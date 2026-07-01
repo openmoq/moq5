@@ -419,6 +419,50 @@ static moq_result_t rx_append_input(moq_session_t *s, int slot,
     return MOQ_OK;
 }
 
+/* Resolve the rx stream for an inbound data delivery: return an existing entry,
+ * or create one for a fresh stream. Returns the slot (>= 0) when the caller
+ * should proceed with parsing, or -1 when the delivery is already fully handled
+ * -- in which case *out_rc holds the result to return (session closed, an
+ * ignored empty non-FIN probe, data-after-FIN close, a STOP_DATA push, or its
+ * WOULD_BLOCK). Behavior is identical to the inline prologue it replaces. */
+static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref,
+                                   size_t len, bool fin, moq_result_t *out_rc)
+{
+    if (!session_is_active(s)) { *out_rc = MOQ_ERR_CLOSED; return -1; }
+
+    int slot = rx_find_by_ref(s, stream_ref);
+    if (slot >= 0) return slot;          /* existing stream: proceed */
+
+    /* Unknown stream. */
+    if (len == 0 && !fin) { *out_rc = MOQ_OK; return -1; }
+    if (rx_is_finished(s, stream_ref._v)) {
+        *out_rc = close_with_error(s, 0x3, "data after FIN");
+        return -1;
+    }
+    slot = rx_find_free(s);
+    if (slot < 0) {
+        if (action_queue_full(s)) { *out_rc = MOQ_ERR_WOULD_BLOCK; return -1; }
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_STOP_DATA;
+        a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
+        a.borrow_epoch = s->borrow_epoch;
+        a.u.stop_data.stream_ref = stream_ref;
+        a.u.stop_data.error_code = 0;
+        *out_rc = push_action(s, &a);
+        return -1;
+    }
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+    memset(rx, 0, sizeof(*rx));
+    rx->active = true;
+    rx->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
+    rx->stream_ref = stream_ref;
+    rx->parse_state = MOQ_RX_AWAITING_HEADER;
+    moq_index_insert(s->idx_rx_by_ref, s->idx_rx_mask,
+                      stream_ref._v, slot);
+    return slot;                          /* new stream: proceed */
+}
+
 /* -- Data bytes handler -------------------------------------------- */
 
 static moq_result_t handle_data_bytes_impl(moq_session_t *s,
@@ -427,34 +471,9 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                                             bool fin,
                                             moq_rcbuf_t *input_rcbuf)
 {
-    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
-
-    int slot = rx_find_by_ref(s, stream_ref);
-    if (slot < 0) {
-        if (len == 0 && !fin) return MOQ_OK;
-        if (rx_is_finished(s, stream_ref._v))
-            return close_with_error(s, 0x3, "data after FIN");
-        slot = rx_find_free(s);
-        if (slot < 0) {
-            if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-            moq_action_t a;
-            memset(&a, 0, sizeof(a));
-            a.kind = MOQ_ACTION_STOP_DATA;
-            a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
-            a.borrow_epoch = s->borrow_epoch;
-            a.u.stop_data.stream_ref = stream_ref;
-            a.u.stop_data.error_code = 0;
-            return push_action(s, &a);
-        }
-        moq_rx_stream_t *rx = &s->rx_streams[slot];
-        memset(rx, 0, sizeof(*rx));
-        rx->active = true;
-        rx->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
-        rx->stream_ref = stream_ref;
-        rx->parse_state = MOQ_RX_AWAITING_HEADER;
-        moq_index_insert(s->idx_rx_by_ref, s->idx_rx_mask,
-                          stream_ref._v, slot);
-    }
+    moq_result_t acquire_rc;
+    int slot = rx_get_or_create_stream(s, stream_ref, len, fin, &acquire_rc);
+    if (slot < 0) return acquire_rc;
 
     moq_rx_stream_t *rx = &s->rx_streams[slot];
 
