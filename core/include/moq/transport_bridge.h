@@ -360,7 +360,27 @@ MOQ_API uint64_t moq_transport_bridge_close_code(
     const moq_transport_bridge_t *brg);
 MOQ_API bool     moq_transport_bridge_is_terminal(
     const moq_transport_bridge_t *brg);
+/*
+ * Mixed/global pending query: true when a service() call could make progress,
+ * covering BOTH blocked outbound writes AND deferred inbound retry (paused
+ * reads, buffered control). Use for "is there work" / idle decisions -- NOT
+ * for transport write-readiness registration (see has_outbound_pending).
+ */
 MOQ_API bool     moq_transport_bridge_has_pending(
+    const moq_transport_bridge_t *brg);
+
+/*
+ * Outbound-only pending query for connection write-readiness. True only for
+ * state that transport send capacity can unblock: the outbound action FIFO
+ * (writes the transport could not accept) and a deferred transport close.
+ * Deliberately EXCLUDES inbound retry state (paused-read pending_retry,
+ * pending_control, etc.), which is unblocked by the app draining events, not
+ * by write capacity. Adapters arm a write-ready notification on this predicate
+ * so a WOULD_BLOCK write retries when the transport can send again; arming on
+ * the mixed has_pending() instead would spin under receive backpressure, since
+ * connections are almost always write-ready.
+ */
+MOQ_API bool     moq_transport_bridge_has_outbound_pending(
     const moq_transport_bridge_t *brg);
 
 /*

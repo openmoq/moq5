@@ -427,6 +427,20 @@ bool moq_transport_bridge_has_pending(const moq_transport_bridge_t *b)
     return false;
 }
 
+bool moq_transport_bridge_has_outbound_pending(const moq_transport_bridge_t *b)
+{
+    if (!b) return false;
+    /* Only state that transport write-readiness can unblock: the outbound
+     * action FIFO (writes the transport could not accept) and a deferred
+     * transport close (a CONNECTION_CLOSE still to send). Inbound retry state
+     * -- pending_control and the per-stream pending_retry/reset/stop/fin --
+     * is deliberately excluded: it is unblocked by the app draining events
+     * (freeing the session's receive queue), NOT by send capacity. Arming
+     * connection-write-ready on inbound pending would spin, since connections
+     * are almost always write-ready. */
+    return b->pending_count > 0 || b->needs_close;
+}
+
 bool moq_transport_bridge_stream_has_pending(
     const moq_transport_bridge_t *b, uint64_t stream_id)
 {

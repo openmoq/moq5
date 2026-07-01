@@ -60,6 +60,7 @@ set(BASE_SYMBOLS
     moq_transport_bridge_close_code
     moq_transport_bridge_is_terminal
     moq_transport_bridge_has_pending
+    moq_transport_bridge_has_outbound_pending
     moq_transport_bridge_uses_uni_control
     moq_transport_bridge_stream_has_pending
     moq_transport_bridge_stream_count

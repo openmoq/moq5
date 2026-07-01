@@ -173,7 +173,9 @@ private:
 static void service_server(server_env &sv) {
     if (!sv.adp) return;
     auto rc = sv.adp->service(0);
-    if (rc < 0 || sv.adp->is_fatal())
+    /* WOULD_BLOCK is retryable/pending per the bridge contract
+     * (transport_bridge.h) -- only other negatives are fatal. */
+    if ((rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) || sv.adp->is_fatal())
         sv.adapter_fatal.store(true);
 }
 

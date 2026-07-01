@@ -53,6 +53,7 @@
 #include <folly/io/async/ssl/OpenSSLTransportCertificate.h>
 
 #include <folly/io/async/EventBase.h>
+#include <folly/io/async/AsyncTimeout.h>
 
 #include <openssl/x509v3.h>
 
@@ -270,6 +271,12 @@ struct moq_mvfst_managed {
     std::string key_path;
     std::shared_ptr<quic::QuicServer> server;
     folly::EventBase *server_evb = nullptr;
+    /* Client mode: the EventBase the managed thread owns and runs. Published by
+     * the managed thread when the pump loop starts and cleared when it exits;
+     * read from app/credit/write-ready threads in wake_pump/request_pump/
+     * notify_shutdown, so it is atomic (release on store, acquire on load).
+     * Null in server mode (where server_evb is a foreign worker thread). */
+    std::atomic<folly::EventBase *> client_evb{nullptr};
     std::atomic<uint16_t> local_port{0};
     std::vector<std::unique_ptr<moq_mvfst_conn>> conns;
     size_t max_connections = MOQ_MVFST_DEFAULT_MAX_CONNECTIONS;
@@ -336,9 +343,76 @@ struct moq_mvfst_managed {
         wait_cv.notify_all();
     }
 
+    /* Client mode: coalesced MoQ-pump scheduler. The managed thread runs a
+     * normal EventBase loop (mvfst owns the socket and its ACK/loss timers);
+     * the MoQ pump is just another callback scheduled onto that loop.
+     * pump_scheduled (the coalescing latch) and pump_settle_needed (the
+     * bounded second-pass request) are deliberately touched cross-thread --
+     * external wake sources set them from app/credit/write-ready threads while
+     * the pump callback clears them on the EventBase thread -- so both are
+     * atomic. pump_run is assigned/cleared only on the EventBase thread (before
+     * loop() starts / after it exits) and invoked only from the pump callback. */
+    std::atomic<bool> pump_scheduled{false};
+    std::atomic<bool> pump_settle_needed{false};
+    std::function<void()> pump_run;
+
+    /* Enqueue one coalesced pump callback on the client EventBase (internal;
+     * external wake sources use request_pump). Idempotent while a pump is
+     * already queued -- the flag clears at the head of the enqueued callback,
+     * so many wakes in one loop turn collapse to a single pump_tick.
+     * runInEventBaseThreadAlwaysEnqueue -- not runInEventBaseThread -- so the
+     * pump never runs inline when scheduled from the EventBase thread itself
+     * (e.g. an inbound callback); it always lands on the next loop turn, which
+     * keeps pump_tick non-reentrant. */
+    void schedule_pump() {
+        if (pump_scheduled.exchange(true)) return;   /* already queued */
+        folly::EventBase *evb = client_evb.load(std::memory_order_acquire);
+        if (!evb) { pump_scheduled.store(false); return; }
+        evb->runInEventBaseThreadAlwaysEnqueue([this]() {
+            pump_scheduled.store(false);
+            if (pump_run) pump_run();
+            /* Settle pass. An external wake may have changed app state that
+             * on_pump only observes on a *later* pass -- the classic managed
+             * on_pump state machine reads an event this pass and acts on it
+             * the next (e.g. poll_events sees SETUP_COMPLETE, then a following
+             * pump sends SUBSCRIBE). The old 5ms cadence supplied that second
+             * pass implicitly; here one bounded follow-up preserves it without
+             * a periodic timer. The follow-up does NOT set pump_settle_needed,
+             * so it cannot self-perpetuate -- only a fresh external wake
+             * re-arms it, and an idle loop stays idle. */
+            if (pump_settle_needed.exchange(false))
+                schedule_pump();
+        });
+    }
+
+    /* Request one MoQ pump from an external wake source (app, credit,
+     * write-ready, inbound transport callback, deadline timer, initial). Arms
+     * a bounded settle pass, then enqueues a coalesced pump. Thread-safe;
+     * callable from any thread. */
+    void request_pump() {
+        pump_settle_needed.store(true);
+        schedule_pump();
+    }
+
+    /* Wake the pump promptly. Client mode: schedule a coalesced pump on the
+     * owned EventBase. Server mode: the legacy condvar path (the server loop
+     * still polls). */
+    void wake_pump() {
+        if (client_evb.load(std::memory_order_acquire)) {
+            request_pump();
+        } else {
+            wake_flag.store(true);
+            wake_cv.notify_one();
+        }
+    }
+
     void notify_shutdown() {
         wake_cv.notify_all();
         wait_cv.notify_all();
+        /* Break the client pump loop. terminateLoopSoon is thread-safe;
+         * harmless if the loop has already exited. */
+        if (auto *evb = client_evb.load(std::memory_order_acquire))
+            evb->terminateLoopSoon();
     }
 
     /* Turn on managed-only outbound stream-credit gating for the client
@@ -594,10 +668,18 @@ moq_result_t moq_mvfst_managed_create(
      * Destroys adapter, transport, session, server. Safe with nulls.
      */
     auto teardown = [](moq_mvfst_managed_t *h) {
-        h->adapter_ptr.reset();
+        /* Close the transport BEFORE destroying the adapter. mvfst has no
+         * unregister for the connection-write callback; closing clears it
+         * (firing onConnectionWriteError) on the still-live impl, so an armed
+         * notifyPendingWriteOnConnection cannot fire into a freed adapter. The
+         * transport object stays alive until after ~impl (whose
+         * teardown_callbacks clears the read/setup/datagram callbacks). */
         if (h->transport) {
             h->transport->close(
                 quic::QuicError(quic::ApplicationErrorCode(0)));
+        }
+        h->adapter_ptr.reset();
+        if (h->transport) {
             h->transport.reset();
         }
         moq_session_t *s = h->session.exchange(nullptr);
@@ -820,7 +902,8 @@ moq_result_t moq_mvfst_managed_create(
 
             if (h->adapter_ptr) {
                 moq_result_t src = h->adapter_ptr->service(now);
-                if (src < 0 || h->adapter_ptr->is_fatal()) {
+                if ((src < 0 && src != MOQ_ERR_WOULD_BLOCK)
+                    || h->adapter_ptr->is_fatal()) {
                     h->set_fatal(h->adapter_ptr->is_fatal()
                         ? h->adapter_ptr->fatal_code() : 0x1);
                     return {false, UINT64_MAX};
@@ -830,7 +913,8 @@ moq_result_t moq_mvfst_managed_create(
             for (auto &c : h->conns) {
                 if (c->should_remove() || !c->adp) continue;
                 moq_result_t crc = c->adp->service(now);
-                if (crc < 0 || c->adp->is_fatal()) c->fatal = true;
+                if ((crc < 0 && crc != MOQ_ERR_WOULD_BLOCK) || c->adp->is_fatal())
+                    c->fatal = true;
                 else if (c->adp->is_closed()) c->close_requested = true;
             }
 
@@ -840,7 +924,8 @@ moq_result_t moq_mvfst_managed_create(
 
             if (h->adapter_ptr) {
                 moq_result_t src = h->adapter_ptr->service(now);
-                if (src < 0 || h->adapter_ptr->is_fatal()) {
+                if ((src < 0 && src != MOQ_ERR_WOULD_BLOCK)
+                    || h->adapter_ptr->is_fatal()) {
                     h->set_fatal(h->adapter_ptr->is_fatal()
                         ? h->adapter_ptr->fatal_code() : 0x1);
                     return {false, UINT64_MAX};
@@ -851,7 +936,8 @@ moq_result_t moq_mvfst_managed_create(
             for (auto &c : h->conns) {
                 if (c->should_remove() || !c->adp) continue;
                 moq_result_t crc = c->adp->service(now);
-                if (crc < 0 || c->adp->is_fatal()) c->fatal = true;
+                if ((crc < 0 && crc != MOQ_ERR_WOULD_BLOCK) || c->adp->is_fatal())
+                    c->fatal = true;
                 else if (c->adp->is_closed()) c->close_requested = true;
             }
 
@@ -902,54 +988,111 @@ moq_result_t moq_mvfst_managed_create(
 
         /* --- Pump loop --- */
         try {
-            while (m->running.load()) {
-                if (evb_ptr)
-                    evb_ptr->loopOnce(EVLOOP_NONBLOCK);
-                if (!m->running.load())
-                    break;
+            if (evb_ptr) {
+                /* CLIENT: EventBase-owned loop. mvfst owns the socket and its
+                 * ACK/loss/PTO timers; the MoQ pump is just a coalesced
+                 * callback scheduled onto that loop. The thread does NOT block
+                 * on a session-only deadline -- doing so would starve mvfst's
+                 * QUIC timers while app-level stream reads are paused (the peer
+                 * would stop seeing ACKs and hit lossTimeoutExpired). Wakes
+                 * (app, credit, write-ready, inbound data) request a pump; a
+                 * one-shot AsyncTimeout requests one at the next MoQ session
+                 * deadline. Zero idle spin, prompt pumping, live QUIC timers. */
+                m->client_evb.store(evb_ptr.get(),
+                                    std::memory_order_release);
+                auto deadline_to = folly::AsyncTimeout::make(
+                    *evb_ptr, [m]() noexcept { m->request_pump(); });
 
-                pump_result pr;
-                if (m->server_evb) {
-                    m->server_evb->runInEventBaseThreadAndWait(
-                        [m, &pr, &pump_tick]() {
-                            pr = pump_tick(m);
-                        });
-                } else {
-                    pr = pump_tick(m);
-                }
-                if (!pr.ok) {
-                    m->running.store(false);
-                    break;
-                }
-
-                if (m->on_activity)
-                    m->on_activity(m, m->user_ctx);
-
-                m->signal_activity();
-
-                /* Sleep no longer than needed to fire the next
-                 * session deadline, capped at 5ms for general
-                 * responsiveness. Deadline was computed on the
-                 * correct thread inside pump_tick. */
-                auto wait_us = std::chrono::microseconds(5000);
-                if (pr.earliest_deadline != UINT64_MAX) {
-                    auto cur = managed_now_us();
-                    if (pr.earliest_deadline <= cur) {
-                        wait_us = std::chrono::microseconds(0);
-                    } else {
-                        auto delta = pr.earliest_deadline - cur;
-                        if (delta < 5000) wait_us =
-                            std::chrono::microseconds(delta);
+                /* The pump body, always run on the EventBase thread through
+                 * request_pump(). Reschedules the deadline timer from the MoQ
+                 * session's next deadline (mvfst's own timers are independent
+                 * and keep running regardless). */
+                m->pump_run = [m, &pump_tick, &deadline_to]() {
+                    pump_result pr = pump_tick(m);
+                    if (m->on_activity)
+                        m->on_activity(m, m->user_ctx);
+                    m->signal_activity();
+                    if (!pr.ok) {
+                        m->running.store(false);
+                        if (auto *e = m->client_evb.load(
+                                std::memory_order_acquire))
+                            e->terminateLoopSoon();
+                        return;
                     }
-                }
+                    deadline_to->cancelTimeout();
+                    if (pr.earliest_deadline != UINT64_MAX) {
+                        auto cur = managed_now_us();
+                        uint64_t d = pr.earliest_deadline <= cur
+                            ? 0 : pr.earliest_deadline - cur;
+                        uint64_t ms = d == 0 ? 0 : (d + 999) / 1000;
+                        /* AsyncTimeout takes a uint32_t millisecond delay.
+                         * Unlike the old 5ms-capped loop, this schedules the
+                         * full MoQ session deadline, which can be a large
+                         * configured idle/goaway/delivery horizon -- clamp so a
+                         * far deadline cannot wrap the cast. Firing early on a
+                         * clamp is harmless: the pump just re-evaluates and
+                         * reschedules. */
+                        if (ms > UINT32_MAX) ms = UINT32_MAX;
+                        deadline_to->scheduleTimeout(
+                            static_cast<uint32_t>(ms));
+                    }
+                };
 
-                if (wait_us.count() > 0) {
-                    std::unique_lock<std::mutex> lk(m->wake_mu);
-                    m->wake_cv.wait_for(lk, wait_us, [m]() {
-                        return m->wake_flag.load() ||
-                               !m->running.load();
-                    });
-                    m->wake_flag.store(false);
+                m->request_pump();     /* initial service + on_pump */
+                /* loopForever (not loop): keep the EventBase a durable owner of
+                 * this thread so it never returns when momentarily idle (e.g.
+                 * after a stream FIN with no registered read event). A plain
+                 * loop() can exit between callbacks, stranding pump callbacks
+                 * enqueued via runInEventBaseThread on a loop that has stopped.
+                 * Exits only via terminateLoopSoon (notify_shutdown / fatal). */
+                evb_ptr->loopForever();
+
+                m->pump_run = nullptr;  /* stop dispatching before locals die */
+                deadline_to->cancelTimeout();
+                m->client_evb.store(nullptr, std::memory_order_release);
+            } else {
+                /* SERVER: legacy manager-thread pump cadence. Unchanged
+                 * pending the schedule-on-server_evb follow-up. */
+                while (m->running.load()) {
+                    pump_result pr;
+                    if (m->server_evb) {
+                        m->server_evb->runInEventBaseThreadAndWait(
+                            [m, &pr, &pump_tick]() {
+                                pr = pump_tick(m);
+                            });
+                    } else {
+                        pr = pump_tick(m);
+                    }
+                    if (!pr.ok) {
+                        m->running.store(false);
+                        break;
+                    }
+
+                    if (m->on_activity)
+                        m->on_activity(m, m->user_ctx);
+
+                    m->signal_activity();
+
+                    auto wait_us = std::chrono::microseconds(5000);
+                    if (pr.earliest_deadline != UINT64_MAX) {
+                        auto cur = managed_now_us();
+                        if (pr.earliest_deadline <= cur) {
+                            wait_us = std::chrono::microseconds(0);
+                        } else {
+                            auto delta = pr.earliest_deadline - cur;
+                            if (delta < 5000) wait_us =
+                                std::chrono::microseconds(delta);
+                        }
+                    }
+
+                    if (wait_us.count() > 0) {
+                        std::unique_lock<std::mutex> lk(m->wake_mu);
+                        m->wake_cv.wait_for(lk, wait_us, [m]() {
+                            return m->wake_flag.load() ||
+                                   !m->running.load();
+                        });
+                        m->wake_flag.store(false);
+                    }
                 }
             }
         } catch (...) {
@@ -958,6 +1101,12 @@ moq_result_t moq_mvfst_managed_create(
         }
 
         teardown(m);
+        /* One-shot drain (loop(), not loopForever): teardown(m) closed the
+         * client transport, which posts mvfst's close/destroy callbacks onto
+         * this EventBase. Run the loop to completion so those callbacks fire
+         * before evb_ptr is destroyed; with no registered events left it
+         * returns on its own. The durable loopForever above has already exited
+         * via terminateLoopSoon by this point. */
         if (evb_ptr) {
             evb_ptr->loop();
             evb_ptr.reset();
@@ -1079,8 +1228,7 @@ moq_result_t moq_mvfst_managed_wake(moq_mvfst_managed_t *m)
 {
     if (!m) return MOQ_ERR_INVAL;
     if (m->is_closed()) return MOQ_ERR_CLOSED;
-    m->wake_flag.store(true);
-    m->wake_cv.notify_one();
+    m->wake_pump();
     return MOQ_OK;
 }
 
@@ -1159,9 +1307,21 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     , public quic::QuicSocket::ConnectionCallback
     , public quic::QuicSocket::ReadCallback
     , public quic::QuicSocket::DatagramCallback
+    , public quic::ConnectionWriteCallback
 {
     moq_session_t *session;
     std::shared_ptr<quic::QuicSocket> socket;
+
+    /* Armed while a connection-write-ready notification is outstanding. Set
+     * when a service leaves the bridge with pending writes the transport could
+     * not accept yet; cleared when onConnectionWriteReady fires (one-shot in
+     * mvfst) or the connection errors. Touched only on the network/EventBase
+     * thread, so no synchronization is needed. */
+    bool write_armed = false;
+    /* Only the event-driven managed client arms write-readiness (its pump has
+     * no poll to fall back on). The server path still polls and reorders its
+     * own teardown separately, so leave its conns unarmed for now. */
+    bool write_ready_enabled = false;
 
     /* Shared transport bridge — all routing goes through this. */
     moq_transport_bridge_t *shared_bridge = nullptr;
@@ -1193,6 +1353,13 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     /* Set by the managed facade: wakes the managed pump when the peer grants
      * outbound stream credit. Unset (null) in attach mode. */
     std::function<void()> credit_wake;
+
+    /* Set by the managed client facade: schedules a coalesced MoQ pump on the
+     * managed EventBase after an inbound transport callback advances the
+     * bridge, so the app's on_pump drains the newly-queued events. Unset
+     * (null) in attach mode, where the caller drives its own pump. */
+    std::function<void()> pump_wake;
+    void wake_managed_pump() { if (pump_wake) pump_wake(); }
 
     static void on_local_bidi_opened(void *ctx, uint64_t stream_id) {
         auto *self = static_cast<impl *>(ctx);
@@ -1337,19 +1504,55 @@ struct __attribute__((visibility("hidden"))) adapter::impl
         }
 
         resume_paused_reads();
+        arm_write_if_pending();
         return rc;
+    }
+
+    /* If the bridge still has writes the transport could not accept, register a
+     * one-shot connection-write-ready notification so the WOULD_BLOCK retry is
+     * driven by mvfst send capacity instead of a poll. Coalesced via
+     * write_armed. Runs on the network/EventBase thread (where service_all and
+     * the write callbacks run). */
+    void arm_write_if_pending() {
+        if (!write_ready_enabled) return;
+        if (write_armed || !socket) return;
+        /* Outbound-only: arm write-ready solely for writes the transport could
+         * not accept. Using the mixed has_pending() would also fire for inbound
+         * paused-read retry, and since connections are almost always
+         * write-ready, that spins onConnectionWriteReady and starves QUIC
+         * read/ACK/timer processing (peer then hits lossTimeoutExpired). */
+        if (!moq_transport_bridge_has_outbound_pending(shared_bridge)) return;
+        auto r = socket->notifyPendingWriteOnConnection(this);
+        if (!r.hasError()) write_armed = true;
+    }
+
+    void onConnectionWriteReady(uint64_t /*maxToSend*/) noexcept override {
+        write_armed = false;   /* mvfst one-shot: consumed by this call */
+        try {
+            /* Flush pending writes now that the transport can accept more;
+             * service_all re-arms if writes remain. */
+            service_all(now_us_from_clock());
+            wake_managed_pump();
+        } catch (...) {
+            moq_transport_bridge_on_transport_error(
+                shared_bridge, 0x1, now_us_from_clock());
+        }
+    }
+
+    void onConnectionWriteError(quic::QuicError /*error*/) noexcept override {
+        write_armed = false;   /* connection tearing down; nothing to retry */
     }
 
     /* -- ConnectionSetupCallback --------------------------------------- */
 
     void onTransportReady() noexcept override {
-        try { service_all(now_us_from_clock()); } catch (...) {
+        try { service_all(now_us_from_clock()); wake_managed_pump(); } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
         }
     }
     void onReplaySafe() noexcept override {
-        try { service_all(now_us_from_clock()); } catch (...) {
+        try { service_all(now_us_from_clock()); wake_managed_pump(); } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
         }
@@ -1360,6 +1563,8 @@ struct __attribute__((visibility("hidden"))) adapter::impl
         (void)error;
         moq_transport_bridge_on_transport_error(
             shared_bridge, 0x1, now_us_from_clock());
+        wake_managed_pump();  /* schedule a pump so the managed handle latches
+                               * fatal (handshake/cert/DNS failure path) */
     }
 
     /* -- ConnectionCallback -------------------------------------------- */
@@ -1409,6 +1614,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
             if (rc == MOQ_ERR_WOULD_BLOCK)
                 pause_read_cb(id);
             service_all(now);
+            wake_managed_pump();
         } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
@@ -1418,6 +1624,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     void onConnectionEnd() noexcept override {
         moq_transport_bridge_on_transport_close(
             shared_bridge, 0, now_us_from_clock());
+        wake_managed_pump();  /* let the pump observe the close and stop */
     }
 
     void onConnectionError(quic::QuicError error) noexcept override {
@@ -1428,6 +1635,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
             code = *app;
         moq_transport_bridge_on_transport_error(
             shared_bridge, code, now_us_from_clock());
+        wake_managed_pump();  /* let the pump observe the fatal and stop */
     }
 
     /* -- ReadCallback -------------------------------------------------- */
@@ -1516,6 +1724,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
             }
 
             service_all(now);
+            wake_managed_pump();
         } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
@@ -1540,10 +1749,23 @@ struct __attribute__((visibility("hidden"))) adapter::impl
              * session itself.) */
             if (id == local_control_stream_id ||
                 id == peer_control_stream_id) {
-                moq_transport_bridge_on_transport_error(
-                    shared_bridge, code ? code : 0x1, now);
+                /* A control-stream read error during connection teardown. mvfst
+                 * reflects a peer CONNECTION_CLOSE onto every stream (including
+                 * the control stream) as a readError, and this can arrive
+                 * BEFORE onConnectionEnd. A clean close (application error code
+                 * 0 / no error) must land as a graceful transport close, not a
+                 * fatal error -- otherwise a peer that closes normally leaves
+                 * the local session fatal. A non-zero code is a genuine
+                 * control-stream reset (a protocol violation) and stays fatal. */
+                if (code == 0)
+                    moq_transport_bridge_on_transport_close(
+                        shared_bridge, 0, now);
+                else
+                    moq_transport_bridge_on_transport_error(
+                        shared_bridge, code, now);
                 unregister_read_cb(id);
                 service_all(now);
+                wake_managed_pump();
                 return;
             }
 
@@ -1555,6 +1777,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
                 unregister_read_cb(id);
             }
             service_all(now);
+            wake_managed_pump();
         } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
@@ -1576,6 +1799,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
                     shared_bridge, buf->data(), buf->length(), now);
             }
             service_all(now);
+            wake_managed_pump();
         } catch (...) {
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now_us_from_clock());
@@ -1676,10 +1900,16 @@ void moq_mvfst_managed::enable_credit_gating()
     if (!adapter_ptr) return;
     auto *im = adapter_ptr->impl_.get();
     im->shared_ep_ctx.credit_gating = true;
+    im->write_ready_enabled = true; /* event-driven client: retry via write-readiness */
     moq_mvfst_managed *self = this;
     im->credit_wake = [self]() {
-        self->wake_flag.store(true);
-        self->wake_cv.notify_all();
+        self->wake_pump();
+    };
+    /* Inbound transport callbacks schedule a coalesced MoQ pump so the app's
+     * on_pump drains newly-queued events (the EventBase itself keeps mvfst's
+     * QUIC timers alive; the pump is a callback on it, not a blocking wait). */
+    im->pump_wake = [self]() {
+        self->request_pump();
     };
 }
 
