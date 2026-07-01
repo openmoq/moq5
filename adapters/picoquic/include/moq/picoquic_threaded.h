@@ -33,11 +33,14 @@
  *   fatal and they stay NULL). See the alpn_list field below.
  *
  * Server mode:
- *   _create builds picoquic context and starts listening. Session and
- *   adapter are created lazily on the network thread when the first
- *   client connects. Until then, _session() and _conn() return NULL
- *   and on_pump is not called. v0 supports one active connection;
- *   additional connections are rejected.
+ *   _create builds picoquic context and starts listening. A per-connection
+ *   session and adapter are created lazily on the network thread as each client
+ *   connects, up to cfg.max_connections (default 1024); a connection past the
+ *   cap is rejected. Before the first client, on_pump is not called and the
+ *   legacy _session()/_conn() return NULL. Iterate connections with
+ *   moq_pq_threaded_next_conn() (per-connection API below); the legacy
+ *   _session()/_conn() return the FIRST live connection for single-connection
+ *   convenience.
  *
  * Build: requires MOQ_BUILD_PQ_THREADED=ON and
  *   MOQ_BUILD_ADAPTER_PICOQUIC=ON.
@@ -173,14 +176,23 @@ typedef struct moq_pq_threaded_cfg {
      * forever) — the previous behavior. Mirrors the knob the pico_wt and mvfst
      * managed facades already expose. */
     uint64_t           goaway_timeout_us;
+
+    /* Appended (struct_size append-only ABI) — server connection cap.
+     *
+     * max_connections: SERVER mode only. The maximum number of simultaneous
+     * accepted client connections; a new connection past the cap is rejected
+     * at the transport (picoquic closes it). 0 = the library default (1024),
+     * mirroring the mvfst managed server. Inert in client mode. */
+    uint32_t           max_connections;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
  * existed before goaway_timeout_us was appended (it cannot know the caller's
  * storage size, so it must not write the full current sizeof -- that would
  * overflow an old caller's smaller struct). Fields appended after the prefix
- * (currently goaway_timeout_us) default to disabled; sni/alpn_* predate the
- * prefix boundary and stay enabled. To use appended fields, or to get the full
+ * (currently goaway_timeout_us and max_connections) default to disabled/zero
+ * (max_connections 0 = the 1024 default); sni/alpn_* predate the prefix
+ * boundary and stay enabled. To use appended fields, or to get the full
  * current struct, use moq_pq_threaded_cfg_init_sized(). */
 void moq_pq_threaded_cfg_init(moq_pq_threaded_cfg_t *cfg);
 
@@ -236,14 +248,63 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t);
  * Returns the MoQ session, or NULL if server mode and no connection
  * has been accepted yet.  Thread-safe (reads under mutex).
  * The returned pointer is owned by the helper — do not destroy it.
+ *
+ * LEGACY / single-connection convenience: in server mode this returns the
+ * FIRST live connection's session. A multi-connection server MUST iterate with
+ * moq_pq_threaded_next_conn() + moq_pq_threaded_conn_session() instead. In
+ * client mode this is the client session (unchanged).
  */
 moq_session_t *moq_pq_threaded_session(moq_pq_threaded_t *t);
 
 /*
  * Returns the adapter connection, or NULL if server mode and no
  * connection has been accepted yet.  Thread-safe.
+ *
+ * LEGACY / single-connection convenience: server mode returns the FIRST live
+ * connection's adapter object; multi-connection servers use next_conn().
  */
 moq_pq_conn_t *moq_pq_threaded_conn(moq_pq_threaded_t *t);
+
+/* -- Per-connection API (server multi-connection) ------------------- *
+ * Mirrors the mvfst managed per-connection model. A moq_pq_threaded_conn_t is
+ * an opaque handle to one accepted server connection. All per-connection calls
+ * are valid ONLY on the network thread inside on_pump, for a handle observed in
+ * the current live next_conn() iteration. */
+
+typedef struct moq_pq_threaded_conn moq_pq_threaded_conn_t;
+
+/*
+ * Iterate accepted server connections. Pass prev=NULL to start; returns NULL
+ * when done. Call on the network thread inside on_pump.
+ *
+ * Handle stability: a moq_pq_threaded_conn_t* is stable while the connection
+ * remains active (heap-owned; unaffected by the internal list growing). Once a
+ * handle no longer appears in iteration it is stale and must not be used
+ * (closed/errored connections disappear after the on_pump that observed them).
+ */
+moq_pq_threaded_conn_t *moq_pq_threaded_next_conn(
+    moq_pq_threaded_t *t, moq_pq_threaded_conn_t *prev);
+
+/*
+ * The MoQ session for a server connection (NULL if the handle is invalid).
+ * Valid only inside on_pump for a live handle. Owned by the helper.
+ */
+moq_session_t *moq_pq_threaded_conn_session(
+    moq_pq_threaded_conn_t *conn);
+
+/*
+ * Close a single server connection. May be called inside on_pump. The close is
+ * deferred until after on_pump returns, so next_conn() iteration stays valid;
+ * the connection then disappears from iteration. Returns MOQ_OK, or
+ * MOQ_ERR_INVAL for a NULL handle.
+ */
+moq_result_t moq_pq_threaded_conn_close(
+    moq_pq_threaded_conn_t *conn, uint64_t error_code);
+
+/*
+ * Number of active server connections. Safe from any thread.
+ */
+size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
 
 /* Fatal state.  Thread-safe.  In client mode, a transport disconnect
  * before the MoQ session reaches MOQ_SESS_ESTABLISHED (cert rejection,

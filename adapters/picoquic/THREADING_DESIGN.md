@@ -247,45 +247,48 @@ _create(cfg) for CLIENT:
 
 ## Server Mode Lifecycle
 
-v0 supports exactly one active server connection.
+The server accepts up to cfg->max_connections concurrent connections (default
+1024); each gets its own session + adapter record. See "Multi-connection server
+(supported)" below for the per-connection API.
 
 ```
 _create(cfg) for SERVER:
   1. Validate cfg (alloc, cert_path, key_path, port, on_pump required)
   2. Allocate moq_pq_threaded_t, init mutex/condvar
-  3. picoquic_create(8, cert, key, ..., server_callback, t)
-         → t->quic
+  3. picoquic_create(max_connections, cert, key, ..., server_callback, t)
+         → t->quic   (cfg->max_connections, or the 1024 default; picoquic
+                      fixes this cap at context create)
   4. If cfg->insecure_skip_verify:
          picoquic_set_null_verifier(t->quic)
   5. If cfg->configure_quic:
          rc = cfg->configure_quic(t->quic, cfg->configure_quic_ctx)
          if rc != 0 → rollback
-  6. t->session = NULL, t->conn = NULL
+  6. conns = NULL, conn_count = 0 (t->session/t->conn mirror the first live conn)
   7. picoquic_start_network_thread(t->quic, param,
          loop_callback, t) → t->thread_ctx
   8. Return MOQ_OK
 
-First inbound connection (picoquic_callback_ready on network thread):
+Inbound connection (picoquic_callback_ready on network thread):
   server_callback:
+    if conn_count >= max_connections → return -1 (cap reached)
     moq_session_create(session_cfg) → s
-    moq_pq_conn_create(s, cnx, alloc) → c
-    lock(t->mutex)
-    t->session = s
-    t->conn = c
-    unlock(t->mutex)
-    on_pump now fires each loop iteration
+    moq_pq_conn_create(s, cnx, alloc) → c   (rebinds cnx to its own callback)
+    append record to conns[]
+    lock(t->mutex); publish first live conn to t->session/t->conn; unlock
+    on_pump fires each loop iteration; each record is serviced independently
 
-Subsequent inbound connections:
-  server_callback returns -1 — one connection only.
+Per-connection teardown (conn_close, service/bridge fatal, or peer close):
+  pruned after on_pump returns (iteration-safe). A local/service/bridge fatal
+  is closed with picoquic_close first; a peer-closed cnx is not re-closed.
+  Pruning one connection does not tear down the server.
 
 _stop():
   picoquic_delete_network_thread → thread exits
-  t->session and t->conn may still be NULL
+  conns[] may still be empty
 
 _destroy():
-  if (t->conn) moq_pq_conn_destroy(t->conn)
-  if (t->session) moq_session_destroy(t->session)
-  picoquic_free(t->quic)
+  for each record: moq_pq_conn_destroy + moq_session_destroy + free
+  picoquic_free(t->quic)   (closes/deletes remaining cnx objects)
   mutex/cond destroy
   free(t)
 ```
@@ -684,9 +687,17 @@ session config.
   `moq_pq_conn_t` + manual event loop pattern remains the primary
   integration path.
 - **Not a generic thread pool.** One network thread per wrapper.
-- **Not multi-connection server.** v0 supports exactly one active
-  server connection. Multi-connection requires per-connection state
-  management and is a future extension.
+- **Multi-connection server (supported).** The server accepts up to
+  `cfg.max_connections` simultaneous client connections (default 1024),
+  each with its own MoQ session/adapter. Iterate them on the network
+  thread inside `on_pump` with `moq_pq_threaded_next_conn()` /
+  `moq_pq_threaded_conn_session()`, close one with
+  `moq_pq_threaded_conn_close()` (deferred prune after `on_pump`), and read
+  the active count with `moq_pq_threaded_conn_count()`. The pump services
+  every connection before and after `on_pump`; a per-connection failure
+  prunes only that connection, leaving the server up. The legacy
+  `moq_pq_threaded_session()` / `_conn()` return the first live connection
+  for single-connection convenience.
 
 ## Build Gate Recommendation
 

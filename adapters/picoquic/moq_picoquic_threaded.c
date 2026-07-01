@@ -35,6 +35,24 @@
  * inbound MoQ object is not held back by too small a window; see create. */
 #define MOQ_PQ_RECV_FLOW_CONTROL (16u * 1024u * 1024u)
 
+/* Default server connection cap when cfg.max_connections is 0. Mirrors the
+ * mvfst managed server default. */
+#define MOQ_PQ_THREADED_DEFAULT_MAX_CONNECTIONS 1024u
+
+/* One accepted server connection. Heap-owned so the public opaque handle
+ * (moq_pq_threaded_conn_t*) stays stable while the internal list grows/compacts.
+ * All fields are touched only on the network thread except where noted. */
+struct moq_pq_threaded_conn {
+    struct moq_pq_threaded *parent;    /* owning server (for thread-guard) */
+    picoquic_cnx_t *cnx;
+    moq_session_t  *session;
+    moq_pq_conn_t  *conn;
+    moq_version_t   negotiated;
+    bool            close_requested;   /* conn_close: prune after on_pump */
+    uint64_t        close_error_code;
+    bool            fatal;             /* per-conn service failure: prune */
+};
+
 struct moq_pq_threaded {
     moq_alloc_t         alloc;
 
@@ -75,10 +93,17 @@ struct moq_pq_threaded {
     pthread_mutex_t     mutex;
     pthread_cond_t      cond;
     picoquic_network_thread_ctx_t *thread_ctx;
+    /* Client mode: the single session/conn/cnx (eager or deferred). */
     moq_session_t      *session;
     moq_pq_conn_t      *conn;
     picoquic_cnx_t     *active_cnx;
-    picoquic_cnx_t     *accepted_cnx;
+    /* Server mode: per-connection records (heap-owned; stable handles).
+     * Grown on accept, compacted on prune -- both on the network thread; read
+     * under mutex by conn_count / the legacy first-conn accessors. */
+    struct moq_pq_threaded_conn **conns;
+    size_t              conn_count;
+    size_t              conn_cap;
+    size_t              max_connections;
     bool                fatal;
     uint64_t            fatal_code;
     bool                stopped;
@@ -137,6 +162,188 @@ static void build_session_cfg(moq_pq_threaded_t *t,
     if (t->send_buffer_size) scfg->send_buffer_size = t->send_buffer_size;
     if (t->recv_buffer_size) scfg->recv_buffer_size = t->recv_buffer_size;
     if (t->goaway_timeout_us) scfg->goaway_timeout_us = t->goaway_timeout_us;
+}
+
+/* ------------------------------------------------------------------ */
+/* Server connection list (all mutations on the network thread)        */
+/* ------------------------------------------------------------------ */
+
+/* Mirror the first live connection into the legacy single-connection accessors
+ * (moq_pq_threaded_session/_conn). Keeping this in sync under the mutex lets
+ * those accessors stay thread-safe without the app thread ever touching conns[]
+ * (which only the network thread mutates). Caller holds t->mutex. */
+static void server_publish_first_locked(moq_pq_threaded_t *t)
+{
+    if (t->conn_count > 0) {
+        t->session    = t->conns[0]->session;
+        t->conn       = t->conns[0]->conn;
+        t->active_cnx = t->conns[0]->cnx;
+    } else {
+        t->session = NULL;
+        t->conn = NULL;
+        t->active_cnx = NULL;
+    }
+}
+
+/* Append a heap-owned record. Caller holds t->mutex (conn_count is read
+ * cross-thread). Returns false on OOM. */
+static bool server_conns_append(moq_pq_threaded_t *t,
+                                struct moq_pq_threaded_conn *c)
+{
+    if (t->conn_count == t->conn_cap) {
+        size_t ncap = t->conn_cap ? t->conn_cap * 2 : 8;
+        struct moq_pq_threaded_conn **na = t->alloc.realloc(
+            t->conns, t->conn_cap * sizeof(*na),
+            ncap * sizeof(*na), t->alloc.ctx);
+        if (!na) return false;
+        t->conns = na;
+        t->conn_cap = ncap;
+    }
+    t->conns[t->conn_count++] = c;
+    server_publish_first_locked(t);
+    return true;
+}
+
+/* Tear down one connection record. do_close sends a picoquic CONNECTION_CLOSE
+ * (close_code) first -- required for an app-requested close AND for a local /
+ * service / bridge fatal (moq_pq_service only reports bridge-fatal; it does not
+ * close the cnx), so the QUIC connection is not left dangling. Callers skip the
+ * close only when the peer already closed it. moq_pq_conn_destroy then unbinds
+ * the cnx callback, so no callback can route into the freed adapter. Network
+ * thread. */
+static void server_conn_free(moq_pq_threaded_t *t,
+                             struct moq_pq_threaded_conn *c,
+                             bool do_close,
+                             uint64_t close_code)
+{
+    if (!c) return;
+    if (do_close && c->cnx)
+        picoquic_close(c->cnx, close_code);
+    if (c->conn) moq_pq_conn_destroy(c->conn);
+    if (c->session) moq_session_destroy(c->session);
+    t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+}
+
+/* Accept one new server connection: create its session + adapter at the
+ * negotiated ALPN version, start it, and append a heap-owned record. Returns
+ * the record or NULL (caller returns -1 so picoquic closes the cnx). Network
+ * thread. */
+static struct moq_pq_threaded_conn *server_accept(moq_pq_threaded_t *t,
+                                                  picoquic_cnx_t *cnx,
+                                                  uint64_t now)
+{
+    moq_session_cfg_t scfg;
+    build_session_cfg(t, &scfg, MOQ_PERSPECTIVE_SERVER);
+    /* Negotiated ALPN names the session version (§13). */
+    const char *alpn = picoquic_tls_get_negotiated_alpn(cnx);
+    moq_version_t v = (moq_version_t)0;
+    if (alpn && moq_alpn_to_version(alpn, strlen(alpn), &v))
+        scfg.version = v;
+    else if (alpn)
+        return NULL;   /* unmappable ALPN: refuse rather than guess */
+
+    moq_session_t *session = NULL;
+    if (moq_session_create(&scfg, now, &session) != MOQ_OK)
+        return NULL;
+
+    moq_pq_conn_cfg_t acfg;
+    moq_pq_conn_cfg_init_sized(&acfg, sizeof(acfg));
+    acfg.session = session;
+    acfg.cnx = cnx;
+    acfg.alloc = &t->alloc;
+    moq_pq_conn_t *conn = NULL;
+    if (moq_pq_conn_create(&acfg, &conn) != 0) {
+        moq_session_destroy(session);
+        return NULL;
+    }
+
+    /* Start the server session (draft-18 sends its own SETUP; draft-16 is a
+     * WRONG_STATE no-op). */
+    moq_result_t src = moq_session_start(session, now);
+    if (src != MOQ_OK && src != MOQ_ERR_WRONG_STATE) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        return NULL;
+    }
+    if (src == MOQ_OK && moq_pq_service(conn, now) < 0) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        return NULL;
+    }
+
+    struct moq_pq_threaded_conn *c = t->alloc.alloc(sizeof(*c), t->alloc.ctx);
+    if (!c) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        return NULL;
+    }
+    memset(c, 0, sizeof(*c));
+    c->parent = t;
+    c->cnx = cnx;
+    c->session = session;
+    c->conn = conn;
+    c->negotiated = scfg.version ? scfg.version : MOQ_VERSION_DRAFT_16;
+
+    pthread_mutex_lock(&t->mutex);
+    bool ok = server_conns_append(t, c);
+    pthread_mutex_unlock(&t->mutex);
+    if (!ok) {
+        moq_pq_conn_destroy(conn);
+        moq_session_destroy(session);
+        t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+        return NULL;
+    }
+    return c;
+}
+
+/* Service every live server connection; a per-conn failure marks it for prune
+ * (does NOT terminate the whole threaded server). Network thread; conns[] is
+ * mutated only on this thread, so no lock is needed to iterate. */
+static void server_service_all(moq_pq_threaded_t *t, uint64_t now)
+{
+    for (size_t i = 0; i < t->conn_count; i++) {
+        struct moq_pq_threaded_conn *c = t->conns[i];
+        if (c->fatal || c->close_requested) continue;
+        if (moq_pq_service(c->conn, now) < 0)
+            c->fatal = true;
+    }
+}
+
+/* True once a connection should leave iteration: app-closed, service-fatal,
+ * bridge-fatal, or cleanly closed by the peer. */
+static bool server_conn_dead(const struct moq_pq_threaded_conn *c)
+{
+    return c->close_requested || c->fatal ||
+           (c->conn && (moq_pq_conn_is_fatal(c->conn) ||
+                        moq_pq_conn_is_closed(c->conn)));
+}
+
+/* Remove dead connections after on_pump, so next_conn() stayed stable during
+ * the callback. Compaction is network-thread-only; only conn_count is
+ * published under the mutex for the cross-thread count accessor. */
+static void server_prune(moq_pq_threaded_t *t)
+{
+    size_t w = 0;
+    for (size_t r = 0; r < t->conn_count; r++) {
+        struct moq_pq_threaded_conn *c = t->conns[r];
+        if (server_conn_dead(c)) {
+            /* Close the cnx unless the peer already closed it. An app close
+             * carries its requested code; a local/service/bridge fatal carries
+             * the bridge fatal code (moq_pq_service left the cnx open). */
+            bool already_closed = c->conn && moq_pq_conn_is_closed(c->conn);
+            uint64_t code = c->close_requested
+                                ? c->close_error_code
+                                : (c->conn ? moq_pq_conn_fatal_code(c->conn) : 0);
+            server_conn_free(t, c, !already_closed, code);
+        } else
+            t->conns[w++] = c;
+    }
+    if (w != t->conn_count) {
+        pthread_mutex_lock(&t->mutex);
+        t->conn_count = w;
+        server_publish_first_locked(t);
+        pthread_mutex_unlock(&t->mutex);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -297,126 +504,39 @@ static int server_callback(picoquic_cnx_t *cnx,
     moq_pq_threaded_t *t = (moq_pq_threaded_t *)callback_ctx;
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
 
+    /* Existing record for this cnx? conns[] is mutated only on this (network)
+     * thread, so the scan needs no lock. */
+    struct moq_pq_threaded_conn *rec = NULL;
+    for (size_t i = 0; i < t->conn_count; i++)
+        if (t->conns[i]->cnx == cnx) { rec = t->conns[i]; break; }
+
     if (event == picoquic_callback_almost_ready ||
         event == picoquic_callback_ready) {
-
-        /* Reserve the connection slot under mutex. v0 supports one active
-         * server connection. */
+        /* Already accepted (almost_ready then ready both fire): benign. */
+        if (rec) return 0;
+        /* Connection cap: reject a new connection past max_connections.
+         * Returning -1 makes picoquic close the not-yet-bound cnx. */
+        if (t->conn_count >= t->max_connections)
+            return -1;
+        /* Accept: create session+adapter for THIS cnx and append a record. A
+         * per-connection accept failure rejects only this cnx (-1) -- it does
+         * NOT make the whole threaded server fatal. moq_pq_conn_create rebinds
+         * the cnx callback to moq_pq_callback(conn), so subsequent events for
+         * this cnx route straight to its own connection. */
+        struct moq_pq_threaded_conn *c = server_accept(t, cnx, now);
+        if (!c) return -1;
         pthread_mutex_lock(&t->mutex);
-        if (t->accepted_cnx) {
-            bool is_accepted = (t->accepted_cnx == cnx);
-            pthread_mutex_unlock(&t->mutex);
-            /* The accepted cnx re-firing (almost_ready then ready) is benign:
-             * it is already set up, so report success without re-creating. */
-            if (is_accepted)
-                return 0;
-            /* A *different* connection while one is already active: reject it.
-             * Returning -1 makes picoquic close the cnx (it is not yet bound
-             * to a session) — returning 0 would leave it open and unmanaged,
-             * forwarding nothing, until the transport idle timeout. */
-            return -1;
-        }
-        t->accepted_cnx = cnx;
-        pthread_mutex_unlock(&t->mutex);
-
-        moq_session_cfg_t scfg;
-        build_session_cfg(t, &scfg, MOQ_PERSPECTIVE_SERVER);
-        /* The negotiated ALPN names the session version (§13). With the
-         * legacy single default ALPN this is always draft-16; with an offer
-         * list it is whatever the select function picked. An unmappable
-         * ALPN (cannot happen for ALPNs we advertised) refuses the
-         * connection rather than guessing. */
-        {
-            const char *alpn = picoquic_tls_get_negotiated_alpn(cnx);
-            moq_version_t v = (moq_version_t)0;
-            if (alpn && moq_alpn_to_version(alpn, strlen(alpn), &v)) {
-                scfg.version = v;
-            } else if (alpn) {
-                pthread_mutex_lock(&t->mutex);
-                t->accepted_cnx = NULL;
-                pthread_mutex_unlock(&t->mutex);
-                return -1;
-            }
-        }
-
-        moq_session_t *session = NULL;
-        if (moq_session_create(&scfg, now, &session) != MOQ_OK) {
-            pthread_mutex_lock(&t->mutex);
-            t->accepted_cnx = NULL;
-            t->fatal = true;
-            t->fatal_code = 0;
-            pthread_mutex_unlock(&t->mutex);
-            mark_activity(t);
-            return -1;
-        }
-
-        moq_pq_conn_cfg_t acfg;
-        moq_pq_conn_cfg_init_sized(&acfg, sizeof(acfg));
-        acfg.session = session;
-        acfg.cnx = cnx;
-        acfg.alloc = &t->alloc;
-        moq_pq_conn_t *conn = NULL;
-        if (moq_pq_conn_create(&acfg, &conn) != 0) {
-            moq_session_destroy(session);
-            pthread_mutex_lock(&t->mutex);
-            t->accepted_cnx = NULL;
-            t->fatal = true;
-            t->fatal_code = 0;
-            pthread_mutex_unlock(&t->mutex);
-            mark_activity(t);
-            return -1;
-        }
-
-        /* Start the server session. Uni-control-pair profiles (draft-18)
-         * send their own SETUP from start -- without this the handshake
-         * never completes. A draft-16 server defines start as
-         * MOQ_ERR_WRONG_STATE (the client initiates), which is the
-         * draft-neutral no-op here. */
-        {
-            moq_result_t src = moq_session_start(session, now);
-            if (src != MOQ_OK && src != MOQ_ERR_WRONG_STATE) {
-                moq_pq_conn_destroy(conn);
-                moq_session_destroy(session);
-                pthread_mutex_lock(&t->mutex);
-                t->accepted_cnx = NULL;
-                t->fatal = true;
-                t->fatal_code = 0;
-                pthread_mutex_unlock(&t->mutex);
-                mark_activity(t);
-                return -1;
-            }
-            if (src == MOQ_OK && moq_pq_service(conn, now) < 0) {
-                moq_pq_conn_destroy(conn);
-                moq_session_destroy(session);
-                pthread_mutex_lock(&t->mutex);
-                t->accepted_cnx = NULL;
-                t->fatal = true;
-                t->fatal_code = 0;
-                pthread_mutex_unlock(&t->mutex);
-                mark_activity(t);
-                return -1;
-            }
-        }
-
-        pthread_mutex_lock(&t->mutex);
-        t->session = session;
-        t->conn = conn;
-        t->active_cnx = cnx;
-        t->negotiated = scfg.version ? scfg.version : MOQ_VERSION_DRAFT_16;
+        if (t->negotiated == 0) t->negotiated = c->negotiated;
         pthread_mutex_unlock(&t->mutex);
         mark_activity(t);
         return 0;
     }
 
-    /* Forward events for the accepted connection. */
-    pthread_mutex_lock(&t->mutex);
-    moq_pq_conn_t *conn = t->conn;
-    picoquic_cnx_t *accepted = t->accepted_cnx;
-    pthread_mutex_unlock(&t->mutex);
-
-    if (conn && cnx == accepted)
+    /* Safety net: route a non-ready event to its connection (normally already
+     * rebound to moq_pq_callback by moq_pq_conn_create). */
+    if (rec && rec->conn && !server_conn_dead(rec))
         return moq_pq_callback(cnx, stream_id, bytes, length,
-                                event, conn, stream_ctx);
+                                event, rec->conn, stream_ctx);
     return 0;
 }
 
@@ -482,6 +602,53 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
         mark_activity(t);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+    }
+
+    /* --- SERVER: service every connection, one on_pump, then prune. A
+     * per-connection failure only prunes that connection; the threaded server
+     * stays up (only endpoint-wide failures terminate the packet loop). --- */
+    if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+        uint64_t snow = picoquic_get_quic_time(quic);
+        if (t->conn_count == 0)
+            return 0;   /* no accepted connection yet: on_pump not called */
+
+        server_service_all(t, snow);
+
+        if (t->on_pump) {
+            int prc = t->on_pump(t, snow, t->on_pump_ctx);
+            if (prc != 0) {
+                pthread_mutex_lock(&t->mutex);
+                t->pump_exit = true;
+                pthread_mutex_unlock(&t->mutex);
+                mark_activity(t);
+                return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            }
+        }
+
+        server_service_all(t, snow);
+        server_prune(t);   /* safe: after on_pump returned */
+
+        /* Per-connection app-wake times (each cnx has its own deadline) and an
+         * aggregate drain state for moq_endpoint_drain(). */
+        bool all_drained = true;
+        for (size_t i = 0; i < t->conn_count; i++) {
+            struct moq_pq_threaded_conn *c = t->conns[i];
+            moq_session_t *sess = moq_pq_conn_session(c->conn);
+            if (sess) {
+                uint64_t dl = moq_session_next_deadline_us(sess);
+                picoquic_set_app_wake_time(c->cnx,
+                                            dl == UINT64_MAX ? 0 : dl);
+            }
+            if (!(picoquic_get_cnx_state(c->cnx) == picoquic_state_ready &&
+                  moq_pq_cnx_stream_backlog_empty(c->cnx)))
+                all_drained = false;
+        }
+        pthread_mutex_lock(&t->mutex);
+        t->tx_drained = all_drained;
+        pthread_mutex_unlock(&t->mutex);
+
+        mark_activity(t);
+        return 0;
     }
 
     if (!t->conn) return 0;
@@ -688,6 +855,10 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         t->recv_buffer_size = cfg->recv_buffer_size;
     if (CFG_HAS(cfg, goaway_timeout_us))
         t->goaway_timeout_us = cfg->goaway_timeout_us;
+    t->max_connections =
+        (CFG_HAS(cfg, max_connections) && cfg->max_connections)
+            ? cfg->max_connections
+            : MOQ_PQ_THREADED_DEFAULT_MAX_CONNECTIONS;
     if (CFG_HAS(cfg, insecure_skip_verify))
         t->insecure_skip_verify = cfg->insecure_skip_verify;
     if (CFG_HAS(cfg, configure_quic)) {
@@ -745,8 +916,13 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
          * whole list; without one, the legacy single draft-16 ALPN. */
         const char *default_alpn = t->alpn_count > 0 ? t->alpn_list[0]
                                                      : MOQ_PQ_ALPN_DEFAULT;
-        t->quic = picoquic_create(8, cert, key, NULL,
-            default_alpn, server_callback, t,
+        /* The transport cap must match cfg.max_connections: picoquic fixes
+         * max_nb_connections at context create (adjust can only lower it),
+         * so a smaller value here would silently override the configured
+         * cap before server_callback ever saw the connection. Fits uint32_t:
+         * sourced from the uint32_t cfg field or the 1024 default. */
+        t->quic = picoquic_create((uint32_t)t->max_connections, cert, key,
+            NULL, default_alpn, server_callback, t,
             NULL, NULL, NULL, now, NULL, NULL, NULL, 0);
         if (t->quic && t->alpn_count > 1)
             picoquic_set_alpn_select_fn_v2(t->quic, threaded_alpn_select);
@@ -1001,10 +1177,22 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
 {
     if (!t) return;
 
-    if (t->conn)
-        moq_pq_conn_destroy(t->conn);
-    if (t->session)
-        moq_session_destroy(t->session);
+    /* The network thread is already stopped and joined (moq_pq_threaded_stop),
+     * so nothing races this teardown. Server connections: destroy each record
+     * (unbinds its cnx callback); the picoquic_free below closes/deletes the
+     * cnx objects, so no ordered close is needed here. The legacy client
+     * single conn (t->conn/t->session) is a mirror of conns[0] in server mode,
+     * so only destroy it directly in client mode to avoid a double free. */
+    if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+        for (size_t i = 0; i < t->conn_count; i++)
+            server_conn_free(t, t->conns[i], false, 0);
+        t->conn_count = 0;
+    } else {
+        if (t->conn) moq_pq_conn_destroy(t->conn);
+        if (t->session) moq_session_destroy(t->session);
+    }
+    if (t->conns)
+        t->alloc.free(t->conns, t->conn_cap * sizeof(*t->conns), t->alloc.ctx);
     if (t->quic)
         picoquic_free(t->quic);
     free_alpn_list(t);
@@ -1045,6 +1233,63 @@ moq_pq_conn_t *moq_pq_threaded_conn(moq_pq_threaded_t *t)
     moq_pq_conn_t *c = t->conn;
     pthread_mutex_unlock(&t->mutex);
     return c;
+}
+
+/* -- Per-connection API (server) --------------------------------------- *
+ * next_conn / conn_session / conn_close are network-thread-only (inside
+ * on_pump), where conns[] is stable (only this thread appends/prunes, and
+ * prune runs after on_pump returns) -- so they need no lock. Off-thread (or
+ * post-teardown) callers are rejected via pq_on_network_thread() to avoid
+ * racing prune/realloc/free. conn_count is a cross-thread read, taken under
+ * the mutex. */
+
+/* True only for the picoquic loop thread. The id is published once the loop
+ * starts; the loop thread observes its own write, so it always matches. Any
+ * other thread sees the id unset or mismatched -- both reject -- so no false
+ * accept is possible and, unlike drain_state's locked check, no lock is
+ * needed here (a racy read can only produce a spurious reject, never a
+ * false accept). */
+static bool pq_on_network_thread(const moq_pq_threaded_t *t)
+{
+    return t->network_thread_id_set &&
+           pthread_equal(pthread_self(), t->network_thread_id);
+}
+
+moq_pq_threaded_conn_t *moq_pq_threaded_next_conn(moq_pq_threaded_t *t,
+                                                  moq_pq_threaded_conn_t *prev)
+{
+    if (!t || !pq_on_network_thread(t) || t->conn_count == 0) return NULL;
+    if (!prev) return t->conns[0];
+    for (size_t i = 0; i + 1 < t->conn_count; i++)
+        if (t->conns[i] == prev) return t->conns[i + 1];
+    return NULL;   /* prev was the last live conn, or is stale */
+}
+
+moq_session_t *moq_pq_threaded_conn_session(moq_pq_threaded_conn_t *conn)
+{
+    if (!conn || !pq_on_network_thread(conn->parent)) return NULL;
+    return conn->session;
+}
+
+moq_result_t moq_pq_threaded_conn_close(moq_pq_threaded_conn_t *conn,
+                                        uint64_t error_code)
+{
+    if (!conn || !pq_on_network_thread(conn->parent)) return MOQ_ERR_INVAL;
+    /* Deferred: the record is pruned (with an ordered CONNECTION_CLOSE) after
+     * the current on_pump returns, so next_conn() iteration stays valid. */
+    conn->close_requested = true;
+    conn->close_error_code = error_code;
+    return MOQ_OK;
+}
+
+size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t)
+{
+    if (!t) return 0;
+    moq_pq_threaded_t *mt = (moq_pq_threaded_t *)t;
+    pthread_mutex_lock(&mt->mutex);
+    size_t n = mt->conn_count;
+    pthread_mutex_unlock(&mt->mutex);
+    return n;
 }
 
 /* Graceful-drain probe for moq_endpoint_drain()'s backend vtable. 1 = local

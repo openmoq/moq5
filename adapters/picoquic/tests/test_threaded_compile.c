@@ -304,6 +304,138 @@ static int smoke_cli_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
     return 0;
 }
 
+/* -- Multi-connection server test (raw session on both sides) -------- *
+ * Uses raw moq_session_* (not the pub/sub facades) so there are no test-owned
+ * per-connection objects whose lifetime must be reconciled with the adapter's
+ * connection prune. Namespace "mconn" / track "vid"; NEXT_GROUP + group 0 --
+ * the proven delivery pattern from test_managed_server_loopback. */
+
+/* Per-connection server state (keyed by the opaque conn handle). sent counts
+ * groups written to this conn (0, 1, then 2 for the survivor). */
+typedef struct {
+    moq_pq_threaded_conn_t *conn;
+    moq_subscription_t      sub;
+    int                     accepted;
+    int                     sent;
+} mc_srv_conn_t;
+
+typedef struct {
+    mc_srv_conn_t conns[8];
+    int           n;
+    volatile int  may_close;    /* test arms the drop after both received */
+    int           close_done;   /* the 2nd connection has been closed */
+} mc_srv_t;
+
+static mc_srv_conn_t *mc_srv_find(mc_srv_t *s, moq_pq_threaded_conn_t *c)
+{
+    for (int i = 0; i < s->n; i++)
+        if (s->conns[i].conn == c) return &s->conns[i];
+    if (s->n < 8) {
+        memset(&s->conns[s->n], 0, sizeof(mc_srv_conn_t));
+        s->conns[s->n].conn = c;
+        return &s->conns[s->n++];
+    }
+    return NULL;
+}
+
+/* Write one object into a fresh group `group` on this connection. */
+static void mc_srv_write(moq_session_t *sess, moq_subscription_t sub,
+                         uint64_t group, uint64_t now)
+{
+    moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+    sg.group_id = group; sg.publisher_priority = 200;
+    moq_subgroup_handle_t h;
+    if (moq_session_open_subgroup(sess, sub, &sg, now, &h) < 0) return;
+    moq_rcbuf_t *b = NULL;
+    if (moq_rcbuf_create(moq_alloc_default(),
+            (const uint8_t *)SMOKE_PAYLOAD, SMOKE_PAYLOAD_LEN, &b) == MOQ_OK) {
+        (void)moq_session_write_object(sess, h, 0, b, now);
+        moq_rcbuf_decref(b);
+    }
+    moq_session_close_subgroup(sess, h, now);
+}
+
+static int mc_srv_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+{
+    mc_srv_t *s = (mc_srv_t *)ctx;
+    moq_pq_threaded_conn_t *c = NULL;
+    while ((c = moq_pq_threaded_next_conn(t, c)) != NULL) {
+        moq_session_t *sess = moq_pq_threaded_conn_session(c);
+        if (!sess) continue;
+        mc_srv_conn_t *e = mc_srv_find(s, c);
+        if (!e) continue;
+
+        moq_event_t ev[16]; size_t ne;
+        moq_session_poll_events_ex(sess, ev, 16, sizeof(moq_event_t), &ne);
+        for (size_t i = 0; i < ne; i++) {
+            if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !e->accepted) {
+                e->sub = ev[i].u.subscribe_request.sub;
+                moq_accept_subscribe_cfg_t acfg;
+                moq_accept_subscribe_cfg_init(&acfg);
+                if (moq_session_accept_subscribe(sess, e->sub, &acfg, now) >= 0)
+                    e->accepted = 1;
+            }
+            moq_event_cleanup(&ev[i]);
+        }
+
+        /* First object to every accepted connection. */
+        if (e->accepted && e->sent == 0) {
+            mc_srv_write(sess, e->sub, 0, now);
+            e->sent = 1;
+        }
+        /* After the drop, a SECOND object to the survivor (conns[0]) proves it
+         * keeps receiving. conns[0] is never the connection we close. */
+        if (s->close_done && e == &s->conns[0] && e->sent == 1) {
+            mc_srv_write(sess, e->sub, 1, now);
+            e->sent = 2;
+        }
+    }
+
+    /* Once the test arms the drop (both clients have received), close the
+     * SECOND connection (deferred prune) via the public per-connection API. */
+    if (!s->close_done && __atomic_load_n(&s->may_close, __ATOMIC_ACQUIRE) &&
+        s->n >= 2 && s->conns[0].sent >= 1 && s->conns[1].sent >= 1) {
+        moq_pq_threaded_conn_close(s->conns[1].conn, 0);
+        s->close_done = 1;
+    }
+    return 0;
+}
+
+/* Raw subscriber client: subscribe to "mconn"/"vid" and count received
+ * objects. */
+typedef struct {
+    int                 subscribed;
+    moq_subscription_t  sub;
+    volatile int        received;   /* count of objects received */
+} mc_cli_t;
+
+static int mc_cli_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+{
+    mc_cli_t *c = (mc_cli_t *)ctx;
+    moq_session_t *sess = moq_pq_threaded_session(t);
+    if (!sess) return 0;
+
+    if (!c->subscribed &&
+        moq_session_state(sess) == MOQ_SESS_ESTABLISHED) {
+        moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
+        moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("mconn") };
+        sc.track_namespace.parts = ns; sc.track_namespace.count = 1;
+        sc.track_name = MOQ_BYTES_LITERAL("vid");
+        sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        if (moq_session_subscribe(sess, &sc, now, &c->sub) >= 0)
+            c->subscribed = 1;
+    }
+
+    moq_event_t ev[16]; size_t ne;
+    moq_session_poll_events_ex(sess, ev, 16, sizeof(moq_event_t), &ne);
+    for (size_t i = 0; i < ne; i++) {
+        if (ev[i].kind == MOQ_EVENT_OBJECT_RECEIVED)
+            __atomic_add_fetch(&c->received, 1, __ATOMIC_SEQ_CST);
+        moq_event_cleanup(&ev[i]);
+    }
+    return 0;
+}
+
 /* -- Config builders ------------------------------------------------ */
 
 static void make_client_cfg(moq_pq_threaded_cfg_t *cfg,
@@ -1018,10 +1150,158 @@ int main(void)
         PASS("threaded_loopback_client_server");
     }
 
-    /* -- Server rejects a second connection (one-connection v0) --------- */
-    /* v0 supports exactly one active server connection (THREADING_DESIGN.md
-     * "Server Mode Lifecycle"). Client A connects and is accepted: server
-     * session != NULL and both pumps run — the proven-serving milestone.
+    /* -- Multi-connection server: two clients, one server --------------- */
+    /* One threaded server accepts TWO client connections (conn_count == 2),
+     * delivers an object to each, then one client disconnects and its
+     * connection is pruned (conn_count == 1) while the other keeps its
+     * delivery and the server stays non-fatal. Progress assertions only
+     * (counts + received flags) over bounded waits -- no latency checks. */
+    {
+        int server_port = 15410 + (rand() % 300);
+        mc_srv_t srv_state; memset(&srv_state, 0, sizeof(srv_state));
+        moq_pq_threaded_cfg_t srv_cfg;
+        make_server_cfg_real(&srv_cfg, moq_alloc_default());
+        srv_cfg.port = server_port;
+        srv_cfg.send_request_capacity = true;
+        srv_cfg.initial_request_capacity = 64;
+        srv_cfg.on_pump = mc_srv_pump;
+        srv_cfg.on_pump_ctx = &srv_state;
+        moq_pq_threaded_t *srv = NULL;
+        if (moq_pq_threaded_create(&srv_cfg, &srv) == MOQ_OK && srv) {
+            mc_cli_t sa = {0}, sb = {0};
+            moq_pq_threaded_cfg_t ca, cb;
+            make_client_cfg(&ca, moq_alloc_default());
+            ca.port = server_port; ca.insecure_skip_verify = true;
+            ca.send_request_capacity = true; ca.initial_request_capacity = 64;
+            ca.on_pump = mc_cli_pump; ca.on_pump_ctx = &sa;
+            cb = ca; cb.on_pump_ctx = &sb;
+
+            moq_pq_threaded_t *a = NULL, *b = NULL;
+            moq_result_t rca = moq_pq_threaded_create(&ca, &a);
+            moq_result_t rcb = moq_pq_threaded_create(&cb, &b);
+            CHECK(rca == MOQ_OK); CHECK(rcb == MOQ_OK);
+
+            if (rca == MOQ_OK && rcb == MOQ_OK && a && b) {
+                /* Both connected + both delivered their first object. Wake the
+                 * server each iteration so its pump runs even when the clients
+                 * are momentarily idle. */
+                int ok = 0;
+                for (int i = 0; i < 400 && !ok; i++) {
+                    moq_pq_threaded_wake(srv);
+                    moq_pq_threaded_wait(srv, 20000);
+                    moq_pq_threaded_wait(a, 5000);
+                    moq_pq_threaded_wait(b, 5000);
+                    ok = moq_pq_threaded_conn_count(srv) == 2 &&
+                         __atomic_load_n(&sa.received, __ATOMIC_SEQ_CST) >= 1 &&
+                         __atomic_load_n(&sb.received, __ATOMIC_SEQ_CST) >= 1;
+                }
+                CHECK(moq_pq_threaded_conn_count(srv) == 2);
+                CHECK(__atomic_load_n(&sa.received, __ATOMIC_SEQ_CST) >= 1);
+                CHECK(__atomic_load_n(&sb.received, __ATOMIC_SEQ_CST) >= 1);
+                CHECK(!moq_pq_threaded_is_fatal(srv));
+
+                /* Arm the drop only after both received, so neither is closed
+                 * before its first delivery. */
+                __atomic_store_n(&srv_state.may_close, 1, __ATOMIC_RELEASE);
+
+                /* The server closes the 2nd connection (moq_pq_threaded_conn_close
+                 * inside on_pump, deferred prune) and then delivers a SECOND
+                 * object to the survivor. Prove: conn_count drops to 1, the
+                 * survivor receives its 2nd object, and the server stays alive. */
+                int done = 0;
+                for (int i = 0; i < 400 && !done; i++) {
+                    moq_pq_threaded_wake(srv);
+                    moq_pq_threaded_wait(srv, 20000);
+                    moq_pq_threaded_wait(a, 5000);
+                    moq_pq_threaded_wait(b, 5000);
+                    int surv2 =
+                        __atomic_load_n(&sa.received, __ATOMIC_SEQ_CST) >= 2 ||
+                        __atomic_load_n(&sb.received, __ATOMIC_SEQ_CST) >= 2;
+                    done = moq_pq_threaded_conn_count(srv) == 1 && surv2;
+                }
+                CHECK(moq_pq_threaded_conn_count(srv) == 1);
+                CHECK(__atomic_load_n(&sa.received, __ATOMIC_SEQ_CST) >= 2 ||
+                      __atomic_load_n(&sb.received, __ATOMIC_SEQ_CST) >= 2);
+                CHECK(!moq_pq_threaded_is_fatal(srv));
+
+                moq_pq_threaded_stop(a);
+                moq_pq_threaded_destroy(a);
+                moq_pq_threaded_stop(b);
+                moq_pq_threaded_destroy(b);
+                b = NULL;
+            }
+            if (b) { moq_pq_threaded_stop(b); moq_pq_threaded_destroy(b); }
+            moq_pq_threaded_stop(srv);
+            moq_pq_threaded_destroy(srv);
+        }
+        PASS("server_multi_connection");
+    }
+
+    /* -- Server cap above eight is real at the transport ----------------- */
+    /* cfg.max_connections must reach picoquic_create(): picoquic fixes
+     * max_nb_connections when the context is created, and
+     * picoquic_adjust_max_connections can only lower it afterwards. If the
+     * server context were created with a smaller hardcoded transport cap
+     * (it used to be 8), connections past that cap would be refused by
+     * picoquic before server_callback ever saw them, silently contradicting
+     * the documented 1024 default. Prove the default cap is real past the
+     * old limit: TEN concurrent clients all connect (conn_count == 10) and
+     * none goes fatal. */
+    {
+        enum { MC_MANY = 10 };
+        int server_port = 15720 + (rand() % 200);
+        pump_counter_t srv_pc = { 0, 0 };
+        moq_pq_threaded_cfg_t srv_cfg;
+        make_server_cfg_real(&srv_cfg, moq_alloc_default());
+        srv_cfg.port = server_port;
+        srv_cfg.on_pump = counting_pump;
+        srv_cfg.on_pump_ctx = &srv_pc;
+        moq_pq_threaded_t *srv = NULL;
+        if (moq_pq_threaded_create(&srv_cfg, &srv) == MOQ_OK && srv) {
+            moq_pq_threaded_t *cli[MC_MANY] = { 0 };
+            pump_counter_t cli_pc[MC_MANY];
+            memset(cli_pc, 0, sizeof(cli_pc));
+            int created = 1;
+            for (int i = 0; i < MC_MANY && created; i++) {
+                moq_pq_threaded_cfg_t c;
+                make_client_cfg(&c, moq_alloc_default());
+                c.port = server_port;
+                c.insecure_skip_verify = true;
+                c.on_pump = counting_pump;
+                c.on_pump_ctx = &cli_pc[i];
+                if (moq_pq_threaded_create(&c, &cli[i]) != MOQ_OK)
+                    created = 0;
+            }
+            CHECK(created);
+
+            if (created) {
+                int ok = 0;
+                for (int i = 0; i < 600 && !ok; i++) {
+                    moq_pq_threaded_wake(srv);
+                    moq_pq_threaded_wait(srv, 20000);
+                    ok = moq_pq_threaded_conn_count(srv) == MC_MANY;
+                }
+                CHECK(moq_pq_threaded_conn_count(srv) == MC_MANY);
+                CHECK(!moq_pq_threaded_is_fatal(srv));
+                for (int i = 0; i < MC_MANY; i++)
+                    CHECK(!moq_pq_threaded_is_fatal(cli[i]));
+            }
+
+            for (int i = 0; i < MC_MANY; i++) {
+                if (!cli[i]) continue;
+                moq_pq_threaded_stop(cli[i]);
+                moq_pq_threaded_destroy(cli[i]);
+            }
+            moq_pq_threaded_stop(srv);
+            moq_pq_threaded_destroy(srv);
+        }
+        PASS("server_cap_beyond_eight_connections");
+    }
+
+    /* -- Server rejects a second connection past max_connections=1 ------ */
+    /* With the connection cap set to 1, the server accepts exactly one active
+     * connection. Client A connects and is accepted: server session != NULL
+     * and both pumps run — the proven-serving milestone.
      * Client B then connects to the SAME server while A is still active.
      * server_callback must REJECT B (return -1 → picoquic closes the cnx)
      * rather than returning success and leaving B open but unmanaged. B
@@ -1044,6 +1324,7 @@ int main(void)
             moq_pq_threaded_cfg_t srv_cfg;
             make_server_cfg_real(&srv_cfg, moq_alloc_default());
             srv_cfg.port = server_port;
+            srv_cfg.max_connections = 1;   /* cap: only client A fits */
             srv_cfg.send_request_capacity = true;
             srv_cfg.initial_request_capacity = 64;
             srv_cfg.on_pump = counting_pump;
@@ -1117,7 +1398,7 @@ int main(void)
             moq_pq_threaded_destroy(srv);
         }
         CHECK(proven);  /* rejected B against a proven-serving peer */
-        PASS("server_rejects_second_connection");
+        PASS("server_cap_rejects_second_connection");
     }
 
     /* -- Cert verifier helper rejects the self-signed server ----------- */
