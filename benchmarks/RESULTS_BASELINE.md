@@ -97,6 +97,42 @@ zero-malloc, and it counts only allocations flowing through libmoq's allocator
 (a real transport's own allocator is separate). `peak Δ` tracks object size (the
 recycled working set), not fan-out.
 
+## 4. mvfst real-transport delivery latency (gauntlet `real_transport_wall`)
+
+**Different metric class — do NOT compare to the sans-I/O numbers above.** This
+is end-to-end wall time over a real localhost direct-QUIC (moqt-16) exchange
+through the mvfst adapter, measured by the shared `moq-gauntlet` harness, not the
+in-process benchmark suite. It is recorded here to validate the **managed mvfst
+client-pump fix** (commit `2eb27bc`, which replaced the client pump's fixed 5 ms
+polling cadence with an EventBase-driven pump) — it is **not** a moxygen
+head-to-head or a general throughput claim.
+
+Localhost single-object / tiny-fanout QUIC is dominated by connection setup and
+scheduler noise, so read the **median**, and only compare rows measured in the
+same run on the same machine.
+
+```sh
+# moq-gauntlet real-transport lane (libmoq mvfst driver), 10 reps/scenario:
+scripts/run_transport_perf.sh build-transport-rel 10
+```
+
+| scenario | objects | 5 ms poll (before) | 200 µs diagnostic | EventBase pump (`2eb27bc`) |
+|----------|---------|--------------------|-------------------|----------------------------|
+| `cache_hit_single`       | 1   | 6,350,000 ns | 268,000 ns | **110,500 ns** |
+| `transport_fanout_smoke` | 6   | 1,045,000 ns | 43,000 ns  | **47,500 ns**  |
+| `transport_warm_fanout`  | 192 | 132,000 ns/obj | 7,950 ns/obj | **6,180 ns/obj** |
+
+**Read:** the fixed 5 ms client-pump cadence added a per-exchange latency floor
+that dominated small transfers (a 1-object cache hit paid ~6.35 ms of pure poll
+latency). The EventBase-driven pump removes that floor entirely — ~47–56× faster
+across the three scenarios, and slightly **better** than the temporary 200 µs
+diagnostic poll (which only proved the cause) because the event-driven path has
+no fixed interval at all. Warm fan-out settles at ~6.2 µs/object, at/under the
+diagnostic's ~8 µs/object. The `200 µs diagnostic` column is the throwaway probe
+used to localize the bottleneck; it never shipped. These are single-machine,
+indicative wall figures — re-run the lane on the target platform for real
+numbers.
+
 ## Other performance notes
 
 - **Staged-datagram replay** (`staged_replay`, session.c): a selection-sort-shaped
@@ -106,8 +142,10 @@ recycled working set), not fan-out.
   applies only to datagrams staged before a track alias binds in
   relay/forwarding scenarios; normal known-alias datagrams bypass it.
 - **No head-to-head real-QUIC benchmark** against moxygen (or any other
-  implementation) exists yet. These are sans-I/O simulation numbers; a fair
-  over-the-wire comparison is separate, future work.
+  implementation) exists yet. Sections 1–3 are sans-I/O simulation numbers;
+  section 4 is a real-transport *self*-comparison (before/after the pump fix),
+  not a cross-implementation result. A fair over-the-wire moxygen comparison is
+  separate, future work.
 
 ## Caveats
 
