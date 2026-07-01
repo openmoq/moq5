@@ -943,6 +943,13 @@ struct moq_session {
     size_t        event_head;
     size_t        event_tail;
 
+    /* A deferred early-arrival request bidi (§3.3, buffered before setup
+     * completed) hit WOULD_BLOCK during its establishment-time refeed (e.g.
+     * SETUP_COMPLETE filled a tiny event queue). No bridge retry exists for
+     * those bytes (they were accepted), so the event-drain path retries the
+     * refeed while this is set. */
+    bool          request_refeed_pending;
+
     uint8_t      *recv_buf;
     size_t        recv_cap;
     size_t        recv_len;
@@ -2272,6 +2279,11 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
                                        moq_stream_ref_t stream_ref,
                                        const uint8_t *buf, size_t len,
                                        bool fin);
+
+/* Dispatch request bidis whose bytes were buffered before establishment
+ * (§3.3 early arrival). Called by the profile when the session transitions
+ * to ESTABLISHED. */
+moq_result_t request_streams_refeed_deferred(moq_session_t *s);
 
 moq_result_t handle_bidi_stream_reset(moq_session_t *s,
                                        moq_stream_ref_t stream_ref);

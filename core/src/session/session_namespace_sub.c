@@ -964,7 +964,6 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
                                        bool fin)
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
-    if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
 
     int32_t ns_slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
                                       stream_ref._v);
@@ -975,9 +974,16 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
      * response (REQUEST_OK then NAMESPACE / NAMESPACE_DONE), established traffic,
      * and reset/stop/FIN teardown. A bidi not in the ns_sub index goes to the
      * generic request path; a fresh inbound SUBSCRIBE_NAMESPACE is handed off
-     * into the ns_sub pool from there. */
+     * into the ns_sub pool from there.
+     *
+     * This routing runs BEFORE the active-session gate: a request bidi may
+     * legally arrive before the peer's SETUP has been processed (§3.3 -- QUIC
+     * gives no cross-stream ordering), and the request path buffers such early
+     * bytes until establishment instead of rejecting them. */
     if (ns_slot < 0 && moq_session_uses_request_streams(s))
         return handle_request_stream_bytes(s, stream_ref, buf, len, fin);
+
+    if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
 
     /* Unknown stream + empty non-FIN retry → no-op. */
     if (ns_slot < 0 && len == 0 && !fin) return MOQ_OK;

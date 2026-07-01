@@ -66,7 +66,10 @@ static moq_result_t d18_maybe_complete(moq_session_t *s)
         s->state = MOQ_SESS_ESTABLISHED;
         moq_event_t e;
         d18_fill_setup_complete_event(s, &e);
-        return push_event(s, &e);
+        moq_result_t rc = push_event(s, &e);
+        if (rc < 0) return rc;
+        /* Dispatch request bidis that arrived before establishment (§3.3). */
+        return request_streams_refeed_deferred(s);
     }
     return MOQ_OK;
 }
@@ -259,8 +262,10 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
         opts.has_max_auth_token_cache_size;
     s->peer_setup.max_auth_token_cache_size = opts.max_auth_token_cache_size;
     d18->setup_received = true;
+    bool established_now = false;
     if (d18->setup_sent && s->state != MOQ_SESS_ESTABLISHED) {
         s->state = MOQ_SESS_ESTABLISHED;
+        established_now = true;
         moq_event_t e;
         d18_fill_setup_complete_event(s, &e);
         e.u.setup_complete.tokens = ev_tokens;
@@ -272,6 +277,10 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
         }
     }
     process_auth_tokens_commit_txn(s, &txn);
+    /* After the token commit (dispatched requests may reference the cache):
+     * dispatch request bidis that arrived before establishment (§3.3). */
+    if (established_now)
+        return request_streams_refeed_deferred(s);
     return MOQ_OK;
 }
 

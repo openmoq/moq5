@@ -712,6 +712,42 @@ endif()\n")
             TIMEOUT 90
             LABELS "network;pico_wt;managed")
 
+        # Namespace registration over WT: the client registers a namespace
+        # (moq_session_publish_namespace) after setup, the server observes
+        # NAMESPACE_PUBLISHED with the exact parts and accepts, the client
+        # observes NAMESPACE_ACCEPTED, then subscribes and gets the object.
+        # Guards the relay-shaped announce -> register -> subscribe flow.
+        add_test(NAME pico_wt_managed_announce
+            COMMAND test_pico_wt_managed_loopback --mode announce
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_announce PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Same registration flow at draft-18 (both sides offer moqt-18): the
+        # registration rides a request bidi that can be delivered before the
+        # peer's SETUP over real UDP (QUIC has no cross-stream ordering) — the
+        # session must buffer it until establishment (§3.3), not hard-fail.
+        add_test(NAME pico_wt_managed_announce_18
+            COMMAND test_pico_wt_managed_loopback --mode announce_18
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_announce_18 PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Plain subscribe + object at draft-18 through the managed pair over
+        # real UDP — the d18 request bidi data plane (the sim covers the
+        # deterministic ordering; this covers the real-network arrival race).
+        add_test(NAME pico_wt_managed_loopback_18
+            COMMAND test_pico_wt_managed_loopback --mode loopback_18
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_loopback_18 PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
         # WT protocol-token negotiation through the managed pair: the
         # d16-only server selects from the client's {18, 16} offer, and a
         # no-overlap offer is a deterministic refusal.

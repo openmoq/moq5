@@ -27,6 +27,14 @@
  *       capsule is timing-dependent over real threads; the capsule parse
  *       + close-code propagation are proven deterministically in
  *       test_pico_wt_loopback.)
+ *   --mode announce: server + one client; the client REGISTERS a
+ *       namespace after setup (moq_session_publish_namespace), the
+ *       server must observe NAMESPACE_PUBLISHED with the exact parts
+ *       and accept it, the client must observe NAMESPACE_ACCEPTED, and
+ *       only then subscribe and receive the object. Models a relay flow
+ *       (publisher announces, relay registers the namespace, subscriber
+ *       resolves it) — proves WT carries the registration control
+ *       messages end-to-end, not just subscribe/publish.
  *
  * Each side's MoQ work runs on its own network thread inside on_pump;
  * the main thread only creates/waits/stops/destroys and reads atomic
@@ -80,6 +88,11 @@ typedef struct {
     atomic_int published; /* set on the network thread, read by the app thread
                            * (bigobj_drain), so it must be atomic. */
     size_t big_size;   /* >0: publish [control, big] on one subgroup */
+    /* announce mode: the server must observe the client's namespace
+     * registration and accept it before anything else proceeds. */
+    int        expect_announce;
+    atomic_int saw_announce;     /* NAMESPACE_PUBLISHED surfaced */
+    atomic_int announce_ns_ok;   /* ...with the exact expected parts */
 } server_app_t;
 
 static void serve_subscribe(moq_session_t *s, moq_subscription_t sub,
@@ -144,8 +157,26 @@ static int server_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
     if (!s) return 0;
     moq_event_t ev;
     while (moq_session_poll_events(s, &ev, 1) > 0) {
-        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !atomic_load(&a->published))
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !atomic_load(&a->published)) {
             serve_subscribe(s, ev.u.subscribe_request.sub, now, a);
+        } else if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED &&
+                   a->expect_announce) {
+            /* The client's registration reached us over WT. Verify the exact
+             * namespace parts (borrowed; valid until the next advancing
+             * call), then accept so the client sees NAMESPACE_ACCEPTED. */
+            const moq_namespace_published_event_t *np =
+                &ev.u.namespace_published;
+            int ok = np->track_namespace.count == 2 &&
+                     np->track_namespace.parts[0].len == 4 &&
+                     memcmp(np->track_namespace.parts[0].data, "pico", 4) == 0 &&
+                     np->track_namespace.parts[1].len == 2 &&
+                     memcmp(np->track_namespace.parts[1].data, "wt", 2) == 0;
+            if (ok) atomic_store(&a->announce_ns_ok, 1);
+            moq_accept_namespace_cfg_t acc;
+            moq_accept_namespace_cfg_init(&acc);
+            if (moq_session_accept_namespace(s, np->ann, &acc, now) == MOQ_OK)
+                atomic_store(&a->saw_announce, 1);
+        }
         moq_event_cleanup(&ev);
     }
     return 0;
@@ -168,7 +199,30 @@ typedef struct {
     int        initiate_goaway;
     int        goaway_sent;
     int        goaway_rc;   /* moq_session_goaway() result (close mode) */
+    /* announce mode: register the namespace after setup, subscribe only
+     * once the server accepted the registration. */
+    int        do_announce;
+    int        announce_sent;
+    int        announce_rc;      /* moq_session_publish_namespace() result */
+    atomic_int ns_accepted;      /* NAMESPACE_ACCEPTED observed */
+    atomic_int ns_rejected;      /* NAMESPACE_REJECTED observed (failure) */
 } client_app_t;
+
+static void client_subscribe(moq_session_t *s, client_app_t *a)
+{
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    static const moq_bytes_t ns[] = {
+        {(const uint8_t *)"pico", 4}, {(const uint8_t *)"wt", 2}
+    };
+    sc.track_namespace.parts = ns;
+    sc.track_namespace.count = 2;
+    sc.track_name = (moq_bytes_t){(const uint8_t *)"video", 5};
+    sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+    moq_subscription_t sub;
+    if (moq_session_subscribe(s, &sc, 0, &sub) >= 0)
+        a->subscribed = 1;
+}
 
 static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
 {
@@ -178,18 +232,31 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
     moq_event_t ev;
     while (moq_session_poll_events(s, &ev, 1) > 0) {
         if (ev.kind == MOQ_EVENT_SETUP_COMPLETE && !a->subscribed) {
-            moq_subscribe_cfg_t sc;
-            moq_subscribe_cfg_init(&sc);
-            static const moq_bytes_t ns[] = {
-                {(const uint8_t *)"pico", 4}, {(const uint8_t *)"wt", 2}
-            };
-            sc.track_namespace.parts = ns;
-            sc.track_namespace.count = 2;
-            sc.track_name = (moq_bytes_t){(const uint8_t *)"video", 5};
-            sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
-            moq_subscription_t sub;
-            if (moq_session_subscribe(s, &sc, 0, &sub) >= 0)
-                a->subscribed = 1;
+            if (a->do_announce) {
+                /* Relay-flow ordering: register the namespace first; the
+                 * subscribe is issued only on NAMESPACE_ACCEPTED below. */
+                if (!a->announce_sent) {
+                    moq_publish_namespace_cfg_t nc;
+                    moq_publish_namespace_cfg_init(&nc);
+                    static const moq_bytes_t ns[] = {
+                        {(const uint8_t *)"pico", 4},
+                        {(const uint8_t *)"wt", 2}
+                    };
+                    nc.track_namespace.parts = ns;
+                    nc.track_namespace.count = 2;
+                    moq_announcement_t ann;
+                    a->announce_rc =
+                        (int)moq_session_publish_namespace(s, &nc, now, &ann);
+                    a->announce_sent = 1;
+                }
+            } else {
+                client_subscribe(s, a);
+            }
+        } else if (ev.kind == MOQ_EVENT_NAMESPACE_ACCEPTED && a->do_announce) {
+            atomic_store(&a->ns_accepted, 1);
+            if (!a->subscribed) client_subscribe(s, a);
+        } else if (ev.kind == MOQ_EVENT_NAMESPACE_REJECTED && a->do_announce) {
+            atomic_store(&a->ns_rejected, 1);
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
             if (a->expect_big > 0) {
                 /* Verify each object's length and pattern; only signal
@@ -400,18 +467,20 @@ static void wait_realtime(moq_pico_wt_managed_t *cli, client_app_t *app,
 
 /* -- scenarios ------------------------------------------------------ */
 
-static run_status_t run_loopback(const char *cert, const char *key,
-                                 int port, int timeout_sec)
+static run_status_t run_loopback_proto(const char *cert, const char *key,
+                                       int port, int timeout_sec,
+                                       const char *wt_protocols)
 {
     server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
-    moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
+    moq_pico_wt_managed_t *srv =
+        make_server_ex(cert, key, port, &sapp, wt_protocols);
     if (!srv) return RUN_RETRY;            /* bind/create — retry */
     for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
-    moq_pico_wt_managed_t *cli =
-        make_client(moq_pico_wt_managed_local_port(srv), &capp);
+    moq_pico_wt_managed_t *cli = make_client_ex2(
+        moq_pico_wt_managed_local_port(srv), &capp, 0, wt_protocols);
     if (!cli) {
         moq_pico_wt_managed_stop(srv);
         moq_pico_wt_managed_destroy(srv);
@@ -449,6 +518,79 @@ static run_status_t run_loopback(const char *cert, const char *key,
     }
     fprintf(stderr, "[loopback] port %d: no setup reached "
             "(retryable; port may be busy)\n", port);
+    return RUN_RETRY;
+}
+
+/* Namespace registration over WT: the client registers ("pico","wt") after
+ * setup; the server must surface NAMESPACE_PUBLISHED with those exact parts
+ * and accept; the client must surface NAMESPACE_ACCEPTED, then subscribe and
+ * receive the object. Guards the relay-shaped control flow (announce →
+ * register → subscribe) end-to-end over real WT — the subscribe/publish-only
+ * modes cannot catch a registration path that never reaches the peer. */
+static run_status_t run_announce(const char *cert, const char *key,
+                                 int port, int timeout_sec,
+                                 const char *wt_protocols)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    sapp.expect_announce = 1;
+    atomic_init(&sapp.saw_announce, 0);
+    atomic_init(&sapp.announce_ns_ok, 0);
+    moq_pico_wt_managed_t *srv =
+        make_server_ex(cert, key, port, &sapp, wt_protocols);
+    if (!srv) return RUN_RETRY;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    atomic_init(&capp.got_object, 0);
+    atomic_init(&capp.ns_accepted, 0);
+    atomic_init(&capp.ns_rejected, 0);
+    capp.do_announce = 1;
+    moq_pico_wt_managed_t *cli = make_client_ex2(
+        moq_pico_wt_managed_local_port(srv), &capp, 0, wt_protocols);
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    wait_for_object(cli, &capp, timeout_sec);
+
+    int got = atomic_load(&capp.got_object);
+    int cli_fatal = moq_pico_wt_managed_is_fatal(cli);
+    int srv_fatal = moq_pico_wt_managed_is_fatal(srv);
+    int fatal = cli_fatal || srv_fatal;
+    uint64_t cli_code = moq_pico_wt_managed_fatal_code(cli);
+    uint64_t srv_code = moq_pico_wt_managed_fatal_code(srv);
+
+    moq_pico_wt_managed_stop(cli);
+    int announce_attempted = capp.announce_sent;
+    int announce_rc = capp.announce_rc;
+    moq_pico_wt_managed_destroy(cli);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+
+    if (got) {
+        CHECK(announce_rc == 0);                     /* registration queued */
+        CHECK(atomic_load(&sapp.saw_announce));      /* reached the server  */
+        CHECK(atomic_load(&sapp.announce_ns_ok));    /* exact parts intact  */
+        CHECK(atomic_load(&capp.ns_accepted));       /* acceptance returned */
+        CHECK(!atomic_load(&capp.ns_rejected));
+        return RUN_OK;
+    }
+    if (announce_attempted || fatal) {
+        fprintf(stderr, "[announce] port %d HARD FAIL: announce_sent=%d "
+                "announce_rc=%d srv_saw=%d ns_ok=%d accepted=%d rejected=%d "
+                "cli_fatal=%d/0x%llx srv_fatal=%d/0x%llx got=0\n",
+                port, announce_attempted, announce_rc,
+                atomic_load(&sapp.saw_announce),
+                atomic_load(&sapp.announce_ns_ok),
+                atomic_load(&capp.ns_accepted),
+                atomic_load(&capp.ns_rejected),
+                cli_fatal, (unsigned long long)cli_code,
+                srv_fatal, (unsigned long long)srv_code);
+        return RUN_HARD;
+    }
+    fprintf(stderr, "[announce] port %d: no setup reached (retryable)\n", port);
     return RUN_RETRY;
 }
 
@@ -1050,12 +1192,17 @@ int main(int argc, char **argv)
     int bigobj = !strcmp(mode, "bigobj");
     int bigobj_smallwin = !strcmp(mode, "bigobj_smallwin");
     int bigobj_drain = !strcmp(mode, "bigobj_drain");
+    int announce = !strcmp(mode, "announce");
+    int announce_18 = !strcmp(mode, "announce_18");
+    int loopback_18 = !strcmp(mode, "loopback_18");
     if (!refuse && !close_mode && !nego && !nego_refuse && !nego_legacy &&
         !nego_legacy_18 && !no_rsa && !bigobj && !bigobj_smallwin &&
-        !bigobj_drain && strcmp(mode, "loopback") != 0) {
+        !bigobj_drain && !announce && !announce_18 && !loopback_18 &&
+        strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "nego|nego_refuse|nego_legacy|nego_legacy_18|"
-                "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain)\n", mode);
+                "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
+                "announce|announce_18|loopback_18)\n", mode);
         return 2;
     }
 
@@ -1083,7 +1230,11 @@ int main(int argc, char **argv)
            : bigobj         ? run_bigobj(cert, key, ports[i], 10, 0)
            : bigobj_smallwin ? run_bigobj(cert, key, ports[i], 10, 1)
            : bigobj_drain   ? run_bigobj_drain(cert, key, ports[i], 30)
-                            : run_loopback(cert, key, ports[i], 6);
+           : announce       ? run_announce(cert, key, ports[i], 6, NULL)
+           : announce_18    ? run_announce(cert, key, ports[i], 6, "moqt-18")
+           : loopback_18    ? run_loopback_proto(cert, key, ports[i], 6,
+                                                 "moqt-18")
+                            : run_loopback_proto(cert, key, ports[i], 6, NULL);
         if (st != RUN_RETRY) break;
     }
 

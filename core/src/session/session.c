@@ -2234,6 +2234,17 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
     if (n > 0)
         session_replay_staged(s);
 
+    /* Same freed-capacity rule for deferred early-arrival request bidis
+     * (§3.3, buffered before establishment): their establishment-time refeed
+     * can WOULD_BLOCK on a full event queue (e.g. SETUP_COMPLETE in a
+     * max_events=1 queue), and there is no bridge retry for those bytes (they
+     * were accepted) nor any guaranteed further peer activity on the stream.
+     * Newly surfaced request events appear on the next poll. A hard dispatch
+     * error closes the session inside the refeed; its CLOSED event/action
+     * surface through the normal queues. */
+    if (n > 0 && s->request_refeed_pending && session_is_active(s))
+        (void)request_streams_refeed_deferred(s);
+
     *out_count = n;
     return MOQ_OK;
 }

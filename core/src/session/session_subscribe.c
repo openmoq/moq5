@@ -862,7 +862,15 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
                                           bool fin)
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
-    if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
+    /* Early arrival (§3.3): QUIC gives no cross-stream ordering, so a request
+     * bidi can be delivered before the peer's SETUP (on its own control
+     * stream) has been processed. The spec says such streams SHOULD be
+     * buffered until setup completes -- so before the session is active the
+     * bytes are accepted into the reserved slot below but dispatch is
+     * deferred; request_streams_refeed_deferred() re-feeds every deferred
+     * slot at establishment. Rejecting here instead tears down the whole
+     * connection on a benign packet-arrival race. */
+    const bool defer_dispatch = !session_is_active(s);
 
     /* A request bidi we locally cancelled: discard any late in-flight response
      * (SUBSCRIBE_OK / FETCH_OK / REQUEST_ERROR the peer sent before seeing our
@@ -967,6 +975,10 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         e->req_recv_len += len;
     }
     if (fin) e->req_recv_fin = true;
+
+    /* Pre-setup: buffered only (bounded by req_recv_cap); dispatched by the
+     * establishment re-feed. */
+    if (defer_dispatch) return MOQ_OK;
 
     /* Dispatch buffered messages one at a time. The dispatch mode follows the
      * entry's state and role: a reserved slot receives its first request; a
@@ -1107,6 +1119,39 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         }
         /* More buffered messages remain: continue (established lifecycle). */
     }
+}
+
+/* Dispatch request bidis that buffered bytes before the session established
+ * (§3.3 early arrival, see handle_request_stream_bytes): every reserved slot
+ * still holding deferred bytes (or a deferred FIN) gets an empty re-feed, which
+ * runs the normal dispatch loop now that the session is active. Called by the
+ * profile at the moment the session transitions to ESTABLISHED, and again from
+ * the event-drain path while request_refeed_pending is set.
+ *
+ * A WOULD_BLOCK from one slot (e.g. SETUP_COMPLETE filled a tiny event queue
+ * at establishment) keeps that slot's buffer intact and latches
+ * request_refeed_pending: there is no bridge pending_retry for these bytes
+ * (they were ACCEPTED pre-establishment) and the peer may never send more on
+ * that stream, so moq_session_poll_events retries the refeed after the app
+ * drains events -- mirroring session_replay_staged. A hard error closed the
+ * session inside the dispatch; stop and report it. */
+moq_result_t request_streams_refeed_deferred(moq_session_t *s)
+{
+    s->request_refeed_pending = false;
+    for (size_t i = 0; i < s->sub_cap; i++) {
+        moq_sub_entry_t *e = &s->subs[i];
+        if (e->state != MOQ_SUB_RECVING_REQUEST) continue;
+        if (e->req_recv_len == 0 && !e->req_recv_fin) continue;
+        moq_result_t rc = handle_request_stream_bytes(
+            s, e->request_stream_ref, NULL, 0, false);
+        if (rc == MOQ_ERR_WOULD_BLOCK) {
+            s->request_refeed_pending = true;   /* retried on event drain */
+            continue;
+        }
+        if (rc < 0) return rc;
+        if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+    }
+    return MOQ_OK;
 }
 
 /* Terminate a stream-correlated request whose request bidi the peer tore down

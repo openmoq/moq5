@@ -305,6 +305,58 @@ int main(void)
         moq_session_destroy(s);
     }
 
+    /* == K. Early arrival (§3.3) + tight event queue: the deferred refeed *
+     *  retries on event drain. A request bidi delivered BEFORE the peer's
+     *  SETUP is buffered; with max_events=1 the SETUP_COMPLETE pushed at
+     *  establishment fills the only event slot, so the establishment-time
+     *  refeed WOULD_BLOCKs. There is no bridge retry for the accepted bytes
+     *  and the peer sends nothing more on the stream -- draining the event
+     *  queue must re-dispatch the deferred request, or it is stranded in
+     *  MOQ_SUB_RECVING_REQUEST forever. */
+    {
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_SERVER);
+        cfg.version = MOQ_VERSION_DRAFT_18;
+        cfg.max_events = 1;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) >= 0);
+        MOQ_TEST_CHECK(moq_session_start(s, 0) >= 0);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        /* Request bidi BEFORE the peer SETUP: accepted + buffered (§3.3). */
+        uint8_t msg[128];
+        size_t n = make_subscribe(msg, sizeof(msg), 0, "early");
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xB080);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(slot_state_for(s, ref),
+                              (int)MOQ_SUB_RECVING_REQUEST);
+
+        /* Peer SETUP establishes; SETUP_COMPLETE fills the single event
+         * slot, so the refeed defers again (no event surfaced yet). */
+        uint8_t setup[16];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, setup, sizeof(setup));
+        moq_d18_encode_setup(&w);
+        MOQ_TEST_CHECK(moq_session_on_control_bytes(
+            s, setup, moq_buf_writer_offset(&w), 1) >= 0);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK_EQ_INT(slot_state_for(s, ref),
+                              (int)MOQ_SUB_RECVING_REQUEST);
+
+        /* Drain SETUP_COMPLETE: the freed capacity re-dispatches the
+         * deferred request; SUBSCRIBE_REQUEST surfaces on the next poll. */
+        moq_event_t ev;
+        MOQ_TEST_CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.kind, (int)MOQ_EVENT_SETUP_COMPLETE);
+        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(got_subscribe_request(s));
+        moq_session_destroy(s);
+    }
+
     MOQ_TEST_PASS("d18_inbound_subscribe");
     return failures != 0;
 }
