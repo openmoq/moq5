@@ -4,6 +4,9 @@ Three sans-I/O benchmarks measuring different layers of the MoQ
 session stack. No sockets, no picoquic, no threads — pure
 encode/pump/decode performance.
 
+For current measured numbers and how to read them, see
+[`RESULTS_BASELINE.md`](RESULTS_BASELINE.md).
+
 ## moq_bench_core
 
 Single-subscriber throughput. One SimPair, one track, N objects.

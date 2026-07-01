@@ -1,66 +1,119 @@
-# Benchmark Results — Baseline (2026-05-20)
+# LibMoQ performance baseline
+
+Durable baseline from fresh local runs of the sans-I/O benchmarks, backing the
+performance claims from the reviewer comparison. These numbers are
+**indicative** — one machine, single-threaded deterministic simulation, no real
+transport. Treat the **allocation counts** and the **average** per-object
+latency as the durable signals; wall-clock throughput and **max** latency are
+scheduler-noisy and vary run to run.
 
 ## Environment
 
 | Field | Value |
 |-------|-------|
-| Commit | `c0169ec` |
-| Build | Default (no explicit `-O2`; CMake default) |
-| Compiler | Apple clang 17.0.0 (clang-1700.6.4.2) |
-| CPU | Apple M1 Max |
-| OS | macOS 15.7.3 arm64 |
-| Objects | 10000 (core) / 1000 (scaling/fanout/loopback) |
-| Object size | 1200 B |
-| Warmup | 100 (core) / 50 (others) |
+| Date | 2026-06-30 |
+| Machine | Apple M1 Max, macOS (Darwin 24.6.0), arm64 |
+| Build mode | Release (`-DCMAKE_BUILD_TYPE=Release`) |
+| Transport | none — deterministic in-process SimPair (sans-I/O core) |
 
-## moq_bench_core (1:1 throughput)
+## Build
 
-| Metric | Value |
-|--------|-------|
-| objects/sec | 415,472 |
-| Mbps | 3,804 |
-| elapsed ms | 24.07 |
-| allocs | 50,000 (5 per object) |
-| peak delta B | 3,680 |
+```sh
+cmake -B build/bench-release \
+  -DCMAKE_BUILD_TYPE=Release -DMOQ_BUILD_BENCHMARKS=ON -DMOQ_BUILD_SIM=ON
+cmake --build build/bench-release -j
+```
 
-## moq_bench_session_scale (per-session scaling)
+## 1. Single-session alias-lookup scaling (`bench_session_lookup`)
 
-| Subscribers | obj/s | Mbps | elapsed ms | cycle lat avg us | allocs | peak delta B |
-|-------------|-------|------|------------|------------------|--------|--------------|
-| 1 | 444,642 | 4,071 | 2.25 | 2.2 | 5,000 | 3,680 |
-| 4 | 440,626 | 4,034 | 9.08 | 9.0 | 20,000 | 3,680 |
-| 16 | 433,158 | 3,966 | 36.94 | 36.9 | 80,000 | 3,680 |
+Stresses the receiver-side track-alias lookup with many subscriptions on one
+session — the O(n) scan replaced by an O(1) open-addressing index
+(`idx_sub_by_alias`).
 
-## moq_bench_process_fanout (process-level fanout)
+```sh
+build/bench-release/benchmarks/moq_bench_session_lookup \
+  --mode alias --subscriptions <N> --objects 10000 --object-size 1200 \
+  --warmup 100 --json
+```
 
-| Subscribers | obj/s | Mbps | elapsed ms | cycle lat avg us | allocs | peak delta B |
-|-------------|-------|------|------------|------------------|--------|--------------|
-| 1 | 455,996 | 4,175 | 2.19 | 2.2 | 5,000 | 3,680 |
-| 4 | 449,489 | 4,115 | 8.90 | 8.9 | 20,000 | 3,680 |
-| 16 | 432,281 | 3,958 | 37.01 | 37.0 | 80,000 | 3,680 |
+| subscriptions | objects/sec | cycle latency avg (µs) | cycle latency max (µs) | allocs | peak Δ (B) |
+|---------------|-------------|------------------------|------------------------|--------|-----------|
+| 64   | 2,789,400 | 0.3 | 19 | 10000 | 1280 |
+| 256  | 2,836,879 | 0.3 | 1  | 10000 | 1280 |
+| 1024 | 2,926,544 | 0.3 | 3  | 10000 | 1280 |
+| 4096 | 2,748,008 | 0.3 | 33 | 10000 | 1280 |
 
-## moq_bench_picoquic_loopback (transport overhead)
+**Read:** *average* latency is **flat (0.3 µs) from 64 to 4096 subscriptions** —
+the alias lookup no longer scales with subscription count (O(1) index). The
+*max* column and throughput wobble are scheduler noise; the flat **avg** is the
+scaling signal. `allocs == objects` (1/object) is the datagram receive payload
+copy from the borrowed `on_datagram` buffer, which is required.
 
-| Metric | Value |
-|--------|-------|
-| objects/sec | 50,472 |
-| Mbps | 462 |
-| elapsed ms | 19.81 |
-| port | 14980 |
+## 2. Steady-state subgroup receive (`bench_session_subgroup`)
 
-## Notes
+One subscription, one subgroup opened once, N objects — isolates per-object
+receive cost with stream setup/teardown amortized out.
 
-- All sans-I/O benchmarks measure session-layer encode/pump/decode
-  cost only — no QUIC transport, no encryption, no network latency.
-- The picoquic loopback benchmark adds QUIC framing, TLS encryption,
-  and UDP socket I/O on the kernel loopback interface.
-- **Sans-I/O → transport overhead ratio: ~8.2x** (415K → 50K obj/s).
-  This is the QUIC/TLS/socket cost on loopback.
-- Throughput scales linearly with subscriber count (session_scale
-  and process_fanout are within 3% of each other — expected since
-  both use N independent SimPairs).
-- Cycle latency scales linearly at ~2.3 us/subscriber.
-- Peak memory delta is constant at 3,680 B regardless of subscriber
-  count — steady-state per-object allocation is fully reclaimed.
-- 5 allocations per object per subscriber (open_subgroup, write_object
-  header+payload, close_subgroup, receive buffer, event).
+```sh
+build/bench-release/benchmarks/moq_bench_session_subgroup \
+  --objects 10000 --object-size 1200 --warmup 100 --json
+```
+
+| objects | received | lost | objects/sec | latency avg (µs) | allocs | allocs/object | peak Δ (B) |
+|---------|----------|------|-------------|------------------|--------|---------------|-----------|
+| 10000 | 10000 | 0 | 2,458,210 | 0.4 | 10000 | **1.00** | 1280 |
+
+**Read:** **1 alloc/object** — the object is assembled directly into the
+delivered rcbuf's inline storage (no separate staging buffer, no copy at emit),
+and input staging is reused across drains. The one remaining allocation is the
+**owned, app-visible payload rcbuf** the receiver frees normally. This is
+copy-free owned delivery, **not** zero-by-default.
+
+## 3. Zero-allocation relay fan-out (`bench_relay_fanout`)
+
+One upstream publisher → relay ingest → M downstream subscribers, all on one
+simulated shard sharing an opt-in per-shard recycling allocator. The relay
+republishes the ingested rcbuf by reference (incref, no clone).
+
+```sh
+build/bench-release/benchmarks/moq_bench_relay_fanout \
+  --fanout <F> --objects 5000 --object-size <S> --warmup 200 --json
+```
+
+| fanout | object size | downstream received | lost | objects/sec | allocs after warmup | frees after warmup | peak Δ (B) |
+|--------|-------------|---------------------|------|-------------|---------------------|--------------------|-----------|
+| 1  | 64   | 5000   | 0 | 1,506,024 | **0** | **0** | 288  |
+| 1  | 1200 | 5000   | 0 | 681,013   | **0** | **0** | 2560 |
+| 8  | 64   | 40000  | 0 | 1,692,047 | **0** | **0** | 288  |
+| 8  | 1200 | 40000  | 0 | 1,008,115 | **0** | **0** | 2560 |
+| 64 | 64   | 320000 | 0 | 2,007,415 | **0** | **0** | 288  |
+| 64 | 1200 | 320000 | 0 | 878,797   | **0** | **0** | 2560 |
+
+**Read:** after warm-up the **libmoq allocator does 0 malloc / 0 free on the
+relay hot path**, across fan-out 1→64 and both object sizes, with every object
+delivered. This is via an **opt-in per-shard recycling allocator supplied
+through the existing `moq_alloc_t` seam** — it is **not** default process-wide
+zero-malloc, and it counts only allocations flowing through libmoq's allocator
+(a real transport's own allocator is separate). `peak Δ` tracks object size (the
+recycled working set), not fan-out.
+
+## Other performance notes
+
+- **Staged-datagram replay** (`staged_replay`, session.c): a selection-sort-shaped
+  min-search, but bounded by a hard `MOQ_STAGED_DG_SLOTS = 16` cap with
+  drop-oldest eviction, so worst case is ~16×16 = 256 comparisons — a fixed
+  constant, **audited out** as not a scaling concern and not peer-scalable. It
+  applies only to datagrams staged before a track alias binds in
+  relay/forwarding scenarios; normal known-alias datagrams bypass it.
+- **No head-to-head real-QUIC benchmark** against moxygen (or any other
+  implementation) exists yet. These are sans-I/O simulation numbers; a fair
+  over-the-wire comparison is separate, future work.
+
+## Caveats
+
+- Single machine, single-threaded deterministic simulation; absolute throughput
+  is indicative only. Re-run on the target platform for real figures.
+- Latency is in-process CPU time per input object, not end-to-end network
+  latency.
+- Numbers correspond to the tree at the time of writing; re-generate after
+  material receive/allocation changes.
