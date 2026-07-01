@@ -11,18 +11,14 @@ name: Publish moq5-interop-client to GHCR
 # settings so the runner (and anyone) can pull it without authentication.
 
 on:
+  # Every push to main (and version tags) rebuilds + republishes. No paths
+  # filter on purpose: a squash/force-push rewrites history, and a paths-filtered
+  # push workflow often will NOT re-run in that case (GitHub can't compute a
+  # changed-file set against the rewritten history) — which silently staled the
+  # published image. Rebuilding on every push is cheap enough for a reference impl.
   push:
     branches: [main]
     tags: ['v*']
-    paths:
-      - 'core/**'
-      - 'adapters/**'
-      - 'service/**'
-      - 'media/**'
-      - 'tools/moq-interop-client/**'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - '.github/workflows/publish-interop-client.yml'
   workflow_dispatch:
     inputs:
       picoquic_ref:
