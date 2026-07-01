@@ -1416,6 +1416,13 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     size_t idx_sub_alias_cap = moq_index_cap_for(sub_cap);
     size_t off_idx_sub_alias = ALIGN_UP(off_idx_reqref + idx_reqref_bytes, idx_align);
     size_t idx_sub_alias_bytes = idx_sub_alias_cap * sizeof(moq_index_entry_t);
+    /* The per-stream receive buffers that follow (ns_recv and the *_req_recv
+     * groups) are sized as `count * ns_sub_recv_cap` byte products WITHOUT an
+     * explicit division-overflow check, unlike the struct-array segments above.
+     * That is safe by construction: every entry count is capped at <= 0xFFFF and
+     * ns_sub_recv_cap is <= 4096 (both bounded above), so each product is
+     * <= ~256 MiB and cannot overflow size_t on any target. The monotonic-order
+     * checks in the cross-check block below also catch any additive wrap. */
     size_t off_ns_recv = off_idx_sub_alias + idx_sub_alias_bytes;
     size_t ns_recv_bytes = ns_sub_cap * ns_sub_recv_cap;
     /* Per-subscription request-stream receive buffers (stream-correlated
@@ -1467,6 +1474,14 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 
 #undef ALIGN_UP
 
+    /* Layout-discipline gate: reject any capacity or offset that would overflow
+     * or break monotonicity BEFORE allocating. Struct-array segments verify the
+     * `count * elem_size` multiplication (bytes/elem == cap); every segment
+     * verifies its offset does not run backwards (an additive wrap); the total is
+     * capped at 64 MiB. RULE: any NEW arena segment added above MUST also be
+     * added here (its order check, plus a mult check if it is a struct array) --
+     * otherwise the layout discipline is incomplete and a bad cap could silently
+     * under-size a region. */
     if (act_bytes / sizeof(moq_action_t) != action_cap ||
         evt_bytes / sizeof(moq_event_t)  != event_cap  ||
         sub_bytes / sizeof(moq_sub_entry_t) != sub_cap ||
