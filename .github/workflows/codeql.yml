@@ -1,0 +1,43 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Weekly drift check so analysis still runs without PR activity.
+    - cron: '23 4 * * 1'
+
+jobs:
+  analyze:
+    name: Analyze (c-cpp)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      # Manual build of the `default` preset (core + sim + tests, no external
+      # QUIC adapters) so CodeQL analyzes exactly what devs build and cannot
+      # pull in picoquic/mvfst/proxygen. Default query suite for now.
+      - name: Build
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake --preset default
+          cmake --build build
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp

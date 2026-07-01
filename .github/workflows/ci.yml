@@ -1,0 +1,311 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-and-test:
+    name: Build + Test (${{ matrix.preset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `dir` is the preset's binaryDir (kept explicit so the build/test
+        # steps don't need per-preset expressions). No adapters in any of
+        # these presets - they need external QUIC deps (separate CI lane).
+        include:
+          - os: ubuntu-latest
+            preset: default
+            dir: build
+            cc: clang
+            cxx: clang++
+          - os: ubuntu-latest
+            preset: nosim
+            dir: build/nosim
+            cc: clang
+            cxx: clang++
+          - os: ubuntu-latest
+            preset: shared
+            dir: build/shared
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            preset: default
+            dir: build
+            cc: clang
+            cxx: clang++
+          - os: ubuntu-latest
+            preset: default
+            dir: build
+            cc: gcc
+            cxx: g++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build ${{ matrix.dir }}
+
+      - name: Test
+        run: ctest --test-dir ${{ matrix.dir }} --output-on-failure
+
+  swift-binding:
+    name: Swift Binding (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Default Swift build: SwiftPM compiles the in-tree C core + media
+      # sources directly (no CMake/install step needed). Transport targets
+      # are gated behind MOQ_TRANSPORT=1 and are intentionally NOT
+      # exercised here - they need installed adapters + pkg-config, which
+      # is a separate, later task.
+      - name: Buffer Sendable contract guard
+        run: scripts/check_swift_buffer_sendable.sh
+
+      - name: Swift test
+        run: swift test
+
+  cpp-binding:
+    name: C++ Binding (Linux)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `cppbind` preset (inherits rc-static: core + sim + media, no
+      # external QUIC adapters) enables MOQ_BUILD_CPP_BINDING and MOQ_BUILD_MSF
+      # so the full cpp_* suite -- including the MSF/CMSF binding parity tests
+      # (cpp_msf) -- is built and run. Kept separate from build-and-test
+      # because the binding has its own preset and test surface.
+      - name: Configure
+        run: cmake --preset cppbind
+
+      - name: Build
+        run: cmake --build build/cppbind
+
+      - name: Test (C++ binding suite)
+        run: ctest --test-dir build/cppbind --output-on-failure -R '^cpp_'
+
+  picoquic-adapter:
+    name: picoquic adapter (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
+
+      # Pinned picoquic + picotls (scripts/setup_picoquic_deps.sh). Appends
+      # MOQ_PICOQUIC_SOURCE_DIR / MOQ_PICOTLS_PREFIX to $GITHUB_ENV so the
+      # configure step sees them. Raw picoquic only - no mvfst/proxygen/
+      # pico_wt. Consumer/install-consumer packaging is tested in a
+      # separate step below.
+      - name: Set up pinned picoquic/picotls
+        run: scripts/setup_picoquic_deps.sh
+
+      - name: Configure
+        run: >
+          cmake -B build/pq-ci
+          -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
+          -DMOQ_BUILD_PQ_THREADED=ON
+          -DMOQ_BUILD_TESTS=ON
+          -DMOQ_WARNINGS_AS_ERRORS=ON
+          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
+          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+        env:
+          CC: clang
+          CXX: clang++
+
+      - name: Build
+        run: cmake --build build/pq-ci
+
+      - name: Test (in-process adapter subset)
+        run: >
+          ctest --test-dir build/pq-ci --output-on-failure
+          -R '^(pq_conformance|adapter_backpressure|threaded_compile|scenario_backpressure|scenario_delay_backpressure)$'
+
+      # Cold-consumer / packaging tier (kept separate so a packaging
+      # failure is distinguishable from an adapter-behavior failure).
+      # Each builds a small consumer against the build/install tree.
+      - name: Test (consumer + install-consumer packaging)
+        run: >
+          ctest --test-dir build/pq-ci --output-on-failure
+          -R '^(adapter_consumer|adapter_threaded_consumer|adapter_threaded_install_consumer)$'
+
+  pico-wt-adapter:
+    name: pico_wt adapter (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
+
+      # Same pinned picoquic/picotls as the raw adapter lane, but this job
+      # exercises the HTTP/3 + WebTransport surface: MOQ_BUILD_ADAPTER_PICO_WT
+      # induces BUILD_HTTP=ON (picohttp-core) via FindPicoquic, and
+      # MOQ_PICO_WT_BUILD_LOOPBACK builds picoquic-test for the deterministic
+      # loopback/conformance sim. No mvfst, no proxygen, no managed helper.
+      # Kept separate from picoquic-adapter so a WebTransport failure stays
+      # distinct from a raw-adapter/packaging failure.
+      - name: Set up pinned picoquic/picotls
+        run: scripts/setup_picoquic_deps.sh
+
+      - name: Configure
+        run: >
+          cmake -B build/pico-wt-ci
+          -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
+          -DMOQ_BUILD_ADAPTER_PICO_WT=ON
+          -DMOQ_PICO_WT_BUILD_LOOPBACK=ON
+          -DMOQ_BUILD_TESTS=ON
+          -DMOQ_WARNINGS_AS_ERRORS=ON
+          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
+          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+        env:
+          CC: clang
+          CXX: clang++
+
+      - name: Build
+        run: cmake --build build/pico-wt-ci
+
+      # The 0x10 hard-failure teardown regression lives in pico_wt_loopback;
+      # pico_wt_conformance covers the WebTransport scenario suite and
+      # pico_wt_public_compile proves the standalone public header.
+      - name: Test (pico_wt regression + conformance)
+        run: >
+          ctest --test-dir build/pico-wt-ci --output-on-failure
+          -R '^(pico_wt_public_compile|pico_wt_loopback|pico_wt_conformance)$'
+
+  sanitizers:
+    name: Sanitizers (ASan/UBSan/LSan, core)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+      # UBSAN defaults to print-and-continue; halt so undefined behavior
+      # actually fails CI. Leak detection is now enabled on Linux (LSan rides
+      # the same ASan build at exit time, ~no extra cost). The `asan` preset
+      # enables no external transport adapters (core/media/sim only).
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      ASAN_OPTIONS: detect_leaks=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset asan
+
+      - name: Build
+        run: cmake --build build/asan
+
+      - name: Test
+        run: ctest --test-dir build/asan --output-on-failure
+
+  fuzz-smoke:
+    name: Fuzz Smoke (libFuzzer)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer needs Clang's compiler-rt fuzzer runtime. Install it
+      # explicitly so the lane is deterministic rather than depending on
+      # whatever the runner image ships; keeps the gate green without
+      # weakening MOQ_REQUIRE_FUZZ below. No external QUIC deps.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      # MOQ_REQUIRE_FUZZ=ON is passed CI-only (NOT in CMakePresets) so a
+      # missing Clang/libFuzzer is a hard FATAL_ERROR here instead of a
+      # silent skip, while local Apple-clang dev (no libFuzzer) is
+      # unaffected. Core+sim only - no transport adapters.
+      - name: Configure
+        run: >
+          cmake -B build/fuzz-ci
+          -DMOQ_BUILD_FUZZ=ON
+          -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_SIM=ON
+          -DMOQ_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build/fuzz-ci
+
+      # Smoke only: -runs=1 startup checks + -runs=0 corpus replays
+      # (seconds). Long fuzzing is deferred to nightly/OSS-Fuzz.
+      - name: Test (fuzz smoke + corpus)
+        run: ctest --test-dir build/fuzz-ci -R '^fuzz_' --output-on-failure
+
+  hardening:
+    name: Hardening (FORTIFY/stack-protector, Linux)
+    runs-on: ubuntu-latest
+    env:
+      # gcc has the most mature _FORTIFY_SOURCE=3 + -fstack-clash-protection.
+      # Pin both CC and CXX so C++ targets don't silently fall back to a
+      # different compiler. These flags are Linux/glibc/ELF-specific - they are
+      # no-ops or unsupported on macOS, so this lane is Linux-only and the flags
+      # are passed CI-only (never in CMakePresets, which local mac dev uses).
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mirror the asan lane's mechanism: hardening via configure-time
+      # CMAKE_*_FLAGS (build-tree-local globals), so nothing leaks into the
+      # installed/exported consumer interfaces. -O2 is required for FORTIFY.
+      # Core/media/sim/tests only - no external QUIC adapters.
+      - name: Configure
+        run: >
+          cmake -B build/harden
+          -DMOQ_BUILD_SIM=ON
+          -DMOQ_BUILD_TESTS=ON
+          -DMOQ_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS="-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection"
+          -DCMAKE_CXX_FLAGS="-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection"
+          -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,relro,-z,now"
+
+      - name: Build
+        run: cmake --build build/harden
+
+      # Run under the hardening flags: FORTIFY and the stack protectors are
+      # runtime checks, so executing the suite is where the payoff is.
+      - name: Test
+        run: ctest --test-dir build/harden --output-on-failure
+
+  boundary-checks:
+    name: Boundary Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: API boundary
+        run: scripts/check_api_boundary.sh
+      - name: Profile boundary
+        run: scripts/check_profile_boundary.sh
+
+  seed-sweep-quick:
+    name: Seed Sweep (quick)
+    runs-on: ubuntu-latest
+    needs: [build-and-test, boundary-checks]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure + Build
+        run: |
+          cmake --preset default
+          cmake --build build
+
+      - name: Quick seed sweep
+        run: scripts/run_seed_sweeps.sh --profile quick

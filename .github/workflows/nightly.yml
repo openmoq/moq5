@@ -1,0 +1,26 @@
+name: Nightly Seed Sweep
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 06:00 UTC daily
+  workflow_dispatch:       # manual trigger
+
+jobs:
+  seed-sweep-standard:
+    name: Seed Sweep (standard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure + Build (normal)
+        run: |
+          cmake --preset default
+          cmake --build build
+
+      - name: Configure + Build (ASan)
+        run: |
+          cmake --preset asan
+          cmake --build build/asan
+
+      - name: Standard seed sweep
+        run: scripts/run_seed_sweeps.sh --profile standard

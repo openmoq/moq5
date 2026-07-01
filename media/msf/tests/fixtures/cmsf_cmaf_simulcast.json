@@ -1,0 +1,74 @@
+{
+  "version": "1",
+  "generatedAt": 1746104606044,
+  "tracks": [
+    {
+      "name": "hd",
+      "packaging": "cmaf",
+      "isLive": true,
+      "role": "video",
+      "renderGroup": 1,
+      "altGroup": 1,
+      "initRef": "init-hd",
+      "codec": "avc1.640028",
+      "width": 1920,
+      "height": 1080,
+      "bitrate": 5000000,
+      "framerate": 30
+    },
+    {
+      "name": "md",
+      "packaging": "cmaf",
+      "isLive": true,
+      "role": "video",
+      "renderGroup": 1,
+      "altGroup": 1,
+      "initRef": "init-md",
+      "codec": "avc1.64001e",
+      "width": 720,
+      "height": 640,
+      "bitrate": 3000000,
+      "framerate": 30
+    },
+    {
+      "name": "sd",
+      "packaging": "cmaf",
+      "isLive": true,
+      "role": "video",
+      "renderGroup": 1,
+      "altGroup": 1,
+      "initRef": "init-sd",
+      "codec": "avc1.64000d",
+      "width": 192,
+      "height": 144,
+      "bitrate": 500000,
+      "framerate": 30
+    },
+    {
+      "name": "audio",
+      "packaging": "cmaf",
+      "isLive": true,
+      "role": "audio",
+      "renderGroup": 1,
+      "initRef": "init-audio",
+      "codec": "mp4a.40.5",
+      "samplerate": 48000,
+      "channelConfig": "2",
+      "bitrate": 67071
+    },
+    {
+      "name": "sap-timeline",
+      "packaging": "eventtimeline",
+      "isLive": true,
+      "eventType": "org.ietf.moq.cmsf.sap",
+      "mimeType": "application/json",
+      "depends": ["hd", "md", "sd", "audio"]
+    }
+  ],
+  "initDataList": [
+    { "id": "init-hd", "type": "inline", "data": "AAAB" },
+    { "id": "init-md", "type": "inline", "data": "AAAC" },
+    { "id": "init-sd", "type": "inline", "data": "AAAD" },
+    { "id": "init-audio", "type": "inline", "data": "AAAE" }
+  ]
+}

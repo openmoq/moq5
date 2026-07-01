@@ -1,0 +1,23 @@
+# pkg-config for the picoquic WebTransport attach adapter (<moq/pico_wt.h>).
+#
+# Relocatable: prefix is derived from this file's own location, so it is
+# correct regardless of the install --prefix. The up-path is computed
+# from CMAKE_INSTALL_LIBDIR depth, so lib, lib64, and multiarch dirs like
+# lib/x86_64-linux-gnu all resolve to ${prefix} correctly.
+#
+# picoquic ships no pkg-config file, so its libraries (picohttp-core,
+# picoquic-core/log) and picotls + OpenSSL are embedded directly here.
+# picotls and OpenSSL are NOT installed into ${prefix}; their absolute
+# lib dirs are baked at libmoq configure time — the same relocatability
+# caveat the picoquic CMake package and libmoq.pc already carry. Static
+# library: everything needed is in public Libs so a plain `--libs`
+# (without --static) links a standalone consumer.
+prefix=${pcfiledir}/@LIBMOQ_PICOWT_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq-pico-wt
+Description: libmoq picoquic WebTransport adapter, attach mode (<moq/pico_wt.h>)
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lmoq-adapter-pico-wt -lmoq-core -lpicohttp-core -lpicoquic-core -lpicoquic-log @LIBMOQ_PICOWT_PTLS_LDFLAG@ -lpicotls-openssl -lpicotls-core -lpicotls-minicrypto @LIBMOQ_PICOWT_SSL_LDFLAG@ -lssl -lcrypto -lpthread
+Cflags: -I${includedir}

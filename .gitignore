@@ -1,0 +1,16 @@
+build/
+build-*/
+.build/
+.deps/
+.swiftpm/
+compile_commands.json
+CMakeUserPresets.json
+.cache/
+.tmp.dprobes.h
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+.idea/
+.DS_Store

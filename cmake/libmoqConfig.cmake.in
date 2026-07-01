@@ -1,0 +1,234 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+include("${CMAKE_CURRENT_LIST_DIR}/libmoqTargets.cmake")
+
+# Optional adapter component — loaded only when explicitly requested
+# via find_package(libmoq COMPONENTS adapter-picoquic).
+if("adapter-picoquic" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND FALSE)
+    else()
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        find_dependency(OpenSSL)
+        find_dependency(Picoquic)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND TRUE)
+    endif()
+endif()
+
+# Optional threaded adapter component.
+if("adapter-picoquic-threaded" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterThreadedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic-threaded_FOUND FALSE)
+    else()
+        # Ensure base adapter is loaded first.
+        if(NOT ${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND)
+            if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+                list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+                find_dependency(OpenSSL)
+                find_dependency(Picoquic)
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+                set(${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND TRUE)
+            endif()
+        endif()
+        find_dependency(Threads)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterThreadedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic-threaded_FOUND TRUE)
+    endif()
+endif()
+
+# Optional mvfst adapter component.
+if("adapter-mvfst" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND FALSE)
+    else()
+        include(CheckLanguage)
+        check_language(CXX)
+        if(NOT CMAKE_CXX_COMPILER)
+            message(FATAL_ERROR "adapter-mvfst requires a C++ compiler")
+        endif()
+        enable_language(CXX)
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        find_dependency(mvfst CONFIG)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND TRUE)
+    endif()
+endif()
+
+# Optional proxygen WebTransport adapter component.
+if("adapter-proxygen-wt" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-proxygen-wt_FOUND FALSE)
+    else()
+        include(CheckLanguage)
+        check_language(CXX)
+        if(NOT CMAKE_CXX_COMPILER)
+            message(FATAL_ERROR "adapter-proxygen-wt requires a C++ compiler")
+        endif()
+        enable_language(CXX)
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        find_dependency(proxygen CONFIG)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-proxygen-wt_FOUND TRUE)
+    endif()
+endif()
+
+# Optional managed proxygen WebTransport client facade component. Loads the
+# attach target first (the managed library links it).
+if("adapter-proxygen-wt-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-proxygen-wt-managed_FOUND FALSE)
+    else()
+        include(CheckLanguage)
+        check_language(CXX)
+        if(NOT CMAKE_CXX_COMPILER)
+            message(FATAL_ERROR "adapter-proxygen-wt-managed requires a C++ compiler")
+        endif()
+        enable_language(CXX)
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        find_dependency(proxygen CONFIG)
+        if(NOT TARGET moq::adapter-proxygen-wt)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtTargets.cmake")
+        endif()
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-proxygen-wt-managed_FOUND TRUE)
+    endif()
+endif()
+
+# Optional pico WT adapter component.
+if("adapter-pico-wt" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND FALSE)
+    else()
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        find_dependency(OpenSSL)
+        find_dependency(Picoquic)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND TRUE)
+    endif()
+endif()
+
+# Optional pico WT managed component (experimental). The managed
+# imported target links moq::adapter-pico-wt, so the attach component is
+# a hard dependency: load it first (if the consumer did not request it
+# explicitly), and only mark managed found once that target is available.
+if("adapter-pico-wt-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt-managed_FOUND FALSE)
+    else()
+        if(NOT ${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND
+           AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
+            list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+            find_dependency(OpenSSL)
+            find_dependency(Picoquic)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
+            set(${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND TRUE)
+        endif()
+        # The managed client installs the default cert verifier from the base
+        # picoquic adapter, so it is a hard dependency too. Load it (if the
+        # consumer did not request it explicitly) so the managed imported
+        # target's moq::adapter-picoquic reference resolves.
+        if(NOT TARGET moq::adapter-picoquic
+           AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+            list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+            find_dependency(OpenSSL)
+            find_dependency(Picoquic)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+            set(${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND TRUE)
+        endif()
+        if(TARGET moq::adapter-pico-wt AND TARGET moq::adapter-picoquic)
+            find_dependency(Threads)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtManagedTargets.cmake")
+            set(${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt-managed_FOUND TRUE)
+        else()
+            # A required adapter (attach or base picoquic) is unavailable →
+            # managed cannot resolve.
+            set(${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt-managed_FOUND FALSE)
+        endif()
+    endif()
+endif()
+
+# Optional service component (endpoint + media receiver/sender tier). The
+# service imported target carries its facade deps as link-only interface
+# libraries (static build), so load whichever managed facades were built
+# before marking it found; moq::core / moq::msf / media come from the main
+# libmoqTargets export already loaded above.
+if("service" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_service_FOUND FALSE)
+    else()
+        find_dependency(Threads)
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        # RAW_QUIC facade: pull in the threaded adapter (and its picoquic
+        # base) if it was installed.
+        if(NOT TARGET moq::adapter-picoquic-threaded AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterThreadedTargets.cmake")
+            if(NOT TARGET moq::adapter-picoquic AND
+               EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+                find_dependency(OpenSSL)
+                find_dependency(Picoquic)
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+            endif()
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterThreadedTargets.cmake")
+        endif()
+        # WEBTRANSPORT facade: pull in the pico-wt managed adapter (and its
+        # attach base) if it was installed.
+        if(NOT TARGET moq::adapter-pico-wt-managed AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtManagedTargets.cmake")
+            if(NOT TARGET moq::adapter-pico-wt AND
+               EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
+                find_dependency(OpenSSL)
+                find_dependency(Picoquic)
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
+            endif()
+            if(NOT TARGET moq::adapter-picoquic AND
+               EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+                find_dependency(OpenSSL)
+                find_dependency(Picoquic)
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake")
+            endif()
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtManagedTargets.cmake")
+        endif()
+        # RAW_QUIC-over-mvfst facade: pull in the mvfst adapter (C++/folly/fizz)
+        # if it was installed. CMake-only -- the folly stack ships no
+        # pkg-config, which is why this backend is absent from libmoq-service.pc.
+        if(NOT TARGET moq::adapter-mvfst AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
+            include(CheckLanguage)
+            check_language(CXX)
+            if(NOT CMAKE_CXX_COMPILER)
+                message(FATAL_ERROR
+                    "libmoq service was built with the mvfst backend; "
+                    "linking it requires a C++ compiler")
+            endif()
+            enable_language(CXX)
+            find_dependency(mvfst CONFIG)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
+        endif()
+        # WEBTRANSPORT-over-proxygen facade: pull in the managed proxygen
+        # adapter (and its attach base, which it links) if installed. CMake-only
+        # -- folly stack has no pkg-config, so it is absent from the .pc.
+        if(NOT TARGET moq::adapter-proxygen-wt-managed AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake")
+            include(CheckLanguage)
+            check_language(CXX)
+            if(NOT CMAKE_CXX_COMPILER)
+                message(FATAL_ERROR
+                    "libmoq service was built with the proxygen backend; "
+                    "linking it requires a C++ compiler")
+            endif()
+            enable_language(CXX)
+            find_dependency(proxygen CONFIG)
+            if(NOT TARGET moq::adapter-proxygen-wt)
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtTargets.cmake")
+            endif()
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake")
+        endif()
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_service_FOUND TRUE)
+    endif()
+endif()
+
+check_required_components(libmoq)

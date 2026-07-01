@@ -1,0 +1,21 @@
+# Installed pico WT managed target — relocatable via prefix detection.
+# File lands at <prefix>/lib/cmake/libmoq/, so four PATH ascents reach
+# the install prefix. Link interface is the attach adapter + the base
+# picoquic adapter (for the default cert verifier the managed client now
+# installs) + Threads; moq::core / picoquic / picohttp / OpenSSL arrive
+# transitively through those (cf. picoquic-threaded). libmoqConfig loads
+# moq::adapter-picoquic before this file so the reference resolves.
+get_filename_component(_PICOWTM_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_PICOWTM_PREFIX "${_PICOWTM_PREFIX}" PATH)
+get_filename_component(_PICOWTM_PREFIX "${_PICOWTM_PREFIX}" PATH)
+get_filename_component(_PICOWTM_PREFIX "${_PICOWTM_PREFIX}" PATH)
+
+if(NOT TARGET moq::adapter-pico-wt-managed)
+  add_library(moq::adapter-pico-wt-managed @_picowtm_lib_type@ IMPORTED)
+  set_target_properties(moq::adapter-pico-wt-managed PROPERTIES
+    IMPORTED_LOCATION "${_PICOWTM_PREFIX}/@_picowtm_libdir@/@_picowtm_lib_name@"
+    INTERFACE_INCLUDE_DIRECTORIES "${_PICOWTM_PREFIX}/@_picowtm_incdir@"
+    INTERFACE_LINK_LIBRARIES "moq::adapter-pico-wt;moq::adapter-picoquic;Threads::Threads")
+endif()
+
+unset(_PICOWTM_PREFIX)

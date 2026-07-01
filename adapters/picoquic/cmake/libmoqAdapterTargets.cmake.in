@@ -1,0 +1,29 @@
+# Installed adapter target — relocatable via prefix detection.
+get_filename_component(_ADAPTER_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_ADAPTER_PREFIX "${_ADAPTER_PREFIX}" PATH)
+get_filename_component(_ADAPTER_PREFIX "${_ADAPTER_PREFIX}" PATH)
+get_filename_component(_ADAPTER_PREFIX "${_ADAPTER_PREFIX}" PATH)
+
+if(NOT TARGET moq::adapter-picoquic)
+  # picoquic-core and picoquic-log are mutually dependent static archives
+  # (core -> picoquic_set_qlog in log; log -> picoquic_frame_name etc. in
+  # core). A single-pass linker (GNU ld) must scan them as a group for both
+  # directions to resolve. CMake auto-repeats archives only for real targets
+  # in a build graph, not these imported ones, so libmoq's exported interface
+  # encodes the group explicitly. macOS ld64 and other multi-pass linkers take
+  # the plain list. Evaluated at consumer configure time (CMAKE_SYSTEM_NAME is
+  # the consumer's platform).
+  set(_libmoq_pq_link "@_adapter_pq_target@@_adapter_pq_log@")
+  if(@_adapter_pq_grouped@ AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_libmoq_pq_link
+      "-Wl,--start-group;@_adapter_pq_target@@_adapter_pq_log@;-Wl,--end-group")
+  endif()
+  add_library(moq::adapter-picoquic @_adapter_lib_type@ IMPORTED)
+  set_target_properties(moq::adapter-picoquic PROPERTIES
+    IMPORTED_LOCATION "${_ADAPTER_PREFIX}/@_adapter_libdir@/@_adapter_lib_name@"
+    INTERFACE_INCLUDE_DIRECTORIES "${_ADAPTER_PREFIX}/@_adapter_incdir@"
+    INTERFACE_LINK_LIBRARIES "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_libmoq_pq_link}")
+  unset(_libmoq_pq_link)
+endif()
+
+unset(_ADAPTER_PREFIX)

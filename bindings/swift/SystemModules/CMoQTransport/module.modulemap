@@ -1,0 +1,4 @@
+module CMoQTransport [system] {
+    header "shim.h"
+    export *
+}

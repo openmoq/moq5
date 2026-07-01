@@ -1,0 +1,38 @@
+{
+  "version": "1",
+  "generatedAt": 1746104606044,
+  "contentProtections": [
+    {
+      "refID": "1",
+      "defaultKID": ["01234567-89ab-cdef-0123-456789abcdef"],
+      "scheme": "cenc",
+      "drmSystem": {
+        "systemID": "1077efec-c0b2-4d02-ace3-3c1e52e2fb4b",
+        "laURL": {
+          "url": "https://clearkey-server.example.com/clearkey",
+          "type": "EME-1.0"
+        },
+        "pssh": "AAAANHBzc2gBAAAAEHfv7MCyTQKs4"
+      }
+    }
+  ],
+  "tracks": [
+    {
+      "name": "video",
+      "packaging": "cmaf",
+      "isLive": true,
+      "role": "video",
+      "renderGroup": 1,
+      "initRef": "init-video",
+      "codec": "avc1.640028",
+      "framerate": 30,
+      "bitrate": 5000000,
+      "width": 1920,
+      "height": 1080,
+      "contentProtectionRefIDs": ["1"]
+    }
+  ],
+  "initDataList": [
+    { "id": "init-video", "type": "inline", "data": "AAAB" }
+  ]
+}

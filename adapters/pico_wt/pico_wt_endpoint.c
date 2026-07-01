@@ -1,0 +1,191 @@
+/*
+ * pico_wt_endpoint.c — Picoquic WebTransport endpoint ops.
+ *
+ * Implements moq_transport_endpoint_ops_t by forwarding to
+ * picoquic's h3zero/picohttp WebTransport API.
+ *
+ * Push-based writes: picoquic_add_to_stream() queues internally
+ * and sets is_active=0, so picohttp_callback_provide_data never
+ * fires for our streams.
+ *
+ * Datagram bridge: push send_datagram() buffers one datagram;
+ * the pull provide_datagram callback flushes it. Single-slot,
+ * lossy — excess datagrams are DROPPED.
+ */
+
+#include "pico_wt_endpoint.h"
+#include <string.h>
+#include <stddef.h>
+
+/* -- Endpoint ops --------------------------------------------------- */
+
+static moq_transport_result_t ep_open_uni(void *ctx, uint64_t *out_id)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    h3zero_stream_ctx_t *sc = picowt_create_local_stream(
+        ep->cnx, 0, ep->h3_ctx, ep->control_stream_id);
+    if (!sc) return MOQ_TRANSPORT_ERROR;
+    sc->path_callback = ep->app_callback;
+    sc->path_callback_ctx = ep->app_callback_ctx;
+    *out_id = sc->stream_id;
+    if (ep->on_uni_opened)
+        ep->on_uni_opened(ep->cb_ctx, sc->stream_id);
+    return MOQ_TRANSPORT_OK;
+}
+
+static moq_transport_result_t ep_open_bidi(void *ctx, uint64_t *out_id)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    h3zero_stream_ctx_t *sc = picowt_create_local_stream(
+        ep->cnx, 1, ep->h3_ctx, ep->control_stream_id);
+    if (!sc) return MOQ_TRANSPORT_ERROR;
+    sc->path_callback = ep->app_callback;
+    sc->path_callback_ctx = ep->app_callback_ctx;
+    *out_id = sc->stream_id;
+    if (ep->on_bidi_opened)
+        ep->on_bidi_opened(ep->cb_ctx, sc->stream_id);
+    return MOQ_TRANSPORT_OK;
+}
+
+static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
+                                        const uint8_t *data, size_t len,
+                                        bool fin)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    int rc = picoquic_add_to_stream(ep->cnx, stream_id, data, len,
+                                     fin ? 1 : 0);
+    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
+                                        uint64_t error_code)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, stream_id);
+    if (!sc) {
+        /* Stream unknown to h3zero — try raw QUIC reset as fallback */
+        int rc = picoquic_reset_stream(ep->cnx, stream_id, error_code);
+        return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    }
+    int rc = picowt_reset_stream(ep->cnx, sc, error_code);
+    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+static moq_transport_result_t ep_stop_sending(void *ctx,
+                                               uint64_t stream_id,
+                                               uint64_t error_code)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    int rc = picoquic_stop_sending(ep->cnx, stream_id, error_code);
+    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+static moq_transport_result_t ep_send_datagram(void *ctx,
+                                                const uint8_t *data,
+                                                size_t len)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+
+    /* Single-slot buffer — drop if occupied */
+    if (ep->pending_dg_len > 0)
+        return MOQ_TRANSPORT_DROPPED;
+
+    if (len > sizeof(ep->pending_dg_buf))
+        return MOQ_TRANSPORT_TOO_LARGE;
+
+    if (data && len > 0)
+        memcpy(ep->pending_dg_buf, data, len);
+    ep->pending_dg_len = len;
+
+    int rc = h3zero_set_datagram_ready(ep->cnx, ep->control_stream_id);
+    if (rc != 0) {
+        ep->pending_dg_len = 0;
+        return MOQ_TRANSPORT_DROPPED;
+    }
+    return MOQ_TRANSPORT_OK;
+}
+
+static moq_transport_result_t ep_close(void *ctx, uint64_t code,
+                                        const uint8_t *reason,
+                                        size_t reason_len)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+
+    uint32_t code32 = (code > UINT32_MAX) ? UINT32_MAX
+                                          : (uint32_t)code;
+
+    char msg[256];
+    size_t copy = reason_len < sizeof(msg) - 1
+                  ? reason_len : sizeof(msg) - 1;
+    if (reason && copy > 0) {
+        memcpy(msg, reason, copy);
+        msg[copy] = '\0';
+    } else {
+        msg[0] = '\0';
+    }
+
+    int rc = picowt_send_close_session_message(
+        ep->cnx, ep->control_stream_ctx,
+        code32, msg[0] ? msg : NULL);
+    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+/* -- Init / cleanup ------------------------------------------------- */
+
+void pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
+                            pico_wt_endpoint_ctx_t *ctx,
+                            picoquic_cnx_t *cnx,
+                            h3zero_callback_ctx_t *h3_ctx,
+                            h3zero_stream_ctx_t *control_stream_ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cnx = cnx;
+    ctx->h3_ctx = h3_ctx;
+    ctx->control_stream_ctx = control_stream_ctx;
+    ctx->control_stream_id = control_stream_ctx->stream_id;
+
+    ctx->pending_dg_len = 0;
+
+    *ops = (moq_transport_endpoint_ops_t){
+        .struct_size     = sizeof(moq_transport_endpoint_ops_t),
+        .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM,
+        .open_uni        = ep_open_uni,
+        .open_bidi       = ep_open_bidi,
+        .write           = ep_write,
+        .write_payload   = NULL,
+        .reset_stream    = ep_reset,
+        .stop_sending    = ep_stop_sending,
+        .send_datagram   = ep_send_datagram,
+        .max_datagram_size = NULL,
+        .close_transport = ep_close,
+    };
+}
+
+void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx)
+{
+    ctx->pending_dg_len = 0;
+}
+
+int pico_wt_endpoint_provide_datagram(pico_wt_endpoint_ctx_t *ctx,
+                                       uint8_t *context,
+                                       size_t space)
+{
+    if (ctx->pending_dg_len == 0)
+        return -1;
+
+    if (ctx->pending_dg_len > space) {
+        ctx->pending_dg_len = 0;
+        return -1;
+    }
+
+    uint8_t *buf = h3zero_provide_datagram_buffer(
+        context, ctx->pending_dg_len, 0);
+    if (!buf) {
+        ctx->pending_dg_len = 0;
+        return -1;
+    }
+
+    memcpy(buf, ctx->pending_dg_buf, ctx->pending_dg_len);
+    ctx->pending_dg_len = 0;
+    return 0;
+}

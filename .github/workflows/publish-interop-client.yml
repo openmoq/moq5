@@ -1,0 +1,97 @@
+name: Publish moq5-interop-client to GHCR
+
+# Builds the MoQ interop test client (tools/moq-interop-client) and publishes it
+# to ghcr.io/openmoq/moq5-interop-client, so the moq-interop-runner can pull it
+# directly — the same way openmoq/moqx publishes ghcr.io/openmoq/moqx-interop-client.
+#
+# Tags pushed: :latest and :<short-sha> (so the runner can pin a build).
+#
+# One-time setup: after the first successful run, set the package
+# ghcr.io/openmoq/moq5-interop-client to Public in the openmoq org's package
+# settings so the runner (and anyone) can pull it without authentication.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'core/**'
+      - 'adapters/**'
+      - 'service/**'
+      - 'media/**'
+      - 'tools/moq-interop-client/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/workflows/publish-interop-client.yml'
+  workflow_dispatch:
+    inputs:
+      picoquic_ref:
+        description: 'picoquic ref (default: master)'
+        required: false
+        default: 'master'
+      picotls_ref:
+        description: 'picotls ref (default: master)'
+        required: false
+        default: 'master'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/openmoq/moq5-interop-client
+  PICOQUIC_REPO: https://github.com/private-octopus/picoquic
+  PICOTLS_REPO: https://github.com/h2o/picotls
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout moq5
+        uses: actions/checkout@v4
+        with:
+          path: src/libmoq
+
+      # libmoq's interop Dockerfile expects picotls/ + picoquic/ + libmoq/ as
+      # siblings in the build context. moq5 does not vendor them, and both carry
+      # their OWN submodules (picotls: cifra/micro-ecc), so the clone MUST recurse.
+      - name: Fetch picoquic + picotls (recurse submodules)
+        run: |
+          PQ_REF="${{ github.event.inputs.picoquic_ref || 'master' }}"
+          PT_REF="${{ github.event.inputs.picotls_ref || 'master' }}"
+          git clone --recurse-submodules --shallow-submodules --depth 1 \
+            --branch "$PQ_REF" "$PICOQUIC_REPO" src/picoquic
+          git clone --recurse-submodules --shallow-submodules --depth 1 \
+            --branch "$PT_REF" "$PICOTLS_REPO" src/picotls
+          echo "PICOQUIC_SHA=$(git -C src/picoquic rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "PICOTLS_SHA=$(git -C src/picotls rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHORT_SHA="$(git -C src/libmoq rev-parse --short HEAD)"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Source: libmoq=$SHORT_SHA picoquic=$PICOQUIC_SHA picotls=$PICOTLS_SHA"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build interop client image
+        # Context = src/ (contains libmoq/ picoquic/ picotls/ siblings); the
+        # Dockerfile lives inside the libmoq checkout.
+        run: |
+          docker build \
+            -f src/libmoq/tools/moq-interop-client/Dockerfile \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ steps.tags.outputs.short_sha }}" \
+            src
+
+      - name: Push tags
+        run: |
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${{ steps.tags.outputs.short_sha }}"
+          echo "Published ${IMAGE}:latest and :${{ steps.tags.outputs.short_sha }}"

@@ -1,0 +1,26 @@
+# pkg-config for the high-level LibMoQ service tier
+# (<moq/endpoint.h>, <moq/media_receiver.h>, <moq/media_sender.h>).
+#
+# The service tier is an OPTIONAL higher-level component layered on the core;
+# it is intentionally NOT folded into libmoq.pc (same posture as the WT adapter
+# packages). `Requires: libmoq` pulls the full core/codec link chain -- and the
+# picoquic raw-QUIC facade libs when the build included them. When the build
+# also compiled the managed WebTransport facade, `libmoq-pico-wt-managed` is
+# added so its static deps (picohttp/picoquic/picotls/OpenSSL) come through too.
+# moq-service is listed first so it precedes its dependencies in the static
+# link line. A consumer needs only:
+#   pkg-config --cflags --libs libmoq-service
+#
+# Relocatable prefix (see libmoq.pc): the .pc lands at
+# <prefix>/<libdir>/pkgconfig, so @LIBMOQ_SERVICE_PC_UP@ ascends back to
+# <prefix> regardless of the install prefix.
+prefix=${pcfiledir}/@LIBMOQ_SERVICE_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq-service
+Description: High-level LibMoQ endpoint/media service tier
+Version: @PROJECT_VERSION@
+Requires: @LIBMOQ_SERVICE_PC_REQUIRES@
+Libs: -L${libdir} -lmoq-service
+Cflags: -I${includedir}

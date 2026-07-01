@@ -1,0 +1,12 @@
+# Relocatable: prefix is derived from this file's location
+# (<prefix>/<libdir>/pkgconfig), so the package works from any install
+# prefix. @LIBMOQ_PC_UP@ ascends libdir depth + 1 levels back to <prefix>.
+prefix=${pcfiledir}/@LIBMOQ_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq
+Description: Sans-I/O Media over QUIC Transport library
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} @LIBMOQ_PC_LIBS@
+Cflags: -I${includedir}

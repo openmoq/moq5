@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "customTop": "ignored",
+  "tracks": [
+    {
+      "name": "video",
+      "packaging": "loc",
+      "isLive": true,
+      "futureField": 42,
+      "anotherUnknown": {"nested": true}
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "version": 2,
+  "configurePresets": [
+    {
+      "name": "_base",
+      "hidden": true,
+      "generator": "Unix Makefiles"
+    },
+    {
+      "name": "default",
+      "inherits": "_base",
+      "binaryDir": "build",
+      "cacheVariables": {
+        "MOQ_BUILD_SIM": "ON",
+        "MOQ_BUILD_TESTS": "ON",
+        "MOQ_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "nosim",
+      "inherits": "_base",
+      "binaryDir": "build/nosim",
+      "cacheVariables": {
+        "MOQ_BUILD_SIM": "OFF",
+        "MOQ_BUILD_TESTS": "ON",
+        "MOQ_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "shared",
+      "inherits": "_base",
+      "binaryDir": "build/shared",
+      "cacheVariables": {
+        "MOQ_BUILD_SIM": "ON",
+        "MOQ_BUILD_TESTS": "ON",
+        "BUILD_SHARED_LIBS": "ON",
+        "MOQ_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "asan",
+      "inherits": "_base",
+      "binaryDir": "build/asan",
+      "cacheVariables": {
+        "MOQ_BUILD_SIM": "ON",
+        "MOQ_BUILD_TESTS": "ON",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "MOQ_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "_base",
+      "binaryDir": "build/fuzz-check",
+      "cacheVariables": {
+        "MOQ_BUILD_SIM": "ON",
+        "MOQ_BUILD_TESTS": "ON",
+        "MOQ_BUILD_FUZZ": "ON"
+      }
+    },
+
+    {
+      "name": "rc-static",
+      "displayName": "Static core + sim + tests (canonical build/<preset> tree)",
+      "inherits": "_base",
+      "binaryDir": "build/rc-static",
+      "cacheVariables": {
+        "MOQ_BUILD_SIM": "ON",
+        "MOQ_BUILD_TESTS": "ON",
+        "MOQ_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "rc-shared",
+      "displayName": "Shared-library build (ABI / symbol hygiene)",
+      "inherits": "rc-static",
+      "binaryDir": "build/rc-shared",
+      "cacheVariables": {
+        "BUILD_SHARED_LIBS": "ON"
+      }
+    },
+    {
+      "name": "cppbind",
+      "displayName": "C++ binding + tests",
+      "inherits": "rc-static",
+      "binaryDir": "build/cppbind",
+      "cacheVariables": {
+        "MOQ_BUILD_CPP_BINDING": "ON",
+        "MOQ_BUILD_MSF": "ON"
+      }
+    },
+    {
+      "name": "install",
+      "displayName": "Service tier, installs into ../local-prefix",
+      "inherits": "_base",
+      "binaryDir": "build/install",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/../local-prefix",
+        "MOQ_BUILD_TESTS": "OFF",
+        "MOQ_BUILD_SIM": "OFF",
+        "MOQ_BUILD_MSF": "ON",
+        "MOQ_BUILD_MEDIA_OBJECT": "ON",
+        "MOQ_BUILD_SERVICE": "ON"
+      }
+    }
+  ]
+}

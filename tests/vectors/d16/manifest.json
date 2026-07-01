@@ -1,0 +1,349 @@
+{
+  "vectors": [
+    {
+      "file": "client_setup_basic.bin",
+      "type": "CLIENT_SETUP",
+      "type_code": "0x20",
+      "description": "CLIENT_SETUP with no params",
+      "wire_length": 4,
+      "wire_hex": "20000100",
+      "expected": { "params_count": 0 }
+    },
+    {
+      "file": "client_setup_max_request_id.bin",
+      "type": "CLIENT_SETUP",
+      "type_code": "0x20",
+      "description": "CLIENT_SETUP with MAX_REQUEST_ID=100",
+      "wire_length": 7,
+      "wire_hex": "20000401024064",
+      "expected": { "params_count": 1, "max_request_id": 100 }
+    },
+    {
+      "file": "server_setup_params.bin",
+      "type": "SERVER_SETUP",
+      "type_code": "0x21",
+      "description": "SERVER_SETUP with MAX_REQUEST_ID=100 and MAX_AUTH_TOKEN_CACHE_SIZE=10",
+      "wire_length": 9,
+      "wire_hex": "21000602024064020a",
+      "expected": { "params_count": 2, "max_request_id": 100, "max_auth_token_cache_size": 10 }
+    },
+    {
+      "file": "subscribe_minimal.bin",
+      "type": "SUBSCRIBE",
+      "type_code": "0x03",
+      "description": "SUBSCRIBE minimal: request_id=0, namespace=[\"ns\"], track=\"t\", no params",
+      "wire_length": 11,
+      "wire_hex": "0300080001026e73017400",
+      "expected": { "request_id": 0, "namespace": ["ns"], "track_name": "t", "params_count": 0 }
+    },
+    {
+      "file": "subscribe_with_params.bin",
+      "type": "SUBSCRIBE",
+      "type_code": "0x03",
+      "description": "SUBSCRIBE: request_id=2, namespace=[\"live\",\"stream\"], track=\"video\", FORWARD=true, SUBSCRIBER_PRIORITY=64, GROUP_ORDER=ASCENDING, filter=NEXT_GROUP",
+      "wire_length": 34,
+      "wire_hex": "03001f0202046c6976650673747265616d05766964656f0410011040400101020101",
+      "expected": { "request_id": 2, "namespace": ["live", "stream"], "track_name": "video", "forward": true, "subscriber_priority": 64, "group_order": 1, "filter_type": 2 }
+    },
+    {
+      "file": "subscribe_ok_minimal.bin",
+      "type": "SUBSCRIBE_OK",
+      "type_code": "0x04",
+      "description": "SUBSCRIBE_OK minimal: request_id=0, track_alias=1, no params, no extensions",
+      "wire_length": 6,
+      "wire_hex": "040003000100",
+      "expected": { "request_id": 0, "track_alias": 1, "params_count": 0 }
+    },
+    {
+      "file": "subscribe_ok_with_params.bin",
+      "type": "SUBSCRIBE_OK",
+      "type_code": "0x04",
+      "description": "SUBSCRIBE_OK: request_id=2, track_alias=5, EXPIRES=30000, LARGEST_OBJECT=(10,20)",
+      "wire_length": 15,
+      "wire_hex": "04000c020502088000753001020a14",
+      "expected": { "request_id": 2, "track_alias": 5, "largest_group": 10, "largest_object": 20, "expires_ms": 30000 }
+    },
+    {
+      "file": "request_error_no_retry.bin",
+      "type": "REQUEST_ERROR",
+      "type_code": "0x05",
+      "description": "REQUEST_ERROR: request_id=0, error_code=0x1, retry_interval=0, reason=\"not found\"",
+      "wire_length": 16,
+      "wire_hex": "05000d000100096e6f7420666f756e64",
+      "expected": { "request_id": 0, "error_code": 1, "retry_interval": 0, "reason": "not found" }
+    },
+    {
+      "file": "request_error_with_retry.bin",
+      "type": "REQUEST_ERROR",
+      "type_code": "0x05",
+      "description": "REQUEST_ERROR: request_id=4, error_code=0x2, retry_interval=5001, reason=\"try again\"",
+      "wire_length": 17,
+      "wire_hex": "05000e040253890974727920616761696e",
+      "expected": { "request_id": 4, "error_code": 2, "retry_interval": 5001, "reason": "try again" }
+    },
+    {
+      "file": "request_ok.bin",
+      "type": "REQUEST_OK",
+      "type_code": "0x07",
+      "description": "REQUEST_OK: request_id=0, no params",
+      "wire_length": 5,
+      "wire_hex": "0700020000",
+      "expected": { "request_id": 0, "params_count": 0 }
+    },
+    {
+      "file": "publish_namespace_minimal.bin",
+      "type": "PUBLISH_NAMESPACE",
+      "type_code": "0x06",
+      "description": "PUBLISH_NAMESPACE: request_id=0, namespace=[\"media\"], no params",
+      "wire_length": 12,
+      "wire_hex": "0600090001056d6564696100",
+      "expected": { "request_id": 0, "namespace": ["media"], "params_count": 0 }
+    },
+    {
+      "file": "publish_namespace_multi.bin",
+      "type": "PUBLISH_NAMESPACE",
+      "type_code": "0x06",
+      "description": "PUBLISH_NAMESPACE: request_id=2, namespace=[\"org\",\"example\",\"live\"], no params",
+      "wire_length": 23,
+      "wire_hex": "0600140203036f7267076578616d706c65046c69766500",
+      "expected": { "request_id": 2, "namespace": ["org", "example", "live"], "params_count": 0 }
+    },
+    {
+      "file": "subscribe_namespace_prefix.bin",
+      "type": "SUBSCRIBE_NAMESPACE",
+      "type_code": "0x11",
+      "description": "SUBSCRIBE_NAMESPACE: request_id=0, prefix=[\"live\"], subscribe_options=2 (BOTH), no params",
+      "wire_length": 12,
+      "wire_hex": "1100090001046c6976650200",
+      "expected": { "request_id": 0, "prefix": ["live"], "subscribe_options": 2, "params_count": 0 }
+    },
+    {
+      "file": "subscribe_namespace_empty.bin",
+      "type": "SUBSCRIBE_NAMESPACE",
+      "type_code": "0x11",
+      "description": "SUBSCRIBE_NAMESPACE: request_id=4, prefix=[] (zero fields), subscribe_options=1 (NAMESPACE), no params",
+      "wire_length": 7,
+      "wire_hex": "11000404000100",
+      "expected": { "request_id": 4, "prefix": [], "subscribe_options": 1, "params_count": 0 }
+    },
+    {
+      "file": "goaway_empty.bin",
+      "type": "GOAWAY",
+      "type_code": "0x10",
+      "description": "GOAWAY with zero-length URI",
+      "wire_length": 4,
+      "wire_hex": "10000100",
+      "expected": { "uri_len": 0 }
+    },
+    {
+      "file": "goaway_with_uri.bin",
+      "type": "GOAWAY",
+      "type_code": "0x10",
+      "description": "GOAWAY with URI \"wss://new.example.com\"",
+      "wire_length": 25,
+      "wire_hex": "100016157773733a2f2f6e65772e6578616d706c652e636f6d",
+      "expected": { "uri": "wss://new.example.com" }
+    },
+    {
+      "file": "unsubscribe.bin",
+      "type": "UNSUBSCRIBE",
+      "type_code": "0x0a",
+      "description": "UNSUBSCRIBE: request_id=6",
+      "wire_length": 4,
+      "wire_hex": "0a000106",
+      "expected": { "request_id": 6 }
+    },
+    {
+      "file": "publish_namespace_done.bin",
+      "type": "PUBLISH_NAMESPACE_DONE",
+      "type_code": "0x09",
+      "description": "PUBLISH_NAMESPACE_DONE: request_id=2",
+      "wire_length": 4,
+      "wire_hex": "09000102",
+      "expected": { "request_id": 2 }
+    },
+    {
+      "file": "publish_namespace_cancel.bin",
+      "type": "PUBLISH_NAMESPACE_CANCEL",
+      "type_code": "0x0c",
+      "description": "PUBLISH_NAMESPACE_CANCEL: request_id=4, error_code=0x1, reason=\"cancelled\"",
+      "wire_length": 15,
+      "wire_hex": "0c000c04010963616e63656c6c6564",
+      "expected": { "request_id": 4, "error_code": 1, "reason": "cancelled" }
+    },
+    {
+      "file": "fetch_standalone.bin",
+      "type": "FETCH",
+      "type_code": "0x16",
+      "description": "FETCH standalone: request_id=3, namespace=[\"live\"], track=\"audio\", range [0,0)..[5,0), GROUP_ORDER=1",
+      "wire_length": 24,
+      "wire_hex": "160015030101046c69766505617564696f00000500012201",
+      "expected": { "request_id": 3, "fetch_type": 1, "namespace": ["live"], "track_name": "audio", "start_group": 0, "start_object": 0, "end_group": 5, "end_object": 0, "params_count": 1, "group_order": 1 }
+    },
+    {
+      "file": "fetch_relative_join.bin",
+      "type": "FETCH",
+      "type_code": "0x16",
+      "description": "FETCH relative joining: request_id=5, joining_request_id=2, joining_start=10, no params",
+      "wire_length": 8,
+      "wire_hex": "1600050502020a00",
+      "expected": { "request_id": 5, "fetch_type": 2, "joining_request_id": 2, "joining_start": 10, "params_count": 0 }
+    },
+    {
+      "file": "fetch_ok.bin",
+      "type": "FETCH_OK",
+      "type_code": "0x18",
+      "description": "FETCH_OK: request_id=3, end_of_track=1, end_group=20, end_object=5, no params, extensions=\"ext\"",
+      "wire_length": 11,
+      "wire_hex": "1800080301140500657874",
+      "expected": { "request_id": 3, "end_of_track": 1, "end_group": 20, "end_object": 5, "extensions_len": 3 }
+    },
+    {
+      "file": "fetch_cancel.bin",
+      "type": "FETCH_CANCEL",
+      "type_code": "0x17",
+      "description": "FETCH_CANCEL: request_id=7",
+      "wire_length": 4,
+      "wire_hex": "17000107",
+      "expected": { "request_id": 7 }
+    },
+    {
+      "file": "publish_minimal.bin",
+      "type": "PUBLISH",
+      "type_code": "0x1d",
+      "description": "PUBLISH minimal: request_id=0, namespace=[\"ns\"], track=\"t\", track_alias=0, no params, no extensions",
+      "wire_length": 12,
+      "wire_hex": "1d00090001026e7301740000",
+      "expected": { "request_id": 0, "namespace": ["ns"], "track_name": "t", "track_alias": 0, "params_count": 0 }
+    },
+    {
+      "file": "publish_with_params.bin",
+      "type": "PUBLISH",
+      "type_code": "0x1d",
+      "description": "PUBLISH: request_id=2, namespace=[\"live\",\"stream\"], track=\"video\", track_alias=1, FORWARD=true",
+      "wire_length": 27,
+      "wire_hex": "1d00180202046c6976650673747265616d05766964656f01011001",
+      "expected": { "request_id": 2, "namespace": ["live", "stream"], "track_name": "video", "track_alias": 1, "forward": true, "params_count": 1 }
+    },
+    {
+      "file": "publish_ok.bin",
+      "type": "PUBLISH_OK",
+      "type_code": "0x1e",
+      "description": "PUBLISH_OK: request_id=2, no params",
+      "wire_length": 5,
+      "wire_hex": "1e00020200",
+      "expected": { "request_id": 2, "params_count": 0 }
+    },
+    {
+      "file": "publish_done.bin",
+      "type": "PUBLISH_DONE",
+      "type_code": "0x0b",
+      "description": "PUBLISH_DONE: request_id=3, status_code=0, stream_count=10, reason=\"finished\"",
+      "wire_length": 15,
+      "wire_hex": "0b000c03000a0866696e6973686564",
+      "expected": { "request_id": 3, "status_code": 0, "stream_count": 10, "reason": "finished" }
+    },
+    {
+      "file": "track_status_minimal.bin",
+      "type": "TRACK_STATUS",
+      "type_code": "0x0d",
+      "description": "TRACK_STATUS minimal: request_id=0, namespace=[\"ns\"], track=\"t\", no params",
+      "wire_length": 11,
+      "wire_hex": "0d00080001026e73017400",
+      "expected": { "request_id": 0, "namespace": ["ns"], "track_name": "t", "params_count": 0 }
+    },
+    {
+      "file": "object_datagram_minimal.bin",
+      "type": "OBJECT_DATAGRAM",
+      "type_code": "0x00",
+      "description": "OBJECT_DATAGRAM: track_alias=1, group=0, object=2, priority=128, payload=\"hi\"",
+      "wire_length": 7,
+      "wire_hex": "00010002806869",
+      "expected": { "track_alias": 1, "group_id": 0, "object_id": 2, "priority": 128 }
+    },
+    {
+      "file": "object_datagram_status.bin",
+      "type": "OBJECT_DATAGRAM",
+      "type_code": "0x20",
+      "description": "OBJECT_DATAGRAM status: track_alias=1, group=5, object=1, status=END_OF_GROUP",
+      "wire_length": 6,
+      "wire_hex": "200105018003",
+      "expected": { "track_alias": 1, "group_id": 5, "object_id": 1, "status": 3 }
+    },
+    {
+      "file": "object_datagram_properties.bin",
+      "type": "OBJECT_DATAGRAM",
+      "type_code": "0x01",
+      "description": "OBJECT_DATAGRAM with properties: track_alias=2, group=1, object=3",
+      "wire_length": 13,
+      "wire_hex": "0102010340030101aa64617461",
+      "expected": { "track_alias": 2, "group_id": 1, "object_id": 3, "has_extensions": true }
+    },
+    {
+      "file": "object_datagram_status_eot.bin",
+      "type": "OBJECT_DATAGRAM",
+      "type_code": "0x24",
+      "description": "OBJECT_DATAGRAM status: track_alias=3, group=10, object=0, status=END_OF_TRACK",
+      "wire_length": 5,
+      "wire_hex": "24030a8004",
+      "expected": { "track_alias": 3, "group_id": 10, "object_id": 0, "status": 4 }
+    },
+    {
+      "file": "object_datagram_zero_oid.bin",
+      "type": "OBJECT_DATAGRAM",
+      "type_code": "0x04",
+      "description": "OBJECT_DATAGRAM zero_object_id: track_alias=1, group=2, object=0 (omitted), payload=\"z\"",
+      "wire_length": 5,
+      "wire_hex": "040102807a",
+      "expected": { "track_alias": 1, "group_id": 2, "object_id": 0 }
+    },
+    {
+      "file": "fetch_obj_first.bin",
+      "type": "FETCH_DATA",
+      "description": "First fetch object: g=1 sg=0 o=0 pri=128 payload=\"hello\"",
+      "wire_length": 10,
+      "wire_hex": "1c0100800568656c6c6f",
+      "expected": { "group_id": 1, "subgroup_id": 0, "object_id": 0, "publisher_priority": 128, "payload_len": 5, "payload_hex": "68656c6c6f" }
+    },
+    {
+      "file": "fetch_obj_props_payload.bin",
+      "type": "FETCH_DATA",
+      "description": "Fetch object with properties + payload: g=2 sg=0 o=0 pri=128 extensions=\"prop\" payload=\"data\"",
+      "wire_length": 14,
+      "wire_hex": "3c0200800470726f700464617461",
+      "expected": { "group_id": 2, "subgroup_id": 0, "object_id": 0, "publisher_priority": 128, "extensions_len": 4, "extensions_hex": "70726f70", "payload_len": 4, "payload_hex": "64617461" }
+    },
+    {
+      "file": "fetch_obj_props_only.bin",
+      "type": "FETCH_DATA",
+      "description": "Properties-only fetch object: g=3 sg=0 o=0 pri=128 extensions=\"meta\" payload_len=0",
+      "wire_length": 10,
+      "wire_hex": "3c030080046d65746100",
+      "expected": { "group_id": 3, "subgroup_id": 0, "object_id": 0, "publisher_priority": 128, "extensions_len": 4, "extensions_hex": "6d657461", "payload_len": 0 }
+    },
+    {
+      "file": "fetch_eor_non_existent.bin",
+      "type": "FETCH_DATA",
+      "description": "End-of-range NON_EXISTENT: group=5 object=10",
+      "wire_length": 4,
+      "wire_hex": "408c050a",
+      "expected": { "is_end_of_range": true, "range_kind": "0x8c", "group_id": 5, "object_id": 10 }
+    },
+    {
+      "file": "fetch_eor_unknown.bin",
+      "type": "FETCH_DATA",
+      "description": "End-of-range UNKNOWN: group=100 object=200",
+      "wire_length": 6,
+      "wire_hex": "410c406440c8",
+      "expected": { "is_end_of_range": true, "range_kind": "0x10c", "group_id": 100, "object_id": 200 }
+    },
+    {
+      "file": "fetch_obj_delta.bin",
+      "type": "FETCH_DATA",
+      "description": "Delta-encoded second object: g=1(same) sg=0(same) o=1(prev+1) pri=128(same) payload=\"ab\"",
+      "wire_length": 4,
+      "wire_hex": "00026162",
+      "expected": { "group_id": 1, "subgroup_id": 0, "object_id": 1, "publisher_priority": 128, "payload_len": 2, "payload_hex": "6162", "prior": { "group_id": 1, "subgroup_id": 0, "object_id": 0, "publisher_priority": 128 } }
+    }
+  ]
+}

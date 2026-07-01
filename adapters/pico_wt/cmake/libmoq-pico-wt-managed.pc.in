@@ -1,0 +1,24 @@
+# pkg-config for the picoquic WebTransport managed facade, experimental
+# (<moq/pico_wt_managed.h>).
+#
+# Relocatable prefix (see libmoq-pico-wt.pc). The attach adapter is a
+# PUBLIC dependency — <moq/pico_wt_managed.h> includes <moq/pico_wt.h>
+# and exposes picoquic types — so it is a `Requires` (not
+# Requires.private). That single Requires also pulls in the full
+# picohttp/picoquic/picotls/OpenSSL link chain, so a consumer needs only:
+#   pkg-config --cflags --libs libmoq-pico-wt-managed
+# The managed lib is listed first so it precedes its dependencies in the
+# static link line. The base picoquic adapter (-lmoq-adapter-picoquic) is
+# added because the managed client installs the default certificate
+# verifier (moq_picoquic_set_cert_verifier) from it; it sits between the
+# managed lib and the picotls/OpenSSL chain that libmoq-pico-wt supplies.
+prefix=${pcfiledir}/@LIBMOQ_PICOWT_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq-pico-wt-managed
+Description: libmoq picoquic WebTransport managed facade, experimental (<moq/pico_wt_managed.h>)
+Version: @PROJECT_VERSION@
+Requires: libmoq-pico-wt
+Libs: -L${libdir} -lmoq-adapter-pico-wt-managed -lmoq-adapter-picoquic
+Cflags: -I${includedir}
