@@ -310,8 +310,16 @@ MOQ_API uint16_t moq_mvfst_managed_local_port(const moq_mvfst_managed_t *m);
 /* -- Cross-thread signaling ------------------------------------------ */
 
 /*
- * Wake the network thread. Safe from any thread. Coalesced.
+ * Wake the network thread so on_pump runs. Safe from any thread. Coalesced.
  * Returns MOQ_OK or MOQ_ERR_CLOSED if stopped, fatal, or pump exited.
+ *
+ * The pump is event-driven: transport-driven / reactive work (an inbound
+ * SUBSCRIBE, a peer close, a write-ready, a session deadline) schedules on_pump
+ * automatically, so you do NOT need to poll or wake for it. But the pump no
+ * longer runs on a fixed cadence -- so any APPLICATION-side state change that
+ * on_pump must act on (e.g. flagging "publish this now" or "accept this
+ * subscribe" from your own thread) MUST call wake() to make on_pump run and
+ * observe it. An app that changes state without waking may never be serviced.
  */
 MOQ_API moq_result_t moq_mvfst_managed_wake(moq_mvfst_managed_t *m);
 

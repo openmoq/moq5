@@ -197,6 +197,16 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_managed_server_loopback COMMAND test_mvfst_managed_server_loopback)
     set_tests_properties(mvfst_managed_server_loopback PROPERTIES TIMEOUT 10)
 
+    # Event-driven server on_pump: a reactive server accepts + publishes with NO
+    # explicit server wakes, driven only by EventBase scheduling on server_evb.
+    add_executable(test_mvfst_managed_server_eventdriven
+        tests/test_managed_server_eventdriven.cpp)
+    target_link_libraries(test_mvfst_managed_server_eventdriven PRIVATE
+        moq::adapter-mvfst mvfst::mvfst)
+    add_test(NAME mvfst_managed_server_eventdriven
+        COMMAND test_mvfst_managed_server_eventdriven)
+    set_tests_properties(mvfst_managed_server_eventdriven PROPERTIES TIMEOUT 20)
+
     add_executable(test_mvfst_managed_server_multi tests/test_managed_server_multi.cpp)
     target_link_libraries(test_mvfst_managed_server_multi PRIVATE moq::adapter-mvfst mvfst::mvfst)
     add_test(NAME mvfst_managed_server_multi COMMAND test_mvfst_managed_server_multi)

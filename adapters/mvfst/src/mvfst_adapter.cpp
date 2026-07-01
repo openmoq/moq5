@@ -157,19 +157,27 @@ struct moq_mvfst_conn
     bool close_requested = false;
     bool fatal = false;
 
-    void onTransportReady() noexcept override {}
+    /* Schedule a server pump on parent (defined out-of-line; parent is
+     * incomplete here). These connection callbacks run on server_evb, so the
+     * scheduled pump observes handshake/close/fatal transitions promptly
+     * instead of waiting on a poll. */
+    void notify_parent_pump() noexcept;
+
+    void onTransportReady() noexcept override { notify_parent_pump(); }
     void onConnectionSetupError(quic::QuicError) noexcept override {
         fatal = true;
+        notify_parent_pump();
     }
-    void onReplaySafe() noexcept override {}
+    void onReplaySafe() noexcept override { notify_parent_pump(); }
     void onFullHandshakeDone() noexcept override {}
     void onNewBidirectionalStream(quic::StreamId) noexcept override {}
     void onNewUnidirectionalStream(quic::StreamId) noexcept override {}
     void onStopSending(quic::StreamId,
                         quic::ApplicationErrorCode) noexcept override {}
-    void onConnectionEnd() noexcept override {}
+    void onConnectionEnd() noexcept override { notify_parent_pump(); }
     void onConnectionError(quic::QuicError) noexcept override {
         fatal = true;
+        notify_parent_pump();
     }
 
     bool should_remove() const {
@@ -267,10 +275,14 @@ struct moq_mvfst_managed {
     std::shared_ptr<quic::QuicClientTransport> transport;
     std::unique_ptr<moq::mvfst::adapter> adapter_ptr;
 
-    /* Server: QuicServer + per-connection state. */
+    /* Server: QuicServer + per-connection state. server_evb is the QuicServer
+     * worker EventBase (owned by QuicServer, not us). Published by the manager
+     * thread during setup and cleared at teardown, but read from cross-thread
+     * wake paths (server_schedule_pump), so it is atomic with release stores /
+     * acquire loads -- mirroring client_evb. */
     std::string key_path;
     std::shared_ptr<quic::QuicServer> server;
-    folly::EventBase *server_evb = nullptr;
+    std::atomic<folly::EventBase *> server_evb{nullptr};
     /* Client mode: the EventBase the managed thread owns and runs. Published by
      * the managed thread when the pump loop starts and cleared when it exits;
      * read from app/credit/write-ready threads in wake_pump/request_pump/
@@ -324,8 +336,8 @@ struct moq_mvfst_managed {
     }
 
     bool is_network_thread() {
-        if (server_evb)
-            return server_evb->isInEventBaseThread();
+        if (auto *e = server_evb.load(std::memory_order_acquire))
+            return e->isInEventBaseThread();
         return is_managed_thread();
     }
 
@@ -394,12 +406,61 @@ struct moq_mvfst_managed {
         schedule_pump();
     }
 
-    /* Wake the pump promptly. Client mode: schedule a coalesced pump on the
-     * owned EventBase. Server mode: the legacy condvar path (the server loop
-     * still polls). */
+    /* -- Server mode: event-driven pump on the QuicServer worker EventBase -- *
+     * The server does NOT own its EventBase (QuicServer does) and does not run
+     * loopForever; instead pump_tick is scheduled onto server_evb as a
+     * coalesced callback. server_pump_enabled is the shutdown gate: every
+     * scheduling site AND every queued callback checks it, so once teardown
+     * clears it no pump work touches conns/session/timer. server_pump_run is
+     * assigned by the manager thread before server_pump_enabled is set (a
+     * release store), and the pump callback reads it only after observing that
+     * flag (an acquire load) -- so the assignment is safely published without a
+     * data race; it is cleared on server_evb in the teardown barrier once the
+     * gate is off. server_deadline_to is created, scheduled, canceled and
+     * destroyed only on server_evb. */
+    std::atomic<bool> server_pump_scheduled{false};
+    std::atomic<bool> server_pump_settle_needed{false};
+    std::atomic<bool> server_pump_enabled{false};
+    std::function<void()> server_pump_run;
+    std::unique_ptr<folly::AsyncTimeout> server_deadline_to;
+
+    /* Enqueue one coalesced server pump onto server_evb (internal). Gated by
+     * server_pump_enabled so nothing is scheduled before startup or after
+     * shutdown begins. AlwaysEnqueue keeps pump_tick off the calling stack
+     * (inbound callbacks run on server_evb too), so it is never reentrant. */
+    void server_schedule_pump() {
+        if (!server_pump_enabled.load(std::memory_order_acquire)) return;
+        if (server_pump_scheduled.exchange(true)) return;
+        folly::EventBase *evb = server_evb.load(std::memory_order_acquire);
+        if (!evb) { server_pump_scheduled.store(false); return; }
+        evb->runInEventBaseThreadAlwaysEnqueue([this]() {
+            server_pump_scheduled.store(false);
+            if (!server_pump_enabled.load(std::memory_order_acquire)) return;
+            if (server_pump_run) server_pump_run();
+            /* Bounded settle pass (same rationale as the client): an external
+             * wake may have changed app state that on_pump only observes on a
+             * later pass. One follow-up; it does not re-arm settle. */
+            if (server_pump_settle_needed.exchange(false))
+                server_schedule_pump();
+        });
+    }
+
+    /* External server wake entry (new conn, inbound callback, app wake,
+     * deadline timer, initial). Arms the settle pass, then schedules. */
+    void server_request_pump() {
+        server_pump_settle_needed.store(true);
+        server_schedule_pump();
+    }
+
+    /* Wake the pump promptly from an external source. Client mode schedules on
+     * the owned EventBase; server mode schedules on the QuicServer worker
+     * EventBase. The condvar fallback only applies before the pump machinery is
+     * live (e.g. during startup) or on a handle with neither evb. */
     void wake_pump() {
         if (client_evb.load(std::memory_order_acquire)) {
             request_pump();
+        } else if (server_pump_enabled.load(std::memory_order_acquire)) {
+            server_request_pump();
         } else {
             wake_flag.store(true);
             wake_cv.notify_one();
@@ -407,6 +468,11 @@ struct moq_mvfst_managed {
     }
 
     void notify_shutdown() {
+        /* Gate server scheduling BEFORE anything else: new schedule sites and
+         * already-queued callbacks bail on this, so the server_evb teardown
+         * barrier can cancel the timer and destroy conns with no pump work
+         * racing it. */
+        server_pump_enabled.store(false, std::memory_order_release);
         wake_cv.notify_all();
         wait_cv.notify_all();
         /* Break the client pump loop. terminateLoopSoon is thread-safe;
@@ -420,6 +486,11 @@ struct moq_mvfst_managed {
      * below, after adapter::impl is complete. */
     void enable_credit_gating();
 
+    /* Wire a managed server connection's adapter so its inbound transport
+     * callbacks schedule the server pump. Defined out-of-line (needs the
+     * complete adapter::impl); the friend grant on adapter exposes impl_. */
+    void wire_conn_server_pump(moq::mvfst::adapter *adp);
+
 #ifdef MOQ_MVFST_TESTING
     /* Test-only telemetry (compiled into the test-internals object lib, not the
      * shipped adapter): outbound stream-credit block events and peer credit
@@ -429,6 +500,14 @@ struct moq_mvfst_managed {
 #endif
 };
 
+/* Defined here now that moq_mvfst_managed is complete. Runs on server_evb (a
+ * connection callback), scheduling a coalesced pump; the enabled gate makes it
+ * a no-op once shutdown begins. */
+inline void moq_mvfst_conn::notify_parent_pump() noexcept
+{
+    if (parent) parent->server_request_pump();
+}
+
 quic::QuicServerTransport::Ptr managed_server_factory::make(
     folly::EventBase * /*evb*/,
     std::unique_ptr<quic::FollyAsyncUDPSocketAlias> sock,
@@ -437,6 +516,18 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
     noexcept
 {
     try {
+        /* Reject once shutdown has begun. running is cleared (under wake_mu)
+         * before the teardown barrier destroys conns, so a connection accepted
+         * in the window between the barrier and server->shutdown() would be
+         * appended to a conns list nothing will ever destroy -- moq_mvfst_conn
+         * has a manual destroy() but no destructor cleanup, so that would leak
+         * its session/adapter and leave callbacks holding a dangling parent.
+         * make() runs on server_evb (serialized with the barrier), so a conn
+         * accepted before the barrier is still swept by it; this gate covers
+         * the post-barrier window. */
+        if (!owner_->running.load(std::memory_order_acquire))
+            return nullptr;
+
         /* Connection cap: reject before allocating any per-connection state so
          * idle peers cannot grow memory/CPU without bound. Returning nullptr is
          * the factory's existing reject path (see the catch below) -- mvfst drops
@@ -480,11 +571,19 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
         try {
             c->adp = std::make_unique<moq::mvfst::adapter>(
                 acfg, c->session, c->transport);
+            /* Inbound callbacks on this conn schedule the server pump so
+             * on_pump drains its events (SUBSCRIBE etc.) without a poll. */
+            owner_->wire_conn_server_pump(c->adp.get());
         } catch (...) {
             c->fatal = true;
             t->close(quic::QuicError(quic::ApplicationErrorCode(0)));
         }
 
+        /* New connection: schedule a pump so on_pump picks it up. Runs on
+         * server_evb (we are in the factory callback); a no-op until the pump
+         * machinery is enabled at startup, after which the initial pump also
+         * sweeps any conn accepted during that window. */
+        owner_->server_request_pump();
         return t;
     } catch (...) {
         return nullptr;
@@ -668,6 +767,11 @@ moq_result_t moq_mvfst_managed_create(
      * Destroys adapter, transport, session, server. Safe with nulls.
      */
     auto teardown = [](moq_mvfst_managed_t *h) {
+        /* Gate server pump scheduling: new schedule sites and already-queued
+         * callbacks bail on this, so the server_evb barrier below owns the
+         * timer/conn teardown with no pump work racing it. Idempotent with
+         * notify_shutdown / the fatal path. */
+        h->server_pump_enabled.store(false, std::memory_order_release);
         /* Close the transport BEFORE destroying the adapter. mvfst has no
          * unregister for the connection-write callback; closing clears it
          * (firing onConnectionWriteError) on the still-live impl, so an armed
@@ -684,8 +788,17 @@ moq_result_t moq_mvfst_managed_create(
         }
         moq_session_t *s = h->session.exchange(nullptr);
         if (s) moq_session_destroy(s);
-        if (h->server_evb) {
-            h->server_evb->runInEventBaseThreadAndWait([h]() {
+        if (auto *sevb = h->server_evb.load(std::memory_order_acquire)) {
+            /* Barrier on server_evb: any in-flight pump callback has already
+             * completed (FIFO), and scheduling is gated off, so it is safe to
+             * cancel/destroy the deadline timer, drop the pump body, and
+             * destroy the conns here. All timer ops stay on server_evb. */
+            sevb->runInEventBaseThreadAndWait([h]() {
+                if (h->server_deadline_to) {
+                    h->server_deadline_to->cancelTimeout();
+                    h->server_deadline_to.reset();
+                }
+                h->server_pump_run = nullptr;
                 for (auto &c : h->conns) c->destroy();
                 h->conns.clear();
                 h->conn_count.store(0);
@@ -698,7 +811,7 @@ moq_result_t moq_mvfst_managed_create(
         if (h->server) {
             h->server->shutdown();
             h->server.reset();
-            h->server_evb = nullptr;
+            h->server_evb.store(nullptr, std::memory_order_release);
         }
         h->thread_exited.store(true);
         h->notify_shutdown();
@@ -758,7 +871,7 @@ moq_result_t moq_mvfst_managed_create(
                 auto evbs = m->server->getWorkerEvbs();
                 if (evbs.empty())
                     throw std::runtime_error("no worker evb");
-                m->server_evb = evbs[0];
+                m->server_evb.store(evbs[0], std::memory_order_release);
 
             } catch (...) {
                 signal_init(m, MOQ_ERR_INTERNAL);
@@ -1050,49 +1163,86 @@ moq_result_t moq_mvfst_managed_create(
                 m->pump_run = nullptr;  /* stop dispatching before locals die */
                 deadline_to->cancelTimeout();
                 m->client_evb.store(nullptr, std::memory_order_release);
-            } else {
-                /* SERVER: legacy manager-thread pump cadence. Unchanged
-                 * pending the schedule-on-server_evb follow-up. */
-                while (m->running.load()) {
-                    pump_result pr;
-                    if (m->server_evb) {
-                        m->server_evb->runInEventBaseThreadAndWait(
-                            [m, &pr, &pump_tick]() {
-                                pr = pump_tick(m);
-                            });
-                    } else {
-                        pr = pump_tick(m);
-                    }
+            } else if (folly::EventBase *sevb =
+                           m->server_evb.load(std::memory_order_acquire)) {
+                /* SERVER: event-driven pump scheduled onto the QuicServer
+                 * worker EventBase -- no 5ms poll. The manager thread wires the
+                 * pump body + deadline timer, kicks one initial pump, then
+                 * blocks until shutdown. pump_tick / on_pump / conn work all run
+                 * on server_evb (where inbound callbacks already run). */
+                m->server_pump_run = [m, &pump_tick]() {
+                    pump_result pr = pump_tick(m);
+                    if (m->on_activity)
+                        m->on_activity(m, m->user_ctx);
+                    m->signal_activity();
                     if (!pr.ok) {
+                        /* Fatal: gate further pumps and wake the manager thread
+                         * to tear down. running is set under wake_mu so the
+                         * no-timeout wait cannot miss the notify. */
+                        m->server_pump_enabled.store(
+                            false, std::memory_order_release);
+                        {
+                            std::lock_guard<std::mutex> lk(m->wake_mu);
+                            m->running.store(false);
+                        }
+                        m->wake_cv.notify_all();
+                        return;
+                    }
+                    /* Reschedule the MoQ session deadline on the server_evb-owned
+                     * timer (mvfst's own timers are independent). */
+                    if (m->server_deadline_to) {
+                        m->server_deadline_to->cancelTimeout();
+                        if (pr.earliest_deadline != UINT64_MAX) {
+                            auto cur = managed_now_us();
+                            uint64_t d = pr.earliest_deadline <= cur
+                                ? 0 : pr.earliest_deadline - cur;
+                            uint64_t ms = d == 0 ? 0 : (d + 999) / 1000;
+                            if (ms > UINT32_MAX) ms = UINT32_MAX;
+                            m->server_deadline_to->scheduleTimeout(
+                                static_cast<uint32_t>(ms));
+                        }
+                    }
+                };
+
+                /* Create the deadline timer ON server_evb (foreign evb: all
+                 * timer ops happen there), then enable scheduling and kick the
+                 * initial pump. */
+                sevb->runInEventBaseThreadAndWait([m, sevb]() {
+                    m->server_deadline_to = folly::AsyncTimeout::make(
+                        *sevb,
+                        [m]() noexcept { m->server_request_pump(); });
+                });
+                m->server_pump_enabled.store(true, std::memory_order_release);
+                m->server_request_pump();   /* initial pump */
+
+                /* No polling: block until shutdown. Wakes/pumps happen on
+                 * server_evb; teardown runs after this returns. */
+                std::unique_lock<std::mutex> lk(m->wake_mu);
+                m->wake_cv.wait(lk, [m]() { return !m->running.load(); });
+            } else {
+                /* No EventBase at all: the lifecycle-only mode (host==NULL
+                 * client, no transport created). There is no event source, so
+                 * on_pump can only be driven by a bounded manager-thread loop.
+                 * This is neither the server latency path nor a real traffic
+                 * path -- it exists for create/stop/destroy discipline -- so a
+                 * small wait here is fine (it is the pre-event-driven behavior
+                 * for this degenerate handle). */
+                while (m->running.load()) {
+                    pump_result pr = pump_tick(m);
+                    if (!pr.ok) {
+                        std::lock_guard<std::mutex> lk(m->wake_mu);
                         m->running.store(false);
                         break;
                     }
-
                     if (m->on_activity)
                         m->on_activity(m, m->user_ctx);
-
                     m->signal_activity();
-
-                    auto wait_us = std::chrono::microseconds(5000);
-                    if (pr.earliest_deadline != UINT64_MAX) {
-                        auto cur = managed_now_us();
-                        if (pr.earliest_deadline <= cur) {
-                            wait_us = std::chrono::microseconds(0);
-                        } else {
-                            auto delta = pr.earliest_deadline - cur;
-                            if (delta < 5000) wait_us =
-                                std::chrono::microseconds(delta);
-                        }
-                    }
-
-                    if (wait_us.count() > 0) {
-                        std::unique_lock<std::mutex> lk(m->wake_mu);
-                        m->wake_cv.wait_for(lk, wait_us, [m]() {
-                            return m->wake_flag.load() ||
-                                   !m->running.load();
+                    std::unique_lock<std::mutex> lk(m->wake_mu);
+                    m->wake_cv.wait_for(lk, std::chrono::microseconds(5000),
+                        [m]() {
+                            return m->wake_flag.load() || !m->running.load();
                         });
-                        m->wake_flag.store(false);
-                    }
+                    m->wake_flag.store(false);
                 }
             }
         } catch (...) {
@@ -1144,7 +1294,14 @@ moq_result_t moq_mvfst_managed_stop(moq_mvfst_managed_t *m)
     if (m->is_managed_thread()) return MOQ_ERR_INVAL;
     if (m->is_network_thread()) return MOQ_ERR_INVAL;
 
-    m->running.store(false);
+    /* Set running under wake_mu: the server manager thread blocks on
+     * wake_cv.wait(!running) with no timeout, so the store must be serialized
+     * with its predicate check to avoid a lost wakeup (the old 5ms wait_for
+     * masked this). */
+    {
+        std::lock_guard<std::mutex> lk(m->wake_mu);
+        m->running.store(false);
+    }
     m->notify_shutdown();
 
     if (m->thread && m->thread->joinable())
@@ -1910,6 +2067,18 @@ void moq_mvfst_managed::enable_credit_gating()
      * QUIC timers alive; the pump is a callback on it, not a blocking wait). */
     im->pump_wake = [self]() {
         self->request_pump();
+    };
+}
+
+void moq_mvfst_managed::wire_conn_server_pump(moq::mvfst::adapter *adp)
+{
+    if (!adp) return;
+    moq_mvfst_managed *self = this;
+    /* Server conns route pump_wake to the server_evb scheduler (not the client
+     * request_pump). onConnectionWriteReady/credit paths are inert here: server
+     * conns leave write_ready_enabled/credit_gating off. */
+    adp->impl_->pump_wake = [self]() {
+        self->server_request_pump();
     };
 }
 
