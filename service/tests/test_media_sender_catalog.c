@@ -1082,6 +1082,82 @@ int main(void)
         MOQ_TEST_PASS("sender_catalog.cmsf_pssh_base64");
     }
 
+    /* -- Post-ready add: the staged generation must be strict MSF-01 ----- */
+    /* Case: base catalog ready+published, one track added after ready, the
+     * generation staged (E2E case D). The emitted objects are consumed by
+     * OTHER MSF-01 receivers (PlayA), whose parsers are stricter than our
+     * own lenient parse -- so assert the exact wire shape, not a libmoq
+     * parse round-trip: base version String "1" (§5.1.1) and the §5.1.6
+     * deltaUpdate array with no root version. */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        (void)add_trk(s, "v", false);
+        moq_media_sender_test_set_ready(s);
+        moq_media_sender_test_mark_registered(s);
+        moq_media_sender_test_mark_published(s);   /* baseline = {v} */
+
+        /* Post-ready add shaped like a real LOC video track (the E2E case D
+         * shape): init data (inlined base64 into the delta add), width/
+         * height/framerate. */
+        {
+            moq_media_track_cfg_t tc;
+            moq_media_track_cfg_init(&tc);
+            tc.name = (moq_bytes_t){ (const uint8_t *)"late", 4 };
+            tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+            tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+            tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
+            tc.bitrate = 1500000;
+            tc.is_live = true;
+            static const uint8_t init_data[] = { 0x01, 0x42, 0xe0, 0x1e };
+            tc.init_data = (moq_bytes_t){ init_data, sizeof(init_data) };
+            tc.width = 320; tc.height = 240;
+            tc.framerate_millis = 30000;
+            moq_media_track_t *late = NULL;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_media_sender_add_track(s, &tc, &late), (int)MOQ_OK);
+        }
+        moq_media_sender_test_mark_registered(s);
+
+        moq_rcbuf_t *objs[3] = { NULL, NULL, NULL };
+        size_t nobj = moq_media_sender_test_stage(s, objs, 3);
+        MOQ_TEST_CHECK_EQ_INT((int)nobj, 2);       /* base + one ADD delta */
+
+        /* Object 0 -- the independent base. §5.1.1: version is the String
+         * "1" (the exact value PlayA and the pre-rewrite libmoq agree on;
+         * "draft-01" is rejected by strict MSF-01 receivers -- the E2E case D
+         * regression). */
+        {
+            char tmp[512];
+            size_t n = moq_rcbuf_len(objs[0]);
+            MOQ_TEST_CHECK(n < sizeof(tmp));
+            memcpy(tmp, moq_rcbuf_data(objs[0]), n); tmp[n] = '\0';
+            MOQ_TEST_CHECK(strstr(tmp, "\"version\":\"1\"") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "draft-01") == NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"tracks\":[") != NULL);
+        }
+
+        /* Object 1 -- the delta. §5.1.6 shape: a deltaUpdate ARRAY of
+         * {op, tracks} operations, and NO root version/tracks fields (a
+         * delta MUST NOT carry them). The added track must be the full
+         * self-contained shape (inline initData base64, no initRef). */
+        {
+            char tmp[1024];
+            size_t n = moq_rcbuf_len(objs[1]);
+            MOQ_TEST_CHECK(n < sizeof(tmp));
+            memcpy(tmp, moq_rcbuf_data(objs[1]), n); tmp[n] = '\0';
+            MOQ_TEST_CHECK(strncmp(tmp, "{\"deltaUpdate\":[{\"op\":\"add\"",
+                                   27) == 0);
+            MOQ_TEST_CHECK(strstr(tmp, "\"version\"") == NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"name\":\"late\"") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"initData\":\"AULgHg==\"") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "initRef") == NULL);
+        }
+
+        for (size_t i = 0; i < nobj; i++) moq_rcbuf_decref(objs[i]);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.post_ready_delta_strict_shape");
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

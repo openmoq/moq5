@@ -289,9 +289,9 @@ int main(void)
         CHECK(moq_msf_catalog_parse(alloc, lit(json), &cat) == MOQ_ERR_PROTO);
     }
 
-    /* -- MSF-01 §5.1.1: version is a String. Parse accepts the bare "1" (the
-     * value reserved for the final MSF version); the encoder emits "draft-01"
-     * for this draft (asserted in the encode tests below). ------------------ */
+    /* -- MSF-01 §5.1.1: version is the String "1" -- the canonical wire form
+     * the encoder emits (asserted in the encode tests below) and the form
+     * strict cross-impl receivers (PlayA) accept. ------------------------- */
     {
         const char *json = "{\"version\":\"1\",\"tracks\":[]}";
         moq_msf_catalog_t cat;
@@ -300,7 +300,8 @@ int main(void)
         moq_msf_catalog_cleanup(alloc, &cat);
     }
 
-    /* -- Accept (and emit) the draft-XX convention for this draft: "draft-01" */
+    /* -- Parse-only compat: "draft-01" (emitted by intermediate libmoq
+     * builds; never emitted anymore). */
     {
         const char *json = "{\"version\":\"draft-01\",\"tracks\":[]}";
         moq_msf_catalog_t cat;
@@ -564,8 +565,8 @@ int main(void)
         CHECK(moq_msf_catalog_encode(alloc, &cat, &out) == MOQ_OK);
         CHECK(out != NULL);
 
-        /* MSF-01 §5.1.1 wire form: version is the JSON String "draft-01" (the
-         * Internet-Draft "draft-XX" convention for this draft). */
+        /* MSF-01 §5.1.1 wire form: version is the JSON String "1" -- the
+         * canonical cross-impl form (PlayA rejects a draft-name string). */
         {
             const char *d = (const char *)moq_rcbuf_data(out);
             size_t n = moq_rcbuf_len(out);
@@ -573,7 +574,7 @@ int main(void)
             size_t c = n < sizeof(tmp) - 1 ? n : sizeof(tmp) - 1;
             memcpy(tmp, d, c);
             tmp[c] = '\0';
-            CHECK(strstr(tmp, "\"version\":\"draft-01\"") != NULL);
+            CHECK(strstr(tmp, "\"version\":\"1\"") != NULL);
         }
 
         moq_msf_catalog_t parsed;
@@ -1411,7 +1412,7 @@ int main(void)
         moq_rcbuf_t *enc = NULL;
         CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_OK);
         moq_bytes_t out = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
-        CHECK(contains_bytes(out, "\"version\":\"draft-01\""));
+        CHECK(contains_bytes(out, "\"version\":\"1\""));
         moq_rcbuf_decref(enc);   /* caller-built catalog: no cleanup */
     }
 
