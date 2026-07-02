@@ -595,10 +595,12 @@ static void ep_facade_wake(moq_endpoint_t *ep)
     if (ep->vt && ep->facade) ep->vt->wake(ep->facade);
 }
 
-/* Internal (endpoint_internal.h): best-effort, non-allocating prompt-wake for
- * attached services. A bare facade wake runs another pump cycle -- and thus
- * every attached hook -- without queuing a task, so a service can schedule
- * reconciliation of already-recorded state with no fallible allocation. */
+/* Public (<moq/endpoint.h>): best-effort, non-allocating pump nudge. A bare
+ * facade wake runs another pump cycle -- and thus every attached hook --
+ * without queuing a task; blocked waiters return because the cycle marks
+ * (coalesced, level-retained) activity, never by direct notification. Also
+ * used internally by attached services to schedule reconciliation of
+ * already-recorded state with no fallible allocation. */
 void moq_endpoint_wake(moq_endpoint_t *ep)
 {
     if (!ep) return;

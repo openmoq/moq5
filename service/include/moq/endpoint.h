@@ -147,6 +147,22 @@ MOQ_API void moq_endpoint_destroy(moq_endpoint_t *ep);
  * latch is set, MOQ_ERR_CLOSED once terminal. */
 MOQ_API moq_result_t moq_endpoint_wait(moq_endpoint_t *ep, uint64_t timeout_us);
 
+/* Nudge the endpoint to run a pump cycle soon: schedules endpoint service work
+ * (every attached hook runs), it does NOT notify waiters directly -- a blocked
+ * moq_endpoint_wait()/attached-service wait returns because the nudged pump
+ * cycle marks activity, and that activity flag is coalesced (multiple nudges
+ * before the cycle collapse into one) and LEVEL-retained (a wake that lands
+ * before the next wait is not lost; the wait returns immediately).
+ *
+ * Callable from any thread. Non-allocating and infallible by contract:
+ * unlike moq_endpoint_post() it queues no task, so it cannot fail -- use it
+ * to schedule reconciliation of state the caller has already recorded
+ * (record state, then wake), keeping the caller's own command atomic with no
+ * fallible allocation. Best-effort and idempotent; harmless (a no-op) after
+ * stop or terminal. It does not interact with the interrupt latch: waking a
+ * latched endpoint still yields MOQ_ERR_INTERRUPTED from blocking calls. */
+MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
+
 /* Block (app thread only) until local reliable stream data has been flushed out
  * of the transport's send queues -- no stream still has queued or ready-to-send
  * bytes or an unsent FIN. Call this after writing the last objects and before

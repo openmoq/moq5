@@ -2661,7 +2661,7 @@ moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
 
     pthread_mutex_lock(&r->mu);
     bool have = (r->ev_tail != r->ev_head) || (r->obj_tail != r->obj_head) ||
-                (r->sap_tail != r->sap_head);
+                (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head);
     pthread_mutex_unlock(&r->mu);
     if (have) return MOQ_OK;
     if (receiver_terminal(r)) return MOQ_ERR_CLOSED;
@@ -2671,7 +2671,7 @@ moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
 
     pthread_mutex_lock(&r->mu);
     have = (r->ev_tail != r->ev_head) || (r->obj_tail != r->obj_head) ||
-           (r->sap_tail != r->sap_head);
+           (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head);
     pthread_mutex_unlock(&r->mu);
     if (have) return MOQ_OK;
     if (receiver_terminal(r)) return MOQ_ERR_CLOSED;
@@ -3158,6 +3158,35 @@ void moq_media_receiver_test_set_limits(moq_media_receiver_t *r,
 size_t moq_media_receiver_test_track_count(const moq_media_receiver_t *r)
 {
     return r->track_count;
+}
+
+/* Enqueue one media-timeline record directly (the internal mt_queue_push under
+ * r->mu), so a wait-contract test can make the media-timeline queue the ONLY
+ * ready queue without driving a full §7 timeline ingest. The minimal
+ * test_new() receiver has no mt ring; allocate a small one lazily here
+ * (receiver_free releases it like the production ring). */
+void moq_media_receiver_test_push_media_timeline(moq_media_receiver_t *r,
+                                                 uint64_t group,
+                                                 uint64_t object,
+                                                 uint64_t media_time_ms,
+                                                 uint64_t wallclock_ms)
+{
+    if (!r->mts) {
+        r->mt_cap = 8;
+        r->mts = (moq_media_timeline_record_t *)r->alloc.alloc(
+            r->mt_cap * sizeof(moq_media_timeline_record_t), r->alloc.ctx);
+        if (!r->mts) { r->mt_cap = 0; return; }
+        memset(r->mts, 0, r->mt_cap * sizeof(moq_media_timeline_record_t));
+    }
+    moq_msf_media_timeline_record_t src;
+    memset(&src, 0, sizeof(src));
+    src.group = group;
+    src.object = object;
+    src.media_time_ms = media_time_ms;
+    src.wallclock_ms = wallclock_ms;
+    pthread_mutex_lock(&r->mu);
+    mt_queue_push(r, NULL, &src);
+    pthread_mutex_unlock(&r->mu);
 }
 
 /* Build a fully-initialized receiver (namespace, catalog name, overflow ring,

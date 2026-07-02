@@ -626,8 +626,12 @@ MOQ_API moq_result_t moq_media_receiver_get_stats(
 
 /* Borrow an existing endpoint (cfg->endpoint MUST be NULL). The endpoint
  * must outlive the receiver; moq_endpoint_stop() refuses with
- * MOQ_ERR_WRONG_STATE while the receiver is attached. v0: at most one
- * receiver per endpoint (a second attach returns MOQ_ERR_WRONG_STATE). */
+ * MOQ_ERR_WRONG_STATE while the receiver is attached. v0 attachment
+ * contract: at most one receiver per endpoint (a second attach returns
+ * MOQ_ERR_WRONG_STATE); a receiver and a sender MAY share one endpoint
+ * (one attachment slot per kind). Blocking waits share the endpoint's
+ * single coalesced activity wake, so multiplex them from one app thread
+ * rather than parking one thread per attachment. */
 MOQ_API moq_result_t moq_media_receiver_attach(moq_endpoint_t *ep,
                                                const moq_media_receiver_cfg_t *cfg,
                                                moq_media_receiver_t **out);
@@ -642,12 +646,15 @@ MOQ_API moq_result_t moq_media_receiver_create(const moq_media_receiver_cfg_t *c
  * destroys it too. void, like every libmoq destroy. */
 MOQ_API void moq_media_receiver_destroy(moq_media_receiver_t *r);
 
-/* Block until a track event is available, the receiver wakes or turns
- * terminal, or timeout_us elapses. Returns MOQ_OK on wake/available,
- * MOQ_DONE on timeout, MOQ_ERR_INTERRUPTED while the endpoint latch is
- * set, MOQ_ERR_CLOSED once terminal (queued events still drain via poll).
- * Reflects the underlying endpoint's terminal state identically in attach
- * and create modes. */
+/* Block until something is pollable, the receiver wakes or turns terminal,
+ * or timeout_us elapses. Level-triggered on ALL four receive queues: a
+ * queued track event, media object, SAP record, or media-timeline record
+ * returns MOQ_OK immediately (before and after the underlying wait), so a
+ * check-then-wait loop over any poll_* surface is race-free. Returns MOQ_OK
+ * on wake/available, MOQ_DONE on timeout, MOQ_ERR_INTERRUPTED while the
+ * endpoint latch is set, MOQ_ERR_CLOSED once terminal (queued items still
+ * drain via poll). Reflects the underlying endpoint's terminal state
+ * identically in attach and create modes. */
 MOQ_API moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
                                              uint64_t timeout_us);
 

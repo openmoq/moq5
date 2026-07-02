@@ -3474,6 +3474,53 @@ bool moq_media_sender_is_ready(const moq_media_sender_t *s)
     return r;
 }
 
+/* The wait level (s->mu held): ready AND the active queue has headroom for
+ * at least one more object under both bounds. Advisory -- see the header. */
+static bool sender_wait_level(const moq_media_sender_t *s)
+{
+    uint32_t depth = s->preq_tail - s->preq_head;
+    return s->ready && depth < active_obj_cap(s) &&
+           s->preq_bytes < active_byte_cap(s);
+}
+
+/* Level-triggered wait, the sender twin of moq_media_receiver_wait: check
+ * the level, block in the ENDPOINT wait (queue drain and the readiness flip
+ * both happen on pump cycles, which mark the endpoint's coalesced activity),
+ * re-check. PRIORITY before every MOQ_OK, pre- and post-wait: interrupt
+ * latch, then terminal (sender fatal / endpoint closed), then the level --
+ * write() refuses MOQ_ERR_INTERRUPTED under the latch and MOQ_ERR_CLOSED
+ * once terminal, so reporting "write now" in either state would be a lie
+ * (unlike the receiver, whose polls stay legal while latched and keep
+ * draining queued items after terminal). Lock order: s->mu is never held
+ * across the endpoint calls (hook order is ep->mu -> s->mu; see the
+ * BLOCK_TIMEOUT comment above); the latch reads use the ep->mu-free
+ * internal probe. */
+moq_result_t moq_media_sender_wait(moq_media_sender_t *s, uint64_t timeout_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+
+    if (moq_endpoint_interrupted_internal(s->ep)) return MOQ_ERR_INTERRUPTED;
+
+    pthread_mutex_lock(&s->mu);
+    bool level = sender_wait_level(s);
+    bool fatal = s->fatal;
+    pthread_mutex_unlock(&s->mu);
+    if (fatal || moq_endpoint_is_closed(s->ep)) return MOQ_ERR_CLOSED;
+    if (level) return MOQ_OK;
+
+    moq_result_t rc = moq_endpoint_wait(s->ep, timeout_us);
+    if (rc == MOQ_ERR_INTERRUPTED || rc == MOQ_DONE) return rc;
+    if (moq_endpoint_interrupted_internal(s->ep)) return MOQ_ERR_INTERRUPTED;
+
+    pthread_mutex_lock(&s->mu);
+    level = sender_wait_level(s);
+    fatal = s->fatal;
+    pthread_mutex_unlock(&s->mu);
+    if (fatal || moq_endpoint_is_closed(s->ep)) return MOQ_ERR_CLOSED;
+    if (level) return MOQ_OK;
+    return rc < 0 ? rc : MOQ_OK;
+}
+
 size_t moq_media_sender_track_subscriptions(const moq_media_sender_t *s,
                                             const moq_media_track_t *track)
 {
@@ -3565,6 +3612,13 @@ moq_media_sender_t *moq_media_sender_test_new(void)
     s->alloc = *alloc;
     s->ep = NULL;
     s->backpressure = MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME;
+    /* Production-default queue bounds: a zeroed cap is not a reachable
+     * production state (sender_new always applies the defaults), and the
+     * wait-level predicate reads them. */
+    s->queue_cap      = SENDER_DEFAULT_QUEUE_OBJECTS;
+    s->queue_byte_cap = SENDER_DEFAULT_QUEUE_BYTES;
+    s->preq_cap       = SENDER_DEFAULT_PRE_READY_OBJECTS;
+    s->preq_byte_cap  = SENDER_DEFAULT_PRE_READY_BYTES;
     pthread_mutex_init(&s->mu, NULL);
     pthread_cond_init(&s->space_cv, NULL);
     return s;
@@ -3573,6 +3627,21 @@ moq_media_sender_t *moq_media_sender_test_new(void)
 void moq_media_sender_test_free(moq_media_sender_t *s)
 {
     if (s) sender_free(s);
+}
+
+/* Force or clear the sender-fatal flag, so a wait-contract test can prove
+ * terminal state beats the ready+space level. Clearing is test-only (fatal is
+ * one-way in production; sender_set_fatal_locked never clears). */
+void moq_media_sender_test_set_fatal(moq_media_sender_t *s, bool fatal)
+{
+    pthread_mutex_lock(&s->mu);
+    if (fatal) {
+        sender_set_fatal_locked(s, 0x1);
+    } else {
+        s->fatal = false;
+        s->fatal_code = 0;
+    }
+    pthread_mutex_unlock(&s->mu);
 }
 
 /* Point a test sender at a (bare) endpoint so the BLOCK_TIMEOUT closed-check can

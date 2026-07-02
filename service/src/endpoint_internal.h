@@ -105,12 +105,10 @@ bool moq_endpoint_is_closed_internal(const moq_endpoint_t *ep);
 moq_result_t moq_endpoint_post_retryable(moq_endpoint_t *ep,
                                          moq_endpoint_task_fn fn, void *ctx);
 
-/* Non-allocating prompt-wake: nudge the network thread to run a pump cycle
- * (and thus every attached hook) soon. Unlike moq_endpoint_post(), it queues
- * no task and so cannot fail or allocate -- the contract is best-effort and
- * idempotent. An attached service uses it to schedule reconciliation of state
- * it has already recorded, so the public command stays atomic (record state +
- * wake) with no fallible allocation. Harmless (a no-op) after stop/terminal. */
-void moq_endpoint_wake(moq_endpoint_t *ep);
+/* moq_endpoint_wake() is PUBLIC (declared in <moq/endpoint.h>, included above):
+ * the non-allocating pump nudge attached services use to schedule
+ * reconciliation of already-recorded state (record state, then wake, so the
+ * public command stays atomic with no fallible allocation). Semantics
+ * unchanged by the export. */
 
 #endif /* MOQ_SERVICE_ENDPOINT_INTERNAL_H */

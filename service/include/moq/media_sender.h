@@ -537,9 +537,14 @@ MOQ_API moq_result_t moq_media_sender_get_stats(
 
 /* Borrow an existing endpoint (cfg->endpoint MUST be NULL). The endpoint
  * must outlive the sender; moq_endpoint_stop() refuses with
- * MOQ_ERR_WRONG_STATE while the sender is attached. v0: at most one sender
- * per endpoint (a second attach returns MOQ_ERR_WRONG_STATE), and a sender
- * and receiver do not share an endpoint in v0. */
+ * MOQ_ERR_WRONG_STATE while the sender is attached. v0 attachment
+ * contract: at most one sender per endpoint (a second attach returns
+ * MOQ_ERR_WRONG_STATE); a sender and a receiver MAY share one endpoint
+ * (one attachment slot per kind), with independent lifecycles -- stop()
+ * stays gated while EITHER is attached, and destroying one never detaches
+ * the other. Blocking waits share the endpoint's single coalesced activity
+ * wake, so multiplex them from one app thread rather than parking one
+ * thread per attachment. */
 MOQ_API moq_result_t moq_media_sender_attach(moq_endpoint_t *ep,
                                              const moq_media_sender_cfg_t *cfg,
                                              moq_media_sender_t **out);
@@ -560,6 +565,31 @@ MOQ_API void moq_media_sender_destroy(moq_media_sender_t *s);
  * subscribed -- use the callbacks on moq_media_sender_cfg_t or the demand
  * queries below (moq_media_sender_has_media_subscriber et al.). */
 MOQ_API bool moq_media_sender_is_ready(const moq_media_sender_t *s);
+
+/* Block (app thread) until the sender's WRITE LEVEL holds, the endpoint
+ * wakes, or timeout_us elapses. The level is: ready (see is_ready) AND the
+ * active send queue has headroom for at least one more object under the
+ * configured object/byte bounds. Level-triggered: a level that already
+ * holds returns MOQ_OK immediately, before and after the underlying
+ * endpoint wait, so a write -> WOULD_BLOCK -> wait -> retry loop is
+ * race-free.
+ *
+ * MOQ_OK means "attempt (another) write now" -- it does NOT promise the
+ * next arbitrary write succeeds: another thread may fill the queue first,
+ * a single write may exceed the byte budget, and drop-policy senders can
+ * still report per-object outcomes. Treat MOQ_OK as advisory readiness,
+ * exactly like moq_media_receiver_wait()'s "poll now".
+ *
+ * Returns MOQ_OK (level holds / endpoint woke), MOQ_DONE (timeout with the
+ * level not holding), MOQ_ERR_INTERRUPTED (endpoint latch set),
+ * MOQ_ERR_CLOSED (sender or endpoint terminal), MOQ_ERR_INVAL (NULL).
+ * PRIORITY: the latch, then terminal state, WIN over the level -- while
+ * latched wait() returns MOQ_ERR_INTERRUPTED (§5.3) and once terminal it
+ * returns MOQ_ERR_CLOSED, even when ready+space still holds, because
+ * write() refuses those same states and MOQ_OK would be a false
+ * "write now". */
+MOQ_API moq_result_t moq_media_sender_wait(moq_media_sender_t *s,
+                                           uint64_t timeout_us);
 
 /* -- Demand queries (§7.2) -------------------------------------------- *
  * App-thread-safe snapshots of subscriber/demand state. They read mirrored

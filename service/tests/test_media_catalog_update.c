@@ -33,6 +33,11 @@ void moq_media_receiver_test_set_limits(moq_media_receiver_t *r,
                                         size_t max_cp_snaps,
                                         uint64_t max_retained_bytes);
 size_t moq_media_receiver_test_track_count(const moq_media_receiver_t *r);
+void moq_media_receiver_test_push_media_timeline(moq_media_receiver_t *r,
+                                                 uint64_t group,
+                                                 uint64_t object,
+                                                 uint64_t media_time_ms,
+                                                 uint64_t wallclock_ms);
 
 static void ingest(moq_media_receiver_t *r, uint64_t g, uint64_t o,
                    const char *json)
@@ -1100,6 +1105,29 @@ int main(void)
             (uint64_t)moq_media_receiver_test_track_count(r), 1);  /* only "a" */
         moq_media_receiver_test_free(r);
         MOQ_TEST_PASS("catalog_update.delta_live_with_duration_dropped");
+    }
+
+    /* -- 31. wait() is level-triggered on the media-timeline queue too ----- */
+    /* A queued media-timeline record with every OTHER queue empty must satisfy
+     * moq_media_receiver_wait()'s ready pre-check (MOQ_OK without blocking),
+     * exactly like a queued track event / object / SAP record. Regression for
+     * the pre-check omitting mt_head/mt_tail: with the omission, wait() falls
+     * through to the endpoint path and (no endpoint here) reports CLOSED --
+     * i.e. a timeline-only wakeup had no wait-contract guarantee. */
+    {
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        moq_media_receiver_test_push_media_timeline(r, 3, 0, 1200, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_receiver_wait(r, 0), (int)MOQ_OK);
+
+        /* The record is really there and pollable. */
+        moq_media_timeline_record_t rec;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_receiver_poll_media_timeline(r, &rec, sizeof(rec)),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(rec.group, 3);
+        MOQ_TEST_CHECK_EQ_U64(rec.media_time_ms, 1200);
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.wait_level_triggered_on_media_timeline");
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

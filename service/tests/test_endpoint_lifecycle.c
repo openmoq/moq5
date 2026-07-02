@@ -8,6 +8,8 @@
  * and stop/destroy ordering + idempotency.
  */
 #include <moq/endpoint.h>
+#include <moq/media_receiver.h>
+#include <moq/media_sender.h>
 #include <moq/picoquic_threaded.h>
 #include "test_support.h"
 
@@ -20,6 +22,8 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sched.h>       /* sched_yield (wake-unblock waiter handoff) */
+#include <stdint.h>      /* UINT64_MAX (indefinite wait) */
 
 static int failures = 0;
 
@@ -93,6 +97,22 @@ static bool wait_for_state(moq_endpoint_t *ep, moq_endpoint_state_t want,
         waited += 100;
     }
     return moq_endpoint_state(ep) == want;
+}
+
+/* -- wake-unblock plumbing --------------------------------------------- */
+
+typedef struct {
+    moq_endpoint_t *ep;
+    atomic_int      entered;   /* waiter is about to block (or already did) */
+    moq_result_t    rc;
+} wake_waiter_t;
+
+static void *wake_waiter_fn(void *arg)
+{
+    wake_waiter_t *w = (wake_waiter_t *)arg;
+    atomic_store(&w->entered, 1);
+    w->rc = moq_endpoint_wait(w->ep, UINT64_MAX);   /* indefinite */
+    return NULL;
 }
 
 /* -- post() task plumbing --------------------------------------------- */
@@ -170,6 +190,26 @@ int main(int argc, char **argv)
         for (int i = 0; i < 50 && !saw_done; i++)
             saw_done = (moq_endpoint_wait(ep, 50000) == MOQ_DONE);
         MOQ_TEST_CHECK(saw_done);
+    }
+
+    /* == wake: the public pump nudge unblocks an INDEFINITE wait ======= */
+    {
+        /* A waiter blocks with NO timeout; the public moq_endpoint_wake()
+         * must let it return. Progress-only: the join is the assertion (a
+         * lost wake hangs here and fails via the ctest timeout — no latency
+         * is measured). The activity flag is level-retained, so BOTH
+         * interleavings are correct: wake before the waiter blocks makes
+         * the wait return immediately; wake after breaks the block. */
+        wake_waiter_t w;
+        w.ep = ep;
+        atomic_init(&w.entered, 0);
+        w.rc = MOQ_ERR_INTERNAL;
+        pthread_t th;
+        MOQ_TEST_CHECK_EQ_INT(pthread_create(&th, NULL, wake_waiter_fn, &w), 0);
+        while (!atomic_load(&w.entered)) sched_yield();
+        moq_endpoint_wake(ep);
+        pthread_join(th, NULL);
+        MOQ_TEST_CHECK_EQ_INT((int)w.rc, (int)MOQ_OK);
     }
 
     /* == drain: an established endpoint that has written no stream data has
@@ -499,6 +539,168 @@ int main(int argc, char **argv)
 
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == Endpoint sharing: one receiver + one sender coexist =========== *
+     * The v0 contract (per-kind hook slots): at most one receiver AND at
+     * most one sender per endpoint, and BOTH may be attached at once. The
+     * lifecycle is independent per attachment: stop() is gated while
+     * EITHER is live, destroying one never detaches the other, and
+     * wake/drain keep working with both attached. (The test server's pump
+     * never answers announces/subscribes, so neither service progresses
+     * past setup -- these are lifecycle assertions only.) */
+    {
+        int sport = 0;
+        moq_pq_threaded_t *ssrv = start_server(cert, key, &sport);
+        MOQ_TEST_CHECK(ssrv != NULL);
+        if (!ssrv) return 1;
+
+        char surl[64];
+        moq_endpoint_cfg_t sc = client_cfg(surl, sizeof(surl), sport);
+        moq_endpoint_t *sep = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&sc, &sep), (int)MOQ_OK);
+        MOQ_TEST_CHECK(wait_for_state(sep, MOQ_ENDPOINT_ESTABLISHED, 15000));
+
+        static const moq_bytes_t ns_parts[] = {
+            { (const uint8_t *)"share", 5 }, { (const uint8_t *)"test", 4 }
+        };
+        moq_namespace_t ns = { ns_parts, 2 };
+
+        moq_media_receiver_cfg_t rcfg;
+        moq_media_receiver_cfg_init_live(&rcfg);
+        rcfg.namespace_ = ns;
+        moq_media_receiver_t *rx = NULL;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_receiver_attach(sep, &rcfg, &rx), (int)MOQ_OK);
+        MOQ_TEST_CHECK(rx != NULL);
+
+        moq_media_sender_cfg_t scfg2;
+        moq_media_sender_cfg_init_live(&scfg2);
+        scfg2.namespace_ = ns;
+        moq_media_sender_t *tx = NULL;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_sender_attach(sep, &scfg2, &tx), (int)MOQ_OK);
+        MOQ_TEST_CHECK(tx != NULL);
+
+        /* Per-kind slots stay single: a SECOND receiver or sender is
+         * refused while the first is attached. */
+        {
+            moq_media_receiver_t *rx2 = NULL;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_media_receiver_attach(sep, &rcfg, &rx2),
+                (int)MOQ_ERR_WRONG_STATE);
+            MOQ_TEST_CHECK(rx2 == NULL);
+            moq_media_sender_t *tx2 = NULL;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_media_sender_attach(sep, &scfg2, &tx2),
+                (int)MOQ_ERR_WRONG_STATE);
+            MOQ_TEST_CHECK(tx2 == NULL);
+        }
+
+        /* stop() is gated while both live. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(sep),
+                              (int)MOQ_ERR_WRONG_STATE);
+
+        /* wake with both attached: safe, and the endpoint stays healthy. */
+        moq_endpoint_wake(sep);
+        MOQ_TEST_CHECK(!moq_endpoint_is_fatal(sep));
+
+        /* Destroying the receiver does NOT detach or kill the sender:
+         * stop() stays gated and the sender handle stays queryable. */
+        moq_media_receiver_destroy(rx);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(sep),
+                              (int)MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(tx));
+        (void)moq_media_sender_is_ready(tx);   /* queryable, value untested */
+
+        /* The freed receiver slot is reusable while the sender lives. */
+        {
+            moq_media_receiver_t *rx3 = NULL;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_media_receiver_attach(sep, &rcfg, &rx3), (int)MOQ_OK);
+            moq_media_receiver_destroy(rx3);
+        }
+
+        /* drain with the sender still attached returns a documented code
+         * (nothing was written, so OK is expected on picoquic; DONE also
+         * legal under load). */
+        {
+            moq_result_t drc = moq_endpoint_drain(sep, 2000000);
+            MOQ_TEST_CHECK(drc == MOQ_OK || drc == MOQ_DONE);
+        }
+
+        moq_media_sender_destroy(tx);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(sep), (int)MOQ_OK);
+        moq_endpoint_destroy(sep);
+        moq_pq_threaded_stop(ssrv);
+        moq_pq_threaded_destroy(ssrv);
+    }
+
+    /* == moq_media_sender_wait: level-triggered wait contract ========== *
+     * Deterministic cases only:
+     *   - NULL sender          -> MOQ_ERR_INVAL
+     *   - not ready            -> MOQ_DONE on a zero/short timeout (the
+     *                             test server never answers the announce)
+     *   - interrupt latch set  -> MOQ_ERR_INTERRUPTED
+     * The ready+space MOQ_OK fast path is covered by the white-box test in
+     * test_media_sender_catalog.c (readiness needs a relay accept). */
+    {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(NULL, 0),
+                              (int)MOQ_ERR_INVAL);
+
+        int wport = 0;
+        moq_pq_threaded_t *wsrv = start_server(cert, key, &wport);
+        MOQ_TEST_CHECK(wsrv != NULL);
+        if (!wsrv) return 1;
+        char wurl[64];
+        moq_endpoint_cfg_t wc = client_cfg(wurl, sizeof(wurl), wport);
+        moq_endpoint_t *wep = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&wc, &wep), (int)MOQ_OK);
+        MOQ_TEST_CHECK(wait_for_state(wep, MOQ_ENDPOINT_ESTABLISHED, 15000));
+
+        static const moq_bytes_t wns_parts[] = {
+            { (const uint8_t *)"wait", 4 }, { (const uint8_t *)"test", 4 }
+        };
+        moq_namespace_t wns = { wns_parts, 2 };
+        moq_media_sender_cfg_t wcfg;
+        moq_media_sender_cfg_init_live(&wcfg);
+        wcfg.namespace_ = wns;
+        moq_media_sender_t *ws = NULL;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_sender_attach(wep, &wcfg, &ws), (int)MOQ_OK);
+
+        /* Not ready (announce never answered): the level never holds, so
+         * once residual endpoint activity drains, the wait reports MOQ_DONE
+         * (MOQ_OK on a wake means "re-check", same as receiver_wait; it must
+         * settle to DONE on a quiescent endpoint, never spuriously report
+         * the level). */
+        MOQ_TEST_CHECK(!moq_media_sender_is_ready(ws));
+        {
+            bool saw_done = false;
+            for (int i = 0; i < 50 && !saw_done; i++)
+                saw_done = (moq_media_sender_wait(ws, 50000) == MOQ_DONE);
+            MOQ_TEST_CHECK(saw_done);
+        }
+
+        /* Latched: immediate MOQ_ERR_INTERRUPTED, repeatably (sticky). */
+        moq_endpoint_set_interrupted(wep, true);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(ws, 5000000),
+                              (int)MOQ_ERR_INTERRUPTED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(ws, 5000000),
+                              (int)MOQ_ERR_INTERRUPTED);
+        moq_endpoint_set_interrupted(wep, false);
+        {
+            bool saw_done = false;
+            for (int i = 0; i < 50 && !saw_done; i++)
+                saw_done = (moq_media_sender_wait(ws, 50000) == MOQ_DONE);
+            MOQ_TEST_CHECK(saw_done);
+        }
+
+        moq_media_sender_destroy(ws);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(wep), (int)MOQ_OK);
+        moq_endpoint_destroy(wep);
+        moq_pq_threaded_stop(wsrv);
+        moq_pq_threaded_destroy(wsrv);
     }
 
     MOQ_TEST_PASS("endpoint_lifecycle");

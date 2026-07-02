@@ -40,5 +40,11 @@ int main(void)
     if (tcfg.start != MOQ_MEDIA_START_CURRENT)
         return 5;
 
+    /* Wake/wait contract surface: NULL-safe forms only (no network), so the
+     * installed prefix proves both new public symbols link and behave. */
+    moq_endpoint_wake(NULL);                       /* documented no-op */
+    if (moq_media_sender_wait(NULL, 0) != MOQ_ERR_INVAL)
+        return 6;
+
     return 0;
 }

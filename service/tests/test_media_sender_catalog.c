@@ -42,6 +42,7 @@ void moq_media_sender_test_mark_registered(moq_media_sender_t *s);
 moq_result_t moq_media_sender_test_validate_cfg(const moq_media_sender_cfg_t *cfg);
 /* Lock-order regression seams (media_sender.c + endpoint.c, _TESTING). */
 void moq_media_sender_test_set_ep(moq_media_sender_t *s, moq_endpoint_t *ep);
+void moq_media_sender_test_set_fatal(moq_media_sender_t *s, bool fatal);
 bool moq_media_sender_test_endpoint_closed(moq_media_sender_t *s);
 moq_endpoint_t *moq_endpoint_test_make_bare(void);
 void moq_endpoint_test_free_bare(moq_endpoint_t *ep);
@@ -1156,6 +1157,79 @@ int main(void)
         for (size_t i = 0; i < nobj; i++) moq_rcbuf_decref(objs[i]);
         moq_media_sender_test_free(s);
         MOQ_TEST_PASS("sender_catalog.post_ready_delta_strict_shape");
+    }
+
+    /* -- moq_media_sender_wait: the ready+space level short-circuits ----- */
+    /* With the sender READY, its queue empty, and a healthy (bare, non-
+     * terminal, unlatched) endpoint, the level holds, so wait() returns
+     * MOQ_OK from the pre-check without ever blocking (a bare endpoint has
+     * no facade -- reaching the endpoint wait would report CLOSED, failing
+     * this test). Complements the not-ready / interrupted / timeout cases
+     * in test_endpoint_lifecycle.c. */
+    {
+        moq_endpoint_t *ep = moq_endpoint_test_make_bare();
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_ep(s, ep);
+        moq_media_sender_test_set_ready(s);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 1000), (int)MOQ_OK);
+        moq_media_sender_test_set_ep(s, NULL);   /* bare ep is test-owned */
+        moq_media_sender_test_free(s);
+        moq_endpoint_test_free_bare(ep);
+        MOQ_TEST_PASS("sender_catalog.wait_level_ready_with_space");
+    }
+
+    /* -- moq_media_sender_wait: the interrupt latch beats the level ------ */
+    /* write() refuses MOQ_ERR_INTERRUPTED while the endpoint latch is set,
+     * so wait() must NEVER report MOQ_OK ("write now") under the same latch
+     * -- even when the ready+space level holds. The latch wins over
+     * everything (§5.3), matching the endpoint/receiver waits and the
+     * header's promise. Clearing the latch restores the level's MOQ_OK. */
+    {
+        moq_endpoint_t *ep = moq_endpoint_test_make_bare();
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_ep(s, ep);
+        moq_media_sender_test_set_ready(s);
+
+        moq_endpoint_set_interrupted(ep, true);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 0),
+                              (int)MOQ_ERR_INTERRUPTED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 1000),
+                              (int)MOQ_ERR_INTERRUPTED);
+        moq_endpoint_set_interrupted(ep, false);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 0), (int)MOQ_OK);
+
+        moq_media_sender_test_set_ep(s, NULL);   /* bare ep is test-owned */
+        moq_media_sender_test_free(s);
+        moq_endpoint_test_free_bare(ep);
+        MOQ_TEST_PASS("sender_catalog.wait_latch_beats_level");
+    }
+
+    /* -- moq_media_sender_wait: terminal state beats the level too ------- */
+    /* write() rejects MOQ_ERR_CLOSED once the sender is fatal (or the
+     * endpoint terminal), so wait() must report MOQ_ERR_CLOSED under the
+     * same state even when ready+space still holds -- never a false "write
+     * now". Clearing the (test-only) fatal restores the level's MOQ_OK. */
+    {
+        moq_endpoint_t *ep = moq_endpoint_test_make_bare();
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_ep(s, ep);
+        moq_media_sender_test_set_ready(s);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 0), (int)MOQ_OK);
+
+        moq_media_sender_test_set_fatal(s, true);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 0),
+                              (int)MOQ_ERR_CLOSED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 1000),
+                              (int)MOQ_ERR_CLOSED);
+
+        moq_media_sender_test_set_fatal(s, false);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_wait(s, 0), (int)MOQ_OK);
+
+        moq_media_sender_test_set_ep(s, NULL);   /* bare ep is test-owned */
+        moq_media_sender_test_free(s);
+        moq_endpoint_test_free_bare(ep);
+        MOQ_TEST_PASS("sender_catalog.wait_terminal_beats_level");
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
