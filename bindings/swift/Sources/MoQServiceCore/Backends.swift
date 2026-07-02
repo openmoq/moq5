@@ -163,10 +163,65 @@ package protocol ReceiverBackend: AnyObject, Sendable {
     func detach()
 }
 
-/// Sender-side backing: readiness, write, track lifecycle. Filled in by the
-/// engine slice (S2) — declared now so the model layer's shape is fixed.
+/// One write/endTrack outcome (the C media_sender vocabulary). For write,
+/// `.ok` means ownership transferred; every other case transfers nothing.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-package protocol SenderBackend: AnyObject, Sendable {}
+package enum SenderOperationResult: Sendable {
+    case ok
+    case wouldBlock        /* bounded queue full / no anchor; retryable */
+    case invalidArgument
+    case wrongState        /* ended/removed/VOD track, or after complete */
+    case interrupted       /* the endpoint latch (C checks it in write) */
+    case closed            /* terminal; discriminate via isFatal/fatalCode */
+}
+
+/// One addTrack outcome.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum SenderAddTrackResult: Sendable {
+    case track(handleID: UInt64)
+    case invalidArgument   /* duplicate name, malformed cfg, bad CP refs */
+    case wouldBlock        /* post-ready add vs a name still tearing down */
+    case wrongState        /* after complete() */
+    case closed
+    case outOfMemory
+}
+
+/// One bounded sender wait's outcome (the S0 `moq_media_sender_wait`
+/// vocabulary; its level is ready AND active-queue headroom, and the latch,
+/// then terminal state, WIN over the level).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum SenderWaitOutcome: Sendable {
+    case activity          /* MOQ_OK: level holds OR the endpoint
+                              woke -- attempt (another) write now; the
+                              level is NOT guaranteed */
+    case timeout           /* MOQ_DONE */
+    case interrupted
+    case closed
+}
+
+/// Sender-side backing. Subscriber/demand events, remove/convert/complete,
+/// and stats land in a later slice.
+///
+/// Any-thread C snapshots: `isReady` (announced + catalog published, NOT
+/// demand), `isTerminal` (closed OR fatal), `isFatal`/`fatalCode` (the
+/// terminal discriminator -- C collapses fatal and clean terminal into
+/// MOQ_ERR_CLOSED). Service-thread only: `addTrack`, `write`, `endTrack`,
+/// `wait` (BLOCKING for at most the given slice -- legal on the service
+/// thread for the same reason the endpoint drain is: while a job runs, the
+/// loop is not in the endpoint wait, so there is exactly one C waiter),
+/// and `detach` (the C sender destroy; called exactly once, nothing after).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package protocol SenderBackend: AnyObject, Sendable {
+    var isReady: Bool { get }
+    var isTerminal: Bool { get }
+    var isFatal: Bool { get }
+    var fatalCode: UInt64 { get }
+    func addTrack(_ configuration: TrackConfiguration) -> SenderAddTrackResult
+    func write(handleID: UInt64, object: OutgoingObject) -> SenderOperationResult
+    func endTrack(handleID: UInt64) -> SenderOperationResult
+    func wait(timeoutMicroseconds: UInt64) -> SenderWaitOutcome
+    func detach()
+}
 
 /// Exclusive ownership of one received object's backing storage (the C
 /// tier's transferred rcbufs, or a test mock). ``MediaObject`` releases it
