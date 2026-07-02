@@ -5,11 +5,19 @@ import Foundation
 
 let enableTransport = ProcessInfo.processInfo.environment["MOQ_TRANSPORT"] == "1"
 
+// NOTE: no package-wide `platforms:` floor. The MoQService model layer uses
+// Swift Duration (macOS 13 / iOS 16), but that requirement is contained to
+// the MoQServiceCore target via per-declaration @available — raising the
+// floor for the shipping MoQ/MoQMedia products is a product decision deferred
+// to the MoQService product slice.
 let package = Package(
     name: "MOQ5",
     products: [
         .library(name: "MoQ", targets: ["MoQ"]),
         .library(name: "MoQMedia", targets: ["MoQMedia"]),
+        // C-free MSF catalog types: importable beside the (future, installed-
+        // mode) MoQService product without pulling the from-source C stack in.
+        .library(name: "MoQCatalog", targets: ["MoQCatalog"]),
     ],
     targets: [
         // C core: sans-I/O MoQ session engine.
@@ -59,11 +67,33 @@ let package = Package(
             path: "bindings/swift/Sources/MoQ"
         ),
 
+        // Pure-Swift MSF catalog (no C dependencies). Split out of MoQMedia so
+        // catalog authoring/parsing stays available to apps that must NOT link
+        // the from-source C targets (see the MoQService plan: the installed-
+        // mode service product is binary-exclusive with the source-built
+        // stack). MoQMedia re-exports it for source compatibility.
+        .target(
+            name: "MoQCatalog",
+            path: "bindings/swift/Sources/MoQCatalog"
+        ),
+
         // Swift media layer.
         .target(
             name: "MoQMedia",
-            dependencies: ["MoQ", "CMoQMediaObject", "CMoQLOC", "CMoQCMAF", "CMoQPlayback"],
+            dependencies: ["MoQ", "MoQCatalog", "CMoQMediaObject", "CMoQLOC", "CMoQCMAF", "CMoQPlayback"],
             path: "bindings/swift/Sources/MoQMedia"
+        ),
+
+        // Pure-Swift model layer for the (future) MoQService product: public
+        // endpoint/receiver/sender/track/object types, configurations, errors,
+        // and the package-internal backend seams. Always built; the C bridge
+        // (CMoQService system module + real backends) lands in a later slice
+        // behind an env gate, alongside the moq_swift_stack_guard collision
+        // canary + negative link test (TODO: guard belongs to that slice --
+        // there is no MoQService product to collide with yet).
+        .target(
+            name: "MoQServiceCore",
+            path: "bindings/swift/Sources/MoQServiceCore"
         ),
 
         // C media: playback pipeline.
@@ -125,6 +155,16 @@ let package = Package(
             name: "MoQRecvArgsTests",
             dependencies: ["MoQRecvArgs"],
             path: "bindings/swift/Tests/MoQRecvArgsTests"
+        ),
+        .testTarget(
+            name: "MoQCatalogTests",
+            dependencies: ["MoQCatalog"],
+            path: "bindings/swift/Tests/MoQCatalogTests"
+        ),
+        .testTarget(
+            name: "MoQServiceCoreTests",
+            dependencies: ["MoQServiceCore"],
+            path: "bindings/swift/Tests/MoQServiceCoreTests"
         ),
     ]
 )

@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import MoQMedia
+@testable import MoQCatalog
 
 @Suite("MSF Catalog Decode")
 struct MSFCatalogDecodeTests {
