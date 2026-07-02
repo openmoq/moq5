@@ -140,6 +140,17 @@ package enum ReceiverCommandResult: Sendable {
     case unsupported                    /* MSF namespace-override tracks */
 }
 
+/// An endpoint backend that can vend REAL attachment backends (the
+/// installed-mode C bridge conforms; scripted test backends do not, so the
+/// public attach keeps throwing `.unsupported` against them). The factory
+/// call creates the C-side attachment (e.g. `moq_media_receiver_attach`) --
+/// callable from the attach caller's thread, per the C service contract.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package protocol ReceiverBackendFactory {
+    func makeReceiverBackend(
+        configuration: MediaReceiver.Configuration) throws -> any ReceiverBackend
+}
+
 /// Receiver-side backing. SAP/timeline record polling lands later.
 ///
 /// Any-thread C snapshots: `isFatal`/`fatalCode` (composing the receiver's

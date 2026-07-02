@@ -15,6 +15,7 @@ final class CBytesArena {
     deinit {
         for allocation in byteAllocations { allocation.deallocate() }
         for allocation in versionAllocations { allocation.deallocate() }
+        for allocation in namespaceAllocations { allocation.deallocate() }
     }
 
     func bytes(_ string: String?) -> moq_bytes_t {
@@ -38,6 +39,18 @@ final class CBytesArena {
         byteAllocations.append(buffer)
         return moq_bytes_t(data: UnsafePointer(buffer.baseAddress),
                            len: utf8.count)
+    }
+
+    private var namespaceAllocations: [UnsafeMutableBufferPointer<moq_bytes_t>] = []
+
+    func namespaceParts(_ parts: [String]) -> moq_namespace_t {
+        guard !parts.isEmpty else { return moq_namespace_t(parts: nil, count: 0) }
+        let buffer = UnsafeMutableBufferPointer<moq_bytes_t>.allocate(
+            capacity: parts.count)
+        _ = buffer.initialize(fromContentsOf: parts.map { bytes($0) })
+        namespaceAllocations.append(buffer)
+        return moq_namespace_t(parts: UnsafePointer(buffer.baseAddress),
+                               count: parts.count)
     }
 
     func versions(_ versions: [MoQVersion])
@@ -157,7 +170,7 @@ func cBackend(_ backend: MoQEndpoint.TransportBackend)
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 final class ServiceEndpointBackend: EndpointBackend, @unchecked Sendable {
 
-    private let endpoint: OpaquePointer
+    let endpoint: OpaquePointer
 
     init(endpoint: OpaquePointer) {
         self.endpoint = endpoint

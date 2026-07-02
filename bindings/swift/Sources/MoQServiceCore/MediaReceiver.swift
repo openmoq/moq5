@@ -114,13 +114,25 @@ public final class MediaReceiver: @unchecked Sendable {
     // MARK: Lifecycle
 
     /// Attach to an existing endpoint (one receiver per endpoint; may share
-    /// the endpoint with one ``MediaSender``). Synchronous: validation and
-    /// the engine slot claim happen here; discovery proceeds on the
-    /// endpoint's service thread.
+    /// the endpoint with one ``MediaSender``). Synchronous: validation, the
+    /// C-side attach, and the engine slot claim happen here; discovery
+    /// proceeds on the endpoint's service thread. Throws
+    /// ``MoQServiceError/unsupported`` for an endpoint without an
+    /// installed-stack backend (the MoQService product provides one).
     public static func attach(to endpoint: MoQEndpoint,
                               configuration: Configuration) throws -> MediaReceiver {
         try configuration.validate()
-        throw MoQServiceError.unsupported   // TODO(S6): real backend factory
+        guard let factory = endpoint.backend as? any ReceiverBackendFactory else {
+            throw MoQServiceError.unsupported
+        }
+        let backend = try factory.makeReceiverBackend(configuration: configuration)
+        do {
+            return try attach(to: endpoint, configuration: configuration,
+                              backend: backend)
+        } catch {
+            backend.detach()    /* never leak the C receiver on a slot race */
+            throw error
+        }
     }
 
     /// The wiring the public attach uses once a backend exists (S6); tests
