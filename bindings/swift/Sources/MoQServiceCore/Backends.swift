@@ -184,6 +184,7 @@ package enum SenderOperationResult: Sendable {
     case wrongState        /* ended/removed/VOD track, or after complete */
     case interrupted       /* the endpoint latch (C checks it in write) */
     case closed            /* terminal; discriminate via isFatal/fatalCode */
+    case outOfMemory       /* allocation failure (payload buffer, C NOMEM) */
 }
 
 /// One addTrack outcome.
@@ -208,6 +209,14 @@ package enum SenderWaitOutcome: Sendable {
     case timeout           /* MOQ_DONE */
     case interrupted
     case closed
+}
+
+/// An endpoint backend that can vend REAL sender backends (the
+/// installed-mode C bridge conforms); see ``ReceiverBackendFactory``.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package protocol SenderBackendFactory {
+    func makeSenderBackend(
+        configuration: MediaSender.Configuration) throws -> any SenderBackend
 }
 
 /// Sender-side backing. Subscriber/demand events, remove/convert/complete,

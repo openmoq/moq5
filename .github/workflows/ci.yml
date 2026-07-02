@@ -75,6 +75,59 @@ jobs:
       - name: Swift test
         run: swift test
 
+  swift-service-binding:
+    name: Swift Service Binding (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pinned picoquic/picotls
+        run: scripts/setup_picoquic_deps.sh
+
+      # Installed-prefix service tier (picoquic-family only: an mvfst/
+      # proxygen service install has no pkg-config file by design).
+      - name: Configure service install tree
+        run: >
+          cmake -B build/swift-service
+          -DCMAKE_BUILD_TYPE=Release
+          -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_MEDIA_OBJECT=ON
+          -DMOQ_BUILD_SERVICE=ON
+          -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
+          -DMOQ_BUILD_PQ_THREADED=ON
+          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
+          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+
+      - name: Build + install prefix
+        run: >
+          cmake --build build/swift-service -j3 &&
+          cmake --install build/swift-service --prefix "$PWD/build/service-prefix"
+
+      # Gated suite: MoQService bridge mapping tests + the C-free suites
+      # (the MoQ-linking test targets run in the ungated swift-binding job;
+      # they cannot share a test bundle with MoQService -- that is the
+      # duplicate-symbol canary working).
+      - name: Gated Swift test (MOQ_SERVICE=1)
+        run: MOQ_SERVICE=1 swift test
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
+
+      # Binary exclusivity: a consumer importing BOTH stacks must FAIL to
+      # link on moq_swift_stack_guard.
+      - name: Stack-guard negative link test
+        run: scripts/check_swift_stack_guard.sh
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
+
+      # Packaging: a cold consumer importing ONLY MoQService must build.
+      - name: Consumer cold-build smoke
+        run: >
+          cd bindings/swift/Tests/fixtures/ServiceConsumer &&
+          MOQ_SERVICE=1 swift build
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
+
   cpp-binding:
     name: C++ Binding (Linux)
     runs-on: ubuntu-latest

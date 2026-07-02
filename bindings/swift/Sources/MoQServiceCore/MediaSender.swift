@@ -120,11 +120,24 @@ public final class MediaSender: @unchecked Sendable {
     // MARK: Lifecycle
 
     /// Attach to an existing endpoint (one sender per endpoint; may share
-    /// the endpoint with one ``MediaReceiver``).
+    /// the endpoint with one ``MediaReceiver``). Synchronous: validation,
+    /// the C-side attach, and the engine slot claim happen here. Throws
+    /// ``MoQServiceError/unsupported`` for an endpoint without an
+    /// installed-stack backend (the MoQService product provides one).
     public static func attach(to endpoint: MoQEndpoint,
                               configuration: Configuration) throws -> MediaSender {
         try configuration.validate()
-        throw MoQServiceError.unsupported   // TODO(S6): real backend factory
+        guard let factory = endpoint.backend as? any SenderBackendFactory else {
+            throw MoQServiceError.unsupported
+        }
+        let backend = try factory.makeSenderBackend(configuration: configuration)
+        do {
+            return try attach(to: endpoint, configuration: configuration,
+                              backend: backend)
+        } catch {
+            backend.detach()    /* never leak the C sender on a slot race */
+            throw error
+        }
     }
 
     /// The wiring the public attach uses once a backend exists (S6); tests
@@ -276,6 +289,8 @@ public final class MediaSender: @unchecked Sendable {
                     throw MoQServiceError.interrupted
                 case .closed:
                     throw attachment.terminalError()
+                case .outOfMemory:
+                    throw MoQServiceError.outOfMemory
                 }
             }
             if queued { return }
@@ -319,6 +334,8 @@ public final class MediaSender: @unchecked Sendable {
                     throw MoQServiceError.interrupted
                 case .closed:
                     throw attachment.terminalError()
+                case .outOfMemory:
+                    throw MoQServiceError.outOfMemory
                 }
             }
             if delivered { return }
@@ -438,6 +455,8 @@ package final class SenderAttachment: @unchecked Sendable {
             throw MoQServiceError.interrupted
         case .closed:
             throw terminalError()
+        case .outOfMemory:
+            throw MoQServiceError.outOfMemory
         }
     }
 }

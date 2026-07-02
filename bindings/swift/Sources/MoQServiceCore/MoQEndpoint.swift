@@ -151,7 +151,7 @@ public final class MoQEndpoint: @unchecked Sendable {
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 extension Duration {
     /// Whole microseconds, saturating; non-positive durations become 0.
-    var wholeMicroseconds: UInt64 {
+    package var wholeMicroseconds: UInt64 {
         guard self > .zero else { return 0 }
         let parts = components
         let fromSeconds = UInt64(parts.seconds).multipliedReportingOverflow(
