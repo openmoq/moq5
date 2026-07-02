@@ -4,10 +4,9 @@ import Foundation
 /// network thread (owned by the C service tier), and up to one
 /// ``MediaReceiver`` plus one ``MediaSender`` attachment.
 ///
-/// This is the model-layer shell: configuration, state, and the interrupt
-/// latch are live; the connect/wait engine (service thread, streams,
-/// teardown) lands with the C bridge slice. Async lifecycle methods throw
-/// ``MoQServiceError/unsupported`` until then.
+/// Lifecycle (`established`/`drain`/`close`), the interrupt latch, and state
+/// run over the endpoint's service-thread engine. The public `connect`
+/// factory (a real transport backend) lands with the C bridge slice.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public final class MoQEndpoint: @unchecked Sendable {
 
@@ -74,15 +73,26 @@ public final class MoQEndpoint: @unchecked Sendable {
     }
 
     public let configuration: Configuration
-    package let backend: any EndpointBackend
+    package let engine: EndpointEngine
+    package var backend: any EndpointBackend { engine.backend }
 
-    package init(configuration: Configuration, backend: any EndpointBackend) {
+    package init(configuration: Configuration, engine: EndpointEngine) {
         self.configuration = configuration
-        self.backend = backend
+        self.engine = engine
     }
 
-    public var state: State { backend.state }
-    public var negotiatedVersion: MoQVersion? { backend.negotiatedVersion }
+    deinit {
+        /* Best-effort, non-blocking backstop: an endpoint dropped without
+         * close() still tears its service thread and backend down. */
+        engine.beginShutdown()
+    }
+
+    /// `.closed` once the endpoint has been closed/destroyed (the engine
+    /// answers post-teardown reads itself; the backend is never touched
+    /// after destroy).
+    public var state: State { engine.state }
+    /// The negotiated version; retains its last value across close.
+    public var negotiatedVersion: MoQVersion? { engine.negotiatedVersion }
 
     // MARK: Interrupt latch
 
@@ -90,26 +100,66 @@ public final class MoQEndpoint: @unchecked Sendable {
     /// this endpoint and its attachments throws
     /// ``MoQServiceError/interrupted`` until ``resume()``. Non-terminal;
     /// callable from any thread (GStreamer `unlock`/`unlock_stop` analog).
-    public func interrupt() { backend.setInterrupted(true) }
+    public func interrupt() { engine.setInterrupted(true) }
 
     /// Clear the interrupt latch; suspended surfaces become usable again.
-    public func resume() { backend.setInterrupted(false) }
+    public func resume() { engine.setInterrupted(false) }
 
-    // MARK: Lifecycle (engine lands with the C bridge slice)
+    // MARK: Lifecycle
 
-    /// Suspends until the connection is ESTABLISHED.
+    /// Suspends until the connection is ESTABLISHED. Throws
+    /// ``MoQServiceError/interrupted`` while the latch is set,
+    /// ``MoQServiceError/fatal(code:)`` / ``MoQServiceError/closed`` once
+    /// terminal; Task cancellation throws `CancellationError`.
     public func established() async throws {
-        throw MoQServiceError.unsupported   // TODO(S2): service-thread engine
+        let backend = self.backend
+        try await engine.waitUntil {
+            switch backend.state {
+            case .established:
+                return .satisfied
+            case .closed:
+                return .failure(backend.isFatal
+                    ? .fatal(code: backend.fatalCode) : .closed)
+            case .connecting, .draining:
+                return .pending
+            }
+        }
     }
 
-    /// Pre-stop flush of locally queued reliable stream data.
+    /// Flush locally queued reliable stream data before stopping -- THE
+    /// flush guarantee (``close()`` never drains). Returns once the local
+    /// stream backlog is provably empty; throws
+    /// ``MoQServiceError/wouldBlock`` when `timeout` elapses first,
+    /// ``MoQServiceError/unsupported`` when the backend cannot prove a
+    /// flush, plus the interrupted/closed/fatal states.
     public func drain(timeout: Duration) async throws {
-        throw MoQServiceError.unsupported   // TODO(S2): service-thread engine
+        guard timeout > .zero else {
+            throw MoQServiceError.invalidArgument("drain timeout must be positive")
+        }
+        try await engine.drain(timeoutMicroseconds: timeout.wholeMicroseconds)
     }
 
-    /// Tear down: children, optional drain, stop (joins the network thread),
-    /// destroy. Idempotent.
-    public func close(drainTimeout: Duration? = nil) async {
-        // TODO(S2): service-thread engine; model shell is a no-op.
+    /// Tear down: stop (joins the network thread) and destroy. Idempotent;
+    /// never throws. This is NOT graceful -- queued send data may be
+    /// truncated. For a flush guarantee, `try await drain(timeout:)` first
+    /// and handle its errors, then close.
+    public func close() async {
+        await engine.close()
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension Duration {
+    /// Whole microseconds, saturating; non-positive durations become 0.
+    var wholeMicroseconds: UInt64 {
+        guard self > .zero else { return 0 }
+        let parts = components
+        let fromSeconds = UInt64(parts.seconds).multipliedReportingOverflow(
+            by: 1_000_000)
+        if fromSeconds.overflow { return .max }
+        /* 1 microsecond == 10^12 attoseconds */
+        let fromAtto = UInt64(parts.attoseconds / 1_000_000_000_000)
+        let total = fromSeconds.partialValue.addingReportingOverflow(fromAtto)
+        return total.overflow ? .max : total.partialValue
     }
 }

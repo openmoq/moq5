@@ -9,14 +9,45 @@
 /// These are implementation seams, not public API: everything here is
 /// `package`-scoped on purpose.
 
-/// The endpoint's confinement/backing: connection state, the interrupt
-/// latch, and the pump nudge. (S2 grows the job queue + wait loop.)
+/// What one blocking activity wait observed (the C `moq_endpoint_wait` /
+/// receiver-wait / sender-wait return vocabulary: MOQ_OK / MOQ_DONE /
+/// MOQ_ERR_INTERRUPTED / MOQ_ERR_CLOSED).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum EndpointWaitResult: Sendable, Hashable {
+    case activity, timeout, interrupted, closed
+}
+
+/// One drain call's outcome (the C `moq_endpoint_drain` vocabulary; the
+/// wrong-thread state cannot occur -- the engine never calls from the C
+/// network thread).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum EndpointDrainResult: Sendable, Hashable {
+    case complete, timeout, interrupted, closed, unsupported
+}
+
+/// The endpoint's transport backing. Two call classes with different rules:
+///
+/// Any-thread (C-snapshot semantics): `state`, `negotiatedVersion`,
+/// `isFatal`, `fatalCode`, `setInterrupted`, `wake`. `wake` is the C pump
+/// nudge: coalesced, LEVEL-retained (a wake landing before the next wait is
+/// not lost), non-allocating, harmless after stop.
+///
+/// Service-thread only, never concurrent (the engine is the sole caller):
+/// `waitForActivity` (the ONE blocking C wait; which C wait it maps to --
+/// endpoint, receiver, or sender -- is this backend's choice), `drain`,
+/// `stop` (joins the C network thread), `destroy`.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package protocol EndpointBackend: AnyObject, Sendable {
     var state: MoQEndpoint.State { get }
     var negotiatedVersion: MoQVersion? { get }
+    var isFatal: Bool { get }
+    var fatalCode: UInt64 { get }
     func setInterrupted(_ interrupted: Bool)
     func wake()
+    func waitForActivity(timeoutMicroseconds: UInt64) -> EndpointWaitResult
+    func drain(timeoutMicroseconds: UInt64) -> EndpointDrainResult
+    func stop()
+    func destroy()
 }
 
 /// Receiver-side backing: track discovery, object polling, subscription
