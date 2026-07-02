@@ -102,6 +102,14 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         cond.unlock()
     }
 
+    /// Test probe: the latch state, for wiring into a
+    /// ScriptedReceiverBackend's latch closure (the real C poll_object
+    /// reads the same endpoint latch internally).
+    var isLatched: Bool {
+        cond.lock(); defer { cond.unlock() }
+        return interrupted
+    }
+
     func wake() {
         cond.lock()
         tripwireLocked("wake")

@@ -11,23 +11,44 @@ import Foundation
 final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
 
     /// @unchecked: an immutable value copy; the Thread is identity-only.
+    struct SubscribeCall: Equatable, Sendable {
+        var handleID: UInt64
+        var start: StartMode
+        var priority: UInt8?
+    }
+
+    /// @unchecked: an immutable value copy; the Thread is identity-only.
     struct Snapshot: @unchecked Sendable {
         var pollCalls = 0
+        var objectPollCalls = 0
         var detachCalls = 0
+        var subscribeCalls: [SubscribeCall] = []
+        var unsubscribeCalls: [UInt64] = []
         var violations: [String] = []
         var serviceThread: Thread?
+        var objectPollBlocked = false
     }
 
     private let cond = NSCondition()
     private var queue: [ReceiverPolledEvent] = []
+    private var objectQueue: [ReceiverPolledObject] = []
+    private var subscribeResults: [ReceiverCommandResult] = []
     private var terminal = false
     private var scriptedFatal = false
     private var scriptedFatalCode: UInt64 = 0
     private var detached = false
+    private var objectGate = false      /* true: pollObject blocks mid-poll */
     private var r = Snapshot()
+    /// Models the C fact that poll_object checks the ENDPOINT latch (poll
+    /// of track events does not). Tests wire `{ endpointBackend.isLatched }`.
+    private let latch: @Sendable () -> Bool
     /// Test hook: called (under the lock) when detach() runs, for
     /// cross-backend teardown-ordering assertions.
     var onDetach: (@Sendable () -> Void)?
+
+    init(latch: @escaping @Sendable () -> Bool = { false }) {
+        self.latch = latch
+    }
 
     // MARK: ReceiverBackend
 
@@ -51,15 +72,72 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         return terminal ? .closed : .none
     }
 
+    var isTerminal: Bool {
+        cond.lock(); defer { cond.unlock() }
+        return terminal
+    }
+
+    var hasQueuedObjects: Bool {
+        cond.lock(); defer { cond.unlock() }
+        return !objectQueue.isEmpty
+    }
+
+    func pollObject() -> ReceiverObjectPollResult {
+        cond.lock()
+        tripwireLocked("pollObject")
+        noteServiceThreadLocked("pollObject")
+        r.objectPollCalls += 1
+        r.objectPollBlocked = true
+        cond.broadcast()
+        while objectGate { cond.wait() }
+        r.objectPollBlocked = false
+        defer {
+            cond.broadcast()
+            cond.unlock()
+        }
+        /* C order (media_receiver.c poll_object): the LATCH gates first,
+         * before any queue inspection. */
+        if latch() { return .interrupted }
+        if !objectQueue.isEmpty { return .object(objectQueue.removeFirst()) }
+        return terminal ? .closed : .none
+    }
+
+    func subscribe(handleID: UInt64, start: StartMode,
+                   priority: UInt8?) -> ReceiverCommandResult {
+        cond.lock()
+        defer { cond.unlock() }
+        tripwireLocked("subscribe")
+        noteServiceThreadLocked("subscribe")
+        r.subscribeCalls.append(SubscribeCall(
+            handleID: handleID, start: start, priority: priority))
+        cond.broadcast()
+        return subscribeResults.isEmpty ? .ok : subscribeResults.removeFirst()
+    }
+
+    func unsubscribe(handleID: UInt64) -> ReceiverCommandResult {
+        cond.lock()
+        defer { cond.unlock() }
+        tripwireLocked("unsubscribe")
+        noteServiceThreadLocked("unsubscribe")
+        r.unsubscribeCalls.append(handleID)
+        cond.broadcast()
+        return subscribeResults.isEmpty ? .ok : subscribeResults.removeFirst()
+    }
+
     func detach() {
         cond.lock()
         tripwireLocked("detach")
         noteServiceThreadLocked("detach")
         detached = true
         r.detachCalls += 1
+        /* The C destroy frees queued undelivered objects; model it so leak
+         * assertions have teeth. */
+        let undelivered = objectQueue
+        objectQueue.removeAll()
         let hook = onDetach
         cond.broadcast()
         cond.unlock()
+        for polled in undelivered { polled.storage.cleanup() }
         hook?()
     }
 
@@ -70,6 +148,34 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         queue.append(contentsOf: events)
         cond.broadcast()
         cond.unlock()
+    }
+
+    func scriptObjects(_ objects: [ReceiverPolledObject]) {
+        cond.lock()
+        objectQueue.append(contentsOf: objects)
+        cond.broadcast()
+        cond.unlock()
+    }
+
+    func scriptSubscribeResults(_ results: [ReceiverCommandResult]) {
+        cond.lock()
+        subscribeResults = results
+        cond.unlock()
+    }
+
+    /// When gated, pollObject blocks mid-poll (after the job started,
+    /// before the transfer completes) until released -- the cancel-race
+    /// window.
+    func setObjectGate(_ gated: Bool) {
+        cond.lock()
+        objectGate = gated
+        cond.broadcast()
+        cond.unlock()
+    }
+
+    @discardableResult
+    func awaitObjectPollBlocked(ceiling: TimeInterval = 10) async -> Bool {
+        await awaitCondition(ceiling: ceiling) { $0.objectPollBlocked }
     }
 
     /// After the queued events drain, polls return .closed.

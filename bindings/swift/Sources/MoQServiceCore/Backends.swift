@@ -1,3 +1,5 @@
+import Foundation
+
 /// Package-internal backend seams.
 ///
 /// The public model types are written against these protocols so the whole
@@ -82,19 +84,82 @@ package enum ReceiverPollResult: Sendable {
     case closed
 }
 
-/// Receiver-side backing: track-event polling and detach. Object/SAP/
-/// timeline polling and subscription control land with the objects slice.
+/// One media object polled from the receiver backend with EXCLUSIVE
+/// ownership (the C `moq_media_object_t` on MOQ_OK): `storage` owns the
+/// transferred buffers and is released exactly once by ``MediaObject``'s
+/// deinit. Metadata is copied at poll time; `handleID` resolves to the S3
+/// `MediaTrack`.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package struct ReceiverPolledObject: Sendable {
+    package var handleID: UInt64
+    package var storage: any OwnedObjectStorage
+    package var isKeyframe: Bool
+    package var endsGroup: Bool
+    package var isDatagram: Bool
+    package var presentationTime: Duration
+    package var decodeTime: Duration
+    package var compositionOffset: Duration
+    package var captureTime: Date?
+
+    package init(handleID: UInt64, storage: any OwnedObjectStorage,
+                 isKeyframe: Bool, endsGroup: Bool, isDatagram: Bool,
+                 presentationTime: Duration, decodeTime: Duration,
+                 compositionOffset: Duration, captureTime: Date?) {
+        self.handleID = handleID
+        self.storage = storage
+        self.isKeyframe = isKeyframe
+        self.endsGroup = endsGroup
+        self.isDatagram = isDatagram
+        self.presentationTime = presentationTime
+        self.decodeTime = decodeTime
+        self.compositionOffset = compositionOffset
+        self.captureTime = captureTime
+    }
+}
+
+/// One `pollObject` outcome (the C `moq_media_receiver_poll_object`
+/// vocabulary). Unlike the track-event poll, this IS latch-gated: the C
+/// side checks the endpoint latch before inspecting the queue, so
+/// `.interrupted` wins even over queued objects.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum ReceiverObjectPollResult: Sendable {
+    case object(ReceiverPolledObject)   /* MOQ_OK: ownership transferred */
+    case none                           /* MOQ_DONE */
+    case interrupted                    /* MOQ_ERR_INTERRUPTED (latch) */
+    case closed                         /* MOQ_ERR_CLOSED (empty AND terminal) */
+}
+
+/// One subscribe/unsubscribe command outcome (asynchronous commands in C:
+/// ok means validated-and-recorded, not peer-accepted).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum ReceiverCommandResult: Sendable {
+    case ok
+    case invalidArgument
+    case wrongState                     /* track already ended */
+    case closed
+    case unsupported                    /* MSF namespace-override tracks */
+}
+
+/// Receiver-side backing. SAP/timeline record polling lands later.
 ///
-/// `isFatal`/`fatalCode` are any-thread C snapshots (composing the
-/// receiver's own fatal codes with the endpoint's, like
-/// `moq_media_receiver_fatal_code`). `pollTrackEvent` and `detach` are
-/// service-thread only; `detach` (the C receiver destroy) is called exactly
-/// once, after which NO method may be called.
+/// Any-thread C snapshots: `isFatal`/`fatalCode` (composing the receiver's
+/// own fatal codes with the endpoint's), `isTerminal` (closed OR fatal --
+/// the object waiter's level term), `hasQueuedObjects` (stats under the C
+/// receiver lock). Service-thread only: `pollTrackEvent`, `pollObject`,
+/// `subscribe`, `unsubscribe`, and `detach` (the C receiver destroy, called
+/// exactly once, after which NO method may be called; queued undelivered
+/// objects die with it, like the C destroy).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package protocol ReceiverBackend: AnyObject, Sendable {
     var isFatal: Bool { get }
     var fatalCode: UInt64 { get }
+    var isTerminal: Bool { get }
+    var hasQueuedObjects: Bool { get }
     func pollTrackEvent() -> ReceiverPollResult
+    func pollObject() -> ReceiverObjectPollResult
+    func subscribe(handleID: UInt64, start: StartMode,
+                   priority: UInt8?) -> ReceiverCommandResult
+    func unsubscribe(handleID: UInt64) -> ReceiverCommandResult
     func detach()
 }
 

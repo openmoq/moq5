@@ -2,11 +2,14 @@ import Foundation
 
 /// Subscribes to a namespace's catalog and media tracks over an endpoint.
 ///
-/// Track discovery is live: the engine eagerly drains the receiver's
-/// track-event queue every pass (the C queue's overflow is TERMINAL — the
-/// SDK's job is to make that unreachable) into a Swift FIFO that
-/// ``trackEvents`` consumes. Object delivery and subscription control land
-/// with the objects slice.
+/// Track discovery is eager: the engine drains the receiver's track-event
+/// queue every pass (the C queue's overflow is TERMINAL — the SDK's job is
+/// to make that unreachable) into a Swift FIFO that ``trackEvents``
+/// consumes. Object delivery is the opposite, strictly PULL-based: the C
+/// object queue is the only buffer, and ``objects`` polls one object per
+/// demand so the configured overflow policy keeps acting on the real queue
+/// depth. ``subscribe(_:start:priority:)``/``unsubscribe(_:)`` provide
+/// manual track selection.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public final class MediaReceiver: @unchecked Sendable {
 
@@ -170,16 +173,71 @@ public final class MediaReceiver: @unchecked Sendable {
     /// lifetime.
     public var tracks: [MediaTrack] { state.orderedTracks() }
 
+    // MARK: Objects
+
+    /// The media object stream, strictly PULL-based: each element is one
+    /// demand-driven poll on the service thread, and the C object queue is
+    /// the ONLY buffer -- the configured overflow policy keeps acting on
+    /// the real queue depth. Single active consumer (a second concurrent
+    /// `next()` throws ``MoQServiceError/wrongState``); may be consumed
+    /// concurrently with ``trackEvents`` by a different task. Objects drain
+    /// after terminal, then the stream ends `nil` (clean) or throws
+    /// ``MoQServiceError/fatal(code:)``. Throws
+    /// ``MoQServiceError/interrupted`` while the endpoint latch is set,
+    /// EVEN with objects queued -- the C object poll is latch-gated, unlike
+    /// the track-event poll. Cancellation: a poll that already started
+    /// delivers its object (exactly-once cleanup either way); a cancel
+    /// before it starts leaves the queue untouched.
+    public var objects: MediaObjects { MediaObjects(receiver: self) }
+
     /// Subscribe a discovered track (manual selection; pause/resume model).
+    /// An ASYNCHRONOUS command, like C: success means validated and
+    /// recorded -- peer acceptance surfaces as delivered objects, rejection
+    /// as a `.ended` track event. Start mode and priority apply only when
+    /// the underlying subscription is first issued; later calls are
+    /// idempotent resume commands.
     public func subscribe(_ track: MediaTrack,
                           start: StartMode = .current,
                           priority: UInt8? = nil) async throws {
-        throw MoQServiceError.unsupported   // TODO(S4): objects slice
+        try await command(for: track, name: "subscribe") { backend, id in
+            backend.subscribe(handleID: id, start: start, priority: priority)
+        }
     }
 
-    /// Pause delivery and purge this track's queued objects.
+    /// Pause delivery and purge this track's queued objects; a later
+    /// ``subscribe(_:start:priority:)`` resumes cheaply.
     public func unsubscribe(_ track: MediaTrack) async throws {
-        throw MoQServiceError.unsupported   // TODO(S4): objects slice
+        try await command(for: track, name: "unsubscribe") { backend, id in
+            backend.unsubscribe(handleID: id)
+        }
+    }
+
+    private func command(
+        for track: MediaTrack, name: String,
+        _ body: @escaping @Sendable (any ReceiverBackend, UInt64) -> ReceiverCommandResult
+    ) async throws {
+        guard let handleID = attachment.handleID(for: track) else {
+            throw MoQServiceError.invalidArgument(
+                "\(name): the track does not belong to this receiver")
+        }
+        let attachment = self.attachment
+        try await endpoint.engine.perform {
+            guard !attachment.state.isDetached else {
+                throw MoQServiceError.closed
+            }
+            switch body(attachment.backend, handleID) {
+            case .ok:
+                return
+            case .invalidArgument:
+                throw MoQServiceError.invalidArgument("\(name): invalid track")
+            case .wrongState:
+                throw MoQServiceError.wrongState
+            case .closed:
+                throw MoQServiceError.closed
+            case .unsupported:
+                throw MoQServiceError.unsupported
+            }
+        }
     }
 
     // MARK: Stream plumbing
@@ -210,6 +268,50 @@ public final class MediaReceiver: @unchecked Sendable {
                  * (after a final drain) -- loop to deliver what remains.
                  * Defensive nil if the state somehow never terminalized. */
                 if !state.hasItemOrTerminal { return nil }
+            }
+        }
+    }
+
+    /// One object-stream element; see ``objects`` for the contract.
+    package func nextObject() async throws -> MediaObject? {
+        guard state.claimObjectsConsumer() else {
+            throw MoQServiceError.wrongState
+        }
+        defer { state.releaseObjectsConsumer() }
+        let attachment = self.attachment
+        while true {
+            let demand: ReceiverAttachment.ObjectDemand
+            do {
+                /* One demand = one service-thread poll. perform's started-
+                 * job rule IS the cancellation guarantee: a poll that
+                 * already began always delivers its result, so a
+                 * transferred object reaches the (even cancelled) caller
+                 * and ARC performs the one cleanup. */
+                demand = try await endpoint.engine.perform {
+                    attachment.demandObject()
+                }
+            } catch let error as MoQServiceError where error == .closed {
+                /* Engine gone: teardown detached us. Undelivered C-queued
+                 * objects died with the C receiver (destroy semantics). */
+                return try state.finalObjectDisposition()
+            }
+            switch demand {
+            case .object(let object):
+                return object
+            case .interrupted:
+                throw MoQServiceError.interrupted
+            case .terminalClean:
+                return nil
+            case .terminalFatal(let code):
+                throw MoQServiceError.fatal(code: code)
+            case .empty:
+                do {
+                    try await endpoint.engine.waitUntil {
+                        attachment.objectWaiterReady ? .satisfied : .pending
+                    }
+                } catch let error as MoQServiceError where error == .closed {
+                    return try state.finalObjectDisposition()
+                }
             }
         }
     }
@@ -256,6 +358,64 @@ package final class ReceiverAttachment: @unchecked Sendable {
         guard state.beginDetach() else { return }
         backend.detach()
     }
+
+    // MARK: Objects (demand-driven; the C queue is the only buffer)
+
+    package enum ObjectDemand {
+        case object(MediaObject)
+        case empty
+        case interrupted
+        case terminalClean
+        case terminalFatal(code: UInt64)
+    }
+
+    /// One demand: drain pending track events FIRST (the C discipline —
+    /// every handle is known before its first object), then poll ONE
+    /// object. Service thread only.
+    package func demandObject() -> ObjectDemand {
+        while true {
+            guard !state.isDetached else { return state.objectTerminalDemand() }
+            drainTrackEvents()
+            switch backend.pollObject() {
+            case .none:
+                return .empty
+            case .interrupted:
+                return .interrupted
+            case .closed:
+                state.markTerminal(fatal: backend.isFatal,
+                                   code: backend.fatalCode)
+                return state.objectTerminalDemand()
+            case .object(let polled):
+                guard let track = state.track(for: polled.handleID) else {
+                    /* Impossible per the C contract (TRACK_ADDED precedes
+                     * every object); never leak the transferred buffers. */
+                    polled.storage.cleanup()
+                    continue
+                }
+                return .object(MediaObject(
+                    storage: polled.storage,
+                    track: track,
+                    isKeyframe: polled.isKeyframe,
+                    endsGroup: polled.endsGroup,
+                    isDatagram: polled.isDatagram,
+                    presentationTime: polled.presentationTime,
+                    decodeTime: polled.decodeTime,
+                    compositionOffset: polled.compositionOffset,
+                    captureTime: polled.captureTime))
+            }
+        }
+    }
+
+    /// The parked object consumer's level term: something to poll, or a
+    /// terminal state to report. Evaluated on the service thread each pass.
+    package var objectWaiterReady: Bool {
+        state.isDetached || backend.hasQueuedObjects || backend.isTerminal
+    }
+
+    /// The stable handle for a track discovered by THIS receiver.
+    package func handleID(for track: MediaTrack) -> UInt64? {
+        state.handleID(for: track)
+    }
 }
 
 // MARK: - Track event stream
@@ -279,6 +439,25 @@ public struct TrackEvents: AsyncSequence, Sendable {
     }
 }
 
+/// The ``MediaReceiver/objects`` async sequence.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public struct MediaObjects: AsyncSequence, Sendable {
+    public typealias Element = MediaObject
+
+    let receiver: MediaReceiver
+
+    public func makeAsyncIterator() -> Iterator {
+        Iterator(receiver: receiver)
+    }
+
+    public struct Iterator: AsyncIteratorProtocol {
+        let receiver: MediaReceiver
+        public mutating func next() async throws -> MediaObject? {
+            try await receiver.nextObject()
+        }
+    }
+}
+
 // MARK: - Lock-guarded receiver state
 
 /// FIFO + track map + terminal/consumer flags. Mutated by the service
@@ -298,12 +477,14 @@ private final class ReceiverState: @unchecked Sendable {
     private let lock = NSLock()
     private var fifo: [TrackEvent] = []
     private var tracksByID: [UInt64: MediaTrack] = [:]
+    private var idsByTrack: [ObjectIdentifier: UInt64] = [:]
     private var ordered: [MediaTrack] = []
     private var terminal = false
     private var fatal = false
     private var fatalCode: UInt64 = 0
     private var detached = false
     private var consumerBusy = false
+    private var objectsConsumerBusy = false
 
     /// Map one polled backend event into the model and queue it. Unknown
     /// handles (an update/remove for a track never added) are dropped
@@ -316,6 +497,7 @@ private final class ReceiverState: @unchecked Sendable {
             guard let description = polled.trackDescription else { return }
             let track = MediaTrack(description: description)
             tracksByID[polled.handleID] = track
+            idsByTrack[ObjectIdentifier(track)] = polled.handleID
             ordered.append(track)
             fifo.append(.added(track))
         case .updated:
@@ -389,8 +571,45 @@ private final class ReceiverState: @unchecked Sendable {
         lock.unlock()
     }
 
+    func claimObjectsConsumer() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if objectsConsumerBusy { return false }
+        objectsConsumerBusy = true
+        return true
+    }
+
+    func releaseObjectsConsumer() {
+        lock.lock()
+        objectsConsumerBusy = false
+        lock.unlock()
+    }
+
     func orderedTracks() -> [MediaTrack] {
         lock.lock(); defer { lock.unlock() }
         return ordered
+    }
+
+    func track(for handleID: UInt64) -> MediaTrack? {
+        lock.lock(); defer { lock.unlock() }
+        return tracksByID[handleID]
+    }
+
+    func handleID(for track: MediaTrack) -> UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        return idsByTrack[ObjectIdentifier(track)]
+    }
+
+    /// The object stream's answer once the receiver is terminal/detached.
+    func objectTerminalDemand() -> ReceiverAttachment.ObjectDemand {
+        lock.lock(); defer { lock.unlock() }
+        return fatal ? .terminalFatal(code: fatalCode) : .terminalClean
+    }
+
+    /// The object stream's answer once the ENGINE is gone: nil for a clean
+    /// end, or the recorded fatal.
+    func finalObjectDisposition() throws -> MediaObject? {
+        lock.lock(); defer { lock.unlock() }
+        if fatal { throw MoQServiceError.fatal(code: fatalCode) }
+        return nil
     }
 }
