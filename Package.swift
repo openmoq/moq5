@@ -4,6 +4,7 @@ import PackageDescription
 import Foundation
 
 let enableTransport = ProcessInfo.processInfo.environment["MOQ_TRANSPORT"] == "1"
+let enableService = ProcessInfo.processInfo.environment["MOQ_SERVICE"] == "1"
 
 // NOTE: no package-wide `platforms:` floor. The MoQService model layer uses
 // Swift Duration (macOS 13 / iOS 16), but that requirement is contained to
@@ -142,16 +143,6 @@ let package = Package(
 
         // Tests.
         .testTarget(
-            name: "MoQTests",
-            dependencies: ["MoQ", "CMoQSim"],
-            path: "bindings/swift/Tests/MoQTests"
-        ),
-        .testTarget(
-            name: "MoQMediaTests",
-            dependencies: ["MoQMedia", "CMoQSim"],
-            path: "bindings/swift/Tests/MoQMediaTests"
-        ),
-        .testTarget(
             name: "MoQRecvArgsTests",
             dependencies: ["MoQRecvArgs"],
             path: "bindings/swift/Tests/MoQRecvArgsTests"
@@ -168,6 +159,59 @@ let package = Package(
         ),
     ]
 )
+
+// SwiftPM links every test target into ONE unified test bundle, and the
+// moq_swift_stack_guard canary (correctly) refuses a binary containing both
+// the source-built MoQ stack and MoQService. The MoQ-linking test targets
+// therefore exist only in ungated builds; the MOQ_SERVICE=1 lane runs the
+// service + C-free suites, complementing the ungated lane that runs these.
+if !enableService {
+    package.targets += [
+        .testTarget(
+            name: "MoQTests",
+            dependencies: ["MoQ", "CMoQSim"],
+            path: "bindings/swift/Tests/MoQTests"
+        ),
+        .testTarget(
+            name: "MoQMediaTests",
+            dependencies: ["MoQMedia", "CMoQSim"],
+            path: "bindings/swift/Tests/MoQMediaTests"
+        ),
+    ]
+}
+
+// The installed-mode MoQService product requires a CMake-installed service
+// tier (picoquic-family backends only -- an mvfst/proxygen-enabled service
+// install has no pkg-config file by design).
+// Build with: MOQ_SERVICE=1 PKG_CONFIG_PATH=<prefix>/lib/pkgconfig swift build
+//
+// BINARY EXCLUSIVITY: one app binary links EITHER MoQService (installed
+// libmoq archives) OR the source-built MoQ/MoQMedia stack, never both --
+// enforced by the moq_swift_stack_guard duplicate-symbol canary
+// (scripts/check_swift_stack_guard.sh).
+if enableService {
+    package.products += [
+        .library(name: "MoQService", targets: ["MoQService"]),
+    ]
+    package.targets += [
+        .systemLibrary(
+            name: "CMoQService",
+            path: "bindings/swift/SystemModules/CMoQService",
+            pkgConfig: "libmoq-service",
+            providers: [.brew(["libmoq"])]
+        ),
+        .target(
+            name: "MoQService",
+            dependencies: ["MoQServiceCore", "CMoQService"],
+            path: "bindings/swift/Sources/MoQService"
+        ),
+        .testTarget(
+            name: "MoQServiceTests",
+            dependencies: ["MoQService", "CMoQService"],
+            path: "bindings/swift/Tests/MoQServiceTests"
+        ),
+    ]
+}
 
 // Live transport targets require CMake-installed adapter.
 // Build with: MOQ_TRANSPORT=1 PKG_CONFIG_PATH=<prefix>/lib/pkgconfig swift build

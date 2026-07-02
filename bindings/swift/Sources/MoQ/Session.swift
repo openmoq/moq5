@@ -47,6 +47,10 @@ public final class Session {
     // MARK: - Lifecycle
 
     public init(configuration: Configuration) throws {
+        /* Always-linked reference to the stack-guard canary: pulls its
+         * object file into every consumer, so a dual link with the
+         * installed-mode MoQService fails loudly (see StackGuard.swift). */
+        _ = moqSwiftStackGuardSource()
         let alloc = moq_alloc_default()!
         var scfg = moq_session_cfg_t()
         // Sized init: this wrapper sets fields past the v0 prefix

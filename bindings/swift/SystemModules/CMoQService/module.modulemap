@@ -1,0 +1,4 @@
+module CMoQService [system] {
+    header "shim.h"
+    export *
+}
