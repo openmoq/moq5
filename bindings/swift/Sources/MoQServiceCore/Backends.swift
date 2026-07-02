@@ -50,11 +50,53 @@ package protocol EndpointBackend: AnyObject, Sendable {
     func destroy()
 }
 
-/// Receiver-side backing: track discovery, object polling, subscription
-/// control. Filled in by the engine slice (S2) — declared now so the model
-/// layer's shape is fixed.
+/// One track event polled from the receiver backend (the C
+/// `moq_media_track_event_t`, eagerly copied). `handleID` is the stable
+/// track identity: the same C `moq_media_track_t*` (never recycled for the
+/// receiver's life) always maps to the same ID, so the Swift side can keep
+/// one `MediaTrack` instance per handle. `trackDescription` is a deep copy
+/// taken AT poll time on the service thread — no C borrow crosses this seam.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-package protocol ReceiverBackend: AnyObject, Sendable {}
+package struct ReceiverPolledEvent: Sendable {
+    package enum Kind: Sendable {
+        case added, updated, removed, ended, catalogReady
+    }
+    package var kind: Kind
+    package var handleID: UInt64
+    package var trackDescription: TrackDescription?
+
+    package init(kind: Kind, handleID: UInt64,
+                 trackDescription: TrackDescription?) {
+        self.kind = kind
+        self.handleID = handleID
+        self.trackDescription = trackDescription
+    }
+}
+
+/// One `pollTrackEvent` outcome (the C `moq_media_receiver_poll_track`
+/// vocabulary: MOQ_OK / MOQ_DONE / MOQ_ERR_CLOSED-when-empty-and-terminal).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum ReceiverPollResult: Sendable {
+    case event(ReceiverPolledEvent)
+    case none
+    case closed
+}
+
+/// Receiver-side backing: track-event polling and detach. Object/SAP/
+/// timeline polling and subscription control land with the objects slice.
+///
+/// `isFatal`/`fatalCode` are any-thread C snapshots (composing the
+/// receiver's own fatal codes with the endpoint's, like
+/// `moq_media_receiver_fatal_code`). `pollTrackEvent` and `detach` are
+/// service-thread only; `detach` (the C receiver destroy) is called exactly
+/// once, after which NO method may be called.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package protocol ReceiverBackend: AnyObject, Sendable {
+    var isFatal: Bool { get }
+    var fatalCode: UInt64 { get }
+    func pollTrackEvent() -> ReceiverPollResult
+    func detach()
+}
 
 /// Sender-side backing: readiness, write, track lifecycle. Filled in by the
 /// engine slice (S2) — declared now so the model layer's shape is fixed.

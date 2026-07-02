@@ -1,6 +1,18 @@
 import Foundation
 @testable import MoQServiceCore
 
+/// Run a BLOCKING handshake wait off the Swift cooperative pool. Async
+/// tests must never park a cooperative thread in a condition-variable wait:
+/// with enough tests in parallel, the pool starves, the child Tasks the
+/// wait depends on cannot run, and a ceiling expires spuriously. GCD's
+/// elastic pool absorbs the blocking instead.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func offPool<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+    await withCheckedContinuation { cont in
+        DispatchQueue.global().async { cont.resume(returning: body()) }
+    }
+}
+
 /// Scripted endpoint backend: implements the REAL wake/wait contract
 /// (coalesced, level-retained activity flag; latch and terminal state win
 /// over activity) so the engine tests exercise the C endpoint semantics, not
@@ -22,7 +34,8 @@ import Foundation
 final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
 
     /// An atomic copy of every recorder, taken under the backend lock.
-    struct Snapshot {
+    /// @unchecked: an immutable value copy; the Thread is identity-only.
+    struct Snapshot: @unchecked Sendable {
         var waitEntries = 0
         var wakeCount = 0
         var drainCalls: [UInt64] = []
@@ -49,6 +62,10 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
 
     // Recorders (cond-guarded; exposed only via snapshot()).
     private var r = Snapshot()
+
+    /// Test hook: called when stop() runs, for cross-backend
+    /// teardown-ordering assertions.
+    var onStop: (@Sendable () -> Void)?
 
     // MARK: EndpointBackend -- any-thread surface
 
@@ -144,8 +161,10 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         tripwireLocked("stop")
         noteServiceThreadLocked("stop")
         r.stopCount += 1
+        let hook = onStop
         cond.broadcast()
         cond.unlock()
+        hook?()
     }
 
     func destroy() {
@@ -213,6 +232,15 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         return true
     }
 
+    /// Async contexts get the off-pool variant automatically (overload by
+    /// context): the blocking wait runs on GCD, never a cooperative thread.
+    @discardableResult
+    func awaitCondition(ceiling: TimeInterval = 10,
+                        _ predicate: @escaping @Sendable (Snapshot) -> Bool
+    ) async -> Bool {
+        await offPool { self.awaitCondition(ceiling: ceiling, predicate) }
+    }
+
     /// Await the engine parked inside waitForActivity with >= `entries` total
     /// entries observed.
     @discardableResult
@@ -222,10 +250,20 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         }
     }
 
+    @discardableResult
+    func awaitParked(entries: Int, ceiling: TimeInterval = 10) async -> Bool {
+        await offPool { self.awaitParked(entries: entries, ceiling: ceiling) }
+    }
+
     /// Await a drain slice blocked on the gate.
     @discardableResult
     func awaitDrainBlocked(ceiling: TimeInterval = 10) -> Bool {
         awaitCondition(ceiling: ceiling) { $0.drainBlocked }
+    }
+
+    @discardableResult
+    func awaitDrainBlocked(ceiling: TimeInterval = 10) async -> Bool {
+        await offPool { self.awaitDrainBlocked(ceiling: ceiling) }
     }
 
     // MARK: Internals (cond held)
@@ -320,5 +358,10 @@ final class TestGate: @unchecked Sendable {
             if !cond.wait(until: deadline) { return false }
         }
         return true
+    }
+
+    @discardableResult
+    func awaitBlocked(count: Int, ceiling: TimeInterval = 10) async -> Bool {
+        await offPool { self.awaitBlocked(count: count, ceiling: ceiling) }
     }
 }

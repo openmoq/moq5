@@ -13,16 +13,19 @@ import Foundation
 /// every other park is a Swift-side condition variable (latched, terminal,
 /// or idle-after-close), which is invisible to the C tier.
 ///
-/// Loop pass order: run queued jobs (FIFO, exactly once) -> handle shutdown
-/// -> handle the latch (fail every parked waiter with `.interrupted`; latch
-/// beats level, C §5.3) -> re-evaluate condition waiters -> block. Later
-/// slices insert the track-event drain and parked object consumers between
-/// the job and waiter steps.
+/// Loop pass order: run queued jobs (FIFO, exactly once) -> run pump hooks
+/// (attached services' eager per-pass work, e.g. the receiver's track-event
+/// drain; hooks also run on latched and stopping passes) -> handle shutdown
+/// (hook teardown BEFORE the endpoint backend's stop/destroy) -> handle the
+/// latch (fail every parked waiter with `.interrupted`; latch beats level,
+/// C §5.3) -> re-evaluate condition waiters -> block.
 ///
 /// Submission contract: once shutdown begins (`close()` or the deinit
 /// backstop), NEW submissions fail deterministically with
-/// ``MoQServiceError/closed`` and never run; jobs accepted before shutdown
-/// still run before teardown.
+/// ``MoQServiceError/closed`` (or `false`) and never run; jobs accepted
+/// before shutdown still run before teardown. `perform` is Task-
+/// cancellable; `postAndWait` is NOT -- it is the teardown-grade submission
+/// for cleanup that must never be skipped.
 ///
 /// Package callers must never await engine operations from inside a job --
 /// the job would suspend the only thread that can complete it.
@@ -38,6 +41,22 @@ package final class EndpointEngine: @unchecked Sendable {
     }
 
     private enum Phase { case running, stopping, stopped }
+
+    /// One attachment slot per kind, mirroring the C endpoint's per-kind
+    /// pump-hook slots (at most one receiver + one sender per endpoint).
+    package enum PumpHookKind: Int, Sendable, CaseIterable {
+        case receiver = 0
+        case sender = 1
+    }
+
+    /// An attached service's per-pass work: `run` does the eager service
+    /// step (e.g. draining the C track-event queue); `teardown` detaches the
+    /// child from the C endpoint. Both run on the service thread, outside
+    /// the engine lock.
+    private struct PumpHook {
+        let run: @Sendable () -> Void
+        let teardown: @Sendable () -> Void
+    }
 
     /// One queued unit of service-thread work. All vars are engine-lock
     /// guarded; `body` runs on the service thread OUTSIDE the lock.
@@ -78,6 +97,7 @@ package final class EndpointEngine: @unchecked Sendable {
     /// The negotiated version snapshotted at retirement, so the accessor
     /// keeps answering after the backend is gone.
     private var retiredNegotiatedVersion: MoQVersion?
+    private var hookSlots: [PumpHookKind: PumpHook] = [:]
 
     /// Defensive ceiling on one C wait; wakes make it irrelevant in practice
     /// and a timeout just loops another pass.
@@ -112,6 +132,48 @@ package final class EndpointEngine: @unchecked Sendable {
                               : backend.negotiatedVersion
     }
 
+    // MARK: Pump hooks (attachments)
+
+    /// Claim `kind`'s attachment slot and install its per-pass hook. `run`
+    /// executes every pass -- including latched ones (the C track-event poll
+    /// is not latch-gated) and the stopping pass (the final drain before
+    /// teardown); `teardown` runs during shutdown, BEFORE the endpoint
+    /// backend's stop/destroy (C: `moq_endpoint_stop` refuses while
+    /// attachments live). Throws `.wrongState` when the slot is taken (one
+    /// attachment per kind, like C) and `.closed` once shutdown has begun.
+    package func installPumpHook(
+        kind: PumpHookKind,
+        run: @escaping @Sendable () -> Void,
+        teardown: @escaping @Sendable () -> Void
+    ) throws {
+        cond.lock()
+        guard phase == .running else {
+            cond.unlock()
+            throw MoQServiceError.closed
+        }
+        guard hookSlots[kind] == nil else {
+            cond.unlock()
+            throw MoQServiceError.wrongState
+        }
+        hookSlots[kind] = PumpHook(run: run, teardown: teardown)
+        nudgeLocked()
+        backend.wake()                  /* .running implies not retired */
+        cond.unlock()
+    }
+
+    /// Release `kind`'s slot without running its teardown -- the caller has
+    /// already detached its child (e.g. a receiver's own close()).
+    package func removePumpHook(kind: PumpHookKind) {
+        cond.lock()
+        hookSlots[kind] = nil
+        cond.unlock()
+    }
+
+    /// Callers hold the lock. Stable order: receiver before sender.
+    private func orderedHooksLocked() -> [PumpHook] {
+        PumpHookKind.allCases.compactMap { hookSlots[$0] }
+    }
+
     // MARK: Submission surface
 
     /// Fire-and-forget service-thread work (the C `post()` analog). Returns
@@ -133,6 +195,34 @@ package final class EndpointEngine: @unchecked Sendable {
         backend.wake()
         cond.unlock()
         return true
+    }
+
+    /// Run `body` on the service thread and wait for it, IMMUNE to task
+    /// cancellation -- the teardown-grade submission: a receiver/sender
+    /// close must never be skipped because its caller was cancelled.
+    /// Returns false without running once shutdown has begun (the engine's
+    /// own teardown pass covers that cleanup).
+    @discardableResult
+    package func postAndWait(
+        _ body: @escaping @Sendable () -> Void
+    ) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let job = Job()
+            cond.lock()
+            guard phase == .running else {
+                cond.unlock()
+                cont.resume(returning: false)
+                return
+            }
+            job.body = {
+                body()
+                cont.resume(returning: true)
+            }
+            jobs.append(job)
+            nudgeLocked()
+            backend.wake()          /* under the lock; see post() */
+            cond.unlock()
+        }
     }
 
     /// Run `body` on the service thread and return its result. Throws
@@ -382,11 +472,30 @@ package final class EndpointEngine: @unchecked Sendable {
                 cond.lock()
             }
 
-            /* 2. Shutdown: fail parked waiters, tear down, resume closers.
-             * The backend is RETIRED under the lock before stop()/destroy():
-             * from here on no other thread makes backend calls, and the
-             * accessors answer from the snapshot. */
+            /* 1b. Pump hooks: eager per-pass service work (the receiver's
+             * track-event drain; later the sender). Runs on every pass --
+             * including latched passes (the C track-event poll is not
+             * latch-gated) and the stopping pass, where it is the final
+             * drain before teardown. */
+            let hooks = orderedHooksLocked()
+            if !hooks.isEmpty {
+                cond.unlock()
+                for hook in hooks { hook.run() }
+                cond.lock()
+            }
+
+            /* 2. Shutdown: tear down attachments (child detach BEFORE the
+             * endpoint stop, per the C attachment gate), fail parked
+             * waiters, tear down, resume closers. The backend is RETIRED
+             * under the lock before stop()/destroy(): from here on no other
+             * thread makes backend calls, and the accessors answer from the
+             * snapshot. */
             if phase == .stopping {
+                let tearingDown = orderedHooksLocked()
+                hookSlots.removeAll()
+                cond.unlock()
+                for hook in tearingDown { hook.teardown() }
+                cond.lock()
                 let failed = takeWaitersLocked()
                 retiredNegotiatedVersion = backend.negotiatedVersion
                 backendRetired = true

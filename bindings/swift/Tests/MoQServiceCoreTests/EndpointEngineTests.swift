@@ -58,12 +58,12 @@ struct EngineConfinementTests {
         let backend = ScriptedEndpointBackend()
         let endpoint = makeEndpoint(backend)
 
-        #expect(backend.awaitParked(entries: 1))
+        #expect(await backend.awaitParked(entries: 1))
         let ran = try await endpoint.engine.perform { true }
         #expect(ran)
         /* The engine re-parks after the job: the wait was genuinely exited
          * and re-entered, not bypassed. */
-        #expect(backend.awaitParked(entries: 2))
+        #expect(await backend.awaitParked(entries: 2))
         await endpoint.close()
         #expect(backend.snapshot().violations.isEmpty)
     }
@@ -80,7 +80,7 @@ struct EngineConfinementTests {
          * the engine is NOT in the C wait. If the level were not retained,
          * B would strand until some unrelated activity. */
         endpoint.engine.post { gate.pass(); recorder.record("a") }
-        #expect(gate.awaitBlocked(count: 1))
+        #expect(await gate.awaitBlocked(count: 1))
         endpoint.engine.post { recorder.record("b") }
         gate.openGate()
 
@@ -114,7 +114,7 @@ struct EndpointLifecycleEngineTests {
         let task = Task { try await endpoint.established() }
         /* The waiter registration nudges a pass; the engine then re-parks
          * with the waiter pending. */
-        #expect(backend.awaitParked(entries: 1))
+        #expect(await backend.awaitParked(entries: 1))
         backend.script(state: .established)
         try await task.value
         await endpoint.close()
@@ -173,7 +173,7 @@ struct EndpointLifecycleEngineTests {
     func terminalParksWithoutSpinning() async throws {
         let backend = ScriptedEndpointBackend()
         let endpoint = makeEndpoint(backend)
-        #expect(backend.awaitParked(entries: 1))
+        #expect(await backend.awaitParked(entries: 1))
 
         backend.script(state: .closed)
         /* The pass after the .closed wait return evaluates waiters and then
@@ -200,7 +200,7 @@ struct EngineLatchTests {
         let endpoint = makeEndpoint(backend)
 
         let task = Task { try await endpoint.established() }
-        #expect(backend.awaitParked(entries: 1))
+        #expect(await backend.awaitParked(entries: 1))
         endpoint.interrupt()
         await #expect(throws: MoQServiceError.interrupted) {
             try await task.value
@@ -222,7 +222,7 @@ struct EngineLatchTests {
 
         /* resume() re-enters the C wait and blocking works again. */
         endpoint.resume()
-        #expect(backend.awaitParked(entries: frozenEntries + 1))
+        #expect(await backend.awaitParked(entries: frozenEntries + 1))
         backend.script(state: .established)
         try await endpoint.established()
         await endpoint.close()
@@ -240,7 +240,7 @@ struct EngineCancellationTests {
         let endpoint = makeEndpoint(backend)
 
         let task = Task { try await endpoint.established() }
-        #expect(backend.awaitParked(entries: 1))
+        #expect(await backend.awaitParked(entries: 1))
         let wakesBefore = backend.snapshot().wakeCount
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
@@ -262,7 +262,7 @@ struct EngineCancellationTests {
         let recorder = EventRecorder()
 
         endpoint.engine.post { gate.pass() }
-        #expect(gate.awaitBlocked(count: 1))
+        #expect(await gate.awaitBlocked(count: 1))
 
         /* Queue B behind the blocked loop; its submission wake tells us the
          * continuation body ran (B is committed to the queue). */
@@ -270,7 +270,7 @@ struct EngineCancellationTests {
         let task = Task {
             try await endpoint.engine.perform { recorder.record("b") }
         }
-        #expect(backend.awaitCondition { $0.wakeCount > wakesBefore })
+        #expect(await backend.awaitCondition { $0.wakeCount > wakesBefore })
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
 
@@ -291,7 +291,7 @@ struct EngineShutdownTests {
         let endpoint = makeEndpoint(backend)
 
         let task = Task { try await endpoint.established() }
-        #expect(backend.awaitParked(entries: 1))
+        #expect(await backend.awaitParked(entries: 1))
         await endpoint.close()
         await #expect(throws: MoQServiceError.closed) { try await task.value }
         var snap = backend.snapshot()
@@ -355,13 +355,13 @@ struct EngineShutdownTests {
 
         /* Hold the loop in job A; queue B (accepted while running). */
         endpoint.engine.post { gate.pass(); recorder.record("a") }
-        #expect(gate.awaitBlocked(count: 1))
+        #expect(await gate.awaitBlocked(count: 1))
         endpoint.engine.post { recorder.record("b") }
 
         /* Begin close: the phase flips to stopping before close()'s wake. */
         let wakesBefore = backend.snapshot().wakeCount
         let closer = Task { await endpoint.close() }
-        #expect(backend.awaitCondition { $0.wakeCount > wakesBefore })
+        #expect(await backend.awaitCondition { $0.wakeCount > wakesBefore })
 
         /* Submissions DURING stopping are rejected deterministically. */
         #expect(endpoint.engine.post { recorder.record("never") } == false)
@@ -485,7 +485,7 @@ struct EngineDrainTests {
         backend.setDrainGate(true)
 
         let task = Task { try await endpoint.drain(timeout: .seconds(10)) }
-        #expect(backend.awaitDrainBlocked())
+        #expect(await backend.awaitDrainBlocked())
         task.cancel()
         backend.setDrainGate(false)   /* slice 1 returns .timeout */
         await #expect(throws: CancellationError.self) { try await task.value }
