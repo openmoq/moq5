@@ -4944,6 +4944,65 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
+    /* == Public hard close (moq_session_close) ======================= *
+     * The transport-agnostic auth-denial path: an app holding only the
+     * session (no adapter/connection object) hard-closes it. Must queue
+     * BOTH the CLOSE_SESSION action (for the adapter) and the
+     * SESSION_CLOSED event (for the app), superseding any stale queued
+     * outputs, exactly like the internal close path. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+
+        MOQ_TEST_CHECK(moq_session_close(NULL, 1, "x", 0) == MOQ_ERR_INVAL);
+
+        /* Queue stale output first: start() queues the SETUP send. */
+        MOQ_TEST_CHECK(moq_session_start(s, 1000) == MOQ_OK);
+
+        static const char reason[] = "auth denied";
+        MOQ_TEST_CHECK(moq_session_close(s, 0x4442u, reason, 2000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+
+        /* Idempotent: a second close is MOQ_OK and does NOT overwrite the
+         * still-undrained original close outputs. */
+        MOQ_TEST_CHECK(moq_session_close(s, 0x9999u, "other", 3000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+
+        /* Exactly ONE action: CLOSE_SESSION with the ORIGINAL code and
+         * the caller's reason bytes (borrowed, per the documented
+         * contract) -- the stale SETUP send was superseded. */
+        moq_action_t acts[4];
+        size_t na = moq_session_poll_actions(s, acts, 4);
+        MOQ_TEST_CHECK(na == 1);
+        MOQ_TEST_CHECK(acts[0].kind == MOQ_ACTION_CLOSE_SESSION);
+        MOQ_TEST_CHECK(acts[0].u.close_session.code == 0x4442u);
+        MOQ_TEST_CHECK(acts[0].u.close_session.reason.len ==
+                       sizeof(reason) - 1);
+        MOQ_TEST_CHECK(acts[0].u.close_session.reason.len == 0 ||
+                       memcmp(acts[0].u.close_session.reason.data, reason,
+                              sizeof(reason) - 1) == 0);
+
+        /* Exactly ONE event: SESSION_CLOSED, same code/reason. */
+        moq_event_t evs[4];
+        size_t ne = moq_session_poll_events(s, evs, 4);
+        MOQ_TEST_CHECK(ne == 1);
+        MOQ_TEST_CHECK(evs[0].kind == MOQ_EVENT_SESSION_CLOSED);
+        MOQ_TEST_CHECK(evs[0].u.closed.code == 0x4442u);
+        MOQ_TEST_CHECK(evs[0].u.closed.reason.len == sizeof(reason) - 1);
+        MOQ_TEST_CHECK(evs[0].u.closed.reason.len == 0 ||
+                       memcmp(evs[0].u.closed.reason.data, reason,
+                              sizeof(reason) - 1) == 0);
+        moq_event_cleanup(&evs[0]);
+
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
     MOQ_TEST_PASS("test_session_foundation");
     return failures;
 }

@@ -1956,6 +1956,21 @@ moq_result_t moq_session_on_datagram(moq_session_t *s,
     return session_step(s, &input);
 }
 
+moq_result_t moq_session_close(moq_session_t *s,
+                                uint64_t code,
+                                const char *reason,
+                                uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    /* Idempotent: an already-CLOSED session keeps whatever close outputs
+     * are still queued (original code/reason) -- close_with_error would
+     * clear and replace them. */
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+
+    session_begin_advance(s, now_us);
+    return close_with_error(s, code, reason);
+}
+
 moq_result_t moq_session_on_transport_close(moq_session_t *s,
                                               uint64_t code,
                                               uint64_t now_us)

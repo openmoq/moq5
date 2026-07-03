@@ -74,6 +74,13 @@ add_executable(test_session_foundation unit/test_session_foundation.c)
 target_link_libraries(test_session_foundation PRIVATE moq-core-test-internals)
 add_test(NAME session_foundation COMMAND test_session_foundation)
 
+# Public-header consumer proof for the hard session close: includes only
+# <moq/session.h> and links moq::core (NOT the test-internals archive),
+# exactly as an external app would.
+add_executable(test_session_public_close unit/test_session_public_close.c)
+target_link_libraries(test_session_public_close PRIVATE moq::core)
+add_test(NAME session_public_close COMMAND test_session_public_close)
+
 add_executable(test_session_subscribe unit/test_session_subscribe.c)
 target_link_libraries(test_session_subscribe PRIVATE moq-core-test-internals)
 # The draft-18 early-object regression establishes its pair through SimPair

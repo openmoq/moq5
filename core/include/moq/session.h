@@ -34,7 +34,7 @@
  *     on_data_reset, on_data_stop, subscribe, accept_subscribe,
  *     reject_subscribe, unsubscribe, open_subgroup, write_object,
  *     begin_object, write_object_data, end_object,
- *     close_subgroup, reset_subgroup, goaway.
+ *     close_subgroup, reset_subgroup, goaway, close.
  *     publish_namespace, publish_namespace_done, accept_namespace,
  *     reject_namespace, cancel_namespace, grant_request_capacity,
  *     subscribe_namespace, on_bidi_stream_bytes, accept_ns_sub,
@@ -366,6 +366,31 @@ MOQ_API moq_result_t moq_session_on_transport_close(moq_session_t *s,
                                                       uint64_t code,
                                                       uint64_t now_us);
 
+/*
+ * Hard-close the session locally (e.g. deny an application-level setup
+ * auth check when only the session handle is in hand). NOT a graceful
+ * drain -- for that use moq_session_goaway(). Transitions to CLOSED,
+ * supersedes every still-queued action/event and outbound byte (queued
+ * payload refs are released, rx stream buffers freed, subgroup/deadline
+ * state cleared), then queues exactly one MOQ_ACTION_CLOSE_SESSION (the
+ * adapter closes the transport with `code`/`reason`) and one
+ * MOQ_EVENT_SESSION_CLOSED (the app observes the close).
+ *
+ * `reason` is NOT copied: if non-NULL it must point to storage that
+ * remains valid until the CLOSE_SESSION action and SESSION_CLOSED event
+ * have been polled (their reason spans borrow it) -- static/literal
+ * strings are recommended. NULL means no reason phrase.
+ *
+ * Idempotent: on an already-CLOSED session returns MOQ_OK and leaves any
+ * still-queued close outputs (their original code/reason) untouched.
+ * MOQ_ERR_INVAL for NULL s. Advancing call: invalidates borrows, takes
+ * now_us.
+ */
+MOQ_API moq_result_t moq_session_close(moq_session_t *s,
+                                        uint64_t code,
+                                        const char *reason,
+                                        uint64_t now_us);
+
 /* -- Borrow validation --------------------------------------------- */
 
 /*
@@ -423,7 +448,10 @@ typedef struct moq_send_control_action {
 
 typedef struct moq_close_session_action {
     uint64_t    code;
-    moq_bytes_t reason;  /* BORROWED from static storage; valid until next advancing call */
+    moq_bytes_t reason;  /* BORROWED: internal closes use static strings;
+                            moq_session_close() borrows the caller's
+                            reason (which must outlive this action's
+                            poll). Valid until the next advancing call. */
 } moq_close_session_action_t;
 
 typedef struct moq_send_data_action {
