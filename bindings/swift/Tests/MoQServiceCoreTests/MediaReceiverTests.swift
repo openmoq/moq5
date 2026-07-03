@@ -199,6 +199,32 @@ struct TrackEventStreamTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("firstVideoTrack skips non-video events and returns the video track")
+    func firstVideoTrack() async throws {
+        let rig = try makeRig()
+        rig.receiverBackend.scriptEvents([
+            .added(1, name: "audio", mediaType: .audio),
+            .catalogReady,
+            .added(2, name: "video"),
+        ])
+        rig.endpointBackend.wake()
+        let video = try await rig.receiver.trackEvents.firstVideoTrack()
+        #expect(video?.description.name == "video")
+        await rig.endpoint.close()
+
+        /* A stream that ends with no video yields nil, not an error. */
+        let empty = try makeRig()
+        empty.receiverBackend.scriptEvents([
+            .added(1, name: "audio", mediaType: .audio),
+        ])
+        empty.receiverBackend.scriptTerminal()
+        empty.endpointBackend.wake()
+        let none = try await empty.receiver.trackEvents.firstVideoTrack()
+        #expect(none == nil)
+        await empty.endpoint.close()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Cancelling a parked consumer throws CancellationError; stream stays usable")
     func cancellation() async throws {
         let rig = try makeRig()

@@ -449,6 +449,21 @@ public struct TrackEvents: AsyncSequence, Sendable {
             try await receiver.nextTrackEvent()
         }
     }
+
+    /// Convenience for the common player shape: consume discovery events
+    /// until the first VIDEO track is added and return it; nil when the
+    /// stream ends first (clean close with no video). Other events are
+    /// consumed and dropped; the single-consumer rule applies while this
+    /// runs, and a later iteration picks up from the current queue.
+    public func firstVideoTrack() async throws -> MediaTrack? {
+        for try await event in self {
+            if case .added(let track) = event,
+               track.description.mediaType == .video {
+                return track
+            }
+        }
+        return nil
+    }
 }
 
 /// The ``MediaReceiver/objects`` async sequence.

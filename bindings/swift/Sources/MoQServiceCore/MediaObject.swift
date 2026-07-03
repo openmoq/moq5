@@ -2,12 +2,15 @@ import Foundation
 
 /// One received media object, exclusively owned by this instance.
 ///
-/// Ownership: the C tier transfers its buffer references on poll; this class
-/// is the sole owner and releases them exactly once in `deinit` (legal on any
-/// thread: exclusive ownership plus the mandated thread-safe allocator). The
-/// underlying buffers are never exposed as refcounted handles, so the C
-/// tier's cross-thread finalizer hazard cannot occur — hence
-/// `@unchecked Sendable` with all stored properties immutable.
+/// Ownership: the bytes are owned by this object's ``OwnedObjectStorage``,
+/// released exactly once via `deinit` → `cleanup()` (legal on any thread).
+/// The MoQService C bridge COPIES received bytes into Swift-owned storage
+/// at poll time and cleans the C object on the service thread in the same
+/// poll (v1 is copied-by-design: the C tier's rcbuf refcounts are
+/// non-atomic and must never reach a cross-thread finalizer; zero-copy
+/// receive is a future C API project). No refcounted C handle ever crosses
+/// into this type — hence `@unchecked Sendable` with all stored properties
+/// immutable.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public final class MediaObject: @unchecked Sendable {
 

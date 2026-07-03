@@ -210,6 +210,13 @@ if enableService {
             dependencies: ["MoQService", "CMoQService"],
             path: "bindings/swift/Tests/MoQServiceTests"
         ),
+        // The product-surface proof: builds in the gated lane; running it
+        // needs a real relay (never default CI).
+        .executableTarget(
+            name: "moq-service-player",
+            dependencies: ["MoQService"],
+            path: "bindings/swift/Examples/MoQServicePlayer"
+        ),
     ]
 }
 
