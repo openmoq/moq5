@@ -9,9 +9,13 @@
 #include <moq/publisher.h>
 #include <moq/subscriber.h>
 #include <moq/rcbuf.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stddef.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -809,6 +813,54 @@ int main(void)
             moq_pq_threaded_destroy(t);
         }
         PASS("wake_triggers_pump");
+    }
+
+    /* ================================================================ */
+    /* Pre-session wake marks activity (deferred client, no conn yet)    */
+    /* ================================================================ */
+
+    {
+        /* A deferred-offer client (alpn_count > 0) to a SILENT local UDP
+         * port never creates the session/conn. The wake contract is not
+         * conn-gated: a wake-up pump cycle with no session must still mark
+         * activity so a parked wait returns MOQ_OK promptly -- not at the
+         * ~30s handshake deadline (CLOSED) and not at the wait timeout
+         * (DONE). The silent peer (bound socket, never answers) keeps the
+         * handshake alive across the assertion window. */
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        CHECK(sock >= 0);
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(bind(sock, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+        socklen_t slen = sizeof(sa);
+        CHECK(getsockname(sock, (struct sockaddr *)&sa, &slen) == 0);
+
+        static const char *const offer[] = { "moqt-18", "moqt-16" };
+        moq_pq_threaded_cfg_t cfg;
+        make_client_cfg(&cfg, &alloc);
+        cfg.insecure_skip_verify = true;
+        cfg.host = "127.0.0.1";
+        cfg.port = (int)ntohs(sa.sin_port);
+        cfg.alpn_list = offer;
+        cfg.alpn_count = 2;
+        moq_pq_threaded_t *t = NULL;
+        moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
+        CHECK(rc == MOQ_OK);
+        if (rc == MOQ_OK) {
+            CHECK(moq_pq_threaded_session(t) == NULL);  /* deferred */
+            /* Drain activity retained from loop startup. */
+            while (moq_pq_threaded_wait(t, 1000) == MOQ_OK) {}
+            /* The nudge; its pump cycle must mark (level-retained)
+             * activity even with no session/conn. */
+            CHECK(moq_pq_threaded_wake(t) == MOQ_OK);
+            CHECK(moq_pq_threaded_wait(t, 45ULL * 1000 * 1000) == MOQ_OK);
+            moq_pq_threaded_stop(t);
+            moq_pq_threaded_destroy(t);
+        }
+        close(sock);
+        PASS("pre_session_wake_marks_activity");
     }
 
     /* ================================================================ */

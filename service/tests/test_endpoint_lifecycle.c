@@ -352,6 +352,44 @@ int main(int argc, char **argv)
         close(sock);
     }
 
+    /* == Pre-session wake: the public nudge wakes a CONNECTING waiter == *
+     * A raw-QUIC client offer (AUTO = every supported version) defers the
+     * session until ALPN negotiation; against a silent UDP peer it stays
+     * session-less. The wake contract is not session-gated: the nudged
+     * pump cycle must mark activity, so a parked moq_endpoint_wait()
+     * returns MOQ_OK promptly -- not CLOSED at the ~30s handshake
+     * deadline, not DONE at the wait timeout. */
+    {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        MOQ_TEST_CHECK(sock >= 0);
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        MOQ_TEST_CHECK_EQ_INT(bind(sock, (struct sockaddr *)&sa, sizeof(sa)), 0);
+        socklen_t slen = sizeof(sa);
+        MOQ_TEST_CHECK_EQ_INT(getsockname(sock, (struct sockaddr *)&sa, &slen), 0);
+
+        char wurl[64];
+        moq_endpoint_cfg_t wc;
+        moq_endpoint_cfg_init(&wc);
+        snprintf(wurl, sizeof(wurl), "moqt://127.0.0.1:%d",
+                 (int)ntohs(sa.sin_port));
+        wc.url = (moq_bytes_t){ (const uint8_t *)wurl, strlen(wurl) };
+        wc.insecure_skip_verify = true;
+
+        moq_endpoint_t *wep = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&wc, &wep), (int)MOQ_OK);
+        /* Drain activity retained from loop startup. */
+        while (moq_endpoint_wait(wep, 1000) == MOQ_OK) {}
+        moq_endpoint_wake(wep);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_wait(wep, 45ULL * 1000 * 1000),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(wep), (int)MOQ_OK);
+        moq_endpoint_destroy(wep);
+        close(sock);
+    }
+
     /* == Version negotiation matrix ==================================== *
      * The v0 threaded server accepts exactly one connection, so every
      * scenario below runs against its own fresh d16-only (or d18-capable)

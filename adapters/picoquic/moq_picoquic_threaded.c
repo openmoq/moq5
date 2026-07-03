@@ -567,8 +567,14 @@ static int loop_callback(picoquic_quic_t *quic,
         return 0;
 
     /* Clear wake_pending before any early return so the flag
-     * doesn't stay stale when conn is not yet available. */
-    if (cb_mode == picoquic_packet_loop_wake_up) {
+     * doesn't stay stale when conn is not yet available. Remember the
+     * mode: a wake-up cycle with no session/conn yet (deferred client
+     * mid-handshake, server before the first accept) is still a pump
+     * cycle by the public wake contract, so the pre-session early
+     * returns below must mark activity for it -- otherwise a parked
+     * wait() sleeps out the handshake deadline instead of waking. */
+    bool was_wake_up = (cb_mode == picoquic_packet_loop_wake_up);
+    if (was_wake_up) {
         pthread_mutex_lock(&t->mutex);
         t->wake_pending = false;
         pthread_mutex_unlock(&t->mutex);
@@ -609,8 +615,13 @@ static int loop_callback(picoquic_quic_t *quic,
      * stays up (only endpoint-wide failures terminate the packet loop). --- */
     if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
         uint64_t snow = picoquic_get_quic_time(quic);
-        if (t->conn_count == 0)
-            return 0;   /* no accepted connection yet: on_pump not called */
+        if (t->conn_count == 0) {
+            /* No accepted connection yet: on_pump not called, but a
+             * requested wake still completes as a no-op pump cycle. */
+            if (was_wake_up)
+                mark_activity(t);
+            return 0;
+        }
 
         server_service_all(t, snow);
 
@@ -651,7 +662,13 @@ static int loop_callback(picoquic_quic_t *quic,
         return 0;
     }
 
-    if (!t->conn) return 0;
+    if (!t->conn) {
+        /* Deferred client before ALPN negotiation: no session to service,
+         * but a requested wake still completes as a no-op pump cycle. */
+        if (was_wake_up)
+            mark_activity(t);
+        return 0;
+    }
 
     uint64_t now = picoquic_get_quic_time(quic);
 
