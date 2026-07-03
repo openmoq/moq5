@@ -214,7 +214,15 @@ _create(cfg) for CLIENT:
   2. Allocate moq_pq_threaded_t, init mutex/condvar
   3. picoquic_create(1, NULL, NULL, ..., client_callback, t)
          → t->quic
-  4. If cfg->insecure_skip_verify:
+  4. If cfg->idle_timeout_ms:
+         picoquic_set_default_idle_timeout(t->quic, cfg->idle_timeout_ms)
+         (defense-in-depth for peers that vanish without CONNECTION_CLOSE:
+          bounds how long a dead peer holds a connection before picoquic
+          reaps it and SESSION_CLOSED surfaces; 0 = picoquic default ~30s.
+          Graceful peers should still close properly; aggressive values can
+          kill quiet-but-live connections -- keepalive is a separate knob.
+          cfg->configure_quic runs AFTER this and may override it.)
+     If cfg->insecure_skip_verify:
          picoquic_set_null_verifier(t->quic)
   5. If cfg->configure_quic:
          rc = cfg->configure_quic(t->quic, cfg->configure_quic_ctx)
@@ -258,7 +266,15 @@ _create(cfg) for SERVER:
   3. picoquic_create(max_connections, cert, key, ..., server_callback, t)
          → t->quic   (cfg->max_connections, or the 1024 default; picoquic
                       fixes this cap at context create)
-  4. If cfg->insecure_skip_verify:
+  4. If cfg->idle_timeout_ms:
+         picoquic_set_default_idle_timeout(t->quic, cfg->idle_timeout_ms)
+         (defense-in-depth for peers that vanish without CONNECTION_CLOSE:
+          bounds how long a dead peer holds a connection before picoquic
+          reaps it and SESSION_CLOSED surfaces; 0 = picoquic default ~30s.
+          Graceful peers should still close properly; aggressive values can
+          kill quiet-but-live connections -- keepalive is a separate knob.
+          cfg->configure_quic runs AFTER this and may override it.)
+     If cfg->insecure_skip_verify:
          picoquic_set_null_verifier(t->quic)
   5. If cfg->configure_quic:
          rc = cfg->configure_quic(t->quic, cfg->configure_quic_ctx)

@@ -857,7 +857,9 @@ static int loop_callback(picoquic_quic_t *quic,
  * so it touches only this prefix -- safe for an old binary whose
  * moq_pq_threaded_cfg_t ended before goaway_timeout_us. (sni/alpn_* predate
  * goaway and stay inside this prefix, so they remain enabled under the
- * pointer-only init; only goaway_timeout_us defaults to disabled.) */
+ * pointer-only init; every field appended past it -- goaway_timeout_us,
+ * max_connections, idle_timeout_ms -- defaults to disabled/zero behind
+ * CFG_HAS.) */
 #define MOQ_PQ_THREADED_CFG_V0_SIZE \
     (offsetof(moq_pq_threaded_cfg_t, goaway_timeout_us))
 
@@ -1060,6 +1062,18 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         picoquic_tp_initial_max_stream_data_uni, MOQ_PQ_RECV_FLOW_CONTROL);
     picoquic_set_default_tp_value(t->quic,
         picoquic_tp_initial_max_data, MOQ_PQ_RECV_FLOW_CONTROL);
+
+    /* QUIC idle timeout (cfg.idle_timeout_ms): defense-in-depth for peers
+     * that vanish WITHOUT a CONNECTION_CLOSE -- picoquic reaps the quiet
+     * connection after this long and the adapter surfaces SESSION_CLOSED
+     * through the terminal-conn observation window. Graceful peers should
+     * still close at the MoQ/transport level; aggressive values can kill
+     * legitimately quiet-but-live connections (keepalive is a separate
+     * knob, not implied here). Applied to the context default before any
+     * cnx is created; a configure_quic_fn override still runs after and
+     * may change it. 0 = picoquic's default (~30s). */
+    if (CFG_HAS(cfg, idle_timeout_ms) && cfg->idle_timeout_ms)
+        picoquic_set_default_idle_timeout(t->quic, cfg->idle_timeout_ms);
 
     if (t->insecure_skip_verify)
         picoquic_set_null_verifier(t->quic);

@@ -189,14 +189,31 @@ typedef struct moq_pq_threaded_cfg {
      * at the transport (picoquic closes it). 0 = the library default (1024),
      * mirroring the mvfst managed server. Inert in client mode. */
     uint32_t           max_connections;
+
+    /* Appended (struct_size append-only ABI) — QUIC idle timeout.
+     *
+     * idle_timeout_ms: QUIC idle timeout in milliseconds. 0 = library
+     * default (picoquic's default, currently about 30,000 ms). Bounds how
+     * long a peer that vanished WITHOUT a CONNECTION_CLOSE can remain
+     * before picoquic reaps the connection and the adapter surfaces
+     * MOQ_EVENT_SESSION_CLOSED (see the terminal-conn observation window
+     * at moq_pq_threaded_next_conn). Defense-in-depth for crashed/vanished
+     * peers only -- graceful clients should still close at the
+     * MoQ/session/transport level. Shorter values trade faster dead-peer
+     * cleanup against killing legitimately quiet connections; keepalive is
+     * a separate concern and not implied. Applied to the QUIC context
+     * default before any connection exists; a configure_quic override runs
+     * AFTER it and may change it. */
+    uint32_t           idle_timeout_ms;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
  * existed before goaway_timeout_us was appended (it cannot know the caller's
  * storage size, so it must not write the full current sizeof -- that would
  * overflow an old caller's smaller struct). Fields appended after the prefix
- * (currently goaway_timeout_us and max_connections) default to disabled/zero
- * (max_connections 0 = the 1024 default); sni/alpn_* predate the prefix
+ * (currently goaway_timeout_us, max_connections, and idle_timeout_ms)
+ * default to disabled/zero (max_connections 0 = the 1024 default,
+ * idle_timeout_ms 0 = the picoquic default); sni/alpn_* predate the prefix
  * boundary and stay enabled. To use appended fields, or to get the full
  * current struct, use moq_pq_threaded_cfg_init_sized(). */
 void moq_pq_threaded_cfg_init(moq_pq_threaded_cfg_t *cfg);

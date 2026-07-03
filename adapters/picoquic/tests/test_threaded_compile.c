@@ -511,17 +511,6 @@ static int lifecycle_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
     return 0;
 }
 
-/* Short server idle timeout: an abruptly-vanished client (thread stopped,
- * no CONNECTION_CLOSE on the wire) turns into a local transport close in
- * ~1s instead of the 30s default -- the same picoquic_callback_close ->
- * bridge transport-close path a peer CONNECTION_CLOSE takes. */
-static int configure_quic_short_idle(picoquic_quic_t *quic, void *ctx)
-{
-    (void)ctx;
-    picoquic_set_default_idle_timeout(quic, 1000);
-    return 0;
-}
-
 static void make_server_cfg_real(moq_pq_threaded_cfg_t *cfg,
                                   const moq_alloc_t *alloc)
 {
@@ -595,8 +584,10 @@ int main(void)
               (uint32_t)offsetof(moq_pq_threaded_cfg_t, goaway_timeout_us));
         CHECK(cfg.alloc == NULL);       /* inside prefix: cleared */
         CHECK(cfg.on_pump == NULL);     /* inside prefix: cleared */
-        /* Appended field (immediately after the prefix) NOT written. */
+        /* Appended fields (after the prefix) NOT written. */
         CHECK(cfg.goaway_timeout_us == 0xABABABABABABABABULL);
+        CHECK(cfg.max_connections == 0xABABABABu);
+        CHECK(cfg.idle_timeout_ms == 0xABABABABu);
         moq_pq_threaded_cfg_init(NULL);
         PASS("cfg_init");
     }
@@ -638,7 +629,9 @@ int main(void)
         CHECK(cfg.struct_size == sizeof(moq_pq_threaded_cfg_t));
         CHECK(cfg.alloc == NULL);
         CHECK(cfg.on_pump == NULL);
-        CHECK(cfg.goaway_timeout_us == 0);  /* appended field zero-inits */
+        CHECK(cfg.goaway_timeout_us == 0);  /* appended fields zero-init */
+        CHECK(cfg.max_connections == 0);
+        CHECK(cfg.idle_timeout_ms == 0);    /* 0 = picoquic default */
         moq_pq_threaded_cfg_init_sized(NULL, sizeof(cfg));
         PASS("cfg_init_sized");
     }
@@ -667,6 +660,28 @@ int main(void)
             moq_pq_threaded_destroy(t);
         }
         PASS("cfg_old_prefix_goaway_absent");
+    }
+
+    /* A caller built before idle_timeout_ms was appended: struct_size ends
+     * before it, and garbage in the (to the caller, nonexistent) field must
+     * never be read -- CFG_HAS gates it. Create is accepted with the
+     * picoquic-default idle timeout. */
+    {
+        moq_pq_threaded_cfg_t cfg;
+        make_client_cfg(&cfg, &alloc);
+        cfg.insecure_skip_verify = true;
+        cfg.port = 14600 + (rand() % 400);
+        cfg.struct_size =
+            (uint32_t)offsetof(moq_pq_threaded_cfg_t, idle_timeout_ms);
+        cfg.idle_timeout_ms = 1;   /* garbage past the caller's struct_size */
+        moq_pq_threaded_t *t = NULL;
+        moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
+        CHECK(rc == MOQ_OK);       /* pre-idle prefix accepted */
+        if (rc == MOQ_OK) {
+            moq_pq_threaded_stop(t);
+            moq_pq_threaded_destroy(t);
+        }
+        PASS("cfg_old_prefix_idle_timeout_absent");
     }
 
     /* ================================================================ */
@@ -1290,9 +1305,11 @@ int main(void)
         srv_cfg.on_pump = lifecycle_pump;
         srv_cfg.on_pump_ctx = &lc;
         /* The client below vanishes abruptly (its stop sends no
-         * CONNECTION_CLOSE); the short idle timeout turns that into the
-         * transport-close path in ~1s, well inside the bounded waits. */
-        srv_cfg.configure_quic = configure_quic_short_idle;
+         * CONNECTION_CLOSE); the first-class idle-timeout knob turns that
+         * into the transport-close path in ~1s, well inside the bounded
+         * waits -- also proving cfg.idle_timeout_ms reaches picoquic
+         * (without it, nothing here would observe the disconnect). */
+        srv_cfg.idle_timeout_ms = 1000;
         moq_pq_threaded_t *srv = NULL;
         moq_result_t src = moq_pq_threaded_create(&srv_cfg, &srv);
         CHECK(src == MOQ_OK);
