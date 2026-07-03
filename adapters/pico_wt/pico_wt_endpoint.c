@@ -6,7 +6,9 @@
  *
  * Push-based writes: picoquic_add_to_stream() queues internally
  * and sets is_active=0, so picohttp_callback_provide_data never
- * fires for our streams.
+ * fires for our streams. A bounded send gate (moq_pq_send_gate.h)
+ * caps the buffered backlog and returns WOULD_BLOCK over the cap,
+ * so the bridge retains and retries as the queue drains.
  *
  * Datagram bridge: push send_datagram() buffers one datagram;
  * the pull provide_datagram callback flushes it. Single-slot,
@@ -52,9 +54,15 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
                                         bool fin)
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+
+    if (moq_pq_send_gate_would_block(&ep->send_gate, ep->cnx, len))
+        return MOQ_TRANSPORT_WOULD_BLOCK;
+
     int rc = picoquic_add_to_stream(ep->cnx, stream_id, data, len,
                                      fin ? 1 : 0);
-    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    if (rc != 0) return MOQ_TRANSPORT_ERROR;
+    moq_pq_send_gate_on_added(&ep->send_gate, len);
+    return MOQ_TRANSPORT_OK;
 }
 
 static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
@@ -145,6 +153,7 @@ void pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
     ctx->control_stream_id = control_stream_ctx->stream_id;
 
     ctx->pending_dg_len = 0;
+    moq_pq_send_gate_init(&ctx->send_gate, cnx);
 
     *ops = (moq_transport_endpoint_ops_t){
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),

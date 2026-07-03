@@ -4,7 +4,9 @@
  * Implements moq_transport_endpoint_ops_t by forwarding to picoquic
  * API calls. Used by the bridge-based picoquic adapter.
  *
- * picoquic queues internally, so write/open never return WOULD_BLOCK.
+ * open never returns WOULD_BLOCK, but write does: a bounded send gate
+ * (moq_pq_send_gate.h) caps the bytes buffered in picoquic's send_queue and
+ * returns WOULD_BLOCK over the cap, so the bridge retains and retries.
  * reset_stream and stop_sending return codes are checked — non-zero
  * maps to ERROR (the bridge treats this as fatal).
  */
@@ -36,9 +38,15 @@ static moq_transport_result_t pq_write(void *ctx, uint64_t stream_id,
                                         bool fin)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+
+    if (moq_pq_send_gate_would_block(&ep->send_gate, ep->cnx, len))
+        return MOQ_TRANSPORT_WOULD_BLOCK;
+
     int rc = picoquic_add_to_stream(ep->cnx, stream_id, data, len,
                                      fin ? 1 : 0);
-    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    if (rc != 0) return MOQ_TRANSPORT_ERROR;
+    moq_pq_send_gate_on_added(&ep->send_gate, len);
+    return MOQ_TRANSPORT_OK;
 }
 
 static moq_transport_result_t pq_reset(void *ctx, uint64_t stream_id,
@@ -140,4 +148,5 @@ void pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
         .close_transport = pq_close,
     };
     ep_ctx->cnx = cnx;
+    moq_pq_send_gate_init(&ep_ctx->send_gate, cnx);
 }

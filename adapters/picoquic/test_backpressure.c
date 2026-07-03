@@ -8,6 +8,7 @@
 #include <moq/picoquic.h>
 #include <moq/session.h>
 #include <moq/rcbuf.h>
+#include "../common/moq_pq_send_gate.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -29,6 +30,13 @@ static uint64_t g_next_bidi = 0;
 static int g_reset_count = 0;
 static uint64_t g_reset_code = 0;
 static bool g_send_fail = false;
+/* Queued-send gate accounting: g_data_sent is the drain signal picoquic exposes
+ * (cumulative stream bytes formatted into packets); g_add_count / g_add_bytes
+ * record every picoquic_add_to_stream call so a test can assert the gate skipped
+ * the append and that retries add each byte exactly once. */
+static uint64_t g_data_sent = 0;
+static int g_add_count = 0;
+static size_t g_add_bytes = 0;
 
 picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c)
     { (void)c; return NULL; }
@@ -39,8 +47,11 @@ void picoquic_set_callback(picoquic_cnx_t *c,
     { (void)c; (void)fn; (void)ctx; }
 int picoquic_add_to_stream(picoquic_cnx_t *c, uint64_t sid,
     const uint8_t *d, size_t len, int fin)
-    { (void)c; (void)sid; (void)d; (void)len; (void)fin;
-      return g_send_fail ? -1 : 0; }
+    { (void)c; (void)sid; (void)d; (void)fin;
+      if (g_send_fail) return -1;
+      g_add_count++; g_add_bytes += len; return 0; }
+uint64_t picoquic_get_data_sent(picoquic_cnx_t *c)
+    { (void)c; return g_data_sent; }
 uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *c, int uni)
     { (void)c; return uni ? g_next_uni++ : g_next_bidi++; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
@@ -821,6 +832,135 @@ int main(void)
 
         moq_pq_conn_destroy(ad);
         moq_session_destroy(s);
+    }
+
+    /* -- 17. Queued-send gate bounds the picoquic send_queue depth ------ *
+     * The endpoint must gate picoquic_add_to_stream once the live send-queue
+     * depth (bytes handed to picoquic minus the bytes it reports sent) would
+     * exceed a cap, returning WOULD_BLOCK so the bridge retains and retries.
+     * That keeps picoquic_add_to_stream's tail-walk short instead of letting a
+     * deep single stream degrade to O(n^2). A control run with a huge cap gives
+     * the ungated byte total; the gated run must append the SAME total (every
+     * byte exactly once, no loss/duplication) but not all at once. */
+    #define SF_PAYLOAD 100
+    size_t baseline_bytes = 0;
+    {
+        setenv("MOQ_PQ_STREAM_QUEUE_BYTES", "1000000", 1);
+        g_data_sent = 0; g_add_count = 0; g_add_bytes = 0;
+
+        moq_alloc_t a = talloc();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&a, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&a, s);
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        uint8_t big[SF_PAYLOAD]; memset(big, 'P', sizeof(big));
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&a, big, sizeof(big), &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        moq_session_close_subgroup(s, sgh, 0);
+
+        CHECK(moq_pq_service(ad, g_time) == 0);   /* huge cap: drains in one pass */
+        baseline_bytes = g_add_bytes;
+        CHECK(baseline_bytes >= SF_PAYLOAD);
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+    {
+        setenv("MOQ_PQ_STREAM_QUEUE_BYTES", "4", 1);
+        g_data_sent = 0; g_add_count = 0; g_add_bytes = 0;
+
+        moq_alloc_t a = talloc();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&a, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&a, s);
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        uint8_t big[SF_PAYLOAD]; memset(big, 'P', sizeof(big));
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&a, big, sizeof(big), &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        moq_session_close_subgroup(s, sgh, 0);
+
+        /* First pass with nothing drained: the gate must fire, so the 100-byte
+         * payload is NOT fully appended yet and fewer bytes than baseline go in. */
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+        CHECK(g_add_bytes < (size_t)SF_PAYLOAD);
+        CHECK(g_add_bytes < baseline_bytes);
+
+        /* Drain: tell the gate picoquic sent what we queued, then re-service.
+         * Each pass reopens the gate and the retained writes resume. */
+        int guard = 0;
+        while (g_add_bytes < baseline_bytes && guard++ < 100) {
+            g_data_sent = g_add_bytes;
+            CHECK(moq_pq_service(ad, g_time) == 0);
+        }
+        /* Every byte appended exactly once (no loss, no duplication), FIN too. */
+        CHECK(g_add_bytes == baseline_bytes);
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+    unsetenv("MOQ_PQ_STREAM_QUEUE_BYTES");
+    #undef SF_PAYLOAD
+
+    /* -- 18. Shared send-gate helper edge cases (both endpoints) -------- *
+     * Direct unit test of moq_pq_send_gate.h -- the logic pico_wt and raw
+     * picoquic share: oversized-write forward progress, FIN passthrough, cap
+     * gating, and the saturating drain fold that tolerates co-traffic on the
+     * same connection also advancing data_sent. */
+    {
+        picoquic_cnx_t *cnx = (picoquic_cnx_t *)(uintptr_t)0xC0FFEE;
+        setenv("MOQ_PQ_STREAM_QUEUE_BYTES", "10", 1);
+        g_data_sent = 100;                 /* pre-existing connection traffic */
+
+        moq_pq_send_gate_t g;
+        moq_pq_send_gate_init(&g, cnx);
+        CHECK(g.cap == 10);
+        CHECK(g.queued == 0);
+        CHECK(g.last_sent == 100);         /* baselined, not counted as backlog */
+
+        /* Oversized write onto an empty backlog is allowed (forward progress). */
+        CHECK(moq_pq_send_gate_would_block(&g, cnx, 1000) == 0);
+        moq_pq_send_gate_on_added(&g, 1000);
+
+        /* Now the backlog exceeds the cap: further payload writes block... */
+        CHECK(moq_pq_send_gate_would_block(&g, cnx, 5) != 0);
+        /* ...but a zero-length FIN-only write always passes. */
+        CHECK(moq_pq_send_gate_would_block(&g, cnx, 0) == 0);
+
+        /* Co-traffic advances data_sent far beyond our queued bytes; the drain
+         * fold saturates at 0 (no underflow) rather than going negative. */
+        g_data_sent = 100 + 100000;
+        CHECK(moq_pq_send_gate_would_block(&g, cnx, 5) == 0);  /* backlog drained */
+        CHECK(g.queued == 0);
+
+        /* A fresh small backlog under the cap does not block; crossing it does. */
+        CHECK(moq_pq_send_gate_would_block(&g, cnx, 8) == 0);
+        moq_pq_send_gate_on_added(&g, 8);
+        CHECK(moq_pq_send_gate_would_block(&g, cnx, 8) != 0); /* 8+8 > 10 */
+
+        /* Bad env values fall back to the built-in default, deterministically. */
+        setenv("MOQ_PQ_STREAM_QUEUE_BYTES", "not-a-number", 1);
+        moq_pq_send_gate_t g2;
+        moq_pq_send_gate_init(&g2, cnx);
+        CHECK(g2.cap == MOQ_PQ_STREAM_QUEUE_CAP_DEFAULT);
+        setenv("MOQ_PQ_STREAM_QUEUE_BYTES", "0", 1);
+        moq_pq_send_gate_init(&g2, cnx);
+        CHECK(g2.cap == MOQ_PQ_STREAM_QUEUE_CAP_DEFAULT);
+        unsetenv("MOQ_PQ_STREAM_QUEUE_BYTES");
+
+        g_data_sent = 0;
     }
 
     if (failures == 0)

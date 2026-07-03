@@ -9,6 +9,7 @@
 
 #include <moq/transport_bridge.h>
 #include <picoquic.h>
+#include "../common/moq_pq_send_gate.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,9 @@ extern "C" {
 
 typedef struct {
     picoquic_cnx_t *cnx;
+    /* Bounds the bytes buffered in picoquic's send_queue (avoids the O(n^2)
+     * tail-walk on deep streams). See moq_pq_send_gate.h. */
+    moq_pq_send_gate_t send_gate;
 } pq_endpoint_ctx_t;
 
 void pq_endpoint_init(moq_transport_endpoint_ops_t *ops,

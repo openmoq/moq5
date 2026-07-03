@@ -13,12 +13,19 @@
 #include <moq/transport_bridge.h>
 #include <pico_webtransport.h>
 #include <h3zero_common.h>
+#include "../common/moq_pq_send_gate.h"
 
 typedef struct {
     picoquic_cnx_t *cnx;
     h3zero_callback_ctx_t *h3_ctx;
     h3zero_stream_ctx_t *control_stream_ctx;
     uint64_t control_stream_id;
+
+    /* Bounds bytes buffered in picoquic's send_queue -- the WT data streams use
+     * the same picoquic_add_to_stream push path as raw QUIC. Connection-level
+     * accounting; the saturating drain fold tolerates H3/WT co-traffic on the
+     * same connection also advancing data_sent (see moq_pq_send_gate.h). */
+    moq_pq_send_gate_t send_gate;
 
     /* Datagram buffer (single-slot, lossy, inline — no heap) */
     size_t pending_dg_len;
