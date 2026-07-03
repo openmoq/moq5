@@ -300,6 +300,40 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_compile COMMAND test_threaded_compile)
 
+    # White-box internals variant (test-only, never installed): the threaded
+    # adapter compiled with MOQ_PQ_THREADED_TESTING so the lifecycle test can
+    # inject a post-on_pump service-pass failure -- the terminal-conn
+    # observation window a black-box peer close cannot reach (peer closes
+    # land at packet ingestion, before the ordinary pump). Mirrors the mvfst
+    # test-internals precedent.
+    add_library(moq-adapter-picoquic-threaded-test-internals STATIC
+        moq_picoquic_threaded.c)
+    target_include_directories(moq-adapter-picoquic-threaded-test-internals
+        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    target_include_directories(moq-adapter-picoquic-threaded-test-internals
+        PRIVATE "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    target_link_libraries(moq-adapter-picoquic-threaded-test-internals
+        PUBLIC moq::adapter-picoquic Threads::Threads)
+    target_compile_definitions(moq-adapter-picoquic-threaded-test-internals
+        PRIVATE MOQ_PQ_THREADED_TESTING)
+    set_target_properties(moq-adapter-picoquic-threaded-test-internals
+        PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(moq-adapter-picoquic-threaded-test-internals
+            PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+
+    add_executable(test_threaded_lifecycle tests/test_threaded_lifecycle.c)
+    target_link_libraries(test_threaded_lifecycle PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_lifecycle PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
+
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
     add_test(NAME adapter_threaded_consumer

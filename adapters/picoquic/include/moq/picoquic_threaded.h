@@ -126,7 +126,12 @@ typedef struct moq_pq_threaded_cfg {
      * queued work here.  All session/adapter/facade calls are safe.
      *
      * For server mode, on_pump is NOT called until the first inbound
-     * connection has been accepted.
+     * connection has been accepted. Normally once per loop iteration;
+     * when a connection turns terminal in the post-pump service pass,
+     * ONE extra sequential invocation runs in the same iteration so the
+     * dead connection is observable before it is pruned (the terminal-
+     * conn observation window; see moq_pq_threaded_next_conn). Never
+     * re-entered.
      *
      * Return 0 to continue.  Nonzero requests clean loop termination
      * (pump_exit state — _wait returns MOQ_ERR_CLOSED, _is_fatal
@@ -279,8 +284,19 @@ typedef struct moq_pq_threaded_conn moq_pq_threaded_conn_t;
  *
  * Handle stability: a moq_pq_threaded_conn_t* is stable while the connection
  * remains active (heap-owned; unaffected by the internal list growing). Once a
- * handle no longer appears in iteration it is stale and must not be used
- * (closed/errored connections disappear after the on_pump that observed them).
+ * handle no longer appears in iteration it is stale and must not be used.
+ *
+ * Terminal-connection lifecycle contract: a connection that becomes terminal
+ * because the PEER/transport closed or a service/bridge failure occurred
+ * REMAINS in iteration until an on_pump has run with it present -- so the
+ * app can poll MOQ_EVENT_SESSION_CLOSED (and any other final events) from
+ * its session before the adapter prunes and destroys them. When such a
+ * death arises in the adapter's post-on_pump service pass, the adapter runs
+ * ONE extra sequential on_pump in the same packet-loop iteration (on_pump
+ * is never re-entered) and prunes only after it returns; the connection
+ * never survives into a later loop iteration. App-requested closes
+ * (moq_pq_threaded_conn_close) disappear after the current on_pump, as
+ * before -- the app initiated those.
  */
 moq_pq_threaded_conn_t *moq_pq_threaded_next_conn(
     moq_pq_threaded_t *t, moq_pq_threaded_conn_t *prev);

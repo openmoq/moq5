@@ -49,8 +49,15 @@ struct moq_pq_threaded_conn {
     moq_pq_conn_t  *conn;
     moq_version_t   negotiated;
     bool            close_requested;   /* conn_close: prune after on_pump */
+    bool            dead_observed;     /* terminal AND an app pump has run
+                                          since (SESSION_CLOSED pollable);
+                                          prune precondition for non-app
+                                          closes */
     uint64_t        close_error_code;
     bool            fatal;             /* per-conn service failure: prune */
+#ifdef MOQ_PQ_THREADED_TESTING
+    bool            test_service_fatal; /* seam: next service pass fatals */
+#endif
 };
 
 struct moq_pq_threaded {
@@ -303,11 +310,38 @@ static void server_service_all(moq_pq_threaded_t *t, uint64_t now)
 {
     for (size_t i = 0; i < t->conn_count; i++) {
         struct moq_pq_threaded_conn *c = t->conns[i];
+#ifdef MOQ_PQ_THREADED_TESTING
+        if (c->test_service_fatal) {
+            c->test_service_fatal = false;
+            /* Model a transport close surfacing in THIS service pass with
+             * the REAL artifact: moq_session_on_transport_close queues
+             * MOQ_EVENT_SESSION_CLOSED and the conn then classifies dead
+             * via is_closed -- so the lifecycle test asserts the EVENT is
+             * pollable in the observation window, not mere visibility. */
+            if (c->session)
+                (void)moq_session_on_transport_close(c->session, 0, now);
+            c->fatal = true;    /* dead THIS pass, event queued above */
+            continue;
+        }
+#endif
         if (c->fatal || c->close_requested) continue;
         if (moq_pq_service(c->conn, now) < 0)
             c->fatal = true;
     }
 }
+
+#ifdef MOQ_PQ_THREADED_TESTING
+/* Test seam (never shipped; the test-internals build only): model a
+ * transport close that surfaces in the NEXT service pass, queuing the real
+ * MOQ_EVENT_SESSION_CLOSED. Armed from on_pump, that is the post-pump
+ * pass -- the exact window where a conn can die with no app pump between
+ * its close event being queued and the prune destroying the session. */
+void moq_pq_threaded_test_arm_service_fatal(moq_pq_threaded_conn_t *c);
+void moq_pq_threaded_test_arm_service_fatal(moq_pq_threaded_conn_t *c)
+{
+    c->test_service_fatal = true;
+}
+#endif
 
 /* True once a connection should leave iteration: app-closed, service-fatal,
  * bridge-fatal, or cleanly closed by the peer. */
@@ -318,15 +352,42 @@ static bool server_conn_dead(const struct moq_pq_threaded_conn *c)
                         moq_pq_conn_is_closed(c->conn)));
 }
 
+/* Record that an app pump has run with the currently-dead connections
+ * still iterable: they may be pruned now. Network-thread only. */
+static void server_mark_dead_observed(moq_pq_threaded_t *t)
+{
+    for (size_t i = 0; i < t->conn_count; i++) {
+        struct moq_pq_threaded_conn *c = t->conns[i];
+        if (server_conn_dead(c))
+            c->dead_observed = true;
+    }
+}
+
+/* True when some connection died WITHOUT an app pump since (peer close or
+ * service/bridge fatal in the post-pump service pass). App-requested
+ * closes don't count: the app initiated them. Network-thread only. */
+static bool server_has_unobserved_dead(const moq_pq_threaded_t *t)
+{
+    for (size_t i = 0; i < t->conn_count; i++) {
+        const struct moq_pq_threaded_conn *c = t->conns[i];
+        if (!c->dead_observed && !c->close_requested && server_conn_dead(c))
+            return true;
+    }
+    return false;
+}
+
 /* Remove dead connections after on_pump, so next_conn() stayed stable during
- * the callback. Compaction is network-thread-only; only conn_count is
+ * the callback. Only connections whose terminal state an app pump could
+ * observe (dead_observed; MOQ_EVENT_SESSION_CLOSED pollable) or that the
+ * app itself closed are freed -- never a dead conn the app has not had a
+ * pump to see. Compaction is network-thread-only; only conn_count is
  * published under the mutex for the cross-thread count accessor. */
 static void server_prune(moq_pq_threaded_t *t)
 {
     size_t w = 0;
     for (size_t r = 0; r < t->conn_count; r++) {
         struct moq_pq_threaded_conn *c = t->conns[r];
-        if (server_conn_dead(c)) {
+        if (server_conn_dead(c) && (c->dead_observed || c->close_requested)) {
             /* Close the cnx unless the peer already closed it. An app close
              * carries its requested code; a local/service/bridge fatal carries
              * the bridge fatal code (moq_pq_service left the cnx open). */
@@ -635,8 +696,34 @@ static int loop_callback(picoquic_quic_t *quic,
                 return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
             }
         }
+        /* Every conn dead before/during that pump was observable by it. */
+        server_mark_dead_observed(t);
 
         server_service_all(t, snow);
+
+        /* Terminal-conn observation window: a conn that turned dead in the
+         * second service pass (peer close processed there, service/bridge
+         * fatal) has had NO app pump since its MOQ_EVENT_SESSION_CLOSED was
+         * queued, and the prune below would destroy the session with the
+         * event un-polled -- an app that releases per-connection state on
+         * SESSION_CLOSED would leak it permanently. Run ONE extra
+         * SEQUENTIAL on_pump so the app observes it in this same
+         * packet-loop callback; the conn never survives into a later
+         * iteration where the app could re-attach to a dying session.
+         * App-requested closes (close_requested) skip the window: the app
+         * initiated them and prunes after the current pump as before. */
+        if (t->on_pump && server_has_unobserved_dead(t)) {
+            int prc = t->on_pump(t, snow, t->on_pump_ctx);
+            if (prc != 0) {
+                pthread_mutex_lock(&t->mutex);
+                t->pump_exit = true;
+                pthread_mutex_unlock(&t->mutex);
+                mark_activity(t);
+                return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            }
+            server_mark_dead_observed(t);
+        }
+
         server_prune(t);   /* safe: after on_pump returned */
 
         /* Per-connection app-wake times (each cnx has its own deadline) and an

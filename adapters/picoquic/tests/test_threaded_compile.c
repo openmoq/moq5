@@ -454,6 +454,74 @@ static void make_client_cfg(moq_pq_threaded_cfg_t *cfg,
 }
 
 #ifdef MOQ_TEST_CERT_PATH
+/* -- Terminal-conn lifecycle pump ------------------------------------ *
+ * Tracks ONE accepted connection through the app's eyes: polls its
+ * session only through live next_conn() iteration (never a stale
+ * pointer), records whether MOQ_EVENT_SESSION_CLOSED was observed before
+ * the conn vanished from iteration, and trips on pump re-entrancy. */
+typedef struct {
+    moq_pq_threaded_conn_t *conn;           /* network-thread only */
+    int accepted;
+    int saw_session_closed;
+    int vanished_before_observed;           /* the lifecycle bug */
+    int vanished_after_observed;
+    int in_pump;
+    int reentered;
+} lifecycle_ctx_t;
+
+static int lifecycle_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
+{
+    (void)now;
+    lifecycle_ctx_t *lc = (lifecycle_ctx_t *)vctx;
+    if (__atomic_exchange_n(&lc->in_pump, 1, __ATOMIC_ACQ_REL))
+        __atomic_store_n(&lc->reentered, 1, __ATOMIC_RELEASE);
+
+    int present = 0;
+    moq_pq_threaded_conn_t *c = NULL;
+    while ((c = moq_pq_threaded_next_conn(t, c)) != NULL) {
+        if (!lc->conn) {
+            lc->conn = c;
+            __atomic_store_n(&lc->accepted, 1, __ATOMIC_RELEASE);
+        }
+        if (c != lc->conn)
+            continue;
+        present = 1;
+        moq_session_t *sess = moq_pq_threaded_conn_session(c);
+        if (!sess)
+            continue;
+        moq_event_t ev[8];
+        size_t ne = 0;
+        moq_session_poll_events_ex(sess, ev, 8, sizeof(moq_event_t), &ne);
+        for (size_t i = 0; i < ne; i++) {
+            if (ev[i].kind == MOQ_EVENT_SESSION_CLOSED)
+                __atomic_store_n(&lc->saw_session_closed, 1,
+                                 __ATOMIC_RELEASE);
+        }
+    }
+    if (lc->conn && !present) {
+        if (__atomic_load_n(&lc->saw_session_closed, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&lc->vanished_after_observed, 1,
+                             __ATOMIC_RELEASE);
+        else
+            __atomic_store_n(&lc->vanished_before_observed, 1,
+                             __ATOMIC_RELEASE);
+        lc->conn = NULL;                    /* stop tracking */
+    }
+    __atomic_store_n(&lc->in_pump, 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* Short server idle timeout: an abruptly-vanished client (thread stopped,
+ * no CONNECTION_CLOSE on the wire) turns into a local transport close in
+ * ~1s instead of the 30s default -- the same picoquic_callback_close ->
+ * bridge transport-close path a peer CONNECTION_CLOSE takes. */
+static int configure_quic_short_idle(picoquic_quic_t *quic, void *ctx)
+{
+    (void)ctx;
+    picoquic_set_default_idle_timeout(quic, 1000);
+    return 0;
+}
+
 static void make_server_cfg_real(moq_pq_threaded_cfg_t *cfg,
                                   const moq_alloc_t *alloc)
 {
@@ -1200,6 +1268,82 @@ int main(void)
             moq_pq_threaded_destroy(srv);
         }
         PASS("threaded_loopback_client_server");
+    }
+
+    /* -- Server lifecycle: terminal conn observable before prune -------- */
+    /* Contract: a server connection that turns terminal because the PEER
+     * closed (or transport/bridge fatal) must remain visible in
+     * next_conn() for an on_pump in the same packet-loop callback, so the
+     * app can poll MOQ_EVENT_SESSION_CLOSED -- only then may the adapter
+     * prune/destroy it. Pump/event-driven assertions only: the pump
+     * records whether the close event was polled BEFORE the conn vanished
+     * from iteration. Also trips on on_pump re-entrancy (the closed-conn
+     * observation pass is an extra SEQUENTIAL pump, never nested). */
+    {
+        int port = 14600 + (rand() % 400);
+        lifecycle_ctx_t lc;
+        memset(&lc, 0, sizeof(lc));
+
+        moq_pq_threaded_cfg_t srv_cfg;
+        make_server_cfg_real(&srv_cfg, moq_alloc_default());
+        srv_cfg.port = port;
+        srv_cfg.on_pump = lifecycle_pump;
+        srv_cfg.on_pump_ctx = &lc;
+        /* The client below vanishes abruptly (its stop sends no
+         * CONNECTION_CLOSE); the short idle timeout turns that into the
+         * transport-close path in ~1s, well inside the bounded waits. */
+        srv_cfg.configure_quic = configure_quic_short_idle;
+        moq_pq_threaded_t *srv = NULL;
+        moq_result_t src = moq_pq_threaded_create(&srv_cfg, &srv);
+        CHECK(src == MOQ_OK);
+
+        if (src == MOQ_OK) {
+            moq_pq_threaded_cfg_t cli_cfg;
+            moq_pq_threaded_cfg_init_sized(&cli_cfg, sizeof(cli_cfg));
+            cli_cfg.alloc = moq_alloc_default();
+            cli_cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+            cli_cfg.host = "localhost";
+            cli_cfg.port = port;
+            cli_cfg.insecure_skip_verify = true;
+            cli_cfg.on_pump = dummy_pump;
+            moq_pq_threaded_t *cli = NULL;
+            moq_result_t crc = moq_pq_threaded_create(&cli_cfg, &cli);
+            CHECK(crc == MOQ_OK);
+
+            if (crc == MOQ_OK) {
+                for (int tries = 0; tries < 400 &&
+                     !__atomic_load_n(&lc.accepted, __ATOMIC_ACQUIRE);
+                     tries++)
+                    moq_pq_threaded_wait(srv, 25000);
+                CHECK(__atomic_load_n(&lc.accepted, __ATOMIC_ACQUIRE) == 1);
+
+                /* Real peer disconnect. */
+                moq_pq_threaded_stop(cli);
+                moq_pq_threaded_destroy(cli);
+
+                /* Wait for the prune (cross-thread count accessor: once the
+                 * only conn is gone, on_pump no longer runs, so the pump
+                 * itself cannot witness the absence). */
+                for (int tries = 0; tries < 400 &&
+                     moq_pq_threaded_conn_count(srv) > 0;
+                     tries++)
+                    moq_pq_threaded_wait(srv, 25000);
+                CHECK(moq_pq_threaded_conn_count(srv) == 0);
+
+                /* THE contract, as an ordering: by the time the conn was
+                 * pruned, SESSION_CLOSED had been polled from an on_pump
+                 * with the conn still iterable -- and no pump ever saw the
+                 * conn vanish unobserved. */
+                CHECK(__atomic_load_n(&lc.saw_session_closed,
+                                      __ATOMIC_ACQUIRE) == 1);
+                CHECK(__atomic_load_n(&lc.vanished_before_observed,
+                                      __ATOMIC_ACQUIRE) == 0);
+                CHECK(__atomic_load_n(&lc.reentered, __ATOMIC_ACQUIRE) == 0);
+            }
+            moq_pq_threaded_stop(srv);
+            moq_pq_threaded_destroy(srv);
+        }
+        PASS("server_terminal_conn_observed_before_prune");
     }
 
     /* -- Multi-connection server: two clients, one server --------------- */
