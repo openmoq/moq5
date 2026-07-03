@@ -23,6 +23,7 @@ option(MOQ_BUILD_MEDIA_OBJECT      "Build moq-media-object normalizer" ${_MOQ_ME
 option(MOQ_BUILD_PLAYBACK          "Build moq-playback pipeline"    OFF)
 option(MOQ_BUILD_SERVICE           "Build moq-service (endpoint + media service tier)" OFF)
 option(MOQ_BUILD_BENCHMARKS        "Build benchmarks"               OFF)
+option(MOQ_BUILD_EXAMPLES          "Build LibMoQ example programs"  ON)
 option(MOQ_BUILD_PQ_THREADED       "Build threaded picoquic helper" OFF)
 option(MOQ_BUILD_INTEROP_CLIENT    "Build interop test client"      OFF)
 option(MOQ_BUILD_ADAPTER_MVFST     "Build mvfst QUIC adapter"       OFF)
@@ -130,9 +131,11 @@ endif()
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
     add_subdirectory(adapters/picoquic)
-    add_subdirectory(examples/picoquic)
-    if(MOQ_BUILD_LOC AND MOQ_BUILD_MSF AND MOQ_BUILD_CMAF AND MOQ_BUILD_PLAYBACK)
-        add_subdirectory(examples/local-media)
+    if(MOQ_BUILD_EXAMPLES)
+        add_subdirectory(examples/picoquic)
+        if(MOQ_BUILD_LOC AND MOQ_BUILD_MSF AND MOQ_BUILD_CMAF AND MOQ_BUILD_PLAYBACK)
+            add_subdirectory(examples/local-media)
+        endif()
     endif()
 endif()
 
@@ -143,7 +146,9 @@ endif()
 # -- mvfst adapter ---------------------------------------------------
 if(MOQ_BUILD_ADAPTER_MVFST)
     add_subdirectory(adapters/mvfst)
-    add_subdirectory(examples/mvfst)
+    if(MOQ_BUILD_EXAMPLES)
+        add_subdirectory(examples/mvfst)
+    endif()
 endif()
 
 if(MOQ_BUILD_ADAPTER_PROXYGEN)
@@ -161,7 +166,9 @@ if(MOQ_BUILD_ADAPTER_PICO_WT)
             "MOQ_BUILD_ADAPTER_PICO_WT=ON requires MOQ_BUILD_ADAPTER_PICOQUIC=ON")
     endif()
     add_subdirectory(adapters/pico_wt)
-    add_subdirectory(examples/pico_wt)
+    if(MOQ_BUILD_EXAMPLES)
+        add_subdirectory(examples/pico_wt)
+    endif()
 endif()
 
 # -- Service tier (endpoint + media receiver/sender) ----------------
@@ -320,7 +327,9 @@ endif()
 # Examples are demonstration code and are intentionally NOT covered by
 # MOQ_WARNINGS_AS_ERRORS (see the option's policy note above): they
 # prioritize readability and several are gated behind adapter deps.
-if(MOQ_BUILD_TESTS)
+# MOQ_BUILD_EXAMPLES=OFF gives a library-only build (packaging /
+# cross-compiles); it also removes the tests that run example binaries.
+if(MOQ_BUILD_TESTS AND MOQ_BUILD_EXAMPLES)
     add_executable(publisher_example examples/publisher/main.c)
     target_link_libraries(publisher_example PRIVATE moq::core)
     add_test(NAME publisher_example COMMAND publisher_example)
@@ -344,12 +353,12 @@ endif()
 # these are the high-level "start here" examples for media integrators. They
 # compile against public headers + moq::service only. No add_test -- running
 # them needs a relay -- but they are always compiled for coverage.
-if(MOQ_BUILD_SERVICE)
+if(MOQ_BUILD_SERVICE AND MOQ_BUILD_EXAMPLES)
     add_subdirectory(examples/service)
 endif()
 
 # -- C++ examples ---------------------------------------------------
-if(MOQ_BUILD_TESTS AND MOQ_BUILD_CPP_BINDING)
+if(MOQ_BUILD_TESTS AND MOQ_BUILD_CPP_BINDING AND MOQ_BUILD_EXAMPLES)
     enable_language(CXX)
     add_executable(local_publish_subscribe
         examples/cpp/local-publish-subscribe/main.cpp)
@@ -365,7 +374,7 @@ endif()
 # -- Local media demo smoke test ------------------------------------
 # Mirrors the examples/local-media build condition exactly (the demo
 # binaries also need the playback pipeline).
-if(MOQ_BUILD_TESTS AND MOQ_BUILD_ADAPTER_PICOQUIC AND MOQ_BUILD_LOC AND MOQ_BUILD_MSF AND MOQ_BUILD_CMAF AND MOQ_BUILD_PLAYBACK)
+if(MOQ_BUILD_TESTS AND MOQ_BUILD_EXAMPLES AND MOQ_BUILD_ADAPTER_PICOQUIC AND MOQ_BUILD_LOC AND MOQ_BUILD_MSF AND MOQ_BUILD_CMAF AND MOQ_BUILD_PLAYBACK)
     add_test(NAME local_media_demo
              COMMAND ${CMAKE_COMMAND} -E env bash
                      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_local_media_demo.sh
