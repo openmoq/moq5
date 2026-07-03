@@ -657,6 +657,7 @@ typedef uint32_t moq_event_kind_t;
 #define MOQ_EVENT_SUBSCRIBE_TRACKS_CANCELLED 43u
 #define MOQ_EVENT_REQUEST_REDIRECT           44u
 #define MOQ_EVENT_REQUEST_GOAWAY             45u
+#define MOQ_EVENT_SUBGROUP_FINISHED          46u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -792,6 +793,28 @@ typedef struct moq_object_received_event {
     moq_rcbuf_t       *payload;     /* OWNED ref transferred on poll; NULL for status objects */
     moq_rcbuf_t       *properties;  /* OWNED ref transferred on poll; NULL if none */
 } moq_object_received_event_t;
+
+/*
+ * A subgroup data stream ended gracefully with a FIN. Emitted after the
+ * subgroup header has been parsed and every buffered object on the stream has
+ * been delivered -- i.e. strictly AFTER the final OBJECT_RECEIVED / OBJECT_CHUNK
+ * of that subgroup. Lets a receiver/relay reclaim per-subgroup state on a clean
+ * end without inferring it from object IDs.
+ *
+ * Exactly one of `sub` / `pub` is valid, matching the OBJECT_RECEIVED events of
+ * the same subgroup (sub for a subscriber-role stream, pub for a
+ * publisher-initiated one). Not emitted for FETCH streams, for streams reset via
+ * RESET_STREAM / STOP_SENDING, or for streams that FIN before a usable subgroup
+ * header was parsed. Owns no resources (moq_event_cleanup is a no-op).
+ */
+typedef struct moq_subgroup_finished_event {
+    moq_subscription_t sub;
+    moq_publication_t  pub;
+    uint64_t           group_id;
+    uint64_t           subgroup_id;
+    bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
+    uint8_t            _pad[7];
+} moq_subgroup_finished_event_t;
 
 /* -- Namespace event detail structs -------------------------------- */
 
@@ -1264,6 +1287,7 @@ typedef struct moq_event {
         moq_subscribe_tracks_error_event_t     subscribe_tracks_error;
         moq_publish_blocked_event_t            publish_blocked;
         moq_subscribe_tracks_cancelled_event_t subscribe_tracks_cancelled;
+        moq_subgroup_finished_event_t          subgroup_finished;
         uint8_t                     _reserved[MOQ_EVENT_DETAIL_MAX];
     } u;
 } moq_event_t;
@@ -1290,7 +1314,7 @@ moq_session_poll_events(moq_session_t *s, moq_event_t *out, size_t cap)
 /*
  * Release owned resources in a polled event. Idempotent.
  * OBJECT_RECEIVED: decrefs payload and properties, sets both NULL.
- * All other kinds: no-op.
+ * All other kinds (including SUBGROUP_FINISHED, which owns none): no-op.
  * Callers MUST call this after processing or dropping every polled event.
  */
 MOQ_API void moq_event_cleanup(moq_event_t *event);

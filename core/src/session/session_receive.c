@@ -84,6 +84,59 @@ static bool rx_is_finished(moq_session_t *s, uint64_t ref_v)
     return false;
 }
 
+/* The single graceful-FIN completion path for a receive data stream. For a
+ * subgroup stream whose header was parsed and bound to exactly one of a
+ * subscription / publication, emit SUBGROUP_FINISHED (after the final
+ * object/chunk of the stream, which the caller has already delivered); then
+ * record the FIN and free the entry. Fetch streams, headerless streams, and
+ * unbound (deferred-alias) streams carry no such binding and skip the event --
+ * they just record + free, matching the prior behavior exactly.
+ *
+ * Backpressure: if the event queue is full the entry is left ACTIVE in
+ * MOQ_RX_PENDING_FINISHED with pending_fin set and MOQ_ERR_WOULD_BLOCK is
+ * returned WITHOUT recording/freeing. The retry (a re-driven FIN delivery)
+ * re-enters here and re-attempts only the SUBGROUP_FINISHED push -- never any
+ * prior object/chunk, whose ownership has already transferred. */
+static moq_result_t rx_finish_stream(moq_session_t *s, int slot)
+{
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+    uint64_t ref_v = rx->stream_ref._v;
+
+    bool bound = moq_subscription_is_valid(rx->sub) !=
+                 moq_publication_is_valid(rx->pub_handle);
+    /* Skip the event when the subgroup ID was never resolved: a
+     * FIRST_OBJECT-mode header whose stream FINs with no object carries only
+     * the decoder's default (0), not a real subgroup ID -- emitting it would
+     * let a relay seal/free subgroup 0 by mistake. Any object on the stream
+     * resolves the ID, and ZERO/PRESENT modes are resolved at the header. */
+    if (rx->stream_kind == MOQ_STREAM_KIND_SUBGROUP && bound &&
+        rx->subgroup_id_resolved) {
+        if (event_queue_full(s)) {
+            rx->parse_state = MOQ_RX_PENDING_FINISHED;
+            return MOQ_ERR_WOULD_BLOCK;
+        }
+        moq_event_t e;
+        memset(&e, 0, sizeof(e));
+        e.kind = MOQ_EVENT_SUBGROUP_FINISHED;
+        e.detail_size = (uint32_t)sizeof(moq_subgroup_finished_event_t);
+        e.borrow_epoch = s->borrow_epoch;
+        e.u.subgroup_finished.sub = rx->sub;
+        e.u.subgroup_finished.pub = rx->pub_handle;
+        e.u.subgroup_finished.group_id = rx->group_id;
+        e.u.subgroup_finished.subgroup_id = rx->subgroup_id;
+        e.u.subgroup_finished.end_of_group = rx->end_of_group;
+        moq_result_t rc = push_event(s, &e);
+        if (rc < 0) {
+            rx->parse_state = MOQ_RX_PENDING_FINISHED;
+            return rc;
+        }
+    }
+
+    rx_record_finished(s, ref_v);
+    rx_free_entry(s, (size_t)slot);
+    return MOQ_OK;
+}
+
 /* -- Receive helpers ----------------------------------------------- */
 
 static moq_result_t rx_try_stop(moq_session_t *s, int slot)
@@ -267,8 +320,7 @@ static moq_result_t rx_emit_chunk(moq_session_t *s, int slot,
     /* Push succeeded. Finalize state transition. */
     if (end) {
         if (rx->pending_fin && rx->input_len == 0) {
-            rx_record_finished(s, rx->stream_ref._v);
-            rx_free_entry(s, (size_t)slot);
+            return rx_finish_stream(s, slot);
         } else {
             rx->parse_state = MOQ_RX_AWAITING_OBJECT;
             rx->payload_written = 0;
@@ -341,11 +393,10 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
     rx->payload_buf = NULL;
     rx->payload_written = 0;
 
-    /* Handle deferred FIN: if no more buffered data, finish now. */
+    /* Handle deferred FIN: if no more buffered data, finish now (emitting
+     * SUBGROUP_FINISHED after this final object). */
     if (rx->pending_fin && rx->hdr_len == 0 && rx->input_len == 0) {
-        rx_record_finished(s, rx->stream_ref._v);
-        rx_free_entry(s, (size_t)slot);
-        return MOQ_OK;
+        return rx_finish_stream(s, slot);
     }
 
     rx->parse_state = MOQ_RX_AWAITING_OBJECT;
@@ -480,6 +531,20 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
     if (rx->parse_state == MOQ_RX_NEED_STOP)
         return rx_try_stop(s, slot);
 
+    /* All objects were emitted and the FIN seen, but SUBGROUP_FINISHED could not
+     * be queued last time (event queue was full). No object bytes remain to
+     * parse -- just re-attempt the finish. On success the entry is freed; a
+     * still-full queue WOULD_BLOCKs again and the bridge re-drives the FIN. This
+     * MUST run before the stale-binding check below: the object/chunk events
+     * already transferred with the stored handles, so once we are pending-finish
+     * the stream owes exactly one SUBGROUP_FINISHED even if the app frees the
+     * subscription/publication in the meantime -- it must not degrade to a
+     * STOP_DATA. */
+    if (rx->parse_state == MOQ_RX_PENDING_FINISHED) {
+        rx->pending_fin = true;
+        return rx_finish_stream(s, slot);
+    }
+
     /* If the bound subscription/publication was freed since this stream's header
      * bound it (e.g. a rejected pending PUBLISH), drop the stream instead of
      * emitting against a stale handle. The binding cannot change mid-call (it is
@@ -569,9 +634,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 return MOQ_OK;
             }
             if (rx->pending_fin && rx->input_len == 0) {
-                rx_record_finished(s, rx->stream_ref._v);
-                rx_free_entry(s, (size_t)slot);
-                return MOQ_OK;
+                return rx_finish_stream(s, slot);
             }
             rx->parse_state = MOQ_RX_AWAITING_OBJECT;
             rx->payload_written = 0;
@@ -615,11 +678,9 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 return close_with_error(s, 0x3, "truncated payload at FIN");
 
             if (rx->pending_fin && rx->active &&
-                rx->parse_state != MOQ_RX_STREAMING_PAYLOAD) {
-                if (rx->input_len == 0) {
-                    rx_record_finished(s, rx->stream_ref._v);
-                    rx_free_entry(s, (size_t)slot);
-                }
+                rx->parse_state != MOQ_RX_STREAMING_PAYLOAD &&
+                rx->input_len == 0) {
+                return rx_finish_stream(s, slot);
             }
             return MOQ_OK;
         }
@@ -781,9 +842,8 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                         if (erc2 < 0) { loop_rc = erc2; goto compact; }
                         fetch_free_entry(s, (int)(fslot));
                     }
-                    rx_record_finished(s, stream_ref._v);
-                    rx_free_entry(s, (size_t)slot);
-                    return MOQ_OK;
+                    /* Fetch stream: rx_finish_stream skips the subgroup event. */
+                    return rx_finish_stream(s, slot);
                 }
 
                 rx->parse_state = MOQ_RX_AWAITING_OBJECT;
@@ -801,9 +861,9 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 if (rx->pending_fin) {
                     if (rx->hdr_len > 0)
                         return close_with_error(s, 0x3, "truncated subgroup header at FIN");
-                    rx_record_finished(s, stream_ref._v);
-                    rx_free_entry(s, (size_t)slot);
-                    return MOQ_OK;
+                    /* No subgroup header was parsed: headerless graceful FIN,
+                     * no SUBGROUP_FINISHED (rx_finish_stream skips: unbound). */
+                    return rx_finish_stream(s, slot);
                 }
                 goto compact;
             }
@@ -894,9 +954,8 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                         if (ferc < 0) { loop_rc = ferc; goto compact; }
                         fetch_free_entry(s, fslot2);
                     }
-                    rx_record_finished(s, stream_ref._v);
-                    rx_free_entry(s, (size_t)slot);
-                    return MOQ_OK;
+                    /* Fetch stream: rx_finish_stream skips the subgroup event. */
+                    return rx_finish_stream(s, slot);
                 }
 
                 if (avail == 0) goto compact;
@@ -1031,9 +1090,9 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 &obj);
             if (orc == MOQ_ERR_BUFFER) {
                 if (rx->pending_fin && avail == 0) {
-                    rx_record_finished(s, stream_ref._v);
-                    rx_free_entry(s, (size_t)slot);
-                    return MOQ_OK;
+                    /* Subgroup header parsed, no (more) objects: graceful FIN.
+                     * Emits SUBGROUP_FINISHED (empty or post-final object). */
+                    return rx_finish_stream(s, slot);
                 }
                 if (rx->pending_fin)
                     return close_with_error(s, 0x3, "truncated object header at FIN");
@@ -1211,9 +1270,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
     } /* while */
 
     if (rx->pending_fin && rx->active && cursor >= rx->input_len) {
-        rx_record_finished(s, stream_ref._v);
-        rx_free_entry(s, (size_t)slot);
-        return MOQ_OK;
+        return rx_finish_stream(s, slot);
     }
 
 compact:

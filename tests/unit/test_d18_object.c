@@ -158,6 +158,10 @@ int main(void)
         int count = 0;
         uint64_t seen_group = 0, seen_obj_max = 0;
         bool payload_ok = true;
+        /* draft-18 also emits SUBGROUP_FINISHED on the subgroup's graceful FIN,
+         * after both objects and with end_of_group=false (the header had no EOG
+         * bit). Verify it arrives exactly once, after the last object. */
+        int finished = 0, objs_before_finished = 0;
         moq_event_t ev;
         while (moq_session_poll_events(client, &ev, 1) > 0) {
             if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
@@ -170,10 +174,19 @@ int main(void)
                     memcmp(moq_rcbuf_data(o->payload), exp, want) != 0)
                     payload_ok = false;
                 count++;
+            } else if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED) {
+                if (finished == 0) objs_before_finished = count;
+                finished++;
+                MOQ_TEST_CHECK_EQ_U64(ev.u.subgroup_finished.group_id, 7);
+                MOQ_TEST_CHECK(ev.u.subgroup_finished.end_of_group == false);
+                MOQ_TEST_CHECK(moq_subscription_is_valid(ev.u.subgroup_finished.sub));
+                MOQ_TEST_CHECK(!moq_publication_is_valid(ev.u.subgroup_finished.pub));
             }
             moq_event_cleanup(&ev);
         }
         MOQ_TEST_CHECK_EQ_INT(count, 2);
+        MOQ_TEST_CHECK_EQ_INT(finished, 1);
+        MOQ_TEST_CHECK_EQ_INT(objs_before_finished, 2);
         MOQ_TEST_CHECK_EQ_U64(seen_group, 7);
         MOQ_TEST_CHECK_EQ_U64(seen_obj_max, 1);
         MOQ_TEST_CHECK(payload_ok);
@@ -1202,6 +1215,45 @@ int main(void)
         MOQ_TEST_CHECK(eot_null_payload);
         MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK_EQ_INT((int)server->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_simpair_destroy(sp);
+    }
+
+    /* == K. FIRST_OBJECT-mode subgroup, empty + FIN -> no SUBGROUP_FINISHED == *
+     * A first-object-mode header whose stream FINs with no object never resolves
+     * its subgroup ID, so no SUBGROUP_FINISHED is fabricated (draft-18). */
+    {
+        moq_simpair_t *sp = make_pair(MOQ_VERSION_DRAFT_18, false, 0, 0);
+        MOQ_TEST_CHECK(sp != NULL);
+        moq_session_t *client = moq_simpair_client(sp);
+        moq_subscription_t ssub;
+        uint64_t alias = 0;
+        MOQ_TEST_CHECK(setup_subscription(sp, "video", &ssub, &alias));
+
+        uint8_t wire[32];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, wire, sizeof(wire));
+        moq_d18_subgroup_header_t shdr;
+        memset(&shdr, 0, sizeof(shdr));
+        shdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_FIRST_OBJ;
+        shdr.track_alias = alias;
+        shdr.group_id = 5;
+        shdr.publisher_priority = 128;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_subgroup_header(&w, &shdr),
+                              (int)MOQ_OK);
+
+        /* Header then a bare FIN (no object). */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_bytes(client,
+            moq_stream_ref_from_u64(0xD18F), wire, moq_buf_writer_offset(&w),
+            true, moq_simpair_now_us(sp)), (int)MOQ_OK);
+
+        int sgf = 0;
+        moq_event_t ev;
+        while (moq_session_poll_events(client, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED) sgf++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(sgf, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_ESTABLISHED);
         moq_simpair_destroy(sp);
     }
 

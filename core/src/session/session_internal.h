@@ -797,6 +797,11 @@ typedef enum moq_rx_parse_state {
      * (the entry then flips to AWAITING_OBJECT and the buffered objects are
      * parsed). */
     MOQ_RX_DEFERRED_ALIAS   = 7,
+    /* Graceful FIN seen and all objects emitted, but the SUBGROUP_FINISHED
+     * event could not be queued (event queue full). The stream stays live with
+     * pending_fin set; rx_finish_stream is retried on the next drive until the
+     * event is queued, then the entry is recorded-finished and freed. */
+    MOQ_RX_PENDING_FINISHED = 8,
 } moq_rx_parse_state_t;
 
 typedef struct moq_rx_stream {

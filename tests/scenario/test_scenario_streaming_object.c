@@ -649,14 +649,25 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
         moq_event_t ev;
         if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
 
-        /* Retry. */
+        /* Retry. The OBJECT_CHUNK emits and fills the 1-slot queue, so the
+         * trailing SUBGROUP_FINISHED backpressures (WOULD_BLOCK, stream held
+         * in PENDING_FINISHED). */
         drc = moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0);
-        if (drc != MOQ_OK) goto done;
+        if (drc != MOQ_ERR_WOULD_BLOCK) goto done;
 
         uint8_t reasm[64]; size_t rlen, cc, oc;
         if (drain_and_reconstruct(c, reasm, sizeof(reasm), &rlen, &cc, &oc, NULL) < 0)
             goto done;
         if (oc != 1 || rlen != 5 || memcmp(reasm, "retry", 5) != 0) goto done;
+
+        /* Queue drained: retry so SUBGROUP_FINISHED can be queued. */
+        if (moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0) != MOQ_OK)
+            goto done;
+        { moq_event_t sgf;
+          if (moq_session_poll_events(c, &sgf, 1) != 1 ||
+              sgf.kind != MOQ_EVENT_SUBGROUP_FINISHED) {
+              moq_event_cleanup(&sgf); goto done; }
+          moq_event_cleanup(&sgf); }
         ts->pre_objects++;
         ts->pre_chunks += cc;
         ts->rnd_wb++;
@@ -761,7 +772,9 @@ static int run_prelude(uint64_t seed, const moq_alloc_t *alloc,
         moq_event_t ev;
         if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
 
-        /* Retry. */
+        /* Retry. This segment feeds no FIN (only header + payload), so the
+         * continuation chunk completes the object with MOQ_OK and no
+         * SUBGROUP_FINISHED. */
         drc = moq_session_on_data_bytes(c, rx_ref, NULL, 0, false, 0);
         if (drc != MOQ_OK) goto done;
 

@@ -731,9 +731,14 @@ static int rnd_feed_data(moq_session_t *c, const moq_action_t *act,
         hash_op(ts, (uint64_t)drc);
         if (drc == MOQ_ERR_WOULD_BLOCK) {
             ts->rnd_wb_data_input++;
-            rnd_drain_client(c, ts);
-            drc = moq_session_on_data_bytes(c, ref, NULL, 0, false, 0);
-            hash_op(ts, (uint64_t)drc);
+            /* A blocked delivery may need more than one drain+retry cycle: the
+             * final object/chunk and the trailing SUBGROUP_FINISHED can each
+             * need their own event-queue slot. Retry until it resolves. */
+            while (drc == MOQ_ERR_WOULD_BLOCK) {
+                rnd_drain_client(c, ts);
+                drc = moq_session_on_data_bytes(c, ref, NULL, 0, false, 0);
+                hash_op(ts, (uint64_t)drc);
+            }
             if (drc == MOQ_OK) ts->rnd_retries++;
             else if (drc != MOQ_ERR_CLOSED) return -1;
         }
@@ -748,9 +753,13 @@ static int rnd_feed_data(moq_session_t *c, const moq_action_t *act,
         hash_op(ts, (uint64_t)drc);
         if (drc == MOQ_ERR_WOULD_BLOCK) {
             ts->rnd_wb_data_input++;
-            rnd_drain_client(c, ts);
-            drc = moq_session_on_data_bytes(c, ref, NULL, 0, false, 0);
-            hash_op(ts, (uint64_t)drc);
+            /* May need multiple drain+retry cycles (final object/chunk, then
+             * the trailing SUBGROUP_FINISHED). Retry until it resolves. */
+            while (drc == MOQ_ERR_WOULD_BLOCK) {
+                rnd_drain_client(c, ts);
+                drc = moq_session_on_data_bytes(c, ref, NULL, 0, false, 0);
+                hash_op(ts, (uint64_t)drc);
+            }
             if (drc == MOQ_OK) ts->rnd_retries++;
             else if (drc != MOQ_ERR_CLOSED) return -1;
         }
@@ -761,6 +770,19 @@ static int rnd_feed_data(moq_session_t *c, const moq_action_t *act,
     if (!hp && act->u.send_data.header_len == 0 && fin) {
         drc = moq_session_on_data_bytes(c, ref, NULL, 0, true, 0);
         hash_op(ts, (uint64_t)drc);
+        /* A bare FIN finishes the subgroup and now emits SUBGROUP_FINISHED,
+         * which can WOULD_BLOCK on the tiny queue. Drain and retry until it
+         * queues (or the session closes). */
+        if (drc == MOQ_ERR_WOULD_BLOCK) {
+            ts->rnd_wb_data_input++;
+            while (drc == MOQ_ERR_WOULD_BLOCK) {
+                rnd_drain_client(c, ts);
+                drc = moq_session_on_data_bytes(c, ref, NULL, 0, false, 0);
+                hash_op(ts, (uint64_t)drc);
+            }
+            if (drc == MOQ_OK) ts->rnd_retries++;
+            else if (drc != MOQ_ERR_CLOSED) return -1;
+        }
         if (drc < 0 && drc != MOQ_ERR_CLOSED) return -1;
     }
     return 0;

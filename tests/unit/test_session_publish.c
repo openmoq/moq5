@@ -966,6 +966,16 @@ int main(void)
             memcmp(moq_rcbuf_data(ev.u.object_received.payload), "late", 4) == 0);
         moq_event_cleanup(&ev);
 
+        /* The publisher-initiated subgroup stream FINs gracefully: its data
+         * stream is bound to the publication (pub valid, sub invalid), so
+         * SUBGROUP_FINISHED is emitted after the final object and before the
+         * publication-level PUBLISH_FINISHED. */
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.kind, (int)MOQ_EVENT_SUBGROUP_FINISHED);
+        MOQ_TEST_CHECK(moq_publication_is_valid(ev.u.subgroup_finished.pub));
+        MOQ_TEST_CHECK(!moq_subscription_is_valid(ev.u.subgroup_finished.sub));
+        moq_event_cleanup(&ev);
+
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
         MOQ_TEST_CHECK_EQ_INT((int)ev.kind, (int)MOQ_EVENT_PUBLISH_FINISHED);
         MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.stream_count, 1);
