@@ -69,6 +69,13 @@ out_dir="${1:-$build_root/dist}"
 deploy_target="${MOQ_IOS_DEPLOYMENT_TARGET:-16.0}"
 jobs="${MOQ_IOS_JOBS:-$(sysctl -n hw.ncpu)}"
 
+# Which slices to build. Default is both (a shippable xcframework); CI sets
+# MOQ_IOS_SLICES=simulator to build only the sim slice it links against. A
+# sim-only xcframework is valid for simulator builds but not a device install.
+# When paired with a sim-only OpenSSL build, point MOQ_IOS_OPENSSL_ROOT at
+# that build's prefix-ios-simulator.
+slices="${MOQ_IOS_SLICES:-device simulator}"
+
 resolve_dep() {
     local name=$1 override=$2 var=$3
     if [ -n "$override" ]; then
@@ -197,18 +204,36 @@ build_slice() {
     log "[$slice] bundle OK ($(du -h "$bdir/libmoq_bundle.a" | cut -f1) platform $platform)"
 }
 
-build_slice ios-device    iphoneos        2
-build_slice ios-simulator iphonesimulator 7
+# Build selected slices; collect create-xcframework args and record the
+# first slice's prefix (the installed headers are platform-neutral, so any
+# built slice supplies them).
+libs=()
+hdr_prefix=""
+for slice in $slices; do
+    case "$slice" in
+    device)
+        build_slice ios-device    iphoneos        2
+        libs+=( "$build_root/ios-device/libmoq_bundle.a" )
+        [ -n "$hdr_prefix" ] || hdr_prefix="$build_root/prefix-ios-device" ;;
+    simulator)
+        build_slice ios-simulator iphonesimulator 7
+        libs+=( "$build_root/ios-simulator/libmoq_bundle.a" )
+        [ -n "$hdr_prefix" ] || hdr_prefix="$build_root/prefix-ios-simulator" ;;
+    *)
+        die "unknown slice '$slice' in MOQ_IOS_SLICES (want: device simulator)" ;;
+    esac
+done
+[ ${#libs[@]} -gt 0 ] || die "MOQ_IOS_SLICES selected no slices"
 
 # -- Headers + clang module -------------------------------------------
-# Installed headers are platform-neutral; stage once (from the device
-# prefix) and reuse for both slices. The module mirrors
+# Installed headers are platform-neutral; stage once (from the first built
+# slice's prefix) and reuse for every slice. The module mirrors
 # bindings/swift/SystemModules/CMoQService so `import CMoQService`
 # resolves identically against pkg-config (macOS) and this xcframework.
 headers="$build_root/headers"
 rm -rf "$headers"
 mkdir -p "$headers"
-cp -R "$build_root/prefix-ios-device/include/moq" "$headers/moq"
+cp -R "$hdr_prefix/include/moq" "$headers/moq"
 
 cat > "$headers/shim.h" <<'EOF'
 #ifndef MOQ_SERVICE_SHIM_H
@@ -233,11 +258,14 @@ module CMoQService [system] {
 EOF
 
 # -- Assemble ----------------------------------------------------------
+# Pair every built slice's library with the shared staged headers.
+xc_args=()
+for lib in "${libs[@]}"; do
+    xc_args+=( -library "$lib" -headers "$headers" )
+done
 mkdir -p "$out_dir"
 rm -rf "$out_dir/LibMoQ.xcframework"
-xcodebuild -create-xcframework \
-    -library "$build_root/ios-device/libmoq_bundle.a"    -headers "$headers" \
-    -library "$build_root/ios-simulator/libmoq_bundle.a" -headers "$headers" \
+xcodebuild -create-xcframework "${xc_args[@]}" \
     -output "$out_dir/LibMoQ.xcframework" >&2
 
 # Stamp compile-only builds so the artifact cannot masquerade as

@@ -75,6 +75,12 @@ out_dir="${1:-$build_root/dist}"
 deploy_target="${MOQ_IOS_DEPLOYMENT_TARGET:-16.0}"
 jobs="${MOQ_IOS_JOBS:-$(sysctl -n hw.ncpu)}"
 
+# Which slices to build. Default is both (a shippable xcframework); CI sets
+# MOQ_IOS_SLICES=simulator to build only the sim slice it links against,
+# halving the OpenSSL build. A sim-only xcframework is valid for simulator
+# builds but not for a device install.
+slices="${MOQ_IOS_SLICES:-device simulator}"
+
 # -- Source ------------------------------------------------------------
 src="${MOQ_OPENSSL_SOURCE_DIR:-}"
 if [ -n "$src" ]; then
@@ -157,20 +163,35 @@ build_slice() {
     log "[$slice] OK (platform $platform)"
 }
 
-build_slice ios-device    ios64-xcrun               -miphoneos-version-min="$deploy_target"        2
-build_slice ios-simulator iossimulator-arm64-xcrun  -mios-simulator-version-min="$deploy_target"   7
+# Build selected slices; assemble create-xcframework args as we go. The
+# OpenSSL headers are identical across the arm64 device/sim slices, so the
+# hint below points at whichever slice was built first.
+xc_args=()
+hint_prefix=""
+for slice in $slices; do
+    case "$slice" in
+    device)
+        build_slice ios-device    ios64-xcrun              -miphoneos-version-min="$deploy_target"       2
+        xc_args+=( -library "$build_root/ios-device/libopenssl_bundle.a" \
+                   -headers "$build_root/prefix-ios-device/include" )
+        [ -n "$hint_prefix" ] || hint_prefix="$build_root/prefix-ios-device" ;;
+    simulator)
+        build_slice ios-simulator iossimulator-arm64-xcrun -mios-simulator-version-min="$deploy_target"  7
+        xc_args+=( -library "$build_root/ios-simulator/libopenssl_bundle.a" \
+                   -headers "$build_root/prefix-ios-simulator/include" )
+        [ -n "$hint_prefix" ] || hint_prefix="$build_root/prefix-ios-simulator" ;;
+    *)
+        die "unknown slice '$slice' in MOQ_IOS_SLICES (want: device simulator)" ;;
+    esac
+done
+[ ${#xc_args[@]} -gt 0 ] || die "MOQ_IOS_SLICES selected no slices"
 
 # -- Assemble OpenSSL.xcframework -------------------------------------
-# Headers are the device prefix's (arm64 device == arm64 sim config).
 mkdir -p "$out_dir"
 rm -rf "$out_dir/OpenSSL.xcframework"
-xcodebuild -create-xcframework \
-    -library "$build_root/ios-device/libopenssl_bundle.a" \
-        -headers "$build_root/prefix-ios-device/include" \
-    -library "$build_root/ios-simulator/libopenssl_bundle.a" \
-        -headers "$build_root/prefix-ios-simulator/include" \
+xcodebuild -create-xcframework "${xc_args[@]}" \
     -output "$out_dir/OpenSSL.xcframework" >&2
 
 log "done: $out_dir/OpenSSL.xcframework"
 log "feed the LibMoQ xcframework build with:"
-log "    MOQ_IOS_OPENSSL_ROOT=$build_root/prefix-ios-device"
+log "    MOQ_IOS_OPENSSL_ROOT=$hint_prefix"

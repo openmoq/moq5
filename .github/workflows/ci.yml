@@ -128,6 +128,49 @@ jobs:
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
 
+  swift-service-ios:
+    name: Swift Service iOS (simulator, macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pinned picoquic/picotls
+        run: scripts/setup_picoquic_deps.sh
+
+      # Simulator-only iOS artifacts (MOQ_IOS_SLICES=simulator builds just the
+      # slice this lane links against, halving the OpenSSL build). The local
+      # full device+simulator build for a shippable xcframework is documented
+      # in docs/ios-packaging.md.
+      - name: Build iOS OpenSSL (simulator slice)
+        run: scripts/build_ios_openssl.sh
+        env:
+          MOQ_IOS_SLICES: simulator
+
+      - name: Build LibMoQ xcframework (simulator slice)
+        run: scripts/build_ios_xcframework.sh
+        env:
+          MOQ_IOS_SLICES: simulator
+          MOQ_IOS_OPENSSL_ROOT: ${{ github.workspace }}/build-ios-openssl/prefix-ios-simulator
+
+      # Prove the binary lane: MoQService compiles for the iOS simulator against
+      # the xcframeworks (`import CMoQService` resolves from LibMoQ.xcframework).
+      - name: Build MoQService (iOS simulator)
+        run: >
+          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
+          --triple arm64-apple-ios16.0-simulator
+          --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          --target MoQService
+
+      # Cold consumer importing ONLY MoQService must link for the simulator
+      # (proves the OpenSSL/picoquic/libmoq symbols resolve). No simulator
+      # boot, no network.
+      - name: Consumer cold-build smoke (iOS simulator)
+        run: >
+          cd bindings/swift/Tests/fixtures/ServiceConsumer &&
+          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
+          --triple arm64-apple-ios16.0-simulator
+          --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+
   cpp-binding:
     name: C++ Binding (Linux)
     runs-on: ubuntu-latest

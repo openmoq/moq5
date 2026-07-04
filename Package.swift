@@ -189,35 +189,64 @@ if !enableService {
 // libmoq archives) OR the source-built MoQ/MoQMedia stack, never both --
 // enforced by the moq_swift_stack_guard duplicate-symbol canary
 // (scripts/check_swift_stack_guard.sh).
+// iOS consumes MoQService from prebuilt xcframeworks (scripts/build_ios_*.sh)
+// instead of pkg-config: `import CMoQService` resolves from the LibMoQ.xcframework
+// module map (module name is independent of the SwiftPM binary-target name), and
+// OpenSSL.xcframework supplies the separately-linked libssl/libcrypto. This lane
+// is opt-in via MOQ_SERVICE_IOS=1 (an iOS build) so a macOS `MOQ_SERVICE=1` build
+// keeps the pkg-config path even if the xcframeworks happen to be built locally.
+// See docs/ios-packaging.md.
+let iosBinaryService = ProcessInfo.processInfo.environment["MOQ_SERVICE_IOS"] == "1"
 if enableService {
     package.products += [
         .library(name: "MoQService", targets: ["MoQService"]),
     ]
-    package.targets += [
-        .systemLibrary(
-            name: "CMoQService",
-            path: "bindings/swift/SystemModules/CMoQService",
-            pkgConfig: "libmoq-service",
-            providers: [.brew(["libmoq"])]
-        ),
-        .target(
-            name: "MoQService",
-            dependencies: ["MoQServiceCore", "CMoQService"],
-            path: "bindings/swift/Sources/MoQService"
-        ),
-        .testTarget(
-            name: "MoQServiceTests",
-            dependencies: ["MoQService", "CMoQService"],
-            path: "bindings/swift/Tests/MoQServiceTests"
-        ),
-        // The product-surface proof: builds in the gated lane; running it
-        // needs a real relay (never default CI).
-        .executableTarget(
-            name: "moq-service-player",
-            dependencies: ["MoQService"],
-            path: "bindings/swift/Examples/MoQServicePlayer"
-        ),
-    ]
+    if iosBinaryService {
+        // .binaryTarget paths MUST be relative to the package root. Default to
+        // the build scripts' output dirs; an alternate location (still relative
+        // to the root) may be given via MOQ_SERVICE_IOS_XCFRAMEWORK_DIR.
+        let xcDir = ProcessInfo.processInfo.environment["MOQ_SERVICE_IOS_XCFRAMEWORK_DIR"]
+        let libmoqXC = xcDir.map { "\($0)/LibMoQ.xcframework" } ?? "build-ios/dist/LibMoQ.xcframework"
+        let opensslXC = xcDir.map { "\($0)/OpenSSL.xcframework" } ?? "build-ios-openssl/dist/OpenSSL.xcframework"
+        package.targets += [
+            .binaryTarget(name: "LibMoQBinary", path: libmoqXC),
+            .binaryTarget(name: "OpenSSLBinary", path: opensslXC),
+            .target(
+                name: "MoQService",
+                // LibMoQBinary vends module CMoQService; OpenSSLBinary is the
+                // separate libssl/libcrypto link (LibMoQ.xcframework holds
+                // libmoq/picoquic/picotls objects but not OpenSSL).
+                dependencies: ["MoQServiceCore", "LibMoQBinary", "OpenSSLBinary"],
+                path: "bindings/swift/Sources/MoQService"
+            ),
+        ]
+    } else {
+        package.targets += [
+            .systemLibrary(
+                name: "CMoQService",
+                path: "bindings/swift/SystemModules/CMoQService",
+                pkgConfig: "libmoq-service",
+                providers: [.brew(["libmoq"])]
+            ),
+            .target(
+                name: "MoQService",
+                dependencies: ["MoQServiceCore", "CMoQService"],
+                path: "bindings/swift/Sources/MoQService"
+            ),
+            .testTarget(
+                name: "MoQServiceTests",
+                dependencies: ["MoQService", "CMoQService"],
+                path: "bindings/swift/Tests/MoQServiceTests"
+            ),
+            // The product-surface proof: builds in the gated lane; running it
+            // needs a real relay (never default CI).
+            .executableTarget(
+                name: "moq-service-player",
+                dependencies: ["MoQService"],
+                path: "bindings/swift/Examples/MoQServicePlayer"
+            ),
+        ]
+    }
 }
 
 // Live transport targets require CMake-installed adapter.
