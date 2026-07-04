@@ -22,6 +22,7 @@ set(_PICOHTTP picoquic::picohttp-core)
 
 add_library(moq-adapter-pico-wt
     pico_wt_endpoint.c
+    ../common/moq_pq_send_queue.c
     pico_wt_adapter.c
 )
 

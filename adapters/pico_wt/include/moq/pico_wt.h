@@ -58,7 +58,7 @@ typedef struct moq_pico_wt_conn_cfg {
     picoquic_cnx_t        *cnx;       /* NOT owned */
     h3zero_callback_ctx_t *h3_ctx;    /* NOT owned */
     h3zero_stream_ctx_t   *ctrl_ctx;  /* NOT owned (WT control stream) */
-    const moq_alloc_t     *alloc;
+    const moq_alloc_t     *alloc;     /* requires alloc + realloc + free */
     void                  *user_ctx;  /* opaque application context */
 } moq_pico_wt_conn_cfg_t;
 

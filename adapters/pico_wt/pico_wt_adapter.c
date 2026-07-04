@@ -117,7 +117,7 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
     if (!cfg->session || !cfg->cnx || !cfg->alloc ||
         !cfg->h3_ctx || !cfg->ctrl_ctx)
         return -1;
-    if (!cfg->alloc->alloc || !cfg->alloc->free)
+    if (!cfg->alloc->alloc || !cfg->alloc->realloc || !cfg->alloc->free)
         return -1;
 
     moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)cfg->alloc->alloc(
@@ -148,8 +148,12 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
     c->last_stop_sending_stream_id = UINT64_MAX;
 
     /* Initialize endpoint ops. */
-    pico_wt_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx,
-                           cfg->cnx, cfg->h3_ctx, cfg->ctrl_ctx);
+    if (pico_wt_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx,
+                              cfg->cnx, cfg->h3_ctx, cfg->ctrl_ctx,
+                              &c->alloc) != 0) {
+        c->alloc.free(c, sizeof(*c), c->alloc.ctx);
+        return -1;
+    }
     c->endpoint_ctx.on_bidi_opened = on_local_bidi_opened;
     c->endpoint_ctx.on_uni_opened = on_local_uni_opened;
     c->endpoint_ctx.cb_ctx = c;
@@ -507,6 +511,14 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
     if (event == picohttp_callback_free)
         return 0;
 
+    /* Pull send: h3zero is ready to put bytes on the wire for this WT data
+     * stream. Serviced even while terminal so picoquic always gets a buffer
+     * response (the queue is drained/empty by then, so it reneges). The WT
+     * control stream is driven by h3zero itself, never routed here. */
+    if (event == picohttp_callback_provide_data)
+        return pico_wt_endpoint_on_provide_data(&c->endpoint_ctx, sid,
+                                                bytes, length);
+
     if (moq_transport_bridge_is_terminal(c->bridge)) return 0;
 
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
@@ -568,8 +580,7 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
             &c->endpoint_ctx, bytes, length);
         break;
 
-    case picohttp_callback_provide_data:
-        break;
+    /* picohttp_callback_provide_data handled above (before the terminal gate). */
 
     case picohttp_callback_reset: {
         if (!stream_ctx) break;

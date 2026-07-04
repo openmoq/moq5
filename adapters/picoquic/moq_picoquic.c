@@ -99,7 +99,11 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
         c->after_callback = cfg->after_callback;
 
     /* Initialize endpoint ops and bridge. */
-    pq_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx, cfg->cnx);
+    if (pq_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx, cfg->cnx,
+                         &c->alloc) != 0) {
+        c->alloc.free(c, sizeof(*c), c->alloc.ctx);
+        return -1;
+    }
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, cfg->alloc);
@@ -107,6 +111,7 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
         &bcfg, cfg->session, &c->endpoint_ops, &c->endpoint_ctx,
         &c->bridge);
     if (brc < 0) {
+        pq_endpoint_cleanup(&c->endpoint_ctx);
         c->alloc.free(c, sizeof(*c), c->alloc.ctx);
         return -1;
     }
@@ -122,6 +127,7 @@ void moq_pq_conn_destroy(moq_pq_conn_t *conn)
     if (!conn) return;
     picoquic_set_callback(conn->cnx, NULL, NULL);
     moq_transport_bridge_destroy(conn->bridge);
+    pq_endpoint_cleanup(&conn->endpoint_ctx);
     moq_alloc_t alloc = conn->alloc;
     alloc.free(conn, sizeof(moq_pq_conn_t), alloc.ctx);
 }
@@ -184,6 +190,19 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
 {
     moq_pq_conn_t *c = (moq_pq_conn_t *)callback_ctx;
     if (!c) return 0;
+
+    /* Pull send: picoquic is ready to put bytes on the wire for `stream_id`.
+     * `bytes` is the provide context, `length` the largest buffer available.
+     * Serviced even while terminal so picoquic always gets a buffer response
+     * (the queue is drained/empty by then, so it reneges). */
+    if (event == picoquic_callback_prepare_to_send) {
+        pq_endpoint_on_prepare_to_send(&c->endpoint_ctx, stream_id,
+                                       bytes, length);
+        if (c->after_callback)
+            c->after_callback(c, c->user_ctx);
+        return 0;
+    }
+
     if (moq_transport_bridge_is_terminal(c->bridge)) return 0;
     uint64_t now = pq_now_us(cnx);
     (void)stream_ctx;

@@ -4,11 +4,12 @@
  * Implements moq_transport_endpoint_ops_t by forwarding to
  * picoquic's h3zero/picohttp WebTransport API.
  *
- * Push-based writes: picoquic_add_to_stream() queues internally
- * and sets is_active=0, so picohttp_callback_provide_data never
- * fires for our streams. A bounded send gate (moq_pq_send_gate.h)
- * caps the buffered backlog and returns WOULD_BLOCK over the cap,
- * so the bridge retains and retries as the queue drains.
+ * Pull writes: write()/write_payload() hold MoQ data in the adapter-owned
+ * send queue and mark the stream active with its h3zero stream context;
+ * h3zero then routes prepare_to_send to picohttp_callback_provide_data, which
+ * pico_wt_endpoint_on_provide_data services by copying queued bytes into
+ * picoquic's packet buffer. write returns WOULD_BLOCK when the queue's byte
+ * cap is reached, so the bridge retains and retries.
  *
  * Datagram bridge: push send_datagram() buffers one datagram;
  * the pull provide_datagram callback flushes it. Single-slot,
@@ -49,26 +50,45 @@ static moq_transport_result_t ep_open_bidi(void *ctx, uint64_t *out_id)
     return MOQ_TRANSPORT_OK;
 }
 
+/* Map a queue push result to the bridge write contract. On accept, mark the
+ * stream active with its h3zero stream context so h3zero routes prepare_to_send
+ * back to our provide_data path. */
+static moq_transport_result_t wt_push_result(pico_wt_endpoint_ctx_t *ep,
+                                             uint64_t stream_id, int r)
+{
+    if (r < 0) return MOQ_TRANSPORT_ERROR;
+    if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK;
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, stream_id);
+    if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, sc) != 0)
+        return MOQ_TRANSPORT_ERROR;
+    return MOQ_TRANSPORT_OK;
+}
+
 static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
                                         const uint8_t *data, size_t len,
                                         bool fin)
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    return wt_push_result(ep, stream_id,
+        moq_pq_send_queue_push_copy(ep->queue, stream_id, data, len, fin));
+}
 
-    if (moq_pq_send_gate_would_block(&ep->send_gate, ep->cnx, len))
-        return MOQ_TRANSPORT_WOULD_BLOCK;
-
-    int rc = picoquic_add_to_stream(ep->cnx, stream_id, data, len,
-                                     fin ? 1 : 0);
-    if (rc != 0) return MOQ_TRANSPORT_ERROR;
-    moq_pq_send_gate_on_added(&ep->send_gate, len);
-    return MOQ_TRANSPORT_OK;
+static moq_transport_result_t ep_write_payload(void *ctx, uint64_t stream_id,
+                                                moq_rcbuf_t *buf, bool fin)
+{
+    pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    return wt_push_result(ep, stream_id,
+        moq_pq_send_queue_push_rcbuf(ep->queue, stream_id, buf, fin));
 }
 
 static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
                                         uint64_t error_code)
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    /* Abandon anything still queued and clear the active mark before resetting,
+     * so no provide_data lands for a reset stream. */
+    moq_pq_send_queue_drop(ep->queue, stream_id);
+    picoquic_mark_active_stream(ep->cnx, stream_id, 0, NULL);
     h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, stream_id);
     if (!sc) {
         /* Stream unknown to h3zero — try raw QUIC reset as fallback */
@@ -77,6 +97,23 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
     }
     int rc = picowt_reset_stream(ep->cnx, sc, error_code);
     return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+int pico_wt_endpoint_on_provide_data(pico_wt_endpoint_ctx_t *ep,
+                                     uint64_t stream_id,
+                                     void *provide_ctx, size_t space)
+{
+    size_t nb = 0; bool is_fin = false, still = false;
+    if (!moq_pq_send_queue_plan(ep->queue, stream_id, space,
+                                &nb, &is_fin, &still)) {
+        (void)picoquic_provide_stream_data_buffer(provide_ctx, 0, 0, 0);
+        return 0;
+    }
+    uint8_t *dst = picoquic_provide_stream_data_buffer(
+        provide_ctx, nb, is_fin ? 1 : 0, still ? 1 : 0);
+    if (dst)
+        moq_pq_send_queue_commit(ep->queue, stream_id, dst, nb);
+    return 0;
 }
 
 static moq_transport_result_t ep_stop_sending(void *ctx,
@@ -140,39 +177,46 @@ static moq_transport_result_t ep_close(void *ctx, uint64_t code,
 
 /* -- Init / cleanup ------------------------------------------------- */
 
-void pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
-                            pico_wt_endpoint_ctx_t *ctx,
-                            picoquic_cnx_t *cnx,
-                            h3zero_callback_ctx_t *h3_ctx,
-                            h3zero_stream_ctx_t *control_stream_ctx)
+int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
+                           pico_wt_endpoint_ctx_t *ctx,
+                           picoquic_cnx_t *cnx,
+                           h3zero_callback_ctx_t *h3_ctx,
+                           h3zero_stream_ctx_t *control_stream_ctx,
+                           const moq_alloc_t *alloc)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->cnx = cnx;
     ctx->h3_ctx = h3_ctx;
     ctx->control_stream_ctx = control_stream_ctx;
     ctx->control_stream_id = control_stream_ctx->stream_id;
-
     ctx->pending_dg_len = 0;
-    moq_pq_send_gate_init(&ctx->send_gate, cnx);
+
+    ctx->queue = moq_pq_send_queue_create(alloc, 0);
+    if (!ctx->queue) return -1;
 
     *ops = (moq_transport_endpoint_ops_t){
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),
-        .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM,
+        .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM |
+                           MOQ_TRANSPORT_CAP_WRITE_PAYLOAD,
         .open_uni        = ep_open_uni,
         .open_bidi       = ep_open_bidi,
         .write           = ep_write,
-        .write_payload   = NULL,
+        .write_payload   = ep_write_payload,
         .reset_stream    = ep_reset,
         .stop_sending    = ep_stop_sending,
         .send_datagram   = ep_send_datagram,
         .max_datagram_size = NULL,
         .close_transport = ep_close,
     };
+    return 0;
 }
 
 void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx)
 {
+    if (!ctx) return;
     ctx->pending_dg_len = 0;
+    moq_pq_send_queue_destroy(ctx->queue);
+    ctx->queue = NULL;
 }
 
 int pico_wt_endpoint_provide_datagram(pico_wt_endpoint_ctx_t *ctx,

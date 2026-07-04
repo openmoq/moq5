@@ -99,6 +99,41 @@ int picoquic_add_to_stream(picoquic_cnx_t *cnx, uint64_t stream_id,
     return 0;
 }
 
+/* Pull-send stubs: track active streams and capture provided bytes. */
+int picoquic_mark_active_stream(picoquic_cnx_t *cnx, uint64_t stream_id,
+    int is_active, void *v_stream_ctx)
+{
+    (void)v_stream_ctx;
+    fake_pq_side_t *s = side_for_cnx(cnx);
+    if (!s) return -1;
+    /* Remove any existing entry. */
+    for (size_t i = 0; i < s->active_count; i++) {
+        if (s->active[i] == stream_id) {
+            s->active[i] = s->active[--s->active_count];
+            break;
+        }
+    }
+    if (is_active && s->active_count < FAKE_PQ_MAX_OPS)
+        s->active[s->active_count++] = stream_id;
+    return 0;
+}
+
+static uint8_t g_provide_scratch[4096];
+static bool g_provide_called;
+static size_t g_provide_nb;
+static int g_provide_fin;
+static int g_provide_still;
+uint8_t *picoquic_provide_stream_data_buffer(void *context, size_t nb_bytes,
+    int is_fin, int is_still_active)
+{
+    (void)context;
+    g_provide_called = true;
+    g_provide_nb = nb_bytes;
+    g_provide_fin = is_fin;
+    g_provide_still = is_still_active;
+    return g_provide_scratch;
+}
+
 uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *cnx, int is_unidir)
 {
     fake_pq_side_t *s = side_for_cnx(cnx);
@@ -291,6 +326,46 @@ void fake_pq_pair_destroy(fake_pq_pair_t *pair)
 /* Pump: deliver outbox ops to peer callback                           */
 /* ================================================================== */
 
+/* Drive prepare_to_send for every active stream on `from`, turning the pulled
+ * bytes into STREAM_WRITE ops (as picoquic would put on the wire). */
+static bool drain_active_streams(fake_pq_side_t *from, moq_pq_conn_t *conn,
+                                 picoquic_cnx_t *cnx)
+{
+    bool progress = false;
+    size_t i = 0;
+    while (i < from->active_count) {
+        uint64_t sid = from->active[i];
+        bool removed = false;
+        for (int guard = 0; guard < FAKE_PQ_MAX_OPS; guard++) {
+            g_provide_called = false;
+            g_provide_nb = 0; g_provide_fin = 0; g_provide_still = 0;
+            moq_pq_callback(cnx, sid, (uint8_t *)(uintptr_t)0x1, 4096,
+                            picoquic_callback_prepare_to_send, conn, NULL);
+            if (!g_provide_called) break;
+            if ((g_provide_nb > 0 || g_provide_fin) &&
+                from->count < FAKE_PQ_MAX_OPS) {
+                fake_pq_op_t *op = &from->ops[from->count++];
+                op->kind = FAKE_PQ_OP_STREAM_WRITE;
+                op->stream_id = sid;
+                op->len = g_provide_nb < sizeof(op->data)
+                          ? g_provide_nb : sizeof(op->data);
+                if (op->len) memcpy(op->data, g_provide_scratch, op->len);
+                op->fin = g_provide_fin != 0;
+                progress = true;
+            }
+            if (!g_provide_still) {
+                /* Drained: the endpoint's provide reported not-still-active.
+                 * mark_active(0) may have already removed it; drop by index. */
+                from->active[i] = from->active[--from->active_count];
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) i++;
+    }
+    return progress;
+}
+
 static bool deliver_ops(fake_pq_side_t *from, moq_pq_conn_t *to_conn,
                          picoquic_cnx_t *to_cnx)
 {
@@ -346,10 +421,14 @@ bool fake_pq_pair_pump_once(fake_pq_pair_t *pair)
     bool progress = false;
 
     moq_pq_service(pair->client_conn, pair->now);
+    progress |= drain_active_streams(&pair->client_side, pair->client_conn,
+                                     (picoquic_cnx_t *)&pair->client_side);
     progress |= deliver_ops(&pair->client_side, pair->server_conn,
                               (picoquic_cnx_t *)&pair->server_side);
 
     moq_pq_service(pair->server_conn, pair->now);
+    progress |= drain_active_streams(&pair->server_side, pair->server_conn,
+                                     (picoquic_cnx_t *)&pair->server_side);
     progress |= deliver_ops(&pair->server_side, pair->client_conn,
                               (picoquic_cnx_t *)&pair->client_side);
 

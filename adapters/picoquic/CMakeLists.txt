@@ -13,7 +13,8 @@ else()
 endif()
 
 add_library(moq-adapter-picoquic
-    moq_picoquic.c picoquic_endpoint.c moq_picoquic_verify.c)
+    moq_picoquic.c picoquic_endpoint.c moq_picoquic_verify.c
+    ../common/moq_pq_send_queue.c)
 add_library(moq::adapter-picoquic ALIAS moq-adapter-picoquic)
 
 target_include_directories(moq-adapter-picoquic
@@ -239,7 +240,8 @@ if(MOQ_BUILD_TESTS)
     # stack. Links the adapter source directly with picoquic headers
     # for type definitions but does not link the picoquic library.
     add_executable(test_adapter_backpressure
-        test_backpressure.c moq_picoquic.c picoquic_endpoint.c)
+        test_backpressure.c moq_picoquic.c picoquic_endpoint.c
+        ../common/moq_pq_send_queue.c)
     target_include_directories(test_adapter_backpressure PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -253,6 +255,7 @@ if(MOQ_BUILD_TESTS)
         tests/support/fake_pq_pair.c
         moq_picoquic.c
         picoquic_endpoint.c
+        ../common/moq_pq_send_queue.c
         ${PROJECT_SOURCE_DIR}/tests/conformance/conformance_scenarios.c)
     target_include_directories(test_pq_conformance PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

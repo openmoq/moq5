@@ -7,6 +7,8 @@
 
 #include "pico_wt_conformance_pair.h"
 #include "conformance_scenarios.h"
+#include <moq/pico_wt.h>
+#include <moq/types.h>
 #include <stdio.h>
 
 static int run_count = 0;
@@ -40,8 +42,43 @@ static int fail_count = 0;
 #define CAP_BIDI (MOQ_ADAPTER_PAIR_CAP_BIDI_STREAMS | \
                   MOQ_ADAPTER_PAIR_CAP_INJECT_BIDI_FIN)
 
+/* Config validation: moq_pico_wt_conn_create must reject a missing allocator
+ * op. The send queue grows its stream table with realloc, so realloc is now
+ * required alongside alloc/free -- rejected up front, before any real use of
+ * the (here dummy) session/cnx/h3 pointers. */
+static int test_conn_create_validation(void)
+{
+    int failures = 0;
+    moq_pico_wt_conn_t *out = NULL;
+
+    if (moq_pico_wt_conn_create(NULL, &out) == 0) failures++;
+
+    moq_pico_wt_conn_cfg_t cfg;
+    moq_pico_wt_conn_cfg_init(&cfg);
+    cfg.session = (moq_session_t *)(uintptr_t)0x1;
+    cfg.cnx     = (picoquic_cnx_t *)(uintptr_t)0x1;
+    cfg.h3_ctx  = (h3zero_callback_ctx_t *)(uintptr_t)0x1;
+    cfg.ctrl_ctx = (h3zero_stream_ctx_t *)(uintptr_t)0x1;
+
+    moq_alloc_t good = *moq_alloc_default();
+    moq_alloc_t bad;
+
+    bad = good; bad.realloc = NULL; cfg.alloc = &bad;
+    if (moq_pico_wt_conn_create(&cfg, &out) == 0) failures++;
+    bad = good; bad.alloc = NULL;   cfg.alloc = &bad;
+    if (moq_pico_wt_conn_create(&cfg, &out) == 0) failures++;
+    bad = good; bad.free = NULL;    cfg.alloc = &bad;
+    if (moq_pico_wt_conn_create(&cfg, &out) == 0) failures++;
+
+    if (failures)
+        fprintf(stderr, "FAIL: conn_create validation (%d)\n", failures);
+    return failures;
+}
+
 int main(void)
 {
+    fail_count += test_conn_create_validation();
+
     RUN_SCENARIO(conformance_setup_handshake, 0);
     RUN_SCENARIO(conformance_subscribe_and_object, 0);
     RUN_SCENARIO(conformance_datagram_object, 0);

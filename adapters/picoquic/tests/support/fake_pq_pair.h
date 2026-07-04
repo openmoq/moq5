@@ -54,6 +54,10 @@ typedef struct {
     bool         drop_datagram;
     uint32_t     datagram_max;   /* negotiated peer max_datagram_frame_size
                                     (0 = DATAGRAM not negotiated) */
+    /* Streams the endpoint marked active for pull sending; the pump drains them
+     * through prepare_to_send into STREAM_WRITE ops. */
+    uint64_t     active[FAKE_PQ_MAX_OPS];
+    size_t       active_count;
 } fake_pq_side_t;
 
 typedef struct {
