@@ -20,6 +20,7 @@
 
 #include "../common/moq_alpn.h"
 #include "../common/moq_pq_stream_backlog.h"
+#include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
 
 #include <errno.h>
 #include <time.h>
@@ -129,6 +130,25 @@ struct moq_pq_threaded {
     int                 wake_in_flight;
     pthread_t           network_thread_id;
     bool                network_thread_id_set;
+
+    /* Characterization telemetry (env MOQ_PQ_THREADED_STATS=1). Written only on
+     * the network thread; read after the thread is joined at stop. */
+    bool                stats_enabled;
+    uint64_t            st_after_send;      /* after_send loop callbacks */
+    uint64_t            st_after_send_nz;   /* after_send phases that sent >0 pkts */
+    uint64_t            st_after_recv;      /* after_receive loop callbacks */
+    uint64_t            st_wake;            /* wake_up loop callbacks */
+    uint64_t            st_after_send_bytes;/* sum of bytes_sent reported */
+    uint64_t            st_service_all;     /* server_service_all invocations */
+    uint64_t            st_pkts_total;      /* packets sent (path-quality delta) */
+    uint64_t            st_pkts_last;       /* last summed path-quality `sent` */
+    uint64_t            st_pkts_max_burst;  /* max packets in one after_send */
+    /* Per-connection stats accumulated from conns freed before stop, so a pruned
+     * connection's prepare/queue counts are not lost. Final = acc + live conns. */
+    uint64_t            st_acc_prepare;
+    uint64_t            st_acc_provided;
+    uint64_t            st_acc_would_block;
+    uint64_t            st_acc_high_water;  /* max, not sum */
 };
 
 /* ------------------------------------------------------------------ */
@@ -226,6 +246,17 @@ static void server_conn_free(moq_pq_threaded_t *t,
     if (!c) return;
     if (do_close && c->cnx)
         picoquic_close(c->cnx, close_code);
+    /* Fold this conn's send stats into the accumulator before it is destroyed,
+     * so a pruned connection's counts survive to the stop-time report. */
+    if (t->stats_enabled && c->conn) {
+        moq_pq_send_stats_t s;
+        moq_pq_conn_get_send_stats(c->conn, &s);
+        t->st_acc_prepare += s.prepare_count;
+        t->st_acc_provided += s.provided_bytes;
+        t->st_acc_would_block += s.queue_would_block;
+        if (s.queue_high_water > t->st_acc_high_water)
+            t->st_acc_high_water = s.queue_high_water;
+    }
     if (c->conn) moq_pq_conn_destroy(c->conn);
     if (c->session) moq_session_destroy(c->session);
     t->alloc.free(c, sizeof(*c), t->alloc.ctx);
@@ -308,6 +339,7 @@ static struct moq_pq_threaded_conn *server_accept(moq_pq_threaded_t *t,
  * mutated only on this thread, so no lock is needed to iterate. */
 static void server_service_all(moq_pq_threaded_t *t, uint64_t now)
 {
+    if (t->stats_enabled) t->st_service_all++;
     for (size_t i = 0; i < t->conn_count; i++) {
         struct moq_pq_threaded_conn *c = t->conns[i];
 #ifdef MOQ_PQ_THREADED_TESTING
@@ -605,12 +637,32 @@ static int server_callback(picoquic_cnx_t *cnx,
 /* Packet loop callback                                                */
 /* ------------------------------------------------------------------ */
 
+/* Sum picoquic's cumulative packets-sent across the instance's connection(s),
+ * via the public default-path quality accessor. Network-thread only. */
+static uint64_t pq_sum_pkts_sent(moq_pq_threaded_t *t)
+{
+    uint64_t sum = 0;
+    picoquic_path_quality_t q;
+    if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+        for (size_t i = 0; i < t->conn_count; i++) {
+            if (!t->conns[i]->cnx) continue;
+            memset(&q, 0, sizeof(q));
+            picoquic_get_default_path_quality(t->conns[i]->cnx, &q);
+            sum += q.sent;
+        }
+    } else if (t->active_cnx) {
+        memset(&q, 0, sizeof(q));
+        picoquic_get_default_path_quality(t->active_cnx, &q);
+        sum += q.sent;
+    }
+    return sum;
+}
+
 static int loop_callback(picoquic_quic_t *quic,
     picoquic_packet_loop_cb_enum cb_mode,
     void *callback_ctx, void *callback_arg)
 {
     moq_pq_threaded_t *t = (moq_pq_threaded_t *)callback_ctx;
-    (void)callback_arg;
 
     if (cb_mode == picoquic_packet_loop_ready) {
         pthread_mutex_lock(&t->mutex);
@@ -626,6 +678,24 @@ static int loop_callback(picoquic_quic_t *quic,
         cb_mode != picoquic_packet_loop_after_send &&
         cb_mode != picoquic_packet_loop_wake_up)
         return 0;
+
+    if (t->stats_enabled) {
+        if (cb_mode == picoquic_packet_loop_after_send) {
+            t->st_after_send++;
+            if (callback_arg)
+                t->st_after_send_bytes += *(size_t *)callback_arg;
+            uint64_t cur = pq_sum_pkts_sent(t);
+            uint64_t d = (cur >= t->st_pkts_last) ? cur - t->st_pkts_last : 0;
+            t->st_pkts_total += d;
+            if (d > 0) t->st_after_send_nz++;   /* phase that actually sent */
+            if (d > t->st_pkts_max_burst) t->st_pkts_max_burst = d;
+            t->st_pkts_last = cur;
+        } else if (cb_mode == picoquic_packet_loop_after_receive) {
+            t->st_after_recv++;
+        } else {
+            t->st_wake++;
+        }
+    }
 
     /* Clear wake_pending before any early return so the flag
      * doesn't stay stale when conn is not yet available. Remember the
@@ -941,6 +1011,10 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     t->alloc = *cfg->alloc;
     t->perspective = persp;
     t->port = port;
+    {   /* Characterization telemetry: opt-in, off unless env set to non-"0". */
+        const char *se = getenv("MOQ_PQ_THREADED_STATS");
+        t->stats_enabled = se && *se && strcmp(se, "0") != 0;
+    }
 
     /* Copy session tuning. */
     if (CFG_HAS(cfg, send_request_capacity))
@@ -1278,6 +1352,69 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
         }
         pthread_mutex_unlock(&t->mutex);
         picoquic_delete_network_thread(ctx);
+    }
+
+    /* Characterization telemetry: the network thread is joined, so the loop
+     * counters and picoquic state are race-free to read here (conns are still
+     * alive; freed later in destroy). One compact, parseable line to stderr. */
+    if (t->stats_enabled) {
+        /* Seed from conns pruned before stop, then fold in the live conns. */
+        moq_pq_send_stats_t agg, one;
+        agg.prepare_count = t->st_acc_prepare;
+        agg.provided_bytes = t->st_acc_provided;
+        agg.queue_would_block = t->st_acc_would_block;
+        agg.queue_high_water = t->st_acc_high_water;
+        picoquic_cnx_t *rep = NULL;
+        if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+            for (size_t i = 0; i < t->conn_count; i++) {
+                moq_pq_conn_get_send_stats(t->conns[i]->conn, &one);
+                agg.prepare_count += one.prepare_count;
+                agg.provided_bytes += one.provided_bytes;
+                agg.queue_would_block += one.queue_would_block;
+                if (one.queue_high_water > agg.queue_high_water)
+                    agg.queue_high_water = one.queue_high_water;
+                if (!rep) rep = t->conns[i]->cnx;
+            }
+        } else {
+            moq_pq_conn_get_send_stats(t->conn, &one);
+            agg.prepare_count += one.prepare_count;
+            agg.provided_bytes += one.provided_bytes;
+            agg.queue_would_block += one.queue_would_block;
+            if (one.queue_high_water > agg.queue_high_water)
+                agg.queue_high_water = one.queue_high_water;
+            rep = t->active_cnx;
+        }
+        picoquic_path_quality_t q; memset(&q, 0, sizeof(q));
+        if (rep) picoquic_get_default_path_quality(rep, &q);
+        /* pkts/positive-send is the real cadence signal: no-output loop turns
+         * (after_send with 0 packets) do not dilute it. */
+        double ppw = t->st_after_send ?
+            (double)t->st_pkts_total / (double)t->st_after_send : 0.0;
+        double ppp = t->st_after_send_nz ?
+            (double)t->st_pkts_total / (double)t->st_after_send_nz : 0.0;
+        fprintf(stderr,
+            "MOQ_PQ_STATS role=%s after_send=%llu after_send_nonzero=%llu "
+            "after_send_bytes=%llu pkts=%llu pkts_per_send_avg=%.2f "
+            "pkts_per_positive_send_avg=%.2f pkts_per_send_max=%llu "
+            "after_recv=%llu wake=%llu service_all=%llu "
+            "prepare=%llu provided=%llu q_high_water=%llu q_would_block=%llu "
+            "cwin=%llu rtt_us=%llu pacing_Bps=%llu bytes_sent=%llu\n",
+            t->perspective == MOQ_PERSPECTIVE_SERVER ? "server" : "client",
+            (unsigned long long)t->st_after_send,
+            (unsigned long long)t->st_after_send_nz,
+            (unsigned long long)t->st_after_send_bytes,
+            (unsigned long long)t->st_pkts_total, ppw, ppp,
+            (unsigned long long)t->st_pkts_max_burst,
+            (unsigned long long)t->st_after_recv,
+            (unsigned long long)t->st_wake,
+            (unsigned long long)t->st_service_all,
+            (unsigned long long)agg.prepare_count,
+            (unsigned long long)agg.provided_bytes,
+            (unsigned long long)agg.queue_high_water,
+            (unsigned long long)agg.queue_would_block,
+            (unsigned long long)q.cwin, (unsigned long long)q.rtt,
+            (unsigned long long)q.pacing_rate,
+            (unsigned long long)q.bytes_sent);
     }
 
     pthread_mutex_lock(&t->mutex);

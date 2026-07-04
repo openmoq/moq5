@@ -83,6 +83,10 @@ void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid);
 /* Aggregate bytes currently buffered across all streams (test/telemetry). */
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q);
 
+/* Telemetry: peak aggregate backlog, and pushes refused for hitting the cap. */
+uint64_t moq_pq_send_queue_high_water(const moq_pq_send_queue_t *q);
+uint64_t moq_pq_send_queue_would_block_count(const moq_pq_send_queue_t *q);
+
 #ifdef __cplusplus
 }
 #endif

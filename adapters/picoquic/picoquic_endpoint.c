@@ -81,6 +81,7 @@ void pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep,
                                     uint64_t stream_id,
                                     void *provide_ctx, size_t max)
 {
+    ep->prepare_count++;
     size_t nb = 0; bool is_fin = false, still = false;
     if (!moq_pq_send_queue_plan(ep->queue, stream_id, max,
                                 &nb, &is_fin, &still)) {
@@ -90,8 +91,20 @@ void pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep,
     }
     uint8_t *dst = picoquic_provide_stream_data_buffer(
         provide_ctx, nb, is_fin ? 1 : 0, still ? 1 : 0);
-    if (dst)
+    if (dst) {
         moq_pq_send_queue_commit(ep->queue, stream_id, dst, nb);
+        ep->provided_bytes += nb;
+    }
+}
+
+void pq_endpoint_get_stats(const pq_endpoint_ctx_t *ep,
+                           moq_pq_send_stats_t *out)
+{
+    if (!out) return;
+    out->prepare_count = ep ? ep->prepare_count : 0;
+    out->provided_bytes = ep ? ep->provided_bytes : 0;
+    out->queue_high_water = ep ? moq_pq_send_queue_high_water(ep->queue) : 0;
+    out->queue_would_block = ep ? moq_pq_send_queue_would_block_count(ep->queue) : 0;
 }
 
 static moq_transport_result_t pq_stop_sending(void *ctx, uint64_t stream_id,

@@ -35,7 +35,17 @@ struct moq_pq_send_queue {
     uint64_t     queued;      /* aggregate remaining bytes across streams */
     pq_stream_t *streams;
     size_t       nstreams;    /* allocated slots */
+    /* Telemetry (characterization): peak aggregate backlog and the number of
+     * pushes refused for hitting the cap (bridge WOULD_BLOCK). */
+    uint64_t     high_water;
+    uint64_t     would_block;
 };
+
+/* Bump the high-water mark after `queued` grows. */
+static void pq_note_high_water(moq_pq_send_queue_t *q)
+{
+    if (q->queued > q->high_water) q->high_water = q->queued;
+}
 
 static uint64_t pq_env_cap(uint64_t fallback)
 {
@@ -173,7 +183,7 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
     /* A zero-length non-FIN write carries nothing; accept it without touching
      * a stream slot (creating one would leak an empty in_use entry). */
     if (len == 0 && !fin) return 1;
-    if (pq_would_exceed(q, len)) return 0;
+    if (pq_would_exceed(q, len)) { q->would_block++; return 0; }
 
     pq_stream_t *s = pq_find_or_create(q, sid);
     if (!s) return -1;
@@ -197,6 +207,7 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
     pq_append(s, c);
     s->remaining += len;
     q->queued += len;
+    pq_note_high_water(q);
     return 1;
 }
 
@@ -211,7 +222,7 @@ int moq_pq_send_queue_push_rcbuf(moq_pq_send_queue_t *q, uint64_t sid,
     if (len == 0)
         return moq_pq_send_queue_push_copy(q, sid, NULL, 0, fin);
 
-    if (pq_would_exceed(q, len)) return 0;
+    if (pq_would_exceed(q, len)) { q->would_block++; return 0; }
 
     pq_stream_t *s = pq_find_or_create(q, sid);
     if (!s) return -1;
@@ -227,6 +238,7 @@ int moq_pq_send_queue_push_rcbuf(moq_pq_send_queue_t *q, uint64_t sid,
     pq_append(s, c);
     s->remaining += len;
     q->queued += len;
+    pq_note_high_water(q);
     return 1;
 }
 
@@ -301,4 +313,14 @@ void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid)
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q)
 {
     return q ? q->queued : 0;
+}
+
+uint64_t moq_pq_send_queue_high_water(const moq_pq_send_queue_t *q)
+{
+    return q ? q->high_water : 0;
+}
+
+uint64_t moq_pq_send_queue_would_block_count(const moq_pq_send_queue_t *q)
+{
+    return q ? q->would_block : 0;
 }

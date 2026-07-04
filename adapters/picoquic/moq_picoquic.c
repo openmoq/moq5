@@ -179,6 +179,14 @@ size_t moq_pq_conn_tombstone_count(const moq_pq_conn_t *c)
     return c ? moq_transport_bridge_tombstone_count(c->bridge) : 0;
 }
 
+void moq_pq_conn_get_send_stats(const moq_pq_conn_t *c,
+                                moq_pq_send_stats_t *out)
+{
+    if (!out) return;
+    if (!c) { memset(out, 0, sizeof(*out)); return; }
+    pq_endpoint_get_stats(&c->endpoint_ctx, out);
+}
+
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
 int moq_pq_callback(picoquic_cnx_t *cnx,
