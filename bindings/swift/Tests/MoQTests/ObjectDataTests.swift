@@ -39,11 +39,21 @@ struct ObjectDataTests {
         try pumpAll(from: server, to: client)
 
         let dataEvents = client.pollEvents()
-        #expect(dataEvents.count == 1)
+        // Closing the subgroup FINs its stream, so a subgroupFinished event
+        // trails the object.
+        #expect(dataEvents.count == 2)
         guard case .objectReceived(let obj) = dataEvents.first else {
             Issue.record("Expected objectReceived, got \(dataEvents)")
             return
         }
+        guard case .subgroupFinished(let fin) = dataEvents.last else {
+            Issue.record("Expected subgroupFinished, got \(dataEvents)")
+            return
+        }
+        #expect(fin.subscription == clientSub)
+        #expect(fin.groupID == 0)
+        #expect(fin.subgroupID == 0)
+        #expect(fin.endOfGroup == false)
 
         #expect(obj.subscription == clientSub)
         #expect(obj.groupID == 0)
@@ -94,17 +104,26 @@ struct ObjectDataTests {
         try server.closeSubgroup(sg)
         try pumpAll(from: server, to: client)
 
-        guard case .objectReceived(let obj) = client.pollEvents().first else {
+        let events = client.pollEvents()
+        guard case .objectReceived(let obj) = events.first else {
             Issue.record("Expected objectReceived")
             return
         }
         #expect(obj.endOfGroup == true)
         #expect(obj.groupID == 1)
+
+        // The END_OF_GROUP bit propagates to the subgroupFinished event too.
+        guard case .subgroupFinished(let fin) = events.last else {
+            Issue.record("Expected subgroupFinished, got \(events)")
+            return
+        }
+        #expect(fin.endOfGroup == true)
+        #expect(fin.groupID == 1)
     }
 
     @Test("Multiple objects in one subgroup")
     func multipleObjects() throws {
-        let (client, server, serverSub, _) = try makeSubscribedPair(
+        let (client, server, serverSub, clientSub) = try makeSubscribedPair(
             track: TrackName(namespace: ["test"], name: "multi"))
 
         let sg = try server.openSubgroup(for: serverSub, groupID: 0)
@@ -116,13 +135,19 @@ struct ObjectDataTests {
         try pumpAll(from: server, to: client)
 
         let events = client.pollEvents()
-        #expect(events.count == 2)
+        // Two objects, then the subgroupFinished from closing the stream.
+        #expect(events.count == 3)
 
         guard case .objectReceived(let obj0) = events[0],
-              case .objectReceived(let obj1) = events[1] else {
-            Issue.record("Expected two objectReceived events")
+              case .objectReceived(let obj1) = events[1],
+              case .subgroupFinished(let fin) = events[2] else {
+            Issue.record("Expected two objectReceived then subgroupFinished, got \(events)")
             return
         }
+        #expect(fin.subscription == clientSub)
+        #expect(fin.groupID == 0)
+        #expect(fin.subgroupID == 0)
+        #expect(fin.endOfGroup == false)
         #expect(obj0.objectID == 0)
         #expect(obj1.objectID == 1)
         #expect(obj0.payload?.copyBytes() == Data("first".utf8))

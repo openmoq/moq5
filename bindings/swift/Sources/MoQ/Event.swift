@@ -14,7 +14,21 @@ public enum Event: Equatable {
     case namespaceRejected(NamespaceRejectedInfo)
     case namespaceDone(Announcement)
     case objectReceived(ReceivedObject)
+    case subgroupFinished(SubgroupFinishedInfo)
     case unknown(UInt32)
+}
+
+/// Detail for ``Event/subgroupFinished(_:)``: a subgroup stream reached a
+/// graceful FIN after a usable subgroup header was parsed. Not emitted for
+/// FETCH streams, streams reset via RESET_STREAM/STOP_SENDING, or streams that
+/// FIN before a header parsed. Carries the subscriber-side identity (mirroring
+/// ``ReceivedObject``); the publisher-initiated variant is not surfaced here.
+public struct SubgroupFinishedInfo: Sendable, Equatable, Hashable {
+    public let subscription: Subscription
+    public let groupID: UInt64
+    public let subgroupID: UInt64
+    /// The subgroup header's END_OF_GROUP bit.
+    public let endOfGroup: Bool
 }
 
 extension Event {
@@ -133,6 +147,15 @@ extension Event {
                 isDatagram: obj.datagram,
                 payload: payload,
                 properties: properties
+            ))
+
+        case MOQ_EVENT_SUBGROUP_FINISHED:
+            let sf = cEvent.u.subgroup_finished
+            result = .subgroupFinished(SubgroupFinishedInfo(
+                subscription: Subscription(sf.sub),
+                groupID: sf.group_id,
+                subgroupID: sf.subgroup_id,
+                endOfGroup: sf.end_of_group
             ))
 
         default:
