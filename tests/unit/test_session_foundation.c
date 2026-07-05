@@ -875,17 +875,20 @@ int main(void)
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
 
-        uint8_t v1[1]; moq_quic_varint_encode(42, v1, 1);
-        uint8_t v2[1]; moq_quic_varint_encode(99, v2, 1);
+        /* 99 needs a 2-byte QUIC varint (> 63); encoding it into a 1-byte
+         * buffer refuses and leaves the byte uninitialized. Size each buffer
+         * to its value and use the encoder's returned length. */
+        uint8_t v1[2]; size_t v1_len = moq_quic_varint_encode(42, v1, sizeof(v1));
+        uint8_t v2[2]; size_t v2_len = moq_quic_varint_encode(99, v2, sizeof(v2));
         moq_kvp_entry_t params[2];
         params[0] = (moq_kvp_entry_t){
             .type = MOQ_SETUP_PARAM_MAX_REQUEST_ID,
-            .value = v1, .value_len = 1,
+            .value = v1, .value_len = v1_len,
             .is_varint = true, .raw = NULL, .raw_len = 0
         };
         params[1] = (moq_kvp_entry_t){
             .type = MOQ_SETUP_PARAM_MAX_REQUEST_ID,
-            .value = v2, .value_len = 1,
+            .value = v2, .value_len = v2_len,
             .is_varint = true, .raw = NULL, .raw_len = 0
         };
         moq_d16_encode_client_setup(&w, params, 2);
