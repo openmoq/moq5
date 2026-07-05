@@ -171,6 +171,16 @@ jobs:
           --triple arm64-apple-ios16.0-simulator
           --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
 
+      # The SwiftUI app skeleton (@main App + AVSampleBufferDisplayLayer over
+      # the binary lane) must compile and link for the simulator. Build-only:
+      # the connection runs behind an app action, never in CI.
+      - name: iOS player skeleton build (iOS simulator)
+        run: >
+          cd bindings/swift/Examples/MoQServiceIOSPlayer &&
+          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
+          --triple arm64-apple-ios16.0-simulator
+          --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+
   cpp-binding:
     name: C++ Binding (Linux)
     runs-on: ubuntu-latest
