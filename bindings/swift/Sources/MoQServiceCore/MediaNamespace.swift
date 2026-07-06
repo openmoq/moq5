@@ -13,10 +13,19 @@ public struct MediaNamespace: Sendable, Hashable, ExpressibleByStringLiteral {
         self.parts = parts
     }
 
-    public init(stringLiteral value: String) {
-        self.parts = value
+    /// Build a namespace from a runtime `/`-separated path, with the same
+    /// semantics as a string literal: split on `/` keeping empty parts, so a
+    /// trailing or doubled `/` is preserved and fails loudly at validation
+    /// rather than being silently normalized. Lets apps pass a user-entered
+    /// string directly instead of hand-splitting into `parts`.
+    public init(_ path: String) {
+        self.parts = path
             .split(separator: "/", omittingEmptySubsequences: false)
             .map(String.init)
+    }
+
+    public init(stringLiteral value: String) {
+        self.init(value)
     }
 
     public var isEmpty: Bool { parts.isEmpty }

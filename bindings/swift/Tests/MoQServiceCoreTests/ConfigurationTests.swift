@@ -88,6 +88,30 @@ struct MediaNamespaceTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Runtime string initializer mirrors the string literal")
+    func runtimeString() {
+        /* The runtime init(_:) is what apps use for user-entered paths; it
+         * must be byte-for-byte identical to the literal path (same split,
+         * same empty-component preservation, same validation outcome). */
+        #expect(MediaNamespace("live/cam1").parts == ["live", "cam1"])
+
+        for input in ["live/cam1", "live/", "live//cam", "solo", "/lead", ""] {
+            let runtime = MediaNamespace(input)
+            let literal = MediaNamespace(stringLiteral: input)
+            #expect(runtime.parts == literal.parts)
+        }
+
+        /* Empty components are preserved (not normalized) and still rejected. */
+        #expect(MediaNamespace("live/").parts == ["live", ""])
+        #expect(throws: MoQServiceError.self) {
+            try MediaNamespace("live//cam").validate()
+        }
+        #expect(throws: Never.self) {
+            try MediaNamespace("live/cam1").validate()
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Configurations reject namespaces with empty parts")
     func configRejectsEmptyParts() {
         let rcfg = MediaReceiver.Configuration(
