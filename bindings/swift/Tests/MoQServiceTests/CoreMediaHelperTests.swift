@@ -78,7 +78,7 @@ struct FormatDescriptionTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test("AAC descriptions carry the ASBD and the ASC cookie")
+    @Test("AAC descriptions carry the ASBD and an esds-wrapped cookie")
     func aac() throws {
         var description = TrackDescription(
             name: "audio", mediaType: .audio, packaging: .raw)
@@ -93,6 +93,21 @@ struct FormatDescriptionTests {
         #expect(asbd?.pointee.mSampleRate == 44_100)
         #expect(asbd?.pointee.mChannelsPerFrame == 2)
         #expect(asbd?.pointee.mFormatID == kAudioFormatMPEG4AAC)
+
+        // CoreAudio's AAC decoder rejects the bare AudioSpecificConfig as its
+        // magic cookie; the cookie must be an MPEG-4 ES descriptor (esds,
+        // ES_Descriptor tag 0x03) that embeds the ASC. A description built from
+        // the bare ASC parses fine but decodes nothing.
+        var cookieSize = 0
+        let cookiePtr = CMAudioFormatDescriptionGetMagicCookie(
+            format, sizeOut: &cookieSize)
+        let cookie = try #require(cookiePtr).withMemoryRebound(
+            to: UInt8.self, capacity: cookieSize) {
+            Data(bytes: $0, count: cookieSize)
+        }
+        #expect(cookie.first == 0x03)                 // ES_Descriptor tag
+        #expect(cookie.contains(0x05))                // DecoderSpecificInfo tag
+        #expect(cookie.suffix(testASC.count) == testASC)  // embeds the ASC
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)

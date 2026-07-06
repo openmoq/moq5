@@ -75,7 +75,7 @@ extension TrackDescription {
         }
         if codecString.hasPrefix("mp4a") {
             try requireMediaType(.audio, for: codecString)
-            return try makeAudioDescription(magicCookie: codecConfig)
+            return try makeAudioDescription(audioSpecificConfig: codecConfig)
         }
         throw MoQServiceError.unsupported
     }
@@ -117,7 +117,7 @@ extension TrackDescription {
     }
 
     private func makeAudioDescription(
-        magicCookie: Data) throws -> CMFormatDescription {
+        audioSpecificConfig asc: Data) throws -> CMFormatDescription {
         guard let samplerate, samplerate > 0 else {
             throw MoQServiceError.invalidArgument(
                 "samplerate is required for an audio format description")
@@ -138,8 +138,13 @@ extension TrackDescription {
             mChannelsPerFrame: channels,
             mBitsPerChannel: 0,
             mReserved: 0)
+        // CoreAudio's AAC decoder wants the AudioSpecificConfig wrapped in an
+        // MPEG-4 ES descriptor (esds) as its magic cookie; handed the bare ASC
+        // it fails at converter-init time ("failure when setting cookie"), so
+        // the description parses fine but decodes nothing. Wrap it.
+        let cookie = Self.aacMagicCookie(audioSpecificConfig: asc)
         var description: CMFormatDescription?
-        let status = magicCookie.withUnsafeBytes { raw in
+        let status = cookie.withUnsafeBytes { raw in
             CMAudioFormatDescriptionCreate(
                 allocator: kCFAllocatorDefault,
                 asbd: &asbd,
@@ -152,6 +157,36 @@ extension TrackDescription {
             throw MoQServiceError.internalError(status)
         }
         return description
+    }
+
+    /// Wrap a raw AAC AudioSpecificConfig in the minimal MPEG-4 ES descriptor
+    /// (esds) CoreAudio expects as its decoder magic cookie: ES_Descriptor ->
+    /// DecoderConfigDescriptor (objectType 0x40 = audio, streamType 0x15 =
+    /// AudioStream) -> DecoderSpecificInfo (= the ASC). Descriptor lengths use
+    /// single-byte encoding, valid while the whole cookie stays under 128 bytes
+    /// (an ASC is only a few bytes); a pathologically large config falls back
+    /// to the bare ASC rather than trap.
+    private static func aacMagicCookie(audioSpecificConfig asc: Data) -> Data {
+        let decSpecLen = 2 + asc.count
+        let decCfgLen = 2 + 13 + decSpecLen
+        let esDescLen = 2 + 3 + decCfgLen
+        guard esDescLen <= 0x7F else { return asc }
+        var cookie = Data(capacity: esDescLen)
+        cookie.append(0x03)                                  // ES_Descriptor
+        cookie.append(UInt8(esDescLen - 2))
+        cookie.append(contentsOf: [0x00, 0x00])              // ES_ID
+        cookie.append(0x00)                                  // stream priority
+        cookie.append(0x04)                                  // DecoderConfig
+        cookie.append(UInt8(decCfgLen - 2))
+        cookie.append(0x40)                                  // objectType: audio
+        cookie.append(0x15)                                  // streamType: audio
+        cookie.append(contentsOf: [0x00, 0x00, 0x00])        // bufferSizeDB
+        cookie.append(contentsOf: [0x00, 0x00, 0x00, 0x00])  // maxBitrate
+        cookie.append(contentsOf: [0x00, 0x00, 0x00, 0x00])  // avgBitrate
+        cookie.append(0x05)                                  // DecoderSpecificInfo
+        cookie.append(UInt8(asc.count))
+        cookie.append(asc)
+        return cookie
     }
 }
 
