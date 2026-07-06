@@ -819,6 +819,26 @@ done:
 
 static void drain_client_chunks(moq_session_t *c, trace_summary_t *ts);
 
+/* Drive a WOULD_BLOCK on the client receive to completion. A single feed can
+ * park more than one delivery in the 1-slot event queue -- e.g. a final object
+ * or chunk, followed by the SUBGROUP_FINISHED emitted on graceful FIN -- so one
+ * drain+retry is not enough. Drain the queued events (freeing slots) and
+ * re-drive the held stream (NULL,0: no new bytes, only the parked delivery is
+ * re-attempted) until it makes progress or terminates. Bounded so a genuine
+ * stall cannot spin. Mirrors run_prelude's completion discipline. */
+static moq_result_t pump_resolve_would_block(moq_simpair_t *sp,
+        moq_session_t *client, moq_stream_ref_t ref,
+        moq_result_t drc, trace_summary_t *ts) {
+    int guard = 0;
+    while (drc == MOQ_ERR_WOULD_BLOCK && guard++ < 256) {
+        ts->rnd_wb++;
+        drain_client_chunks(client, ts);
+        drc = moq_session_on_data_bytes(client, ref, NULL, 0, false,
+                                        moq_simpair_now_us(sp));
+    }
+    return drc;
+}
+
 /* -- Random phase: chunked data pump -------------------------------- */
 
 static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
@@ -946,13 +966,7 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
                             chunk_fin, moq_simpair_now_us(sp));
                     }
 
-                    if (drc == MOQ_ERR_WOULD_BLOCK) {
-                        ts->rnd_wb++;
-                        drain_client_chunks(client, ts);
-                        drc = moq_session_on_data_bytes(
-                            client, ref, NULL, 0, false,
-                            moq_simpair_now_us(sp));
-                    }
+                    drc = pump_resolve_would_block(sp, client, ref, drc, ts);
                     if (drc < 0) {
                         moq_action_cleanup(&acts[i]);
                         for (size_t j = i + 1; j < na; j++)
@@ -962,9 +976,14 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
                     off += chunk;
                 }
                 if (clen == 0 && fin) {
+                    /* Zero-length FIN-only delivery: the graceful FIN can park a
+                     * SUBGROUP_FINISHED it cannot queue -- resolve it with the
+                     * same discipline as the chunk path, or a co-batched action
+                     * (e.g. the next stream's header) is discarded on abort. */
                     moq_result_t frc = moq_session_on_data_bytes(
                         client, ref, NULL, 0, true,
                         moq_simpair_now_us(sp));
+                    frc = pump_resolve_would_block(sp, client, ref, frc, ts);
                     if (frc < 0) {
                         moq_action_cleanup(&acts[i]);
                         for (size_t j = i + 1; j < na; j++)
