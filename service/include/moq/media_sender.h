@@ -84,6 +84,11 @@ typedef struct moq_media_sender_callbacks {
     void (*on_subscriber_left)(
         void *ctx, moq_media_sender_t *sender, moq_media_track_t *track,
         size_t active_subscriptions);
+    void (*on_ready)(void *ctx, moq_media_sender_t *sender);
+    void (*on_closed)(void *ctx, moq_media_sender_t *sender,
+                      bool is_fatal, uint64_t fatal_code);
+    void (*on_track_closed)(void *ctx, moq_media_sender_t *sender,
+                            moq_media_track_t *track);
 } moq_media_sender_callbacks_t;
 
 MOQ_API void moq_media_sender_callbacks_init(moq_media_sender_callbacks_t *cb);
@@ -152,6 +157,11 @@ typedef struct moq_media_sender_cfg {
      * create/attach; ctx and the function pointers are retained for the
      * sender's life. Leave zeroed for no callbacks (queries still work). */
     moq_media_sender_callbacks_t         callbacks;
+
+    /* false: advertise + answer SUBSCRIBE (pull).
+     * true: also PUBLISH every track and emit the catalog live so a relay
+     * caches it without a FETCH (push). Default to false. */
+    bool                                 publish_tracks;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,

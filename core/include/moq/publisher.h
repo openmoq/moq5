@@ -90,6 +90,12 @@ typedef struct moq_pub_callbacks {
     /* Appended: fired when a subscriber updates priority/forward/timeout. */
     void (*on_subscriber_updated)(void *ctx, moq_pub_track_t *track,
                                    const moq_pub_subscribe_update_info_t *info);
+    void (*on_publish_ok)(void *ctx, moq_pub_track_t *track, bool forward);
+    void (*on_publish_error)(void *ctx, moq_pub_track_t *track,
+                              moq_request_error_t error_code);
+    void (*on_publish_forward_changed)(void *ctx, moq_pub_track_t *track,
+                                        bool forward);
+    void (*on_publish_finished)(void *ctx, moq_pub_track_t *track);
 } moq_pub_callbacks_t;
 
 MOQ_API void moq_pub_callbacks_init(moq_pub_callbacks_t *cb);
@@ -188,6 +194,67 @@ MOQ_API moq_result_t moq_pub_remove_track(
     moq_publisher_t *pub,
     moq_pub_track_t *track,
     uint64_t now_us);
+
+/*
+ * Configuration for publishing a track. Publishing is a per-track OPERATION,
+ * not a publisher mode: a track added with moq_pub_add_track may be advertised
+ * (advertise_namespace) and receive SUBSCRIBE, AND/OR be published with
+ * moq_pub_publish_track.
+ */
+typedef struct moq_pub_publish_cfg {
+    uint32_t    struct_size;
+    bool        has_track_alias;
+    uint64_t    track_alias;        /* has_track_alias==false: session assigns */
+    bool        has_forward;
+    bool        forward;            /* initial forward intent (default true) */
+    moq_bytes_t track_properties;   /* opaque track properties (e.g. DYNAMIC_GROUPS) */
+    const moq_auth_token_t *auth_tokens;   /* borrowed for the call */
+    size_t                  auth_token_count;
+} moq_pub_publish_cfg_t;
+
+MOQ_API void moq_pub_publish_cfg_init(moq_pub_publish_cfg_t *cfg);
+
+/*
+ * Send PUBLISH for an existing track (publisher-initiated). The track's
+ * namespace and name from moq_pub_add_track are used.
+ *
+ * Advancing call. Returns MOQ_ERR_REQUEST_BLOCKED if no request capacity and
+ * MOQ_ERR_WOULD_BLOCK if the action queue is full (retry via moq_pub_tick /
+ * moq_pub_flush). Idempotent: a second call while the publication is live
+ * returns MOQ_OK. Returns MOQ_ERR_WRONG_STATE if the track is ended,
+ * MOQ_ERR_CLOSED if the publisher is closed.
+ *
+ * Objects are written with the same moq_pub_write_object[_ex] API -- the
+ * facade routes them to the publication once it is established. Acceptance is
+ * surfaced via moq_pub_track_is_published / on_publish_ok.
+ */
+MOQ_API moq_result_t moq_pub_publish_track(
+    moq_publisher_t *pub,
+    moq_pub_track_t *track,
+    const moq_pub_publish_cfg_t *cfg,
+    uint64_t now_us);
+
+/* Inverse of moq_pub_publish_track: end the publication cleanly (PUBLISH_DONE),
+ * leaving the track and its subscriptions intact. No-op MOQ_OK if never
+ * published. WOULD_BLOCK (retry via tick/flush) / WRONG_STATE (object
+ * mid-stream) / CLOSED. */
+MOQ_API moq_result_t moq_pub_unpublish_track(
+    moq_publisher_t *pub,
+    moq_pub_track_t *track,
+    uint64_t now_us);
+
+/* True once the peer has accepted this track's publication. False for NULL
+ * inputs, a foreign track, a track never published, or while the publication
+ * is still pending / errored / finished. */
+MOQ_API bool moq_pub_track_is_published(
+    const moq_publisher_t *pub,
+    const moq_pub_track_t *track);
+
+/* True when the publication is established AND the peer's forward state is 1. 
+ * Objects written while this is false are still accepted by the facade*/
+MOQ_API bool moq_pub_track_forward(
+    const moq_publisher_t *pub,
+    const moq_pub_track_t *track);
 
 /* -- Retained group (origin-local explicit-FETCH cache) ------------- */
 

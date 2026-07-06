@@ -277,6 +277,13 @@ uint64_t moq_pico_wt_conn_close_code(const moq_pico_wt_conn_t *conn)
     return conn ? moq_transport_bridge_close_code(conn->bridge) : 0;
 }
 
+void moq_pico_wt_conn_notify_transport_closed(moq_pico_wt_conn_t *conn,
+                                              uint64_t code, uint64_t now_us)
+{
+    if (!conn) return;
+    moq_transport_bridge_on_transport_close(conn->bridge, code, now_us);
+}
+
 /* -- Service -------------------------------------------------------- */
 
 int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)

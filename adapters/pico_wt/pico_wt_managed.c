@@ -488,6 +488,13 @@ static int loop_callback(picoquic_quic_t *quic,
     if (!conn)
         return 0;
 
+    if (m->cnx &&
+        picoquic_get_cnx_state(m->cnx) == picoquic_state_disconnected &&
+        !moq_pico_wt_conn_is_closed(conn) && !moq_pico_wt_conn_is_fatal(conn)) {
+        moq_pico_wt_conn_notify_transport_closed(
+            conn, 0, picoquic_get_quic_time(quic));
+    }
+
     uint64_t now = picoquic_get_quic_time(quic);
 
     /* service → on_pump → service (all on the network thread). */

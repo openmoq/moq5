@@ -116,6 +116,10 @@ MOQ_API bool moq_pico_wt_conn_is_closed(const moq_pico_wt_conn_t *conn);
  * or conn is NULL. */
 MOQ_API uint64_t moq_pico_wt_conn_close_code(const moq_pico_wt_conn_t *conn);
 
+/* Surface a QUIC CONNECTION_CLOSE into the bridge as a clean close. */
+MOQ_API void moq_pico_wt_conn_notify_transport_closed(
+    moq_pico_wt_conn_t *conn, uint64_t code, uint64_t now_us);
+
 /*
  * Pump session actions into the WT connection. Call after each
  * picoquic event-loop iteration. Returns 0 on success, -1 on fatal.

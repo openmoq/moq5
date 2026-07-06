@@ -331,6 +331,18 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_sender_catalog PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_catalog COMMAND test_media_sender_catalog)
+
+        # Lifecycle callbacks (on_ready / on_closed): deterministic, no network.
+        # Drives the production fire helpers via the same test seam.
+        add_executable(test_media_sender_lifecycle
+            tests/test_media_sender_lifecycle.c)
+        target_link_libraries(test_media_sender_lifecycle PRIVATE
+            moq-service-sender-test-internals moq::core moq::msf
+            Threads::Threads)
+        target_include_directories(test_media_sender_lifecycle PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_lifecycle
+            COMMAND test_media_sender_lifecycle)
     endif()
 
     # Lifecycle tests need a real network loopback: a threaded-picoquic
