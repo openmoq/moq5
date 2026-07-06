@@ -128,6 +128,16 @@ jobs:
         env:
           PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
 
+      # The universal SwiftUI example app must build for macOS through this
+      # pkg-config lane (its iOS-simulator build lives in swift-service-ios).
+      # Build-only; no network.
+      - name: SimplePlayer example build (macOS)
+        run: >
+          cd bindings/swift/Examples/SimplePlayer &&
+          MOQ_SERVICE=1 swift build
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/build/service-prefix/lib/pkgconfig
+
   swift-service-ios:
     name: Swift Service iOS (simulator, macOS)
     runs-on: macos-latest
@@ -171,12 +181,13 @@ jobs:
           --triple arm64-apple-ios16.0-simulator
           --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
 
-      # The SwiftUI app skeleton (@main App + AVSampleBufferDisplayLayer over
-      # the binary lane) must compile and link for the simulator. Build-only:
-      # the connection runs behind an app action, never in CI.
-      - name: iOS player skeleton build (iOS simulator)
+      # The universal SwiftUI example app (@main App + AVSampleBufferDisplayLayer
+      # over the binary lane) must compile and link for the simulator. Its macOS
+      # build runs in the pkg-config job. Build-only: the connection runs behind
+      # the Connect button, never in CI.
+      - name: SimplePlayer example build (iOS simulator)
         run: >
-          cd bindings/swift/Examples/MoQServiceIOSPlayer &&
+          cd bindings/swift/Examples/SimplePlayer &&
           MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
           --triple arm64-apple-ios16.0-simulator
           --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"

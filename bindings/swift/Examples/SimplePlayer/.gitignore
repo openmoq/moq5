@@ -1,0 +1,8 @@
+# CA trust roots are fetched at bundle time by scripts/make-app.sh, never
+# committed (a vendored cert chain does not belong in source history).
+cacert.pem
+
+# Built app bundles / SwiftPM output.
+build/
+*.app
+.build/
