@@ -193,6 +193,22 @@ final class ServiceEndpointBackend: EndpointBackend, @unchecked Sendable {
     var isFatal: Bool { moq_endpoint_is_fatal(endpoint) }
     var fatalCode: UInt64 { moq_endpoint_fatal_code(endpoint) }
 
+    var terminalFailure: TerminalFailure {
+        var out = moq_endpoint_terminal_t()
+        let rc = moq_endpoint_get_terminal(
+            endpoint, &out, MemoryLayout<moq_endpoint_terminal_t>.size)
+        guard rc == moq_result_t(MOQ_OK) else { return .none }
+        let code = out.detail_code
+        switch out.reason {
+        case MOQ_ENDPOINT_TERMINAL_CLEAN:           return .clean
+        case MOQ_ENDPOINT_TERMINAL_PROTOCOL:        return .protocolFatal(code: code)
+        case MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE: return .tlsCertificate(code: code)
+        case MOQ_ENDPOINT_TERMINAL_TLS:             return .tls(code: code)
+        case MOQ_ENDPOINT_TERMINAL_TRANSPORT:       return .transport(code: code)
+        default:                                    return .none
+        }
+    }
+
     func setInterrupted(_ interrupted: Bool) {
         moq_endpoint_set_interrupted(endpoint, interrupted)
     }

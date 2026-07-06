@@ -44,12 +44,27 @@ package protocol EndpointBackend: AnyObject, Sendable {
     var negotiatedVersion: MoQVersion? { get }
     var isFatal: Bool { get }
     var fatalCode: UInt64 { get }
+    /// Why the endpoint went terminal, classified transport-agnostically.
+    /// Meaningful once `state == .closed`; drives how `established()` throws.
+    var terminalFailure: TerminalFailure { get }
     func setInterrupted(_ interrupted: Bool)
     func wake()
     func waitForActivity(timeoutMicroseconds: UInt64) -> EndpointWaitResult
     func drain(timeoutMicroseconds: UInt64) -> EndpointDrainResult
     func stop()
     func destroy()
+}
+
+/// Mirror of the C `moq_endpoint_terminal_reason_t`, carrying the transport-
+/// native detail code (a QUIC CRYPTO_ERROR / TLS alert for the TLS cases).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package enum TerminalFailure: Sendable, Equatable {
+    case none                           // not terminal, or reason unknown
+    case clean                          // clean close
+    case protocolFatal(code: UInt64)    // MoQ/bridge fatal code
+    case tlsCertificate(code: UInt64)   // peer certificate verification failed
+    case tls(code: UInt64)              // other TLS/crypto handshake failure
+    case transport(code: UInt64)        // generic transport/handshake failure
 }
 
 /// One track event polled from the receiver backend (the C

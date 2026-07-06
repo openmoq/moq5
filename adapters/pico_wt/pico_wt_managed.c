@@ -98,6 +98,10 @@ struct moq_pico_wt_managed {
     picoquic_cnx_t    *active_cnx;
     bool               fatal;
     uint64_t           fatal_code;
+    uint64_t           terminal_error;  /* picoquic local error captured at a
+                                         * client handshake/transport failure;
+                                         * 0 otherwise. Classified by the service
+                                         * endpoint (TLS vs transport). */
     bool               closed;
     uint64_t           close_code;
     bool               close_flush_started;       /* network thread only */
@@ -476,8 +480,16 @@ static int loop_callback(picoquic_quic_t *quic,
      * so the app does not wait forever. */
     if (m->perspective == MOQ_PERSPECTIVE_CLIENT && m->cnx && !m->conn &&
         picoquic_get_cnx_state(m->cnx) == picoquic_state_disconnected) {
+        uint64_t local_err = picoquic_get_local_error(m->cnx);
         pthread_mutex_lock(&m->mutex);
-        if (!m->fatal && !m->closed) { m->fatal = true; m->fatal_code = 0; }
+        if (!m->fatal && !m->closed) {
+            m->fatal = true;
+            /* fatal_code stays 0 (no MoQ/bridge protocol fatal happened); the
+             * transport reason lives in terminal_error for the endpoint to
+             * classify (cert rejection => a QUIC CRYPTO_ERROR). */
+            m->fatal_code = 0;
+            m->terminal_error = local_err;
+        }
         pthread_mutex_unlock(&m->mutex);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
@@ -1029,6 +1041,15 @@ uint64_t moq_pico_wt_managed_close_code(const moq_pico_wt_managed_t *m)
     uint64_t c = mm->close_code;
     pthread_mutex_unlock(&mm->mutex);
     return c;
+}
+uint64_t moq_pico_wt_managed_terminal_error(const moq_pico_wt_managed_t *m)
+{
+    if (!m) return 0;
+    moq_pico_wt_managed_t *mm = (moq_pico_wt_managed_t *)m;
+    pthread_mutex_lock(&mm->mutex);
+    uint64_t e = mm->terminal_error;
+    pthread_mutex_unlock(&mm->mutex);
+    return e;
 }
 
 int moq_pico_wt_managed_local_port(const moq_pico_wt_managed_t *m)

@@ -108,9 +108,11 @@ public final class MoQEndpoint: @unchecked Sendable {
     // MARK: Lifecycle
 
     /// Suspends until the connection is ESTABLISHED. Throws
-    /// ``MoQServiceError/interrupted`` while the latch is set,
-    /// ``MoQServiceError/fatal(code:)`` / ``MoQServiceError/closed`` once
-    /// terminal; Task cancellation throws `CancellationError`.
+    /// ``MoQServiceError/interrupted`` while the latch is set; once terminal,
+    /// ``MoQServiceError/closed`` (clean close), ``MoQServiceError/fatal(code:)``
+    /// (protocol fatal), or ``MoQServiceError/connectionFailed(_:)`` (TLS,
+    /// certificate, or transport failure, classified by reason). Task
+    /// cancellation throws `CancellationError`.
     public func established() async throws {
         let backend = self.backend
         try await engine.waitUntil {
@@ -118,8 +120,21 @@ public final class MoQEndpoint: @unchecked Sendable {
             case .established:
                 return .satisfied
             case .closed:
-                return .failure(backend.isFatal
-                    ? .fatal(code: backend.fatalCode) : .closed)
+                switch backend.terminalFailure {
+                case .none, .clean:
+                    return .failure(.closed)
+                case .protocolFatal(let code):
+                    return .failure(.fatal(code: code))
+                case .tlsCertificate(let code):
+                    return .failure(.connectionFailed(
+                        ConnectionFailure(kind: .certificateUnverified, code: code)))
+                case .tls(let code):
+                    return .failure(.connectionFailed(
+                        ConnectionFailure(kind: .tls, code: code)))
+                case .transport(let code):
+                    return .failure(.connectionFailed(
+                        ConnectionFailure(kind: .transport, code: code)))
+                }
             case .connecting, .draining:
                 return .pending
             }

@@ -30,12 +30,42 @@ public enum MoQServiceError: Error, Sendable, Hashable {
     case closed
 
     /// Terminal failure; `code` is the C tier's fatal code (endpoint,
-    /// receiver, or sender scoped).
+    /// receiver, or sender scoped). Used for MoQ/protocol fatals — a
+    /// transport/handshake failure is reported as ``connectionFailed(_:)``,
+    /// which classifies why (a `fatal(code:)` with a bare 0 could not).
     case fatal(code: UInt64)
+
+    /// The connection could not be established, classified by its cause.
+    /// Distinguishes a certificate rejection from a plain transport failure —
+    /// something the endpoint's fatal code alone (0 for all of these) cannot.
+    case connectionFailed(ConnectionFailure)
 
     case outOfMemory
 
     /// An unexpected C result code leaked through; the raw value is kept
     /// for diagnostics.
     case internalError(Int32)
+}
+
+/// Why a connection attempt failed. `code` carries the transport-native detail
+/// (for picoquic: a QUIC CRYPTO_ERROR whose low byte is the TLS alert); it is
+/// diagnostic, not something to branch on — branch on `kind`.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public struct ConnectionFailure: Error, Sendable, Hashable {
+    public enum Kind: Sendable, Hashable {
+        /// The peer's certificate did not verify against the trust anchors.
+        case certificateUnverified
+        /// Another TLS/crypto handshake failure.
+        case tls
+        /// A generic transport/handshake failure (timeout, connection
+        /// refused, ALPN mismatch, network error).
+        case transport
+    }
+    public let kind: Kind
+    public let code: UInt64
+
+    public init(kind: Kind, code: UInt64) {
+        self.kind = kind
+        self.code = code
+    }
 }

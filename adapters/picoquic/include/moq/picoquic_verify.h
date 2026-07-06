@@ -79,6 +79,12 @@ typedef struct st_picoquic_quic_t picoquic_quic_t;
 MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
                                            const char *ca_file);
 
+/* Preflight a CA bundle path without a QUIC context: returns 1 if `ca_file`
+ * loads as a trust store (or is NULL/empty = system roots), 0 if it cannot be
+ * loaded. Lets the service endpoint report a bad CA file as a configuration
+ * error (MOQ_ERR_INVAL) up front, rather than as a generic connect failure. */
+MOQ_API int moq_picoquic_ca_file_loadable(const char *ca_file);
+
 #ifdef __cplusplus
 }
 #endif

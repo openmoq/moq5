@@ -203,7 +203,46 @@ typedef enum moq_endpoint_state {
 MOQ_API moq_endpoint_state_t moq_endpoint_state(const moq_endpoint_t *ep);
 MOQ_API bool     moq_endpoint_is_closed(const moq_endpoint_t *ep);
 MOQ_API bool     moq_endpoint_is_fatal(const moq_endpoint_t *ep);
+/* The MoQ/bridge fatal code (nonzero => a protocol-level fatal). It is 0 for a
+ * transport/handshake failure -- do NOT treat fatal_code == 0 as "no error";
+ * use moq_endpoint_get_terminal() below to classify why an endpoint went
+ * terminal. Kept for protocol-fatal callers and backward compatibility. */
 MOQ_API uint64_t moq_endpoint_fatal_code(const moq_endpoint_t *ep);
+
+/* Why an endpoint reached a terminal state, classified transport-agnostically.
+ * TLS_CERTIFICATE / TLS / TRANSPORT let a consumer tell a certificate rejection
+ * apart from a timeout or an ALPN mismatch, which moq_endpoint_fatal_code()
+ * cannot (they all report 0). */
+typedef enum moq_endpoint_terminal_reason {
+    MOQ_ENDPOINT_TERMINAL_NONE = 0,        /* not terminal, or reason unknown */
+    MOQ_ENDPOINT_TERMINAL_CLEAN,           /* clean close */
+    MOQ_ENDPOINT_TERMINAL_PROTOCOL,        /* MoQ/bridge fatal (nonzero code) */
+    MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE, /* peer certificate verification failed */
+    MOQ_ENDPOINT_TERMINAL_TLS,             /* other TLS/crypto handshake failure */
+    MOQ_ENDPOINT_TERMINAL_TRANSPORT        /* generic transport/handshake failure */
+} moq_endpoint_terminal_reason_t;
+
+/* ABI-forward (struct_size prefix; sized-init like the media stats structs). */
+typedef struct moq_endpoint_terminal {
+    uint32_t struct_size;
+    moq_endpoint_terminal_reason_t reason;
+    /* Transport-native detail: the MoQ/bridge fatal code for PROTOCOL; the
+     * picoquic local error (a QUIC CRYPTO_ERROR whose low byte is the TLS
+     * alert) for TLS/TLS_CERTIFICATE/TRANSPORT; 0 for CLEAN/NONE. */
+    uint64_t detail_code;
+} moq_endpoint_terminal_t;
+
+/* v0 layout size: the whole struct as first published (all fields are v0). */
+#define MOQ_ENDPOINT_TERMINAL_V0_SIZE \
+    (offsetof(moq_endpoint_terminal_t, detail_code) + sizeof(uint64_t))
+
+/* Classify the endpoint's terminal reason. Fills `*out` (sized-copy by
+ * `out_size`, stamping out->struct_size with bytes written). Returns MOQ_OK, or
+ * MOQ_ERR_INVAL for NULL args or an out_size below MOQ_ENDPOINT_TERMINAL_V0_SIZE.
+ * On a non-terminal endpoint the reason is MOQ_ENDPOINT_TERMINAL_NONE. */
+MOQ_API moq_result_t moq_endpoint_get_terminal(const moq_endpoint_t *ep,
+                                               moq_endpoint_terminal_t *out,
+                                               size_t out_size);
 
 /* Returns 0 (no moq_version_t value) until the endpoint reaches ESTABLISHED;
  * the negotiated version thereafter. The media tier reads it at

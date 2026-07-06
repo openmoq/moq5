@@ -281,6 +281,11 @@ typedef struct ep_backend_vtable {
     int           (*drain_state)(void *facade);
     moq_result_t  (*stop)(void *facade);
     void          (*destroy)(void *facade);
+    /* Classify the facade's terminal reason + native detail code. NULL is
+     * treated as "generic" (NONE/PROTOCOL/TRANSPORT/CLEAN only). */
+    void          (*terminal)(void *facade,
+                              moq_endpoint_terminal_reason_t *reason,
+                              uint64_t *detail);
 } ep_backend_vtable_t;
 
 /* drain_state return codes. */
@@ -507,6 +512,68 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 }
 #endif
 
+/* -- Terminal-reason classification --------------------------------- *
+ * Turn a facade's raw terminal signals into a transport-agnostic reason. The
+ * generic form (mvfst/proxygen) knows only PROTOCOL vs generic transport; the
+ * picoquic form additionally reads picoquic's captured local error to tell a
+ * TLS/certificate failure apart from a plain transport failure. */
+#if defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
+                                bool clean_closed,
+                                moq_endpoint_terminal_reason_t *reason,
+                                uint64_t *detail)
+{
+    if (is_fatal && fatal_code != 0) {
+        *reason = MOQ_ENDPOINT_TERMINAL_PROTOCOL; *detail = fatal_code;
+    } else if (is_fatal) {
+        *reason = MOQ_ENDPOINT_TERMINAL_TRANSPORT; *detail = 0;
+    } else if (clean_closed) {
+        *reason = MOQ_ENDPOINT_TERMINAL_CLEAN; *detail = 0;
+    } else {
+        *reason = MOQ_ENDPOINT_TERMINAL_NONE; *detail = 0;
+    }
+}
+#endif
+
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
+    defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+#include <picoquic.h>   /* picoquic_is_handshake_error */
+static void ep_classify_pico(bool is_fatal, uint64_t fatal_code,
+                             bool clean_closed, uint64_t terminal_error,
+                             moq_endpoint_terminal_reason_t *reason,
+                             uint64_t *detail)
+{
+    if (is_fatal && fatal_code != 0) {
+        /* A MoQ/bridge protocol fatal took precedence over any transport code. */
+        *reason = MOQ_ENDPOINT_TERMINAL_PROTOCOL; *detail = fatal_code;
+        return;
+    }
+    if (is_fatal) {
+        if (picoquic_is_handshake_error(terminal_error)) {
+            /* QUIC CRYPTO_ERROR: low byte is the TLS alert. Certificate-related
+             * alerts (picotls PTLS_ALERT_*): 42 bad_certificate,
+             * 44 certificate_revoked, 45 certificate_expired,
+             * 46 certificate_unknown, 48 unknown_ca. */
+            uint8_t alert = (uint8_t)(terminal_error & 0xFFu);
+            *reason = (alert == 42 || alert == 44 || alert == 45 ||
+                       alert == 46 || alert == 48)
+                ? MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE
+                : MOQ_ENDPOINT_TERMINAL_TLS;
+        } else {
+            *reason = MOQ_ENDPOINT_TERMINAL_TRANSPORT;
+        }
+        *detail = terminal_error;
+        return;
+    }
+    if (clean_closed) {
+        *reason = MOQ_ENDPOINT_TERMINAL_CLEAN; *detail = 0;
+        return;
+    }
+    *reason = MOQ_ENDPOINT_TERMINAL_NONE; *detail = 0;
+}
+#endif
+
 /* -- Per-facade vtable shims ---------------------------------------- *
  * Cast the opaque facade handle to its concrete managed type and forward.
  * Compiled only when the facade is built; a facade with no clean-close
@@ -521,10 +588,16 @@ static bool          pq_vt_clean_closed(void *f) { (void)f; return false; } /* r
 static int           pq_vt_drain_state(void *f) { return moq_pq_threaded_drain_state((moq_pq_threaded_t *)f); }
 static moq_result_t  pq_vt_stop(void *f) { return moq_pq_threaded_stop((moq_pq_threaded_t *)f); }
 static void          pq_vt_destroy(void *f) { moq_pq_threaded_destroy((moq_pq_threaded_t *)f); }
+static void          pq_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    moq_pq_threaded_t *t = (moq_pq_threaded_t *)f;
+    ep_classify_pico(moq_pq_threaded_is_fatal(t), moq_pq_threaded_fatal_code(t),
+        false /* raw QUIC: no clean-close concept */,
+        moq_pq_threaded_terminal_error(t), r, d);
+}
 static const ep_backend_vtable_t PQ_VT = {
     pq_vt_wait, pq_vt_wake, pq_vt_negver, pq_vt_is_fatal,
     pq_vt_fatal_code, pq_vt_clean_closed, pq_vt_drain_state, pq_vt_stop,
-    pq_vt_destroy,
+    pq_vt_destroy, pq_vt_terminal,
 };
 #endif
 
@@ -538,10 +611,15 @@ static bool          wt_vt_clean_closed(void *f) { return moq_pico_wt_managed_is
 static int           wt_vt_drain_state(void *f) { return moq_pico_wt_managed_drain_state((moq_pico_wt_managed_t *)f); }
 static moq_result_t  wt_vt_stop(void *f) { return moq_pico_wt_managed_stop((moq_pico_wt_managed_t *)f); }
 static void          wt_vt_destroy(void *f) { moq_pico_wt_managed_destroy((moq_pico_wt_managed_t *)f); }
+static void          wt_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)f;
+    ep_classify_pico(moq_pico_wt_managed_is_fatal(m), moq_pico_wt_managed_fatal_code(m),
+        moq_pico_wt_managed_is_closed(m), moq_pico_wt_managed_terminal_error(m), r, d);
+}
 static const ep_backend_vtable_t WT_VT = {
     wt_vt_wait, wt_vt_wake, wt_vt_negver, wt_vt_is_fatal,
     wt_vt_fatal_code, wt_vt_clean_closed, wt_vt_drain_state, wt_vt_stop,
-    wt_vt_destroy,
+    wt_vt_destroy, wt_vt_terminal,
 };
 #endif
 
@@ -557,10 +635,16 @@ static bool          mvfst_vt_clean_closed(void *f) { (void)f; return false; } /
 static int           mvfst_vt_drain_state(void *f) { (void)f; return EP_DRAIN_UNSUPPORTED; }
 static moq_result_t  mvfst_vt_stop(void *f) { return moq_mvfst_managed_stop((moq_mvfst_managed_t *)f); }
 static void          mvfst_vt_destroy(void *f) { moq_mvfst_managed_destroy((moq_mvfst_managed_t *)f); }
+static void          mvfst_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    /* mvfst verifies internally and exposes no per-cnx transport error yet:
+     * PROTOCOL vs generic transport only. */
+    ep_classify_generic(moq_mvfst_managed_is_fatal((moq_mvfst_managed_t *)f),
+        moq_mvfst_managed_fatal_code((moq_mvfst_managed_t *)f), false, r, d);
+}
 static const ep_backend_vtable_t MVFST_VT = {
     mvfst_vt_wait, mvfst_vt_wake, mvfst_vt_negver, mvfst_vt_is_fatal,
     mvfst_vt_fatal_code, mvfst_vt_clean_closed, mvfst_vt_drain_state,
-    mvfst_vt_stop, mvfst_vt_destroy,
+    mvfst_vt_stop, mvfst_vt_destroy, mvfst_vt_terminal,
 };
 #endif
 
@@ -575,10 +659,15 @@ static bool          proxygen_vt_clean_closed(void *f) { return moq_proxygen_wt_
 static int           proxygen_vt_drain_state(void *f) { (void)f; return EP_DRAIN_UNSUPPORTED; }
 static moq_result_t  proxygen_vt_stop(void *f) { return moq_proxygen_wt_managed_stop((moq_proxygen_wt_managed_t *)f); }
 static void          proxygen_vt_destroy(void *f) { moq_proxygen_wt_managed_destroy((moq_proxygen_wt_managed_t *)f); }
+static void          proxygen_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    ep_classify_generic(moq_proxygen_wt_managed_is_fatal((moq_proxygen_wt_managed_t *)f),
+        moq_proxygen_wt_managed_fatal_code((moq_proxygen_wt_managed_t *)f),
+        moq_proxygen_wt_managed_is_closed((moq_proxygen_wt_managed_t *)f), r, d);
+}
 static const ep_backend_vtable_t PROXYGEN_VT = {
     proxygen_vt_wait, proxygen_vt_wake, proxygen_vt_negver, proxygen_vt_is_fatal,
     proxygen_vt_fatal_code, proxygen_vt_clean_closed, proxygen_vt_drain_state,
-    proxygen_vt_stop, proxygen_vt_destroy,
+    proxygen_vt_stop, proxygen_vt_destroy, proxygen_vt_terminal,
 };
 #endif
 
@@ -995,6 +1084,20 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
         return MOQ_ERR_NOMEM;
     }
 
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
+    defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+    /* Preflight the CA bundle: a file that cannot be loaded is a configuration
+     * error, reported here as MOQ_ERR_INVAL rather than collapsing into a
+     * generic transport/handshake failure inside the verifier install. */
+    if (ep->ca_file && !cfg->insecure_skip_verify &&
+        !moq_picoquic_ca_file_loadable(ep->ca_file)) {
+        ep_free_strings(ep);
+        pthread_mutex_destroy(&ep->mu);
+        alloc->free(ep, sizeof(*ep), alloc->ctx);
+        return MOQ_ERR_INVAL;
+    }
+#endif
+
     /* Select the backend for the resolved (protocol, backend) and let its
      * create-fn build the facade. The resolver already rejected any backend
      * with no compiled-in row, so a miss here is unreachable. */
@@ -1235,6 +1338,27 @@ uint64_t moq_endpoint_fatal_code(const moq_endpoint_t *ep)
 {
     if (!ep) return 0;
     return ep_facade_fatal_code(ep);
+}
+
+moq_result_t moq_endpoint_get_terminal(const moq_endpoint_t *ep,
+                                       moq_endpoint_terminal_t *out,
+                                       size_t out_size)
+{
+    if (!ep || !out || out_size < MOQ_ENDPOINT_TERMINAL_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    memset(out, 0, n);
+
+    moq_endpoint_terminal_t t;
+    memset(&t, 0, sizeof(t));
+    t.reason = MOQ_ENDPOINT_TERMINAL_NONE;
+    t.detail_code = 0;
+    if (ep->vt && ep->facade && ep->vt->terminal)
+        ep->vt->terminal(ep->facade, &t.reason, &t.detail_code);
+
+    t.struct_size = (uint32_t)n;
+    memcpy(out, &t, n);
+    return MOQ_OK;
 }
 
 moq_version_t moq_endpoint_negotiated_version(const moq_endpoint_t *ep)

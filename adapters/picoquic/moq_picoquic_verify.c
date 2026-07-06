@@ -26,6 +26,18 @@ static void moq_picoquic_dispose_verifier(ptls_verify_certificate_t *verifier)
     free(verifier);
 }
 
+int moq_picoquic_ca_file_loadable(const char *ca_file)
+{
+    /* Empty/NULL means "system roots" -- always acceptable. */
+    if (ca_file == NULL || ca_file[0] == '\0') return 1;
+    X509_STORE *store = X509_STORE_new();
+    /* OOM is not a CA-file problem; do not report the file as unloadable. */
+    if (store == NULL) return 1;
+    int ok = (X509_STORE_load_locations(store, ca_file, NULL) == 1);
+    X509_STORE_free(store);
+    return ok;
+}
+
 int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic, const char *ca_file)
 {
     if (!quic) return -1;

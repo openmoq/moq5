@@ -141,6 +141,26 @@ struct EndpointLifecycleEngineTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Terminal classification: transport/TLS reasons -> connectionFailed")
+    func terminalConnectionFailures() async throws {
+        let cases: [(TerminalFailure, ConnectionFailure)] = [
+            (.tlsCertificate(code: 0x130),
+             ConnectionFailure(kind: .certificateUnverified, code: 0x130)),
+            (.tls(code: 0x128), ConnectionFailure(kind: .tls, code: 0x128)),
+            (.transport(code: 0), ConnectionFailure(kind: .transport, code: 0)),
+        ]
+        for (terminal, expected) in cases {
+            let backend = ScriptedEndpointBackend()
+            let endpoint = makeEndpoint(backend)
+            backend.script(state: .closed, fatal: true, terminal: terminal)
+            await #expect(throws: MoQServiceError.connectionFailed(expected)) {
+                try await endpoint.established()
+            }
+            await endpoint.close()
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("A close racing the waiter sweep still resolves parked waiters")
     func terminalRaceFlushesWaiters() async throws {
         let backend = ScriptedEndpointBackend()

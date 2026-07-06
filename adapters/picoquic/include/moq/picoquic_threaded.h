@@ -347,6 +347,11 @@ size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
  * So a failed cert verification is observable via is_fatal(). */
 bool     moq_pq_threaded_is_fatal(const moq_pq_threaded_t *t);
 uint64_t moq_pq_threaded_fatal_code(const moq_pq_threaded_t *t);
+/* The picoquic local error captured when a CLIENT connection failed during the
+ * handshake (a QUIC CRYPTO_ERROR = 0x100|alert for a TLS failure, else a
+ * transport code; 0 when there was no such failure). The service endpoint
+ * classifies it into a transport-agnostic terminal reason. Thread-safe. */
+uint64_t moq_pq_threaded_terminal_error(const moq_pq_threaded_t *t);
 
 /* Graceful-drain probe (backs moq_endpoint_drain). 1 = local stream flush done
  * (no queued/ready stream data or unsent FIN; NOT a packet-ACK check), 0 = still

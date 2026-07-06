@@ -239,6 +239,14 @@ MOQ_API bool     moq_pico_wt_managed_is_closed(
 MOQ_API uint64_t moq_pico_wt_managed_close_code(
     const moq_pico_wt_managed_t *m);
 
+/* The picoquic local error captured when a CLIENT connection failed during the
+ * handshake (cert rejection, timeout, refused, ALPN mismatch): a QUIC
+ * CRYPTO_ERROR (0x100 | TLS alert) for a TLS failure, else a transport code; 0
+ * when there was no such failure. The service endpoint classifies it into a
+ * transport-agnostic terminal reason. Thread-safe. */
+MOQ_API uint64_t moq_pico_wt_managed_terminal_error(
+    const moq_pico_wt_managed_t *m);
+
 /* Graceful-drain probe (backs moq_endpoint_drain). 1 = local stream flush done
  * (no queued/ready reliable stream data or unsent FIN; NOT a packet-ACK check),
  * 0 = still draining, -2 = called on the network thread. App-thread; safe to

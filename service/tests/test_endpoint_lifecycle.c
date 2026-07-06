@@ -171,6 +171,35 @@ int main(int argc, char **argv)
     MOQ_TEST_CHECK(srv != NULL);
     if (!srv) return 1;
 
+    /* == Malformed CA file -> MOQ_ERR_INVAL (preflighted config error) === *
+     * A CA bundle that cannot be loaded is a configuration error surfaced by
+     * connect() up front, not a generic transport/handshake failure. */
+    {
+        char ca_path[] = "/tmp/moq_bad_ca_XXXXXX";
+        int fd = mkstemp(ca_path);
+        MOQ_TEST_CHECK(fd >= 0);
+        if (fd >= 0) {
+            static const char junk[] =
+                "-----BEGIN CERTIFICATE-----\nnotbase64\n"
+                "-----END CERTIFICATE-----\n";
+            (void)write(fd, junk, sizeof(junk) - 1);
+            close(fd);
+            char bad_url[64];
+            snprintf(bad_url, sizeof(bad_url), "moqt://127.0.0.1:%d", port);
+            moq_endpoint_cfg_t bc;
+            moq_endpoint_cfg_init(&bc);
+            bc.url = (moq_bytes_t){ (const uint8_t *)bad_url, strlen(bad_url) };
+            bc.insecure_skip_verify = false;
+            bc.ca_file = (moq_bytes_t){ (const uint8_t *)ca_path,
+                                        strlen(ca_path) };
+            moq_endpoint_t *bad_ep = NULL;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&bc, &bad_ep),
+                                  (int)MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK(bad_ep == NULL);
+            unlink(ca_path);
+        }
+    }
+
     /* == Loopback: connect -> ESTABLISHED, negotiated version ========= */
     char url[64];
     moq_endpoint_cfg_t c = client_cfg(url, sizeof(url), port);

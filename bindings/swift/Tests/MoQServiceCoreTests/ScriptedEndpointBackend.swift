@@ -93,6 +93,16 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         tripwireLocked("fatalCode")
         return scriptedFatalCode
     }
+    /// Explicit terminal-reason override; when nil, mirror the old
+    /// isFatal/fatalCode mapping so existing fatal/closed tests are unchanged.
+    var scriptedTerminal: TerminalFailure?
+    var terminalFailure: TerminalFailure {
+        cond.lock()
+        defer { cond.unlock() }
+        tripwireLocked("terminalFailure")
+        if let scriptedTerminal { return scriptedTerminal }
+        return scriptedFatal ? .protocolFatal(code: scriptedFatalCode) : .clean
+    }
 
     func setInterrupted(_ value: Bool) {
         cond.lock()
@@ -190,11 +200,13 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     /// Scripted state transition. Marks activity by default, like the real
     /// endpoint (state changes happen on pump cycles, which mark activity).
     func script(state: MoQEndpoint.State, fatal: Bool = false, code: UInt64 = 0,
-                version: MoQVersion? = nil, markActivity: Bool = true) {
+                version: MoQVersion? = nil, markActivity: Bool = true,
+                terminal: TerminalFailure? = nil) {
         cond.lock()
         scriptedState = state
         scriptedFatal = fatal
         scriptedFatalCode = code
+        scriptedTerminal = terminal
         if let version { scriptedVersion = version }
         if markActivity { wakeFlag = true }
         cond.broadcast()
