@@ -199,6 +199,69 @@ static int test_destroy_clears_callback(void)
     return failures;
 }
 
+/* Drive the fake pair to quiescence (mirrors the conformance vt_pump_quiescent
+ * loop). Returns 0 once no side makes further progress, -1 if it never settles. */
+static int pump_quiescent(fake_pq_pair_t *pair)
+{
+    for (int i = 0; i < 128; i++)
+        if (!fake_pq_pair_pump_once(pair)) return 0;
+    return -1;
+}
+
+/* Control stream on a NON-ZERO client-initiated bidi stream.
+ *
+ * A peer that reserves client bidi stream 0 -- e.g. Apple's Network.framework,
+ * whose NWConnectionGroup keeps stream 0 for itself and hands out client
+ * streams from 4 -- opens the MoQ control stream on stream 4. MoQT-16 §6.1
+ * identifies the control stream as "the first stream opened is a
+ * client-initiated bidirectional control stream ... which begins with
+ * CLIENT_SETUP" (by position, not a fixed QUIC stream id). The adapter must
+ * accept CLIENT_SETUP there rather than looking only at stream 0. */
+static int test_control_on_nonzero_bidi(void)
+{
+    int failures = 0;
+    fake_pq_pair_t pair;
+    PQ_CHECK(fake_pq_pair_create(&pair) == 0);
+
+    /* Reserve client bidi stream 0: the control stream now lands on stream 4. */
+    pair.client_side.next_bidi_id = 4;
+
+    PQ_CHECK(moq_session_start(pair.client_session, pair.now) >= 0);
+    PQ_CHECK(pump_quiescent(&pair) == 0);
+    PQ_CHECK(!moq_pq_conn_is_fatal(pair.client_conn));
+    PQ_CHECK(!moq_pq_conn_is_fatal(pair.server_conn));
+
+    /* SETUP completes despite control living on stream 4 -- the server accepted
+     * CLIENT_SETUP there instead of rejecting/misrouting it as request data. */
+    PQ_CHECK(moq_session_state(pair.client_session) == MOQ_SESS_ESTABLISHED);
+    PQ_CHECK(moq_session_state(pair.server_session) == MOQ_SESS_ESTABLISHED);
+    /* Prove control really used the non-zero stream: exactly one client bidi
+     * opened, at id 4 (next advanced 4 -> 8). */
+    PQ_CHECK(pair.client_side.next_bidi_id == 8);
+
+    fake_pq_pair_destroy(&pair);
+    return failures;
+}
+
+/* Regression: the ordinary case -- control on client bidi stream 0 -- still
+ * establishes (the first-client-bidi latch resolves to 0). */
+static int test_control_on_stream_zero(void)
+{
+    int failures = 0;
+    fake_pq_pair_t pair;
+    PQ_CHECK(fake_pq_pair_create(&pair) == 0);   /* default: next bidi id = 0 */
+
+    PQ_CHECK(moq_session_start(pair.client_session, pair.now) >= 0);
+    PQ_CHECK(pump_quiescent(&pair) == 0);
+
+    PQ_CHECK(moq_session_state(pair.client_session) == MOQ_SESS_ESTABLISHED);
+    PQ_CHECK(moq_session_state(pair.server_session) == MOQ_SESS_ESTABLISHED);
+    PQ_CHECK(pair.client_side.next_bidi_id == 4);   /* control took stream 0 */
+
+    fake_pq_pair_destroy(&pair);
+    return failures;
+}
+
 int main(void)
 {
     int total = 0;
@@ -207,6 +270,8 @@ int main(void)
     total += test_cfg_init_abi();
     total += test_closed_rejects_late_callbacks();
     total += test_destroy_clears_callback();
+    total += test_control_on_nonzero_bidi();
+    total += test_control_on_stream_zero();
 
     {
         moq_adapter_pair_t p = fake_pq_conformance_create();

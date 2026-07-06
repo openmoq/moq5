@@ -27,6 +27,13 @@ struct moq_pq_conn {
     moq_transport_bridge_t     *bridge;
     moq_transport_endpoint_ops_t endpoint_ops;
     pq_endpoint_ctx_t           endpoint_ctx;
+
+    /* Bidi-control profiles (draft-16): the control stream is the FIRST
+     * client-initiated bidirectional stream, identified by position/content
+     * (MoQT §6.1) rather than a fixed QUIC stream ID. Latched on first sight
+     * (UINT64_MAX = not yet seen) so peers that carry control on a non-zero
+     * bidi stream interoperate. */
+    uint64_t                    control_bidi_id;
 };
 
 /* -- Helpers -------------------------------------------------------- */
@@ -91,6 +98,7 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
     c->session = cfg->session;
     c->cnx = cfg->cnx;
     c->alloc = *cfg->alloc;
+    c->control_bidi_id = UINT64_MAX;   /* no control stream latched yet */
     if (cfg->struct_size >= offsetof(moq_pq_conn_cfg_t, user_ctx) +
         sizeof(cfg->user_ctx))
         c->user_ctx = cfg->user_ctx;
@@ -223,14 +231,25 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
 
         if (is_bidi) {
             /* Control routing is profile-dependent. Bidi-control profiles
-             * (draft-16) carry control on client-initiated bidi stream 0
-             * (matched in both directions: the peer's stream 0 and the
-             * read half of our own). Uni-control-pair profiles (draft-18)
-             * carry control on unidirectional streams the bridge
-             * classifies itself -- every bidi stream is a request stream
-             * there, including stream 0. */
-            bool is_control = (stream_id == 0) &&
-                !moq_transport_bridge_uses_uni_control(c->bridge);
+             * (draft-16) carry control on the FIRST client-initiated
+             * bidirectional stream (MoQT §6.1: "The first stream opened is a
+             * client-initiated bidirectional control stream ... which begins
+             * with CLIENT_SETUP" -- identified by position, not a fixed QUIC
+             * stream ID). We latch that stream on first sight and route it to
+             * on_peer_control_bytes in both directions; every other bidi
+             * stream is a request stream. This matches stream 0 for a peer
+             * that opens control first (the common case) while also accepting
+             * peers that reserve stream 0 and carry control on a higher bidi
+             * stream (e.g. Apple's Network.framework). Uni-control-pair
+             * profiles (draft-18) classify control among unidirectional
+             * streams, so every bidi stream is a request stream. */
+            bool uni_control = moq_transport_bridge_uses_uni_control(c->bridge);
+            if (!uni_control && c->control_bidi_id == UINT64_MAX &&
+                PICOQUIC_IS_CLIENT_STREAM_ID(stream_id)) {
+                c->control_bidi_id = stream_id;
+            }
+            bool is_control = !uni_control &&
+                stream_id == c->control_bidi_id;
 
             if (is_control) {
                 moq_transport_bridge_on_peer_control_bytes(
