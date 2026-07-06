@@ -62,7 +62,7 @@ struct SenderAttachTests {
             backend: ScriptedSenderBackend())
         await second.close()
 
-        await #expect(throws: MoQServiceError.unsupported) {
+        #expect(throws: MoQServiceError.unsupported) {
             _ = try MediaSender.attach(
                 to: rig.endpoint, configuration: .live(namespace: "live/x"))
         }
@@ -243,7 +243,7 @@ struct SenderLosslessTests {
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("The budget is exact: slices consume it, then wouldBlock surfaces")
     func losslessBudgetExhaustion() async throws {
-        var config = MediaSender.Configuration(
+        let config = MediaSender.Configuration(
             namespace: "live/cam1",
             sendPolicy: .lossless(timeout: .milliseconds(100)))
         let rig = try makeSenderRig(configuration: config)
@@ -288,7 +288,7 @@ struct SenderLosslessTests {
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Never-ready lossless writes exhaust the budget into wouldBlock")
     func losslessNeverReadyTimesOut() async throws {
-        var config = MediaSender.Configuration(
+        let config = MediaSender.Configuration(
             namespace: "live/cam1",
             sendPolicy: .lossless(timeout: .milliseconds(100)))
         let rig = try makeSenderRig(configuration: config)

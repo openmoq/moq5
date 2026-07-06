@@ -82,7 +82,7 @@ struct ReceiverAttachTests {
     func publicAttachUnsupported() async throws {
         let rig = try makeRig()
         await rig.receiver.close()
-        await #expect(throws: MoQServiceError.unsupported) {
+        #expect(throws: MoQServiceError.unsupported) {
             _ = try MediaReceiver.attach(
                 to: rig.endpoint, configuration: .live(namespace: "live/cam1"))
         }

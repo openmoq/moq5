@@ -232,6 +232,32 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 
+# Stage the upstream picoquic static archives into the prefix libdir. The
+# generated pkg-config files reference them with -L${libdir} (-lpicoquic-core
+# / -lpicoquic-log in libmoq.pc, plus -lpicohttp-core in the pico WT .pc), but
+# picoquic ships no install rules -- so without this a clean
+# `pkg-config --libs libmoq` link fails with "library 'picoquic-core' not
+# found". In source-tree mode they are add_subdirectory targets we can stage;
+# imported/system picoquic provides its own library location (out of scope).
+if(MOQ_PICOQUIC_SOURCE_DIR)
+    set(_moq_pq_install_archives "")
+    foreach(_moq_pq_target picoquic-core picoquic-log)
+        if(TARGET ${_moq_pq_target})
+            list(APPEND _moq_pq_install_archives ${_moq_pq_target})
+        endif()
+    endforeach()
+    # picohttp-core (picoquic HTTP/3) is only built and referenced when a
+    # WebTransport adapter is enabled.
+    if((MOQ_BUILD_ADAPTER_PICO_WT OR MOQ_BUILD_PICO_WT_MANAGED)
+       AND TARGET picohttp-core)
+        list(APPEND _moq_pq_install_archives picohttp-core)
+    endif()
+    foreach(_moq_pq_target IN LISTS _moq_pq_install_archives)
+        install(FILES $<TARGET_FILE:${_moq_pq_target}>
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endforeach()
+endif()
+
 install(FILES LICENSE.txt
     DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
