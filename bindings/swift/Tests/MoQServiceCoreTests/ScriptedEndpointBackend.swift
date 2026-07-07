@@ -66,6 +66,9 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     /// Test hook: called when stop() runs, for cross-backend
     /// teardown-ordering assertions.
     var onStop: (@Sendable () -> Void)?
+    /// Test hook: called when destroy() runs (after stop()), for
+    /// teardown-ordering assertions.
+    var onDestroy: (@Sendable () -> Void)?
 
     // MARK: EndpointBackend -- any-thread surface
 
@@ -191,8 +194,10 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         noteServiceThreadLocked("destroy")
         destroyed = true
         r.destroyCount += 1
+        let hook = onDestroy
         cond.broadcast()
         cond.unlock()
+        hook?()
     }
 
     // MARK: Test control

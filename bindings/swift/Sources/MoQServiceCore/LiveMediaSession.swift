@@ -189,24 +189,33 @@ public final class LiveMediaSession: @unchecked Sendable {
         previous?.cancel()
     }
 
-    /// Stop the active watch and tear it down (receiver then endpoint).
-    /// Suppresses any further state emission from the superseded watch;
-    /// idempotent. Awaits teardown completion.
+    /// Stop the active watch and tear it down (receiver then endpoint),
+    /// awaiting teardown completion. Suppresses any further state emission from
+    /// the superseded watch; idempotent. Exactly ``beginStop()`` followed by
+    /// awaiting its handle.
     public func stop() async {
-        let previous = beginStop()
-        previous?.cancel()
-        await previous?.value
+        await beginStop().value
     }
 
-    /// The synchronous half of ``stop()`` (NSLock is unavailable from async
-    /// contexts): supersede the current watch and hand back its driver to
-    /// cancel and await.
-    private func beginStop() -> Task<Void, Never>? {
+    /// Supersede the active watch and begin its teardown, applied
+    /// **synchronously**: the supersede is in effect before this returns, so a
+    /// ``start(_:)`` called immediately afterward serializes behind the
+    /// teardown — a disconnect→reconnect never runs two live endpoints at once,
+    /// even when the caller cannot `await`.
+    ///
+    /// This is the race-free primitive for a synchronous context (a UI
+    /// disconnect handler): calling `stop()` from a detached `Task` instead
+    /// defers this supersede until that task is scheduled, and a `start()` in
+    /// between would then be cancelled by the late-running stop. Prefer
+    /// `beginStop()` there. Returns the teardown as a handle: ignore it for
+    /// fire-and-forget, or `await …​.value` to wait (which is what `stop()`
+    /// does). Idempotent.
+    @discardableResult
+    public func beginStop() -> Task<Void, Never> {
         lock.lock()
         defer { lock.unlock() }
         generation += 1
         let previous = currentTask
-        currentTask = nil
         currentEndpoint = nil
         currentReceiver = nil
         currentState = nil
@@ -214,7 +223,9 @@ public final class LiveMediaSession: @unchecked Sendable {
         currentSelector = nil
         receivingEmitted = false
         terminalReached = false
-        return previous
+        let teardown = Task { previous?.cancel(); await previous?.value }
+        currentTask = teardown
+        return teardown
     }
 
     // MARK: Driver (one watch)

@@ -394,6 +394,128 @@ struct LiveMediaSessionTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Disconnect (stop) racing reconnect (start): A is fully destroyed before B's factory")
+    func stopThenStartSerializes() async throws {
+        let log = OrderedLog()
+        let gate = TestGate()
+        let factory = WatchFactory(onCreate: { index, watch in
+            log.append("create#\(index)")
+            watch.receiverBackend.onDetach = { log.append("detach#\(index)") }
+            watch.endpointBackend.onStop = {
+                log.append("stop#\(index)")
+                if index == 0 { gate.pass() }   // freeze A's teardown at endpoint stop
+            }
+            watch.endpointBackend.onDestroy = { log.append("destroy#\(index)") }
+        })
+        let session = LiveMediaSession(endpointFactory: factory.make)
+        let collector = StateCollector(session)
+        defer { collector.cancel() }
+
+        // Watch A up to steady state.
+        session.start(liveConfig())
+        #expect(await factory.awaitWatchCount(1))
+        let watchA = factory.watches[0]
+        watchA.endpointBackend.script(state: .established, version: .draft18)
+        watchA.receiverBackend.scriptEvents([.added(1, name: "video"), .catalogReady])
+        watchA.endpointBackend.wake()
+        #expect(await collector.awaitStates {
+            hasCase($0) { if case .awaitingFirstObject = $0 { true } else { false } }
+        })
+
+        // Disconnect: a stop() whose teardown freezes at A's endpoint stop, so
+        // it is provably still in flight.
+        let stopTask = Task { await session.stop() }
+        #expect(await gate.awaitBlocked(count: 1))
+
+        // Reconnect WHILE the stop teardown is frozen. The distinguishing
+        // guarantee: B must NOT start until A's teardown completes, so with
+        // A frozen, B's endpoint factory never runs. (Without the guarantee,
+        // B's endpoint is created here, concurrent with A's live endpoint.)
+        session.start(liveConfig())
+        #expect(await factory.awaitWatchCount(2, ceiling: 0.3) == false)
+
+        // Release A's teardown; only now may B's endpoint factory run.
+        gate.openGate()
+        #expect(await factory.awaitWatchCount(2))
+        _ = await stopTask.value
+
+        // A's receiver detach, endpoint stop, AND destroy all precede B's
+        // factory -> the two endpoints never coexist across the reconnect.
+        let detachA = try #require(log.firstIndex("detach#0"))
+        let stopA = try #require(log.firstIndex("stop#0"))
+        let destroyA = try #require(log.firstIndex("destroy#0"))
+        let createB = try #require(log.firstIndex("create#1"))
+        #expect(detachA < stopA)
+        #expect(stopA < destroyA)
+        #expect(destroyA < createB)
+        #expect(watchA.endpointBackend.snapshot().violations.isEmpty)
+
+        await session.stop()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("beginStop() supersedes synchronously: an immediate start() serializes and the new watch survives")
+    func beginStopThenStartSerializes() async throws {
+        let log = OrderedLog()
+        let gate = TestGate()
+        let factory = WatchFactory(onCreate: { index, watch in
+            log.append("create#\(index)")
+            watch.receiverBackend.onDetach = { log.append("detach#\(index)") }
+            watch.endpointBackend.onStop = {
+                log.append("stop#\(index)")
+                if index == 0 { gate.pass() }
+            }
+            watch.endpointBackend.onDestroy = { log.append("destroy#\(index)") }
+        })
+        let session = LiveMediaSession(endpointFactory: factory.make)
+        let collector = StateCollector(session)
+        defer { collector.cancel() }
+
+        session.start(liveConfig())
+        #expect(await factory.awaitWatchCount(1))
+        let watchA = factory.watches[0]
+        watchA.endpointBackend.script(state: .established, version: .draft18)
+        watchA.receiverBackend.scriptEvents([.added(1, name: "video"), .catalogReady])
+        watchA.endpointBackend.wake()
+        #expect(await collector.awaitStates {
+            hasCase($0) { if case .awaitingFirstObject = $0 { true } else { false } }
+        })
+
+        // The fixed disconnect → reconnect, both synchronous with no Task
+        // between them: beginStop() supersedes NOW, so the immediate start()
+        // serializes behind A's teardown instead of being cancelled by a
+        // late-running stop.
+        let teardown = session.beginStop()
+        session.start(liveConfig())
+
+        // A's teardown is frozen at its endpoint stop, so B cannot start yet.
+        #expect(await gate.awaitBlocked(count: 1))
+        #expect(await factory.awaitWatchCount(2, ceiling: 0.3) == false)
+
+        // Release: A is destroyed, only then is B created.
+        gate.openGate()
+        #expect(await factory.awaitWatchCount(2))
+        _ = await teardown.value
+        let destroyA = try #require(log.firstIndex("destroy#0"))
+        let createB = try #require(log.firstIndex("create#1"))
+        #expect(destroyA < createB)
+
+        // B was NOT cancelled by the supersede — it runs its own watch through
+        // to steady state (a second awaitingFirstObject).
+        let watchB = factory.watches[1]
+        watchB.endpointBackend.script(state: .established, version: .draft18)
+        watchB.receiverBackend.scriptEvents([.added(1, name: "video"), .catalogReady])
+        watchB.endpointBackend.wake()
+        #expect(await collector.awaitStates {
+            $0.filter { if case .awaitingFirstObject = $0 { true } else { false } }
+                .count >= 2
+        })
+        #expect(watchB.endpointBackend.snapshot().stopCount == 0)
+
+        await session.stop()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("stop() suppresses post-stop state emissions and tears down")
     func stopSuppressesEmissions() async throws {
         let factory = WatchFactory()
