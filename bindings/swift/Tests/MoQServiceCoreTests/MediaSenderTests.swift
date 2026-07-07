@@ -270,7 +270,7 @@ struct SenderLosslessTests {
         let rig = try makeSenderRig(configuration: .lossless(namespace: "live/cam1"))
         let track = try await addVideoTrack(rig)
         rig.senderBackend.setReady(false)   /* unscripted writes now block */
-        rig.senderBackend.scriptWaits([.timeout, .activity])
+        rig.senderBackend.setWaitGate(true)
 
         let writer = Task {
             try await rig.sender.write(frame([6], sync: true), to: track)
@@ -278,8 +278,9 @@ struct SenderLosslessTests {
         /* After the first blocked attempt+slice, readiness arrives (the C
          * pump publishes the catalog, marking activity). The loop's next
          * attempts succeed within budget. */
-        #expect(await rig.senderBackend.awaitCondition { $0.waitCalls.count >= 1 })
+        #expect(await rig.senderBackend.awaitWaitBlocked())
         rig.senderBackend.setReady(true)
+        rig.senderBackend.setWaitGate(false)
         try await writer.value
         #expect(rig.senderBackend.snapshot().acceptedPayloads == [Data([6])])
         await rig.endpoint.close()

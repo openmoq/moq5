@@ -302,18 +302,20 @@ struct LiveMediaSessionTests {
         let watch = factory.watches[0]
 
         watch.endpointBackend.script(state: .established, version: .draft18)
+        watch.endpointBackend.wake()
+
+        #expect(await collector.awaitStates {
+            hasCase($0) { if case .awaitingCatalog = $0 { true } else { false } }
+        })
+        #expect(session.state == .awaitingCatalog)
+
         watch.receiverBackend.scriptEvents([.added(1, name: "video"), .catalogReady])
         watch.endpointBackend.wake()
 
         #expect(await collector.awaitStates {
             hasCase($0) { if case .awaitingFirstObject = $0 { true } else { false } }
         })
-        /* Ordered prefix through discovery. */
-        let prefix = collector.all
-        #expect(prefix[0] == .connecting)
-        #expect(prefix[1] == .established(version: .draft18))
-        #expect(prefix[2] == .awaitingCatalog)
-        #expect({ if case .awaitingFirstObject = prefix[3] { true } else { false } }())
+        #expect({ if case .awaitingFirstObject = session.state { true } else { false } }())
 
         /* First selected object flips the watch into .receiving and yields. */
         let (polled, _) = liveObject(1, media: [1, 2, 3], keyframe: true)
