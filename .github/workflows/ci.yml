@@ -44,7 +44,7 @@ jobs:
             cxx: g++
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
@@ -62,7 +62,7 @@ jobs:
     name: Swift Binding (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Default Swift build: SwiftPM compiles the in-tree C core + media
       # sources directly (no CMake/install step needed). Transport targets
@@ -79,7 +79,7 @@ jobs:
     name: Swift Service Binding (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up pinned picoquic/picotls
         run: scripts/setup_picoquic_deps.sh
@@ -142,7 +142,7 @@ jobs:
     name: Swift Service iOS (simulator, macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up pinned picoquic/picotls
         run: scripts/setup_picoquic_deps.sh
@@ -199,7 +199,7 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The `cppbind` preset (inherits rc-static: core + sim + media, no
       # external QUIC adapters) enables MOQ_BUILD_CPP_BINDING and MOQ_BUILD_MSF
@@ -219,7 +219,7 @@ jobs:
     name: picoquic adapter (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
@@ -265,7 +265,7 @@ jobs:
     name: pico_wt adapter (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libssl-dev cmake
@@ -318,7 +318,7 @@ jobs:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       ASAN_OPTIONS: detect_leaks=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake --preset asan
@@ -336,7 +336,7 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # libFuzzer needs Clang's compiler-rt fuzzer runtime. Install it
       # explicitly so the lane is deterministic rather than depending on
@@ -377,7 +377,7 @@ jobs:
       CC: gcc
       CXX: g++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Mirror the asan lane's mechanism: hardening via configure-time
       # CMAKE_*_FLAGS (build-tree-local globals), so nothing leaks into the
@@ -406,7 +406,7 @@ jobs:
     name: Boundary Checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: API boundary
         run: scripts/check_api_boundary.sh
       - name: Profile boundary
@@ -417,7 +417,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-and-test, boundary-checks]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure + Build
         run: |
