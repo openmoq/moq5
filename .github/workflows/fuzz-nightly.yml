@@ -81,7 +81,7 @@ jobs:
       # finding is reproducible with: <target> <reproducer-file>.
       - name: Upload fuzz artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fuzz-artifacts
           path: fuzz-artifacts/**
