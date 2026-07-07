@@ -25,9 +25,14 @@ enum PlayerState: Equatable {
 }
 
 /// The app-level playback state and loop. `@MainActor` so the `@Published`
-/// UI state and the display layer are touched only on the main thread; the
-/// heavy lifting stays inside MoQService's own service thread, which this
-/// loop merely awaits.
+/// UI state and the display layer are touched only on the main thread.
+///
+/// The whole connect → established → discover → select → receive lifecycle —
+/// and the serialized-reconnect teardown that a disconnect→reconnect needs to
+/// avoid running two live sessions at once — now lives in the SDK's
+/// ``LiveMediaSession``. This model just maps ``WatchState`` onto `PlayerState`
+/// for the UI and drives the app-only render pipeline from the session's
+/// object stream. No generation tokens, no manual endpoint/receiver teardown.
 @MainActor
 final class PlayerModel: ObservableObject {
 
@@ -78,19 +83,38 @@ final class PlayerModel: ObservableObject {
     let displayLayer = AVSampleBufferDisplayLayer()
     #endif
 
-    private var playbackTask: Task<Void, Never>?
     private let defaults = UserDefaults.standard
 
+    /// The SDK watch handle: one reusable session for the model's life.
+    /// `LiveMediaSession()` wires `MoQEndpoint.connect` as its endpoint factory.
+    private let session = LiveMediaSession()
+
+    /// Maps the session's `WatchState` onto `PlayerState`; recreated per
+    /// connect so a superseded watch's buffered states never reach the UI.
+    private var stateObserver: Task<Void, Never>?
+    /// The per-watch object → render loop; nil while there is nothing to render.
+    private var renderTask: Task<Void, Never>?
+    /// The last render task after cancellation, so the next one waits for it to
+    /// release the session's single-consumer object claim before iterating.
+    private var previousRender: Task<Void, Never>?
+
     #if canImport(AVFoundation) && canImport(CoreMedia)
-    /// The A/V render + sync pipeline for the active session; nil while idle.
+    /// The A/V render + sync pipeline for the active watch; nil while idle.
     private var pipeline: RenderPipeline?
     #endif
 
-    /// Generation token. Bumped on every connect()/disconnect() so a stale
-    /// task that is still unwinding cannot clobber a newer connection's UI
-    /// state (terminal clears, status). A task's writes apply only while its
-    /// captured `run` is still current.
-    private var runID: Int = 0
+    /// Video is required, audio optional — expressed over the whole track
+    /// snapshot so no-video is a clean `noMatchingTracks` (a "No video" failure)
+    /// while a stream that carries audio gets both tracks selected.
+    private static let videoRequiredSelector = TrackSelector { tracks in
+        guard let video = tracks.first(where: { $0.description.mediaType == .video })
+        else { return [] }
+        var selection = [video]
+        if let audio = tracks.first(where: { $0.description.mediaType == .audio }) {
+            selection.append(audio)
+        }
+        return selection
+    }
 
     init() {
         urlText = defaults.string(forKey: "SimplePlayer.url")
@@ -110,41 +134,213 @@ final class PlayerModel: ObservableObject {
             state = .failed("Invalid URL")
             return
         }
-        let namespace = MediaNamespace(namespaceText)
-        let configuration = makeConfiguration(url: url)
+        let configuration = LiveMediaSession.Configuration(
+            endpoint: makeConfiguration(url: url),
+            namespace: MediaNamespace(namespaceText),
+            selector: Self.videoRequiredSelector)
 
-        runID &+= 1
-        let run = runID
         isRunning = true
+        // Immediate feedback; the observer confirms and advances it as the
+        // session progresses.
+        state = .connecting
         sampleCount = 0
         trackName = nil
         negotiatedVersion = nil
-        state = .connecting
 
-        // Sessions are strictly serial: cancel any prior task and await its
-        // full teardown (endpoint close + pipeline stop) BEFORE dialing, so a
-        // disconnect→reconnect never runs two live sessions against the relay
-        // at once — that overlap is what made the second play's audio stutter.
-        let previous = playbackTask
-        playbackTask = Task { [weak self] in
-            previous?.cancel()
-            _ = await previous?.value
-            guard let self else { return }
-            await self.play(run: run, configuration: configuration,
-                            namespace: namespace)
-        }
+        // start() supersedes any prior watch AND serializes behind an in-flight
+        // stop()'s teardown, so a disconnect→reconnect never runs two live
+        // endpoints at once — the SDK owns what used to be hand-rolled here.
+        session.start(configuration)
+        observeState()
     }
 
     func disconnect() {
-        // Supersede: bump the generation so the in-flight task's terminal
-        // writes no-op, silence the pipeline immediately, and drop to idle. The
-        // task is cancelled and left to unwind (closing its endpoint); it is
-        // kept on `playbackTask` so the next connect() awaits it before dialing.
-        runID &+= 1
         isRunning = false
-        teardownPipeline()
         state = .idle
-        playbackTask?.cancel()
+        cancelObserver()
+        cancelRender()
+        teardownPipeline()
+        // beginStop() applies the supersede SYNCHRONOUSLY (teardown proceeds on
+        // its own), so an immediate reconnect's start() serializes behind it.
+        // A deferred `Task { await stop() }` would instead let that start() run
+        // first and then be cancelled by the late stop — the disconnect race.
+        session.beginStop()
+    }
+
+    // -- State observation ------------------------------------------------
+
+    private func observeState() {
+        cancelObserver()
+        stateObserver = Task { [weak self, session] in
+            for await watchState in session.stateUpdates() {
+                guard let self else { break }
+                if self.apply(watchState) { break }   // stop on a terminal state
+            }
+        }
+    }
+
+    private func cancelObserver() {
+        stateObserver?.cancel()
+        stateObserver = nil
+    }
+
+    /// Map one `WatchState` onto the UI. Returns `true` for a terminal state,
+    /// which ends the observer (a superseded watch's late states can't leak).
+    private func apply(_ watchState: WatchState) -> Bool {
+        switch watchState {
+        case .connecting:
+            state = .connecting
+            sampleCount = 0
+            trackName = nil
+            negotiatedVersion = nil
+            cancelRender()
+            teardownPipeline()
+            return false
+        case .established:
+            state = .established
+            refreshVersion()
+            return false
+        case .awaitingCatalog:
+            state = .waitingForMedia
+            refreshVersion()
+            return false
+        case .awaitingFirstObject(let tracks):
+            state = .waitingForMedia
+            refreshVersion()
+            trackName = trackName ?? videoName(in: tracks)
+            startRender()
+            return false
+        case .receiving(let tracks):
+            state = .playing
+            trackName = trackName ?? videoName(in: tracks)
+            startRender()
+            return false
+        case .noMatchingTracks:
+            finishWatch(.failed("No video track in the stream catalog"))
+            return true
+        case .ended:
+            finishWatch(.ended)
+            return true
+        case .failed(let error):
+            finishWatch(.failed(describe(error)))
+            return true
+        }
+    }
+
+    private func finishWatch(_ terminal: PlayerState) {
+        state = terminal
+        isRunning = false
+        cancelRender()
+        teardownPipeline()
+    }
+
+    /// Read the negotiated version off the live endpoint (the durable fact),
+    /// not the transient `.established` payload — a coalescing state stream may
+    /// drop that state, but the endpoint keeps answering.
+    private func refreshVersion() {
+        if negotiatedVersion == nil,
+           let version = session.endpoint?.negotiatedVersion {
+            negotiatedVersion = String(describing: version)
+        }
+    }
+
+    private func videoName(in tracks: [MediaTrack]) -> String? {
+        tracks.first { $0.description.mediaType == .video }?.description.name
+    }
+
+    // -- Rendering (app-only; the SDK vends objects, not sample buffers) ---
+
+    /// Start the object → render loop for the current watch (idempotent within
+    /// a watch). It serializes behind the previous watch's render task so the
+    /// session's single-consumer object claim is released before re-iterating.
+    private func startRender() {
+        guard renderTask == nil else { return }
+        let cleanup = previousRender
+        renderTask = Task { [weak self] in
+            await cleanup?.value
+            guard let self, !Task.isCancelled else { return }
+            await self.renderObjects()
+        }
+    }
+
+    private func cancelRender() {
+        guard let task = renderTask else { return }
+        task.cancel()
+        previousRender = task        // its unwind releases the object claim
+        renderTask = nil
+    }
+
+    #if canImport(CoreMedia)
+    /// Route each object to the video or audio renderer by media type, building
+    /// each renderer's format description once. Audio is best-effort — a stream
+    /// can carry an audio track whose catalog lacks the fields CoreMedia needs,
+    /// so we fall back to video-only rather than fail the whole session. The
+    /// object stream ends (or throws) when the watch ends; the state observer
+    /// owns the resulting `PlayerState`, so errors here are swallowed.
+    private func renderObjects() async {
+        var videoFormat: CMFormatDescription?
+        var audioFormat: CMFormatDescription?
+        #if canImport(AVFoundation)
+        let pipeline = RenderPipeline(displayLayer: displayLayer)
+        self.pipeline = pipeline
+        #endif
+        do {
+            for try await object in session.objects {
+                let description = object.track.description
+                switch description.mediaType {
+                case .video:
+                    if videoFormat == nil {
+                        videoFormat = try description.makeFormatDescription()
+                    }
+                    let sample = try object.makeSampleBuffer(
+                        formatDescription: videoFormat!)
+                    #if canImport(AVFoundation)
+                    pipeline.enqueueVideo(sample)
+                    #endif
+                    sampleCount += 1
+                case .audio:
+                    if audioFormat == nil,
+                       let format = try? description.makeFormatDescription() {
+                        audioFormat = format
+                        #if canImport(AVFoundation)
+                        pipeline.attachAudio()
+                        #endif
+                    }
+                    if let audioFormat {
+                        let sample = try object.makeSampleBuffer(
+                            formatDescription: audioFormat)
+                        #if canImport(AVFoundation)
+                        pipeline.enqueueAudio(sample)
+                        #endif
+                    }
+                }
+            }
+        } catch {
+            // Terminal/interrupted object stream; the state observer maps it.
+        }
+    }
+    #else
+    /// Non-CoreMedia platforms (Linux): count video access units so the UI has
+    /// a liveness signal, without any rendering.
+    private func renderObjects() async {
+        do {
+            for try await object in session.objects
+                where object.track.description.mediaType == .video {
+                if !object.mediaData.isEmpty { sampleCount += 1 }
+            }
+        } catch {
+            // Terminal/interrupted object stream; the state observer maps it.
+        }
+    }
+    #endif
+
+    /// Tear down the active render pipeline, freeing the shared display layer
+    /// to join a fresh pipeline on the next watch.
+    private func teardownPipeline() {
+        #if canImport(AVFoundation) && canImport(CoreMedia)
+        pipeline?.stop()
+        pipeline = nil
+        #endif
     }
 
     // -- Configuration mapping --------------------------------------------
@@ -181,214 +377,33 @@ final class PlayerModel: ObservableObject {
         return configuration
     }
 
-    // -- The playback loop -------------------------------------------------
-
-    /// True only while `run` is the newest connect()/disconnect() generation.
-    private func isCurrent(_ run: Int) -> Bool { run == runID }
-
-    private func play(run: Int, configuration: MoQEndpoint.Configuration,
-                      namespace: MediaNamespace) async {
-        let outcome: PlayerState
-        do {
-            let endpoint = try MoQEndpoint.connect(configuration: configuration)
-            outcome = await receive(
-                run: run, endpoint: endpoint, namespace: namespace)
-        } catch is CancellationError {
-            outcome = .idle
-        } catch {
-            outcome = .failed(describe(error))
-        }
-        // Terminal UI state: apply only if this task is still current. A
-        // newer connect()/disconnect() has already installed its own state.
-        guard isCurrent(run) else { return }
-        playbackTask = nil
-        isRunning = false
-        teardownPipeline()
-        state = outcome
-    }
-
-    /// established -> receiver -> catalog -> select video (+ audio) tracks ->
-    /// format descriptions -> for-await objects routed by role -> render
-    /// pipeline. The core MoQService shape, wrapped in app state. Owns the
-    /// endpoint's teardown on every path and returns the terminal state.
-    private func receive(
-        run: Int, endpoint: MoQEndpoint, namespace: MediaNamespace
-    ) async -> PlayerState {
-        do {
-            try await endpoint.established()
-            // Bail before attaching if superseded/cancelled during the
-            // establish await (the next cancellation-aware await is inside
-            // the discovery/object loops, so guard the gap explicitly).
-            guard isCurrent(run), !Task.isCancelled else {
-                await endpoint.close()
-                return .idle
-            }
-            state = .established
-            negotiatedVersion = endpoint.negotiatedVersion
-                .map(String.init(describing:))
-
-            // .live(namespace:) auto-subscribes every discovered track and
-            // drops to the latest keyframe under pressure — the right preset
-            // for a live viewer.
-            let receiver = try MediaReceiver.attach(
-                to: endpoint, configuration: .live(namespace: namespace))
-            state = .waitingForMedia
-
-            let selection = try await selectTracks(receiver, run: run)
-            guard let video = selection.video else {
-                await receiver.close()
-                await endpoint.close()
-                return .failed("No video track in the stream catalog")
-            }
-            if isCurrent(run) {
-                trackName = video.description.name
-            }
-
-            #if canImport(CoreMedia)
-            let outcome = try await pump(
-                run: run, receiver: receiver,
-                video: video, audio: selection.audio)
-            #else
-            let outcome = try await countOnly(
-                run: run, receiver: receiver, video: video)
-            #endif
-
-            await receiver.close()
-            await endpoint.close()
-            return outcome
-        } catch is CancellationError {
-            await endpoint.close()
-            return .idle
-        } catch {
-            await endpoint.close()
-            return .failed(describe(error))
-        }
-    }
-
-    /// Drain discovery until the catalog is fully enumerated, then pick the
-    /// first video track and the first audio track. Waiting for `catalogReady`
-    /// (rather than returning on the first video event) is what lets a stream's
-    /// audio be discovered before playback begins — an audio-only decision
-    /// can't be made from a single video event. Selection lives here, apart
-    /// from the render pipeline, so a later ABR rendition switch changes only
-    /// this step.
-    private func selectTracks(
-        _ receiver: MediaReceiver, run: Int
-    ) async throws -> (video: MediaTrack?, audio: MediaTrack?) {
-        for try await event in receiver.trackEvents {
-            guard isCurrent(run), !Task.isCancelled else { break }
-            if case .catalogReady = event { break }
-        }
-        let tracks = receiver.tracks
-        return (tracks.first { $0.description.mediaType == .video },
-                tracks.first { $0.description.mediaType == .audio })
-    }
-
-    #if canImport(CoreMedia)
-    /// The object loop: route each object to the video or audio renderer by
-    /// track identity, building each renderer's format description once. Audio
-    /// is best-effort — a stream can carry an audio track whose catalog lacks
-    /// the fields CoreMedia needs, so we fall back to video-only rather than
-    /// fail the whole session.
-    private func pump(
-        run: Int, receiver: MediaReceiver,
-        video: MediaTrack, audio: MediaTrack?
-    ) async throws -> PlayerState {
-        let videoFormat = try video.description.makeFormatDescription()
-
-        var audioTrack: MediaTrack?
-        var audioFormat: CMFormatDescription?
-        if let audio,
-           let format = try? audio.description.makeFormatDescription() {
-            audioTrack = audio
-            audioFormat = format
-        }
-
-        #if canImport(AVFoundation)
-        let pipeline = RenderPipeline(displayLayer: displayLayer)
-        if audioFormat != nil { pipeline.attachAudio() }
-        self.pipeline = pipeline
-        #endif
-
-        for try await object in receiver.objects {
-            // Stop as soon as this task is superseded or cancelled; no
-            // suspension follows before the state writes, so runID is stable
-            // through the rest of the iteration.
-            guard isCurrent(run), !Task.isCancelled else { break }
-            if object.track === video {
-                let sample = try object.makeSampleBuffer(
-                    formatDescription: videoFormat)
-                #if canImport(AVFoundation)
-                pipeline.enqueueVideo(sample)
-                #endif
-                sampleCount += 1
-                if state != .playing { state = .playing }
-            } else if let audioTrack, object.track === audioTrack,
-                      let audioFormat {
-                let sample = try object.makeSampleBuffer(
-                    formatDescription: audioFormat)
-                #if canImport(AVFoundation)
-                pipeline.enqueueAudio(sample)
-                #endif
-            }
-        }
-        return isCurrent(run) ? .ended : .idle
-    }
-    #else
-    /// Non-CoreMedia platforms (Linux): count video access units so the UI has
-    /// a liveness signal, without any rendering.
-    private func countOnly(
-        run: Int, receiver: MediaReceiver, video: MediaTrack
-    ) async throws -> PlayerState {
-        for try await object in receiver.objects where object.track === video {
-            guard isCurrent(run), !Task.isCancelled else { break }
-            if !object.mediaData.isEmpty { sampleCount += 1 }
-            if state != .playing { state = .playing }
-        }
-        return isCurrent(run) ? .ended : .idle
-    }
-    #endif
-
-    /// Tear down the active render pipeline, freeing the shared display layer
-    /// to join a fresh pipeline on the next connection.
-    private func teardownPipeline() {
-        #if canImport(AVFoundation) && canImport(CoreMedia)
-        pipeline?.stop()
-        pipeline = nil
-        #endif
-    }
-
     /// Give the most common connection failures a human sentence; fall back
     /// to the error's own description for the rest.
-    private func describe(_ error: Error) -> String {
-        if let serviceError = error as? MoQServiceError {
-            switch serviceError {
-            case .interrupted:
-                return "Connection interrupted"
-            case .closed:
-                return "Connection closed"
-            case .unsupported:
-                return "Unsupported media format (CMAF playback is not " +
-                       "wired up yet — use a RAW/LOC stream)"
-            // The SDK now classifies why a connection failed, so the app can
-            // report it truthfully instead of guessing from an opaque code.
-            case .connectionFailed(let failure):
-                switch failure.kind {
-                case .certificateUnverified:
-                    return "The server's certificate could not be verified. " +
-                           "On iOS, set a CA bundle in Advanced."
-                case .tls:
-                    return "TLS handshake failed (0x\(String(failure.code, radix: 16)))"
-                case .transport:
-                    return "Could not reach the relay"
-                }
-            case .invalidArgument(let message):
-                return message
-            default:
-                return String(describing: serviceError)
+    private func describe(_ error: MoQServiceError) -> String {
+        switch error {
+        case .interrupted:
+            return "Connection interrupted"
+        case .closed:
+            return "Connection closed"
+        case .unsupported:
+            return "Unsupported media format (CMAF playback is not " +
+                   "wired up yet — use a RAW/LOC stream)"
+        // The SDK classifies why a connection failed, so the app can report it
+        // truthfully instead of guessing from an opaque code.
+        case .connectionFailed(let failure):
+            switch failure.kind {
+            case .certificateUnverified:
+                return "The server's certificate could not be verified. " +
+                       "On iOS, set a CA bundle in Advanced."
+            case .tls:
+                return "TLS handshake failed (0x\(String(failure.code, radix: 16)))"
+            case .transport:
+                return "Could not reach the relay"
             }
+        case .invalidArgument(let message):
+            return message
+        default:
+            return String(describing: error)
         }
-        return String(describing: error)
     }
-
 }
