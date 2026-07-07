@@ -86,6 +86,43 @@ if grep -q '^TAP version\|^1\.\.\|^\(ok\|not ok\) ' "$TMPERR"; then
     fail "subscribe-before-announce TAP leaked to stderr"
 fi
 
+# -- 5: invalid --draft (trailing junk) → exit 1, validation error --
+
+RC=0
+"$BIN" --relay moqt://127.0.0.1:9 --draft 16junk >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "--draft 16junk exit code $RC, expected 1"
+fi
+if ! grep -q 'must be exactly 16 or 18' "$TMPERR"; then
+    fail "--draft 16junk missing validation error"
+fi
+
+# -- 6: invalid MOQT_DRAFT (non-numeric) → exit 1, validation error --
+
+RC=0
+MOQT_DRAFT=abc "$BIN" --relay moqt://127.0.0.1:9 --test setup-only \
+    >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "MOQT_DRAFT=abc exit code $RC, expected 1"
+fi
+if ! grep -q 'must be exactly 16 or 18' "$TMPERR"; then
+    fail "MOQT_DRAFT=abc missing validation error"
+fi
+
+# -- 7: --help → exit 0, usage shape (mentions --draft) --
+
+RC=0
+"$BIN" --help >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 0 ]; then
+    fail "--help exit code $RC, expected 0"
+fi
+if ! grep -q 'Usage:' "$TMPERR"; then
+    fail "--help missing usage text"
+fi
+if ! grep -q -- '--draft' "$TMPERR"; then
+    fail "--help usage missing --draft"
+fi
+
 # -- Summary --
 
 if [ "$FAILURES" -gt 0 ]; then
@@ -93,4 +130,4 @@ if [ "$FAILURES" -gt 0 ]; then
     exit 1
 fi
 
-echo "PASS: smoke_interop_client (4 checks)"
+echo "PASS: smoke_interop_client (7 checks)"

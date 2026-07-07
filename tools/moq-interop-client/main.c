@@ -17,6 +17,7 @@
 #include <moq/endpoint.h>
 #include <moq/session.h>
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -24,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Monotonic clock                                                     */
@@ -119,7 +121,29 @@ static void ctx_destroy(test_ctx_t *c)
 static moq_bytes_t ns_interop_parts[] = {
     { (const uint8_t *)"moq-test", 8 },
     { (const uint8_t *)"interop", 7 },
+    { NULL, 0 },   /* optional per-case label; see set_case_ns() */
 };
+static size_t ns_interop_count = 2;
+
+/* Run-all runs every case in one process against one relay. If they all shared
+ * the "moq-test/interop" namespace, a case that announces it and then tears the
+ * session down (currently without a graceful CONNECTION_CLOSE) leaves the relay
+ * holding that namespace until its idle timeout, so the NEXT announce-case
+ * collides ("namespace rejected"). Giving each case a distinct 3rd label keeps
+ * them independent regardless of teardown timing. NULL/empty -> 2-part (the
+ * single-case default, unchanged). */
+static void set_case_ns(const char *tag)
+{
+    if (tag && *tag) {
+        ns_interop_parts[2].data = (const uint8_t *)tag;
+        ns_interop_parts[2].len  = strlen(tag);
+        ns_interop_count = 3;
+    } else {
+        ns_interop_parts[2].data = NULL;
+        ns_interop_parts[2].len  = 0;
+        ns_interop_count = 2;
+    }
+}
 
 static moq_bytes_t ns_nonexistent_parts[] = {
     { (const uint8_t *)"nonexistent", 11 },
@@ -175,7 +199,7 @@ static moq_result_t interop_pump_task(moq_endpoint_t *ep, moq_session_t *sess,
         moq_publish_namespace_cfg_t ncfg;
         moq_publish_namespace_cfg_init(&ncfg);
         ncfg.track_namespace.parts = ns_interop_parts;
-        ncfg.track_namespace.count = 2;
+        ncfg.track_namespace.count = ns_interop_count;
         moq_announcement_t ann;
         moq_result_t rc = moq_session_publish_namespace(sess, &ncfg, now, &ann);
         pthread_mutex_lock(&c->mu);
@@ -324,6 +348,7 @@ typedef struct {
     const char *test_name;
     bool        tls_disable_verify;
     bool        verbose;
+    int         draft;   /* 0 = auto (offer every draft); 16/18 = pin exactly */
 } cli_opts_t;
 
 static void print_usage(const char *prog)
@@ -333,31 +358,48 @@ static void print_usage(const char *prog)
         "\n"
         "  --relay URL             moqt://host:port (raw QUIC) or\n"
         "                          https://host:port/path (WebTransport)\n"
-        "  --test NAME             test case name\n"
+        "  --test NAME             test case name (default: run all cases)\n"
+        "  --draft N               pin the offered draft to 16 or 18\n"
+        "                          (default: offer every draft, negotiate one)\n"
         "  --tls-disable-verify    skip TLS certificate verification\n"
         "  --verbose               print session state and events to stderr\n"
         "  --help                  show this help\n"
         "\n"
         "Environment fallback (CLI wins):\n"
-        "  RELAY_URL, TESTCASE, TLS_DISABLE_VERIFY=1\n"
+        "  RELAY_URL, TESTCASE, MOQT_DRAFT, TLS_DISABLE_VERIFY=1\n"
         "\n"
-        "Transport (raw QUIC vs WebTransport) and draft version (16/18) are\n"
-        "selected automatically: the scheme picks the transport, and the\n"
-        "endpoint offers every draft this build supports and negotiates one.\n"
+        "Transport (raw QUIC vs WebTransport) is selected automatically from the\n"
+        "URL scheme. The draft version is auto-negotiated (the endpoint offers\n"
+        "every draft this build supports) unless pinned with --draft/MOQT_DRAFT.\n"
         "\n"
         "Supported: setup-only, announce-only, publish-namespace-done,\n"
         "  subscribe-error, announce-subscribe, subscribe-before-announce\n",
         prog);
 }
 
+/* Strict draft parse: NULL/empty -> 0 (auto), exactly "16" or "18" -> that
+ * draft, anything else -> -1 (rejected). atoi would silently accept "16junk"
+ * as 16 and "abc" as 0 (auto), falsifying per-draft interop results. */
+static int parse_draft(const char *s)
+{
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (*end != '\0' || (v != 16 && v != 18)) return -1;
+    return (int)v;
+}
+
 static cli_opts_t parse_cli(int argc, char **argv)
 {
     cli_opts_t opts = {0};
+    const char *draft_str = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc)
             opts.relay_url = argv[++i];
         else if (strcmp(argv[i], "--test") == 0 && i + 1 < argc)
             opts.test_name = argv[++i];
+        else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc)
+            draft_str = argv[++i];
         else if (strcmp(argv[i], "--tls-disable-verify") == 0)
             opts.tls_disable_verify = true;
         else if (strcmp(argv[i], "--verbose") == 0)
@@ -372,9 +414,23 @@ static cli_opts_t parse_cli(int argc, char **argv)
     }
     if (!opts.relay_url) opts.relay_url = getenv("RELAY_URL");
     if (!opts.test_name) opts.test_name = getenv("TESTCASE");
+    /* No test named (bare `make test`, which sets RELAY_URL but no TESTCASE):
+     * leave test_name NULL so main() runs the whole suite, like the other
+     * interop clients (moq-rs, imquic, ...). */
     if (!opts.tls_disable_verify) {
         const char *env = getenv("TLS_DISABLE_VERIFY");
         if (env && strcmp(env, "1") == 0) opts.tls_disable_verify = true;
+    }
+    /* Draft pin: --draft wins, else MOQT_DRAFT, else auto (offer all). */
+    if (!draft_str) {
+        const char *env = getenv("MOQT_DRAFT");
+        if (env && *env) draft_str = env;
+    }
+    opts.draft = parse_draft(draft_str);
+    if (opts.draft < 0) {
+        fprintf(stderr, "error: --draft/MOQT_DRAFT must be exactly 16 or 18 "
+                "(got \"%s\"); omit for auto-negotiation\n", draft_str);
+        exit(1);
     }
     return opts;
 }
@@ -423,9 +479,14 @@ static void tap_negotiated(moq_endpoint_t *ep, const char *url)
 /* Endpoint helpers                                                     */
 /* ------------------------------------------------------------------ */
 
+/* Draft to pin for this run: 0 = auto (offer every draft this build supports),
+ * 16/18 = offer exactly that one. Set once from the CLI/env in main(). */
+static int g_draft_pin = 0;
+
 /* Create + start an endpoint. Transport, draft offer, and TLS are all owned
  * by the endpoint: AUTO protocol derives the transport from the URL scheme;
- * the zero-init version offer means "offer every draft this build supports". */
+ * the zero-init version offer means "offer every draft this build supports"
+ * unless a specific draft was pinned (--draft / MOQT_DRAFT). */
 static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
 {
     moq_endpoint_cfg_t cfg;
@@ -434,6 +495,18 @@ static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
     cfg.protocol = MOQ_TRANSPORT_PROTOCOL_AUTO;
     cfg.backend = MOQ_TRANSPORT_BACKEND_AUTO;
     /* cfg.versions left zero-init == MOQ_VERSION_POLICY_AUTO (offer all). */
+    if (g_draft_pin != 0) {
+        /* EXACT offer: propose only the pinned draft; a peer that can't speak
+         * it fails the connect (that is the point of a pinned interop run).
+         * The offer is copied by connect, so a static single-element array is
+         * a safe backing store for the borrowed pointer. */
+        static moq_version_t pinned;
+        pinned = (moq_version_t)g_draft_pin;
+        cfg.versions.struct_size  = sizeof(moq_version_offer_t);
+        cfg.versions.policy       = MOQ_VERSION_POLICY_EXACT;
+        cfg.versions.versions     = &pinned;
+        cfg.versions.version_count = 1;
+    }
     cfg.insecure_skip_verify = insecure;
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     /* cfg.sni empty -> defaults to URL host; cfg.wt_path empty -> URL path. */
@@ -837,7 +910,7 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
     ctx_init(&pub_ctx, TEST_ANNOUNCE_ONLY, verbose, "pub");
     ctx_init(&sub_ctx, TEST_SUBSCRIBE_ERROR, verbose, "sub");
     sub_ctx.subscribe_ns = ns_interop_parts;
-    sub_ctx.subscribe_ns_count = 2;
+    sub_ctx.subscribe_ns_count = ns_interop_count;
     pub_ctx.req_accept_sub = true;
 
     moq_endpoint_t *pub_ep = NULL, *sub_ep = NULL;
@@ -980,6 +1053,15 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
             bool closed = pub_ctx.session_closed;
             pthread_mutex_unlock(&pub_ctx.mu);
             if (sent || afail) break;
+            if (subscribe_first) {
+                /* Premature SUBSCRIBE rejected by the relay -> the publisher
+                 * will never see one to accept; stop waiting (that rejection
+                 * is the expected outcome, resolved below). */
+                pthread_mutex_lock(&sub_ctx.mu);
+                bool serr_early = sub_ctx.subscribe_error;
+                pthread_mutex_unlock(&sub_ctx.mu);
+                if (serr_early) break;
+            }
             if (closed || moq_endpoint_is_closed(pub_ep)) { ar = "session closed"; break; }
             if (moq_endpoint_is_fatal(pub_ep)) { ar = "fatal"; break; }
             uint64_t now = now_us_mono();
@@ -997,9 +1079,21 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
         int arc = pub_ctx.accept_sub_rc;
         pthread_mutex_unlock(&pub_ctx.mu);
 
-        if (afail)       { FAIL(3, "accept_subscribe failed: %d", arc); goto emit; }
-        else if (asent)  { PASS(3, "SUBSCRIBE accepted"); }
-        else             { FAIL(3, "%s", ar); goto emit; }
+        /* subscribe-before-announce: a relay that rejected the premature
+         * SUBSCRIBE correctly leaves the publisher with nothing to accept.
+         * Treat that as the expected pass; step 5 then confirms the
+         * SUBSCRIBE_ERROR the subscriber saw. */
+        bool sub_rejected = false;
+        if (subscribe_first) {
+            pthread_mutex_lock(&sub_ctx.mu);
+            sub_rejected = sub_ctx.subscribe_error;
+            pthread_mutex_unlock(&sub_ctx.mu);
+        }
+
+        if (afail)             { FAIL(3, "accept_subscribe failed: %d", arc); goto emit; }
+        else if (asent)        { PASS(3, "SUBSCRIBE accepted"); }
+        else if (sub_rejected) { PASS(3, "relay rejected premature SUBSCRIBE (expected)"); }
+        else                   { FAIL(3, "%s", ar); goto emit; }
     }
 
     /* 5: subscriber got SubscribeOk */
@@ -1034,6 +1128,18 @@ static int run_dual_session(const char *url, bool insecure, bool verbose,
         pthread_mutex_unlock(&sub_ctx.mu);
 
         if (sfail)      { FAIL(4, "subscribe failed: %d", src); }
+        else if (subscribe_first) {
+            /* subscribe-before-announce: the subscriber issued SUBSCRIBE before
+             * the namespace existed. A relay that rejects it (SUBSCRIBE_ERROR)
+             * is behaving correctly -- that is the expected pass. A relay that
+             * instead holds the request and delivers SUBSCRIBE_OK once the
+             * publisher announces is also valid. Either outcome passes; only a
+             * transport failure or timeout fails. (announce-subscribe below
+             * still requires SUBSCRIBE_OK.) */
+            if (serr)      { PASS(4, "SUBSCRIBE_ERROR (expected before announce)"); }
+            else if (sok)  { PASS(4, "SUBSCRIBE_OK received"); }
+            else           { FAIL(4, "%s", sr); }
+        }
         else if (serr)  { FAIL(4, "SUBSCRIBE_ERROR received"); }
         else if (sok)   { PASS(4, "SUBSCRIBE_OK received"); }
         else            { FAIL(4, "%s", sr); }
@@ -1099,6 +1205,44 @@ static const test_entry_t supported_tests[] = {
     { NULL, NULL },
 };
 
+/* No explicit test selected (bare `make test` sets RELAY_URL but no TESTCASE):
+ * run the whole suite and emit ONE TAP line per case, matching the other
+ * interop clients (moq-rs, imquic, ...). Each case's own multi-step TAP is
+ * suppressed here (redirected off stdout) so the run-all view stays one line
+ * per case; use --test/TESTCASE to run a single case in full detail. The exit
+ * code is lenient: 0 as long as at least one case ran to a result (the runner
+ * grades per-case from the TAP, and reserves a non-zero exit for a client that
+ * could not run at all). */
+static int run_all_tests(const char *url, bool insecure, bool verbose)
+{
+    int total = 0;
+    for (const test_entry_t *e = supported_tests; e->name; e++) total++;
+    tap_plan(total);
+
+    int num = 0, passed = 0;
+    for (const test_entry_t *e = supported_tests; e->name; e++) {
+        num++;
+        /* Distinct namespace per case so back-to-back announces don't collide
+         * on a relay still holding a prior case's namespace. */
+        set_case_ns(e->name);
+        /* Redirect the case's stdout (its own plan + sub-steps) to /dev/null,
+         * keeping only the per-case summary line below. stderr (verbose diag)
+         * is left alone. Restore stdout before reporting. */
+        fflush(stdout);
+        int saved = dup(STDOUT_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); close(devnull); }
+        int rc = e->run(url, insecure, verbose);
+        fflush(stdout);
+        if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
+
+        bool ok = (rc == 0);
+        if (ok) passed++;
+        tap_result(num, ok, e->name, 0, ok ? NULL : "case did not pass");
+    }
+    return passed > 0 ? 0 : 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
@@ -1106,12 +1250,19 @@ static const test_entry_t supported_tests[] = {
 int main(int argc, char **argv)
 {
     cli_opts_t opts = parse_cli(argc, argv);
+    g_draft_pin = opts.draft;
 
-    if (!opts.relay_url || !opts.test_name) {
-        fprintf(stderr, "error: --relay and --test are required "
-                "(or set RELAY_URL and TESTCASE)\n");
+    if (!opts.relay_url) {
+        fprintf(stderr, "error: --relay is required "
+                "(or set RELAY_URL)\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    /* No test named -> run the whole suite (one TAP line per case). */
+    if (!opts.test_name) {
+        return run_all_tests(opts.relay_url, opts.tls_disable_verify,
+                             opts.verbose);
     }
 
     if (is_unsupported(opts.test_name)) {
