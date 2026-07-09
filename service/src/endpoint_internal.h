@@ -93,6 +93,9 @@ bool moq_endpoint_interrupted_internal(const moq_endpoint_t *ep);
  * take its own non-endpoint lock). Safe to call from any thread. */
 bool moq_endpoint_is_closed_internal(const moq_endpoint_t *ep);
 
+bool moq_endpoint_is_fatal_internal(const moq_endpoint_t *ep);
+uint64_t moq_endpoint_fatal_code_internal(const moq_endpoint_t *ep);
+
 /* Internal retryable post: like moq_endpoint_post(), but a task that returns
  * MOQ_ERR_WOULD_BLOCK is REQUEUED (the same node, no re-allocation) to run again
  * on a later pump cycle instead of being freed -- allocation-free retry for work

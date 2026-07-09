@@ -375,6 +375,12 @@ void moq_pq_threaded_test_arm_service_fatal(moq_pq_threaded_conn_t *c)
 }
 #endif
 
+static void client_final_pump(moq_pq_threaded_t *t, picoquic_quic_t *quic)
+{
+    if (t->on_pump)
+        (void)t->on_pump(t, picoquic_get_quic_time(quic), t->on_pump_ctx);
+}
+
 /* True once a connection should leave iteration: app-closed, service-fatal,
  * bridge-fatal, or cleanly closed by the peer. */
 static bool server_conn_dead(const struct moq_pq_threaded_conn *c)
@@ -737,6 +743,7 @@ static int loop_callback(picoquic_quic_t *quic,
             t->fatal_code = 0;
         }
         pthread_mutex_unlock(&t->mutex);
+        client_final_pump(t, quic);
         mark_activity(t);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -853,6 +860,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 t->fatal_code = 0;  /* transport/handshake-level failure */
             }
             pthread_mutex_unlock(&t->mutex);
+            client_final_pump(t, quic);
             mark_activity(t);
             return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
         }
@@ -864,6 +872,7 @@ static int loop_callback(picoquic_quic_t *quic,
         t->fatal = true;
         t->fatal_code = moq_pq_conn_fatal_code(t->conn);
         pthread_mutex_unlock(&t->mutex);
+        client_final_pump(t, quic);
         mark_activity(t);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -884,6 +893,9 @@ static int loop_callback(picoquic_quic_t *quic,
         t->fatal = true;
         t->fatal_code = moq_pq_conn_fatal_code(t->conn);
         pthread_mutex_unlock(&t->mutex);
+        /* The pump earlier in THIS cycle ran before the fatal was latched:
+         * it could not have observed it. One final observing pump. */
+        client_final_pump(t, quic);
         mark_activity(t);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }

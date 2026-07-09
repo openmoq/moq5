@@ -869,6 +869,34 @@ static void demand_on_left(void *ctx, moq_media_sender_t *sender,
     atomic_fetch_add(&d->leaves, 1);
 }
 
+/* -- Lifecycle (on_ready / on_closed) callback capture ---------------- *
+ * Same memory-ordering scheme as the demand capture: the payload fields are
+ * written before the seq-cst counter increment, so the test thread reads
+ * them safely once it observes the increment. */
+typedef struct {
+    atomic_int ready_calls;
+    atomic_int closed_calls;
+    bool       closed_is_fatal;
+    uint64_t   closed_code;
+} lifecycle_state_t;
+static lifecycle_state_t g_life;
+
+static void life_on_ready(void *ctx, moq_media_sender_t *sender)
+{
+    (void)sender;
+    atomic_fetch_add(&((lifecycle_state_t *)ctx)->ready_calls, 1);
+}
+
+static void life_on_closed(void *ctx, moq_media_sender_t *sender,
+                           bool is_fatal, uint64_t fatal_code)
+{
+    lifecycle_state_t *l = (lifecycle_state_t *)ctx;
+    (void)sender;
+    l->closed_is_fatal = is_fatal;
+    l->closed_code = fatal_code;
+    atomic_fetch_add(&l->closed_calls, 1);
+}
+
 /* -- CMAF object/init builders for the validate_cmaf tests ----------- */
 
 static void wr32be(uint8_t *p, uint32_t v)
@@ -4485,6 +4513,67 @@ int main(int argc, char **argv)
         moq_media_sender_destroy(s);
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == on_closed fires for an endpoint-level connect failure ========= *
+     * TLS certificate verification failure: insecure_skip_verify=false
+     * against the loopback server's self-signed cert. The handshake fails
+     * fatally with NO session ever established, so the publisher was never
+     * created and its callbacks cannot surface the death -- only the sender
+     * hook's endpoint-terminal check can. Before that check existed, a
+     * callbacks-only app never learned the sender was dead (only the
+     * polling queries saw endpoint state) and waited on on_ready forever.
+     * Cert-verify (not ALPN mismatch) is the failure vector on purpose: it
+     * needs the full first round trip, so create()+attach (microseconds)
+     * reliably completes BEFORE the failure lands and the hook path -- not
+     * the synchronous attach-gate path -- is what gets exercised. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        ec.insecure_skip_verify = false;   /* real verification: must fail */
+
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        memset(&g_life, 0, sizeof(g_life));
+        moq_media_sender_callbacks_init(&cfg.callbacks);
+        cfg.callbacks.ctx = &g_life;
+        cfg.callbacks.on_ready = life_on_ready;
+        cfg.callbacks.on_closed = life_on_closed;
+
+        /* If the failure ever beats create() (attach gate -> MOQ_ERR_CLOSED,
+         * a polling-visible outcome, also correct), don't fail the test --
+         * but the expected path is create() OK + on_closed from the hook. */
+        moq_media_sender_t *s = NULL;
+        moq_result_t crc = moq_media_sender_create(&cfg, &s);
+        if (crc == MOQ_OK) {
+            /* The handshake failure is quick; the 10s ceiling is a backstop. */
+            for (int i = 0; i < 200 && atomic_load(&g_life.closed_calls) == 0;
+                 i++)
+                usleep(50000);
+            MOQ_TEST_CHECK_EQ_INT(atomic_load(&g_life.closed_calls), 1);
+            MOQ_TEST_CHECK(g_life.closed_is_fatal);
+            MOQ_TEST_CHECK_EQ_INT(atomic_load(&g_life.ready_calls), 0);
+            /* The callback agrees with the polling queries. */
+            MOQ_TEST_CHECK(moq_media_sender_is_fatal(s));
+            MOQ_TEST_CHECK(moq_media_sender_is_closed(s));
+            moq_media_sender_destroy(s);
+        } else {
+            MOQ_TEST_CHECK_EQ_INT((int)crc, (int)MOQ_ERR_CLOSED);
+            MOQ_TEST_CHECK(s == NULL);
+            printf("note: connect failure preempted create(); "
+                   "hook path not exercised this run\n");
+        }
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.on_closed_connect_failure");
     }
 
     MOQ_TEST_PASS("media_sender");

@@ -1927,6 +1927,11 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         sender_fire_closed(s, true, fatal_code);
         return;
     }
+
+    if (sender_ep_closed(s)) {
+        sender_fire_closed(s, moq_endpoint_is_fatal_internal(s->ep),
+                           moq_endpoint_fatal_code_internal(s->ep));
+    }
     if (!session) return;
 
     if (!s->pub) {

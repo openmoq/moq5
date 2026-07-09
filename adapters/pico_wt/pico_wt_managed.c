@@ -437,6 +437,11 @@ fail:
 }
 
 /* -- Packet-loop callback (network thread) -------------------------- */
+static void client_final_pump(moq_pico_wt_managed_t *m, picoquic_quic_t *quic)
+{
+    if (m->on_pump)
+        (void)m->on_pump(m, picoquic_get_quic_time(quic), m->on_pump_ctx);
+}
 
 static int loop_callback(picoquic_quic_t *quic,
     picoquic_packet_loop_cb_enum cb_mode,
@@ -479,6 +484,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_lock(&m->mutex);
         if (!m->fatal && !m->closed) { m->fatal = true; m->fatal_code = 0; }
         pthread_mutex_unlock(&m->mutex);
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -503,6 +509,7 @@ static int loop_callback(picoquic_quic_t *quic,
         m->fatal = true;
         m->fatal_code = moq_transport_bridge_fatal_code(conn->bridge);
         pthread_mutex_unlock(&m->mutex);
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -523,6 +530,9 @@ static int loop_callback(picoquic_quic_t *quic,
         m->fatal = true;
         m->fatal_code = moq_transport_bridge_fatal_code(conn->bridge);
         pthread_mutex_unlock(&m->mutex);
+        /* The pump earlier in THIS cycle ran before the fatal was latched:
+         * it could not have observed it. One final observing pump. */
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -544,8 +554,11 @@ static int loop_callback(picoquic_quic_t *quic,
     pthread_mutex_unlock(&m->mutex);
 
     /* Fatal is terminal immediately — there is no clean frame worth
-     * preserving. wait()/wake() are already terminal (m->fatal). */
+     * preserving. wait()/wake() are already terminal (m->fatal). The pump
+     * earlier in this cycle ran before the fatal was cached above, so run
+     * one final observing pump before the loop exits. */
     if (fatal_now) {
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }

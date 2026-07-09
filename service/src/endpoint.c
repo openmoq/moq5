@@ -1065,6 +1065,18 @@ bool moq_endpoint_is_closed_internal(const moq_endpoint_t *ep)
     return ep_terminal(ep);
 }
 
+bool moq_endpoint_is_fatal_internal(const moq_endpoint_t *ep)
+{
+    if (!ep) return false;
+    return ep_facade_is_fatal(ep);
+}
+
+uint64_t moq_endpoint_fatal_code_internal(const moq_endpoint_t *ep)
+{
+    if (!ep) return 0;
+    return ep_facade_fatal_code(ep);
+}
+
 void moq_endpoint_detach_hook(moq_endpoint_t *ep,
                               moq_endpoint_hook_kind_t kind, void *ctx)
 {
