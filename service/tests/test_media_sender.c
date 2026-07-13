@@ -2203,6 +2203,74 @@ int main(int argc, char **argv)
         moq_pq_threaded_destroy(srv);
     }
 
+    /* == no subscriber, drop_without_demand: stay at the live edge ==== *
+     * Media written without demand is dropped (counted); a later
+     * subscriber receives only media written after it joined. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.no_subscribe = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);           /* DROP_TO_KEYFRAME, big default bound */
+        cfg.endpoint = &ec;
+        cfg.drop_without_demand = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+        MOQ_TEST_CHECK(atomic_load(&g_srv.ns_accepted));
+
+        /* A full GOP written with no demand: dropped, not held. */
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)i);
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        moq_media_sender_stats_t st;
+        for (int i = 0; i < 200; i++) {
+            (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+            if (st.objects_dropped >= 3 && st.objects_queued == 0) break;
+            usleep(50000);
+        }
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_sent, 0);
+
+        /* Demand appears: only the fresh GOP written afterwards reaches the
+         * subscriber; the pre-demand GOP is gone. */
+        g_srv.no_subscribe = false;
+        for (int i = 0; i < 200 && !moq_media_sender_track_has_subscriber(s, v);
+             i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(s, v));
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0x10 + i));
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
+        MOQ_TEST_CHECK_EQ_INT(srv_count(&g_srv), 3);   /* fresh GOP only */
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK(st.objects_sent >= 3);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);  /* no further drops */
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+    }
+
     /* == terminal: a fatal handshake makes write return CLOSED ========= *
      * EXACT draft-18 against a draft-16-only server fails fatally. Two
      * race-equivalent terminal outcomes, both correct: create() may refuse

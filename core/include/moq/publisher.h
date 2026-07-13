@@ -234,10 +234,9 @@ MOQ_API moq_result_t moq_pub_publish_track(
     const moq_pub_publish_cfg_t *cfg,
     uint64_t now_us);
 
-/* Inverse of moq_pub_publish_track: end the publication cleanly (PUBLISH_DONE),
- * leaving the track and its subscriptions intact. No-op MOQ_OK if never
- * published. WOULD_BLOCK (retry via tick/flush) / WRONG_STATE (object
- * mid-stream) / CLOSED. */
+/* Inverse of moq_pub_publish_track: end the publication cleanly, leaving the
+ * track and its subscriptions intact. No-op MOQ_OK if never published.
+ * WOULD_BLOCK (retry via tick/flush) / WRONG_STATE (object mid-stream) / CLOSED. */
 MOQ_API moq_result_t moq_pub_unpublish_track(
     moq_publisher_t *pub,
     moq_pub_track_t *track,

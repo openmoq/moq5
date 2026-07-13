@@ -162,6 +162,10 @@ typedef struct moq_media_sender_cfg {
      * true: also PUBLISH every track and emit the catalog live so a relay
      * caches it without a FETCH (push). Default to false. */
     bool                                 publish_tracks;
+
+    /* Media written while its track has no demand: false (default) holds it
+     * queued until demand appears; true drops it to stay at the live edge. */
+    bool                                 drop_without_demand;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,

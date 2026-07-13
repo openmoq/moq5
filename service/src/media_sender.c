@@ -262,6 +262,8 @@ struct moq_media_sender {
                                              strict by default (cfg_init) */
     bool             publish_tracks;      /* publisher-initiated PUBLISH per
                                              track + live initial catalog */
+    bool             drop_without_demand; /* drop queued media without demand
+                                             (live edge); default: hold */
     uint64_t         block_timeout_us;
     uint32_t         preq_cap;            /* pre-ready object bound */
     uint64_t         preq_byte_cap;
@@ -1312,10 +1314,11 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             continue;
         }
 
-        /* No demand: the facade would no-op the write, so drop the queued media
-         * outright to stay at the live edge (head still blocks behind it, v0). */
+        /* No demand: drop_without_demand drops the queued media to stay at
+         * the live edge; the default holds the head until demand appears. */
         if (!has_sub) {
-            preq_drop_all_for_track(s, t);
+            if (s->drop_without_demand)
+                preq_drop_all_for_track(s, t);
             break;
         }
 
@@ -2774,6 +2777,10 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
     if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, publish_tracks) +
                                 sizeof(cfg->publish_tracks))
         s->publish_tracks = cfg->publish_tracks;
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t,
+                                     drop_without_demand) +
+                                sizeof(cfg->drop_without_demand))
+        s->drop_without_demand = cfg->drop_without_demand;
     s->block_timeout_us = cfg->block_timeout_us
         ? cfg->block_timeout_us : SENDER_DEFAULT_BLOCK_TIMEOUT_US;
     s->queue_cap = cfg->queue_max_objects
