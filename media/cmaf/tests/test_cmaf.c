@@ -1420,6 +1420,70 @@ int main(void)
               == MOQ_ERR_PROTO);
     }
 
+    /* -- 42. prft/emsg/styp ahead of a chunk's moof are skipped ------- *
+     * ISO/IEC 23000-19 permits prft and emsg boxes in CMAF chunks ahead
+     * of the moof (and a fragment may lead with styp); real publishers
+     * emit them (ffmpeg -write_prft, moqtail's testsrc prefixes every
+     * chunk with a prft). They are metadata, not chunk-ordering
+     * violations -- skip them in parse_fragment and validate_object.
+     * Unknown boxes (e.g. free) still reject. */
+    {
+        /* prft: fullbox, reference_track_ID + ntp (8) + media time (4). */
+        uint8_t obj[256]; size_t n = 0;
+        n += box_hdr(obj + n, 8 + 4 + 4 + 8 + 4, "prft");
+        wr32(obj + n, 0); n += 4;              /* version + flags */
+        wr32(obj + n, 1); n += 4;              /* reference_track_ID */
+        wr32(obj + n, 0); n += 4;              /* ntp_timestamp hi */
+        wr32(obj + n, 0); n += 4;              /* ntp_timestamp lo */
+        wr32(obj + n, 0); n += 4;              /* media_time (v0) */
+        size_t prefix = n;
+        n += build_cmaf_chunk(obj + n, 1, 0x02000000, 1, 0, 0xAA);
+
+        moq_cmaf_object_report_t rep;
+        CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ obj, n }, &rep)
+              == MOQ_OK);
+        CHECK(rep.valid == true);
+        CHECK(rep.chunk_count == 1);
+        CHECK(rep.starts_with_sync == true);
+
+        moq_cmaf_sample_t s[4];
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, s, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ obj, n }, &frag)
+              == MOQ_OK);
+        CHECK(frag.chunk_count == 1);
+        CHECK(frag.track_id == 1);
+        CHECK(frag.sample_count == 1);
+
+        /* emsg between two chunks of a multi-chunk object also skips. */
+        uint8_t multi[512]; size_t m = 0;
+        m += build_cmaf_chunk(multi + m, 1, 0x02000000, 1, 0, 0xAA);
+        m += box_hdr(multi + m, 12, "emsg");
+        wr32(multi + m, 0x01000000); m += 4;   /* version 1, flags 0 */
+        m += build_cmaf_chunk(multi + m, 1, 0x00000000, 1, 0, 0xBB);
+        CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ multi, m }, &rep)
+              == MOQ_OK);
+        CHECK(rep.chunk_count == 2);
+        moq_cmaf_fragment_info_init(&frag, s, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ multi, m }, &frag)
+              == MOQ_OK);
+        CHECK(frag.chunk_count == 2);
+
+        /* An unknown top-level box is still not a chunk: reject. */
+        uint8_t bad[256]; size_t bn = 0;
+        bn += box_hdr(bad + bn, 12, "free");
+        wr32(bad + bn, 0); bn += 4;
+        bn += build_cmaf_chunk(bad + bn, 1, 0x02000000, 1, 0, 0xAA);
+        CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ bad, bn }, &rep)
+              == MOQ_ERR_PROTO);
+        CHECK(rep.reason == MOQ_CMAF_ERR_MALFORMED);
+        moq_cmaf_fragment_info_init(&frag, s, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ bad, bn }, &frag)
+              == MOQ_ERR_PROTO);
+
+        (void)prefix;
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

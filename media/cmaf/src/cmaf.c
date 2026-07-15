@@ -635,8 +635,21 @@ moq_result_t moq_cmaf_parse_fragment(moq_bytes_t fragment,
         uint32_t type = box_type(fragment.data + pos);
 
         if (expect_moof) {
-            /* A CMAF chunk starts with a moof; anything else here (mdat first,
-             * a second moof, styp, ...) is not a successive moof+mdat chunk. */
+            /* A CMAF chunk starts with a moof, but ISO/IEC 23000-19 permits
+             * prft and emsg boxes ahead of it (and a fragment may lead with
+             * styp/sidx). They are metadata, not chunk structure -- skip
+             * them rather than reject the object, for interop with real
+             * publishers that emit them (ffmpeg -write_prft; moqtail's
+             * testsrc prefixes every chunk with a prft latency anchor).
+             * Anything else here (mdat first, a second moof, free, ...) is
+             * still not a successive moof+mdat chunk. */
+            if (type == FOURCC('p','r','f','t') ||
+                type == FOURCC('e','m','s','g') ||
+                type == FOURCC('s','t','y','p') ||
+                type == FOURCC('s','i','d','x')) {
+                pos += b.size;
+                continue;
+            }
             if (type != FOURCC('m','o','o','f'))
                 return MOQ_ERR_PROTO;
 
@@ -774,8 +787,18 @@ moq_result_t moq_cmaf_validate_object(const moq_cmaf_init_info_t *init,
         uint32_t type = box_type(object.data + pos);
 
         if (expect_moof) {
-            /* A chunk must START with a moof; anything else (mdat first, a
-             * second moof, styp, free, ...) breaks the successive-chunk rule. */
+            /* A chunk must START with a moof, but ISO/IEC 23000-19 permits
+             * prft/emsg (and a leading styp/sidx) ahead of it -- skip those
+             * (see the matching skip in moq_cmaf_parse_fragment). Anything
+             * else (mdat first, a second moof, free, ...) breaks the
+             * successive-chunk rule. */
+            if (type == FOURCC('p','r','f','t') ||
+                type == FOURCC('e','m','s','g') ||
+                type == FOURCC('s','t','y','p') ||
+                type == FOURCC('s','i','d','x')) {
+                pos += b.size;
+                continue;
+            }
             if (type != FOURCC('m','o','o','f')) {
                 reason = MOQ_CMAF_ERR_MALFORMED; break;
             }
