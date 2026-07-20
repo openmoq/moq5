@@ -114,6 +114,8 @@ struct moq_media_track {
                                                 from moq_pub_active_subscriptions()
                                                 for demand visibility (§7.2) */
     bool                  is_catalog;        /* the catalog track */
+    bool                  pub_closed_fired;  /* on_track_closed fired: latched so a
+                                                repeated PUBLISH_FINISHED does not re-fire */
     bool                  removed;           /* remove_track called: excluded from
                                                 future catalog builds, writes
                                                 refused; handle kept until destroy */
@@ -258,6 +260,10 @@ struct moq_media_sender {
     moq_media_send_backpressure_t backpressure;
     bool             validate_cmaf;       /* CMSF §3.3/§3.4 object validation;
                                              strict by default (cfg_init) */
+    bool             publish_tracks;      /* publisher-initiated PUBLISH per
+                                             track + live initial catalog */
+    bool             drop_without_demand; /* drop queued media without demand
+                                             (live edge); default: hold */
     uint64_t         block_timeout_us;
     uint32_t         preq_cap;            /* pre-ready object bound */
     uint64_t         preq_byte_cap;
@@ -281,6 +287,10 @@ struct moq_media_sender {
     bool              fatal;
     uint64_t          fatal_code;
 
+    /* Latches so on_ready / on_closed each fire at most once (network thread). */
+    bool              ready_fired;
+    bool              closed_fired;
+
     moq_media_sender_stats_t stats;       /* counters (mu-protected) */
 
     /* Catalog republish (S1). catalog_dirty is set by add_track/remove_track
@@ -298,6 +308,7 @@ struct moq_media_sender {
     moq_publisher_t  *pub;
     moq_media_track_t *catalog_track;
     bool              catalog_published;     /* initial retained catalog installed */
+    bool              live_catalog_sent;     /* initial catalog emitted live (publish) */
     uint64_t          catalog_group;        /* last published generation (0 = initial) */
     moq_rcbuf_t      *published_catalog;     /* last committed catalog bytes (the
                                                 independent base / no-op dedup) */
@@ -327,11 +338,43 @@ static void sender_set_fatal_locked(moq_media_sender_t *s, uint64_t code)
     pthread_cond_broadcast(&s->space_cv);   /* unblock BLOCK_TIMEOUT waiters */
 }
 
+/* Fire on_closed at most once. Claims closed_fired under the lock, then invokes
+ * the callback OUTSIDE it (non-reentrant contract). Network thread. */
+static void sender_fire_closed(moq_media_sender_t *s, bool is_fatal,
+                               uint64_t fatal_code)
+{
+    pthread_mutex_lock(&s->mu);
+    if (s->closed_fired) { pthread_mutex_unlock(&s->mu); return; }
+    s->closed_fired = true;
+    void *cbctx = s->callbacks.ctx;
+    void (*cb)(void *, moq_media_sender_t *, bool, uint64_t)
+        = s->callbacks.on_closed;
+    pthread_mutex_unlock(&s->mu);
+
+    if (cb) cb(cbctx, s, is_fatal, fatal_code);
+}
+
+/* Fire on_ready at most once, on the network thread, OUTSIDE s->mu. Claims the
+ * ready_fired latch under the lock, then invokes the callback after release. */
+static void sender_fire_ready(moq_media_sender_t *s)
+{
+    pthread_mutex_lock(&s->mu);
+    if (s->ready_fired) { pthread_mutex_unlock(&s->mu); return; }
+    s->ready_fired = true;
+    void *cbctx = s->callbacks.ctx;
+    void (*cb)(void *, moq_media_sender_t *) = s->callbacks.on_ready;
+    pthread_mutex_unlock(&s->mu);
+
+    if (cb) cb(cbctx, s);
+}
+
 static void sender_set_fatal(moq_media_sender_t *s, uint64_t code)
 {
     pthread_mutex_lock(&s->mu);
     sender_set_fatal_locked(s, code);
     pthread_mutex_unlock(&s->mu);
+    /* A fatal is a terminal close: surface it as on_closed(is_fatal=true). */
+    sender_fire_closed(s, true, code);
 }
 
 static bool sender_terminal(const moq_media_sender_t *s)
@@ -461,6 +504,40 @@ static bool preq_track_anchor(const moq_media_sender_t *s,
         }
     }
     return found;
+}
+
+/* Drop all queued media of `track` while it has no demand, keeping the sender at
+ * the live edge (the peer accepts a mid-GOP resume gap for minimal latency).
+ * Preserves the terminal END_OF_TRACK (is_end) and arms pending_reset if a wire
+ * subgroup is open. Single compaction pass. mu held. */
+static void preq_drop_all_for_track(moq_media_sender_t *s,
+                                    moq_media_track_t *t)
+{
+    uint32_t rd = s->preq_head, wr = s->preq_head;
+    bool dropped_any = false;
+    while (rd != s->preq_tail) {
+        sender_preq_entry_t *e = &s->preq[rd % s->ring_cap];
+        if (e->track == t && !e->is_end) {
+            s->preq_bytes -= e->bytes;
+            s->stats.objects_dropped++;
+            if (e->is_sync) s->stats.keyframes_dropped++;
+            preq_entry_release(s, e);   /* clears the slot */
+            dropped_any = true;
+        } else {
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            wr++;
+        }
+        rd++;
+    }
+    s->preq_tail = wr;
+    if (dropped_any) {
+        s->stats.groups_dropped++;
+        /* An open wire subgroup for this track just lost its tail - the drain
+         * must RESET it, not leave it truncated. */
+        if (t->emit_open)
+            t->pending_reset = true;
+        pthread_cond_broadcast(&s->space_cv);   /* freed space: wake writers */
+    }
 }
 
 /* Evict the oldest group that can go without stranding any track's
@@ -966,6 +1043,17 @@ static void sap_history_append(moq_media_sender_t *s, moq_media_track_t *tl,
     if (tl->sap_lead < tl->sap_base_seq) tl->sap_lead = tl->sap_base_seq;
 }
 
+/* Whether a track wants data on the wire: a subscriber (pull), or the
+ * publication established with forward on (publish-initiated). */
+static bool sender_track_demand(moq_media_sender_t *s, moq_media_track_t *t)
+{
+    if (!t || !t->pub_track) return false;
+    if (moq_pub_has_subscriber(s->pub, t->pub_track)) return true;
+    if (s->publish_tracks)
+        return moq_pub_track_forward(s->pub, t->pub_track);
+    return false;
+}
+
 /* Emit timeline objects for `tl` from its side history, gated on the timeline
  * track's OWN subscriber so it can never head-of-line-block media (MSF §8.3).
  * The timeline shares the media group ids: each new media group boundary emits
@@ -978,7 +1066,7 @@ static void sender_emit_sap_for(moq_media_sender_t *s, moq_media_track_t *tl,
                                 uint64_t now_us)
 {
     if (!tl->pub_track) return;
-    if (!moq_pub_has_subscriber(s->pub, tl->pub_track)) return;
+    if (!sender_track_demand(s, tl)) return;
 
     uint64_t next_seq = tl->sap_base_seq + tl->sap_rec_count;
     while (tl->sap_lead < next_seq) {
@@ -1097,7 +1185,7 @@ static void sender_emit_mt_for(moq_media_sender_t *s, moq_media_track_t *tl,
                                uint64_t now_us)
 {
     if (!tl->pub_track) return;
-    if (!moq_pub_has_subscriber(s->pub, tl->pub_track)) return;
+    if (!sender_track_demand(s, tl)) return;
 
     uint64_t next_seq = tl->mt_base_seq + tl->mt_rec_count;
     while (tl->mt_lead < next_seq) {
@@ -1190,7 +1278,7 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             continue;
         }
 
-        bool has_sub = moq_pub_has_subscriber(s->pub, t->pub_track);
+        bool has_sub = sender_track_demand(s, t);
 
         /* Terminal marker: emit a reliable END_OF_TRACK after this track's
          * queued objects (FIFO preserves the ordering). The facade closes any
@@ -1226,16 +1314,13 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             continue;
         }
 
-        /* Ready is publish-path readiness, NOT subscriber presence: the
-         * facade silently no-ops a write with no active subscriber, so
-         * emitting now would discard the media. Hold the head until a
-         * subscriber (a relay, typically) exists for its track; the
-         * bounded queue + backpressure policy bound the wait. (FIFO hold:
-         * a subscriber-less track at the head also pauses tracks behind
-         * it -- acceptable for v0, where a relay subscribes to all
-         * advertised tracks together.) */
-        if (!has_sub)
+        /* No demand: drop_without_demand drops the queued media to stay at
+         * the live edge; the default holds the head until demand appears. */
+        if (!has_sub) {
+            if (s->drop_without_demand)
+                preq_drop_all_for_track(s, t);
             break;
+        }
 
         /* A drop abandoned this track's open group: reset it on the wire
          * before emitting the next (newer) group. */
@@ -1352,8 +1437,23 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
         ? (moq_bytes_t){ s->catalog_name, s->catalog_name_len }
         : t->name;
     tcfg.advertise_namespace = advertise;
-    if (moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track) != MOQ_OK)
+
+    if (t->is_catalog) {
+        tcfg.has_publisher_priority = true;
+        tcfg.publisher_priority = 0;
+    }
+
+    if (moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track) != MOQ_OK) {
         sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+        return;
+    }
+
+    if (s->publish_tracks && t->pub_track) {
+        moq_pub_publish_cfg_t pcfg;
+        moq_pub_publish_cfg_init(&pcfg);
+        if (moq_pub_publish_track(s->pub, t->pub_track, &pcfg, now_us) != MOQ_OK)
+            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+    }
 }
 
 static bool rcbuf_bytes_eq(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
@@ -1781,6 +1881,41 @@ static void sender_resync_demand(moq_media_sender_t *s)
     sender_tracks_release(s, snap, n);
 }
 
+static void sender_pub_on_closed(void *ctx, uint64_t error_code)
+{
+    (void)error_code;   /* the peer's session error is not the sender fatal code */
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    sender_fire_closed(s, false, 0);
+}
+
+static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+
+    pthread_mutex_lock(&s->mu);
+
+    /* The catalog track is private (not in s->tracks[]); check it first. */
+    if (s->catalog_track && s->catalog_track->pub_track == pt) {
+        pthread_mutex_unlock(&s->mu);
+        sender_fire_closed(s, false, 0);   /* no catalog -> session is done */
+        return;
+    }
+
+    moq_media_track_t *t = NULL;
+    for (size_t i = 0; i < s->track_count; i++) {
+        if (s->tracks[i]->pub_track == pt) { t = s->tracks[i]; break; }
+    }
+    /* Fire once per track, for app-visible media only. */
+    bool fire = t && track_is_app_media(t) && !t->pub_closed_fired;
+    if (fire) t->pub_closed_fired = true;
+    void *cbctx = s->callbacks.ctx;
+    void (*cb)(void *, moq_media_sender_t *, moq_media_track_t *)
+        = s->callbacks.on_track_closed;
+    pthread_mutex_unlock(&s->mu);
+
+    if (fire && cb) cb(cbctx, s, t);
+}
+
 static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                         uint64_t now_us, void *ctx)
 {
@@ -1789,8 +1924,18 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
 
     pthread_mutex_lock(&s->mu);
     bool fatal = s->fatal;
+    uint64_t fatal_code = s->fatal_code;
     pthread_mutex_unlock(&s->mu);
-    if (fatal || !session) return;
+    if (fatal) {
+        sender_fire_closed(s, true, fatal_code);
+        return;
+    }
+
+    if (sender_ep_closed(s)) {
+        sender_fire_closed(s, moq_endpoint_is_fatal_internal(s->ep),
+                           moq_endpoint_fatal_code_internal(s->ep));
+    }
+    if (!session) return;
 
     if (!s->pub) {
         if (moq_session_state(session) != MOQ_SESS_ESTABLISHED)
@@ -1799,10 +1944,9 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
-        /* Demand visibility (§7.2) is mirrored by polling
-         * moq_pub_active_subscriptions in sender_resync_demand (below), not by
-         * the core join/left callbacks -- those miss the clear-without-left
-         * paths (session close / finish). So no pub callbacks are installed. */
+        pcfg.callbacks.ctx = s;
+        pcfg.callbacks.on_closed = sender_pub_on_closed;
+        pcfg.callbacks.on_publish_finished = sender_pub_on_publish_finished;
         if (moq_pub_create(session, &s->alloc, &pcfg, &s->pub) != MOQ_OK) {
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
@@ -1821,11 +1965,25 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         ccfg.track_namespace = s->namespace_;
         ccfg.track_name = (moq_bytes_t){ s->catalog_name, s->catalog_name_len };
         ccfg.advertise_namespace = true;
+        ccfg.has_publisher_priority = true;
+        ccfg.publisher_priority = 0;   /* catalog leads delivery */
         if (moq_pub_add_track(s->pub, &ccfg, now_us,
                               &s->catalog_track->pub_track) != MOQ_OK) {
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
         }
+        /* PUBLISH the catalog track (media tracks are published in
+         * sender_add_pub_track below). */
+        if (s->publish_tracks) {
+            moq_pub_publish_cfg_t cpcfg;
+            moq_pub_publish_cfg_init(&cpcfg);
+            if (moq_pub_publish_track(s->pub, s->catalog_track->pub_track,
+                                      &cpcfg, now_us) != MOQ_OK) {
+                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                return;
+            }
+        }
+
         /* Walk a snapshot so a concurrent app-thread realloc of s->tracks cannot
          * free the vector mid-walk; the per-track registration below takes s->mu
          * to decide and create the publisher track atomically. NOMEM here is
@@ -1901,14 +2059,37 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
      * callback in the same cycle it is accepted (before the drain runs). */
     sender_resync_demand(s);
 
-    /* Readiness: namespace accepted (catalog track carries the announce)
-     * AND the catalog is published. */
+    /* Publish-initiated: once the peer accepts the catalog PUBLISH, push the
+     * initial catalog object live so a relay caches it without a FETCH. */
+    if (s->publish_tracks && !s->live_catalog_sent && s->catalog_published &&
+        sender_track_demand(s, s->catalog_track) &&
+        s->published_catalog) {
+        moq_pub_object_cfg_t ocfg;
+        moq_pub_object_cfg_init(&ocfg);
+
+        /* Same (group 0, object 0) as the retained group: it is the same catalog
+         * object, so a live subscriber and a FETCH joiner see one identity. */
+        ocfg.group_id = 0;
+        ocfg.object_id = 0;
+        ocfg.payload = s->published_catalog;
+        ocfg.end_of_group = true;
+        moq_result_t wrc = moq_pub_write_object_ex(
+            s->pub, s->catalog_track->pub_track, &ocfg, now_us);
+        if (wrc == MOQ_OK)
+            s->live_catalog_sent = true;
+    }
+
+    /* Ready: catalog published AND accepted by the peer - via the namespace
+     * advertisement (pull) or the catalog's PUBLISH (publish). */
     if (!s->ready && s->catalog_published &&
-        moq_pub_namespace_accepted(s->pub, s->catalog_track->pub_track)) {
+        (moq_pub_namespace_accepted(s->pub, s->catalog_track->pub_track) ||
+         (s->publish_tracks &&
+          moq_pub_track_is_published(s->pub, s->catalog_track->pub_track)))) {
         pthread_mutex_lock(&s->mu);
         s->ready = true;
         pthread_cond_broadcast(&s->space_cv);  /* bound widened to queue_cap */
         pthread_mutex_unlock(&s->mu);
+        sender_fire_ready(s);
     }
 
     /* Post-ready track maintenance: tear down removed tracks (end-of-track, then
@@ -2581,8 +2762,25 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
                                         on_subscriber_left) +
                                    sizeof(cb->on_subscriber_left))
             s->callbacks.on_subscriber_left = cb->on_subscriber_left;
+        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
+                                        on_ready) + sizeof(cb->on_ready))
+            s->callbacks.on_ready = cb->on_ready;
+        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
+                                        on_closed) + sizeof(cb->on_closed))
+            s->callbacks.on_closed = cb->on_closed;
+        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
+                                        on_track_closed) +
+                                   sizeof(cb->on_track_closed))
+            s->callbacks.on_track_closed = cb->on_track_closed;
         s->callbacks.struct_size = sizeof(s->callbacks);
     }
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, publish_tracks) +
+                                sizeof(cfg->publish_tracks))
+        s->publish_tracks = cfg->publish_tracks;
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t,
+                                     drop_without_demand) +
+                                sizeof(cfg->drop_without_demand))
+        s->drop_without_demand = cfg->drop_without_demand;
     s->block_timeout_us = cfg->block_timeout_us
         ? cfg->block_timeout_us : SENDER_DEFAULT_BLOCK_TIMEOUT_US;
     s->queue_cap = cfg->queue_max_objects
@@ -3626,7 +3824,12 @@ moq_media_sender_t *moq_media_sender_test_new(void)
 
 void moq_media_sender_test_free(moq_media_sender_t *s)
 {
-    if (s) sender_free(s);
+    if (!s) return;
+    /* A test may have lazily created the private catalog track (via
+     * moq_media_sender_test_catalog_track); sender_free does not own it (destroy
+     * does), so release it here to keep the test leak-free. */
+    if (s->catalog_track) { track_free(s, s->catalog_track); s->catalog_track = NULL; }
+    sender_free(s);
 }
 
 /* Force or clear the sender-fatal flag, so a wait-contract test can prove
@@ -3667,6 +3870,66 @@ void moq_media_sender_test_set_ready(moq_media_sender_t *s)
     pthread_mutex_lock(&s->mu);
     s->ready = true;
     pthread_mutex_unlock(&s->mu);
+}
+
+/* Install lifecycle callbacks on a test sender (no endpoint), so the fire
+ * seams below can be observed. Mirrors the negotiated copy sender_new does. */
+void moq_media_sender_test_set_callbacks(moq_media_sender_t *s,
+                                         const moq_media_sender_callbacks_t *cb)
+{
+    pthread_mutex_lock(&s->mu);
+    s->callbacks.ctx = cb->ctx;
+    s->callbacks.on_ready = cb->on_ready;
+    s->callbacks.on_closed = cb->on_closed;
+    s->callbacks.on_track_closed = cb->on_track_closed;
+    s->callbacks.struct_size = sizeof(s->callbacks);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Drive the core on_publish_finished handler for a track, mapping by pub_track
+ * exactly as the network thread does. The test assigns the track a sentinel
+ * pub_track (its own address) so the production mapping loop resolves it; then
+ * the real handler runs (app-media filter + per-track latch + catalog->on_closed
+ * routing). Pass the catalog track to exercise the catalog-termination path. */
+void moq_media_sender_test_fire_publish_finished(moq_media_sender_t *s,
+                                                 moq_media_track_t *track)
+{
+    track->pub_track = (moq_pub_track_t *)track;   /* sentinel for the map */
+    sender_pub_on_publish_finished(s, track->pub_track);
+}
+
+/* Expose the catalog track handle so the test can drive its termination. */
+moq_media_track_t *moq_media_sender_test_catalog_track(moq_media_sender_t *s)
+{
+    if (!s->catalog_track) {
+        s->catalog_track = (moq_media_track_t *)s->alloc.alloc(
+            sizeof(moq_media_track_t), s->alloc.ctx);
+        if (s->catalog_track) {
+            memset(s->catalog_track, 0, sizeof(*s->catalog_track));
+            s->catalog_track->is_catalog = true;
+        }
+    }
+    return s->catalog_track;
+}
+
+/* Drive the PRODUCTION fire helpers (same code the network thread runs), so the
+ * test exercises the real single-fire latch + callback dispatch, not a copy. */
+void moq_media_sender_test_fire_ready(moq_media_sender_t *s)
+{
+    sender_fire_ready(s);
+}
+
+void moq_media_sender_test_fire_closed(moq_media_sender_t *s, bool is_fatal,
+                                       uint64_t fatal_code)
+{
+    sender_fire_closed(s, is_fatal, fatal_code);
+}
+
+/* Drive the fatal path end-to-end: sender_set_fatal marks fatal AND fires
+ * on_closed(is_fatal=true) inline, exactly as a network-thread fatal does. */
+void moq_media_sender_test_fire_fatal(moq_media_sender_t *s, uint64_t code)
+{
+    sender_set_fatal(s, code);
 }
 
 /* Simulate complete() state without an endpoint: set completing + mark every

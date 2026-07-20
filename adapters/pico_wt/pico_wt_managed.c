@@ -441,6 +441,11 @@ fail:
 }
 
 /* -- Packet-loop callback (network thread) -------------------------- */
+static void client_final_pump(moq_pico_wt_managed_t *m, picoquic_quic_t *quic)
+{
+    if (m->on_pump)
+        (void)m->on_pump(m, picoquic_get_quic_time(quic), m->on_pump_ctx);
+}
 
 static int loop_callback(picoquic_quic_t *quic,
     picoquic_packet_loop_cb_enum cb_mode,
@@ -491,6 +496,7 @@ static int loop_callback(picoquic_quic_t *quic,
             m->terminal_error = local_err;
         }
         pthread_mutex_unlock(&m->mutex);
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -500,6 +506,13 @@ static int loop_callback(picoquic_quic_t *quic,
     if (!conn)
         return 0;
 
+    if (m->cnx &&
+        picoquic_get_cnx_state(m->cnx) == picoquic_state_disconnected &&
+        !moq_pico_wt_conn_is_closed(conn) && !moq_pico_wt_conn_is_fatal(conn)) {
+        moq_pico_wt_conn_notify_transport_closed(
+            conn, 0, picoquic_get_quic_time(quic));
+    }
+
     uint64_t now = picoquic_get_quic_time(quic);
 
     /* service → on_pump → service (all on the network thread). */
@@ -508,6 +521,7 @@ static int loop_callback(picoquic_quic_t *quic,
         m->fatal = true;
         m->fatal_code = moq_transport_bridge_fatal_code(conn->bridge);
         pthread_mutex_unlock(&m->mutex);
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -528,6 +542,9 @@ static int loop_callback(picoquic_quic_t *quic,
         m->fatal = true;
         m->fatal_code = moq_transport_bridge_fatal_code(conn->bridge);
         pthread_mutex_unlock(&m->mutex);
+        /* The pump earlier in THIS cycle ran before the fatal was latched:
+         * it could not have observed it. One final observing pump. */
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }
@@ -549,8 +566,11 @@ static int loop_callback(picoquic_quic_t *quic,
     pthread_mutex_unlock(&m->mutex);
 
     /* Fatal is terminal immediately — there is no clean frame worth
-     * preserving. wait()/wake() are already terminal (m->fatal). */
+     * preserving. wait()/wake() are already terminal (m->fatal). The pump
+     * earlier in this cycle ran before the fatal was cached above, so run
+     * one final observing pump before the loop exits. */
     if (fatal_now) {
+        client_final_pump(m, quic);
         mark_activity(m);
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
     }

@@ -7209,6 +7209,195 @@ static void test_ns_refcount_would_block_retry(void) {
     MOQ_TEST_PASS("ns_refcount_would_block_retry");
 }
 
+/* -- Publisher-initiated PUBLISH ---------------------------------- */
+
+/* On the client (the subscriber side of the simpair), drain one
+ * PUBLISH_REQUEST and accept it, optionally forcing the forward flag. Returns
+ * true if a request was accepted. */
+static bool client_accept_publish(moq_simpair_t *sp) {
+    moq_event_t ev;
+    if (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) != 1)
+        return false;
+    bool accepted = false;
+    if (ev.kind == MOQ_EVENT_PUBLISH_REQUEST) {
+        moq_accept_publish_cfg_t acc;
+        moq_accept_publish_cfg_init(&acc);
+        moq_result_t rc = moq_session_accept_publish(moq_simpair_client(sp),
+            ev.u.publish_request.pub, &acc, moq_simpair_now_us(sp));
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        accepted = true;
+    }
+    moq_event_cleanup(&ev);
+    return accepted;
+}
+
+static void test_publish_track_accepted(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    simpair_setup(&as, &alloc, &sp);
+
+    moq_pub_cfg_t cfg; moq_pub_cfg_init(&cfg);
+    cfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    moq_pub_create(moq_simpair_server(sp), &alloc, &cfg, &pub);
+
+    moq_pub_track_cfg_t tcfg; moq_pub_track_cfg_init(&tcfg);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    tcfg.track_namespace.parts = ns_parts; tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_pub_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_pub_add_track(pub, &tcfg,
+        moq_simpair_now_us(sp), &track) == MOQ_OK);
+
+    /* Publish the track (publisher-initiated PUBLISH). */
+    moq_pub_publish_cfg_t pcfg; moq_pub_publish_cfg_init(&pcfg);
+    MOQ_TEST_CHECK(moq_pub_publish_track(pub, track,
+        &pcfg, moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_pub_track_is_published(pub, track));
+
+    /* Client receives PUBLISH and accepts -> PUBLISH_OK. */
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK(client_accept_publish(sp));
+
+    /* Server tick consumes PUBLISH_OK -> published, forward defaults true. */
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK(moq_pub_tick(pub, moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_track_is_published(pub, track));
+    MOQ_TEST_CHECK(moq_pub_track_forward(pub, track));
+
+    /* Idempotent: a second publish_track is a no-op MOQ_OK. */
+    MOQ_TEST_CHECK(moq_pub_publish_track(pub, track,
+        &pcfg, moq_simpair_now_us(sp)) == MOQ_OK);
+
+    /* A published track is NOT counted as a subscriber. */
+    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 0);
+    MOQ_TEST_CHECK(!moq_pub_has_subscriber(pub, track));
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("publish_track_accepted");
+}
+
+/* Write objects on a published track: they must reach the publication's data
+ * stream (the write fan-out routes to the publication slot). */
+static void test_publish_track_write(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    simpair_setup(&as, &alloc, &sp);
+
+    moq_pub_cfg_t cfg; moq_pub_cfg_init(&cfg);
+    cfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    moq_pub_create(moq_simpair_server(sp), &alloc, &cfg, &pub);
+
+    moq_pub_track_cfg_t tcfg; moq_pub_track_cfg_init(&tcfg);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    tcfg.track_namespace.parts = ns_parts; tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_pub_track_t *track = NULL;
+    moq_pub_add_track(pub, &tcfg, moq_simpair_now_us(sp), &track);
+
+    moq_pub_publish_cfg_t pcfg; moq_pub_publish_cfg_init(&pcfg);
+    moq_pub_publish_track(pub, track, &pcfg, moq_simpair_now_us(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK(client_accept_publish(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_pub_tick(pub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK(moq_pub_track_is_published(pub, track));
+
+    /* Write one object; routed to the publication slot. */
+    moq_rcbuf_t *payload = NULL;
+    moq_rcbuf_create(&alloc, (const uint8_t *)"abcd", 4, &payload);
+    moq_result_t rc = moq_pub_write_object(pub, track, 0, 0, payload,
+        moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    moq_rcbuf_decref(payload);
+
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+
+    /* end_track on a published track finishes the publication (PUBLISH_DONE). */
+    rc = moq_pub_end_track(pub, track, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    MOQ_TEST_CHECK(!moq_pub_track_is_published(pub, track));
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("publish_track_write");
+}
+
+/* Coexistence: one track is BOTH advertised (receives SUBSCRIBE) AND published.
+ * Proves PUBLISH is an operation, not an exclusive mode. */
+static void test_publish_and_subscribe_coexist(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    simpair_setup(&as, &alloc, &sp);
+
+    moq_pub_cfg_t cfg; moq_pub_cfg_init(&cfg);
+    cfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    moq_pub_create(moq_simpair_server(sp), &alloc, &cfg, &pub);
+
+    moq_pub_track_cfg_t tcfg; moq_pub_track_cfg_init(&tcfg);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    tcfg.track_namespace.parts = ns_parts; tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    tcfg.advertise_namespace = true;          /* announce ... */
+    moq_pub_track_t *track = NULL;
+    moq_pub_add_track(pub, &tcfg, moq_simpair_now_us(sp), &track);
+
+    /* ... AND publish the same track. */
+    moq_pub_publish_cfg_t pcfg; moq_pub_publish_cfg_init(&pcfg);
+    MOQ_TEST_CHECK(moq_pub_publish_track(pub, track,
+        &pcfg, moq_simpair_now_us(sp)) == MOQ_OK);
+
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+
+    /* Client accepts the namespace and the publish, in whatever order they
+     * surface; drain its event queue. */
+    for (int i = 0; i < 4; i++) {
+        moq_event_t ev;
+        if (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) != 1)
+            break;
+        if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
+            moq_accept_namespace_cfg_t nacc;
+            moq_accept_namespace_cfg_init(&nacc);
+            moq_session_accept_namespace(moq_simpair_client(sp),
+                ev.u.namespace_published.ann, &nacc, moq_simpair_now_us(sp));
+        } else if (ev.kind == MOQ_EVENT_PUBLISH_REQUEST) {
+            moq_accept_publish_cfg_t acc;
+            moq_accept_publish_cfg_init(&acc);
+            moq_session_accept_publish(moq_simpair_client(sp),
+                ev.u.publish_request.pub, &acc, moq_simpair_now_us(sp));
+        }
+        moq_event_cleanup(&ev);
+    }
+
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK(moq_pub_tick(pub, moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_namespace_accepted(pub, track));
+    MOQ_TEST_CHECK(moq_pub_track_is_published(pub, track));
+
+    /* Now a SUBSCRIBE for the same track is also accepted (coexists). */
+    moq_subscribe_cfg_t scfg; moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace.parts = ns_parts; scfg.track_namespace.count = 1;
+    scfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_subscription_t sub_h;
+    MOQ_TEST_CHECK(moq_session_subscribe(moq_simpair_client(sp), &scfg,
+        moq_simpair_now_us(sp), &sub_h) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK(moq_pub_tick(pub, moq_simpair_now_us(sp)) == MOQ_OK);
+
+    MOQ_TEST_CHECK(moq_pub_has_subscriber(pub, track));     /* subscription slot */
+    MOQ_TEST_CHECK(moq_pub_track_is_published(pub, track)); /* publication intact */
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("publish_and_subscribe_coexist");
+}
+
 int main(void) {
     test_create_destroy();
     test_pub_cfg_init_old_prefix_no_overflow();
@@ -7313,6 +7502,9 @@ int main(void) {
     test_ns_refcount_shared();
     test_ns_refcount_distinct();
     test_ns_refcount_would_block_retry();
+    test_publish_track_accepted();
+    test_publish_track_write();
+    test_publish_and_subscribe_coexist();
 
     /* == end_of_group ABI: old struct_size must not read end_of_group == */
     {

@@ -24,9 +24,18 @@ typedef struct {
     moq_rcbuf_t *properties;    /* incref'd or NULL */
 } pub_retained_obj_t;
 
+/* A fan-out slot targets EITHER an accepted subscription or a publication we
+ * initiated (kind); the subgroup send path is identical for both. */
+typedef enum {
+    PUB_SLOT_SUBSCRIPTION = 0,
+    PUB_SLOT_PUBLICATION  = 1,
+} pub_slot_kind_t;
+
 typedef struct {
     bool                  active;
-    moq_subscription_t    sub;
+    pub_slot_kind_t       kind;
+    moq_subscription_t    sub;   /* valid when kind == PUB_SLOT_SUBSCRIPTION */
+    moq_publication_t     pub;   /* valid when kind == PUB_SLOT_PUBLICATION  */
     moq_subgroup_handle_t sg;
     bool                  sg_open;
     bool                  sg_has_extensions;
@@ -77,6 +86,13 @@ struct moq_pub_track {
     pub_retained_obj_t *retained;
     size_t              retained_count;
     uint64_t            max_retained_bytes;
+
+    /* Publisher-initiated PUBLISH state, independent of advertise/subscribe
+     * above (both may be live on one track). The data slot opens on PUBLISH_OK. */
+    bool                publish_requested;
+    bool                publish_ok;
+    bool                publish_forward;
+    moq_publication_t   publication;
 };
 
 typedef struct {
@@ -171,7 +187,8 @@ static size_t track_active_count(const moq_pub_track_t *t)
 {
     size_t n = 0;
     for (size_t i = 0; i < t->slot_cap; i++)
-        if (t->slots[i].active) n++;
+        if (t->slots[i].active && t->slots[i].kind == PUB_SLOT_SUBSCRIPTION)
+            n++;
     return n;
 }
 
@@ -185,10 +202,31 @@ static void track_set_subscriber(moq_pub_track_t *t, moq_subscription_t sub)
     pub_sub_slot_t *s = track_find_free_slot(t);
     if (!s) return;
     s->active = true;
+    s->kind = PUB_SLOT_SUBSCRIPTION;
     s->sub = sub;
     s->sg_open = false;
     s->streaming = false;
     s->cur_group = 0;
+}
+
+static void track_set_publication(moq_pub_track_t *t, moq_publication_t pub)
+{
+    pub_sub_slot_t *s = track_find_free_slot(t);
+    if (!s) return;
+    s->active = true;
+    s->kind = PUB_SLOT_PUBLICATION;
+    s->pub = pub;
+    s->sg_open = false;
+    s->streaming = false;
+    s->cur_group = 0;
+}
+
+static pub_sub_slot_t *track_find_publication_slot(moq_pub_track_t *t)
+{
+    for (size_t i = 0; i < t->slot_cap; i++)
+        if (t->slots[i].active && t->slots[i].kind == PUB_SLOT_PUBLICATION)
+            return &t->slots[i];
+    return NULL;
 }
 
 /* Release a retained-object vector (decref each element's refs, free array). */
@@ -375,6 +413,17 @@ static void track_clear_subscriber(moq_pub_track_t *t)
         track_clear_slot(t->pub, &t->slots[i]);
 }
 
+/* True when the caller's callbacks struct is large enough to include the field
+ * at byte offset `off` of width `sz`. */
+static bool cb_has_field(const moq_pub_callbacks_t *cb, size_t off, size_t sz)
+{
+    return cb->struct_size >= off + sz;
+}
+
+#define CB_HAS(cb, field) \
+    (cb_has_field((cb), offsetof(moq_pub_callbacks_t, field), \
+                  sizeof((cb)->field)) && (cb)->field)
+
 /* -- Helpers ------------------------------------------------------ */
 
 static void *pub_alloc(moq_publisher_t *p, size_t sz) {
@@ -520,6 +569,16 @@ static moq_pub_track_t *find_track_by_sub(moq_publisher_t *pub,
 {
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next)
         if (track_find_slot_by_sub(t, sub))
+            return t;
+    return NULL;
+}
+
+static moq_pub_track_t *find_track_by_pub(moq_publisher_t *pub,
+                                           moq_publication_t pub_handle)
+{
+    for (moq_pub_track_t *t = pub->tracks; t; t = t->next)
+        if (t->publish_requested &&
+            moq_publication_eq(t->publication, pub_handle))
             return t;
     return NULL;
 }
@@ -799,7 +858,7 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
     if (!t) return MOQ_ERR_NOMEM;
     memset(t, 0, sizeof(*t));
     t->pub = pub;
-    t->slot_cap = pub->sub_slot_cap;
+    t->slot_cap = pub->sub_slot_cap + 1;
     t->slots = (pub_sub_slot_t *)pub_alloc(pub,
         t->slot_cap * sizeof(pub_sub_slot_t));
     if (!t->slots) {
@@ -922,6 +981,27 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
         track->ns_entry->refcount <= 1)
         return MOQ_ERR_WRONG_STATE;
 
+    if (track->publish_requested) {
+        pub_sub_slot_t *psl = track_find_publication_slot(track);
+        if (psl && psl->streaming) return MOQ_ERR_WRONG_STATE;
+        if (psl && psl->sg_open) {
+            moq_result_t rc = moq_session_reset_subgroup(pub->session,
+                psl->sg, 0x0, now_us);
+            if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
+            if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
+            psl->sg_open = false;
+        }
+        moq_finish_publish_cfg_t fcfg;
+        moq_finish_publish_cfg_init(&fcfg);
+        moq_result_t rc = moq_session_finish_publish(pub->session,
+            track->publication, &fcfg, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
+        if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
+        track->publish_requested = false;
+        track->publish_ok = false;
+        if (psl) track_clear_slot(pub, psl);
+    }
+
     /* Reset the live streaming subgroup on all active slots and retire each
      * publisher-side subscription, so the session frees its subscription entry
      * before the track is dropped. Without the retire step the session keeps the
@@ -934,6 +1014,9 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
     for (size_t si = 0; si < track->slot_cap; si++) {
         pub_sub_slot_t *sl = &track->slots[si];
         if (!sl->active) continue;
+        /* Publication slots are finished above via PUBLISH_DONE, not retired as
+         * subscriptions; skip them so done_subscribe only sees real subscribers. */
+        if (sl->kind == PUB_SLOT_PUBLICATION) continue;
         if (sl->sg_open) {
             moq_result_t rc = moq_session_reset_subgroup(pub->session,
                 sl->sg, 0x0, now_us);
@@ -1113,8 +1196,12 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         sgcfg.object_properties = need_ext;
         sgcfg.end_of_group = want_eog;
 
-        moq_result_t rc = moq_session_open_subgroup(pub->session,
-            slot->sub, &sgcfg, now_us, &slot->sg);
+        moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
+            ? moq_session_open_pub_subgroup(pub->session,
+                slot->pub, &sgcfg, now_us, &slot->sg)
+            : moq_session_open_subgroup(pub->session,
+                slot->sub, &sgcfg, now_us, &slot->sg);
+
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
             track_clear_slot(pub, slot);
@@ -1158,9 +1245,13 @@ static moq_result_t write_datagram_object(moq_publisher_t *pub,
     const moq_pub_object_cfg_t *obj, uint64_t now_us)
 {
     if (obj->has_status) {
-        moq_result_t rc = moq_session_send_status_datagram(pub->session,
-            slot->sub, obj->group_id, obj->object_id, track->priority,
-            obj->status, now_us);
+        moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
+            ? moq_session_send_pub_status_datagram(pub->session,
+                slot->pub, obj->group_id, obj->object_id, track->priority,
+                obj->status, now_us)
+            : moq_session_send_status_datagram(pub->session,
+                slot->sub, obj->group_id, obj->object_id, track->priority,
+                obj->status, now_us);
         if (rc == MOQ_ERR_STALE_HANDLE) {
             track_clear_slot(pub, slot);
             return MOQ_OK;
@@ -1175,9 +1266,13 @@ static moq_result_t write_datagram_object(moq_publisher_t *pub,
         props_len = moq_rcbuf_len(obj->properties);
     }
 
-    moq_result_t rc = moq_session_send_object_datagram(pub->session,
-        slot->sub, obj->group_id, obj->object_id, track->priority,
-        false, obj->payload, props, props_len, now_us);
+    moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
+        ? moq_session_send_pub_object_datagram(pub->session,
+            slot->pub, obj->group_id, obj->object_id, track->priority,
+            false, obj->payload, props, props_len, now_us)
+        : moq_session_send_object_datagram(pub->session,
+            slot->sub, obj->group_id, obj->object_id, track->priority,
+            false, obj->payload, props, props_len, now_us);
     if (rc == MOQ_ERR_STALE_HANDLE) {
         track_clear_slot(pub, slot);
         return MOQ_OK;
@@ -1251,6 +1346,12 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (track->ended) return MOQ_OK;          /* idempotent: already terminated */
+
+    /* End the publication (PUBLISH_DONE) first, then any subscription slot. */
+    {
+        moq_result_t rc = moq_pub_unpublish_track(pub, track, now_us);
+        if (rc != MOQ_OK) return rc;
+    }
 
     /* Single active slot, like the write fan-out (documented v0 limit). */
     pub_sub_slot_t *slot = track_first_active_slot(track);
@@ -1946,6 +2047,99 @@ bool moq_pub_namespace_accepted(const moq_publisher_t *pub,
            track->ns_entry->state == PUB_NS_ACCEPTED;
 }
 
+void moq_pub_publish_cfg_init(moq_pub_publish_cfg_t *cfg)
+{
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->struct_size = sizeof(*cfg);
+    cfg->has_forward = true;
+    cfg->forward = true;
+}
+
+moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
+                                   moq_pub_track_t *track,
+                                   const moq_pub_publish_cfg_t *cfg,
+                                   uint64_t now_us)
+{
+    if (!pub || !track || !cfg) return MOQ_ERR_INVAL;
+    if (track->pub != pub) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < sizeof(moq_pub_publish_cfg_t)) return MOQ_ERR_INVAL;
+    if (pub->closed) return MOQ_ERR_CLOSED;
+    if (track->ended) return MOQ_ERR_WRONG_STATE;
+    if (track->publish_requested) return MOQ_OK;   /* idempotent */
+
+    moq_publish_cfg_t pcfg;
+    moq_publish_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ track->ns_parts, track->ns_count };
+    pcfg.track_name = (moq_bytes_t){ track->name_buf, track->name_len };
+    pcfg.has_track_alias = cfg->has_track_alias;
+    pcfg.track_alias = cfg->track_alias;
+    pcfg.has_forward = cfg->has_forward;
+    pcfg.forward = cfg->forward;
+    pcfg.track_properties = cfg->track_properties;
+    pcfg.auth_tokens = cfg->auth_tokens;
+    pcfg.auth_token_count = cfg->auth_token_count;
+
+    moq_publication_t handle;
+    moq_result_t rc = moq_session_publish(pub->session, &pcfg, now_us, &handle);
+    if (rc < 0) return rc;   /* REQUEST_BLOCKED / WOULD_BLOCK: nothing bound, retry */
+
+    track->publication = handle;
+    track->publish_requested = true;
+    track->publish_forward = cfg->has_forward ? cfg->forward : true;
+    return MOQ_OK;
+}
+
+moq_result_t moq_pub_unpublish_track(moq_publisher_t *pub,
+                                     moq_pub_track_t *track,
+                                     uint64_t now_us)
+{
+    if (!pub || !track) return MOQ_ERR_INVAL;
+    if (track->pub != pub) return MOQ_ERR_INVAL;
+    if (pub->closed) return MOQ_ERR_CLOSED;
+    if (!track->publish_requested) return MOQ_OK;   /* not published: no-op */
+
+    /* Close the data subgroup cleanly before PUBLISH_DONE (finish needs no open
+     * stream). Retryable: WOULD_BLOCK at any step lets the caller retry. */
+    pub_sub_slot_t *psl = track_find_publication_slot(track);
+    if (psl && psl->streaming) return MOQ_ERR_WRONG_STATE;
+    if (psl && psl->sg_open) {
+        moq_result_t rc = moq_session_close_subgroup(pub->session,
+            psl->sg, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
+        if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
+        psl->sg_open = false;
+    }
+
+    moq_finish_publish_cfg_t fcfg;
+    moq_finish_publish_cfg_init(&fcfg);
+    moq_result_t rc = moq_session_finish_publish(pub->session,
+        track->publication, &fcfg, now_us);
+    if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
+    if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
+
+    track->publish_requested = false;
+    track->publish_ok = false;
+    if (psl) track_clear_slot(pub, psl);
+    return MOQ_OK;
+}
+
+bool moq_pub_track_is_published(const moq_publisher_t *pub,
+                                const moq_pub_track_t *track)
+{
+    if (!pub || !track) return false;
+    if (track->pub != pub) return false;
+    return track->publish_ok;
+}
+
+bool moq_pub_track_forward(const moq_publisher_t *pub,
+                           const moq_pub_track_t *track)
+{
+    if (!pub || !track) return false;
+    if (track->pub != pub) return false;
+    return track->publish_ok && track->publish_forward;
+}
+
 bool moq_pub_is_draining(const moq_publisher_t *pub)
 {
     if (!pub) return false;
@@ -2106,6 +2300,66 @@ moq_result_t moq_pub_tick(moq_publisher_t *pub, uint64_t now_us)
                     ev.u.subscribe_updated.delivery_timeout_us;
                 pub->callbacks.on_subscriber_updated(
                     pub->callbacks.ctx, t, &info);
+            }
+            break;
+        }
+
+        case MOQ_EVENT_PUBLISH_OK: {
+            moq_pub_track_t *t = find_track_by_pub(pub,
+                ev.u.publish_ok.pub);
+            if (t) {
+                t->publish_ok = true;
+                t->publish_forward = ev.u.publish_ok.send_allowed;
+                if (!track_find_publication_slot(t))
+                    track_set_publication(t, t->publication);
+                if (CB_HAS(&pub->callbacks, on_publish_ok))
+                    pub->callbacks.on_publish_ok(pub->callbacks.ctx, t,
+                        t->publish_forward);
+            }
+            break;
+        }
+
+        case MOQ_EVENT_PUBLISH_UPDATED: {
+            moq_pub_track_t *t = find_track_by_pub(pub,
+                ev.u.publish_updated.pub);
+            if (t && ev.u.publish_updated.has_forward) {
+                t->publish_forward = ev.u.publish_updated.forward;
+                if (CB_HAS(&pub->callbacks, on_publish_forward_changed))
+                    pub->callbacks.on_publish_forward_changed(
+                        pub->callbacks.ctx, t, t->publish_forward);
+            }
+            break;
+        }
+
+        case MOQ_EVENT_PUBLISH_ERROR: {
+            moq_pub_track_t *t = find_track_by_pub(pub,
+                ev.u.publish_error.pub);
+            if (t) {
+                /* Publication terminated before acceptance: clear so a later
+                 * moq_pub_publish_track may retry, and drop any data slot. */
+                t->publish_requested = false;
+                t->publish_ok = false;
+                pub_sub_slot_t *sl = track_find_publication_slot(t);
+                if (sl) track_clear_slot(pub, sl);
+                if (CB_HAS(&pub->callbacks, on_publish_error))
+                    pub->callbacks.on_publish_error(pub->callbacks.ctx, t,
+                        ev.u.publish_error.error_code);
+            }
+            break;
+        }
+
+        case MOQ_EVENT_PUBLISH_FINISHED:
+        case MOQ_EVENT_PUBLISH_UNSUBSCRIBED: {
+            moq_publication_t ph = (ev.kind == MOQ_EVENT_PUBLISH_FINISHED)
+                ? ev.u.publish_finished.pub
+                : ev.u.publish_unsubscribed.pub;
+            moq_pub_track_t *t = find_track_by_pub(pub, ph);
+            if (t) {
+                t->publish_ok = false;
+                pub_sub_slot_t *sl = track_find_publication_slot(t);
+                if (sl) track_clear_slot(pub, sl);
+                if (CB_HAS(&pub->callbacks, on_publish_finished))
+                    pub->callbacks.on_publish_finished(pub->callbacks.ctx, t);
             }
             break;
         }
