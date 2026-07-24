@@ -1,4 +1,4 @@
-#include <moq/codec_string.h>
+#include <moq/codec_signaling.h>
 
 #include <stddef.h>
 #include <string.h>

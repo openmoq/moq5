@@ -1,4 +1,4 @@
-#include <moq/codec_string.h>
+#include <moq/codec_signaling.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -847,6 +847,6 @@ int main(void)
         CHECK(moq_codec_init_data_build(&cfg, out, sizeof(out), &out_len) == MOQ_ERR_PROTO);
     }
 
-    if (failures == 0) printf("PASS: test_codec_string\n");
+    if (failures == 0) printf("PASS: test_codec_signaling\n");
     return failures;
 }

@@ -1,11 +1,12 @@
-#ifndef MOQ_CODEC_STRING_H
-#define MOQ_CODEC_STRING_H
+#ifndef MOQ_CODEC_SIGNALING_H
+#define MOQ_CODEC_SIGNALING_H
 
 /*
- * MSF codec utilities. Two composable helpers for an MSF catalog track:
- * moq_codec_init_data_build() produces the decoder configuration record
- * (init_data), and moq_codec_string_format() produces the codec string
- * (e.g. "avc1.64001f", "mp4a.40.2") from that same record.
+ * Codec signaling utilities. Two composable helpers producing the artifacts
+ * a catalog uses to signal a media track's codec: moq_codec_init_data_build()
+ * produces the decoder configuration record (init_data), and
+ * moq_codec_string_format() produces the codec string (e.g. "avc1.64001f",
+ * "mp4a.40.2") from that same record.
  *
  * Pure, allocation-free, thread-safe. The caller always states the byte
  * format explicitly (no sniffing). Output goes to a caller-provided
@@ -138,4 +139,4 @@ MOQ_API moq_result_t moq_codec_string_format(const moq_codec_string_cfg_t *cfg,
 }
 #endif
 
-#endif /* MOQ_CODEC_STRING_H */
+#endif /* MOQ_CODEC_SIGNALING_H */
