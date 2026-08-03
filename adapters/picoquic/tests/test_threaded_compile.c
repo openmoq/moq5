@@ -70,8 +70,10 @@ static void test_free(void *ptr, size_t size, void *ctx)
 
 /* -- Pump helpers --------------------------------------------------- */
 
-static int dummy_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int dummy_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)t; (void)now; (void)ctx;
     return 0;
 }
@@ -81,8 +83,10 @@ typedef struct {
     int          exit_after;
 } pump_counter_t;
 
-static int counting_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int counting_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)t; (void)now;
     pump_counter_t *pc = (pump_counter_t *)ctx;
     int n = __atomic_add_fetch(&pc->pump_count, 1, __ATOMIC_SEQ_CST);
@@ -139,8 +143,10 @@ typedef struct {
     volatile int        called;
 } stop_from_pump_ctx_t;
 
-static int stop_from_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int stop_from_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     stop_from_pump_ctx_t *sc = (stop_from_pump_ctx_t *)ctx;
     if (!__atomic_load_n(&sc->called, __ATOMIC_ACQUIRE)) {
@@ -174,8 +180,10 @@ typedef struct {
     volatile int      finished;        /* latched once finish succeeds */
 } smoke_srv_t;
 
-static int smoke_srv_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     smoke_srv_t *s = (smoke_srv_t *)ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
@@ -263,8 +271,10 @@ static void smoke_on_closed(void *ctx, uint64_t error_code)
     __atomic_store_n(&c->session_closed, 1, __ATOMIC_RELEASE);
 }
 
-static int smoke_cli_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int smoke_cli_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     smoke_cli_t *c = (smoke_cli_t *)ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
@@ -328,6 +338,21 @@ typedef struct {
     int           n;
     volatile int  may_close;    /* test arms the drop after both received */
     int           close_done;   /* the 2nd connection has been closed */
+
+    /* lane-contract observations (network-thread writes; the test thread
+     * reads after waits, ordered by the wake/wait handshake) */
+    int           max_in_pass;  /* most conns one pump pass iterated */
+    int           pump_depth;
+    volatile int  reentry;      /* pump re-entered (never expected) */
+    volatile int  wrong_lane;   /* lane index / conn_lane mismatch */
+
+    /* pump-window enforcement: a conn captured in-pump, then re-checked
+     * from on_activity (network thread, OUTSIDE the pump window) */
+    moq_pq_threaded_conn_t *act_conn;
+    volatile int  act_ran;
+    volatile int  act_nc_null;      /* lane_next_conn refused */
+    volatile int  act_cs_null;      /* conn_session refused */
+    volatile int  act_cc_invalid;   /* conn_close refused */
 } mc_srv_t;
 
 static mc_srv_conn_t *mc_srv_find(mc_srv_t *s, moq_pq_threaded_conn_t *c)
@@ -359,15 +384,31 @@ static void mc_srv_write(moq_session_t *sess, moq_subscription_t sub,
     moq_session_close_subgroup(sess, h, now);
 }
 
-static int mc_srv_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int mc_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
     mc_srv_t *s = (mc_srv_t *)ctx;
+
+    /* lane contract: not re-entered; iteration stays on the facade's one
+     * lane (index 0). */
+    if (++s->pump_depth > 1) s->reentry = 1;
+    if (moq_pq_threaded_lane_index(lane) != 0 ||
+        moq_pq_threaded_lane(t, 0) != lane ||
+        moq_pq_threaded_lane(t, 1) != NULL)
+        s->wrong_lane = 1;
+
+    int seen = 0;
     moq_pq_threaded_conn_t *c = NULL;
-    while ((c = moq_pq_threaded_next_conn(t, c)) != NULL) {
+    while ((c = moq_pq_threaded_lane_next_conn(lane, c)) != NULL) {
+        seen++;
+        if (moq_pq_threaded_conn_lane(c) != lane)
+            s->wrong_lane = 1;
         moq_session_t *sess = moq_pq_threaded_conn_session(c);
         if (!sess) continue;
         mc_srv_conn_t *e = mc_srv_find(s, c);
         if (!e) continue;
+        /* the first conn (survivor; never closed) is the pump-window probe */
+        if (!s->act_conn) s->act_conn = s->conns[0].conn;
 
         moq_event_t ev[16]; size_t ne;
         moq_session_poll_events_ex(sess, ev, 16, sizeof(moq_event_t), &ne);
@@ -402,7 +443,24 @@ static int mc_srv_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
         moq_pq_threaded_conn_close(s->conns[1].conn, 0);
         s->close_done = 1;
     }
+    if (seen > s->max_in_pass) s->max_in_pass = seen;
+    s->pump_depth--;
     return 0;
+}
+
+/* on_activity runs on the network thread but OUTSIDE the pump window: the
+ * per-connection API must refuse, even holding a conn valid inside the pump. */
+static void mc_srv_activity(moq_pq_threaded_t *t, void *ctx)
+{
+    mc_srv_t *s = (mc_srv_t *)ctx;
+    if (s->act_ran || !s->act_conn) return;
+    s->act_nc_null =
+        (moq_pq_threaded_lane_next_conn(moq_pq_threaded_lane(t, 0),
+                                        NULL) == NULL);
+    s->act_cs_null = (moq_pq_threaded_conn_session(s->act_conn) == NULL);
+    s->act_cc_invalid =
+        (moq_pq_threaded_conn_close(s->act_conn, 9) == MOQ_ERR_INVAL);
+    s->act_ran = 1;
 }
 
 /* Raw subscriber client: subscribe to "mconn"/"vid" and count received
@@ -413,8 +471,10 @@ typedef struct {
     volatile int        received;   /* count of objects received */
 } mc_cli_t;
 
-static int mc_cli_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int mc_cli_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     mc_cli_t *c = (mc_cli_t *)ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
@@ -450,13 +510,13 @@ static void make_client_cfg(moq_pq_threaded_cfg_t *cfg,
     cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
     cfg->host = "localhost";
     cfg->port = 4443;
-    cfg->on_pump = dummy_pump;
+    cfg->on_lane_pump = dummy_pump;
 }
 
 #ifdef MOQ_TEST_CERT_PATH
 /* -- Terminal-conn lifecycle pump ------------------------------------ *
  * Tracks ONE accepted connection through the app's eyes: polls its
- * session only through live next_conn() iteration (never a stale
+ * session only through live lane iteration iteration (never a stale
  * pointer), records whether MOQ_EVENT_SESSION_CLOSED was observed before
  * the conn vanished from iteration, and trips on pump re-entrancy. */
 typedef struct {
@@ -469,8 +529,10 @@ typedef struct {
     int reentered;
 } lifecycle_ctx_t;
 
-static int lifecycle_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
+static int lifecycle_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *vctx)
 {
+    (void)lane;
     (void)now;
     lifecycle_ctx_t *lc = (lifecycle_ctx_t *)vctx;
     if (__atomic_exchange_n(&lc->in_pump, 1, __ATOMIC_ACQ_REL))
@@ -478,7 +540,7 @@ static int lifecycle_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
 
     int present = 0;
     moq_pq_threaded_conn_t *c = NULL;
-    while ((c = moq_pq_threaded_next_conn(t, c)) != NULL) {
+    while ((c = moq_pq_threaded_lane_next_conn(lane, c)) != NULL) {
         if (!lc->conn) {
             lc->conn = c;
             __atomic_store_n(&lc->accepted, 1, __ATOMIC_RELEASE);
@@ -520,7 +582,7 @@ static void make_server_cfg_real(moq_pq_threaded_cfg_t *cfg,
     cfg->cert_path = MOQ_TEST_CERT_PATH;
     cfg->key_path = MOQ_TEST_KEY_PATH;
     cfg->port = 14600 + (rand() % 400);
-    cfg->on_pump = dummy_pump;
+    cfg->on_lane_pump = dummy_pump;
     cfg->insecure_skip_verify = true;
 }
 #endif
@@ -534,7 +596,7 @@ static void make_server_cfg_stub(moq_pq_threaded_cfg_t *cfg,
     cfg->cert_path = "/tmp/nonexistent_cert.pem";
     cfg->key_path = "/tmp/nonexistent_key.pem";
     cfg->port = 4443;
-    cfg->on_pump = dummy_pump;
+    cfg->on_lane_pump = dummy_pump;
 }
 
 /* -- Waiter thread -------------------------------------------------- */
@@ -583,7 +645,7 @@ int main(void)
         CHECK(cfg.struct_size ==
               (uint32_t)offsetof(moq_pq_threaded_cfg_t, goaway_timeout_us));
         CHECK(cfg.alloc == NULL);       /* inside prefix: cleared */
-        CHECK(cfg.on_pump == NULL);     /* inside prefix: cleared */
+        CHECK(cfg.on_lane_pump == NULL);     /* inside prefix: cleared */
         /* Appended fields (after the prefix) NOT written. */
         CHECK(cfg.goaway_timeout_us == 0xABABABABABABABABULL);
         CHECK(cfg.max_connections == 0xABABABABu);
@@ -628,7 +690,7 @@ int main(void)
         moq_pq_threaded_cfg_init_sized(&cfg, sizeof(cfg));
         CHECK(cfg.struct_size == sizeof(moq_pq_threaded_cfg_t));
         CHECK(cfg.alloc == NULL);
-        CHECK(cfg.on_pump == NULL);
+        CHECK(cfg.on_lane_pump == NULL);
         CHECK(cfg.goaway_timeout_us == 0);  /* appended fields zero-init */
         CHECK(cfg.max_connections == 0);
         CHECK(cfg.idle_timeout_ms == 0);    /* 0 = picoquic default */
@@ -704,7 +766,45 @@ int main(void)
         CHECK(moq_pq_threaded_conn(NULL) == NULL);
         CHECK(moq_pq_threaded_is_fatal(NULL) == false);
         CHECK(moq_pq_threaded_fatal_code(NULL) == 0);
+        /* lane API NULL-safety */
+        CHECK(moq_pq_threaded_lane_count(NULL) == 0);
+        CHECK(moq_pq_threaded_lane(NULL, 0) == NULL);
+        CHECK(moq_pq_threaded_lane_index(NULL) == 0);
+        CHECK(moq_pq_threaded_conn_lane(NULL) == NULL);
+        CHECK(moq_pq_threaded_lane_wake(NULL) == MOQ_ERR_INVAL);
         PASS("null_args");
+    }
+
+    /* ================================================================ */
+    /* Lane config: one lane; lane_count > 1 refused (no clamp)         */
+    /* ================================================================ */
+
+    {
+        /* > 1 is unsupported (single network thread; no faked concurrency) */
+        moq_pq_threaded_cfg_t cfg;
+        moq_pq_threaded_t *t = NULL;
+        make_client_cfg(&cfg, moq_alloc_default());
+        cfg.lane_count = 2;
+        CHECK(moq_pq_threaded_create(&cfg, &t) == MOQ_ERR_UNSUPPORTED);
+        CHECK(t == NULL);
+
+        make_client_cfg(&cfg, moq_alloc_default());
+        cfg.lane_count = 5;
+        CHECK(moq_pq_threaded_create(&cfg, &t) == MOQ_ERR_UNSUPPORTED);
+
+        /* 0 (unset) is the single lane; the accessors describe it */
+        make_client_cfg(&cfg, moq_alloc_default());
+        t = NULL;
+        if (moq_pq_threaded_create(&cfg, &t) == MOQ_OK && t) {
+            CHECK(moq_pq_threaded_lane_count(t) == 1);
+            moq_pq_threaded_lane_t *lane = moq_pq_threaded_lane(t, 0);
+            CHECK(lane != NULL);
+            CHECK(moq_pq_threaded_lane_index(lane) == 0);
+            CHECK(moq_pq_threaded_lane(t, 1) == NULL);  /* no clamp */
+            moq_pq_threaded_stop(t);
+            moq_pq_threaded_destroy(t);
+        }
+        PASS("lane_config");
     }
 
     /* ================================================================ */
@@ -718,7 +818,7 @@ int main(void)
         moq_pq_threaded_cfg_init(&cfg);
         cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
         cfg.host = "localhost"; cfg.port = 4443;
-        cfg.on_pump = dummy_pump;
+        cfg.on_lane_pump = dummy_pump;
         CHECK(moq_pq_threaded_create(&cfg, &t) == MOQ_ERR_INVAL);
 
         moq_alloc_t bad_alloc = { NULL, test_alloc, NULL, NULL };
@@ -726,12 +826,12 @@ int main(void)
         CHECK(moq_pq_threaded_create(&cfg, &t) == MOQ_ERR_INVAL);
 
         moq_pq_threaded_cfg_init(&cfg);
-        cfg.alloc = &alloc; cfg.on_pump = dummy_pump;
+        cfg.alloc = &alloc; cfg.on_lane_pump = dummy_pump;
         cfg.host = "localhost"; cfg.port = 4443;
         CHECK(moq_pq_threaded_create(&cfg, &t) == MOQ_ERR_INVAL);
 
         make_client_cfg(&cfg, &alloc);
-        cfg.on_pump = NULL;
+        cfg.on_lane_pump = NULL;
         CHECK(moq_pq_threaded_create(&cfg, &t) == MOQ_ERR_INVAL);
 
         make_client_cfg(&cfg, &alloc);
@@ -871,7 +971,7 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* Client wake returns OK and on_pump runs                           */
+    /* Client wake returns OK and on_lane_pump runs                           */
     /* ================================================================ */
 
     {
@@ -880,8 +980,8 @@ int main(void)
         make_client_cfg(&cfg, &alloc);
         cfg.insecure_skip_verify = true;
         cfg.port = 14600 + (rand() % 400);
-        cfg.on_pump = counting_pump;
-        cfg.on_pump_ctx = &pc;
+        cfg.on_lane_pump = counting_pump;
+        cfg.on_lane_pump_ctx = &pc;
         moq_pq_threaded_t *t = NULL;
         moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
         CHECK(rc == MOQ_OK);
@@ -977,8 +1077,8 @@ int main(void)
         make_client_cfg(&cfg, &alloc);
         cfg.insecure_skip_verify = true;
         cfg.port = 14600 + (rand() % 400);
-        cfg.on_pump = counting_pump;
-        cfg.on_pump_ctx = &pc;
+        cfg.on_lane_pump = counting_pump;
+        cfg.on_lane_pump_ctx = &pc;
         moq_pq_threaded_t *t = NULL;
         moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
         CHECK(rc == MOQ_OK);
@@ -1071,7 +1171,7 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* Client stop from on_pump → WRONG_STATE                           */
+    /* Client stop from on_lane_pump → WRONG_STATE                           */
     /* ================================================================ */
 
     {
@@ -1080,8 +1180,8 @@ int main(void)
         make_client_cfg(&cfg, &alloc);
         cfg.insecure_skip_verify = true;
         cfg.port = 14600 + (rand() % 400);
-        cfg.on_pump = stop_from_pump;
-        cfg.on_pump_ctx = &sc;
+        cfg.on_lane_pump = stop_from_pump;
+        cfg.on_lane_pump_ctx = &sc;
         moq_pq_threaded_t *t = NULL;
         moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
         CHECK(rc == MOQ_OK);
@@ -1133,8 +1233,8 @@ int main(void)
         make_client_cfg(&cfg, &alloc);
         cfg.insecure_skip_verify = true;
         cfg.port = 14600 + (rand() % 400);
-        cfg.on_pump = counting_pump;
-        cfg.on_pump_ctx = &pc;
+        cfg.on_lane_pump = counting_pump;
+        cfg.on_lane_pump_ctx = &pc;
         moq_pq_threaded_t *t = NULL;
         moq_result_t rc = moq_pq_threaded_create(&cfg, &t);
         CHECK(rc == MOQ_OK);
@@ -1231,8 +1331,8 @@ int main(void)
         srv_cfg.port = server_port;
         srv_cfg.send_request_capacity = true;
         srv_cfg.initial_request_capacity = 64;
-        srv_cfg.on_pump = counting_pump;
-        srv_cfg.on_pump_ctx = &srv_pc;
+        srv_cfg.on_lane_pump = counting_pump;
+        srv_cfg.on_lane_pump_ctx = &srv_pc;
         moq_pq_threaded_t *srv = NULL;
         moq_result_t src = moq_pq_threaded_create(&srv_cfg, &srv);
         CHECK(src == MOQ_OK);
@@ -1249,8 +1349,8 @@ int main(void)
             cli_cfg.insecure_skip_verify = true;
             cli_cfg.send_request_capacity = true;
             cli_cfg.initial_request_capacity = 64;
-            cli_cfg.on_pump = counting_pump;
-            cli_cfg.on_pump_ctx = &cli_pc;
+            cli_cfg.on_lane_pump = counting_pump;
+            cli_cfg.on_lane_pump_ctx = &cli_pc;
             moq_pq_threaded_t *cli = NULL;
             moq_result_t crc = moq_pq_threaded_create(&cli_cfg, &cli);
             CHECK(crc == MOQ_OK);
@@ -1288,11 +1388,11 @@ int main(void)
     /* -- Server lifecycle: terminal conn observable before prune -------- */
     /* Contract: a server connection that turns terminal because the PEER
      * closed (or transport/bridge fatal) must remain visible in
-     * next_conn() for an on_pump in the same packet-loop callback, so the
+     * lane iteration for an on_lane_pump in the same packet-loop callback, so the
      * app can poll MOQ_EVENT_SESSION_CLOSED -- only then may the adapter
      * prune/destroy it. Pump/event-driven assertions only: the pump
      * records whether the close event was polled BEFORE the conn vanished
-     * from iteration. Also trips on on_pump re-entrancy (the closed-conn
+     * from iteration. Also trips on on_lane_pump re-entrancy (the closed-conn
      * observation pass is an extra SEQUENTIAL pump, never nested). */
     {
         int port = 14600 + (rand() % 400);
@@ -1302,8 +1402,8 @@ int main(void)
         moq_pq_threaded_cfg_t srv_cfg;
         make_server_cfg_real(&srv_cfg, moq_alloc_default());
         srv_cfg.port = port;
-        srv_cfg.on_pump = lifecycle_pump;
-        srv_cfg.on_pump_ctx = &lc;
+        srv_cfg.on_lane_pump = lifecycle_pump;
+        srv_cfg.on_lane_pump_ctx = &lc;
         /* The client below vanishes abruptly (its stop sends no
          * CONNECTION_CLOSE); the first-class idle-timeout knob turns that
          * into the transport-close path in ~1s, well inside the bounded
@@ -1322,7 +1422,7 @@ int main(void)
             cli_cfg.host = "localhost";
             cli_cfg.port = port;
             cli_cfg.insecure_skip_verify = true;
-            cli_cfg.on_pump = dummy_pump;
+            cli_cfg.on_lane_pump = dummy_pump;
             moq_pq_threaded_t *cli = NULL;
             moq_result_t crc = moq_pq_threaded_create(&cli_cfg, &cli);
             CHECK(crc == MOQ_OK);
@@ -1339,7 +1439,7 @@ int main(void)
                 moq_pq_threaded_destroy(cli);
 
                 /* Wait for the prune (cross-thread count accessor: once the
-                 * only conn is gone, on_pump no longer runs, so the pump
+                 * only conn is gone, on_lane_pump no longer runs, so the pump
                  * itself cannot witness the absence). */
                 for (int tries = 0; tries < 400 &&
                      moq_pq_threaded_conn_count(srv) > 0;
@@ -1348,7 +1448,7 @@ int main(void)
                 CHECK(moq_pq_threaded_conn_count(srv) == 0);
 
                 /* THE contract, as an ordering: by the time the conn was
-                 * pruned, SESSION_CLOSED had been polled from an on_pump
+                 * pruned, SESSION_CLOSED had been polled from an on_lane_pump
                  * with the conn still iterable -- and no pump ever saw the
                  * conn vanish unobserved. */
                 CHECK(__atomic_load_n(&lc.saw_session_closed,
@@ -1377,8 +1477,10 @@ int main(void)
         srv_cfg.port = server_port;
         srv_cfg.send_request_capacity = true;
         srv_cfg.initial_request_capacity = 64;
-        srv_cfg.on_pump = mc_srv_pump;
-        srv_cfg.on_pump_ctx = &srv_state;
+        srv_cfg.on_lane_pump = mc_srv_pump;
+        srv_cfg.on_lane_pump_ctx = &srv_state;
+        srv_cfg.on_activity = mc_srv_activity;
+        srv_cfg.on_activity_ctx = &srv_state;
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&srv_cfg, &srv) == MOQ_OK && srv) {
             mc_cli_t sa = {0}, sb = {0};
@@ -1386,8 +1488,8 @@ int main(void)
             make_client_cfg(&ca, moq_alloc_default());
             ca.port = server_port; ca.insecure_skip_verify = true;
             ca.send_request_capacity = true; ca.initial_request_capacity = 64;
-            ca.on_pump = mc_cli_pump; ca.on_pump_ctx = &sa;
-            cb = ca; cb.on_pump_ctx = &sb;
+            ca.on_lane_pump = mc_cli_pump; ca.on_lane_pump_ctx = &sa;
+            cb = ca; cb.on_lane_pump_ctx = &sb;
 
             moq_pq_threaded_t *a = NULL, *b = NULL;
             moq_result_t rca = moq_pq_threaded_create(&ca, &a);
@@ -1413,12 +1515,30 @@ int main(void)
                 CHECK(__atomic_load_n(&sb.received, __ATOMIC_SEQ_CST) >= 1);
                 CHECK(!moq_pq_threaded_is_fatal(srv));
 
+                /* lane contract: the server pump saw BOTH of its lane's
+                 * connections in one pass, was never re-entered, and stayed
+                 * on the facade's one lane. */
+                CHECK(srv_state.max_in_pass == 2);
+                CHECK(srv_state.reentry == 0);
+                CHECK(srv_state.wrong_lane == 0);
+
+                /* pump-window enforcement: from on_activity (network thread,
+                 * outside the pump window) the per-connection API refuses. */
+                for (int i = 0; i < 200 && !srv_state.act_ran; i++) {
+                    moq_pq_threaded_wake(srv);
+                    moq_pq_threaded_wait(srv, 20000);
+                }
+                CHECK(srv_state.act_ran == 1);
+                CHECK(srv_state.act_nc_null == 1);
+                CHECK(srv_state.act_cs_null == 1);
+                CHECK(srv_state.act_cc_invalid == 1);
+
                 /* Arm the drop only after both received, so neither is closed
                  * before its first delivery. */
                 __atomic_store_n(&srv_state.may_close, 1, __ATOMIC_RELEASE);
 
                 /* The server closes the 2nd connection (moq_pq_threaded_conn_close
-                 * inside on_pump, deferred prune) and then delivers a SECOND
+                 * inside on_lane_pump, deferred prune) and then delivers a SECOND
                  * object to the survivor. Prove: conn_count drops to 1, the
                  * survivor receives its 2nd object, and the server stays alive. */
                 int done = 0;
@@ -1467,31 +1587,44 @@ int main(void)
         moq_pq_threaded_cfg_t srv_cfg;
         make_server_cfg_real(&srv_cfg, moq_alloc_default());
         srv_cfg.port = server_port;
-        srv_cfg.on_pump = counting_pump;
-        srv_cfg.on_pump_ctx = &srv_pc;
+        srv_cfg.on_lane_pump = counting_pump;
+        srv_cfg.on_lane_pump_ctx = &srv_pc;
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&srv_cfg, &srv) == MOQ_OK && srv) {
             moq_pq_threaded_t *cli[MC_MANY] = { 0 };
             pump_counter_t cli_pc[MC_MANY];
             memset(cli_pc, 0, sizeof(cli_pc));
-            int created = 1;
-            for (int i = 0; i < MC_MANY && created; i++) {
+            int connected = 1;
+            for (int i = 0; i < MC_MANY && connected; i++) {
                 moq_pq_threaded_cfg_t c;
                 make_client_cfg(&c, moq_alloc_default());
                 c.port = server_port;
                 c.insecure_skip_verify = true;
-                c.on_pump = counting_pump;
-                c.on_pump_ctx = &cli_pc[i];
-                if (moq_pq_threaded_create(&c, &cli[i]) != MOQ_OK)
-                    created = 0;
-            }
-            CHECK(created);
+                c.on_lane_pump = counting_pump;
+                c.on_lane_pump_ctx = &cli_pc[i];
+                if (moq_pq_threaded_create(&c, &cli[i]) != MOQ_OK) {
+                    connected = 0;
+                    continue;
+                }
 
-            if (created) {
+                /* Keep every earlier client live while this one completes
+                 * negotiation. This proves the transport accepts the tenth
+                 * concurrent connection without making the result depend on
+                 * a burst of ten handshakes completing in lockstep. */
+                int ready = 0;
+                for (int tries = 0; tries < 200 && !ready; tries++) {
+                    moq_pq_threaded_wait(cli[i], 25000);
+                    ready =
+                        moq_pq_threaded_negotiated_version(cli[i]) != 0;
+                }
+                connected = ready && !moq_pq_threaded_is_fatal(cli[i]);
+            }
+            CHECK(connected);
+
+            if (connected) {
                 int ok = 0;
-                for (int i = 0; i < 600 && !ok; i++) {
-                    moq_pq_threaded_wake(srv);
-                    moq_pq_threaded_wait(srv, 20000);
+                for (int i = 0; i < 200 && !ok; i++) {
+                    moq_pq_threaded_wait(srv, 25000);
                     ok = moq_pq_threaded_conn_count(srv) == MC_MANY;
                 }
                 CHECK(moq_pq_threaded_conn_count(srv) == MC_MANY);
@@ -1540,8 +1673,8 @@ int main(void)
             srv_cfg.max_connections = 1;   /* cap: only client A fits */
             srv_cfg.send_request_capacity = true;
             srv_cfg.initial_request_capacity = 64;
-            srv_cfg.on_pump = counting_pump;
-            srv_cfg.on_pump_ctx = &srv_pc;
+            srv_cfg.on_lane_pump = counting_pump;
+            srv_cfg.on_lane_pump_ctx = &srv_pc;
             moq_pq_threaded_t *srv = NULL;
             if (moq_pq_threaded_create(&srv_cfg, &srv) != MOQ_OK) continue;
 
@@ -1554,8 +1687,8 @@ int main(void)
             a_cfg.insecure_skip_verify = true;
             a_cfg.send_request_capacity = true;
             a_cfg.initial_request_capacity = 64;
-            a_cfg.on_pump = counting_pump;
-            a_cfg.on_pump_ctx = &a_pc;
+            a_cfg.on_lane_pump = counting_pump;
+            a_cfg.on_lane_pump_ctx = &a_pc;
             moq_pq_threaded_t *a = NULL;
             if (moq_pq_threaded_create(&a_cfg, &a) == MOQ_OK && a) {
                 for (int tries = 0; tries < 200 && !a_serving; tries++) {
@@ -1641,8 +1774,8 @@ int main(void)
             srv_cfg.port = server_port;
             srv_cfg.send_request_capacity = true;
             srv_cfg.initial_request_capacity = 64;
-            srv_cfg.on_pump = counting_pump;
-            srv_cfg.on_pump_ctx = &srv_pc;
+            srv_cfg.on_lane_pump = counting_pump;
+            srv_cfg.on_lane_pump_ctx = &srv_pc;
             moq_pq_threaded_t *srv = NULL;
             if (moq_pq_threaded_create(&srv_cfg, &srv) != MOQ_OK) continue;
 
@@ -1683,8 +1816,8 @@ int main(void)
             b_cfg.insecure_skip_verify = true;
             b_cfg.send_request_capacity = true;
             b_cfg.initial_request_capacity = 64;
-            b_cfg.on_pump = counting_pump;
-            b_cfg.on_pump_ctx = &cli_pc;
+            b_cfg.on_lane_pump = counting_pump;
+            b_cfg.on_lane_pump_ctx = &cli_pc;
             moq_pq_threaded_t *b = NULL;
             if (moq_pq_threaded_create(&b_cfg, &b) == MOQ_OK && b) {
                 for (int tries = 0; tries < 200 && !b_reachable; tries++) {
@@ -1727,8 +1860,8 @@ int main(void)
         srv_cfg.port = server_port;
         srv_cfg.send_request_capacity = true;
         srv_cfg.initial_request_capacity = 64;
-        srv_cfg.on_pump = smoke_srv_pump;
-        srv_cfg.on_pump_ctx = &srv_state;
+        srv_cfg.on_lane_pump = smoke_srv_pump;
+        srv_cfg.on_lane_pump_ctx = &srv_state;
         moq_pq_threaded_t *srv = NULL;
         moq_result_t src = moq_pq_threaded_create(&srv_cfg, &srv);
         CHECK(src == MOQ_OK);
@@ -1744,8 +1877,8 @@ int main(void)
             cli_cfg.insecure_skip_verify = true;
             cli_cfg.send_request_capacity = true;
             cli_cfg.initial_request_capacity = 64;
-            cli_cfg.on_pump = smoke_cli_pump;
-            cli_cfg.on_pump_ctx = &cli_state;
+            cli_cfg.on_lane_pump = smoke_cli_pump;
+            cli_cfg.on_lane_pump_ctx = &cli_state;
             moq_pq_threaded_t *cli = NULL;
             moq_result_t crc = moq_pq_threaded_create(&cli_cfg, &cli);
             CHECK(crc == MOQ_OK);

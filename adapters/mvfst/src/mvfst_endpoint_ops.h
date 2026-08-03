@@ -45,6 +45,13 @@ struct mvfst_endpoint_ctx_t {
      * gating is enabled); grant counters record peer credit grants seen via
      * onUni/BidirectionalStreamsAvailable -- evidence that retry is driven by
      * the credit callback, not the poll. */
+    /* Outbound-progress mark for the managed facade's transmission-
+     * driven pump: a successful stream write records the stream here;
+     * the adapter consumes the mark when it arms a TX byte-event for
+     * that stream. Network-thread confined. */
+    bool     wrote_since_pump_arm = false;
+    uint64_t last_write_stream    = 0;
+
     bool     credit_gating    = false;
     bool     uni_blocked      = false;
     bool     bidi_blocked     = false;

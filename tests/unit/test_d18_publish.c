@@ -897,7 +897,7 @@ int main(void)
         moq_stream_ref_t ref = moq_stream_ref_from_u64(1);
         moq_publication_t h = feed_publish(s, ref, 0, "live", 7);
         moq_accept_publish_cfg_t ac;
-        moq_accept_publish_cfg_init(&ac);
+        moq_accept_publish_cfg_init_sized(&ac, sizeof(ac)); /* sets the new-group tail */
         ac.has_new_group_request = true;
         ac.new_group_request = 3;
         MOQ_TEST_CHECK_EQ_INT(
@@ -942,7 +942,7 @@ int main(void)
         }
         MOQ_TEST_CHECK(dyn_seen);
         moq_accept_publish_cfg_t ac;
-        moq_accept_publish_cfg_init(&ac);
+        moq_accept_publish_cfg_init_sized(&ac, sizeof(ac)); /* sets the new-group tail */
         ac.has_new_group_request = true;
         ac.new_group_request = 0;             /* "no group info" is a value */
         MOQ_TEST_CHECK_EQ_INT(
@@ -1077,6 +1077,90 @@ int main(void)
         moq_session_destroy(s);
     }
 
+    /* == Inbound update with SUBSCRIPTION_FILTER applies (PUBLISH) ===== */
+    {
+        moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+        moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+        moq_publish_cfg_t pc;
+        moq_publish_cfg_init(&pc);
+        pc.track_namespace = (moq_namespace_t){ parts, 1 };
+        pc.track_name = MOQ_BYTES_LITERAL("v");
+        moq_publication_t h;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_publish(s, &pc, 1, &h),
+                              (int)MOQ_OK);
+        moq_action_t act;
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
+        while (moq_session_poll_actions(s, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_OPEN_BIDI_STREAM)
+                ref = act.u.open_bidi_stream.stream_ref;
+            moq_action_cleanup(&act);
+        }
+        /* Plain PUBLISH_OK establishes the subscription. */
+        uint8_t ok[96];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, ok, sizeof(ok));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_d18_encode_publish_ok(&w, &(moq_d18_msg_params_t){0}),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, ok,
+                moq_buf_writer_offset(&w), false, 1), (int)MOQ_OK);
+        { moq_event_t de;
+          while (moq_session_poll_events(s, &de, 1) > 0)
+              moq_event_cleanup(&de); }
+
+        /* The subscriber narrows the subscription with a filter (§10.2.9:
+         * allowed on a REQUEST_UPDATE for a subscription). */
+        moq_d18_msg_params_t mp;
+        memset(&mp, 0, sizeof(mp));
+        mp.has_filter = true;
+        mp.filter_type = 3;  /* AbsoluteStart */
+        mp.filter_start_group = 7;
+        mp.filter_start_object = 2;
+        uint8_t upd[96];
+        moq_buf_writer_t uw;
+        moq_buf_writer_init(&uw, upd, sizeof(upd));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_d18_encode_request_update(&uw, 1, &mp), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, upd,
+                moq_buf_writer_offset(&uw), false, 1), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+
+        bool surfaced = false;
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_PUBLISH_UPDATED) {
+                surfaced = true;
+                MOQ_TEST_CHECK(ev.u.publish_updated.has_filter);
+                MOQ_TEST_CHECK(ev.u.publish_updated.filter ==
+                    MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START);
+                MOQ_TEST_CHECK_EQ_U64(ev.u.publish_updated.start_group, 7);
+                MOQ_TEST_CHECK_EQ_U64(ev.u.publish_updated.start_object, 2);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(surfaced);
+
+        /* Acknowledged with REQUEST_OK on the publish bidi. */
+        bool got_ok = false;
+        while (moq_session_poll_actions(s, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+                act.u.send_bidi_stream.stream_ref._v == ref._v) {
+                moq_buf_reader_t r;
+                moq_buf_reader_init(&r, act.u.send_bidi_stream.data,
+                                    act.u.send_bidi_stream.len);
+                moq_control_envelope_t env;
+                if (moq_d18_decode_envelope(&r, &env) == MOQ_OK &&
+                    env.msg_type == MOQ_D18_REQUEST_OK)
+                    got_ok = true;
+            }
+            moq_action_cleanup(&act);
+        }
+        MOQ_TEST_CHECK(got_ok);
+        moq_session_destroy(s);
+    }
+
     /* == SimPair: PUBLISH_OK new-group request reaches the publisher ==== */
     {
         moq_simpair_t *sp = make_pair();
@@ -1109,7 +1193,7 @@ int main(void)
         MOQ_TEST_CHECK(dyn_seen);
 
         moq_accept_publish_cfg_t ac;
-        moq_accept_publish_cfg_init(&ac);
+        moq_accept_publish_cfg_init_sized(&ac, sizeof(ac)); /* sets the new-group tail */
         ac.has_new_group_request = true;
         ac.new_group_request = 4;
         MOQ_TEST_CHECK_EQ_INT(
@@ -1417,7 +1501,10 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* forward=0: an early subgroup object is not delivered; the stream is STOPPED. */
+    /* forward=0: an early subgroup STREAM still binds -- Forward State
+     * prohibits Objects, not streams, and empty subgroups count toward the
+     * done's Stream Count, so the stream is NOT stopped -- but its Objects
+     * are prohibited and consumed WITHOUT surfacing OBJECT_RECEIVED. */
     {
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
         moq_publication_t h = feed_publish_fwd(s, moq_stream_ref_from_u64(3),
@@ -1426,7 +1513,7 @@ int main(void)
         moq_stream_ref_t dref = moq_stream_ref_from_u64(0x901);
         feed_subgroup_object(s, dref, 9, 0, "nope");
         MOQ_TEST_CHECK_EQ_INT(count_objects(s), 0);
-        MOQ_TEST_CHECK(saw_stop_data(s, dref));
+        MOQ_TEST_CHECK(!saw_stop_data(s, dref));
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }

@@ -9,15 +9,33 @@
 #include <moq/endpoint.h>
 #include <moq/media_receiver.h>
 #include <moq/media_sender.h>
+#include <moq/publisher.h>
 
 #include <stddef.h>
+#include <stdint.h>
 
 int main(void)
 {
-    /* Endpoint cfg: init must stamp the ABI guard. */
+    /* Endpoint cfg ABI: the pointer-only init stamps ONLY the frozen v0 prefix
+     * (so it can never overflow an old caller); the sized init stamps the full
+     * struct so the appended wt_profile tail field is usable. */
     moq_endpoint_cfg_t ec;
     moq_endpoint_cfg_init(&ec);
-    if (ec.struct_size != sizeof(moq_endpoint_cfg_t))
+    if (ec.struct_size != MOQ_ENDPOINT_CFG_V0_SIZE)
+        return 1;
+
+    /* The new WebTransport wire-profile API, exercised through the INSTALLED
+     * public headers: reachable via the sized init, defaults to BACKEND_DEFAULT
+     * (the zero value -- selects nothing), and accepts an explicit compat
+     * dialect. */
+    moq_endpoint_cfg_t ecs;
+    moq_endpoint_cfg_init_sized(&ecs, sizeof(ecs));
+    if (ecs.struct_size != sizeof(moq_endpoint_cfg_t))
+        return 1;
+    if (ecs.wt_profile != (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT)
+        return 1;
+    ecs.wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+    if (ecs.wt_profile != (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT)
         return 1;
 
     /* Receiver cfg (live preset): forces an overflow policy, stamps struct_size. */
@@ -26,12 +44,49 @@ int main(void)
     if (rcfg.struct_size != sizeof(moq_media_receiver_cfg_t))
         return 2;
 
-    /* Sender cfg (live preset). */
+    /* Sender cfg (live preset). The pointer-only initializer stamps the
+     * FROZEN v0 prefix (it cannot know the caller's storage size), so the
+     * stamp is a non-zero prefix of the current struct -- never more. */
     moq_media_sender_cfg_t scfg;
     moq_media_sender_cfg_init_live(&scfg);
-    if (scfg.struct_size != sizeof(moq_media_sender_cfg_t))
+    if (scfg.struct_size == 0 || scfg.struct_size > sizeof(moq_media_sender_cfg_t))
         return 3;
 
+    /* Sized presets stamp the caller's full struct and enable the appended
+     * fields (the documented push-sender flow). */
+    moq_media_sender_cfg_init_live_sized(&scfg, sizeof(scfg));
+    if (scfg.struct_size != sizeof(moq_media_sender_cfg_t))
+        return 31;
+    scfg.publish_tracks = true;
+    scfg.drop_without_demand = true;
+    moq_media_sender_cfg_init_sized(&scfg, sizeof(scfg));
+    if (scfg.struct_size != sizeof(moq_media_sender_cfg_t))
+        return 32;
+    moq_media_sender_cfg_init_lossless_sized(&scfg, sizeof(scfg));
+    if (scfg.struct_size != sizeof(moq_media_sender_cfg_t))
+        return 33;
+
+    /* Sender callbacks: frozen pointer-only init vs sized init. */
+    moq_media_sender_callbacks_t scb;
+    moq_media_sender_callbacks_init(&scb);
+    if (scb.struct_size == 0 ||
+        scb.struct_size > sizeof(moq_media_sender_callbacks_t))
+        return 34;
+    moq_media_sender_callbacks_init_sized(&scb, sizeof(scb));
+    if (scb.struct_size != sizeof(moq_media_sender_callbacks_t))
+        return 35;
+
+
+    /* Core publisher cfg initializers (frozen pointer + sized forms). */
+    moq_pub_object_cfg_t oc;
+    moq_pub_object_cfg_init(&oc);
+    if (oc.struct_size == 0 || oc.struct_size > sizeof(oc)) return 40;
+    moq_pub_object_cfg_init_sized(&oc, sizeof(oc));
+    if (oc.struct_size != sizeof(oc)) return 41;
+    oc.end_of_group = true;
+    moq_pub_begin_object_cfg_t bo;
+    moq_pub_begin_object_cfg_init_sized(&bo, sizeof(bo));
+    if (bo.struct_size != sizeof(bo)) return 42;
     /* Per-track subscribe cfg: the manual-subscription surface. */
     moq_media_receiver_track_subscribe_cfg_t tcfg;
     moq_media_receiver_track_subscribe_cfg_init(&tcfg);

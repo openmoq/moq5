@@ -1669,6 +1669,127 @@ int main(void)
         MOQ_TEST_CHECK(alloc_state.balance == 0);
     }
 
+    /* == GOAWAY: a URI is weighed against the live arena ==============
+     * A queued event legally holds bytes in the arena, so the URI that
+     * follows is classified against the space left: one that fits an empty
+     * arena is retryable, and one no arena could hold ends the session at
+     * once rather than after a wasted drain cycle. */
+    {
+        static const char k_uri[] = "wss://relocate.example.com/new-session";
+
+        /* -- Transient: retained, then delivered intact after a drain ---- */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+            /* Room for the URI alone, not beside a queued namespace event. */
+            cx.output_scratch_size = (uint32_t)(sizeof(k_uri) + 8);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, &cx, NULL);
+
+            /* Occupy the client's arena with a real queued announcement. */
+            {
+                uint8_t buf[128];
+                moq_buf_writer_t w;
+                moq_buf_writer_init(&w, buf, sizeof(buf));
+                moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("namespace-part") };
+                moq_namespace_t ns = { parts, 1 };
+                MOQ_TEST_CHECK(moq_d16_encode_publish_namespace(&w, 1, &ns,
+                                                                NULL, 0)
+                               == MOQ_OK);
+                MOQ_TEST_CHECK(moq_session_on_control_bytes(c, buf,
+                                   moq_buf_writer_offset(&w), 1000) == MOQ_OK);
+            }
+            MOQ_TEST_CHECK(c->event_scratch_len > 0);
+            size_t held = c->event_scratch_len;
+
+            /* The URI cannot fit beside it: retained, arena untouched. */
+            {
+                uint8_t buf[128];
+                moq_buf_writer_t w;
+                moq_buf_writer_init(&w, buf, sizeof(buf));
+                MOQ_TEST_CHECK(moq_d16_encode_goaway(&w,
+                                   (const uint8_t *)k_uri,
+                                   strlen(k_uri)) == MOQ_OK);
+                MOQ_TEST_CHECK(moq_session_on_control_bytes(c, buf,
+                                   moq_buf_writer_offset(&w), 1500)
+                               == MOQ_ERR_WOULD_BLOCK);
+            }
+            MOQ_TEST_CHECK(c->event_scratch_len == held);
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
+
+            /* Drain the announcement, replay: exactly one GOAWAY, URI intact. */
+            moq_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED);
+            moq_event_cleanup(&ev);
+
+            MOQ_TEST_CHECK(moq_session_process_pending(c, 2000) == MOQ_OK);
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_GOAWAY);
+            MOQ_TEST_CHECK(ev.u.goaway.new_session_uri.len == strlen(k_uri));
+            MOQ_TEST_CHECK(memcmp(ev.u.goaway.new_session_uri.data, k_uri,
+                                  strlen(k_uri)) == 0);
+            moq_event_cleanup(&ev);
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 0);
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_DRAINING);
+
+            moq_session_destroy(c);
+            moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* -- Permanent: closes at once, with the arena already occupied -- */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+            cx.output_scratch_size = (uint32_t)(strlen(k_uri) / 2);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, &cx, NULL);
+
+            {   /* a legal nonzero cursor first */
+                uint8_t buf[128];
+                moq_buf_writer_t w;
+                moq_buf_writer_init(&w, buf, sizeof(buf));
+                moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("ns") };
+                moq_namespace_t ns = { parts, 1 };
+                MOQ_TEST_CHECK(moq_d16_encode_publish_namespace(&w, 1, &ns,
+                                                                NULL, 0)
+                               == MOQ_OK);
+                MOQ_TEST_CHECK(moq_session_on_control_bytes(c, buf,
+                                   moq_buf_writer_offset(&w), 1000) == MOQ_OK);
+            }
+            MOQ_TEST_CHECK(c->event_scratch_len > 0);
+
+            uint8_t buf[128];
+            moq_buf_writer_t w;
+            moq_buf_writer_init(&w, buf, sizeof(buf));
+            MOQ_TEST_CHECK(moq_d16_encode_goaway(&w, (const uint8_t *)k_uri,
+                                                 strlen(k_uri)) == MOQ_OK);
+            /* A normal close reports MOQ_OK: the message was handled, by
+             * ending the session. */
+            moq_result_t rc = moq_session_on_control_bytes(c, buf,
+                                  moq_buf_writer_offset(&w), 1500);
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            MOQ_TEST_CHECK(moq_session_poll_actions(c, &a, 1) == 1);
+            MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+            MOQ_TEST_CHECK(a.u.close_session.code == 0x1);
+            moq_action_cleanup(&a);
+
+            moq_session_destroy(c);
+            moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+    }
+
     /* == GOAWAY: duplicate receive → PROTOCOL_VIOLATION ============= */
     {
         test_alloc_state_t alloc_state = {0};
@@ -5001,6 +5122,477 @@ int main(void)
                        memcmp(evs[0].u.closed.reason.data, reason,
                               sizeof(reason) - 1) == 0);
         moq_event_cleanup(&evs[0]);
+
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == Transactional namespace copy into event scratch ============ */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+
+        const size_t A = _Alignof(moq_bytes_t);
+        const size_t E = sizeof(moq_bytes_t);
+        uint8_t *base = s->event_scratch;
+        size_t cap0 = s->event_scratch_cap;
+
+        /* A zero-part namespace succeeds at an unaligned cursor that is
+         * already at capacity, without moving the cursor: an empty array
+         * needs no storage, so no padding may be charged for it. */
+        s->event_scratch_len = 7;
+        s->event_scratch_cap = 7;
+        moq_namespace_t zsrc = { NULL, 0 };
+        moq_namespace_t zdst = { (moq_bytes_t *)(uintptr_t)1, 99 };
+        MOQ_TEST_CHECK(event_scratch_copy_namespace(s, &zsrc, &zdst));
+        MOQ_TEST_CHECK(zdst.parts == NULL);
+        MOQ_TEST_CHECK(zdst.count == 0);
+        MOQ_TEST_CHECK(s->event_scratch_len == 7);
+
+        /* Later regions compute their alignment from the ORIGINAL cursor. Two
+         * shapes matter: an unaligned byte tail, and an ALIGNED token array --
+         * with capacity sized exactly for the token region measured from the
+         * original cursor, so consuming padding for the empty namespace would
+         * make it fail. */
+        s->event_scratch_cap = cap0;
+        s->event_scratch_len = 1;
+        MOQ_TEST_CHECK(event_scratch_copy_namespace(s, &zsrc, &zdst));
+        MOQ_TEST_CHECK(s->event_scratch_len == 1);
+        {
+            static const uint8_t tail[3] = { 0xAA, 0xBB, 0xCC };
+            uint8_t *tp = event_scratch_copy(s, tail, sizeof(tail));
+            MOQ_TEST_CHECK(tp == base + 1);
+            MOQ_TEST_CHECK(s->event_scratch_len == 4);
+        }
+        {
+            const size_t TA = _Alignof(moq_resolved_token_t);
+            const size_t TE = sizeof(moq_resolved_token_t);
+            size_t tok_aligned = (1 + TA - 1) & ~(TA - 1);
+            s->event_scratch_len = 1;
+            s->event_scratch_cap = tok_aligned + 2 * TE;  /* exact from cursor 1 */
+            MOQ_TEST_CHECK(event_scratch_copy_namespace(s, &zsrc, &zdst));
+            MOQ_TEST_CHECK(s->event_scratch_len == 1);
+            void *toks = event_scratch_alloc_aligned(s, 2 * TE, TA);
+            MOQ_TEST_CHECK(toks == base + tok_aligned);
+            MOQ_TEST_CHECK(s->event_scratch_len == tok_aligned + 2 * TE);
+            s->event_scratch_cap = cap0;
+        }
+
+        /* A multi-part copy from an unaligned cursor: aligned parts array,
+         * exact bytes, exact final cursor; a zero-length part stays valid. */
+        s->event_scratch_len = 1;
+        moq_bytes_t parts_in[3] = {
+            { (const uint8_t *)"ab", 2 },
+            { NULL, 0 },
+            { (const uint8_t *)"cde", 3 },
+        };
+        moq_namespace_t msrc = { parts_in, 3 };
+        moq_namespace_t mdst = { NULL, 0 };
+        MOQ_TEST_CHECK(event_scratch_copy_namespace(s, &msrc, &mdst));
+        MOQ_TEST_CHECK(mdst.count == 3);
+        MOQ_TEST_CHECK(((uintptr_t)mdst.parts % A) == 0);
+        {
+            size_t aligned = (1 + A - 1) & ~(A - 1);
+            MOQ_TEST_CHECK((uint8_t *)mdst.parts == base + aligned);
+            MOQ_TEST_CHECK(mdst.parts[0].len == 2 &&
+                           memcmp(mdst.parts[0].data, "ab", 2) == 0);
+            MOQ_TEST_CHECK(mdst.parts[1].data == NULL && mdst.parts[1].len == 0);
+            MOQ_TEST_CHECK(mdst.parts[2].len == 3 &&
+                           memcmp(mdst.parts[2].data, "cde", 3) == 0);
+            MOQ_TEST_CHECK(s->event_scratch_len == aligned + 3 * E + 2 + 3);
+        }
+
+        /* A late-tail failure restores the exact entry cursor -- and stays
+         * restored across repeated attempts (no cumulative arena leak). */
+        {
+            size_t aligned = (1 + A - 1) & ~(A - 1);
+            moq_bytes_t big[2] = {
+                { (const uint8_t *)"pppp", 4 },
+                { (const uint8_t *)
+                  "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", 40 },
+            };
+            moq_namespace_t bsrc = { big, 2 };
+            moq_namespace_t bdst = { (moq_bytes_t *)(uintptr_t)1, 99 };
+            s->event_scratch_len = 1;
+            s->event_scratch_cap = aligned + 2 * E + 4 + 8; /* second tail cannot fit */
+            for (int i = 0; i < 3; i++) {
+                MOQ_TEST_CHECK(!event_scratch_copy_namespace(s, &bsrc, &bdst));
+                MOQ_TEST_CHECK(s->event_scratch_len == 1);
+            }
+            /* The destination was never published. */
+            MOQ_TEST_CHECK(bdst.parts == (moq_bytes_t *)(uintptr_t)1);
+            MOQ_TEST_CHECK(bdst.count == 99);
+            /* Retry after capacity returns succeeds exactly once. */
+            s->event_scratch_cap = cap0;
+            MOQ_TEST_CHECK(event_scratch_copy_namespace(s, &bsrc, &bdst));
+            MOQ_TEST_CHECK(bdst.count == 2);
+            MOQ_TEST_CHECK(s->event_scratch_len == aligned + 2 * E + 4 + 40);
+        }
+
+        /* Count-multiplication overflow fails cleanly with no cursor
+         * movement and no destination publish. */
+        {
+            moq_bytes_t one = { (const uint8_t *)"x", 1 };
+            moq_namespace_t osrc = { &one, SIZE_MAX };
+            moq_namespace_t odst = { NULL, 0 };
+            s->event_scratch_len = 5;
+            MOQ_TEST_CHECK(!event_scratch_copy_namespace(s, &osrc, &odst));
+            MOQ_TEST_CHECK(s->event_scratch_len == 5);
+            MOQ_TEST_CHECK(odst.parts == NULL && odst.count == 0);
+        }
+
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == Every migrated namespace-copy call site is transactional ===
+     * Each producer below is driven with a namespace whose LAST part cannot
+     * fit, so the copy fails after the parts array and an earlier tail were
+     * placed. The shared helper must restore the entry cursor exactly and
+     * publish nothing; the caller must surface no event, and a replay with
+     * capacity restored must commit exactly one transition. */
+    {
+        const size_t A = _Alignof(moq_bytes_t);
+        const size_t E = sizeof(moq_bytes_t);
+        /* Two parts: the first fits, the second cannot. */
+        moq_bytes_t np[2] = {
+            { (const uint8_t *)"aa", 2 },
+            { (const uint8_t *)"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 32 },
+        };
+        moq_namespace_t ns = { np, 2 };
+        moq_bytes_t name = { (const uint8_t *)"trk", 3 };
+
+#define NS_COPY_TIGHT_CAP(sv_) do {                                              \
+            (sv_)->event_scratch_len = 1;                                   \
+            size_t al = (1 + A - 1) & ~(A - 1);                             \
+            (sv_)->event_scratch_cap = al + 2 * E + 2 + 8;                  \
+        } while (0)
+/* The blocked attempt must be the SCRATCH failure specifically -- the callers
+ * classify it MOQ_ERR_BUFFER -- with the cursor restored and nothing
+ * surfaced. Asserting the exact code stops an unrelated earlier error from
+ * passing the case vacuously. */
+#define NS_COPY_ASSERT_BLOCKED(rc_, sv_) do {                                    \
+            MOQ_TEST_CHECK((rc_) == MOQ_ERR_BUFFER);                        \
+            MOQ_TEST_CHECK((sv_)->event_scratch_len == 1);                  \
+            moq_event_t ev_;                                                \
+            memset(&ev_, 0, sizeof(ev_));                                   \
+            MOQ_TEST_CHECK(moq_session_poll_events((sv_), &ev_, 1) == 0);   \
+        } while (0)
+/* Replaying the same operation with capacity restored commits exactly one
+ * owner transition and surfaces exactly one event of the expected kind --
+ * proving the blocked attempt left no partial owner state behind. */
+#define NS_COPY_ASSERT_REPLAY_ONCE(sv_, cap_, call_, kind_) do {                 \
+            (sv_)->event_scratch_cap = (cap_);                              \
+            MOQ_TEST_CHECK((call_) == MOQ_OK);                              \
+            moq_event_t rev_;                                               \
+            memset(&rev_, 0, sizeof(rev_));                                 \
+            MOQ_TEST_CHECK(moq_session_poll_events((sv_), &rev_, 1) == 1);  \
+            MOQ_TEST_CHECK(rev_.kind == (kind_));                           \
+            moq_event_cleanup(&rev_);                                       \
+            moq_event_t xev_;                                               \
+            memset(&xev_, 0, sizeof(xev_));                                 \
+            MOQ_TEST_CHECK(moq_session_poll_events((sv_), &xev_, 1) == 0);  \
+        } while (0)
+
+        /* 1. session_subscribe.c -- session_core_on_subscribe */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_decoded_subscribe_t d;
+            memset(&d, 0, sizeof(d));
+            d.track_namespace = ns; d.track_name = name;
+            d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_subscribe(sv, &d, -1, false), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0,
+                session_core_on_subscribe(sv, &d, -1, false),
+                MOQ_EVENT_SUBSCRIBE_REQUEST);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* 2. session_publish.c -- session_core_on_publish */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_decoded_publish_t d;
+            memset(&d, 0, sizeof(d));
+            d.track_namespace = ns; d.track_name = name; d.track_alias = 7;
+            d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_publish(sv, &d), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0, session_core_on_publish(sv, &d),
+                MOQ_EVENT_PUBLISH_REQUEST);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* 3. session_fetch.c -- session_core_on_fetch */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_decoded_fetch_t d;
+            memset(&d, 0, sizeof(d));
+            d.joining_sub_slot = -1; d.fetch_type = 1;
+            d.track_namespace = ns; d.track_name = name;
+            d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_fetch(sv, &d), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0, session_core_on_fetch(sv, &d),
+                MOQ_EVENT_FETCH_REQUEST);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* 4. session_namespace.c -- session_core_on_publish_namespace */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_decoded_publish_namespace_t d;
+            memset(&d, 0, sizeof(d));
+            d.track_namespace = ns;
+            d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_publish_namespace(sv, &d), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0,
+                session_core_on_publish_namespace(sv, &d),
+                MOQ_EVENT_NAMESPACE_PUBLISHED);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* 5. session_track_status.c -- session_core_on_track_status_request */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_decoded_track_status_request_t d;
+            memset(&d, 0, sizeof(d));
+            d.track_namespace = ns; d.track_name = name;
+            d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_track_status_request(sv, &d, false), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0,
+                session_core_on_track_status_request(sv, &d, false),
+                MOQ_EVENT_TRACK_STATUS_REQUEST);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* 6. session_subscribe_tracks.c, caller A -- the request's prefix */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_decoded_subscribe_tracks_request_t d;
+            memset(&d, 0, sizeof(d));
+            d.track_namespace_prefix = ns; d.forward = true;
+            d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_subscribe_tracks(sv, &d, false), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0,
+                session_core_on_subscribe_tracks(sv, &d, false),
+                MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* 7. session_subscribe_tracks.c, caller B -- PUBLISH_BLOCKED's suffix.
+         * Needs a committed track-sub slot, so the request is accepted with a
+         * roomy arena first, then the arena is tightened for the notification. */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+            moq_bytes_t p1[1] = { { (const uint8_t *)"p", 1 } };
+            moq_namespace_t small = { p1, 1 };
+            moq_decoded_subscribe_tracks_request_t req;
+            memset(&req, 0, sizeof(req));
+            req.track_namespace_prefix = small; req.forward = true;
+            req.endpoint.has_request_id = true; req.endpoint.request_id = 0;
+            MOQ_TEST_CHECK(session_core_on_subscribe_tracks(sv, &req, false) == MOQ_OK);
+            {   /* drain the request event so the queue is clear */
+                moq_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
+                MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST);
+                moq_event_cleanup(&ev);
+            }
+            moq_decoded_publish_blocked_t pb;
+            memset(&pb, 0, sizeof(pb));
+            pb.target_slot = req.endpoint.slot;
+            pb.track_namespace_suffix = ns; pb.track_name = name;
+            size_t cap0 = sv->event_scratch_cap;
+            NS_COPY_TIGHT_CAP(sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_publish_blocked(sv, req.endpoint.slot,
+                                                              &pb), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0,
+                session_core_on_publish_blocked(sv, req.endpoint.slot, &pb),
+                MOQ_EVENT_PUBLISH_BLOCKED);
+            moq_session_destroy(c); moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+#undef NS_COPY_TIGHT_CAP
+#undef NS_COPY_ASSERT_BLOCKED
+#undef NS_COPY_ASSERT_REPLAY_ONCE
+    }
+
+    /* == SETUP token scratch classification ========================= */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+
+        const size_t TA = _Alignof(moq_resolved_token_t);
+        const size_t TE = sizeof(moq_resolved_token_t);
+        static const uint8_t val[10] = { 'a','b','c','d','e','f','g','h','i','j' };
+        moq_resolved_token_t toks[2] = {
+            { .token_type = 1, .token_value = { val, 10 } },
+            { .token_type = 2, .token_value = { val, 6 } },
+        };
+
+        /* No tokens: no bytes, no padding, always satisfiable. */
+        MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 0) ==
+                       MOQ_EVENT_SCRATCH_FITS);
+
+        /* The requirement is the tails in order, then the padding those tails
+         * leave, then the aligned array -- measured from wherever the copy
+         * starts, not from the arena base. */
+        {
+            size_t tails = 10 + 6;
+            size_t exact_from_0 = tails +
+                ((TA - (tails & (TA - 1))) & (TA - 1)) + 2 * TE;
+
+            s->event_scratch_len = 0;
+            s->event_scratch_cap = exact_from_0;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 2) ==
+                           MOQ_EVENT_SCRATCH_FITS);
+
+            /* One byte short of the exact requirement is unsatisfiable by any
+             * cursor, so it is permanent rather than a wait. */
+            s->event_scratch_cap = exact_from_0 - 1;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 2) ==
+                           MOQ_EVENT_SCRATCH_PERMANENT);
+
+            /* Fits an empty arena but not the live tail: retryable once the
+             * arena recycles. */
+            s->event_scratch_cap = exact_from_0 + 4;
+            s->event_scratch_len = 8;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 2) ==
+                           MOQ_EVENT_SCRATCH_BLOCKED);
+
+            /* Same arena, cursor back at zero: satisfiable again. */
+            s->event_scratch_len = 0;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 2) ==
+                           MOQ_EVENT_SCRATCH_FITS);
+        }
+
+        /* An unaligned cursor shifts the padding, so the same tokens need
+         * more room than the from-zero requirement. */
+        {
+            size_t tails = 10 + 6;
+            size_t from_1 = 1 + tails;
+            size_t exact_from_1 = tails +
+                ((TA - (from_1 & (TA - 1))) & (TA - 1)) + 2 * TE;
+            s->event_scratch_len = 1;
+            s->event_scratch_cap = 1 + exact_from_1;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 2) ==
+                           MOQ_EVENT_SCRATCH_FITS);
+            s->event_scratch_cap = 1 + exact_from_1 - 1;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, 2) ==
+                           MOQ_EVENT_SCRATCH_BLOCKED);
+        }
+
+        /* A token count whose array size would overflow is permanent, never a
+         * wait -- and is rejected before the token array is walked. */
+        {
+            s->event_scratch_len = 0;
+            s->event_scratch_cap = 4096;
+            MOQ_TEST_CHECK(setup_event_scratch_classify(s, toks, SIZE_MAX) ==
+                           MOQ_EVENT_SCRATCH_PERMANENT);
+        }
+
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == Byte-tail scratch classification =========================== */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+
+        s->event_scratch_cap = 64;
+        s->event_scratch_len = 0;
+
+        /* Nothing to copy always fits, whatever the cursor. */
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 0) ==
+                       MOQ_EVENT_SCRATCH_FITS);
+        s->event_scratch_len = 64;
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 0) ==
+                       MOQ_EVENT_SCRATCH_FITS);
+
+        /* Exactly the arena fits from empty; one more never can. */
+        s->event_scratch_len = 0;
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 64) ==
+                       MOQ_EVENT_SCRATCH_FITS);
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 65) ==
+                       MOQ_EVENT_SCRATCH_PERMANENT);
+
+        /* Fits empty but not the live tail: retryable, not terminal. */
+        s->event_scratch_len = 40;
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 64) ==
+                       MOQ_EVENT_SCRATCH_BLOCKED);
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 24) ==
+                       MOQ_EVENT_SCRATCH_FITS);
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 25) ==
+                       MOQ_EVENT_SCRATCH_BLOCKED);
+
+        /* A cursor past the cap -- which the arena never produces -- yields no
+         * room rather than a wrapped subtraction. */
+        s->event_scratch_len = 200;
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 1) ==
+                       MOQ_EVENT_SCRATCH_BLOCKED);
+        MOQ_TEST_CHECK(event_scratch_classify_bytes(s, 65) ==
+                       MOQ_EVENT_SCRATCH_PERMANENT);
+
+        /* Classification mutates nothing. */
+        s->event_scratch_len = 7;
+        (void)event_scratch_classify_bytes(s, 1);
+        (void)event_scratch_classify_bytes(s, 4096);
+        (void)event_scratch_classify_bytes(s, 0);
+        MOQ_TEST_CHECK(s->event_scratch_len == 7);
+        MOQ_TEST_CHECK(s->event_scratch_cap == 64);
 
         moq_session_destroy(s);
         MOQ_TEST_CHECK(as.balance == 0);

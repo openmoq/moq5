@@ -440,6 +440,53 @@ int main()
         sub.tick(0);
     }
 
+    // -- 12. filter update forwards; acks drain with NO callback ----
+    // The binding supports FILTER SENDING only (documented boundary): it
+    // never installs on_update_ok, and the facade must drain the
+    // acknowledgment event through tick without one -- proven by the second
+    // update being accepted (one-outstanding-update would refuse it if the
+    // first ack were stuck).
+    {
+        auto [c, s] = establish(failures);
+
+        auto pub = moq::publisher::create(
+            s, {.accept_mode = moq::pub_accept_mode::accept_all}).value();
+        pub.add_track({.ns = {"ns"}, .track = "t"}, 0);
+
+        auto sub = moq::subscriber::create(c).value();
+        auto track = sub.subscribe(
+            {.ns = {"ns"}, .track = "t"}, 0).value();
+        pump(c, s, 0);
+        pub.tick(0);
+        pump(s, c, 0);
+        sub.tick(0);
+        MOQ_CHECK(track.is_active());
+
+        moq::subscription_update_config ucfg;
+        ucfg.has_filter = true;
+        ucfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        ucfg.start_group = 3;
+        ucfg.start_object = 0;
+        auto ur = sub.update_subscription(track, ucfg, 0);
+        MOQ_CHECK(ur.ok());
+
+        pump(c, s, 0);
+        pub.tick(0);
+        pump(s, c, 0);
+        sub.tick(0);   // drains the acknowledgment without any callback
+
+        // The ack was consumed: a second update is legal.
+        moq::subscription_update_config u2;
+        u2.has_subscriber_priority = true;
+        u2.subscriber_priority = 9;
+        auto ur2 = sub.update_subscription(track, u2, 0);
+        MOQ_CHECK(ur2.ok());
+        pump(c, s, 0);
+        pub.tick(0);
+        pump(s, c, 0);
+        sub.tick(0);
+    }
+
     MOQ_PASS("test_cpp_subscriber");
     return failures;
 }

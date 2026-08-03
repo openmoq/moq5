@@ -33,16 +33,24 @@ public final class LiveMediaSession: @unchecked Sendable {
         public var selector: TrackSelector
         /// The receiver's queue-overflow policy (the C queue is the buffer).
         public var overflowPolicy: MediaReceiver.Configuration.OverflowPolicy
+        /// Optional bound on how long a watch waits for the endpoint to reach
+        /// ESTABLISHED. `nil` (the default) preserves the unbounded wait; a
+        /// finite value opts into ``MoQEndpoint/established(within:)`` — on
+        /// expiry the watch fails with a `.transport` connection failure and the
+        /// endpoint is closed, instead of sitting in `.connecting` forever.
+        public var establishmentTimeout: Duration?
 
         public init(endpoint: MoQEndpoint.Configuration,
                     namespace: MediaNamespace,
                     selector: TrackSelector = .firstVideo,
                     overflowPolicy: MediaReceiver.Configuration.OverflowPolicy
-                        = .dropToKeyframe()) {
+                        = .dropToKeyframe(),
+                    establishmentTimeout: Duration? = nil) {
             self.endpoint = endpoint
             self.namespace = namespace
             self.selector = selector
             self.overflowPolicy = overflowPolicy
+            self.establishmentTimeout = establishmentTimeout
         }
     }
 
@@ -251,7 +259,11 @@ public final class LiveMediaSession: @unchecked Sendable {
 
         var receiver: MediaReceiver?
         do {
-            try await endpoint.established()
+            if let deadline = config.establishmentTimeout {
+                try await endpoint.established(within: deadline)
+            } else {
+                try await endpoint.established()
+            }
             emit(.established(version: endpoint.negotiatedVersion), gen: gen)
             emit(.awaitingCatalog, gen: gen)
 

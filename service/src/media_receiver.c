@@ -1,5 +1,5 @@
 /*
- * moq_media_receiver_t — receive-side media facade (design §6).
+ * moq_media_receiver_t — receive-side media facade.
  *
  * Threading model: the receiver registers an internal endpoint pump hook
  * (endpoint_internal.h) that runs on the endpoint's network thread. ALL
@@ -57,6 +57,17 @@
  * min(caller_size, sizeof(current)). */
 #define MEDIA_TRACK_EVENT_V0_SIZE \
     (offsetof(moq_media_track_event_t, config_generation) + sizeof(uint32_t))
+
+/* ABI boundary: the appended detail block must start exactly at the
+ * v0 sizeof (the align-rounded end of config_generation) -- the
+ * _reserved_track_ev spacer occupies the old trailing padding, and this
+ * equality pin keeps it honest under any layout change. */
+_Static_assert(offsetof(moq_media_track_event_t, has_largest) ==
+               ((offsetof(moq_media_track_event_t, config_generation) +
+                 sizeof(((moq_media_track_event_t *)0)->config_generation) +
+                 (_Alignof(moq_media_track_event_t) - 1)) &
+                ~(size_t)(_Alignof(moq_media_track_event_t) - 1)),
+               "UPDATE_OK detail block must sit exactly at the v0 sizeof");
 #define MEDIA_OBJECT_V0_SIZE \
     (offsetof(moq_media_object_t, samples_owned) + sizeof(moq_cmaf_sample_t *))
 #define MEDIA_RECEIVER_STATS_V0_SIZE \
@@ -131,6 +142,23 @@ struct moq_media_track {
     uint64_t         walk_key_group;
     bool             forward_sent;     /* last forward state sent (pause) */
     bool             forward_desired;
+    /* -- update-acknowledgment attribution state machine --------------- *
+     * app_gen bumps on every subscribe_track/unsubscribe_track call that
+     * CHANGES desired_subscribed; reconciled_app_gen is the newest app
+     * generation whose effect was either sent on the wire or proven
+     * coalesced-away (a reconciler pass with nothing to send advances it
+     * silently). A successful send stamps the outstanding update's
+     * attribution ONCE: upd_notify_app = (app_gen > reconciled_app_gen).
+     * The ack surfaces MOQ_MEDIA_TRACK_UPDATE_OK only when upd_notify_app
+     * -- one event per APP-ATTRIBUTED WIRE ACKNOWLEDGMENT; pure
+     * flow-control acks stay silent regardless of the generations they
+     * happen to carry. Error/terminal/VOD-rearm clear the pending
+     * attribution so a replacement subscription's first ack never
+     * inherits it. Guarded by r->mu (toggles bump under it). */
+    uint64_t         app_gen;
+    uint64_t         reconciled_app_gen;
+    bool             upd_notify_app;
+    uint64_t         upd_sent_app_gen;
 
     /* Subscription lifecycle, mu-published so the public track_state accessor
      * never races the network-thread-only sub_track pointer:
@@ -167,6 +195,14 @@ struct moq_media_track {
 typedef struct receiver_event {
     moq_media_track_event_kind_t kind;
     moq_media_track_t           *track;
+    /* per-event copies of the UPDATE_OK scalars, filled at PUSH time
+     * (deriving them at poll from track state would corrupt multiple
+     * queued acknowledgments). Zero for every other kind. */
+    bool     has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
+    bool     has_expires;
+    uint64_t expires_ms;
 } receiver_event_t;
 
 struct moq_media_receiver {
@@ -305,11 +341,47 @@ static bool rq_push(moq_media_receiver_t *r, moq_media_track_event_kind_t kind,
         return false;
     }
     receiver_event_t *e = &r->events[r->ev_tail % r->ev_cap];
+    memset(e, 0, sizeof(*e));
     e->kind = kind;
     e->track = track;
     r->ev_tail++;
     pthread_mutex_unlock(&r->mu);
     return true;
+}
+
+#ifdef MOQ_MEDIA_RECEIVER_TESTING
+/* Test-only interleaving hook: invoked by the reconciler BETWEEN the
+ * {desired, app_gen} snapshot and the wire send, with no locks held, so a
+ * test can toggle app intent at exactly the racy instant and prove the
+ * snapshot rule causally. Never compiled into the shipping library. */
+static void (*g_reconcile_race_hook)(void *ctx);
+static void *g_reconcile_race_hook_ctx;
+void moq_media_receiver_test_set_race_hook(void (*fn)(void *), void *ctx);
+void moq_media_receiver_test_set_race_hook(void (*fn)(void *), void *ctx)
+{
+    g_reconcile_race_hook = fn;
+    g_reconcile_race_hook_ctx = ctx;
+}
+#define RECONCILE_RACE_HOOK() \
+    do { \
+        if (g_reconcile_race_hook) \
+            g_reconcile_race_hook(g_reconcile_race_hook_ctx); \
+    } while (0)
+#else
+#define RECONCILE_RACE_HOOK() ((void)0)
+#endif
+
+/* Pure attribution classifier: given the generation
+ * SNAPSHOT taken together with the target computation and the current
+ * reconciled generation, decide whether a wire update carries app
+ * attribution and advance the reconciled generation -- never past the
+ * snapshot (a later toggle stays unreconciled for the next pass). Used by
+ * BOTH reconciler branches; exposed to tests via the seam below. */
+static void attribution_classify(uint64_t gen_snap, uint64_t reconciled,
+                                 bool *out_notify, uint64_t *out_reconciled)
+{
+    *out_notify = gen_snap > reconciled;
+    *out_reconciled = gen_snap > reconciled ? gen_snap : reconciled;
 }
 
 static void receiver_set_fatal(moq_media_receiver_t *r, uint64_t code)
@@ -1414,6 +1486,43 @@ static void receiver_on_subscribe_error(void *ctx, moq_sub_track_t *track,
  * AFTER draining objects, so media delivered in the same tick as the done is not
  * dropped. The catalog subscription is not converted, so its done is ignored
  * (status quo -- the catalog's own FETCH/SUBSCRIBE delivery path stands). */
+/* the peer acknowledged one of our Forward updates. Runs inside
+ * moq_sub_tick on the network thread. Emits MOQ_MEDIA_TRACK_UPDATE_OK only
+ * when the acknowledged update carries app attribution; pure
+ * flow-control acknowledgments are consumed silently. The event's scalars
+ * are copied at push time (queue-entry copies). */
+static void receiver_on_update_ok(void *ctx, moq_sub_track_t *track,
+                                  const moq_sub_update_result_t *result)
+{
+    moq_media_receiver_t *r = (moq_media_receiver_t *)ctx;
+    moq_media_track_t *t = NULL;
+    for (size_t i = 0; i < r->track_count; i++)
+        if (r->tracks[i]->sub_track == track) { t = r->tracks[i]; break; }
+    if (!t) return;
+    pthread_mutex_lock(&r->mu);
+    bool notify = t->upd_notify_app;
+    t->upd_notify_app = false;
+    t->upd_sent_app_gen = 0;
+    if (!notify) { pthread_mutex_unlock(&r->mu); return; }
+    if (r->ev_tail - r->ev_head >= r->ev_cap) {
+        r->fatal = true;
+        r->fatal_code = MOQ_MEDIA_RECEIVER_FATAL_EVENT_OVERFLOW;
+        pthread_mutex_unlock(&r->mu);
+        return;
+    }
+    receiver_event_t *e = &r->events[r->ev_tail % r->ev_cap];
+    memset(e, 0, sizeof(*e));
+    e->kind = MOQ_MEDIA_TRACK_UPDATE_OK;
+    e->track = t;
+    e->has_largest = result->has_largest;
+    e->largest_group = result->largest_group;
+    e->largest_object = result->largest_object;
+    e->has_expires = result->has_expires;
+    e->expires_ms = result->expires_ms;
+    r->ev_tail++;
+    pthread_mutex_unlock(&r->mu);
+}
+
 static void receiver_on_subscribe_done(void *ctx, moq_sub_track_t *track,
                                        uint64_t status_code)
 {
@@ -2007,6 +2116,14 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r)
             (void)moq_sub_release_track(r->sub, t->sub_track);
             t->sub_track = NULL;
         }
+        /* the live subscription is gone; a pending app attribution
+         * dies with it. The VOD-rearm replacement subscription's first
+         * ack must not inherit it (and forward_sent resets with the fresh
+         * SUBSCRIBE default below/at establish). */
+        pthread_mutex_lock(&r->mu);
+        t->upd_notify_app = false;
+        t->upd_sent_app_gen = 0;
+        pthread_mutex_unlock(&r->mu);
 
         if (status == RECEIVER_DONE_TRACK_ENDED && !t->vod_rearmed && !t->ended) {
             /* Re-arm for VOD: keep desired_subscribed; reset the lifecycle flags
@@ -2115,23 +2232,57 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
         moq_media_track_t *t = r->tracks[i];
         if (!t->sub_track || t->ended || t->removed) continue;
 
+        /* Race rule: {desired_subscribed, app_gen} are
+         * snapshotted TOGETHER under r->mu, and ONLY the snapshot
+         * generation feeds the no-wire reconciliation and the send
+         * attribution. A toggle landing after this snapshot influenced
+         * neither the computed target nor the sent update, so it must stay
+         * UNRECONCILED for the next pass -- advancing to the live app_gen
+         * here would either misattribute a flow-only update to the later
+         * toggle or silently swallow the toggle's own future update. */
         pthread_mutex_lock(&r->mu);
         bool want = t->desired_subscribed;
+        uint64_t gen_snap = t->app_gen;
         pthread_mutex_unlock(&r->mu);
         /* Queued objects for a disabled track are purged in unsubscribe_track
          * (independent of forward state); here we only drive the Forward State. */
 
+        /* Test-only racy instant: a hook-driven toggle here lands AFTER
+         * the snapshot -- it must influence neither this pass's target nor
+         * its attribution, and must stay unreconciled for the next pass. */
+        RECONCILE_RACE_HOOK();
+
         bool target = want && flow_allows;
         t->forward_desired = target;
-        if (t->forward_desired == t->forward_sent) continue;
+        if (t->forward_desired == t->forward_sent) {
+            /* Wire-neutral pass: the SNAPSHOTTED app changes are proven
+             * coalesced-away; reconcile them (and only them) silently. */
+            pthread_mutex_lock(&r->mu);
+            bool dummy_notify;
+            attribution_classify(gen_snap, t->reconciled_app_gen,
+                                 &dummy_notify, &t->reconciled_app_gen);
+            pthread_mutex_unlock(&r->mu);
+            continue;
+        }
         moq_sub_update_cfg_t ucfg;
         moq_sub_update_cfg_init(&ucfg);
         ucfg.has_forward = true;
         ucfg.forward = t->forward_desired;
-        /* WRONG_STATE = an update is still outstanding; retry next cycle. */
+        /* WRONG_STATE = an update is still outstanding; retry next cycle
+         * -- and change NOTHING: neither the pending update's attribution
+         * nor reconciled_app_gen. */
         if (moq_sub_update_subscription(r->sub, t->sub_track, &ucfg,
-                                        now_us) == MOQ_OK)
+                                        now_us) == MOQ_OK) {
             t->forward_sent = t->forward_desired;
+            /* Attribution is decided ONCE, from the SNAPSHOT taken with
+             * the target computation (the race rule above). */
+            pthread_mutex_lock(&r->mu);
+            attribution_classify(gen_snap, t->reconciled_app_gen,
+                                 &t->upd_notify_app,
+                                 &t->reconciled_app_gen);
+            t->upd_sent_app_gen = gen_snap;
+            pthread_mutex_unlock(&r->mu);
+        }
     }
 }
 
@@ -2163,6 +2314,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         scfg.callbacks.on_subscribed = receiver_on_subscribed;
         scfg.callbacks.on_subscribe_error = receiver_on_subscribe_error;
         scfg.on_subscribe_done = receiver_on_subscribe_done;
+        scfg.on_update_ok = receiver_on_update_ok;
         if (moq_sub_create(session, &r->alloc, &scfg, &r->sub) != MOQ_OK) {
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
             return;
@@ -2560,8 +2712,11 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
      * drive receiver_hook against a session it controls. The guard is a no-op
      * in shipping builds (ep is never NULL there). */
     if (ep) {
+        /* No time-based service deadline today (next_deadline_us left NULL): the
+         * receiver wakes on transport/event activity, not a service timer. */
+        moq_endpoint_hook_ops_t ops = { .pump = receiver_hook };
         moq_result_t arc = moq_endpoint_attach_hook(
-            ep, MOQ_ENDPOINT_HOOK_RECEIVER, receiver_hook, r);
+            ep, MOQ_ENDPOINT_HOOK_RECEIVER, &ops, r);
         if (arc < 0) {
             receiver_free(r);
             return arc;
@@ -2708,6 +2863,13 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
     full.track = e.track;
     full.desc = e.track ? &e.track->desc : NULL;
     full.config_generation = 0;
+    /* the UPDATE_OK scalars come from the QUEUE ENTRY's per-event
+     * copies, never from current track state. Zero for other kinds. */
+    full.has_largest = e.has_largest;
+    full.largest_group = e.largest_group;
+    full.largest_object = e.largest_object;
+    full.has_expires = e.has_expires;
+    full.expires_ms = e.expires_ms;
     memcpy(ev, &full, n);
     return MOQ_OK;
 }
@@ -2810,6 +2972,7 @@ moq_result_t moq_media_receiver_subscribe_track(
         track->desired_filter = filt;
         track->desired_has_priority = has_prio;
         track->desired_priority = prio;
+        track->app_gen++;          /* state-changing app intent */
     }
     track->desired_subscribed = true;
     pthread_mutex_unlock(&r->mu);
@@ -2837,6 +3000,8 @@ moq_result_t moq_media_receiver_unsubscribe_track(
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_WRONG_STATE;
     }
+    if (track->desired_subscribed)
+        track->app_gen++;          /* state-changing app intent */
     track->desired_subscribed = false;
     /* Purge the track's queued objects now, under the same lock that guards the
      * queue (a pure data operation -- no session calls -- so it is safe off the
@@ -3257,4 +3422,30 @@ moq_result_t moq_media_receiver_test_post_teardown(moq_media_receiver_t *r,
     receiver_free(r);
     return rc;
 }
+/* Test seams: the pure attribution classifier (deterministic interleaving
+ * proofs run against the PRODUCTION logic) and a per-track attribution
+ * inspector (causal proof that terminal/rearm cleanup really cleared the
+ * pending app attribution). Test-internals only; never exported. */
+void moq_media_receiver_test_classify(uint64_t gen_snap, uint64_t reconciled,
+                                      bool *out_notify,
+                                      uint64_t *out_reconciled)
+{
+    attribution_classify(gen_snap, reconciled, out_notify, out_reconciled);
+}
+
+void moq_media_receiver_test_track_attrib(moq_media_receiver_t *r,
+                                          moq_media_track_t *t,
+                                          bool *out_notify,
+                                          uint64_t *out_sent_gen,
+                                          uint64_t *out_app_gen,
+                                          uint64_t *out_reconciled)
+{
+    pthread_mutex_lock(&r->mu);
+    if (out_notify) *out_notify = t->upd_notify_app;
+    if (out_sent_gen) *out_sent_gen = t->upd_sent_app_gen;
+    if (out_app_gen) *out_app_gen = t->app_gen;
+    if (out_reconciled) *out_reconciled = t->reconciled_app_gen;
+    pthread_mutex_unlock(&r->mu);
+}
+
 #endif /* MOQ_MEDIA_RECEIVER_TESTING */

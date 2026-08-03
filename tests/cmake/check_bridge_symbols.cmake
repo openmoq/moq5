@@ -51,6 +51,7 @@ set(BASE_SYMBOLS
     moq_transport_bridge_on_peer_bidi_bytes
     moq_transport_bridge_on_peer_stream_reset
     moq_transport_bridge_on_peer_stop_sending
+    moq_transport_bridge_on_peer_stream_terminal
     moq_transport_bridge_on_peer_datagram
     moq_transport_bridge_on_transport_close
     moq_transport_bridge_on_transport_error
@@ -63,6 +64,9 @@ set(BASE_SYMBOLS
     moq_transport_bridge_has_outbound_pending
     moq_transport_bridge_uses_uni_control
     moq_transport_bridge_stream_has_pending
+    moq_transport_bridge_event_progress_token
+    moq_transport_bridge_has_events
+    moq_transport_bridge_terminal_facts
     moq_transport_bridge_stream_count
     moq_transport_bridge_tombstone_count
     moq_transport_bridge_find_ref

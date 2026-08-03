@@ -28,8 +28,8 @@
  *
  *     In server mode, create() starts a QuicServer listener.
  *     Each accepted QUIC connection gets its own moq_session_t
- *     and adapter. The app iterates connections via next_conn()
- *     inside on_pump.
+ *     and adapter. The app iterates the lane's connections via
+ *     moq_mvfst_lane_next_conn() inside on_lane_pump.
  *
  *     MoQ version / ALPN:
  *       The offered MoQ-over-QUIC ALPN is set via cfg.alpn_list /
@@ -43,7 +43,7 @@
  *
  * Thread safety:
  *   wake() and wait() are safe from any thread.
- *   session() returns a pointer valid only inside on_pump callbacks
+ *   session() returns a pointer valid only inside on_lane_pump callbacks
  *     on the managed network thread. Do not call session APIs from
  *     the application thread.
  *   create/stop/destroy are called from the application thread.
@@ -71,16 +71,31 @@ extern "C" {
 typedef struct moq_mvfst_managed moq_mvfst_managed_t;
 
 /*
- * Pump callback: runs on the network thread between adapter service
- * calls. The session pointer from moq_mvfst_managed_session() is
- * valid inside this callback.
+ * A lane is an exclusive access window over a set of the facade's
+ * connections. mvfst runs a single EventBase worker per managed facade,
+ * so there is exactly ONE lane; lane_count > 1 is rejected at create()
+ * with MOQ_ERR_UNSUPPORTED (true multi-lane would need multiple worker
+ * EventBases — a separate re-architecture, and mvfst is not the fanout
+ * target). The lane exists so the managed API matches the shared lane
+ * shape across adapters.
+ */
+typedef struct moq_mvfst_managed_lane moq_mvfst_managed_lane_t;
+
+/*
+ * Lane pump callback: runs on the network thread, inside the lane's
+ * exclusive access window, between adapter service calls. It services
+ * ALL of the lane's connections in one pass — iterate them with
+ * moq_mvfst_lane_next_conn(). The client's single session is available
+ * via moq_mvfst_managed_session(); a server reaches its sessions through
+ * lane iteration (moq_mvfst_managed_session() is NULL on a server).
  *
  * Return 0 to continue, nonzero to request clean shutdown.
  * Must NOT call moq_mvfst_managed_stop() from inside.
  */
-typedef int (*moq_mvfst_pump_fn)(moq_mvfst_managed_t *m,
-                                  uint64_t now_us,
-                                  void *ctx);
+typedef int (*moq_mvfst_lane_pump_fn)(moq_mvfst_managed_t *m,
+                                       moq_mvfst_managed_lane_t *lane,
+                                       uint64_t now_us,
+                                       void *user);
 
 /*
  * Activity callback: signal-only notification after each pump.
@@ -125,9 +140,9 @@ typedef struct moq_mvfst_managed_cfg {
     uint32_t              recv_buffer_size;
 
     /* Callbacks. */
-    moq_mvfst_pump_fn     on_pump;        /* required */
-    moq_mvfst_activity_fn on_activity;    /* optional, signal-only */
-    void                 *user_ctx;       /* passed to callbacks */
+    moq_mvfst_lane_pump_fn on_lane_pump;  /* required */
+    moq_mvfst_activity_fn  on_activity;   /* optional, signal-only */
+    void                  *user_ctx;      /* passed to both callbacks */
 
     /* Session deadline tuning (0 = disabled). */
     uint64_t              goaway_timeout_us;  /* GOAWAY drain timeout */
@@ -166,14 +181,40 @@ typedef struct moq_mvfst_managed_cfg {
 
     /* Appended (struct_size append-only ABI) — QUIC transport tuning.
      * These were originally placed before the callback pointers, which shifted
-     * the public on_pump/on_activity/user_ctx offsets; they were moved here so
-     * the callback layout (and the frozen v0 prefix) stays stable. Read only
+     * the public on_lane_pump/on_activity/user_ctx offsets; they were moved here
+     * so the callback layout (and the frozen v0 prefix) stays stable. Read only
      * behind CFG_HAS, so a shorter caller leaves them at the library defaults.
      *
      * max_num_ptos:   max consecutive PTOs before close (0 = library default).
      * initial_rtt_us: initial RTT estimate in microseconds (0 = default). */
     uint16_t              max_num_ptos;
     uint32_t              initial_rtt_us;
+
+    /* Appended (struct_size append-only ABI) — lane count.
+     *
+     * mvfst runs a single EventBase worker per managed facade, so it
+     * supports exactly ONE lane. 0 or 1 = the single lane (the previous
+     * behavior). Any value > 1 fails create() with MOQ_ERR_UNSUPPORTED —
+     * the adapter does not fake concurrency behind one serialized domain.
+     * This is enforced for client and server facades alike. */
+    uint32_t              lane_count;
+
+    /* Appended (struct_size append-only ABI) — optional application service-
+     * deadline query, ONE ABI block read only when struct_size covers THROUGH
+     * app_deadline_ctx (the callback and its context are honored together or not
+     * at all). Returns the app's earliest pending time-based deadline as an
+     * ABSOLUTE CLOCK_MONOTONIC microsecond value, or UINT64_MAX for none. The
+     * EventBase pump folds it with the session deadlines and drives the one-shot
+     * AsyncTimeout, so a purely time-based deadline (e.g. a periodic catalog
+     * refresh) wakes an otherwise-idle facade. MUST be pure, non-blocking, and
+     * non-reentrant (no re-entry into this facade). NULL = none. The fold happens
+     * only inside a live pump, so when application state changes the value this
+     * query would return, the owner MUST issue moq_mvfst_managed_wake() /
+     * moq_mvfst_lane_wake() so the next pump recomputes the deadline; an idle
+     * facade will not observe the new deadline on its own. Enabled through
+     * moq_mvfst_managed_cfg_init_sized(). */
+    uint64_t            (*app_deadline_us)(void *ctx);
+    void                 *app_deadline_ctx;
 } moq_mvfst_managed_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the
@@ -181,8 +222,9 @@ typedef struct moq_mvfst_managed_cfg {
  * It cannot know the caller's storage size, so it must not write the full
  * current sizeof -- that would overflow a caller compiled against the original
  * (smaller) struct. Appended fields (goaway_timeout_us, sni/alpn_*,
- * max_connections, max_num_ptos, initial_rtt_us) default to disabled; to set
- * any of them, or to initialize the full current struct, use
+ * max_connections, max_num_ptos, initial_rtt_us, lane_count, and the
+ * app_deadline_us/app_deadline_ctx block) default to disabled; to set any of
+ * them, or to initialize the full current struct, use
  * moq_mvfst_managed_cfg_init_sized(). */
 MOQ_API void moq_mvfst_managed_cfg_init(moq_mvfst_managed_cfg_t *cfg);
 
@@ -204,7 +246,7 @@ MOQ_API void moq_mvfst_managed_cfg_init_sized(moq_mvfst_managed_cfg_t *cfg,
  *
  * Server mode: spawns a network thread, creates a QuicServer listener
  * bound to cfg.host:cfg.port (0 = ephemeral). Accepted connections
- * get per-connection sessions and adapters, iterable via next_conn().
+ * get per-connection sessions and adapters, iterable via moq_mvfst_lane_next_conn().
  *
  * create() blocks until init succeeds or fails. On success, the
  * pump loop is running.
@@ -225,7 +267,7 @@ MOQ_API moq_result_t moq_mvfst_managed_create(
  * After stop returns, no callbacks will fire and the session is
  * destroyed.
  *
- * Must NOT be called from on_pump or on_activity.
+ * Must NOT be called from on_lane_pump or on_activity.
  * Returns MOQ_ERR_INVAL if called from the managed thread.
  */
 MOQ_API moq_result_t moq_mvfst_managed_stop(moq_mvfst_managed_t *m);
@@ -235,57 +277,79 @@ MOQ_API moq_result_t moq_mvfst_managed_stop(moq_mvfst_managed_t *m);
  * Calls stop() internally if not already stopped.
  * destroy(NULL) is a no-op.
  *
- * Must NOT be called from on_pump or on_activity.
+ * Must NOT be called from on_lane_pump or on_activity.
  */
 MOQ_API void moq_mvfst_managed_destroy(moq_mvfst_managed_t *m);
 
 /*
  * Access the underlying session (client mode only).
  * Returns non-NULL only when called from the managed network thread
- * (inside on_pump). Returns NULL from any other thread, after stop,
+ * (inside on_lane_pump). Returns NULL from any other thread, after stop,
  * before init completes, or in server mode.
  *
- * Server mode: use next_conn() + conn_session() instead.
+ * Server mode: iterate the lane via moq_mvfst_lane_next_conn() +
+ * moq_mvfst_conn_session() instead. This is a CLIENT-only convenience,
+ * not a server correctness path.
  */
 MOQ_API moq_session_t *moq_mvfst_managed_session(moq_mvfst_managed_t *m);
 
-/* -- Per-connection API (server mode) -------------------------------- */
+/* -- Lanes ----------------------------------------------------------- */
 
 typedef struct moq_mvfst_conn moq_mvfst_conn_t;
 
+/* Number of lanes (always 1 for mvfst). */
+MOQ_API uint32_t moq_mvfst_managed_lane_count(const moq_mvfst_managed_t *m);
+
+/* The lane at `index` (only 0 is valid), or NULL if out of range. The
+ * returned pointer is stable for the facade's lifetime. */
+MOQ_API moq_mvfst_managed_lane_t *moq_mvfst_managed_lane(
+    moq_mvfst_managed_t *m, uint32_t index);
+
+/* The lane's index (0). */
+MOQ_API uint32_t moq_mvfst_lane_index(const moq_mvfst_managed_lane_t *lane);
+
 /*
- * Iterate accepted connections. Returns NULL when done.
- * Pass prev=NULL to start.
+ * Iterate the connections owned by this lane. Returns NULL when done.
+ * Pass prev=NULL to start. ONLY valid inside this lane's on_lane_pump
+ * (returns NULL otherwise) — the pump sees ALL of the lane's connections
+ * in one pass.
  *
- * Handle stability: a moq_mvfst_conn_t* is stable while the
- * connection remains active. Apps may store it as an opaque
- * identity key across on_pump calls. Conn API calls
- * (conn_session, conn_close) are valid only inside on_pump
- * for handles observed in the current/live next_conn()
- * iteration. Once a handle no longer appears in iteration,
+ * Handle stability: a moq_mvfst_conn_t* is stable while the connection
+ * remains active. Apps may store it as an opaque identity key across
+ * on_lane_pump calls. Conn API calls (conn_session, conn_close) are
+ * valid only inside on_lane_pump for handles observed in the
+ * current/live iteration. Once a handle no longer appears in iteration,
  * it is stale and must not be used.
  */
-MOQ_API moq_mvfst_conn_t *moq_mvfst_managed_next_conn(
-    moq_mvfst_managed_t *m,
+MOQ_API moq_mvfst_conn_t *moq_mvfst_lane_next_conn(
+    moq_mvfst_managed_lane_t *lane,
     moq_mvfst_conn_t *prev);
+
+/* The lane that owns this connection. Valid inside on_lane_pump. */
+MOQ_API moq_mvfst_managed_lane_t *moq_mvfst_managed_conn_lane(
+    moq_mvfst_conn_t *conn);
+
+/* Ask the adapter to run this lane's pump. Safe from any thread;
+ * coalesced. Same delivery as moq_mvfst_managed_wake() (one lane). */
+MOQ_API moq_result_t moq_mvfst_lane_wake(moq_mvfst_managed_lane_t *lane);
 
 /*
  * Get the session for a server connection.
- * Valid only inside on_pump for a live connection handle.
+ * Valid only inside on_lane_pump for a live connection handle.
  */
 MOQ_API moq_session_t *moq_mvfst_conn_session(moq_mvfst_conn_t *conn);
 
 /*
- * Close a single server connection. May be called inside on_pump.
- * Actual cleanup is deferred until after the current on_pump returns,
- * so iteration via next_conn() is safe.
+ * Close a single server connection. May be called inside on_lane_pump.
+ * Actual cleanup is deferred until after the current on_lane_pump returns,
+ * so iteration via moq_mvfst_lane_next_conn() is safe.
  *
  * Close/error lifecycle:
  *   Connections that are closed (by the app or peer) or that hit a
- *   transport/protocol error disappear from next_conn() iteration
- *   after the current on_pump returns. There is no separate close
+ *   transport/protocol error disappear from moq_mvfst_lane_next_conn() iteration
+ *   after the current on_lane_pump returns. There is no separate close
  *   reason API — poll moq_session_poll_events_ex() for
- *   MOQ_EVENT_SESSION_CLOSED inside on_pump to observe close
+ *   MOQ_EVENT_SESSION_CLOSED inside on_lane_pump to observe close
  *   causes before the connection is removed.
  *
  *   Applications needing detailed transport-level close callbacks
@@ -310,15 +374,15 @@ MOQ_API uint16_t moq_mvfst_managed_local_port(const moq_mvfst_managed_t *m);
 /* -- Cross-thread signaling ------------------------------------------ */
 
 /*
- * Wake the network thread so on_pump runs. Safe from any thread. Coalesced.
+ * Wake the network thread so on_lane_pump runs. Safe from any thread. Coalesced.
  * Returns MOQ_OK or MOQ_ERR_CLOSED if stopped, fatal, or pump exited.
  *
  * The pump is event-driven: transport-driven / reactive work (an inbound
- * SUBSCRIBE, a peer close, a write-ready, a session deadline) schedules on_pump
+ * SUBSCRIBE, a peer close, a write-ready, a session deadline) schedules on_lane_pump
  * automatically, so you do NOT need to poll or wake for it. But the pump no
  * longer runs on a fixed cadence -- so any APPLICATION-side state change that
- * on_pump must act on (e.g. flagging "publish this now" or "accept this
- * subscribe" from your own thread) MUST call wake() to make on_pump run and
+ * on_lane_pump must act on (e.g. flagging "publish this now" or "accept this
+ * subscribe" from your own thread) MUST call wake() to make on_lane_pump run and
  * observe it. An app that changes state without waking may never be serviced.
  */
 MOQ_API moq_result_t moq_mvfst_managed_wake(moq_mvfst_managed_t *m);

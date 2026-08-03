@@ -140,6 +140,15 @@ private:
 /* Forward declare so conn_server_cb can reference it. */
 struct moq_mvfst_managed;
 
+/* The single lane of a managed facade. mvfst runs one EventBase worker,
+ * so a facade has exactly one lane; it exists to match the shared lane
+ * API. It just points back at its owner (the pump/iteration operate on
+ * the owner's one connection set / EventBase). */
+struct moq_mvfst_managed_lane {
+    moq_mvfst_managed *owner = nullptr;
+    uint32_t index = 0;
+};
+
 /*
  * Per-connection state for managed server mode.
  * Owns session, adapter, transport, and callbacks for one
@@ -220,7 +229,7 @@ private:
  *
  *   running:  true while the pump loop is active. Set by the thread
  *             on successful init, cleared by stop() request or
- *             natural pump exit (on_pump returns nonzero).
+ *             natural pump exit (on_lane_pump returns nonzero).
  *
  *   thread_exited: true once the network thread has finished
  *             (session destroyed, thread about to return). Set by
@@ -294,9 +303,19 @@ struct moq_mvfst_managed {
     size_t max_connections = MOQ_MVFST_DEFAULT_MAX_CONNECTIONS;
     std::atomic<size_t> conn_count{0};
 
-    moq_mvfst_pump_fn on_pump = nullptr;
+    moq_mvfst_lane_pump_fn on_lane_pump = nullptr;
     moq_mvfst_activity_fn on_activity = nullptr;
     void *user_ctx = nullptr;
+
+    /* App service-deadline query (ctx = the service endpoint), folded into the
+     * pump's earliest deadline. Consulted only inside a live pump. */
+    uint64_t (*app_deadline_us)(void *) = nullptr;
+    void *app_deadline_ctx = nullptr;
+
+    /* the facade's single lane (owner set in create). The `struct` tag is
+     * required: the public moq_mvfst_managed_lane() accessor hides the tag
+     * in C++ ordinary lookup. */
+    struct moq_mvfst_managed_lane lane;
 
     std::unique_ptr<std::thread> thread;
     std::mutex tid_mu;
@@ -339,6 +358,45 @@ struct moq_mvfst_managed {
         if (auto *e = server_evb.load(std::memory_order_acquire))
             return e->isInEventBaseThread();
         return is_managed_thread();
+    }
+
+    /* True ONLY while on_lane_pump is executing (set around that one call,
+     * cleared before on_activity). in_lane_pump is written and read solely
+     * on the network thread, so a plain bool needs no synchronization: the
+     * gated APIs read it only after is_network_thread() has confirmed we
+     * are on that thread. This is the mvfst analogue of the MsQuic pump
+     * marker — session/lane/conn access is the pump's exclusive window, not
+     * merely "any EventBase callback" (on_activity runs on this thread too,
+     * but outside the window). */
+    bool in_lane_pump = false;
+    bool in_pump_window() {
+        return is_network_thread() && in_lane_pump;
+    }
+
+    /* Earliest deadline driving the pump's one-shot AsyncTimeout: the minimum of
+     * the session deadlines and, ONLY while the pump is live, the application
+     * service deadline. The single source of truth for both the client
+     * deadline_to and the server server_deadline_to reschedules. Session reads
+     * run on the network thread; the app callback is pure/non-reentrant and is
+     * consulted only when running (a stopping facade clears running before
+     * teardown, so nothing rearms a timer from it). */
+    uint64_t compute_earliest_deadline() {
+        uint64_t dl = UINT64_MAX;
+        if (session.load()) {
+            uint64_t d = moq_session_next_deadline_us(session.load());
+            if (d < dl) dl = d;
+        }
+        for (auto &c : conns) {
+            if (!c->session) continue;
+            uint64_t d = moq_session_next_deadline_us(c->session);
+            if (d < dl) dl = d;
+        }
+        if (app_deadline_us &&
+            running.load(std::memory_order_acquire)) {
+            uint64_t ad = app_deadline_us(app_deadline_ctx);
+            if (ad < dl) dl = ad;
+        }
+        return dl;
     }
 
     bool is_closed() const {
@@ -384,8 +442,8 @@ struct moq_mvfst_managed {
             pump_scheduled.store(false);
             if (pump_run) pump_run();
             /* Settle pass. An external wake may have changed app state that
-             * on_pump only observes on a *later* pass -- the classic managed
-             * on_pump state machine reads an event this pass and acts on it
+             * on_lane_pump only observes on a *later* pass -- the classic managed
+             * on_lane_pump state machine reads an event this pass and acts on it
              * the next (e.g. poll_events sees SETUP_COMPLETE, then a following
              * pump sends SUBSCRIBE). The old 5ms cadence supplied that second
              * pass implicitly; here one bounded follow-up preserves it without
@@ -438,7 +496,7 @@ struct moq_mvfst_managed {
             if (!server_pump_enabled.load(std::memory_order_acquire)) return;
             if (server_pump_run) server_pump_run();
             /* Bounded settle pass (same rationale as the client): an external
-             * wake may have changed app state that on_pump only observes on a
+             * wake may have changed app state that on_lane_pump only observes on a
              * later pass. One follow-up; it does not re-arm settle. */
             if (server_pump_settle_needed.exchange(false))
                 server_schedule_pump();
@@ -545,6 +603,7 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
         ts.advertisedInitialMaxStreamsUni = 100;
+
         ts.datagramConfig.enabled = true;
         ts.datagramConfig.sendDropOldDataFirst = true;
         if (owner_->max_num_ptos)
@@ -572,14 +631,14 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
             c->adp = std::make_unique<moq::mvfst::adapter>(
                 acfg, c->session, c->transport);
             /* Inbound callbacks on this conn schedule the server pump so
-             * on_pump drains its events (SUBSCRIBE etc.) without a poll. */
+             * on_lane_pump drains its events (SUBSCRIBE etc.) without a poll. */
             owner_->wire_conn_server_pump(c->adp.get());
         } catch (...) {
             c->fatal = true;
             t->close(quic::QuicError(quic::ApplicationErrorCode(0)));
         }
 
-        /* New connection: schedule a pump so on_pump picks it up. Runs on
+        /* New connection: schedule a pump so on_lane_pump picks it up. Runs on
          * server_evb (we are in the factory callback); a no-op until the pump
          * machinery is enabled at startup, after which the initial pump also
          * sweeps any conn accepted during that window. */
@@ -650,9 +709,9 @@ moq_result_t moq_mvfst_managed_create(
     if (!cfg || !out) return MOQ_ERR_INVAL;
     *out = nullptr;
 
-    /* Minimum struct_size must include at least through on_pump. */
-    if (cfg->struct_size < offsetof(moq_mvfst_managed_cfg_t, on_pump) +
-        sizeof(cfg->on_pump))
+    /* Minimum struct_size must include at least through on_lane_pump. */
+    if (cfg->struct_size < offsetof(moq_mvfst_managed_cfg_t, on_lane_pump) +
+        sizeof(cfg->on_lane_pump))
         return MOQ_ERR_INVAL;
 
     /* Validate perspective. */
@@ -661,8 +720,14 @@ moq_result_t moq_mvfst_managed_create(
     if (persp != MOQ_PERSPECTIVE_CLIENT && persp != MOQ_PERSPECTIVE_SERVER)
         return MOQ_ERR_INVAL;
 
-    /* on_pump is required. */
-    if (!CFG_HAS(cfg, on_pump) || !cfg->on_pump) return MOQ_ERR_INVAL;
+    /* on_lane_pump is required. */
+    if (!CFG_HAS(cfg, on_lane_pump) || !cfg->on_lane_pump)
+        return MOQ_ERR_INVAL;
+
+    /* mvfst is single-EventBase: exactly one lane. Reject any real
+     * multi-lane request rather than faking it behind one domain. */
+    if (CFG_HAS(cfg, lane_count) && cfg->lane_count > 1)
+        return MOQ_ERR_UNSUPPORTED;
 
     /* Read all fields via CFG_HAS. */
     const char *host = CFG_HAS(cfg, host) ? cfg->host : NULL;
@@ -731,9 +796,18 @@ moq_result_t moq_mvfst_managed_create(
         if (CFG_HAS(cfg, initial_rtt_us)) m->initial_rtt_us = cfg->initial_rtt_us;
         if (CFG_HAS(cfg, max_connections) && cfg->max_connections)
             m->max_connections = cfg->max_connections;
-        m->on_pump = cfg->on_pump;
+        m->on_lane_pump = cfg->on_lane_pump;
         m->on_activity = CFG_HAS(cfg, on_activity) ? cfg->on_activity : nullptr;
         m->user_ctx = CFG_HAS(cfg, user_ctx) ? cfg->user_ctx : nullptr;
+        /* app_deadline_us + app_deadline_ctx are ONE ABI block: gated on the
+         * LAST field's fit, so the pair is read together or not at all -- never
+         * the callback with a context read past the caller's struct. */
+        if (CFG_HAS(cfg, app_deadline_ctx)) {
+            m->app_deadline_us = cfg->app_deadline_us;
+            m->app_deadline_ctx = cfg->app_deadline_ctx;
+        }
+        m->lane.owner = m;
+        m->lane.index = 0;
 
         moq_session_cfg_init_sized(&m->session_cfg, sizeof(m->session_cfg), &m->alloc, persp);
         m->session_cfg.version = version;   /* exact version (16 == default) */
@@ -969,6 +1043,7 @@ moq_result_t moq_mvfst_managed_create(
                         m->transport->getTransportSettings();
                     ts.advertisedInitialMaxStreamsBidi = 100;
                     ts.advertisedInitialMaxStreamsUni = 100;
+
                     ts.datagramConfig.enabled = true;
                     ts.datagramConfig.sendDropOldDataFirst = true;
                     if (m->max_num_ptos)
@@ -1003,7 +1078,7 @@ moq_result_t moq_mvfst_managed_create(
         signal_init(m, MOQ_OK);
 
         /*
-         * pump_tick: service adapters, call on_pump, remove dead
+         * pump_tick: service adapters, call on_lane_pump, remove dead
          * conns. For client mode, called directly on the managed
          * thread. For server mode, called on the worker EventBase
          * via runInEventBaseThreadAndWait.
@@ -1031,7 +1106,9 @@ moq_result_t moq_mvfst_managed_create(
                 else if (c->adp->is_closed()) c->close_requested = true;
             }
 
-            int pump_rc = h->on_pump(h, now, h->user_ctx);
+            h->in_lane_pump = true;
+            int pump_rc = h->on_lane_pump(h, &h->lane, now, h->user_ctx);
+            h->in_lane_pump = false;
             if (pump_rc != 0)
                 return {false, UINT64_MAX};
 
@@ -1083,20 +1160,13 @@ moq_result_t moq_mvfst_managed_create(
                     h->negotiated.store((int)h->cfg_version);
             }
 
-            /* Compute earliest session deadline on the correct
-             * thread (server conns live on the worker EventBase). */
-            uint64_t dl = UINT64_MAX;
-            if (h->session.load()) {
-                uint64_t d = moq_session_next_deadline_us(
-                    h->session.load());
-                if (d < dl) dl = d;
-            }
-            for (auto &c : h->conns) {
-                if (!c->session) continue;
-                uint64_t d = moq_session_next_deadline_us(c->session);
-                if (d < dl) dl = d;
-            }
-            return {true, dl};
+            /* Earliest deadline (min of session deadlines + the live app
+             * deadline) on the correct thread — server conns live on the worker
+             * EventBase. Drives both the client deadline_to and the server
+             * server_deadline_to reschedules below. Reached only on the live
+             * path: the fatal / closed / nonzero-pump-result returns above skip
+             * it, so the app callback is never consulted for a terminal pump. */
+            return {true, h->compute_earliest_deadline()};
         };
 
         /* --- Pump loop --- */
@@ -1151,7 +1221,7 @@ moq_result_t moq_mvfst_managed_create(
                     }
                 };
 
-                m->request_pump();     /* initial service + on_pump */
+                m->request_pump();     /* initial service + on_lane_pump */
                 /* loopForever (not loop): keep the EventBase a durable owner of
                  * this thread so it never returns when momentarily idle (e.g.
                  * after a stream FIN with no registered read event). A plain
@@ -1168,7 +1238,7 @@ moq_result_t moq_mvfst_managed_create(
                 /* SERVER: event-driven pump scheduled onto the QuicServer
                  * worker EventBase -- no 5ms poll. The manager thread wires the
                  * pump body + deadline timer, kicks one initial pump, then
-                 * blocks until shutdown. pump_tick / on_pump / conn work all run
+                 * blocks until shutdown. pump_tick / on_lane_pump / conn work all run
                  * on server_evb (where inbound callbacks already run). */
                 m->server_pump_run = [m, &pump_tick]() {
                     pump_result pr = pump_tick(m);
@@ -1222,7 +1292,7 @@ moq_result_t moq_mvfst_managed_create(
             } else {
                 /* No EventBase at all: the lifecycle-only mode (host==NULL
                  * client, no transport created). There is no event source, so
-                 * on_pump can only be driven by a bounded manager-thread loop.
+                 * on_lane_pump can only be driven by a bounded manager-thread loop.
                  * This is neither the server latency path nor a real traffic
                  * path -- it exists for create/stop/destroy discipline -- so a
                  * small wait here is fine (it is the pre-event-driven behavior
@@ -1325,15 +1395,35 @@ moq_session_t *moq_mvfst_managed_session(moq_mvfst_managed_t *m)
 {
     if (!m) return nullptr;
     if (m->perspective == MOQ_PERSPECTIVE_SERVER) return nullptr;
-    if (!m->is_network_thread()) return nullptr;
+    if (!m->in_pump_window()) return nullptr; /* pump window only */
     return m->session.load();
 }
 
-moq_mvfst_conn_t *moq_mvfst_managed_next_conn(
-    moq_mvfst_managed_t *m, moq_mvfst_conn_t *prev)
+uint32_t moq_mvfst_managed_lane_count(const moq_mvfst_managed_t *m)
 {
-    if (!m) return nullptr;
-    if (!m->is_network_thread()) return nullptr;
+    return m ? 1u : 0u;
+}
+
+moq_mvfst_managed_lane_t *moq_mvfst_managed_lane(
+    moq_mvfst_managed_t *m, uint32_t index)
+{
+    if (!m || index != 0) return nullptr;
+    return &m->lane;
+}
+
+uint32_t moq_mvfst_lane_index(const moq_mvfst_managed_lane_t *lane)
+{
+    return lane ? lane->index : 0u;
+}
+
+moq_mvfst_conn_t *moq_mvfst_lane_next_conn(
+    moq_mvfst_managed_lane_t *lane, moq_mvfst_conn_t *prev)
+{
+    /* only valid inside this lane's own on_lane_pump window */
+    if (!lane || !lane->owner) return nullptr;
+    moq_mvfst_managed_t *m = lane->owner;
+    if (&m->lane != lane) return nullptr;
+    if (!m->in_pump_window()) return nullptr;
     if (m->conns.empty()) return nullptr;
 
     if (!prev) return m->conns.front().get();
@@ -1348,10 +1438,23 @@ moq_mvfst_conn_t *moq_mvfst_managed_next_conn(
     return nullptr;
 }
 
+moq_mvfst_managed_lane_t *moq_mvfst_managed_conn_lane(
+    moq_mvfst_conn_t *conn)
+{
+    if (!conn || !conn->parent) return nullptr;
+    return &conn->parent->lane;
+}
+
+moq_result_t moq_mvfst_lane_wake(moq_mvfst_managed_lane_t *lane)
+{
+    if (!lane || !lane->owner) return MOQ_ERR_INVAL;
+    return moq_mvfst_managed_wake(lane->owner);
+}
+
 moq_session_t *moq_mvfst_conn_session(moq_mvfst_conn_t *conn)
 {
     if (!conn) return nullptr;
-    if (!conn->parent || !conn->parent->is_network_thread())
+    if (!conn->parent || !conn->parent->in_pump_window())
         return nullptr;
     return conn->session;
 }
@@ -1360,7 +1463,7 @@ moq_result_t moq_mvfst_conn_close(moq_mvfst_conn_t *conn,
                                     uint64_t error_code)
 {
     if (!conn) return MOQ_ERR_INVAL;
-    if (!conn->parent || !conn->parent->is_network_thread())
+    if (!conn->parent || !conn->parent->in_pump_window())
         return MOQ_ERR_INVAL;
     conn->close_requested = true;
     if (conn->transport)
@@ -1465,6 +1568,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     , public quic::QuicSocket::ReadCallback
     , public quic::QuicSocket::DatagramCallback
     , public quic::ConnectionWriteCallback
+    , public quic::ByteEventCallback
 {
     moq_session_t *session;
     std::shared_ptr<quic::QuicSocket> socket;
@@ -1479,6 +1583,18 @@ struct __attribute__((visibility("hidden"))) adapter::impl
      * no poll to fall back on). The server path still polls and reorders its
      * own teardown separately, so leave its conns unarmed for now. */
     bool write_ready_enabled = false;
+    /* Outbound-progress pump slot (managed only): armed while a TX
+     * byte-event registration is outstanding for the last-written
+     * stream offset. TX fires once the bytes reach the wire (past
+     * congestion control and pacing), and its firing schedules the
+     * next pump — so a publisher that emits more data from on_lane_pump
+     * keeps its own transmission-paced clock with no reliance on app
+     * wakes. TX, not ACK: an ACK-paced slot adds an RTT plus the
+     * peer's delayed-ACK timer per window, which serializes a
+     * one-object-in-flight publisher at ACK-timer cadence.
+     * Network-thread confined. */
+    bool progress_pump_enabled = false;
+    bool progress_armed = false;
 
     /* Shared transport bridge — all routing goes through this. */
     moq_transport_bridge_t *shared_bridge = nullptr;
@@ -1513,7 +1629,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
 
     /* Set by the managed client facade: schedules a coalesced MoQ pump on the
      * managed EventBase after an inbound transport callback advances the
-     * bridge, so the app's on_pump drains the newly-queued events. Unset
+     * bridge, so the app's on_lane_pump drains the newly-queued events. Unset
      * (null) in attach mode, where the caller drives its own pump. */
     std::function<void()> pump_wake;
     void wake_managed_pump() { if (pump_wake) pump_wake(); }
@@ -1583,6 +1699,11 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     }
 
     void teardown_callbacks() {
+        /* An armed byte-event holds a raw pointer to this impl; the
+         * socket outlives us (shared_ptr member), so cancel explicitly —
+         * the cancellation callback lands on the still-live impl. */
+        if (progress_armed)
+            socket->cancelAllByteEventCallbacks();
         for (auto id : read_cb_streams)
             socket->setReadCallback(id, nullptr, std::nullopt);
         read_cb_streams.clear();
@@ -1662,6 +1783,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
 
         resume_paused_reads();
         arm_write_if_pending();
+        arm_progress_pump();
         return rc;
     }
 
@@ -1681,6 +1803,47 @@ struct __attribute__((visibility("hidden"))) adapter::impl
         if (!moq_transport_bridge_has_outbound_pending(shared_bridge)) return;
         auto r = socket->notifyPendingWriteOnConnection(this);
         if (!r.hasError()) write_armed = true;
+    }
+
+    /* After a pass that wrote stream data, register a one-shot TX
+     * byte-event at the last written offset. Registration for an
+     * already-transmitted offset is legal — mvfst schedules the
+     * callback asynchronously, never inline. If the stream is already
+     * reclaimed (everything it carried was sent and acknowledged), the
+     * transmission this registration would wait for has effectively
+     * happened: give the pump its slot directly instead. */
+    void arm_progress_pump() {
+        if (!progress_pump_enabled || progress_armed || !socket) return;
+        if (!shared_ep_ctx.wrote_since_pump_arm) return;
+        shared_ep_ctx.wrote_since_pump_arm = false;
+        uint64_t id = shared_ep_ctx.last_write_stream;
+        auto off = socket->getStreamWriteOffset(id);
+        if (!off.hasError() && *off > 0) {
+            auto r = socket->registerByteEventCallback(
+                quic::ByteEvent::Type::TX, id, *off - 1, this);
+            if (!r.hasError()) {
+                progress_armed = true;
+                return;
+            }
+        }
+        wake_managed_pump();
+    }
+
+    void onByteEvent(quic::ByteEvent) noexcept override {
+        progress_armed = false;
+        try {
+            /* The wire drained what the last pass wrote: service (which
+             * re-arms if this pass writes) and give the app its pump. */
+            service_all(now_us_from_clock());
+            wake_managed_pump();
+        } catch (...) {
+            moq_transport_bridge_on_transport_error(
+                shared_bridge, 0x1, now_us_from_clock());
+        }
+    }
+
+    void onByteEventCanceled(quic::ByteEventCancellation) noexcept override {
+        progress_armed = false;   /* stream reset or connection teardown */
     }
 
     void onConnectionWriteReady(uint64_t /*maxToSend*/) noexcept override {
@@ -2058,12 +2221,13 @@ void moq_mvfst_managed::enable_credit_gating()
     auto *im = adapter_ptr->impl_.get();
     im->shared_ep_ctx.credit_gating = true;
     im->write_ready_enabled = true; /* event-driven client: retry via write-readiness */
+    im->progress_pump_enabled = true; /* pump slots ride TX progress */
     moq_mvfst_managed *self = this;
     im->credit_wake = [self]() {
         self->wake_pump();
     };
     /* Inbound transport callbacks schedule a coalesced MoQ pump so the app's
-     * on_pump drains newly-queued events (the EventBase itself keeps mvfst's
+     * on_lane_pump drains newly-queued events (the EventBase itself keeps mvfst's
      * QUIC timers alive; the pump is a callback on it, not a blocking wait). */
     im->pump_wake = [self]() {
         self->request_pump();
@@ -2080,6 +2244,10 @@ void moq_mvfst_managed::wire_conn_server_pump(moq::mvfst::adapter *adp)
     adp->impl_->pump_wake = [self]() {
         self->server_request_pump();
     };
+    /* Server publishers get the same transmission-paced pump slots as
+     * the client (their conns leave write_ready/credit gating off, but
+     * outbound progress must still schedule the next pass). */
+    adp->impl_->progress_pump_enabled = true;
 }
 
 #ifdef MOQ_MVFST_TESTING
@@ -2115,5 +2283,25 @@ extern "C" uint64_t moq_mvfst_managed_credit_grant_count(
     const moq_mvfst_managed_t *m)
 {
     return m ? m->credit_grant_count() : 0;
+}
+
+/* The earliest deadline the pump would publish to its one-shot AsyncTimeout —
+ * the SAME moq_mvfst_managed::compute_earliest_deadline() the client and server
+ * pump paths call. Lets a test drive the session+app fold deterministically,
+ * without waiting on wall-clock timer delivery. Intended for an idle facade with
+ * no sessions (so the read is safe off the network thread and reflects only the
+ * app fold). */
+extern "C" uint64_t moq_mvfst_managed_test_earliest_deadline(
+    moq_mvfst_managed_t *m)
+{
+    return m ? m->compute_earliest_deadline() : UINT64_MAX;
+}
+
+/* Drive the live/stopping latch the fold guards on, so a test can exercise the
+ * terminal path (a stopping pump must not consult the app callback). */
+extern "C" void moq_mvfst_managed_test_set_running(
+    moq_mvfst_managed_t *m, bool running)
+{
+    if (m) m->running.store(running, std::memory_order_release);
 }
 #endif /* MOQ_MVFST_TESTING */

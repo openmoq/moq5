@@ -53,6 +53,40 @@ final class PlayerModel: ObservableObject {
         case rawQUIC = "Raw QUIC"
         var id: String { rawValue }
     }
+    /// Which QUIC stack serves the connection. This example DEFAULTS to
+    /// `.picoquic` on a fresh install: the picoquic family reliably serves
+    /// both raw-QUIC `moqt://` relays and WebTransport `https://` relays.
+    /// `.automatic` also resolves to the picoquic family. An explicitly saved
+    /// user choice always wins over this default.
+    ///
+    /// `.wtquicNetwork` (WebTransport over Network.framework) is
+    /// EXPERIMENTAL. On the tested OS/SDK (macOS 15.7.3 / iOS 26.2),
+    /// Network.framework's public QUIC-multiplex client drops a conformant
+    /// HTTP/3 server's eager server-initiated control stream during the
+    /// connection's ready transition, so establishment against third-party
+    /// relays is unreliable. It stays selectable for experimentation, but it
+    /// is no longer the default and is not recommended on any platform.
+    ///
+    /// `.wtquicMsquic` is WebTransport over MsQuic (cross-platform, but the
+    /// iOS xcframework does not build MsQuic, so it is unsupported at connect
+    /// there). A backend not compiled into the installed service fails with a
+    /// clear "unsupported" message.
+    enum BackendChoice: String, CaseIterable, Identifiable {
+        case wtquicNetwork = "Network.framework (WT)"
+        case wtquicMsquic = "MsQuic (WT)"
+        case automatic = "Auto (picoquic)"
+        case picoquic = "picoquic"
+        var id: String { rawValue }
+        /// The picker label. Distinct from `rawValue` (which is the persisted
+        /// key — never change it, or saved preferences break): the label may
+        /// carry an "Experimental" marker the stored value must not.
+        var displayName: String {
+            switch self {
+            case .wtquicNetwork: "Network.framework (WT) · Experimental"
+            default: rawValue
+            }
+        }
+    }
     enum VersionChoice: String, CaseIterable, Identifiable {
         case automatic = "Auto"          // offer all supported versions
         case draft18 = "Draft 18"
@@ -61,6 +95,9 @@ final class PlayerModel: ObservableObject {
     }
 
     @Published var transport: TransportChoice = .automatic
+    @Published var backend: BackendChoice {
+        didSet { defaults.set(backend.rawValue, forKey: "SimplePlayer.backend") }
+    }
     @Published var version: VersionChoice = .automatic
     /// Path to a PEM CA bundle. Required on iOS for OpenSSL verification
     /// (iOS ships no readable system PEM bundle); optional on macOS.
@@ -74,6 +111,11 @@ final class PlayerModel: ObservableObject {
     @Published private(set) var trackName: String?
     @Published private(set) var negotiatedVersion: String?
     @Published private(set) var isRunning: Bool = false
+    /// The backend that the CURRENT/last connection actually used, latched
+    /// at connect(). Failure messages describe THIS, not a picker the user
+    /// may have changed mid-connection (the picker is also disabled while
+    /// running -- see ContentView).
+    private var activeBackend: BackendChoice = .picoquic
 
     #if canImport(AVFoundation)
     /// The render target the view hosts. Sample buffers are enqueued on
@@ -121,6 +163,10 @@ final class PlayerModel: ObservableObject {
             ?? "https://relay.example.com:4433/moq-relay"
         namespaceText = defaults.string(forKey: "SimplePlayer.namespace")
             ?? "live/cam1"
+        // Fresh install defaults to the reliable picoquic family; an
+        // explicitly saved choice (any prior selection) is preserved.
+        backend = defaults.string(forKey: "SimplePlayer.backend")
+            .flatMap(BackendChoice.init(rawValue:)) ?? .picoquic
     }
 
     // -- Actions ---------------------------------------------------------
@@ -137,15 +183,15 @@ final class PlayerModel: ObservableObject {
         let configuration = LiveMediaSession.Configuration(
             endpoint: makeConfiguration(url: url),
             namespace: MediaNamespace(namespaceText),
-            selector: Self.videoRequiredSelector)
+            selector: Self.videoRequiredSelector,
+            // Bound establishment so an unreachable relay (or an experimental
+            // backend that wedges before it establishes) surfaces a clear
+            // failure instead of an indefinite "Connecting…".
+            establishmentTimeout: .seconds(15))
 
         isRunning = true
-        // Immediate feedback; the observer confirms and advances it as the
-        // session progresses.
-        state = .connecting
-        sampleCount = 0
-        trackName = nil
-        negotiatedVersion = nil
+        activeBackend = backend        // latch: describe() uses this, not the live picker
+        beginWatchUIState()
 
         // start() supersedes any prior watch AND serializes behind an in-flight
         // stop()'s teardown, so a disconnect→reconnect never runs two live
@@ -184,12 +230,34 @@ final class PlayerModel: ObservableObject {
         stateObserver = nil
     }
 
+    /// Per-watch UI reset, applied SYNCHRONOUSLY before `session.start()`:
+    /// the new watch's `.connecting` emission can be coalesced away
+    /// (`bufferingNewest(1)`), so nothing downstream may be trusted to
+    /// clear the previous watch's surface — in particular the
+    /// establishment latch, or a pre-establishment failure of the NEW
+    /// watch would be classified with the OLD watch's phase.
+    func beginWatchUIState() {
+        state = .connecting
+        sampleCount = 0
+        trackName = nil
+        negotiatedVersion = nil
+        establishmentLatched = false
+    }
+
+    /// Durable establishment latch for failure classification. The state
+    /// stream coalesces (`bufferingNewest(1)`), so `.established` itself
+    /// may never be OBSERVED -- any post-establishment state implies it,
+    /// and once latched it stays true for the watch (a UI state variable
+    /// alone would misclassify a media failure as a transport one).
+    private var establishmentLatched = false
+
     /// Map one `WatchState` onto the UI. Returns `true` for a terminal state,
     /// which ends the observer (a superseded watch's late states can't leak).
-    private func apply(_ watchState: WatchState) -> Bool {
+    func apply(_ watchState: WatchState) -> Bool {
         switch watchState {
         case .connecting:
             state = .connecting
+            establishmentLatched = false
             sampleCount = 0
             trackName = nil
             negotiatedVersion = nil
@@ -198,20 +266,24 @@ final class PlayerModel: ObservableObject {
             return false
         case .established:
             state = .established
+            establishmentLatched = true
             refreshVersion()
             return false
         case .awaitingCatalog:
             state = .waitingForMedia
+            establishmentLatched = true
             refreshVersion()
             return false
         case .awaitingFirstObject(let tracks):
             state = .waitingForMedia
+            establishmentLatched = true
             refreshVersion()
             trackName = trackName ?? videoName(in: tracks)
             startRender()
             return false
         case .receiving(let tracks):
             state = .playing
+            establishmentLatched = true
             trackName = trackName ?? videoName(in: tracks)
             startRender()
             return false
@@ -222,7 +294,8 @@ final class PlayerModel: ObservableObject {
             finishWatch(.ended)
             return true
         case .failed(let error):
-            finishWatch(.failed(describe(error)))
+            finishWatch(.failed(describe(
+                error, duringConnect: !establishmentLatched)))
             return true
         }
     }
@@ -349,20 +422,33 @@ final class PlayerModel: ObservableObject {
     /// here is invented. `.automatic` transport derives from the URL scheme
     /// (moqt:// -> raw QUIC, https:// -> WebTransport, taking the WT path
     /// from the URL).
-    private func makeConfiguration(url: URL) -> MoQEndpoint.Configuration {
+    func makeConfiguration(url: URL) -> MoQEndpoint.Configuration {
         var configuration = MoQEndpoint.Configuration(url: url)
         switch transport {
         case .automatic:    break
         case .webTransport: configuration.transportProtocol = .webTransport
         case .rawQUIC:      configuration.transportProtocol = .rawQUIC
         }
+        switch backend {
+        case .automatic:     break
+        case .picoquic:      configuration.backend = .picoquic
+        case .wtquicNetwork: configuration.backend = .wtquicNetwork
+        case .wtquicMsquic:  configuration.backend = .wtquicMsquic
+        }
         switch version {
         case .automatic: break
         case .draft18:   configuration.versions = .list([.draft18])
         case .draft16:   configuration.versions = .list([.draft16])
         }
+        // The wtquic backends verify against system trust (or
+        // insecureSkipVerify) and have no custom-CA-file concept: never attach
+        // caFileURL for .wtquicNetwork or .wtquicMsquic (the UI also hides the
+        // CA control for them, and the C tier rejects a custom CA with
+        // verification on). Only the picoquic family consults a CA bundle.
         let trimmedCA = caFilePath.trimmingCharacters(in: .whitespaces)
-        if !trimmedCA.isEmpty {
+        if backend == .wtquicNetwork || backend == .wtquicMsquic {
+            // no CA file, ever
+        } else if !trimmedCA.isEmpty {
             configuration.caFileURL = URL(fileURLWithPath: trimmedCA)
         } else if let bundled = Bundle.main.url(
             forResource: "cacert", withExtension: "pem") {
@@ -378,27 +464,61 @@ final class PlayerModel: ObservableObject {
     }
 
     /// Give the most common connection failures a human sentence; fall back
-    /// to the error's own description for the rest.
-    private func describe(_ error: MoQServiceError) -> String {
+    /// to the error's own description for the rest. PHASE-AWARE:
+    /// `.unsupported` means two different things depending on when it
+    /// arrives, and the message must never blame the transport
+    /// configuration for a media-format failure (or vice versa).
+    func describe(_ error: MoQServiceError,
+                  duringConnect: Bool) -> String {
         switch error {
         case .interrupted:
             return "Connection interrupted"
         case .closed:
             return "Connection closed"
+        case .unsupported where duringConnect:
+            // Pre-establishment this is a transport/backend-config
+            // rejection -- e.g. the selected backend is not compiled into
+            // the installed service, or its transport/TLS options are
+            // unsupported (a .wtquicNetwork raw-QUIC URL, or a CA file
+            // with system trust).
+            return "This transport configuration isn't supported by the " +
+                   "installed service (backend: \(activeBackend.rawValue))."
         case .unsupported:
-            return "Unsupported media format (CMAF playback is not " +
-                   "wired up yet — use a RAW/LOC stream)"
+            // Post-establishment the transport is fine: the stream's
+            // media format is what the receiver cannot handle
+            // (unsupported packaging/CMAF shape, codec, or track type).
+            return "The stream uses a media format this player doesn't " +
+                   "support (unsupported packaging or codec)."
         // The SDK classifies why a connection failed, so the app can report it
         // truthfully instead of guessing from an opaque code.
         case .connectionFailed(let failure):
             switch failure.kind {
             case .certificateUnverified:
-                return "The server's certificate could not be verified. " +
-                       "On iOS, set a CA bundle in Advanced."
+                switch activeBackend {
+                case .wtquicNetwork:
+                    return "The server's certificate is not trusted by the " +
+                           "system (Network.framework uses system trust; no " +
+                           "CA file applies)."
+                case .wtquicMsquic:
+                    return "The server's certificate is not trusted (the " +
+                           "MsQuic WebTransport backend uses system trust or " +
+                           "insecureSkipVerify; no CA file applies)."
+                case .automatic, .picoquic:
+                    return "The server's certificate could not be verified. " +
+                           "On iOS, set a CA bundle in Advanced."
+                }
             case .tls:
-                return "TLS handshake failed (0x\(String(failure.code, radix: 16)))"
+                // the code is a signed transport-native detail (a negative
+                // Security OSStatus on the Network.framework backend)
+                return "TLS handshake failed (code \(failure.code))"
             case .transport:
-                return "Could not reach the relay"
+                // Covers both an unreachable relay and an establishment
+                // timeout (QUIC may have reached the relay but never finished
+                // establishing — e.g. the experimental Network.framework
+                // backend wedging), so do not claim "could not reach".
+                return "Could not establish the connection over " +
+                       "\(activeBackend.rawValue). Try a different backend " +
+                       "in Advanced."
             }
         case .invalidArgument(let message):
             return message

@@ -277,11 +277,13 @@ private func liveObject(_ handleID: UInt64, media: [UInt8], keyframe: Bool = fal
 
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 private func liveConfig(namespace: MediaNamespace = "live/cam1",
-                        selector: TrackSelector = .firstVideo)
+                        selector: TrackSelector = .firstVideo,
+                        establishmentTimeout: Duration? = nil)
     -> LiveMediaSession.Configuration {
     LiveMediaSession.Configuration(
         endpoint: .init(url: URL(string: "moqt://relay.test:4443")!),
-        namespace: namespace, selector: selector)
+        namespace: namespace, selector: selector,
+        establishmentTimeout: establishmentTimeout)
 }
 
 // MARK: - Tests
@@ -330,6 +332,41 @@ struct LiveMediaSessionTests {
         })
 
         await session.stop()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("establishmentTimeout fails the watch with a transport failure, no stray state")
+    func establishmentTimeoutFailsWatch() async throws {
+        let factory = WatchFactory()
+        let session = LiveMediaSession(endpointFactory: factory.make)
+        let collector = StateCollector(session)
+        defer { collector.cancel() }
+
+        // The endpoint never establishes; the finite deadline must fail the
+        // watch instead of leaving it in .connecting forever.
+        session.start(liveConfig(establishmentTimeout: .milliseconds(100)))
+        #expect(await factory.awaitWatchCount(1))
+
+        #expect(await collector.awaitStates {
+            hasCase($0) {
+                if case .failed(.connectionFailed(let f)) = $0 { f.kind == .transport }
+                else { false }
+            }
+        })
+        // No false-establishment leaked in before the failure, and the failed
+        // state is terminal (later same-generation emissions are dropped).
+        #expect(!hasCase(collector.all) {
+            if case .established = $0 { true } else { false }
+        })
+        // The session's durable state stays on the terminal failure.
+        #expect({
+            if case .failed(.connectionFailed(let f)) = session.state {
+                f.kind == .transport
+            } else { false }
+        }())
+        // The endpoint was closed cleanly by the timeout path.
+        #expect(factory.watches[0].endpointBackend.snapshot().destroyCount == 1)
+        #expect(factory.watches[0].endpointBackend.snapshot().violations.isEmpty)
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -870,7 +907,7 @@ struct LiveMediaSessionTests {
             var iterator = session.objects.makeAsyncIterator()
             box.put(try? await iterator.next())      // video -> .receiving
             await gate.wait()
-            box.put(try? await iterator.next())      // audio (the finding)
+            box.put(try? await iterator.next())      // audio (the case under test)
         }
 
         #expect(await box.awaitCount(1))             // video delivered

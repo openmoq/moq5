@@ -19,6 +19,28 @@ int sub_find_by_request_id(moq_session_t *s, uint64_t request_id)
     return ep.slot;
 }
 
+/*
+ * Allocation-free duplicate detection: compare the DECODED identity
+ * against each live entry's stored canonical key in place, so selection
+ * never allocates. The key-blob form below serves the outbound paths,
+ * which already hold a built key.
+ */
+static bool sub_is_duplicate_track_id(moq_session_t *s,
+                                       const moq_namespace_t *ns,
+                                       moq_bytes_t name,
+                                       moq_sub_role_t role)
+{
+    for (size_t i = 0; i < s->sub_cap; i++) {
+        moq_sub_entry_t *e = &s->subs[i];
+        if (e->state == MOQ_SUB_FREE || e->state == MOQ_SUB_TERMINATED)
+            continue;
+        if (e->role != role) continue;
+        if (moq_track_key_matches(e->track_id_buf, e->track_id_len, ns, name))
+            return true;
+    }
+    return false;
+}
+
 static bool sub_is_duplicate_track(moq_session_t *s,
                                     const uint8_t *track_id, size_t track_id_len,
                                     moq_sub_role_t role)
@@ -116,6 +138,17 @@ int sub_resolve_handle(moq_session_t *s, moq_subscription_t h)
     return (int)slot;
 }
 
+const moq_resolved_window_t *moq_session_sub_resolved_window(
+    moq_session_t *s, moq_subscription_t sub)
+{
+    if (!s) return NULL;
+    int slot = sub_resolve_handle(s, sub);
+    if (slot < 0) return NULL;
+    moq_sub_entry_t *e = &s->subs[slot];
+    if (e->role != MOQ_SUB_ROLE_PUBLISHER || !e->window.has_window) return NULL;
+    return &e->window;
+}
+
 static void sub_free_entry(moq_session_t *s, size_t slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
@@ -143,6 +176,10 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
         e->update_pending = false;
         e->update_request_id = 0;
     }
+    e->update_has_forward = false;
+    e->update_forward = false;
+    e->update_has_filter = false;
+    e->update_filter_type = 0;
     e->update_failed = false;
     if (e->track_id_buf) {
         s->alloc.free(e->track_id_buf, e->track_id_len, s->alloc.ctx);
@@ -157,6 +194,36 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     e->has_largest = false;
     e->largest_group = 0;
     e->largest_object = 0;
+    /* Release the reserved registry record exactly once (empty reservations are
+     * reclaimed here; observed records stay pinned). Clear the resolved window
+     * and captured raw filter so a recycled slot carries no stale state. */
+    if (e->hist) {
+        track_hist_release(s, e->hist);
+        e->hist = NULL;
+    }
+    memset(&e->window, 0, sizeof(e->window));
+    e->req_start_group = 0;
+    e->req_start_object = 0;
+    e->req_end_group = 0;
+    /* Release the owned deferred-done reason exactly once and clear the
+     * Stream-Count gating state so a recycled slot starts ungated. */
+    if (e->done_reason_buf) {
+        s->alloc.free(e->done_reason_buf, e->done_reason_len, s->alloc.ctx);
+        e->done_reason_buf = NULL;
+    }
+    e->done_reason_len = 0;
+    e->done_pending = false;
+    e->done_status_code = 0;
+    e->done_stream_count = 0;
+    e->processed_stream_count = 0;
+    e->done_deadline_us = 0;
+    e->done_expired = false;
+    e->dt_pub_has_object = e->dt_pub_has_subgroup = false;
+    e->dt_pub_object_ms = e->dt_pub_subgroup_ms = 0;
+    e->dt_sub_has_object = e->dt_sub_has_subgroup = false;
+    e->dt_sub_object_ms = e->dt_sub_subgroup_ms = 0;
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
+    e->dt_upd_object_ms = e->dt_upd_subgroup_ms = 0;
     sub_alias_index_clear(s, slot);   /* remove alias while still ESTABLISHED */
     e->state = MOQ_SUB_FREE;
     e->generation++;
@@ -167,66 +234,236 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     session_discard_staged_if_no_pending(s);
 }
 
+/* Finalize a deferred subscriber-role done: the advertised Stream Count is
+ * satisfied -- or the terminal deadline EXPIRED and the reaper's
+ * scan/stop/rescan loop found no live bound streams left (§9.8) -- so
+ * surface the retained SUBSCRIBE_DONE and dispose of the entry.
+ * Retryable: nothing is mutated until the event is queued (queue/scratch
+ * pressure leaves the deferral intact for sub_reap_deferred_dones or the next
+ * processed stream). Control-correlated profiles (no request bidi) free the
+ * entry immediately; stream-correlated profiles free it if the bidi's FIN
+ * already arrived, otherwise the entry drains as TERMINATED and the
+ * request-stream handler frees it on FIN (the local send half was already
+ * closed when the terminal was accepted). Mirrors pub_finalize_done -- minus
+ * the drain-ref, because the entry (and its by-streamref key) is retained
+ * until the FIN rather than freed early. */
+static moq_result_t sub_finalize_done(moq_session_t *s, int slot)
+{
+    moq_sub_entry_t *e = &s->subs[slot];
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+
+    size_t scratch_saved = s->event_scratch_len;
+    moq_bytes_t reason = {0};
+    if (e->done_reason_len > 0) {
+        reason.data = event_scratch_copy(s, e->done_reason_buf,
+                                         e->done_reason_len);
+        reason.len = e->done_reason_len;
+        if (!reason.data) {
+            s->event_scratch_len = scratch_saved;
+            /* Empty scratch that still cannot hold the reason is permanently
+             * too small: fail terminally (mirrors the immediate path) instead
+             * of retrying the deferred done forever. */
+            if (scratch_saved == 0)
+                return close_with_error(s, 0x1,
+                    "event scratch permanently too small");
+            return MOQ_ERR_BUFFER;
+        }
+    }
+
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_SUBSCRIBE_DONE;
+    ev.detail_size = (uint32_t)sizeof(moq_subscribe_done_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.subscribe_done.sub = e->handle;
+    ev.u.subscribe_done.status_code = e->done_status_code;
+    ev.u.subscribe_done.stream_count = e->done_stream_count;
+    ev.u.subscribe_done.reason = reason;
+
+    moq_result_t rc = push_event(s, &ev);
+    if (rc < 0) {
+        s->event_scratch_len = scratch_saved;
+        return rc;
+    }
+
+    if (e->request_stream_ref._v == 0 || e->req_recv_fin) {
+        sub_free_entry(s, (size_t)slot);   /* frees the owned reason */
+    } else {
+        e->done_pending = false;   /* reason stays owned; freed on the FIN */
+        sub_alias_index_clear(s, (size_t)slot);
+        e->state = MOQ_SUB_TERMINATED;
+    }
+    return MOQ_OK;
+}
+
+void sub_note_stream_processed(moq_session_t *s, moq_subscription_t sub)
+{
+    int slot = sub_resolve_handle(s, sub);
+    if (slot < 0) return;
+    moq_sub_entry_t *e = &s->subs[slot];
+    if (e->role != MOQ_SUB_ROLE_SUBSCRIBER) return;
+    e->processed_stream_count++;
+    /* §9.8: direct count-based finalization is legal only in GATED. Once
+     * EXPIRED, the count is merely recorded -- finalization belongs to the
+     * reaper's scan-before-finalize loop (a FIN consumed while expiry
+     * stops sit action-blocked must not finalize past unstopped streams).
+     * The sentinel count is never satisfiable by counting. */
+    if (e->done_pending && !e->done_expired &&
+        e->done_stream_count != MOQ_QUIC_VARINT_MAX &&
+        e->processed_stream_count >= e->done_stream_count)
+        (void)sub_finalize_done(s, slot);
+}
+
+/* Subscription-pool half of the deferred-completion sweep. Same resumption
+ * contract as pub_reap_deferred_dones_resumable(): resumes at s->sweep_slot,
+ * evaluates against s->sweep_now_us, skips non-runnable owners UNCHARGED, charges
+ * the due-mark / stop / finalize transitions separately, and
+ * returns false when it suspended with sweep_slot left on the pending owner. */
+bool sub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
+{
+    for (; s->sweep_slot < s->sub_cap; s->sweep_slot++) {
+        if (s->state == MOQ_SESS_CLOSED) return true;  /* finalize may close */
+
+        size_t i = s->sweep_slot;
+        moq_sub_entry_t *e = &s->subs[i];
+        if (!e->done_pending) continue;    /* costs nothing; never suspends */
+
+        /* A suspension inside STOP_STREAMS or FINALIZE resumes in that phase:
+         * SELECT already qualified this owner, and re-running it could reach a
+         * different verdict now that earlier transitions have committed. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT) {
+            /* SELECT: an owner with an unsatisfied count and a future deadline has
+             * no runnable work and skips UNCHARGED, so a pool of future owners
+             * cannot exhaust the budget and suspend an idle pass. */
+            bool count_satisfied =
+                (e->done_stream_count != MOQ_QUIC_VARINT_MAX &&
+                 e->processed_stream_count >= e->done_stream_count);
+            bool due = (s->sweep_now_us >= e->done_deadline_us);
+            if (!e->done_expired && !count_satisfied && !due)
+                continue;
+
+            if (count_satisfied && !e->done_expired) {
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
+                (void)sub_finalize_done(s, (int)i);
+                continue;
+            }
+
+            if (!e->done_expired) {
+                /* Durable due-mark: its own charged transition, fired once. */
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
+                e->done_expired = true;
+            }
+        }
+
+        /* EXPIRED: scan, stop, rescan-to-zero, then finalize. Action
+         * backpressure leaves the entry EXPIRED (blocked work -> the post-sweep
+         * retry deadline); an event-blocked finalize likewise -- the next pass
+         * re-enters at the scan. Each STOP attempt is one unit, tracked by
+         * s->sweep_rx_pos so a suspended scan resumes mid-pool. */
+
+        /* STOP_STREAMS: branch on the PERSISTED phase. Assigning it here
+         * unconditionally would make a suspension at the finalize check rescan
+         * the rx pool on re-entry instead of finalizing. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT ||
+            s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS) {
+            s->sweep_phase = MOQ_SWEEP_PHASE_STOP_STREAMS;
+            moq_result_t src = session_stop_bound_streams_resumable(s, e->handle,
+                                                     MOQ_PUBLICATION_INVALID, budget);
+            if (src == MOQ_SESSION_SUSPENDED)
+                return false;              /* rx cursor stays: we resume here */
+            if (src < 0) {
+                /* Action capacity: this owner is abandoned for now, so its rx
+                 * cursor must NOT leak into the next owner's scan. */
+                session_sweep_owner_reset(s);
+                continue;
+            }
+            /* Owner's rx scan is complete; the next phase owns a clean cursor. */
+            s->sweep_rx_pos = 0;
+            s->sweep_rx_found = false;
+            s->sweep_phase = MOQ_SWEEP_PHASE_FINALIZE;
+        }
+
+        if (budget) {
+            if (*budget == 0) return false;   /* resume AT finalize */
+            (*budget)--;
+        }
+        (void)sub_finalize_done(s, (int)i);
+        session_sweep_owner_reset(s);
+    }
+    s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    return true;
+}
+
+
+/* The canonical full-track-name key builder lives in session_track_hist.c
+ * (moq_build_track_key) and is shared so subscription request identities and
+ * history-registry keys cannot drift. This thin alias keeps the local call
+ * sites readable. */
 static uint8_t *build_track_id(moq_session_t *s,
                                 const moq_namespace_t *ns,
                                 moq_bytes_t name,
                                 size_t *out_len)
 {
-    size_t total = 1;
-    for (size_t i = 0; i < ns->count; i++)
-        total += 2 + ns->parts[i].len;
-    total += 2 + name.len;
-    *out_len = total;
-
-    uint8_t *buf = (uint8_t *)s->alloc.alloc(total, s->alloc.ctx);
-    if (!buf) return NULL;
-
-    size_t off = 0;
-    buf[off++] = (uint8_t)ns->count;
-    for (size_t i = 0; i < ns->count; i++) {
-        uint16_t flen = (uint16_t)ns->parts[i].len;
-        buf[off++] = (uint8_t)(flen >> 8);
-        buf[off++] = (uint8_t)(flen & 0xFF);
-        if (flen > 0)
-            memcpy(buf + off, ns->parts[i].data, flen);
-        off += flen;
-    }
-    uint16_t nlen = (uint16_t)name.len;
-    buf[off++] = (uint8_t)(nlen >> 8);
-    buf[off++] = (uint8_t)(nlen & 0xFF);
-    if (name.len > 0 && name.data)
-        memcpy(buf + off, name.data, name.len);
-
-    return buf;
+    return moq_build_track_key(s, ns, name, out_len);
 }
 
 /* -- Message parameter validation ---------------------------------- */
 
-/* Copy namespace parts into output scratch. */
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* -- Subscribe handlers -------------------------------------------- */
+
+/*
+ * Queue a terminal REQUEST_ERROR for an inbound SUBSCRIBE that cannot be
+ * accepted -- uniformly across ALL reject reasons (auth-token, duplicate-track,
+ * subscription-pool-full, history-cap). Pre-commit: encode the error, queue it
+ * on the request bidi (stream-correlated) or the control channel, keep the bidi
+ * DRAINABLE (`reject_drain`) so a still-open subscriber's trailing FIN is
+ * absorbed by the drain ring -- unless the FIN already arrived with the request
+ * (`reject_drain` false then, so no drain slot is consumed/leaked), free any
+ * reserved staging slot, then commit the inbound request + auth transaction.
+ * NOTHING else is committed (no event, entry, or history). On MOQ_OK the caller
+ * marks auth committed; on WOULD_BLOCK (capacity shortfall) nothing was
+ * committed, so cleanup_all aborts the txn and the whole reject replays.
+ * `reason` may be NULL.
+ */
+static moq_result_t sub_reject_terminal(moq_session_t *s,
+    moq_decoded_subscribe_t *d, int reserved_slot, bool reject_drain,
+    uint64_t error_code, const char *reason, size_t reason_len)
+{
+    if (reject_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+    uint8_t err_buf[256];
+    moq_buf_writer_t ew;
+    moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
+    moq_result_t rc = s->profile->encode_request_error(s, &ew,
+        &(moq_request_error_encode_args_t){
+            /* request_id is used only by the control-channel (non-stream) form. */
+            .request_id = d->endpoint.has_stream_ref ? 0 : d->request_id,
+            .error_code = error_code,
+            .reason = (const uint8_t *)reason, .reason_len = reason_len });
+    if (rc < 0) return rc;
+    rc = d->endpoint.has_stream_ref
+        ? queue_send_bidi(s, d->endpoint.stream_ref, err_buf,
+                          moq_buf_writer_offset(&ew), true)
+        : queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
+    if (rc < 0) return rc;
+    if (reject_drain)
+        (void)drain_ref_add(s, d->endpoint.stream_ref);
+    if (reserved_slot >= 0) sub_free_entry(s, (size_t)reserved_slot);
+    s->profile->commit_inbound_request(s, &d->endpoint);
+    process_auth_tokens_commit_txn(s, &d->auth_txn);
+    return MOQ_OK;
+}
 
 moq_result_t session_core_on_subscribe(moq_session_t *s,
                                         moq_decoded_subscribe_t *d,
-                                        int reserved_slot)
+                                        int reserved_slot,
+                                        bool request_fin)
 {
     /*
      * All exits route through cleanup_all to free staging
@@ -237,7 +474,15 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     moq_result_t rc;
     uint8_t *tid = NULL;
     size_t tid_len = 0;
+    /* Reserved registry record; released on any pre-commit failure via
+     * cleanup_all, or stored on the entry at commit. */
+    moq_track_hist_t *hist = NULL;
     size_t scratch_saved = s->event_scratch_len;
+    /* Stream-correlated rejects keep the request bidi drainable so the rejected
+     * subscriber's trailing FIN is absorbed -- but only when the FIN has not
+     * already arrived with the request (then it is consumed in this call and a
+     * drain slot would leak). Mirrors the TRACK_STATUS reject. */
+    bool reject_drain = d->endpoint.has_stream_ref && !request_fin;
 
     if (event_queue_full(s)) {
         result = MOQ_ERR_WOULD_BLOCK;
@@ -250,115 +495,61 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
      * error rides the request bidi for stream-correlated profiles (never the
      * control channel) and the shared control channel otherwise. */
     if (d->auth_reject_code) {
-        if (d->endpoint.has_stream_ref) {
-            /* Encode to a stack buffer first so a temporarily full send buffer
-             * surfaces as WOULD_BLOCK (retryable), not a hard error that would
-             * drop the request and the required REQUEST_ERROR. */
-            uint8_t err_buf[256];
-            moq_buf_writer_t ew;
-            moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-            rc = s->profile->encode_request_error(s, &ew,
-                &(moq_request_error_encode_args_t){
-                    .error_code = d->auth_reject_code });
-            if (rc < 0) { result = rc; goto cleanup_all; }
-            rc = queue_send_bidi(s, d->endpoint.stream_ref, err_buf,
-                                 moq_buf_writer_offset(&ew), true);
-            if (rc < 0) { result = rc; goto cleanup_all; }
-            if (reserved_slot >= 0) sub_free_entry(s, (size_t)reserved_slot);
-            s->profile->commit_inbound_request(s, &d->endpoint);
-            auth_committed = true;
-            process_auth_tokens_commit_txn(s, &d->auth_txn);
-            result = MOQ_OK;
-            goto cleanup_all;
-        }
-        uint8_t err_buf[256];
-        moq_buf_writer_t ew;
-        moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-        rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){
-                .request_id = d->request_id, .error_code = d->auth_reject_code });
-        if (rc < 0) { result = rc; goto cleanup_all; }
-        rc = queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
-        if (rc < 0) { result = rc; goto cleanup_all; }
-        s->profile->commit_inbound_request(s, &d->endpoint);
-        auth_committed = true;
-        process_auth_tokens_commit_txn(s, &d->auth_txn);
-        result = MOQ_OK;
+        result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
+                                     d->auth_reject_code, NULL, 0);
+        if (result == MOQ_OK) auth_committed = true;
         goto cleanup_all;
     }
 
-    tid = build_track_id(s, &d->track_namespace, d->track_name, &tid_len);
-    if (tid_len > 0 && !tid) {
-        result = MOQ_ERR_NOMEM;
-        goto cleanup_all;
-    }
-
-    if (sub_is_duplicate_track(s, tid, tid_len, MOQ_SUB_ROLE_PUBLISHER)) {
-        if (tid) { s->alloc.free(tid, tid_len, s->alloc.ctx); tid = NULL; }
-        if (d->endpoint.has_stream_ref) {
-            /* Stream-correlated profiles deliver the error on the request bidi
-             * and terminate that stream; the reserved slot is freed here and the
-             * peer's request sequence advances (the request was well-formed, it
-             * is the track that is a duplicate). */
-            /* Encode to a stack buffer first so a temporarily full send buffer
-             * surfaces as WOULD_BLOCK (retryable), not a hard error that would
-             * drop the request and the required REQUEST_ERROR. */
-            uint8_t derr_buf[256];
-            moq_buf_writer_t ew;
-            moq_buf_writer_init(&ew, derr_buf, sizeof(derr_buf));
-            rc = s->profile->encode_request_error(s, &ew,
-                &(moq_request_error_encode_args_t){
-                    .error_code = 0x19,
-                    .reason = (const uint8_t *)"duplicate subscription",
-                    .reason_len = 22 });
-            if (rc < 0) { result = rc; goto cleanup_all; }
-            rc = queue_send_bidi(s, d->endpoint.stream_ref, derr_buf,
-                                 moq_buf_writer_offset(&ew), true);
-            if (rc < 0) { result = rc; goto cleanup_all; }
-            if (reserved_slot >= 0) sub_free_entry(s, (size_t)reserved_slot);
-            s->profile->commit_inbound_request(s, &d->endpoint);
-            auth_committed = true;
-            process_auth_tokens_commit_txn(s, &d->auth_txn);
-            result = MOQ_OK;
-            goto cleanup_all;
-        }
-        uint8_t err_buf[256];
-        moq_buf_writer_t ew;
-        moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-        rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){
-                .request_id = d->request_id, .error_code = 0x19,
-                .reason = (const uint8_t *)"duplicate subscription",
-                .reason_len = 22 });
-        if (rc < 0) { result = rc; goto cleanup_all; }
-        rc = queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
-        if (rc < 0) { result = rc; goto cleanup_all; }
-        s->profile->commit_inbound_request(s, &d->endpoint);
-        auth_committed = true;
-        process_auth_tokens_commit_txn(s, &d->auth_txn);
-        result = MOQ_OK;
+    /* Selection is allocation-free: duplicate detection and the history
+     * decision both compare the decoded identity against stored canonical
+     * keys in place. The request's own identity key is built only in
+     * funded execution below, once every selected rejection is behind us. */
+    if (sub_is_duplicate_track_id(s, &d->track_namespace, d->track_name,
+                                  MOQ_SUB_ROLE_PUBLISHER)) {
+        result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
+                                     0x19, "duplicate subscription", 22);
+        if (result == MOQ_OK) auth_committed = true;
         goto cleanup_all;
     }
 
     int slot = reserved_slot >= 0 ? reserved_slot : sub_find_free(s);
     if (slot < 0) {
-        if (tid) { s->alloc.free(tid, tid_len, s->alloc.ctx); tid = NULL; }
-        uint8_t err_buf[256];
-        moq_buf_writer_t ew;
-        moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
-        rc = s->profile->encode_request_error(s, &ew,
-            &(moq_request_error_encode_args_t){
-                .request_id = d->request_id, .error_code = 0x0,
-                .reason = (const uint8_t *)"subscription pool full",
-                .reason_len = 22 });
-        if (rc < 0) { result = rc; goto cleanup_all; }
-        rc = queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
-        if (rc < 0) { result = rc; goto cleanup_all; }
-        s->profile->commit_inbound_request(s, &d->endpoint);
-        auth_committed = true;
-        process_auth_tokens_commit_txn(s, &d->auth_txn);
-        result = MOQ_OK;
+        result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
+                                     0x0, "subscription pool full", 22);
+        if (result == MOQ_OK) auth_committed = true;
         goto cleanup_all;
+    }
+
+    /* Reserve this track's registry record. Select first (allocation-free,
+     * comparing the decoded identity against stored canonical keys), so a
+     * genuinely full registry and an allocation failure stay distinct: a
+     * full registry is NOT a session-fatal parser error and rejects the
+     * well-formed request with REQUEST_ERROR(INTERNAL_ERROR 0x0) via the
+     * shared terminal-reject path -- nothing (no event, entry, or history)
+     * is committed until the error is queued, the bidi stays drainable so
+     * the session survives the trailing FIN, and WOULD_BLOCK leaves the
+     * whole reject replayable -- while a failed record-key copy reports
+     * MOQ_ERR_NOMEM and queues no response at all. */
+    if (moq_track_hist_select(s, &d->track_namespace, d->track_name) ==
+            MOQ_TH_SEL_FULL) {
+        result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
+                                     0x0, "track history full", 18);
+        if (result == MOQ_OK) auth_committed = true;
+        goto cleanup_all;
+    }
+    /* Funded execution: the entry's retained identity key, then the
+     * registry reservation. Both allocation failures are MOQ_ERR_NOMEM
+     * with no response queued. */
+    tid = build_track_id(s, &d->track_namespace, d->track_name, &tid_len);
+    if (tid_len > 0 && !tid) {
+        result = MOQ_ERR_NOMEM;
+        goto cleanup_all;
+    }
+    {
+        moq_result_t hrc = track_hist_reserve_selected(
+            s, &d->track_namespace, d->track_name, &hist);
+        if (hrc < 0) { result = hrc; goto cleanup_all; }
     }
 
     moq_namespace_t ev_ns;
@@ -480,8 +671,19 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     entry->track_alias = 0;
     entry->track_id_buf = tid;
     entry->track_id_len = tid_len;
+    entry->hist = hist;
     entry->delivery_timeout_us = d->delivery_timeout_us;
+    entry->dt_sub_has_object   = d->dt_has_object;
+    entry->dt_sub_object_ms    = d->dt_object_ms;
+    entry->dt_sub_has_subgroup = d->dt_has_subgroup;
+    entry->dt_sub_subgroup_ms  = d->dt_subgroup_ms;
     entry->filter_type = d->has_filter ? d->filter_type : 0;
+    /* Capture the raw SUBSCRIBE filter window so moq_session_accept_subscribe can
+     * resolve it against the accept snapshot; only meaningful for the
+     * ABSOLUTE_* filters, harmless zeros otherwise. */
+    entry->req_start_group = d->start_group;
+    entry->req_start_object = d->start_object;
+    entry->req_end_group = d->end_group;
     entry->forward = d->forward;
     d->endpoint.kind = MOQ_REQ_SUBSCRIPTION;
     d->endpoint.slot = slot;
@@ -501,6 +703,9 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
 cleanup_all:
     process_auth_tokens_free_staging(s, d->tokens, d->token_staged,
         d->token_count);
+    /* Release the reserved record on every failure path (it is only stored on
+     * the entry at the committed return above; reaching here means it was not). */
+    if (hist) track_hist_release(s, hist);
     if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
     if (!auth_committed)
         process_auth_tokens_abort_txn(s, &d->auth_txn);
@@ -943,8 +1148,61 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
                 "empty FIN on request stream without request");
         /* Reserve a slot to buffer the inbound request. */
         slot = sub_find_free(s);
-        if (slot < 0)
-            return close_with_error(s, 0x3, "subscription pool full");
+        if (slot < 0) {
+            /* Staging/subscription pool exhausted. Local resource pressure is NOT
+             * peer protocol misbehavior, so the SESSION always survives -- never a
+             * PROTOCOL_VIOLATION close. A drain ref absorbs the peer's trailing
+             * bytes/FIN via the drain-ring check at the top of this handler.
+             * Nothing was staged, so there is nothing to free. */
+            if (!fin && s->drain_ref_count >= s->drain_ref_cap)
+                return MOQ_ERR_WOULD_BLOCK;   /* retry when drain capacity frees */
+            if (defer_dispatch) {
+                /* Pre-setup: no control stream yet, so an application-level
+                 * REQUEST_ERROR cannot be sent. draft-18 §3.3 permits resetting an
+                 * early request bidi that we do not want to (or cannot) buffer, so
+                 * RESET only this stream and keep the session. Needs two action
+                 * slots (STOP_SENDING + RESET_STREAM) plus the drain ref checked
+                 * above -- all no-mutation until reserved, so WOULD_BLOCK retries. */
+                if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+                moq_action_t stop;
+                memset(&stop, 0, sizeof(stop));
+                stop.kind = MOQ_ACTION_STOP_BIDI_STREAM;
+                stop.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+                stop.borrow_epoch = s->borrow_epoch;
+                stop.u.stop_bidi_stream.stream_ref = stream_ref;
+                stop.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED */
+                moq_result_t rrc = push_action(s, &stop);
+                if (rrc < 0) return rrc;
+                moq_action_t reset;
+                memset(&reset, 0, sizeof(reset));
+                reset.kind = MOQ_ACTION_RESET_BIDI_STREAM;
+                reset.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
+                reset.borrow_epoch = s->borrow_epoch;
+                reset.u.reset_bidi_stream.stream_ref = stream_ref;
+                reset.u.reset_bidi_stream.error_code = 0x1;
+                rrc = push_action(s, &reset);
+                if (rrc < 0) return rrc;
+                if (!fin) (void)drain_ref_add(s, stream_ref);
+                return MOQ_OK;
+            }
+            /* Post-setup: graceful stream-correlated rejection -- REQUEST_ERROR
+             * (INTERNAL_ERROR) + FIN on the request bidi. */
+            uint8_t perr[64];
+            moq_buf_writer_t pw;
+            moq_buf_writer_init(&pw, perr, sizeof(perr));
+            moq_result_t erc = s->profile->encode_request_error(s, &pw,
+                &(moq_request_error_encode_args_t){
+                    .error_code = 0x0,
+                    .reason = (const uint8_t *)"request pool full",
+                    .reason_len = 17 });
+            if (erc < 0) return erc;
+            erc = queue_send_bidi(s, stream_ref, perr,
+                                  moq_buf_writer_offset(&pw), true);
+            if (erc < 0) return erc;
+            /* Absorb the peer's trailing FIN unless it already arrived here. */
+            if (!fin) (void)drain_ref_add(s, stream_ref);
+            return MOQ_OK;
+        }
         moq_sub_entry_t *re = &s->subs[slot];
         re->generation |= 1;
         re->state = MOQ_SUB_RECVING_REQUEST;
@@ -998,6 +1256,20 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
                 return close_with_error(s, 0x3,
                     "extra bytes after terminal response on request stream");
             if (e->req_recv_fin) sub_free_entry(s, (size_t)slot);
+            return MOQ_OK;
+        }
+
+        /* A terminal done was consumed but deferred for Stream-Count gating:
+         * the entry stays ESTABLISHED so late data streams still bind, while
+         * the request bidi drains. Only empty input / a FIN is acceptable --
+         * the FIN was recorded on append and is absorbed at finalize (freeing
+         * the entry then, or via TERMINATED above if it arrives later). Extra
+         * bytes after the terminal are a protocol error. Mirrors the
+         * done_pending branch in handle_publish_stream_bytes. */
+        if (e->done_pending) {
+            if (e->req_recv_len > 0)
+                return close_with_error(s, 0x3,
+                    "extra bytes after terminal response on request stream");
             return MOQ_OK;
         }
 
@@ -1202,19 +1474,38 @@ moq_result_t request_stream_teardown(moq_session_t *s,
 
     if (ep.kind == MOQ_REQ_FETCH) {
         moq_fetch_entry_t *fe = &s->fetches[ep.slot];
-        bool need_reset = fe->data_stream_started && !fe->data_stream_fin;
-        /* Reserve everything before mutating: the data-reset MUST be queued, so
+        bool need_data_abort = fe->data_stream_started && !fe->data_stream_fin;
+        /* The abort direction follows stream ownership, not the request.
+         *
+         * A fetch data stream is unidirectional and always flows publisher ->
+         * fetcher, so only the publisher holds a sending half on it. The
+         * fetcher, which merely receives, must abort with STOP_DATA; issuing
+         * RESET_DATA there asks the transport to reset a direction this
+         * endpoint does not own, which the transport rejects and the bridge
+         * escalates to a connection fatal. This mirrors
+         * fetch_request_bidi_cancel(), which already stops the incoming
+         * response stream for the fetcher role. */
+        bool fetcher = (fe->role == MOQ_FETCH_ROLE_FETCHER);
+        /* Reserve everything before mutating: the data abort MUST be queued, so
          * a full action queue defers the whole teardown for a later retry. */
         if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-        if (need_reset && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-        if (need_reset) {
+        if (need_data_abort && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        if (need_data_abort) {
             moq_action_t a;
             memset(&a, 0, sizeof(a));
-            a.kind = MOQ_ACTION_RESET_DATA;
-            a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
-            a.borrow_epoch = s->borrow_epoch;
-            a.u.reset_data.stream_ref = fe->data_stream_ref;
-            a.u.reset_data.error_code = 0x1;   /* CANCELLED */
+            if (fetcher) {
+                a.kind = MOQ_ACTION_STOP_DATA;
+                a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
+                a.borrow_epoch = s->borrow_epoch;
+                a.u.stop_data.stream_ref = fe->data_stream_ref;
+                a.u.stop_data.error_code = 0x1;   /* CANCELLED */
+            } else {
+                a.kind = MOQ_ACTION_RESET_DATA;
+                a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+                a.borrow_epoch = s->borrow_epoch;
+                a.u.reset_data.stream_ref = fe->data_stream_ref;
+                a.u.reset_data.error_code = 0x1;   /* CANCELLED */
+            }
             (void)push_action(s, &a);
         }
         moq_event_t e;
@@ -1224,6 +1515,12 @@ moq_result_t request_stream_teardown(moq_session_t *s,
         e.borrow_epoch = s->borrow_epoch;
         e.u.fetch_cancelled.fetch = fe->handle;
         (void)push_event(s, &e);
+        /* A fetcher's data uni may not have presented its FETCH_HEADER yet.
+         * Tombstone the request id so late data is absorbed and stopped instead
+         * of resolving against a freed request -- the same protection
+         * fetch_request_bidi_cancel() applies on its cancel path. */
+        if (fetcher)
+            fetch_cancel_tomb_add(s, fe->request_id);
         fetch_free_entry(s, ep.slot);
         return MOQ_OK;
     }
@@ -1509,6 +1806,16 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
         pub_track_alias_in_use(s, d->track_alias))
         return close_with_error(s, 0x5, "duplicate track alias");
 
+    /* §9.8 inbound extraction, scanned ONCE before any success/error event
+     * or entry transition (a malformed timeout must close with 0x3 and can
+     * be neither masked by scratch exhaustion nor downgraded to the
+     * unsupported-property reject below). The extracted values are retained
+     * here and committed only after push_event succeeds. */
+    moq_dt_scan_t insc;
+    if (session_scan_dt_props(s, d->track_properties,
+                              d->track_properties_len, false, &insc) < 0)
+        return close_with_error(s, 0x3, "malformed track properties");
+
     /* §2.5.1: an unknown Mandatory Track Property in SUBSCRIBE_OK -> the
      * subscriber MUST cancel the subscription. Surface a terminal
      * SUBSCRIBE_ERROR(UNSUPPORTED_EXTENSION) and tear down the request bidi via
@@ -1582,12 +1889,19 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
         return rc;
     }
 
-    /* Commit. */
+    /* Commit (incl. the §9.8 timeout values scanned above). */
+    s->subs[slot].dt_pub_has_object   = insc.has_object;
+    s->subs[slot].dt_pub_object_ms    = insc.object_ms;
+    s->subs[slot].dt_pub_has_subgroup = insc.has_subgroup;
+    s->subs[slot].dt_pub_subgroup_ms  = insc.subgroup_ms;
     s->subs[slot].state = MOQ_SUB_ESTABLISHED;
     s->subs[slot].track_alias = d->track_alias;
     s->subs[slot].has_largest = d->has_largest;
     s->subs[slot].largest_group = d->has_largest ? d->largest_group : 0;
     s->subs[slot].largest_object = d->has_largest ? d->largest_object : 0;
+    /* Merge the peer-advertised Largest Object into the registry. Monotonic; idempotent under retransmission. */
+    if (d->has_largest && s->subs[slot].hist)
+        track_hist_merge(s->subs[slot].hist, d->largest_group, d->largest_object);
     /* Gates outbound new-group requests on this subscription's updates. */
     s->subs[slot].dynamic_groups = d->dynamic_groups;
     /* Index this established subscriber-role alias BEFORE replaying deferred
@@ -1627,7 +1941,9 @@ moq_result_t session_core_on_subscribe_error(moq_session_t *s,
         rc = session_core_emit_request_redirect(s, MOQ_REQUEST_FAMILY_SUBSCRIBE,
             s->subs[d->target_slot].handle._opaque, redirect, d->error_code,
             d->can_retry, d->retry_after_ms, d->reason, d->reason_len);
-        if (rc < 0) return rc;
+        /* The emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     } else {
         moq_bytes_t reason = {0};
         if (d->reason_len > 0) {
@@ -1757,11 +2073,58 @@ static moq_result_t queue_subscribe_response(moq_session_t *s, size_t slot,
 /* A REQUEST_OK arrived for our pending subscription update (stream-correlated
  * profiles correlate it by the request bidi). Clear the pending state; an OK for
  * an entry with no pending update is a protocol violation. */
-moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot)
+moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
+    bool has_largest, uint64_t largest_group, uint64_t largest_object,
+    bool has_expires, uint64_t expires_ms)
 {
     moq_sub_entry_t *e = &s->subs[slot];
     if (e->state != MOQ_SUB_ESTABLISHED || !e->update_pending)
         return close_with_error(s, 0x3, "REQUEST_OK without a pending update");
+    /* Emit MOQ_EVENT_SUBSCRIPTION_UPDATE_OK exactly once. A full event queue is
+     * a retryable WOULD_BLOCK checked BEFORE clearing update_pending, so the
+     * acknowledgment is never dropped and never double-emitted (a duplicate
+     * REQUEST_OK after the flag clears is a protocol violation above). */
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_SUBSCRIPTION_UPDATE_OK;
+    ev.detail_size = (uint32_t)sizeof(moq_subscription_update_ok_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.subscription_update_ok.sub = e->handle;
+    ev.u.subscription_update_ok.has_largest = has_largest;
+    ev.u.subscription_update_ok.largest_group = has_largest ? largest_group : 0;
+    ev.u.subscription_update_ok.largest_object = has_largest ? largest_object : 0;
+    ev.u.subscription_update_ok.has_expires = has_expires;
+    ev.u.subscription_update_ok.expires_ms = has_expires ? expires_ms : 0;
+    moq_result_t rc = push_event(s, &ev);
+    if (rc < 0) return rc;   /* retryable; update_pending still set */
+    /* Merge the peer-advertised Largest into the registry. */
+    if (has_largest && e->hist)
+        track_hist_merge(e->hist, largest_group, largest_object);
+    /* Latch the acknowledged Forward state: object delivery on this
+     * subscription gates on it from the NEXT object admission on. */
+    if (e->update_has_forward)
+        e->forward = e->update_forward;
+    e->update_has_forward = false;
+    /* latch the acknowledged filter type (Joining-FETCH gates on it). */
+    if (e->update_has_filter)
+        e->filter_type = e->update_filter_type;
+    e->update_has_filter = false;
+    /* §9.8: latch acknowledged timeout carriers and recompute the retained
+     * legacy projection from the COMPLETE current pair. */
+    if (e->dt_upd_has_object) {
+        e->dt_sub_has_object = true;
+        e->dt_sub_object_ms = e->dt_upd_object_ms;
+    }
+    if (e->dt_upd_has_subgroup) {
+        e->dt_sub_has_subgroup = true;
+        e->dt_sub_subgroup_ms = e->dt_upd_subgroup_ms;
+    }
+    if (e->dt_upd_has_object || e->dt_upd_has_subgroup)
+        e->delivery_timeout_us = ms_to_us_sat(dt_negotiate_ms(
+            e->dt_sub_has_object, e->dt_sub_object_ms,
+            e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms));
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
     e->update_pending = false;
     e->update_request_id = 0;
     return MOQ_OK;
@@ -1779,6 +2142,9 @@ moq_result_t session_core_on_subscribe_update_error(moq_session_t *s, int slot)
         return close_with_error(s, 0x3, "REQUEST_ERROR without a pending update");
     e->update_pending = false;
     e->update_request_id = 0;
+    e->update_has_forward = false;   /* never acknowledged */
+    e->update_has_filter = false;    /* pending filter dies unacked */
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
     /* The subscription must now be terminated by PUBLISH_DONE(UPDATE_FAILED);
      * block further updates and require that terminal message. */
     e->update_failed = true;
@@ -1989,6 +2355,12 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
     if (event_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
     if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
 
+    /* One registry snapshot: it feeds BOTH the REQUEST_OK Largest
+     * Object and the stored resolved window. No app mediation on this path. */
+    bool     usnap_has = e->hist && e->hist->has_largest;
+    uint64_t usnap_g = usnap_has ? e->hist->largest_group : 0;
+    uint64_t usnap_o = usnap_has ? e->hist->largest_object : 0;
+
     /* Copy resolved auth tokens into scratch for borrow-epoch-safe delivery. */
     moq_resolved_token_t *ev_tokens = NULL;
     rc = session_stage_tokens_for_event(s, d->tokens, d->token_staged,
@@ -2005,7 +2377,14 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
         uint8_t ok_buf[64];
         moq_buf_writer_t ow;
         moq_buf_writer_init(&ow, ok_buf, sizeof(ok_buf));
-        rc = s->profile->encode_request_ok(s, &ow, d->request_id);
+        moq_request_update_ok_encode_args_t oka = {
+            .request_id = d->request_id,
+            .has_largest = usnap_has,
+            .largest_group = usnap_g,
+            .largest_object = usnap_o,
+            .has_expires = false,   /* no EXPIRES source on this path  */
+        };
+        rc = s->profile->encode_request_update_ok(s, &ow, &oka);
         if (rc < 0) { result = rc; goto cleanup_all; }
         size_t ok_len = moq_buf_writer_offset(&ow);
         if (moq_session_uses_request_streams(s))
@@ -2033,6 +2412,11 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
     ev.u.subscribe_updated.token_count = d->token_count;
     ev.u.subscribe_updated.has_new_group_request = d->has_new_group_request;
     ev.u.subscribe_updated.new_group_request = d->new_group_request;
+    ev.u.subscribe_updated.has_filter = d->has_filter;
+    ev.u.subscribe_updated.filter = d->filter_type;
+    ev.u.subscribe_updated.start_group = d->start_group;
+    ev.u.subscribe_updated.start_object = d->start_object;
+    ev.u.subscribe_updated.end_group = d->end_group;
 
     rc = push_event(s, &ev);
     if (rc < 0) { result = rc; goto cleanup_all; }
@@ -2040,8 +2424,33 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
     /* Commit. */
     if (d->has_forward)
         e->forward = d->forward;
+    if (d->dt_has_object) {
+        e->dt_sub_has_object = true;
+        e->dt_sub_object_ms = d->dt_object_ms;
+    }
+    if (d->dt_has_subgroup) {
+        e->dt_sub_has_subgroup = true;
+        e->dt_sub_subgroup_ms = d->dt_subgroup_ms;
+    }
     if (d->has_delivery_timeout)
-        e->delivery_timeout_us = d->delivery_timeout_us;
+        /* Retained legacy projection: recomputed from the COMPLETE current
+         * pair AFTER applying this message's carriers (the event above
+         * projected only the carriers present in the message). */
+        e->delivery_timeout_us = ms_to_us_sat(dt_negotiate_ms(
+            e->dt_sub_has_object, e->dt_sub_object_ms,
+            e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms));
+    if (d->has_filter) {
+        e->filter_type = d->filter_type;
+        /* Re-resolve + store the window against the SAME snapshot that fed the
+         * REQUEST_OK Largest Object. */
+        e->req_start_group = d->start_group;
+        e->req_start_object = d->start_object;
+        e->req_end_group = d->end_group;
+        moq_resolve_filter_window(d->filter_type,
+                                  d->start_group, d->start_object, d->end_group,
+                                  usnap_has, usnap_g, usnap_o,
+                                  s->profile->location_varint_max, &e->window);
+    }
     s->profile->commit_inbound_request(s, &d->endpoint);
     auth_committed = true;
     process_auth_tokens_commit_txn(s, &d->auth_txn);
@@ -2156,6 +2565,17 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         return MOQ_ERR_INVAL;
     }
 
+    /* Reserve this track's registry record: received objects on this
+     * subscription max-merge their largest into it. A full registry fails the
+     * local subscribe with NOMEM before anything is sent (the record is released
+     * on every pre-commit failure path below and in sub_free_entry). */
+    moq_track_hist_t *hist = track_hist_reserve(s, tid, tid_len);
+    if (!hist) {
+        if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
+        s->profile->abort_request(s, &req_ep);
+        return MOQ_ERR_NOMEM;
+    }
+
     /* Stream-correlated profiles open a dedicated bidi stream per request;
      * others send the request on the shared control channel. */
     bool req_stream = moq_session_uses_request_streams(s);
@@ -2163,6 +2583,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
 
     /* Encode directly into send_buf via profile op. */
     if (action_queue_full(s)) {
+        track_hist_release(s, hist);
         if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return MOQ_ERR_WOULD_BLOCK;
@@ -2196,6 +2617,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
 
         moq_result_t rc2 = s->profile->encode_subscribe(s, &w, &args);
         if (rc2 < 0) {
+            track_hist_release(s, hist);
             if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
             s->profile->abort_request(s, &req_ep);
             return rc2;
@@ -2222,6 +2644,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         }
         moq_result_t arc = push_action(s, &act);
         if (arc < 0) {
+            track_hist_release(s, hist);
             if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
             s->profile->abort_request(s, &req_ep);
             return arc;
@@ -2244,6 +2667,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     entry->has_largest = false;
     entry->largest_group = 0;
     entry->largest_object = 0;
+    entry->hist = hist;
     entry->filter_type = cfg->filter;
     /* Commit the effective Forward State (default true) so the data-plane
      * reordering buffer only holds early data for a forwarding subscription. */
@@ -2311,6 +2735,15 @@ moq_result_t moq_session_accept_subscribe(
     if (!s || !cfg) return MOQ_ERR_INVAL;
     if (cfg->struct_size < sizeof(moq_accept_subscribe_cfg_t))
         return MOQ_ERR_INVAL;
+    /* §9.8 local property scanner: pure, and hoisted ABOVE
+     * session_begin_advance so malformed local properties reject before ANY
+     * session mutation (no clock/borrow-epoch advance, no reap). */
+    if (cfg->track_properties.len > 0 && !cfg->track_properties.data)
+        return MOQ_ERR_INVAL;
+    moq_dt_scan_t dtscan;
+    if (session_scan_dt_props(s, cfg->track_properties.data,
+                              cfg->track_properties.len, true, &dtscan) < 0)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -2320,16 +2753,36 @@ moq_result_t moq_session_accept_subscribe(
     if (s->subs[slot].state != MOQ_SUB_PENDING_PUBLISHER)
         return MOQ_ERR_WRONG_STATE;
 
-    /* Validate all inputs before any state mutation. */
+    /* Validate all inputs before any state mutation. Bound Location fields
+     * against the PROFILE's ceiling (design §4): draft-16 QUIC varint, draft-18
+     * vi64 (full uint64). EXPIRES is a QUIC/vi64 duration -- keep its existing
+     * QUIC-varint bound (it is not a Location). */
+    uint64_t loc_max = s->profile->location_varint_max;
     if (cfg->has_largest) {
-        if (cfg->largest_group > MOQ_QUIC_VARINT_MAX ||
-            cfg->largest_object > MOQ_QUIC_VARINT_MAX)
+        if (cfg->largest_group > loc_max || cfg->largest_object > loc_max)
             return MOQ_ERR_INVAL;
     }
     if (cfg->has_expires && cfg->expires_ms > MOQ_QUIC_VARINT_MAX)
         return MOQ_ERR_INVAL;
     if (cfg->track_properties.len > 0 && !cfg->track_properties.data)
         return MOQ_ERR_INVAL;
+
+    /* Single resolution snapshot: the max of the
+     * app-supplied accept value and this track's registry record. That ONE value
+     * feeds the outbound SUBSCRIBE_OK Largest Object, resolves the relative
+     * filter into the stored window, resolves buffered Joining FETCHes, and is
+     * merged back into the registry -- so all four agree (§5.1.2). */
+    moq_track_hist_t *shist = s->subs[slot].hist;
+    bool     snap_has = cfg->has_largest;
+    uint64_t snap_g   = cfg->has_largest ? cfg->largest_group : 0;
+    uint64_t snap_o   = cfg->has_largest ? cfg->largest_object : 0;
+    if (shist && shist->has_largest &&
+        (!snap_has || shist->largest_group > snap_g ||
+         (shist->largest_group == snap_g && shist->largest_object > snap_o))) {
+        snap_has = true;
+        snap_g   = shist->largest_group;
+        snap_o   = shist->largest_object;
+    }
 
     /* Compute alias locally without mutating profile state. */
     uint64_t alias;
@@ -2365,9 +2818,9 @@ moq_result_t moq_session_accept_subscribe(
     moq_subscribe_ok_encode_args_t args = {
         .request_id = s->subs[slot].request_id,
         .track_alias = alias,
-        .has_largest = cfg->has_largest,
-        .largest_group = cfg->largest_group,
-        .largest_object = cfg->largest_object,
+        .has_largest = snap_has,
+        .largest_group = snap_g,
+        .largest_object = snap_o,
         .has_expires = cfg->has_expires,
         .expires_ms = cfg->expires_ms,
         .track_properties = cfg->track_properties.data,
@@ -2384,7 +2837,7 @@ moq_result_t moq_session_accept_subscribe(
      * by the accept outcome (cfg largest). Nothing is mutated yet, so a shortfall
      * leaves the accept fully retryable (BUFFER if it can never fit). */
     moq_result_t pjrc = session_core_pending_joins_can_resolve(s, s->subs[slot].request_id,
-            cfg->has_largest, cfg->largest_group, 1 /* OK action */,
+            snap_has, snap_g, 1 /* OK action */,
             0 /* OK takes no drain */, ok_len);
     if (pjrc < 0) return pjrc;
 
@@ -2395,10 +2848,25 @@ moq_result_t moq_session_accept_subscribe(
 
     /* Commit: all outputs reserved. */
     s->subs[slot].state = MOQ_SUB_ESTABLISHED;
+    s->subs[slot].dt_pub_has_object   = dtscan.has_object;
+    s->subs[slot].dt_pub_object_ms    = dtscan.object_ms;
+    s->subs[slot].dt_pub_has_subgroup = dtscan.has_subgroup;
+    s->subs[slot].dt_pub_subgroup_ms  = dtscan.subgroup_ms;
     s->subs[slot].track_alias = alias;
-    s->subs[slot].has_largest = cfg->has_largest;
-    s->subs[slot].largest_group = cfg->has_largest ? cfg->largest_group : 0;
-    s->subs[slot].largest_object = cfg->has_largest ? cfg->largest_object : 0;
+    s->subs[slot].has_largest = snap_has;
+    s->subs[slot].largest_group = snap_has ? snap_g : 0;
+    s->subs[slot].largest_object = snap_has ? snap_o : 0;
+    /* Merge the snapshot back into the registry (an app seed never lowers an
+     * observed value; the merge is monotonic) and resolve + store the window
+     * against the SAME snapshot. The facade installs this window via
+     * moq_session_sub_resolved_window. */
+    if (snap_has && shist) track_hist_merge(shist, snap_g, snap_o);
+    moq_resolve_filter_window(s->subs[slot].filter_type,
+                              s->subs[slot].req_start_group,
+                              s->subs[slot].req_start_object,
+                              s->subs[slot].req_end_group,
+                              snap_has, snap_g, snap_o, loc_max,
+                              &s->subs[slot].window);
     /* Latch whether OUR track properties advertised dynamic groups: inbound
      * new-group requests on this subscription's updates are gated on it (the
      * peer MUST NOT send one otherwise, §10.2.13). */
@@ -2544,26 +3012,17 @@ moq_result_t moq_session_request_goaway_subscribe(
 static moq_result_t subscribe_request_bidi_cancel(moq_session_t *s, int slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
     if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = e->request_stream_ref;
-    moq_action_t stop;
-    memset(&stop, 0, sizeof(stop));
-    stop.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    stop.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
-    stop.borrow_epoch = s->borrow_epoch;
-    stop.u.stop_bidi_stream.stream_ref = ref;
-    stop.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED */
-    moq_result_t src = push_action(s, &stop);
-    if (src < 0) return src;
-    moq_action_t reset;
-    memset(&reset, 0, sizeof(reset));
-    reset.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    reset.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    reset.borrow_epoch = s->borrow_epoch;
-    reset.u.reset_bidi_stream.stream_ref = ref;
-    reset.u.reset_bidi_stream.error_code = 0x1;
-    src = push_action(s, &reset);
+    moq_action_t abort_a;
+    memset(&abort_a, 0, sizeof(abort_a));
+    abort_a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    abort_a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+    abort_a.borrow_epoch = s->borrow_epoch;
+    abort_a.u.abort_bidi_stream.stream_ref = ref;
+    abort_a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
+    moq_result_t src = push_action(s, &abort_a);
     if (src < 0) return src;
     (void)drain_ref_add(s, ref);   /* slot reserved above */
     sub_free_entry(s, (size_t)slot);
@@ -2586,6 +3045,11 @@ moq_result_t moq_session_unsubscribe(moq_session_t *s,
         return MOQ_ERR_WRONG_STATE;
     if (e->state != MOQ_SUB_PENDING_SUBSCRIBER &&
         e->state != MOQ_SUB_ESTABLISHED)
+        return MOQ_ERR_WRONG_STATE;
+    /* The publisher already terminated (deferred done): the subscription is
+     * logically Terminated and no control may follow -- the pending
+     * SUBSCRIBE_DONE surfaces once the advertised streams are processed. */
+    if (e->done_pending)
         return MOQ_ERR_WRONG_STATE;
 
     /* Stream-correlated profiles have no UNSUBSCRIBE message: cancel by tearing
@@ -2624,15 +3088,109 @@ moq_result_t moq_session_unsubscribe(moq_session_t *s,
 
 /* -- Inbound PUBLISH_DONE for subscriber-role subscription --------- */
 
+/* §9.8: negotiated terminal-wait floor for this entry -- the larger of the
+ * per-type negotiated timeouts (d18 §10.11 "larger of the two"; d16's
+ * single value occupies both types), saturating ms->us. */
+static uint64_t sub_dt_floor_us(const moq_sub_entry_t *e)
+{
+    uint64_t o = dt_negotiate_ms(e->dt_pub_has_object, e->dt_pub_object_ms,
+                                 e->dt_sub_has_object, e->dt_sub_object_ms);
+    uint64_t g = dt_negotiate_ms(e->dt_pub_has_subgroup,
+                                 e->dt_pub_subgroup_ms,
+                                 e->dt_sub_has_subgroup,
+                                 e->dt_sub_subgroup_ms);
+    return ms_to_us_sat(o > g ? o : g);
+}
+
+/* Atomically retire a crossed REQUEST_UPDATE at terminal commit: draft-16
+ * keeps ONE tombstone (reserved by the caller) for the publisher's mandatory
+ * single response and drops the by-id registry key, so a duplicate response
+ * is then an unknown request (violation) instead of resolving through the
+ * still-live entry; draft-18 just clears the pending state. */
+static void sub_retire_crossed_update(moq_session_t *s, moq_sub_entry_t *e,
+                                      bool need_tomb)
+{
+    if (!e->update_pending) return;
+    if (need_tomb) unsub_tomb_add(s, e->update_request_id);
+    request_registry_remove_by_id(s, e->update_request_id);
+    e->update_pending = false;
+    e->update_request_id = 0;
+    e->update_has_forward = false;   /* never acknowledged */
+    e->update_has_filter = false;    /* pending filter dies unacked */
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
+}
+
 moq_result_t session_core_on_subscribe_done(moq_session_t *s,
                                              int slot,
                                              const moq_decoded_publish_done_t *d,
                                              bool free_now)
 {
-    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_sub_entry_t *e = &s->subs[slot];
     /* On the terminal PUBLISH_DONE the subscriber closes its send half so the
      * publisher can retire the request bidi; reserve that action up front. */
-    bool close_half = !free_now && s->subs[slot].request_stream_ref._v != 0;
+    bool close_half = !free_now && e->request_stream_ref._v != 0;
+    /* An in-flight REQUEST_UPDATE crossed the terminal. Draft-16 answers it
+     * exactly once by request id on the control channel, so reserve ONE
+     * tombstone for that mandatory ack (otherwise it would look like a
+     * response to an unknown request and close the session); draft-18
+     * correlates updates by request stream and never consumes id tombstones,
+     * so it must not spend one. The update itself is retired atomically at
+     * terminal commit (sub_retire_crossed_update). */
+    bool need_tomb = e->update_pending &&
+                     !moq_session_uses_request_streams(s);
+    if (need_tomb && s->unsub_tomb_count + 1 > s->unsub_tomb_cap)
+        return close_with_error(s, 0x3,
+            "subscribe done tombstone budget exceeded");
+
+    /* Stream-Count gating (draft-16 §9.15 / draft-18 §10.11), mirroring
+     * session_core_on_publish_done: the terminal done is likely to precede
+     * late-arriving / late-opening data streams. Keep the subscription
+     * ESTABLISHED (alias bound, so those streams still bind and deliver)
+     * until the advertised number of data streams have been processed; only
+     * then surface SUBSCRIBE_DONE. A Stream Count of 0 finalizes
+     * immediately; the 2^62-1 "unknown" sentinel DEFERS and is bounded by
+     * the terminal deadline below (§9.8: the timeout is the drafts'
+     * recovery for "unable to be exact"). The local send half still closes
+     * now, exactly once, so the peer can retire the bidi while the gate
+     * holds. */
+    if (e->role == MOQ_SUB_ROLE_SUBSCRIBER &&
+        d->stream_count != 0 &&
+        (d->stream_count == MOQ_QUIC_VARINT_MAX ||
+         e->processed_stream_count < d->stream_count)) {
+        if (close_half && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        uint8_t *rbuf = NULL;
+        if (d->reason_len > 0) {
+            rbuf = (uint8_t *)s->alloc.alloc(d->reason_len, s->alloc.ctx);
+            if (!rbuf) return MOQ_ERR_NOMEM;
+            memcpy(rbuf, d->reason, d->reason_len);
+        }
+        sub_retire_crossed_update(s, e, need_tomb);
+        if (e->done_reason_buf)   /* unreachable: duplicates rejected upstream */
+            s->alloc.free(e->done_reason_buf, e->done_reason_len, s->alloc.ctx);
+        e->done_reason_buf = rbuf;
+        e->done_reason_len = d->reason_len;
+        e->done_status_code = d->status_code;
+        e->done_stream_count = d->stream_count;
+        e->done_pending = true;
+        /* §9.8: stamp the terminal deadline ONCE (never restamped; later
+         * acked timeout updates affect future deferrals only). The wait is
+         * the configured/default bound floored by the negotiated delivery
+         * timeouts; the 2^62-1 sentinel defers like any finite count and
+         * is finalized by this deadline (the drafts' recovery for "unable
+         * to be exact"). */
+        {
+            uint64_t wait_us = s->done_wait_timeout_us;
+            uint64_t floor_us = sub_dt_floor_us(e);
+            if (floor_us > wait_us) wait_us = floor_us;
+            e->done_deadline_us = deadline_add(s->last_now_us, wait_us);
+            e->done_expired = false;
+        }
+        if (close_half)
+            (void)queue_close_bidi(s, e->request_stream_ref);
+        return MOQ_OK;
+    }
+
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (close_half && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
     size_t scratch_saved = s->event_scratch_len;
@@ -2665,6 +3223,7 @@ moq_result_t session_core_on_subscribe_done(moq_session_t *s,
         return rc;
     }
 
+    sub_retire_crossed_update(s, &s->subs[slot], need_tomb);
     if (free_now) {
         sub_free_entry(s, (size_t)slot);
     } else {
@@ -2771,11 +3330,46 @@ moq_result_t moq_session_done_subscribe(
 
 /* -- REQUEST_UPDATE (outbound) ------------------------------------- */
 
+/* Frozen original prefix: struct_size .. delivery_timeout_us (the layout
+ * before the auth-token append; it matches the read path's minimum,
+ * offsetof(auth_tokens)). The pointer-only initializer touches only this
+ * prefix -- writing sizeof(current) would overflow a caller that allocated
+ * the original-sized struct -- and every appended field (auth tokens,
+ * new-group request, filter) stays disabled unless _init_sized opts in. */
+#define MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE \
+    ((offsetof(moq_subscription_update_cfg_t, delivery_timeout_us) + \
+      sizeof(((moq_subscription_update_cfg_t *)0)->delivery_timeout_us) + \
+      (_Alignof(moq_subscription_update_cfg_t) - 1)) & \
+     ~(size_t)(_Alignof(moq_subscription_update_cfg_t) - 1))
+/* The floor is derived INDEPENDENTLY (aligned end of the original last
+ * field) so it cannot follow layout drift; equality-pin the first appended
+ * field against it. Same discipline for the v0 boundary: aligned end of
+ * new_group_request, equality-pinned by has_filter. */
+_Static_assert(offsetof(moq_subscription_update_cfg_t, auth_tokens) ==
+               MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE,
+               "auth_tokens must sit exactly at the frozen v0 floor");
+_Static_assert(offsetof(moq_subscription_update_cfg_t, has_filter) ==
+               ((offsetof(moq_subscription_update_cfg_t, new_group_request) +
+                 sizeof(((moq_subscription_update_cfg_t *)0)->new_group_request) +
+                 (_Alignof(moq_subscription_update_cfg_t) - 1)) &
+                ~(size_t)(_Alignof(moq_subscription_update_cfg_t) - 1)),
+               "the filter block must sit exactly at the v0 sizeof");
+
 void moq_subscription_update_cfg_init(moq_subscription_update_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_subscription_update_cfg_t);
+    memset(cfg, 0, MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE;
+}
+
+void moq_subscription_update_cfg_init_sized(
+    moq_subscription_update_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_update_subscription(
@@ -2806,16 +3400,54 @@ moq_result_t moq_session_update_subscription(
         has_new_group_request = true;
         new_group_request = cfg->new_group_request;
     }
+    /* Filter block: whole-BLOCK gate on its LAST field, so a caller
+     * whose struct ends mid-block can never produce a torn filter. */
+    bool has_filter = false;
+    uint32_t filter = 0;
+    uint64_t f_sg = 0, f_so = 0, f_eg = 0;
+    if (UPD_CFG_HAS(end_group) && cfg->has_filter) {
+        has_filter = true;
+        filter = (uint32_t)cfg->filter;
+        f_sg = cfg->start_group;
+        f_so = cfg->start_object;
+        f_eg = cfg->end_group;
+    }
 #undef UPD_CFG_HAS
 #undef UPD_CFG_MIN
     if (!cfg->has_subscriber_priority && !cfg->has_forward &&
         !cfg->has_delivery_timeout && auth_token_count == 0 &&
-        !has_new_group_request)
+        !has_new_group_request && !has_filter)
         return MOQ_ERR_INVAL;
     if (cfg->has_delivery_timeout && cfg->delivery_timeout_us < 1000)
         return MOQ_ERR_INVAL;
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
         return MOQ_ERR_INVAL;
+    /* Filter validation, BEFORE any mutation, matching moq_session_subscribe:
+     * the enum member must be a real filter form; ABSOLUTE_RANGE requires
+     * end_group >= start_group; locations on the relative forms are IGNORED
+     * (the wire carries none for them). */
+    if (has_filter) {
+        if (filter != MOQ_SUBSCRIBE_FILTER_NEXT_GROUP &&
+            filter != MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT &&
+            filter != MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START &&
+            filter != MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE)
+            return MOQ_ERR_INVAL;
+        if (filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE && f_eg < f_sg)
+            return MOQ_ERR_INVAL;
+        /* The APPLICABLE absolute locations must be encodable under this
+         * profile's ceiling (draft-16 QUIC varints, draft-18 vi64) --
+         * prechecked HERE so an over-ceiling value is INVAL with zero
+         * mutation, never a post-advance encoder failure. */
+        if (filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START ||
+            filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE) {
+            uint64_t loc_max = s->profile->location_varint_max;
+            if (f_sg > loc_max || f_so > loc_max)
+                return MOQ_ERR_INVAL;
+            if (filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE &&
+                f_eg > loc_max)
+                return MOQ_ERR_INVAL;
+        }
+    }
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -2827,6 +3459,11 @@ moq_result_t moq_session_update_subscription(
     if (e->role != MOQ_SUB_ROLE_SUBSCRIBER)
         return MOQ_ERR_WRONG_STATE;
     if (e->state != MOQ_SUB_ESTABLISHED)
+        return MOQ_ERR_WRONG_STATE;
+    /* A deferred terminal (done_pending) is logically Terminated: the entry
+     * stays ESTABLISHED only so late data streams still bind. No control may
+     * be sent for the request after its terminal was accepted. */
+    if (e->done_pending)
         return MOQ_ERR_WRONG_STATE;
     if (e->goaway_sent) return MOQ_ERR_WRONG_STATE;   /* migrated: no REQUEST_UPDATE */
     if (e->update_pending)
@@ -2862,6 +3499,11 @@ moq_result_t moq_session_update_subscription(
         .auth_token_count = auth_token_count,
         .has_new_group_request = has_new_group_request,
         .new_group_request = new_group_request,
+        .has_filter = has_filter,
+        .filter = filter,
+        .filter_start_group = f_sg,
+        .filter_start_object = f_so,
+        .filter_end_group = f_eg,
     };
 
     moq_buf_writer_t w;
@@ -2905,6 +3547,20 @@ moq_result_t moq_session_update_subscription(
 
     e->update_pending = true;
     e->update_request_id = req_ep.request_id;
+    /* A Forward change takes effect at the ACK (the CURRENT acknowledged
+     * Forward state gates object delivery); remember it until then. */
+    e->update_has_forward = cfg->has_forward;
+    e->update_forward = cfg->has_forward ? cfg->forward : false;
+    /* §9.8: a timeout change pends until the ACK. The generic cfg field is
+     * emitted as BOTH d18 parameters (and d16's single one), so it pends
+     * into both types, in the wire's milliseconds. */
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = cfg->has_delivery_timeout;
+    e->dt_upd_object_ms = e->dt_upd_subgroup_ms =
+        cfg->has_delivery_timeout ? cfg->delivery_timeout_us / 1000u : 0;
+    /* the acknowledged filter TYPE latches at the ACK (its requester-
+     * side consumer is the Joining-FETCH eligibility gate); pend it here. */
+    e->update_has_filter = has_filter;
+    e->update_filter_type = has_filter ? filter : 0;
     s->profile->commit_request(s, &req_ep);
     return MOQ_OK;
 }

@@ -101,8 +101,10 @@ static test_cert gen_cert_wrong_dns()
 
 /* -- Noop pump ------------------------------------------------------- */
 
-static int pump_noop(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_noop(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 0;
 }
@@ -196,7 +198,7 @@ static void test_dns_identity_mismatch()
     cfg.port = port;
     cfg.insecure_skip_verify = false;
     cfg.cert_path = tmppath;
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
     cfg.max_num_ptos = 2;

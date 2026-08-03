@@ -26,6 +26,21 @@ static uint8_t *rcbuf_data_ptr(moq_rcbuf_t *buf)
     return (uint8_t *)buf + sizeof(moq_rcbuf_t);
 }
 
+moq_result_t moq_rcbuf_allocation_size(size_t payload_len, size_t *out)
+{
+    if (!out) return MOQ_ERR_INVAL;
+    *out = 0;
+    /* Additive by construction: header + payload in one allocation. The
+     * public contract pins allocation_size(n) == allocation_size(0) + n;
+     * alloc_uninit below sizes through THIS function, so create/clone can
+     * never drift from what capacity models were told. */
+    size_t total = sizeof(moq_rcbuf_t) + payload_len;
+    if (total < payload_len)
+        return MOQ_ERR_INVAL;
+    *out = total;
+    return MOQ_OK;
+}
+
 moq_result_t moq_rcbuf_alloc_uninit(const moq_alloc_t *alloc, size_t len,
                                     moq_rcbuf_t **out, uint8_t **data_out)
 {
@@ -36,10 +51,10 @@ moq_result_t moq_rcbuf_alloc_uninit(const moq_alloc_t *alloc, size_t len,
     if (!alloc || !alloc->alloc || !alloc->free)
         return MOQ_ERR_INVAL;
 
-    /* Guard against size_t overflow. */
-    size_t total = sizeof(moq_rcbuf_t) + len;
-    if (total < len)
-        return MOQ_ERR_INVAL;
+    size_t total = 0;
+    moq_result_t src = moq_rcbuf_allocation_size(len, &total);
+    if (src != MOQ_OK)
+        return src;
 
     moq_rcbuf_t *buf = (moq_rcbuf_t *)alloc->alloc(total, alloc->ctx);
     if (!buf)

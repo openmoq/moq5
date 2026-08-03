@@ -1358,7 +1358,10 @@ int main(void)
 
         moq_accept_subscribe_cfg_t acc;
         moq_accept_subscribe_cfg_init(&acc);
-        const uint8_t ext[] = {0x01, 0x02, 0x03};
+        /* A VALID unknown odd-type extension (type 1, len 1): opaque
+         * pass-through survives the §9.8 local property scanner, which
+         * rejects malformed local blobs with MOQ_ERR_INVAL. */
+        const uint8_t ext[] = {0x01, 0x01, 0xAA};
         acc.track_properties.data = ext;
         acc.track_properties.len = 3;
         moq_session_accept_subscribe(sv, ev.u.subscribe_request.sub, &acc, 0);
@@ -2577,7 +2580,7 @@ int main(void)
         moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
         moq_namespace_t ns = { ns_parts, 1 };
 
-        /* Round 1: subscribe (request_id 0), pending unsub. */
+        /* subscribe (request_id 0), pending unsub. */
         moq_subscribe_cfg_t sub_cfg;
         moq_subscribe_cfg_init(&sub_cfg);
         sub_cfg.track_namespace = ns;
@@ -2589,7 +2592,7 @@ int main(void)
         MOQ_TEST_CHECK(moq_session_unsubscribe(c, csub1, 0) == MOQ_OK);
 
         /* Tombstone full (1/1). Second pending unsub would WOULD_BLOCK.
-         * Drain tombstone by delivering late response for round 1. */
+         * Drain tombstone by delivering late response for . */
         { moq_event_t evts[8]; size_t ne;
           while ((ne = moq_session_poll_events(sv, evts, 8)) > 0)
               for (size_t j = 0; j < ne; j++) {
@@ -2615,7 +2618,7 @@ int main(void)
               for (size_t j = 0; j < na; j++) moq_action_cleanup(&acts[j]);
         }
 
-        /* Round 2: tombstone consumed, slot free. */
+        /* tombstone consumed, slot free. */
         sub_cfg.track_name = MOQ_BYTES_LITERAL("t2");
         moq_subscription_t csub2;
         MOQ_TEST_CHECK(moq_session_subscribe(c, &sub_cfg, 0, &csub2) == MOQ_OK);
@@ -2639,7 +2642,7 @@ int main(void)
         /* Deliver late SUBSCRIBE_OK for request_id 2. */
         pump_actions_to_peer(sv, c, 0);
 
-        /* Client must stay open — tombstone for round 2 is present. */
+        /* Client must stay open — tombstone for is present. */
         MOQ_TEST_CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
 
         /* Deliver UNSUBSCRIBEs to server. */
@@ -2942,7 +2945,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- REQUEST_UPDATE: unsupported param → REQUEST_ERROR ------------- */
+    /* -- REQUEST_UPDATE: SUBSCRIPTION_FILTER applies (§9.2.2.5) --------- */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -2971,12 +2974,20 @@ int main(void)
         pump_actions_to_peer(sv, c, 0);
         if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
 
-        /* Send REQUEST_UPDATE with SUBSCRIPTION_FILTER (unsupported v1). */
+        /* Send REQUEST_UPDATE narrowing the subscription to an
+         * AbsoluteRange window (§9.2.2.5: the parameter MAY appear in
+         * REQUEST_UPDATE for a subscription). */
         uint8_t ubuf[128];
         moq_buf_writer_t uw;
         moq_buf_writer_init(&uw, ubuf, sizeof(ubuf));
-        uint8_t filter_buf[8];
-        size_t filter_len = moq_quic_varint_encode(1, filter_buf, sizeof(filter_buf));
+        uint8_t filter_buf[32];
+        size_t filter_len = 0;
+        moq_d16_subscription_filter_t filt = {
+            .filter_type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE,
+            .start_group = 5, .start_object = 3, .end_group = 9,
+        };
+        MOQ_TEST_CHECK(moq_d16_encode_subscription_filter(filter_buf,
+            sizeof(filter_buf), &filter_len, &filt) == MOQ_OK);
         moq_kvp_entry_t upd_params[] = {
             { .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
               .value = filter_buf, .value_len = filter_len, .is_varint = false },
@@ -2986,35 +2997,114 @@ int main(void)
         moq_result_t upd_rc = moq_session_on_control_bytes(sv, ubuf,
             moq_buf_writer_offset(&uw), 0);
         MOQ_TEST_CHECK(upd_rc == MOQ_OK);
-
-        /* Session stays open — REQUEST_ERROR sent, no session close. */
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
 
-        /* No SUBSCRIBE_UPDATED event. */
-        MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 0);
+        /* SUBSCRIBE_UPDATED surfaces the new window. */
+        MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED);
+        MOQ_TEST_CHECK(ev.u.subscribe_updated.has_filter);
+        MOQ_TEST_CHECK(ev.u.subscribe_updated.filter ==
+            MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.start_group, 5);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.start_object, 3);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.end_group, 9);
+        moq_event_cleanup(&ev);
 
-        /* Decode outbound: REQUEST_ERROR with NOT_SUPPORTED. */
-        bool found_err = false;
+        /* The subscription entry tracks the updated filter type. */
+        {
+            int slot = sub_resolve_handle(sv, ssub);
+            MOQ_TEST_CHECK(slot >= 0);
+            MOQ_TEST_CHECK(sv->subs[slot].filter_type ==
+                MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+        }
+
+        /* Acknowledged with REQUEST_OK; no REQUEST_ERROR, no PUBLISH_DONE. */
+        bool found_ok = false, found_err = false, found_done = false;
         { moq_action_t acts[4]; size_t na;
           while ((na = moq_session_poll_actions(sv, acts, 4)) > 0)
               for (size_t i = 0; i < na; i++) {
                   if (acts[i].kind == MOQ_ACTION_SEND_CONTROL) {
                       uint64_t mt = decode_action_msg_type(&acts[i]);
-                      if (mt == MOQ_D16_REQUEST_ERROR) {
-                          moq_d16_request_error_t rerr;
-                          if (decode_action_request_error(&acts[i], &rerr) == MOQ_OK) {
-                              MOQ_TEST_CHECK(rerr.error_code ==
-                                  MOQ_REQUEST_ERROR_NOT_SUPPORTED);
-                              MOQ_TEST_CHECK(rerr.request_id == 2);
-                          }
-                          found_err = true;
-                      }
+                      if (mt == MOQ_D16_REQUEST_OK) found_ok = true;
+                      if (mt == MOQ_D16_REQUEST_ERROR) found_err = true;
+                      if (mt == MOQ_D16_PUBLISH_DONE) found_done = true;
                   }
                   moq_action_cleanup(&acts[i]);
               }
         }
-        MOQ_TEST_CHECK(found_err);
+        MOQ_TEST_CHECK(found_ok);
+        MOQ_TEST_CHECK(!found_err);
+        MOQ_TEST_CHECK(!found_done);
 
+        /* The subscription survives the update. */
+        MOQ_TEST_CHECK(sub_resolve_handle(sv, ssub) >= 0);
+
+        { moq_action_t acts[4]; size_t na;
+          while ((na = moq_session_poll_actions(c, acts, 4)) > 0)
+              for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+        }
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* -- REQUEST_UPDATE: malformed SUBSCRIPTION_FILTER closes session --- */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+        moq_event_t ev;
+        if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
+        if (moq_session_poll_events(sv, &ev, 1) == 1) moq_event_cleanup(&ev);
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_namespace_t ns = { ns_parts, 1 };
+        moq_subscribe_cfg_t sub_cfg;
+        moq_subscribe_cfg_init(&sub_cfg);
+        sub_cfg.track_namespace = ns;
+        sub_cfg.track_name = MOQ_BYTES_LITERAL("t");
+        sub_cfg.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        moq_subscription_t csub;
+        moq_session_subscribe(c, &sub_cfg, 0, &csub);
+        pump_actions_to_peer(c, sv, 0);
+        moq_session_poll_events(sv, &ev, 1);
+        moq_subscription_t ssub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+        moq_accept_subscribe_cfg_t acc;
+        moq_accept_subscribe_cfg_init(&acc);
+        moq_session_accept_subscribe(sv, ssub, &acc, 0);
+        pump_actions_to_peer(sv, c, 0);
+        if (moq_session_poll_events(c, &ev, 1) == 1) moq_event_cleanup(&ev);
+
+        /* Filter value is a bare AbsoluteRange type with no locations —
+         * a length mismatch, PROTOCOL_VIOLATION per §9.2.2.5. */
+        uint8_t ubuf[128];
+        moq_buf_writer_t uw;
+        moq_buf_writer_init(&uw, ubuf, sizeof(ubuf));
+        uint8_t filter_buf[8];
+        size_t filter_len = moq_quic_varint_encode(
+            MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, filter_buf,
+            sizeof(filter_buf));
+        moq_kvp_entry_t upd_params[] = {
+            { .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
+              .value = filter_buf, .value_len = filter_len,
+              .is_varint = false },
+        };
+        MOQ_TEST_CHECK(moq_d16_encode_request_update(&uw, 2, 0,
+            upd_params, 1) == MOQ_OK);
+        moq_session_on_control_bytes(sv, ubuf, moq_buf_writer_offset(&uw), 0);
+
+        /* Should close — malformed param value. */
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+
+        { moq_event_t evts[4]; size_t ne;
+          while ((ne = moq_session_poll_events(sv, evts, 4)) > 0)
+              for (size_t i = 0; i < ne; i++) moq_event_cleanup(&evts[i]);
+          moq_action_t acts[4]; size_t na;
+          while ((na = moq_session_poll_actions(sv, acts, 4)) > 0)
+              for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+        }
         { moq_action_t acts[4]; size_t na;
           while ((na = moq_session_poll_actions(c, acts, 4)) > 0)
               for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
@@ -3532,7 +3622,7 @@ int main(void)
     /* Failed subscription REQUEST_UPDATE → ERROR + PUBLISH_DONE     */
     /* ============================================================== */
 
-    /* == Unsupported sub update produces ERROR + PUBLISH_DONE ======== */
+    /* == Rejected sub update produces ERROR + PUBLISH_DONE =========== */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -3559,18 +3649,22 @@ int main(void)
         pump_actions_to_peer(sv, c, 2000);
         moq_session_poll_events(c, &ev, 1);
 
-        /* Send unsupported REQUEST_UPDATE (SUBSCRIPTION_FILTER). */
+        /* Send a failing REQUEST_UPDATE: an unknown USE_ALIAS auth token
+         * rejects the update at the message level (0x17). */
         uint8_t wire[128];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, wire, sizeof(wire));
-        uint8_t filt_buf[16];
-        size_t filt_len = 0;
-        moq_d16_subscription_filter_t filt = { .filter_type = 0x2 };
-        moq_d16_encode_subscription_filter(filt_buf, sizeof(filt_buf),
-            &filt_len, &filt);
+        moq_d16_auth_token_t use_tok = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_ALIAS,
+            .alias = 999,
+        };
+        uint8_t tb[64];
+        moq_buf_writer_t tw;
+        moq_buf_writer_init(&tw, tb, sizeof(tb));
+        MOQ_TEST_CHECK(moq_d16_auth_token_encode(&tw, &use_tok) == MOQ_OK);
         moq_kvp_entry_t params[1] = {{
-            .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
-            .value = filt_buf, .value_len = filt_len,
+            .type = MOQ_MSG_PARAM_AUTHORIZATION_TOKEN,
+            .value = tb, .value_len = moq_buf_writer_offset(&tw),
             .is_varint = false, .raw = NULL, .raw_len = 0,
         }};
         moq_d16_encode_request_update(&w, 2, 0, params, 1);
@@ -3655,16 +3749,20 @@ int main(void)
         { moq_action_t a; while (moq_session_poll_actions(sv, &a, 1) > 0)
               moq_action_cleanup(&a); }
 
-        /* Unsupported REQUEST_UPDATE (SUBSCRIPTION_FILTER) terminates the sub. */
+        /* A rejected REQUEST_UPDATE (unknown USE_ALIAS token, 0x17)
+         * terminates the sub. */
         uint8_t wire[128]; moq_buf_writer_t w;
         moq_buf_writer_init(&w, wire, sizeof(wire));
-        uint8_t filt_buf[16]; size_t filt_len = 0;
-        moq_d16_subscription_filter_t filt = { .filter_type = 0x2 };
-        moq_d16_encode_subscription_filter(filt_buf, sizeof(filt_buf),
-            &filt_len, &filt);
+        moq_d16_auth_token_t use_tok = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_ALIAS,
+            .alias = 999,
+        };
+        uint8_t tb[64]; moq_buf_writer_t tw;
+        moq_buf_writer_init(&tw, tb, sizeof(tb));
+        MOQ_TEST_CHECK(moq_d16_auth_token_encode(&tw, &use_tok) == MOQ_OK);
         moq_kvp_entry_t params[1] = {{
-            .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
-            .value = filt_buf, .value_len = filt_len,
+            .type = MOQ_MSG_PARAM_AUTHORIZATION_TOKEN,
+            .value = tb, .value_len = moq_buf_writer_offset(&tw),
             .is_varint = false, .raw = NULL, .raw_len = 0,
         }};
         moq_d16_encode_request_update(&w, 2, 0, params, 1);
@@ -3751,18 +3849,22 @@ int main(void)
         /* Action queue: 1 of 2 used (SUBSCRIBE_OK). Need 2 for
          * the two-action error response, only 1 slot free → WB. */
 
-        /* Send unsupported REQUEST_UPDATE — needs 2 slots, only 1. */
+        /* Send a rejected REQUEST_UPDATE (unknown USE_ALIAS token) —
+         * needs 2 slots, only 1. */
         uint8_t wire[128];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, wire, sizeof(wire));
-        uint8_t filt_buf[16];
-        size_t filt_len = 0;
-        moq_d16_subscription_filter_t filt = { .filter_type = 0x2 };
-        moq_d16_encode_subscription_filter(filt_buf, sizeof(filt_buf),
-            &filt_len, &filt);
+        moq_d16_auth_token_t use_tok = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_ALIAS,
+            .alias = 999,
+        };
+        uint8_t tb[64];
+        moq_buf_writer_t tw;
+        moq_buf_writer_init(&tw, tb, sizeof(tb));
+        MOQ_TEST_CHECK(moq_d16_auth_token_encode(&tw, &use_tok) == MOQ_OK);
         moq_kvp_entry_t params[1] = {{
-            .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
-            .value = filt_buf, .value_len = filt_len,
+            .type = MOQ_MSG_PARAM_AUTHORIZATION_TOKEN,
+            .value = tb, .value_len = moq_buf_writer_offset(&tw),
             .is_varint = false,
         }};
         moq_d16_encode_request_update(&w, 2, 0, params, 1);
@@ -3825,18 +3927,21 @@ int main(void)
             sv_sub, &asub, 2000) == MOQ_OK);
         /* SUBSCRIBE_OK sits in send_buf (not yet polled). */
 
-        /* Send unsupported REQUEST_UPDATE. */
+        /* Send a rejected REQUEST_UPDATE (unknown USE_ALIAS token). */
         uint8_t wire[128];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, wire, sizeof(wire));
-        uint8_t filt_buf[16];
-        size_t filt_len = 0;
-        moq_d16_subscription_filter_t filt = { .filter_type = 0x2 };
-        moq_d16_encode_subscription_filter(filt_buf, sizeof(filt_buf),
-            &filt_len, &filt);
+        moq_d16_auth_token_t use_tok = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_ALIAS,
+            .alias = 999,
+        };
+        uint8_t tb[64];
+        moq_buf_writer_t tw;
+        moq_buf_writer_init(&tw, tb, sizeof(tb));
+        MOQ_TEST_CHECK(moq_d16_auth_token_encode(&tw, &use_tok) == MOQ_OK);
         moq_kvp_entry_t params[1] = {{
-            .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
-            .value = filt_buf, .value_len = filt_len,
+            .type = MOQ_MSG_PARAM_AUTHORIZATION_TOKEN,
+            .value = tb, .value_len = moq_buf_writer_offset(&tw),
             .is_varint = false,
         }};
         moq_d16_encode_request_update(&w, 2, 0, params, 1);
@@ -4027,7 +4132,7 @@ int main(void)
         /* Priority + token: DELIVERY_TIMEOUT(0x02) absent here, so the
          * wire order is AUTH_TOKEN(0x03) then SUBSCRIBER_PRIORITY(0x20). */
         moq_subscription_update_cfg_t ucfg;
-        moq_subscription_update_cfg_init(&ucfg);
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
         ucfg.has_subscriber_priority = true;
         ucfg.subscriber_priority = 200;
         moq_auth_token_t tok = {
@@ -4125,7 +4230,7 @@ int main(void)
         moq_event_cleanup(&ev);
 
         moq_subscription_update_cfg_t ucfg;
-        moq_subscription_update_cfg_init(&ucfg);
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
         ucfg.has_new_group_request = true;
         ucfg.new_group_request = 21;
         MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
@@ -4173,7 +4278,7 @@ int main(void)
         moq_event_cleanup(&ev);
 
         moq_subscription_update_cfg_t ucfg;
-        moq_subscription_update_cfg_init(&ucfg);
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
         ucfg.has_new_group_request = true;
         ucfg.new_group_request = 5;
         MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
@@ -4456,13 +4561,15 @@ int main(void)
             moq_buf_writer_offset(&ew), 2000), MOQ_OK);
         MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
 
-        /* After error, another update succeeds. */
+        /* a rejected update FAILS the subscription (shared state
+         * machine, both drafts): further updates are refused until the
+         * mandatory PUBLISH_DONE(UPDATE_FAILED) terminal. */
         { moq_action_t da[4]; size_t dn;
           while ((dn = moq_session_poll_actions(c, da, 4)) > 0)
               for (size_t i = 0; i < dn; i++) moq_action_cleanup(&da[i]); }
         ucfg.subscriber_priority = 100;
         MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
-            &ucfg, 3000), MOQ_OK);
+            &ucfg, 3000), MOQ_ERR_WRONG_STATE);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -5061,7 +5168,11 @@ int main(void)
         moq_done_subscribe_cfg_t dcfg;
         moq_done_subscribe_cfg_init(&dcfg);
         dcfg.status_code = 0x4;
-        dcfg.stream_count = 7;
+        /* No data streams were delivered here, so the truthful Stream Count
+         * is 0 -- which surfaces SUBSCRIBE_DONE immediately (a nonzero count
+         * would gate the event on that many processed data streams; see
+         * test_session_stream_count for the gated matrix). */
+        dcfg.stream_count = 0;
         dcfg.reason = MOQ_BYTES_LITERAL("done");
         MOQ_TEST_CHECK_EQ_INT(moq_session_done_subscribe(sv, sv_sub,
             &dcfg, 1000), MOQ_OK);
@@ -5070,7 +5181,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_DONE);
         MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.status_code, 0x4);
-        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 7);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 0);
         MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_done.reason.len, 4);
         MOQ_TEST_CHECK(memcmp(ev.u.subscribe_done.reason.data, "done", 4) == 0);
         moq_event_cleanup(&ev);
@@ -6197,6 +6308,483 @@ int main(void)
         moq_accept_subscribe_cfg_t acc; moq_accept_subscribe_cfg_init(&acc);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(c, c_sub, &acc,
             1500), (int)MOQ_OK);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+
+    /* ================== subscription-filter updates ================= */
+
+    /* == Filter update: wire content, server window event, ack, latch ==== */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_subscribe_cfg_t scfg;
+        moq_subscribe_cfg_init(&scfg);
+        scfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+        scfg.track_name = MOQ_BYTES_LITERAL("t");
+        scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        moq_subscription_t sub;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_subscribe(c, &scfg, 0, &sub), MOQ_OK);
+        pump_actions_to_peer(c, sv, 0);
+        moq_event_t ev;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        moq_accept_subscribe_cfg_t acc;
+        moq_accept_subscribe_cfg_init(&acc);
+        MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(sv,
+            ev.u.subscribe_request.sub, &acc, 0), MOQ_OK);
+        pump_actions_to_peer(sv, c, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_OK);
+        moq_event_cleanup(&ev);
+        int slot = test_sub_resolve_handle(c, sub);
+        MOQ_TEST_CHECK(slot >= 0);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[slot].filter_type,
+                              MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT);
+
+        /* Send an ABSOLUTE_RANGE filter update through the sized cfg. */
+        moq_subscription_update_cfg_t ucfg;
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.has_filter = true;
+        ucfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        ucfg.start_group = 2; ucfg.start_object = 1; ucfg.end_group = 7;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+            &ucfg, 1000), MOQ_OK);
+        /* The filter TYPE pends until the ack: still LARGEST here. */
+        MOQ_TEST_CHECK_EQ_U64(c->subs[slot].filter_type,
+                              MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT);
+
+        moq_action_t acts[4];
+        size_t na = moq_session_poll_actions(c, acts, 4);
+        MOQ_TEST_CHECK_EQ_SIZE(na, 1);
+        {
+            moq_control_envelope_t env;
+            moq_buf_reader_t r;
+            moq_buf_reader_init(&r, acts[0].u.send_control.data,
+                acts[0].u.send_control.len);
+            MOQ_TEST_CHECK_EQ_INT(moq_control_decode_envelope(&r, &env),
+                                  MOQ_OK);
+            moq_kvp_entry_t params[4];
+            moq_d16_request_update_t upd = {
+                .params = params, .params_cap = 4 };
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_request_update(
+                env.payload, env.payload_len, &upd), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(upd.params_count, 1);
+            MOQ_TEST_CHECK_EQ_U64(upd.params[0].type,
+                MOQ_MSG_PARAM_SUBSCRIPTION_FILTER);
+            moq_d16_subscription_filter_t f;
+            memset(&f, 0, sizeof(f));
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_subscription_filter(
+                upd.params[0].value, upd.params[0].value_len, &f), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(f.filter_type,
+                MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+            MOQ_TEST_CHECK_EQ_U64(f.start_group, 2);
+            MOQ_TEST_CHECK_EQ_U64(f.start_object, 1);
+            MOQ_TEST_CHECK_EQ_U64(f.end_group, 7);
+        }
+        moq_session_on_control_bytes(sv, acts[0].u.send_control.data,
+            acts[0].u.send_control.len, 1000);
+        for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+
+        /* Server surfaces the filter on SUBSCRIBE_UPDATED. */
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED);
+        MOQ_TEST_CHECK(ev.u.subscribe_updated.has_filter);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.filter,
+            MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.start_group, 2);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.end_group, 7);
+        moq_event_cleanup(&ev);
+
+        /* The auto-ack latches the filter type on the requester. */
+        pump_actions_to_peer(sv, c, 1000);
+        {
+            int n_ok = 0;
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_SUBSCRIPTION_UPDATE_OK) n_ok++;
+                moq_event_cleanup(&ev);
+            }
+            MOQ_TEST_CHECK_EQ_INT(n_ok, 1);
+        }
+        MOQ_TEST_CHECK_EQ_U64(c->subs[slot].filter_type,
+                              MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+        MOQ_TEST_CHECK(!c->subs[slot].update_has_filter);
+
+        /* Behavioral latch consumer: a Joining FETCH now refuses (it
+         * requires a LARGEST_OBJECT filter). */
+        {
+            moq_fetch_cfg_t fcfg; moq_fetch_cfg_init(&fcfg);
+            fcfg.is_joining = true; fcfg.joining_relative = true;
+            fcfg.joining_start = 0; fcfg.joining_sub = sub;
+            moq_fetch_t fh;
+            MOQ_TEST_CHECK(moq_session_fetch(c, &fcfg, 2000, &fh) != MOQ_OK);
+        }
+
+        /* Relative form: locations set on LARGEST_OBJECT are IGNORED and
+         * the wire carries none. */
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.has_filter = true;
+        ucfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        ucfg.start_group = 99; ucfg.start_object = 98; ucfg.end_group = 97;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+            &ucfg, 3000), MOQ_OK);
+        na = moq_session_poll_actions(c, acts, 4);
+        MOQ_TEST_CHECK_EQ_SIZE(na, 1);
+        {
+            moq_control_envelope_t env;
+            moq_buf_reader_t r;
+            moq_buf_reader_init(&r, acts[0].u.send_control.data,
+                acts[0].u.send_control.len);
+            MOQ_TEST_CHECK_EQ_INT(moq_control_decode_envelope(&r, &env),
+                                  MOQ_OK);
+            moq_kvp_entry_t params[4];
+            moq_d16_request_update_t upd = {
+                .params = params, .params_cap = 4 };
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_request_update(
+                env.payload, env.payload_len, &upd), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(upd.params_count, 1);
+            moq_d16_subscription_filter_t f;
+            memset(&f, 0, sizeof(f));
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_subscription_filter(
+                upd.params[0].value, upd.params[0].value_len, &f), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(f.filter_type,
+                MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT);
+            MOQ_TEST_CHECK_EQ_U64(f.start_group, 0);   /* wire omits them */
+            MOQ_TEST_CHECK_EQ_U64(f.start_object, 0);
+            MOQ_TEST_CHECK_EQ_U64(f.end_group, 0);
+        }
+        moq_session_on_control_bytes(sv, acts[0].u.send_control.data,
+            acts[0].u.send_control.len, 3000);
+        for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+        { moq_event_t e2;
+          while (moq_session_poll_events(sv, &e2, 1) == 1)
+              moq_event_cleanup(&e2); }
+        pump_actions_to_peer(sv, c, 3000);
+        { moq_event_t e2;
+          while (moq_session_poll_events(c, &e2, 1) == 1)
+              moq_event_cleanup(&e2); }
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == Filter update: INVAL with zero mutation; reject clears pending == */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_subscribe_cfg_t scfg;
+        moq_subscribe_cfg_init(&scfg);
+        scfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+        scfg.track_name = MOQ_BYTES_LITERAL("t");
+        scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        moq_subscription_t sub;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_subscribe(c, &scfg, 0, &sub), MOQ_OK);
+        pump_actions_to_peer(c, sv, 0);
+        moq_event_t ev;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        moq_accept_subscribe_cfg_t acc;
+        moq_accept_subscribe_cfg_init(&acc);
+        MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(sv,
+            ev.u.subscribe_request.sub, &acc, 0), MOQ_OK);
+        pump_actions_to_peer(sv, c, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+        int slot = test_sub_resolve_handle(c, sub);
+        MOQ_TEST_CHECK(slot >= 0);
+
+        /* Over-ceiling ABSOLUTE location (d16 caps locations at the QUIC
+         * varint max): INVAL with ZERO mutation -- borrow epoch unchanged
+         * (session_begin_advance never ran), no pending state, no action;
+         * a valid update then succeeds. */
+        {
+            uint64_t epoch_before = c->borrow_epoch;
+            moq_subscription_update_cfg_t oc2;
+            moq_subscription_update_cfg_init_sized(&oc2, sizeof(oc2));
+            oc2.has_filter = true;
+            oc2.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+            oc2.start_group = MOQ_QUIC_VARINT_MAX + 1;
+            oc2.start_object = 0;
+            MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+                &oc2, 900), MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK_EQ_U64(c->borrow_epoch, epoch_before);
+            MOQ_TEST_CHECK(!c->subs[slot].update_pending);
+            MOQ_TEST_CHECK(!c->subs[slot].update_has_filter);
+            { moq_action_t a2;
+              MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(c, &a2, 1),
+                                     (size_t)0); }
+        }
+
+        /* ABSOLUTE_RANGE end < start and a bogus enum: INVAL before any
+         * mutation -- no action, no pending update, no pending filter. */
+        moq_subscription_update_cfg_t ucfg;
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.has_filter = true;
+        ucfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        ucfg.start_group = 9; ucfg.end_group = 3;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+            &ucfg, 1000), MOQ_ERR_INVAL);
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.has_filter = true;
+        ucfg.filter = (moq_subscribe_filter_t)99;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+            &ucfg, 1000), MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(!c->subs[slot].update_pending);
+        MOQ_TEST_CHECK(!c->subs[slot].update_has_filter);
+        { moq_action_t a;
+          MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(c, &a, 1),
+                                 (size_t)0); }
+
+        /* A valid filter update then succeeds; the peer REJECTS it: the
+         * pending filter dies unacked and the type never latches. */
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.has_filter = true;
+        ucfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        ucfg.start_group = 4; ucfg.start_object = 0;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+            &ucfg, 2000), MOQ_OK);
+        MOQ_TEST_CHECK(c->subs[slot].update_has_filter);
+        uint64_t upd_rid = c->subs[slot].update_request_id;
+        { moq_action_t a;
+          while (moq_session_poll_actions(c, &a, 1) == 1)
+              moq_action_cleanup(&a); }   /* update bytes: dropped (rejected) */
+        {
+            uint8_t buf[64]; moq_buf_writer_t w;
+            moq_buf_writer_init(&w, buf, sizeof(buf));
+            moq_bytes_t reason = MOQ_BYTES_LITERAL("no");
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_encode_request_error(&w, upd_rid,
+                0x0, 0, reason.data, reason.len), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT(moq_session_on_control_bytes(c, buf,
+                moq_buf_writer_offset(&w), 2500), MOQ_OK);
+        }
+        MOQ_TEST_CHECK(!c->subs[slot].update_pending);
+        MOQ_TEST_CHECK(!c->subs[slot].update_has_filter);
+        /* d16 rejection now routes through the SHARED failure state
+         * machine -- update_failed latches, further updates are refused
+         * until the mandatory PUBLISH_DONE(UPDATE_FAILED) terminal. */
+        MOQ_TEST_CHECK(c->subs[slot].update_failed);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[slot].filter_type,
+                              MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT);
+        moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.has_subscriber_priority = true;
+        ucfg.subscriber_priority = 2;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+            &ucfg, 2600), MOQ_ERR_WRONG_STATE);
+        /* The mandatory terminal lands and surfaces the failure status. */
+        {
+            uint8_t db[64]; moq_buf_writer_t dw;
+            moq_buf_writer_init(&dw, db, sizeof(db));
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_encode_publish_done(&dw,
+                c->subs[slot].request_id, 0x8, 0, NULL, 0), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT(moq_session_on_control_bytes(c, db,
+                moq_buf_writer_offset(&dw), 2700), MOQ_OK);
+        }
+        {
+            int done_n = 0; uint64_t done_status = ~0ull; moq_event_t e2;
+            while (moq_session_poll_events(c, &e2, 1) == 1) {
+                if (e2.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+                    done_n++;
+                    done_status = e2.u.subscribe_done.status_code;
+                }
+                moq_event_cleanup(&e2);
+            }
+            MOQ_TEST_CHECK_EQ_INT(done_n, 1);
+            MOQ_TEST_CHECK_EQ_U64(done_status, 0x8);
+        }
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == Session update cfg: the two canaries + torn-filter guard ======== */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_subscribe_cfg_t scfg;
+        moq_subscribe_cfg_init(&scfg);
+        scfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+        scfg.track_name = MOQ_BYTES_LITERAL("t");
+        moq_subscription_t sub;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_subscribe(c, &scfg, 0, &sub), MOQ_OK);
+        pump_actions_to_peer(c, sv, 0);
+        moq_event_t ev;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        moq_accept_subscribe_cfg_t acc;
+        moq_accept_subscribe_cfg_init(&acc);
+        MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(sv,
+            ev.u.subscribe_request.sub, &acc, 0), MOQ_OK);
+        pump_actions_to_peer(sv, c, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+
+        /* Both boundaries derived INDEPENDENTLY of the appended fields
+         * (aligned ends of the respective last ORIGINAL fields), and
+         * equality-checked against the offsets they pin -- layout drift
+         * fails here instead of false-passing. */
+        const size_t v0 =
+            (offsetof(moq_subscription_update_cfg_t, delivery_timeout_us) +
+             sizeof(uint64_t) +
+             (_Alignof(moq_subscription_update_cfg_t) - 1)) &
+            ~(size_t)(_Alignof(moq_subscription_update_cfg_t) - 1);
+        MOQ_TEST_CHECK_EQ_SIZE(v0,
+            offsetof(moq_subscription_update_cfg_t, auth_tokens));
+
+        /* (a) EXACT-24-byte allocation through the POINTER initializer: the
+         * pre-freeze init memset sizeof(current) and overflowed this heap
+         * block (ASan lane discriminator); the frozen init stays inside. */
+        {
+            /* Raw-byte writes via memcpy-at-offsetof: gcc-15's array-bounds
+             * analysis (rightly) refuses struct-member access through an
+             * undersized allocation. */
+            uint8_t *raw = (uint8_t *)malloc(v0);
+            MOQ_TEST_CHECK(raw != NULL);
+            moq_subscription_update_cfg_init(
+                (moq_subscription_update_cfg_t *)(void *)raw);
+            const bool bt = true; const uint8_t prio = 77;
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  has_subscriber_priority), &bt, sizeof(bt));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  subscriber_priority), &prio, sizeof(prio));
+            MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+                (const moq_subscription_update_cfg_t *)(const void *)raw,
+                1000), MOQ_OK);
+            free(raw);
+        }
+        /* Ack the update so the next one may be sent. */
+        { moq_action_t a;
+          while (moq_session_poll_actions(c, &a, 1) == 1) {
+              moq_session_on_control_bytes(sv, a.u.send_control.data,
+                  a.u.send_control.len, 1000);
+              moq_action_cleanup(&a);
+          } }
+        { moq_event_t e2;
+          while (moq_session_poll_events(sv, &e2, 1) == 1)
+              moq_event_cleanup(&e2); }
+        pump_actions_to_peer(sv, c, 1000);
+        { moq_event_t e2;
+          while (moq_session_poll_events(c, &e2, 1) == 1)
+              moq_event_cleanup(&e2); }
+
+        /* (b) EXACT-56-byte old full-size caller, bytes 24..55 POISONED:
+         * the frozen pointer init leaves the tails untouched (struct_size
+         * 24 gates them off) and the wire carries only the prefix param. */
+        {
+            const size_t old_full =
+                (offsetof(moq_subscription_update_cfg_t,
+                          new_group_request) + sizeof(uint64_t) +
+                 (_Alignof(moq_subscription_update_cfg_t) - 1)) &
+                ~(size_t)(_Alignof(moq_subscription_update_cfg_t) - 1);
+            MOQ_TEST_CHECK_EQ_SIZE(old_full,
+                offsetof(moq_subscription_update_cfg_t, has_filter));
+            uint8_t *raw = (uint8_t *)malloc(old_full);
+            MOQ_TEST_CHECK(raw != NULL);
+            /* POISON FIRST, then run the initializer, then prove it left
+             * every tail byte untouched -- poisoning after the init could
+             * never prove preservation. */
+            memset(raw, 0xAA, old_full);
+            moq_subscription_update_cfg_init(
+                (moq_subscription_update_cfg_t *)(void *)raw);
+            for (size_t pi = v0; pi < old_full; pi++)
+                if (raw[pi] != 0xAA) { MOQ_TEST_CHECK(raw[pi] == 0xAA); break; }
+            const bool bt2 = true, bf2 = false;
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  has_forward), &bt2, sizeof(bt2));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  forward), &bf2, sizeof(bf2));
+            MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+                (const moq_subscription_update_cfg_t *)(const void *)raw,
+                2000), MOQ_OK);
+            free(raw);
+            moq_action_t a;
+            MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(c, &a, 1), 1);
+            moq_control_envelope_t env;
+            moq_buf_reader_t r;
+            moq_buf_reader_init(&r, a.u.send_control.data,
+                                a.u.send_control.len);
+            MOQ_TEST_CHECK_EQ_INT(moq_control_decode_envelope(&r, &env),
+                                  MOQ_OK);
+            moq_kvp_entry_t params[4];
+            moq_d16_request_update_t upd = {
+                .params = params, .params_cap = 4 };
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_request_update(
+                env.payload, env.payload_len, &upd), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(upd.params_count, 1);   /* FORWARD only */
+            MOQ_TEST_CHECK_EQ_U64(upd.params[0].type, MOQ_MSG_PARAM_FORWARD);
+            moq_session_on_control_bytes(sv, a.u.send_control.data,
+                a.u.send_control.len, 2000);
+            moq_action_cleanup(&a);
+            { moq_event_t e2;
+              while (moq_session_poll_events(sv, &e2, 1) == 1)
+                  moq_event_cleanup(&e2); }
+            pump_actions_to_peer(sv, c, 2000);
+            { moq_event_t e2;
+              while (moq_session_poll_events(c, &e2, 1) == 1)
+                  moq_event_cleanup(&e2); }
+        }
+
+        /* (c) TORN-filter guard: a struct cut mid-block (covers
+         * has_filter..start_object but NOT end_group) with has_filter
+         * poisoned true -> the whole block is IGNORED; prefix applies. */
+        {
+            const size_t torn =
+                offsetof(moq_subscription_update_cfg_t, end_group);
+            uint8_t *raw = (uint8_t *)malloc(torn);
+            MOQ_TEST_CHECK(raw != NULL);
+            memset(raw, 0xAA, torn);
+            moq_subscription_update_cfg_init_sized(
+                (moq_subscription_update_cfg_t *)(void *)raw, torn);
+            const bool bt3 = true; const uint8_t prio3 = 5;
+            const uint32_t frange = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+            const uint64_t sg3 = 1, so3 = 0;
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  has_subscriber_priority), &bt3, sizeof(bt3));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  subscriber_priority), &prio3, sizeof(prio3));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  has_filter), &bt3, sizeof(bt3));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  filter), &frange, sizeof(frange));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  start_group), &sg3, sizeof(sg3));
+            memcpy(raw + offsetof(moq_subscription_update_cfg_t,
+                                  start_object), &so3, sizeof(so3));
+            MOQ_TEST_CHECK_EQ_INT(moq_session_update_subscription(c, sub,
+                (const moq_subscription_update_cfg_t *)(const void *)raw,
+                3000), MOQ_OK);
+            free(raw);
+            moq_action_t a;
+            MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(c, &a, 1), 1);
+            moq_control_envelope_t env;
+            moq_buf_reader_t r;
+            moq_buf_reader_init(&r, a.u.send_control.data,
+                                a.u.send_control.len);
+            MOQ_TEST_CHECK_EQ_INT(moq_control_decode_envelope(&r, &env),
+                                  MOQ_OK);
+            moq_kvp_entry_t params[4];
+            moq_d16_request_update_t upd = {
+                .params = params, .params_cap = 4 };
+            MOQ_TEST_CHECK_EQ_INT(moq_d16_decode_request_update(
+                env.payload, env.payload_len, &upd), MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(upd.params_count, 1);
+            MOQ_TEST_CHECK_EQ_U64(upd.params[0].type,
+                MOQ_MSG_PARAM_SUBSCRIBER_PRIORITY);
+            moq_action_cleanup(&a);
+        }
 
         moq_session_destroy(c);
         moq_session_destroy(sv);

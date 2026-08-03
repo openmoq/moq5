@@ -158,6 +158,9 @@ func cBackend(_ backend: MoQEndpoint.TransportBackend)
     case .picoquic: MOQ_TRANSPORT_BACKEND_PICOQUIC
     case .mvfst: MOQ_TRANSPORT_BACKEND_MVFST
     case .proxygen: MOQ_TRANSPORT_BACKEND_PROXYGEN
+    case .msquic: MOQ_TRANSPORT_BACKEND_MSQUIC
+    case .wtquicNetwork: MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK
+    case .wtquicMsquic: MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC
     }
 }
 
@@ -166,7 +169,7 @@ func cBackend(_ backend: MoQEndpoint.TransportBackend)
 /// `EndpointBackend` over an owned `moq_endpoint_t`. All C endpoint APIs
 /// used here are any-thread safe (the service tier's contract); the engine
 /// additionally confines the blocking/teardown calls to its service thread
-/// and guarantees nothing runs after `destroy()` (S2 retirement).
+/// and guarantees nothing runs after `destroy()` (retirement).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 final class ServiceEndpointBackend: EndpointBackend, @unchecked Sendable {
 

@@ -332,6 +332,120 @@ int main(void)
         moq_session_destroy(s);
     }
 
+    /* == Outbound filter update rides the request bidi ========== */
+    {
+        moq_session_t *s = make_established_ev(MOQ_PERSPECTIVE_CLIENT, 0, 0);
+        MOQ_TEST_CHECK(s != NULL);
+        moq_subscription_t h;
+        moq_stream_ref_t ref = establish_subscriber(s, "video", &h);
+
+        moq_subscription_update_cfg_t cfg;
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
+        cfg.has_filter = true;
+        cfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        cfg.start_group = 3; cfg.start_object = 2; cfg.end_group = 9;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_update_subscription(s, h, &cfg, 1), (int)MOQ_OK);
+        MOQ_TEST_CHECK(s->subs[0].update_pending);
+        MOQ_TEST_CHECK(s->subs[0].update_has_filter);
+        MOQ_TEST_CHECK_EQ_U64(s->subs[0].update_filter_type,
+                              MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+
+        moq_action_t act;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(s, &act, 1), 1);
+        moq_d18_request_update_t u;
+        MOQ_TEST_CHECK(update_from_action(&act, ref, &u));
+        MOQ_TEST_CHECK(u.params.has_filter);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_type,
+                              MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_start_group, 3);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_start_object, 2);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_end_group, 9);
+        moq_action_cleanup(&act);
+
+        /* d18's vi64 ceiling ACCEPTS locations above the QUIC-varint max
+         * (the same value draft-16 must reject with zero mutation). */
+        {
+            moq_subscription_update_cfg_t wide;
+            moq_subscription_update_cfg_init_sized(&wide, sizeof(wide));
+            wide.has_filter = true;
+            wide.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+            wide.start_group = MOQ_QUIC_VARINT_MAX + 1;
+            wide.start_object = 0;
+            /* An update is already pending from above: WRONG_STATE, not
+             * INVAL -- the ceiling precheck passed. Prove acceptance for
+             * real on a fresh session below. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_update_subscription(s, h, &wide, 2),
+                (int)MOQ_ERR_WRONG_STATE);
+        }
+        /* One update outstanding: a second is refused while pending. */
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
+        cfg.has_filter = true;
+        cfg.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        cfg.start_group = 77; cfg.end_group = 5;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_update_subscription(s, h, &cfg, 2),
+            (int)MOQ_ERR_WRONG_STATE);
+
+        /* Ack the pending update on the bidi, then REALLY send the
+         * relative-filter update and decode it: junk locations are
+         * IGNORED and stay off the wire. */
+        {
+            uint8_t ok[32]; moq_buf_writer_t w;
+            moq_buf_writer_init(&w, ok, sizeof(ok));
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_request_ok(&w), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+                s, ref, ok, moq_buf_writer_offset(&w), false, 3),
+                (int)MOQ_OK);
+        }
+        { moq_event_t e2;
+          while (moq_session_poll_events(s, &e2, 1) == 1)
+              moq_event_cleanup(&e2); }
+        MOQ_TEST_CHECK(!s->subs[0].update_pending);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_update_subscription(s, h, &cfg, 4), (int)MOQ_OK);
+        {
+            moq_action_t act2;
+            MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(s, &act2, 1), 1);
+            moq_d18_request_update_t u2;
+            MOQ_TEST_CHECK(update_from_action(&act2, ref, &u2));
+            MOQ_TEST_CHECK(u2.params.has_filter);
+            MOQ_TEST_CHECK_EQ_U64(u2.params.filter_type,
+                                  MOQ_SUBSCRIBE_FILTER_NEXT_GROUP);
+            MOQ_TEST_CHECK_EQ_U64(u2.params.filter_start_group, 0);
+            MOQ_TEST_CHECK_EQ_U64(u2.params.filter_start_object, 0);
+            MOQ_TEST_CHECK_EQ_U64(u2.params.filter_end_group, 0);
+            moq_action_cleanup(&act2);
+        }
+        moq_session_destroy(s);
+    }
+
+    /* == Outbound d18 accepts above-QUIC-varint locations ======= */
+    {
+        moq_session_t *s = make_established_ev(MOQ_PERSPECTIVE_CLIENT, 0, 0);
+        moq_subscription_t h;
+        moq_stream_ref_t ref = establish_subscriber(s, "video", &h);
+        moq_subscription_update_cfg_t wide;
+        moq_subscription_update_cfg_init_sized(&wide, sizeof(wide));
+        wide.has_filter = true;
+        wide.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        wide.start_group = MOQ_QUIC_VARINT_MAX + 1;   /* > 2^62-1: vi64 ok */
+        wide.start_object = 1;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_update_subscription(s, h, &wide, 1), (int)MOQ_OK);
+        moq_action_t act;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(s, &act, 1), 1);
+        moq_d18_request_update_t u;
+        MOQ_TEST_CHECK(update_from_action(&act, ref, &u));
+        MOQ_TEST_CHECK(u.params.has_filter);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_start_group,
+                              MOQ_QUIC_VARINT_MAX + 1);
+        moq_action_cleanup(&act);
+        moq_session_destroy(s);
+    }
+
     /* == Outbound: forward-only update ================================ */
     {
         moq_session_t *s = make_established_ev(MOQ_PERSPECTIVE_CLIENT, 0, 0);
@@ -426,7 +540,7 @@ int main(void)
         moq_subscription_t h;
         moq_stream_ref_t ref = establish_subscriber(s, "video", &h);
         moq_subscription_update_cfg_t cfg;
-        moq_subscription_update_cfg_init(&cfg);
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
         moq_auth_token_t tok = {
             .token_type = 11,
             .token_value = MOQ_BYTES_LITERAL("fresh"),
@@ -462,7 +576,7 @@ int main(void)
         moq_subscription_t h;
         moq_stream_ref_t ref = establish_subscriber(s, "video", &h);
         moq_subscription_update_cfg_t cfg;
-        moq_subscription_update_cfg_init(&cfg);
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
         cfg.struct_size =
             (uint32_t)offsetof(moq_subscription_update_cfg_t, auth_tokens);
         cfg.has_subscriber_priority = true;
@@ -494,7 +608,7 @@ int main(void)
         moq_subscription_t h;
         moq_stream_ref_t ref = establish_subscriber(s, "video", &h);
         moq_subscription_update_cfg_t cfg;
-        moq_subscription_update_cfg_init(&cfg);
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
         static moq_auth_token_t many[MOQ_D18_MAX_AUTH_TOKENS + 1];
         for (size_t i = 0; i < MOQ_D18_MAX_AUTH_TOKENS + 1; i++) {
             many[i].token_type = i;
@@ -529,7 +643,7 @@ int main(void)
         moq_subscription_t h;
         (void)establish_subscriber(s, "video", &h);   /* no DYNAMIC_GROUPS */
         moq_subscription_update_cfg_t cfg;
-        moq_subscription_update_cfg_init(&cfg);
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
         cfg.has_new_group_request = true;
         cfg.new_group_request = 0;
         MOQ_TEST_CHECK_EQ_INT(
@@ -546,7 +660,7 @@ int main(void)
             (moq_bytes_t){ dyn, 2 }, &h);
         MOQ_TEST_CHECK(s->subs[0].dynamic_groups);
         moq_subscription_update_cfg_t cfg;
-        moq_subscription_update_cfg_init(&cfg);
+        moq_subscription_update_cfg_init_sized(&cfg, sizeof(cfg));
         cfg.has_new_group_request = true;
         cfg.new_group_request = 0;            /* "no group info" is a value */
         MOQ_TEST_CHECK_EQ_INT(
@@ -747,6 +861,69 @@ int main(void)
         moq_session_destroy(s);
     }
 
+    /* == Inbound: SUBSCRIPTION_FILTER applies (§10.2.9) ================ */
+    {
+        moq_session_t *s = make_established_ev(MOQ_PERSPECTIVE_SERVER, 0, 0);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xD101);
+        moq_subscription_t h = establish_publisher(s, "video", 0, ref);
+
+        /* The subscriber narrows the subscription to an AbsoluteRange
+         * window via REQUEST_UPDATE (allowed for a subscription). */
+        moq_d18_msg_params_t p = { 0 };
+        p.has_filter = true;
+        p.filter_type = 4;  /* AbsoluteRange */
+        p.filter_start_group = 5;
+        p.filter_start_object = 3;
+        p.filter_end_group = 9;
+        uint8_t msg[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_d18_encode_request_update(&w, 2, &p), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, msg,
+                moq_buf_writer_offset(&w), false, 1), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+
+        bool updated = false;
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                updated = true;
+                MOQ_TEST_CHECK(ev.u.subscribe_updated.has_filter);
+                MOQ_TEST_CHECK(ev.u.subscribe_updated.filter ==
+                    MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+                MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.start_group, 5);
+                MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.start_object, 3);
+                MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.end_group, 9);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(updated);
+
+        /* REQUEST_OK on the request bidi; subscription stays established
+         * and its entry tracks the updated filter type. */
+        moq_action_t act;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(s, &act, 1), 1);
+        MOQ_TEST_CHECK_EQ_U64(act.kind, MOQ_ACTION_SEND_BIDI_STREAM);
+        moq_buf_reader_t rr;
+        moq_buf_reader_init(&rr, act.u.send_bidi_stream.data,
+                            act.u.send_bidi_stream.len);
+        moq_control_envelope_t env;
+        moq_d18_decode_envelope(&rr, &env);
+        MOQ_TEST_CHECK_EQ_U64(env.msg_type, MOQ_D18_REQUEST_OK);
+        moq_action_cleanup(&act);
+        MOQ_TEST_CHECK_EQ_INT(slot_state_for(s, ref), (int)MOQ_SUB_ESTABLISHED);
+        {
+            moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+            MOQ_TEST_CHECK(ep.kind == MOQ_REQ_SUBSCRIPTION);
+            MOQ_TEST_CHECK(s->subs[ep.slot].filter_type ==
+                MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE);
+        }
+        (void)h;
+        moq_session_destroy(s);
+    }
+
     /* == Inbound: REQUEST_UPDATE with delivery timeout surfaces it ==== */
     {
         moq_session_t *s = make_established_ev(MOQ_PERSPECTIVE_SERVER, 0, 0);
@@ -821,7 +998,24 @@ int main(void)
         moq_d18_encode_request_update(&w, 2, &p);
         (void)moq_session_on_bidi_stream_bytes(s, ref, msg,
             moq_buf_writer_offset(&w), false, 1);
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+        /* §9.8: draft-18 defines the two timeouts independently -- DIFFERING
+         * values are LEGAL (previously rejected). The legacy event field
+         * projects min_nonzero of this message's carriers. */
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        {
+            moq_event_t ev2; bool saw2 = false;
+            while (moq_session_poll_events(s, &ev2, 1) == 1) {
+                if (ev2.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                    saw2 = true;
+                    MOQ_TEST_CHECK(ev2.u.subscribe_updated.has_delivery_timeout);
+                    MOQ_TEST_CHECK_EQ_U64(
+                        ev2.u.subscribe_updated.delivery_timeout_us,
+                        3000ull * 1000ull);
+                }
+                moq_event_cleanup(&ev2);
+            }
+            MOQ_TEST_CHECK(saw2);
+        }
         moq_session_destroy(s);
     }
 

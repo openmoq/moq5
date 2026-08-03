@@ -1,0 +1,22 @@
+# pkg-config for the wtquic WebTransport adapter (<moq/wtquic.h>).
+#
+# Relocatable: prefix is derived from this file's own location, so it is
+# correct regardless of the install --prefix. The up-path is computed
+# from CMAKE_INSTALL_LIBDIR depth.
+#
+# The transitive transport dependency is expressed through wtquic's own
+# pkg-config (Requires: wtquic — the BACKEND-NEUTRAL core), so wtquic's
+# install prefix must be on PKG_CONFIG_PATH. Whichever backend the
+# consumer links (wtquic-msquic.pc, wtquic-network.pc, ...) carries its
+# own transport link dependencies. CMake (find_package(libmoq
+# COMPONENTS adapter-wtquic)) is the fully supported consumer path.
+prefix=${pcfiledir}/@LIBMOQ_WTQUIC_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq-wtquic
+Description: libmoq wtquic WebTransport adapter (<moq/wtquic.h>)
+Version: @PROJECT_VERSION@
+Requires: wtquic
+Libs: -L${libdir} -lmoq-adapter-wtquic -lmoq-core
+Cflags: -I${includedir}

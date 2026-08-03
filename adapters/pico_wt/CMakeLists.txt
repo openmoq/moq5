@@ -367,6 +367,62 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     endif()
     add_test(NAME pico_wt_conformance COMMAND test_pico_wt_conformance)
     set_tests_properties(pico_wt_conformance PROPERTIES TIMEOUT 60)
+
+    # Inbound receive backpressure + capacity invariance. Needs the adapter's
+    # internal header for the per-stream receive state assertions.
+    add_executable(test_pico_wt_backpressure
+        tests/test_pico_wt_backpressure.c
+        tests/pico_wt_harness.c
+    )
+    target_include_directories(test_pico_wt_backpressure PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_backpressure PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+        OpenSSL::SSL OpenSSL::Crypto
+    )
+    target_compile_definitions(test_pico_wt_backpressure PRIVATE
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_backpressure PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_backpressure COMMAND test_pico_wt_backpressure)
+    set_tests_properties(pico_wt_backpressure PROPERTIES TIMEOUT 180)
+
+    # Receive-backpressure lifecycle: what happens to a paused stream on FIN,
+    # RESET, STOP_SENDING, teardown, and before the connection is READY.
+    # Recompiles the adapter sources so the test build can reach the
+    # MOQ_PICO_WT_TESTING dispatch hook. The hook is absent from the shipped
+    # library and no symbol is exported from it.
+    add_executable(test_pico_wt_rx_lifecycle
+        tests/test_pico_wt_rx_lifecycle.c
+        tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_rx_lifecycle PRIVATE
+        MOQ_PICO_WT_TESTING)
+    target_include_directories(test_pico_wt_rx_lifecycle PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_rx_lifecycle PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+        OpenSSL::SSL OpenSSL::Crypto
+    )
+    target_compile_definitions(test_pico_wt_rx_lifecycle PRIVATE
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_rx_lifecycle PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_rx_lifecycle COMMAND test_pico_wt_rx_lifecycle)
+    set_tests_properties(pico_wt_rx_lifecycle PROPERTIES TIMEOUT 180)
 endif()
 
 # -- Managed facade -------------------------------------------------
@@ -738,6 +794,31 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # draft-18 announce -> accept -> withdraw (publish_namespace_done) over
+        # real WT. The withdrawal aborts the request bidi; the peer must still
+        # see NAMESPACE_DONE, neither side goes fatal, and the subscription's
+        # object still arrives. Genuinely-negotiated peers (RESET_STREAM_AT).
+        add_test(NAME pico_wt_managed_announce_done_18
+            COMMAND test_pico_wt_managed_loopback --mode announce_done_18
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_announce_done_18 PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Same withdrawal against a relay that omits the reset_stream_at
+        # transport parameter (imquic/moqx). The client synthesizes the TP to
+        # unblock CONNECT, so the abort must downgrade to a plain RESET_STREAM;
+        # a RESET_STREAM_AT would be rejected by this no-rsa picoquic server and
+        # tear the WT session down. Seeing NAMESPACE_DONE proves the downgrade.
+        add_test(NAME pico_wt_managed_announce_done_no_rsa
+            COMMAND test_pico_wt_managed_loopback --mode announce_done_no_rsa
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_announce_done_no_rsa PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
         # Plain subscribe + object at draft-18 through the managed pair over
         # real UDP — the d18 request bidi data plane (the sim covers the
         # deterministic ordering; this covers the real-network arrival race).
@@ -842,5 +923,22 @@ endif()\n")
         set_tests_properties(pico_wt_managed_edges PROPERTIES
             TIMEOUT 60
             LABELS "network;pico_wt;managed")
+
+        # cfg init contract + whole-block field test: the pointer init stamps the
+        # full current struct (a current-header caller can set app_deadline); the
+        # sized init honors an explicit (possibly partial) size. Built normally;
+        # the canonical ASan configuration instruments it too.
+        add_executable(test_pico_wt_managed_cfg_abi
+            tests/test_pico_wt_managed_cfg_abi.c)
+        target_link_libraries(test_pico_wt_managed_cfg_abi
+            PRIVATE moq::adapter-pico-wt-managed moq::adapter-picoquic)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_cfg_abi PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_cfg_abi
+            COMMAND test_pico_wt_managed_cfg_abi)
+        set_tests_properties(pico_wt_managed_cfg_abi PROPERTIES TIMEOUT 30)
     endif()
 endif()

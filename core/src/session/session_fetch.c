@@ -126,28 +126,6 @@ void fetch_on_request_goaway_release(moq_session_t *s, int slot)
     e->generation++;
 }
 
-/* -- Copy namespace parts into output scratch ---------------------- */
-
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* -- Inbound FETCH handler ----------------------------------------- */
 
 /* Emit a core-generated FETCH REQUEST_ERROR, routed like the auth-reject path: on
@@ -218,7 +196,17 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
         return close_with_error(s, 0x3, "fetch pool full");
 
     /* Build entry-owned token storage in temporaries first, so a copy failure
-     * leaves the fetch slot untouched (still FREE) and the request fully retryable. */
+     * leaves the fetch slot untouched (still FREE) and commits nothing: no
+     * entry, no registry re-key, no request id, no event.
+     *
+     * That failure is MOQ_ERR_NOMEM -- a hard error, since no drain makes memory
+     * appear -- and the request-stream handler frees the still-receiving staging
+     * slot on any hard failure, so the request's buffered bytes go with it. An
+     * empty re-feed therefore has nothing to resume; recovery is re-delivery of
+     * the whole request, which admits cleanly because no request id was
+     * committed. A caller driving the session through the transport bridge gets
+     * a connection fatal instead, deliberately: only MOQ_ERR_WOULD_BLOCK is a
+     * wait there. */
     size_t n = d->token_count;
     moq_resolved_token_t tmp[MOQ_DECODED_MAX_TOKENS];
     bool tmp_staged[MOQ_DECODED_MAX_TOKENS];
@@ -245,7 +233,10 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
                     if (tmp_staged[j] && !took_from_d[j])
                         s->alloc.free((void *)(uintptr_t)tmp[j].token_value.data,
                                       tmp[j].token_value.len, s->alloc.ctx);
-                return MOQ_ERR_WOULD_BLOCK;   /* nothing mutated: retryable */
+                /* Every copy taken so far is released and no entry, registry key
+                 * or event exists yet -- but no drain makes memory appear, so
+                 * this is an error rather than a wait. */
+                return MOQ_ERR_NOMEM;
             }
             memcpy(copy, d->tokens[i].token_value.data, len);
             tmp[i].token_value.data = copy;
@@ -798,7 +789,9 @@ moq_result_t session_core_on_fetch_error(moq_session_t *s, int slot,
         rc = session_core_emit_request_redirect(s, MOQ_REQUEST_FAMILY_FETCH,
             s->fetches[slot].handle._opaque, redirect, error_code,
             can_retry, retry_after_ms, reason, reason_len);
-        if (rc < 0) return rc;
+        /* The emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     } else {
         moq_bytes_t ev_reason = {0};
         if (reason_len > 0) {
@@ -1225,6 +1218,10 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         if (s->subs[jsub].state != MOQ_SUB_ESTABLISHED &&
             s->subs[jsub].state != MOQ_SUB_PENDING_SUBSCRIBER)
             return MOQ_ERR_WRONG_STATE;
+        /* A deferred terminal (done_pending) is logically Terminated; the
+         * Joining Location is usable only while Established (§5.1). */
+        if (s->subs[jsub].done_pending)
+            return MOQ_ERR_WRONG_STATE;
         if (s->subs[jsub].filter_type != MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT)
             return MOQ_ERR_INVAL;
         /* The joining start is derived from the subscription's *current* largest
@@ -1482,7 +1479,7 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
     bool stop_data = e->data_stream_started && !e->data_stream_fin;
-    if (action_queue_avail(s) < (size_t)(2 + (stop_data ? 1 : 0)))
+    if (action_queue_avail(s) < (size_t)(1 + (stop_data ? 1 : 0)))
         return MOQ_ERR_WOULD_BLOCK;
     if (e->request_stream_ref._v != 0 &&
         s->drain_ref_count >= s->drain_ref_cap)
@@ -1490,20 +1487,12 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
     moq_stream_ref_t ref = e->request_stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
-    a.u.stop_bidi_stream.stream_ref = ref;
-    a.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED */
+    a.u.abort_bidi_stream.stream_ref = ref;
+    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
     moq_result_t arc = push_action(s, &a);
-    if (arc < 0) return arc;
-    memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    a.borrow_epoch = s->borrow_epoch;
-    a.u.reset_bidi_stream.stream_ref = ref;
-    a.u.reset_bidi_stream.error_code = 0x1;
-    arc = push_action(s, &a);
     if (arc < 0) return arc;
     if (stop_data) {
         memset(&a, 0, sizeof(a));

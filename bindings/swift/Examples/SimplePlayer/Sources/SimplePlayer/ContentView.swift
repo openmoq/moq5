@@ -167,6 +167,18 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
 
+                // Which QUIC stack: Auto stays picoquic; the wtquic backends
+                // (Network.framework, MsQuic) are WebTransport and use system
+                // trust -- the CA field does not apply there. A menu picker (not
+                // segmented) keeps the four longer labels usable at narrow
+                // window widths.
+                Picker("Backend", selection: $model.backend) {
+                    ForEach(PlayerModel.BackendChoice.allCases) {
+                        Text($0.displayName).tag($0)   // label may say "Experimental"; tag stays the raw case
+                    }
+                }
+                .pickerStyle(.menu)
+
                 Picker("Version", selection: $model.version) {
                     ForEach(PlayerModel.VersionChoice.allCases) {
                         Text($0.rawValue).tag($0)
@@ -174,17 +186,27 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
 
-                // iOS ships no readable system PEM bundle, so OpenSSL
-                // verification there needs an explicit CA file.
-                field(systemImage: "lock.shield",
-                      placeholder: "CA bundle path (PEM, optional)",
-                      text: $model.caFilePath)
+                // The CA bundle applies ONLY to the picoquic family (OpenSSL
+                // verification; iOS ships no readable system PEM bundle). The
+                // wtquic backends (Network.framework, MsQuic) use system trust
+                // and have no CA-file concept, so the control is hidden for
+                // .wtquicNetwork and .wtquicMsquic.
+                if model.backend != .wtquicNetwork
+                    && model.backend != .wtquicMsquic {
+                    field(systemImage: "lock.shield",
+                          placeholder: "CA bundle path (PEM, optional)",
+                          text: $model.caFilePath)
+                }
 
                 Toggle("Skip TLS verification (insecure)",
                        isOn: $model.insecureSkipVerify)
                     .font(.callout)
             }
             .padding(.top, 12)
+            // Configuration is fixed for the life of a connection: disable
+            // the controls while running so the picker can't drift away from
+            // the backend actually in use (which would mis-describe failures).
+            .disabled(model.isRunning)
         } label: {
             Label("Advanced", systemImage: "slider.horizontal.3")
                 .font(.subheadline)

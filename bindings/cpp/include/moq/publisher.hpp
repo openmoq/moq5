@@ -111,7 +111,9 @@ public:
         moq_pub_track_cfg_t c;
         /* Sized init: this binding always copies the appended fields
          * (has_publisher_priority, max_retained_bytes), so the cfg must
-         * advertise the full current size for add_track to honor them. */
+         * advertise the full current size for add_track to honor them. The
+         * later-appended monotonic_groups stays at its zeroed default (no
+         * C++ knob in this slice; opting in is a C-level cfg decision). */
         moq_pub_track_cfg_init_sized(&c, sizeof(c));
         c.track_namespace        = cfg.ns.c_namespace();
         c.track_name             = cfg.track.raw();
@@ -179,7 +181,8 @@ public:
                               uint64_t now)
     {
         moq_pub_object_cfg_t c;
-        moq_pub_object_cfg_init(&c);
+        /* Sized init: end_of_group is an appended tail field. */
+        moq_pub_object_cfg_init_sized(&c, sizeof(c));
         c.group_id   = cfg.group_id;
         c.object_id  = cfg.object_id;
         c.payload    = cfg.payload ? cfg.payload->raw() : nullptr;
@@ -217,7 +220,8 @@ public:
                               const buffer &properties, uint64_t now)
     {
         moq_pub_begin_object_cfg_t c;
-        moq_pub_begin_object_cfg_init(&c);
+        /* Sized init: properties is an appended tail field. */
+        moq_pub_begin_object_cfg_init_sized(&c, sizeof(c));
         c.group_id       = group_id;
         c.object_id      = object_id;
         c.payload_length = payload_length;

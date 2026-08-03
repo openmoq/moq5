@@ -38,6 +38,7 @@
  */
 
 #include "session_internal.h"
+#include "../wire/control_d16_internal.h"
 #include "moq/control.h"
 
 /* ==================== REGION: PROFILE STATE / INIT ==================== */
@@ -376,11 +377,32 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
      * a duplicate stale SERVER_SETUP, which is what queuing it before these
      * allocations risked).
      */
+    /* The completion event's whole token requirement is classified before any
+     * of it is copied: a shortfall an empty arena could satisfy is transient
+     * (the arena recycles once events drain), while one no empty arena could
+     * satisfy can never be retried into success. */
+    size_t scratch_saved = s->event_scratch_len;
+    switch (setup_event_scratch_classify(s, resolved, token_count)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1, "event scratch permanently too small");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+
     for (size_t i = 0; i < token_count; i++) {
         if (resolved[i].token_value.len > 0) {
             uint8_t *copy = event_scratch_copy(s, resolved[i].token_value.data,
                                           resolved[i].token_value.len);
-            if (!copy) return MOQ_ERR_BUFFER;
+            if (!copy) {
+                /* The preflight said the whole requirement fits: a failure
+                 * here is an internal inconsistency, not arena pressure, and
+                 * has no unblock edge to wait on. */
+                s->event_scratch_len = scratch_saved;
+                return close_with_error(s, 0x1,
+                    "internal: setup scratch preflight mismatch");
+            }
             resolved[i].token_value.data = copy;
         }
     }
@@ -391,7 +413,11 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
     if (token_count > 0) {
         moq_resolved_token_t *tok_copy = (moq_resolved_token_t *)event_scratch_alloc_aligned(
             s, token_count * sizeof(moq_resolved_token_t), _Alignof(moq_resolved_token_t));
-        if (!tok_copy) return MOQ_ERR_BUFFER;
+        if (!tok_copy) {
+            s->event_scratch_len = scratch_saved;
+            return close_with_error(s, 0x1,
+                "internal: setup scratch preflight mismatch");
+        }
         memcpy(tok_copy, resolved, token_count * sizeof(moq_resolved_token_t));
         e.u.setup_complete.tokens = tok_copy;
         e.u.setup_complete.token_count = token_count;
@@ -404,6 +430,7 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
                                                      s->alloc.ctx);
             if (!p) {
                 moq_ov_free_preowned(&ov, &s->alloc);
+                s->event_scratch_len = scratch_saved;
                 return MOQ_ERR_NOMEM;
             }
             memcpy(p, ov.entries[i].value, ov.entries[i].value_len);
@@ -415,17 +442,21 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
      * Phase 3: Commit. All retryable allocation has succeeded and the event
      * slot was reserved at entry (the event_queue_full check above, with
      * nothing pushing an event before here). The only operation that can
-     * still fail is queuing SERVER_SETUP on a full action queue, and it is
-     * the FIRST observable mutation -- a WOULD_BLOCK there leaves nothing
-     * queued/pushed/committed, so the retry is clean. push_event cannot
-     * fail (slot reserved), and the cache commit allocates nothing.
+     * still fail is queuing SERVER_SETUP, which needs both an action slot and
+     * room in the send buffer, and it is the FIRST observable mutation -- a
+     * failure there leaves nothing queued/pushed/committed and restores the
+     * scratch cursor, so the retry is clean. push_event cannot fail (slot
+     * reserved), and the cache commit allocates nothing.
      */
     moq_setup_params_t local_tmp;
     d16_build_local_setup(s, &local_tmp);
 
     rc = d16_encode_and_queue_setup(s, &local_tmp, false);
     if (rc < 0) {
+        /* Nothing was queued, so the staged event bytes are unreferenced: the
+         * arena returns to its entry state for the retry. */
         moq_ov_free_preowned(&ov, &s->alloc);
+        s->event_scratch_len = scratch_saved;
         return rc;
     }
 
@@ -594,11 +625,31 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
      * Pre-allocate cache-value copies for pending REGISTERs so Phase 3
      * commits without allocation.
      */
+    /* Classify the completion event's whole token requirement before copying
+     * any of it: a shortfall an empty arena could satisfy is transient, while
+     * one no empty arena could satisfy can never be retried into success. */
+    size_t scratch_saved = s->event_scratch_len;
+    switch (setup_event_scratch_classify(s, resolved, token_count)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1, "event scratch permanently too small");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+
     for (size_t i = 0; i < token_count; i++) {
         if (resolved[i].token_value.len > 0) {
             uint8_t *copy = event_scratch_copy(s, resolved[i].token_value.data,
                                           resolved[i].token_value.len);
-            if (!copy) return MOQ_ERR_BUFFER;
+            if (!copy) {
+                /* The preflight said the whole requirement fits: a failure
+                 * here is an internal inconsistency, not arena pressure, and
+                 * has no unblock edge to wait on. */
+                s->event_scratch_len = scratch_saved;
+                return close_with_error(s, 0x1,
+                    "internal: setup scratch preflight mismatch");
+            }
             resolved[i].token_value.data = copy;
         }
     }
@@ -609,7 +660,11 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
     if (token_count > 0) {
         moq_resolved_token_t *tok_copy = (moq_resolved_token_t *)event_scratch_alloc_aligned(
             s, token_count * sizeof(moq_resolved_token_t), _Alignof(moq_resolved_token_t));
-        if (!tok_copy) return MOQ_ERR_BUFFER;
+        if (!tok_copy) {
+            s->event_scratch_len = scratch_saved;
+            return close_with_error(s, 0x1,
+                "internal: setup scratch preflight mismatch");
+        }
         memcpy(tok_copy, resolved, token_count * sizeof(moq_resolved_token_t));
         e.u.setup_complete.tokens = tok_copy;
         e.u.setup_complete.token_count = token_count;
@@ -622,6 +677,7 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
                                                      s->alloc.ctx);
             if (!p) {
                 moq_ov_free_preowned(&ov, &s->alloc);
+                s->event_scratch_len = scratch_saved;
                 return MOQ_ERR_NOMEM;
             }
             memcpy(p, ov.entries[i].value, ov.entries[i].value_len);
@@ -632,6 +688,7 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
     rc = push_event(s, &e);
     if (rc < 0) {
         moq_ov_free_preowned(&ov, &s->alloc);
+        s->event_scratch_len = scratch_saved;
         return rc;
     }
 
@@ -1039,7 +1096,9 @@ static moq_result_t d16_decode_subscribe(moq_session_t *s,
             if (v == 0)
                 D16_PARAM_CLOSE("DELIVERY_TIMEOUT must be > 0");
             out->has_delivery_timeout = true;
-            out->delivery_timeout_us = v * 1000;
+            out->delivery_timeout_us = ms_to_us_sat(v);
+            out->dt_has_object = out->dt_has_subgroup = true;
+            out->dt_object_ms = out->dt_subgroup_ms = v;
             break;
         }
         case MOQ_MSG_PARAM_NEW_GROUP_REQUEST: {
@@ -1068,6 +1127,22 @@ static moq_result_t d16_decode_subscribe(moq_session_t *s,
  * structural inconsistency -- this is NOT full extension validation; the
  * blob stays opaque to the application either way. Returns MOQ_ERR_PROTO
  * only for the >1 violation. */
+/* §9.8 pure scanner (vtable op): the single d16 DELIVERY TIMEOUT extension
+ * writes BOTH per-type slots (§11.1). */
+static moq_result_t d16_scan_delivery_timeouts(const uint8_t *data,
+                                               size_t len, bool strict_local,
+                                               moq_dt_scan_t *out)
+{
+    bool has = false; uint64_t ms = 0;
+    moq_result_t rc = moq_d16_scan_delivery_timeout_ext(data, len,
+                                                        strict_local,
+                                                        &has, &ms);
+    if (rc < 0) return rc;
+    out->has_object = out->has_subgroup = has;
+    out->object_ms = out->subgroup_ms = ms;
+    return MOQ_OK;
+}
+
 #define D16_EXT_DYNAMIC_GROUPS 0x30u
 static moq_result_t d16_scan_extensions_dynamic_groups(
     const uint8_t *data, size_t len, bool *out_dynamic_groups)
@@ -1207,14 +1282,6 @@ static const uint64_t d16_request_update_all_params[] = {
     MOQ_MSG_PARAM_NEW_GROUP_REQUEST,
 };
 
-static const uint64_t d16_request_update_supported[] = {
-    MOQ_MSG_PARAM_AUTHORIZATION_TOKEN,
-    MOQ_MSG_PARAM_SUBSCRIBER_PRIORITY,
-    MOQ_MSG_PARAM_FORWARD,
-    MOQ_MSG_PARAM_DELIVERY_TIMEOUT,
-    MOQ_MSG_PARAM_NEW_GROUP_REQUEST,
-};
-
 static moq_result_t d16_decode_request_update(moq_session_t *s,
                                                const moq_control_envelope_t *env,
                                                moq_decoded_request_update_t *out,
@@ -1312,18 +1379,11 @@ static moq_result_t d16_decode_request_update(moq_session_t *s,
         return close_with_error(s, perr, "invalid REQUEST_UPDATE parameter");
     }
 
-    /* Check for unsupported-but-valid params (skip wrong-scope). */
-    for (size_t i = 0; i < upd.params_count; i++) {
-        if (!d16_param_is_allowed(upd.params[i].type, allowed, num_allowed))
-            continue;
-        if (!d16_param_is_allowed(upd.params[i].type,
-                d16_request_update_supported,
-                sizeof(d16_request_update_supported) /
-                sizeof(d16_request_update_supported[0])))
-            { out->has_unsupported = true; break; }
-    }
+    /* Every allowed subscription/publish update parameter is modeled below;
+     * has_unsupported now marks only update targets we cannot update (set
+     * during target resolution above). */
 
-    /* Decode supported param values (skip wrong-scope). */
+    /* Decode param values (skip wrong-scope). */
     for (size_t i = 0; i < upd.params_count; i++) {
         if (!d16_param_is_allowed(upd.params[i].type, allowed, num_allowed))
             continue;
@@ -1361,7 +1421,22 @@ static moq_result_t d16_decode_request_update(moq_session_t *s,
                     "DELIVERY_TIMEOUT must be > 0 in REQUEST_UPDATE");
             }
             out->has_delivery_timeout = true;
-            out->delivery_timeout_us = v * 1000;
+            out->delivery_timeout_us = ms_to_us_sat(v);
+            out->dt_has_object = out->dt_has_subgroup = true;
+            out->dt_object_ms = out->dt_subgroup_ms = v;
+        } else if (upd.params[i].type == MOQ_MSG_PARAM_SUBSCRIPTION_FILTER) {
+            moq_d16_subscription_filter_t f;
+            if (moq_d16_decode_subscription_filter(
+                    upd.params[i].value, upd.params[i].value_len, &f) < 0) {
+                *out_consumed = true;
+                return close_with_error(s, 0x3,
+                    "malformed SUBSCRIPTION_FILTER in REQUEST_UPDATE");
+            }
+            out->has_filter = true;
+            out->filter_type = f.filter_type;
+            out->start_group = f.start_group;
+            out->start_object = f.start_object;
+            out->end_group = f.end_group;
         } else if (upd.params[i].type == MOQ_MSG_PARAM_NEW_GROUP_REQUEST) {
             uint64_t v;
             size_t consumed = moq_quic_varint_decode(
@@ -1877,6 +1952,8 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
             if (moq_d16_decode_param_expires(
                     pub.params[i].value, pub.params[i].value_len, &exp) < 0)
                 D16_PUB_PARAM_CLOSE("malformed EXPIRES");
+            out->has_expires = true;
+            out->expires_ms = exp;
             break;
         }
         case MOQ_MSG_PARAM_LARGEST_OBJECT: {
@@ -1884,6 +1961,9 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
             if (moq_d16_decode_location(
                     pub.params[i].value, pub.params[i].value_len, &loc) < 0)
                 D16_PUB_PARAM_CLOSE("malformed LARGEST_OBJECT");
+            out->has_largest = true;
+            out->largest_group = loc.group;
+            out->largest_object = loc.object;
             break;
         }
         case MOQ_MSG_PARAM_AUTHORIZATION_TOKEN:
@@ -1974,6 +2054,8 @@ static moq_result_t d16_decode_publish_ok_inbound(
             } else {
                 out->has_delivery_timeout = true;
                 out->delivery_timeout_ms = v;
+                out->dt_has_object = out->dt_has_subgroup = true;
+                out->dt_object_ms = out->dt_subgroup_ms = v;
             }
             break;
         }
@@ -2005,6 +2087,12 @@ static moq_result_t d16_decode_publish_ok_inbound(
                     ok.params[i].value_len, &f) < 0) {
                 out->has_deferred_param_error = true;
                 out->deferred_param_reason = "malformed SUBSCRIPTION_FILTER";
+            } else {
+                out->has_filter = true;
+                out->filter_type = (uint32_t)f.filter_type;
+                out->filter_start_group = f.start_group;
+                out->filter_start_object = f.start_object;
+                out->filter_end_group = f.end_group;
             }
             break;
         }
@@ -2083,17 +2171,30 @@ static moq_result_t d16_decode_publish_done_inbound(
     moq_request_endpoint_t ep = request_registry_find_by_id(s, done.request_id);
     if (ep.kind == MOQ_REQ_SUBSCRIPTION) {
         int slot = ep.slot;
+        /* §5.1: the publisher terminates only Established or Pending
+         * (Publisher) subscriptions with PUBLISH_DONE. A SUBSCRIBE-initiated
+         * subscription pending its first response (Pending (Subscriber))
+         * must receive exactly one SUBSCRIBE_OK or REQUEST_ERROR -- a
+         * PUBLISH_DONE there is a protocol violation (and, with Stream-Count
+         * gating, could never be satisfied: the track alias only arrives in
+         * SUBSCRIBE_OK, so no data stream could ever bind). */
         if (slot < 0 || (size_t)slot >= s->sub_cap ||
-            (s->subs[slot].state != MOQ_SUB_PENDING_SUBSCRIBER &&
-             s->subs[slot].state != MOQ_SUB_ESTABLISHED)) {
+            s->subs[slot].state != MOQ_SUB_ESTABLISHED) {
             *out_consumed = true;
             return close_with_error(s, 0x3,
-                "PUBLISH_DONE for non-active subscription");
+                "PUBLISH_DONE for non-established subscription");
         }
         if (s->subs[slot].role != MOQ_SUB_ROLE_SUBSCRIBER) {
             *out_consumed = true;
             return close_with_error(s, 0x3,
                 "PUBLISH_DONE for publisher-role subscription");
+        }
+        /* PUBLISH_DONE is the publisher's final message for the request; a
+         * second one while the first is deferred is a violation (and must
+         * not replace the retained status/count/reason). */
+        if (s->subs[slot].done_pending) {
+            *out_consumed = true;
+            return close_with_error(s, 0x3, "duplicate PUBLISH_DONE");
         }
         *out_consumed = true;
         {
@@ -2119,9 +2220,16 @@ static moq_result_t d16_decode_publish_done_inbound(
         *out_consumed = true;
         return close_with_error(s, 0x3, "PUBLISH_DONE for non-subscriber publish");
     }
-    if (pe->state != MOQ_PUB_ESTABLISHED) {
+    /* §5.1: the publisher may terminate a PUBLISH-initiated subscription
+     * from Pending (Publisher) as well as Established. */
+    if (pe->state != MOQ_PUB_ESTABLISHED &&
+        pe->state != MOQ_PUB_PENDING_SUBSCRIBER) {
         *out_consumed = true;
-        return close_with_error(s, 0x3, "PUBLISH_DONE for non-established publish");
+        return close_with_error(s, 0x3, "PUBLISH_DONE for non-active publish");
+    }
+    if (pe->done_pending) {
+        *out_consumed = true;
+        return close_with_error(s, 0x3, "duplicate PUBLISH_DONE");
     }
 
     out->request_id  = done.request_id;
@@ -2492,7 +2600,9 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
         moq_result_t drc = d16_decode_subscribe(s, env, &decoded, &consumed);
         if (drc != MOQ_OK) return drc;
         if (consumed) return MOQ_OK;  /* auth reject handled internally */
-        return session_core_on_subscribe(s, &decoded, -1);
+        /* draft-16 correlates by request-id on the shared control channel (no
+         * per-request bidi / FIN), so request_fin is not applicable. */
+        return session_core_on_subscribe(s, &decoded, -1, false);
     }
 
     case MOQ_D16_SUBSCRIBE_OK: {
@@ -2585,29 +2695,60 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
             return session_core_on_track_status_ok(s, &tsok);
         }
         case MOQ_REQ_SUBSCRIPTION_UPDATE: {
+            /* §2b: REQUEST_UPDATE_OK MAY carry LARGEST_OBJECT (draft-16 has no
+             * EXPIRES on this path; an EXPIRES, if present, is ignored). Validate
+             * against the SUBSCRIBE_OK param set (same as track-status). */
             uint64_t perr = d16_validate_msg_params(ok.params, ok.params_count,
-                NULL, 0);
+                d16_subscribe_ok_allowed_params,
+                sizeof(d16_subscribe_ok_allowed_params) /
+                sizeof(d16_subscribe_ok_allowed_params[0]));
             if (perr)
                 return close_with_error(s, perr,
                     "invalid param in REQUEST_OK for subscription update");
+            bool has_lg = false; uint64_t lg = 0, lo = 0;
+            for (size_t pi = 0; pi < ok.params_count; pi++) {
+                if (ok.params[pi].type != MOQ_MSG_PARAM_LARGEST_OBJECT) continue;
+                moq_d16_location_t loc;
+                if (moq_d16_decode_location(ok.params[pi].value,
+                        ok.params[pi].value_len, &loc) < 0)
+                    return close_with_error(s, 0x3,
+                        "malformed LARGEST_OBJECT in REQUEST_OK");
+                has_lg = true; lg = loc.group; lo = loc.object;
+            }
             if (ep.slot >= 0 && (size_t)ep.slot < s->sub_cap &&
                 s->subs[ep.slot].update_pending &&
                 s->subs[ep.slot].update_request_id == ok.request_id) {
-                s->subs[ep.slot].update_pending = false;
+                moq_result_t hrc = session_core_on_subscribe_update_ok(s, ep.slot,
+                    has_lg, lg, lo, false /* no d16 EXPIRES */, 0);
+                if (hrc < 0) return hrc;  /* WOULD_BLOCK retryable; id kept */
             }
             request_registry_remove_by_id(s, ok.request_id);
             return MOQ_OK;
         }
         case MOQ_REQ_PUBLICATION_UPDATE: {
             uint64_t perr = d16_validate_msg_params(ok.params, ok.params_count,
-                NULL, 0);
+                d16_subscribe_ok_allowed_params,
+                sizeof(d16_subscribe_ok_allowed_params) /
+                sizeof(d16_subscribe_ok_allowed_params[0]));
             if (perr)
                 return close_with_error(s, perr,
                     "invalid param in REQUEST_OK for publication update");
+            bool has_lg = false; uint64_t lg = 0, lo = 0;
+            for (size_t pi = 0; pi < ok.params_count; pi++) {
+                if (ok.params[pi].type != MOQ_MSG_PARAM_LARGEST_OBJECT) continue;
+                moq_d16_location_t loc;
+                if (moq_d16_decode_location(ok.params[pi].value,
+                        ok.params[pi].value_len, &loc) < 0)
+                    return close_with_error(s, 0x3,
+                        "malformed LARGEST_OBJECT in REQUEST_OK");
+                has_lg = true; lg = loc.group; lo = loc.object;
+            }
             if (ep.slot >= 0 && (size_t)ep.slot < s->pub_cap &&
                 s->publishes[ep.slot].update_pending &&
                 s->publishes[ep.slot].update_request_id == ok.request_id) {
-                s->publishes[ep.slot].update_pending = false;
+                moq_result_t hrc = session_core_on_publish_update_ok(s, ep.slot,
+                    has_lg, lg, lo, false, 0);
+                if (hrc < 0) return hrc;
             }
             request_registry_remove_by_id(s, ok.request_id);
             return MOQ_OK;
@@ -2707,13 +2848,17 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
                 err.reason, err.reason_len, NULL);
         }
         case MOQ_REQ_SUBSCRIPTION_UPDATE: {
-            /* TODO: surface update failure via event when facade needs it */
+            /* route through the SHARED update-failure state machine (the
+             * same one the stream-correlated profile uses): §9.11 requires
+             * the subscription be terminated with PUBLISH_DONE(UPDATE_FAILED)
+             * after a rejected update, so update_failed must latch and block
+             * further updates until that terminal. The by-id registry entry
+             * is this profile's own bookkeeping and is still removed here. */
+            request_registry_remove_by_id(s, err.request_id);
             if (ep.slot >= 0 && (size_t)ep.slot < s->sub_cap &&
                 s->subs[ep.slot].update_pending &&
-                s->subs[ep.slot].update_request_id == err.request_id) {
-                s->subs[ep.slot].update_pending = false;
-            }
-            request_registry_remove_by_id(s, err.request_id);
+                s->subs[ep.slot].update_request_id == err.request_id)
+                return session_core_on_subscribe_update_error(s, ep.slot);
             return MOQ_OK;
         }
         case MOQ_REQ_PUBLICATION_UPDATE: {
@@ -2722,6 +2867,9 @@ static moq_result_t d16_handle_control_message(moq_session_t *s,
                 s->publishes[ep.slot].update_pending &&
                 s->publishes[ep.slot].update_request_id == err.request_id) {
                 s->publishes[ep.slot].update_pending = false;
+                s->publishes[ep.slot].update_has_forward = false;
+                s->publishes[ep.slot].dt_upd_has_object = false;
+                s->publishes[ep.slot].dt_upd_has_subgroup = false;
             }
             request_registry_remove_by_id(s, err.request_id);
             return MOQ_OK;
@@ -3304,6 +3452,31 @@ static moq_result_t d16_encode_request_ok(moq_session_t *s,
     return moq_d16_encode_request_ok(w, request_id, NULL, 0);
 }
 
+/* REQUEST_UPDATE_OK (draft-16): a REQUEST_OK carrying the resolved
+ * LARGEST_OBJECT. draft-16's REQUEST_OK does not carry EXPIRES on this path
+ * (design §2b / §9.2.2.6), so has_expires is ignored. */
+static moq_result_t d16_encode_request_update_ok(moq_session_t *s,
+    moq_buf_writer_t *w, const moq_request_update_ok_encode_args_t *args)
+{
+    (void)s;
+    moq_kvp_entry_t params[1];
+    size_t param_count = 0;
+    uint8_t param_buf[16];
+    if (args->has_largest) {
+        moq_buf_writer_t lw;
+        moq_buf_writer_init(&lw, param_buf, sizeof(param_buf));
+        moq_buf_write_varint(&lw, args->largest_group);
+        moq_buf_write_varint(&lw, args->largest_object);
+        params[param_count] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_LARGEST_OBJECT,
+            .value = param_buf,
+            .value_len = moq_buf_writer_offset(&lw),
+            .is_varint = false, .raw = NULL, .raw_len = 0 };
+        param_count++;
+    }
+    return moq_d16_encode_request_ok(w, args->request_id, params, param_count);
+}
+
 static moq_result_t d16_encode_request_error(moq_session_t *s,
                                                moq_buf_writer_t *w,
                                                const moq_request_error_encode_args_t *args)
@@ -3333,17 +3506,17 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
      * 0x20. With auth tokens the entry array and encoded token values
      * come from output scratch (the same pattern as d16_encode_subscribe);
      * the budget stays within the inbound decoder's KVP cap. */
-    moq_kvp_entry_t local_params[4];
+    moq_kvp_entry_t local_params[5];
     moq_kvp_entry_t *params = local_params;
-    size_t params_cap = 4;
+    size_t params_cap = 5;
     uint8_t *tok_buf = NULL;
     size_t tok_buf_len = 0;
     size_t scratch_saved = s->output_scratch_len;
 
     if (args->auth_token_count > 0) {
-        if (args->auth_token_count > D16_MAX_MSG_PARAMS - 4)
+        if (args->auth_token_count > D16_MAX_MSG_PARAMS - 5)
             return MOQ_ERR_INVAL;
-        params_cap = args->auth_token_count + 4;
+        params_cap = args->auth_token_count + 5;
         params = (moq_kvp_entry_t *)scratch_alloc_aligned(
             s, params_cap * sizeof(moq_kvp_entry_t),
             _Alignof(moq_kvp_entry_t));
@@ -3362,6 +3535,7 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
 
     size_t pc = 0;
     uint8_t param_bufs[4][8];
+    uint8_t fbuf[40];   /* encoded subscription-filter value */
     size_t pbi = 0;
 
     if (args->has_delivery_timeout) {
@@ -3395,6 +3569,22 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
             .type = MOQ_MSG_PARAM_SUBSCRIBER_PRIORITY,
             .value = param_bufs[pbi], .value_len = n, .is_varint = true };
         pc++; pbi++;
+    }
+    if (args->has_filter) {                          /* 0x21, after 0x20 */
+        moq_d16_subscription_filter_t f = {
+            .filter_type = args->filter,
+            .start_group = args->filter_start_group,
+            .start_object = args->filter_start_object,
+            .end_group = args->filter_end_group,
+        };
+        size_t flen = 0;
+        if (moq_d16_encode_subscription_filter(fbuf, sizeof(fbuf), &flen,
+                                               &f) != MOQ_OK)
+            goto inval;
+        params[pc] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
+            .value = fbuf, .value_len = flen, .is_varint = false };
+        pc++;
     }
     if (args->has_new_group_request) {               /* 0x32, last in order */
         size_t n = moq_quic_varint_encode(args->new_group_request,
@@ -3480,7 +3670,7 @@ static moq_result_t d16_encode_publish_op(moq_session_t *s,
                                             const moq_publish_encode_args_t *args)
 {
     uint8_t local_param_bufs[2][16];
-    moq_kvp_entry_t local_params[2];
+    moq_kvp_entry_t local_params[3];
     size_t param_count = 0;
 
     moq_kvp_entry_t *params = local_params;
@@ -3488,18 +3678,32 @@ static moq_result_t d16_encode_publish_op(moq_session_t *s,
 
     if (args->auth_token_count > 0) {
         params = d16_alloc_auth_params(s, args->auth_tokens,
-            args->auth_token_count, 2, &param_count);
+            args->auth_token_count, 3, &param_count);
         if (!params) {
             s->output_scratch_len = scratch_saved;
             return MOQ_ERR_BUFFER;
         }
     }
 
+    /* Ascending order after AUTH 0x03: LARGEST_OBJECT 0x09, FORWARD 0x10. */
+    if (args->has_largest) {
+        moq_buf_writer_t lw;
+        moq_buf_writer_init(&lw, local_param_bufs[0], 16);
+        moq_buf_write_varint(&lw, args->largest_group);
+        moq_buf_write_varint(&lw, args->largest_object);
+        params[param_count] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_LARGEST_OBJECT,
+            .value = local_param_bufs[0],
+            .value_len = moq_buf_writer_offset(&lw),
+            .is_varint = false, .raw = NULL, .raw_len = 0 };
+        param_count++;
+    }
+
     if (args->has_forward && !args->forward) {
-        size_t n = moq_quic_varint_encode(0, local_param_bufs[0], 16);
+        size_t n = moq_quic_varint_encode(0, local_param_bufs[1], 16);
         params[param_count] = (moq_kvp_entry_t){
             .type = MOQ_MSG_PARAM_FORWARD,
-            .value = local_param_bufs[0], .value_len = n,
+            .value = local_param_bufs[1], .value_len = n,
             .is_varint = true, .raw = NULL, .raw_len = 0 };
         param_count++;
     }
@@ -3537,47 +3741,76 @@ static bool d16_track_properties_dynamic_groups(const uint8_t *data,
     return dyn;
 }
 
-static moq_result_t d16_encode_publish_ok_op(moq_session_t *s,
-                                               moq_buf_writer_t *w,
-                                               uint64_t request_id,
-                                               uint8_t subscriber_priority,
-                                               uint8_t group_order,
-                                               bool has_new_group_request,
-                                               uint64_t new_group_request)
+static moq_result_t d16_encode_publish_ok_op(
+    moq_session_t *s, moq_buf_writer_t *w,
+    const moq_publish_ok_encode_args_t *args)
 {
     (void)s;
-    moq_kvp_entry_t params[4];
+    /* Ascending type order: FORWARD 0x10, SUBSCRIBER_PRIORITY 0x20,
+     * SUBSCRIPTION_FILTER 0x21, GROUP_ORDER 0x22, NEW_GROUP_REQUEST 0x32. */
+    moq_kvp_entry_t params[5];
     size_t param_count = 0;
     uint8_t param_bufs[4][16];
+    size_t pbi = 0;
+    /* type varint + up to three 8-byte location varints. */
+    uint8_t filter_buf[32];
 
-    if (subscriber_priority != 128) {
-        size_t n = moq_quic_varint_encode(subscriber_priority,
-                                           param_bufs[param_count], 16);
+    /* PUBLISH_OK FORWARD: omission defaults to 1 (§9.2.2.8 -- only
+     * REQUEST_UPDATE means "unchanged"), so only 0 is worth sending, same as
+     * SUBSCRIBE. args->forward carries the effective value. */
+    if (args->has_forward && !args->forward) {
+        size_t n = moq_quic_varint_encode(0, param_bufs[pbi], 16);
+        params[param_count] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_FORWARD,
+            .value = param_bufs[pbi], .value_len = n,
+            .is_varint = true, .raw = NULL, .raw_len = 0 };
+        param_count++; pbi++;
+    }
+    if (args->subscriber_priority != 128) {
+        size_t n = moq_quic_varint_encode(args->subscriber_priority,
+                                           param_bufs[pbi], 16);
         params[param_count] = (moq_kvp_entry_t){
             .type = MOQ_MSG_PARAM_SUBSCRIBER_PRIORITY,
-            .value = param_bufs[param_count], .value_len = n,
+            .value = param_bufs[pbi], .value_len = n,
             .is_varint = true, .raw = NULL, .raw_len = 0 };
+        param_count++; pbi++;
+    }
+    if (args->has_filter) {
+        moq_d16_subscription_filter_t f = {
+            .filter_type = args->filter,
+            .start_group = args->start_group,
+            .start_object = args->start_object,
+            .end_group = args->end_group,
+        };
+        size_t flen = 0;
+        moq_result_t frc = moq_d16_encode_subscription_filter(
+            filter_buf, sizeof(filter_buf), &flen, &f);
+        if (frc < 0) return frc;
+        params[param_count] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
+            .value = filter_buf, .value_len = flen,
+            .is_varint = false, .raw = NULL, .raw_len = 0 };
         param_count++;
     }
-    if (group_order != MOQ_GROUP_ORDER_DEFAULT) {
-        size_t n = moq_quic_varint_encode(group_order,
-                                           param_bufs[param_count], 16);
+    if (args->group_order != MOQ_GROUP_ORDER_DEFAULT) {
+        size_t n = moq_quic_varint_encode(args->group_order,
+                                           param_bufs[pbi], 16);
         params[param_count] = (moq_kvp_entry_t){
             .type = MOQ_MSG_PARAM_GROUP_ORDER,
-            .value = param_bufs[param_count], .value_len = n,
+            .value = param_bufs[pbi], .value_len = n,
             .is_varint = true, .raw = NULL, .raw_len = 0 };
-        param_count++;
+        param_count++; pbi++;
     }
-    if (has_new_group_request) {                     /* 0x32, last in order */
-        size_t n = moq_quic_varint_encode(new_group_request,
-                                           param_bufs[param_count], 16);
+    if (args->has_new_group_request) {               /* 0x32, last in order */
+        size_t n = moq_quic_varint_encode(args->new_group_request,
+                                           param_bufs[pbi], 16);
         params[param_count] = (moq_kvp_entry_t){
             .type = MOQ_MSG_PARAM_NEW_GROUP_REQUEST,
-            .value = param_bufs[param_count], .value_len = n,
+            .value = param_bufs[pbi], .value_len = n,
             .is_varint = true, .raw = NULL, .raw_len = 0 };
-        param_count++;
+        param_count++; pbi++;
     }
-    return moq_d16_encode_publish_ok(w, request_id, params, param_count);
+    return moq_d16_encode_publish_ok(w, args->request_id, params, param_count);
 }
 
 static moq_result_t d16_encode_publish_done_op(moq_session_t *s,
@@ -4533,6 +4766,7 @@ static const moq_profile_ops_t d16_ops = {
     .encode_subscribe       = d16_encode_subscribe,
     .encode_subscribe_ok    = d16_encode_subscribe_ok,
     .encode_request_ok      = d16_encode_request_ok,
+    .encode_request_update_ok = d16_encode_request_update_ok,
     .encode_request_error   = d16_encode_request_error,
     .encode_request_update  = d16_encode_request_update_op,
     .encode_unsubscribe     = d16_encode_unsubscribe,
@@ -4549,6 +4783,7 @@ static const moq_profile_ops_t d16_ops = {
     .encode_goaway          = d16_encode_goaway,
     .encode_publish         = d16_encode_publish_op,
     .track_properties_dynamic_groups = d16_track_properties_dynamic_groups,
+    .scan_delivery_timeouts = d16_scan_delivery_timeouts,
     .encode_publish_ok      = d16_encode_publish_ok_op,
     .encode_publish_done    = d16_encode_publish_done_op,
     .encode_publish_namespace       = d16_encode_publish_namespace_op,
@@ -4575,6 +4810,7 @@ static const moq_profile_ops_t d16_ops = {
      * unidirectional stream as data and never invokes the request-stream
      * validator). */
     .uses_request_streams            = false,
+    .location_varint_max             = MOQ_QUIC_VARINT_MAX,
     .fetch_descending_supported      = true,   /* absolute Group IDs on the wire */
     .uses_uni_control_channel        = false,
     .classify_uni_stream             = NULL,

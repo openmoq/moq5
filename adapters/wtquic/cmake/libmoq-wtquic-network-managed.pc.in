@@ -1,0 +1,23 @@
+# pkg-config for the managed Network.framework MoQ client
+# (<moq/wtquic_network_managed.h>). APPLE ONLY.
+#
+# Relocatable: prefix is derived from this file's own location, so it is
+# correct regardless of the install --prefix. The up-path is computed
+# from CMAKE_INSTALL_LIBDIR depth.
+#
+# The transitive dependencies are expressed through pkg-config
+# (Requires: libmoq-wtquic wtquic-network), so both install prefixes
+# must be on PKG_CONFIG_PATH; wtquic-network.pc carries the Apple
+# framework link flags. CMake (find_package(libmoq COMPONENTS
+# adapter-wtquic-network-managed)) is the fully supported consumer
+# path.
+prefix=${pcfiledir}/@LIBMOQ_WTQUIC_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq-wtquic-network-managed
+Description: Managed MoQ client over wtquic Network.framework
+Version: @PROJECT_VERSION@
+Requires: wtquic-network
+Libs: -L${libdir} -lmoq-adapter-wtquic-network-managed -lmoq-adapter-wtquic -lmoq-core
+Cflags: -I${includedir}

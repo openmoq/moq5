@@ -316,9 +316,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* 3. Attach a sender (live preset: DROP_TO_KEYFRAME). */
+    /* 3. Attach a sender (live preset: DROP_TO_KEYFRAME) in PUSH mode:
+     * publish_tracks is an APPENDED cfg field, so the sized preset init is
+     * required for the sender to read it. */
     moq_media_sender_cfg_t scfg;
-    moq_media_sender_cfg_init_live(&scfg);
+    moq_media_sender_cfg_init_live_sized(&scfg, sizeof(scfg));
+    scfg.publish_tracks = true;           /* PUBLISH tracks + live catalog */
     scfg.endpoint = NULL;                 /* attach mode: we own ep above */
     scfg.namespace_.parts = ns_parts;
     scfg.namespace_.count = ns_count;

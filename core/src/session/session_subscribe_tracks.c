@@ -92,24 +92,6 @@ bool track_sub_prefix_conflicts(moq_session_t *s, const moq_bytes_t *parts,
 
 /* -- Copy namespace into output scratch ---------------------------- */
 
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                   const moq_namespace_t *src,
-                                   moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts && src->count > 0) return false;
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* Emit a terminal REQUEST_ERROR + FIN for a pre-commit reject on the request
  * bidi, retiring the bidi via the drain ring when the requester has not yet
  * closed its half. Mirrors the track-status reject path. */

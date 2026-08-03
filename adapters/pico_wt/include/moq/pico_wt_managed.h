@@ -180,9 +180,34 @@ typedef struct moq_pico_wt_managed_cfg {
      * NULL: no negotiation either way (legacy draft-16 behavior). */
     const char        *wt_protocols;
 
+    /* Appended (struct_size append-only ABI, read as ONE block through
+     * app_deadline_ctx). Optional application service-deadline query: returns
+     * the app's earliest pending time-based deadline in this facade's clock
+     * domain (µs), or UINT64_MAX for none. Consulted after each pump to fold
+     * into the packet loop's next wake, so a purely time-based service deadline
+     * (e.g. a periodic catalog refresh) wakes an otherwise-idle managed loop.
+     * MUST be pure/non-blocking and MUST NOT re-enter the facade. NULL = none.
+     * The fold happens only during a pump, so when application state changes
+     * the value this query would return, the owner MUST issue a facade wake
+     * (moq_pico_wt_managed_wake) so the next pump recomputes the next-wake time;
+     * an idle loop will not observe the new deadline on its own.
+     * Set it after either initializer: moq_pico_wt_managed_cfg_init stamps the
+     * full current struct, and moq_pico_wt_managed_cfg_init_sized(cfg, sizeof)
+     * does too; the block is read only when struct_size covers through
+     * app_deadline_ctx. */
+    uint64_t         (*app_deadline_us)(void *ctx);
+    void              *app_deadline_ctx;
+
 } moq_pico_wt_managed_cfg_t;
 
+/* Pointer initializer: clears and stamps the full current struct; set any field,
+ * including the appended app_deadline block, directly afterward. */
 MOQ_API void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg);
+
+/* Explicit caller-sized initializer: clears and stamps
+ * min(cfg_size, this library's struct size). */
+MOQ_API void moq_pico_wt_managed_cfg_init_sized(moq_pico_wt_managed_cfg_t *cfg,
+                                                size_t cfg_size);
 
 /* -- Lifecycle ---------------------------------------------------- */
 

@@ -10,6 +10,8 @@
 #include <moq/codec.h>
 #include "test_support.h"
 #include "test_session_support.h"
+#include "../support/failpoint.h"
+#include "../support/txn_snapshot.h"
 #include "../../core/src/session/session_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,6 +145,12 @@ static moq_result_t setup_subscriber(moq_session_t *c,
     return MOQ_OK;
 }
 
+/* The namespace-subscription slot keyed to `ref`, or -1. */
+static int ns_slot_for(moq_session_t *s, moq_stream_ref_t ref)
+{
+    return moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v);
+}
+
 /* -- Drain helper -------------------------------------------------- */
 
 #define DRAIN_BOTH(c, sv) do { \
@@ -156,6 +164,289 @@ static moq_result_t setup_subscriber(moq_session_t *c,
     while ((_na = moq_session_poll_actions(sv, _a, 8)) > 0) \
         for (size_t _i = 0; _i < _na; _i++) moq_action_cleanup(&_a[_i]); \
 } while (0)
+
+/* -- Failpoint fixtures and hooks for the NAMESPACE response op ----- */
+
+/* Occupancy across all seven request/subscription pools. The
+ * request-id sequence counters live in profile-private state a test
+ * cannot reach, so id non-advancement is proven behaviorally instead:
+ * this operation consumes no request id at all (the subscription's id was
+ * assigned at subscribe time), which occupancy + owner generation pin. */
+static int ns_registry_busy(const moq_session_t *s)
+{
+    int n = 0;
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].state != MOQ_SUB_FREE) n++;
+    for (size_t i = 0; i < s->fetch_cap; i++)
+        if (s->fetches[i].state != MOQ_FETCH_FREE) n++;
+    for (size_t i = 0; i < s->ann_cap; i++)
+        if (s->announcements[i].state != MOQ_ANN_FREE) n++;
+    for (size_t i = 0; i < s->ts_cap; i++)
+        if (s->track_statuses[i].state != MOQ_TS_FREE) n++;
+    for (size_t i = 0; i < s->pub_cap; i++)
+        if (s->publishes[i].state != MOQ_PUB_FREE) n++;
+    for (size_t i = 0; i < s->ns_sub_cap; i++)
+        if (s->ns_subs[i].state != MOQ_NS_SUB_FREE) n++;
+    for (size_t i = 0; i < s->track_sub_cap; i++)
+        if (s->track_subs[i].state != MOQ_TRACK_SUB_FREE) n++;
+    return n;
+}
+
+/* Operation-specific snapshot per the mutation inventory: tracker
+ * presence/identity/flag, the buffered response bytes, and
+ * request-registry occupancy. The tracked set's interior scalars (count,
+ * cap, counted bytes) live in a type PRIVATE to the implementation file,
+ * so they are covered without layout assumptions: counted bytes through
+ * the receive budget in the generic snapshot, and every interior scalar
+ * through the opaque byte snapshot of the tracker block where one
+ * pre-exists (the grow fixture). */
+typedef struct ns_hook_state {
+    bool     tracker_present;
+    const void *tracker;          /* same-run identity; not cross-run */
+    bool     tracker_inbound;
+    size_t   recv_len;
+    size_t   send_len;
+    int      registry_busy;
+} ns_hook_state_t;
+
+typedef struct ns_hook_ctx {
+    int      slot;
+    uint64_t h_opaque;   /* the subscription handle, for run-portable
+                          * normalization: a handle carries a per-session
+                          * tag, so records store "same handle as the
+                          * fixture's subscription", never the raw value */
+} ns_hook_ctx_t;
+
+static void ns_hook_capture(const moq_session_t *s, void *vctx, void *vst)
+{
+    const ns_hook_ctx_t *ctx = (const ns_hook_ctx_t *)vctx;
+    ns_hook_state_t *st = (ns_hook_state_t *)vst;
+    memset(st, 0, sizeof(*st));
+    const void *set = s->ns_subs[ctx->slot].announced_suffixes;
+    st->tracker_present = set != NULL;
+    st->tracker = set;
+    st->tracker_inbound = s->ns_subs[ctx->slot].announced_suffixes_inbound;
+    st->recv_len = s->ns_subs[ctx->slot].recv_len;
+    st->send_len = s->send_len;
+    st->registry_busy = ns_registry_busy(s);
+}
+
+/* Same-run check: every field including pointer identity. */
+static int ns_hook_check(const moq_session_t *s, void *vctx, const void *vst)
+{
+    const ns_hook_state_t *want = (const ns_hook_state_t *)vst;
+    ns_hook_state_t now;
+    ns_hook_capture(s, vctx, &now);
+    int bad = 0;
+#define NS_HF(f, fmt) do { \
+        if (now.f != want->f) { \
+            fprintf(stderr, "TXN ns-hook: " #f " " fmt ", expected " fmt \
+                    "\n", now.f, want->f); \
+            bad++; \
+        } \
+    } while (0)
+    NS_HF(tracker_present, "%d");
+    NS_HF(tracker, "%p");
+    NS_HF(tracker_inbound, "%d");
+    NS_HF(recv_len, "%zu");
+    NS_HF(send_len, "%zu");
+    NS_HF(registry_busy, "%d");
+#undef NS_HF
+    return bad;
+}
+
+/* Cross-run check: values only -- pointer identity differs between runs. */
+static int ns_hook_check_values(const moq_session_t *s, void *vctx,
+                                const void *vst)
+{
+    const ns_hook_state_t *want = (const ns_hook_state_t *)vst;
+    ns_hook_state_t now;
+    ns_hook_capture(s, vctx, &now);
+    int bad = 0;
+#define NS_HF(f, fmt) do { \
+        if (now.f != want->f) { \
+            fprintf(stderr, "TXN ns-final: " #f " " fmt ", expected " fmt \
+                    "\n", now.f, want->f); \
+            bad++; \
+        } \
+    } while (0)
+    NS_HF(tracker_present, "%d");
+    NS_HF(tracker_inbound, "%d");
+    NS_HF(recv_len, "%zu");
+    NS_HF(send_len, "%zu");
+    NS_HF(registry_busy, "%d");
+#undef NS_HF
+    return bad;
+}
+
+/* Normalize one event of this operation's flow into its full semantic
+ * image: handle, then the complete suffix structure (count, each part's
+ * length and bytes). An event kind without a normalizer is a test failure
+ * -- new output must be covered, never silently kind-only. */
+static bool ns_norm_event(const moq_event_t *ev, void *vctx,
+                          txs_norm_vec_t *out)
+{
+    const ns_hook_ctx_t *ctx = (const ns_hook_ctx_t *)vctx;
+    txs_img_t img;
+    txs_img_init(&img);
+    switch (ev->kind) {
+    case MOQ_EVENT_NAMESPACE_FOUND:
+    case MOQ_EVENT_NAMESPACE_GONE: {
+        const moq_namespace_t *ns =
+            ev->kind == MOQ_EVENT_NAMESPACE_FOUND
+                ? &ev->u.namespace_found.track_namespace_suffix
+                : &ev->u.namespace_gone.track_namespace_suffix;
+        uint64_t handle = ev->kind == MOQ_EVENT_NAMESPACE_FOUND
+                ? ev->u.namespace_found.handle._opaque
+                : ev->u.namespace_gone.handle._opaque;
+        txs_img_u64(&img, handle == ctx->h_opaque);
+        txs_img_u64(&img, (uint64_t)ns->count);
+        for (size_t i = 0; i < ns->count; i++)
+            txs_img_bytes(&img, ns->parts[i].data, ns->parts[i].len);
+        break;
+    }
+    case MOQ_EVENT_NS_SUB_OK:
+        txs_img_u64(&img, ev->u.ns_sub_ok.handle._opaque == ctx->h_opaque);
+        break;
+    case MOQ_EVENT_GOAWAY:
+        txs_img_bytes(&img, ev->u.goaway.new_session_uri.data,
+                      ev->u.goaway.new_session_uri.len);
+        break;
+    default:
+        fprintf(stderr, "TXN ns-norm: unnormalized event kind %d\n",
+                (int)ev->kind);
+        return false;
+    }
+    return txs_norm_append_img(out, (uint64_t)ev->kind, &img);
+}
+
+/* Normalize one action: kind, stream ref, and the full payload bytes.
+ * An unnormalized kind is a failure for the same reason as above. */
+static bool ns_norm_action(const moq_action_t *a, void *vctx,
+                           txs_norm_vec_t *out)
+{
+    (void)vctx;
+    txs_img_t img;
+    txs_img_init(&img);
+    switch (a->kind) {
+    case MOQ_ACTION_SEND_CONTROL:
+        txs_img_bytes(&img, a->u.send_control.data, a->u.send_control.len);
+        break;
+    case MOQ_ACTION_OPEN_BIDI_STREAM:
+        txs_img_u64(&img, a->u.open_bidi_stream.stream_ref._v);
+        txs_img_u64(&img, a->u.open_bidi_stream.fin);
+        txs_img_bytes(&img, a->u.open_bidi_stream.data,
+                      a->u.open_bidi_stream.len);
+        break;
+    case MOQ_ACTION_SEND_BIDI_STREAM:
+        txs_img_u64(&img, a->u.send_bidi_stream.stream_ref._v);
+        txs_img_u64(&img, a->u.send_bidi_stream.fin);
+        txs_img_bytes(&img, a->u.send_bidi_stream.data,
+                      a->u.send_bidi_stream.len);
+        break;
+    case MOQ_ACTION_CLOSE_BIDI_STREAM:
+        txs_img_u64(&img, a->u.close_bidi_stream.stream_ref._v);
+        break;
+    default:
+        fprintf(stderr, "TXN ns-norm: unnormalized action kind %d\n",
+                (int)a->kind);
+        return false;
+    }
+    return txs_norm_append_img(out, 0x1000u + (uint64_t)a->kind, &img);
+}
+
+/* The registered hook set for this operation: the sweep reaches capture,
+ * check and the normalizers only through this instance. */
+static txs_op_hooks_t ns_make_hooks(ns_hook_ctx_t *hctx)
+{
+    txs_op_hooks_t h;
+    memset(&h, 0, sizeof(h));
+    h.ctx = hctx;
+    h.capture = ns_hook_capture;
+    h.check = ns_hook_check;
+    h.check_values = ns_hook_check_values;
+    h.normalize_event = ns_norm_event;
+    h.normalize_action = ns_norm_action;
+    return h;
+}
+
+/* Drain and normalize everything the CLIENT produced, events then
+ * actions, in poll order, through the registered normalizers. Returns the
+ * number of failed appends. */
+static int ns_collect_output(moq_session_t *c, const txs_op_hooks_t *h,
+                             txs_norm_vec_t *out)
+{
+    int bad = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(c, &ev, 1) > 0) {
+        if (!h->normalize_event(&ev, h->ctx, out)) bad++;
+        moq_event_cleanup(&ev);
+    }
+    moq_action_t a;
+    while (moq_session_poll_actions(c, &a, 1) > 0) {
+        if (!h->normalize_action(&a, h->ctx, out)) bad++;
+        moq_action_cleanup(&a);
+    }
+    return bad;
+}
+
+/* One fixture: an fp-backed pair with an established namespace
+ * subscription. tiny_events = a one-slot event queue with the scratch-free
+ * NS_SUB_OK left queued (the pre-admission state); otherwise the queue is
+ * drained. */
+typedef struct ns_fx {
+    fp_alloc_state_t fs;
+    moq_session_t *c, *sv;
+    moq_ns_sub_handle_t h;
+    moq_stream_ref_t ref;
+    uint64_t rid;
+    int slot;
+} ns_fx_t;
+
+static int ns_fx_setup(ns_fx_t *f, bool tiny_events)
+{
+    memset(f, 0, sizeof(*f));
+    moq_alloc_t alloc = fp_allocator(&f->fs);
+    moq_session_cfg_t tiny = MOQ_SESSION_CFG_INIT;
+    tiny.alloc = &alloc;
+    tiny.max_events = 1;
+    establish_pair(&alloc, 64, 64, &f->c, &f->sv,
+                   tiny_events ? &tiny : NULL, NULL);
+    if (!f->c || !f->sv) return 1;
+    setup_subscriber(f->c, &f->h, &f->ref, &f->rid);
+    uint8_t ok[128];
+    size_t oklen = encode_request_ok(ok, sizeof(ok), f->rid);
+    moq_session_on_bidi_stream_bytes(f->c, f->ref, ok, oklen, false, 0);
+    if (!tiny_events) {
+        moq_event_t ev;
+        while (moq_session_poll_events(f->c, &ev, 1) > 0)
+            moq_event_cleanup(&ev);
+    }
+    f->slot = ns_slot_for(f->c, f->ref);
+    return f->slot < 0;
+}
+
+/* Tear down and require the allocator's terminal facts: clean sticky
+ * flags, destroy-to-zero for balance, live bytes and table occupancy. */
+static int ns_fx_teardown(ns_fx_t *f, const char *op)
+{
+    int bad = 0;
+    moq_event_t ev; moq_action_t a;
+    while (moq_session_poll_events(f->c, &ev, 1) > 0) moq_event_cleanup(&ev);
+    while (moq_session_poll_events(f->sv, &ev, 1) > 0) moq_event_cleanup(&ev);
+    while (moq_session_poll_actions(f->c, &a, 1) > 0) moq_action_cleanup(&a);
+    while (moq_session_poll_actions(f->sv, &a, 1) > 0) moq_action_cleanup(&a);
+    bad += fp_sticky_clean(&f->fs, op);
+    moq_session_destroy(f->c);
+    moq_session_destroy(f->sv);
+    if (f->fs.balance != 0 || f->fs.live_bytes != 0 || f->fs.table_len != 0) {
+        fprintf(stderr, "FAILPOINT %s: destroy left balance %lld, "
+                "live %lld, table %zu\n", op, (long long)f->fs.balance,
+                (long long)f->fs.live_bytes, f->fs.table_len);
+        bad++;
+    }
+    return bad;
+}
 
 int main(void)
 {
@@ -3508,6 +3799,723 @@ int main(void)
         moq_session_destroy(c);
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == Failpoint harness self-checks ================================
+     * The allocator is itself an oracle, so its own contract is pinned
+     * before anything relies on it: recorded sizes govern accounting,
+     * unknown pointers are refused (never delegated to libc), every
+     * violation latches a named sticky flag, and the map/delta helpers
+     * detect what they claim to. */
+    {
+        /* Wrong-size free: recorded size governs, sticky flag latches. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            void *p = al.alloc(16, al.ctx);
+            MOQ_TEST_CHECK(p != NULL);
+            al.free(p, 99, al.ctx);
+            MOQ_TEST_CHECK(fs.balance == 0);
+            MOQ_TEST_CHECK(fs.live_bytes == 0);
+            MOQ_TEST_CHECK(fs.sticky_size_mismatch != 0);
+        }
+        /* Unknown free: refused, accounted nothing, no crash. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            int local;
+            al.free(&local, 4, al.ctx);
+            MOQ_TEST_CHECK(fs.balance == 0);
+            MOQ_TEST_CHECK(fs.live_bytes == 0);
+            MOQ_TEST_CHECK(fs.sticky_unknown_ptr != 0);
+        }
+        /* Unknown realloc: refused with NULL, sticky latched. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            int local;
+            MOQ_TEST_CHECK(al.realloc(&local, 4, 8, al.ctx) == NULL);
+            MOQ_TEST_CHECK(fs.sticky_unknown_ptr != 0);
+            MOQ_TEST_CHECK(fs.balance == 0);
+        }
+        /* Wrong old_size on realloc: recorded size governs live bytes. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            void *p = al.alloc(16, al.ctx);
+            void *q = al.realloc(p, 4 /* wrong */, 32, al.ctx);
+            MOQ_TEST_CHECK(q != NULL);
+            MOQ_TEST_CHECK(fs.sticky_size_mismatch != 0);
+            MOQ_TEST_CHECK(fs.live_bytes == 32);
+            al.free(q, 32, al.ctx);
+            MOQ_TEST_CHECK(fs.live_bytes == 0 && fs.balance == 0);
+        }
+        /* Map equality detects an added block; the signed delta names it. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            void *a = al.alloc(10, al.ctx);
+            fp_map_snap_t snap;
+            fp_map_capture(&fs, &snap);
+            void *b = al.alloc(20, al.ctx);
+            fp_quiet = 1;
+            MOQ_TEST_CHECK(fp_map_equals(&fs, &snap, "selfcheck") == 1);
+            fp_quiet = 0;
+            fp_delta_t d;
+            fp_delta_compute(&fs, &snap, &d);
+            MOQ_TEST_CHECK(d.added_n == 1 && d.added[0] == 20);
+            MOQ_TEST_CHECK(d.removed_n == 0);
+            MOQ_TEST_CHECK(d.count_delta == 1 && d.byte_delta == 20);
+            al.free(a, 10, al.ctx);
+            fp_delta_compute(&fs, &snap, &d);
+            MOQ_TEST_CHECK(d.added_n == 1 && d.removed_n == 1 &&
+                           d.removed[0] == 10);
+            al.free(b, 20, al.ctx);
+            MOQ_TEST_CHECK(fs.sticky_size_mismatch == 0 &&
+                           fs.sticky_unknown_ptr == 0);
+        }
+        /* Attempt-log overflow latches instead of truncating silently. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            void *ptrs[FP_LOG_CAP + 1];
+            for (size_t i = 0; i < FP_LOG_CAP + 1; i++)
+                ptrs[i] = al.alloc(8, al.ctx);
+            MOQ_TEST_CHECK(fs.sticky_log_overflow != 0);
+            for (size_t i = 0; i < FP_LOG_CAP + 1; i++)
+                al.free(ptrs[i], 8, al.ctx);
+            MOQ_TEST_CHECK(fs.balance == 0);
+        }
+        /* Table overflow REFUSES the allocation before malloc: a block the
+         * table could not track could never round-trip the wrapper. */
+        {
+            static fp_alloc_state_t fs;
+            memset(&fs, 0, sizeof(fs));
+            moq_alloc_t al = fp_allocator(&fs);
+            static void *ptrs[FP_TABLE_CAP];
+            fs.log_from = UINT64_MAX;    /* logging off: table test only */
+            for (size_t i = 0; i < FP_TABLE_CAP; i++) {
+                ptrs[i] = al.alloc(1, al.ctx);
+                MOQ_TEST_CHECK(ptrs[i] != NULL);
+            }
+            MOQ_TEST_CHECK(al.alloc(1, al.ctx) == NULL);
+            MOQ_TEST_CHECK(fs.sticky_table_overflow != 0);
+            MOQ_TEST_CHECK(fs.balance == FP_TABLE_CAP);
+            for (size_t i = 0; i < FP_TABLE_CAP; i++)
+                al.free(ptrs[i], 1, al.ctx);
+            MOQ_TEST_CHECK(fs.balance == 0);
+        }
+        /* Signature/prefix bounds and declaration errors are refusals, not
+         * reads past the log; negative expectations run under the quiet
+         * flag so a passing run prints nothing alarming. */
+        {
+            fp_alloc_state_t fs = {0};
+            moq_alloc_t al = fp_allocator(&fs);
+            void *p = al.alloc(8, al.ctx);
+            static const fp_expect_t one[1] = {
+                { FP_ALLOC, FP_SIZE_EXACT, 8, 0 },
+            };
+            static const fp_expect_t bad_ref[1] = {
+                { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },  /* refs itself */
+            };
+            fp_quiet = 1;
+            MOQ_TEST_CHECK(fp_check_signature(&fs, fs.log_len + 1, one, 1,
+                                              "selfcheck") == 1);
+            MOQ_TEST_CHECK(fp_check_prefix(&fs, fs.log_len + 1, NULL, 0,
+                                           "selfcheck") == 1);
+            MOQ_TEST_CHECK(fp_check_signature(&fs, 0, bad_ref, 1,
+                                              "selfcheck") == 1);
+            fp_quiet = 0;
+            MOQ_TEST_CHECK(fp_check_signature(&fs, 0, one, 1,
+                                              "selfcheck") == 0);
+            al.free(p, 8, al.ctx);
+            MOQ_TEST_CHECK(fs.balance == 0);
+        }
+        /* Two identical UNRESOLVED owner records must never compare
+         * equal: incomparable is a failure, not a vacuous pass. */
+        {
+            txs_owner_t a = { -1000 - 7, 3, 1, 1, 1 };
+            txs_owner_t b = a;
+            txs_quiet = 1;
+            MOQ_TEST_CHECK(txs_owner_equals(&a, &b, "selfcheck") == 1);
+            txs_quiet = 0;
+            txs_owner_t c = { TXS_OWNER_NONE, -1, -1, 0, 0 };
+            txs_owner_t d = c;
+            MOQ_TEST_CHECK(txs_owner_equals(&c, &d, "selfcheck") == 0);
+        }
+    }
+
+    /* == Suffix tracking is all-or-nothing under allocation failure ====
+     * Handling one NAMESPACE response allocates, in this order: the
+     * canonical suffix key, the tracker object on first use, the stored key
+     * copy, and the key array. Any of them failing must report NOMEM --
+     * never a wait -- and leave the subscription exactly as it was, with
+     * the buffered response bytes retained so an ordinary empty re-feed
+     * replays the message once memory is available.
+     *
+     * Every ordinal is swept on its OWN fixture and drives its OWN
+     * recovery-equivalence cycle against the baseline run: same ordered
+     * normalized output (events and actions, full semantic fields), same
+     * final generic snapshot and operation-hook values, same allocation
+     * footprint. The declared outcome table below is machine-checked: the
+     * signature's attempt count must equal the table's row count, and each
+     * row selects the recovery its ordinal must prove.
+     *
+     * Mutation inventory (the fields a NAMESPACE response may durably
+     * touch): the entry's tracker pointer + inbound flag, the tracked
+     * set's interior scalars (private type -- covered by the receive
+     * budget and, where a tracker pre-exists, the opaque block snapshot),
+     * s->recv_payload_bytes, the event queue + event scratch, and the
+     * entry's buffered response bytes. Entry state/generation, actions,
+     * registry occupancy and request-id consumption must never move; the
+     * generic snapshot and the ns hooks cover those. */
+    {
+        /* Canonical key encoding: [count u8][u16 len][bytes] per part; a
+         * one-part 5-byte suffix ("found") keys as 8 bytes, a 2-byte one as
+         * 5. Stated from the documented stored encoding, not read back. */
+        static const fp_expect_t k_first_sig[4] = {
+            { FP_ALLOC, FP_SIZE_EXACT, 8, 0 },      /* canonical key */
+            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tracker (private) */
+            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy */
+            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* key array (private) */
+        };
+        static const fp_outcome_row_t k_first_out[4] = {
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+        };
+        static const fp_expect_t k_grow_sig[3] = {
+            { FP_ALLOC, FP_SIZE_EXACT, 5, 0 },      /* canonical key ("ee") */
+            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy */
+            { FP_REALLOC_GROW, FP_SIZE_ANY, 0, 0 }, /* key-array growth */
+        };
+        static const fp_outcome_row_t k_grow_out[3] = {
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+        };
+        static const char *k_four[4] = { "aa", "bb", "cc", "dd" };
+
+        /* Baseline evidence for the first-suffix insert. */
+        fp_attempt_t   base_log[FP_LOG_CAP];
+        txs_norm_vec_t base_out;
+        txs_snapshot_t base_final;
+        ns_hook_state_t base_hook;
+        fp_delta_t     base_delta;
+        size_t         base_budget_delta = 0;
+        txs_norm_init(&base_out);
+
+        {
+            ns_fx_t f;
+            MOQ_TEST_CHECK(ns_fx_setup(&f, false) == 0);
+            ns_hook_ctx_t hctx = { f.slot, f.h._opaque };
+            txs_op_hooks_t hooks = ns_make_hooks(&hctx);
+
+            fp_map_snap_t pre_op;
+            fp_map_capture(&f.fs, &pre_op);
+            size_t budget0 = f.c->recv_payload_bytes;
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+
+            uint8_t msg[256];
+            size_t mlen = encode_namespace_msg(msg, sizeof(msg),
+                                               MOQ_D16_NAMESPACE, "found");
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg, mlen,
+                                                      false, 0),
+                (int)MOQ_OK);
+            failures += fp_check_signature(&f.fs, 0, k_first_sig, 4,
+                                           "ns-baseline");
+            memcpy(base_log, f.fs.log, f.fs.log_len * sizeof(fp_attempt_t));
+            MOQ_TEST_CHECK_EQ_SIZE(f.fs.log_len, 4u);
+            /* The outcome table is total over the signature: one declared
+             * row per attempt, or the sweep must not run. */
+            MOQ_TEST_CHECK_EQ_SIZE(sizeof(k_first_out) / sizeof(k_first_out[0]),
+                                   f.fs.log_len);
+
+            failures += ns_collect_output(f.c, &hooks, &base_out);
+            txs_capture(f.c, &f.ref, 1, &base_final);
+            hooks.capture(f.c, hooks.ctx, &base_hook);
+            fp_delta_compute(&f.fs, &pre_op, &base_delta);
+            base_budget_delta = f.c->recv_payload_bytes - budget0;
+            MOQ_TEST_CHECK(base_budget_delta > 0);
+            failures += ns_fx_teardown(&f, "ns-baseline");
+        }
+
+        /* -- The fifth insert against a full key array ------------------
+         * Baseline plus one FRESH fixture per origin, each with its own
+         * recovery cycle. The tracker pre-exists here, so the failure
+         * contract "the set is exactly as it was on entry" is pinned by an
+         * OPAQUE BYTE SNAPSHOT of the tracker block over its
+         * allocator-recorded size: every interior scalar -- count and cap
+         * included -- must hold, and a divergence names the first
+         * differing byte offset. */
+        fp_attempt_t   grow_log[FP_LOG_CAP];
+        txs_norm_vec_t grow_out;
+        txs_snapshot_t grow_final;
+        ns_hook_state_t grow_hook;
+        fp_delta_t     grow_delta;
+        txs_norm_init(&grow_out);
+
+        for (int origin = 0; origin <= 3; origin++) {
+            /* origin 0 is the baseline; 1..3 are the swept ordinals. */
+            ns_fx_t f;
+            MOQ_TEST_CHECK(ns_fx_setup(&f, false) == 0);
+            ns_hook_ctx_t hctx = { f.slot, f.h._opaque };
+            txs_op_hooks_t hooks = ns_make_hooks(&hctx);
+            moq_event_t ev;
+
+            for (int i = 0; i < 4; i++) {
+                uint8_t m[256];
+                size_t l = encode_namespace_msg(m, sizeof(m),
+                                                MOQ_D16_NAMESPACE, k_four[i]);
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, m, l,
+                                                          false, 0),
+                    (int)MOQ_OK);
+                MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 1);
+                MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NAMESPACE_FOUND);
+                moq_event_cleanup(&ev);
+            }
+            /* One no-op advancing call recycles the arena: the cursor a
+             * failing call must restore is the one it STARTS from. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(f.c->event_scratch_len, 0u);
+
+            void *set_before = f.c->ns_subs[f.slot].announced_suffixes;
+            MOQ_TEST_CHECK(set_before != NULL);
+            int ti = fp_table_find(&f.fs, set_before);
+            MOQ_TEST_CHECK(ti >= 0);
+            size_t tracker_size = f.fs.table[ti].size;
+            uint8_t tracker_image[128];
+            MOQ_TEST_CHECK(tracker_size <= sizeof(tracker_image));
+            memcpy(tracker_image, set_before, tracker_size);
+
+            fp_map_snap_t m0;
+            fp_map_capture(&f.fs, &m0);
+            txs_snapshot_t s0;
+            txs_capture(f.c, &f.ref, 1, &s0);
+            ns_hook_state_t h0;
+            hooks.capture(f.c, hooks.ctx, &h0);
+            size_t budget0 = f.c->recv_payload_bytes;
+
+            uint8_t msg[256];
+            size_t mlen = encode_namespace_msg(msg, sizeof(msg),
+                                               MOQ_D16_NAMESPACE, "ee");
+            if (origin == 0) {
+                f.fs.log_from = f.fs.call_count;
+                f.fs.log_len = 0;
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg,
+                                                          mlen, false, 0),
+                    (int)MOQ_OK);
+                failures += fp_check_signature(&f.fs, 0, k_grow_sig, 3,
+                                               "ns-grow-baseline");
+                memcpy(grow_log, f.fs.log,
+                       f.fs.log_len * sizeof(fp_attempt_t));
+                MOQ_TEST_CHECK_EQ_SIZE(
+                    sizeof(k_grow_out) / sizeof(k_grow_out[0]),
+                    f.fs.log_len);
+                failures += ns_collect_output(f.c, &hooks, &grow_out);
+                txs_capture(f.c, &f.ref, 1, &grow_final);
+                hooks.capture(f.c, hooks.ctx, &grow_hook);
+                fp_delta_compute(&f.fs, &m0, &grow_delta);
+                MOQ_TEST_CHECK(f.c->recv_payload_bytes > budget0);
+            } else {
+                uint64_t k = (uint64_t)origin;
+                const fp_outcome_row_t *row = &k_grow_out[k - 1];
+                MOQ_TEST_CHECK(row->phase == FP_PHASE_PRE_COMMIT);
+                MOQ_TEST_CHECK(row->outcome == FP_NOMEM_RETAIN);
+
+                f.fs.log_from = f.fs.call_count;
+                f.fs.log_len = 0;
+                f.fs.fail_at = f.fs.call_count + k;
+                moq_result_t rc = moq_session_on_bidi_stream_bytes(
+                    f.c, f.ref, msg, mlen, false, 0);
+                fp_context("ns-grow", k, 3, &f.fs);
+                MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_NOMEM);
+                MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+                f.fs.fail_at = 0;
+                failures += fp_check_prefix(&f.fs, 0, grow_log, (size_t)k,
+                                            "ns-grow");
+                failures += fp_map_equals(&f.fs, &m0, "ns-grow");
+                failures += txs_check_eq(f.c, &f.ref, 1, &s0, "ns-grow");
+                /* The failing feed CARRIED bytes, and NOMEM retains them:
+                 * the declared carrier delta is exactly the fed length. */
+                h0.recv_len += mlen;
+                failures += hooks.check(f.c, hooks.ctx, &h0);
+                h0.recv_len -= mlen;
+                MOQ_TEST_CHECK(f.c->ns_subs[f.slot].announced_suffixes
+                               == set_before);
+                for (size_t b = 0; b < tracker_size; b++) {
+                    if (((const uint8_t *)set_before)[b] !=
+                        tracker_image[b]) {
+                        fprintf(stderr, "TXN ns-grow: tracker block byte "
+                                "%zu changed under a failed insert\n", b);
+                        failures++;
+                        break;
+                    }
+                }
+                MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 0);
+
+                /* This ordinal's own recovery cycle: bytes were retained,
+                 * so the declared empty re-feed replays the insert against
+                 * a NEW window -- the recovery's allocation sequence must
+                 * agree with the baseline's, not just its net footprint. */
+                f.fs.log_from = f.fs.call_count;
+                f.fs.log_len = 0;
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL,
+                                                          0, false, 0),
+                    (int)MOQ_OK);
+                failures += fp_check_signature(&f.fs, 0, k_grow_sig, 3,
+                                               "ns-grow-rec");
+                failures += fp_check_prefix(&f.fs, 0, grow_log, 3,
+                                            "ns-grow-rec");
+                txs_norm_vec_t out;
+                txs_norm_init(&out);
+                failures += ns_collect_output(f.c, &hooks, &out);
+                failures += txs_norm_equals(&out, &grow_out, "ns-grow-rec");
+                txs_norm_free(&out);
+                failures += txs_check_eq(f.c, &f.ref, 1, &grow_final,
+                                         "ns-grow-final");
+                failures += hooks.check_values(f.c, hooks.ctx, &grow_hook);
+                fp_delta_t delta;
+                fp_delta_compute(&f.fs, &m0, &delta);
+                failures += fp_delta_equals(&delta, &grow_delta,
+                                            "ns-grow-rec");
+            }
+
+            /* Retained contents + removal: all five retire, each with its
+             * own bytes, none closing the session. */
+            static const char *k_all[5] = { "aa", "bb", "cc", "dd", "ee" };
+            for (int i = 0; i < 5; i++) {
+                uint8_t m[256];
+                size_t l = encode_namespace_msg(m, sizeof(m),
+                                                MOQ_D16_NAMESPACE_DONE,
+                                                k_all[i]);
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, m, l,
+                                                          false, 0),
+                    (int)MOQ_OK);
+                MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 1);
+                MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NAMESPACE_GONE);
+                MOQ_TEST_CHECK(memcmp(
+                    ev.u.namespace_gone.track_namespace_suffix.parts[0].data,
+                    k_all[i], strlen(k_all[i])) == 0);
+                moq_event_cleanup(&ev);
+            }
+            MOQ_TEST_CHECK(moq_session_state(f.c) == MOQ_SESS_ESTABLISHED);
+            failures += ns_fx_teardown(&f, "ns-grow");
+        }
+        txs_norm_free(&grow_out);
+
+        /* Per-ordinal sweep: one FRESH pre-admitted fixture per origin,
+         * each with its own recovery-equivalence cycle -- a defect at an
+         * earlier ordinal cannot hide behind a later attempt.
+         *
+         * Pre-admission: the byte feed appends the response BEFORE the
+         * handler runs and NOMEM retains those bytes, so a failing
+         * byte-carrying call can never equal its pre-call snapshot. The
+         * response is admitted under a genuine event-capacity WOULD_BLOCK
+         * (the one-slot queue holds the scratch-free NS_SUB_OK) and the
+         * sweep drives the EMPTY re-feed, whose pre-call equality is
+         * exact. */
+        for (uint64_t k = 1; k <= 4; k++) {
+            const fp_outcome_row_t *row = &k_first_out[k - 1];
+            MOQ_TEST_CHECK(row->phase == FP_PHASE_PRE_COMMIT);
+            MOQ_TEST_CHECK(row->outcome == FP_NOMEM_RETAIN);
+
+            ns_fx_t f;
+            MOQ_TEST_CHECK(ns_fx_setup(&f, true) == 0);
+            ns_hook_ctx_t hctx = { f.slot, f.h._opaque };
+            txs_op_hooks_t hooks = ns_make_hooks(&hctx);
+            MOQ_TEST_CHECK(event_queue_full(f.c));
+
+            fp_map_snap_t pre_feed;
+            fp_map_capture(&f.fs, &pre_feed);
+            uint8_t msg[256];
+            size_t mlen = encode_namespace_msg(msg, sizeof(msg),
+                                               MOQ_D16_NAMESPACE, "found");
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg, mlen,
+                                                      false, 0),
+                (int)MOQ_ERR_WOULD_BLOCK);
+            failures += fp_map_equals(&f.fs, &pre_feed, "ns-preadmit");
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].recv_len > 0);
+
+            moq_event_t ev;
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NS_SUB_OK);
+            moq_event_cleanup(&ev);
+            MOQ_TEST_CHECK_EQ_SIZE(f.c->event_scratch_len, 0u);
+
+            fp_map_snap_t m0;
+            fp_map_capture(&f.fs, &m0);
+            txs_snapshot_t s0;
+            txs_capture(f.c, &f.ref, 1, &s0);
+            ns_hook_state_t h0;
+            hooks.capture(f.c, hooks.ctx, &h0);
+            size_t budget0 = f.c->recv_payload_bytes;
+
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+            f.fs.fail_at = f.fs.call_count + k;
+            moq_result_t rc = moq_session_on_bidi_stream_bytes(
+                f.c, f.ref, NULL, 0, false, 0);
+            fp_context("ns-sweep", k, 4, &f.fs);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+            f.fs.fail_at = 0;
+            failures += fp_check_prefix(&f.fs, 0, base_log, (size_t)k,
+                                        "ns-sweep");
+            failures += fp_map_equals(&f.fs, &m0, "ns-sweep");
+            failures += txs_check_eq(f.c, &f.ref, 1, &s0, "ns-sweep");
+            failures += hooks.check(f.c, hooks.ctx, &h0);
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 0);
+            moq_action_t no_act;
+            MOQ_TEST_CHECK(moq_session_poll_actions(f.c, &no_act, 1) == 0);
+
+            /* This ordinal's own recovery: the declared empty re-feed,
+             * against a NEW operation window so the recovery's allocation
+             * SEQUENCE -- not just its net footprint -- must agree with
+             * the baseline's; equal footprints alone cannot see an extra
+             * allocate/free pair. */
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_OK);
+            failures += fp_check_signature(&f.fs, 0, k_first_sig, 4,
+                                           "ns-recovery");
+            failures += fp_check_prefix(&f.fs, 0, base_log, 4,
+                                        "ns-recovery");
+            txs_norm_vec_t out;
+            txs_norm_init(&out);
+            failures += ns_collect_output(f.c, &hooks, &out);
+            failures += txs_norm_equals(&out, &base_out, "ns-recovery");
+            txs_norm_free(&out);
+
+            txs_snapshot_t expect = base_final;
+            /* The pre-admitted fixture's absolute budget differs from the
+             * baseline fixture's; the operation's CHARGE must not. */
+            expect.recv_payload_bytes = budget0 + base_budget_delta;
+            failures += txs_check_eq(f.c, &f.ref, 1, &expect, "ns-final");
+            failures += hooks.check_values(f.c, hooks.ctx, &base_hook);
+            fp_delta_t delta;
+            fp_delta_compute(&f.fs, &m0, &delta);
+            failures += fp_delta_equals(&delta, &base_delta, "ns-recovery");
+            failures += ns_fx_teardown(&f, "ns-sweep");
+        }
+
+        /* -- The event gate orders the origins -------------------------
+         * The canonical key is allocated BEFORE the event gate; the
+         * tracker and everything after it sit BEHIND it. Three pinned
+         * facts: a key failure beats a full queue and reports NOMEM; a
+         * tracker failpoint under a full queue is left unconsumed while
+         * the call reports the genuine WOULD_BLOCK; and after drainage the
+         * empty re-feed reaches that failpoint and reports NOMEM. The
+         * re-feed repeats the key attempt as its own first ordinal, so the
+         * tracker is re-armed against a NEW operation window over the
+         * monotonic lifetime counter -- never by resetting it. */
+        {
+            ns_fx_t f;
+            MOQ_TEST_CHECK(ns_fx_setup(&f, true) == 0);
+            MOQ_TEST_CHECK(event_queue_full(f.c));
+
+            uint8_t msg[256];
+            size_t mlen = encode_namespace_msg(msg, sizeof(msg),
+                                               MOQ_D16_NAMESPACE, "aa");
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+            f.fs.fail_at = f.fs.call_count + 1;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg, mlen,
+                                                      false, 0),
+                (int)MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+            f.fs.fail_at = 0;
+
+            uint64_t pre = f.fs.call_count;
+            f.fs.fail_at = pre + 2;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_ERR_WOULD_BLOCK);
+            MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, pre + 1);
+            MOQ_TEST_CHECK(f.fs.call_count < f.fs.fail_at);
+            f.fs.fail_at = 0;
+
+            moq_event_t ev;
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NS_SUB_OK);
+            moq_event_cleanup(&ev);
+            uint64_t pre2 = f.fs.call_count;
+            f.fs.fail_at = pre2 + 2;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+            f.fs.fail_at = 0;
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].announced_suffixes == NULL);
+
+            /* And the suffix still arrives exactly once. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NAMESPACE_FOUND);
+            MOQ_TEST_CHECK_EQ_SIZE(
+                ev.u.namespace_found.track_namespace_suffix.parts[0].len, 2);
+            MOQ_TEST_CHECK(memcmp(
+                ev.u.namespace_found.track_namespace_suffix.parts[0].data,
+                "aa", 2) == 0);
+            moq_event_cleanup(&ev);
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 0);
+            failures += ns_fx_teardown(&f, "ns-ordering");
+        }
+
+
+        /* -- Rollback restores a real NONZERO scratch cursor ------------
+         * The sweeps above run with an empty arena, where a rollback that
+         * CLEARED the cursor would be indistinguishable from one that
+         * RESTORED it. Here a server GOAWAY carrying a New Session URI is
+         * left queued and unpolled, so its URI occupies the arena; each
+         * failing response must put the cursor back to exactly that
+         * occupancy, and the URI must survive byte-for-byte. At each armed
+         * failure the ordinal must have been REACHED and the event queue
+         * must NOT be full, so the NOMEM is attributable to the armed
+         * allocation rather than to capacity pressure. */
+        {
+            static const char k_uri[] = "moqs://relay.example/next";
+            ns_fx_t f;
+            MOQ_TEST_CHECK(ns_fx_setup(&f, false) == 0);
+            ns_hook_ctx_t hctx = { f.slot, f.h._opaque };
+            txs_op_hooks_t hooks = ns_make_hooks(&hctx);
+
+            {
+                uint8_t ga[256];
+                moq_buf_writer_t w;
+                moq_buf_writer_init(&w, ga, sizeof(ga));
+                MOQ_TEST_CHECK(moq_d16_encode_goaway(&w,
+                    (const uint8_t *)k_uri, sizeof(k_uri) - 1) == MOQ_OK);
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_control_bytes(f.c, ga,
+                        moq_buf_writer_offset(&w), 0),
+                    (int)MOQ_OK);
+            }
+            MOQ_TEST_CHECK(moq_session_state(f.c) == MOQ_SESS_DRAINING);
+            size_t held = f.c->event_scratch_len;
+            MOQ_TEST_CHECK(held > 0);
+
+            /* First failing origin: the tracker object. */
+            txs_snapshot_t s0;
+            txs_capture(f.c, &f.ref, 1, &s0);
+            ns_hook_state_t h0;
+            hooks.capture(f.c, hooks.ctx, &h0);
+            size_t mlen_aa;
+            {
+                uint8_t msg[256];
+                mlen_aa = encode_namespace_msg(msg, sizeof(msg),
+                                               MOQ_D16_NAMESPACE, "aa");
+                MOQ_TEST_CHECK(!event_queue_full(f.c));
+                f.fs.fail_at = f.fs.call_count + 2;
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg,
+                                                          mlen_aa, false, 0),
+                    (int)MOQ_ERR_NOMEM);
+                MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+                f.fs.fail_at = 0;
+            }
+            /* The cursor is back at the GOAWAY URI's occupancy, exactly;
+             * the hook sees only the retained-bytes delta. */
+            MOQ_TEST_CHECK_EQ_SIZE(f.c->event_scratch_len, held);
+            failures += txs_check_eq(f.c, &f.ref, 1, &s0, "ns-cursor");
+            /* Declared carrier delta: the failed feed's bytes stay
+             * buffered; everything else in the hook state holds. */
+            h0.recv_len += mlen_aa;
+            failures += hooks.check(f.c, hooks.ctx, &h0);
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].announced_suffixes == NULL);
+            MOQ_TEST_CHECK(moq_session_state(f.c) == MOQ_SESS_DRAINING);
+
+            /* Recover, leaving the FOUND queued so the cursor GROWS. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_OK);
+            size_t held2 = f.c->event_scratch_len;
+            MOQ_TEST_CHECK(held2 > held);
+
+            /* Second failing origin: the stored key copy, from the new
+             * nonzero occupancy. */
+            void *set_before = f.c->ns_subs[f.slot].announced_suffixes;
+            MOQ_TEST_CHECK(set_before != NULL);
+            txs_snapshot_t s1;
+            txs_capture(f.c, &f.ref, 1, &s1);
+            {
+                uint8_t msg[256];
+                size_t mlen = encode_namespace_msg(msg, sizeof(msg),
+                                                   MOQ_D16_NAMESPACE, "bb");
+                MOQ_TEST_CHECK(!event_queue_full(f.c));
+                f.fs.fail_at = f.fs.call_count + 2;
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg,
+                                                          mlen, false, 0),
+                    (int)MOQ_ERR_NOMEM);
+                MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+                f.fs.fail_at = 0;
+            }
+            MOQ_TEST_CHECK_EQ_SIZE(f.c->event_scratch_len, held2);
+            failures += txs_check_eq(f.c, &f.ref, 1, &s1, "ns-cursor");
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].announced_suffixes
+                           == set_before);
+
+            /* Recover the second suffix too. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_OK);
+
+            /* Everything queued across both failures delivers intact:
+             * GOAWAY URI byte-for-byte, then each suffix exactly once --
+             * the full normalized record, not just the payload bytes. */
+            /* Compare against fully-constructed expected images -- the
+             * URI and BOTH suffixes byte-for-byte, not kinds alone. */
+            txs_norm_vec_t out, want;
+            txs_norm_init(&out);
+            txs_norm_init(&want);
+            failures += ns_collect_output(f.c, &hooks, &out);
+            {
+                txs_img_t img;
+                txs_img_init(&img);
+                txs_img_bytes(&img, (const uint8_t *)k_uri,
+                              sizeof(k_uri) - 1);
+                MOQ_TEST_CHECK(txs_norm_append_img(&want,
+                    (uint64_t)MOQ_EVENT_GOAWAY, &img));
+                static const char *k_two[2] = { "aa", "bb" };
+                for (int i = 0; i < 2; i++) {
+                    txs_img_init(&img);
+                    txs_img_u64(&img, 1);           /* the fixture's handle */
+                    txs_img_u64(&img, 1);           /* one suffix part */
+                    txs_img_bytes(&img, (const uint8_t *)k_two[i], 2);
+                    MOQ_TEST_CHECK(txs_norm_append_img(&want,
+                        (uint64_t)MOQ_EVENT_NAMESPACE_FOUND, &img));
+                }
+            }
+            failures += txs_norm_equals(&out, &want, "ns-cursor");
+            txs_norm_free(&want);
+            txs_norm_free(&out);
+            failures += ns_fx_teardown(&f, "ns-cursor");
+        }
+
+        txs_norm_free(&base_out);
     }
 
     MOQ_TEST_PASS("test_session_namespace_sub");

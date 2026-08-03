@@ -116,21 +116,19 @@ int main(void)
     MOQ_TEST_CHECK_EQ_INT((int)act3.kind, (int)MOQ_ACTION_OPEN_BIDI_STREAM);
     moq_action_cleanup(&act3);
 
-    /* Unsubscribe on a stream-correlated profile is transport teardown, not a
-     * control message: it STOP_SENDINGs the request bidi (the required
-     * cancellation signal) and RESETs our own send half. No SEND_CONTROL is
-     * emitted, and the subscription is freed immediately. */
+    /* Unsubscribe on a stream-correlated profile is transport teardown, not
+     * a control message: ONE whole-stream abort of the request bidi (both
+     * directions, one code). No SEND_CONTROL is emitted, and the
+     * subscription is freed immediately. */
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_unsubscribe(s, h, 1), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
 
     moq_action_t tdn[4];
     size_t ntdn = moq_session_poll_actions(s, tdn, 4);
-    MOQ_TEST_CHECK_EQ_SIZE(ntdn, 2);
-    /* STOP is required and must come first; RESET terminates our send half. */
-    MOQ_TEST_CHECK_EQ_INT((int)tdn[0].kind, (int)MOQ_ACTION_STOP_BIDI_STREAM);
-    MOQ_TEST_CHECK_EQ_U64(tdn[0].u.stop_bidi_stream.stream_ref._v, ref._v);
-    MOQ_TEST_CHECK_EQ_INT((int)tdn[1].kind, (int)MOQ_ACTION_RESET_BIDI_STREAM);
-    MOQ_TEST_CHECK_EQ_U64(tdn[1].u.reset_bidi_stream.stream_ref._v, ref._v);
+    MOQ_TEST_CHECK_EQ_SIZE(ntdn, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)tdn[0].kind, (int)MOQ_ACTION_ABORT_BIDI_STREAM);
+    MOQ_TEST_CHECK_EQ_U64(tdn[0].u.abort_bidi_stream.stream_ref._v, ref._v);
+    MOQ_TEST_CHECK_EQ_U64(tdn[0].u.abort_bidi_stream.error_code, 0x1);
     for (size_t i = 0; i < ntdn; i++) {
         MOQ_TEST_CHECK(tdn[i].kind != MOQ_ACTION_SEND_CONTROL);
         moq_action_cleanup(&tdn[i]);

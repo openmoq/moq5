@@ -123,6 +123,128 @@ if ! grep -q -- '--draft' "$TMPERR"; then
     fail "--help usage missing --draft"
 fi
 
+# -- 8: bare "wtquic" backend is rejected (flag) --
+
+RC=0
+"$BIN" --backend wtquic --relay https://127.0.0.1:9/ --test setup-only \
+    >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "--backend wtquic exit code $RC, expected 1"
+fi
+if ! grep -q 'bare "wtquic" is not accepted' "$TMPERR"; then
+    fail "--backend wtquic missing rejection message"
+fi
+
+# -- 9: bare "wtquic" is rejected via MOQT_BACKEND too --
+
+RC=0
+MOQT_BACKEND=wtquic "$BIN" --relay https://127.0.0.1:9/ --test setup-only \
+    >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "MOQT_BACKEND=wtquic exit code $RC, expected 1"
+fi
+
+# -- 10: WebTransport-only backends reject a raw-QUIC (moqt://) URL --
+
+for BE in wtquic-network wtquic-msquic proxygen; do
+    RC=0
+    "$BIN" --backend "$BE" --relay moqt://127.0.0.1:9 --test setup-only \
+        >"$TMPOUT" 2>"$TMPERR" || RC=$?
+    if [ "$RC" -ne 1 ]; then
+        fail "--backend $BE moqt:// exit code $RC, expected 1"
+    fi
+    if ! grep -q 'WebTransport only' "$TMPERR"; then
+        fail "--backend $BE moqt:// missing WebTransport-only error"
+    fi
+done
+
+# -- 11: raw-QUIC-only backend rejects a WebTransport (https://) URL --
+
+RC=0
+"$BIN" --backend msquic --relay https://127.0.0.1:9/ --test setup-only \
+    >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "--backend msquic https:// exit code $RC, expected 1"
+fi
+if ! grep -q 'raw-QUIC only' "$TMPERR"; then
+    fail "--backend msquic https:// missing raw-QUIC-only error"
+fi
+
+# -- 12: unknown backend token → exit 1 --
+
+RC=0
+"$BIN" --backend bogus --relay https://127.0.0.1:9/ --test setup-only \
+    >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "--backend bogus exit code $RC, expected 1"
+fi
+
+# -- 13: --backend wins over MOQT_BACKEND (proven via scheme cross-check) --
+# env picks a WT-only backend, the flag picks a raw-QUIC-only one, the URL is
+# https://; if the flag wins we get a raw-QUIC-only rejection, if the env won we
+# would connect. Instant, no relay round-trip.
+
+RC=0
+MOQT_BACKEND=wtquic-network "$BIN" --backend msquic --relay https://127.0.0.1:9/ \
+    --test setup-only >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ] || ! grep -q 'raw-QUIC only' "$TMPERR"; then
+    fail "--backend did not override MOQT_BACKEND"
+fi
+
+# -- 14: --help lists the new backend tokens and the bare-wtquic rejection --
+
+"$BIN" --help >"$TMPOUT" 2>"$TMPERR" || true
+if ! grep -q 'wtquic-msquic' "$TMPERR"; then
+    fail "--help missing wtquic-msquic backend"
+fi
+if ! grep -q 'wtquic-network' "$TMPERR"; then
+    fail "--help missing wtquic-network backend"
+fi
+if ! grep -q 'bare "wtquic" is not accepted' "$TMPERR"; then
+    fail "--help missing bare-wtquic rejection note"
+fi
+
+# -- 15: --wt-profile is rejected for a backend that cannot select a dialect --
+
+RC=0
+"$BIN" --backend picoquic --wt-profile d13-14 --relay https://127.0.0.1:9/ \
+    --test setup-only >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ]; then
+    fail "--wt-profile on picoquic exit code $RC, expected 1"
+fi
+if ! grep -q 'applies only to the wtquic-msquic backend' "$TMPERR"; then
+    fail "--wt-profile on picoquic missing rejection message"
+fi
+
+# -- 16: an unknown --wt-profile value is rejected (on wtquic-msquic) --
+
+RC=0
+"$BIN" --backend wtquic-msquic --wt-profile bogus --relay https://127.0.0.1:9/ \
+    --test setup-only >"$TMPOUT" 2>"$TMPERR" || RC=$?
+if [ "$RC" -ne 1 ] || ! grep -q 'must be' "$TMPERR"; then
+    fail "--wt-profile bogus not rejected"
+fi
+
+# -- 17: TAP identity is TRUTHFUL. wtquic-msquic reports the selected dialect;
+# a fixed-dialect WebTransport backend reports native; raw QUIC reports n/a. The
+# request line is emitted before the (failing) dial, so a dead port is fine. --
+
+"$BIN" --backend wtquic-msquic --wt-profile d13-14 --relay https://127.0.0.1:9/ \
+    --test setup-only >"$TMPOUT" 2>"$TMPERR" || true
+if ! grep -q '^# request: backend=wtquic-msquic wt-profile=d13-14 draft=' "$TMPOUT"; then
+    fail "wtquic-msquic d13-14 identity not reported truthfully"
+fi
+"$BIN" --backend picoquic --relay https://127.0.0.1:9/ \
+    --test setup-only >"$TMPOUT" 2>"$TMPERR" || true
+if ! grep -q '^# request: backend=picoquic wt-profile=native draft=' "$TMPOUT"; then
+    fail "picoquic WebTransport identity should be native"
+fi
+"$BIN" --backend msquic --relay moqt://127.0.0.1:9 \
+    --test setup-only >"$TMPOUT" 2>"$TMPERR" || true
+if ! grep -q '^# request: backend=msquic wt-profile=n/a draft=' "$TMPOUT"; then
+    fail "raw-QUIC msquic identity should be n/a"
+fi
+
 # -- Summary --
 
 if [ "$FAILURES" -gt 0 ]; then
@@ -130,4 +252,4 @@ if [ "$FAILURES" -gt 0 ]; then
     exit 1
 fi
 
-echo "PASS: smoke_interop_client (7 checks)"
+echo "PASS: smoke_interop_client (17 checks)"

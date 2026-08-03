@@ -93,6 +93,7 @@ typedef struct {
     int        expect_announce;
     atomic_int saw_announce;     /* NAMESPACE_PUBLISHED surfaced */
     atomic_int announce_ns_ok;   /* ...with the exact expected parts */
+    atomic_int saw_done;         /* NAMESPACE_DONE surfaced (withdrawal) */
 } server_app_t;
 
 static void serve_subscribe(moq_session_t *s, moq_subscription_t sub,
@@ -176,6 +177,11 @@ static int server_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
             moq_accept_namespace_cfg_init(&acc);
             if (moq_session_accept_namespace(s, np->ann, &acc, now) == MOQ_OK)
                 atomic_store(&a->saw_announce, 1);
+        } else if (ev.kind == MOQ_EVENT_NAMESPACE_DONE && a->expect_announce) {
+            /* The announcer withdrew (draft-18: aborted the request bidi).
+             * Seeing DONE proves the abort's RESET/STOP arrived intact rather
+             * than tearing the WT session down. */
+            atomic_store(&a->saw_done, 1);
         }
         moq_event_cleanup(&ev);
     }
@@ -204,8 +210,15 @@ typedef struct {
     int        do_announce;
     int        announce_sent;
     int        announce_rc;      /* moq_session_publish_namespace() result */
+    moq_announcement_t ann;      /* handle from publish_namespace (for withdraw) */
     atomic_int ns_accepted;      /* NAMESPACE_ACCEPTED observed */
     atomic_int ns_rejected;      /* NAMESPACE_REJECTED observed (failure) */
+    /* done mode: after acceptance, withdraw the registration
+     * (moq_session_publish_namespace_done) — draft-18 aborts the request
+     * bidi, which over WebTransport must NOT tear the session down. */
+    int        do_done;
+    int        done_sent;
+    int        done_rc;          /* moq_session_publish_namespace_done() result */
 } client_app_t;
 
 static void client_subscribe(moq_session_t *s, client_app_t *a)
@@ -244,9 +257,9 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
                     };
                     nc.track_namespace.parts = ns;
                     nc.track_namespace.count = 2;
-                    moq_announcement_t ann;
                     a->announce_rc =
-                        (int)moq_session_publish_namespace(s, &nc, now, &ann);
+                        (int)moq_session_publish_namespace(s, &nc, now,
+                                                           &a->ann);
                     a->announce_sent = 1;
                 }
             } else {
@@ -255,6 +268,14 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_ACCEPTED && a->do_announce) {
             atomic_store(&a->ns_accepted, 1);
             if (!a->subscribed) client_subscribe(s, a);
+            /* Withdraw after acceptance: draft-18 aborts the announce request
+             * bidi (RESET/STOP). The subscription and its object delivery must
+             * survive it, proving the WT session stays usable. */
+            if (a->do_done && !a->done_sent) {
+                a->done_rc = (int)moq_session_publish_namespace_done(
+                    s, a->ann, now);
+                a->done_sent = 1;
+            }
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_REJECTED && a->do_announce) {
             atomic_store(&a->ns_rejected, 1);
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
@@ -591,6 +612,117 @@ static run_status_t run_announce(const char *cert, const char *key,
         return RUN_HARD;
     }
     fprintf(stderr, "[announce] port %d: no setup reached (retryable)\n", port);
+    return RUN_RETRY;
+}
+
+/* Draft-18 announce -> accept -> WITHDRAW over WebTransport. draft-18 has no
+ * PUBLISH_NAMESPACE_DONE message: withdrawal aborts the announce request bidi
+ * (RESET_STREAM + STOP_SENDING). Over WT the abort MUST be a plain RESET_STREAM
+ * whenever reliable-reset was not negotiated: picowt_reset_stream requests a
+ * reliable_size preamble, which picoquic refuses locally in that case, and the
+ * error turns into a fatal bridge failure that closes the whole H3/WT session.
+ *
+ * drop_rsa=1 models exactly that peer: a relay that negotiates WebTransport but
+ * omits the reset_stream_at transport parameter (imquic, moqx). The managed
+ * client synthesizes the missing TP to unblock CONNECT, but that does not make
+ * reliable-reset usable (picoquic latched the negotiated bit before the fake).
+ * A naive abort (picowt_reset_stream with a reliable_size preamble) is then
+ * rejected LOCALLY by picoquic_reset_stream_at (ILLEGAL_TRANSPORT_EXTENSION),
+ * which becomes a fatal bridge error and closes the connection -- the
+ * deterministic in-process analogue of the interop teardown. The capability-
+ * aware reset must downgrade to a plain RESET_STREAM (reliable_size 0): the
+ * server then observes NAMESPACE_DONE, no side goes fatal, and the
+ * subscription's object still arrives (session usable). Seeing NAMESPACE_DONE
+ * here therefore PROVES the plain-reset downgrade -- a reliable_size preamble
+ * would have gone fatal locally before any withdrawal reached the peer.
+ *
+ * drop_rsa=0 is the genuinely-negotiated control: both sides advertise
+ * reset_stream_at, the abort stays a RESET_STREAM_AT with the reliable WT
+ * preamble, and the withdrawal is delivered just the same. */
+static run_status_t run_announce_done(const char *cert, const char *key,
+                                      int port, int timeout_sec,
+                                      const char *wt_protocols, int drop_rsa)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    sapp.expect_announce = 1;
+    atomic_init(&sapp.saw_announce, 0);
+    atomic_init(&sapp.announce_ns_ok, 0);
+    atomic_init(&sapp.saw_done, 0);
+
+    moq_pico_wt_managed_cfg_t scfg;
+    moq_pico_wt_managed_cfg_init(&scfg);
+    scfg.alloc = moq_alloc_default();
+    scfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    scfg.cert_path = cert;
+    scfg.key_path = key;
+    scfg.port = port;
+    scfg.send_request_capacity = true;
+    scfg.initial_request_capacity = 16;
+    scfg.on_pump = server_pump;
+    scfg.on_pump_ctx = &sapp;
+    scfg.wt_protocols = wt_protocols;
+    if (drop_rsa) scfg.configure_quic = server_drop_reset_stream_at;
+    moq_pico_wt_managed_t *srv = NULL;
+    if (moq_pico_wt_managed_create(&scfg, &srv) != MOQ_OK) return RUN_RETRY;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    atomic_init(&capp.got_object, 0);
+    atomic_init(&capp.ns_accepted, 0);
+    atomic_init(&capp.ns_rejected, 0);
+    capp.do_announce = 1;
+    capp.do_done = 1;
+    moq_pico_wt_managed_t *cli = make_client_ex2(
+        moq_pico_wt_managed_local_port(srv), &capp, 0, wt_protocols);
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    /* Wait for BOTH the object (subscription usable) and the server observing
+     * the withdrawal (DONE round-tripped): the object can beat the DONE, so
+     * waiting on it alone would race the withdrawal. */
+    uint64_t waited = 0, budget = (uint64_t)timeout_sec * 1000;
+    while ((!atomic_load(&capp.got_object) || !atomic_load(&sapp.saw_done)) &&
+           waited < budget) {
+        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
+            break;
+        waited += 200;
+    }
+
+    int got = atomic_load(&capp.got_object);
+    int saw_done = atomic_load(&sapp.saw_done);
+    int fatal = moq_pico_wt_managed_is_fatal(cli) ||
+                moq_pico_wt_managed_is_fatal(srv);
+    uint64_t cli_code = moq_pico_wt_managed_fatal_code(cli);
+    uint64_t srv_code = moq_pico_wt_managed_fatal_code(srv);
+
+    moq_pico_wt_managed_stop(cli);
+    int announce_attempted = capp.announce_sent;
+    int done_attempted = capp.done_sent;
+    int done_rc = capp.done_rc;
+    moq_pico_wt_managed_destroy(cli);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+
+    if (got && saw_done && !fatal) {
+        CHECK(done_rc == 0);                         /* withdrawal queued */
+        CHECK(atomic_load(&capp.ns_accepted));       /* acceptance returned */
+        CHECK(!atomic_load(&capp.ns_rejected));
+        return RUN_OK;
+    }
+    if (announce_attempted || done_attempted || fatal) {
+        fprintf(stderr, "[announce_done%s] port %d HARD FAIL: got=%d "
+                "done_sent=%d done_rc=%d saw_done=%d accepted=%d "
+                "fatal=%d cli=0x%llx srv=0x%llx\n",
+                drop_rsa ? "/no_rsa" : "", port, got, done_attempted, done_rc,
+                saw_done, atomic_load(&capp.ns_accepted), fatal,
+                (unsigned long long)cli_code, (unsigned long long)srv_code);
+        return RUN_HARD;
+    }
+    fprintf(stderr, "[announce_done] port %d: no setup reached (retryable)\n",
+            port);
     return RUN_RETRY;
 }
 
@@ -1194,15 +1326,19 @@ int main(int argc, char **argv)
     int bigobj_drain = !strcmp(mode, "bigobj_drain");
     int announce = !strcmp(mode, "announce");
     int announce_18 = !strcmp(mode, "announce_18");
+    int announce_done_18 = !strcmp(mode, "announce_done_18");
+    int announce_done_no_rsa = !strcmp(mode, "announce_done_no_rsa");
     int loopback_18 = !strcmp(mode, "loopback_18");
     if (!refuse && !close_mode && !nego && !nego_refuse && !nego_legacy &&
         !nego_legacy_18 && !no_rsa && !bigobj && !bigobj_smallwin &&
-        !bigobj_drain && !announce && !announce_18 && !loopback_18 &&
+        !bigobj_drain && !announce && !announce_18 && !announce_done_18 &&
+        !announce_done_no_rsa && !loopback_18 &&
         strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "nego|nego_refuse|nego_legacy|nego_legacy_18|"
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
-                "announce|announce_18|loopback_18)\n", mode);
+                "announce|announce_18|announce_done_18|announce_done_no_rsa|"
+                "loopback_18)\n", mode);
         return 2;
     }
 
@@ -1232,6 +1368,10 @@ int main(int argc, char **argv)
            : bigobj_drain   ? run_bigobj_drain(cert, key, ports[i], 30)
            : announce       ? run_announce(cert, key, ports[i], 6, NULL)
            : announce_18    ? run_announce(cert, key, ports[i], 6, "moqt-18")
+           : announce_done_18 ? run_announce_done(cert, key, ports[i], 6,
+                                                  "moqt-18", 0)
+           : announce_done_no_rsa ? run_announce_done(cert, key, ports[i], 6,
+                                                      "moqt-18", 1)
            : loopback_18    ? run_loopback_proto(cert, key, ports[i], 6,
                                                  "moqt-18")
                             : run_loopback_proto(cert, key, ports[i], 6, NULL);

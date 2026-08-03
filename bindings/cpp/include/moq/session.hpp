@@ -32,6 +32,8 @@ struct session_config {
     uint32_t           recv_buffer_size         = 0;
     uint32_t           output_scratch_size      = 0;
     uint64_t           idle_timeout_us          = 0;
+    // §9.8: bound on the deferred-terminal wait (0 = 30s library default).
+    uint64_t           done_wait_timeout_us     = 0;
     uint64_t           goaway_timeout_us        = 0;
     bool               streaming_objects        = false;
     bool               send_auth_token_cache_size = false;
@@ -72,6 +74,7 @@ public:
         c.recv_buffer_size         = cfg.recv_buffer_size;
         c.output_scratch_size      = cfg.output_scratch_size;
         c.idle_timeout_us          = cfg.idle_timeout_us;
+        c.done_wait_timeout_us     = cfg.done_wait_timeout_us;
         c.goaway_timeout_us        = cfg.goaway_timeout_us;
         c.streaming_objects        = cfg.streaming_objects;
         c.send_auth_token_cache_size = cfg.send_auth_token_cache_size;
@@ -368,7 +371,10 @@ public:
                                      uint64_t now)
     {
         moq_subscription_update_cfg_t c;
-        moq_subscription_update_cfg_init(&c);
+        /* Sized init: this wrapper sets appended tail fields (auth tokens,
+         * new-group request, filter); the frozen pointer-only init would
+         * stamp the v0 prefix and silently drop them. */
+        moq_subscription_update_cfg_init_sized(&c, sizeof(c));
         c.has_subscriber_priority = cfg.has_subscriber_priority;
         c.subscriber_priority     = cfg.subscriber_priority;
         c.has_forward             = cfg.has_forward;
@@ -379,6 +385,11 @@ public:
         c.auth_token_count        = cfg.auth_tokens.size();
         c.has_new_group_request   = cfg.has_new_group_request;
         c.new_group_request       = cfg.new_group_request;
+        c.has_filter              = cfg.has_filter;
+        c.filter                  = cfg.filter;
+        c.start_group             = cfg.start_group;
+        c.start_object            = cfg.start_object;
+        c.end_group               = cfg.end_group;
         return result_from_rc(
             moq_session_update_subscription(s_, sub.raw(), &c, now));
     }
@@ -490,7 +501,9 @@ public:
             return errc::invalid;
 
         moq_publish_cfg_t c;
-        moq_publish_cfg_init(&c);
+        /* Sets the auth-token tail past the frozen v0 prefix, so the sized
+         * init is required (the pointer init would leave them reader-ignored). */
+        moq_publish_cfg_init_sized(&c, sizeof(c));
         c.track_namespace  = cfg.ns.c_namespace();
         c.track_name       = cfg.track.raw();
         c.has_track_alias  = cfg.has_track_alias;
@@ -513,12 +526,20 @@ public:
                                 uint64_t now)
     {
         moq_accept_publish_cfg_t c;
-        moq_accept_publish_cfg_init(&c);
+        /* Sets tails past the frozen v0 prefix (new-group, filter, forward),
+         * so the sized init is required. */
+        moq_accept_publish_cfg_init_sized(&c, sizeof(c));
         c.has_subscriber_priority = cfg.has_subscriber_priority;
         c.subscriber_priority     = cfg.subscriber_priority;
         c.group_order             = to_c(cfg.group_order);
         c.has_new_group_request   = cfg.has_new_group_request;
         c.new_group_request       = cfg.new_group_request;
+        c.filter                  = to_c(cfg.filter);
+        c.start_group             = cfg.start_group;
+        c.start_object            = cfg.start_object;
+        c.end_group               = cfg.end_group;
+        c.has_forward             = cfg.has_forward;
+        c.forward                 = cfg.forward;
         return result_from_rc(
             moq_session_accept_publish(s_, pub.raw(), &c, now));
     }

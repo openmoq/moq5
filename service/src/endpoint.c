@@ -10,19 +10,24 @@
  * rows are: RAW_QUIC -> moq_pq_threaded_t and WEBTRANSPORT ->
  * moq_pico_wt_managed_t (always, picoquic); plus, when compiled in and asked
  * for explicitly (AUTO stays picoquic/pico_wt first), RAW_QUIC ->
- * moq_mvfst_managed_t (MOQ_SERVICE_HAVE_MVFST_MANAGED) and WEBTRANSPORT ->
+ * moq_mvfst_managed_t (MOQ_SERVICE_HAVE_MVFST_MANAGED) or
+ * moq_msquic_managed_t (MOQ_SERVICE_HAVE_MSQUIC_MANAGED, lane pump API) and
+ * WEBTRANSPORT ->
  * moq_proxygen_wt_managed_t (MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED). Each
- * facade owns the network thread, the QUIC context, and the MoQ session. The
+ * facade owns the managed execution context (a network thread; the
+ * wtquic-Network backend instead binds its serial queue), the QUIC context,
+ * and the MoQ session. The
  * endpoint adds
  * the service-tier contracts on top: the
  * sticky interrupt latch, the post() executor (exactly-once, FIFO,
  * NULL-session terminal drain), terminal-state classification, and the
  * attachment count the media services use.
  *
- * Threading: the facade network thread runs ep_pump_cycle() (drains post()
+ * Threading: the facade's managed execution context runs ep_pump_cycle()
+ * (drains post()
  * tasks, refreshes the cached endpoint state); the app thread calls the
  * public surface. Shared state lives under ep->mu; the interrupt latch is a
- * lone atomic so set_interrupted() never takes a lock the network thread
+ * lone atomic so set_interrupted() never takes a lock the managed context
  * holds.
  *
  * Version negotiation is live for the picoquic facades: the resolved offer
@@ -31,9 +36,10 @@
  * order decides), the facade reads the negotiated ALPN / selected WT-Protocol
  * back and creates the MoQ session with the matching version. The proxygen
  * WebTransport facade is likewise live (it creates the session after the WT
- * CONNECT response). The mvfst facade is exact-version-first: it creates the
- * session before the ALPN handshake, so it accepts only a single offered
- * version (a multi-version / AUTO offer is MOQ_ERR_UNSUPPORTED at create).
+ * CONNECT response). The mvfst and MsQuic facades are exact-version-first:
+ * they create the session before the ALPN handshake, so they accept only a
+ * single offered version (a multi-version / AUTO offer is MOQ_ERR_UNSUPPORTED
+ * at create).
  * Either way moq_endpoint_negotiated_version() surfaces the version once
  * established.
  */
@@ -61,8 +67,21 @@
 #ifdef MOQ_SERVICE_HAVE_MVFST_MANAGED
 #include <moq/mvfst.h>
 #endif
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+#include <moq/msquic_managed.h>
+#endif
 #ifdef MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED
 #include <moq/proxygen_wt_managed.h>
+#endif
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+#include <moq/wtquic_network_managed.h>
+#endif
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+#include <moq/wtquic_msquic_managed.h>
+/* The service profile enum is mapped EXPLICITLY onto the adapter enum in
+ * ep_create_wtquic_msquic (they intentionally do not share values -- the service
+ * enum has a BACKEND_DEFAULT sentinel). No equal-value assert: the mapping is
+ * the switch there, and the adapter<->wtquic pin lives in the adapter. */
 #endif
 
 /* -- Version support ------------------------------------------------ */
@@ -140,7 +159,10 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
                                       moq_endpoint_resolved_t *out)
 {
     if (!cfg || !out) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_endpoint_cfg_t)) return MOQ_ERR_INVAL;
+    /* Forward-compatible floor: accept any caller at or above the frozen v0
+     * layout. Appended tail fields (wt_profile) are read below only when
+     * struct_size covers them, so a v0-sized caller is served, not rejected. */
+    if (cfg->struct_size < MOQ_ENDPOINT_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     memset(out, 0, sizeof(*out));
 
     /* Optional byte spans must be coherent: a non-zero length with a NULL
@@ -179,12 +201,14 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
     }
 
     /* Backend matrix: picoquic serves both protocols (native QUIC and
-     * pico_wt); mvfst serves RAW_QUIC only, when compiled into the service.
-     * AUTO picks the first compiled-in backend supporting the resolved
-     * protocol -- picoquic first -- so AUTO stays picoquic even with mvfst
-     * built. An explicit backend that is not compiled in (or not valid for
-     * the resolved protocol) is MOQ_ERR_UNSUPPORTED. mvfst is RAW_QUIC-only;
-     * proxygen is WEBTRANSPORT-only (each rejects the other protocol). */
+     * pico_wt); every other backend is explicit opt-in. AUTO resolves
+     * DIRECTLY and STABLY to picoquic -- if the required picoquic facade
+     * is not compiled in, connect() reports MOQ_ERR_UNSUPPORTED rather
+     * than falling through to mvfst/MsQuic/proxygen/wtquic-Network. An
+     * explicit backend that is not compiled in (or not valid for the
+     * resolved protocol) is MOQ_ERR_UNSUPPORTED. mvfst and MsQuic are
+     * RAW_QUIC-only; proxygen and wtquic-Network are WEBTRANSPORT-only
+     * (each rejects the other protocol). */
     switch (cfg->backend) {
     case MOQ_TRANSPORT_BACKEND_AUTO:
     case MOQ_TRANSPORT_BACKEND_PICOQUIC:
@@ -200,12 +224,44 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
 #else
         return MOQ_ERR_UNSUPPORTED;
 #endif
+    case MOQ_TRANSPORT_BACKEND_MSQUIC:
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        /* MsQuic managed is native QUIC only -- no WebTransport facade. */
+        if (out->protocol != MOQ_TRANSPORT_PROTOCOL_RAW_QUIC)
+            return MOQ_ERR_UNSUPPORTED;
+        out->backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        break;
+#else
+        return MOQ_ERR_UNSUPPORTED;
+#endif
     case MOQ_TRANSPORT_BACKEND_PROXYGEN:
 #ifdef MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED
         /* proxygen is WebTransport only -- it has no raw-QUIC facade. */
         if (out->protocol != MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT)
             return MOQ_ERR_UNSUPPORTED;
         out->backend = MOQ_TRANSPORT_BACKEND_PROXYGEN;
+        break;
+#else
+        return MOQ_ERR_UNSUPPORTED;
+#endif
+    case MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK:
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+        /* The wtquic Network.framework client is WebTransport only (and
+         * Apple-only -- off Apple the facade is never compiled in). */
+        if (out->protocol != MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT)
+            return MOQ_ERR_UNSUPPORTED;
+        out->backend = MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK;
+        break;
+#else
+        return MOQ_ERR_UNSUPPORTED;
+#endif
+    case MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC:
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+        /* The wtquic-over-MsQuic client is WebTransport only (it has no raw-QUIC
+         * facade) and cross-platform wherever wtquic's MsQuic component builds. */
+        if (out->protocol != MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT)
+            return MOQ_ERR_UNSUPPORTED;
+        out->backend = MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC;
         break;
 #else
         return MOQ_ERR_UNSUPPORTED;
@@ -243,6 +299,25 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         }
     }
 
+    /* WebTransport wire profile: an appended tail field, so read it ONLY when
+     * struct_size fully covers it (complete-presence gate); a v0-sized caller
+     * gets MOQ_WT_PROFILE_BACKEND_DEFAULT (0, already memset). */
+    out->wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, wt_profile) + sizeof(cfg->wt_profile)) {
+        /* Range first: a bad value is a clean MOQ_ERR_INVAL, not a late reject. */
+        if (cfg->wt_profile > (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT)
+            return MOQ_ERR_INVAL;
+        /* An EXPLICIT selection is honored ONLY by a backend that can pick a
+         * dialect (wtquic-msquic). Every other backend has a fixed dialect or no
+         * WebTransport, so reject rather than silently ignore -- the public
+         * contract must not accept a selection it will not apply. */
+        if (cfg->wt_profile != (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT &&
+            out->backend != MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC)
+            return MOQ_ERR_UNSUPPORTED;
+        out->wt_profile = cfg->wt_profile;
+    }
+
     return resolve_versions(&cfg->versions, out);
 }
 
@@ -275,8 +350,8 @@ typedef struct ep_backend_vtable {
     /* Graceful-drain probe (for moq_endpoint_drain). Returns: 1 = transport
      * outbound is idle enough to stop without truncating queued reliable stream
      * data; 0 = still draining; -1 = the backend cannot prove drain (caller maps
-     * to MOQ_ERR_UNSUPPORTED); -2 = called on the network thread (MOQ_ERR_WRONG
-     * _STATE). Evaluated only by the facade's own network thread's view, exposed
+     * to MOQ_ERR_UNSUPPORTED); -2 = called on the managed context (MOQ_ERR_WRONG
+     * _STATE). Evaluated only by the facade's own managed-context view, exposed
      * thread-safely. */
     int           (*drain_state)(void *facade);
     moq_result_t  (*stop)(void *facade);
@@ -318,9 +393,11 @@ struct moq_endpoint {
     const ep_backend_vtable_t *vt;
 
     /* Internal pump hooks (one slot per kind; see endpoint_internal.h).
-     * Mutated under mu; invoked on the network thread under mu. */
-    moq_endpoint_hook_fn hook_fn[MOQ_ENDPOINT_HOOK_KIND_COUNT];
-    void                *hook_ctx[MOQ_ENDPOINT_HOOK_KIND_COUNT];
+     * Mutated under mu; invoked on the managed execution context under mu.
+     * hook_ops is copied by value at attach; hook_ops[k].pump == NULL means the
+     * slot is free. */
+    moq_endpoint_hook_ops_t hook_ops[MOQ_ENDPOINT_HOOK_KIND_COUNT];
+    void                   *hook_ctx[MOQ_ENDPOINT_HOOK_KIND_COUNT];
 
     /* Sticky interrupt latch: lone atomic, settable from any thread. */
     atomic_bool interrupted;
@@ -358,7 +435,10 @@ static ep_task_t *ep_pop_task(moq_endpoint_t *ep)
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
     defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 /* Re-queue a task node at the tail without re-allocating it. */
 static void ep_requeue_task(moq_endpoint_t *ep, ep_task_t *t)
@@ -373,7 +453,7 @@ static void ep_requeue_task(moq_endpoint_t *ep, ep_task_t *t)
 
 /*
  * Drain the post() tasks queued when this cycle began -- captured tail, FIFO.
- * Calling moq_session_* from a task is legal here (network thread).
+ * Calling moq_session_* from a task is legal here (the managed context).
  *
  * A task posted via the internal retryable path (t->retryable) that returns
  * MOQ_ERR_WOULD_BLOCK is REQUEUED (the same node, no re-allocation) to retry on
@@ -408,17 +488,32 @@ static void ep_drain_posted(moq_endpoint_t *ep, moq_session_t *session,
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep);
 /*
- * One pump cycle, on the facade's network thread: drain accepted post()
+ * One pump cycle, on the facade's managed execution context: drain accepted post()
  * tasks FIFO (calling moq_session_* is legal here), then refresh the cached
  * endpoint state from the session.
  */
 static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
                           uint64_t now_us)
 {
-    ep_drain_posted(ep, session, now_us);
+    /* Header §5.4 (normative, exactly-once): an accepted post() task runs with
+     * session == NULL ONLY during stop()/terminal drain (ep_drain_terminal).
+     * A managed facade can pump this cycle BEFORE its session is published --
+     * a WebTransport CONNECT still handshaking -- and draining here would hand
+     * fn a NULL session outside the terminal window, breaking that contract
+     * (and, for a client that reads NULL as "gone", tearing down a live,
+     * still-connecting session). So drain accepted tasks only once a live
+     * session exists; a pre-establishment (NULL) cycle still refreshes the
+     * cached endpoint state and runs attached hooks below, leaving the queue
+     * intact for a later live cycle or the terminal drain. */
+    if (session)
+        ep_drain_posted(ep, session, now_us);
 
     moq_endpoint_state_t st = MOQ_ENDPOINT_CONNECTING;
     if (session) {
@@ -439,8 +534,8 @@ static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
      * contract in endpoint_internal.h forbids re-entering public endpoint
      * APIs from inside. */
     for (int k = 0; k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
-        if (ep->hook_fn[k])
-            ep->hook_fn[k](ep, session, now_us, ep->hook_ctx[k]);
+        if (ep->hook_ops[k].pump)
+            ep->hook_ops[k].pump(ep, session, now_us, ep->hook_ctx[k]);
     }
     pthread_mutex_unlock(&ep->mu);
 }
@@ -449,7 +544,7 @@ static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
 
 /* Drain every queued task with the NULL-session closed marker (§5.4: each
  * accepted task runs exactly once; ctx cleanup is deterministic). Called
- * after the network thread is joined, so nothing races the queue. */
+ * after the managed context is quiesced, so nothing races the queue. */
 static void ep_drain_terminal(moq_endpoint_t *ep)
 {
     for (;;) {
@@ -463,9 +558,13 @@ static void ep_drain_terminal(moq_endpoint_t *ep)
 /* -- Facade dispatch -------------------------------------------------- */
 
 #ifdef MOQ_SERVICE_HAVE_PQ_THREADED
-static int ep_pq_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int ep_pq_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                      uint64_t now_us, void *ctx)
 {
+    (void)lane;
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    /* The endpoint is a single-lane client; moq_pq_threaded_session() is the
+     * documented client-session accessor, valid in the pump window. */
     ep_pump_cycle(ep, moq_pq_threaded_session(t), now_us);
     return 0;
 }
@@ -481,10 +580,39 @@ static int ep_wt_pump(moq_pico_wt_managed_t *m, uint64_t now_us, void *ctx)
 #endif
 
 #ifdef MOQ_SERVICE_HAVE_MVFST_MANAGED
-static int ep_mvfst_pump(moq_mvfst_managed_t *m, uint64_t now_us, void *ctx)
+static int ep_mvfst_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                         uint64_t now_us, void *ctx)
 {
+    (void)lane;
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    /* The endpoint is a single-lane client; moq_mvfst_managed_session() is the
+     * documented client-session accessor, valid in the pump window. */
     ep_pump_cycle(ep, moq_mvfst_managed_session(m), now_us);
+    return 0;
+}
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+/*
+ * MsQuic managed pump. The facade drives one lane per doorbell; this endpoint
+ * is a single-lane client, so the lane carries exactly one connection. Drive
+ * it through the lane's connection iterator (never the client-only
+ * moq_msquic_managed_session accessor) so the same shim is correct if a future
+ * sharded relay row runs the lane with multiple connections.
+ */
+static int ep_msquic_pump(moq_msquic_managed_t *m,
+                          moq_msquic_managed_lane_t *lane,
+                          uint64_t now_us, void *user)
+{
+    (void)m;
+    moq_endpoint_t *ep = (moq_endpoint_t *)user;
+    moq_msquic_managed_conn_t *c = moq_msquic_lane_next_conn(lane, NULL);
+    /* No connection yet (pre-CONNECTED): the session is NULL. ep_pump_cycle
+     * refreshes cached state (the app thread observes CONNECTING) but DEFERS
+     * accepted post() tasks per the §5.4 contract -- they run once a live
+     * session exists or in the terminal drain, never with a NULL session
+     * mid-connect. */
+    ep_pump_cycle(ep, c ? moq_msquic_managed_conn_session(c) : NULL, now_us);
     return 0;
 }
 #endif
@@ -495,6 +623,52 @@ static int ep_proxygen_pump(moq_proxygen_wt_managed_t *m, uint64_t now_us,
 {
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
     ep_pump_cycle(ep, moq_proxygen_wt_managed_session(m), now_us);
+    return 0;
+}
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+/*
+ * wtquic Network.framework managed pump. Drive the one client connection
+ * through the lane iterator (the same shim shape as MsQuic). NOTE this
+ * facade's pump begins only at establishment (the lane window never opens
+ * pre-establishment), so pump cycles -- posted-task drains and hook runs --
+ * start once the WT session is up; before that the endpoint stays
+ * CONNECTING and accepted tasks defer (they still run exactly once: at the
+ * first cycles, or in the terminal drain).
+ */
+static int ep_wtquic_network_pump(moq_wtquic_network_managed_t *m,
+                         moq_wtquic_network_managed_lane_t *lane,
+                         uint64_t now_us, void *user)
+{
+    (void)m;
+    moq_endpoint_t *ep = (moq_endpoint_t *)user;
+    moq_wtquic_network_managed_conn_t *c = moq_wtquic_network_lane_next_conn(lane, NULL);
+    ep_pump_cycle(ep, c ? moq_wtquic_network_managed_conn_session(c) : NULL,
+                  now_us);
+    return 0;
+}
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+/*
+ * wtquic-over-MsQuic managed pump. Same single-lane client shim as MsQuic and
+ * wtquic-Network: drive the one connection through the lane iterator (never the
+ * client-only session accessor) so the shim stays correct if a future sharded
+ * relay row runs the lane with multiple connections. Before establishment the
+ * lane still pumps to refresh state (the endpoint stays CONNECTING), but the
+ * session is NULL, so accepted post() tasks DEFER rather than drain -- they run
+ * on the first live cycle or in the terminal drain (see ep_pump_cycle).
+ */
+static int ep_wtquic_msquic_pump(moq_wtquic_msquic_managed_t *m,
+                        moq_wtquic_msquic_managed_lane_t *lane,
+                        uint64_t now_us, void *user)
+{
+    (void)m;
+    moq_endpoint_t *ep = (moq_endpoint_t *)user;
+    moq_wtquic_msquic_managed_conn_t *c = moq_wtquic_msquic_lane_next_conn(lane, NULL);
+    ep_pump_cycle(ep, c ? moq_wtquic_msquic_managed_conn_session(c) : NULL,
+                  now_us);
     return 0;
 }
 #endif
@@ -518,7 +692,10 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
  * picoquic form additionally reads picoquic's captured local error to tell a
  * TLS/certificate failure apart from a plain transport failure. */
 #if defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
 static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
                                 bool clean_closed,
                                 moq_endpoint_terminal_reason_t *reason,
@@ -648,6 +825,43 @@ static const ep_backend_vtable_t MVFST_VT = {
 };
 #endif
 
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+static moq_result_t  msquic_vt_wait(void *f, uint64_t t) { return moq_msquic_managed_wait((moq_msquic_managed_t *)f, t); }
+static void          msquic_vt_wake(void *f) { (void)moq_msquic_managed_wake((moq_msquic_managed_t *)f); }
+static moq_version_t msquic_vt_negver(void *f) { return moq_msquic_managed_negotiated_version((moq_msquic_managed_t *)f); }
+static bool          msquic_vt_is_fatal(void *f) { return moq_msquic_managed_is_fatal((moq_msquic_managed_t *)f); }
+static uint64_t      msquic_vt_fatal_code(void *f) { return moq_msquic_managed_fatal_code((moq_msquic_managed_t *)f); }
+/* MsQuic exposes a terminal-close accessor: a graceful close latches is_closed
+ * with is_fatal clear (fatal wins over closed when both latch, and
+ * ep_classify_generic checks is_fatal first), so this maps to a CLEAN terminal. */
+static bool          msquic_vt_clean_closed(void *f) { return moq_msquic_managed_is_closed((moq_msquic_managed_t *)f); }
+/* Unlike mvfst, MsQuic exposes public outbound-flush probes: the drain is idle
+ * once no connection is live and no stream send / datagram is still in flight.
+ * All three probes are thread-safe, so no wrong-thread case arises. */
+static int           msquic_vt_drain_state(void *f) {
+    moq_msquic_managed_t *m = (moq_msquic_managed_t *)f;
+    bool idle = moq_msquic_managed_conn_count(m) == 0 &&
+                moq_msquic_managed_pending_sends(m) <= 0 &&
+                moq_msquic_managed_pending_datagrams(m) <= 0;
+    return idle ? EP_DRAIN_DONE : EP_DRAIN_PENDING;
+}
+static moq_result_t  msquic_vt_stop(void *f) { return moq_msquic_managed_stop((moq_msquic_managed_t *)f); }
+static void          msquic_vt_destroy(void *f) { moq_msquic_managed_destroy((moq_msquic_managed_t *)f); }
+static void          msquic_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    /* MsQuic verifies internally and exposes no per-cnx transport error
+     * (PROTOCOL vs generic transport only), but it DOES expose a clean-close
+     * accessor: a graceful close maps to CLEAN, not NONE. */
+    ep_classify_generic(moq_msquic_managed_is_fatal((moq_msquic_managed_t *)f),
+        moq_msquic_managed_fatal_code((moq_msquic_managed_t *)f),
+        moq_msquic_managed_is_closed((moq_msquic_managed_t *)f), r, d);
+}
+static const ep_backend_vtable_t MSQUIC_VT = {
+    msquic_vt_wait, msquic_vt_wake, msquic_vt_negver, msquic_vt_is_fatal,
+    msquic_vt_fatal_code, msquic_vt_clean_closed, msquic_vt_drain_state,
+    msquic_vt_stop, msquic_vt_destroy, msquic_vt_terminal,
+};
+#endif
+
 #ifdef MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED
 static moq_result_t  proxygen_vt_wait(void *f, uint64_t t) { return moq_proxygen_wt_managed_wait((moq_proxygen_wt_managed_t *)f, t); }
 static void          proxygen_vt_wake(void *f) { (void)moq_proxygen_wt_managed_wake((moq_proxygen_wt_managed_t *)f); }
@@ -668,6 +882,114 @@ static const ep_backend_vtable_t PROXYGEN_VT = {
     proxygen_vt_wait, proxygen_vt_wake, proxygen_vt_negver, proxygen_vt_is_fatal,
     proxygen_vt_fatal_code, proxygen_vt_clean_closed, proxygen_vt_drain_state,
     proxygen_vt_stop, proxygen_vt_destroy, proxygen_vt_terminal,
+};
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+/* The endpoint's public calls run on the app thread, which is off the
+ * facade's serial-queue domain, so the blocking wait/stop compositions are
+ * legal here by construction (on-domain they would be refused). */
+static moq_result_t  wtquic_network_vt_wait(void *f, uint64_t t) { return moq_wtquic_network_managed_wait((moq_wtquic_network_managed_t *)f, t); }
+/* best-effort per the endpoint wake contract: non-allocating and
+ * infallible to call; a wake racing the facade's stop may be absorbed
+ * by teardown, which the contract's "harmless during/after terminal
+ * teardown" already covers */
+static void          wtquic_network_vt_wake(void *f) { (void)moq_wtquic_network_managed_wake((moq_wtquic_network_managed_t *)f); }
+static moq_version_t wtquic_network_vt_negver(void *f) { return moq_wtquic_network_managed_negotiated_version((moq_wtquic_network_managed_t *)f); }
+static bool          wtquic_network_vt_is_fatal(void *f) { return moq_wtquic_network_managed_is_fatal((moq_wtquic_network_managed_t *)f); }
+static uint64_t      wtquic_network_vt_fatal_code(void *f) { return moq_wtquic_network_managed_fatal_code((moq_wtquic_network_managed_t *)f); }
+static bool          wtquic_network_vt_clean_closed(void *f) { return moq_wtquic_network_managed_is_closed((moq_wtquic_network_managed_t *)f); }
+/* No public outbound-flush probe -> drain unsupported (never claim a drain
+ * the backend cannot verify; same stance as mvfst/proxygen). */
+static int           wtquic_network_vt_drain_state(void *f) { (void)f; return EP_DRAIN_UNSUPPORTED; }
+static moq_result_t  wtquic_network_vt_stop(void *f) { return moq_wtquic_network_managed_stop((moq_wtquic_network_managed_t *)f); }
+static void          wtquic_network_vt_destroy(void *f) { moq_wtquic_network_managed_destroy((moq_wtquic_network_managed_t *)f); }
+/*
+ * Pure classification (declared in endpoint_internal.h for white-box
+ * tests). By PROVENANCE, not an OSStatus allowlist: NW_TRUST is sealed
+ * only by wtquic's explicit trust evaluator (the peer's chain failed
+ * SecTrustEvaluateWithError) -> TLS_CERTIFICATE; NW_TLS is any other
+ * TLS-domain error NW itself delivered -> TLS; every other captured
+ * record (NW_POSIX, NW_DNS, BACKEND) -> TRANSPORT. Each preserves the
+ * RAW native_code bits as the detail (Security OSStatus values are
+ * negative: errSecNotTrusted -67843 for a self-signed peer) -- the
+ * terminal contract promises the backend's native detail, never a
+ * codeless collapse. A MoQ/bridge protocol fatal (nonzero code) takes
+ * precedence, as everywhere.
+ */
+void moq_endpoint_classify_wtquic_network(bool fatal, uint64_t fatal_code,
+                                 bool clean_closed, bool have_record,
+                                 const wtq_transport_error_t *rec,
+                                 moq_endpoint_terminal_reason_t *reason,
+                                 uint64_t *detail)
+{
+    if (fatal && fatal_code == 0 && have_record && rec != NULL &&
+        rec->native_domain != (uint32_t)WTQ_ERRDOM_NONE) {
+        if (rec->native_domain == (uint32_t)WTQ_ERRDOM_NW_TRUST)
+            *reason = MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE;
+        else if (rec->native_domain == (uint32_t)WTQ_ERRDOM_NW_TLS)
+            *reason = MOQ_ENDPOINT_TERMINAL_TLS;
+        else
+            *reason = MOQ_ENDPOINT_TERMINAL_TRANSPORT;
+        *detail = (uint64_t)rec->native_code;
+        return;
+    }
+    ep_classify_generic(fatal, fatal_code, clean_closed, reason, detail);
+}
+
+static void          wtquic_network_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    moq_wtquic_network_managed_t *m = (moq_wtquic_network_managed_t *)f;
+    bool fatal = moq_wtquic_network_managed_is_fatal(m);
+    uint64_t code = moq_wtquic_network_managed_fatal_code(m);
+    wtq_transport_error_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.struct_size = (uint32_t)sizeof(rec);
+    bool have = fatal && code == 0 &&
+                moq_wtquic_network_managed_transport_error(m, &rec);
+    moq_endpoint_classify_wtquic_network(fatal, code,
+                                moq_wtquic_network_managed_is_closed(m),
+                                have, &rec, r, d);
+}
+static const ep_backend_vtable_t WTQUIC_NETWORK_VT = {
+    wtquic_network_vt_wait, wtquic_network_vt_wake, wtquic_network_vt_negver, wtquic_network_vt_is_fatal,
+    wtquic_network_vt_fatal_code, wtquic_network_vt_clean_closed, wtquic_network_vt_drain_state,
+    wtquic_network_vt_stop, wtquic_network_vt_destroy, wtquic_network_vt_terminal,
+};
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+/* The endpoint's public calls run on the app thread, off the facade's
+ * coordinator/doorbell domain, so the blocking wait/stop compositions are legal
+ * here by construction (inside a callback they would be refused). */
+static moq_result_t  wtquic_msquic_vt_wait(void *f, uint64_t t) { return moq_wtquic_msquic_managed_wait((moq_wtquic_msquic_managed_t *)f, t); }
+static void          wtquic_msquic_vt_wake(void *f) { (void)moq_wtquic_msquic_managed_wake((moq_wtquic_msquic_managed_t *)f); }
+static moq_version_t wtquic_msquic_vt_negver(void *f) { return moq_wtquic_msquic_managed_negotiated_version((moq_wtquic_msquic_managed_t *)f); }
+static bool          wtquic_msquic_vt_is_fatal(void *f) { return moq_wtquic_msquic_managed_is_fatal((moq_wtquic_msquic_managed_t *)f); }
+static uint64_t      wtquic_msquic_vt_fatal_code(void *f) { return moq_wtquic_msquic_managed_fatal_code((moq_wtquic_msquic_managed_t *)f); }
+static bool          wtquic_msquic_vt_clean_closed(void *f) { return moq_wtquic_msquic_managed_is_closed((moq_wtquic_msquic_managed_t *)f); }
+/* No truthful outbound-flush probe: this facade exposes no per-connection
+ * pending send/datagram count, and conn_count is not maintained for the single
+ * client connection -- so any "idle" answer would be a guess that reports DONE
+ * for a live client and truncates the drain. Report UNSUPPORTED (the caller maps
+ * it to MOQ_ERR_UNSUPPORTED) rather than claim a drain the backend cannot prove;
+ * same stance as mvfst/proxygen/wtquic-Network. A truthful probe would require an
+ * attach-level pending-bytes API this facade does not expose. */
+static int           wtquic_msquic_vt_drain_state(void *f) { (void)f; return EP_DRAIN_UNSUPPORTED; }
+static moq_result_t  wtquic_msquic_vt_stop(void *f) { return moq_wtquic_msquic_managed_stop((moq_wtquic_msquic_managed_t *)f); }
+static void          wtquic_msquic_vt_destroy(void *f) { moq_wtquic_msquic_managed_destroy((moq_wtquic_msquic_managed_t *)f); }
+static void          wtquic_msquic_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    /* Generic classification only: the facade exposes no per-connection
+     * transport-error detail, so PROTOCOL vs generic transport (with a clean
+     * close mapping to CLEAN) is the whole story -- do not invent TLS detail. */
+    moq_wtquic_msquic_managed_t *m = (moq_wtquic_msquic_managed_t *)f;
+    ep_classify_generic(moq_wtquic_msquic_managed_is_fatal(m),
+        moq_wtquic_msquic_managed_fatal_code(m),
+        moq_wtquic_msquic_managed_is_closed(m), r, d);
+}
+static const ep_backend_vtable_t WTQUIC_MSQUIC_VT = {
+    wtquic_msquic_vt_wait, wtquic_msquic_vt_wake, wtquic_msquic_vt_negver, wtquic_msquic_vt_is_fatal,
+    wtquic_msquic_vt_fatal_code, wtquic_msquic_vt_clean_closed, wtquic_msquic_vt_drain_state,
+    wtquic_msquic_vt_stop, wtquic_msquic_vt_destroy, wtquic_msquic_vt_terminal,
 };
 #endif
 
@@ -699,13 +1021,17 @@ void moq_endpoint_wake(moq_endpoint_t *ep)
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep)
 {
     if (ep->vt && ep->facade) return ep->vt->negotiated_version(ep->facade);
     return (moq_version_t)0;
 }
-#endif /* any facade */
+#endif /* any facade (or the bare-endpoint test seam) */
 
 static bool ep_facade_is_fatal(const moq_endpoint_t *ep)
 {
@@ -755,7 +1081,10 @@ static bool ep_terminal(const moq_endpoint_t *ep)
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
 static char *ep_strdup_bytes(const moq_alloc_t *a, moq_bytes_t b, size_t *len)
 {
     char *p = (char *)a->alloc(b.len + 1, a->ctx);
@@ -789,7 +1118,10 @@ static void ep_free_strings(moq_endpoint_t *ep)
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
 
 typedef moq_result_t (*ep_backend_create_fn)(moq_endpoint_t *ep,
                                              const moq_endpoint_resolved_t *r,
@@ -819,8 +1151,10 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
     fc.configure_quic = ep_configure_quic;
     fc.configure_quic_ctx = ep;
-    fc.on_pump = ep_pq_pump;
-    fc.on_pump_ctx = ep;
+    fc.on_lane_pump = ep_pq_pump;
+    fc.on_lane_pump_ctx = ep;
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -836,9 +1170,11 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
                                  const moq_endpoint_cfg_t *cfg)
 {
     moq_pico_wt_managed_cfg_t fc;
-    moq_pico_wt_managed_cfg_init(&fc);
+    moq_pico_wt_managed_cfg_init_sized(&fc, sizeof(fc));  /* enables app_deadline */
     fc.alloc = &ep->alloc;
     fc.perspective = MOQ_PERSPECTIVE_CLIENT;
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
     /* See the RAW_QUIC branch: grant the peer request capacity so it can
      * subscribe to published tracks. */
     fc.send_request_capacity = true;
@@ -897,13 +1233,80 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
      * (NULL = system roots), with the SNI as the checked identity. */
     if (!cfg->insecure_skip_verify && ep->ca_file)
         fc.cert_path = ep->ca_file;
-    fc.on_pump = ep_mvfst_pump;
+    fc.on_lane_pump = ep_mvfst_pump;
     fc.user_ctx = ep;
+    /* app service-deadline (media_sender catalog refresh, etc.): folded into the
+     * EventBase pump's earliest deadline. Sized init covered the block. */
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
     moq_mvfst_managed_t *fac = NULL;
     moq_result_t crc = moq_mvfst_managed_create(&fc, &fac);
     if (crc < 0) return crc;
     ep->facade = fac;
     ep->vt = &MVFST_VT;
+    return MOQ_OK;
+}
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
+                                     const moq_endpoint_resolved_t *r,
+                                     const moq_endpoint_cfg_t *cfg)
+{
+    /* Exact-version only: the managed MsQuic adapter creates the MoQ session
+     * before the ALPN handshake (single offered ALPN), so it cannot negotiate
+     * a multi-version offer. Require exactly one offered version and pass it as
+     * the facade's single version. AUTO (newest-first) therefore needs an
+     * EXACT version policy for MsQuic, like mvfst. */
+    if (ep->alpn_offer_count != 1)
+        return MOQ_ERR_UNSUPPORTED;
+    /* The one offered ALPN token round-trips to its version (the offer was
+     * built from moq_alpn_for_version). */
+    moq_version_t version = 0;
+    if (!moq_alpn_to_version(ep->alpn_offer[0], strlen(ep->alpn_offer[0]),
+                             &version))
+        return MOQ_ERR_UNSUPPORTED;
+
+    /* TLS knobs the managed MsQuic facade cannot honor yet are REJECTED, not
+     * silently ignored (the endpoint contract honors cfg.sni and cfg.ca_file).
+     * moq_msquic_managed exposes only host (used as both remote and TLS server
+     * name) + insecure_skip_verify -- no separate SNI, no CA-file field. So:
+     *   - custom CA roots (ca_file set with verification on): unsupported.
+     *   - explicit SNI override (resolved sni != url host): unsupported.
+     * insecure_skip_verify (self-signed loopback) and default verification
+     * against the platform/system roots stay supported. */
+    if (!cfg->insecure_skip_verify && ep->ca_file != NULL)
+        return MOQ_ERR_UNSUPPORTED;
+    if (ep->sni != NULL && ep->host != NULL &&
+        strcmp(ep->sni, ep->host) != 0)
+        return MOQ_ERR_UNSUPPORTED;
+
+    moq_msquic_managed_cfg_t fc;
+    /* Sized init: this endpoint sets the appended `version` field, so the
+     * pointer-only init (frozen prefix) would leave it at the default. */
+    moq_msquic_managed_cfg_init_sized(&fc, sizeof(fc));
+    fc.alloc = &ep->alloc;
+    fc.perspective = MOQ_PERSPECTIVE_CLIENT;
+    fc.host = ep->host;                 /* remote + TLS server name (sni==host,
+                                           enforced above) */
+    fc.port = (uint16_t)r->url.port;
+    fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    /* See the picoquic branch: grant the peer request capacity so it can
+     * subscribe to tracks this endpoint publishes. */
+    fc.send_request_capacity = true;
+    fc.initial_request_capacity = 64;
+    fc.version = version;
+    fc.on_lane_pump = ep_msquic_pump;
+    fc.on_lane_pump_user = ep;
+    /* app service-deadline (media_sender catalog refresh, etc.): folded into
+     * each lane doorbell's next-wait computation. Sized init covered the block. */
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
+    moq_msquic_managed_t *fac = NULL;
+    moq_result_t crc = moq_msquic_managed_create(&fc, &fac);
+    if (crc < 0) return crc;
+    ep->facade = fac;
+    ep->vt = &MSQUIC_VT;
     return MOQ_OK;
 }
 #endif
@@ -948,13 +1351,148 @@ static moq_result_t ep_create_proxygen(moq_endpoint_t *ep,
 }
 #endif
 
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+static moq_result_t ep_create_wtquic_network(moq_endpoint_t *ep,
+                                             const moq_endpoint_resolved_t *r,
+                                             const moq_endpoint_cfg_t *cfg)
+{
+    /* TLS knobs the facade cannot honor are REJECTED, not silently ignored
+     * (the endpoint contract honors cfg.sni and cfg.ca_file). The facade
+     * exposes only host (remote + TLS server name, via Network.framework's
+     * system trust) + insecure_skip_verify -- no separate SNI, no CA-file
+     * field. Same policy as the MsQuic backend. */
+    if (!cfg->insecure_skip_verify && ep->ca_file != NULL)
+        return MOQ_ERR_UNSUPPORTED;
+    if (ep->sni != NULL && ep->host != NULL &&
+        strcmp(ep->sni, ep->host) != 0)
+        return MOQ_ERR_UNSUPPORTED;
+
+    /* The facade's wt_protocols is a comma-separated UNQUOTED token list in
+     * preference order (it builds the header itself) -- NOT the pico_wt
+     * quoted wt_offer string. Negotiation is real, so the full multi-version
+     * offer (AUTO/LIST) passes through. The facade copies the string. */
+    char offer[MOQ_ENDPOINT_MAX_VERSIONS * 16];
+    size_t off = 0;
+    for (size_t i = 0; i < ep->alpn_offer_count; i++) {
+        size_t n = strlen(ep->alpn_offer[i]);
+        if (off + n + 3 > sizeof(offer))
+            return MOQ_ERR_INTERNAL;   /* unreachable: 8 short tokens */
+        if (i > 0) { offer[off++] = ','; offer[off++] = ' '; }
+        memcpy(offer + off, ep->alpn_offer[i], n);
+        off += n;
+    }
+    offer[off] = '\0';
+
+    moq_wtquic_network_managed_cfg_t fc;
+    moq_wtquic_network_managed_cfg_init(&fc);
+    fc.alloc = &ep->alloc;
+    fc.host = ep->host;                 /* remote + TLS server name (sni==host,
+                                           enforced above) */
+    fc.port = (int)r->url.port;
+    fc.path = ep->path;
+    fc.wt_protocols = ep->alpn_offer_count > 0 ? offer : NULL;
+    fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    /* See the picoquic branch: grant the peer request capacity so it can
+     * subscribe to tracks this endpoint publishes. */
+    fc.send_request_capacity = true;
+    fc.initial_request_capacity = 64;
+    fc.on_lane_pump = ep_wtquic_network_pump;
+    fc.on_lane_pump_user = ep;
+    fc.perspective = MOQ_PERSPECTIVE_CLIENT;   /* explicit: client-only */
+    fc.lane_count = 1;                         /* explicit: single lane */
+    /* the app service-deadline (media_sender catalog refresh, etc.): the
+     * pointer init stamped the full struct, so the block is honored and
+     * the facade folds it into the native delayed doorbell. */
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
+    moq_wtquic_network_managed_t *fac = NULL;
+    moq_result_t crc = moq_wtquic_network_managed_create(&fc, &fac);
+    if (crc < 0) return crc;
+    ep->facade = fac;
+    ep->vt = &WTQUIC_NETWORK_VT;
+    return MOQ_OK;
+}
+#endif
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+static moq_result_t ep_create_wtquic_msquic(moq_endpoint_t *ep,
+                                            const moq_endpoint_resolved_t *r,
+                                            const moq_endpoint_cfg_t *cfg)
+{
+    /* TLS knobs the facade cannot honor are REJECTED, not silently ignored (the
+     * endpoint contract honors cfg.sni and cfg.ca_file). The facade exposes only
+     * host (remote + TLS server name) + insecure_skip_verify -- no separate SNI,
+     * no CA-file field. Same policy as the MsQuic and wtquic-Network backends. */
+    if (!cfg->insecure_skip_verify && ep->ca_file != NULL)
+        return MOQ_ERR_UNSUPPORTED;
+    if (ep->sni != NULL && ep->host != NULL &&
+        strcmp(ep->sni, ep->host) != 0)
+        return MOQ_ERR_UNSUPPORTED;
+
+    moq_wtquic_msquic_managed_cfg_t fc;
+    /* Sized init: this endpoint sets appended fields (send_request_capacity,
+     * lane_count), so the pointer-only init (frozen prefix) would leave them at
+     * their defaults. */
+    moq_wtquic_msquic_managed_cfg_init_sized(&fc, sizeof(fc));
+    fc.alloc = &ep->alloc;
+    fc.perspective = MOQ_PERSPECTIVE_CLIENT;   /* explicit: client-only */
+    fc.host = ep->host;                 /* remote + TLS server name (sni==host,
+                                           enforced above) */
+    fc.port = (uint16_t)r->url.port;
+    fc.wt_path = ep->path;
+    fc.insecure_skip_verify = cfg->insecure_skip_verify;
+    /* The facade takes the WT-protocol token vector directly (it builds the
+     * WT-Available-Protocols header itself, negotiation is real): pass the
+     * parsed offer array and count, so the full multi-version offer (AUTO/LIST)
+     * passes through. NULL/0 would select the facade default. */
+    fc.wt_protocols = ep->alpn_offer_count > 0 ? ep->alpn_offer : NULL;
+    fc.wt_protocol_count = ep->alpn_offer_count;
+    /* See the picoquic branch: grant the peer request capacity so it can
+     * subscribe to tracks this endpoint publishes. */
+    fc.send_request_capacity = true;
+    fc.initial_request_capacity = 64;
+    fc.lane_count = 1;                         /* explicit: single lane */
+    fc.on_lane_pump = ep_wtquic_msquic_pump;
+    fc.on_lane_pump_user = ep;
+    /* app service-deadline (media_sender catalog refresh, etc.): folded into
+     * each lane pump's recomputed deadline. Sized init covered the block. */
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
+    /* WebTransport wire profile: map the service enum EXPLICITLY onto the
+     * adapter enum. The two do NOT share numeric values -- the service enum
+     * carries a BACKEND_DEFAULT sentinel the adapter has no notion of. The
+     * resolver already gated/validated the value and guaranteed this backend is
+     * the only one that accepts an explicit selection; BACKEND_DEFAULT resolves
+     * to the backend's default (CURRENT). */
+    switch (r->wt_profile) {
+    case MOQ_WT_PROFILE_D13_14_COMPAT:
+        fc.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT;
+        break;
+    case MOQ_WT_PROFILE_CURRENT:
+    case MOQ_WT_PROFILE_BACKEND_DEFAULT:
+    default:
+        fc.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT;
+        break;
+    }
+    moq_wtquic_msquic_managed_t *fac = NULL;
+    moq_result_t crc = moq_wtquic_msquic_managed_create(&fc, &fac);
+    if (crc < 0) return crc;
+    ep->facade = fac;
+    ep->vt = &WTQUIC_MSQUIC_VT;
+    return MOQ_OK;
+}
+#endif
+
 typedef struct ep_backend_row {
     moq_transport_protocol_t protocol;
     moq_transport_backend_t  backend;
     ep_backend_create_fn     create;
 } ep_backend_row_t;
 
-/* Preference order within a protocol (first available wins for AUTO). */
+/* One row per (protocol, backend); AUTO already resolved to PICOQUIC at
+ * cfg resolution, so lookup here is exact -- never first-available. */
 static const ep_backend_row_t EP_BACKENDS[] = {
 #ifdef MOQ_SERVICE_HAVE_PQ_THREADED
     { MOQ_TRANSPORT_PROTOCOL_RAW_QUIC,     MOQ_TRANSPORT_BACKEND_PICOQUIC, ep_create_pq },
@@ -967,21 +1505,62 @@ static const ep_backend_row_t EP_BACKENDS[] = {
      * only by an explicit backend = MVFST. */
     { MOQ_TRANSPORT_PROTOCOL_RAW_QUIC,     MOQ_TRANSPORT_BACKEND_MVFST,    ep_create_mvfst },
 #endif
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+    /* After picoquic: AUTO RAW_QUIC still picks picoquic; MsQuic is reached
+     * only by an explicit backend = MSQUIC. Uses the lane pump API and is the
+     * intended path for future sharded relay work. */
+    { MOQ_TRANSPORT_PROTOCOL_RAW_QUIC,     MOQ_TRANSPORT_BACKEND_MSQUIC,   ep_create_msquic },
+#endif
 #ifdef MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED
     /* After pico_wt: AUTO WEBTRANSPORT still picks pico_wt; proxygen is
      * reached only by an explicit backend = PROXYGEN. */
     { MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT, MOQ_TRANSPORT_BACKEND_PROXYGEN, ep_create_proxygen },
 #endif
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+    /* After pico_wt/proxygen: AUTO WEBTRANSPORT still picks pico_wt when
+     * built; the Network.framework client is reached only by an explicit
+     * backend = WTQUIC_NETWORK. Lane pump API; Apple/client-only. */
+    { MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT, MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK, ep_create_wtquic_network },
+#endif
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+    /* After pico_wt/proxygen/wtquic-Network: AUTO WEBTRANSPORT still picks
+     * pico_wt when built; the wtquic-over-MsQuic client is reached only by an
+     * explicit backend = WTQUIC_MSQUIC. Lane pump API; cross-platform,
+     * client-only. */
+    { MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT, MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC, ep_create_wtquic_msquic },
+#endif
 };
 
 #endif /* any facade */
 
-void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg)
+/* The frozen v0 floor must anchor exactly at the first appended field
+ * (wt_profile): everything through `alloc` is v0, wt_profile is the first tail
+ * field. If a field is inserted before wt_profile this assert fires -- move it
+ * past the floor instead. */
+_Static_assert(MOQ_ENDPOINT_CFG_V0_SIZE ==
+                   offsetof(moq_endpoint_cfg_t, wt_profile),
+               "moq_endpoint_cfg_t v0 floor must end exactly at wt_profile");
+
+void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_endpoint_cfg_t);
-    cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
+    if (cfg_size > sizeof(*cfg)) cfg_size = sizeof(*cfg);
+    memset(cfg, 0, cfg_size);
+    if (cfg_size >= sizeof(uint32_t))
+        cfg->struct_size = (uint32_t)cfg_size;
+    /* perspective (v0, CLIENT is the v0 default) -- set only when covered so we
+     * never write past cfg_size for an undersized caller. */
+    if (cfg_size >= offsetof(moq_endpoint_cfg_t, perspective) +
+                        sizeof(cfg->perspective))
+        cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
+}
+
+void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg)
+{
+    /* Pointer-only: clear and stamp ONLY the frozen v0 prefix, so this can
+     * never overflow the buffer of an old caller that predates a tail field.
+     * Tail fields (wt_profile) require moq_endpoint_cfg_init_sized(). */
+    moq_endpoint_cfg_init_sized(cfg, MOQ_ENDPOINT_CFG_V0_SIZE);
 }
 
 moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
@@ -998,17 +1577,23 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
 #if !defined(MOQ_SERVICE_HAVE_PQ_THREADED) && \
     !defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) && \
-    !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    !defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
     return MOQ_ERR_UNSUPPORTED;   /* no managed facade in this build */
 #else
     if (r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {
 #if !defined(MOQ_SERVICE_HAVE_PQ_THREADED) && \
-    !defined(MOQ_SERVICE_HAVE_MVFST_MANAGED)
+    !defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED)
         return MOQ_ERR_UNSUPPORTED;   /* no raw-QUIC facade built */
 #endif
     } else {
 #if !defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) && \
-    !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED)
+    !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
         return MOQ_ERR_UNSUPPORTED;   /* no WebTransport facade built */
 #endif
     }
@@ -1125,12 +1710,14 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
 
 moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
                                       moq_endpoint_hook_kind_t kind,
-                                      moq_endpoint_hook_fn fn, void *ctx)
+                                      const moq_endpoint_hook_ops_t *ops,
+                                      void *ctx)
 {
-    if (!ep || !fn || kind < 0 || kind >= MOQ_ENDPOINT_HOOK_KIND_COUNT)
+    if (!ep || !ops || !ops->pump ||
+        kind < 0 || kind >= MOQ_ENDPOINT_HOOK_KIND_COUNT)
         return MOQ_ERR_INVAL;
     pthread_mutex_lock(&ep->mu);
-    if (ep->stopped || ep->hook_fn[kind]) {
+    if (ep->stopped || ep->hook_ops[kind].pump) {
         pthread_mutex_unlock(&ep->mu);
         return MOQ_ERR_WRONG_STATE;
     }
@@ -1141,11 +1728,31 @@ moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
         pthread_mutex_unlock(&ep->mu);
         return MOQ_ERR_CLOSED;
     }
-    ep->hook_fn[kind] = fn;
+    ep->hook_ops[kind] = *ops;          /* copied by value */
     ep->hook_ctx[kind] = ctx;
     ep->attachments++;
     pthread_mutex_unlock(&ep->mu);
     return MOQ_OK;
+}
+
+/* Aggregate app-service deadline across attached hooks (ctx = the endpoint).
+ * Runs on the managed context after a pump, OUTSIDE the pump's exclusive window;
+ * takes ep->mu then each hook's own lock (ep->mu -> s->mu) and calls only the
+ * hooks' pure cached next_deadline_us reads. */
+uint64_t moq_endpoint_app_deadline_us(void *ctx)
+{
+    moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    if (!ep) return UINT64_MAX;
+    uint64_t d = UINT64_MAX;
+    pthread_mutex_lock(&ep->mu);
+    for (int k = 0; k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
+        if (ep->hook_ops[k].pump && ep->hook_ops[k].next_deadline_us) {
+            uint64_t hd = ep->hook_ops[k].next_deadline_us(ep->hook_ctx[k]);
+            if (hd < d) d = hd;
+        }
+    }
+    pthread_mutex_unlock(&ep->mu);
+    return d;
 }
 
 bool moq_endpoint_interrupted_internal(const moq_endpoint_t *ep)
@@ -1185,8 +1792,8 @@ void moq_endpoint_detach_hook(moq_endpoint_t *ep,
 {
     if (!ep || kind < 0 || kind >= MOQ_ENDPOINT_HOOK_KIND_COUNT) return;
     pthread_mutex_lock(&ep->mu);
-    if (ep->hook_fn[kind] && ep->hook_ctx[kind] == ctx) {
-        ep->hook_fn[kind] = NULL;
+    if (ep->hook_ops[kind].pump && ep->hook_ctx[kind] == ctx) {
+        ep->hook_ops[kind] = (moq_endpoint_hook_ops_t){0};
         ep->hook_ctx[kind] = NULL;
         ep->attachments--;
     }
@@ -1212,7 +1819,7 @@ moq_result_t moq_endpoint_stop(moq_endpoint_t *ep)
     atomic_store(&ep->closed, true);   /* mirror for ep->mu-free readers */
     pthread_mutex_unlock(&ep->mu);
 
-    /* The network thread is joined: drain accepted tasks with the
+    /* The managed context is quiesced: drain accepted tasks with the
      * NULL-session closed marker (exactly-once; ctx cleanup deterministic). */
     ep_drain_terminal(ep);
     return MOQ_OK;
@@ -1282,7 +1889,7 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
     if (atomic_load(&ep->interrupted)) return MOQ_ERR_INTERRUPTED;
 
     /* App-thread only, and only backends that can actually prove drain. The
-     * network thread drives the flush, so calling this from a hook would
+     * managed context drives the flush, so calling this from a hook would
      * deadlock the very progress it waits on. */
     int ds = ep_facade_drain_state(ep);
     if (ds == EP_DRAIN_UNSUPPORTED)  return MOQ_ERR_UNSUPPORTED;
@@ -1307,7 +1914,7 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
         uint64_t remaining = timeout_us - elapsed;
         uint64_t slice = remaining < EP_DRAIN_POLL_SLICE_US
                        ? remaining : EP_DRAIN_POLL_SLICE_US;
-        /* Actively kick the network thread so it makes send progress and
+        /* Actively kick the managed context so it makes send progress and
          * re-evaluates the drain state -- do not rely on autonomous packet-loop
          * wakeups alone (an idle loop with a pending FIN would never re-probe).
          * Then wait a bounded slice and re-check at the top. */
@@ -1407,7 +2014,7 @@ static moq_result_t ep_post_impl(moq_endpoint_t *ep, moq_endpoint_task_fn fn,
     if (ep->stopped) {
         /* stop() finished its terminal drain while we allocated. The task
          * was never accepted into the queue, and an accepted task only ever
-         * runs on the network thread (or its post-join drain) -- never
+         * runs on the managed context (or its post-quiesce drain) -- never
          * inline on the caller. So this is the post-after-terminal case:
          * free the node, never run fn; the caller still owns ctx. */
         pthread_mutex_unlock(&ep->mu);
@@ -1419,7 +2026,7 @@ static moq_result_t ep_post_impl(moq_endpoint_t *ep, moq_endpoint_task_fn fn,
     ep->q_tail = t;
     pthread_mutex_unlock(&ep->mu);
 
-    /* Wake the network thread so the task runs promptly. A terminal wake is
+    /* Wake the managed context so the task runs promptly. A terminal wake is
      * harmless: stop()'s drain owns any task the pump no longer reaches. */
     ep_facade_wake(ep);
     return MOQ_OK;
@@ -1498,5 +2105,20 @@ size_t moq_endpoint_test_task_count(moq_endpoint_t *ep)
     for (ep_task_t *t = ep->q_head; t; t = t->next) n++;
     pthread_mutex_unlock(&ep->mu);
     return n;
+}
+
+/* Run one full pump cycle (the real ep_pump_cycle: the session-gated task drain
+ * + state refresh + hooks). Drives the NULL-vs-live post() contract directly. */
+void moq_endpoint_test_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
+                                  uint64_t now_us)
+{
+    ep_pump_cycle(ep, session, now_us);
+}
+
+/* Run the terminal drain (the sole NULL-session task drain, §5.4): every queued
+ * task runs exactly once with the closed marker. */
+void moq_endpoint_test_drain_terminal(moq_endpoint_t *ep)
+{
+    ep_drain_terminal(ep);
 }
 #endif /* MOQ_MEDIA_SENDER_TESTING || MOQ_MEDIA_RECEIVER_TESTING */

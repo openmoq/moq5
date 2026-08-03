@@ -13,7 +13,9 @@
  *     written to every same-shard recipient. moq_pub_write_object retains
  *     it via a non-atomic incref (cheap), so the buffer is shared, never
  *     cloned. We prove this by watching moq_rcbuf_refcount rise by exactly
- *     one per accepted write. (Crossing a shard boundary would instead
+ *     one per accepted write -- and by one more for a PARTIAL write, whose
+ *     pending-operation snapshot retains the payload so the retry is
+ *     byte-exact without a host-side copy. (Crossing a shard boundary would instead
  *     require moq_rcbuf_clone(dst_alloc, src, out) /
  *     moq::buffer::clone_for_shard(dst_alloc) — not used here, because all
  *     recipients live on this one thread / executor-affinity domain.)
@@ -23,9 +25,9 @@
  *     moq_pub_write_object returns MOQ_ERR_WOULD_BLOCK for THAT recipient
  *     only. The host records it for retry and KEEPS GOING — the block must
  *     not abort the fan-out or drop the other recipients' data. Here
- *     recipient B models a slow/backed-up consumer (its action queue is
- *     pre-filled), while A and C accept normally; B is retried after its
- *     queue drains.
+ *     recipient B models a slow/backed-up consumer (a one-action queue:
+ *     its subgroup open lands, the data write blocks), while A and C accept
+ *     normally; B's SAME write is retried after its queue drains.
  *
  * "Blocked recipient" here means: that recipient's session action queue is
  * full, so the publisher cannot enqueue the SEND_DATA action and returns
@@ -178,24 +180,11 @@ int main(void)
      * queue so we can model it as a backed-up/slow consumer. */
     recipient_t rcpts[3];
     recipient_setup(&alloc, 42, 0,  &rcpts[0]);  /* A: default queue */
-    recipient_setup(&alloc, 43, 8,  &rcpts[1]);  /* B: shallow queue  */
+    recipient_setup(&alloc, 43, 1,  &rcpts[1]);  /* B: one-action queue:
+                                                    the fan write itself
+                                                    splits (open lands,
+                                                    the data write blocks) */
     recipient_setup(&alloc, 44, 0,  &rcpts[2]);  /* C: default queue */
-
-    /* --- Make recipient B "blocked": fill its action queue with a
-     *     separate filler stream (kept off the shared-payload refcount so
-     *     the shared-reuse math below stays exact). --- */
-    {
-        uint8_t fill[] = { 0x01 };
-        moq_rcbuf_t *filler = NULL;
-        moq_rcbuf_create(&alloc, fill, sizeof(fill), &filler);
-        moq_result_t frc = MOQ_OK;
-        for (uint64_t oid = 0; oid < 1000 && frc == MOQ_OK; oid++)
-            frc = moq_pub_write_object(rcpts[1].pub, rcpts[1].track,
-                                       0, oid, filler,
-                                       moq_simpair_now_us(rcpts[1].sp));
-        MOQ_TEST_CHECK(frc == MOQ_ERR_WOULD_BLOCK);  /* B's queue is now full */
-        moq_rcbuf_decref(filler);
-    }
 
     /* --- The shared payload and the host fan-out loop --- */
     uint8_t data[] = { 0xDE, 0xAD, 0xBE, 0xEF };
@@ -217,7 +206,10 @@ int main(void)
             rcpts[i].delivered = true;
             accepted++;
         } else if (rc == MOQ_ERR_WOULD_BLOCK) {
-            rcpts[i].blocked = true;   /* record for retry, do NOT abort */
+            /* Partial: the write must be retried AS-IS (byte-identical --
+             * the facade retained the payload snapshot); record it and
+             * KEEP GOING. */
+            rcpts[i].blocked = true;
             blocked++;
         } else {
             MOQ_TEST_CHECK(0);         /* unexpected error */
@@ -231,9 +223,11 @@ int main(void)
     MOQ_TEST_CHECK(rcpts[2].delivered && !rcpts[2].blocked);  /* C accepted */
     MOQ_TEST_CHECK(accepted == 2 && blocked == 1);
 
-    /* SHARED, NOT CLONED: each accepted write incref'd the SAME payload.
-     * refcount == 1 (ours) + 2 (A, C). B's blocked write took no ref. */
-    MOQ_TEST_CHECK(moq_rcbuf_refcount(payload) == 3);
+    /* SHARED, NOT CLONED: each accepted write incref'd the SAME payload,
+     * and B's PARTIAL write retained it too (the pending-operation snapshot
+     * that makes the retry byte-exact without the host keeping its own
+     * copy). refcount == 1 (ours) + 2 (A, C sessions) + 1 (B's pending op). */
+    MOQ_TEST_CHECK(moq_rcbuf_refcount(payload) == 4);
 
     /* A and C delivered to their subscribers, independent of B's block. */
     recipient_pump(&rcpts[0]);
@@ -246,6 +240,9 @@ int main(void)
     for (size_t i = 0; i < 3; i++) {
         if (!rcpts[i].blocked) continue;
         recipient_pump(&rcpts[i]);    /* downstream catches up; queue frees */
+        /* Retry the SAME call: the facade resumes the pending operation
+         * from its retained snapshot -- no duplicate to the destinations
+         * already served, no reset, no host-side copy. */
         moq_result_t rc = moq_pub_write_object(rcpts[i].pub, rcpts[i].track,
                                                FAN_G, FAN_O, payload,
                                                moq_simpair_now_us(rcpts[i].sp));

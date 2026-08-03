@@ -1,4 +1,5 @@
 #include "moq/control_d18.h"
+#include "control_d18_internal.h"
 #include "moq/vi64.h"
 #include <string.h>
 
@@ -132,6 +133,7 @@ static uint64_t d18_full_track_len(const moq_namespace_t *ns,
      MOQ_D18_PARAM_BIT_AUTHORIZATION_TOKEN | MOQ_D18_PARAM_BIT_FILL_TIMEOUT)
 #define D18_REQUEST_UPDATE_PARAM_MASK \
     (MOQ_D18_PARAM_BIT_FORWARD | MOQ_D18_PARAM_BIT_SUBSCRIBER_PRIORITY | \
+     MOQ_D18_PARAM_BIT_SUBSCRIPTION_FILTER | \
      MOQ_D18_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | \
      MOQ_D18_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | \
      MOQ_D18_PARAM_BIT_AUTHORIZATION_TOKEN | \
@@ -565,6 +567,71 @@ static moq_result_t d18_validate_track_properties(const uint8_t *data,
     return d18_validate_props_inner(data, len, false, NULL, NULL);
 }
 
+/* §9.8: pure per-profile timeout scanner. Extracts OBJECT_DELIVERY_TIMEOUT
+ * (0x02) and SUBGROUP_DELIVERY_TIMEOUT (0x06) Track Properties (§12.1/§12.2)
+ * from a property block, searching BOTH the mutable list and the contents of
+ * IMMUTABLE_PROPERTIES (§12.7 processors MUST search both). The timeouts are
+ * single-value properties, so the same type appearing twice anywhere across
+ * (mutable UNION immutable) is malformed (MOQ_ERR_PROTO), as is a nested
+ * IMMUTABLE_PROPERTIES or any structural failure. Unknown properties
+ * (including mandatory ones) pass through untouched -- this is an extractor,
+ * not a validator; callers layer their own strictness. */
+static moq_result_t d18_scan_timeouts_inner(const uint8_t *data, size_t len,
+                                            bool nested,
+                                            bool *has_obj, uint64_t *obj_ms,
+                                            bool *has_sub, uint64_t *sub_ms)
+{
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, data, len);
+    uint64_t prev = 0;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (moq_buf_read_vi64(&r, &delta) < 0) return MOQ_ERR_PROTO;
+        if (delta > UINT64_MAX - prev) return MOQ_ERR_PROTO;
+        uint64_t type = prev + delta;
+        prev = type;
+        if (type & 1) {
+            uint64_t vlen;
+            if (moq_buf_read_vi64(&r, &vlen) < 0) return MOQ_ERR_PROTO;
+            if (vlen > 0xFFFFu) return MOQ_ERR_PROTO;
+            if (vlen > moq_buf_reader_remaining(&r)) return MOQ_ERR_PROTO;
+            if (type == D18_PROP_IMMUTABLE) {
+                if (nested) return MOQ_ERR_PROTO;
+                moq_result_t rc = d18_scan_timeouts_inner(
+                    moq_buf_reader_ptr(&r), (size_t)vlen, true,
+                    has_obj, obj_ms, has_sub, sub_ms);
+                if (rc < 0) return rc;
+            }
+            r.pos += (size_t)vlen;
+        } else {
+            uint64_t v;
+            if (moq_buf_read_vi64(&r, &v) < 0) return MOQ_ERR_PROTO;
+            if (type == 0x02u) {               /* OBJECT_DELIVERY_TIMEOUT */
+                if (*has_obj) return MOQ_ERR_PROTO;   /* duplicate */
+                *has_obj = true; *obj_ms = v;
+            } else if (type == 0x06u) {        /* SUBGROUP_DELIVERY_TIMEOUT */
+                if (*has_sub) return MOQ_ERR_PROTO;
+                *has_sub = true; *sub_ms = v;
+            }
+        }
+    }
+    return MOQ_OK;
+}
+
+moq_result_t moq_d18_scan_delivery_timeouts(const uint8_t *props, size_t len,
+                                            bool *out_has_object,
+                                            uint64_t *out_object_ms,
+                                            bool *out_has_subgroup,
+                                            uint64_t *out_subgroup_ms)
+{
+    *out_has_object = false;   *out_object_ms = 0;
+    *out_has_subgroup = false; *out_subgroup_ms = 0;
+    if (!props || len == 0) return MOQ_OK;
+    return d18_scan_timeouts_inner(props, len, false,
+                                   out_has_object, out_object_ms,
+                                   out_has_subgroup, out_subgroup_ms);
+}
+
 /* Decode-side scan: structurally valid; *out_mandatory reports whether any
  * Mandatory Track Property is present so the caller can respond with a
  * request-level UNSUPPORTED_EXTENSION rather than closing the session. */
@@ -811,10 +878,13 @@ moq_result_t moq_d18_decode_subscribe_ok(const uint8_t *payload,
 
 /* -- PUBLISH (draft-18 §10.10) ------------------------------------- */
 
-/* PUBLISH permits the FORWARD (publisher's initial forward intent) and
- * AUTHORIZATION_TOKEN message parameters; other parameters are a violation. */
+/* PUBLISH permits FORWARD (publisher's initial forward intent),
+ * AUTHORIZATION_TOKEN, LARGEST_OBJECT (§10.2.11 -- MUST be included once
+ * Objects have been published), and EXPIRES (§10.2.10); other parameters are a
+ * violation. */
 #define D18_PUBLISH_PARAM_MASK \
-    (MOQ_D18_PARAM_BIT_FORWARD | MOQ_D18_PARAM_BIT_AUTHORIZATION_TOKEN)
+    (MOQ_D18_PARAM_BIT_FORWARD | MOQ_D18_PARAM_BIT_AUTHORIZATION_TOKEN | \
+     MOQ_D18_PARAM_BIT_LARGEST_OBJECT | MOQ_D18_PARAM_BIT_EXPIRES)
 
 moq_result_t moq_d18_encode_publish(moq_buf_writer_t *w,
                                     const moq_d18_publish_t *p)
@@ -881,13 +951,16 @@ moq_result_t moq_d18_decode_publish(const uint8_t *payload, size_t payload_len,
 
 /* -- PUBLISH_OK (draft-18 §10.10 / §10.5) -------------------------- */
 
-/* PUBLISH_OK is a REQUEST_OK carrying the subscriber's delivery parameters and
- * an empty Track Properties tail (a non-empty tail is a PROTOCOL_VIOLATION). */
+/* PUBLISH_OK is a REQUEST_OK carrying the subscriber's delivery parameters,
+ * its SUBSCRIPTION_FILTER choice (§10.2.9 -- omitted = unfiltered), and
+ * EXPIRES (§10.2.10), with an empty Track Properties tail (a non-empty tail is
+ * a PROTOCOL_VIOLATION). */
 #define D18_PUBLISH_OK_PARAM_MASK \
     (MOQ_D18_PARAM_BIT_SUBSCRIBER_PRIORITY | MOQ_D18_PARAM_BIT_FORWARD | \
      MOQ_D18_PARAM_BIT_GROUP_ORDER | MOQ_D18_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | \
      MOQ_D18_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | \
-     MOQ_D18_PARAM_BIT_NEW_GROUP_REQUEST)
+     MOQ_D18_PARAM_BIT_NEW_GROUP_REQUEST | \
+     MOQ_D18_PARAM_BIT_SUBSCRIPTION_FILTER | MOQ_D18_PARAM_BIT_EXPIRES)
 
 moq_result_t moq_d18_encode_publish_ok(moq_buf_writer_t *w,
                                        const moq_d18_msg_params_t *params)
@@ -1763,8 +1836,8 @@ moq_result_t moq_d18_decode_request_update(const uint8_t *payload,
     if (rc < 0) return rc;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    /* A subscription REQUEST_UPDATE carries FORWARD / SUBSCRIBER_PRIORITY and
-     * the delivery-timeout parameters. */
+    /* A subscription REQUEST_UPDATE carries FORWARD / SUBSCRIBER_PRIORITY /
+     * SUBSCRIPTION_FILTER and the delivery-timeout parameters. */
     if ((rc = moq_d18_decode_msg_params(&r, count,
             D18_REQUEST_UPDATE_PARAM_MASK, &out->params)) < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -1797,9 +1870,55 @@ moq_result_t moq_d18_decode_request_ok(const uint8_t *payload,
     uint64_t count;
     moq_result_t rc = moq_buf_read_vi64(&r, &count);
     if (rc < 0) return rc;
-    /* Parameters and Track Properties are not modelled for REQUEST_UPDATE_OK
-     * yet: accept only the zero-parameter, empty-properties form. */
+    /* The zero-parameter, empty-properties REQUEST_OK form
+     * (PUBLISH_NAMESPACE_OK, SUBSCRIBE_NAMESPACE_OK, SUBSCRIBE_TRACKS_OK).
+     * PUBLISH_OK / SUBSCRIBE_OK are NOT this form -- they carry delivery
+     * parameters via their own decoders. A REQUEST_UPDATE_OK that carries
+     * LARGEST_OBJECT / EXPIRES uses moq_d18_decode_request_update_ok. */
     if (count != 0) return MOQ_ERR_PROTO;
+    if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
+    return MOQ_OK;
+}
+
+/* REQUEST_UPDATE_OK response parameters (REQUEST_OK §10.5; Message Parameters
+ * §10.2, where EXPIRES = 0x08 and LARGEST_OBJECT = 0x09): a REQUEST_UPDATE_OK
+ * MAY carry LARGEST_OBJECT and EXPIRES; Track Properties are empty. Distinct
+ * from the zero-parameter REQUEST_OK form above. */
+#define D18_REQUEST_UPDATE_OK_PARAM_MASK \
+    (MOQ_D18_PARAM_BIT_EXPIRES | MOQ_D18_PARAM_BIT_LARGEST_OBJECT)
+
+moq_result_t moq_d18_encode_request_update_ok(moq_buf_writer_t *w,
+                                              const moq_d18_msg_params_t *p)
+{
+    if (!w || !p) return MOQ_ERR_INVAL;
+    if (!d18_params_within_mask(p, D18_REQUEST_UPDATE_OK_PARAM_MASK))
+        return MOQ_ERR_INVAL;
+    size_t saved = w->pos, len_off;
+    moq_result_t rc = d18_write_header(w, MOQ_D18_REQUEST_OK, &len_off);
+    if (rc < 0) return rc;
+    if ((rc = moq_d18_encode_msg_params(w, p)) < 0) goto fail;
+    /* Track Properties are empty for REQUEST_UPDATE_OK (payload ends here). */
+    if ((rc = d18_patch_len(w, len_off)) < 0) goto fail;
+    return MOQ_OK;
+fail:
+    w->pos = saved;
+    return rc;
+}
+
+moq_result_t moq_d18_decode_request_update_ok(const uint8_t *payload,
+                                              size_t payload_len,
+                                              moq_d18_msg_params_t *out)
+{
+    if (!payload || !out) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, payload, payload_len);
+    uint64_t count;
+    moq_result_t rc = moq_buf_read_vi64(&r, &count);
+    if (rc < 0) return rc;
+    if ((rc = moq_d18_decode_msg_params(&r, count,
+            D18_REQUEST_UPDATE_OK_PARAM_MASK, out)) < 0) return rc;
+    /* Empty Track Properties (§10.5): any trailing bytes are a violation. */
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     return MOQ_OK;
 }

@@ -55,17 +55,38 @@ static void rx_free_entry(moq_session_t *s, size_t slot)
     memset(rx, 0, sizeof(*rx));
 }
 
+/* An IDENTIFIABLE (post-header, publication- or subscription-bound) data
+ * stream terminated by RESET counts toward the terminal done's Stream Count
+ * exactly like a FIN'd one: the subscriber has processed it -- nothing more
+ * arrives. Called only at the SUCCESSFUL terminal teardown sites in
+ * handle_data_* (after any streaming terminal-RESET event queued), NEVER from
+ * generic rx_free_entry -- STOP, session teardown, and malformed-stream
+ * cleanup must not count, and a pre-header RESET is un-attributable (the
+ * binding never happened). */
+static void rx_record_reset_processed(moq_session_t *s, int slot)
+{
+    if (moq_publication_is_valid(s->rx_streams[slot].pub_handle))
+        pub_note_stream_processed(s, s->rx_streams[slot].pub_handle);
+    else if (moq_subscription_is_valid(s->rx_streams[slot].sub))
+        sub_note_stream_processed(s, s->rx_streams[slot].sub);
+}
+
 static void rx_record_finished(moq_session_t *s, uint64_t ref_v)
 {
-    /* A FIN'd data stream bound to a subscriber-role publication counts toward
-     * that publication's PUBLISH_DONE Stream Count (rx_record_finished is the
-     * single FIN signal -- never called on a STOP). The rx is still live here
-     * (freed by the caller right after). Fetch / subscription streams carry an
-     * invalid pub_handle, so this is a no-op for them. */
+    /* A COMPLETED data stream bound to a subscriber-role publication or
+     * subscription counts toward that binding's terminal-done Stream Count.
+     * This is the FIN signal (never called on a STOP); identifiable RESET
+     * terminations count via rx_record_reset_processed at the reset teardown
+     * sites. The rx is still live here (freed by the caller right after).
+     * Fetch streams carry an invalid pub_handle AND an invalid sub, so this
+     * is a no-op for them. */
     int rxslot = rx_find_by_ref(s, moq_stream_ref_from_u64(ref_v));
-    if (rxslot >= 0 &&
-        moq_publication_is_valid(s->rx_streams[rxslot].pub_handle))
-        pub_note_stream_processed(s, s->rx_streams[rxslot].pub_handle);
+    if (rxslot >= 0) {
+        if (moq_publication_is_valid(s->rx_streams[rxslot].pub_handle))
+            pub_note_stream_processed(s, s->rx_streams[rxslot].pub_handle);
+        else if (moq_subscription_is_valid(s->rx_streams[rxslot].sub))
+            sub_note_stream_processed(s, s->rx_streams[rxslot].sub);
+    }
 
     size_t idx = (s->rx_fin_head + s->rx_fin_count) % s->rx_fin_cap;
     if (s->rx_fin_count >= s->rx_fin_cap)
@@ -73,6 +94,99 @@ static void rx_record_finished(moq_session_t *s, uint64_t ref_v)
     else
         s->rx_fin_count++;
     s->rx_finished[idx] = ref_v;
+}
+
+/* Forward State 0 prohibits Objects, not streams: a bound stream stays
+ * bound (and its FIN / identifiable RESET counts exactly once) while the
+ * binding's CURRENT acknowledged Forward state is 0, but its objects are
+ * consumed without surfacing object/chunk events. Applies to BOTH
+ * subscriber-role subscriptions (we asked the publisher to pause) and
+ * subscriber-role publications. Evaluated ONCE per object at header
+ * admission and frozen into rx->suppress_cur_object -- never re-read at
+ * emission time, so a mid-object Forward flip cannot truncate or expose a
+ * partial chunk sequence. */
+static bool rx_objects_suppressed(moq_session_t *s,
+                                  const moq_rx_stream_t *rx)
+{
+    if (moq_subscription_is_valid(rx->sub)) {
+        int sslot = sub_resolve_handle(s, rx->sub);
+        return sslot >= 0 &&
+               s->subs[sslot].role == MOQ_SUB_ROLE_SUBSCRIBER &&
+               !s->subs[sslot].forward;
+    }
+    if (moq_publication_is_valid(rx->pub_handle)) {
+        int pslot = pub_resolve_handle(s, rx->pub_handle);
+        return pslot >= 0 && !s->publishes[pslot].send_allowed;
+    }
+    return false;
+}
+
+static moq_result_t rx_try_stop(moq_session_t *s, int slot);
+
+/* §9.8 EXPIRED sweep: STOP-and-discard every live rx stream bound to the
+ * given subscription/publication (the drafts' permitted early-discard),
+ * rescanning to zero -- stopping frees the rx entry, so a fully successful
+ * sweep terminates with a clean scan. Returns MOQ_OK when no live bound
+ * stream remains; MOQ_ERR_WOULD_BLOCK when action capacity ran out (the
+ * remaining streams are taken up by the next reap pass). */
+
+/*
+ * Resumable form: each STOP attempt costs one budget unit and the scan position
+ * persists in s->sweep_rx_pos, so a suspended sweep resumes mid-pool instead of
+ * re-attempting streams it already stopped. Non-matching and inactive slots are
+ * free and never suspend.
+ *
+ * Returns MOQ_SESSION_SUSPENDED when the budget ran out with matching streams
+ * still live. That is distinct from MOQ_ERR_WOULD_BLOCK, which continues to
+ * mean action capacity was exhausted and the remaining streams pass to the next
+ * reap.
+ */
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* Counts entries into the bound-stream scan. Present only in the test-internals
+ * archive; the shipped library has no such symbol. */
+uint64_t session_stop_scan_entries;
+#endif
+
+moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
+                                                  moq_subscription_t sub,
+                                                  moq_publication_t pub,
+                                                  uint32_t *budget)
+{
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    session_stop_scan_entries++;
+#endif
+    for (;;) {
+        for (; s->sweep_rx_pos < s->rx_cap; s->sweep_rx_pos++) {
+            size_t i = s->sweep_rx_pos;
+            moq_rx_stream_t *rx = &s->rx_streams[i];
+            if (!rx->active) continue;
+            bool match = false;
+            if (moq_subscription_is_valid(sub) &&
+                moq_subscription_is_valid(rx->sub) &&
+                moq_subscription_eq(rx->sub, sub))
+                match = true;
+            if (moq_publication_is_valid(pub) &&
+                moq_publication_is_valid(rx->pub_handle) &&
+                moq_publication_eq(rx->pub_handle, pub))
+                match = true;
+            if (!match) continue;
+
+            if (budget) {
+                if (*budget == 0) return MOQ_SESSION_SUSPENDED;
+                (*budget)--;
+            }
+            s->sweep_rx_found = true;
+            moq_result_t rc = rx_try_stop(s, (int)i);
+            if (rc < 0) return rc;
+        }
+        /* A completed scan that stopped nothing means no bound stream remains.
+         * Otherwise rescan from zero: stopping frees entries, so the pool must
+         * settle to a clean pass before the owner may finalize. */
+        bool found = s->sweep_rx_found;
+        s->sweep_rx_pos = 0;
+        s->sweep_rx_found = false;
+        if (!found) return MOQ_OK;
+    }
 }
 
 static bool rx_is_finished(moq_session_t *s, uint64_t ref_v)
@@ -194,6 +308,28 @@ static bool rx_binding_alive(moq_session_t *s, const moq_rx_stream_t *rx)
 static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
+
+    /* Prohibited object (frozen at header admission): consume the pending
+     * chunk without surfacing OBJECT_CHUNK. Reporting success lets every
+     * caller -- begin/data/end emission, PENDING_CHUNK re-drives, and the
+     * terminal-RESET teardown -- run its normal state transitions and
+     * exactly-once FIN/RESET accounting. */
+    if (rx->suppress_cur_object) {
+        if (rx->pending_chunk) {
+            moq_rcbuf_decref(rx->pending_chunk);
+            rx->pending_chunk = NULL;
+        }
+        if (rx->pending_begin && rx->cur_extensions) {
+            size_t ext_len = moq_rcbuf_len(rx->cur_extensions);
+            if (ext_len <= s->recv_payload_bytes)
+                s->recv_payload_bytes -= ext_len;
+            else
+                s->recv_payload_bytes = 0;
+            moq_rcbuf_decref(rx->cur_extensions);
+            rx->cur_extensions = NULL;
+        }
+        return MOQ_OK;
+    }
 
     /* Re-allocate chunk if a prior attempt got NOMEM. */
     if (!rx->pending_chunk && rx->pending_data_len > 0) {
@@ -337,6 +473,36 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
 
+    /* Prohibited object (frozen at header admission): consume without
+     * surfacing OBJECT_RECEIVED -- release the assembled payload/extensions
+     * (with the same budget bookkeeping as rx_free_entry) and take the same
+     * state transition as a successful emit. FIN teardown is unaffected. */
+    if (rx->suppress_cur_object) {
+        if (rx->payload_rcbuf) {
+            moq_rcbuf_decref(rx->payload_rcbuf);
+            if ((size_t)rx->payload_expected <= s->recv_payload_bytes)
+                s->recv_payload_bytes -= (size_t)rx->payload_expected;
+            else
+                s->recv_payload_bytes = 0;
+            rx->payload_rcbuf = NULL;
+            rx->payload_buf = NULL;
+        }
+        if (rx->cur_extensions) {
+            size_t ext_len = moq_rcbuf_len(rx->cur_extensions);
+            if (ext_len <= s->recv_payload_bytes)
+                s->recv_payload_bytes -= ext_len;
+            else
+                s->recv_payload_bytes = 0;
+            moq_rcbuf_decref(rx->cur_extensions);
+            rx->cur_extensions = NULL;
+        }
+        rx->payload_written = 0;
+        if (rx->pending_fin && rx->hdr_len == 0 && rx->input_len == 0)
+            return rx_finish_stream(s, slot);
+        rx->parse_state = MOQ_RX_AWAITING_OBJECT;
+        return MOQ_OK;
+    }
+
     if (event_queue_full(s)) {
         rx->parse_state = MOQ_RX_PENDING_EMIT;
         return MOQ_ERR_WOULD_BLOCK;
@@ -392,6 +558,10 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
     rx->payload_rcbuf = NULL;
     rx->payload_buf = NULL;
     rx->payload_written = 0;
+
+    /* (Received-object history is fed at object ADMISSION in the header-parse
+     * loop, before delivery -- see the track_hist_merge there -- so both the
+     * streaming and non-streaming emit paths are covered.) */
 
     /* Handle deferred FIN: if no more buffered data, finish now (emitting
      * SUBGROUP_FINISHED after this final object). */
@@ -628,8 +798,9 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
         if (was_end) {
             if (was_terminal) {
                 /* Terminal reset: the stream is gone (mirrors the direct
-                 * handle_data_reset path, which frees without recording a
-                 * FIN). */
+                 * handle_data_reset path). An identifiable publication-bound
+                 * stream counts as processed, exactly like the direct path. */
+                rx_record_reset_processed(s, slot);
                 rx_free_entry(s, (size_t)slot);
                 return MOQ_OK;
             }
@@ -873,7 +1044,8 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
             int sub_slot = sub_find_by_alias_subscriber(s, hdr.track_alias);
             int pub_slot_rx = -1;
             if (sub_slot < 0)
-                pub_slot_rx = pub_find_by_alias_subscriber(s, hdr.track_alias);
+                pub_slot_rx = pub_find_by_alias_subscriber(s,
+                    hdr.track_alias);
             if (sub_slot < 0 && pub_slot_rx < 0) {
                 /* Alias not yet established. If a forwarding subscription is
                  * pending, a SUBSCRIBE_OK may establish this alias imminently:
@@ -1153,6 +1325,26 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
             rx->payload_expected = payload_len;
             rx->payload_written = 0;
             rx->cur_extensions = ext_rcbuf;
+            /* Freeze this object's suppression decision (Forward State at
+             * ADMISSION): retained through chunks/retries/FIN/RESET; a
+             * Forward flip affects the next object only. */
+            rx->suppress_cur_object = rx_objects_suppressed(s, rx);
+
+            /* Feed received-object history at ADMISSION --
+             * covers both the streaming and non-streaming emit paths below.
+             * Idempotent (monotonic max) so a re-driven parse is safe. */
+            {
+                int hslot = sub_resolve_handle(s, rx->sub);
+                if (hslot >= 0)
+                    track_hist_merge(s->subs[hslot].hist,
+                                     rx->group_id, object_id);
+                else {
+                    int pslot = pub_resolve_handle(s, rx->pub_handle);
+                    if (pslot >= 0)
+                        track_hist_merge(s->publishes[pslot].hist,
+                                         rx->group_id, object_id);
+                }
+            }
 
             cursor += r.pos;
 
@@ -1400,6 +1592,7 @@ moq_result_t handle_data_reset(moq_session_t *s,
     if (!s->streaming_objects ||
         (rx->parse_state != MOQ_RX_STREAMING_PAYLOAD &&
          rx->parse_state != MOQ_RX_PENDING_CHUNK)) {
+        rx_record_reset_processed(s, slot);
         rx_free_entry(s, (size_t)slot);
         return MOQ_OK;
     }
@@ -1417,6 +1610,7 @@ moq_result_t handle_data_reset(moq_session_t *s,
         rx->pending_end = false;
         rx->pending_data_len = 0;
         if (was_final) {
+            rx_record_reset_processed(s, slot);
             rx_free_entry(s, (size_t)slot);
             return MOQ_OK;
         }
@@ -1433,6 +1627,10 @@ moq_result_t handle_data_reset(moq_session_t *s,
     moq_result_t rc = rx_push_pending_chunk(s, slot);
     if (rc < 0) return rc;
 
+    /* Counted only now: a WOULD_BLOCK'd terminal-RESET event returned above
+     * and the retry re-enters, so the count lands exactly once at the
+     * successful teardown. */
+    rx_record_reset_processed(s, slot);
     rx_free_entry(s, (size_t)slot);
     return MOQ_OK;
 }

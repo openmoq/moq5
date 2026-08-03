@@ -16,7 +16,7 @@
  *   --ca FILE     PEM CA file for certificate verification
  *   --timeout N   Total elapsed timeout in seconds (default: 10)
  *
- * All session work happens inside on_pump on the managed thread.
+ * All session work happens inside on_lane_pump on the managed thread.
  * The app thread only uses wake/wait for signaling.
  *
  * Thread safety: app_state fields are C11 atomics or constant
@@ -54,8 +54,10 @@ typedef struct {
 
 /* -- Pump callback --------------------------------------------------- */
 
-static int on_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int on_lane_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                         uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     app_state_t *app = (app_state_t *)ctx;
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -268,7 +270,7 @@ int main(int argc, char **argv)
     cfg.port = (int)port;
     cfg.insecure_skip_verify = insecure ? true : false;
     cfg.cert_path = ca_file;
-    cfg.on_pump = on_pump;
+    cfg.on_lane_pump = on_lane_pump;
     cfg.user_ctx = &app;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;

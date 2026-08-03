@@ -38,5 +38,11 @@ let package = Package(
             // fetches the Mozilla CA bundle into the built .app at bundle time;
             // the app reads it from its own bundle (see PlayerModel).
         ),
+        // Pure model tests (configuration mapping, phase-aware failure
+        // messaging); never opens a connection.
+        .testTarget(
+            name: "SimplePlayerTests",
+            dependencies: ["SimplePlayer"]
+        ),
     ]
 )

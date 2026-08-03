@@ -153,14 +153,16 @@ struct server_state {
     std::atomic<bool> post_burst_done{false};
 };
 
-static int server_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int server_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     auto *ss = static_cast<server_state *>(ctx);
 
     std::set<moq_mvfst_conn_t *> live;
     {
         moq_mvfst_conn_t *c = nullptr;
-        while ((c = moq_mvfst_managed_next_conn(m, c)) != nullptr)
+        while ((c = moq_mvfst_lane_next_conn(lane, c)) != nullptr)
             live.insert(c);
     }
     for (auto it = ss->conns.begin(); it != ss->conns.end(); ) {
@@ -300,8 +302,10 @@ struct client_state {
     std::string pb_payload;
 };
 
-static int client_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     auto *cs = static_cast<client_state *>(ctx);
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -431,7 +435,7 @@ static void test_repeated_connect_disconnect()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = server_pump;
+    scfg.on_lane_pump = server_pump;
     scfg.user_ctx = &ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -450,7 +454,7 @@ static void test_repeated_connect_disconnect()
         ccfg.host = "127.0.0.1";
         ccfg.port = port;
         ccfg.insecure_skip_verify = true;
-        ccfg.on_pump = client_pump;
+        ccfg.on_lane_pump = client_pump;
         ccfg.user_ctx = &cs;
         ccfg.send_request_capacity = true;
         ccfg.initial_request_capacity = 16;
@@ -495,7 +499,7 @@ static void test_multi_client_churn()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = server_pump;
+    scfg.on_lane_pump = server_pump;
     scfg.user_ctx = &ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -518,7 +522,7 @@ static void test_multi_client_churn()
         ccfg.host = "127.0.0.1";
         ccfg.port = port;
         ccfg.insecure_skip_verify = true;
-        ccfg.on_pump = client_pump;
+        ccfg.on_lane_pump = client_pump;
         ccfg.user_ctx = &cs[i];
         ccfg.send_request_capacity = true;
         ccfg.initial_request_capacity = 16;
@@ -540,7 +544,7 @@ static void test_multi_client_churn()
     MVFST_CHECK(moq_mvfst_managed_conn_count(srv) == 3);
     MVFST_CHECK(!ss.error.load());
 
-    /* Round 1: server writes one object per connection. */
+    /* server writes one object per connection. */
     ss.write_round.store(1);
     MVFST_CHECK(wait_multi(srv, cli, cs, N, &ss, [&]() {
         for (int i = 0; i < N; i++)
@@ -561,7 +565,7 @@ static void test_multi_client_churn()
     MVFST_CHECK(moq_mvfst_managed_conn_count(srv) == 2);
     MVFST_CHECK(!moq_mvfst_managed_is_fatal(srv));
 
-    /* Round 2: server writes another object to remaining conns. */
+    /* server writes another object to remaining conns. */
     ss.write_round.store(2);
     MVFST_CHECK(wait_multi(srv, cli, cs, N, &ss, [&]() {
         return cs[0].objects_received.load() >= 2 &&
@@ -606,7 +610,7 @@ static void test_datagram_burst()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = server_pump;
+    scfg.on_lane_pump = server_pump;
     scfg.user_ctx = &ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -624,7 +628,7 @@ static void test_datagram_burst()
     ccfg.host = "127.0.0.1";
     ccfg.port = port;
     ccfg.insecure_skip_verify = true;
-    ccfg.on_pump = client_pump;
+    ccfg.on_lane_pump = client_pump;
     ccfg.user_ctx = &cs;
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 16;

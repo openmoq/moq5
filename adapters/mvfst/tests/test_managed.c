@@ -26,8 +26,10 @@ static int failures = 0;
 
 /* -- Pump callbacks -------------------------------------------------- */
 
-static int pump_exit(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_exit(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 1;
 }
@@ -36,8 +38,10 @@ typedef struct {
     int session_ok;
 } pump_session_ctx_t;
 
-static int pump_check_session(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_check_session(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     pump_session_ctx_t *c = (pump_session_ctx_t *)ctx;
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -46,20 +50,24 @@ static int pump_check_session(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
 }
 
 static int pump_count_val;
-static int pump_counting(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_counting(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     pump_count_val++;
     return (pump_count_val >= 3) ? 1 : 0;
 }
 
-static int pump_forever(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_forever(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 0;
 }
 
-static moq_mvfst_managed_cfg_t make_cfg(moq_mvfst_pump_fn fn, void *ctx)
+static moq_mvfst_managed_cfg_t make_cfg(moq_mvfst_lane_pump_fn fn, void *ctx)
 {
     moq_mvfst_managed_cfg_t cfg;
     /* Full current struct: these tests set appended fields (alpn/sni/...). */
@@ -68,7 +76,7 @@ static moq_mvfst_managed_cfg_t make_cfg(moq_mvfst_pump_fn fn, void *ctx)
     /* host = NULL: lifecycle-only mode, no transport created. */
     cfg.host = NULL;
     cfg.port = 4433;
-    cfg.on_pump = fn;
+    cfg.on_lane_pump = fn;
     cfg.user_ctx = ctx;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
@@ -227,8 +235,10 @@ typedef struct {
     moq_result_t stop_result;
 } pump_stop_ctx_t;
 
-static int pump_try_stop(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_try_stop(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     pump_stop_ctx_t *c = (pump_stop_ctx_t *)ctx;
     c->stop_result = moq_mvfst_managed_stop(m);
@@ -253,8 +263,10 @@ typedef struct {
     int callback_ran;
 } pump_destroy_ctx_t;
 
-static int pump_try_destroy(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_try_destroy(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     pump_destroy_ctx_t *c = (pump_destroy_ctx_t *)ctx;
     moq_mvfst_managed_destroy(m);
@@ -282,7 +294,7 @@ static void test_invalid_config(void)
     MVFST_CHECK(moq_mvfst_managed_create(NULL, &m) == MOQ_ERR_INVAL);
 
     moq_mvfst_managed_cfg_t cfg = make_cfg(NULL, NULL);
-    cfg.on_pump = NULL;
+    cfg.on_lane_pump = NULL;
     MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
 
     cfg = make_cfg(pump_exit, NULL);
@@ -328,7 +340,7 @@ static void test_invalid_config(void)
         old->perspective = MOQ_PERSPECTIVE_CLIENT;
         old->host = NULL;
         old->port = 4433;
-        old->on_pump = pump_exit;
+        old->on_lane_pump = pump_exit;
         old->cert_path = NULL;
         old->key_path = NULL;
         old->insecure_skip_verify = false;
@@ -378,7 +390,7 @@ static void test_server_config_validation(void)
     moq_mvfst_managed_cfg_init(&cfg);
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.port = 0;
-    cfg.on_pump = pump_exit;
+    cfg.on_lane_pump = pump_exit;
     cfg.key_path = "/tmp/nonexistent_key.pem";
     MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
 
@@ -386,7 +398,7 @@ static void test_server_config_validation(void)
     moq_mvfst_managed_cfg_init(&cfg);
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.port = 0;
-    cfg.on_pump = pump_exit;
+    cfg.on_lane_pump = pump_exit;
     cfg.cert_path = "/tmp/nonexistent_cert.pem";
     MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
 
@@ -394,7 +406,7 @@ static void test_server_config_validation(void)
     moq_mvfst_managed_cfg_init(&cfg);
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.port = 0;
-    cfg.on_pump = pump_exit;
+    cfg.on_lane_pump = pump_exit;
     cfg.cert_path = "/tmp/nonexistent_cert.pem";
     cfg.key_path = "/tmp/nonexistent_key.pem";
     cfg.insecure_skip_verify = true;
@@ -405,7 +417,7 @@ static void test_server_config_validation(void)
     moq_mvfst_managed_cfg_init(&cfg);
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.port = 0;
-    cfg.on_pump = pump_exit;
+    cfg.on_lane_pump = pump_exit;
     cfg.cert_path = "/nonexistent/path/cert.pem";
     cfg.key_path = "/nonexistent/path/key.pem";
     MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
@@ -493,7 +505,7 @@ static void test_alpn_version_config(void)
         prefix.perspective = MOQ_PERSPECTIVE_CLIENT;
         prefix.host = NULL;
         prefix.port = 4433;
-        prefix.on_pump = pump_exit;
+        prefix.on_lane_pump = pump_exit;
 
         char dirty[sizeof(moq_mvfst_managed_cfg_t)];
         memset(dirty, 0xFF, sizeof(dirty));
@@ -519,7 +531,7 @@ static void test_alpn_version_config(void)
         prefix.perspective = MOQ_PERSPECTIVE_CLIENT;
         prefix.host = NULL;
         prefix.port = 4433;
-        prefix.on_pump = pump_exit;
+        prefix.on_lane_pump = pump_exit;
 
         char dirty[sizeof(moq_mvfst_managed_cfg_t)];
         memset(dirty, 0xFF, sizeof(dirty));
@@ -544,7 +556,7 @@ static void test_alpn_version_config(void)
         prefix.perspective = MOQ_PERSPECTIVE_CLIENT;
         prefix.host = NULL;
         prefix.port = 4433;
-        prefix.on_pump = pump_exit;
+        prefix.on_lane_pump = pump_exit;
 
         char dirty[sizeof(moq_mvfst_managed_cfg_t)];
         memset(dirty, 0xFF, sizeof(dirty));
@@ -608,8 +620,10 @@ typedef struct {
     atomic_int callback_ran;
 } activity_stop_ctx_t;
 
-static int activity_pump_forever(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int activity_pump_forever(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 0;
 }
@@ -648,6 +662,58 @@ static void test_stop_from_activity_rejected(void)
     moq_mvfst_managed_destroy(m);
 }
 
+/* Lane contract: mvfst is single-EventBase, so it supports exactly ONE
+ * lane. lane_count > 1 is REFUSED (not silently clamped), 0/1 give the
+ * single lane, and the lane accessors report one lane at index 0. */
+static void test_lane_config(void)
+{
+    moq_mvfst_managed_t *m = NULL;
+
+    /* > 1 is unsupported (no faked concurrency behind one domain). */
+    {
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_exit, NULL);
+        cfg.lane_count = 2;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) ==
+                    MOQ_ERR_UNSUPPORTED);
+        MVFST_CHECK(m == NULL);
+    }
+    {
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_exit, NULL);
+        cfg.lane_count = 5;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) ==
+                    MOQ_ERR_UNSUPPORTED);
+    }
+
+    /* 0 and 1 are the single lane; the accessors describe it. */
+    {
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_forever, NULL);
+        cfg.lane_count = 0;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_OK);
+        MVFST_CHECK(moq_mvfst_managed_lane_count(m) == 1);
+        moq_mvfst_managed_lane_t *lane = moq_mvfst_managed_lane(m, 0);
+        MVFST_CHECK(lane != NULL);
+        MVFST_CHECK(moq_mvfst_lane_index(lane) == 0);
+        MVFST_CHECK(moq_mvfst_managed_lane(m, 1) == NULL); /* no clamp */
+        moq_mvfst_managed_destroy(m);
+        m = NULL;
+    }
+    {
+        moq_mvfst_managed_cfg_t cfg = make_cfg(pump_forever, NULL);
+        cfg.lane_count = 1;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_OK);
+        MVFST_CHECK(moq_mvfst_managed_lane_count(m) == 1);
+        moq_mvfst_managed_destroy(m);
+        m = NULL;
+    }
+
+    /* NULL-safety of the lane API. */
+    MVFST_CHECK(moq_mvfst_managed_lane_count(NULL) == 0);
+    MVFST_CHECK(moq_mvfst_managed_lane(NULL, 0) == NULL);
+    MVFST_CHECK(moq_mvfst_lane_index(NULL) == 0);
+    MVFST_CHECK(moq_mvfst_lane_wake(NULL) == MOQ_ERR_INVAL);
+    MVFST_CHECK(moq_mvfst_managed_conn_lane(NULL) == NULL);
+}
+
 int main(void)
 {
     test_create_stop_destroy();
@@ -667,6 +733,7 @@ int main(void)
     test_invalid_config();
     test_server_config_validation();
     test_alpn_version_config();
+    test_lane_config();
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

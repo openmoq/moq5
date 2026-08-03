@@ -3,8 +3,10 @@
                                       adapter-picoquic-threaded component */
 #include <stdio.h>
 
-static int dummy_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int dummy_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)t; (void)now; (void)ctx;
     return 0;
 }
@@ -26,7 +28,7 @@ int main(void)
         return 1;
     if (cfg.alloc != NULL)
         return 2;
-    if (cfg.on_pump != NULL)
+    if (cfg.on_lane_pump != NULL)
         return 3;
 
     /* Create, stop, destroy with valid client config.
@@ -35,7 +37,7 @@ int main(void)
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     cfg.host = "localhost";
     cfg.port = 14990;
-    cfg.on_pump = dummy_pump;
+    cfg.on_lane_pump = dummy_pump;
     cfg.insecure_skip_verify = true;
 
     moq_pq_threaded_t *t = NULL;

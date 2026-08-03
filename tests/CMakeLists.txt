@@ -52,8 +52,14 @@ add_executable(test_control_d16 unit/test_control_d16.c)
 target_link_libraries(test_control_d16 PRIVATE moq::core)
 add_test(NAME control_d16 COMMAND test_control_d16)
 
+add_executable(test_session_sweep unit/test_session_sweep.c)
+target_link_libraries(test_session_sweep PRIVATE moq-core-test-internals)
+target_compile_definitions(test_session_sweep PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME session_sweep COMMAND test_session_sweep)
+
 add_executable(test_transport_bridge unit/test_transport_bridge.c)
 target_link_libraries(test_transport_bridge PRIVATE moq-core-test-internals)
+target_compile_definitions(test_transport_bridge PRIVATE MOQ_SESSION_SWEEP_TESTING)
 target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
@@ -99,6 +105,14 @@ add_test(NAME session_fetch COMMAND test_session_fetch)
 add_executable(test_session_publish unit/test_session_publish.c)
 target_link_libraries(test_session_publish PRIVATE moq-core-test-internals)
 add_test(NAME session_publish COMMAND test_session_publish)
+
+add_executable(test_session_track_hist unit/test_session_track_hist.c)
+target_link_libraries(test_session_track_hist PRIVATE moq-core-test-internals)
+add_test(NAME session_track_hist COMMAND test_session_track_hist)
+
+# test_session_track_hist_lc / _publish_params / _stream_count are SimPair-based
+# (moq::sim) — they live in the sim-gated block below, alongside the other
+# SimPair tests, so a sim-disabled build (e.g. the shared-link lane) configures.
 
 add_executable(test_session_track_status unit/test_session_track_status.c)
 target_link_libraries(test_session_track_status PRIVATE moq-core-test-internals)
@@ -184,6 +198,24 @@ if(TARGET moq::sim)
     add_executable(test_simpair unit/test_simpair.c)
     target_link_libraries(test_simpair PRIVATE moq::sim)
     add_test(NAME simpair COMMAND test_simpair)
+
+    # End-to-end allocation-failure lane over the public SimPair surface.
+    add_executable(test_simpair_failpoints unit/test_simpair_failpoints.c)
+    target_link_libraries(test_simpair_failpoints PRIVATE moq::sim)
+    add_test(NAME simpair_failpoints COMMAND test_simpair_failpoints)
+
+    # SimPair-based session tests (moq_simpair_* fixtures over paired sessions).
+    add_executable(test_session_track_hist_lc unit/test_session_track_hist_lc.c)
+    target_link_libraries(test_session_track_hist_lc PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_track_hist_lc COMMAND test_session_track_hist_lc)
+
+    add_executable(test_session_publish_params unit/test_session_publish_params.c)
+    target_link_libraries(test_session_publish_params PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_publish_params COMMAND test_session_publish_params)
+
+    add_executable(test_session_stream_count unit/test_session_stream_count.c)
+    target_link_libraries(test_session_stream_count PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_stream_count COMMAND test_session_stream_count)
 
     add_executable(test_scenario_lifecycle scenario/test_scenario_lifecycle.c)
     target_link_libraries(test_scenario_lifecycle PRIVATE moq::sim)

@@ -117,6 +117,15 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
             delivered = true;
             break;
 
+        case FAKE_OP_ABORT:
+            /* the whole-stream abort reaches the peer as BOTH signals */
+            moq_transport_bridge_on_peer_stream_reset(
+                to_bridge, o->stream_id, o->error_code, ctx->now);
+            moq_transport_bridge_on_peer_stop_sending(
+                to_bridge, o->stream_id, o->error_code, ctx->now);
+            delivered = true;
+            break;
+
         case FAKE_OP_DATAGRAM:
             moq_transport_bridge_on_peer_datagram(
                 to_bridge, o->data, o->data_len, ctx->now);

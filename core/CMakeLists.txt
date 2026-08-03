@@ -14,6 +14,7 @@ add_library(moq-core
     src/session/session_fetch.c
     src/session/session_publish.c
     src/session/session_track_status.c
+    src/session/session_track_hist.c
     src/session/session_namespace.c
     src/session/session_namespace_sub.c
     src/session/session_subscribe_tracks.c
@@ -71,6 +72,7 @@ if(MOQ_BUILD_TESTS)
         src/session/session.c src/session/session_setup.c
         src/session/session_subscribe.c src/session/session_fetch.c
         src/session/session_publish.c src/session/session_track_status.c
+        src/session/session_track_hist.c
         src/session/session_namespace.c src/session/session_namespace_sub.c
         src/session/session_subscribe_tracks.c
         src/session/session_subgroup.c src/session/session_receive.c
@@ -84,4 +86,11 @@ if(MOQ_BUILD_TESTS)
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     )
     target_compile_features(moq-core-test-internals PUBLIC c_std_11)
+    # White-box instrumentation compiled ONLY into this internals-only static
+    # lib -- never the shipping moq-core library/dylib (verified with nm in CI
+    # symbol-hygiene checks): publisher admission counters for exactly-once
+    # retry tests, and deferred-completion sweep scan counters.
+    target_compile_definitions(moq-core-test-internals PRIVATE
+        MOQ_PUB_TESTING          # publisher admission counters
+        MOQ_SESSION_SWEEP_TESTING)  # sweep + budget-context instrumentation
 endif()

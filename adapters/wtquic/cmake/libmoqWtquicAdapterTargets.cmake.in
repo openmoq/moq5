@@ -1,0 +1,18 @@
+# Installed wtquic adapter target — relocatable via prefix detection.
+# File lands at <prefix>/lib/cmake/libmoq/, so four PATH ascents reach
+# the install prefix. The wtquic package (wtq::wtquic) is resolved by
+# the component block in libmoqConfig.cmake before this file loads.
+get_filename_component(_WTQUIC_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)
+get_filename_component(_WTQUIC_PREFIX "${_WTQUIC_PREFIX}" PATH)
+get_filename_component(_WTQUIC_PREFIX "${_WTQUIC_PREFIX}" PATH)
+get_filename_component(_WTQUIC_PREFIX "${_WTQUIC_PREFIX}" PATH)
+
+if(NOT TARGET moq::adapter-wtquic)
+  add_library(moq::adapter-wtquic @_wtquic_lib_type@ IMPORTED)
+  set_target_properties(moq::adapter-wtquic PROPERTIES
+    IMPORTED_LOCATION "${_WTQUIC_PREFIX}/@_wtquic_libdir@/@_wtquic_lib_name@"
+    INTERFACE_INCLUDE_DIRECTORIES "${_WTQUIC_PREFIX}/@_wtquic_incdir@"
+    INTERFACE_LINK_LIBRARIES "moq::core;wtq::wtquic")
+endif()
+
+unset(_WTQUIC_PREFIX)

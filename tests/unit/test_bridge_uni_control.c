@@ -376,6 +376,428 @@ int main(void)
         uc_destroy(&f);
     }
 
+    /* == G2. ABORT_BIDI_STREAM dispatch: native op vs fallback ========= *
+     *  The whole-request abort must produce EQUIVALENT bridge state on a
+     *  native abort_stream endpoint and on the reset+stop fallback: the
+     *  stream is deactivated once, and the peer-visible teardown carries
+     *  the one code. Plus the fallback's explicit pending state and the
+     *  partial-failure fatal. */
+    for (int native = 0; native < 2; native++) {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        if (native)
+            fake_endpoint_enable_abort(&f.ep);
+
+        static const uint8_t req_bytes[] = { 0xAA, 0xBB };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7701);
+        moq_action_t open_act;
+        memset(&open_act, 0, sizeof(open_act));
+        open_act.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        open_act.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        open_act.borrow_epoch = f.session->borrow_epoch;
+        open_act.u.open_bidi_stream.stream_ref = ref;
+        open_act.u.open_bidi_stream.data = req_bytes;
+        open_act.u.open_bidi_stream.len  = sizeof(req_bytes);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &open_act),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        const fake_op_t *ob = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI);
+        MOQ_TEST_CHECK(ob != NULL);
+        uint64_t bidi_id = ob->stream_id;
+        fake_endpoint_clear_ops(&f.ep);
+
+        moq_action_t abort_act;
+        memset(&abort_act, 0, sizeof(abort_act));
+        abort_act.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        abort_act.detail_size =
+            (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        abort_act.borrow_epoch = f.session->borrow_epoch;
+        abort_act.u.abort_bidi_stream.stream_ref = ref;
+        abort_act.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &abort_act),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+
+        if (native) {
+            const fake_op_t *ab = fake_endpoint_find(&f.ep, FAKE_OP_ABORT);
+            MOQ_TEST_CHECK(ab != NULL);
+            MOQ_TEST_CHECK_EQ_U64(ab->stream_id, bidi_id);
+            MOQ_TEST_CHECK_EQ_U64(ab->error_code, 0x1);
+            MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) == NULL);
+            MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_STOP) == NULL);
+        } else {
+            const fake_op_t *rs = fake_endpoint_find(&f.ep, FAKE_OP_RESET);
+            const fake_op_t *st = fake_endpoint_find(&f.ep, FAKE_OP_STOP);
+            MOQ_TEST_CHECK(rs != NULL && st != NULL);
+            MOQ_TEST_CHECK_EQ_U64(rs->stream_id, bidi_id);
+            MOQ_TEST_CHECK_EQ_U64(st->stream_id, bidi_id);
+            MOQ_TEST_CHECK_EQ_U64(rs->error_code, 0x1);
+            MOQ_TEST_CHECK_EQ_U64(st->error_code, 0x1);
+        }
+        /* EQUIVALENT bridge state: the entry is KEPT in the discard
+         * lifecycle (same ref) until a terminal peer signal, and both
+         * paths retire it on FIN. */
+        MOQ_TEST_CHECK(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        /* late peer bytes are DISCARDED (no fresh ref, not fatal) */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_bidi_bytes(
+                f.bridge, bidi_id, req_bytes, 1, false, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        /* peer FIN retires the discarding entry */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_bidi_bytes(
+                f.bridge, bidi_id, NULL, 0, true, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        uc_destroy(&f);
+    }
+
+    /* == G3. Fallback pending state: WOULD_BLOCK before either half ==== */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        static const uint8_t req_bytes[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7702);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = req_bytes;
+        a.u.open_bidi_stream.len = sizeof(req_bytes);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        const fake_op_t *ob = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI);
+        MOQ_TEST_CHECK(ob != NULL);
+        uint64_t bidi_id = ob->stream_id;
+        fake_endpoint_clear_ops(&f.ep);
+
+        f.ep.block_reset = true; /* nothing can be applied yet */
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) == NULL);
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_STOP) == NULL);
+
+        /* unblock: the retry applies BOTH halves, once each */
+        f.ep.block_reset = false;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        const fake_op_t *rs = fake_endpoint_find(&f.ep, FAKE_OP_RESET);
+        const fake_op_t *st = fake_endpoint_find(&f.ep, FAKE_OP_STOP);
+        MOQ_TEST_CHECK(rs != NULL && st != NULL);
+        MOQ_TEST_CHECK_EQ_U64(rs->stream_id, bidi_id);
+        MOQ_TEST_CHECK_EQ_U64(st->stream_id, bidi_id);
+        uc_destroy(&f);
+    }
+
+    /* == G4. Fallback pending state: WOULD_BLOCK after the RESET half === *
+     *  The accepted RESET must NOT be re-sent when the STOP unblocks. */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        static const uint8_t req_bytes[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7703);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = req_bytes;
+        a.u.open_bidi_stream.len = sizeof(req_bytes);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        uint64_t bidi_id =
+            fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
+        fake_endpoint_clear_ops(&f.ep);
+
+        f.ep.block_stop = true; /* RESET lands; STOP blocks */
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) != NULL);
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_STOP) == NULL);
+        fake_endpoint_clear_ops(&f.ep);
+
+        f.ep.block_stop = false;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        /* ONLY the remaining STOP half was retried */
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) == NULL);
+        const fake_op_t *st = fake_endpoint_find(&f.ep, FAKE_OP_STOP);
+        MOQ_TEST_CHECK(st != NULL);
+        MOQ_TEST_CHECK_EQ_U64(st->stream_id, bidi_id);
+        uc_destroy(&f);
+    }
+
+    /* == G5. Partial runtime failure is fatal, never rolled back ======== */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        static const uint8_t req_bytes[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7704);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = req_bytes;
+        a.u.open_bidi_stream.len = sizeof(req_bytes);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        fake_endpoint_clear_ops(&f.ep);
+
+        f.ep.fail_stop = true; /* the RESET half lands, the STOP fails */
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK(
+            (int)moq_transport_bridge_service(f.bridge, 0) < 0);
+        MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.bridge));
+        uc_destroy(&f);
+    }
+
+    /* == G6. Old-prefix struct_size: abort_stream NOT read; fallback used *
+     *  An ops struct declaring a struct_size that predates abort_stream
+     *  must never have the field dereferenced — HAS_FIELD gates it, and
+     *  the bridge uses the reset+stop fallback. */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        /* Provide a real abort_stream, then shrink struct_size to exclude
+         * it: if the bridge read it anyway, FAKE_OP_ABORT would appear. */
+        fake_endpoint_enable_abort(&f.ep);
+        f.ep.vtable.struct_size =
+            (uint32_t)offsetof(moq_transport_endpoint_ops_t, abort_stream);
+
+        static const uint8_t rb[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7705);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = rb;
+        a.u.open_bidi_stream.len = sizeof(rb);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        fake_endpoint_clear_ops(&f.ep);
+
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        /* fallback used: reset+stop, abort NOT read */
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_ABORT) == NULL);
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) != NULL);
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_STOP) != NULL);
+        uc_destroy(&f);
+    }
+
+    /* == G7. Discard: late bytes during NATIVE abort WOULD_BLOCK ======== *
+     *  Before the abort op is accepted, late peer bytes must be absorbed
+     *  (no fresh ref, not fatal). Terminal input then retires it. */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        fake_endpoint_enable_abort(&f.ep);
+        static const uint8_t rb[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7706);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = rb;
+        a.u.open_bidi_stream.len = sizeof(rb);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        uint64_t bidi_id =
+            fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
+        fake_endpoint_clear_ops(&f.ep);
+
+        f.ep.block_abort = true; /* abort op stays pending */
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        /* late bytes while abort pending: discarded, not fatal */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_bidi_bytes(
+                f.bridge, bidi_id, rb, 1, false, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        /* the backend-neutral terminal retires it */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_stream_terminal(
+                f.bridge, bidi_id, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        uc_destroy(&f);
+    }
+
+    /* == G8. Discard: late bytes during fallback AFTER reset, before stop *
+     *  and after an accepted abort (peer RESET retires). */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);   /* no native abort: fallback */
+        static const uint8_t rb[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7707);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = rb;
+        a.u.open_bidi_stream.len = sizeof(rb);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        uint64_t bidi_id =
+            fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
+        fake_endpoint_clear_ops(&f.ep);
+
+        f.ep.block_stop = true; /* RESET lands, STOP blocks */
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) != NULL);
+        /* late bytes after RESET, before STOP: discarded */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_bidi_bytes(
+                f.bridge, bidi_id, rb, 1, false, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+
+        /* finish the abort, then late bytes after ACCEPTED abort: discarded;
+         * peer RESET retires the entry */
+        f.ep.block_stop = false;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_bidi_bytes(
+                f.bridge, bidi_id, rb, 1, false, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_stream_reset(
+                f.bridge, bidi_id, 0x1, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        uc_destroy(&f);
+    }
+
+    /* == G9. STOP_SENDING is NOT a terminal receive-side signal ======== *
+     *  After abort, a peer STOP only asks us to stop OUR send half; the
+     *  peer may keep sending. The discard mapping must survive STOP, keep
+     *  discarding late bytes, and retire only on a full terminal. */
+    {
+        uc_fixture_t f;
+        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        fake_endpoint_enable_abort(&f.ep);
+        static const uint8_t rb[] = { 0xAA };
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7708);
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_OPEN_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_open_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.open_bidi_stream.stream_ref = ref;
+        a.u.open_bidi_stream.data = rb;
+        a.u.open_bidi_stream.len = sizeof(rb);
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        uint64_t bidi_id =
+            fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
+        fake_endpoint_clear_ops(&f.ep);
+
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = f.session->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;
+        MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+
+        /* peer STOP: does NOT retire the discarding entry */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_stop_sending(
+                f.bridge, bidi_id, 0x1, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        /* late peer bytes AFTER the STOP: still discarded on the SAME
+         * mapping (no fresh ref, not fatal) */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_bidi_bytes(
+                f.bridge, bidi_id, rb, 1, false, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        /* only a full-stream terminal retires it */
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_stream_terminal(
+                f.bridge, bidi_id, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        uc_destroy(&f);
+    }
+
     /* == H. Peer RESET of its uni control channel terminates ========== *
      *  A real draft-18 session: an inbound peer uni carrying the SETUP
      *  stream type classifies as CONTROL through the live inbound path;

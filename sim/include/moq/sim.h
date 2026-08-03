@@ -130,11 +130,26 @@ typedef struct moq_simpair_cfg {
     /* Client subscription pool size (0 = session default). Mirror of
      * server_max_subscriptions for the client session. */
     uint32_t           client_max_subscriptions;
+
+    /* Per-track largest-location history registry capacity for BOTH sessions
+     * (0 = session default). Appended, CFG_HAS-gated. Lets tests drive the
+     * registry cap-exhaustion pre-commit reject path. */
+    uint32_t           max_track_history_records;
+
+    /* Max object payload bytes for BOTH sessions (0 = session default).
+     * Appended, CFG_HAS-gated. Lets tests drive the over-limit-object drop. */
+    uint32_t           max_object_payload_size;
+    /* Appended: forwarded into both sessions' done_wait_timeout_us (§9.8);
+     * 0 keeps the library default. */
+    uint64_t done_wait_timeout_us;
+    /* Appended: advertised auth-token cache size for both sessions (0 =
+     * none advertised; REGISTER tokens then close). */
+    uint64_t auth_token_cache_size;
 } moq_simpair_cfg_t;
 
 #ifdef __cplusplus
 #define MOQ_SIMPAIR_CFG_INIT \
-    (moq_simpair_cfg_t{ sizeof(moq_simpair_cfg_t), 0, 0, 0, false, 0, false, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, (moq_version_t)0, 0, 0 })
+    (moq_simpair_cfg_t{ sizeof(moq_simpair_cfg_t), 0, 0, 0, false, 0, false, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, (moq_version_t)0, 0, 0, 0, 0, 0, 0 })
 #else
 #define MOQ_SIMPAIR_CFG_INIT \
     ((moq_simpair_cfg_t){ .struct_size = sizeof(moq_simpair_cfg_t) })

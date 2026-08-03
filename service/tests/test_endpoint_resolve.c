@@ -6,6 +6,7 @@
 #include "endpoint_internal.h"
 #include "test_support.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -33,13 +34,122 @@ int main(void)
 {
     /* == cfg_init defaults ============================================ */
     {
+        /* Pointer-only init clears/stamps ONLY the frozen v0 prefix (it cannot
+         * know the caller's size), so struct_size is the v0 floor, not the
+         * current sizeof -- this is what makes it overflow-safe for an old
+         * caller. Every v0 field still gets its default. */
         moq_endpoint_cfg_t c;
         moq_endpoint_cfg_init(&c);
-        MOQ_TEST_CHECK_EQ_U64(c.struct_size, sizeof(moq_endpoint_cfg_t));
+        MOQ_TEST_CHECK_EQ_U64(c.struct_size, MOQ_ENDPOINT_CFG_V0_SIZE);
         MOQ_TEST_CHECK_EQ_INT((int)c.perspective, (int)MOQ_PERSPECTIVE_CLIENT);
         MOQ_TEST_CHECK_EQ_INT((int)c.protocol, (int)MOQ_TRANSPORT_PROTOCOL_AUTO);
         MOQ_TEST_CHECK_EQ_INT((int)c.backend, (int)MOQ_TRANSPORT_BACKEND_AUTO);
         MOQ_TEST_CHECK(!c.insecure_skip_verify);
+
+        /* The sized init stamps the full current size and zeroes the tail, so
+         * wt_profile is reachable and defaults to BACKEND_DEFAULT (0 = select
+         * nothing), NOT an explicit CURRENT. */
+        moq_endpoint_cfg_t s;
+        moq_endpoint_cfg_init_sized(&s, sizeof(s));
+        MOQ_TEST_CHECK_EQ_U64(s.struct_size, sizeof(moq_endpoint_cfg_t));
+        MOQ_TEST_CHECK_EQ_INT((int)s.perspective, (int)MOQ_PERSPECTIVE_CLIENT);
+        MOQ_TEST_CHECK_EQ_U64(s.wt_profile,
+                              (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+        /* The v0 floor must sit exactly at wt_profile (the first tail field). */
+        MOQ_TEST_CHECK_EQ_U64(MOQ_ENDPOINT_CFG_V0_SIZE,
+                              offsetof(moq_endpoint_cfg_t, wt_profile));
+    }
+
+    /* == wt_profile resolve: gate + range + backend rejection ========== *
+     * An EXPLICIT profile is honored only by the wtquic-msquic backend; on any
+     * other backend it is MOQ_ERR_UNSUPPORTED (not silently ignored).
+     * BACKEND_DEFAULT is accepted everywhere. These use the always-compiled
+     * AUTO/picoquic backend (a fixed-dialect WebTransport backend), so they run
+     * regardless of whether the wtquic-msquic facade is built into this tree. */
+    {
+        moq_endpoint_resolved_t r;
+
+        /* v0-sized caller (no wt_profile field): resolve defaults to
+         * BACKEND_DEFAULT, never reads past the buffer. */
+        moq_endpoint_cfg_t v0 = mkcfg("https://relay.example/moq");
+        v0.struct_size = MOQ_ENDPOINT_CFG_V0_SIZE;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                              (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+
+        /* Full-size caller, BACKEND_DEFAULT explicitly: accepted on picoquic. */
+        moq_endpoint_cfg_t c = mkcfg("https://relay.example/moq");
+        c.struct_size = sizeof(c);
+        c.wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                              (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+
+        /* An EXPLICIT selection on picoquic (fixed dialect) is rejected -- the
+         * public contract must not accept a profile it will not apply. */
+        c.wt_profile = (uint32_t)MOQ_WT_PROFILE_CURRENT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c.wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+
+        /* Out-of-range profile is a clean INVAL (checked before the backend
+         * rejection: malformed input is INVAL, not UNSUPPORTED). */
+        c.wt_profile = 7;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+
+        /* A struct_size that only PARTIALLY covers wt_profile must not read it
+         * (complete-presence gate): treated as absent -> BACKEND_DEFAULT, so a
+         * poisoned explicit value is neither applied nor rejected. */
+        moq_endpoint_cfg_t part = mkcfg("https://relay.example/moq");
+        part.wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+        part.struct_size =
+            (uint32_t)(offsetof(moq_endpoint_cfg_t, wt_profile) + 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&part, &r),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                              (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+        /* The selectable backend accepts an explicit selection and resolves it
+         * verbatim (built only where the facade is compiled in). */
+        moq_endpoint_cfg_t w = mkcfg("https://relay.example/moq");
+        w.struct_size = sizeof(w);
+        w.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC;
+        w.wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                              (uint64_t)MOQ_WT_PROFILE_D13_14_COMPAT);
+        w.wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                              (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+#endif
+    }
+
+    /* == old-caller overflow guard (v0-sized HEAP buffer) ============= *
+     * Simulate a binary compiled against the pre-wt_profile header: a heap
+     * allocation of exactly the v0 size. The pointer-only init must not write
+     * past it, and resolve must not read past it. Under ASan either violation is
+     * a hard heap-buffer-overflow, so this is the load-bearing forward-compat
+     * check, not just an equality assertion. */
+    {
+        void *raw = malloc(MOQ_ENDPOINT_CFG_V0_SIZE);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            moq_endpoint_cfg_t *old = (moq_endpoint_cfg_t *)raw;
+            moq_endpoint_cfg_init(old);      /* writes exactly V0_SIZE bytes */
+            MOQ_TEST_CHECK_EQ_U64(old->struct_size, MOQ_ENDPOINT_CFG_V0_SIZE);
+            old->url = B("https://relay.example/moq");
+            moq_endpoint_resolved_t r;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r),
+                                  (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                                  (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+            free(raw);
+        }
     }
 
     /* == Malformed configs ============================================ */
@@ -132,8 +242,9 @@ int main(void)
     /* == Backend matrix =============================================== */
     {
         moq_endpoint_resolved_t r;
-        /* AUTO resolves to picoquic for RAW_QUIC -- picoquic is first in the
-         * registry, so AUTO stays picoquic even when mvfst is also built. */
+        /* AUTO resolves DIRECTLY to picoquic for RAW_QUIC -- a stable
+         * default, never a first-available scan, so AUTO stays picoquic
+         * no matter which opt-in backends are also built. */
         moq_endpoint_cfg_t c = mkcfg("moqt://relay.example");  /* backend AUTO */
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)r.backend,
@@ -176,6 +287,35 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_UNSUPPORTED);
 
+        /* MsQuic: RAW_QUIC only, and only when compiled into the service.
+         * It is opt-in -- reached only by an explicit backend = MSQUIC; AUTO
+         * stays picoquic (pinned above). When built, explicit MSQUIC + moqt://
+         * resolves to RAW_QUIC/MSQUIC; otherwise it is UNSUPPORTED. (The
+         * exact-version constraint is a connect-time check, not resolve-time.) */
+        c = mkcfg("moqt://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)r.protocol,
+                              (int)MOQ_TRANSPORT_PROTOCOL_RAW_QUIC);
+        MOQ_TEST_CHECK_EQ_INT((int)r.backend,
+                              (int)MOQ_TRANSPORT_BACKEND_MSQUIC);
+#else
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+#endif
+        /* MsQuic has no WebTransport facade: MSQUIC + WEBTRANSPORT is always
+         * UNSUPPORTED, whether or not MsQuic is built. */
+        c = mkcfg("https://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c = mkcfg("moqt://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        c.protocol = MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+
         /* proxygen: WEBTRANSPORT only, and only when compiled into the
          * service. When built, explicit PROXYGEN + https:// resolves to
          * WEBTRANSPORT/PROXYGEN; otherwise it is UNSUPPORTED. */
@@ -199,6 +339,64 @@ int main(void)
                               (int)MOQ_ERR_UNSUPPORTED);
         c = mkcfg("https://relay.example");
         c.backend = MOQ_TRANSPORT_BACKEND_PROXYGEN;
+        c.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+
+        /* wtquic-Network: WEBTRANSPORT only, and only when compiled into the
+         * service (Apple-only). Opt-in -- reached only by an explicit
+         * backend = WTQUIC_NETWORK; AUTO WEBTRANSPORT stays pico_wt. When
+         * built, explicit WTQUIC_NETWORK + https:// resolves to
+         * WEBTRANSPORT/WTQUIC_NETWORK; otherwise it is UNSUPPORTED. */
+        c = mkcfg("https://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK;
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)r.protocol,
+                              (int)MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT);
+        MOQ_TEST_CHECK_EQ_INT((int)r.backend,
+                              (int)MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK);
+#else
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+#endif
+        /* The wtquic Network client has no raw-QUIC facade: WTQUIC_NETWORK
+         * + RAW_QUIC is always UNSUPPORTED, whether or not it is built. */
+        c = mkcfg("moqt://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c = mkcfg("https://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK;
+        c.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+
+        /* wtquic-MsQuic: WEBTRANSPORT only, and only when compiled into the
+         * service (cross-platform). Opt-in -- reached only by an explicit
+         * backend = WTQUIC_MSQUIC; AUTO WEBTRANSPORT stays pico_wt (pinned
+         * above). When built, explicit WTQUIC_MSQUIC + https:// resolves to
+         * WEBTRANSPORT/WTQUIC_MSQUIC; otherwise it is UNSUPPORTED. */
+        c = mkcfg("https://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC;
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)r.protocol,
+                              (int)MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT);
+        MOQ_TEST_CHECK_EQ_INT((int)r.backend,
+                              (int)MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC);
+#else
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+#endif
+        /* The wtquic MsQuic client has no raw-QUIC facade: WTQUIC_MSQUIC +
+         * RAW_QUIC is always UNSUPPORTED, whether or not it is built. */
+        c = mkcfg("moqt://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c = mkcfg("https://relay.example");
+        c.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC;
         c.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_UNSUPPORTED);
@@ -350,6 +548,72 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_post(NULL, NULL, NULL),
                               (int)MOQ_ERR_INVAL);
     }
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+    /* == wtquic-Network terminal classification (pure, synthetic) ====== *
+     * Provenance mapping with the native detail preserved for EVERY
+     * captured record -- no OSStatus allowlist, and no codeless
+     * TRANSPORT collapse for POSIX/DNS/BACKEND records. */
+    {
+        struct {
+            uint32_t domain;
+            int64_t code;
+            moq_endpoint_terminal_reason_t want;
+        } cases[] = {
+            { (uint32_t)WTQ_ERRDOM_NW_TRUST, -67843,
+              MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE },
+            { (uint32_t)WTQ_ERRDOM_NW_TLS, -9836,
+              MOQ_ENDPOINT_TERMINAL_TLS },
+            { (uint32_t)WTQ_ERRDOM_NW_POSIX, 54 /* ECONNRESET */,
+              MOQ_ENDPOINT_TERMINAL_TRANSPORT },
+            { (uint32_t)WTQ_ERRDOM_NW_DNS, 8,
+              MOQ_ENDPOINT_TERMINAL_TRANSPORT },
+            { (uint32_t)WTQ_ERRDOM_BACKEND, -1,
+              MOQ_ENDPOINT_TERMINAL_TRANSPORT },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            wtq_transport_error_t rec;
+            memset(&rec, 0, sizeof(rec));
+            rec.struct_size = (uint32_t)sizeof(rec);
+            rec.kind = 3; /* WTQ_ERR_KIND_LOCAL */
+            rec.native_domain = cases[i].domain;
+            rec.native_code = cases[i].code;
+            moq_endpoint_terminal_reason_t reason;
+            uint64_t detail = 0;
+            moq_endpoint_classify_wtquic_network(true, 0, false, true, &rec,
+                                        &reason, &detail);
+            MOQ_TEST_CHECK_EQ_INT((int)reason, (int)cases[i].want);
+            /* the raw native bits survive, sign included */
+            MOQ_TEST_CHECK((int64_t)detail == cases[i].code);
+        }
+        /* no captured record: the generic fallback rules hold */
+        moq_endpoint_terminal_reason_t reason;
+        uint64_t detail = 0xAA;
+        moq_endpoint_classify_wtquic_network(true, 7, false, false, NULL,
+                                    &reason, &detail);
+        MOQ_TEST_CHECK_EQ_INT((int)reason,
+                              (int)MOQ_ENDPOINT_TERMINAL_PROTOCOL);
+        MOQ_TEST_CHECK_EQ_U64(detail, 7);
+        moq_endpoint_classify_wtquic_network(true, 0, false, false, NULL,
+                                    &reason, &detail);
+        MOQ_TEST_CHECK_EQ_INT((int)reason,
+                              (int)MOQ_ENDPOINT_TERMINAL_TRANSPORT);
+        MOQ_TEST_CHECK_EQ_U64(detail, 0);
+        moq_endpoint_classify_wtquic_network(false, 0, true, false, NULL,
+                                    &reason, &detail);
+        MOQ_TEST_CHECK_EQ_INT((int)reason,
+                              (int)MOQ_ENDPOINT_TERMINAL_CLEAN);
+        /* a NONE-domain record never claims a native detail */
+        wtq_transport_error_t none;
+        memset(&none, 0, sizeof(none));
+        none.struct_size = (uint32_t)sizeof(none);
+        moq_endpoint_classify_wtquic_network(true, 0, false, true, &none,
+                                    &reason, &detail);
+        MOQ_TEST_CHECK_EQ_INT((int)reason,
+                              (int)MOQ_ENDPOINT_TERMINAL_TRANSPORT);
+        MOQ_TEST_CHECK_EQ_U64(detail, 0);
+    }
+#endif /* MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED */
 
     /* == New result codes are wired ================================== */
     {

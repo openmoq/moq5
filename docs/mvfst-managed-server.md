@@ -8,10 +8,10 @@ mvfst QUIC transport. Requires `MOQ_BUILD_ADAPTER_MVFST=ON`.
 The managed server owns a QuicServer listener on one worker
 EventBase. Each accepted QUIC connection gets its own
 moq_session_t and adapter bridge. The application iterates
-connections via `next_conn()` inside `on_pump` and uses
+connections via `moq_mvfst_lane_next_conn()` inside `on_lane_pump` and uses
 `wake()`/`wait()` for cross-thread signaling.
 
-All session and connection calls must happen inside `on_pump`.
+All session and connection calls must happen inside `on_lane_pump`.
 
 ```
 App thread                   Managed network thread
@@ -23,7 +23,7 @@ App thread                   Managed network thread
   wake() ──────────────────→ EventBase.loopOnce()
                              accept new connections
                              adapter.service(now) per conn
-                             on_pump(managed, now, ctx)
+                             on_lane_pump(managed, now, ctx)
   wait() ◄──────────────────  signal_activity()
 
   stop() ──────────────────→ close all connections
@@ -43,7 +43,7 @@ cfg.perspective  = MOQ_PERSPECTIVE_SERVER;
 cfg.port         = 0;       /* 0 = ephemeral; use local_port() after create */
 cfg.cert_path    = "/path/to/server.pem";
 cfg.key_path     = "/path/to/server-key.pem";
-cfg.on_pump      = my_pump;
+cfg.on_lane_pump      = my_pump;
 cfg.user_ctx     = &my_state;
 cfg.send_request_capacity = true;
 cfg.initial_request_capacity = 16;
@@ -64,9 +64,10 @@ moq_mvfst_managed_destroy(m);  /* calls stop() internally */
 ## Pump callback
 
 ```c
-int my_pump(moq_mvfst_managed_t *m, uint64_t now_us, void *ctx) {
+int my_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+            uint64_t now_us, void *ctx) {
     moq_mvfst_conn_t *conn = NULL;
-    while ((conn = moq_mvfst_managed_next_conn(m, conn)) != NULL) {
+    while ((conn = moq_mvfst_lane_next_conn(lane, conn)) != NULL) {
         moq_session_t *s = moq_mvfst_conn_session(conn);
         /* poll events, accept subscribes, write objects */
     }
@@ -87,7 +88,7 @@ drained before the callback fires.
 | `conn_close` | pump | Marks close; removal deferred until after pump returns |
 | `conn_count` | any | Atomic; safe from app thread |
 
-Note: conn handles are valid only for the current `on_pump` call.
+Note: conn handles are valid only for the current `on_lane_pump` call.
 
 ## Server config
 
@@ -118,11 +119,11 @@ Note: conn handles are valid only for the current `on_pump` call.
 
 Connections that are closed (by the app via `conn_close`, by
 the peer, or by a transport/protocol error) are removed from
-`next_conn()` iteration after the current `on_pump` returns.
+`moq_mvfst_lane_next_conn()` iteration after the current `on_lane_pump` returns.
 
 The managed server does **not** expose a per-connection close
 reason API. To observe close causes, poll session events inside
-`on_pump` before the connection disappears:
+`on_lane_pump` before the connection disappears:
 
 ```c
 moq_event_t ev[16]; size_t ne;

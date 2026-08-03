@@ -17,6 +17,10 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
                                   uint32_t max_events,
                                   moq_version_t version,
                                   uint32_t max_subscriptions,
+                                  uint32_t max_track_history_records,
+                                  uint32_t max_object_payload_size,
+                                  uint64_t done_wait_timeout_us,
+                                  uint64_t auth_token_cache_size,
                                   moq_session_t **out)
 {
     moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
@@ -30,6 +34,16 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
     scfg.max_events = max_events;
     scfg.version = version;
     if (max_subscriptions) scfg.max_subscriptions = max_subscriptions;
+    if (max_track_history_records)
+        scfg.max_track_history_records = max_track_history_records;
+    if (max_object_payload_size)
+        scfg.max_object_payload_size = max_object_payload_size;
+    if (done_wait_timeout_us)
+        scfg.done_wait_timeout_us = done_wait_timeout_us;
+    if (auth_token_cache_size) {
+        scfg.send_auth_token_cache_size = true;
+        scfg.auth_token_cache_size = auth_token_cache_size;
+    }
     return moq_session_create(&scfg, initial_now_us, out);
 }
 
@@ -130,6 +144,22 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, client_max_subscriptions),
                       sizeof(cfg->client_max_subscriptions)))
         client_max_subscriptions = cfg->client_max_subscriptions;
+    uint32_t max_track_history_records = 0;   /* 0 -> session default */
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, max_track_history_records),
+                      sizeof(cfg->max_track_history_records)))
+        max_track_history_records = cfg->max_track_history_records;
+    uint64_t done_wait_timeout_us = 0;        /* 0 -> library default */
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, done_wait_timeout_us),
+                      sizeof(cfg->done_wait_timeout_us)))
+        done_wait_timeout_us = cfg->done_wait_timeout_us;
+    uint64_t auth_token_cache_size = 0;       /* 0 -> none advertised */
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, auth_token_cache_size),
+                      sizeof(cfg->auth_token_cache_size)))
+        auth_token_cache_size = cfg->auth_token_cache_size;
+    uint32_t max_object_payload_size = 0;   /* 0 -> session default */
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, max_object_payload_size),
+                      sizeof(cfg->max_object_payload_size)))
+        max_object_payload_size = cfg->max_object_payload_size;
 
     if (fault_per_mille > 1000)
         fault_per_mille = 1000;
@@ -167,6 +197,10 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                                    max_actions, max_events,
                                    version,
                                    client_max_subscriptions,
+                                   max_track_history_records,
+                                   max_object_payload_size,
+                                   done_wait_timeout_us,
+                                   auth_token_cache_size,
                                    &sp->client);
     if (rc < 0)
         goto fail;
@@ -180,6 +214,10 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                       max_actions, max_events,
                       version,
                       server_max_subscriptions,
+                      max_track_history_records,
+                      max_object_payload_size,
+                      done_wait_timeout_us,
+                      auth_token_cache_size,
                       &sp->server);
     if (rc < 0)
         goto fail;

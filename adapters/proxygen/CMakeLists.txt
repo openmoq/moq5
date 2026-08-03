@@ -306,6 +306,46 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME proxygen_wt_managed COMMAND test_wt_managed)
     set_tests_properties(proxygen_wt_managed PROPERTIES TIMEOUT 30)
 
+    # Pump-scheduler proof. Recompiles the managed facade with
+    # MOQ_PROXYGEN_WT_TESTING so the test can drive the PRODUCTION
+    # pump_once/schedule_pump_soon loop over a fake WebTransport (no dial). The
+    # seam is compile-guarded and never enters the shipped adapter; the test
+    # links this object lib (not the managed library) to avoid duplicate symbols.
+    add_library(moq-adapter-proxygen-wt-managed-test-internals OBJECT
+        src/wt_managed.cpp)
+    target_include_directories(moq-adapter-proxygen-wt-managed-test-internals
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(moq-adapter-proxygen-wt-managed-test-internals
+        PUBLIC moq::core proxygen::proxygen moq::adapter-proxygen-wt)
+    target_compile_features(moq-adapter-proxygen-wt-managed-test-internals
+        PUBLIC cxx_std_20)
+    target_compile_definitions(moq-adapter-proxygen-wt-managed-test-internals
+        PRIVATE MOQ_BUILDING MOQ_PROXYGEN_WT_TESTING)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(moq-adapter-proxygen-wt-managed-test-internals PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+
+    add_executable(test_wt_managed_scheduler tests/test_wt_managed_scheduler.cpp)
+    target_include_directories(test_wt_managed_scheduler PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_wt_managed_scheduler PRIVATE
+        moq-adapter-proxygen-wt-managed-test-internals
+        moq::adapter-proxygen-wt proxygen::proxygen)
+    if(_cares_dir)
+        target_link_directories(test_wt_managed_scheduler PRIVATE "${_cares_dir}")
+    endif()
+    target_compile_features(test_wt_managed_scheduler PRIVATE cxx_std_20)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_wt_managed_scheduler PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME proxygen_wt_managed_scheduler COMMAND test_wt_managed_scheduler)
+    set_tests_properties(proxygen_wt_managed_scheduler PROPERTIES TIMEOUT 40)
+
     # -- Cold-consumer tests ------------------------------------------
     # Build-tree consumer: find_package(libmoq COMPONENTS
     # adapter-proxygen-wt) against the build tree, include ONLY

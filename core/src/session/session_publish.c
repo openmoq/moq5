@@ -34,6 +34,69 @@ int pub_resolve_handle(moq_session_t *s, moq_publication_t h)
     return (int)slot;
 }
 
+const moq_resolved_window_t *moq_session_pub_resolved_window(
+    moq_session_t *s, moq_publication_t pub)
+{
+    if (!s) return NULL;
+    int slot = pub_resolve_handle(s, pub);
+    if (slot < 0) return NULL;
+    moq_pub_entry_t *e = &s->publishes[slot];
+    if (!e->window.has_window) return NULL;
+    return &e->window;
+}
+
+moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
+    bool has_largest, uint64_t largest_group, uint64_t largest_object,
+    bool has_expires, uint64_t expires_ms)
+{
+    moq_pub_entry_t *e = &s->publishes[slot];
+    if (e->state != MOQ_PUB_ESTABLISHED || !e->update_pending)
+        return close_with_error(s, 0x3, "REQUEST_OK without a pending update");
+    /* Emit MOQ_EVENT_PUBLICATION_UPDATE_OK exactly once; a full event queue is a
+     * retryable WOULD_BLOCK checked BEFORE clearing update_pending. */
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_PUBLICATION_UPDATE_OK;
+    ev.detail_size = (uint32_t)sizeof(moq_publication_update_ok_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.publication_update_ok.pub = e->handle;
+    ev.u.publication_update_ok.has_largest = has_largest;
+    ev.u.publication_update_ok.largest_group = has_largest ? largest_group : 0;
+    ev.u.publication_update_ok.largest_object = has_largest ? largest_object : 0;
+    ev.u.publication_update_ok.has_expires = has_expires;
+    ev.u.publication_update_ok.expires_ms = has_expires ? expires_ms : 0;
+    moq_result_t rc = push_event(s, &ev);
+    if (rc < 0) return rc;   /* retryable; update_pending still set */
+    if (has_largest && e->hist)
+        track_hist_merge(e->hist, largest_group, largest_object);
+    /* Latch the acknowledged Forward state: object delivery (streams and
+     * datagrams) gates on it from this point on. */
+    if (e->update_has_forward)
+        e->send_allowed = e->update_forward;
+    e->update_has_forward = false;
+    /* §9.8: latch acknowledged timeout carriers; retained legacy stays
+     * EXACT milliseconds, recomputed from the complete current pair. */
+    if (e->dt_upd_has_object) {
+        e->dt_sub_has_object = true;
+        e->dt_sub_object_ms = e->dt_upd_object_ms;
+    }
+    if (e->dt_upd_has_subgroup) {
+        e->dt_sub_has_subgroup = true;
+        e->dt_sub_subgroup_ms = e->dt_upd_subgroup_ms;
+    }
+    if (e->dt_upd_has_object || e->dt_upd_has_subgroup) {
+        e->has_delivery_timeout = true;
+        e->delivery_timeout_ms = dt_negotiate_ms(
+            e->dt_sub_has_object, e->dt_sub_object_ms,
+            e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms);
+    }
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
+    e->update_pending = false;
+    e->update_request_id = 0;
+    return MOQ_OK;
+}
+
 void pub_free_entry(moq_session_t *s, int slot)
 {
     moq_pub_entry_t *e = &s->publishes[slot];
@@ -48,6 +111,12 @@ void pub_free_entry(moq_session_t *s, int slot)
         e->done_reason_buf = NULL;
         e->done_reason_len = 0;
     }
+    /* Release the reserved registry record exactly once BEFORE the memset
+     * (empty reservations reclaimed; observed records pinned). */
+    if (e->hist) {
+        track_hist_release(s, e->hist);
+        e->hist = NULL;
+    }
     uint32_t next_gen = e->generation + 1;
     /* Preserve the co-allocated request-bidi receive buffer across reuse. */
     uint8_t *recv_buf = e->req_recv_buf;
@@ -60,7 +129,8 @@ void pub_free_entry(moq_session_t *s, int slot)
 }
 
 /* Emit the deferred PUBLISH_FINISHED for a subscriber-role publication whose
- * Stream Count has now been satisfied, then free the entry. Returns
+ * Stream Count has now been satisfied -- or whose terminal deadline EXPIRED
+ * with no live bound streams left (§9.8) -- then free the entry. Returns
  * MOQ_ERR_WOULD_BLOCK if the event queue (or scratch) cannot take it yet; the
  * caller leaves done_pending set and retries via pub_reap_deferred_dones. */
 static moq_result_t pub_finalize_done(moq_session_t *s, int slot)
@@ -114,9 +184,11 @@ static moq_result_t pub_finalize_done(moq_session_t *s, int slot)
     return MOQ_OK;
 }
 
-/* Count a completed (FIN'd) data stream toward a subscriber-role publication's
- * PUBLISH_DONE Stream Count. If a deferred PUBLISH_DONE is now satisfied,
- * finalize promptly (a WOULD_BLOCK is retried by pub_reap_deferred_dones). */
+/* Count a completed data stream -- FIN'd, or terminated by an identifiable
+ * RESET (the receive path counts both at their terminal teardown sites) --
+ * toward a subscriber-role publication's PUBLISH_DONE Stream Count. If a
+ * deferred PUBLISH_DONE is now satisfied, finalize promptly (a WOULD_BLOCK is
+ * retried by pub_reap_deferred_dones). */
 void pub_note_stream_processed(moq_session_t *s, moq_publication_t pub)
 {
     int slot = pub_resolve_handle(s, pub);
@@ -124,25 +196,109 @@ void pub_note_stream_processed(moq_session_t *s, moq_publication_t pub)
     moq_pub_entry_t *pe = &s->publishes[slot];
     if (pe->role != MOQ_PUB_ROLE_SUBSCRIBER) return;
     pe->processed_stream_count++;
-    if (pe->done_pending &&
+    /* §9.8: direct count-based finalization only in GATED (see
+     * sub_note_stream_processed). */
+    if (pe->done_pending && !pe->done_expired &&
+        pe->done_stream_count != MOQ_QUIC_VARINT_MAX &&
         pe->processed_stream_count >= pe->done_stream_count)
         (void)pub_finalize_done(s, slot);
 }
 
-/* Retry-finalize any deferred PUBLISH_DONE whose Stream Count is satisfied but
- * whose PUBLISH_FINISHED could not be queued earlier (event queue was full). */
-void pub_reap_deferred_dones(moq_session_t *s)
+/* Drive deferred publication terminals (§9.8): GATED count-satisfied
+ * retries, deadline firing, and the EXPIRED scan/stop/rescan/finalize
+ * loop; one blocked entry never aborts the sweep. */
+/*
+ * Sweep the publication pool for deferred completions, resumably.
+ *
+ * Starts at s->sweep_slot. SELECT classifies readiness first: an owner with no
+ * runnable work skips UNCHARGED. Charged separately thereafter are the durable
+ * due-mark, the stream-stop attempt, and the finalize attempt. With a
+ * budget, it stops the moment the budget is exhausted and leaves sweep_slot on
+ * the owner still to be processed, so the caller can resume exactly there.
+ * Returns true when the pool retired, false when it suspended.
+ *
+ * Owners are evaluated against s->sweep_now_us -- the epoch the sweep began --
+ * so a suspended sweep never mixes two clocks. Slots that become due later are
+ * picked up by the caller's catch-up sweep, not by this one.
+ */
+bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
 {
-    for (size_t i = 0; i < s->pub_cap; i++) {
-        if (s->state == MOQ_SESS_CLOSED) return;  /* finalize may close (scratch) */
+    for (; s->sweep_slot < s->pub_cap; s->sweep_slot++) {
+        if (s->state == MOQ_SESS_CLOSED) return true;  /* finalize may close */
+
+        size_t i = s->sweep_slot;
         moq_pub_entry_t *pe = &s->publishes[i];
-        if (pe->done_pending &&
-            pe->processed_stream_count >= pe->done_stream_count) {
-            if (pub_finalize_done(s, (int)i) < 0)
-                return;   /* event queue full: try again next advance */
+        if (!pe->done_pending) continue;   /* costs nothing; never suspends */
+
+        /* A suspension inside STOP_STREAMS or FINALIZE resumes in that phase:
+         * SELECT already qualified this owner, and re-running it could reach a
+         * different verdict now that earlier transitions have committed. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT) {
+            /* SELECT: classify readiness BEFORE spending anything. An owner whose
+             * count is unsatisfied and whose deadline is still in the future has no
+             * runnable work, so it must skip uncharged -- otherwise a pool of
+             * future owners could exhaust the budget and suspend a pass that had
+             * nothing to do. */
+            bool count_satisfied =
+                (pe->done_stream_count != MOQ_QUIC_VARINT_MAX &&
+                 pe->processed_stream_count >= pe->done_stream_count);
+            bool due = (s->sweep_now_us >= pe->done_deadline_us);
+            if (!pe->done_expired && !count_satisfied && !due)
+                continue;                      /* not runnable: uncharged skip */
+
+            if (count_satisfied && !pe->done_expired) {
+                /* FINALIZE attempt: one unit. */
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
+                (void)pub_finalize_done(s, (int)i);
+                continue;
+            }
+
+            if (!pe->done_expired) {
+                /* The durable due-mark is its own charged transition. */
+                if (budget) {
+                    if (*budget == 0) return false;
+                    (*budget)--;
+                }
+                pe->done_expired = true;
+            }
         }
+
+        /* STOP_STREAMS: branch on the PERSISTED phase. Assigning it here
+         * unconditionally would make a suspension at the finalize check rescan
+         * the rx pool on re-entry instead of finalizing. */
+        if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT ||
+            s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS) {
+            s->sweep_phase = MOQ_SWEEP_PHASE_STOP_STREAMS;
+            moq_result_t src = session_stop_bound_streams_resumable(s, MOQ_SUBSCRIPTION_INVALID,
+                                                     pe->handle, budget);
+            if (src == MOQ_SESSION_SUSPENDED)
+                return false;              /* rx cursor stays: we resume here */
+            if (src < 0) {
+                /* Action capacity: this owner is abandoned for now, so its rx
+                 * cursor must NOT leak into the next owner's scan. */
+                session_sweep_owner_reset(s);
+                continue;
+            }
+            /* Owner's rx scan is complete; the next phase owns a clean cursor. */
+            s->sweep_rx_pos = 0;
+            s->sweep_rx_found = false;
+            s->sweep_phase = MOQ_SWEEP_PHASE_FINALIZE;
+        }
+
+        if (budget) {
+            if (*budget == 0) return false;   /* resume AT finalize */
+            (*budget)--;
+        }
+        (void)pub_finalize_done(s, (int)i);
+        session_sweep_owner_reset(s);
     }
+    s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    return true;
 }
+
 
 bool pub_track_alias_in_use(moq_session_t *s, uint64_t alias)
 {
@@ -188,26 +344,6 @@ static moq_result_t queue_publish_response(moq_session_t *s, size_t slot,
     return queue_send_control(s, data, len);
 }
 
-/* -- Copy namespace parts into output scratch ---------------------- */
-
-static bool event_scratch_copy_namespace(moq_session_t *s,
-                                    const moq_namespace_t *src,
-                                    moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* -- Inbound PUBLISH handler --------------------------------------- */
 
 moq_result_t session_core_on_publish(moq_session_t *s,
@@ -216,10 +352,25 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     bool auth_committed = false;
     moq_result_t result = MOQ_OK;
     moq_result_t rc;
+    /* Reserved registry record; released on any pre-commit failure via
+     * cleanup_all, or stored on the entry at commit. */
+    moq_track_hist_t *phist = NULL;
     size_t scratch_saved = s->event_scratch_len;
 
     if (event_queue_full(s)) {
         result = MOQ_ERR_WOULD_BLOCK;
+        goto cleanup_all;
+    }
+
+    /* §9.8 inbound extraction, BEFORE any event/entry/registry mutation:
+     * the publisher's timeout Track Properties/extension from THIS PUBLISH
+     * (failure keeps the profile's protocol character, as on SUBSCRIBE_OK)
+     * -- routed through cleanup_all so staged USE_ALIAS buffers and the
+     * auth transaction are released, never leaked. */
+    moq_dt_scan_t dtscan;
+    if (session_scan_dt_props(s, d->track_properties,
+                              d->track_properties_len, false, &dtscan) < 0) {
+        result = close_with_error(s, 0x3, "malformed track properties");
         goto cleanup_all;
     }
 
@@ -309,6 +460,55 @@ moq_result_t session_core_on_publish(moq_session_t *s,
                 .request_id = d->request_id, .error_code = 0x0,
                 .reason = (const uint8_t *)"publish pool full",
                 .reason_len = 17 });
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        rc = d->endpoint.has_stream_ref
+            ? queue_send_bidi(s, d->endpoint.stream_ref, err_buf,
+                              moq_buf_writer_offset(&ew), true)
+            : queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
+        if (rc < 0) { result = rc; goto cleanup_all; }
+        if (reject_drain)
+            (void)drain_ref_add(s, d->endpoint.stream_ref);
+        s->profile->commit_inbound_request(s, &d->endpoint);
+        auth_committed = true;
+        process_auth_tokens_commit_txn(s, &d->auth_txn);
+        result = MOQ_OK;
+        goto cleanup_all;
+    }
+
+    /* Reserve this track's registry record, selecting allocation-free
+     * first so a full registry and an allocation failure stay distinct.
+     * A full registry is NOT a session-fatal parser error: reject with
+     * REQUEST_ERROR(INTERNAL_ERROR 0x0) via the same pre-commit pattern as
+     * the pool-full branch above -- no event, entry, or history is committed
+     * until the error is queued, and WOULD_BLOCK leaves it replayable. The
+     * session stays open. This rejection stays AHEAD of the later
+     * duplicate-alias close, as recorded. */
+    bool phist_full = moq_track_hist_select(s, &d->track_namespace,
+                                            d->track_name) ==
+                      MOQ_TH_SEL_FULL;
+    if (!phist_full) {
+        /* Funded execution: an existing record takes a ref, a free slot
+         * creates one. A failed key copy is MOQ_ERR_NOMEM with nothing
+         * mutated and no response queued -- never the history-full
+         * rejection below. */
+        moq_result_t hrc = track_hist_reserve_selected(
+            s, &d->track_namespace, d->track_name, &phist);
+        if (hrc < 0) { result = hrc; goto cleanup_all; }
+    }
+    if (phist_full) {
+        if (action_queue_full(s) ||
+            (reject_drain && s->drain_ref_count >= s->drain_ref_cap)) {
+            result = MOQ_ERR_WOULD_BLOCK;
+            goto cleanup_all;
+        }
+        uint8_t err_buf[128];
+        moq_buf_writer_t ew;
+        moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
+        rc = s->profile->encode_request_error(s, &ew,
+            &(moq_request_error_encode_args_t){
+                .request_id = d->request_id, .error_code = 0x0,
+                .reason = (const uint8_t *)"track history full",
+                .reason_len = 18 });
         if (rc < 0) { result = rc; goto cleanup_all; }
         rc = d->endpoint.has_stream_ref
             ? queue_send_bidi(s, d->endpoint.stream_ref, err_buf,
@@ -433,6 +633,11 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     e.u.publish_request.token_count = d->token_count;
     e.u.publish_request.track_properties = ev_props;
     e.u.publish_request.dynamic_groups = d->dynamic_groups;
+    e.u.publish_request.has_largest = d->has_largest;
+    e.u.publish_request.largest_group = d->has_largest ? d->largest_group : 0;
+    e.u.publish_request.largest_object = d->has_largest ? d->largest_object : 0;
+    e.u.publish_request.has_expires = d->has_expires;
+    e.u.publish_request.expires_ms = d->has_expires ? d->expires_ms : 0;
 
     rc = push_event(s, &e);
     if (rc < 0) {
@@ -447,6 +652,18 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     entry->handle = handle;
     entry->request_id = d->request_id;
     entry->track_alias = d->track_alias;
+    entry->dt_pub_has_object   = dtscan.has_object;
+    entry->dt_pub_object_ms    = dtscan.object_ms;
+    entry->dt_pub_has_subgroup = dtscan.has_subgroup;
+    entry->dt_pub_subgroup_ms  = dtscan.subgroup_ms;
+    entry->hist = phist;
+    /* Max-merge the publisher-advertised Largest into the reserved record AT
+     * COMMIT: relay largest reporting and later relative-window
+     * resolution read fresh history. Monotonic/idempotent; values are wire
+     * varints, so the profile ceiling (§4) is enforced by the codec. Placed
+     * after push_event so a WOULD_BLOCK'd (replayable) request mutates nothing. */
+    if (d->has_largest && phist)
+        track_hist_merge(phist, d->largest_group, d->largest_object);
     /* Gates outbound new-group requests on the accept and later updates. */
     entry->dynamic_groups = d->dynamic_groups;
     /* Initial Forward State (§9.4): with FORWARD omitted/1 the publisher may begin
@@ -476,6 +693,9 @@ moq_result_t session_core_on_publish(moq_session_t *s,
 cleanup_all:
     process_auth_tokens_free_staging(s, d->tokens, d->token_staged,
         d->token_count);
+    /* Release the reserved record on every failure path (only stored on the
+     * entry at the committed return above; reaching here means it was not). */
+    if (phist) track_hist_release(s, phist);
     if (!auth_committed)
         process_auth_tokens_abort_txn(s, &d->auth_txn);
     return result;
@@ -516,6 +736,13 @@ moq_result_t session_core_on_publish_ok(moq_session_t *s,
     ev.u.publish_ok.expires_ms = d->expires_ms;
     ev.u.publish_ok.has_new_group_request = d->has_new_group_request;
     ev.u.publish_ok.new_group_request = d->new_group_request;
+    /* The subscriber's SUBSCRIPTION_FILTER, surfaced RAW;
+     * the resolved window stays internal (below). */
+    ev.u.publish_ok.has_filter = d->has_filter;
+    ev.u.publish_ok.filter = d->filter_type;
+    ev.u.publish_ok.start_group = d->has_filter ? d->filter_start_group : 0;
+    ev.u.publish_ok.start_object = d->has_filter ? d->filter_start_object : 0;
+    ev.u.publish_ok.end_group = d->has_filter ? d->filter_end_group : 0;
 
     moq_result_t rc = push_event(s, &ev);
     if (rc < 0) return rc;
@@ -526,8 +753,30 @@ moq_result_t session_core_on_publish_ok(moq_session_t *s,
     e->group_order = d->group_order;
     e->has_delivery_timeout = d->has_delivery_timeout;
     e->delivery_timeout_ms = d->delivery_timeout_ms;
+    e->dt_sub_has_object   = d->dt_has_object;
+    e->dt_sub_object_ms    = d->dt_object_ms;
+    e->dt_sub_has_subgroup = d->dt_has_subgroup;
+    e->dt_sub_subgroup_ms  = d->dt_subgroup_ms;
     e->has_expires = d->has_expires;
     e->expires_ms = d->expires_ms;
+    if (d->has_filter) {
+        /* Keep the raw filter and resolve it against ONE snapshot of our
+         * registry largest -- the window is internal (the
+         * enforcement input), never exposed on the event. */
+        e->filter_type = d->filter_type;
+        e->req_start_group = d->filter_start_group;
+        e->req_start_object = d->filter_start_object;
+        e->req_end_group = d->filter_end_group;
+        bool     snap_has = e->hist && e->hist->has_largest;
+        uint64_t snap_g = snap_has ? e->hist->largest_group : 0;
+        uint64_t snap_o = snap_has ? e->hist->largest_object : 0;
+        moq_resolve_filter_window(d->filter_type,
+                                  d->filter_start_group,
+                                  d->filter_start_object,
+                                  d->filter_end_group,
+                                  snap_has, snap_g, snap_o,
+                                  s->profile->location_varint_max, &e->window);
+    }
     return MOQ_OK;
 }
 
@@ -588,18 +837,55 @@ moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
 
 /* -- Public API ---------------------------------------------------- */
 
+/* The frozen v0 prefixes must never shrink: a v0 caller measures its whole
+ * struct against them. These pin "v0 still covers every original field", so
+ * moving a v0 field out of the prefix is a build error. */
+_Static_assert(MOQ_PUBLISH_CFG_V0_SIZE >=
+                   offsetof(moq_publish_cfg_t, track_properties) +
+                       sizeof(moq_bytes_t),
+               "publish cfg v0 prefix must cover through track_properties");
+_Static_assert(MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE >=
+                   offsetof(moq_accept_publish_cfg_t, group_order) +
+                       sizeof(moq_group_order_t),
+               "accept-publish cfg v0 prefix must cover through group_order");
+
+/* Frozen-v0 pointer initializers. A pointer-only init cannot know
+ * the caller's allocation, so it must never write past the frozen v0 prefix --
+ * an old caller may have allocated exactly that much. Callers that set any
+ * appended field use the _sized variants below. */
 void moq_publish_cfg_init(moq_publish_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_publish_cfg_t);
+    memset(cfg, 0, MOQ_PUBLISH_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_PUBLISH_CFG_V0_SIZE;
+}
+
+void moq_publish_cfg_init_sized(moq_publish_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    /* Clear exactly what the caller allocated, never more than this library's
+     * struct knows about (matches moq_session_cfg_init_sized). */
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 void moq_accept_publish_cfg_init(moq_accept_publish_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_accept_publish_cfg_t);
+    memset(cfg, 0, MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE;
+}
+
+void moq_accept_publish_cfg_init_sized(moq_accept_publish_cfg_t *cfg,
+                                        size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 void moq_reject_publish_cfg_init(moq_reject_publish_cfg_t *cfg)
@@ -627,6 +913,17 @@ moq_result_t moq_session_publish(moq_session_t *s,
         auth_tokens = cfg->auth_tokens;
         auth_token_count = cfg->auth_token_count;
     }
+
+    /* §9.8 local property scanner: pure, and hoisted ABOVE
+     * session_begin_advance so malformed local properties reject before ANY
+     * session mutation -- not even the clock/borrow-epoch advance or a reap
+     * runs for a call that fails INVAL. */
+    if (cfg->track_properties.len > 0 && !cfg->track_properties.data)
+        return MOQ_ERR_INVAL;
+    moq_dt_scan_t dtscan;
+    if (session_scan_dt_props(s, cfg->track_properties.data,
+                              cfg->track_properties.len, true, &dtscan) < 0)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
 
@@ -657,6 +954,17 @@ moq_result_t moq_session_publish(moq_session_t *s,
         s->profile->abort_request(s, &req_ep);
         return MOQ_ERR_WOULD_BLOCK;
     }
+
+    /* Reserve this track's registry record: objects we publish on
+     * this publication max-merge their largest into it as a backstop (the facade
+     * also merges via its own reference). Transient key, freed immediately; a
+     * full registry fails the local publish with NOMEM before anything is sent
+     * (released on the pre-commit failure paths below and in pub_free_entry). */
+    /* Declared here; RESERVED only AFTER alias validation below, so the
+     * alias-collision / alias-search failure exits cannot leak a reservation
+     *. Released on the encode/push failure paths and in
+     * pub_free_entry. */
+    moq_track_hist_t *phist = NULL;
     {
         bool forward = cfg->has_forward ? cfg->forward : true;
 
@@ -690,6 +998,24 @@ moq_result_t moq_session_publish(moq_session_t *s,
             if (next_alias_after == 0) next_alias_after = 1;
         }
 
+        /* Alias validated: NOW reserve this track's registry record. A full
+         * registry fails the local publish with NOMEM before anything is sent. */
+        {
+            size_t pklen = 0;
+            uint8_t *pkey = moq_build_track_key(s, &cfg->track_namespace,
+                                                cfg->track_name, &pklen);
+            if (!pkey && pklen > 0) {
+                s->profile->abort_request(s, &req_ep);
+                return MOQ_ERR_NOMEM;
+            }
+            phist = track_hist_reserve(s, pkey, pklen);
+            if (pkey) s->alloc.free(pkey, pklen, s->alloc.ctx);
+            if (!phist) {
+                s->profile->abort_request(s, &req_ep);
+                return MOQ_ERR_NOMEM;
+            }
+        }
+
         moq_publish_encode_args_t args = {
             .request_id = req_ep.request_id,
             .track_namespace = cfg->track_namespace,
@@ -701,6 +1027,12 @@ moq_result_t moq_session_publish(moq_session_t *s,
             .track_properties_len = cfg->track_properties.len,
             .auth_tokens = auth_tokens,
             .auth_token_count = auth_token_count,
+            /* LARGEST_OBJECT rides the PUBLISH straight from the registry
+             * record: MUST be advertised once Objects have
+             * been published on this track; absent when nothing observed. */
+            .has_largest = phist->has_largest,
+            .largest_group = phist->has_largest ? phist->largest_group : 0,
+            .largest_object = phist->has_largest ? phist->largest_object : 0,
         };
 
         moq_buf_writer_t w;
@@ -709,6 +1041,7 @@ moq_result_t moq_session_publish(moq_session_t *s,
 
         moq_result_t rc2 = s->profile->encode_publish(s, &w, &args);
         if (rc2 < 0) {
+            track_hist_release(s, phist);
             s->profile->abort_request(s, &req_ep);
             return rc2;
         }
@@ -737,6 +1070,7 @@ moq_result_t moq_session_publish(moq_session_t *s,
         }
         moq_result_t arc = push_action(s, &act);
         if (arc < 0) {
+            track_hist_release(s, phist);
             s->profile->abort_request(s, &req_ep);
             return arc;
         }
@@ -748,6 +1082,11 @@ moq_result_t moq_session_publish(moq_session_t *s,
         entry->role = MOQ_PUB_ROLE_PUBLISHER;
         entry->request_id = req_ep.request_id;
         entry->track_alias = alias;
+        entry->hist = phist;
+        entry->dt_pub_has_object   = dtscan.has_object;
+        entry->dt_pub_object_ms    = dtscan.object_ms;
+        entry->dt_pub_has_subgroup = dtscan.has_subgroup;
+        entry->dt_pub_subgroup_ms  = dtscan.subgroup_ms;
         /* Latch whether OUR track properties advertised dynamic groups:
          * inbound new-group requests on PUBLISH_OK / publication updates are
          * gated on it (the peer MUST NOT send one otherwise, §10.2.13). */
@@ -781,21 +1120,52 @@ moq_result_t moq_session_accept_publish(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    /* ABI-additive cfg: the new-group-request fields are appended; callers
-     * compiled against the smaller struct remain valid and send nothing. */
-#define ACC_CFG_MIN offsetof(moq_accept_publish_cfg_t, has_new_group_request)
+    /* ABI-additive cfg: the new-group-request, filter, and forward fields are
+     * appended; callers compiled against the smaller struct remain valid and
+     * send nothing. The filter and forward tails are read as COMPLETE SEMANTIC
+     * BLOCKS -- gated on their LAST member -- so a struct_size landing partway
+     * into a block never yields a torn half-present value. */
 #define ACC_CFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_publish_cfg_t, f) + \
      sizeof(cfg->f))
-    if (cfg->struct_size < ACC_CFG_MIN) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     bool has_new_group_request = false;
     uint64_t new_group_request = 0;
     if (ACC_CFG_HAS(new_group_request) && cfg->has_new_group_request) {
         has_new_group_request = true;
         new_group_request = cfg->new_group_request;
     }
+    /* FILTER block: gated on end_group (its last member). */
+    bool                   has_filter = false;
+    moq_subscribe_filter_t filter = MOQ_SUBSCRIBE_FILTER_NONE;
+    uint64_t f_start_group = 0, f_start_object = 0, f_end_group = 0;
+    if (ACC_CFG_HAS(end_group) && cfg->filter != MOQ_SUBSCRIBE_FILTER_NONE) {
+        has_filter = true;
+        filter = cfg->filter;
+        f_start_group = cfg->start_group;
+        f_start_object = cfg->start_object;
+        f_end_group = cfg->end_group;
+    }
+    /* FORWARD block: gated on forward (its last member). Omission from
+     * PUBLISH_OK defaults to 1 (d16 §9.2.2.8 / d18 §10.2.12: only
+     * REQUEST_UPDATE means "unchanged"), so the EFFECTIVE value is always
+     * defined: an absent/ungated block resolves to forwarding. */
+    bool fwd_effective = true;
+    if (ACC_CFG_HAS(forward) && cfg->has_forward)
+        fwd_effective = cfg->forward;
 #undef ACC_CFG_HAS
-#undef ACC_CFG_MIN
+    /* Same filter validity rules as the wire encoders (unknown type / inverted
+     * range), applied before any advance or mutation. */
+    if (has_filter) {
+        if (filter != MOQ_SUBSCRIBE_FILTER_NEXT_GROUP &&
+            filter != MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT &&
+            filter != MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START &&
+            filter != MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE)
+            return MOQ_ERR_INVAL;
+        if (filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE &&
+            f_end_group < f_start_group)
+            return MOQ_ERR_INVAL;
+    }
     if (cfg->group_order != MOQ_GROUP_ORDER_DEFAULT &&
         cfg->group_order != MOQ_GROUP_ORDER_ASCENDING &&
         cfg->group_order != MOQ_GROUP_ORDER_DESCENDING)
@@ -807,6 +1177,11 @@ moq_result_t moq_session_accept_publish(
     int slot = pub_resolve_handle(s, pub);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     if (s->publishes[slot].state != MOQ_PUB_PENDING_SUBSCRIBER)
+        return MOQ_ERR_WRONG_STATE;
+    /* The publisher already terminated from Pending (Publisher) (§5.1) and
+     * the done is deferred on its Stream Count: the subscription is
+     * logically Terminated -- a response may no longer be sent. */
+    if (s->publishes[slot].done_pending)
         return MOQ_ERR_WRONG_STATE;
     /* §10.2.13: a new-group request may ride PUBLISH_OK only when the track
      * carried DYNAMIC_GROUPS == 1. Refused before any mutation. */
@@ -821,10 +1196,23 @@ moq_result_t moq_session_accept_publish(
 
         uint8_t priority = cfg->has_subscriber_priority ?
                            cfg->subscriber_priority : 128;
-        moq_result_t rc2 = s->profile->encode_publish_ok(s, &w,
-            s->publishes[slot].request_id, priority,
-            (uint8_t)cfg->group_order,
-            has_new_group_request, new_group_request);
+        moq_publish_ok_encode_args_t ok_args = {
+            .request_id = s->publishes[slot].request_id,
+            .subscriber_priority = priority,
+            .group_order = (uint8_t)cfg->group_order,
+            .has_new_group_request = has_new_group_request,
+            .new_group_request = new_group_request,
+            .has_filter = has_filter,
+            .filter = filter,
+            .start_group = f_start_group,
+            .start_object = f_start_object,
+            .end_group = f_end_group,
+            /* Always the EFFECTIVE value; the profiles emit the parameter only
+             * when it is 0 (omission defaults to 1 on PUBLISH_OK). */
+            .has_forward = true,
+            .forward = fwd_effective,
+        };
+        moq_result_t rc2 = s->profile->encode_publish_ok(s, &w, &ok_args);
         if (rc2 < 0) return rc2;
 
         /* PUBLISH_OK carries no FIN -- the subscription lives on the bidi. A
@@ -836,6 +1224,20 @@ moq_result_t moq_session_accept_publish(
     }
 
     s->publishes[slot].state = MOQ_PUB_ESTABLISHED;
+    /* Latch the EFFECTIVE forward state this side (the subscriber role)
+     * conveyed on the PUBLISH_OK -- unconditionally, because omission means 1,
+     * not "unchanged" (so a PUBLISH(FORWARD=0) accepted without a forward
+     * override resolves to forwarding on BOTH endpoints). The raw filter is
+     * kept for reference. (The RESOLVED window lives on the ORIGINAL
+     * PUBLISHER's entry, computed when it receives this PUBLISH_OK --
+     * resolution is against the publisher's registry, not ours.) */
+    s->publishes[slot].send_allowed = fwd_effective;
+    if (has_filter) {
+        s->publishes[slot].filter_type = (uint32_t)filter;
+        s->publishes[slot].req_start_group = f_start_group;
+        s->publishes[slot].req_start_object = f_start_object;
+        s->publishes[slot].req_end_group = f_end_group;
+    }
     return MOQ_OK;
 }
 
@@ -859,6 +1261,10 @@ moq_result_t moq_session_reject_publish(
     int slot = pub_resolve_handle(s, pub);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     if (s->publishes[slot].state != MOQ_PUB_PENDING_SUBSCRIBER)
+        return MOQ_ERR_WRONG_STATE;
+    /* Logically Terminated by the publisher's deferred done (§5.1 pending
+     * termination): a response may no longer be sent. */
+    if (s->publishes[slot].done_pending)
         return MOQ_ERR_WRONG_STATE;
 
     /* Stream-correlated profiles finish the request bidi with the terminal
@@ -902,12 +1308,41 @@ moq_result_t moq_session_reject_publish(
 
 /* -- Inbound PUBLISH_DONE handler ---------------------------------- */
 
+/* §9.8 negotiated terminal-wait floor (see sub_dt_floor_us). */
+static uint64_t pub_dt_floor_us(const moq_pub_entry_t *e)
+{
+    uint64_t o = dt_negotiate_ms(e->dt_pub_has_object, e->dt_pub_object_ms,
+                                 e->dt_sub_has_object, e->dt_sub_object_ms);
+    uint64_t g = dt_negotiate_ms(e->dt_pub_has_subgroup,
+                                 e->dt_pub_subgroup_ms,
+                                 e->dt_sub_has_subgroup,
+                                 e->dt_sub_subgroup_ms);
+    return ms_to_us_sat(o > g ? o : g);
+}
+
+/* Mirror of sub_retire_crossed_update (see session_subscribe.c). */
+static void pub_retire_crossed_update(moq_session_t *s, moq_pub_entry_t *pe,
+                                      bool need_tomb)
+{
+    if (!pe->update_pending) return;
+    if (need_tomb) unsub_tomb_add(s, pe->update_request_id);
+    request_registry_remove_by_id(s, pe->update_request_id);
+    pe->update_pending = false;
+    pe->update_request_id = 0;
+    pe->update_has_forward = false;   /* never acknowledged */
+    pe->dt_upd_has_object = pe->dt_upd_has_subgroup = false;
+}
+
 moq_result_t session_core_on_publish_done(moq_session_t *s,
                                            const moq_decoded_publish_done_t *d,
                                            bool free_now)
 {
     moq_pub_entry_t *pe = &s->publishes[d->target_slot];
-    bool need_tomb = pe->update_pending;
+    /* Draft-16 answers a crossed update exactly once by id (tombstone it);
+     * draft-18 correlates by request stream and never consumes id
+     * tombstones, so it must not spend one. Retired atomically at commit. */
+    bool need_tomb = pe->update_pending &&
+                     !moq_session_uses_request_streams(s);
     /* A PUBLISH_DONE that finishes a publication with a pending REQUEST_UPDATE
      * must leave a tombstone so the peer's late REQUEST_OK/ERROR for that update
      * is absorbed rather than treated as an unknown request. If the shared
@@ -925,17 +1360,22 @@ moq_result_t session_core_on_publish_done(moq_session_t *s,
      * the close action up front (reserve-before-mutate). */
     bool close_half = !free_now && pe->request_stream_ref._v != 0;
 
-    /* Stream-Count gating (draft-16 §9.15): PUBLISH_DONE arrives on the control
-     * channel and is likely to precede late-arriving / late-opening data streams.
-     * Keep the publication ESTABLISHED (so those streams still bind its alias and
+    /* Stream-Count gating (draft-16 §9.15 / draft-18 §10.11): the terminal
+     * done is likely to precede late-arriving / late-opening data streams.
+     * Keep the publication live (so those streams still bind its alias and
      * deliver objects) until the advertised number of data streams have been
-     * processed; only then surface PUBLISH_FINISHED and free the entry. A Stream
-     * Count of 0 (datagram-only) or the 2^62-1 "unknown" sentinel finalizes
-     * immediately -- the sans-I/O core has no timer to bound the unknown case
-     * (the embedding's session/idle timeout does). */
+     * processed; only then surface PUBLISH_FINISHED and free the entry. A
+     * Stream Count of 0 (datagram-only) finalizes immediately; the 2^62-1
+     * "unknown" sentinel DEFERS and is bounded by the terminal deadline
+     * below (§9.8). §5.1 permits the
+     * publisher to terminate from Pending (Publisher) too; a pending
+     * publication's subgroup streams still bind regardless of Forward State
+     * (Forward 0 prohibits Objects, not streams -- empty subgroups count,
+     * draft-18 §10.11), so the gate applies uniformly. */
     if (pe->role == MOQ_PUB_ROLE_SUBSCRIBER &&
-        d->stream_count != 0 && d->stream_count != MOQ_QUIC_VARINT_MAX &&
-        pe->processed_stream_count < d->stream_count) {
+        d->stream_count != 0 &&
+        (d->stream_count == MOQ_QUIC_VARINT_MAX ||
+         pe->processed_stream_count < d->stream_count)) {
         if (close_half && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         uint8_t *rbuf = NULL;
         if (d->reason_len > 0) {
@@ -943,14 +1383,23 @@ moq_result_t session_core_on_publish_done(moq_session_t *s,
             if (!rbuf) return MOQ_ERR_NOMEM;
             memcpy(rbuf, d->reason, d->reason_len);
         }
-        if (need_tomb) unsub_tomb_add(s, pe->update_request_id);
-        if (pe->done_reason_buf)   /* a re-DONE shouldn't happen; be safe */
+        pub_retire_crossed_update(s, pe, need_tomb);
+        if (pe->done_reason_buf)   /* unreachable: duplicates rejected upstream */
             s->alloc.free(pe->done_reason_buf, pe->done_reason_len, s->alloc.ctx);
         pe->done_reason_buf = rbuf;
         pe->done_reason_len = d->reason_len;
         pe->done_status_code = d->status_code;
         pe->done_stream_count = d->stream_count;
         pe->done_pending = true;
+        /* §9.8: stamp the terminal deadline once (see the subscription
+         * handler); the sentinel defers and is bounded by this deadline. */
+        {
+            uint64_t wait_us = s->done_wait_timeout_us;
+            uint64_t floor_us = pub_dt_floor_us(pe);
+            if (floor_us > wait_us) wait_us = floor_us;
+            pe->done_deadline_us = deadline_add(s->last_now_us, wait_us);
+            pe->done_expired = false;
+        }
         if (close_half)
             (void)queue_close_bidi(s, pe->request_stream_ref);
         return MOQ_OK;
@@ -989,8 +1438,7 @@ moq_result_t session_core_on_publish_done(moq_session_t *s,
         return rc;
     }
 
-    if (need_tomb)
-        unsub_tomb_add(s, pe->update_request_id);
+    pub_retire_crossed_update(s, pe, need_tomb);
     if (free_now) {
         pub_free_entry(s, d->target_slot);
     } else {
@@ -1135,11 +1583,25 @@ moq_result_t session_core_on_publish_request_update(
                                         &ev_tokens);
     if (rc < 0) { result = rc; goto cleanup_all; }
 
+    /* One registry snapshot: feeds BOTH the REQUEST_OK Largest
+     * Object and the stored resolved window on the PUBLISH-established entry. */
+    moq_pub_entry_t *e = &s->publishes[d->target_slot];
+    bool     usnap_has = e->hist && e->hist->has_largest;
+    uint64_t usnap_g = usnap_has ? e->hist->largest_group : 0;
+    uint64_t usnap_o = usnap_has ? e->hist->largest_object : 0;
+
     {
         uint8_t ok_buf[128];
         moq_buf_writer_t ow;
         moq_buf_writer_init(&ow, ok_buf, sizeof(ok_buf));
-        rc = s->profile->encode_request_ok(s, &ow, d->request_id);
+        moq_request_update_ok_encode_args_t oka = {
+            .request_id = d->request_id,
+            .has_largest = usnap_has,
+            .largest_group = usnap_g,
+            .largest_object = usnap_o,
+            .has_expires = false,
+        };
+        rc = s->profile->encode_request_update_ok(s, &ow, &oka);
         if (rc < 0) { result = rc; goto cleanup_all; }
         rc = req_stream
             ? queue_send_bidi(s, resp_ref, ok_buf,
@@ -1147,8 +1609,6 @@ moq_result_t session_core_on_publish_request_update(
             : queue_send_control(s, ok_buf, moq_buf_writer_offset(&ow));
         if (rc < 0) { result = rc; goto cleanup_all; }
     }
-
-    moq_pub_entry_t *e = &s->publishes[d->target_slot];
 
     moq_event_t ev;
     memset(&ev, 0, sizeof(ev));
@@ -1166,6 +1626,11 @@ moq_result_t session_core_on_publish_request_update(
     ev.u.publish_updated.token_count = d->token_count;
     ev.u.publish_updated.has_new_group_request = d->has_new_group_request;
     ev.u.publish_updated.new_group_request = d->new_group_request;
+    ev.u.publish_updated.has_filter = d->has_filter;
+    ev.u.publish_updated.filter = d->filter_type;
+    ev.u.publish_updated.start_group = d->start_group;
+    ev.u.publish_updated.start_object = d->start_object;
+    ev.u.publish_updated.end_group = d->end_group;
 
     rc = push_event(s, &ev);
     if (rc < 0) { result = rc; goto cleanup_all; }
@@ -1174,8 +1639,28 @@ moq_result_t session_core_on_publish_request_update(
         e->subscriber_priority = d->subscriber_priority;
     if (d->has_forward)
         e->send_allowed = d->forward;
-    if (d->has_delivery_timeout)
-        e->delivery_timeout_ms = d->delivery_timeout_us / 1000;
+    if (d->dt_has_object) {
+        e->dt_sub_has_object = true;
+        e->dt_sub_object_ms = d->dt_object_ms;
+    }
+    if (d->dt_has_subgroup) {
+        e->dt_sub_has_subgroup = true;
+        e->dt_sub_subgroup_ms = d->dt_subgroup_ms;
+    }
+    if (d->has_delivery_timeout) {
+        /* Retained legacy _ms projection: EXACT milliseconds, recomputed
+         * from the COMPLETE current pair after applying this message's
+         * carriers (the event projected only the message's carriers). */
+        e->has_delivery_timeout = true;
+        e->delivery_timeout_ms = dt_negotiate_ms(
+            e->dt_sub_has_object, e->dt_sub_object_ms,
+            e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms);
+    }
+    if (d->has_filter)
+        moq_resolve_filter_window(d->filter_type,
+                                  d->start_group, d->start_object, d->end_group,
+                                  usnap_has, usnap_g, usnap_o,
+                                  s->profile->location_varint_max, &e->window);
     s->profile->commit_inbound_request(s, &d->endpoint);
     auth_committed = true;
     process_auth_tokens_commit_txn(s, &d->auth_txn);
@@ -1252,6 +1737,11 @@ moq_result_t moq_session_update_publication(
         return MOQ_ERR_WRONG_STATE;
     if (e->state != MOQ_PUB_ESTABLISHED)
         return MOQ_ERR_WRONG_STATE;
+    /* A deferred terminal (done_pending) is logically Terminated: the entry
+     * stays live only so late data streams still bind. No control may be
+     * sent for the request after its terminal was accepted. */
+    if (e->done_pending)
+        return MOQ_ERR_WRONG_STATE;
     if (e->goaway_sent) return MOQ_ERR_WRONG_STATE;   /* migrated: no REQUEST_UPDATE */
     if (e->update_pending)
         return MOQ_ERR_WRONG_STATE;
@@ -1315,6 +1805,14 @@ moq_result_t moq_session_update_publication(
 
     e->update_pending = true;
     e->update_request_id = req_ep.request_id;
+    /* A Forward change takes effect at the ACK (the CURRENT acknowledged
+     * Forward state gates object delivery); remember it until then. */
+    e->update_has_forward = cfg->has_forward;
+    e->update_forward = cfg->has_forward ? cfg->forward : false;
+    /* §9.8: a timeout change pends until the ACK (generic -> both types). */
+    e->dt_upd_has_object = e->dt_upd_has_subgroup = cfg->has_delivery_timeout;
+    e->dt_upd_object_ms = e->dt_upd_subgroup_ms =
+        cfg->has_delivery_timeout ? cfg->delivery_timeout_us / 1000u : 0;
     s->profile->commit_request(s, &req_ep);
     return MOQ_OK;
 }
@@ -1406,13 +1904,15 @@ int pub_find_by_alias_subscriber(moq_session_t *s, uint64_t alias)
         moq_pub_entry_t *e = &s->publishes[i];
         if (e->role != MOQ_PUB_ROLE_SUBSCRIBER || e->track_alias != alias)
             continue;
-        /* Established always receives objects. A publication still pending our
-         * PUBLISH_OK accepts objects too, but only when its initial Forward State
-         * is 1 (§9.4: the publisher may send before PUBLISH_OK). A pending,
-         * forward-0 publication delivers nothing yet -- early data falls through to
-         * the unknown-alias path (STOP_SENDING). */
+        /* Pure ALIAS RESOLUTION, independent of Forward State: streams bind
+         * and count regardless (Forward 0 prohibits Objects, not streams --
+         * draft-18 §10.11 counts empty subgroups), and a paused
+         * publication's datagram must still resolve HERE so it is dropped
+         * at delivery (session_core_on_object_datagram, after the history
+         * merge) instead of masquerading as unknown-alias data and entering
+         * the staging ring behind an unrelated pending subscription. */
         if (e->state == MOQ_PUB_ESTABLISHED ||
-            (e->state == MOQ_PUB_PENDING_SUBSCRIBER && e->send_allowed))
+            e->state == MOQ_PUB_PENDING_SUBSCRIBER)
             return (int)i;
     }
     return -1;

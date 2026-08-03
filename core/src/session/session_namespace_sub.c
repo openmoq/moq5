@@ -155,7 +155,10 @@ static void ns_suffix_set_free(ns_suffix_set_t *set,
 typedef enum {
     NS_SUF_DUP        = 0,   /* already present; no change, no charge */
     NS_SUF_INSERTED   = 1,   /* inserted; receive budget charged */
-    NS_SUF_NOMEM      = -1,  /* allocation failure (retryable WOULD_BLOCK) */
+    /* Allocation failure. The set, its capacity, the counters and the receive
+     * budget are exactly as they were on entry, but nothing the session can do
+     * makes memory appear, so this is an error rather than a wait. */
+    NS_SUF_NOMEM      = -1,
     NS_SUF_OVER_BUDGET = -2, /* would exceed receive budget (caller must close) */
 } ns_suffix_add_status_t;
 
@@ -166,51 +169,61 @@ static void ns_recv_budget_release(moq_session_t *s, size_t n)
                                 ? s->recv_payload_bytes - n : 0;
 }
 
+/* Insert one counted key, all-or-nothing: either the key is present and the
+ * capacity growth plus key bytes are charged, or the set, its counters and the
+ * receive budget are exactly as they were on entry.
+ *
+ * The whole requirement -- the capacity delta this insert needs and the copied
+ * key bytes -- is weighed against the budget once, before either allocation, so
+ * an insert can never grow the array and then refuse the key it grew for. The
+ * key copy is taken FIRST: a growth failure after it can free the copy, while a
+ * copy failure after a committed realloc could not put the old array back. */
 static ns_suffix_add_status_t ns_suffix_set_add_counted(
     moq_session_t *s, ns_suffix_set_t *set,
     const uint8_t *key, size_t key_len)
 {
     if (ns_suffix_set_contains(set, key, key_len)) return NS_SUF_DUP;
 
-    /* Grow the key array if needed, charging the capacity delta to the receive
-     * budget before committing the realloc. */
+    size_t new_cap = set->cap;
+    size_t grow = 0;
     if (set->count >= set->cap) {
-        size_t new_cap = set->cap ? set->cap * 2 : NS_SUF_INIT_CAP;
+        new_cap = set->cap ? set->cap * 2 : NS_SUF_INIT_CAP;
         if (new_cap < set->cap ||
             new_cap > SIZE_MAX / sizeof(ns_suffix_key_t))
             return NS_SUF_OVER_BUDGET;
-        size_t grow = (new_cap - set->cap) * sizeof(ns_suffix_key_t);
-        size_t projected;
-        if (!ns_size_add(s->recv_payload_bytes, grow, &projected) ||
-            projected > s->max_recv_buf)
-            return NS_SUF_OVER_BUDGET;
+        grow = (new_cap - set->cap) * sizeof(ns_suffix_key_t);
+    }
+    size_t need, projected;
+    if (!ns_size_add(grow, key_len, &need) ||
+        !ns_size_add(s->recv_payload_bytes, need, &projected) ||
+        projected > s->max_recv_buf)
+        return NS_SUF_OVER_BUDGET;
+
+    /* A key always carries at least its part count, so a zero-length key cannot
+     * reach here and a NULL copy is a real allocation failure. */
+    uint8_t *copy = (uint8_t *)s->alloc.alloc(key_len, s->alloc.ctx);
+    if (!copy) return NS_SUF_NOMEM;
+    memcpy(copy, key, key_len);
+
+    if (grow > 0) {
         size_t new_size = new_cap * sizeof(ns_suffix_key_t);
         ns_suffix_key_t *nk = set->keys
             ? (ns_suffix_key_t *)s->alloc.realloc(set->keys,
                   set->cap * sizeof(ns_suffix_key_t), new_size, s->alloc.ctx)
             : (ns_suffix_key_t *)s->alloc.alloc(new_size, s->alloc.ctx);
-        if (!nk) return NS_SUF_NOMEM;
+        if (!nk) {
+            s->alloc.free(copy, key_len, s->alloc.ctx);
+            return NS_SUF_NOMEM;   /* old array and counters untouched */
+        }
         set->keys = nk;
         set->cap = new_cap;
-        set->counted_bytes += grow;
-        s->recv_payload_bytes += grow;
     }
 
-    /* Charge the copied key bytes. */
-    {
-        size_t projected;
-        if (!ns_size_add(s->recv_payload_bytes, key_len, &projected) ||
-            projected > s->max_recv_buf)
-            return NS_SUF_OVER_BUDGET;
-    }
-    uint8_t *copy = (uint8_t *)s->alloc.alloc(key_len, s->alloc.ctx);
-    if (!copy) return NS_SUF_NOMEM;
-    memcpy(copy, key, key_len);
     set->keys[set->count].data = copy;
     set->keys[set->count].len = key_len;
     set->count++;
-    set->counted_bytes += key_len;
-    s->recv_payload_bytes += key_len;
+    set->counted_bytes += need;
+    s->recv_payload_bytes += need;
     return NS_SUF_INSERTED;
 }
 
@@ -646,30 +659,22 @@ moq_result_t moq_session_subscribe_namespace(
 /* Stream-correlated local teardown of a namespace-sub request bidi (§10.9.1): an
  * unexpected message (e.g. a REQUEST_UPDATE, which is not modelled here) on an
  * established/pending publisher-side bidi closes that bidi, not the session.
- * Cancel both directions with STOP + RESET, retire the ref via the drain ring so
+ * Cancel the request stream with ONE whole-stream abort, retire the ref via the drain ring so
  * a late in-flight message is discarded rather than mistaken for a fresh request,
  * and free the entry. Reserves all capacity before mutating (retryable). */
 static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot)
 {
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
     if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = s->ns_subs[slot].stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
-    a.u.stop_bidi_stream.stream_ref = ref;
-    a.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
+    a.u.abort_bidi_stream.stream_ref = ref;
+    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
     moq_result_t rc = push_action(s, &a);
-    if (rc < 0) return rc;
-    memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    a.borrow_epoch = s->borrow_epoch;
-    a.u.reset_bidi_stream.stream_ref = ref;
-    a.u.reset_bidi_stream.error_code = 0x1;
-    rc = push_action(s, &a);
     if (rc < 0) return rc;
     if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
     ns_sub_free_entry(s, slot);
@@ -1397,6 +1402,22 @@ static moq_result_t copy_suffix_to_event_scratch(moq_session_t *s,
     return MOQ_OK;
 }
 
+/* Recovery contract for the results this returns.
+ *
+ * MOQ_ERR_WOULD_BLOCK is the retryable one the public API documents: the
+ * subscription and its buffered response bytes are both retained, and an
+ * ordinary empty re-feed of the same bidi resumes where this left off.
+ *
+ * MOQ_ERR_NOMEM is a hard error, not a wait -- no drain makes memory appear.
+ * The subscription and its buffered bytes are nonetheless left exactly as they
+ * were, so a caller driving the session directly may recover by the same empty
+ * re-feed once memory is available. That is a property of this path, not a
+ * general promise: the request-stream families free a still-receiving staging
+ * slot on any hard failure (session_subscribe.c), so their bytes are gone and
+ * only re-delivery can recover. A caller driving the session through the
+ * transport bridge gets neither: the bridge escalates every negative other than
+ * MOQ_ERR_WOULD_BLOCK to a connection fatal, deliberately, because a session
+ * that cannot allocate has no unblock edge to wait for. */
 static moq_result_t handle_subscriber_response(moq_session_t *s,
                                                 int32_t slot)
 {
@@ -1482,7 +1503,9 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                     &resp.redirect, resp.error_code,
                     resp.retry_interval != 0, resp.retry_interval,
                     resp.reason, resp.reason_len);
-                if (rc < 0) return rc;
+                /* The emitter reports a terminal close as MOQ_OK, so the
+                 * teardown below runs only while the session is still open. */
+                if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
             } else {
                 moq_bytes_t reason_copy = { NULL, 0 };
                 if (resp.reason_len > 0 && resp.reason) {
@@ -1534,7 +1557,10 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
             size_t skey_len = ns_suffix_key_len(&resp.suffix);
             uint8_t *skey_buf = (uint8_t *)s->alloc.alloc(
                 skey_len, s->alloc.ctx);
-            if (!skey_buf) return MOQ_ERR_WOULD_BLOCK;
+            /* No suffix scratch or tracking state has been touched yet, and no
+             * drain frees memory, so this is an error rather than a wait. See
+             * the recovery contract above the response handler. */
+            if (!skey_buf) return MOQ_ERR_NOMEM;
             ns_suffix_key_build(&resp.suffix, skey_buf);
 
             if (resp.kind == MOQ_NS_RESP_NAMESPACE_DONE) {
@@ -1568,31 +1594,41 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
              * retryable WOULD_BLOCK. */
             bool inbound_inserted = false;
             if (resp.kind == MOQ_NS_RESP_NAMESPACE) {
-                if (!e->announced_suffixes) {
-                    e->announced_suffixes = s->alloc.alloc(
+                /* The first tracked suffix needs a set. Build it privately and
+                 * publish it onto the entry only once the insert has succeeded,
+                 * so a failed insert cannot leave an empty tracker behind that a
+                 * later NAMESPACE_DONE would treat as an established set. */
+                ns_suffix_set_t *set = (ns_suffix_set_t *)e->announced_suffixes;
+                ns_suffix_set_t *fresh = NULL;
+                if (!set) {
+                    fresh = (ns_suffix_set_t *)s->alloc.alloc(
                         sizeof(ns_suffix_set_t), s->alloc.ctx);
-                    if (!e->announced_suffixes) {
+                    if (!fresh) {
+                        s->event_scratch_len = scratch_save;
                         s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
-                        return MOQ_ERR_WOULD_BLOCK;
+                        return MOQ_ERR_NOMEM;
                     }
-                    memset(e->announced_suffixes, 0,
-                        sizeof(ns_suffix_set_t));
-                    e->announced_suffixes_inbound = true;
+                    memset(fresh, 0, sizeof(*fresh));
+                    set = fresh;
                 }
                 ns_suffix_add_status_t st = ns_suffix_set_add_counted(
-                    s, (ns_suffix_set_t *)e->announced_suffixes,
-                    skey_buf, skey_len);
-                if (st == NS_SUF_NOMEM) {
+                    s, set, skey_buf, skey_len);
+                if (st < 0) {
+                    if (fresh) {
+                        ns_suffix_set_free(fresh, &s->alloc);
+                        s->alloc.free(fresh, sizeof(*fresh), s->alloc.ctx);
+                    }
                     s->event_scratch_len = scratch_save;
                     s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
-                    return MOQ_ERR_WOULD_BLOCK;
+                    if (st == NS_SUF_OVER_BUDGET)
+                        return close_with_error(s, 0x1,
+                            "inbound namespace suffix tracking exceeds "
+                            "receive budget");
+                    return MOQ_ERR_NOMEM;
                 }
-                if (st == NS_SUF_OVER_BUDGET) {
-                    s->event_scratch_len = scratch_save;
-                    s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
-                    return close_with_error(s, 0x1,
-                        "inbound namespace suffix tracking exceeds "
-                        "receive budget");
+                if (fresh) {
+                    e->announced_suffixes = fresh;
+                    e->announced_suffixes_inbound = true;
                 }
                 inbound_inserted = (st == NS_SUF_INSERTED);
             }

@@ -31,6 +31,7 @@ typedef enum {
     FAKE_OP_STOP,
     FAKE_OP_DATAGRAM,
     FAKE_OP_CLOSE,
+    FAKE_OP_ABORT,
 } fake_op_kind_t;
 
 typedef struct {
@@ -53,6 +54,12 @@ typedef struct {
     bool      block_open_uni;
     bool      block_open_bidi;
     bool      block_close;
+    bool      use_abort_op;       /* wire abort_stream into the vtable  */
+    bool      block_abort;        /* abort_stream -> WOULD_BLOCK        */
+    bool      block_reset;        /* reset_stream -> WOULD_BLOCK        */
+    bool      block_stop;         /* stop_sending -> WOULD_BLOCK        */
+    bool      fail_stop;          /* stop_sending -> ERROR (partial)    */
+    bool      fail_write;         /* write -> ERROR                     */
     bool      drop_datagram;
     int       block_count;
 
@@ -94,6 +101,7 @@ static moq_transport_result_t fake_write(void *ctx, uint64_t stream_id,
                                           bool fin)
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
+    if (ep->fail_write) return MOQ_TRANSPORT_ERROR;
     if (ep->block_write) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     if (ep->count < FAKE_EP_MAX_OPS) {
         fake_op_t *o = &ep->ops[ep->count++];
@@ -112,6 +120,7 @@ static moq_transport_result_t fake_reset(void *ctx, uint64_t stream_id,
                                           uint64_t error_code)
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
+    if (ep->block_reset) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     if (ep->count < FAKE_EP_MAX_OPS) {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
@@ -126,6 +135,8 @@ static moq_transport_result_t fake_stop(void *ctx, uint64_t stream_id,
                                          uint64_t error_code)
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
+    if (ep->fail_stop) return MOQ_TRANSPORT_ERROR;
+    if (ep->block_stop) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     if (ep->count < FAKE_EP_MAX_OPS) {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
@@ -170,6 +181,21 @@ static moq_transport_result_t fake_close(void *ctx, uint64_t code,
     return MOQ_TRANSPORT_OK;
 }
 
+static moq_transport_result_t fake_abort(void *ctx, uint64_t stream_id,
+                                          uint64_t error_code)
+{
+    fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
+    if (ep->block_abort) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
+    if (ep->count < FAKE_EP_MAX_OPS) {
+        fake_op_t *o = &ep->ops[ep->count++];
+        memset(o, 0, sizeof(*o));
+        o->kind = FAKE_OP_ABORT;
+        o->stream_id = stream_id;
+        o->error_code = error_code;
+    }
+    return MOQ_TRANSPORT_OK;
+}
+
 static void fake_endpoint_init(fake_endpoint_t *ep,
                                 uint64_t uni_base, uint64_t bidi_base)
 {
@@ -187,6 +213,13 @@ static void fake_endpoint_init(fake_endpoint_t *ep,
     ops.send_datagram = fake_datagram;
     ops.close_transport = fake_close;
     ep->vtable = ops;
+}
+
+/* Call AFTER init to expose the optional native abort op. */
+static inline void fake_endpoint_enable_abort(fake_endpoint_t *ep)
+{
+    ep->use_abort_op = true;
+    ep->vtable.abort_stream = fake_abort;
 }
 
 static void fake_endpoint_clear_ops(fake_endpoint_t *ep)

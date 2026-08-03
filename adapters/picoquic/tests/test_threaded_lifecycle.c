@@ -3,13 +3,13 @@
  * observation contract:
  *
  *   A connection that becomes terminal must remain visible in
- *   moq_pq_threaded_next_conn() for one app on_pump before the adapter
+ *   moq_pq_threaded_lane_next_conn() for one app on_lane_pump before the adapter
  *   prunes/destroys it.
  *
- * The hard-to-reach window is a death arising in the POST-on_pump service
+ * The hard-to-reach window is a death arising in the POST-on_lane_pump service
  * pass (a session/bridge failure there; peer closes land at packet
  * ingestion and are observable by the ordinary pump). The
- * MOQ_PQ_THREADED_TESTING seam models exactly that: armed from on_pump,
+ * MOQ_PQ_THREADED_TESTING seam models exactly that: armed from on_lane_pump,
  * the NEXT service pass -- the post-pump one -- marks the conn fatal.
  * Without the observation window, the same loop iteration prunes it and no
  * pump ever sees the dead conn (the relay "namespace stays occupied after
@@ -57,8 +57,10 @@ typedef struct {
     int reentered;
 } window_ctx_t;
 
-static int window_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
+static int window_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *vctx)
 {
+    (void)lane;
     (void)now;
     window_ctx_t *w = (window_ctx_t *)vctx;
     if (__atomic_exchange_n(&w->in_pump, 1, __ATOMIC_ACQ_REL))
@@ -67,7 +69,7 @@ static int window_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
     int was_armed = __atomic_load_n(&w->armed, __ATOMIC_ACQUIRE);
     int present = 0;
     moq_pq_threaded_conn_t *c = NULL;
-    while ((c = moq_pq_threaded_next_conn(t, c)) != NULL) {
+    while ((c = moq_pq_threaded_lane_next_conn(lane, c)) != NULL) {
         if (!w->conn) {
             w->conn = c;
             __atomic_store_n(&w->accepted, 1, __ATOMIC_RELEASE);
@@ -100,8 +102,10 @@ static int window_pump(moq_pq_threaded_t *t, uint64_t now, void *vctx)
     return 0;
 }
 
-static int dummy_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx)
+static int dummy_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)t; (void)now; (void)ctx;
     return 0;
 }
@@ -120,8 +124,8 @@ int main(void)
     srv_cfg.cert_path = MOQ_TEST_CERT_PATH;
     srv_cfg.key_path = MOQ_TEST_KEY_PATH;
     srv_cfg.port = port;
-    srv_cfg.on_pump = window_pump;
-    srv_cfg.on_pump_ctx = &w;
+    srv_cfg.on_lane_pump = window_pump;
+    srv_cfg.on_lane_pump_ctx = &w;
     moq_pq_threaded_t *srv = NULL;
     CHECK(moq_pq_threaded_create(&srv_cfg, &srv) == MOQ_OK);
 
@@ -133,7 +137,7 @@ int main(void)
         cli_cfg.host = "localhost";
         cli_cfg.port = port;
         cli_cfg.insecure_skip_verify = true;
-        cli_cfg.on_pump = dummy_pump;
+        cli_cfg.on_lane_pump = dummy_pump;
         moq_pq_threaded_t *cli = NULL;
         CHECK(moq_pq_threaded_create(&cli_cfg, &cli) == MOQ_OK);
 

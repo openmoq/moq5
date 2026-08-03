@@ -1,4 +1,5 @@
 #include "moq/control.h"
+#include "control_d16_internal.h"
 #include "moq/wire.h"
 #include <string.h>
 
@@ -847,6 +848,53 @@ moq_result_t moq_d16_decode_subscribe_ok(const uint8_t *payload,
     }
 
     return MOQ_OK;
+}
+
+/* §9.8: pure per-profile timeout scanner (draft-16). Extracts the
+ * DELIVERY TIMEOUT Track Extension (Extension Header Type 0x02, §11.1, a
+ * varint of milliseconds) from an opaque Track Extensions KVP block. A wire
+ * value of 0 is categorically illegal (§11.1: the receiver MUST close with
+ * PROTOCOL_VIOLATION) -> MOQ_ERR_PROTO in every mode. DUPLICATES: draft-16
+ * leaves Extension Header repeatability to an unfinished registry item
+ * (§13.3), so a repeat is NOT a documented protocol violation -- strict
+ * (local emission) still refuses to EMIT one (MOQ_ERR_PROTO -> the caller's
+ * INVAL), while lenient (inbound) keeps the FIRST value and ignores
+ * repeats. `strict` also selects structural handling: strict treats any
+ * structural failure as MOQ_ERR_PROTO; lenient stops at the first
+ * structural inconsistency and reports nothing extracted. */
+moq_result_t moq_d16_scan_delivery_timeout_ext(const uint8_t *ext, size_t len,
+                                               bool strict,
+                                               bool *out_has,
+                                               uint64_t *out_ms)
+{
+    *out_has = false; *out_ms = 0;
+    if (!ext || len == 0) return MOQ_OK;
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, ext, len);
+    for (;;) {
+        moq_kvp_entry_t e;
+        moq_result_t rc = moq_kvp_decode_next(&dec, &e);
+        if (rc == MOQ_DONE) return MOQ_OK;
+        if (rc < 0) {
+            if (strict) return MOQ_ERR_PROTO;
+            *out_has = false; *out_ms = 0;     /* lenient: stay opaque */
+            return MOQ_OK;
+        }
+        if (e.type != 0x02u) continue;         /* DELIVERY TIMEOUT ext */
+        uint64_t v = 0;
+        size_t n = moq_quic_varint_decode(e.value, e.value_len, &v);
+        if (n == 0 || n != e.value_len) {
+            if (strict) return MOQ_ERR_PROTO;
+            *out_has = false; *out_ms = 0;
+            return MOQ_OK;
+        }
+        if (v == 0) return MOQ_ERR_PROTO;      /* §11.1: zero always closes */
+        if (*out_has) {
+            if (strict) return MOQ_ERR_PROTO;  /* never EMIT a duplicate */
+            continue;                          /* inbound: first value wins */
+        }
+        *out_has = true; *out_ms = v;
+    }
 }
 
 moq_result_t moq_d16_encode_subscribe_ok(moq_buf_writer_t *w,

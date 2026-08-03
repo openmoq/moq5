@@ -18,7 +18,7 @@
  *   --key FILE    PEM private key (required)
  *   --timeout N   Elapsed timeout in seconds (default: 30)
  *
- * All session work happens inside on_pump on the managed thread.
+ * All session work happens inside on_lane_pump on the managed thread.
  * The app thread only uses wake/wait for signaling.
  *
  * Thread safety: app_state fields are C11 atomics or constant
@@ -45,13 +45,15 @@ typedef struct {
 
 /* -- Pump callback --------------------------------------------------- */
 
-static int on_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int on_lane_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                         uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     app_state_t *app = (app_state_t *)ctx;
 
     moq_mvfst_conn_t *conn = NULL;
-    while ((conn = moq_mvfst_managed_next_conn(m, conn)) != NULL) {
+    while ((conn = moq_mvfst_lane_next_conn(lane, conn)) != NULL) {
         moq_session_t *s = moq_mvfst_conn_session(conn);
         if (!s) continue;
 
@@ -202,7 +204,7 @@ int main(int argc, char **argv)
     cfg.port = (int)port;
     cfg.cert_path = cert_file;
     cfg.key_path = key_file;
-    cfg.on_pump = on_pump;
+    cfg.on_lane_pump = on_lane_pump;
     cfg.user_ctx = &app;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;

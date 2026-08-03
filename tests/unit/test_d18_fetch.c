@@ -850,6 +850,292 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    MOQ_TEST_PASS("d18_fetch");
+    /* == T. Fetch teardown aborts the data uni in the direction it owns ==
+     *
+     * A fetch data stream is unidirectional, publisher -> fetcher. Only the
+     * publisher holds a sending half on it, so only the publisher may
+     * RESET_DATA; the fetcher, which merely receives, must STOP_DATA. Sending
+     * RESET for a direction this endpoint does not own is rejected by the
+     * transport and escalated to a connection fatal by the bridge. */
+    {
+        /* Fetcher role: STOP_DATA, never RESET_DATA.
+         *
+         * The ownership state is reached through the real transitions --
+         * FETCH_OK on the request bidi, then FETCH_HEADER opening the peer's
+         * data uni -- not by assigning the fields. */
+        moq_session_t *s = make_established_d18_client();
+        MOQ_TEST_CHECK(s != NULL);
+        moq_fetch_t h = { 0 };
+        moq_stream_ref_t ref = do_fetch(s, "video", &h, NULL);
+
+        uint8_t ok[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, ok, sizeof(ok));
+        moq_d18_encode_fetch_ok(&w, false, (moq_d18_location_t){ 10, 0 },
+                                (moq_bytes_t){0});
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, ok,
+                moq_buf_writer_offset(&w), false, 1), (int)MOQ_OK);
+
+        moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep.kind, (int)MOQ_REQ_FETCH);
+        uint64_t req_id = s->fetches[ep.slot].request_id;
+
+        /* The publisher's data uni presents FETCH_HEADER for this request. */
+        uint8_t hdr[16];
+        moq_buf_writer_init(&w, hdr, sizeof(hdr));
+        moq_buf_write_varint(&w, MOQ_D18_STREAM_FETCH_HEADER);
+        moq_buf_write_varint(&w, req_id);
+        moq_stream_ref_t duni = moq_stream_ref_from_u64(0xD001);
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(
+            s, duni, hdr, moq_buf_writer_offset(&w), false, 2) >= 0);
+
+        moq_event_t de;
+        while (moq_session_poll_events(s, &de, 1) > 0) moq_event_cleanup(&de);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        /* Reached by real transitions, not assignment. */
+        moq_fetch_entry_t *fe = &s->fetches[ep.slot];
+        MOQ_TEST_CHECK_EQ_INT((int)fe->role, (int)MOQ_FETCH_ROLE_FETCHER);
+        MOQ_TEST_CHECK(fe->data_stream_started);
+        MOQ_TEST_CHECK(!fe->data_stream_fin);
+
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+
+        int stops = 0, resets = 0;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_STOP_DATA) stops++;
+            if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(stops, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+        MOQ_TEST_CHECK(fetch_cancel_tomb_contains(s, req_id));
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+    {
+        /* Publisher role: RESET_DATA, never STOP_DATA -- it owns the send
+         * half. The data uni is opened by the real accept path. */
+        moq_session_t *s = make_established_d18_server();
+        MOQ_TEST_CHECK(s != NULL);
+        uint8_t msg[128];
+        size_t n = make_fetch(msg, sizeof(msg), 0, 1, "video");
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xF7A1);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1),
+            (int)MOQ_OK);
+
+        moq_fetch_t fh = { 0 };
+        moq_event_t e;
+        while (moq_session_poll_events(s, &e, 1) > 0) {
+            if (e.kind == MOQ_EVENT_FETCH_REQUEST) fh = e.u.fetch_request.fetch;
+            moq_event_cleanup(&e);
+        }
+        moq_accept_fetch_cfg_t acc;
+        moq_accept_fetch_cfg_init(&acc);
+        acc.end_group = 10; acc.end_object = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_fetch(s, fh, &acc, 1),
+                              (int)MOQ_OK);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep.kind, (int)MOQ_REQ_FETCH);
+        moq_fetch_entry_t *fe = &s->fetches[ep.slot];
+        MOQ_TEST_CHECK_EQ_INT((int)fe->role, (int)MOQ_FETCH_ROLE_PUBLISHER);
+        MOQ_TEST_CHECK(fe->data_stream_started);   /* opened by accept_fetch */
+        MOQ_TEST_CHECK(!fe->data_stream_fin);
+
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+
+        int stops = 0, resets = 0;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_STOP_DATA) stops++;
+            if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(resets, 1);
+        MOQ_TEST_CHECK_EQ_INT(stops, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+    {
+        /* Capacity: a full action queue defers the WHOLE teardown without
+         * mutating, and the retry then completes it exactly once. */
+        moq_session_t *s = make_established_d18_client();
+        MOQ_TEST_CHECK(s != NULL);
+        moq_fetch_t h = { 0 };
+        moq_stream_ref_t ref = do_fetch(s, "video", &h, NULL);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+        moq_fetch_entry_t *fe = &s->fetches[ep.slot];
+        fe->state = MOQ_FETCH_ACCEPTED;
+        fe->data_stream_started = true;
+        fe->data_stream_fin = false;
+        fe->data_stream_ref = moq_stream_ref_from_u64(0xD003);
+
+        size_t filled = 0;
+        while (!action_queue_full(s)) {
+            moq_action_t f;
+            memset(&f, 0, sizeof(f));
+            f.kind = MOQ_ACTION_STOP_DATA;
+            f.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
+            f.borrow_epoch = s->borrow_epoch;
+            f.u.stop_data.stream_ref = moq_stream_ref_from_u64(0xA000 + filled);
+            if (push_action(s, &f) < 0) break;
+            filled++;
+        }
+        MOQ_TEST_CHECK(filled > 0);
+
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref),
+                              (int)MOQ_ERR_WOULD_BLOCK);
+        /* Nothing mutated: the request still resolves and the entry is intact. */
+        moq_request_endpoint_t again = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)again.kind, (int)MOQ_REQ_FETCH);
+        MOQ_TEST_CHECK_EQ_INT((int)again.slot, (int)ep.slot);
+
+        /* Drain one slot and retry: it completes, emitting exactly one STOP. */
+        MOQ_TEST_CHECK(moq_session_poll_actions(s, &a, 1) > 0);
+        moq_action_cleanup(&a);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        int stops = 0, resets = 0;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_STOP_DATA &&
+                a.u.stop_data.stream_ref._v == 0xD003) stops++;
+            if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(stops, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+    {
+        /* Late data uni after a fetcher teardown: FETCH_HEADER for the freed
+         * request must be absorbed, not fatal. */
+        moq_session_t *s = make_established_d18_client();
+        MOQ_TEST_CHECK(s != NULL);
+        moq_fetch_t h = { 0 };
+        moq_stream_ref_t ref = do_fetch(s, "video", &h, NULL);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+        moq_fetch_entry_t *fe = &s->fetches[ep.slot];
+        uint64_t req_id = fe->request_id;
+        /* Torn down BEFORE any data uni presented its FETCH_HEADER. */
+        fe->data_stream_started = false;
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        /* The data uni now arrives late. */
+        uint8_t hdr[16];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, hdr, sizeof(hdr));
+        moq_buf_write_varint(&w, MOQ_D18_STREAM_FETCH_HEADER);
+        moq_buf_write_varint(&w, req_id);
+        moq_stream_ref_t duni = moq_stream_ref_from_u64(0xD004);
+        moq_result_t lrc = moq_session_on_data_bytes(
+            s, duni, hdr, moq_buf_writer_offset(&w), false, 2);
+        MOQ_TEST_CHECK(lrc >= 0 || lrc == MOQ_ERR_WOULD_BLOCK);
+
+        /* Absorbed ACTIVELY, not ignored: the late stream is stopped, and the
+         * tombstone that authorised absorbing it is consumed exactly once. */
+        int late_stops = 0;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_STOP_DATA &&
+                a.u.stop_data.stream_ref._v == duni._v) late_stops++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(late_stops, 1);
+        MOQ_TEST_CHECK(!fetch_cancel_tomb_contains(s, req_id));
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+
+    /* == U. Teardown is atomic against a full EVENT queue ==============
+     *
+     * The production path reserves event capacity BEFORE action capacity, so a
+     * full event queue must defer the whole teardown with nothing mutated --
+     * no abort action, no tombstone, no registry removal, no entry change. */
+    {
+        moq_session_t *s = make_server(1);          /* event queue of 1 */
+        MOQ_TEST_CHECK(s != NULL);
+        uint8_t msg[128];
+        size_t n = make_fetch(msg, sizeof(msg), 0, 1, "video");
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xF7B2);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1),
+            (int)MOQ_OK);
+
+        moq_fetch_t fh = { 0 };
+        moq_event_t e;
+        while (moq_session_poll_events(s, &e, 1) > 0) {
+            if (e.kind == MOQ_EVENT_FETCH_REQUEST) fh = e.u.fetch_request.fetch;
+            moq_event_cleanup(&e);
+        }
+        moq_accept_fetch_cfg_t acc;
+        moq_accept_fetch_cfg_init(&acc);
+        acc.end_group = 10; acc.end_object = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_fetch(s, fh, &acc, 1),
+                              (int)MOQ_OK);
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+
+        moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep.kind, (int)MOQ_REQ_FETCH);
+        moq_fetch_entry_t *fe = &s->fetches[ep.slot];
+        uint64_t req_id = fe->request_id;
+        moq_fetch_state_t st0 = fe->state;
+        bool started0 = fe->data_stream_started;
+
+        /* Occupy the single event slot. */
+        moq_event_t filler;
+        memset(&filler, 0, sizeof(filler));
+        filler.kind = MOQ_EVENT_FETCH_CANCELLED;
+        filler.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
+        filler.borrow_epoch = s->borrow_epoch;
+        filler.u.fetch_cancelled.fetch = fe->handle;
+        MOQ_TEST_CHECK(push_event(s, &filler) >= 0);
+        MOQ_TEST_CHECK(event_queue_full(s));
+
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref),
+                              (int)MOQ_ERR_WOULD_BLOCK);
+
+        /* Nothing mutated. */
+        int any = 0;
+        while (moq_session_poll_actions(s, &a, 1) > 0) { any++; moq_action_cleanup(&a); }
+        MOQ_TEST_CHECK_EQ_INT(any, 0);                  /* no abort queued */
+        MOQ_TEST_CHECK(!fetch_cancel_tomb_contains(s, req_id));
+        moq_request_endpoint_t again = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)again.kind, (int)MOQ_REQ_FETCH);
+        MOQ_TEST_CHECK_EQ_INT((int)again.slot, (int)ep.slot);
+        MOQ_TEST_CHECK_EQ_INT((int)s->fetches[ep.slot].state, (int)st0);
+        MOQ_TEST_CHECK_EQ_INT((int)s->fetches[ep.slot].data_stream_started,
+                              (int)started0);
+
+        /* Free one event slot; the retry completes exactly once. */
+        MOQ_TEST_CHECK(moq_session_poll_events(s, &e, 1) > 0);
+        moq_event_cleanup(&e);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+
+        int resets = 0, stops = 0;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+            if (a.kind == MOQ_ACTION_STOP_DATA) stops++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(resets, 1);               /* publisher direction */
+        MOQ_TEST_CHECK_EQ_INT(stops, 0);
+        MOQ_TEST_CHECK_EQ_INT(drain_kind(s, MOQ_EVENT_FETCH_CANCELLED), 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+
+    if (!failures) MOQ_TEST_PASS("d18_fetch");
     return failures != 0;
 }

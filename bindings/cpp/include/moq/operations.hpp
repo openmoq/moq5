@@ -86,6 +86,13 @@ struct subscription_update_config {
     std::span<const moq_auth_token_t> auth_tokens = {};
     bool     has_new_group_request   = false;   /* requires dynamic_groups */
     uint64_t new_group_request       = 0;
+    /* update the subscription's filter. Locations apply to the
+     * ABSOLUTE_* forms only (ignored otherwise, matching subscribe). */
+    bool                   has_filter   = false;
+    moq_subscribe_filter_t filter       = MOQ_SUBSCRIBE_FILTER_NONE;
+    uint64_t               start_group  = 0;
+    uint64_t               start_object = 0;
+    uint64_t               end_group    = 0;
 };
 
 struct done_subscribe_config {
@@ -160,6 +167,16 @@ struct accept_publish_config {
     group_order group_order             = group_order::default_order;
     bool        has_new_group_request   = false;   /* requires dynamic_groups */
     uint64_t    new_group_request       = 0;
+    /* Subscription filter sent on the response (none = unfiltered). */
+    subscribe_filter filter       = subscribe_filter::none;
+    uint64_t         start_group  = 0;
+    uint64_t         start_object = 0;
+    uint64_t         end_group    = 0;
+    /* Initial forwarding state sent on the response. Unset resolves to
+     * forwarding (wire omission defaults to 1; it does NOT preserve the
+     * publisher's initial value). */
+    bool             has_forward  = false;
+    bool             forward      = true;
 };
 
 struct reject_publish_config {

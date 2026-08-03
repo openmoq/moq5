@@ -41,6 +41,20 @@ typedef struct moq_sub_callbacks {
 
 MOQ_API void moq_sub_callbacks_init(moq_sub_callbacks_t *cb);
 
+/* The peer accepted an outbound subscription update . Produced by the
+ * library and BORROWED for the duration of the on_update_ok callback --
+ * plain scalars, nothing retained. struct_size is stamped by the LIBRARY
+ * with its own sizeof: gate any future appended field on
+ * struct_size >= offsetof + sizeof before reading it. */
+typedef struct moq_sub_update_result {
+    uint32_t struct_size;
+    bool     has_largest;      /* the response carried the peer's Largest */
+    uint64_t largest_group;    /* valid iff has_largest */
+    uint64_t largest_object;   /* valid iff has_largest */
+    bool     has_expires;      /* draft-18 only */
+    uint64_t expires_ms;       /* valid iff has_expires */
+} moq_sub_update_result_t;
+
 /* -- Configuration ------------------------------------------------ */
 
 typedef struct moq_sub_cfg {
@@ -73,13 +87,25 @@ typedef struct moq_sub_cfg {
      * the default (16 MiB, matching the session's default receive budget).
      * Values larger than SIZE_MAX are clamped to SIZE_MAX. */
     uint64_t max_queued_object_bytes;
+    /* Appended: fired when the peer ACCEPTS an outbound
+     * moq_sub_update_subscription for this track -- success only; a
+     * REJECTED update terminates the subscription and surfaces through
+     * on_subscribe_done with the update-failure status code (0x8).
+     * *result is borrowed for the duration of the callback. Fired
+     * synchronously inside moq_sub_tick AFTER the session has applied the
+     * update (the acknowledgment is what latches Forward/timeout/filter
+     * changes), and always refers to the track's single outstanding
+     * update. Uses callbacks.ctx. */
+    void (*on_update_ok)(void *ctx, moq_sub_track_t *track,
+                         const moq_sub_update_result_t *result);
 } moq_sub_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the
  * layout before the first appended field). It cannot know the caller's storage
  * size, so it must not write the full current sizeof -- that would overflow a
  * caller compiled against the original (smaller) struct. Appended fields
- * (on_goaway, on_subscribe_done, max_queued_object_bytes) default to disabled;
+ * (on_goaway, on_subscribe_done, max_queued_object_bytes, on_update_ok)
+ * default to disabled;
  * to set any of them, or to initialize the full current struct, use
  * moq_sub_cfg_init_sized(). */
 MOQ_API void moq_sub_cfg_init(moq_sub_cfg_t *cfg);
@@ -158,18 +184,41 @@ typedef struct moq_sub_update_cfg {
     bool     forward;
     bool     has_delivery_timeout;
     uint64_t delivery_timeout_us;
+    /* Appended: update the subscription's filter. Whole-BLOCK gate:
+     * read only when struct_size covers THROUGH end_group, so a caller
+     * whose struct ends mid-block can never send a torn filter. Location
+     * fields apply to the ABSOLUTE_* forms only; values set on the
+     * relative forms are IGNORED (the wire carries none for them);
+     * ABSOLUTE_RANGE with end_group < start_group is MOQ_ERR_INVAL. */
+    bool                   has_filter;
+    moq_subscribe_filter_t filter;
+    uint64_t               start_group;
+    uint64_t               start_object;
+    uint64_t               end_group;
 } moq_sub_update_cfg_t;
 
+/* Pointer-only initializer: zeroes and stamps ONLY the frozen v0 prefix
+ * (struct_size .. delivery_timeout_us -- the layout before the filter
+ * append). The appended filter block stays disabled; to set it, or to
+ * initialize the full current struct, use moq_sub_update_cfg_init_sized. */
 MOQ_API void moq_sub_update_cfg_init(moq_sub_update_cfg_t *cfg);
+
+/* Size-aware initializer: zeroes and stamps min(cfg_size, sizeof current
+ * struct). Pass sizeof(moq_sub_update_cfg_t) for the full current struct.
+ * No-op if cfg is NULL or cfg_size cannot hold struct_size. */
+MOQ_API void moq_sub_update_cfg_init_sized(moq_sub_update_cfg_t *cfg,
+                                           size_t cfg_size);
 
 /*
  * Update an active subscription's parameters (priority, forward,
- * delivery timeout).  Only one update may be outstanding per track;
- * a second call before the peer responds returns MOQ_ERR_WRONG_STATE.
+ * delivery timeout, filter).  Only one update may be outstanding per
+ * track; a second call before the peer responds returns
+ * MOQ_ERR_WRONG_STATE.
  *
- * The peer's response (accept or reject) is consumed internally by
- * the session core.  This slice does not surface the response to
- * the facade caller.
+ * The peer's ACCEPTANCE is surfaced through the appended
+ * moq_sub_cfg_t.on_update_ok callback (success only). A REJECTED update
+ * terminates the subscription: it surfaces through on_subscribe_done
+ * with the update-failure status code (0x8), never through on_update_ok.
  */
 MOQ_API moq_result_t moq_sub_update_subscription(
     moq_subscriber_t *sub,

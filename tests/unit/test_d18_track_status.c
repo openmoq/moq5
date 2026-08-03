@@ -138,7 +138,8 @@ static int test_codec(void)
 static moq_session_t *make_session_caps(moq_perspective_t persp,
                                         uint32_t max_events,
                                         uint32_t send_buffer_size,
-                                        uint32_t max_track_status)
+                                        uint32_t max_track_status,
+                                        uint32_t scratch_size)
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
@@ -146,6 +147,7 @@ static moq_session_t *make_session_caps(moq_perspective_t persp,
     if (max_events) cfg.max_events = max_events;
     if (send_buffer_size) cfg.send_buffer_size = send_buffer_size;
     if (max_track_status) cfg.max_track_statuses = max_track_status;
+    if (scratch_size) cfg.output_scratch_size = scratch_size;
     moq_session_t *s = NULL;
     if (moq_session_create(&cfg, 0, &s) < 0) return NULL;
     if (moq_session_start(s, 0) < 0) { moq_session_destroy(s); return NULL; }
@@ -165,7 +167,7 @@ static moq_session_t *make_session_caps(moq_perspective_t persp,
 
 static moq_session_t *make_session(moq_perspective_t persp)
 {
-    return make_session_caps(persp, 0, 0, 0);
+    return make_session_caps(persp, 0, 0, 0, 0);
 }
 
 static int count_busy_subs(moq_session_t *s)
@@ -247,6 +249,21 @@ static moq_stream_ref_t open_ts(moq_session_t *s, moq_track_status_handle_t *h)
         moq_action_cleanup(&act);
     }
     return ref;
+}
+
+/* Leave a real scratch-bearing event queued: a server GOAWAY carrying a New
+ * Session URI, which the client copies into the event-scratch arena. The
+ * Request ID names one of the client's own outbound requests, so it carries
+ * client (even) parity. */
+static moq_result_t queue_goaway_uri(moq_session_t *s, const char *uri)
+{
+    uint8_t msg[256];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_result_t rc = moq_d18_encode_goaway(&w, (const uint8_t *)uri,
+                                            strlen(uri), 0, 100);
+    if (rc < 0) return rc;
+    return moq_session_on_control_bytes(s, msg, moq_buf_writer_offset(&w), 1);
 }
 
 int main(void)
@@ -439,7 +456,7 @@ int main(void)
         moq_session_destroy(s);
 
         /* Pool-full reject, request fed WITHOUT FIN. */
-        s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 0, 0, 1);
+        s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 0, 0, 1, 0);
         moq_d18_msg_params_t q = { 0 };
         moq_stream_ref_t r1 = moq_stream_ref_from_u64(1);
         (void)feed_ts(s, r1, 0, "live", &q);          /* fills the 1-slot pool */
@@ -586,7 +603,7 @@ int main(void)
      *  no entry is created, the generic staging slot holds the buffered request
      *  for the re-feed, and nothing is orphaned. */
     {
-        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 1, 0, 0);
+        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 1, 0, 0, 0);
         moq_stream_ref_t r1 = moq_stream_ref_from_u64(1);
         moq_stream_ref_t r2 = moq_stream_ref_from_u64(3);
         moq_d18_msg_params_t p = { 0 };
@@ -627,7 +644,7 @@ int main(void)
 
     /* == accept backpressure is WOULD_BLOCK, not BUFFER, retryable ==== */
     {
-        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 0, 24, 8);
+        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 0, 24, 8, 0);
         moq_d18_msg_params_t p = { 0 };
         const char *fields = "abcdefgh";
         moq_track_status_handle_t handles[8];
@@ -663,7 +680,7 @@ int main(void)
      *  REQUEST_ERROR on its bidi (not surfaced, not WOULD_BLOCK); the session
      *  stays up and the staging slot is reclaimed. */
     {
-        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 0, 0, 1);
+        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 0, 0, 1, 0);
         moq_d18_msg_params_t p = { 0 };
         moq_stream_ref_t r1 = moq_stream_ref_from_u64(1);
         moq_track_status_handle_t h = feed_ts(s, r1, 0, "live", &p);
@@ -805,6 +822,125 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)client->state, (int)MOQ_SESS_ESTABLISHED);
         MOQ_TEST_CHECK_EQ_INT((int)server->state, (int)MOQ_SESS_ESTABLISHED);
         moq_simpair_destroy(sp);
+    }
+
+    /* == Requester: Track Properties are weighed against the live arena ==
+     * A queued event legally holds bytes in the arena, so the properties tail
+     * that follows is classified against the space left: one that fits an
+     * empty arena is retryable and arrives intact after a drain, and one no
+     * arena could hold ends the session at once rather than after a wasted
+     * drain cycle. */
+    {
+        static const char k_uri[] = "wss://relocate.example.com/replacement";
+        static const uint32_t k_scratch = 128;
+
+        /* -- Transient: retained, then delivered intact after a drain ---- */
+        {
+            moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_CLIENT,
+                                                 0, 0, 0, k_scratch);
+            MOQ_TEST_CHECK(s != NULL);
+            moq_track_status_handle_t h;
+            moq_stream_ref_t ref = open_ts(s, &h);
+
+            MOQ_TEST_CHECK_EQ_INT((int)queue_goaway_uri(s, k_uri), (int)MOQ_OK);
+            MOQ_TEST_CHECK(s->event_scratch_len > 0);
+            size_t held = s->event_scratch_len;
+
+            /* Opaque properties (repeated type 0, value 0) sized to fit the
+             * whole arena but not what is left beside the queued URI. */
+            uint8_t props[100];
+            memset(props, 0, sizeof(props));
+            moq_bytes_t pr = { props, sizeof(props) };
+            moq_d18_msg_params_t p = { 0 };
+            p.has_largest = true; p.largest_group = 4; p.largest_object = 1;
+            uint8_t ok[256];
+            moq_buf_writer_t w;
+            moq_buf_writer_init(&w, ok, sizeof(ok));
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_track_status_ok(&w, &p, pr), (int)MOQ_OK);
+
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, ok,
+                    moq_buf_writer_offset(&w), true, 2),
+                (int)MOQ_ERR_WOULD_BLOCK);
+            MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, held);
+            /* Nothing was surfaced and the request keeps its owner. */
+            MOQ_TEST_CHECK(request_registry_find_by_streamref(s, ref).kind ==
+                           MOQ_REQ_TRACK_STATUS);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_DRAINING);
+
+            moq_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_GOAWAY);
+            moq_event_cleanup(&ev);
+
+            /* Re-feed the same bidi: exactly one OK, properties intact. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, false, 3),
+                (int)MOQ_OK);
+            int oks = 0;
+            memset(&ev, 0, sizeof(ev));
+            while (moq_session_poll_events(s, &ev, 1) > 0) {
+                if (ev.kind == MOQ_EVENT_TRACK_STATUS_OK) {
+                    oks++;
+                    MOQ_TEST_CHECK(ev.u.track_status_ok.has_largest);
+                    MOQ_TEST_CHECK_EQ_U64(ev.u.track_status_ok.largest_group, 4);
+                    MOQ_TEST_CHECK_EQ_SIZE(
+                        ev.u.track_status_ok.track_properties.len,
+                        sizeof(props));
+                    MOQ_TEST_CHECK(memcmp(
+                        ev.u.track_status_ok.track_properties.data,
+                        props, sizeof(props)) == 0);
+                }
+                moq_event_cleanup(&ev);
+                memset(&ev, 0, sizeof(ev));
+            }
+            MOQ_TEST_CHECK_EQ_INT(oks, 1);
+            /* The FIN retained across the blocked call retires the entry. */
+            MOQ_TEST_CHECK(request_registry_find_by_streamref(s, ref).kind ==
+                           MOQ_REQ_NONE);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_DRAINING);
+            moq_session_destroy(s);
+        }
+
+        /* -- Permanent: closes at once, with the arena already occupied -- */
+        {
+            moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_CLIENT,
+                                                 0, 0, 0, k_scratch);
+            MOQ_TEST_CHECK(s != NULL);
+            moq_track_status_handle_t h;
+            moq_stream_ref_t ref = open_ts(s, &h);
+
+            MOQ_TEST_CHECK_EQ_INT((int)queue_goaway_uri(s, k_uri), (int)MOQ_OK);
+            MOQ_TEST_CHECK(s->event_scratch_len > 0);
+
+            /* Larger than the whole arena: no drain can ever satisfy it. */
+            uint8_t props[160];
+            memset(props, 0, sizeof(props));
+            moq_bytes_t pr = { props, sizeof(props) };
+            moq_d18_msg_params_t p = { 0 };
+            uint8_t ok[256];
+            moq_buf_writer_t w;
+            moq_buf_writer_init(&w, ok, sizeof(ok));
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_track_status_ok(&w, &p, pr), (int)MOQ_OK);
+
+            /* A normal close reports MOQ_OK: the message was handled, by
+             * ending the session. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, ok,
+                    moq_buf_writer_offset(&w), true, 2), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            MOQ_TEST_CHECK_EQ_INT(moq_session_poll_actions(s, &a, 1), 1);
+            MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+            MOQ_TEST_CHECK_EQ_U64(a.u.close_session.code, 0x1);
+            moq_action_cleanup(&a);
+            moq_session_destroy(s);
+        }
     }
 
     MOQ_TEST_PASS("d18_track_status");

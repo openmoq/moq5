@@ -62,6 +62,8 @@ struct moq_subscriber {
     void              (*on_goaway)(void *ctx, moq_bytes_t new_session_uri);
     void              (*on_subscribe_done)(void *ctx, moq_sub_track_t *track,
                                            uint64_t status_code);
+    void              (*on_update_ok)(void *ctx, moq_sub_track_t *track,
+                                      const moq_sub_update_result_t *result);
     bool                closed;
     bool                draining;
 
@@ -368,6 +370,17 @@ moq_result_t moq_sub_create(moq_session_t *session,
         sizeof(cfg->callbacks))
         return MOQ_ERR_INVAL;
 
+/* ABI boundary: the appended callback must start exactly at the
+ * v0 sizeof -- the align-rounded end of max_queued_object_bytes, the
+ * old struct's last field (probe-verified zero trailing padding, so no
+ * reserved spacer is needed). */
+_Static_assert(offsetof(moq_sub_cfg_t, on_update_ok) ==
+               ((offsetof(moq_sub_cfg_t, max_queued_object_bytes) +
+                 sizeof(((moq_sub_cfg_t *)0)->max_queued_object_bytes) +
+                 (_Alignof(moq_sub_cfg_t) - 1)) &
+                ~(size_t)(_Alignof(moq_sub_cfg_t) - 1)),
+               "on_update_ok must sit exactly at the v0 sizeof");
+
 #define SUB_CFG_HAS(field) \
     (cfg->struct_size >= offsetof(moq_sub_cfg_t, field) + sizeof(cfg->field))
 
@@ -496,6 +509,8 @@ moq_result_t moq_sub_create(moq_session_t *session,
         s->on_goaway = cfg->on_goaway;
     if (SUB_CFG_HAS(on_subscribe_done))
         s->on_subscribe_done = cfg->on_subscribe_done;
+    if (SUB_CFG_HAS(on_update_ok))
+        s->on_update_ok = cfg->on_update_ok;
 
 #undef SUB_CFG_HAS
 
@@ -643,11 +658,39 @@ moq_result_t moq_sub_release_track(moq_subscriber_t *sub,
     return MOQ_OK;
 }
 
+/* Frozen v0 prefix: struct_size .. delivery_timeout_us -- the layout before
+ * the filter append. The pointer-only initializer touches only this
+ * prefix (writing sizeof(current) would overflow an old caller's storage);
+ * the appended filter block stays disabled unless _init_sized opts in. */
+#define MOQ_SUB_UPDATE_CFG_V0_SIZE \
+    (offsetof(moq_sub_update_cfg_t, delivery_timeout_us) + \
+     sizeof(((moq_sub_update_cfg_t *)0)->delivery_timeout_us))
+
+/* ABI boundary: the appended filter block must start exactly at the
+ * independently derived v0 floor (the align-rounded end of
+ * delivery_timeout_us) -- never inside the old struct's storage. */
+_Static_assert(offsetof(moq_sub_update_cfg_t, has_filter) ==
+               ((offsetof(moq_sub_update_cfg_t, delivery_timeout_us) +
+                 sizeof(((moq_sub_update_cfg_t *)0)->delivery_timeout_us) +
+                 (_Alignof(moq_sub_update_cfg_t) - 1)) &
+                ~(size_t)(_Alignof(moq_sub_update_cfg_t) - 1)),
+               "filter block must sit exactly at the v0 sizeof");
+
 void moq_sub_update_cfg_init(moq_sub_update_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    memset(cfg, 0, MOQ_SUB_UPDATE_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_SUB_UPDATE_CFG_V0_SIZE;
+}
+
+void moq_sub_update_cfg_init_sized(moq_sub_update_cfg_t *cfg,
+                                   size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
@@ -657,18 +700,29 @@ moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
 {
     if (!sub || !track || !cfg) return MOQ_ERR_INVAL;
     if (track->sub != sub) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_sub_update_cfg_t)) return MOQ_ERR_INVAL;
+    /* Frozen v0 floor: an old caller's 24-byte struct stays valid; the
+     * appended filter block is whole-block-gated below. */
+    if (cfg->struct_size < MOQ_SUB_UPDATE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (sub->closed) return MOQ_ERR_CLOSED;
     if (track->state != SUB_TRACK_ACTIVE) return MOQ_ERR_WRONG_STATE;
 
     moq_subscription_update_cfg_t ucfg;
-    moq_subscription_update_cfg_init(&ucfg);
+    moq_subscription_update_cfg_init_sized(&ucfg, sizeof(ucfg));
     ucfg.has_subscriber_priority = cfg->has_subscriber_priority;
     ucfg.subscriber_priority = cfg->subscriber_priority;
     ucfg.has_forward = cfg->has_forward;
     ucfg.forward = cfg->forward;
     ucfg.has_delivery_timeout = cfg->has_delivery_timeout;
     ucfg.delivery_timeout_us = cfg->delivery_timeout_us;
+    if (cfg->struct_size >= offsetof(moq_sub_update_cfg_t, end_group) +
+                                sizeof(cfg->end_group) &&
+        cfg->has_filter) {
+        ucfg.has_filter = true;
+        ucfg.filter = cfg->filter;
+        ucfg.start_group = cfg->start_group;
+        ucfg.start_object = cfg->start_object;
+        ucfg.end_group = cfg->end_group;
+    }
 
     return moq_session_update_subscription(sub->session, track->handle,
                                             &ucfg, now_us);
@@ -1002,6 +1056,28 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         case MOQ_EVENT_FETCH_CANCELLED:
             break;
 
+        case MOQ_EVENT_SUBSCRIPTION_UPDATE_OK: {
+            /* success-only acknowledgment of our outbound update. The
+             * session already applied the latches; the callback observes
+             * post-acknowledgment state. Consumed (queue drains) even when
+             * no callback is installed. */
+            moq_sub_track_t *t = find_track_by_handle(sub,
+                ev.u.subscription_update_ok.sub);
+            if (t && sub->on_update_ok) {
+                moq_sub_update_result_t res;
+                memset(&res, 0, sizeof(res));
+                res.struct_size = (uint32_t)sizeof(res);
+                res.has_largest = ev.u.subscription_update_ok.has_largest;
+                res.largest_group =
+                    ev.u.subscription_update_ok.largest_group;
+                res.largest_object =
+                    ev.u.subscription_update_ok.largest_object;
+                res.has_expires = ev.u.subscription_update_ok.has_expires;
+                res.expires_ms = ev.u.subscription_update_ok.expires_ms;
+                sub->on_update_ok(sub->callbacks.ctx, t, &res);
+            }
+            break;
+        }
         case MOQ_EVENT_UNSUBSCRIBED: {
             moq_sub_track_t *t = find_track_by_handle(sub,
                 ev.u.unsubscribed.sub);

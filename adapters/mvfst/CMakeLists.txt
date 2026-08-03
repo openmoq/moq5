@@ -197,8 +197,8 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_managed_server_loopback COMMAND test_mvfst_managed_server_loopback)
     set_tests_properties(mvfst_managed_server_loopback PROPERTIES TIMEOUT 10)
 
-    # Event-driven server on_pump: a reactive server accepts + publishes with NO
-    # explicit server wakes, driven only by EventBase scheduling on server_evb.
+    # Event-driven server on_lane_pump: a reactive server accepts + publishes with
+    # NO explicit server wakes, driven only by EventBase scheduling on server_evb.
     add_executable(test_mvfst_managed_server_eventdriven
         tests/test_managed_server_eventdriven.cpp)
     target_link_libraries(test_mvfst_managed_server_eventdriven PRIVATE
@@ -206,6 +206,17 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_managed_server_eventdriven
         COMMAND test_mvfst_managed_server_eventdriven)
     set_tests_properties(mvfst_managed_server_eventdriven PROPERTIES TIMEOUT 20)
+
+    # Sustained drip publishing with no app wakes: one object per pump pass,
+    # so later passes can only be scheduled by the facade's own
+    # outbound-progress (delivery) signal.
+    add_executable(test_mvfst_managed_server_drip
+        tests/test_managed_server_drip.cpp)
+    target_link_libraries(test_mvfst_managed_server_drip PRIVATE
+        moq::adapter-mvfst mvfst::mvfst)
+    add_test(NAME mvfst_managed_server_drip
+        COMMAND test_mvfst_managed_server_drip)
+    set_tests_properties(mvfst_managed_server_drip PROPERTIES TIMEOUT 30)
 
     add_executable(test_mvfst_managed_server_multi tests/test_managed_server_multi.cpp)
     target_link_libraries(test_mvfst_managed_server_multi PRIVATE moq::adapter-mvfst mvfst::mvfst)
@@ -271,6 +282,26 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_managed_stream_credit COMMAND test_mvfst_managed_stream_credit)
     set_tests_properties(mvfst_managed_stream_credit PROPERTIES TIMEOUT 30)
 
+    # Application service-deadline fold: drives compute_earliest_deadline() (the
+    # shared source for the client deadline_to and server server_deadline_to
+    # reschedules) through the test-internals seam. No network.
+    add_executable(test_mvfst_managed_app_deadline tests/test_managed_app_deadline.cpp)
+    target_link_libraries(test_mvfst_managed_app_deadline PRIVATE
+        moq-adapter-mvfst-test-internals mvfst::mvfst)
+    add_test(NAME mvfst_managed_app_deadline COMMAND test_mvfst_managed_app_deadline)
+    set_tests_properties(mvfst_managed_app_deadline PROPERTIES TIMEOUT 30)
+
+    # Real-transport idle app-deadline: each EventBase one-shot timer (client
+    # deadline_to, server server_deadline_to) fires from the folded deadline and
+    # reschedules, with no manual wakes. Counts only deadline-driven pumps.
+    add_executable(test_mvfst_managed_app_deadline_timer
+        tests/test_managed_app_deadline_timer.cpp)
+    target_link_libraries(test_mvfst_managed_app_deadline_timer PRIVATE
+        moq::adapter-mvfst mvfst::mvfst)
+    add_test(NAME mvfst_managed_app_deadline_timer
+        COMMAND test_mvfst_managed_app_deadline_timer)
+    set_tests_properties(mvfst_managed_app_deadline_timer PROPERTIES TIMEOUT 40)
+
     # -- Build-tree consumer tests ------------------------------------
     # C-only consumer: configure + build against build-tree config.
     set(_c_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/c_consumer_test")
@@ -298,6 +329,27 @@ if(MOQ_BUILD_TESTS)
     set(_install_prefix "${CMAKE_CURRENT_BINARY_DIR}/install_test_prefix")
     set(_install_c_bin "${CMAKE_CURRENT_BINARY_DIR}/install_c_consumer_build")
     set(_install_cxx_bin "${CMAKE_CURRENT_BINARY_DIR}/install_cxx_consumer_build")
+
+    # The installed libmoq config re-runs find_package(mvfst) (-> fizz, folly,
+    # fmt, ...) in the consumer. Without guidance it rediscovers whatever those
+    # packages resolve to ambiently, which need not be the graph this build
+    # compiled against (e.g. a different fmt), and it loses this build's
+    # toolchain link context. Forward the exact package directories THIS build
+    # resolved plus its link flags so the consumer builds against the same graph
+    # and toolchain. Every value is a configured CMake variable (empty when a
+    # dep was found ambiently / no extra flags were set, so the forward is a
+    # no-op there) — never a hardcoded path. Each is emitted as ONE quoted
+    # argument so a value with spaces cannot split.
+    set(_fwd_pkg_dirs "")
+    foreach(_pkg mvfst folly Fizz fmt liboqs Sodium Boost Glog gflags)
+        if(DEFINED ${_pkg}_DIR AND NOT "${${_pkg}_DIR}" STREQUAL "")
+            string(APPEND _fwd_pkg_dirs "    \"-D${_pkg}_DIR=${${_pkg}_DIR}\"\n")
+        endif()
+    endforeach()
+    if(NOT "${CMAKE_EXE_LINKER_FLAGS}" STREQUAL "")
+        string(APPEND _fwd_pkg_dirs
+            "    \"-DCMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}\"\n")
+    endif()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_install_consumer_test.cmake"
         "# Build before install to ensure targets are up to date\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -319,6 +371,7 @@ if(MOQ_BUILD_TESTS)
         "    -B \"${_install_c_bin}\"\n"
         "    -DCMAKE_PREFIX_PATH=${_install_prefix}\n"
         "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
+        "${_fwd_pkg_dirs}"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"C consumer configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -332,6 +385,7 @@ if(MOQ_BUILD_TESTS)
         "    -B \"${_install_cxx_bin}\"\n"
         "    -DCMAKE_PREFIX_PATH=${_install_prefix}\n"
         "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
+        "${_fwd_pkg_dirs}"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"C++ consumer configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"

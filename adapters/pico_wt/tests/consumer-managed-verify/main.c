@@ -34,10 +34,14 @@ int main(void)
     moq_pico_wt_managed_cfg_t cfg;
     moq_pico_wt_managed_cfg_init(&cfg);
 
+    /* Both the pointer and sized inits stamp the full current struct. */
     if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
         return 1;
     if (cfg.alloc != NULL || cfg.on_pump != NULL)
         return 2;
+    moq_pico_wt_managed_cfg_init_sized(&cfg, sizeof(cfg));
+    if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
+        return 6;
 
     /* Wire the verifier the way a production WT client would. */
     cfg.insecure_skip_verify = false;

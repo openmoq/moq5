@@ -14,11 +14,13 @@
 
 /* -- Session helper ------------------------------------------------ */
 
-static moq_session_t *make_session(moq_perspective_t persp)
+static moq_session_t *make_session_scratch(moq_perspective_t persp,
+                                           uint32_t scratch_size)
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
     cfg.version = MOQ_VERSION_DRAFT_18;
+    if (scratch_size) cfg.output_scratch_size = scratch_size;
     moq_session_t *s = NULL;
     if (moq_session_create(&cfg, 0, &s) < 0) return NULL;
     if (moq_session_start(s, 0) < 0) { moq_session_destroy(s); return NULL; }
@@ -34,6 +36,11 @@ static moq_session_t *make_session(moq_perspective_t persp)
     moq_action_t a2;
     while (moq_session_poll_actions(s, &a2, 1) > 0) moq_action_cleanup(&a2);
     return s;
+}
+
+static moq_session_t *make_session(moq_perspective_t persp)
+{
+    return make_session_scratch(persp, 0);
 }
 
 /* Drain pending actions, returning the first OPEN_BIDI_STREAM ref. */
@@ -166,6 +173,174 @@ static bool feed_redirect_expect(moq_session_t *s, moq_stream_ref_t ref,
         moq_event_cleanup(&ev);
     }
     return got;
+}
+
+/* The composite REDIRECT shape used by the scratch-classification cases. */
+typedef struct {
+    moq_bytes_t uri;
+    const moq_bytes_t *parts;
+    size_t part_count;
+    moq_bytes_t name;
+    moq_bytes_t reason;
+} redirect_shape_t;
+
+/* REQUEST_ERROR(REDIRECT) carrying an arbitrary namespace and reason. */
+static size_t encode_redirect_shape(uint8_t *buf, size_t cap,
+                                    const redirect_shape_t *x, bool ns_scoped)
+{
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_d18_redirect_t rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.connect_uri = x->uri;
+    rd.track_namespace = (moq_namespace_t){ (moq_bytes_t *)x->parts,
+                                            x->part_count };
+    /* Namespace-scoped families require an empty Track Name (§10.6). */
+    if (!ns_scoped) rd.track_name = x->name;
+    moq_d18_encode_request_error_redirect(&w, MOQ_REQUEST_ERROR_REDIRECT, 7000,
+                                          x->reason, &rd);
+    return moq_buf_writer_offset(&w);
+}
+
+/* Leave a real scratch-bearing event queued: a server GOAWAY carrying a New
+ * Session URI, which the client copies into the event-scratch arena. The
+ * Request ID names one of the client's own outbound requests, so it carries
+ * client (even) parity. */
+static moq_result_t queue_goaway_uri(moq_session_t *s, const char *uri)
+{
+    uint8_t msg[256];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_result_t rc = moq_d18_encode_goaway(&w, (const uint8_t *)uri,
+                                            strlen(uri), 0, 100);
+    if (rc < 0) return rc;
+    return moq_session_on_control_bytes(s, msg, moq_buf_writer_offset(&w), 1);
+}
+
+/* The arena size at which every region up to but excluding the reason still
+ * fits beside `held` occupied bytes -- so the composite blocks in its last
+ * region. Computed here from the shape rather than read back from the session,
+ * so it is an independent statement of what the copy will consume. */
+static uint32_t cap_blocking_the_reason(size_t held, const redirect_shape_t *x,
+                                        bool ns_scoped)
+{
+    const size_t align = _Alignof(moq_bytes_t);
+    size_t c = held + x->uri.len;
+    if (x->part_count > 0) {
+        c += (align - (c & (align - 1))) & (align - 1);
+        c += x->part_count * sizeof(moq_bytes_t);
+        for (size_t i = 0; i < x->part_count; i++) c += x->parts[i].len;
+    }
+    if (!ns_scoped) c += x->name.len;
+    return (uint32_t)c;
+}
+
+/* Who owns `ref`, and in what state. NS_SUB keys its bidi in the namespace-sub
+ * index; every other family keys it in the request registry. `kind` is negative
+ * for the index-keyed case so the two never compare equal by accident. */
+typedef struct {
+    int      kind;
+    int      slot;
+    int      state;
+    uint32_t generation;
+} owner_snap_t;
+
+static owner_snap_t owner_snapshot(const moq_session_t *s,
+                                   moq_stream_ref_t ref, bool by_ns_index)
+{
+    owner_snap_t o = { 0, -1, -1, 0 };
+    if (by_ns_index) {
+        o.kind = -2;
+        o.slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v);
+        if (o.slot >= 0) {
+            o.state = (int)s->ns_subs[o.slot].state;
+            o.generation = s->ns_subs[o.slot].generation;
+        }
+        return o;
+    }
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    o.kind = (int)ep.kind;
+    o.slot = ep.slot;
+    switch (ep.kind) {
+    case MOQ_REQ_SUBSCRIPTION:
+        o.state = (int)s->subs[ep.slot].state;
+        o.generation = s->subs[ep.slot].generation;
+        break;
+    case MOQ_REQ_FETCH:
+        o.state = (int)s->fetches[ep.slot].state;
+        o.generation = s->fetches[ep.slot].generation;
+        break;
+    case MOQ_REQ_TRACK_STATUS:
+        o.state = (int)s->track_statuses[ep.slot].state;
+        o.generation = s->track_statuses[ep.slot].generation;
+        break;
+    case MOQ_REQ_ANNOUNCEMENT:
+        o.state = (int)s->announcements[ep.slot].state;
+        o.generation = s->announcements[ep.slot].generation;
+        break;
+    default:
+        break;
+    }
+    return o;
+}
+
+static int check_owner_unchanged(const owner_snap_t *before,
+                                 const owner_snap_t *after)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK_EQ_INT(after->kind, before->kind);
+    MOQ_TEST_CHECK_EQ_INT(after->slot, before->slot);
+    MOQ_TEST_CHECK_EQ_INT(after->state, before->state);
+    MOQ_TEST_CHECK_EQ_U64(after->generation, before->generation);
+    return failures;
+}
+
+/* Poll the queue and assert exactly one REQUEST_REDIRECT whose borrowed spans
+ * are byte-identical to `x`, inspected before the event is cleaned up. */
+static int expect_one_redirect(moq_session_t *s, const redirect_shape_t *x,
+                               moq_request_family_t fam, bool ns_scoped)
+{
+    int failures = 0;
+    int seen = 0;
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    while (moq_session_poll_events(s, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_REQUEST_REDIRECT) {
+            const moq_request_redirect_event_t *r = &ev.u.request_redirect;
+            seen++;
+            MOQ_TEST_CHECK_EQ_INT((int)r->family, (int)fam);
+            MOQ_TEST_CHECK_EQ_U64(r->error_code, MOQ_REQUEST_ERROR_REDIRECT);
+            MOQ_TEST_CHECK_EQ_U64(r->retry_after_ms, 7000);
+            MOQ_TEST_CHECK_EQ_SIZE(r->connect_uri.len, x->uri.len);
+            if (r->connect_uri.len == x->uri.len)
+                MOQ_TEST_CHECK(memcmp(r->connect_uri.data, x->uri.data,
+                                      x->uri.len) == 0);
+            MOQ_TEST_CHECK_EQ_SIZE(r->track_namespace.count, x->part_count);
+            if (r->track_namespace.count == x->part_count) {
+                for (size_t i = 0; i < x->part_count; i++) {
+                    MOQ_TEST_CHECK_EQ_SIZE(r->track_namespace.parts[i].len,
+                                           x->parts[i].len);
+                    if (r->track_namespace.parts[i].len == x->parts[i].len)
+                        MOQ_TEST_CHECK(memcmp(r->track_namespace.parts[i].data,
+                                              x->parts[i].data,
+                                              x->parts[i].len) == 0);
+                }
+            }
+            size_t want_name = ns_scoped ? 0 : x->name.len;
+            MOQ_TEST_CHECK_EQ_SIZE(r->track_name.len, want_name);
+            if (want_name && r->track_name.len == want_name)
+                MOQ_TEST_CHECK(memcmp(r->track_name.data, x->name.data,
+                                      want_name) == 0);
+            MOQ_TEST_CHECK_EQ_SIZE(r->reason.len, x->reason.len);
+            if (r->reason.len == x->reason.len)
+                MOQ_TEST_CHECK(memcmp(r->reason.data, x->reason.data,
+                                      x->reason.len) == 0);
+        }
+        moq_event_cleanup(&ev);
+        memset(&ev, 0, sizeof(ev));
+    }
+    MOQ_TEST_CHECK_EQ_INT(seen, 1);
+    return failures;
 }
 
 /* Drain actions; true iff a terminal REQUEST_ERROR(REDIRECT) was queued on `ref`. */
@@ -761,6 +936,267 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_session_reject_ns_sub(s, h, &rc_old, 1), (int)MOQ_OK);
         moq_session_destroy(s);
+    }
+
+    /* The five families whose request bidi can carry a REDIRECT, with the
+     * request kind each one keys under (NS_SUB keys outside the registry). */
+    static const struct {
+        moq_stream_ref_t (*open)(moq_session_t *);
+        moq_request_family_t fam;
+        moq_request_kind_t   kind;
+        bool ns_scoped;      /* Track Name must be empty */
+        bool by_ns_index;    /* NS_SUB keys its bidi outside the registry */
+    } k_fams[] = {
+        { open_subscribe,           MOQ_REQUEST_FAMILY_SUBSCRIBE,
+          MOQ_REQ_SUBSCRIPTION,  false, false },
+        { open_fetch,               MOQ_REQUEST_FAMILY_FETCH,
+          MOQ_REQ_FETCH,         false, false },
+        { open_track_status,        MOQ_REQUEST_FAMILY_TRACK_STATUS,
+          MOQ_REQ_TRACK_STATUS,  false, false },
+        { open_publish_namespace,   MOQ_REQUEST_FAMILY_ANNOUNCEMENT,
+          MOQ_REQ_ANNOUNCEMENT,  true,  false },
+        { open_subscribe_namespace, MOQ_REQUEST_FAMILY_NS_SUB,
+          MOQ_REQ_NONE,          true,  true  },
+    };
+
+    /* == The REDIRECT composite is weighed against the live arena ======
+     * The event stages four regions in order -- Connect URI, the aligned
+     * namespace array and its part bytes, Track Name, reason -- so a shape that
+     * fits an empty arena can still fail beside a queued event, in a region
+     * whose position depends on the alignment padding the earlier ones leave.
+     * Such a shape is retryable: the request keeps its owner, and once the
+     * queue drains an ordinary empty re-feed delivers it whole. */
+    {
+        static const char k_goaway_uri[] =
+            "wss://relocate.example.com/replacement-x";
+        /* Odd-length parts, so the array's padding depends on what precedes it. */
+        static const moq_bytes_t k_parts[3] = {
+            { (const uint8_t *)"alpha",  5 },
+            { (const uint8_t *)"bee",    3 },
+            { (const uint8_t *)"gamma7", 6 },
+        };
+        static const redirect_shape_t k_shape = {
+            .uri    = { (const uint8_t *)"https://relay-two.example/x", 27 },
+            .parts  = k_parts,
+            .part_count = 3,
+            .name   = { (const uint8_t *)"v2", 2 },
+            .reason = { (const uint8_t *)"moved", 5 },
+        };
+        for (size_t i = 0; i < sizeof(k_fams) / sizeof(k_fams[0]); i++) {
+            uint32_t cap = cap_blocking_the_reason(strlen(k_goaway_uri),
+                                                   &k_shape, k_fams[i].ns_scoped);
+            moq_session_t *s = make_session_scratch(MOQ_PERSPECTIVE_CLIENT, cap);
+            MOQ_TEST_CHECK(s != NULL);
+            moq_stream_ref_t ref = k_fams[i].open(s);
+
+            MOQ_TEST_CHECK_EQ_INT((int)queue_goaway_uri(s, k_goaway_uri),
+                                  (int)MOQ_OK);
+            size_t held = s->event_scratch_len;
+            MOQ_TEST_CHECK_EQ_SIZE(held, strlen(k_goaway_uri));
+
+            owner_snap_t before = owner_snapshot(s, ref, k_fams[i].by_ns_index);
+            MOQ_TEST_CHECK(before.slot >= 0);
+            if (!k_fams[i].by_ns_index)
+                MOQ_TEST_CHECK_EQ_INT(before.kind, (int)k_fams[i].kind);
+
+            uint8_t msg[512];
+            size_t n = encode_redirect_shape(msg, sizeof(msg), &k_shape,
+                                             k_fams[i].ns_scoped);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 2),
+                (int)MOQ_ERR_WOULD_BLOCK);
+            /* Nothing staged, and the owner is unmoved: same kind, same slot,
+             * same state, same generation. */
+            MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, held);
+            owner_snap_t after = owner_snapshot(s, ref, k_fams[i].by_ns_index);
+            failures += check_owner_unchanged(&before, &after);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_DRAINING);
+
+            /* The queued GOAWAY is the only event: no redirect was surfaced. */
+            int queued = 0;
+            moq_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            while (moq_session_poll_events(s, &ev, 1) > 0) {
+                queued++;
+                MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_GOAWAY);
+                moq_event_cleanup(&ev);
+                memset(&ev, 0, sizeof(ev));
+            }
+            MOQ_TEST_CHECK_EQ_INT(queued, 1);
+
+            /* Ordinary empty re-feed: the buffered envelope replays once. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, false, 3),
+                (int)MOQ_OK);
+            failures += expect_one_redirect(s, &k_shape, k_fams[i].fam,
+                                            k_fams[i].ns_scoped);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_DRAINING);
+            moq_session_destroy(s);
+        }
+    }
+
+    /* == A REDIRECT no arena could hold ends the session at once =======
+     * The close is reported as MOQ_OK, so each family handler must stop there:
+     * the session is already gone, and its teardown -- closing the send half,
+     * taking a drain ref, freeing or transitioning the entry -- must not run
+     * behind it. */
+    {
+        static const char k_goaway_uri[] = "wss://relocate.example.com/x";
+        static const moq_bytes_t k_parts[1] = { { (const uint8_t *)"alt", 3 } };
+        uint8_t big_reason[200];
+        memset(big_reason, 'r', sizeof(big_reason));
+        const redirect_shape_t shape = {
+            .uri    = { (const uint8_t *)"https://relay2", 14 },
+            .parts  = k_parts,
+            .part_count = 1,
+            .name   = { (const uint8_t *)"v2", 2 },
+            .reason = { big_reason, sizeof(big_reason) },
+        };
+
+        for (size_t i = 0; i < sizeof(k_fams) / sizeof(k_fams[0]); i++) {
+            moq_session_t *s = make_session_scratch(MOQ_PERSPECTIVE_CLIENT, 160);
+            MOQ_TEST_CHECK(s != NULL);
+            moq_stream_ref_t ref = k_fams[i].open(s);
+            MOQ_TEST_CHECK_EQ_INT((int)queue_goaway_uri(s, k_goaway_uri),
+                                  (int)MOQ_OK);
+            MOQ_TEST_CHECK(s->event_scratch_len > 0);   /* a real live cursor */
+            owner_snap_t before = owner_snapshot(s, ref, k_fams[i].by_ns_index);
+            MOQ_TEST_CHECK(before.slot >= 0);
+            size_t drains_before = s->drain_ref_count;
+
+            uint8_t msg[512];
+            size_t n = encode_redirect_shape(msg, sizeof(msg), &shape,
+                                             k_fams[i].ns_scoped);
+            /* A normal close reports MOQ_OK: the message was handled, by
+             * ending the session. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 2),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+
+            /* No teardown ran behind the close. */
+            owner_snap_t after = owner_snapshot(s, ref, k_fams[i].by_ns_index);
+            failures += check_owner_unchanged(&before, &after);
+            MOQ_TEST_CHECK_EQ_SIZE(s->drain_ref_count, drains_before);
+
+            /* Exactly one action, the session close -- no half-close write. */
+            int actions = 0;
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            while (moq_session_poll_actions(s, &a, 1) > 0) {
+                actions++;
+                MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+                if (a.kind == MOQ_ACTION_CLOSE_SESSION)
+                    MOQ_TEST_CHECK_EQ_U64(a.u.close_session.code, 0x1);
+                moq_action_cleanup(&a);
+                memset(&a, 0, sizeof(a));
+            }
+            MOQ_TEST_CHECK_EQ_INT(actions, 1);
+
+            /* Exactly one event, the terminal -- the redirect never surfaced. */
+            int events = 0;
+            moq_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            while (moq_session_poll_events(s, &ev, 1) > 0) {
+                events++;
+                MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SESSION_CLOSED);
+                moq_event_cleanup(&ev);
+                memset(&ev, 0, sizeof(ev));
+            }
+            MOQ_TEST_CHECK_EQ_INT(events, 1);
+            moq_session_destroy(s);
+        }
+    }
+
+    /* == Boundary shapes, driven straight at the emitter ===============
+     * The wire caps a namespace at the profile's part array, so the exact
+     * capacity, zero-part and overflowing-count shapes are stated directly. */
+    {
+        static const moq_bytes_t k_parts[2] = {
+            { (const uint8_t *)"one", 3 },
+            { (const uint8_t *)"twoo", 4 },
+        };
+        const uint8_t k_uri[]    = "https://r2";      /* 10 bytes */
+        const uint8_t k_name[]   = "v2";              /* 2 */
+        const uint8_t k_reason[] = "moved";           /* 5 */
+        moq_decoded_redirect_t rd;
+        memset(&rd, 0, sizeof(rd));
+        rd.connect_uri = k_uri;
+        rd.connect_uri_len = 10;
+        rd.track_namespace = (moq_namespace_t){ (moq_bytes_t *)k_parts, 2 };
+        rd.track_name = k_name;
+        rd.track_name_len = 2;
+
+        const size_t align = _Alignof(moq_bytes_t);
+        size_t need = 10;                                   /* URI */
+        need += (align - (need & (align - 1))) & (align - 1);
+        need += 2 * sizeof(moq_bytes_t) + 3 + 4;            /* array + parts */
+        need += 2 + 5;                                      /* name + reason */
+
+        /* Exactly enough from an empty arena: staged, not refused. */
+        {
+            moq_session_t *s = make_session_scratch(MOQ_PERSPECTIVE_CLIENT,
+                                                    (uint32_t)need);
+            MOQ_TEST_CHECK(s != NULL);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)session_core_emit_request_redirect(s,
+                    MOQ_REQUEST_FAMILY_SUBSCRIBE, 1, &rd,
+                    MOQ_REQUEST_ERROR_REDIRECT, true, 7000, k_reason, 5),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, need);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+            moq_session_destroy(s);
+        }
+
+        /* One byte short of it: permanent, so the session ends rather than
+         * waiting for a drain that could not help. */
+        {
+            moq_session_t *s = make_session_scratch(MOQ_PERSPECTIVE_CLIENT,
+                                                    (uint32_t)(need - 1));
+            MOQ_TEST_CHECK(s != NULL);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)session_core_emit_request_redirect(s,
+                    MOQ_REQUEST_FAMILY_SUBSCRIBE, 1, &rd,
+                    MOQ_REQUEST_ERROR_REDIRECT, true, 7000, k_reason, 5),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+            moq_session_destroy(s);
+        }
+
+        /* A zero-part namespace consumes no bytes and no padding: the exact
+         * sum of the three byte regions is enough. */
+        {
+            moq_decoded_redirect_t zero = rd;
+            zero.track_namespace = (moq_namespace_t){ NULL, 0 };
+            moq_session_t *s = make_session_scratch(MOQ_PERSPECTIVE_CLIENT,
+                                                    (uint32_t)(10 + 2 + 5));
+            MOQ_TEST_CHECK(s != NULL);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)session_core_emit_request_redirect(s,
+                    MOQ_REQUEST_FAMILY_SUBSCRIBE, 1, &zero,
+                    MOQ_REQUEST_ERROR_REDIRECT, true, 7000, k_reason, 5),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_SIZE(s->event_scratch_len, 10u + 2u + 5u);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+            moq_session_destroy(s);
+        }
+
+        /* A part count whose array size would overflow is rejected before the
+         * parts pointer it describes is ever read. */
+        {
+            moq_decoded_redirect_t huge = rd;
+            huge.track_namespace = (moq_namespace_t){ NULL,
+                SIZE_MAX / sizeof(moq_bytes_t) + 1 };
+            moq_session_t *s = make_session_scratch(MOQ_PERSPECTIVE_CLIENT, 0);
+            MOQ_TEST_CHECK(s != NULL);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)session_core_emit_request_redirect(s,
+                    MOQ_REQUEST_FAMILY_SUBSCRIBE, 1, &huge,
+                    MOQ_REQUEST_ERROR_REDIRECT, true, 7000, k_reason, 5),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+            moq_session_destroy(s);
+        }
     }
 
     MOQ_TEST_PASS("d18_redirect");

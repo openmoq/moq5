@@ -768,3 +768,96 @@ moq_version_t moq_proxygen_wt_managed_negotiated_version(
 }
 
 } /* extern "C" */
+
+#ifdef MOQ_PROXYGEN_WT_TESTING
+#include "wt_managed_testing.h"
+
+/* Test-only: start the managed facade over a caller-provided (fake) WebTransport
+ * instead of dialing. The network thread builds the session + attach Adapter
+ * exactly as connect_coro's tail does, then hands off to the PRODUCTION
+ * pump_once / schedule_pump_soon loop — so the 5 ms periodic pump this proves is
+ * the shipped one, only the CONNECT bootstrap is faked. Not shipped. */
+moq_proxygen_wt_managed_t *moq_proxygen_wt_test_start(
+    const moq_proxygen_wt_managed_cfg_t *cfg, proxygen::WebTransport *fake_wt)
+{
+    if (!cfg || !cfg->alloc || !CFG_HAS(cfg, on_pump) || !cfg->on_pump || !fake_wt)
+        return nullptr;
+    const moq_alloc_t *alloc = cfg->alloc;
+    auto *m = static_cast<moq_proxygen_wt_managed_t *>(
+        alloc->alloc(sizeof(moq_proxygen_wt_managed_t), alloc->ctx));
+    if (!m) return nullptr;
+    try {
+        new (m) moq_proxygen_wt_managed_t();
+        m->alloc = *alloc;
+        m->on_pump = cfg->on_pump;
+        m->on_activity = CFG_HAS(cfg, on_activity) ? cfg->on_activity : nullptr;
+        m->user_ctx = CFG_HAS(cfg, user_ctx) ? cfg->user_ctx : nullptr;
+        if (CFG_HAS(cfg, send_request_capacity))
+            m->send_request_capacity = cfg->send_request_capacity;
+        if (CFG_HAS(cfg, initial_request_capacity))
+            m->initial_request_capacity = cfg->initial_request_capacity;
+    } catch (...) {
+        alloc->free(m, sizeof(moq_proxygen_wt_managed_t), alloc->ctx);
+        return nullptr;
+    }
+
+    m->running.store(true);
+    try {
+        m->thread = std::make_unique<std::thread>([m, fake_wt]() {
+            m->net_tid = std::this_thread::get_id();
+            moq_session_cfg_t scfg;
+            moq_session_cfg_init_sized(&scfg, sizeof(scfg), &m->alloc,
+                                       MOQ_PERSPECTIVE_CLIENT);
+            scfg.send_request_capacity = m->send_request_capacity;
+            scfg.initial_request_capacity = m->initial_request_capacity;
+            moq_session_t *s = nullptr;
+            if (moq_session_create(&scfg, now_us_steady(), &s) < 0) {
+                m->running.store(false);
+                m->signal_init(MOQ_ERR_INTERNAL);
+                return;
+            }
+            moq::wt::Adapter::Config acfg{};
+            acfg.session = s;
+            acfg.alloc = &m->alloc;
+            acfg.executor = &m->evb;       /* same executor as production */
+            acfg.now_us = now_us_steady;
+            auto a = moq::wt::Adapter::create(acfg, fake_wt);
+            if (!a) {
+                moq_session_destroy(s);
+                m->running.store(false);
+                m->signal_init(MOQ_ERR_INTERNAL);
+                return;
+            }
+            m->adapter = std::move(a);
+            m->session.store(s);
+            moq_session_start(s, now_us_steady());
+            m->signal_init(MOQ_OK);
+            m->schedule_pump_soon();       /* kick the production periodic pump */
+            m->evb.loopForever();
+            /* teardown mirrors create(): the fake WT (caller-owned) outlives it */
+            m->adapter.reset();
+            if (auto *ss = m->session.exchange(nullptr)) moq_session_destroy(ss);
+            m->evb.loop();
+            m->thread_exited.store(true);
+            m->mark_activity();
+        });
+    } catch (...) {
+        m->running.store(false);
+        m->~moq_proxygen_wt_managed_t();
+        alloc->free(m, sizeof(moq_proxygen_wt_managed_t), alloc->ctx);
+        return nullptr;
+    }
+
+    { std::unique_lock<std::mutex> lk(m->init_mu);
+      m->init_cv.wait(lk, [m]() { return m->init_done.load(); }); }
+    if (m->init_result.load() < 0) {
+        m->running.store(false);
+        m->evb.terminateLoopSoon();
+        if (m->thread && m->thread->joinable()) m->thread->join();
+        m->~moq_proxygen_wt_managed_t();
+        alloc->free(m, sizeof(moq_proxygen_wt_managed_t), alloc->ctx);
+        return nullptr;
+    }
+    return m;
+}
+#endif /* MOQ_PROXYGEN_WT_TESTING */

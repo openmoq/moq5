@@ -71,6 +71,64 @@ nor `TESTCASE`) the client runs every case and exits 0 as long as it ran;
 per-case pass/fail is in the TAP. `--draft` / `MOQT_DRAFT` must be exactly `16`
 or `18`.
 
+## Backend selection (testing)
+
+`--backend NAME` (or `MOQT_BACKEND`; the flag wins over the environment) pins
+the transport backend so the same suite can exercise libmoq's own adapters. It
+is a testing knob, not part of the interop-runner interface, and defaults to
+`auto` (the picoquic family). Each backend is transport-restricted; the client
+cross-checks the name against the URL scheme and rejects a mismatch up front:
+
+| `--backend` | Transport | Notes |
+|---|---|---|
+| `auto` | raw QUIC + WebTransport | picoquic family (default) |
+| `picoquic` | raw QUIC + WebTransport | |
+| `msquic` | raw QUIC only | exact-version — pin `--draft 16`/`18` (a single ALPN) |
+| `mvfst` | raw QUIC only | exact-version; when compiled in |
+| `proxygen` | WebTransport only | when compiled in |
+| `wtquic-msquic` | WebTransport only | WebTransport over MsQuic (cross-platform) |
+| `wtquic-network` | WebTransport only | **experimental** — WebTransport over Apple Network.framework; unreliable against eager third-party relays |
+
+Bare `wtquic` is **not** accepted (it names no upstream transport). A backend
+that is not compiled into the build is rejected at connect with
+`MOQ_ERR_UNSUPPORTED` — the resolver never silently falls back to picoquic.
+
+The TAP stream names the exercised backend, WebTransport profile, and draft:
+`# request: backend=… wt-profile=… draft=…` up front (visible even when the
+connection fails), and `# negotiated: draft-N over TRANSPORT (backend: …)` once
+setup completes.
+
+### WebTransport profile (`--wt-profile`)
+
+`--wt-profile NAME` (or `MOQT_WT_PROFILE`; the flag wins) selects the
+WebTransport-over-HTTP/3 wire dialect for the **wtquic-msquic** backend. The two
+dialects are mutually exclusive and never auto-negotiated:
+
+| `--wt-profile` | extended CONNECT `:protocol` | peers |
+|---|---|---|
+| `current` (default) | `webtransport-h3` (current WebTransport-H3 draft) | e.g. imquic |
+| `d13-14` | `webtransport` (drafts 13/14 + max-sessions signal) | proxygen/moxygen/moqx and the picoquic h3zero family |
+
+It is **rejected** for any other backend (`picoquic` has a fixed WebTransport
+dialect; raw-QUIC `msquic`/`mvfst` have no WebTransport) rather than silently
+ignored. In the TAP `# request:` identity, those backends report their truthful
+dialect — `native` for a fixed-dialect WebTransport backend, `n/a` for raw QUIC —
+never a `current`/`d13-14` they did not speak.
+
+```
+# Direct MsQuic, raw QUIC, draft 18:
+moq-interop-client --backend msquic --draft 18 --relay moqt://relay:4443 --test setup-only
+
+# WebTransport over MsQuic against a proxygen/moxygen/moqx-style relay:
+moq-interop-client --backend wtquic-msquic --wt-profile d13-14 --relay https://relay:4443/ --test setup-only
+```
+
+To build a native matrix binary that has every backend compiled in, enable the
+adapters explicitly (each requires its dependency): `MOQ_BUILD_PQ_THREADED`,
+`MOQ_BUILD_PICO_WT_MANAGED`, `MOQ_BUILD_MSQUIC_MANAGED`,
+`MOQ_BUILD_WTQUIC_MSQUIC_MANAGED`, `MOQ_BUILD_WTQUIC_NETWORK_MANAGED`, alongside
+`MOQ_BUILD_SERVICE` and `MOQ_BUILD_INTEROP_CLIENT`.
+
 ### Docker
 
 ```

@@ -120,11 +120,13 @@ struct server_state {
     std::atomic<bool> may_goaway{false};
 };
 
-static int server_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int server_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     auto *ss = static_cast<server_state *>(ctx);
     moq_mvfst_conn_t *conn = nullptr;
-    while ((conn = moq_mvfst_managed_next_conn(m, conn)) != nullptr) {
+    while ((conn = moq_mvfst_lane_next_conn(lane, conn)) != nullptr) {
         moq_session_t *s = moq_mvfst_conn_session(conn);
         if (!s) continue;
         moq_event_t ev[16]; size_t ne;
@@ -146,8 +148,10 @@ struct client_state {
     std::atomic<bool> setup_complete{false};
 };
 
-static int client_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     auto *cs = static_cast<client_state *>(ctx);
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -181,7 +185,7 @@ static void test_goaway_drain_timeout()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = server_pump;
+    scfg.on_lane_pump = server_pump;
     scfg.user_ctx = &ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -201,7 +205,7 @@ static void test_goaway_drain_timeout()
     ccfg.host = "127.0.0.1";
     ccfg.port = port;
     ccfg.insecure_skip_verify = true;
-    ccfg.on_pump = client_pump;
+    ccfg.on_lane_pump = client_pump;
     ccfg.user_ctx = &cs;
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 16;

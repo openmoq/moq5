@@ -4,6 +4,7 @@
 #include <moq/codec.h>
 #include <moq/control.h>
 #include "test_session_support.h"
+#include "../../core/src/wire/control_d18_internal.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -472,7 +473,7 @@ static void test_datagram_object_received(void) {
 
     moq_rcbuf_t *pay = NULL;
     moq_rcbuf_create(&alloc, (const uint8_t *)"dgdata", 6, &pay);
-    moq_pub_object_cfg_t obj; moq_pub_object_cfg_init(&obj);
+    moq_pub_object_cfg_t obj; moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
     obj.group_id = 1;
     obj.object_id = 0;
     obj.payload = pay;
@@ -526,7 +527,7 @@ static void test_status_datagram_received(void) {
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     moq_sub_tick(sub, moq_simpair_now_us(sp));
 
-    moq_pub_object_cfg_t obj; moq_pub_object_cfg_init(&obj);
+    moq_pub_object_cfg_t obj; moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
     obj.group_id = 0;
     obj.object_id = 0;
     obj.datagram = true;
@@ -578,7 +579,7 @@ static void test_datagram_with_properties(void) {
     moq_rcbuf_t *pay = NULL, *props = NULL;
     moq_rcbuf_create(&alloc, (const uint8_t *)"body", 4, &pay);
     moq_rcbuf_create(&alloc, (const uint8_t *)"\x01\x01\xAA", 3, &props);
-    moq_pub_object_cfg_t obj; moq_pub_object_cfg_init(&obj);
+    moq_pub_object_cfg_t obj; moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
     obj.group_id = 0; obj.object_id = 0;
     obj.payload = pay; obj.properties = props;
     obj.datagram = true;
@@ -636,12 +637,12 @@ static void test_pending_retry_with_properties(void) {
     moq_rcbuf_create(&alloc, (const uint8_t *)"obj2", 4, &p2);
     moq_rcbuf_create(&alloc, (const uint8_t *)"\x01\x01\xBB", 3, &props);
 
-    moq_pub_object_cfg_t o1; moq_pub_object_cfg_init(&o1);
+    moq_pub_object_cfg_t o1; moq_pub_object_cfg_init_sized(&o1, sizeof(o1));
     o1.group_id = 0; o1.object_id = 0;
     o1.payload = p1; o1.datagram = true;
     moq_pub_write_object_ex(pub, ptrack, &o1, moq_simpair_now_us(sp));
 
-    moq_pub_object_cfg_t o2; moq_pub_object_cfg_init(&o2);
+    moq_pub_object_cfg_t o2; moq_pub_object_cfg_init_sized(&o2, sizeof(o2));
     o2.group_id = 0; o2.object_id = 1;
     o2.payload = p2; o2.properties = props; o2.datagram = true;
     moq_pub_write_object_ex(pub, ptrack, &o2, moq_simpair_now_us(sp));
@@ -781,12 +782,12 @@ static void test_object_byte_budget_with_properties(void) {
     moq_rcbuf_create(&alloc, (const uint8_t *)"55555", 5, &p2);
     moq_rcbuf_create(&alloc, (const uint8_t *)"\x01\x01\xAA", 3, &props);
 
-    moq_pub_object_cfg_t o1; moq_pub_object_cfg_init(&o1);
+    moq_pub_object_cfg_t o1; moq_pub_object_cfg_init_sized(&o1, sizeof(o1));
     o1.group_id = 0; o1.object_id = 0;
     o1.payload = p1; o1.properties = props; o1.datagram = true;
     moq_pub_write_object_ex(pub, ptrack, &o1, moq_simpair_now_us(sp));
 
-    moq_pub_object_cfg_t o2; moq_pub_object_cfg_init(&o2);
+    moq_pub_object_cfg_t o2; moq_pub_object_cfg_init_sized(&o2, sizeof(o2));
     o2.group_id = 0; o2.object_id = 1;
     o2.payload = p2; o2.datagram = true;
     moq_pub_write_object_ex(pub, ptrack, &o2, moq_simpair_now_us(sp));
@@ -2886,14 +2887,16 @@ static void test_update_error_clears_pending(void) {
     MOQ_TEST_CHECK(moq_session_state(moq_simpair_client(sp))
         == MOQ_SESS_ESTABLISHED);
 
-    /* After error clears pending, another update succeeds. */
+    /* the rejection FAILS the subscription (shared state machine,
+     * both drafts) -- no further update until the mandatory
+     * PUBLISH_DONE(UPDATE_FAILED) terminal. */
     ucfg.subscriber_priority = 100;
     MOQ_TEST_CHECK_EQ_INT(moq_sub_update_subscription(sub, track, &ucfg,
-        moq_simpair_now_us(sp)), MOQ_OK);
+        moq_simpair_now_us(sp)), MOQ_ERR_WRONG_STATE);
 
     teardown_update_test(sub, pub, sp);
     MOQ_TEST_CHECK(as.balance == 0);
-    MOQ_TEST_PASS("update_error_clears_pending");
+    MOQ_TEST_PASS("update_error_fails_subscription");
 }
 
 static void test_update_invalid_states(void) {
@@ -3620,7 +3623,421 @@ static void test_goaway_old_callback_struct_size(void) {
     MOQ_TEST_PASS("goaway_old_callback_struct_size");
 }
 
+
+/* ==================================================================== *
+ *  Update acknowledgments + filter forwarding                          *
+ * ==================================================================== */
+
+typedef struct {
+    int      ok_n;
+    moq_sub_track_t *ok_track;
+    uint32_t res_struct_size;
+    bool     has_largest;
+    uint64_t largest_group, largest_object;
+    bool     has_expires;
+    uint64_t expires_ms;
+    int      done_n;
+    uint64_t done_status;
+} s4_upd_state_t;
+
+static void s4_on_update_ok(void *ctx, moq_sub_track_t *track,
+                            const moq_sub_update_result_t *result)
+{
+    s4_upd_state_t *st = (s4_upd_state_t *)ctx;
+    st->ok_n++;
+    st->ok_track = track;
+    st->res_struct_size = result->struct_size;
+    st->has_largest = result->has_largest;
+    st->largest_group = result->largest_group;
+    st->largest_object = result->largest_object;
+    st->has_expires = result->has_expires;
+    st->expires_ms = result->expires_ms;
+}
+
+static void s4_on_done(void *ctx, moq_sub_track_t *track,
+                       uint64_t status_code)
+{
+    s4_upd_state_t *st = (s4_upd_state_t *)ctx;
+    (void)track;
+    st->done_n++;
+    st->done_status = status_code;
+}
+
+/* Success exactly once, Largest passthrough, and the WRONG_STATE window. */
+static void test_s4_update_ok_callback(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *ptrack;
+    setup_pair(&as, &alloc, &sp, &pub, &ptrack);
+    moq_session_t *sv = moq_simpair_server(sp);
+
+    /* Seed publisher-side history so the acknowledgment carries Largest. */
+    {
+        moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("test") };
+        moq_namespace_t nns = { ns, 1 };
+        MOQ_TEST_CHECK(moq_session_note_object_published(sv, &nns,
+            MOQ_BYTES_LITERAL("video"), 6, 4) == MOQ_OK);
+    }
+
+    sub_cb_state_t cbs = {0};
+    s4_upd_state_t ust = {0};
+    moq_sub_cfg_t cfg; moq_sub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.callbacks.ctx = &ust;   /* shared ctx for the appended callback */
+    cfg.callbacks.on_subscribed = NULL;
+    (void)cbs;
+    cfg.on_update_ok = s4_on_update_ok;
+
+    moq_subscriber_t *sub = NULL;
+    MOQ_TEST_CHECK(moq_sub_create(moq_simpair_client(sp), &alloc,
+        &cfg, &sub) == MOQ_OK);
+    moq_sub_track_cfg_t tcfg; moq_sub_track_cfg_init(&tcfg);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("test") };
+    tcfg.track_namespace.parts = ns;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_sub_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_sub_subscribe(sub, &tcfg,
+        moq_simpair_now_us(sp), &track) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_pub_tick(pub, moq_simpair_now_us(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+
+    /* Send a filter update through the facade cfg (sized init). */
+    moq_sub_update_cfg_t ucfg;
+    moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+    ucfg.has_filter = true;
+    ucfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    ucfg.start_group = 1; ucfg.start_object = 0;
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    /* One outstanding update per track. */
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_ERR_WRONG_STATE);
+
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 1);
+    MOQ_TEST_CHECK(ust.ok_track == track);
+    MOQ_TEST_CHECK_EQ_U64(ust.res_struct_size,
+                          (uint64_t)sizeof(moq_sub_update_result_t));
+    MOQ_TEST_CHECK(ust.has_largest);
+    MOQ_TEST_CHECK_EQ_U64(ust.largest_group, 6);
+    MOQ_TEST_CHECK_EQ_U64(ust.largest_object, 4);
+    MOQ_TEST_CHECK(!ust.has_expires);   /* d16 never carries EXPIRES */
+
+    /* Exactly once: further ticks fire nothing. */
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 1);
+
+    /* A second update is legal after the ack and fires its own callback. */
+    moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+    ucfg.has_subscriber_priority = true;
+    ucfg.subscriber_priority = 7;
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 2);
+
+    moq_sub_destroy(sub);
+    moq_pub_destroy(pub);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("s4_update_ok_callback");
+}
+
+/* Rejection: on_update_ok never fires; the terminal surfaces the
+ * update-failure status through on_subscribe_done. */
+static void test_s4_update_rejected(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *ptrack;
+    setup_pair(&as, &alloc, &sp, &pub, &ptrack);
+    moq_session_t *cl = moq_simpair_client(sp);
+
+    s4_upd_state_t ust = {0};
+    moq_sub_cfg_t cfg; moq_sub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.callbacks.ctx = &ust;
+    cfg.on_update_ok = s4_on_update_ok;
+    cfg.on_subscribe_done = s4_on_done;
+
+    moq_subscriber_t *sub = NULL;
+    MOQ_TEST_CHECK(moq_sub_create(cl, &alloc, &cfg, &sub) == MOQ_OK);
+    moq_sub_track_cfg_t tcfg; moq_sub_track_cfg_init(&tcfg);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("test") };
+    tcfg.track_namespace.parts = ns;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_sub_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_sub_subscribe(sub, &tcfg,
+        moq_simpair_now_us(sp), &track) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_pub_tick(pub, moq_simpair_now_us(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+
+    moq_sub_update_cfg_t ucfg;
+    moq_sub_update_cfg_init(&ucfg);   /* v0 pointer init: prefix update */
+    ucfg.has_forward = true; ucfg.forward = false;
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+
+    /* Learn the update's request id, DISCARD the outbound bytes (the peer
+     * "rejects" instead), and inject REQUEST_ERROR at the client. */
+    uint64_t upd_rid = 0;
+    {
+        moq_action_t a;
+        while (moq_session_poll_actions(cl, &a, 1) == 1) {
+            if (a.kind == MOQ_ACTION_SEND_CONTROL) {
+                moq_control_envelope_t env; moq_buf_reader_t r;
+                moq_buf_reader_init(&r, a.u.send_control.data,
+                                    a.u.send_control.len);
+                if (moq_control_decode_envelope(&r, &env) == MOQ_OK &&
+                    env.msg_type == MOQ_D16_REQUEST_UPDATE) {
+                    moq_kvp_entry_t params[4];
+                    moq_d16_request_update_t upd = {
+                        .params = params, .params_cap = 4 };
+                    if (moq_d16_decode_request_update(env.payload,
+                            env.payload_len, &upd) == MOQ_OK)
+                        upd_rid = upd.request_id;
+                }
+            }
+            moq_action_cleanup(&a);
+        }
+    }
+    MOQ_TEST_CHECK(upd_rid != 0);
+    {
+        uint8_t buf[64]; moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        moq_bytes_t reason = MOQ_BYTES_LITERAL("no");
+        MOQ_TEST_CHECK(moq_d16_encode_request_error(&w, upd_rid, 0x0, 0,
+            reason.data, reason.len) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_control_bytes(cl, buf,
+            moq_buf_writer_offset(&w),
+            moq_simpair_now_us(sp)) == MOQ_OK);
+    }
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 0);   /* success callback never fires */
+    /* Further updates refuse until the mandatory terminal. */
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_ERR_WRONG_STATE);
+    /* The mandatory PUBLISH_DONE(UPDATE_FAILED) surfaces status 0x8
+     * exactly once through on_subscribe_done. */
+    {
+        uint8_t db[64]; moq_buf_writer_t dw;
+        moq_buf_writer_init(&dw, db, sizeof(db));
+        moq_session_t *cls = moq_simpair_client(sp);
+        uint64_t sub_rid = 0;
+        for (size_t i = 0; i < cls->sub_cap; i++)
+            if (cls->subs[i].state == MOQ_SUB_ESTABLISHED)
+                sub_rid = cls->subs[i].request_id;
+        MOQ_TEST_CHECK(moq_d16_encode_publish_done(&dw, sub_rid, 0x8, 0,
+                                                   NULL, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_control_bytes(cls, db,
+            moq_buf_writer_offset(&dw), moq_simpair_now_us(sp)) == MOQ_OK);
+    }
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.done_n, 1);
+    MOQ_TEST_CHECK_EQ_U64(ust.done_status, 0x8);
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 0);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.done_n, 1);   /* exactly once */
+
+    moq_sub_destroy(sub);
+    moq_pub_destroy(pub);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("s4_update_rejected");
+}
+
+/* ABI: exact-104 poisoned-tail sub cfg never enables the callback; the
+ * facade still drains acknowledgment events without one. */
+static void test_s4_sub_cfg_canary(void) {
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *ptrack;
+    setup_pair(&as, &alloc, &sp, &pub, &ptrack);
+
+    const size_t old_size = offsetof(moq_sub_cfg_t, on_update_ok);
+    uint8_t *raw = (uint8_t *)malloc(old_size);
+    MOQ_TEST_CHECK(raw != NULL);
+    memset(raw, 0xAA, old_size);
+    {
+        moq_sub_cfg_t tmp; moq_sub_cfg_init_sized(&tmp, sizeof(tmp));
+        tmp.max_tracks = 4; tmp.max_objects = 8;
+        memcpy(raw, &tmp, old_size);
+        uint32_t ss = (uint32_t)old_size;
+        memcpy(raw + offsetof(moq_sub_cfg_t, struct_size), &ss, sizeof(ss));
+    }
+    moq_subscriber_t *sub = NULL;
+    MOQ_TEST_CHECK(moq_sub_create(moq_simpair_client(sp), &alloc,
+        (const moq_sub_cfg_t *)(const void *)raw, &sub) == MOQ_OK);
+    free(raw);
+
+    moq_sub_track_cfg_t tcfg; moq_sub_track_cfg_init(&tcfg);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("test") };
+    tcfg.track_namespace.parts = ns;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_sub_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_sub_subscribe(sub, &tcfg,
+        moq_simpair_now_us(sp), &track) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_pub_tick(pub, moq_simpair_now_us(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+
+    /* An update on the old-cfg subscriber: the acknowledgment event is
+     * DRAINED without a callback (no stall, no crash, no poisoned read). */
+    moq_sub_update_cfg_t ucfg; moq_sub_update_cfg_init(&ucfg);
+    ucfg.has_subscriber_priority = true; ucfg.subscriber_priority = 3;
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK(moq_sub_tick(sub, moq_simpair_now_us(sp)) == MOQ_OK);
+    /* A second update proves the first ack was consumed. */
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+
+    moq_sub_destroy(sub);
+    moq_pub_destroy(pub);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("s4_sub_cfg_canary");
+}
+
+
+/* d18: nonzero EXPIRES reaches the callback, and a backpressured ack
+ * (client event queue full at arrival) is retried -- the callback fires
+ * EXACTLY ONCE, after the queue drains and the buffered input redrives. */
+static void test_s4_update_ok_d18_expires_backpressure(void) {
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_cfg_t scfg2 = MOQ_SIMPAIR_CFG_INIT;
+    scfg2.alloc = &alloc; scfg2.seed = 42; scfg2.initial_now_us = 1000;
+    scfg2.client_send_request_capacity = true;
+    scfg2.client_initial_request_capacity = 16;
+    scfg2.server_send_request_capacity = true;
+    scfg2.server_initial_request_capacity = 16;
+    scfg2.version = MOQ_VERSION_DRAFT_18;
+    scfg2.max_events = 2;             /* tiny event queues: forces deferral */
+    moq_simpair_t *sp = NULL;
+    moq_simpair_create(&scfg2, &sp);
+    moq_simpair_start(sp);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_session_t *cl = moq_simpair_client(sp);
+    moq_session_t *sv = moq_simpair_server(sp);
+    { moq_event_t ev;
+      while (moq_session_poll_events(cl, &ev, 1) == 1) moq_event_cleanup(&ev);
+      while (moq_session_poll_events(sv, &ev, 1) == 1) moq_event_cleanup(&ev); }
+
+    moq_pub_cfg_t pcfg; moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
+    pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    moq_pub_create(sv, &alloc, &pcfg, &pub);
+    moq_pub_track_cfg_t ptc; moq_pub_track_cfg_init(&ptc);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("test") };
+    ptc.track_namespace.parts = ns; ptc.track_namespace.count = 1;
+    ptc.track_name = MOQ_BYTES_LITERAL("video");
+    moq_pub_track_t *ptrack = NULL;
+    moq_pub_add_track(pub, &ptc, moq_simpair_now_us(sp), &ptrack);
+
+    s4_upd_state_t ust = {0};
+    moq_sub_cfg_t cfg; moq_sub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.callbacks.ctx = &ust;
+    cfg.on_update_ok = s4_on_update_ok;
+    moq_subscriber_t *sub = NULL;
+    MOQ_TEST_CHECK(moq_sub_create(cl, &alloc, &cfg, &sub) == MOQ_OK);
+    moq_sub_track_cfg_t tcfg; moq_sub_track_cfg_init(&tcfg);
+    tcfg.track_namespace.parts = ns; tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_sub_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_sub_subscribe(sub, &tcfg,
+        moq_simpair_now_us(sp), &track) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_pub_tick(pub, moq_simpair_now_us(sp));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+
+    /* Send the update; DISCARD the outbound bytes (the crafted ack below
+     * plays the peer) but learn the request bidi ref from the action. */
+    moq_sub_update_cfg_t ucfg;
+    moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+    ucfg.has_filter = true;
+    ucfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &ucfg,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_stream_ref_t bref = moq_stream_ref_from_u64(0);
+    { moq_action_t a;
+      while (moq_session_poll_actions(cl, &a, 1) == 1) {
+          if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM)
+              bref = a.u.send_bidi_stream.stream_ref;
+          moq_action_cleanup(&a);
+      } }
+    MOQ_TEST_CHECK(bref._v != 0);
+
+    /* Fill the client event queue (cap 2) with datagram deliveries. */
+    {
+        uint8_t d[2] = { 0x51, 0x52 };
+        moq_rcbuf_t *pl = NULL; moq_rcbuf_create(&alloc, d, sizeof(d), &pl);
+        moq_pub_object_cfg_t oc; moq_pub_object_cfg_init(&oc);
+        oc.group_id = 1; oc.object_id = 0; oc.payload = pl;
+        oc.datagram = true;
+        MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, ptrack, &oc,
+            moq_simpair_now_us(sp)) == MOQ_OK);
+        oc.object_id = 1;
+        MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, ptrack, &oc,
+            moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_rcbuf_decref(pl);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+    }
+
+    /* Craft REQUEST_UPDATE_OK with LARGEST {8,2} + EXPIRES 4500ms; the
+     * full client event queue DEFERS the ack (buffered, pending kept). */
+    {
+        uint8_t ok[64]; moq_buf_writer_t w;
+        moq_buf_writer_init(&w, ok, sizeof(ok));
+        moq_d18_msg_params_t p; memset(&p, 0, sizeof(p));
+        p.has_largest = true;
+        p.largest_group = 8; p.largest_object = 2;
+        p.has_expires = true; p.expires_ms = 4500;
+        MOQ_TEST_CHECK(moq_d18_encode_request_update_ok(&w, &p) == MOQ_OK);
+        /* The full event queue MUST defer the ack: exactly WOULD_BLOCK
+         * (accepting MOQ_OK would let fixture drift silently remove the
+         * backpressured path this test exists for). */
+        MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, bref, ok,
+            moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp))
+            == MOQ_ERR_WOULD_BLOCK);
+    }
+    /* Tick drains the two object events; the ack has NOT fired yet (it is
+     * still buffered input awaiting a redrive). */
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 0);
+
+    /* Redrive the buffered bidi input; the next tick fires EXACTLY ONCE
+     * with the crafted scalars. */
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(cl, bref, NULL, 0,
+        false, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 1);
+    MOQ_TEST_CHECK(ust.has_largest);
+    MOQ_TEST_CHECK_EQ_U64(ust.largest_group, 8);
+    MOQ_TEST_CHECK_EQ_U64(ust.largest_object, 2);
+    MOQ_TEST_CHECK(ust.has_expires);
+    MOQ_TEST_CHECK_EQ_U64(ust.expires_ms, 4500);
+    moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK_EQ_INT(ust.ok_n, 1);   /* no duplicate */
+
+    moq_sub_destroy(sub);
+    moq_pub_destroy(pub);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("s4_update_ok_d18_expires_backpressure");
+}
+
 int main(void) {
+    test_s4_update_ok_callback();
+    test_s4_update_rejected();
+    test_s4_update_ok_d18_expires_backpressure();
+    test_s4_sub_cfg_canary();
     test_subscribe_accepted();
     test_subscribe_rejected();
     test_object_received();

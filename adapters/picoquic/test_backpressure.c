@@ -88,12 +88,67 @@ int picoquic_queue_datagram_frame(picoquic_cnx_t *c, size_t len,
     { (void)c; (void)len; (void)d; return 0; }
 /* The endpoint's DATAGRAM honesty gate reads the peer's negotiated max via
  * this; report a nonzero capability so the datagram dispatch path is exercised
- * (not refused by the gate). */
+ * (not refused by the gate). The per-stream backpressure code reads the LOCAL
+ * (get_local=1) initial_max_stream_data_* to size its window budget. */
+static uint64_t g_rx_window = 65535;        /* uni streams */
+static uint64_t g_rx_window_bidi_remote = 0; /* peer-initiated bidi (0 = uni value) */
+static uint64_t g_rx_window_bidi_local = 0;  /* locally-initiated bidi (0 = uni value) */
+static bool g_tp_null = false;               /* TPs unreadable -> fail closed */
 picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c,
     int get_local)
     { (void)c; (void)get_local; static picoquic_tp_t tp;
+      if (g_tp_null) return NULL;
       memset(&tp, 0, sizeof(tp)); tp.max_datagram_frame_size = 1252;
+      tp.initial_max_stream_data_uni = g_rx_window;
+      tp.initial_max_stream_data_bidi_remote =
+          g_rx_window_bidi_remote ? g_rx_window_bidi_remote : g_rx_window;
+      tp.initial_max_stream_data_bidi_local =
+          g_rx_window_bidi_local ? g_rx_window_bidi_local : g_rx_window;
       return &tp; }
+
+/* -- Per-stream receive flow-control instrumentation ----------------- *
+ * Records the adapter's picoquic_set_app_flow_control / open_flow_control calls
+ * so tests can assert credit is frozen while pending and released after service.
+ * Keyed by stream id; small fixed table is plenty for the test streams. */
+#define FC_MAX 32
+static struct { uint64_t sid; int use; int set_calls;
+                int open_calls; uint64_t open_total; } g_fc[FC_MAX];
+static int g_fc_n = 0;
+static int fc_slot(uint64_t sid)
+    { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return i;
+      if (g_fc_n < FC_MAX) { g_fc[g_fc_n].sid = sid; g_fc[g_fc_n].use = -1;
+          return g_fc_n++; } return 0; }
+static void fc_reset(void) { memset(g_fc, 0, sizeof(g_fc)); g_fc_n = 0; }
+static int fc_use(uint64_t sid)     /* last app-flow-control flag, -1 if untouched */
+    { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].use;
+      return -1; }
+static int fc_open_calls(uint64_t sid)
+    { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].open_calls;
+      return 0; }
+static uint64_t fc_open_total(uint64_t sid)
+    { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].open_total;
+      return 0; }
+static bool g_set_fc_fail = false;   /* failure injection (FC errors */
+static bool g_open_fc_fail = false;  /* must be fatal, not silently ignored)  */
+int picoquic_set_app_flow_control(picoquic_cnx_t *c, uint64_t sid, int use)
+    { (void)c; if (g_set_fc_fail) return -1;
+      int s = fc_slot(sid); g_fc[s].use = use; g_fc[s].set_calls++;
+      return 0; }
+int picoquic_open_flow_control(picoquic_cnx_t *c, uint64_t sid, uint64_t sz)
+    { (void)c; if (g_open_fc_fail) return -1;
+      int s = fc_slot(sid); g_fc[s].open_calls++; g_fc[s].open_total += sz;
+      return 0; }
+/* Budget-direction plumbing: the adapter derives each stream's budget from the
+ * LOCAL initial_max_stream_data_* for the stream's category + initiator, so the
+ * stub must model distinct limits and a configurable role. */
+static int g_is_client = 0;
+int picoquic_is_client(picoquic_cnx_t *c) { (void)c; return g_is_client; }
+/* Grant gating reads the connection state: picoquic_open_flow_control silently
+ * no-ops unless the connection is exactly READY, so the adapter defers grants
+ * until then. Default READY; tests flip it to model the pre-ready phase. */
+static picoquic_state_enum g_cnx_state = picoquic_state_ready;
+picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t *c)
+    { (void)c; return g_cnx_state; }
 
 /* -- Helpers -------------------------------------------------------- */
 
@@ -1086,6 +1141,934 @@ int main(void)
         CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
         unsetenv("MOQ_PQ_STREAM_QUEUE_BYTES");
 
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 100. Receive flow control: pause-on-pending, no credit while
+     *         pending, retained-exactly-once, resume-with-credit, re-block ---- *
+     * A max_events=1 client can hold one object event at a time. Feed three
+     * objects one at a time on stream 7; the 2nd blocks in the session, the 3rd
+     * is retained by the adapter. Prove: the stream is frozen (app flow control
+     * on), no window is granted while pending, and all three objects arrive in
+     * order exactly once as service drains, with credit released only then. */
+    {
+        fc_reset();
+        /* Small budget so the batched grant (quantum = budget/2) actually fires
+         * within the few dozen bytes this scenario delivers. */
+        g_rx_window = 32;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        const uint64_t SID = 7;
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+
+        /* obj0 -> queued; obj1 -> blocks in session; obj2 -> retained. */
+        const char *bodies[3] = { "AAA", "BBB", "CCC" };
+        for (int k = 0; k < 3; k++) {
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&al, (const uint8_t *)bodies[k], 3, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, SID);   /* one object's actions per iteration */
+        }
+
+        /* The stream is under app flow control (frozen), and the pending stall
+         * did not open any window (no credit while retained work exists). */
+        CHECK(fc_use(SID) == 1);
+        int open_after_pause = fc_open_calls(SID);
+
+        moq_event_t ev;
+        /* obj0 available now; obj1/obj2 held back (not fed to the session). */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        CHECK(moq_rcbuf_len(ev.u.object_received.payload) == 3 &&
+              moq_rcbuf_data(ev.u.object_received.payload)[0] == 'A');
+        moq_event_cleanup(&ev);
+        CHECK(moq_session_poll_events(c, &ev, 1) == 0);
+        /* retaining obj2 granted no new credit */
+        CHECK(fc_open_calls(SID) == open_after_pause);
+
+        CHECK(moq_pq_service(ad, g_time) == 0);   /* drains obj1; obj2 re-blocks */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        CHECK(moq_rcbuf_data(ev.u.object_received.payload)[0] == 'B');
+        moq_event_cleanup(&ev);
+
+        CHECK(moq_pq_service(ad, g_time) == 0);   /* drains obj2 (the retained one) */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        CHECK(moq_rcbuf_data(ev.u.object_received.payload)[0] == 'C');
+        moq_event_cleanup(&ev);
+
+        /* exactly once: nothing left, session healthy */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 0);
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+        /* credit was released as the app drained (window advanced past the pause) */
+        CHECK(fc_open_calls(SID) > open_after_pause);
+        CHECK(fc_use(SID) == 1);   /* still app-controlled, never handed back */
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 101. Reset while paused: retained state is dropped, no leak --------- */
+    {
+        fc_reset();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        const uint64_t SID = 11;
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        for (int k = 0; k < 2; k++) {
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&al, (const uint8_t *)"XY", 2, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, SID);
+        }
+        CHECK(fc_use(SID) == 1);
+        /* Peer resets the stream while the adapter holds retained/paused state. */
+        moq_pq_callback(NULL, SID, NULL, 0, picoquic_callback_stream_reset,
+                        ad, NULL);
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+        /* Further delivery on the reset stream must not resurrect it. */
+        CHECK(moq_pq_service(ad, g_time) == 0);
+
+        moq_pq_conn_destroy(ad);   /* balanced allocator proves no retained leak */
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 101b. FIN while paused: retained across the pause, delivered on drain */
+    {
+        fc_reset();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        const uint64_t SID = 23;
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        for (int k = 0; k < 2; k++) {          /* obj0 queued, obj1 blocks */
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&al, (const uint8_t *)"Q", 1, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, SID);
+        }
+        CHECK(fc_use(SID) == 1);
+        /* Peer FINs the stream while it is paused: retained, not delivered yet. */
+        moq_pq_callback(NULL, SID, NULL, 0, picoquic_callback_stream_fin,
+                        ad, NULL);
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* obj0 */
+        moq_event_cleanup(&ev);
+        CHECK(moq_pq_service(ad, g_time) == 0);           /* obj1 drains */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* obj1 */
+        moq_event_cleanup(&ev);
+        CHECK(moq_pq_service(ad, g_time) == 0);           /* replays retained FIN */
+
+        /* FIN was delivered exactly once: further bytes on the finished stream
+         * are a protocol violation and close the session. */
+        uint8_t post[] = { 0xFF };
+        moq_pq_callback(NULL, SID, post, 1, picoquic_callback_stream_data,
+                        ad, NULL);
+        CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 102. Two streams: a blocked stream does not freeze an independent one *
+     * max_events=1. Stream A (id 20) blocks with an object pending in the
+     * session. After the app frees the one queue slot, stream B (id 19) delivers
+     * IMMEDIATELY -- while A is still blocked -- proving each inbound stream is
+     * flow-controlled independently (A's stall never gated B). */
+    {
+        fc_reset();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+
+        moq_subgroup_cfg_t sgA; moq_subgroup_cfg_init(&sgA); sgA.group_id = 0;
+        moq_subgroup_handle_t hA;
+        moq_session_open_subgroup(s, ss, &sgA, 0, &hA);
+
+        for (int k = 0; k < 2; k++) {       /* A obj0 -> queued; A obj1 -> blocks */
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&al, (const uint8_t *)"A", 1, &p);
+            moq_session_write_object(s, hA, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, 15);
+        }
+        CHECK(fc_use(15) == 1);             /* A is under app flow control, paused */
+
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* free the queue slot */
+        CHECK(moq_rcbuf_data(ev.u.object_received.payload)[0] == 'A');
+        moq_event_cleanup(&ev);
+
+        /* A obj1 is STILL pending in the session (no service yet). Deliver on a
+         * different stream B; it must arrive without waiting on A. */
+        moq_subgroup_cfg_t sgB; moq_subgroup_cfg_init(&sgB); sgB.group_id = 1;
+        moq_subgroup_handle_t hB;
+        moq_session_open_subgroup(s, ss, &sgB, 0, &hB);
+        moq_rcbuf_t *pb = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"B", 1, &pb);
+        moq_session_write_object(s, hB, 0, pb, 0);
+        moq_rcbuf_decref(pb);
+        feed_data(s, ad, 19);
+
+        CHECK(fc_use(19) == 1);             /* B independently flow-controlled */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* B arrived while A blocked */
+        CHECK(moq_rcbuf_data(ev.u.object_received.payload)[0] == 'B');
+        moq_event_cleanup(&ev);
+
+        /* A eventually drains on service; nothing was lost. */
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        CHECK(moq_rcbuf_data(ev.u.object_received.payload)[0] == 'A');
+        moq_event_cleanup(&ev);
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 103. Destroy while paused: balanced counting allocator ------------- */
+    {
+        fc_reset();
+        g_bal = 0;
+        moq_alloc_t cal = calloc_();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&cal, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&cal, c);
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        for (int k = 0; k < 3; k++) {
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&cal, (const uint8_t *)"ZZ", 2, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, 31);
+        }
+        /* Tear down with a stream still paused + a retained buffer alive. */
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+        CHECK(g_bal == 0);   /* every allocation (incl. the retention buffer) freed */
+    }
+
+    /* -- 104. d16 bidi control backpressure: control pauses ITSELF ----------- *
+     * Control gets the same per-stream mechanism: while control input is
+     * pending, later control callbacks are retained (never re-fed), no credit
+     * is granted, and everything drains in order exactly once through the
+     * control routing. (Independence from media streams is test 102's angle;
+     * this is the "control itself can pause" angle.) */
+    {
+        fc_reset();
+        g_rx_window = 65535;
+        g_rx_window_bidi_remote = 32;   /* control = peer bidi on the server */
+        moq_alloc_t a104 = talloc();
+        moq_session_cfg_t cc; moq_session_cfg_init_sized(&cc, sizeof(cc), &a104, MOQ_PERSPECTIVE_CLIENT);
+        cc.send_request_capacity = true; cc.initial_request_capacity = 5;
+        moq_session_cfg_t sc; moq_session_cfg_init_sized(&sc, sizeof(sc), &a104, MOQ_PERSPECTIVE_SERVER);
+        sc.send_request_capacity = true; sc.initial_request_capacity = 5;
+        sc.max_events = 1;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_session_create(&cc, 0, &c); moq_session_create(&sc, 0, &s);
+        moq_session_start(c, 0);
+        pump_ctl(c, s); pump_ctl(s, c);
+        { moq_event_t e; moq_session_poll_events(c, &e, 1); }
+        /* Server: SETUP_COMPLETE fills the 1-slot event queue. */
+        moq_pq_conn_t *ad = mkad(&a104, s);
+
+        /* Two client SUBSCRIBEs; feed their control bytes one at a time. */
+        moq_bytes_t ns[] = {{ (const uint8_t *)"ns", 2 }};
+        for (int k = 0; k < 2; k++) {
+            moq_subscribe_cfg_t sub; moq_subscribe_cfg_init(&sub);
+            sub.track_namespace = (moq_namespace_t){ ns, 1 };
+            sub.track_name = (moq_bytes_t){ (const uint8_t *)(k ? "u" : "t"), 1 };
+            moq_subscription_t h;
+            moq_session_subscribe(c, &sub, 0, &h);
+            moq_action_t acts[4]; size_t na = moq_session_poll_actions(c, acts, 4);
+            for (size_t i = 0; i < na; i++) {
+                if (acts[i].kind == MOQ_ACTION_SEND_CONTROL)
+                    moq_pq_callback(NULL, 0,
+                        (uint8_t *)acts[i].u.send_control.data,
+                        acts[i].u.send_control.len,
+                        picoquic_callback_stream_data, ad, NULL);
+                moq_action_cleanup(&acts[i]);
+            }
+        }
+        /* sub#1 blocked in the session (queue full with SETUP_COMPLETE); sub#2
+         * retained by the adapter. Control is under app flow control, frozen. */
+        CHECK(fc_use(0) == 1);
+        CHECK(fc_open_calls(0) == 0);
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        CHECK(ev.kind == MOQ_EVENT_SETUP_COMPLETE);
+        moq_event_cleanup(&ev);
+
+        CHECK(moq_pq_service(ad, g_time) == 0);   /* sub#1 drains; sub#2 replays, re-blocks */
+        CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+        moq_event_cleanup(&ev);
+
+        CHECK(moq_pq_service(ad, g_time) == 0);   /* sub#2 drains */
+        CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+        moq_event_cleanup(&ev);
+        CHECK(moq_session_poll_events(s, &ev, 1) == 0);   /* exactly once */
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+        /* Credit released only after the control input drained. */
+        CHECK(fc_open_calls(0) > 0);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+        g_rx_window_bidi_remote = 0;
+    }
+
+    /* -- 105. picoquic_set_app_flow_control failure is FATAL ----------------- *
+     * If the window is not ours the backpressure invariant cannot hold; the
+     * adapter must not continue as if it were. */
+    {
+        fc_reset();
+        g_rx_window = 65535;
+        g_set_fc_fail = true;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"AAA", 3, &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        feed_data(s, ad, 3);
+        CHECK(moq_pq_conn_is_fatal(ad));
+        g_set_fc_fail = false;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 106. picoquic_open_flow_control failure is FATAL -------------------- */
+    {
+        fc_reset();
+        g_rx_window = 8;   /* tiny budget: the first successful feed owes a grant */
+        g_open_fc_fail = true;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"AAAAAA", 6, &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        feed_data(s, ad, 3);
+        CHECK(moq_pq_conn_is_fatal(ad));
+        g_open_fc_fail = false;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 107. FIN riding the chunk that blocks: retired, never re-credited ---- */
+    {
+        fc_reset();
+        g_rx_window = 32;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        const uint64_t SID = 27;
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        for (int k = 0; k < 2; k++) {
+            moq_rcbuf_t *p = NULL;
+            /* Payloads sized so the FIN-carrying chunk alone crosses the grant
+             * quantum (budget/2 = 16): if the entry wrongly outlived the FIN, a
+             * finished-stream grant WOULD fire on the post-drain resume. */
+            moq_rcbuf_create(&al, (const uint8_t *)"QQQQQQQQQQQQQQQQQQQQ", 20, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+        }
+        moq_session_close_subgroup(s, sgh, 0);
+        /* One feed pass: obj0 fills the queue; obj1's chunk carries the FIN and
+         * WOULD_BLOCKs -> the FIN is retained WITH the blocked chunk. */
+        feed_data(s, ad, SID);
+        CHECK(fc_use(SID) == 1);
+        /* Grants made while the session was still ACCEPTING (obj0) are normal;
+         * snapshot the count -- the FIN must permanently freeze it. */
+        int calls_at_fin = fc_open_calls(SID);
+
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* obj0 */
+        moq_event_cleanup(&ev);
+        CHECK(moq_pq_service(ad, g_time) == 0);           /* obj1 + FIN drain */
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* obj1 */
+        moq_event_cleanup(&ev);
+        CHECK(moq_pq_service(ad, g_time) == 0);
+
+        /* The stream ended with that FIN: no credit may ever be granted on the
+         * finished stream (a grant here means the entry outlived the FIN). */
+        CHECK(fc_open_calls(SID) == calls_at_fin);
+
+        /* FIN was delivered exactly once: bytes after it close the session. */
+        uint8_t post[] = { 0xFF };
+        moq_pq_callback(NULL, SID, post, 1, picoquic_callback_stream_data,
+                        ad, NULL);
+        CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 108. Retention bound counts the BLOCKED chunk too ------------------- *
+     * The unprocessed total (blocked-in-session + retained + incoming) is capped
+     * by the advertised window; exceeding it is an impossible transport state
+     * and must be fatal (bounded retention, no unbounded buffering). */
+    {
+        fc_reset();
+        g_rx_window = 8;    /* window smaller than two object chunks */
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        const uint64_t SID = 31;
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        for (int k = 0; k < 3; k++) {   /* obj0 queued; obj1 blocks; obj2 overruns */
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&al, (const uint8_t *)"AAAAAA", 6, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, SID);
+        }
+        /* blocked (~7) + incoming (~7) > budget 8: the peer sent past the frozen
+         * window -- impossible on a real transport, fatal here. */
+        CHECK(moq_pq_conn_is_fatal(ad));
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+        g_rx_window = 65535;
+    }
+
+    /* -- 109. Budget direction: locally-initiated bidi uses bidi_LOCAL -------- *
+     * The d16 control stream is the client's OWN bidi stream: on the CLIENT
+     * adapter its receive budget must come from initial_max_stream_data_bidi_
+     * local (RFC 9000: the limit for locally-initiated bidi), while test 104's
+     * server side proves the peer-initiated case (bidi_remote). Unequal limits
+     * make the selection observable: grants (quantum = budget/2) fire within
+     * this scenario's ~50 control bytes ONLY if the small bidi_local budget was
+     * chosen -- picking bidi_remote/uni (65535) would need a 32 KiB quantum. */
+    {
+        fc_reset();
+        g_is_client = 1;                 /* we are the client: sid 0 is OURS */
+        g_rx_window = 65535;
+        g_rx_window_bidi_local = 32;
+        g_rx_window_bidi_remote = 65535;
+        moq_alloc_t a109 = talloc();
+        moq_session_cfg_t cc; moq_session_cfg_init_sized(&cc, sizeof(cc), &a109, MOQ_PERSPECTIVE_CLIENT);
+        cc.send_request_capacity = true; cc.initial_request_capacity = 5;
+        cc.max_events = 1;
+        moq_session_cfg_t sc; moq_session_cfg_init_sized(&sc, sizeof(sc), &a109, MOQ_PERSPECTIVE_SERVER);
+        sc.send_request_capacity = true; sc.initial_request_capacity = 5;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_session_create(&cc, 0, &c); moq_session_create(&sc, 0, &s);
+        moq_session_start(c, 0);
+        pump_ctl(c, s); pump_ctl(s, c);
+        { moq_event_t e; moq_session_poll_events(s, &e, 1); }
+        /* Client: SETUP_COMPLETE fills the 1-slot event queue (unpolled). */
+        moq_pq_conn_t *ad = mkad(&a109, c);
+
+        /* Three subscribe/accept rounds; the server's SUBSCRIBE_OK control bytes
+         * arrive at the CLIENT adapter on its locally-initiated control bidi.
+         * (Three, so total control delivery safely crosses the grant quantum
+         * budget/2 = 16 once drained.) */
+        static const char *names109[3] = { "t", "u", "v" };
+        moq_bytes_t ns[] = {{ (const uint8_t *)"ns", 2 }};
+        for (int k = 0; k < 3; k++) {
+            moq_subscribe_cfg_t sub; moq_subscribe_cfg_init(&sub);
+            sub.track_namespace = (moq_namespace_t){ ns, 1 };
+            sub.track_name = (moq_bytes_t){ (const uint8_t *)names109[k], 1 };
+            moq_subscription_t h;
+            moq_session_subscribe(c, &sub, 0, &h);
+            pump_ctl(c, s);                       /* client -> server directly */
+            moq_event_t ev;
+            CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+            moq_subscription_t srv_sub = ev.u.subscribe_request.sub;
+            moq_event_cleanup(&ev);
+            moq_accept_subscribe_cfg_t ac; moq_accept_subscribe_cfg_init(&ac);
+            moq_session_accept_subscribe(s, srv_sub, &ac, 0);
+            moq_action_t acts[4]; size_t na = moq_session_poll_actions(s, acts, 4);
+            for (size_t i = 0; i < na; i++) {     /* server -> client ADAPTER */
+                if (acts[i].kind == MOQ_ACTION_SEND_CONTROL)
+                    moq_pq_callback(NULL, 0,
+                        (uint8_t *)acts[i].u.send_control.data,
+                        acts[i].u.send_control.len,
+                        picoquic_callback_stream_data, ad, NULL);
+                moq_action_cleanup(&acts[i]);
+            }
+        }
+        /* SUBSCRIBE_OK #1 blocked (queue holds SETUP_COMPLETE); #2/#3 retained. */
+        CHECK(fc_use(0) == 1);
+        CHECK(fc_open_calls(0) == 0);
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+        CHECK(ev.kind == MOQ_EVENT_SETUP_COMPLETE);
+        moq_event_cleanup(&ev);
+        int oks = 0;
+        for (int iter = 0; iter < 8 && oks < 3; iter++) {
+            CHECK(moq_pq_service(ad, g_time) == 0);
+            while (moq_session_poll_events(c, &ev, 1) == 1) {
+                oks++;
+                moq_event_cleanup(&ev);
+            }
+        }
+        CHECK(oks == 3);                          /* in order, exactly once */
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+        /* Grants fired -> the SMALL bidi_local budget was selected. */
+        CHECK(fc_open_calls(0) > 0);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+        g_is_client = 0;
+        g_rx_window_bidi_local = 0;
+        g_rx_window_bidi_remote = 0;
+    }
+
+    /* -- 110. d18 uni-control backpressure: the peer's uni control stream
+     *         pauses ITSELF (draft-18 sibling of test 104) ------------------- *
+     * Draft-18 carries control on a unidirectional control-stream PAIR: the
+     * client's control stream arrives as a plain uni stream (sid 2) and the
+     * BRIDGE classifies it by its leading stream type (the SETUP envelope);
+     * the adapter routes every uni byte through the same per-stream receive
+     * flow control. Draft-18's control stream carries only SETUP and GOAWAY
+     * (requests ride their own bidi streams), so the choreography is:
+     * SETUP_COMPLETE occupies a 1-slot event queue, the client's GOAWAY
+     * blocks (control paused, credit frozen), fragments of a duplicate
+     * GOAWAY fed while paused are retained adapter-side, and after the drain
+     * a final one-byte probe completes the duplicate -- the session closes
+     * on "duplicate GOAWAY" ONLY if the retained fragments were replayed in
+     * order exactly once (lost/duplicated retention leaves a fragment that
+     * never completes an envelope, and the session would stay open). */
+    {
+        fc_reset();
+        g_rx_window = 32;   /* uni budget: quantum = 16, crossed by ~18 control
+                             * bytes delivered in this scenario */
+        moq_alloc_t a110 = talloc();
+        moq_session_cfg_t cc; moq_session_cfg_init_sized(&cc, sizeof(cc), &a110, MOQ_PERSPECTIVE_CLIENT);
+        cc.version = MOQ_VERSION_DRAFT_18;
+        /* Advertise a token cache size: pads the client SETUP a few bytes so
+         * total control delivery crosses the grant quantum (budget/2 = 16). */
+        cc.send_auth_token_cache_size = true;
+        cc.auth_token_cache_size = 64;
+        moq_session_cfg_t sc; moq_session_cfg_init_sized(&sc, sizeof(sc), &a110, MOQ_PERSPECTIVE_SERVER);
+        sc.version = MOQ_VERSION_DRAFT_18;
+        sc.max_events = 1;
+        moq_session_t *c = NULL, *s = NULL;
+        CHECK(moq_session_create(&cc, 0, &c) == 0);
+        CHECK(moq_session_create(&sc, 0, &s) == 0);
+        /* Symmetric d18 handshake: both endpoints open their OWN uni control
+         * stream and send SETUP on it. */
+        moq_session_start(c, 0);
+        moq_session_start(s, 0);
+        moq_pq_conn_t *ad = mkad(&a110, s);
+        const uint64_t SID = 2;   /* first client-initiated uni stream */
+
+        /* Client -> server: feed the client's ENTIRE control stream through
+         * the adapter from its first byte (OPEN_UNI_CONTROL data = stream
+         * type + SETUP envelope) so the bridge classification is real. */
+        {
+            moq_action_t acts[4]; size_t na = moq_session_poll_actions(c, acts, 4);
+            CHECK(na >= 1);
+            for (size_t i = 0; i < na; i++) {
+                if (acts[i].kind == MOQ_ACTION_OPEN_UNI_CONTROL)
+                    moq_pq_callback(NULL, SID,
+                        (uint8_t *)acts[i].u.open_uni_control.data,
+                        acts[i].u.open_uni_control.len,
+                        picoquic_callback_stream_data, ad, NULL);
+                else if (acts[i].kind == MOQ_ACTION_SEND_CONTROL)
+                    moq_pq_callback(NULL, SID,
+                        (uint8_t *)acts[i].u.send_control.data,
+                        acts[i].u.send_control.len,
+                        picoquic_callback_stream_data, ad, NULL);
+                moq_action_cleanup(&acts[i]);
+            }
+        }
+        /* SETUP consumed: server ESTABLISHED, SETUP_COMPLETE fills the 1-slot
+         * event queue (unpolled). The control stream is under app flow
+         * control from first sight; no grant yet (SETUP < quantum). */
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+        CHECK(fc_use(SID) == 1);
+        CHECK(fc_open_calls(SID) == 0);
+
+        /* Server -> client: the server's own uni control (its SETUP) goes out
+         * through the endpoint's pull-send path; capture and feed it to the
+         * raw client session (the leading stream type IS the SETUP envelope,
+         * so the control parser consumes it verbatim). */
+        {
+            g_active_flag = -1;
+            CHECK(moq_pq_service(ad, g_time) == 0);
+            CHECK(g_active_flag == 1);          /* server control stream opened */
+            uint64_t srv_sid = g_active_sid;
+            uint8_t cap[256]; size_t clen = 0;
+            for (int r = 0; r < 20; r++) {
+                g_provide_nb = 999; g_provide_fin = -1;
+                moq_pq_callback(NULL, srv_sid, (uint8_t *)(uintptr_t)0xABC, 64,
+                                picoquic_callback_prepare_to_send, ad, NULL);
+                if (g_provide_nb == 0) break;
+                CHECK(clen + g_provide_nb <= sizeof(cap));
+                memcpy(cap + clen, g_provide_buf, g_provide_nb);
+                clen += g_provide_nb;
+                if (g_provide_fin) break;
+            }
+            CHECK(clen > 0);
+            CHECK(moq_session_on_control_bytes(c, cap, clen, 0) == 0);
+            moq_event_t ev;
+            CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+            CHECK(ev.kind == MOQ_EVENT_SETUP_COMPLETE);
+            moq_event_cleanup(&ev);
+        }
+
+        /* Client GOAWAY: capture its wire bytes (SEND_CONTROL appends to the
+         * already-open uni control stream). Copy them out -- fed as the
+         * blocking chunk, re-fed fragment-wise as the duplicate probe. */
+        uint8_t gw[32]; size_t gwn = 0;
+        CHECK(moq_session_goaway(c, NULL, 0, 0) == 0);
+        {
+            moq_action_t acts[4]; size_t na = moq_session_poll_actions(c, acts, 4);
+            for (size_t i = 0; i < na; i++) {
+                if (acts[i].kind == MOQ_ACTION_SEND_CONTROL &&
+                    acts[i].u.send_control.len <= sizeof(gw)) {
+                    memcpy(gw, acts[i].u.send_control.data,
+                           acts[i].u.send_control.len);
+                    gwn = acts[i].u.send_control.len;
+                }
+                moq_action_cleanup(&acts[i]);
+            }
+        }
+        CHECK(gwn >= 3);   /* need head/middle/tail fragments below */
+
+        /* GOAWAY blocks: its event cannot push past the unpolled
+         * SETUP_COMPLETE -> the session retains it, the bridge goes
+         * pending-control, the adapter pauses the control stream. */
+        moq_pq_callback(NULL, SID, gw, gwn,
+                        picoquic_callback_stream_data, ad, NULL);
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+        CHECK(fc_use(SID) == 1);
+        int oc_at_pause = fc_open_calls(SID);
+
+        /* Feed a duplicate GOAWAY MINUS its last byte, in two fragments,
+         * while paused: both must be retained adapter-side (never fed to the
+         * blocked bridge) and replayed in order after the drain. */
+        moq_pq_callback(NULL, SID, gw, 1,
+                        picoquic_callback_stream_data, ad, NULL);
+        moq_pq_callback(NULL, SID, gw + 1, gwn - 2,
+                        picoquic_callback_stream_data, ad, NULL);
+        CHECK(!moq_pq_conn_is_fatal(ad));
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+        /* No credit granted while the stream has pending/retained work. */
+        CHECK(fc_open_calls(SID) == oc_at_pause);
+
+        /* Drain: free the event slot, service -> the retained GOAWAY parses
+         * (event queued), then the adapter replays the retained fragments in
+         * order -- they form an incomplete envelope and simply buffer. */
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        CHECK(ev.kind == MOQ_EVENT_SETUP_COMPLETE);
+        moq_event_cleanup(&ev);
+        CHECK(moq_pq_service(ad, g_time) == 0);
+
+        CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        CHECK(ev.kind == MOQ_EVENT_GOAWAY);
+        moq_event_cleanup(&ev);
+        CHECK(moq_session_poll_events(s, &ev, 1) == 0);   /* exactly once */
+        CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);   /* DRAINING, healthy */
+        /* Credit released only after the control input drained. */
+        CHECK(fc_open_calls(SID) > oc_at_pause);
+        CHECK(fc_use(SID) == 1);   /* still app-controlled */
+
+        /* Exactly-once/in-order proof: the last byte completes the duplicate
+         * GOAWAY ONLY if both retained fragments were replayed intact and in
+         * order -- the session then closes on "duplicate GOAWAY". Had the
+         * fragments been dropped (or fed to the blocked bridge and lost),
+         * this lone byte is an incomplete envelope and the session stays
+         * open, failing this check. */
+        moq_pq_callback(NULL, SID, gw + gwn - 1, 1,
+                        picoquic_callback_stream_data, ad, NULL);
+        CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+        g_rx_window = 65535;
+    }
+
+    /* -- 111. after_callback fires on the FATAL receive path ----------------- *
+     * The hook contract (picoquic.h): "Fires on all paths including fatal". A
+     * flow-control ownership failure goes fatal inside the data callback; the
+     * hook must still fire, exactly once for that invocation. */
+    {
+        fc_reset();
+        g_rx_window = 65535;
+        g_set_fc_fail = true;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = c; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &al; ac.after_callback = hook_fn;
+        moq_pq_conn_t *ad = NULL; moq_pq_conn_create(&ac, &ad);
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"AAA", 3, &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+
+        /* Feed exactly ONE callback invocation carrying the first chunk. */
+        moq_action_t acts[8]; size_t na = moq_session_poll_actions(s, acts, 8);
+        bool fed = false;
+        for (size_t i = 0; i < na; i++) {
+            if (!fed && acts[i].kind == MOQ_ACTION_SEND_DATA &&
+                acts[i].u.send_data.header_len > 0) {
+                g_hook_count = 0;
+                moq_pq_callback(NULL, 3,
+                    (uint8_t *)acts[i].u.send_data.header,
+                    acts[i].u.send_data.header_len,
+                    picoquic_callback_stream_data, ad, NULL);
+                fed = true;
+            }
+            moq_action_cleanup(&acts[i]);
+        }
+        CHECK(fed);
+        CHECK(moq_pq_conn_is_fatal(ad));   /* the FC failure went fatal */
+        CHECK(g_hook_count == 1);          /* hook fired on the fatal path */
+        g_set_fc_fail = false;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 112. after_callback fires on an already-terminal callback ----------- *
+     * Hook behavior must not be state-dependent: a callback arriving after the
+     * bridge went terminal still invokes the hook, exactly once. */
+    {
+        fc_reset();
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = c; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &al; ac.after_callback = hook_fn;
+        moq_pq_conn_t *ad = NULL; moq_pq_conn_create(&ac, &ad);
+
+        /* Terminalize: peer transport close. */
+        moq_pq_callback(NULL, 0, NULL, 0, picoquic_callback_close, ad, NULL);
+        CHECK(moq_pq_conn_is_closed(ad));
+
+        /* A late stream-data callback on the terminal adapter: no processing,
+         * but the hook still fires exactly once. */
+        uint8_t junk[] = { 0x01 };
+        g_hook_count = 0;
+        moq_pq_callback(NULL, 7, junk, 1,
+                        picoquic_callback_stream_data, ad, NULL);
+        CHECK(g_hook_count == 1);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 113. moq_pq_service reports fatal from the post-service credit step -- *
+     * A paused stream drains during service; the resume grant fails -> the
+     * adapter goes fatal INSIDE the post-service step. service() must return
+     * -1 (never success-after-fatal), with the hook fired exactly once. */
+    {
+        fc_reset();
+        g_rx_window = 32;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 1, 0);
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = c; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &al; ac.after_callback = hook_fn;
+        moq_pq_conn_t *ad = NULL; moq_pq_conn_create(&ac, &ad);
+
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        for (int k = 0; k < 2; k++) {      /* obj0 queued; obj1 blocks */
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&al, (const uint8_t *)"AAAAAA", 6, &p);
+            moq_session_write_object(s, sgh, (uint64_t)k, p, 0);
+            moq_rcbuf_decref(p);
+            feed_data(s, ad, 3);
+        }
+        moq_event_t ev;
+        CHECK(moq_session_poll_events(c, &ev, 1) == 1);   /* free the slot */
+        moq_event_cleanup(&ev);
+
+        g_open_fc_fail = true;             /* the resume grant will fail */
+        g_hook_count = 0;
+        int src = moq_pq_service(ad, g_time);
+        CHECK(src == -1);                  /* fatal reported, not swallowed */
+        CHECK(moq_pq_conn_is_fatal(ad));
+        CHECK(g_hook_count == 1);          /* hook exactly once per service() */
+        g_open_fc_fail = false;
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 114. Unreadable transport parameters: fail closed -------------------- *
+     * NULL TPs mean the credit-accounting basis is unavailable; the adapter
+     * must not fabricate a budget. */
+    {
+        fc_reset();
+        g_tp_null = true;
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"AAA", 3, &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        feed_data(s, ad, 3);
+        CHECK(moq_pq_conn_is_fatal(ad));
+        g_tp_null = false;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 115. A REAL zero budget rejects payload bytes ------------------------ *
+     * Zero advertised window is meaningful: the peer may close the stream but
+     * may not send payload. Nonzero bytes against it are an impossible
+     * transport state, not a reason to invent 65535 bytes of credit. */
+    {
+        fc_reset();
+        g_rx_window = 0;
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        uint8_t one[] = { 0x14 };
+        moq_pq_callback(NULL, 11, one, 1,
+                        picoquic_callback_stream_data, ad, NULL);
+        CHECK(moq_pq_conn_is_fatal(ad));
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 116. A REAL zero budget still admits a zero-byte FIN ----------------- */
+    {
+        fc_reset();
+        g_rx_window = 0;
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        moq_pq_callback(NULL, 11, NULL, 0,
+                        picoquic_callback_stream_fin, ad, NULL);
+        CHECK(!moq_pq_conn_is_fatal(ad));  /* an empty close is within credit */
+        CHECK(moq_session_state(c) != MOQ_SESS_CLOSED);
+        g_rx_window = 65535;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 117. Pre-ready grants are OWED, not lost ----------------------------- *
+     * picoquic_open_flow_control silently no-ops unless the connection is
+     * exactly READY. Progress made before READY must not consume the grant:
+     * no call is made pre-ready, and the first service after READY issues ONE
+     * real grant (the owed credit sweeps out). */
+    {
+        fc_reset();
+        g_rx_window = 8;   /* tiny budget: the first chunk owes a grant */
+        g_cnx_state = picoquic_state_client_almost_ready;   /* pre-ready */
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&al, c);
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"AAAAAA", 6, &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        feed_data(s, ad, 3);
+        /* Progress happened (a grant is owed), but the connection is not READY:
+         * nothing may be recorded as issued. */
+        CHECK(fc_open_calls(3) == 0);
+        CHECK(!moq_pq_conn_is_fatal(ad));
+
+        /* READY: the next service sweeps the owed grant out -- exactly one. */
+        g_cnx_state = picoquic_state_ready;
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(fc_open_calls(3) == 1);
+        /* And it is not re-issued on the next service (granted advanced). */
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(fc_open_calls(3) == 1);
+
+        g_rx_window = 65535;
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 118/119. after_callback fires on already-fatal/closed service exits -- */
+    {
+        fc_reset();
+        g_set_fc_fail = true;   /* drive the adapter fatal via one data chunk */
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = c; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &al; ac.after_callback = hook_fn;
+        moq_pq_conn_t *ad = NULL; moq_pq_conn_create(&ac, &ad);
+        moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+        moq_subgroup_handle_t sgh;
+        moq_session_open_subgroup(s, ss, &sg, 0, &sgh);
+        moq_rcbuf_t *p = NULL;
+        moq_rcbuf_create(&al, (const uint8_t *)"AAA", 3, &p);
+        moq_session_write_object(s, sgh, 0, p, 0);
+        moq_rcbuf_decref(p);
+        feed_data(s, ad, 3);
+        CHECK(moq_pq_conn_is_fatal(ad));
+        g_set_fc_fail = false;
+
+        /* Service on the already-FATAL adapter: hook once, rc == -1. */
+        g_hook_count = 0;
+        CHECK(moq_pq_service(ad, g_time) == -1);
+        CHECK(g_hook_count == 1);
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+    {
+        fc_reset();
+        moq_session_t *c = NULL, *s = NULL;
+        (void)setup(&al, &c, &s, 0, 0);
+        moq_pq_conn_cfg_t ac; moq_pq_conn_cfg_init_sized(&ac, sizeof(ac));
+        ac.session = c; ac.cnx = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
+        ac.alloc = &al; ac.after_callback = hook_fn;
+        moq_pq_conn_t *ad = NULL; moq_pq_conn_create(&ac, &ad);
+        moq_pq_callback(NULL, 0, NULL, 0, picoquic_callback_close, ad, NULL);
+        CHECK(moq_pq_conn_is_closed(ad));
+
+        /* Service on the already-CLOSED adapter: hook once, rc == 0. */
+        g_hook_count = 0;
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(g_hook_count == 1);
         moq_pq_conn_destroy(ad);
         moq_session_destroy(c); moq_session_destroy(s);
     }

@@ -400,7 +400,11 @@ int main(void)
             ref = act.u.open_bidi_stream.stream_ref;
             moq_action_cleanup(&act);
         }
-        /* No SUBSCRIBE_OK yet: PUBLISH_DONE is not a valid first response. */
+        /* No SUBSCRIBE_OK yet: PUBLISH_DONE is not a valid first response.
+         * §5.1: a pending SUBSCRIBE (Pending (Subscriber)) must receive
+         * exactly one SUBSCRIBE_OK or REQUEST_ERROR; PUBLISH_DONE terminates
+         * only Established or Pending (Publisher) -- PUBLISH-initiated --
+         * subscriptions. */
         uint8_t dn[64];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, dn, sizeof(dn));

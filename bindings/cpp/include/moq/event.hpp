@@ -206,6 +206,11 @@ struct subscribe_updated {
     std::span<const moq_resolved_token_t> tokens;
     bool         has_new_group_request;
     uint64_t     new_group_request;
+    bool         has_filter;
+    moq_subscribe_filter_t filter;
+    uint64_t     start_group;
+    uint64_t     start_object;
+    uint64_t     end_group;
 };
 
 struct object_chunk {
@@ -346,6 +351,13 @@ struct publish_request {
     std::span<const uint8_t>              track_properties;
     std::span<const moq_resolved_token_t> tokens;
     bool                                  dynamic_groups;
+    /* Publisher-advertised Largest Object / EXPIRES (absent = nothing
+     * published / no expiry advertised). */
+    bool                                  has_largest;
+    uint64_t                              largest_group;
+    uint64_t                              largest_object;
+    bool                                  has_expires;
+    uint64_t                              expires_ms;
 
     namespace_name track_namespace() const { return {ns_raw}; }
 };
@@ -361,6 +373,12 @@ struct publish_ok {
     uint64_t          expires_ms;
     bool              has_new_group_request;
     uint64_t          new_group_request;
+    /* The subscriber's raw subscription filter (absent = unfiltered). */
+    bool              has_filter;
+    subscribe_filter  filter;
+    uint64_t          start_group;
+    uint64_t          start_object;
+    uint64_t          end_group;
 };
 
 struct publish_error {
@@ -459,6 +477,29 @@ struct publish_updated {
     std::span<const moq_resolved_token_t> tokens;
     bool        has_new_group_request;
     uint64_t    new_group_request;
+    bool        has_filter;
+    moq_subscribe_filter_t filter;
+    uint64_t    start_group;
+    uint64_t    start_object;
+    uint64_t    end_group;
+};
+
+struct subscription_update_ok {
+    subscription sub;
+    bool         has_largest;
+    uint64_t     largest_group;
+    uint64_t     largest_object;
+    bool         has_expires;
+    uint64_t     expires_ms;
+};
+
+struct publication_update_ok {
+    publication pub;
+    bool        has_largest;
+    uint64_t    largest_group;
+    uint64_t    largest_object;
+    bool        has_expires;
+    uint64_t    expires_ms;
 };
 
 struct unknown {
@@ -514,6 +555,8 @@ using event_variant = std::variant<
     event::subscribe_done,
     event::publish_unsubscribed,
     event::publish_updated,
+    event::subscription_update_ok,
+    event::publication_update_ok,
     event::unknown>;
 // clang-format on
 
@@ -680,7 +723,9 @@ public:
                 d.subscriber_priority, d.has_forward, d.forward,
                 d.has_delivery_timeout, d.delivery_timeout_us,
                 {d.tokens, d.token_count},
-                d.has_new_group_request, d.new_group_request};
+                d.has_new_group_request, d.new_group_request,
+                d.has_filter, d.filter,
+                d.start_group, d.start_object, d.end_group};
         }
         case MOQ_EVENT_OBJECT_CHUNK: {
             auto &d = e.u.object_chunk;
@@ -771,7 +816,9 @@ public:
                 bytes_view(d.track_name), d.track_alias, d.forward,
                 {d.track_properties.data, d.track_properties.len},
                 {d.tokens, d.token_count},
-                d.dynamic_groups};
+                d.dynamic_groups,
+                d.has_largest, d.largest_group, d.largest_object,
+                d.has_expires, d.expires_ms};
         }
         case MOQ_EVENT_PUBLISH_OK: {
             auto &d = e.u.publish_ok;
@@ -780,7 +827,9 @@ public:
                 group_order_from_c(d.group_order),
                 d.has_delivery_timeout, d.delivery_timeout_ms,
                 d.has_expires, d.expires_ms,
-                d.has_new_group_request, d.new_group_request};
+                d.has_new_group_request, d.new_group_request,
+                d.has_filter, subscribe_filter_from_c(d.filter),
+                d.start_group, d.start_object, d.end_group};
         }
         case MOQ_EVENT_PUBLISH_ERROR: {
             auto &d = e.u.publish_error;
@@ -857,7 +906,24 @@ public:
                 d.subscriber_priority, d.has_forward, d.forward,
                 d.has_delivery_timeout, d.delivery_timeout_us,
                 {d.tokens, d.token_count},
-                d.has_new_group_request, d.new_group_request};
+                d.has_new_group_request, d.new_group_request,
+                d.has_filter, d.filter,
+                d.start_group, d.start_object, d.end_group};
+        }
+
+        case MOQ_EVENT_SUBSCRIPTION_UPDATE_OK: {
+            auto &d = e.u.subscription_update_ok;
+            return event::subscription_update_ok{
+                subscription(d.sub), d.has_largest,
+                d.largest_group, d.largest_object,
+                d.has_expires, d.expires_ms};
+        }
+        case MOQ_EVENT_PUBLICATION_UPDATE_OK: {
+            auto &d = e.u.publication_update_ok;
+            return event::publication_update_ok{
+                publication(d.pub), d.has_largest,
+                d.largest_group, d.largest_object,
+                d.has_expires, d.expires_ms};
         }
         default:
             return event::unknown{e.kind};

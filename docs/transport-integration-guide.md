@@ -6,7 +6,8 @@ public headers, examples, and tests** — no private context.
 
 libmoq's protocol core is sans-I/O. A *transport adapter* connects a
 `moq_session_t` to a real QUIC/WebTransport stack. A *managed facade*
-goes one step further: it owns the QUIC context, a network thread, the
+goes one step further: it owns the QUIC context, a managed execution
+context (a network thread, or wtquic-Network's serial queue), the
 connection lifecycle, and the session, and hands you a running
 `moq_session_t` to drive. Applications almost always want a managed
 facade.
@@ -28,6 +29,8 @@ C++ attach mode for callers that already own a `proxygen::WebTransport`
 | **picoquic WebTransport** | WebTransport over HTTP/3 (ALPN `h3`) | picoquic h3zero/picowt (C) | light (same as picoquic + HTTP/3) | yes (experimental) — `moq/pico_wt.h` installs (CMake + `libmoq-pico-wt.pc`); `moq/pico_wt_managed.h` installs (CMake + `libmoq-pico-wt-managed.pc`) when `MOQ_BUILD_PICO_WT_MANAGED=ON` | `moq_pico_wt_managed_t` (experimental) | browser/WebTransport interop |
 | **mvfst raw** | raw QUIC (ALPN `moqt-16`) | Meta mvfst (C++/folly) | heavy (folly, fizz, mvfst, C++ toolchain) | yes — installed, but **CMake-only** (no `pkg-config` entry) | `moq_mvfst_managed_t` | servers/relays already in the folly ecosystem; multi-connection server |
 | **proxygen WebTransport** | WebTransport | proxygen (C++) | heavy (proxygen/folly) | yes (experimental) — installed as **CMake-only** components `adapter-proxygen-wt` (attach) + `adapter-proxygen-wt-managed` (managed), no `.pc` | `moq_proxygen_wt_managed_t` (experimental) | WebTransport in a proxygen/folly C++ service — see §10 |
+| **wtquic Network.framework** | WebTransport over HTTP/3 (Network.framework) | wtquic `network` component (C, Apple-only) | light (wtquic; no MsQuic for this path) | yes (experimental, Apple-only) — `moq/wtquic_network_managed.h` installs (CMake component `adapter-wtquic-network-managed` + `libmoq-wtquic-network-managed.pc`) when `MOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON` | `moq_wtquic_network_managed_t` (experimental; client-only, lane API, serial-queue domain — no worker thread) | Apple apps wanting WT on the system network stack |
+| **wtquic MsQuic** | WebTransport over HTTP/3 (MsQuic) | wtquic `msquic` component (C) | MsQuic + wtquic (C) | yes (experimental) — `moq/wtquic_msquic_managed.h` installs (CMake component `adapter-wtquic-msquic-managed` + `libmoq-wtquic-msquic-managed.pc`) when `MOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON` | `moq_wtquic_msquic_managed_t` (experimental; lane API, coordinator + doorbell worker threads; service-tier client-only) | cross-platform WebTransport over MsQuic; real multi-version negotiation |
 
 Quick rules of thumb:
 
@@ -42,14 +45,38 @@ Quick rules of thumb:
   WT CONNECT, owns the thread + session; explicit-select only — see §10), or
   a C++ attach mode where you own the `proxygen::WebTransport*` and the
   session lifecycle yourself. Installable CMake-only (no `.pc`).
+- **Apple app, WebTransport on the system stack →** wtquic
+  Network.framework client (`moq_wtquic_network_managed_t`): client-only, one
+  lane/one connection, no worker thread (wtquic's serial queue is the
+  session domain — actor-friendly for Swift hosts). Not raw QUIC and not
+  a server.
+- **Cross-platform WebTransport over MsQuic →** wtquic MsQuic managed facade
+  (`moq_wtquic_msquic_managed_t`): WebTransport with real per-connection
+  multi-version WT-Protocol negotiation, owns its coordinator + doorbell worker
+  threads. From the service tier it is the client-only
+  `MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC`. Distinct from **direct MsQuic**
+  (raw QUIC, exact-version, `MOQ_TRANSPORT_BACKEND_MSQUIC`) and **wtquic
+  Network.framework** (Apple-only system stack).
 
 ---
 
 ## 2. The common managed-consumer pattern
 
 Every managed facade follows the same shape. Names differ by a prefix
-(`moq_pq_threaded_`, `moq_pico_wt_managed_`, `moq_mvfst_managed_`); the
-flow is identical.
+(`moq_pq_threaded_`, `moq_pico_wt_managed_`, `moq_mvfst_managed_`,
+`moq_msquic_managed_`); the flow is identical.
+
+The three **raw-QUIC** managed adapters — msquic, mvfst, and
+picoquic_threaded — and the **wtquic Network.framework managed client**
+(`moq_wtquic_network_managed_`, WebTransport, Apple/client-only) share the
+unified **lane** API: the pump callback is
+`on_lane_pump(handle, lane, now, user)`, servers iterate a lane's
+connections with `<prefix>_lane_next_conn(lane, prev)`, and each is a
+single serialized lane (`cfg.lane_count > 1` → `MOQ_ERR_UNSUPPORTED`;
+msquic additionally supports multiple real lanes; the wtquic Network
+client degenerates to one lane owning one client connection). The other
+WebTransport managed adapters (`moq_pico_wt_managed_`, proxygen) still
+use the older `on_pump(handle, now, ctx)` shape.
 
 ```c
 /* 1. Configure (ABI-safe: always cfg_init first). */
@@ -59,17 +86,23 @@ cfg.alloc        = moq_alloc_default();      /* or your allocator */
 cfg.perspective  = MOQ_PERSPECTIVE_CLIENT;   /* or _SERVER */
 cfg.host         = "203.0.113.4";            /* client: remote host */
 cfg.port         = 4433;
-cfg.on_pump      = on_pump;                  /* REQUIRED, see §3 */
-cfg.on_pump_ctx  = &app;                     /* (mvfst uses user_ctx) */
+cfg.on_lane_pump = on_lane_pump;             /* lane adapters: REQUIRED,
+                                              * see §3 (pico-WT/proxygen
+                                              * still use on_pump) */
+cfg.on_lane_pump_ctx = &app;                 /* (mvfst: user_ctx;
+                                              * wtquic-Network:
+                                              * on_lane_pump_user) */
 /* cert policy: see §5 */
 
-/* 2. Create — spawns the network thread, returns once it is running
- *    (or failed). The TLS/WT handshake completes asynchronously. */
+/* 2. Create — starts the managed execution context (a network
+ *    thread; wtquic-Network instead binds its backend serial
+ *    queue), returns once it is underway (or failed). The TLS/WT
+ *    handshake completes asynchronously. */
 moq_<backend>_t *t = NULL;
 if (moq_<backend>_create(&cfg, &t) != MOQ_OK) { /* handle */ }
 
-/* 3. App thread: block until the network thread signals progress.
- *    Never touch the session from here. */
+/* 3. App thread: block until the managed execution context
+ *    signals progress. Never touch the session from here. */
 while (!app.done) {
     moq_result_t r = moq_<backend>_wait(t, 100000 /* us */);
     if (r == MOQ_ERR_CLOSED) break;          /* stopped / fatal / exit */
@@ -78,31 +111,50 @@ while (!app.done) {
 if (moq_<backend>_is_fatal(t)) { /* report fatal_code */ }
 
 /* 4. Stop then destroy, from the app thread, never from a callback. */
-moq_<backend>_stop(t);       /* idempotent; joins the network thread */
+moq_<backend>_stop(t);       /* idempotent; waits for managed
+                              * teardown (joins the thread, or the
+                              * wtquic-Network queue drain) */
 moq_<backend>_destroy(t);
 ```
 
 `wait()` returns `MOQ_OK` (the pump ran), `MOQ_DONE` (timeout, no
 activity), or `MOQ_ERR_CLOSED` (stopped, fatal, or the pump asked to
 exit). `timeout_us == 0` is a non-blocking poll; `UINT64_MAX` waits
-indefinitely. `wake()` (any thread, coalesced) nudges the network thread
-to run `on_pump` when your app thread has queued work for it.
+indefinitely. `wake()` (any thread, coalesced) nudges the managed
+context to run the pump callback (`on_lane_pump` or `on_pump`) when
+your app thread has queued work for it — absent a concurrent stop,
+every accepted wake is followed by at least one pump pass (bursts may
+share a pass; a wake racing stop may be absorbed by teardown).
 
 > mvfst note: `destroy()` calls `stop()` internally, so the mvfst
 > example calls only `destroy()`. The other facades expect explicit
 > `stop()` then `destroy()`. Calling `stop()` before `destroy()` is
 > always safe.
+>
+> wtquic-Network variation (`moq_wtquic_network_managed_`): the pump user
+> field is `on_lane_pump_user`; there is NO network thread — wtquic's
+> backend-owned serial queue is the session domain, so blocking
+> `stop()`/`join()`/`wait()` are off-domain-only and actor hosts use
+> `stop_begin()` + `cfg.on_stopped` instead; the lane iterator and
+> conn-view accessors are STRICT (valid only inside `on_lane_pump` —
+> posted closures use the `managed_session()`/`managed_adapter()`
+> actor escape hatch); and wake() rings a preallocated doorbell —
+> non-allocating and coalesced like the other facades, with one honest
+> caveat: an MOQ_OK wake racing stop may be absorbed by teardown
+> (MOQ_OK is not a delivery receipt across a stop race).
 
 ---
 
 ## 3. Threading rules (read this twice)
 
 `moq_session_t` is **single-thread-confined**. The managed facade runs
-it on its own network thread. Therefore:
+it on its own managed execution context (a network thread, or
+wtquic-Network's serial queue). Therefore:
 
-- **`on_pump` is the only place you may call `moq_session_*`,
-  `moq_sub_*`, or `moq_pub_*`.** It runs on the network thread between
-  transport service calls. Subscribe, poll events, read objects,
+- **The pump callback (`on_lane_pump` or `on_pump`) is the only place
+  you may call `moq_session_*`, `moq_sub_*`, or `moq_pub_*`.** It runs
+  on the managed thread (or, for wtquic-Network, the serial-queue
+  domain) between transport service calls. Subscribe, poll events, read objects,
   publish — all here. Return `0` to continue, nonzero to request a clean
   loop exit (after which `wait()` returns `MOQ_ERR_CLOSED` and
   `is_fatal()` stays false).
@@ -110,8 +162,8 @@ it on its own network thread. Therefore:
   is up (after the connection / WT CONNECT is established); treat NULL
   as "not ready yet; return 0". Even when the accessor is reachable from
   another thread, **the returned `moq_session_t` is single-thread-
-  confined and must only be touched on the managed/network thread —
-  normally inside `on_pump`.** Do not call session APIs on the app
+  confined and must only be touched on the managed execution context —
+  normally inside the pump callback.** Do not call session APIs on the app
   thread just because the pointer is non-NULL.
 - **`on_activity` is signal-only.** Do not call any session/adapter API
   from it — use it to set a flag or signal a condvar.
@@ -119,9 +171,11 @@ it on its own network thread. Therefore:
   (e.g. pushes decoded objects onto a mutex-protected queue); the app
   thread consumes. `wake()`/`wait()` are the only sanctioned
   cross-thread signals into/out of the facade.
-- **Never call `stop()`/`destroy()` from `on_pump`/`on_activity`.**
-  `stop()` from the network thread is rejected (`MOQ_ERR_WRONG_STATE`
-  for raw picoquic threaded and picoquic WT; `MOQ_ERR_INVAL` for mvfst).
+- **Never call `stop()`/`destroy()` from the pump callback or
+  `on_activity`.**
+  A blocking `stop()` from the managed execution context is rejected
+  (`MOQ_ERR_WRONG_STATE` for raw picoquic threaded, picoquic WT, and
+  an on-domain wtquic-Network call; `MOQ_ERR_INVAL` for mvfst).
 
 This is exactly how the VLC input module is built: the pump fills a
 packet queue under a mutex; the demux thread drains it after `wait()`.
@@ -130,7 +184,8 @@ packet queue under a mutex; the demux thread drains it after `wait()`.
 
 ## 4. Subscriber skeletons
 
-The `on_pump` body is nearly identical across backends — only the
+The pump-callback body (`on_lane_pump` or `on_pump`) is nearly
+identical across backends — only the
 facade type and session accessor differ. A robust pump: get the session
 (bail if NULL), subscribe once after setup completes, drain events.
 
@@ -139,8 +194,10 @@ facade type and session accessor differ. A robust pump: get the session
 ```c
 #include <moq/picoquic_threaded.h>
 
-static int on_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
+static int on_lane_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                        uint64_t now, void *ctx) {
     app_t *a = ctx;
+    (void)lane;   /* a client's single session: use _session() */
     moq_session_t *s = moq_pq_threaded_session(t);
     if (!s) return 0;
     moq_event_t ev;
@@ -158,7 +215,8 @@ static int on_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
     }
     return 0;
 }
-/* cfg: perspective=CLIENT, host, port, on_pump, on_pump_ctx.
+/* cfg: perspective=CLIENT, host, port, on_lane_pump, on_lane_pump_ctx.
+ * lane_count > 1 -> MOQ_ERR_UNSUPPORTED (single network thread = one lane).
  * Raw QUIC uses MOQ_PQ_ALPN_DEFAULT ("moqt-16"). */
 ```
 
@@ -185,20 +243,25 @@ static int on_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx) {
 
 ### mvfst raw (`moq_mvfst_managed_t`)
 
-Same pump shape; note mvfst uses a single `user_ctx` (no separate
-`on_pump_ctx`) and `moq_session_poll_events_ex` in the example.
+Same pump shape; note mvfst's callback is `on_lane_pump` (it takes a
+`lane`), uses a single `user_ctx` (no separate `on_pump_ctx`), and
+`moq_session_poll_events_ex` in the example. mvfst is single-EventBase,
+so it has exactly one lane; `cfg.lane_count > 1` → `MOQ_ERR_UNSUPPORTED`.
 
 ```c
 #include <moq/mvfst.h>
 
-static int on_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx) {
+static int on_lane_pump(moq_mvfst_managed_t *m,
+                        moq_mvfst_managed_lane_t *lane,
+                        uint64_t now, void *ctx) {
     app_t *a = ctx;
+    (void)lane;   /* a client's single session: use managed_session() */
     moq_session_t *s = moq_mvfst_managed_session(m);
     if (!s) return 0;
     /* ...same SETUP_COMPLETE → subscribe, OBJECT_RECEIVED → consume... */
     return 0;
 }
-/* cfg: perspective=CLIENT, host, port, on_pump, user_ctx,
+/* cfg: perspective=CLIENT, host, port, on_lane_pump, user_ctx,
  * send_request_capacity=true, initial_request_capacity=16.
  * Raw QUIC. ALPN/version via cfg.alpn_list/alpn_count (default "moqt-16").
  * Exact-version adapter: a single ALPN only; alpn_count > 1 (AUTO) →
@@ -339,15 +402,15 @@ backend-agnostic and should not change when you switch stacks.
 
 Servers/publishers use the same managed pattern with
 `perspective = MOQ_PERSPECTIVE_SERVER` and `cert_path`/`key_path` set.
-Inside `on_pump`:
+Inside the pump callback:
 
 - Accept incoming subscribes: on `MOQ_EVENT_SUBSCRIBE_REQUEST`, call
   `moq_session_accept_subscribe(...)`, then open a subgroup and write
   objects (`moq_session_open_subgroup` → `moq_session_write_object` →
   `moq_session_close_subgroup`), or use the `moq_pub_*` publisher facade.
-- mvfst servers are multi-connection: iterate with
-  `moq_mvfst_managed_next_conn()` and use `moq_mvfst_conn_session()` per
-  connection. The picoquic WT managed server is **single-connection** —
+- mvfst servers are multi-connection: inside `on_lane_pump`, iterate the
+  lane with `moq_mvfst_lane_next_conn()` and use
+  `moq_mvfst_conn_session()` per connection. The picoquic WT managed server is **single-connection** —
   a second WT CONNECT is refused with HTTP 501, and the refused client
   sees a deterministic terminal **fatal** (`wait()` → `MOQ_ERR_CLOSED`,
   `is_fatal()`, `fatal_code()==0`, `session()` NULL), not a silent
@@ -498,9 +561,12 @@ leaks into core or any non-proxygen header. A C++ compiler and a discoverable
 ## 11. What not to do
 
 - **Do not call `moq_session_*` (or `moq_sub_*`/`moq_pub_*`) from the
-  app thread.** Only `on_pump` may touch the session. This is the
-  single most common way to corrupt state.
-- **Do not call `stop()`/`destroy()` from `on_pump`/`on_activity`.**
+  app thread.** Only the pump callback (`on_lane_pump`/`on_pump`) may
+  touch the session (wtquic-Network additionally allows posted
+  closures on its serial domain). This is the single most common way
+  to corrupt state.
+- **Do not call `stop()`/`destroy()` from the pump callback or
+  `on_activity`.**
 - **Do not call session/adapter APIs from `on_activity`** — it is
   signal-only.
 - **Do not include internal adapter headers** (`pico_wt_adapter.h`,

@@ -1,5 +1,5 @@
 /*
- * moq_media_sender_t slice 1: cfg validation, attach/create ownership and
+ * moq_media_sender_t: cfg validation, attach/create ownership and
  * endpoint attachment gating, add_track gating, the sync-anchored
  * pre-ready queue, terminal behavior, and a live loopback against a
  * raw-session picoquic server that accepts the namespace so the sender
@@ -60,7 +60,10 @@ typedef struct {
 
 typedef struct {
     atomic_bool  ns_accepted;
-    bool         no_subscribe;    /* gate the MEDIA ("v") subscription only --
+    atomic_bool  no_subscribe;    /* main thread flips it mid-test while the
+                                     server pump reads it: atomic, like
+                                     ns_accepted. Gates the MEDIA ("v")
+                                     subscription only --
                                      the catalog is always subscribed, so the
                                      network pump stays active and the drain
                                      runs even while "v" has no subscriber */
@@ -71,6 +74,11 @@ typedef struct {
                                          "v" objects have arrived (late-join);
                                          0 = subscribe immediately */
     bool         cat_hold;        /* delay the catalog SUBSCRIBE (late joiner) */
+    bool         push_mode;       /* PUSH consumer: accept every PUBLISH, never
+                                     SUBSCRIBE anything -- catalog generations
+                                     must arrive via publication-forward demand */
+    bool         pub_cat_ok;      /* accepted the catalog track's PUBLISH */
+    moq_publication_t pub_cat;    /* its handle (capture key in push mode) */
     bool         cat_subscribed;
     bool         cat_fetch_issued; /* Joining FETCH(offset 0) for the catalog --
                                       how a joiner obtains the retained generation
@@ -93,6 +101,9 @@ typedef struct {
     int          a_count;         /* count of "a" objects (any status) */
     int          v_done;          /* count of SUBSCRIBE_DONE on "v" */
     uint64_t     v_done_status;   /* status code of the last "v" SUBSCRIBE_DONE */
+    uint64_t     v_done_streams;  /* stream count of the last "v" done */
+    uint64_t     v_finite_end;    /* nonzero: subscribe "v" ABSOLUTE_RANGE
+                                     {0,0}..end (finite-window completion) */
     int          a_done;          /* count of SUBSCRIBE_DONE on "a" */
     uint64_t     a_done_status;   /* status code of the last "a" SUBSCRIBE_DONE */
     uint64_t     ev_seq;          /* monotonic observation counter (catalog
@@ -119,8 +130,9 @@ static srv_state_t g_srv;
 
 static int srv_count(srv_state_t *st);   /* defined below; used in the pump */
 
-static bool srv_do_subscribe(moq_session_t *session, const char *name,
-                             uint64_t now_us, moq_subscription_t *out)
+static bool srv_do_subscribe_filtered(moq_session_t *session, const char *name,
+                                      uint64_t now_us, uint64_t finite_end,
+                                      moq_subscription_t *out)
 {
     moq_bytes_t parts[] = {
         MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
@@ -129,8 +141,20 @@ static bool srv_do_subscribe(moq_session_t *session, const char *name,
     scfg.struct_size = sizeof(scfg);
     scfg.track_namespace = (moq_namespace_t){ parts, 2 };
     scfg.track_name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
-    scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    if (finite_end) {
+        scfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        scfg.start_group = 0; scfg.start_object = 0;
+        scfg.end_group = finite_end;
+    } else {
+        scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    }
     return moq_session_subscribe(session, &scfg, now_us, out) == MOQ_OK;
+}
+
+static bool srv_do_subscribe(moq_session_t *session, const char *name,
+                             uint64_t now_us, moq_subscription_t *out)
+{
+    return srv_do_subscribe_filtered(session, name, now_us, 0, out);
 }
 
 /* Record one catalog generation (group/object + verbatim JSON). Shared by the
@@ -160,8 +184,10 @@ static void srv_capture_catalog(srv_state_t *st, uint64_t group, uint64_t object
     pthread_mutex_unlock(&st->mu);
 }
 
-static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     srv_state_t *st = (srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -175,6 +201,21 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
             moq_session_accept_namespace(session,
                 ev.u.namespace_published.ann, &acc, now_us);
             atomic_store(&st->ns_accepted, true);
+        } else if (st->push_mode && ev.kind == MOQ_EVENT_PUBLISH_REQUEST) {
+            /* Push consumer: accept every PUBLISH; remember the catalog
+             * track's publication handle so its live generations (delivered
+             * WITHOUT any SUBSCRIBE) can be captured below. */
+            const moq_publish_request_event_t *pr = &ev.u.publish_request;
+            moq_accept_publish_cfg_t acc;
+            moq_accept_publish_cfg_init(&acc);
+            if (moq_session_accept_publish(session, pr->pub, &acc,
+                                           now_us) == MOQ_OK &&
+                pr->track_name.len == strlen(MOQ_MSF_CATALOG_TRACK_NAME) &&
+                memcmp(pr->track_name.data, MOQ_MSF_CATALOG_TRACK_NAME,
+                       pr->track_name.len) == 0) {
+                st->pub_cat = pr->pub;
+                st->pub_cat_ok = true;
+            }
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
             const moq_object_received_event_t *o = &ev.u.object_received;
             /* Capture the catalog payload (so a test can verify what the sender
@@ -183,6 +224,10 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
              * objects. */
             if (st->cat_subscribed && moq_subscription_eq(o->sub, st->sub_cat)) {
                 /* Live catalog generations (republishes) arrive here. */
+                srv_capture_catalog(st, o->group_id, o->object_id, o->payload);
+            } else if (st->pub_cat_ok &&
+                       moq_publication_eq(o->pub, st->pub_cat)) {
+                /* Push mode: catalog generations ride the PUBLICATION. */
                 srv_capture_catalog(st, o->group_id, o->object_id, o->payload);
             } else if (st->a_subscribed && moq_subscription_eq(o->sub, st->sub_a)) {
                 pthread_mutex_lock(&st->mu);
@@ -258,6 +303,7 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
             if (st->v_subscribed && moq_subscription_eq(dn->sub, st->sub_v)) {
                 st->v_done++;
                 st->v_done_status = dn->status_code;
+                st->v_done_streams = dn->stream_count;
                 st->v_done_seq = ++st->ev_seq;
             } else if (st->a_subscribed &&
                        moq_subscription_eq(dn->sub, st->sub_a)) {
@@ -277,7 +323,7 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
         moq_event_cleanup(&ev);
     }
 
-    if (atomic_load(&st->ns_accepted)) {
+    if (atomic_load(&st->ns_accepted) && !st->push_mode) {
         /* Catalog first (always, unless held for a late-joiner test): drives
          * pump activity + discovery. */
         if (!st->cat_hold && !st->cat_subscribed &&
@@ -299,8 +345,9 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
         }
         /* Media: gated, so a test can keep "v" unsubscribed while the pump
          * stays live via the catalog. */
-        if (!st->no_subscribe && !st->v_subscribed && !st->v_unsubscribed &&
-            srv_do_subscribe(session, "v", now_us, &st->sub_v))
+        if (!atomic_load(&st->no_subscribe) && !st->v_subscribed && !st->v_unsubscribed &&
+            srv_do_subscribe_filtered(session, "v", now_us,
+                                      st->v_finite_end, &st->sub_v))
             st->v_subscribed = true;
         /* Demand test: drop the "v" subscription so the sender sees a left. */
         if (atomic_load(&st->unsub_v_request) && st->v_subscribed &&
@@ -398,8 +445,8 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
         cfg.send_request_capacity = true;
         cfg.initial_request_capacity = 16;
         cfg.goaway_timeout_us = st->goaway_timeout_us;  /* 0 = off for most tests */
-        cfg.on_pump = server_pump;
-        cfg.on_pump_ctx = st;
+        cfg.on_lane_pump = server_pump;
+        cfg.on_lane_pump_ctx = st;
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&cfg, &srv) == MOQ_OK) {
             *out_port = port;
@@ -413,7 +460,10 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
 
 static void fill_cfg(moq_media_sender_cfg_t *cfg, moq_bytes_t *parts)
 {
-    moq_media_sender_cfg_init_live(cfg);
+    /* Sized preset: several tests set APPENDED fields (drop_without_demand,
+     * the lifecycle callbacks) on this cfg; the pointer-only init's frozen
+     * v0 struct_size would make production silently ignore them. */
+    moq_media_sender_cfg_init_live_sized(cfg, sizeof(*cfg));
     parts[0] = MOQ_BYTES_LITERAL("svc");
     parts[1] = MOQ_BYTES_LITERAL("demo");
     cfg->namespace_ = (moq_namespace_t){ parts, 2 };
@@ -659,7 +709,7 @@ static const moq_msf_track_t *find_track(const moq_msf_catalog_t *c,
     return NULL;
 }
 
-/* Distinct objects captured for a catalog group (S2b: object 0 + deltas 1..N). */
+/* Distinct objects captured for a catalog group (object 0 + deltas 1..N). */
 static int group_obj_count(uint64_t group)
 {
     int n = 0;
@@ -706,7 +756,7 @@ static uint64_t cat_gen_seq(uint64_t group)
     return seq;
 }
 
-/* Count distinct catalog GROUPS captured (S2b: a generation is a group whose
+/* Count distinct catalog GROUPS captured (a generation is a group whose
  * object 0 is the independent base and objects 1..N are deltaUpdates). */
 static int count_cat_groups(void)
 {
@@ -1878,7 +1928,7 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
         MOQ_TEST_CHECK(atomic_load(&g_srv.ns_accepted));
 
-        /* add_track after ready is now legal (S1): it registers the track and
+        /* add_track after ready is now legal : it registers the track and
          * triggers a catalog republish. (Dedicated catalog-generation tests
          * below assert the republish placement/content.) */
         moq_media_track_cfg_t tc;
@@ -2090,6 +2140,145 @@ int main(int argc, char **argv)
         moq_pq_threaded_destroy(srv);
     }
 
+    /* == live loopback: finite window auto-completes on a monotonic track = *
+     * The sender declares monotonic groups on every track . A peer
+     * subscribing "v" with a FINITE end (groups {0,0}..1) must be completed
+     * automatically -- SUBSCRIBE_DONE(SUBSCRIPTION_ENDED 0x3) with the EXACT
+     * stream count (groups 0 and 1 only) -- as soon as production begins
+     * group 2, while the open-ended "a" subscription keeps flowing. Also
+     * proves catalog republishing stays legal under monotonic mode: each
+     * generation is a NEW group (sender_prepare_republish advances
+     * pending_group), so the mid-phase add_track must produce a NEW,
+     * CAUSALLY-verified catalog object naming "a2". (Multiple objects
+     * within ONE generation group -- base + delta at objects 0/1 -- are
+     * covered by test_media_sender_push_cursor under the same monotonic
+     * flags.) */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.want_a = true;
+        g_srv.v_finite_end = 1;   /* "v": ABSOLUTE_RANGE {0,0}..1 */
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL, *a = NULL;
+        add_video_track(s, &v);
+        add_audio_track(s, &a);
+
+        /* Group 0 keyframes on both tracks; wait for delivery so the finite
+         * subscription is installed and receiving BEFORE production
+         * advances. */
+        { moq_rcbuf_t *b = mkbuf(16, 1);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, v, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+        { moq_rcbuf_t *b = mkbuf(16, 2);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, a, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+        for (int i = 0; i < 200 &&
+             (srv_count(&g_srv) < 1 || srv_a_count(&g_srv) < 1); i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(srv_count(&g_srv) >= 1);
+        MOQ_TEST_CHECK(srv_a_count(&g_srv) >= 1);
+
+        /* Mid-stream catalog republish: record the PRE-add catalog object
+         * count so the post-add assertion is causal, then add "a2". */
+        int cat_before;
+        pthread_mutex_lock(&g_srv.mu);
+        cat_before = g_srv.cat_n;
+        pthread_mutex_unlock(&g_srv.mu);
+        {
+            moq_media_track_cfg_t tc;
+            moq_media_track_cfg_init(&tc);
+            tc.name = MOQ_BYTES_LITERAL("a2");
+            tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+            tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+            tc.codec = MOQ_BYTES_LITERAL("opus");
+            tc.samplerate = 48000;
+            tc.channel_config = MOQ_BYTES_LITERAL("2");
+            tc.bitrate = 32000;
+            moq_media_track_t *x = NULL;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_media_sender_add_track(s, &tc, &x), (int)MOQ_OK);
+        }
+
+        /* Advance production: keyframes start groups 1, 2, 3 on "v". The
+         * finite window ends at group 1, so beginning group 2 seals it. */
+        for (int g = 1; g <= 3; g++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0x10 + g));
+            moq_media_send_object_t o = mkobj(b, true, true, true);
+            o.presentation_time_us = (uint64_t)(1 + g) * 1000u;
+            if (moq_media_sender_write(s, v, &o) != MOQ_OK) moq_rcbuf_decref(b);
+        }
+
+        /* The finite "v" subscription auto-completes: exactly one
+         * SUBSCRIBE_DONE with SUBSCRIPTION_ENDED (0x3) and the EXACT stream
+         * count -- one subgroup per group, groups 0 and 1 only. */
+        { int vd = 0; uint64_t vs = ~0ull;
+          for (int i = 0; i < 200; i++) {
+              srv_dones(&g_srv, &vd, &vs, NULL, NULL);
+              if (vd >= 1) break;
+              usleep(50000);
+          }
+          MOQ_TEST_CHECK_EQ_INT(vd, 1);
+          MOQ_TEST_CHECK_EQ_U64(vs, 0x3);
+          pthread_mutex_lock(&g_srv.mu);
+          MOQ_TEST_CHECK_EQ_U64(g_srv.v_done_streams, 2);
+          pthread_mutex_unlock(&g_srv.mu); }
+
+        /* The open-ended "a" subscription SURVIVES: more audio still
+         * arrives and no "a" done was sent. */
+        int a_before = srv_a_count(&g_srv);
+        for (int g = 0; g < 3; g++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0x60 + g));
+            moq_media_send_object_t o = mkobj(b, true, true, true);
+            o.presentation_time_us = (uint64_t)(8 + g) * 1000u;
+            if (moq_media_sender_write(s, a, &o) != MOQ_OK) moq_rcbuf_decref(b);
+        }
+        for (int i = 0; i < 200 && srv_a_count(&g_srv) <= a_before; i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(srv_a_count(&g_srv) > a_before);
+        { int ad = 0;
+          srv_dones(&g_srv, NULL, NULL, &ad, NULL);
+          MOQ_TEST_CHECK_EQ_INT(ad, 0); }
+        /* CAUSAL catalog assertion: a NEW catalog object arrived after the
+         * "a2" add, and its payload actually names "a2" -- the monotonic
+         * catalog track still republishes. */
+        { int catn = cat_before; bool has_a2 = false;
+          for (int i = 0; i < 200; i++) {
+              pthread_mutex_lock(&g_srv.mu);
+              catn = g_srv.cat_n;
+              has_a2 = false;
+              for (int j = cat_before; j < g_srv.cat_n; j++) {
+                  const srv_cat_obj_t *c = &g_srv.cats[j];
+                  for (size_t k = 0; k + 4 <= c->len && !has_a2; k++)
+                      if (memcmp(c->buf + k, "\"a2\"", 4) == 0)
+                          has_a2 = true;
+              }
+              pthread_mutex_unlock(&g_srv.mu);
+              if (catn > cat_before && has_a2) break;
+              usleep(50000);
+          }
+          MOQ_TEST_CHECK(catn > cat_before);
+          MOQ_TEST_CHECK(has_a2); }
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+    }
+
     /* == end_track on a subscriber-less track must not wedge the queue ==== *
      * Regression: the terminal marker was checked AFTER the no-subscriber hold,
      * so ending a track with no subscriber parked the marker at the head
@@ -2100,7 +2289,7 @@ int main(int argc, char **argv)
     {
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
-        g_srv.no_subscribe = true;    /* peer never subscribes "v" */
+        atomic_store(&g_srv.no_subscribe, true);    /* peer never subscribes "v" */
         g_srv.want_a = true;          /* but does subscribe "a" */
         moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
         MOQ_TEST_CHECK(srv != NULL);
@@ -2153,7 +2342,7 @@ int main(int argc, char **argv)
     {
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
-        g_srv.no_subscribe = true;
+        atomic_store(&g_srv.no_subscribe, true);
         moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
         MOQ_TEST_CHECK(srv != NULL);
         if (!srv) return 1;
@@ -2191,7 +2380,7 @@ int main(int argc, char **argv)
         /* Now let the server subscribe: the HELD objects (not discarded)
          * are delivered. A broken hold would have emitted them into the
          * subscriber-less publisher and the server would receive none. */
-        g_srv.no_subscribe = false;
+        atomic_store(&g_srv.no_subscribe, false);
         for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
         MOQ_TEST_CHECK(srv_count(&g_srv) >= 3);
         (void)moq_media_sender_get_stats(s, &st, sizeof(st));
@@ -2203,13 +2392,104 @@ int main(int argc, char **argv)
         moq_pq_threaded_destroy(srv);
     }
 
+    /* == PUSH mode: catalog generations flow with NO subscriber ======= *
+     * The peer accepts every PUBLISH but never subscribes anything; the
+     * catalog's initial generation AND every later one (add, remove,
+     * complete) must arrive live via publication-forward demand. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.push_mode = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.publish_tracks = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        /* Generation 0: the initial catalog arrives via the publication.
+         * All waits count DISTINCT GROUPS under the mutex (a generation can
+         * span several delta objects, so object counts cannot phase-gate). */
+        MOQ_TEST_CHECK(wait_cat_gens(1, 400) >= 1);
+
+        /* ADD generation: a post-ready track must republish live. */
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = (moq_bytes_t){ (const uint8_t *)"a2", 2 };
+        tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.codec = (moq_bytes_t){ (const uint8_t *)"opus", 4 };
+        tc.bitrate = 128000;
+        tc.samplerate = 48000;                       /* MSF-01 5.2.28 */
+        tc.channel_config =
+            (moq_bytes_t){ (const uint8_t *)"2", 1 };  /* MSF-01 5.2.29 */
+        tc.is_live = true;
+        moq_media_track_t *a2 = NULL;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_sender_add_track(s, &tc, &a2), (int)MOQ_OK);
+        MOQ_TEST_CHECK(wait_cat_gens(2, 400) >= 2);   /* ADD generation */
+
+        /* REMOVE generation. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_remove_track(s, a2),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK(wait_cat_gens(3, 400) >= 3);   /* REMOVE generation */
+
+        /* COMPLETE generation (live -> VOD conversion metadata). */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+        MOQ_TEST_CHECK(wait_cat_gens(4, 400) >= 4);   /* COMPLETE generation */
+
+        /* ONE final locked snapshot: exact group progression (groups
+         * advance one at a time from the first observed group; object ids
+         * within a group increase without gaps or repeats) and exactly four
+         * observed consecutive generations. The deterministic no-extra /
+         * stability-after-commit proof lives in the internals cursor test
+         * (media_sender_push_cursor), which forces a further generation as
+         * a real barrier -- elapsed time is not a negative oracle here. */
+        pthread_mutex_lock(&g_srv.mu);
+        bool ordered = true;
+        uint64_t g0 = g_srv.cat_n ? g_srv.cats[0].group : 0;
+        uint64_t expect_group = g0, expect_obj = 0;
+        for (int i = 0; i < g_srv.cat_n; i++) {
+            const srv_cat_obj_t *co = &g_srv.cats[i];
+            if (co->group == expect_group + 1) {      /* next generation */
+                expect_group = co->group;
+                expect_obj = 0;
+            }
+            if (co->group != expect_group || co->object != expect_obj) {
+                ordered = false;
+                break;
+            }
+            expect_obj++;
+        }
+        bool four_consecutive = (expect_group == g0 + 3);
+        pthread_mutex_unlock(&g_srv.mu);
+        MOQ_TEST_CHECK(ordered);
+        MOQ_TEST_CHECK(four_consecutive);
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("push_catalog_updates_no_subscriber");
+    }
+
+
     /* == no subscriber, drop_without_demand: stay at the live edge ==== *
      * Media written without demand is dropped (counted); a later
      * subscriber receives only media written after it joined. */
     {
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
-        g_srv.no_subscribe = true;
+        atomic_store(&g_srv.no_subscribe, true);
         moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
         MOQ_TEST_CHECK(srv != NULL);
         if (!srv) return 1;
@@ -2248,7 +2528,7 @@ int main(int argc, char **argv)
 
         /* Demand appears: only the fresh GOP written afterwards reaches the
          * subscriber; the pre-demand GOP is gone. */
-        g_srv.no_subscribe = false;
+        atomic_store(&g_srv.no_subscribe, false);
         for (int i = 0; i < 200 && !moq_media_sender_track_has_subscriber(s, v);
              i++)
             usleep(50000);
@@ -3823,7 +4103,7 @@ int main(int argc, char **argv)
         moq_pq_threaded_destroy(srv);
     }
 
-    /* == S2b: a post-ready generation is object 0 (independent base) + delta
+    /* == a post-ready generation is object 0 (independent base) + delta
      * objects (removes then adds); reconstruct == current. ================= */
     {
         int port = 0;
@@ -3912,7 +4192,7 @@ int main(int argc, char **argv)
         moq_pq_threaded_destroy(srv);
     }
 
-    /* == S2b: a post-ready CMAF init-bearing add falls back to a FULL
+    /* == a post-ready CMAF init-bearing add falls back to a FULL
      * independent generation (CMSF initDataList/initRef shape), NOT a delta with
      * inline initData -- otherwise the surviving track's init shape would differ
      * from the next independent catalog and the receiver would drop it as an
@@ -4338,7 +4618,7 @@ int main(int argc, char **argv)
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
         memset(&g_demand, 0, sizeof(g_demand));
-        g_srv.no_subscribe = true;        /* catalog-only to start; gate "v" */
+        atomic_store(&g_srv.no_subscribe, true);        /* catalog-only to start; gate "v" */
         moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
         MOQ_TEST_CHECK(srv != NULL);
         if (!srv) return 1;
@@ -4348,7 +4628,8 @@ int main(int argc, char **argv)
         moq_media_sender_cfg_t cfg;
         fill_cfg(&cfg, parts);
         cfg.endpoint = &ec;
-        moq_media_sender_callbacks_init(&cfg.callbacks);
+        moq_media_sender_callbacks_init_sized(&cfg.callbacks,
+                                              sizeof(cfg.callbacks));
         cfg.callbacks.ctx = &g_demand;
         cfg.callbacks.on_subscriber_joined = demand_on_join;
         cfg.callbacks.on_subscriber_left = demand_on_left;
@@ -4379,7 +4660,7 @@ int main(int argc, char **argv)
         }
 
         /* (2) allow the peer to subscribe "v": demand appears. */
-        g_srv.no_subscribe = false;
+        atomic_store(&g_srv.no_subscribe, false);
         for (int i = 0; i < 200 && atomic_load(&g_demand.joins) == 0; i++)
             usleep(50000);
         MOQ_TEST_CHECK(atomic_load(&g_demand.joins) == 1);
@@ -4428,7 +4709,8 @@ int main(int argc, char **argv)
         moq_media_sender_cfg_t cfg;
         fill_cfg(&cfg, parts);
         cfg.endpoint = &ec;
-        moq_media_sender_callbacks_init(&cfg.callbacks);
+        moq_media_sender_callbacks_init_sized(&cfg.callbacks,
+                                              sizeof(cfg.callbacks));
         cfg.callbacks.ctx = &g_demand;
         cfg.callbacks.on_subscriber_joined = demand_on_join;
         cfg.callbacks.on_subscriber_left = demand_on_left;
@@ -4471,7 +4753,7 @@ int main(int argc, char **argv)
     {
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
-        g_srv.no_subscribe = true;
+        atomic_store(&g_srv.no_subscribe, true);
         moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
         MOQ_TEST_CHECK(srv != NULL);
         if (!srv) return 1;
@@ -4501,7 +4783,7 @@ int main(int argc, char **argv)
     {
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
-        g_srv.no_subscribe = true;
+        atomic_store(&g_srv.no_subscribe, true);
         moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
         MOQ_TEST_CHECK(srv != NULL);
         if (!srv) return 1;
@@ -4545,7 +4827,8 @@ int main(int argc, char **argv)
         moq_media_sender_cfg_t cfg;
         fill_cfg(&cfg, parts);
         cfg.endpoint = &ec;
-        moq_media_sender_callbacks_init(&cfg.callbacks);
+        moq_media_sender_callbacks_init_sized(&cfg.callbacks,
+                                              sizeof(cfg.callbacks));
         cfg.callbacks.ctx = &g_demand;
         cfg.callbacks.on_subscriber_joined = demand_on_join;
         cfg.callbacks.on_subscriber_left = demand_on_left;
@@ -4611,7 +4894,8 @@ int main(int argc, char **argv)
         fill_cfg(&cfg, parts);
         cfg.endpoint = &ec;
         memset(&g_life, 0, sizeof(g_life));
-        moq_media_sender_callbacks_init(&cfg.callbacks);
+        moq_media_sender_callbacks_init_sized(&cfg.callbacks,
+                                              sizeof(cfg.callbacks));
         cfg.callbacks.ctx = &g_life;
         cfg.callbacks.on_ready = life_on_ready;
         cfg.callbacks.on_closed = life_on_closed;

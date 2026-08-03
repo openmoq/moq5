@@ -1,3 +1,4 @@
+#include <assert.h>
 #include "session_internal.h"
 
 /* Bounded backoff applied to the *reported* next deadline when a subgroup
@@ -31,25 +32,76 @@ static bool session_idle_expired(const moq_session_t *s)
            s->last_now_us >= s->idle_deadline_us;
 }
 
-void session_begin_advance(moq_session_t *s, uint64_t now_us)
+moq_result_t session_scan_dt_props(const moq_session_t *s,
+                                   const uint8_t *data, size_t len,
+                                   bool strict_local, moq_dt_scan_t *out)
 {
-    s->last_now_us = now_us;
-    s->borrow_epoch++;
+    memset(out, 0, sizeof(*out));
+    if (!data || len == 0) return MOQ_OK;
+    moq_result_t rc = s->profile->scan_delivery_timeouts(data, len,
+                                                         strict_local, out);
+    if (rc < 0)
+        memset(out, 0, sizeof(*out));   /* contract: zeroed on failure (the
+                                         * d18 walk may have filled one type
+                                         * before hitting a later duplicate) */
+    return rc;
+}
 
-    if (s->action_head == s->action_tail) {
-        s->send_len = 0;
-        sg_reap_terminal(s);
+/*
+ * Drive the two-pool deferred-completion sweep to its next stopping point.
+ *
+ * Pool order is fixed (publications, then subscriptions) so a resumed sweep
+ * runs the same order it would have uninterrupted. Returns true when BOTH
+ * pools retired -- only then may the caller recompute expiry_retry_deadline_us,
+ * which is armed from the state of the complete sweep and would be wrong if
+ * derived from a partial one.
+ */
+static bool session_sweep_run(moq_session_t *s, uint32_t *budget)
+{
+    if (s->sweep_stage == MOQ_SWEEP_STAGE_REAP_SUBGROUPS) {
+        /* Subgroups are only reaped when the action queue has drained, matching
+         * the send_len reset above. */
+        if (s->action_head == s->action_tail &&
+            !sg_reap_terminal_resumable(s, budget))
+            return false;
+        s->sweep_stage = MOQ_SWEEP_STAGE_PUB;
+        s->sweep_slot = 0;
+        s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
     }
+    if (s->sweep_stage == MOQ_SWEEP_STAGE_PUB) {
+        if (!pub_reap_deferred_dones_resumable(s, budget))
+            return false;
+        s->sweep_stage = MOQ_SWEEP_STAGE_SUB;
+        s->sweep_slot = 0;
+        s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    }
+    if (s->sweep_stage == MOQ_SWEEP_STAGE_SUB) {
+        if (!sub_reap_deferred_dones_resumable(s, budget))
+            return false;
+        s->sweep_stage = MOQ_SWEEP_STAGE_DONE;
+    }
+    return true;
+}
 
+/*
+ * Per-physical-call preparation.
+ *
+ * Runs exactly once for EVERY advancing call, whether or not that call
+ * inherits a suspended cursor, and before any sweep work. A continuation is a
+ * real call: it must invalidate borrows and reclaim whatever the queues have
+ * since drained, or a record polled before the suspension would stay valid
+ * across it and newly empty queues would never release their scratch.
+ */
+static void session_call_prepare(moq_session_t *s)
+{
+    s->borrow_epoch++;
+    if (s->action_head == s->action_tail)
+        s->send_len = 0;
 #ifndef NDEBUG
     if (s->output_scratch_len > 0)
         memset(s->output_scratch, 0xCD, s->output_scratch_len);
 #endif
     s->output_scratch_len = 0;
-
-    /* The event borrow arena holds spans referenced by still-queued
-     * events; it can only recycle once the queue has drained (same
-     * idiom as send_buf above, which waits for the action queue). */
     if (s->event_head == s->event_tail) {
 #ifndef NDEBUG
         if (s->event_scratch_len > 0)
@@ -57,11 +109,207 @@ void session_begin_advance(moq_session_t *s, uint64_t now_us)
 #endif
         s->event_scratch_len = 0;
     }
+}
 
-    /* Retry any deferred PUBLISH_FINISHED whose Stream Count is now satisfied but
-     * whose event could not be queued when its last data stream FIN'd. No-op
-     * unless a subscriber-role PUBLISH_DONE is currently being gated. */
-    pub_reap_deferred_dones(s);
+/* Start a fresh sweep at `now`, or resume the suspended one at ITS epoch.
+ * Returns true when it armed a fresh sweep for this call. */
+static bool session_sweep_arm(moq_session_t *s, uint64_t now_us)
+{
+    if (s->sweep_active) return false;       /* resume: keep sweep_now_us */
+    s->sweep_active = true;
+    s->sweep_stage = MOQ_SWEEP_STAGE_REAP_SUBGROUPS;
+    s->sweep_slot = 0;
+    s->sweep_rx_pos = 0;
+    s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    s->sweep_reaped_subgroup = false;
+    s->sweep_now_us = now_us;
+    /* Logical time advances with the sweep, NOT with the physical call: an
+     * inherited sweep must retire against the epoch it was suspended at, or
+     * every time-derived recomputation it triggers (expiry_retry_deadline_us,
+     * the reported subgroup deadline) would be stamped with a clock that sweep
+     * never ran under. */
+    s->last_now_us = now_us;
+    return true;
+}
+
+/* Clear the per-owner cursor. Called when an owner completes or is abandoned,
+ * so its rx scan position never leaks into the next owner or pool. */
+void session_sweep_owner_reset(moq_session_t *s)
+{
+    s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
+    s->sweep_rx_pos = 0;
+    s->sweep_rx_found = false;
+}
+
+static void session_sweep_retire(moq_session_t *s)
+{
+    s->sweep_active = false;
+    s->sweep_stage = MOQ_SWEEP_STAGE_IDLE;
+    s->sweep_slot = 0;
+    s->sweep_reaped_subgroup = false;
+    session_sweep_owner_reset(s);
+}
+
+void session_sweep_discard(moq_session_t *s)
+{
+    if (s) session_sweep_retire(s);
+}
+
+
+#if defined(MOQ_SESSION_SWEEP_TESTING)
+uint64_t session_budget_enter_count;
+uint64_t session_budget_suspend_count;
+#endif
+
+uint32_t session_budget_remaining(const moq_session_t *s)
+{
+    return s ? s->budget_remaining : 0;
+}
+
+void session_budget_enter(moq_session_t *s, uint32_t budget)
+{
+    if (!s) return;
+#if defined(MOQ_SESSION_SWEEP_TESTING)
+    session_budget_enter_count++;
+#endif
+    /* The bridge is contractually non-reentrant, so nesting is not supported.
+     * Overwriting an active context would silently discard the outer remaining
+     * budget and make the resulting misbehaviour hard to localize. */
+    assert(!s->budget_active);
+    s->budget_active = true;
+    s->budget_remaining = budget;
+}
+
+void session_budget_leave(moq_session_t *s)
+{
+    if (!s) return;
+    s->budget_active = false;
+    s->budget_remaining = 0;
+}
+
+/*
+ * Arm or disarm the single session-level expiry retry.
+ *
+ * Armed iff ANY entry in EITHER pool remains expired with blocked work, which
+ * is why it may only be evaluated after a COMPLETE two-pool sweep: derived from
+ * a partial sweep, one entry finalizing could drop another entry's wake.
+ */
+static void session_expiry_retry_recompute(moq_session_t *s)
+{
+    if (s->state == MOQ_SESS_CLOSED) {
+        s->expiry_retry_deadline_us = UINT64_MAX;
+        return;
+    }
+    bool blocked = false;
+    for (size_t i = 0; !blocked && i < s->sub_cap; i++)
+        if (s->subs[i].done_pending && s->subs[i].done_expired)
+            blocked = true;
+    for (size_t i = 0; !blocked && i < s->pub_cap; i++)
+        if (s->publishes[i].done_pending && s->publishes[i].done_expired)
+            blocked = true;
+    s->expiry_retry_deadline_us = blocked
+        ? deadline_add(s->last_now_us, MOQ_DONE_EXPIRY_RETRY_US)
+        : UINT64_MAX;
+}
+
+/*
+ * Run the deferred-completion sweep for one advancing call.
+ *
+ * Every call prepares itself once (borrows invalidated, drained queues
+ * reclaimed), then: an inherited cursor is completed FIRST at ITS own epoch,
+ * and this call afterwards runs ONE fresh sweep at its own now_us -- always,
+ * not only when the clock advanced. Equal timestamps still owe one, because
+ * replay/refeed since the suspension can make an owner the old cursor already
+ * walked past runnable again.
+ *
+ * budget == NULL is unlimited mode, which never returns suspended -- what keeps
+ * the private sentinel out of every application-facing result.
+ *
+ * With a budget it may stop mid-sweep and report suspension; the cursor holds
+ * the resume point. expiry_retry_deadline_us is recomputed only when the
+ * COMPLETE two-pool sweep retires.
+ */
+static bool session_advance_sweep(moq_session_t *s, uint64_t now_us,
+                                  uint32_t *budget)
+{
+    session_call_prepare(s);
+
+    for (;;) {
+        bool fresh = session_sweep_arm(s, now_us);
+        if (!session_sweep_run(s, budget))
+            return false;                    /* suspended: cursor holds place */
+
+        session_sweep_retire(s);
+        session_expiry_retry_recompute(s);   /* complete sweep only */
+
+        /* Catch-up: an INHERITED sweep ran at the epoch it was suspended at, so
+         * this call still owes a sweep of its own before its caller mutates --
+         * budgeted callers included. Keyed on which sweep just finished, not on
+         * the timestamps: a continuation at the SAME time still owes one,
+         * because replay/refeed since the suspension can have made an owner the
+         * old cursor already walked past runnable again. */
+        if (fresh)
+            return true;
+    }
+}
+
+/*
+ * Budgeted form of the advancing-call preamble.
+ *
+ * Requires an active budget context (bridge service brackets one); it spends
+ * s->budget_remaining directly, so the caller's ledger and the sweep's spending
+ * are the same counter.
+ *
+ * Returns MOQ_SESSION_SUSPENDED ONLY when runnable work could not be afforded.
+ * A pool that is empty, or holds only future/count-unsatisfied owners, has no
+ * runnable work and therefore completes even at zero budget. On suspension the
+ * cursor stays active and holds the exact resume point, including its own
+ * sweep_now_us epoch.
+ *
+ * Private: declared in the non-installed session_transport.h and returned only
+ * across internal boundaries. No application-facing caller can observe it.
+ */
+moq_result_t session_begin_advance_budgeted(moq_session_t *s, uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    assert(s->budget_active);
+    if (!session_advance_sweep(s, now_us, &s->budget_remaining)) {
+#if defined(MOQ_SESSION_SWEEP_TESTING)
+        session_budget_suspend_count++;
+#endif
+        return MOQ_SESSION_SUSPENDED;
+    }
+    return MOQ_OK;
+}
+/*
+ * Begin an advancing call.
+ *
+ * Per-call preparation runs once, then the session-owned stage machine
+ * (REAP_SUBGROUPS -> PUB -> SUB -> DONE) completes any inherited cursor at its
+ * own epoch and runs one fresh sweep at this call's now_us. Unlimited mode
+ * drives both to completion and cannot suspend.
+ */
+void session_begin_advance(moq_session_t *s, uint64_t now_us)
+{
+    (void)session_advance_sweep(s, now_us, NULL);
+}
+
+/*
+ * Advancing-call preamble for the entry points bridge service can reach.
+ *
+ * With no budget context this is exactly session_begin_advance(): unlimited
+ * mode drives the stage machine to completion and cannot suspend, so an
+ * application-facing caller never observes MOQ_SESSION_SUSPENDED. Inside a
+ * budget context the sweep may stop, and the caller must return the sentinel
+ * WITHOUT refreshing idle or performing its own transition -- that transition
+ * would otherwise mutate state the sweep has not yet reached.
+ */
+moq_result_t session_advance_entry(moq_session_t *s, uint64_t now_us)
+{
+    if (s->budget_active)
+        return session_begin_advance_budgeted(s, now_us);
+    session_begin_advance(s, now_us);
+    return MOQ_OK;
 }
 
 /* -- Action resource cleanup --------------------------------------- */
@@ -325,6 +573,26 @@ bool moq_session_uses_uni_control(const moq_session_t *s)
     return s->profile->uses_uni_control_channel;
 }
 
+uint64_t moq_session_event_progress_token(const moq_session_t *s)
+{
+    return s->event_progress_token;
+}
+
+bool moq_session_terminal_enqueued(const moq_session_t *s)
+{
+    return s != NULL && s->terminal_enqueued;
+}
+
+bool moq_session_terminal_observed(const moq_session_t *s)
+{
+    return s != NULL && s->terminal_observed;
+}
+
+bool moq_session_has_events(const moq_session_t *s)
+{
+    return s->event_head != s->event_tail;
+}
+
 moq_uni_class_t moq_session_classify_peer_uni(const moq_session_t *s,
                                               const uint8_t *data, size_t len)
 {
@@ -382,6 +650,18 @@ moq_result_t push_event(moq_session_t *s, const moq_event_t *e)
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     s->events[s->event_tail % s->event_cap] = *e;
     s->event_tail++;
+    /* Monotonic event-progress token: advances on every enqueue (here) AND every
+     * dequeue (moq_session_poll_events_ex). A caller that services the session on
+     * a pass separate from the one that drains events (the managed adapters'
+     * coalesced doorbell) compares it across a whole pump+service cycle to tell
+     * "progress was made" (the queue was refilled OR drained) from "nothing
+     * moved". Combined with has_events it drives a bounded re-pump that closes
+     * both the small-queue (service refilled) and large-queue (bounded pump left
+     * a residual) cases, without spinning a non-draining app. Never reset
+     * (queue-index resets do not touch it); unsigned wrap is fine — callers only
+     * compare for equality. Surfaced through the private adapter SPI, never the
+     * public API. */
+    s->event_progress_token++;
     return MOQ_OK;
 }
 
@@ -484,6 +764,131 @@ bool event_scratch_fits_aligned(const moq_session_t *s, size_t count,
     remaining -= array_bytes;
     if (tail_bytes > remaining) return false;
     return true;
+}
+
+/* Copy a namespace (aligned parts array + per-part byte tails) into the event
+ * scratch arena, transactionally: on any failure the arena cursor is restored
+ * exactly and *dst is left unwritten -- a retry after capacity returns starts
+ * from the same cursor, with no cumulative leak. A zero-part namespace
+ * succeeds without touching the arena at all: the wire permits count == 0, an
+ * empty array needs no storage, and consuming alignment padding for it would
+ * charge capacity for nothing while shifting later regions' alignment.
+ * Zero-length individual parts stay valid ({NULL, 0}, matching
+ * event_scratch_copy's len == 0 result). The count multiplication is
+ * overflow-checked; the aligned allocation's own arithmetic is already
+ * overflow-safe.
+ *
+ * Callers that stage a namespace as one region of a larger event weigh the
+ * whole composite first and use this only to copy that region -- the REDIRECT
+ * event does exactly that, so its classifier, not this helper, decides whether
+ * the copy can proceed at all. */
+bool event_scratch_copy_namespace(moq_session_t *s,
+                                  const moq_namespace_t *src,
+                                  moq_namespace_t *dst)
+{
+    if (src->count == 0) {
+        dst->parts = NULL;
+        dst->count = 0;
+        return true;
+    }
+    if (src->count > SIZE_MAX / sizeof(moq_bytes_t)) return false;
+
+    size_t saved = s->event_scratch_len;
+    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
+        s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
+    if (!parts) return false;   /* alloc_aligned mutates nothing on failure */
+
+    for (size_t i = 0; i < src->count; i++) {
+        uint8_t *data = event_scratch_copy(s, src->parts[i].data,
+                                           src->parts[i].len);
+        if (!data && src->parts[i].len > 0) {
+            s->event_scratch_len = saved;
+            return false;
+        }
+        parts[i].data = data;
+        parts[i].len  = src->parts[i].len;
+    }
+
+    dst->parts = parts;
+    dst->count = src->count;
+    return true;
+}
+
+/* Classify a SETUP completion event's total scratch requirement -- the resolved
+ * token-value byte tails in order, then the alignment padding those tails leave
+ * before an aligned moq_resolved_token_t array of token_count entries -- against
+ * both an empty arena and the live cursor.
+ *
+ * The two answers are different questions. A requirement that cannot fit an
+ * EMPTY arena can never be satisfied by draining events, so it is permanent and
+ * the caller closes the session. A requirement that fits an empty arena but not
+ * the current tail is transient: the arena recycles when the event queue drains,
+ * so the caller retains the message and returns WOULD_BLOCK.
+ *
+ * The alignment padding is measured from the cursor AFTER the byte tails,
+ * because that is where the array actually lands; measuring it from the arena
+ * base, or ordering the array before the tails, computes a different (and
+ * sometimes smaller) requirement than the copy will consume. All arithmetic is
+ * subtraction-based so no sum can wrap; an overflowing requirement is
+ * permanent, never a wait. A zero token_count needs no bytes and no padding. */
+static bool setup_event_scratch_requirement_fits(const moq_session_t *s,
+                                                 const moq_resolved_token_t *toks,
+                                                 size_t token_count,
+                                                 size_t from_cursor)
+{
+    if (token_count == 0) return true;
+    if (token_count > SIZE_MAX / sizeof(moq_resolved_token_t)) return false;
+
+    if (from_cursor > s->event_scratch_cap) return false;
+    size_t remaining = s->event_scratch_cap - from_cursor;
+    size_t cursor = from_cursor;
+
+    for (size_t i = 0; i < token_count; i++) {
+        size_t len = toks[i].token_value.len;
+        if (len > remaining) return false;
+        remaining -= len;
+        cursor += len;
+    }
+
+    const size_t align = _Alignof(moq_resolved_token_t);
+    size_t pad = (align - (cursor & (align - 1))) & (align - 1);
+    if (pad > remaining) return false;
+    remaining -= pad;
+
+    size_t array_bytes = token_count * sizeof(moq_resolved_token_t);
+    return array_bytes <= remaining;
+}
+
+/* Decide, before any copying, whether a SETUP completion event's tokens can be
+ * staged now, later, or never. PERMANENT means close; BLOCKED means retain the
+ * message and retry once events drain; FITS means proceed. */
+moq_event_scratch_verdict_t setup_event_scratch_classify(
+    const moq_session_t *s, const moq_resolved_token_t *toks,
+    size_t token_count)
+{
+    if (!setup_event_scratch_requirement_fits(s, toks, token_count, 0))
+        return MOQ_EVENT_SCRATCH_PERMANENT;
+    if (!setup_event_scratch_requirement_fits(s, toks, token_count,
+                                              s->event_scratch_len))
+        return MOQ_EVENT_SCRATCH_BLOCKED;
+    return MOQ_EVENT_SCRATCH_FITS;
+}
+
+/* Classify a single contiguous byte tail against both an empty arena and the
+ * live cursor. The two answers are different questions: a tail larger than the
+ * whole arena can never be satisfied by draining events, while one that only
+ * the current tail cannot hold becomes satisfiable when the queue empties and
+ * the arena recycles. Subtraction-only, and a cursor past the cap (which the
+ * arena never produces) is treated as no room rather than wrapping. */
+moq_event_scratch_verdict_t event_scratch_classify_bytes(
+    const moq_session_t *s, size_t len)
+{
+    if (len == 0) return MOQ_EVENT_SCRATCH_FITS;
+    if (len > s->event_scratch_cap) return MOQ_EVENT_SCRATCH_PERMANENT;
+    if (s->event_scratch_len > s->event_scratch_cap ||
+        len > s->event_scratch_cap - s->event_scratch_len)
+        return MOQ_EVENT_SCRATCH_BLOCKED;
+    return MOQ_EVENT_SCRATCH_FITS;
 }
 
 /* -- Send helper --------------------------------------------------- */
@@ -649,7 +1054,10 @@ moq_result_t session_core_send_request_goaway(
     bool eligible;
     switch (family) {
     case MOQ_REQUEST_FAMILY_SUBSCRIBE:
-        eligible = s->subs[slot].state == MOQ_SUB_ESTABLISHED;
+        /* A deferred terminal (done_pending) is logically Terminated: no
+         * control (including a per-request GOAWAY) may follow it. */
+        eligible = s->subs[slot].state == MOQ_SUB_ESTABLISHED &&
+                   !s->subs[slot].done_pending;
         ref = s->subs[slot].request_stream_ref;
         sent = &s->subs[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_FETCH:
@@ -657,7 +1065,8 @@ moq_result_t session_core_send_request_goaway(
         ref = s->fetches[slot].request_stream_ref;
         sent = &s->fetches[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_PUBLISH:
-        eligible = s->publishes[slot].state == MOQ_PUB_ESTABLISHED;
+        eligible = s->publishes[slot].state == MOQ_PUB_ESTABLISHED &&
+                   !s->publishes[slot].done_pending;
         ref = s->publishes[slot].request_stream_ref;
         sent = &s->publishes[slot].goaway_sent; break;
     case MOQ_REQUEST_FAMILY_ANNOUNCEMENT:
@@ -755,10 +1164,14 @@ moq_result_t close_with_error(moq_session_t *s,
                                uint64_t code, const char *reason)
 {
     s->state = MOQ_SESS_CLOSED;
+    /* A closing session has no deferred completions left to sweep; an inherited
+     * cursor would resume against freed owners. */
+    session_sweep_discard(s);
     s->goaway_deadline_us = UINT64_MAX;
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
+    s->expiry_retry_deadline_us = UINT64_MAX;
     decref_queued_data_payloads(s);
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
@@ -793,7 +1206,13 @@ moq_result_t close_with_error(moq_session_t *s,
         e.u.closed.reason.data = (const uint8_t *)reason;
         e.u.closed.reason.len  = strlen(reason);
     }
-    push_event(s, &e);
+    /* Record the enqueued fact ONLY on a successful placement: the fact means
+     * "the terminal event is in the queue", not "a close was attempted". Both
+     * queues were just cleared above, so this cannot block today -- checking the
+     * result keeps the fact honest if that ever changes. Monotonic: an already
+     * true fact stays true. */
+    if (push_event(s, &e) == MOQ_OK)
+        s->terminal_enqueued = true;
     return MOQ_OK;
 }
 
@@ -1083,7 +1502,8 @@ static moq_result_t session_step(moq_session_t *s, const moq_input_t *input)
 {
     if (!s || !input) return MOQ_ERR_INVAL;
 
-    session_begin_advance(s, input->now_us);
+    moq_result_t arc = session_advance_entry(s, input->now_us);
+    if (arc != MOQ_OK) return arc;
 
     switch (input->kind) {
     case MOQ_INPUT_START:
@@ -1191,6 +1611,15 @@ void moq_event_cleanup(moq_event_t *event)
         }
     }
 }
+
+/* §9.8 pinned append offset: done_wait_timeout_us begins at the first
+ * 8-byte-aligned slot after the pre-append tail. If this moves, the append
+ * broke ABI. */
+_Static_assert(offsetof(moq_session_cfg_t, done_wait_timeout_us) ==
+               ((offsetof(moq_session_cfg_t, max_track_history_records)
+                 + sizeof(uint32_t) + 7u) & ~(size_t)7u),
+               "done_wait_timeout_us must occupy the first aligned slot "
+               "after the pre-append tail");
 
 static size_t cfg_read_u32(const moq_session_cfg_t *cfg, size_t field_offset,
                             size_t field_size)
@@ -1316,6 +1745,27 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         sizeof(cfg->max_track_subscriptions));
     if (!track_sub_cap)  track_sub_cap = MOQ_DEFAULT_MAX_TRACK_SUBS;
     if (track_sub_cap > 0xFFFF) return MOQ_ERR_INVAL;
+
+    /* Track-largest history registry: default covers one record per
+     * subscription + publish + track-status entry (each is a merge source
+     * and reserves a record at establishment). Separately allocated below.
+     * The default sum cannot overflow: each cap is already bounded <=0xFFFF.
+     * A caller-supplied cap is only bounded by the pool byte size fitting in
+     * size_t (checked here); an over-large but representable cap simply fails
+     * the allocation with MOQ_ERR_NOMEM below -- no arbitrary public ceiling. */
+    size_t th_cap = cfg_read_u32(cfg,
+        offsetof(moq_session_cfg_t, max_track_history_records),
+        sizeof(cfg->max_track_history_records));
+    /* §9.8: done_wait_timeout_us (appended; read only when covered). 0 =
+     * the finite library default -- old-size callers, an absent field, and
+     * an explicit zero all select it. */
+    uint64_t done_wait_us = 0;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, done_wait_timeout_us)
+                            + sizeof(cfg->done_wait_timeout_us))
+        done_wait_us = cfg->done_wait_timeout_us;
+    if (done_wait_us == 0) done_wait_us = MOQ_DONE_WAIT_DEFAULT_US;
+    if (!th_cap)      th_cap = sub_cap + pub_cap + ts_cap;
+    if (th_cap > SIZE_MAX / sizeof(moq_track_hist_t)) return MOQ_ERR_INVAL;
 
     moq_version_t version = MOQ_VERSION_DRAFT_16;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, version) +
@@ -1649,6 +2099,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
+    s->done_wait_timeout_us = done_wait_us;
+    s->expiry_retry_deadline_us = UINT64_MAX;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, goaway_timeout_us) +
         sizeof(cfg->goaway_timeout_us))
         s->goaway_timeout_us = cfg->goaway_timeout_us;
@@ -1700,6 +2152,21 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         }
     }
 
+    /* Track-largest history registry: separately allocated (kept out of the
+     * single session block so its cap never disturbs the block layout). */
+    s->th_cap = th_cap;
+    if (th_cap > 0) {
+        size_t th_bytes = th_cap * sizeof(moq_track_hist_t);
+        s->track_hist = (moq_track_hist_t *)s->alloc.alloc(th_bytes, s->alloc.ctx);
+        if (!s->track_hist) {
+            moq_token_cache_free(&s->peer_token_cache);
+            profile->destroy(s->profile_state);
+            s->alloc.free(s, total, s->alloc.ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(s->track_hist, 0, th_bytes);
+    }
+
     *out = s;
     return MOQ_OK;
 }
@@ -1707,17 +2174,40 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 void moq_session_destroy(moq_session_t *s)
 {
     if (!s) return;
+    session_sweep_discard(s);
     if (s->profile && s->profile_state)
         s->profile->destroy(s->profile_state);
     decref_queued_data_payloads(s);
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
     free_staged_datagrams(s);
+    track_hist_destroy(s);
     moq_token_cache_free(&s->peer_token_cache);
     for (size_t i = 0; i < s->sub_cap; i++) {
         if (s->subs[i].track_id_buf)
             s->alloc.free(s->subs[i].track_id_buf, s->subs[i].track_id_len,
                           s->alloc.ctx);
+        /* A deferred done still owns its reason copy (freed in sub_free_entry
+         * on the normal path); release it on teardown. */
+        if (s->subs[i].done_reason_buf)
+            s->alloc.free(s->subs[i].done_reason_buf,
+                          s->subs[i].done_reason_len, s->alloc.ctx);
+    }
+    /* Same for a publication whose gated done never finalized (the normal
+     * path frees it in pub_free_entry). */
+    for (size_t i = 0; i < s->pub_cap; i++) {
+        if (s->publishes[i].done_reason_buf)
+            s->alloc.free(s->publishes[i].done_reason_buf,
+                          s->publishes[i].done_reason_len, s->alloc.ctx);
+    }
+    /* Track-status entries own a canonical track-name key that is
+     * freed in ts_free_entry on the normal path; free any still-live one here on
+     * session teardown (the reserved registry records are freed by
+     * track_hist_destroy above). */
+    for (size_t i = 0; i < s->ts_cap; i++) {
+        if (s->track_statuses[i].track_id_buf)
+            s->alloc.free(s->track_statuses[i].track_id_buf,
+                          s->track_statuses[i].track_id_len, s->alloc.ctx);
     }
     for (size_t i = 0; i < s->ann_cap; i++) {
         if (s->announcements[i].ns_id_buf)
@@ -1792,15 +2282,25 @@ moq_result_t session_core_on_goaway(moq_session_t *s,
     if (event_queue_full(s))
         return MOQ_ERR_WOULD_BLOCK;
 
+    /* A URI larger than the whole arena can never be delivered, so it ends the
+     * session immediately rather than after a wasted drain cycle; one that only
+     * the live tail cannot hold waits for the queue to drain. */
+    switch (event_scratch_classify_bytes(s, uri_len)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1,
+            "event scratch permanently too small for GOAWAY URI");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+
     uint8_t *uri_copy = NULL;
     if (uri_len > 0) {
         uri_copy = event_scratch_copy(s, uri, uri_len);
-        if (!uri_copy) {
-            if (s->event_scratch_len == 0)
-                return close_with_error(s, 0x1,
-                    "event scratch permanently too small for GOAWAY URI");
-            return MOQ_ERR_WOULD_BLOCK;
-        }
+        if (!uri_copy)
+            return close_with_error(s, 0x1,
+                "internal: event scratch preflight mismatch");
     }
 
     s->goaway_received = true;
@@ -1821,6 +2321,76 @@ moq_result_t session_core_on_goaway(moq_session_t *s,
     return push_event(s, &e);
 }
 
+/* Simulate a REDIRECT event's whole scratch requirement from `from_cursor`,
+ * region by region in the order the copy below performs them: the Connect URI
+ * bytes, then (for a nonzero namespace count) the padding an aligned parts
+ * array needs at that point, the array itself and each part's bytes in order,
+ * then the Track Name bytes and finally the reason bytes. Only the namespace
+ * array is alignment-sensitive, so the running cursor is tracked as far as its
+ * padding and no further -- every later region is raw bytes.
+ *
+ * A zero-part namespace consumes nothing, not even padding, matching
+ * event_scratch_copy_namespace: charging padding for an empty array would both
+ * bill capacity for nothing and shift where the later regions land.
+ *
+ * Pure, and all capacity arithmetic is subtraction from the remaining space so
+ * no sum can wrap. The count multiplication is overflow-checked BEFORE the
+ * per-part walk, so an overflowing count is rejected without dereferencing the
+ * parts pointer it describes. `from_cursor` never exceeds the cap in practice;
+ * a value that does is treated as no room rather than wrapping. */
+static bool redirect_event_scratch_requirement_fits(
+    const moq_session_t *s, const moq_decoded_redirect_t *rd,
+    size_t reason_len, size_t from_cursor)
+{
+    if (from_cursor > s->event_scratch_cap) return false;
+    size_t remaining = s->event_scratch_cap - from_cursor;
+
+    if (rd->connect_uri_len > remaining) return false;
+    remaining -= rd->connect_uri_len;
+    /* Bounded by the cap, so the sum cannot wrap. */
+    size_t cursor = from_cursor + rd->connect_uri_len;
+
+    if (rd->track_namespace.count > 0) {
+        if (rd->track_namespace.count > SIZE_MAX / sizeof(moq_bytes_t))
+            return false;
+        const size_t align = _Alignof(moq_bytes_t);
+        size_t pad = (align - (cursor & (align - 1))) & (align - 1);
+        if (pad > remaining) return false;
+        remaining -= pad;
+        size_t array_bytes = rd->track_namespace.count * sizeof(moq_bytes_t);
+        if (array_bytes > remaining) return false;
+        remaining -= array_bytes;
+        for (size_t i = 0; i < rd->track_namespace.count; i++) {
+            size_t plen = rd->track_namespace.parts[i].len;
+            if (plen > remaining) return false;
+            remaining -= plen;
+        }
+    }
+
+    if (rd->track_name_len > remaining) return false;
+    remaining -= rd->track_name_len;
+    return reason_len <= remaining;
+}
+
+/* Decide, before any copying, whether a REDIRECT event's four regions can be
+ * staged now, later, or never. A requirement that cannot fit an EMPTY arena can
+ * never be satisfied by draining events, so it is permanent and the caller
+ * closes the session; one that fits an empty arena but not the live cursor is
+ * transient, and becomes satisfiable once the queue drains and the arena
+ * recycles. The two answers can differ by more than the occupied bytes, since
+ * the namespace array's padding depends on where the earlier regions leave the
+ * cursor. */
+static moq_event_scratch_verdict_t redirect_event_scratch_classify(
+    const moq_session_t *s, const moq_decoded_redirect_t *rd, size_t reason_len)
+{
+    if (!redirect_event_scratch_requirement_fits(s, rd, reason_len, 0))
+        return MOQ_EVENT_SCRATCH_PERMANENT;
+    if (!redirect_event_scratch_requirement_fits(s, rd, reason_len,
+                                                 s->event_scratch_len))
+        return MOQ_EVENT_SCRATCH_BLOCKED;
+    return MOQ_EVENT_SCRATCH_FITS;
+}
+
 moq_result_t session_core_emit_request_redirect(
     moq_session_t *s, moq_request_family_t family, uint64_t handle_opaque,
     const moq_decoded_redirect_t *rd, uint64_t error_code,
@@ -1833,36 +2403,32 @@ moq_result_t session_core_emit_request_redirect(
     moq_bytes_t ev_uri = {0}, ev_name = {0}, ev_reason = {0};
     moq_namespace_t ev_ns = {0};
 
+    switch (redirect_event_scratch_classify(s, rd, reason_len)) {
+    case MOQ_EVENT_SCRATCH_PERMANENT:
+        return close_with_error(s, 0x1,
+            "event scratch permanently too small for REDIRECT");
+    case MOQ_EVENT_SCRATCH_BLOCKED:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_EVENT_SCRATCH_FITS:
+        break;
+    }
+
     if (rd->connect_uri_len > 0) {
         ev_uri.data = event_scratch_copy(s, rd->connect_uri, rd->connect_uri_len);
         ev_uri.len = rd->connect_uri_len;
-        if (!ev_uri.data) goto nomem;
+        if (!ev_uri.data) goto preflight_mismatch;
     }
-    if (rd->track_namespace.count > 0) {
-        moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(
-            s, rd->track_namespace.count * sizeof(moq_bytes_t),
-            _Alignof(moq_bytes_t));
-        if (!parts) goto nomem;
-        for (size_t i = 0; i < rd->track_namespace.count; i++) {
-            size_t plen = rd->track_namespace.parts[i].len;
-            uint8_t *pd = plen ? event_scratch_copy(s,
-                rd->track_namespace.parts[i].data, plen) : NULL;
-            if (plen && !pd) goto nomem;
-            parts[i].data = pd;
-            parts[i].len = plen;
-        }
-        ev_ns.parts = parts;
-        ev_ns.count = rd->track_namespace.count;
-    }
+    if (!event_scratch_copy_namespace(s, &rd->track_namespace, &ev_ns))
+        goto preflight_mismatch;
     if (rd->track_name_len > 0) {
         ev_name.data = event_scratch_copy(s, rd->track_name, rd->track_name_len);
         ev_name.len = rd->track_name_len;
-        if (!ev_name.data) goto nomem;
+        if (!ev_name.data) goto preflight_mismatch;
     }
     if (reason_len > 0) {
         ev_reason.data = event_scratch_copy(s, reason, reason_len);
         ev_reason.len = reason_len;
-        if (!ev_reason.data) goto nomem;
+        if (!ev_reason.data) goto preflight_mismatch;
     }
 
     moq_event_t e;
@@ -1887,12 +2453,12 @@ moq_result_t session_core_emit_request_redirect(
     }
     return MOQ_OK;
 
-nomem:
+preflight_mismatch:
+    /* The classifier said the whole composite fits: a copy failing here is an
+     * internal inconsistency with no unblock edge to wait on. */
     s->event_scratch_len = scratch_saved;
-    if (scratch_saved == 0)
-        return close_with_error(s, 0x1,
-            "event scratch permanently too small for REDIRECT");
-    return MOQ_ERR_BUFFER;
+    return close_with_error(s, 0x1,
+        "internal: event scratch preflight mismatch");
 }
 
 moq_result_t moq_session_goaway(moq_session_t *s,
@@ -1985,6 +2551,7 @@ moq_result_t moq_session_on_transport_close(moq_session_t *s,
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
+    s->expiry_retry_deadline_us = UINT64_MAX;
     decref_queued_data_payloads(s);
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
@@ -2002,7 +2569,12 @@ moq_result_t moq_session_on_transport_close(moq_session_t *s,
     e.detail_size = (uint32_t)sizeof(moq_session_closed_event_t);
     e.borrow_epoch = s->borrow_epoch;
     e.u.closed.code = code;
-    push_event(s, &e);
+    /* Same enqueued-fact rule as close_with_error: record it only when the
+     * event is actually queued. This path reaches terminal from the transport
+     * side, so it may run BEFORE or AFTER a local close enqueued the event --
+     * the fact is monotonic and idempotent either way. */
+    if (push_event(s, &e) == MOQ_OK)
+        s->terminal_enqueued = true;
     return MOQ_OK;
 }
 
@@ -2015,7 +2587,8 @@ moq_result_t moq_session_on_data_bytes(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     if (len > 0 && !buf) return MOQ_ERR_INVAL;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
@@ -2043,7 +2616,8 @@ moq_result_t moq_session_on_data_reset(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     (void)error_code;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
@@ -2059,7 +2633,8 @@ moq_result_t moq_session_on_bidi_stream_bytes(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     if (len > 0 && !buf) return MOQ_ERR_INVAL;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
@@ -2073,7 +2648,8 @@ moq_result_t moq_session_on_bidi_stream_reset(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     (void)error_code;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
@@ -2087,7 +2663,8 @@ moq_result_t moq_session_on_bidi_stream_stop(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     (void)error_code;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
@@ -2232,7 +2809,24 @@ moq_result_t moq_session_poll_events_ex(moq_session_t *s,
         memcpy(dst, head, copy);
         uint64_t epoch = s->borrow_epoch;
         memcpy(dst + offsetof(moq_event_t, borrow_epoch), &epoch, sizeof(epoch));
+        /* The observed fact is recorded HERE -- at the transfer -- not when the
+         * event was queued and not when the queue merely holds one. It means a
+         * caller received MOQ_EVENT_SESSION_CLOSED. Placed after the copy
+         * succeeded and before the head advance, so it cannot be set for an
+         * event that was not handed out (the size-gated `break` above returns
+         * without copying). terminal_observed therefore implies
+         * terminal_enqueued by construction: the event could only be here
+         * because a push_event placed it. */
+        if (head->kind == MOQ_EVENT_SESSION_CLOSED)
+            s->terminal_observed = true;
         s->event_head++;
+        /* Advance the progress token on event TRANSFER too (not only enqueue):
+         * a bounded poll that dequeues events frees queue capacity, which is the
+         * progress an adapter re-drive needs to see when the app drains a
+         * pre-existing backlog that service() did not itself refill (a large
+         * event queue never backpressures, so the enqueue signal alone misses
+         * it). See moq_transport_bridge_event_progress_token. */
+        s->event_progress_token++;
         dst += element_size;
         n++;
     }
@@ -2353,10 +2947,21 @@ static uint64_t reported_subgroup_deadline(const moq_session_t *s)
 
 uint64_t moq_session_next_deadline_us(const moq_session_t *s)
 {
-    if (!s) return UINT64_MAX;
+    if (!s || s->state == MOQ_SESS_CLOSED) return UINT64_MAX;
     uint64_t d = s->goaway_deadline_us;
     uint64_t sg = reported_subgroup_deadline(s);
     if (sg < d) d = sg;
     if (s->idle_deadline_us < d) d = s->idle_deadline_us;
+    /* §9.8: every armed, not-yet-fired terminal deadline; fired entries
+     * contribute only via the bounded retry deadline below. */
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].done_pending && !s->subs[i].done_expired &&
+            s->subs[i].done_deadline_us < d)
+            d = s->subs[i].done_deadline_us;
+    for (size_t i = 0; i < s->pub_cap; i++)
+        if (s->publishes[i].done_pending && !s->publishes[i].done_expired &&
+            s->publishes[i].done_deadline_us < d)
+            d = s->publishes[i].done_deadline_us;
+    if (s->expiry_retry_deadline_us < d) d = s->expiry_retry_deadline_us;
     return d;
 }

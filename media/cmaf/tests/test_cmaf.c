@@ -205,6 +205,82 @@ static size_t build_aac_init(uint8_t *buf, size_t cap,
 }
 
 /*
+ * Build a GENUINE first-sample-flags-present (0x000004) fragment:
+ * moof(traf(tfhd + tfdt + trun)) + mdat, where the tfhd carries
+ * default_sample_flags (tfhd flag 0x20) and the trun carries the 4-byte
+ * first_sample_flags payload. This is the FFmpeg CMAF shape. NOTE: the
+ * older helpers below (build_fragment / build_moof / build_cmaf_chunk)
+ * name a parameter "first_sample_flags" but actually encode PER-SAMPLE
+ * flags records (trun 0x000400) -- they exercise a different trun form
+ * and must not be used as proof of 0x000004 behavior.
+ *
+ * trun_flags is the FULL trun flag word: every declared field is emitted
+ * (first_sample_flags for 0x004 unless omit_fsf_payload, a sample_size
+ * word per sample for 0x200, a per-sample flags word for 0x400), so a
+ * fixture carrying the forbidden 0x004+0x400 combination is structurally
+ * COMPLETE and only the flag conflict makes it malformed.
+ * omit_fsf_payload ends the trun immediately after whatever precedes the
+ * first_sample_flags word (the truncation case).
+ */
+static size_t build_fsf_fragment(uint8_t *buf, size_t cap,
+                                 uint32_t default_flags,
+                                 uint32_t first_flags,
+                                 uint32_t trun_flags,
+                                 int omit_fsf_payload,
+                                 uint32_t sample_count,
+                                 uint32_t sample_size,
+                                 uint32_t sample_flags_word,
+                                 const uint8_t *mdat_payload,
+                                 size_t mdat_len)
+{
+    size_t p = 0;
+    size_t fsf_bytes =
+        ((trun_flags & 0x004u) && !omit_fsf_payload) ? 4 : 0;
+    size_t per_sample = 0;                    /* emit EVERY declared field */
+    if (trun_flags & 0x200u) per_sample += 4; /* sample_size records */
+    if (trun_flags & 0x400u) per_sample += 4; /* per-sample flags records */
+    size_t trun_size = 8 + 8 + fsf_bytes + sample_count * per_sample;
+    size_t tfdt_size = 8 + 4 + 8;
+    size_t tfhd_size = 8 + 8 + 4;             /* + default_sample_flags */
+    size_t mfhd_size = 8 + 8;                 /* version/flags + seq no */
+    size_t traf_size = 8 + tfhd_size + tfdt_size + trun_size;
+    size_t moof_size = 8 + mfhd_size + traf_size;
+    assert(moof_size + 8 + mdat_len <= cap &&
+           "build_fsf_fragment: output buffer too small");
+
+    p += box_hdr(buf + p, (uint32_t)moof_size, "moof");
+    p += box_hdr(buf + p, (uint32_t)mfhd_size, "mfhd");
+    wr32(buf + p, 0); p += 4;                 /* version + flags */
+    wr32(buf + p, 1); p += 4;                 /* sequence_number */
+    p += box_hdr(buf + p, (uint32_t)traf_size, "traf");
+
+    /* tfhd: flags 0x20 -> default_sample_flags present */
+    p += box_hdr(buf + p, (uint32_t)tfhd_size, "tfhd");
+    wr32(buf + p, 0x00000020); p += 4;
+    wr32(buf + p, 1); p += 4;                 /* track_id */
+    wr32(buf + p, default_flags); p += 4;
+
+    p += box_hdr(buf + p, (uint32_t)tfdt_size, "tfdt");
+    wr32(buf + p, 0x01000000); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+
+    p += box_hdr(buf + p, (uint32_t)trun_size, "trun");
+    wr32(buf + p, trun_flags); p += 4;
+    wr32(buf + p, sample_count); p += 4;
+    if (fsf_bytes) { wr32(buf + p, first_flags); p += 4; }
+    for (uint32_t i = 0; i < sample_count; i++) {
+        if (trun_flags & 0x200u) { wr32(buf + p, sample_size); p += 4; }
+        if (trun_flags & 0x400u) { wr32(buf + p, sample_flags_word); p += 4; }
+    }
+
+    p += box_hdr(buf + p, (uint32_t)(8 + mdat_len), "mdat");
+    memcpy(buf + p, mdat_payload, mdat_len);
+    p += mdat_len;
+    return p;
+}
+
+/*
  * Build a minimal fragment: moof(traf(tfhd + tfdt + trun)) + mdat.
  */
 static size_t build_fragment(uint8_t *buf, size_t cap,
@@ -1228,8 +1304,7 @@ int main(void)
      *    structurally valid trun whose fragment then breaks moof->mdat
      *    ordering (a second mdat where a moof is required) returns PROTO and
      *    must not leave the parsed count in out. The required count is
-     *    committed only after the whole fragment validates. (RED: before the
-     *    fix parse_trun stamped out->sample_count, leaking it on this PROTO.) */
+     *    committed only after the whole fragment validates. */
     {
         static uint8_t obj[256]; size_t n = 0;
         n += build_moof_n_samples(obj + n, 1, 3, 0x02000000);
@@ -1482,6 +1557,159 @@ int main(void)
               == MOQ_ERR_PROTO);
 
         (void)prefix;
+    }
+
+    /* ============ trun first_sample_flags (0x000004) ================ */
+
+    /* -- 1. genuine 0x000004: sample 0 overridden, later samples keep
+     *        the tfhd default; classification flips to sync ----------- */
+    {
+        uint8_t payload[300]; memset(payload, 0xCD, sizeof(payload));
+        uint8_t buf[512];
+        size_t len = build_fsf_fragment(buf, sizeof(buf),
+            0x01010000u, 0x02000000u, 0x204u, 0, 3, 100, 0,
+            payload, sizeof(payload));
+        moq_cmaf_sample_t out[8];
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, out, 8);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_OK);
+        CHECK(frag.sample_count == 3);
+        CHECK(frag.samples[0].flags == 0x02000000u);
+        CHECK(moq_cmaf_sap_from_sample_flags(frag.samples[0].flags)
+              == MOQ_SAP_UNKNOWN);                    /* sync sample */
+        CHECK(frag.samples[1].flags == 0x01010000u);
+        CHECK(frag.samples[2].flags == 0x01010000u);
+        CHECK(moq_cmaf_sap_from_sample_flags(frag.samples[1].flags)
+              == MOQ_SAP_NONE);                       /* dependent P/B */
+        CHECK(frag.default_sample_flags == 0x01010000u);
+    }
+
+    /* -- 2. per-sample flags (0x000400) behavior unchanged ---------- */
+    {
+        moq_cmaf_sample_t in[] = {
+            { 0, 100, 0x02000000u, 0 },
+            { 0, 100, 0x01010000u, 0 },
+        };
+        uint8_t payload[200]; memset(payload, 0xCE, sizeof(payload));
+        uint8_t buf[512];
+        size_t len = build_fragment(buf, sizeof(buf), 0,
+            0x600, in, 2, payload, sizeof(payload));
+        moq_cmaf_sample_t out[4];
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, out, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_OK);
+        CHECK(frag.sample_count == 2);
+        CHECK(frag.samples[0].flags == 0x02000000u);
+        CHECK(frag.samples[1].flags == 0x01010000u);
+    }
+
+    /* -- 3. 0x000004 + 0x000400 together is PROTO. The fixture emits
+     *        EVERY declared field (fsf word, per-sample sizes AND
+     *        per-sample flags), so it is structurally COMPLETE and the
+     *        flag conflict is the ONLY malformation -- relaxing just the
+     *        mutual-exclusion check makes this parse return MOQ_OK. ---- */
+    {
+        uint8_t payload[100]; memset(payload, 0xCF, sizeof(payload));
+        uint8_t buf[512];
+        size_t len = build_fsf_fragment(buf, sizeof(buf),
+            0x01010000u, 0x02000000u, 0x604u, 0, 1, 100, 0x01000000u,
+            payload, sizeof(payload));
+        moq_cmaf_sample_t out[4];
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, out, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_ERR_PROTO);
+        CHECK(frag.sample_count == 0);        /* nothing committed */
+        /* Same malformation with NO buffer must stay PROTO, never a
+         * BUFFER downgrade. */
+        moq_cmaf_fragment_info_init(&frag, NULL, 0);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_ERR_PROTO);
+        CHECK(frag.sample_count == 0);
+    }
+
+    /* -- 4. truncated first_sample_flags is PROTO: the trun box ends
+     *        IMMEDIATELY after sample_count with ONLY flag 0x004 set (no
+     *        payload word, no per-sample fields), so the fsf r<4 bounds
+     *        check is the SOLE failure. Two samples against a one-slot
+     *        buffer makes the insufficient-buffer variant genuine, and
+     *        poisoned caller storage must come back untouched. --------- */
+    {
+        uint8_t payload[100]; memset(payload, 0xD0, sizeof(payload));
+        uint8_t buf[512];
+        size_t len = build_fsf_fragment(buf, sizeof(buf),
+            0x01010000u, 0, 0x004u, 1 /* omit fsf payload */, 2, 0, 0,
+            payload, sizeof(payload));
+        moq_cmaf_sample_t out[4];
+        memset(out, 0xAA, sizeof(out));       /* poisoned caller storage */
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, out, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_ERR_PROTO);
+        CHECK(frag.sample_count == 0);
+        {   /* partial output must not leak into caller storage */
+            const uint8_t *ob = (const uint8_t *)out;
+            int untouched = 1;
+            for (size_t bi = 0; bi < sizeof(out); bi++)
+                if (ob[bi] != 0xAA) { untouched = 0; break; }
+            CHECK(untouched == 1);
+        }
+        moq_cmaf_fragment_info_init(&frag, NULL, 0);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_ERR_PROTO);
+        CHECK(frag.sample_count == 0);
+        moq_cmaf_sample_t one[1];             /* cap 1 < count 2: genuinely
+                                                 insufficient */
+        memset(one, 0xAA, sizeof(one));
+        moq_cmaf_fragment_info_init(&frag, one, 1);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_ERR_PROTO);
+        CHECK(frag.sample_count == 0);
+        {
+            const uint8_t *ob = (const uint8_t *)one;
+            int untouched = 1;
+            for (size_t bi = 0; bi < sizeof(one); bi++)
+                if (ob[bi] != 0xAA) { untouched = 0; break; }
+            CHECK(untouched == 1);
+        }
+    }
+
+    /* -- 5. valid 0x000004 through the two-pass BUFFER path --------- */
+    {
+        uint8_t payload[300]; memset(payload, 0xD1, sizeof(payload));
+        uint8_t buf[512];
+        size_t len = build_fsf_fragment(buf, sizeof(buf),
+            0x01010000u, 0x02000000u, 0x204u, 0, 3, 100, 0,
+            payload, sizeof(payload));
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, NULL, 0);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_ERR_BUFFER);
+        CHECK(frag.sample_count == 3);        /* the required count */
+        moq_cmaf_sample_t out[3];
+        moq_cmaf_fragment_info_init(&frag, out, 3);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, len }, &frag)
+              == MOQ_OK);
+        CHECK(frag.samples[0].flags == 0x02000000u);
+        CHECK(frag.samples[2].flags == 0x01010000u);
+    }
+
+    /* -- 6. validate_object: FFmpeg-shaped group-leading keyframe --- */
+    {
+        uint8_t payload[100]; memset(payload, 0xD2, sizeof(payload));
+        uint8_t obj[512];
+        size_t len = build_fsf_fragment(obj, sizeof(obj),
+            0x01010000u, 0x02000000u, 0x204u, 0, 1,
+            (uint32_t)sizeof(payload), 0,
+            payload, sizeof(payload));
+        moq_cmaf_object_report_t rep;
+        CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ obj, len },
+                                       &rep) == MOQ_OK);
+        CHECK(rep.valid == true);
+        CHECK(rep.starts_with_sync == true);  /* the fix: fsf drives it */
+        CHECK(rep.sap_type == MOQ_SAP_UNKNOWN);
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

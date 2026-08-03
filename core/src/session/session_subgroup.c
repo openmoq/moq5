@@ -1,5 +1,22 @@
 #include "session_internal.h"
 
+/* Backstop registry feed: max-merge an outbound object's Location
+ * into the owning subscription's or publication's reserved record. The facade
+ * additionally merges via its own record reference (the authoritative feed);
+ * this covers raw-session writers and is idempotent (monotonic max). */
+static void sg_note_object_published(moq_session_t *s, const moq_sg_entry_t *e,
+                                     uint64_t object_id)
+{
+    int slot = sub_resolve_handle(s, e->sub);
+    if (slot >= 0) {
+        track_hist_merge(s->subs[slot].hist, e->group_id, object_id);
+        return;
+    }
+    slot = pub_resolve_handle(s, e->pub);
+    if (slot >= 0)
+        track_hist_merge(s->publishes[slot].hist, e->group_id, object_id);
+}
+
 static bool sg_send_allowed(moq_session_t *s, const moq_sg_entry_t *sg)
 {
     if (moq_subscription_is_valid(sg->sub)) {
@@ -102,17 +119,34 @@ void sg_recompute_deadline(moq_session_t *s)
     s->subgroup_deadline_us = d;
 }
 
-void sg_reap_terminal(moq_session_t *s)
+/*
+ * Reap CLOSING/RESETTING subgroups, resumably.
+ *
+ * Resumes at s->sweep_slot and charges one unit per ELIGIBLE reap; slots in
+ * any other state cost nothing and never suspend the scan. Returns true when
+ * the pool retired. The subgroup deadline is recomputed only after the
+ * COMPLETE scan -- recomputing from a partial scan could drop a wake that a
+ * not-yet-visited entry still needs.
+ */
+bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
 {
-    bool reaped = false;
-    for (size_t i = 0; i < s->sg_cap; i++) {
-        if (s->subgroups[i].state == MOQ_SG_CLOSING ||
-            s->subgroups[i].state == MOQ_SG_RESETTING) {
-            sg_free_entry(i, s->subgroups);
-            reaped = true;
+    for (; s->sweep_slot < s->sg_cap; s->sweep_slot++) {
+        size_t i = s->sweep_slot;
+        if (s->subgroups[i].state != MOQ_SG_CLOSING &&
+            s->subgroups[i].state != MOQ_SG_RESETTING)
+            continue;                      /* costs nothing; never suspends */
+        if (budget) {
+            if (*budget == 0) return false;
+            (*budget)--;
         }
+        sg_free_entry(i, s->subgroups);
+        s->sweep_reaped_subgroup = true;
     }
-    if (reaped) sg_recompute_deadline(s);
+    if (s->sweep_reaped_subgroup) {
+        sg_recompute_deadline(s);
+        s->sweep_reaped_subgroup = false;
+    }
+    return true;
 }
 
 /* -- Subgroup handle helpers --------------------------------------- */
@@ -243,13 +277,26 @@ moq_result_t moq_session_open_subgroup(
     entry->subgroup_id = cfg->subgroup_id;
     entry->has_prev_object = false;
     entry->has_extensions = has_ext;
-    if (s->subs[sub_slot].delivery_timeout_us > 0) {
-        entry->delivery_deadline_us = deadline_add(now_us,
-            s->subs[sub_slot].delivery_timeout_us);
-        if (entry->delivery_deadline_us < s->subgroup_deadline_us)
-            s->subgroup_deadline_us = entry->delivery_deadline_us;
-    } else {
-        entry->delivery_deadline_us = UINT64_MAX;
+    /* §9.8: the subgroup timer uses the exact NEGOTIATED SUBGROUP timeout
+     * -- per-type min-nonzero of the publisher-side (our Track Properties)
+     * and subscriber-side (peer parameters/acked updates) values -- never
+     * the min_nonzero legacy projection, which could wrongly shorten it
+     * when the object timeout is smaller (d18 §8). Start instant (armed at
+     * open) is deliberately unchanged; the start-instant correction is a
+     * recorded backlog item (design §9.8 A2). */
+    {
+        const moq_sub_entry_t *dte = &s->subs[sub_slot];
+        uint64_t sg_ms = dt_negotiate_ms(
+            dte->dt_pub_has_subgroup, dte->dt_pub_subgroup_ms,
+            dte->dt_sub_has_subgroup, dte->dt_sub_subgroup_ms);
+        uint64_t sg_us = ms_to_us_sat(sg_ms);
+        if (sg_us > 0) {
+            entry->delivery_deadline_us = deadline_add(now_us, sg_us);
+            if (entry->delivery_deadline_us < s->subgroup_deadline_us)
+                s->subgroup_deadline_us = entry->delivery_deadline_us;
+        } else {
+            entry->delivery_deadline_us = UINT64_MAX;
+        }
     }
     s->next_stream_ref++;
 
@@ -325,6 +372,7 @@ moq_result_t moq_session_write_object(
     /* Commit. */
     entry->prev_object_id = object_id;
     entry->has_prev_object = true;
+    sg_note_object_published(s, entry, object_id);
     return MOQ_OK;
 }
 
@@ -393,6 +441,7 @@ moq_result_t moq_session_write_status_object(
 
     entry->prev_object_id = object_id;
     entry->has_prev_object = true;
+    sg_note_object_published(s, entry, object_id);
     return MOQ_OK;
 }
 
@@ -536,6 +585,7 @@ moq_result_t moq_session_write_object_ex(
 
     entry->prev_object_id = cfg->object_id;
     entry->has_prev_object = true;
+    sg_note_object_published(s, entry, cfg->object_id);
     return MOQ_OK;
 }
 
@@ -676,6 +726,7 @@ moq_result_t moq_session_begin_object(
 
     entry->prev_object_id = object_id;
     entry->has_prev_object = true;
+    sg_note_object_published(s, entry, object_id);
     entry->state = MOQ_SG_STREAMING;
     entry->streaming_payload_len = payload_length;
     entry->streaming_bytes_written = 0;
@@ -806,6 +857,7 @@ moq_result_t moq_session_begin_object_ex(
 
     entry->prev_object_id = cfg->object_id;
     entry->has_prev_object = true;
+    sg_note_object_published(s, entry, cfg->object_id);
     entry->state = MOQ_SG_STREAMING;
     entry->streaming_payload_len = cfg->payload_length;
     entry->streaming_bytes_written = 0;
@@ -904,6 +956,28 @@ moq_result_t session_core_on_object_datagram(moq_session_t *s,
     if (s->recv_payload_bytes > s->max_recv_buf ||
         obj_budget > s->max_recv_buf - s->recv_payload_bytes)
         return MOQ_ERR_WOULD_BLOCK;
+
+    /* Feed received-object history at ADMISSION -- once the object passed the
+     * receive-limit checks above, before delivery capacity.
+     * Idempotent (monotonic max), so a WOULD_BLOCK retry re-merges harmlessly. */
+    if (d->sub_slot >= 0)
+        track_hist_merge(s->subs[d->sub_slot].hist, d->group_id, d->object_id);
+    else if (d->pub_slot >= 0)
+        track_hist_merge(s->publishes[d->pub_slot].hist,
+                         d->group_id, d->object_id);
+
+    /* Forward State 0 prohibits Objects: a paused binding -- subscriber-role
+     * subscription OR publication -- drops prohibited datagram objects HERE,
+     * after the history merge (Largest advances on receipt) and after alias
+     * resolution (so a paused publication's datagram is never mistaken for
+     * unknown-alias data and staged). A datagram is single-shot, so the
+     * decision is made once at admission -- no chunk sequence to freeze. */
+    if (d->sub_slot >= 0 &&
+        s->subs[d->sub_slot].role == MOQ_SUB_ROLE_SUBSCRIBER &&
+        !s->subs[d->sub_slot].forward)
+        return MOQ_OK;
+    if (d->pub_slot >= 0 && !s->publishes[d->pub_slot].send_allowed)
+        return MOQ_OK;
 
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -1026,7 +1100,10 @@ moq_result_t moq_session_send_object_datagram(
     args.payload            = pdata;
     args.payload_len        = plen;
 
-    return send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args);
+    if (drc >= 0)
+        track_hist_merge(s->subs[sub_slot].hist, group_id, object_id);
+    return drc;
 }
 
 moq_result_t moq_session_send_status_datagram(
@@ -1065,7 +1142,10 @@ moq_result_t moq_session_send_status_datagram(
     args.is_status          = true;
     args.object_status      = wire_status;
 
-    return send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args);
+    if (drc >= 0)
+        track_hist_merge(s->subs[sub_slot].hist, group_id, object_id);
+    return drc;
 }
 
 moq_result_t moq_session_send_pub_object_datagram(
@@ -1107,7 +1187,10 @@ moq_result_t moq_session_send_pub_object_datagram(
     args.payload            = pdata;
     args.payload_len        = plen;
 
-    return send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args);
+    if (drc >= 0)
+        track_hist_merge(s->publishes[slot].hist, group_id, object_id);
+    return drc;
 }
 
 moq_result_t moq_session_send_pub_status_datagram(
@@ -1147,7 +1230,10 @@ moq_result_t moq_session_send_pub_status_datagram(
     args.is_status          = true;
     args.object_status      = wire_status;
 
-    return send_datagram_encoded(s, &args);
+    moq_result_t drc = send_datagram_encoded(s, &args);
+    if (drc >= 0)
+        track_hist_merge(s->publishes[slot].hist, group_id, object_id);
+    return drc;
 }
 
 moq_result_t moq_session_on_data_stop(moq_session_t *s,
@@ -1157,7 +1243,8 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
-    session_begin_advance(s, now_us);
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_find_by_stream_ref(s, stream_ref);

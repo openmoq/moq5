@@ -118,8 +118,10 @@ public:
 
 /* -- Pump that does nothing ------------------------------------------ */
 
-static int pump_noop(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_noop(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 0;
 }
@@ -154,7 +156,7 @@ static moq_mvfst_managed_cfg_t make_fast_cfg(const char *host, int port)
     cfg.host = host;
     cfg.port = port;
     cfg.insecure_skip_verify = true;
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
     cfg.max_num_ptos = 2;
@@ -264,7 +266,7 @@ static void test_invalid_cert_path()
     cfg.port = 4433;
     cfg.insecure_skip_verify = false;
     cfg.cert_path = "/nonexistent/path/moq_test_cert.pem";
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
 
@@ -287,7 +289,7 @@ static void test_insecure_plus_cert_path()
     cfg.port = 4433;
     cfg.insecure_skip_verify = true;
     cfg.cert_path = "/etc/ssl/cert.pem";
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
 
@@ -309,7 +311,7 @@ static void test_dns_resolution_failure()
     cfg.host = "this-host-does-not-exist.invalid";
     cfg.port = 4433;
     cfg.insecure_skip_verify = true;
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
 

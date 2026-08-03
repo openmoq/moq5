@@ -85,6 +85,11 @@ typedef struct {
     uint64_t               pending_reset_code;
     bool                   pending_stop;
     uint64_t               pending_stop_code;
+    /* Whole-stream ABORT discard lifecycle: the entry is kept (its ref
+     * mapping preserved so late peer bytes are DISCARDED, never given a
+     * fresh ref), and retired on the peer's FIN / RESET / stream
+     * terminal. Set by dispatch_abort_bidi. */
+    bool                   aborting;
     /* Inbound peer-uni classification (uni-control-pair mode only). */
     uint8_t                uni_disp;        /* bridge_uni_disp_t */
     uint8_t                classify_len;    /* retained leading bytes (< 9) */
@@ -105,6 +110,9 @@ typedef enum {
     PENDING_CLOSE_BIDI_FIN,
     PENDING_RESET_STREAM,
     PENDING_STOP_SENDING,
+    PENDING_ABORT_STREAM,   /* whole-stream abort not yet applied (or,
+                               in the sequential fallback, its RESET
+                               half not yet accepted) */
     PENDING_CLOSE_TRANSPORT,
 } bridge_pending_kind_t;
 
@@ -181,6 +189,9 @@ bridge_stream_entry_t *bridge_find_by_id(
     moq_transport_bridge_t *b, uint64_t transport_id);
 
 void bridge_deactivate_stream(bridge_stream_entry_t *e);
+/* Retire an aborting entry on any terminal peer signal (FIN/reset/
+ * stream terminal). No-op if the entry is absent or not aborting. */
+void bridge_retire_aborting(moq_transport_bridge_t *b, uint64_t transport_id);
 
 moq_stream_ref_t bridge_assign_inbound_ref(
     moq_transport_bridge_t *b, uint64_t transport_id,
@@ -228,5 +239,51 @@ bool bridge_stream_has_inbound_pending(
  */
 bridge_uni_route_t bridge_route_peer_uni(
     moq_transport_bridge_t *b, moq_uni_class_t cls, uint64_t stream_id);
+
+/*
+ * Outcome of a budgeted service pass.
+ *
+ * suspended    a deferred-completion sweep could not finish within the budget.
+ *              The session cursor holds the resume point; a later pass
+ *              continues from there. The operation that OBSERVED the
+ *              suspension retains its retry/deferred state, while earlier work
+ *              in the same pass remains committed -- a pass may legitimately
+ *              commit several owners and then suspend on the next.
+ * sweep_spent  sweep steps charged by this call.
+ */
+typedef struct moq_bridge_budgeted_result {
+    bool     suspended;
+    uint32_t sweep_spent;
+} moq_bridge_budgeted_result_t;
+
+/*
+ * Service the bridge with a bounded deferred-completion sweep.
+ *
+ * WHAT sweep_budget METERS, precisely: steps of the session's deferred
+ * completion stage machine (REAP_SUBGROUPS / PUB / SUB). It does NOT
+ * meter outbound pending items retried, actions dispatched, control messages
+ * handled, or rx parse units -- so this is not an invocation-wide work bound,
+ * and must not be described as one.
+ *
+ * A budget of 0 is legal and useful: a pool that is idle, or holds only
+ * future/count-unsatisfied owners, has no runnable work and completes anyway.
+ * Only runnable work that cannot be afforded suspends.
+ *
+ * out is REQUIRED. A finite budget that can suspend, paired with a discarded
+ * outcome, would report a drained pass while a cursor is still live -- the
+ * hidden stall this exists to prevent. Returns MOQ_ERR_INVAL when out is NULL;
+ * *out is zeroed before any other argument is validated.
+ *
+ * moq_transport_bridge_service() is the unlimited path and does NOT route
+ * through here: it enters no budget context at all, which is what makes it
+ * structurally incapable of suspending.
+ *
+ * Not exported. Callable within moq-core and from white-box tests linking
+ * moq-core-test-internals; promotion to MOQ_API belongs with the first
+ * out-of-library caller.
+ */
+moq_result_t moq_transport_bridge_service_budgeted(
+    moq_transport_bridge_t *b, uint64_t now_us, uint32_t sweep_budget,
+    moq_bridge_budgeted_result_t *out);
 
 #endif /* MOQ_TRANSPORT_BRIDGE_INTERNAL_H */

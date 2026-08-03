@@ -11,6 +11,7 @@
 
 #include "pico_wt_harness.h"
 #include <moq/moq.h>
+#include "../pico_wt_adapter.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -488,18 +489,19 @@ static void test_control_stream_empty_fin(void)
 }
 
 /*
- * Regression: inbound WOULD_BLOCK must propagate to h3zero.
+ * Inbound WOULD_BLOCK must pause the stream, never tear the connection down.
  *
- * h3zero cannot pause reads. When the bridge has unresolvable
- * inbound pending state (session event queue full, nobody draining),
- * deliver_stream_bytes returns -1. The callback must propagate that
- * to h3zero, which closes the connection. Silently continuing
- * would violate the bridge's inbound WOULD_BLOCK contract.
+ * h3zero cannot decline a WT data callback, so an adapter with no receive
+ * flow control has only two options when the session refuses bytes: drop them
+ * or kill the connection. This adapter does neither -- it owns each WT data
+ * stream's QUIC receive window, withholds credit while the stream still has
+ * retained bridge work, and retains in-window bytes for ordered replay. A
+ * small event queue must therefore SLOW the peer, not terminate it.
  *
- * Strategy: small max_events (3), subscribe + accept, then blast
- * objects without draining client events until the queue fills.
+ * Strategy: small max_events (3), subscribe + accept, then blast objects
+ * without draining client events until the queue fills.
  */
-static void test_inbound_would_block_propagated(void)
+static void test_inbound_would_block_pauses(void)
 {
     pico_wt_harness_t h;
     pico_wt_harness_cfg_t cfg = {
@@ -562,12 +564,10 @@ static void test_inbound_would_block_propagated(void)
     }
 
     /* Open ONE subgroup (one uni stream) and write many objects to it.
-     * The per-stream inbound WOULD_BLOCK contract only trips when more
-     * bytes arrive on a stream that still has pending state - so all
-     * objects must share a stream. Do NOT drain client events: the
-     * event queue fills, inbound delivery returns WOULD_BLOCK, pending
-     * remains, and the next bytes on that stream force the callback to
-     * return -1 -> h3zero tears down the connection. */
+     * Receive backpressure is per stream, so all objects must share one.
+     * Do NOT drain client events: the event queue fills, inbound delivery
+     * returns WOULD_BLOCK, and the stream keeps retained work -- the state
+     * in which the adapter must withhold credit and pause. */
     moq_subgroup_cfg_t sgcfg;
     moq_subgroup_cfg_init(&sgcfg);
     sgcfg.group_id = 0;
@@ -599,23 +599,44 @@ static void test_inbound_would_block_propagated(void)
         pico_wt_harness_pump(&h, 500);
     }
 
-    /* The client adapter must have taken the hard-failure path: on the
-     * first delivery that left inbound pending unresolved, the callback
-     * returns -1 (tearing down the connection) and marks the bridge
-     * fatal with the adapter's own teardown code. */
-    CHECK(moq_pico_wt_conn_is_fatal(h.client_conn));
-    CHECK(moq_transport_bridge_is_terminal(h.client_conn->bridge));
+    /* An undrained receiver must survive. The adapter pauses the stream by
+     * withholding credit; it must NOT raise its teardown sentinel (0x10), and
+     * it must not have swallowed the refusal and kept feeding a pending stream
+     * (which the bridge reports as 0x3). */
+    CHECK(!moq_pico_wt_conn_is_fatal(h.client_conn));
+    CHECK(!moq_transport_bridge_is_terminal(h.client_conn->bridge));
 
-    /* The fatal code must be the adapter's hard-failure teardown sentinel
-     * (0x10), which is deliberately distinct from the bridge's generic
-     * internal-fatal code (0x1) AND its "bytes arrived on a stream with
-     * pending inbound" contract-violation code (0x3). Code 0x3 would mean
-     * the adapter swallowed the -1 and kept feeding bytes to a pending
-     * stream - exactly what this guards. The 0x10 check makes the
-     * adapter-initiated teardown unambiguous (not a generic bridge fatal). */
     uint64_t fc = moq_transport_bridge_fatal_code(h.client_conn->bridge);
-    CHECK(fc == 0x10 /* adapter hard-failure teardown sentinel */);
+    CHECK(fc != 0x10 /* adapter hard-failure teardown sentinel */);
     CHECK(fc != 0x3 /* bridge inbound-pending contract violation */);
+
+    /* The backpressure must be real rather than unbounded local buffering:
+     * some tracked stream is holding retained work while the app does not
+     * drain. (The adapter tracks the control stream too, so scan rather than
+     * assume a slot.) */
+    bool any_pending = false;
+    for (size_t i = 0; i < h.client_conn->rx_count; i++) {
+        if (!h.client_conn->rx[i].active) continue;
+        if (moq_transport_bridge_stream_has_pending(
+                h.client_conn->bridge, h.client_conn->rx[i].stream_id))
+            any_pending = true;
+    }
+    CHECK(any_pending);
+
+    /* And it must be recoverable: once the application drains, the retained
+     * bytes replay in order and the session keeps delivering. */
+    uint32_t drained = 0;
+    for (int i = 0; i < 200; i++) {
+        moq_event_t ev;
+        while (moq_session_poll_events(h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) drained++;
+            moq_event_cleanup(&ev);
+        }
+        moq_pico_wt_service(h.client_conn, h.now);
+        pico_wt_harness_pump(&h, 200);
+    }
+    CHECK(drained > 0);
+    CHECK(!moq_pico_wt_conn_is_fatal(h.client_conn));
 
 cleanup:
     pico_wt_harness_cleanup(&h);
@@ -631,7 +652,7 @@ int main(void)
     test_deregister_after_close_not_fatal();
     test_drain_then_close_recovers();
     test_control_stream_empty_fin();
-    test_inbound_would_block_propagated();
+    test_inbound_would_block_pauses();
 
     if (failures == 0)
         printf("test_pico_wt_loopback: PASS (%d tests)\n", 9);

@@ -1,4 +1,5 @@
 #include <moq/moq.hpp>
+#include <algorithm>
 #include "test_support.hpp"
 
 #include <vector>
@@ -281,6 +282,106 @@ int main()
                 MOQ_CHECK(obj.payload_data.empty());
             },
             [&](const auto &) { MOQ_CHECK(false); });
+    }
+
+    // -- 8b. Appended-field discriminators: the facade cfg builders must
+    //        use SIZED init, or these appended fields silently vanish. ----
+    {
+        auto [c, s] = establish(failures);
+        auto pub = moq::publisher::create(
+            s, {.accept_mode = moq::pub_accept_mode::accept_all}).value();
+        auto track = pub.add_track(
+            {.ns = {"ns"}, .track = "t"}, 0).value();
+        c.subscribe({.ns = {"ns"}, .track = "t"}, 0);
+        pump(c, s, 0);
+        pub.tick(0);
+        pump(s, c, 0);
+        c.poll_event();
+
+        // end_of_group must reach the wire (appended tail of the C cfg).
+        std::vector<uint8_t> pdat{1, 2, 3};
+        auto payload = moq::buffer::create(pdat.data(), pdat.size()).value();
+        auto wr = pub.write_object(track,
+            {.group_id = 0, .object_id = 0,
+             .payload = &payload,
+             .end_of_group = true},
+            0);
+        MOQ_CHECK(wr.ok());
+        pump(s, c, 0);
+        auto ev = c.poll_event();
+        MOQ_CHECK(ev.has_value());
+        ev->visit(
+            [&](const moq::event::object_received &obj) {
+                MOQ_CHECK(obj.end_of_group);   // dropped by a frozen init
+            },
+            [&](const auto &) { MOQ_CHECK(false); });
+
+    }
+
+
+    // -- 8c. Streaming begin-properties discriminator: the appended
+    //        properties field of the begin cfg must reach the wire. The
+    //        properties bytes are VALID draft KVP ({key=1, len=1, 0xBB} --
+    //        the same fixture the C session test uses); a fresh session
+    //        pair with a streaming-enabled client surfaces them on the
+    //        first chunk. Dropped by a frozen begin init. -----------------
+    {
+        moq::session_config ccfg{};
+        ccfg.perspective              = moq::perspective::client;
+        ccfg.send_request_capacity    = true;
+        ccfg.initial_request_capacity = 16;
+        ccfg.streaming_objects        = true;
+
+        moq::session_config scfg{};
+        scfg.perspective              = moq::perspective::server;
+        scfg.send_request_capacity    = true;
+        scfg.initial_request_capacity = 16;
+
+        auto cr = moq::session::create(ccfg);
+        auto sr = moq::session::create(scfg);
+        MOQ_CHECK(cr.ok() && sr.ok());
+        auto c = std::move(*cr);
+        auto s = std::move(*sr);
+        c.start(0);
+        pump(c, s, 0); s.poll_event();
+        pump(s, c, 0); c.poll_event();
+
+        auto pub = moq::publisher::create(
+            s, {.accept_mode = moq::pub_accept_mode::accept_all}).value();
+        auto track = pub.add_track(
+            {.ns = {"ns"}, .track = "t"}, 0).value();
+        c.subscribe({.ns = {"ns"}, .track = "t"}, 0);
+        pump(c, s, 0);
+        pub.tick(0);
+        pump(s, c, 0);
+        c.poll_event();
+
+        static const uint8_t kvp[] = { 0x01, 0x01, 0xBB };  /* valid KVP */
+        auto props = moq::buffer::create(kvp, sizeof(kvp)).value();
+        MOQ_CHECK(pub.begin_object(track, 0, 0, 2, props, 0).ok());
+        std::vector<uint8_t> cdat{7, 8};
+        auto chunk = moq::buffer::create(cdat.data(), cdat.size()).value();
+        MOQ_CHECK(pub.write_data(track, chunk, 0).ok());
+        MOQ_CHECK(pub.end_object(track, 0).ok());
+        pump(s, c, 0);
+        bool saw_props = false;
+        while (auto e2 = c.poll_event()) {
+            e2->visit(
+                [&](const moq::event::object_chunk &obj) {
+                    if (obj.properties_data.size() == sizeof(kvp) &&
+                        std::equal(obj.properties_data.begin(),
+                                   obj.properties_data.end(), kvp))
+                        saw_props = true;
+                },
+                [&](const moq::event::object_received &obj) {
+                    if (obj.properties_data.size() == sizeof(kvp) &&
+                        std::equal(obj.properties_data.begin(),
+                                   obj.properties_data.end(), kvp))
+                        saw_props = true;
+                },
+                [&](const auto &) {});
+        }
+        MOQ_CHECK(saw_props);
     }
 
     // -- 9. pub_object_config: datagram with properties ----------------

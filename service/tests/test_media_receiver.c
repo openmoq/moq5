@@ -155,8 +155,10 @@ typedef struct {
 
 static sap_srv_state_t g_sap;
 
-static int sap_server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int sap_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     sap_srv_state_t *st = (sap_srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -226,7 +228,7 @@ static int sap_server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
                 st->failed = true; return -1;
             }
             moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init(&ocfg);
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
             ocfg.group_id = k_sap_script[i].g;
             ocfg.object_id = k_sap_script[i].o;
             ocfg.payload = payload;
@@ -251,7 +253,7 @@ static int sap_server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
                              (const uint8_t *)scores_json,
                              strlen(scores_json), &payload) == MOQ_OK) {
             moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init(&ocfg);
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
             ocfg.group_id = 0;
             ocfg.object_id = 0;
             ocfg.payload = payload;
@@ -274,7 +276,7 @@ static int sap_server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
                              (const uint8_t *)history_json,
                              strlen(history_json), &payload) == MOQ_OK) {
             moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init(&ocfg);
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
             ocfg.group_id = 0;
             ocfg.object_id = 0;
             ocfg.payload = payload;
@@ -324,8 +326,10 @@ typedef struct {
 
 static mt_srv_state_t g_mt;
 
-static int mt_server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int mt_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     mt_srv_state_t *st = (mt_srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -385,7 +389,7 @@ static int mt_server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
                 st->failed = true; return -1;
             }
             moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init(&ocfg);
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
             ocfg.group_id = k_mt_script[i].g;
             ocfg.object_id = k_mt_script[i].o;
             ocfg.payload = payload;
@@ -436,7 +440,7 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
             return false;
         }
         moq_pub_object_cfg_t ocfg;
-        moq_pub_object_cfg_init(&ocfg);
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
         ocfg.group_id = (uint64_t)(i / OBJS_PER_GROUP);
         ocfg.object_id = (uint64_t)(i % OBJS_PER_GROUP);
         ocfg.payload = payload;
@@ -460,8 +464,10 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
 
 static srv_state_t g_srv;
 
-static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     srv_state_t *st = (srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -567,7 +573,7 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
                 return -1;
             }
             moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init(&ocfg);
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
             ocfg.group_id = 1;
             ocfg.object_id = 0;
             ocfg.payload = payload;
@@ -613,8 +619,10 @@ static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
 
 /* Server that knows the catalog track but refuses every subscription
  * (the publisher facade only answers subscribes for tracks it has). */
-static int reject_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int reject_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     srv_state_t *st = (srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -652,8 +660,10 @@ static int reject_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
  * SUBSCRIBE + Joining FETCH(offset=0) path in media_receiver.c. Uses the public
  * core session serving APIs directly -- no publisher facade, no FETCH-serving
  * public API. */
-static int fetch_only_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int fetch_only_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     srv_state_t *st = (srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -720,7 +730,8 @@ static int fetch_only_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
     return 0;
 }
 
-typedef int (*pump_fn_t)(moq_pq_threaded_t *, uint64_t, void *);
+typedef int (*pump_fn_t)(moq_pq_threaded_t *, moq_pq_threaded_lane_t *,
+                         uint64_t, void *);
 
 static moq_pq_threaded_t *start_server_with(const char *cert,
                                             const char *key,
@@ -743,8 +754,8 @@ static moq_pq_threaded_t *start_server_with(const char *cert,
         cfg.port = port;
         cfg.send_request_capacity = true;
         cfg.initial_request_capacity = 16;
-        cfg.on_pump = pump;
-        cfg.on_pump_ctx = st;
+        cfg.on_lane_pump = pump;
+        cfg.on_lane_pump_ctx = st;
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&cfg, &srv) == MOQ_OK) {
             *out_port = port;

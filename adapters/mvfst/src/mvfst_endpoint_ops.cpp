@@ -131,6 +131,8 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
         auto result = ep->socket->writeChain(stream_id, std::move(buf), fin);
         if (result.hasError())
             return map_local_error(result.error());
+        ep->wrote_since_pump_arm = true;
+        ep->last_write_stream = stream_id;
         return MOQ_TRANSPORT_OK;
     });
 }
@@ -167,6 +169,8 @@ static moq_transport_result_t ep_write_payload(void *ctx,
         auto result = ep->socket->writeChain(stream_id, std::move(iobuf), fin);
         if (result.hasError())
             return map_local_error(result.error());
+        ep->wrote_since_pump_arm = true;
+        ep->last_write_stream = stream_id;
         return MOQ_TRANSPORT_OK;
     });
 }

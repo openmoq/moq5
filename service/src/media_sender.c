@@ -56,6 +56,26 @@
 #define MEDIA_SENDER_CFG_MIN_SIZE \
     offsetof(moq_media_sender_cfg_t, callbacks)
 
+/* Default automatic catalog-refresh interval when the cfg field is 0 or an
+ * old caller's struct_size predates it (MSF-01 §5.1 cache-staleness republish). */
+#define SENDER_DEFAULT_CATALOG_REFRESH_US 1000000ull   /* 1 second */
+
+/* ABI pin for the appended catalog_refresh_interval_us. The useful, portable
+ * contract is that the field begins exactly at the aligned boundary AFTER the
+ * previous last field (drop_without_demand) -- derived independently here, no
+ * hard-coded offset (which would reject otherwise-valid ABIs on other targets).
+ * This keeps a caller built against the pre-refresh struct bit-compatible and
+ * makes the whole-field struct_size gate exact. */
+#define SENDER_CFG_PRE_REFRESH_END \
+    (offsetof(moq_media_sender_cfg_t, drop_without_demand) + \
+     sizeof(((moq_media_sender_cfg_t *)0)->drop_without_demand))
+#define SENDER_CFG_REFRESH_ALIGN _Alignof(uint64_t)
+_Static_assert(
+    offsetof(moq_media_sender_cfg_t, catalog_refresh_interval_us) ==
+        ((SENDER_CFG_PRE_REFRESH_END + SENDER_CFG_REFRESH_ALIGN - 1) &
+         ~(size_t)(SENDER_CFG_REFRESH_ALIGN - 1)),
+    "catalog_refresh_interval_us must begin at the old aligned sizeof boundary");
+
 #define SENDER_DEFAULT_SAP_HISTORY_GROUPS 8u
 #define SENDER_DEFAULT_MEDIA_TIMELINE_HISTORY_GROUPS 8u
 
@@ -122,7 +142,7 @@ struct moq_media_track {
     bool                  in_published;       /* track is part of the last committed
                                                 catalog generation -- the baseline
                                                 the next deltaUpdate diffs against
-                                                (S2b). */
+                                                . */
     bool                  catalog_meta_dirty; /* a surviving (still-published) tuple's
                                                 catalog metadata changed in place
                                                 (e.g. live->VOD) -- a change a
@@ -278,6 +298,24 @@ struct moq_media_sender {
     moq_media_track_t **tracks;           /* app-built track list */
     size_t            track_count, track_cap;
     bool              tracks_frozen;      /* hook started building publisher */
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    /* One-shot fault seam: force the catalog-republish live-write loop to
+     * behave as if object `test_block_republish_obj` hit WOULD_BLOCK, and
+     * snapshot the loop state at that instant (all under s->mu). Test-only:
+     * never compiled into shipping libraries. */
+    int64_t           test_block_republish_obj;   /* -1 = off */
+    bool              test_block_fired;
+    size_t            test_block_cursor;
+    size_t            test_block_count;
+    bool              test_block_retained_set;
+    unsigned          test_retained_installs;   /* successful catalog
+                                                   retained-group installs */
+    bool              test_block_retained_once; /* one-shot: force the retained
+                                                   install (set_retained_group)
+                                                   to WOULD_BLOCK once, AFTER the
+                                                   live writes -- models
+                                                   retained-install backpressure */
+#endif
 
     sender_preq_entry_t *preq;            /* ring; entries own their refs */
     uint32_t          preq_head, preq_tail;
@@ -293,7 +331,7 @@ struct moq_media_sender {
 
     moq_media_sender_stats_t stats;       /* counters (mu-protected) */
 
-    /* Catalog republish (S1). catalog_dirty is set by add_track/remove_track
+    /* Catalog republish . catalog_dirty is set by add_track/remove_track
      * under s->mu; the hook coalesces pending mutations into ONE new independent
      * generation per cycle. The rest is network-thread-only. */
     bool              catalog_dirty;
@@ -312,7 +350,7 @@ struct moq_media_sender {
     uint64_t          catalog_group;        /* last published generation (0 = initial) */
     moq_rcbuf_t      *published_catalog;     /* last committed catalog bytes (the
                                                 independent base / no-op dedup) */
-    /* Staged in-flight generation (S2b). A post-ready generation is a NEW group:
+    /* Staged in-flight generation . A post-ready generation is a NEW group:
      * object 0 = the prior committed catalog (independent base), objects 1..N =
      * deltaUpdate objects (removes then adds) transforming it to the current
      * catalog. The dense object list is live-written in order then installed as
@@ -324,6 +362,25 @@ struct moq_media_sender {
     size_t            pending_obj_cursor;    /* next object to live-write */
     bool              pending_retained_set;
     moq_rcbuf_t      *pending_current;       /* new baseline (commit -> published) */
+    /* Automatic independent catalog refresh: a late viewer joining through a
+     * relay that resolves Joining FETCHes locally would otherwise never see the
+     * catalog on the subscribe path, so the sender periodically republishes it.
+     * Network-thread-only.
+     * interval_us is resolved at create: SENDER_DEFAULT_CATALOG_REFRESH_US when
+     * the cfg field is 0/absent, UINT64_MAX when explicitly disabled, else the
+     * caller's value. deadline_us is the next refresh time (UINT64_MAX = not
+     * armed / disabled); armed when the initial catalog installs and re-armed
+     * on every generation commit so a real mutation resets the cadence. */
+    uint64_t          catalog_refresh_interval_us;
+    uint64_t          catalog_refresh_deadline_us;
+    /* Cached next service-deadline for the managed-adapter wake query, recomputed
+     * at the end of every sender_hook (where facade access is legal) and read by
+     * sender_next_deadline_us as a pure scalar under s->mu -- so the deadline the
+     * idle managed loop wakes on never re-enters the publisher/session/adapter.
+     * UINT64_MAX when refresh is not timer-waiting (disabled, unarmed, not ready,
+     * fatal/closed, at the group ceiling, a generation pending/dirty, or no
+     * catalog demand). */
+    uint64_t          refresh_wake_deadline_us;
     uint64_t          pending_group;
 };
 
@@ -335,6 +392,7 @@ static void sender_set_fatal_locked(moq_media_sender_t *s, uint64_t code)
         s->fatal = true;
         s->fatal_code = code;
     }
+    s->refresh_wake_deadline_us = UINT64_MAX;   /* terminal: no managed wake */
     pthread_cond_broadcast(&s->space_cv);   /* unblock BLOCK_TIMEOUT waiters */
 }
 
@@ -346,6 +404,10 @@ static void sender_fire_closed(moq_media_sender_t *s, bool is_fatal,
     pthread_mutex_lock(&s->mu);
     if (s->closed_fired) { pthread_mutex_unlock(&s->mu); return; }
     s->closed_fired = true;
+    /* Terminal (incl. a CLEAN close): disarm the managed wake atomically with
+     * the close latch, so a cached finite deadline cannot survive to a cycle
+     * that returns early (e.g. session == NULL) before the next recompute. */
+    s->refresh_wake_deadline_us = UINT64_MAX;
     void *cbctx = s->callbacks.ctx;
     void (*cb)(void *, moq_media_sender_t *, bool, uint64_t)
         = s->callbacks.on_closed;
@@ -1097,7 +1159,7 @@ static void sender_emit_sap_for(moq_media_sender_t *s, moq_media_track_t *tl,
                                &payload) != MOQ_OK)
             return;
         moq_pub_object_cfg_t ocfg;
-        moq_pub_object_cfg_init(&ocfg);
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
         ocfg.group_id = g;
         ocfg.object_id = obj;
         ocfg.payload = payload;
@@ -1226,7 +1288,7 @@ static void sender_emit_mt_for(moq_media_sender_t *s, moq_media_track_t *tl,
         if (crc != MOQ_OK) return;
 
         moq_pub_object_cfg_t ocfg;
-        moq_pub_object_cfg_init(&ocfg);
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
         ocfg.group_id = g;
         ocfg.object_id = obj;
         ocfg.payload = payload;
@@ -1343,7 +1405,7 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
         uint64_t oid = new_group ? 0 : t->emit_obj;
 
         moq_pub_object_cfg_t ocfg;
-        moq_pub_object_cfg_init(&ocfg);
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
         ocfg.group_id = e->group_seq;
         ocfg.object_id = oid;
         ocfg.payload = e->payload;
@@ -1431,7 +1493,11 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
                                  bool advertise, uint64_t now_us)
 {
     moq_pub_track_cfg_t tcfg;
-    moq_pub_track_cfg_init(&tcfg);
+    /* Sized init: the catalog branch below sets the APPENDED
+     * has_publisher_priority tail field, which moq_pub_add_track reads only
+     * when struct_size covers it -- the pointer-only init's frozen v0
+     * struct_size would silently drop it (default priority 128, not 0). */
+    moq_pub_track_cfg_init_sized(&tcfg, sizeof(tcfg));
     tcfg.track_namespace = s->namespace_;
     tcfg.track_name = t->is_catalog
         ? (moq_bytes_t){ s->catalog_name, s->catalog_name_len }
@@ -1442,6 +1508,13 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
         tcfg.has_publisher_priority = true;
         tcfg.publisher_priority = 0;
     }
+    /* The sender's production is strictly monotonic on every track: media
+     * emission drains group_seq in order (eviction only drops OLDER groups
+     * before emission; an abandoned group never rewinds), and catalog
+     * generations only advance, with delta objects appended to the OPEN
+     * generation group. Declaring it lets finite subscription filters
+     * auto-complete once production passes their end group. */
+    tcfg.monotonic_groups = true;
 
     if (moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track) != MOQ_OK) {
         sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
@@ -1684,7 +1757,100 @@ static bool sender_stage_generation(moq_media_sender_t *s)
     return true;
 }
 
-/* Post-ready catalog republish (S2b, network thread). Coalesces pending add/
+/* Arm the next automatic-refresh deadline from now (caller holds s->mu, or is
+ * on the network thread before the sender is live). UINT64_MAX is reserved
+ * EXCLUSIVELY for the disabled/unarmed state (what sender_refresh_due reads as
+ * "never"), so a finite interval must never resolve to it: a finite deadline
+ * that would overflow saturates to UINT64_MAX-1 (still armed, fires eventually).
+ * Refresh is also disarmed once the generation counter reaches the varint
+ * ceiling (MOQ_QUIC_VARINT_MAX): the next group would be unencodable, so rather
+ * than re-arm and churn (staging a group the facade would reject as fatal) the
+ * deadline is parked at UINT64_MAX. */
+static void sender_arm_refresh(moq_media_sender_t *s, uint64_t now_us)
+{
+    if (s->catalog_refresh_interval_us == UINT64_MAX ||
+        s->catalog_group >= MOQ_QUIC_VARINT_MAX) {
+        s->catalog_refresh_deadline_us = UINT64_MAX;   /* disabled / ceiling */
+        return;
+    }
+    uint64_t d = now_us + s->catalog_refresh_interval_us;
+    /* Saturate to UINT64_MAX-1 on overflow AND on the exact-max collision:
+     * now+interval == UINT64_MAX does not overflow but would alias the
+     * disabled/unarmed sentinel, so a finite interval could silently disable. */
+    if (d < now_us || d == UINT64_MAX) d = UINT64_MAX - 1;
+    s->catalog_refresh_deadline_us = d;
+}
+
+/* Recompute the cached managed-adapter wake deadline (caller holds s->mu; run at
+ * the end of sender_hook, where facade access is legal). It is the armed refresh
+ * deadline iff refresh is genuinely TIMER-WAITING; otherwise UINT64_MAX, so an
+ * expired deadline can never keep an idle managed loop immediately-due while the
+ * hook does no work. Terminality is read from the cached closed_fired/fatal
+ * latches, never sender_ep_closed() (which would reach the adapter). */
+static void sender_recompute_wake_deadline(moq_media_sender_t *s)
+{
+    uint64_t d = UINT64_MAX;
+    if (s->ready && !s->fatal && !s->closed_fired &&
+        s->catalog_refresh_interval_us != UINT64_MAX &&
+        s->catalog_refresh_deadline_us != UINT64_MAX &&
+        s->catalog_group < MOQ_QUIC_VARINT_MAX &&
+        s->pending_obj_count == 0 && !s->catalog_dirty &&
+        s->catalog_track && sender_track_demand(s, s->catalog_track))
+        d = s->catalog_refresh_deadline_us;
+    s->refresh_wake_deadline_us = d;
+}
+
+/* Managed-adapter wake query (moq_endpoint_hook_ops.next_deadline_us): a PURE
+ * cached-scalar read under s->mu -- no publisher/session/endpoint/adapter
+ * re-entry, safe to call after the pump's exclusive window has closed. */
+static uint64_t sender_next_deadline_us(void *ctx)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    pthread_mutex_lock(&s->mu);
+    uint64_t d = s->refresh_wake_deadline_us;
+    pthread_mutex_unlock(&s->mu);
+    return d;
+}
+
+/* True when an automatic independent catalog refresh is due (caller holds
+ * s->mu). Disabled interval or an unarmed deadline is never due. */
+static bool sender_refresh_due(const moq_media_sender_t *s, uint64_t now_us)
+{
+    if (s->catalog_refresh_interval_us == UINT64_MAX) return false;
+    if (s->catalog_refresh_deadline_us == UINT64_MAX) return false;
+    return now_us >= s->catalog_refresh_deadline_us;
+}
+
+/* Stage a refresh generation (caller holds s->mu, pending is empty): a NEW
+ * group whose sole object 0 is the COMPLETE current catalog (independent,
+ * never a delta), even when its bytes match the last committed catalog -- the
+ * point is to place a fresh independent object on the subscribe path for late
+ * joiners, not to signal a content change. Reuses the same pending_* cursor /
+ * retained-install machinery as a mutation generation, so a WOULD_BLOCK is
+ * exactly-once and retryable. Returns true if staged; false at the varint group
+ * ceiling (the next group would be unencodable) or on a build failure (fatal). */
+static bool sender_stage_refresh(moq_media_sender_t *s)
+{
+    /* The next group (catalog_group + 1) must be an encodable QUIC varint; at
+     * the ceiling refuse cleanly rather than stage a group the facade rejects. */
+    if (s->catalog_group >= MOQ_QUIC_VARINT_MAX) return false;
+    moq_rcbuf_t *current = NULL;
+    if (sender_build_catalog(s, &current, true) != MOQ_OK || !current) {
+        sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
+        return false;
+    }
+    s->pending_group = s->catalog_group + 1;
+    s->pending_obj_cursor = 0;
+    s->pending_retained_set = false;
+    s->pending_current = current;             /* becomes published on commit */
+    moq_rcbuf_incref(current);
+    s->pending_objs[0] = current;             /* single independent object */
+    s->pending_obj_count = 1;
+    sender_commit_baseline(s);                /* no tuple change; keeps in sync */
+    return true;
+}
+
+/* Post-ready catalog republish (network thread). Coalesces pending add/
  * remove mutations into ONE new generation in a NEW group: object 0 is the
  * prior committed catalog (independent base) and objects 1..N are deltaUpdate
  * objects (removes then adds) transforming it to the current catalog
@@ -1700,20 +1866,51 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
     pthread_mutex_lock(&s->mu);
 
     if (s->pending_obj_count == 0) {
-        if (!s->catalog_dirty) { pthread_mutex_unlock(&s->mu); return; }
-        s->catalog_dirty = false;   /* a later mutation re-sets it */
-        if (!sender_stage_generation(s)) { pthread_mutex_unlock(&s->mu); return; }
+        /* A real add/remove/conversion generation takes precedence. */
+        if (s->catalog_dirty) {
+            s->catalog_dirty = false;   /* a later mutation re-sets it */
+            (void)sender_stage_generation(s);   /* stages, no-op dedups, or fatal */
+            if (s->fatal) { pthread_mutex_unlock(&s->mu); return; }
+        }
+        /* No mutation generation this cycle (dedup, or nothing was dirty): if a
+         * periodic refresh is due AND the catalog has demand, stage exactly one
+         * independent refresh. No demand -> no refresh / no group advance. Never
+         * a redundant second generation in one cycle (a mutation above leaves
+         * pending_obj_count > 0, skipping this). */
+        if (s->pending_obj_count == 0 &&
+            sender_refresh_due(s, now_us) &&
+            sender_track_demand(s, s->catalog_track)) {
+            (void)sender_stage_refresh(s);
+            if (s->fatal) { pthread_mutex_unlock(&s->mu); return; }
+        }
+        if (s->pending_obj_count == 0) { pthread_mutex_unlock(&s->mu); return; }
     }
 
-    /* Live-write objects 0..N-1 in order to active subscribers. With no
-     * subscriber the live writes are skipped (the retained group below serves
-     * any future joiner) -- same discipline as the media drain. A WOULD_BLOCK
-     * retries from the cursor (no duplicate / skipped object). */
-    if (moq_pub_has_subscriber(s->pub, s->catalog_track->pub_track)) {
+    /* Live-write objects 0..N-1 in order wherever the catalog has demand --
+     * a subscriber (pull) OR an established forward-on publication (push),
+     * the same sender_track_demand the initial catalog and the media drain
+     * use. With no demand the live writes are skipped (the retained group
+     * below serves any future joiner). A WOULD_BLOCK retries from the cursor
+     * (no duplicate / skipped object). */
+    if (sender_track_demand(s, s->catalog_track)) {
         while (s->pending_obj_cursor < s->pending_obj_count) {
             size_t k = s->pending_obj_cursor;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            if (s->test_block_republish_obj >= 0 &&
+                (int64_t)k == s->test_block_republish_obj) {
+                /* Snapshot the exact mid-generation state, then return as a
+                 * WOULD_BLOCK would: cursor untouched, nothing committed. */
+                s->test_block_republish_obj = -1;   /* one-shot */
+                s->test_block_fired = true;
+                s->test_block_cursor = s->pending_obj_cursor;
+                s->test_block_count = s->pending_obj_count;
+                s->test_block_retained_set = s->pending_retained_set;
+                pthread_mutex_unlock(&s->mu);
+                return;
+            }
+#endif
             moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init(&ocfg);
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
             ocfg.group_id = s->pending_group;
             ocfg.object_id = k;
             ocfg.payload = s->pending_objs[k];
@@ -1738,6 +1935,17 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
     /* Install the dense retained group (objects 0..N) after the live publish, so
      * a joiner reconstructs the same generation a FETCH would. */
     if (!s->pending_retained_set) {
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        if (s->test_block_retained_once) {
+            /* One-shot: behave exactly as a set_retained_group WOULD_BLOCK --
+             * the live objects are already written, but the install (and thus
+             * the commit + deadline re-arm) is deferred to the next pump with
+             * pending state intact. */
+            s->test_block_retained_once = false;
+            pthread_mutex_unlock(&s->mu);
+            return;
+        }
+#endif
         moq_pub_retained_object_t robjs[3];
         for (size_t i = 0; i < s->pending_obj_count; i++) {
             robjs[i].object_id = i;
@@ -1759,10 +1967,18 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
             return;
         }
         s->pending_retained_set = true;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        s->test_retained_installs++;
+#endif
     }
 
-    /* Commit the generation: advance the group and adopt the new baseline. */
+    /* Commit the generation: advance the group and adopt the new baseline. Any
+     * committed generation (mutation OR refresh) resets the refresh cadence, so
+     * the next automatic refresh is one full interval away and a WOULD_BLOCK
+     * retry across ticks never drifts the cadence (the deadline advances only
+     * here, at commit, not while a generation is mid-flight). */
     s->catalog_group = s->pending_group;
+    sender_arm_refresh(s, now_us);
     if (s->published_catalog) moq_rcbuf_decref(s->published_catalog);
     s->published_catalog = s->pending_current;   /* move ref */
     s->pending_current = NULL;
@@ -1881,6 +2097,32 @@ static void sender_resync_demand(moq_media_sender_t *s)
     sender_tracks_release(s, snap, n);
 }
 
+/* Peer rejected a catalog or media-track PUBLISH: the sender can never
+ * deliver on it, so become fatal (PUBLISH_REJECTED) -- surfaced once via
+ * on_closed(is_fatal=true) and waking any blocked writer. No auto-retry:
+ * the service has no auth/policy context to redecide; the app may recreate
+ * the sender. */
+static void sender_pub_on_publish_error(void *ctx, moq_pub_track_t *track,
+                                        moq_request_error_t error_code)
+{
+    (void)track; (void)error_code;
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED);
+}
+
+/* Peer refused (REJECTED) or withdrew (CANCELLED) the advertised namespace:
+ * the sender cannot publish under it, so become fatal with the matching
+ * code (the public header declares NAMESPACE_REJECTED/CANCELLED). */
+static void sender_pub_on_namespace_terminal(void *ctx,
+    const moq_pub_namespace_terminal_info_t *info)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    uint64_t code = (info->kind == MOQ_PUB_NAMESPACE_CANCELLED)
+        ? MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED
+        : MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED;
+    sender_set_fatal(s, code);
+}
+
 static void sender_pub_on_closed(void *ctx, uint64_t error_code)
 {
     (void)error_code;   /* the peer's session error is not the sender fatal code */
@@ -1947,6 +2189,9 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pcfg.callbacks.ctx = s;
         pcfg.callbacks.on_closed = sender_pub_on_closed;
         pcfg.callbacks.on_publish_finished = sender_pub_on_publish_finished;
+        pcfg.callbacks.on_publish_error = sender_pub_on_publish_error;
+        pcfg.callbacks.on_namespace_terminal =
+            sender_pub_on_namespace_terminal;
         if (moq_pub_create(session, &s->alloc, &pcfg, &s->pub) != MOQ_OK) {
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
@@ -1961,12 +2206,18 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pthread_mutex_unlock(&s->mu);
 
         moq_pub_track_cfg_t ccfg;
-        moq_pub_track_cfg_init(&ccfg);
+        /* Sized init: has_publisher_priority below is an appended tail field
+         * (see sender_add_pub_track). */
+        moq_pub_track_cfg_init_sized(&ccfg, sizeof(ccfg));
         ccfg.track_namespace = s->namespace_;
         ccfg.track_name = (moq_bytes_t){ s->catalog_name, s->catalog_name_len };
         ccfg.advertise_namespace = true;
         ccfg.has_publisher_priority = true;
         ccfg.publisher_priority = 0;   /* catalog leads delivery */
+        /* Catalog generations are monotone; deltas append to the open
+         * generation group (legal: no completion evidence forms while the
+         * group's bracket never cleanly closes). */
+        ccfg.monotonic_groups = true;
         if (moq_pub_add_track(s->pub, &ccfg, now_us,
                               &s->catalog_track->pub_track) != MOQ_OK) {
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
@@ -2041,11 +2292,18 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
         }
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        pthread_mutex_lock(&s->mu);
+        s->test_retained_installs++;   /* the initial catalog's install */
+        pthread_mutex_unlock(&s->mu);
+#endif
         /* Keep the ref as the published baseline (generation 0) for the no-op
          * dedup and the deltaUpdate diff in sender_republish_catalog. */
         s->published_catalog = json;
         s->catalog_group = 0;
         s->catalog_published = true;
+        /* Start the automatic-refresh clock from the initial catalog install. */
+        sender_arm_refresh(s, now_us);
         /* Record the initial catalog's track set as the published baseline. */
         pthread_mutex_lock(&s->mu);
         for (size_t i = 0; i < s->track_count; i++)
@@ -2054,6 +2312,19 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
     }
 
     (void)moq_pub_tick(s->pub, now_us);
+
+    /* A dispatched event (namespace rejection/cancellation, or a rejected
+     * PUBLISH) can have turned the sender fatal inside the tick above. That
+     * is terminal: stop this cycle before any further work -- especially the
+     * readiness block below, which would otherwise fire on_ready after the
+     * fatal on_closed. The fatal path already fired on_closed and woke
+     * waiters. */
+    {
+        pthread_mutex_lock(&s->mu);
+        bool now_fatal = s->fatal;
+        pthread_mutex_unlock(&s->mu);
+        if (now_fatal) return;
+    }
 
     /* Reconcile demand right after the tick so a fresh subscribe fires the join
      * callback in the same cycle it is accepted (before the drain runs). */
@@ -2065,7 +2336,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         sender_track_demand(s, s->catalog_track) &&
         s->published_catalog) {
         moq_pub_object_cfg_t ocfg;
-        moq_pub_object_cfg_init(&ocfg);
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
 
         /* Same (group 0, object 0) as the retained group: it is the same catalog
          * object, so a live subscriber and a FETCH joiner see one identity. */
@@ -2199,6 +2470,13 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
      * mirror and app callbacks reflect subscriptions cleared without a left
      * event (session close / end / VOD finish). */
     sender_resync_demand(s);
+
+    /* Cache the next managed-adapter wake deadline from the now-settled state
+     * (facade access is legal on this path); sender_next_deadline_us returns it
+     * as a pure scalar so an idle managed loop wakes to fire the refresh. */
+    pthread_mutex_lock(&s->mu);
+    sender_recompute_wake_deadline(s);
+    pthread_mutex_unlock(&s->mu);
 }
 
 /* Publisher teardown posted to the network thread (ctx = publisher alone;
@@ -2214,12 +2492,32 @@ static moq_result_t sender_destroy_pub_task(moq_endpoint_t *ep,
 
 /* -- cfg -------------------------------------------------------------- */
 
+/* Frozen v0 floors. The callbacks prefix runs through on_subscriber_left --
+ * everything before the appended on_ready/on_closed/on_track_closed fields.
+ * The cfg prefix runs through the v0 PORTION of the embedded callbacks (the
+ * pre-publish layout ended with the nested callbacks as its last field), so
+ * an old caller's sizeof is offsetof(callbacks) + the v0 callbacks size --
+ * NOT offsetof(callbacks) + sizeof(current callbacks), which includes the
+ * appended callback fields. Pointer-only initializers must never clear past
+ * these floors. */
+#define MEDIA_SENDER_CALLBACKS_V0_SIZE \
+    offsetof(moq_media_sender_callbacks_t, on_ready)
+#define MEDIA_SENDER_CFG_V0_SIZE \
+    (offsetof(moq_media_sender_cfg_t, callbacks) + \
+     MEDIA_SENDER_CALLBACKS_V0_SIZE)
+
 void moq_media_sender_cfg_init(moq_media_sender_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    moq_media_sender_callbacks_init(&cfg->callbacks);  /* nested struct_size */
+    /* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) would
+     * overflow a caller compiled against the pre-publish (smaller) struct.
+     * Appended fields (the on_ready/on_closed/on_track_closed callbacks,
+     * publish_tracks, drop_without_demand, catalog_refresh_interval_us) stay
+     * disabled/default; callers that set them use the _sized initializers. */
+    memset(cfg, 0, MEDIA_SENDER_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MEDIA_SENDER_CFG_V0_SIZE;
+    /* Nested struct_size: the v0 portion this initializer cleared. */
+    cfg->callbacks.struct_size = (uint32_t)MEDIA_SENDER_CALLBACKS_V0_SIZE;
     /* CMSF §3.3/§3.4: validate CMAF output by default (strict). Affects CMAF
      * tracks only; RAW/LOC is unaffected. Callers wanting passthrough set
      * validate_cmaf = false explicitly after init. */
@@ -2230,8 +2528,10 @@ void moq_media_sender_cfg_init(moq_media_sender_cfg_t *cfg)
 void moq_media_sender_callbacks_init(moq_media_sender_callbacks_t *cb)
 {
     if (!cb) return;
-    memset(cb, 0, sizeof(*cb));
-    cb->struct_size = sizeof(*cb);
+    /* Frozen v0 prefix only (see MEDIA_SENDER_CALLBACKS_V0_SIZE): the
+     * appended lifecycle callbacks need moq_media_sender_callbacks_init_sized. */
+    memset(cb, 0, MEDIA_SENDER_CALLBACKS_V0_SIZE);
+    cb->struct_size = (uint32_t)MEDIA_SENDER_CALLBACKS_V0_SIZE;
 }
 
 void moq_media_sender_cfg_init_live(moq_media_sender_cfg_t *cfg)
@@ -2246,6 +2546,76 @@ void moq_media_sender_cfg_init_lossless(moq_media_sender_cfg_t *cfg)
     if (!cfg) return;
     cfg->backpressure = MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT;
     cfg->block_timeout_us = SENDER_DEFAULT_BLOCK_TIMEOUT_US;
+}
+
+void moq_media_sender_callbacks_init_sized(moq_media_sender_callbacks_t *cb,
+                                           size_t cb_size)
+{
+    if (!cb) return;
+    /* Clear exactly what the caller allocated, never more than this library's
+     * struct knows about (same contract as moq_pub_cfg_init_sized). */
+    size_t n = cb_size < sizeof(*cb) ? cb_size : sizeof(*cb);
+    if (n < sizeof(cb->struct_size)) return;  /* too small to even stamp */
+    memset(cb, 0, n);
+    cb->struct_size = (uint32_t)n;
+}
+
+void moq_media_sender_cfg_init_sized(moq_media_sender_cfg_t *cfg,
+                                     size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;  /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    /* Initialize as much of the nested callbacks struct as the caller's
+     * storage covers (bounded by BOTH the outer bytes available and the
+     * library's own callbacks size). */
+    {
+        size_t cb_off = offsetof(moq_media_sender_cfg_t, callbacks);
+        if (n > cb_off)
+            moq_media_sender_callbacks_init_sized(&cfg->callbacks, n - cb_off);
+    }
+    if (n >= offsetof(moq_media_sender_cfg_t, validate_cmaf) +
+             sizeof(cfg->validate_cmaf))
+        cfg->validate_cmaf = true;
+    /* backpressure stays UNSET on purpose: forced choice (§7.5). */
+}
+
+/* The caller-storage prefix the preset wrappers may touch. Computed from
+ * cfg_size, NEVER read back from cfg->struct_size: when cfg_size is smaller
+ * than the struct_size field itself, the base initializer cannot stamp it,
+ * so the field holds whatever (possibly poisoned) bytes the caller had --
+ * gating on it could write a preset default out of bounds. */
+static size_t sender_cfg_prefix(size_t cfg_size)
+{
+    return cfg_size < sizeof(moq_media_sender_cfg_t)
+               ? cfg_size : sizeof(moq_media_sender_cfg_t);
+}
+
+void moq_media_sender_cfg_init_live_sized(moq_media_sender_cfg_t *cfg,
+                                          size_t cfg_size)
+{
+    moq_media_sender_cfg_init_sized(cfg, cfg_size);
+    if (!cfg) return;
+    size_t n = sender_cfg_prefix(cfg_size);
+    if (n >= offsetof(moq_media_sender_cfg_t, backpressure) +
+                 sizeof(cfg->backpressure))
+        cfg->backpressure = MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME;
+}
+
+void moq_media_sender_cfg_init_lossless_sized(moq_media_sender_cfg_t *cfg,
+                                              size_t cfg_size)
+{
+    moq_media_sender_cfg_init_sized(cfg, cfg_size);
+    if (!cfg) return;
+    size_t n = sender_cfg_prefix(cfg_size);
+    if (n >= offsetof(moq_media_sender_cfg_t, backpressure) +
+                 sizeof(cfg->backpressure))
+        cfg->backpressure = MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT;
+    if (n >= offsetof(moq_media_sender_cfg_t, block_timeout_us) +
+                 sizeof(cfg->block_timeout_us))
+        cfg->block_timeout_us = SENDER_DEFAULT_BLOCK_TIMEOUT_US;
 }
 
 void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg)
@@ -2729,49 +3099,44 @@ static void sender_free(moq_media_sender_t *s)
     s->alloc.free(s, sizeof(*s), s->alloc.ctx);
 }
 
-static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
-                               const moq_media_sender_cfg_t *cfg,
-                               moq_media_sender_t **out)
+/* Copy the cfg's appended tail (callbacks + publish_tracks +
+ * drop_without_demand) into the sender, prefix-safely. The effective
+ * callbacks prefix is bounded by BOTH the outer bytes the caller's
+ * struct_size makes available past offsetof(callbacks) AND the nested
+ * callbacks.struct_size -- so an old caller whose (complete, for its build)
+ * callbacks block is smaller than this library's keeps every field it set,
+ * and a mis-sized outer struct_size can never install bytes past the
+ * caller's real storage. Field gates are whole-field: a partially-covered
+ * pointer is never copied. s->callbacks must already be zeroed. */
+static void sender_copy_cfg_tail(moq_media_sender_t *s,
+                                 const moq_media_sender_cfg_t *cfg)
 {
-    const moq_alloc_t *alloc = moq_alloc_default();
-    moq_media_sender_t *s = (moq_media_sender_t *)alloc->alloc(
-        sizeof(*s), alloc->ctx);
-    if (!s) return MOQ_ERR_NOMEM;
-    memset(s, 0, sizeof(*s));
-    s->alloc = *alloc;
-    s->ep = ep;
-    s->owns_endpoint = owns;
-    s->backpressure = cfg->backpressure;
-    s->validate_cmaf = cfg->validate_cmaf;
-    /* Demand-visibility callbacks: read only when the OUTER cfg struct_size
-     * reaches the appended field (older/smaller cfg => no callbacks). The nested
-     * callbacks struct is then copied PREFIX-SAFELY by its own struct_size
-     * (0 = none), so a future appended callback field stays ABI-safe.
-     * s->callbacks is already zeroed by the memset above. */
-    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, callbacks) +
-                                sizeof(cfg->callbacks)) {
+    size_t cb_off = offsetof(moq_media_sender_cfg_t, callbacks);
+    if (cfg->struct_size > cb_off) {
         const moq_media_sender_callbacks_t *cb = &cfg->callbacks;
-        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t, ctx) +
-                                   sizeof(cb->ctx))
+        size_t avail = cfg->struct_size - cb_off;
+        if (avail > sizeof(*cb)) avail = sizeof(*cb);
+        /* The nested struct_size is only readable when the outer prefix
+         * covers it; then it further bounds the effective prefix. */
+        size_t eff = 0;
+        if (avail >= offsetof(moq_media_sender_callbacks_t, ctx))
+            eff = cb->struct_size < avail ? cb->struct_size : avail;
+#define SENDER_CB_FIELD_IN(name) \
+        (eff >= offsetof(moq_media_sender_callbacks_t, name) + \
+                sizeof(cb->name))
+        if (SENDER_CB_FIELD_IN(ctx))
             s->callbacks.ctx = cb->ctx;
-        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
-                                        on_subscriber_joined) +
-                                   sizeof(cb->on_subscriber_joined))
+        if (SENDER_CB_FIELD_IN(on_subscriber_joined))
             s->callbacks.on_subscriber_joined = cb->on_subscriber_joined;
-        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
-                                        on_subscriber_left) +
-                                   sizeof(cb->on_subscriber_left))
+        if (SENDER_CB_FIELD_IN(on_subscriber_left))
             s->callbacks.on_subscriber_left = cb->on_subscriber_left;
-        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
-                                        on_ready) + sizeof(cb->on_ready))
+        if (SENDER_CB_FIELD_IN(on_ready))
             s->callbacks.on_ready = cb->on_ready;
-        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
-                                        on_closed) + sizeof(cb->on_closed))
+        if (SENDER_CB_FIELD_IN(on_closed))
             s->callbacks.on_closed = cb->on_closed;
-        if (cb->struct_size >= offsetof(moq_media_sender_callbacks_t,
-                                        on_track_closed) +
-                                   sizeof(cb->on_track_closed))
+        if (SENDER_CB_FIELD_IN(on_track_closed))
             s->callbacks.on_track_closed = cb->on_track_closed;
+#undef SENDER_CB_FIELD_IN
         s->callbacks.struct_size = sizeof(s->callbacks);
     }
     if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, publish_tracks) +
@@ -2781,6 +3146,41 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
                                      drop_without_demand) +
                                 sizeof(cfg->drop_without_demand))
         s->drop_without_demand = cfg->drop_without_demand;
+    /* Whole-field gate: an old caller whose struct_size predates this field
+     * reads as 0 -> the library default. 0 -> default, UINT64_MAX -> disabled,
+     * else the caller's custom interval. The deadline is armed later, when the
+     * initial catalog installs. */
+    {
+        uint64_t raw = 0;
+        if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t,
+                                         catalog_refresh_interval_us) +
+                                    sizeof(cfg->catalog_refresh_interval_us))
+            raw = cfg->catalog_refresh_interval_us;
+        s->catalog_refresh_interval_us =
+            (raw == 0) ? SENDER_DEFAULT_CATALOG_REFRESH_US : raw;
+    }
+    s->catalog_refresh_deadline_us = UINT64_MAX;   /* not armed yet */
+    s->refresh_wake_deadline_us = UINT64_MAX;      /* no managed wake yet */
+}
+
+static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
+                               const moq_media_sender_cfg_t *cfg,
+                               moq_media_sender_t **out)
+{
+    const moq_alloc_t *alloc = moq_alloc_default();
+    moq_media_sender_t *s = (moq_media_sender_t *)alloc->alloc(
+        sizeof(*s), alloc->ctx);
+    if (!s) return MOQ_ERR_NOMEM;
+    memset(s, 0, sizeof(*s));
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    s->test_block_republish_obj = -1;
+#endif
+    s->alloc = *alloc;
+    s->ep = ep;
+    s->owns_endpoint = owns;
+    s->backpressure = cfg->backpressure;
+    s->validate_cmaf = cfg->validate_cmaf;
+    sender_copy_cfg_tail(s, cfg);
     s->block_timeout_us = cfg->block_timeout_us
         ? cfg->block_timeout_us : SENDER_DEFAULT_BLOCK_TIMEOUT_US;
     s->queue_cap = cfg->queue_max_objects
@@ -2847,13 +3247,22 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
     memset(s->catalog_track, 0, sizeof(*s->catalog_track));
     s->catalog_track->is_catalog = true;
 
-    moq_result_t arc = moq_endpoint_attach_hook(
-        ep, MOQ_ENDPOINT_HOOK_SENDER, sender_hook, s);
-    if (arc < 0) {
-        track_free(s, s->catalog_track);
-        s->catalog_track = NULL;
-        sender_free(s);
-        return arc;
+    /* ep == NULL is the test seam (moq_media_sender_test_new_cfg): the test
+     * drives sender_hook directly, so skip the endpoint attach. Production
+     * create/attach always passes a live endpoint. */
+    if (ep) {
+        moq_endpoint_hook_ops_t ops = {
+            .pump = sender_hook,
+            .next_deadline_us = sender_next_deadline_us,
+        };
+        moq_result_t arc = moq_endpoint_attach_hook(
+            ep, MOQ_ENDPOINT_HOOK_SENDER, &ops, s);
+        if (arc < 0) {
+            track_free(s, s->catalog_track);
+            s->catalog_track = NULL;
+            sender_free(s);
+            return arc;
+        }
     }
     *out = s;
     return MOQ_OK;
@@ -2982,7 +3391,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     /* MSF §5.2.35: trackDuration MUST NOT appear on a live track. */
     if (cfg->has_track_duration && cfg->is_live) return MOQ_ERR_INVAL;
 
-    /* add_track is legal both before and after READY (S1): a post-ready add
+    /* add_track is legal both before and after READY : a post-ready add
      * registers the track and triggers an independent catalog republish. Once
      * completion has been requested (§11.3) the sender is terminal. */
     pthread_mutex_lock(&s->mu);
@@ -3667,7 +4076,10 @@ bool moq_media_sender_is_ready(const moq_media_sender_t *s)
     if (!s) return false;
     moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
     pthread_mutex_lock(&ms->mu);
-    bool r = ms->ready;
+    /* A fatal sender is terminal, never ready: a rejected/cancelled namespace
+     * is no longer announced, so readiness cannot hold once the sender is
+     * fatal (and a not-yet-ready sender can never flip ready afterwards). */
+    bool r = ms->ready && !ms->fatal;
     pthread_mutex_unlock(&ms->mu);
     return r;
 }
@@ -3800,6 +4212,27 @@ moq_result_t moq_media_sender_test_validate_cfg(const moq_media_sender_cfg_t *cf
     return sender_validate_cfg(cfg);
 }
 
+/* Build a sender from a real cfg with NO endpoint (mirrors the receiver's
+ * scripted seam): moq_media_sender_add_track and the real sender_hook can
+ * then be driven against a caller-supplied SimPair session, so rejection
+ * paths are exercised through the PRODUCTION hook -- not a handler stub. */
+moq_media_sender_t *moq_media_sender_test_new_cfg(
+    const moq_media_sender_cfg_t *cfg)
+{
+    if (sender_validate_cfg(cfg) < 0) return NULL;
+    moq_media_sender_t *s = NULL;
+    if (sender_new(NULL, false, cfg, &s) != MOQ_OK) return NULL;
+    return s;
+}
+
+/* Drive the production sender_hook with a caller-controlled session (the hook
+ * ignores its endpoint argument -- (void)ep). */
+void moq_media_sender_test_pump(moq_media_sender_t *s,
+                                moq_session_t *session, uint64_t now_us)
+{
+    sender_hook(NULL, session, now_us, s);
+}
+
 moq_media_sender_t *moq_media_sender_test_new(void)
 {
     const moq_alloc_t *alloc = moq_alloc_default();
@@ -3807,6 +4240,7 @@ moq_media_sender_t *moq_media_sender_test_new(void)
         sizeof(*s), alloc->ctx);
     if (!s) return NULL;
     memset(s, 0, sizeof(*s));
+    s->test_block_republish_obj = -1;
     s->alloc = *alloc;
     s->ep = NULL;
     s->backpressure = MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME;
@@ -3963,6 +4397,57 @@ bool moq_media_sender_test_catalog_dirty(const moq_media_sender_t *s)
     return d;
 }
 
+/* The last committed catalog generation number (0 = the initial catalog). Each
+ * add/remove/conversion or automatic refresh that commits advances it by one. */
+uint64_t moq_media_sender_test_catalog_group(const moq_media_sender_t *s)
+{
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    pthread_mutex_lock(&ms->mu);
+    uint64_t g = ms->catalog_group;
+    pthread_mutex_unlock(&ms->mu);
+    return g;
+}
+
+/* Force the last-committed catalog generation number, so a test can drive the
+ * group ceiling (UINT64_MAX) without publishing 2^64 generations. */
+void moq_media_sender_test_set_catalog_group(moq_media_sender_t *s, uint64_t g)
+{
+    pthread_mutex_lock(&s->mu);
+    s->catalog_group = g;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* The cached managed-adapter wake deadline (what sender_next_deadline_us
+ * returns): a pure scalar, UINT64_MAX when refresh is not timer-waiting. */
+uint64_t moq_media_sender_test_next_deadline_us(moq_media_sender_t *s)
+{
+    return sender_next_deadline_us(s);
+}
+
+/* The RESOLVED automatic-refresh interval (default applied for 0/absent,
+ * UINT64_MAX when explicitly disabled). Lets a config test prove the default /
+ * custom / disable resolution without standing up an endpoint. */
+uint64_t moq_media_sender_test_refresh_interval(const moq_media_sender_t *s)
+{
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    pthread_mutex_lock(&ms->mu);
+    uint64_t iv = ms->catalog_refresh_interval_us;
+    pthread_mutex_unlock(&ms->mu);
+    return iv;
+}
+
+/* Count of successful catalog retained-group installs (initial + every
+ * committed generation). A refresh that advances the group installs exactly
+ * one, so this distinguishes a real group advance from a no-op. */
+unsigned moq_media_sender_test_retained_installs(const moq_media_sender_t *s)
+{
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    pthread_mutex_lock(&ms->mu);
+    unsigned n = ms->test_retained_installs;
+    pthread_mutex_unlock(&ms->mu);
+    return n;
+}
+
 /* Snapshot the current catalog as the "published" baseline (simulates a prior
  * committed generation). */
 void moq_media_sender_test_mark_published(moq_media_sender_t *s)
@@ -4070,4 +4555,91 @@ size_t moq_media_sender_test_stage(moq_media_sender_t *s,
     pthread_mutex_unlock(&s->mu);
     return out;
 }
+/* Run the PRODUCTION cfg-tail copier (callbacks + publish_tracks +
+ * drop_without_demand) against a test sender, so the ABI prefix rules are
+ * tested on the exact code create/attach runs -- not a test-only mirror. */
+void moq_media_sender_test_apply_cfg_tail(moq_media_sender_t *s,
+                                          const moq_media_sender_cfg_t *cfg)
+{
+    pthread_mutex_lock(&s->mu);
+    memset(&s->callbacks, 0, sizeof(s->callbacks));
+    s->publish_tracks = false;
+    s->drop_without_demand = false;
+    sender_copy_cfg_tail(s, cfg);
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Which callbacks the copier installed (1 joined, 2 left, 4 ready, 8 closed,
+ * 16 track_closed, 32 ctx) plus the copied flags (256 publish_tracks,
+ * 512 drop_without_demand). */
+unsigned moq_media_sender_test_cfg_tail_mask(const moq_media_sender_t *s)
+{
+    unsigned m = 0;
+    if (s->callbacks.on_subscriber_joined) m |= 1u;
+    if (s->callbacks.on_subscriber_left)   m |= 2u;
+    if (s->callbacks.on_ready)             m |= 4u;
+    if (s->callbacks.on_closed)            m |= 8u;
+    if (s->callbacks.on_track_closed)      m |= 16u;
+    if (s->callbacks.ctx)                  m |= 32u;
+    if (s->publish_tracks)                 m |= 256u;
+    if (s->drop_without_demand)            m |= 512u;
+    return m;
+}
+
+/* Arm the one-shot republish fault: the live-write loop returns (as on
+ * WOULD_BLOCK) immediately BEFORE writing `object_id` of the next pending
+ * generation, snapshotting the loop state. */
+void moq_media_sender_test_block_republish_before(moq_media_sender_t *s,
+                                                  uint64_t object_id)
+{
+    pthread_mutex_lock(&s->mu);
+    s->test_block_republish_obj = (int64_t)object_id;
+    s->test_block_fired = false;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Arm a one-shot WOULD_BLOCK at the retained-install step (set_retained_group),
+ * AFTER the live objects are written -- exercises retained-install backpressure
+ * distinct from an object-write block. */
+void moq_media_sender_test_block_retained_install_once(moq_media_sender_t *s)
+{
+    pthread_mutex_lock(&s->mu);
+    s->test_block_retained_once = true;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Whether the armed fault fired; on true, returns the snapshot: the cursor
+ * (== the blocked object id: everything before it was written exactly once),
+ * the pending count (nonzero == the generation is NOT committed), and
+ * whether the retained group had been installed at that instant. */
+bool moq_media_sender_test_block_republish_state(moq_media_sender_t *s,
+                                                 size_t *cursor,
+                                                 size_t *count,
+                                                 bool *retained_set)
+{
+    pthread_mutex_lock(&s->mu);
+    bool fired = s->test_block_fired;
+    if (fired) {
+        if (cursor) *cursor = s->test_block_cursor;
+        if (count) *count = s->test_block_count;
+        if (retained_set) *retained_set = s->test_block_retained_set;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return fired;
+}
+
+/* Live republish state under the sender lock: the CURRENT pending cursor and
+ * count (count == 0 means the last generation committed) and how many
+ * retained-group installs have succeeded so far. */
+void moq_media_sender_test_republish_live(moq_media_sender_t *s,
+                                          size_t *cursor, size_t *count,
+                                          unsigned *retained_installs)
+{
+    pthread_mutex_lock(&s->mu);
+    if (cursor) *cursor = s->pending_obj_cursor;
+    if (count) *count = s->pending_obj_count;
+    if (retained_installs) *retained_installs = s->test_retained_installs;
+    pthread_mutex_unlock(&s->mu);
+}
+
 #endif /* MOQ_MEDIA_SENDER_TESTING */

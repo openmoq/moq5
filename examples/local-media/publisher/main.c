@@ -392,7 +392,7 @@ static int loop_callback(picoquic_quic_t *quic,
         }
 
         moq_pub_object_cfg_t obj;
-        moq_pub_object_cfg_init(&obj);
+        moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
         obj.group_id = ctx->frame_count;
         obj.object_id = 0;
         obj.payload = payload;

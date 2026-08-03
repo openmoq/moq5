@@ -1055,14 +1055,20 @@ static moq_result_t emit_decode(moq_playback_t *pb,
 
     for (size_t si = 0; si < frag.sample_count; si++) {
         moq_cmaf_sample_t *s = &frag.samples[si];
+        /* Pass 1 already validated every scale below, so these never fail here;
+         * checking the results (rather than discarding them) both preserves the
+         * MOQ_ERR_INVAL contract and leaves no output uninitialized on the
+         * unreachable failure edge. */
         uint64_t dts_us;
-        pb_scale_checked(dts_ticks, t->timescale, &dts_us);
+        if (!pb_scale_checked(dts_ticks, t->timescale, &dts_us))
+            return MOQ_ERR_INVAL;
 
         bool neg = s->composition_offset < 0;
         uint32_t abs_co = neg ? (uint32_t)(-(int64_t)s->composition_offset)
                               : (uint32_t)s->composition_offset;
         uint64_t abs_us;
-        pb_scale_checked(abs_co, t->timescale, &abs_us);
+        if (!pb_scale_checked(abs_co, t->timescale, &abs_us))
+            return MOQ_ERR_INVAL;
         int64_t comp_us = neg ? -(int64_t)abs_us : (int64_t)abs_us;
 
         uint64_t pts_us = (comp_us >= 0)
@@ -1070,7 +1076,8 @@ static moq_result_t emit_decode(moq_playback_t *pb,
             : dts_us - (uint64_t)(-comp_us);
 
         uint64_t dur64;
-        pb_scale_checked(s->duration, t->timescale, &dur64);
+        if (!pb_scale_checked(s->duration, t->timescale, &dur64))
+            return MOQ_ERR_INVAL;
         uint32_t dur_us = (uint32_t)dur64;
 
         moq_playback_cmd_t dec_cmd;

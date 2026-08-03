@@ -2,7 +2,7 @@
  * Managed mvfst server lifecycle test.
  *
  * Verifies that a managed server can create/start/stop/destroy,
- * that on_pump runs, and that local_port is set after bind.
+ * that on_lane_pump runs, and that local_port is set after bind.
  *
  * No client connections here — just listener lifecycle.
  *
@@ -120,8 +120,10 @@ struct tmp_files {
 
 static std::atomic<int> pump_count{0};
 
-static int pump_counting(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_counting(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     pump_count.fetch_add(1);
     return (pump_count.load() >= 3) ? 1 : 0;
@@ -148,7 +150,7 @@ static void test_server_lifecycle()
     cfg.port = 0;
     cfg.cert_path = tf.cert_path;
     cfg.key_path = tf.key_path;
-    cfg.on_pump = pump_counting;
+    cfg.on_lane_pump = pump_counting;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
 
@@ -161,7 +163,9 @@ static void test_server_lifecycle()
     MVFST_CHECK(!moq_mvfst_managed_is_fatal(m));
     MVFST_CHECK(moq_mvfst_managed_session(m) == nullptr);
     MVFST_CHECK(moq_mvfst_managed_conn_count(m) == 0);
-    MVFST_CHECK(moq_mvfst_managed_next_conn(m, nullptr) == nullptr);
+    /* off the network thread, lane iteration yields nothing */
+    MVFST_CHECK(moq_mvfst_lane_next_conn(
+        moq_mvfst_managed_lane(m, 0), nullptr) == nullptr);
 
     auto dl = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < dl) {
@@ -178,7 +182,7 @@ static void test_server_lifecycle()
 
     /* Server stop idempotency: stop, stop, destroy. */
     pump_count.store(0);
-    cfg.on_pump = pump_counting;
+    cfg.on_lane_pump = pump_counting;
     m = nullptr;
     rc = moq_mvfst_managed_create(&cfg, &m);
     MVFST_CHECK(rc == MOQ_OK);
@@ -193,8 +197,10 @@ static void test_server_lifecycle()
 /* Test: server with bad cert/key content                             */
 /* ================================================================== */
 
-static int pump_noop(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_noop(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 0;
 }
@@ -222,7 +228,7 @@ static void test_server_bad_cert_content()
     cfg.port = 0;
     cfg.cert_path = cert_path;
     cfg.key_path = key_path;
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
 
     moq_mvfst_managed_t *m = nullptr;
     moq_result_t rc = moq_mvfst_managed_create(&cfg, &m);

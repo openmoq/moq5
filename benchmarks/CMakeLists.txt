@@ -24,6 +24,74 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC)
     target_link_libraries(moq_bench_picoquic_loopback PRIVATE moq::adapter-picoquic)
 endif()
 
+# WebTransport transport comparison: the same MoQ workload over
+# wtquic/MsQuic and over the managed picoquic WebTransport loopback.
+if(MOQ_BUILD_ADAPTER_WTQUIC AND MOQ_BUILD_PICO_WT_MANAGED)
+    add_executable(moq_bench_wt_compare bench_wt_compare.c)
+    target_link_libraries(moq_bench_wt_compare PRIVATE
+        moq::adapter-wtquic moq::adapter-pico-wt-managed)
+
+    if(MOQ_BUILD_TESTS)
+        add_test(NAME bench_wt_compare_smoke
+            COMMAND ${CMAKE_COMMAND} -E env bash
+                ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_wt_compare.sh
+                $<TARGET_FILE:moq_bench_wt_compare>)
+        set_tests_properties(bench_wt_compare_smoke PROPERTIES
+            TIMEOUT 120
+            LABELS "bench;network;smoke")
+    endif()
+endif()
+
+# Raw MoQ-over-QUIC transport comparison: the same MoQ workload over
+# the managed MsQuic facade and over the threaded picoquic facade.
+if(MOQ_BUILD_MSQUIC_MANAGED AND MOQ_BUILD_PQ_THREADED)
+    add_executable(moq_bench_quic_fanout bench_quic_fanout.c)
+    target_link_libraries(moq_bench_quic_fanout PRIVATE
+        moq::adapter-msquic-managed moq::adapter-picoquic-threaded)
+    if(MOQ_BUILD_ADAPTER_MVFST)
+        target_link_libraries(moq_bench_quic_fanout PRIVATE
+            moq::adapter-mvfst)
+        target_compile_definitions(moq_bench_quic_fanout PRIVATE
+            MOQ_BENCH_HAVE_MVFST)
+        set_target_properties(moq_bench_quic_fanout PROPERTIES
+            LINKER_LANGUAGE CXX)
+    endif()
+
+    add_executable(moq_bench_quic_compare bench_quic_compare.c)
+    target_link_libraries(moq_bench_quic_compare PRIVATE
+        moq::adapter-msquic-managed moq::adapter-picoquic-threaded)
+    if(MOQ_BUILD_ADAPTER_MVFST)
+        # the source stays C; mvfst drags in C++ dependencies, so the
+        # final link must go through the C++ driver
+        target_link_libraries(moq_bench_quic_compare PRIVATE
+            moq::adapter-mvfst)
+        target_compile_definitions(moq_bench_quic_compare PRIVATE
+            MOQ_BENCH_HAVE_MVFST)
+        set_target_properties(moq_bench_quic_compare PROPERTIES
+            LINKER_LANGUAGE CXX)
+    endif()
+
+    if(MOQ_BUILD_TESTS)
+        add_test(NAME bench_quic_compare_smoke
+            COMMAND ${CMAKE_COMMAND} -E env bash
+                ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_quic_compare.sh
+                $<TARGET_FILE:moq_bench_quic_compare>)
+        set_tests_properties(bench_quic_compare_smoke PROPERTIES
+            TIMEOUT 120
+            LABELS "bench;network;smoke")
+        if(MOQ_BUILD_ADAPTER_MVFST)
+            add_test(NAME bench_quic_compare_all_smoke
+                COMMAND ${CMAKE_COMMAND} -E env
+                    MOQ_BENCH_BACKEND=all bash
+                    ${CMAKE_SOURCE_DIR}/scripts/smoke_bench_quic_compare.sh
+                    $<TARGET_FILE:moq_bench_quic_compare>)
+            set_tests_properties(bench_quic_compare_all_smoke PROPERTIES
+                TIMEOUT 120
+                LABELS "bench;network;smoke")
+        endif()
+    endif()
+endif()
+
 if(MOQ_BUILD_TESTS)
     add_test(NAME bench_core_smoke
              COMMAND moq_bench_core --objects 8 --object-size 64)

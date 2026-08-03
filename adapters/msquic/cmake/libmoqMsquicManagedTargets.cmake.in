@@ -1,0 +1,11 @@
+# Installed managed MsQuic facade target. The managed implementation ships
+# inside the attach library (libmoq-adapter-msquic) — the facade calls an
+# adapter-internal helper that must resolve in the same shared object — so
+# this component is an INTERFACE imported target over that library, with no
+# artifact of its own. The attach target and Threads are resolved by the
+# component block in libmoqConfig.cmake before this file loads.
+if(NOT TARGET moq::adapter-msquic-managed)
+  add_library(moq::adapter-msquic-managed INTERFACE IMPORTED)
+  set_target_properties(moq::adapter-msquic-managed PROPERTIES
+    INTERFACE_LINK_LIBRARIES "moq::adapter-msquic;Threads::Threads")
+endif()

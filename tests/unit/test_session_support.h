@@ -237,6 +237,8 @@ TSS_UNUSED static void establish_pair(moq_alloc_t *alloc,
         ccfg.max_publishes = c_extra->max_publishes;
         ccfg.max_track_statuses = c_extra->max_track_statuses;
         ccfg.idle_timeout_us = c_extra->idle_timeout_us;
+        ccfg.max_track_history_records = c_extra->max_track_history_records;
+        ccfg.version = c_extra->version;
     }
     moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
     scfg.alloc = alloc;
@@ -266,6 +268,8 @@ TSS_UNUSED static void establish_pair(moq_alloc_t *alloc,
         scfg.max_publishes = s_extra->max_publishes;
         scfg.max_track_statuses = s_extra->max_track_statuses;
         scfg.idle_timeout_us = s_extra->idle_timeout_us;
+        scfg.max_track_history_records = s_extra->max_track_history_records;
+        scfg.version = s_extra->version;
     }
     moq_session_create(&ccfg, 0, c_out);
     moq_session_create(&scfg, 0, s_out);

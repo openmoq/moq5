@@ -7,8 +7,11 @@
 
 static int64_t g_alloc_balance = 0;
 
+static size_t g_last_alloc_size = 0;
+
 static void *counting_alloc(size_t size, void *ctx)
 {
+    g_last_alloc_size = size;
     (void)ctx;
     void *p = malloc(size);
     if (p) g_alloc_balance++;
@@ -638,6 +641,60 @@ int main(void)
         MOQ_TEST_CHECK(g_release_count == 0);
         moq_rcbuf_decref(root);
         MOQ_TEST_CHECK(g_release_count == 1);
+        MOQ_TEST_CHECK(g_alloc_balance == 0);
+    }
+
+    /* -- allocation-size contract ------------------------------------ */
+    {
+        /* Additive sizing, pinned publicly: size(n) == H + n. */
+        size_t h = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(0, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(h > 0);
+        static const size_t lens[] = { 1, 7, 64, 4096, 1u << 20 };
+        for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+            size_t got = 0;
+            MOQ_TEST_CHECK(moq_rcbuf_allocation_size(lens[i], &got) ==
+                           MOQ_OK);
+            MOQ_TEST_CHECK(got == h + lens[i]);
+        }
+        /* Overflow: totals that cannot be represented fail INVAL with the
+         * out-param zeroed; the largest representable length succeeds. */
+        size_t got = (size_t)-1;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(SIZE_MAX, &got) ==
+                       MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(got == 0);
+        got = (size_t)-1;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(SIZE_MAX - h + 1, &got) ==
+                       MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(got == 0);
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(SIZE_MAX - h, &got) ==
+                       MOQ_OK);
+        MOQ_TEST_CHECK(got == SIZE_MAX);
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(0, NULL) == MOQ_ERR_INVAL);
+    }
+    {
+        /* create/clone request EXACTLY the advertised size — proven with a
+         * size-recording allocator, per payload length incl. zero. */
+        static const size_t lens[] = { 0, 1, 64, 4096 };
+        for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+            size_t want = 0;
+            MOQ_TEST_CHECK(moq_rcbuf_allocation_size(lens[i], &want) ==
+                           MOQ_OK);
+            uint8_t body[4096];
+            memset(body, 0x5A, sizeof(body));
+            g_last_alloc_size = 0;
+            moq_rcbuf_t *buf = NULL;
+            MOQ_TEST_CHECK(moq_rcbuf_create(&g_counting, body, lens[i],
+                                            &buf) == MOQ_OK);
+            MOQ_TEST_CHECK(g_last_alloc_size == want);
+            g_last_alloc_size = 0;
+            moq_rcbuf_t *clone = NULL;
+            MOQ_TEST_CHECK(moq_rcbuf_clone(&g_counting, buf, &clone) ==
+                           MOQ_OK);
+            MOQ_TEST_CHECK(g_last_alloc_size == want);
+            moq_rcbuf_decref(clone);
+            moq_rcbuf_decref(buf);
+        }
         MOQ_TEST_CHECK(g_alloc_balance == 0);
     }
 

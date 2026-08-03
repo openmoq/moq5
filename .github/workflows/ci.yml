@@ -75,6 +75,61 @@ jobs:
       - name: Swift test
         run: swift test
 
+  service-public-surface:
+    name: Service Public Surface (ubuntu)
+    runs-on: ubuntu-latest
+    # The service tier's public-surface gate: the deterministic (no-network)
+    # service tests plus the IN-TREE plain-C++17 public-header consumer
+    # (service_consumer_cxx), built with warnings-as-errors. The INSTALLED
+    # C consumer (pkg-config from an install prefix) runs in the picoquic
+    # service lane as service_pkgconfig_consumer; there is no installed C++
+    # fixture yet. No transport adapter here: this proves the headers, the
+    # ABI initializer floors, and C/C++ compile+link of the service surface
+    # alone. A shared build backs the symbol check (the new initializers
+    # must be exported).
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure (service + tests, no adapters)
+        run: >
+          cmake -B build/service-surface
+          -DCMAKE_BUILD_TYPE=Release
+          -DMOQ_BUILD_TESTS=ON
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_MEDIA_OBJECT=ON
+          -DMOQ_BUILD_SERVICE=ON
+          -DMOQ_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build/service-surface -j3
+
+      - name: Deterministic service tests (incl. C/C++ consumers)
+        run: >
+          ctest --test-dir build/service-surface --output-on-failure
+          -R 'media_sender_catalog|media_sender_lifecycle|service_consumer_cxx|endpoint_resolve'
+
+      - name: Shared service build + initializer symbol check
+        run: |
+          set -eu
+          cmake -B build/service-surface-shared \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_MSF=ON \
+            -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
+            -DMOQ_WARNINGS_AS_ERRORS=ON
+          cmake --build build/service-surface-shared -j3
+          lib="$(find build/service-surface-shared/service -name 'libmoq-service.so*' -type f -print -quit)"
+          test -n "$lib"
+          for sym in moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized; do
+            nm -D --defined-only "$lib" | grep -q " $sym\$" ||
+              { echo "missing export: $sym"; exit 1; }
+          done
+          core="$(find build/service-surface-shared/core -name 'libmoq-core.so*' -type f -print -quit)"
+          test -n "$core"
+          for sym in moq_pub_callbacks_init_sized moq_pub_object_cfg_init_sized moq_pub_begin_object_cfg_init_sized; do
+            nm -D --defined-only "$core" | grep -q " $sym\$" ||
+              { echo "missing core export: $sym"; exit 1; }
+          done
+
   swift-service-binding:
     name: Swift Service Binding (macOS)
     runs-on: macos-latest
@@ -155,6 +210,13 @@ jobs:
         run: scripts/build_ios_openssl.sh
         env:
           MOQ_IOS_SLICES: simulator
+
+      # The xcframework build cross-compiles wtquic itself per slice, so it
+      # needs only the PINNED CHECKOUT (fetch-only: no configure, no MsQuic).
+      - name: Set up pinned wtquic (fetch-only)
+        run: scripts/setup_wtquic_deps.sh
+        env:
+          WTQ_FETCH_ONLY: "1"
 
       - name: Build LibMoQ xcframework (simulator slice)
         run: scripts/build_ios_xcframework.sh

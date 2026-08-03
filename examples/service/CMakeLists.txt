@@ -14,3 +14,6 @@ target_link_libraries(moq_example_media_receive PRIVATE moq::service)
 
 add_executable(moq_example_media_send media_send.c)
 target_link_libraries(moq_example_media_send PRIVATE moq::service)
+
+add_executable(moq_example_media_publish_loc media_publish_loc.c)
+target_link_libraries(moq_example_media_publish_loc PRIVATE moq::service)

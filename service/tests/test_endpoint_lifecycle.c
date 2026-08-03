@@ -29,9 +29,10 @@ static int failures = 0;
 
 /* -- server side (direct facade) ------------------------------------ */
 
-static int server_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
-    (void)t; (void)now_us; (void)ctx;
+    (void)t; (void)lane; (void)now_us; (void)ctx;
     return 0;
 }
 static moq_pq_threaded_t *start_server_ex(const char *cert, const char *key,
@@ -54,7 +55,7 @@ static moq_pq_threaded_t *start_server_ex(const char *cert, const char *key,
         cfg.port = port;
         cfg.send_request_capacity = true;
         cfg.initial_request_capacity = 16;
-        cfg.on_pump = server_pump;
+        cfg.on_lane_pump = server_pump;
         cfg.alpn_list = alpn_list;
         cfg.alpn_count = alpn_count;
         moq_pq_threaded_t *srv = NULL;
@@ -551,7 +552,7 @@ int main(int argc, char **argv)
             cc.insecure_skip_verify = true;
             cc.send_request_capacity = true;
             cc.initial_request_capacity = 16;
-            cc.on_pump = server_pump;
+            cc.on_lane_pump = server_pump;
             cc.alpn_list = both_alpn;
             cc.alpn_count = 2;
             moq_pq_threaded_t *cli = NULL;
@@ -599,7 +600,7 @@ int main(int argc, char **argv)
         cfg.cert_path = cert;
         cfg.key_path = key;
         cfg.port = port;            /* same port: bind must fail */
-        cfg.on_pump = server_pump;
+        cfg.on_lane_pump = server_pump;
         moq_pq_threaded_t *dup = NULL;
         MOQ_TEST_CHECK(moq_pq_threaded_create(&cfg, &dup) != MOQ_OK);
         MOQ_TEST_CHECK(dup == NULL);

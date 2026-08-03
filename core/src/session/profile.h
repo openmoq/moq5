@@ -10,6 +10,8 @@ struct moq_subscribe_encode_args;
 struct moq_subscribe_ok_encode_args;
 struct moq_request_error_encode_args;
 struct moq_request_update_encode_args;
+struct moq_request_update_ok_encode_args;
+struct moq_publish_ok_encode_args;
 struct moq_decoded_subgroup_header;
 struct moq_decoded_object_header;
 struct moq_subgroup_header_encode_args;
@@ -61,6 +63,15 @@ typedef enum moq_uni_class {
  * init_in_place initializes pre-allocated memory; destroy cleans up
  * without freeing (the block is freed by session_destroy).
  */
+
+/* §9.8: exact per-type delivery-timeout scan result (raw wire ms; has_
+ * preserves d18 omission-vs-explicit-zero). */
+typedef struct moq_dt_scan {
+    bool     has_object;
+    uint64_t object_ms;
+    bool     has_subgroup;
+    uint64_t subgroup_ms;
+} moq_dt_scan_t;
 
 typedef struct moq_profile_ops {
     size_t state_size;
@@ -115,6 +126,11 @@ typedef struct moq_profile_ops {
     moq_result_t (*encode_request_ok)(moq_session_t *s,
                                        struct moq_buf_writer *w,
                                        uint64_t request_id);
+    /* REQUEST_UPDATE_OK response: REQUEST_OK carrying the resolved LARGEST_OBJECT
+     * (both drafts) and EXPIRES (draft-18 only), empty Track Properties. */
+    moq_result_t (*encode_request_update_ok)(moq_session_t *s,
+                                       struct moq_buf_writer *w,
+                                       const struct moq_request_update_ok_encode_args *args);
     moq_result_t (*encode_request_error)(moq_session_t *s,
                                           struct moq_buf_writer *w,
                                           const struct moq_request_error_encode_args *args);
@@ -158,11 +174,7 @@ typedef struct moq_profile_ops {
 
     moq_result_t (*encode_publish_ok)(moq_session_t *s,
                                        struct moq_buf_writer *w,
-                                       uint64_t request_id,
-                                       uint8_t subscriber_priority,
-                                       uint8_t group_order,
-                                       bool has_new_group_request,
-                                       uint64_t new_group_request);
+                                       const struct moq_publish_ok_encode_args *args);
     moq_result_t (*encode_publish_done)(moq_session_t *s,
                                          struct moq_buf_writer *w,
                                          const struct moq_finish_publish_encode_args *args);
@@ -311,6 +323,16 @@ typedef struct moq_profile_ops {
     bool uses_request_streams;
 
     /*
+     * Capability: the largest value a Location field (group / object id) can
+     * carry on the wire for this profile. Draft-16 uses the QUIC varint
+     * (MOQ_QUIC_VARINT_MAX == 2^62-1); draft-18's vi64 spans the full 64-bit
+     * range (MOQ_VI64_MAX == UINT64_MAX, §1.4.1). The session core asks this
+     * capability instead of testing a draft version when bounding / advancing
+     * Largest Object locations (design §4).
+     */
+    uint64_t location_varint_max;
+
+    /*
      * Capability: true if this profile's FETCH-response data plane can carry a
      * descending group order. Draft-16 sets true (fetch objects carry absolute
      * Group IDs); draft-18 sets false (group deltas with ascending-only
@@ -389,6 +411,15 @@ typedef struct moq_profile_ops {
                                             int slot, uint32_t kind,
                                             const uint8_t *buf, size_t len,
                                             bool fin, size_t *out_consumed);
+
+    /* §9.8 pure timeout-property scanner (bytes in, exact per-type raw-ms
+     * out; no session access). strict_local selects the LOCAL wrapper
+     * semantics (structural failure errors); inbound passes false (d16
+     * stays lenient-opaque on structure; semantic violations -- wire zero,
+     * duplicates, nested immutable -- error in every mode). */
+    moq_result_t (*scan_delivery_timeouts)(const uint8_t *data, size_t len,
+                                           bool strict_local,
+                                           moq_dt_scan_t *out);
 } moq_profile_ops_t;
 
 const moq_profile_ops_t *moq_profile_lookup(moq_version_t version);

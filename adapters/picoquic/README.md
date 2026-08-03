@@ -28,7 +28,7 @@ App thread                        Network thread
 ──────────                        ──────────────
                                   picoquic event loop
                                   ├── moq_pq_service
-enqueue work (app queue)          ├── on_pump():
+enqueue work (app queue)          ├── on_lane_pump():
 moq_pq_threaded_wake(t)  ──────→ │   dequeue + process work
                                   │   call moq_pub_write / sub_poll
                                   ├── moq_pq_service
@@ -44,11 +44,11 @@ queues and uses `_wake` / `_wait` for signaling.
 
 | Callback | Thread | May call moq APIs? |
 |----------|--------|--------------------|
-| `on_pump` | Network | Yes |
+| `on_lane_pump` | Network | Yes |
 | `on_activity` | Network | No — signal only |
 | `configure_quic` | Caller of `_create` | picoquic_quic_t config only |
 
-- `on_pump` runs between `moq_pq_service` calls. Create facades,
+- `on_lane_pump` runs between `moq_pq_service` calls. Create facades,
   tick them, publish objects, poll received objects here.
 - `on_activity` fires after each pump cycle. Set a flag or signal
   a condvar to wake the app thread. No mutation APIs.
@@ -62,7 +62,8 @@ typedef struct {
     spsc_queue_t      inbox;
 } my_app_t;
 
-int my_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
+int my_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+            uint64_t now, void *ctx) {
     my_app_t *app = ctx;
     if (!app->sub) {
         moq_sub_cfg_t sc; moq_sub_cfg_init(&sc);
@@ -88,8 +89,8 @@ int main() {
     /* TLS certificate verification is ON by default (system CA chain). Do NOT
      * disable it against a real relay. For a LOCAL/self-signed test relay only,
      * you may set cfg.insecure_skip_verify = true (accepts any cert). */
-    cfg.on_pump = my_pump;
-    cfg.on_pump_ctx = &app;
+    cfg.on_lane_pump = my_pump;
+    cfg.on_lane_pump_ctx = &app;
 
     moq_pq_threaded_t *t;
     moq_pq_threaded_create(&cfg, &t);
@@ -113,7 +114,8 @@ int main() {
 ### Server example
 
 ```c
-int my_server_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
+int my_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+            uint64_t now, void *ctx) {
     my_server_t *app = ctx;
     if (!app->pub) {
         moq_pub_cfg_t pc; moq_pub_cfg_init(&pc);
@@ -134,14 +136,14 @@ int main() {
     cfg.cert_path = "cert.pem";
     cfg.key_path = "key.pem";
     cfg.port = 4443;
-    cfg.on_pump = my_server_pump;
-    cfg.on_pump_ctx = &app;
+    cfg.on_lane_pump = my_server_pump;
+    cfg.on_lane_pump_ctx = &app;
 
     moq_pq_threaded_t *t;
     moq_pq_threaded_create(&cfg, &t);
 
     /* _session() returns NULL until a client connects */
-    /* on_pump is not called until then */
+    /* on_lane_pump is not called until then */
 
     while (!moq_pq_threaded_is_fatal(t)) {
         moq_result_t r = moq_pq_threaded_wait(t, 100000);
@@ -159,7 +161,7 @@ int main() {
 - Session and adapter are created lazily on the network thread
   when the first client connection fires `picoquic_callback_ready`.
 - `_session()` and `_conn()` return NULL until that happens.
-- `on_pump` is not called until session/adapter exist.
+- `on_lane_pump` is not called until session/adapter exist.
 - v0 supports one active server connection. Additional connections
   are ignored by the helper without replacing the existing session.
 - `_stop()` before any client connects is safe and clean.
@@ -168,9 +170,9 @@ int main() {
 
 ```
 _create()    → allocates wrapper, picoquic context, starts thread
-_wake()      → wakes network thread to run on_pump
+_wake()      → wakes network thread to run on_lane_pump
 _wait()      → blocks app thread until activity/timeout/stop
-_stop()      → joins thread (idempotent, must not be from on_pump)
+_stop()      → joins thread (idempotent, must not be from on_lane_pump)
 _destroy()   → frees adapter, session, picoquic, wrapper
 ```
 

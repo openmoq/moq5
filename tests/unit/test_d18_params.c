@@ -180,7 +180,7 @@ static int test_codec(void)
         MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
     }
 
-    /* Encode-side mask: a REQUEST_UPDATE cannot carry GROUP_ORDER or a filter. */
+    /* Encode-side mask: a REQUEST_UPDATE cannot carry GROUP_ORDER. */
     {
         moq_d18_msg_params_t p = { 0 };
         p.has_group_order = true; p.group_order = 1;
@@ -189,12 +189,29 @@ static int test_codec(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_request_update(&w, 2, &p),
                               (int)MOQ_ERR_INVAL);
         MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
-        moq_d18_msg_params_t p2 = { 0 };
-        p2.has_filter = true; p2.filter_type = 3;
+    }
+
+    /* A SUBSCRIPTION_FILTER rides a REQUEST_UPDATE (§10.2.9) and
+     * round-trips. */
+    {
+        moq_d18_msg_params_t p = { 0 };
+        p.has_filter = true; p.filter_type = 3;  /* AbsoluteStart */
+        p.filter_start_group = 11; p.filter_start_object = 4;
+        moq_buf_writer_t w;
         moq_buf_writer_init(&w, buf, sizeof(buf));
-        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_request_update(&w, 2, &p2),
-                              (int)MOQ_ERR_INVAL);
-        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_request_update(&w, 2, &p),
+                              (int)MOQ_OK);
+        moq_buf_reader_t r;
+        moq_buf_reader_init(&r, buf, moq_buf_writer_offset(&w));
+        moq_control_envelope_t env;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_envelope(&r, &env),
+                              (int)MOQ_OK);
+        moq_d18_request_update_t u;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_decode_request_update(env.payload,
+            env.payload_len, &u), (int)MOQ_OK);
+        MOQ_TEST_CHECK(u.params.has_filter && u.params.filter_type == 3);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_start_group, 11);
+        MOQ_TEST_CHECK_EQ_U64(u.params.filter_start_object, 4);
     }
 
     /* SUBSCRIBE_OK round-trip: LARGEST_OBJECT + EXPIRES params + opaque
@@ -610,7 +627,9 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
 
-        /* Mismatched object/subgroup timeouts close the session. */
+        /* §9.8: differing object/subgroup timeouts are LEGAL (draft-18 §8
+         * defines them independently); the legacy event field projects
+         * min_nonzero of this message's carriers. */
         moq_session_t *s2 = make_server();
         MOQ_TEST_CHECK(s2 != NULL);
         p.object_delivery_timeout_ms = 3000;
@@ -619,7 +638,20 @@ int main(void)
         moq_d18_encode_subscribe(&w, 0, &ns2, MOQ_BYTES_LITERAL("video"), &p);
         (void)moq_session_on_bidi_stream_bytes(s2, moq_stream_ref_from_u64(1),
             msg, moq_buf_writer_offset(&w), false, 1);
-        MOQ_TEST_CHECK_EQ_INT((int)s2->state, (int)MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK_EQ_INT((int)s2->state, (int)MOQ_SESS_ESTABLISHED);
+        {
+            moq_event_t ev2; bool saw2 = false;
+            while (moq_session_poll_events(s2, &ev2, 1) == 1) {
+                if (ev2.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+                    saw2 = true;
+                    MOQ_TEST_CHECK_EQ_U64(
+                        ev2.u.subscribe_request.delivery_timeout_us,
+                        3000ull * 1000ull);
+                }
+                moq_event_cleanup(&ev2);
+            }
+            MOQ_TEST_CHECK(saw2);
+        }
         moq_session_destroy(s2);
     }
 

@@ -137,7 +137,7 @@ static bool publish_track(msrv_t *st, moq_pub_track_t *track, int *counter,
             return false;
         }
         moq_pub_object_cfg_t ocfg;
-        moq_pub_object_cfg_init(&ocfg);
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
         ocfg.group_id = (uint64_t)(i / OBJS_PER_GROUP);
         ocfg.object_id = (uint64_t)(i % OBJS_PER_GROUP);
         ocfg.payload = payload;
@@ -155,8 +155,10 @@ static bool publish_track(msrv_t *st, moq_pub_track_t *track, int *counter,
     return true;
 }
 
-static int msrv_pump(moq_pq_threaded_t *t, uint64_t now_us, void *ctx)
+static int msrv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                       uint64_t now_us, void *ctx)
 {
+    (void)lane;
     msrv_t *st = (msrv_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
     if (!session) return 0;
@@ -255,8 +257,8 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
         cfg.port = port;
         cfg.send_request_capacity = true;
         cfg.initial_request_capacity = 16;
-        cfg.on_pump = msrv_pump;
-        cfg.on_pump_ctx = &g_msrv;
+        cfg.on_lane_pump = msrv_pump;
+        cfg.on_lane_pump_ctx = &g_msrv;
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&cfg, &srv) == MOQ_OK) {
             *out_port = port;

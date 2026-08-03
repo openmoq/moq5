@@ -185,7 +185,23 @@ typedef struct moq_transport_endpoint_ops {
                                               const uint8_t *reason,
                                               size_t reason_len);
 
+    /* Object-pointer reserve prefix: unchanged layout for existing
+     * callers. New ops are appended AFTER it and gated by struct_size
+     * (HAS_FIELD), never overlaying a reserve slot with a function
+     * pointer (ISO C does not guarantee they share a representation). */
     void *reserved[4];
+
+    /*
+     * OPTIONAL whole-stream abort: RESET our send half AND STOP_SENDING
+     * the peer's half, both with `error_code`, as one operation. When
+     * absent (struct_size too small, or NULL) the bridge falls back to
+     * reset_stream + stop_sending with explicit pending state (a
+     * WOULD_BLOCK after one successful half retries only the remaining
+     * half); a runtime failure after partial application is fatal, never
+     * rolled back. Appended after `reserved`: old callers stay ABI-safe.
+     */
+    moq_transport_result_t (*abort_stream)(void *ctx, uint64_t stream_id,
+                                           uint64_t error_code);
 } moq_transport_endpoint_ops_t;
 
 #ifdef __cplusplus
@@ -275,8 +291,14 @@ MOQ_API moq_result_t moq_transport_bridge_service(
  * service(). Calling inbound handlers from inside an endpoint op
  * callback is undefined behavior.
  *
- * stream_id is the transport's native stream identifier.
- * The bridge maps it to/from moq_stream_ref_t internally.
+ * stream_id is an ADAPTER-CHOSEN OPAQUE KEY identifying this transport
+ * stream: unique for the LIFETIME OF THE CONNECTION (never reused, even
+ * after tombstone expiry) and never UINT64_MAX (reserved as
+ * MOQ_TRANSPORT_STREAM_ID_NONE). Adapters whose transport assigns native
+ * QUIC stream ids synchronously MAY use them as keys (they satisfy the
+ * uniqueness rule and make logs match captures); the bridge compares keys
+ * by equality only, derives no meaning from the value, and maps them
+ * to/from moq_stream_ref_t internally.
  *
  * Return value: MOQ_OK on success. MOQ_ERR_WOULD_BLOCK means the
  * bridge has retained internal retry state; the adapter MUST NOT
@@ -313,6 +335,16 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_reset(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     uint64_t error_code, uint64_t now_us);
+
+/*
+ * The peer's transport stream has fully terminated (both directions
+ * done, as the adapter's stream-closed signal reports). Backend-neutral:
+ * every adapter that learns of stream termination should call this. It
+ * retires a stream the bridge is discarding after a whole-stream abort;
+ * on any other stream it is a harmless no-op.
+ */
+MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_terminal(
+    moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us);
 
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stop_sending(
     moq_transport_bridge_t *brg, uint64_t stream_id,
@@ -407,6 +439,62 @@ MOQ_API bool     moq_transport_bridge_uses_uni_control(
  */
 MOQ_API bool     moq_transport_bridge_stream_has_pending(
     const moq_transport_bridge_t *brg, uint64_t stream_id);
+
+/*
+ * Opaque event-progress token for the attached session. Advances (by an
+ * unspecified amount) on every event ENQUEUE and every event DEQUEUE, and is
+ * stable across calls that move no event. A coalesced-doorbell adapter (whose
+ * app pump runs on a pass SEPARATE from service()) snapshots it BEFORE the pump
+ * and compares for EQUALITY after the post-pump service pass: inequality means
+ * the whole cycle moved events — the bounded pump dequeued some (draining a
+ * pre-existing backlog) and/or service enqueued some (refilling the queue). It
+ * pairs this with has_events to owe another pump only when work moved AND events
+ * remain. Bounded by construction: a non-draining app moves no events once its
+ * queue is full, so the token never advances and no pump re-arms.
+ *
+ * Caller-serialized, opaque (equality-only; never subtract or order it — it
+ * wraps). This is private, lockstep adapter SPI, NOT application API.
+ */
+MOQ_API uint64_t moq_transport_bridge_event_progress_token(
+    const moq_transport_bridge_t *brg);
+
+/*
+ * True while the attached session still holds at least one undelivered event.
+ * Paired with the progress token by a coalesced-doorbell adapter: after a
+ * pump+service cycle, re-arm one pump only when the token advanced (the cycle
+ * moved events -- enqueue or dequeue) AND events remain here to drain. That
+ * closes both the small-queue case (service refilled the queue after the pump)
+ * and the large-queue case (the bounded pump drained some pre-existing events
+ * but left more), while a non-draining app -- which moves no events once its
+ * queue is full -- never advances the token and so never re-arms. Private,
+ * lockstep adapter SPI, NOT application API.
+ */
+MOQ_API bool     moq_transport_bridge_has_events(
+    const moq_transport_bridge_t *brg);
+
+/*
+ * The attached session's independent monotonic terminal facts, read together
+ * so an adapter cannot sample them at two different instants.
+ *
+ *   returns        ENQUEUED -- MOQ_EVENT_SESSION_CLOSED was actually placed in
+ *                  the event queue.
+ *   *out_observed  OBSERVED -- moq_session_poll_events_ex TRANSFERRED that
+ *                  event to a caller. A queued-but-unpolled terminal reads
+ *                  false: availability is not observation.
+ *
+ * OBSERVED implies ENQUEUED. Both are monotonic and idempotent, and their
+ * ORDER RELATIVE TO TRANSPORT TERMINAL IS NOT FIXED -- a local close enqueues
+ * before any transport shutdown, a peer close can complete natively first. An
+ * adapter must therefore record its own transport facts separately and never
+ * derive one from the other. Deliberately NOT expressed through
+ * moq_transport_bridge_is_closed/is_fatal, which latch the BRIDGE's terminal on
+ * paths that need not have enqueued a session event.
+ *
+ * out_observed may be NULL. Pure read under caller-provided serialization.
+ * Private, lockstep adapter SPI, NOT application API.
+ */
+MOQ_API bool     moq_transport_bridge_terminal_facts(
+    const moq_transport_bridge_t *brg, bool *out_observed);
 
 MOQ_API size_t   moq_transport_bridge_stream_count(
     const moq_transport_bridge_t *brg);

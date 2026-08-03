@@ -414,13 +414,25 @@ public:
                                      uint64_t now)
     {
         moq_sub_update_cfg_t c;
-        moq_sub_update_cfg_init(&c);
+        /* Sized init: the filter block is an appended tail; the frozen
+         * pointer-only init would drop it. Result callbacks are
+         * deliberately NOT exposed by this binding (it has no callback
+         * plumbing); the facade drains acknowledgment events internally,
+         * and a rejected update surfaces through the C on_subscribe_done
+         * path with the update-failure status. This binding supports
+         * FILTER SENDING only. */
+        moq_sub_update_cfg_init_sized(&c, sizeof(c));
         c.has_subscriber_priority = cfg.has_subscriber_priority;
         c.subscriber_priority     = cfg.subscriber_priority;
         c.has_forward             = cfg.has_forward;
         c.forward                 = cfg.forward;
         c.has_delivery_timeout    = cfg.has_delivery_timeout;
         c.delivery_timeout_us     = cfg.delivery_timeout_us;
+        c.has_filter              = cfg.has_filter;
+        c.filter                  = cfg.filter;
+        c.start_group             = cfg.start_group;
+        c.start_object            = cfg.start_object;
+        c.end_group               = cfg.end_group;
         return result_from_rc(
             moq_sub_update_subscription(s_, track.raw(), &c, now));
     }

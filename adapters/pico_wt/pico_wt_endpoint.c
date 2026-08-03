@@ -17,6 +17,7 @@
  */
 
 #include "pico_wt_endpoint.h"
+#include <picoquic_utils.h>   /* picoquic_frames_varint_encode_length */
 #include <string.h>
 #include <stddef.h>
 
@@ -85,6 +86,12 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
                                         uint64_t error_code)
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
+    /* MoQ code -> WebTransport application-error space for the wire. Reject
+     * an out-of-range code BEFORE mutating any stream state, so a rejected
+     * reset leaves the queue/active-mark untouched. */
+    uint64_t wt_code;
+    if (!pico_wt_moq_err_to_wt(error_code, &wt_code))
+        return MOQ_TRANSPORT_ERROR;
     /* Abandon anything still queued and clear the active mark before resetting,
      * so no provide_data lands for a reset stream. */
     moq_pq_send_queue_drop(ep->queue, stream_id);
@@ -92,10 +99,52 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
     h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, stream_id);
     if (!sc) {
         /* Stream unknown to h3zero — try raw QUIC reset as fallback */
-        int rc = picoquic_reset_stream(ep->cnx, stream_id, error_code);
+        ep->last_reset_reliable_size = 0;
+        int rc = picoquic_reset_stream(ep->cnx, stream_id, wt_code);
         return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
     }
-    int rc = picowt_reset_stream(ep->cnx, sc, error_code);
+
+    /* Capability-aware reset. picowt_reset_stream() resets a local stream with
+     * a reliable_size preamble, i.e. picoquic_reset_stream_at() with
+     * reliable_size > 0. picoquic only permits that when the reliable-reset
+     * extension was genuinely NEGOTIATED: cnx->is_reset_stream_at_enabled is
+     * latched once as (local && remote) while parsing the peer's transport
+     * parameters, and picoquic_reset_stream_at() rejects a nonzero
+     * reliable_size with PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION otherwise
+     * -- LOCALLY, before any frame is queued. That local error surfaces as a
+     * fatal bridge failure and closes the connection (the draft-18 announce
+     * withdrawal did exactly this against a relay without the extension).
+     *
+     * The managed client SYNTHESIZES the peer's missing TP to unblock the WT
+     * CONNECT, but that mutates remote_parameters AFTER the negotiated bit is
+     * latched, so it never makes reliable-reset usable. A synthesized-
+     * capability peer must therefore get a plain RESET_STREAM (reliable_size
+     * 0). The live remote TP plus the synthesized flag reconstruct genuine
+     * negotiation without reaching into picoquic's internal cnx state. */
+    const picoquic_tp_t *rtp = picoquic_get_transport_parameters(ep->cnx, 0);
+    bool genuine_at = rtp && rtp->is_reset_stream_at_enabled &&
+                      !ep->reset_stream_at_synthesized;
+    if (genuine_at) {
+        /* picowt uses reliable_size = 2 + varint(control_stream_id) for a local
+         * stream; mirror it as the test witness. */
+        ep->last_reset_reliable_size =
+            2 + picoquic_frames_varint_encode_length(ep->control_stream_id);
+        int rc = picowt_reset_stream(ep->cnx, sc, wt_code);
+        return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    }
+
+    /* Plain RESET_STREAM, preserving picowt_reset_stream's bookkeeping: the
+     * same local/bidirectional eligibility (a remote unidirectional stream has
+     * no local send half to reset) and is_fin_sent marking, but reliable_size 0
+     * so picoquic emits RESET_STREAM and never trips the guard above. */
+    ep->last_reset_reliable_size = 0;
+    unsigned client_mode = (unsigned)(picoquic_is_client(ep->cnx) != 0);
+    bool is_bidir = (sc->stream_id & 2u) == 0;
+    bool is_local = ((sc->stream_id ^ client_mode) & 1u) != 0;
+    if (!is_local && !is_bidir)
+        return MOQ_TRANSPORT_ERROR;
+    int rc = picoquic_reset_stream(ep->cnx, sc->stream_id, wt_code);
+    sc->ps.stream_state.is_fin_sent = 1;
     return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
 }
 
@@ -121,8 +170,22 @@ static moq_transport_result_t ep_stop_sending(void *ctx,
                                                uint64_t error_code)
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
-    int rc = picoquic_stop_sending(ep->cnx, stream_id, error_code);
-    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    /* MoQ code -> WebTransport application-error space for the wire; an
+     * out-of-range code is rejected (nothing is sent). */
+    uint64_t wt_code;
+    if (!pico_wt_moq_err_to_wt(error_code, &wt_code))
+        return MOQ_TRANSPORT_ERROR;
+    int rc = picoquic_stop_sending(ep->cnx, stream_id, wt_code);
+    if (rc != 0)
+        return MOQ_TRANSPORT_ERROR;   /* nothing sent: receive state untouched */
+    /* STOP_SENDING accepted: our receive direction on this stream is cancelled,
+     * so the adapter must drop its tracked receive state. Otherwise a later
+     * sweep could replay retained bytes, or grant credit, for a stream the
+     * application just stopped -- which is exactly what libmoq emits when it
+     * cancels a peer-origin fetch data stream. */
+    if (ep->on_local_stop_sending)
+        ep->on_local_stop_sending(ep->cb_ctx, stream_id);
+    return MOQ_TRANSPORT_OK;
 }
 
 static moq_transport_result_t ep_send_datagram(void *ctx,

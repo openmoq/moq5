@@ -24,7 +24,7 @@ int main(void)
 
     if (cfg.struct_size != sizeof(moq_pq_threaded_cfg_t))
         return 1;
-    if (cfg.alloc != NULL || cfg.on_pump != NULL)
+    if (cfg.alloc != NULL || cfg.on_lane_pump != NULL)
         return 2;
 
     /* Verifier helper: header on the include path + symbol linkable.

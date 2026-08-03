@@ -47,8 +47,11 @@ public enum MoQServiceError: Error, Sendable, Hashable {
     case internalError(Int32)
 }
 
-/// Why a connection attempt failed. `code` carries the transport-native detail
-/// (for picoquic: a QUIC CRYPTO_ERROR whose low byte is the TLS alert); it is
+/// Why a connection attempt failed. `code` carries the transport-native
+/// detail, reinterpreted from the endpoint's raw `detail_code` bits as a
+/// SIGNED value: for picoquic it is a QUIC CRYPTO_ERROR whose low byte is
+/// the TLS alert (small positive), for the wtquic Network.framework backend
+/// a Security OSStatus (negative — e.g. errSecNotTrusted, -67843). It is
 /// diagnostic, not something to branch on — branch on `kind`.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public struct ConnectionFailure: Error, Sendable, Hashable {
@@ -62,9 +65,9 @@ public struct ConnectionFailure: Error, Sendable, Hashable {
         case transport
     }
     public let kind: Kind
-    public let code: UInt64
+    public let code: Int64
 
-    public init(kind: Kind, code: UInt64) {
+    public init(kind: Kind, code: Int64) {
         self.kind = kind
         self.code = code
     }

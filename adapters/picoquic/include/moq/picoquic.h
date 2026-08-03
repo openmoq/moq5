@@ -13,6 +13,30 @@
  * stream/datagram operations, and routes inbound stream bytes, resets,
  * stops, and datagrams into the corresponding session input functions.
  *
+ * Receive backpressure: every inbound stream (data, request bidi, AND control)
+ * is placed under picoquic application-controlled flow control, so a stalled
+ * application (the session returning MOQ_ERR_WOULD_BLOCK) becomes real
+ * per-stream QUIC backpressure -- the adapter withholds MAX_STREAM_DATA until
+ * service() drains the stall, stopping the peer's sender at the advertised
+ * window instead of letting the receive window run away. It is strictly
+ * per-stream and independent: a blocked media stream never pauses control or
+ * another stream, and a blocked control stream pauses only itself. Credit is
+ * granted in budget/2 batches anchored to application progress, which bounds
+ * the ADAPTER-INDUCED connection-wide MAX_DATA increments to <= 2x progress
+ * (picoquic couples stream grants to connection MAX_DATA in
+ * picoquic_open_flow_control). picoquic's own automatic MAX_DATA growth is
+ * independent and NOT bounded by the adapter; total connection arrest is
+ * derivative -- it holds because delivery (which anchors the automatic
+ * advance) stops once the frozen stream windows are exhausted. See the block
+ * comment in moq_picoquic.c for the exact accounting, the retained-byte
+ * replay contract, and the derivative connection-arrest argument.
+ *
+ * Caller contract: do NOT enable picoquic_set_max_data_control (nonzero) on a
+ * quic context whose connections are attached to this adapter. Its nonzero
+ * mode silently disables picoquic_open_flow_control (the per-stream credit
+ * mechanism this adapter depends on), and the conflict is not detectable
+ * through picoquic's public API.
+ *
  * One moq_pq_conn_t per MoQ session/QUIC connection. The adapter does
  * not own the picoquic context or connection — those are created and
  * driven by the application's event loop.

@@ -58,6 +58,7 @@ typedef struct {
      * through prepare_to_send into STREAM_WRITE ops. */
     uint64_t     active[FAKE_PQ_MAX_OPS];
     size_t       active_count;
+    bool         is_client;      /* role, read back by picoquic_is_client() */
 } fake_pq_side_t;
 
 typedef struct {

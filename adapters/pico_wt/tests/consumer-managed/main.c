@@ -20,11 +20,16 @@ int main(void)
     moq_pico_wt_managed_cfg_t cfg;
     moq_pico_wt_managed_cfg_init(&cfg);
 
-    /* cfg_init must set the ABI guard and zero the rest. */
+    /* The pointer init stamps the full current struct and zeroes it. */
     if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
         return 1;
     if (cfg.alloc != NULL || cfg.on_pump != NULL)
         return 2;
+
+    /* The sized init also stamps the full struct at sizeof. */
+    moq_pico_wt_managed_cfg_init_sized(&cfg, sizeof(cfg));
+    if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
+        return 6;
 
     /* The handle is opaque to consumers: only a pointer is available. */
     moq_pico_wt_managed_t *handle = (moq_pico_wt_managed_t *)0;

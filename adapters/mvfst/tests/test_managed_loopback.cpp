@@ -5,7 +5,7 @@
  * a client, complete MoQ setup, subscribe, and receive an object.
  *
  * Thread confinement:
- *   Client session calls happen inside on_pump (managed thread).
+ *   Client session calls happen inside on_lane_pump (managed thread).
  *   Server session/adapter calls happen on the server EventBase
  *   via runInEventBaseThreadAndWait.
  *   Test thread only reads atomics and mutex-protected result fields.
@@ -245,8 +245,10 @@ struct client_state {
     recv_result dg_obj;
 };
 
-static int client_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     auto *cs = static_cast<client_state *>(ctx);
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -360,7 +362,7 @@ static void test_managed_client_loopback()
     cfg.host = "127.0.0.1";
     cfg.port = bound.getPort();
     cfg.insecure_skip_verify = true;
-    cfg.on_pump = client_pump;
+    cfg.on_lane_pump = client_pump;
     cfg.user_ctx = &cs;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;

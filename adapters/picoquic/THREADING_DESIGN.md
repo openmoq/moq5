@@ -45,15 +45,15 @@ The adapter contract (`picoquic.h:17`) states:
 
 This helper enforces that rule. All `moq_session_*`, `moq_pq_*`,
 `moq_pub_*`, and `moq_sub_*` calls happen exclusively on the
-network thread, inside the `on_pump` callback:
+network thread, inside the `on_lane_pump` callback:
 
 1. **`loop_callback`** (fires on `after_receive`, `after_send`):
-   calls `moq_pq_service`, then `on_pump`, then `moq_pq_service`
+   calls `moq_pq_service`, then `on_lane_pump`, then `moq_pq_service`
    again, then `mark_activity`.
 
 2. **`wake_up` callback** (fires on `picoquic_packet_loop_wake_up`):
    clears `wake_pending` under mutex, then same sequence —
-   `service → on_pump → service → mark_activity`.
+   `service → on_lane_pump → service → mark_activity`.
 
 The app thread NEVER directly calls session/adapter/facade APIs.
 It communicates via application-level queues:
@@ -66,7 +66,7 @@ moq_pq_threaded_wake(t) ────────→ pipe write → poll wakes
                                    loop_callback(wake_up):
                                    ├── clear wake_pending
                                    ├── moq_pq_service
-                                   ├── on_pump():
+                                   ├── on_lane_pump():
                                    │   dequeue work
                                    │   call moq_pub_write / sub_poll
                                    ├── moq_pq_service
@@ -80,7 +80,7 @@ read results from app queue
 - No mutex-protected `with_session` / `with_lock` API. Wrapping
   picoquic callbacks under a lock conflicts with picoquic's internal
   timing and re-entrance assumptions.
-- No direct app-thread access to session state. The `on_pump`
+- No direct app-thread access to session state. The `on_lane_pump`
   callback is the single point of session interaction.
 
 ## Proposed API
@@ -136,11 +136,11 @@ typedef struct moq_pq_threaded_cfg {
      * its facade, publishes objects, polls received objects, and
      * processes queued work here.
      *
-     * All session/adapter/facade calls are safe inside on_pump.
-     * For server mode, on_pump is NOT called until the first
+     * All session/adapter/facade calls are safe inside on_lane_pump.
+     * For server mode, on_lane_pump is NOT called until the first
      * inbound connection has been accepted and the session/adapter
      * are ready — the app can safely call _session() / _conn()
-     * from inside on_pump without null checks.
+     * from inside on_lane_pump without null checks.
      *
      * Return 0 to continue. Nonzero requests clean loop
      * termination: the helper sets pump_exit = true, calls
@@ -148,12 +148,13 @@ typedef struct moq_pq_threaded_cfg {
      * PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP. The thread
      * exits cleanly. _stop then returns MOQ_OK (unless fatal
      * was also set). */
-    int              (*on_pump)(moq_pq_threaded_t *t,
-                                uint64_t now_us, void *ctx);
-    void              *on_pump_ctx;
+    int              (*on_lane_pump)(moq_pq_threaded_t *t,
+                                     moq_pq_threaded_lane_t *lane,
+                                     uint64_t now_us, void *user);
+    void              *on_lane_pump_ctx;
 
     /* Optional: called on network thread after the
-     * service → on_pump → service cycle. Signal-only — do NOT call
+     * service → on_lane_pump → service cycle. Signal-only — do NOT call
      * session/adapter/facade APIs. Use to flag the app thread.
      * May be NULL; the helper calls mark_activity() regardless. */
     void             (*on_activity)(moq_pq_threaded_t *t, void *ctx);
@@ -210,7 +211,7 @@ needed.
 
 ```
 _create(cfg) for CLIENT:
-  1. Validate cfg (alloc, host, port, on_pump required)
+  1. Validate cfg (alloc, host, port, on_lane_pump required)
   2. Allocate moq_pq_threaded_t, init mutex/condvar
   3. picoquic_create(1, NULL, NULL, ..., client_callback, t)
          → t->quic
@@ -261,7 +262,7 @@ The server accepts up to cfg->max_connections concurrent connections (default
 
 ```
 _create(cfg) for SERVER:
-  1. Validate cfg (alloc, cert_path, key_path, port, on_pump required)
+  1. Validate cfg (alloc, cert_path, key_path, port, on_lane_pump required)
   2. Allocate moq_pq_threaded_t, init mutex/condvar
   3. picoquic_create(max_connections, cert, key, ..., server_callback, t)
          → t->quic   (cfg->max_connections, or the 1024 default; picoquic
@@ -291,10 +292,10 @@ Inbound connection (picoquic_callback_ready on network thread):
     moq_pq_conn_create(s, cnx, alloc) → c   (rebinds cnx to its own callback)
     append record to conns[]
     lock(t->mutex); publish first live conn to t->session/t->conn; unlock
-    on_pump fires each loop iteration; each record is serviced independently
+    on_lane_pump fires each loop iteration; each record is serviced independently
 
 Per-connection teardown (conn_close, service/bridge fatal, or peer close):
-  pruned after on_pump returns (iteration-safe). A local/service/bridge fatal
+  pruned after on_lane_pump returns (iteration-safe). A local/service/bridge fatal
   is closed with picoquic_close first; a peer-closed cnx is not re-closed.
   Pruning one connection does not tear down the server.
 
@@ -332,13 +333,13 @@ Fields protected by `t->mutex`:
   thread) and `_stop` (app thread), consumed by `_wait`.
 - `t->wake_pending` — written by `_wake` (any thread), cleared
   by network thread on `wake_up` callback.
-- `t->pump_exit` — written by network thread when on_pump returns
+- `t->pump_exit` — written by network thread when on_lane_pump returns
   nonzero, read by `_stop`.
 
 Fields NOT shared (network-thread-only):
 - `t->quic`, `t->cnx` — only touched during create and by
   picoquic's internal thread.
-- Adapter/session mutation — only via `on_pump` on network thread.
+- Adapter/session mutation — only via `on_lane_pump` on network thread.
 
 Fields written once during create, read-only after:
 - Config copies (callbacks, tuning fields).
@@ -397,7 +398,7 @@ loop_callback(wake_up):
     lock(t->mutex)
     t->wake_pending = false
     unlock(t->mutex)
-    /* normal cycle: service → on_pump → service → mark_activity */
+    /* normal cycle: service → on_lane_pump → service → mark_activity */
 ```
 
 Multiple `_wake` calls between processing coalesce: the second
@@ -419,17 +420,17 @@ mark_activity(t):
 ```
 
 `mark_activity` is called by the helper's `loop_callback` at the
-end of each cycle, AFTER the `service → on_pump → service`
+end of each cycle, AFTER the `service → on_lane_pump → service`
 sequence completes. It is NOT wired to the adapter's
 `after_callback` — the adapter's `after_callback` is left NULL.
 The helper controls exactly when activity is signaled.
 
 Call sites (all on network thread):
-- `loop_callback(after_receive)`: service → on_pump → service → mark_activity
-- `loop_callback(after_send)`: service → on_pump → service → mark_activity
-- `loop_callback(wake_up)`: clear wake_pending → service → on_pump → service → mark_activity
+- `loop_callback(after_receive)`: service → on_lane_pump → service → mark_activity
+- `loop_callback(after_send)`: service → on_lane_pump → service → mark_activity
+- `loop_callback(wake_up)`: clear wake_pending → service → on_lane_pump → service → mark_activity
 - Fatal detected in loop_callback: set fatal under mutex → mark_activity
-- on_pump returns nonzero: set pump_exit under mutex → mark_activity
+- on_lane_pump returns nonzero: set pump_exit under mutex → mark_activity
 
 `_wait` consumes the flag:
 
@@ -450,9 +451,9 @@ _wait(t, timeout_us):
     unlock → return MOQ_DONE
 ```
 
-## on_pump Termination
+## on_lane_pump Termination
 
-When `on_pump` returns nonzero:
+When `on_lane_pump` returns nonzero:
 
 1. The helper sets `t->pump_exit = true` under mutex.
 2. Calls `mark_activity()` — wakes any `_wait` caller.
@@ -535,10 +536,10 @@ moq_pq_threaded_t owns:
 ```
 
 The caller owns:
-- Any facade created on the session. Must be created from `on_pump`
+- Any facade created on the session. Must be created from `on_lane_pump`
   (network thread) and destroyed after `_stop` / before `_destroy`.
 - Cert/key file paths (must remain valid until `_create` returns).
-- The `on_pump`, `on_activity`, and `configure_quic` function
+- The `on_lane_pump`, `on_activity`, and `configure_quic` function
   pointers and their ctx.
 - Any application-level queues used for cross-thread communication.
 
@@ -546,11 +547,11 @@ The caller owns:
 
 | Callback | Thread | May call session/adapter/facade APIs? |
 |----------|--------|---------------------------------------|
-| `on_pump` | Network | Yes — the intended call site |
+| `on_lane_pump` | Network | Yes — the intended call site |
 | `on_activity` | Network | No — signal-only |
 | `configure_quic` | Caller of _create | No session/adapter exists yet; picoquic_quic_t config only |
 
-- `on_pump` fires between `moq_pq_service` calls. The app ticks
+- `on_lane_pump` fires between `moq_pq_service` calls. The app ticks
   its facade, publishes objects, polls received objects, and
   processes queued work here.
 - `on_activity` fires after the full cycle completes, after
@@ -616,7 +617,8 @@ typedef struct {
 } my_app_t;
 
 /* Runs on network thread */
-int my_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
+int my_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+            uint64_t now, void *ctx) {
     my_app_t *app = ctx;
     moq_session_t *s = moq_pq_threaded_session(t);
 
@@ -649,7 +651,7 @@ int main() {
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     cfg.host = "localhost"; cfg.port = 4443;
     cfg.insecure_skip_verify = true;  /* demo only */
-    cfg.on_pump = my_pump; cfg.on_pump_ctx = &app;
+    cfg.on_lane_pump = my_pump; cfg.on_lane_pump_ctx = &app;
 
     moq_pq_threaded_t *t;
     moq_pq_threaded_create(&cfg, &t);
@@ -675,18 +677,18 @@ int main() {
 
 | # | Case | Method |
 |---|------|--------|
-| 1 | Clean lifecycle | Loopback: server + client wrappers, publish objects via on_pump, verify receipt via inbox queue |
+| 1 | Clean lifecycle | Loopback: server + client wrappers, publish objects via on_lane_pump, verify receipt via inbox queue |
 | 2 | Stop while waiting | App thread in _wait, second thread calls _stop; verify _wait returns promptly with MOQ_ERR_CLOSED |
 | 3 | Fatal detection | Configure tiny max_actions to force adapter fatal; verify _wait returns MOQ_ERR_CLOSED, _is_fatal true |
 | 4 | Wake coalescing | Rapid _wake calls; verify second returns MOQ_OK without pipe write, no pipe exhaustion |
 | 5 | Stop without wait | Create → stop → destroy without calling _wait |
 | 6 | Double stop | Call stop twice; second returns MOQ_OK |
-| 7 | on_pump creates facade | Verify facade creation in first on_pump call (session is valid, non-NULL) |
-| 8 | on_pump nonzero return | on_pump returns 1; verify _wait returns MOQ_ERR_CLOSED, _is_fatal false |
+| 7 | on_lane_pump creates facade | Verify facade creation in first on_lane_pump call (session is valid, non-NULL) |
+| 8 | on_lane_pump nonzero return | on_lane_pump returns 1; verify _wait returns MOQ_ERR_CLOSED, _is_fatal false |
 | 9 | Null/invalid args | All public APIs handle NULL gracefully |
 | 10 | Server: no client | Create server → stop → destroy; _session() returns NULL throughout |
 | 11 | Facade destroy ordering | Destroy facade after _stop, before _destroy; verify no use-after-free |
-| 12 | Stop from on_pump | on_pump calls _stop; verify MOQ_ERR_WRONG_STATE returned |
+| 12 | Stop from on_lane_pump | on_lane_pump calls _stop; verify MOQ_ERR_WRONG_STATE returned |
 | 13 | configure_quic callback | Verify callback fires with valid quic context during _create |
 | 14 | configure_quic failure | configure_quic returns nonzero; _create fails, no thread running |
 
@@ -706,11 +708,11 @@ session config.
 - **Multi-connection server (supported).** The server accepts up to
   `cfg.max_connections` simultaneous client connections (default 1024),
   each with its own MoQ session/adapter. Iterate them on the network
-  thread inside `on_pump` with `moq_pq_threaded_next_conn()` /
+  thread inside `on_lane_pump` with `moq_pq_threaded_lane_next_conn()` /
   `moq_pq_threaded_conn_session()`, close one with
-  `moq_pq_threaded_conn_close()` (deferred prune after `on_pump`), and read
+  `moq_pq_threaded_conn_close()` (deferred prune after `on_lane_pump`), and read
   the active count with `moq_pq_threaded_conn_count()`. The pump services
-  every connection before and after `on_pump`; a per-connection failure
+  every connection before and after `on_lane_pump`; a per-connection failure
   prunes only that connection, leaving the server up. The legacy
   `moq_pq_threaded_session()` / `_conn()` return the first live connection
   for single-connection convenience.

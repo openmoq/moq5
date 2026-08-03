@@ -10,7 +10,7 @@
  * the network thread. The test cases drive the sans-I/O core directly via the
  * endpoint's post() executor, which runs moq_session_* calls on the network
  * thread where they are legal. This is the protocol/conformance dogfood of the
- * service tier (design slice 4); application integrators should start with
+ * service tier; application integrators should start with
  * examples/service/ instead.
  */
 
@@ -349,7 +349,37 @@ typedef struct {
     bool        tls_disable_verify;
     bool        verbose;
     int         draft;   /* 0 = auto (offer every draft); 16/18 = pin exactly */
+    moq_transport_backend_t backend;   /* 0 = AUTO (picoquic); see --backend */
+    const char *backend_name;          /* the selected name, for diagnostics */
+    uint32_t wt_profile;               /* moq_wt_profile_t; 0 = backend default */
+    const char *wt_profile_name;       /* the selected name, for diagnostics */
 } cli_opts_t;
+
+/* Transport backend selection (INTERNAL testing knob, default AUTO=picoquic):
+ * drives cfg.backend so the same interop suite can exercise libmoq's own
+ * adapters. Some backends are transport-restricted; parse_cli cross-checks the
+ * name against the URL scheme. Not part of the interop-runner interface. */
+static const struct {
+    const char             *name;
+    moq_transport_backend_t backend;
+    bool                    raw_quic;      /* usable with moqt:// */
+    bool                    webtransport;  /* usable with https:// */
+} g_backends[] = {
+    { "auto",          MOQ_TRANSPORT_BACKEND_AUTO,           true,  true  },
+    { "picoquic",      MOQ_TRANSPORT_BACKEND_PICOQUIC,       true,  true  },
+    { "msquic",        MOQ_TRANSPORT_BACKEND_MSQUIC,         true,  false },
+    { "mvfst",         MOQ_TRANSPORT_BACKEND_MVFST,          true,  false },
+    { "proxygen",      MOQ_TRANSPORT_BACKEND_PROXYGEN,       false, true  },
+    /* WebTransport over MsQuic (cross-platform). */
+    { "wtquic-msquic", MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC,  false, true  },
+    /* WebTransport over Apple Network.framework -- EXPERIMENTAL: its public
+     * NF QUIC multiplex client drops an eager H3 server's control stream, so
+     * establishment against third-party relays is unreliable (see the wtquic
+     * COMPATIBILITY notes). Selectable for evidence only, never a default.
+     * There is deliberately NO bare "wtquic" alias: bare wtquic names no
+     * upstream transport and is always rejected. */
+    { "wtquic-network", MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK, false, true  },
+};
 
 static void print_usage(const char *prog)
 {
@@ -361,12 +391,22 @@ static void print_usage(const char *prog)
         "  --test NAME             test case name (default: run all cases)\n"
         "  --draft N               pin the offered draft to 16 or 18\n"
         "                          (default: offer every draft, negotiate one)\n"
+        "  --backend NAME          transport backend (testing): auto|picoquic|\n"
+        "                          msquic|mvfst|proxygen|wtquic-msquic|\n"
+        "                          wtquic-network (default: auto). wtquic-network\n"
+        "                          is EXPERIMENTAL; bare \"wtquic\" is not accepted.\n"
+        "  --wt-profile NAME       WebTransport-over-H3 dialect, wtquic-msquic ONLY:\n"
+        "                          current (:protocol=webtransport-h3, default) or\n"
+        "                          d13-14 (:protocol=webtransport, proxygen/moxygen/\n"
+        "                          moqx/h3zero family). Rejected for any other\n"
+        "                          backend (fixed dialect / no WebTransport).\n"
         "  --tls-disable-verify    skip TLS certificate verification\n"
         "  --verbose               print session state and events to stderr\n"
         "  --help                  show this help\n"
         "\n"
         "Environment fallback (CLI wins):\n"
-        "  RELAY_URL, TESTCASE, MOQT_DRAFT, TLS_DISABLE_VERIFY=1\n"
+        "  RELAY_URL, TESTCASE, MOQT_DRAFT, MOQT_BACKEND, MOQT_WT_PROFILE,\n"
+        "  TLS_DISABLE_VERIFY=1\n"
         "\n"
         "Transport (raw QUIC vs WebTransport) is selected automatically from the\n"
         "URL scheme. The draft version is auto-negotiated (the endpoint offers\n"
@@ -393,6 +433,8 @@ static cli_opts_t parse_cli(int argc, char **argv)
 {
     cli_opts_t opts = {0};
     const char *draft_str = NULL;
+    const char *backend_str = NULL;
+    const char *wt_profile_str = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--relay") == 0 && i + 1 < argc)
             opts.relay_url = argv[++i];
@@ -400,6 +442,10 @@ static cli_opts_t parse_cli(int argc, char **argv)
             opts.test_name = argv[++i];
         else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc)
             draft_str = argv[++i];
+        else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc)
+            backend_str = argv[++i];
+        else if (strcmp(argv[i], "--wt-profile") == 0 && i + 1 < argc)
+            wt_profile_str = argv[++i];
         else if (strcmp(argv[i], "--tls-disable-verify") == 0)
             opts.tls_disable_verify = true;
         else if (strcmp(argv[i], "--verbose") == 0)
@@ -432,6 +478,89 @@ static cli_opts_t parse_cli(int argc, char **argv)
                 "(got \"%s\"); omit for auto-negotiation\n", draft_str);
         exit(1);
     }
+    /* Backend: --backend wins, else MOQT_BACKEND, else AUTO (picoquic). */
+    if (!backend_str) {
+        const char *env = getenv("MOQT_BACKEND");
+        if (env && *env) backend_str = env;
+    }
+    if (backend_str) {
+        int bi = -1;
+        for (size_t k = 0; k < sizeof(g_backends) / sizeof(g_backends[0]); k++)
+            if (strcmp(backend_str, g_backends[k].name) == 0) { bi = (int)k; break; }
+        if (bi < 0) {
+            fprintf(stderr, "error: --backend/MOQT_BACKEND unknown \"%s\" "
+                    "(auto|picoquic|msquic|mvfst|proxygen|wtquic-msquic|"
+                    "wtquic-network; bare \"wtquic\" is not accepted)\n",
+                    backend_str);
+            exit(1);
+        }
+        opts.backend = g_backends[bi].backend;
+        opts.backend_name = g_backends[bi].name;
+        /* Backends are transport-restricted; catch a scheme mismatch here with
+         * a clear message rather than a bare MOQ_ERR_UNSUPPORTED at connect. */
+        if (opts.relay_url) {
+            bool is_wt = strncmp(opts.relay_url, "https://", 8) == 0;
+            if (is_wt && !g_backends[bi].webtransport) {
+                fprintf(stderr, "error: backend \"%s\" is raw-QUIC only; "
+                        "use a moqt:// relay URL\n", backend_str);
+                exit(1);
+            }
+            if (!is_wt && !g_backends[bi].raw_quic) {
+                fprintf(stderr, "error: backend \"%s\" is WebTransport only; "
+                        "use an https:// relay URL\n", backend_str);
+                exit(1);
+            }
+        }
+    }
+    /* WebTransport wire profile: --wt-profile wins, else MOQT_WT_PROFILE. It is
+     * a dialect knob honored ONLY by the wtquic-msquic backend; every other
+     * backend has a FIXED WebTransport dialect (picoquic/proxygen/wtquic-network)
+     * or no WebTransport at all (raw QUIC). The value forwarded to the library
+     * defaults to BACKEND_DEFAULT (no explicit selection; wtquic-msquic maps it
+     * to CURRENT), but the REQUEST IDENTITY (below) is derived from the backend,
+     * so a run can never certify a "current"/"d13-14" dialect the transport did
+     * not actually speak. */
+    opts.wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+    if (!wt_profile_str) {
+        const char *env = getenv("MOQT_WT_PROFILE");
+        if (env && *env) wt_profile_str = env;
+    }
+    bool profile_selectable =
+        (opts.backend == MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC);
+    if (wt_profile_str) {
+        /* An explicit profile is accepted ONLY where it is actually applied.
+         * Accepting it for a backend that ignores it would let the run claim a
+         * dialect it never used -- reject instead. */
+        if (!profile_selectable) {
+            fprintf(stderr, "error: --wt-profile/MOQT_WT_PROFILE applies only "
+                    "to the wtquic-msquic backend; backend \"%s\" has a fixed "
+                    "WebTransport dialect or no WebTransport\n",
+                    opts.backend_name ? opts.backend_name : "auto");
+            exit(1);
+        }
+        if (strcmp(wt_profile_str, "current") == 0) {
+            opts.wt_profile = (uint32_t)MOQ_WT_PROFILE_CURRENT;
+        } else if (strcmp(wt_profile_str, "d13-14") == 0) {
+            opts.wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+        } else {
+            fprintf(stderr, "error: --wt-profile/MOQT_WT_PROFILE must be "
+                    "\"current\" or \"d13-14\" (got \"%s\")\n", wt_profile_str);
+            exit(1);
+        }
+    }
+    /* Truthful request identity: the wtquic-msquic backend reports the selected
+     * profile; any other WebTransport backend reports its fixed dialect as
+     * "native"; a raw-QUIC transport reports "n/a" (no WebTransport at all). */
+    bool is_wt = opts.relay_url != NULL &&
+                 strncmp(opts.relay_url, "https://", 8) == 0;
+    if (profile_selectable)
+        opts.wt_profile_name =
+            opts.wt_profile == (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT
+                ? "d13-14" : "current";
+    else if (is_wt)
+        opts.wt_profile_name = "native";
+    else
+        opts.wt_profile_name = "n/a";
     return opts;
 }
 
@@ -439,10 +568,36 @@ static cli_opts_t parse_cli(int argc, char **argv)
 /* TAP output                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Draft to pin for this run: 0 = auto (offer every draft this build supports),
+ * 16/18 = offer exactly that one. Set once from the CLI/env in main(). */
+static int g_draft_pin = 0;
+
+/* Transport backend for this run (default AUTO = picoquic); set from
+ * --backend / MOQT_BACKEND in main(). */
+static moq_transport_backend_t g_backend = MOQ_TRANSPORT_BACKEND_AUTO;
+
+/* The selected backend's name, for TAP/diagnostics (default "auto"). */
+static const char *g_backend_name = "auto";
+
+/* WebTransport wire profile for this run; set from --wt-profile /
+ * MOQT_WT_PROFILE in main(). Only the wtquic-msquic backend applies the value;
+ * the identity string is the backend's truthful dialect ("current"/"d13-14" for
+ * wtquic-msquic, "native" for a fixed-dialect WebTransport backend, "n/a" for
+ * raw QUIC) -- never a dialect the transport did not speak. */
+static uint32_t g_wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+static const char *g_wt_profile_name = "n/a";
+
 static void tap_plan(int n)
 {
     printf("TAP version 14\n");
     printf("1..%d\n", n);
+    /* Name the requested backend + draft pin up front, so a connect FAILURE
+     * (which never reaches the negotiated line) still records exactly which
+     * backend/draft combination was exercised. */
+    printf("# request: backend=%s wt-profile=%s draft=%s\n", g_backend_name,
+           g_wt_profile_name,
+           g_draft_pin == 16 ? "16" : g_draft_pin == 18 ? "18" : "auto");
+    fflush(stdout);
 }
 
 static void tap_result(int num, bool ok, const char *desc,
@@ -459,6 +614,16 @@ static void tap_result(int num, bool ok, const char *desc,
     fflush(stdout);
 }
 
+/* Emit a planned step that could not run because an earlier step failed, as a
+ * TAP SKIP (`ok N - desc # SKIP reason`). This keeps the plan complete without
+ * inflating one root failure into several: the real failure stays the single
+ * `not ok`, and the unreached steps are skips, not failures. */
+static void tap_result_skip(int num, const char *desc, const char *reason)
+{
+    printf("ok %d - %s # SKIP %s\n", num, desc, reason);
+    fflush(stdout);
+}
+
 static void tap_skip(const char *test_name, const char *reason)
 {
     printf("TAP version 14\n");
@@ -470,18 +635,15 @@ static void tap_skip(const char *test_name, const char *reason)
  * complete. Comments are ignored by harness pass/fail accounting. */
 static void tap_negotiated(moq_endpoint_t *ep, const char *url)
 {
-    printf("# negotiated: draft-%u over %s\n",
-        (unsigned)moq_endpoint_negotiated_version(ep), transport_label(url));
+    printf("# negotiated: draft-%u over %s (backend: %s)\n",
+        (unsigned)moq_endpoint_negotiated_version(ep), transport_label(url),
+        g_backend_name);
     fflush(stdout);
 }
 
 /* ------------------------------------------------------------------ */
 /* Endpoint helpers                                                     */
 /* ------------------------------------------------------------------ */
-
-/* Draft to pin for this run: 0 = auto (offer every draft this build supports),
- * 16/18 = offer exactly that one. Set once from the CLI/env in main(). */
-static int g_draft_pin = 0;
 
 /* Create + start an endpoint. Transport, draft offer, and TLS are all owned
  * by the endpoint: AUTO protocol derives the transport from the URL scheme;
@@ -490,10 +652,13 @@ static int g_draft_pin = 0;
 static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
 {
     moq_endpoint_cfg_t cfg;
-    moq_endpoint_cfg_init(&cfg);
+    /* Sized init: we set wt_profile, a struct_size-gated tail field, so the
+     * pointer-only init (which stamps only the v0 floor) would drop it. */
+    moq_endpoint_cfg_init_sized(&cfg, sizeof(cfg));
     cfg.url = (moq_bytes_t){ (const uint8_t *)url, strlen(url) };
     cfg.protocol = MOQ_TRANSPORT_PROTOCOL_AUTO;
-    cfg.backend = MOQ_TRANSPORT_BACKEND_AUTO;
+    cfg.backend = g_backend;
+    cfg.wt_profile = g_wt_profile;
     /* cfg.versions left zero-init == MOQ_VERSION_POLICY_AUTO (offer all). */
     if (g_draft_pin != 0) {
         /* EXACT offer: propose only the pinned draft; a peer that can't speak
@@ -611,7 +776,7 @@ static int run_announce_only(const char *url, bool insecure, bool verbose)
     if (!ep) {
         tap_plan(2);
         tap_result(1, false, "setup", 0, "failed to create endpoint");
-        tap_result(2, false, "namespace accepted", 0, "no connection");
+        tap_result_skip(2, "namespace accepted", "setup failed");
         ctx_destroy(&c);
         return 1;
     }
@@ -627,7 +792,13 @@ static int run_announce_only(const char *url, bool insecure, bool verbose)
     if (setup_ok) tap_negotiated(ep, url);
     tap_result(1, setup_ok, "setup", ms1,
         setup_ok ? "MoQ setup complete" : reason);
-    if (!setup_ok) { exit_code = 1; goto done; }
+    if (!setup_ok) {
+        /* Setup failed: the later step cannot run, but the plan promised it --
+         * emit it as a SKIP so the TAP stays complete (plan == results) without
+         * turning one setup failure into two failures. */
+        tap_result_skip(2, "namespace accepted", "setup failed");
+        exit_code = 1; goto done;
+    }
 
     /* Request publish_namespace. */
     pthread_mutex_lock(&c.mu);
@@ -699,8 +870,8 @@ static int run_publish_namespace_done(const char *url, bool insecure,
     if (!ep) {
         tap_plan(3);
         tap_result(1, false, "setup", 0, "failed to create endpoint");
-        tap_result(2, false, "namespace accepted", 0, "no connection");
-        tap_result(3, false, "namespace done sent", 0, "no connection");
+        tap_result_skip(2, "namespace accepted", "setup failed");
+        tap_result_skip(3, "namespace done sent", "setup failed");
         ctx_destroy(&c);
         return 1;
     }
@@ -716,7 +887,13 @@ static int run_publish_namespace_done(const char *url, bool insecure,
     if (setup_ok) tap_negotiated(ep, url);
     tap_result(1, setup_ok, "setup", ms1,
         setup_ok ? "MoQ setup complete" : reason);
-    if (!setup_ok) { exit_code = 1; goto done; }
+    if (!setup_ok) {
+        /* Keep the TAP complete: the two unreached steps are skips, not
+         * failures, so one setup failure is not counted as three. */
+        tap_result_skip(2, "namespace accepted", "setup failed");
+        tap_result_skip(3, "namespace done sent", "setup failed");
+        exit_code = 1; goto done;
+    }
 
     /* Publish namespace. */
     pthread_mutex_lock(&c.mu);
@@ -755,11 +932,15 @@ static int run_publish_namespace_done(const char *url, bool insecure,
         char msg[64];
         snprintf(msg, sizeof(msg), "publish_namespace failed: %d", ns_rc2);
         tap_result(2, false, "namespace accepted", ms2, msg);
+        tap_result_skip(3, "namespace done sent", "namespace not accepted");
         exit_code = 1; goto done;
     }
     tap_result(2, ns_accepted2, "namespace accepted", ms2,
         ns_accepted2 ? "NAMESPACE_ACCEPTED received" : ns_reason);
-    if (!ns_accepted2) { exit_code = 1; goto done; }
+    if (!ns_accepted2) {
+        tap_result_skip(3, "namespace done sent", "namespace not accepted");
+        exit_code = 1; goto done;
+    }
 
     /* Send publish_namespace_done. */
     pthread_mutex_lock(&c.mu);
@@ -807,7 +988,7 @@ static int run_subscribe_error(const char *url, bool insecure, bool verbose)
     if (!ep) {
         tap_plan(2);
         tap_result(1, false, "setup", 0, "failed to create endpoint");
-        tap_result(2, false, "subscribe error or timeout", 0, "no connection");
+        tap_result_skip(2, "subscribe error or timeout", "setup failed");
         ctx_destroy(&c);
         return 1;
     }
@@ -823,7 +1004,10 @@ static int run_subscribe_error(const char *url, bool insecure, bool verbose)
     if (setup_ok) tap_negotiated(ep, url);
     tap_result(1, setup_ok, "setup", ms1,
         setup_ok ? "MoQ setup complete" : reason);
-    if (!setup_ok) { exit_code = 1; goto done; }
+    if (!setup_ok) {
+        tap_result_skip(2, "subscribe error or timeout", "setup failed");
+        exit_code = 1; goto done;
+    }
 
     /* Subscribe to nonexistent namespace. */
     pthread_mutex_lock(&c.mu);
@@ -1205,14 +1389,52 @@ static const test_entry_t supported_tests[] = {
     { NULL, NULL },
 };
 
+/* Pull the first failing sub-step out of a case's captured TAP as
+ * "<sub-step>: <message>", so the one-line-per-case view still says WHY it
+ * failed (a bare "case did not pass" is useless in the runner's report).
+ * Returns false if the capture held no failure. */
+static bool first_failure(FILE *cap, char *out, size_t out_len)
+{
+    char line[512], step[256];
+    step[0] = '\0';
+    rewind(cap);
+    while (fgets(line, sizeof(line), cap)) {
+        if (step[0] == '\0') {
+            /* Find the first failing sub-step and remember its description. */
+            if (strncmp(line, "not ok ", 7) != 0) continue;
+            const char *dash = strstr(line, " - ");
+            snprintf(step, sizeof(step), "%s", dash ? dash + 3 : "sub-test");
+            step[strcspn(step, "\r\n")] = '\0';
+            continue;
+        }
+        /* Its YAML block follows; the first message: is the reason. A new
+         * result line first means it carried no message. */
+        const char *m = strstr(line, "message: \"");
+        if (m) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s", m + strlen("message: \""));
+            char *q = strchr(msg, '"');
+            if (q) *q = '\0';
+            snprintf(out, out_len, "%s: %s", step, msg);
+            return true;
+        }
+        if (strncmp(line, "ok ", 3) == 0 || strncmp(line, "not ok ", 7) == 0)
+            break;
+    }
+    if (step[0] == '\0') return false;
+    snprintf(out, out_len, "%s", step);
+    return true;
+}
+
 /* No explicit test selected (bare `make test` sets RELAY_URL but no TESTCASE):
  * run the whole suite and emit ONE TAP line per case, matching the other
  * interop clients (moq-rs, imquic, ...). Each case's own multi-step TAP is
- * suppressed here (redirected off stdout) so the run-all view stays one line
- * per case; use --test/TESTCASE to run a single case in full detail. The exit
- * code is lenient: 0 as long as at least one case ran to a result (the runner
- * grades per-case from the TAP, and reserves a non-zero exit for a client that
- * could not run at all). */
+ * captured off stdout (not discarded) so the run-all view stays one line per
+ * case while still reporting the real duration and the first failing sub-step;
+ * use --test/TESTCASE to run a single case in full detail. The exit code is
+ * lenient: 0 as long as at least one case ran to a result (the runner grades
+ * per-case from the TAP, and reserves a non-zero exit for a client that could
+ * not run at all). */
 static int run_all_tests(const char *url, bool insecure, bool verbose)
 {
     int total = 0;
@@ -1225,20 +1447,34 @@ static int run_all_tests(const char *url, bool insecure, bool verbose)
         /* Distinct namespace per case so back-to-back announces don't collide
          * on a relay still holding a prior case's namespace. */
         set_case_ns(e->name);
-        /* Redirect the case's stdout (its own plan + sub-steps) to /dev/null,
-         * keeping only the per-case summary line below. stderr (verbose diag)
-         * is left alone. Restore stdout before reporting. */
+        /* Capture the case's stdout (its own plan + sub-steps) so only the
+         * per-case summary line below reaches the runner, while the detail
+         * stays available for the failure message. stderr (verbose diag) is
+         * left alone. Restore stdout before reporting. */
+        FILE *cap = tmpfile();
+        int sink = cap ? fileno(cap) : open("/dev/null", O_WRONLY);
         fflush(stdout);
         int saved = dup(STDOUT_FILENO);
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); close(devnull); }
+        if (sink >= 0) dup2(sink, STDOUT_FILENO);
+
+        uint64_t t0 = now_us_mono();
         int rc = e->run(url, insecure, verbose);
+        uint64_t ms = (now_us_mono() - t0) / 1000;
+
         fflush(stdout);
         if (saved >= 0) { dup2(saved, STDOUT_FILENO); close(saved); }
+        if (!cap && sink >= 0) close(sink);
 
         bool ok = (rc == 0);
+        char why[320];
+        const char *msg = NULL;
+        if (!ok)
+            msg = (cap && first_failure(cap, why, sizeof(why)))
+                      ? why : "case did not pass";
+        if (cap) fclose(cap);
+
         if (ok) passed++;
-        tap_result(num, ok, e->name, 0, ok ? NULL : "case did not pass");
+        tap_result(num, ok, e->name, ms, msg);
     }
     return passed > 0 ? 0 : 1;
 }
@@ -1251,6 +1487,10 @@ int main(int argc, char **argv)
 {
     cli_opts_t opts = parse_cli(argc, argv);
     g_draft_pin = opts.draft;
+    g_backend = opts.backend;
+    if (opts.backend_name) g_backend_name = opts.backend_name;
+    g_wt_profile = opts.wt_profile;
+    if (opts.wt_profile_name) g_wt_profile_name = opts.wt_profile_name;
 
     if (!opts.relay_url) {
         fprintf(stderr, "error: --relay is required "

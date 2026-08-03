@@ -2,6 +2,7 @@
 #include "test_support.hpp"
 
 #include <cstring>
+#include <variant>
 #include <vector>
 
 static void pump(moq::session &from, moq::session &to, uint64_t now)
@@ -119,7 +120,8 @@ int main()
          * subscriber may put new-group requests on later updates. */
         static const uint8_t dyn_props[] = { 0x30, 0x01 };
         MOQ_CHECK(s.accept_subscribe(srv_sub,
-            {.track_properties = moq::bytes_view(dyn_props, 2)}, 0).ok());
+            {.has_largest = true, .largest_group = 12, .largest_object = 5,
+             .track_properties = moq::bytes_view(dyn_props, 2)}, 0).ok());
         pump(s, c, 0);
         {
             auto ok_ev = c.poll_event();
@@ -167,8 +169,29 @@ int main()
             [&](const auto &) { MOQ_CHECK(false); });
         pump(s, c, 0); // REQUEST_OK for the update.
 
+        // The update ack now surfaces SUBSCRIPTION_UPDATE_OK on the requester
+        // (client) side; consume it before the subsequent subscribe_done.
+        auto uok = c.poll_event();
+        MOQ_CHECK(uok.has_value());
+        uok->visit(
+            [&](const moq::event::subscription_update_ok &ok) {
+                MOQ_CHECK(ok.sub == sub);
+                /* Scalar conversion discriminated: the publisher advertised
+                 * Largest (12,5) at accept, so the ack carries it; a draft-16
+                 * ack never carries EXPIRES. */
+                MOQ_CHECK(ok.has_largest);
+                MOQ_CHECK(ok.largest_group == 12);
+                MOQ_CHECK(ok.largest_object == 5);
+                MOQ_CHECK(!ok.has_expires);
+                MOQ_CHECK(ok.expires_ms == 0);
+            },
+            [&](const auto &) { MOQ_CHECK(false); });
+
+        // No data streams were delivered here, so the truthful Stream Count
+        // is 0 -- which surfaces subscribe_done immediately (a nonzero count
+        // would gate the event on that many processed data streams).
         auto dr = s.done_subscribe(srv_sub,
-            {.status_code = 9, .stream_count = 2, .reason = "done"},
+            {.status_code = 9, .stream_count = 0, .reason = "done"},
             0);
         MOQ_CHECK(dr.ok());
         pump(s, c, 0);
@@ -179,7 +202,7 @@ int main()
             [&](const moq::event::subscribe_done &done) {
                 MOQ_CHECK(done.sub == sub);
                 MOQ_CHECK(done.status_code == 9);
-                MOQ_CHECK(done.stream_count == 2);
+                MOQ_CHECK(done.stream_count == 0);
                 MOQ_CHECK(done.reason == "done");
             },
             [&](const auto &) { MOQ_CHECK(false); });
@@ -287,6 +310,16 @@ int main()
             },
             [&](const auto &) { MOQ_CHECK(false); });
 
+        // Seed the publisher's (c's) track registry with a nonzero largest so
+        // the update ack carries distinct nondefault Largest values -- this
+        // discriminates a real field read-through from a stuck-at-zero default.
+        {
+            moq_bytes_t part = MOQ_BYTES_LITERAL("live");
+            moq_namespace_t ns{ &part, 1 };
+            MOQ_CHECK(moq_session_note_object_published(
+                c.raw(), &ns, MOQ_BYTES_LITERAL("video"), 7, 3) == MOQ_OK);
+        }
+
         const moq_auth_token_t pub_tok = {
             .token_type = 9,
             .token_value = { (const uint8_t *)"renew", 5 },
@@ -310,6 +343,25 @@ int main()
             },
             [&](const auto &) { MOQ_CHECK(false); });
         pump(c, s, 0); // REQUEST_OK for the update.
+
+        // The update ack now surfaces PUBLICATION_UPDATE_OK on the requester
+        // (server) side; consume it before the subsequent publish_finished.
+        auto pok = s.poll_event();
+        MOQ_CHECK(pok.has_value());
+        pok->visit(
+            [&](const moq::event::publication_update_ok &ok) {
+                MOQ_CHECK(ok.pub == srv_pub);
+                /* Scalar conversion discriminator: the publisher's registry was
+                 * seeded to (7,3), so the ack MUST carry those distinct nonzero
+                 * Largest values (proving every field reads through, not just
+                 * the handle). EXPIRES is never emitted on the ack path. */
+                MOQ_CHECK(ok.has_largest);
+                MOQ_CHECK(ok.largest_group == 7);
+                MOQ_CHECK(ok.largest_object == 3);
+                MOQ_CHECK(!ok.has_expires);
+                MOQ_CHECK(ok.expires_ms == 0);
+            },
+            [&](const auto &) { MOQ_CHECK(false); });
 
         /* This publication opened no data streams (datagram-only path), so its
          * PUBLISH_DONE Stream Count is 0, which finalizes immediately. A non-zero
@@ -485,6 +537,102 @@ int main()
                       MOQ_FETCH_RANGE_UNKNOWN);
         static_assert(moq::fetch_range_kind_from_c(MOQ_FETCH_RANGE_UNKNOWN) ==
                       moq::fetch_range_kind::unknown);
+    }
+
+    // Synthetic UPDATE_OK conversion discriminator (both event kinds). Build C
+    // events directly with distinct nonzero Largest AND EXPIRES, wrap in
+    // moq::polled_event, and assert EVERY converted field. The live ack path
+    // never emits EXPIRES, so this is the only place the has_expires/expires_ms
+    // read-through is exercised.
+    {
+        moq_event_t ce{};
+        ce.kind = MOQ_EVENT_SUBSCRIPTION_UPDATE_OK;
+        ce.detail_size = (uint32_t)sizeof(moq_subscription_update_ok_event_t);
+        ce.u.subscription_update_ok = moq_subscription_update_ok_event_t{
+            .sub = moq_subscription_t{._opaque = 0x1234},
+            .has_largest = true, .largest_group = 4242, .largest_object = 77,
+            .has_expires = true, .expires_ms = 60000};
+        moq::polled_event pe{ce};
+        auto v = pe.variant();
+        auto *ok = std::get_if<moq::event::subscription_update_ok>(&v);
+        MOQ_CHECK(ok != nullptr);
+        if (ok) {
+            MOQ_CHECK(ok->has_largest);
+            MOQ_CHECK(ok->largest_group == 4242);
+            MOQ_CHECK(ok->largest_object == 77);
+            MOQ_CHECK(ok->has_expires);
+            MOQ_CHECK(ok->expires_ms == 60000);
+        }
+    }
+    {
+        moq_event_t ce{};
+        ce.kind = MOQ_EVENT_PUBLICATION_UPDATE_OK;
+        ce.detail_size = (uint32_t)sizeof(moq_publication_update_ok_event_t);
+        ce.u.publication_update_ok = moq_publication_update_ok_event_t{
+            .pub = moq_publication_t{._opaque = 0x5678},
+            .has_largest = true, .largest_group = 9001, .largest_object = 12,
+            .has_expires = true, .expires_ms = 45000};
+        moq::polled_event pe{ce};
+        auto v = pe.variant();
+        auto *ok = std::get_if<moq::event::publication_update_ok>(&v);
+        MOQ_CHECK(ok != nullptr);
+        if (ok) {
+            MOQ_CHECK(ok->has_largest);
+            MOQ_CHECK(ok->largest_group == 9001);
+            MOQ_CHECK(ok->largest_object == 12);
+            MOQ_CHECK(ok->has_expires);
+            MOQ_CHECK(ok->expires_ms == 45000);
+        }
+    }
+
+    // Conversion discriminators: synthetic C events with nondefault values
+    // for every appended publish_request / publish_ok field.
+    {
+        moq_event_t ce{};
+        ce.kind = MOQ_EVENT_PUBLISH_REQUEST;
+        ce.detail_size = (uint32_t)sizeof(moq_publish_request_event_t);
+        auto &d = ce.u.publish_request;
+        d.pub = moq_publication_t{._opaque = 0x77};
+        d.track_alias = 5;
+        d.forward = true;
+        d.has_largest = true; d.largest_group = 314; d.largest_object = 15;
+        d.has_expires = true; d.expires_ms = 27500;
+        moq::polled_event pe{ce};
+        auto v = pe.variant();
+        auto *req = std::get_if<moq::event::publish_request>(&v);
+        MOQ_CHECK(req != nullptr);
+        if (req) {
+            MOQ_CHECK(req->has_largest);
+            MOQ_CHECK(req->largest_group == 314);
+            MOQ_CHECK(req->largest_object == 15);
+            MOQ_CHECK(req->has_expires);
+            MOQ_CHECK(req->expires_ms == 27500);
+        }
+    }
+    {
+        moq_event_t ce{};
+        ce.kind = MOQ_EVENT_PUBLISH_OK;
+        ce.detail_size = (uint32_t)sizeof(moq_publish_ok_event_t);
+        auto &d = ce.u.publish_ok;
+        d.pub = moq_publication_t{._opaque = 0x88};
+        d.send_allowed = false;
+        d.subscriber_priority = 9;
+        d.group_order = MOQ_GROUP_ORDER_DESCENDING;
+        d.has_filter = true;
+        d.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        d.start_group = 21; d.start_object = 2; d.end_group = 42;
+        moq::polled_event pe{ce};
+        auto v = pe.variant();
+        auto *ok = std::get_if<moq::event::publish_ok>(&v);
+        MOQ_CHECK(ok != nullptr);
+        if (ok) {
+            MOQ_CHECK(!ok->send_allowed);
+            MOQ_CHECK(ok->has_filter);
+            MOQ_CHECK(ok->filter == moq::subscribe_filter::absolute_range);
+            MOQ_CHECK(ok->start_group == 21);
+            MOQ_CHECK(ok->start_object == 2);
+            MOQ_CHECK(ok->end_group == 42);
+        }
     }
 
     MOQ_PASS("test_cpp_advanced_operations");

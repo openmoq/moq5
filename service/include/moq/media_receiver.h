@@ -265,9 +265,19 @@ typedef enum moq_media_track_event_kind {
                                     updated in place before this fires. */
     MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog generation */
     MOQ_MEDIA_TRACK_ENDED,       /* peer end-of-track / rejection */
-    MOQ_MEDIA_CATALOG_READY      /* first (independent) catalog enumerated; fires
+    MOQ_MEDIA_CATALOG_READY,     /* first (independent) catalog enumerated; fires
                                     exactly once per connection (later generations
                                     emit only ADDED/REMOVED) */
+    MOQ_MEDIA_TRACK_UPDATE_OK    /* the peer acknowledged an APP-initiated
+                                    pause/resume for this track . Fires only
+                                    for wire acknowledgments attributed to a
+                                    subscribe_track/unsubscribe_track intent
+                                    change; internal flow-control reconciliation
+                                    is never surfaced. The appended
+                                    has_largest/expires fields below are
+                                    OBSERVATIONAL (where delivery resumed
+                                    relative to what was missed); the receiver
+                                    issues no catch-up FETCH. */
 } moq_media_track_event_kind_t;
 
 typedef struct moq_media_track_event {
@@ -290,6 +300,24 @@ typedef struct moq_media_track_event {
                                             above); NULL for CATALOG_READY */
     uint32_t config_generation;          /* reserved for dynamic config;
                                             always 0 today */
+    /* Permanently reserved, never read: the v0 struct ended in four
+     * bytes of trailing padding after config_generation; the appended
+     * fields below start at the old sizeof so an old caller's storage is
+     * never written past its struct_size (poll_track stamps
+     * min(your sizeof, the library's) and copies only that much). */
+    uint8_t  _reserved_track_ev[4];
+    /* Appended , valid for MOQ_MEDIA_TRACK_UPDATE_OK only; zero for
+     * every other kind. Copied per event at queue time (never derived from
+     * later track state). Presence gate: an OLDER library stamps its own
+     * (v0) sizeof, so read this block only when the stamped
+     * struct_size >= offsetof(has_largest) + sizeof(has_largest) -- the
+     * reserved spacer sits INSIDE the old sizeof, so comparing against its
+     * offset would misread uninitialized memory as present. */
+    bool     has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
+    bool     has_expires;                /* draft-18 peers only */
+    uint64_t expires_ms;
 } moq_media_track_event_t;
 
 /* The description for a track handle (handle-owned; same lifetime as the
@@ -441,7 +469,7 @@ MOQ_API moq_result_t moq_media_receiver_track_state(
  * destroy-notify, FFmpeg AVBufferRef free). Copy payload/fragment into a
  * framework-owned buffer for downstream. True cross-thread zero-copy ingest
  * would require a future, separate thread-safe media-buffer API -- not
- * moq_rcbuf_t (see BACKLOG: "Thread-safe zero-copy receive export"). */
+ * moq_rcbuf_t (a thread-safe zero-copy receive export is not offered). */
 
 typedef struct moq_media_object {
     uint32_t              struct_size;        /* ABI guard: poll_object stamps the

@@ -44,6 +44,25 @@ struct EndpointConfigurationMappingTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Every backend maps to its C constant (exhaustive)")
+    func backendMapping() {
+        // exhaustive by construction: a new enum case breaks this list at
+        // compile time via the switch in cBackend, and at review time here
+        let cases: [(MoQEndpoint.TransportBackend, moq_transport_backend_t)] = [
+            (.automatic, MOQ_TRANSPORT_BACKEND_AUTO),
+            (.picoquic, MOQ_TRANSPORT_BACKEND_PICOQUIC),
+            (.mvfst, MOQ_TRANSPORT_BACKEND_MVFST),
+            (.proxygen, MOQ_TRANSPORT_BACKEND_PROXYGEN),
+            (.msquic, MOQ_TRANSPORT_BACKEND_MSQUIC),
+            (.wtquicNetwork, MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK),
+            (.wtquicMsquic, MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC),
+        ]
+        for (swift, c) in cases {
+            #expect(cBackend(swift) == c)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Version offers map to LIST/EXACT with the draft values")
     func versionOffers() throws {
         var configuration = MoQEndpoint.Configuration(

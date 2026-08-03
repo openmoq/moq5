@@ -95,17 +95,26 @@ static size_t framed(uint8_t *buf, size_t cap, uint64_t type,
     return moq_buf_writer_offset(&w);
 }
 
-/* Count STOP_BIDI_STREAM + RESET_BIDI_STREAM for `ref`, draining all actions. */
+/* The profiles must no longer emit the legacy half-action kinds. */
+static int g_legacy_half_actions;
+
+/* Count cancellation teardown for `ref`, draining all actions. The
+ * cancellation is ONE whole-stream abort, counted into both out-params;
+ * the legacy half-action kinds must no longer appear at all. */
 static void count_cancel_actions(moq_session_t *s, moq_stream_ref_t ref,
                                  int *stops, int *resets)
 {
     *stops = 0; *resets = 0;
     moq_action_t a;
     while (moq_session_poll_actions(s, &a, 1) > 0) {
-        if (a.kind == MOQ_ACTION_STOP_BIDI_STREAM &&
-            a.u.stop_bidi_stream.stream_ref._v == ref._v) (*stops)++;
-        if (a.kind == MOQ_ACTION_RESET_BIDI_STREAM &&
-            a.u.reset_bidi_stream.stream_ref._v == ref._v) (*resets)++;
+        if (a.kind == MOQ_ACTION_ABORT_BIDI_STREAM &&
+            a.u.abort_bidi_stream.stream_ref._v == ref._v) {
+            (*stops)++;
+            (*resets)++;
+        }
+        if (a.kind == MOQ_ACTION_STOP_BIDI_STREAM ||
+            a.kind == MOQ_ACTION_RESET_BIDI_STREAM)
+            g_legacy_half_actions++;
         moq_action_cleanup(&a);
     }
 }
@@ -285,11 +294,11 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == Preflight: 0x33 cancel needs 2 actions (STOP+RESET); with only one ==
-     *  free action slot it returns WOULD_BLOCK with nothing surfaced and the
-     *  request intact, then commits once a slot is freed. */
+    /* == Preflight: the 0x33 cancel needs ONE action slot (the whole-stream
+     *  ABORT); with zero free slots it returns WOULD_BLOCK with nothing
+     *  surfaced and the request intact, then commits once a slot frees. */
     {
-        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_CLIENT, 0, 2);
+        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_CLIENT, 0, 1);
         moq_stream_ref_t ref = open_subscribe(s);   /* drains its OPEN_BIDI */
         /* A second subscribe (distinct track) leaves its OPEN_BIDI queued,
          * occupying one of the two action slots. */

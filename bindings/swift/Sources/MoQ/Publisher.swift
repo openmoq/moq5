@@ -165,8 +165,15 @@ public final class Publisher {
 
     /// Write a complete object to all subscribers of a track.
     /// The facade manages subgroup lifecycle internally.
-    /// The payload Buffer is retained by the session until the
-    /// action is polled; the caller keeps its own reference.
+    /// Ownership: on success the payload Buffer is retained by the session
+    /// until the action is polled. On `wouldBlock` the facade RETAINS a
+    /// payload/properties snapshot until the operation completes, and the
+    /// retry must be byte-identical -- a fresh Buffer with the same bytes
+    /// resumes, changed bytes throw `wrongState`. From Swift the only ways
+    /// out of a pending operation are completing that retry or tearing the
+    /// publisher/session down (the C tier's per-track abandonment,
+    /// moq_pub_reset_group, is not yet surfaced here -- a known binding
+    /// gap). The caller keeps its own reference.
     public func writeObject(
         to track: PublisherTrack,
         groupID: UInt64,
@@ -180,8 +187,14 @@ public final class Publisher {
     }
 
     /// Write an object with full configuration (properties, datagram,
-    /// status, end-of-group). Payload and properties Buffers are
-    /// retained by the session until actions are polled.
+    /// status, end-of-group). Ownership: on success the payload/properties
+    /// Buffers are retained by the session until actions are polled; on
+    /// `wouldBlock` the facade retains a snapshot until the operation
+    /// completes, and the retry must be byte-identical (fresh Buffer with
+    /// same bytes resumes; changed bytes throw `wrongState`). Completing
+    /// the retry or tearing the publisher/session down are the only Swift-
+    /// visible ways out of a pending operation (per-track abandonment is a
+    /// known binding gap).
     public func writeObject(
         to track: PublisherTrack,
         _ config: PublishObjectConfiguration,
@@ -192,7 +205,10 @@ public final class Publisher {
         }
 
         var cfg = moq_pub_object_cfg_t()
-        moq_pub_object_cfg_init(&cfg)
+        /* Sized init: end_of_group below is an appended tail field the
+         * frozen pointer-init deliberately leaves disabled. */
+        moq_pub_object_cfg_init_sized(&cfg,
+            MemoryLayout<moq_pub_object_cfg_t>.size)
         cfg.group_id = config.groupID
         cfg.object_id = config.objectID
         cfg.payload = config.payload?.raw

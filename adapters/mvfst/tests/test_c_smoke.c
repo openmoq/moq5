@@ -8,8 +8,10 @@
 #include <moq/mvfst.h>
 #include <stdio.h>
 
-static int pump_noop(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_noop(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 1;
 }
@@ -28,7 +30,7 @@ int main(void)
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     cfg.host = "127.0.0.1";
     cfg.port = 4433;
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
 

@@ -13,6 +13,8 @@
 #include <moq/control_d18.h>
 #include <moq/sim.h>
 #include "test_support.h"
+#include "../support/failpoint.h"
+#include "../support/txn_snapshot.h"
 #include "../../core/src/session/session_internal.h"
 
 /* -- Codec round-trips and malformed rejection --------------------- */
@@ -272,19 +274,328 @@ static bool action_has_msg(moq_session_t *s, moq_stream_ref_t ref,
     return seen;
 }
 
-/* Count queued RESET/STOP actions on `ref`. */
+/* The profiles must no longer emit the legacy half-action kinds. */
+static int g_legacy_half_actions;
+
+/* Count queued teardown actions on `ref`: cancellation is ONE whole-stream
+ * abort (counted into BOTH out-params so existing expectations of "reset
+ * and stop happened" keep meaning "the request stream was torn down");
+ * the legacy half-action kinds must no longer be emitted at all. */
 static void count_teardown(moq_session_t *s, moq_stream_ref_t ref,
                            int *resets, int *stops)
 {
     *resets = 0; *stops = 0;
     moq_action_t act;
     while (moq_session_poll_actions(s, &act, 1) > 0) {
-        if (act.kind == MOQ_ACTION_RESET_BIDI_STREAM &&
-            act.u.reset_bidi_stream.stream_ref._v == ref._v) (*resets)++;
-        if (act.kind == MOQ_ACTION_STOP_BIDI_STREAM &&
-            act.u.stop_bidi_stream.stream_ref._v == ref._v) (*stops)++;
+        if (act.kind == MOQ_ACTION_ABORT_BIDI_STREAM &&
+            act.u.abort_bidi_stream.stream_ref._v == ref._v) {
+            (*resets)++;
+            (*stops)++;
+        }
+        /* the profiles emit no legacy half-actions anymore */
+        if (act.kind == MOQ_ACTION_RESET_BIDI_STREAM ||
+            act.kind == MOQ_ACTION_STOP_BIDI_STREAM)
+            g_legacy_half_actions++;
         moq_action_cleanup(&act);
     }
+}
+
+/* -- Failpoint fixtures and hooks: the NAMESPACE response op on the
+ * draft-18 request-stream route. The oracle mirrors the draft-16 suite's
+ * (the handler is shared); only the wire route differs. */
+
+/* Occupancy across all seven request/subscription pools; request-id
+ * sequence counters are profile-private, and this operation consumes no
+ * request id at all. */
+static int p18ns_registry_busy(const moq_session_t *s)
+{
+    int n = 0;
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].state != MOQ_SUB_FREE) n++;
+    for (size_t i = 0; i < s->fetch_cap; i++)
+        if (s->fetches[i].state != MOQ_FETCH_FREE) n++;
+    for (size_t i = 0; i < s->ann_cap; i++)
+        if (s->announcements[i].state != MOQ_ANN_FREE) n++;
+    for (size_t i = 0; i < s->ts_cap; i++)
+        if (s->track_statuses[i].state != MOQ_TS_FREE) n++;
+    for (size_t i = 0; i < s->pub_cap; i++)
+        if (s->publishes[i].state != MOQ_PUB_FREE) n++;
+    for (size_t i = 0; i < s->ns_sub_cap; i++)
+        if (s->ns_subs[i].state != MOQ_NS_SUB_FREE) n++;
+    for (size_t i = 0; i < s->track_sub_cap; i++)
+        if (s->track_subs[i].state != MOQ_TRACK_SUB_FREE) n++;
+    return n;
+}
+
+/* Mutation-inventory hook: tracker presence/identity/flag, buffered
+ * response bytes, send cursor, pool occupancy. The tracked set's interior
+ * scalars are a private type, covered by the receive budget (generic
+ * snapshot) without layout assumptions. */
+typedef struct p18ns_hook_state {
+    bool        tracker_present;
+    const void *tracker;          /* same-run identity; not cross-run */
+    bool        tracker_inbound;
+    size_t      recv_len;
+    size_t      send_len;
+    int         registry_busy;
+} p18ns_hook_state_t;
+
+typedef struct p18ns_hook_ctx {
+    int      slot;
+    uint64_t h_opaque;   /* run-portable handle normalization */
+} p18ns_hook_ctx_t;
+
+static void p18ns_hook_capture(const moq_session_t *s, void *vctx, void *vst)
+{
+    const p18ns_hook_ctx_t *ctx = (const p18ns_hook_ctx_t *)vctx;
+    p18ns_hook_state_t *st = (p18ns_hook_state_t *)vst;
+    memset(st, 0, sizeof(*st));
+    const void *set = s->ns_subs[ctx->slot].announced_suffixes;
+    st->tracker_present = set != NULL;
+    st->tracker = set;
+    st->tracker_inbound = s->ns_subs[ctx->slot].announced_suffixes_inbound;
+    st->recv_len = s->ns_subs[ctx->slot].recv_len;
+    st->send_len = s->send_len;
+    st->registry_busy = p18ns_registry_busy(s);
+}
+
+static int p18ns_hook_check(const moq_session_t *s, void *vctx,
+                            const void *vst)
+{
+    const p18ns_hook_state_t *want = (const p18ns_hook_state_t *)vst;
+    p18ns_hook_state_t now;
+    p18ns_hook_capture(s, vctx, &now);
+    int bad = 0;
+#define P18_HF(f, fmt) do { \
+        if (now.f != want->f) { \
+            fprintf(stderr, "TXN p18ns-hook: " #f " " fmt ", expected " fmt \
+                    "\n", now.f, want->f); \
+            bad++; \
+        } \
+    } while (0)
+    P18_HF(tracker_present, "%d");
+    P18_HF(tracker, "%p");
+    P18_HF(tracker_inbound, "%d");
+    P18_HF(recv_len, "%zu");
+    P18_HF(send_len, "%zu");
+    P18_HF(registry_busy, "%d");
+#undef P18_HF
+    return bad;
+}
+
+/* Cross-run: values only, pointer identity differs between runs. */
+static int p18ns_hook_check_values(const moq_session_t *s, void *vctx,
+                                   const void *vst)
+{
+    const p18ns_hook_state_t *want = (const p18ns_hook_state_t *)vst;
+    p18ns_hook_state_t now;
+    p18ns_hook_capture(s, vctx, &now);
+    int bad = 0;
+#define P18_HF(f, fmt) do { \
+        if (now.f != want->f) { \
+            fprintf(stderr, "TXN p18ns-final: " #f " " fmt ", expected " \
+                    fmt "\n", now.f, want->f); \
+            bad++; \
+        } \
+    } while (0)
+    P18_HF(tracker_present, "%d");
+    P18_HF(tracker_inbound, "%d");
+    P18_HF(recv_len, "%zu");
+    P18_HF(send_len, "%zu");
+    P18_HF(registry_busy, "%d");
+#undef P18_HF
+    return bad;
+}
+
+/* Full-semantics event normalizer: handle linkage plus the complete
+ * suffix structure. An unnormalized kind is a test failure. */
+static bool p18ns_norm_event(const moq_event_t *ev, void *vctx,
+                             txs_norm_vec_t *out)
+{
+    const p18ns_hook_ctx_t *ctx = (const p18ns_hook_ctx_t *)vctx;
+    txs_img_t img;
+    txs_img_init(&img);
+    switch (ev->kind) {
+    case MOQ_EVENT_NAMESPACE_FOUND:
+    case MOQ_EVENT_NAMESPACE_GONE: {
+        const moq_namespace_t *ns =
+            ev->kind == MOQ_EVENT_NAMESPACE_FOUND
+                ? &ev->u.namespace_found.track_namespace_suffix
+                : &ev->u.namespace_gone.track_namespace_suffix;
+        uint64_t handle = ev->kind == MOQ_EVENT_NAMESPACE_FOUND
+                ? ev->u.namespace_found.handle._opaque
+                : ev->u.namespace_gone.handle._opaque;
+        txs_img_u64(&img, handle == ctx->h_opaque);
+        txs_img_u64(&img, (uint64_t)ns->count);
+        for (size_t i = 0; i < ns->count; i++)
+            txs_img_bytes(&img, ns->parts[i].data, ns->parts[i].len);
+        break;
+    }
+    case MOQ_EVENT_NS_SUB_OK:
+        txs_img_u64(&img, ev->u.ns_sub_ok.handle._opaque == ctx->h_opaque);
+        break;
+    default:
+        fprintf(stderr, "TXN p18ns-norm: unnormalized event kind %d\n",
+                (int)ev->kind);
+        return false;
+    }
+    return txs_norm_append_img(out, (uint64_t)ev->kind, &img);
+}
+
+static bool p18ns_norm_action(const moq_action_t *a, void *vctx,
+                              txs_norm_vec_t *out)
+{
+    (void)vctx;
+    txs_img_t img;
+    txs_img_init(&img);
+    switch (a->kind) {
+    case MOQ_ACTION_OPEN_BIDI_STREAM:
+        txs_img_u64(&img, a->u.open_bidi_stream.stream_ref._v);
+        txs_img_u64(&img, a->u.open_bidi_stream.fin);
+        txs_img_bytes(&img, a->u.open_bidi_stream.data,
+                      a->u.open_bidi_stream.len);
+        break;
+    case MOQ_ACTION_SEND_BIDI_STREAM:
+        txs_img_u64(&img, a->u.send_bidi_stream.stream_ref._v);
+        txs_img_u64(&img, a->u.send_bidi_stream.fin);
+        txs_img_bytes(&img, a->u.send_bidi_stream.data,
+                      a->u.send_bidi_stream.len);
+        break;
+    case MOQ_ACTION_CLOSE_BIDI_STREAM:
+        txs_img_u64(&img, a->u.close_bidi_stream.stream_ref._v);
+        break;
+    default:
+        fprintf(stderr, "TXN p18ns-norm: unnormalized action kind %d\n",
+                (int)a->kind);
+        return false;
+    }
+    return txs_norm_append_img(out, 0x1000u + (uint64_t)a->kind, &img);
+}
+
+static txs_op_hooks_t p18ns_make_hooks(p18ns_hook_ctx_t *hctx)
+{
+    txs_op_hooks_t h;
+    memset(&h, 0, sizeof(h));
+    h.ctx = hctx;
+    h.capture = p18ns_hook_capture;
+    h.check = p18ns_hook_check;
+    h.check_values = p18ns_hook_check_values;
+    h.normalize_event = p18ns_norm_event;
+    h.normalize_action = p18ns_norm_action;
+    return h;
+}
+
+static int p18ns_collect_output(moq_session_t *c, const txs_op_hooks_t *h,
+                                txs_norm_vec_t *out)
+{
+    int bad = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(c, &ev, 1) > 0) {
+        if (!h->normalize_event(&ev, h->ctx, out)) bad++;
+        moq_event_cleanup(&ev);
+    }
+    moq_action_t a;
+    while (moq_session_poll_actions(c, &a, 1) > 0) {
+        if (!h->normalize_action(&a, h->ctx, out)) bad++;
+        moq_action_cleanup(&a);
+    }
+    return bad;
+}
+
+/* One draft-18 client with an established namespace subscription on the
+ * failpoint allocator. tiny_events keeps the scratch-free NS_SUB_OK queued
+ * in a one-slot queue (the pre-admission state); otherwise it is drained. */
+typedef struct p18ns_fx {
+    fp_alloc_state_t fs;
+    moq_session_t *c;
+    moq_ns_sub_handle_t h;
+    moq_stream_ref_t ref;
+    int slot;
+} p18ns_fx_t;
+
+static int p18ns_fx_setup(p18ns_fx_t *f, bool tiny_events)
+{
+    memset(f, 0, sizeof(*f));
+    moq_alloc_t alloc = fp_allocator(&f->fs);
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), &alloc,
+                               MOQ_PERSPECTIVE_CLIENT);
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    if (tiny_events) cfg.max_events = 1;
+    if (moq_session_create(&cfg, 0, &f->c) < 0) return 1;
+    if (moq_session_start(f->c, 0) < 0) return 1;
+    moq_action_t a;
+    while (moq_session_poll_actions(f->c, &a, 1) > 0) moq_action_cleanup(&a);
+    uint8_t setup[16];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, setup, sizeof(setup));
+    moq_d18_encode_setup(&w);
+    moq_session_on_control_bytes(f->c, setup, moq_buf_writer_offset(&w), 0);
+    moq_event_t ev;
+    while (moq_session_poll_events(f->c, &ev, 1) > 0) moq_event_cleanup(&ev);
+
+    moq_subscribe_namespace_cfg_t nc;
+    moq_subscribe_namespace_cfg_init(&nc);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    nc.track_namespace_prefix = (moq_namespace_t){ parts, 1 };
+    nc.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+    if (moq_session_subscribe_namespace(f->c, &nc, 0, &f->h) != MOQ_OK)
+        return 1;
+    f->ref = (moq_stream_ref_t){ 0 };
+    while (moq_session_poll_actions(f->c, &a, 1) > 0) {
+        if (a.kind == MOQ_ACTION_OPEN_BIDI_STREAM)
+            f->ref = a.u.open_bidi_stream.stream_ref;
+        moq_action_cleanup(&a);
+    }
+    if (f->ref._v == 0) return 1;
+
+    uint8_t ok[32];
+    moq_buf_writer_t ow;
+    moq_buf_writer_init(&ow, ok, sizeof(ok));
+    if (moq_d18_encode_request_ok(&ow) != MOQ_OK) return 1;
+    if (moq_session_on_bidi_stream_bytes(f->c, f->ref, ok,
+            moq_buf_writer_offset(&ow), false, 0) != MOQ_OK)
+        return 1;
+    if (!tiny_events) {
+        while (moq_session_poll_events(f->c, &ev, 1) > 0)
+            moq_event_cleanup(&ev);
+    }
+    f->slot = moq_index_find(f->c->idx_ns_by_ref, f->c->idx_ns_mask,
+                             f->ref._v);
+    return f->slot < 0;
+}
+
+static size_t p18ns_encode_namespace(uint8_t *buf, size_t cap,
+                                     const char *field)
+{
+    uint8_t payload[64];
+    moq_buf_writer_t pw;
+    moq_buf_writer_init(&pw, payload, sizeof(payload));
+    moq_bytes_t parts[] = { { (const uint8_t *)field, strlen(field) } };
+    moq_namespace_t ns = { parts, 1 };
+    moq_buf_write_namespace_prefix(&pw, &ns);
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_control_encode_envelope(&w, MOQ_D18_NAMESPACE, payload,
+                                (uint16_t)moq_buf_writer_offset(&pw));
+    return moq_buf_writer_offset(&w);
+}
+
+static int p18ns_fx_teardown(p18ns_fx_t *f, const char *op)
+{
+    int bad = 0;
+    moq_event_t ev; moq_action_t a;
+    while (moq_session_poll_events(f->c, &ev, 1) > 0) moq_event_cleanup(&ev);
+    while (moq_session_poll_actions(f->c, &a, 1) > 0) moq_action_cleanup(&a);
+    bad += fp_sticky_clean(&f->fs, op);
+    moq_session_destroy(f->c);
+    if (f->fs.balance != 0 || f->fs.live_bytes != 0 || f->fs.table_len != 0) {
+        fprintf(stderr, "FAILPOINT %s: destroy left balance %lld, live %lld, "
+                "table %zu\n", op, (long long)f->fs.balance,
+                (long long)f->fs.live_bytes, f->fs.table_len);
+        bad++;
+    }
+    return bad;
 }
 
 int main(void)
@@ -1048,6 +1359,164 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(count_busy_subs(s), 0);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
+    }
+
+    /* == Suffix-tracker allocation failure is transactional (parity) ==
+     * The transactional NOMEM contract for inbound NAMESPACE handling is
+     * swept per-origin on draft-16; the handler is shared, so ONE origin
+     * here -- the tracker, the first allocation behind the event gate --
+     * runs the SAME oracle through the draft-18 request-stream route:
+     * declared signature and outcome row, pre-admitted empty-re-feed
+     * equality (map, generic snapshot, hooks), reached-ordinal and prefix
+     * agreement, then a recovery whose allocation sequence, ordered
+     * normalized output, final snapshot, hook values and footprint all
+     * equal a no-fault draft-18 baseline.
+     *
+     * Mutation inventory: identical to the draft-16 suite's -- tracker
+     * pointer + inbound flag, buffered response bytes, receive budget,
+     * event queue + scratch; entry state/generation, actions, occupancy
+     * and request-id consumption must never move. */
+    {
+        static const fp_expect_t k_first_sig[4] = {
+            { FP_ALLOC, FP_SIZE_EXACT, 8, 0 },      /* canonical key */
+            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tracker (private) */
+            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy */
+            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* key array (private) */
+        };
+        static const fp_outcome_row_t k_first_out[4] = {
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+            { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
+        };
+        const uint64_t k = 2;   /* the tracker ordinal */
+        MOQ_TEST_CHECK(k_first_out[k - 1].phase == FP_PHASE_PRE_COMMIT);
+        MOQ_TEST_CHECK(k_first_out[k - 1].outcome == FP_NOMEM_RETAIN);
+
+        fp_attempt_t   base_log[FP_LOG_CAP];
+        txs_norm_vec_t base_out;
+        txs_snapshot_t base_final;
+        p18ns_hook_state_t base_hook;
+        fp_delta_t     base_delta;
+        size_t         base_budget_delta = 0;
+        txs_norm_init(&base_out);
+
+        /* Baseline: the un-failed operation on this route. */
+        {
+            p18ns_fx_t f;
+            MOQ_TEST_CHECK(p18ns_fx_setup(&f, false) == 0);
+            p18ns_hook_ctx_t hctx = { f.slot, f.h._opaque };
+            txs_op_hooks_t hooks = p18ns_make_hooks(&hctx);
+
+            fp_map_snap_t pre_op;
+            fp_map_capture(&f.fs, &pre_op);
+            size_t budget0 = f.c->recv_payload_bytes;
+            uint8_t msg[128];
+            size_t mlen = p18ns_encode_namespace(msg, sizeof(msg), "found");
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg, mlen,
+                                                      false, 0),
+                (int)MOQ_OK);
+            failures += fp_check_signature(&f.fs, 0, k_first_sig, 4,
+                                           "p18ns-baseline");
+            memcpy(base_log, f.fs.log, f.fs.log_len * sizeof(fp_attempt_t));
+            MOQ_TEST_CHECK_EQ_SIZE(
+                sizeof(k_first_out) / sizeof(k_first_out[0]), f.fs.log_len);
+
+            failures += p18ns_collect_output(f.c, &hooks, &base_out);
+            txs_capture(f.c, &f.ref, 1, &base_final);
+            hooks.capture(f.c, hooks.ctx, &base_hook);
+            fp_delta_compute(&f.fs, &pre_op, &base_delta);
+            base_budget_delta = f.c->recv_payload_bytes - budget0;
+            MOQ_TEST_CHECK(base_budget_delta > 0);
+            failures += p18ns_fx_teardown(&f, "p18ns-baseline");
+        }
+
+        /* The swept origin, pre-admitted, with its own recovery cycle. */
+        {
+            p18ns_fx_t f;
+            MOQ_TEST_CHECK(p18ns_fx_setup(&f, true) == 0);
+            p18ns_hook_ctx_t hctx = { f.slot, f.h._opaque };
+            txs_op_hooks_t hooks = p18ns_make_hooks(&hctx);
+            MOQ_TEST_CHECK(event_queue_full(f.c));
+
+            fp_map_snap_t pre_feed;
+            fp_map_capture(&f.fs, &pre_feed);
+            uint8_t msg[128];
+            size_t mlen = p18ns_encode_namespace(msg, sizeof(msg), "found");
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, msg, mlen,
+                                                      false, 0),
+                (int)MOQ_ERR_WOULD_BLOCK);
+            failures += fp_map_equals(&f.fs, &pre_feed, "p18ns-preadmit");
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].recv_len > 0);
+
+            moq_event_t ev;
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NS_SUB_OK);
+            moq_event_cleanup(&ev);
+            MOQ_TEST_CHECK_EQ_SIZE(f.c->event_scratch_len, 0u);
+
+            fp_map_snap_t m0;
+            fp_map_capture(&f.fs, &m0);
+            txs_snapshot_t s0;
+            txs_capture(f.c, &f.ref, 1, &s0);
+            p18ns_hook_state_t h0;
+            hooks.capture(f.c, hooks.ctx, &h0);
+            size_t budget0 = f.c->recv_payload_bytes;
+
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+            f.fs.fail_at = f.fs.call_count + k;
+            moq_result_t rc = moq_session_on_bidi_stream_bytes(
+                f.c, f.ref, NULL, 0, false, 0);
+            fp_context("p18ns-sweep", k, 4, &f.fs);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK_EQ_U64(f.fs.call_count, f.fs.fail_at);
+            f.fs.fail_at = 0;
+            failures += fp_check_prefix(&f.fs, 0, base_log, (size_t)k,
+                                        "p18ns-sweep");
+            failures += fp_map_equals(&f.fs, &m0, "p18ns-sweep");
+            failures += txs_check_eq(f.c, &f.ref, 1, &s0, "p18ns-sweep");
+            failures += hooks.check(f.c, hooks.ctx, &h0);
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].announced_suffixes == NULL);
+            MOQ_TEST_CHECK(moq_session_poll_events(f.c, &ev, 1) == 0);
+            moq_action_t no_act;
+            MOQ_TEST_CHECK(moq_session_poll_actions(f.c, &no_act, 1) == 0);
+
+            /* Recovery against a NEW window: the sequence, not just the
+             * footprint, must equal the baseline's. */
+            f.fs.log_from = f.fs.call_count;
+            f.fs.log_len = 0;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(f.c, f.ref, NULL, 0,
+                                                      false, 0),
+                (int)MOQ_OK);
+            failures += fp_check_signature(&f.fs, 0, k_first_sig, 4,
+                                           "p18ns-recovery");
+            failures += fp_check_prefix(&f.fs, 0, base_log, 4,
+                                        "p18ns-recovery");
+            txs_norm_vec_t out;
+            txs_norm_init(&out);
+            failures += p18ns_collect_output(f.c, &hooks, &out);
+            failures += txs_norm_equals(&out, &base_out, "p18ns-recovery");
+            txs_norm_free(&out);
+
+            txs_snapshot_t expect = base_final;
+            expect.recv_payload_bytes = budget0 + base_budget_delta;
+            failures += txs_check_eq(f.c, &f.ref, 1, &expect, "p18ns-final");
+            failures += hooks.check_values(f.c, hooks.ctx, &base_hook);
+            fp_delta_t delta;
+            fp_delta_compute(&f.fs, &m0, &delta);
+            failures += fp_delta_equals(&delta, &base_delta,
+                                        "p18ns-recovery");
+            MOQ_TEST_CHECK(f.c->ns_subs[f.slot].announced_suffixes != NULL);
+            failures += p18ns_fx_teardown(&f, "p18ns-sweep");
+        }
+
+        txs_norm_free(&base_out);
     }
 
     MOQ_TEST_PASS("d18_subscribe_namespace");

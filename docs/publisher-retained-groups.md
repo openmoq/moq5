@@ -144,7 +144,7 @@ moq_pub_retained_object_t retained[2] = {
 
 for (size_t i = 0; i < 2; i++) {
     moq_pub_object_cfg_t obj;
-    moq_pub_object_cfg_init(&obj);
+    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
     obj.group_id = catalog_group_id;
     obj.object_id = retained[i].object_id;
     obj.payload = retained[i].payload;

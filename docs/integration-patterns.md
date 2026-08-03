@@ -9,7 +9,7 @@ playback pipeline.
 ```
 App / player thread              Network thread (picoquic)
 ───────────────────              ─────────────────────────
-                                 on_pump():
+                                 on_lane_pump():
 enqueue publish request            dequeue + write objects
 moq_pq_threaded_wake() ────────→   moq_pub_write_object_ex
                                    moq_pub_tick
@@ -27,10 +27,10 @@ application-level queues.
 
 | Callback | Thread | May call libmoq APIs? |
 |----------|--------|-----------------------|
-| `on_pump` | Network | Yes — the intended call site |
+| `on_lane_pump` | Network | Yes — the intended call site |
 | `on_activity` | Network | No — signal only |
 
-`on_pump` runs between `moq_pq_service` calls. Create facades,
+`on_lane_pump` runs between `moq_pq_service` calls. Create facades,
 tick them, publish/poll objects here. Return 0 to continue,
 nonzero to request clean shutdown.
 
@@ -42,7 +42,7 @@ Neither callback may call `moq_pq_threaded_stop`.
 moq_pq_threaded_create(&cfg, &t);   // start network thread
 
 while (!done) {
-    moq_pq_threaded_wake(t);        // ask on_pump to run
+    moq_pq_threaded_wake(t);        // ask on_lane_pump to run
     moq_pq_threaded_wait(t, timeout_us);
     // process results from app queue
 }
@@ -57,10 +57,11 @@ moq_pq_threaded_destroy(t);         // free resources
 The receiver subscribes to tracks, receives MoQ objects, parses
 them into media samples, and pushes samples to the app thread.
 
-### on_pump implementation
+### on_lane_pump implementation
 
 ```c
-int receiver_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
+int receiver_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+              uint64_t now, void *ctx) {
     receiver_t *rx = ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
@@ -152,7 +153,7 @@ while (!done) {
 `moq_media_object_parse` is a stateless, sans-I/O function that
 extracts timestamps, keyframe flags, and sample data from raw MoQ
 objects based on LOC properties and CMAF packaging. It runs on
-the network thread inside `on_pump`.
+the network thread inside `on_lane_pump`.
 
 ```c
 /* Set up track info from an MSF catalog entry (recommended). */
@@ -198,7 +199,7 @@ shedding, and DTS monotonicity enforcement, the `moq_playback_t`
 pipeline wraps the normalizer with stateful track management:
 
 ```c
-/* Create pipeline in on_pump after subscribing. */
+/* Create pipeline in on_lane_pump after subscribing. */
 moq_playback_cfg_t pcfg; moq_playback_cfg_init(&pcfg);
 pcfg.max_samples_per_object = 30;
 if (moq_playback_create(rx->alloc, &pcfg, &rx->playback) != MOQ_OK)
@@ -211,7 +212,7 @@ ptc.timescale  = 90000;
 if (moq_playback_add_track(rx->playback, &ptc, &rx->pb_track) != MOQ_OK)
     return 1;
 
-/* Feed objects in on_pump. */
+/* Feed objects in on_lane_pump. */
 moq_playback_push_sub_object(rx->playback, rx->pb_track,
     &sub_object, now);  /* returns MOQ_OK or error */
 
@@ -231,10 +232,11 @@ while (moq_playback_poll_command(rx->playback, &cmd) == MOQ_OK) {
 The publisher receives media from the app thread via a queue,
 encodes it as MoQ objects, and writes them on the network thread.
 
-### on_pump implementation
+### on_lane_pump implementation
 
 ```c
-int publisher_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
+int publisher_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+              uint64_t now, void *ctx) {
     publisher_t *px = ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
@@ -289,7 +291,7 @@ int publisher_pump(moq_pq_threaded_t *t, uint64_t now, void *ctx) {
     write_request_t req;
     while (app_queue_pop(&px->write_queue, &req)) {
         moq_pub_object_cfg_t obj;
-        moq_pub_object_cfg_init(&obj);
+        moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
         obj.group_id   = req.group_id;
         obj.object_id  = req.object_id;
         obj.payload    = req.payload;
@@ -334,7 +336,7 @@ moq_pq_threaded_wake(t);
 ```
 
 The app thread transfers its owned rcbuf refs to the queue.
-The network thread's `on_pump` owns them from that point and
+The network thread's `on_lane_pump` owns them from that point and
 decrefs after `write_object_ex` succeeds, or on permanent error.
 On `WOULD_BLOCK`, refs stay with the requeued request.
 Zero-copy through the entire path.

@@ -79,30 +79,22 @@ static moq_result_t ann_queue_resp(moq_session_t *s, size_t slot,
 }
 
 /* Stream-correlated local teardown of an announce request bidi (§3.3.2): cancel
- * both still-open directions with STOP + RESET, retire the ref via the drain ring
+ * the request stream with ONE whole-stream abort, retire the ref via the drain ring
  * (so a late in-flight response is discarded rather than mistaken for a fresh
  * request), and free the entry. Reserves all capacity before mutating. */
 static moq_result_t ann_local_teardown(moq_session_t *s, size_t slot)
 {
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
     if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = s->announcements[slot].request_stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_STOP_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_stop_bidi_stream_action_t);
+    a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+    a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
     a.borrow_epoch = s->borrow_epoch;
-    a.u.stop_bidi_stream.stream_ref = ref;
-    a.u.stop_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
+    a.u.abort_bidi_stream.stream_ref = ref;
+    a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
     moq_result_t rc = push_action(s, &a);
-    if (rc < 0) return rc;
-    memset(&a, 0, sizeof(a));
-    a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
-    a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
-    a.borrow_epoch = s->borrow_epoch;
-    a.u.reset_bidi_stream.stream_ref = ref;
-    a.u.reset_bidi_stream.error_code = 0x1;
-    rc = push_action(s, &a);
     if (rc < 0) return rc;
     if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
     ann_free_entry(s, slot);
@@ -260,26 +252,6 @@ static uint8_t *build_ns_id(moq_session_t *s,
     return buf;
 }
 
-/* Copy namespace parts into output scratch. */
-static bool event_scratch_copy_ns(moq_session_t *s,
-                              const moq_namespace_t *src,
-                              moq_namespace_t *dst)
-{
-    moq_bytes_t *parts = (moq_bytes_t *)event_scratch_alloc_aligned(s, src->count * sizeof(moq_bytes_t), _Alignof(moq_bytes_t));
-    if (!parts) return false;
-
-    for (size_t i = 0; i < src->count; i++) {
-        uint8_t *data = event_scratch_copy(s, src->parts[i].data, src->parts[i].len);
-        if (!data && src->parts[i].len > 0) return false;
-        parts[i].data = data;
-        parts[i].len  = src->parts[i].len;
-    }
-
-    dst->parts = parts;
-    dst->count = src->count;
-    return true;
-}
-
 /* -- Incoming PUBLISH_NAMESPACE handler (semantic) ------------------ */
 
 moq_result_t session_core_on_publish_namespace(moq_session_t *s,
@@ -373,7 +345,7 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
     }
 
     moq_namespace_t ev_ns;
-    if (!event_scratch_copy_ns(s, &d->track_namespace, &ev_ns)) {
+    if (!event_scratch_copy_namespace(s, &d->track_namespace, &ev_ns)) {
         if (scratch_saved == 0) {
             result = close_with_error(s, 0x1,
                 "event scratch permanently too small");
@@ -603,7 +575,9 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
             MOQ_REQUEST_FAMILY_ANNOUNCEMENT, entry->handle._opaque, redirect,
             d->error_code, d->can_retry, d->retry_after_ms,
             d->reason, d->reason_len);
-        if (rc < 0) return rc;
+        /* The emitter reports a terminal close as MOQ_OK, so the teardown below
+         * runs only while the session is still open. */
+        if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     } else {
         moq_bytes_t reason = {0};
         if (d->reason_len > 0) {

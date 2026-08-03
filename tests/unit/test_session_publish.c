@@ -1817,6 +1817,91 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(alloc_state.balance, 0);
     }
 
+    /* == REQUEST_UPDATE with SUBSCRIPTION_FILTER applies (PUBLISH) ==== */
+    {
+        test_alloc_state_t alloc_state = {0};
+        moq_alloc_t alloc = test_allocator(&alloc_state);
+
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+
+        /* Client publishes and server accepts. */
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_namespace_t ns = { ns_parts, 1 };
+        moq_publish_cfg_t pcfg;
+        moq_publish_cfg_init(&pcfg);
+        pcfg.track_namespace = ns;
+        pcfg.track_name = MOQ_BYTES_LITERAL("t");
+
+        moq_publication_t pub_h;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_publish(c, &pcfg, 1000, &pub_h),
+            (int)MOQ_OK);
+        pump_actions_to_peer(c, sv, 1000);
+        moq_event_t ev;
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        moq_accept_publish_cfg_t acfg;
+        moq_accept_publish_cfg_init(&acfg);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_publish(sv,
+            ev.u.publish_request.pub, &acfg, 2000), (int)MOQ_OK);
+        pump_actions_to_peer(sv, c, 2000);
+        moq_session_poll_events(c, &ev, 1);
+
+        /* Subscriber (sv) narrows the PUBLISH-established subscription with
+         * a SUBSCRIPTION_FILTER (§9.2.2.5: allowed on a REQUEST_UPDATE for
+         * a subscription). */
+        uint8_t wire[128];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, wire, sizeof(wire));
+        uint8_t filt_buf[32];
+        size_t filt_len = 0;
+        moq_d16_subscription_filter_t filt = {
+            .filter_type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START,
+            .start_group = 7, .start_object = 2,
+        };
+        MOQ_TEST_CHECK(moq_d16_encode_subscription_filter(filt_buf,
+            sizeof(filt_buf), &filt_len, &filt) == MOQ_OK);
+        moq_kvp_entry_t params[1] = {
+            { .type = MOQ_MSG_PARAM_SUBSCRIPTION_FILTER,
+              .value = filt_buf, .value_len = filt_len, .is_varint = false },
+        };
+        moq_d16_encode_request_update(&w, 1, 0, params, 1);
+
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_control_bytes(c, wire,
+            moq_buf_writer_offset(&w), 3000), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
+
+        /* Publisher acknowledges with REQUEST_OK. */
+        moq_action_t acts[4];
+        size_t na = moq_session_poll_actions(c, acts, 4);
+        MOQ_TEST_CHECK(na >= 1);
+        MOQ_TEST_CHECK_EQ_INT((int)acts[0].kind, (int)MOQ_ACTION_SEND_CONTROL);
+        {
+            moq_buf_reader_t cr;
+            moq_buf_reader_init(&cr, acts[0].u.send_control.data,
+                acts[0].u.send_control.len);
+            moq_control_envelope_t env;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_control_decode_envelope(&cr, &env),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)env.msg_type, (int)MOQ_D16_REQUEST_OK);
+        }
+        for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+
+        /* PUBLISH_UPDATED surfaces the filter window. */
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.kind, (int)MOQ_EVENT_PUBLISH_UPDATED);
+        MOQ_TEST_CHECK(moq_publication_eq(ev.u.publish_updated.pub, pub_h));
+        MOQ_TEST_CHECK(ev.u.publish_updated.has_filter);
+        MOQ_TEST_CHECK(ev.u.publish_updated.filter ==
+            MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.publish_updated.start_group, 7);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.publish_updated.start_object, 2);
+        MOQ_TEST_CHECK(!ev.u.publish_updated.has_forward);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK_EQ_INT(alloc_state.balance, 0);
+    }
+
     /* == REQUEST_UPDATE for FETCH returns NOT_SUPPORTED, no close ==== */
     {
         test_alloc_state_t alloc_state = {0};
@@ -2373,7 +2458,7 @@ int main(void)
 
         moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
         moq_publish_cfg_t pcfg;
-        moq_publish_cfg_init(&pcfg);
+        moq_publish_cfg_init_sized(&pcfg, sizeof(pcfg)); /* sets the auth tail */
         pcfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
         pcfg.track_name = MOQ_BYTES_LITERAL("video");
         uint8_t tok_val[] = { 0xBB, 0xCC };
@@ -2417,7 +2502,7 @@ int main(void)
 
         moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
         moq_publish_cfg_t pcfg;
-        moq_publish_cfg_init(&pcfg);
+        moq_publish_cfg_init_sized(&pcfg, sizeof(pcfg)); /* sets the auth tail */
         pcfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
         pcfg.track_name = MOQ_BYTES_LITERAL("video");
         pcfg.auth_tokens = NULL;
@@ -2441,7 +2526,7 @@ int main(void)
 
         moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
         moq_publish_cfg_t pcfg;
-        moq_publish_cfg_init(&pcfg);
+        moq_publish_cfg_init_sized(&pcfg, sizeof(pcfg)); /* sets the auth tail */
         pcfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
         pcfg.track_name = MOQ_BYTES_LITERAL("video");
         moq_auth_token_t tok = {

@@ -1,4 +1,5 @@
 #include "test_session_support.h"
+#include "test_oom_support.h"
 #include "../../core/src/session/session_internal.h"
 #include <string.h>
 
@@ -2493,21 +2494,19 @@ int main(void)
 
     /* == Setup REGISTER retry must not hit duplicate alias ============ */
     /*
-     * Regression: d16_handle_setup_client called moq_token_cache_register
-     * before scratch_copy. If scratch_copy failed for a later token, the
-     * first token was already in the cache. On retry (recv_buf reprocessed),
-     * the first REGISTER hit DUPLICATE → spurious session close 0x14.
-     * After fix: no cache mutation before retryable failure point; retry
-     * returns the same error without spurious close.
+     * No cache mutation may precede a retryable failure: if the first REGISTER
+     * were cached before a later allocation failed, the retry would see its
+     * own alias as a duplicate and close 0x14. The pre-commit cache-value copy
+     * is made to fail, which is retryable, and the retry must reach the same
+     * outcome with the scratch cursor restored and no spurious close.
      */
     {
-        test_alloc_state_t as = {0};
-        moq_alloc_t alloc = test_allocator(&as);
+        oom_alloc_state_t os = {0};
+        moq_alloc_t alloc = { &os, oom_alloc, oom_realloc, oom_free };
 
         moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
         scfg.alloc = &alloc;
         scfg.perspective = MOQ_PERSPECTIVE_SERVER;
-        scfg.output_scratch_size = 16;
         scfg.send_auth_token_cache_size = true;
         scfg.auth_token_cache_size = 1024;
 
@@ -2531,15 +2530,43 @@ int main(void)
             },
         };
 
+        /* Fail the next allocation: the pre-commit cache-value copy, which
+         * runs after the event scratch has been staged. */
+        os.fail_at = os.alloc_count + 1;
+        size_t scratch_before = sv->event_scratch_len;
         moq_result_t rc = feed_client_setup_with_tokens(sv, tokens, 2, NULL, 0);
-        MOQ_TEST_CHECK(rc < 0);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_NOMEM);
         MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK(sv->event_scratch_len == scratch_before);
+        {   /* nothing queued or surfaced by the failed attempt */
+            moq_action_t a; moq_event_t e;
+            memset(&a, 0, sizeof(a)); memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 0);
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 0);
+        }
 
-        rc = moq_session_on_control_bytes(sv, NULL, 0, 1);
-        MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
+        /* The retained control message replays through the pending path once
+         * the allocator heals: exactly one SERVER_SETUP and one completion,
+         * and no duplicate-alias close from a half-committed cache. */
+        os.fail_at = 0;
+        rc = moq_session_process_pending(sv, 0);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
+        {
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 1);
+            MOQ_TEST_CHECK(a.kind == MOQ_ACTION_SEND_CONTROL);
+            moq_action_cleanup(&a);
+            moq_event_t e;
+            memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 1);
+            MOQ_TEST_CHECK(e.kind == MOQ_EVENT_SETUP_COMPLETE);
+            moq_event_cleanup(&e);
+        }
 
         moq_session_destroy(sv);
-        MOQ_TEST_CHECK(as.balance == 0);
+        MOQ_TEST_CHECK(os.balance == 0);
     }
 
     /* == SUBSCRIBE REGISTER retry must not hit duplicate alias ======== */
@@ -2713,6 +2740,201 @@ int main(void)
         moq_session_destroy(c);
         moq_session_destroy(sv);
         MOQ_TEST_CHECK_EQ_INT((int)as.balance, 0);
+    }
+
+    /* == SETUP token scratch: a shortfall no empty arena could hold ======
+     * The completion event's whole token requirement is classified before any
+     * of it is copied. A requirement larger than the entire arena can never be
+     * satisfied, so the session closes normally (0x1) -- it must not surface a
+     * buffer error, which bridge ingress escalates to a connection fatal. */
+    {
+        /* Nonzero bytes throughout: a NUL would fail token value validation
+         * long before the scratch requirement is considered. */
+        static uint8_t big_val[40];
+        for (size_t i = 0; i < sizeof(big_val); i++)
+            big_val[i] = (uint8_t)(0x41 + (i % 26));
+        /* USE_VALUE carries the literal without touching the token cache, so
+         * the scratch requirement is what the handler weighs. */
+        moq_d16_auth_token_t tok = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_VALUE,
+            .alias = 0,
+            .token_type = 0,
+            .token_value = big_val,
+            .token_value_len = sizeof(big_val),
+        };
+
+        /* -- CLIENT_SETUP ------------------------------------------------- */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+            cfg.alloc = &alloc;
+            cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+            cfg.output_scratch_size = 32;      /* smaller than the requirement */
+            moq_session_t *sv = NULL;
+            MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &sv) == MOQ_OK);
+
+            /* close_with_error reports MOQ_OK: the message was handled, by
+             * ending the session. */
+            moq_result_t rc = feed_client_setup_with_tokens(sv, &tok, 1, NULL, 0);
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            MOQ_TEST_CHECK(rc != MOQ_ERR_BUFFER);
+            MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+            {
+                moq_action_t a;
+                memset(&a, 0, sizeof(a));
+                MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 1);
+                MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+                MOQ_TEST_CHECK(a.u.close_session.code == 0x1);
+                MOQ_TEST_CHECK(a.u.close_session.reason.len ==
+                               strlen("event scratch permanently too small"));
+                MOQ_TEST_CHECK(memcmp(a.u.close_session.reason.data,
+                                      "event scratch permanently too small",
+                                      a.u.close_session.reason.len) == 0);
+                moq_action_cleanup(&a);
+                moq_event_t e;
+                memset(&e, 0, sizeof(e));
+                MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 1);
+                MOQ_TEST_CHECK(e.kind == MOQ_EVENT_SESSION_CLOSED);
+                moq_event_cleanup(&e);
+            }
+            moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* -- SERVER_SETUP ------------------------------------------------- */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+            cfg.alloc = &alloc;
+            cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+            cfg.output_scratch_size = 32;
+            moq_session_t *c = NULL;
+            MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &c) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_start(c, 0) == MOQ_OK);
+            {
+                moq_action_t a;
+                memset(&a, 0, sizeof(a));
+                MOQ_TEST_CHECK(moq_session_poll_actions(c, &a, 1) == 1);
+                moq_action_cleanup(&a);
+            }
+
+            moq_result_t rc = feed_server_setup_with_tokens(c, &tok, 1, NULL, 0);
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            MOQ_TEST_CHECK(rc != MOQ_ERR_BUFFER);
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+            {
+                moq_action_t a;
+                memset(&a, 0, sizeof(a));
+                MOQ_TEST_CHECK(moq_session_poll_actions(c, &a, 1) == 1);
+                MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+                MOQ_TEST_CHECK(a.u.close_session.code == 0x1);
+                MOQ_TEST_CHECK(a.u.close_session.reason.len ==
+                               strlen("event scratch permanently too small"));
+                MOQ_TEST_CHECK(memcmp(a.u.close_session.reason.data,
+                                      "event scratch permanently too small",
+                                      a.u.close_session.reason.len) == 0);
+                moq_action_cleanup(&a);
+            }
+            moq_session_destroy(c);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+    }
+
+    /* -- SERVER_SETUP: post-scratch cache allocation fails ------------
+     * The staged event bytes must be released and the retry must complete
+     * exactly once, with no half-committed cache to trip a duplicate alias. */
+    {
+        oom_alloc_state_t os = {0};
+        moq_alloc_t alloc = { &os, oom_alloc, oom_realloc, oom_free };
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        cfg.send_auth_token_cache_size = true;
+        cfg.auth_token_cache_size = 1024;
+        moq_session_t *c = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &c) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_start(c, 0) == MOQ_OK);
+        {
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            MOQ_TEST_CHECK(moq_session_poll_actions(c, &a, 1) == 1);
+            moq_action_cleanup(&a);
+        }
+
+        moq_d16_auth_token_t reg = {
+            .alias_type = MOQ_AUTH_TOKEN_REGISTER,
+            .alias = 7,
+            .token_type = 3,
+            .token_value = (const uint8_t *)"value-bytes",
+            .token_value_len = 11,
+        };
+
+        size_t scratch_before = c->event_scratch_len;
+        os.fail_at = os.alloc_count + 1;      /* the preowned cache copy */
+        moq_result_t rc = feed_server_setup_with_tokens(c, &reg, 1, NULL, 0);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK(c->event_scratch_len == scratch_before);
+        MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_SETUP_SENT);
+        {
+            moq_action_t a; moq_event_t e;
+            memset(&a, 0, sizeof(a)); memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_actions(c, &a, 1) == 0);
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &e, 1) == 0);
+        }
+
+        os.fail_at = 0;
+        MOQ_TEST_CHECK(moq_session_process_pending(c, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
+        {
+            moq_event_t e;
+            memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &e, 1) == 1);
+            MOQ_TEST_CHECK(e.kind == MOQ_EVENT_SETUP_COMPLETE);
+            moq_event_cleanup(&e);
+            moq_event_t x;
+            memset(&x, 0, sizeof(x));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &x, 1) == 0);
+        }
+        moq_session_destroy(c);
+        MOQ_TEST_CHECK(os.balance == 0);
+    }
+
+    /* -- CLIENT_SETUP: the SERVER_SETUP reply cannot be queued ---------
+     * The staged event bytes are released when the pre-output send fails, so
+     * the retained message replays from the same cursor. */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        cfg.send_buffer_size = 2;            /* no room for a SERVER_SETUP */
+        moq_session_t *sv = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &sv) == MOQ_OK);
+
+        moq_d16_auth_token_t tok = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_VALUE,
+            .alias = 0,
+            .token_type = 0,
+            .token_value = (const uint8_t *)"token-value",
+            .token_value_len = 11,
+        };
+
+        size_t scratch_before = sv->event_scratch_len;
+        moq_result_t rc = feed_client_setup_with_tokens(sv, &tok, 1, NULL, 0);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(sv->event_scratch_len == scratch_before);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_IDLE);
+        {
+            moq_action_t a; moq_event_t e;
+            memset(&a, 0, sizeof(a)); memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 0);
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 0);
+        }
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
     }
 
     MOQ_TEST_PASS("test_session_auth");

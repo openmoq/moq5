@@ -52,6 +52,23 @@ MOQ_API moq_result_t moq_rcbuf_create(const moq_alloc_t *alloc,
                                        moq_rcbuf_t **out);
 
 /*
+ * The exact number of bytes moq_rcbuf_create / moq_rcbuf_clone request from
+ * the allocator for a payload of `payload_len` bytes. Pure; touches nothing.
+ *
+ * PINNED CONTRACT (capacity models depend on it): sizing is ADDITIVE —
+ * with H := moq_rcbuf_allocation_size(0), every valid length satisfies
+ * moq_rcbuf_allocation_size(n) == H + n. H is therefore usable strictly as
+ * per-buffer header overhead, with payload bytes accounted separately. If a
+ * future layout ever breaks additivity, every capacity formula built on H
+ * must be redesigned — do not silently reuse H.
+ *
+ * Returns MOQ_ERR_INVAL when `out` is NULL or when the total would overflow
+ * size_t (*out is set to 0 on any failure); MOQ_OK otherwise.
+ */
+MOQ_API moq_result_t moq_rcbuf_allocation_size(size_t payload_len,
+                                               size_t *out);
+
+/*
  * Callback invoked exactly once on final decref of a wrapped buffer.
  * Called before the rcbuf header is freed.
  */

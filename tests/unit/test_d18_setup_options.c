@@ -667,6 +667,107 @@ int main(void)
         moq_simpair_destroy(sp);
     }
 
+    /* == The SETUP handler always sees an empty scratch arena ==========
+     * An early request bidi may be torn down before establishment, queuing an
+     * event ahead of SETUP -- so the event queue need not be empty when SETUP
+     * arrives. That event carries no borrowed bytes, and every other
+     * event-scratch producer needs an active session, so the arena cursor is
+     * still zero when the handler weighs the completion event's tokens. */
+    {
+        moq_session_t *sv = make_started(MOQ_PERSPECTIVE_SERVER, 0);
+        MOQ_TEST_CHECK(sv != NULL);
+        if (sv) {
+            moq_stream_ref_t ref = { 0x40 };
+            uint8_t sub[64];
+            moq_buf_writer_t sw;
+            moq_buf_writer_init(&sw, sub, sizeof(sub));
+            moq_buf_write_vi64(&sw, 0x20);            /* SUBSCRIBE */
+            moq_buf_write_uint16(&sw, 0);             /* empty payload */
+            MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, ref, sub,
+                               moq_buf_writer_offset(&sw), false, 0) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_on_bidi_stream_reset(sv, ref, 0x1, 0)
+                           == MOQ_OK);
+
+            /* The teardown really did surface an event, and it borrowed no
+             * scratch. */
+            MOQ_TEST_CHECK(sv->event_head != sv->event_tail);
+            MOQ_TEST_CHECK(sv->event_scratch_len == 0);
+
+            /* SETUP is processed with the arena still empty. */
+            uint8_t opts[8];
+            moq_buf_writer_t ow;
+            moq_buf_writer_init(&ow, opts, sizeof(opts));
+            MOQ_TEST_CHECK(feed_setup(sv, opts,
+                                      moq_buf_writer_offset(&ow)) == MOQ_OK);
+            MOQ_TEST_CHECK(sv->event_scratch_len == 0);
+            MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
+
+            /* The teardown event precedes the completion, and nothing else
+             * follows. */
+            moq_event_t e;
+            memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 1);
+            MOQ_TEST_CHECK(e.kind == MOQ_EVENT_UNSUBSCRIBED);
+            moq_event_cleanup(&e);
+            memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 1);
+            MOQ_TEST_CHECK(e.kind == MOQ_EVENT_SETUP_COMPLETE);
+            moq_event_cleanup(&e);
+            memset(&e, 0, sizeof(e));
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &e, 1) == 0);
+
+            moq_session_destroy(sv);
+        }
+    }
+
+    /* == A SETUP token requirement beyond the arena closes normally ====
+     * Regression for the shared classification: the shortfall must end the
+     * session with the internal-limit close, never a buffer error. */
+    {
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_SERVER);
+        cfg.version = MOQ_VERSION_DRAFT_18;
+        cfg.output_scratch_size = 32;
+        moq_session_t *sv = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &sv) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_start(sv, 0) == MOQ_OK);
+        if (sv) {
+            uint8_t val[40];
+            for (size_t i = 0; i < sizeof(val); i++)
+                val[i] = (uint8_t)(0x41 + (i % 26));
+
+            /* One USE_VALUE token option whose literal dwarfs the arena. */
+            uint8_t payload[160];
+            moq_buf_writer_t w;
+            moq_buf_writer_init(&w, payload, sizeof(payload));
+            put_vi64(&w, 0x03);                       /* token option        */
+            put_vi64(&w, 1 + 1 + sizeof(val));        /* alias_type+type+val */
+            put_vi64(&w, MOQ_AUTH_TOKEN_USE_VALUE);
+            put_vi64(&w, 0);                          /* token type          */
+            moq_buf_write_raw(&w, val, sizeof(val));
+
+            moq_result_t rc = feed_setup(sv, payload,
+                                         moq_buf_writer_offset(&w));
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            MOQ_TEST_CHECK(rc != MOQ_ERR_BUFFER);
+            MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 1);
+            MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+            MOQ_TEST_CHECK(a.u.close_session.code == 0x1);
+            MOQ_TEST_CHECK(a.u.close_session.reason.len ==
+                           strlen("event scratch permanently too small"));
+            MOQ_TEST_CHECK(memcmp(a.u.close_session.reason.data,
+                                  "event scratch permanently too small",
+                                  a.u.close_session.reason.len) == 0);
+            moq_action_cleanup(&a);
+            moq_session_destroy(sv);
+        }
+    }
+
     MOQ_TEST_PASS("d18_setup_options");
     return failures != 0;
 }

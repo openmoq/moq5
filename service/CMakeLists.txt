@@ -47,6 +47,15 @@ if(MOQ_BUILD_ADAPTER_MVFST)
     list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_MVFST_MANAGED=1)
     list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-mvfst)
 endif()
+if(MOQ_BUILD_MSQUIC_MANAGED)
+    # RAW_QUIC over MsQuic (exact-version, lane pump API; see src/endpoint.c).
+    # Opt-in only: reached by an explicit backend = MSQUIC, never by AUTO --
+    # picoquic stays the default/preferred RAW_QUIC facade. CMake-only: MsQuic
+    # ships its own CMake package (msquic::msquic) but no libmoq pkg-config, so
+    # this backend is NOT advertised in libmoq-service.pc (see below).
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_MSQUIC_MANAGED=1)
+    list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-msquic-managed)
+endif()
 if(MOQ_BUILD_ADAPTER_PROXYGEN)
     # WebTransport over proxygen (multi-version negotiation; see src/endpoint.c).
     # The managed C facade is moq::adapter-proxygen-wt-managed. CMake-only:
@@ -54,6 +63,27 @@ if(MOQ_BUILD_ADAPTER_PROXYGEN)
     # in libmoq-service.pc (see below).
     list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED=1)
     list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-proxygen-wt-managed)
+endif()
+if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED)
+    # WebTransport over wtquic's Network.framework backend (real multi-version
+    # negotiation, lane pump API; Apple/client-only -- the adapter option is a
+    # FATAL error off Apple, so this gate never fires elsewhere). Opt-in only:
+    # reached by an explicit backend = WTQUIC_NETWORK, never by AUTO --
+    # pico_wt stays the default/preferred WEBTRANSPORT facade. Advertised in
+    # libmoq-service.pc via libmoq-wtquic-network-managed (wtquic ships
+    # pkg-config, unlike the C++ stacks).
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED=1)
+    list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-wtquic-network-managed)
+endif()
+if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
+    # WebTransport over wtquic's MsQuic backend (real multi-version negotiation,
+    # lane pump API; cross-platform, client-only). Opt-in only: reached by an
+    # explicit backend = WTQUIC_MSQUIC, never by AUTO -- pico_wt stays the
+    # default/preferred WEBTRANSPORT facade. Advertised in libmoq-service.pc via
+    # libmoq-wtquic-msquic-managed (wtquic ships pkg-config, unlike the C++
+    # stacks; its wtquic-msquic dependency carries the MsQuic search path).
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED=1)
+    list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-wtquic-msquic-managed)
 endif()
 target_compile_definitions(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_DEFS})
 target_link_libraries(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_LIBS})
@@ -92,11 +122,25 @@ install(DIRECTORY include/moq
 # enabled service is CMake-only (find_package(libmoq COMPONENTS service) links
 # the managed adapter). pkg-config consumers must use a service build without
 # those C++ backends. (A future split could keep a pkg-config-linkable
-# picoquic-only service.)
-if(NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN)
+# picoquic-only service.) MsQuic is the same story: msquic::msquic is a CMake
+# package with no pkg-config, so an MsQuic-enabled service is CMake-only too.
+if(NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN
+   AND NOT MOQ_BUILD_MSQUIC_MANAGED)
     set(LIBMOQ_SERVICE_PC_REQUIRES "libmoq")
     if(MOQ_BUILD_PICO_WT_MANAGED)
         string(APPEND LIBMOQ_SERVICE_PC_REQUIRES " libmoq-pico-wt-managed")
+    endif()
+    if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED)
+        # wtquic ships pkg-config (wtquic-network), so an NF-enabled service
+        # stays pkg-config-linkable -- unlike the CMake-only C++ backends.
+        string(APPEND LIBMOQ_SERVICE_PC_REQUIRES " libmoq-wtquic-network-managed")
+    endif()
+    if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
+        # wtquic ships pkg-config (wtquic-msquic), so an MsQuic-WebTransport
+        # service stays pkg-config-linkable -- the wtquic-msquic dependency
+        # carries the MsQuic search path, unlike the CMake-only msquic::msquic
+        # package the DIRECT MsQuic backend pulls in.
+        string(APPEND LIBMOQ_SERVICE_PC_REQUIRES " libmoq-wtquic-msquic-managed")
     endif()
 
     # Relocatable prefix: ascend (libdir depth + 1) levels from
@@ -199,6 +243,27 @@ if(MOQ_BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_resolve COMMAND test_endpoint_resolve)
 
+    # White-box post() NULL-session contract test (no network, no msf): endpoint.c
+    # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
+    # controlled session (NULL pre-establishment, then a live IDLE session). Own
+    # object set so the testing define never leaks into the shipping library.
+    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c)
+    target_include_directories(moq-service-endpoint-test-internals
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(moq-service-endpoint-test-internals
+        PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+    target_compile_definitions(moq-service-endpoint-test-internals
+        PRIVATE MOQ_MEDIA_SENDER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
+    target_compile_features(moq-service-endpoint-test-internals PUBLIC c_std_11)
+
+    add_executable(test_endpoint_post_contract tests/test_endpoint_post_contract.c)
+    target_link_libraries(test_endpoint_post_contract PRIVATE
+        moq-service-endpoint-test-internals moq::core Threads::Threads)
+    target_include_directories(test_endpoint_post_contract PRIVATE
+        ${CMAKE_SOURCE_DIR}/tests/unit)
+    add_test(NAME endpoint_post_contract COMMAND test_endpoint_post_contract)
+
     # White-box catalog-update test: compile the receiver (+ endpoint) with the
     # test seam so the catalog ingest/reconcile path can be driven with crafted
     # objects, no network. Built as its own object set (the testing define would
@@ -240,6 +305,15 @@ if(MOQ_BUILD_TESTS)
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_scripted
                 COMMAND test_media_receiver_scripted)
+            add_executable(test_media_receiver_update_ack
+                tests/test_media_receiver_update_ack.c)
+            target_link_libraries(test_media_receiver_update_ack PRIVATE
+                moq-service-receiver-test-internals moq::core moq::msf
+                moq::sim Threads::Threads)
+            target_include_directories(test_media_receiver_update_ack PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_update_ack
+                COMMAND test_media_receiver_update_ack)
 
             # Large-object intake guard: a single large LOC video object
             # (64/128/256 KiB, plus a type-0x31 extension-enabled variant) fed
@@ -343,6 +417,71 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_lifecycle
             COMMAND test_media_sender_lifecycle)
+        add_executable(test_media_sender_reject
+            tests/test_media_sender_reject.c)
+        target_link_libraries(test_media_sender_reject PRIVATE
+            moq-service-sender-test-internals moq::core moq::msf
+            moq::sim Threads::Threads)
+        target_include_directories(test_media_sender_reject PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_reject
+            COMMAND test_media_sender_reject)
+
+        # Automatic catalog-refresh test. Needs BOTH the sender and
+        # receiver seams (a real sender publishes periodic catalogs; a real
+        # receiver dedups them), so it links a combined internals object set
+        # compiling media_sender.c + media_receiver.c + endpoint.c ONCE with
+        # both testing defines -- linking the two separate internals libs would
+        # duplicate endpoint.c. Requires moq::msf and moq::sim.
+        if(TARGET moq::sim)
+            add_library(moq-service-refresh-test-internals OBJECT
+                src/media_sender.c src/media_receiver.c src/endpoint.c)
+            target_include_directories(moq-service-refresh-test-internals
+                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_link_libraries(moq-service-refresh-test-internals
+                PUBLIC moq::core moq::msf Threads::Threads)
+            target_compile_definitions(moq-service-refresh-test-internals
+                PRIVATE MOQ_MEDIA_SENDER_TESTING=1 MOQ_MEDIA_RECEIVER_TESTING=1
+                ${_MOQ_SERVICE_FACADE_DEFS})
+            target_link_libraries(moq-service-refresh-test-internals
+                PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
+            target_compile_features(moq-service-refresh-test-internals
+                PUBLIC c_std_11)
+
+            add_executable(test_media_sender_refresh
+                tests/test_media_sender_refresh.c)
+            target_link_libraries(test_media_sender_refresh PRIVATE
+                moq-service-refresh-test-internals moq::core moq::msf
+                moq::sim Threads::Threads)
+            target_include_directories(test_media_sender_refresh PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_sender_refresh
+                COMMAND test_media_sender_refresh)
+        endif()
+
+        # C++17 public-header consumer: the service headers must compile,
+        # link, and run from plain C++ (extern "C" surface only). Init-only,
+        # no network -- the C++ mirror of tests/consumer/main.c. Skipped when
+        # no C++ compiler is available.
+        include(CheckLanguage)
+        check_language(CXX)
+        if(CMAKE_CXX_COMPILER)
+            enable_language(CXX)
+            add_executable(test_service_consumer_cxx
+                tests/consumer/main_cxx.cpp)
+            target_link_libraries(test_service_consumer_cxx PRIVATE
+                moq::service)
+            set_target_properties(test_service_consumer_cxx PROPERTIES
+                CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+            if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_service_consumer_cxx PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME service_consumer_cxx
+                COMMAND test_service_consumer_cxx)
+        endif()
     endif()
 
     # Lifecycle tests need a real network loopback: a threaded-picoquic
@@ -361,6 +500,24 @@ if(MOQ_BUILD_TESTS)
         # run concurrently with each other; the shared RESOURCE_LOCK serializes
         # them under ctest -jN (LABELS alone do not).
         set_tests_properties(endpoint_lifecycle PROPERTIES
+            LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
+
+        # Idle managed-loopback discriminator for automatic catalog refresh:
+        # a media_sender over a REAL pq_threaded endpoint whose catalog group
+        # advances while idle only if the adapter wakes itself at the refresh
+        # deadline. Public API only (shipping moq::service). Network.
+        add_executable(test_media_sender_idle_refresh
+            tests/test_media_sender_idle_refresh.c)
+        target_link_libraries(test_media_sender_idle_refresh PRIVATE
+            moq::service moq::adapter-picoquic-threaded moq::msf
+            Threads::Threads)
+        target_include_directories(test_media_sender_idle_refresh PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_idle_refresh
+            COMMAND test_media_sender_idle_refresh
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(media_sender_idle_refresh PROPERTIES
             LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
 
         add_executable(test_media_receiver
@@ -402,6 +559,25 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_sender PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit
             ${CMAKE_SOURCE_DIR}/tests/support)
+        # Dedicated internals-linked cursor test: the ONLY network binary on
+        # the MOQ_MEDIA_SENDER_TESTING rail (the production suite above links
+        # the shipping moq::service). Narrowly scoped: one push-mode consumer,
+        # one forced mid-generation WOULD_BLOCK.
+        add_executable(test_media_sender_push_cursor
+            tests/test_media_sender_push_cursor.c)
+        target_link_libraries(test_media_sender_push_cursor PRIVATE
+            moq-service-sender-test-internals
+            moq::adapter-picoquic-threaded moq::msf
+            Threads::Threads)
+        target_include_directories(test_media_sender_push_cursor PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_push_cursor
+            COMMAND test_media_sender_push_cursor
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(media_sender_push_cursor PROPERTIES
+            LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
+
         add_test(NAME media_sender
             COMMAND test_media_sender
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -420,7 +596,8 @@ if(MOQ_BUILD_TESTS)
         # folly/fizz stack, which pkg-config cannot express -- see the .pc block).
         find_program(PKG_CONFIG_EXECUTABLE pkg-config)
         if(MOQ_PICOQUIC_SOURCE_DIR AND PKG_CONFIG_EXECUTABLE
-           AND NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN)
+           AND NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN
+           AND NOT MOQ_BUILD_MSQUIC_MANAGED)
             set(_svc_openssl_root "")
             if(OPENSSL_SSL_LIBRARY)
                 get_filename_component(_svc_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
@@ -444,6 +621,223 @@ if(MOQ_BUILD_TESTS)
                     "${CMAKE_INSTALL_LIBDIR}")
             set_tests_properties(service_pkgconfig_consumer
                 PROPERTIES TIMEOUT 600)
+        endif()
+    endif()
+
+    # Explicit MsQuic backend selection over a real MsQuic loopback: the
+    # endpoint client (backend = MSQUIC) against a managed MsQuic server peer,
+    # one SUBSCRIBE + object + clean close. Self-signed certs into the build
+    # dir (its own fixture -- the adapter's msquic_gen_certs lives in a
+    # different tree). Port 0 (ephemeral) on both sides, so no port lock.
+    if(MOQ_BUILD_MSQUIC_MANAGED)
+        add_executable(test_endpoint_msquic_smoke
+            tests/test_endpoint_msquic_smoke.c)
+        target_link_libraries(test_endpoint_msquic_smoke PRIVATE
+            moq::service moq::adapter-msquic-managed Threads::Threads)
+        target_include_directories(test_endpoint_msquic_smoke PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        find_program(MOQ_OPENSSL openssl)
+        if(MOQ_OPENSSL)
+            add_test(NAME service_msquic_gen_certs
+                COMMAND ${MOQ_OPENSSL} req -x509 -newkey rsa:2048
+                    -sha256 -days 30 -nodes
+                    -keyout ${CMAKE_CURRENT_BINARY_DIR}/msquic_key.pem
+                    -out ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
+                    -subj /CN=localhost)
+            set_tests_properties(service_msquic_gen_certs PROPERTIES
+                FIXTURES_SETUP service_msquic_certs
+                LABELS "network;msquic")
+            add_test(NAME endpoint_msquic_smoke
+                COMMAND test_endpoint_msquic_smoke
+                    --cert ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
+                    --key ${CMAKE_CURRENT_BINARY_DIR}/msquic_key.pem)
+            set_tests_properties(endpoint_msquic_smoke PROPERTIES
+                FIXTURES_REQUIRED service_msquic_certs
+                LABELS "network;msquic" TIMEOUT 120)
+        endif()
+    endif()
+
+    # Explicit wtquic-over-MsQuic backend selection over a real WT loopback: the
+    # endpoint client (backend = WTQUIC_MSQUIC) against the same facade in server
+    # mode, one SUBSCRIBE + object + clean close, run once per draft with real
+    # WT-Protocol negotiation. Cross-platform (wherever wtquic's MsQuic component
+    # builds). Self-signed certs into the build dir; port 0 (ephemeral).
+    if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
+        add_executable(test_endpoint_wtquic_msquic_smoke
+            tests/test_endpoint_wtquic_msquic_smoke.c)
+        target_link_libraries(test_endpoint_wtquic_msquic_smoke PRIVATE
+            moq::service moq::adapter-wtquic-msquic-managed
+            moq::adapter-wtquic wtq::msquic Threads::Threads)
+        target_include_directories(test_endpoint_wtquic_msquic_smoke PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        find_program(MOQ_OPENSSL openssl)
+        if(MOQ_OPENSSL)
+            add_test(NAME service_wtquic_msquic_gen_certs
+                COMMAND ${MOQ_OPENSSL} req -x509 -newkey rsa:2048
+                    -sha256 -days 30 -nodes
+                    -keyout ${CMAKE_CURRENT_BINARY_DIR}/wtquic_msquic_key.pem
+                    -out ${CMAKE_CURRENT_BINARY_DIR}/wtquic_msquic_cert.pem
+                    -subj /CN=localhost)
+            set_tests_properties(service_wtquic_msquic_gen_certs PROPERTIES
+                FIXTURES_SETUP service_wtquic_msquic_certs
+                LABELS "network")
+            add_test(NAME endpoint_wtquic_msquic_smoke
+                COMMAND test_endpoint_wtquic_msquic_smoke
+                    --cert ${CMAKE_CURRENT_BINARY_DIR}/wtquic_msquic_cert.pem
+                    --key ${CMAKE_CURRENT_BINARY_DIR}/wtquic_msquic_key.pem)
+            set_tests_properties(endpoint_wtquic_msquic_smoke PROPERTIES
+                FIXTURES_REQUIRED service_wtquic_msquic_certs
+                LABELS "network" TIMEOUT 120)
+        endif()
+
+        # Installed packaging: a relocated-prefix consumer that requests ONLY
+        # COMPONENTS service (and, when the .pc is generated, the pkg-config
+        # chain libmoq-service -> libmoq-wtquic-msquic-managed -> wtquic-msquic).
+        # No injected -L: the wtquic-msquic dependency carries the MsQuic search
+        # path. The .pc exists unless a CMake-only backend (mvfst/proxygen/direct
+        # MsQuic) was also built.
+        # This consumer pins that an installed picoquic is discovered FROM THE
+        # PREFIX, and its negative control requires that dropping picoquic makes
+        # the consumer fail to configure. Both only hold when the service build
+        # actually pulls a picoquic-based facade (pico_wt or picoquic-threaded);
+        # a wtquic-only service legitimately needs no picoquic, and the control
+        # would then fire on a correct build. It also needs the caller-supplied
+        # hints that materialize the installed picoquic. Register only when all
+        # of that is true — an abort is not a result. A tree wanting this
+        # coverage builds pico_wt/pq-threaded and passes
+        # -DMOQ_PICOQUIC_SOURCE_DIR=... -DMOQ_PICOTLS_PREFIX=...
+        if(wtquic_DIR AND MOQ_PICOQUIC_SOURCE_DIR AND MOQ_PICOTLS_PREFIX
+           AND (MOQ_BUILD_PICO_WT_MANAGED OR MOQ_BUILD_PQ_THREADED))
+            get_filename_component(_svc_wtqm_prefix "${wtquic_DIR}" DIRECTORY)
+            get_filename_component(_svc_wtqm_prefix "${_svc_wtqm_prefix}" DIRECTORY)
+            get_filename_component(_svc_wtqm_prefix "${_svc_wtqm_prefix}" DIRECTORY)
+            set(_svc_wtqm_do_pc OFF)
+            if(NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN
+               AND NOT MOQ_BUILD_MSQUIC_MANAGED)
+                set(_svc_wtqm_do_pc ON)
+            endif()
+            # openssl root so the materialized picoquic (and the relocated
+            # consumer link) find the same OpenSSL the build used.
+            set(_svc_wtqm_ossl "")
+            if(OPENSSL_SSL_LIBRARY)
+                get_filename_component(_svc_wtqm_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+                get_filename_component(_svc_wtqm_ossl "${_svc_wtqm_o}" DIRECTORY)
+            endif()
+            add_test(NAME service_wtquic_msquic_install_consumer
+                COMMAND ${CMAKE_COMMAND}
+                    -DBUILD=${PROJECT_BINARY_DIR}
+                    -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
+                    -DWORK=${CMAKE_CURRENT_BINARY_DIR}/wtquic-msquic-consumer-work
+                    "-DWTQUIC_PREFIX=${_svc_wtqm_prefix}"
+                    "-DMSQUIC_DIR_HINT=${msquic_DIR}"
+                    "-DPICOQUIC_SOURCE_DIR=${MOQ_PICOQUIC_SOURCE_DIR}"
+                    "-DPICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}"
+                    "-DOPENSSL_ROOT=${_svc_wtqm_ossl}"
+                    "-DBUILD_TYPE=${CMAKE_BUILD_TYPE}"
+                    -DC_COMPILER=${CMAKE_C_COMPILER}
+                    -DDO_PKGCONFIG=${_svc_wtqm_do_pc}
+                    -DLIBDIR=${CMAKE_INSTALL_LIBDIR}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/wtquic_msquic_install_consumer.cmake)
+            set_tests_properties(service_wtquic_msquic_install_consumer PROPERTIES
+                TIMEOUT 900)
+        elseif(wtquic_DIR)
+            message(STATUS
+                "service: skipping service_wtquic_msquic_install_consumer "
+                "(needs a picoquic-based facade — pico_wt or picoquic-threaded — "
+                "plus -DMOQ_PICOQUIC_SOURCE_DIR and -DMOQ_PICOTLS_PREFIX, so the "
+                "installed picoquic it pins is genuinely a dependency)")
+        endif()
+    endif()
+
+    # Explicit wtquic Network.framework backend selection over a real WT
+    # loopback: the endpoint client (backend = WTQUIC_NETWORK) against a
+    # wtquic MsQuic attach server peer, one SUBSCRIBE + object + clean close
+    # with real multi-version negotiation. Apple-only (the facade). Certs are
+    # this test's own fixture; port 0 (ephemeral), no port lock.
+    if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED)
+        add_executable(test_endpoint_wtquic_network_smoke
+            tests/test_endpoint_wtquic_network_smoke.c)
+        target_link_libraries(test_endpoint_wtquic_network_smoke PRIVATE
+            moq::service moq::adapter-wtquic-network-managed
+            moq::adapter-wtquic wtq::msquic Threads::Threads)
+        target_include_directories(test_endpoint_wtquic_network_smoke PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        find_program(MOQ_OPENSSL openssl)
+        if(MOQ_OPENSSL)
+            add_test(NAME service_wtquic_network_gen_certs
+                COMMAND ${MOQ_OPENSSL} req -x509 -newkey rsa:2048
+                    -sha256 -days 30 -nodes
+                    -keyout ${CMAKE_CURRENT_BINARY_DIR}/wtquic_network_key.pem
+                    -out ${CMAKE_CURRENT_BINARY_DIR}/wtquic_network_cert.pem
+                    -subj /CN=localhost)
+            set_tests_properties(service_wtquic_network_gen_certs PROPERTIES
+                FIXTURES_SETUP service_wtquic_network_certs
+                LABELS "network")
+            add_test(NAME endpoint_wtquic_network_smoke
+                COMMAND test_endpoint_wtquic_network_smoke
+                    --cert ${CMAKE_CURRENT_BINARY_DIR}/wtquic_network_cert.pem
+                    --key ${CMAKE_CURRENT_BINARY_DIR}/wtquic_network_key.pem)
+            set_tests_properties(endpoint_wtquic_network_smoke PROPERTIES
+                FIXTURES_REQUIRED service_wtquic_network_certs
+                LABELS "network" TIMEOUT 120)
+        endif()
+
+        # One-shot WT smoke server for the .wtquicNetwork runtime proof
+        # (test support only, never installed). It is a wtquic MsQuic
+        # ATTACH peer, so it is gated on the msquic component being present
+        # in the wtquic package (a network-only wtquic -- e.g. the iOS
+        # build -- has no wtq::msquic and simply skips this peer). The
+        # runtime proof itself is a STANDALONE Swift executable
+        # (bindings/swift/Examples/WtquicNetworkRuntimeProof), driven by
+        # scripts/check_wtquic_network_runtime.sh: Network.framework does not
+        # establish connections inside an xctest host, so the proof must
+        # run as a normal process, not a unit test.
+        if(TARGET wtq::msquic)
+            add_executable(wtquic_network_smoke_server tests/wtquic_network_smoke_server.c)
+            # the publisher facade lives in moq::core; moq::loc encodes
+            # the object properties; moq::msf only lends its header (the
+            # catalog track-name constant)
+            target_link_libraries(wtquic_network_smoke_server PRIVATE
+                moq::adapter-wtquic moq::loc wtq::msquic Threads::Threads)
+            target_include_directories(wtquic_network_smoke_server PRIVATE
+                ${PROJECT_SOURCE_DIR}/media/msf/include)
+        endif()
+
+        # NF-only installed packaging: CMake COMPONENTS service consumer
+        # against a relocated prefix, plus (when the .pc is generated)
+        # the pkg-config chain libmoq-service ->
+        # libmoq-wtquic-network-managed -> wtquic-network.
+        if(wtquic_DIR)
+            get_filename_component(_svc_wtq_prefix "${wtquic_DIR}" DIRECTORY)
+            get_filename_component(_svc_wtq_prefix "${_svc_wtq_prefix}" DIRECTORY)
+            get_filename_component(_svc_wtq_prefix "${_svc_wtq_prefix}" DIRECTORY)
+            set(_svc_wtq_do_pc OFF)
+            if(NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN
+               AND NOT MOQ_BUILD_MSQUIC_MANAGED)
+                set(_svc_wtq_do_pc ON)
+            endif()
+            set(_svc_wtq_ossl "")
+            if(OPENSSL_SSL_LIBRARY)
+                get_filename_component(_svc_wtq_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+                get_filename_component(_svc_wtq_ossl "${_svc_wtq_o}" DIRECTORY)
+            endif()
+            add_test(NAME service_wtquic_network_install_consumer
+                COMMAND ${CMAKE_COMMAND}
+                    -DBUILD=${PROJECT_BINARY_DIR}
+                    -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
+                    -DWORK=${CMAKE_CURRENT_BINARY_DIR}/wtquic-network-consumer-work
+                    "-DWTQUIC_PREFIX=${_svc_wtq_prefix}"
+                    "-DMSQUIC_DIR_HINT=${msquic_DIR}"
+                    "-DPICOQUIC_SOURCE_DIR=${MOQ_PICOQUIC_SOURCE_DIR}"
+                    "-DPICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}"
+                    "-DOPENSSL_ROOT=${_svc_wtq_ossl}"
+                    "-DBUILD_TYPE=${CMAKE_BUILD_TYPE}"
+                    -DC_COMPILER=${CMAKE_C_COMPILER}
+                    -DDO_PKGCONFIG=${_svc_wtq_do_pc}
+                    -DLIBDIR=${CMAKE_INSTALL_LIBDIR}
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/wtquic_network_install_consumer.cmake)
+            set_tests_properties(service_wtquic_network_install_consumer PROPERTIES
+                TIMEOUT 900)
         endif()
     endif()
 endif()

@@ -170,12 +170,18 @@ struct mc_client_state {
     std::atomic<bool> sub_ok{false};
     std::atomic<bool> error{false};
 
+    /* pump-window pin: managed_session() from on_activity must be NULL */
+    std::atomic<bool> act_ran{false};
+    std::atomic<bool> act_session_null{false};
+
     std::mutex result_mu;
     std::vector<recv_obj> objects;
 };
 
-static int mc_client_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int mc_client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     auto *cs = static_cast<mc_client_state *>(ctx);
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -253,18 +259,56 @@ struct mc_server_state {
     std::atomic<bool> may_close_b{false};
     std::atomic<bool> close_b_sent{false};
     std::atomic<bool> error{false};
+
+    /* lane-contract observations */
+    std::atomic<int>  max_in_pass{0};      /* most conns seen in one pass */
+    std::atomic<int>  pump_depth{0};
+    std::atomic<bool> reentry_seen{false}; /* pump re-entered concurrently */
+    std::atomic<bool> wrong_lane_seen{false}; /* conn_lane / index mismatch */
+    moq_mvfst_managed_lane_t *lane_seen{nullptr};
+
+    /* pump-window enforcement (checked from on_activity, which runs on the
+     * same EventBase thread but OUTSIDE the pump window). A conn observed
+     * during on_lane_pump is stashed, then on_activity must find that lane
+     * iteration and every conn accessor refuse. */
+    moq_mvfst_conn_t *activity_conn{nullptr};
+    std::atomic<bool> activity_ran{false};
+    std::atomic<bool> act_next_conn_null{false};
+    std::atomic<bool> act_conn_session_null{false};
+    std::atomic<bool> act_conn_close_invalid{false};
 };
 
-static int mc_server_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int mc_server_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
     (void)now;
     auto *ss = static_cast<mc_server_state *>(ctx);
 
+    /* lane contract: this lane's pump is never re-entered concurrently,
+     * and it iterates only its own lane (index 0, the facade's lane). */
+    if (ss->pump_depth.fetch_add(1) + 1 > 1)
+        ss->reentry_seen.store(true);
+    ss->lane_seen = lane;
+    if (moq_mvfst_lane_index(lane) != 0 ||
+        moq_mvfst_managed_lane(m, 0) != lane ||
+        moq_mvfst_managed_lane(m, 1) != nullptr)
+        ss->wrong_lane_seen.store(true);
+
     /* Collect live conns into a set. */
     std::set<moq_mvfst_conn_t *> live;
     moq_mvfst_conn_t *conn = nullptr;
-    while ((conn = moq_mvfst_managed_next_conn(m, conn)) != nullptr)
+    while ((conn = moq_mvfst_lane_next_conn(lane, conn)) != nullptr) {
         live.insert(conn);
+        /* every connection the pump sees must belong to this lane */
+        if (moq_mvfst_managed_conn_lane(conn) != lane)
+            ss->wrong_lane_seen.store(true);
+    }
+    if ((int)live.size() > ss->max_in_pass.load())
+        ss->max_in_pass.store((int)live.size());
+    /* stash a live conn for the on_activity pump-window check; it is in
+     * `live` this pass, so it is not reaped before on_activity runs */
+    if (!live.empty())
+        ss->activity_conn = *live.begin();
 
     /* Prune stale entries. */
     for (auto it = ss->conns.begin(); it != ss->conns.end(); ) {
@@ -398,7 +442,38 @@ static int mc_server_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
         if (a_wr && b_wr) ss->both_written.store(true);
     }
 
+    ss->pump_depth.fetch_sub(1);
     return 0;
+}
+
+/* on_activity runs on the network/EventBase thread but OUTSIDE the pump
+ * window: lane iteration and every conn accessor must refuse, even though
+ * a valid conn handle from the pump is in hand. */
+static void mc_server_activity(moq_mvfst_managed_t *m, void *ctx)
+{
+    (void)m;
+    auto *ss = static_cast<mc_server_state *>(ctx);
+    if (ss->activity_ran.load()) return;
+    moq_mvfst_conn_t *c = ss->activity_conn;
+    moq_mvfst_managed_lane_t *lane = ss->lane_seen;
+    if (!c || !lane) return;
+    ss->act_next_conn_null.store(
+        moq_mvfst_lane_next_conn(lane, nullptr) == nullptr);
+    ss->act_conn_session_null.store(
+        moq_mvfst_conn_session(c) == nullptr);
+    ss->act_conn_close_invalid.store(
+        moq_mvfst_conn_close(c, 7) == MOQ_ERR_INVAL);
+    ss->activity_ran.store(true);
+}
+
+/* client managed_session() is a pump-window accessor too: NULL from
+ * on_activity even though this runs on the network thread. */
+static void mc_client_activity(moq_mvfst_managed_t *m, void *ctx)
+{
+    auto *cs = static_cast<mc_client_state *>(ctx);
+    if (moq_mvfst_managed_session(m) == nullptr)
+        cs->act_session_null.store(true);
+    cs->act_ran.store(true);
 }
 
 /* -- Wait helper ----------------------------------------------------- */
@@ -468,7 +543,8 @@ static void test_multi_client()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = mc_server_pump;
+    scfg.on_lane_pump = mc_server_pump;
+    scfg.on_activity = mc_server_activity;
     scfg.user_ctx = &ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -494,7 +570,8 @@ static void test_multi_client()
     ccfg_a.host = "127.0.0.1";
     ccfg_a.port = port;
     ccfg_a.cert_path = tf.cert_path;
-    ccfg_a.on_pump = mc_client_pump;
+    ccfg_a.on_lane_pump = mc_client_pump;
+    ccfg_a.on_activity = mc_client_activity;
     ccfg_a.user_ctx = &csa;
     ccfg_a.send_request_capacity = true;
     ccfg_a.initial_request_capacity = 16;
@@ -516,7 +593,7 @@ static void test_multi_client()
     ccfg_b.host = "127.0.0.1";
     ccfg_b.port = port;
     ccfg_b.cert_path = tf.cert_path;
-    ccfg_b.on_pump = mc_client_pump;
+    ccfg_b.on_lane_pump = mc_client_pump;
     ccfg_b.user_ctx = &csb;
     ccfg_b.send_request_capacity = true;
     ccfg_b.initial_request_capacity = 16;
@@ -543,6 +620,24 @@ static void test_multi_client()
     MVFST_CHECK(!ss.error.load());
     MVFST_CHECK(!csa.error.load());
     MVFST_CHECK(!csb.error.load());
+
+    /* lane contract: the server pump saw BOTH of its lane's connections
+     * in a single pass, never re-entered its own pump, and every
+     * iterated conn belonged to the facade's one lane (index 0). */
+    MVFST_CHECK(ss.max_in_pass.load() == 2);
+    MVFST_CHECK(!ss.reentry_seen.load());
+    MVFST_CHECK(!ss.wrong_lane_seen.load());
+
+    /* pump-window enforcement: on_activity runs on the network thread but
+     * OUTSIDE the pump window, so the session/lane/conn accessors must all
+     * refuse — even holding a conn handle that was valid inside the pump. */
+    MVFST_CHECK(wait_mc(srv, cli_a, cli_b, ss, csa, csb, [&]() {
+        return ss.activity_ran.load() && csa.act_ran.load();
+    }));
+    MVFST_CHECK(ss.act_next_conn_null.load());     /* lane iteration refused */
+    MVFST_CHECK(ss.act_conn_session_null.load());  /* conn_session refused */
+    MVFST_CHECK(ss.act_conn_close_invalid.load()); /* conn_close refused */
+    MVFST_CHECK(csa.act_session_null.load());       /* client session NULL */
 
     /* --- Phase 2: both subscribe --- */
     MVFST_CHECK(wait_mc(srv, cli_a, cli_b, ss, csa, csb, [&]() {
@@ -691,7 +786,8 @@ static void test_max_connections_cap()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = mc_server_pump;
+    scfg.on_lane_pump = mc_server_pump;
+    scfg.on_activity = mc_server_activity;
     scfg.user_ctx = &ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -715,7 +811,7 @@ static void test_max_connections_cap()
     ca.host = "127.0.0.1";
     ca.port = port;
     ca.cert_path = tf.cert_path;
-    ca.on_pump = mc_client_pump;
+    ca.on_lane_pump = mc_client_pump;
     ca.user_ctx = &csa;
     ca.send_request_capacity = true;
     ca.initial_request_capacity = 16;
@@ -745,7 +841,7 @@ static void test_max_connections_cap()
     cb.host = "127.0.0.1";
     cb.port = port;
     cb.cert_path = tf.cert_path;
-    cb.on_pump = mc_client_pump;
+    cb.on_lane_pump = mc_client_pump;
     cb.user_ctx = &csb;
     cb.send_request_capacity = true;
     cb.initial_request_capacity = 16;

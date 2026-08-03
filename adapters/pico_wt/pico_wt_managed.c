@@ -76,6 +76,8 @@ struct moq_pico_wt_managed {
     void              *on_pump_ctx;
     void             (*on_activity)(moq_pico_wt_managed_t *, void *);
     void              *on_activity_ctx;
+    uint64_t         (*app_deadline_us)(void *);   /* optional service deadline */
+    void              *app_deadline_ctx;
 
     /* Owned transport. */
     picoquic_quic_t   *quic;
@@ -96,6 +98,9 @@ struct moq_pico_wt_managed {
     moq_session_t     *session;
     moq_pico_wt_conn_t *conn;
     picoquic_cnx_t    *active_cnx;
+    bool               reset_stream_at_synthesized; /* client faked the peer TP
+                                                      * (propagated to the conn's
+                                                      * endpoint ctx) */
     bool               fatal;
     uint64_t           fatal_code;
     uint64_t           terminal_error;  /* picoquic local error captured at a
@@ -192,11 +197,24 @@ static void allow_peer_missing_reset_stream_at(moq_pico_wt_managed_t *m,
      *
      * Self-gating + safe: it is a no-op for a peer that already advertises
      * reset_stream_at, and applies only to the CLIENT path (the server path
-     * does not install this callback). libmoq's WT data path uses RESET_STREAM,
-     * never RESET_STREAM_AT, so faking this peer TP only unblocks CONNECT and
-     * never causes libmoq to emit a frame the peer cannot accept. Kept in
-     * libmoq's adapter rather than patching picoquic. */
+     * does not install this callback). Kept in libmoq's adapter rather than
+     * patching picoquic.
+     *
+     * Synthesizing the peer TP unblocks CONNECT (picowt gates it on the parsed
+     * peer TP) but does NOT enable reliable-reset: picoquic already latched
+     * cnx->is_reset_stream_at_enabled = (local && remote) while parsing the
+     * peer's parameters, so mutating remote_parameters here cannot flip it. A
+     * later stream abort that requests a reliable_size preamble
+     * (picowt_reset_stream) would then be rejected LOCALLY by
+     * picoquic_reset_stream_at (PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION) and
+     * become a fatal bridge error that closes the connection -- exactly what
+     * draft-18 announce withdrawal hit. We record that the capability was faked
+     * so the endpoint downgrades those aborts to a plain RESET_STREAM (see
+     * ep_reset). */
     ((picoquic_tp_t *)remote_const)->is_reset_stream_at_enabled = 1;
+    m->reset_stream_at_synthesized = true;
+    if (m->conn)
+        m->conn->endpoint_ctx.reset_stream_at_synthesized = true;
 }
 
 static int managed_client_h3_callback(picoquic_cnx_t *cnx,
@@ -325,6 +343,11 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
         moq_session_destroy(session);
         goto fail;
     }
+    /* Carry a synthesized-capability decision (faked before the conn existed,
+     * to unblock CONNECT) into the endpoint so stream aborts downgrade to a
+     * plain RESET_STREAM instead of a reliable_size preamble picoquic would
+     * refuse locally (reliable-reset was never actually negotiated). */
+    conn->endpoint_ctx.reset_stream_at_synthesized = m->reset_stream_at_synthesized;
 
     moq_session_start(session, now);
 
@@ -605,10 +628,17 @@ static int loop_callback(picoquic_quic_t *quic,
         return 0;
     }
 
-    /* Wake at the next session deadline. */
+    /* Wake at the next deadline: the session's, folded with the optional app
+     * service deadline (e.g. periodic catalog refresh) so an idle managed loop
+     * still wakes to fire it. app_deadline_us is a pure cached read (no facade
+     * re-entry). */
     if (m->active_cnx) {
         uint64_t dl = moq_session_next_deadline_us(
             moq_pico_wt_conn_session(conn));
+        if (m->app_deadline_us) {
+            uint64_t ad = m->app_deadline_us(m->app_deadline_ctx);
+            if (ad < dl) dl = ad;
+        }
         picoquic_set_app_wake_time(m->active_cnx,
                                    dl == UINT64_MAX ? 0 : dl);
     }
@@ -636,11 +666,25 @@ static int loop_callback(picoquic_quic_t *quic,
 
 /* -- cfg_init ------------------------------------------------------- */
 
+/* The pointer initializer clears and stamps the full current struct, so a caller
+ * can set the appended app_deadline block directly. The sized form is the
+ * explicit caller-sized API. The whole-block read gate (through app_deadline_ctx)
+ * in create() reads the block only when the caller's struct_size covers it. */
 void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg)
 {
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    cfg->struct_size = (uint32_t)sizeof(*cfg);
+}
+
+void moq_pico_wt_managed_cfg_init_sized(moq_pico_wt_managed_cfg_t *cfg,
+                                        size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 /* -- create --------------------------------------------------------- */
@@ -768,6 +812,12 @@ moq_result_t moq_pico_wt_managed_create(
     }
     m->on_pump = cfg->on_pump;
     m->on_pump_ctx = CFG_HAS(cfg, on_pump_ctx) ? cfg->on_pump_ctx : NULL;
+    /* app_deadline_us + app_deadline_ctx form ONE ABI block: only read when
+     * struct_size covers THROUGH app_deadline_ctx. */
+    if (CFG_HAS(cfg, app_deadline_ctx)) {
+        m->app_deadline_us = cfg->app_deadline_us;
+        m->app_deadline_ctx = cfg->app_deadline_ctx;
+    }
     if (CFG_HAS(cfg, on_activity)) {
         m->on_activity = cfg->on_activity;
         m->on_activity_ctx = cfg->on_activity_ctx;

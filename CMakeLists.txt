@@ -30,6 +30,13 @@ option(MOQ_BUILD_INTEROP_CLIENT    "Build interop test client"      OFF)
 option(MOQ_BUILD_ADAPTER_MVFST     "Build mvfst QUIC adapter"       OFF)
 option(MOQ_BUILD_ADAPTER_PROXYGEN  "Build proxygen WebTransport adapter" OFF)
 option(MOQ_BUILD_ADAPTER_PICO_WT   "Build picoquic WebTransport adapter" OFF)
+option(MOQ_BUILD_ADAPTER_WTQUIC    "Build wtquic WebTransport adapter" OFF)
+option(MOQ_BUILD_ADAPTER_MSQUIC    "Build MsQuic raw-QUIC adapter"  OFF)
+option(MOQ_BUILD_WTQUIC_NETWORK_MANAGED
+    "Build the managed MoQ client over wtquic Network.framework (Apple)" OFF)
+option(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED
+    "Build the managed MoQ facade over wtquic's MsQuic backend" OFF)
+option(MOQ_BUILD_MSQUIC_MANAGED    "Build managed MsQuic raw-QUIC helper" OFF)
 option(MOQ_PICO_WT_BUILD_LOOPBACK "Build pico_wt loopback test (needs picoquic-test)" OFF)
 option(MOQ_BUILD_PICO_WT_MANAGED  "Build managed picoquic WebTransport helper" OFF)
 option(MOQ_BUILD_FUZZ              "Build fuzz targets"             OFF)
@@ -159,6 +166,59 @@ endif()
 
 if(MOQ_BUILD_ADAPTER_PROXYGEN)
     add_subdirectory(adapters/proxygen)
+endif()
+
+# -- wtquic adapter (WebTransport over HTTP/3, backend-neutral) -------
+if(MOQ_BUILD_ADAPTER_WTQUIC)
+    # wtquic installs a CMake package; point CMAKE_PREFIX_PATH at its
+    # install prefix (e.g. the workspace local-prefix).
+    # the ADAPTER needs only the wtquic core; msquic is found as an
+    # OPTIONAL component because the adapter's real-transport tests
+    # (and the interop tool) drive it explicitly.
+    find_package(wtquic CONFIG QUIET OPTIONAL_COMPONENTS msquic network)
+    if(NOT wtquic_FOUND)
+        message(FATAL_ERROR
+            "MOQ_BUILD_ADAPTER_WTQUIC=ON but the wtquic package (with "
+            "its msquic component) was not found. Install wtquic "
+            "(cmake --install <wtquic-build> --prefix <prefix>) and "
+            "configure with -DCMAKE_PREFIX_PATH=<prefix>, or set "
+            "-Dwtquic_DIR=<prefix>/lib/cmake/wtquic.")
+    endif()
+    add_subdirectory(adapters/wtquic)
+endif()
+
+if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED AND NOT MOQ_BUILD_ADAPTER_WTQUIC)
+    message(FATAL_ERROR
+        "MOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON requires "
+        "MOQ_BUILD_ADAPTER_WTQUIC=ON")
+endif()
+
+if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED AND NOT MOQ_BUILD_ADAPTER_WTQUIC)
+    message(FATAL_ERROR
+        "MOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON requires "
+        "MOQ_BUILD_ADAPTER_WTQUIC=ON")
+endif()
+
+if(MOQ_BUILD_MSQUIC_MANAGED AND NOT MOQ_BUILD_ADAPTER_MSQUIC)
+    message(FATAL_ERROR
+        "MOQ_BUILD_MSQUIC_MANAGED=ON requires MOQ_BUILD_ADAPTER_MSQUIC=ON")
+endif()
+
+# -- msquic adapter (raw MoQ over QUIC, MsQuic-backed) ----------------
+if(MOQ_BUILD_ADAPTER_MSQUIC)
+    # MsQuic resolves via an installed msquic CMake package (e.g.
+    # Homebrew libmsquic) or a checkout at MOQ_MSQUIC_ROOT.
+    list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
+    find_package(MsQuic)
+    if(NOT MsQuic_FOUND)
+        message(FATAL_ERROR
+            "MOQ_BUILD_ADAPTER_MSQUIC=ON but MsQuic was not found. "
+            "Install an msquic CMake package (e.g. brew install "
+            "libmsquic) and configure with -DCMAKE_PREFIX_PATH=<prefix>, "
+            "or set -DMOQ_MSQUIC_ROOT=<msquic-checkout> (header at "
+            "src/inc/msquic.h, library under build/bin/).")
+    endif()
+    add_subdirectory(adapters/msquic)
 endif()
 
 if(MOQ_BUILD_PICO_WT_MANAGED AND NOT MOQ_BUILD_ADAPTER_PICO_WT)
@@ -532,6 +592,53 @@ if(MOQ_BUILD_ADAPTER_PICO_WT)
         "  find_dependency(Picoquic)\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND TRUE)\n"
+        "endif()\n")
+endif()
+if(MOQ_BUILD_ADAPTER_WTQUIC)
+    # Build trees are not relocatable, so the wtquic package location
+    # this build resolved is baked as the default.
+    string(APPEND _build_tree_config
+        "if(\"adapter-wtquic\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
+        "  if(NOT wtquic_DIR)\n"
+        "    set(wtquic_DIR \"${wtquic_DIR}\")\n"
+        "  endif()\n"
+        "  find_dependency(wtquic CONFIG COMPONENTS msquic)\n"
+        "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake\")\n"
+        "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic_FOUND TRUE)\n"
+        "endif()\n")
+endif()
+if(MOQ_BUILD_ADAPTER_MSQUIC)
+    # Build trees are not relocatable, so the MsQuic discovery this
+    # build resolved is baked as the default (config-package dir when
+    # one was found, checkout root otherwise).
+    string(APPEND _build_tree_config
+        "macro(_moq_find_msquic_buildtree)\n"
+        "  if(NOT msquic_DIR AND NOT \"${msquic_DIR}\" STREQUAL \"\")\n"
+        "    set(msquic_DIR \"${msquic_DIR}\")\n"
+        "  endif()\n"
+        "  if(NOT MOQ_MSQUIC_ROOT)\n"
+        "    set(MOQ_MSQUIC_ROOT \"${MOQ_MSQUIC_ROOT}\")\n"
+        "  endif()\n"
+        "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
+        "  find_dependency(MsQuic)\n"
+        "endmacro()\n"
+        "if(\"adapter-msquic\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
+        "  _moq_find_msquic_buildtree()\n"
+        "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake\")\n"
+        "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic_FOUND TRUE)\n"
+        "endif()\n")
+endif()
+if(MOQ_BUILD_MSQUIC_MANAGED)
+    string(APPEND _build_tree_config
+        "if(\"adapter-msquic-managed\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
+        "  if(NOT TARGET moq::adapter-msquic)\n"
+        "    _moq_find_msquic_buildtree()\n"
+        "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake\")\n"
+        "    set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic_FOUND TRUE)\n"
+        "  endif()\n"
+        "  find_dependency(Threads)\n"
+        "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicManagedTargets.cmake\")\n"
+        "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic-managed_FOUND TRUE)\n"
         "endif()\n")
 endif()
 # Build-tree resolution for the pico WT managed component (build-tree

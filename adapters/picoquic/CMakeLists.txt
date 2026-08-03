@@ -289,6 +289,32 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME pq_sim_establish COMMAND test_pq_sim_establish)
         set_tests_properties(pq_sim_establish PROPERTIES TIMEOUT 30)
+
+        # Per-stream receive backpressure over real picoquic: proves the
+        # adapter's application-controlled flow control ARRESTS the peer's
+        # sender at the bounded window when the app stalls (white-box on the
+        # server's picoquic stream state), then resumes on drain. Needs the
+        # picoquic private header for stream introspection, exactly as the
+        # upstream flow_control_test.c does.
+        add_executable(test_pq_sim_flow_control tests/test_pq_sim_flow_control.c)
+        target_include_directories(test_pq_sim_flow_control PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_sim_flow_control PRIVATE
+            moq::adapter-picoquic
+            picoquic-test
+            OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(test_pq_sim_flow_control PRIVATE
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_sim_flow_control PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>
+                -Wno-unused-parameter)
+        endif()
+        add_test(NAME pq_sim_flow_control COMMAND test_pq_sim_flow_control)
+        set_tests_properties(pq_sim_flow_control PROPERTIES TIMEOUT 60)
     endif()
 endif()
 
@@ -305,7 +331,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
 
     # White-box internals variant (test-only, never installed): the threaded
     # adapter compiled with MOQ_PQ_THREADED_TESTING so the lifecycle test can
-    # inject a post-on_pump service-pass failure -- the terminal-conn
+    # inject a post-on_lane_pump service-pass failure -- the terminal-conn
     # observation window a black-box peer close cannot reach (peer closes
     # land at packet ingestion, before the ordinary pump). Mirrors the mvfst
     # test-internals precedent.

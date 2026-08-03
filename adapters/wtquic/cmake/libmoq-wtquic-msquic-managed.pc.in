@@ -1,0 +1,20 @@
+# pkg-config for the managed MoQ facade over wtquic's MsQuic backend
+# (<moq/wtquic_msquic_managed.h>).
+#
+# Relocatable: prefix is derived from this file's own location, so it is
+# correct regardless of the install --prefix.
+#
+# The transitive dependency on wtquic's msquic backend is expressed
+# through pkg-config (Requires: wtquic-msquic), so its install prefix must
+# be on PKG_CONFIG_PATH. CMake (find_package(libmoq COMPONENTS
+# adapter-wtquic-msquic-managed)) is the fully supported consumer path.
+prefix=${pcfiledir}/@LIBMOQ_WTQUIC_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: libmoq-wtquic-msquic-managed
+Description: Managed MoQ facade over wtquic MsQuic
+Version: @PROJECT_VERSION@
+Requires: wtquic-msquic
+Libs: -L${libdir} -lmoq-adapter-wtquic-msquic-managed -lmoq-adapter-wtquic -lmoq-core
+Cflags: -I${includedir}

@@ -352,7 +352,7 @@ static int loop_callback(picoquic_quic_t *quic,
     if (!app->warmup_done) {
         if (app->objects_published < app->cfg->warmup) {
             moq_pub_object_cfg_t obj;
-            moq_pub_object_cfg_init(&obj);
+            moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
             obj.group_id = app->objects_published;
             obj.object_id = 0;
             obj.payload = app->payload;
@@ -392,7 +392,7 @@ static int loop_callback(picoquic_quic_t *quic,
     /* Phase 2: measured — publish and count received objects. */
     if (app->objects_published < app->cfg->warmup + app->cfg->objects) {
         moq_pub_object_cfg_t obj;
-        moq_pub_object_cfg_init(&obj);
+        moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
         obj.group_id = app->objects_published;
         obj.object_id = 0;
         obj.payload = app->payload;

@@ -115,8 +115,10 @@ struct tmp_files {
 
 /* -- Pump callbacks -------------------------------------------------- */
 
-static int pump_noop(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_noop(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)m; (void)now; (void)ctx;
     return 0;
 }
@@ -125,14 +127,16 @@ struct setup_state {
     std::atomic<bool> setup_complete{false};
 };
 
-static int pump_setup_watch(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int pump_setup_watch(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     auto *ss = static_cast<setup_state *>(ctx);
 
     /* Server: iterate connections. */
     moq_mvfst_conn_t *conn = nullptr;
-    while ((conn = moq_mvfst_managed_next_conn(m, conn)) != nullptr) {
+    while ((conn = moq_mvfst_lane_next_conn(lane, conn)) != nullptr) {
         moq_session_t *s = moq_mvfst_conn_session(conn);
         if (!s) continue;
         moq_event_t ev[16]; size_t ne;
@@ -185,7 +189,7 @@ static void test_bad_cert_key_pairing()
     cfg.port = 0;
     cfg.cert_path = tf.cert_path;
     cfg.key_path = tf.key_path;
-    cfg.on_pump = pump_noop;
+    cfg.on_lane_pump = pump_noop;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
 
@@ -216,7 +220,7 @@ static void test_stop_with_active_client()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = pump_setup_watch;
+    scfg.on_lane_pump = pump_setup_watch;
     scfg.user_ctx = &srv_ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -238,7 +242,7 @@ static void test_stop_with_active_client()
     ccfg.host = "127.0.0.1";
     ccfg.port = port;
     ccfg.insecure_skip_verify = true;
-    ccfg.on_pump = pump_setup_watch;
+    ccfg.on_lane_pump = pump_setup_watch;
     ccfg.user_ctx = &cli_ss;
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 16;
@@ -302,7 +306,7 @@ static void test_client_disconnect_cleanup()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = pump_setup_watch;
+    scfg.on_lane_pump = pump_setup_watch;
     scfg.user_ctx = &srv_ss;
     scfg.send_request_capacity = true;
     scfg.initial_request_capacity = 16;
@@ -324,7 +328,7 @@ static void test_client_disconnect_cleanup()
     ccfg.host = "127.0.0.1";
     ccfg.port = port;
     ccfg.insecure_skip_verify = true;
-    ccfg.on_pump = pump_setup_watch;
+    ccfg.on_lane_pump = pump_setup_watch;
     ccfg.user_ctx = &cli_ss;
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 16;
@@ -403,7 +407,7 @@ static void test_stop_from_server_activity_rejected()
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
-    scfg.on_pump = pump_noop;
+    scfg.on_lane_pump = pump_noop;
     scfg.on_activity = activity_try_stop_server;
     scfg.user_ctx = &ac;
     scfg.send_request_capacity = true;

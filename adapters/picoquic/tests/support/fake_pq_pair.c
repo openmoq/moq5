@@ -244,7 +244,44 @@ picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *cnx,
     memset(&tp, 0, sizeof(tp));
     fake_pq_side_t *s = side_for_cnx(cnx);
     tp.max_datagram_frame_size = s ? s->datagram_max : 0;
+    /* Advertise receive windows so the adapter's per-stream backpressure sizes
+     * its budgets (any nonzero values; conformance never fills them). All three
+     * categories: a zero here is honored as a REAL zero budget (fatal on
+     * payload), so the fake must model an endpoint that advertised windows. */
+    tp.initial_max_stream_data_uni = 65535;
+    tp.initial_max_stream_data_bidi_remote = 65535;
+    tp.initial_max_stream_data_bidi_local = 65535;
     return &tp;
+}
+
+/* Per-stream receive flow control: no-op stubs (this pair does not model QUIC
+ * flow control, but the adapter now calls these on every inbound data stream). */
+int picoquic_set_app_flow_control(picoquic_cnx_t *cnx, uint64_t stream_id,
+                                  int use_app_flow_control)
+{
+    (void)cnx; (void)stream_id; (void)use_app_flow_control;
+    return 0;
+}
+int picoquic_open_flow_control(picoquic_cnx_t *cnx, uint64_t stream_id,
+                               uint64_t expected_data_size)
+{
+    (void)cnx; (void)stream_id; (void)expected_data_size;
+    return 0;
+}
+/* Budget-direction selection reads the local role; the pair's client side is
+ * the client. */
+int picoquic_is_client(picoquic_cnx_t *cnx)
+{
+    fake_pq_side_t *s = side_for_cnx(cnx);
+    return s != NULL && s->is_client ? 1 : 0;
+}
+
+/* Grant gating reads the connection state; the fake pair is always "ready"
+ * (conformance runs post-handshake flows). */
+picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t *cnx)
+{
+    (void)cnx;
+    return picoquic_state_ready;
 }
 
 /* ================================================================== */
@@ -259,10 +296,12 @@ int fake_pq_pair_create(fake_pq_pair_t *pair)
     /* Client: uni=2,6,10..., bidi=0,4,8... */
     pair->client_side.next_uni_id = 2;
     pair->client_side.next_bidi_id = 0;
+    pair->client_side.is_client = true;
 
     /* Server: uni=3,7,11..., bidi=1,5,9... */
     pair->server_side.next_uni_id = 3;
     pair->server_side.next_bidi_id = 1;
+    pair->server_side.is_client = false;
 
     /* DATAGRAM negotiated by default so the datagram conformance scenarios
      * exercise delivery; the endpoint's honesty gate reads this via the

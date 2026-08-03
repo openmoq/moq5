@@ -539,7 +539,23 @@ static moq_result_t parse_trun(const uint8_t *box, size_t avail,
     uint32_t count = rd32(p + 4);
     p += 8; r -= 8;
     if ((fl & 0x01)) { if (r < 4) return MOQ_ERR_PROTO; p += 4; r -= 4; }
-    if ((fl & 0x04)) { if (r < 4) return MOQ_ERR_PROTO; p += 4; r -= 4; }
+    /* first-sample-flags-present (0x000004): the value overrides the tfhd
+     * default for SAMPLE ZERO ONLY (ISO 14496-12 8.8.8; the FFmpeg CMAF
+     * shape marks the group-leading keyframe this way while
+     * default_sample_flags says non-sync). Mutually exclusive with
+     * sample-flags-present (0x000400): when every sample carries its own
+     * flags a first-sample override is contradictory -- reject as PROTO,
+     * and reject it BEFORE the count/buffer handling so the malformation
+     * is never downgraded to a BUFFER retry. */
+    bool     has_first_flags = false;
+    uint32_t first_flags = 0;
+    if ((fl & 0x04)) {
+        if (r < 4) return MOQ_ERR_PROTO;
+        if (fl & 0x400) return MOQ_ERR_PROTO;
+        first_flags = rd32(p);
+        has_first_flags = true;
+        p += 4; r -= 4;
+    }
 
     if (count == 0) return MOQ_ERR_PROTO;
 
@@ -586,7 +602,8 @@ static moq_result_t parse_trun(const uint8_t *box, size_t avail,
         moq_cmaf_sample_t *s = &out->samples[i];
         s->duration = out->default_sample_duration;
         s->size = out->default_sample_size;
-        s->flags = out->default_sample_flags;
+        s->flags = (i == 0 && has_first_flags) ? first_flags
+                                               : out->default_sample_flags;
         s->composition_offset = 0;
         if ((fl & 0x100)) { if (r < 4) return MOQ_ERR_PROTO; s->duration = rd32(p); p += 4; r -= 4; }
         if ((fl & 0x200)) { if (r < 4) return MOQ_ERR_PROTO; s->size = rd32(p); p += 4; r -= 4; }

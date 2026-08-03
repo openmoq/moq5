@@ -164,6 +164,29 @@ typedef struct moq_session_cfg {
     /* Appended (ABI-additive, draft-18 only): SUBSCRIBE_TRACKS pool size
      * (default 16). Old callers (smaller struct_size) get the default. */
     uint32_t           max_track_subscriptions;
+
+    /* Appended (ABI-additive): capacity of the per-track largest-location
+     * history registry, which records the largest published/received object
+     * location per track (keyed by full track name) so the library can report
+     * each track's largest object to subscribers and resolve relative
+     * subscription filters correctly. Records are refcounted while empty
+     * (unobserved) and reclaimed when their last referencing request releases;
+     * once a largest has been observed the record persists until the session
+     * is destroyed. When the registry is full a new record cannot be created:
+     * a local caller gets MOQ_ERR_NOMEM, an inbound peer request that needs a
+     * new record is rejected without terminating the session.
+     * 0 = default (max_subscriptions + max_publishes + max_track_statuses).
+     * Old callers (smaller struct_size) get the default. */
+    uint32_t           max_track_history_records;
+
+    /* Appended (ABI-safe, §9.8): bound on how long a deferred terminal done
+     * (Stream Count gating) waits for its advertised data streams before
+     * the session expires the wait, discards the remaining streams and
+     * surfaces the terminal event. 0 selects the library default (30
+     * seconds). The effective wait is never below the subscription's
+     * negotiated delivery timeouts. Read only when struct_size covers this
+     * field; older callers get the library default. */
+    uint64_t           done_wait_timeout_us;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus
@@ -228,6 +251,55 @@ MOQ_API moq_session_state_t moq_session_state(const moq_session_t *s);
 
 /* Session perspective (CLIENT or SERVER). Returns 0 if s is NULL. */
 MOQ_API moq_perspective_t moq_session_perspective(const moq_session_t *s);
+
+/*
+ * Record that an Object at {group_id, object_id} has been published or
+ * received on the given track, advancing that track's largest-location
+ * history (see moq_session_cfg_t.max_track_history_records). The library
+ * feeds this automatically for objects written/received through the session;
+ * a relay or a publisher restoring history across sessions calls it directly
+ * to seed or advance the track's Largest Object.
+ *
+ * The largest is used to report each track's largest object to subscribers
+ * and to resolve relative subscription filters (Largest Object / Next Group)
+ * at message-processing time.
+ *
+ * `ns` parts and `track_name` are BORROWED for the duration of the call
+ * (copied into the record's owned key). NOT an advancing call: it records
+ * history only -- it does not advance the borrow epoch, consume time, or
+ * produce actions/events (so it never invalidates borrowed spans from a prior
+ * poll). Must run on the session's owning shard; NOT thread-safe against
+ * concurrent session calls.
+ *
+ * Merge is monotonic in location order: a location not greater than the
+ * track's current largest is a no-op success (idempotent under reorder /
+ * retransmit). group_id and object_id are object-location components; the
+ * maximum value is PROFILE-SPECIFIC (the session's wire version fixes it):
+ * draft-16 caps a location at 2^62-1, draft-18 at 2^64-1 (its full wire range).
+ * A component above the session's limit is rejected. (The publisher facade /
+ * raw object-write data plane currently caps object payload and locations at
+ * the 2^62-1 bound regardless of profile; a draft-18 producer wanting
+ * full-width object IDs on the write path is tracked as a follow-up. This note
+ * API and the subscribe/update negotiation honor the profile-specific bound.)
+ *
+ * Returns:
+ *   MOQ_OK              merged, or no-op (already <= current largest)
+ *   MOQ_ERR_INVAL       NULL args, a malformed full track name (empty/NULL
+ *                       namespace, a component or name with nonzero length
+ *                       but NULL data, or an over-long full name), or a
+ *                       location component above the session's profile limit
+ *   MOQ_ERR_NOMEM       a new record is required but the registry is full
+ *                       (max_track_history_records reached) or allocation
+ *                       failed; nothing is recorded
+ *   MOQ_ERR_WRONG_STATE the session is not active (before setup / closed)
+ * On any error no record is created and no largest is changed.
+ */
+MOQ_API moq_result_t moq_session_note_object_published(
+    moq_session_t *s,
+    const moq_namespace_t *ns,
+    moq_bytes_t track_name,
+    uint64_t group_id,
+    uint64_t object_id);
 
 /* -- Inputs (advancing calls) -------------------------------------- */
 
@@ -440,6 +512,16 @@ typedef uint32_t moq_action_kind_t;
  */
 #define MOQ_ACTION_RESET_BIDI_STREAM 12u
 #define MOQ_ACTION_STOP_BIDI_STREAM  13u
+/*
+ * Whole-request teardown: abort BOTH directions of a request bidi with
+ * ONE error code. This is what request cancellation means on the wire —
+ * the profiles emit it instead of an adjacent STOP+RESET pair, and the
+ * bridge dispatches it as one transaction (a native endpoint
+ * abort_stream when available, else reset+stop with explicit pending
+ * state). Kinds 12/13 remain defined for future genuinely
+ * single-half-only semantics; current profiles no longer emit them.
+ */
+#define MOQ_ACTION_ABORT_BIDI_STREAM 14u
 
 typedef struct moq_send_control_action {
     const uint8_t *data;  /* BORROWED until next advancing call */
@@ -501,6 +583,11 @@ typedef struct moq_stop_bidi_stream_action {
     uint64_t         error_code;
 } moq_stop_bidi_stream_action_t;
 
+typedef struct moq_abort_bidi_stream_action {
+    moq_stream_ref_t stream_ref;
+    uint64_t         error_code;
+} moq_abort_bidi_stream_action_t;
+
 typedef struct moq_send_datagram_action {
     const uint8_t *data;
     size_t         len;
@@ -554,6 +641,7 @@ typedef struct moq_action {
         moq_send_uni_control_action_t  send_uni_control;
         moq_reset_bidi_stream_action_t reset_bidi_stream;
         moq_stop_bidi_stream_action_t  stop_bidi_stream;
+        moq_abort_bidi_stream_action_t abort_bidi_stream;
         uint8_t                        _reserved[MOQ_ACTION_DETAIL_MAX];
     } u;
 } moq_action_t;
@@ -658,6 +746,18 @@ typedef uint32_t moq_event_kind_t;
 #define MOQ_EVENT_REQUEST_REDIRECT           44u
 #define MOQ_EVENT_REQUEST_GOAWAY             45u
 #define MOQ_EVENT_SUBGROUP_FINISHED          46u
+/*
+ * Response counterparts to the inbound update-request events
+ * (MOQ_EVENT_SUBSCRIBE_UPDATED 15 / MOQ_EVENT_PUBLISH_UPDATED 38, which fire on
+ * the *publisher* side when a peer's update request arrives). These fire on the
+ * *original requester* side when the peer accepts an outbound update we sent.
+ * Success only -- a rejected update drives the existing terminal subscribe-done
+ * path, never a *_UPDATE_OK. Emitted exactly once per accepted update. Detail is
+ * plain scalars (no borrowed spans), so safe to read after the next advancing
+ * call.
+ */
+#define MOQ_EVENT_SUBSCRIPTION_UPDATE_OK     47u
+#define MOQ_EVENT_PUBLICATION_UPDATE_OK      48u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -916,6 +1016,17 @@ typedef struct moq_unsubscribed_event {
     moq_subscription_t sub;  /* identifier only; stale after polling */
 } moq_unsubscribed_event_t;
 
+/* The publisher's terminal done for an ordinary subscription. When the done
+ * advertises a finite, nonzero stream count, this event is DELAYED until that
+ * many of the subscription's data streams have been processed (completed, or
+ * identifiably reset after their header) -- objects on late-arriving streams
+ * are still delivered in the interim. A count of 0 surfaces the event
+ * immediately. The wait -- including for the maximum representable count
+ * (2^62-1, "unknown") -- is bounded by the deadline from
+ * moq_session_cfg_t.done_wait_timeout_us (floored by the negotiated
+ * delivery timeouts): on expiry the remaining streams are discarded and
+ * the event surfaces with the publisher's original values. The
+ * subscription handle is stale after polling. */
 typedef struct moq_subscribe_done_event {
     moq_subscription_t sub;
     uint64_t           status_code;
@@ -943,6 +1054,15 @@ typedef struct moq_subscribe_updated_event {
      * only -- whether and when to start a group is application policy. */
     bool                         has_new_group_request;
     uint64_t                     new_group_request;
+    /* Appended: a replacement Subscription Filter carried on the update
+     * (omitted on the wire means unchanged). start/end fields are valid
+     * per the filter type, as on the SUBSCRIBE_REQUEST event. Which
+     * objects to deliver under the new window is application policy. */
+    bool                         has_filter;
+    moq_subscribe_filter_t       filter;
+    uint64_t                     start_group;
+    uint64_t                     start_object;
+    uint64_t                     end_group;
 } moq_subscribe_updated_event_t;
 
 typedef enum moq_object_terminal {
@@ -1077,6 +1197,18 @@ typedef struct moq_publish_request_event {
      * Property DYNAMIC_GROUPS == 1); omitted on the wire means false. When
      * true, a new-group request may ride the accept (and later updates). */
     bool               dynamic_groups;
+    /* Appended: the publisher's advertised Largest Object for this track. The
+     * publisher MUST include it once Objects have been published, so absence
+     * means "nothing published yet". Also max-merged into this session's track
+     * history at request commit, so the registry is current even if the app
+     * ignores this field. */
+    bool               has_largest;
+    uint64_t           largest_group;
+    uint64_t           largest_object;
+    /* Appended: the publisher's advertised EXPIRES (milliseconds). Surfaced
+     * only -- the session does not run an expiry timer. */
+    bool               has_expires;
+    uint64_t           expires_ms;
 } moq_publish_request_event_t;
 
 typedef struct moq_publish_ok_event {
@@ -1095,6 +1227,16 @@ typedef struct moq_publish_ok_event {
      * only -- whether and when to start a group is application policy. */
     bool                         has_new_group_request;
     uint64_t                     new_group_request;
+    /* Appended: the subscription filter the subscriber chose, surfaced RAW
+     * exactly as it arrived (same shape as moq_publish_updated_event_t) --
+     * absent means unfiltered. The session separately resolves this against the
+     * track's largest into an internal window; that resolved window is not
+     * exposed here. */
+    bool                   has_filter;
+    moq_subscribe_filter_t filter;
+    uint64_t               start_group;
+    uint64_t               start_object;
+    uint64_t               end_group;
 } moq_publish_ok_event_t;
 
 typedef struct moq_publish_error_event {
@@ -1106,6 +1248,18 @@ typedef struct moq_publish_error_event {
     moq_bytes_t         reason;
 } moq_publish_error_event_t;
 
+/* The publisher's terminal done for a publication we subscribed to. Same
+ * delayed-delivery contract as moq_subscribe_done_event_t: with a finite,
+ * nonzero stream count the event is DELAYED until that many of the
+ * publication's data streams have been processed (completed, or identifiably
+ * reset after their header) -- objects on late-arriving streams are still
+ * delivered in the interim. A count of 0 surfaces the event immediately.
+ * The wait -- including for the maximum representable count (2^62-1,
+ * "unknown") -- is bounded by the deadline from
+ * moq_session_cfg_t.done_wait_timeout_us (floored by the negotiated
+ * delivery timeouts): on expiry the remaining streams are discarded and
+ * the event surfaces with the publisher's original values. The publication
+ * handle is stale after polling. */
 typedef struct moq_publish_finished_event {
     moq_publication_t pub;
     uint64_t          status_code;
@@ -1137,7 +1291,51 @@ typedef struct moq_publish_updated_event {
      * only -- whether and when to start a group is application policy. */
     bool                         has_new_group_request;
     uint64_t                     new_group_request;
+    /* Appended: a replacement Subscription Filter carried on the update
+     * (omitted on the wire means unchanged). start/end fields are valid
+     * per the filter type. Which objects to deliver under the new window
+     * is application policy. */
+    bool                         has_filter;
+    moq_subscribe_filter_t       filter;
+    uint64_t                     start_group;
+    uint64_t                     start_object;
+    uint64_t                     end_group;
 } moq_publish_updated_event_t;
+
+/*
+ * MOQ_EVENT_SUBSCRIPTION_UPDATE_OK (47): the peer accepted an outbound update we
+ * sent on a subscription. Fires exactly once per accepted update, on the
+ * requester side, when the pending-update state clears. `has_largest` is true
+ * iff the peer carried a Largest Object (both drafts); the app uses it to decide
+ * a gap-FETCH after widening an End (§10.9.1). No value is synthesised when
+ * absent (absence means the peer published/received nothing). `has_expires` may
+ * be set only under draft-18 (a draft-16 acknowledgment does not carry EXPIRES
+ * on this path); always false under draft-16, and reflects whatever the PEER sent
+ * -- this library's own outbound acks do not currently emit EXPIRES. Plain
+ * scalars only -- no borrowed spans, safe to read after the next advancing call.
+ */
+typedef struct moq_subscription_update_ok_event {
+    moq_subscription_t sub;            /* the subscription we updated */
+    bool     has_largest;
+    uint64_t largest_group;            /* valid iff has_largest */
+    uint64_t largest_object;           /* valid iff has_largest */
+    bool     has_expires;              /* EXPIRES present -- d18 only */
+    uint64_t expires_ms;               /* valid iff has_expires */
+} moq_subscription_update_ok_event_t;
+
+/*
+ * MOQ_EVENT_PUBLICATION_UPDATE_OK (48): the peer accepted an outbound update we
+ * sent on a publish-established subscription. Same semantics as
+ * moq_subscription_update_ok_event_t; see MOQ_EVENT_SUBSCRIPTION_UPDATE_OK.
+ */
+typedef struct moq_publication_update_ok_event {
+    moq_publication_t pub;             /* the PUBLISH-established sub we updated */
+    bool     has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
+    bool     has_expires;
+    uint64_t expires_ms;
+} moq_publication_update_ok_event_t;
 
 typedef struct moq_track_status_request_event {
     moq_track_status_handle_t handle;
@@ -1279,6 +1477,8 @@ typedef struct moq_event {
         moq_publish_finished_event_t  publish_finished;
         moq_publish_unsubscribed_event_t publish_unsubscribed;
         moq_publish_updated_event_t     publish_updated;
+        moq_subscription_update_ok_event_t subscription_update_ok;
+        moq_publication_update_ok_event_t  publication_update_ok;
         moq_track_status_request_event_t track_status_request;
         moq_track_status_ok_event_t      track_status_ok;
         moq_track_status_error_event_t   track_status_error;
@@ -1538,10 +1738,36 @@ typedef struct moq_subscription_update_cfg {
      * against the smaller struct send nothing. */
     bool                    has_new_group_request;
     uint64_t                new_group_request;
+    /* Appended: update the subscription's filter (both drafts carry it
+     * as a parameter on the subscription-update request). Whole-BLOCK
+     * gate: the block is read only when struct_size covers THROUGH end_group,
+     * so a caller whose struct ends mid-block can never send a torn filter.
+     * Location fields are used by the ABSOLUTE_* forms only; values set on
+     * the relative forms are IGNORED, exactly like moq_session_subscribe
+     * (the wire carries no locations for them). For ABSOLUTE_RANGE,
+     * end_group < start_group is MOQ_ERR_INVAL before any mutation. */
+    bool                   has_filter;
+    moq_subscribe_filter_t filter;
+    uint64_t               start_group;
+    uint64_t               start_object;
+    uint64_t               end_group;
 } moq_subscription_update_cfg_t;
 
+/* Pointer-only initializer: zeroes and stamps ONLY the frozen original
+ * prefix (struct_size .. delivery_timeout_us -- the layout before the
+ * auth-token append). It cannot know the caller's storage size, so it must
+ * not write the current sizeof. All appended fields (auth tokens, new-group
+ * request, filter) stay disabled; to set any of them use
+ * moq_subscription_update_cfg_init_sized(). */
 MOQ_API void moq_subscription_update_cfg_init(
     moq_subscription_update_cfg_t *cfg);
+
+/* Size-aware initializer: zeroes and stamps min(cfg_size, sizeof current
+ * struct). Pass sizeof(moq_subscription_update_cfg_t) to initialize the
+ * full current struct with all appended fields available. No-op if cfg is
+ * NULL or cfg_size cannot hold struct_size. */
+MOQ_API void moq_subscription_update_cfg_init_sized(
+    moq_subscription_update_cfg_t *cfg, size_t cfg_size);
 
 /*
  * Update an active subscription's parameters. Advancing call.
@@ -1762,7 +1988,29 @@ typedef struct moq_publish_cfg {
     size_t                  auth_token_count;
 } moq_publish_cfg_t;
 
+/*
+ * Frozen v0 prefix: everything through track_properties. Pinned so a later
+ * append can never shift the floor an old caller is measured against.
+ */
+#define MOQ_PUBLISH_CFG_V0_SIZE offsetof(moq_publish_cfg_t, auth_tokens)
+
+/*
+ * moq_publish_cfg_init() is POINTER-ONLY: it cannot know the caller's struct
+ * size, so it clears and stamps ONLY the frozen v0 prefix and never writes past
+ * it (safe on an exact-v0 allocation). Fields beyond the prefix are left
+ * untouched and ignored by moq_session_publish() (struct_size == V0).
+ *
+ * A caller that sets ANY field past the prefix (auth_tokens/auth_token_count)
+ * MUST use moq_publish_cfg_init_sized(), which records the real struct_size so
+ * those fields are read.
+ */
 MOQ_API void moq_publish_cfg_init(moq_publish_cfg_t *cfg);
+
+/*
+ * Clears and stamps min(cfg_size, this library's sizeof) -- never more than the
+ * caller allocated, never more than this library knows about.
+ */
+MOQ_API void moq_publish_cfg_init_sized(moq_publish_cfg_t *cfg, size_t cfg_size);
 
 /*
  * Initiate a publisher-initiated subscription. Advancing call.
@@ -1787,9 +2035,42 @@ typedef struct moq_accept_publish_cfg {
      * nothing. */
     bool              has_new_group_request;
     uint64_t          new_group_request;
+    /* Appended (ABI-safe): the FILTER BLOCK -- the subscription filter this
+     * subscriber chooses for the publisher-initiated subscription, carried as
+     * SUBSCRIPTION_FILTER on the response. Read as a COMPLETE BLOCK: consulted
+     * only when struct_size covers through end_group; a prefix stopping partway
+     * leaves the subscription unfiltered (a half-present start/object is never
+     * read). filter == MOQ_SUBSCRIBE_FILTER_NONE also means unfiltered. */
+    moq_subscribe_filter_t filter;
+    uint64_t               start_group;
+    uint64_t               start_object;
+    uint64_t               end_group;
+    /* Appended (ABI-safe): the FORWARD BLOCK -- the subscriber's initial
+     * forwarding state. Read as a COMPLETE BLOCK: consulted only when
+     * struct_size covers through forward. When absent (or has_forward is
+     * false) the EFFECTIVE state resolves to forwarding: on-the-wire omission
+     * defaults to 1 -- it does NOT mean "keep the publisher's initial value". */
+    bool              has_forward;
+    bool              forward;
 } moq_accept_publish_cfg_t;
 
+/*
+ * Frozen v0 prefix: everything through group_order. Pinned so a later append
+ * can never shift the floor an old caller is measured against.
+ */
+#define MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE \
+    offsetof(moq_accept_publish_cfg_t, has_new_group_request)
+
+/*
+ * POINTER-ONLY: clears and stamps ONLY the frozen v0 prefix, never writing past
+ * it (safe on an exact-v0 allocation). A caller that sets ANY field past the
+ * prefix (new-group request, the filter block, or the forward block) MUST use
+ * moq_accept_publish_cfg_init_sized().
+ */
 MOQ_API void moq_accept_publish_cfg_init(moq_accept_publish_cfg_t *cfg);
+
+MOQ_API void moq_accept_publish_cfg_init_sized(moq_accept_publish_cfg_t *cfg,
+                                                size_t cfg_size);
 
 /*
  * Accept an incoming publish (subscriber side). Advancing call.

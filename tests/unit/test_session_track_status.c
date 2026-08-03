@@ -725,6 +725,177 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
+    /* == A reason tail is weighed against the live arena, not the cursor ==
+     * A queued GOAWAY event legally holds its URI in the arena, so the error
+     * reason that follows must be classified against the space that is left:
+     * one that fits an empty arena is retryable, and one that no arena could
+     * hold ends the session instead of surfacing a buffer error. */
+    {
+        static const char k_uri[] = "wss://relocate.example.com/path";
+        static const char k_reason[] =
+            "the requested track is unavailable on this origin right now";
+
+        /* -- Transient: retained, then delivered intact after a drain ---- */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+            /* Room for either tail alone, not both at once. */
+            cx.output_scratch_size = (uint32_t)(sizeof(k_reason) + 24);
+            establish_pair(&alloc, 10, 10, &c, &sv, &cx, NULL);
+
+            moq_track_status_cfg_t cfg;
+            moq_track_status_cfg_init(&cfg);
+            moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+            cfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+            cfg.track_name = MOQ_BYTES_LITERAL("t");
+            moq_track_status_handle_t handle;
+            MOQ_TEST_CHECK(moq_session_track_status(c, &cfg, 1000, &handle)
+                           == MOQ_OK);
+            pump_actions_to_peer(c, sv, 1000);
+
+            moq_event_t rq;
+            memset(&rq, 0, sizeof(rq));
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &rq, 1) == 1);
+            MOQ_TEST_CHECK(rq.kind == MOQ_EVENT_TRACK_STATUS_REQUEST);
+            moq_track_status_handle_t sv_handle = rq.u.track_status_request.handle;
+            moq_event_cleanup(&rq);
+
+            /* Occupy the client's arena with a real queued GOAWAY event. */
+            MOQ_TEST_CHECK(moq_session_goaway(sv, (const uint8_t *)k_uri,
+                                              strlen(k_uri), 1500) == MOQ_OK);
+            pump_actions_to_peer(sv, c, 1500);
+            MOQ_TEST_CHECK(c->event_scratch_len >= strlen(k_uri));
+
+            moq_reject_track_status_cfg_t rej;
+            moq_reject_track_status_cfg_init(&rej);
+            rej.error_code = (moq_request_error_t)0x0;
+            rej.reason = (moq_bytes_t){ (const uint8_t *)k_reason,
+                                        strlen(k_reason) };
+            MOQ_TEST_CHECK(moq_session_reject_track_status(sv, sv_handle, &rej,
+                                                           2000) == MOQ_OK);
+
+            /* The reason cannot fit beside the retained URI: the message is
+             * retained as a transient shortage -- not a buffer error, which
+             * transport ingress escalates to a fatal -- the arena is
+             * untouched, and nothing is surfaced. Fed directly so the result
+             * itself is observed. */
+            size_t scratch_held = c->event_scratch_len;
+            {
+                moq_action_t a;
+                memset(&a, 0, sizeof(a));
+                MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 1);
+                MOQ_TEST_CHECK(a.kind == MOQ_ACTION_SEND_CONTROL);
+                MOQ_TEST_CHECK(moq_session_on_control_bytes(c,
+                                   a.u.send_control.data,
+                                   a.u.send_control.len, 2000)
+                               == MOQ_ERR_WOULD_BLOCK);
+                moq_action_cleanup(&a);
+            }
+            MOQ_TEST_CHECK(c->event_scratch_len == scratch_held);
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_DRAINING);
+
+            /* Drain the GOAWAY, then replay: exactly one error event, reason
+             * intact. */
+            moq_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_GOAWAY);
+            moq_event_cleanup(&ev);
+
+            MOQ_TEST_CHECK(moq_session_process_pending(c, 2500) == MOQ_OK);
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_TRACK_STATUS_ERROR);
+            MOQ_TEST_CHECK(ev.u.track_status_error.reason.len ==
+                           strlen(k_reason));
+            MOQ_TEST_CHECK(memcmp(ev.u.track_status_error.reason.data,
+                                  k_reason, strlen(k_reason)) == 0);
+            moq_event_cleanup(&ev);
+            memset(&ev, 0, sizeof(ev));
+            MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 0);
+
+            moq_session_destroy(c);
+            moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+
+        /* -- Permanent: closes immediately, no wasted retry -------------- */
+        {
+            test_alloc_state_t as = {0};
+            moq_alloc_t alloc = test_allocator(&as);
+            moq_session_t *c = NULL, *sv = NULL;
+            moq_session_cfg_t cx = MOQ_SESSION_CFG_INIT;
+            /* Smaller than the reason itself. */
+            cx.output_scratch_size = (uint32_t)(strlen(k_reason) / 2);
+            establish_pair(&alloc, 10, 10, &c, &sv, &cx, NULL);
+
+            moq_track_status_cfg_t cfg;
+            moq_track_status_cfg_init(&cfg);
+            moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+            cfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+            cfg.track_name = MOQ_BYTES_LITERAL("t");
+            moq_track_status_handle_t handle;
+            MOQ_TEST_CHECK(moq_session_track_status(c, &cfg, 1000, &handle)
+                           == MOQ_OK);
+            pump_actions_to_peer(c, sv, 1000);
+
+            moq_event_t rq;
+            memset(&rq, 0, sizeof(rq));
+            MOQ_TEST_CHECK(moq_session_poll_events(sv, &rq, 1) == 1);
+            moq_track_status_handle_t sv_handle = rq.u.track_status_request.handle;
+            moq_event_cleanup(&rq);
+
+            /* A legal queued event first, so a cursor-based judgement would
+             * wrongly read this shortage as transient. */
+            {
+                uint8_t buf[128];
+                moq_buf_writer_t w;
+                moq_buf_writer_init(&w, buf, sizeof(buf));
+                moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("ns") };
+                moq_namespace_t nsx = { parts, 1 };
+                MOQ_TEST_CHECK(moq_d16_encode_publish_namespace(&w, 1, &nsx,
+                                                                NULL, 0)
+                               == MOQ_OK);
+                MOQ_TEST_CHECK(moq_session_on_control_bytes(c, buf,
+                                   moq_buf_writer_offset(&w), 1500) == MOQ_OK);
+            }
+            MOQ_TEST_CHECK(c->event_scratch_len > 0);
+
+            moq_reject_track_status_cfg_t rej;
+            moq_reject_track_status_cfg_init(&rej);
+            rej.error_code = (moq_request_error_t)0x0;
+            rej.reason = (moq_bytes_t){ (const uint8_t *)k_reason,
+                                        strlen(k_reason) };
+            MOQ_TEST_CHECK(moq_session_reject_track_status(sv, sv_handle, &rej,
+                                                           2000) == MOQ_OK);
+            {
+                moq_action_t a;
+                memset(&a, 0, sizeof(a));
+                MOQ_TEST_CHECK(moq_session_poll_actions(sv, &a, 1) == 1);
+                /* A normal close reports MOQ_OK. */
+                moq_result_t rc = moq_session_on_control_bytes(c,
+                                      a.u.send_control.data,
+                                      a.u.send_control.len, 2000);
+                MOQ_TEST_CHECK(rc == MOQ_OK);
+                moq_action_cleanup(&a);
+            }
+
+            MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_CLOSED);
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            MOQ_TEST_CHECK(moq_session_poll_actions(c, &a, 1) == 1);
+            MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_SESSION);
+            MOQ_TEST_CHECK(a.u.close_session.code == 0x1);
+            moq_action_cleanup(&a);
+
+            moq_session_destroy(c);
+            moq_session_destroy(sv);
+            MOQ_TEST_CHECK(as.balance == 0);
+        }
+    }
+
     MOQ_TEST_PASS("test_session_track_status");
     return failures;
 }

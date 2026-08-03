@@ -408,6 +408,60 @@ int main()
         MOQ_CHECK(s.next_deadline_us() != UINT64_MAX);
     }
 
+    // -- 13b. done_wait_timeout_us forwards (behavioral, §9.8) ----------
+    // A gated terminal (Stream Count 1, zero streams delivered) must arm
+    // the SUBSCRIBER's terminal deadline from the configured wait -- 7s
+    // here, not the 30s library default -- proving session_config actually
+    // forwards the knob into the C configuration.
+    {
+        moq::session_config ccfg{};
+        ccfg.perspective              = moq::perspective::client;
+        ccfg.send_request_capacity    = true;
+        ccfg.initial_request_capacity = 16;
+        ccfg.done_wait_timeout_us     = 7000000;
+        moq::session_config scfg{};
+        scfg.perspective              = moq::perspective::server;
+        scfg.send_request_capacity    = true;
+        scfg.initial_request_capacity = 16;
+        auto cr = moq::session::create(ccfg);
+        auto sr = moq::session::create(scfg);
+        MOQ_CHECK(cr.ok() && sr.ok());
+        auto c2 = std::move(*cr);
+        auto s2 = std::move(*sr);
+        c2.start(0);
+        auto pump13 = [](moq::session &from, moq::session &to,
+                         uint64_t now) {
+            while (auto act = from.poll_action()) {
+                act->visit(
+                    [&](const moq::action::send_control &sc) {
+                        (void)to.on_control_bytes(sc.data, now);
+                    },
+                    [&](const auto &) {});
+            }
+        };
+        pump13(c2, s2, 0); (void)s2.poll_event();
+        pump13(s2, c2, 0); (void)c2.poll_event();
+        auto sub = c2.subscribe({.ns = {"ns"}, .track = "t"}, 0).value();
+        pump13(c2, s2, 0);
+        auto req = s2.poll_event();
+        MOQ_CHECK(req.has_value());
+        moq::subscription srv_sub{};
+        req->visit(
+            [&](const moq::event::subscribe_request &sr2) {
+                srv_sub = sr2.sub;
+            },
+            [&](const auto &) { MOQ_CHECK(false); });
+        MOQ_CHECK(s2.accept_subscribe(srv_sub, {}, 0).ok());
+        pump13(s2, c2, 0); (void)c2.poll_event();
+        // Gated done: Stream Count 1, nothing delivered -> deferred.
+        MOQ_CHECK(s2.done_subscribe(srv_sub,
+            {.status_code = 2, .stream_count = 1}, 100).ok());
+        pump13(s2, c2, 100);
+        MOQ_CHECK(!c2.poll_event().has_value());   // no terminal yet
+        MOQ_CHECK(c2.next_deadline_us() == 100 + 7000000);
+        (void)sub;
+    }
+
     // -- 14. Enum conversion static asserts -----------------------------
     {
         static_assert(moq::to_c(moq::perspective::client) == MOQ_PERSPECTIVE_CLIENT);

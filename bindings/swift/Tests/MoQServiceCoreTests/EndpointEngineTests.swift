@@ -146,6 +146,11 @@ struct EndpointLifecycleEngineTests {
         let cases: [(TerminalFailure, ConnectionFailure)] = [
             (.tlsCertificate(code: 0x130),
              ConnectionFailure(kind: .certificateUnverified, code: 0x130)),
+            // the wtquic Network.framework backend seals a NEGATIVE
+            // Security OSStatus (errSecNotTrusted): the raw detail bits
+            // must round-trip to the signed value, never a huge UInt64
+            (.tlsCertificate(code: UInt64(bitPattern: -67843)),
+             ConnectionFailure(kind: .certificateUnverified, code: -67843)),
             (.tls(code: 0x128), ConnectionFailure(kind: .tls, code: 0x128)),
             (.transport(code: 0), ConnectionFailure(kind: .transport, code: 0)),
         ]
@@ -511,6 +516,80 @@ struct EngineDrainTests {
         await #expect(throws: CancellationError.self) { try await task.value }
         /* Exactly one slice ran: the between-slice check saw the cancel. */
         #expect(backend.snapshot().drainCalls.count == 1)
+        await endpoint.close()
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+}
+
+@Suite("Establishment deadline")
+struct EstablishmentDeadlineTests {
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    private func makeEndpoint(_ backend: ScriptedEndpointBackend) -> MoQEndpoint {
+        MoQEndpoint(
+            configuration: .init(url: URL(string: "moqt://relay.test:4443")!),
+            engine: EndpointEngine(backend: backend))
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Deadline expires: transport failure, endpoint closed, no leakage")
+    func timesOutAndCloses() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)   // stays .connecting; never establishes
+        await #expect(throws: MoQServiceError.connectionFailed(
+            ConnectionFailure(kind: .transport, code: 0))) {
+            try await endpoint.established(within: .milliseconds(100))
+        }
+        // The waiter was cancelled and the endpoint closed cleanly (stop+destroy).
+        #expect(backend.snapshot().stopCount == 1)
+        #expect(backend.snapshot().destroyCount == 1)
+        // No late state leaks in: the endpoint stays terminal and a follow-up
+        // wait fails cleanly rather than resurrecting, and nothing touches the
+        // backend after destroy().
+        #expect(endpoint.state == .closed)
+        await #expect(throws: MoQServiceError.closed) {
+            try await endpoint.established(within: .seconds(5))
+        }
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Establishment wins the race: returns, endpoint not closed")
+    func establishesBeforeDeadline() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)
+        backend.script(state: .established)          // already up, well within deadline
+        try await endpoint.established(within: .seconds(30))
+        #expect(endpoint.state == .established)
+        #expect(backend.snapshot().stopCount == 0)   // the deadline never fired
+        await endpoint.close()
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Cancellation propagates as CancellationError, not a timeout close")
+    func propagatesCancellation() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)         // stays .connecting
+        let task = Task { try await endpoint.established(within: .seconds(30)) }
+        #expect(await backend.awaitParked(entries: 1))
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        // Cancellation must NOT trigger the timeout's close path.
+        #expect(backend.snapshot().stopCount == 0)
+        await endpoint.close()
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A real terminal before the deadline is surfaced, not masked as timeout")
+    func realTerminalBeatsDeadline() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)
+        backend.script(state: .closed, fatal: true, code: 9)   // fails on its own
+        await #expect(throws: MoQServiceError.fatal(code: 9)) {
+            try await endpoint.established(within: .seconds(30))
+        }
         await endpoint.close()
         #expect(backend.snapshot().violations.isEmpty)
     }

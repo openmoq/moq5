@@ -97,6 +97,80 @@ if("adapter-proxygen-wt-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONE
     endif()
 endif()
 
+# Optional wtquic WebTransport adapter component (experimental). The
+# imported target links the BACKEND-NEUTRAL wtq::wtquic core publicly;
+# transport backends are the consumer's choice (request wtquic's own
+# msquic/network components as needed).
+if("adapter-wtquic" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic_FOUND FALSE)
+    else()
+        find_dependency(wtquic CONFIG)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic_FOUND TRUE)
+    endif()
+endif()
+
+# Optional managed Network.framework client (Apple; loads the attach
+# adapter first when the consumer did not request it explicitly).
+if("adapter-wtquic-network-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicNetworkManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-network-managed_FOUND FALSE)
+    else()
+        find_dependency(wtquic CONFIG COMPONENTS network)
+        if(NOT TARGET moq::adapter-wtquic)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+        endif()
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicNetworkManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-network-managed_FOUND TRUE)
+    endif()
+endif()
+
+# Optional managed wtquic-over-MsQuic facade component (loads the attach
+# adapter first if the consumer did not request it explicitly).
+if("adapter-wtquic-msquic-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicMsquicManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-msquic-managed_FOUND FALSE)
+    else()
+        find_dependency(wtquic CONFIG COMPONENTS msquic)
+        if(NOT TARGET moq::adapter-wtquic)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+        endif()
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicMsquicManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-msquic-managed_FOUND TRUE)
+    endif()
+endif()
+
+# Optional direct MsQuic adapter component (raw MoQ over QUIC).
+if("adapter-msquic" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic_FOUND FALSE)
+    else()
+        list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        find_dependency(MsQuic)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic_FOUND TRUE)
+    endif()
+endif()
+
+# Optional managed MsQuic facade component (loads the attach adapter
+# first if the consumer did not request it explicitly).
+if("adapter-msquic-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic-managed_FOUND FALSE)
+    else()
+        if(NOT TARGET moq::adapter-msquic)
+            list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+            find_dependency(MsQuic)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake")
+            set(${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic_FOUND TRUE)
+        endif()
+        find_dependency(Threads)
+        include("${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicManagedTargets.cmake")
+        set(${CMAKE_FIND_PACKAGE_NAME}_adapter-msquic-managed_FOUND TRUE)
+    endif()
+endif()
+
 # Optional pico WT adapter component.
 if("adapter-pico-wt" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
     if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake")
@@ -226,9 +300,65 @@ if("service" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
             endif()
             include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake")
         endif()
+        # WEBTRANSPORT-over-Network.framework facade (Apple-only): pull in
+        # the wtquic network managed component (and its attach base) if it
+        # was installed.
+        if(NOT TARGET moq::adapter-wtquic-network-managed AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicNetworkManagedTargets.cmake")
+            find_dependency(wtquic CONFIG COMPONENTS network)
+            if(NOT TARGET moq::adapter-wtquic AND
+               EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+            endif()
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicNetworkManagedTargets.cmake")
+        endif()
+        # WEBTRANSPORT-over-MsQuic facade (cross-platform): pull in the wtquic
+        # MsQuic managed component (and its attach base) if it was installed.
+        # The wtquic msquic component carries the MsQuic search path transitively.
+        if(NOT TARGET moq::adapter-wtquic-msquic-managed AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicMsquicManagedTargets.cmake")
+            find_dependency(wtquic CONFIG COMPONENTS msquic)
+            if(NOT TARGET moq::adapter-wtquic AND
+               EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+            endif()
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicMsquicManagedTargets.cmake")
+        endif()
+        # RAW_QUIC-over-MsQuic facade: pull in the direct MsQuic managed adapter
+        # (and its attach base) if it was installed. moq::service links it when
+        # built with MOQ_BUILD_MSQUIC_MANAGED, so an all-backends service install
+        # must resolve it too -- otherwise the service targets reference a
+        # missing moq::adapter-msquic-managed at generate time.
+        if(NOT TARGET moq::adapter-msquic-managed AND
+           EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicManagedTargets.cmake")
+            if(NOT TARGET moq::adapter-msquic AND
+               EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake")
+                list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+                find_dependency(MsQuic)
+                include("${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake")
+            endif()
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicManagedTargets.cmake")
+        endif()
         include("${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake")
         set(${CMAKE_FIND_PACKAGE_NAME}_service_FOUND TRUE)
     endif()
 endif()
+
+# Name the missing required components in the failure — the stock
+# check_required_components only flips libmoq_FOUND, which reads as an
+# anonymous "set to FALSE" at the consumer.
+set(_libmoq_missing "")
+foreach(_libmoq_comp ${${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS})
+    if(NOT ${CMAKE_FIND_PACKAGE_NAME}_${_libmoq_comp}_FOUND AND
+       ${CMAKE_FIND_PACKAGE_NAME}_FIND_REQUIRED_${_libmoq_comp})
+        list(APPEND _libmoq_missing ${_libmoq_comp})
+    endif()
+endforeach()
+if(_libmoq_missing)
+    set(${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE
+        "missing required libmoq component(s): ${_libmoq_missing}")
+endif()
+unset(_libmoq_missing)
+unset(_libmoq_comp)
 
 check_required_components(libmoq)

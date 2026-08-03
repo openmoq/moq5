@@ -181,8 +181,10 @@ if !enableService {
 }
 
 // The installed-mode MoQService product requires a CMake-installed service
-// tier (picoquic-family backends only -- an mvfst/proxygen-enabled service
-// install has no pkg-config file by design).
+// tier with a pkg-config file: the picoquic-family backends and the
+// wtquic-Network backend qualify (its chain is libmoq-service ->
+// libmoq-wtquic-network-managed -> wtquic-network); an mvfst/proxygen/
+// MsQuic-enabled service install has no pkg-config file by design.
 // Build with: MOQ_SERVICE=1 PKG_CONFIG_PATH=<prefix>/lib/pkgconfig swift build
 //
 // BINARY EXCLUSIVITY: one app binary links EITHER MoQService (installed
@@ -197,6 +199,24 @@ if !enableService {
 // keeps the pkg-config path even if the xcframeworks happen to be built locally.
 // See docs/ios-packaging.md.
 let iosBinaryService = ProcessInfo.processInfo.environment["MOQ_SERVICE_IOS"] == "1"
+// Apple-only framework linkage shared by BOTH MoQService definitions:
+// SwiftPM resolves pkg-config without --static, so an NF-enabled service
+// install's Libs.private frameworks (wtquic-network: Network/Security)
+// never reach the link, and the iOS xcframework will carry the backend
+// too. Conditioned on Apple platforms -- a Linux MOQ_SERVICE=1 build must
+// not attempt -framework linkage (the Network backend cannot exist there).
+let moqServiceLinkerSettings: [LinkerSetting] = [
+    .linkedFramework("Network",
+                     .when(platforms: [.macOS, .iOS, .tvOS, .watchOS])),
+    .linkedFramework("Security",
+                     .when(platforms: [.macOS, .iOS, .tvOS, .watchOS])),
+    // wtquic declares Network, Security, AND Foundation as public
+    // framework dependencies of wtq::network; link all three explicitly
+    // rather than riding whatever Foundation linkage Swift happens to
+    // add for its own runtime.
+    .linkedFramework("Foundation",
+                     .when(platforms: [.macOS, .iOS, .tvOS, .watchOS])),
+]
 if enableService {
     package.products += [
         .library(name: "MoQService", targets: ["MoQService"]),
@@ -217,7 +237,8 @@ if enableService {
                 // separate libssl/libcrypto link (LibMoQ.xcframework holds
                 // libmoq/picoquic/picotls objects but not OpenSSL).
                 dependencies: ["MoQServiceCore", "LibMoQBinary", "OpenSSLBinary"],
-                path: "bindings/swift/Sources/MoQService"
+                path: "bindings/swift/Sources/MoQService",
+                linkerSettings: moqServiceLinkerSettings
             ),
         ]
     } else {
@@ -231,7 +252,8 @@ if enableService {
             .target(
                 name: "MoQService",
                 dependencies: ["MoQServiceCore", "CMoQService"],
-                path: "bindings/swift/Sources/MoQService"
+                path: "bindings/swift/Sources/MoQService",
+                linkerSettings: moqServiceLinkerSettings
             ),
             .testTarget(
                 name: "MoQServiceTests",
@@ -244,6 +266,14 @@ if enableService {
                 name: "moq-service-player",
                 dependencies: ["MoQService"],
                 path: "bindings/swift/Examples/MoQServicePlayer"
+            ),
+            // Standalone .wtquicNetwork runtime proof (a real process --
+            // Network.framework does not establish inside an xctest host).
+            // Run via scripts/check_wtquic_network_runtime.sh.
+            .executableTarget(
+                name: "moq-wtquic-network-runtime-proof",
+                dependencies: ["MoQService"],
+                path: "bindings/swift/Examples/WtquicNetworkRuntimeProof"
             ),
         ]
     }

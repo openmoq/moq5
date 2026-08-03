@@ -28,6 +28,11 @@ typedef struct moq_endpoint_resolved {
     moq_version_policy_t policy;
     moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
     size_t        version_count;
+    /* WebTransport wire profile (moq_wt_profile_t), range-validated and
+     * struct_size-gated at resolve; MOQ_WT_PROFILE_CURRENT when the cfg
+     * predates the field. Consumed only by WebTransport backends that honor a
+     * dialect choice (wtquic-msquic). */
+    uint32_t      wt_profile;
 } moq_endpoint_resolved_t;
 
 /*
@@ -76,11 +81,53 @@ typedef void (*moq_endpoint_hook_fn)(moq_endpoint_t *ep,
                                      moq_session_t *session,
                                      uint64_t now_us, void *ctx);
 
+/* A hook's operations, copied BY VALUE into the endpoint at attach.
+ *   pump             — required; the per-cycle hook (today's moq_endpoint_hook_fn).
+ *   next_deadline_us — optional; returns the hook's earliest pending time-based
+ *                      service deadline in the endpoint clock domain (µs), or
+ *                      UINT64_MAX for "none". It is queried OUTSIDE the pump's
+ *                      exclusive window to compute the managed loop's next wake,
+ *                      so it MUST be a pure, non-blocking read of state the hook
+ *                      already cached during its pump: it MUST NOT re-enter the
+ *                      endpoint, the session, the adapter, or the publisher/
+ *                      receiver facade. NULL = the hook has no time-based
+ *                      deadline. */
+typedef struct moq_endpoint_hook_ops {
+    moq_endpoint_hook_fn pump;
+    uint64_t (*next_deadline_us)(void *ctx);
+} moq_endpoint_hook_ops_t;
+
 moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
                                       moq_endpoint_hook_kind_t kind,
-                                      moq_endpoint_hook_fn fn, void *ctx);
+                                      const moq_endpoint_hook_ops_t *ops,
+                                      void *ctx);
+
+/* The endpoint's aggregate application-deadline callback (ctx = the endpoint):
+ * min over attached hooks of ops.next_deadline_us(hook_ctx), UINT64_MAX if none.
+ * Handed to every DEADLINE-DRIVEN managed adapter as its app_deadline callback so
+ * a purely time-based service deadline (e.g. the media_sender periodic catalog
+ * refresh) wakes an otherwise-idle managed loop. Runs on the managed context,
+ * takes ep->mu then each hook's own lock (the ep->mu -> s->mu order), and calls
+ * only the pure cached hook reads above. */
+uint64_t moq_endpoint_app_deadline_us(void *ctx);
 void moq_endpoint_detach_hook(moq_endpoint_t *ep,
                               moq_endpoint_hook_kind_t kind, void *ctx);
+
+#ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
+#include <wtquic/types.h>
+/* Pure terminal classification for the wtquic-Network backend (exposed
+ * for white-box tests via moq-service-test-internals; hidden visibility,
+ * never installed). `have_record` says `rec` holds a captured wtquic
+ * transport-error record: TRUST provenance -> TLS_CERTIFICATE, TLS ->
+ * TLS, any other non-NONE domain -> TRANSPORT, each preserving the raw
+ * native_code bits as the detail; otherwise the generic fallback
+ * (PROTOCOL for a nonzero fatal code, CLEAN, TRANSPORT/0, NONE). */
+void moq_endpoint_classify_wtquic_network(bool fatal, uint64_t fatal_code,
+                                 bool clean_closed, bool have_record,
+                                 const wtq_transport_error_t *rec,
+                                 moq_endpoint_terminal_reason_t *reason,
+                                 uint64_t *detail);
+#endif
 
 /* The sticky interrupt latch, for attached services' non-blocking polls
  * (the design's poll contract returns MOQ_ERR_INTERRUPTED while latched). */

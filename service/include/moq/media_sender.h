@@ -91,7 +91,19 @@ typedef struct moq_media_sender_callbacks {
                             moq_media_track_t *track);
 } moq_media_sender_callbacks_t;
 
+/* Pointer-only initializer: clears and stamps ONLY the frozen v0 prefix
+ * (through on_subscriber_left). It cannot know the caller's storage size, so
+ * it never touches the appended on_ready/on_closed/on_track_closed fields --
+ * they stay disabled (struct_size == the v0 prefix). To SET any appended
+ * callback, initialize with moq_media_sender_callbacks_init_sized(cb,
+ * sizeof *cb) instead. */
 MOQ_API void moq_media_sender_callbacks_init(moq_media_sender_callbacks_t *cb);
+
+/* Sized initializer: clears and stamps min(cb_size, this library's struct
+ * size). Pass sizeof(*cb) to enable every callback your build knows about.
+ * Safe for a caller compiled against an older, smaller header too. */
+MOQ_API void moq_media_sender_callbacks_init_sized(
+    moq_media_sender_callbacks_t *cb, size_t cb_size);
 
 /* -- Configuration (§7.1) --------------------------------------------- */
 
@@ -166,6 +178,25 @@ typedef struct moq_media_sender_cfg {
     /* Media written while its track has no demand: false (default) holds it
      * queued until demand appears; true drops it to stay at the live edge. */
     bool                                 drop_without_demand;
+
+    /* Interval between automatic independent catalog refreshes, in
+     * microseconds. While the catalog track has demand the sender
+     * periodically republishes the current catalog as a new independent
+     * group (object 0 = the complete catalog, never a delta), so a late
+     * viewer joining through a relay that resolves Joining FETCHes locally
+     * still bootstraps from a fresh subscribe-path catalog object (MSF-01
+     * §5.1: a new independent catalog MAY be published after enough time
+     * that the prior object may have left a delivery-network cache).
+     *   0  (or an old-size caller whose struct_size predates this field):
+     *      library default of 1 second.
+     *   a finite nonzero value: that custom interval.
+     *   UINT64_MAX: refresh explicitly DISABLED. Disabling can reintroduce
+     *      late-join incompatibility with relays that neither proxy nor
+     *      cache unresolved Joining FETCHes upstream -- only the FIRST
+     *      catalog joiner per publisher session obtains the catalog there.
+     * A real track add/remove/conversion generation always takes precedence
+     * and resets the refresh cadence; no demand means no refresh. */
+    uint64_t                             catalog_refresh_interval_us;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,
@@ -182,6 +213,27 @@ typedef struct moq_media_sender_cfg {
 MOQ_API void moq_media_sender_cfg_init(moq_media_sender_cfg_t *cfg);
 MOQ_API void moq_media_sender_cfg_init_live(moq_media_sender_cfg_t *cfg);
 MOQ_API void moq_media_sender_cfg_init_lossless(moq_media_sender_cfg_t *cfg);
+
+/* Sized forms of the three initializers above. The pointer-only forms clear
+ * and stamp ONLY the frozen v0 prefix (through the v0 nested callbacks), so
+ * they never enable the appended publish_tracks / drop_without_demand /
+ * catalog_refresh_interval_us fields or the appended callbacks. To set ANY
+ * appended field -- e.g. a live-preset push sender, or a custom/disabled
+ * catalog refresh interval -- initialize with the _sized form and sizeof(*cfg):
+ *
+ *     moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+ *     cfg.publish_tracks = true;
+ *
+ * Each clears and stamps min(cfg_size, this library's struct size) and applies
+ * its preset defaults only to fields that lie within that prefix; the nested
+ * callbacks struct is initialized to the portion the caller's storage covers.
+ * Safe for a caller compiled against an older, smaller header too. */
+MOQ_API void moq_media_sender_cfg_init_sized(moq_media_sender_cfg_t *cfg,
+                                             size_t cfg_size);
+MOQ_API void moq_media_sender_cfg_init_live_sized(moq_media_sender_cfg_t *cfg,
+                                                  size_t cfg_size);
+MOQ_API void moq_media_sender_cfg_init_lossless_sized(
+    moq_media_sender_cfg_t *cfg, size_t cfg_size);
 
 /* -- Track configuration (§7.1) --------------------------------------- *
  * Carries enough to derive the track's MSF catalog entry and to package
@@ -572,8 +624,10 @@ MOQ_API moq_result_t moq_media_sender_create(const moq_media_sender_cfg_t *cfg,
  * stops and destroys it too. */
 MOQ_API void moq_media_sender_destroy(moq_media_sender_t *s);
 
-/* is_ready (§7.2): the namespace has been accepted AND the catalog is
- * published -- the publish path is ready to accept/send media. It does NOT
+/* is_ready (§7.2): the catalog is published AND the peer acknowledged the
+ * announcement -- the namespace accepted (pull), or, in push mode
+ * (publish_tracks), the catalog track's PUBLISH accepted. The publish path
+ * is then ready to accept/send media. It does NOT
  * mean a subscriber exists (pure publish often has no downstream
  * visibility). To observe DEMAND -- whether a relay/player has actually
  * subscribed -- use the callbacks on moq_media_sender_cfg_t or the demand
@@ -629,9 +683,9 @@ MOQ_API bool moq_media_sender_track_has_subscriber(
 MOQ_API bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s);
 
 /* is_closed: clean close / drained. is_fatal: connect, certificate,
- * protocol, transport, or sender failure (catalog encode, namespace
- * rejected, setup). fatal_code: the sender's own code when sender-fatal,
- * otherwise the endpoint's. */
+ * protocol, transport, or sender failure (catalog encode, setup, namespace
+ * rejected or cancelled, PUBLISH rejected). fatal_code: the sender's own code
+ * when sender-fatal, otherwise the endpoint's. */
 MOQ_API bool     moq_media_sender_is_closed(const moq_media_sender_t *s);
 MOQ_API bool     moq_media_sender_is_fatal(const moq_media_sender_t *s);
 MOQ_API uint64_t moq_media_sender_fatal_code(const moq_media_sender_t *s);
@@ -642,6 +696,12 @@ MOQ_API uint64_t moq_media_sender_fatal_code(const moq_media_sender_t *s);
                                                         retained setup failed */
 #define MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED 0x3u /* peer refused the
                                                         namespace */
+#define MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED 0x4u /* peer withdrew a
+                                                        previously accepted
+                                                        namespace */
+#define MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED   0x5u /* peer rejected a
+                                                        catalog or media-track
+                                                        PUBLISH */
 
 #ifdef __cplusplus
 }

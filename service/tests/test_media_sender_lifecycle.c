@@ -31,6 +31,9 @@ void moq_media_sender_test_fire_fatal(moq_media_sender_t *s, uint64_t code);
 void moq_media_sender_test_fire_publish_finished(moq_media_sender_t *s,
                                                  moq_media_track_t *track);
 moq_media_track_t *moq_media_sender_test_catalog_track(moq_media_sender_t *s);
+void moq_media_sender_test_apply_cfg_tail(moq_media_sender_t *s,
+                                          const moq_media_sender_cfg_t *cfg);
+unsigned moq_media_sender_test_cfg_tail_mask(const moq_media_sender_t *s);
 
 /* Add an app-visible RAW video track to a test sender (returns its handle). */
 static moq_media_track_t *add_video(moq_media_sender_t *s, const char *name)
@@ -93,10 +96,23 @@ static void on_track_closed_cb(void *ctx, moq_media_sender_t *sender,
     o->track_closed_last = track;
 }
 
+/* Real no-op callbacks for the copier tests (never actually invoked; the
+ * mask seam only reports pointer presence). Integer sentinels cast to
+ * function pointers would be UB to even compare/call. */
+static void noop_joined(void *ctx, moq_media_sender_t *sender,
+                        moq_media_track_t *track, size_t n)
+{ (void)ctx; (void)sender; (void)track; (void)n; }
+static void noop_left(void *ctx, moq_media_sender_t *sender,
+                      moq_media_track_t *track, size_t n)
+{ (void)ctx; (void)sender; (void)track; (void)n; }
+
 static void install(moq_media_sender_t *s, struct obs *o)
 {
     moq_media_sender_callbacks_t cb;
-    moq_media_sender_callbacks_init(&cb);
+    /* Sized init: on_ready/on_closed/on_track_closed are APPENDED fields; the
+     * pointer-only initializer stamps only the frozen v0 prefix and would
+     * leave them disabled. */
+    moq_media_sender_callbacks_init_sized(&cb, sizeof(cb));
     cb.ctx = o;
     cb.on_ready = on_ready_cb;
     cb.on_closed = on_closed_cb;
@@ -252,6 +268,196 @@ int main(void)
         moq_media_sender_test_fire_closed(s, false, 0);
         moq_media_sender_test_free(s);
         MOQ_TEST_PASS("sender_lifecycle.no_callbacks_safe");
+    }
+
+    /* -- ABI: pointer-only initializers clear ONLY the frozen v0 prefix -- */
+
+    /* Old-layout heap canary: a caller compiled before the appended
+     * on_ready/on_closed/on_track_closed fields hands the pointer-only
+     * initializer exactly the v0 storage; the bytes after it must survive. */
+    {
+        enum { CB_V0 =
+            (int)offsetof(moq_media_sender_callbacks_t, on_ready) };
+        union {
+            moq_media_sender_callbacks_t aligner;   /* alignment only */
+            struct {
+                unsigned char prefix[CB_V0];
+                uint64_t canary;
+            } box;
+        } u;
+        memset(&u, 0xAB, sizeof(u));
+        moq_media_sender_callbacks_init(
+            (moq_media_sender_callbacks_t *)&u.box);
+        uint32_t ss;
+        memcpy(&ss, u.box.prefix, sizeof(ss));
+        MOQ_TEST_CHECK(ss == (uint32_t)CB_V0);
+        MOQ_TEST_CHECK(u.box.canary == 0xABABABABABABABABULL);
+
+        moq_media_sender_callbacks_t full;
+        memset(&full, 0xAB, sizeof(full));
+        moq_media_sender_callbacks_init_sized(&full, sizeof(full));
+        MOQ_TEST_CHECK(full.struct_size == sizeof(full));
+        MOQ_TEST_CHECK(full.on_ready == NULL);
+        MOQ_TEST_PASS("sender_lifecycle.callbacks_init_old_prefix_no_overflow");
+    }
+
+    /* Same for the cfg initializers (all three presets): the v0 cfg ended
+     * with the v0 PORTION of the embedded callbacks; the appended callback
+     * fields + publish_tracks + drop_without_demand lie past the caller's
+     * storage. */
+    {
+        enum { CFG_V0 =
+            (int)(offsetof(moq_media_sender_cfg_t, callbacks) +
+                  offsetof(moq_media_sender_callbacks_t, on_ready)) };
+        union {
+            moq_media_sender_cfg_t aligner;   /* alignment only */
+            struct {
+                unsigned char prefix[CFG_V0];
+                uint64_t canary;
+            } box;
+        } u;
+        void (*const inits[])(moq_media_sender_cfg_t *) = {
+            moq_media_sender_cfg_init,
+            moq_media_sender_cfg_init_live,
+            moq_media_sender_cfg_init_lossless,
+        };
+        for (size_t i = 0; i < sizeof(inits) / sizeof(inits[0]); i++) {
+            memset(&u, 0xAB, sizeof(u));
+            inits[i]((moq_media_sender_cfg_t *)&u.box);
+            uint32_t ss;
+            memcpy(&ss, u.box.prefix, sizeof(ss));
+            MOQ_TEST_CHECK(ss == (uint32_t)CFG_V0);
+            MOQ_TEST_CHECK(u.box.canary == 0xABABABABABABABABULL);
+        }
+
+        /* Sized presets enable the appended fields; oversized-future clamps. */
+        moq_media_sender_cfg_t full;
+        moq_media_sender_cfg_init_live_sized(&full, sizeof(full));
+        MOQ_TEST_CHECK(full.struct_size == sizeof(full));
+        MOQ_TEST_CHECK(full.backpressure == MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME);
+        MOQ_TEST_CHECK(full.validate_cmaf == true);
+        MOQ_TEST_CHECK(full.callbacks.struct_size == sizeof(full.callbacks));
+        MOQ_TEST_CHECK(full.publish_tracks == false);
+        full.publish_tracks = true;   /* the documented push-preset flow */
+        moq_media_sender_cfg_t over;
+        moq_media_sender_cfg_init_lossless_sized(&over, sizeof(over) + 64);
+        MOQ_TEST_CHECK(over.struct_size == sizeof(over));
+        MOQ_TEST_CHECK(over.backpressure == MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT);
+        MOQ_TEST_PASS("sender_lifecycle.cfg_init_old_prefix_no_overflow");
+    }
+
+    /* -- ABI: the PRODUCTION cfg-tail copier honors old-caller prefixes -- */
+
+    /* An old caller's COMPLETE (for its build) cfg: outer struct_size ends at
+     * the v0 floor, nested callbacks struct_size at the v0 callbacks prefix,
+     * with the v0 on_subscriber_joined field set. The copier must keep it. */
+    {
+        enum { CB_V0 =
+            (int)offsetof(moq_media_sender_callbacks_t, on_ready) };
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        struct obs o; memset(&o, 0, sizeof(o));
+
+        moq_media_sender_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.struct_size =
+            (uint32_t)(offsetof(moq_media_sender_cfg_t, callbacks) +
+                       (size_t)CB_V0);
+        cfg.callbacks.struct_size = (uint32_t)CB_V0;
+        cfg.callbacks.ctx = &o;
+        cfg.callbacks.on_subscriber_joined = noop_joined;
+        moq_media_sender_test_apply_cfg_tail(s, &cfg);
+        unsigned m = moq_media_sender_test_cfg_tail_mask(s);
+        MOQ_TEST_CHECK((m & 1u) != 0);    /* joined survived */
+        MOQ_TEST_CHECK((m & 32u) != 0);   /* ctx survived */
+        MOQ_TEST_CHECK((m & 4u) == 0);    /* on_ready absent (past prefix) */
+        MOQ_TEST_CHECK((m & 256u) == 0);  /* publish_tracks absent */
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_lifecycle.cfg_tail_old_prefix_callbacks_kept");
+    }
+
+    /* Partial-field poison: the outer struct_size ends MID-way through the
+     * appended on_ready pointer; the nested struct_size claims everything.
+     * The effective prefix is bounded by BOTH, whole-field: on_ready's
+     * poisoned bytes must not be installed. */
+    {
+        enum { CB_V0 =
+            (int)offsetof(moq_media_sender_callbacks_t, on_ready) };
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        struct obs o; memset(&o, 0, sizeof(o));
+
+        moq_media_sender_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        memset((unsigned char *)&cfg.callbacks + CB_V0, 0xEE,
+               sizeof(cfg.callbacks) - (size_t)CB_V0);
+        cfg.callbacks.struct_size = (uint32_t)sizeof(cfg.callbacks);
+        cfg.callbacks.ctx = &o;
+        cfg.callbacks.on_subscriber_left = noop_left;
+        cfg.struct_size =
+            (uint32_t)(offsetof(moq_media_sender_cfg_t, callbacks) +
+                       (size_t)CB_V0 + 4);
+        moq_media_sender_test_apply_cfg_tail(s, &cfg);
+        unsigned m = moq_media_sender_test_cfg_tail_mask(s);
+        MOQ_TEST_CHECK((m & 2u) != 0);    /* left survived (whole field) */
+        MOQ_TEST_CHECK((m & 4u) == 0);    /* poisoned on_ready NOT installed */
+        MOQ_TEST_CHECK((m & (8u | 16u)) == 0);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_lifecycle.cfg_tail_partial_field_poison");
+    }
+
+    /* Oversized-future caller: outer + nested sizes beyond this build clamp
+     * to what the library knows; every current field flows through. */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        struct obs o; memset(&o, 0, sizeof(o));
+
+        moq_media_sender_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.struct_size = (uint32_t)(sizeof(cfg) + 64);
+        cfg.callbacks.struct_size = (uint32_t)(sizeof(cfg.callbacks) + 64);
+        cfg.callbacks.ctx = &o;
+        cfg.callbacks.on_ready = on_ready_cb;
+        cfg.callbacks.on_closed = on_closed_cb;
+        cfg.publish_tracks = true;
+        cfg.drop_without_demand = true;
+        moq_media_sender_test_apply_cfg_tail(s, &cfg);
+        unsigned m = moq_media_sender_test_cfg_tail_mask(s);
+        MOQ_TEST_CHECK((m & 4u) != 0);     /* on_ready */
+        MOQ_TEST_CHECK((m & 8u) != 0);     /* on_closed */
+        MOQ_TEST_CHECK((m & 256u) != 0);   /* publish_tracks */
+        MOQ_TEST_CHECK((m & 512u) != 0);   /* drop_without_demand */
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_lifecycle.cfg_tail_oversized_future");
+    }
+
+
+    /* Tiny-size hardening: a cfg_size smaller than the struct_size field
+     * itself must leave the caller's storage COMPLETELY untouched -- the
+     * base init cannot even stamp, and the preset wrappers must not gate on
+     * the unstamped (poisoned) struct_size to write defaults out of bounds. */
+    {
+        void (*const sized_inits[])(moq_media_sender_cfg_t *, size_t) = {
+            moq_media_sender_cfg_init_sized,
+            moq_media_sender_cfg_init_live_sized,
+            moq_media_sender_cfg_init_lossless_sized,
+        };
+        for (size_t i = 0; i < sizeof(sized_inits) / sizeof(sized_inits[0]);
+             i++) {
+            for (size_t n = 0; n < sizeof(uint32_t); n++) {
+                union { moq_media_sender_cfg_t aligner; /* alignment only */
+                        unsigned char raw[sizeof(moq_media_sender_cfg_t)]; } u;
+                memset(&u, 0xEE, sizeof(u));   /* poison, incl. struct_size */
+                sized_inits[i]((moq_media_sender_cfg_t *)u.raw, n);
+                bool untouched = true;
+                for (size_t b = 0; b < sizeof(u.raw); b++)
+                    if (u.raw[b] != 0xEE) { untouched = false; break; }
+                MOQ_TEST_CHECK(untouched);
+            }
+        }
+        moq_media_sender_callbacks_t cb;
+        memset(&cb, 0xEE, sizeof(cb));
+        moq_media_sender_callbacks_init_sized(&cb, 3);
+        MOQ_TEST_CHECK(((unsigned char *)&cb)[0] == 0xEE);
+        MOQ_TEST_PASS("sender_lifecycle.sized_init_tiny_size_untouched");
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

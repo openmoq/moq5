@@ -173,8 +173,10 @@ struct cert_client_state {
     std::atomic<bool> setup_done{false};
 };
 
-static int cert_client_pump(moq_mvfst_managed_t *m, uint64_t now, void *ctx)
+static int cert_client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                    uint64_t now, void *ctx)
 {
+    (void)lane;
     (void)now;
     auto *cs = static_cast<cert_client_state *>(ctx);
     moq_session_t *s = moq_mvfst_managed_session(m);
@@ -245,7 +247,7 @@ static void test_cert_path_secure_loopback()
     cfg.port = port;
     cfg.insecure_skip_verify = false;
     cfg.cert_path = tmppath;
-    cfg.on_pump = cert_client_pump;
+    cfg.on_lane_pump = cert_client_pump;
     cfg.user_ctx = &cs;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;

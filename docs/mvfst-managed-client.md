@@ -7,7 +7,7 @@ mvfst QUIC transport. Requires `MOQ_BUILD_ADAPTER_MVFST=ON`.
 
 The managed client owns the network thread, EventBase, mvfst
 QuicClientTransport, moq_session_t, and the adapter bridge. The
-application drives protocol logic inside an `on_pump` callback
+application drives protocol logic inside an `on_lane_pump` callback
 and uses `wake()`/`wait()` for cross-thread signaling.
 
 ```
@@ -20,7 +20,7 @@ App thread                   Managed network thread
 
   wake() ──────────────────→ EventBase.loopOnce()
                              adapter.service(now)
-                             on_pump(session)
+                             on_lane_pump(session)
   wait() ◄──────────────────  signal_activity()
 
   stop() ──────────────────→ teardown adapter
@@ -40,7 +40,7 @@ cfg.perspective  = MOQ_PERSPECTIVE_CLIENT;
 cfg.host         = "relay.example.com";  /* hostname or numeric IP */
 cfg.port         = 4433;
 cfg.insecure_skip_verify = true;  /* or: cfg.cert_path = "/path/to/ca.pem"; */
-cfg.on_pump      = my_pump;
+cfg.on_lane_pump      = my_pump;
 cfg.user_ctx     = &my_state;
 cfg.send_request_capacity = true;
 cfg.initial_request_capacity = 16;
@@ -61,14 +61,15 @@ moq_mvfst_managed_destroy(m);  /* calls stop() internally */
 ## Session access
 
 `moq_mvfst_managed_session()` returns non-NULL **only when called
-from the managed network thread** (inside `on_pump`). Calling it
+from the managed network thread** (inside `on_lane_pump`). Calling it
 from the app thread always returns NULL. All `moq_session_*` calls
-must happen inside `on_pump`.
+must happen inside `on_lane_pump`.
 
 ## Pump callback
 
 ```c
-int my_pump(moq_mvfst_managed_t *m, uint64_t now_us, void *ctx) {
+int my_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+            uint64_t now_us, void *ctx) {
     moq_session_t *s = moq_mvfst_managed_session(m);
     if (!s) return 0;
 

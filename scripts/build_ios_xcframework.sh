@@ -4,8 +4,10 @@
 #
 # Produces a single static xcframework containing the full MoQService
 # C stack (core + media + service + picoquic raw/threaded + pico_wt
-# raw/managed) with its transport dependencies (picoquic, picohttp,
-# picotls) merged into one archive per platform slice:
+# raw/managed + the wtquic attach and Network.framework managed
+# adapters, service backend WTQUIC_NETWORK enabled) with its transport
+# dependencies (picoquic, picohttp, picotls, wtquic core + network)
+# merged into one archive per platform slice:
 #
 #     <out>/LibMoQ.xcframework
 #         ios-arm64/            device slice   (LC_BUILD_VERSION platform 2)
@@ -46,6 +48,9 @@
 #                              else <repo>/../picoquic)
 #   MOQ_PICOTLS_SOURCE_DIR     picotls checkout  (default: <repo>/.deps/picoquic-ci/picotls,
 #                              else <repo>/../picotls)
+#   MOQ_WTQUIC_SOURCE_DIR      wtquic checkout   (default: <repo>/.deps/wtquic-ci/wtquic,
+#                              else <repo>/../wtquic; materialize the
+#                              pinned checkout with scripts/setup_wtquic_deps.sh)
 #   MOQ_IOS_DEPLOYMENT_TARGET  min iOS version   (default: 16.0)
 #   MOQ_IOS_JOBS               parallel build jobs (default: hw.ncpu)
 #
@@ -93,6 +98,56 @@ resolve_dep() {
 picoquic_src=$(resolve_dep picoquic "${MOQ_PICOQUIC_SOURCE_DIR:-}" MOQ_PICOQUIC_SOURCE_DIR)
 picotls_src=$(resolve_dep picotls "${MOQ_PICOTLS_SOURCE_DIR:-}" MOQ_PICOTLS_SOURCE_DIR)
 
+# wtquic checkout (core + Network.framework backend; the msquic backend
+# is not built for iOS). The DEFAULT path is the pinned checkout that
+# scripts/setup_wtquic_deps.sh materializes into .deps/wtquic-ci/wtquic,
+# and the pin is VERIFIED before anything compiles: an artifact must
+# never silently embed whatever HEAD a sibling checkout happens to be
+# on. MOQ_WTQUIC_SOURCE_DIR remains available as an EXPLICIT unverified
+# override for local development, and is labeled loudly as such.
+wtquic_pin=$(sed -n 's/^WTQUIC_REF="\${WTQUIC_REF:-\(.*\)}"$/\1/p' \
+    "$script_dir/setup_wtquic_deps.sh" | head -1)
+[ -n "$wtquic_pin" ] || die "cannot read the wtquic pin from setup_wtquic_deps.sh"
+wtquic_src=""
+wtquic_pinned=0
+if [ -n "${MOQ_WTQUIC_SOURCE_DIR:-}" ]; then
+    [ -d "$MOQ_WTQUIC_SOURCE_DIR" ] \
+        || die "wtquic: '$MOQ_WTQUIC_SOURCE_DIR' is not a directory"
+    wtquic_src="$MOQ_WTQUIC_SOURCE_DIR"
+    log "WARNING: MOQ_WTQUIC_SOURCE_DIR override in use -- the wtquic"
+    log "WARNING: sources are NOT verified against the dependency pin"
+    log "WARNING: ($wtquic_pin); the artifact is a local development"
+    log "WARNING: build, not a pinned release build."
+elif [ -d "$repo_root/.deps/wtquic-ci/wtquic" ]; then
+    wtquic_src="$repo_root/.deps/wtquic-ci/wtquic"
+    wtquic_pinned=1
+else
+    die "pinned wtquic checkout not found; run scripts/setup_wtquic_deps.sh
+  (or set MOQ_WTQUIC_SOURCE_DIR as an explicit UNVERIFIED override)"
+fi
+if [ "$wtquic_pinned" = 1 ]; then
+    actual=$(git -C "$wtquic_src" rev-parse HEAD 2>/dev/null || echo unknown)
+    if [ "$actual" != "$wtquic_pin" ]; then
+        die "wtquic pin mismatch BEFORE compiling anything:
+  pinned:   $wtquic_pin
+  checkout: $actual ($wtquic_src)
+Re-run scripts/setup_wtquic_deps.sh to re-materialize the pin, or set
+MOQ_WTQUIC_SOURCE_DIR explicitly for an unverified local build."
+    fi
+    # the SHA alone is not reproducibility: tracked, staged, or
+    # untracked changes in the pinned checkout would still compile
+    # unpinned sources into the artifact
+    dirty=$(git -C "$wtquic_src" status --porcelain 2>/dev/null | head -5)
+    if [ -n "$dirty" ]; then
+        die "wtquic pinned checkout is DIRTY (HEAD is $wtquic_pin) BEFORE
+compiling anything:
+$dirty
+Remove/clean $wtquic_src (setup_wtquic_deps.sh re-materializes it), or
+set MOQ_WTQUIC_SOURCE_DIR explicitly for an unverified local build."
+    fi
+    log "wtquic pin verified: $wtquic_pin (clean checkout)"
+fi
+
 # OpenSSL prefix. Default: REQUIRE an iOS-built OpenSSL 3.x via
 # MOQ_IOS_OPENSSL_ROOT, so the xcframework this produces is actually
 # linkable in an app. The picoquic adapter's certificate verifier and
@@ -123,6 +178,7 @@ fi
 
 log "picoquic source : $picoquic_src"
 log "picotls source  : $picotls_src"
+log "wtquic source   : $wtquic_src ($(git -C "$wtquic_src" rev-parse --short HEAD 2>/dev/null || echo untracked))"
 log "OpenSSL prefix  : $openssl_root"
 log "deployment tgt  : iOS $deploy_target"
 log "build root      : $build_root"
@@ -144,6 +200,30 @@ build_slice() {
     local slice=$1 sysroot=$2 want_platform=$3
     local bdir="$build_root/$slice"
     local prefix="$build_root/prefix-$slice"
+    local wtq_bdir="$build_root/wtquic-$slice"
+    local wtq_prefix="$build_root/wtquic-prefix-$slice"
+
+    log "[$slice] configure wtquic (core + network)"
+    cmake -B "$wtq_bdir" -S "$wtquic_src" \
+        -DCMAKE_SYSTEM_NAME=iOS \
+        -DCMAKE_OSX_SYSROOT="$sysroot" \
+        -DCMAKE_OSX_ARCHITECTURES=arm64 \
+        -DCMAKE_OSX_DEPLOYMENT_TARGET="$deploy_target" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DWTQ_BUILD_NETWORK=ON \
+        -DWTQ_BUILD_MSQUIC=OFF \
+        -DWTQ_BUILD_PICOQUIC=OFF \
+        -DWTQ_BUILD_TESTS=OFF -DWTQ_BUILD_SIM=OFF \
+        -DWTQ_BUILD_FUZZ=OFF -DWTQ_BUILD_NW_EXPERIMENTAL=OFF \
+        -DWTQ_BUILD_BENCHMARKS=OFF -DWTQ_BUILD_EXAMPLES=OFF \
+        >&2
+    log "[$slice] build + install wtquic -> $wtq_prefix"
+    cmake --build "$wtq_bdir" -j"$jobs" >&2
+    rm -rf "$wtq_prefix"
+    cmake --install "$wtq_bdir" --prefix "$wtq_prefix" >/dev/null
+    [ -f "$wtq_prefix/lib/cmake/wtquic/wtquic-networkTargets.cmake" ] \
+        || die "[$slice] wtquic network component missing from $wtq_prefix"
 
     log "[$slice] configure"
     cmake -B "$bdir" -S "$repo_root" \
@@ -163,6 +243,9 @@ build_slice() {
         -DMOQ_BUILD_PQ_THREADED=ON \
         -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
         -DMOQ_BUILD_PICO_WT_MANAGED=ON \
+        -DMOQ_BUILD_ADAPTER_WTQUIC=ON \
+        -DMOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON \
+        -Dwtquic_DIR="$wtq_prefix/lib/cmake/wtquic" \
         -DMOQ_PICOQUIC_SOURCE_DIR="$picoquic_src" \
         -DPICOQUIC_FETCH_PTLS=ON \
         -DFETCHCONTENT_SOURCE_DIR_PICOTLS="$picotls_src" \
@@ -170,7 +253,7 @@ build_slice() {
         -DWITH_FUSION=OFF \
         -DBUILD_DEMO=OFF -DBUILD_PQBENCH=OFF -DBUILD_LOGREADER=OFF \
         -DOPENSSL_ROOT_DIR="$openssl_root" \
-        "-DCMAKE_FIND_ROOT_PATH=$openssl_root;$picotls_src" \
+        "-DCMAKE_FIND_ROOT_PATH=$openssl_root;$picotls_src;$wtq_prefix" \
         >&2
 
     log "[$slice] build"
@@ -187,6 +270,11 @@ build_slice() {
         [ -f "$bdir/$dep" ] || die "[$slice] expected archive missing: $bdir/$dep"
         merge+=("$bdir/$dep")
     done
+    for dep in lib/libwtquic.a lib/libwtquic-network.a; do
+        [ -f "$wtq_prefix/$dep" ] \
+            || die "[$slice] expected archive missing: $wtq_prefix/$dep"
+        merge+=("$wtq_prefix/$dep")
+    done
     libtool -static -no_warning_for_no_symbols \
         -o "$bdir/libmoq_bundle.a" "${merge[@]}"
 
@@ -196,6 +284,10 @@ build_slice() {
     # nm/otool and trip pipefail).
     nm "$bdir/libmoq_bundle.a" 2>/dev/null | grep "T _moq_endpoint_connect" >/dev/null \
         || die "[$slice] _moq_endpoint_connect missing from bundle"
+    nm "$bdir/libmoq_bundle.a" 2>/dev/null | grep "T _moq_wtquic_network_managed_create" >/dev/null \
+        || die "[$slice] _moq_wtquic_network_managed_create missing from bundle"
+    nm "$bdir/libmoq_bundle.a" 2>/dev/null | grep "T _wtq_nw_conn_doorbell_ring" >/dev/null \
+        || die "[$slice] _wtq_nw_conn_doorbell_ring missing from bundle"
     local platform
     platform=$(otool -l "$bdir/libmoq_bundle.a" 2>/dev/null \
         | awk '/platform/ && !found {print $2; found=1} END {if (!found) print "none"}')

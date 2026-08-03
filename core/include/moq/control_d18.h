@@ -538,13 +538,22 @@ MOQ_API moq_result_t moq_d18_decode_request_update(
 
 /*
  * REQUEST_OK (draft-18 §10.5): no Request ID (the bidi stream correlates).
- * REQUEST_UPDATE_OK carries no parameters and empty Track Properties; the
- * decoder accepts only that form (non-empty parameters/properties are a
- * PROTOCOL_VIOLATION here until those are modelled).
+ * The ZERO-PARAMETER form -- used for PUBLISH_NAMESPACE_OK,
+ * SUBSCRIBE_NAMESPACE_OK, and SUBSCRIBE_TRACKS_OK: no parameters and empty
+ * Track Properties. The decoder accepts only that form here (any
+ * parameters/properties are rejected). Note: PUBLISH_OK and SUBSCRIBE_OK are
+ * NOT zero-parameter -- they carry the subscriber's delivery parameters and use
+ * their own encoders (moq_d18_encode_publish_ok / _subscribe_ok). The
+ * REQUEST_UPDATE_OK form, which MAY carry LARGEST_OBJECT / EXPIRES parameters,
+ * uses the internal moq_d18_{encode,decode}_request_update_ok variants
+ * (control_d18_internal.h).
  */
 MOQ_API moq_result_t moq_d18_encode_request_ok(moq_buf_writer_t *w);
 MOQ_API moq_result_t moq_d18_decode_request_ok(const uint8_t *payload,
                                                size_t payload_len);
+/* The REQUEST_UPDATE_OK variants that carry LARGEST_OBJECT / EXPIRES params are
+ * INTERNAL (core/src/wire/control_d18_internal.h) -- not part of the public
+ * codec surface (the public additions are limited to the session API). */
 
 /*
  * PUBLISH_DONE (draft-18 §10.11): a publisher's final message before closing
