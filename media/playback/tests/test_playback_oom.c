@@ -180,7 +180,7 @@ static size_t build_aac_init(uint8_t *buf, uint32_t timescale,
     wr32(buf+p,0); p+=4; wr32(buf+p,1); p+=4;
     p+=box_hdr(buf+p,(uint32_t)mp,"mp4a");
     memset(buf+p,0,28);
-    wr16(buf+p+8,channels); wr16(buf+p+24,samplerate); p+=28;
+    wr16(buf+p+16,channels); wr16(buf+p+24,samplerate); p+=28;
     p+=box_hdr(buf+p,(uint32_t)esz,"esds");
     wr32(buf+p,0); p+=4;
     buf[p++]=0x03; buf[p++]=(uint8_t)(esl-2);

@@ -368,7 +368,7 @@ static moq_result_t parse_stsd_entry(const uint8_t *stsd_box,
         eb = body + entry.hdr + 28;
         eb_len = entry.size - entry.hdr - 28;
         out->samplerate = rd16(body + entry.hdr + 24);
-        out->channel_count = rd16(body + entry.hdr + 8);
+        out->channel_count = rd16(body + entry.hdr + 16);
     } else {
         out->codec_kind = MOQ_CMAF_CODEC_UNKNOWN;
         return MOQ_OK;
