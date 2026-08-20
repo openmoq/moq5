@@ -2330,10 +2330,16 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
      * callback in the same cycle it is accepted (before the drain runs). */
     sender_resync_demand(s);
 
-    /* Publish-initiated: once the peer accepts the catalog PUBLISH, push the
-     * initial catalog object live so a relay caches it without a FETCH. */
+    /* Publish-initiated: write the initial catalog live so a catalog-blind
+     * relay can cache it (media_sender.h: publish_tracks "without a FETCH").
+     * Retained-group install is a different operation (docs/publisher-
+     * retained-groups.md): SUBSCRIBE + Joining FETCH(offset 0) reads the
+     * origin cache; live write fills the relay. Do not wait for
+     * sender_track_demand — PUBLISH_OK often arrives with Forward 0, and
+     * write_object_ex still fans out to the established publication. Gating
+     * on demand skipped the live object, left the relay empty, and late
+     * joiners saw a live namespace with no catalog. */
     if (s->publish_tracks && !s->live_catalog_sent && s->catalog_published &&
-        sender_track_demand(s, s->catalog_track) &&
         s->published_catalog) {
         moq_pub_object_cfg_t ocfg;
         moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
