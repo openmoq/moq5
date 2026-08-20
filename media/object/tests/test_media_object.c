@@ -246,7 +246,7 @@ int main(void)
         moq_rcbuf_decref(props);
     }
 
-    /* -- RAW on a draft-18 session: the info draft picks the encoding ---- *
+    /* -- RAW draft-18: the track info draft picks the encoding -------- *
      * The property block's integers follow the negotiated draft, so a draft-18
      * block only reads back when the track info says draft-18; with the default
      * (draft-16) the same bytes are malformed. */

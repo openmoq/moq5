@@ -485,11 +485,11 @@ static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
     return MOQ_LOC_PROFILE_01;
 }
 
-/* The draft whose integer encoding the LOC property block uses (§1.4.1): the
- * one the session negotiated, latched by the hook. The write path validates
- * against the same draft it encodes for, so the two can never disagree. A
- * sender with no endpoint (unit tests) stays on draft-16. Called with s->mu
- * held (the latch is written under it). */
+/* The draft whose integer encoding the LOC property block uses: the one the
+ * session negotiated, latched by the hook (see <moq/loc.h>). The write path
+ * validates the block against the same draft it was encoded for, so the two can
+ * never disagree. A sender with no endpoint (unit tests) stays on draft-16.
+ * Called with s->mu held (the latch is written under it). */
 static moq_version_t sender_loc_draft(const moq_media_sender_t *s)
 {
     return s->negotiated_draft ? s->negotiated_draft : MOQ_VERSION_DRAFT_16;

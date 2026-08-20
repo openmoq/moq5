@@ -888,7 +888,7 @@ int main(void)
      * draft, and a draft-18 session's block must satisfy the draft-18 property
      * validation the write path applies to it. */
 
-    /* -- D18 timestamp byte-level oracle (the 33333us capture time) ---- */
+    /* -- D18 timestamp oracle (the 33333us capture time) ------------- */
     {
         moq_loc_headers_t h;
         moq_loc_headers_init(&h);
@@ -984,7 +984,7 @@ int main(void)
         }
     }
 
-    /* -- D18 carries values draft-16 cannot ------------------------------ */
+    /* -- D18 carries values draft-16 cannot -------------------------- */
     {
         moq_loc_headers_t h;
         moq_loc_headers_init(&h);
@@ -1008,7 +1008,7 @@ int main(void)
         }
     }
 
-    /* -- a draft this library has no encoding for is refused ------------ */
+    /* -- a draft this library has no encoding for is refused --------- */
     {
         moq_loc_headers_t h;
         moq_loc_headers_init(&h);
