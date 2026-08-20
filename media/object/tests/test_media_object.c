@@ -32,7 +32,8 @@ static moq_rcbuf_t *make_loc_props(const moq_alloc_t *alloc,
         lh.video_frame_marking.end_of_frame = true;
     }
     moq_rcbuf_t *out = NULL;
-    if (moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &out) != MOQ_OK)
+    if (moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                       &lh, &out) != MOQ_OK)
         return NULL;
     return out;
 }
@@ -228,7 +229,8 @@ int main(void)
         lh.has_timestamp = true;
         lh.timestamp = 5000;
         moq_rcbuf_t *props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                             &lh, &props) == MOQ_OK);
 
         moq_media_object_input_t oi;
         moq_media_object_input_init(&oi);
@@ -239,6 +241,48 @@ int main(void)
         CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &po, NULL) == MOQ_OK);
         CHECK(po.keyframe == false);
         CHECK(po.decode_time_us == 5000);
+
+        moq_rcbuf_decref(payload);
+        moq_rcbuf_decref(props);
+    }
+
+    /* -- RAW on a draft-18 session: the info draft picks the encoding ---- *
+     * The property block's integers follow the negotiated draft, so a draft-18
+     * block only reads back when the track info says draft-18; with the default
+     * (draft-16) the same bytes are malformed. */
+    {
+        moq_media_track_info_t ti;
+        moq_media_track_info_init(&ti);
+        ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        ti.packaging = MOQ_MEDIA_PACKAGING_RAW;
+
+        uint8_t data[] = { 0x01 };
+        moq_rcbuf_t *payload = NULL;
+        CHECK(moq_rcbuf_create(alloc, data, 1, &payload) == MOQ_OK);
+
+        moq_loc_headers_t lh;
+        moq_loc_headers_init(&lh);
+        lh.has_timestamp = true;
+        lh.timestamp = 33333;
+        moq_rcbuf_t *props = NULL;
+        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_18,
+                             &lh, &props) == MOQ_OK);
+
+        moq_media_object_input_t oi;
+        moq_media_object_input_init(&oi);
+        oi.payload = payload;
+        oi.properties = props;
+
+        moq_media_parsed_object_t po;
+        moq_media_drop_reason_t why = 0;
+        CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &po, &why)
+              == MOQ_ERR_PROTO);
+        CHECK(why == MOQ_MEDIA_DROP_MALFORMED_LOC);
+
+        ti.draft = MOQ_VERSION_DRAFT_18;
+        CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &po, NULL) == MOQ_OK);
+        CHECK(po.has_capture_time == true);
+        CHECK(po.capture_time_us == 33333);
 
         moq_rcbuf_decref(payload);
         moq_rcbuf_decref(props);
@@ -459,7 +503,8 @@ int main(void)
         lh.has_video_frame_marking = true;
         lh.video_frame_marking.independent = false;
         moq_rcbuf_t *props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                             &lh, &props) == MOQ_OK);
 
         size_t len = build_fragment(buf, 90000, 3000, 2, 0x00000000, 0, mdat, 2);
         moq_rcbuf_t *payload = NULL;
@@ -483,7 +528,8 @@ int main(void)
         lh.has_video_frame_marking = true;
         lh.video_frame_marking.independent = true;
         props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                             &lh, &props) == MOQ_OK);
 
         len = build_fragment(buf, 90000, 3000, 2, 0x00010000, 0, mdat, 2);
         payload = NULL;

@@ -46,11 +46,14 @@ struct headers {
     bytes_view video_config{};
 };
 
-inline result<headers> parse(profile p, bytes_view properties)
+/* `draft` is the version the session negotiated: it selects the property
+ * block's integer encoding (see moq/loc.h). */
+inline result<headers> parse(profile p, moq_version_t draft,
+                             bytes_view properties)
 {
     moq_loc_headers_t ch;
     moq_result_t rc = moq_loc_parse(
-        static_cast<moq_loc_profile_t>(p), properties.raw(), &ch);
+        static_cast<moq_loc_profile_t>(p), draft, properties.raw(), &ch);
     if (rc < 0)
         return errc_from_result(rc);
 
@@ -84,7 +87,7 @@ inline result<headers> parse(profile p, bytes_view properties)
     return h;
 }
 
-inline result<buffer> encode(profile p, const headers &h,
+inline result<buffer> encode(profile p, moq_version_t draft, const headers &h,
                               const moq_alloc_t *alloc = moq_alloc_default())
 {
     moq_loc_headers_t ch;
@@ -120,7 +123,7 @@ inline result<buffer> encode(profile p, const headers &h,
 
     moq_rcbuf_t *raw = nullptr;
     moq_result_t rc = moq_loc_encode(alloc,
-        static_cast<moq_loc_profile_t>(p), &ch, &raw);
+        static_cast<moq_loc_profile_t>(p), draft, &ch, &raw);
     if (rc < 0)
         return errc_from_result(rc);
 

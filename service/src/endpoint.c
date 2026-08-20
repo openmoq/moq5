@@ -1826,6 +1826,13 @@ uint64_t moq_endpoint_fatal_code_internal(const moq_endpoint_t *ep)
     return ep_facade_fatal_code(ep);
 }
 
+moq_version_t moq_endpoint_negotiated_version_internal(
+    const moq_endpoint_t *ep)
+{
+    if (!ep) return (moq_version_t)0;
+    return ep->negotiated;
+}
+
 void moq_endpoint_detach_hook(moq_endpoint_t *ep,
                               moq_endpoint_hook_kind_t kind, void *ctx)
 {

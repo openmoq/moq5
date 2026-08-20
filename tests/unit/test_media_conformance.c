@@ -274,7 +274,7 @@ static const moq_test_media_case_t MSF_CASES[] = {
 static moq_result_t loc_encode(const moq_alloc_t *al, const void *m,
                                moq_rcbuf_t **out)
 {
-    return moq_loc_encode(al, MOQ_LOC_PROFILE_01,
+    return moq_loc_encode(al, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
                           (const moq_loc_headers_t *)m, out);
 }
 
@@ -283,7 +283,8 @@ static bool loc_reparse_equal(moq_bytes_t bytes, const void *m)
     const moq_loc_headers_t *want = (const moq_loc_headers_t *)m;
     moq_loc_headers_t got;
     moq_loc_headers_init(&got);
-    if (moq_loc_parse(MOQ_LOC_PROFILE_01, bytes, &got) != MOQ_OK) return false;
+    if (moq_loc_parse(MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16, bytes,
+                      &got) != MOQ_OK) return false;
 
     if (got.has_timestamp != want->has_timestamp ||
         got.timestamp != want->timestamp) return false;
@@ -317,7 +318,7 @@ static moq_result_t loc_parse_only(moq_bytes_t bytes)
 {
     moq_loc_headers_t h;
     moq_loc_headers_init(&h);
-    return moq_loc_parse(MOQ_LOC_PROFILE_01, bytes, &h);
+    return moq_loc_parse(MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16, bytes, &h);
 }
 
 static const moq_test_media_format_ops_t LOC_OPS = {

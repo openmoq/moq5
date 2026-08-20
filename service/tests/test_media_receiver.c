@@ -544,7 +544,8 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
         h.has_video_frame_marking = true;
         h.video_frame_marking.independent = (i % OBJS_PER_GROUP) == 0;
         moq_rcbuf_t *props = NULL;
-        if (moq_loc_encode(moq_alloc_default(), MOQ_LOC_PROFILE_01, &h,
+        if (moq_loc_encode(moq_alloc_default(), MOQ_LOC_PROFILE_01,
+                           MOQ_VERSION_DRAFT_16, &h,
                            &props) != MOQ_OK)
             return false;
         uint8_t bytes[OBJ_PAYLOAD_LEN];

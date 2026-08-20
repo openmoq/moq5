@@ -22,7 +22,8 @@ private func encodeLOCProps(
         h.video_frame_marking.end_of_frame = true
     }
     var p: OpaquePointer?
-    let rc = moq_loc_encode(moq_alloc_default()!, MOQ_LOC_PROFILE_01, &h, &p)
+    let rc = moq_loc_encode(moq_alloc_default()!, MOQ_LOC_PROFILE_01,
+                            MOQ_VERSION_DRAFT_16, &h, &p)
     guard rc == MOQ_OK else { throw MoQError.internal }
     guard let ptr = p else { return nil }
     return Buffer(adopting: ptr)

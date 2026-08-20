@@ -151,7 +151,8 @@ static size_t build_loc_ext(uint8_t *out, size_t out_cap)
     h.video_frame_marking.independent = true;   /* -> keyframe */
 
     moq_rcbuf_t *ext = NULL;
-    if (moq_loc_encode(moq_alloc_default(), MOQ_LOC_PROFILE_01, &h, &ext) < 0
+    if (moq_loc_encode(moq_alloc_default(), MOQ_LOC_PROFILE_01,
+                       MOQ_VERSION_DRAFT_16, &h, &ext) < 0
         || !ext)
         return 0;
     size_t n = moq_rcbuf_len(ext);

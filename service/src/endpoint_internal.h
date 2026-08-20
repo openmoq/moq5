@@ -148,6 +148,14 @@ bool moq_endpoint_is_closed_internal(const moq_endpoint_t *ep);
 bool moq_endpoint_is_fatal_internal(const moq_endpoint_t *ep);
 uint64_t moq_endpoint_fatal_code_internal(const moq_endpoint_t *ep);
 
+/* The negotiated version WITHOUT taking ep->mu, for an attached service: the
+ * public moq_endpoint_negotiated_version() locks ep->mu, which a hook (the pump
+ * holds ep->mu across hooks) and a service-mu holder must not do. The pump sets
+ * the value under ep->mu immediately before it runs the hooks, so a hook always
+ * observes the established session's version. 0 until ESTABLISHED. */
+moq_version_t moq_endpoint_negotiated_version_internal(
+    const moq_endpoint_t *ep);
+
 /* Internal retryable post: like moq_endpoint_post(), but a task that returns
  * MOQ_ERR_WOULD_BLOCK is REQUEUED (the same node, no re-allocation) to run again
  * on a later pump cycle instead of being freed -- allocation-free retry for work

@@ -325,6 +325,10 @@ struct moq_media_sender {
     bool              fatal;
     uint64_t          fatal_code;
 
+    /* Negotiated MoQ draft, latched by the hook from the endpoint. Selects the
+     * LOC property encoding (sender_loc_draft). 0 until established. */
+    moq_version_t     negotiated_draft;
+
     /* Latches so on_ready / on_closed each fire at most once (network thread). */
     bool              ready_fired;
     bool              closed_fired;
@@ -479,6 +483,16 @@ static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
 {
     (void)s;   /* version-driven once LOC-02 lands; LOC-01-only for now */
     return MOQ_LOC_PROFILE_01;
+}
+
+/* The draft whose integer encoding the LOC property block uses (§1.4.1): the
+ * one the session negotiated, latched by the hook. The write path validates
+ * against the same draft it encodes for, so the two can never disagree. A
+ * sender with no endpoint (unit tests) stays on draft-16. Called with s->mu
+ * held (the latch is written under it). */
+static moq_version_t sender_loc_draft(const moq_media_sender_t *s)
+{
+    return s->negotiated_draft ? s->negotiated_draft : MOQ_VERSION_DRAFT_16;
 }
 
 /* -- Send queue (mu held by caller) ----------------------------------- *
@@ -987,7 +1001,8 @@ static bool sender_build_props(moq_media_sender_t *s,
         h.video_frame_marking.independent = e->is_sync;
     }
     moq_rcbuf_t *loc = NULL;
-    if (moq_loc_encode(&s->alloc, sender_loc_profile(s), &h, &loc) != MOQ_OK)
+    if (moq_loc_encode(&s->alloc, sender_loc_profile(s), sender_loc_draft(s),
+                       &h, &loc) != MOQ_OK)
         return false;
     *out = loc;   /* has_timestamp is always set, so loc is non-NULL */
     return true;
@@ -2161,10 +2176,16 @@ static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
 static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                         uint64_t now_us, void *ctx)
 {
-    (void)ep;
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
 
+    /* Latch the negotiated draft: it picks the LOC property encoding, and the
+     * drain path needs it under s->mu. The hook runs under ep->mu, so read it
+     * with the ep->mu-free accessor (0 before the session is established, and
+     * for a test sender driven without an endpoint). */
+    moq_version_t neg = moq_endpoint_negotiated_version_internal(ep);
+
     pthread_mutex_lock(&s->mu);
+    if (neg) s->negotiated_draft = neg;
     bool fatal = s->fatal;
     uint64_t fatal_code = s->fatal_code;
     pthread_mutex_unlock(&s->mu);
@@ -3638,12 +3659,15 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         return MOQ_ERR_WRONG_STATE;
     }
 
-    /* The LOC Capture Timestamp is emitted as a QUIC varint by moq_loc_encode,
-     * but ONLY for RAW packaging (CMAF passes the app's property block through
-     * untouched, so its timestamp fields are never encoded here). A value beyond
-     * the varint range cannot be encoded; left to the drain path it would fatal
-     * the sender AFTER the object was queued and its payload ownership taken.
-     * Reject it synchronously -- before any enqueue / ownership transfer. The
+    /* The LOC Capture Timestamp is emitted by moq_loc_encode, but ONLY for RAW
+     * packaging (CMAF passes the app's property block through untouched, so its
+     * timestamp fields are never encoded here). A value the property encoding
+     * cannot carry would, left to the drain path, fatal the sender AFTER the
+     * object was queued and its payload ownership taken. Reject it
+     * synchronously -- before any enqueue / ownership transfer. The bound stays
+     * the QUIC-varint range for every draft: draft-16 cannot encode past it,
+     * and draft-18's vi64 spans all of uint64 but keeps the same single shared
+     * bound rather than admitting timestamps only one draft can emit. The
      * encoded value is capture_time_us when has_capture_time, else the
      * presentation_time_us fallback (sender_build_props), so validate whichever
      * will be encoded. MOQ_QUIC_VARINT_MAX itself is encodable (accepted). */

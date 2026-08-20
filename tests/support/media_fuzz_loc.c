@@ -121,19 +121,22 @@ static int loc_soft(const moq_alloc_t *alloc, const uint8_t *buf, size_t len)
 {
     int failures = 0;
     moq_loc_headers_t p1;
-    if (moq_loc_parse(MOQ_LOC_PROFILE_01, (moq_bytes_t){ buf, len }, &p1)
+    if (moq_loc_parse(MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                      (moq_bytes_t){ buf, len }, &p1)
         != MOQ_OK)
         return 0;   /* reject is fine */
     /* A parsed model must re-encode (an empty model legitimately encodes to no
      * bytes: MOQ_OK with a NULL rcbuf -- treated as a zero-length property set). */
     moq_rcbuf_t *re = NULL;
-    moq_result_t er = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &p1, &re);
+    moq_result_t er = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01,
+                                     MOQ_VERSION_DRAFT_16, &p1, &re);
     MOQ_TEST_CHECK(er == MOQ_OK);
     if (er == MOQ_OK) {
         moq_bytes_t rb = re ? (moq_bytes_t){ moq_rcbuf_data(re), moq_rcbuf_len(re) }
                             : (moq_bytes_t){ NULL, 0 };
         moq_loc_headers_t p2;
-        moq_result_t rc2 = moq_loc_parse(MOQ_LOC_PROFILE_01, rb, &p2);
+        moq_result_t rc2 = moq_loc_parse(MOQ_LOC_PROFILE_01,
+                                         MOQ_VERSION_DRAFT_16, rb, &p2);
         MOQ_TEST_CHECK(rc2 == MOQ_OK);
         if (rc2 == MOQ_OK)
             MOQ_TEST_CHECK(loc_headers_equal(&p1, &p2));
@@ -179,6 +182,7 @@ static int loc_mutate(const moq_alloc_t *alloc, moq_fuzz_rng_t *rng,
         if (n > 0) {
             moq_loc_headers_t p1;
             moq_result_t rc = moq_loc_parse(MOQ_LOC_PROFILE_01,
+                MOQ_VERSION_DRAFT_16,
                 (moq_bytes_t){ buf, blen + n }, &p1);
             MOQ_TEST_CHECK(rc == MOQ_OK);          /* unknown KVP ignored */
             if (rc == MOQ_OK)
@@ -201,6 +205,7 @@ static int loc_mutate(const moq_alloc_t *alloc, moq_fuzz_rng_t *rng,
             buf[blen + 1] = 0x05;                  /* length 5, no value bytes */
             moq_loc_headers_t p1;
             moq_result_t rc = moq_loc_parse(MOQ_LOC_PROFILE_01,
+                MOQ_VERSION_DRAFT_16,
                 (moq_bytes_t){ buf, blen + 2 }, &p1);
             MOQ_TEST_CHECK(rc != MOQ_OK);          /* truncated value -> reject */
         }
@@ -225,7 +230,8 @@ static int loc_one_case(const moq_alloc_t *alloc, moq_fuzz_rng_t *rng,
     loc_gen(rng, &model, vcfg);
 
     moq_rcbuf_t *enc = NULL;
-    moq_result_t rc = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &model, &enc);
+    moq_result_t rc = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01,
+                                     MOQ_VERSION_DRAFT_16, &model, &enc);
     MOQ_TEST_CHECK(rc == MOQ_OK && enc != NULL);   /* generated valid must encode */
     if (rc != MOQ_OK || !enc) {
         if (enc) moq_rcbuf_decref(enc);
@@ -236,14 +242,16 @@ static int loc_one_case(const moq_alloc_t *alloc, moq_fuzz_rng_t *rng,
 
     moq_bytes_t bytes = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
     moq_loc_headers_t back;
-    moq_result_t prc = moq_loc_parse(MOQ_LOC_PROFILE_01, bytes, &back);
+    moq_result_t prc = moq_loc_parse(MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                                     bytes, &back);
     MOQ_TEST_CHECK(prc == MOQ_OK);
     if (prc == MOQ_OK)
         MOQ_TEST_CHECK(loc_headers_equal(&model, &back));
 
     /* Encode is deterministic: the same model yields identical bytes. */
     moq_rcbuf_t *enc2 = NULL;
-    moq_result_t rc2 = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &model, &enc2);
+    moq_result_t rc2 = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01,
+                                      MOQ_VERSION_DRAFT_16, &model, &enc2);
     MOQ_TEST_CHECK(rc2 == MOQ_OK && enc2 != NULL);
     if (rc2 == MOQ_OK && enc2) {
         size_t n1 = moq_rcbuf_len(enc), n2 = moq_rcbuf_len(enc2);
