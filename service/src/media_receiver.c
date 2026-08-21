@@ -325,6 +325,10 @@ struct moq_media_receiver {
     uint32_t         mt_cap, mt_head, mt_tail;
     bool             fatal;
     uint64_t         fatal_code;
+    /* Negotiated MoQ draft, latched by the hook from the endpoint. Stamped into
+     * every track handle's info so the LOC property block is parsed with the
+     * encoding the session negotiated. 0 until established. */
+    moq_version_t    negotiated_draft;
     moq_media_receiver_stats_t stats;    /* counter fields only */
 };
 
@@ -899,6 +903,10 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
         moq_cmaf_init_info_init(&d->init);
         d->has_init = false;
     }
+    /* Stamped after every info init above: the parse side reads it to pick the
+     * property block's integer encoding. Set on the hook thread, which latched
+     * it before this catalog was ingested; 0 leaves the info default. */
+    if (r->negotiated_draft) d->info.draft = r->negotiated_draft;
     return t;
 }
 
@@ -2407,10 +2415,16 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
 static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
                           uint64_t now_us, void *ctx)
 {
-    (void)ep;
     moq_media_receiver_t *r = (moq_media_receiver_t *)ctx;
 
+    /* Latch the negotiated draft: it picks the encoding the LOC property
+     * block is parsed with (receiver_track_build stamps it into each handle).
+     * The hook runs under ep->mu, so read it with the ep->mu-free accessor
+     * (0 before the session is established, and with no endpoint in tests). */
+    moq_version_t neg = moq_endpoint_negotiated_version_internal(ep);
+
     pthread_mutex_lock(&r->mu);
+    if (neg) r->negotiated_draft = neg;
     bool fatal = r->fatal;
     pthread_mutex_unlock(&r->mu);
     if (fatal || !session) return;

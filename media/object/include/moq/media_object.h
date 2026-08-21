@@ -52,6 +52,11 @@ typedef struct moq_media_track_info {
     moq_media_type_t     media_type;
     moq_media_packaging_t packaging;
     uint32_t             timescale;
+    /* The session's negotiated MoQ draft. LOC object properties are encoded
+     * differently per draft (see <moq/loc.h>), so a receiver must set this from
+     * moq_endpoint_negotiated_version(). moq_media_track_info_init defaults it
+     * to MOQ_VERSION_DRAFT_16; read only when struct_size covers it. */
+    moq_version_t        draft;
 } moq_media_track_info_t;
 
 MOQ_API void moq_media_track_info_init(moq_media_track_info_t *info);

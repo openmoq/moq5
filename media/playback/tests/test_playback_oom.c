@@ -67,7 +67,7 @@ static moq_rcbuf_t *make_props(const moq_alloc_t *alloc,
         lh.video_frame_marking.end_of_frame = true;
     }
     moq_rcbuf_t *out = NULL;
-    moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &out);
+    moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16, &lh, &out);
     return out;
 }
 

@@ -206,12 +206,13 @@ int main()
         moq::loc::headers lh;
         lh.has_timestamp = true;
         lh.timestamp     = 42;
-        auto enc = moq::loc::encode(moq::loc::profile::loc01, lh);
+        auto enc = moq::loc::encode(moq::loc::profile::loc01,
+            MOQ_VERSION_DRAFT_16, lh);
         CHECK(enc.ok(), 40);
         CHECK(!enc->empty(), 41);
 
         auto dec = moq::loc::parse(moq::loc::profile::loc01,
-            moq::bytes_view(enc->data(), enc->size()));
+            MOQ_VERSION_DRAFT_16, moq::bytes_view(enc->data(), enc->size()));
         CHECK(dec.ok(), 42);
         CHECK(dec->timestamp == 42, 43);
     }

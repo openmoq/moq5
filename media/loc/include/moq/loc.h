@@ -8,6 +8,11 @@
  * bytes for the selected LOC profile. Each profile maps typed C
  * fields to the property IDs defined by that LOC draft version.
  *
+ * The LOC profile fixes the property IDs and their semantics; the
+ * negotiated MoQ transport draft fixes how the property block encodes
+ * integers, so both parse and encode take it (see the `draft`
+ * parameter below).
+ *
  * Pure helper library: no sessions, no I/O, no threads.
  * Link against moq::loc (depends only on moq::core).
  *
@@ -16,6 +21,7 @@
 
 #include <moq/types.h>
 #include <moq/rcbuf.h>
+#include <moq/session.h>   /* moq_version_t: the negotiated transport draft */
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,8 +31,19 @@ extern "C" {
 
 typedef enum moq_loc_profile {
     MOQ_LOC_PROFILE_01 = 1,  /* draft-ietf-moq-loc-01 */
-    MOQ_LOC_PROFILE_02 = 2,  /* draft-ietf-moq-loc-02; reserved, requires D18 KVP codec */
+    MOQ_LOC_PROFILE_02 = 2,  /* draft-ietf-moq-loc-02; reserved, its property
+                              * mapping is not implemented (ID 0x06 collides
+                              * with LOC-01 Audio Level) */
 } moq_loc_profile_t;
+
+/* -- Property block encoding ------------------------------------------ *
+ * A property block is a list of typed properties whose integer encoding is
+ * fixed by the negotiated MoQ draft (draft-ietf-moq-transport-18 §1.4.1 and
+ * §1.4.3, draft-16 §1.4.2). Draft-16 and draft-18 encode integers differently
+ * and agree only for values up to 63, so a block written for one draft is
+ * rejected on a session that negotiated the other. Callers pass the version
+ * the session negotiated (moq_endpoint_negotiated_version); MOQ_ERR_INVAL for
+ * any other value. */
 
 /* -- Video Frame Marking (RFC 9626 §3.1) ------------------------------ */
 
@@ -88,10 +105,11 @@ MOQ_API void moq_loc_headers_init(moq_loc_headers_t *h);
  *
  * Returns MOQ_OK on success.
  * Returns MOQ_ERR_INVAL if out is NULL, data is NULL with len > 0,
- *   or profile is not a supported value.
+ *   or profile / draft is not a supported value.
  * Returns MOQ_ERR_PROTO on malformed data.
  */
 MOQ_API moq_result_t moq_loc_parse(moq_loc_profile_t profile,
+                                    moq_version_t draft,
                                     moq_bytes_t properties,
                                     moq_loc_headers_t *out);
 
@@ -104,11 +122,13 @@ MOQ_API moq_result_t moq_loc_parse(moq_loc_profile_t profile,
  * If no fields are set, returns MOQ_OK with *out_properties = NULL.
  * Returns MOQ_ERR_INVAL on invalid input (audio level > 127,
  *   temporal_id > 7, NULL alloc or out_properties, unsupported
- *   profile, or a field unsupported by the selected profile).
+ *   profile or draft, a field unsupported by the selected profile, or
+ *   a value the draft's integer encoding cannot represent).
  * Returns MOQ_ERR_NOMEM on allocation failure.
  */
 MOQ_API moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
                                      moq_loc_profile_t profile,
+                                     moq_version_t draft,
                                      const moq_loc_headers_t *headers,
                                      moq_rcbuf_t **out_properties);
 

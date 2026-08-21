@@ -368,8 +368,10 @@ static int loop_callback(picoquic_quic_t *quic,
         lh.video_frame_marking.independent = is_key;
 
         moq_rcbuf_t *props = NULL;
-        if (moq_loc_encode(&ctx->alloc, MOQ_LOC_PROFILE_01, &lh,
-                            &props) != MOQ_OK) {
+        /* The property block follows the session's draft; this demo leaves the
+         * session at the default draft-16. */
+        if (moq_loc_encode(&ctx->alloc, MOQ_LOC_PROFILE_01,
+                            MOQ_VERSION_DRAFT_16, &lh, &props) != MOQ_OK) {
             running = 0;
             return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
         }

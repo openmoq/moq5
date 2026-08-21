@@ -150,7 +150,8 @@ static moq_rcbuf_t *make_props(const moq_alloc_t *alloc,
         lh.video_frame_marking.end_of_frame = true;
     }
     moq_rcbuf_t *out = NULL;
-    if (moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &out) != MOQ_OK)
+    if (moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                       &lh, &out) != MOQ_OK)
         return NULL;
     return out;
 }

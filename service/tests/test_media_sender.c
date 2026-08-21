@@ -283,7 +283,8 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                         moq_loc_headers_init(&h);
                         moq_bytes_t pb = { moq_rcbuf_data(o->properties),
                                            moq_rcbuf_len(o->properties) };
-                        if (moq_loc_parse(MOQ_LOC_PROFILE_01, pb, &h)
+                        if (moq_loc_parse(MOQ_LOC_PROFILE_01,
+                                          MOQ_VERSION_DRAFT_16, pb, &h)
                             == MOQ_OK) {
                             r->has_ts = h.has_timestamp;
                             r->ts = h.timestamp;

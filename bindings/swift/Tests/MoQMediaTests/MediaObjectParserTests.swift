@@ -25,7 +25,8 @@ private func encodeLOCProperties(
     }
     var props: OpaquePointer?
     let alloc = moq_alloc_default()!
-    let rc = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &headers, &props)
+    let rc = moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                            &headers, &props)
     guard rc == MOQ_OK else { throw MoQError.internal }
     guard let p = props else { return nil }
     return Buffer(adopting: p)

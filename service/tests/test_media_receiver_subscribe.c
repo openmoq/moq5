@@ -125,7 +125,8 @@ static bool publish_track(msrv_t *st, moq_pub_track_t *track, int *counter,
         h.has_video_frame_marking = true;
         h.video_frame_marking.independent = (i % OBJS_PER_GROUP) == 0;
         moq_rcbuf_t *props = NULL;
-        if (moq_loc_encode(moq_alloc_default(), MOQ_LOC_PROFILE_01, &h,
+        if (moq_loc_encode(moq_alloc_default(), MOQ_LOC_PROFILE_01,
+                           MOQ_VERSION_DRAFT_16, &h,
                            &props) != MOQ_OK)
             return false;
         uint8_t bytes[16];

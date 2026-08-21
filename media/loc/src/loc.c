@@ -1,13 +1,42 @@
 #include <moq/loc.h>
-#include <moq/kvp.h>
+#include <moq/vi64.h>
 #include <moq/wire.h>
 #include <string.h>
 
 /*
- * LOC-02 uses transport-17/18 vi64 integer encoding and a different
- * KVP wire format. Until a vi64 codec lands in moq-core, LOC-02
- * parse/encode returns MOQ_ERR_INVAL.
+ * LOC-02 reassigns the property IDs (Timestamp moves to 0x06, which LOC-01
+ * uses for Audio Level) and adds a timescale. That mapping is not
+ * implemented: LOC-02 parse/encode returns MOQ_ERR_INVAL.
  */
+
+/* -- KVP integer codec (per negotiated draft) ------------------------- *
+ * The KVP layout is the same in both drafts; only the variable-length integer
+ * differs, so one set of walkers is parameterized by the codec. */
+
+typedef struct loc_vint {
+    size_t (*len)(uint64_t value);
+    size_t (*encode)(uint64_t value, uint8_t *buf, size_t buf_len);
+    size_t (*decode)(const uint8_t *buf, size_t buf_len, uint64_t *out_value);
+} loc_vint_t;
+
+static const loc_vint_t loc_vint_quic = {
+    moq_quic_varint_len, moq_quic_varint_encode, moq_quic_varint_decode,
+};
+
+static const loc_vint_t loc_vint_vi64 = {
+    moq_vi64_len, moq_vi64_encode, moq_vi64_decode,
+};
+
+/* The integer codec the negotiated draft uses for property KVPs
+ * (draft-ietf-moq-transport-18 §1.4.1), or NULL for an unknown version. */
+static const loc_vint_t *loc_vint_for(moq_version_t draft)
+{
+    switch (draft) {
+    case MOQ_VERSION_DRAFT_16: return &loc_vint_quic;
+    case MOQ_VERSION_DRAFT_18: return &loc_vint_vi64;
+    }
+    return NULL;
+}
 
 /* -- Property IDs (LOC-01, draft-ietf-moq-loc-01) -------------------- */
 
@@ -83,6 +112,7 @@ static uint64_t encode_audio_level(const moq_loc_audio_level_t *al)
 /* -- Parse ----------------------------------------------------------- */
 
 moq_result_t moq_loc_parse(moq_loc_profile_t profile,
+                            moq_version_t draft,
                             moq_bytes_t properties,
                             moq_loc_headers_t *out)
 {
@@ -92,24 +122,36 @@ moq_result_t moq_loc_parse(moq_loc_profile_t profile,
     if (profile != MOQ_LOC_PROFILE_01)
         return MOQ_ERR_INVAL;
 
+    const loc_vint_t *vi = loc_vint_for(draft);
+    if (!vi)
+        return MOQ_ERR_INVAL;
+
     if (properties.len == 0)
         return MOQ_OK;
     if (!properties.data)
         return MOQ_ERR_INVAL;
 
-    moq_kvp_decoder_t dec;
-    moq_kvp_decoder_init(&dec, properties.data, properties.len);
+    const uint8_t *p = properties.data;
+    size_t rem = properties.len;
+    uint64_t prev = 0;
 
-    moq_kvp_entry_t entry;
-    moq_result_t rc;
-    while ((rc = moq_kvp_decode_next(&dec, &entry)) == MOQ_OK) {
-        if (entry.is_varint) {
+    while (rem > 0) {
+        uint64_t delta = 0;
+        size_t n = vi->decode(p, rem, &delta);
+        if (n == 0) return MOQ_ERR_PROTO;
+        p += n; rem -= n;
+
+        if (delta > UINT64_MAX - prev) return MOQ_ERR_PROTO;
+        uint64_t type = prev + delta;
+        prev = type;
+
+        if ((type & 1u) == 0) {          /* even type: one integer value */
             uint64_t val = 0;
-            if (moq_quic_varint_decode(entry.value, entry.value_len, &val)
-                != entry.value_len)
-                return MOQ_ERR_PROTO;
+            n = vi->decode(p, rem, &val);
+            if (n == 0) return MOQ_ERR_PROTO;
+            p += n; rem -= n;
 
-            switch (entry.type) {
+            switch (type) {
             case LOC01_CAPTURE_TIMESTAMP:
                 out->has_timestamp = true;
                 out->timestamp = val;
@@ -131,17 +173,24 @@ moq_result_t moq_loc_parse(moq_loc_profile_t profile,
             default:
                 break;
             }
-        } else {
-            if (entry.type == LOC01_VIDEO_CONFIG) {
+        } else {                         /* odd type: length-prefixed bytes */
+            uint64_t vlen = 0;
+            n = vi->decode(p, rem, &vlen);
+            if (n == 0) return MOQ_ERR_PROTO;
+            p += n; rem -= n;
+
+            if (vlen > 0xFFFFu) return MOQ_ERR_PROTO;
+            if (vlen > rem) return MOQ_ERR_PROTO;
+
+            if (type == LOC01_VIDEO_CONFIG) {
                 out->has_video_config = true;
-                out->video_config.data = entry.value;
-                out->video_config.len = entry.value_len;
+                out->video_config.data = p;
+                out->video_config.len = (size_t)vlen;
             }
+            p += (size_t)vlen; rem -= (size_t)vlen;
         }
     }
 
-    if (rc != MOQ_DONE)
-        return rc;
     return MOQ_OK;
 }
 
@@ -160,38 +209,51 @@ typedef struct loc01_prop {
     size_t         bytes_len;
 } loc01_prop_t;
 
-static size_t loc01_prop_encoded_len(uint64_t prev, const loc01_prop_t *p)
+/* Encoded size of one entry, or 0 if the draft's integer encoding cannot
+ * represent the type delta, the value, or the byte-field length (the QUIC
+ * varint caps at 2^62-1; a byte field caps at 2^16-1 in both drafts). */
+static size_t loc01_prop_encoded_len(const loc_vint_t *vi, uint64_t prev,
+                                      const loc01_prop_t *p)
 {
-    if (p->is_varint)
-        return moq_kvp_varint_entry_encoded_len(prev, p->type, p->val);
+    if (p->type < prev) return 0;
+    size_t total = vi->len(p->type - prev);
+    if (total == 0) return 0;
 
-    moq_kvp_entry_t e;
-    memset(&e, 0, sizeof(e));
-    e.type = p->type;
-    e.is_varint = false;
-    e.value = p->bytes;
-    e.value_len = p->bytes_len;
-    return moq_kvp_entry_encoded_len(prev, &e);
+    if (p->is_varint) {
+        size_t vlen = vi->len(p->val);
+        return vlen ? total + vlen : 0;
+    }
+
+    if (p->bytes_len > 0xFFFFu) return 0;
+    if (p->bytes_len > 0 && !p->bytes) return 0;
+    size_t llen = vi->len(p->bytes_len);
+    return llen ? total + llen + p->bytes_len : 0;
 }
 
-static size_t loc01_prop_encode(uint64_t prev, const loc01_prop_t *p,
+static size_t loc01_prop_encode(const loc_vint_t *vi, uint64_t prev,
+                                 const loc01_prop_t *p,
                                  uint8_t *buf, size_t buf_len)
 {
-    if (p->is_varint)
-        return moq_kvp_encode_varint_entry(prev, p->type, p->val,
-                                            buf, buf_len);
+    size_t need = loc01_prop_encoded_len(vi, prev, p);
+    if (need == 0 || buf_len < need) return 0;
 
-    moq_kvp_entry_t e;
-    memset(&e, 0, sizeof(e));
-    e.type = p->type;
-    e.is_varint = false;
-    e.value = p->bytes;
-    e.value_len = p->bytes_len;
-    return moq_kvp_encode_entry(prev, &e, buf, buf_len);
+    size_t pos = vi->encode(p->type - prev, buf, buf_len);
+    if (p->is_varint) {
+        pos += vi->encode(p->val, buf + pos, buf_len - pos);
+        return pos;
+    }
+
+    pos += vi->encode(p->bytes_len, buf + pos, buf_len - pos);
+    if (p->bytes_len > 0) {
+        memcpy(buf + pos, p->bytes, p->bytes_len);
+        pos += p->bytes_len;
+    }
+    return pos;
 }
 
 moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
                              moq_loc_profile_t profile,
+                             moq_version_t draft,
                              const moq_loc_headers_t *headers,
                              moq_rcbuf_t **out_properties)
 {
@@ -199,6 +261,10 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     *out_properties = NULL;
 
     if (profile != MOQ_LOC_PROFILE_01)
+        return MOQ_ERR_INVAL;
+
+    const loc_vint_t *vi = loc_vint_for(draft);
+    if (!vi)
         return MOQ_ERR_INVAL;
 
     if (headers->has_audio_level && headers->audio_level.level > 127)
@@ -261,7 +327,7 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     size_t total = 0;
     uint64_t prev = 0;
     for (size_t i = 0; i < prop_count; i++) {
-        size_t n = loc01_prop_encoded_len(prev, &props[i]);
+        size_t n = loc01_prop_encoded_len(vi, prev, &props[i]);
         if (n == 0) return MOQ_ERR_INVAL;
         total += n;
         prev = props[i].type;
@@ -280,7 +346,8 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     size_t pos = 0;
     prev = 0;
     for (size_t i = 0; i < prop_count; i++) {
-        size_t n = loc01_prop_encode(prev, &props[i], buf + pos, total - pos);
+        size_t n = loc01_prop_encode(vi, prev, &props[i],
+                                      buf + pos, total - pos);
         if (n == 0) {
             if (heap) alloc->free(buf, total, alloc->ctx);
             return MOQ_ERR_INVAL;

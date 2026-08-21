@@ -290,6 +290,7 @@ static size_t build_aac_init(uint8_t *buf, uint32_t timescale,
         _lh.video_frame_marking.end_of_frame = true;          \
     }                                                         \
     CHECK(moq_loc_encode((alloc_p), MOQ_LOC_PROFILE_01,       \
+                         MOQ_VERSION_DRAFT_16,                \
                          &_lh, (out_ptr)) == MOQ_OK);         \
 } while (0)
 
@@ -2349,7 +2350,8 @@ int main(void)
         lh.has_timestamp = true;
         lh.timestamp = 7000;
         moq_rcbuf_t *props = NULL;
-        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, &lh, &props) == MOQ_OK);
+        CHECK(moq_loc_encode(alloc, MOQ_LOC_PROFILE_01, MOQ_VERSION_DRAFT_16,
+                             &lh, &props) == MOQ_OK);
 
         moq_rcbuf_t *p = NULL;
         CHECK(moq_rcbuf_create(alloc, data, 1, &p) == MOQ_OK);

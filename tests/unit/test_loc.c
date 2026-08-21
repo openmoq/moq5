@@ -1,6 +1,8 @@
 #include <moq/loc.h>
 #include <moq/kvp.h>
 #include <moq/wire.h>
+#include <moq/control_d18.h>   /* the draft-18 property validation the write
+                                * path applies to an emitted block */
 #include <moq/rcbuf.h>
 #include "test_support.h"
 #include "test_oom_support.h"
@@ -8,6 +10,10 @@
 
 #define P01 MOQ_LOC_PROFILE_01
 #define P02 MOQ_LOC_PROFILE_02
+/* Negotiated draft: it selects the property block's integer encoding (QUIC
+ * varint for draft-16, vi64 for draft-18). */
+#define D16 MOQ_VERSION_DRAFT_16
+#define D18 MOQ_VERSION_DRAFT_18
 
 int main(void)
 {
@@ -34,29 +40,31 @@ int main(void)
     {
         moq_loc_headers_t h;
         moq_bytes_t empty = { NULL, 0 };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, empty, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, empty, &h) == MOQ_OK);
         MOQ_TEST_CHECK(h.has_timestamp == false);
     }
 
     /* -- parse NULL out returns INVAL -------------------------------- */
     {
         moq_bytes_t empty = { NULL, 0 };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, empty, NULL) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, empty, NULL) == MOQ_ERR_INVAL);
     }
 
     /* -- NULL data with nonzero len returns INVAL -------------------- */
     {
         moq_loc_headers_t h;
         moq_bytes_t bad = { NULL, 5 };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, bad, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, bad, &h) == MOQ_ERR_INVAL);
     }
 
     /* -- invalid profile parse returns INVAL ------------------------- */
     {
         moq_loc_headers_t h;
         moq_bytes_t empty = { NULL, 0 };
-        MOQ_TEST_CHECK(moq_loc_parse((moq_loc_profile_t)0, empty, &h) == MOQ_ERR_INVAL);
-        MOQ_TEST_CHECK(moq_loc_parse((moq_loc_profile_t)99, empty, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse((moq_loc_profile_t)0, D16, empty,
+                                     &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse((moq_loc_profile_t)99, D16, empty,
+                                     &h) == MOQ_ERR_INVAL);
     }
 
     /* -- invalid profile encode returns INVAL ------------------------ */
@@ -67,9 +75,11 @@ int main(void)
         h.timestamp = 1;
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, (moq_loc_profile_t)0, &h, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, (moq_loc_profile_t)0, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
         MOQ_TEST_CHECK(out == NULL);
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, (moq_loc_profile_t)99, &h, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, (moq_loc_profile_t)99, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
         MOQ_TEST_CHECK(out == NULL);
     }
 
@@ -77,7 +87,7 @@ int main(void)
     {
         moq_loc_headers_t h;
         moq_bytes_t empty = { NULL, 0 };
-        MOQ_TEST_CHECK(moq_loc_parse(P02, empty, &h) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(P02, D16, empty, &h) == MOQ_ERR_INVAL);
     }
 
     /* -- LOC-02 encode returns INVAL --------------------------------- */
@@ -88,7 +98,8 @@ int main(void)
         h.timestamp = 48000;
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P02, &h, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P02, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
         MOQ_TEST_CHECK(out == NULL);
     }
 
@@ -101,7 +112,7 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
         MOQ_TEST_CHECK(out != NULL);
 
         /* Expected wire: delta=0x02 (1 byte), value=1000000.
@@ -118,7 +129,7 @@ int main(void)
 
         moq_loc_headers_t parsed;
         moq_bytes_t props = { d, len };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(parsed.timestamp, 1000000);
         moq_rcbuf_decref(out);
     }
@@ -133,7 +144,7 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         /* Expected: delta=0x06, value=0x9E (V=1|level=30).
          * Wire: [0x06] [0x40 0x9E] = 3 bytes.
@@ -158,7 +169,7 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         /* Expected: delta=0x04, value=0xE0.
          * Wire: [0x04] [0x40 0xE0] = 3 bytes.
@@ -181,7 +192,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
         MOQ_TEST_CHECK(h.has_video_frame_marking == true);
         MOQ_TEST_CHECK(h.video_frame_marking.start_of_frame == true);
         MOQ_TEST_CHECK(h.video_frame_marking.end_of_frame == true);
@@ -201,7 +212,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
         MOQ_TEST_CHECK(h.video_frame_marking.has_layer_id == true);
         MOQ_TEST_CHECK_EQ_INT(h.video_frame_marking.layer_id, 0);
         MOQ_TEST_CHECK(h.video_frame_marking.base_layer_sync == true);
@@ -221,7 +232,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
         MOQ_TEST_CHECK(h.has_video_config == true);
         MOQ_TEST_CHECK_EQ_SIZE(h.video_config.len, sizeof(extradata));
         MOQ_TEST_CHECK(memcmp(h.video_config.data, extradata,
@@ -251,7 +262,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(h.timestamp, 5000);
         MOQ_TEST_CHECK(h.video_frame_marking.independent == true);
         MOQ_TEST_CHECK(h.audio_level.voice_activity == true);
@@ -268,7 +279,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_ERR_PROTO);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_ERR_PROTO);
     }
 
     /* -- audio level value > 0xFF returns PROTO ----------------------- */
@@ -280,7 +291,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_ERR_PROTO);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_ERR_PROTO);
     }
 
     /* -- unknown extension ignored ----------------------------------- */
@@ -292,7 +303,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
         MOQ_TEST_CHECK(h.has_timestamp == false);
     }
 
@@ -308,7 +319,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
     }
 
     /* -- duplicate known: last wins ---------------------------------- */
@@ -322,7 +333,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) == MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(h.timestamp, 200);
     }
 
@@ -331,7 +342,7 @@ int main(void)
         uint8_t wire[] = { 0x40 };
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, sizeof(wire) };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) < 0);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) < 0);
     }
 
     /* -- truncated length-prefixed video config ---------------------- */
@@ -345,7 +356,7 @@ int main(void)
 
         moq_loc_headers_t h;
         moq_bytes_t props = { wire, pos };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &h) < 0);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &h) < 0);
     }
 
     /* -- encode no fields returns OK + NULL -------------------------- */
@@ -354,7 +365,7 @@ int main(void)
         moq_loc_headers_init(&h);
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = (moq_rcbuf_t *)1;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
         MOQ_TEST_CHECK(out == NULL);
     }
 
@@ -364,9 +375,12 @@ int main(void)
         moq_loc_headers_init(&h);
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(NULL, P01, &h, &out) == MOQ_ERR_INVAL);
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, NULL, &out) == MOQ_ERR_INVAL);
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, NULL) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(NULL, P01, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, NULL,
+                                      &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h,
+                                      NULL) == MOQ_ERR_INVAL);
     }
 
     /* -- encode audio level > 127 returns INVAL ---------------------- */
@@ -377,7 +391,8 @@ int main(void)
         h.audio_level.level = 128;
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
     }
 
     /* -- encode temporal_id > 7 returns INVAL ------------------------ */
@@ -388,7 +403,8 @@ int main(void)
         h.video_frame_marking.temporal_id = 8;
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
     }
 
     /* -- LOC-01: timescale encode returns INVAL ----------------------- */
@@ -399,7 +415,8 @@ int main(void)
         h.timescale = 48000;
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h,
+                                      &out) == MOQ_ERR_INVAL);
     }
 
     /* -- video frame marking with layer_id roundtrip ------------------ */
@@ -416,11 +433,11 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         moq_loc_headers_t parsed;
         moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
         MOQ_TEST_CHECK(parsed.video_frame_marking.has_layer_id == true);
         MOQ_TEST_CHECK_EQ_INT(parsed.video_frame_marking.layer_id, 15);
         moq_rcbuf_decref(out);
@@ -447,11 +464,11 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         moq_loc_headers_t parsed;
         moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(parsed.timestamp, 1746104600000000ULL);
         MOQ_TEST_CHECK(parsed.video_frame_marking.independent == true);
         MOQ_TEST_CHECK(parsed.audio_level.voice_activity == true);
@@ -473,7 +490,7 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         const uint8_t *d = moq_rcbuf_data(out);
         uint64_t v = 0;
@@ -494,7 +511,8 @@ int main(void)
         moq_alloc_t fail_alloc = oom_allocator(&oom);
 
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out) == MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, D16, &h,
+                                      &out) == MOQ_ERR_NOMEM);
         MOQ_TEST_CHECK(out == NULL);
         MOQ_TEST_CHECK(oom.balance == 0);
     }
@@ -515,7 +533,8 @@ int main(void)
             oom_alloc_state_t oom = { 0, 0, 1 };
             moq_alloc_t fail_alloc = oom_allocator(&oom);
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out) == MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, D16, &h,
+                                          &out) == MOQ_ERR_NOMEM);
             MOQ_TEST_CHECK(out == NULL);
             MOQ_TEST_CHECK(oom.balance == 0);
         }
@@ -525,7 +544,8 @@ int main(void)
             oom_alloc_state_t oom = { 0, 0, 2 };
             moq_alloc_t fail_alloc = oom_allocator(&oom);
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out) == MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, D16, &h,
+                                          &out) == MOQ_ERR_NOMEM);
             MOQ_TEST_CHECK(out == NULL);
             MOQ_TEST_CHECK(oom.balance == 0);
         }
@@ -534,12 +554,12 @@ int main(void)
         {
             const moq_alloc_t *alloc = moq_alloc_default();
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
             MOQ_TEST_CHECK(out != NULL);
 
             moq_loc_headers_t parsed;
             moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
-            MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
             MOQ_TEST_CHECK(parsed.has_video_config == true);
             MOQ_TEST_CHECK_EQ_SIZE(parsed.video_config.len, sizeof(big_config));
             MOQ_TEST_CHECK(memcmp(parsed.video_config.data, big_config,
@@ -558,11 +578,11 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         moq_loc_headers_t parsed;
         moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
         MOQ_TEST_CHECK(parsed.audio_level.voice_activity == false);
         MOQ_TEST_CHECK_EQ_INT(parsed.audio_level.level, 127);
         moq_rcbuf_decref(out);
@@ -580,11 +600,11 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
 
         moq_loc_headers_t parsed;
         moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
-        MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(parsed.video_frame_marking.layer_id, 255);
         moq_rcbuf_decref(out);
     }
@@ -601,7 +621,7 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
         MOQ_TEST_CHECK(out != NULL);
 
         /* Wire: [delta 0x0d] [len 0x03] [AA BB CC] = 5 bytes. */
@@ -689,7 +709,7 @@ int main(void)
 
             const moq_alloc_t *alloc = moq_alloc_default();
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
             MOQ_TEST_CHECK(out != NULL);
             if (out) {
                 MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(out), planned);
@@ -736,7 +756,7 @@ int main(void)
 
             const moq_alloc_t *alloc = moq_alloc_default();
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
             MOQ_TEST_CHECK(out != NULL);
             if (!out) continue;
 
@@ -744,7 +764,7 @@ int main(void)
 
             moq_loc_headers_t parsed;
             moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
-            MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed) == MOQ_OK);
             MOQ_TEST_CHECK(parsed.has_video_config == true);
             MOQ_TEST_CHECK_EQ_SIZE(parsed.video_config.len, kValueLens[c]);
             MOQ_TEST_CHECK(memcmp(parsed.video_config.data, cfg,
@@ -769,7 +789,7 @@ int main(void)
             oom_alloc_state_t oom = { 0, 0, 1 };
             moq_alloc_t fail_alloc = oom_allocator(&oom);
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out)
+            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, D16, &h, &out)
                            == MOQ_ERR_NOMEM);
             MOQ_TEST_CHECK(out == NULL);
             MOQ_TEST_CHECK(oom.balance == 0);
@@ -780,7 +800,7 @@ int main(void)
             oom_alloc_state_t oom = { 0, 0, 2 };
             moq_alloc_t fail_alloc = oom_allocator(&oom);
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out)
+            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, D16, &h, &out)
                            == MOQ_ERR_NOMEM);
             MOQ_TEST_CHECK(out == NULL);
             MOQ_TEST_CHECK(oom.balance == 0);
@@ -802,7 +822,7 @@ int main(void)
         oom_alloc_state_t oom = { 0, 0, 1 };
         moq_alloc_t fail_alloc = oom_allocator(&oom);
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out)
+        MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, D16, &h, &out)
                        == MOQ_ERR_NOMEM);
         MOQ_TEST_CHECK(out == NULL);
         MOQ_TEST_CHECK(oom.balance == 0);
@@ -820,7 +840,7 @@ int main(void)
             h.video_config.data = NULL;
             h.video_config.len = 4;
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out)
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out)
                            == MOQ_ERR_INVAL);
             MOQ_TEST_CHECK(out == NULL);
         }
@@ -834,7 +854,7 @@ int main(void)
             h.video_config.data = big;
             h.video_config.len = sizeof(big);
             moq_rcbuf_t *out = NULL;
-            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out)
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out)
                            == MOQ_ERR_INVAL);
             MOQ_TEST_CHECK(out == NULL);
         }
@@ -850,7 +870,7 @@ int main(void)
 
         const moq_alloc_t *alloc = moq_alloc_default();
         moq_rcbuf_t *out = NULL;
-        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out) == MOQ_OK);
         MOQ_TEST_CHECK(out != NULL);
         if (out) {
             /* Wire: [delta 0x0d] [len 0x00] = 2 bytes. */
@@ -859,6 +879,157 @@ int main(void)
             MOQ_TEST_CHECK_EQ_HEX(moq_rcbuf_data(out)[1], 0x00);
             moq_rcbuf_decref(out);
         }
+    }
+
+    /* == draft-18 property blocks ====================================== *
+     * The property block's integers follow the negotiated draft
+     * (draft-ietf-moq-transport-18 §1.4.1 / §1.4.3): draft-16 and draft-18
+     * agree only up to 63, so the same headers must produce different bytes per
+     * draft, and a draft-18 session's block must satisfy the draft-18 property
+     * validation the write path applies to it. */
+
+    /* -- D18 timestamp oracle (the 33333us capture time) ------------- */
+    {
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true;
+        h.timestamp = 33333;          /* second frame at 30fps */
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_rcbuf_t *b18 = NULL, *b16 = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D18, &h, &b18) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &b16) == MOQ_OK);
+        if (b18 && b16) {
+            /* D18: [delta 0x02] [33333 in 3 bytes: 0xC0 0x82 0x35]. */
+            const uint8_t *d = moq_rcbuf_data(b18);
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(b18), 4);
+            MOQ_TEST_CHECK_EQ_HEX(d[0], 0x02);
+            MOQ_TEST_CHECK_EQ_HEX(d[1], 0xC0);
+            MOQ_TEST_CHECK_EQ_HEX(d[2], 0x82);
+            MOQ_TEST_CHECK_EQ_HEX(d[3], 0x35);
+            /* D16: [delta 0x02] [33333 in 4 bytes: 0x80 0x00 0x82 0x35]. */
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(b16), 5);
+
+            /* The draft-18 block passes the validation a draft-18 session runs
+             * over an outgoing property block; the draft-16 block does not (the
+             * mismatch that failed every frame past 63us). */
+            MOQ_TEST_CHECK(moq_d18_validate_properties(
+                d, moq_rcbuf_len(b18)) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_d18_validate_properties(
+                moq_rcbuf_data(b16), moq_rcbuf_len(b16)) == MOQ_ERR_PROTO);
+
+            /* Each draft reads its own bytes; the other draft's do not decode
+             * as valid metadata. */
+            moq_loc_headers_t parsed;
+            moq_bytes_t props = { d, moq_rcbuf_len(b18) };
+            MOQ_TEST_CHECK(moq_loc_parse(P01, D18, props, &parsed) == MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(parsed.timestamp, 33333);
+            MOQ_TEST_CHECK(moq_loc_parse(P01, D16, props, &parsed)
+                           == MOQ_ERR_PROTO);
+        }
+        if (b18) moq_rcbuf_decref(b18);
+        if (b16) moq_rcbuf_decref(b16);
+    }
+
+    /* -- D18 round-trip: every field, including an odd-type length ---- */
+    {
+        static const uint8_t cfg[200] = { 0x67, 0x42 };
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true;
+        h.timestamp = 1000000;
+        h.has_video_frame_marking = true;
+        h.video_frame_marking.start_of_frame = true;
+        h.video_frame_marking.end_of_frame = true;
+        h.video_frame_marking.independent = true;
+        h.has_audio_level = true;
+        h.audio_level.voice_activity = true;
+        h.audio_level.level = 30;
+        h.has_video_config = true;
+        h.video_config.data = cfg;
+        h.video_config.len = sizeof(cfg);
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D18, &h, &out) == MOQ_OK);
+        if (out) {
+            const uint8_t *d = moq_rcbuf_data(out);
+            size_t len = moq_rcbuf_len(out);
+            /* [0x02][0xCF 0x42 0x40] timestamp, [0x02][0x80 0xE0] marking,
+             * [0x02][0x80 0x9E] audio level, [0x07][0x80 0xC8] + 200 bytes of
+             * video config = 213. The marking value (0xE0) and the 200-byte
+             * length both pass 63, so both take a 2-byte D18 form. */
+            MOQ_TEST_CHECK_EQ_SIZE(len, 213);
+            MOQ_TEST_CHECK_EQ_HEX(d[10], 0x07);
+            MOQ_TEST_CHECK_EQ_HEX(d[11], 0x80);
+            MOQ_TEST_CHECK_EQ_HEX(d[12], 0xC8);
+            MOQ_TEST_CHECK(moq_d18_validate_properties(d, len) == MOQ_OK);
+
+            moq_loc_headers_t parsed;
+            moq_bytes_t props = { d, len };
+            MOQ_TEST_CHECK(moq_loc_parse(P01, D18, props, &parsed) == MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(parsed.timestamp, 1000000);
+            MOQ_TEST_CHECK(parsed.has_video_frame_marking == true);
+            MOQ_TEST_CHECK(parsed.video_frame_marking.start_of_frame == true);
+            MOQ_TEST_CHECK(parsed.video_frame_marking.end_of_frame == true);
+            MOQ_TEST_CHECK(parsed.video_frame_marking.independent == true);
+            MOQ_TEST_CHECK(parsed.has_audio_level == true);
+            MOQ_TEST_CHECK(parsed.audio_level.voice_activity == true);
+            MOQ_TEST_CHECK_EQ_INT(parsed.audio_level.level, 30);
+            MOQ_TEST_CHECK(parsed.has_video_config == true);
+            MOQ_TEST_CHECK_EQ_SIZE(parsed.video_config.len, sizeof(cfg));
+            MOQ_TEST_CHECK(parsed.video_config.data != NULL &&
+                           parsed.video_config.data[0] == 0x67);
+            moq_rcbuf_decref(out);
+        }
+    }
+
+    /* -- D18 carries values draft-16 cannot -------------------------- */
+    {
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true;
+        h.timestamp = UINT64_MAX;
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D16, &h, &out)
+                       == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, D18, &h, &out) == MOQ_OK);
+        if (out) {
+            /* [delta 0x02] + the 9-byte D18 form = 10 bytes. */
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(out), 10);
+            moq_loc_headers_t parsed;
+            moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
+            MOQ_TEST_CHECK(moq_loc_parse(P01, D18, props, &parsed) == MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(parsed.timestamp, UINT64_MAX);
+            moq_rcbuf_decref(out);
+        }
+    }
+
+    /* -- a draft this library has no encoding for is refused --------- */
+    {
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true;
+        h.timestamp = 1;
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, (moq_version_t)0, &h, &out)
+                       == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, (moq_version_t)17, &h, &out)
+                       == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(out == NULL);
+
+        moq_loc_headers_t parsed;
+        moq_bytes_t empty = { NULL, 0 };
+        MOQ_TEST_CHECK(moq_loc_parse(P01, (moq_version_t)0, empty, &parsed)
+                       == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(P01, (moq_version_t)17, empty, &parsed)
+                       == MOQ_ERR_INVAL);
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

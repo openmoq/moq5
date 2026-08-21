@@ -13,6 +13,7 @@ void moq_media_track_info_init(moq_media_track_info_t *info)
     if (!info) return;
     memset(info, 0, sizeof(*info));
     info->struct_size = sizeof(*info);
+    info->draft = MOQ_VERSION_DRAFT_16;
 }
 
 void moq_media_object_input_init(moq_media_object_input_t *in)
@@ -76,6 +77,10 @@ static bool cmaf_sample_is_keyframe(uint32_t flags)
     (offsetof(moq_media_track_info_t, timescale) + \
      sizeof(((moq_media_track_info_t *)0)->timescale))
 
+#define TRACK_INFO_DRAFT_SIZE \
+    (offsetof(moq_media_track_info_t, draft) + \
+     sizeof(((moq_media_track_info_t *)0)->draft))
+
 #define OBJECT_INPUT_MIN_SIZE \
     (offsetof(moq_media_object_input_t, properties) + \
      sizeof(((moq_media_object_input_t *)0)->properties))
@@ -131,7 +136,13 @@ moq_result_t moq_media_object_parse(
         }
 
         if (props.len > 0 || track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
-            moq_result_t lr = moq_loc_parse(MOQ_LOC_PROFILE_01, props, &loc);
+            /* The property block's integer encoding follows the negotiated
+             * draft; a caller predating the field gets draft-16. */
+            moq_version_t draft = MOQ_VERSION_DRAFT_16;
+            if (track->struct_size >= TRACK_INFO_DRAFT_SIZE && track->draft)
+                draft = track->draft;
+            moq_result_t lr = moq_loc_parse(MOQ_LOC_PROFILE_01, draft,
+                                            props, &loc);
             if (lr == MOQ_ERR_PROTO) {
                 if (drop_reason) *drop_reason = MOQ_MEDIA_DROP_MALFORMED_LOC;
                 return MOQ_ERR_PROTO;

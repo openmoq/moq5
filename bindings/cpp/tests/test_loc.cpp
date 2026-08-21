@@ -9,7 +9,8 @@ int main()
 
     // Parse empty LOC-01 — success, no fields
     {
-        auto r = moq::loc::parse(moq::loc::profile::loc01, {});
+        auto r = moq::loc::parse(moq::loc::profile::loc01,
+                                 MOQ_VERSION_DRAFT_16, {});
         MOQ_CHECK(r.ok());
         MOQ_CHECK(!r->has_timestamp);
         MOQ_CHECK(!r->has_timescale);
@@ -21,7 +22,8 @@ int main()
     // Encode empty LOC-01 — success, empty/default buffer
     {
         moq::loc::headers h;
-        auto r = moq::loc::encode(moq::loc::profile::loc01, h);
+        auto r = moq::loc::encode(moq::loc::profile::loc01,
+                                  MOQ_VERSION_DRAFT_16, h);
         MOQ_CHECK(r.ok());
         MOQ_CHECK(r->empty());
     }
@@ -32,7 +34,8 @@ int main()
         h.has_timestamp = true;
         h.timestamp     = 1000000;
 
-        auto r = moq::loc::encode(moq::loc::profile::loc01, h);
+        auto r = moq::loc::encode(moq::loc::profile::loc01,
+                                  MOQ_VERSION_DRAFT_16, h);
         MOQ_CHECK(r.ok());
         MOQ_CHECK(r->size() == 5);
         auto d = r->data();
@@ -50,7 +53,8 @@ int main()
         h.audio_level.voice_activity = true;
         h.audio_level.level          = 30;
 
-        auto r = moq::loc::encode(moq::loc::profile::loc01, h);
+        auto r = moq::loc::encode(moq::loc::profile::loc01,
+                                  MOQ_VERSION_DRAFT_16, h);
         MOQ_CHECK(r.ok());
         MOQ_CHECK(r->size() == 3);
         auto d = r->data();
@@ -63,7 +67,7 @@ int main()
     {
         // Build wire: delta=0x0d, length=3, data={0xAA,0xBB,0xCC}
         uint8_t wire[] = {0x0d, 0x03, 0xAA, 0xBB, 0xCC};
-        auto r = moq::loc::parse(moq::loc::profile::loc01,
+        auto r = moq::loc::parse(moq::loc::profile::loc01, MOQ_VERSION_DRAFT_16,
                                   moq::bytes_view(wire, sizeof(wire)));
         MOQ_CHECK(r.ok());
         MOQ_CHECK(r->has_video_config);
@@ -75,7 +79,8 @@ int main()
 
     // LOC-02 parse returns errc::invalid
     {
-        auto r = moq::loc::parse(moq::loc::profile::loc02, {});
+        auto r = moq::loc::parse(moq::loc::profile::loc02,
+                                 MOQ_VERSION_DRAFT_16, {});
         MOQ_CHECK(!r.ok());
         MOQ_CHECK(r.error().code() == moq::errc::invalid);
     }
@@ -85,7 +90,8 @@ int main()
         moq::loc::headers h;
         h.has_timestamp = true;
         h.timestamp     = 48000;
-        auto r = moq::loc::encode(moq::loc::profile::loc02, h);
+        auto r = moq::loc::encode(moq::loc::profile::loc02,
+                                  MOQ_VERSION_DRAFT_16, h);
         MOQ_CHECK(!r.ok());
         MOQ_CHECK(r.error().code() == moq::errc::invalid);
     }
@@ -94,7 +100,7 @@ int main()
     {
         // delta=6, value=0x100 (2-byte QUIC varint: 0x41 0x00)
         uint8_t wire[] = {0x06, 0x41, 0x00};
-        auto r = moq::loc::parse(moq::loc::profile::loc01,
+        auto r = moq::loc::parse(moq::loc::profile::loc01, MOQ_VERSION_DRAFT_16,
                                   moq::bytes_view(wire, sizeof(wire)));
         MOQ_CHECK(!r.ok());
         MOQ_CHECK(r.error().code() == moq::errc::protocol);
@@ -104,7 +110,7 @@ int main()
     {
         // delta=4, value=0x10000 (4-byte QUIC varint: 0x80 0x01 0x00 0x00)
         uint8_t wire[] = {0x04, 0x80, 0x01, 0x00, 0x00};
-        auto r = moq::loc::parse(moq::loc::profile::loc01,
+        auto r = moq::loc::parse(moq::loc::profile::loc01, MOQ_VERSION_DRAFT_16,
                                   moq::bytes_view(wire, sizeof(wire)));
         MOQ_CHECK(!r.ok());
         MOQ_CHECK(r.error().code() == moq::errc::protocol);
@@ -118,12 +124,13 @@ int main()
         h.has_video_config = true;
         h.video_config     = moq::bytes_view(cfg_data, sizeof(cfg_data));
 
-        auto enc = moq::loc::encode(moq::loc::profile::loc01, h);
+        auto enc = moq::loc::encode(moq::loc::profile::loc01,
+                                  MOQ_VERSION_DRAFT_16, h);
         MOQ_CHECK(enc.ok());
         MOQ_CHECK(!enc->empty());
 
         auto dec = moq::loc::parse(moq::loc::profile::loc01,
-            moq::bytes_view(enc->data(), enc->size()));
+            MOQ_VERSION_DRAFT_16, moq::bytes_view(enc->data(), enc->size()));
         MOQ_CHECK(dec.ok());
         MOQ_CHECK(dec->has_video_config);
         MOQ_CHECK(dec->video_config.size() == sizeof(cfg_data));
@@ -148,11 +155,12 @@ int main()
         h.has_video_config                          = true;
         h.video_config = moq::bytes_view(cfg, sizeof(cfg));
 
-        auto enc = moq::loc::encode(moq::loc::profile::loc01, h);
+        auto enc = moq::loc::encode(moq::loc::profile::loc01,
+                                  MOQ_VERSION_DRAFT_16, h);
         MOQ_CHECK(enc.ok());
 
         auto dec = moq::loc::parse(moq::loc::profile::loc01,
-            moq::bytes_view(enc->data(), enc->size()));
+            MOQ_VERSION_DRAFT_16, moq::bytes_view(enc->data(), enc->size()));
         MOQ_CHECK(dec.ok());
         MOQ_CHECK(dec->timestamp == 5000);
         MOQ_CHECK(dec->video_frame_marking.independent);
