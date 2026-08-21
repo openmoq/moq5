@@ -14,6 +14,7 @@ option(MOQ_BUILD_CPP_BINDING       "Build C++ binding"              OFF)
 option(MOQ_BUILD_LOC               "Build moq-loc LOC helpers"      ON)
 option(MOQ_BUILD_MSF               "Build moq-msf catalog parser"   OFF)
 option(MOQ_BUILD_CMAF              "Build moq-cmaf segment parser"  ON)
+option(MOQ_BUILD_CODEC_SIGNALING   "Build the codec-signaling helpers" ON)
 if(MOQ_BUILD_LOC AND MOQ_BUILD_CMAF)
     set(_MOQ_MEDIA_OBJECT_DEFAULT ON)
 else()
@@ -95,6 +96,11 @@ endif()
 # -- CMAF segment parser --------------------------------------------
 if(MOQ_BUILD_CMAF)
     add_subdirectory(media/cmaf)
+endif()
+
+# -- Codec-signaling helpers ----------------------------------------
+if(MOQ_BUILD_CODEC_SIGNALING)
+    add_subdirectory(media/codec_signaling)
 endif()
 
 # -- Media object normalizer ----------------------------------------
