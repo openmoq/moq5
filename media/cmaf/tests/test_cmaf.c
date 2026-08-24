@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ffmpeg_aac_stereo_init.h"
 #include "media_builders.h"  /* shared CENC-protected init builder */
 
 static int failures = 0;
@@ -172,7 +173,7 @@ static size_t build_aac_init(uint8_t *buf, size_t cap,
     /* mp4a */
     p += box_hdr(buf + p, (uint32_t)mp4a_size, "mp4a");
     memset(buf + p, 0, 28);
-    wr16(buf + p + 8, channels);
+    wr16(buf + p + 16, channels);
     wr16(buf + p + 24, samplerate);
     p += 28;
 
@@ -592,6 +593,28 @@ int main(void)
         CHECK(memcmp(info.codec_config.data, asc, sizeof(asc)) == 0);
     }
 
+    /* -- 3b. parse a fixed FFmpeg stereo AAC init ------------------- */
+    {
+        static const uint8_t asc[] = { 0x11, 0x90, 0x56, 0xe5, 0x00 };
+        moq_cmaf_init_info_t info;
+        moq_cmaf_init_info_init(&info);
+        moq_result_t rc = moq_cmaf_parse_init(
+            (moq_bytes_t){ k_ffmpeg_aac_stereo_init,
+                           sizeof(k_ffmpeg_aac_stereo_init) },
+            &info);
+        CHECK(rc == MOQ_OK);
+        CHECK(info.codec_kind == MOQ_CMAF_CODEC_AAC);
+        CHECK(info.timescale == 48000);
+        CHECK(info.samplerate == 48000);
+        CHECK(info.channel_count == 2);
+        CHECK(info.codec_config.len == sizeof(asc));
+        CHECK(info.codec_config.data != NULL);
+        if (info.codec_config.data != NULL &&
+            info.codec_config.len == sizeof(asc)) {
+            CHECK(memcmp(info.codec_config.data, asc, sizeof(asc)) == 0);
+        }
+    }
+
     /* -- 4. AV1/Opus init: TODO when test synthesis is straightforward */
 
     /* -- 5. parse fragment with one sample ---------------------------- */
@@ -933,7 +956,7 @@ int main(void)
         wr32(buf + p, 1); p += 4;
         p += box_hdr(buf + p, (uint32_t)mp4a_size, "mp4a");
         memset(buf + p, 0, 28);
-        wr16(buf + p + 8, 2);
+        wr16(buf + p + 16, 2);
         wr16(buf + p + 24, 48000);
         p += 28;
         p += box_hdr(buf + p, (uint32_t)esds_size, "esds");

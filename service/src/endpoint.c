@@ -318,6 +318,26 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->wt_profile = cfg->wt_profile;
     }
 
+    /* Handshake bound: the same complete-presence gate; a v0-sized caller gets
+     * 0 (already memset) = the backend's own default. Only picoquic can apply
+     * it (the connect path's configure_quic hook); every other backend would
+     * silently ignore it, so a non-zero value there is an UNSUPPORTED reject,
+     * as with wt_profile. */
+    out->handshake_timeout_us = 0;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, handshake_timeout_us) +
+            sizeof(cfg->handshake_timeout_us)) {
+        /* Range first, as with wt_profile: a value the backend would turn into
+         * an immediate timeout by wrapping its absolute deadline is a clean
+         * MOQ_ERR_INVAL on EVERY backend, not a capability answer. */
+        if (cfg->handshake_timeout_us > MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US)
+            return MOQ_ERR_INVAL;
+        if (cfg->handshake_timeout_us != 0 &&
+            out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+            return MOQ_ERR_UNSUPPORTED;
+        out->handshake_timeout_us = cfg->handshake_timeout_us;
+    }
+
     return resolve_versions(&cfg->versions, out);
 }
 
@@ -379,6 +399,7 @@ struct moq_endpoint {
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
     char *ca_file; size_t ca_file_len; /* NULL = system roots */
     bool  insecure;
+    uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
 
     /* The version offer as transport tokens, preference order. The ALPN
      * entries point at the static strings in moq_alpn.h (no ownership);
@@ -674,13 +695,16 @@ static int ep_wtquic_msquic_pump(moq_wtquic_msquic_managed_t *m,
 #endif
 
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
-/* Install real certificate verification unless explicitly skipped: chain +
- * server-name validation against ep->ca_file (NULL = system roots). The
- * facades' built-in default accepts the peer cert, which is NOT
- * production-safe -- making the safe path the default is this tier's job. */
+/* Apply the caller's handshake bound, then install real certificate
+ * verification unless explicitly skipped: chain + server-name validation
+ * against ep->ca_file (NULL = system roots). The facades' built-in default
+ * accepts the peer cert, which is NOT production-safe -- making the safe path
+ * the default is this tier's job.  */
 static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 {
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    if (ep->handshake_timeout_us > 0)
+        picoquic_set_default_handshake_timeout(quic, ep->handshake_timeout_us);
     if (ep->insecure) return 0;
     return moq_picoquic_set_cert_verifier(quic, ep->ca_file);
 }
@@ -1155,6 +1179,11 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.on_lane_pump_ctx = ep;
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
     fc.app_deadline_ctx = ep;
+    /* Send QUIC keepalive on the client connection so an idle publisher (one
+     * with no subscriber yet) is not dropped by a relay's transport idle
+     * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
+     * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
+    fc.keep_alive_interval_ms = 15000;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1541,6 +1570,15 @@ _Static_assert(MOQ_ENDPOINT_CFG_V0_SIZE ==
                    offsetof(moq_endpoint_cfg_t, wt_profile),
                "moq_endpoint_cfg_t v0 floor must end exactly at wt_profile");
 
+/* Each further tail field is APPENDED after the previous tail, never inserted
+ * into it: a caller compiled against the older layout keeps the same offsets
+ * for every field it knows, and its buffer ends before the new one. If
+ * handshake_timeout_us is ever moved ahead of wt_profile's end this fires. */
+_Static_assert(offsetof(moq_endpoint_cfg_t, handshake_timeout_us) >=
+                   offsetof(moq_endpoint_cfg_t, wt_profile) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->wt_profile),
+               "handshake_timeout_us must be appended after wt_profile");
+
 void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
@@ -1607,6 +1645,7 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     ep->alloc = *alloc;
     ep->protocol = r.protocol;
     ep->insecure = cfg->insecure_skip_verify;
+    ep->handshake_timeout_us = r.handshake_timeout_us;
     atomic_init(&ep->interrupted, false);
     atomic_init(&ep->closed, false);
     pthread_mutex_init(&ep->mu, NULL);

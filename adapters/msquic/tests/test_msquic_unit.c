@@ -758,8 +758,17 @@ static int rx_pair_up(struct rx_pair *p, uint32_t aut_max_events,
 
 /* Poll the subscriber; for each object, record its id-count and a byte
  * check against the deterministic fill. */
-static void rx_collect(struct rx_pair *p, int *count, uint8_t *seen,
-                       int *errors)
+/* Ordered arrival log, so a row can assert the exact sequence rather than
+ * only a set. Sized for the largest workload any caller delivers. */
+struct rx_tally {
+    int count;
+    uint8_t seen[8];
+    int errors;
+    uint64_t order[16];
+    int order_len;
+};
+
+static void rx_collect_tally(struct rx_pair *p, struct rx_tally *t)
 {
     moq_event_t ev;
 
@@ -768,15 +777,42 @@ static void rx_collect(struct rx_pair *p, int *count, uint8_t *seen,
             uint64_t oid = ev.u.object_received.object_id;
             const moq_rcbuf_t *pl = ev.u.object_received.payload;
 
-            (*count)++;
+            t->count++;
             if (oid < 8)
-                seen[oid]++;
-            if (pl == NULL || moq_rcbuf_len(pl) != 3 ||
-                moq_rcbuf_data(pl)[0] != (uint8_t)('A' + oid))
-                (*errors)++;
+                t->seen[oid]++;
+            if (t->order_len <
+                (int)(sizeof(t->order) / sizeof(t->order[0])))
+                t->order[t->order_len++] = oid;
+            /* every payload byte, not just the first: the fill is the
+             * object's own letter repeated, so a corrupted middle byte is
+             * a real difference the old first-byte check missed */
+            if (pl == NULL || moq_rcbuf_len(pl) != 3) {
+                t->errors++;
+            } else {
+                const uint8_t *d = moq_rcbuf_data(pl);
+                uint8_t want = (uint8_t)('A' + oid);
+
+                if (d[0] != want || d[1] != want || d[2] != want)
+                    t->errors++;
+            }
         }
         moq_event_cleanup(&ev);
     }
+}
+
+static void rx_collect(struct rx_pair *p, int *count, uint8_t *seen,
+                       int *errors)
+{
+    struct rx_tally t;
+
+    memset(&t, 0, sizeof(t));
+    t.count = *count;
+    memcpy(t.seen, seen, sizeof(t.seen));
+    t.errors = *errors;
+    rx_collect_tally(p, &t);
+    *count = t.count;
+    memcpy(seen, t.seen, sizeof(t.seen));
+    *errors = t.errors;
 }
 
 /*
@@ -872,6 +908,123 @@ static void t_receive_multibuffer_partial_hold(void)
     rx_pair_down(&p);
     if (failures == before)
         printf("PASS: receive_multibuffer_partial_hold\n");
+}
+
+/*
+ * Capacity invariance: the SAME workload must arrive complete, in order,
+ * byte-exact and exactly once at every receive-queue ceiling. A small
+ * ceiling only changes how often the adapter must arrest and resume -- it
+ * may never change what the application ends up with.
+ *
+ * Objects are laid into one multi-buffer RECEIVE so the arrest lands
+ * mid-event at the tight ceilings, and the drain loop is a bounded
+ * service/redeliver cycle whose bound is a hang guard: the verdict is the
+ * exact final tally, never elapsed rounds.
+ */
+static void t_receive_capacity_invariance(uint32_t cap)
+{
+    int before = failures;
+    struct rx_pair p;
+    moq_subscription_t server_sub;
+    enum { NOBJ = 6, MAX_ROUNDS = 8 * NOBJ };
+
+    if (rx_pair_up(&p, cap, &server_sub) != 0) {
+        CHECK(0 && "rx pair up");
+        rx_pair_down(&p);
+        return;
+    }
+    CHECK(moq_subscription_is_valid(server_sub));
+    if (!moq_subscription_is_valid(server_sub)) {
+        rx_pair_down(&p);
+        return;
+    }
+
+    moq_subgroup_cfg_t sgc;
+    moq_subgroup_handle_t sg;
+    moq_subgroup_cfg_init(&sgc);
+    sgc.group_id = 0;
+    sgc.subgroup_id = 0;
+    sgc.publisher_priority = 200;
+    CHECK(moq_session_open_subgroup(p.peer, server_sub, &sgc, 0, &sg) ==
+          MOQ_OK);
+
+    /* one wire chunk per object, captured by servicing between writes */
+    size_t off[NOBJ + 1];
+    off[0] = 0;
+    for (int i = 0; i < NOBJ; i++) {
+        char payload[4] = { (char)('A' + i), (char)('A' + i),
+                            (char)('A' + i), 0 };
+        moq_rcbuf_t *b = NULL;
+
+        CHECK(moq_rcbuf_create(moq_alloc_default(),
+                               (const uint8_t *)payload, 3, &b) == MOQ_OK);
+        if (b == NULL)
+            break;
+        CHECK(moq_session_write_object(p.peer, sg, (uint64_t)i, b, 0) ==
+              MOQ_OK);
+        moq_rcbuf_decref(b);
+        rx_pump(&p, 3);
+        off[i + 1] = p.uni_len;
+    }
+    CHECK(p.uni_open);
+    for (int i = 0; i < NOBJ; i++)
+        CHECK(off[i + 1] > off[i]);
+
+    const uint8_t *bufs[NOBJ];
+    size_t lens[NOBJ];
+    for (int i = 0; i < NOBJ; i++) {
+        bufs[i] = p.uni_bytes + off[i];
+        lens[i] = off[i + 1] - off[i];
+    }
+    fake_msq_deliver_receive_multi(p.uni_st, bufs, lens, NOBJ, true);
+
+    /* Immediately after the single delivery, the ceiling decides whether
+     * the adapter had to arrest: a tight queue cannot take all six objects
+     * in one go, so delivery must be disabled with bytes held; a ceiling
+     * above the workload must take the lot without arresting at all. */
+    if (cap < NOBJ) {
+        CHECK(p.uni_st->recv_disabled);
+        CHECK(p.uni_st->held_len > 0);
+    } else {
+        CHECK(!p.uni_st->recv_disabled);
+        CHECK(p.uni_st->held_len == 0);
+    }
+
+    /* drain: collect what fits, service to retry the pending feed, and
+     * redeliver whatever the transport is holding, until the tally is
+     * complete. The round bound is a hang guard only. */
+    struct rx_tally t;
+    int rounds = 0;
+
+    memset(&t, 0, sizeof(t));
+    rx_collect_tally(&p, &t);
+    while (t.count < NOBJ && rounds < MAX_ROUNDS) {
+        moq_msquic_conn_service(p.aut.conn);
+        rx_collect_tally(&p, &t);
+        if (t.count < NOBJ && fake_msq_redeliver_held(p.uni_st)) {
+            moq_msquic_conn_service(p.aut.conn);
+            rx_collect_tally(&p, &t);
+        }
+        rounds++;
+    }
+
+    /* the invariant, identical at every ceiling */
+    CHECK(t.count == NOBJ);
+    for (int i = 0; i < NOBJ; i++)
+        CHECK(t.seen[i] == 1); /* each id exactly once: no loss, no dup */
+    CHECK(t.errors == 0);      /* byte-exact, every byte */
+    /* and in the order they were published, not merely all present */
+    CHECK(t.order_len == NOBJ);
+    for (int i = 0; i < NOBJ && i < t.order_len; i++)
+        CHECK(t.order[i] == (uint64_t)i);
+    CHECK(!moq_msquic_conn_is_fatal(p.aut.conn));
+    /* nothing is left arrested once the application has caught up */
+    CHECK(!p.uni_st->recv_disabled);
+    CHECK(p.uni_st->held_len == 0);
+
+    rx_pair_down(&p);
+    if (failures == before)
+        printf("PASS: receive_capacity_invariance[cap=%u]\n", cap);
 }
 
 /*
@@ -1855,6 +2008,10 @@ int main(void)
     t_receive_multibuffer_full_accept();
     t_receive_terminal_while_paused();
     t_receive_multibuffer_partial_hold();
+    t_receive_capacity_invariance(1);
+    t_receive_capacity_invariance(2);
+    t_receive_capacity_invariance(4);
+    t_receive_capacity_invariance(64);
     t_event_progress_token_semantics();
     t_settings_required();
     t_rcbuf_lifetime();

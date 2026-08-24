@@ -312,6 +312,11 @@ typedef struct moq_profile_ops {
 
     /* -- Request-stream correlation capability + hooks ---------------- */
 
+    /* Track Namespace cardinality for full-name request APIs. Draft-16
+     * requires 1..32 fields; draft-18 permits the root namespace (0 fields).
+     * Present fields are non-empty in both profiles. */
+    size_t min_track_namespace_fields;
+
     /*
      * Capability: when true, this profile correlates requests by the identity
      * of a dedicated bidirectional stream opened per request (the request
@@ -331,6 +336,37 @@ typedef struct moq_profile_ops {
      * Largest Object locations (design §4).
      */
     uint64_t location_varint_max;
+
+    /*
+     * Capability: true if this profile's FETCH object header can carry the
+     * datagram-preference bit. Draft-18 sets true; draft-16 sets false (no
+     * datagram bit in the fetch header). The session core asks this capability
+     * (moq_session_supports_fetch_datagram) instead of testing a draft version,
+     * so the query never leaks the version.
+     */
+    bool fetch_datagram_supported;
+
+    /*
+     * Capability: the largest REQUEST_ERROR code this profile can put on the
+     * wire. Draft-16 encodes it as a QUIC varint (MOQ_QUIC_VARINT_MAX ==
+     * 2^62-1, §9.8); draft-18 encodes it as a vi64, which spans the full
+     * 64-bit range (MOQ_VI64_MAX == UINT64_MAX, §1.4.1 / §10.6.2). Public
+     * reject/cancel APIs ask this capability instead of testing a draft
+     * version, and refuse an unrepresentable value BEFORE any mutation
+     * rather than truncating it.
+     */
+    uint64_t request_error_wire_max;
+
+    /*
+     * The semantic REQUEST_ERROR code this profile surfaces for a raw decoded
+     * wire value. Draft-16 states no unknown-code rule, so it returns the raw
+     * value unchanged; draft-18 §15 (:6411-6415) requires every unknown code,
+     * GREASE included, to be treated as INTERNAL_ERROR, so it maps anything
+     * outside its own registry (§15.10.2). Called with the FULL decoded
+     * value, and only after any raw-value dispatch (REDIRECT recognition)
+     * has already happened.
+     */
+    moq_request_error_t (*semantic_request_error)(uint64_t raw);
 
     /*
      * Capability: true if this profile's FETCH-response data plane can carry a

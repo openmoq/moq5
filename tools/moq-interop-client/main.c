@@ -17,6 +17,8 @@
 #include <moq/endpoint.h>
 #include <moq/session.h>
 
+#include "url_policy.h"
+
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -387,7 +389,8 @@ static void print_usage(const char *prog)
         "Usage: %s --relay URL --test NAME [options]\n"
         "\n"
         "  --relay URL             moqt://host:port (raw QUIC) or\n"
-        "                          https://host:port/path (WebTransport)\n"
+        "                          https://host:port[/path] (WebTransport;\n"
+        "                          no path means the root mount \"/\")\n"
         "  --test NAME             test case name (default: run all cases)\n"
         "  --draft N               pin the offered draft to 16 or 18\n"
         "                          (default: offer every draft, negotiate one)\n"
@@ -674,7 +677,15 @@ static moq_endpoint_t *make_endpoint(const char *url, bool insecure)
     }
     cfg.insecure_skip_verify = insecure;
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
-    /* cfg.sni empty -> defaults to URL host; cfg.wt_path empty -> URL path. */
+    /* cfg.sni empty -> defaults to URL host; cfg.wt_path empty -> URL path,
+     * which the endpoint then defaults to "/moq". A relay URL with no path at
+     * all asked for the root mount instead, which is where interop relays
+     * commonly publish WebTransport; an explicit path still wins. */
+    {
+        moq_bytes_t wt_path_override;
+        if (interop_resolve_wt_path(url, &wt_path_override))
+            cfg.wt_path = wt_path_override;
+    }
 
     moq_endpoint_t *ep = NULL;
     if (moq_endpoint_connect(&cfg, &ep) != MOQ_OK) return NULL;

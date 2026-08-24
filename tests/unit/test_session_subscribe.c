@@ -5,6 +5,80 @@
 #include <moq/sim.h>
 #endif
 
+/* Tracking allocator for the #245b arena test: counts every alloc/realloc/free
+ * call and remembers the session slab pointer/size, so the test can prove that
+ * exact allocation is freed exactly once (not merely that the net balance
+ * returns to zero) and that installing/removing carriers allocates nothing. */
+typedef struct {
+    int      alloc_calls, realloc_calls, free_calls;
+    void    *slab_ptr;      /* set by the test to the session base */
+    size_t   slab_size;     /* set by the test to sv->alloc_size */
+    int      slab_frees;    /* frees of exactly (slab_ptr, slab_size) */
+    int      slab_size_mismatch;
+    int64_t  balance;
+} carrier_track_t;
+static void *ct_alloc(size_t size, void *ctx) {
+    carrier_track_t *t = (carrier_track_t *)ctx;
+    t->alloc_calls++;
+    void *p = malloc(size);
+    if (p) t->balance++;
+    return p;
+}
+static void *ct_realloc(void *ptr, size_t old_sz, size_t new_sz, void *ctx) {
+    carrier_track_t *t = (carrier_track_t *)ctx;
+    (void)old_sz;
+    t->realloc_calls++;
+    if (!ptr) { void *p = malloc(new_sz); if (p) t->balance++; return p; }
+    return realloc(ptr, new_sz);
+}
+static void ct_free(void *ptr, size_t size, void *ctx) {
+    carrier_track_t *t = (carrier_track_t *)ctx;
+    t->free_calls++;
+    if (ptr) t->balance--;
+    if (ptr && ptr == t->slab_ptr) {
+        t->slab_frees++;
+        if (size != t->slab_size) t->slab_size_mismatch++;
+    }
+    free(ptr);
+}
+static moq_alloc_t ct_allocator(carrier_track_t *t) {
+    moq_alloc_t a = { t, ct_alloc, ct_realloc, ct_free };
+    return a;
+}
+
+/* True iff the array [arr_addr, arr_addr + cap*elem) lies wholly inside the slab
+ * [base_addr, base_addr + alloc_size). Uses integer addresses and guarded flow
+ * so an array below the base or past the slab end is reported WITHOUT ever
+ * computing an out-of-object pointer difference or an underflowing subtraction
+ * (both undefined). Returns false for any violation. */
+static int carrier_slab_bounds_ok(uintptr_t base_addr, uintptr_t arr_addr,
+                                  size_t alloc_size, size_t cap, size_t elem) {
+    if (arr_addr < base_addr) return 0;
+    size_t offset = (size_t)(arr_addr - base_addr);
+    if (offset > alloc_size) return 0;
+    size_t remaining = alloc_size - offset;
+    if (elem == 0) return cap == 0;
+    return cap <= remaining / elem;
+}
+
+/* Self-check: the bounds predicate is UB-safe and diagnostic on bad inputs. It
+ * must never compute arr-base for arr<base nor underflow when offset>size. */
+static int carrier_slab_bounds_selfcheck(void) {
+    int failures = 0;
+    const size_t E = 4;
+    /* A well-formed array that fits. */
+    MOQ_TEST_CHECK(carrier_slab_bounds_ok(1000, 1040, 200, 7, E));
+    /* Array below the base: rejected, no pointer subtraction. */
+    MOQ_TEST_CHECK(!carrier_slab_bounds_ok(1000, 900, 200, 1, E));
+    /* Offset past the slab end: rejected, no underflow. */
+    MOQ_TEST_CHECK(!carrier_slab_bounds_ok(1000, 1300, 200, 1, E));
+    /* Array starts inside but overruns the slab end: rejected. */
+    MOQ_TEST_CHECK(!carrier_slab_bounds_ok(1000, 1196, 200, 2, E));
+    /* Exactly-fits boundary accepted. */
+    MOQ_TEST_CHECK(carrier_slab_bounds_ok(1000, 1100, 200, 25, E));
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -6789,6 +6863,143 @@ int main(void)
         moq_session_destroy(c);
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* ============================================================== */
+    /* No-slot admission carriers (#245b): arena storage + accounting */
+    /* ============================================================== */
+    /* Absolute, fixture-declared inventory throughout -- nothing is read back
+     * from the product's own observed count. NOTE: this is a DIRECT-HELPER block
+     * -- it exercises noslot_carrier_install/find/remove directly, proving their
+     * accounting/monotonicity. It does NOT prove product-path completion; the
+     * integration oracle (a real refusal, then real replay/completion) lives in
+     * the no-owner matrix. */
+    failures += carrier_slab_bounds_selfcheck();
+    {
+        carrier_track_t ct = {0};
+        moq_alloc_t alloc = ct_allocator(&ct);
+        moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
+        scfg.alloc = &alloc;
+        scfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        scfg.version = MOQ_VERSION_DRAFT_18;
+        scfg.send_request_capacity = true;
+        scfg.initial_request_capacity = 10;
+        /* All SEVEN request-owner capacities that sum to drain_ref_cap set to 1,
+         * so the independently declared carrier capacity is exactly 7. */
+        scfg.max_subscriptions = 1;
+        scfg.max_announcements = 1;
+        scfg.max_fetches = 1;
+        scfg.max_publishes = 1;
+        scfg.max_track_statuses = 1;
+        scfg.max_namespace_subscriptions = 1;
+        scfg.max_track_subscriptions = 1;
+        moq_session_t *sv = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&scfg, 0, &sv), (int)MOQ_OK);
+        MOQ_TEST_CHECK(sv != NULL);
+        int alloc0 = 0, realloc0 = 0, free0 = 0;
+        if (sv) {
+            ct.slab_ptr = (void *)sv;
+            ct.slab_size = sv->alloc_size;
+            /* drain_ref_cap = sum of the seven request-owner pool capacities
+             * (1 each) = 7, and the carrier capacity is declared EQUAL to it. */
+            MOQ_TEST_CHECK_EQ_SIZE(sv->drain_ref_cap, (size_t)7);
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_cap, (size_t)7);
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_cap, sv->drain_ref_cap);
+            /* Arena ownership: the WHOLE carrier array extent lies inside the
+             * session slab, checked with UB-safe guarded integer-address math
+             * (no out-of-object pointer difference, no underflow), and the base
+             * is naturally aligned. */
+            MOQ_TEST_CHECK(sv->noslot_carriers != NULL);
+            MOQ_TEST_CHECK(carrier_slab_bounds_ok(
+                (uintptr_t)sv, (uintptr_t)sv->noslot_carriers, sv->alloc_size,
+                sv->noslot_carrier_cap, sizeof(moq_noslot_carrier_t)));
+            MOQ_TEST_CHECK(
+                ((uintptr_t)sv->noslot_carriers %
+                 _Alignof(moq_noslot_carrier_t)) == 0);
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)0);
+            /* Baseline allocator call counts: installs/removes must not
+             * allocate, reallocate, or free anything. */
+            alloc0 = ct.alloc_calls;
+            realloc0 = ct.realloc_calls;
+            free0 = ct.free_calls;
+
+            moq_stream_ref_t A = moq_stream_ref_from_u64(0xA1);
+            moq_stream_ref_t B = moq_stream_ref_from_u64(0xB2);
+            moq_stream_ref_t C = moq_stream_ref_from_u64(0xC3);
+
+            /* first install: exact count, ref, FIN */
+            MOQ_TEST_CHECK(noslot_carrier_install(sv, A, false));
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)1);
+            MOQ_TEST_CHECK(noslot_carrier_find(sv, A) >= 0);
+            MOQ_TEST_CHECK_EQ_U64(
+                sv->noslot_carriers[noslot_carrier_find(sv, A)].stream_ref, A._v);
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, A)].fin ? 1 : 0, 0);
+
+            /* reinstall same ref, still FIN false: no duplicate, count fixed */
+            MOQ_TEST_CHECK(noslot_carrier_install(sv, A, false));
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)1);
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, A)].fin ? 1 : 0, 0);
+
+            /* FIN monotonic false -> true */
+            MOQ_TEST_CHECK(noslot_carrier_install(sv, A, true));
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)1);
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, A)].fin ? 1 : 0, 1);
+
+            /* FIN never regresses true -> false on a later FIN-false reinstall */
+            MOQ_TEST_CHECK(noslot_carrier_install(sv, A, false));
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, A)].fin ? 1 : 0, 1);
+
+            /* an unrelated carrier stays byte/identity exact while A changes */
+            MOQ_TEST_CHECK(noslot_carrier_install(sv, B, true));
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)2);
+            MOQ_TEST_CHECK(noslot_carrier_find(sv, B) >= 0);
+            MOQ_TEST_CHECK_EQ_U64(
+                sv->noslot_carriers[noslot_carrier_find(sv, B)].stream_ref, B._v);
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, B)].fin ? 1 : 0, 1);
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, A)].fin ? 1 : 0, 1);
+
+            /* a direct remove of the target decrements exactly once and leaves
+             * only the target absent (NOT a product-path completion claim) */
+            noslot_carrier_remove(sv, A);
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)1);
+            MOQ_TEST_CHECK_EQ_INT(noslot_carrier_find(sv, A), -1);
+            MOQ_TEST_CHECK(noslot_carrier_find(sv, B) >= 0);
+
+            /* removing an absent carrier is inert */
+            noslot_carrier_remove(sv, A);
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)1);
+            MOQ_TEST_CHECK(noslot_carrier_find(sv, B) >= 0);
+
+            /* a freed slot reused: no stale ref or FIN from the prior occupant */
+            MOQ_TEST_CHECK(noslot_carrier_install(sv, C, false));
+            MOQ_TEST_CHECK_EQ_SIZE(sv->noslot_carrier_count, (size_t)2);
+            MOQ_TEST_CHECK(noslot_carrier_find(sv, C) >= 0);
+            MOQ_TEST_CHECK_EQ_U64(
+                sv->noslot_carriers[noslot_carrier_find(sv, C)].stream_ref, C._v);
+            MOQ_TEST_CHECK_EQ_INT(
+                sv->noslot_carriers[noslot_carrier_find(sv, C)].fin ? 1 : 0, 0);
+            MOQ_TEST_CHECK_EQ_INT(noslot_carrier_find(sv, A), -1);
+
+            /* No install/remove performed ANY allocator/reallocator/free call --
+             * arena-backed, not merely net-balance-neutral. */
+            MOQ_TEST_CHECK_EQ_INT(ct.alloc_calls, alloc0);
+            MOQ_TEST_CHECK_EQ_INT(ct.realloc_calls, realloc0);
+            MOQ_TEST_CHECK_EQ_INT(ct.free_calls, free0);
+        }
+        moq_session_destroy(sv);
+        /* Arena ownership at destroy: the exact session slab (identified by its
+         * base pointer and size) is freed EXACTLY once with its exact size, and
+         * every session allocation is reclaimed (balance 0). Balance alone does
+         * not prove the slab was reclaimed once, so both are required. */
+        MOQ_TEST_CHECK_EQ_INT(ct.slab_frees, 1);
+        MOQ_TEST_CHECK_EQ_INT(ct.slab_size_mismatch, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)ct.balance, 0);
     }
 
     MOQ_TEST_PASS("test_session_subscribe");

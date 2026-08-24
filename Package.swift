@@ -276,8 +276,85 @@ if enableService {
                 path: "bindings/swift/Examples/WtquicNetworkRuntimeProof"
             ),
         ]
+        // Finding 5 (MOQ-SWIFT-VIDEO-DIMENSION-TRAP) security regression: a
+        // bounded subprocess that drives the REAL service CoreMedia dimension
+        // conversion, so an out-of-range width/height is proven to be
+        // range-rejected rather than trapping the parent test process. These import CoreMedia, so they are Apple-host
+        // only (`#if os(macOS)`) -- the MoQService product itself stays
+        // available on non-Apple service builds; only these test artifacts are
+        // gated. Service stack only; never enrolled outside MOQ_SERVICE=1.
+        #if os(macOS)
+        package.targets += [
+            .executableTarget(
+                name: "MoQServiceTrapProbe",
+                dependencies: ["MoQService", "MoQServiceCore"],
+                path: "bindings/swift/Examples/MoQServiceTrapProbe"
+            ),
+            .testTarget(
+                name: "MoQServiceDimensionTests",
+                dependencies: ["MoQService", "MoQServiceCore", "MoQServiceTrapProbe"],
+                path: "bindings/swift/Tests/MoQServiceDimensionTests"
+            ),
+        ]
+        #endif
     }
 }
+
+// Package-internal decoder helpers extracted from the (transport-gated)
+// MoQSwiftPlayer example. They import only the source-built MoQ/MoQMedia stack +
+// Apple media frameworks. NOT a public product -- no library() entry; `package`
+// visibility only. Apple-host-only (`#if os(macOS)`) so the package's default
+// non-Apple buildability is preserved.
+//
+// Stack separation (see the moq_swift_stack_guard note above): the source-stack
+// decoder TEST target must never share SwiftPM's unified test bundle with
+// MoQServiceTests, or the two stacks collide on `moq_swift_stack_guard`. So:
+//   * the library + child probe exist whenever they are needed -- the ordinary
+//     (non-service) lane runs Findings 6/7, and the transport player links the
+//     library -- i.e. `!enableService || enableTransport`;
+//   * the decoder test target exists ONLY in the non-service lane
+//     (`!enableService`), exactly like MoQTests/MoQMediaTests above;
+//   * the pure `MOQ_SERVICE=1` lane (service, no transport) enrolls NONE of
+//     them, and `MOQ_TRANSPORT=1 MOQ_SERVICE=1` keeps the library so the player
+//     never dangles -- while still contributing no source-stack test target.
+#if os(macOS)
+if !enableService || enableTransport {
+    package.targets += [
+        .target(
+            name: "MoQSwiftPlayerDecoders",
+            dependencies: ["MoQ", "MoQMedia"],
+            path: "bindings/swift/Examples/MoQSwiftPlayerDecoders",
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreMedia"),
+                .linkedFramework("CoreVideo"),
+                .linkedFramework("AudioToolbox"),
+            ]
+        ),
+        // Bounded subprocess trap probe: runs one decoder case per process so
+        // the parent tests classify an abort (where a runtime still traps)
+        // without taking the whole `swift test` process down. A standalone
+        // source-stack executable -- it never links MoQService.
+        .executableTarget(
+            name: "MoQPlayerTrapProbe",
+            dependencies: ["MoQSwiftPlayerDecoders"],
+            path: "bindings/swift/Examples/MoQPlayerTrapProbe"
+        ),
+    ]
+}
+if !enableService {
+    // Findings 6 & 7 security regression: valid-vector behavior-neutrality +
+    // malformed-input rejection oracles + child-process attribution. Source-
+    // stack test, so it is excluded from the MOQ_SERVICE=1 unified test bundle.
+    package.targets += [
+        .testTarget(
+            name: "MoQSwiftPlayerDecoderTests",
+            dependencies: ["MoQSwiftPlayerDecoders", "MoQPlayerTrapProbe"],
+            path: "bindings/swift/Tests/MoQSwiftPlayerDecoderTests"
+        ),
+    ]
+}
+#endif
 
 // Live transport targets require CMake-installed adapter.
 // Build with: MOQ_TRANSPORT=1 PKG_CONFIG_PATH=<prefix>/lib/pkgconfig swift build
@@ -301,7 +378,8 @@ if enableTransport {
         ),
         .executableTarget(
             name: "moq-swift-player",
-            dependencies: ["MoQ", "MoQMedia", "MoQRecvArgs", "MoQTransport"],
+            dependencies: ["MoQ", "MoQMedia", "MoQRecvArgs", "MoQTransport",
+                           "MoQSwiftPlayerDecoders"],
             path: "bindings/swift/Examples/MoQSwiftPlayer",
             linkerSettings: [
                 .linkedFramework("AppKit"),

@@ -14,10 +14,12 @@
  * of every access unit so AUs can be split cheaply; ffmpeg inserts these with
  *   -bsf:v h264_metadata=aud=insert
  *
- * Usage: media_publish_loc <url> <namespace> [track]
+ * Usage: media_publish_loc <url> <namespace> [track] [--insecure-skip-verify]
  *   url        moqt://host:port[/path]  (raw QUIC), or https://host:port/path (WT)
  *   namespace  slash-separated, e.g. "demo"
  *   track      track name (default "video")
+ *   --insecure-skip-verify  disable TLS certificate verification; for
+ *                           LOCAL/self-signed testing ONLY. Off by default.
  *
  * Example:
  *   ffmpeg -re -stream_loop -1 -f lavfi -i testsrc=size=1280x720:rate=30 \
@@ -28,6 +30,8 @@
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
 #include <moq/rcbuf.h>
+
+#include "../common/moq_example_args.h"
 
 #include <signal.h>
 #include <stdbool.h>
@@ -253,7 +257,11 @@ static int emit_au(pub_state_t *st, const char *track,
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <url> <namespace> [track]\n", argv[0]);
+        fprintf(stderr,
+            "usage: %s <url> <namespace> [track] [--insecure-skip-verify]\n"
+            "  --insecure-skip-verify  disable TLS certificate verification\n"
+            "                          (LOCAL/self-signed testing ONLY)\n",
+            argv[0]);
         return 2;
     }
     const char *url = argv[1];
@@ -261,7 +269,19 @@ int main(int argc, char **argv)
     snprintf(nsbuf, sizeof(nsbuf), "%s", argv[2]);
     moq_bytes_t ns_parts[32];
     size_t ns_count = split_namespace(nsbuf, ns_parts, 32);
-    const char *track = (argc > 3) ? argv[3] : "video";
+    /* Optional trailing args: [track] and/or --insecure-skip-verify, either
+     * order. TLS verification is ON unless the flag is passed explicitly. */
+    moq_example_optargs_t opt =
+        moq_example_parse_optargs(argc, argv, 3, "video");
+    if (!opt.ok) {
+        fprintf(stderr,
+            "usage: %s <url> <namespace> [track] [--insecure-skip-verify]\n"
+            "  --insecure-skip-verify  disable TLS certificate verification\n"
+            "                          (LOCAL/self-signed testing ONLY)\n",
+            argv[0]);
+        return 2;
+    }
+    const char *track = opt.track;
 
     signal(SIGINT, on_signal);
 
@@ -307,7 +327,10 @@ int main(int argc, char **argv)
     moq_endpoint_cfg_init(&ec);
     ec.url.data = (const uint8_t *)url;
     ec.url.len = strlen(url);
-    ec.insecure_skip_verify = true;   /* demo only */
+    /* TLS certificate verification is ON by default; disable it only when the
+     * operator explicitly opts in via --insecure-skip-verify (local/self-signed
+     * testing). */
+    ec.insecure_skip_verify = opt.insecure_skip_verify;
 
     moq_endpoint_t *ep = NULL;
     moq_result_t rc = moq_endpoint_connect(&ec, &ep);

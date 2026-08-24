@@ -24,6 +24,12 @@ typedef struct {
     uint64_t pre_rcv_hash;  size_t pre_rcv_count;
     uint64_t rnd_fed_hash;  size_t rnd_fed_count;
     uint64_t rnd_rcv_hash;  size_t rnd_rcv_count;
+    /* RESET_DATA actions observed by the pump. This runner's operation set does
+     * not produce any, and FETCH resets do not emit SUBGROUP_RESET, so the
+     * retained-closure contract on moq_session_on_data_reset() is NOT exercised
+     * here. Pinned at exactly zero in both deterministic runs rather than left
+     * to a comment around an unreachable call. */
+    size_t reset_actions;
 } trace_t;
 #define MIX(h,v) do { (h) ^= (v); (h) *= 0x100000001B3ULL; } while(0)
 static void hash_pl(uint64_t *h, size_t len, const uint8_t *d) {
@@ -82,7 +88,8 @@ static void dump_log(uint64_t s, int r, const oplog_t *l) {
     return -1; } while(0)
 
 static int pump_with_chunking(moq_simpair_t *sp, rng_t *cr,
-                               uint64_t *fh, size_t *fc) {
+                               uint64_t *fh, size_t *fc,
+                               size_t *reset_actions) {
     moq_session_t *sv = moq_simpair_server(sp), *cl = moq_simpair_client(sp);
     for (int rd = 0; rd < 4; rd++) {
         moq_action_t a[16]; size_t na = moq_session_poll_actions(sv, a, 16);
@@ -134,10 +141,20 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *cr,
                     (*fc)++;
                 }
             } else if (a[i].kind == MOQ_ACTION_RESET_DATA) {
-                moq_stream_ref_t ref = moq_stream_ref_from_u64(a[i].u.reset_data.stream_ref._v + 10000);
-                if (moq_session_on_data_reset(cl, ref, a[i].u.reset_data.error_code,
-                        moq_simpair_now_us(sp)) < 0)
-                    PUMP_FAIL(a,i,na);
+                /* UNSUPPORTED ACTION for this runner. Its operation set does
+                 * not produce RESET_DATA, so delivering one here would run a
+                 * retained-closure recovery that nothing in this file tests --
+                 * and FETCH resets do not emit SUBGROUP_RESET anyway. Count it
+                 * and fail loudly instead of calling on_data_reset() from an
+                 * allegedly unreachable branch: the counter is pinned at zero
+                 * in both deterministic runs, so a reset that starts arriving
+                 * is a named finding rather than silent new behaviour. */
+                if (reset_actions) (*reset_actions)++;
+                fprintf(stderr, "FAIL: fetch pump observed RESET_DATA -- this "
+                        "pump must gain same-call reset retry "
+                        "(moq_session_on_data_reset) plus FETCH event "
+                        "accounting before it can deliver one\n");
+                PUMP_FAIL(a,i,na);
             }
             moq_action_cleanup(&a[i]);
         }
@@ -177,7 +194,7 @@ static void drain_all(moq_session_t *c, moq_session_t *sv, trace_t *ts) {
 }
 
 #define DO_PUMP do { log_op(log,OP_PUMP,0); HMIX(ts,OP_PUMP); \
-    if (pump_with_chunking(sp,crng,&ts->rnd_fed_hash,&ts->rnd_fed_count) < 0) return -1; } while(0)
+    if (pump_with_chunking(sp,crng,&ts->rnd_fed_hash,&ts->rnd_fed_count,&ts->reset_actions) < 0) return -1; } while(0)
 #define FIND(st_val, out) int out = -1; \
     for (int _i = 0; _i < MAX_FETCHES; _i++) if (st->f[_i].st == (st_val)) { out = _i; break; }
 static int execute_step(moq_simpair_t *sp, shadow_t *st,
@@ -191,7 +208,8 @@ static int execute_step(moq_simpair_t *sp, shadow_t *st,
     switch (op) {
     case OP_PUMP:
         log_op(log, op, 0); HMIX(ts, op);
-        if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count) < 0) return -1;
+        if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count,
+                               &ts->reset_actions) < 0) return -1;
         break;
     case OP_FETCH: {
         FIND(FS_NONE, slot); if (slot < 0) { DO_PUMP; break; }
@@ -204,7 +222,8 @@ static int execute_step(moq_simpair_t *sp, shadow_t *st,
         moq_fetch_t h; moq_result_t rc = moq_session_fetch(cl, &fc, moq_simpair_now_us(sp), &h);
         log_op(log, op, rc >= 0 ? 1 : 0); HMIX(ts, op); HMIX(ts, rc);
         if (rc == MOQ_OK) {
-            if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count) < 0) return -1;
+            if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count,
+                               &ts->reset_actions) < 0) return -1;
             moq_event_t ev[4]; size_t ne = moq_session_poll_events(sv, ev, 4);
             HMIX(ts, ne);
             for (size_t j = 0; j < ne; j++) {
@@ -223,7 +242,8 @@ static int execute_step(moq_simpair_t *sp, shadow_t *st,
         HMIX(ts, rc);
         if (rc == MOQ_OK) {
             st->f[idx].st = FS_ACCEPTED;
-            if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count) < 0) return -1;
+            if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count,
+                               &ts->reset_actions) < 0) return -1;
             moq_event_t ev[4]; size_t ne = moq_session_poll_events(cl, ev, 4);
             HMIX(ts, ne);
             for (size_t j = 0; j < ne; j++) { HMIX(ts, ev[j].kind); moq_event_cleanup(&ev[j]); }
@@ -238,7 +258,8 @@ static int execute_step(moq_simpair_t *sp, shadow_t *st,
         HMIX(ts, rc);
         if (rc == MOQ_OK) {
             st->f[idx].st = FS_DONE;
-            if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count) < 0) return -1;
+            if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count,
+                               &ts->reset_actions) < 0) return -1;
             moq_event_t ev[4]; size_t ne = moq_session_poll_events(cl, ev, 4);
             HMIX(ts, ne);
             for (size_t j = 0; j < ne; j++) { HMIX(ts, ev[j].kind); moq_event_cleanup(&ev[j]); }
@@ -305,7 +326,8 @@ static int execute_step(moq_simpair_t *sp, shadow_t *st,
         break; }
     default:
         log_op(log, OP_PUMP, 0); HMIX(ts, OP_PUMP);
-        if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count) < 0) return -1;
+        if (pump_with_chunking(sp, crng, &ts->rnd_fed_hash, &ts->rnd_fed_count,
+                               &ts->reset_actions) < 0) return -1;
         break;
     }
     for (int i = 0; i < MAX_FETCHES; i++)
@@ -533,7 +555,8 @@ static int run_scenario(uint64_t seed, const moq_alloc_t *alloc,
     /* Final pump to flush remaining data. */
     if (!st.closed) {
         for (int f = 0; f < 16; f++) {
-            if (pump_with_chunking(sp, &crng, &sum->rnd_fed_hash, &sum->rnd_fed_count) < 0)
+            if (pump_with_chunking(sp, &crng, &sum->rnd_fed_hash, &sum->rnd_fed_count,
+                                   &sum->reset_actions) < 0)
                 { failures++; break; }
             drain_cli_evts(moq_simpair_client(sp), sum);
         }
@@ -569,11 +592,21 @@ int main(void)
 #define CMP(f) (sums[0].f != sums[1].f)
         if (CMP(hash) || CMP(count) || CMP(pre_exp_count) || CMP(pre_rcv_count) ||
             CMP(pre_exp_hash) || CMP(pre_rcv_hash) || CMP(rnd_fed_count) ||
-            CMP(rnd_rcv_count) || CMP(rnd_fed_hash) || CMP(rnd_rcv_hash)) {
+            CMP(rnd_rcv_count) || CMP(rnd_fed_hash) || CMP(rnd_rcv_hash) ||
+            CMP(reset_actions)) {
             fprintf(stderr, "FAIL seed=0x%llx: determinism mismatch\n", (unsigned long long)seed);
             REPLAY(seed, max_steps); failures++;
         }
 #undef CMP
+        /* This runner produces NO reset actions; pinned in both runs. */
+        for (int r = 0; r < 2; r++) {
+            if (sums[r].reset_actions != 0) {
+                fprintf(stderr, "FAIL seed=0x%llx run=%d: expected 0 RESET_DATA "
+                        "actions, observed %zu\n",
+                        (unsigned long long)seed, r, sums[r].reset_actions);
+                REPLAY(seed, max_steps); failures++;
+            }
+        }
         if (sums[0].pre_exp_count != sums[0].pre_rcv_count ||
             sums[0].pre_exp_hash != sums[0].pre_rcv_hash) {
             fprintf(stderr, "FAIL seed=0x%llx: prelude oracle exp=%zu/%llx rcv=%zu/%llx\n",

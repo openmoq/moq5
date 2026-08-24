@@ -188,6 +188,36 @@ struct moq_media_track {
     bool                  pending_reset;     /* a drop abandoned emit_group;
                                                 the drain must reset it */
 
+    /* Per-pass drain scratch (network thread, mu held). Cleared at the top of
+     * every sender_drain pass; never observable outside it.
+     *   drain_hold    -- this track has a retained entry, so EVERY later entry
+     *                    of the track (END_OF_TRACK included) must be retained
+     *                    too, which is what preserves per-track FIFO order and
+     *                    stops a terminal overtaking its own held media.
+     *   drain_dropped -- this track already armed its once-per-pass wire RESET
+     *                    for a no-demand discard. Drop COUNTING is cumulative
+     *                    and lives below, not here.
+     *   drain_demand  -- cached demand answer: -1 unknown, 0 no, 1 yes, so the
+     *                    pass makes at most one demand query per track. */
+    bool                  drain_hold;
+    bool                  drain_dropped;
+    /* This pass already ATTEMPTED this track's pending reset (from the queue
+     * path). Distinct from drain_dropped, which is no-demand drop accounting.
+     * Nothing frees capacity between the queue path and the post-pass sweep,
+     * so a second attempt in the same pass would be futile: the sweep skips a
+     * track already attempted, and the obligation stays retryable for the next
+     * production hook. */
+    bool                  drain_reset_tried;
+    int8_t                drain_demand;
+
+    /* CUMULATIVE dropped-group identity for this track, for the whole track
+     * lifetime -- NOT per pass. `groups_dropped` is a cumulative distinct
+     * (track, group_seq) count, so two objects of the same group discarded in
+     * different drain passes (or by different discard paths) must count once.
+     * group_seq is monotonic per track, so the last one is sufficient. */
+    bool                  drop_group_valid;
+    uint64_t              drop_group_last;
+
     /* CMSF SAP event-timeline generation (§3.6.1 / MSF §8.3). A media track
      * with emit_sap_timeline owns a generated sibling eventtimeline track
      * (sap_timeline); that timeline track has is_event_timeline set and is the
@@ -319,6 +349,16 @@ struct moq_media_sender {
 
     sender_preq_entry_t *preq;            /* ring; entries own their refs */
     uint32_t          preq_head, preq_tail;
+    /* Queued MEDIA objects, maintained O(1) at the single enqueue/release
+     * chokepoints. The PHYSICAL depth is preq_tail - preq_head, which also
+     * counts a queued END_OF_TRACK marker; the public objects_queued counter
+     * belongs to the media population and uses this instead. */
+    uint32_t          preq_media;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    /* Test-only: attempts of the pending-reset transition. Never in the
+     * shipping library (this whole field is behind the testing define). */
+    uint32_t          test_reset_attempts;
+#endif
     uint64_t          preq_bytes;
 
     bool              ready;
@@ -486,12 +526,53 @@ static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
  * the (typically larger) send-queue bound after. The ring is sized to the
  * max of both so the bound is purely a policy gate, never a realloc. */
 
+/* The single release chokepoint: every path that removes an entry from the ring
+ * comes through here, so the media count is maintained in exactly one place.
+ * A non-marker entry was necessarily counted at enqueue, so the decrement is
+ * EXACT -- deliberately not clamped at zero, because saturating there would
+ * hide a double release or a missed enqueue instead of surfacing it. */
 static void preq_entry_release(moq_media_sender_t *s, sender_preq_entry_t *e)
 {
-    (void)s;
+    if (!e->is_end) s->preq_media--;
     if (e->payload)    moq_rcbuf_decref(e->payload);
     if (e->properties) moq_rcbuf_decref(e->properties);
     memset(e, 0, sizeof(*e));
+}
+
+/* THE drop-accounting chokepoint: one queued MEDIA entry is being discarded.
+ * EVERY discard path goes through here -- the no-demand policy, lifecycle
+ * removal/completion, and capacity-policy eviction -- so none of them can drift
+ * from the others on bytes, objects, keyframes, or groups.
+ *
+ * `groups_dropped` counts CUMULATIVE DISTINCT (track, group_seq) values from
+ * which at least one queued media object was discarded. group_seq is monotonic
+ * per track, so remembering the last dropped group for the track's LIFETIME is
+ * sufficient and makes the count independent of how the discards are split
+ * across drain passes or across discard paths.
+ *
+ * This is purely the cumulative fact. The per-pass "first discard for this
+ * track" fact that the no-demand path needs to arm its wire RESET once is
+ * `drain_dropped`, handled at that call site. Markers are NOT media and must
+ * never reach here. */
+static void preq_note_dropped(moq_media_sender_t *s, moq_media_track_t *t,
+                              const sender_preq_entry_t *e)
+{
+    s->preq_bytes -= e->bytes;
+    s->stats.objects_dropped++;
+    if (e->is_sync) s->stats.keyframes_dropped++;
+    if (!t->drop_group_valid || t->drop_group_last != e->group_seq)
+        s->stats.groups_dropped++;
+    t->drop_group_valid = true;
+    t->drop_group_last = e->group_seq;
+}
+
+/* The single enqueue chokepoint for the media count. It reads the COMMITTED
+ * entry rather than taking a caller-supplied flag, so the two chokepoints
+ * cannot disagree about what an entry is. */
+static void preq_note_enqueued(moq_media_sender_t *s,
+                               const sender_preq_entry_t *e)
+{
+    if (!e->is_end) s->preq_media++;
 }
 
 static uint32_t active_obj_cap(const moq_media_sender_t *s)
@@ -529,10 +610,8 @@ static void preq_evict_group(moq_media_sender_t *s,
          * END_OF_TRACK marker (is_end) even when it shares the dropped group --
          * it is the only reliable EOS and must survive the eviction. */
         if (e->track == t && e->group_seq == g && !e->is_end) {
-            s->preq_bytes -= e->bytes;
-            s->stats.objects_dropped++;
-            if (e->is_sync) s->stats.keyframes_dropped++;
-            preq_entry_release(s, e);   /* clears the slot */
+            preq_note_dropped(s, t, e);   /* THE shared accounting chokepoint */
+            preq_entry_release(s, e);     /* clears the slot */
             dropped_any = true;
         } else {
             if (wr != rd) s->preq[wr % s->ring_cap] = *e;
@@ -542,9 +621,10 @@ static void preq_evict_group(moq_media_sender_t *s,
     }
     s->preq_tail = wr;
     if (dropped_any) {
-        s->stats.groups_dropped++;
-        /* If the wire subgroup for this group is open, its tail just went
-         * away -- the drain must RESET it, not leave it truncated. */
+        /* Counting is done by preq_note_dropped above. What remains here is
+         * this path's own wire semantics: if the subgroup for this group is
+         * open, its tail just went away -- the drain must RESET it, not leave
+         * it truncated. */
         if (t->emit_open && t->emit_group == g)
             t->pending_reset = true;
     }
@@ -566,40 +646,6 @@ static bool preq_track_anchor(const moq_media_sender_t *s,
         }
     }
     return found;
-}
-
-/* Drop all queued media of `track` while it has no demand, keeping the sender at
- * the live edge (the peer accepts a mid-GOP resume gap for minimal latency).
- * Preserves the terminal END_OF_TRACK (is_end) and arms pending_reset if a wire
- * subgroup is open. Single compaction pass. mu held. */
-static void preq_drop_all_for_track(moq_media_sender_t *s,
-                                    moq_media_track_t *t)
-{
-    uint32_t rd = s->preq_head, wr = s->preq_head;
-    bool dropped_any = false;
-    while (rd != s->preq_tail) {
-        sender_preq_entry_t *e = &s->preq[rd % s->ring_cap];
-        if (e->track == t && !e->is_end) {
-            s->preq_bytes -= e->bytes;
-            s->stats.objects_dropped++;
-            if (e->is_sync) s->stats.keyframes_dropped++;
-            preq_entry_release(s, e);   /* clears the slot */
-            dropped_any = true;
-        } else {
-            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
-            wr++;
-        }
-        rd++;
-    }
-    s->preq_tail = wr;
-    if (dropped_any) {
-        s->stats.groups_dropped++;
-        /* An open wire subgroup for this track just lost its tail - the drain
-         * must RESET it, not leave it truncated. */
-        if (t->emit_open)
-            t->pending_reset = true;
-        pthread_cond_broadcast(&s->space_cv);   /* freed space: wake writers */
-    }
 }
 
 /* Evict the oldest group that can go without stranding any track's
@@ -1313,6 +1359,40 @@ static void sender_emit_mt_for(moq_media_sender_t *s, moq_media_track_t *tl,
     }
 }
 
+/* THE pending-reset state transition. An armed `pending_reset` is lifecycle
+ * work OWED by the track: the abandoned open subgroup must be RESET on the wire
+ * before anything can turn it into a clean FIN.
+ *
+ *   MOQ_OK        -- and only then -- clears the obligation, clears emit_open,
+ *                    and counts the abandonment exactly once.
+ *   WOULD_BLOCK   -- shared capacity: EVERY field, the obligation and the code
+ *                    are preserved exactly for retry, and nothing is counted.
+ *   any other <0  -- fatal; the obligation is NOT cleared and no successful
+ *                    abandonment is counted.
+ *
+ * Returns MOQ_OK when there was nothing to do, so callers can treat "not owed"
+ * and "discharged" alike. s->mu held. */
+static moq_result_t sender_flush_reset(moq_media_sender_t *s,
+                                       moq_media_track_t *t, uint64_t now_us)
+{
+    if (!t->pending_reset) return MOQ_OK;
+    if (!t->pub_track) return MOQ_OK;   /* nothing on the wire to abandon */
+    t->drain_reset_tried = true;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    s->test_reset_attempts++;
+#endif
+    moq_result_t rrc = moq_pub_reset_group(s->pub, t->pub_track, 0x10, now_us);
+    if (rrc == MOQ_ERR_WOULD_BLOCK) return rrc;      /* retryable, untouched */
+    if (rrc < 0) {
+        sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+        return rrc;                                   /* obligation retained */
+    }
+    t->pending_reset = false;
+    t->emit_open = false;
+    s->stats.groups_abandoned++;
+    return MOQ_OK;
+}
+
 /* True for a service-owned generated timeline track (SAP eventtimeline or MSF
  * media timeline): the app never writes to or removes it directly. */
 static bool track_is_generated_timeline(const moq_media_track_t *t)
@@ -1326,79 +1406,160 @@ static bool track_is_generated_timeline(const moq_media_track_t *t)
  * touches re-enters s->mu). */
 static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
 {
-    while (s->preq_head != s->preq_tail) {
-        sender_preq_entry_t *e = &s->preq[s->preq_head % s->ring_cap];
+    /* ONE forward compaction pass over [preq_head, preq_tail), using the same
+     * read/write-cursor idiom as preq_evict_group:
+     * an entry that can be emitted now is emitted and released, an entry that
+     * cannot is RETAINED IN PLACE by copying it to the write cursor. preq_head
+     * never moves; preq_tail becomes the write cursor at the end. Work per
+     * invocation is therefore one pass over the current depth -- no rotation,
+     * no restart, no nested full-ring helper, no allocation.
+     *
+     * Lack of demand is TRACK-LOCAL and may be skipped: an undemanded track
+     * must not stop demanded media behind it. A real MOQ_ERR_WOULD_BLOCK from
+     * a facade/session operation is SHARED output-capacity backpressure: the
+     * refused entry and the whole unprocessed suffix are retained verbatim and
+     * this invocation stops. */
+    uint32_t rd = s->preq_head, wr = s->preq_head;
+    const uint32_t depth0 = s->preq_tail - s->preq_head;
+    bool stop = false;          /* shared capacity refused, or fatal */
+
+    /* Per-pass scratch, cleared before the pass. */
+    for (size_t i = 0; i < s->track_count; i++) {
+        s->tracks[i]->drain_hold = false;
+        s->tracks[i]->drain_dropped = false;
+        s->tracks[i]->drain_reset_tried = false;
+        s->tracks[i]->drain_demand = -1;
+    }
+
+    while (rd != s->preq_tail) {
+        sender_preq_entry_t *e = &s->preq[rd % s->ring_cap];
         moq_media_track_t *t = e->track;
 
-        /* A removed track's queued work is dropped: the catalog no longer
-         * declares it and its pub track is ended by the hook. */
-        if (t->removed) {
-            s->preq_bytes -= e->bytes;
-            preq_entry_release(s, e);
-            s->preq_head++;
-            pthread_cond_broadcast(&s->space_cv);
+        /* Shared capacity already refused: retain this and every later entry
+         * exactly as they are. */
+        if (stop) {
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            wr++; rd++;
             continue;
         }
 
-        bool has_sub = sender_track_demand(s, t);
+        /* A removed track's queued work is discarded: the catalog no longer
+         * declares it and its pub track is ended by the hook. This reaches
+         * both moq_media_sender_remove_track() and moq_media_sender_complete()
+         * (which marks every track removed), and the discard is COUNTED like
+         * any other -- the public conservation identity is unconditional.
+         * The private terminal marker is not media and is not counted. No wire
+         * RESET is armed here: removed-track teardown runs before the drain
+         * and owns its terminal semantics. */
+        if (t->removed) {
+            if (!e->is_end) preq_note_dropped(s, t, e);
+            preq_entry_release(s, e);
+            rd++;
+            continue;
+        }
+
+        /* This track already retained an entry in this pass: everything later
+         * on the same track stays behind it, END_OF_TRACK included. That is
+         * what keeps per-track FIFO exact and stops a terminal overtaking its
+         * own held media. */
+        if (t->drain_hold) {
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            wr++; rd++;
+            continue;
+        }
+
+        if (t->drain_demand < 0)
+            t->drain_demand = sender_track_demand(s, t) ? 1 : 0;
+        bool has_sub = t->drain_demand == 1;
 
         /* Terminal marker: emit a reliable END_OF_TRACK after this track's
-         * queued objects (FIFO preserves the ordering). The facade closes any
-         * open subgroup and FINs a fresh one; the session stays alive.
+         * queued objects (per-track order is preserved by drain_hold above).
+         * The facade closes any open subgroup and FINs a fresh one; the session
+         * stays alive.
          *
-         * Handled BEFORE the no-subscriber hold below: moq_pub_end_track()
+         * Handled BEFORE the no-demand branch below: moq_pub_end_track()
          * treats "no subscriber" as local terminal success, so a track ended
          * before a relay subscribes (or after the subscriber leaves) drains
-         * its terminal here instead of wedging the head and blocking every
-         * entry behind it (including other tracks). */
+         * its terminal here -- and because nothing of that track is still
+         * held, it cannot overtake anything. */
         if (e->is_end) {
-            /* A drop abandoned an open group: reset it on the wire first --
-             * only meaningful while a live subscriber/stream exists. */
-            if (has_sub && t->pending_reset) {
-                moq_result_t rrc = moq_pub_reset_group(s->pub, t->pub_track,
-                                                       0x10, now_us);
-                if (rrc == MOQ_ERR_WOULD_BLOCK) break;   /* retry next pump */
-                t->pending_reset = false;
-                t->emit_open = false;
-                s->stats.groups_abandoned++;
+            /* A drop abandoned an open group: the obligation is discharged
+             * through THE one transition before the terminal can turn the same
+             * subgroup into a clean FIN -- independent of the cached demand
+             * answer, which is not what decides whether the abandon is owed. */
+            {
+                moq_result_t rrc = sender_flush_reset(s, t, now_us);
+                if (rrc != MOQ_OK) {   /* shared capacity, or fatal */
+                    t->drain_hold = true;
+                    stop = true;
+                    if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+                    wr++; rd++;
+                    continue;
+                }
             }
             moq_result_t erc = moq_pub_end_track(s->pub, t->pub_track, now_us);
-            if (erc == MOQ_ERR_WOULD_BLOCK) break;     /* keep entry, retry */
-            if (erc < 0) {
-                sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-                break;
+            if (erc != MOQ_OK) {
+                /* WOULD_BLOCK is shared capacity, NOT a fatal: retry later. */
+                if (erc != MOQ_ERR_WOULD_BLOCK)
+                    sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                t->drain_hold = true;
+                stop = true;
+                if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+                wr++; rd++;
+                continue;
             }
             t->emit_open = false;
-            t->pending_reset = false;   /* terminal supersedes any pending reset */
+            /* pending_reset is NOT cleared here: the only transition that may
+             * clear it is sender_flush_reset(), which ran above. */
             preq_entry_release(s, e);
-            s->preq_head++;
-            pthread_cond_broadcast(&s->space_cv);
+            rd++;
             continue;
         }
 
-        /* No demand: drop_without_demand drops the queued media to stay at
-         * the live edge; the default holds the head until demand appears. */
+        /* No demand: drop_without_demand releases this track's media as it is
+         * encountered (staying at the live edge) and the pass CONTINUES with
+         * other tracks; the default retains it for its own track only. */
         if (!has_sub) {
-            if (s->drop_without_demand)
-                preq_drop_all_for_track(s, t);
-            break;
+            if (s->drop_without_demand) {
+                preq_note_dropped(s, t, e);
+                /* Arm the wire RESET once per affected track in this pass: an
+                 * open wire subgroup just lost its tail and must not be
+                 * truncated. */
+                if (!t->drain_dropped) {
+                    t->drain_dropped = true;
+                    if (t->emit_open) t->pending_reset = true;
+                }
+                preq_entry_release(s, e);
+                rd++;
+                continue;
+            }
+            t->drain_hold = true;
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            wr++; rd++;
+            continue;
         }
 
         /* A drop abandoned this track's open group: reset it on the wire
          * before emitting the next (newer) group. */
         if (t->pending_reset) {
-            moq_result_t rrc = moq_pub_reset_group(s->pub, t->pub_track,
-                                                   0x10, now_us);
-            if (rrc == MOQ_ERR_WOULD_BLOCK) break;   /* retry next pump */
-            t->pending_reset = false;
-            t->emit_open = false;
-            s->stats.groups_abandoned++;
+            moq_result_t rrc = sender_flush_reset(s, t, now_us);
+            if (rrc != MOQ_OK) {   /* shared capacity, or fatal */
+                t->drain_hold = true;
+                stop = true;
+                if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+                wr++; rd++;
+                continue;
+            }
         }
 
         moq_rcbuf_t *props = NULL;
         if (!sender_build_props(s, e, &props)) {
             sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-            break;
+            t->drain_hold = true;
+            stop = true;
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            wr++; rd++;
+            continue;
         }
 
         bool new_group = !t->emit_open || t->emit_group != e->group_seq;
@@ -1420,10 +1581,15 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
                                                    &ocfg, now_us);
         if (props) moq_rcbuf_decref(props);   /* facade took its own ref */
 
-        if (wrc == MOQ_ERR_WOULD_BLOCK) break;       /* keep entry, retry */
-        if (wrc < 0) {
-            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-            break;
+        if (wrc != MOQ_OK) {
+            /* WOULD_BLOCK is shared capacity, NOT a fatal: retry later. */
+            if (wrc != MOQ_ERR_WOULD_BLOCK)
+                sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            t->drain_hold = true;
+            stop = true;
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            wr++; rd++;
+            continue;
         }
 
         t->emit_group = e->group_seq;
@@ -1454,8 +1620,29 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
 
         s->preq_bytes -= e->bytes;
         preq_entry_release(s, e);     /* decrefs the entry's refs */
-        s->preq_head++;
-        pthread_cond_broadcast(&s->space_cv);   /* space freed for writers */
+        rd++;
+    }
+
+    s->preq_tail = wr;
+    /* Any slot freed before a refusal must still wake blocked writers. */
+    if ((s->preq_tail - s->preq_head) < depth0)
+        pthread_cond_broadcast(&s->space_cv);
+
+    /* An armed pending_reset is owed EVEN IF the track has no queued entry for
+     * the pass above to hang it off -- an abandoned tail with nothing behind it
+     * must still be RESET, not left open. Sweep every track once (bounded
+     * O(track_count)), including any obligation the no-demand discards just
+     * armed in this same pass, but SKIP a track the queue path already
+     * attempted: nothing frees capacity in between, so a second attempt in the
+     * same pass is futile. Either way the obligation stays retryable for the
+     * next production hook; a fatal is already latched. */
+    if (!s->fatal) {
+        for (size_t i = 0; i < s->track_count; i++) {
+            moq_media_track_t *t = s->tracks[i];
+            if (!t->pending_reset || t->removed || t->drain_reset_tried)
+                continue;
+            if (sender_flush_reset(s, t, now_us) != MOQ_OK) break;
+        }
     }
 
     /* Emit generated timelines from their side history. They never enter the
@@ -2382,10 +2569,22 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         for (size_t i = 0; i < n; i++) {
             moq_media_track_t *t = snap[i];
             if (t->is_catalog) continue;   /* creation-time immutable */
-            /* `removed` is app-written under s->mu; read it under the lock. */
+            /* `removed` is app-written under s->mu; read it under the lock.
+             * The pending-reset PREFLIGHT is taken in the SAME critical
+             * section: an app-thread capacity eviction (or removal) cannot arm
+             * the obligation in a gap and then have this teardown turn the
+             * abandoned subgroup into a clean FIN. `owed` therefore reflects
+             * the obligation as of the same instant as `removed`. */
             pthread_mutex_lock(&s->mu);
             bool removed = t->removed;
+            moq_result_t owed = MOQ_OK;
+            if (removed && t->pending_reset)
+                owed = sender_flush_reset(s, t, now_us);
             pthread_mutex_unlock(&s->mu);
+            /* The abandon must complete BEFORE any end_track/remove can close
+             * the same subgroup: on refusal skip this track's teardown for now
+             * and retry on a later hook. */
+            if (owed != MOQ_OK) continue;
             if (removed) {
                 if (!t->pub_track) {
                     /* No publisher track (pre-ready removal or never registered)
@@ -3852,6 +4051,7 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     }
     s->preq_bytes += need;
     s->preq_tail++;
+    preq_note_enqueued(s, e);
     s->stats.objects_written++;
     if (obj->ends_group) track->group_open = false;
     bool wake = s->ready;   /* post-ready: kick the drain (see below) */
@@ -3890,9 +4090,12 @@ moq_result_t moq_media_sender_end_track(moq_media_sender_t *s,
      * already queued/sent). */
     if (track->end_requested) { pthread_mutex_unlock(&s->mu); return MOQ_OK; }
 
-    /* Need one physical ring slot for the terminal marker (0 bytes, so it does
-     * not count against the byte budget). */
-    if ((s->preq_tail - s->preq_head) >= s->ring_cap) {
+    /* The terminal marker needs one slot against the ACTIVE queue OBJECT bound
+     * -- the same bound write() is held to (preq_fits) -- not against the
+     * larger physical allocation, which is an implementation detail. It is a
+     * zero-byte entry, so the byte budget does not apply. Nothing is latched
+     * on refusal: end_requested stays clear and the caller retries. */
+    if ((s->preq_tail - s->preq_head) >= active_obj_cap(s)) {
         pthread_mutex_unlock(&s->mu);
         return MOQ_ERR_WOULD_BLOCK;   /* queue full; retry after it drains */
     }
@@ -3903,6 +4106,7 @@ moq_result_t moq_media_sender_end_track(moq_media_sender_t *s,
     e->is_end = true;
     e->group_seq = track->group_seq;
     s->preq_tail++;
+    preq_note_enqueued(s, e);   /* a marker is not queued media */
 
     track->end_requested = true;
     track->group_open = false;   /* no further objects open a group */
@@ -4060,7 +4264,13 @@ moq_result_t moq_media_sender_get_stats(const moq_media_sender_t *s,
     moq_media_sender_stats_t snap;
     pthread_mutex_lock(&ms->mu);
     snap = ms->stats;
-    snap.objects_queued = ms->preq_tail - ms->preq_head;
+    /* MEDIA accepted by write() and still queued -- the same population as
+     * objects_written / objects_sent / objects_dropped / bytes_queued. A
+     * private zero-byte END_OF_TRACK work item occupies a physical ring slot
+     * but is NOT part of that population, so the physical depth
+     * (preq_tail - preq_head, which capacity checks keep using) is not the
+     * public answer. O(1): maintained at the enqueue/release chokepoints. */
+    snap.objects_queued = ms->preq_media;
     snap.bytes_queued = ms->preq_bytes;
     pthread_mutex_unlock(&ms->mu);
     size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
@@ -4223,6 +4433,13 @@ moq_media_sender_t *moq_media_sender_test_new_cfg(
     moq_media_sender_t *s = NULL;
     if (sender_new(NULL, false, cfg, &s) != MOQ_OK) return NULL;
     return s;
+}
+
+/* Test-only: how many times the pending-reset transition has been ATTEMPTED.
+ * Behind MOQ_MEDIA_SENDER_TESTING, so it is absent from the shipping library. */
+uint32_t moq_media_sender_test_reset_attempts(const moq_media_sender_t *s)
+{
+    return s ? s->test_reset_attempts : 0u;
 }
 
 /* Drive the production sender_hook with a caller-controlled session (the hook

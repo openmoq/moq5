@@ -1,6 +1,7 @@
 #ifndef MOQ_EVENT_HPP
 #define MOQ_EVENT_HPP
 
+#include <cstddef>
 #include <moq/buffer.hpp>
 #include <moq/types.hpp>
 #include <moq/visit.hpp>
@@ -235,6 +236,13 @@ struct object_chunk {
      * polled_event is destroyed. Copy increfs; move steals. */
     buffer chunk_buf;
     buffer properties_buf;
+
+    /* Appended at the aggregate tail so shorter existing aggregate
+     * initialization stays source-compatible. The peer's RESET_STREAM cause,
+     * valid only when terminal == object_terminal::reset; zero otherwise,
+     * including when the C event predates the field (see the detail_size
+     * gate in the conversion). */
+    uint64_t error_code = 0;
 
     buffer chunk_owned() const noexcept { return chunk_buf; }
     buffer properties_owned() const noexcept { return properties_buf; }
@@ -738,7 +746,17 @@ public:
                 d.payload_length,
                 span_from_rcbuf(d.chunk), span_from_rcbuf(d.properties),
                 d.chunk, d.properties,
-                buffer::retain(d.chunk), buffer::retain(d.properties)};
+                buffer::retain(d.chunk), buffer::retain(d.properties),
+                /* The cause is exposed only when it MEANS something: the
+                 * terminal must be a RESET, and the C detail must cover the
+                 * whole appended field. Otherwise zero -- so neither an older
+                 * event's tail nor a NORMAL/STOP terminal's physical bytes
+                 * escape as a cause. */
+                (d.terminal == MOQ_OBJECT_TERMINAL_RESET &&
+                 e.detail_size >= offsetof(moq_object_chunk_event_t, error_code) +
+                                      sizeof(d.error_code))
+                    ? d.error_code
+                    : 0u};
         }
         case MOQ_EVENT_NS_SUB_REQUEST: {
             auto &d = e.u.ns_sub_request;

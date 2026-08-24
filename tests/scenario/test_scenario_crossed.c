@@ -180,6 +180,66 @@ static int cross_sub_update(uint64_t seed,
 
 /* ---- Sub-scenario 2: PUBLISH update × PUBLISH_DONE --------------- */
 
+/* Classify one SESSION_CLOSED against the expected protocol violation.
+ * The side that DETECTED it reports code + reason; its peer observes the same
+ * close through the transport, which carries the application code but NO
+ * reason string -- so a code-only 0x3 is the expected peer shape. Reasonless
+ * means len == 0: a nonzero length with NULL data is malformed and must NOT
+ * be accepted as the peer shape. */
+static void classify_close(const moq_event_t *ev, const char *expected_reason,
+                           size_t expected_len, bool *matched,
+                           bool *unexpected)
+{
+    /* Kept for the negative unit checks below; the scenario itself uses the
+     * counting form so a missing or duplicated peer close cannot pass. */
+    bool code_ok = ev->u.closed.code == 0x3;
+    bool reasonless = ev->u.closed.reason.len == 0;
+    bool reason_ok = !reasonless && ev->u.closed.reason.data != NULL &&
+                     ev->u.closed.reason.len == expected_len &&
+                     memcmp(ev->u.closed.reason.data, expected_reason,
+                            expected_len) == 0;
+    if (code_ok && reason_ok)
+        *matched = true;
+    else if (code_ok && reasonless)
+        ;   /* peer's transport-observed close: code only */
+    else
+        *unexpected = true;   /* wrong code, or a malformed/other reason */
+}
+
+/* A nonzero reason length with NULL data is malformed: it must NOT be
+ * accepted as the reasonless peer shape, or a corrupt close could masquerade
+ * as the expected transport-observed one. */
+static int classify_close_negatives(void)
+{
+    int failures = 0;
+    static const char expected[] = "REQUEST_UPDATE unknown existing ID";
+    moq_event_t ev;
+    bool matched, unexpected;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_SESSION_CLOSED;
+    ev.u.closed.code = 0x3;
+    ev.u.closed.reason.data = NULL;
+    ev.u.closed.reason.len = 7;            /* malformed */
+    matched = false; unexpected = false;
+    classify_close(&ev, expected, sizeof(expected) - 1, &matched, &unexpected);
+    if (matched || !unexpected) failures++;
+
+    /* The genuine peer shape (code only) is still accepted. */
+    ev.u.closed.reason.len = 0;
+    matched = false; unexpected = false;
+    classify_close(&ev, expected, sizeof(expected) - 1, &matched, &unexpected);
+    if (matched || unexpected) failures++;
+
+    /* A different code is never the peer shape. */
+    ev.u.closed.code = 0x4;
+    matched = false; unexpected = false;
+    classify_close(&ev, expected, sizeof(expected) - 1, &matched, &unexpected);
+    if (!unexpected) failures++;
+
+    return failures;
+}
+
 static int cross_pub_update(uint64_t seed,
                              moq_alloc_t *alloc, trace_t *ts)
 {
@@ -245,33 +305,35 @@ static int cross_pub_update(uint64_t seed,
             "REQUEST_UPDATE unknown existing ID";
         bool matched = false;
         bool unexpected_close = false;
+        /* Per-session tallies: exactly ONE closure per side, of which exactly
+         * one carries the expected reason (the detecting side) and exactly one
+         * is code-only (the peer's transport-observed close). An aggregate
+         * flag would accept zero peer closes or duplicates. */
+        int cl_closes = 0, sv_closes = 0, reasoned = 0, codeonly = 0;
         moq_event_t ev;
         while (moq_session_poll_events(cl, &ev, 1) == 1) {
             if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                if (ev.u.closed.code == 0x3 &&
-                    ev.u.closed.reason.len == sizeof(expected_reason) - 1 &&
-                    ev.u.closed.reason.data &&
-                    memcmp(ev.u.closed.reason.data, expected_reason,
-                           sizeof(expected_reason) - 1) == 0)
-                    matched = true;
-                else
-                    unexpected_close = true;
+                cl_closes++;
+                if (ev.u.closed.reason.len == 0) codeonly++; else reasoned++;
+                classify_close(&ev, expected_reason,
+                               sizeof(expected_reason) - 1, &matched,
+                               &unexpected_close);
             }
             moq_event_cleanup(&ev);
         }
         while (moq_session_poll_events(sv, &ev, 1) == 1) {
             if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
-                if (ev.u.closed.code == 0x3 &&
-                    ev.u.closed.reason.len == sizeof(expected_reason) - 1 &&
-                    ev.u.closed.reason.data &&
-                    memcmp(ev.u.closed.reason.data, expected_reason,
-                           sizeof(expected_reason) - 1) == 0)
-                    matched = true;
-                else
-                    unexpected_close = true;
+                sv_closes++;
+                if (ev.u.closed.reason.len == 0) codeonly++; else reasoned++;
+                classify_close(&ev, expected_reason,
+                               sizeof(expected_reason) - 1, &matched,
+                               &unexpected_close);
             }
             moq_event_cleanup(&ev);
         }
+        if (cl_closes != 1 || sv_closes != 1 ||
+            reasoned != 1 || codeonly != 1)
+            unexpected_close = true;
         destroy_pair(sp);
         if (unexpected_close) return -6;
         return matched ? 0 : -5;
@@ -392,6 +454,10 @@ int main(void)
     uint64_t seed_start = 0;
     uint64_t num_seeds = 100;
 
+    int neg = classify_close_negatives();
+    if (neg != 0)
+        fprintf(stderr, "FAIL classify_close negatives: %d\n", neg);
+
     const char *e;
     if ((e = getenv("MOQ_SCENARIO_SEED_START")) != NULL)
         seed_start = strtoull(e, NULL, 0);
@@ -457,6 +523,8 @@ int main(void)
                 (unsigned long long)num_seeds);
         return 1;
     }
+    if (neg != 0)
+        return 1;
     fprintf(stderr, "PASS: test_scenario_crossed (%llu seeds)\n",
             (unsigned long long)num_seeds);
     return 0;

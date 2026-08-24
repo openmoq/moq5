@@ -316,6 +316,21 @@ package final class EndpointEngine: @unchecked Sendable {
         cond.unlock()
     }
 
+    /// Re-evaluate every parked waiter now: a consumer freed capacity that a
+    /// waiter's level term depends on (e.g. the bounded track-event FIFO
+    /// dropped below its cap, so a parked object waiter can make progress
+    /// again). Package-internal, callable from any thread; no public API. The
+    /// level is re-checked on the service thread, so this only wakes it --
+    /// the predicate, not this call, decides readiness.
+    package func nudgeWaiters() {
+        cond.lock()
+        nudgeLocked()
+        if !backendRetired {
+            backend.wake()
+        }
+        cond.unlock()
+    }
+
     // MARK: Drain
 
     /// Flush locally queued reliable stream data (the C drain), sliced so

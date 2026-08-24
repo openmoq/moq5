@@ -77,8 +77,28 @@ TXS_UNUSED static txs_owner_t txs_owner_capture(const moq_session_t *s,
 {
     txs_owner_t o = { TXS_OWNER_NONE, -1, -1, 0, 0 };
 
+    /* A slot arrives from an index, so it is only as trustworthy as that
+     * index. Reading a stale or corrupt key out of bounds would be undefined
+     * behaviour in the very harness meant to diagnose it, so an out-of-range
+     * slot becomes a LOUD incomparable record instead. */
+/* Parameters are deliberately not named `slot`/`kind`: the preprocessor
+ * substitutes after `.` too, which would rewrite `o.slot` inside the body. */
+#define TXS_SLOT_OK(slotval, capval) \
+    ((slotval) >= 0 && (size_t)(slotval) < (capval))
+#define TXS_BAD_SLOT(kindval, slotval, capval) do { \
+        TXS_DIAG("TXN: owner capture slot %d out of range for kind %d" \
+                " (capacity %zu)\n", (int)(slotval), (int)(kindval), \
+                (size_t)(capval)); \
+        o.kind = -2000 - (int)(kindval); \
+        o.slot = (int)(slotval); \
+        o.invalid = 1; \
+        return o; \
+    } while (0)
+
     int32_t ns = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v);
     if (ns >= 0) {
+        if (!TXS_SLOT_OK(ns, s->ns_sub_cap))
+            TXS_BAD_SLOT(TXS_OWNER_NS, ns, s->ns_sub_cap);
         o.kind = TXS_OWNER_NS;
         o.slot = (int)ns;
         o.state = (int)s->ns_subs[ns].state;
@@ -90,6 +110,24 @@ TXS_UNUSED static txs_owner_t txs_owner_capture(const moq_session_t *s,
     if (ep.kind == MOQ_REQ_NONE) return o;
     o.kind = (int)ep.kind;
     o.slot = (int)ep.slot;
+    {
+        /* Supported-ness and capacity are tracked separately: a recognized
+         * kind whose pool is EMPTY must still be bounds-checked, or a zero
+         * capacity would wave every slot through to an indexed read. */
+        size_t cap = 0;
+        bool supported = true;
+        switch (ep.kind) {
+        case MOQ_REQ_SUBSCRIPTION:     cap = s->sub_cap; break;
+        case MOQ_REQ_FETCH:            cap = s->fetch_cap; break;
+        case MOQ_REQ_TRACK_STATUS:     cap = s->ts_cap; break;
+        case MOQ_REQ_ANNOUNCEMENT:     cap = s->ann_cap; break;
+        case MOQ_REQ_PUBLISH:          cap = s->pub_cap; break;
+        case MOQ_REQ_SUBSCRIBE_TRACKS: cap = s->track_sub_cap; break;
+        default: supported = false; break;
+        }
+        if (supported && !TXS_SLOT_OK(ep.slot, cap))
+            TXS_BAD_SLOT(ep.kind, ep.slot, cap);
+    }
     switch (ep.kind) {
     case MOQ_REQ_SUBSCRIPTION:
         o.state = (int)s->subs[ep.slot].state;
@@ -107,6 +145,14 @@ TXS_UNUSED static txs_owner_t txs_owner_capture(const moq_session_t *s,
         o.state = (int)s->announcements[ep.slot].state;
         o.generation = s->announcements[ep.slot].generation;
         break;
+    case MOQ_REQ_PUBLISH:
+        o.state = (int)s->publishes[ep.slot].state;
+        o.generation = s->publishes[ep.slot].generation;
+        break;
+    case MOQ_REQ_SUBSCRIBE_TRACKS:
+        o.state = (int)s->track_subs[ep.slot].state;
+        o.generation = s->track_subs[ep.slot].generation;
+        break;
     default:
         /* A kind this helper does not resolve must be LOUD, and its record
          * distinct from every complete one -- two incomplete records of
@@ -118,6 +164,8 @@ TXS_UNUSED static txs_owner_t txs_owner_capture(const moq_session_t *s,
         o.invalid = 1;
         break;
     }
+#undef TXS_SLOT_OK
+#undef TXS_BAD_SLOT
     return o;
 }
 
@@ -253,6 +301,11 @@ TXS_UNUSED static bool txs_norm_append(txs_norm_vec_t *v, uint64_t kind,
     r->len = len;
     r->bytes = NULL;
     if (len > 0) {
+        if (!bytes) {
+            TXS_DIAG("TXN: record kind %llu declares %zu bytes with a NULL "
+                     "pointer\n", (unsigned long long)kind, len);
+            return false;
+        }
         r->bytes = (uint8_t *)malloc(len);
         if (!r->bytes) return false;
         memcpy(r->bytes, bytes, len);
@@ -302,6 +355,17 @@ typedef struct txs_img {
     uint8_t buf[512];
     size_t  len;
     int     overflow;
+    /* Sticky: a non-empty span was offered with a NULL pointer. The product
+     * does not emit that for a valid field, so it means malformed harness or
+     * decoder input -- which must produce a NAMED diagnostic, never an
+     * out-of-bounds read. Kept separate from `overflow` so the two cannot be
+     * confused in a failure report. */
+    int     null_span;
+    /* Sticky and DISTINCT from null_span: a container count was malformed or
+     * beyond its declared bound. An over-bound count is not a NULL pointer, and
+     * reporting it as one would misname the fault for any caller that ignored
+     * the helper's return value. */
+    int     bad_count;
 } txs_img_t;
 
 TXS_UNUSED static void txs_img_init(txs_img_t *im) { memset(im, 0, sizeof(*im)); }
@@ -318,15 +382,208 @@ TXS_UNUSED static void txs_img_bytes(txs_img_t *im, const uint8_t *b,
 {
     txs_img_u64(im, (uint64_t)n);
     if (im->overflow) return;
+    /* Length first, then the pointer, THEN the copy: a non-empty span with a
+     * NULL pointer is latched and skipped rather than dereferenced. */
     if (n > sizeof(im->buf) - im->len) { im->overflow = 1; return; }
+    if (n > 0 && !b) { im->null_span = 1; return; }
     if (n > 0) memcpy(im->buf + im->len, b, n);
     im->len += n;
+}
+
+/* Direct-assertion guard (#279). The count-assertion macros do NOT
+ * short-circuit, so an index after a failed count check still runs. This
+ * validates count, index, container pointer and leaf pointer IN THAT ORDER,
+ * fails BY NAME, and only then compares -- and it never silently skips the
+ * comparison when the pointer is NULL, which would let a missing span pass. */
+TXS_UNUSED static int txs_check_part_bytes(const moq_namespace_t *ns,
+                                           size_t idx, const void *want,
+                                           size_t want_len, const char *what)
+{
+    if (!ns) { TXS_DIAG("TXN %s: NULL namespace\n", what); return 1; }
+    if (idx >= ns->count) {
+        TXS_DIAG("TXN %s: part %zu out of range (count %zu)\n", what, idx,
+                 ns->count);
+        return 1;
+    }
+    if (!ns->parts) {
+        TXS_DIAG("TXN %s: count %zu with a NULL parts array\n", what,
+                 ns->count);
+        return 1;
+    }
+    if (ns->parts[idx].len != want_len) {
+        TXS_DIAG("TXN %s: part %zu length %zu, expected %zu\n", what, idx,
+                 ns->parts[idx].len, want_len);
+        return 1;
+    }
+    if (want_len > 0 && !ns->parts[idx].data) {
+        TXS_DIAG("TXN %s: part %zu declares %zu bytes with NULL data\n", what,
+                 idx, want_len);
+        return 1;
+    }
+    if (want_len > 0 && memcmp(ns->parts[idx].data, want, want_len) != 0) {
+        TXS_DIAG("TXN %s: part %zu bytes differ\n", what, idx);
+        return 1;
+    }
+    return 0;
+}
+
+/* Direct raw-span check (#279). The `if (len == want && ptr) memcmp(...)`
+ * shape silently DROPS a declared comparison when the pointer is NULL, so a
+ * missing span passes. This validates the exact length, then REQUIRES the
+ * pointer, then compares -- failing by name at each step and never
+ * dereferencing after a failed guard (`MOQ_TEST_CHECK` does not
+ * short-circuit). */
+TXS_UNUSED static int txs_check_span_bytes(const void *got, size_t got_len,
+                                           const void *want, size_t want_len,
+                                           const char *what)
+{
+    if (got_len != want_len) {
+        TXS_DIAG("TXN %s: span length %zu, expected %zu\n", what, got_len,
+                 want_len);
+        return 1;
+    }
+    if (want_len > 0 && !got) {
+        TXS_DIAG("TXN %s: declares %zu bytes with a NULL pointer\n", what,
+                 want_len);
+        return 1;
+    }
+    if (want_len > 0 && memcmp(got, want, want_len) != 0) {
+        TXS_DIAG("TXN %s: span bytes differ\n", what);
+        return 1;
+    }
+    return 0;
+}
+
+/* -- borrowed CONTAINER guards (#279) ---------------------------------- *
+ * `txs_img_bytes()` can guard a leaf `moq_bytes_t.data`, but it is reached only
+ * AFTER the array has been indexed -- so it cannot protect the array itself. A
+ * nonzero count with a NULL container, or an implausible count over a small
+ * backing array, walks out of bounds before any image overflow could latch.
+ * These helpers enforce the order the sweep requires: bound the count, then
+ * require the pointer, THEN index.
+ *
+ * On failure they latch the APPROPRIATE distinct sticky state as well as
+ * returning false -- `bad_count` for a malformed or over-bound count,
+ * `null_span` for a nonempty NULL container or leaf -- so a caller that ignores
+ * the result still cannot build a silently short image, and cannot have the
+ * fault misnamed either. */
+TXS_UNUSED static bool txs_img_parts(txs_img_t *im, const char *what,
+                                     const moq_bytes_t *arr, size_t count,
+                                     size_t max_count)
+{
+    txs_img_u64(im, (uint64_t)count);
+    if (count > max_count) {
+        TXS_DIAG("TXN %s: namespace part count %zu exceeds the bound %zu\n",
+                 what, count, max_count);
+        im->bad_count = 1;
+        return false;
+    }
+    if (count > 0 && !arr) {
+        TXS_DIAG("TXN %s: namespace part count %zu with a NULL parts array\n",
+                 what, count);
+        im->null_span = 1;
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (arr[i].len && !arr[i].data) {
+            TXS_DIAG("TXN %s: namespace part %zu declares %zu bytes with NULL "
+                     "data\n", what, i, arr[i].len);
+            im->null_span = 1;
+            return false;
+        }
+        txs_img_bytes(im, arr[i].data, arr[i].len);
+    }
+    return true;
+}
+
+TXS_UNUSED static bool txs_img_tokens(txs_img_t *im, const char *what,
+                                      const moq_resolved_token_t *toks,
+                                      size_t count, size_t max_count)
+{
+    txs_img_u64(im, (uint64_t)count);
+    if (count > max_count) {
+        TXS_DIAG("TXN %s: token count %zu exceeds the bound %zu\n", what,
+                 count, max_count);
+        im->bad_count = 1;
+        return false;
+    }
+    if (count > 0 && !toks) {
+        TXS_DIAG("TXN %s: token count %zu with a NULL tokens array\n", what,
+                 count);
+        im->null_span = 1;
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        txs_img_u64(im, toks[i].token_type);
+        if (toks[i].token_value.len && !toks[i].token_value.data) {
+            TXS_DIAG("TXN %s: token %zu declares %zu value bytes with NULL "
+                     "data\n", what, i, toks[i].token_value.len);
+            im->null_span = 1;
+            return false;
+        }
+        txs_img_bytes(im, toks[i].token_value.data, toks[i].token_value.len);
+    }
+    return true;
+}
+
+/* Permanent self-check: the two container failure classes must stay
+ * distinguishable in BOTH helpers -- a regression confined to either token
+ * branch would otherwise stay green. Returns the number of failures.
+ *
+ * Genuinely quiet: it deliberately provokes the helpers, so it saves the
+ * caller's `txs_quiet`, silences the expected negative probes, and restores the
+ * saved value on every exit. Expected probe output must never be mistaken for a
+ * real diagnostic. */
+TXS_UNUSED static int txs_selfcheck_img_states(void)
+{
+    const int saved_quiet = txs_quiet;
+    txs_quiet = 1;
+    int bad = 0;
+    const moq_bytes_t one = { (const uint8_t *)"x", 1 };
+    /* A VALID local token for the over-bound case: the count guard must fire
+     * first, so this is never indexed. */
+    const moq_resolved_token_t tok = { 0, { (const uint8_t *)"t", 1 } };
+
+    txs_img_t a; txs_img_init(&a);
+    if (txs_img_parts(&a, "selfcheck", &one, 99, 32)) bad++;   /* over bound */
+    if (!a.bad_count || a.null_span) bad++;
+
+    txs_img_t b; txs_img_init(&b);
+    if (txs_img_parts(&b, "selfcheck", NULL, 2, 32)) bad++;    /* NULL array */
+    if (!b.null_span || b.bad_count) bad++;
+
+    txs_img_t c; txs_img_init(&c);
+    if (txs_img_tokens(&c, "selfcheck", &tok, 99, 16)) bad++;  /* over bound */
+    if (!c.bad_count || c.null_span) bad++;
+
+    txs_img_t d; txs_img_init(&d);
+    if (txs_img_tokens(&d, "selfcheck", NULL, 2, 16)) bad++;   /* NULL array */
+    if (!d.null_span || d.bad_count) bad++;
+
+    txs_quiet = saved_quiet;
+    return bad;
 }
 
 TXS_UNUSED static bool txs_norm_append_img(txs_norm_vec_t *v, uint64_t kind,
                                            const txs_img_t *im)
 {
-    if (im->overflow) return false;
+    if (im->bad_count) {
+        TXS_DIAG("TXN: record kind %llu carries a malformed or over-bound "
+                 "container count; refusing to build the image\n",
+                 (unsigned long long)kind);
+        return false;
+    }
+    if (im->null_span) {
+        TXS_DIAG("TXN: record kind %llu carries a NON-EMPTY span with a NULL "
+                 "pointer; refusing to build the image\n",
+                 (unsigned long long)kind);
+        return false;
+    }
+    if (im->overflow) {
+        TXS_DIAG("TXN: record kind %llu overflowed the image buffer\n",
+                 (unsigned long long)kind);
+        return false;
+    }
     return txs_norm_append(v, kind, im->buf, im->len);
 }
 

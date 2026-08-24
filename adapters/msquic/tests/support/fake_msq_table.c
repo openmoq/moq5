@@ -21,6 +21,17 @@ static fake_msq_stream_t *stream_of(HQUIC h)
     return (fake_msq_stream_t *)h;
 }
 
+/* Read a handle's discriminator without aliasing it as either struct: both
+ * tagged objects begin with the uint32_t tag, so the first bytes of the
+ * object representation carry it. */
+static uint32_t kind_of(HQUIC h)
+{
+    uint32_t kind = 0;
+
+    memcpy(&kind, h, sizeof(kind));
+    return kind;
+}
+
 static QUIC_STATUS QUIC_API f_stream_open(HQUIC conn,
                                           QUIC_STREAM_OPEN_FLAGS flags,
                                           QUIC_STREAM_CALLBACK_HANDLER cb,
@@ -32,6 +43,7 @@ static QUIC_STATUS QUIC_API f_stream_open(HQUIC conn,
         return QUIC_STATUS_OUT_OF_MEMORY;
     fake_msq_stream_t *st = &f->streams[f->stream_count++];
     memset(st, 0, sizeof(*st));
+    st->kind = FAKE_MSQ_KIND_STREAM;
     st->owner = f;
     st->in_use = true;
     st->cb = cb;
@@ -48,6 +60,10 @@ static QUIC_STATUS QUIC_API f_stream_start(HQUIC h,
     fake_msq_stream_t *st = stream_of(h);
     fake_msq_t *f = st->owner;
 
+    if (f->stream_start_fails > 0) {
+        f->stream_start_fails--;
+        return QUIC_STATUS_ABORTED; /* refused before any state moves */
+    }
     st->started = true;
     st->start_flags = flags;
     /* real QUIC numbering from the fake's own counters, matching what
@@ -111,6 +127,15 @@ static QUIC_STATUS QUIC_API f_stream_shutdown(
     st->shutdown_calls++;
     st->last_shutdown_flags = flags;
     st->last_shutdown_code = code;
+    /* record in order; announce the first call that no longer fits rather
+     * than overwriting an earlier entry */
+    if (st->shutdown_log_len < FAKE_MSQ_SHUTDOWN_LOG) {
+        st->shutdown_flags_log[st->shutdown_log_len] = (uint32_t)flags;
+        st->shutdown_codes_log[st->shutdown_log_len] = code;
+        st->shutdown_log_len++;
+    } else {
+        st->shutdown_log_overflow = true;
+    }
     return QUIC_STATUS_SUCCESS;
 }
 
@@ -171,8 +196,17 @@ static void QUIC_API f_conn_shutdown(HQUIC conn,
     fake_msq_t *f = (fake_msq_t *)conn;
 
     (void)flags;
-    f->conn_shutdowns++;
+    atomic_fetch_add(&f->conn_shutdowns, 1);
     f->last_conn_shutdown_code = code;
+    if (f->on_conn_shutdown != NULL)
+        f->on_conn_shutdown(f, f->on_conn_shutdown_ctx);
+}
+
+static void QUIC_API f_conn_close(HQUIC conn)
+{
+    fake_msq_t *f = (fake_msq_t *)conn;
+
+    atomic_fetch_add(&f->conn_closes, 1);
 }
 
 /* Mirror of the adapter's laundering: SetCallbackHandler carries the handler
@@ -183,12 +217,36 @@ static QUIC_STREAM_CALLBACK_HANDLER f_ptr_to_stream_cb(void *cb)
     return u.fn;
 }
 
+static QUIC_CONNECTION_CALLBACK_HANDLER f_ptr_to_conn_cb(void *cb)
+{
+    union { void *obj; QUIC_CONNECTION_CALLBACK_HANDLER fn; } u = { .obj = cb };
+    return u.fn;
+}
+
 static void QUIC_API f_set_callback_handler(HQUIC h, void *cb, void *ctx)
 {
+    if (kind_of(h) == FAKE_MSQ_KIND_CONN) {
+        fake_msq_t *f = (fake_msq_t *)h;
+
+        f->conn_cb = f_ptr_to_conn_cb(cb);
+        f->conn_ctx = ctx;
+        return;
+    }
+    FAKE_MSQ_REQUIRE(kind_of(h) == FAKE_MSQ_KIND_STREAM);
     fake_msq_stream_t *st = stream_of(h);
 
     st->cb = f_ptr_to_stream_cb(cb);
     st->ctx = ctx;
+}
+
+static QUIC_STATUS QUIC_API f_conn_set_configuration(HQUIC conn,
+                                                     HQUIC configuration)
+{
+    fake_msq_t *f = (fake_msq_t *)conn;
+
+    (void)configuration;
+    atomic_fetch_add(&f->conn_set_configs, 1);
+    return QUIC_STATUS_SUCCESS;
 }
 
 static QUIC_STATUS QUIC_API f_get_param(HQUIC h, uint32_t param,
@@ -205,6 +263,10 @@ static QUIC_STATUS QUIC_API f_get_param(HQUIC h, uint32_t param,
 void fake_msq_init(fake_msq_t *f, bool is_client)
 {
     memset(f, 0, sizeof(*f));
+    f->kind = FAKE_MSQ_KIND_CONN;
+    atomic_init(&f->conn_shutdowns, 0);
+    atomic_init(&f->conn_closes, 0);
+    atomic_init(&f->conn_set_configs, 0);
     f->is_client = is_client;
     f->force_next_id = UINT64_MAX;
     f->api.StreamOpen = f_stream_open;
@@ -214,6 +276,8 @@ void fake_msq_init(fake_msq_t *f, bool is_client)
     f->api.StreamClose = f_stream_close;
     f->api.StreamReceiveSetEnabled = f_stream_receive_set_enabled;
     f->api.ConnectionShutdown = f_conn_shutdown;
+    f->api.ConnectionClose = f_conn_close;
+    f->api.ConnectionSetConfiguration = f_conn_set_configuration;
     f->api.DatagramSend = f_datagram_send;
     f->api.SetCallbackHandler = f_set_callback_handler;
     f->api.GetParam = f_get_param;
@@ -227,6 +291,18 @@ const QUIC_API_TABLE *fake_msq_table(fake_msq_t *f)
 HQUIC fake_msq_conn_handle(fake_msq_t *f)
 {
     return (HQUIC)f;
+}
+
+bool fake_msq_conn_cb_installed(const fake_msq_t *f)
+{
+    return f->conn_cb != NULL;
+}
+
+QUIC_STATUS fake_msq_deliver_conn_event(fake_msq_t *f,
+                                        QUIC_CONNECTION_EVENT *ev)
+{
+    FAKE_MSQ_REQUIRE(f->conn_cb != NULL);
+    return f->conn_cb(fake_msq_conn_handle(f), f->conn_ctx, ev);
 }
 
 fake_msq_stream_t *fake_msq_stream_at(fake_msq_t *f, int index)
@@ -243,6 +319,7 @@ fake_msq_stream_t *fake_msq_peer_stream(fake_msq_t *f, uint64_t id,
         return NULL;
     fake_msq_stream_t *st = &f->streams[f->stream_count++];
     memset(st, 0, sizeof(*st));
+    st->kind = FAKE_MSQ_KIND_STREAM;
     st->owner = f;
     st->in_use = true;
     st->id = id;

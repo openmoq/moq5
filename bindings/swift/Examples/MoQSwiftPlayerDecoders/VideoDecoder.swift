@@ -4,15 +4,19 @@ import Foundation
 import MoQ
 import MoQMedia
 
-enum VideoDecoderError: Error, CustomStringConvertible {
+package enum VideoDecoderError: Error, CustomStringConvertible {
     case malformedAVCC(String)
+    /// Malformed decoder input rejected BEFORE CoreMedia (e.g. an empty access
+    /// unit), distinct from a downstream CoreMedia status failure.
+    case malformedInput(String)
     case formatDescriptionFailed(OSStatus)
     case blockBufferFailed(OSStatus)
     case sampleBufferFailed(OSStatus)
 
-    var description: String {
+    package var description: String {
         switch self {
         case .malformedAVCC(let d): return "Malformed avcC: \(d)"
+        case .malformedInput(let d): return "Malformed input: \(d)"
         case .formatDescriptionFailed(let s): return "CMVideoFormatDescription failed: \(s)"
         case .blockBufferFailed(let s): return "CMBlockBuffer failed: \(s)"
         case .sampleBufferFailed(let s): return "CMSampleBuffer failed: \(s)"
@@ -20,7 +24,7 @@ enum VideoDecoderError: Error, CustomStringConvertible {
     }
 }
 
-func createH264FormatDescription(
+package func createH264FormatDescription(
     avccData: Data
 ) throws -> CMVideoFormatDescription {
     guard avccData.count >= 7, avccData[avccData.startIndex] == 1 else {
@@ -67,8 +71,18 @@ func createH264FormatDescription(
         offset += len
     }
 
-    guard !paramSets.isEmpty else {
-        throw VideoDecoderError.malformedAVCC("no parameter sets")
+    // Reject malformed parameter-set shapes BEFORE handing them to CoreMedia,
+    // so the failure is a typed `malformedAVCC` rather than a downstream
+    // CMVideoFormatDescription status (and so an all-empty flatten never
+    // force-unwraps a nil base address).
+    guard numSPS >= 1 else {
+        throw VideoDecoderError.malformedAVCC("no SPS")
+    }
+    guard numPPS >= 1 else {
+        throw VideoDecoderError.malformedAVCC("no PPS")
+    }
+    guard paramSets.allSatisfy({ !$0.isEmpty }) else {
+        throw VideoDecoderError.malformedAVCC("empty parameter set")
     }
 
     let nalLengthSize: Int32 = Int32((avccData[avccData.startIndex + 4] & 0x03) + 1)
@@ -92,7 +106,7 @@ func createH264FormatDescription(
 
 /// Create a CMSampleBuffer for one video frame from CMAF mdat bytes.
 /// Timestamps are rebased: pass DTS/PTS relative to stream start.
-func createSampleBuffer(
+package func createSampleBuffer(
     data: Data,
     formatDescription: CMVideoFormatDescription,
     decodeTimeUS: Int64,
@@ -100,6 +114,11 @@ func createSampleBuffer(
     durationUS: UInt32,
     isKeyframe: Bool
 ) throws -> CMSampleBuffer {
+    // Reject an empty access unit up front: a distinct pre-CoreMedia input
+    // error, before any CMBlockBuffer allocation or forced `baseAddress!`.
+    guard !data.isEmpty else {
+        throw VideoDecoderError.malformedInput("empty access unit")
+    }
     let timescale: CMTimeScale = 1_000_000
 
     var blockBuffer: CMBlockBuffer?

@@ -18,6 +18,9 @@
 #include <moq/picoquic.h>
 #include <moq/subscriber.h>
 #include <moq/rcbuf.h>
+
+#include "../common/moq_example_term.h"
+
 #include <picoquic_packet_loop.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,8 +59,10 @@ static void on_subscribed(void *ctx, moq_sub_track_t *track) {
 static void on_error(void *ctx, moq_sub_track_t *track,
                       moq_request_error_t code, moq_bytes_t reason) {
     (void)ctx; (void)track;
-    fprintf(stderr, "  subscribe error: code=%u reason=\"%.*s\"\n",
-        code, (int)reason.len, reason.data ? (const char *)reason.data : "");
+    /* reason is PEER-CONTROLLED: escape before printing. */
+    fprintf(stderr, "  subscribe error: code=%u reason=\"", code);
+    moq_example_term_fprint(stderr, reason.data, reason.len);
+    fputs("\"\n", stderr);
 }
 
 static void on_draining(void *ctx) {
@@ -145,13 +150,14 @@ static int loop_callback(picoquic_quic_t *quic,
     while (moq_sub_poll_object(ctx->sub, &obj) == MOQ_OK) {
         size_t props_len = obj.properties ? moq_rcbuf_len(obj.properties) : 0;
         if (obj.payload) {
-            fprintf(stderr, "  object: g=%llu o=%llu \"%.*s\" [props=%zu]%s\n",
+            /* payload is PEER-CONTROLLED: bounded, terminal-safe preview. */
+            fprintf(stderr, "  object: g=%llu o=%llu ",
                 (unsigned long long)obj.group_id,
-                (unsigned long long)obj.object_id,
-                (int)moq_rcbuf_len(obj.payload),
-                (const char *)moq_rcbuf_data(obj.payload),
-                props_len,
-                obj.datagram ? " datagram" : "");
+                (unsigned long long)obj.object_id);
+            moq_example_term_fprint_preview(stderr,
+                moq_rcbuf_data(obj.payload), moq_rcbuf_len(obj.payload), 64);
+            fprintf(stderr, " [props=%zu]%s\n",
+                props_len, obj.datagram ? " datagram" : "");
         } else {
             fprintf(stderr, "  object: g=%llu o=%llu status=%u\n",
                 (unsigned long long)obj.group_id,

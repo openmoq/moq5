@@ -64,24 +64,36 @@
  * listener. Each accepted connection is placed on a lane and, inside
  * that lane's on_lane_pump, the application iterates the lane's
  * connections via moq_msquic_lane_next_conn() and drives their
- * sessions. A connection whose transport reached its terminal stays
- * visible to its lane's pump for the batch that delivers its final
- * events (poll SESSION_CLOSED there), and is then reclaimed.
+ * sessions.
+ *
+ * Terminal children (SERVER): a connection whose transport reached its
+ * terminal stays visible to its lane's pump — across as many pumps as the
+ * application needs — until the application both polls its SESSION_CLOSED
+ * and acknowledges it with moq_msquic_managed_conn_ack_terminal(). Only
+ * then may it be reclaimed. A BOUNDED pump may therefore return without
+ * draining that event and still find the same child, its session and its
+ * `user` state on a later pump. Until it acknowledges, the child keeps
+ * consuming one of cfg.max_connections; see that function for the full
+ * contract and for what forced teardown does.
  *
  * Compatibility view (CLIENT ONLY): the facade-level accessors
  * (_session, is_fatal/is_closed/codes) describe the single client
  * connection. On a SERVER they are NOT a per-connection correctness
  * API — a server observes terminal by polling SESSION_CLOSED inside the
  * lane pump. The pending probes aggregate across all live connections
- * (zero at quiescence) and are valid for both.
+ * (zero at quiescence) and are valid for both. The client connection is
+ * likewise not acknowledged: the facade owns its lifetime, and
+ * moq_msquic_managed_session() is pump-scoped and simply reads NULL once
+ * that connection is gone.
  *
- * Version: exact-version. The facade offers exactly one MoQ ALPN,
- * chosen by cfg.version (default draft-16 / "moqt-16"), and creates
- * the session at that version eagerly. A client/server version
- * mismatch therefore fails ALPN negotiation at the handshake: the
- * client observes a bounded fatal terminal with no MoQ setup, and the
- * server never accepts the connection. Deferred multi-version offers
- * (a real ALPN list) are a later addition.
+ * Version: clients are exact-version and offer exactly one MoQ ALPN,
+ * chosen by cfg.version (default draft-16 / "moqt-16"). Servers may
+ * either offer that same exact single ALPN, or append a version list in
+ * cfg.versions/cfg.version_count and accept several draft ALPNs on one
+ * listener. The server list is ordered by preference, most preferred first;
+ * the selected version is the first mutually supported entry in that server
+ * list. A multi-version server creates each child session at the version
+ * MsQuic reports for that accepted connection.
  *
  * Teardown: stop() refuses new accepts, shuts every live connection
  * down, waits for each transport to quiesce (all pending sends and
@@ -109,9 +121,12 @@ typedef struct moq_msquic_managed_lane moq_msquic_managed_lane_t;
 /* An accepted connection (server) or the single client connection. */
 typedef struct moq_msquic_managed_conn moq_msquic_managed_conn_t;
 
+#define MOQ_MSQUIC_MANAGED_MAX_VERSIONS 8u
+
 /* Information available at server accept, for lane placement. Sparse
- * for now (only struct_size); peer address / negotiated ALPN / version
- * land later behind struct_size without breaking choose_lane. */
+ * for now (only struct_size). The negotiated MoQ version is available
+ * later from moq_msquic_managed_conn_negotiated_version() once the
+ * accepted connection is visible in its lane pump. */
 typedef struct moq_msquic_accept_info {
     uint32_t struct_size;
 } moq_msquic_accept_info_t;
@@ -204,11 +219,69 @@ typedef struct moq_msquic_managed_cfg {
      * moq_msquic_managed_cfg_init_sized. */
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
+
+    /* appended: outgoing subgroup pool per
+     * session, forwarded verbatim to moq_session_cfg_t.max_open_subgroups
+     * (0 = session default -- and what prefix-sized callers get). A small value
+     * makes the SESSION's write pool the sender-side blocker independent of any
+     * consumer table. Honored only when struct_size covers the field ENTIRELY;
+     * a size landing inside it reads as 0, never as its low bytes.
+     *
+     * Contract: 0 selects the session default; legal explicit values are
+     * 1..0xffff. A FULL-SIZED config carrying a larger value makes
+     * moq_msquic_managed_create return MOQ_ERR_INVAL before any allocation or
+     * transport setup -- the core's own limit, reported at the facade rather
+     * than surfacing later as an internal or transport error. */
+    uint32_t max_open_subgroups;
+    /* appended LAST: SERVER-only list of MoQ versions to offer as ALPNs on one
+     * listener, ordered by server preference (most preferred first). The
+     * selected version is the first mutually supported entry in this server
+     * list. The list is one ABI block: honored only when struct_size covers
+     * both pointer and count entirely; prefix/partial callers behave as absent.
+     *
+     * When version_count == 0, the exact-version cfg.version field above remains
+     * authoritative (0 = draft-16). When version_count > 0:
+     *   - perspective must be SERVER;
+     *   - cfg.version must be 0 (no exact-version/list conflict);
+     *   - versions must point at 1..MOQ_MSQUIC_MANAGED_MAX_VERSIONS entries;
+     *   - entries must be known MoQ versions and must not duplicate.
+     *
+     * create() deep-copies the list and ALPN buffer array before starting
+     * transport; the caller may free or mutate the source array after create().
+     * A multi-version SERVER returns 0 from the facade-level
+     * moq_msquic_managed_negotiated_version(); use
+     * moq_msquic_managed_conn_negotiated_version() inside the lane pump for an
+     * accepted connection's immutable selected draft. */
+    const moq_version_t *versions;
+    size_t version_count;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(
     moq_msquic_managed_cfg_t *cfg, size_t size);
 
+/* Process-global MTU note (SERVER perspective): creating a managed SERVER
+ * lowers MsQuic's PROCESS-GLOBAL minimum MTU floor to a 1280-byte IP path MTU
+ * (a one-time SetParam on QUIC_PARAM_GLOBAL_SETTINGS). This is required because
+ * a server's first reply to a bare Initial is sized on the pre-configuration
+ * CONNECTION path: the new connection copies MsQuic's library-global settings
+ * and seeds its path MTU before a configuration is attached, so that first reply
+ * is sized from the process-global default (1288) -- the listener configuration
+ * alone does NOT govern it.
+ *
+ * There is no registration-scoped settings parameter, so the floor is
+ * necessarily process-wide. LibMoQ performs NO destroy-time restore: the floor
+ * remains in force while MsQuic stays initialized and another open API table or
+ * registration may depend on it. (MsQuic itself owns global-settings lifetime --
+ * it loads them at the first MsQuicOpen2 reference and may reset them on a later
+ * MsQuicOpen2 after the last MsQuicClose; the next managed-server create simply
+ * reapplies the floor. LibMoQ adds no refcount and no restore.)
+ *
+ * A managed CLIENT create does NOT issue this write, but a client created in the
+ * same process AFTER a managed server inherits the conservative 1280 initial
+ * floor; the client's own configuration still declares no MTU override and no
+ * process-global MAXIMUM is imposed, so DPLPMTUD can still grow the path. If the
+ * global write is rejected, the SERVER create fails closed (MOQ_ERR_INTERNAL,
+ * *out left NULL). */
 MOQ_API moq_result_t moq_msquic_managed_create(
     const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out);
 
@@ -300,6 +373,34 @@ typedef struct moq_msquic_lane_stats {
                                     * staging attempts and synchronous
                                     * send failures are never counted)   */
     uint64_t flush_bytes;          /* bytes in those accepted batches    */
+#ifdef MOQ_MSQUIC_TESTING
+    /* Test-only future-field discriminator. It makes sizeof(current) larger
+     * than the frozen v0 floor in white-box builds, so a regression that
+     * validates against sizeof(current) is observable before a real public
+     * field is appended. Never part of the production ABI. */
+    uint64_t test_appended;
+
+    /* Diagnostic-only, appended AFTER the frozen v0 prefix so no existing
+     * field offset moves and MOQ_MSQUIC_LANE_STATS_V0_SIZE stays put.
+     *
+     * `deadline_sweeps` counts a deadline that FIRED. The no-work path first
+     * queries every present connection, and each query walks that session's
+     * capacity tables; nothing counted that scan. These do:
+     *   deadline_queries  one per connection per no-work scan
+     *   deadline_class_*  that query's outcome, partitioning the queries
+     * Classification is relative to ONE scan-entry instant sampled before the
+     * loop, not to a moving `now`: none = no deadline at all, future = later
+     * than that instant, due = at or before it. Cumulative; never read by the
+     * product.
+     *
+     * These are plain uint64_t and wrap modulo 2^64; readers take differences
+     * with unsigned modular subtraction, which stays correct across a wrap.
+     * The scan path deliberately carries no saturation branch. */
+    uint64_t deadline_queries;
+    uint64_t deadline_class_none;
+    uint64_t deadline_class_future;
+    uint64_t deadline_class_due;
+#endif
 } moq_msquic_lane_stats_t;
 
 /* Frozen v0 layout floor: the smallest out_size moq_msquic_lane_get_stats
@@ -345,6 +446,54 @@ MOQ_API void moq_msquic_managed_conn_set_user(
 MOQ_API void *moq_msquic_managed_conn_user(
     const moq_msquic_managed_conn_t *conn);
 
+/* SERVER: tell the facade this terminal child may be reclaimed.
+ *
+ * WHAT IT ASSERTS. Terminal processing for this connection is complete: the
+ * application no longer needs the child to remain iterable, and it will not use
+ * the borrowed conn/session handles after the acknowledging callback returns.
+ * Independently owned application state and retained moq_rcbuf_t are
+ * unaffected, and nothing reference-counted is released by the call. The
+ * assertion is not mechanically verifiable — the library records that it was
+ * made.
+ *
+ * WHY IT EXISTS. A lane pump is free to be BOUNDED: to service part of its work
+ * and return before draining every session. Without an acknowledgment the
+ * facade could only guess, from a pump having had the OPPORTUNITY to poll, that
+ * the terminal was consumed — and reclaim a child whose session a bounded
+ * consumer was still going to read.
+ *
+ * WHEN IT MAY BE CALLED. Only from the owning lane's on_lane_pump, and only for
+ * a connection that callback was presented. MOQ_EVENT_SESSION_CLOSED must
+ * ALREADY have been transferred to the application by a poll of this
+ * connection's session: a queued-but-unpolled terminal is not enough, and
+ * neither is a completed transport shutdown. Because observation is a durable
+ * session fact rather than a queue read, the acknowledging callback need NOT be
+ * the one that polled — a later pump is fine.
+ *
+ * RESULTS.
+ *   MOQ_OK               accepted; also returned for a duplicate call while the
+ *                        handle is still valid in the current callback.
+ *   MOQ_ERR_INVAL        conn == NULL.
+ *   MOQ_ERR_WRONG_STATE  the single client connection (it is not reclaimed
+ *                        per-child); outside the owning lane's pump; or the
+ *                        terminal has not been observed yet.
+ *
+ * HANDLE LIFETIME. The handle is valid only for the current callback. After a
+ * successful acknowledgment the connection may be reclaimed as soon as that
+ * callback returns — do not retain the pointer. A stale or released handle is
+ * invalid input: no rejection is promised and none is attempted.
+ *
+ * IF IT IS NEVER CALLED. A terminal server child stays linked, iterable and
+ * counted against cfg.max_connections; it is never reclaimed because time
+ * passed, so once the reserve is exhausted new accepts are refused at the
+ * listener. Every accepted child has a MoQ session from the moment it exists
+ * (it is created before the transport is wired), so there is no
+ * nothing-to-acknowledge class here. Forced facade teardown (stop()/destroy())
+ * still reclaims without acknowledgment, behind the documented callback/pump
+ * exclusion barrier; that is the forced path, not the normal one. */
+MOQ_API moq_result_t moq_msquic_managed_conn_ack_terminal(
+    moq_msquic_managed_conn_t *conn);
+
 /* Shut one connection's transport down (async, orderly; code is the
  * application close code). The connection's final events arrive on a
  * later pump. */
@@ -357,7 +506,10 @@ MOQ_API size_t moq_msquic_managed_conn_count(
 
 /* Graceful drain: refuse new connections; existing ones continue until
  * they close on their own (watch conn_count and the pending probes).
- * Safe from any thread, idempotent. */
+ * Safe from any thread, idempotent. A terminal SERVER child still counts
+ * until the application acknowledges it, so conn_count reaches zero only
+ * for a server that calls moq_msquic_managed_conn_ack_terminal; stop() is
+ * the unconditional path. */
 MOQ_API void moq_msquic_managed_drain(moq_msquic_managed_t *m);
 
 /* Server: the bound listen port (after create). */
@@ -392,12 +544,18 @@ MOQ_API bool moq_msquic_managed_is_closed(const moq_msquic_managed_t *m);
 MOQ_API uint64_t moq_msquic_managed_close_code(
     const moq_msquic_managed_t *m);
 
-/* The MoQ version this facade speaks. Exact-version: the single offered
- * ALPN fixes it at create(), so this is the negotiated version from that
- * point (0 only for a NULL facade). Parity with the other managed
- * adapters' negotiated_version accessor. */
+/* The MoQ version this facade speaks. Exact-version endpoints know it at
+ * create(). A multi-version SERVER returns 0 here because version is
+ * per-accepted-connection; use the conn accessor from the lane pump. */
 MOQ_API moq_version_t moq_msquic_managed_negotiated_version(
     const moq_msquic_managed_t *m);
+
+/* The immutable MoQ version selected for an accepted server connection or the
+ * single client connection. Valid only for an application-owned connection
+ * pointer inside its owning on_lane_pump; returns 0 for NULL or outside that
+ * pump window. */
+MOQ_API moq_version_t moq_msquic_managed_conn_negotiated_version(
+    const moq_msquic_managed_conn_t *conn);
 
 #ifdef __cplusplus
 }

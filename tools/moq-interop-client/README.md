@@ -148,7 +148,9 @@ docker run --rm \
 
 - `moqt://host:port` — raw QUIC (ALPN `moqt-16` / `moqt-18`, negotiated)
 - `moqt://[::1]:port` — IPv6 literal
-- `https://host:port/path` — WebTransport
+- `https://host:port/path` — WebTransport with an explicit CONNECT path
+- `https://host:port` — WebTransport at `/`, for relays that mount the root
+  (with no path in the URL the library default `/moq` would be wrong)
 
 ## TAP output
 

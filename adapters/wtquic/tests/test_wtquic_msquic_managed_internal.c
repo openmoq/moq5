@@ -46,14 +46,54 @@ typedef struct {
     long live;
     long budget;
     bool limited;
+    /* denial accounting: proves an armed zero budget actually refused the
+     * first allocation attempted after arming, rather than being inferred
+     * from the terminal result */
+    long denials;
+    long succ_since_arm;
+    long first_denial_succ_before;
 } acnt_t;
-static void acnt_init(acnt_t *a) { pthread_mutex_init(&a->mu, NULL); a->live = 0; a->budget = 0; a->limited = false; }
+static void acnt_reset_denials(acnt_t *a)
+{
+    a->denials = 0;
+    a->succ_since_arm = 0;
+    a->first_denial_succ_before = -1;
+}
+static void acnt_init(acnt_t *a)
+{
+    pthread_mutex_init(&a->mu, NULL);
+    a->live = 0; a->budget = 0; a->limited = false;
+    acnt_reset_denials(a);
+}
+/* arm a zero budget and start denial accounting from this instant */
+static void acnt_arm_zero(acnt_t *a)
+{
+    pthread_mutex_lock(&a->mu);
+    a->limited = true;
+    a->budget = 0;
+    acnt_reset_denials(a);
+    pthread_mutex_unlock(&a->mu);
+}
+static void acnt_disarm(acnt_t *a)
+{
+    pthread_mutex_lock(&a->mu);
+    a->limited = false;
+    pthread_mutex_unlock(&a->mu);
+}
+static void acnt_denials(acnt_t *a, long *out_denials, long *out_first_after)
+{
+    pthread_mutex_lock(&a->mu);
+    if (out_denials)    *out_denials    = a->denials;
+    if (out_first_after) *out_first_after = a->first_denial_succ_before;
+    pthread_mutex_unlock(&a->mu);
+}
 static void acnt_init_budget(acnt_t *a, long budget)
 {
     pthread_mutex_init(&a->mu, NULL);
     a->live = 0;
     a->budget = budget;
     a->limited = true;
+    acnt_reset_denials(a);
 }
 static void acnt_destroy(acnt_t *a) { pthread_mutex_destroy(&a->mu); }
 static long acnt_live(acnt_t *a)
@@ -68,6 +108,15 @@ static void *acnt_alloc(size_t n, void *ctx)
     acnt_t *a = ctx;
     pthread_mutex_lock(&a->mu);
     bool deny = a->limited && a->budget-- <= 0;
+    if (a->limited) {
+        if (deny) {
+            if (a->first_denial_succ_before < 0)
+                a->first_denial_succ_before = a->succ_since_arm;
+            a->denials++;
+        } else {
+            a->succ_since_arm++;
+        }
+    }
     if (!deny)
         a->live++;
     pthread_mutex_unlock(&a->mu);
@@ -87,6 +136,15 @@ static void *acnt_realloc(void *p, size_t os, size_t ns, void *ctx)
     (void)os;
     pthread_mutex_lock(&a->mu);
     bool deny = a->limited && a->budget-- <= 0;
+    if (a->limited) {
+        if (deny) {
+            if (a->first_denial_succ_before < 0)
+                a->first_denial_succ_before = a->succ_since_arm;
+            a->denials++;
+        } else {
+            a->succ_since_arm++;
+        }
+    }
     if (!deny && p == NULL)
         a->live++;
     pthread_mutex_unlock(&a->mu);
@@ -2394,7 +2452,295 @@ static moq_wtquic_msquic_managed_t *make_client(const moq_alloc_t *alloc,
     return m;
 }
 
+/* --- WT_ALPN_ERROR on the client negotiation-failure route (RED) --------- */
+/* draft-ietf-webtrans-http3-15 3.3 + its IANA registry entry: a client that
+ * REQUIRES application-protocol negotiation MUST close the WebTransport session
+ * with WT_ALPN_ERROR (0x0817b3dd) when a successful response omits WT-Protocol,
+ * or carries a token the client never offered. Client-side wire obligation,
+ * observed at the establishment close -- not a server-local surrogate.
+ *
+ * Only the NEGOTIATION-failure class owes this code. Session/adapter
+ * construction failures share mm_establish_fail() but are NOT ALPN failures,
+ * and their positive close contract is deliberately not asserted here. */
+#define WT_ALPN_ERROR_CODE 0x0817b3ddu
+
+/* Each arm is declared, so the two required failure classes cannot collapse
+ * into one: the token actually handed to establishment, whether it must be
+ * present, and (when present) its exact bytes. */
+typedef struct {
+    const char *name;          /* arm name, printed in every diagnostic */
+    const char *tok;           /* token passed to the establishment callback */
+    bool        expect_present;/* must the arm pass a non-NULL token? */
+    const char *expect_bytes;  /* exact bytes when present */
+} alpn_arm_t;
+
+static const char *g_alpn_arm = "(none)";
+#define ACHECK(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "FAIL [arm %s] %s:%d: %s\n", \
+                g_alpn_arm, __FILE__, __LINE__, #expr); \
+        g_fail++; \
+    } \
+} while (0)
+
+/* --- captured connect image (the client's OUTBOUND offer) ----------------- */
+static void       *g_alpn_conn;
+static int         g_alpn_connects;
+static size_t      g_alpn_offer_count;
+static char        g_alpn_offer0[64];
+static bool        g_alpn_offer0_null;
+static wtq_result_t alpn_capture_connect(wtq_msquic_env_t *env,
+                                         const wtq_msquic_client_cfg_t *cfg,
+                                         wtq_session_t **out)
+{
+    (void)env;
+    g_alpn_connects++;
+    g_alpn_conn = cfg->user;              /* the admitted connection */
+    g_alpn_offer_count = 0;
+    g_alpn_offer0[0] = '\0';
+    g_alpn_offer0_null = true;
+    if (cfg->connect != NULL) {
+        g_alpn_offer_count = cfg->connect->subprotocol_count;
+        if (cfg->connect->subprotocols != NULL &&
+            cfg->connect->subprotocol_count > 0 &&
+            cfg->connect->subprotocols[0] != NULL) {
+            g_alpn_offer0_null = false;
+            snprintf(g_alpn_offer0, sizeof(g_alpn_offer0), "%s",
+                     cfg->connect->subprotocols[0]);
+        }
+    }
+    *out = FAKE_WS;
+    return WTQ_OK;
+}
+
+/* --- close observer -------------------------------------------------------- */
+static int             g_alpn_close_calls;
+static wtq_session_t  *g_alpn_close_ws;
+static uint32_t        g_alpn_close_code;
+static void alpn_close_op(wtq_session_t *ws, uint32_t code)
+{
+    g_alpn_close_calls++;
+    g_alpn_close_ws = ws;
+    g_alpn_close_code = code;
+}
+
+/* One arm: fresh fixture, exact draft-18 offer, driven through the REAL
+ * establishment callback. Failure-safe: if the preflight says this token no
+ * longer rejects, the arm reports that and does NOT drive the (now successful)
+ * establishment route. */
+static void alpn_run_arm(const alpn_arm_t *arm)
+{
+    g_alpn_arm = arm->name;
+    g_alpn_conn = NULL; g_alpn_connects = 0;
+    g_alpn_offer_count = 0; g_alpn_offer0[0] = '\0'; g_alpn_offer0_null = true;
+    g_alpn_close_calls = 0; g_alpn_close_ws = NULL; g_alpn_close_code = 0;
+
+    moq_wtquic_msquic_managed_test_set_transport(alpn_capture_connect,
+                                                 trivial_release);
+    moq_wtquic_msquic_managed_test_set_close_op(alpn_close_op);
+
+    acnt_t a;
+    acnt_init(&a);
+    moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+    const char *only18[] = { "moqt-18" };
+    moq_wtquic_msquic_managed_t *m = make_client(&alloc, only18, 1);
+    if (m != NULL) {
+        /* -- the arm's own token really is of the declared class ---------- */
+        ACHECK(arm->expect_present == (arm->tok != NULL));
+        if (arm->expect_present) {
+            ACHECK(arm->tok != NULL && strlen(arm->tok) > 0);
+            ACHECK(arm->tok != NULL && arm->expect_bytes != NULL &&
+                   strcmp(arm->tok, arm->expect_bytes) == 0);
+        }
+
+        /* -- the OUTBOUND offer materialized as exactly one exact token ---- */
+        ACHECK(g_alpn_connects == 1);
+        ACHECK(g_alpn_offer_count == 1);
+        ACHECK(!g_alpn_offer0_null);
+        ACHECK(strcmp(g_alpn_offer0, "moqt-18") == 0);
+        ACHECK(g_alpn_conn != NULL);
+
+        /* -- preflight: the REAL negotiator must reject this token --------- */
+        moq_version_t nv = 0;
+        bool rejects = !moq_wtquic_msquic_managed_test_negotiate(
+            m, arm->tok, arm->tok != NULL ? strlen(arm->tok) : 0, &nv);
+        ACHECK(rejects);
+
+        if (rejects && g_alpn_conn != NULL) {
+            void *conn = g_alpn_conn;
+            moq_wtquic_msquic_managed_test_deliver_established(m, conn, arm->tok);
+
+            /* -- the WIRE obligation: this is the RED -- */
+            ACHECK(g_alpn_close_calls == 1);
+            ACHECK(g_alpn_close_ws == FAKE_WS);
+            ACHECK(g_alpn_close_code == WT_ALPN_ERROR_CODE);
+
+            const int      seen_calls = g_alpn_close_calls;
+            wtq_session_t *seen_ws    = g_alpn_close_ws;
+            const uint32_t seen_code  = g_alpn_close_code;
+
+            /* -- declared pre-session terminal inventory, before teardown -- */
+            ACHECK(moq_wtquic_msquic_managed_session(m) == NULL);
+            ACHECK(moq_wtquic_msquic_managed_conn_session(conn) == NULL);
+            ACHECK(moq_wtquic_msquic_managed_negotiated_version(m) == 0);
+            ACHECK(moq_wtquic_msquic_managed_conn_negotiated_version(conn) == 0);
+            ACHECK(moq_wtquic_msquic_managed_is_fatal(m));
+            ACHECK(moq_wtquic_msquic_managed_fatal_code(m) == 0);
+            ACHECK(!moq_wtquic_msquic_managed_is_closed(m));   /* not ALSO clean-closed */
+            /* SOURCE-DERIVED, not observed. Both facts are independent:
+             * conn_count is incremented only in mm_accept_prepare (the SERVER
+             * admission path), and in_use is the server child-slot reservation
+             * bit -- mm_client_start() zero-initializes the client connection
+             * and never sets it. So a CLIENT facade reports 0 live connections
+             * and its connection is NOT in_use. The pointer is nonetheless
+             * valid here, which the gate and gen-state reads below evidence. */
+            ACHECK(moq_wtquic_msquic_managed_conn_count(m) == 0);
+            ACHECK(!moq_wtquic_msquic_managed_test_conn_in_use(conn));
+
+            bool lt = false, tq = true, sb = true;
+            moq_wtquic_msquic_managed_test_conn_gate(conn, &lt, &tq, &sb);
+            ACHECK(lt);        /* logical_terminal latched */
+            ACHECK(!tq);       /* transport NOT quiesced on this path */
+            ACHECK(!sb);       /* pre-session failure: not session-backed */
+
+            moq_version_t cv = 1; void *cu = (void *)1;
+            bool q = true, cp = true;
+            moq_wtquic_msquic_managed_test_conn_gen_state(conn, &cv, &cu, &q, &cp);
+            ACHECK(cv == 0);   /* internal connection version */
+            ACHECK(cu == NULL);
+            ACHECK(!q);        /* quiesce_requested */
+            ACHECK(!cp);       /* close_pending */
+
+            /* -- lifecycle conservation: the observer stays installed across
+             * stop/destroy, so a duplicate or altered close during cleanup is
+             * caught rather than happening after the last assertion. */
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+            m = NULL;
+            ACHECK(g_alpn_close_calls == seen_calls);   /* still exactly one */
+            ACHECK(g_alpn_close_ws == seen_ws);         /* same session */
+            ACHECK(g_alpn_close_code == seen_code);     /* unchanged */
+        }
+        if (m != NULL) {
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+        }
+    }
+    ACHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+
+    moq_wtquic_msquic_managed_test_set_close_op(NULL);
+    moq_wtquic_msquic_managed_test_set_transport(trivial_connect, trivial_release);
+    g_alpn_arm = "(none)";
+}
+
+static void test_alpn_error_on_negotiation_failure(void)
+{
+    static const alpn_arm_t arms[] = {
+        { "missing-token",   NULL,      false, NULL },
+        { "unoffered-token", "moqt-16", true,  "moqt-16" },
+    };
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    for (size_t i = 0; i < sizeof(arms) / sizeof(arms[0]); i++)
+        alpn_run_arm(&arms[i]);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+}
+
 /* --- WT-Protocol negotiation (exact token + offered enforcement) --------- */
+/* Negative CLASS discriminator: a construction failure is NOT an ALPN failure.
+ * The token is offered AND selected, so negotiation SUCCEEDS; the allocator is
+ * then limited to zero further allocations immediately before establishment, so
+ * the FIRST moq_session_create() allocation fails and the route closes before
+ * any adapter can dereference the sentinel session. Asserts only the negative
+ * -- it does not freeze 0 as the one correct construction-failure code. */
+static void test_alpn_not_used_for_construction_failure(void)
+{
+    g_alpn_arm = "construction-failure";
+    moq_wtquic_msquic_managed_test_no_listener(true);
+
+    g_alpn_conn = NULL; g_alpn_connects = 0;
+    g_alpn_close_calls = 0; g_alpn_close_ws = NULL; g_alpn_close_code = 0;
+    moq_wtquic_msquic_managed_test_set_transport(alpn_capture_connect,
+                                                 trivial_release);
+    moq_wtquic_msquic_managed_test_set_close_op(alpn_close_op);
+
+    acnt_t a;
+    acnt_init(&a);                     /* UNLIMITED for facade construction */
+    moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+    const char *only18[] = { "moqt-18" };
+    moq_wtquic_msquic_managed_t *m = make_client(&alloc, only18, 1);
+    if (m != NULL) {
+        ACHECK(g_alpn_connects == 1);
+        ACHECK(g_alpn_offer_count == 1);
+        ACHECK(!g_alpn_offer0_null);
+        ACHECK(strcmp(g_alpn_offer0, "moqt-18") == 0);
+        ACHECK(g_alpn_conn != NULL);
+        if (g_alpn_conn != NULL) {
+            void *conn = g_alpn_conn;
+            /* the arm: this token IS accepted by the real negotiator */
+            moq_version_t nv = 0;
+            ACHECK(moq_wtquic_msquic_managed_test_negotiate(m, "moqt-18", 7, &nv));
+            ACHECK(nv == MOQ_VERSION_DRAFT_18);
+
+            /* starve the allocator only now, so the construction route fails.
+             * Denial accounting starts at this instant. */
+            acnt_arm_zero(&a);
+            long pre_denials = -1, pre_first = -2;
+            acnt_denials(&a, &pre_denials, &pre_first);
+            ACHECK(pre_denials == 0);      /* armed, nothing refused yet */
+            ACHECK(pre_first == -1);
+
+            moq_wtquic_msquic_managed_test_deliver_established(m, conn, "moqt-18");
+
+            /* the denial is MEASURED, not inferred from the terminal result:
+             * at least one allocation was refused, and the FIRST allocation
+             * attempted after arming is the one that was refused (no armed
+             * allocation succeeded before it) */
+            long denials = -1, first_after = -2;
+            acnt_denials(&a, &denials, &first_after);
+            /* EXACT inventory: the failure path performs exactly one
+             * allocator call after arming -- moq_session_create()'s first
+             * allocation -- so the arm pins the count, not merely ">= 1". */
+            ACHECK(denials == 1);
+            ACHECK(first_after == 0);
+
+            /* lift the limit so teardown runs outside the fault-injection
+             * arm; no claim is made about whether teardown allocates */
+            acnt_disarm(&a);
+
+            ACHECK(g_alpn_close_calls == 1);
+            ACHECK(g_alpn_close_ws == FAKE_WS);
+            ACHECK(g_alpn_close_code != WT_ALPN_ERROR_CODE);   /* the negative */
+            ACHECK(moq_wtquic_msquic_managed_conn_session(conn) == NULL);
+            ACHECK(moq_wtquic_msquic_managed_conn_negotiated_version(conn) == 0);
+            ACHECK(moq_wtquic_msquic_managed_session(m) == NULL);
+            ACHECK(moq_wtquic_msquic_managed_negotiated_version(m) == 0);
+            ACHECK(moq_wtquic_msquic_managed_is_fatal(m));
+            ACHECK(moq_wtquic_msquic_managed_fatal_code(m) == 0);
+
+            const int      seen_calls = g_alpn_close_calls;
+            wtq_session_t *seen_ws    = g_alpn_close_ws;
+            const uint32_t seen_code  = g_alpn_close_code;
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+            m = NULL;
+            ACHECK(g_alpn_close_calls == seen_calls);
+            ACHECK(g_alpn_close_ws == seen_ws);
+            ACHECK(g_alpn_close_code == seen_code);
+        }
+        if (m != NULL) {
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+        }
+    }
+    ACHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+    moq_wtquic_msquic_managed_test_set_close_op(NULL);
+    moq_wtquic_msquic_managed_test_set_transport(trivial_connect, trivial_release);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+    g_alpn_arm = "(none)";
+}
+
 static void test_negotiation_matrix(void)
 {
     moq_version_t v;
@@ -3626,6 +3972,8 @@ int main(void)
     test_deadline_reap_no_use_after_publish();
     test_doorbell_wake_vs_stop();
     test_negotiation_matrix();
+    test_alpn_error_on_negotiation_failure();
+    test_alpn_not_used_for_construction_failure();
     test_first_fatal_cause();
     test_guard_held_publication();
     test_draining_null_callback();

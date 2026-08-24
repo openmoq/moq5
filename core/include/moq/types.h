@@ -82,7 +82,9 @@ MOQ_API moq_bytes_t moq_bytes_cstr(const char *s);
 
 typedef struct moq_namespace {
     const moq_bytes_t *parts;
-    size_t             count;   /* 0..32; 0 allowed for prefix APIs */
+    size_t             count;   /* 0..32; root full names are draft-18-only;
+                                 * empty prefixes/suffixes are valid; every
+                                 * present part must be non-empty */
 } moq_namespace_t;
 
 #define MOQ_FULL_TRACK_NAME_MAX 4096

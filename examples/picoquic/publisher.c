@@ -14,6 +14,9 @@
 #include <moq/picoquic.h>
 #include <moq/publisher.h>
 #include <moq/rcbuf.h>
+
+#include "publisher_conn_guard.h"
+
 #include <picoquic_packet_loop.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +32,7 @@ static void sigint_handler(int sig) {
 
 typedef struct {
     moq_pq_conn_t   *adapter;
+    picoquic_cnx_t  *cnx;        /* the ONE connection that owns the adapter */
     moq_publisher_t  *pub;
     moq_pub_track_t  *track;
     moq_alloc_t       alloc;
@@ -86,10 +90,29 @@ static int server_callback(picoquic_cnx_t *cnx,
     app_ctx_t *app = (app_ctx_t *)callback_ctx;
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
 
-    if (event == picoquic_callback_almost_ready ||
-        event == picoquic_callback_ready) {
-        if (app->adapter) return 0;
+    bool is_ready = (event == picoquic_callback_almost_ready ||
+                     event == picoquic_callback_ready);
+    /* Singleton example: the session/adapter is bound to ONE connection. Route
+     * every callback through the connection-isolation classifier so a second
+     * connection can neither become the owner nor have its events dispatched
+     * into the first connection's adapter (finding #9). */
+    switch (pq_pub_classify(app->adapter != NULL, is_ready, cnx, app->cnx)) {
+    case PQ_PUB_OWNER_READY:
+        return 0;                        /* benign repeat ready from the owner */
+    case PQ_PUB_DISPATCH:
+        return moq_pq_callback(cnx, stream_id, bytes, length,
+                                event, app->adapter, stream_ctx);
+    case PQ_PUB_CLOSE_BUSY:
+        /* A different connection: refuse it, never feed the first adapter. */
+        picoquic_close(cnx, PICOQUIC_TRANSPORT_SERVER_BUSY);
+        return 0;
+    case PQ_PUB_IGNORE:
+        return 0;                        /* pre-owner handshake event */
+    case PQ_PUB_CREATE:
+        break;                           /* fall through to create + adopt */
+    }
 
+    {
         moq_session_cfg_t scfg;
         moq_session_cfg_init_sized(&scfg, sizeof(scfg), &app->alloc, MOQ_PERSPECTIVE_SERVER);
         scfg.send_request_capacity = true;
@@ -110,6 +133,7 @@ static int server_callback(picoquic_cnx_t *cnx,
             moq_session_destroy(session);
             return -1;
         }
+        app->cnx = cnx;                  /* adopt this connection as the owner */
 
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
@@ -141,11 +165,6 @@ static int server_callback(picoquic_cnx_t *cnx,
         fprintf(stderr, "  connection ready, track added\n");
         return 0;
     }
-
-    if (app->adapter)
-        return moq_pq_callback(cnx, stream_id, bytes, length,
-                                event, app->adapter, stream_ctx);
-    return 0;
 }
 
 /* -- Packet loop callback ------------------------------------------- */
@@ -261,8 +280,10 @@ int main(int argc, char *argv[])
 
     uint64_t now = picoquic_current_time();
 
+    /* Singleton example: cap the context at ONE connection. The callback guard
+     * (pq_pub_classify) is the real enforcement -- this is defense in depth. */
     picoquic_quic_t *quic = picoquic_create(
-        8, argv[1], argv[2], NULL, MOQ_PQ_ALPN_DEFAULT,
+        1, argv[1], argv[2], NULL, MOQ_PQ_ALPN_DEFAULT,
         server_callback, &app,
         NULL, NULL, NULL, now, NULL, NULL, NULL, 0);
     if (!quic) {

@@ -30,7 +30,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../common/moq_example_term.h"
+
 #define PICO_WT_ALPN "h3"
+
+/* Escaped payload preview cap (source bytes) for peer-controlled objects. */
+#define PICO_WT_PREVIEW_BYTES 64
 
 typedef struct {
     picoquic_quic_t    *quic;
@@ -133,8 +138,13 @@ static void client_drain_events(client_ctx_t *c)
                 const uint8_t *d =
                     moq_rcbuf_data(ev.u.object_received.payload);
                 size_t l = moq_rcbuf_len(ev.u.object_received.payload);
-                printf("[client] object received (%zu bytes): %.*s\n",
-                       l, (int)l, (const char *)d);
+                /* Payload is PEER-CONTROLLED: print the full length plus a
+                 * bounded, terminal-safe escaped preview (no raw control bytes,
+                 * capped so a huge object cannot flood the terminal). */
+                fputs("[client] object received (", stdout);
+                moq_example_term_fprint_preview(stdout, d, l,
+                                                PICO_WT_PREVIEW_BYTES);
+                fputs(")\n", stdout);
             } else {
                 printf("[client] object received (empty)\n");
             }

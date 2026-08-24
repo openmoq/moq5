@@ -594,11 +594,26 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
         if (owner_->conns.size() >= owner_->max_connections)
             return nullptr;
 
+        /* mvfst owns the socket and hands it over here; a null one is invalid
+         * input, so reject it the way every other precondition above does
+         * rather than dereferencing it. */
+        if (!sock)
+            return nullptr;
+
+        /* Read the socket's EventBase BEFORE the socket is moved into the
+         * call. Argument initializations are indeterminately sequenced
+         * (C++17 [expr.call]/8), so a compiler may complete the move into the
+         * second parameter before evaluating the first -- which would leave
+         * this dereferencing a moved-from unique_ptr. Both orders are legal
+         * and compilers differ, so the ordering must be expressed here rather
+         * than assumed. */
+        folly::EventBase *sock_evb = sock->getEventBase();
+
         auto conn = std::make_unique<moq_mvfst_conn>();
         conn->parent = owner_;
 
         auto t = quic::QuicServerTransport::make(
-            sock->getEventBase(), std::move(sock),
+            sock_evb, std::move(sock),
             conn.get(), conn.get(), std::move(ctx));
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;

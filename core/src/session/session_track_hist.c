@@ -343,11 +343,12 @@ moq_result_t moq_session_note_object_published(
     uint64_t loc_max = s->profile->location_varint_max;
     if (group_id > loc_max || object_id > loc_max)
         return MOQ_ERR_INVAL;
-    /* Reject malformed track names before touching any state: a NULL/empty
-     * namespace, a NULL component with nonzero length, or a NULL name with
-     * nonzero length would otherwise be dereferenced / memcpy'd while building
-     * the key. Same gate the request-initiating APIs use. */
-    if (moq_validate_full_track_name(ns, track_name) < 0) return MOQ_ERR_INVAL;
+    /* Reject malformed track names before touching any state. Namespace
+     * cardinality follows the selected profile; byte and total-size rules are
+     * shared with the request-initiating APIs. */
+    if (moq_validate_full_track_name_min_fields(
+            ns, track_name, s->profile->min_track_namespace_fields) < 0)
+        return MOQ_ERR_INVAL;
     if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
 
     size_t key_len = 0;

@@ -77,6 +77,11 @@ typedef struct {
     bool                   active;
     bool                   peer_send_closed;
     bool                   local_send_closed;
+    /* A peer STOP_SENDING has been answered for this stream's local send half.
+     * Tracked separately from local_send_closed because a FIN may already have
+     * closed that half before the STOP arrived: the RESET is owed once, and
+     * only once, per stream. */
+    bool                   peer_stop_received;
     /* Inbound pending state (bridge-owned) */
     bool                   pending_retry;
     bool                   pending_fin;

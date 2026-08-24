@@ -1,4 +1,6 @@
 #include <moq/moq.hpp>
+#include <moq/control.h>
+#include <moq/control_d18.h>
 #include "test_support.hpp"
 
 #include <cstring>
@@ -696,6 +698,91 @@ int main()
             copy.reset();
             owned = moq::buffer();
             MOQ_CHECK(freed);
+        }
+    }
+
+    // -- 17. Draft-18 C++ request accepts the root namespace -----------
+    {
+        moq::session_config ccfg{};
+        ccfg.perspective = moq::perspective::client;
+        ccfg.version = MOQ_VERSION_DRAFT_18;
+        auto created = moq::session::create(ccfg);
+        MOQ_CHECK(created.ok());
+        auto c = std::move(*created);
+
+        MOQ_CHECK(c.start(0).ok());
+        {
+            auto opening = c.poll_action();
+            MOQ_CHECK(opening.has_value());
+            if (opening)
+                MOQ_CHECK(opening->kind() == MOQ_ACTION_OPEN_UNI_CONTROL);
+        }
+
+        uint8_t setup[16]{};
+        moq_buf_writer_t writer;
+        moq_buf_writer_init(&writer, setup, sizeof(setup));
+        MOQ_CHECK(moq_d18_encode_setup(&writer) == MOQ_OK);
+        MOQ_CHECK(c.on_control_bytes(
+                       std::span<const uint8_t>{
+                           setup, moq_buf_writer_offset(&writer)}, 0).ok());
+        MOQ_CHECK(c.state() == moq::session_state::established);
+        {
+            auto setup_event = c.poll_event();
+            MOQ_CHECK(setup_event.has_value());
+            if (setup_event)
+                MOQ_CHECK(setup_event->kind() == MOQ_EVENT_SETUP_COMPLETE);
+        }
+
+        moq::publish_namespace_config cfg{};
+        auto ann = c.publish_namespace(cfg, 0);
+        MOQ_CHECK(ann.ok());
+
+        auto action = c.poll_action();
+        MOQ_CHECK(action.has_value());
+        bool saw_root_publish_namespace = false;
+        if (action) {
+            action->visit(
+                [&](const moq::action::open_bidi_stream &bs) {
+                    saw_root_publish_namespace = true;
+                    MOQ_CHECK(!bs.fin);
+
+                    moq_buf_reader_t reader;
+                    moq_buf_reader_init(&reader, bs.data.data(),
+                                        bs.data.size());
+                    moq_control_envelope_t env{};
+                    MOQ_CHECK(moq_d18_decode_envelope(&reader, &env) ==
+                              MOQ_OK);
+                    MOQ_CHECK(env.msg_type == MOQ_D18_PUBLISH_NAMESPACE);
+                    MOQ_CHECK(moq_buf_reader_remaining(&reader) == 0);
+
+                    moq_bytes_t parts[1]{};
+                    moq_d18_publish_namespace_t decoded{};
+                    MOQ_CHECK(moq_d18_decode_publish_namespace(
+                                  env.payload, env.payload_len, parts, 1,
+                                  &decoded) == MOQ_OK);
+                    MOQ_CHECK(decoded.request_id == 0);
+                    MOQ_CHECK(decoded.track_namespace.count == 0);
+                },
+                [&](const auto &) { MOQ_CHECK(false); });
+        }
+        MOQ_CHECK(saw_root_publish_namespace);
+        MOQ_CHECK(!c.poll_action().has_value());
+
+        // The C capability query, reached through the C++ session's raw
+        // handle. There is no C++ wrapper for it and none is invented here:
+        // the point is that the public C symbol links and answers correctly
+        // from C++. Both arms are asserted from C++, so this coverage
+        // discriminates a profile-derived answer from a constant: the
+        // established draft-18 session above permits the root namespace,
+        // while a default (draft-16) session does not.
+        MOQ_CHECK(moq_session_supports_zero_field_track_namespace(c.raw()));
+        MOQ_CHECK(!moq_session_supports_zero_field_track_namespace(nullptr));
+        {
+            auto [d16c, d16s] = establish_pair(failures);
+            MOQ_CHECK(
+                !moq_session_supports_zero_field_track_namespace(d16c.raw()));
+            MOQ_CHECK(
+                !moq_session_supports_zero_field_track_namespace(d16s.raw()));
         }
     }
 

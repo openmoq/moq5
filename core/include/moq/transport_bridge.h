@@ -346,6 +346,41 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_reset(
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_terminal(
     moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us);
 
+/*
+ * Report a peer STOP_SENDING. Do not also reset the stream yourself.
+ *
+ * For an ACTIVE BIDIRECTIONAL mapping that is NOT already undergoing a
+ * whole-stream abort, the bridge owns the response: the first STOP report it
+ * accepts closes that stream's local send half and queues one RESET_STREAM
+ * obligation, which service() performs outside the transport's receive
+ * callback. Acceptance can fail -- if the pending queue is full the call
+ * returns an error and the bridge becomes fatal, and no obligation exists.
+ *
+ * Given that accepted first report, further STOP_SENDING indications for the
+ * same stream queue NO additional obligation. service() may ATTEMPT the one
+ * obligation on several passes -- a WOULD_BLOCK leaves it pending and it is
+ * retried -- but at most one RESET is ever successfully emitted and accepted by
+ * the endpoint. A bridge destroyed before service, or one whose endpoint fails
+ * the operation, emits none.
+ *
+ * An active bidi already undergoing a whole-stream abort is left to that
+ * stronger lifecycle: the abort already owns the reset/stop work and the
+ * mapping must stay in its discard state until the peer's terminal, so no
+ * additional reset is queued for it.
+ *
+ * Only the sending direction ends. On a bidi the peer's own send half stays
+ * live until its own terminal (FIN, RESET_STREAM, or full stream
+ * termination). For a bidi WE opened, the mapping and its receive half are
+ * therefore preserved across the STOP so the response to our request still
+ * reaches the session.
+ *
+ * Every other stream class keeps its existing handling and is NOT part of the
+ * queued-reset path above: an unknown or already retired stream is a no-op; a
+ * peer-origin unidirectional stream has no local send half and is a no-op; a
+ * unidirectional control stream takes its own fatal teardown; and any other
+ * local-origin unidirectional stream continues through the session's data-stop
+ * path.
+ */
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stop_sending(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     uint64_t error_code, uint64_t now_us);

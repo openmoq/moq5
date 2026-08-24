@@ -21,6 +21,7 @@
 
 #include "endpoint_internal.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -68,6 +69,15 @@ _Static_assert(offsetof(moq_media_track_event_t, has_largest) ==
                  (_Alignof(moq_media_track_event_t) - 1)) &
                 ~(size_t)(_Alignof(moq_media_track_event_t) - 1)),
                "UPDATE_OK detail block must sit exactly at the v0 sizeof");
+/* The parse-drop detail block is a SECOND appended generation: it must start at
+ * the align-rounded end of the UPDATE_OK block (right after expires_ms), so an
+ * older caller passing the UPDATE_OK-generation sizeof is never written past. */
+_Static_assert(offsetof(moq_media_track_event_t, parse_drop_class) ==
+               ((offsetof(moq_media_track_event_t, expires_ms) +
+                 sizeof(((moq_media_track_event_t *)0)->expires_ms) +
+                 (_Alignof(moq_media_track_event_t) - 1)) &
+                ~(size_t)(_Alignof(moq_media_track_event_t) - 1)),
+               "parse-drop detail block must sit exactly after the UPDATE_OK block");
 #define MEDIA_OBJECT_V0_SIZE \
     (offsetof(moq_media_object_t, samples_owned) + sizeof(moq_cmaf_sample_t *))
 #define MEDIA_RECEIVER_STATS_V0_SIZE \
@@ -120,6 +130,19 @@ struct moq_media_track {
     /* Data path (network-thread state). */
     moq_sub_track_t *sub_track;        /* non-NULL while subscribed */
     bool             ended;            /* TRACK_ENDED emitted */
+    /* Coalesced parse-drop diagnostic state (all under r->mu). A malformed
+     * media/SAP/media-timeline object for this track bumps parse_drops and, if
+     * no diagnostic is already pending, marks parse_drop_pending (and the
+     * receiver's pending count). poll_track synthesizes ONE MOQ_MEDIA_TRACK_
+     * PARSE_DROP event from this state -- reporting parse_drops (total) and
+     * parse_drops - parse_drops_reported (delta since the last drain) -- then
+     * clears the pending flag and advances parse_drops_reported. This bounds the
+     * app-visible signal to one pending event per track regardless of how many
+     * malformed objects a peer sends; parse drops are never fatal. */
+    uint64_t         parse_drops;
+    uint64_t         parse_drops_reported;
+    bool             parse_drop_pending;
+    moq_media_parse_drop_class_t parse_drop_last_class;
     /* SUBSCRIBE_DONE handling (network thread). on_subscribe_done records the
      * completion here and the pump processes it AFTER draining objects, so media
      * delivered in the same tick as the done is not lost. vod_rearmed is a
@@ -284,6 +307,10 @@ struct moq_media_receiver {
     pthread_mutex_t  mu;
     receiver_event_t *events;
     uint32_t         ev_cap, ev_head, ev_tail;
+    /* Number of tracks with a parse-drop diagnostic pending (see
+     * moq_media_track). Lets wait()/poll_track test for pending parse drops
+     * cheaply without scanning every track. */
+    uint32_t         parse_drop_pending_count;
     struct receiver_obj_entry *objs;     /* ring; entries own their refs */
     uint64_t         obj_sizes_total;    /* queued payload bytes */
     uint32_t         obj_head, obj_tail;
@@ -349,6 +376,40 @@ static bool rq_push(moq_media_receiver_t *r, moq_media_track_event_kind_t kind,
     return true;
 }
 
+/* Coalesced, NON-FATAL parse-drop bookkeeping with r->mu ALREADY held. Bumps the
+ * global and per-track counters; if this is the first pending diagnostic for the
+ * track, marks it pending and bumps the receiver pending count. Returns true iff
+ * a new diagnostic became pending (the caller must wake the endpoint after it
+ * unlocks). Deliberately does NOT use the ordinary event queue (rq_push
+ * terminalizes on overflow): a malformed-object flood must never make the
+ * receiver fatal. */
+static bool receiver_note_parse_drop_locked(moq_media_receiver_t *r,
+                                            moq_media_track_t *track,
+                                            moq_media_parse_drop_class_t cls)
+{
+    r->stats.parse_drops++;
+    track->parse_drops++;
+    track->parse_drop_last_class = cls;
+    if (track->parse_drop_pending)
+        return false;
+    track->parse_drop_pending = true;
+    r->parse_drop_pending_count++;
+    return true;
+}
+
+/* Locking wrapper for the sites that do not already hold r->mu. Must NOT be
+ * called while holding r->mu. */
+static void receiver_note_parse_drop(moq_media_receiver_t *r,
+                                     moq_media_track_t *track,
+                                     moq_media_parse_drop_class_t cls)
+{
+    pthread_mutex_lock(&r->mu);
+    bool newly_pending = receiver_note_parse_drop_locked(r, track, cls);
+    pthread_mutex_unlock(&r->mu);
+    if (newly_pending)
+        moq_endpoint_wake(r->ep);
+}
+
 #ifdef MOQ_MEDIA_RECEIVER_TESTING
 /* Test-only interleaving hook: invoked by the reconciler BETWEEN the
  * {desired, app_gen} snapshot and the wire send, with no locks held, so a
@@ -367,8 +428,43 @@ void moq_media_receiver_test_set_race_hook(void (*fn)(void *), void *ctx)
         if (g_reconcile_race_hook) \
             g_reconcile_race_hook(g_reconcile_race_hook_ctx); \
     } while (0)
+
+/* Publication-contract phase observer, distinct from the reconcile/ack hook
+ * above. One callback is invoked at four points that BRACKET the two critical
+ * sections a correct publication contract must serialize: the effective-catalog
+ * publication (writer PRE, before any access to has_effective/effective; writer
+ * POST, after old-generation retention/detachment, publication of effective and
+ * has_effective, and the catalog_complete mutation, but before the intended
+ * unlock) and the public content-protection lookup (reader PRE, after the null
+ * check but before reading has_effective/selecting effective; reader POST, after
+ * the traversal result is selected, before the intended unlock). A
+ * single-threaded test uses it, with moq_media_receiver_test_mu_held (below), to
+ * probe whether the code under test holds r->mu at each boundary. The hook
+ * observes; it neither locks the code under test nor supplies the missing lock.
+ * `phase` is one of the constants below. Never compiled into the shipping lib. */
+enum {
+    MOQ_MR_WRITER_PRE  = 0,
+    MOQ_MR_WRITER_POST = 1,
+    MOQ_MR_READER_PRE  = 2,
+    MOQ_MR_READER_POST = 3
+};
+static void (*g_pub_phase_hook)(const moq_media_receiver_t *r, int phase,
+                                void *ctx);
+static void *g_pub_phase_hook_ctx;
+void moq_media_receiver_test_set_pub_phase_hook(
+    void (*fn)(const moq_media_receiver_t *, int, void *), void *ctx);
+void moq_media_receiver_test_set_pub_phase_hook(
+    void (*fn)(const moq_media_receiver_t *, int, void *), void *ctx)
+{
+    g_pub_phase_hook = fn;
+    g_pub_phase_hook_ctx = ctx;
+}
+#define PUB_PHASE_HOOK(r, ph) \
+    do { if (g_pub_phase_hook) g_pub_phase_hook((r), (ph), g_pub_phase_hook_ctx); } \
+    while (0)
 #else
 #define RECONCILE_RACE_HOOK() ((void)0)
+#define PUB_PHASE_HOOK(r, ph) ((void)0)
 #endif
 
 /* Pure attribution classifier: given the generation
@@ -1134,6 +1230,12 @@ static moq_result_t receiver_reserve_cp_snap(moq_media_receiver_t *r)
 static void receiver_commit_effective(moq_media_receiver_t *r,
                                       moq_msf_catalog_t *cand)
 {
+    /* One lock/unlock pair holds r->mu across the whole publication critical
+     * section, so the public find_content_protection() reader (which takes the
+     * same mutex) never observes a torn effective/has_effective transition. */
+    pthread_mutex_lock(&r->mu);
+    /* Writer PRE: before any access to r->has_effective / r->effective. */
+    PUB_PHASE_HOOK(r, MOQ_MR_WRITER_PRE);
     if (r->has_effective) {
         if (r->effective.content_protection_count > 0) {
             /* Retain for CP-pointer validity. Account its bytes (slot + cap
@@ -1147,12 +1249,14 @@ static void receiver_commit_effective(moq_media_receiver_t *r,
     }
     r->effective = *cand;     /* move ownership */
     r->has_effective = true;
-    /* MSF §5.1.3: latch terminal completion for app observation (get_stats). */
-    if (r->effective.is_complete) {
-        pthread_mutex_lock(&r->mu);
+    /* MSF §5.1.3: latch terminal completion for app observation (get_stats).
+     * Folded into the enclosing lock -- no nested lock. */
+    if (r->effective.is_complete)
         r->stats.catalog_complete = true;
-        pthread_mutex_unlock(&r->mu);
-    }
+    /* Writer POST: after retention/detach, publication of effective and
+     * has_effective, and the catalog_complete mutation, before the unlock. */
+    PUB_PHASE_HOOK(r, MOQ_MR_WRITER_POST);
+    pthread_mutex_unlock(&r->mu);
 }
 
 static void receiver_count_drop(moq_media_receiver_t *r)
@@ -1303,6 +1407,17 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
             receiver_count_drop(r);
             return;
         }
+        /* Inbound semantic validation (§5.2.3/§5.1.7/CMSF §4.1.1.1): the raw
+         * parser is lenient, but before adopting a peer catalog we reject
+         * duplicate track tuples / initDataList ids / contentProtection refIDs
+         * rather than silently coalescing them. Treated like a malformed
+         * independent catalog: fatal on the first, a counted drop afterwards. */
+        if (moq_msf_catalog_validate_identities(&r->alloc, &cand) != MOQ_OK) {
+            moq_msf_catalog_cleanup(&r->alloc, &cand);
+            if (first) { receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE); return; }
+            receiver_count_drop(r);
+            return;
+        }
         adopt_result_t a = receiver_adopt(r, &cand, now_us);
         if (a != ADOPT_OK) {
             moq_msf_catalog_cleanup(&r->alloc, &cand);
@@ -1353,7 +1468,17 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
         return;
     }
     moq_msf_catalog_t cand;
-    rc = moq_msf_catalog_apply_delta(&r->alloc, &r->effective, &delta, &cand);
+    /* Bound the delta before it builds the effective catalog: the receiver
+     * never retains more than max_stable_handles tracks, so a delta that would
+     * exceed that is refused (MOQ_ERR_PROTO -> desync) before any O(n) work.
+     * Identity lookups inside apply are indexed, so a large valid delta is
+     * O(base + delta), not O(n^2). */
+    moq_msf_apply_limits_t alim;
+    memset(&alim, 0, sizeof(alim));
+    alim.struct_size = sizeof(alim);
+    alim.max_effective_tracks = r->max_stable_handles;
+    rc = moq_msf_catalog_apply_delta_ex(&r->alloc, &r->effective, &delta,
+                                        &alim, &cand);
     moq_msf_catalog_cleanup(&r->alloc, &delta);
     if (rc != MOQ_OK) { receiver_desync(r); return; }   /* apply failure */
 
@@ -1570,9 +1695,7 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
     moq_media_object_input_t in;
     moq_media_object_input_init(&in);
     if (moq_media_object_input_from_sub_object(so, &in) != MOQ_OK) {
-        pthread_mutex_lock(&r->mu);
-        r->stats.parse_drops++;
-        pthread_mutex_unlock(&r->mu);
+        receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA);
         moq_sub_object_cleanup(so);
         return;
     }
@@ -1599,9 +1722,7 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
         }
     }
     if (rc != MOQ_OK) {
-        pthread_mutex_lock(&r->mu);
-        r->stats.parse_drops++;
-        pthread_mutex_unlock(&r->mu);
+        receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA);
         if (heap_samples)
             r->alloc.free(heap_samples,
                           sample_cap * sizeof(moq_cmaf_sample_t),
@@ -1652,9 +1773,7 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
                 parsed.sample_count * sizeof(moq_cmaf_sample_t),
                 r->alloc.ctx);
             if (!owned) {
-                pthread_mutex_lock(&r->mu);
-                r->stats.parse_drops++;
-                pthread_mutex_unlock(&r->mu);
+                receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA);
                 moq_sub_object_cleanup(so);
                 return;
             }
@@ -1900,9 +2019,7 @@ static void receiver_on_sap_object(moq_media_receiver_t *r,
     pthread_mutex_unlock(&r->mu);
     if (!wanted) { moq_sub_object_cleanup(so); return; }
     if (!so->payload) {
-        pthread_mutex_lock(&r->mu);
-        r->stats.parse_drops++;
-        pthread_mutex_unlock(&r->mu);
+        receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_SAP);
         moq_sub_object_cleanup(so);
         return;
     }
@@ -1952,9 +2069,12 @@ static void receiver_on_sap_object(moq_media_receiver_t *r,
         }
     }
 
+    bool parse_drop_newly_pending = false;
     pthread_mutex_lock(&r->mu);
     if (malformed) {
-        r->stats.parse_drops++;   /* nothing enqueued, dedup cursor untouched */
+        /* Already under r->mu here, so use the locked variant and wake below. */
+        parse_drop_newly_pending = receiver_note_parse_drop_locked(
+            r, track, MOQ_MEDIA_PARSE_DROP_SAP);
     } else {
         for (size_t i = 0; i < tmp_n; i++) {
             uint64_t g = tmp[i].group, o = tmp[i].object;
@@ -1972,6 +2092,8 @@ static void receiver_on_sap_object(moq_media_receiver_t *r,
         }
     }
     pthread_mutex_unlock(&r->mu);
+    if (parse_drop_newly_pending)
+        moq_endpoint_wake(r->ep);
     if (heap_tmp) r->alloc.free(heap_tmp, tmp_cap * sizeof(*tmp), r->alloc.ctx);
     moq_sub_object_cleanup(so);
 }
@@ -2023,9 +2145,7 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
     pthread_mutex_unlock(&r->mu);
     if (!wanted) { moq_sub_object_cleanup(so); return; }
     if (!so->payload) {
-        pthread_mutex_lock(&r->mu);
-        r->stats.parse_drops++;
-        pthread_mutex_unlock(&r->mu);
+        receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE);
         moq_sub_object_cleanup(so);
         return;
     }
@@ -2048,9 +2168,7 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
         heap_tmp = (moq_msf_media_timeline_record_t *)r->alloc.alloc(
             need * sizeof(*heap_tmp), r->alloc.ctx);
         if (!heap_tmp) {
-            pthread_mutex_lock(&r->mu);
-            r->stats.parse_drops++;   /* OOM: drop whole object, non-fatal */
-            pthread_mutex_unlock(&r->mu);
+            receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE);
             moq_sub_object_cleanup(so);
             return;
         }
@@ -2059,9 +2177,7 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
         rc = moq_msf_media_timeline_decode(json, tmp, cap, &n);
     }
     if (rc != MOQ_OK) {
-        pthread_mutex_lock(&r->mu);
-        r->stats.parse_drops++;   /* malformed: nothing enqueued */
-        pthread_mutex_unlock(&r->mu);
+        receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE);
         if (heap_tmp) r->alloc.free(heap_tmp, cap * sizeof(*heap_tmp),
                                     r->alloc.ctx);
         moq_sub_object_cleanup(so);
@@ -2816,7 +2932,8 @@ moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
 
     pthread_mutex_lock(&r->mu);
     bool have = (r->ev_tail != r->ev_head) || (r->obj_tail != r->obj_head) ||
-                (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head);
+                (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head) ||
+                (r->parse_drop_pending_count > 0);
     pthread_mutex_unlock(&r->mu);
     if (have) return MOQ_OK;
     if (receiver_terminal(r)) return MOQ_ERR_CLOSED;
@@ -2826,7 +2943,8 @@ moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
 
     pthread_mutex_lock(&r->mu);
     have = (r->ev_tail != r->ev_head) || (r->obj_tail != r->obj_head) ||
-           (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head);
+           (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head) ||
+           (r->parse_drop_pending_count > 0);
     pthread_mutex_unlock(&r->mu);
     if (have) return MOQ_OK;
     if (receiver_terminal(r)) return MOQ_ERR_CLOSED;
@@ -2845,33 +2963,71 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
     memset(ev, 0, n);
 
     pthread_mutex_lock(&r->mu);
-    if (r->ev_tail == r->ev_head) {
-        bool fatal = r->fatal;
+    if (r->ev_tail != r->ev_head) {
+        receiver_event_t e = r->events[r->ev_head % r->ev_cap];
+        r->ev_head++;
         pthread_mutex_unlock(&r->mu);
-        if (fatal || moq_endpoint_is_closed(r->ep))
-            return MOQ_ERR_CLOSED;
-        return MOQ_DONE;
-    }
-    receiver_event_t e = r->events[r->ev_head % r->ev_cap];
-    r->ev_head++;
-    pthread_mutex_unlock(&r->mu);
 
-    moq_media_track_event_t full;
-    memset(&full, 0, sizeof(full));
-    full.struct_size = (uint32_t)n;
-    full.kind = e.kind;
-    full.track = e.track;
-    full.desc = e.track ? &e.track->desc : NULL;
-    full.config_generation = 0;
-    /* the UPDATE_OK scalars come from the QUEUE ENTRY's per-event
-     * copies, never from current track state. Zero for other kinds. */
-    full.has_largest = e.has_largest;
-    full.largest_group = e.largest_group;
-    full.largest_object = e.largest_object;
-    full.has_expires = e.has_expires;
-    full.expires_ms = e.expires_ms;
-    memcpy(ev, &full, n);
-    return MOQ_OK;
+        moq_media_track_event_t full;
+        memset(&full, 0, sizeof(full));
+        full.struct_size = (uint32_t)n;
+        full.kind = e.kind;
+        full.track = e.track;
+        full.desc = e.track ? &e.track->desc : NULL;
+        full.config_generation = 0;
+        /* the UPDATE_OK scalars come from the QUEUE ENTRY's per-event
+         * copies, never from current track state. Zero for other kinds. */
+        full.has_largest = e.has_largest;
+        full.largest_group = e.largest_group;
+        full.largest_object = e.largest_object;
+        full.has_expires = e.has_expires;
+        full.expires_ms = e.expires_ms;
+        memcpy(ev, &full, n);
+        return MOQ_OK;
+    }
+
+    /* Ordinary discovery/update events are drained first (so a consumer always
+     * sees TRACK_ADDED before any later event for a handle); only once the queue
+     * is empty do we synthesize a coalesced parse-drop diagnostic from pending
+     * per-track state. This never touches the ordinary event queue, so a
+     * malformed-object flood cannot overflow it or terminalize the receiver. */
+    if (r->parse_drop_pending_count > 0) {
+        moq_media_track_t *t = NULL;
+        for (size_t i = 0; i < r->track_count; i++) {
+            if (r->tracks[i]->parse_drop_pending) { t = r->tracks[i]; break; }
+        }
+        if (t) {
+            /* Snapshot total/delta/class under r->mu, clear the pending flag,
+             * and advance parse_drops_reported; the public event is filled from
+             * the snapshot, never re-read from the track after unlock. */
+            uint64_t total = t->parse_drops;
+            uint64_t delta = t->parse_drops - t->parse_drops_reported;
+            moq_media_parse_drop_class_t cls = t->parse_drop_last_class;
+            t->parse_drops_reported = t->parse_drops;
+            t->parse_drop_pending = false;
+            r->parse_drop_pending_count--;
+            pthread_mutex_unlock(&r->mu);
+
+            moq_media_track_event_t full;
+            memset(&full, 0, sizeof(full));
+            full.struct_size = (uint32_t)n;
+            full.kind = MOQ_MEDIA_TRACK_PARSE_DROP;
+            full.track = t;
+            full.desc = &t->desc;
+            full.config_generation = 0;
+            full.parse_drop_class = cls;
+            full.parse_drops_total = total;
+            full.parse_drops_delta = delta;
+            memcpy(ev, &full, n);
+            return MOQ_OK;
+        }
+    }
+
+    bool fatal = r->fatal;
+    pthread_mutex_unlock(&r->mu);
+    if (fatal || moq_endpoint_is_closed(r->ep))
+        return MOQ_ERR_CLOSED;
+    return MOQ_DONE;
 }
 
 const moq_media_track_desc_t *moq_media_track_desc_get(
@@ -2884,8 +3040,28 @@ const moq_cmsf_content_protection_t *
 moq_media_receiver_find_content_protection(
     const moq_media_receiver_t *r, moq_bytes_t ref_id)
 {
-    if (!r || !r->has_effective) return NULL;
-    return moq_msf_catalog_find_content_protection(&r->effective, ref_id);
+    if (!r) return NULL;                  /* null receiver: no probe, no lock */
+    /* Hold r->mu across the whole effective-generation selection and traversal,
+     * the same mutex receiver_commit_effective() holds while publishing. The
+     * returned pointer stays valid past the unlock only because a later commit
+     * retains any previous effective catalog that carried contentProtections
+     * (cp_snaps) -- the retained-snapshot lifetime contract is unchanged. */
+    pthread_mutex_t *mu = (pthread_mutex_t *)&r->mu;
+    pthread_mutex_lock(mu);
+    /* Reader PRE: after the null check + lock, before reading has_effective /
+     * selecting the effective generation. */
+    PUB_PHASE_HOOK(r, MOQ_MR_READER_PRE);
+    /* Both outcomes -- the empty (no effective catalog) selection and a real
+     * traversal -- run inside the lock, so the selection is computed
+     * unconditionally and POST fires for both. */
+    const moq_cmsf_content_protection_t *cp =
+        r->has_effective
+            ? moq_msf_catalog_find_content_protection(&r->effective, ref_id)
+            : NULL;
+    /* Reader POST: after the traversal result is selected, before the unlock. */
+    PUB_PHASE_HOOK(r, MOQ_MR_READER_POST);
+    pthread_mutex_unlock(mu);
+    return cp;
 }
 
 /* -- Per-track subscription control (app thread) ---------------------- *
@@ -3234,6 +3410,33 @@ uint64_t moq_media_receiver_fatal_code(const moq_media_receiver_t *r)
  * objects, with no endpoint or network. The receiver's per-handle public APIs
  * tolerate a NULL endpoint (treated as not-closed), so subscribe/unsubscribe/
  * track_state can be exercised against a test receiver too. */
+
+/* Observation-only probe of the publication mutex, exact tri-state:
+ *   0  = FREE    (trylock acquired it; released immediately)
+ *   1  = HELD    (trylock returned EBUSY)
+ *  -1  = INVALID (any other trylock error) -- the caller MUST turn this into a
+ *        named failure, so an unexpected mutex error never satisfies the held
+ *        contract. Single-threaded use inside a phase hook. */
+int moq_media_receiver_test_mu_held(const moq_media_receiver_t *r);
+int moq_media_receiver_test_mu_held(const moq_media_receiver_t *r)
+{
+    pthread_mutex_t *mu = (pthread_mutex_t *)&r->mu;
+    int rc = pthread_mutex_trylock(mu);
+    if (rc == 0) {
+        pthread_mutex_unlock(mu);
+        return 0;           /* FREE -> code under test does NOT hold r->mu */
+    }
+    if (rc == EBUSY) return 1;   /* HELD */
+    return -1;                   /* INVALID */
+}
+
+/* Number of retained CP-bearing catalog snapshots (retention contract). Lets
+ * the writer fixture prove a snapshot was actually retained before free. */
+size_t moq_media_receiver_test_cp_snap_count(const moq_media_receiver_t *r);
+size_t moq_media_receiver_test_cp_snap_count(const moq_media_receiver_t *r)
+{
+    return r ? r->cp_snap_count : 0;
+}
 
 moq_media_receiver_t *moq_media_receiver_test_new(bool auto_subscribe)
 {

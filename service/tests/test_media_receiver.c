@@ -45,6 +45,11 @@ typedef struct {
                                           has a subscriber server-side */
     atomic_bool      catalog_subscribed; /* same latch for the catalog track */
     int              published;
+    /* Deliberately malformed normal media objects for the class-MEDIA parse
+     * path. The current fixture uses garbage CMAF fragment payloads, not object
+     * properties, so sender-side property validation is out of the path. */
+    atomic_int       malformed_target;
+    int              malformed_published;
     bool             failed;
     /* FETCH-only raw-session server (fetch_only_pump) state. */
     moq_subscription_t catalog_sub;      /* accepted catalog SUBSCRIBE */
@@ -70,6 +75,16 @@ static const char k_media_catalog_json[] =
     "{\"version\":1,\"generatedAt\":1,\"tracks\":["
     "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,"
     "\"role\":\"video\",\"codec\":\"av01\",\"timescale\":1000000}"
+    "]}";
+
+/* A single CMAF media track, for the class-MEDIA malformed-object test: a
+ * garbage CMAF fragment payload fails the receiver's media parse (the sender
+ * treats the payload as opaque, so it crosses the wire). */
+static const char k_cmaf_media_catalog_json[] =
+    "{\"version\":1,\"generatedAt\":1,\"tracks\":["
+    "{\"name\":\"v\",\"packaging\":\"cmaf\",\"isLive\":true,"
+    "\"role\":\"video\",\"codec\":\"avc1.64001f\",\"timescale\":90000,"
+    "\"width\":1280,\"height\":720,\"framerate\":30,\"bitrate\":2000000}"
     "]}";
 
 /* The MSF §11.3 conversion of k_media_catalog_json: the SAME "v" tuple with the
@@ -407,6 +422,107 @@ static int mt_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     return 0;
 }
 
+/* Anti-flood harness: publishes a controllable number of MALFORMED media-timeline
+ * objects (each a distinct object; each fails to parse -> one parse_drop) so a
+ * test can prove that many malformed objects on one track neither overflow the
+ * track-event queue nor terminalize the receiver, and coalesce to one diagnostic.
+ * Reuses k_mt_catalog_json (v + tl). publish_target is raised by the test thread;
+ * the pump catches up. */
+typedef struct {
+    moq_publisher_t *pub;
+    moq_pub_track_t *catalog_track;
+    moq_pub_track_t *media_track;   /* "v" (so its SUBSCRIBE is accepted) */
+    moq_pub_track_t *tl_track;      /* "tl" media timeline (flooded) */
+    atomic_int       publish_target;
+    atomic_int       published_n;
+    bool             failed;
+} af_srv_state_t;
+
+static af_srv_state_t g_af;
+
+static int af_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                          uint64_t now_us, void *ctx)
+{
+    (void)lane;
+    af_srv_state_t *st = (af_srv_state_t *)ctx;
+    moq_session_t *session = moq_pq_threaded_session(t);
+    if (!session) return 0;
+
+    if (!st->pub) {
+        moq_pub_cfg_t pcfg;
+        moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
+        pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+        if (moq_pub_create(session, moq_alloc_default(), &pcfg, &st->pub)
+            != MOQ_OK) { st->failed = true; return -1; }
+        moq_bytes_t parts[] = {
+            MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
+        moq_namespace_t ns = { parts, 2 };
+        moq_pub_track_cfg_t tc;
+        moq_pub_track_cfg_init(&tc);
+        tc.track_namespace = ns;
+        tc.track_name = MOQ_BYTES_LITERAL(MOQ_MSF_CATALOG_TRACK_NAME);
+        if (moq_pub_add_track(st->pub, &tc, now_us, &st->catalog_track)
+            != MOQ_OK) { st->failed = true; return -1; }
+        moq_pub_track_cfg_init(&tc);
+        tc.track_namespace = ns;
+        tc.track_name = MOQ_BYTES_LITERAL("v");
+        if (moq_pub_add_track(st->pub, &tc, now_us, &st->media_track)
+            != MOQ_OK) { st->failed = true; return -1; }
+        moq_pub_track_cfg_init(&tc);
+        tc.track_namespace = ns;
+        tc.track_name = MOQ_BYTES_LITERAL("tl");
+        if (moq_pub_add_track(st->pub, &tc, now_us, &st->tl_track)
+            != MOQ_OK) { st->failed = true; return -1; }
+        moq_rcbuf_t *payload = NULL;
+        if (moq_rcbuf_create(moq_alloc_default(),
+                             (const uint8_t *)k_mt_catalog_json,
+                             strlen(k_mt_catalog_json), &payload) < 0) {
+            st->failed = true; return -1;
+        }
+        moq_pub_retained_object_t robj = { .object_id = 0, .payload = payload };
+        moq_pub_retained_group_cfg_t rg;
+        moq_pub_retained_group_cfg_init(&rg);
+        rg.group_id = 0;
+        rg.objects = &robj;
+        rg.object_count = 1;
+        moq_result_t src = moq_pub_set_retained_group(st->pub,
+                                                      st->catalog_track, &rg);
+        moq_rcbuf_decref(payload);
+        if (src != MOQ_OK) { st->failed = true; return -1; }
+    }
+
+    (void)moq_pub_tick(st->pub, now_us);
+    if (st->tl_track && moq_pub_has_subscriber(st->pub, st->tl_track)) {
+        int target = atomic_load(&st->publish_target);
+        while (atomic_load(&st->published_n) < target) {
+            int i = atomic_load(&st->published_n);
+            /* Malformed media-timeline payload (2-item record): one parse_drop,
+             * nothing enqueued. Each object is distinct (group 0, object i). */
+            static const char k_bad[] = "[[0,[0,0]]]";
+            moq_rcbuf_t *payload = NULL;
+            if (moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)k_bad,
+                                 sizeof(k_bad) - 1, &payload) < 0) {
+                st->failed = true; return -1;
+            }
+            moq_pub_object_cfg_t ocfg;
+            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
+            ocfg.group_id = 0;
+            ocfg.object_id = (uint64_t)i;
+            ocfg.payload = payload;
+            ocfg.end_of_group = false;
+            moq_result_t wrc = moq_pub_write_object_ex(st->pub, st->tl_track,
+                                                       &ocfg, now_us);
+            moq_rcbuf_decref(payload);
+            if (wrc == MOQ_ERR_WOULD_BLOCK || wrc == MOQ_ERR_WRONG_STATE)
+                break;   /* retry next pump */
+            if (wrc != MOQ_OK) { st->failed = true; return -1; }
+            (void)atomic_fetch_add(&st->published_n, 1);
+        }
+    }
+    (void)moq_pub_tick(st->pub, now_us);
+    return 0;
+}
+
 #define OBJS_PER_GROUP 3
 #define OBJ_PAYLOAD_LEN 16
 
@@ -458,6 +574,36 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
         if (wrc == MOQ_ERR_WRONG_STATE) return true;
         if (wrc != MOQ_OK) return false;
         st->published++;
+    }
+    /* Deliberately malformed normal media objects: a garbage CMAF fragment
+     * payload (the sender treats the payload as opaque, so it crosses the wire;
+     * the RECEIVER's media parse fails, MOQ_ERR_PROTO / MALFORMED_CMAF) -> a
+     * class-MEDIA parse drop; nothing surfaces via poll_object. No properties
+     * (so the sender's object-property validation is not involved). Distinct
+     * group ids so they never collide with the normal objects above. Only used
+     * by the class-MEDIA block, whose media track is CMAF. */
+    int mtarget = atomic_load(&st->malformed_target);
+    while (st->malformed_published < mtarget) {
+        int i = st->malformed_published;
+        /* A box claiming length 1 with type "bad!" -- structurally invalid. */
+        uint8_t garbage[] = { 0x00, 0x00, 0x00, 0x01, 'b', 'a', 'd', '!' };
+        moq_rcbuf_t *payload = NULL;
+        if (moq_rcbuf_create(moq_alloc_default(), garbage, sizeof(garbage),
+                             &payload) < 0)
+            return false;
+        moq_pub_object_cfg_t ocfg;
+        moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
+        ocfg.group_id = 1000 + (uint64_t)i;
+        ocfg.object_id = 0;
+        ocfg.payload = payload;
+        ocfg.end_of_group = true;
+        moq_result_t wrc = moq_pub_write_object_ex(st->pub, st->media_track,
+                                                   &ocfg, now_us);
+        moq_rcbuf_decref(payload);
+        if (wrc == MOQ_ERR_WOULD_BLOCK || wrc == MOQ_ERR_WRONG_STATE)
+            return true;
+        if (wrc != MOQ_OK) return false;
+        st->malformed_published++;
     }
     return true;
 }
@@ -859,6 +1005,30 @@ static bool wait_received(moq_media_receiver_t *r, uint64_t want, int ticks)
         usleep(50000);
     }
     return false;
+}
+
+/* Drain track events (waiting up to `ticks` short waits) and count the coalesced
+ * MOQ_MEDIA_TRACK_PARSE_DROP events surfaced for `track`; the last one is
+ * captured in *last. Ordinary events are skipped. Stops after the first drain
+ * pass that surfaces any (so it observes the coalesced count, not a race).
+ * Returns the count seen. */
+static int collect_parse_drops(moq_media_receiver_t *r,
+                               moq_media_track_t *track,
+                               moq_media_track_event_t *last, int ticks)
+{
+    int n = 0;
+    for (int i = 0; i < ticks; i++) {
+        moq_media_track_event_t ev;
+        while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+            if (ev.kind == MOQ_MEDIA_TRACK_PARSE_DROP && ev.track == track) {
+                if (last) *last = ev;
+                n++;
+            }
+        }
+        if (n > 0 || moq_media_receiver_is_fatal(r)) break;
+        (void)moq_media_receiver_wait(r, 50000);
+    }
+    return n;
 }
 
 static bool bytes_is(moq_bytes_t b, const char *s)
@@ -1326,6 +1496,80 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
         MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
         MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+
+        moq_media_receiver_destroy(r);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_CHECK(!g_srv.failed);
+    }
+
+    /* == class MEDIA parse drop: a normal CMAF media object with malformed
+     *    fragment payload fails the media parse -> a coalesced PARSE_DROP
+     *    (class MEDIA) for the media track, non-fatal, no poll_object leak,
+     *    counters distinct from overflow/catalog drops. ===================== */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.catalog_json = k_cmaf_media_catalog_json;
+        g_srv.media_track_name = "v";
+        moq_pq_threaded_t *srv = start_server_with(cert, key, server_pump,
+                                                   &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        moq_media_receiver_t *r = NULL;
+        if (srv) {
+            char url[64];
+            moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+            moq_bytes_t parts[2];
+            moq_media_receiver_cfg_t cfg;
+            fill_cfg(&cfg, parts);
+            cfg.endpoint = &ec;
+            cfg.auto_subscribe = true;
+            if (moq_media_receiver_create(&cfg, &r) != MOQ_OK) r = NULL;
+        }
+        MOQ_TEST_CHECK(r != NULL);
+
+        moq_media_track_t *track = r ? drain_until_ready(r) : NULL;
+        MOQ_TEST_CHECK(track != NULL);
+        if (track) {
+            /* Three malformed CMAF media objects, no valid ones. */
+            atomic_store(&g_srv.malformed_target, 3);
+            moq_media_receiver_stats_t st;
+            memset(&st, 0, sizeof(st));
+            for (int i = 0; i < 600; i++) {
+                (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
+                if (st.parse_drops >= 3 || moq_media_receiver_is_fatal(r)) break;
+                usleep(50000);
+            }
+            MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 3);
+            MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+
+            moq_media_track_event_t pd;
+            int pdn = collect_parse_drops(r, track, &pd, 200);
+            MOQ_TEST_CHECK_EQ_INT(pdn, 1);   /* coalesced */
+            if (pdn == 1) {
+                MOQ_TEST_CHECK_EQ_INT((int)pd.kind,
+                                      (int)MOQ_MEDIA_TRACK_PARSE_DROP);
+                MOQ_TEST_CHECK(pd.track == track);
+                MOQ_TEST_CHECK_EQ_INT((int)pd.parse_drop_class,
+                                      (int)MOQ_MEDIA_PARSE_DROP_MEDIA);
+                MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_total, 3);
+                MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_delta, 3);
+            }
+
+            /* A malformed object never surfaces as a media object. */
+            moq_media_object_t mo;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_media_receiver_poll_object(r, &mo, sizeof(mo)),
+                (int)MOQ_DONE);
+
+            /* Distinct from the overflow/catalog counters. */
+            (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
+            MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 3);
+            MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+            MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 0);
+            MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 0);
+            MOQ_TEST_CHECK_EQ_U64(st.catalog_drops, 0);
+        }
 
         moq_media_receiver_destroy(r);
         moq_pq_threaded_stop(srv);
@@ -2177,6 +2421,31 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK_EQ_U64(mst.parse_drops, 2);
             MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
 
+            /* The two malformed SAP objects surface as ONE coalesced
+             * parse-drop diagnostic for the sap track (class SAP), non-fatal,
+             * with counters distinct from the drop/overflow/catalog counters. */
+            if (sap) {
+                moq_media_track_event_t pd;
+                int pdn = collect_parse_drops(r, sap, &pd, 100);
+                MOQ_TEST_CHECK_EQ_INT(pdn, 1);   /* coalesced, not one-per-object */
+                if (pdn == 1) {
+                    MOQ_TEST_CHECK_EQ_INT((int)pd.kind,
+                                          (int)MOQ_MEDIA_TRACK_PARSE_DROP);
+                    MOQ_TEST_CHECK(pd.track == sap);
+                    MOQ_TEST_CHECK_EQ_INT((int)pd.parse_drop_class,
+                                          (int)MOQ_MEDIA_PARSE_DROP_SAP);
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_total, 2);
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_delta, 2);
+                }
+                MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+                (void)moq_media_receiver_get_stats(r, &mst, sizeof(mst));
+                MOQ_TEST_CHECK_EQ_U64(mst.parse_drops, 2);
+                MOQ_TEST_CHECK_EQ_U64(mst.objects_dropped, 0);
+                MOQ_TEST_CHECK_EQ_U64(mst.groups_dropped, 0);
+                MOQ_TEST_CHECK_EQ_U64(mst.keyframes_dropped, 0);
+                MOQ_TEST_CHECK_EQ_U64(mst.catalog_drops, 0);
+            }
+
             /* No SAP object ever leaks into the media object path. */
             moq_media_object_t mo;
             MOQ_TEST_CHECK_EQ_INT(
@@ -2373,7 +2642,120 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK_EQ_U64(st_after.parse_drops, st_before.parse_drops + 1);
             MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
 
+            /* The one malformed media-timeline object surfaces a coalesced
+             * parse-drop diagnostic for the tl track (class MEDIA_TIMELINE). */
+            if (tl) {
+                moq_media_track_event_t pd;
+                int pdn = collect_parse_drops(r, tl, &pd, 100);
+                MOQ_TEST_CHECK_EQ_INT(pdn, 1);
+                if (pdn == 1) {
+                    MOQ_TEST_CHECK_EQ_INT((int)pd.kind,
+                                          (int)MOQ_MEDIA_TRACK_PARSE_DROP);
+                    MOQ_TEST_CHECK(pd.track == tl);
+                    MOQ_TEST_CHECK_EQ_INT((int)pd.parse_drop_class,
+                                          (int)MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE);
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_delta, 1);
+                }
+                MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+            }
+
             MOQ_TEST_CHECK(!g_mt.failed);
+            moq_media_receiver_destroy(r);
+        }
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+    }
+
+    /* == parse-drop anti-flood + coalescing: many malformed objects on one
+     *    track with a SMALL max_track_events must not overflow the event queue
+     *    or terminalize the receiver, and coalesce to ONE diagnostic; draining
+     *    it then arming more drops yields a FRESH diagnostic with the new
+     *    delta. Parse drops never use the ordinary event queue. ============= */
+    {
+        int port = 0;
+        memset(&g_af, 0, sizeof(g_af));
+        moq_pq_threaded_t *srv = start_server_with(cert, key, af_server_pump,
+                                                   (srv_state_t *)&g_af, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (srv) {
+            char url[64];
+            moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+            moq_bytes_t parts[2];
+            moq_media_receiver_cfg_t cfg;
+            fill_cfg(&cfg, parts);
+            cfg.endpoint = &ec;
+            cfg.auto_subscribe = true;
+            cfg.max_track_events = 4;   /* small: 100 malformed >> 4 must not overflow */
+            moq_media_receiver_t *r = NULL;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_media_receiver_create(&cfg, &r),
+                                  (int)MOQ_OK);
+
+            moq_media_track_t *tl = NULL;
+            bool ready = false;
+            moq_media_track_event_t ev;
+            for (int i = 0; i < 300 && !ready; i++) {
+                (void)moq_media_receiver_wait(r, 100000);
+                while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+                    if (ev.kind == MOQ_MEDIA_TRACK_ADDED && ev.desc &&
+                        bytes_is(ev.desc->name, "tl"))
+                        tl = ev.track;
+                    if (ev.kind == MOQ_MEDIA_CATALOG_READY) ready = true;
+                }
+                if (moq_media_receiver_is_fatal(r)) break;
+            }
+            MOQ_TEST_CHECK(ready);
+            MOQ_TEST_CHECK(tl != NULL);
+            if (tl) {
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_media_receiver_subscribe_track(r, tl, NULL),
+                    (int)MOQ_OK);
+
+                /* Phase 1: 100 malformed objects. usleep-poll (not
+                 * moq_media_receiver_wait, which returns instantly once a
+                 * parse-drop is pending) so delivery of the whole run catches
+                 * up before the counts are read. */
+                atomic_store(&g_af.publish_target, 100);
+                moq_media_receiver_stats_t st;
+                memset(&st, 0, sizeof(st));
+                for (int i = 0; i < 600; i++) {
+                    (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
+                    if (st.parse_drops >= 100 || moq_media_receiver_is_fatal(r))
+                        break;
+                    usleep(50000);
+                }
+                MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 100);
+                /* The core anti-flood property: 100 malformed objects with a
+                 * 4-deep event queue and the receiver never terminalized. */
+                MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+
+                moq_media_track_event_t pd;
+                int pdn = collect_parse_drops(r, tl, &pd, 200);
+                MOQ_TEST_CHECK_EQ_INT(pdn, 1);   /* coalesced to one, not 100 */
+                if (pdn == 1) {
+                    MOQ_TEST_CHECK_EQ_INT((int)pd.parse_drop_class,
+                                          (int)MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE);
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_total, 100);
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_delta, 100);
+                }
+
+                /* Phase 2: 40 more -> a FRESH diagnostic with the new delta. */
+                atomic_store(&g_af.publish_target, 140);
+                for (int i = 0; i < 600; i++) {
+                    (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
+                    if (st.parse_drops >= 140 || moq_media_receiver_is_fatal(r))
+                        break;
+                    usleep(50000);
+                }
+                MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 140);
+                MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+                int pdn2 = collect_parse_drops(r, tl, &pd, 200);
+                MOQ_TEST_CHECK_EQ_INT(pdn2, 1);
+                if (pdn2 == 1) {
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_total, 140);
+                    MOQ_TEST_CHECK_EQ_U64(pd.parse_drops_delta, 40);
+                }
+            }
+            MOQ_TEST_CHECK(!g_af.failed);
             moq_media_receiver_destroy(r);
         }
         moq_pq_threaded_stop(srv);

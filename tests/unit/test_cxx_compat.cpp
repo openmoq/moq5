@@ -3,6 +3,7 @@
  * Verifies that public headers compile and key macros work from C++.
  */
 
+#include <cstddef>
 #include <moq/moq.h>
 #include "test_support.h"
 #include <cstring>
@@ -49,6 +50,16 @@ int main()
     cfg.max_actions = 1;
     MOQ_TEST_CHECK(cfg.perspective == MOQ_PERSPECTIVE_CLIENT);
     MOQ_TEST_CHECK(cfg.max_actions == 1);
+
+    /* The appended object-chunk cause field is reachable and default-zero from
+     * C++, and the routing identity keeps its place ahead of the tail. */
+    {
+        moq_object_chunk_event_t oc{};
+        MOQ_TEST_CHECK(oc.error_code == 0u);
+        MOQ_TEST_CHECK(offsetof(moq_object_chunk_event_t, error_code) >
+                       offsetof(moq_object_chunk_event_t, properties));
+        MOQ_TEST_CHECK(sizeof(moq_object_chunk_event_t) <= MOQ_EVENT_DETAIL_MAX);
+    }
 
     MOQ_TEST_PASS("test_cxx_compat");
     return failures;

@@ -141,6 +141,64 @@ struct ReceiverEagerDrainTests {
         #expect(a.description.trackDuration == .seconds(90))
         await rig.endpoint.close()
     }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Parse-drop events map to .parseDrop for the track, never to .ended")
+    func parseDropMapping() async throws {
+        let rig = try makeRig()
+        rig.receiverBackend.scriptEvents([
+            .added(9, name: "audio"),
+            .parseDrop(9, .sap, total: 3, delta: 3),
+        ])
+        rig.endpointBackend.wake()
+
+        var events: [TrackEvent] = []
+        for try await event in rig.receiver.trackEvents {
+            events.append(event)
+            if events.count == 2 { break }
+        }
+        guard case .added(let a) = events[0],
+              case .parseDrop(let t, let cls, let total, let delta) = events[1]
+        else {
+            Issue.record("unexpected event shapes: \(events)")
+            return
+        }
+        #expect(a === t)              /* same handle as the added track */
+        #expect(cls == .sap)
+        #expect(total == 3)
+        #expect(delta == 3)
+        /* The regression this guards: a parse drop must NEVER surface as a
+         * false track end. */
+        #expect(!events.contains { if case .ended = $0 { true } else { false } })
+        await rig.endpoint.close()
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A parse-drop with no class is dropped, never defaulted to .media or .ended")
+    func parseDropMissingClassSkipped() async throws {
+        let rig = try makeRig()
+        rig.receiverBackend.scriptEvents([
+            .added(9, name: "audio"),
+            .parseDropNoClass(9),     /* missing class -> must be skipped */
+            .removed(9),
+        ])
+        rig.endpointBackend.wake()
+
+        var events: [TrackEvent] = []
+        for try await event in rig.receiver.trackEvents {
+            events.append(event)
+            if events.count == 2 { break }
+        }
+        /* The class-less parse drop is skipped: only .added then .removed
+         * surface, and nothing is invented as .parseDrop, .media, or .ended. */
+        guard case .added = events[0], case .removed = events[1] else {
+            Issue.record("unexpected event shapes: \(events)")
+            return
+        }
+        #expect(!events.contains { if case .parseDrop = $0 { true } else { false } })
+        #expect(!events.contains { if case .ended = $0 { true } else { false } })
+        await rig.endpoint.close()
+    }
 }
 
 @Suite("Track event stream")
@@ -348,7 +406,7 @@ struct ReceiverTeardownTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Forgotten close(): dropping receiver AND endpoint still tears everything down")
-    func forgottenCloseBackstop() throws {
+    func forgottenCloseBackstop() async throws {
         let endpointBackend = ScriptedEndpointBackend()
         let receiverBackend = ScriptedReceiverBackend()
         var endpoint: MoQEndpoint? = MoQEndpoint(
@@ -365,8 +423,8 @@ struct ReceiverTeardownTests {
          * receiver -> endpoint -> engine) keeps them alive. */
         receiver = nil
         endpoint = nil
-        #expect(receiverBackend.awaitCondition { $0.detachCalls == 1 })
-        #expect(endpointBackend.awaitCondition { $0.destroyCount == 1 })
+        #expect(await receiverBackend.awaitCondition { $0.detachCalls == 1 })
+        #expect(await endpointBackend.awaitCondition { $0.destroyCount == 1 })
         #expect(receiverBackend.snapshot().violations.isEmpty)
         #expect(endpointBackend.snapshot().violations.isEmpty)
     }

@@ -72,6 +72,9 @@ jobs:
       - name: Buffer Sendable contract guard
         run: scripts/check_swift_buffer_sendable.sh
 
+      # Runs the full ungated suite, including the security regression coverage
+      # for findings 4, 6, 7 (`TrackEventBacklogTests`, `ChildTrapProbeTests`),
+      # which now pass against the product fixes.
       - name: Swift test
         run: swift test
 
@@ -163,6 +166,11 @@ jobs:
       # (the MoQ-linking test targets run in the ungated swift-binding job;
       # they cannot share a test bundle with MoQService -- that is the
       # duplicate-symbol canary working).
+      # Runs the gated suite, including the finding-5 video-dimension security
+      # regression coverage (`ServiceDimensionTests`, service stack), which now
+      # passes against the product guard. The finding-4/6/7 source-stack suites
+      # run in the ungated swift-binding job (they cannot share this service
+      # test bundle -- the moq_swift_stack_guard duplicate-symbol canary).
       - name: Gated Swift test (MOQ_SERVICE=1)
         run: MOQ_SERVICE=1 swift test
         env:
@@ -313,7 +321,7 @@ jobs:
       - name: Test (in-process adapter subset)
         run: >
           ctest --test-dir build/pq-ci --output-on-failure
-          -R '^(pq_conformance|adapter_backpressure|threaded_compile|scenario_backpressure|scenario_delay_backpressure)$'
+          -R '^(pq_conformance|adapter_backpressure|threaded_compile|threaded_tls_policy|threaded_tls_handshake|scenario_backpressure|scenario_delay_backpressure)$'
 
       # Cold-consumer / packaging tier (kept separate so a packaging
       # failure is distinguishable from an adapter-behavior failure).
@@ -488,3 +496,25 @@ jobs:
 
       - name: Quick seed sweep
         run: scripts/run_seed_sweeps.sh --profile quick
+
+  shell-selftest:
+    name: Shell self-tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # /bin/bash is the shell the scripts actually run under: on macOS it is
+      # 3.2 (the floor developers and users have), on Linux a modern control.
+      # Running every auto-discovered `--self-test` under /bin/bash on both
+      # catches shell-version divergence - e.g. an empty array expanded under
+      # `set -u`, which aborts on 3.2 but not on 4.4+. Stub binaries only; this
+      # lane runs no fuzzers.
+      - name: Report /bin/bash version
+        run: /bin/bash --version | head -1
+
+      - name: Shell self-test lane (/bin/bash)
+        run: bash scripts/selftest_all.sh --bash /bin/bash

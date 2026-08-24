@@ -36,6 +36,13 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 find_package(mvfst CONFIG REQUIRED)
 
+# mvfst's static folly/mvfst archives carry unresolved fmt references
+# (libfolly.a(json.cpp.o), libmvfst.a(QuicException.cpp.o)). fmt::fmt must be
+# in the adapter's exported link interface so a consumer naming only
+# moq::adapter-mvfst links without adding fmt directly -- it cannot rely on
+# Folly's package config happening to discover fmt on the consumer side.
+find_package(fmt CONFIG REQUIRED)
+
 # -- Adapter library ------------------------------------------------
 
 add_library(moq-adapter-mvfst
@@ -55,6 +62,16 @@ target_link_libraries(moq-adapter-mvfst
     PUBLIC  moq::core
     PRIVATE mvfst::mvfst
 )
+
+# Packaging-only interface for the hand-written imported target files. fmt is
+# a static-link requirement of the mvfst/Folly objects, not a LibMoQ public
+# header requirement, so keep our direct edge link-only. Upstream mvfst/Folly
+# targets may still propagate their own compile usage.
+add_library(moq-adapter-mvfst-export-interface INTERFACE)
+target_link_libraries(moq-adapter-mvfst-export-interface INTERFACE
+    moq::core
+    mvfst::mvfst
+    "$<LINK_ONLY:fmt::fmt>")
 
 target_compile_features(moq-adapter-mvfst PUBLIC cxx_std_17)
 
@@ -89,7 +106,8 @@ install(FILES cmake/FindSodium.cmake
 # -- Adapter target files -------------------------------------------
 # Separate from core libmoqTargets to keep the optional boundary.
 # Build-tree targets (absolute paths — valid on this machine).
-set(_mvfst_adapter_link "moq::core;mvfst::mvfst")
+set(_mvfst_adapter_link
+    "$<TARGET_PROPERTY:moq-adapter-mvfst-export-interface,INTERFACE_LINK_LIBRARIES>")
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterMvfstTargets.cmake"
     CONTENT "\
@@ -120,7 +138,7 @@ if(NOT TARGET moq::adapter-mvfst)\n\
     IMPORTED_LOCATION \"\${_MVFST_PREFIX}/${_mvfst_adapter_libdir}/${_mvfst_adapter_lib_name}\"\n\
     IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
     INTERFACE_INCLUDE_DIRECTORIES \"\${_MVFST_PREFIX}/${_mvfst_adapter_incdir}\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::core$<SEMICOLON>mvfst::mvfst\")\n\
+    INTERFACE_LINK_LIBRARIES \"${_mvfst_adapter_link}\")\n\
 endif()\n\
 \n\
 unset(_MVFST_PREFIX)\n")

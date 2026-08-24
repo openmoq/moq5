@@ -2217,8 +2217,11 @@ static void test_track_hist_tristate_publish(void)
         moq_session_t *s = d18_server_established(&alloc, 2);
         MOQ_TEST_CHECK(s != NULL);
         if (!s) return;
+        /* No FIN: the publication must stay live to own alias 7 and hold its
+         * registry slot. A same-call FIN is the peer closing its half, which
+         * tears the publication down and releases both. */
         MOQ_TEST_CHECK(feed_d18_publish(s, moq_stream_ref_from_u64(4), "a",
-                                        7, /*fin*/true) == MOQ_OK);
+                                        7, /*fin*/false) == MOQ_OK);
         /* The first PUBLISH surfaced a request event and owns alias 7. */
         {   int npub = 0; moq_event_t e;
             while (moq_session_poll_events(s, &e, 1) == 1) {
@@ -2267,8 +2270,10 @@ static void test_track_hist_tristate_publish(void)
         int64_t bal = as.balance;
         int calls = as.count;
 
+        /* No FIN: the reservation's ref is only observable while the
+         * publication it belongs to is still live. */
         moq_result_t rc = feed_d18_publish(s, moq_stream_ref_from_u64(4),
-                                           "x", 7, /*fin*/true);
+                                           "x", 7, /*fin*/false);
         MOQ_TEST_CHECK(rc != MOQ_ERR_NOMEM);
         MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
         /* EXISTING: exactly ZERO allocator attempts for the whole

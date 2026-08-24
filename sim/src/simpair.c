@@ -12,6 +12,7 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
                                   bool send_request_capacity,
                                   uint64_t initial_request_capacity,
                                   bool streaming_objects,
+                                  uint32_t max_open_subgroups,
                                   uint64_t goaway_timeout_us,
                                   uint32_t max_actions,
                                   uint32_t max_events,
@@ -29,6 +30,8 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
     scfg.send_request_capacity = send_request_capacity;
     scfg.initial_request_capacity = initial_request_capacity;
     scfg.streaming_objects = streaming_objects;
+    if (max_open_subgroups)
+        scfg.max_open_subgroups = max_open_subgroups;
     scfg.goaway_timeout_us = goaway_timeout_us;
     scfg.max_actions = max_actions;
     scfg.max_events = max_events;
@@ -115,6 +118,17 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, client_streaming_objects),
                       sizeof(cfg->client_streaming_objects)))
         client_streaming_objects = cfg->client_streaming_objects;
+
+    bool server_streaming_objects = false;
+    if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, server_streaming_objects),
+                      sizeof(cfg->server_streaming_objects)))
+        server_streaming_objects = cfg->server_streaming_objects;
+
+    uint32_t server_max_open_subgroups = 0;   /* 0 -> session default (64) */
+    if (cfg_has_field(cfg,
+                      offsetof(moq_simpair_cfg_t, server_max_open_subgroups),
+                      sizeof(cfg->server_max_open_subgroups)))
+        server_max_open_subgroups = cfg->server_max_open_subgroups;
     uint64_t client_goaway_timeout_us = 0;
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, client_goaway_timeout_us),
                       sizeof(cfg->client_goaway_timeout_us)))
@@ -193,6 +207,7 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                                    client_send_request_capacity,
                                    client_initial_request_capacity,
                                    client_streaming_objects,
+                                   0 /* client keeps the default pool */,
                                    client_goaway_timeout_us,
                                    max_actions, max_events,
                                    version,
@@ -209,7 +224,8 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                       MOQ_PERSPECTIVE_SERVER,
                       server_send_request_capacity,
                       server_initial_request_capacity,
-                      false,
+                      server_streaming_objects,
+                      server_max_open_subgroups,
                       server_goaway_timeout_us,
                       max_actions, max_events,
                       version,
@@ -287,32 +303,58 @@ moq_result_t moq_simpair_start(moq_simpair_t *sp)
 
 moq_result_t moq_simpair_step(moq_simpair_t *sp, size_t *out_delivered)
 {
+    size_t to_server = 0;
+    size_t to_client = 0;
+    moq_result_t rc = moq_simpair_step_directional(sp, &to_server,
+                                                   &to_client);
+    /* Preserve the pre-split contract: on failure leave *out_delivered
+     * untouched (the directional call writes neither count on rc < 0). */
+    if (rc < 0)
+        return rc;
+    if (out_delivered)
+        *out_delivered = to_server + to_client;
+    return rc;
+}
+
+moq_result_t moq_simpair_step_directional(moq_simpair_t *sp,
+                                          size_t *out_to_server,
+                                          size_t *out_to_client)
+{
     if (!sp) return MOQ_ERR_INVAL;
     sp->step++;
 
-    size_t delivered = 0;
+    size_t to_server = 0;
+    size_t to_client = 0;
 
-    moq_result_t rc = sim_delay_deliver_matured(sp, &delivered);
+    /* Matured delayed inputs attribute to the direction they target (only
+     * fault-injected runs ever mature entries). */
+    size_t matured = 0;
+    size_t matured_srv = 0;
+    moq_result_t rc = sim_delay_deliver_matured(sp, &matured, &matured_srv);
     if (rc < 0) return rc;
+    to_server += matured_srv;
+    to_client += matured - matured_srv;
 
     rc = pump_direction(sp, sp->client, sp->server,
                         MOQ_PERSPECTIVE_CLIENT,
                         MOQ_PERSPECTIVE_SERVER,
-                        &delivered);
+                        &to_server, &to_client);
     if (rc < 0)
         return rc;
 
     rc = pump_direction(sp, sp->server, sp->client,
                         MOQ_PERSPECTIVE_SERVER,
                         MOQ_PERSPECTIVE_CLIENT,
-                        &delivered);
+                        &to_client, &to_server);
     if (rc < 0)
         return rc;
 
-    if (out_delivered)
-        *out_delivered = delivered;
-    if (delivered == 0)
-        trace_quiescent(sp, delivered);
+    if (out_to_server)
+        *out_to_server = to_server;
+    if (out_to_client)
+        *out_to_client = to_client;
+    if (to_server + to_client == 0)
+        trace_quiescent(sp, 0);
     return MOQ_OK;
 }
 

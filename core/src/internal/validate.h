@@ -11,12 +11,13 @@
 #endif
 
 MOQ_VALIDATE_UNUSED
-static moq_result_t moq_validate_namespace(const moq_namespace_t *ns)
+static moq_result_t moq_validate_namespace_min_fields(
+    const moq_namespace_t *ns, size_t min_fields)
 {
     if (!ns) return MOQ_ERR_INVAL;
-    if (ns->count == 0 || ns->count > 32)
+    if (min_fields > 32 || ns->count < min_fields || ns->count > 32)
         return MOQ_ERR_INVAL;
-    if (!ns->parts) return MOQ_ERR_INVAL;
+    if (ns->count > 0 && !ns->parts) return MOQ_ERR_INVAL;
     size_t total = 0;
     for (size_t i = 0; i < ns->count; i++) {
         if (ns->parts[i].len == 0) return MOQ_ERR_INVAL;
@@ -29,10 +30,16 @@ static moq_result_t moq_validate_namespace(const moq_namespace_t *ns)
 }
 
 MOQ_VALIDATE_UNUSED
-static moq_result_t moq_validate_full_track_name(
-    const moq_namespace_t *ns, moq_bytes_t track_name)
+static moq_result_t moq_validate_namespace(const moq_namespace_t *ns)
 {
-    moq_result_t rc = moq_validate_namespace(ns);
+    return moq_validate_namespace_min_fields(ns, 1);
+}
+
+MOQ_VALIDATE_UNUSED
+static moq_result_t moq_validate_full_track_name_min_fields(
+    const moq_namespace_t *ns, moq_bytes_t track_name, size_t min_fields)
+{
+    moq_result_t rc = moq_validate_namespace_min_fields(ns, min_fields);
     if (rc < 0) return rc;
     if (track_name.len > 0 && !track_name.data)
         return MOQ_ERR_INVAL;
@@ -42,6 +49,13 @@ static moq_result_t moq_validate_full_track_name(
     if (track_name.len > MOQ_FULL_TRACK_NAME_MAX - ns_total)
         return MOQ_ERR_INVAL;
     return MOQ_OK;
+}
+
+MOQ_VALIDATE_UNUSED
+static moq_result_t moq_validate_full_track_name(
+    const moq_namespace_t *ns, moq_bytes_t track_name)
+{
+    return moq_validate_full_track_name_min_fields(ns, track_name, 1);
 }
 
 MOQ_VALIDATE_UNUSED

@@ -22,6 +22,19 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         var pollCalls = 0
         var objectPollCalls = 0
         var detachCalls = 0
+        /// Track events still queued in the backend (never polled). The
+        /// backend is the bounded C queue's stand-in, so a nonzero value after
+        /// a drain is the retained suffix a bounded Swift ring must leave here.
+        var queuedEventsRemaining = 0
+        /// Number of times `pollTrackEvent` returned `.closed` (the terminal
+        /// disposition). The bounded contract surfaces the terminal exactly
+        /// once, and only after the whole event suffix has been polled -- so
+        /// this declares terminal-poll state exactly rather than by inference.
+        var terminalPollsReturned = 0
+        /// Objects still queued in the backend (never polled). Lets a test
+        /// prove an object whose TRACK_ADDED is retained is left in the
+        /// backend rather than adopted or discarded.
+        var queuedObjectsRemaining = 0
         var subscribeCalls: [SubscribeCall] = []
         var unsubscribeCalls: [UInt64] = []
         var violations: [String] = []
@@ -69,7 +82,8 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         r.pollCalls += 1
         cond.broadcast()
         if !queue.isEmpty { return .event(queue.removeFirst()) }
-        return terminal ? .closed : .none
+        if terminal { r.terminalPollsReturned += 1; return .closed }
+        return .none
     }
 
     var isTerminal: Bool {
@@ -190,7 +204,10 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
 
     func snapshot() -> Snapshot {
         cond.lock(); defer { cond.unlock() }
-        return r
+        var snap = r
+        snap.queuedEventsRemaining = queue.count
+        snap.queuedObjectsRemaining = objectQueue.count
+        return snap
     }
 
     /// Handshake await on the recorders; predicate reads ONLY its argument.
@@ -253,6 +270,19 @@ extension ReceiverPolledEvent {
     }
     static func ended(_ id: UInt64) -> ReceiverPolledEvent {
         ReceiverPolledEvent(kind: .ended, handleID: id, trackDescription: nil)
+    }
+    static func parseDrop(_ id: UInt64, _ cls: ParseDropClass,
+                          total: UInt64, delta: UInt64) -> ReceiverPolledEvent {
+        ReceiverPolledEvent(kind: .parseDrop, handleID: id,
+                            trackDescription: nil, parseDropClass: cls,
+                            parseDropTotal: total, parseDropDelta: delta)
+    }
+    /* A parse-drop with NO class (models missing/unknown class data): the model
+     * must drop it, never default to .media or surface .ended. */
+    static func parseDropNoClass(_ id: UInt64) -> ReceiverPolledEvent {
+        ReceiverPolledEvent(kind: .parseDrop, handleID: id,
+                            trackDescription: nil, parseDropClass: nil,
+                            parseDropTotal: 1, parseDropDelta: 1)
     }
     static var catalogReady: ReceiverPolledEvent {
         ReceiverPolledEvent(kind: .catalogReady, handleID: 0,

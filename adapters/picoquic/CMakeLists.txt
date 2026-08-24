@@ -363,6 +363,67 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
 
+    # TLS test fixtures are REQUIRED for the threaded TLS gates, not optional.
+    # The threaded adapter already requires source-tree picoquic, whose certs/
+    # directory ships these files, so a missing fixture is a broken checkout and
+    # must fail configuration -- never silently turn a security gate into a
+    # passing runtime SKIP.
+    set(_pq_tls_cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+    set(_pq_tls_key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    set(_pq_tls_ca   "${MOQ_PICOQUIC_SOURCE_DIR}/certs/test-ca.crt")
+    foreach(_pq_tls_fixture "${_pq_tls_cert}" "${_pq_tls_key}" "${_pq_tls_ca}")
+        if(NOT EXISTS "${_pq_tls_fixture}")
+            message(FATAL_ERROR
+                "picoquic threaded TLS tests require the fixture:\n"
+                "    ${_pq_tls_fixture}\n"
+                "It ships in the picoquic source tree's certs/ directory. Point "
+                "-DMOQ_PICOQUIC_SOURCE_DIR at a picoquic checkout that includes "
+                "certs/cert.pem, certs/key.pem and certs/test-ca.crt.")
+        endif()
+    endforeach()
+
+    # Deterministic TLS certificate-policy oracle for the raw threaded client.
+    # White-box: it reads the picotls master context off the QUIC context
+    # (picoquic_internal.h + picotls.h) and drives the MOQ_PQ_THREADED_TESTING
+    # installer seam, so it needs the same PRIVATE picoquic source include the
+    # test-internals adapter uses, plus the picotls headers.
+    add_executable(test_threaded_tls_policy tests/test_threaded_tls_policy.c)
+    target_link_libraries(test_threaded_tls_policy PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_threaded_tls_policy PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic"
+        ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
+    target_compile_definitions(test_threaded_tls_policy PRIVATE
+        MOQ_TEST_CERT_PATH="${_pq_tls_cert}"
+        MOQ_TEST_KEY_PATH="${_pq_tls_key}")
+    add_test(NAME threaded_tls_policy COMMAND test_threaded_tls_policy)
+
+    # Real-handshake controls (loopback) for the client TLS policy: default
+    # rejects the untrusted test server cert (terminal), insecure accepts, custom
+    # CA with a matching SNI accepts, and custom CA with a WRONG SNI is rejected
+    # on the hostname mismatch (terminal). Needs the test CA that signed the
+    # server cert.
+    add_executable(test_threaded_tls_handshake tests/test_threaded_tls_handshake.c)
+    target_link_libraries(test_threaded_tls_handshake PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_compile_definitions(test_threaded_tls_handshake PRIVATE
+        MOQ_TEST_CERT_PATH="${_pq_tls_cert}"
+        MOQ_TEST_KEY_PATH="${_pq_tls_key}"
+        MOQ_TEST_CA_PATH="${_pq_tls_ca}")
+    add_test(NAME threaded_tls_handshake COMMAND test_threaded_tls_handshake)
+
+    # Keepalive arming oracle (Vojtech idle-publisher report). White-box: drives
+    # the MOQ_PQ_THREADED_TESTING keepalive seam to prove keep_alive_interval_ms
+    # is applied to the client connection with the correct microsecond interval,
+    # and that the appended field is ABI-safe (a short struct_size never reads
+    # it). No live handshake, no relay, no wall clock.
+    add_executable(test_threaded_keepalive tests/test_threaded_keepalive.c)
+    target_link_libraries(test_threaded_keepalive PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_threaded_keepalive PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    add_test(NAME threaded_keepalive COMMAND test_threaded_keepalive)
+
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
     add_test(NAME adapter_threaded_consumer

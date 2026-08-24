@@ -21,6 +21,17 @@ extern "C" {
 #endif
 
 #define FAKE_EP_MAX_OPS    128
+
+/*
+ * The recorder is bounded twice over: it holds FAKE_EP_MAX_OPS operations and
+ * clamps each payload to one record's byte array. Both losses are announced
+ * through the sticky flags below, because silently they are indistinguishable
+ * from an endpoint that was never called and from a peer that sent fewer
+ * bytes -- so a fixture asserting an exact operation set or exact bytes could
+ * pass on evidence that was thrown away. Sticky: once set they stay set, so a
+ * later well-sized operation cannot mask an earlier loss.
+ */
+#define FAKE_EP_HAS_LOSS_FLAGS 1
 #define FAKE_EP_MAX_DATA   4096
 
 typedef enum {
@@ -47,6 +58,10 @@ typedef struct {
     fake_op_t ops[FAKE_EP_MAX_OPS];
     size_t    count;
 
+    /* sticky loss evidence; cleared only by initialization */
+    bool      overflowed;   /* an operation was not recorded */
+    bool      truncated;    /* a payload was clamped */
+
     uint64_t  next_uni_id;
     uint64_t  next_bidi_id;
 
@@ -72,7 +87,9 @@ static moq_transport_result_t fake_open_uni(void *ctx, uint64_t *out)
     if (ep->block_open_uni) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     uint64_t id = ep->next_uni_id++;
     *out = id;
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_OPEN_UNI;
@@ -87,7 +104,9 @@ static moq_transport_result_t fake_open_bidi(void *ctx, uint64_t *out)
     if (ep->block_open_bidi) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
     uint64_t id = ep->next_bidi_id++;
     *out = id;
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_OPEN_BIDI;
@@ -103,13 +122,19 @@ static moq_transport_result_t fake_write(void *ctx, uint64_t stream_id,
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->fail_write) return MOQ_TRANSPORT_ERROR;
     if (ep->block_write) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_WRITE;
         o->stream_id = stream_id;
         o->fin = fin;
-        size_t copy = len < sizeof(o->data) ? len : sizeof(o->data);
+        size_t copy = len;
+        if (copy > sizeof(o->data)) {
+            copy = sizeof(o->data);
+            ep->truncated = true;
+        }
         if (data && copy > 0) memcpy(o->data, data, copy);
         o->data_len = copy;
     }
@@ -121,7 +146,9 @@ static moq_transport_result_t fake_reset(void *ctx, uint64_t stream_id,
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->block_reset) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_RESET;
@@ -137,7 +164,9 @@ static moq_transport_result_t fake_stop(void *ctx, uint64_t stream_id,
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->fail_stop) return MOQ_TRANSPORT_ERROR;
     if (ep->block_stop) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_STOP;
@@ -152,11 +181,17 @@ static moq_transport_result_t fake_datagram(void *ctx,
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->drop_datagram) return MOQ_TRANSPORT_DROPPED;
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_DATAGRAM;
-        size_t copy = len < sizeof(o->data) ? len : sizeof(o->data);
+        size_t copy = len;
+        if (copy > sizeof(o->data)) {
+            copy = sizeof(o->data);
+            ep->truncated = true;
+        }
         if (data && copy > 0) memcpy(o->data, data, copy);
         o->data_len = copy;
     }
@@ -169,12 +204,18 @@ static moq_transport_result_t fake_close(void *ctx, uint64_t code,
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->block_close) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_CLOSE;
         o->error_code = code;
-        size_t copy = reason_len < sizeof(o->data) ? reason_len : sizeof(o->data);
+        size_t copy = reason_len;
+        if (copy > sizeof(o->data)) {
+            copy = sizeof(o->data);
+            ep->truncated = true;
+        }
         if (reason && copy > 0) memcpy(o->data, reason, copy);
         o->data_len = copy;
     }
@@ -186,7 +227,9 @@ static moq_transport_result_t fake_abort(void *ctx, uint64_t stream_id,
 {
     fake_endpoint_t *ep = (fake_endpoint_t *)ctx;
     if (ep->block_abort) { ep->block_count++; return MOQ_TRANSPORT_WOULD_BLOCK; }
-    if (ep->count < FAKE_EP_MAX_OPS) {
+    if (ep->count >= FAKE_EP_MAX_OPS) {
+        ep->overflowed = true;
+    } else {
         fake_op_t *o = &ep->ops[ep->count++];
         memset(o, 0, sizeof(*o));
         o->kind = FAKE_OP_ABORT;
@@ -222,6 +265,10 @@ static inline void fake_endpoint_enable_abort(fake_endpoint_t *ep)
     ep->vtable.abort_stream = fake_abort;
 }
 
+/* Clears the recorded operations only. The sticky loss flags deliberately
+ * survive: a fixture that clears between phases must not thereby lose the
+ * evidence that an earlier phase dropped something. Initialization clears
+ * them, since it starts a new endpoint. */
 static void fake_endpoint_clear_ops(fake_endpoint_t *ep)
 {
     ep->count = 0;

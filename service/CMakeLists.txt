@@ -243,6 +243,68 @@ if(MOQ_BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_resolve COMMAND test_endpoint_resolve)
 
+    # Handshake-bound propagation (picoquic only): prove the resolved value
+    # reaches the QUIC context through the real connect path. endpoint.c is
+    # recompiled with the picoquic setter renamed to a recorder the test
+    # defines, so the seam exists only in this binary -- the shipping library
+    # never sees it. Own object set for exactly that reason.
+    if(MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED)
+        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c)
+        target_include_directories(moq-service-hs-test-internals
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(moq-service-hs-test-internals
+            PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+        target_compile_definitions(moq-service-hs-test-internals PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS}
+            picoquic_set_default_handshake_timeout=moq_test_set_default_handshake_timeout)
+        target_compile_features(moq-service-hs-test-internals PUBLIC c_std_11)
+
+        add_executable(test_endpoint_handshake_timeout
+            tests/test_endpoint_handshake_timeout.c)
+        target_link_libraries(test_endpoint_handshake_timeout PRIVATE
+            moq-service-hs-test-internals moq::core Threads::Threads)
+        target_compile_definitions(test_endpoint_handshake_timeout PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_endpoint_handshake_timeout PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_handshake_timeout
+                 COMMAND test_endpoint_handshake_timeout)
+    endif()
+
+    # Service picoquic keepalive default (Vojtech idle-publisher report): prove
+    # the endpoint's raw-threaded client carries keep_alive_interval_ms = 15000
+    # into moq_pq_threaded_create(). endpoint.c is recompiled with the adapter
+    # create renamed to a recorder the test defines, so the seam exists only in
+    # this binary -- the shipping library never sees it. Own object set for
+    # exactly that reason.
+    if(MOQ_BUILD_PQ_THREADED)
+        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c)
+        target_include_directories(moq-service-ka-test-internals
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(moq-service-ka-test-internals
+            PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+        target_compile_definitions(moq-service-ka-test-internals PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS}
+            moq_pq_threaded_create=moq_test_pq_threaded_create)
+        target_compile_features(moq-service-ka-test-internals PUBLIC c_std_11)
+
+        add_executable(test_endpoint_keepalive_default
+            tests/test_endpoint_keepalive_default.c)
+        target_link_libraries(test_endpoint_keepalive_default PRIVATE
+            moq-service-ka-test-internals moq::core Threads::Threads
+            ${_MOQ_SERVICE_FACADE_LIBS})
+        target_compile_definitions(test_endpoint_keepalive_default PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_endpoint_keepalive_default PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_keepalive_default
+                 COMMAND test_endpoint_keepalive_default)
+    endif()
+
     # White-box post() NULL-session contract test (no network, no msf): endpoint.c
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
@@ -291,6 +353,19 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_catalog_update PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
+
+        # Publication-race RED (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
+        # try-lock phase oracle for the effective-catalog publication vs the
+        # public content-protection lookup, plus a TSan stress companion.
+        add_executable(test_media_catalog_publication_race
+            tests/test_media_catalog_publication_race.c)
+        target_link_libraries(test_media_catalog_publication_race PRIVATE
+            moq-service-receiver-test-internals moq::core moq::msf
+            Threads::Threads)
+        target_include_directories(test_media_catalog_publication_race PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_catalog_publication_race
+            COMMAND test_media_catalog_publication_race)
 
         # Scripted-peer facade test (no network): drive the REAL
         # receiver_hook with a simpair client session and inject crafted moqx
@@ -417,6 +492,18 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_lifecycle
             COMMAND test_media_sender_lifecycle)
+        # Pacing attribution: one production sender_hook == one drain pass,
+        # driven against a real SimPair subscriber. Deterministic pump units.
+        add_executable(test_media_sender_pacing
+            tests/test_media_sender_pacing.c)
+        target_link_libraries(test_media_sender_pacing PRIVATE
+            moq-service-sender-test-internals moq::core moq::msf
+            moq::sim Threads::Threads)
+        target_include_directories(test_media_sender_pacing PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_sender_pacing
+            COMMAND test_media_sender_pacing)
+
         add_executable(test_media_sender_reject
             tests/test_media_sender_reject.c)
         target_link_libraries(test_media_sender_reject PRIVATE

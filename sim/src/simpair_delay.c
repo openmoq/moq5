@@ -562,10 +562,17 @@ moq_result_t deliver_or_delay_data_stop(
 }
 
 moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
-                                       size_t *delivered)
+                                       size_t *delivered,
+                                       size_t *to_server)
 {
     while (sp->delay_head && sp->delay_head->due_us <= sp->now_us) {
         sim_delay_entry_t *e = sp->delay_head;
+        /* Read the target BEFORE the entry is freed on any path below; a
+         * stale-dropped entry still counts as handled toward its direction,
+         * mirroring the combined counter's semantics. */
+        if (to_server && e->to == MOQ_PERSPECTIVE_SERVER) {
+            (*to_server)++;
+        }
         sp->delay_head = e->next;
 
         moq_session_t *target =

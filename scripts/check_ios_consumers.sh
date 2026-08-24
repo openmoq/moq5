@@ -3,11 +3,14 @@
 # check_ios_consumers.sh - build-only iOS consumer link checks.
 #
 # Proves an app importing MoQService compiles AND LINKS against the
-# locally built xcframeworks for BOTH iOS slices, using SimplePlayer as
-# the consumer (it compiles the full backend-selection mapping,
-# including .wtquicNetwork, so a stale LibMoQ.xcframework whose headers
-# predate a backend fails here). No simulator boot, no device, no
-# network -- link checks only.
+# locally built xcframeworks for BOTH iOS slices, using SimplePlayerXcode
+# as the consumer -- the env-free iOS/Xcode consumer that depends on the
+# MoQServiceApple wrapper package (NOT the root MOQ5 env-gated lane), so
+# this check runs with NO MOQ_SERVICE* environment, exactly as Xcode
+# resolves it. It reuses SimplePlayer's sources, so it compiles the full
+# backend-selection mapping, including .wtquicNetwork; a stale
+# LibMoQ.xcframework whose headers predate a backend fails here. No
+# simulator boot, no device, no network -- link checks only.
 #
 # Prerequisites (built locally first):
 #   scripts/build_ios_openssl.sh          (both slices)
@@ -19,7 +22,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
-player="$repo_root/bindings/swift/Examples/SimplePlayer"
+player="$repo_root/bindings/swift/Examples/SimplePlayerXcode"
 
 log() { printf '[check_ios_consumers] %s\n' "$*" >&2; }
 die() { printf '[check_ios_consumers] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -48,9 +51,13 @@ build_for() {
     # incremental output has produced false results before).
     local scratch="$repo_root/build-ios/consumer-$name"
     rm -rf "$scratch"
-    log "[$name] SimplePlayer build ($triple; scratch $scratch)"
+    log "[$name] SimplePlayerXcode build ($triple; scratch $scratch; no env)"
+    # Explicitly UNSET MOQ_SERVICE* so a stray shell env can never mask an
+    # accidental reintroduction of the root MOQ5 dependency: the MoQServiceApple
+    # wrapper vends MoQService unconditionally, which is the whole point of the
+    # iOS/Xcode lane, and this check is load-bearing on that.
     (cd "$player" && \
-     MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build \
+     env -u MOQ_SERVICE -u MOQ_SERVICE_IOS -u MOQ_TRANSPORT swift build \
         --scratch-path "$scratch" \
         --triple "$triple" \
         --sdk "$(xcrun --sdk "$sdk" --show-sdk-path)" >&2)

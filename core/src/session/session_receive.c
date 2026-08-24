@@ -18,6 +18,7 @@ static int rx_find_free(moq_session_t *s)
 static void rx_free_entry(moq_session_t *s, size_t slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
+    rx_occ_unlink(s, slot);
     moq_index_remove(s->idx_rx_by_ref, s->idx_rx_mask, rx->stream_ref._v);
     if (rx->payload_rcbuf) {
         /* An object assembled but not yet emitted: the payload lives inside
@@ -53,6 +54,8 @@ static void rx_free_entry(moq_session_t *s, size_t slot)
         rx->pending_chunk = NULL;
     }
     memset(rx, 0, sizeof(*rx));
+    rx->occ_next = -1;     /* the memset zeroed these; -1 is "unlinked" */
+    rx->occ_prev = -1;
 }
 
 /* An IDENTIFIABLE (post-header, publication- or subscription-bound) data
@@ -156,10 +159,24 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
     session_stop_scan_entries++;
 #endif
     for (;;) {
-        for (; s->sweep_rx_pos < s->rx_cap; s->sweep_rx_pos++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_rx_rescan_passes++;
+#endif
+        /* Walks the rx OCCUPANCY list: the scan's cost follows the live
+         * streams, not `rx_cap`. `nxt` is captured before rx_try_stop(), which
+         * frees the entry and unlinks it (that unlink also advances this
+         * cursor, hence the conditional advance). */
+        while (s->sweep_rx_pos < s->rx_cap) {
             size_t i = s->sweep_rx_pos;
+            int32_t nxt = s->rx_streams[i].occ_next;
+#define RX_SCAN_ADVANCE()                                                     \
+    do { if (s->sweep_rx_pos == i)                                            \
+             s->sweep_rx_pos = (nxt >= 0) ? (size_t)nxt : s->rx_cap; } while (0)
             moq_rx_stream_t *rx = &s->rx_streams[i];
-            if (!rx->active) continue;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            session_work_rx_probes++;
+#endif
+            if (!rx->active) { RX_SCAN_ADVANCE(); continue; }
             bool match = false;
             if (moq_subscription_is_valid(sub) &&
                 moq_subscription_is_valid(rx->sub) &&
@@ -169,21 +186,26 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                 moq_publication_is_valid(rx->pub_handle) &&
                 moq_publication_eq(rx->pub_handle, pub))
                 match = true;
-            if (!match) continue;
+            if (!match) { RX_SCAN_ADVANCE(); continue; }
 
             if (budget) {
                 if (*budget == 0) return MOQ_SESSION_SUSPENDED;
                 (*budget)--;
             }
             s->sweep_rx_found = true;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            session_work_rx_charged++;
+#endif
             moq_result_t rc = rx_try_stop(s, (int)i);
             if (rc < 0) return rc;
+            RX_SCAN_ADVANCE();
         }
+#undef RX_SCAN_ADVANCE
         /* A completed scan that stopped nothing means no bound stream remains.
          * Otherwise rescan from zero: stopping frees entries, so the pool must
          * settle to a clean pass before the owner may finalize. */
         bool found = s->sweep_rx_found;
-        s->sweep_rx_pos = 0;
+        s->sweep_rx_pos = moq_occ_first(s->rx_occ_head, s->rx_cap);
         s->sweep_rx_found = false;
         if (!found) return MOQ_OK;
     }
@@ -211,6 +233,54 @@ static bool rx_is_finished(moq_session_t *s, uint64_t ref_v)
  * returned WITHOUT recording/freeing. The retry (a re-driven FIN delivery)
  * re-enters here and re-attempts only the SUBGROUP_FINISHED push -- never any
  * prior object/chunk, whose ownership has already transferred. */
+/*
+ * Emit SUBGROUP_RESET for an abnormally terminated subgroup stream. Mirrors
+ * rx_finish_stream(): same binding/resolution guard, same parking discipline
+ * when the event queue is full. The caller frees the entry on MOQ_OK.
+ */
+static moq_result_t rx_drive_reset(moq_session_t *s, int slot);
+
+static moq_result_t rx_emit_subgroup_reset(moq_session_t *s, int slot,
+                                           uint64_t error_code)
+{
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+
+    bool bound = moq_subscription_is_valid(rx->sub) !=
+                 moq_publication_is_valid(rx->pub_handle);
+    /* Same guard as the clean-FIN path: a FIRST_OBJECT-mode header whose
+     * stream never carried an object holds only the decoder's default (0),
+     * not a real subgroup ID -- reporting it would let a relay seal subgroup
+     * 0 by mistake. */
+    if (rx->stream_kind != MOQ_STREAM_KIND_SUBGROUP || !bound ||
+        !rx->subgroup_id_resolved)
+        return MOQ_OK;
+
+    if (event_queue_full(s)) {
+        rx->reset_error_code = error_code;
+        rx->parse_state = MOQ_RX_PENDING_RESET;
+        return MOQ_ERR_WOULD_BLOCK;
+    }
+
+    moq_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.kind = MOQ_EVENT_SUBGROUP_RESET;
+    e.detail_size = (uint32_t)sizeof(moq_subgroup_reset_event_t);
+    e.borrow_epoch = s->borrow_epoch;
+    e.u.subgroup_reset.sub = rx->sub;
+    e.u.subgroup_reset.pub = rx->pub_handle;
+    e.u.subgroup_reset.group_id = rx->group_id;
+    e.u.subgroup_reset.subgroup_id = rx->subgroup_id;
+    e.u.subgroup_reset.error_code = error_code;
+    e.u.subgroup_reset.end_of_group = rx->end_of_group;
+    moq_result_t rc = push_event(s, &e);
+    if (rc < 0) {
+        rx->reset_error_code = error_code;
+        rx->parse_state = MOQ_RX_PENDING_RESET;
+        return rc;
+    }
+    return MOQ_OK;
+}
+
 static moq_result_t rx_finish_stream(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
@@ -352,11 +422,18 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
     e.u.object_chunk.begin = rx->pending_begin;
     e.u.object_chunk.end = rx->pending_end;
     e.u.object_chunk.terminal = rx->pending_terminal;
+    /* Routing identity rides EVERY chunk: a consumer multiplexing concurrent
+     * subgroups needs it on continuations and terminals, not only on begin. */
+    e.u.object_chunk.group_id = rx->group_id;
+    e.u.object_chunk.subgroup_id = rx->subgroup_id;
+    e.u.object_chunk.object_id = rx->cur_object_id;
+    /* The cause is meaningful only for an abnormal terminal; zero otherwise. */
+    e.u.object_chunk.error_code =
+        (rx->pending_terminal == MOQ_OBJECT_TERMINAL_RESET)
+            ? rx->pending_reset_code
+            : 0;
 
     if (rx->pending_begin) {
-        e.u.object_chunk.group_id = rx->group_id;
-        e.u.object_chunk.subgroup_id = rx->subgroup_id;
-        e.u.object_chunk.object_id = rx->cur_object_id;
         e.u.object_chunk.publisher_priority = rx->publisher_priority;
         e.u.object_chunk.status = rx->cur_status;
         e.u.object_chunk.end_of_group = rx->end_of_group;
@@ -675,6 +752,10 @@ static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref
     }
     moq_rx_stream_t *rx = &s->rx_streams[slot];
     memset(rx, 0, sizeof(*rx));
+    rx->occ_next = -1;
+    rx->occ_prev = -1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    rx_occ_link(s, (size_t)slot);
     rx->active = true;
     rx->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
     rx->stream_ref = stream_ref;
@@ -753,11 +834,21 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
         }
     }
 
+    /* A parked subgroup terminal is owed: every drive route retries it,
+     * including a generic delivery that carries no new bytes. */
+    if (rx->parse_state == MOQ_RX_PENDING_RESET)
+        return rx_drive_reset(s, slot);
+
     if (rx->parse_state == MOQ_RX_PENDING_EMIT) {
         moq_result_t erc = rx_emit_object(s, slot);
         if (erc < 0) return erc;
         if (!s->rx_streams[slot].active) return MOQ_OK;
         rx = &s->rx_streams[slot];
+        /* The parked object is delivered; if a RESET was observed while it
+         * waited, that obligation is still owed and must be completed here
+         * rather than resuming ordinary parsing. */
+        if (rx->reset_owed)
+            return rx_drive_reset(s, slot);
     }
 
     if (rx->parse_state == MOQ_RX_PENDING_CHUNK) {
@@ -793,6 +884,19 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
              * input_cap stays charged to recv_input_bytes until the stream
              * is freed. */
             rx->input_len = remaining;
+        }
+
+        /* A RESET observed earlier is still owed: resuming ordinary parsing
+         * here would strand the obligation. Normalize the just-drained chunk's
+         * state FIRST -- it has been emitted, so the stream is either between
+         * objects (its end shipped) or mid-object -- and only then hand to the
+         * single driver. Handing over while the state still reads
+         * PENDING_CHUNK would make the driver push the same chunk again and
+         * enqueue a spurious empty continuation. */
+        if (rx->reset_owed && !was_terminal) {
+            rx->parse_state = was_end ? MOQ_RX_AWAITING_OBJECT
+                                      : MOQ_RX_STREAMING_PAYLOAD;
+            return rx_drive_reset(s, slot);
         }
 
         if (was_end) {
@@ -1555,8 +1659,14 @@ void session_retry_resumed_deferred(moq_session_t *s)
 
 void session_discard_deferred_streams(moq_session_t *s)
 {
-    for (size_t i = 0; i < s->rx_cap; i++) {
+    /* Walks the rx OCCUPANCY list: only active streams can be deferred, and the
+     * successor is captured before the free that unlinks the entry. */
+    for (int32_t i = s->rx_occ_head, nxt; i >= 0; i = nxt) {
         moq_rx_stream_t *rx = &s->rx_streams[i];
+        nxt = rx->occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_deferred_rx_probes++;
+#endif
         if (!rx->active || rx->parse_state != MOQ_RX_DEFERRED_ALIAS)
             continue;
         /* Best-effort STOP_DATA. If the action queue is full, rx_try_stop
@@ -1579,7 +1689,110 @@ moq_result_t handle_data_bytes_rcbuf(moq_session_t *s,
     return handle_data_bytes_impl(s, stream_ref, data, len, fin, input_rcbuf);
 }
 
+/*
+ * Complete the RESET obligation recorded on this stream. Every route that can
+ * observe the reset -- a repeated on_data_reset, or the generic pending-chunk
+ * path of on_data_bytes -- funnels here, so the terminal is emitted exactly
+ * once with the ORIGINAL cause however the drive arrives.
+ *
+ * The two surfaces do not overlap, and the split is by VISIBILITY, not by
+ * whether the parser has an object open: when a streaming object is in flight
+ * AND its object events are surfaced, the closure is that object's
+ * OBJECT_CHUNK(RESET). Otherwise no visible object terminal can carry it --
+ * whole-object mode, a stream between objects or past its last one, or an
+ * object suppressed by Forward State 0 -- so a bound subgroup with a resolved
+ * ID reports SUBGROUP_RESET instead. A subgroup whose identity was never
+ * resolved (FIRST_OBJECT header, no object) reports neither, rather than
+ * fabricating subgroup 0.
+ */
+static moq_result_t rx_drive_reset(moq_session_t *s, int slot)
+{
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+    const uint64_t code = rx->reset_error_code;
+
+    /* A parked subgroup-level terminal: retry that emit, nothing else. */
+    if (rx->parse_state == MOQ_RX_PENDING_RESET) {
+        moq_result_t prc = rx_emit_subgroup_reset(s, slot, code);
+        if (prc < 0) return prc;
+        rx_record_reset_processed(s, slot);
+        rx_free_entry(s, (size_t)slot);
+        return MOQ_OK;
+    }
+
+    /* A COMPLETE whole-object payload already parsed off the wire, whose
+     * OBJECT_RECEIVED was refused, is not a partial the reset may discard: it
+     * predates the reset and keeps its place in the event order. Emit it
+     * first, then the subgroup terminal. A refusal here retains the
+     * obligation, so the next drive resumes at this same point. */
+    if (!s->streaming_objects && rx->parse_state == MOQ_RX_PENDING_EMIT) {
+        moq_result_t oc = rx_emit_object(s, slot);
+        if (oc < 0) return oc;
+        if (!s->rx_streams[slot].active) return MOQ_OK;
+        rx = &s->rx_streams[slot];
+    }
+
+    bool mid_object = s->streaming_objects &&
+                      (rx->parse_state == MOQ_RX_STREAMING_PAYLOAD ||
+                       rx->parse_state == MOQ_RX_PENDING_CHUNK);
+
+    if (mid_object && rx->parse_state == MOQ_RX_PENDING_CHUNK &&
+        rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL) {
+        /* An already-pending NORMAL chunk is owed to the receiver first. A
+         * refusal here keeps the obligation (captured by the caller) so the
+         * next drive resumes at this same point. */
+        bool was_final = rx->pending_end;
+        moq_result_t rc = rx_push_pending_chunk(s, slot);
+        if (rc < 0) return rc;
+        rx = &s->rx_streams[slot];
+        rx->pending_begin = false;
+        rx->pending_end = false;
+        rx->pending_data_len = 0;
+        /* That chunk completed the object: no object remains in flight, so the
+         * terminal below is the subgroup-level one, not a second chunk. */
+        if (was_final) mid_object = false;
+    }
+
+    if (mid_object) {
+        /* Arm the object's terminal chunk with the retained cause. A
+         * suppressed object (Forward State 0 at its admission) consumes that
+         * terminal WITHOUT surfacing it, so it cannot be the closure: the
+         * subgroup -- already visible to the application from an earlier
+         * object -- still needs exactly one signal, and falls through to the
+         * subgroup terminal below. The resolved/bound guard there decides,
+         * not whether an object event happened to be visible. */
+        bool suppressed = rx->suppress_cur_object;
+        rx->pending_chunk = NULL;
+        rx->pending_begin = false;
+        rx->pending_end = true;
+        rx->pending_terminal = MOQ_OBJECT_TERMINAL_RESET;
+        rx->pending_reset_code = code;
+        rx->pending_data_len = 0;
+        rx->parse_state = MOQ_RX_PENDING_CHUNK;
+
+        moq_result_t rc = rx_push_pending_chunk(s, slot);
+        if (rc < 0) return rc;
+        if (suppressed) {
+            rx = &s->rx_streams[slot];
+            moq_result_t erc = rx_emit_subgroup_reset(s, slot, code);
+            if (erc < 0) return erc;
+        }
+    } else {
+        /* No object in flight (whole-object mode, an idle streaming subgroup,
+         * or a streaming object that just completed): the closure is the
+         * subgroup terminal, emitted only for a resolved, bound subgroup. */
+        moq_result_t erc = rx_emit_subgroup_reset(s, slot, code);
+        if (erc < 0) return erc;
+    }
+
+    /* Counted only now: a refused terminal returned above and the retry
+     * re-enters, so the count lands exactly once at the successful teardown. */
+    rx_record_reset_processed(s, slot);
+    rx_free_entry(s, (size_t)slot);
+    return MOQ_OK;
+}
+
 moq_result_t handle_data_reset(moq_session_t *s,
+                                uint64_t error_code,
                                 moq_stream_ref_t stream_ref)
 {
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1589,48 +1802,13 @@ moq_result_t handle_data_reset(moq_session_t *s,
 
     moq_rx_stream_t *rx = &s->rx_streams[slot];
 
-    if (!s->streaming_objects ||
-        (rx->parse_state != MOQ_RX_STREAMING_PAYLOAD &&
-         rx->parse_state != MOQ_RX_PENDING_CHUNK)) {
-        rx_record_reset_processed(s, slot);
-        rx_free_entry(s, (size_t)slot);
-        return MOQ_OK;
+    /* Capture the obligation BEFORE anything that can block: a refused flush
+     * below must not lose the fact that a RESET is owed, nor its cause. The
+     * FIRST peer code wins -- a later re-drive retries the stored obligation
+     * and never overwrites it. */
+    if (!rx->reset_owed) {
+        rx->reset_owed = true;
+        rx->reset_error_code = error_code;
     }
-
-    /* Streaming mid-object: push any pending payload chunk first,
-     * then emit terminal RESET — unless the pending chunk already
-     * completes the object normally (end=true). */
-    if (rx->parse_state == MOQ_RX_PENDING_CHUNK &&
-        rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL) {
-        bool was_final = rx->pending_end;
-        moq_result_t rc = rx_push_pending_chunk(s, slot);
-        if (rc < 0) return rc;
-        rx = &s->rx_streams[slot];
-        rx->pending_begin = false;
-        rx->pending_end = false;
-        rx->pending_data_len = 0;
-        if (was_final) {
-            rx_record_reset_processed(s, slot);
-            rx_free_entry(s, (size_t)slot);
-            return MOQ_OK;
-        }
-    }
-
-    /* Emit terminal RESET event. */
-    rx->pending_chunk = NULL;
-    rx->pending_begin = false;
-    rx->pending_end = true;
-    rx->pending_terminal = MOQ_OBJECT_TERMINAL_RESET;
-    rx->pending_data_len = 0;
-    rx->parse_state = MOQ_RX_PENDING_CHUNK;
-
-    moq_result_t rc = rx_push_pending_chunk(s, slot);
-    if (rc < 0) return rc;
-
-    /* Counted only now: a WOULD_BLOCK'd terminal-RESET event returned above
-     * and the retry re-enters, so the count lands exactly once at the
-     * successful teardown. */
-    rx_record_reset_processed(s, slot);
-    rx_free_entry(s, (size_t)slot);
-    return MOQ_OK;
+    return rx_drive_reset(s, slot);
 }

@@ -38,6 +38,15 @@ int main(void)
     if (ecs.wt_profile != (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT)
         return 1;
 
+    /* The handshake bound, the next appended tail field, reached the same way:
+     * the sized init defaults it to 0 (leave the backend's own value), and a
+     * caller can set a real microsecond bound. */
+    if (ecs.handshake_timeout_us != 0)
+        return 1;
+    ecs.handshake_timeout_us = 5000000ull;
+    if (ecs.handshake_timeout_us != 5000000ull)
+        return 1;
+
     /* Receiver cfg (live preset): forces an overflow policy, stamps struct_size. */
     moq_media_receiver_cfg_t rcfg;
     moq_media_receiver_cfg_init_live(&rcfg);

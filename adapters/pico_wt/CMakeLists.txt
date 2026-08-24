@@ -830,6 +830,43 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # WT_ALPN_ERROR wire obligation (draft-ietf-webtrans-http3-15 3.3):
+        # the server echoes no WT-Protocol on a successful CONNECT and the
+        # client requires exact draft-18, so the client must close the
+        # WebTransport session with 0x0817b3dd. The oracle is the SERVER's
+        # observed peer close code -- it proves A close with that code, not
+        # exact multiplicity (the bridge stops counting once terminal); the
+        # lab JS oracle owns exact multiplicity.
+        add_test(NAME pico_wt_managed_alpn_close_18
+            COMMAND test_pico_wt_managed_loopback --mode alpn_close_18
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_alpn_close_18 PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Callback-ownership lifecycle: the WT control stream's context must be
+        # the ADAPTER (so adapter teardown can clear it) and must be CLEARED
+        # after detach. Recompiles the managed + adapter sources to reach the
+        # private MOQ_PICO_WT_TESTING seam; nothing is exported.
+        add_executable(test_pico_wt_ownership
+            tests/test_pico_wt_ownership.c
+            pico_wt_managed.c
+            pico_wt_adapter.c
+            pico_wt_endpoint.c
+            ../common/moq_pq_send_queue.c
+        )
+        target_compile_definitions(test_pico_wt_ownership PRIVATE MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_ownership PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_pico_wt_ownership PRIVATE moq::adapter-pico-wt-managed)
+        add_test(NAME pico_wt_ownership
+            COMMAND test_pico_wt_ownership
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_ownership PROPERTIES
+            TIMEOUT 60 LABELS "network;pico_wt;managed")
+
         # WT protocol-token negotiation through the managed pair: the
         # d16-only server selects from the client's {18, 16} offer, and a
         # no-overlap offer is a deterministic refusal.

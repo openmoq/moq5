@@ -25,6 +25,16 @@ int main()
     moq_endpoint_cfg_init_sized(&ec, sizeof(ec));
     if (ec.struct_size != sizeof(moq_endpoint_cfg_t))
         return 1;
+    /* The appended tail fields are reachable from C++ through the same public
+     * headers: both default to their zero value (no selection / the backend's
+     * own handshake value) and both are assignable. */
+    if (ec.wt_profile != static_cast<uint32_t>(MOQ_WT_PROFILE_BACKEND_DEFAULT))
+        return 1;
+    if (ec.handshake_timeout_us != 0)
+        return 1;
+    ec.handshake_timeout_us = 5000000ull;
+    if (ec.handshake_timeout_us != 5000000ull)
+        return 1;
 
     moq_media_receiver_cfg_t rcfg;
     moq_media_receiver_cfg_init_live(&rcfg);

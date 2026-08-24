@@ -24,6 +24,18 @@ private let testAVCC = Data([
 /* AudioSpecificConfig: AAC-LC, 44.1 kHz, stereo. */
 private let testASC = Data([0x12, 0x10])
 
+/* AudioSpecificConfig: AAC-LC, 32 kHz, MONO. Distinct from both testASC
+ * (44.1 kHz stereo) and the 48000/2 CoreMedia defaults in BOTH fields, so a
+ * derivation that ignored the ASC (or hardcoded a rate/channel count) is
+ * caught by the rate AND the channel assertions. Bits: AOT=2 (00010),
+ * samplingFrequencyIndex=5 (0101 = 32000), channelConfiguration=1 (0001). */
+private let derivedASC = Data([0x12, 0x88])
+
+/* AudioSpecificConfig with channelConfiguration=0 (program config element):
+ * the channel count is not a simple field and must be rejected, not guessed.
+ * Bits: AOT=2, samplingFrequencyIndex=4 (44100), channelConfiguration=0. */
+private let pceASC = Data([0x12, 0x00])
+
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 private func videoDescription(
     codec: String = "avc1.64001f",
@@ -108,6 +120,115 @@ struct FormatDescriptionTests {
         #expect(cookie.first == 0x03)                 // ES_Descriptor tag
         #expect(cookie.contains(0x05))                // DecoderSpecificInfo tag
         #expect(cookie.suffix(testASC.count) == testASC)  // embeds the ASC
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("AAC derives samplerate and channels from the ASC when the catalog omits them")
+    func aacDerivesFromASCWhenMetadataMissing() throws {
+        // A moqtail-style catalog: valid AAC ASC in codecConfig, but no
+        // samplerate and no channelConfig. Both MSF fields are derivable from
+        // the ASC, so a description must still build.
+        var description = TrackDescription(
+            name: "audio", mediaType: .audio, packaging: .raw)
+        description.codec = "mp4a.40.2"
+        description.codecConfig = derivedASC   // 32 kHz mono
+        description.samplerate = nil
+        description.channelConfig = nil
+
+        let format = try description.makeFormatDescription()
+        #expect(CMFormatDescriptionGetMediaType(format) == kCMMediaType_Audio)
+        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)
+        // Derived from the ASC, NOT the 48000/2 CoreMedia defaults or testASC.
+        #expect(asbd?.pointee.mSampleRate == 32_000)
+        #expect(asbd?.pointee.mChannelsPerFrame == 1)
+        #expect(asbd?.pointee.mFormatID == kAudioFormatMPEG4AAC)
+
+        // The cookie must still be the esds-wrapped ASC, byte-for-byte.
+        var cookieSize = 0
+        let cookiePtr = CMAudioFormatDescriptionGetMagicCookie(
+            format, sizeOut: &cookieSize)
+        let cookie = try #require(cookiePtr).withMemoryRebound(
+            to: UInt8.self, capacity: cookieSize) {
+            Data(bytes: $0, count: cookieSize)
+        }
+        #expect(cookie.first == 0x03)
+        #expect(cookie.contains(0x05))
+        #expect(cookie.suffix(derivedASC.count) == derivedASC)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("AAC explicit catalog samplerate/channels win over the ASC")
+    func aacExplicitMetadataOverridesASC() throws {
+        // Explicit metadata is present and DIFFERS from what the ASC encodes
+        // (testASC = 44.1 kHz stereo); the explicit values must be used, so
+        // derivation is a fallback for missing fields only.
+        var description = TrackDescription(
+            name: "audio", mediaType: .audio, packaging: .raw)
+        description.codec = "mp4a.40.2"
+        description.codecConfig = testASC       // 44.1 kHz stereo
+        description.samplerate = 48_000
+        description.channelConfig = "1"
+
+        let format = try description.makeFormatDescription()
+        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)
+        #expect(asbd?.pointee.mSampleRate == 48_000)   // explicit, not 44100
+        #expect(asbd?.pointee.mChannelsPerFrame == 1)   // explicit, not 2
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("AAC derives only the missing field, keeping explicit metadata")
+    func aacDerivesOnlyMissingField() throws {
+        // samplerate omitted (derive 44100 from testASC), channelConfig
+        // explicit ("1"). The derived rate must appear WITHOUT the derivation
+        // overwriting the explicit channel count.
+        var description = TrackDescription(
+            name: "audio", mediaType: .audio, packaging: .raw)
+        description.codec = "mp4a.40.2"
+        description.codecConfig = testASC       // 44.1 kHz stereo
+        description.samplerate = nil
+        description.channelConfig = "1"
+
+        let format = try description.makeFormatDescription()
+        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)
+        #expect(asbd?.pointee.mSampleRate == 44_100)   // derived from ASC
+        #expect(asbd?.pointee.mChannelsPerFrame == 1)   // explicit, not 2
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("AAC rejects an ASC shape whose channel count it cannot derive")
+    func aacRejectsUnsupportedASCShape() {
+        // channelConfiguration=0 is a program config element: the channel
+        // count is not a simple field, so with no explicit channelConfig the
+        // helper must refuse rather than guess.
+        var description = TrackDescription(
+            name: "audio", mediaType: .audio, packaging: .raw)
+        description.codec = "mp4a.40.2"
+        description.codecConfig = pceASC
+        description.samplerate = nil
+        description.channelConfig = nil
+        #expect(throws: MoQServiceError.self) {
+            _ = try description.makeFormatDescription()
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("AAC derives only the missing field, tolerating an ASC piece the explicit field covers")
+    func aacDerivesMissingFieldDespiteUnsupportedOtherField() throws {
+        // channelConfig is explicit ("1"), samplerate is missing. The ASC is a
+        // program-config-element shape (channelConfiguration == 0) that cannot
+        // yield a channel count -- but that field is supplied explicitly, so it
+        // must NOT block deriving the sample rate. pceASC encodes 44.1 kHz.
+        var description = TrackDescription(
+            name: "audio", mediaType: .audio, packaging: .raw)
+        description.codec = "mp4a.40.2"
+        description.codecConfig = pceASC
+        description.samplerate = nil
+        description.channelConfig = "1"
+
+        let format = try description.makeFormatDescription()
+        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)
+        #expect(asbd?.pointee.mSampleRate == 44_100)   // derived, PCE not fatal
+        #expect(asbd?.pointee.mChannelsPerFrame == 1)   // explicit
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)

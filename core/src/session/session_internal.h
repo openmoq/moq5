@@ -23,6 +23,7 @@
 #define MOQ_DEFAULT_MAX_OBJ_PAYLOAD  (4u * 1024 * 1024)
 #define MOQ_DEFAULT_MAX_RECV_BUF (16u * 1024 * 1024)
 #define MOQ_DEFAULT_MAX_NS_SUBS 16
+#define MOQ_DEFAULT_MAX_NS_SUFFIXES 4096
 /* Slot count for the pre-SUBSCRIBE_OK datagram reordering buffer (held bytes
  * are separately bounded by the receive-buffer budget).
  *
@@ -259,6 +260,17 @@ typedef struct moq_sub_entry {
     uint64_t           dt_upd_object_ms;
     bool               dt_upd_has_subgroup;
     uint64_t           dt_upd_subgroup_ms;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_sub_entry_t;
 
 typedef enum moq_ann_state {
@@ -295,6 +307,13 @@ typedef struct moq_ann_entry {
     size_t             req_recv_cap;
     size_t             req_recv_len;
     bool               req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * PUBLISH_NAMESPACE carried the peer's FIN, and the commit that re-keyed
+     * the bidi onto this entry took that FIN over with it. The announcement
+     * handler consumes it into req_recv_fin and retains the owner -- the
+     * application still has to accept or reject -- so it never survives the
+     * call that installed it. Cleared on every free/reuse. */
+    bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -424,6 +443,13 @@ typedef struct moq_fetch_entry {
     size_t             req_recv_cap;
     size_t             req_recv_len;
     bool               req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * FETCH carried the peer's FIN, and the commit that re-keyed the bidi onto
+     * this entry took that FIN over with it. Both publisher-role states consume
+     * it synchronously into req_recv_fin and retain the owner -- the response
+     * and any data stream are still to come -- so it never survives the call
+     * that installed it. Cleared on every free/reuse. */
+    bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -439,6 +465,17 @@ typedef struct moq_fetch_entry {
     moq_resolved_token_t join_tokens[MOQ_DECODED_MAX_TOKENS];
     bool                 join_token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t               join_token_count;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_fetch_entry_t;
 
 typedef enum moq_pub_state {
@@ -496,6 +533,13 @@ typedef struct moq_pub_entry {
     size_t             req_recv_cap;
     size_t             req_recv_len;
     bool               req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * PUBLISH carried the peer's FIN, and the commit that re-keyed the bidi
+     * onto this entry took that FIN over with it. It is consumed by this
+     * family's own FIN handling; a teardown that blocks on event capacity
+     * keeps it, so an empty re-feed resumes and completes exactly once.
+     * Cleared on every free/reuse. */
+    bool               handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -551,6 +595,17 @@ typedef struct moq_pub_entry {
      * filter (and re-resolved on REQUEST_UPDATE snapshots) against this
      * side's registry largest. */
     moq_resolved_window_t window;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_pub_entry_t;
 
 typedef enum moq_ts_state {
@@ -586,6 +641,12 @@ typedef struct moq_ts_entry {
     size_t                      req_recv_cap;
     size_t                      req_recv_len;
     bool                        req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * TRACK_STATUS carried the peer's FIN, and the commit that re-keyed the
+     * bidi onto this entry took that FIN over with it. The publisher-side FIN
+     * handling consumes it into req_recv_fin, retaining the owner.
+     * Cleared on every free/reuse. */
+    bool                        handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -825,6 +886,17 @@ typedef struct moq_sg_entry {
     uint64_t               streaming_bytes_written;
     uint64_t               delivery_deadline_us;
     bool                   has_extensions;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_sg_entry_t;
 
 /* -- Auth token cache ---------------------------------------------- */
@@ -905,6 +977,16 @@ typedef struct moq_auth_txn {
 
 #define MOQ_DECODED_MAX_TOKENS 16
 
+/* -- No-slot admission carrier (#245b) ------------------------------- *
+ * The minimal durable record of a no-slot request-bidi terminal owed but not
+ * yet emittable for local resource pressure. The terminal is fixed and
+ * content-independent, so only the stream identity and the observed FIN fact
+ * are retained -- never the peer's request bytes. */
+typedef struct moq_noslot_carrier {
+    uint64_t stream_ref;   /* 0 == free slot */
+    bool     fin;          /* the peer's send half already FIN'd */
+} moq_noslot_carrier_t;
+
 /* -- Namespace sub entry (publisher side, one per bidi stream) ------- */
 
 typedef struct moq_ns_sub_entry {
@@ -929,6 +1011,21 @@ typedef struct moq_ns_sub_entry {
     bool                got_response;
     bool                parse_complete;
     bool                pending_fin;
+    /* Transitional FIN ownership, distinct from pending_fin: the creating
+     * SUBSCRIBE_TRACKS-style handoff -- here the draft-18 SUBSCRIBE_NAMESPACE
+     * request-stream commit -- carried the peer's FIN, and the commit that
+     * moved the bidi into this entry took that FIN over with it. The reciprocal
+     * close it drives reserves an action slot, so the fact stays here across a
+     * refusal and an empty re-feed completes it. This pool's free is SELECTIVE,
+     * so it is cleared there by name. */
+    bool                handoff_fin_pending;
+    /* A publisher-side extra-byte teardown was attempted and refused for
+     * capacity. Draft-18 §10.9.1 makes such a teardown close the request bidi,
+     * not buffer the bytes, so the obligation -- not the raw bytes -- is what
+     * must survive: this durable marker re-drives ns_sub_local_teardown on the
+     * documented empty re-feed, with no peer-byte redelivery. Cleared in the
+     * selective free (#245c). */
+    bool                local_teardown_pending;
     bool                closing_remote_error;
     bool                forward;
     bool                auth_processed;
@@ -950,6 +1047,14 @@ typedef struct moq_ns_sub_entry {
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
+    bool suffix_cap_terminating;  /* the per-subscription active-suffix cap was
+                                   * exceeded: the offending bidi is being retired
+                                   * by synthesizing NAMESPACE_GONE for the active
+                                   * suffixes (the tree is the durable cursor). Set
+                                   * before the first GONE so an event/action-
+                                   * capacity block resumes the terminal on the
+                                   * next empty re-feed instead of re-decoding the
+                                   * over-cap NAMESPACE. Cleared on slot free. */
 } moq_ns_sub_entry_t;
 
 void ns_sub_destroy_all(moq_session_t *s);
@@ -1006,6 +1111,14 @@ typedef struct moq_track_sub_entry {
     size_t                  req_recv_cap;
     size_t                  req_recv_len;
     bool                    req_recv_fin;
+    /* Transitional FIN ownership, distinct from req_recv_fin: the creating
+     * SUBSCRIBE_TRACKS carried the peer's FIN, and the commit that re-keyed the
+     * bidi onto this entry took that FIN over with it. Unlike the track-status,
+     * fetch and announcement families, THIS consumer can block -- the
+     * cancellation reserves event capacity -- so the fact stays here across the
+     * refusal and an empty re-feed completes it. Cleared by the whole-record
+     * reset on free/reuse. */
+    bool                    handoff_fin_pending;
     bool goaway_sent;   /* a per-request GOAWAY was emitted on this request
                          * bidi; the entry stays live until the peer tears the
                          * old stream down (FIN/RESET/STOP) or the timeout fires. */
@@ -1148,10 +1261,22 @@ typedef enum moq_rx_parse_state {
      * pending_fin set; rx_finish_stream is retried on the next drive until the
      * event is queued, then the entry is recorded-finished and freed. */
     MOQ_RX_PENDING_FINISHED = 8,
+    /* A subgroup-level closure is owed for a bound, resolved subgroup -- the
+     * reset had no application-visible object terminal to carry it (whole-object
+     * mode, a streaming stream idle between objects or past its last one, an
+     * object suppressed by Forward State 0, or after a final NORMAL chunk
+     * drained) -- but the SUBGROUP_RESET event could not be queued (event queue
+     * full). The stream stays live with reset_error_code retained; the emit is
+     * retried on the next drive, by any route, until it lands, then the entry
+     * is freed. */
+    MOQ_RX_PENDING_RESET    = 9,
 } moq_rx_parse_state_t;
 
 typedef struct moq_rx_stream {
     bool                   active;
+    /* RESET_STREAM code retained while a SUBGROUP_RESET emit is parked, so a
+     * re-drive cannot overwrite or lose the code the peer actually sent. */
+    uint64_t               reset_error_code;
     /* Frozen per-object suppression decision (Forward State 0 prohibits
      * Objects): stamped ONCE at object-header admission and retained
      * through all chunks, retries, FIN and terminal RESET, so a Forward
@@ -1213,6 +1338,27 @@ typedef struct moq_rx_stream {
     bool                   pending_end;
     bool                   pending_from_input;
     moq_object_terminal_t  pending_terminal;
+    /* The peer's RESET_STREAM code owed to the pending terminal chunk, copied
+     * from the retained obligation below when the terminal is armed. */
+    uint64_t               pending_reset_code;
+    /* A peer RESET_STREAM was observed and its terminal is not yet emitted.
+     * Captured BEFORE any operation that can block, so a refused flush cannot
+     * lose the obligation, and never overwritten: the FIRST peer code is the
+     * cause, whatever a later re-drive passes. Every drive route -- repeated
+     * on_data_reset, or the generic pending-chunk path of on_data_bytes --
+     * completes this same obligation. */
+    bool                   reset_owed;
+    /*
+     * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
+     * is allocated (state != FREE / active). Every sweep that used to scan the
+     * whole pool walks this list instead, so its cost follows the live owner
+     * set rather than the configured capacity -- and because the list is kept
+     * in slot order, owners are still served in exactly the order the full
+     * scan served them, so no externally visible ordering changes.
+     */
+    int32_t occ_next;    /* next linked slot, -1 = end */
+    int32_t occ_prev;    /* previous linked slot, -1 = head */
+    bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
 } moq_rx_stream_t;
 
 /* A datagram that arrived for an alias not yet established by a SUBSCRIBE_OK;
@@ -1226,6 +1372,40 @@ typedef struct moq_staged_datagram {
     uint8_t  *bytes;
     size_t    len;
 } moq_staged_datagram_t;
+
+/* -- Peer FIN on a request bidi ------------------------------------ *
+ * The peer has closed its send half when the durable latch records a wire FIN,
+ * or when a same-call FIN handed over with the request still sits on the
+ * destination owner as transitional ownership. A terminal that would reserve a
+ * drain ref to absorb the peer's remaining send half must consult this, not
+ * req_recv_fin alone: a FIN already observed leaves nothing to drain, and a
+ * full drain ring must not block a terminal the peer has already finished. */
+static inline bool pub_peer_fin_observed(const moq_pub_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool ts_peer_fin_observed(const moq_ts_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool fetch_peer_fin_observed(const moq_fetch_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool ann_peer_fin_observed(const moq_ann_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+static inline bool track_sub_peer_fin_observed(const moq_track_sub_entry_t *e) {
+    return e->req_recv_fin || e->handoff_fin_pending;
+}
+/* The namespace-sub family's durable latch is `pending_fin`, and its handler
+ * also sees the wire FIN of the current call, so the unified fact takes all
+ * three. */
+static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
+    return fin || e->pending_fin || e->handoff_fin_pending;
+}
+
+/* No-slot admission carriers (#245b). */
+int  noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref);
+bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin);
+void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref);
 
 /* -- Request registry ---------------------------------------------- */
 
@@ -1338,6 +1518,17 @@ struct moq_session {
     moq_sub_entry_t *subs;
     size_t           sub_cap;
 
+    /*
+     * Heads of the five intrusive occupancy lists (see the per-entry fields).
+     * -1 means empty; they are initialized explicitly because the session slab
+     * is zero-filled and slot 0 is a valid member.
+     */
+    int32_t          pub_occ_head;
+    int32_t          sub_occ_head;
+    int32_t          sg_occ_head;
+    int32_t          rx_occ_head;
+    int32_t          fetch_occ_head;
+
     moq_ann_entry_t *announcements;
     size_t           ann_cap;
 
@@ -1426,6 +1617,20 @@ struct moq_session {
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
+    /* No-slot admission carriers (#245b). A draft-18 request bidi that arrives
+     * with the subscription pool full owes a fixed, content-independent
+     * terminal (pre-setup STOP+RESET, post-setup REQUEST_ERROR+FIN). When drain/
+     * action/send capacity cannot admit that terminal yet, the OPERATION -- not
+     * the peer bytes -- is retained here: just the stream ref and the observed
+     * FIN fact, so the documented empty re-feed re-drives the terminal with no
+     * peer-byte redelivery, and moq_session_has_transport_stream() reports the
+     * stream live so the bridge retains rather than fatalizes. Arena-backed in
+     * the session slab at create time (installation cannot allocation-fail); cap
+     * is bounded by the total request-owner/drain lifecycle capacity. */
+    moq_noslot_carrier_t *noslot_carriers;
+    size_t           noslot_carrier_cap;
+    size_t           noslot_carrier_count;
+
     uint64_t            goaway_timeout_us;
     uint64_t            goaway_deadline_us;
     uint64_t            subgroup_deadline_us;
@@ -1505,6 +1710,10 @@ struct moq_session {
 
     moq_ns_sub_entry_t *ns_subs;
     size_t              ns_sub_cap;
+    /* Per-subscription active peer-announced suffix cap (cfg-resolved, default
+     * MOQ_DEFAULT_MAX_NS_SUFFIXES). Bounds the inbound suffix tree of one
+     * SUBSCRIBE_NAMESPACE independently of the session-wide receive budget. */
+    size_t              max_ns_suffixes;
     moq_index_entry_t  *idx_ns_by_ref;
     size_t              idx_ns_mask;
 
@@ -1769,7 +1978,7 @@ moq_result_t session_core_emit_request_redirect(
     bool can_retry, uint64_t retry_after_ms,
     const uint8_t *reason, size_t reason_len);
 
-void sg_free_entry(size_t slot, moq_sg_entry_t *entries);
+void sg_free_entry(moq_session_t *s, size_t slot);
 bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget);
 
 /* -- Inbound data reordering buffer (data before SUBSCRIBE_OK) ------ *
@@ -2120,8 +2329,20 @@ typedef struct moq_decoded_publish_namespace {
     uint64_t         auth_reject_code; /* non-zero: message-level token reject */
 } moq_decoded_publish_namespace_t;
 
+/* `request_fin_observed` says the request bidi's FIN has been observed for the
+ * buffered request now being dispatched -- on this transport call, or on an
+ * earlier one whose refusal the generic staging owner retained in its
+ * `req_recv_fin` latch (`handle_request_stream_bytes()` passes that latch, not
+ * the raw call FIN, so an empty re-feed still carries the fact). Draft-16
+ * passes false: its control-channel route has no per-request bidi FIN.
+ *
+ * A pre-commit rejection creates no destination owner and installs no
+ * `handoff_fin_pending` marker; staging's latch is its whole retry carrier. The
+ * fact suppresses the drain reference and nothing else -- wire output and
+ * staging retirement still follow stream correlation. */
 moq_result_t session_core_on_publish_namespace(moq_session_t *s,
-                                                moq_decoded_publish_namespace_t *d);
+                                                moq_decoded_publish_namespace_t *d,
+                                                bool request_fin_observed);
 
 /* Dispatch bytes arriving on an established PUBLISH_NAMESPACE request bidi
  * (stream-correlated profiles), role-keyed: the announcer side parses the
@@ -2501,8 +2722,11 @@ typedef struct moq_decoded_publish_done {
 
 /* -- Publish handlers (session_publish.c) ----------------------------- */
 
+/* `request_fin_observed` carries the same fact as the announcement handler
+ * above, on the same terms. */
 moq_result_t session_core_on_publish(moq_session_t *s,
-                                      moq_decoded_publish_t *d);
+                                      moq_decoded_publish_t *d,
+                                      bool request_fin_observed);
 moq_result_t session_core_on_publish_ok(moq_session_t *s,
                                          const moq_decoded_publish_ok_t *d);
 /* Surface a PUBLISH error (REQUEST_ERROR rejecting our outbound PUBLISH).
@@ -2516,6 +2740,32 @@ moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
 
 int pub_resolve_handle(moq_session_t *s, moq_publication_t h);
 int pub_find_free(moq_session_t *s);
+
+/*
+ * Occupancy-list maintenance. A slot must be linked exactly when it becomes
+ * allocated and unlinked exactly when it is freed; the sweeps then walk the
+ * list instead of the pool. `*_occ_unlink` also advances any live sweep cursor
+ * that is parked on the slot being removed, so a suspended sweep resumes at
+ * the successor rather than following a stale link.
+ */
+/* First slot of an occupancy list, or `cap` when the list is empty. Every
+ * scan cursor that used to start at slot 0 starts here instead. */
+static inline size_t moq_occ_first(int32_t head, size_t cap)
+{
+    return head >= 0 ? (size_t)head : cap;
+}
+
+void pub_occ_link(moq_session_t *s, size_t slot);
+void pub_occ_unlink(moq_session_t *s, size_t slot);
+void sub_occ_link(moq_session_t *s, size_t slot);
+void sub_occ_unlink(moq_session_t *s, size_t slot);
+void sg_occ_link(moq_session_t *s, size_t slot);
+void sg_occ_unlink(moq_session_t *s, size_t slot);
+void rx_occ_link(moq_session_t *s, size_t slot);
+void rx_occ_unlink(moq_session_t *s, size_t slot);
+void fetch_occ_link(moq_session_t *s, size_t slot);
+void fetch_occ_unlink(moq_session_t *s, size_t slot);
+
 void pub_free_entry(moq_session_t *s, int slot);
 /* Alias resolution for subscriber-role publications, independent of Forward
  * State (streams bind/count regardless; prohibited objects are dropped at
@@ -2556,6 +2806,79 @@ void sub_note_stream_processed(moq_session_t *s, moq_subscription_t sub);
  * bound to the handle; MOQ_OK = none remain, WOULD_BLOCK = action-blocked. */
 #ifdef MOQ_SESSION_SWEEP_TESTING
 extern uint64_t session_stop_scan_entries;
+
+/*
+ * Exact-work probe counters for the advancing-call preamble.
+ *
+ * OBSERVATIONAL ONLY: each is a plain increment at one loop-body entry or one
+ * charged transition; none participates in any control decision, so removing
+ * them cannot change behaviour. Compiled solely into moq-core-test-internals,
+ * exactly like session_stop_scan_entries above.
+ *
+ * A PROBE is one visit to a candidate owner slot -- the unit that scales with
+ * configured pool capacity when a scan is capacity-bounded rather than
+ * ownership-bounded. A CHARGED transition is work performed on an owner that
+ * actually had work. They are counted separately, and each stage keeps its own
+ * counter, so a scan moving from one stage to another cannot hide inside an
+ * aggregate.
+ *
+ * Tests assert DELTAS around one declared advancing call: several tests in one
+ * binary accumulate into them.
+ */
+extern uint64_t session_work_sg_reap_probes;    /* subgroup slots visited, terminal reap */
+extern uint64_t session_work_sg_reap_charged;   /* subgroups actually reaped */
+extern uint64_t session_work_sg_deadline_probes;/* subgroup slots visited, deadline recompute */
+extern uint64_t session_work_pub_reap_probes;   /* publication slots visited, deferred-done reap */
+extern uint64_t session_work_pub_reap_pending;  /* publication owners found with deferred work */
+extern uint64_t session_work_sub_reap_probes;   /* subscription slots visited, deferred-done reap */
+extern uint64_t session_work_sub_reap_pending;  /* subscription owners found with deferred work */
+extern uint64_t session_work_retry_sub_probes;  /* subscription slots visited, retry-deadline recompute */
+extern uint64_t session_work_retry_pub_probes;  /* publication slots visited, retry-deadline recompute */
+extern uint64_t session_work_rx_probes;         /* rx slots visited, bound-stream scan */
+
+/*
+ * The remaining configured-capacity scans transitively reachable from
+ * session_advance_sweep(). Each is a distinct named site: a cleanup scan must
+ * never fold into the bound-stream counter, or a correction that moved work
+ * from one into the other would cancel in an aggregate.
+ */
+extern uint64_t session_work_close_sg_probes;   /* subgroup slots, close_with_error */
+extern uint64_t session_work_close_rx_probes;   /* rx slots, free_rx_stream_bufs */
+extern uint64_t session_work_fwd_pending_probes;/* subscription slots, session_has_forwarding_pending_subscriber */
+extern uint64_t session_work_deferred_rx_probes;/* rx slots, session_discard_deferred_streams */
+extern uint64_t session_work_join_probes;       /* fetch slots, session_core_discard_pending_joins */
+extern uint64_t session_work_join_resolve_probes; /* fetch slots, session_core_pending_joins_can_resolve */
+extern uint64_t session_work_join_reject_probes;  /* fetch slots, session_core_reject_pending_joins */
+extern uint64_t session_work_staged_probes;     /* staged-datagram slots, staged_clear_unresolved */
+
+/*
+ * NON-CAPACITY loops in the same reachable set: one counter per LOOP SITE, the
+ * same rule the capacity scans follow. Each is bounded by live occupancy, by a
+ * caller-supplied count, or by the live index population -- never by a
+ * configured pool size -- so they are excluded from the capacity-invariance
+ * comparator and carry an absolute declared model instead.
+ */
+extern uint64_t session_work_queued_action;      /* queued actions visited, close-time decref */
+extern uint64_t session_work_queued_event;       /* queued events visited, close-time decref */
+extern uint64_t session_work_tomb_probes;        /* live fetch-cancel tombstones scanned */
+extern uint64_t session_work_auth_staging;       /* auth staging slots freed (argument-bounded) */
+extern uint64_t session_work_index_find;         /* moq_index_find probe steps */
+extern uint64_t session_work_index_find_calls;   /* moq_index_find invocations */
+extern uint64_t session_work_index_rm_calls;     /* moq_index_remove invocations */
+extern uint64_t session_work_index_rm_search;    /* moq_index_remove search steps */
+extern uint64_t session_work_index_rm_backshift; /* moq_index_remove backshift steps */
+
+/*
+ * CONTROL loops: bounded by active work, not by capacity and not by occupancy.
+ * Counted so the image can claim completeness without describing them.
+ */
+extern uint64_t session_work_catchup_passes;     /* session_advance_sweep catch-up iterations */
+extern uint64_t session_work_rx_rescan_passes;   /* bound-stream scan rescan passes */
+/* One charged bound-stream terminal transition: the unit the sweep budget
+ * spends, taken immediately before the STOP attempt. It counts the ATTEMPT, so
+ * a stop that action capacity refuses is still one charged transition -- which
+ * is what the budget itself charges. */
+extern uint64_t session_work_rx_charged;
 #endif
 moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                                                   moq_subscription_t sub,
@@ -2652,12 +2975,20 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot);
 
 /* Surface MOQ_EVENT_REQUEST_GOAWAY for a request migrated by a request-stream
  * GOAWAY (§10.4): free the request entry, close our send half if still open, and
- * strict-drain the bidi. Leaves data streams alone (graceful migration). The
- * caller resolves family+slot from the bidi's stream ref. */
+ * -- unless the peer's FIN has already been observed -- strict-drain the bidi.
+ * Leaves data streams alone (graceful migration). The caller resolves
+ * family+slot from the bidi's stream ref.
+ *
+ * `peer_fin_observed` is the owner's cumulative fact, not a raw per-call flag:
+ * the draft-18 dispatchers receive it from the owner's durable FIN latch, and
+ * the namespace-subscription route passes `pending_fin`. Once the peer has
+ * closed its send half nothing can arrive late, so the strict reference has
+ * nothing to absorb and is not reserved -- output and retirement are
+ * unaffected. */
 moq_result_t session_core_on_request_goaway(
     moq_session_t *s, moq_request_family_t family, int slot,
     moq_stream_ref_t ref, const uint8_t *uri, size_t uri_len,
-    uint64_t timeout_ms);
+    uint64_t timeout_ms, bool peer_fin_observed);
 
 /* Outbound per-request GOAWAY (§10.4): the shared sender behind the seven typed
  * public wrappers. Enforces the family×state eligibility matrix, draft-16
@@ -2680,12 +3011,15 @@ moq_result_t session_core_send_request_goaway(
 bool request_goaway_free_on_teardown(moq_session_t *s, moq_stream_ref_t ref);
 bool request_goaway_already_sent(moq_session_t *s, moq_stream_ref_t ref);
 
-/* Retire a request migrated by a per-request GOAWAY (sent or received): strict-
- * drain the request bidi (FIN/RESET/STOP retire it; a duplicate GOAWAY or stray
- * non-empty bytes close 0x3) and free/tombstone the entry, leaving data streams
- * intact. The caller has reserved the drain-ref slot. */
+/* Retire a request migrated by a per-request GOAWAY (sent or received): when
+ * `need_drain`, strict-drain the request bidi (FIN/RESET/STOP retire it; a
+ * duplicate GOAWAY or stray non-empty bytes close 0x3); either way free or
+ * tombstone the entry, leaving data streams intact. The caller decides
+ * `need_drain` -- an already-observed peer FIN leaves nothing to absorb -- and
+ * has reserved the drain-ref slot when it is true. Retirement itself is
+ * unconditional. */
 void request_goaway_retire(moq_session_t *s, moq_request_family_t family,
-                           int slot, moq_stream_ref_t ref);
+                           int slot, moq_stream_ref_t ref, bool need_drain);
 
 /* -- Shared namespace-prefix helpers (ns_sub + track_sub) ------------ *
  * Two namespace prefixes overlap when one is a prefix of the other (an empty
@@ -2895,6 +3229,7 @@ moq_result_t handle_data_bytes_rcbuf(moq_session_t *s,
                                       moq_rcbuf_t *input_rcbuf,
                                       bool fin);
 moq_result_t handle_data_reset(moq_session_t *s,
+                                uint64_t error_code,
                                 moq_stream_ref_t stream_ref);
 
 /* -- Namespace-sub handlers (session_namespace_sub.c) --------------- */

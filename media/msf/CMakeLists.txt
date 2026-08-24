@@ -67,4 +67,13 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_msf_media PRIVATE moq::msf)
         add_test(NAME msf_media COMMAND test_msf_media)
     endif()
+
+    # Structural O(n) proof for apply_delta identity lookups: recompile msf.c
+    # with MOQ_MSF_TESTING so the test-only compare counter is present (it is
+    # absent from the shipped moq-msf library, which never defines the macro).
+    add_executable(test_msf_scaling tests/test_msf_scaling.c src/msf.c)
+    target_compile_definitions(test_msf_scaling PRIVATE MOQ_MSF_TESTING MOQ_BUILDING)
+    target_include_directories(test_msf_scaling PRIVATE include)
+    target_link_libraries(test_msf_scaling PRIVATE moq::core)
+    add_test(NAME msf_scaling COMMAND test_msf_scaling)
 endif()

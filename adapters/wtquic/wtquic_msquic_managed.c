@@ -310,6 +310,28 @@ void moq_wtquic_msquic_managed_test_fire_hook(void *conn)
 }
 #endif
 
+/* The ESTABLISHMENT/DEFERRED close chokepoint -- not every close in the
+ * file: the two quiescence closes remain direct by deliberate scope. Both
+ * the establishment-failure close and the deferred close route through
+ * here, so a test can observe either without duplicating conditionals at
+ * each site. In a production build (no
+ * MOQ_WTQ_MM_TESTING) this compiles to exactly one
+ * `wtq_session_close(s, code, NULL, 0)` call and nothing else. Order matters:
+ * an installed observer runs BEFORE the fake-handle/release-seam skip, so an
+ * establishment close is observable under the fake transport. */
+static void mm_close_session(wtq_session_t *s, uint32_t code)
+{
+#if defined(MOQ_WTQ_MM_TESTING)
+    if (g_mm_test_close != NULL) {
+        g_mm_test_close(s, code);
+        return;
+    }
+    if (g_mm_test_release != NULL)
+        return;   /* sentinel handle from the fake transport: nothing to close */
+#endif
+    (void)wtq_session_close(s, code, NULL, 0);
+}
+
 /* --- internal structures -------------------------------------------------- */
 
 struct moq_wtquic_msquic_managed_lane {
@@ -823,19 +845,24 @@ static void mm_hook(moq_wtquic_conn_t *conn, void *user)
 /* An establishment failure before the adapter exists: mark the child terminal
  * and close the transport. Facade-fatal for a CLIENT; child-local for a server
  * (the server outlives one bad child). */
+/* draft-ietf-webtrans-http3-15 3.3 registry: WebTransport session aborted
+ * because application protocol negotiation failed. A WebTransport WIRE code --
+ * never a MoQ close/fatal code. */
+#define MOQ_WT_ALPN_ERROR 0x0817b3ddu
+
+/* `close_code` is chosen BY THE CALL SITE, because this helper is shared by
+ * classes that owe different codes: a negotiation rejection owes
+ * WT_ALPN_ERROR, while session/adapter construction failures keep their
+ * existing code 0 (unchanged behaviour, not a positive spec contract). */
 static void mm_establish_fail(moq_wtquic_msquic_managed_t *m,
                               moq_wtquic_msquic_managed_conn_t *c,
-                              wtq_session_t *s)
+                              wtq_session_t *s,
+                              uint32_t close_code)
 {
     mm_mark_logical_terminal(c);
     if (m->perspective == MOQ_PERSPECTIVE_CLIENT)
         mm_latch_fatal(m, 0);
-#if defined(MOQ_WTQ_MM_TESTING)
-    /* a fake-transport session (driven through the establishment seam) is not a
-     * real handle; the installed release seam marks that case */
-    if (g_mm_test_release == NULL)
-#endif
-        (void)wtq_session_close(s, 0, NULL, 0);
+    mm_close_session(s, close_code);
 }
 
 static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
@@ -860,7 +887,7 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
 
     moq_version_t version = 0;
     if (!mm_negotiate(m, sub, &version)) {
-        mm_establish_fail(m, c, s);
+        mm_establish_fail(m, c, s, MOQ_WT_ALPN_ERROR);  /* negotiation rejected */
         return;
     }
 
@@ -880,7 +907,7 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
 
     moq_session_t *ms = NULL;
     if (moq_session_create(&scfg, mm_now_us(), &ms) < 0) {
-        mm_establish_fail(m, c, s);
+        mm_establish_fail(m, c, s, 0);  /* construction failure: unchanged code */
         return;
     }
 
@@ -893,7 +920,7 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
     moq_wtquic_conn_t *mc = NULL;
     if (moq_wtquic_conn_create(&ccfg, &mc) < 0) {
         moq_session_destroy(ms);
-        mm_establish_fail(m, c, s);
+        mm_establish_fail(m, c, s, 0);  /* construction failure: unchanged code */
         return;
     }
 
@@ -1587,14 +1614,7 @@ static int mm_pump_lane(moq_wtquic_msquic_managed_t *m,
         }
         if (c->ws == NULL || c->session == NULL)
             continue; /* not established yet — retain for a later pump */
-#if defined(MOQ_WTQ_MM_TESTING)
-        if (g_mm_test_close != NULL)
-            g_mm_test_close(c->ws, c->close_pending_code);
-        else if (g_mm_test_release == NULL)
-            (void)wtq_session_close(c->ws, c->close_pending_code, NULL, 0);
-#else
-        (void)wtq_session_close(c->ws, c->close_pending_code, NULL, 0);
-#endif
+        mm_close_session(c->ws, c->close_pending_code);
         c->close_pending = false;
     }
 

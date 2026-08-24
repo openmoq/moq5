@@ -1,3 +1,4 @@
+#include <type_traits>
 #include <moq/moq.hpp>
 #include "test_support.hpp"
 
@@ -619,6 +620,29 @@ int main()
 
     // -- 15. request_error enum static asserts --------------------------
     {
+        /*
+         * The enum's representation must span the whole protocol domain: a
+         * narrowed underlying type silently aliases a wide code onto a
+         * registered one, which is the defect this arc exists to remove.
+         *
+         * These are RUNTIME checks on purpose. As static_asserts they would
+         * make a narrowed-enum mutant fail to BUILD, and a failed build is
+         * void evidence under this project's mutant rule -- the oracle has
+         * to observe the narrowing, not refuse to compile against it. The
+         * wide source is volatile for the same reason: a literal would trip
+         * a constant-conversion diagnostic instead.
+         */
+        volatile std::uint64_t wide = UINT64_C(0x100000001);
+        const std::uint64_t wide_v = wide;
+
+        MOQ_CHECK(sizeof(moq_request_error_t) == 8);
+        MOQ_CHECK(sizeof(std::underlying_type_t<moq::request_error>) == 8);
+        MOQ_CHECK(
+            static_cast<std::uint64_t>(moq::to_c(
+                static_cast<moq::request_error>(wide_v))) == wide_v);
+        MOQ_CHECK(moq::request_error_from_c(
+                      static_cast<moq_request_error_t>(wide_v)) !=
+                  moq::request_error::unauthorized);
         static_assert(moq::to_c(moq::request_error::internal_error) ==
                       MOQ_REQUEST_ERROR_INTERNAL_ERROR);
         static_assert(moq::to_c(moq::request_error::unauthorized) ==

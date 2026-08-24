@@ -338,6 +338,53 @@ MOQ_API moq_result_t moq_msf_catalog_apply_delta(
     const moq_msf_catalog_t *delta,
     moq_msf_catalog_t *out);
 
+/*
+ * Bounds for moq_msf_catalog_apply_delta_ex, so a caller (e.g. a media
+ * receiver) can refuse an over-large delta BEFORE building the effective
+ * catalog or scanning identities. A zero field means "no limit". ABI-safe:
+ * set struct_size = sizeof and zero the rest; new trailing fields default off.
+ */
+typedef struct moq_msf_apply_limits {
+    uint32_t struct_size;
+    size_t   max_delta_ops;        /* reject if delta_update_count exceeds it */
+    size_t   max_effective_tracks; /* reject if base + adds/clones exceeds it */
+} moq_msf_apply_limits_t;
+
+/*
+ * Like moq_msf_catalog_apply_delta, but enforces `limits` before any expensive
+ * work. moq_msf_catalog_apply_delta is the unlimited convenience wrapper
+ * (limits == NULL). Identity lookups are resolved through a temporary index
+ * built over the effective tracks, so apply is O(base + delta) rather than
+ * O(n^2). limits == NULL or an all-zero struct is unlimited.
+ *
+ * Returns MOQ_ERR_PROTO when a limit is exceeded (in addition to the tuple /
+ * terminal-base violations moq_msf_catalog_apply_delta returns), and
+ * MOQ_ERR_INVAL for malformed caller-provided catalog storage.
+ */
+MOQ_API moq_result_t moq_msf_catalog_apply_delta_ex(
+    const moq_alloc_t *alloc,
+    const moq_msf_catalog_t *base,
+    const moq_msf_catalog_t *delta,
+    const moq_msf_apply_limits_t *limits,
+    moq_msf_catalog_t *out);
+
+/*
+ * Inbound semantic validation of an INDEPENDENT catalog's identity spaces,
+ * intended for a receiver to run before adopting a peer-supplied catalog. The
+ * raw parser is deliberately lenient (fuzz/raw callers); this is the strict
+ * inbound gate. Checks, in O(n) via a temporary index:
+ *   - track Namespace|Name tuples are unique (§5.2.3);
+ *   - initDataList ids are unique (§5.1.7);
+ *   - contentProtection refIDs are unique (CMSF §4.1.1.1).
+ * Returns MOQ_OK if all identity spaces are unique, MOQ_ERR_PROTO on the first
+ * duplicate, MOQ_ERR_INVAL if cat is NULL, is a delta, or has malformed
+ * caller-provided identity storage, MOQ_ERR_NOMEM on allocation failure. Does
+ * not mutate cat.
+ */
+MOQ_API moq_result_t moq_msf_catalog_validate_identities(
+    const moq_alloc_t *alloc,
+    const moq_msf_catalog_t *cat);
+
 MOQ_API const moq_msf_track_t *moq_msf_catalog_find_role(
     const moq_msf_catalog_t *cat, const char *role);
 

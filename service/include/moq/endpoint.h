@@ -207,7 +207,41 @@ typedef struct moq_endpoint_cfg {
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg), not the
      * pointer-only moq_endpoint_cfg_init(). */
     uint32_t wt_profile;
+    /* appended (enabled by struct_size): upper bound in microseconds on the
+     * TRANSPORT handshake -- how long a peer that never completes the QUIC/TLS
+     * handshake holds the endpoint in CONNECTING before it goes terminal. It
+     * does NOT bound a peer that completes the handshake and then stalls the
+     * WebTransport CONNECT or the MoQ SETUP. 0 leaves the backend's own value
+     * (30 s on picoquic). Honored by the picoquic backend on both protocols. No
+     * other service backend can apply THIS setting -- a transport-handshake-only
+     * bound -- so a NON-ZERO value there is a connect-time MOQ_ERR_UNSUPPORTED,
+     * not a silent no-op. That is a statement about this knob, not about
+     * timeouts in general: other backends have their own timeout mechanisms
+     * with different scope (the MsQuic managed facade, for one, carries a
+     * combined idle/handshake setting), and this field does not drive them.
+     *
+     * ACCEPTED RANGE. The value is a real duration, not a switch: the backend
+     * applies it as an absolute deadline (connection start + this bound), so an
+     * unbounded value would wrap that sum and produce the OPPOSITE of a long
+     * wait. The accepted values are therefore exactly:
+     *   0                                           leave the backend default
+     *   1 .. MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US  a microsecond duration
+     *   anything larger                             MOQ_ERR_INVAL
+     * The MOQ_ERR_INVAL is raised during resolution, BEFORE the backend
+     * capability check, so an out-of-range value reads as INVAL on every
+     * backend rather than UNSUPPORTED on some. There is NO "infinite" sentinel
+     * and nothing is silently clamped -- use 0 to leave the backend's own
+     * value. Because it is past
+     * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
+     * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    uint64_t handshake_timeout_us;
 } moq_endpoint_cfg_t;
+
+/* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).
+ * A practical no-limit ceiling -- roughly 292,000 years -- chosen so a backend
+ * can add the duration to its absolute microsecond clock without the unsigned
+ * sum wrapping. A larger value is MOQ_ERR_INVAL, never a clamp. */
+#define MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US ((uint64_t)INT64_MAX)
 
 /* Frozen v0 config floor: the smallest cfg struct_size connect()/resolve accept.
  * The required prefix runs through `alloc` (url, protocol, backend, versions,
@@ -223,16 +257,18 @@ typedef struct moq_endpoint_cfg {
  * clears and stamps ONLY the frozen v0 prefix (MOQ_ENDPOINT_CFG_V0_SIZE) and
  * leaves every appended tail field untouched. A config produced this way runs
  * with the tail ABSENT (struct_size stops at the v0 floor), which resolves to
- * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile -- no explicit selection.
- * Because it never writes past the v0 floor, it can NEVER overflow the buffer of
- * an old caller that predates a later tail field. To SET any tail field, use
+ * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection) and to 0
+ * (the backend default) for handshake_timeout_us. Because it never writes past
+ * the v0 floor, it can NEVER overflow the buffer of an old caller that predates
+ * a later tail field. To SET any tail field, use
  * moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
 
 /* Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the
- * initializer to use whenever you set anything beyond the v0 floor (wt_profile).
- * Pass sizeof(moq_endpoint_cfg_t). Never writes past cfg_size, so it is safe for
- * a caller compiled against an older, smaller header too. */
+ * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
+ * handshake_timeout_us). Pass sizeof(moq_endpoint_cfg_t). Never writes past
+ * cfg_size, so it is safe for a caller compiled against an older, smaller
+ * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,
                                          size_t cfg_size);
 

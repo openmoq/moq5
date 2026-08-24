@@ -162,6 +162,12 @@ struct moq_msquic_conn {
     bool close_clean;
     uint64_t close_code;
     bool shutdown_complete;        /* conn SHUTDOWN_COMPLETE observed */
+#ifdef MOQ_MSQUIC_TESTING
+    /* Number of close feeds that crossed conn_feed_close's pending/fed guard.
+     * Tests use this to distinguish one committed bridge call from a boolean
+     * that merely says at least one feed was attempted. */
+    uint32_t test_close_feed_commits;
+#endif
 
     moq_transport_endpoint_ops_t ops;
 };
@@ -189,6 +195,12 @@ bool moq_msq_conn_has_events(const moq_msquic_conn_t *conn);
 
 #ifdef MOQ_MSQUIC_TESTING
 /* White-box seams for the unit tests (never shipped). */
+/* One clock source shared by the attach adapter and managed facade. Tests
+ * install it before constructing either object and clear it only after every
+ * worker has stopped, so session deadlines and doorbell attribution advance
+ * from the same deterministic time. NULL preserves the production clock. */
+extern uint64_t (*moq_msq_test_now_us)(void);
+
 const moq_transport_endpoint_ops_t *moq_msquic_test_ops(
     moq_msquic_conn_t *conn);
 void moq_msquic_test_flush(moq_msquic_conn_t *conn);

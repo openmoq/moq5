@@ -57,12 +57,41 @@ target_link_libraries(test_session_sweep PRIVATE moq-core-test-internals)
 target_compile_definitions(test_session_sweep PRIVATE MOQ_SESSION_SWEEP_TESTING)
 add_test(NAME session_sweep COMMAND test_session_sweep)
 
+add_executable(test_session_occupancy unit/test_session_occupancy.c)
+target_link_libraries(test_session_occupancy PRIVATE moq-core-test-internals)
+add_test(NAME session_occupancy COMMAND test_session_occupancy)
+
+# Exact-work oracle: advancing-preamble work must scale with the active/ready
+# owner set, not with configured pool capacity.
+add_executable(test_session_exact_work unit/test_session_exact_work.c)
+target_link_libraries(test_session_exact_work PRIVATE moq-core-test-internals)
+target_compile_definitions(test_session_exact_work PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME session_exact_work COMMAND test_session_exact_work)
+
+# Same fixture with ONLY the complexity family compiled out. It proves the
+# probe counters are observational: every lifecycle/output/model control still
+# passes while the capacity defect is simply no longer reported.
+add_executable(test_session_exact_work_controls unit/test_session_exact_work.c)
+target_link_libraries(test_session_exact_work_controls PRIVATE moq-core-test-internals)
+target_compile_definitions(test_session_exact_work_controls PRIVATE
+    MOQ_SESSION_SWEEP_TESTING EXACT_WORK_NO_COMPLEXITY)
+add_test(NAME session_exact_work_controls COMMAND test_session_exact_work_controls)
+
 add_executable(test_transport_bridge unit/test_transport_bridge.c)
 target_link_libraries(test_transport_bridge PRIVATE moq-core-test-internals)
 target_compile_definitions(test_transport_bridge PRIVATE MOQ_SESSION_SWEEP_TESTING)
 target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
+
+# Fake-endpoint fidelity: every recorded-operation capacity loss and every
+# byte-bearing truncation is observable and sticky, so a fixture cannot
+# assert an exact operation set or exact bytes on evidence that was dropped.
+add_executable(test_fake_endpoint_fidelity unit/test_fake_endpoint_fidelity.c)
+target_link_libraries(test_fake_endpoint_fidelity PRIVATE moq-core-test-internals)
+target_include_directories(test_fake_endpoint_fidelity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME fake_endpoint_fidelity COMMAND test_fake_endpoint_fidelity)
 
 add_executable(test_bridge_conformance
     unit/test_bridge_conformance.c
@@ -146,6 +175,10 @@ add_executable(test_request_registry_streamref unit/test_request_registry_stream
 target_link_libraries(test_request_registry_streamref PRIVATE moq-core-test-internals)
 add_test(NAME request_registry_streamref COMMAND test_request_registry_streamref)
 
+add_executable(test_request_error_width unit/test_request_error_width.c)
+target_link_libraries(test_request_error_width PRIVATE moq-core-test-internals)
+add_test(NAME request_error_width COMMAND test_request_error_width)
+
 add_executable(test_action_uni_control unit/test_action_uni_control.c)
 target_link_libraries(test_action_uni_control PRIVATE moq-core-test-internals)
 add_test(NAME action_uni_control COMMAND test_action_uni_control)
@@ -189,6 +222,10 @@ add_test(NAME d18_inbound_subscribe COMMAND test_d18_inbound_subscribe)
 add_executable(test_d18_subscribe_response unit/test_d18_subscribe_response.c)
 target_link_libraries(test_d18_subscribe_response PRIVATE moq-core-test-internals)
 add_test(NAME d18_subscribe_response COMMAND test_d18_subscribe_response)
+
+add_executable(test_namespace_cardinality unit/test_namespace_cardinality.c)
+target_link_libraries(test_namespace_cardinality PRIVATE moq-core-test-internals)
+add_test(NAME namespace_cardinality COMMAND test_namespace_cardinality)
 
 add_executable(test_d18_fetch unit/test_d18_fetch.c)
 target_link_libraries(test_d18_fetch PRIVATE moq-core-test-internals)
@@ -276,6 +313,30 @@ if(TARGET moq::sim)
     add_executable(test_d18_subscribe_tracks unit/test_d18_subscribe_tracks.c)
     target_link_libraries(test_d18_subscribe_tracks PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_subscribe_tracks COMMAND test_d18_subscribe_tracks)
+
+    add_executable(test_ownership_graph unit/test_ownership_graph.c)
+    target_link_libraries(test_ownership_graph PRIVATE moq-core-test-internals)
+    add_test(NAME ownership_graph COMMAND test_ownership_graph)
+
+    add_executable(test_d18_fin_handoff unit/test_d18_fin_handoff.c)
+    target_link_libraries(test_d18_fin_handoff PRIVATE moq-core-test-internals)
+    add_test(NAME d18_fin_handoff COMMAND test_d18_fin_handoff)
+
+    add_executable(test_d18_ns_response_fin unit/test_d18_ns_response_fin.c)
+    target_link_libraries(test_d18_ns_response_fin PRIVATE moq-core-test-internals)
+    add_test(NAME d18_ns_response_fin COMMAND test_d18_ns_response_fin)
+
+    # The interop client's URL policy is header-only and private to the tool,
+    # so the test reaches it by include path and links only moq::core. The
+    # client target itself stays gated by MOQ_BUILD_INTEROP_CLIENT.
+    add_executable(test_interop_url_policy
+                   ${CMAKE_SOURCE_DIR}/tools/moq-interop-client/test_url_policy.c)
+    target_include_directories(test_interop_url_policy PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools/moq-interop-client
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+    target_link_libraries(test_interop_url_policy PRIVATE moq::core)
+    add_test(NAME interop_url_policy COMMAND test_interop_url_policy)
+    set_tests_properties(interop_url_policy PROPERTIES LABELS "interop;unit")
 
     add_executable(test_d18_publish unit/test_d18_publish.c)
     target_link_libraries(test_d18_publish PRIVATE moq-core-test-internals moq::sim)

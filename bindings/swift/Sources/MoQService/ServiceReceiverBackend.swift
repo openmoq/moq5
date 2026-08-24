@@ -212,9 +212,32 @@ final class ServiceReceiverBackend: ReceiverBackend, @unchecked Sendable {
             case MOQ_MEDIA_TRACK_REMOVED:
                 return .event(ReceiverPolledEvent(
                     kind: .removed, handleID: handleID, trackDescription: nil))
-            default:    /* MOQ_MEDIA_TRACK_ENDED */
+            case MOQ_MEDIA_TRACK_ENDED:
                 return .event(ReceiverPolledEvent(
                     kind: .ended, handleID: handleID, trackDescription: nil))
+            case MOQ_MEDIA_TRACK_PARSE_DROP:
+                let cls: ParseDropClass
+                switch event.parse_drop_class {
+                case MOQ_MEDIA_PARSE_DROP_MEDIA: cls = .media
+                case MOQ_MEDIA_PARSE_DROP_SAP: cls = .sap
+                case MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE: cls = .mediaTimeline
+                default:
+                    /* Unknown/zero future class: the class is part of the
+                     * diagnostic, so skip rather than invent .media (and never
+                     * a false .ended). */
+                    continue
+                }
+                return .event(ReceiverPolledEvent(
+                    kind: .parseDrop, handleID: handleID, trackDescription: nil,
+                    parseDropClass: cls,
+                    parseDropTotal: event.parse_drops_total,
+                    parseDropDelta: event.parse_drops_delta))
+            default:
+                /* Unknown/future kind (or one with no polled representation,
+                 * e.g. MOQ_MEDIA_TRACK_UPDATE_OK): skip it, never surface a
+                 * false .ended. Skipping unknown future events is acceptable;
+                 * falsely ending a track is not. */
+                continue
             }
         }
     }

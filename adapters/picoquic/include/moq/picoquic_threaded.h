@@ -56,8 +56,10 @@
  *   picoquic adapters and the verifier helper):
  *     pkg-config --cflags --libs libmoq
  *
- * Certificate policy: see insecure_skip_verify / configure_quic below
- *   and <moq/picoquic_verify.h>. The default is NOT production-safe.
+ * Certificate policy: a CLIENT verifies the peer certificate against the
+ *   system trust store by default (fail-closed -- _create fails if the
+ *   verifier cannot be installed). See insecure_skip_verify / configure_quic
+ *   below and <moq/picoquic_verify.h>.
  *
  * See adapters/picoquic/THREADING_DESIGN.md for the full design.
  */
@@ -91,11 +93,15 @@ typedef struct moq_pq_threaded_cfg {
     /* Network */
     moq_perspective_t  perspective;    /* CLIENT or SERVER; required */
     const char        *host;           /* client: remote host; required.
-                                          Also used as the TLS SNI and the
-                                          server name a verifier checks the
-                                          peer cert against — it must match
-                                          the certificate for verification
-                                          to pass. */
+                                          Always the remote DIAL target. It is
+                                          also the TLS SNI and the verified
+                                          server name ONLY when the appended
+                                          `sni` field is absent; an explicit
+                                          `sni` overrides it (see `sni`), so a
+                                          caller can dial an address while
+                                          verifying a DNS name. When it is the
+                                          verified name it must match the peer
+                                          certificate. */
     int                port;           /* 1..65535; required */
 
     /* Session tuning (zero/false = default).
@@ -110,20 +116,24 @@ typedef struct moq_pq_threaded_cfg {
     uint32_t           send_buffer_size;            /* default 4096 */
     uint32_t           recv_buffer_size;            /* default 4096 */
 
-    /* TLS verification.  If true, calls picoquic_set_null_verifier —
-     * suitable for demos and tests only.  Default false does NOT install
-     * any verifier; picoquic's built-in default has no CA store and
-     * accepts the peer cert, so it is NOT production-safe.  For production
-     * install a real verifier via configure_quic — the supported helper is
-     * moq_picoquic_set_cert_verifier() in <moq/picoquic_verify.h>. */
+    /* TLS verification (client).  Default false is fail-closed: a client
+     * installs the system-trust certificate verifier
+     * (moq_picoquic_set_cert_verifier(), <moq/picoquic_verify.h>) BEFORE
+     * configure_quic and FAILS _create if it cannot install it, so a default
+     * client never connects unauthenticated.  If true, calls
+     * picoquic_set_null_verifier instead (accepts any cert) — demos and tests
+     * only.  To trust a private CA, install your own verifier from
+     * configure_quic, which runs after the default and transactionally
+     * replaces it.  Server perspective verifies no client certificate. */
     bool               insecure_skip_verify;
 
     /* Optional: called during _create after picoquic_create but
      * before any connections or the network thread starts.  The app
      * may configure TLS settings, certificate verification, token
-     * stores, or any other picoquic_quic_t options.  The supported way
-     * to enable production cert verification here is
-     * moq_picoquic_set_cert_verifier() (<moq/picoquic_verify.h>).
+     * stores, or any other picoquic_quic_t options.  For a client it runs
+     * AFTER the default system-trust verifier is installed; installing your
+     * own verifier here (e.g. moq_picoquic_set_cert_verifier() with a private
+     * CA, <moq/picoquic_verify.h>) transactionally replaces the default.
      * Return 0 to continue, nonzero to abort _create. */
     int              (*configure_quic)(picoquic_quic_t *quic, void *ctx);
     void              *configure_quic_ctx;
@@ -241,15 +251,37 @@ typedef struct moq_pq_threaded_cfg {
      * moq_pq_threaded_cfg_init_sized. */
     uint64_t         (*app_deadline_us)(void *ctx);
     void              *app_deadline_ctx;
+
+    /* Appended (struct_size append-only ABI). QUIC keepalive interval in
+     * MILLISECONDS for every connection this facade owns. 0 = disabled (no
+     * keepalive; the default). A nonzero value calls picoquic_enable_keep_alive
+     * on each connection right after it is created (the client connection, and
+     * every accepted server connection), so an otherwise-quiet connection --
+     * e.g. a publisher with no subscriber yet -- keeps sending QUIC PING traffic
+     * and is not reaped by a peer/relay idle timeout.
+     *
+     * The idle-related knobs are distinct:
+     *   - idle_timeout_ms  = how long WE wait before reaping a vanished peer
+     *                        (our context idle bound; cannot override a peer's
+     *                        shorter idle timeout);
+     *   - app_deadline_us  = wake the loop for a service/app deadline (e.g. a
+     *                        catalog refresh), demand-gated app scheduling;
+     *   - keep_alive_interval_ms = send QUIC keepalive traffic on an otherwise
+     *                        quiet connection so the transport is not dropped.
+     * Keepalive is NOT a substitute for MoQ/session deadlines. Set via
+     * moq_pq_threaded_cfg_init_sized. */
+    uint32_t           keep_alive_interval_ms;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
  * existed before goaway_timeout_us was appended (it cannot know the caller's
  * storage size, so it must not write the full current sizeof -- that would
  * overflow an old caller's smaller struct). Fields appended after the prefix
- * (currently goaway_timeout_us, max_connections, and idle_timeout_ms)
+ * (currently goaway_timeout_us, max_connections, idle_timeout_ms,
+ * lane_count, app_deadline_us/ctx, and keep_alive_interval_ms)
  * default to disabled/zero (max_connections 0 = the 1024 default,
- * idle_timeout_ms 0 = the picoquic default); sni/alpn_* predate the prefix
+ * idle_timeout_ms 0 = the picoquic default, lane_count 0 = single lane,
+ * keep_alive_interval_ms 0 = keepalive disabled); sni/alpn_* predate the prefix
  * boundary and stay enabled. To use appended fields, or to get the full
  * current struct, use moq_pq_threaded_cfg_init_sized(). */
 void moq_pq_threaded_cfg_init(moq_pq_threaded_cfg_t *cfg);

@@ -61,7 +61,7 @@ private func buildAACInit(
     hdr(UInt32(stsdSize), "stsd"); w32(0); w32(1)
     hdr(UInt32(mp4aSize), "mp4a")
     var mp4aFixed = Data(repeating: 0, count: 28)
-    mp4aFixed[8] = UInt8(channels >> 8); mp4aFixed[9] = UInt8(channels & 0xFF)
+    mp4aFixed[16] = UInt8(channels >> 8); mp4aFixed[17] = UInt8(channels & 0xFF) // channelcount
     mp4aFixed[24] = UInt8(samplerate >> 8); mp4aFixed[25] = UInt8(samplerate & 0xFF)
     buf.append(mp4aFixed)
     hdr(UInt32(esdsSize), "esds"); w32(0)

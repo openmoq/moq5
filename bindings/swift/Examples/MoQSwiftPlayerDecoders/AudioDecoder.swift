@@ -2,7 +2,35 @@ import AudioToolbox
 import AVFoundation
 import Foundation
 
-final class AudioDecoder {
+package enum AACConverterError: Error, CustomStringConvertible {
+    case converterCreationFailed(OSStatus)
+    /// The AudioSpecificConfig is too large to encode in the one-byte ESDS
+    /// descriptor bodies -- rejected BEFORE creating the converter, distinct
+    /// from a converter-creation failure.
+    case oversizedCodecConfig
+    package var description: String {
+        switch self {
+        case .converterCreationFailed(let s): return "AudioConverterNew failed: \(s)"
+        case .oversizedCodecConfig: return "oversized AAC codec config"
+        }
+    }
+}
+
+/// The largest AudioSpecificConfig that fits the one-byte ESDS descriptor
+/// bodies: the outer ES descriptor body is `20 + ascLen`, the tightest field,
+/// so `20 + ascLen <= 0x7f` gives `ascLen <= 107`.
+let maxAACCodecConfigBytes = 107
+
+/// The converter-creation seam. Defaults to `AudioConverterNew`, so the real
+/// player path is behavior-identical; a test can inject a recording factory to
+/// observe whether the converter is created BEFORE oversized-ASC validation
+/// (the "before AudioConverterNew" rule) without touching audio hardware.
+package typealias AudioConverterFactory = (
+    UnsafePointer<AudioStreamBasicDescription>,
+    UnsafePointer<AudioStreamBasicDescription>,
+    UnsafeMutablePointer<AudioConverterRef?>) -> OSStatus
+
+package final class AudioDecoder {
     private var engine: AVAudioEngine?
     private var playerNode: AVAudioPlayerNode?
     private var converter: AudioConverterRef?
@@ -10,7 +38,9 @@ final class AudioDecoder {
     private var sampleRate: Double = 0
     private var channels: UInt32 = 0
 
-    func configure(codec: String, sampleRate: UInt32, channels: UInt32,
+    package init() {}
+
+    package func configure(codec: String, sampleRate: UInt32, channels: UInt32,
                    codecConfig: Data?) {
         teardown()
 
@@ -31,18 +61,6 @@ final class AudioDecoder {
         self.sampleRate = Double(sampleRate)
         self.channels = ch
 
-        var inputDesc = AudioStreamBasicDescription(
-            mSampleRate: Float64(sampleRate),
-            mFormatID: formatID,
-            mFormatFlags: 0,
-            mBytesPerPacket: 0,
-            mFramesPerPacket: 1024,
-            mBytesPerFrame: 0,
-            mChannelsPerFrame: ch,
-            mBitsPerChannel: 0,
-            mReserved: 0
-        )
-
         // Non-interleaved Float32 PCM at the SOURCE sample rate.
         guard let format = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -54,44 +72,14 @@ final class AudioDecoder {
             return
         }
 
-        // Interleaved output for AudioConverter (simpler callback).
-        var outputDesc = AudioStreamBasicDescription(
-            mSampleRate: Float64(sampleRate),
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: ch * 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: ch * 4,
-            mChannelsPerFrame: ch,
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-
-        var conv: AudioConverterRef?
-        var status = AudioConverterNew(&inputDesc, &outputDesc, &conv)
-        guard status == noErr, let conv else {
-            print("  [audio] AudioConverterNew failed: \(status)")
+        let conv: AudioConverterRef
+        do {
+            conv = try makeAACConverter(
+                formatID: formatID, sampleRate: sampleRate,
+                channels: ch, codecConfig: codecConfig)
+        } catch {
+            print("  [audio] \(error)")
             return
-        }
-
-        if let asc = codecConfig, !asc.isEmpty {
-            let cookie = buildAACMagicCookie(asc: asc)
-            cookie.withUnsafeBytes { buf in
-                status = AudioConverterSetProperty(
-                    conv,
-                    kAudioConverterDecompressionMagicCookie,
-                    UInt32(buf.count),
-                    buf.baseAddress!)
-            }
-            if status != noErr {
-                asc.withUnsafeBytes { buf in
-                    _ = AudioConverterSetProperty(
-                        conv,
-                        kAudioConverterDecompressionMagicCookie,
-                        UInt32(buf.count),
-                        buf.baseAddress!)
-                }
-            }
         }
 
         self.converter = conv
@@ -121,7 +109,7 @@ final class AudioDecoder {
         print("  [audio] configured: \(codec) \(sampleRate)Hz \(ch)ch")
     }
 
-    func decode(payload: Data, presentationTimeUS: Int64,
+    package func decode(payload: Data, presentationTimeUS: Int64,
                 syncHostTime: Int64) {
         guard let converter, let playerNode, let pcmFormat else { return }
         guard !payload.isEmpty else { return }
@@ -147,12 +135,12 @@ final class AudioDecoder {
         }
     }
 
-    func flush() {
+    package func flush() {
         playerNode?.stop()
         playerNode?.play()
     }
 
-    func teardown() {
+    package func teardown() {
         playerNode?.stop()
         engine?.stop()
         if let converter { AudioConverterDispose(converter) }
@@ -224,8 +212,71 @@ final class AudioDecoder {
         return pcmBuffer
     }
 
-    private func buildAACMagicCookie(asc: Data) -> Data {
+    /// Create the AAC decompression converter and install its magic cookie.
+    /// Extracted from `configure` (same order, same effect) so the real player
+    /// runs this exact path; `factory` defaults to `AudioConverterNew`. The ASC
+    /// length is validated BEFORE the converter is created, so an oversized
+    /// config is rejected with a typed error and `factory` is never called (the
+    /// security regression asserts exactly that -- zero factory calls). This
+    /// closes MOQ-SWIFTPLAYER-AAC-LENGTH-TRAP, where the pre-fix code built the
+    /// converter first and only then reached `buildAACMagicCookie`, whose
+    /// descriptor-length `UInt8(...)` conversion overflowed on a large ASC.
+    package func makeAACConverter(
+        formatID: AudioFormatID, sampleRate: UInt32, channels ch: UInt32,
+        codecConfig: Data?,
+        factory: AudioConverterFactory = AudioConverterNew
+    ) throws -> AudioConverterRef {
+        // Validate the ASC length BEFORE creating the converter, so an oversized
+        // config is rejected with a typed error and the factory is never called.
+        if let asc = codecConfig, !asc.isEmpty, asc.count > maxAACCodecConfigBytes {
+            throw AACConverterError.oversizedCodecConfig
+        }
+
+        var inputDesc = AudioStreamBasicDescription(
+            mSampleRate: Float64(sampleRate), mFormatID: formatID,
+            mFormatFlags: 0, mBytesPerPacket: 0, mFramesPerPacket: 1024,
+            mBytesPerFrame: 0, mChannelsPerFrame: ch, mBitsPerChannel: 0,
+            mReserved: 0)
+
+        // Interleaved output for AudioConverter (simpler callback).
+        var outputDesc = AudioStreamBasicDescription(
+            mSampleRate: Float64(sampleRate), mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: ch * 4, mFramesPerPacket: 1,
+            mBytesPerFrame: ch * 4, mChannelsPerFrame: ch,
+            mBitsPerChannel: 32, mReserved: 0)
+
+        var conv: AudioConverterRef?
+        var status = factory(&inputDesc, &outputDesc, &conv)
+        guard status == noErr, let conv else {
+            throw AACConverterError.converterCreationFailed(status)
+        }
+
+        if let asc = codecConfig, !asc.isEmpty {
+            let cookie = try buildAACMagicCookie(asc: asc)
+            cookie.withUnsafeBytes { buf in
+                status = AudioConverterSetProperty(
+                    conv, kAudioConverterDecompressionMagicCookie,
+                    UInt32(buf.count), buf.baseAddress!)
+            }
+            if status != noErr {
+                asc.withUnsafeBytes { buf in
+                    _ = AudioConverterSetProperty(
+                        conv, kAudioConverterDecompressionMagicCookie,
+                        UInt32(buf.count), buf.baseAddress!)
+                }
+            }
+        }
+        return conv
+    }
+
+    package func buildAACMagicCookie(asc: Data) throws -> Data {
         let ascLen = asc.count
+        // Reject an oversized ASC normally instead of overflowing the one-byte
+        // ESDS descriptor bodies via `UInt8(...)` below.
+        guard ascLen <= maxAACCodecConfigBytes else {
+            throw AACConverterError.oversizedCodecConfig
+        }
         let decSpecLen = 2 + ascLen
         let decCfgLen = 2 + 13 + decSpecLen
         let esDescLen = 2 + 3 + decCfgLen

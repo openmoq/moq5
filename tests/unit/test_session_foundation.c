@@ -5331,8 +5331,8 @@ int main(void)
             d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
             size_t cap0 = sv->event_scratch_cap;
             NS_COPY_TIGHT_CAP(sv);
-            NS_COPY_ASSERT_BLOCKED(session_core_on_publish(sv, &d), sv);
-            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0, session_core_on_publish(sv, &d),
+            NS_COPY_ASSERT_BLOCKED(session_core_on_publish(sv, &d, false), sv);
+            NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0, session_core_on_publish(sv, &d, false),
                 MOQ_EVENT_PUBLISH_REQUEST);
             moq_session_destroy(c); moq_session_destroy(sv);
             MOQ_TEST_CHECK(as.balance == 0);
@@ -5370,9 +5370,9 @@ int main(void)
             d.endpoint.has_request_id = true; d.endpoint.request_id = 0;
             size_t cap0 = sv->event_scratch_cap;
             NS_COPY_TIGHT_CAP(sv);
-            NS_COPY_ASSERT_BLOCKED(session_core_on_publish_namespace(sv, &d), sv);
+            NS_COPY_ASSERT_BLOCKED(session_core_on_publish_namespace(sv, &d, false), sv);
             NS_COPY_ASSERT_REPLAY_ONCE(sv, cap0,
-                session_core_on_publish_namespace(sv, &d),
+                session_core_on_publish_namespace(sv, &d, false),
                 MOQ_EVENT_NAMESPACE_PUBLISHED);
             moq_session_destroy(c); moq_session_destroy(sv);
             MOQ_TEST_CHECK(as.balance == 0);

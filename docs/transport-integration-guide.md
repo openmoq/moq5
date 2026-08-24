@@ -291,65 +291,89 @@ Cert handling is explicit on every client facade:
     `insecure_skip_verify` nor `cert_path` set uses the **system trust
     store** + host/IP identity. Set `cert_path` (PEM CA trust; mutually
     exclusive with `insecure_skip_verify`) to pin a CA.
-  - **picoquic (raw threaded and WebTransport)** does **not**.
-    `insecure_skip_verify = false` merely declines to install the null
-    verifier; it installs no CA/identity policy, and picoquic's built-in
-    default has no CA store and **accepts the peer cert**. So the
-    picoquic default is **NOT production-safe** — you must install a real
-    verifier via the `configure_quic(quic, ctx)` hook (it runs after the
-    QUIC context is created and before any connection). The verifier
-    types are not reachable from installed headers, so libmoq ships the
-    helper below for exactly this.
-- **Servers** require `cert_path` + `key_path`; `insecure_skip_verify`
-  is rejected for servers.
+  - **picoquic** client facades also fail closed on default. Raw
+    `moq_pq_threaded` and `moq_pico_wt_managed` clients install the
+    **system trust store** verifier (chain + server name) themselves when
+    `insecure_skip_verify = false`, and **fail `_create` if it cannot be
+    installed** — a default client never connects unauthenticated.
+    picoquic's own built-in default has no CA store and would accept any
+    cert, which is exactly why these facades install the verifier rather
+    than relying on it. To pin a private CA, install your own verifier
+    from the `configure_quic(quic, ctx)` hook — it runs after the default
+    and transactionally replaces it. The verifier types are not reachable
+    from installed headers, so libmoq ships the helper below.
+- **Servers** require `cert_path` + `key_path` (`_create` fails
+  `MOQ_ERR_INVAL` without them). `insecure_skip_verify` and the CA-pinning
+  helper are **client-side** controls for verifying a *server* certificate;
+  they do not configure client-certificate authentication. Leave
+  `insecure_skip_verify` false in a server configuration: it is not rejected
+  for raw servers, but on a server it only selects picoquic's null verifier
+  and configures no useful policy. Applications that need mutual TLS
+  (client-certificate auth) must configure it explicitly through the transport
+  — that is outside this facade's contract.
 
-### The safe picoquic pattern (copy this)
+### Certificate verification: default vs. private CA
 
-`<moq/picoquic_verify.h>` provides `moq_picoquic_set_cert_verifier(quic,
-ca_file)` — an OpenSSL-backed verifier (chain + hostname/SNI) using the
-system trust store (`ca_file == NULL`) or a PEM bundle. Call it from
-`configure_quic`; picoquic owns the verifier's lifetime. The same call
-works for **both** `moq_pq_threaded` and `moq_pico_wt_managed` (both pass
-a `picoquic_quic_t*`):
+**Default (system trust) — nothing to do.** With
+`insecure_skip_verify = false` (the default) and **no** `configure_quic`
+hook, both `moq_pq_threaded` and `moq_pico_wt_managed` already install an
+OpenSSL-backed verifier (certificate chain + hostname/SNI) against the
+system trust store. This is the fail-closed default; adding a hook that
+re-installs system trust would be redundant with it.
+
+```c
+cfg.insecure_skip_verify = false;   /* default: verifies vs system trust */
+/* no configure_quic needed */
+```
+
+**Private CA — add a hook that pins it.** `<moq/picoquic_verify.h>`
+provides `moq_picoquic_set_cert_verifier(quic, ca_file)`. Add a
+`configure_quic` hook only to customize the automatic default — pass a
+**non-NULL** PEM bundle path; picoquic owns the verifier's lifetime, and
+the hook runs after the default and transactionally replaces it. The same
+call works for **both** transports (both pass a `picoquic_quic_t*`):
 
 ```c
 #include <moq/picoquic_verify.h>
 
-static int configure_quic(picoquic_quic_t *quic, void *ctx) {
+static int pin_private_ca(picoquic_quic_t *quic, void *ctx) {
     (void)ctx;
-    /* NULL = system trust store; or pass a PEM CA bundle path. */
-    return moq_picoquic_set_cert_verifier(quic, NULL);  /* 0 = OK */
+    return moq_picoquic_set_cert_verifier(quic, "/etc/moq/ca.pem"); /* 0 = OK */
 }
 
-cfg.insecure_skip_verify = false;       /* not enough on its own */
-cfg.configure_quic       = configure_quic;   /* this is what verifies */
+cfg.insecure_skip_verify = false;
+cfg.configure_quic       = pin_private_ca;   /* replaces the system default */
 ```
 
-This is the exact pattern the FFmpeg and OBS integrations use for **both**
-raw picoquic (`moq_pq_threaded`) and pico WT managed
-(`moq_pico_wt_managed`) — one helper, both transports.
+One helper covers both raw picoquic (`moq_pq_threaded`) and pico WT
+managed (`moq_pico_wt_managed`).
 
 **Set the server name correctly, or verification cannot pass.** The
 helper validates the certificate *chain* AND the *server name*, so the
 name the client presents as SNI must match the peer certificate:
-- raw `moq_pq_threaded`: the `host` field is the connection target **and**
-  the SNI / verified name. Set it to the cert's name (not a bare IP unless
-  the cert has that IP SAN).
-- pico WT managed: the `sni` field (default `"localhost"`) is the verified
-  name; `host` is only the dial target. A consumer connecting to
-  `example.com` must set `cfg.sni = "example.com"` — leaving the default
-  verifies against `"localhost"` and fails.
+- raw `moq_pq_threaded`: `host` is always the dial target. An explicit
+  `cfg.sni` is the SNI / verified name and overrides `host`; with `cfg.sni`
+  unset, `host` is the fallback SNI / verified name. So set `cfg.sni` to the
+  cert's name when dialing by address (or a name that differs from the cert),
+  otherwise set `host` to the cert's name (not a bare IP unless the cert has
+  that IP SAN).
+- pico WT managed: an explicit `cfg.sni` always wins as the verified name;
+  otherwise a **DNS** `host` becomes the SNI / verified name. There is no DNS
+  name to send for an **IP-literal** `host`, so a verified IP-literal host with
+  no explicit `cfg.sni` and no custom `configure_quic` verifier fails `_create`
+  with `MOQ_ERR_INVAL` (supply `cfg.sni`). `"localhost"` is only the
+  compatibility placeholder for the insecure or caller-customized-verifier
+  path, not a general default verified name.
 
 The helper lives in the **picoquic adapter**. Raw `moq_pq_threaded`
 consumers already link it (the `adapter-picoquic-threaded` component pulls
 in `adapter-picoquic`, and `libmoq.pc` carries it). **pico WT managed
-consumers must also pull in the picoquic adapter component** (the managed
-facade does not depend on it):
-- CMake: `find_package(libmoq COMPONENTS adapter-pico-wt-managed adapter-picoquic)`, then link `moq::adapter-pico-wt-managed moq::adapter-picoquic`.
-- pkg-config: there is no standalone `.pc` for the raw picoquic adapter
-  (it is folded into `libmoq.pc`); add `libmoq` alongside
-  `libmoq-pico-wt-managed`, e.g. `pkg-config --cflags --libs
-  libmoq-pico-wt-managed libmoq`.
+consumers get it transitively too**: `moq-adapter-pico-wt-managed` links
+`moq::adapter-picoquic` PUBLIC (the managed client installs the default
+verifier itself), so linking `moq::adapter-pico-wt-managed` — via
+`find_package(libmoq COMPONENTS adapter-pico-wt-managed)` or the
+`libmoq-pico-wt-managed` pkg-config package — already resolves the helper.
+No separate `adapter-picoquic` component is required.
 
 ### How a rejection looks (verify it, don't assume)
 
@@ -371,10 +395,11 @@ So the portable check across both facades is `is_fatal()` after a bounded
 `wait()`. Do not infer "the cert was fine" from "no error yet" — wait for
 an established session or a terminal fatal.
 
-Bottom line: do not assume `insecure_skip_verify = false` means
-verification is happening on the picoquic backends. It does not — call
-`moq_picoquic_set_cert_verifier` from `configure_quic` for any production
-picoquic / pico-WT client.
+Bottom line: on the picoquic client facades (`moq_pq_threaded` and
+`moq_pico_wt_managed`), `insecure_skip_verify = false` DOES verify — the
+facade installs the system-trust verifier and fails closed if it cannot.
+Call `moq_picoquic_set_cert_verifier` from `configure_quic` only to pin a
+private CA or otherwise customize that default.
 
 ---
 

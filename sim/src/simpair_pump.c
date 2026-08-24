@@ -83,7 +83,8 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                             moq_session_t *to_session,
                             moq_perspective_t from,
                             moq_perspective_t to,
-                            size_t *delivered)
+                            size_t *delivered,
+                            size_t *delivered_reverse)
 {
     uint8_t mutate_buf[2048];
     moq_action_t actions[16];
@@ -586,11 +587,28 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                     return rc;
                 }
             }
-            /* CLOSE_SESSION: traced by trace_action above but not
-             * delivered to peer. The session API has no peer-close
-             * input function. SimPair does not model transport
-             * connection close; the session's own close event is
-             * the observable signal for scenario runners. */
+            else if (actions[i].kind == MOQ_ACTION_CLOSE_SESSION) {
+                /* Model transport close: the peer observes the connection
+                 * closing with the application error code, through the
+                 * transport-close input. moq_session_close() makes
+                 * CLOSE_SESSION the last action it queues and actions poll in
+                 * queue order, so everything sent before the close was already
+                 * delivered above -- a graceful drain falls out for free.
+                 * Idempotent for crossed closes: a peer that already reached
+                 * CLOSED observed its own close and is skipped, so no second
+                 * close event is produced. */
+                if (moq_session_state(to_session) != MOQ_SESS_CLOSED) {
+                    moq_result_t rc = moq_session_on_transport_close(
+                        to_session, actions[i].u.close_session.code,
+                        sp->now_us);
+                    if (rc < 0) {
+                        moq_action_cleanup(&actions[i]);
+                        for (size_t j = i + 1; j < n; j++)
+                            moq_action_cleanup(&actions[j]);
+                        return rc;
+                    }
+                }
+            }
 
             moq_action_cleanup(&actions[i]);
         }
@@ -674,7 +692,14 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                     sp, from_session, sender_ref, 0x100,
                     j, receiver_persp, from);
                 if (rc < 0) return rc;
-                (*delivered)++;
+                /* This injection is delivered INTO from_session, so the work
+                 * is handled toward `from` -- the reverse of this pump's
+                 * direction. Charging it to *delivered would attribute it to
+                 * the wrong side; the combined total is unchanged either
+                 * way, which is exactly why only a directional count can
+                 * catch it. */
+                if (delivered_reverse) (*delivered_reverse)++;
+                else (*delivered)++;
             }
         }
     }

@@ -252,6 +252,52 @@ int main()
     }
 #endif
 
+    // -- 7. batched poll surface, from an out-of-tree consumer --------
+    // Exercises BOTH new templates through installed headers only, so the
+    // public source usability of the batching surface is covered.
+    {
+        moq::session_config cfg;
+        cfg.perspective = moq::perspective::client;
+        auto s = moq::session::create(cfg, 0);
+        CHECK(static_cast<bool>(s), 70);
+        if (s) {
+            std::size_t acts = s->poll_actions<8>([](moq::polled_action &a) {
+                (void)a.kind();
+            });
+            CHECK(acts == 0, 71);              // nothing queued before start
+            std::size_t evts = s->poll_events<8>([](moq::polled_event &e) {
+                (void)e.kind();
+            });
+            CHECK(evts == 0, 72);
+            // default-N forms, both families
+            std::size_t da = s->poll_actions([](moq::polled_action &) {});
+            CHECK(da == 0, 73);
+            std::size_t de = s->poll_events([](moq::polled_event &) {});
+            CHECK(de == 0, 74);
+            // member-pointer callables: valid std::invocable values that only
+            // compile if the implementation uses std::invoke
+            std::size_t ma = s->poll_actions<4>(&moq::polled_action::kind);
+            CHECK(ma == 0, 75);
+            std::size_t me = s->poll_events<4>(&moq::polled_event::kind);
+            CHECK(me == 0, 76);
+        }
+    }
+
+    // -- 8. profile capability query, from an out-of-tree consumer ----
+    // This same consumer is built twice against the exported package: by the
+    // ordinary cpp_consumer CTest, which points CMAKE_PREFIX_PATH at the BUILD
+    // TREE export, and by a separate installed-prefix gate that consumes a real
+    // `cmake --install` tree. The declaration must therefore be reachable, and
+    // the symbol resolvable, through the package's public surface rather than
+    // only from inside the project's own targets.
+    {
+        CHECK(!moq_session_supports_zero_field_track_namespace(nullptr), 80);
+        // `client` is the established default-version (draft-16) session from
+        // section 3, which requires 1..32 namespace fields.
+        CHECK(!moq_session_supports_zero_field_track_namespace(client.raw()),
+              81);
+    }
+
     std::printf("PASS: moq_consumer_test\n");
     return 0;
 }

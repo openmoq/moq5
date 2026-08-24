@@ -22,6 +22,8 @@
 #include <moq/endpoint.h>
 #include <moq/media_receiver.h>
 
+#include "../common/moq_example_term.h"
+
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -142,12 +144,15 @@ int main(int argc, char **argv)
                  * catalog carried them: a CMAF track references a shared entry
                  * via MSF-01 initRef -> initDataList; RAW/LOC keeps init inline.
                  * Either way the receiver hands you the resolved segment here. */
-                printf("TRACK_ADDED name=%.*s codec=%.*s "
-                       "codec_config(extradata)=%zu init_data(init segment)=%zu\n",
-                       (int)tev.desc->name.len,
-                       tev.desc->name.data ? (const char *)tev.desc->name.data : "",
-                       (int)tev.desc->codec.len,
-                       tev.desc->codec.data ? (const char *)tev.desc->codec.data : "",
+                /* name and codec are PEER-CONTROLLED: escape before printing so
+                 * a remote peer cannot inject terminal control sequences. */
+                fputs("TRACK_ADDED name=", stdout);
+                moq_example_term_fprint(stdout, tev.desc->name.data,
+                                        tev.desc->name.len);
+                fputs(" codec=", stdout);
+                moq_example_term_fprint(stdout, tev.desc->codec.data,
+                                        tev.desc->codec.len);
+                printf(" codec_config(extradata)=%zu init_data(init segment)=%zu\n",
                        tev.desc->init.codec_config.len,
                        tev.desc->init_data.len);
 
@@ -171,11 +176,14 @@ int main(int argc, char **argv)
                     moq_bytes_t ref = tev.desc->content_protection_ref_ids[ci];
                     const moq_cmsf_content_protection_t *cp =
                         moq_media_receiver_find_content_protection(rx, ref);
-                    printf("  cmsf protection ref=%.*s scheme=%.*s kids=%zu%s\n",
-                           (int)ref.len, ref.data ? (const char *)ref.data : "",
-                           cp ? (int)cp->scheme.len : 0,
-                           cp && cp->scheme.data ? (const char *)cp->scheme.data
-                                                 : "",
+                    /* ref and scheme are PEER-CONTROLLED: escape before print. */
+                    fputs("  cmsf protection ref=", stdout);
+                    moq_example_term_fprint(stdout, ref.data, ref.len);
+                    fputs(" scheme=", stdout);
+                    if (cp)
+                        moq_example_term_fprint(stdout, cp->scheme.data,
+                                                cp->scheme.len);
+                    printf(" kids=%zu%s\n",
                            cp ? cp->default_kid_count : 0,
                            cp ? "" : " (unresolved)");
                 }

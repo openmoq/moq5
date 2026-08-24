@@ -32,13 +32,20 @@ Network.framework backend:
 MOQ_SERVICE=1 PKG_CONFIG_PATH=<prefix>/lib/pkgconfig swift build
 ```
 
-iOS simulator (binary xcframework lane; see `docs/ios-packaging.md` for
-building `LibMoQ.xcframework` / `OpenSSL.xcframework` first):
+iOS / Xcode (env-free binary xcframework lane). This `SimplePlayer` package
+depends on the root `MOQ5` service product, whose iOS lane is env-gated — env
+Xcode never sets during manifest evaluation. So the iOS/Xcode build lives in the
+sibling **`../SimplePlayerXcode`** package, which reuses these same sources but
+depends on the `MoQServiceApple` wrapper (vends `MoQService` with no
+`MOQ_SERVICE*` env). Build the `LibMoQ.xcframework` / `OpenSSL.xcframework`
+first (see `docs/ios-packaging.md`), then, with **no** env:
 
 ```bash
-MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build \
+cd ../SimplePlayerXcode
+swift build \
   --triple arm64-apple-ios16.0-simulator \
   --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+# or bundle a .app:  ../SimplePlayer/scripts/make-app.sh ios-sim
 ```
 
 CI builds both lanes but never runs the app (no network in CI); the

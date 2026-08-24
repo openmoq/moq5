@@ -115,11 +115,15 @@ typedef struct moq_pq_threaded_cfg {
     uint32_t           send_buffer_size;            /* default 4096 */
     uint32_t           recv_buffer_size;            /* default 4096 */
 
-    /* TLS verification. If true, the helper calls
-     * picoquic_set_null_verifier — suitable for demos and tests
-     * only. If false (default), the picoquic context uses the
-     * system's default TLS verification, which requires a valid
-     * CA chain. For custom verification, use configure_quic. */
+    /* TLS verification (client). If false (default), a CLIENT installs
+     * the system-trust verifier itself — moq_picoquic_set_cert_verifier(
+     * quic, NULL) — and _create rolls back if that install fails (picoquic's
+     * built-in default accepts any peer cert, so the safe default must install
+     * a real verifier). If true, the helper installs picoquic_set_null_verifier
+     * — demos and tests only. configure_quic runs afterward and may replace the
+     * installed verifier (e.g. a private CA). A SERVER does not install a
+     * client-side verifier; insecure_skip_verify on a server only selects the
+     * null verifier and does not enable client-certificate authentication. */
     bool               insecure_skip_verify;
 
     /* Optional: called during _create after picoquic_create but
@@ -223,11 +227,18 @@ _create(cfg) for CLIENT:
           Graceful peers should still close properly; aggressive values can
           kill quiet-but-live connections -- keepalive is a separate knob.
           cfg->configure_quic runs AFTER this and may override it.)
-     If cfg->insecure_skip_verify:
-         picoquic_set_null_verifier(t->quic)
+     CLIENT certificate policy (fail-closed by default):
+         If cfg->insecure_skip_verify:
+             picoquic_set_null_verifier(t->quic)      (demo/test only)
+         Else (default):
+             moq_picoquic_set_cert_verifier(t->quic, NULL)   (system trust)
+             if it cannot install → rollback (_create fails; no
+             unauthenticated connection)
   5. If cfg->configure_quic:
          rc = cfg->configure_quic(t->quic, cfg->configure_quic_ctx)
          if rc != 0 → rollback
+         (runs after the default verifier and may transactionally replace it,
+          e.g. to pin a private CA)
   6. picoquic_create_client_cnx(t->quic, addr, ..., ALPN,
          client_callback, t)
          → t->cnx
@@ -275,8 +286,12 @@ _create(cfg) for SERVER:
           Graceful peers should still close properly; aggressive values can
           kill quiet-but-live connections -- keepalive is a separate knob.
           cfg->configure_quic runs AFTER this and may override it.)
-     If cfg->insecure_skip_verify:
-         picoquic_set_null_verifier(t->quic)
+     SERVER certificate policy: unlike the client, the server installs NO
+     client-side default verifier (it presents cert_path/key_path to peers)
+     and does not enable client-certificate authentication by default; it does
+     not inherit the client's fail-closed verification guarantee.
+         If cfg->insecure_skip_verify:
+             picoquic_set_null_verifier(t->quic)
   5. If cfg->configure_quic:
          rc = cfg->configure_quic(t->quic, cfg->configure_quic_ctx)
          if rc != 0 → rollback

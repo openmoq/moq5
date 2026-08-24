@@ -1,31 +1,38 @@
 /*
- * Real-MsQuic loopback proof of INBOUND receive backpressure recovery.
+ * Real-MsQuic APPLICATION-EVENT HOLD / RELEASE.
  *
- * A managed server subscribes and STALLS its receiver (after SUBSCRIBE_OK
- * it stops polling session events, so received objects back the bridge up
- * and the adapter arrests delivery by accepting zero bytes). A managed
- * client publishes a fixed set of 4096-byte objects, more than the
- * adapter's ~1 MiB in-flight send budget can hold at once, so the sender
- * is backpressured while the receiver is stalled. On release the whole
- * set is delivered.
+ * A managed server subscribes and then stops polling object events. A
+ * managed client publishes a fixed set of 4096-byte objects over real
+ * MsQuic. While the receiver's application polling is held, the transfer
+ * must survive: the publisher puts the whole workload out, real bytes
+ * reach the transport, the receiver's own pump keeps running on transport
+ * activity alone -- and the application receives NOTHING. On release the
+ * entire workload arrives.
  *
- * What this proves (claims kept narrow on purpose):
- *   - a stalled receiver eventually backpressures the sender: the
- *     publisher's transport-accepted bytes (lane flush_bytes) plateau
- *     below the full workload while the SESSION accepts every object;
- *   - while stalled, the receiving APPLICATION observes no object
- *     delivery (it is not polling);
- *   - on release the ENTIRE workload is delivered BYTE-EXACT and
+ * What this proves, and only this:
+ *   - a receiver that holds its application polling does not break the
+ *     connection, lose data, or go fatal -- neither side does;
+ *   - while held, the receiving APPLICATION observes no object delivery,
+ *     which is armed BEFORE the first object is published so it cannot be
+ *     a race between the control and data streams;
+ *   - the receiver's pump advances during the hold WITHOUT any application
+ *     wake, so it is real transport activity driving it;
+ *   - on release the ENTIRE workload is delivered BYTE-EXACT, IN ORDER and
  *     EXACTLY ONCE, with no loss and no duplication.
  *
- * What this does NOT claim: it does not measure peer QUIC stream flow-
- * control credit at the wire. The production receive window (16 MiB)
- * exceeds this workload, and flush_bytes / objects_drained are adapter-
- * and application-level signals, not transport credit counters. The
- * exact receive-arrest mechanics (partial accept, hold, resume,
- * multi-buffer stop-and-hold, resume-failure fatal) are proven
- * deterministically in the unit rail (test_msquic_unit.c). This test is
- * the end-to-end recovery confirmation over real MsQuic.
+ * What this deliberately does NOT claim:
+ *   - it does not claim sender backpressure. This workload is far inside
+ *     the 16 MiB receive window, so MsQuic can and does accept all of it;
+ *     `flush_bytes` is used only as a MONOTONIC transport-progress marker,
+ *     never as evidence that the sender was blocked. It also counts MoQ
+ *     framing, so it is not comparable to the payload total at all;
+ *   - it does not claim native receive pause/resume or adapter arrest. The
+ *     arrest mechanics -- partial accept, hold, resume, multi-buffer
+ *     stop-and-hold, resume-failure fatal, and capacity invariance across
+ *     receive-queue ceilings -- are owned deterministically by
+ *     test_msquic_unit.c;
+ *   - it does not claim receive-credit renewal. That is the over-window
+ *     qualification cell's one unique fact.
  */
 
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
@@ -38,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>
@@ -56,6 +64,63 @@ enum { N_OBJECTS = 384 };                 /* > the ~1 MiB / ~256-object
                                              in-flight send budget */
 enum { WORKLOAD_BYTES = N_OBJECTS * OBJECT_SIZE };
 enum { SENDER_MAX_ACTIONS = 1024 };       /* session queue never the limiter */
+
+/*
+ * Every phase of this cell waits on a real elapsed-time allowance, never a
+ * kick count. kick() waits at most 5 ms per side and returns early whenever
+ * either side has activity, so a fixed number of iterations is not a time
+ * bound at all: on a fast machine it can be consumed long before the work
+ * it is waiting for completes, and the guard becomes the verdict rather
+ * than a backstop. 10 s is three orders of magnitude above the ~0.03 s a
+ * healthy run takes, and far inside the registration's 120 s CTest cap, so
+ * it leaves room for sanitizer and loaded-CI variance. One allowance is
+ * shared by all three phases: they wait on different facts, but they all
+ * want the same "this cannot still be healthy" backstop.
+ */
+enum { PHASE_TIMEOUT_US = 10 * 1000 * 1000 };
+
+/*
+ * Monotonic elapsed microseconds since `since`. Returns UINT64_MAX if the
+ * clock cannot be read, which the caller treats as expiry -- fail closed,
+ * never loop forever on a clock that stopped answering.
+ */
+static uint64_t monotonic_elapsed_us(const struct timespec *since)
+{
+    struct timespec now;
+    uint64_t secs;
+    long nsec;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return UINT64_MAX;
+    if (now.tv_sec < since->tv_sec ||
+        (now.tv_sec == since->tv_sec && now.tv_nsec < since->tv_nsec))
+        return UINT64_MAX; /* a backward monotonic sample is exactly the
+                            * condition this helper exists to fail closed
+                            * on: report expiry, never keep waiting */
+    secs = (uint64_t)(now.tv_sec - since->tv_sec);
+    nsec = now.tv_nsec - since->tv_nsec;
+    if (nsec < 0) {
+        nsec += 1000000000L; /* secs >= 1 here, so the borrow is safe */
+        secs--;
+    }
+    if (secs > (UINT64_MAX - 1000000u) / 1000000u)
+        return UINT64_MAX;
+    return secs * 1000000u + (uint64_t)(nsec / 1000);
+}
+
+/*
+ * Start a phase's allowance. Returns false if CLOCK_MONOTONIC cannot be
+ * read at all, which the caller reports rather than waiting blind.
+ */
+static bool phase_start(struct timespec *start)
+{
+    return clock_gettime(CLOCK_MONOTONIC, start) == 0;
+}
+
+static bool phase_expired(const struct timespec *start)
+{
+    return monotonic_elapsed_us(start) >= PHASE_TIMEOUT_US;
+}
 
 static void payload_fill(uint8_t *dst, size_t size, uint64_t idx)
 {
@@ -77,6 +142,9 @@ struct server_side {
     int drained;                 /* objects the application polled */
     int object_errors;           /* byte / id mismatches */
     int dup_objects;
+    uint64_t next_expected;      /* arrival order across the release */
+    int order_errors;
+    uint64_t pumps;              /* completed server pump generations */
     uint8_t seen[N_OBJECTS];
 };
 
@@ -90,6 +158,7 @@ static int server_pump(moq_msquic_managed_t *m,
 
     (void)m;
     pthread_mutex_lock(&sv->mu);
+    sv->pumps++;
     bool may_drain = !sv->sub_ok || sv->release;
     if (s != NULL && may_drain) {
         moq_event_t ev;
@@ -118,6 +187,9 @@ static int server_pump(moq_msquic_managed_t *m,
                     if (memcmp(moq_rcbuf_data(p), want, OBJECT_SIZE) != 0)
                         sv->object_errors++;
                 }
+                if (oid != sv->next_expected)
+                    sv->order_errors++;
+                sv->next_expected = oid + 1;
                 if (oid < (uint64_t)N_OBJECTS && sv->seen[oid]++ != 0)
                     sv->dup_objects++;
                 sv->drained++;
@@ -152,6 +224,7 @@ struct client_side {
     int setup;
     moq_subscription_t sub;
     bool have_sub, accepted, subgroup_open;
+    bool gate_open;              /* set only once the receiver holds */
     moq_subgroup_handle_t sg;
     uint64_t published;
     int publish_errors;
@@ -184,7 +257,7 @@ static int client_pump(moq_msquic_managed_t *m,
         if (moq_session_accept_subscribe(s, cl->sub, &ac, now) < 0)
             cl->publish_errors++;
     }
-    if (s != NULL && cl->accepted && !cl->subgroup_open) {
+    if (s != NULL && cl->accepted && cl->gate_open && !cl->subgroup_open) {
         moq_subgroup_cfg_t sgc;
         moq_subgroup_cfg_init(&sgc);
         sgc.group_id = 0;
@@ -231,12 +304,52 @@ static uint64_t client_published(struct client_side *cl)
     return p;
 }
 
-static uint64_t client_pumps(struct client_side *cl)
+
+static uint64_t server_pumps(struct server_side *sv)
+{
+    uint64_t p;
+
+    pthread_mutex_lock(&sv->mu);
+    p = sv->pumps;
+    pthread_mutex_unlock(&sv->mu);
+    return p;
+}
+
+static bool server_holding(struct server_side *sv)
+{
+    bool h;
+
+    pthread_mutex_lock(&sv->mu);
+    h = sv->sub_ok && !sv->release;
+    pthread_mutex_unlock(&sv->mu);
+    return h;
+}
+
+static bool client_accepted(struct client_side *cl)
+{
+    bool a;
+
+    pthread_mutex_lock(&cl->mu);
+    a = cl->accepted;
+    pthread_mutex_unlock(&cl->mu);
+    return a;
+}
+
+static void client_open_gate(struct client_side *cl)
 {
     pthread_mutex_lock(&cl->mu);
-    uint64_t p = cl->pumps;
+    cl->gate_open = true;
     pthread_mutex_unlock(&cl->mu);
-    return p;
+}
+
+/* Drive the CLIENT only. Waiting on the server is allowed -- what must not
+ * happen during the held phase is an application wake of the server, since
+ * the point is that real transport activity advances its pump on its own. */
+static void kick_client_only(struct server_side *sv, struct client_side *cl)
+{
+    (void)moq_msquic_managed_wake(cl->m);
+    (void)moq_msquic_managed_wait(cl->m, 5 * 1000);
+    (void)moq_msquic_managed_wait(sv->m, 5 * 1000);
 }
 
 static int server_drained(struct server_side *sv)
@@ -307,66 +420,111 @@ static void t_stalled_receiver_recovers(const char *cert, const char *key)
         return;
     }
 
-    /* Phase 1: publish the whole set into the session while the receiver
-     * is stalled. The session accepts everything; the transport does not. */
-    bool all_written = false;
-    for (int i = 0; i < 6000 && !all_written; i++) {
+    /* Phase 1 -- ARM THE HOLD, then open the publication gate.
+     *
+     * The publisher may not open its subgroup or write a single object
+     * until the receiver has observed SUBSCRIBE_OK and stopped polling
+     * objects. Without that gate the two streams race: object data can
+     * reach the receiver's session and be polled before the control
+     * response arms the hold, and "the application received nothing"
+     * becomes a coin flip rather than a contract. */
+    struct timespec arm_start;
+    bool armed = false;
+    bool arm_clock_ok = phase_start(&arm_start);
+
+    CHECK(arm_clock_ok);
+    while (arm_clock_ok) {
         kick(&sv, &cl);
-        all_written = client_published(&cl) >= N_OBJECTS;
+        armed = server_holding(&sv) && client_accepted(&cl);
+        if (armed || phase_expired(&arm_start))
+            break;
     }
-    CHECK(all_written);
+    CHECK(armed);
+    /* the hold is armed BEFORE any object exists */
+    CHECK(client_published(&cl) == 0);
+    CHECK(server_drained(&sv) == 0);
 
-    /* Keep the receiver stalled and wait for the publisher's transport-accepted
-     * bytes to reach a STABLE, NONZERO plateau strictly below the workload: the
-     * transport admitted a bounded prefix (the ~1 MiB send budget) and does NOT
-     * advance while the receiver holds the rest off, even though the session
-     * accepted every object. The plateau is defined as N consecutive COMPLETED
-     * pump generations with NO advance in flush_bytes; ANY advance resets the
-     * stable count. This waits for genuine stability instead of comparing
-     * timing-sensitive point samples (which could catch flush_bytes mid-climb).
-     * Pump-generation-counted, never sleep-based. */
-    enum { PLATEAU_STABLE_GENS = 40, PLATEAU_FLOOR = 512 * 1024 };
-    uint64_t plateau = client_flush_bytes(&cl);
-    uint64_t last_pumps = client_pumps(&cl);
-    int stable_gens = 0;
-    for (int i = 0; i < 200000 && stable_gens < PLATEAU_STABLE_GENS; i++) {
-        kick(&sv, &cl);
-        uint64_t pumps = client_pumps(&cl);
-        if (pumps == last_pumps)
-            continue;                    /* no completed pump generation yet */
-        last_pumps = pumps;
-        uint64_t f = client_flush_bytes(&cl);
-        if (f != plateau) {              /* transport advanced: not yet stable */
-            plateau = f;
-            stable_gens = 0;
-        } else {
-            stable_gens++;
-        }
+    uint64_t server_pumps_armed = server_pumps(&sv);
+
+    client_open_gate(&cl);
+
+    /* Phase 2 -- HELD. Drive the CLIENT only: the receiver is never woken
+     * by the application from here, so any advance of its pump generation
+     * is real transport activity arriving.
+     *
+     * ONE monotonic held-ready predicate, three facts, all of them things
+     * that once true stay true:
+     *
+     *   - the publisher accepted the whole workload;
+     *   - a substantial number of bytes really reached the transport;
+     *   - the server's pump count is above the PRE-GATE armed baseline.
+     *
+     * The third is the causal one: the server is never explicitly woken
+     * after the gate opens, so a pump count above the baseline captured
+     * before it can only have come from arriving transport activity. That
+     * is what makes "the application delivered nothing" a statement about
+     * the application rather than about a receiver that never ran.
+     *
+     * Nothing here samples the pump count mid-phase and then demands a
+     * FURTHER generation: once the receiver has consumed all the transport
+     * work currently available, no later generation is owed, and no
+     * allowance of any length can conjure one. The bound is a fail-closed
+     * elapsed-time backstop, never the verdict. */
+    enum { PROGRESS_FLOOR = 512 * 1024 };
+    struct timespec held_start;
+    bool held_clock_ok = phase_start(&held_start);
+    bool held_ready = false;
+    uint64_t flushed = 0;
+
+    CHECK(held_clock_ok);
+    while (held_clock_ok) {
+        kick_client_only(&sv, &cl);
+        flushed = client_flush_bytes(&cl);
+        held_ready = client_published(&cl) >= N_OBJECTS &&
+                     flushed != UINT64_MAX &&
+                     flushed >= (uint64_t)PROGRESS_FLOOR &&
+                     server_pumps(&sv) > server_pumps_armed;
+        if (held_ready || phase_expired(&held_start))
+            break;
     }
-    int drained_stall = server_drained(&sv);
+    uint64_t server_pumps_held = server_pumps(&sv);
 
-    CHECK(stable_gens >= PLATEAU_STABLE_GENS);    /* a real plateau formed */
-    CHECK(plateau != UINT64_MAX);
-    CHECK(plateau >= (uint64_t)PLATEAU_FLOOR);    /* nonzero, a real prefix, not
-                                                    a trivial few objects */
-    CHECK(plateau < (uint64_t)WORKLOAD_BYTES);    /* below the workload */
-    CHECK(drained_stall == 0);                    /* app delivered nothing */
+    CHECK(held_ready);
+    CHECK(client_published(&cl) == N_OBJECTS);  /* publisher put it all out */
+    CHECK(flushed >= (uint64_t)PROGRESS_FLOOR); /* real transport progress */
+    CHECK(server_pumps_held > server_pumps_armed); /* advanced, unwoken */
 
-    printf("STALLED: published=%llu, transport flush_bytes plateau=%llu "
-           "(>= %d, < workload=%d) stable across %d pump-gens, app drained=%d\n",
+    /* the contract: with its polling held, the application received
+     * nothing, and neither side went fatal doing it */
+    int drained_held = server_drained(&sv);
+
+    CHECK(drained_held == 0);
+    CHECK(!moq_msquic_managed_is_fatal(cl.m));
+    CHECK(!moq_msquic_managed_is_fatal(sv.m));
+
+    printf("HELD: published=%llu, transport flush_bytes=%llu (>= %d), "
+           "receiver pumped %llu -> %llu with no application wake, "
+           "app drained=%d\n",
            (unsigned long long)client_published(&cl),
-           (unsigned long long)plateau, PLATEAU_FLOOR, WORKLOAD_BYTES,
-           PLATEAU_STABLE_GENS, drained_stall);
+           (unsigned long long)flushed, PROGRESS_FLOOR,
+           (unsigned long long)server_pumps_armed,
+           (unsigned long long)server_pumps_held, drained_held);
 
-    /* Phase 2: release -> the entire workload is delivered byte-exact and
-     * exactly once */
+    /* Phase 3 -- RELEASE. Both sides are driven now, and the entire
+     * workload must arrive byte-exact, in order, exactly once. */
     pthread_mutex_lock(&sv.mu);
     sv.release = true;
     pthread_mutex_unlock(&sv.mu);
+    struct timespec rel_start;
+    bool rel_clock_ok = phase_start(&rel_start);
     bool full = false;
-    for (int i = 0; i < 8000 && !full; i++) {
+
+    CHECK(rel_clock_ok);
+    while (rel_clock_ok) {
         kick(&sv, &cl);
         full = server_drained(&sv) >= N_OBJECTS;
+        if (full || phase_expired(&rel_start))
+            break;
     }
     CHECK(full);
 
@@ -383,6 +541,7 @@ static void t_stalled_receiver_recovers(const char *cert, const char *key)
     CHECK(sv.drained == N_OBJECTS);   /* all delivered */
     CHECK(sv.dup_objects == 0);       /* exactly once */
     CHECK(sv.object_errors == 0);     /* byte-exact */
+    CHECK(sv.order_errors == 0);      /* and in the order published */
     int missing = 0;
     for (int i = 0; i < N_OBJECTS; i++)
         if (sv.seen[i] != 1)
@@ -412,8 +571,10 @@ static void t_stalled_receiver_recovers(const char *cert, const char *key)
  * so it proves the transport RECEIVE-CREDIT path recovers — the windows are
  * advanced and the full 48 MiB is delivered byte-exact. It does NOT prove
  * autonomous managed progress: the explicit per-iteration wakes stand in for
- * any lost scheduler re-drive. Autonomous delivery with no external receiver
- * wake is proven separately by autonomous_bounded_drain below. */
+ * any lost scheduler re-drive. That the doorbell re-drives a draining
+ * receiver by itself, and stops when nothing drains, is proven
+ * deterministically over a real session event backlog in
+ * test_msquic_no_spin.c. */
 enum { BIG_OBJ = 64u * 1024u };
 enum { BIG_N = 768 };                          /* 48 MiB total on one subgroup */
 enum { BIG_STREAM_WIN = 16u * 1024u * 1024u }; /* StreamRecvWindowDefault */
@@ -643,483 +804,51 @@ static void t_over_window_continuous_drain(const char *cert, const char *key)
         printf("PASS: over_window_continuous_drain\n");
 }
 
-/* --- autonomous bounded-poll delivery: the managed re-drive regression ------
- *
- * The exact shape of the original MsQuic gauntlet stall: ONE subscriber, ONE
- * subgroup, 1024 x 256-byte objects, DEFAULT session event capacity, and a
- * receiver that polls a BOUNDED batch (<= 16) per pump and is NEVER explicitly
- * woken after setup. Autonomous managed progress alone must deliver every
- * object.
- *
- * The doorbell runs one on_lane_pump, then a post-pump service pass that can
- * refill the session event queue from inbound the bridge buffered while the
- * queue was full. That refill produces app-consumable events but does not
- * itself arm another pump, and — the publisher having finished — no fresh
- * transport RECEIVE arrives to arm one either. So without an explicit re-drive
- * the transfer stalls on a 16-event boundary: the publisher completes, the
- * receiver stays established and nonfatal, and the buffered remainder never
- * reaches the application. This test requires the scheduler to sustain that
- * re-drive to 1024/1024 with no external receiver wake.
- *
- * Unlike over_window above, NOTHING here wakes the receiver during delivery —
- * that is the whole point: over_window's explicit big_kick() drives both
- * facades every iteration and so proves transport credit recovery while
- * MASKING a lost autonomous re-drive; this case proves the re-drive itself.
- */
-enum { AUTO_OBJ = 256 };
-enum { AUTO_N = 1024 };
-enum { AUTO_POLL = 16 };   /* bounded per-pump event batch (never drain-loop) */
-
-struct auto_server {
-    pthread_mutex_t mu;
-    moq_msquic_managed_t *m;
-    int setup;
-    bool subscribed;
-    int drained, object_errors, dup_objects;
-    uint8_t seen[AUTO_N];
-};
-
-static int auto_server_pump(moq_msquic_managed_t *m,
-                            moq_msquic_managed_lane_t *lane, uint64_t now,
-                            void *ctx)
-{
-    struct auto_server *sv = ctx;
-    moq_msquic_managed_conn_t *c = moq_msquic_lane_next_conn(lane, NULL);
-    moq_session_t *s = c ? moq_msquic_managed_conn_session(c) : NULL;
-
-    (void)m;
-    pthread_mutex_lock(&sv->mu);
-    if (s != NULL) {
-        /* BOUNDED poll: exactly one batch of up to AUTO_POLL events, never a
-         * drain-until-empty loop — a dropped re-pump is only visible when the
-         * app leaves events behind, as a real bounded consumer does. */
-        moq_event_t ev[AUTO_POLL];
-        size_t ne = 0;
-        (void)moq_session_poll_events_ex(s, ev, AUTO_POLL, sizeof(ev[0]), &ne);
-        for (size_t i = 0; i < ne; i++) {
-            switch (ev[i].kind) {
-            case MOQ_EVENT_SETUP_COMPLETE: sv->setup++; break;
-            case MOQ_EVENT_OBJECT_RECEIVED: {
-                const moq_rcbuf_t *p = ev[i].u.object_received.payload;
-                uint64_t oid = ev[i].u.object_received.object_id;
-
-                if (p == NULL || moq_rcbuf_len(p) != AUTO_OBJ) {
-                    sv->object_errors++;
-                } else {
-                    uint8_t want[AUTO_OBJ];
-                    payload_fill(want, AUTO_OBJ, oid);
-                    if (memcmp(moq_rcbuf_data(p), want, AUTO_OBJ) != 0)
-                        sv->object_errors++;
-                }
-                if (oid < (uint64_t)AUTO_N && sv->seen[oid]++ != 0)
-                    sv->dup_objects++;
-                sv->drained++;
-                break;
-            }
-            default: break;
-            }
-            moq_event_cleanup(&ev[i]);
-        }
-        if (sv->setup > 0 && !sv->subscribed) {
-            static const moq_bytes_t ns[] = { { (const uint8_t *)"msq", 3 } };
-            moq_subscribe_cfg_t sc;
-            moq_subscription_t sub;
-            moq_subscribe_cfg_init(&sc);
-            sc.track_namespace.parts = (moq_bytes_t *)ns;
-            sc.track_namespace.count = 1;
-            sc.track_name = (moq_bytes_t){ (const uint8_t *)"track", 5 };
-            sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
-            sv->subscribed = true;
-            (void)moq_session_subscribe(s, &sc, now, &sub);
-        }
-    }
-    pthread_mutex_unlock(&sv->mu);
-    return 0;
-}
-
-struct auto_client {
-    pthread_mutex_t mu;
-    moq_msquic_managed_t *m;
-    int setup;
-    moq_subscription_t sub;
-    bool have_sub, accepted, subgroup_open;
-    moq_subgroup_handle_t sg;
-    uint64_t published;
-    int publish_errors;
-};
-
-static int auto_client_pump(moq_msquic_managed_t *m,
-                            moq_msquic_managed_lane_t *lane, uint64_t now,
-                            void *ctx)
-{
-    struct auto_client *cl = ctx;
-    moq_session_t *s = moq_msquic_managed_session(m);
-
-    (void)lane;
-    pthread_mutex_lock(&cl->mu);
-    moq_event_t ev;
-    while (s != NULL && moq_session_poll_events(s, &ev, 1) > 0) {
-        if (ev.kind == MOQ_EVENT_SETUP_COMPLETE) cl->setup++;
-        else if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
-            cl->sub = ev.u.subscribe_request.sub;
-            cl->have_sub = true;
-        }
-        moq_event_cleanup(&ev);
-    }
-    if (s != NULL && cl->have_sub && !cl->accepted) {
-        moq_accept_subscribe_cfg_t ac;
-        cl->accepted = true;
-        moq_accept_subscribe_cfg_init(&ac);
-        if (moq_session_accept_subscribe(s, cl->sub, &ac, now) < 0)
-            cl->publish_errors++;
-    }
-    if (s != NULL && cl->accepted && !cl->subgroup_open) {
-        moq_subgroup_cfg_t sgc;
-        moq_subgroup_cfg_init(&sgc);
-        sgc.group_id = 0;
-        sgc.publisher_priority = 200;
-        if (moq_session_open_subgroup(s, cl->sub, &sgc, now, &cl->sg) < 0)
-            cl->publish_errors++;
-        else
-            cl->subgroup_open = true;
-    }
-    while (s != NULL && cl->subgroup_open && cl->published < (uint64_t)AUTO_N) {
-        uint8_t bytes[AUTO_OBJ];
-        moq_rcbuf_t *buf = NULL;
-        payload_fill(bytes, AUTO_OBJ, cl->published);
-        if (moq_rcbuf_create(moq_alloc_default(), bytes, AUTO_OBJ, &buf) < 0) {
-            cl->publish_errors++;
-            break;
-        }
-        moq_result_t wr =
-            moq_session_write_object(s, cl->sg, cl->published, buf, now);
-        moq_rcbuf_decref(buf);
-        if (wr == MOQ_OK) cl->published++;
-        else break;
-    }
-    pthread_mutex_unlock(&cl->mu);
-    return 0;
-}
-
-static int auto_drained(struct auto_server *sv)
-{
-    pthread_mutex_lock(&sv->mu);
-    int d = sv->drained;
-    pthread_mutex_unlock(&sv->mu);
-    return d;
-}
-
-static uint64_t auto_published(struct auto_client *cl)
-{
-    pthread_mutex_lock(&cl->mu);
-    uint64_t p = cl->published;
-    pthread_mutex_unlock(&cl->mu);
-    return p;
-}
-
-static bool auto_established(struct auto_server *sv, struct auto_client *cl)
-{
-    pthread_mutex_lock(&sv->mu);
-    bool s = sv->setup > 0 && sv->subscribed;
-    pthread_mutex_unlock(&sv->mu);
-    pthread_mutex_lock(&cl->mu);
-    bool c = cl->have_sub;
-    pthread_mutex_unlock(&cl->mu);
-    return s && c;
-}
-
-static void t_autonomous_bounded_drain(const char *cert, const char *key,
-                                       uint32_t recv_cap)
-{
-    int before = failures;
-    struct auto_server sv;
-    struct auto_client cl;
-
-    memset(&sv, 0, sizeof(sv));
-    memset(&cl, 0, sizeof(cl));
-    pthread_mutex_init(&sv.mu, NULL);
-    pthread_mutex_init(&cl.mu, NULL);
-
-    moq_msquic_managed_cfg_t scfg;
-    cfg_side(&scfg, MOQ_PERSPECTIVE_SERVER, 0, cert, key, auto_server_pump, &sv,
-             0);
-    /* recv_cap == 0 selects the session default event capacity (the gauntlet
-     * shape); a large cap re-fills the queue less often but must still reach
-     * 1024/1024 autonomously — the re-drive settles either way. */
-    scfg.max_events = recv_cap;
-    CHECK(moq_msquic_managed_create(&scfg, &sv.m) == MOQ_OK);
-    if (sv.m == NULL) return;
-    uint16_t port = moq_msquic_managed_port(sv.m);
-    CHECK(port != 0);
-
-    moq_msquic_managed_cfg_t ccfg;
-    cfg_side(&ccfg, MOQ_PERSPECTIVE_CLIENT, port, cert, key, auto_client_pump,
-             &cl, SENDER_MAX_ACTIONS);
-    CHECK(moq_msquic_managed_create(&ccfg, &cl.m) == MOQ_OK);
-    if (cl.m == NULL) {
-        (void)moq_msquic_managed_stop(sv.m);
-        moq_msquic_managed_destroy(sv.m);
-        return;
-    }
-
-    /* Phase A — SETUP ONLY: drive the handshake and the subscribe handshake.
-     * Waking the receiver is allowed HERE; it stops before any object is
-     * published, so no delivery is charged to an explicit receiver wake. */
-    bool ready = false;
-    for (int i = 0; i < 40000 && !ready; i++) {
-        (void)moq_msquic_managed_wake(sv.m);
-        (void)moq_msquic_managed_wake(cl.m);
-        (void)moq_msquic_managed_wait(cl.m, 2 * 1000);
-        (void)moq_msquic_managed_wait(sv.m, 2 * 1000);
-        ready = auto_established(&sv, &cl);
-    }
-    CHECK(ready);
-
-    /* Phase B — publish + AUTONOMOUS receive. Wake ONLY the publisher; the
-     * receiver is NEVER woken again. Its every pump is a transport-driven
-     * autonomous one — precisely what the managed scheduler must sustain.
-     * Plateau-bounded: a stall fails fast (no progress for a run of waits)
-     * instead of spinning to the iteration cap. */
-    bool full = false;
-    int last = -1, stagnant = 0;
-    for (int i = 0; i < 200000 && !full; i++) {
-        (void)moq_msquic_managed_wake(cl.m);          /* publisher only */
-        (void)moq_msquic_managed_wait(cl.m, 2 * 1000);
-        (void)moq_msquic_managed_wait(sv.m, 2 * 1000);  /* WAIT, never WAKE */
-        int d = auto_drained(&sv);
-        full = d >= AUTO_N;
-        if (d == last) {
-            if (++stagnant > 500) break;   /* ~1s of no autonomous progress */
-        } else {
-            last = d;
-            stagnant = 0;
-        }
-    }
-
-    int drained = auto_drained(&sv);
-    uint64_t published = auto_published(&cl);
-    bool sv_fatal = moq_msquic_managed_is_fatal(sv.m);
-    bool cl_fatal = moq_msquic_managed_is_fatal(cl.m);
-
-    if (!full) {
-        /* Causality of the stall, via PUBLIC discriminators only (no seam):
-         * the transfer is not dead, it is un-pumped. The publisher completed,
-         * the receiver is established and nonfatal, delivery stopped on a
-         * 16-event boundary, and explicit receiver wakes advance it one
-         * bounded batch at a time to completion. On the fixed scheduler this
-         * branch is never taken — autonomous progress already reached AUTO_N. */
-        fprintf(stderr,
-                "AUTONOMOUS STALL: drained=%d/%d (=%d*%d + %d) published=%llu "
-                "established=%d sv_fatal=%d\n",
-                drained, AUTO_N, drained / AUTO_POLL, AUTO_POLL,
-                drained % AUTO_POLL, (unsigned long long)published,
-                auto_established(&sv, &cl), sv_fatal);
-        CHECK(published == AUTO_N);            /* publisher done: data buffered */
-        CHECK(auto_established(&sv, &cl));      /* receiver still established */
-        CHECK(!sv_fatal);                      /* receiver alive, just idle */
-        CHECK(drained < AUTO_N);               /* stalled below the workload */
-
-        int d0 = drained;
-        (void)moq_msquic_managed_wake(sv.m);   /* ONE explicit receiver wake */
-        (void)moq_msquic_managed_wait(sv.m, 50 * 1000);
-        int d1 = auto_drained(&sv);
-        CHECK(d1 > d0);                        /* a wake advances the transfer */
-
-        bool rec = false;                      /* repeated wakes complete it */
-        for (int i = 0; i < 200000 && !rec; i++) {
-            (void)moq_msquic_managed_wake(sv.m);
-            (void)moq_msquic_managed_wait(sv.m, 5 * 1000);
-            rec = auto_drained(&sv) >= AUTO_N;
-        }
-        CHECK(rec);
-        drained = auto_drained(&sv);
-    }
-
-    (void)moq_msquic_managed_stop(cl.m);
-    (void)moq_msquic_managed_stop(sv.m);
-    moq_msquic_managed_destroy(cl.m);
-    moq_msquic_managed_destroy(sv.m);
-
-    /* The regression proper: autonomous progress alone delivered everything. */
-    CHECK(full);
-    CHECK(published == AUTO_N);
-    CHECK(cl.publish_errors == 0);
-    CHECK(drained == AUTO_N);            /* all delivered */
-    CHECK(sv.dup_objects == 0);          /* exactly once */
-    CHECK(sv.object_errors == 0);        /* byte-exact */
-    int missing = 0;
-    for (int i = 0; i < AUTO_N; i++)
-        if (sv.seen[i] != 1)
-            missing++;
-    CHECK(missing == 0);                 /* no loss */
-    CHECK(!cl_fatal && !sv_fatal);       /* no fatal state */
-
-    printf("AUTONOMOUS[cap=%u]: delivered=%d/%d (published=%llu) byte-exact "
-           "exactly-once, no external receiver wake (missing=%d dup=%d)\n",
-           recv_cap, drained, AUTO_N, (unsigned long long)published, missing,
-           sv.dup_objects);
-
-    pthread_mutex_destroy(&sv.mu);
-    pthread_mutex_destroy(&cl.mu);
-    if (failures == before)
-        printf("PASS: autonomous_bounded_drain[cap=%u]\n", recv_cap);
-}
-
-/* --- anti-spin: a non-draining receiver must not busy-loop the doorbell -----
- *
- * The re-drive is gated on the event-progress token: a receiver that frees no
- * event capacity advances the token zero times, so no pump is re-armed. This
- * proves the bound directly — with the publisher quiet (no new transport events)
- * and NO explicit receiver wake, a receiver that drains nothing must let its
- * doorbell go idle: its pump-sweep count barely moves. An unconditional re-arm
- * would spin here (a service pass every idle tick), which this test catches. */
-
-struct nospin_server {
-    pthread_mutex_t mu;
-    moq_msquic_managed_t *m;
-    int setup;
-    bool subscribed;
-    bool frozen;   /* once subscribed, never poll again (drain nothing) */
-};
-
-static int nospin_server_pump(moq_msquic_managed_t *m,
-                              moq_msquic_managed_lane_t *lane, uint64_t now,
-                              void *ctx)
-{
-    struct nospin_server *sv = ctx;
-    moq_msquic_managed_conn_t *c = moq_msquic_lane_next_conn(lane, NULL);
-    moq_session_t *s = c ? moq_msquic_managed_conn_session(c) : NULL;
-
-    (void)m;
-    pthread_mutex_lock(&sv->mu);
-    if (s != NULL && !sv->frozen) {
-        moq_event_t ev[AUTO_POLL];
-        size_t ne = 0;
-        (void)moq_session_poll_events_ex(s, ev, AUTO_POLL, sizeof(ev[0]), &ne);
-        for (size_t i = 0; i < ne; i++) {
-            if (ev[i].kind == MOQ_EVENT_SETUP_COMPLETE) sv->setup++;
-            moq_event_cleanup(&ev[i]);
-        }
-        if (sv->setup > 0 && !sv->subscribed) {
-            static const moq_bytes_t ns[] = { { (const uint8_t *)"msq", 3 } };
-            moq_subscribe_cfg_t sc;
-            moq_subscription_t sub;
-            moq_subscribe_cfg_init(&sc);
-            sc.track_namespace.parts = (moq_bytes_t *)ns;
-            sc.track_namespace.count = 1;
-            sc.track_name = (moq_bytes_t){ (const uint8_t *)"track", 5 };
-            sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
-            sv->subscribed = true;
-            (void)moq_session_subscribe(s, &sc, now, &sub);
-            sv->frozen = true;   /* stop draining: objects will queue and stall */
-        }
-    }
-    pthread_mutex_unlock(&sv->mu);
-    return 0;
-}
-
-static uint64_t lane_pump_sweeps(moq_msquic_managed_t *m)
-{
-    moq_msquic_managed_lane_t *lane = moq_msquic_managed_lane(m, 0);
-    moq_msquic_lane_stats_t st;
-    if (lane == NULL ||
-        moq_msquic_lane_get_stats(lane, &st, sizeof(st)) != MOQ_OK)
-        return UINT64_MAX;
-    return st.pump_sweeps;
-}
-
-static void t_nondraining_no_spin(const char *cert, const char *key)
-{
-    int before = failures;
-    struct nospin_server sv;
-    struct auto_client cl;
-
-    memset(&sv, 0, sizeof(sv));
-    memset(&cl, 0, sizeof(cl));
-    pthread_mutex_init(&sv.mu, NULL);
-    pthread_mutex_init(&cl.mu, NULL);
-
-    moq_msquic_managed_cfg_t scfg;
-    cfg_side(&scfg, MOQ_PERSPECTIVE_SERVER, 0, cert, key, nospin_server_pump,
-             &sv, 0);
-    scfg.max_events = 0;
-    CHECK(moq_msquic_managed_create(&scfg, &sv.m) == MOQ_OK);
-    if (sv.m == NULL) return;
-    uint16_t port = moq_msquic_managed_port(sv.m);
-    CHECK(port != 0);
-
-    moq_msquic_managed_cfg_t ccfg;
-    cfg_side(&ccfg, MOQ_PERSPECTIVE_CLIENT, port, cert, key, auto_client_pump,
-             &cl, SENDER_MAX_ACTIONS);
-    CHECK(moq_msquic_managed_create(&ccfg, &cl.m) == MOQ_OK);
-    if (cl.m == NULL) {
-        (void)moq_msquic_managed_stop(sv.m);
-        moq_msquic_managed_destroy(sv.m);
-        return;
-    }
-
-    /* Drive setup + a publish burst. The receiver subscribes then freezes; its
-     * event queue fills and the adapter arrests. */
-    bool primed = false;
-    for (int i = 0; i < 40000 && !primed; i++) {
-        (void)moq_msquic_managed_wake(sv.m);
-        (void)moq_msquic_managed_wake(cl.m);
-        (void)moq_msquic_managed_wait(cl.m, 2 * 1000);
-        (void)moq_msquic_managed_wait(sv.m, 2 * 1000);
-        pthread_mutex_lock(&sv.mu);
-        bool sub = sv.subscribed;
-        pthread_mutex_unlock(&sv.mu);
-        primed = sub && auto_published(&cl) >= AUTO_N;
-    }
-    CHECK(primed);
-
-    /* QUIET WINDOW: no wakes to either side — pure waits on the frozen
-     * receiver. A correctly gated re-drive idles here (the token never advances
-     * because the app drains nothing), so pump-sweeps barely move. */
-    uint64_t sweeps0 = lane_pump_sweeps(sv.m);
-    for (int i = 0; i < 400; i++)
-        (void)moq_msquic_managed_wait(sv.m, 5 * 1000);   /* ~2s of quiet */
-    uint64_t sweeps1 = lane_pump_sweeps(sv.m);
-
-    bool sv_fatal = moq_msquic_managed_is_fatal(sv.m);
-    (void)moq_msquic_managed_stop(cl.m);
-    (void)moq_msquic_managed_stop(sv.m);
-    moq_msquic_managed_destroy(cl.m);
-    moq_msquic_managed_destroy(sv.m);
-
-    CHECK(sweeps0 != UINT64_MAX && sweeps1 != UINT64_MAX);
-    /* Bounded: idle doorbell does a handful of sweeps at most across ~2s; a spin
-     * would be thousands. The gate is what makes this hold. */
-    uint64_t delta = sweeps1 - sweeps0;
-    CHECK(delta < 100);
-    CHECK(!sv_fatal);
-
-    printf("NO-SPIN: non-draining receiver quiet-window pump-sweeps delta=%llu "
-           "(bound<100)\n", (unsigned long long)delta);
-
-    pthread_mutex_destroy(&sv.mu);
-    pthread_mutex_destroy(&cl.mu);
-    if (failures == before)
-        printf("PASS: nondraining_no_spin\n");
-}
-
 int main(int argc, char **argv)
 {
+    /*
+     * Two cells live in this binary and they belong to DIFFERENT lanes, so
+     * each CTest registration names the one it wants. A CTest label applies
+     * to the registered command, not to a C function, so running both from
+     * one command would put the qualification cell inside the correctness
+     * gate no matter how it was labelled.
+     *
+     *   stall       -- the retained application-event hold/release cell
+     *   over_window -- the real-QUIC credit-renewal qualification cell
+     *   (absent)    -- documented direct-run mode: both, for a developer
+     *                  running the binary by hand. Both CTest registrations
+     *                  always pass a selector, so this can never affect
+     *                  their classification.
+     *
+     * An unrecognized selector fails closed rather than silently running
+     * nothing.
+     */
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <cert.pem> <key.pem>\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <cert.pem> <key.pem> [stall|over_window]\n",
+                argv[0]);
         return 2;
     }
+    const char *sel = argc > 3 ? argv[3] : NULL;
+    bool run_stall = sel == NULL || strcmp(sel, "stall") == 0;
+    bool run_over_window = sel == NULL || strcmp(sel, "over_window") == 0;
+
+    if (!run_stall && !run_over_window) {
+        fprintf(stderr, "unknown case selector '%s' "
+                        "(expected stall|over_window)\n", sel);
+        return 2;
+    }
+
     static const QUIC_API_TABLE *lib_pin;
     if (QUIC_FAILED(MsQuicOpen2(&lib_pin))) {
         fprintf(stderr, "MsQuicOpen2 failed\n");
         return 2;
     }
 
-    t_stalled_receiver_recovers(argv[1], argv[2]);
-    t_over_window_continuous_drain(argv[1], argv[2]);
-    t_autonomous_bounded_drain(argv[1], argv[2], 0);      /* default capacity */
-    t_autonomous_bounded_drain(argv[1], argv[2], 8192);   /* large capacity */
-    t_nondraining_no_spin(argv[1], argv[2]);
+    if (run_stall)
+        t_stalled_receiver_recovers(argv[1], argv[2]);
+    if (run_over_window)
+        t_over_window_continuous_drain(argv[1], argv[2]);
 
     if (failures == 0)
         printf("PASS: msquic_recv_loopback\n");

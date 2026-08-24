@@ -147,6 +147,49 @@ moq_result_t moq_loc_parse(moq_loc_profile_t profile,
 
 /* -- Encode ---------------------------------------------------------- */
 
+/*
+ * One planned LOC-01 property. Planning every field into a single list
+ * keeps the encoded byte count and the emitted bytes driven by the same
+ * iteration: the list is built once, measured, then written.
+ */
+typedef struct loc01_prop {
+    uint64_t       type;
+    bool           is_varint;
+    uint64_t       val;       /* is_varint */
+    const uint8_t *bytes;     /* !is_varint, borrowed */
+    size_t         bytes_len;
+} loc01_prop_t;
+
+static size_t loc01_prop_encoded_len(uint64_t prev, const loc01_prop_t *p)
+{
+    if (p->is_varint)
+        return moq_kvp_varint_entry_encoded_len(prev, p->type, p->val);
+
+    moq_kvp_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = p->type;
+    e.is_varint = false;
+    e.value = p->bytes;
+    e.value_len = p->bytes_len;
+    return moq_kvp_entry_encoded_len(prev, &e);
+}
+
+static size_t loc01_prop_encode(uint64_t prev, const loc01_prop_t *p,
+                                 uint8_t *buf, size_t buf_len)
+{
+    if (p->is_varint)
+        return moq_kvp_encode_varint_entry(prev, p->type, p->val,
+                                            buf, buf_len);
+
+    moq_kvp_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = p->type;
+    e.is_varint = false;
+    e.value = p->bytes;
+    e.value_len = p->bytes_len;
+    return moq_kvp_encode_entry(prev, &e, buf, buf_len);
+}
+
 moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
                              moq_loc_profile_t profile,
                              const moq_loc_headers_t *headers,
@@ -166,59 +209,62 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     if (headers->has_timescale)
         return MOQ_ERR_INVAL;
 
-    bool has_any = headers->has_timestamp ||
-                   headers->has_video_frame_marking ||
-                   headers->has_audio_level ||
-                   headers->has_video_config;
-    if (!has_any) return MOQ_OK;
-
-    /* Collect varint entries (type, value) and one optional bytes entry.
-     * LOC-01 IDs: 0x02 timestamp, 0x04 vfm, 0x06 audio, 0x0d config */
-    uint64_t vi_type[3];
-    uint64_t vi_val[3];
-    size_t vi_count = 0;
+    /* Plan every present field in ascending LOC-01 property-ID order:
+     * 0x02 timestamp, 0x04 frame marking, 0x06 audio level,
+     * 0x0d video config. */
+    loc01_prop_t props[4];
+    size_t prop_count = 0;
 
     if (headers->has_timestamp) {
-        vi_type[vi_count] = LOC01_CAPTURE_TIMESTAMP;
-        vi_val[vi_count]  = headers->timestamp;
-        vi_count++;
+        props[prop_count].type = LOC01_CAPTURE_TIMESTAMP;
+        props[prop_count].is_varint = true;
+        props[prop_count].val = headers->timestamp;
+        props[prop_count].bytes = NULL;
+        props[prop_count].bytes_len = 0;
+        prop_count++;
     }
 
     if (headers->has_video_frame_marking) {
-        vi_type[vi_count] = LOC01_VIDEO_FRAME_MARKING;
-        vi_val[vi_count]  = encode_video_frame_marking(
+        props[prop_count].type = LOC01_VIDEO_FRAME_MARKING;
+        props[prop_count].is_varint = true;
+        props[prop_count].val = encode_video_frame_marking(
             &headers->video_frame_marking);
-        vi_count++;
+        props[prop_count].bytes = NULL;
+        props[prop_count].bytes_len = 0;
+        prop_count++;
     }
 
     if (headers->has_audio_level) {
-        vi_type[vi_count] = LOC01_AUDIO_LEVEL;
-        vi_val[vi_count]  = encode_audio_level(&headers->audio_level);
-        vi_count++;
+        props[prop_count].type = LOC01_AUDIO_LEVEL;
+        props[prop_count].is_varint = true;
+        props[prop_count].val = encode_audio_level(&headers->audio_level);
+        props[prop_count].bytes = NULL;
+        props[prop_count].bytes_len = 0;
+        prop_count++;
     }
 
-    bool has_config = headers->has_video_config;
+    if (headers->has_video_config) {
+        props[prop_count].type = LOC01_VIDEO_CONFIG;
+        props[prop_count].is_varint = false;
+        props[prop_count].val = 0;
+        props[prop_count].bytes = headers->video_config.data;
+        props[prop_count].bytes_len = headers->video_config.len;
+        prop_count++;
+    }
+
+    /* No fields present means no properties: the caller gets MOQ_OK with a
+     * NULL rcbuf. Every path below therefore encodes at least one entry,
+     * so the selected buffer is always written before it is copied. */
+    if (prop_count == 0) return MOQ_OK;
 
     /* Compute total encoded size. */
     size_t total = 0;
     uint64_t prev = 0;
-    for (size_t i = 0; i < vi_count; i++) {
-        size_t n = moq_kvp_varint_entry_encoded_len(prev, vi_type[i],
-                                                      vi_val[i]);
+    for (size_t i = 0; i < prop_count; i++) {
+        size_t n = loc01_prop_encoded_len(prev, &props[i]);
         if (n == 0) return MOQ_ERR_INVAL;
         total += n;
-        prev = vi_type[i];
-    }
-    if (has_config) {
-        moq_kvp_entry_t ce;
-        memset(&ce, 0, sizeof(ce));
-        ce.type = LOC01_VIDEO_CONFIG;
-        ce.is_varint = false;
-        ce.value = headers->video_config.data;
-        ce.value_len = headers->video_config.len;
-        size_t n = moq_kvp_entry_encoded_len(prev, &ce);
-        if (n == 0) return MOQ_ERR_INVAL;
-        total += n;
+        prev = props[i].type;
     }
 
     /* Encode into a stack buffer, then copy into an rcbuf. */
@@ -233,33 +279,24 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
 
     size_t pos = 0;
     prev = 0;
-    for (size_t i = 0; i < vi_count; i++) {
-        size_t n = moq_kvp_encode_varint_entry(prev, vi_type[i],
-                                                vi_val[i],
-                                                buf + pos, total - pos);
+    for (size_t i = 0; i < prop_count; i++) {
+        size_t n = loc01_prop_encode(prev, &props[i], buf + pos, total - pos);
         if (n == 0) {
             if (heap) alloc->free(buf, total, alloc->ctx);
             return MOQ_ERR_INVAL;
         }
         pos += n;
-        prev = vi_type[i];
-    }
-    if (has_config) {
-        moq_kvp_entry_t ce;
-        memset(&ce, 0, sizeof(ce));
-        ce.type = LOC01_VIDEO_CONFIG;
-        ce.is_varint = false;
-        ce.value = headers->video_config.data;
-        ce.value_len = headers->video_config.len;
-        size_t n = moq_kvp_encode_entry(prev, &ce, buf + pos, total - pos);
-        if (n == 0) {
-            if (heap) alloc->free(buf, total, alloc->ctx);
-            return MOQ_ERR_INVAL;
-        }
-        pos += n;
+        prev = props[i].type;
     }
 
-    moq_result_t rc = moq_rcbuf_create(alloc, buf, total, out_properties);
+    /* The bytes handed to the rcbuf are exactly the bytes the plan
+     * measured; a short write would copy unwritten buffer tail. */
+    if (pos != total) {
+        if (heap) alloc->free(buf, total, alloc->ctx);
+        return MOQ_ERR_INVAL;
+    }
+
+    moq_result_t rc = moq_rcbuf_create(alloc, buf, pos, out_properties);
     if (heap) alloc->free(buf, total, alloc->ctx);
     return rc;
 }

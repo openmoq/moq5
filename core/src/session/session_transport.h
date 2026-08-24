@@ -21,6 +21,20 @@
 bool moq_session_uses_uni_control(const moq_session_t *s);
 
 /*
+ * True when the session still needs the PEER's terminal (FIN/RESET) on this
+ * bidi stream after our own send half has closed -- i.e. a peer-origin
+ * receive path, a locally-terminated request bidi in the drain ring, or a
+ * no-slot admission carrier awaiting its terminal. This is deliberately
+ * NARROWER than moq_session_has_transport_stream(), which additionally
+ * recognises a live request-registry owner for retainability (#245a): a
+ * local-origin request bidi we ourselves FIN'd must still retire even though
+ * its owner lingers awaiting a response. The bridge uses this to decide
+ * whether to keep a locally-closed mapping alive or tombstone it.
+ */
+bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
+                                             moq_stream_ref_t ref);
+
+/*
  * Classify an inbound peer unidirectional stream by its leading bytes. If the
  * profile has no unidirectional control channel (e.g. draft-16), returns
  * MOQ_UNI_CLASS_DATA so every peer unidirectional stream is treated as data.
@@ -118,6 +132,13 @@ uint32_t session_budget_remaining(const moq_session_t *s);
  * DELTAS across a call: several tests in one binary accumulate into them. */
 extern uint64_t session_budget_enter_count;    /* budget contexts entered */
 extern uint64_t session_budget_suspend_count;  /* budgeted advances suspended */
+/* Namespace-suffix membership-work probe: bumped once per ns_suffix_key_cmp()
+ * call, which is shared by the inbound (receive-budget-counted) and outbound
+ * (publisher) suffix sets. The counter is NOT inbound-only; tests measure its
+ * DELTA around a controlled inbound workload. It observes membership work and
+ * does not change it. Representation-neutral: a future ordered-tree membership
+ * would probe far fewer keys per insert. */
+extern uint64_t session_ns_suffix_probe_count;
 #endif
 
 #endif /* MOQ_SESSION_TRANSPORT_H */

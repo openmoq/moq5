@@ -12938,7 +12938,7 @@ static void test_declare_install_immediate(moq_version_t ver, bool tick_mode)
 static moq_pub_deferred_t *s3a_last_deferred;
 static uint64_t s3a_last_deferred_id;
 static moq_pub_accept_decision_t s3a_defer_cb(void *ctx,
-    const moq_pub_subscribe_info_t *info, unsigned int *error_code)
+    const moq_pub_subscribe_info_t *info, moq_request_error_t *error_code)
 {
     (void)ctx; (void)error_code;
     s3a_last_deferred = info->deferred;

@@ -180,6 +180,8 @@ static int test_future_owners_are_uncharged(void)
     session_sweep_owner_reset(s);
     for (size_t i = 0; i < s->pub_cap && i < 4; i++) {
         moq_pub_entry_t *pe = &s->publishes[i];
+        /* Production allocation links the slot; the sweep walks that list. */
+        pub_occ_link(s, i);
         pe->done_pending = true;
         pe->done_expired = false;
         pe->done_stream_count = 5;
@@ -253,6 +255,8 @@ static int test_zero_budget_idle_sweep_completes(void)
 
     for (size_t i = 0; i < s->pub_cap && i < 4; i++) {
         moq_pub_entry_t *pe = &s->publishes[i];
+        /* Production allocation links the slot; the sweep walks that list. */
+        pub_occ_link(s, i);
         pe->done_pending = true;
         pe->done_expired = false;
         pe->done_stream_count = 5;
@@ -284,6 +288,7 @@ static int test_old_epoch_then_catch_up(void)
     sweep_arm_expired_pub(s, 0);
     sweep_bind_rx(s, 2, s->publishes[0].handle);
     moq_pub_entry_t *late = &s->publishes[1];
+    pub_occ_link(s, 1);          /* as production allocation would */
     late->done_pending = true;
     late->done_expired = false;
     late->done_stream_count = MOQ_QUIC_VARINT_MAX;

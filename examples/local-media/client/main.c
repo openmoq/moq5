@@ -15,6 +15,9 @@
 #include <moq/playback.h>
 #include <moq/msf.h>
 #include <moq/rcbuf.h>
+
+#include "../../common/moq_example_term.h"
+
 #include <picoquic_packet_loop.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,8 +80,10 @@ static void on_subscribed(void *ctx, moq_sub_track_t *track) {
 static void on_error(void *ctx, moq_sub_track_t *track,
                       moq_request_error_t code, moq_bytes_t reason) {
     (void)ctx; (void)track;
-    fprintf(stderr, "  subscribe error: %u \"%.*s\"\n",
-        code, (int)reason.len, reason.data ? (const char *)reason.data : "");
+    /* reason is PEER-CONTROLLED: escape before printing. */
+    fprintf(stderr, "  subscribe error: %u \"", code);
+    moq_example_term_fprint(stderr, reason.data, reason.len);
+    fputs("\"\n", stderr);
     running = 0;
 }
 
@@ -122,13 +127,17 @@ static void handle_catalog_object(client_ctx_t *ctx, moq_sub_object_t *obj,
         moq_msf_catalog_cleanup(&ctx->alloc, &cat);
         return;
     }
-    fprintf(stderr, "  catalog: discovered video track \"%.*s\"\n",
-        (int)vt->name.len, (const char *)vt->name.data);
+    /* track name comes from the parsed catalog (peer-controlled): escape it. */
+    fputs("  catalog: discovered video track \"", stderr);
+    moq_example_term_fprint(stderr, vt->name.data, vt->name.len);
+    fputs("\"\n", stderr);
 
     if (vt->packaging.len != 4 ||
         memcmp(vt->packaging.data, "cmaf", 4) != 0) {
-        fprintf(stderr, "  catalog: expected cmaf packaging, got \"%.*s\"\n",
-            (int)vt->packaging.len, (const char *)vt->packaging.data);
+        /* packaging string is peer-controlled: escape it. */
+        fputs("  catalog: expected cmaf packaging, got \"", stderr);
+        moq_example_term_fprint(stderr, vt->packaging.data, vt->packaging.len);
+        fputs("\"\n", stderr);
         moq_msf_catalog_cleanup(&ctx->alloc, &cat);
         return;
     }

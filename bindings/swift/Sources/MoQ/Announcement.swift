@@ -35,7 +35,7 @@ public struct NamespacePublishedInfo: Sendable, Equatable, Hashable {
 /// Publisher-side event: peer rejected our namespace announcement.
 public struct NamespaceRejectedInfo: Sendable, Equatable, Hashable {
     public let announcement: Announcement
-    public let errorCode: UInt32
+    public let errorCode: UInt64
     public let reason: String
     public let canRetry: Bool
 }

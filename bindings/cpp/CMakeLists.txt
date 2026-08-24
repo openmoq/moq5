@@ -80,6 +80,22 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_cpp_session PRIVATE moq::cpp)
     add_test(NAME cpp_session COMMAND test_cpp_session)
 
+    # Single-TU cardinality proof: macro-renames only the two size-aware poll
+    # entry points so the fakes in that TU are reached without interposition.
+    # Must stay one TU -- a second, differently macro-expanded moq::session in
+    # the same binary would violate the ODR.
+    add_executable(test_cpp_batched_poll_cardinality
+                   tests/test_batched_poll_cardinality.cpp)
+    target_link_libraries(test_cpp_batched_poll_cardinality PRIVATE moq::cpp)
+    add_test(NAME cpp_batched_poll_cardinality
+             COMMAND test_cpp_batched_poll_cardinality)
+
+    add_executable(test_cpp_batched_poll_semantics
+                   tests/test_batched_poll_semantics.cpp)
+    target_link_libraries(test_cpp_batched_poll_semantics PRIVATE moq::cpp)
+    add_test(NAME cpp_batched_poll_semantics
+             COMMAND test_cpp_batched_poll_semantics)
+
     add_executable(test_cpp_operations tests/test_operations.cpp)
     target_link_libraries(test_cpp_operations PRIVATE moq::cpp)
     add_test(NAME cpp_operations COMMAND test_cpp_operations)

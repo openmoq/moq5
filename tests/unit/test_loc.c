@@ -589,6 +589,278 @@ int main(void)
         moq_rcbuf_decref(out);
     }
 
+    /* -- video config alone: byte-level oracle ------------------------ */
+    {
+        uint8_t cfg[] = { 0xAA, 0xBB, 0xCC };
+
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_video_config = true;
+        h.video_config.data = cfg;
+        h.video_config.len = sizeof(cfg);
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(out != NULL);
+
+        /* Wire: [delta 0x0d] [len 0x03] [AA BB CC] = 5 bytes. */
+        const uint8_t *d = moq_rcbuf_data(out);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(out), 5);
+        MOQ_TEST_CHECK_EQ_HEX(d[0], 0x0d);
+        MOQ_TEST_CHECK_EQ_HEX(d[1], 0x03);
+        MOQ_TEST_CHECK(memcmp(d + 2, cfg, sizeof(cfg)) == 0);
+        moq_rcbuf_decref(out);
+    }
+
+    /* -- emitted length equals the independently planned length -------
+     * The encoder measures every present field with the KVP length
+     * helpers and then writes exactly that many bytes. Recomputing the
+     * plan here pins that equality through the public surface, for each
+     * field alone and for the combined encoding. */
+    {
+        uint8_t cfg[] = { 0x01, 0x02, 0x03, 0x04, 0x05 };
+
+        struct {
+            const char *name;
+            bool ts, vfm, al, cfg_on;
+        } cases[] = {
+            { "timestamp",       true,  false, false, false },
+            { "frame marking",   false, true,  false, false },
+            { "audio level",     false, false, true,  false },
+            { "video config",    false, false, false, true  },
+            { "ts+vfm",          true,  true,  false, false },
+            { "ts+config",       true,  false, false, true  },
+            { "vfm+al+config",   false, true,  true,  true  },
+            { "all four",        true,  true,  true,  true  },
+        };
+
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            moq_loc_headers_t h;
+            moq_loc_headers_init(&h);
+            if (cases[c].ts) {
+                h.has_timestamp = true;
+                h.timestamp = 1746104600000000ULL;
+            }
+            if (cases[c].vfm) {
+                h.has_video_frame_marking = true;
+                h.video_frame_marking.start_of_frame = true;
+                h.video_frame_marking.independent = true;
+                h.video_frame_marking.temporal_id = 3;
+            }
+            if (cases[c].al) {
+                h.has_audio_level = true;
+                h.audio_level.voice_activity = true;
+                h.audio_level.level = 42;
+            }
+            if (cases[c].cfg_on) {
+                h.has_video_config = true;
+                h.video_config.data = cfg;
+                h.video_config.len = sizeof(cfg);
+            }
+
+            /* Plan the same entries in the same ascending order. */
+            size_t planned = 0;
+            uint64_t prev = 0;
+            if (cases[c].ts) {
+                planned += moq_kvp_varint_entry_encoded_len(prev, 0x02,
+                                                             h.timestamp);
+                prev = 0x02;
+            }
+            if (cases[c].vfm) {
+                /* SOF|independent|tid=3 == 0xA3 */
+                planned += moq_kvp_varint_entry_encoded_len(prev, 0x04, 0xA3);
+                prev = 0x04;
+            }
+            if (cases[c].al) {
+                planned += moq_kvp_varint_entry_encoded_len(prev, 0x06, 0xAA);
+                prev = 0x06;
+            }
+            if (cases[c].cfg_on) {
+                moq_kvp_entry_t ce;
+                memset(&ce, 0, sizeof(ce));
+                ce.type = 0x0d;
+                ce.is_varint = false;
+                ce.value = cfg;
+                ce.value_len = sizeof(cfg);
+                planned += moq_kvp_entry_encoded_len(prev, &ce);
+            }
+            MOQ_TEST_CHECK(planned > 0);
+
+            const moq_alloc_t *alloc = moq_alloc_default();
+            moq_rcbuf_t *out = NULL;
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+            MOQ_TEST_CHECK(out != NULL);
+            if (out) {
+                MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(out), planned);
+
+                /* Every emitted byte is decodable: nothing beyond the
+                 * planned span, and no unwritten tail. */
+                moq_kvp_decoder_t dec;
+                moq_kvp_decoder_init(&dec, moq_rcbuf_data(out),
+                                      moq_rcbuf_len(out));
+                moq_kvp_entry_t e;
+                size_t seen = 0;
+                moq_result_t rc;
+                while ((rc = moq_kvp_decode_next(&dec, &e)) == MOQ_OK)
+                    seen++;
+                MOQ_TEST_CHECK(rc == MOQ_DONE);
+                MOQ_TEST_CHECK_EQ_SIZE(seen,
+                    (size_t)(cases[c].ts + cases[c].vfm +
+                             cases[c].al + cases[c].cfg_on));
+                moq_rcbuf_decref(out);
+            }
+        }
+    }
+
+    /* -- stack/heap boundary around the 256-byte scratch buffer -------
+     * A config entry encodes as [delta 0x0d][len varint][value]; with a
+     * 2-byte length varint that is value_len + 3 bytes on the wire. So
+     * 253 bytes of config is exactly 256 (the last stack-path size) and
+     * 254 is 257 (the first heap-path size). Both must produce the same
+     * byte-exact result. */
+    {
+        static const size_t kValueLens[] = { 252, 253, 254, 300 };
+        static const size_t kExpected[]  = { 255, 256, 257, 303 };
+
+        for (size_t c = 0; c < sizeof(kValueLens) / sizeof(kValueLens[0]); c++) {
+            uint8_t cfg[320];
+            for (size_t i = 0; i < kValueLens[c]; i++)
+                cfg[i] = (uint8_t)(i * 7 + c);
+
+            moq_loc_headers_t h;
+            moq_loc_headers_init(&h);
+            h.has_video_config = true;
+            h.video_config.data = cfg;
+            h.video_config.len = kValueLens[c];
+
+            const moq_alloc_t *alloc = moq_alloc_default();
+            moq_rcbuf_t *out = NULL;
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+            MOQ_TEST_CHECK(out != NULL);
+            if (!out) continue;
+
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(out), kExpected[c]);
+
+            moq_loc_headers_t parsed;
+            moq_bytes_t props = { moq_rcbuf_data(out), moq_rcbuf_len(out) };
+            MOQ_TEST_CHECK(moq_loc_parse(P01, props, &parsed) == MOQ_OK);
+            MOQ_TEST_CHECK(parsed.has_video_config == true);
+            MOQ_TEST_CHECK_EQ_SIZE(parsed.video_config.len, kValueLens[c]);
+            MOQ_TEST_CHECK(memcmp(parsed.video_config.data, cfg,
+                                   kValueLens[c]) == 0);
+            moq_rcbuf_decref(out);
+        }
+    }
+
+    /* -- allocator failure at the first heap size (257 bytes) --------- */
+    {
+        uint8_t cfg[254];
+        memset(cfg, 0x5A, sizeof(cfg));
+
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_video_config = true;
+        h.video_config.data = cfg;
+        h.video_config.len = sizeof(cfg);
+
+        /* The staging allocation is alloc #1 on this path. */
+        {
+            oom_alloc_state_t oom = { 0, 0, 1 };
+            moq_alloc_t fail_alloc = oom_allocator(&oom);
+            moq_rcbuf_t *out = NULL;
+            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out)
+                           == MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK(out == NULL);
+            MOQ_TEST_CHECK(oom.balance == 0);
+        }
+
+        /* The rcbuf allocation is alloc #2; the staging buffer is freed. */
+        {
+            oom_alloc_state_t oom = { 0, 0, 2 };
+            moq_alloc_t fail_alloc = oom_allocator(&oom);
+            moq_rcbuf_t *out = NULL;
+            MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out)
+                           == MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK(out == NULL);
+            MOQ_TEST_CHECK(oom.balance == 0);
+        }
+    }
+
+    /* -- allocator failure on the last stack size (256 bytes) ---------
+     * Only the rcbuf allocates here, so alloc #1 is the rcbuf itself. */
+    {
+        uint8_t cfg[253];
+        memset(cfg, 0x33, sizeof(cfg));
+
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_video_config = true;
+        h.video_config.data = cfg;
+        h.video_config.len = sizeof(cfg);
+
+        oom_alloc_state_t oom = { 0, 0, 1 };
+        moq_alloc_t fail_alloc = oom_allocator(&oom);
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(&fail_alloc, P01, &h, &out)
+                       == MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK(out == NULL);
+        MOQ_TEST_CHECK(oom.balance == 0);
+    }
+
+    /* -- invalid video config rejected before any buffer is used ------ */
+    {
+        const moq_alloc_t *alloc = moq_alloc_default();
+
+        /* Non-empty span with a NULL pointer. */
+        {
+            moq_loc_headers_t h;
+            moq_loc_headers_init(&h);
+            h.has_video_config = true;
+            h.video_config.data = NULL;
+            h.video_config.len = 4;
+            moq_rcbuf_t *out = NULL;
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out)
+                           == MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK(out == NULL);
+        }
+
+        /* Value length beyond the KVP odd-type maximum (2^16 - 1). */
+        {
+            static uint8_t big[70000];
+            moq_loc_headers_t h;
+            moq_loc_headers_init(&h);
+            h.has_video_config = true;
+            h.video_config.data = big;
+            h.video_config.len = sizeof(big);
+            moq_rcbuf_t *out = NULL;
+            MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out)
+                           == MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK(out == NULL);
+        }
+    }
+
+    /* -- an empty video config still produces a property -------------- */
+    {
+        moq_loc_headers_t h;
+        moq_loc_headers_init(&h);
+        h.has_video_config = true;
+        h.video_config.data = NULL;
+        h.video_config.len = 0;
+
+        const moq_alloc_t *alloc = moq_alloc_default();
+        moq_rcbuf_t *out = NULL;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, P01, &h, &out) == MOQ_OK);
+        MOQ_TEST_CHECK(out != NULL);
+        if (out) {
+            /* Wire: [delta 0x0d] [len 0x00] = 2 bytes. */
+            MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(out), 2);
+            MOQ_TEST_CHECK_EQ_HEX(moq_rcbuf_data(out)[0], 0x0d);
+            MOQ_TEST_CHECK_EQ_HEX(moq_rcbuf_data(out)[1], 0x00);
+            moq_rcbuf_decref(out);
+        }
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -3695,6 +3695,134 @@ int main(void)
         MOQ_TEST_CHECK(alloc_state.balance == 0);
     }
 
+    /* write_fetch_range_before_group:
+     * draft-16 exact boundary, wire-decoded, + reject-without-mutation. The
+     * marker before group 6 must emit a FETCH_END_UNKNOWN at the inclusive
+     * Location (5, profile max object = MOQ_QUIC_VARINT_MAX = 2^62-1). d16's
+     * QUIC-varint ceiling differs from d18's UINT64_MAX, so this proves the
+     * marker uses the PROFILE-owned max, not a hardcoded constant. */
+    {
+        test_alloc_state_t alloc_state = {0};
+        moq_alloc_t alloc = test_allocator(&alloc_state);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);   /* draft-16 */
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+        moq_namespace_t ns = { ns_parts, 1 };
+        moq_fetch_cfg_t fcfg;
+        moq_fetch_cfg_init(&fcfg);
+        fcfg.track_namespace = ns;
+        fcfg.track_name = MOQ_BYTES_LITERAL("y");
+        fcfg.start_group = 5; fcfg.end_group = 10;
+        fcfg.group_order = MOQ_GROUP_ORDER_ASCENDING;
+        moq_fetch_t h;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(c, &fcfg, 1000, &h), (int)MOQ_OK);
+        pump_actions_to_peer(c, sv, 1000);
+
+        moq_event_t ev;
+        bool got = false;
+        while (moq_session_poll_events(sv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_FETCH_REQUEST) { got = true; break; }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got);
+        moq_fetch_t sv_fetch = ev.u.fetch_request.fetch;
+        moq_accept_fetch_cfg_t acc;
+        moq_accept_fetch_cfg_init(&acc);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_fetch(sv, sv_fetch, &acc, 1000),
+                              (int)MOQ_OK);
+        /* Drain accept's actions (open + FETCH_HEADER) so the next SEND_DATA is
+         * the range marker alone. */
+        { moq_action_t a; while (moq_session_poll_actions(sv, &a, 1) > 0)
+                              moq_action_cleanup(&a); }
+
+        /* Locate the accepted entry (white-box) for prior-cursor assertions. */
+        moq_fetch_entry_t *fe = NULL;
+        for (size_t i = 0; i < sv->fetch_cap; i++)
+            if (sv->fetches[i].state == MOQ_FETCH_ACCEPTED) { fe = &sv->fetches[i]; break; }
+        MOQ_TEST_CHECK(fe != NULL);
+
+        /* Seed a NON-DEFAULT prior cursor so a reject that corrupts any field
+         * (group/subgroup/object/priority/actual) is caught, not just has_prev. */
+        fe->prior.has_prev = true;
+        fe->prior.has_actual = true;
+        fe->prior.group_id = 3;
+        fe->prior.subgroup_id = 2;
+        fe->prior.object_id = 88;
+        fe->prior.publisher_priority = 5;
+        moq_fetch_prior_object_t prior_snap = fe->prior;
+
+        /* Reject-without-mutation: the ENTIRE prior cursor is byte-identical
+         * after each rejected call. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_range_before_group(
+            sv, sv_fetch, MOQ_FETCH_RANGE_UNKNOWN, 0, 1000), (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(memcmp(&fe->prior, &prior_snap, sizeof(prior_snap)) == 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_range_before_group(
+            sv, sv_fetch, (moq_fetch_range_kind_t)99, 6, 1000), (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(memcmp(&fe->prior, &prior_snap, sizeof(prior_snap)) == 0);
+
+        /* Success: prior Location advances to (5, 2^62-1). */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_range_before_group(
+            sv, sv_fetch, MOQ_FETCH_RANGE_UNKNOWN, 6, 1000), (int)MOQ_OK);
+        MOQ_TEST_CHECK(fe->prior.has_prev);
+        MOQ_TEST_CHECK_EQ_INT((int)fe->prior.group_id, 5);
+        MOQ_TEST_CHECK(fe->prior.object_id == MOQ_QUIC_VARINT_MAX);
+
+        /* Wire-decode the marker: EXACTLY one SEND_DATA on the fetch data stream,
+         * QUIC varints [kind][group][object] with nothing trailing. */
+        int send_data = 0;
+        { moq_action_t a;
+          while (moq_session_poll_actions(sv, &a, 1) > 0) {
+              if (a.kind == MOQ_ACTION_SEND_DATA) {
+                  send_data++;
+                  MOQ_TEST_CHECK(a.u.send_data.stream_ref._v ==
+                                 fe->data_stream_ref._v);
+                  MOQ_TEST_CHECK(a.u.send_data.header_len > 0);
+                  moq_buf_reader_t rr;
+                  moq_buf_reader_init(&rr, a.u.send_data.header,
+                                      a.u.send_data.header_len);
+                  uint64_t kind = 0, g = 0, o = 0;
+                  MOQ_TEST_CHECK(moq_buf_read_varint(&rr, &kind) == MOQ_OK);
+                  MOQ_TEST_CHECK(moq_buf_read_varint(&rr, &g) == MOQ_OK);
+                  MOQ_TEST_CHECK(moq_buf_read_varint(&rr, &o) == MOQ_OK);
+                  MOQ_TEST_CHECK_EQ_INT((int)kind, (int)MOQ_D16_FETCH_END_UNKNOWN);
+                  MOQ_TEST_CHECK_EQ_INT((int)g, 5);
+                  MOQ_TEST_CHECK(o == MOQ_QUIC_VARINT_MAX);
+                  MOQ_TEST_CHECK(moq_buf_reader_remaining(&rr) == 0);
+              }
+              moq_action_cleanup(&a);
+          } }
+        MOQ_TEST_CHECK_EQ_INT(send_data, 1);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(alloc_state.balance == 0);
+    }
+
+    /* fetch-datagram capability is profile-owned : draft-16 reports no support, draft-18 reports support; the query
+     * never leaks the version. */
+    {
+        test_alloc_state_t alloc_state = {0};
+        moq_alloc_t alloc = test_allocator(&alloc_state);
+        moq_session_cfg_t c16 = MOQ_SESSION_CFG_INIT; c16.version = MOQ_VERSION_DRAFT_16;
+        moq_session_cfg_t s16 = MOQ_SESSION_CFG_INIT; s16.version = MOQ_VERSION_DRAFT_16;
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, &c16, &s16);
+        MOQ_TEST_CHECK(moq_session_supports_fetch_datagram(c) == false);
+        MOQ_TEST_CHECK(moq_session_supports_fetch_datagram(sv) == false);
+        moq_session_destroy(c); moq_session_destroy(sv);
+
+        moq_session_cfg_t c18 = MOQ_SESSION_CFG_INIT; c18.version = MOQ_VERSION_DRAFT_18;
+        moq_session_cfg_t s18 = MOQ_SESSION_CFG_INIT; s18.version = MOQ_VERSION_DRAFT_18;
+        moq_session_t *c2 = NULL, *sv2 = NULL;
+        establish_pair(&alloc, 10, 10, &c2, &sv2, &c18, &s18);
+        MOQ_TEST_CHECK(moq_session_supports_fetch_datagram(c2) == true);
+        MOQ_TEST_CHECK(moq_session_supports_fetch_datagram(sv2) == true);
+        MOQ_TEST_CHECK(moq_session_supports_fetch_datagram(NULL) == false);
+        moq_session_destroy(c2); moq_session_destroy(sv2);
+    }
+
+
     MOQ_TEST_PASS("test_session_fetch");
     return failures ? 1 : 0;
 }

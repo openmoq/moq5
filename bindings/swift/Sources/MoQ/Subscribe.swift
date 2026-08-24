@@ -121,7 +121,7 @@ public struct SubscribeOkInfo: Sendable, Equatable, Hashable {
 
 public struct SubscribeErrorInfo: Sendable, Equatable, Hashable {
     public let subscription: Subscription
-    public let errorCode: UInt32
+    public let errorCode: UInt64
     public let reason: String
     public let canRetry: Bool
 }

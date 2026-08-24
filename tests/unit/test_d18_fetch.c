@@ -479,6 +479,75 @@ int main(void)
         moq_session_destroy(s);
     }
 
+    /* == J2. before_group marker uses the PROFILE-owned maximum ======= *
+     * d18's Location object id is a vi64, so the marker immediately before
+     * group 6 lands at (5, UINT64_MAX) -- NOT d16's QUIC-varint ceiling.
+     * Together with the d16 arm in test_session_fetch.c this proves the
+     * maximum comes from the profile, not a compiled-in constant. */
+    {
+        moq_session_t *s = make_established_d18_server();
+        MOQ_TEST_CHECK(s != NULL);
+        uint8_t msg[128];
+        size_t n = make_fetch(msg, sizeof(msg), 0, 1, "video");
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xF3A0);
+        moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1);
+        moq_fetch_t h = { 0 };
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_FETCH_REQUEST) h = ev.u.fetch_request.fetch;
+            moq_event_cleanup(&ev);
+        }
+        moq_accept_fetch_cfg_t acc;
+        moq_accept_fetch_cfg_init(&acc);
+        acc.end_group = 10; acc.end_object = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_fetch(s, h, &acc, 1),
+                              (int)MOQ_OK);
+        { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0)
+                              moq_action_cleanup(&a); }
+
+        moq_fetch_entry_t *fe = NULL;
+        for (size_t i = 0; i < s->fetch_cap; i++)
+            if (s->fetches[i].state == MOQ_FETCH_ACCEPTED) { fe = &s->fetches[i]; break; }
+        MOQ_TEST_CHECK(fe != NULL);
+
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_range_before_group(
+            s, h, MOQ_FETCH_RANGE_UNKNOWN, 6, 1), (int)MOQ_OK);
+        if (fe) {
+            MOQ_TEST_CHECK(fe->prior.has_prev);
+            MOQ_TEST_CHECK_EQ_INT((int)fe->prior.group_id, 5);
+            MOQ_TEST_CHECK(fe->prior.object_id == UINT64_MAX);
+            /* the d16 ceiling would be wrong here */
+            MOQ_TEST_CHECK(fe->prior.object_id != MOQ_QUIC_VARINT_MAX);
+        }
+
+        /* Wire: vi64 [kind][group][object], object == UINT64_MAX. */
+        int send_data = 0;
+        { moq_action_t a;
+          while (moq_session_poll_actions(s, &a, 1) > 0) {
+              if (a.kind == MOQ_ACTION_SEND_DATA) {
+                  send_data++;
+                  moq_buf_reader_t rr;
+                  moq_buf_reader_init(&rr, a.u.send_data.header,
+                                      a.u.send_data.header_len);
+                  uint64_t kind = 0, g = 0, o = 0;
+                  MOQ_TEST_CHECK(moq_buf_read_vi64(&rr, &kind) == MOQ_OK);
+                  MOQ_TEST_CHECK(moq_buf_read_vi64(&rr, &g) == MOQ_OK);
+                  MOQ_TEST_CHECK(moq_buf_read_vi64(&rr, &o) == MOQ_OK);
+                  /* The marker really is an END_UNKNOWN range marker: d18
+                   * carries the same 0x10C codepoint as d16 (the profile's
+                   * own D18_FETCH_END_UNKNOWN is private, so the codepoint
+                   * is asserted directly rather than via the d16 name). */
+                  MOQ_TEST_CHECK_EQ_U64(kind, 0x10Cu);
+                  MOQ_TEST_CHECK_EQ_INT((int)g, 5);
+                  MOQ_TEST_CHECK(o == UINT64_MAX);
+                  MOQ_TEST_CHECK(moq_buf_reader_remaining(&rr) == 0);
+              }
+              moq_action_cleanup(&a);
+          } }
+        MOQ_TEST_CHECK_EQ_INT(send_data, 1);
+        moq_session_destroy(s);
+    }
+
     /* == K. Publisher reject_fetch emits REQUEST_ERROR (fin), no ctrl = */
     {
         moq_session_t *s = make_established_d18_server();

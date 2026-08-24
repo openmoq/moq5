@@ -16,6 +16,7 @@
  */
 
 #include <moq/picoquic_threaded.h>
+#include <moq/picoquic_verify.h>   /* moq_picoquic_set_cert_verifier (default) */
 #include <picoquic_packet_loop.h>
 
 #include "../common/moq_alpn.h"
@@ -84,6 +85,7 @@ struct moq_pq_threaded {
     uint32_t            send_buffer_size;
     uint32_t            recv_buffer_size;
     uint64_t            goaway_timeout_us;
+    uint32_t            keep_alive_interval_ms;  /* 0 = keepalive disabled */
     bool                insecure_skip_verify;
     int               (*configure_quic_fn)(picoquic_quic_t *, void *);
     void               *configure_quic_ctx;
@@ -399,7 +401,48 @@ void moq_pq_threaded_test_arm_service_fatal(moq_pq_threaded_conn_t *c)
 {
     c->test_service_fatal = true;
 }
+
+/* Test seam (never shipped; the test-internals build only). The default
+ * client cert-verifier installer, swappable so the policy oracle can force an
+ * installation failure without mocking the whole constructor, plus call
+ * counters. Production compiles none of this and calls
+ * moq_picoquic_set_cert_verifier() directly. */
+int (*moq_pq_threaded_test_cert_installer)(picoquic_quic_t *, const char *);
+unsigned moq_pq_threaded_test_cert_install_calls;
+unsigned moq_pq_threaded_test_null_verifier_calls;
+
+/* Test seam (never shipped; the test-internals build only). Keepalive arming
+ * is routed through a swappable hook plus a call counter and captured args, so
+ * a unit test can prove the facade calls picoquic_enable_keep_alive exactly
+ * once per connection, on a non-NULL cnx, with the converted microsecond
+ * interval -- without a live handshake or a real idle timeout. Production
+ * compiles none of this and calls picoquic_enable_keep_alive() directly. */
+void (*moq_pq_threaded_test_keep_alive)(picoquic_cnx_t *, uint64_t);
+unsigned moq_pq_threaded_test_keep_alive_calls;
+picoquic_cnx_t *moq_pq_threaded_test_keep_alive_last_cnx;
+uint64_t moq_pq_threaded_test_keep_alive_last_interval_us;
 #endif
+
+/* Arm QUIC keepalive on one connection this facade owns, when configured.
+ * interval_ms == 0 disables keepalive (no call). A nonzero interval converts
+ * to picoquic's microseconds with a 64-bit multiply. Called for the client
+ * connection and every accepted server connection. */
+static void pq_threaded_arm_keep_alive(moq_pq_threaded_t *t, picoquic_cnx_t *cnx)
+{
+    if (t->keep_alive_interval_ms == 0 || !cnx) return;
+    uint64_t interval_us = (uint64_t)t->keep_alive_interval_ms * 1000u;
+#ifdef MOQ_PQ_THREADED_TESTING
+    if (moq_pq_threaded_test_keep_alive)
+        moq_pq_threaded_test_keep_alive(cnx, interval_us);
+    else
+        picoquic_enable_keep_alive(cnx, interval_us);
+    moq_pq_threaded_test_keep_alive_calls++;
+    moq_pq_threaded_test_keep_alive_last_cnx = cnx;
+    moq_pq_threaded_test_keep_alive_last_interval_us = interval_us;
+#else
+    picoquic_enable_keep_alive(cnx, interval_us);
+#endif
+}
 
 static void client_final_pump(moq_pq_threaded_t *t, picoquic_quic_t *quic)
 {
@@ -660,6 +703,9 @@ static int server_callback(picoquic_cnx_t *cnx,
          * this cnx route straight to its own connection. */
         struct moq_pq_threaded_conn *c = server_accept(t, cnx, now);
         if (!c) return -1;
+        /* An explicit adapter keepalive applies to every connection this
+         * facade owns, accepted server connections included. No-op when 0. */
+        pq_threaded_arm_keep_alive(t, cnx);
         pthread_mutex_lock(&t->mutex);
         if (t->negotiated == 0) t->negotiated = c->negotiated;
         pthread_mutex_unlock(&t->mutex);
@@ -1106,6 +1152,8 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         t->recv_buffer_size = cfg->recv_buffer_size;
     if (CFG_HAS(cfg, goaway_timeout_us))
         t->goaway_timeout_us = cfg->goaway_timeout_us;
+    if (CFG_HAS(cfg, keep_alive_interval_ms))
+        t->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
     t->max_connections =
         (CFG_HAS(cfg, max_connections) && cfg->max_connections)
             ? cfg->max_connections
@@ -1228,8 +1276,37 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     if (CFG_HAS(cfg, idle_timeout_ms) && cfg->idle_timeout_ms)
         picoquic_set_default_idle_timeout(t->quic, cfg->idle_timeout_ms);
 
-    if (t->insecure_skip_verify)
+    /* Client certificate policy -- fail-closed by default. picoquic's built-in
+     * default has no CA store and accepts any peer certificate, so the
+     * safe-looking default config must install a real verifier itself. A
+     * default client installs the system-trust verifier BEFORE any
+     * configure_quic hook (a custom hook then transactionally replaces it, and
+     * picoquic disposes the one it replaced), and creation FAILS if that
+     * verifier cannot be installed rather than connecting unauthenticated.
+     * insecure_skip_verify installs the explicit null verifier (test-only).
+     * Server perspective is unchanged: it verifies no client certificate by
+     * default, and insecure_skip_verify still selects the null verifier. */
+    if (persp == MOQ_PERSPECTIVE_CLIENT) {
+        if (t->insecure_skip_verify) {
+            picoquic_set_null_verifier(t->quic);
+#ifdef MOQ_PQ_THREADED_TESTING
+            moq_pq_threaded_test_null_verifier_calls++;
+#endif
+        } else {
+#ifdef MOQ_PQ_THREADED_TESTING
+            int vrc = moq_pq_threaded_test_cert_installer
+                ? moq_pq_threaded_test_cert_installer(t->quic, NULL)
+                : moq_picoquic_set_cert_verifier(t->quic, NULL);
+            moq_pq_threaded_test_cert_install_calls++;
+#else
+            int vrc = moq_picoquic_set_cert_verifier(t->quic, NULL);
+#endif
+            if (vrc != 0)
+                goto fail_configure;
+        }
+    } else if (t->insecure_skip_verify) {
         picoquic_set_null_verifier(t->quic);
+    }
 
     if (t->configure_quic_fn) {
         if (t->configure_quic_fn(t->quic, t->configure_quic_ctx) != 0)
@@ -1260,6 +1337,11 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
             client_callback, t);
         freeaddrinfo(res);
         if (!cnx) goto fail_configure;
+
+        /* Keep an otherwise-quiet client connection (e.g. a publisher with no
+         * subscriber) alive against a peer/relay idle timeout. No-op when
+         * keep_alive_interval_ms is 0. */
+        pq_threaded_arm_keep_alive(t, cnx);
 
         if (t->alpn_count > 0) {
             t->client_deferred = true;

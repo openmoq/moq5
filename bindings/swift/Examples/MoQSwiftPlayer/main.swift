@@ -6,6 +6,7 @@ import MoQ
 import MoQMedia
 import MoQTransport
 import MoQRecvArgs
+import MoQSwiftPlayerDecoders
 
 setbuf(stdout, nil); setbuf(stderr, nil)
 func log(_ msg: String) { print("  \(msg)") }

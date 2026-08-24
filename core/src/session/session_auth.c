@@ -525,6 +525,9 @@ static void free_staging_internal(moq_session_t *s,
 {
     if (!staged) return;
     for (size_t i = 0; i < count; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_auth_staging++;
+#endif
         if (staged[i] && tokens[i].token_value.data &&
             tokens[i].token_value.len > 0) {
             s->alloc.free((void *)(uintptr_t)tokens[i].token_value.data,

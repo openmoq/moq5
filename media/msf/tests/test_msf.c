@@ -2876,18 +2876,26 @@ int main(void)
         moq_msf_track_t rt;
         memset(&rt, 0, sizeof(rt));
 
+        moq_msf_track_t bt;
+        memset(&bt, 0, sizeof(bt));
+        bt.struct_size = sizeof(bt);
+        bt.name = lit("b"); bt.packaging = lit("cmaf"); bt.is_live = true;
+
         moq_msf_catalog_t base;
         memset(&base, 0, sizeof(base));
         base.struct_size = sizeof(base);
         base.version = MOQ_MSF_VERSION;
-        base.tracks = NULL;   /* never read: guard fails before the copy loop */
-        base.track_count = SIZE_MAX / sizeof(moq_msf_track_t) + 1;
+        base.tracks = &bt;      /* valid base; the wrap rides the delta op */
+        base.track_count = 1;
 
+        /* The op's declared track_count overflows cap*sizeof(track). tracks is
+         * non-NULL (only track_count is a lie), so the byte-size wrap guard --
+         * not the NULL-array guard -- must fire, before any allocation. */
         moq_msf_delta_op_t op;
         memset(&op, 0, sizeof(op));
-        op.op = MOQ_MSF_DELTA_OP_REMOVE;   /* does not grow cap */
+        op.op = MOQ_MSF_DELTA_OP_ADD;
         op.tracks = &rt;
-        op.track_count = 1;
+        op.track_count = SIZE_MAX / sizeof(moq_msf_track_t) + 1;
 
         moq_msf_catalog_t delta;
         memset(&delta, 0, sizeof(delta));
@@ -2909,18 +2917,25 @@ int main(void)
         moq_msf_track_t rt;
         memset(&rt, 0, sizeof(rt));
 
+        moq_msf_track_t bt;
+        memset(&bt, 0, sizeof(bt));
+        bt.struct_size = sizeof(bt);
+        bt.name = lit("b"); bt.packaging = lit("cmaf"); bt.is_live = true;
+
         moq_msf_catalog_t base;
         memset(&base, 0, sizeof(base));
         base.struct_size = sizeof(base);
         base.version = MOQ_MSF_VERSION;
-        base.tracks = NULL;
-        base.track_count = SIZE_MAX - 2;
+        base.tracks = &bt;      /* valid base */
+        base.track_count = 1;
 
+        /* cap = 1 + SIZE_MAX overflows the running sum; the addition wrap guard
+         * fires before allocation (tracks non-NULL, so not the NULL guard). */
         moq_msf_delta_op_t op;
         memset(&op, 0, sizeof(op));
-        op.op = MOQ_MSF_DELTA_OP_ADD;   /* cap += op.track_count -> wraps */
+        op.op = MOQ_MSF_DELTA_OP_ADD;
         op.tracks = &rt;
-        op.track_count = 5;
+        op.track_count = SIZE_MAX;
 
         moq_msf_catalog_t delta;
         memset(&delta, 0, sizeof(delta));
@@ -2934,6 +2949,401 @@ int main(void)
         CHECK(moq_msf_catalog_apply_delta(&a, &base, &delta, &out)
               == MOQ_ERR_NOMEM);
         CHECK(os.alloc_count == 0);
+    }
+
+    /* apply_delta_ex / validate_identities: public NULL-array guards (0319 F2).
+     * A nonzero count with a NULL array is invalid input, rejected before any
+     * dereference (no crash). */
+    {
+        moq_msf_track_t vt;
+        memset(&vt, 0, sizeof(vt));
+        vt.struct_size = sizeof(vt);
+        vt.name = lit("v"); vt.packaging = lit("cmaf"); vt.is_live = true;
+
+        /* base->tracks NULL with a nonzero count. */
+        moq_msf_catalog_t base;
+        memset(&base, 0, sizeof(base));
+        base.struct_size = sizeof(base);
+        base.version = MOQ_MSF_VERSION;
+        base.tracks = NULL; base.track_count = 3;
+        moq_msf_delta_op_t rmop = { MOQ_MSF_DELTA_OP_REMOVE, &vt, 1 };
+        moq_msf_catalog_t delta;
+        memset(&delta, 0, sizeof(delta));
+        delta.struct_size = sizeof(delta);
+        delta.delta_update = &rmop; delta.delta_update_count = 1;
+        moq_msf_catalog_t out;
+        memset(&out, 0, sizeof(out));
+        CHECK(moq_msf_catalog_apply_delta(alloc, &base, &delta, &out)
+              == MOQ_ERR_INVAL);
+
+        /* delta op tracks NULL with a nonzero count. */
+        base.tracks = &vt; base.track_count = 1;
+        moq_msf_delta_op_t badop = { MOQ_MSF_DELTA_OP_ADD, NULL, 2 };
+        delta.delta_update = &badop; delta.delta_update_count = 1;
+        memset(&out, 0, sizeof(out));
+        CHECK(moq_msf_catalog_apply_delta(alloc, &base, &delta, &out)
+              == MOQ_ERR_INVAL);
+
+        /* validate_identities: each of the three arrays NULL with a count. */
+        moq_msf_catalog_t c;
+        memset(&c, 0, sizeof(c));
+        c.struct_size = sizeof(c); c.version = MOQ_MSF_VERSION;
+        c.tracks = NULL; c.track_count = 2;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+        c.tracks = &vt; c.track_count = 1;
+        c.init_data_list = NULL; c.init_data_count = 2;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+        c.init_data_list = NULL; c.init_data_count = 0;
+        c.content_protections = NULL; c.content_protection_count = 2;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+    }
+
+    /* -- MSF delta security residuals (0317) ------------------------------- *
+     * §5.2.2/§5.2.3: identity is the Namespace|Name tuple; an omitted op
+     * namespace is catalog-namespace inheritance, NOT a wildcard over explicit
+     * namespaces. This layer cannot resolve the catalog namespace, so a
+     * name-only op must match only tracks that ALSO omit a namespace, never an
+     * arbitrary explicit-namespace track. */
+    {
+        #define MK_TRK(dst, nm, ns_present, ns)                              \
+            do {                                                             \
+                memset(&(dst), 0, sizeof(dst));                              \
+                (dst).struct_size = sizeof(dst);                            \
+                (dst).name = lit(nm); (dst).packaging = lit("cmaf");        \
+                (dst).is_live = true;                                       \
+                (dst).has_namespace = (ns_present);                         \
+                if (ns_present) (dst).namespace_ = lit(ns);                 \
+            } while (0)
+
+        /* Base: two tracks with the SAME name under DISTINCT explicit
+         * namespaces (a legal catalog -- distinct tuples). */
+        moq_msf_track_t bt[2];
+        MK_TRK(bt[0], "v", true, "nsA");
+        MK_TRK(bt[1], "v", true, "nsB");
+        moq_msf_catalog_t base;
+        memset(&base, 0, sizeof(base));
+        base.struct_size = sizeof(base);
+        base.version = MOQ_MSF_VERSION;
+        base.tracks = bt; base.track_count = 2;
+
+        /* RED 1 -- namespace-less REMOVE is not a wildcard: it must NOT delete
+         * an arbitrary explicit-namespace track. No name-only track exists, so
+         * the remove target is absent -> MOQ_ERR_PROTO. */
+        {
+            moq_msf_track_t rt; MK_TRK(rt, "v", false, "");
+            moq_msf_delta_op_t op = { MOQ_MSF_DELTA_OP_REMOVE, &rt, 1 };
+            moq_msf_catalog_t delta;
+            memset(&delta, 0, sizeof(delta));
+            delta.struct_size = sizeof(delta);
+            delta.delta_update = &op; delta.delta_update_count = 1;
+            moq_msf_catalog_t out;
+            memset(&out, 0, sizeof(out));
+            moq_result_t rc = moq_msf_catalog_apply_delta(alloc, &base, &delta, &out);
+            CHECK(rc == MOQ_ERR_PROTO);          /* NOT first-match removal */
+            if (rc == MOQ_OK) moq_msf_catalog_cleanup(alloc, &out);
+        }
+
+        /* RED 2 -- namespace-less CLONE parent is not a wildcard. parentName
+         * only, no parentNamespace -> the parent is ambiguous/absent among
+         * explicit-namespace tracks -> MOQ_ERR_PROTO. */
+        {
+            moq_msf_track_t ct;
+            memset(&ct, 0, sizeof(ct));
+            ct.struct_size = sizeof(ct);
+            ct.name = lit("v2"); ct.packaging = lit("cmaf"); ct.is_live = true;
+            ct.has_parent_name = true; ct.parent_name = lit("v");
+            /* has_parent_namespace = false: name-only parent reference. */
+            moq_msf_delta_op_t op = { MOQ_MSF_DELTA_OP_CLONE, &ct, 1 };
+            moq_msf_catalog_t delta;
+            memset(&delta, 0, sizeof(delta));
+            delta.struct_size = sizeof(delta);
+            delta.delta_update = &op; delta.delta_update_count = 1;
+            moq_msf_catalog_t out;
+            memset(&out, 0, sizeof(out));
+            moq_result_t rc = moq_msf_catalog_apply_delta(alloc, &base, &delta, &out);
+            CHECK(rc == MOQ_ERR_PROTO);          /* NOT first-match clone */
+            if (rc == MOQ_OK) moq_msf_catalog_cleanup(alloc, &out);
+        }
+
+        /* Positive control A -- a namespace-less op DOES match a namespace-less
+         * base track (same identity class), and leaves explicit-ns tracks. */
+        {
+            moq_msf_track_t b2[2];
+            MK_TRK(b2[0], "v", false, "");        /* no-namespace track */
+            MK_TRK(b2[1], "w", true, "nsA");
+            moq_msf_catalog_t base2;
+            memset(&base2, 0, sizeof(base2));
+            base2.struct_size = sizeof(base2);
+            base2.version = MOQ_MSF_VERSION;
+            base2.tracks = b2; base2.track_count = 2;
+
+            moq_msf_track_t rt; MK_TRK(rt, "v", false, "");
+            moq_msf_delta_op_t op = { MOQ_MSF_DELTA_OP_REMOVE, &rt, 1 };
+            moq_msf_catalog_t delta;
+            memset(&delta, 0, sizeof(delta));
+            delta.struct_size = sizeof(delta);
+            delta.delta_update = &op; delta.delta_update_count = 1;
+            moq_msf_catalog_t out;
+            memset(&out, 0, sizeof(out));
+            moq_result_t rc = moq_msf_catalog_apply_delta(alloc, &base2, &delta, &out);
+            CHECK(rc == MOQ_OK);
+            if (rc == MOQ_OK) {
+                CHECK_EQ_SIZE(out.track_count, 1);
+                CHECK(bv_eq(out.tracks[0].name, "w"));
+                CHECK(out.tracks[0].has_namespace &&
+                      bv_eq(out.tracks[0].namespace_, "nsA"));
+                moq_msf_catalog_cleanup(alloc, &out);
+            }
+        }
+
+        /* Positive control B -- an explicit-namespace op still targets exactly
+         * the matching tuple (nsB/v survives when nsA/v is removed). */
+        {
+            moq_msf_track_t rt; MK_TRK(rt, "v", true, "nsA");
+            moq_msf_delta_op_t op = { MOQ_MSF_DELTA_OP_REMOVE, &rt, 1 };
+            moq_msf_catalog_t delta;
+            memset(&delta, 0, sizeof(delta));
+            delta.struct_size = sizeof(delta);
+            delta.delta_update = &op; delta.delta_update_count = 1;
+            moq_msf_catalog_t out;
+            memset(&out, 0, sizeof(out));
+            moq_result_t rc = moq_msf_catalog_apply_delta(alloc, &base, &delta, &out);
+            CHECK(rc == MOQ_OK);
+            if (rc == MOQ_OK) {
+                CHECK_EQ_SIZE(out.track_count, 1);
+                CHECK(bv_eq(out.tracks[0].name, "v"));
+                CHECK(out.tracks[0].has_namespace &&
+                      bv_eq(out.tracks[0].namespace_, "nsB"));
+                moq_msf_catalog_cleanup(alloc, &out);
+            }
+        }
+        #undef MK_TRK
+    }
+
+    /* -- apply_delta_ex cap-before-apply (0317 item 1a) -------------------- *
+     * A delta that is valid but exceeds the caller's limits must be refused
+     * (MOQ_ERR_PROTO) BEFORE the effective catalog is built. Differential: the
+     * SAME delta succeeds unlimited (apply_delta) and is rejected under a small
+     * limit. */
+    {
+        #define MK_TRK2(dst, nm)                                             \
+            do {                                                             \
+                memset(&(dst), 0, sizeof(dst));                              \
+                (dst).struct_size = sizeof(dst);                            \
+                (dst).name = lit(nm); (dst).packaging = lit("cmaf");        \
+                (dst).is_live = true;                                       \
+            } while (0)
+
+        moq_msf_track_t bt; MK_TRK2(bt, "base");
+        moq_msf_catalog_t base;
+        memset(&base, 0, sizeof(base));
+        base.struct_size = sizeof(base);
+        base.version = MOQ_MSF_VERSION;
+        base.tracks = &bt; base.track_count = 1;
+
+        moq_msf_track_t at[3];
+        MK_TRK2(at[0], "a"); MK_TRK2(at[1], "b"); MK_TRK2(at[2], "c");
+        moq_msf_delta_op_t op = { MOQ_MSF_DELTA_OP_ADD, at, 3 };
+        moq_msf_catalog_t delta;
+        memset(&delta, 0, sizeof(delta));
+        delta.struct_size = sizeof(delta);
+        delta.delta_update = &op; delta.delta_update_count = 1;
+
+        /* Unlimited: 1 base + 3 adds = 4 tracks, succeeds. */
+        moq_msf_catalog_t out;
+        memset(&out, 0, sizeof(out));
+        CHECK(moq_msf_catalog_apply_delta(alloc, &base, &delta, &out) == MOQ_OK);
+        CHECK_EQ_SIZE(out.track_count, 4);
+        moq_msf_catalog_cleanup(alloc, &out);
+
+        /* max_effective_tracks = 3 (< 4): refused before building eff. */
+        moq_msf_apply_limits_t lim;
+        memset(&lim, 0, sizeof(lim));
+        lim.struct_size = sizeof(lim);
+        lim.max_effective_tracks = 3;
+        memset(&out, 0, sizeof(out));
+        CHECK(moq_msf_catalog_apply_delta_ex(alloc, &base, &delta, &lim, &out)
+              == MOQ_ERR_PROTO);
+
+        /* max_delta_ops: a delta whose op count exceeds the limit is refused
+         * before any work (a 2-op delta against max_delta_ops = 1). */
+        moq_msf_delta_op_t ops2[2] = {
+            { MOQ_MSF_DELTA_OP_ADD, &at[0], 1 },
+            { MOQ_MSF_DELTA_OP_ADD, &at[1], 1 },
+        };
+        moq_msf_catalog_t delta2;
+        memset(&delta2, 0, sizeof(delta2));
+        delta2.struct_size = sizeof(delta2);
+        delta2.delta_update = ops2; delta2.delta_update_count = 2;
+        memset(&lim, 0, sizeof(lim));
+        lim.struct_size = sizeof(lim);
+        lim.max_delta_ops = 1;                 /* 2 ops > 1 -> refuse */
+        memset(&out, 0, sizeof(out));
+        CHECK(moq_msf_catalog_apply_delta_ex(alloc, &base, &delta2, &lim, &out)
+              == MOQ_ERR_PROTO);
+
+        /* A limit that is NOT exceeded still succeeds. */
+        memset(&lim, 0, sizeof(lim));
+        lim.struct_size = sizeof(lim);
+        lim.max_effective_tracks = 4; lim.max_delta_ops = 8;
+        memset(&out, 0, sizeof(out));
+        CHECK(moq_msf_catalog_apply_delta_ex(alloc, &base, &delta, &lim, &out)
+              == MOQ_OK);
+        CHECK_EQ_SIZE(out.track_count, 4);
+        moq_msf_catalog_cleanup(alloc, &out);
+        #undef MK_TRK2
+    }
+
+    /* -- validate_identities: inbound duplicate rejection (0317 item 3) ---- *
+     * The raw parser is lenient; the receiver-facing validator rejects
+     * duplicate Namespace|Name tuples, initDataList ids, and contentProtection
+     * refIDs in an INDEPENDENT catalog. */
+    {
+        /* Duplicate track tuple (same name, both name-only). */
+        moq_msf_track_t dt[2];
+        for (int i = 0; i < 2; i++) {
+            memset(&dt[i], 0, sizeof(dt[i]));
+            dt[i].struct_size = sizeof(dt[i]);
+            dt[i].name = lit("v"); dt[i].packaging = lit("cmaf");
+            dt[i].is_live = true;
+        }
+        moq_msf_catalog_t dup;
+        memset(&dup, 0, sizeof(dup));
+        dup.struct_size = sizeof(dup);
+        dup.version = MOQ_MSF_VERSION;
+        dup.tracks = dt; dup.track_count = 2;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &dup) == MOQ_ERR_PROTO);
+
+        /* Distinct tuples (same name, distinct explicit namespaces) are OK. */
+        dt[0].has_namespace = true; dt[0].namespace_ = lit("nsA");
+        dt[1].has_namespace = true; dt[1].namespace_ = lit("nsB");
+        CHECK(moq_msf_catalog_validate_identities(alloc, &dup) == MOQ_OK);
+
+        /* Duplicate initDataList id. */
+        moq_msf_track_t ok1; memset(&ok1, 0, sizeof(ok1));
+        ok1.struct_size = sizeof(ok1);
+        ok1.name = lit("v"); ok1.packaging = lit("cmaf"); ok1.is_live = true;
+        moq_msf_init_data_entry_t ids[2] = {
+            { lit("i1"), lit("inline"), lit("AA") },
+            { lit("i1"), lit("inline"), lit("BB") },
+        };
+        moq_msf_catalog_t idc;
+        memset(&idc, 0, sizeof(idc));
+        idc.struct_size = sizeof(idc); idc.version = MOQ_MSF_VERSION;
+        idc.tracks = &ok1; idc.track_count = 1;
+        idc.init_data_list = ids; idc.init_data_count = 2;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &idc) == MOQ_ERR_PROTO);
+        ids[1].id = lit("i2");
+        CHECK(moq_msf_catalog_validate_identities(alloc, &idc) == MOQ_OK);
+
+        /* Duplicate contentProtection refID. */
+        moq_cmsf_content_protection_t cps[2];
+        memset(cps, 0, sizeof(cps));
+        cps[0].ref_id = lit("cp1"); cps[0].scheme = lit("cenc");
+        cps[1].ref_id = lit("cp1"); cps[1].scheme = lit("cbcs");
+        moq_msf_catalog_t cpc;
+        memset(&cpc, 0, sizeof(cpc));
+        cpc.struct_size = sizeof(cpc); cpc.version = MOQ_MSF_VERSION;
+        cpc.tracks = &ok1; cpc.track_count = 1;
+        cpc.content_protections = cps; cpc.content_protection_count = 2;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &cpc) == MOQ_ERR_PROTO);
+        cps[1].ref_id = lit("cp2");
+        CHECK(moq_msf_catalog_validate_identities(alloc, &cpc) == MOQ_OK);
+
+        /* A delta is not an independent catalog. */
+        moq_msf_delta_op_t nop = { MOQ_MSF_DELTA_OP_ADD, &ok1, 1 };
+        moq_msf_catalog_t dcat;
+        memset(&dcat, 0, sizeof(dcat));
+        dcat.struct_size = sizeof(dcat);
+        dcat.delta_update = &nop; dcat.delta_update_count = 1;
+        CHECK(moq_msf_catalog_validate_identities(alloc, &dcat) == MOQ_ERR_INVAL);
+    }
+
+    /* Public identity-span guards (0321): a span that claims content with a
+     * NULL data pointer, or uses the byte-span empty-slot sentinel
+     * (len == SIZE_MAX), is invalid input -> MOQ_ERR_INVAL, no hash/deref. */
+    {
+        moq_bytes_t null1 = { NULL, 1 };
+        moq_bytes_t cmaf = lit("cmaf");
+
+        /* validate_identities: track name NULL. */
+        {
+            moq_msf_track_t t; memset(&t, 0, sizeof(t));
+            t.struct_size = sizeof(t); t.name = null1; t.packaging = cmaf; t.is_live = true;
+            moq_msf_catalog_t c; memset(&c, 0, sizeof(c));
+            c.struct_size = sizeof(c); c.version = MOQ_MSF_VERSION;
+            c.tracks = &t; c.track_count = 1;
+            CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+
+            /* explicit namespace NULL. */
+            t.name = lit("v"); t.has_namespace = true; t.namespace_ = null1;
+            CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+        }
+        /* validate_identities: initData id NULL, then sentinel len. */
+        {
+            moq_msf_track_t t; memset(&t, 0, sizeof(t));
+            t.struct_size = sizeof(t); t.name = lit("v"); t.packaging = cmaf; t.is_live = true;
+            moq_msf_init_data_entry_t id = { null1, lit("inline"), lit("AA") };
+            moq_msf_catalog_t c; memset(&c, 0, sizeof(c));
+            c.struct_size = sizeof(c); c.version = MOQ_MSF_VERSION;
+            c.tracks = &t; c.track_count = 1;
+            c.init_data_list = &id; c.init_data_count = 1;
+            CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+            id.id = (moq_bytes_t){ (const uint8_t *)"x", SIZE_MAX };   /* sentinel */
+            CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+        }
+        /* validate_identities: contentProtection refID NULL. */
+        {
+            moq_msf_track_t t; memset(&t, 0, sizeof(t));
+            t.struct_size = sizeof(t); t.name = lit("v"); t.packaging = cmaf; t.is_live = true;
+            moq_cmsf_content_protection_t cp; memset(&cp, 0, sizeof(cp));
+            cp.ref_id = null1; cp.scheme = lit("cenc");
+            moq_msf_catalog_t c; memset(&c, 0, sizeof(c));
+            c.struct_size = sizeof(c); c.version = MOQ_MSF_VERSION;
+            c.tracks = &t; c.track_count = 1;
+            c.content_protections = &cp; c.content_protection_count = 1;
+            CHECK(moq_msf_catalog_validate_identities(alloc, &c) == MOQ_ERR_INVAL);
+        }
+        /* apply_delta_ex: base track name NULL. */
+        {
+            moq_msf_track_t bt; memset(&bt, 0, sizeof(bt));
+            bt.struct_size = sizeof(bt); bt.name = null1; bt.packaging = cmaf; bt.is_live = true;
+            moq_msf_catalog_t base; memset(&base, 0, sizeof(base));
+            base.struct_size = sizeof(base); base.version = MOQ_MSF_VERSION;
+            base.tracks = &bt; base.track_count = 1;
+            moq_msf_track_t rt; memset(&rt, 0, sizeof(rt));
+            rt.struct_size = sizeof(rt); rt.name = lit("x"); rt.packaging = cmaf; rt.is_live = true;
+            moq_msf_delta_op_t op = { MOQ_MSF_DELTA_OP_ADD, &rt, 1 };
+            moq_msf_catalog_t delta; memset(&delta, 0, sizeof(delta));
+            delta.struct_size = sizeof(delta); delta.delta_update = &op; delta.delta_update_count = 1;
+            moq_msf_catalog_t out; memset(&out, 0, sizeof(out));
+            CHECK(moq_msf_catalog_apply_delta(alloc, &base, &delta, &out) == MOQ_ERR_INVAL);
+        }
+        /* apply_delta_ex: remove op target name NULL; clone parent name NULL. */
+        {
+            moq_msf_track_t bt; memset(&bt, 0, sizeof(bt));
+            bt.struct_size = sizeof(bt); bt.name = lit("a"); bt.packaging = cmaf; bt.is_live = true;
+            moq_msf_catalog_t base; memset(&base, 0, sizeof(base));
+            base.struct_size = sizeof(base); base.version = MOQ_MSF_VERSION;
+            base.tracks = &bt; base.track_count = 1;
+
+            moq_msf_track_t rmt; memset(&rmt, 0, sizeof(rmt));
+            rmt.struct_size = sizeof(rmt); rmt.name = null1; rmt.packaging = cmaf;
+            moq_msf_delta_op_t rop = { MOQ_MSF_DELTA_OP_REMOVE, &rmt, 1 };
+            moq_msf_catalog_t d1; memset(&d1, 0, sizeof(d1));
+            d1.struct_size = sizeof(d1); d1.delta_update = &rop; d1.delta_update_count = 1;
+            moq_msf_catalog_t out; memset(&out, 0, sizeof(out));
+            CHECK(moq_msf_catalog_apply_delta(alloc, &base, &d1, &out) == MOQ_ERR_INVAL);
+
+            moq_msf_track_t ct; memset(&ct, 0, sizeof(ct));
+            ct.struct_size = sizeof(ct); ct.name = lit("a2"); ct.packaging = cmaf; ct.is_live = true;
+            ct.has_parent_name = true; ct.parent_name = null1;
+            moq_msf_delta_op_t cop = { MOQ_MSF_DELTA_OP_CLONE, &ct, 1 };
+            moq_msf_catalog_t d2; memset(&d2, 0, sizeof(d2));
+            d2.struct_size = sizeof(d2); d2.delta_update = &cop; d2.delta_update_count = 1;
+            memset(&out, 0, sizeof(out));
+            CHECK(moq_msf_catalog_apply_delta(alloc, &base, &d2, &out) == MOQ_ERR_INVAL);
+        }
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

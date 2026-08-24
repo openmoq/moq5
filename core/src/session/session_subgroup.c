@@ -97,8 +97,10 @@ static int sg_find_by_stream_ref(moq_session_t *s, moq_stream_ref_t ref)
     return -1;
 }
 
-void sg_free_entry(size_t slot, moq_sg_entry_t *entries)
+void sg_free_entry(moq_session_t *s, size_t slot)
 {
+    moq_sg_entry_t *entries = s->subgroups;
+    sg_occ_unlink(s, slot);
     entries[slot].delivery_deadline_us = UINT64_MAX;
     entries[slot].state = MOQ_SG_FREE;
     entries[slot].generation++;
@@ -112,10 +114,15 @@ void sg_free_entry(size_t slot, moq_sg_entry_t *entries)
 void sg_recompute_deadline(moq_session_t *s)
 {
     uint64_t d = UINT64_MAX;
-    for (size_t i = 0; i < s->sg_cap; i++)
+    /* Only live subgroups can carry a deadline, and only those are linked. */
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_sg_deadline_probes++;
+#endif
         if (s->subgroups[i].state != MOQ_SG_FREE &&
             s->subgroups[i].delivery_deadline_us < d)
             d = s->subgroups[i].delivery_deadline_us;
+    }
     s->subgroup_deadline_us = d;
 }
 
@@ -130,17 +137,35 @@ void sg_recompute_deadline(moq_session_t *s)
  */
 bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
 {
-    for (; s->sweep_slot < s->sg_cap; s->sweep_slot++) {
+    /*
+     * Walks the subgroup OCCUPANCY list, not the pool: the reap's cost follows
+     * the live subgroups, not `sg_cap`. The list is slot-ordered, so entries
+     * are reaped in exactly the order the old full scan reaped them.
+     */
+    while (s->sweep_slot < s->sg_cap) {
         size_t i = s->sweep_slot;
+        int32_t nxt = s->subgroups[i].occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_sg_reap_probes++;
+#endif
         if (s->subgroups[i].state != MOQ_SG_CLOSING &&
-            s->subgroups[i].state != MOQ_SG_RESETTING)
+            s->subgroups[i].state != MOQ_SG_RESETTING) {
+            s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
             continue;                      /* costs nothing; never suspends */
+        }
         if (budget) {
             if (*budget == 0) return false;
             (*budget)--;
         }
-        sg_free_entry(i, s->subgroups);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_sg_reap_charged++;
+#endif
+        sg_free_entry(s, i);               /* unlinks, and advances the cursor */
         s->sweep_reaped_subgroup = true;
+        /* The unlink fixup already moved the cursor off the freed slot; only a
+         * path that did NOT move it needs the explicit advance. */
+        if (s->sweep_slot == i)
+            s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
     }
     if (s->sweep_reaped_subgroup) {
         sg_recompute_deadline(s);
@@ -265,6 +290,8 @@ moq_result_t moq_session_open_subgroup(
     /* Commit. */
     moq_sg_entry_t *entry = &s->subgroups[slot];
     entry->generation |= 1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    sg_occ_link(s, (size_t)slot);
     entry->state = MOQ_SG_OPEN;
     entry->sub = sub;
     entry->pub = MOQ_PUBLICATION_INVALID;   /* subscription-backed: no owning

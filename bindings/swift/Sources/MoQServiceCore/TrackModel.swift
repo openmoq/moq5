@@ -107,6 +107,15 @@ public final class MediaTrack: @unchecked Sendable, Hashable {
     }
 }
 
+/// Which receive path a coalesced parse-drop diagnostic came from
+/// (mirrors the C `moq_media_parse_drop_class_t`).
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public enum ParseDropClass: Sendable {
+    case media           /// a normal media object (poll_object)
+    case sap             /// a CMSF SAP timeline object (poll_sap)
+    case mediaTimeline   /// an MSF media-timeline object (poll_media_timeline)
+}
+
 /// Receiver-side track lifecycle events (the `trackEvents` stream elements).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public enum TrackEvent: Sendable {
@@ -115,4 +124,10 @@ public enum TrackEvent: Sendable {
     case removed(MediaTrack)
     case ended(MediaTrack)
     case catalogReady             /// first catalog fully enumerated (once)
+    /// One or more media objects for this track failed to parse and were
+    /// dropped (NON-FATAL). Coalesced: at most one is delivered per track until
+    /// drained. `total` is cumulative for the track, `delta` is drops since the
+    /// previous parse-drop event for it. Never a substitute for `.ended`.
+    case parseDrop(MediaTrack, class: ParseDropClass,
+                   total: UInt64, delta: UInt64)
 }

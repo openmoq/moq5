@@ -62,6 +62,10 @@ void ann_free_entry(moq_session_t *s, size_t slot)
     }
     e->goaway_sent = false;   /* selective free: clear the migration marker so a
                                * reused slot is never seen as already migrated */
+    /* Selective free, so the transitional FIN ownership must be cleared here by
+     * name: unlike the pools that reset by whole-record memset, nothing else in
+     * this function would stop a stale marker reaching the next owner. */
+    e->handoff_fin_pending = false;
     e->state = MOQ_ANN_FREE;
     e->generation++;
 }
@@ -85,7 +89,12 @@ static moq_result_t ann_queue_resp(moq_session_t *s, size_t slot,
 static moq_result_t ann_local_teardown(moq_session_t *s, size_t slot)
 {
     if (action_queue_avail(s) < 1) return MOQ_ERR_WOULD_BLOCK;
-    if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
+    /* A peer FIN already observed on this bidi -- latched, or handed over with
+     * the request -- leaves nothing to absorb, so the drain is not owed and a
+     * full ring must not refuse the teardown. */
+    bool need_drain = !ann_peer_fin_observed(&s->announcements[slot]);
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = s->announcements[slot].request_stream_ref;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
@@ -96,7 +105,8 @@ static moq_result_t ann_local_teardown(moq_session_t *s, size_t slot)
     a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED (§3.3.3) */
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
-    if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
+    if (need_drain && ref._v != 0)
+        (void)drain_ref_add(s, ref);   /* slot reserved above */
     ann_free_entry(s, slot);
     return MOQ_OK;
 }
@@ -119,6 +129,14 @@ moq_result_t handle_announcement_stream_bytes(moq_session_t *s, int slot,
         e->req_recv_len += len;
     }
     if (fin) e->req_recv_fin = true;
+    /* A FIN that rode the creating PUBLISH_NAMESPACE was handed to this entry
+     * by the commit that re-keyed the bidi; from here it is the same fact as a
+     * wire FIN. The durable latch takes it over and the owner is RETAINED --
+     * the application still has to accept or reject -- so this cannot block. */
+    if (e->handoff_fin_pending) {
+        e->req_recv_fin = true;
+        e->handoff_fin_pending = false;
+    }
 
     for (;;) {
         e = &s->announcements[slot];
@@ -160,8 +178,14 @@ moq_result_t session_core_on_announce_update_rejected(
 {
     /* Reserve a drain slot up front: after REQUEST_ERROR + FIN frees the entry
      * (and its stream-ref key), late bytes the peer sent before seeing our FIN
-     * must be discarded rather than mistaken for a fresh request. */
-    if (s->drain_ref_count >= s->drain_ref_cap) return MOQ_ERR_WOULD_BLOCK;
+     * must be discarded rather than mistaken for a fresh request. A peer FIN
+     * already observed on this bidi -- latched by the announcement handler
+     * before dispatch, or handed over with the creating request -- leaves
+     * nothing to absorb, so the reference is not owed and a full ring must not
+     * refuse the terminal. */
+    bool need_drain = !ann_peer_fin_observed(&s->announcements[slot]);
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
     uint8_t err_buf[128];
     moq_buf_writer_t ew;
     moq_buf_writer_init(&ew, err_buf, sizeof(err_buf));
@@ -174,7 +198,8 @@ moq_result_t session_core_on_announce_update_rejected(
     if (rc < 0) return rc;        /* WOULD_BLOCK: retryable, nothing mutated */
     s->profile->commit_inbound_request(s, uep);
     moq_stream_ref_t ref = s->announcements[slot].request_stream_ref;
-    if (ref._v != 0) (void)drain_ref_add(s, ref);   /* slot reserved above */
+    if (need_drain && ref._v != 0)
+        (void)drain_ref_add(s, ref);   /* slot reserved above */
     ann_free_entry(s, (size_t)slot);
     return MOQ_OK;
 }
@@ -255,7 +280,8 @@ static uint8_t *build_ns_id(moq_session_t *s,
 /* -- Incoming PUBLISH_NAMESPACE handler (semantic) ------------------ */
 
 moq_result_t session_core_on_publish_namespace(moq_session_t *s,
-                                                moq_decoded_publish_namespace_t *d)
+                                                moq_decoded_publish_namespace_t *d,
+                                                bool request_fin_observed)
 {
     bool auth_committed = false;
     moq_result_t result = MOQ_OK;
@@ -270,6 +296,13 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
     }
 
     bool req_stream = d->endpoint.has_stream_ref;
+    /* The pre-commit rejection's single drain decision, shared by the auth and
+     * pool-full branches. An observed FIN closes the peer's send half -- with
+     * this message, or on an earlier call whose refusal staging retained -- so
+     * no late bytes can arrive and the reference is unnecessary; the rejection
+     * still routes REQUEST_ERROR + FIN on the bidi and still removes its staging
+     * stream-ref key, which `req_stream` alone governs. */
+    bool reject_drain = req_stream && !request_fin_observed;
 
     /* A message-level authorization-token reject (e.g. unknown alias): fail the
      * request with REQUEST_ERROR (no event); a REGISTER carried alongside still
@@ -280,7 +313,7 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
          * staging stream-ref key is removed and the bidi retained in the drain
          * ring so a trailing FIN / late bytes are absorbed (the staging sub slot
          * is freed by the request-stream handoff). Reserve drain before mutating. */
-        if (req_stream && s->drain_ref_count >= s->drain_ref_cap) {
+        if (reject_drain && s->drain_ref_count >= s->drain_ref_cap) {
             result = MOQ_ERR_WOULD_BLOCK;
             goto cleanup_all;
         }
@@ -301,7 +334,8 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
         process_auth_tokens_commit_txn(s, &d->auth_txn);
         if (req_stream && d->endpoint.stream_ref._v != 0) {
             request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
-            (void)drain_ref_add(s, d->endpoint.stream_ref); /* reserved above */
+            if (reject_drain)
+                (void)drain_ref_add(s, d->endpoint.stream_ref); /* reserved above */
         }
         result = MOQ_OK;
         goto cleanup_all;
@@ -309,7 +343,7 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
 
     int slot = ann_find_free(s);
     if (slot < 0) {
-        if (req_stream && s->drain_ref_count >= s->drain_ref_cap) {
+        if (reject_drain && s->drain_ref_count >= s->drain_ref_cap) {
             result = MOQ_ERR_WOULD_BLOCK;
             goto cleanup_all;
         }
@@ -332,7 +366,8 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
         process_auth_tokens_commit_txn(s, &d->auth_txn);
         if (req_stream && d->endpoint.stream_ref._v != 0) {
             request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
-            (void)drain_ref_add(s, d->endpoint.stream_ref); /* reserved above */
+            if (reject_drain)
+                (void)drain_ref_add(s, d->endpoint.stream_ref); /* reserved above */
         }
         result = MOQ_OK;
         goto cleanup_all;
@@ -508,7 +543,8 @@ moq_result_t session_core_on_publish_namespace_cancel(
     e.detail_size = (uint32_t)sizeof(moq_namespace_cancelled_event_t);
     e.borrow_epoch = s->borrow_epoch;
     e.u.namespace_cancelled.ann = s->announcements[d->target_slot].handle;
-    e.u.namespace_cancelled.error_code = (moq_request_error_t)d->error_code;
+    e.u.namespace_cancelled.error_code =
+        s->profile->semantic_request_error(d->error_code);
     e.u.namespace_cancelled.reason = reason;
 
     moq_result_t rc = push_event(s, &e);
@@ -561,7 +597,8 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
      * (D16 carries the response on the control channel: no stream-ref, no drain). */
     bool req_stream = (entry->request_stream_ref._v != 0);
     moq_stream_ref_t req_ref = entry->request_stream_ref;
-    if (req_stream && s->drain_ref_count >= s->drain_ref_cap)
+    bool need_drain = req_stream && !ann_peer_fin_observed(entry);
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
     /* Close the announcer's send half after the terminal error so the peer can
      * retire the request bidi; reserve that action up front (alongside the drain
@@ -598,7 +635,8 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
         e.detail_size = (uint32_t)sizeof(moq_namespace_rejected_event_t);
         e.borrow_epoch = s->borrow_epoch;
         e.u.namespace_rejected.ann = entry->handle;
-        e.u.namespace_rejected.error_code = (moq_request_error_t)d->error_code;
+        e.u.namespace_rejected.error_code =
+            s->profile->semantic_request_error(d->error_code);
         e.u.namespace_rejected.can_retry = d->can_retry;
         e.u.namespace_rejected.retry_after_ms = d->retry_after_ms;
         e.u.namespace_rejected.reason = reason;
@@ -612,7 +650,8 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
 
     if (req_stream && req_ref._v != 0) {
         (void)queue_close_bidi(s, req_ref);   /* action reserved above */
-        (void)drain_ref_add(s, req_ref);      /* slot reserved above */
+        if (need_drain)
+            (void)drain_ref_add(s, req_ref);  /* slot reserved above */
     }
     ann_free_entry(s, (size_t)d->target_slot);
     return MOQ_OK;
@@ -655,7 +694,9 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
         return MOQ_ERR_INVAL;
 
     /* Validate namespace. */
-    if (moq_validate_namespace(&cfg->track_namespace) < 0)
+    if (moq_validate_namespace_min_fields(
+            &cfg->track_namespace,
+            s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
 
     /* Check request ID credit via profile. */
@@ -879,6 +920,11 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
     if (cfg->struct_size < offsetof(moq_reject_namespace_cfg_t, redirect))
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 #define ANN_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_namespace_cfg_t, f) + sizeof(cfg->f))
 
@@ -916,7 +962,8 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
      * mutating (D16 carries the response on the control channel: no drain). */
     bool req_stream = (entry->request_stream_ref._v != 0);
     moq_stream_ref_t req_ref = entry->request_stream_ref;
-    if (req_stream && s->drain_ref_count >= s->drain_ref_cap)
+    bool need_drain = req_stream && !ann_peer_fin_observed(entry);
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
     moq_result_t arc;
@@ -937,7 +984,7 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
     }
     if (arc < 0) return arc;
 
-    if (req_stream && req_ref._v != 0)
+    if (need_drain && req_ref._v != 0)
         (void)drain_ref_add(s, req_ref);   /* slot reserved above */
     ann_free_entry(s, (size_t)slot);
     return MOQ_OK;
@@ -960,6 +1007,11 @@ moq_result_t moq_session_cancel_namespace(moq_session_t *s,
     if (cfg->struct_size < sizeof(moq_cancel_namespace_cfg_t))
         return MOQ_ERR_INVAL;
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;

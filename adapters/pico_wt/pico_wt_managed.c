@@ -54,6 +54,14 @@ static void managed_raise_recv_windows(picoquic_quic_t *quic)
         picoquic_tp_initial_max_data, PICO_WT_MANAGED_RECV_FLOW_CONTROL);
 }
 
+#if defined(MOQ_PICO_WT_TESTING)
+#include "tests/pico_wt_test_seam.h"
+/* TEST-ONLY per-facade instrumentation. Written only on the network thread
+ * (the WT callback), read only after that thread has been joined by
+ * moq_pico_wt_managed_stop(), which supplies the happens-before edge. */
+typedef struct { int event; const void *ctx; } moq_pwt_test_ev_t;
+#endif
+
 struct moq_pico_wt_managed {
     moq_alloc_t        alloc;
 
@@ -123,6 +131,17 @@ struct moq_pico_wt_managed {
     int                wake_in_flight;
     pthread_t          network_thread_id;
     bool               network_thread_id_set;
+
+#if defined(MOQ_PICO_WT_TESTING)
+    /* TEST-ONLY: server control-stream identity + callback event inventory */
+    picoquic_cnx_t   *test_ctrl_cnx;
+    uint64_t          test_ctrl_sid;
+    int               test_ctrl_have;
+    moq_pico_wt_conn_t *test_detached_conn;  /* stale, for classification only */
+    moq_pwt_test_ev_t test_ev[MOQ_PWT_EV_MAX];
+    size_t            test_ev_n;
+    size_t            test_ev_overflow;
+#endif
 };
 
 /* -- cfg helpers ---------------------------------------------------- */
@@ -264,6 +283,11 @@ static size_t managed_alpn_select(picoquic_quic_t *quic,
     return count;
 }
 
+/* draft-ietf-webtrans-http3-15 3.3 registry: WebTransport session aborted
+ * because application protocol negotiation failed. Private to this adapter --
+ * it is a WebTransport wire code, never a MoQ close/fatal code. */
+#define MOQ_WT_ALPN_ERROR 0x0817b3ddu
+
 /* -- WT client control-stream callback (network thread) ------------- */
 
 static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
@@ -316,14 +340,17 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
             (const char *)stream_ctx->ps.stream_state.header.wt_protocol;
         moq_version_t v = (moq_version_t)0;
         if (tok && tok[0] != '\0') {
+            /* unknown token, or one we never offered: negotiation FAILED */
             if (!moq_alpn_to_version(tok, strlen(tok), &v) ||
                 !wt_offer_contains(m->wt_protocols, tok))
-                goto fail;
+                goto alpn_fail;
             scfg.version = v;
         } else {
             const char *d16 = moq_alpn_for_version(MOQ_VERSION_DRAFT_16);
+            /* no token AND no legacy draft-16 in the offer: negotiation FAILED.
+             * (With draft-16 offered this stays the documented fallback.) */
             if (!d16 || !wt_offer_contains(m->wt_protocols, d16))
-                goto fail;
+                goto alpn_fail;
             scfg.version = MOQ_VERSION_DRAFT_16;
         }
     }
@@ -360,6 +387,18 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     mark_activity(m);
     return 0;
 
+alpn_fail:
+    /* draft-ietf-webtrans-http3-15 3.3: a client that REQUIRES application
+     * protocol negotiation MUST close the WebTransport session with
+     * WT_ALPN_ERROR when a successful response omits WT-Protocol (and no
+     * legacy fallback applies) or selects a token it never offered. This is a
+     * WebTransport WIRE error: it is sent on the wire and deliberately does
+     * NOT become a MoQ bridge code -- the local terminal below is unchanged
+     * (fatal, fatal_code 0). The send result is not turned into new state; a
+     * failure to enqueue still leaves the same local terminal. */
+    (void)picowt_send_close_session_message(cnx, stream_ctx,
+                                            MOQ_WT_ALPN_ERROR, NULL);
+    /* fall through to the shared local terminal */
 fail:
     pthread_mutex_lock(&m->mutex);
     m->fatal = true;
@@ -375,11 +414,54 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     size_t length, picohttp_call_back_event_t event,
     h3zero_stream_ctx_t *stream_ctx, void *app_ctx)
 {
+#if defined(MOQ_PICO_WT_TESTING)
+    /* TEST-ONLY inventory. Network thread only. app_ctx is NOT always the
+     * facade -- h3zero delivers body/FIN with the ADAPTER context -- so the
+     * facade is derived from the connection's path table, whose app_ctx the
+     * facade itself installed. The raw context is stored verbatim and
+     * classified only after quiescence; nothing here locks or dereferences it. */
+    {
+        h3zero_callback_ctx_t *ih3 = (h3zero_callback_ctx_t *)
+            picoquic_get_callback_context(cnx);
+        moq_pico_wt_managed_t *im =
+            (ih3 != NULL && ih3->path_table != NULL && ih3->path_table_nb > 0)
+                ? (moq_pico_wt_managed_t *)ih3->path_table[0].path_app_ctx
+                : NULL;
+        if (im != NULL) {
+            if (im->test_ev_n < MOQ_PWT_EV_MAX) {
+                im->test_ev[im->test_ev_n].event = (int)event;
+                im->test_ev[im->test_ev_n].ctx   = app_ctx;
+                im->test_ev_n++;
+            } else {
+                im->test_ev_overflow++;
+            }
+        }
+    }
+#endif
+
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)app_ctx;
-    (void)bytes; (void)length;
+
+    /* DUAL CONTEXT, decided by event -- h3zero calls this function with two
+     * different `app_ctx` owners on the control stream:
+     *
+     *   - CONNECT and the synthetic POST notification are direct path-table
+     *     calls, so `app_ctx` is the FACADE (`m`);
+     *   - every other event is delivered with the stream's retained
+     *     `path_callback_ctx`, which moq_pico_wt_conn_create() set to the
+     *     ADAPTER. h3zero's body branch restores only `path_callback` from the
+     *     path table, never that context.
+     *
+     * So the adapter's context is NOT rebound here: leaving it in place is what
+     * keeps clear_all_stream_callbacks()/detach_from_picoquic() able to
+     * recognise and clear this stream, i.e. the adapter keeps ownership and no
+     * callback can reach a detached adapter. Adapter-owned events are simply
+     * forwarded with the context they already carry. */
+    if (event == picohttp_callback_post)
+        return 0;   /* synthetic notification on the facade context; no-op */
 
     if (event != picohttp_callback_connect)
-        return 0;  /* data routes to the adapter after attach */
+        return moq_pico_wt_callback(cnx, bytes, length, event,
+                                    stream_ctx, app_ctx);
 
     /* One active connection: refuse a second CONNECT. (Callbacks are
      * serialized on the single network thread, so this is race-free.)
@@ -445,6 +527,13 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
         }
     }
 
+#if defined(MOQ_PICO_WT_TESTING)
+    /* TEST-ONLY: remember this server's WT control stream so the ownership
+     * oracle can inspect its callback binding. */
+    m->test_ctrl_cnx  = cnx;
+    m->test_ctrl_sid  = stream_ctx->stream_id;
+    m->test_ctrl_have = 1;
+#endif
     pthread_mutex_lock(&m->mutex);
     m->session = session;
     m->conn = conn;
@@ -1219,3 +1308,90 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
     pthread_mutex_unlock(&m->mutex);
     return result;
 }
+
+#if defined(MOQ_PICO_WT_TESTING)
+/* TEST-ONLY ownership seam (absent from the shipped library, nothing exported).
+ * Reports the WT CONTROL stream's callback/context binding together with the
+ * adapter pointer, so a test can assert the invariant that
+ * clear_all_stream_callbacks()/detach_from_picoquic() depend on: the control
+ * stream's path_callback_ctx must be the ADAPTER, otherwise adapter teardown
+ * cannot recognise -- and therefore cannot clear -- this callback. */
+/* Classify the callback bound to the server's WT control stream. The
+ * comparison happens HERE so no caller converts a function pointer through an
+ * object pointer type.
+ *
+ * Thread contract: the caller must have joined the owning network thread
+ * (moq_pico_wt_managed_stop) before calling. h3zero's stream tree is walked
+ * here, which is only safe once no callback can run. */
+static moq_pwt_cb_kind_t pwt_cb_kind(picohttp_post_data_cb_fn cb)
+{
+    if (cb == NULL)                    return MOQ_PWT_CB_NONE;
+    if (cb == moq_pico_wt_callback)    return MOQ_PWT_CB_ADAPTER;
+    if (cb == managed_server_wt_cb)    return MOQ_PWT_CB_FACADE;
+    return MOQ_PWT_CB_OTHER;
+}
+
+static moq_pwt_ctx_kind_t pwt_ctx_kind(const moq_pico_wt_managed_t *m,
+                                       const void *ctx)
+{
+    if (ctx == NULL)                     return MOQ_PWT_CTX_NONE;
+    if (ctx == (const void *)m)          return MOQ_PWT_CTX_FACADE;
+    if (ctx == (const void *)m->conn)    return MOQ_PWT_CTX_ADAPTER;
+    /* a detached (freed) adapter still classifies as ADAPTER, so a binding
+     * left pointing at it cannot be mistaken for "cleared". The pointer is
+     * only ever COMPARED, never dereferenced. */
+    if (m->test_detached_conn != NULL &&
+        ctx == (const void *)m->test_detached_conn) return MOQ_PWT_CTX_ADAPTER;
+    return MOQ_PWT_CTX_OTHER;
+}
+
+int moq_pico_wt_managed_test_ctrl_binding(moq_pico_wt_managed_t *m,
+                                          moq_pwt_cb_kind_t  *out_cb,
+                                          moq_pwt_ctx_kind_t *out_ctx)
+{
+    if (m == NULL) return -1;
+    if (out_cb)  *out_cb  = MOQ_PWT_CB_NONE;
+    if (out_ctx) *out_ctx = MOQ_PWT_CTX_NONE;
+    if (!m->test_ctrl_have) return -1;
+
+    h3zero_callback_ctx_t *h3ctx = (h3zero_callback_ctx_t *)
+        picoquic_get_callback_context(m->test_ctrl_cnx);
+    if (h3ctx == NULL) return 0;
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(h3ctx, m->test_ctrl_sid);
+    if (sc == NULL) return 0;            /* stream already deleted */
+
+    if (out_cb)  *out_cb  = pwt_cb_kind(sc->path_callback);
+    if (out_ctx) *out_ctx = pwt_ctx_kind(m, sc->path_callback_ctx);
+    return 1;
+}
+
+size_t moq_pico_wt_managed_test_event_count(moq_pico_wt_managed_t *m)
+{ return m ? m->test_ev_n : 0; }
+
+size_t moq_pico_wt_managed_test_event_overflow(moq_pico_wt_managed_t *m)
+{ return m ? m->test_ev_overflow : 0; }
+
+int moq_pico_wt_managed_test_event_at(moq_pico_wt_managed_t *m, size_t i,
+                                      int *out_event,
+                                      moq_pwt_ctx_kind_t *out_ctx)
+{
+    if (m == NULL || i >= m->test_ev_n) return -1;
+    if (out_event) *out_event = m->test_ev[i].event;
+    if (out_ctx)   *out_ctx   = pwt_ctx_kind(m, m->test_ev[i].ctx);
+    return 0;
+}
+
+void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m)
+{
+    if (!m) return;
+    pthread_mutex_lock(&m->mutex);
+    moq_pico_wt_conn_t *conn = m->conn;
+    m->conn = NULL;
+    m->test_detached_conn = conn;      /* compared, never dereferenced */
+    pthread_mutex_unlock(&m->mutex);
+    /* NOT the facade teardown order: this extracts the owned pointer after
+     * quiescence and invokes the exact adapter destructor, leaving m->conn
+     * NULL so the facade can still be destroyed without a double free. */
+    if (conn) moq_pico_wt_conn_destroy(conn);
+}
+#endif /* MOQ_PICO_WT_TESTING */

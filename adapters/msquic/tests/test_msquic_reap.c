@@ -11,12 +11,13 @@
  * The reaper must therefore YIELD whenever lane work is armed in that window and
  * let the doorbell run the pump first; the next pass reaps.
  *
- * SCOPE: this pins the scheduling rule — a pump OPPORTUNITY precedes further
- * batch reclamation. It is NOT proof that the application consumed the terminal:
- * nothing obliges the app to poll, and an app that ignores its events still gets
- * the child reclaimed. Explicit terminal facts and an application acknowledgment
- * before reclamation are separate, later work. The closed-count below is fixture
- * validation (the rig really did drive terminals), not the lifetime contract.
+ * SCOPE: this pins the SCHEDULING rule — a pump OPPORTUNITY precedes further
+ * batch reclamation, i.e. the ORDER of work within a reap pass. It is not the
+ * lifetime contract: whether a child may be reclaimed at all is decided by the
+ * application's acknowledgment, which this test's server pump gives greedily in
+ * the same pump that consumed the terminal, and which
+ * test_msquic_terminal_ack.c is what actually pins. The closed-count below is
+ * fixture validation (the rig really did drive terminals).
  *
  * The race is made deterministic with the white-box reap-gap seam: every reap
  * window arms a pump exactly as a worker batch's guard_leave would, so the yield
@@ -95,16 +96,23 @@ static int server_pump(moq_msquic_managed_t *m,
     while ((c = moq_msquic_lane_next_conn(lane, c)) != NULL) {
         moq_session_t *s = moq_msquic_managed_conn_session(c);
         moq_event_t ev;
+        bool closed = false;
 
         if (s == NULL)
             continue;
         while (moq_session_poll_events(s, &ev, 1) > 0) {
             if (ev.kind == MOQ_EVENT_SETUP_COMPLETE)
                 atomic_fetch_add(&sv->setup_seen, 1);
-            else if (ev.kind == MOQ_EVENT_SESSION_CLOSED)
+            else if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
                 atomic_fetch_add(&sv->closed_seen, 1);
+                closed = true;
+            }
             moq_event_cleanup(&ev);
         }
+        /* A greedy consumer: it has just taken this child's terminal, so it
+         * releases the child in the same pump. Reclamation waits for this. */
+        if (closed)
+            (void)moq_msquic_managed_conn_ack_terminal(c);
     }
     return 0;
 }

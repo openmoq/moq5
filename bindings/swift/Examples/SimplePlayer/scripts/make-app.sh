@@ -11,9 +11,12 @@
 #   scripts/make-app.sh macos      -> build/SimplePlayer.app   (then: open it)
 #   scripts/make-app.sh ios-sim    -> build/SimplePlayer.app   (then: simctl install)
 #
-# macOS needs a libmoq-service pkg-config prefix:
+# macOS builds THIS package (SimplePlayer, root MOQ5 pkg-config lane) and needs
+# a libmoq-service pkg-config prefix:
 #   PKG_CONFIG_PATH=<prefix>/lib/pkgconfig scripts/make-app.sh macos
-# iOS needs the binary xcframeworks first (see docs/ios-packaging.md).
+# iOS builds the sibling SimplePlayerXcode package (the env-free MoQServiceApple
+# wrapper lane) and needs the binary xcframeworks first, with NO MOQ_SERVICE*
+# env (see docs/ios-packaging.md).
 #
 set -euo pipefail
 
@@ -57,7 +60,15 @@ PLIST
   echo "✓ built $APP  —  run it:  open $APP"
   ;;
 ios-sim)
-  export MOQ_SERVICE=1 MOQ_SERVICE_IOS=1
+  # The env-free iOS/Xcode lane: build the sibling SimplePlayerXcode package,
+  # which depends on the MoQServiceApple wrapper. UNSET any MOQ_SERVICE* the
+  # shell carries so the build can never silently fall back to the root MOQ5
+  # dependency -- env-free is the whole point of this lane. The .app still lands
+  # in this package's build/ (the documented location), so resolve APP to an
+  # absolute path before changing directories.
+  unset MOQ_SERVICE MOQ_SERVICE_IOS MOQ_TRANSPORT
+  APP="$(pwd)/$APP"                     # absolute -> Examples/SimplePlayer/build/SimplePlayer.app
+  cd ../SimplePlayerXcode              # reuses these sources via a symlink
   SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
   TRIPLE="arm64-apple-ios16.0-simulator"
   swift build --triple "$TRIPLE" --sdk "$SDK" -c "$CONFIG"
@@ -65,7 +76,7 @@ ios-sim)
   rm -rf "$APP"
   mkdir -p "$APP"
   cp "$BIN" "$APP/SimplePlayer"
-  cp Info.plist "$APP/Info.plist"       # the committed iOS Info.plist
+  cp Info.plist "$APP/Info.plist"       # symlink to ../SimplePlayer/Info.plist
   fetch_ca "$APP/cacert.pem"
   echo "✓ built $APP  —  install it:  xcrun simctl install booted $APP"
   ;;

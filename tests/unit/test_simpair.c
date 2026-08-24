@@ -554,6 +554,519 @@ static void truncate_trace_fn(void *ctx, const moq_sim_trace_record_t *r)
     }
 }
 
+static int sp_server_pool_arm(bool full_sized)
+{
+    int failures = 0;
+    test_alloc_state_t alloc_state = {0};
+    moq_alloc_t alloc = test_allocator(&alloc_state);
+    moq_simpair_t *sp = NULL;
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = &alloc;
+    cfg.seed = 0xAB1;
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    cfg.server_max_open_subgroups = 1;   /* set in BOTH arms; only the
+                                          * full-sized struct_size exposes it */
+    cfg.struct_size = full_sized
+        ? (uint32_t)sizeof(cfg)
+        : (uint32_t)(offsetof(moq_simpair_cfg_t, server_streaming_objects) +
+                     sizeof(cfg.server_streaming_objects));
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 10;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 10;
+    MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+    if (!sp)
+        return failures + 1;
+    MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+
+    /* Drain establishment events on both ends. */
+    {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+    }
+
+    /* Client subscribes; the server observes exactly one request. */
+    moq_subscription_t srv_sub = {0};
+    bool have_srv_sub = false;
+    {
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+        moq_subscribe_cfg_t sub_cfg;
+        moq_subscribe_cfg_init(&sub_cfg);
+        sub_cfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+        sub_cfg.track_name = MOQ_BYTES_LITERAL("audio");
+        sub_cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        moq_subscription_t sub;
+        MOQ_TEST_CHECK(moq_session_subscribe(moq_simpair_client(sp),
+            &sub_cfg, moq_simpair_now_us(sp), &sub) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+
+        moq_event_t ev;
+        int got = moq_session_poll_events(moq_simpair_server(sp), &ev, 1);
+        MOQ_TEST_CHECK(got == 1);
+        if (got == 1) {
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+                srv_sub = ev.u.subscribe_request.sub;
+                have_srv_sub = true;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    if (!have_srv_sub) {
+        moq_simpair_destroy(sp);
+        return failures + 1;
+    }
+
+    /* Accept and drain the client's SUBSCRIBE_OK. */
+    {
+        moq_accept_subscribe_cfg_t accept;
+        moq_accept_subscribe_cfg_init(&accept);
+        MOQ_TEST_CHECK(moq_session_accept_subscribe(
+            moq_simpair_server(sp), srv_sub, &accept,
+            moq_simpair_now_us(sp)) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+    }
+
+    /* First subgroup open must succeed on both arms. */
+    moq_subgroup_cfg_t sgc;
+    moq_subgroup_cfg_init(&sgc);
+    sgc.group_id = 0;
+    sgc.subgroup_id = 0;
+    moq_subgroup_handle_t h1 = {0}, h2 = {0};
+    bool h2_open = false;
+    MOQ_TEST_CHECK(moq_session_open_subgroup(
+        moq_simpair_server(sp), srv_sub, &sgc,
+        moq_simpair_now_us(sp), &h1) == MOQ_OK);
+    /* Flush the first open so the action queue has room -- a refusal of the
+     * second open can then only be the subgroup pool. */
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+
+    size_t cap = moq_session_action_capacity(moq_simpair_server(sp));
+    MOQ_TEST_CHECK(cap > 0);
+    sgc.group_id = 1;
+    moq_result_t rc2 = moq_session_open_subgroup(
+        moq_simpair_server(sp), srv_sub, &sgc,
+        moq_simpair_now_us(sp), &h2);
+    if (full_sized) {
+        /* pool 1: subgroup A holds the only slot -> B refuses, pool not queue */
+        MOQ_TEST_CHECK(rc2 == MOQ_ERR_WOULD_BLOCK);
+    } else {
+        /* prefix-sized caller: default pool (64) -> B opens */
+        MOQ_TEST_CHECK(rc2 == MOQ_OK);
+        h2_open = (rc2 == MOQ_OK);
+    }
+
+    if (h2_open)
+        (void)moq_session_close_subgroup(moq_simpair_server(sp), h2,
+                                         moq_simpair_now_us(sp));
+    (void)moq_session_close_subgroup(moq_simpair_server(sp), h1,
+                                     moq_simpair_now_us(sp));
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(alloc_state.balance == 0);
+    return failures;
+}
+static int sp_matured_arm(bool client_to_server)
+{
+    int failures = 0;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = &alloc;
+    cfg.seed = client_to_server ? 0xC2500 : 0x5C200;
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    cfg.initial_now_us = 1000;
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 16;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 16;
+    cfg.fault_per_mille = 1000;
+    cfg.fault_flags = MOQ_SIM_FAULT_DELAY;   /* delay only, no split */
+    moq_simpair_t *sp = NULL;
+    MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+    if (!sp)
+        return failures + 1;
+    MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+    /* Establish and quiesce with faults still OFF, then drain setup events. */
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+    {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+    }
+    moq_simpair_enable_faults(sp);
+
+    moq_session_t *subscriber =
+        client_to_server ? moq_simpair_client(sp) : moq_simpair_server(sp);
+    moq_session_t *target =
+        client_to_server ? moq_simpair_server(sp) : moq_simpair_client(sp);
+
+    /* Exactly one SUBSCRIBE toward the target. */
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("md") };
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+    scfg.track_name = MOQ_BYTES_LITERAL("t");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t sub_h;
+    MOQ_TEST_CHECK(moq_session_subscribe(subscriber, &scfg,
+        moq_simpair_now_us(sp), &sub_h) == MOQ_OK);
+
+    /* One directional step queues the delayed control action; it is NOT
+     * delivered at the same instant (the target sees no request yet). */
+    {
+        size_t to_s = 0, to_c = 0;
+        MOQ_TEST_CHECK(
+            moq_simpair_step_directional(sp, &to_s, &to_c) == MOQ_OK);
+    }
+    MOQ_TEST_CHECK(moq_simpair_delayed_count(sp) == 1);
+    {
+        moq_event_t ev;
+        MOQ_TEST_CHECK(moq_session_poll_events(target, &ev, 1) == 0);
+    }
+
+    /* Advance exactly to the maturation deadline. */
+    uint64_t now = moq_simpair_now_us(sp);
+    uint64_t deadline = moq_simpair_next_deadline_us(sp);
+    MOQ_TEST_CHECK(deadline > now);
+    MOQ_TEST_CHECK(moq_simpair_advance_to(sp, deadline) == MOQ_OK);
+
+    /* One directional step matures the entry: the delivered input attributes
+     * to the target's direction ONLY. */
+    {
+        size_t to_s = 0, to_c = 0;
+        MOQ_TEST_CHECK(
+            moq_simpair_step_directional(sp, &to_s, &to_c) == MOQ_OK);
+        if (client_to_server) {
+            MOQ_TEST_CHECK(to_s == 1);
+            MOQ_TEST_CHECK(to_c == 0);
+        } else {
+            MOQ_TEST_CHECK(to_s == 0);
+            MOQ_TEST_CHECK(to_c == 1);
+        }
+    }
+    MOQ_TEST_CHECK(moq_simpair_delayed_count(sp) == 0);
+
+    /* Exactly one SUBSCRIBE_REQUEST surfaced at the target. */
+    {
+        moq_event_t ev;
+        size_t reqs = 0;
+        while (moq_session_poll_events(target, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+                reqs++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(reqs == 1);
+    }
+    /* A subsequent step + drain shows no duplicate. */
+    {
+        size_t to_s = 0, to_c = 0;
+        MOQ_TEST_CHECK(
+            moq_simpair_step_directional(sp, &to_s, &to_c) == MOQ_OK);
+        moq_event_t ev;
+        size_t dup = 0;
+        while (moq_session_poll_events(target, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+                dup++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(dup == 0);
+    }
+
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    return failures;
+}
+/* An INJECTED STOP is delivered back into the SENDER's session, so the work is
+ * handled toward the sender's side. Only a directional count can catch a
+ * mis-attribution: the combined total is identical either way. One arm per
+ * stream origin. */
+/* The untouched-on-error contract on the DETERMINISTIC allocation-failure
+ * path, not just the NULL-argument one: a step that returns MOQ_ERR_NOMEM
+ * must leave BOTH directional outputs exactly as the caller left them.
+ * Sentinels are re-stamped before every step, so a successful step may
+ * overwrite them and only the failing step's outputs are asserted. */
+static int sp_directional_oom_untouched(void)
+{
+    int failures = 0;
+    /* Count the allocations a clean run needs, then re-run failing one. */
+    uint64_t baseline = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        oom_alloc_state_t oas = {0};
+        moq_alloc_t alloc = oom_allocator(&oas);
+        if (pass == 1) oas.fail_at = baseline;   /* fail the LAST alloc */
+
+        moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.seed = 0x00A11;
+        cfg.initial_now_us = 1000;
+        cfg.version = MOQ_VERSION_DRAFT_18;
+        cfg.client_send_request_capacity = true;
+        cfg.client_initial_request_capacity = 16;
+        cfg.server_send_request_capacity = true;
+        cfg.server_initial_request_capacity = 16;
+        /* Delay+split force per-step allocations, so a deterministic
+         * fail_at lands inside a step rather than at setup. */
+        cfg.fault_per_mille = 1000;
+        cfg.fault_flags = MOQ_SIM_FAULT_DELAY | MOQ_SIM_FAULT_SPLIT_DATA;
+
+        moq_simpair_t *sp = NULL;
+        if (moq_simpair_create(&cfg, &sp) != MOQ_OK || sp == NULL) {
+            if (pass == 1) { MOQ_TEST_CHECK(false); }
+            continue;
+        }
+        MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+        moq_simpair_enable_faults(sp);
+
+        bool saw_nomem = false;
+        for (int step = 0; step < 24; step++) {
+            /* Re-stamp before EVERY step: only the failing step's outputs
+             * are under test. */
+            size_t to_srv = 0xA5A5A5A5u, to_cli = 0x5A5A5A5Au;
+            moq_result_t rc = moq_simpair_step_directional(sp, &to_srv, &to_cli);
+            if (rc == MOQ_ERR_NOMEM) {
+                saw_nomem = true;
+                /* The documented contract: neither output was written. */
+                MOQ_TEST_CHECK(to_srv == 0xA5A5A5A5u);
+                MOQ_TEST_CHECK(to_cli == 0x5A5A5A5Au);
+                break;
+            }
+            if (rc < 0) break;
+            (void)moq_simpair_advance_to(sp, moq_simpair_now_us(sp) + 1000);
+        }
+        if (pass == 0) {
+            baseline = oas.alloc_count;   /* allocations a clean run made */
+            MOQ_TEST_CHECK(baseline > 0);
+        } else {
+            /* Non-vacuity: the injected failure really did surface. */
+            MOQ_TEST_CHECK(saw_nomem);
+        }
+        moq_simpair_destroy(sp);
+    }
+    return failures;
+}
+
+static int sp_inject_stop_direction_arm(bool server_origin)
+{
+    int failures = 0;
+    test_alloc_state_t alloc_state = {0};
+    moq_alloc_t alloc = test_allocator(&alloc_state);
+    moq_simpair_t *sp = NULL;
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = &alloc;
+    cfg.seed = 0x570;
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 16;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 16;
+    /* Configured now, ARMED only after setup quiesces (below). */
+    cfg.fault_flags = MOQ_SIM_FAULT_INJECT_STOP;
+    cfg.fault_per_mille = 1000;
+    MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+    if (!sp) return failures + 1;
+    MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 32, NULL) == MOQ_OK);
+
+    moq_session_t *cl = moq_simpair_client(sp);
+    moq_session_t *sv = moq_simpair_server(sp);
+
+    /* One live data stream, from the requested origin. */
+    moq_session_t *sub_side = server_origin ? cl : sv;
+    moq_session_t *pub_side = server_origin ? sv : cl;
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("inj") };
+    moq_namespace_t ns = { ns_parts, 1 };
+    moq_subscribe_cfg_t sub_cfg;
+    moq_subscribe_cfg_init(&sub_cfg);
+    sub_cfg.track_namespace = ns;
+    sub_cfg.track_name = MOQ_BYTES_LITERAL("t");
+    moq_subscription_t sub;
+    MOQ_TEST_CHECK(moq_session_subscribe(sub_side, &sub_cfg, 0, &sub) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 32, NULL) == MOQ_OK);
+
+    moq_subscription_t peer_sub = MOQ_SUBSCRIPTION_INVALID;
+    moq_event_t ev;
+    while (moq_session_poll_events(pub_side, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+            peer_sub = ev.u.subscribe_request.sub;
+            moq_accept_subscribe_cfg_t acc;
+            moq_accept_subscribe_cfg_init(&acc);
+            MOQ_TEST_CHECK(moq_session_accept_subscribe(pub_side, peer_sub,
+                                                        &acc, 0) == MOQ_OK);
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(moq_subscription_is_valid(peer_sub));
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 32, NULL) == MOQ_OK);
+
+    moq_subgroup_cfg_t sg_cfg;
+    moq_subgroup_cfg_init(&sg_cfg);
+    moq_subgroup_handle_t sg;
+    MOQ_TEST_CHECK(moq_session_open_subgroup(pub_side, peer_sub, &sg_cfg, 0,
+                                             &sg) == MOQ_OK);
+    moq_rcbuf_t *p = NULL;
+    MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"x", 1, &p) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_write_object(pub_side, sg, 0, p, 0) == MOQ_OK);
+    moq_rcbuf_decref(p);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 32, NULL) == MOQ_OK);
+    while (moq_session_poll_events(cl, &ev, 1) == 1) moq_event_cleanup(&ev);
+    while (moq_session_poll_events(sv, &ev, 1) == 1) moq_event_cleanup(&ev);
+
+    /* Quiesced: nothing is queued, so the ONLY work the next step can do is
+     * the injected STOP. */
+    moq_simpair_enable_faults(sp);
+    size_t to_server = 0, to_client = 0;
+    MOQ_TEST_CHECK(moq_simpair_step_directional(sp, &to_server, &to_client)
+                   == MOQ_OK);
+
+    /* The STOP is delivered into the SENDER's session: a server-origin stream
+     * means the sender is the server, so the work lands toward the server. */
+    if (server_origin) {
+        MOQ_TEST_CHECK(to_server == 1);
+        MOQ_TEST_CHECK(to_client == 0);
+    } else {
+        MOQ_TEST_CHECK(to_client == 1);
+        MOQ_TEST_CHECK(to_server == 0);
+    }
+
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(alloc_state.balance == 0);
+    return failures;
+}
+
+static int sp_directional_checks(void)
+{
+    int failures = 0;
+
+    /* -- normal direction: both counters advance over an establishment (the
+     *    SETUP exchange moves actions both ways). -- */
+    {
+        test_alloc_state_t alloc_state = {0};
+        moq_alloc_t alloc = test_allocator(&alloc_state);
+        moq_simpair_t *sp = NULL;
+        moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.seed = 0x5D1;
+        cfg.version = MOQ_VERSION_DRAFT_18;
+        cfg.client_send_request_capacity = true;
+        cfg.client_initial_request_capacity = 10;
+        cfg.server_send_request_capacity = true;
+        cfg.server_initial_request_capacity = 10;
+        MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+        if (sp) {
+            MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+            size_t tot_srv = 0, tot_cli = 0;
+            for (int i = 0; i < 64; i++) {
+                size_t to_s = 0, to_c = 0;
+                MOQ_TEST_CHECK(
+                    moq_simpair_step_directional(sp, &to_s, &to_c) == MOQ_OK);
+                tot_srv += to_s;
+                tot_cli += to_c;
+                if (to_s + to_c == 0)
+                    break;
+            }
+            MOQ_TEST_CHECK(tot_srv > 0);
+            MOQ_TEST_CHECK(tot_cli > 0);
+            moq_simpair_destroy(sp);
+            MOQ_TEST_CHECK(alloc_state.balance == 0);
+        }
+    }
+
+    /* -- combined-count parity: two same-seed runs, one stepped directionally
+     *    and one via moq_simpair_step; per step (to_server + to_client) must
+     *    equal step's delivered count. -- */
+    {
+        test_alloc_state_t as_a = {0}, as_b = {0};
+        moq_alloc_t alloc_a = test_allocator(&as_a);
+        moq_alloc_t alloc_b = test_allocator(&as_b);
+        moq_simpair_cfg_t ca = MOQ_SIMPAIR_CFG_INIT, cb = MOQ_SIMPAIR_CFG_INIT;
+        ca.alloc = &alloc_a; cb.alloc = &alloc_b;
+        ca.seed = cb.seed = 0x5D2;
+        ca.version = cb.version = MOQ_VERSION_DRAFT_18;
+        ca.client_send_request_capacity = cb.client_send_request_capacity = true;
+        ca.client_initial_request_capacity =
+            cb.client_initial_request_capacity = 10;
+        ca.server_send_request_capacity = cb.server_send_request_capacity = true;
+        ca.server_initial_request_capacity =
+            cb.server_initial_request_capacity = 10;
+        moq_simpair_t *a = NULL, *b = NULL;
+        MOQ_TEST_CHECK(moq_simpair_create(&ca, &a) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_simpair_create(&cb, &b) == MOQ_OK);
+        if (a && b) {
+            MOQ_TEST_CHECK(moq_simpair_start(a) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_start(b) == MOQ_OK);
+            for (int i = 0; i < 64; i++) {
+                size_t to_s = 0, to_c = 0, comb = 0;
+                MOQ_TEST_CHECK(
+                    moq_simpair_step_directional(a, &to_s, &to_c) == MOQ_OK);
+                MOQ_TEST_CHECK(moq_simpair_step(b, &comb) == MOQ_OK);
+                MOQ_TEST_CHECK(to_s + to_c == comb);
+                if (comb == 0)
+                    break;
+            }
+        }
+        if (a) moq_simpair_destroy(a);
+        if (b) moq_simpair_destroy(b);
+        MOQ_TEST_CHECK(as_a.balance == 0);
+        MOQ_TEST_CHECK(as_b.balance == 0);
+    }
+
+    /* -- nullable outputs: NULL for either/both must not crash; a NULL sp is
+     *    rejected. -- */
+    {
+        test_alloc_state_t alloc_state = {0};
+        moq_alloc_t alloc = test_allocator(&alloc_state);
+        moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.seed = 0x5D3;
+        cfg.version = MOQ_VERSION_DRAFT_18;
+        cfg.client_send_request_capacity = true;
+        cfg.client_initial_request_capacity = 10;
+        cfg.server_send_request_capacity = true;
+        cfg.server_initial_request_capacity = 10;
+        moq_simpair_t *sp = NULL;
+        MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+        MOQ_TEST_CHECK(
+            moq_simpair_step_directional(NULL, NULL, NULL) == MOQ_ERR_INVAL);
+        {   /* Documented contract: on error NEITHER output is written. Prove
+             * it with distinct non-null sentinels -- a NULL-only call cannot. */
+            size_t s_srv = 0xA5A5A5A5u, s_cli = 0x5A5A5A5Au;
+            MOQ_TEST_CHECK(moq_simpair_step_directional(NULL, &s_srv, &s_cli)
+                           == MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK(s_srv == 0xA5A5A5A5u);
+            MOQ_TEST_CHECK(s_cli == 0x5A5A5A5Au);
+        }
+        if (sp) {
+            MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+            size_t x = 0;
+            MOQ_TEST_CHECK(
+                moq_simpair_step_directional(sp, NULL, NULL) == MOQ_OK);
+            MOQ_TEST_CHECK(
+                moq_simpair_step_directional(sp, &x, NULL) == MOQ_OK);
+            MOQ_TEST_CHECK(
+                moq_simpair_step_directional(sp, NULL, &x) == MOQ_OK);
+            moq_simpair_destroy(sp);
+            MOQ_TEST_CHECK(alloc_state.balance == 0);
+        }
+    }
+
+    /* -- matured-delay target attribution (load-bearing): a delayed control
+     *    action matures to its target's direction ONLY. Two arms, one per
+     *    direction; neutering the matured-side attribution fails at least one. */
+    failures += sp_matured_arm(true);    /* client -> server */
+    failures += sp_matured_arm(false);   /* server -> client */
+
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1304,7 +1817,7 @@ int main(void)
         moq_session_open_subgroup(moq_simpair_server(sp),
             ssub, &sg_cfg, moq_simpair_now_us(sp), &sg);
         moq_rcbuf_t *p = NULL;
-        moq_rcbuf_create(&alloc, big, 512, &p);
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, big, 512, &p) == MOQ_OK);
         moq_session_write_object(moq_simpair_server(sp), sg, 0, p,
             moq_simpair_now_us(sp));
         moq_rcbuf_decref(p);
@@ -6346,6 +6859,196 @@ int main(void)
             MOQ_TEST_CHECK(oas.balance == 0);
         }
     }
+/* One arm of the appended-field ABI check for server_max_open_subgroups.
+ *   full_sized == false: a PREFIX-sized cfg (struct_size stops before the
+ *     field) with garbage 1 beyond the prefix -> the server keeps the default
+ *     pool, so a SECOND concurrent subgroup open SUCCEEDS.
+ *   full_sized == true: a FULL-sized cfg with the field = 1 -> the server's
+ *     outgoing subgroup pool is 1, so the second open is REFUSED with
+ *     WOULD_BLOCK while action capacity is still positive (proving the pool,
+ *     not the action queue, is the blocker). */
+
+    /* == Appended-field ABI for server_max_open_subgroups: prefix-sized
+     * (garbage ignored -> default pool, second open succeeds) AND full-sized
+     * (pool 1 -> second open refuses with positive action capacity). ==== */
+    failures += sp_server_pool_arm(false);   /* prefix-sized: default pool */
+    failures += sp_server_pool_arm(true);    /* full-sized: pool 1 refuses */
+
+    /* == moq_simpair_step_directional: attribution, parity, nullable, and
+     * matured-delay target attribution ================================ */
+    failures += sp_directional_checks();
+    failures += sp_inject_stop_direction_arm(true);    /* server-origin  */
+    failures += sp_inject_stop_direction_arm(false);   /* client-origin  */
+    failures += sp_directional_oom_untouched();
+
+    /* == server_streaming_objects forwarding ===
+     * Old-sized cfg (struct_size excludes the field) is still accepted and the
+     * field defaults OFF; a full-sized cfg forwards it ON. Observed via the
+     * SERVER's delivery of an object published by the CLIENT: OBJECT_RECEIVED
+     * (off) vs OBJECT_CHUNK (on). */
+    {
+        struct { bool full_sized; bool streaming_on; } cases[2] = {
+            { false, false },   /* old-sized -> field excluded -> defaults OFF */
+            { true,  true  },   /* full-sized -> forwarded ON */
+        };
+        for (int ci = 0; ci < 2; ci++) {
+            test_alloc_state_t alloc_state = {0};
+            moq_alloc_t alloc = test_allocator(&alloc_state);
+            moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+            cfg.alloc = &alloc;
+            cfg.seed = 0x57EA;
+            cfg.initial_now_us = 1000;
+            cfg.client_send_request_capacity = true;
+            cfg.client_initial_request_capacity = 10;
+            cfg.server_send_request_capacity = true;
+            cfg.server_initial_request_capacity = 10;
+            cfg.server_streaming_objects = true;   /* byte set in BOTH cases */
+            if (!cases[ci].full_sized)
+                cfg.struct_size = (uint32_t)offsetof(moq_simpair_cfg_t,
+                                                     server_streaming_objects);
+
+            moq_simpair_t *sp = NULL;
+            MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);   /* accepted */
+            MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+            moq_event_t ev;
+            while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+                moq_event_cleanup(&ev);
+            while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+                moq_event_cleanup(&ev);
+
+            /* SERVER subscribes; CLIENT is the publisher. */
+            moq_bytes_t np[] = { MOQ_BYTES_LITERAL("live") };
+            moq_namespace_t ns = { np, 1 };
+            moq_subscribe_cfg_t sc;
+            moq_subscribe_cfg_init(&sc);
+            sc.track_namespace = ns;
+            sc.track_name = MOQ_BYTES_LITERAL("audio");
+            sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+            moq_subscription_t sub;
+            MOQ_TEST_CHECK(moq_session_subscribe(moq_simpair_server(sp), &sc,
+                moq_simpair_now_us(sp), &sub) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+
+            /* CLIENT accepts. */
+            MOQ_TEST_CHECK(moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+            moq_subscription_t cli_sub = ev.u.subscribe_request.sub;
+            moq_accept_subscribe_cfg_t ac;
+            moq_accept_subscribe_cfg_init(&ac);
+            MOQ_TEST_CHECK(moq_session_accept_subscribe(moq_simpair_client(sp),
+                cli_sub, &ac, moq_simpair_now_us(sp)) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+            while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+                moq_event_cleanup(&ev);   /* drain SUBSCRIBE_OK */
+
+            /* CLIENT writes one object on a subgroup. */
+            moq_subgroup_cfg_t sg;
+            moq_subgroup_cfg_init(&sg);
+            sg.group_id = 1; sg.subgroup_id = 0;
+            moq_subgroup_handle_t sgh;
+            MOQ_TEST_CHECK(moq_session_open_subgroup(moq_simpair_client(sp),
+                cli_sub, &sg, moq_simpair_now_us(sp), &sgh) == MOQ_OK);
+            moq_rcbuf_t *p = NULL;
+            MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"hello", 5, &p) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_write_object(moq_simpair_client(sp), sgh, 0,
+                p, moq_simpair_now_us(sp)) == MOQ_OK);
+            moq_rcbuf_decref(p);
+            MOQ_TEST_CHECK(moq_session_close_subgroup(moq_simpair_client(sp), sgh,
+                moq_simpair_now_us(sp)) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+
+            /* SERVER delivery: OBJECT_CHUNK iff streaming forwarded on. */
+            int chunks = 0, received = 0;
+            while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_OBJECT_CHUNK) chunks++;
+                else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) received++;
+                moq_event_cleanup(&ev);
+            }
+            if (cases[ci].streaming_on) {
+                MOQ_TEST_CHECK(chunks >= 1);
+                MOQ_TEST_CHECK_EQ_INT(received, 0);
+            } else {
+                MOQ_TEST_CHECK(received >= 1);
+                MOQ_TEST_CHECK_EQ_INT(chunks, 0);
+            }
+
+            moq_simpair_destroy(sp);
+            MOQ_TEST_CHECK(alloc_state.balance == 0);
+        }
+    }
+    /* == SimPair transport-close delivery ===
+     * A session's CLOSE_SESSION action is delivered to the peer via
+     * moq_session_on_transport_close -- deterministically (two identical runs
+     * agree) and idempotently (both ends closed, re-pumping adds nothing). */
+    {
+        for (int run = 0; run < 2; run++) {
+            test_alloc_state_t alloc_state = {0};
+            moq_alloc_t alloc = test_allocator(&alloc_state);
+            moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+            cfg.alloc = &alloc;
+            cfg.seed = 0xC105E;
+            cfg.initial_now_us = 1000;
+            moq_simpair_t *sp = NULL;
+            MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+            moq_event_t ev;
+            while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+                moq_event_cleanup(&ev);
+            while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+                moq_event_cleanup(&ev);
+
+            /* Client closes with a distinctive code; the pump delivers it. */
+            MOQ_TEST_CHECK(moq_session_close(moq_simpair_client(sp), 0x7, "bye",
+                                             moq_simpair_now_us(sp)) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+
+            int cl_closed = 0, sv_closed = 0;
+            uint64_t cl_code = 0, sv_code = 0;
+            while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                    cl_closed++; cl_code = ev.u.closed.code;
+                }
+                moq_event_cleanup(&ev);
+            }
+            while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                    sv_closed++; sv_code = ev.u.closed.code;
+                }
+                moq_event_cleanup(&ev);
+            }
+            /* Local detector and peer each observe EXACTLY one close, code 0x7. */
+            MOQ_TEST_CHECK_EQ_INT(cl_closed, 1);
+            MOQ_TEST_CHECK_EQ_INT(sv_closed, 1);
+            MOQ_TEST_CHECK_EQ_INT((int)cl_code, 0x7);
+            MOQ_TEST_CHECK_EQ_INT((int)sv_code, 0x7);
+            MOQ_TEST_CHECK(moq_session_state(moq_simpair_client(sp))
+                           == MOQ_SESS_CLOSED);
+            MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(sp))
+                           == MOQ_SESS_CLOSED);
+
+            /* Idempotent: another pump yields no further close events. */
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+            int extra = 0;
+            while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) extra++;
+                moq_event_cleanup(&ev);
+            }
+            while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) extra++;
+                moq_event_cleanup(&ev);
+            }
+            MOQ_TEST_CHECK_EQ_INT(extra, 0);
+
+            moq_simpair_destroy(sp);
+            MOQ_TEST_CHECK(alloc_state.balance == 0);
+        }
+    }
+
+
+
+
 
     MOQ_TEST_PASS("test_simpair");
     return failures;

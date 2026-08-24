@@ -36,6 +36,7 @@ int fetch_resolve_handle(moq_session_t *s, moq_fetch_t h)
 
 void fetch_free_entry(moq_session_t *s, int slot)
 {
+    fetch_occ_unlink(s, (size_t)slot);
     moq_fetch_entry_t *e = &s->fetches[slot];
     /* Free any buffered Joining-FETCH staged token values the entry still owns
      * (a PENDING_JOIN freed without release; the memset below only drops the
@@ -56,6 +57,8 @@ void fetch_free_entry(moq_session_t *s, int slot)
     memset(e, 0, sizeof(*e));
     e->state = MOQ_FETCH_FREE;
     e->generation = next_gen;
+    e->occ_next = -1;      /* the memset zeroed these; -1 is "unlinked" */
+    e->occ_prev = -1;
     e->req_recv_buf = recv_buf;
     e->req_recv_cap = recv_cap;
 }
@@ -89,6 +92,9 @@ bool fetch_cancel_tomb_contains(const moq_session_t *s, uint64_t request_id)
 bool fetch_cancel_tomb_consume(moq_session_t *s, uint64_t request_id)
 {
     for (size_t i = 0; i < s->fetch_cancel_tomb_count; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_tomb_probes++;
+#endif
         if (s->fetch_cancel_tombs[i] == request_id) {
             /* Preserve FIFO order of the remaining entries so drop-oldest stays
              * meaningful. */
@@ -247,13 +253,17 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
     moq_fetch_entry_t *e = &s->fetches[slot];
     uint32_t live_gen = e->generation | 1;
     e->generation = live_gen;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    fetch_occ_link(s, (size_t)slot);
     e->state = MOQ_FETCH_PENDING_JOIN;
     e->role = MOQ_FETCH_ROLE_PUBLISHER;
     e->handle = (moq_fetch_t){ moq_handle_pack(MOQ_HANDLE_POOL_FETCH,
         s->session_tag, live_gen, (uint32_t)slot) };
     e->request_id = d->request_id;
     e->request_stream_ref = d->endpoint.stream_ref;
-    e->req_recv_fin = d->request_fin;
+    /* The peer's FIN is NOT copied here: the generic destination handoff
+     * installs it as transitional ownership on this entry and drives the
+     * family's own FIN handling, exactly as it does for a standalone FETCH. */
     e->join_fetch_type = (uint8_t)d->fetch_type;
     e->join_request_id = d->joining_request_id;
     e->join_start = d->joining_start;
@@ -287,7 +297,7 @@ static moq_result_t fetch_reject_pending_join(moq_session_t *s, int slot,
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
     moq_stream_ref_t ref = e->request_stream_ref;
-    bool need_drain = ref._v != 0 && !e->req_recv_fin;
+    bool need_drain = ref._v != 0 && !fetch_peer_fin_observed(e);
     /* Reserve the drain slot before the send: the fetcher's later FIN/RESET on the
      * (soon-freed) join bidi must be absorbed, never read as a stray FIN. */
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
@@ -322,7 +332,12 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
 {
     size_t n_event = 0, n_action = 0, n_drain = 0, send = 0, rel_scratch = 0;
     bool any_reject = false;
-    for (size_t i = 0; i < s->fetch_cap; i++) {
+    /* Only an allocated fetch can be a buffered join, and only allocated slots
+     * are linked, so the preflight walks the live fetches, not `fetch_cap`. */
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_join_resolve_probes++;
+#endif
         moq_fetch_entry_t *e = &s->fetches[i];
         if (e->state != MOQ_FETCH_PENDING_JOIN || e->join_request_id != sub_req_id)
             continue;
@@ -333,7 +348,8 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
             any_reject = true;
             n_action++;
             send += PENDING_JOIN_REJECT_BOUND;
-            if (e->request_stream_ref._v != 0 && !e->req_recv_fin) n_drain++;
+            if (e->request_stream_ref._v != 0 &&
+                !fetch_peer_fin_observed(e)) n_drain++;
         } else {
             n_event++;
             rel_scratch += pending_join_release_scratch(e);   /* scratch-copied tokens */
@@ -368,7 +384,10 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
 moq_result_t session_core_release_pending_joins(moq_session_t *s, int sub_slot)
 {
     moq_sub_entry_t *sub = &s->subs[sub_slot];
-    for (size_t i = 0; i < s->fetch_cap; i++) {
+    /* Same occupancy list as the preflight and the reject; the successor is
+     * captured before a release or reject can free the entry. */
+    for (int32_t i = s->fetch_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->fetches[i].occ_next;
         moq_fetch_entry_t *e = &s->fetches[i];
         if (e->state != MOQ_FETCH_PENDING_JOIN ||
             e->join_request_id != sub->request_id)
@@ -454,7 +473,12 @@ moq_result_t session_core_release_pending_joins(moq_session_t *s, int sub_slot)
 
 moq_result_t session_core_reject_pending_joins(moq_session_t *s, uint64_t sub_req_id)
 {
-    for (size_t i = 0; i < s->fetch_cap; i++) {
+    /* Same list; the successor is captured before the reject frees the entry. */
+    for (int32_t i = s->fetch_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->fetches[i].occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_join_reject_probes++;
+#endif
         if (s->fetches[i].state == MOQ_FETCH_PENDING_JOIN &&
             s->fetches[i].join_request_id == sub_req_id) {
             moq_result_t rc = fetch_reject_pending_join(s, (int)i,
@@ -467,10 +491,16 @@ moq_result_t session_core_reject_pending_joins(moq_session_t *s, uint64_t sub_re
 
 void session_core_discard_pending_joins(moq_session_t *s, uint64_t sub_req_id)
 {
-    for (size_t i = 0; i < s->fetch_cap; i++)
+    /* Same list; the successor is captured before the free that unlinks. */
+    for (int32_t i = s->fetch_occ_head, nxt; i >= 0; i = nxt) {
+        nxt = s->fetches[i].occ_next;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_join_probes++;
+#endif
         if (s->fetches[i].state == MOQ_FETCH_PENDING_JOIN &&
             s->fetches[i].join_request_id == sub_req_id)
             fetch_free_entry(s, (int)i);   /* frees the entry-owned token storage */
+    }
 }
 
 moq_result_t session_core_on_fetch(moq_session_t *s,
@@ -737,6 +767,8 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
 
     /* Commit: now safe to mutate entry. */
     entry->generation = live_gen;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_PUBLISHER;
     entry->role = MOQ_FETCH_ROLE_PUBLISHER;
     entry->handle = handle;
@@ -812,7 +844,8 @@ moq_result_t session_core_on_fetch_error(moq_session_t *s, int slot,
         e.detail_size = (uint32_t)sizeof(moq_fetch_error_event_t);
         e.borrow_epoch = s->borrow_epoch;
         e.u.fetch_error.fetch = s->fetches[slot].handle;
-        e.u.fetch_error.error_code = (moq_request_error_t)error_code;
+        e.u.fetch_error.error_code =
+            s->profile->semantic_request_error(error_code);
         e.u.fetch_error.can_retry = can_retry;
         e.u.fetch_error.retry_after_ms = retry_after_ms;
         e.u.fetch_error.reason = ev_reason;
@@ -1244,8 +1277,9 @@ moq_result_t moq_session_fetch(moq_session_t *s,
             }
         }
     } else {
-        if (moq_validate_full_track_name(&cfg->track_namespace,
-                                          cfg->track_name) < 0)
+        if (moq_validate_full_track_name_min_fields(
+                &cfg->track_namespace, cfg->track_name,
+                s->profile->min_track_namespace_fields) < 0)
             return MOQ_ERR_INVAL;
         if (cfg->end_group < cfg->start_group)
             return MOQ_ERR_INVAL;
@@ -1348,6 +1382,8 @@ moq_result_t moq_session_fetch(moq_session_t *s,
     /* Commit. */
     moq_fetch_entry_t *entry = &s->fetches[slot];
     entry->generation |= 1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_FETCHER;
     entry->role = MOQ_FETCH_ROLE_FETCHER;
     entry->request_id = req_ep.request_id;
@@ -1387,6 +1423,11 @@ moq_result_t moq_session_reject_fetch(
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     if (cfg->can_retry && cfg->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
         return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 #define FETCH_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_fetch_cfg_t, f) + sizeof(cfg->f))
 
@@ -1417,7 +1458,8 @@ moq_result_t moq_session_reject_fetch(
      * ring once the entry is freed (else the empty-FIN path is fatal). Reserve the
      * drain slot before mutating (D16 responds on the control channel: no drain). */
     moq_stream_ref_t req_ref = s->fetches[slot].request_stream_ref;
-    bool need_drain = req_ref._v != 0 && !s->fetches[slot].req_recv_fin;
+    bool need_drain = req_ref._v != 0 &&
+                      !fetch_peer_fin_observed(&s->fetches[slot]);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -1467,10 +1509,12 @@ moq_result_t moq_session_reject_fetch(
 }
 
 /* Internal draft-18 cancel of a fetcher-role fetch: STOP_SENDING + RESET the
- * request bidi, STOP the response data uni if it is open, drain the request bidi
- * (drain_refs), then free the fetch slot and record the request id in the
- * cancel-tombstone cache so an in-flight data uni is absorbed rather than treated
- * as an unknown request (which would close the session). Reserve-before-mutate
+ * request bidi, STOP the response data uni if it is open, enter the request bidi
+ * in the drain ring when the peer's FIN has not already been observed, then free
+ * the fetch slot and record the request id in the cancel-tombstone cache so an
+ * in-flight data uni is absorbed rather than treated as an unknown request
+ * (which would close the session). The data-stream STOP and the tombstone are
+ * unconditional; only the drain reference follows the observed FIN. Reserve-before-mutate
  * (WOULD_BLOCK leaves state intact). Shared by moq_session_fetch_cancel and the
  * UNSUPPORTED_EXTENSION (0x33) path; the caller validated role/state and
  * request-stream use, and does not depend on session_begin_advance (safe inside
@@ -1479,10 +1523,16 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
 {
     moq_fetch_entry_t *e = &s->fetches[slot];
     bool stop_data = e->data_stream_started && !e->data_stream_fin;
+    /* One drain decision for both the preflight and the insertion below: the
+     * reference exists to absorb what the peer may still send on the request
+     * bidi, so an already-observed FIN makes it unnecessary. The abort, the
+     * data-stream STOP, the registry removal, the cancel tombstone and the
+     * entry's retirement are unaffected. */
+    bool need_drain = e->request_stream_ref._v != 0 &&
+                      !fetch_peer_fin_observed(e);
     if (action_queue_avail(s) < (size_t)(1 + (stop_data ? 1 : 0)))
         return MOQ_ERR_WOULD_BLOCK;
-    if (e->request_stream_ref._v != 0 &&
-        s->drain_ref_count >= s->drain_ref_cap)
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
     moq_stream_ref_t ref = e->request_stream_ref;
     moq_action_t a;
@@ -1506,12 +1556,14 @@ static moq_result_t fetch_request_bidi_cancel(moq_session_t *s, int slot)
     }
     if (e->request_stream_ref._v != 0) {
         request_registry_remove_by_streamref(s, e->request_stream_ref);
-        (void)drain_ref_add(s, ref);   /* slot reserved above */
+        if (need_drain)
+            (void)drain_ref_add(s, ref);   /* slot reserved above */
         e->request_stream_ref = moq_stream_ref_from_u64(0);
     }
-    /* The request bidi is drained via drain_refs; free the fetch slot now and
-     * tombstone the request id so a late data uni (FETCH_HEADER) is stopped and
-     * absorbed without reoccupying the pool. */
+    /* The request bidi is entered in the drain ring only while still peer-open;
+     * either way the fetch slot is freed now and the request id tombstoned, so a
+     * late data uni (FETCH_HEADER) is stopped and absorbed without reoccupying
+     * the pool. */
     fetch_cancel_tomb_add(s, e->request_id);
     fetch_free_entry(s, slot);
     return MOQ_OK;
@@ -1536,7 +1588,8 @@ moq_result_t moq_session_fetch_cancel(moq_session_t *s,
 
     /* Stream-correlated profiles have no FETCH_CANCEL message: tear down the
      * request bidi via the shared internal sequence (STOP_SENDING + RESET, STOP
-     * the data uni if open), keeping the entry as a request-id tombstone. */
+     * the data uni if open), which frees the entry and records its request id in
+     * the cancel-tombstone cache. */
     if (moq_session_uses_request_streams(s))
         return fetch_request_bidi_cancel(s, slot);
 
@@ -1711,7 +1764,10 @@ moq_result_t moq_session_write_fetch_object(
     return MOQ_OK;
 }
 
-moq_result_t moq_session_write_fetch_range(
+/* Shared end-of-range marker emit: validated by the public entry points, which
+ * own their own argument contracts. Rejects before any queueing or cursor
+ * mutation, so a refused call leaves the fetch entry byte-identical. */
+static moq_result_t fetch_range_marker(
     moq_session_t *s,
     moq_fetch_t fetch,
     moq_fetch_range_kind_t kind,
@@ -1719,9 +1775,6 @@ moq_result_t moq_session_write_fetch_range(
     uint64_t object_id,
     uint64_t now_us)
 {
-    if (!s) return MOQ_ERR_INVAL;
-    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
-        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1761,6 +1814,43 @@ moq_result_t moq_session_write_fetch_range(
     entry->prior.group_id = group_id;
     entry->prior.object_id = object_id;
     return MOQ_OK;
+}
+
+moq_result_t moq_session_write_fetch_range(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    moq_fetch_range_kind_t kind,
+    uint64_t group_id,
+    uint64_t object_id,
+    uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
+        return MOQ_ERR_INVAL;
+    return fetch_range_marker(s, fetch, kind, group_id, object_id, now_us);
+}
+
+moq_result_t moq_session_write_fetch_range_before_group(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    moq_fetch_range_kind_t kind,
+    uint64_t first_group,
+    uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
+        return MOQ_ERR_INVAL;
+    if (first_group == 0) return MOQ_ERR_INVAL;   /* nothing precedes group 0 */
+    /* The profile owns the draft's maximum encodable object id; the marker's
+     * inclusive Location is the LAST object of the group before first_group. */
+    uint64_t max_obj = s->profile->location_varint_max;
+    return fetch_range_marker(s, fetch, kind, first_group - 1u, max_obj, now_us);
+}
+
+bool moq_session_supports_fetch_datagram(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->fetch_datagram_supported;
 }
 
 moq_result_t moq_session_end_fetch(

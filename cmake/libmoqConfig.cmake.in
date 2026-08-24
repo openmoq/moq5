@@ -51,6 +51,10 @@ if("adapter-mvfst" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
         endif()
         enable_language(CXX)
         list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+        # fmt is a direct edge of the adapter target (mvfst/folly static archives
+        # reference fmt::fmt); resolve it here rather than relying on Folly's
+        # config to discover it transitively.
+        find_dependency(fmt CONFIG)
         find_dependency(mvfst CONFIG)
         include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
         set(${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND TRUE)
@@ -278,6 +282,7 @@ if("service" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
                     "linking it requires a C++ compiler")
             endif()
             enable_language(CXX)
+            find_dependency(fmt CONFIG)
             find_dependency(mvfst CONFIG)
             include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
         endif()

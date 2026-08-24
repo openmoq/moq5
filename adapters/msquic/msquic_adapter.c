@@ -54,8 +54,16 @@
 
 #include "msquic_internal.h"
 
+#ifdef MOQ_MSQUIC_TESTING
+uint64_t (*moq_msq_test_now_us)(void);
+#endif
+
 static uint64_t now_us(void)
 {
+#ifdef MOQ_MSQUIC_TESTING
+    if (moq_msq_test_now_us != NULL)
+        return moq_msq_test_now_us();
+#endif
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -267,6 +275,9 @@ static void conn_feed_close(moq_msquic_conn_t *c)
 {
     if (!c->close_pending || c->close_fed)
         return;
+#ifdef MOQ_MSQUIC_TESTING
+    c->test_close_feed_commits++;
+#endif
     c->close_fed = true;
     if (c->close_clean)
         (void)moq_transport_bridge_on_transport_close(
@@ -626,6 +637,17 @@ static moq_transport_result_t ep_close_transport(void *ctx, uint64_t code,
         return MOQ_TRANSPORT_ERROR;
     if (c->conn == NULL)
         return MOQ_TRANSPORT_ERROR;
+    /* A local close is a terminal cause in its own right: orderly, carrying
+     * the application's code. Record it BEFORE telling the transport --
+     * afterwards the connection delivers only SHUTDOWN_COMPLETE, whose
+     * fallback would read this as an unclean death with code 0, which is
+     * indistinguishable from a transport failure reporting 0. First-wins, as
+     * at every other initiating site: a cause already recorded stands. */
+    if (!c->close_pending) {
+        c->close_pending = true;
+        c->close_clean = true;
+        c->close_code = code;
+    }
     /* async, never blocks; SHUTDOWN_COMPLETE follows on the worker */
     c->api->ConnectionShutdown(c->conn,
                                QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, code);

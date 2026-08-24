@@ -161,6 +161,29 @@ int main(void)
         MOQ_TEST_CHECK(moq_session_uses_uni_control(&fs));
     }
 
+    /* == C. A session with NO profile bound ============================
+     * Public capability queries must answer false rather than dereference a
+     * NULL profile. The zeroed session header is the same white-box shape used
+     * above -- no production seam exists (or should) for this state. */
+    {
+        moq_session_t ps;
+        memset(&ps, 0, sizeof(ps));
+        MOQ_TEST_CHECK(ps.profile == NULL);
+        MOQ_TEST_CHECK(!moq_session_supports_zero_field_track_namespace(&ps));
+        /* NULL session too, from the same call site. */
+        MOQ_TEST_CHECK(!moq_session_supports_zero_field_track_namespace(NULL));
+
+        /* And with a profile bound, the answer follows THAT profile's field --
+         * both arms, so neither is a constant. */
+        moq_profile_ops_t zp;
+        memset(&zp, 0, sizeof(zp));
+        zp.min_track_namespace_fields = 0;
+        ps.profile = &zp;
+        MOQ_TEST_CHECK(moq_session_supports_zero_field_track_namespace(&ps));
+        zp.min_track_namespace_fields = 1;
+        MOQ_TEST_CHECK(!moq_session_supports_zero_field_track_namespace(&ps));
+    }
+
     MOQ_TEST_PASS("profile_stream_caps");
     return failures != 0;
 }

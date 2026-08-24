@@ -98,6 +98,14 @@ extension TrackDescription {
             throw MoQServiceError.invalidArgument(
                 "video dimensions are required for a format description")
         }
+        // CoreMedia dimensions are Int32. Reject out-of-range values with a
+        // typed error rather than trapping the `Int32(...)` conversion below.
+        // A representable Int32.max is deliberately allowed through to CoreMedia
+        // (unrealistic, but not a Swift range violation).
+        guard width <= Int(Int32.max), height <= Int(Int32.max) else {
+            throw MoQServiceError.invalidArgument(
+                "video dimensions exceed the CoreMedia Int32 range")
+        }
         let atoms: NSDictionary = [atom: configuration as NSData]
         let extensions: NSDictionary = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms:
@@ -118,18 +126,65 @@ extension TrackDescription {
 
     private func makeAudioDescription(
         audioSpecificConfig asc: Data) throws -> CMFormatDescription {
-        guard let samplerate, samplerate > 0 else {
-            throw MoQServiceError.invalidArgument(
-                "samplerate is required for an audio format description")
+        // MSF-01 §5.2.28/§5.2.29 require samplerate/channelConfig on authored
+        // audio tracks, but real catalogs (moqtail) omit them, and both are
+        // carried in the AAC AudioSpecificConfig already in codecConfig. Derive
+        // ONLY the field(s) the catalog omits, as a tolerant CONSUMER
+        // convenience; explicit catalog metadata always wins, and an ASC piece
+        // needed only for a field the catalog DID provide must never cause a
+        // rejection -- e.g. a program-config-element channel layout is fine when
+        // channelConfig is explicit. Skip the parser entirely when nothing is
+        // missing. (codecConfig is required upstream, so `asc` is always present
+        // here -- sender-side strictness is unchanged.)
+        let needSampleRate = (samplerate == nil)
+        let needChannels = (channelConfig == nil)
+        let derived: (sampleRate: Int?, channels: UInt32?)
+        if needSampleRate || needChannels {
+            derived = try Self.deriveAudioParameters(
+                fromASC: asc,
+                needSampleRate: needSampleRate, needChannels: needChannels)
+        } else {
+            derived = (nil, nil)
         }
-        guard let channels = channelConfig.flatMap(UInt32.init),
-              channels > 0 else {
-            throw MoQServiceError.invalidArgument(
-                "channelConfig must be a numeric channel count " +
-                "for an audio format description")
+
+        let effectiveSampleRate: Float64
+        if let samplerate {
+            guard samplerate > 0 else {
+                throw MoQServiceError.invalidArgument(
+                    "samplerate must be a positive value " +
+                    "for an audio format description")
+            }
+            effectiveSampleRate = Float64(samplerate)
+        } else {
+            // deriveAudioParameters throws for a needed-but-underivable field,
+            // so this is non-nil here; the guard is defensive.
+            guard let derivedRate = derived.sampleRate else {
+                throw MoQServiceError.invalidArgument(
+                    "samplerate is absent and could not be derived from the " +
+                    "AudioSpecificConfig")
+            }
+            effectiveSampleRate = Float64(derivedRate)
         }
+
+        let channels: UInt32
+        if let channelConfig {
+            guard let explicit = UInt32(channelConfig), explicit > 0 else {
+                throw MoQServiceError.invalidArgument(
+                    "channelConfig must be a numeric channel count " +
+                    "for an audio format description")
+            }
+            channels = explicit
+        } else {
+            guard let derivedChannels = derived.channels else {
+                throw MoQServiceError.invalidArgument(
+                    "channelConfig is absent and could not be derived from " +
+                    "the AudioSpecificConfig")
+            }
+            channels = derivedChannels
+        }
+
         var asbd = AudioStreamBasicDescription(
-            mSampleRate: Float64(samplerate),
+            mSampleRate: effectiveSampleRate,
             mFormatID: kAudioFormatMPEG4AAC,
             mFormatFlags: 0,
             mBytesPerPacket: 0,
@@ -187,6 +242,99 @@ extension TrackDescription {
         cookie.append(UInt8(asc.count))
         cookie.append(asc)
         return cookie
+    }
+
+    /// Derive the sampling frequency (Hz) and/or channel count from an AAC
+    /// AudioSpecificConfig (ISO/IEC 14496-3 §1.6.2.1): a 5-bit audioObjectType
+    /// (with the 6-bit escape when 31), a 4-bit samplingFrequencyIndex (with a
+    /// 24-bit explicit-frequency escape when 15), then a 4-bit
+    /// channelConfiguration. This is a fallback for catalogs that omit the MSF
+    /// samplerate/channelConfig fields.
+    ///
+    /// It always reads the whole prefix so the bit cursor lands correctly, but
+    /// only THROWS for a field the caller actually needs (`needSampleRate` /
+    /// `needChannels`) and cannot derive unambiguously -- a reserved frequency
+    /// index, or a channelConfiguration of 0/reserved (a program config element
+    /// whose channel count is not a simple field). A field that is not needed is
+    /// returned as nil without rejection, so an unsupported ASC piece required
+    /// only for an explicit catalog value never blocks construction. A truncated
+    /// config always throws, since the mandatory prefix cannot be parsed.
+    /// Returned components are non-nil for every needed field.
+    private static func deriveAudioParameters(
+        fromASC asc: Data, needSampleRate: Bool, needChannels: Bool
+    ) throws -> (sampleRate: Int?, channels: UInt32?) {
+        let bytes = [UInt8](asc)
+        var bitPos = 0
+        func readBits(_ count: Int) throws -> UInt32 {
+            var value: UInt32 = 0
+            for _ in 0..<count {
+                let byteIndex = bitPos >> 3
+                guard byteIndex < bytes.count else {
+                    throw MoQServiceError.invalidArgument(
+                        "AudioSpecificConfig is too short to derive the " +
+                        "audio format")
+                }
+                let bit = (bytes[byteIndex] >> (7 - (bitPos & 7))) & 1
+                value = (value << 1) | UInt32(bit)
+                bitPos += 1
+            }
+            return value
+        }
+
+        // audioObjectType, with the 31 -> +6-bit escape. Not used for the
+        // rate/channel fields, but read so the bit cursor lands on them.
+        var audioObjectType = try readBits(5)
+        if audioObjectType == 31 {
+            audioObjectType = 32 + (try readBits(6))
+        }
+        _ = audioObjectType
+
+        // Sampling frequency: read the index (and its 24-bit escape) regardless,
+        // so the channelConfiguration bits are reached even when the rate itself
+        // is not needed or not derivable.
+        let frequencyIndex = try readBits(4)
+        var sampleRate: Int?
+        if frequencyIndex == 15 {
+            let explicit = Int(try readBits(24))   // explicit frequency escape
+            sampleRate = explicit > 0 ? explicit : nil
+        } else {
+            let table = [96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                         22050, 16000, 12000, 11025, 8000, 7350]
+            sampleRate = Int(frequencyIndex) < table.count
+                ? table[Int(frequencyIndex)] : nil
+        }
+        if needSampleRate {
+            guard let derivedRate = sampleRate, derivedRate > 0 else {
+                throw MoQServiceError.invalidArgument(
+                    "AudioSpecificConfig sampling-frequency index " +
+                    "\(frequencyIndex) is reserved; supply an explicit " +
+                    "samplerate")
+            }
+        }
+
+        let channelConfiguration = try readBits(4)
+        let channels: UInt32?
+        switch channelConfiguration {
+        case 1...6:
+            channels = channelConfiguration          // 1..6 map 1:1
+        case 7:
+            channels = 8                             // 7.1
+        default:
+            // 0 = program config element (count is not a simple field);
+            // 8..15 reserved.
+            channels = nil
+        }
+        if needChannels {
+            guard channels != nil else {
+                // Refuse rather than guess -- but only when the catalog did not
+                // supply an explicit channelConfig.
+                throw MoQServiceError.invalidArgument(
+                    "AudioSpecificConfig channel configuration " +
+                    "\(channelConfiguration) is not a simple channel count; " +
+                    "supply an explicit channelConfig")
+            }
+        }
+        return (sampleRate, channels)
     }
 }
 

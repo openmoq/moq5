@@ -1533,8 +1533,9 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
         return MOQ_ERR_INVAL;
 
     /* Validate namespace + track name against full-track-name budget. */
-    if (moq_validate_full_track_name(&cfg->track_namespace,
-                                      cfg->track_name) < 0)
+    if (moq_validate_full_track_name_min_fields(
+            &cfg->track_namespace, cfg->track_name,
+            pub->session->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
 
     /* Reject duplicate track identity. */

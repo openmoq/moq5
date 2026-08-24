@@ -33,6 +33,11 @@ typedef struct moq_endpoint_resolved {
      * predates the field. Consumed only by WebTransport backends that honor a
      * dialect choice (wtquic-msquic). */
     uint32_t      wt_profile;
+    /* Transport-handshake bound in microseconds, struct_size-gated at resolve;
+     * 0 (the backend default) when the cfg predates the field. Consumed only by
+     * the picoquic backends -- resolve rejects a non-zero value on any backend
+     * that cannot apply it. */
+    uint64_t      handshake_timeout_us;
 } moq_endpoint_resolved_t;
 
 /*

@@ -187,6 +187,17 @@ typedef struct moq_session_cfg {
      * negotiated delivery timeouts. Read only when struct_size covers this
      * field; older callers get the library default. */
     uint64_t           done_wait_timeout_us;
+
+    /* Appended (ABI-additive): the maximum number of simultaneously active
+     * peer-announced namespace suffixes tracked for one namespace subscription.
+     * This is a per-subscription active-suffix cap; it does not replace the
+     * session-wide receive-byte budget -- both apply. When a peer announces a
+     * new unique suffix after this cap is full, the library does NOT close the
+     * session: it surfaces NAMESPACE_GONE for the already-active suffixes,
+     * retires only the offending namespace-subscription stream, and the session
+     * stays ESTABLISHED. 0 selects the library default (4096). Read only when
+     * struct_size covers this field; older callers get the default. */
+    uint32_t           max_namespace_suffixes_per_subscription;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus
@@ -253,6 +264,22 @@ MOQ_API moq_session_state_t moq_session_state(const moq_session_t *s);
 MOQ_API moq_perspective_t moq_session_perspective(const moq_session_t *s);
 
 /*
+ * True when the negotiated draft permits a Track Namespace with ZERO fields —
+ * the root namespace (draft-18 yes, draft-16 no, which requires 1..32). Pure
+ * query: a caller forwarding a namespace onto this session asks the capability
+ * instead of testing a draft version, so version details never leak into caller
+ * logic. Observing — no advancement, no output, no borrow invalidation.
+ *
+ * This describes the Track Namespace only. It says nothing about Track
+ * Namespace PREFIX cardinality: an empty prefix on a namespace subscription
+ * stays legal in draft-16.
+ *
+ * False for a NULL session, and for a session that has no profile bound.
+ */
+MOQ_API bool moq_session_supports_zero_field_track_namespace(
+    const moq_session_t *s);
+
+/*
  * Record that an Object at {group_id, object_id} has been published or
  * received on the given track, advancing that track's largest-location
  * history (see moq_session_cfg_t.max_track_history_records). The library
@@ -284,9 +311,10 @@ MOQ_API moq_perspective_t moq_session_perspective(const moq_session_t *s);
  *
  * Returns:
  *   MOQ_OK              merged, or no-op (already <= current largest)
- *   MOQ_ERR_INVAL       NULL args, a malformed full track name (empty/NULL
- *                       namespace, a component or name with nonzero length
- *                       but NULL data, or an over-long full name), or a
+ *   MOQ_ERR_INVAL       NULL args, a malformed full track name (namespace
+ *                       cardinality invalid for the selected profile, a
+ *                       component or name with nonzero length but NULL data,
+ *                       or an over-long full name), or a
  *                       location component above the session's profile limit
  *   MOQ_ERR_NOMEM       a new record is required but the registry is full
  *                       (max_track_history_records reached) or allocation
@@ -396,6 +424,29 @@ MOQ_API moq_result_t moq_session_on_data_rcbuf(moq_session_t *s,
  *
  * Releases internal parse state for stream_ref. Does not close the
  * session unless the reset violates an invariant.
+ *
+ * A reset owes the application a visible closure: OBJECT_CHUNK with a
+ * RESET terminal when a streaming object was in flight, otherwise
+ * SUBGROUP_RESET for a bound subgroup whose id is resolved. When that
+ * output cannot be queued -- a full event queue, or a complete object
+ * still owed ahead of it -- this returns MOQ_ERR_WOULD_BLOCK and the
+ * obligation is RETAINED. The session is not closed and the stream is
+ * not released.
+ *
+ * To complete it: drain output (poll events, freeing a slot) and CALL
+ * THIS FUNCTION AGAIN with the SAME stream_ref and the SAME error_code,
+ * until it returns something other than MOQ_ERR_WOULD_BLOCK. Any later
+ * advancing drive on that stream -- including an empty
+ * moq_session_on_data_bytes(ref, NULL, 0, false) re-feed -- also
+ * completes the owed closure, but repeating this call is the recovery to
+ * write: it is the same operation with its own arguments, and it does
+ * not depend on which drive routes happen to service the obligation.
+ *
+ * MOQ_ERR_WOULD_BLOCK implies the reset was already RECORDED: the
+ * obligation and its cause are captured before anything that can block.
+ * So the FIRST error_code seen for a stream is the cause that is
+ * reported, and a retry passing a different code does not replace it --
+ * pass the original anyway, rather than relying on that.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -758,6 +809,7 @@ typedef uint32_t moq_event_kind_t;
  */
 #define MOQ_EVENT_SUBSCRIPTION_UPDATE_OK     47u
 #define MOQ_EVENT_PUBLICATION_UPDATE_OK      48u
+#define MOQ_EVENT_SUBGROUP_RESET             49u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -810,20 +862,47 @@ typedef uint32_t moq_group_order_t;
 
 /* -- Request error codes (semantic, for reject_subscribe) ---------- */
 
-typedef uint32_t moq_request_error_t;
+typedef uint64_t moq_request_error_t;
 
+/*
+ * The codes below are the drafts' own registries -- draft-16 §13.4.2 and
+ * draft-18 §15.10.2 -- not an abbreviated convenience list. This type is 64
+ * bits wide because the protocol's error-code domain is, and the largest
+ * value a given protocol version can actually carry differs between
+ * versions; a reject/cancel call refuses a code its session cannot express
+ * rather than silently altering it.
+ *
+ * Codes present in BOTH registries.
+ */
 #define MOQ_REQUEST_ERROR_INTERNAL_ERROR         0x0u
 #define MOQ_REQUEST_ERROR_UNAUTHORIZED           0x1u
 #define MOQ_REQUEST_ERROR_TIMEOUT                0x2u
 #define MOQ_REQUEST_ERROR_NOT_SUPPORTED          0x3u
-#define MOQ_REQUEST_ERROR_GOING_AWAY             0x6u
+#define MOQ_REQUEST_ERROR_MALFORMED_AUTH_TOKEN   0x4u
+#define MOQ_REQUEST_ERROR_EXPIRED_AUTH_TOKEN     0x5u
 #define MOQ_REQUEST_ERROR_DOES_NOT_EXIST         0x10u
 #define MOQ_REQUEST_ERROR_INVALID_RANGE          0x11u
+#define MOQ_REQUEST_ERROR_MALFORMED_TRACK        0x12u
 #define MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION     0x19u
+#define MOQ_REQUEST_ERROR_UNINTERESTED               0x20u
 #define MOQ_REQUEST_ERROR_PREFIX_OVERLAP             0x30u
 #define MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID 0x32u
+
+/*
+ * Registered by draft-18 ONLY. A draft-16 peer does not know them, so a
+ * draft-16 session treats them like any other unknown value.
+ */
+#define MOQ_REQUEST_ERROR_GOING_AWAY                 0x6u
+#define MOQ_REQUEST_ERROR_EXCESSIVE_LOAD             0x9u
+#define MOQ_REQUEST_ERROR_NAMESPACE_TOO_LARGE        0x31u
 #define MOQ_REQUEST_ERROR_UNSUPPORTED_EXTENSION      0x33u
 #define MOQ_REQUEST_ERROR_REDIRECT                   0x34u
+
+/*
+ * Draft-18 §14 also reserves 0x7f*N + 0x9D for greasing. Those are
+ * deliberately NOT exposed as semantic constants: they carry no meaning, and
+ * a draft-18 session treats them as unknown per §15's unknown-code rule.
+ */
 
 /* -- Subscribe event detail structs -------------------------------- */
 
@@ -870,7 +949,7 @@ typedef struct moq_subscribe_error_event {
     moq_subscription_t  sub;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_subscribe_error_event_t;
@@ -916,6 +995,51 @@ typedef struct moq_subgroup_finished_event {
     uint8_t            _pad[7];
 } moq_subgroup_finished_event_t;
 
+/*
+ * A subgroup data stream ended abnormally with a RESET_STREAM: the abnormal
+ * counterpart of SUBGROUP_FINISHED, which a receiver/relay uses to close its
+ * per-subgroup state.
+ *
+ * A reset has exactly TWO non-overlapping surfaces, chosen by whether an
+ * application-visible object terminal can carry the closure -- for one reset
+ * exactly one of them fires:
+ *
+ *   - A streaming object is in flight AND its object events are surfaced:
+ *     the closure IS that object's OBJECT_CHUNK with
+ *     terminal=MOQ_OBJECT_TERMINAL_RESET, carrying the peer's code in the
+ *     chunk's error_code. This event is NOT emitted.
+ *   - Otherwise, for a bound subgroup whose ID is resolved, no visible object
+ *     terminal can carry the closure, so THIS event reports it. That covers
+ *     whole-object mode (a partial payload is dropped; a complete one is
+ *     delivered as OBJECT_RECEIVED first, in order, and this event follows),
+ *     a streaming stream between objects or after its last object completed,
+ *     and a streaming object whose events are suppressed by Forward State 0
+ *     (its parsed header resolves the subgroup identity even though no object
+ *     event is surfaced for it).
+ *
+ * Exactly one of `sub` / `pub` is valid, matching the OBJECT_RECEIVED events of
+ * the same subgroup. `error_code` is the RESET_STREAM application error code:
+ * the FIRST code the peer sent for this stream, retained across event-queue
+ * backpressure so a re-driven terminal reports the original cause. Emitted at
+ * most once per stream.
+ *
+ * Not emitted for FETCH streams, for gracefully FINed streams (those emit
+ * SUBGROUP_FINISHED), or for a stream reset before its subgroup ID was
+ * resolved -- a FIRST_OBJECT-mode header that never carried an object has only
+ * the decoder default, and reporting it would let a relay seal subgroup 0 by
+ * mistake. A suppressed object's parsed header DOES resolve the identity, so
+ * that case still reports. Owns no resources (moq_event_cleanup is a no-op).
+ */
+typedef struct moq_subgroup_reset_event {
+    moq_subscription_t sub;
+    moq_publication_t  pub;
+    uint64_t           group_id;
+    uint64_t           subgroup_id;
+    uint64_t           error_code;    /* RESET_STREAM application error code */
+    bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
+    uint8_t            _pad[7];
+} moq_subgroup_reset_event_t;
+
 /* -- Namespace event detail structs -------------------------------- */
 
 typedef struct moq_namespace_published_event {
@@ -933,7 +1057,7 @@ typedef struct moq_namespace_rejected_event {
     moq_announcement_t  ann;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_namespace_rejected_event_t;
@@ -945,7 +1069,6 @@ typedef struct moq_namespace_accepted_event {
 typedef struct moq_namespace_cancelled_event {
     moq_announcement_t  ann;
     moq_request_error_t error_code;
-    uint8_t             _pad[4];
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_namespace_cancelled_event_t;
 
@@ -1077,17 +1200,31 @@ typedef struct moq_object_chunk_event {
     moq_rcbuf_t          *chunk;       /* OWNED; payload bytes, NULL if no data */
     bool                  begin;       /* first chunk: metadata fields valid */
     bool                  end;         /* last chunk or only chunk */
-    moq_object_terminal_t terminal;    /* valid when end=true */
+    /* valid when end=true. MOQ_OBJECT_TERMINAL_RESET means the peer reset the
+     * stream while THIS object was in flight and surfaced; the cause is in
+     * error_code below. When no visible object terminal can carry the closure
+     * (whole-object mode, between objects, or a suppressed object), the reset
+     * reports MOQ_EVENT_SUBGROUP_RESET instead -- for one reset exactly one of
+     * the two surfaces fires. */
+    moq_object_terminal_t terminal;
     uint8_t               _pad[3];
-    uint64_t              group_id;        /* valid when begin=true */
-    uint64_t              subgroup_id;     /* valid when begin=true */
-    uint64_t              object_id;       /* valid when begin=true */
+    /* Routing identity: valid on EVERY chunk of the object -- begin,
+     * continuation and end -- so a consumer multiplexing concurrent subgroups
+     * routes each chunk to the record it belongs to. */
+    uint64_t              group_id;
+    uint64_t              subgroup_id;
+    uint64_t              object_id;
     uint8_t               publisher_priority; /* valid when begin=true */
     moq_object_status_t   status;          /* valid when begin=true */
     bool                  end_of_group;    /* valid when begin=true */
     uint8_t               _pad2[4];
     uint64_t              payload_length;  /* declared wire length; valid when begin=true */
     moq_rcbuf_t          *properties;      /* OWNED; valid when begin=true, NULL if none */
+    /* Appended. The peer's RESET_STREAM application code, valid ONLY on a
+     * terminal chunk whose terminal is MOQ_OBJECT_TERMINAL_RESET; zero on
+     * every other chunk, including NORMAL and STOP terminals (zero is also a
+     * legal peer code, so read it only under the RESET terminal). */
+    uint64_t              error_code;
 } moq_object_chunk_event_t;
 
 typedef uint32_t moq_namespace_interest_t;
@@ -1109,7 +1246,6 @@ typedef struct moq_ns_sub_ok_event {
 typedef struct moq_ns_sub_error_event {
     moq_ns_sub_handle_t  handle;
     moq_request_error_t  error_code;
-    uint8_t              _pad[4];
     moq_bytes_t          reason;  /* BORROWED from output scratch */
 } moq_ns_sub_error_event_t;
 
@@ -1143,7 +1279,7 @@ typedef struct moq_fetch_error_event {
     moq_fetch_t         fetch;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;  /* BORROWED from output scratch */
 } moq_fetch_error_event_t;
@@ -1243,7 +1379,7 @@ typedef struct moq_publish_error_event {
     moq_publication_t   pub;
     moq_request_error_t error_code;
     bool                can_retry;
-    uint8_t             _pad[3];
+    uint8_t             _pad[7];
     uint64_t            retry_after_ms;
     moq_bytes_t         reason;
 } moq_publish_error_event_t;
@@ -1364,7 +1500,7 @@ typedef struct moq_track_status_error_event {
     moq_track_status_handle_t handle;
     moq_request_error_t       error_code;
     bool                      can_retry;
-    uint8_t                   _pad[3];
+    uint8_t                   _pad[7];
     uint64_t                  retry_after_ms;
     moq_bytes_t               reason;
 } moq_track_status_error_event_t;
@@ -1393,7 +1529,7 @@ typedef struct moq_subscribe_tracks_error_event {
     moq_track_sub_handle_t handle;
     moq_request_error_t    error_code;
     bool                   can_retry;
-    uint8_t                _pad[3];
+    uint8_t                _pad[7];
     uint64_t               retry_after_ms;
     moq_bytes_t            reason;  /* BORROWED from output scratch */
 } moq_subscribe_tracks_error_event_t;
@@ -1488,6 +1624,7 @@ typedef struct moq_event {
         moq_publish_blocked_event_t            publish_blocked;
         moq_subscribe_tracks_cancelled_event_t subscribe_tracks_cancelled;
         moq_subgroup_finished_event_t          subgroup_finished;
+        moq_subgroup_reset_event_t             subgroup_reset;
         uint8_t                     _reserved[MOQ_EVENT_DETAIL_MAX];
     } u;
 } moq_event_t;
@@ -1572,7 +1709,8 @@ MOQ_API uint64_t moq_session_peer_auth_token_cache_size(const moq_session_t *s);
 /*
  * Subscribe configuration.
  *
- * Required: track_namespace (1..32 non-empty parts), track_name,
+ * Required: track_namespace (draft-16: 1..32 non-empty parts; draft-18:
+ *   0..32 non-empty parts), track_name,
  *   filter (must not be NONE).
  * Filter-dependent: start_group/start_object (ABSOLUTE_START,
  *   ABSOLUTE_RANGE), end_group (ABSOLUTE_RANGE only).
@@ -1915,6 +2053,34 @@ MOQ_API moq_result_t moq_session_write_fetch_range(
     uint64_t group_id,
     uint64_t object_id,
     uint64_t now_us);
+
+/*
+ * Write an end-of-range gap marker whose inclusive Location is IMMEDIATELY
+ * BEFORE `first_group` -- it covers every Location up to and including the last
+ * object of `first_group - 1`. Publisher side. Advancing call. Use this to mark
+ * a leading gap before the first object a publisher can serve (e.g. a cache's
+ * evicted prefix): the marker lands at group `first_group - 1` with the highest
+ * object id the active draft can represent, which the session supplies so the
+ * caller never needs a draft-specific limit. Returns MOQ_ERR_INVAL if
+ * first_group == 0 (nothing precedes group 0) or kind is invalid, in both cases
+ * without queueing anything or advancing the prior Location. Marker semantics
+ * otherwise match moq_session_write_fetch_range (advances the prior Location
+ * only).
+ */
+MOQ_API moq_result_t moq_session_write_fetch_range_before_group(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    moq_fetch_range_kind_t kind,
+    uint64_t first_group,
+    uint64_t now_us);
+
+/*
+ * True when the negotiated draft's FETCH object header can carry the
+ * datagram-preference bit (draft-18 yes, draft-16 no). Pure query: a publisher
+ * asks the capability instead of testing a draft version, so version details
+ * never leak into caller logic. False for a NULL session.
+ */
+MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
 
 /*
  * Close the fetch data stream with FIN. Publisher side. Advancing call.

@@ -7,6 +7,7 @@
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -889,26 +890,28 @@ void moq_msf_catalog_cleanup(const moq_alloc_t *alloc,
     cat->track_count = 0;
 }
 
-/* Match a track in list[0..n) by name, additionally requiring namespace when
- * has_ns (catalog-level namespace inheritance is not resolved). Returns the
- * index, or -1 if absent. */
-static long find_track_idx(const moq_msf_track_t *list, size_t n,
-                           moq_bytes_t name, bool has_ns, moq_bytes_t ns)
+static bool bytes_eq(moq_bytes_t a, moq_bytes_t b);   /* defined below */
+
+/* An identity span is safe to hash/compare only if it is not the reserved
+ * byte-span empty-slot sentinel (len == SIZE_MAX) and does not claim content
+ * with a NULL data pointer. Parsed catalogs never violate this; public callers
+ * that hand-build a catalog can, so identity spans are checked before any
+ * hash/memcmp reaches ns_index_* / bs_index_*. */
+static bool ident_span_ok(moq_bytes_t b)
 {
-    for (size_t i = 0; i < n; i++) {
-        const moq_msf_track_t *t = &list[i];
-        if (t->name.len != name.len ||
-            (name.len && memcmp(t->name.data, name.data, name.len) != 0))
-            continue;
-        if (has_ns) {
-            if (!t->has_namespace) continue;
-            if (t->namespace_.len != ns.len ||
-                (ns.len && memcmp(t->namespace_.data, ns.data, ns.len) != 0))
-                continue;
-        }
-        return (long)i;
-    }
-    return -1;
+    if (b.len == SIZE_MAX) return false;      /* reserved bs_index sentinel */
+    if (b.len > 0 && !b.data) return false;   /* content with no buffer */
+    return true;
+}
+
+/* Validate the identity spans of one track: its name, and its namespace when
+ * declared. (Other metadata is not an identity span and is not checked here --
+ * receive-path leniency for non-identity fields is preserved.) */
+static bool track_identity_ok(const moq_msf_track_t *t)
+{
+    if (!ident_span_ok(t->name)) return false;
+    if (t->has_namespace && !ident_span_ok(t->namespace_)) return false;
+    return true;
 }
 
 /* Build an effective track from a clone parent plus the clone op's overrides.
@@ -964,10 +967,209 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
                                         const moq_msf_catalog_t *cat,
                                         moq_rcbuf_t **out_json, bool strict_cp);
 
-moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
-                                          const moq_msf_catalog_t *base,
-                                          const moq_msf_catalog_t *delta,
-                                          moq_msf_catalog_t *out)
+/* ------------------------------------------------------------------------- *
+ * Identity index: an open-addressing hash set (linear probing, tombstones)
+ * mapping a track's Namespace|Name identity to its slot in a track array.
+ * apply_delta_ex drives every lookup through it so the per-op cost is O(1)
+ * amortized instead of a per-op linear scan (O(n)) -- the whole apply is
+ * O(base + delta) rather than O(n^2). validate_identities reuses it for O(n)
+ * duplicate detection over the track array.
+ *
+ * Slots hold a track index (>= 0), NIDX_EMPTY, or NIDX_TOMB (a removed entry
+ * whose probe chain must stay intact). Load factor is kept <= 0.5.            */
+
+#if defined(MOQ_MSF_TESTING)
+/* Test-only compare counter (not MOQ_API; absent from the shipped library,
+ * which never defines MOQ_MSF_TESTING). Proves the indexed lookup does O(n),
+ * not O(n^2), identity compares -- see tests/test_msf_scaling.c. */
+size_t moq_msf_test_identity_compares = 0;
+#endif
+
+#define NIDX_EMPTY  ((long)-1)
+#define NIDX_TOMB   ((long)-2)
+
+typedef struct {
+    long   *slot;   /* cap entries */
+    size_t  cap;    /* power of two */
+    size_t  mask;   /* cap - 1 */
+} ns_index_t;
+
+static uint64_t ident_hash(bool has_ns, moq_bytes_t ns, moq_bytes_t name)
+{
+    uint64_t h = 1469598103934665603ULL;          /* FNV-1a offset basis */
+    uint8_t nb = has_ns ? 1u : 0u;
+    h ^= nb; h *= 1099511628211ULL;
+    for (size_t i = 0; i < name.len; i++) {
+        h ^= (uint8_t)name.data[i]; h *= 1099511628211ULL;
+    }
+    if (has_ns)
+        for (size_t i = 0; i < ns.len; i++) {
+            h ^= (uint8_t)ns.data[i]; h *= 1099511628211ULL;
+        }
+    return h;
+}
+
+/* Full Namespace|Name identity equality. Per MSF §5.2.2 an omitted namespace is
+ * catalog-namespace inheritance, NOT a wildcard: this layer cannot resolve the
+ * catalog namespace, so a name-only reference (has_ns false) matches only tracks
+ * that ALSO omit a namespace, never an arbitrary explicit-namespace track (the
+ * two identity classes never collide, as track_tuple_eq already enforces on the
+ * authoring path). */
+static bool ident_eq_track(bool has_ns, moq_bytes_t ns, moq_bytes_t name,
+                           const moq_msf_track_t *t)
+{
+#if defined(MOQ_MSF_TESTING)
+    moq_msf_test_identity_compares++;
+#endif
+    if (t->name.len != name.len ||
+        (name.len && memcmp(t->name.data, name.data, name.len) != 0))
+        return false;
+    if (has_ns != t->has_namespace) return false;
+    if (has_ns &&
+        (t->namespace_.len != ns.len ||
+         (ns.len && memcmp(t->namespace_.data, ns.data, ns.len) != 0)))
+        return false;
+    return true;
+}
+
+static moq_result_t ns_index_init(ns_index_t *ix, size_t nslots,
+                                  const moq_alloc_t *alloc)
+{
+    size_t cap = 8;
+    /* cap >= 2 * nslots, power of two, wrap-guarded. */
+    while (cap < nslots || (cap >> 1) < nslots) {
+        if (cap > (SIZE_MAX >> 1)) return MOQ_ERR_NOMEM;
+        cap <<= 1;
+    }
+    size_t bytes;
+    if (!moq_msf_checked_array_bytes(cap, sizeof(long), &bytes))
+        return MOQ_ERR_NOMEM;
+    ix->slot = (long *)alloc->alloc(bytes, alloc->ctx);
+    if (!ix->slot) return MOQ_ERR_NOMEM;
+    for (size_t i = 0; i < cap; i++) ix->slot[i] = NIDX_EMPTY;
+    ix->cap = cap; ix->mask = cap - 1;
+    return MOQ_OK;
+}
+
+static void ns_index_free(ns_index_t *ix, const moq_alloc_t *alloc)
+{
+    if (ix->slot) alloc->free(ix->slot, ix->cap * sizeof(long), alloc->ctx);
+    ix->slot = NULL; ix->cap = 0;
+}
+
+/* Live track index for `identity`, resolving stored slots against `tracks`;
+ * or -1 if absent (tombstones are skipped, EMPTY ends the probe). */
+static long ns_index_find(const ns_index_t *ix, const moq_msf_track_t *tracks,
+                          bool has_ns, moq_bytes_t ns, moq_bytes_t name)
+{
+    uint64_t h = ident_hash(has_ns, ns, name);
+    size_t i = (size_t)h & ix->mask;
+    for (size_t p = 0; p <= ix->mask; p++) {
+        long s = ix->slot[i];
+        if (s == NIDX_EMPTY) return -1;
+        if (s >= 0 && ident_eq_track(has_ns, ns, name, &tracks[s])) return s;
+        i = (i + 1) & ix->mask;
+    }
+    return -1;
+}
+
+/* Insert track index `ti` (identity read from tracks[ti]). The caller must
+ * have confirmed the identity is absent (via ns_index_find) first. */
+static void ns_index_insert(ns_index_t *ix, const moq_msf_track_t *tracks,
+                            long ti)
+{
+    const moq_msf_track_t *t = &tracks[ti];
+    uint64_t h = ident_hash(t->has_namespace, t->namespace_, t->name);
+    size_t i = (size_t)h & ix->mask;
+    for (size_t p = 0; p <= ix->mask; p++) {
+        long s = ix->slot[i];
+        if (s == NIDX_EMPTY || s == NIDX_TOMB) { ix->slot[i] = ti; return; }
+        i = (i + 1) & ix->mask;
+    }
+    /* Unreachable: load factor <= 0.5 guarantees a free slot. */
+}
+
+static void ns_index_remove(ns_index_t *ix, const moq_msf_track_t *tracks,
+                            bool has_ns, moq_bytes_t ns, moq_bytes_t name)
+{
+    uint64_t h = ident_hash(has_ns, ns, name);
+    size_t i = (size_t)h & ix->mask;
+    for (size_t p = 0; p <= ix->mask; p++) {
+        long s = ix->slot[i];
+        if (s == NIDX_EMPTY) return;
+        if (s >= 0 && ident_eq_track(has_ns, ns, name, &tracks[s])) {
+            ix->slot[i] = NIDX_TOMB; return;
+        }
+        i = (i + 1) & ix->mask;
+    }
+}
+
+/* ------------------------------------------------------------------------- *
+ * Byte-span index: the same open-addressing set keyed on a single byte span,
+ * for the initDataList-id and contentProtection-refID uniqueness checks in
+ * validate_identities. Both arrays are peer-controlled with no numeric cap
+ * (only the upstream object byte cap), so their uniqueness check must be O(n),
+ * not O(n^2). Keys are borrowed and valid for the validate call. An empty slot
+ * is marked by len == SIZE_MAX (no real key uses it), so a zero-length key is
+ * still storable. */
+typedef struct { moq_bytes_t *key; size_t cap; size_t mask; } bs_index_t;
+
+static uint64_t bs_hash(moq_bytes_t k)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < k.len; i++) { h ^= (uint8_t)k.data[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static moq_result_t bs_index_init(bs_index_t *ix, size_t nslots,
+                                  const moq_alloc_t *alloc)
+{
+    size_t cap = 8;
+    while (cap < nslots || (cap >> 1) < nslots) {
+        if (cap > (SIZE_MAX >> 1)) return MOQ_ERR_NOMEM;
+        cap <<= 1;
+    }
+    size_t bytes;
+    if (!moq_msf_checked_array_bytes(cap, sizeof(moq_bytes_t), &bytes))
+        return MOQ_ERR_NOMEM;
+    ix->key = (moq_bytes_t *)alloc->alloc(bytes, alloc->ctx);
+    if (!ix->key) return MOQ_ERR_NOMEM;
+    for (size_t i = 0; i < cap; i++) { ix->key[i].data = NULL; ix->key[i].len = SIZE_MAX; }
+    ix->cap = cap; ix->mask = cap - 1;
+    return MOQ_OK;
+}
+
+static void bs_index_free(bs_index_t *ix, const moq_alloc_t *alloc)
+{
+    if (ix->key) alloc->free(ix->key, ix->cap * sizeof(moq_bytes_t), alloc->ctx);
+    ix->key = NULL; ix->cap = 0;
+}
+
+/* Insert k if absent; return true if k was already present (a duplicate). */
+static bool bs_index_add_dup(bs_index_t *ix, moq_bytes_t k)
+{
+    uint64_t h = bs_hash(k);
+    size_t i = (size_t)h & ix->mask;
+    for (size_t p = 0; p <= ix->mask; p++) {
+        moq_bytes_t *s = &ix->key[i];
+        if (s->len == SIZE_MAX) { *s = k; return false; }   /* empty -> insert */
+#if defined(MOQ_MSF_TESTING)
+        moq_msf_test_identity_compares++;
+#endif
+        if (s->len == k.len &&
+            (k.len == 0 || (s->data && k.data &&
+                            memcmp(s->data, k.data, k.len) == 0)))
+            return true;
+        i = (i + 1) & ix->mask;
+    }
+    return false;   /* unreachable: load factor <= 0.5 */
+}
+
+moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
+                                            const moq_msf_catalog_t *base,
+                                            const moq_msf_catalog_t *delta,
+                                            const moq_msf_apply_limits_t *limits,
+                                            moq_msf_catalog_t *out)
 {
     if (!alloc || !base || !delta || !out) return MOQ_ERR_INVAL;
     if (base->delta_update) return MOQ_ERR_INVAL;     /* base must be independent */
@@ -976,7 +1178,30 @@ moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
      * tracks or content will follow, so applying any delta to it is a protocol
      * error (and would otherwise drop the MUST-NOT-be-removed isComplete). */
     if (base->is_complete) return MOQ_ERR_PROTO;
+    /* Public callers can hand-build a catalog: reject a nonzero count with a
+     * NULL array, and any identity span that would fault or collide with the
+     * index sentinel, before any dereference / hash. */
+    if (base->track_count > 0 && !base->tracks) return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < base->track_count; i++)
+        if (!track_identity_ok(&base->tracks[i])) return MOQ_ERR_INVAL;
     memset(out, 0, sizeof(*out));
+
+    /* ABI-safe limits read: a field is honored only if the caller's struct is
+     * large enough to carry it (a zero field is "no limit"). */
+    size_t lim_ops = 0, lim_tracks = 0;
+    if (limits) {
+        if (limits->struct_size >=
+            offsetof(moq_msf_apply_limits_t, max_delta_ops) + sizeof(size_t))
+            lim_ops = limits->max_delta_ops;
+        if (limits->struct_size >=
+            offsetof(moq_msf_apply_limits_t, max_effective_tracks) + sizeof(size_t))
+            lim_tracks = limits->max_effective_tracks;
+    }
+
+    /* Cap-before-apply: refuse an over-large delta before allocating the
+     * effective catalog, building the index, or scanning any identity. */
+    if (lim_ops && delta->delta_update_count > lim_ops)
+        return MOQ_ERR_PROTO;
 
     /* Capacity = base tracks + every add/clone track (removes only shrink).
      * Guard the running sum against size_t wrap, then the byte size against
@@ -985,59 +1210,105 @@ moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
     size_t cap = base->track_count;
     for (size_t i = 0; i < delta->delta_update_count; i++) {
         const moq_msf_delta_op_t *op = &delta->delta_update[i];
+        if (op->track_count > 0 && !op->tracks) return MOQ_ERR_INVAL;
+        /* Per-op-track identity spans are validated in the apply loop below --
+         * after the overflow guards, so a lying (huge) track_count is rejected
+         * as NOMEM before anything iterates it. */
         if (op->op == MOQ_MSF_DELTA_OP_ADD || op->op == MOQ_MSF_DELTA_OP_CLONE) {
             if (op->track_count > SIZE_MAX - cap)
                 return MOQ_ERR_NOMEM;
             cap += op->track_count;
         }
     }
+    if (lim_tracks && cap > lim_tracks)
+        return MOQ_ERR_PROTO;
 
     moq_msf_track_t *eff = NULL;
-    size_t eff_bytes = 0;
+    uint8_t         *removed = NULL;
+    size_t eff_bytes = 0, rem_bytes = 0;
+    ns_index_t ix = { NULL, 0, 0 };
     if (cap > 0) {
         if (!moq_msf_checked_array_bytes(cap, sizeof(moq_msf_track_t),
                                          &eff_bytes))
             return MOQ_ERR_NOMEM;
         eff = (moq_msf_track_t *)alloc->alloc(eff_bytes, alloc->ctx);
         if (!eff) return MOQ_ERR_NOMEM;
+        if (!moq_msf_checked_array_bytes(cap, sizeof(uint8_t), &rem_bytes)) {
+            alloc->free(eff, eff_bytes, alloc->ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        removed = (uint8_t *)alloc->alloc(rem_bytes, alloc->ctx);
+        if (!removed) { alloc->free(eff, eff_bytes, alloc->ctx); return MOQ_ERR_NOMEM; }
+        memset(removed, 0, rem_bytes);
+        moq_result_t irc = ns_index_init(&ix, cap, alloc);
+        if (irc < 0) {
+            alloc->free(removed, rem_bytes, alloc->ctx);
+            alloc->free(eff, eff_bytes, alloc->ctx);
+            return irc;
+        }
     }
+
     size_t n = 0;
-    for (size_t i = 0; i < base->track_count; i++) eff[n++] = base->tracks[i];
+    for (size_t i = 0; i < base->track_count; i++) {
+        eff[n] = base->tracks[i];
+        ns_index_insert(&ix, eff, (long)n);
+        n++;
+    }
 
     moq_result_t rc = MOQ_OK;
     for (size_t i = 0; i < delta->delta_update_count && rc == MOQ_OK; i++) {
         const moq_msf_delta_op_t *op = &delta->delta_update[i];
         for (size_t j = 0; j < op->track_count; j++) {
             const moq_msf_track_t *ot = &op->tracks[j];
+            /* Reject a NULL/sentinel identity span before it is hashed. */
+            if (!track_identity_ok(ot) ||
+                (op->op == MOQ_MSF_DELTA_OP_CLONE &&
+                 (!ident_span_ok(ot->parent_name) ||
+                  (ot->has_parent_namespace &&
+                   !ident_span_ok(ot->parent_namespace))))) {
+                rc = MOQ_ERR_INVAL; break;
+            }
             if (op->op == MOQ_MSF_DELTA_OP_ADD) {
                 /* 5.1.6/5.3: add declares a NEW tuple -- a collision is a bad
                  * delta (the tuple is immutable once declared). */
-                if (find_track_idx(eff, n, ot->name,
-                        ot->has_namespace, ot->namespace_) >= 0) {
+                if (ns_index_find(&ix, eff, ot->has_namespace,
+                                  ot->namespace_, ot->name) >= 0) {
                     rc = MOQ_ERR_PROTO; break;
                 }
-                eff[n++] = *ot;
+                eff[n] = *ot; removed[n] = 0;
+                ns_index_insert(&ix, eff, (long)n); n++;
             } else if (op->op == MOQ_MSF_DELTA_OP_REMOVE) {
-                long idx = find_track_idx(eff, n, ot->name,
-                                          ot->has_namespace, ot->namespace_);
+                long idx = ns_index_find(&ix, eff, ot->has_namespace,
+                                         ot->namespace_, ot->name);
                 if (idx < 0) { rc = MOQ_ERR_PROTO; break; }  /* not declared */
-                for (size_t k = (size_t)idx; k + 1 < n; k++) eff[k] = eff[k + 1];
-                n--;
+                removed[idx] = 1;
+                ns_index_remove(&ix, eff, ot->has_namespace,
+                                ot->namespace_, ot->name);
             } else { /* CLONE */
-                long idx = find_track_idx(eff, n, ot->parent_name,
-                    ot->has_parent_namespace, ot->parent_namespace);
+                long idx = ns_index_find(&ix, eff, ot->has_parent_namespace,
+                                         ot->parent_namespace, ot->parent_name);
                 if (idx < 0) { rc = MOQ_ERR_PROTO; break; }  /* parent absent */
                 moq_msf_track_t e = eff[(size_t)idx];
                 apply_clone_overrides(&e, ot);
                 /* The cloned tuple MUST be new. */
-                if (find_track_idx(eff, n, e.name,
-                        e.has_namespace, e.namespace_) >= 0) {
+                if (ns_index_find(&ix, eff, e.has_namespace,
+                                  e.namespace_, e.name) >= 0) {
                     rc = MOQ_ERR_PROTO; break;
                 }
-                eff[n++] = e;
+                eff[n] = e; removed[n] = 0;
+                ns_index_insert(&ix, eff, (long)n); n++;
             }
         }
     }
+
+    /* Compact: drop tombstoned (removed) slots, preserving order. */
+    size_t live = 0;
+    if (rc == MOQ_OK)
+        for (size_t i = 0; i < n; i++)
+            if (!removed[i]) eff[live++] = eff[i];
+
+    ns_index_free(&ix, alloc);
+    if (removed) alloc->free(removed, rem_bytes, alloc->ctx);
 
     moq_rcbuf_t *json = NULL;
     if (rc == MOQ_OK) {
@@ -1046,7 +1317,7 @@ moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
         mid.struct_size = sizeof(mid);
         mid.version = MOQ_MSF_VERSION;
         mid.tracks = eff;
-        mid.track_count = n;
+        mid.track_count = live;
         if (delta->has_generated_at) {
             mid.has_generated_at = true; mid.generated_at = delta->generated_at;
         } else if (base->has_generated_at) {
@@ -1070,6 +1341,89 @@ moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
     rc = moq_msf_catalog_parse(alloc, jb, out);
     moq_rcbuf_decref(json);
     return rc;
+}
+
+moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
+                                          const moq_msf_catalog_t *base,
+                                          const moq_msf_catalog_t *delta,
+                                          moq_msf_catalog_t *out)
+{
+    /* Unlimited convenience wrapper -- direct callers that trust their peer. */
+    return moq_msf_catalog_apply_delta_ex(alloc, base, delta, NULL, out);
+}
+
+moq_result_t moq_msf_catalog_validate_identities(const moq_alloc_t *alloc,
+                                                 const moq_msf_catalog_t *cat)
+{
+    if (!alloc || !cat) return MOQ_ERR_INVAL;
+    if (cat->delta_update) return MOQ_ERR_INVAL;   /* independent catalogs only */
+    /* Public callers can hand-build a catalog: a nonzero count with a NULL
+     * array is invalid input, rejected before any dereference. */
+    if (cat->track_count > 0 && !cat->tracks) return MOQ_ERR_INVAL;
+    if (cat->init_data_count > 0 && !cat->init_data_list) return MOQ_ERR_INVAL;
+    if (cat->content_protection_count > 0 && !cat->content_protections)
+        return MOQ_ERR_INVAL;
+
+    /* §5.2.3: Namespace|Name tuples are unique within the catalog. O(n) via the
+     * identity index (the peer-controlled, potentially large, vector). */
+    if (cat->track_count > 0) {
+        ns_index_t ix = { NULL, 0, 0 };
+        moq_result_t rc = ns_index_init(&ix, cat->track_count, alloc);
+        if (rc < 0) return rc;
+        for (size_t i = 0; i < cat->track_count; i++) {
+            const moq_msf_track_t *t = &cat->tracks[i];
+            if (!track_identity_ok(t)) {               /* NULL / sentinel span */
+                ns_index_free(&ix, alloc);
+                return MOQ_ERR_INVAL;
+            }
+            if (ns_index_find(&ix, cat->tracks, t->has_namespace,
+                              t->namespace_, t->name) >= 0) {
+                ns_index_free(&ix, alloc);
+                return MOQ_ERR_PROTO;                  /* duplicate tuple */
+            }
+            ns_index_insert(&ix, cat->tracks, (long)i);
+        }
+        ns_index_free(&ix, alloc);
+    }
+
+    /* §5.1.7: initDataList ids are unique. O(n) via the byte-span index -- the
+     * array is peer-controlled with no numeric cap, so it cannot be an O(n^2)
+     * scan. */
+    if (cat->init_data_count > 0) {
+        bs_index_t bx = { NULL, 0, 0 };
+        moq_result_t rc = bs_index_init(&bx, cat->init_data_count, alloc);
+        if (rc < 0) return rc;
+        for (size_t i = 0; i < cat->init_data_count; i++) {
+            if (!ident_span_ok(cat->init_data_list[i].id)) {
+                bs_index_free(&bx, alloc);
+                return MOQ_ERR_INVAL;
+            }
+            if (bs_index_add_dup(&bx, cat->init_data_list[i].id)) {
+                bs_index_free(&bx, alloc);
+                return MOQ_ERR_PROTO;
+            }
+        }
+        bs_index_free(&bx, alloc);
+    }
+
+    /* CMSF §4.1.1.1: contentProtection refIDs are unique. O(n), same reason. */
+    if (cat->content_protection_count > 0) {
+        bs_index_t bx = { NULL, 0, 0 };
+        moq_result_t rc = bs_index_init(&bx, cat->content_protection_count, alloc);
+        if (rc < 0) return rc;
+        for (size_t i = 0; i < cat->content_protection_count; i++) {
+            if (!ident_span_ok(cat->content_protections[i].ref_id)) {
+                bs_index_free(&bx, alloc);
+                return MOQ_ERR_INVAL;
+            }
+            if (bs_index_add_dup(&bx, cat->content_protections[i].ref_id)) {
+                bs_index_free(&bx, alloc);
+                return MOQ_ERR_PROTO;
+            }
+        }
+        bs_index_free(&bx, alloc);
+    }
+    return MOQ_OK;
 }
 
 const moq_msf_track_t *moq_msf_catalog_find_role(

@@ -145,11 +145,25 @@ typedef struct moq_simpair_cfg {
     /* Appended: advertised auth-token cache size for both sessions (0 =
      * none advertised; REGISTER tokens then close). */
     uint64_t auth_token_cache_size;
+
+    /* Appended (struct_size append-only ABI). Server-session streaming_objects
+     * flag -- mirror of client_streaming_objects for the server side. Read via
+     * cfg_has_field, so an older caller whose struct_size is below this offset
+     * defaults to false (whole-object OBJECT_RECEIVED). */
+    bool               server_streaming_objects;
+
+    /* Appended (struct_size append-only ABI). Server-session outgoing subgroup
+     * pool size, so pool-refusal backpressure and large fan-out batches can be
+     * exercised deterministically. Read via cfg_has_field; 0 keeps the session
+     * default (64). */
+    uint32_t           server_max_open_subgroups;
 } moq_simpair_cfg_t;
 
 #ifdef __cplusplus
+/* Value-initialize (zeroes every field) then stamp struct_size, so appending a
+ * field never requires updating a positional list. */
 #define MOQ_SIMPAIR_CFG_INIT \
-    (moq_simpair_cfg_t{ sizeof(moq_simpair_cfg_t), 0, 0, 0, false, 0, false, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, (moq_version_t)0, 0, 0, 0, 0, 0, 0 })
+    ([]{ moq_simpair_cfg_t c{}; c.struct_size = sizeof(c); return c; }())
 #else
 #define MOQ_SIMPAIR_CFG_INIT \
     ((moq_simpair_cfg_t){ .struct_size = sizeof(moq_simpair_cfg_t) })
@@ -177,6 +191,28 @@ MOQ_SIM_API moq_result_t moq_simpair_start(moq_simpair_t *sp);
  */
 MOQ_SIM_API moq_result_t moq_simpair_step(moq_simpair_t *sp,
                                        size_t *out_delivered);
+
+/*
+ * Pump one deterministic step reporting HANDLED WORK by direction:
+ * out_to_server is the count of units the step handled toward the server
+ * session, out_to_client the reverse. moq_simpair_step is this with the two
+ * counts summed. Either out-param may be NULL. On failure neither count is
+ * written.
+ *
+ * "Handled" is NOT a strict receive-doorbell under delay faults. A unit is
+ * counted once when the step handles it toward a direction -- whether it is
+ * delivered immediately OR queued as a delayed input -- and a delayed input
+ * is counted AGAIN toward its target direction when it later matures and is
+ * delivered. So under MOQ_SIM_FAULT_DELAY a single client->server action can
+ * contribute to out_to_server twice: once at the step that queues it and once
+ * at the step that matures it. Fault-free, each unit is counted exactly once.
+ * Callers needing "inputs actually delivered to the server this step" must key
+ * on the maturation step (advance to moq_simpair_next_deadline_us, then one
+ * step), where the matured delivery is attributed to its target direction.
+ */
+MOQ_SIM_API moq_result_t moq_simpair_step_directional(moq_simpair_t *sp,
+                                                      size_t *out_to_server,
+                                                      size_t *out_to_client);
 
 /*
  * Run steps until a step delivers no actions.

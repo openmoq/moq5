@@ -516,7 +516,7 @@ struct SenderTeardownTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Forgotten close(): dropping sender AND endpoint still tears down")
-    func forgottenCloseBackstop() throws {
+    func forgottenCloseBackstop() async throws {
         let endpointBackend = ScriptedEndpointBackend()
         let senderBackend = ScriptedSenderBackend()
         var endpoint: MoQEndpoint? = MoQEndpoint(
@@ -528,8 +528,8 @@ struct SenderTeardownTests {
         _ = sender
         sender = nil
         endpoint = nil
-        #expect(senderBackend.awaitCondition { $0.detachCalls == 1 })
-        #expect(endpointBackend.awaitCondition { $0.destroyCount == 1 })
+        #expect(await senderBackend.awaitCondition { $0.detachCalls == 1 })
+        #expect(await endpointBackend.awaitCondition { $0.destroyCount == 1 })
         #expect(senderBackend.snapshot().violations.isEmpty)
         #expect(endpointBackend.snapshot().violations.isEmpty)
     }

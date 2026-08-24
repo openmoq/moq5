@@ -650,6 +650,7 @@ int main(void)
         CHECK(cfg.goaway_timeout_us == 0xABABABABABABABABULL);
         CHECK(cfg.max_connections == 0xABABABABu);
         CHECK(cfg.idle_timeout_ms == 0xABABABABu);
+        CHECK(cfg.keep_alive_interval_ms == 0xABABABABu);
         moq_pq_threaded_cfg_init(NULL);
         PASS("cfg_init");
     }
@@ -694,6 +695,7 @@ int main(void)
         CHECK(cfg.goaway_timeout_us == 0);  /* appended fields zero-init */
         CHECK(cfg.max_connections == 0);
         CHECK(cfg.idle_timeout_ms == 0);    /* 0 = picoquic default */
+        CHECK(cfg.keep_alive_interval_ms == 0);  /* 0 = keepalive disabled */
         moq_pq_threaded_cfg_init_sized(NULL, sizeof(cfg));
         PASS("cfg_init_sized");
     }

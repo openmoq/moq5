@@ -6,10 +6,61 @@
 #include <moq/operations.hpp>
 #include <moq/result.hpp>
 
+#include <array>
+#include <concepts>
+#include <cstddef>
+#include <functional>
 #include <optional>
+#include <utility>
 #include <span>
 
 namespace moq {
+
+namespace detail {
+
+/*
+ * Owns EVERY raw record of a batched poll while armed. Each record is moved out
+ * with std::exchange as it is adopted, so a visited slot is left value-
+ * initialised and owns nothing. On the normal path release() disarms the guard,
+ * which also avoids N cleanup calls over empty records; if the callback throws,
+ * the guard is still armed and cleans the unvisited suffix exactly once.
+ *
+ * This is the single ownership mechanism: there is no second, redundant defence,
+ * so removing either the transfer or the armed cleanup is independently fatal
+ * and independently detectable.
+ */
+struct action_batch_guard {
+    moq_action_t *recs;
+    std::size_t   count;
+    bool          armed = true;
+    action_batch_guard(moq_action_t *r, std::size_t n) noexcept : recs(r), count(n) {}
+    void release() noexcept { armed = false; }
+    ~action_batch_guard()
+    {
+        if (!armed) return;
+        for (std::size_t i = 0; i < count; i++) moq_action_cleanup(&recs[i]);
+    }
+    action_batch_guard(const action_batch_guard &)            = delete;
+    action_batch_guard &operator=(const action_batch_guard &) = delete;
+};
+
+struct event_batch_guard {
+    moq_event_t *recs;
+    std::size_t  count;
+    bool         armed = true;
+    event_batch_guard(moq_event_t *r, std::size_t n) noexcept : recs(r), count(n) {}
+    void release() noexcept { armed = false; }
+    ~event_batch_guard()
+    {
+        if (!armed) return;
+        for (std::size_t i = 0; i < count; i++) moq_event_cleanup(&recs[i]);
+    }
+    event_batch_guard(const event_batch_guard &)            = delete;
+    event_batch_guard &operator=(const event_batch_guard &) = delete;
+};
+
+}  // namespace detail
+
 
 struct session_config {
     perspective        perspective              = perspective::client;
@@ -204,6 +255,78 @@ public:
         if (moq_session_poll_events(s_, &e, 1) == 0)
             return std::nullopt;
         return polled_event(e);
+    }
+
+    /*
+     * Bounded batched polling: ONE underlying C poll of capacity N, then
+     * `consume` is invoked once per returned record, in queue order.
+     *
+     * Returns the number of records polled and visited; 0 means `consume` was
+     * never invoked. There is no internal drain loop and no early-stop
+     * protocol -- call again to drain further.
+     *
+     * OWNERSHIP. An internal guard owns every raw record while armed. Each
+     * record is MOVED into the existing move-only polled_action / polled_event
+     * owner (std::exchange leaves the slot value-initialised, owning nothing),
+     * so ownership lives in exactly one place at every instant. On normal
+     * completion the guard is released; if `consume` throws, the still-armed
+     * guard cleans the unvisited suffix exactly once while the current owner
+     * cleans itself during unwinding. Moving the owner out of `consume` works
+     * through the wrapper's existing move contract.
+     *
+     * LIFETIME PRECONDITION. Non-payload fields of a polled record are borrowed
+     * (see the contract at the top of action.hpp / event.hpp): they are valid
+     * only while their owner is alive, and an advancing call on THIS session
+     * can invalidate them sooner. Therefore:
+     *   - a borrowed variant or reference must NOT be used after `consume`
+     *     returns for that record;
+     *   - `consume` must NOT make an advancing call on THIS session while the
+     *     batch is dispatching -- doing so can invalidate the current record and
+     *     every record not yet visited. Advancing a DIFFERENT session (the usual
+     *     pump pattern) is fine;
+     *   - variants of the rcbuf-owning alternatives keep their retained buffers
+     *     and remain valid after `consume` returns and after the owner is
+     *     destroyed. Those are action::send_data (payload) and, for events,
+     *     object_received (payload + properties), fetch_object (payload +
+     *     properties) and object_chunk (chunk + properties).
+     *
+     * COST. Storage is a value-initialised std::array on the stack; the
+     * batching layer performs no heap allocation. Stack use scales with N:
+     * N * sizeof(moq_action_t) or N * sizeof(moq_event_t) (96 and 144 bytes per
+     * record respectively at the time of writing). The default N = 16 matches
+     * the measured batching target, NOT any queue depth -- the action queue
+     * defaults to 64 and the event queue to 16.
+     */
+    template <std::size_t N = 16, class F>
+        requires std::invocable<F &, polled_action &>
+    std::size_t poll_actions(F &&consume)
+    {
+        static_assert(N > 0, "batched poll capacity must be at least 1");
+        std::array<moq_action_t, N> raw{};
+        const std::size_t n = moq_session_poll_actions(s_, raw.data(), N);
+        detail::action_batch_guard guard{raw.data(), n};
+        for (std::size_t i = 0; i < n; i++) {
+            polled_action owner(std::exchange(raw[i], moq_action_t{}));
+            std::invoke(consume, owner);
+        }
+        guard.release();
+        return n;
+    }
+
+    template <std::size_t N = 16, class F>
+        requires std::invocable<F &, polled_event &>
+    std::size_t poll_events(F &&consume)
+    {
+        static_assert(N > 0, "batched poll capacity must be at least 1");
+        std::array<moq_event_t, N> raw{};
+        const std::size_t n = moq_session_poll_events(s_, raw.data(), N);
+        detail::event_batch_guard guard{raw.data(), n};
+        for (std::size_t i = 0; i < n; i++) {
+            polled_event owner(std::exchange(raw[i], moq_event_t{}));
+            std::invoke(consume, owner);
+        }
+        guard.release();
+        return n;
     }
 
     // -- Subscribe operations ------------------------------------------

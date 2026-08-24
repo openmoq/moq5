@@ -246,6 +246,16 @@ trusted certificate. For a **local self-signed** test relay, append
 ./build/rc-static/examples/service/moq_example_media_receive moqt://localhost:4433 example       --insecure-skip-verify
 ```
 
+`moq_example_media_publish_loc` (real H.264 from stdin) takes the same flag and
+the same secure default; `[track]` and `--insecure-skip-verify` may appear in
+either order:
+
+```
+ffmpeg ... -f h264 pipe:1 \
+  | ./build/rc-static/examples/service/moq_example_media_publish_loc \
+      moqt://localhost:4433 example video --insecure-skip-verify
+```
+
 ### Consuming an installed libmoq (Meson / pkg-config)
 
 After `cmake --install`, the service tier ships its own pkg-config file, so a

@@ -100,6 +100,9 @@ moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
 void pub_free_entry(moq_session_t *s, int slot)
 {
     moq_pub_entry_t *e = &s->publishes[slot];
+    /* Leave the occupancy list BEFORE the reset below: unlinking repairs the
+     * neighbours' links, which the memset would otherwise destroy. */
+    pub_occ_unlink(s, (size_t)slot);
     request_registry_remove_by_id(s, e->request_id);
     if (e->update_pending)
         request_registry_remove_by_id(s, e->update_request_id);
@@ -126,6 +129,8 @@ void pub_free_entry(moq_session_t *s, int slot)
     e->generation = next_gen;
     e->req_recv_buf = recv_buf;
     e->req_recv_cap = recv_cap;
+    e->occ_next = -1;      /* the memset zeroed these; -1 is "unlinked" */
+    e->occ_prev = -1;
 }
 
 /* Emit the deferred PUBLISH_FINISHED for a subscriber-role publication whose
@@ -141,7 +146,7 @@ static moq_result_t pub_finalize_done(moq_session_t *s, int slot)
     /* Stream-correlated profiles: if the request bidi has not FIN'd yet, freeing
      * the entry drops its by-streamref key, so a later FIN/bytes would be
      * misclassified. Reserve a drain-ref to absorb that late FIN. */
-    bool need_drain = pe->request_stream_ref._v != 0 && !pe->req_recv_fin;
+    bool need_drain = pe->request_stream_ref._v != 0 && !pub_peer_fin_observed(pe);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -221,14 +226,39 @@ void pub_note_stream_processed(moq_session_t *s, moq_publication_t pub)
  * so a suspended sweep never mixes two clocks. Slots that become due later are
  * picked up by the caller's catch-up sweep, not by this one.
  */
+/* Advance the sweep cursor to the successor captured before the work, unless
+ * a free already moved it there through the occupancy unlink. */
+#define PUB_SWEEP_ADVANCE()                                                   \
+    do { if (s->sweep_slot == i)                                              \
+             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->pub_cap; } while (0)
+
 bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
 {
-    for (; s->sweep_slot < s->pub_cap; s->sweep_slot++) {
+    /*
+     * Walks the publication OCCUPANCY list, not the pool: the reap's cost
+     * follows the live publications, not `pub_cap`. Slot-ordered, so owners are
+     * served -- and their completions emitted -- in the old scan's order.
+     *
+     * `nxt` is captured BEFORE any work, because finalizing frees the entry and
+     * unlinks it; the unlink also advances this cursor, which is why the
+     * advance below is conditional.
+     */
+    while (s->sweep_slot < s->pub_cap) {
         if (s->state == MOQ_SESS_CLOSED) return true;  /* finalize may close */
 
         size_t i = s->sweep_slot;
+        int32_t nxt = s->publishes[i].occ_next;
         moq_pub_entry_t *pe = &s->publishes[i];
-        if (!pe->done_pending) continue;   /* costs nothing; never suspends */
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_pub_reap_probes++;
+#endif
+        if (!pe->done_pending) {           /* costs nothing; never suspends */
+            PUB_SWEEP_ADVANCE();
+            continue;
+        }
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_pub_reap_pending++;
+#endif
 
         /* A suspension inside STOP_STREAMS or FINALIZE resumes in that phase:
          * SELECT already qualified this owner, and re-running it could reach a
@@ -244,7 +274,9 @@ bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
                  pe->processed_stream_count >= pe->done_stream_count);
             bool due = (s->sweep_now_us >= pe->done_deadline_us);
             if (!pe->done_expired && !count_satisfied && !due)
-                continue;                      /* not runnable: uncharged skip */
+            {   PUB_SWEEP_ADVANCE();
+                continue;                  /* not runnable: uncharged skip */
+            }
 
             if (count_satisfied && !pe->done_expired) {
                 /* FINALIZE attempt: one unit. */
@@ -253,6 +285,7 @@ bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
                     (*budget)--;
                 }
                 (void)pub_finalize_done(s, (int)i);
+                PUB_SWEEP_ADVANCE();
                 continue;
             }
 
@@ -271,6 +304,10 @@ bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
          * the rx pool on re-entry instead of finalizing. */
         if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT ||
             s->sweep_phase == MOQ_SWEEP_PHASE_STOP_STREAMS) {
+            if (s->sweep_phase == MOQ_SWEEP_PHASE_SELECT)
+                /* A FRESH rx scan for this owner starts at the rx occupancy
+                 * head; a RESUMED one keeps the position it suspended at. */
+                s->sweep_rx_pos = moq_occ_first(s->rx_occ_head, s->rx_cap);
             s->sweep_phase = MOQ_SWEEP_PHASE_STOP_STREAMS;
             moq_result_t src = session_stop_bound_streams_resumable(s, MOQ_SUBSCRIPTION_INVALID,
                                                      pe->handle, budget);
@@ -280,6 +317,7 @@ bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
                 /* Action capacity: this owner is abandoned for now, so its rx
                  * cursor must NOT leak into the next owner's scan. */
                 session_sweep_owner_reset(s);
+                PUB_SWEEP_ADVANCE();
                 continue;
             }
             /* Owner's rx scan is complete; the next phase owns a clean cursor. */
@@ -294,10 +332,13 @@ bool pub_reap_deferred_dones_resumable(moq_session_t *s, uint32_t *budget)
         }
         (void)pub_finalize_done(s, (int)i);
         session_sweep_owner_reset(s);
+        PUB_SWEEP_ADVANCE();
     }
     s->sweep_phase = MOQ_SWEEP_PHASE_SELECT;
     return true;
 }
+
+#undef PUB_SWEEP_ADVANCE
 
 
 bool pub_track_alias_in_use(moq_session_t *s, uint64_t alias)
@@ -347,7 +388,8 @@ static moq_result_t queue_publish_response(moq_session_t *s, size_t slot,
 /* -- Inbound PUBLISH handler --------------------------------------- */
 
 moq_result_t session_core_on_publish(moq_session_t *s,
-                                      moq_decoded_publish_t *d)
+                                      moq_decoded_publish_t *d,
+                                      bool request_fin_observed)
 {
     bool auth_committed = false;
     moq_result_t result = MOQ_OK;
@@ -379,8 +421,15 @@ moq_result_t session_core_on_publish(moq_session_t *s,
      * the publisher's send half stays open (PUBLISH is not first-and-only), so a
      * late message before it sees our FIN must be discarded, not reclassified as a
      * fresh request. Draft-16 carries the reject on the control channel and never
-     * drains (it also handled auth-reject in its profile decode). */
-    bool reject_drain = d->endpoint.has_stream_ref;
+     * drains (it also handled auth-reject in its profile decode).
+     *
+     * An observed FIN closes the publisher's send half -- with this message, or
+     * on an earlier call whose refusal staging retained -- so nothing can arrive
+     * late and the drain reference is unnecessary: the rejection still emits its
+     * REQUEST_ERROR + FIN and retires staging, it just takes no reference. This
+     * selector is the single drain decision for all four pre-commit branches --
+     * preflight and insertion alike. */
+    bool reject_drain = d->endpoint.has_stream_ref && !request_fin_observed;
 
     /* Message-level authorization-token reject (stream-correlated profiles): a
      * REGISTER carried alongside still commits its alias (§10.2.2). */
@@ -647,6 +696,8 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     }
 
     entry->generation = live_gen;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    pub_occ_link(s, (size_t)slot);
     entry->state = MOQ_PUB_PENDING_SUBSCRIBER;
     entry->role = MOQ_PUB_ROLE_SUBSCRIBER;
     entry->handle = handle;
@@ -814,7 +865,7 @@ moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
     e.detail_size = (uint32_t)sizeof(moq_publish_error_event_t);
     e.borrow_epoch = s->borrow_epoch;
     e.u.publish_error.pub = s->publishes[slot].handle;
-    e.u.publish_error.error_code = (moq_request_error_t)error_code;
+    e.u.publish_error.error_code = s->profile->semantic_request_error(error_code);
     e.u.publish_error.can_retry = can_retry;
     e.u.publish_error.retry_after_ms = retry_after_ms;
     e.u.publish_error.reason = ev_reason;
@@ -930,8 +981,9 @@ moq_result_t moq_session_publish(moq_session_t *s,
     if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
     if (s->goaway_received) return MOQ_ERR_GOAWAY;
 
-    if (moq_validate_full_track_name(&cfg->track_namespace,
-                                      cfg->track_name) < 0)
+    if (moq_validate_full_track_name_min_fields(
+            &cfg->track_namespace, cfg->track_name,
+            s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
         return MOQ_ERR_INVAL;
@@ -1078,6 +1130,8 @@ moq_result_t moq_session_publish(moq_session_t *s,
 
         moq_pub_entry_t *entry = &s->publishes[slot];
         entry->generation |= 1;
+        /* Allocated: join the occupancy list the preamble scans walk. */
+        pub_occ_link(s, (size_t)slot);
         entry->state = MOQ_PUB_PENDING_PUBLISHER;
         entry->role = MOQ_PUB_ROLE_PUBLISHER;
         entry->request_id = req_ep.request_id;
@@ -1223,6 +1277,8 @@ moq_result_t moq_session_accept_publish(
         if (arc < 0) return arc;
     }
 
+    /* Acceptance changes STATE only: this slot was allocated -- and linked --
+     * when the peer's PUBLISH created it. */
     s->publishes[slot].state = MOQ_PUB_ESTABLISHED;
     /* Latch the EFFECTIVE forward state this side (the subscriber role)
      * conveyed on the PUBLISH_OK -- unconditionally, because omission means 1,
@@ -1254,6 +1310,11 @@ moq_result_t moq_session_reject_publish(
     /* PUBLISH is not REDIRECT-eligible (§10.6 lists 5 families; PUBLISH not among
      * them); refuse a REDIRECT code rather than emit an unacceptable response. */
     if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT) return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1272,7 +1333,7 @@ moq_result_t moq_session_reject_publish(
      * peer's late FIN (unless it already arrived). */
     moq_pub_entry_t *pe = &s->publishes[slot];
     bool req_stream = (pe->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !pe->req_recv_fin;
+    bool need_drain = req_stream && !pub_peer_fin_observed(pe);
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
@@ -1864,7 +1925,7 @@ moq_result_t moq_session_finish_publish(
      * reciprocal FIN (unless it already arrived). */
     moq_pub_entry_t *pe = &s->publishes[slot];
     bool req_stream = (pe->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !pe->req_recv_fin;
+    bool need_drain = req_stream && !pub_peer_fin_observed(pe);
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
@@ -1999,6 +2060,8 @@ moq_result_t moq_session_open_pub_subgroup(
 
     moq_sg_entry_t *entry = &s->subgroups[slot];
     entry->generation |= 1;
+    /* Allocated: join the occupancy list the preamble scans walk. */
+    sg_occ_link(s, (size_t)slot);
     entry->state = MOQ_SG_OPEN;
     entry->sub = MOQ_SUBSCRIPTION_INVALID;
     entry->pub = pub;

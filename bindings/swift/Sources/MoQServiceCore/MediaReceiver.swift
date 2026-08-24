@@ -262,7 +262,12 @@ public final class MediaReceiver: @unchecked Sendable {
         defer { state.releaseConsumer() }
         while true {
             switch state.takeNext() {
-            case .item(let event):
+            case .item(let event, let freedCapacity):
+                /* Consuming this event dropped the FIFO below its cap, so a
+                 * demand can now stage the retained surplus and poll. Wake any
+                 * parked object waiter to re-evaluate -- without this the async
+                 * object stream would sit until an unrelated engine wake. */
+                if freedCapacity { endpoint.engine.nudgeWaiters() }
                 return event
             case .terminalClean:
                 return nil
@@ -345,21 +350,60 @@ package final class ReceiverAttachment: @unchecked Sendable {
         self.backend = backend
     }
 
-    /// The eager drain: empty the backend's event queue into the Swift FIFO.
-    /// Runs on the service thread every engine pass.
-    package func drainTrackEvents() {
+    /// Drain the backend's event queue into the bounded Swift FIFO, staging at
+    /// most ``ReceiverState/stagingCapacity`` (64, matching the C queue default
+    /// this backend uses). Stops BEFORE polling once staging is full, leaving
+    /// the surplus backend-owned (end-to-end backpressure) -- so a full ring
+    /// costs zero backend polls. Runs on the service thread every engine pass.
+    ///
+    /// Returns `true` when it stopped because staging is full (the backend may
+    /// still hold events, including a `TRACK_ADDED` for an object not yet
+    /// delivered); `false` when it drained to empty or hit a terminal.
+    @discardableResult
+    package func drainTrackEvents() -> Bool {
         while true {
-            guard !state.isDetached else { return }
+            guard !state.isDetached else { return false }
+            if state.stagingIsFull { return true }   // stop before the 65th poll
             switch backend.pollTrackEvent() {
             case .none:
-                return
+                return false
             case .closed:
                 state.markTerminal(fatal: backend.isFatal,
                                    code: backend.fatalCode)
-                return
+                return false
             case .event(let polled):
                 state.integrate(polled)
             }
+        }
+    }
+
+    /// Read-only observability (package-internal, no behavior change): the
+    /// number of track events currently staged in the Swift FIFO. Lets tests
+    /// assert the eager drain's staging depth directly.
+    package var stagedTrackEventCount: Int { state.stagedCount }
+
+    /// One consumed staged track event, exactly the vocabulary the real
+    /// stream consumer (`nextTrackEvent`) drives through `state.takeNext()`.
+    /// Package-internal test-drive seam: NOT a public API and NOT a config
+    /// field -- it lets a synchronous test free ring slots and observe order,
+    /// identity, and terminal disposition without the async engine, so the
+    /// bounded-staging contract is provable deterministically.
+    package enum TakenTrackEvent: Sendable {
+        case item(TrackEvent)
+        case empty
+        case terminalClean
+        case terminalFatal(code: UInt64)
+    }
+
+    /// Consume one staged track event (front of the FIFO), or report the
+    /// terminal disposition once the FIFO is drained. A faithful pass-through
+    /// of the consumer's `state.takeNext()` step.
+    package func takeStagedTrackEvent() -> TakenTrackEvent {
+        switch state.takeNext() {
+        case .item(let event, _):     return .item(event)
+        case .empty:                  return .empty
+        case .terminalClean:          return .terminalClean
+        case .terminalFatal(let code): return .terminalFatal(code: code)
         }
     }
 
@@ -387,7 +431,12 @@ package final class ReceiverAttachment: @unchecked Sendable {
     package func demandObject() -> ObjectDemand {
         while true {
             guard !state.isDetached else { return state.objectTerminalDemand() }
-            drainTrackEvents()
+            // If staging filled up, a required TRACK_ADDED for the next object
+            // may still be retained in the backend. There is no queued-track
+            // predicate in the backend protocol, so use the staging state as
+            // the gate: do NOT poll an object -- neither adopt nor discard it --
+            // until the consumer frees a slot and the add can be staged first.
+            if drainTrackEvents() { return .empty }
             switch backend.pollObject() {
             case .none:
                 return .empty
@@ -420,8 +469,22 @@ package final class ReceiverAttachment: @unchecked Sendable {
 
     /// The parked object consumer's level term: something to poll, or a
     /// terminal state to report. Evaluated on the service thread each pass.
+    ///
+    /// Backend-driven readiness (a queued object AND a backend terminal, which
+    /// `demandObject()` observes only via `pollObject()`) is *ready* only when
+    /// the Swift track-event FIFO has room: `demandObject()` drains events
+    /// before polling and returns `.empty` when that drain stops on a full
+    /// FIFO, so reporting either as ready while full would wake the waiter into
+    /// an immediate `.empty` and re-park -- a hot retry that also burns a
+    /// service-thread `perform` each pass. Gating both on `!stagingIsFull`
+    /// closes that edge; `nextTrackEvent()` nudges the engine when it frees a
+    /// slot so the waiter is re-evaluated (see ``Taken``). Detach is the one
+    /// exception: `demandObject()` reports the Swift-side terminal disposition
+    /// without polling the backend, so it needs no capacity.
     package var objectWaiterReady: Bool {
-        state.isDetached || backend.hasQueuedObjects || backend.isTerminal
+        state.isDetached
+            || (!state.stagingIsFull
+                && (backend.hasQueuedObjects || backend.isTerminal))
     }
 
     /// The stable handle for a track discovered by THIS receiver.
@@ -495,7 +558,10 @@ public struct MediaObjects: AsyncSequence, Sendable {
 private final class ReceiverState: @unchecked Sendable {
 
     enum Taken {
-        case item(TrackEvent)
+        /// `freedCapacity` is true when this pop dropped the FIFO out of a
+        /// full state -- the edge that makes a parked object waiter runnable
+        /// again, so the consumer nudges the engine to re-evaluate it.
+        case item(TrackEvent, freedCapacity: Bool)
         case empty
         case terminalClean
         case terminalFatal(code: UInt64)
@@ -539,6 +605,15 @@ private final class ReceiverState: @unchecked Sendable {
         case .ended:
             guard let track = tracksByID[polled.handleID] else { return }
             fifo.append(.ended(track))
+        case .parseDrop:
+            /* Non-fatal diagnostic for a known track; never a track end. The
+             * class is part of the diagnostic -- a missing class is dropped,
+             * never defaulted to .media. */
+            guard let track = tracksByID[polled.handleID],
+                  let cls = polled.parseDropClass else { return }
+            fifo.append(.parseDrop(track, class: cls,
+                                   total: polled.parseDropTotal,
+                                   delta: polled.parseDropDelta))
         case .catalogReady:
             fifo.append(.catalogReady)
         }
@@ -575,10 +650,32 @@ private final class ReceiverState: @unchecked Sendable {
         return !fifo.isEmpty || terminal
     }
 
+    /// The bound on Swift-side track-event staging: matches the C queue default
+    /// this backend uses (no public config field). Surplus beyond this stays
+    /// backend-owned so backpressure reaches the peer end to end.
+    static let stagingCapacity = 64
+
+    /// Read-only observability of the staged track-event count. No mutation,
+    /// no behavior change; lets tests observe the FIFO depth.
+    var stagedCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return fifo.count
+    }
+
+    /// True once staging has reached ``stagingCapacity`` -- the eager drain
+    /// stops before polling further, leaving the surplus backend-owned.
+    var stagingIsFull: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return fifo.count >= Self.stagingCapacity
+    }
+
     func takeNext() -> Taken {
         lock.lock()
         defer { lock.unlock() }
-        if !fifo.isEmpty { return .item(fifo.removeFirst()) }
+        if !fifo.isEmpty {
+            let wasFull = fifo.count >= Self.stagingCapacity
+            return .item(fifo.removeFirst(), freedCapacity: wasFull)
+        }
         if terminal {
             return fatal ? .terminalFatal(code: fatalCode) : .terminalClean
         }

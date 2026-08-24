@@ -48,17 +48,32 @@ jobs:
         with:
           path: src/libmoq
 
+      # Validate the manual workflow_dispatch refs BEFORE they are used and
+      # BEFORE GHCR login / any package write. The inputs reach this step ONLY as
+      # step-level `env:` values (data), never interpolated into the script body,
+      # so a malicious ref cannot become shell source; the validator then rejects
+      # anything that is not a plain branch/tag/SHA token. On a normal push the
+      # inputs are unset and both default to 'master'.
+      - name: Validate picoquic + picotls refs
+        env:
+          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'master' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'master' }}
+        run: |
+          src/libmoq/scripts/validate_git_ref.sh "$PICOQUIC_REF" picoquic_ref
+          src/libmoq/scripts/validate_git_ref.sh "$PICOTLS_REF" picotls_ref
+
       # libmoq's interop Dockerfile expects picotls/ + picoquic/ + libmoq/ as
       # siblings in the build context. moq5 does not vendor them, and both carry
       # their OWN submodules (picotls: cifra/micro-ecc), so the clone MUST recurse.
       - name: Fetch picoquic + picotls (recurse submodules)
+        env:
+          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'master' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'master' }}
         run: |
-          PQ_REF="${{ github.event.inputs.picoquic_ref || 'master' }}"
-          PT_REF="${{ github.event.inputs.picotls_ref || 'master' }}"
           git clone --recurse-submodules --shallow-submodules --depth 1 \
-            --branch "$PQ_REF" "$PICOQUIC_REPO" src/picoquic
+            --branch "$PICOQUIC_REF" "$PICOQUIC_REPO" src/picoquic
           git clone --recurse-submodules --shallow-submodules --depth 1 \
-            --branch "$PT_REF" "$PICOTLS_REPO" src/picotls
+            --branch "$PICOTLS_REF" "$PICOTLS_REPO" src/picotls
           echo "PICOQUIC_SHA=$(git -C src/picoquic rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "PICOTLS_SHA=$(git -C src/picotls rev-parse --short HEAD)" >> "$GITHUB_ENV"
 

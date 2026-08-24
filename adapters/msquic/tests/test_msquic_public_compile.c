@@ -121,12 +121,102 @@ int main(void)
     if (moq_msquic_managed_conn_user(NULL) != NULL)
         return 1;
     moq_msquic_managed_conn_set_user(NULL, NULL);
+    if (moq_msquic_managed_conn_ack_terminal(NULL) != MOQ_ERR_INVAL)
+        return 1;
+    {
+        /* the acknowledgment's exact shape: a token or lane parameter, or a
+         * void return, would fail to compile here */
+        moq_result_t (*ack)(moq_msquic_managed_conn_t *) =
+            moq_msquic_managed_conn_ack_terminal;
+
+        if (ack == NULL)
+            return 1;
+    }
     moq_msquic_managed_drain(NULL);
     if (moq_msquic_managed_conn_count(NULL) != 0)
         return 1;
     if (moq_msquic_managed_is_fatal(NULL) ||
         moq_msquic_managed_is_closed(NULL))
         return 1;
+    /* appended max_open_subgroups: zero (session default) after a full-size
+     * init, settable, and appended after the app_deadline block. */
+    moq_msquic_managed_cfg_init_sized(&mcfg, sizeof(mcfg));
+    if (mcfg.max_open_subgroups != 0)
+        return 1;
+    mcfg.max_open_subgroups = 7;
+    if (mcfg.max_open_subgroups != 7)
+        return 1;
+    /* order: the appended field follows the previous tail (app_deadline_ctx),
+     * i.e. the app_deadline block is preserved ahead of it */
+    if (offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) <
+        offsetof(moq_msquic_managed_cfg_t, app_deadline_ctx) + sizeof(void *))
+        return 1;
+    /* a caller sized THROUGH the app_deadline block but excluding the newer
+     * max_open_subgroups: the prior prefix initializes (app_deadline_ctx and
+     * session_idle_timeout_us zeroed), the excluded field keeps its poison */
+    memset(&mcfg, 0xff, sizeof(mcfg));
+    moq_msquic_managed_cfg_init_sized(
+        &mcfg, offsetof(moq_msquic_managed_cfg_t, max_open_subgroups));
+    if (mcfg.struct_size !=
+        (uint32_t)offsetof(moq_msquic_managed_cfg_t, max_open_subgroups))
+        return 1;
+    if (mcfg.session_idle_timeout_us != 0) /* pre-boundary field zeroed */
+        return 1;
+    if (mcfg.app_deadline_ctx != NULL) /* the immediate predecessor zeroed */
+        return 1;
+    if (mcfg.max_open_subgroups == 0) /* poison untouched */
+        return 1;
+    /* appended versions/version_count: one ABI block at the struct tail. */
+    {
+        static const moq_version_t drafts[] = {
+            MOQ_VERSION_DRAFT_18,
+            MOQ_VERSION_DRAFT_16,
+        };
+
+        moq_msquic_managed_cfg_init_sized(&mcfg, sizeof(mcfg));
+        if (mcfg.versions != NULL || mcfg.version_count != 0)
+            return 1;
+        mcfg.versions = drafts;
+        mcfg.version_count = 2;
+        if (mcfg.versions != drafts || mcfg.version_count != 2)
+            return 1;
+        if (MOQ_MSQUIC_MANAGED_MAX_VERSIONS < 2u)
+            return 1;
+        if (offsetof(moq_msquic_managed_cfg_t, versions) <
+            offsetof(moq_msquic_managed_cfg_t, max_open_subgroups) +
+                sizeof(mcfg.max_open_subgroups))
+            return 1;
+        if (offsetof(moq_msquic_managed_cfg_t, version_count) <=
+            offsetof(moq_msquic_managed_cfg_t, versions))
+            return 1;
+        if (sizeof(moq_msquic_managed_cfg_t) <
+            offsetof(moq_msquic_managed_cfg_t, version_count) +
+                sizeof(mcfg.version_count))
+            return 1;
+
+        memset(&mcfg, 0xff, sizeof(mcfg));
+        moq_msquic_managed_cfg_init_sized(
+            &mcfg, offsetof(moq_msquic_managed_cfg_t, versions));
+        if (mcfg.struct_size !=
+            (uint32_t)offsetof(moq_msquic_managed_cfg_t, versions))
+            return 1;
+        if (mcfg.max_open_subgroups != 0)
+            return 1;
+        {
+            unsigned char poison[sizeof(mcfg.versions)];
+
+            memcpy(poison,
+                   (const unsigned char *)&mcfg +
+                       offsetof(moq_msquic_managed_cfg_t, versions),
+                   sizeof(poison));
+            for (size_t i = 0; i < sizeof(poison); i++)
+                if (poison[i] != 0xffu)
+                    return 1;
+        }
+    }
+    if (moq_msquic_managed_conn_negotiated_version(NULL) != 0)
+        return 1;
+
 #endif
     if (cfg.struct_size != sizeof(cfg))
         return 1;

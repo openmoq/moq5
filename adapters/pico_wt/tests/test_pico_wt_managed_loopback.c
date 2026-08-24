@@ -1106,6 +1106,129 @@ static run_status_t run_nego_legacy_18(const char *cert, const char *key,
     return fatal ? RUN_OK : RUN_HARD;
 }
 
+/* WT_ALPN_ERROR, draft-ietf-webtrans-http3-15 section 3.3 + its IANA registry
+ * entry: 0x0817b3dd (135771101). A client that REQUIRES application-protocol
+ * negotiation MUST close the WebTransport session with this code when a
+ * successful (2xx) response omits WT-Protocol. */
+#define WT_ALPN_ERROR_CODE 0x0817b3ddULL
+
+/* Same geometry as run_nego_legacy_18 (server echoes no WT-Protocol; client
+ * offers ONLY moqt-18), but the subject is the WIRE obligation rather than the
+ * local decision: after refusing to bind a profile, does the client actually
+ * send the mandated close capsule? The oracle is the SERVER's observation of a
+ * peer WebTransport close and its exact code, which the managed facade already
+ * surfaces -- handle_control_capsule() propagates the capsule's error_code via
+ * moq_transport_bridge_on_transport_close(), and the managed loop caches it as
+ * is_closed()/close_code(). */
+static run_status_t run_alpn_close_18(const char *cert, const char *key,
+                                      int port, int timeout_sec)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    moq_pico_wt_managed_t *srv = make_server_ex(cert, key, port, &sapp, NULL);
+    if (!srv) return RUN_RETRY;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    atomic_init(&capp.got_object, 0);
+    moq_pico_wt_managed_t *cli = make_client_ex2(
+        moq_pico_wt_managed_local_port(srv), &capp, 0, "moqt-18");
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    /* Bounded observation window. Both facades own autonomous network threads,
+     * so moq_pico_wt_managed_wait() does NOT pump either side -- it observes
+     * activity and yields bounded wall-clock opportunity for the network
+     * threads to run. The loop below is an ITERATION budget (roughly
+     * timeout_sec worth of 2x100ms waits), not a measured elapsed-time
+     * budget. */
+    const uint64_t budget = (uint64_t)timeout_sec * 1000;
+    uint64_t waited = 0;
+    int srv_session_seen = 0;
+    while (waited < budget) {
+        if (moq_pico_wt_managed_session(srv) != NULL) srv_session_seen = 1;
+        if (moq_pico_wt_managed_is_fatal(cli) && moq_pico_wt_managed_is_closed(srv))
+            break;
+        moq_pico_wt_managed_wait(cli, 100000);
+        moq_pico_wt_managed_wait(srv, 100000);
+        waited += 200;
+    }
+    /* Extra bounded observation on the server: a capsule may land after the
+     * client's local latch, so a missing capsule must not be mistaken for a
+     * race. Again, this waits -- it does not pump. */
+    for (int i = 0; i < 15; i++) {
+        if (moq_pico_wt_managed_session(srv) != NULL) srv_session_seen = 1;
+        if (moq_pico_wt_managed_is_closed(srv)) break;
+        moq_pico_wt_managed_wait(srv, 100000);
+    }
+
+    const int      cli_fatal   = moq_pico_wt_managed_is_fatal(cli);
+    const uint64_t cli_fcode   = moq_pico_wt_managed_fatal_code(cli);
+    const unsigned cli_version = (unsigned)moq_pico_wt_managed_negotiated_version(cli);
+    const unsigned srv_version = (unsigned)moq_pico_wt_managed_negotiated_version(srv);
+    const int      srv_closed  = moq_pico_wt_managed_is_closed(srv);
+    const uint64_t srv_code    = moq_pico_wt_managed_close_code(srv);
+    const int      srv_fatal   = moq_pico_wt_managed_is_fatal(srv);
+
+    /* The ARM is established only when the server created its session. A
+     * pre-accept transport failure (cert, connect, bind contention) also
+     * latches cli_fatal, and would otherwise sail past this point and emit the
+     * SAME missing-close diagnostics as the product defect. So retry on an
+     * unestablished arm REGARDLESS of the client's local latch; once the arm
+     * IS established, a missing client fatal is a real failure, not a retry. */
+    if (!srv_session_seen) {
+        moq_pico_wt_managed_stop(cli); moq_pico_wt_managed_destroy(cli);
+        moq_pico_wt_managed_stop(srv); moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    fprintf(stderr,
+            "[alpn_close_18] srv_session=%d srv_closed=%d srv_close_code=0x%llx "
+            "srv_fatal=%d srv_version=%u | cli_fatal=%d cli_fatal_code=%llu "
+            "cli_version=%u got_object=%d\n",
+            srv_session_seen, srv_closed, (unsigned long long)srv_code,
+            srv_fatal, srv_version, cli_fatal,
+            (unsigned long long)cli_fcode, cli_version,
+            atomic_load(&capp.got_object));
+
+    /* -- arm ---------------------------------------------------------------
+     * No token is selected BY CONSTRUCTION: the fixture passes
+     * wt_protocols == NULL, and the server-side selection path is the only
+     * writer of a response token. srv_version == 16 is the corroborating exact
+     * state that follows (the default profile), not a wire-header parse. No
+     * expectation here is derived from a value the call under test produced. */
+    CHECK(srv_session_seen);                       /* server created its session */
+    CHECK(srv_version == MOQ_VERSION_DRAFT_16);    /* exact, not merely "not 18" */
+
+    /* -- client local contract (already-known behaviour, kept as control) -- */
+    CHECK(cli_fatal);                              /* fail-closed, not a guess */
+    CHECK(!moq_pico_wt_managed_is_closed(cli));    /* a local failure is NOT a clean close */
+    CHECK(moq_pico_wt_managed_session(cli) == NULL); /* no MoQ session object at all */
+    CHECK(cli_version == 0);                       /* and no negotiated version */
+    CHECK(cli_version != MOQ_VERSION_DRAFT_16);    /* no silent d16 fallback */
+    CHECK(cli_fcode == 0);                         /* transport-class per the header contract */
+    CHECK(!atomic_load(&capp.got_object));
+
+    /* -- the WIRE obligation: this is the RED ------------------------------
+     * MULTIPLICITY LIMIT, stated: is_closed()/close_code() prove the server
+     * received A close carrying the latched code. The bridge stops counting
+     * once terminal, so this oracle can neither prove "exactly one" nor detect
+     * a later duplicate. Exact multiplicity is measured by the lab JS oracle
+     * (accepted==1, closes==1, matching==1), which must be re-run against any
+     * eventual product GREEN. */
+    CHECK(srv_closed);                             /* a peer WT close was observed at all */
+    CHECK(srv_code == WT_ALPN_ERROR_CODE);         /* and it carried WT_ALPN_ERROR */
+    CHECK(!srv_fatal);                             /* not a MoQ protocol fatal */
+
+    moq_pico_wt_managed_stop(cli);
+    moq_pico_wt_managed_destroy(cli);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+    return RUN_OK;   /* outcome is carried by `failures`, not by the status */
+}
+
 static run_status_t run_refuse(const char *cert, const char *key,
                                int port, int timeout_sec)
 {
@@ -1329,16 +1452,17 @@ int main(int argc, char **argv)
     int announce_done_18 = !strcmp(mode, "announce_done_18");
     int announce_done_no_rsa = !strcmp(mode, "announce_done_no_rsa");
     int loopback_18 = !strcmp(mode, "loopback_18");
+    int alpn_close_18 = !strcmp(mode, "alpn_close_18");
     if (!refuse && !close_mode && !nego && !nego_refuse && !nego_legacy &&
         !nego_legacy_18 && !no_rsa && !bigobj && !bigobj_smallwin &&
         !bigobj_drain && !announce && !announce_18 && !announce_done_18 &&
-        !announce_done_no_rsa && !loopback_18 &&
+        !announce_done_no_rsa && !loopback_18 && !alpn_close_18 &&
         strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "nego|nego_refuse|nego_legacy|nego_legacy_18|"
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
                 "announce|announce_18|announce_done_18|announce_done_no_rsa|"
-                "loopback_18)\n", mode);
+                "loopback_18|alpn_close_18)\n", mode);
         return 2;
     }
 
@@ -1374,6 +1498,7 @@ int main(int argc, char **argv)
                                                       "moqt-18", 1)
            : loopback_18    ? run_loopback_proto(cert, key, ports[i], 6,
                                                  "moqt-18")
+           : alpn_close_18  ? run_alpn_close_18(cert, key, ports[i], 6)
                             : run_loopback_proto(cert, key, ports[i], 6, NULL);
         if (st != RUN_RETRY) break;
     }

@@ -80,6 +80,14 @@ static size_t encode_request_error(uint8_t *buf, size_t cap,
     return moq_buf_writer_offset(&w);
 }
 
+/* Shared inbound/outbound suffix-membership probe counter (compiled into
+ * moq-core-test-internals under MOQ_SESSION_SWEEP_TESTING). The d16
+ * public-route control below reads its DELTA across a small valid response
+ * sequence to prove membership work is nonzero and bounded on this profile.
+ * Representation-neutral: an ordered-tree membership would probe far fewer
+ * keys per insert. Same counter the d18 quadratic RED measures. */
+extern uint64_t session_ns_suffix_probe_count;
+
 static size_t encode_namespace_msg(uint8_t *buf, size_t cap,
                                     uint64_t msg_type,
                                     const char *suffix_field)
@@ -143,6 +151,268 @@ static moq_result_t setup_subscriber(moq_session_t *c,
         moq_action_cleanup(&acts[i]);
     }
     return MOQ_OK;
+}
+
+/* -- Strict d16 public-route helpers for the probe control (case 28b) -------
+ * setup_subscriber() above is shared by ~30 cases and is deliberately lenient
+ * (it does not classify unrelated actions, check feed results, or match the
+ * handle); tightening it would broaden those tests. These local helpers give
+ * the probe control the strict, failure-safe contract without that blast
+ * radius. */
+
+/* Exact, NULL-safe match of one d16 event against (kind, handle, suffix). */
+static int ns16_event_is(const moq_event_t *ev, unsigned kind,
+                         moq_ns_sub_handle_t h, const char *sfx)
+{
+    /* Reject an unsupported expected kind before touching a union member. */
+    if (kind != MOQ_EVENT_NAMESPACE_FOUND && kind != MOQ_EVENT_NAMESPACE_GONE)
+        return 0;
+    if (ev->kind != kind) return 0;
+    moq_ns_sub_handle_t eh;
+    moq_namespace_t s;
+    if (kind == MOQ_EVENT_NAMESPACE_GONE) {
+        eh = ev->u.namespace_gone.handle;
+        s  = ev->u.namespace_gone.track_namespace_suffix;
+    } else {
+        eh = ev->u.namespace_found.handle;
+        s  = ev->u.namespace_found.track_namespace_suffix;
+    }
+    size_t n = strlen(sfx);
+    if (eh._opaque != h._opaque) return 0;
+    if (s.count != 1) return 0;
+    if (s.parts == NULL) return 0;                    /* NULL-safe before deref */
+    if (s.parts[0].len != n) return 0;
+    if (n != 0 && s.parts[0].data == NULL) return 0;
+    return n == 0 || memcmp(s.parts[0].data, sfx, n) == 0;
+}
+
+/* Checked local encoders for the strict control: unlike the shared len-only
+ * helpers (used by ~30 older cases, deliberately not refactored here), these
+ * check every encoder return code and only report a length after a successful
+ * encode -- so a failed encoder, which can be nonzero-length or emit a wrong
+ * fallback payload, is caught by the return code, not merely by length. */
+static moq_result_t ns16_encode_request_ok_checked(uint8_t *buf, size_t cap,
+                                                   uint64_t rid, size_t *out_len)
+{
+    *out_len = 0;
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_result_t rc = moq_d16_encode_request_ok(&w, rid, NULL, 0);
+    if (rc != MOQ_OK) return rc;
+    *out_len = moq_buf_writer_offset(&w);
+    return MOQ_OK;
+}
+
+static moq_result_t ns16_encode_namespace_msg_checked(uint8_t *buf, size_t cap,
+                                                      uint64_t msg_type,
+                                                      const char *suffix_field,
+                                                      size_t *out_len)
+{
+    *out_len = 0;
+    uint8_t payload[128];
+    moq_buf_writer_t pw;
+    moq_buf_writer_init(&pw, payload, sizeof(payload));
+    moq_bytes_t parts[1];
+    moq_namespace_t ns;
+    if (suffix_field) {
+        parts[0] = moq_bytes_cstr(suffix_field);
+        ns = (moq_namespace_t){ parts, 1 };
+    } else {
+        ns = (moq_namespace_t){ NULL, 0 };
+    }
+    moq_result_t prc = moq_buf_write_namespace_prefix(&pw, &ns);
+    if (prc != MOQ_OK) return prc;
+    size_t plen = moq_buf_writer_offset(&pw);
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_result_t erc =
+        moq_control_encode_envelope(&w, msg_type, payload, (uint16_t)plen);
+    if (erc != MOQ_OK) return erc;
+    *out_len = moq_buf_writer_offset(&w);
+    return MOQ_OK;
+}
+
+/* Permanent self-check: prove the checked encoders' failure path is real and
+ * reports zero length, so an "ignore rc and rely on length" mutant fails here.
+ * Quiet on pass. */
+static int test_ns16_encoder_selfcheck(void)
+{
+    int failures = 0;
+    uint8_t tiny[2];
+    uint8_t big[128];
+    size_t len;
+
+    /* Deliberately tiny buffer: encode must fail and report zero length. */
+    MOQ_TEST_CHECK(ns16_encode_request_ok_checked(tiny, sizeof(tiny), 7, &len) < 0);
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)len, 0u);
+    MOQ_TEST_CHECK(ns16_encode_namespace_msg_checked(
+        tiny, sizeof(tiny), MOQ_D16_NAMESPACE, "aaa", &len) < 0);
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)len, 0u);
+    MOQ_TEST_CHECK(ns16_encode_namespace_msg_checked(
+        tiny, sizeof(tiny), MOQ_D16_NAMESPACE_DONE, "aaa", &len) < 0);
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)len, 0u);
+
+    /* Normal buffer: encode must succeed and report a positive length. */
+    MOQ_TEST_CHECK_EQ_INT(
+        (int)ns16_encode_request_ok_checked(big, sizeof(big), 7, &len), (int)MOQ_OK);
+    MOQ_TEST_CHECK(len > 0);
+    MOQ_TEST_CHECK_EQ_INT((int)ns16_encode_namespace_msg_checked(
+        big, sizeof(big), MOQ_D16_NAMESPACE, "aaa", &len), (int)MOQ_OK);
+    MOQ_TEST_CHECK(len > 0);
+    MOQ_TEST_CHECK_EQ_INT((int)ns16_encode_namespace_msg_checked(
+        big, sizeof(big), MOQ_D16_NAMESPACE_DONE, "aaa", &len), (int)MOQ_OK);
+    MOQ_TEST_CHECK(len > 0);
+
+    return failures;                                   /* quiet on pass */
+}
+
+/* Feed one NAMESPACE / NAMESPACE_DONE for a single-part suffix and require
+ * exactly one matching event, zero actions, no extra output, ESTABLISHED. */
+static int ns16_feed_one(moq_session_t *c, moq_stream_ref_t ref,
+                         moq_ns_sub_handle_t h, const char *sfx, int is_done,
+                         unsigned expect_kind)
+{
+    int failures = 0;
+    uint8_t ns[128];
+    size_t nlen = 0;
+    moq_result_t nrc = ns16_encode_namespace_msg_checked(ns, sizeof(ns),
+        is_done ? MOQ_D16_NAMESPACE_DONE : MOQ_D16_NAMESPACE, sfx, &nlen);
+    MOQ_TEST_CHECK_EQ_INT((int)nrc, (int)MOQ_OK);      /* checked encoder */
+    MOQ_TEST_CHECK(nlen > 0);                          /* never feed an empty buffer */
+    if (nrc != MOQ_OK || nlen == 0) return failures;
+    moq_result_t frc =
+        moq_session_on_bidi_stream_bytes(c, ref, ns, nlen, false, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)frc, (int)MOQ_OK);
+    if (frc != MOQ_OK) return failures;               /* don't poll after bad feed */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
+
+    /* Zero actions on this route; stop before the event assertions on an
+     * unexpected action (clean it first). */
+    moq_action_t act;
+    int na = moq_session_poll_actions(c, &act, 1);
+    MOQ_TEST_CHECK_EQ_INT(na, 0);
+    if (na > 0) { moq_action_cleanup(&act); return failures; }
+
+    moq_event_t ev;
+    int got = moq_session_poll_events(c, &ev, 1);
+    MOQ_TEST_CHECK_EQ_INT(got, 1);
+    if (got == 1) {                                   /* inspect only a real event */
+        MOQ_TEST_CHECK(ns16_event_is(&ev, expect_kind, h, sfx));
+        moq_event_cleanup(&ev);
+        int extra = moq_session_poll_events(c, &ev, 1);
+        MOQ_TEST_CHECK_EQ_INT(extra, 0);              /* no more */
+        if (extra > 0) moq_event_cleanup(&ev);        /* clean the unexpected one */
+    }
+    return failures;
+}
+
+/* Establish a d16 subscriber to ESTABLISHED strictly: checked subscribe result,
+ * exactly one nonzero OPEN_BIDI ref (send half open), no unrelated setup action,
+ * checked REQUEST_OK feed, one NS_SUB_OK matching the declared handle, exactly
+ * ESTABLISHED, no extra events/actions. *out_ok is true iff usable. */
+static int ns16_establish_strict(moq_session_t *c, moq_ns_sub_handle_t *out_h,
+                                 moq_stream_ref_t *out_ref, bool *out_ok)
+{
+    int failures = 0;
+    *out_ok = false;
+    moq_subscribe_namespace_cfg_t cfg;
+    moq_subscribe_namespace_cfg_init(&cfg);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("test") };
+    cfg.track_namespace_prefix.parts = parts;
+    cfg.track_namespace_prefix.count = 1;
+    moq_result_t rc = moq_session_subscribe_namespace(c, &cfg, 0, out_h);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    if (rc != MOQ_OK) return failures;
+
+    moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
+    uint64_t rid = 0;
+    bool decoded = false;                 /* separate from rid==0, a valid id */
+    int opens = 0, other = 0;
+    bool open_fin = true;
+    moq_action_t act;
+    while (moq_session_poll_actions(c, &act, 1) > 0) {
+        if (act.kind == MOQ_ACTION_OPEN_BIDI_STREAM) {
+            opens++;
+            ref = act.u.open_bidi_stream.stream_ref;
+            open_fin = act.u.open_bidi_stream.fin;
+            /* Strict decode of the request the REQUEST_OK must echo: nonempty
+             * opening bytes; a well-formed SUBSCRIBE_NAMESPACE envelope with no
+             * trailing bytes; a body carrying the declared "test" prefix. */
+            const uint8_t *ob = act.u.open_bidi_stream.data;
+            size_t oblen = act.u.open_bidi_stream.len;
+            if (ob != NULL && oblen > 0) {
+                moq_control_envelope_t env;
+                moq_buf_reader_t r;
+                moq_buf_reader_init(&r, ob, oblen);
+                if (moq_control_decode_envelope(&r, &env) == MOQ_OK &&
+                    env.msg_type == MOQ_D16_SUBSCRIBE_NAMESPACE &&
+                    moq_buf_reader_remaining(&r) == 0) {
+                    moq_bytes_t dp[32];
+                    moq_kvp_entry_t dparams[4];
+                    moq_d16_subscribe_namespace_t sub = {
+                        .track_namespace_prefix = { dp, 0 },
+                        .params = dparams, .params_cap = 4,
+                    };
+                    if (moq_d16_decode_subscribe_namespace(
+                            env.payload, env.payload_len, dp, 32, &sub) == MOQ_OK &&
+                        sub.track_namespace_prefix.count == 1 &&
+                        sub.track_namespace_prefix.parts != NULL &&
+                        sub.track_namespace_prefix.parts[0].len == 4 &&
+                        sub.track_namespace_prefix.parts[0].data != NULL &&
+                        memcmp(sub.track_namespace_prefix.parts[0].data,
+                               "test", 4) == 0) {
+                        rid = sub.request_id;
+                        decoded = true;
+                    }
+                }
+            }
+        } else other++;
+        moq_action_cleanup(&act);
+    }
+    MOQ_TEST_CHECK_EQ_INT(opens, 1);
+    MOQ_TEST_CHECK_EQ_INT(other, 0);
+    MOQ_TEST_CHECK(ref._v != 0);
+    MOQ_TEST_CHECK(open_fin == false);
+    MOQ_TEST_CHECK(decoded);               /* request decoded strictly */
+    if (opens != 1 || other != 0 || ref._v == 0 || open_fin || !decoded)
+        return failures;                   /* leave *out_ok false */
+
+    uint8_t ok[128];
+    size_t olen = 0;
+    moq_result_t orc = ns16_encode_request_ok_checked(ok, sizeof(ok), rid, &olen);
+    MOQ_TEST_CHECK_EQ_INT((int)orc, (int)MOQ_OK);      /* checked encoder */
+    MOQ_TEST_CHECK(olen > 0);
+    if (orc != MOQ_OK || olen == 0) return failures;
+    moq_result_t frc = moq_session_on_bidi_stream_bytes(c, ref, ok, olen, false, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)frc, (int)MOQ_OK);
+    if (frc != MOQ_OK) return failures;
+
+    moq_action_t sa;
+    int sna = moq_session_poll_actions(c, &sa, 1);
+    MOQ_TEST_CHECK_EQ_INT(sna, 0);
+    if (sna > 0) { moq_action_cleanup(&sa); return failures; }
+
+    moq_event_t ev;
+    int got = moq_session_poll_events(c, &ev, 1);
+    MOQ_TEST_CHECK_EQ_INT(got, 1);
+    if (got != 1) return failures;
+    bool ev_ok = ((int)ev.kind == (int)MOQ_EVENT_NS_SUB_OK) &&
+                 (ev.u.ns_sub_ok.handle._opaque == out_h->_opaque);
+    MOQ_TEST_CHECK_EQ_INT((int)ev.kind, (int)MOQ_EVENT_NS_SUB_OK);
+    MOQ_TEST_CHECK(ev.u.ns_sub_ok.handle._opaque == out_h->_opaque);
+    moq_event_cleanup(&ev);
+    if (!ev_ok) return failures;
+    int extra = moq_session_poll_events(c, &ev, 1);
+    MOQ_TEST_CHECK_EQ_INT(extra, 0);
+    if (extra > 0) { moq_event_cleanup(&ev); return failures; }
+    if (moq_session_state(c) != MOQ_SESS_ESTABLISHED) {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
+        return failures;
+    }
+
+    *out_ref = ref;
+    *out_ok = true;                        /* every requirement passed */
+    return failures;
 }
 
 /* The namespace-subscription slot keyed to `ref`, or -1. */
@@ -451,6 +721,10 @@ static int ns_fx_teardown(ns_fx_t *f, const char *op)
 int main(void)
 {
     int failures = 0;
+
+    /* Strict-control encoder self-check (proves the checked encoders' failure
+     * path is real before any 28b feed relies on them). */
+    failures += test_ns16_encoder_selfcheck();
 
     /* == 1. subscribe_namespace → OPEN_BIDI_STREAM action ============= */
     {
@@ -1418,6 +1692,53 @@ int main(void)
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NAMESPACE_FOUND);
         MOQ_TEST_CHECK(ev.u.namespace_found.track_namespace_suffix.count == 1);
         moq_event_cleanup(&ev);
+
+        DRAIN_BOTH(c, sv);
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == 28b. d16 public-route probe control ==========================
+     * A small valid draft-16 sequence proving the shared suffix-membership
+     * probe delta is nonzero and bounded on the public route, with exact
+     * FOUND/GONE behaviour. This is the profile-neutral counterpart to the
+     * d18 quadratic RED: a control, not a RED -- both bounds hold today.
+     * Uses the strict, failure-safe local helpers (ns16_*). */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 64, 64, &c, &sv, NULL, NULL);
+
+        moq_ns_sub_handle_t h; moq_stream_ref_t ref; bool ok = false;
+        failures += ns16_establish_strict(c, &h, &ref, &ok);
+        if (ok) {
+            static const char *k_sfx[3] = { "aaa", "bbb", "ccc" };
+            uint64_t probe_before = session_ns_suffix_probe_count;
+            for (int i = 0; i < 3; i++)
+                failures += ns16_feed_one(c, ref, h, k_sfx[i], 0,
+                                          MOQ_EVENT_NAMESPACE_FOUND);
+            /* No unsigned subtraction unless monotonicity is proven by control
+             * flow: compute the delta only in the true branch. */
+            if (session_ns_suffix_probe_count >= probe_before) {
+                uint64_t probe_delta =
+                    session_ns_suffix_probe_count - probe_before;
+                /* Nonzero: membership work was performed for the three distinct
+                 * inserts (a removed probe increment would drop this to 0). */
+                MOQ_TEST_CHECK(probe_delta > 0);
+                /* Bounded: a conservative O(N log N) ceiling for N=3 distinct
+                 * suffixes; representation-neutral (documented, not a flat-array
+                 * byte formula). ceil_log2(N+1) with N=3 is 2. */
+                MOQ_TEST_CHECK(probe_delta <= (uint64_t)(4 * 3 * 2));
+            } else {
+                MOQ_TEST_CHECK(session_ns_suffix_probe_count >= probe_before);
+            }
+
+            /* Exact GONE: NAMESPACE_DONE for "aaa" releases exactly that key. */
+            failures += ns16_feed_one(c, ref, h, "aaa", 1,
+                                      MOQ_EVENT_NAMESPACE_GONE);
+        }
 
         DRAIN_BOTH(c, sv);
         moq_session_destroy(c);
@@ -3947,8 +4268,8 @@ int main(void)
 
     /* == Suffix tracking is all-or-nothing under allocation failure ====
      * Handling one NAMESPACE response allocates, in this order: the
-     * canonical suffix key, the tracker object on first use, the stored key
-     * copy, and the key array. Any of them failing must report NOMEM --
+     * canonical suffix key, the tracker object on first use, the tree node,
+     * and the stored key copy. Any of them failing must report NOMEM --
      * never a wait -- and leave the subscription exactly as it was, with
      * the buffered response bytes retained so an ordinary empty re-feed
      * replays the message once memory is available.
@@ -3976,8 +4297,8 @@ int main(void)
         static const fp_expect_t k_first_sig[4] = {
             { FP_ALLOC, FP_SIZE_EXACT, 8, 0 },      /* canonical key */
             { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tracker (private) */
-            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy */
-            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* key array (private) */
+            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tree node (private) */
+            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy (== key) */
         };
         static const fp_outcome_row_t k_first_out[4] = {
             { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
@@ -3985,10 +4306,12 @@ int main(void)
             { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
             { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
         };
+        /* Inserting into a populated tree allocates one node plus its key copy,
+         * no array growth: [canonical key, tree node, stored key copy]. */
         static const fp_expect_t k_grow_sig[3] = {
             { FP_ALLOC, FP_SIZE_EXACT, 5, 0 },      /* canonical key ("ee") */
-            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy */
-            { FP_REALLOC_GROW, FP_SIZE_ANY, 0, 0 }, /* key-array growth */
+            { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tree node (private) */
+            { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy (== key) */
         };
         static const fp_outcome_row_t k_grow_out[3] = {
             { FP_PHASE_PRE_COMMIT, FP_NOMEM_RETAIN },
@@ -4043,13 +4366,13 @@ int main(void)
             failures += ns_fx_teardown(&f, "ns-baseline");
         }
 
-        /* -- The fifth insert against a full key array ------------------
+        /* -- The fifth insert into a populated tree ---------------------
          * Baseline plus one FRESH fixture per origin, each with its own
          * recovery cycle. The tracker pre-exists here, so the failure
          * contract "the set is exactly as it was on entry" is pinned by an
          * OPAQUE BYTE SNAPSHOT of the tracker block over its
-         * allocator-recorded size: every interior scalar -- count and cap
-         * included -- must hold, and a divergence names the first
+         * allocator-recorded size: every interior scalar -- root, count and
+         * counted_bytes -- must hold, and a divergence names the first
          * differing byte offset. */
         fp_attempt_t   grow_log[FP_LOG_CAP];
         txs_norm_vec_t grow_out;

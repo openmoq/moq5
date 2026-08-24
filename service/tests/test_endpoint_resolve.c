@@ -55,6 +55,8 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)s.perspective, (int)MOQ_PERSPECTIVE_CLIENT);
         MOQ_TEST_CHECK_EQ_U64(s.wt_profile,
                               (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+        /* Same for the handshake bound: 0 = the backend's own default. */
+        MOQ_TEST_CHECK_EQ_U64(s.handshake_timeout_us, 0);
         /* The v0 floor must sit exactly at wt_profile (the first tail field). */
         MOQ_TEST_CHECK_EQ_U64(MOQ_ENDPOINT_CFG_V0_SIZE,
                               offsetof(moq_endpoint_cfg_t, wt_profile));
@@ -129,6 +131,122 @@ int main(void)
 #endif
     }
 
+    /* == handshake_timeout_us resolve: gate + backend rejection ======= *
+     * The bound is applied on the QUIC context by the picoquic backend and by
+     * no other. AUTO resolves to picoquic here unconditionally -- that is the
+     * resolver's stable selection, NOT a claim that the picoquic facade is
+     * compiled into every build; connect() reports UNSUPPORTED when it is not.
+     * 0 means "the backend's own default" and is accepted everywhere. */
+    {
+        moq_endpoint_resolved_t r;
+
+        /* v0-sized caller (no field): 0, and resolve never reads past it. */
+        moq_endpoint_cfg_t v0 = mkcfg("moqt://relay.example:4433");
+        v0.struct_size = MOQ_ENDPOINT_CFG_V0_SIZE;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
+
+        /* Full-size caller on picoquic: carried through verbatim. */
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+        c.handshake_timeout_us = 5000000ull;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 5000000ull);
+
+        /* Explicit 0 stays 0 (backend default), not a smuggled value. */
+        c.handshake_timeout_us = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
+
+        /* A struct_size that only PARTIALLY covers the field must not read it
+         * (complete-presence gate): treated as absent -> backend default. */
+        moq_endpoint_cfg_t part;
+        moq_endpoint_cfg_init_sized(&part, sizeof(part));
+        part.url = B("moqt://relay.example:4433");
+        part.handshake_timeout_us = 5000000ull;
+        part.struct_size = (uint32_t)(
+            offsetof(moq_endpoint_cfg_t, handshake_timeout_us) + 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&part, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
+
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        /* A backend with no handshake bound REJECTS a non-zero value rather
+         * than silently ignoring it; zero is still fine there. */
+        moq_endpoint_cfg_t m;
+        moq_endpoint_cfg_init_sized(&m, sizeof(m));
+        m.url = B("moqt://relay.example:4433");
+        m.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        m.handshake_timeout_us = 5000000ull;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&m, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        m.handshake_timeout_us = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&m, &r), (int)MOQ_OK);
+#endif
+    }
+
+    /* == handshake_timeout_us upper boundary ========================== *
+     * The bound becomes an ABSOLUTE deadline (connection start + duration) in
+     * the backend, so a value with no headroom above that clock would wrap the
+     * unsigned sum and mean the opposite of a long wait. The accepted range is
+     * closed at MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US; past it is MOQ_ERR_INVAL,
+     * never a clamp. */
+    {
+        moq_endpoint_resolved_t r;
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+
+        /* The named maximum itself is INSIDE the range and survives verbatim --
+         * this is what makes the reject a boundary rather than a cap. */
+        c.handshake_timeout_us = MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us,
+                              MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US);
+
+        /* One past it. The addition is exact in uint64_t (the maximum is
+         * INT64_MAX, so +1 is 2^63), not an expression that itself overflows. */
+        c.handshake_timeout_us = MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US + 1ull;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+
+        /* And the value a caller would most naturally reach for as "no bound",
+         * which is precisely the one that wraps. */
+        c.handshake_timeout_us = UINT64_MAX;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_INVAL);
+
+        /* Range is checked BEFORE the backend capability answer: out of range
+         * reads as INVAL everywhere, not UNSUPPORTED on some backends. Proven
+         * on a non-picoquic backend, which rejects even an IN-range non-zero
+         * value with UNSUPPORTED -- so the two answers are distinguishable. */
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        moq_endpoint_cfg_t m2;
+        moq_endpoint_cfg_init_sized(&m2, sizeof(m2));
+        m2.url = B("moqt://relay.example:4433");
+        m2.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        m2.handshake_timeout_us = UINT64_MAX;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&m2, &r),
+                              (int)MOQ_ERR_INVAL);
+#endif
+
+        /* An ABSENT field is never range-read: a v0-sized caller carrying
+         * out-of-range bytes in memory it does not declare still resolves. */
+        moq_endpoint_cfg_t v0b;
+        moq_endpoint_cfg_init_sized(&v0b, sizeof(v0b));
+        v0b.url = B("moqt://relay.example:4433");
+        v0b.handshake_timeout_us = UINT64_MAX;
+        v0b.struct_size = MOQ_ENDPOINT_CFG_V0_SIZE;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0b, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
+
+        /* Same for a PARTIALLY covered field: not read, so not ranged. */
+        v0b.struct_size = (uint32_t)(
+            offsetof(moq_endpoint_cfg_t, handshake_timeout_us) + 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0b, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
+    }
+
     /* == old-caller overflow guard (v0-sized HEAP buffer) ============= *
      * Simulate a binary compiled against the pre-wt_profile header: a heap
      * allocation of exactly the v0 size. The pointer-only init must not write
@@ -148,6 +266,51 @@ int main(void)
                                   (int)MOQ_OK);
             MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
                                   (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+            MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
+            free(raw);
+        }
+    }
+
+    /* == old-caller overflow guard (PRECEDING-layout HEAP buffer) ===== *
+     * The generation directly before handshake_timeout_us: v0 PLUS wt_profile,
+     * i.e. a heap allocation of exactly offsetof(..., handshake_timeout_us)
+     * bytes, so the buffer ENDS where the new field begins. A shortened
+     * struct_size on a full-size struct would not prove this -- the bytes would
+     * still be there to read. Under ASan a read of the new field here is a hard
+     * heap-buffer-overflow, which is what makes this the load-bearing check.
+     * Kept beside the frozen-v0 canary above, which covers the older
+     * generation; both must hold. */
+    {
+        const size_t old_size = offsetof(moq_endpoint_cfg_t,
+                                         handshake_timeout_us);
+        /* The preceding layout really is shorter than the current one. */
+        MOQ_TEST_CHECK(old_size < sizeof(moq_endpoint_cfg_t));
+        void *raw = malloc(old_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            moq_endpoint_cfg_t *old = (moq_endpoint_cfg_t *)raw;
+            /* Sized init writes exactly old_size bytes -- never the new field. */
+            moq_endpoint_cfg_init_sized(old, old_size);
+            MOQ_TEST_CHECK_EQ_U64(old->struct_size, (uint64_t)old_size);
+            old->url = B("https://relay.example/moq");
+
+            moq_endpoint_resolved_t r;
+            /* wt_profile behavior is unchanged at this size: it is fully
+             * covered, so an EXPLICIT profile is still READ and still rejected
+             * on a backend that cannot select a dialect (AUTO -> picoquic).
+             * That reject is also what proves the field is read here. */
+            old->wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r),
+                                  (int)MOQ_ERR_UNSUPPORTED);
+
+            /* And with no explicit selection it resolves, with the new field
+             * absent -> the backend's own default. */
+            old->wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r),
+                                  (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.wt_profile,
+                                  (uint64_t)MOQ_WT_PROFILE_BACKEND_DEFAULT);
+            MOQ_TEST_CHECK_EQ_U64(r.handshake_timeout_us, 0);
             free(raw);
         }
     }

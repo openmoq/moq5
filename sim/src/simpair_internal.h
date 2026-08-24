@@ -261,8 +261,12 @@ moq_result_t deliver_or_delay_data_stop(
     moq_stream_ref_t sender_ref, uint64_t error_code,
     int dslot, moq_perspective_t from, moq_perspective_t sender_persp);
 
+/* to_server (nullable): additionally counts the matured inputs whose target
+ * was the SERVER session -- the directional receive signal event-paced
+ * fixtures key their doorbell model on. */
 moq_result_t sim_delay_deliver_matured(moq_simpair_t *sp,
-                                       size_t *delivered);
+                                       size_t *delivered,
+                                       size_t *to_server);
 
 /* -- simpair_pump.c -------------------------------------------------- */
 
@@ -285,11 +289,15 @@ int sim_bidi_find_by_opener(moq_simpair_t *sp, uint64_t opener_ref,
 int sim_bidi_find_by_responder(moq_simpair_t *sp, uint64_t responder_ref,
                                moq_perspective_t opener);
 
+/* delivered: work handled toward `to`. delivered_reverse (nullable): work
+ * this pump handles toward `from` -- the fault-injected STOP is delivered
+ * back into from_session, so it is counted there. */
 moq_result_t pump_direction(moq_simpair_t *sp,
                             moq_session_t *from_session,
                             moq_session_t *to_session,
                             moq_perspective_t from,
                             moq_perspective_t to,
-                            size_t *delivered);
+                            size_t *delivered,
+                            size_t *delivered_reverse);
 
 #endif /* SIMPAIR_INTERNAL_H */

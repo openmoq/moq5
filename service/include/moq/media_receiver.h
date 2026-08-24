@@ -268,7 +268,7 @@ typedef enum moq_media_track_event_kind {
     MOQ_MEDIA_CATALOG_READY,     /* first (independent) catalog enumerated; fires
                                     exactly once per connection (later generations
                                     emit only ADDED/REMOVED) */
-    MOQ_MEDIA_TRACK_UPDATE_OK    /* the peer acknowledged an APP-initiated
+    MOQ_MEDIA_TRACK_UPDATE_OK,   /* the peer acknowledged an APP-initiated
                                     pause/resume for this track . Fires only
                                     for wire acknowledgments attributed to a
                                     subscribe_track/unsubscribe_track intent
@@ -278,7 +278,26 @@ typedef enum moq_media_track_event_kind {
                                     OBSERVATIONAL (where delivery resumed
                                     relative to what was missed); the receiver
                                     issues no catch-up FETCH. */
+    MOQ_MEDIA_TRACK_PARSE_DROP   /* one or more media objects for this track
+                                    failed to parse and were dropped. NON-FATAL:
+                                    a malformed object never tears down the
+                                    receiver. Coalesced -- at most one parse-drop
+                                    diagnostic is pending per track at a time, so
+                                    a peer flooding malformed objects cannot flood
+                                    the app or overflow any queue. Read
+                                    parse_drop_class / parse_drops_total /
+                                    parse_drops_delta (below); `track` is always
+                                    non-NULL (every parse drop is track-scoped)
+                                    and `desc` is the handle's description. */
 } moq_media_track_event_kind_t;
+
+/* Which receive path a coalesced MOQ_MEDIA_TRACK_PARSE_DROP came from. */
+typedef enum moq_media_parse_drop_class {
+    MOQ_MEDIA_PARSE_DROP_MEDIA = 1,       /* a normal media object (poll_object) */
+    MOQ_MEDIA_PARSE_DROP_SAP,             /* a CMSF SAP timeline object (poll_sap) */
+    MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE,  /* an MSF media-timeline object
+                                             (poll_media_timeline) */
+} moq_media_parse_drop_class_t;
 
 typedef struct moq_media_track_event {
     uint32_t                      struct_size; /* ABI guard: poll_track stamps the
@@ -318,6 +337,16 @@ typedef struct moq_media_track_event {
     uint64_t largest_object;
     bool     has_expires;                /* draft-18 peers only */
     uint64_t expires_ms;
+    /* Appended (second generation), valid for MOQ_MEDIA_TRACK_PARSE_DROP only;
+     * zero for every other kind. Snapshotted at poll time from the track's
+     * coalesced per-track counters. Presence gate: an OLDER library stamps its
+     * own sizeof, so read this block only when the stamped struct_size >=
+     * offsetof(parse_drop_class) + sizeof(parse_drop_class). */
+    moq_media_parse_drop_class_t parse_drop_class; /* path/class of the last drop
+                                                      in this coalesced run */
+    uint64_t parse_drops_total;          /* cumulative parse drops for this track */
+    uint64_t parse_drops_delta;          /* drops since the previous drained
+                                            parse-drop event for this track */
 } moq_media_track_event_t;
 
 /* The description for a track handle (handle-owned; same lifetime as the
@@ -618,7 +647,10 @@ typedef struct moq_media_receiver_stats {
     uint64_t groups_dropped;      /* whole groups discarded */
     uint64_t keyframes_dropped;
     uint64_t parse_drops;         /* media-level parse failures (counted,
-                                     per-object, never terminal) */
+                                     per-object, never terminal). Also surfaced
+                                     per track as a coalesced
+                                     MOQ_MEDIA_TRACK_PARSE_DROP event via
+                                     poll_track -- no longer counter-only. */
     uint64_t overflow_events;     /* times a policy had to act */
     uint64_t pause_transitions;   /* FLOW_CONTROL pause/resume edges */
     bool     paused;              /* FLOW_CONTROL currently pausing */

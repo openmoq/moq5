@@ -838,6 +838,33 @@ static moq_result_t pump_resolve_would_block(moq_simpair_t *sp,
     }
     return drc;
 }
+/* Drive a WOULD_BLOCK on a peer RESET to completion, per the contract on
+ * moq_session_on_data_reset(): the reset owes a visible closure, that output can
+ * be refused, and the recovery is to drain output and REPEAT THE SAME RESET CALL
+ * with the SAME ref and code.
+ *
+ * A generic advancing drive on the stream is INTENTIONALLY permitted to service
+ * the already-retained obligation instead -- that is a contract behaviour, pinned
+ * by test_session_receive.c's F1.2. This driver repeats the reset anyway because
+ * that is the public, operation-local recovery: it retries the call that
+ * blocked, with its own arguments, and so does not depend on which drive routes
+ * happen to service the obligation.
+ *
+ * Drains through drain_client_chunks so every event freed here still reaches the
+ * chunk oracle. Bounded so a genuine stall cannot spin; hard errors are returned
+ * unchanged. */
+static moq_result_t pump_resolve_reset_would_block(moq_simpair_t *sp,
+        moq_session_t *client, moq_stream_ref_t ref, uint64_t code,
+        moq_result_t rrc, trace_summary_t *ts) {
+    int guard = 0;
+    while (rrc == MOQ_ERR_WOULD_BLOCK && guard++ < 256) {
+        ts->rnd_wb++;
+        drain_client_chunks(client, ts);
+        rrc = moq_session_on_data_reset(client, ref, code,
+                                       moq_simpair_now_us(sp));
+    }
+    return rrc;
+}
 
 /* -- Random phase: chunked data pump -------------------------------- */
 
@@ -1000,6 +1027,11 @@ static int pump_with_chunking(moq_simpair_t *sp, rng_t *chunk_rng,
                 moq_result_t rrc = moq_session_on_data_reset(client, ref,
                     acts[i].u.reset_data.error_code,
                     moq_simpair_now_us(sp));
+                /* A refused reset closure is backpressure, not a data
+                 * error: see moq_session_on_data_reset()'s contract and
+                 * pump_resolve_reset_would_block(). (seed 0x28e, step 40) */
+                rrc = pump_resolve_reset_would_block(
+                    sp, client, ref, acts[i].u.reset_data.error_code, rrc, ts);
                 if (rrc < 0) {
                     moq_action_cleanup(&acts[i]);
                     for (size_t j = i + 1; j < na; j++)

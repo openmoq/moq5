@@ -816,6 +816,17 @@ static int rnd_pump_s_to_c(moq_session_t *sv, moq_session_t *c,
                 moq_result_t rc = moq_session_on_data_reset(c,
                     acts[i].u.reset_data.stream_ref,
                     acts[i].u.reset_data.error_code, 0);
+                /* A reset whose abnormal-subgroup event cannot be queued
+                 * blocks and is owed: re-drive it after draining, the same
+                 * way the transport bridge retains pending_reset. */
+                if (rc == MOQ_ERR_WOULD_BLOCK) {
+                    ts->rnd_wb_data_input++;
+                    rnd_drain_client(c, ts);
+                    rc = moq_session_on_data_reset(c,
+                        acts[i].u.reset_data.stream_ref,
+                        acts[i].u.reset_data.error_code, 0);
+                    if (rc == MOQ_OK) ts->rnd_retries++;
+                }
                 if (rc < 0 && rc != MOQ_ERR_CLOSED) err = -1;
             }
             moq_action_cleanup(&acts[i]);

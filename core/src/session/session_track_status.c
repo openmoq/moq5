@@ -442,7 +442,8 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
         ev.detail_size = (uint32_t)sizeof(moq_track_status_error_event_t);
         ev.borrow_epoch = s->borrow_epoch;
         ev.u.track_status_error.handle = e->handle;
-        ev.u.track_status_error.error_code = (moq_request_error_t)error_code;
+        ev.u.track_status_error.error_code =
+            s->profile->semantic_request_error(error_code);
         ev.u.track_status_error.can_retry = can_retry;
         ev.u.track_status_error.retry_after_ms = retry_after_ms;
         ev.u.track_status_error.reason = ev_reason;
@@ -491,6 +492,10 @@ moq_result_t moq_session_track_status(moq_session_t *s,
         auth_token_count = cfg->auth_token_count;
     }
     if (moq_validate_auth_tokens(auth_tokens, auth_token_count) < 0)
+        return MOQ_ERR_INVAL;
+    if (moq_validate_full_track_name_min_fields(
+            &cfg->track_namespace, cfg->track_name,
+            s->profile->min_track_namespace_fields) < 0)
         return MOQ_ERR_INVAL;
 #undef TS_CFG_HAS
 #undef TS_CFG_MIN
@@ -672,7 +677,7 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
      * response, so reserve a drain slot up front (unless the requester already
      * FIN'd, in which case the bidi is fully closed and nothing late arrives). */
     bool req_stream = (e->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !e->req_recv_fin;
+    bool need_drain = req_stream && !ts_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 
@@ -710,6 +715,11 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
     /* Pre-redirect minimum: the original cfg was {struct_size, error_code}. */
     if (cfg->struct_size < offsetof(moq_reject_track_status_cfg_t, reason))
         return MOQ_ERR_INVAL;
+    /* The code must be representable in THIS profile's wire encoding; refuse
+     * before any mutation rather than truncate (draft-16 encodes a QUIC
+     * varint, draft-18 a vi64 spanning the full 64-bit range). */
+    if (cfg->error_code > s->profile->request_error_wire_max)
+        return MOQ_ERR_INVAL;
 #define TS_REJ_HAS(f) \
     (cfg->struct_size >= offsetof(moq_reject_track_status_cfg_t, f) + sizeof(cfg->f))
 
@@ -745,7 +755,7 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
 #undef TS_REJ_HAS
 
     bool req_stream = (e->request_stream_ref._v != 0);
-    bool need_drain = req_stream && !e->req_recv_fin;
+    bool need_drain = req_stream && !ts_peer_fin_observed(e);
     if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
 

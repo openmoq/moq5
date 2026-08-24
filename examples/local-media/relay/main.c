@@ -13,6 +13,9 @@
 #include <moq/picoquic.h>
 #include <moq/session.h>
 #include <moq/rcbuf.h>
+
+#include "../../common/moq_example_term.h"
+
 #include <picoquic_packet_loop.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -361,8 +364,10 @@ static void subscribe_upstream_for(relay_ctx_t *ctx, int idx, uint64_t now)
         ctx->upstream.session, &scfg, now, &t->up_sub);
     if (rc == MOQ_OK) {
         t->up_subscribed = true;
-        fprintf(stderr, "  relay: upstream subscribe sent for \"%.*s\"\n",
-            (int)ctx->name_len[idx], (const char *)ctx->name_buf[idx]);
+        /* track name originates from a peer subscribe: escape before print. */
+        fputs("  relay: upstream subscribe sent for \"", stderr);
+        moq_example_term_fprint(stderr, ctx->name_buf[idx], ctx->name_len[idx]);
+        fputs("\"\n", stderr);
     } else {
         fprintf(stderr, "  relay: upstream subscribe failed: %d\n", rc);
     }
@@ -666,9 +671,11 @@ static void pump_downstream(relay_ctx_t *ctx, uint64_t now)
                 t->is_catalog = relay_name_is_catalog(
                     ctx->name_buf[idx], ctx->name_len[idx]);
 
-                fprintf(stderr, "  relay: downstream subscribe accepted \"%.*s\"%s\n",
-                    (int)ctx->name_len[idx],
-                    (const char *)ctx->name_buf[idx],
+                /* track name from the downstream peer subscribe: escape it. */
+                fputs("  relay: downstream subscribe accepted \"", stderr);
+                moq_example_term_fprint(stderr, ctx->name_buf[idx],
+                                        ctx->name_len[idx]);
+                fprintf(stderr, "\"%s\n",
                     t->is_catalog ? " (retained: Joining FETCH)" : "");
 
                 if (ctx->up_established)

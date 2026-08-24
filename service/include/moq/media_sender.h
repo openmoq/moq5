@@ -568,18 +568,41 @@ typedef struct moq_media_vod_track {
 MOQ_API moq_result_t moq_media_sender_convert_to_vod(
     moq_media_sender_t *s, const moq_media_vod_track_t *items, size_t count);
 
-/* -- Stats (§7.5: every drop is counted, never silent) ---------------- */
+/* -- Stats (§7.5: every drop is counted, never silent) ---------------- *
+ * FOUR of the counters below -- objects_written, objects_sent, objects_queued,
+ * objects_dropped -- plus bytes_queued form ONE population: MEDIA objects
+ * accepted by write(), and the bytes they hold. The remaining counters
+ * (groups_dropped, keyframes_dropped, groups_abandoned, backpressure_stalls,
+ * last_error, sap_records_evicted) describe other facts and are not part of it.
+ *
+ * Private lifecycle work the service queues on your behalf -- the END_OF_TRACK
+ * terminal marker end_track() queues -- is NOT media and appears in none of the
+ * five. In particular objects_queued == 0 means NO MEDIA IS PENDING; it does
+ * not mean every queued lifecycle item has completed, so a terminal may still
+ * be in flight. Within that population conservation holds unconditionally:
+ *   objects_written == objects_sent + objects_queued + objects_dropped */
 
 typedef struct moq_media_sender_stats {
     uint32_t struct_size;
     uint64_t objects_written;     /* accepted by write() (queued) */
     uint64_t objects_sent;        /* emitted to the session */
-    uint64_t objects_queued;      /* currently in the queue */
+    uint64_t objects_queued;      /* media accepted by write() and still
+                                     queued; excludes the private terminal
+                                     marker (see the note above) */
     uint64_t bytes_queued;        /* payload+properties bytes queued */
-    uint64_t objects_dropped;     /* discarded by a drop policy */
-    uint64_t groups_dropped;      /* whole groups discarded */
+    uint64_t objects_dropped;     /* queued media discarded: by a drop policy,
+                                     or by explicit lifecycle removal --
+                                     remove_track() / complete() */
+    uint64_t groups_dropped;      /* distinct (track, group) values from which
+                                     at least ONE queued media object was
+                                     discarded: several objects of one group
+                                     count once, two groups twice */
     uint64_t keyframes_dropped;
-    uint64_t groups_abandoned;    /* open subgroups RESET on the wire */
+    uint64_t groups_abandoned;    /* open wire subgroups actually driven through
+                                     the RESET lifecycle. A partially emitted
+                                     group can contribute to BOTH this and
+                                     groups_dropped -- they are two different
+                                     facts about it */
     uint64_t backpressure_stalls; /* BLOCK_TIMEOUT waits entered */
     moq_result_t last_error;      /* last non-OK write() return (0 = none) */
     /* Generated SAP event-timeline records aged out of the bounded history

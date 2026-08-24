@@ -1130,6 +1130,57 @@ int main(void)
         MOQ_TEST_PASS("catalog_update.wait_level_triggered_on_media_timeline");
     }
 
+    /* -- inbound identity validation on receiver ingest (0319 F3) --------- *
+     * A duplicate Namespace|Name tuple in an INDEPENDENT catalog is rejected
+     * before adoption (previously coalesced first-wins). Both CAT2 tracks are
+     * name-only, so two "a" entries are the same tuple. */
+    {
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        /* First catalog is unusable -> fatal, nothing adopted. */
+        ingest(r, 0, 0, CAT2(TRK("a", "video"), TRK("a", "audio")));
+        MOQ_TEST_CHECK(moq_media_receiver_test_is_fatal(r));
+        MOQ_TEST_CHECK((size_t)moq_media_receiver_test_track_count(r) == 0);
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.dup_identity_first_catalog_fatal");
+    }
+    {
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        ingest(r, 0, 0, CAT2(TRK("a", "video"), TRK("b", "audio")));
+        (void)drain(r, k, tr, 16);
+        uint64_t d0 = moq_media_receiver_test_catalog_drops(r);
+        size_t   tc0 = moq_media_receiver_test_track_count(r);
+        /* A LATER catalog with a duplicate tuple is a counted drop; the current
+         * effective is preserved and the receiver is not fatal. */
+        ingest(r, 1, 0, CAT2(TRK("x", "video"), TRK("x", "audio")));
+        MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_catalog_drops(r), d0 + 1);
+        MOQ_TEST_CHECK((size_t)moq_media_receiver_test_track_count(r) == tc0);
+        MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.dup_identity_later_drop");
+    }
+    {
+        /* Over-cap delta is refused through the receiver: the effective catalog
+         * is preserved and the drop is counted. The apply_delta_ex track cap
+         * (max_effective_tracks = max_stable_handles) refuses it before building
+         * the effective catalog; this coincides with the existing adopt cap, so
+         * the drop outcome is defense-in-depth (the cap's distinguishing proof
+         * is the msf-unit apply_delta_ex test). */
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        moq_media_receiver_test_set_limits(r, 2, 64, 16u * 1024u * 1024u);
+        ingest(r, 0, 0, CAT2(TRK("a", "video"), TRK("b", "audio")));   /* 2 == cap */
+        (void)drain(r, k, tr, 16);
+        uint64_t d0 = moq_media_receiver_test_catalog_drops(r);
+        size_t   tc0 = moq_media_receiver_test_track_count(r);
+        MOQ_TEST_CHECK(tc0 == 2);
+        ingest(r, 0, 1, "{\"deltaUpdate\":[{\"op\":\"add\",\"tracks\":["
+                        TRK("c", "video") "]}]}");
+        MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_catalog_drops(r), d0 + 1);
+        MOQ_TEST_CHECK((size_t)moq_media_receiver_test_track_count(r) == tc0);
+        MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.overcap_delta_refused");
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

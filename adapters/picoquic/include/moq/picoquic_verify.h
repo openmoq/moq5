@@ -15,21 +15,22 @@
  * is opaque), so this small helper wraps the picotls-OpenSSL verifier
  * and is the supported way for a cold consumer to enable verification.
  *
- * The moq_pico_wt_managed facade calls this itself to fail closed by
- * default (insecure_skip_verify=false), so a managed client is verified
- * with no extra steps. Use this helper directly only to customize that —
- * e.g. a private-CA trust store via the configure_quic hook, which runs
- * after the default verifier — or to verify a raw moq_pq_threaded client
- * (which does not install a default verifier).
+ * The moq_pico_wt_managed facade and the raw moq_pq_threaded client both
+ * call this themselves to fail closed by default (insecure_skip_verify=false),
+ * so a DEFAULT client is verified against the system trust store with NO
+ * configure_quic hook and no extra steps. Call this helper directly ONLY to
+ * customize that default — e.g. to pin a private CA — from the configure_quic
+ * hook, which runs after the automatic default verifier and transactionally
+ * replaces it. Passing a non-NULL PEM bundle path is what makes the hook do
+ * something the default does not; re-installing system trust with a NULL
+ * ca_file from the hook is redundant with the automatic default.
  *
- * Call it from the configure_quic callback of a managed facade — it runs
- * after the QUIC context is created and before any connection:
- *
- *   static int configure(picoquic_quic_t *quic, void *ctx) {
+ *   // Private-CA customization (the only reason to add the hook):
+ *   static int pin_private_ca(picoquic_quic_t *quic, void *ctx) {
  *       (void)ctx;
- *       return moq_picoquic_set_cert_verifier(quic, NULL);  // 0 = OK
+ *       return moq_picoquic_set_cert_verifier(quic, "/etc/moq/ca.pem"); // 0=OK
  *   }
- *   cfg.configure_quic = configure;   // moq_pq_threaded OR moq_pico_wt_managed
+ *   cfg.configure_quic = pin_private_ca;  // moq_pq_threaded OR pico WT managed
  *
  * Both moq_pq_threaded_cfg_t.configure_quic and
  * moq_pico_wt_managed_cfg_t.configure_quic take a picoquic_quic_t*, so
@@ -74,7 +75,10 @@ typedef struct st_picoquic_quic_t picoquic_quic_t;
  * QUIC context is destroyed. Do not call before picoquic_create.
  *
  * Returns 0 on success, -1 on error (bad args, CA file load failure, or
- * allocation failure); on error no verifier is installed.
+ * allocation failure). Transactional: the helper builds the trust store and
+ * verifier first and calls the picoquic setter only after both succeed, so on
+ * error the replacement verifier is NOT installed and any previously installed
+ * verifier remains unchanged.
  */
 MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
                                            const char *ca_file);

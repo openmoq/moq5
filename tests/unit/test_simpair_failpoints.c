@@ -295,8 +295,8 @@ int main(void)
     static const fp_expect_t k_sig[4] = {
         { FP_ALLOC, FP_SIZE_EXACT, 8, 0 },      /* canonical key */
         { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tracker (private) */
-        { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy */
-        { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* key array (private) */
+        { FP_ALLOC, FP_SIZE_ANY, 0, 0 },        /* tree node (private) */
+        { FP_ALLOC, FP_SIZE_SAME_AS, 0, 0 },    /* stored key copy (== key) */
     };
 
     /* No-fault baseline, run twice: exactly one byte-checked delivery and

@@ -243,17 +243,24 @@ constexpr object_terminal object_terminal_from_c(moq_object_terminal_t v) noexce
     return static_cast<object_terminal>(v);
 }
 
-enum class request_error : uint32_t {
+enum class request_error : uint64_t {
     internal_error             = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
     unauthorized               = MOQ_REQUEST_ERROR_UNAUTHORIZED,
     timeout                    = MOQ_REQUEST_ERROR_TIMEOUT,
     not_supported              = MOQ_REQUEST_ERROR_NOT_SUPPORTED,
+    malformed_auth_token       = MOQ_REQUEST_ERROR_MALFORMED_AUTH_TOKEN,
+    expired_auth_token         = MOQ_REQUEST_ERROR_EXPIRED_AUTH_TOKEN,
+    excessive_load             = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD,
+    malformed_track            = MOQ_REQUEST_ERROR_MALFORMED_TRACK,
+    uninterested               = MOQ_REQUEST_ERROR_UNINTERESTED,
+    namespace_too_large        = MOQ_REQUEST_ERROR_NAMESPACE_TOO_LARGE,
     going_away                 = MOQ_REQUEST_ERROR_GOING_AWAY,
     does_not_exist             = MOQ_REQUEST_ERROR_DOES_NOT_EXIST,
     invalid_range              = MOQ_REQUEST_ERROR_INVALID_RANGE,
     duplicate_subscription     = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION,
     prefix_overlap             = MOQ_REQUEST_ERROR_PREFIX_OVERLAP,
     invalid_joining_request_id = MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID,
+    unsupported_extension      = MOQ_REQUEST_ERROR_UNSUPPORTED_EXTENSION,
     redirect                   = MOQ_REQUEST_ERROR_REDIRECT,
 };
 

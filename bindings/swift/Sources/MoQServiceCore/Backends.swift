@@ -76,17 +76,27 @@ package enum TerminalFailure: Sendable, Equatable {
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package struct ReceiverPolledEvent: Sendable {
     package enum Kind: Sendable {
-        case added, updated, removed, ended, catalogReady
+        case added, updated, removed, ended, catalogReady, parseDrop
     }
     package var kind: Kind
     package var handleID: UInt64
     package var trackDescription: TrackDescription?
+    /* parseDrop only; ignored for other kinds. */
+    package var parseDropClass: ParseDropClass?
+    package var parseDropTotal: UInt64
+    package var parseDropDelta: UInt64
 
     package init(kind: Kind, handleID: UInt64,
-                 trackDescription: TrackDescription?) {
+                 trackDescription: TrackDescription?,
+                 parseDropClass: ParseDropClass? = nil,
+                 parseDropTotal: UInt64 = 0,
+                 parseDropDelta: UInt64 = 0) {
         self.kind = kind
         self.handleID = handleID
         self.trackDescription = trackDescription
+        self.parseDropClass = parseDropClass
+        self.parseDropTotal = parseDropTotal
+        self.parseDropDelta = parseDropDelta
     }
 }
 

@@ -422,6 +422,10 @@ endif()
 # MOQ_BUILD_EXAMPLES=OFF gives a library-only build (packaging /
 # cross-compiles); it also removes the tests that run example binaries.
 if(MOQ_BUILD_TESTS AND MOQ_BUILD_EXAMPLES)
+    # Header-only example support + its unit tests (terminal-safe output,
+    # example arg parsing). Pure C, no transport/service dependency.
+    add_subdirectory(examples/common)
+
     add_executable(publisher_example examples/publisher/main.c)
     target_link_libraries(publisher_example PRIVATE moq::core)
     add_test(NAME publisher_example COMMAND publisher_example)
@@ -545,6 +549,7 @@ if(MOQ_BUILD_ADAPTER_MVFST)
         "  endif()\n"
         "  enable_language(CXX)\n"
         "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake\")\n"
+        "  find_dependency(fmt CONFIG)\n"
         "  find_dependency(mvfst CONFIG)\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND TRUE)\n"
@@ -721,6 +726,7 @@ if(MOQ_BUILD_SERVICE)
             "    endif()\n"
             "    enable_language(CXX)\n"
             "    list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake\")\n"
+            "    find_dependency(fmt CONFIG)\n"
             "    find_dependency(mvfst CONFIG)\n"
             "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake\")\n"
             "  endif()\n")

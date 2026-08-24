@@ -29,6 +29,15 @@ int main()
     moq_alloc_t alloc = { nullptr, cpp_alloc, cpp_realloc, cpp_free };
 
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    /* The value-init lambda must stamp struct_size and zero every field, so
+     * appended fields default off without per-field maintenance as the struct
+     * grows: struct_size stamped, and the appended tail fields zeroed. */
+    if (cfg.struct_size != static_cast<std::uint32_t>(sizeof(cfg)))
+        return 10;
+    if (cfg.server_streaming_objects != false)
+        return 11;
+    if (cfg.server_max_open_subgroups != 0u)
+        return 12;
     cfg.alloc = &alloc;
     cfg.seed = 7;
     cfg.initial_now_us = 11;
