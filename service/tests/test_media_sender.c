@@ -206,14 +206,16 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
              * track's publication handle so its live generations (delivered
              * WITHOUT any SUBSCRIBE) can be captured below. */
             const moq_publish_request_event_t *pr = &ev.u.publish_request;
-            moq_accept_publish_cfg_t acc;
-            moq_accept_publish_cfg_init(&acc);
-            if (moq_session_accept_publish(session, pr->pub, &acc,
-                                           now_us) == MOQ_OK &&
+            const bool is_catalog =
                 pr->track_name.len == strlen(MOQ_MSF_CATALOG_TRACK_NAME) &&
                 memcmp(pr->track_name.data, MOQ_MSF_CATALOG_TRACK_NAME,
-                       pr->track_name.len) == 0) {
-                st->pub_cat = pr->pub;
+                       pr->track_name.len) == 0;
+            const moq_publication_t cand = pr->pub;
+            moq_accept_publish_cfg_t acc;
+            moq_accept_publish_cfg_init(&acc);
+            if (moq_session_accept_publish(session, cand, &acc,
+                                           now_us) == MOQ_OK && is_catalog) {
+                st->pub_cat = cand;
                 st->pub_cat_ok = true;
             }
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {

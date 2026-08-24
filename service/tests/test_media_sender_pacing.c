@@ -233,6 +233,7 @@ typedef struct {
     bool        accepted;     /* did this fixture answer it? */
     uint64_t    pub_opaque;   /* exact handle, DERIVED pre-ingress */
     uint64_t    track_alias;  /* exact alias, DERIVED pre-ingress */
+    bool        has_largest;  /* catalog only: PUBLISH follows the retained group */
 } pubreq_exp_t;
 typedef struct {
     int      pass;
@@ -988,7 +989,7 @@ static void expect_pub_requests(fix_t *fix, const pubreq_exp_t *exp, int n,
         MOQ_TEST_CHECK_EQ_SIZE(q->token_count, 0);
         MOQ_TEST_CHECK_EQ_SIZE(q->props_len, 0);
         MOQ_TEST_CHECK(!q->dynamic_groups);
-        MOQ_TEST_CHECK(!q->has_largest);
+        MOQ_TEST_CHECK(q->has_largest == exp[e].has_largest);
         MOQ_TEST_CHECK_EQ_U64(q->largest_group, 0);
         MOQ_TEST_CHECK_EQ_U64(q->largest_object, 0);
         MOQ_TEST_CHECK(!q->has_expires);
@@ -3462,13 +3463,13 @@ static void test_reset_partial_fanout(void)
      * EXACTLY the video one, so only that track fans out. */
     {
         /* Source-declared request ORDER decides which derived handle/alias
-         * belongs to which track: catalog first, then the media snapshot in
-         * add order (v, a). */
+         * belongs to which track: the media snapshot in add order (v, a), then
+         * the catalog, whose PUBLISH is sent after its retained group exists. */
         const pubreq_exp_t preq[3] = {
+            { "v", true,  fix.exp_pub_handle[0], fix.exp_pub_alias[0] },
+            { "a", false, fix.exp_pub_handle[1], fix.exp_pub_alias[1] },
             { MOQ_MSF_CATALOG_TRACK_NAME, false,
-              fix.exp_pub_handle[0], fix.exp_pub_alias[0] },
-            { "v", true,  fix.exp_pub_handle[1], fix.exp_pub_alias[1] },
-            { "a", false, fix.exp_pub_handle[2], fix.exp_pub_alias[2] },
+              fix.exp_pub_handle[2], fix.exp_pub_alias[2], true },
         };
         expect_pub_requests(&fix, preq, 3, "fanout-publish-requests");
     }

@@ -413,6 +413,7 @@ struct moq_media_sender {
      * on every generation commit so a real mutation resets the cadence. */
     uint64_t          catalog_refresh_interval_us;
     uint64_t          catalog_refresh_deadline_us;
+    bool              catalog_had_demand;
     /* Cached next service-deadline for the managed-adapter wake query, recomputed
      * at the end of every sender_hook (where facade access is legal) and read by
      * sender_next_deadline_us as a pure scalar under s->mu -- so the deadline the
@@ -2059,6 +2060,11 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
             (void)sender_stage_generation(s);   /* stages, no-op dedups, or fatal */
             if (s->fatal) { pthread_mutex_unlock(&s->mu); return; }
         }
+        bool cat_demand = sender_track_demand(s, s->catalog_track);
+        if (cat_demand != s->catalog_had_demand) {
+            s->catalog_had_demand = cat_demand;
+            if (cat_demand) sender_arm_refresh(s, now_us);
+        }
         /* No mutation generation this cycle (dedup, or nothing was dirty): if a
          * periodic refresh is due AND the catalog has demand, stage exactly one
          * independent refresh. No demand -> no refresh / no group advance. Never
@@ -2066,7 +2072,7 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
          * pending_obj_count > 0, skipping this). */
         if (s->pending_obj_count == 0 &&
             sender_refresh_due(s, now_us) &&
-            sender_track_demand(s, s->catalog_track)) {
+            cat_demand) {
             (void)sender_stage_refresh(s);
             if (s->fatal) { pthread_mutex_unlock(&s->mu); return; }
         }
@@ -2410,17 +2416,6 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
         }
-        /* PUBLISH the catalog track (media tracks are published in
-         * sender_add_pub_track below). */
-        if (s->publish_tracks) {
-            moq_pub_publish_cfg_t cpcfg;
-            moq_pub_publish_cfg_init(&cpcfg);
-            if (moq_pub_publish_track(s->pub, s->catalog_track->pub_track,
-                                      &cpcfg, now_us) != MOQ_OK) {
-                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-                return;
-            }
-        }
 
         /* Walk a snapshot so a concurrent app-thread realloc of s->tracks cannot
          * free the vector mid-walk; the per-track registration below takes s->mu
@@ -2489,6 +2484,16 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         s->published_catalog = json;
         s->catalog_group = 0;
         s->catalog_published = true;
+
+        if (s->publish_tracks) {
+            moq_pub_publish_cfg_t cpcfg;
+            moq_pub_publish_cfg_init(&cpcfg);
+            if (moq_pub_publish_track(s->pub, s->catalog_track->pub_track,
+                                      &cpcfg, now_us) != MOQ_OK) {
+                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                return;
+            }
+        }
         /* Start the automatic-refresh clock from the initial catalog install. */
         sender_arm_refresh(s, now_us);
         /* Record the initial catalog's track set as the published baseline. */
@@ -2533,7 +2538,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         ocfg.end_of_group = true;
         moq_result_t wrc = moq_pub_write_object_ex(
             s->pub, s->catalog_track->pub_track, &ocfg, now_us);
-        if (wrc == MOQ_OK)
+        if (wrc == MOQ_OK && sender_track_demand(s, s->catalog_track))
             s->live_catalog_sent = true;
     }
 

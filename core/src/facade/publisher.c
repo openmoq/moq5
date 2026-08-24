@@ -1851,6 +1851,9 @@ static moq_result_t track_install_retained(moq_pub_track_t *t, uint64_t group_id
     t->retained_group_id = group_id;
     t->has_retained = true;
     t->wrote_object = false;   /* retained group is now the latest published loc */
+    if (retained_can_advertise_largest(t))
+        track_hist_merge(t->hist, group_id,
+                         pub_track_retained_last_object_id(t));
     return MOQ_OK;
 }
 
