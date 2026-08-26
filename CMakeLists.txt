@@ -7,6 +7,8 @@ project(libmoq
 )
 
 # -- Build options --------------------------------------------------
+include(CMakeDependentOption)
+
 option(MOQ_BUILD_TESTS             "Build test suite"               ON)
 option(MOQ_BUILD_SIM               "Build moq-sim"                  ${MOQ_BUILD_TESTS})
 option(MOQ_BUILD_ADAPTER_PICOQUIC  "Build picoquic adapter"         OFF)
@@ -15,6 +17,8 @@ option(MOQ_BUILD_LOC               "Build moq-loc LOC helpers"      ON)
 option(MOQ_BUILD_MSF               "Build moq-msf catalog parser"   OFF)
 option(MOQ_BUILD_CMAF              "Build moq-cmaf segment parser"  ON)
 option(MOQ_BUILD_CODEC_SIGNALING   "Build the codec-signaling helpers" ON)
+cmake_dependent_option(MOQ_BUILD_CMAF_PACKAGER
+    "Build moq-cmaf-packager CMAF writer" ON "MOQ_BUILD_CMAF" OFF)
 if(MOQ_BUILD_LOC AND MOQ_BUILD_CMAF)
     set(_MOQ_MEDIA_OBJECT_DEFAULT ON)
 else()
@@ -103,6 +107,10 @@ endif()
 # -- Codec-signaling helpers ----------------------------------------
 if(MOQ_BUILD_CODEC_SIGNALING)
     add_subdirectory(media/codec_signaling)
+endif()
+# -- CMAF packager (write side of media/cmaf) -----------------------
+if(MOQ_BUILD_CMAF_PACKAGER)
+    add_subdirectory(media/cmaf_packager)
 endif()
 
 # -- Media object normalizer ----------------------------------------
@@ -355,6 +363,9 @@ if(MOQ_BUILD_MSF)
 endif()
 if(MOQ_BUILD_MEDIA_OBJECT)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-media-object")
+endif()
+if(MOQ_BUILD_CMAF_PACKAGER)
+    string(APPEND LIBMOQ_PC_LIBS " -lmoq-cmaf-packager")
 endif()
 if(MOQ_BUILD_CMAF)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-cmaf")
