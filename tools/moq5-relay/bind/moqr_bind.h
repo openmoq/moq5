@@ -353,6 +353,11 @@ uint32_t moqr_bind_debug_conn_open_sgs(const moqr_bind_t *b, uint32_t slot);
 /* Test-only: the RESOLVED conn-slot capacity (diagnostic sweeps iterate
  * exactly this range, never a hard-coded bound). */
 uint32_t moqr_bind_debug_max_conns(const moqr_bind_t *b);
+
+/* Test-only: number of retry helpers that hit WOULD_BLOCK while the bind-owned
+ * intent scratch was already active and therefore had to defer to the caller's
+ * normal retry path instead of draining recursively. */
+uint64_t moqr_bind_debug_intent_retry_suppressed(const moqr_bind_t *b);
 #endif
 
 #endif /* MOQR_BIND_H */

@@ -43,6 +43,11 @@ moqr_latency_observe(moqr_latency_hist_t *h, uint64_t latency_us)
 /* d16 MAX_REQUEST_ID grant step (request-id units). Each grant raises the
  * ceiling by this; the peer keeps ~half a window of headroom. */
 #define BIND_DEF_GRANT_WINDOW 1024u
+/* Fixed pump work batches. Storage is bind-owned, not automatic, so embedded
+ * callers do not inherit a hidden multi-KiB moqr_bind_pump() frame. */
+#define BIND_PUMP_EVENT_BATCH 16u
+#define BIND_PUMP_REVOKED_BATCH 16u
+#define BIND_PUMP_INTENT_BATCH 32u
 
 typedef struct b_dsub {
     bool       used;
@@ -203,6 +208,11 @@ struct moqr_bind {
      * 256-delivery guard with work remaining; cleared at the next pump's
      * start. Read through moqr_bind_pump_budget_pending. */
     bool         budget_pending;
+    bool         in_pump;   /* non-reentrant: one owner thread pumps a bind */
+    bool         intent_drain_active;
+#ifdef MOQR_BIND_TESTING
+    uint64_t     dbg_intent_retry_suppressed;
+#endif
     b_conn_t    *conns;
     /* Phase F delivery scheduling (bind is the only writer of both):
      * dl_ready is filled from moqr_core_drain_ready and self-rearms
@@ -211,6 +221,9 @@ struct moqr_bind {
      * ceil(max_conns/64) words each. */
     uint64_t    *dl_ready;
     uint64_t    *dl_parked;
+    moq_event_t *pump_events;
+    moqr_revoked_grant_t *pump_revoked;
+    moqr_intent_t *pump_intents;
     uint64_t     events_translated;
     uint64_t     deliveries_written;
     uint64_t     ingest_refusals;
@@ -604,6 +617,12 @@ moqr_bind_debug_max_conns(const moqr_bind_t *b)
     return b != NULL ? b->max_conns : 0u;
 }
 
+uint64_t
+moqr_bind_debug_intent_retry_suppressed(const moqr_bind_t *b)
+{
+    return b != NULL ? b->dbg_intent_retry_suppressed : 0u;
+}
+
 /* Test-only scheduling-state dump for one conn slot. Out-of-range slots
  * report a zeroed state (the SGDIAG sweep probes a fixed slot range). */
 void
@@ -708,6 +727,15 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
         out->structure_bytes,
         moqr_cap_mul(2u * (uint64_t)bind_dl_word_count(bl.max_conns),
                      sizeof(uint64_t)));
+    out->structure_bytes = moqr_cap_add(
+        out->structure_bytes,
+        moqr_cap_add(moqr_cap_mul(BIND_PUMP_EVENT_BATCH,
+                                  sizeof(moq_event_t)),
+                     moqr_cap_add(
+                         moqr_cap_mul(BIND_PUMP_REVOKED_BATCH,
+                                      sizeof(moqr_revoked_grant_t)),
+                         moqr_cap_mul(BIND_PUMP_INTENT_BATCH,
+                                      sizeof(moqr_intent_t)))));
     uint64_t ann_slots = moqr_cap_mul(bl.max_conns, bl.n_anns);
     if (ann_slots > lim->max_ns_nodes) {
         ann_slots = lim->max_ns_nodes;
@@ -838,6 +866,30 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         }
         memset(b->dl_ready, 0, dw);
         memset(b->dl_parked, 0, dw);
+    }
+    b->pump_events =
+        b->alloc.alloc((size_t)BIND_PUMP_EVENT_BATCH *
+                           sizeof(*b->pump_events),
+                       b->alloc.ctx);
+    if (b->pump_events == NULL) {
+        moqr_bind_destroy(b);
+        return MOQR_ERR_NOMEM;
+    }
+    b->pump_revoked =
+        b->alloc.alloc((size_t)BIND_PUMP_REVOKED_BATCH *
+                           sizeof(*b->pump_revoked),
+                       b->alloc.ctx);
+    if (b->pump_revoked == NULL) {
+        moqr_bind_destroy(b);
+        return MOQR_ERR_NOMEM;
+    }
+    b->pump_intents =
+        b->alloc.alloc((size_t)BIND_PUMP_INTENT_BATCH *
+                           sizeof(*b->pump_intents),
+                       b->alloc.ctx);
+    if (b->pump_intents == NULL) {
+        moqr_bind_destroy(b);
+        return MOQR_ERR_NOMEM;
     }
     for (uint32_t i = 0; i < b->max_conns; i++) {
         b_conn_t *cn = &b->conns[i];
@@ -1161,6 +1213,14 @@ bind_defer_push_nsu(moqr_bind_t *b, const moqr_intent_t *it)
 static bool
 bind_execute_intents(moqr_bind_t *b, uint64_t now_us)
 {
+    if (b->intent_drain_active) {
+#ifdef MOQR_BIND_TESTING
+        b->dbg_intent_retry_suppressed++;
+#endif
+        return false;
+    }
+    b->intent_drain_active = true;
+
     /* 1. Retry parked scalars first, in FIFO order. Stop retrying at the first
      *    that still blocks (nothing behind it may overtake it), but fall
      *    through to step 2 so borrowed intents newly in the ring are still
@@ -1192,17 +1252,18 @@ bind_execute_intents(moqr_bind_t *b, uint64_t now_us)
      *    deep-copied into the slot's sidecar. Both those and scalar intents
      *    park once anything is blocked (order), else execute and park only if
      *    they themselves block. */
-    moqr_intent_t its[32];
     size_t n;
-    while ((n = moqr_core_poll_intents(b->core, its, 32)) > 0) {
+    while ((n = moqr_core_poll_intents(b->core, b->pump_intents,
+                                       BIND_PUMP_INTENT_BATCH)) > 0) {
         for (size_t i = 0; i < n; i++) {
-            bool is_nsu = its[i].kind == MOQR_INTENT_NS_FOUND ||
-                          its[i].kind == MOQR_INTENT_NS_GONE;
-            if (!bind_intent_deferrable(its[i].kind) && !is_nsu) {
+            moqr_intent_t *it = &b->pump_intents[i];
+            bool is_nsu = it->kind == MOQR_INTENT_NS_FOUND ||
+                          it->kind == MOQR_INTENT_NS_GONE;
+            if (!bind_intent_deferrable(it->kind) && !is_nsu) {
                 /* Router-only / consume-in-pump kinds (UPSTREAM_SUBSCRIBE):
                  * they own no per-session output order to preserve. */
                 moqr_intent_t tw;
-                (void)bind_try_intent(b, &its[i], now_us, BIND_TRY_FRESH, NULL,
+                (void)bind_try_intent(b, it, now_us, BIND_TRY_FRESH, NULL,
                                       &tw);
                 continue;
             }
@@ -1212,16 +1273,16 @@ bind_execute_intents(moqr_bind_t *b, uint64_t now_us)
                  * already parked. */
                 if (is_nsu) {
                     moqr_intent_t tw;
-                    (void)bind_try_intent(b, &its[i], now_us,
+                    (void)bind_try_intent(b, it, now_us,
                                           BIND_TRY_FORCE_PARK, NULL, &tw);
-                } else if (!bind_defer_push(b, &its[i])) {
-                    bind_ordered_overflow_close(b, &its[i], now_us);
+                } else if (!bind_defer_push(b, it)) {
+                    bind_ordered_overflow_close(b, it, now_us);
                 }
                 continue;
             }
             moqr_intent_t defer;
             bool parked = false;
-            if (!bind_try_intent(b, &its[i], now_us, BIND_TRY_FRESH, &parked,
+            if (!bind_try_intent(b, it, now_us, BIND_TRY_FRESH, &parked,
                                  &defer)) {
                 if (!bind_defer_push(b, &defer)) {
                     bind_ordered_overflow_close(b, &defer, now_us);
@@ -1234,6 +1295,7 @@ bind_execute_intents(moqr_bind_t *b, uint64_t now_us)
             }
         }
     }
+    b->intent_drain_active = false;
     return !blocked;
 }
 
@@ -1272,16 +1334,34 @@ bind_pending_purge_conn(moqr_bind_t *b, uint64_t binding_cookie)
     b->pending_count = kept;
 }
 
+static bool
+bind_retry_may_drain_intents(moqr_bind_t *b)
+{
+    if (b->intent_drain_active) {
+#ifdef MOQR_BIND_TESTING
+        b->dbg_intent_retry_suppressed++;
+#endif
+        return false;
+    }
+    return true;
+}
+
 /* A core call that queues intents may return WOULD_BLOCK when the ring is
  * momentarily full (leftover intents from earlier in the same pump). The
  * core's atomicity invariant guarantees any single fan-out fits an EMPTY
- * ring, so executing the pending intents (a full drain) and retrying
- * always makes progress. Evaluate the expression, draining+retrying up to
- * a small bound; assign the final result to `dst`. */
+ * ring, so executing the pending intents (a full drain) and retrying makes
+ * progress outside an already-active drain. During an intent drain, preserve
+ * WOULD_BLOCK for the caller-specific defer path instead of recursively
+ * reusing b->pump_intents and overwriting the outer batch. Evaluate the
+ * expression, draining+retrying up to a small bound; assign the final result
+ * to `dst`. */
 #define BIND_CALL_RETRY(dst, expr)                                        \
     do {                                                                  \
         (dst) = (expr);                                                   \
         for (int _r = 0; (dst) == MOQR_ERR_WOULD_BLOCK && _r < 8; _r++) { \
+            if (!bind_retry_may_drain_intents(b)) {                       \
+                break;                                                    \
+            }                                                             \
             (void)bind_execute_intents(b, now_us);                        \
             (dst) = (expr);                                               \
         }                                                                 \
@@ -1546,6 +1626,21 @@ moqr_bind_destroy(moqr_bind_t *b)
         if (b->dl_parked != NULL) {
             a.free(b->dl_parked, dw, a.ctx);
         }
+    }
+    if (b->pump_intents != NULL) {
+        a.free(b->pump_intents,
+               (size_t)BIND_PUMP_INTENT_BATCH * sizeof(*b->pump_intents),
+               a.ctx);
+    }
+    if (b->pump_revoked != NULL) {
+        a.free(b->pump_revoked,
+               (size_t)BIND_PUMP_REVOKED_BATCH * sizeof(*b->pump_revoked),
+               a.ctx);
+    }
+    if (b->pump_events != NULL) {
+        a.free(b->pump_events,
+               (size_t)BIND_PUMP_EVENT_BATCH * sizeof(*b->pump_events),
+               a.ctx);
     }
     if (b->nsu != NULL) {
         for (uint32_t i = 0; i < b->nsu_cap; i++) {
@@ -4176,6 +4271,11 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
     if (b == NULL) {
         return MOQR_ERR_INVAL;
     }
+    if (b->in_pump || b->pump_events == NULL || b->pump_revoked == NULL ||
+        b->pump_intents == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    b->in_pump = true;
     /* Per-pump flag, not sticky: a pass below reports it when the
      * 256-delivery guard expired with work remaining — the ONE outcome
      * whose leftover work no future event re-signals AND whose retry needs
@@ -4187,12 +4287,13 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         if (!cn->used || cn->closed) {
             continue;
         }
-        moq_event_t evs[16];
         size_t n;
         while (cn->used && !cn->closed &&
-               (n = moq_session_poll_events(cn->session, evs, 16)) > 0) {
+               (n = moq_session_poll_events(cn->session, b->pump_events,
+                                            BIND_PUMP_EVENT_BATCH)) > 0) {
             for (size_t e = 0; e < n; e++) {
-                if (bind_event_is_request(evs[e].kind)) {
+                moq_event_t *ev = &b->pump_events[e];
+                if (bind_event_is_request(ev->kind)) {
                     cn->requests_seen++;
                 }
                 /* A fail-close mid-batch must stop translation immediately —
@@ -4201,9 +4302,9 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
                  * this conn, including the remainder of THIS batch, may be
                  * ingested. */
                 if (cn->used && !cn->closed) {
-                    bind_on_event(b, cn, &evs[e], now_us);
+                    bind_on_event(b, cn, ev, now_us);
                 }
-                moq_event_cleanup(&evs[e]);
+                moq_event_cleanup(ev);
             }
         }
         /* Re-check the grant every pump (not only when events arrive): a peer
@@ -4225,49 +4326,55 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
      * so a backpressured cancel is never lost. A revoked grant on a gone/closed
      * conn is acked with no wire cancel (never act on a torn-down session).
      * Peek is non-draining, so this is a single bounded pass, not a while-loop. */
-    moqr_revoked_grant_t rev[16];
-    size_t rn = moqr_core_peek_revoked_grants(b->core, rev, 16);
+    size_t rn = moqr_core_peek_revoked_grants(b->core, b->pump_revoked,
+                                              BIND_PUMP_REVOKED_BATCH);
     for (size_t k = 0; k < rn; k++) {
-        if (rev[k].binding_cookie == 0 ||
-            rev[k].binding_cookie - 1u >= b->max_conns) {
-            moqr_core_ack_revoked_grant(b->core, rev[k].binding_cookie,
-                                        rev[k].session_cookie);
+        moqr_revoked_grant_t *rev = &b->pump_revoked[k];
+        if (rev->binding_cookie == 0 ||
+            rev->binding_cookie - 1u >= b->max_conns) {
+            moqr_core_ack_revoked_grant(b->core, rev->binding_cookie,
+                                        rev->session_cookie);
             continue;
         }
-        b_conn_t *rcn = &b->conns[rev[k].binding_cookie - 1u];
+        b_conn_t *rcn = &b->conns[rev->binding_cookie - 1u];
         if (!rcn->used || rcn->closed || rcn->session == NULL) {
-            moqr_core_ack_revoked_grant(b->core, rev[k].binding_cookie,
-                                        rev[k].session_cookie);
+            moqr_core_ack_revoked_grant(b->core, rev->binding_cookie,
+                                        rev->session_cookie);
             continue;
         }
         moq_cancel_namespace_cfg_t ccfg;
         moq_cancel_namespace_cfg_init(&ccfg);
-        ccfg.error_code = rev[k].error_code;
+        ccfg.error_code = rev->error_code;
         moq_result_t crc = moq_session_cancel_namespace(
             rcn->session,
-            (moq_announcement_t){ ._opaque = rev[k].session_cookie }, &ccfg,
+            (moq_announcement_t){ ._opaque = rev->session_cookie }, &ccfg,
             now_us);
         if (crc == MOQ_OK) {
-            moqr_core_ack_revoked_grant(b->core, rev[k].binding_cookie,
-                                        rev[k].session_cookie);
+            moqr_core_ack_revoked_grant(b->core, rev->binding_cookie,
+                                        rev->session_cookie);
         } else if (crc != MOQ_ERR_WOULD_BLOCK) {
             /* A hard error (e.g. wrong state) can never succeed on retry: drop
              * it rather than spin forever, and record the anomaly. */
             b->session_errors++;
-            moqr_core_ack_revoked_grant(b->core, rev[k].binding_cookie,
-                                        rev[k].session_cookie);
+            moqr_core_ack_revoked_grant(b->core, rev->binding_cookie,
+                                        rev->session_cookie);
         }
         /* WOULD_BLOCK: leave the grant peekable; retried on the next pump. */
     }
     (void)bind_execute_intents(b, now_us);
     /* Retry closes that blocked on intent space (the ring is drained). */
+    bool detach_retried = false;
     for (uint32_t i = 0; i < b->max_conns; i++) {
         b_conn_t *cn = &b->conns[i];
         if (cn->used && cn->detach_pending) {
             cn->closed = false;
             cn->detach_pending = false;
             conn_detach(b, cn, now_us);
+            detach_retried = true;
         }
+    }
+    if (detach_retried) {
+        (void)bind_execute_intents(b, now_us);
     }
     /* Hold delivery while an output intent is still parked: an object must
      * never overtake the ACCEPT/REJECT/DONE queued ahead of it. The backlog
@@ -4399,6 +4506,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             }
         }
     }
+    b->in_pump = false;
     return MOQR_OK;
 }
 

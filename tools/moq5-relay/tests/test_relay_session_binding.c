@@ -3903,6 +3903,266 @@ borrowed_intent_never_parked(void)
     return f;
 }
 
+#define REENTRY_NS_WATCHERS 33u
+#define REENTRY_STATUS_INTENTS 33u
+#define REENTRY_STATUS_COOKIE_BASE 0x4E700000u
+
+typedef struct intent_reentry_router_rec {
+    uint64_t status_cookie[REENTRY_STATUS_INTENTS + 4u];
+    uint32_t status_n;
+    uint32_t ns_found;
+    uint32_t ns_gone;
+    uint32_t other;
+    char     order[96];
+    uint32_t order_len;
+} intent_reentry_router_rec_t;
+
+static void
+intent_reentry_router_reset(intent_reentry_router_rec_t *rec)
+{
+    memset(rec, 0, sizeof(*rec));
+}
+
+static void
+intent_reentry_router_mark(intent_reentry_router_rec_t *rec, char c)
+{
+    if (rec->order_len + 1u < sizeof(rec->order)) {
+        rec->order[rec->order_len++] = c;
+        rec->order[rec->order_len] = '\0';
+    }
+}
+
+static bool
+intent_reentry_router(void *ctx, const moqr_intent_t *it, uint64_t now_us)
+{
+    (void)now_us;
+    intent_reentry_router_rec_t *rec = ctx;
+    switch (it->kind) {
+    case MOQR_INTENT_TRACK_STATUS_ERROR:
+        if (rec->status_n <
+            (uint32_t)(sizeof(rec->status_cookie) /
+                       sizeof(rec->status_cookie[0]))) {
+            rec->status_cookie[rec->status_n] = it->cookie;
+        }
+        rec->status_n++;
+        intent_reentry_router_mark(rec, 'E');
+        break;
+    case MOQR_INTENT_NS_FOUND:
+        rec->ns_found++;
+        intent_reentry_router_mark(rec, 'N');
+        break;
+    case MOQR_INTENT_NS_GONE:
+        rec->ns_gone++;
+        intent_reentry_router_mark(rec, 'G');
+        break;
+    default:
+        rec->other++;
+        intent_reentry_router_mark(rec, '?');
+        break;
+    }
+    return true;
+}
+
+static moqr_result_t
+intent_reentry_rig_create(rig_t *r, ca_t *a,
+                          intent_reentry_router_rec_t *rec)
+{
+    memset(r, 0, sizeof(*r));
+    r->alloc = a;
+    r->now = 1;
+    if (moqr_trace_create(&a->vt, 512, &r->trace) != MOQR_OK) {
+        return MOQR_ERR_NOMEM;
+    }
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a->vt);
+    cfg.trace = r->trace;
+    cfg.max_bindings = 80;
+    cfg.max_tracks = 4;
+    cfg.max_subs = 2;
+    cfg.max_ns_nodes = 8;
+    cfg.max_ns_subs = REENTRY_NS_WATCHERS;
+    cfg.max_intents = REENTRY_STATUS_INTENTS + 1u;
+    cfg.log_budget.max_groups = 4;
+    cfg.log_budget.max_bytes = 1u << 20;
+    cfg.linger_us = 500;
+    if (moqr_core_create(&cfg, &r->core) != MOQR_OK) {
+        moqr_trace_destroy(r->trace);
+        return MOQR_ERR_NOMEM;
+    }
+    moqr_bind_cfg_t bcfg;
+    moqr_bind_cfg_init_sized(&bcfg, sizeof(bcfg), &a->vt);
+    bcfg.core = r->core;
+    bcfg.max_conns = MAX_CONNS;
+    bcfg.max_downstream_subs = 2;
+    bcfg.max_upstream_subs = 2;
+    bcfg.max_publishes = 2;
+    bcfg.max_announces = 2;
+    bcfg.max_open_subgroups = 4;
+    bcfg.router = intent_reentry_router;
+    bcfg.router_ctx = rec;
+    if (moqr_bind_create(&bcfg, &r->bind) != MOQR_OK) {
+        moqr_core_destroy(r->core);
+        moqr_trace_destroy(r->trace);
+        return MOQR_ERR_NOMEM;
+    }
+    moqr_core_limits_t lim;
+    moqr_core_get_limits(r->core, &lim);
+    R_CHECK(r, lim.max_intents == REENTRY_STATUS_INTENTS + 1u);
+    R_CHECK(r, lim.max_ns_subs == REENTRY_NS_WATCHERS);
+    return MOQR_OK;
+}
+
+static void
+intent_reentry_install_watchers(rig_t *r, moqr_binding_t watchers[])
+{
+    moq_bytes_t pfx[1] = { B("dead") };
+    moqr_ns_t prefix = { .parts = pfx, .count = 1 };
+    for (uint32_t i = 0; i < REENTRY_NS_WATCHERS; i++) {
+        uint64_t cookie = MOQR_SHARD_COOKIE_BASE + 0x100u + i;
+        R_CHECK(r, moqr_core_binding_open(r->core, cookie, &watchers[i]) ==
+                       MOQR_OK);
+        R_CHECK(r, moqr_core_ns_subscribe(r->core, watchers[i], prefix,
+                                          0xD000u + i) == MOQR_OK);
+    }
+}
+
+/* The bind-owned intent scratch must not be reused by a retry helper while an
+ * outer intent batch is live. This drives the real path:
+ *   SUB_DONE -> injected reset failure -> conn_detach -> binding_close WOULD_BLOCK
+ * because the core ring still holds the tail of the outer batch and the closing
+ * connection owns a namespace with a 33-watcher NS_GONE fanout. The old shared
+ * scratch recursively polled that tail into b->pump_intents, overwriting the
+ * outer batch; status cookie 0 was skipped and the tail duplicated. */
+static int
+intent_retry_reentry_preserves_outer_batch(void)
+{
+    ca_t a;
+    ca_init(&a);
+    intent_reentry_router_rec_t rec;
+    intent_reentry_router_reset(&rec);
+    g_test_server_streaming_objects = true;
+    g_test_client_streaming_objects = true;
+    rig_t rig;
+    if (intent_reentry_rig_create(&rig, &a, &rec) != MOQR_OK) {
+        g_test_server_streaming_objects = false;
+        g_test_client_streaming_objects = false;
+        printf("FAIL: intent_retry_reentry rig create\n");
+        return 1;
+    }
+    conn_t *pub = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *sub = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    g_test_server_streaming_objects = false;
+    g_test_client_streaming_objects = false;
+    R_CHECK(&rig, pub && sub);
+    rig_pump(&rig, 4);
+
+    moqr_binding_t watchers[REENTRY_NS_WATCHERS];
+    intent_reentry_install_watchers(&rig, watchers);
+
+    /* The future closing connection owns a namespace observed only through the
+     * router. Its close therefore has a large, deterministic NS_GONE fanout. */
+    moq_bytes_t dead[2] = { B("dead"), B("owned") };
+    moq_publish_namespace_cfg_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = dead, .count = 2 };
+    moq_announcement_t dead_ann;
+    R_CHECK(&rig, moq_session_publish_namespace(sub->peer, &pcfg, rig.now,
+                                                &dead_ann) == MOQ_OK);
+    rig_pump(&rig, 12);
+    R_CHECK(&rig, rec.ns_found == REENTRY_NS_WATCHERS);
+    R_CHECK(&rig, rec.ns_gone == 0);
+    peer_state_t sub_ctrl;
+    memset(&sub_ctrl, 0, sizeof(sub_ctrl));
+    peer_drain(&rig, sub, &sub_ctrl, false, false, 0, 0);
+    R_CHECK(&rig, sub_ctrl.namespace_accepted);
+    intent_reentry_router_reset(&rec);
+
+    /* The same connection is also a downstream subscriber with a begun subgroup,
+     * so SUB_DONE's reset failure closes that namespace-owning binding. */
+    peer_state_t pub_ps, sub_ps;
+    memset(&pub_ps, 0, sizeof(pub_ps));
+    memset(&sub_ps, 0, sizeof(sub_ps));
+    moq_bytes_t live[2] = { B("live"), B("cam1") };
+    reval_make_subscribe_grant(&rig, pub, sub, &pub_ps, &sub_ps, live);
+    R_CHECK(&rig, !sub_ps.done_seen);
+
+    moq_subgroup_cfg_t sca;
+    moq_subgroup_cfg_init(&sca);
+    sca.group_id = 1;
+    sca.subgroup_id = 0;
+    moq_subgroup_handle_t sga;
+    R_CHECK(&rig, moq_session_open_subgroup(pub->peer, pub_ps.up_sub, &sca,
+                                            rig.now, &sga) == MOQ_OK);
+    R_CHECK(&rig, moq_session_begin_object(pub->peer, sga, 0, 96, rig.now) ==
+                      MOQ_OK);
+    {
+        uint8_t body[32];
+        memset(body, 0xC5, sizeof(body));
+        moq_rcbuf_t *pl = NULL;
+        R_CHECK(&rig, moq_rcbuf_create(&a.vt, body, sizeof(body), &pl) ==
+                          MOQ_OK);
+        R_CHECK(&rig,
+                moq_session_write_object_data(pub->peer, sga, pl, rig.now) ==
+                    MOQ_OK);
+        moq_rcbuf_decref(pl);
+    }
+    rig_pump(&rig, 8);
+    peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
+    R_CHECK(&rig, sub_ps.chunks >= 1);
+
+    uint32_t up_slot = 0;
+    uint64_t up_handle = 0;
+    R_CHECK(&rig, moqr_bind_debug_first_usub(rig.bind, &up_slot, &up_handle));
+    moqr_bind_debug_fail_sg_reset(1);
+    uint64_t suppressed0 =
+        moqr_bind_debug_intent_retry_suppressed(rig.bind);
+    moqr_bind_debug_upstream_terminated(rig.bind, up_slot,
+                                        MOQ_REQUEST_FAMILY_SUBSCRIBE,
+                                        up_handle, 0, rig.now);
+
+    moq_bytes_t miss_ns_part[1] = { B("missing") };
+    moqr_ns_t miss_ns = { .parts = miss_ns_part, .count = 1 };
+    for (uint32_t i = 0; i < REENTRY_STATUS_INTENTS; i++) {
+        R_CHECK(&rig, moqr_core_track_status(
+                          rig.core, watchers[i], miss_ns, B("track"),
+                          REENTRY_STATUS_COOKIE_BASE + i) == MOQR_OK);
+    }
+    moqr_core_stats_t cs;
+    moqr_core_get_stats(rig.core, &cs);
+    R_CHECK(&rig, cs.intent_highwater >= REENTRY_STATUS_INTENTS + 1u);
+
+    rig.now += 1000;
+    (void)moqr_bind_pump(rig.bind, rig.now);
+
+    uint64_t suppressed1 =
+        moqr_bind_debug_intent_retry_suppressed(rig.bind);
+    R_CHECK(&rig, suppressed1 == suppressed0 + 1u);
+    R_CHECK(&rig, rec.status_n == REENTRY_STATUS_INTENTS);
+    for (uint32_t i = 0; i < REENTRY_STATUS_INTENTS &&
+                         i < rec.status_n; i++) {
+        R_CHECK(&rig, rec.status_cookie[i] == REENTRY_STATUS_COOKIE_BASE + i);
+    }
+    R_CHECK(&rig, rec.ns_gone == REENTRY_NS_WATCHERS);
+    R_CHECK(&rig, rec.other == 0);
+    for (uint32_t i = 0; i < rec.status_n && i < sizeof(rec.order); i++) {
+        if (i < REENTRY_STATUS_INTENTS) {
+            R_CHECK(&rig, rec.order[i] == 'E');
+        }
+    }
+    R_CHECK(&rig, rec.order_len == REENTRY_STATUS_INTENTS +
+                                  REENTRY_NS_WATCHERS);
+
+    moqr_bind_debug_fail_sg_reset(0);
+    rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    int f = rig.failures;
+    if (f == 0) {
+        printf("PASS: intent_retry_reentry_preserves_outer_batch\n");
+    }
+    return f;
+}
+
 /* -- Downstream subgroup-slot reclamation ----------------------------------- */
 
 /* Publish one object on a FRESH subgroup stream (group, subgroup), then close
@@ -12072,6 +12332,7 @@ main(void)
     failures += long_lived_request_credit(MOQ_VERSION_DRAFT_18, 0);
     failures += long_lived_request_credit(MOQ_VERSION_DRAFT_16, 1);
     failures += borrowed_intent_never_parked();
+    failures += intent_retry_reentry_preserves_outer_batch();
     failures += subgroup_slot_reclamation();
     failures += subgroup_reclamation_shapes();
     failures += subgroup_eviction_spares_live_lower_group();

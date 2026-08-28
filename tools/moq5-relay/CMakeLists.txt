@@ -219,6 +219,11 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/core/src/relay.c)
         set_tests_properties(relay_sub_done_pd
             PROPERTIES LABELS "relay" TIMEOUT 30)
+        add_test(NAME relay_bind_pump_stack COMMAND ${MOQR_WIRE_BASH}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bind_pump_stack.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/bind/moqr_bind.c)
+        set_tests_properties(relay_bind_pump_stack
+            PROPERTIES LABELS "relay" TIMEOUT 30)
         add_test(NAME relay_reap_wiring COMMAND ${MOQR_WIRE_BASH}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_reap_wiring.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c

@@ -5,7 +5,8 @@
  * bool padding), the widened bitset word arithmetic at the uint32_t
  * maximum, the descriptor slope across the 63/64/65 and 128/129 word
  * boundaries (ready + parked add exactly TWO 8-byte words per crossing),
- * and the create-time counting-allocator slope with leak-free destruction.
+ * the bind-owned pump scratch term, and the create-time counting-allocator
+ * slope with leak-free destruction.
  */
 
 #include "moqr_bind.c"
@@ -19,11 +20,16 @@
 /* counting allocator (same shape as test_relay_log) */
 typedef struct ca {
     moq_alloc_t vt;
-    long allocs, frees, live;
+    long allocs, frees, live, attempts;
+    long fail_at;   /* fail exactly this allocation attempt; 0 = never */
 } ca_t;
 static void *ca_a(size_t n, void *c)
 {
     ca_t *a = c;
+    a->attempts++;
+    if (a->fail_at != 0 && a->attempts == a->fail_at) {
+        return NULL;
+    }
     void *p = malloc(n);
     if (p) {
         a->allocs++;
@@ -34,6 +40,10 @@ static void *ca_a(size_t n, void *c)
 static void *ca_r(void *p, size_t o, size_t n, void *c)
 {
     ca_t *a = c;
+    a->attempts++;
+    if (a->fail_at != 0 && a->attempts == a->fail_at) {
+        return NULL;
+    }
     void *q = realloc(p, n);
     if (q) {
         a->live += (long)n - (long)o;
@@ -94,6 +104,15 @@ test_bind_word_count(void)
 }
 
 /* -- Descriptor + allocator slopes across word boundaries --------------------- */
+
+static uint64_t
+bind_pump_scratch_bytes_test(void)
+{
+    return (uint64_t)BIND_PUMP_EVENT_BATCH * sizeof(moq_event_t) +
+           (uint64_t)BIND_PUMP_REVOKED_BATCH *
+               sizeof(moqr_revoked_grant_t) +
+           (uint64_t)BIND_PUMP_INTENT_BATCH * sizeof(moqr_intent_t);
+}
 
 static uint64_t
 describe_bind(ca_t *a, moqr_core_t *core, uint32_t max_conns)
@@ -164,6 +183,7 @@ test_bind_capacity_slopes(void)
                         4 * sizeof(b_sg_t) + 4 * sizeof(b_usub_t) +
                         4 * sizeof(b_pub_t) + 4 * sizeof(b_ann_t) +
                         lim.max_fetches * sizeof(b_fetch_t);
+    uint64_t scratch = bind_pump_scratch_bytes_test();
 
     uint64_t d1 = describe_bind(&a, core, 1);
     uint64_t d63 = describe_bind(&a, core, 63);
@@ -177,13 +197,16 @@ test_bind_capacity_slopes(void)
     MOQ_TEST_CHECK_EQ_U64(d65 - d64, per_conn + 16);      /* 2 word pairs */
     MOQ_TEST_CHECK_EQ_U64(d128 - d65, 63 * per_conn);     /* 2 word pairs */
     MOQ_TEST_CHECK_EQ_U64(d129 - d128, per_conn + 16);    /* 3 word pairs */
+    MOQ_TEST_CHECK(scratch > 2048u);   /* the embedded stack RED is real */
 
     /* Create-time slope mirrors the descriptor exactly (all bind tables are
      * eager), and every size destroys leak-free. */
+    long c1 = create_bind_live(&a, core, 1);
     long c63 = create_bind_live(&a, core, 63);
     long c64 = create_bind_live(&a, core, 64);
     long c65 = create_bind_live(&a, core, 65);
-    MOQ_TEST_CHECK(c63 > 0 && c64 > 0 && c65 > 0);
+    MOQ_TEST_CHECK(c1 > 0 && c63 > 0 && c64 > 0 && c65 > 0);
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)c1, d1);
     MOQ_TEST_CHECK_EQ_U64((uint64_t)(c64 - c63), per_conn);
     MOQ_TEST_CHECK_EQ_U64((uint64_t)(c65 - c64), per_conn + 16);
 
@@ -193,12 +216,93 @@ test_bind_capacity_slopes(void)
     return failures;
 }
 
+static int
+test_bind_pump_scratch_owned(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+
+    moqr_core_relay_cfg_t ccfg;
+    moqr_core_relay_cfg_init_sized(&ccfg, sizeof(ccfg), &a.vt);
+    ccfg.log_budget.max_groups = 4;
+    ccfg.log_budget.max_bytes = 1 << 20;
+    moqr_core_t *core = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&ccfg, &core) == MOQR_OK);
+
+    moqr_bind_cfg_t cfg;
+    moqr_bind_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.core = core;
+    cfg.max_conns = 1;
+    cfg.max_downstream_subs = 1;
+    cfg.max_open_subgroups = 1;
+    cfg.max_upstream_subs = 1;
+    cfg.max_publishes = 1;
+    cfg.max_announces = 1;
+
+    moqr_bind_t *b = NULL;
+    MOQ_TEST_CHECK(moqr_bind_create(&cfg, &b) == MOQR_OK);
+    MOQ_TEST_CHECK(b != NULL);
+    MOQ_TEST_CHECK(b->pump_events != NULL);
+    MOQ_TEST_CHECK(b->pump_revoked != NULL);
+    MOQ_TEST_CHECK(b->pump_intents != NULL);
+    MOQ_TEST_CHECK(b->pump_events != (moq_event_t *)(void *)b->pump_revoked);
+    MOQ_TEST_CHECK(b->pump_intents !=
+                   (moqr_intent_t *)(void *)b->pump_events);
+    MOQ_TEST_CHECK(b->pump_intents !=
+                   (moqr_intent_t *)(void *)b->pump_revoked);
+
+    long attempts_before = a.attempts;
+    long live_before = a.live;
+    MOQ_TEST_CHECK(moqr_bind_pump(b, 1000) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)(a.attempts - attempts_before), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(a.live - live_before), 0);
+
+    b->in_pump = true;
+    MOQ_TEST_CHECK(moqr_bind_pump(b, 2000) == MOQR_ERR_INVAL);
+    b->in_pump = false;
+
+    moqr_bind_destroy(b);
+    moqr_core_destroy(core);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+
+    for (long fail = 7; fail <= 9; fail++) {
+        ca_t fa;
+        ca_init(&fa);
+        moqr_core_t *fc = NULL;
+        moqr_core_relay_cfg_t fccfg;
+        moqr_core_relay_cfg_init_sized(&fccfg, sizeof(fccfg), &fa.vt);
+        fccfg.log_budget.max_groups = 4;
+        fccfg.log_budget.max_bytes = 1 << 20;
+        MOQ_TEST_CHECK(moqr_core_create(&fccfg, &fc) == MOQR_OK);
+        moqr_bind_cfg_t fcfg;
+        moqr_bind_cfg_init_sized(&fcfg, sizeof(fcfg), &fa.vt);
+        fcfg.core = fc;
+        fcfg.max_conns = 1;
+        fcfg.max_downstream_subs = 1;
+        fcfg.max_open_subgroups = 1;
+        fcfg.max_upstream_subs = 1;
+        fcfg.max_publishes = 1;
+        fcfg.max_announces = 1;
+        fa.fail_at = fa.attempts + fail;
+        moqr_bind_t *fb = NULL;
+        MOQ_TEST_CHECK(moqr_bind_create(&fcfg, &fb) == MOQR_ERR_NOMEM);
+        MOQ_TEST_CHECK(fb == NULL);
+        moqr_core_destroy(fc);
+        MOQ_TEST_CHECK_EQ_INT((int)fa.live, 0);
+    }
+
+    MOQ_TEST_PASS("bind_pump_scratch_owned");
+    return failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
     failures += test_bind_word_count();
     failures += test_bind_capacity_slopes();
+    failures += test_bind_pump_scratch_owned();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
