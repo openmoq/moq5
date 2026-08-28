@@ -548,8 +548,12 @@ static moq_result_t build_avcc(const moq_codec_init_data_cfg_t *cfg,
 /*
  * Parse the fields an hvcC header needs from an HEVC SPS NAL (payload after
  * the 2-byte NAL header), per ISO/IEC 23008-2 7.3.2.2.1. The 12-byte general
- * profile_tier_level maps directly onto hvcC bytes 1..12. Sub-layer PTL
- * (sps_max_sub_layers_minus1 > 0) is not parsed.
+ * profile_tier_level maps directly onto hvcC bytes 1..12.
+ *
+ * When sps_max_sub_layers_minus1 > 0 the SPS carries sub-layer PTL syntax
+ * between the general PTL and sps_seq_parameter_set_id. hvcC needs none of it,
+ * but it is variable-length and has to be stepped over to reach
+ * chroma_format_idc and the bit depths.
  */
 static moq_result_t parse_hevc_sps(const uint8_t *sps, size_t sps_len,
                                    uint8_t ptl[12],
@@ -562,7 +566,9 @@ static moq_result_t parse_hevc_sps(const uint8_t *sps, size_t sps_len,
     if (sps_len < 3) {
         return MOQ_ERR_PROTO;
     }
-    uint8_t rbsp[64];
+    /* Large enough for the general PTL plus a full set of sub-layer PTLs
+     * (7 x 96 bits) and the fields we read after them. */
+    uint8_t rbsp[256];
     size_t n = deemulate(sps + 2, sps_len - 2, rbsp, sizeof(rbsp));
     if (n < 13) {
         return MOQ_ERR_PROTO;
@@ -574,10 +580,37 @@ static moq_result_t parse_hevc_sps(const uint8_t *sps, size_t sps_len,
     uint32_t tid_nest = br_u(&br, 1);   /* sps_temporal_id_nesting     */
 
     memcpy(ptl, rbsp + 1, 12);          /* general profile_tier_level  */
-    if (max_sub > 0) {
-        return MOQ_ERR_UNSUPPORTED;     /* sub-layer PTL not handled   */
-    }
     br.bitpos = 8 + 12 * 8;
+
+    /* profile_tier_level() sub-layer part, 23008-2 7.3.3. The general half is
+     * the fixed 12 bytes already copied above; what follows is present only
+     * when there is more than one temporal sub-layer. max_sub is 3 bits, so
+     * it never exceeds 7 and the arrays below are always in range. */
+    if (max_sub > 0) {
+        bool profile_present[7] = { false };
+        bool level_present[7] = { false };
+        for (uint32_t i = 0; i < max_sub; i++) {
+            profile_present[i] = br_u(&br, 1) != 0;
+            level_present[i] = br_u(&br, 1) != 0;
+        }
+        for (uint32_t i = max_sub; i < 8; i++) {
+            br_u(&br, 2);               /* reserved_zero_2bits         */
+        }
+        for (uint32_t i = 0; i < max_sub; i++) {
+            if (profile_present[i]) {
+                /* Same layout as the general PTL minus its 8-bit level. */
+                br_u(&br, 32);
+                br_u(&br, 32);
+                br_u(&br, 24);
+            }
+            if (level_present[i]) {
+                br_u(&br, 8);           /* sub_layer_level_idc         */
+            }
+        }
+        if (br.overrun) {
+            return MOQ_ERR_PROTO;
+        }
+    }
 
     br_ue(&br);                         /* sps_seq_parameter_set_id    */
     uint32_t chroma = br_ue(&br);
