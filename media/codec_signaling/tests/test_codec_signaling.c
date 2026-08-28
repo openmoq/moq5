@@ -665,6 +665,46 @@ int main(void)
         CHECK(out_len == sizeof(expect) && memcmp(out, expect, sizeof(expect)) == 0);
     }
 
+    /* -- HEVC Annex B with temporal sub-layers -> hvcC -------------- */
+    {
+        /* VPS + SPS + PPS captured from Apple's low-latency HEVC encoder
+         * (com.apple.videotoolbox.videoencoder.hevc.rtvc) at 1280x720. Its SPS
+         * carries sps_max_sub_layers_minus1 = 1, which the parser used to
+         * reject outright with MOQ_ERR_UNSUPPORTED -- no hvcC meant no video
+         * track was ever announced, so a stream encoded this way came out
+         * audio-only. The sub-layer PTL is skipped, not interpreted. */
+        static const uint8_t annexb[] = {
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x03, 0xff, 0xff, 0x01, 0x60,
+            0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
+            0x5d, 0x00, 0x00, 0x1b, 0x02, 0x40, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01,
+            0x03, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x5d, 0x00, 0x00, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16,
+            0x20, 0x6e, 0xe4, 0x52, 0x32, 0xe7, 0xe1, 0x3d, 0x0b, 0xea, 0x1b, 0xd5,
+            0x29, 0xa8, 0x10, 0x10, 0x10, 0x1f, 0xc2, 0x01, 0x04, 0x00, 0x00, 0x00,
+            0x01, 0x44, 0x01, 0xc0, 0x72, 0xf0, 0x5b, 0x24,
+        };
+        /* general profile_tier_level, hvcC bytes 1..12: Main profile, Main
+         * tier, general_level_idc 0x5d (level 4.0). */
+        static const uint8_t ptl[] = {
+            0x01, 0x60, 0x00, 0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5d,
+        };
+        moq_codec_init_data_cfg_t cfg;
+        moq_codec_init_data_cfg_init(&cfg);
+        cfg.source_format = MOQ_CODEC_SOURCE_HEVC_ANNEXB;
+        cfg.source = bytes(annexb, sizeof(annexb));
+
+        uint8_t out[256];
+        size_t out_len = 0;
+        moq_result_t rc = moq_codec_init_data_build(&cfg, out, sizeof(out), &out_len);
+        CHECK(rc == MOQ_OK);
+        CHECK(out_len >= 23);
+        CHECK(out[0] == 0x01);                            /* configurationVersion */
+        CHECK(memcmp(out + 1, ptl, sizeof(ptl)) == 0);
+        /* byte 21: constantFrameRate(2)=0 | numTemporalLayers(3)=2 |
+         * temporalIdNested(1)=1 | lengthSizeMinusOne(2)=3 */
+        CHECK(out[21] == 0x17);
+    }
+
     /* -- AV1 OBU -> av1C (header vs ffmpeg; seq header verbatim) ---- */
     {
         /* Temporal delimiter + sequence header OBU from SVT-AV1. */
