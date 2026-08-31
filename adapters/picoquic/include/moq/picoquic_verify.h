@@ -10,20 +10,22 @@
  * picoquic's built-in default has no CA store and ACCEPTS the peer
  * certificate, so a client context with no verifier installed is NOT
  * production-safe — a real verifier must be installed. The picotls/picoquic
- * verifier types needed to do this are not reachable from installed
- * headers (picotls headers are not installed; ptls_verify_certificate_t
- * is opaque), so this small helper wraps the picotls-OpenSSL verifier
- * and is the supported way for a cold consumer to enable verification.
+ * verifier types needed to do this are not part of the LibMoQ public
+ * surface, so this small helper wraps the configured picoquic TLS
+ * backend verifier and is the supported way for a cold consumer to
+ * enable verification.
  *
  * The moq_pico_wt_managed facade and the raw moq_pq_threaded client both
  * call this themselves to fail closed by default (insecure_skip_verify=false),
- * so a DEFAULT client is verified against the system trust store with NO
- * configure_quic hook and no extra steps. Call this helper directly ONLY to
- * customize that default — e.g. to pin a private CA — from the configure_quic
- * hook, which runs after the automatic default verifier and transactionally
- * replaces it. Passing a non-NULL PEM bundle path is what makes the hook do
- * something the default does not; re-installing system trust with a NULL
- * ca_file from the hook is redundant with the automatic default.
+ * so a DEFAULT client is verified with NO configure_quic hook and no extra
+ * steps whenever the configured backend can create its default verifier.
+ * Call this helper directly ONLY to customize that default — e.g. to pin a
+ * private CA — from the configure_quic hook, which runs after the automatic
+ * default verifier and transactionally replaces it. In OpenSSL builds,
+ * re-installing system trust with a NULL ca_file from the hook is redundant
+ * with the automatic default. In raw mbedTLS-only embedded builds, prefer the
+ * moq_pq_threaded_cfg_t.ca_file field (or the service endpoint ca_file) so the
+ * automatic verifier can be installed before any hook runs.
  *
  *   // Private-CA customization (the only reason to add the hook):
  *   static int pin_private_ca(picoquic_quic_t *quic, void *ctx) {
@@ -62,14 +64,22 @@ extern "C" {
 typedef struct st_picoquic_quic_t picoquic_quic_t;
 
 /*
- * Install an OpenSSL-backed certificate verifier on `quic` (a client
+ * Install a picoquic TLS-backend certificate verifier on `quic` (a client
  * context). The verifier validates the peer's certificate chain and the
  * server name (SNI/hostname), and rejects a chain that does not validate
  * — so the handshake fails closed instead of silently accepting.
  *
  * ca_file:
- *   NULL  -> use the OpenSSL default trust store (system CAs).
+ *   NULL  -> use the backend default trust store when the configured backend
+ *            has one (OpenSSL builds do; mbedTLS-only embedded builds do not).
  *   path  -> use the PEM bundle at `path` as the trust anchors.
+ *
+ * In an mbedTLS-only picoquic build, this helper requires a non-empty PEM
+ * `ca_file` and returns -1 without installing a verifier when no explicit CA
+ * file is supplied. That preserves the fail-closed default on targets without
+ * a system trust store; applications should pass their platform credential
+ * route through the raw threaded ca_file field or the service ca_file field
+ * when using the raw picoquic backend.
  *
  * The verifier's lifetime is owned by `quic`: picoquic frees it when the
  * QUIC context is destroyed. Do not call before picoquic_create.
@@ -84,9 +94,10 @@ MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
                                            const char *ca_file);
 
 /* Preflight a CA bundle path without a QUIC context: returns 1 if `ca_file`
- * loads as a trust store (or is NULL/empty = system roots), 0 if it cannot be
- * loaded. Lets the service endpoint report a bad CA file as a configuration
- * error (MOQ_ERR_INVAL) up front, rather than as a generic connect failure. */
+ * loads as a trust store (or, for backends with an implicit system store, is
+ * NULL/empty), 0 if it cannot be loaded. Lets the service endpoint report a
+ * bad CA file as a configuration error (MOQ_ERR_INVAL) up front, rather than
+ * as a generic connect failure. */
 MOQ_API int moq_picoquic_ca_file_loadable(const char *ca_file);
 
 #ifdef __cplusplus

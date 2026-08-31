@@ -111,7 +111,7 @@ static int configure_quic_fail(picoquic_quic_t *quic, void *ctx)
     return -1;
 }
 
-/* Installs the libmoq production verifier (system trust store). */
+/* Installs the libmoq production verifier for the configured backend. */
 static int configure_quic_verify(picoquic_quic_t *quic, void *ctx)
 {
     (void)ctx;
@@ -651,6 +651,14 @@ int main(void)
         CHECK(cfg.max_connections == 0xABABABABu);
         CHECK(cfg.idle_timeout_ms == 0xABABABABu);
         CHECK(cfg.keep_alive_interval_ms == 0xABABABABu);
+        {
+            const unsigned char *p = (const unsigned char *)&cfg;
+            for (size_t i = offsetof(moq_pq_threaded_cfg_t, ca_file);
+                 i < offsetof(moq_pq_threaded_cfg_t, ca_file) +
+                     sizeof(cfg.ca_file);
+                 i++)
+                CHECK(p[i] == 0xABu);
+        }
         moq_pq_threaded_cfg_init(NULL);
         PASS("cfg_init");
     }
@@ -696,6 +704,7 @@ int main(void)
         CHECK(cfg.max_connections == 0);
         CHECK(cfg.idle_timeout_ms == 0);    /* 0 = picoquic default */
         CHECK(cfg.keep_alive_interval_ms == 0);  /* 0 = keepalive disabled */
+        CHECK(cfg.ca_file == NULL);
         moq_pq_threaded_cfg_init_sized(NULL, sizeof(cfg));
         PASS("cfg_init_sized");
     }
@@ -1750,10 +1759,11 @@ int main(void)
     }
 
     /* -- Cert verifier helper rejects the self-signed server ----------- */
-    /* moq_picoquic_set_cert_verifier(quic, NULL) installs the system-trust
-     * verifier via configure_quic. Against the self-signed test server the
-     * client must FAIL CLOSED as FATAL: the handshake is rejected before the
-     * MoQ session reaches ESTABLISHED, so the loop's client-side disconnect
+    /* In the default OpenSSL lane, moq_picoquic_set_cert_verifier(quic, NULL)
+     * installs the system-trust verifier via configure_quic. Against the
+     * self-signed test server the client must FAIL CLOSED as FATAL: the
+     * handshake is rejected before the MoQ session reaches ESTABLISHED, so the
+     * loop's client-side disconnect
      * guard latches is_fatal()==true with fatal_code()==0 (transport-level)
      * and wait() returns MOQ_ERR_CLOSED — matching pico WT managed.
      *

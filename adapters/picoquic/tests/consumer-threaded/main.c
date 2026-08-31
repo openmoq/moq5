@@ -11,7 +11,7 @@ static int dummy_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     return 0;
 }
 
-/* Production cert verification: install the system-trust verifier. This
+/* Production cert verification: install the backend verifier. This
  * is the documented configure_quic hook a real client would use. */
 static int configure_verify(picoquic_quic_t *quic, void *ctx)
 {

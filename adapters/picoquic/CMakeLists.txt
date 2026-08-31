@@ -24,34 +24,99 @@ target_include_directories(moq-adapter-picoquic
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-# moq_picoquic_verify.c needs picotls' OpenSSL verifier header
-# (<picotls/openssl.h>). picotls is not installed by picoquic, so locate
-# its source include dir from the hints FindPicoquic resolves (it always
-# sets PTLS_PREFIX / MOQ_PICOTLS_PREFIX, in both source- and installed-
-# picoquic modes). PRIVATE: not part of the public interface (the public
-# header forward-declares picoquic_quic_t only). A deliberate, actionable
-# error if absent — never a cryptic missing-header failure mid-build.
-find_path(MOQ_PTLS_OPENSSL_INCLUDE_DIR
-    NAMES picotls/openssl.h
-    HINTS
-        ${PTLS_INCLUDE_DIR}
-        ${PTLS_PREFIX}/include
-        ${MOQ_PICOTLS_PREFIX}/include
-        ${MOQ_PICOTLS_PREFIX}/../include
-    DOC "Directory containing <picotls/openssl.h> for the cert verifier")
-if(NOT MOQ_PTLS_OPENSSL_INCLUDE_DIR)
-    message(FATAL_ERROR
-        "moq-adapter-picoquic requires picotls headers (<picotls/openssl.h>) "
-        "to build the certificate-verifier helper (moq_picoquic_verify.c), "
-        "but they were not found. picotls is not installed by picoquic; "
-        "pass -DMOQ_PICOTLS_PREFIX=<picotls-build-or-prefix> (the tree "
-        "containing include/picotls/openssl.h), or build against source "
-        "picoquic so FindPicoquic sets PTLS_INCLUDE_DIR.")
+# moq_picoquic_verify.c wraps the TLS verifier supplied by the configured
+# picoquic crypto backend. OpenSSL remains the default for source compatibility;
+# mbedTLS is selected explicitly, or automatically when picoquic is configured
+# with WITH_OPENSSL=OFF and WITH_MBEDTLS=ON.
+set(_moq_pq_verify_backend "${MOQ_PICOQUIC_VERIFY_BACKEND}")
+string(TOLOWER "${_moq_pq_verify_backend}" _moq_pq_verify_backend)
+if(_moq_pq_verify_backend STREQUAL "auto")
+    if(DEFINED WITH_OPENSSL AND NOT WITH_OPENSSL)
+        if(WITH_MBEDTLS)
+            set(_moq_pq_verify_backend "mbedtls")
+        else()
+            message(FATAL_ERROR
+                "moq-adapter-picoquic cannot install a production TLS verifier "
+                "when picoquic is built with WITH_OPENSSL=OFF and "
+                "WITH_MBEDTLS=OFF. Enable mbedTLS or set "
+                "MOQ_PICOQUIC_VERIFY_BACKEND to a supported backend.")
+        endif()
+    else()
+        set(_moq_pq_verify_backend "openssl")
+    endif()
 endif()
-target_include_directories(moq-adapter-picoquic
-    PRIVATE ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
 
-find_package(OpenSSL REQUIRED)
+set(_adapter_tls_link "")
+set(_adapter_tls_install_link "")
+set(MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL OFF CACHE INTERNAL
+    "adapter-picoquic install-tree dependency on OpenSSL")
+set(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND "${_moq_pq_verify_backend}" CACHE INTERNAL
+    "adapter-picoquic configured verifier backend")
+
+if(_moq_pq_verify_backend STREQUAL "openssl")
+    # The OpenSSL verifier branch needs picotls' OpenSSL header
+    # (<picotls/openssl.h>). picotls is not installed by picoquic, so locate
+    # its source include dir from the hints FindPicoquic resolves. PRIVATE:
+    # not part of the public interface (the public header forward-declares
+    # picoquic_quic_t only). A deliberate, actionable error if absent -- never
+    # a cryptic missing-header failure mid-build.
+    find_path(MOQ_PTLS_OPENSSL_INCLUDE_DIR
+        NAMES picotls/openssl.h
+        HINTS
+            ${PTLS_INCLUDE_DIR}
+            ${PTLS_PREFIX}/include
+            ${MOQ_PICOTLS_PREFIX}/include
+            ${MOQ_PICOTLS_PREFIX}/../include
+        DOC "Directory containing <picotls/openssl.h> for the cert verifier")
+    if(NOT MOQ_PTLS_OPENSSL_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "moq-adapter-picoquic selected the OpenSSL certificate verifier, "
+            "but picotls headers (<picotls/openssl.h>) were not found. "
+            "Pass -DMOQ_PICOTLS_PREFIX=<picotls-build-or-prefix>, build "
+            "against source picoquic so FindPicoquic sets PTLS_INCLUDE_DIR, "
+            "or use -DMOQ_PICOQUIC_VERIFY_BACKEND=mbedtls with an mbedTLS "
+            "picoquic build.")
+    endif()
+    find_package(OpenSSL REQUIRED)
+    target_include_directories(moq-adapter-picoquic
+        PRIVATE ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
+    target_compile_definitions(moq-adapter-picoquic
+        PRIVATE MOQ_PICOQUIC_VERIFY_OPENSSL)
+    set(_adapter_tls_link OpenSSL::SSL OpenSSL::Crypto)
+    set(_adapter_tls_install_link ";OpenSSL::SSL;OpenSSL::Crypto")
+    set(MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL ON CACHE INTERNAL
+        "adapter-picoquic install-tree dependency on OpenSSL")
+elseif(_moq_pq_verify_backend STREQUAL "mbedtls")
+    find_path(MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR
+        NAMES ptls_mbedtls.h
+        HINTS
+            ${MOQ_PICOQUIC_SOURCE_DIR}/picoquic_mbedtls
+            ${PTLS_INCLUDE_DIR}
+            ${PTLS_PREFIX}/include
+            ${MOQ_PICOTLS_PREFIX}/include
+            ${MOQ_PICOTLS_PREFIX}/../include
+        DOC "Directory containing picoquic's ptls_mbedtls.h")
+    if(NOT MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "moq-adapter-picoquic selected the mbedTLS certificate verifier, "
+            "but picoquic's ptls_mbedtls.h was not found. Build against a "
+            "picoquic source tree configured with -DWITH_OPENSSL=OFF "
+            "-DWITH_MBEDTLS=ON, or set MOQ_PICOQUIC_VERIFY_BACKEND=openssl.")
+    endif()
+    if(DEFINED WITH_MBEDTLS AND NOT WITH_MBEDTLS)
+        message(FATAL_ERROR
+            "MOQ_PICOQUIC_VERIFY_BACKEND=mbedtls requires picoquic built with "
+            "-DWITH_MBEDTLS=ON.")
+    endif()
+    target_include_directories(moq-adapter-picoquic
+        SYSTEM PRIVATE ${MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR})
+    target_compile_definitions(moq-adapter-picoquic
+        PRIVATE MOQ_PICOQUIC_VERIFY_MBEDTLS)
+else()
+    message(FATAL_ERROR
+        "Unsupported MOQ_PICOQUIC_VERIFY_BACKEND='${MOQ_PICOQUIC_VERIFY_BACKEND}'. "
+        "Expected auto, openssl, or mbedtls.")
+endif()
 
 # Resolve picoquic-log target name before linking.
 set(_PQ_LOG "")
@@ -62,13 +127,8 @@ elseif(TARGET picoquic-log)
 endif()
 
 target_link_libraries(moq-adapter-picoquic
-    PUBLIC moq::core OpenSSL::SSL OpenSSL::Crypto
+    PUBLIC moq::core ${_adapter_tls_link}
     PUBLIC $<BUILD_INTERFACE:${_PQ}>)
-
-if(_PQ_LOG)
-    target_link_libraries(moq-adapter-picoquic
-        PUBLIC $<BUILD_INTERFACE:${_PQ_LOG}>)
-endif()
 
 set_property(TARGET moq-adapter-picoquic APPEND PROPERTY
     INTERFACE_LINK_LIBRARIES "$<INSTALL_INTERFACE:${_PQ}>")
@@ -105,10 +165,7 @@ install(FILES moq_picoquic.h
 # consumption (absolute paths) and one for install-tree (relocatable).
 
 # Build-tree targets (absolute paths — valid on this machine)
-set(_adapter_pq_link "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_PQ}")
-if(_PQ_LOG)
-    string(APPEND _adapter_pq_link ";${_PQ_LOG}")
-endif()
+set(_adapter_pq_link "moq::core;${_adapter_tls_link};${_PQ}")
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterTargets.cmake"
     CONTENT "\
@@ -247,7 +304,7 @@ if(MOQ_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}
         $<TARGET_PROPERTY:${_PQ},INTERFACE_INCLUDE_DIRECTORIES>)
     target_link_libraries(test_adapter_backpressure
-        PRIVATE moq::core OpenSSL::SSL OpenSSL::Crypto)
+        PRIVATE moq::core ${_adapter_tls_link})
     add_test(NAME adapter_backpressure COMMAND test_adapter_backpressure)
 
     add_executable(test_pq_conformance
@@ -263,7 +320,7 @@ if(MOQ_BUILD_TESTS)
         ${PROJECT_SOURCE_DIR}/tests/conformance
         $<TARGET_PROPERTY:${_PQ},INTERFACE_INCLUDE_DIRECTORIES>)
     target_link_libraries(test_pq_conformance
-        PRIVATE moq::core OpenSSL::SSL OpenSSL::Crypto)
+        PRIVATE moq::core ${_adapter_tls_link})
     add_test(NAME pq_conformance COMMAND test_pq_conformance)
 
     # Real-transport establishment in the deterministic simulator: genuine
@@ -278,7 +335,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_pq_sim_establish PRIVATE
             moq::adapter-picoquic
             picoquic-test
-            OpenSSL::SSL OpenSSL::Crypto)
+            ${_adapter_tls_link})
         target_compile_definitions(test_pq_sim_establish PRIVATE
             PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -304,7 +361,7 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_pq_sim_flow_control PRIVATE
             moq::adapter-picoquic
             picoquic-test
-            OpenSSL::SSL OpenSSL::Crypto)
+            ${_adapter_tls_link})
         target_compile_definitions(test_pq_sim_flow_control PRIVATE
             PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
@@ -461,7 +518,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         moq-adapter-picoquic-threaded-test-internals)
     target_include_directories(test_threaded_tls_policy PRIVATE
         "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic"
-        ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
+        ${PTLS_INCLUDE_DIR})
     target_compile_definitions(test_threaded_tls_policy PRIVATE
         MOQ_TEST_CERT_PATH="${_pq_tls_cert}"
         MOQ_TEST_KEY_PATH="${_pq_tls_key}")

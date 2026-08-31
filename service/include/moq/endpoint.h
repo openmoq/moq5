@@ -179,9 +179,12 @@ typedef struct moq_endpoint_cfg {
                                          backends have no separate SNI (host
                                          is both); an override != URL host is
                                          rejected with MOQ_ERR_UNSUPPORTED */
-    moq_bytes_t ca_file;              /* empty = system roots. The MsQuic and
-                                         wtquic-Network backends have no
-                                         CA-file field: a custom ca_file with
+    moq_bytes_t ca_file;              /* empty = backend default roots when
+                                         available. picoquic mbedTLS-only
+                                         builds have no implicit store here and
+                                         require a PEM ca_file. The MsQuic and
+                                         wtquic-Network backends have no CA-file
+                                         field: a custom ca_file with
                                          verification on is rejected with
                                          MOQ_ERR_UNSUPPORTED (use system trust
                                          or insecure_skip_verify) */
@@ -280,8 +283,8 @@ MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,
  * endpoint. The
  * connection and handshake complete asynchronously; observe progress via
  * wait()/state(). Unless insecure_skip_verify is set, real certificate
- * verification (chain + server name, against ca_file or the system roots)
- * is installed -- the safe path is the default at this tier. */
+ * verification (chain + server name, against ca_file or backend default roots
+ * when available) is installed -- the safe path is the default at this tier. */
 MOQ_API moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
                                           moq_endpoint_t **out);
 

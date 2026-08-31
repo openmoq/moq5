@@ -50,6 +50,7 @@ extern unsigned moq_pq_threaded_test_cert_install_calls;
 extern unsigned moq_pq_threaded_test_null_verifier_calls;
 
 static int failures = 0;
+static const char *last_ca_file;
 
 #define CHECK(expr)                                                     \
     do {                                                                \
@@ -101,13 +102,13 @@ static void dispose2(ptls_verify_certificate_t *v) { (void)v; custom2_disposed++
  * own store/verifier creation succeeded (0 ok). */
 static int counting_installer0(picoquic_quic_t *quic, const char *ca)
 {
-    (void)ca;
+    last_ca_file = ca;
     picoquic_set_verify_certificate_callback(quic, &default0, dispose_default0);
     return 0;
 }
 static int counting_installer5(picoquic_quic_t *quic, const char *ca)
 {
-    (void)ca;
+    last_ca_file = ca;
     picoquic_set_verify_certificate_callback(quic, &default5, dispose_default5);
     return 0;
 }
@@ -117,7 +118,8 @@ static int counting_installer5(picoquic_quic_t *quic, const char *ca)
  * scoped: it replaces only the default install, nothing else. */
 static int failing_installer(picoquic_quic_t *quic, const char *ca)
 {
-    (void)quic; (void)ca;
+    (void)quic;
+    last_ca_file = ca;
     return -1;
 }
 
@@ -183,6 +185,7 @@ static void reset_seam(void)
     moq_pq_threaded_test_cert_installer = NULL;
     moq_pq_threaded_test_cert_install_calls = 0;
     moq_pq_threaded_test_null_verifier_calls = 0;
+    last_ca_file = NULL;
 }
 
 static void client_cfg(moq_pq_threaded_cfg_t *c, int port,
@@ -206,10 +209,10 @@ int main(void)
     srand((unsigned)getpid());
     int base = 15600 + (rand() % 300);
 
-    /* -- Case 1: default client -- the GENUINE system-trust verifier is
-     *    installed once (real installer, seam left NULL), present before the
-     *    configure hook, no null verifier. Kept as the real-verifier control,
-     *    separate from the counted-disposal cases below. */
+    /* -- Case 1: default OpenSSL-lane client -- the GENUINE system-trust
+     *    verifier is installed once (real installer, seam left NULL), present
+     *    before the configure hook, no null verifier. Kept as the real-verifier
+     *    control, separate from the counted-disposal cases below. */
     {
         reset_seam();
         hook_ctx_t h; memset(&h, 0, sizeof(h));
@@ -311,7 +314,27 @@ int main(void)
         CHECK(default5_disposed == 1);    /* disposed once on the failure path */
     }
 
-    /* -- Case 6: server -- no automatic client verifier installation. */
+    /* -- Case 6: explicit CA -- the default verifier sees the cfg.ca_file
+     *    BEFORE configure_quic, which is the mbedTLS-only embedded path. */
+    {
+        reset_seam();
+        moq_pq_threaded_test_cert_installer = counting_installer0;
+        default0_disposed = 0;
+        hook_ctx_t h; memset(&h, 0, sizeof(h));
+        moq_pq_threaded_cfg_t c; client_cfg(&c, base + 5, &h, 0);
+        c.ca_file = "/tmp/moq-test-ca.pem";
+        moq_pq_threaded_t *t = NULL;
+        CHECK(moq_pq_threaded_create(&c, &t) == MOQ_OK);
+        CHECK(moq_pq_threaded_test_cert_install_calls == 1);
+        CHECK(last_ca_file != NULL);
+        CHECK(strcmp(last_ca_file, "/tmp/moq-test-ca.pem") == 0);
+        CHECK(h.hook_calls == 1);
+        CHECK(h.verify_at_entry == (void *)&default0);
+        if (t) { moq_pq_threaded_stop(t); moq_pq_threaded_destroy(t); }
+        CHECK(default0_disposed == 1);
+    }
+
+    /* -- Case 7: server -- no automatic client verifier installation. */
     {
         reset_seam();
         moq_pq_threaded_cfg_t s;
@@ -320,7 +343,7 @@ int main(void)
         s.perspective = MOQ_PERSPECTIVE_SERVER;
         s.cert_path = MOQ_TEST_CERT_PATH;
         s.key_path = MOQ_TEST_KEY_PATH;
-        s.port = base + 5;
+        s.port = base + 6;
         s.on_lane_pump = dummy_pump;
         moq_pq_threaded_t *t = NULL;
         CHECK(moq_pq_threaded_create(&s, &t) == MOQ_OK);

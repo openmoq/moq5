@@ -25,7 +25,7 @@ C++ attach mode for callers that already own a `proxygen::WebTransport`
 
 | | Transport | Stack | Deps | Installed / stable today | Managed C facade | Best fit |
 |---|---|---|---|---|---|---|
-| **picoquic raw** | raw QUIC (ALPN `moqt-16`) | picoquic (C) | light (C, picotls, OpenSSL) | yes — `moq/picoquic.h` installed; threaded helper installed when `MOQ_BUILD_PQ_THREADED=ON` | `moq_pq_threaded_t` | default for native apps; smallest dependency footprint |
+| **picoquic raw** | raw QUIC (ALPN `moqt-16`) | picoquic (C) | light (C, picotls, OpenSSL or mbedTLS) | yes — `moq/picoquic.h` installed; threaded helper installed when `MOQ_BUILD_PQ_THREADED=ON` | `moq_pq_threaded_t` | default for native apps; smallest dependency footprint |
 | **picoquic WebTransport** | WebTransport over HTTP/3 (ALPN `h3`) | picoquic h3zero/picowt (C) | light (same as picoquic + HTTP/3) | yes (experimental) — `moq/pico_wt.h` installs (CMake + `libmoq-pico-wt.pc`); `moq/pico_wt_managed.h` installs (CMake + `libmoq-pico-wt-managed.pc`) when `MOQ_BUILD_PICO_WT_MANAGED=ON` | `moq_pico_wt_managed_t` (experimental) | browser/WebTransport interop |
 | **mvfst raw** | raw QUIC (ALPN `moqt-16`) | Meta mvfst (C++/folly) | heavy (folly, fizz, mvfst, C++ toolchain) | yes — installed, but **CMake-only** (no `pkg-config` entry) | `moq_mvfst_managed_t` | servers/relays already in the folly ecosystem; multi-connection server |
 | **proxygen WebTransport** | WebTransport | proxygen (C++) | heavy (proxygen/folly) | yes (experimental) — installed as **CMake-only** components `adapter-proxygen-wt` (attach) + `adapter-proxygen-wt-managed` (managed), no `.pc` | `moq_proxygen_wt_managed_t` (experimental) | WebTransport in a proxygen/folly C++ service — see §10 |
@@ -292,10 +292,14 @@ Cert handling is explicit on every client facade:
     store** + host/IP identity. Set `cert_path` (PEM CA trust; mutually
     exclusive with `insecure_skip_verify`) to pin a CA.
   - **picoquic** client facades also fail closed on default. Raw
-    `moq_pq_threaded` and `moq_pico_wt_managed` clients install the
-    **system trust store** verifier (chain + server name) themselves when
+    `moq_pq_threaded` and `moq_pico_wt_managed` clients install a real
+    backend verifier (chain + server name) themselves when
     `insecure_skip_verify = false`, and **fail `_create` if it cannot be
-    installed** — a default client never connects unauthenticated.
+    installed** — a default client never connects unauthenticated. OpenSSL
+    builds use the system trust store when no CA file is supplied. mbedTLS-only
+    raw picoquic builds have no implicit system store here and require an
+    explicit PEM CA file through `moq_pq_threaded_cfg_t.ca_file` or the service
+    endpoint `ca_file`.
     picoquic's own built-in default has no CA store and would accept any
     cert, which is exactly why these facades install the verifier rather
     than relying on it. To pin a private CA, install your own verifier
@@ -314,24 +318,30 @@ Cert handling is explicit on every client facade:
 
 ### Certificate verification: default vs. private CA
 
-**Default (system trust) — nothing to do.** With
+**Default verification — usually nothing to do.** With
 `insecure_skip_verify = false` (the default) and **no** `configure_quic`
-hook, both `moq_pq_threaded` and `moq_pico_wt_managed` already install an
-OpenSSL-backed verifier (certificate chain + hostname/SNI) against the
-system trust store. This is the fail-closed default; adding a hook that
-re-installs system trust would be redundant with it.
+hook, both `moq_pq_threaded` and `moq_pico_wt_managed` install a backend
+verifier (certificate chain + hostname/SNI) themselves. OpenSSL builds use the
+system trust store. mbedTLS-only raw picoquic builds have no implicit system
+trust store here, so they require an explicit PEM CA file through
+`moq_pq_threaded_cfg_t.ca_file` or the service endpoint `ca_file`. In all cases,
+creation fails closed if no real verifier can be installed.
 
 ```c
-cfg.insecure_skip_verify = false;   /* default: verifies vs system trust */
+cfg.insecure_skip_verify = false;   /* default: install a real verifier */
 /* no configure_quic needed */
 ```
 
-**Private CA — add a hook that pins it.** `<moq/picoquic_verify.h>`
-provides `moq_picoquic_set_cert_verifier(quic, ca_file)`. Add a
-`configure_quic` hook only to customize the automatic default — pass a
-**non-NULL** PEM bundle path; picoquic owns the verifier's lifetime, and
-the hook runs after the default and transactionally replaces it. The same
-call works for **both** transports (both pass a `picoquic_quic_t*`):
+**Private CA — pass `ca_file` on raw picoquic, or add a replacement hook.**
+`<moq/picoquic_verify.h>` provides
+`moq_picoquic_set_cert_verifier(quic, ca_file)`. For raw
+`moq_pq_threaded`, prefer `cfg.ca_file` so the automatic fail-closed verifier
+can install before any hook; the service endpoint forwards its `ca_file` to the
+raw facade. Use `configure_quic` only to replace an already-installed default
+with a different TLS policy; pass a **non-NULL** PEM bundle path. picoquic owns
+the verifier's lifetime, and the hook runs after the default and
+transactionally replaces it. The same helper works for **both** picoquic
+transports (both pass a `picoquic_quic_t*`):
 
 ```c
 #include <moq/picoquic_verify.h>
@@ -342,7 +352,7 @@ static int pin_private_ca(picoquic_quic_t *quic, void *ctx) {
 }
 
 cfg.insecure_skip_verify = false;
-cfg.configure_quic       = pin_private_ca;   /* replaces the system default */
+cfg.configure_quic       = pin_private_ca;   /* replaces the backend default */
 ```
 
 One helper covers both raw picoquic (`moq_pq_threaded`) and pico WT
@@ -397,9 +407,11 @@ an established session or a terminal fatal.
 
 Bottom line: on the picoquic client facades (`moq_pq_threaded` and
 `moq_pico_wt_managed`), `insecure_skip_verify = false` DOES verify — the
-facade installs the system-trust verifier and fails closed if it cannot.
-Call `moq_picoquic_set_cert_verifier` from `configure_quic` only to pin a
-private CA or otherwise customize that default.
+facade installs the configured backend verifier and fails closed if it cannot.
+For raw picoquic, pass `ca_file` to pin a private CA, or call
+`moq_picoquic_set_cert_verifier` from `configure_quic` to replace an installed
+default with a custom verifier. mbedTLS-only raw embedded builds must use
+`ca_file` so the automatic verifier can be installed.
 
 ---
 

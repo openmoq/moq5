@@ -1084,8 +1084,8 @@ static int loop_callback(picoquic_quic_t *quic,
  * moq_pq_threaded_cfg_t ended before goaway_timeout_us. (sni/alpn_* predate
  * goaway and stay inside this prefix, so they remain enabled under the
  * pointer-only init; every field appended past it -- goaway_timeout_us,
- * max_connections, idle_timeout_ms -- defaults to disabled/zero behind
- * CFG_HAS.) */
+ * max_connections, idle_timeout_ms, keep_alive_interval_ms, ca_file --
+ * defaults to disabled/zero behind CFG_HAS.) */
 #define MOQ_PQ_THREADED_CFG_V0_SIZE \
     (offsetof(moq_pq_threaded_cfg_t, goaway_timeout_us))
 
@@ -1151,6 +1151,7 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
 
     const char *cert = CFG_HAS(cfg, cert_path) ? cfg->cert_path : NULL;
     const char *key  = CFG_HAS(cfg, key_path)  ? cfg->key_path  : NULL;
+    const char *ca_file = CFG_HAS(cfg, ca_file) ? cfg->ca_file : NULL;
 
     if (persp == MOQ_PERSPECTIVE_CLIENT) {
         const char *host = CFG_HAS(cfg, host) ? cfg->host : NULL;
@@ -1323,13 +1324,15 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     /* Client certificate policy -- fail-closed by default. picoquic's built-in
      * default has no CA store and accepts any peer certificate, so the
      * safe-looking default config must install a real verifier itself. A
-     * default client installs the system-trust verifier BEFORE any
-     * configure_quic hook (a custom hook then transactionally replaces it, and
-     * picoquic disposes the one it replaced), and creation FAILS if that
-     * verifier cannot be installed rather than connecting unauthenticated.
-     * insecure_skip_verify installs the explicit null verifier (test-only).
-     * Server perspective is unchanged: it verifies no client certificate by
-     * default, and insecure_skip_verify still selects the null verifier. */
+     * default client installs the configured backend verifier against ca_file
+     * BEFORE any configure_quic hook (a custom hook then transactionally replaces
+     * it, and picoquic disposes the one it replaced), and creation FAILS if that
+     * verifier cannot be installed rather than connecting unauthenticated. The
+     * OpenSSL backend can use system roots when ca_file is NULL; mbedTLS-only
+     * builds require ca_file. insecure_skip_verify installs the explicit null
+     * verifier (test-only). Server perspective is unchanged: it verifies no
+     * client certificate by default, and insecure_skip_verify still selects the
+     * null verifier. */
     if (persp == MOQ_PERSPECTIVE_CLIENT) {
         if (t->insecure_skip_verify) {
             picoquic_set_null_verifier(t->quic);
@@ -1339,11 +1342,11 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         } else {
 #ifdef MOQ_PQ_THREADED_TESTING
             int vrc = moq_pq_threaded_test_cert_installer
-                ? moq_pq_threaded_test_cert_installer(t->quic, NULL)
-                : moq_picoquic_set_cert_verifier(t->quic, NULL);
+                ? moq_pq_threaded_test_cert_installer(t->quic, ca_file)
+                : moq_picoquic_set_cert_verifier(t->quic, ca_file);
             moq_pq_threaded_test_cert_install_calls++;
 #else
-            int vrc = moq_picoquic_set_cert_verifier(t->quic, NULL);
+            int vrc = moq_picoquic_set_cert_verifier(t->quic, ca_file);
 #endif
             if (vrc != 0)
                 goto fail_configure;

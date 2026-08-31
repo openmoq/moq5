@@ -129,13 +129,6 @@ static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     return 0;
 }
 
-/* configure_quic hook that pins the test CA (custom-CA scenario). */
-static int pin_test_ca(picoquic_quic_t *quic, void *ctx)
-{
-    (void)ctx;
-    return moq_picoquic_set_cert_verifier(quic, MOQ_TEST_CA_PATH);
-}
-
 /* Drive the loopback until the client ESTABLISHES or latches fatal, then
  * snapshot the public terminal state before stop/destroy. */
 static hs_result_t run_client(int port, int insecure, int custom_ca,
@@ -151,10 +144,10 @@ static hs_result_t run_client(int port, int insecure, int custom_ca,
     cfg.port = port;
     cfg.insecure_skip_verify = insecure ? true : false;
     cfg.sni = sni;                 /* verified name; NULL => host */
+    if (custom_ca)
+        cfg.ca_file = MOQ_TEST_CA_PATH;
     cfg.on_lane_pump = client_pump;
     cfg.on_lane_pump_ctx = &c;
-    if (custom_ca)
-        cfg.configure_quic = pin_test_ca;
 
     moq_pq_threaded_t *cli = NULL;
     if (moq_pq_threaded_create(&cfg, &cli) != MOQ_OK || !cli)

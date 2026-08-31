@@ -2,15 +2,17 @@
  * moq_picoquic_set_cert_verifier — production TLS verification for
  * picoquic clients. See <moq/picoquic_verify.h>.
  *
- * Wraps picotls' OpenSSL verifier (system or PEM trust store, with
- * hostname/SNI checking) and installs it via
- * picoquic_set_verify_certificate_callback. picoquic owns the verifier
- * lifetime: the dispose fn is invoked when the QUIC context is freed.
+ * Wraps the configured picotls verifier (OpenSSL or mbedTLS, with
+ * hostname/SNI checking) and installs it via picoquic. picoquic owns
+ * the verifier lifetime: the dispose fn is invoked when the QUIC
+ * context is freed.
  */
 
 #include <moq/picoquic_verify.h>
 
 #include <picoquic.h>
+
+#if defined(MOQ_PICOQUIC_VERIFY_OPENSSL)
 #include <picotls/openssl.h>
 #include <openssl/x509.h>
 
@@ -72,3 +74,44 @@ int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic, const char *ca_file)
                                              moq_picoquic_dispose_verifier);
     return 0;
 }
+#elif defined(MOQ_PICOQUIC_VERIFY_MBEDTLS)
+#include <ptls_mbedtls.h>
+
+int moq_picoquic_ca_file_loadable(const char *ca_file)
+{
+    if (ca_file == NULL || ca_file[0] == '\0')
+        return 0;   /* mbedTLS provider has no implicit system store here. */
+
+    unsigned int store_loaded = 0;
+    ptls_verify_certificate_t *verifier =
+        ptls_mbedtls_get_certificate_verifier(ca_file, &store_loaded);
+    if (verifier != NULL)
+        ptls_mbedtls_dispose_verify_certificate(verifier);
+    return verifier != NULL && store_loaded != 0;
+}
+
+int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic, const char *ca_file)
+{
+    if (!quic || ca_file == NULL || ca_file[0] == '\0')
+        return -1;
+
+    unsigned int store_loaded = 0;
+    ptls_verify_certificate_t *verifier =
+        ptls_mbedtls_get_certificate_verifier(ca_file, &store_loaded);
+    if (verifier == NULL || store_loaded == 0) {
+        if (verifier != NULL)
+            ptls_mbedtls_dispose_verify_certificate(verifier);
+        return -1;
+    }
+
+    int rc = picoquic_set_verify_certificate_callback_ex(
+        quic, verifier, ptls_mbedtls_dispose_verify_certificate);
+    if (rc != 0) {
+        ptls_mbedtls_dispose_verify_certificate(verifier);
+        return -1;
+    }
+    return 0;
+}
+#else
+#error "Define MOQ_PICOQUIC_VERIFY_OPENSSL or MOQ_PICOQUIC_VERIFY_MBEDTLS"
+#endif

@@ -397,7 +397,7 @@ struct moq_endpoint {
     char *host;    size_t host_len;
     char *sni;     size_t sni_len;
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
-    char *ca_file; size_t ca_file_len; /* NULL = system roots */
+    char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
 
@@ -697,9 +697,9 @@ static int ep_wtquic_msquic_pump(moq_wtquic_msquic_managed_t *m,
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
 /* Apply the caller's handshake bound, then install real certificate
  * verification unless explicitly skipped: chain + server-name validation
- * against ep->ca_file (NULL = system roots). The facades' built-in default
- * accepts the peer cert, which is NOT production-safe -- making the safe path
- * the default is this tier's job.  */
+ * against ep->ca_file, or the backend default roots when available. The
+ * facades' built-in default accepts the peer cert, which is NOT
+ * production-safe -- making the safe path the default is this tier's job. */
 static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 {
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
@@ -1169,6 +1169,7 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.host = ep->host;
     fc.sni = ep->sni;                   /* may differ from host; the verifier
                                            checks this name */
+    fc.ca_file = ep->ca_file;
     fc.alpn_list = ep->alpn_offer;
     fc.alpn_count = ep->alpn_offer_count;
     fc.port = (int)r->url.port;
@@ -1258,8 +1259,8 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
     fc.alpn_count = ep->alpn_offer_count;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
     /* mvfst has no configure_quic hook; it verifies internally. Mirror the
-     * picoquic verifier policy: skip when insecure, else trust ep->ca_file
-     * (NULL = system roots), with the SNI as the checked identity. */
+     * verifier policy: skip when insecure, else trust ep->ca_file when set,
+     * otherwise mvfst's default roots, with the SNI as the checked identity. */
     if (!cfg->insecure_skip_verify && ep->ca_file)
         fc.cert_path = ep->ca_file;
     fc.on_lane_pump = ep_mvfst_pump;
@@ -1359,7 +1360,8 @@ static moq_result_t ep_create_proxygen(moq_endpoint_t *ep,
     fc.path = ep->path;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
     /* proxygen verifies internally; mirror the verifier policy: skip when
-     * insecure, else trust ep->ca_file (NULL = system roots). */
+     * insecure, else trust ep->ca_file when set, otherwise proxygen's default
+     * roots. */
     if (!cfg->insecure_skip_verify && ep->ca_file)
         fc.ca_file = ep->ca_file;
     /* proxygen takes the WT-protocol token vector directly (it builds the
@@ -1713,7 +1715,8 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     /* Preflight the CA bundle: a file that cannot be loaded is a configuration
      * error, reported here as MOQ_ERR_INVAL rather than collapsing into a
      * generic transport/handshake failure inside the verifier install. */
-    if (ep->ca_file && !cfg->insecure_skip_verify &&
+    if (r.backend == MOQ_TRANSPORT_BACKEND_PICOQUIC &&
+        !cfg->insecure_skip_verify &&
         !moq_picoquic_ca_file_loadable(ep->ca_file)) {
         ep_free_strings(ep);
         pthread_mutex_destroy(&ep->mu);

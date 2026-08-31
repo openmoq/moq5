@@ -26,6 +26,10 @@ option(MOQ_BUILD_SERVICE           "Build moq-service (endpoint + media service 
 option(MOQ_BUILD_BENCHMARKS        "Build benchmarks"               OFF)
 option(MOQ_BUILD_EXAMPLES          "Build LibMoQ example programs"  ON)
 option(MOQ_BUILD_PQ_THREADED       "Build threaded picoquic helper" OFF)
+set(MOQ_PICOQUIC_VERIFY_BACKEND "auto" CACHE STRING
+    "picoquic certificate verifier backend: auto, openssl, or mbedtls")
+set_property(CACHE MOQ_PICOQUIC_VERIFY_BACKEND PROPERTY STRINGS
+    auto openssl mbedtls)
 option(MOQ_BUILD_INTEROP_CLIENT    "Build interop test client"      OFF)
 option(MOQ_BUILD_RELAY             "Build moq-relay (deterministic relay core + tool)" OFF)
 option(MOQ_BUILD_ADAPTER_MVFST     "Build mvfst QUIC adapter"       OFF)
@@ -400,13 +404,39 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC)
     if(MOQ_PTLS_LIB_DIR)
         string(APPEND LIBMOQ_PC_LIBS " -L${MOQ_PTLS_LIB_DIR}")
     endif()
-    string(APPEND LIBMOQ_PC_LIBS " -lpicotls-openssl -lpicotls-core -lpicotls-minicrypto")
-    find_package(OpenSSL QUIET)
-    if(OPENSSL_FOUND AND OPENSSL_CRYPTO_LIBRARY)
-        get_filename_component(_ssl_dir "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
-        string(APPEND LIBMOQ_PC_LIBS " -L${_ssl_dir}")
+    set(_libmoq_pc_has_openssl OFF)
+    if((DEFINED WITH_OPENSSL AND WITH_OPENSSL) OR MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)
+        set(_libmoq_pc_has_openssl ON)
     endif()
-    string(APPEND LIBMOQ_PC_LIBS " -lssl -lcrypto -lpthread")
+    if(_libmoq_pc_has_openssl)
+        string(APPEND LIBMOQ_PC_LIBS " -lpicotls-openssl")
+    endif()
+    string(APPEND LIBMOQ_PC_LIBS " -lpicotls-core -lpicotls-minicrypto")
+    if(DEFINED WITH_MBEDTLS AND WITH_MBEDTLS)
+        set(_libmoq_mbed_dirs "")
+        foreach(_libmoq_mbed_var MBEDTLS_LIBRARY MBEDTLS_X509 MBEDTLS_CRYPTO)
+            if(${_libmoq_mbed_var})
+                get_filename_component(_libmoq_mbed_dir "${${_libmoq_mbed_var}}" DIRECTORY)
+                list(APPEND _libmoq_mbed_dirs "${_libmoq_mbed_dir}")
+            endif()
+        endforeach()
+        if(_libmoq_mbed_dirs)
+            list(REMOVE_DUPLICATES _libmoq_mbed_dirs)
+            foreach(_libmoq_mbed_dir IN LISTS _libmoq_mbed_dirs)
+                string(APPEND LIBMOQ_PC_LIBS " -L${_libmoq_mbed_dir}")
+            endforeach()
+        endif()
+        string(APPEND LIBMOQ_PC_LIBS " -lmbedtls -lmbedx509 -lmbedcrypto")
+    endif()
+    if(_libmoq_pc_has_openssl)
+        find_package(OpenSSL QUIET)
+        if(OPENSSL_FOUND AND OPENSSL_CRYPTO_LIBRARY)
+            get_filename_component(_ssl_dir "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
+            string(APPEND LIBMOQ_PC_LIBS " -L${_ssl_dir}")
+        endif()
+        string(APPEND LIBMOQ_PC_LIBS " -lssl -lcrypto")
+    endif()
+    string(APPEND LIBMOQ_PC_LIBS " -lpthread")
 endif()
 string(STRIP "${LIBMOQ_PC_LIBS}" LIBMOQ_PC_LIBS)
 
@@ -536,13 +566,20 @@ export(EXPORT libmoqTargets
 
 set(_build_tree_config "include(CMakeFindDependencyMacro)\n")
 string(APPEND _build_tree_config
+    "set(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL ${MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL})\n"
+    "macro(_libmoq_find_adapter_picoquic_deps)\n"
+    "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
+    "  if(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)\n"
+    "    find_dependency(OpenSSL)\n"
+    "  endif()\n"
+    "  find_dependency(Picoquic)\n"
+    "endmacro()\n")
+string(APPEND _build_tree_config
     "include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqTargets.cmake\")\n")
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
     string(APPEND _build_tree_config
         "if(\"adapter-picoquic\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
-        "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
-        "  find_dependency(OpenSSL)\n"
-        "  find_dependency(Picoquic)\n"
+        "  _libmoq_find_adapter_picoquic_deps()\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND TRUE)\n"
         "endif()\n")
@@ -550,9 +587,7 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC)
         string(APPEND _build_tree_config
             "if(\"adapter-picoquic-threaded\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
             "  if(NOT \${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND)\n"
-            "    list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
-            "    find_dependency(OpenSSL)\n"
-            "    find_dependency(Picoquic)\n"
+            "    _libmoq_find_adapter_picoquic_deps()\n"
             "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
             "    set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND TRUE)\n"
             "  endif()\n"
@@ -686,9 +721,7 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
         "  endif()\n"
         "  if(NOT TARGET moq::adapter-picoquic\n"
         "     AND EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
-        "    list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
-        "    find_dependency(OpenSSL)\n"
-        "    find_dependency(Picoquic)\n"
+        "    _libmoq_find_adapter_picoquic_deps()\n"
         "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
         "    set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-picoquic_FOUND TRUE)\n"
         "  endif()\n"
@@ -713,8 +746,7 @@ if(MOQ_BUILD_SERVICE)
         "     EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterThreadedTargets.cmake\")\n"
         "    if(NOT TARGET moq::adapter-picoquic AND\n"
         "       EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
-        "      find_dependency(OpenSSL)\n"
-        "      find_dependency(Picoquic)\n"
+        "      _libmoq_find_adapter_picoquic_deps()\n"
         "      include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
         "    endif()\n"
         "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterThreadedTargets.cmake\")\n"
@@ -729,8 +761,7 @@ if(MOQ_BUILD_SERVICE)
         "    endif()\n"
         "    if(NOT TARGET moq::adapter-picoquic AND\n"
         "       EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
-        "      find_dependency(OpenSSL)\n"
-        "      find_dependency(Picoquic)\n"
+        "      _libmoq_find_adapter_picoquic_deps()\n"
         "      include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterTargets.cmake\")\n"
         "    endif()\n"
         "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtManagedTargets.cmake\")\n"

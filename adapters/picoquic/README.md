@@ -81,14 +81,17 @@ int main() {
     my_app_t app = {0};
 
     moq_pq_threaded_cfg_t cfg;
-    moq_pq_threaded_cfg_init(&cfg);
+    moq_pq_threaded_cfg_init_sized(&cfg, sizeof(cfg));
     cfg.alloc = moq_alloc_default();
     cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
     cfg.host = "relay.example.com";
     cfg.port = 4443;
-    /* TLS certificate verification is ON by default (system CA chain). Do NOT
-     * disable it against a real relay. For a LOCAL/self-signed test relay only,
-     * you may set cfg.insecure_skip_verify = true (accepts any cert). */
+    /* TLS certificate verification is ON by default. OpenSSL builds use the
+     * system CA chain; mbedTLS-only embedded builds require an explicit CA file
+     * via the sized cfg.ca_file field or the service ca_file field. Do NOT
+     * disable verification against a real relay. For a LOCAL/self-signed test
+     * relay only, you may set cfg.insecure_skip_verify = true (accepts any
+     * cert). */
     cfg.on_lane_pump = my_pump;
     cfg.on_lane_pump_ctx = &app;
 

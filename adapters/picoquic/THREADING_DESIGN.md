@@ -116,12 +116,13 @@ typedef struct moq_pq_threaded_cfg {
     uint32_t           recv_buffer_size;            /* default 4096 */
 
     /* TLS verification (client). If false (default), a CLIENT installs
-     * the system-trust verifier itself — moq_picoquic_set_cert_verifier(
-     * quic, NULL) — and _create rolls back if that install fails (picoquic's
-     * built-in default accepts any peer cert, so the safe default must install
-     * a real verifier). If true, the helper installs picoquic_set_null_verifier
-     * — demos and tests only. configure_quic runs afterward and may replace the
-     * installed verifier (e.g. a private CA). A SERVER does not install a
+     * a real backend verifier itself -- moq_picoquic_set_cert_verifier(quic,
+     * NULL) on backends with an implicit system store, or an explicit CA file
+     * on mbedTLS-only embedded builds -- and _create rolls back if that install
+     * fails (picoquic's built-in default accepts any peer cert, so the safe
+     * default must install a real verifier). If true, the helper installs
+     * picoquic_set_null_verifier -- demos and tests only. configure_quic runs
+     * afterward and may replace the installed verifier. A SERVER does not install a
      * client-side verifier; insecure_skip_verify on a server only selects the
      * null verifier and does not enable client-certificate authentication. */
     bool               insecure_skip_verify;
@@ -231,7 +232,8 @@ _create(cfg) for CLIENT:
          If cfg->insecure_skip_verify:
              picoquic_set_null_verifier(t->quic)      (demo/test only)
          Else (default):
-             moq_picoquic_set_cert_verifier(t->quic, NULL)   (system trust)
+             moq_picoquic_set_cert_verifier(t->quic, cfg->ca_file)
+                 (backend default when available, explicit CA otherwise)
              if it cannot install → rollback (_create fails; no
              unauthenticated connection)
   5. If cfg->configure_quic:

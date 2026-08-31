@@ -240,9 +240,21 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
 
     if(TARGET picoquic-core)
         # picoquic-core references picoquic-log symbols (picoquic_set_qlog)
-        # but does not link it. Patch the dependency so downstream gets
-        # the correct link order on all platforms.
+        # but does not link it. Upstream also declares picoquic-log -> core,
+        # which creates a static archive cycle once the missing core -> log edge
+        # is added; CMake then repeats both archives, and Apple ld warns about
+        # the duplicate libraries. In source-tree mode libmoq needs the core ->
+        # log edge for correct downstream order, so make that the only edge in
+        # the pair. Upstream executables built in this tree link both targets
+        # explicitly, and installed picoquic packages keep their own exported
+        # interface untouched.
         if(TARGET picoquic-log)
+            get_target_property(_pq_log_libs picoquic-log INTERFACE_LINK_LIBRARIES)
+            if(_pq_log_libs)
+                list(REMOVE_ITEM _pq_log_libs picoquic-core picoquic::picoquic-core)
+                set_target_properties(picoquic-log PROPERTIES
+                    INTERFACE_LINK_LIBRARIES "${_pq_log_libs}")
+            endif()
             get_target_property(_pq_core_libs picoquic-core INTERFACE_LINK_LIBRARIES)
             if(NOT _pq_core_libs OR NOT "picoquic-log" IN_LIST _pq_core_libs)
                 target_link_libraries(picoquic-core PUBLIC picoquic-log)

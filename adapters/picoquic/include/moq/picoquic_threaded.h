@@ -56,10 +56,11 @@
  *   picoquic adapters and the verifier helper):
  *     pkg-config --cflags --libs libmoq
  *
- * Certificate policy: a CLIENT verifies the peer certificate against the
- *   system trust store by default (fail-closed -- _create fails if the
- *   verifier cannot be installed). See insecure_skip_verify / configure_quic
- *   below and <moq/picoquic_verify.h>.
+ * Certificate policy: a CLIENT verifies the peer certificate by default
+ *   (fail-closed -- _create fails if the configured backend verifier cannot
+ *   be installed). OpenSSL builds use system trust by default; mbedTLS-only
+ *   embedded builds require an explicit CA file. See insecure_skip_verify /
+ *   configure_quic below and <moq/picoquic_verify.h>.
  *
  * See adapters/picoquic/THREADING_DESIGN.md for the full design.
  */
@@ -116,24 +117,26 @@ typedef struct moq_pq_threaded_cfg {
     uint32_t           send_buffer_size;            /* default 4096 */
     uint32_t           recv_buffer_size;            /* default 4096 */
 
-    /* TLS verification (client).  Default false is fail-closed: a client
-     * installs the system-trust certificate verifier
+    /* TLS verification (client). Default false is fail-closed: a client
+     * installs the configured backend certificate verifier
      * (moq_picoquic_set_cert_verifier(), <moq/picoquic_verify.h>) BEFORE
-     * configure_quic and FAILS _create if it cannot install it, so a default
-     * client never connects unauthenticated.  If true, calls
-     * picoquic_set_null_verifier instead (accepts any cert) — demos and tests
-     * only.  To trust a private CA, install your own verifier from
-     * configure_quic, which runs after the default and transactionally
-     * replaces it.  Server perspective verifies no client certificate. */
+     * configure_quic and FAILS _create if it cannot install it, so a client
+     * never connects unauthenticated. OpenSSL builds can use system trust with
+     * no CA file; mbedTLS-only builds require the appended ca_file field. If
+     * true, calls picoquic_set_null_verifier instead (accepts any cert) — demos
+     * and tests only. To replace the default policy, install your own verifier
+     * from configure_quic, which runs after the default and transactionally
+     * replaces it. Server perspective verifies no client certificate. */
     bool               insecure_skip_verify;
 
     /* Optional: called during _create after picoquic_create but
      * before any connections or the network thread starts.  The app
      * may configure TLS settings, certificate verification, token
      * stores, or any other picoquic_quic_t options.  For a client it runs
-     * AFTER the default system-trust verifier is installed; installing your
-     * own verifier here (e.g. moq_picoquic_set_cert_verifier() with a private
-     * CA, <moq/picoquic_verify.h>) transactionally replaces the default.
+     * AFTER the default backend verifier is installed when one is available;
+     * installing your own verifier here (e.g. moq_picoquic_set_cert_verifier()
+     * with a private CA, <moq/picoquic_verify.h>) transactionally replaces the
+     * default.
      * Return 0 to continue, nonzero to abort _create. */
     int              (*configure_quic)(picoquic_quic_t *quic, void *ctx);
     void              *configure_quic_ctx;
@@ -271,6 +274,17 @@ typedef struct moq_pq_threaded_cfg {
      * Keepalive is NOT a substitute for MoQ/session deadlines. Set via
      * moq_pq_threaded_cfg_init_sized. */
     uint32_t           keep_alive_interval_ms;
+
+    /* Appended (struct_size append-only ABI) — client CA bundle path.
+     *
+     * ca_file: CLIENT mode only. NULL = backend default roots when the selected
+     * TLS backend has an implicit trust store. Non-NULL = PEM bundle to use as
+     * trust anchors, installed before configure_quic. mbedTLS-only embedded
+     * builds have no implicit system store through this facade, so a verified
+     * client must provide this field or _create fails closed. The path is borrowed
+     * for the duration of _create only. Inert when insecure_skip_verify=true and
+     * inert in server mode. */
+    const char        *ca_file;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that

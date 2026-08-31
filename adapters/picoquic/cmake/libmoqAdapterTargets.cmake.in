@@ -22,7 +22,7 @@ if(NOT TARGET moq::adapter-picoquic)
   set_target_properties(moq::adapter-picoquic PROPERTIES
     IMPORTED_LOCATION "${_ADAPTER_PREFIX}/@_adapter_libdir@/@_adapter_lib_name@"
     INTERFACE_INCLUDE_DIRECTORIES "${_ADAPTER_PREFIX}/@_adapter_incdir@"
-    INTERFACE_LINK_LIBRARIES "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_libmoq_pq_link}")
+    INTERFACE_LINK_LIBRARIES "moq::core@_adapter_tls_install_link@;${_libmoq_pq_link}")
   unset(_libmoq_pq_link)
 endif()
 
