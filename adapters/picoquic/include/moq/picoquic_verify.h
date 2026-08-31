@@ -84,11 +84,13 @@ typedef struct st_picoquic_quic_t picoquic_quic_t;
  * The verifier's lifetime is owned by `quic`: picoquic frees it when the
  * QUIC context is destroyed. Do not call before picoquic_create.
  *
- * Returns 0 on success, -1 on error (bad args, CA file load failure, or
- * allocation failure). Transactional: the helper builds the trust store and
- * verifier first and calls the picoquic setter only after both succeed, so on
- * error the replacement verifier is NOT installed and any previously installed
- * verifier remains unchanged.
+ * Returns 0 on success, -1 on error (bad args, CA file load failure,
+ * allocation failure, or a setter rejection on picoquic revisions that can
+ * report one). Transactional: the helper builds the trust store and verifier
+ * first and calls the picoquic setter only after both succeed. On revisions
+ * with the error-reporting setter, a rejected replacement is disposed by this
+ * helper and any previously installed verifier remains unchanged. Older
+ * picoquic revisions expose a void setter that unconditionally takes ownership.
  */
 MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
                                            const char *ca_file);

@@ -12,6 +12,24 @@
 
 #include <picoquic.h>
 
+#include <stddef.h>
+
+/* picoquic 33afc776 introduced the error-reporting setter together with the
+ * TLS-config-frozen error. Older supported revisions expose only the historical
+ * void setter, which cannot fail and takes ownership before returning. */
+static int moq_picoquic_install_verifier(
+    picoquic_quic_t *quic,
+    ptls_verify_certificate_t *verifier,
+    picoquic_free_verify_certificate_ctx dispose)
+{
+#if defined(PICOQUIC_ERROR_TLS_CONFIG_FROZEN)
+    return picoquic_set_verify_certificate_callback_ex(quic, verifier, dispose);
+#else
+    picoquic_set_verify_certificate_callback(quic, verifier, dispose);
+    return 0;
+#endif
+}
+
 #if defined(MOQ_PICOQUIC_VERIFY_OPENSSL)
 #include <picotls/openssl.h>
 #include <openssl/x509.h>
@@ -70,8 +88,11 @@ int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic, const char *ca_file)
     }
     if (store != NULL) X509_STORE_free(store);
 
-    picoquic_set_verify_certificate_callback(quic, &verifier->super,
-                                             moq_picoquic_dispose_verifier);
+    if (moq_picoquic_install_verifier(quic, &verifier->super,
+                                      moq_picoquic_dispose_verifier) != 0) {
+        moq_picoquic_dispose_verifier(&verifier->super);
+        return -1;
+    }
     return 0;
 }
 #elif defined(MOQ_PICOQUIC_VERIFY_MBEDTLS)
@@ -104,9 +125,8 @@ int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic, const char *ca_file)
         return -1;
     }
 
-    int rc = picoquic_set_verify_certificate_callback_ex(
-        quic, verifier, ptls_mbedtls_dispose_verify_certificate);
-    if (rc != 0) {
+    if (moq_picoquic_install_verifier(
+            quic, verifier, ptls_mbedtls_dispose_verify_certificate) != 0) {
         ptls_mbedtls_dispose_verify_certificate(verifier);
         return -1;
     }

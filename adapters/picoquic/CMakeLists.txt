@@ -292,6 +292,35 @@ add_library(test_adapter_compile OBJECT test_compile.c)
 target_link_libraries(test_adapter_compile PRIVATE moq::adapter-picoquic)
 
 if(MOQ_BUILD_TESTS)
+    # Compile and run the real verifier source against both public picoquic API
+    # generations. The legacy row intentionally has no _ex declaration; the
+    # modern row makes setter refusal and ownership observable.
+    foreach(_verify_api IN ITEMS legacy modern)
+        add_executable(test_picoquic_verify_api_${_verify_api}
+            tests/test_verify_api_compat.c
+            moq_picoquic_verify.c)
+        target_include_directories(test_picoquic_verify_api_${_verify_api}
+            BEFORE PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/verify_api
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${PROJECT_SOURCE_DIR}/core/include)
+        target_compile_definitions(test_picoquic_verify_api_${_verify_api}
+            PRIVATE MOQ_PICOQUIC_VERIFY_MBEDTLS)
+        if(_verify_api STREQUAL "modern")
+            target_compile_definitions(test_picoquic_verify_api_${_verify_api}
+                PRIVATE MOQ_TEST_PICOQUIC_MODERN_API)
+        endif()
+        set_target_properties(test_picoquic_verify_api_${_verify_api}
+            PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_picoquic_verify_api_${_verify_api}
+                PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME picoquic_verify_api_${_verify_api}
+                 COMMAND test_picoquic_verify_api_${_verify_api})
+    endforeach()
+
     # Backpressure test provides its own picoquic function stubs so it
     # can exercise moq_pq_callback/moq_pq_service without a real QUIC
     # stack. Links the adapter source directly with picoquic headers
