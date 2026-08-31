@@ -1751,6 +1751,24 @@ struct moq_session {
     size_t                 track_sub_cap;
 };
 
+/* A size_t payload is unconditionally representable when the platform's
+ * entire size_t range fits in draft-16's QUIC-varint ceiling. Compile the
+ * comparison out on those targets (notably 32-bit embedded builds); wider
+ * targets retain the profile-specific draft-16/18 bound. */
+_Static_assert(MOQ_QUIC_VARINT_MAX == (UINT64_MAX >> 2),
+               "QUIC varint ceiling changed");
+static inline bool session_payload_size_fits_profile(
+    const moq_session_t *s, size_t payload_len)
+{
+#if SIZE_MAX <= (UINT64_MAX >> 2)
+    (void)s;
+    (void)payload_len;
+    return true;
+#else
+    return (uint64_t)payload_len <= s->profile->object_payload_len_max;
+#endif
+}
+
 /* -- Decoded inbound OBJECT_DATAGRAM (profile -> session core) ------- */
 
 typedef struct moq_decoded_object_datagram {

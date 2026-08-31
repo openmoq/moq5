@@ -1257,6 +1257,53 @@ int main(void)
         moq_simpair_destroy(sp);
     }
 
+    /* == L. Object payload-length ceiling follows the negotiated profile == *
+     * Draft-16's Object Payload Length is a QUIC varint; draft-18 uses vi64
+     * and can represent the full uint64_t range. Exercise the public streaming
+     * write boundary without allocating a multi-exabyte payload. */
+    {
+        const moq_profile_ops_t *d16 = moq_profile_lookup(MOQ_VERSION_DRAFT_16);
+        const moq_profile_ops_t *d18 = moq_profile_lookup(MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK_EQ_U64(d16->object_payload_len_max,
+                              MOQ_QUIC_VARINT_MAX);
+        MOQ_TEST_CHECK_EQ_U64(d18->object_payload_len_max, UINT64_MAX);
+
+        /* The draft-16 encoder independently refuses the first value beyond
+         * its declared ceiling and commits no header bytes. */
+        uint8_t header[32];
+        moq_buf_writer_t writer;
+        moq_buf_writer_init(&writer, header, sizeof(header));
+        moq_object_header_encode_args_t args;
+        memset(&args, 0, sizeof(args));
+        args.payload_len = MOQ_QUIC_VARINT_MAX + UINT64_C(1);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)d16->encode_object_header(NULL, &writer, &args),
+            (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&writer), 0);
+
+        moq_simpair_t *sp = make_pair(MOQ_VERSION_DRAFT_18, false, 0, 0);
+        MOQ_TEST_CHECK(sp != NULL);
+        moq_session_t *server = moq_simpair_server(sp);
+        moq_subscription_t ssub;
+        MOQ_TEST_CHECK(setup_subscription(sp, "wide-payload", &ssub, NULL));
+
+        moq_subgroup_cfg_t scfg;
+        moq_subgroup_cfg_init(&scfg);
+        scfg.group_id = 1;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_open_subgroup(server, ssub, &scfg,
+                moq_simpair_now_us(sp), &sg), (int)MOQ_OK);
+
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_begin_object(server, sg, 0,
+                MOQ_QUIC_VARINT_MAX + UINT64_C(1),
+                moq_simpair_now_us(sp)),
+            (int)MOQ_OK);
+
+        moq_simpair_destroy(sp);
+    }
+
     MOQ_TEST_PASS("d18_object");
     return failures != 0;
 }

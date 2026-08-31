@@ -2987,6 +2987,7 @@ static const moq_profile_ops_t d18_ops = {
     .process_control_data    = d18_process_control_data,
     .min_track_namespace_fields = 0,
     .uses_request_streams    = true,
+    .object_payload_len_max  = MOQ_VI64_MAX,
     .location_varint_max     = MOQ_VI64_MAX,
     .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */
     .request_error_wire_max  = MOQ_VI64_MAX,

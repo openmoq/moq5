@@ -338,6 +338,14 @@ typedef struct moq_profile_ops {
     bool uses_request_streams;
 
     /*
+     * Capability: the largest Object Payload Length this profile can encode.
+     * Draft-16 uses a QUIC varint (2^62-1); draft-18 uses vi64 and therefore
+     * accepts the full uint64_t range. Draft-neutral write paths must use this
+     * instead of imposing the draft-16 ceiling on every profile.
+     */
+    uint64_t object_payload_len_max;
+
+    /*
      * Capability: the largest value a Location field (group / object id) can
      * carry on the wire for this profile. Draft-16 uses the QUIC varint
      * (MOQ_QUIC_VARINT_MAX == 2^62-1); draft-18's vi64 spans the full 64-bit

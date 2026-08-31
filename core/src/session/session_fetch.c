@@ -1848,7 +1848,8 @@ moq_result_t moq_session_write_fetch_object(
         return MOQ_ERR_WRONG_STATE;
 
     size_t payload_len = cfg->payload ? moq_rcbuf_len(cfg->payload) : 0;
-    if (payload_len > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (!session_payload_size_fits_profile(s, payload_len))
+        return MOQ_ERR_INVAL;
     size_t props_len = cfg->properties ? moq_rcbuf_len(cfg->properties) : 0;
 
     /* Refuse object properties the draft forbids (draft-18: a Mandatory Track

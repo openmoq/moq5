@@ -355,7 +355,8 @@ moq_result_t moq_session_write_object(
         return MOQ_ERR_INVAL;
 
     size_t payload_len = moq_rcbuf_len(payload);
-    if (payload_len > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (!session_payload_size_fits_profile(s, payload_len))
+        return MOQ_ERR_INVAL;
 
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -503,7 +504,8 @@ moq_result_t moq_session_write_object_ex(
         return MOQ_ERR_INVAL;
 
     size_t payload_len = cfg->payload ? moq_rcbuf_len(cfg->payload) : 0;
-    if (payload_len > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (!session_payload_size_fits_profile(s, payload_len))
+        return MOQ_ERR_INVAL;
     size_t props_len = cfg->properties ? moq_rcbuf_len(cfg->properties) : 0;
 
     /* Properties require extensions-enabled subgroup. */
@@ -718,7 +720,8 @@ moq_result_t moq_session_begin_object(
     if (entry->has_prev_object && object_id <= entry->prev_object_id)
         return MOQ_ERR_INVAL;
 
-    if (payload_length > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (payload_length > s->profile->object_payload_len_max)
+        return MOQ_ERR_INVAL;
 
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
@@ -790,7 +793,8 @@ moq_result_t moq_session_begin_object_ex(
     if (entry->has_prev_object && cfg->object_id <= entry->prev_object_id)
         return MOQ_ERR_INVAL;
 
-    if (cfg->payload_length > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (cfg->payload_length > s->profile->object_payload_len_max)
+        return MOQ_ERR_INVAL;
 
     size_t props_len = cfg->properties ? moq_rcbuf_len(cfg->properties) : 0;
     if (props_len > 0 && !entry->has_extensions) return MOQ_ERR_INVAL;
