@@ -36,7 +36,12 @@ target_include_directories(moq-adapter-pico-wt
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-find_package(OpenSSL REQUIRED)
+if(MOQ_WITH_OPENSSL)
+    find_package(OpenSSL REQUIRED)
+    set(_moq_openssl_link OpenSSL::SSL OpenSSL::Crypto)
+else()
+    set(_moq_openssl_link "")
+endif()
 
 # picohttp-core is PUBLIC: <moq/pico_wt.h> publicly includes
 # pico_webtransport.h / h3zero_common.h, so consumers of the adapter
@@ -46,7 +51,7 @@ find_package(OpenSSL REQUIRED)
 # the build-tree target name must never leak into an export.
 target_link_libraries(moq-adapter-pico-wt
     PUBLIC  moq::core $<BUILD_INTERFACE:${_PICOHTTP}>
-    PRIVATE OpenSSL::SSL OpenSSL::Crypto
+    PRIVATE ${_moq_openssl_link}
 )
 
 # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
@@ -67,7 +72,10 @@ endif()
 # adapter-pico-wt)` works against ${PROJECT_BINARY_DIR}, mirroring the
 # picoquic adapter. The install-tree counterpart is generated in the
 # install section below.
-set(_picowt_link "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_PICOHTTP}")
+set(_picowt_link "moq::core;${_PICOHTTP}")
+if(MOQ_WITH_OPENSSL)
+    set(_picowt_link "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_PICOHTTP}")
+endif()
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqPicoWtAdapterTargets.cmake"
     CONTENT "\
@@ -471,7 +479,7 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     target_link_libraries(moq-adapter-pico-wt-managed
         PUBLIC  moq::adapter-pico-wt moq::adapter-picoquic
         PRIVATE $<BUILD_INTERFACE:${_PICOHTTP}> ${_PICO_CORE}
-                Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+                Threads::Threads ${_moq_openssl_link})
     # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
     target_compile_definitions(moq-adapter-pico-wt-managed PRIVATE
         MOQ_BUILDING)

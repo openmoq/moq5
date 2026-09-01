@@ -12,8 +12,13 @@ else()
     message(FATAL_ERROR "No picoquic-core target available")
 endif()
 
+if(MOQ_WITH_OPENSSL)
+    set(_moq_pq_verify moq_picoquic_verify.c)
+else()
+    set(_moq_pq_verify moq_picoquic_verify_unavailable.c)
+endif()
 add_library(moq-adapter-picoquic
-    moq_picoquic.c picoquic_endpoint.c moq_picoquic_verify.c
+    moq_picoquic.c picoquic_endpoint.c ${_moq_pq_verify}
     ../common/moq_pq_send_queue.c)
 add_library(moq::adapter-picoquic ALIAS moq-adapter-picoquic)
 
@@ -31,6 +36,7 @@ target_include_directories(moq-adapter-picoquic
 # picoquic modes). PRIVATE: not part of the public interface (the public
 # header forward-declares picoquic_quic_t only). A deliberate, actionable
 # error if absent — never a cryptic missing-header failure mid-build.
+if(MOQ_WITH_OPENSSL)
 find_path(MOQ_PTLS_OPENSSL_INCLUDE_DIR
     NAMES picotls/openssl.h
     HINTS
@@ -52,6 +58,10 @@ target_include_directories(moq-adapter-picoquic
     PRIVATE ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
 
 find_package(OpenSSL REQUIRED)
+set(_moq_openssl_link OpenSSL::SSL OpenSSL::Crypto)
+else()
+set(_moq_openssl_link "")
+endif()
 
 # Resolve picoquic-log target name before linking.
 set(_PQ_LOG "")
@@ -62,7 +72,7 @@ elseif(TARGET picoquic-log)
 endif()
 
 target_link_libraries(moq-adapter-picoquic
-    PUBLIC moq::core OpenSSL::SSL OpenSSL::Crypto
+    PUBLIC moq::core ${_moq_openssl_link}
     PUBLIC $<BUILD_INTERFACE:${_PQ}>)
 
 if(_PQ_LOG)
@@ -105,7 +115,10 @@ install(FILES moq_picoquic.h
 # consumption (absolute paths) and one for install-tree (relocatable).
 
 # Build-tree targets (absolute paths — valid on this machine)
-set(_adapter_pq_link "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_PQ}")
+set(_adapter_pq_link "moq::core;${_PQ}")
+if(MOQ_WITH_OPENSSL)
+    set(_adapter_pq_link "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_PQ}")
+endif()
 if(_PQ_LOG)
     string(APPEND _adapter_pq_link ";${_PQ_LOG}")
 endif()
