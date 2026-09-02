@@ -338,6 +338,24 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->handshake_timeout_us = cfg->handshake_timeout_us;
     }
 
+    /* Delegated verifier: the same complete-presence gate. Rejected rather
+     * than ignored where it could not take effect. */
+    out->cert_verifier = NULL;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, cert_verifier) +
+            sizeof(cfg->cert_verifier)) {
+        if (cfg->cert_verifier != NULL) {
+            if (cfg->cert_verifier->verify_chain == NULL) return MOQ_ERR_INVAL;
+            /* These also mean "not the native verifier" but disagree about
+             * what to do instead; refuse rather than pick one. */
+            if (cfg->insecure_skip_verify || cfg->ca_file.len != 0)
+                return MOQ_ERR_INVAL;
+            if (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+                return MOQ_ERR_UNSUPPORTED;
+            out->cert_verifier = cfg->cert_verifier;
+        }
+    }
+
     return resolve_versions(&cfg->versions, out);
 }
 
@@ -399,6 +417,7 @@ struct moq_endpoint {
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
     char *ca_file; size_t ca_file_len; /* NULL = system roots */
     bool  insecure;
+    const moq_cert_verifier_t *cert_verifier;  /* borrowed; NULL = native */
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
 
     /* The version offer as transport tokens, preference order. The ALPN
@@ -706,6 +725,8 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
     if (ep->handshake_timeout_us > 0)
         picoquic_set_default_handshake_timeout(quic, ep->handshake_timeout_us);
     if (ep->insecure) return 0;
+    if (ep->cert_verifier != NULL)
+        return moq_picoquic_set_platform_cert_verifier(quic, ep->cert_verifier);
     return moq_picoquic_set_cert_verifier(quic, ep->ca_file);
 }
 #endif
@@ -1646,6 +1667,7 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     ep->protocol = r.protocol;
     ep->insecure = cfg->insecure_skip_verify;
     ep->handshake_timeout_us = r.handshake_timeout_us;
+    ep->cert_verifier = r.cert_verifier;
     atomic_init(&ep->interrupted, false);
     atomic_init(&ep->closed, false);
     pthread_mutex_init(&ep->mu, NULL);

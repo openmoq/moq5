@@ -53,6 +53,7 @@
  */
 
 #include <moq/export.h>
+#include <moq/cert_verifier.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,14 @@ MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
  * loaded. Lets the service endpoint report a bad CA file as a configuration
  * error (MOQ_ERR_INVAL) up front, rather than as a generic connect failure. */
 MOQ_API int moq_picoquic_ca_file_loadable(const char *ca_file);
+
+/*
+ * Delegate the chain decision to `verifier` instead of validating against a CA
+ * file -- see <moq/cert_verifier.h>. picotls still verifies CertificateVerify.
+ * `verifier` is borrowed and must outlive `quic`. 0 on success.
+ */
+MOQ_API int moq_picoquic_set_platform_cert_verifier(
+    picoquic_quic_t *quic, const moq_cert_verifier_t *verifier);
 
 #ifdef __cplusplus
 }

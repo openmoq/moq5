@@ -35,6 +35,7 @@
 
 #include <moq/types.h>
 #include <moq/session.h>
+#include <moq/cert_verifier.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -235,6 +236,18 @@ typedef struct moq_endpoint_cfg {
      * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint64_t handshake_timeout_us;
+    /* appended (enabled by struct_size): delegate the certificate chain
+     * decision to the application instead of validating against ca_file or the
+     * system trust store -- see <moq/cert_verifier.h>. Borrowed, so it must
+     * outlive the endpoint; NULL keeps the native verifier.
+     *
+     * Honored only by the picoquic backend, whose connect path has the
+     * configure_quic hook this installs through; a non-NULL value on any other
+     * backend is a connect-time MOQ_ERR_UNSUPPORTED, not a silent no-op, as
+     * with wt_profile. Mutually exclusive with insecure_skip_verify and with a
+     * non-empty ca_file (MOQ_ERR_INVAL both ways): each of those also means
+     * "not the native verifier", but they disagree about what to do instead. */
+    const moq_cert_verifier_t *cert_verifier;
 } moq_endpoint_cfg_t;
 
 /* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).

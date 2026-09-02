@@ -6,6 +6,7 @@
  * compile against this via the moq-service-test-internals target.
  */
 
+#include <moq/cert_verifier.h>
 #include <moq/endpoint.h>
 #include <moq/url.h>
 
@@ -38,6 +39,9 @@ typedef struct moq_endpoint_resolved {
      * the picoquic backends -- resolve rejects a non-zero value on any backend
      * that cannot apply it. */
     uint64_t      handshake_timeout_us;
+    /* Delegated chain verifier, struct_size-gated at resolve; NULL when the
+     * cfg predates the field or supplies none. Borrowed from the cfg. */
+    const moq_cert_verifier_t *cert_verifier;
 } moq_endpoint_resolved_t;
 
 /*
