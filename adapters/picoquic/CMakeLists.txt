@@ -493,6 +493,20 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
     add_test(NAME threaded_keepalive COMMAND test_threaded_keepalive)
 
+    # stop() on a facade whose connection is open must send CONNECTION_CLOSE
+    # before joining the thread: a loopback threaded server sees its
+    # connection count drop within seconds of the client's stop(), not after
+    # the idle timeout. Real handshake over loopback (needs the test cert).
+    add_executable(test_threaded_stop_close tests/test_threaded_stop_close.c)
+    target_link_libraries(test_threaded_stop_close PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_compile_definitions(test_threaded_stop_close PRIVATE
+        MOQ_TEST_CERT_PATH="${_pq_tls_cert}"
+        MOQ_TEST_KEY_PATH="${_pq_tls_key}")
+    add_test(NAME threaded_stop_close COMMAND test_threaded_stop_close)
+    set_tests_properties(threaded_stop_close PROPERTIES
+        TIMEOUT 60 SKIP_RETURN_CODE 77)
+
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
     add_test(NAME adapter_threaded_consumer

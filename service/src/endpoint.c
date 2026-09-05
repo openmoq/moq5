@@ -1216,6 +1216,10 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     fc.wt_protocols = ep->wt_offer;
     fc.configure_quic = ep_configure_quic;
     fc.configure_quic_ctx = ep;
+    /* Same keepalive as the raw picoquic facade: a publisher waiting for its
+     * first subscriber sends nothing, and red5-moq-relay / moxygen idle a
+     * silent WebTransport session out after 30 s. */
+    fc.keep_alive_interval_ms = 15000;
     fc.on_pump = ep_wt_pump;
     fc.on_pump_ctx = ep;
     moq_pico_wt_managed_t *fac = NULL;

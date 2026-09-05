@@ -320,6 +320,14 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
  * MUST NOT be called from on_lane_pump or on_activity; returns
  * MOQ_ERR_WRONG_STATE if detected.
  *
+ * Connections still open when stop() is called are closed on the wire
+ * first: the loop sends CONNECTION_CLOSE (application code 0) on each and
+ * is given a short bounded window (MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US) to
+ * put it on the wire before the thread is joined, so the peer sees a
+ * prompt close instead of an idle timeout. The same applies when
+ * on_lane_pump requests termination. Stopping does not wait for the
+ * peer's reply.
+ *
  * After return, no more callbacks will fire. The caller must then
  * destroy its facade (if any) and call _destroy().
  */

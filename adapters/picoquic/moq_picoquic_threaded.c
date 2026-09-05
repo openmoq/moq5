@@ -148,6 +148,12 @@ struct moq_pq_threaded {
                                          * done (no queued/ready stream data or
                                          * unsent FIN). Read by drain_state. */
     bool                loop_exited;    /* loop acknowledged stop request */
+    bool                loop_running;   /* between the ready callback and the
+                                         * loop's own termination; stop() waits
+                                         * (bounded) for it to clear so a queued
+                                         * CONNECTION_CLOSE reaches the wire */
+    bool                local_close_started;      /* network thread only */
+    uint64_t            local_close_deadline_us;  /* network thread only */
     bool                loop_came_up;   /* packet loop reached its ready
                                            callback (latched; a later loop
                                            exit does not clear it) */
@@ -785,6 +791,73 @@ static uint64_t pq_sum_pkts_sent(moq_pq_threaded_t *t)
     return sum;
 }
 
+/* Bounded window a local stop/pump-exit gives the packet loop to put the
+ * CONNECTION_CLOSE on the wire before the network thread is joined. */
+#ifndef MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US
+#define MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US 250000u
+#endif
+
+/* Every loop exit goes through here so stop() can tell a loop that is
+ * still flushing from one that is gone (loop_running). Network thread. */
+static int loop_terminate(moq_pq_threaded_t *t)
+{
+    pthread_mutex_lock(&t->mutex);
+    t->loop_running = false;
+    t->loop_exited = true;
+    pthread_cond_broadcast(&t->cond);
+    pthread_mutex_unlock(&t->mutex);
+    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+}
+
+/* A stop() or pump-exit while a connection is still open used to end the
+ * packet loop at once, leaving the QUIC connection dangling: nothing was ever
+ * sent, the peer only learned of the departure through its idle timeout
+ * (30 s on red5-moq-relay and moxygen), and a publisher that reconnected
+ * meanwhile could find its namespace still held by the ghost session. Send
+ * CONNECTION_CLOSE on every open connection and let the loop run its send
+ * pass; picoquic moves a connection to closing once the frame is out. The
+ * client cnx is owned by the application (picoquic never deletes it), so its
+ * state can be polled; a server cnx may be deleted by picoquic once
+ * disconnected (the record's pointer is cleared by server_conn_after_callback),
+ * so the server side relies on the bounded deadline instead. Returns 0 while
+ * the flush is in progress and the terminate code once it is done. */
+static int local_close_step(moq_pq_threaded_t *t, picoquic_quic_t *quic)
+{
+    uint64_t now = picoquic_get_quic_time(quic);
+    bool client = t->perspective == MOQ_PERSPECTIVE_CLIENT;
+    if (!t->local_close_started) {
+        t->local_close_started = true;
+        t->local_close_deadline_us = now + MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US;
+        bool sent = false;
+        if (client) {
+            bool peer_gone;
+            pthread_mutex_lock(&t->mutex);
+            peer_gone = t->fatal;
+            pthread_mutex_unlock(&t->mutex);
+            if (t->active_cnx && !peer_gone &&
+                picoquic_get_cnx_state(t->active_cnx) < picoquic_state_disconnecting) {
+                picoquic_close(t->active_cnx, 0);
+                sent = true;
+            }
+        } else {
+            for (size_t i = 0; i < t->conn_count; i++) {
+                picoquic_cnx_t *cnx = t->conns[i]->cnx;
+                if (cnx && picoquic_get_cnx_state(cnx) < picoquic_state_disconnecting) {
+                    picoquic_close(cnx, 0);
+                    sent = true;
+                }
+            }
+        }
+        if (sent)
+            return 0;   /* let this cycle's send pass emit the frame(s) */
+        return loop_terminate(t);   /* nothing to flush */
+    }
+    bool done = now >= t->local_close_deadline_us;
+    if (!done && client && t->active_cnx)
+        done = picoquic_get_cnx_state(t->active_cnx) >= picoquic_state_closing_received;
+    return done ? loop_terminate(t) : 0;
+}
+
 static int loop_callback(picoquic_quic_t *quic,
     picoquic_packet_loop_cb_enum cb_mode,
     void *callback_ctx, void *callback_arg)
@@ -796,6 +869,7 @@ static int loop_callback(picoquic_quic_t *quic,
         t->network_thread_id = pthread_self();
         t->network_thread_id_set = true;
         t->loop_came_up = true;
+        t->loop_running = true;
         pthread_cond_broadcast(&t->cond);
         pthread_mutex_unlock(&t->mutex);
         return 0;
@@ -843,14 +917,10 @@ static int loop_callback(picoquic_quic_t *quic,
      * reliably interrupt a blocked wait on every platform, so without
      * this the join would stall until the loop's natural timer. */
     pthread_mutex_lock(&t->mutex);
-    bool stop_requested = t->stopped;
-    if (stop_requested) {
-        t->loop_exited = true;
-        pthread_cond_broadcast(&t->cond);
-    }
+    bool stop_requested = t->stopped || t->pump_exit;
     pthread_mutex_unlock(&t->mutex);
     if (stop_requested)
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return local_close_step(t, quic);   /* close on the wire, then leave */
 
     /* Client mode (deferred-offer): before the session exists, the only
      * terminal signal is the connection dying (e.g. ALPN no-overlap ends the
@@ -868,7 +938,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
         client_final_pump(t, quic);
         mark_activity(t);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(t);
     }
 
     /* --- SERVER: service every connection, one on_lane_pump, then prune. A
@@ -895,7 +965,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 t->pump_exit = true;
                 pthread_mutex_unlock(&t->mutex);
                 mark_activity(t);
-                return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                return local_close_step(t, quic);
             }
         }
         /* Every conn dead before/during that pump was observable by it. */
@@ -923,7 +993,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 t->pump_exit = true;
                 pthread_mutex_unlock(&t->mutex);
                 mark_activity(t);
-                return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                return local_close_step(t, quic);
             }
             server_mark_dead_observed(t);
         }
@@ -1000,7 +1070,7 @@ static int loop_callback(picoquic_quic_t *quic,
             pthread_mutex_unlock(&t->mutex);
             client_final_pump(t, quic);
             mark_activity(t);
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return loop_terminate(t);
         }
     }
 
@@ -1012,7 +1082,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
         client_final_pump(t, quic);
         mark_activity(t);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(t);
     }
 
     if (t->on_lane_pump) {
@@ -1024,7 +1094,7 @@ static int loop_callback(picoquic_quic_t *quic,
             t->pump_exit = true;
             pthread_mutex_unlock(&t->mutex);
             mark_activity(t);
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return local_close_step(t, quic);
         }
     }
 
@@ -1037,7 +1107,7 @@ static int loop_callback(picoquic_quic_t *quic,
          * it could not have observed it. One final observing pump. */
         client_final_pump(t, quic);
         mark_activity(t);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(t);
     }
 
     /* Set app wake time for session deadlines. */
@@ -1563,7 +1633,11 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
         clock_gettime(CLOCK_REALTIME, &deadline);
         deadline.tv_sec += 3;
         pthread_mutex_lock(&t->mutex);
-        while (!t->loop_exited && !t->fatal && !t->pump_exit) {
+        /* loop_running clears when the loop leaves on its own -- after the
+         * close flush on a stop, or on a fatal / pump-exit / clean close
+         * that already ended it -- and is never set for a loop that never
+         * came up. */
+        while (t->loop_running) {
             if (pthread_cond_timedwait(&t->cond, &t->mutex,
                                        &deadline) == ETIMEDOUT)
                 break;
