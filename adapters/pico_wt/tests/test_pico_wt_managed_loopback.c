@@ -219,6 +219,9 @@ typedef struct {
     int        do_done;
     int        done_sent;
     int        done_rc;          /* moq_session_publish_namespace_done() result */
+    /* stop_close mode: keep pumping after the object (no GOAWAY, no
+     * pump-exit) so the test can stop() a facade whose connection is open. */
+    int        keep_running;
 } client_app_t;
 
 static void client_subscribe(moq_session_t *s, client_app_t *a)
@@ -315,7 +318,7 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
         }
         moq_event_cleanup(&ev);
     }
-    if (a->initiate_goaway)
+    if (a->initiate_goaway || a->keep_running)
         return 0;  /* keep running to reach the terminal closed state */
     return atomic_load(&a->got_object) ? 1 : 0;  /* else pump-exit */
 }
@@ -538,6 +541,82 @@ static run_status_t run_loopback_proto(const char *cert, const char *key,
         return RUN_HARD;                  /* real handshake/object failure */
     }
     fprintf(stderr, "[loopback] port %d: no setup reached "
+            "(retryable; port may be busy)\n", port);
+    return RUN_RETRY;
+}
+
+/* stop() closes an open connection on the wire. After the object the client
+ * keeps pumping (no GOAWAY, no pump-exit) and the test stops it while its
+ * connection is up. The server must learn of the departure promptly -- from
+ * the client's CONNECTION_CLOSE, not from its own idle timeout -- so its
+ * facade reaches the closed state within a couple of seconds, and never
+ * fatal. Before the fix stop() only joined the network thread: nothing was
+ * sent and a relay held the ghost session (and the namespace it announced)
+ * until the 30 s idle timeout. */
+static run_status_t run_stop_close(const char *cert, const char *key,
+                                   int port, int timeout_sec)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
+    if (!srv) return RUN_RETRY;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    atomic_init(&capp.got_object, 0);
+    capp.keep_running = 1;
+    moq_pico_wt_managed_t *cli =
+        make_client(moq_pico_wt_managed_local_port(srv), &capp);
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    wait_for_object(cli, &capp, timeout_sec);
+    int got = atomic_load(&capp.got_object);
+    int cli_fatal = moq_pico_wt_managed_is_fatal(cli);
+
+    /* The connection is open and idle: stop() must close it on the wire. */
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    moq_pico_wt_managed_stop(cli);
+    int reached_setup = capp.subscribed;
+
+    int srv_closed = 0;
+    double waited_s = 0.0;
+    if (got) {
+        for (;;) {
+            if (moq_pico_wt_managed_is_closed(srv)) { srv_closed = 1; break; }
+            moq_pico_wt_managed_wait(srv, 100000);
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            waited_s = (double)(t1.tv_sec - t0.tv_sec) +
+                       (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+            if (waited_s >= 3.0) break;
+        }
+    }
+    int srv_fatal = moq_pico_wt_managed_is_fatal(srv);
+
+    moq_pico_wt_managed_destroy(cli);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+
+    if (got) {
+        CHECK(!cli_fatal);
+        if (!srv_closed)
+            fprintf(stderr, "[stop_close] server did not observe the client's "
+                            "close within %.1fs (idle timeout instead?)\n",
+                    waited_s);
+        CHECK(srv_closed);
+        CHECK(!srv_fatal);
+        return RUN_OK;
+    }
+    if (reached_setup || cli_fatal) {
+        fprintf(stderr, "[stop_close] port %d HARD FAIL: setup=%d fatal=%d "
+                        "got=0\n", port, reached_setup, cli_fatal);
+        return RUN_HARD;
+    }
+    fprintf(stderr, "[stop_close] port %d: no setup reached "
             "(retryable; port may be busy)\n", port);
     return RUN_RETRY;
 }
@@ -1453,16 +1532,17 @@ int main(int argc, char **argv)
     int announce_done_no_rsa = !strcmp(mode, "announce_done_no_rsa");
     int loopback_18 = !strcmp(mode, "loopback_18");
     int alpn_close_18 = !strcmp(mode, "alpn_close_18");
+    int stop_close = !strcmp(mode, "stop_close");
     if (!refuse && !close_mode && !nego && !nego_refuse && !nego_legacy &&
         !nego_legacy_18 && !no_rsa && !bigobj && !bigobj_smallwin &&
         !bigobj_drain && !announce && !announce_18 && !announce_done_18 &&
         !announce_done_no_rsa && !loopback_18 && !alpn_close_18 &&
-        strcmp(mode, "loopback") != 0) {
+        !stop_close && strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "nego|nego_refuse|nego_legacy|nego_legacy_18|"
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
                 "announce|announce_18|announce_done_18|announce_done_no_rsa|"
-                "loopback_18|alpn_close_18)\n", mode);
+                "loopback_18|alpn_close_18|stop_close)\n", mode);
         return 2;
     }
 
@@ -1481,6 +1561,7 @@ int main(int argc, char **argv)
     run_status_t st = RUN_RETRY;
     for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
         st = refuse         ? run_refuse(cert, key, ports[i], 6)
+           : stop_close     ? run_stop_close(cert, key, ports[i], 6)
            : close_mode     ? run_close(cert, key, ports[i], 6)
            : nego           ? run_nego(cert, key, ports[i], 6)
            : nego_refuse    ? run_nego_refuse(cert, key, ports[i], 6)

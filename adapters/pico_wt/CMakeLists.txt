@@ -758,6 +758,17 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # stop() on a facade whose connection is open must send
+        # CONNECTION_CLOSE before joining the thread: the server observes the
+        # departure within seconds, not after its idle timeout.
+        add_test(NAME pico_wt_managed_stop_close
+            COMMAND test_pico_wt_managed_loopback --mode stop_close
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_stop_close PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
         # Graceful drain: publish 256 KiB under a forced ~64 KiB window, poll the
         # drain predicate until the publisher's transport reports flushed, and
         # prove full delivery at that point (backs moq_endpoint_drain).
@@ -866,6 +877,26 @@ endif()\n")
                 "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
         set_tests_properties(pico_wt_ownership PROPERTIES
             TIMEOUT 60 LABELS "network;pico_wt;managed")
+
+        # Keepalive arming oracle for the managed WT facade (mirrors
+        # threaded_keepalive): keep_alive_interval_ms is applied to the client
+        # connection with the converted microsecond interval, 0 arms nothing,
+        # and a short struct_size never reads the appended field. Same
+        # test-internals recompile as the ownership oracle.
+        add_executable(test_pico_wt_managed_keepalive
+            tests/test_pico_wt_managed_keepalive.c
+            pico_wt_managed.c
+            pico_wt_adapter.c
+            pico_wt_endpoint.c
+            ../common/moq_pq_send_queue.c
+        )
+        target_compile_definitions(test_pico_wt_managed_keepalive PRIVATE MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_managed_keepalive PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_pico_wt_managed_keepalive PRIVATE moq::adapter-pico-wt-managed)
+        add_test(NAME pico_wt_managed_keepalive COMMAND test_pico_wt_managed_keepalive)
+        set_tests_properties(pico_wt_managed_keepalive PROPERTIES
+            TIMEOUT 30 LABELS "pico_wt;managed")
 
         # WT protocol-token negotiation through the managed pair: the
         # d16-only server selects from the client's {18, 16} offer, and a

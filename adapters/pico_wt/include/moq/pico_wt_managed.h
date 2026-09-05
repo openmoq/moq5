@@ -198,6 +198,18 @@ typedef struct moq_pico_wt_managed_cfg {
     uint64_t         (*app_deadline_us)(void *ctx);
     void              *app_deadline_ctx;
 
+    /* Appended (struct_size append-only ABI). QUIC keepalive interval in
+     * milliseconds for every connection this facade owns (the client
+     * connection, and each accepted server connection). 0 = no keepalive
+     * (the default). A nonzero value calls picoquic_enable_keep_alive with
+     * the converted microsecond interval, so an otherwise idle session (a
+     * publisher waiting for its first subscriber, a subscriber between
+     * groups) keeps sending PING and is not idle-timed-out by the peer;
+     * red5-moq-relay and moxygen both close a silent connection after 30 s.
+     * Mirrors moq_pq_threaded_cfg_t.keep_alive_interval_ms. Read only when
+     * struct_size covers it. */
+    uint32_t           keep_alive_interval_ms;
+
 } moq_pico_wt_managed_cfg_t;
 
 /* Pointer initializer: clears and stamps the full current struct; set any field,
@@ -227,6 +239,13 @@ MOQ_API moq_result_t moq_pico_wt_managed_create(
  * Stop and join the network thread. Idempotent. MUST NOT be called
  * from on_pump/on_activity (returns MOQ_ERR_WRONG_STATE). After return,
  * no more callbacks fire; then call _destroy.
+ *
+ * A connection that is still open when stop() is called is closed on the
+ * wire first: the loop sends CONNECTION_CLOSE (application code 0) and is
+ * given a short bounded window (MOQ_PICO_WT_LOCAL_CLOSE_FLUSH_US) to put
+ * it on the wire before the thread is joined, so the peer sees a prompt
+ * close instead of an idle timeout. The same applies when on_pump
+ * requests termination. Stopping does not wait for the peer's reply.
  */
 MOQ_API moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m);
 

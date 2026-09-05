@@ -40,6 +40,12 @@
  * budget so a large object is admitted in full. */
 #define PICO_WT_MANAGED_RECV_FLOW_CONTROL (16u * 1024u * 1024u)
 
+/* Bounded window a local stop/pump-exit gives the packet loop to put the
+ * CONNECTION_CLOSE on the wire before the network thread is joined. */
+#ifndef MOQ_PICO_WT_LOCAL_CLOSE_FLUSH_US
+#define MOQ_PICO_WT_LOCAL_CLOSE_FLUSH_US 250000u
+#endif
+
 /* Advertise the inbound uni-stream + connection receive credit on the default
  * transport parameters, so every cnx created from this quic context (client
  * cnx and inbound server cnxs) inherits it. picowt's per-cnx parameter setup
@@ -86,6 +92,7 @@ struct moq_pico_wt_managed {
     void              *on_activity_ctx;
     uint64_t         (*app_deadline_us)(void *);   /* optional service deadline */
     void              *app_deadline_ctx;
+    uint32_t           keep_alive_interval_ms;  /* 0 = keepalive disabled */
 
     /* Owned transport. */
     picoquic_quic_t   *quic;
@@ -122,6 +129,12 @@ struct moq_pico_wt_managed {
     uint64_t           close_flush_deadline_us;    /* network thread only */
     bool               stopped;
     bool               loop_came_up;   /* loop reached ready (latched) */
+    bool               loop_running;   /* between the ready callback and the
+                                        * loop's own termination; stop() waits
+                                        * (bounded) for it to clear so a queued
+                                        * CONNECTION_CLOSE reaches the wire */
+    bool               local_close_started;      /* network thread only */
+    uint64_t           local_close_deadline_us;  /* network thread only */
     bool               pump_exit;
     bool               tx_drained;      /* network thread: local stream flush
                                          * done (no queued/ready stream data or
@@ -143,6 +156,8 @@ struct moq_pico_wt_managed {
     size_t            test_ev_overflow;
 #endif
 };
+
+static void pwt_arm_keep_alive(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx);
 
 /* -- cfg helpers ---------------------------------------------------- */
 
@@ -534,6 +549,8 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     m->test_ctrl_sid  = stream_ctx->stream_id;
     m->test_ctrl_have = 1;
 #endif
+    /* An explicit keepalive applies to accepted server connections too. */
+    pwt_arm_keep_alive(m, cnx);
     pthread_mutex_lock(&m->mutex);
     m->session = session;
     m->conn = conn;
@@ -550,6 +567,89 @@ fail:
     pthread_mutex_unlock(&m->mutex);
     mark_activity(m);
     return -1;
+}
+
+/* -- Keepalive ------------------------------------------------------ */
+
+#if defined(MOQ_PICO_WT_TESTING)
+/* TEST-ONLY seam: when set, replaces picoquic_enable_keep_alive so a unit test
+ * can prove the facade arms keepalive exactly once per connection, on a
+ * non-NULL cnx, with the converted microsecond interval -- without a live
+ * handshake or a real idle timeout. Production compiles none of this and
+ * calls picoquic_enable_keep_alive() directly. */
+void (*moq_pico_wt_test_keep_alive)(picoquic_cnx_t *, uint64_t);
+unsigned moq_pico_wt_test_keep_alive_calls;
+picoquic_cnx_t *moq_pico_wt_test_keep_alive_last_cnx;
+uint64_t moq_pico_wt_test_keep_alive_last_interval_us;
+#endif
+
+/* Arm QUIC keepalive on one connection this facade owns, when configured.
+ * interval_ms == 0 disables keepalive (no call). Called for the client
+ * connection and every accepted server connection. */
+static void pwt_arm_keep_alive(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx)
+{
+    if (m->keep_alive_interval_ms == 0 || !cnx) return;
+    uint64_t interval_us = (uint64_t)m->keep_alive_interval_ms * 1000u;
+#if defined(MOQ_PICO_WT_TESTING)
+    if (moq_pico_wt_test_keep_alive)
+        moq_pico_wt_test_keep_alive(cnx, interval_us);
+    else
+        picoquic_enable_keep_alive(cnx, interval_us);
+    moq_pico_wt_test_keep_alive_calls++;
+    moq_pico_wt_test_keep_alive_last_cnx = cnx;
+    moq_pico_wt_test_keep_alive_last_interval_us = interval_us;
+#else
+    picoquic_enable_keep_alive(cnx, interval_us);
+#endif
+}
+
+/* -- Local termination (stop / pump-exit) --------------------------- */
+
+/* Every loop exit goes through here so stop() can tell a loop that is
+ * still flushing from one that is gone (loop_running). Network thread. */
+static int loop_terminate(moq_pico_wt_managed_t *m)
+{
+    pthread_mutex_lock(&m->mutex);
+    m->loop_running = false;
+    pthread_cond_broadcast(&m->cond);
+    pthread_mutex_unlock(&m->mutex);
+    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+}
+
+/* A stop() or pump-exit while the connection is still open used to end the
+ * packet loop at once, leaving the QUIC connection dangling: nothing was ever
+ * sent, the peer only learned of the departure through its idle timeout
+ * (30 s on red5-moq-relay and moxygen), and a publisher that reconnected
+ * meanwhile could find its namespace still held by the ghost session. Send
+ * CONNECTION_CLOSE and let the loop run its send pass; picoquic moves the
+ * connection to closing once the frame is out. The client cnx is owned by
+ * the application (picoquic never deletes it), so its state can be polled; a
+ * server cnx may be deleted by picoquic once disconnected, so the server side
+ * relies on the bounded deadline instead of dereferencing it again. Returns 0
+ * while the flush is in progress and the terminate code once it is done. */
+static int local_close_step(moq_pico_wt_managed_t *m, picoquic_quic_t *quic)
+{
+    uint64_t now = picoquic_get_quic_time(quic);
+    bool client = m->perspective == MOQ_PERSPECTIVE_CLIENT;
+    if (!m->local_close_started) {
+        m->local_close_started = true;
+        m->local_close_deadline_us = now + MOQ_PICO_WT_LOCAL_CLOSE_FLUSH_US;
+        picoquic_cnx_t *cnx = client ? m->cnx : m->active_cnx;
+        bool peer_closed;
+        pthread_mutex_lock(&m->mutex);
+        peer_closed = m->closed || m->fatal;
+        pthread_mutex_unlock(&m->mutex);
+        if (cnx && !peer_closed &&
+            picoquic_get_cnx_state(cnx) < picoquic_state_disconnecting) {
+            picoquic_close(cnx, 0);
+            return 0;   /* let this cycle's send pass emit the frame */
+        }
+        return loop_terminate(m);   /* nothing to flush */
+    }
+    bool done = now >= m->local_close_deadline_us;
+    if (!done && client && m->cnx)
+        done = picoquic_get_cnx_state(m->cnx) >= picoquic_state_closing_received;
+    return done ? loop_terminate(m) : 0;
 }
 
 /* -- Packet-loop callback (network thread) -------------------------- */
@@ -570,6 +670,7 @@ static int loop_callback(picoquic_quic_t *quic,
         m->network_thread_id = pthread_self();
         m->network_thread_id_set = true;
         m->loop_came_up = true;
+        m->loop_running = true;
         pthread_cond_broadcast(&m->cond);
         pthread_mutex_unlock(&m->mutex);
         if (callback_arg)
@@ -591,6 +692,17 @@ static int loop_callback(picoquic_quic_t *quic,
         return 0;
     }
 
+    /* stop() requested exit (it pipe-woke the loop), or an earlier pump
+     * asked for termination: close the connection on the wire and leave
+     * once the frame is out. Checked before any servicing so the flush
+     * cannot be pre-empted by a fatal/closed path. */
+    bool stop_requested;
+    pthread_mutex_lock(&m->mutex);
+    stop_requested = m->stopped || m->pump_exit;
+    pthread_mutex_unlock(&m->mutex);
+    if (stop_requested)
+        return local_close_step(m, quic);
+
     /* Client connect failure: if the QUIC connection reaches the
      * disconnected state before the WT session is up (handshake
      * timeout, connection refused, cert rejected), surface it as fatal
@@ -610,7 +722,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&m->mutex);
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     /* Snapshot conn (set by the WT callback on this same thread). */
@@ -635,7 +747,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&m->mutex);
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     if (m->on_pump) {
@@ -645,7 +757,7 @@ static int loop_callback(picoquic_quic_t *quic,
             m->pump_exit = true;
             pthread_mutex_unlock(&m->mutex);
             mark_activity(m);
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return local_close_step(m, quic);
         }
     }
 
@@ -658,7 +770,7 @@ static int loop_callback(picoquic_quic_t *quic,
          * it could not have observed it. One final observing pump. */
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     /* Cache terminal state for thread-safe accessors. fatal wins over
@@ -684,7 +796,7 @@ static int loop_callback(picoquic_quic_t *quic,
     if (fatal_now) {
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     /* Clean close: wait()/wake() are already terminal (m->closed), so a
@@ -713,7 +825,7 @@ static int loop_callback(picoquic_quic_t *quic,
             m->close_flush_saw_inflight = true;  /* non-ACK backlog seen */
         if ((m->close_flush_saw_inflight && backlog_empty) ||
             now >= m->close_flush_deadline_us)
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return loop_terminate(m);
         return 0;
     }
 
@@ -907,6 +1019,8 @@ moq_result_t moq_pico_wt_managed_create(
         m->app_deadline_us = cfg->app_deadline_us;
         m->app_deadline_ctx = cfg->app_deadline_ctx;
     }
+    if (CFG_HAS(cfg, keep_alive_interval_ms))
+        m->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
     if (CFG_HAS(cfg, on_activity)) {
         m->on_activity = cfg->on_activity;
         m->on_activity_ctx = cfg->on_activity_ctx;
@@ -1001,6 +1115,10 @@ moq_result_t moq_pico_wt_managed_create(
         picoquic_set_callback(m->cnx, managed_client_h3_callback, m);
         if (picoquic_start_client_cnx(m->cnx) != 0)
             goto fail_configure;
+        /* Keep an otherwise-quiet client connection (a publisher with no
+         * subscriber yet) alive against the peer's idle timeout. No-op
+         * when keep_alive_interval_ms is 0. */
+        pwt_arm_keep_alive(m, m->cnx);
     }
 
     memset(&m->loop_param, 0, sizeof(m->loop_param));
@@ -1089,8 +1207,27 @@ moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m)
         pthread_cond_wait(&m->cond, &m->mutex);
     pthread_mutex_unlock(&m->mutex);
 
-    if (ctx)
+    if (ctx) {
+        /* Pipe-wake the loop so it observes m->stopped, closes a still-open
+         * connection on the wire and exits on its own; wait (bounded) for
+         * that BEFORE picoquic_delete_network_thread, which sets
+         * thread_should_close and would end the loop ahead of the send pass
+         * that carries the CONNECTION_CLOSE. A loop that already exited
+         * (fatal / closed / pump-exit) or never came up has loop_running
+         * clear and is not waited for. */
+        (void)picoquic_wake_up_network_thread(ctx);
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 1;
+        pthread_mutex_lock(&m->mutex);
+        while (m->loop_running) {
+            if (pthread_cond_timedwait(&m->cond, &m->mutex,
+                                       &deadline) == ETIMEDOUT)
+                break;
+        }
+        pthread_mutex_unlock(&m->mutex);
         picoquic_delete_network_thread(ctx);
+    }
 
     pthread_mutex_lock(&m->mutex);
     bool was_fatal = m->fatal;
