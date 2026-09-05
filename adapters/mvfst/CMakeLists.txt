@@ -34,14 +34,17 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # -- Resolve mvfst --------------------------------------------------
 
-find_package(mvfst CONFIG REQUIRED)
-
-# mvfst's static folly/mvfst archives carry unresolved fmt references
-# (libfolly.a(json.cpp.o), libmvfst.a(QuicException.cpp.o)). fmt::fmt must be
-# in the adapter's exported link interface so a consumer naming only
+# fmt BEFORE mvfst: folly's package config references fmt::fmt but does not
+# find it itself, so find_package(mvfst) -> find_dependency(folly) fails with
+# "imported targets are referenced, but are missing: fmt::fmt" unless the
+# target already exists (seen with a moxygen getdeps-built prefix).
+# mvfst's static folly/mvfst archives also carry unresolved fmt references
+# (libfolly.a(json.cpp.o), libmvfst.a(QuicException.cpp.o)), so fmt::fmt must
+# be in the adapter's exported link interface: a consumer naming only
 # moq::adapter-mvfst links without adding fmt directly -- it cannot rely on
 # Folly's package config happening to discover fmt on the consumer side.
 find_package(fmt CONFIG REQUIRED)
+find_package(mvfst CONFIG REQUIRED)
 
 # -- Adapter library ------------------------------------------------
 
