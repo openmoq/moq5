@@ -641,6 +641,29 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(endpoint_lifecycle PROPERTIES
             LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
 
+        # mvfst backend: a media sender attached to an endpoint that went
+        # terminal must still be destroyable (the facade used to free the
+        # session on its fatal loop exit; the sender's inline moq_pub_destroy
+        # then read freed memory). Skips (77) when mvfst is not built.
+        if(MOQ_BUILD_ADAPTER_MVFST AND MOQ_BUILD_PQ_THREADED)
+            add_executable(test_endpoint_mvfst_fatal_teardown
+                tests/test_endpoint_mvfst_fatal_teardown.c)
+            target_link_libraries(test_endpoint_mvfst_fatal_teardown PRIVATE
+                moq::service moq::adapter-mvfst moq::adapter-picoquic-threaded
+                Threads::Threads)
+            target_compile_definitions(test_endpoint_mvfst_fatal_teardown PRIVATE
+                ${_MOQ_SERVICE_FACADE_DEFS})
+            target_include_directories(test_endpoint_mvfst_fatal_teardown PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME endpoint_mvfst_fatal_teardown
+                COMMAND test_endpoint_mvfst_fatal_teardown
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(endpoint_mvfst_fatal_teardown PROPERTIES
+                LABELS "network" TIMEOUT 90 RESOURCE_LOCK service_network
+                SKIP_RETURN_CODE 77)
+        endif()
+
         # Idle managed-loopback discriminator for automatic catalog refresh:
         # a media_sender over a REAL pq_threaded endpoint whose catalog group
         # advances while idle only if the adapter wakes itself at the refresh
