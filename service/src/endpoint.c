@@ -1325,6 +1325,10 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
     fc.send_request_capacity = true;
     fc.initial_request_capacity = 64;
     fc.version = version;
+    /* Same keepalive as the picoquic facades: a publisher waiting for its
+     * first subscriber sends nothing, and red5-moq-relay / moxygen idle a
+     * silent connection out after 30 s. */
+    fc.keep_alive_interval_ms = 15000;
     fc.on_lane_pump = ep_msquic_pump;
     fc.on_lane_pump_user = ep;
     /* app service-deadline (media_sender catalog refresh, etc.): folded into

@@ -264,8 +264,10 @@ MOQ_API moq_result_t moq_mvfst_managed_create(
 
 /*
  * Request clean shutdown. Idempotent. Joins the network thread.
- * After stop returns, no callbacks will fire and the session is
- * destroyed.
+ * After stop returns, no callbacks will fire. The client session stays
+ * allocated (but no longer serviced) until _destroy(), like the picoquic
+ * facades, so a service-tier consumer that still holds it can tear down
+ * after the endpoint went terminal.
  *
  * Must NOT be called from on_lane_pump or on_activity.
  * Returns MOQ_ERR_INVAL if called from the managed thread.

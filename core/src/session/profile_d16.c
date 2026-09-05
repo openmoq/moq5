@@ -38,6 +38,7 @@
  */
 
 #include "session_internal.h"
+#include "request_id_window.h"
 #include "../wire/control_d16_internal.h"
 #include "moq/control.h"
 
@@ -48,7 +49,10 @@
 typedef struct moq_d16_profile_state {
     moq_version_t version;
     uint64_t      next_local_request_id;
-    uint64_t      peer_next_request_id;
+    /* Peer request ids: high-water mark + not-yet-seen ids below it. Requests
+     * on the control stream arrive in order, but PUBLISH_NAMESPACE / PUBLISH /
+     * FETCH on their own bidi streams can overtake each other. */
+    moq_request_id_window_t peer_requests;
     uint64_t      requests_blocked_at;
     uint64_t      next_track_alias;
     bool          request_was_blocked;
@@ -78,8 +82,8 @@ static void d16_init_in_place(void *state, const moq_session_cfg_t *cfg)
 
     d16->next_local_request_id =
         (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 0 : 1;
-    d16->peer_next_request_id =
-        (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 1 : 0;
+    moq_request_id_window_init(&d16->peer_requests,
+        (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 1 : 0);
     d16->requests_blocked_at = UINT64_MAX;
     d16->request_was_blocked = false;
     d16->next_track_alias = 1;
@@ -3135,8 +3139,15 @@ static moq_result_t d16_validate_inbound_request(moq_session_t *s,
     uint64_t expected_parity = peer_is_client ? 0 : 1;
     if ((wire_request_id & 1) != expected_parity)
         return close_with_error(s, 0x4, "wrong request ID parity");
-    if (wire_request_id != d16->peer_next_request_id)
-        return close_with_error(s, 0x4, "request ID not next in sequence");
+    switch (moq_request_id_window_classify(&d16->peer_requests,
+                                           wire_request_id)) {
+    case MOQ_REQUEST_ID_NEW: break;
+    case MOQ_REQUEST_ID_DUPLICATE:
+        return close_with_error(s, 0x4, "duplicate request ID");
+    case MOQ_REQUEST_ID_TOO_FAR_AHEAD:
+        return close_with_error(s, 0x4, "request ID too far ahead of the "
+                                        "lowest outstanding request");
+    }
     uint64_t local_max = s->local_setup.has_max_request_id ?
         s->local_setup.max_request_id : 0;
     if (wire_request_id >= local_max)
@@ -3153,8 +3164,7 @@ static void d16_commit_inbound_request(moq_session_t *s,
 {
     moq_d16_profile_state_t *d16 =
         (moq_d16_profile_state_t *)s->profile_state;
-    (void)ep;
-    d16->peer_next_request_id += 2;
+    moq_request_id_window_commit(&d16->peer_requests, ep->request_id);
 }
 
 static void d16_release_request(moq_session_t *s,
