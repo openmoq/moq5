@@ -641,27 +641,54 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(endpoint_lifecycle PROPERTIES
             LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
 
-        # mvfst backend: a media sender attached to an endpoint that went
-        # terminal must still be destroyable (the facade used to free the
-        # session on its fatal loop exit; the sender's inline moq_pub_destroy
-        # then read freed memory). Skips (77) when mvfst is not built.
-        if(MOQ_BUILD_ADAPTER_MVFST AND MOQ_BUILD_PQ_THREADED)
+        # Managed-facade session lifetime, against a loopback picoquic threaded
+        # server. A media sender attached to an endpoint must still be
+        # destroyable after the facade went terminal (fatal_teardown: the
+        # server closes the connection; the mvfst facade used to free the
+        # session on its fatal loop exit and the sender's inline
+        # moq_pub_destroy read freed memory), and the sender's POSTED destroy
+        # must survive the facade's stop (stop_after_sender_destroy: the msquic
+        # facade used to free the session in stop()'s child reclaim, ahead of
+        # moq_endpoint_stop()'s terminal drain that runs the destroy). Both
+        # take --backend; a backend that is not built skips (77).
+        if(MOQ_BUILD_PQ_THREADED)
             add_executable(test_endpoint_mvfst_fatal_teardown
                 tests/test_endpoint_mvfst_fatal_teardown.c)
-            target_link_libraries(test_endpoint_mvfst_fatal_teardown PRIVATE
-                moq::service moq::adapter-mvfst moq::adapter-picoquic-threaded
-                Threads::Threads)
-            target_compile_definitions(test_endpoint_mvfst_fatal_teardown PRIVATE
-                ${_MOQ_SERVICE_FACADE_DEFS})
-            target_include_directories(test_endpoint_mvfst_fatal_teardown PRIVATE
-                ${CMAKE_SOURCE_DIR}/tests/unit)
-            add_test(NAME endpoint_mvfst_fatal_teardown
-                COMMAND test_endpoint_mvfst_fatal_teardown
-                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
-                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
-            set_tests_properties(endpoint_mvfst_fatal_teardown PROPERTIES
-                LABELS "network" TIMEOUT 90 RESOURCE_LOCK service_network
-                SKIP_RETURN_CODE 77)
+            add_executable(test_endpoint_stop_after_sender_destroy
+                tests/test_endpoint_stop_after_sender_destroy.c)
+            foreach(_lt IN ITEMS test_endpoint_mvfst_fatal_teardown
+                                 test_endpoint_stop_after_sender_destroy)
+                target_link_libraries(${_lt} PRIVATE
+                    moq::service moq::adapter-picoquic-threaded Threads::Threads
+                    ${_MOQ_SERVICE_FACADE_LIBS})
+                target_compile_definitions(${_lt} PRIVATE ${_MOQ_SERVICE_FACADE_DEFS})
+                target_include_directories(${_lt} PRIVATE ${CMAKE_SOURCE_DIR}/tests/unit)
+            endforeach()
+            set(_lt_backends picoquic)
+            if(MOQ_BUILD_ADAPTER_MVFST)
+                list(APPEND _lt_backends mvfst)
+            endif()
+            if(MOQ_BUILD_MSQUIC_MANAGED)
+                list(APPEND _lt_backends msquic)
+            endif()
+            foreach(_lb IN LISTS _lt_backends)
+                add_test(NAME endpoint_stop_after_sender_destroy_${_lb}
+                    COMMAND test_endpoint_stop_after_sender_destroy --backend ${_lb}
+                        --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                        --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+                set_tests_properties(endpoint_stop_after_sender_destroy_${_lb} PROPERTIES
+                    LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network
+                    SKIP_RETURN_CODE 77)
+                if(NOT _lb STREQUAL "picoquic")
+                    add_test(NAME endpoint_${_lb}_fatal_teardown
+                        COMMAND test_endpoint_mvfst_fatal_teardown --backend ${_lb}
+                            --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                            --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+                    set_tests_properties(endpoint_${_lb}_fatal_teardown PROPERTIES
+                        LABELS "network" TIMEOUT 90 RESOURCE_LOCK service_network
+                        SKIP_RETURN_CODE 77)
+                endif()
+            endforeach()
         endif()
 
         # Idle managed-loopback discriminator for automatic catalog refresh:

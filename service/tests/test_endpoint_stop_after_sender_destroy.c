@@ -1,22 +1,20 @@
 /*
- * Managed-facade backends (mvfst, msquic): the client session outlives a
- * fatal loop exit until the endpoint is destroyed, so a media sender still
- * attached to it can be torn down afterwards. --backend selects the facade
- * (default mvfst); a backend that is not built skips (77).
+ * The session outlives the facade's stop() until destroy() on every backend.
  *
- * Reproduces the moqxr crash against red5-moq-relay: the relay closed the
- * session, the mvfst facade's network thread destroyed the MoQ session on its
- * way out, and moq_media_sender_destroy() (which runs moq_pub_destroy() inline
- * once the endpoint is terminal -- nothing can be posted to a dead pump)
- * dereferenced the freed session in track_hist_release. The picoquic facades
- * keep the session until destroy(); the mvfst facade now does the same.
+ * Documented teardown order: destroy the media sender, then stop and destroy
+ * the endpoint. While the endpoint is live, moq_media_sender_destroy() POSTS
+ * its publisher-facade destroy to the pump; moq_endpoint_stop() then stops
+ * the facade and drains the accepted tasks with the closed marker, so the
+ * posted moq_pub_destroy() runs after the facade stopped and releases each
+ * track's history through the publisher's session pointer. A facade that
+ * frees the session in stop() (the msquic facade did, in its child reclaim)
+ * hands that drain freed memory -- ASan: heap-use-after-free in
+ * track_hist_release <- free_track_state <- moq_pub_destroy <-
+ * sender_destroy_pub_task <- ep_drain_terminal <- moq_endpoint_stop, seen
+ * from the moqxr publisher over msquic as a corrupted heap in MsQuicClose.
  *
- * Shape: a loopback picoquic threaded server accepts the mvfst client, the
- * sender announces its namespace and a track (which reserves session-owned
- * history), then the server closes the connection with an application error.
- * The client goes terminal; the sender is destroyed in the documented order
- * (sender, then endpoint stop/destroy). Under ASan the old facade reports a
- * heap-use-after-free in moq_pub_destroy. Args: --cert <file> --key <file>.
+ * Loopback picoquic threaded server; --backend picoquic|mvfst|msquic (a
+ * backend that is not built skips with 77). Args: --cert --key.
  */
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
@@ -28,37 +26,19 @@
 
 #include "test_support.h"
 
-#if defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED)
-
-typedef struct {
-    uint64_t accepted_at_us;   /* first pump that saw a connection */
-    int      closed;           /* close issued */
-} server_ctx_t;
-
-/* Close the (single) accepted connection about a second after it appeared:
- * long enough for SETUP, PUBLISH_NAMESPACE and the track registration. */
 static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now_us, void *ctx)
 {
-    (void)t;
-    server_ctx_t *sc = (server_ctx_t *)ctx;
-    moq_pq_threaded_conn_t *c = NULL;
-    while ((c = moq_pq_threaded_lane_next_conn(lane, c)) != NULL) {
-        if (sc->accepted_at_us == 0) sc->accepted_at_us = now_us;
-        if (!sc->closed && now_us - sc->accepted_at_us > 1000000) {
-            sc->closed = 1;
-            (void)moq_pq_threaded_conn_close(c, 0x10);
-        }
-    }
+    (void)t; (void)lane; (void)now_us; (void)ctx;
     return 0;
 }
 
 static moq_pq_threaded_t *start_server(const char *cert, const char *key,
-                                       server_ctx_t *sc, int *out_port)
+                                       int *out_port)
 {
-    int base = 15300 + (int)(getpid() % 997);
+    int base = 16600 + (int)(getpid() % 997);
     for (int attempt = 0; attempt < 8; attempt++) {
-        int port = base + attempt * 17;
+        int port = base + attempt * 19;
         moq_pq_threaded_cfg_t cfg;
         moq_pq_threaded_cfg_init(&cfg);
         cfg.alloc = moq_alloc_default();
@@ -69,7 +49,6 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
         cfg.send_request_capacity = true;
         cfg.initial_request_capacity = 16;
         cfg.on_lane_pump = server_pump;
-        cfg.on_lane_pump_ctx = sc;
         moq_pq_threaded_t *srv = NULL;
         if (moq_pq_threaded_create(&cfg, &srv) == MOQ_OK) {
             *out_port = port;
@@ -82,9 +61,8 @@ static moq_pq_threaded_t *start_server(const char *cert, const char *key,
 static int run(const char *cert, const char *key, moq_transport_backend_t backend)
 {
     int failures = 0;
-    server_ctx_t sc; memset(&sc, 0, sizeof(sc));
     int port = 0;
-    moq_pq_threaded_t *srv = start_server(cert, key, &sc, &port);
+    moq_pq_threaded_t *srv = start_server(cert, key, &port);
     MOQ_TEST_CHECK(srv != NULL);
     if (!srv) return failures;
     for (int i = 0; i < 3; i++) moq_pq_threaded_wait(srv, 100000);
@@ -96,28 +74,24 @@ static int run(const char *cert, const char *key, moq_transport_backend_t backen
     cfg.url = (moq_bytes_t){(const uint8_t *)url, strlen(url)};
     cfg.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
     cfg.backend = backend;
-    moq_version_t v[1] = {MOQ_VERSION_DRAFT_16};
+    moq_version_t v[1] = {MOQ_VERSION_DRAFT_16};   /* the threaded server's default ALPN */
     cfg.versions.struct_size = sizeof(cfg.versions);
-    cfg.versions.policy = MOQ_VERSION_POLICY_EXACT;   /* mvfst: exact only */
+    cfg.versions.policy = MOQ_VERSION_POLICY_EXACT;
     cfg.versions.versions = v;
     cfg.versions.version_count = 1;
-    cfg.insecure_skip_verify = true;                  /* self-signed loopback */
+    cfg.insecure_skip_verify = true;
 
     moq_endpoint_t *ep = NULL;
     MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&cfg, &ep), (int)MOQ_OK);
     if (!ep) { moq_pq_threaded_stop(srv); moq_pq_threaded_destroy(srv); return failures + 1; }
 
     static const moq_bytes_t ns_parts[] = {
-        {(const uint8_t *)"mvfst", 5}, {(const uint8_t *)"fatal", 5}};
+        {(const uint8_t *)"stop", 4}, {(const uint8_t *)"order", 5}};
     moq_media_sender_cfg_t scfg;
     moq_media_sender_cfg_init_live(&scfg);
     scfg.namespace_ = (moq_namespace_t){ns_parts, 2};
     moq_media_sender_t *tx = NULL;
     MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_attach(ep, &scfg, &tx), (int)MOQ_OK);
-
-    /* The track's largest-location history record is reserved in the session
-     * registry at add_track; releasing it is what the crash dereferenced. */
-    moq_media_track_t *track = NULL;
     if (tx) {
         moq_media_track_cfg_t tcfg;
         moq_media_track_cfg_init(&tcfg);
@@ -129,35 +103,23 @@ static int run(const char *cert, const char *key, moq_transport_backend_t backen
         tcfg.bitrate = 500000;
         tcfg.width = 320;
         tcfg.height = 240;
+        moq_media_track_t *track = NULL;
         MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(tx, &tcfg, &track),
                               (int)MOQ_OK);
     }
 
-    /* Established first (the server accepted us), then terminal (it closed). */
-    int established = 0, terminal = 0;
+    int established = 0;
     for (int i = 0; i < 100 && !established; i++) {
         (void)moq_endpoint_wait(ep, 100000);
         established = moq_endpoint_state(ep) == MOQ_ENDPOINT_ESTABLISHED;
         if (moq_endpoint_is_fatal(ep)) break;
     }
-    if (!established) {
-        moq_endpoint_terminal_t t; memset(&t, 0, sizeof t);
-        moq_endpoint_get_terminal(ep, &t, sizeof t);
-        fprintf(stderr, "not established: state=%d fatal=%d code=0x%llx reason=%d detail=0x%llx\n",
-                (int)moq_endpoint_state(ep), moq_endpoint_is_fatal(ep),
-                (unsigned long long)moq_endpoint_fatal_code(ep), (int)t.reason,
-                (unsigned long long)t.detail_code);
-    }
     MOQ_TEST_CHECK(established);
-    for (int i = 0; i < 150 && !terminal; i++) {
-        (void)moq_endpoint_wait(ep, 100000);
-        terminal = moq_endpoint_is_fatal(ep) || moq_endpoint_is_closed(ep) ||
-                   moq_endpoint_state(ep) == MOQ_ENDPOINT_CLOSED;
-    }
-    MOQ_TEST_CHECK(terminal);
-    MOQ_TEST_CHECK(sc.closed);
+    /* let the announce and the track registration run on the pump */
+    for (int i = 0; i < 5; i++) (void)moq_endpoint_wait(ep, 100000);
 
-    /* The crash site. */
+    /* Documented order: the sender's destroy is POSTED (endpoint live) and
+     * runs from stop()'s terminal drain, after the facade stopped. */
     if (tx) moq_media_sender_destroy(tx);
     MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(ep), (int)MOQ_OK);
     moq_endpoint_destroy(ep);
@@ -166,27 +128,23 @@ static int run(const char *cert, const char *key, moq_transport_backend_t backen
     moq_pq_threaded_destroy(srv);
     return failures;
 }
-#endif
 
 int main(int argc, char **argv)
 {
-#if !defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) && !defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED)
-    (void)argc; (void)argv;
-    fprintf(stderr, "no managed facade backend built; skipping\n");
-    return 77;
-#else
-    const char *cert = NULL, *key = NULL, *backend_name = "mvfst";
+    const char *cert = NULL, *key = NULL, *backend_name = "picoquic";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--cert") && i + 1 < argc) cert = argv[++i];
         else if (!strcmp(argv[i], "--key") && i + 1 < argc) key = argv[++i];
         else if (!strcmp(argv[i], "--backend") && i + 1 < argc) backend_name = argv[++i];
     }
     if (!cert || !key) {
-        fprintf(stderr, "usage: %s --cert <file> --key <file> [--backend mvfst|msquic]\n", argv[0]);
+        fprintf(stderr, "usage: %s --cert <file> --key <file> [--backend picoquic|mvfst|msquic]\n", argv[0]);
         return 2;
     }
     moq_transport_backend_t backend;
-    if (!strcmp(backend_name, "mvfst")) {
+    if (!strcmp(backend_name, "picoquic")) {
+        backend = MOQ_TRANSPORT_BACKEND_PICOQUIC;
+    } else if (!strcmp(backend_name, "mvfst")) {
 #ifdef MOQ_SERVICE_HAVE_MVFST_MANAGED
         backend = MOQ_TRANSPORT_BACKEND_MVFST;
 #else
@@ -203,7 +161,6 @@ int main(int argc, char **argv)
     }
     int failures = run(cert, key, backend);
     if (failures) return failures;
-    MOQ_TEST_PASS("test_endpoint_mvfst_fatal_teardown");
+    MOQ_TEST_PASS("test_endpoint_stop_after_sender_destroy");
     return 0;
-#endif
 }
