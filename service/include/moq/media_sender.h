@@ -179,23 +179,25 @@ typedef struct moq_media_sender_cfg {
      * queued until demand appears; true drops it to stay at the live edge. */
     bool                                 drop_without_demand;
 
-    /* Interval between automatic independent catalog refreshes, in
-     * microseconds. While the catalog track has demand the sender
-     * periodically republishes the current catalog as a new independent
-     * group (object 0 = the complete catalog, never a delta), so a late
-     * viewer joining through a relay that resolves Joining FETCHes locally
-     * still bootstraps from a fresh subscribe-path catalog object (MSF-01
-     * §5.1: a new independent catalog MAY be published after enough time
-     * that the prior object may have left a delivery-network cache).
-     *   0  (or an old-size caller whose struct_size predates this field):
-     *      library default of 1 second.
-     *   a finite nonzero value: that custom interval.
-     *   UINT64_MAX: refresh explicitly DISABLED. Disabling can reintroduce
-     *      late-join incompatibility with relays that neither proxy nor
-     *      cache unresolved Joining FETCHes upstream -- only the FIRST
-     *      catalog joiner per publisher session obtains the catalog there.
-     * A real track add/remove/conversion generation always takes precedence
-     * and resets the refresh cadence; no demand means no refresh. */
+    /* OPT-IN interval between automatic independent catalog refreshes, in
+     * microseconds. Default OFF: MSF-01 §5 says a catalog object SHOULD be
+     * published only when the availability of tracks changes, or after a
+     * period of time such that the object might fall out of cache in a
+     * delivery network. The sender always republishes on a real track
+     * add/remove/conversion; it does NOT republish on a timer unless asked.
+     *   0 (or an old-size caller whose struct_size predates this field) or
+     *      UINT64_MAX: no timed refresh (the default).
+     *   a finite nonzero value: while the catalog track has demand,
+     *      republish the current catalog every interval as a new
+     *      independent group (object 0 = the complete catalog, never a
+     *      delta). Use this only for the cache-staleness case the draft
+     *      allows, e.g. a late viewer joining through a relay that resolves
+     *      Joining FETCHes locally and neither proxies nor caches unresolved
+     *      ones upstream (there only the FIRST catalog joiner per publisher
+     *      session obtains the catalog), and pick an interval on the order
+     *      of the relay's cache lifetime rather than seconds.
+     * A real mutation generation always takes precedence and resets the
+     * refresh cadence; no demand means no refresh. */
     uint64_t                             catalog_refresh_interval_us;
 } moq_media_sender_cfg_t;
 
@@ -218,7 +220,7 @@ MOQ_API void moq_media_sender_cfg_init_lossless(moq_media_sender_cfg_t *cfg);
  * and stamp ONLY the frozen v0 prefix (through the v0 nested callbacks), so
  * they never enable the appended publish_tracks / drop_without_demand /
  * catalog_refresh_interval_us fields or the appended callbacks. To set ANY
- * appended field -- e.g. a live-preset push sender, or a custom/disabled
+ * appended field -- e.g. a live-preset push sender, or an opt-in timed
  * catalog refresh interval -- initialize with the _sized form and sizeof(*cfg):
  *
  *     moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));

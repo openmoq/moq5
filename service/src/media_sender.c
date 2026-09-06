@@ -56,9 +56,13 @@
 #define MEDIA_SENDER_CFG_MIN_SIZE \
     offsetof(moq_media_sender_cfg_t, callbacks)
 
-/* Default automatic catalog-refresh interval when the cfg field is 0 or an
- * old caller's struct_size predates it (MSF-01 §5.1 cache-staleness republish). */
-#define SENDER_DEFAULT_CATALOG_REFRESH_US 1000000ull   /* 1 second */
+/* Automatic catalog refresh is OPT-IN. MSF-01 §5: a catalog object SHOULD be
+ * published only when track availability changes, or after enough time that
+ * the prior object might have left a delivery-network cache. A cfg field of 0
+ * (or an old-size caller whose struct_size predates it) therefore resolves to
+ * the disabled sentinel below; only an explicit finite interval republishes on
+ * a timer. */
+#define SENDER_CATALOG_REFRESH_DISABLED UINT64_MAX
 
 /* ABI pin for the appended catalog_refresh_interval_us. The useful, portable
  * contract is that the field begins exactly at the aligned boundary AFTER the
@@ -414,9 +418,10 @@ struct moq_media_sender {
      * relay that resolves Joining FETCHes locally would otherwise never see the
      * catalog on the subscribe path, so the sender periodically republishes it.
      * Network-thread-only.
-     * interval_us is resolved at create: SENDER_DEFAULT_CATALOG_REFRESH_US when
-     * the cfg field is 0/absent, UINT64_MAX when explicitly disabled, else the
-     * caller's value. deadline_us is the next refresh time (UINT64_MAX = not
+     * interval_us is resolved at create: SENDER_CATALOG_REFRESH_DISABLED
+     * (UINT64_MAX) when the cfg field is 0/absent or explicitly UINT64_MAX
+     * (opt-in per MSF-01 §5), else the caller's value. deadline_us is the next
+     * refresh time (UINT64_MAX = not
      * armed / disabled); armed when the initial catalog installs and re-armed
      * on every generation commit so a real mutation resets the cadence. */
     uint64_t          catalog_refresh_interval_us;
@@ -3390,9 +3395,10 @@ static void sender_copy_cfg_tail(moq_media_sender_t *s,
                                 sizeof(cfg->drop_without_demand))
         s->drop_without_demand = cfg->drop_without_demand;
     /* Whole-field gate: an old caller whose struct_size predates this field
-     * reads as 0 -> the library default. 0 -> default, UINT64_MAX -> disabled,
-     * else the caller's custom interval. The deadline is armed later, when the
-     * initial catalog installs. */
+     * reads as 0. 0 -> disabled (the default: MSF-01 §5 says publish only on
+     * availability change or cache staleness), UINT64_MAX -> disabled, else the
+     * caller's opt-in interval. The deadline is armed later, when the initial
+     * catalog installs. */
     {
         uint64_t raw = 0;
         if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t,
@@ -3400,7 +3406,7 @@ static void sender_copy_cfg_tail(moq_media_sender_t *s,
                                     sizeof(cfg->catalog_refresh_interval_us))
             raw = cfg->catalog_refresh_interval_us;
         s->catalog_refresh_interval_us =
-            (raw == 0) ? SENDER_DEFAULT_CATALOG_REFRESH_US : raw;
+            (raw == 0) ? SENDER_CATALOG_REFRESH_DISABLED : raw;
     }
     s->catalog_refresh_deadline_us = UINT64_MAX;   /* not armed yet */
     s->refresh_wake_deadline_us = UINT64_MAX;      /* no managed wake yet */
@@ -4704,9 +4710,10 @@ uint64_t moq_media_sender_test_next_deadline_us(moq_media_sender_t *s)
     return sender_next_deadline_us(s);
 }
 
-/* The RESOLVED automatic-refresh interval (default applied for 0/absent,
- * UINT64_MAX when explicitly disabled). Lets a config test prove the default /
- * custom / disable resolution without standing up an endpoint. */
+/* The RESOLVED automatic-refresh interval (UINT64_MAX when disabled, which
+ * is the default for 0/absent as well as explicit UINT64_MAX). Lets a config
+ * test prove the default / custom / disable resolution without standing up an
+ * endpoint. */
 uint64_t moq_media_sender_test_refresh_interval(const moq_media_sender_t *s)
 {
     moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
