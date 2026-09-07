@@ -60,6 +60,7 @@
 
 #include <msquic.h>
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -99,6 +100,7 @@ extern bool moq_msq_test_lane_inject_terminal_child(
 extern moq_result_t moq_msq_test_managed_create_lanes_only(
     const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out);
 extern void (*moq_msq_test_stop_latched)(moq_msquic_managed_t *m);
+extern void (*moq_msq_test_prewait)(moq_msquic_managed_lane_t *lane);
 
 
 enum { PH_HOLD = 0, PH_RUN = 1, PH_DONE = 2 };
@@ -190,6 +192,188 @@ static moq_msquic_managed_lane_t *_Atomic g_lane;
 /* Installed only around the ordered stop control's single stop() call, and
  * scoped to that facade. */
 static moq_msquic_managed_t *_Atomic g_stop_m;
+
+/* Post-exit progress is acknowledged by the real worker at its lock-free
+ * pre-wait hook. This mutex is never held across a lane API call. All waits
+ * in one control share ONE absolute deadline, including false notifications.
+ * The worker parks between requests, so delayed dispatch is ordered and an
+ * external wake cannot be mistaken for an executed sweep. */
+static struct progress {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool enabled;
+    bool abort;
+    bool held;
+    bool permit;
+    bool have_base;
+    int error;
+    uint64_t base;
+    uint64_t observed;
+    unsigned false_wakes;
+    pthread_t caller;
+    pthread_t worker;
+    struct timespec until;
+} g_progress = { .mu = PTHREAD_MUTEX_INITIALIZER,
+                 .cv = PTHREAD_COND_INITIALIZER };
+
+static void progress_error(int error)
+{
+    if (g_progress.error == 0)
+        g_progress.error = error;
+    g_progress.abort = true;
+    pthread_cond_broadcast(&g_progress.cv);
+}
+
+static void progress_init(bool enabled)
+{
+    pthread_mutex_lock(&g_progress.mu);
+    g_progress.enabled = enabled;
+    g_progress.abort = false;
+    g_progress.held = false;
+    g_progress.permit = false;
+    g_progress.have_base = false;
+    g_progress.error = 0;
+    g_progress.base = 0;
+    g_progress.observed = 0;
+    g_progress.false_wakes = 0;
+    g_progress.caller = pthread_self();
+    if (enabled) {
+        if (clock_gettime(CLOCK_REALTIME, &g_progress.until) != 0)
+            progress_error(errno);
+        else
+            g_progress.until.tv_sec += HOLD_GUARD_US / 1000000u;
+    }
+    pthread_mutex_unlock(&g_progress.mu);
+}
+
+/* mu held. Any timeout/error sticks even if a predicate changes concurrently. */
+static void progress_wait(void)
+{
+    int rc = pthread_cond_timedwait(&g_progress.cv, &g_progress.mu,
+                                     &g_progress.until);
+    if (rc != 0)
+        progress_error(rc);
+}
+
+static bool progress_reached(uint64_t target)
+{
+    return g_progress.observed >= target;
+}
+
+static void progress_release(void)
+{
+    pthread_mutex_lock(&g_progress.mu);
+    g_progress.abort = true;
+    g_progress.enabled = false;
+    pthread_cond_broadcast(&g_progress.cv);
+    pthread_mutex_unlock(&g_progress.mu);
+}
+
+static void progress_prewait(moq_msquic_managed_lane_t *lane)
+{
+    struct fx *f = atomic_load(&g_fx);
+    if (f == NULL || lane != atomic_load(&g_lane) ||
+        atomic_load(&f->exit_at_pump) <= 0)
+        return;
+
+    moq_msquic_lane_stats_t st;
+    moq_result_t rc = moq_msquic_lane_get_stats(lane, &st, sizeof(st));
+    pthread_mutex_lock(&g_progress.mu);
+    if (!g_progress.enabled || g_progress.abort) {
+        pthread_mutex_unlock(&g_progress.mu);
+        return;
+    }
+    if (rc != MOQ_OK || pthread_equal(pthread_self(), g_progress.caller)) {
+        progress_error(EINVAL);
+    } else if (!g_progress.have_base) {
+        g_progress.worker = pthread_self();
+        g_progress.base = st.pump_sweeps;
+        g_progress.have_base = true;
+    } else if (!pthread_equal(pthread_self(), g_progress.worker) ||
+               st.pump_sweeps < g_progress.observed) {
+        progress_error(EINVAL);
+    }
+    if (g_progress.error == 0)
+        g_progress.observed = st.pump_sweeps;
+    g_progress.held = true;
+    pthread_cond_broadcast(&g_progress.cv);
+    while (!g_progress.permit && !g_progress.abort) {
+        progress_wait();
+        if (!g_progress.permit && !g_progress.abort) {
+            g_progress.false_wakes++;
+            pthread_cond_broadcast(&g_progress.cv);
+        }
+    }
+    g_progress.held = false;
+    g_progress.permit = false;
+    pthread_mutex_unlock(&g_progress.mu);
+}
+
+static bool progress_drive(moq_msquic_managed_lane_t *lane, int *rounds)
+{
+    *rounds = 0;
+    pthread_mutex_lock(&g_progress.mu);
+    while (!g_progress.held && g_progress.error == 0)
+        progress_wait();
+    if (g_progress.error != 0 || !g_progress.have_base ||
+        g_progress.base > UINT64_MAX - POST_EXIT_SWEEPS) {
+        fprintf(stderr, "post-exit rendezvous failed: error=%d base=%d\n",
+                g_progress.error, (int)g_progress.have_base);
+        pthread_mutex_unlock(&g_progress.mu);
+        progress_release();
+        return false;
+    }
+
+    uint64_t base = g_progress.base;
+    uint64_t target = base + POST_EXIT_SWEEPS;
+    unsigned before_false = g_progress.false_wakes;
+    /* The worker is held without permission. Make it actually consume a
+     * notification that carries no progress and acknowledge that fact. */
+    pthread_cond_broadcast(&g_progress.cv);
+    while (g_progress.false_wakes == before_false && g_progress.error == 0)
+        progress_wait();
+    CHECK(g_progress.held);
+    CHECK(g_progress.observed == base);
+    CHECK(!progress_reached(target)); /* live no-progress non-vacuity oracle */
+
+    while (!progress_reached(target) && g_progress.error == 0) {
+        uint64_t next = g_progress.observed + 1;
+        pthread_mutex_unlock(&g_progress.mu);
+        moq_result_t rc = moq_msquic_lane_wake(lane);
+        pthread_mutex_lock(&g_progress.mu);
+        if (rc != MOQ_OK) {
+            progress_error(EINVAL);
+            break;
+        }
+        (*rounds)++;
+        g_progress.permit = true;
+        pthread_cond_broadcast(&g_progress.cv);
+        while ((!progress_reached(next) || !g_progress.held) &&
+               g_progress.error == 0)
+            progress_wait();
+    }
+    int error = g_progress.error;
+    uint64_t observed = g_progress.observed;
+    unsigned false_wakes = g_progress.false_wakes - before_false;
+    pthread_mutex_unlock(&g_progress.mu);
+
+    /* Independent public snapshot while the worker is still held. Neither
+     * the helper's predicate nor notification count can fabricate progress. */
+    moq_msquic_lane_stats_t st;
+    bool stats_ok = moq_msquic_lane_get_stats(lane, &st, sizeof(st)) == MOQ_OK;
+    CHECK(stats_ok);
+    if (stats_ok) {
+        CHECK(st.pump_sweeps == observed);
+        CHECK(st.pump_sweeps >= target);
+    }
+    CHECK(error == 0);
+    printf("POST-EXIT-PROGRESS: base=%llu observed=%llu required=%d "
+           "rounds=%d false_notifications=%u error=%d\n",
+           (unsigned long long)base, (unsigned long long)observed,
+           POST_EXIT_SWEEPS, *rounds, false_wakes, error);
+    progress_release();
+    return error == 0 && stats_ok && st.pump_sweeps >= target;
+}
 
 /* Fires inside doorbell_reap, once the child is freed and its reserve released
  * — so publishing here is the one point at which BOTH the counter and the
@@ -381,6 +565,9 @@ static bool rig_up(struct rig *r, struct fx *f, uint32_t max_conns,
     cfg.lane_count = 1;
     cfg.on_lane_pump = pump;
     cfg.on_lane_pump_user = f;
+    /* Install before spawning; clear only after every worker is joined. */
+    moq_msq_test_reap_gap = reap_gap_hook;
+    moq_msq_test_prewait = progress_prewait;
     /* no host, no port, no cert, no key: the constructor opens no listener */
     if (moq_msq_test_managed_create_lanes_only(&cfg, &r->m) != MOQ_OK ||
         r->m == NULL)
@@ -389,19 +576,29 @@ static bool rig_up(struct rig *r, struct fx *f, uint32_t max_conns,
     if (r->lane == NULL)
         return false;
     atomic_store(&g_lane, r->lane);
-    moq_msq_test_reap_gap = reap_gap_hook;
     return true;
 }
 
 static void rig_down(struct rig *r)
 {
-    moq_msq_test_reap_gap = NULL;
-    atomic_store(&g_lane, NULL);
+    progress_release(); /* includes error paths with a worker still parked */
     if (r->m != NULL) {
-        (void)moq_msquic_managed_stop(r->m);
+        CHECK(moq_msquic_managed_stop(r->m) == MOQ_OK);
+        CHECK(moq_msquic_managed_conn_count(r->m) == 0);
+        CHECK(moq_msquic_managed_stop(r->m) == MOQ_OK);
+        CHECK(moq_msquic_managed_conn_count(r->m) == 0);
         moq_msquic_managed_destroy(r->m);
         r->m = NULL;
     }
+    /* A parked worker can report an error after the main thread's last
+     * progress snapshot. Joining closes that interval before this check. */
+    pthread_mutex_lock(&g_progress.mu);
+    int progress_error_at_join = g_progress.error;
+    pthread_mutex_unlock(&g_progress.mu);
+    CHECK(progress_error_at_join == 0);
+    moq_msq_test_reap_gap = NULL;
+    moq_msq_test_prewait = NULL;
+    atomic_store(&g_lane, NULL);
 }
 
 static void fx_init(struct fx *f)
@@ -411,6 +608,7 @@ static void fx_init(struct fx *f)
     atomic_store(&f->phase, PH_HOLD);
     atomic_store(&g_fx, f);
     bar_reset();
+    progress_init(false);
 }
 
 /* --- 1. fairness ----------------------------------------------------------- */
@@ -541,6 +739,7 @@ static void t_pump_exit_retains_child(bool ack_first)
     fx_init(&f);
     atomic_store(&f.exit_at_pump, -1); /* arm: the next RUN callback exits */
     atomic_store(&f.ack_before_exit, ack_first ? 1 : 0);
+    progress_init(true);
     if (!rig_up(&r, &f, 1, fair_pump)) {
         CHECK(0 && "lanes-only facade");
         rig_down(&r);
@@ -569,27 +768,10 @@ static void t_pump_exit_retains_child(bool ack_first)
      * can be read mid-reclamation. Nothing here is timed. */
     bool reaped_ok = !ack_first || bar_wait(&g_bar.reaped, HOLD_GUARD_US);
 
-    /* Arm the lane from OUTSIDE until the doorbell has MEASURABLY run that many
-     * more work-branch iterations — sweeps advance even while the callback is
-     * suppressed, so this is the operation count that gives the assertion below
-     * something to be true about. A blind arming loop would let a doorbell that
-     * never got the lane satisfy "no later callback ran" vacuously; here that
-     * outcome exhausts the spin bound and fails instead. */
-    uint64_t sweeps_at_exit = 0;
-    moq_msquic_lane_stats_t st;
-
-    if (moq_msquic_lane_get_stats(r.lane, &st, sizeof(st)) == MOQ_OK)
-        sweeps_at_exit = st.pump_sweeps;
-
-    bool swept = false;
-    int spins2 = 0;
-
-    for (; spins2 < SPIN_MAX && !swept; spins2++) {
-        (void)moq_msquic_lane_wake(r.lane);
-        (void)moq_msquic_managed_wait(r.m, WAIT_US);
-        if (moq_msquic_lane_get_stats(r.lane, &st, sizeof(st)) == MOQ_OK)
-            swept = st.pump_sweeps >= sweeps_at_exit + POST_EXIT_SWEEPS;
-    }
+    /* CLOSED from wait() is not a worker acknowledgment. The ordered
+     * rendezvous requires eight additional real sweeps under one hang guard. */
+    int progress_rounds = 0;
+    bool swept = progress_drive(r.lane, &progress_rounds);
 
     int pumps_after_exit = atomic_load(&f.pumps);
     int reaps_after_exit = atomic_load(&f.reaps);
@@ -615,7 +797,7 @@ static void t_pump_exit_retains_child(bool ack_first)
            "conns_held=%zu wake=%d wait=%d wait_spins=%d fatal=%d\n",
            (int)ack_first, (int)placed, atomic_load(&f.exit_at_pump),
            pumps_at_exit, pumps_after_exit, atomic_load(&f.ack_rc),
-           (int)reaped_ok, (int)swept, spins2, reaps_after_exit, conns_held,
+           (int)reaped_ok, (int)swept, progress_rounds, reaps_after_exit, conns_held,
            wake_rc, wait_rc, wait_spins, (int)fatal);
 
     CHECK(placed);
@@ -624,7 +806,6 @@ static void t_pump_exit_retains_child(bool ack_first)
     CHECK(reaped_ok);
     /* the doorbell really did run its work branch after the exit */
     CHECK(swept);
-    CHECK(spins2 < SPIN_MAX);
     CHECK(atomic_load(&f.nonzero_returns) == 1);
     if (ack_first)
         CHECK(atomic_load(&f.ack_rc) == MOQ_OK);

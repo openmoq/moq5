@@ -197,10 +197,10 @@ static void t_cfg_validation(void)
 
     CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
 
+    moq_msquic_conn_cfg_init_sized(&cfg, sizeof(cfg));
     CHECK(moq_msquic_conn_create(NULL, &conn) == MOQ_ERR_INVAL);
     CHECK(moq_msquic_conn_create(&cfg, NULL) == MOQ_ERR_INVAL);
 
-    moq_msquic_conn_cfg_init_sized(&cfg, sizeof(cfg));
     cfg.alloc = moq_alloc_default();
     cfg.session = r.session;
     cfg.api = fake_msq_table(&r.fake);
