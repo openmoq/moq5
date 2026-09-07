@@ -115,6 +115,93 @@ _Static_assert((int)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT ==
 _Static_assert((int)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT ==
                    (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_13_14_COMPAT,
                "profile D13_14_COMPAT must map to wtquic H3_DRAFT_13_14_COMPAT");
+_Static_assert((int)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT ==
+                   (int)WTQ_WEBTRANSPORT_PROFILE_H3_DRAFT_02_RFC9297_COMPAT,
+               "profile D02_RFC9297_COMPAT must map to wtquic "
+               "H3_DRAFT_02_RFC9297_COMPAT");
+
+/* The facade's Origin policy is its own closed enum; the values mirror the
+ * provider's modes, and the forwarding path assigns them verbatim. */
+_Static_assert((int)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET ==
+                   (int)WTQ_ORIGIN_POLICY_UNSET &&
+               (int)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE ==
+                   (int)WTQ_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE &&
+               (int)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST ==
+                   (int)WTQ_ORIGIN_POLICY_ALLOWLIST &&
+               (int)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL ==
+                   (int)WTQ_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL,
+               "the facade Origin policy must share wtquic's mode values");
+
+/* The PREVIOUS FULL config, frozen here field for field. The append's oracle
+ * is this struct's sizeof -- padding included -- not the end of its last
+ * member: on a target where the two differ (ARM ILP32: 132 vs 136) an old
+ * full-size caller would otherwise expose its trailing padding as a complete
+ * Origin pointer. Frozen independently of the current declaration, so a
+ * change to either side is a compile error. */
+typedef struct {
+    uint32_t struct_size;
+    const moq_alloc_t *alloc;
+    moq_perspective_t perspective;
+    const char *host;
+    uint16_t port;
+    const char *cert_path;
+    const char *key_path;
+    bool insecure_skip_verify;
+    uint32_t idle_timeout_ms;
+    const char *wt_path;
+    const char *const *wt_protocols;
+    size_t wt_protocol_count;
+    moq_wtquic_msquic_lane_pump_fn on_lane_pump;
+    void *on_lane_pump_user;
+    moq_wtquic_msquic_activity_fn on_activity;
+    void *on_activity_ctx;
+    void (*on_stopped)(void *ctx);
+    void *on_stopped_ctx;
+    bool send_request_capacity;
+    uint32_t initial_request_capacity;
+    uint32_t max_events;
+    uint32_t max_actions;
+    uint32_t max_connections;
+    uint32_t lane_count;
+    moq_wtquic_msquic_choose_lane_fn choose_lane;
+    void *choose_lane_user;
+    bool streaming_objects;
+    uint64_t session_idle_timeout_us;
+    uint32_t webtransport_profile;
+    uint64_t (*app_deadline_us)(void *ctx);
+    void *app_deadline_ctx;
+} mm_cfg_prev_full_t;
+
+#define MM_PREV_OFF(f)                                                  \
+    _Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t, f) ==           \
+                       offsetof(mm_cfg_prev_full_t, f),                                \
+                   "old config field " #f " moved from its frozen offset")
+MM_PREV_OFF(struct_size);   MM_PREV_OFF(alloc);
+MM_PREV_OFF(perspective);   MM_PREV_OFF(host);
+MM_PREV_OFF(port);          MM_PREV_OFF(cert_path);
+MM_PREV_OFF(key_path);      MM_PREV_OFF(insecure_skip_verify);
+MM_PREV_OFF(idle_timeout_ms); MM_PREV_OFF(wt_path);
+MM_PREV_OFF(wt_protocols);  MM_PREV_OFF(wt_protocol_count);
+MM_PREV_OFF(on_lane_pump);  MM_PREV_OFF(on_lane_pump_user);
+MM_PREV_OFF(on_activity);   MM_PREV_OFF(on_activity_ctx);
+MM_PREV_OFF(on_stopped);    MM_PREV_OFF(on_stopped_ctx);
+MM_PREV_OFF(send_request_capacity);
+MM_PREV_OFF(initial_request_capacity);
+MM_PREV_OFF(max_events);    MM_PREV_OFF(max_actions);
+MM_PREV_OFF(max_connections); MM_PREV_OFF(lane_count);
+MM_PREV_OFF(choose_lane);   MM_PREV_OFF(choose_lane_user);
+MM_PREV_OFF(streaming_objects);
+MM_PREV_OFF(session_idle_timeout_us);
+MM_PREV_OFF(webtransport_profile);
+MM_PREV_OFF(app_deadline_us); MM_PREV_OFF(app_deadline_ctx);
+#undef MM_PREV_OFF
+_Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t, origin) >=
+                   sizeof(mm_cfg_prev_full_t),
+               "the Origin append must begin at/after the PREVIOUS FULL "
+               "sizeof, never inside its trailing padding");
+_Static_assert(sizeof(moq_wtquic_msquic_managed_cfg_t) > sizeof(mm_cfg_prev_full_t),
+               "the new config must be strictly larger than the old one");
+
 
 /*
  * Frozen v0 lane-stats layout — the exact layout MOQ_WTQUIC_MSQUIC_LANE_STATS_V0_SIZE
@@ -147,6 +234,7 @@ typedef struct {
                        offsetof(mm_lane_stats_v0_t, f),                      \
                    "v0 lane-stats field " #f " moved from its frozen offset")
 MM_STATS_FROZEN_OFF(struct_size);
+
 MM_STATS_FROZEN_OFF(wakes_same_lane);
 MM_STATS_FROZEN_OFF(wakes_cross_lane);
 MM_STATS_FROZEN_OFF(wakes_external);
@@ -248,6 +336,21 @@ static uint32_t g_mm_test_last_listener_profile = 0xFFFFFFFFu;
 uint32_t moq_wtquic_msquic_managed_test_last_listener_profile(void)
 {
     return g_mm_test_last_listener_profile;
+}
+
+/* A SUBSTITUTE for the native listener callee, invoked where
+ * wtq_msquic_listener_start is invoked, with the same arguments and through
+ * the same result and unwind path. Observing the config anywhere earlier
+ * cannot see a change made between that point and the call, so the
+ * substitution is the callee itself, not a bystander. */
+typedef wtq_result_t (*mm_test_listener_start_fn)(
+    wtq_msquic_env_t *, const wtq_msquic_listener_cfg_t *,
+    wtq_msquic_listener_t **);
+static mm_test_listener_start_fn g_mm_test_listener_start;
+void moq_wtquic_msquic_managed_test_set_listener_start(
+    mm_test_listener_start_fn fn)
+{
+    g_mm_test_listener_start = fn;
 }
 
 /* When set, the pump's adapter service passes call this per connection instead
@@ -451,6 +554,11 @@ struct moq_wtquic_msquic_managed {
     bool streaming_objects;
     uint64_t session_idle_timeout_us;
     uint32_t webtransport_profile;  /* wtq_webtransport_profile_t; 0 = current */
+    /* the Origin contract: owned copies, freed in destroy */
+    char *origin;                   /* client only; NULL = none */
+    uint32_t origin_policy;         /* server only; 0 = UNSET */
+    char **allowed_origins;         /* server ALLOWLIST only */
+    size_t allowed_origin_count;
 
     /* callbacks */
     moq_wtquic_msquic_lane_pump_fn on_lane_pump;
@@ -595,6 +703,160 @@ static moq_result_t mm_dup_protos(moq_wtquic_msquic_managed_t *m,
     for (size_t i = 0; i < n; i++) {
         if (src[i] == NULL)
             return MOQ_ERR_INVAL;
+        arr[i] = mm_strdup(m, src[i]);
+        if (arr[i] == NULL)
+            return MOQ_ERR_NOMEM;
+    }
+    return MOQ_OK;
+}
+
+/* The size-gated borrowed Origin view, and its verdict. Nothing here
+ * allocates, initializes synchronization, or enters the provider: a
+ * structurally invalid configuration must be refused with MOQ_ERR_INVAL and
+ * no effects at all, which a fail-first allocator would otherwise turn into
+ * MOQ_ERR_NOMEM. */
+typedef struct mm_origin_view {
+    const char *origin;
+    uint32_t policy;
+    const char *const *list;
+    size_t list_n;
+} mm_origin_view_t;
+
+static bool mm_origin_len(const char *s, size_t *out);
+
+static moq_result_t mm_origin_preflight(const moq_wtquic_msquic_managed_cfg_t *cfg,
+                                        uint32_t profile,
+                                        mm_origin_view_t *out)
+{
+#define MM_PRE_HAS(field)                                                    \
+    ((size_t)cfg->struct_size >=                                             \
+     offsetof(moq_wtquic_msquic_managed_cfg_t, field) + sizeof(cfg->field))
+    bool is_client = cfg->perspective == MOQ_PERSPECTIVE_CLIENT;
+    size_t budget = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->origin = MM_PRE_HAS(origin) ? cfg->origin : NULL;
+    out->policy = MM_PRE_HAS(origin_policy) ? cfg->origin_policy : 0u;
+    /* the pointer and the count are ONE block, gated on the last field */
+    bool have_list_block = MM_PRE_HAS(allowed_origin_count);
+    if (have_list_block) {
+        out->list = cfg->allowed_origins;
+        out->list_n = cfg->allowed_origin_count;
+    }
+#undef MM_PRE_HAS
+
+    /* role coherence: refuse the other role's inputs, never discard them */
+    if (is_client) {
+        if (out->policy != (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET ||
+            out->list != NULL || out->list_n != 0)
+            return MOQ_ERR_INVAL;
+    } else if (out->origin != NULL) {
+        return MOQ_ERR_INVAL;
+    }
+    if (out->policy >
+        (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL)
+        return MOQ_ERR_INVAL;
+    if (out->origin != NULL) {
+        size_t olen;
+        if (!mm_origin_len(out->origin, &olen))
+            return MOQ_ERR_INVAL;
+    }
+    /* D02 carries an Origin in both directions: the client must supply one,
+     * and the server must state a policy for it. */
+    if (profile == (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT) {
+        if (is_client && out->origin == NULL)
+            return MOQ_ERR_INVAL;
+        if (!is_client &&
+            out->policy == (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET)
+            return MOQ_ERR_INVAL;
+    }
+    if (out->policy == (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST) {
+        if (!have_list_block)
+            return MOQ_ERR_INVAL; /* never downgrades to another policy */
+        if (out->list == NULL || out->list_n == 0 ||
+            out->list_n > (size_t)MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGINS)
+            return MOQ_ERR_INVAL;
+        for (size_t i = 0; i < out->list_n; i++) {
+            size_t li;
+            if (!mm_origin_len(out->list[i], &li))
+                return MOQ_ERR_INVAL;
+            if (li + 1u >
+                (size_t)MOQ_WTQUIC_MSQUIC_MANAGED_ORIGIN_COPY_BUDGET - budget)
+                return MOQ_ERR_INVAL;
+            budget += li + 1u;
+            for (size_t j = 0; j < i; j++)
+                if (strcmp(out->list[i], out->list[j]) == 0)
+                    return MOQ_ERR_INVAL;
+        }
+    } else if (out->list != NULL || out->list_n != 0) {
+        return MOQ_ERR_INVAL; /* every other policy requires exactly NULL/0 */
+    }
+    return MOQ_OK;
+}
+
+static void mm_free_origins(moq_wtquic_msquic_managed_t *m)
+{
+    if (m->allowed_origins == NULL)
+        return;
+    for (size_t i = 0; i < m->allowed_origin_count; i++)
+        mm_free_str(m, m->allowed_origins[i]);
+    m->alloc.free(m->allowed_origins,
+                  m->allowed_origin_count * sizeof(m->allowed_origins[0]),
+                  m->alloc.ctx);
+    m->allowed_origins = NULL;
+    m->allowed_origin_count = 0;
+}
+
+/* One Origin entry's length, refusing an empty or over-long string before any
+ * allocation. Returns false without writing *out when the entry is invalid. */
+static bool mm_origin_len(const char *s, size_t *out)
+{
+    size_t n;
+    if (s == NULL)
+        return false;
+    n = strnlen(s, (size_t)MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGIN_BYTES + 1u);
+    if (n == 0 || n > (size_t)MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGIN_BYTES)
+        return false;
+    *out = n;
+    return true;
+}
+
+/* Deep-copy the server allowlist. Every bound is checked BEFORE anything is
+ * allocated: the count, each entry's length, the copy budget (which counts
+ * every terminator), and exact-byte duplicates. The array and its strings are
+ * published as they grow, so a mid-loop OOM is cleaned by destroy(). */
+static moq_result_t mm_dup_origins(moq_wtquic_msquic_managed_t *m,
+                                   const char *const *src, size_t n)
+{
+    size_t budget = 0;
+    size_t bytes;
+    char **arr;
+
+    if (n == 0 || n > (size_t)MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGINS ||
+        src == NULL)
+        return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < n; i++) {
+        size_t li;
+        if (!mm_origin_len(src[i], &li))
+            return MOQ_ERR_INVAL;
+        /* the budget counts the terminator of every entry */
+        if (li + 1u > (size_t)MOQ_WTQUIC_MSQUIC_MANAGED_ORIGIN_COPY_BUDGET -
+                          budget)
+            return MOQ_ERR_INVAL;
+        budget += li + 1u;
+        for (size_t j = 0; j < i; j++)
+            if (strcmp(src[i], src[j]) == 0)
+                return MOQ_ERR_INVAL; /* exact-byte duplicate */
+    }
+    if (!mm_arr_bytes(n, sizeof(*src), &bytes))
+        return MOQ_ERR_INVAL;
+    arr = m->alloc.alloc(bytes, m->alloc.ctx);
+    if (arr == NULL)
+        return MOQ_ERR_NOMEM;
+    memset(arr, 0, bytes);
+    m->allowed_origins = arr;
+    m->allowed_origin_count = n;
+    for (size_t i = 0; i < n; i++) {
         arr[i] = mm_strdup(m, src[i]);
         if (arr[i] == NULL)
             return MOQ_ERR_NOMEM;
@@ -1278,6 +1540,8 @@ static moq_result_t mm_client_start(moq_wtquic_msquic_managed_t *m)
      * The libmoq profile values mirror wtq_webtransport_profile_t 1:1. memset
      * zeroed the v2 tail; struct_size (= sizeof(conn)) covers it. */
     conn.webtransport_profile = m->webtransport_profile;
+    /* the configured Origin, copied at create(); NULL when none was given */
+    conn.origin = m->origin;
 
     wtq_msquic_client_cfg_t ccfg;
     memset(&ccfg, 0, sizeof(ccfg));
@@ -1428,6 +1692,34 @@ static void mm_accept_abandon(void *luser, void *user)
     pthread_mutex_unlock(&m->mu);
 }
 
+#if defined(MOQ_WTQ_MM_TESTING)
+/* The identities the server path is expected to hand the native callee. A
+ * test compares against these rather than against the outgoing configuration
+ * it is checking, so a well-typed but WRONG callback is caught. Test-only:
+ * compiled out of every shipped build, like the other seams. */
+const wtq_session_events_t *moq_wtquic_msquic_managed_test_expected_events(void);
+const wtq_session_events_t *moq_wtquic_msquic_managed_test_expected_events(void)
+{
+    return &g_mm_events;
+}
+wtq_msquic_accept_prepare_fn moq_wtquic_msquic_managed_test_expected_accept_prepare(void);
+wtq_msquic_accept_prepare_fn moq_wtquic_msquic_managed_test_expected_accept_prepare(void)
+{
+    return mm_accept_prepare;
+}
+wtq_msquic_accept_abandon_fn moq_wtquic_msquic_managed_test_expected_accept_abandon(void);
+wtq_msquic_accept_abandon_fn moq_wtquic_msquic_managed_test_expected_accept_abandon(void)
+{
+    return mm_accept_abandon;
+}
+wtq_msquic_transport_quiesced_fn moq_wtquic_msquic_managed_test_expected_quiesced(void);
+wtq_msquic_transport_quiesced_fn moq_wtquic_msquic_managed_test_expected_quiesced(void)
+{
+    return mm_on_quiesced;
+}
+#endif /* MOQ_WTQ_MM_TESTING */
+
+
 /*
  * Open the env and start the listener. The children pool is allocated up front
  * (max_connections fixed slots) so accept_prepare only picks a slot. On any
@@ -1457,6 +1749,11 @@ static moq_result_t mm_server_start(moq_wtquic_msquic_managed_t *m)
     serve.subprotocols = (const char *const *)m->protos;
     serve.subprotocol_count = m->proto_count;
     serve.require_subprotocol = true;
+    /* Origin authorization for this path. The facade registers exactly one
+     * path, so the per-path budget is the whole connection's. */
+    serve.origin_policy = m->origin_policy;
+    serve.allowed_origins = (const char *const *)m->allowed_origins;
+    serve.allowed_origin_count = m->allowed_origin_count;
 
     wtq_msquic_listener_cfg_t lcfg;
     memset(&lcfg, 0, sizeof(lcfg));
@@ -1480,16 +1777,26 @@ static moq_result_t mm_server_start(moq_wtquic_msquic_managed_t *m)
 
 #if defined(MOQ_WTQ_MM_TESTING)
     g_mm_test_last_listener_profile = lcfg.webtransport_profile;
-    if (g_mm_test_no_listener) {
+    if (g_mm_test_no_listener && g_mm_test_listener_start == NULL) {
         m->listener = NULL; /* accept callbacks are driven directly in tests */
         m->bound_port = 0;
         return MOQ_OK;
     }
 #endif
-    wtq_result_t lr = wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
+    wtq_result_t lr;
+#if defined(MOQ_WTQ_MM_TESTING)
+    /* the substitute stands exactly where the native callee stands */
+    lr = g_mm_test_listener_start != NULL
+             ? g_mm_test_listener_start(m->env, &lcfg, &m->listener)
+             : wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
+#else
+    lr = wtq_msquic_listener_start(m->env, &lcfg, &m->listener);
+#endif
     if (lr != WTQ_OK)
         return mm_map_wtq_result(lr);
-    m->bound_port = wtq_msquic_listener_port(m->listener);
+    /* a real start always yields a handle; a test substitute may not */
+    m->bound_port =
+        m->listener != NULL ? wtq_msquic_listener_port(m->listener) : 0;
     return MOQ_OK;
 }
 
@@ -2085,6 +2392,24 @@ moq_result_t moq_wtquic_msquic_managed_create(
                       &lanes_bytes))
         return MOQ_ERR_INVAL;
 
+    /* Structural validation of the size-gated tail happens HERE, before the
+     * first allocation and before any synchronization primitive exists, so a
+     * malformed configuration is MOQ_ERR_INVAL with no effects rather than
+     * whatever a failing allocator would have said first. */
+    uint32_t pre_profile = 0;
+    if (MM_CFG_HAS(webtransport_profile)) {
+        if (cfg->webtransport_profile >
+            MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT)
+            return MOQ_ERR_INVAL;
+        pre_profile = cfg->webtransport_profile;
+    }
+    mm_origin_view_t mm_pre;
+    {
+        moq_result_t prc = mm_origin_preflight(cfg, pre_profile, &mm_pre);
+        if (prc != MOQ_OK)
+            return prc;
+    }
+
     moq_wtquic_msquic_managed_t *m =
         cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);
     if (m == NULL)
@@ -2135,20 +2460,30 @@ moq_result_t moq_wtquic_msquic_managed_create(
         m->streaming_objects = cfg->streaming_objects;
     if (MM_CFG_HAS(session_idle_timeout_us))
         m->session_idle_timeout_us = cfg->session_idle_timeout_us;
-    if (MM_CFG_HAS(webtransport_profile)) {
-        /* Only the two defined profiles; reject anything else up front (both
-         * the client connect and the server listener would otherwise reject it
-         * later, less directly). */
-        if (cfg->webtransport_profile > MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT)
-            goto inval;
-        m->webtransport_profile = cfg->webtransport_profile;
-    }
+    /* validated in the preflight above, before anything was allocated */
+    m->webtransport_profile = pre_profile;
     /* app_deadline_us + app_deadline_ctx are ONE ABI block: gated on the LAST
      * field's fit, so the pair is read together or not at all — never the
      * callback with a context read past the caller's struct. */
     if (MM_CFG_HAS(app_deadline_ctx)) {
         m->app_deadline_us = cfg->app_deadline_us;
         m->app_deadline_ctx = cfg->app_deadline_ctx;
+    }
+    /* the validated view was preflighted before any allocation; only the
+     * copies remain */
+    m->origin_policy = mm_pre.policy;
+    if (mm_pre.origin != NULL) {
+        m->origin = mm_strdup(m, mm_pre.origin);
+        if (m->origin == NULL)
+            goto oom;
+    }
+    if (mm_pre.policy ==
+        (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST) {
+        moq_result_t orc = mm_dup_origins(m, mm_pre.list, mm_pre.list_n);
+        if (orc == MOQ_ERR_NOMEM)
+            goto oom;
+        if (orc != MOQ_OK)
+            goto inval; /* unreachable: preflight validated it */
     }
     m->on_stopped_owns = m->on_stopped != NULL;
 
@@ -2374,6 +2709,8 @@ void moq_wtquic_msquic_managed_destroy(moq_wtquic_msquic_managed_t *m)
     mm_free_str(m, m->key_path);
     mm_free_str(m, m->wt_path);
     mm_free_protos(m);
+    mm_free_origins(m);
+    mm_free_str(m, m->origin);
     if (m->lanes != NULL) {
         for (uint32_t i = 0; i < m->lanes_inited; i++)
             pthread_mutex_destroy(&m->lanes[i].mu);

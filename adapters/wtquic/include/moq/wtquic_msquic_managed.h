@@ -130,6 +130,24 @@ typedef void (*moq_wtquic_msquic_activity_fn)(
  * wt_protocol_count is rejected by create() with MOQ_ERR_INVAL. */
 #define MOQ_WTQUIC_MSQUIC_MANAGED_MAX_WT_PROTOCOLS 8u
 
+/* The alignment the config aggregate already carries, expressed through the
+ * widest member kinds it holds rather than an assumed width: an appended
+ * field marked with it can never begin inside the previous struct's trailing
+ * padding. Portable to C11 and C++11. */
+typedef union moq_wtquic_msquic_cfg_tail_align {
+    uint64_t u64;
+    void *ptr;
+    size_t sz;
+    void (*fn)(void *);
+} moq_wtquic_msquic_cfg_tail_align_t;
+#if defined(__cplusplus)
+#  define MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS \
+      alignas(moq_wtquic_msquic_cfg_tail_align_t)
+#else
+#  define MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS \
+      _Alignas(moq_wtquic_msquic_cfg_tail_align_t)
+#endif
+
 /*
  * OWNERSHIP: every pointer in this struct — host/cert_path/key_path/wt_path,
  * the wt_protocols array AND each protocol string it points at, and alloc —
@@ -197,13 +215,17 @@ typedef struct moq_wtquic_msquic_managed_cfg {
      * idle_timeout_ms (the QUIC transport idle). */
     uint64_t session_idle_timeout_us;
     /* appended: the WebTransport-over-HTTP/3 wire profile this facade speaks on
-     * BOTH paths -- the client extended CONNECT and the server listener. The
-     * two profiles are mutually exclusive and never auto-negotiated:
+     * BOTH paths -- the client extended CONNECT and the server listener.
+     * Exactly ONE profile is configured; the facade never advertises a set
+     * and never auto-negotiates:
      *   0 = MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT (default; ":protocol =
      *       webtransport-h3", the current WebTransport-H3 draft), and
      *   1 = MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT (":protocol =
      *       webtransport" + the drafts-13/14 max-sessions signal, what
-     *       proxygen/moxygen/moqx and the picoquic h3zero family speak).
+     *       proxygen/moxygen/moqx and the picoquic h3zero family speak), and
+     *   2 = MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT (":protocol =
+     *       webtransport" + the draft-02 request marker and RFC 9297
+     *       quarter-stream-ID datagrams).
      * Maps 1:1 onto wtq_webtransport_profile_t; an out-of-range value is
      * rejected by create(). */
     uint32_t webtransport_profile;
@@ -224,13 +246,96 @@ typedef struct moq_wtquic_msquic_managed_cfg {
      * moq_wtquic_msquic_managed_cfg_init_sized. */
     uint64_t (*app_deadline_us)(void *ctx);
     void *app_deadline_ctx;
+
+    /* appended: the HTTP Origin contract. Each field is gated on ITS OWN
+     * complete fit, except the allowlist pointer and count, which are ONE
+     * block read together or not at all. A partial field is absent, never a
+     * partially copied value. Both are BORROWED for the create() call: the
+     * facade copies whatever it retains.
+     *
+     * The block starts at the aggregate's OWN alignment, so it begins at or
+     * beyond the previous full sizeof rather than inside that struct's
+     * trailing padding. Without this, a target whose last old member ends
+     * before the padded size (ARM ILP32: last member ends at 132, sizeof is
+     * 136) would let an old full-size caller expose its padding bytes as a
+     * complete Origin pointer. The alignment comes from the widest member
+     * kinds the struct already holds, never from an assumed pointer width,
+     * and the struct is never packed.
+     *
+     * CLIENT only. The serialized Origin sent on the extended CONNECT. NULL
+     * = none. Otherwise a nonempty NUL-terminated string of at most
+     * MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGIN_BYTES bytes excluding the NUL,
+     * copied unchanged -- never normalized, and never invented from the
+     * destination authority, SNI or the WebTransport path. The provider
+     * validates its serialized-origin grammar, and the whole generated
+     * CONNECT must still fit the provider's field-section budget: meeting
+     * this length limit alone does not guarantee that. D02_RFC9297_COMPAT
+     * requires one. A server passing a non-NULL origin is refused. */
+    MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS const char *origin;
+
+    /* SERVER only. One of moq_wtquic_msquic_origin_policy_t, stored as a
+     * uint32_t so the ABI does not depend on an enum's size. UNSET keeps the
+     * existing CURRENT/D13 behavior; advertising D02_RFC9297_COMPAT with
+     * UNSET is refused by create(). ANY non-UNSET policy applies to EVERY
+     * request on the path, including CURRENT and D13, and requires one
+     * present, valid, single serialized Origin. This is Origin
+     * authorization: it is not TLS and not application authentication. A
+     * client passing a non-UNSET policy is refused. */
+    uint32_t origin_policy;
+
+    /* SERVER, ALLOWLIST only: the exact byte strings admitted, compared
+     * case-sensitively with no normalization, wildcard, suffix or same-site
+     * interpretation; `null` is admitted only as an explicit entry.
+     * ALLOWLIST requires 1..MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGINS non-NULL,
+     * non-duplicate entries of at most
+     * MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGIN_BYTES bytes each excluding the
+     * NUL, whose copied size including every NUL is at most
+     * MOQ_WTQUIC_MSQUIC_MANAGED_ORIGIN_COPY_BUDGET. Every other policy
+     * requires exactly NULL and 0. A complete ALLOWLIST policy whose list is
+     * absent or partial is invalid -- it never downgrades to another
+     * policy. */
+    const char *const *allowed_origins;
+    size_t allowed_origin_count;
 } moq_wtquic_msquic_managed_cfg_t;
+
+/* How a server path authorizes the client's serialized Origin. Facade-owned:
+ * the values mirror the provider's modes, but no provider type appears in
+ * this header. */
+typedef enum moq_wtquic_msquic_origin_policy {
+    /* no Origin authorization; the existing CURRENT/D13 behavior */
+    MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET = 0,
+    /* any valid tuple origin; the opaque "null" is rejected */
+    MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE = 1,
+    /* only an exact byte match against allowed_origins */
+    MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST = 2,
+    /* any valid tuple origin, and the opaque "null" as well */
+    MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL = 3
+} moq_wtquic_msquic_origin_policy_t;
+
+/* Origin limits. The entry limit excludes the NUL; the copy budget includes
+ * every NUL. A larger count, a longer entry, or a total past the budget fails
+ * create() with MOQ_ERR_INVAL. */
+#define MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGINS 8u
+#define MOQ_WTQUIC_MSQUIC_MANAGED_MAX_ORIGIN_BYTES 320u
+#define MOQ_WTQUIC_MSQUIC_MANAGED_ORIGIN_COPY_BUDGET 512u
 
 /* The wire profile carried by moq_wtquic_msquic_managed_cfg_t.webtransport_profile
  * (values mirror wtq_webtransport_profile_t). */
 typedef enum moq_wtquic_msquic_wt_profile {
     MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT = 0,       /* :protocol = webtransport-h3 */
-    MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT = 1  /* :protocol = webtransport */
+    MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT = 1, /* :protocol = webtransport */
+    /*
+     * The draft-02 + RFC 9297 dialect.
+     *
+     * Stated as what this profile EMITS, not as what a peer selects: the
+     * extended CONNECT carries the bare "webtransport" token plus the
+     * draft-02 request marker, the local WebTransport signal is the draft-02
+     * one, and datagrams use RFC 9297 quarter-stream IDs. It is neither the
+     * full historical draft-02 datagram machinery nor draft-07, and it
+     * carries no browser promise. Which profile a given peer ends up on is
+     * that peer's selection and is NOT asserted here.
+     */
+    MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT = 2
 } moq_wtquic_msquic_wt_profile_t;
 
 /* Frozen v0 config floor: the smallest cfg struct_size create() accepts. The

@@ -3235,6 +3235,19 @@ static void test_wt_profile_abi_forwarding(void)
         CHECK(moq_wtquic_msquic_managed_test_last_listener_profile() ==
               (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT);
     }
+    /* SERVER forwarding, D02/RFC9297 -> forwarded onto the listener cfg. A
+     * facade that silently narrowed it to CURRENT would serve a different
+     * dialect than the one configured. Advertising it requires a policy. */
+    {
+        moq_wtquic_msquic_managed_cfg_t c; SRV_BASE(c);
+        c.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT;
+        c.origin_policy =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+        SRV_CREATE_OK(c);
+        CHECK(moq_wtquic_msquic_managed_test_last_listener_profile() ==
+              (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT);
+    }
     /* SERVER forwarding, explicit compat -> forwarded onto the listener cfg. */
     {
         moq_wtquic_msquic_managed_cfg_t c; SRV_BASE(c);
@@ -3281,7 +3294,9 @@ static void test_wt_profile_abi_forwarding(void)
     /* INVALID VALUE: out-of-range -> create rejects with INVAL, never starts. */
     {
         moq_wtquic_msquic_managed_cfg_t c; SRV_BASE(c);
-        c.webtransport_profile = 7;
+        /* 3 is the first value past the defined set: 0, 1 and 2 are all
+         * real dialects now, so the boundary is what this pins. */
+        c.webtransport_profile = 3;
         moq_wtquic_msquic_managed_t *m = NULL;
         CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_INVAL);
         CHECK(m == NULL);
@@ -3316,6 +3331,839 @@ static void test_wt_profile_abi_forwarding(void)
 #undef SRV_CREATE_OK
 #undef SRV_BASE
 
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+}
+
+/* --- the Origin contract: ABI gating, role rules, bounds, forwarding ------ *
+ *
+ * The four appended fields are read only when each fits entirely (the
+ * allowlist pointer and count as ONE block), refused before any effect when
+ * the combination is incoherent, and forwarded onto the COMPLETE native
+ * configuration the callee is handed -- observed there, not from a local.
+ * Every retained byte is copied before create() returns, so the caller's
+ * storage can be destroyed and the forwarded bytes must still be exact. */
+
+extern const wtq_session_events_t *
+    moq_wtquic_msquic_managed_test_expected_events(void);
+extern wtq_msquic_accept_prepare_fn
+    moq_wtquic_msquic_managed_test_expected_accept_prepare(void);
+extern wtq_msquic_accept_abandon_fn
+    moq_wtquic_msquic_managed_test_expected_accept_abandon(void);
+extern wtq_msquic_transport_quiesced_fn
+    moq_wtquic_msquic_managed_test_expected_quiesced(void);
+
+extern void moq_wtquic_msquic_managed_test_set_listener_start(
+    wtq_result_t (*fn)(wtq_msquic_env_t *,
+                       const wtq_msquic_listener_cfg_t *,
+                       wtq_msquic_listener_t **));
+
+/* The complete listener inputs, as the callee sees them. Pointers are kept as
+ * handed over: the ownership cases read them AFTER the caller's storage is
+ * gone, so a facade that forwarded borrowed memory is caught. */
+static struct {
+    unsigned calls;
+    uint32_t profile;
+    wtq_webtransport_profile_set_t profiles;   /* the singleton mask */
+    size_t path_stride;
+    size_t path_count;
+    uint32_t policy;
+    const char *const *origins;
+    size_t origin_count;
+    const char *path;
+    size_t subproto_count;
+    bool require_subprotocol;
+    uint32_t cfg_size;
+    uint32_t path_size;
+    const char *bind_address;
+    const char *cert_file;
+    const char *key_file;
+    const wtq_session_events_t *events;
+    void *user;
+    wtq_msquic_accept_prepare_fn accept_prepare;
+    wtq_msquic_accept_abandon_fn accept_abandon;
+    wtq_msquic_transport_quiesced_fn on_quiesced;
+    uint16_t port;
+    const char *subproto0;
+    const char *subproto1;
+} g_lc;
+
+/* The substitute CALLEE: it stands where wtq_msquic_listener_start stands and
+ * returns through the same result path, so a change made after any earlier
+ * observation point is still visible here. g_lc_rc selects the result, which
+ * exercises the native-refusal unwind with the copies already taken. */
+static wtq_result_t g_lc_rc = WTQ_OK;
+static wtq_result_t lc_start(wtq_msquic_env_t *env,
+                             const wtq_msquic_listener_cfg_t *cfg,
+                             wtq_msquic_listener_t **out)
+{
+    (void)env;
+    *out = NULL;
+    g_lc.calls++;
+    g_lc.cfg_size = cfg->struct_size;
+    g_lc.bind_address = cfg->bind_address;
+    g_lc.cert_file = cfg->cert_file;
+    g_lc.key_file = cfg->key_file;
+    g_lc.events = cfg->events;
+    g_lc.user = cfg->user;
+    g_lc.accept_prepare = cfg->accept_prepare;
+    g_lc.accept_abandon = cfg->accept_abandon;
+    g_lc.on_quiesced = cfg->on_transport_quiesced;
+    g_lc.port = cfg->port;
+    g_lc.profile = cfg->webtransport_profile;
+    g_lc.profiles = cfg->webtransport_profiles;
+    g_lc.path_size = (cfg->paths != NULL && cfg->path_count > 0)
+                         ? cfg->paths[0].struct_size
+                         : 0u;
+    g_lc.path_stride = cfg->path_stride;
+    g_lc.path_count = cfg->path_count;
+    if (cfg->paths != NULL && cfg->path_count > 0) {
+        g_lc.policy = cfg->paths[0].origin_policy;
+        g_lc.origins = cfg->paths[0].allowed_origins;
+        g_lc.origin_count = cfg->paths[0].allowed_origin_count;
+        g_lc.path = cfg->paths[0].path;
+        g_lc.subproto_count = cfg->paths[0].subprotocol_count;
+        g_lc.require_subprotocol = cfg->paths[0].require_subprotocol;
+        g_lc.subproto0 = cfg->paths[0].subprotocol_count > 0
+                             ? cfg->paths[0].subprotocols[0]
+                             : NULL;
+        g_lc.subproto1 = cfg->paths[0].subprotocol_count > 1
+                             ? cfg->paths[0].subprotocols[1]
+                             : NULL;
+    }
+    return g_lc_rc;
+}
+
+/* the complete connect inputs, likewise */
+static struct {
+    unsigned calls;
+    uint32_t profile;
+    const char *origin;
+    const char *path;
+    size_t subproto_count;
+} g_cc;
+
+static wtq_result_t capture_connect_full(wtq_msquic_env_t *env,
+                                         const wtq_msquic_client_cfg_t *cfg,
+                                         wtq_session_t **out)
+{
+    (void)env;
+    g_cc.calls++;
+    g_cc.profile = cfg->connect->webtransport_profile;
+    g_cc.origin = cfg->connect->origin;
+    g_cc.path = cfg->connect->path;
+    g_cc.subproto_count = cfg->connect->subprotocol_count;
+    *out = FAKE_WS;
+    return WTQ_OK;
+}
+
+/* heap storage a test can destroy after create() */
+static char *ostrdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    CHECK(d != NULL);
+    if (d != NULL)
+        memcpy(d, s, n);
+    return d;
+}
+
+/* The PREVIOUS FULL config, frozen field for field in the test itself. The
+ * old-caller fixture uses THIS type's sizeof -- padding included -- because
+ * the last member ends before that size on some targets (ARM ILP32: 132 vs
+ * 136), and the whole point of the fixture is the old caller's real size. */
+typedef struct {
+    uint32_t struct_size;
+    const moq_alloc_t *alloc;
+    moq_perspective_t perspective;
+    const char *host;
+    uint16_t port;
+    const char *cert_path;
+    const char *key_path;
+    bool insecure_skip_verify;
+    uint32_t idle_timeout_ms;
+    const char *wt_path;
+    const char *const *wt_protocols;
+    size_t wt_protocol_count;
+    moq_wtquic_msquic_lane_pump_fn on_lane_pump;
+    void *on_lane_pump_user;
+    moq_wtquic_msquic_activity_fn on_activity;
+    void *on_activity_ctx;
+    void (*on_stopped)(void *ctx);
+    void *on_stopped_ctx;
+    bool send_request_capacity;
+    uint32_t initial_request_capacity;
+    uint32_t max_events;
+    uint32_t max_actions;
+    uint32_t max_connections;
+    uint32_t lane_count;
+    moq_wtquic_msquic_choose_lane_fn choose_lane;
+    void *choose_lane_user;
+    bool streaming_objects;
+    uint64_t session_idle_timeout_us;
+    uint32_t webtransport_profile;
+    uint64_t (*app_deadline_us)(void *ctx);
+    void *app_deadline_ctx;
+} origin_cfg_prev_full_t;
+
+static void test_origin_abi_roles_bounds_forwarding(void)
+{
+    acnt_t a;
+    acnt_init(&a);
+    moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+
+#define OSRV(c) do {                                                        \
+        moq_wtquic_msquic_managed_cfg_init_sized(&(c), sizeof(c));          \
+        (c).alloc = &alloc; (c).perspective = MOQ_PERSPECTIVE_SERVER;       \
+        (c).cert_path = "c"; (c).key_path = "k"; (c).on_lane_pump = pump;   \
+    } while (0)
+#define OCLI(c) do {                                                        \
+        moq_wtquic_msquic_managed_cfg_init_sized(&(c), sizeof(c));          \
+        (c).alloc = &alloc; (c).perspective = MOQ_PERSPECTIVE_CLIENT;       \
+        (c).host = "127.0.0.1"; (c).port = 443; (c).on_lane_pump = pump;    \
+    } while (0)
+#define OCREATE_OK(c, mp) do {                                              \
+        CHECK(moq_wtquic_msquic_managed_create(&(c), (mp)) == MOQ_OK);      \
+    } while (0)
+#define ODONE(m) do {                                                       \
+        if ((m) != NULL) { moq_wtquic_msquic_managed_stop(m);               \
+                           moq_wtquic_msquic_managed_destroy(m); }          \
+    } while (0)
+#define OREFUSE(c) do {                                                     \
+        moq_wtquic_msquic_managed_t *mm_ = NULL;                            \
+        CHECK(moq_wtquic_msquic_managed_create(&(c), &mm_) == MOQ_ERR_INVAL);\
+        CHECK(mm_ == NULL);                                                 \
+    } while (0)
+
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    moq_wtquic_msquic_managed_test_set_listener_start(lc_start);
+
+    /* -- the default: no policy, nothing forwarded, everything else intact - */
+    {
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.calls == 1);
+        CHECK(g_lc.policy == (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET);
+        CHECK(g_lc.origins == NULL && g_lc.origin_count == 0);
+        /* the singleton contract: the mask stays zero and the stride stays
+         * zero (current element size), so no extra profile is advertised */
+        CHECK(g_lc.profiles == 0);
+        CHECK(g_lc.path_stride == 0);
+        CHECK(g_lc.path_count == 1);
+        CHECK(g_lc.profile == (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT);
+        /* unrelated forwarded fields are unchanged */
+        CHECK(g_lc.path != NULL && strcmp(g_lc.path, "/moq") == 0);
+        CHECK(g_lc.subproto_count == 2 && g_lc.require_subprotocol);
+        ODONE(m);
+    }
+
+    /* -- ALLOWLIST forwarding, and the copy is the facade's own ----------- */
+    {
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        char *o0 = ostrdup("https://app.example");
+        char *o1 = ostrdup("null");
+        const char **arr = malloc(2 * sizeof(*arr));
+        CHECK(arr != NULL);
+        arr[0] = o0; arr[1] = o1;
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = (const char *const *)arr;
+        c.allowed_origin_count = 2;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.calls == 1);
+        CHECK(g_lc.policy == (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST);
+        CHECK(g_lc.origin_count == 2);
+        /* forwarded storage is NOT the caller's */
+        CHECK(g_lc.origins != (const char *const *)arr);
+        CHECK(g_lc.origins != NULL && g_lc.origins[0] != o0);
+        /* destroy the caller's storage, then require the exact bytes */
+        memset(o0, 'X', strlen(o0));
+        memset(o1, 'X', strlen(o1));
+        free(o0); free(o1); free(arr);
+        if (g_lc.origins != NULL && g_lc.origin_count == 2) {
+            CHECK(g_lc.origins[0] != NULL &&
+                  strcmp(g_lc.origins[0], "https://app.example") == 0);
+            CHECK(g_lc.origins[1] != NULL &&
+                  strcmp(g_lc.origins[1], "null") == 0);
+        }
+        ODONE(m);
+    }
+
+    /* -- the client Origin is forwarded onto the CONNECT, and copied ------ */
+    moq_wtquic_msquic_managed_test_no_listener(false);
+    moq_wtquic_msquic_managed_test_set_transport(capture_connect_full,
+                                                 trivial_release);
+    {
+        moq_wtquic_msquic_managed_cfg_t c; OCLI(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        char *o = ostrdup("https://client.example");
+        c.origin = o;
+        c.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT;
+        memset(&g_cc, 0, sizeof(g_cc));
+        OCREATE_OK(c, &m);
+        CHECK(g_cc.calls == 1);
+        CHECK(g_cc.origin != NULL && g_cc.origin != o);
+        memset(o, 'X', strlen(o));
+        free(o);
+        CHECK(g_cc.origin != NULL &&
+              strcmp(g_cc.origin, "https://client.example") == 0);
+        CHECK(g_cc.profile ==
+              (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT);
+        CHECK(g_cc.path != NULL && strcmp(g_cc.path, "/moq") == 0);
+        CHECK(g_cc.subproto_count == 2);
+        ODONE(m);
+    }
+    /* absent origin stays NULL on the wire */
+    {
+        moq_wtquic_msquic_managed_cfg_t c; OCLI(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        memset(&g_cc, 0, sizeof(g_cc));
+        OCREATE_OK(c, &m);
+        CHECK(g_cc.calls == 1 && g_cc.origin == NULL);
+        ODONE(m);
+    }
+    moq_wtquic_msquic_managed_test_set_transport(trivial_connect,
+                                                 trivial_release);
+    moq_wtquic_msquic_managed_test_no_listener(true);
+
+    /* -- role coherence ---------------------------------------------------- */
+    {   /* a server may not carry a client Origin */
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin = "https://app.example";
+        OREFUSE(c);
+    }
+    {   /* a client may not carry a policy */
+        moq_wtquic_msquic_managed_cfg_t c; OCLI(c);
+        c.origin_policy =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+        OREFUSE(c);
+    }
+    {   /* nor an allowlist */
+        static const char *const one[1] = { "https://a.example" };
+        moq_wtquic_msquic_managed_cfg_t c; OCLI(c);
+        c.allowed_origins = one;
+        c.allowed_origin_count = 1;
+        OREFUSE(c);
+    }
+
+    /* -- policy vocabulary and list coherence ------------------------------ */
+    {   /* unknown policy value */
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = 4;
+        OREFUSE(c);
+    }
+    {   /* ALLOWLIST with no list */
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        OREFUSE(c);
+    }
+    {   /* ALLOWLIST with a count but a NULL array */
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origin_count = 1;
+        OREFUSE(c);
+    }
+    {   /* ALLOWLIST with an array but a zero count */
+        static const char *const one[1] = { "https://a.example" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = one;
+        OREFUSE(c);
+    }
+    {   /* a non-ALLOWLIST policy may not carry a list */
+        static const char *const one[1] = { "https://a.example" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
+        c.allowed_origins = one;
+        c.allowed_origin_count = 1;
+        OREFUSE(c);
+    }
+    {   /* a NULL entry inside the list */
+        static const char *const bad[2] = { "https://a.example", NULL };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = bad;
+        c.allowed_origin_count = 2;
+        OREFUSE(c);
+    }
+    {   /* an empty entry */
+        static const char *const bad[1] = { "" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = bad;
+        c.allowed_origin_count = 1;
+        OREFUSE(c);
+    }
+    {   /* exact-byte duplicates */
+        static const char *const dup[2] = { "https://a.example",
+                                            "https://a.example" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = dup;
+        c.allowed_origin_count = 2;
+        OREFUSE(c);
+    }
+
+    /* -- D02 requires a policy -------------------------------------------- */
+    {
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        c.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT;
+        OREFUSE(c);   /* UNSET + D02 */
+    }
+    {   /* and a policy applies under CURRENT too */
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        c.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT;
+        c.origin_policy =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.policy ==
+              (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE);
+        CHECK(g_lc.profile == (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT);
+        ODONE(m);
+    }
+    {   /* and under D13 */
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        c.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D13_14_COMPAT;
+        c.origin_policy =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.policy ==
+              (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL);
+        ODONE(m);
+    }
+
+    /* -- exact bounds ------------------------------------------------------ */
+    {   /* 8 entries pass, 9 refuse */
+        static const char *const eight[9] = { "a1", "a2", "a3", "a4",
+                                              "a5", "a6", "a7", "a8", "a9" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = eight;
+        c.allowed_origin_count = 8;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.origin_count == 8);
+        ODONE(m);
+
+        moq_wtquic_msquic_managed_cfg_t c9; OSRV(c9);
+        c9.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c9.allowed_origins = eight;
+        c9.allowed_origin_count = 9;
+        OREFUSE(c9);
+    }
+    {   /* 320 bytes pass, 321 refuse (the limit excludes the NUL) */
+        char big[322];
+        const char *one[1];
+        memset(big, 'a', sizeof(big));
+        big[320] = '\0';
+        one[0] = big;
+        {
+            moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+            moq_wtquic_msquic_managed_t *m = NULL;
+            c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+            c.allowed_origins = (const char *const *)one;
+            c.allowed_origin_count = 1;
+            memset(&g_lc, 0, sizeof(g_lc));
+            OCREATE_OK(c, &m);
+            CHECK(g_lc.origin_count == 1);
+            CHECK(g_lc.origins != NULL && g_lc.origins[0] != NULL &&
+                  strlen(g_lc.origins[0]) == 320);
+            ODONE(m);
+        }
+        big[320] = 'a';
+        big[321] = '\0';
+        {
+            moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+            c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+            c.allowed_origins = (const char *const *)one;
+            c.allowed_origin_count = 1;
+            OREFUSE(c);
+        }
+        /* the client Origin obeys the same length limit */
+        {
+            moq_wtquic_msquic_managed_cfg_t c; OCLI(c);
+            c.origin = big;   /* 321 bytes */
+            OREFUSE(c);
+        }
+    }
+    {   /* the copy budget counts every terminator: 512 passes, 513 refuses */
+        char e1[256], e2[257];
+        const char *two[2];
+        memset(e1, 'b', sizeof(e1)); e1[255] = '\0';   /* 255 + NUL = 256 */
+        memset(e2, 'c', sizeof(e2)); e2[255] = '\0';   /* 255 + NUL = 256 */
+        two[0] = e1; two[1] = e2;
+        {
+            moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+            moq_wtquic_msquic_managed_t *m = NULL;
+            c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+            c.allowed_origins = (const char *const *)two;
+            c.allowed_origin_count = 2;
+            memset(&g_lc, 0, sizeof(g_lc));
+            OCREATE_OK(c, &m);          /* exactly 512 copied bytes */
+            CHECK(g_lc.origin_count == 2);
+            ODONE(m);
+        }
+        e2[255] = 'c'; e2[256] = '\0';  /* one byte more -> 513 */
+        {
+            moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+            c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+            c.allowed_origins = (const char *const *)two;
+            c.allowed_origin_count = 2;
+            OREFUSE(c);
+        }
+    }
+
+    /* -- ABI: sizes, partial tails, poison, canaries ---------------------- */
+    {
+        /* the OLD CALLER'S SIZE: the frozen type's sizeof, padding included,
+         * not the end of its last member */
+        const size_t prev_full = sizeof(origin_cfg_prev_full_t);
+        const size_t prev_last_end =
+            offsetof(origin_cfg_prev_full_t, app_deadline_ctx) +
+            sizeof(((origin_cfg_prev_full_t *)0)->app_deadline_ctx);
+        static const char *const one[1] = { "https://a.example" };
+        /* every new field begins at or after the previous full size, which
+         * on a padded target is strictly past its last member's end */
+        CHECK(offsetof(moq_wtquic_msquic_managed_cfg_t, origin) >= prev_full);
+        CHECK(prev_full >= prev_last_end);
+        /* the V0 floor is unmoved by the append */
+        CHECK(MOQ_WTQUIC_MSQUIC_MANAGED_CFG_V0_SIZE ==
+              offsetof(moq_wtquic_msquic_managed_cfg_t, on_activity_ctx) +
+                  sizeof(((moq_wtquic_msquic_managed_cfg_t *)0)->on_activity_ctx));
+        CHECK(prev_full < sizeof(moq_wtquic_msquic_managed_cfg_t));
+
+        /* a caller at the PREVIOUS full size: the tail is absent, so a
+         * D02 server is refused (no policy can be read) and a default
+         * server still starts with UNSET */
+        {
+            moq_wtquic_msquic_managed_cfg_t c;
+            moq_wtquic_msquic_managed_t *m = NULL;
+            memset(&c, 0xAB, sizeof(c));          /* poison the whole struct */
+            moq_wtquic_msquic_managed_cfg_init_sized(&c, prev_full);
+            CHECK(c.struct_size == (uint32_t)prev_full);
+            /* the sized init zeroed the supplied prefix, INCLUDING the old
+             * struct's trailing padding. Put the poison back there only: an
+             * old full-size caller really does hand over uninitialized
+             * padding, and nothing past prev_last_end may be read. */
+            if (prev_full > prev_last_end)
+                memset((unsigned char *)&c + prev_last_end, 0xAB,
+                       prev_full - prev_last_end);
+            c.alloc = &alloc; c.perspective = MOQ_PERSPECTIVE_SERVER;
+            c.cert_path = "c"; c.key_path = "k"; c.on_lane_pump = pump;
+            memset(&g_lc, 0, sizeof(g_lc));
+            OCREATE_OK(c, &m);
+            /* the poisoned tail was never read */
+            CHECK(g_lc.policy ==
+                  (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET);
+            CHECK(g_lc.origins == NULL && g_lc.origin_count == 0);
+            ODONE(m);
+        }
+        /* the V0 floor still works and reads no tail */
+        {
+            moq_wtquic_msquic_managed_cfg_t c;
+            moq_wtquic_msquic_managed_t *m = NULL;
+            memset(&c, 0xCD, sizeof(c));
+            moq_wtquic_msquic_managed_cfg_init_sized(
+                &c, MOQ_WTQUIC_MSQUIC_MANAGED_CFG_V0_SIZE);
+            c.alloc = &alloc; c.perspective = MOQ_PERSPECTIVE_SERVER;
+            c.cert_path = "c"; c.key_path = "k"; c.on_lane_pump = pump;
+            memset(&g_lc, 0, sizeof(g_lc));
+            OCREATE_OK(c, &m);
+            CHECK(g_lc.policy ==
+                  (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_UNSET);
+            CHECK(g_lc.profile ==
+                  (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT);
+            ODONE(m);
+        }
+        /* each partial tail boundary: a field one byte short is ABSENT, not
+         * partially read. The poisoned bytes past struct_size would be a
+         * nonsense policy or pointer if they were consulted. */
+        {
+            const size_t bounds[4] = {
+                offsetof(moq_wtquic_msquic_managed_cfg_t, origin) +
+                    sizeof(((moq_wtquic_msquic_managed_cfg_t *)0)->origin) - 1u,
+                offsetof(moq_wtquic_msquic_managed_cfg_t, origin_policy) +
+                    sizeof(((moq_wtquic_msquic_managed_cfg_t *)0)->origin_policy) - 1u,
+                offsetof(moq_wtquic_msquic_managed_cfg_t, allowed_origins) +
+                    sizeof(((moq_wtquic_msquic_managed_cfg_t *)0)->allowed_origins) - 1u,
+                offsetof(moq_wtquic_msquic_managed_cfg_t, allowed_origin_count) +
+                    sizeof(((moq_wtquic_msquic_managed_cfg_t *)0)->allowed_origin_count) - 1u,
+            };
+            for (size_t i = 0; i < 4; i++) {
+                moq_wtquic_msquic_managed_cfg_t c;
+                moq_wtquic_msquic_managed_t *m = NULL;
+                memset(&c, 0xEF, sizeof(c));
+                moq_wtquic_msquic_managed_cfg_init_sized(&c, bounds[i]);
+                c.alloc = &alloc; c.perspective = MOQ_PERSPECTIVE_SERVER;
+                c.cert_path = "c"; c.key_path = "k"; c.on_lane_pump = pump;
+                /* set the whole block; only the fields that FIT may be read */
+                if (bounds[i] >= offsetof(moq_wtquic_msquic_managed_cfg_t,
+                                          origin_policy) +
+                                     sizeof(c.origin_policy))
+                    c.origin_policy =
+                        (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+                c.allowed_origins = one;
+                c.allowed_origin_count = 1;
+                memset(&g_lc, 0, sizeof(g_lc));
+                moq_result_t rc = moq_wtquic_msquic_managed_create(&c, &m);
+                if (bounds[i] < offsetof(moq_wtquic_msquic_managed_cfg_t,
+                                         allowed_origin_count) +
+                                    sizeof(c.allowed_origin_count)) {
+                    /* the list block is not wholly covered: it is NOT read.
+                     * With a complete ALLOWLIST policy that is invalid; with
+                     * the policy itself absent the server simply starts. */
+                    if (bounds[i] >= offsetof(moq_wtquic_msquic_managed_cfg_t,
+                                              origin_policy) +
+                                         sizeof(c.origin_policy)) {
+                        CHECK(rc == MOQ_ERR_INVAL);
+                        CHECK(m == NULL);
+                    } else {
+                        CHECK(rc == MOQ_OK);
+                        CHECK(g_lc.origins == NULL && g_lc.origin_count == 0);
+                        ODONE(m);
+                        m = NULL;
+                    }
+                } else {
+                    CHECK(rc == MOQ_OK);
+                    CHECK(g_lc.origin_count == 1);
+                    ODONE(m);
+                    m = NULL;
+                }
+                ODONE(m);
+            }
+        }
+        /* a larger future struct: the known extent is read, the unknown tail
+         * ignored, and a canary past it is never touched */
+        {
+            struct future {
+                moq_wtquic_msquic_managed_cfg_t base;
+                uint64_t canary[4];
+            } f;
+            moq_wtquic_msquic_managed_t *m = NULL;
+            memset(&f, 0, sizeof(f));
+            moq_wtquic_msquic_managed_cfg_init_sized(&f.base, sizeof(f.base));
+            f.base.struct_size = (uint32_t)sizeof(f);
+            for (size_t i = 0; i < 4; i++)
+                f.canary[i] = 0xA5A5A5A5A5A5A5A5ull;
+            f.base.alloc = &alloc;
+            f.base.perspective = MOQ_PERSPECTIVE_SERVER;
+            f.base.cert_path = "c"; f.base.key_path = "k";
+            f.base.on_lane_pump = pump;
+            f.base.origin_policy =
+                (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+            f.base.allowed_origins = one;
+            f.base.allowed_origin_count = 1;
+            memset(&g_lc, 0, sizeof(g_lc));
+            OCREATE_OK(f.base, &m);
+            CHECK(g_lc.origin_count == 1);
+            for (size_t i = 0; i < 4; i++)
+                CHECK(f.canary[i] == 0xA5A5A5A5A5A5A5A5ull);
+            ODONE(m);
+        }
+    }
+
+    /* -- allocation failure while copying leaves nothing behind ----------- */
+    {
+        static const char *const three[3] = { "https://a.example",
+                                              "https://b.example",
+                                              "https://c.example" };
+        for (long budget = 1; budget <= 12; budget++) {
+            acnt_t fa;
+            acnt_init_budget(&fa, budget);
+            moq_alloc_t falloc = { &fa, acnt_alloc, acnt_realloc, acnt_free };
+            moq_wtquic_msquic_managed_cfg_t c;
+            moq_wtquic_msquic_managed_t *m = NULL;
+            moq_wtquic_msquic_managed_cfg_init_sized(&c, sizeof(c));
+            c.alloc = &falloc; c.perspective = MOQ_PERSPECTIVE_SERVER;
+            c.cert_path = "c"; c.key_path = "k"; c.on_lane_pump = pump;
+            c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+            c.allowed_origins = three;
+            c.allowed_origin_count = 3;
+            moq_result_t rc = moq_wtquic_msquic_managed_create(&c, &m);
+            if (rc == MOQ_OK) {
+                ODONE(m);
+            } else {
+                CHECK(rc == MOQ_ERR_NOMEM);
+                CHECK(m == NULL);
+            }
+            CHECK(acnt_live(&fa) == 0);   /* no leak on either path */
+            acnt_destroy(&fa);
+        }
+    }
+
+    /* -- the callee sees the COMPLETE declared configuration --------------- */
+    {
+        static const char *const two[2] = { "https://a.example",
+                                            "https://b.example" };
+        static const char *const protos[2] = { "moqt-16", "moqt-18" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        c.webtransport_profile =
+            (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT;
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = two;
+        c.allowed_origin_count = 2;
+        /* nondefault geometry, so nothing here can pass by inheriting a
+         * default; the subprotocol order is the REVERSE of the facade's */
+        c.host = "127.0.0.2";
+        c.port = 4711;
+        c.wt_path = "/relay";
+        c.wt_protocols = protos;
+        c.wt_protocol_count = 2;
+        memset(&g_lc, 0, sizeof(g_lc));
+        OCREATE_OK(c, &m);
+        CHECK(g_lc.calls == 1);
+        /* sizes stated independently, not copied from the builder */
+        CHECK(g_lc.cfg_size == (uint32_t)sizeof(wtq_msquic_listener_cfg_t));
+        CHECK(g_lc.path_size == (uint32_t)sizeof(wtq_serve_config_t));
+        CHECK(g_lc.path_count == 1);
+        CHECK(g_lc.path_stride == 0);       /* current element size */
+        CHECK(g_lc.profiles == 0);          /* the singleton, not a set */
+        CHECK(g_lc.profile ==
+              (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT);
+        /* exact bytes and preference order */
+        CHECK(g_lc.path != NULL && strcmp(g_lc.path, "/relay") == 0);
+        CHECK(g_lc.subproto_count == 2 && g_lc.require_subprotocol);
+        CHECK(g_lc.subproto0 != NULL && strcmp(g_lc.subproto0, "moqt-16") == 0);
+        CHECK(g_lc.subproto1 != NULL && strcmp(g_lc.subproto1, "moqt-18") == 0);
+        /* credentials and callback/context identities */
+        CHECK(g_lc.cert_file != NULL && strcmp(g_lc.cert_file, "c") == 0);
+        CHECK(g_lc.key_file != NULL && strcmp(g_lc.key_file, "k") == 0);
+        /* exact identities, taken from the production symbols rather than
+         * from the outgoing config being checked: a well-typed but WRONG
+         * table or callback is a different pointer and fails here */
+        CHECK(g_lc.events ==
+              moq_wtquic_msquic_managed_test_expected_events());
+        CHECK(g_lc.user == (void *)m);
+        CHECK(g_lc.accept_prepare ==
+              moq_wtquic_msquic_managed_test_expected_accept_prepare());
+        CHECK(g_lc.accept_abandon ==
+              moq_wtquic_msquic_managed_test_expected_accept_abandon());
+        CHECK(g_lc.on_quiesced ==
+              moq_wtquic_msquic_managed_test_expected_quiesced());
+        /* the configured geometry, not the defaults */
+        CHECK(g_lc.bind_address != NULL &&
+              strcmp(g_lc.bind_address, "127.0.0.2") == 0);
+        CHECK(g_lc.port == 4711);
+        CHECK(g_lc.policy ==
+              (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST);
+        CHECK(g_lc.origin_count == 2);
+        CHECK(g_lc.origins != NULL && g_lc.origins != two);
+        ODONE(m);
+    }
+    /* -- a native refusal returns through the same path, and unwinds ------- */
+    {
+        static const char *const one[1] = { "https://a.example" };
+        moq_wtquic_msquic_managed_cfg_t c; OSRV(c);
+        moq_wtquic_msquic_managed_t *m = NULL;
+        c.origin_policy = (uint32_t)MOQ_WTQUIC_MSQUIC_ORIGIN_POLICY_ALLOWLIST;
+        c.allowed_origins = one;
+        c.allowed_origin_count = 1;
+        memset(&g_lc, 0, sizeof(g_lc));
+        g_lc_rc = WTQ_ERR_INVALID_ARG;
+        CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_INVAL);
+        CHECK(m == NULL);
+        CHECK(g_lc.calls == 1);      /* the copies were taken, then unwound */
+        g_lc_rc = WTQ_ERR_TOO_LARGE;
+        CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_INVAL);
+        CHECK(m == NULL);
+        g_lc_rc = WTQ_ERR_NOMEM;
+        CHECK(moq_wtquic_msquic_managed_create(&c, &m) == MOQ_ERR_NOMEM);
+        CHECK(m == NULL);
+        g_lc_rc = WTQ_OK;
+    }
+
+    /* -- structural refusal has NO effects, even with a failing allocator -- */
+    {
+        static const char *const dup[2] = { "https://a.example",
+                                            "https://a.example" };
+        static const char *const one[1] = { "https://a.example" };
+        struct { const char *name; bool client; uint32_t prof; uint32_t pol;
+                 const char *origin; const char *const *list; size_t n; }
+        bad[] = {
+            { "unknown policy",   false, 0, 4, NULL, NULL, 0 },
+            { "server origin",    false, 0, 0, "https://a.example", NULL, 0 },
+            { "duplicate list",   false, 0, 2, NULL, dup, 2 },
+            { "client policy",    true,  0, 1, NULL, NULL, 0 },
+            { "client list",      true,  0, 0, NULL, one, 1 },
+            { "client D02 no origin", true,
+              (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT,
+              0, NULL, NULL, 0 },
+            { "server D02 unset", false,
+              (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_D02_RFC9297_COMPAT,
+              0, NULL, NULL, 0 },
+        };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            acnt_t fa;
+            acnt_init_budget(&fa, 0);   /* the FIRST allocation would fail */
+            moq_alloc_t falloc = { &fa, acnt_alloc, acnt_realloc, acnt_free };
+            moq_wtquic_msquic_managed_cfg_t c;
+            moq_wtquic_msquic_managed_t *m = NULL;
+            moq_wtquic_msquic_managed_cfg_init_sized(&c, sizeof(c));
+            c.alloc = &falloc;
+            c.on_lane_pump = pump;
+            if (bad[i].client) {
+                c.perspective = MOQ_PERSPECTIVE_CLIENT;
+                c.host = "127.0.0.1"; c.port = 443;
+            } else {
+                c.perspective = MOQ_PERSPECTIVE_SERVER;
+                c.cert_path = "c"; c.key_path = "k";
+            }
+            c.webtransport_profile = bad[i].prof;
+            c.origin_policy = bad[i].pol;
+            c.origin = bad[i].origin;
+            c.allowed_origins = bad[i].list;
+            c.allowed_origin_count = bad[i].n;
+            memset(&g_lc, 0, sizeof(g_lc));
+            g_cc.calls = 0;
+            moq_result_t rc = moq_wtquic_msquic_managed_create(&c, &m);
+            /* INVAL, not the NOMEM a fail-first allocator would have produced */
+            CHECK(rc == MOQ_ERR_INVAL);
+            CHECK(m == NULL);
+            CHECK(acnt_live(&fa) == 0);
+            /* and nothing was attempted: no allocation, no provider entry */
+            CHECK(fa.denials == 0);
+            CHECK(g_lc.calls == 0 && g_cc.calls == 0);
+            acnt_destroy(&fa);
+        }
+        /* controls: absent Origin is fine under CURRENT and D13 */
+        for (uint32_t prof = 0; prof <= 1; prof++) {
+            moq_wtquic_msquic_managed_cfg_t c; OCLI(c);
+            moq_wtquic_msquic_managed_t *m = NULL;
+            c.webtransport_profile = prof;
+            moq_wtquic_msquic_managed_test_no_listener(false);
+            moq_wtquic_msquic_managed_test_set_transport(capture_connect_full,
+                                                         trivial_release);
+            memset(&g_cc, 0, sizeof(g_cc));
+            OCREATE_OK(c, &m);
+            CHECK(g_cc.calls == 1 && g_cc.origin == NULL);
+            ODONE(m);
+            moq_wtquic_msquic_managed_test_set_transport(trivial_connect,
+                                                         trivial_release);
+            moq_wtquic_msquic_managed_test_no_listener(true);
+        }
+    }
+
+    moq_wtquic_msquic_managed_test_set_listener_start(NULL);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+#undef OREFUSE
+#undef ODONE
+#undef OCREATE_OK
+#undef OCLI
+#undef OSRV
     CHECK(acnt_live(&a) == 0);
     acnt_destroy(&a);
 }
@@ -3982,6 +4830,7 @@ int main(void)
     test_connect_result_mapping();
     test_wait_state_machine();
     test_wt_profile_abi_forwarding();
+    test_origin_abi_roles_bounds_forwarding();
 
     if (g_fail != 0) {
         fprintf(stderr, "FAILED: test_wtquic_msquic_managed_internal (%d)\n",

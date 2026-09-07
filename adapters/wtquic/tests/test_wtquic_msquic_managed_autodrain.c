@@ -248,13 +248,6 @@ static int sub_drained(struct sub_side *sv)
     pthread_mutex_unlock(&sv->mu);
     return d;
 }
-static uint64_t sub_pumps(struct sub_side *sv)
-{
-    pthread_mutex_lock(&sv->mu);
-    uint64_t p = sv->pumps;
-    pthread_mutex_unlock(&sv->mu);
-    return p;
-}
 static bool sub_ready(struct sub_side *sv)
 {
     pthread_mutex_lock(&sv->mu);

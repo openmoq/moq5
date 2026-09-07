@@ -36,6 +36,10 @@ option(MOQ_BUILD_ADAPTER_MVFST     "Build mvfst QUIC adapter"       OFF)
 option(MOQ_BUILD_ADAPTER_PROXYGEN  "Build proxygen WebTransport adapter" OFF)
 option(MOQ_BUILD_ADAPTER_PICO_WT   "Build picoquic WebTransport adapter" OFF)
 option(MOQ_BUILD_ADAPTER_WTQUIC    "Build wtquic WebTransport adapter" OFF)
+# Declared HERE, not inside the adapter's test block, so that requesting it
+# without its prerequisites is a named refusal rather than an unused variable.
+option(MOQ_WTQUIC_ORIGIN_GATE
+    "Build the native WebTransport Origin authorization fixture" OFF)
 option(MOQ_BUILD_ADAPTER_MSQUIC    "Build MsQuic raw-QUIC adapter"  OFF)
 option(MOQ_BUILD_WTQUIC_NETWORK_MANAGED
     "Build the managed MoQ client over wtquic Network.framework (Apple)" OFF)
@@ -184,6 +188,25 @@ if(MOQ_BUILD_ADAPTER_PROXYGEN)
 endif()
 
 # -- wtquic adapter (WebTransport over HTTP/3, backend-neutral) -------
+# An explicitly requested fixture must never be silently absent. Each missing
+# prerequisite is named on its own, so the message says what to turn on rather
+# than leaving CMake's unused-variable notice as the only clue.
+if(MOQ_WTQUIC_ORIGIN_GATE)
+    if(NOT MOQ_BUILD_TESTS)
+        message(FATAL_ERROR
+            "MOQ_WTQUIC_ORIGIN_GATE=ON requires MOQ_BUILD_TESTS=ON")
+    endif()
+    if(NOT MOQ_BUILD_ADAPTER_WTQUIC)
+        message(FATAL_ERROR
+            "MOQ_WTQUIC_ORIGIN_GATE=ON requires MOQ_BUILD_ADAPTER_WTQUIC=ON")
+    endif()
+    if(NOT MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
+        message(FATAL_ERROR
+            "MOQ_WTQUIC_ORIGIN_GATE=ON requires "
+            "MOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON")
+    endif()
+endif()
+
 if(MOQ_BUILD_ADAPTER_WTQUIC)
     # wtquic installs a CMake package; point CMAKE_PREFIX_PATH at its
     # install prefix (e.g. the workspace local-prefix).

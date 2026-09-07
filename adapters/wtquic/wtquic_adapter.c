@@ -31,6 +31,8 @@
 #include <moq/transport_bridge.h>
 #include <moq/wtquic.h>
 
+#include "wtquic_adapter_internal.h"
+
 #define MOQ_WTQ_MAX_STREAMS 16 /* mirrors wtquic's session handle pool */
 
 struct moq_wtq_stream {

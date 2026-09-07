@@ -311,6 +311,72 @@ if(MOQ_BUILD_TESTS)
         endif()
     endif()
 
+    # -- Origin authorization gate ---------------------------------------
+    #
+    # The orchestration -- the frozen row table, the observation recorders
+    # and the verdict -- is transport-free by construction, so it builds
+    # and runs here with no provider, no socket and no certificate. This is
+    # the test that proves the RULES; the native fixture below only wires a
+    # transport to them.
+    add_executable(test_wtquic_origin_rows
+        tests/test_wtquic_origin_rows.c tests/origin_rows.c)
+    target_include_directories(test_wtquic_origin_rows PRIVATE tests)
+    # origin_rows.c uses pthreads; Darwin's libSystem hides the omission,
+    # other link environments do not.
+    target_link_libraries(test_wtquic_origin_rows PRIVATE Threads::Threads)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_origin_rows PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_origin_rows COMMAND test_wtquic_origin_rows)
+
+    # The DRIVER -- build, connect, wait, tear down, decide -- exercised
+    # through a fake transport that can produce a callback before connect
+    # returns, a reentrant callback, a late contradiction, a partial
+    # construction and a call that blocks past the budget. Time is
+    # injected, so nothing sleeps and nothing opens a socket.
+    add_executable(test_wtquic_origin_driver
+        tests/test_wtquic_origin_driver.c tests/origin_driver.c
+        tests/origin_rows.c)
+    target_include_directories(test_wtquic_origin_driver PRIVATE tests)
+    # origin_rows.c uses pthreads; Darwin's libSystem hides the omission,
+    # other link environments do not.
+    target_link_libraries(test_wtquic_origin_driver PRIVATE Threads::Threads)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_origin_driver PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_origin_driver COMMAND test_wtquic_origin_driver)
+
+    # The parent/child report path with REAL processes and a real pipe:
+    # a codec round trip proves none of what this checks.
+    add_executable(test_wtquic_origin_super
+        tests/test_wtquic_origin_super.c tests/origin_super.c
+        tests/origin_rows.c)
+    target_include_directories(test_wtquic_origin_super PRIVATE tests)
+    # origin_rows.c uses pthreads; Darwin's libSystem hides the omission,
+    # other link environments do not.
+    target_link_libraries(test_wtquic_origin_super PRIVATE Threads::Threads)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_origin_super PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_origin_super COMMAND test_wtquic_origin_super)
+    set_tests_properties(wtquic_origin_super PROPERTIES TIMEOUT 120)
+
+    # The native gate lives inside the facade guard below, so an explicit
+    # request with no facade target would otherwise generate nothing at all.
+    if(MOQ_WTQUIC_ORIGIN_GATE AND NOT TARGET moq::adapter-wtquic-msquic-managed)
+        message(FATAL_ERROR
+            "MOQ_WTQUIC_ORIGIN_GATE=ON but the managed wtquic-MsQuic facade "
+            "target was not built. It needs a wtquic prefix providing the "
+            "msquic component; configure with -Dwtquic_DIR=<prefix>/lib/cmake/"
+            "wtquic and -Dmsquic_DIR=<prefix>/share/msquic.")
+    endif()
+
     # Managed wtquic-MsQuic facade: behavioral + linked C/C++ consumers. These
     # link the real library, so they build only when the facade is enabled.
     if(TARGET moq::adapter-wtquic-msquic-managed)
@@ -324,6 +390,87 @@ if(MOQ_BUILD_TESTS)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME wtquic_msquic_managed COMMAND test_wtquic_msquic_managed)
+
+
+        # The native fixture is EXPLICITLY REQUESTED and never built by an
+        # ordinary configure. It needs a wtquic providing the trusted client
+        # entry: against a prefix without it the request FAILS here, loudly,
+        # rather than quietly dropping a target and letting a smaller suite be
+        # reported as a complete run. Ordinary old-prefix consumers are
+        # unaffected while the fixture is not requested.
+        if(MOQ_WTQUIC_ORIGIN_GATE)
+            # Use the imported target's FULL compile and link requirements.
+            # Copying only its direct include directories loses the transitive
+            # ones -- msquic.h among them -- so the check fails against a
+            # perfectly good prefix and proves nothing about the symbol.
+            include(CheckCSourceCompiles)
+            include(CMakePushCheckState)
+            cmake_push_check_state(RESET)
+            set(CMAKE_REQUIRED_LIBRARIES wtq::msquic)
+            # A typed pointer the compiler cannot fold away: the check must
+            # LINK the symbol, not merely see its declaration.
+            check_c_source_compiles("
+#include <wtquic/wtquic_msquic.h>
+static wtq_result_t (*volatile p)(wtq_msquic_env_t *,
+                                  const wtq_msquic_client_cfg_t *,
+                                  const wtq_msquic_client_trust_cfg_t *,
+                                  wtq_session_t **) =
+    wtq_msquic_client_connect_with_trust;
+int main(void) { return p == 0; }
+" MOQ_WTQUIC_HAVE_TRUSTED_CLIENT)
+            cmake_pop_check_state()
+            if(NOT MOQ_WTQUIC_HAVE_TRUSTED_CLIENT)
+                message(FATAL_ERROR
+                    "MOQ_WTQUIC_ORIGIN_GATE was requested, but this wtquic "
+                    "does not provide wtq_msquic_client_connect_with_trust. "
+                    "The Origin fixture cannot verify a server certificate "
+                    "without it; select a wtquic that has it rather than "
+                    "building a fixture that cannot prove anything.")
+            endif()
+            add_executable(test_wtquic_origin_gate
+                tests/test_wtquic_origin_gate.c tests/origin_driver.c
+                tests/origin_super.c tests/origin_rows.c)
+            target_include_directories(test_wtquic_origin_gate PRIVATE tests)
+            target_link_libraries(test_wtquic_origin_gate PRIVATE
+                moq::adapter-wtquic-msquic-managed wtq::msquic Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_wtquic_origin_gate PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            # Identity only. The row execution is held: no registered test
+            # starts an environment, a listener or a client.
+            add_test(NAME wtquic_origin_gate_identity
+                COMMAND test_wtquic_origin_gate --identity)
+            set_tests_properties(wtquic_origin_gate_identity PROPERTIES
+                TIMEOUT 60)
+
+            # The ACTUAL native callbacks and owning pump, with only the
+            # transport operations substituted: no provider, socket,
+            # certificate or network. It needs the WT headers, which is why it
+            # lives behind the same request as the fixture.
+            add_executable(test_wtquic_origin_native
+                tests/test_wtquic_origin_native.c tests/origin_driver.c
+                tests/origin_rows.c tests/origin_super.c)
+            target_include_directories(test_wtquic_origin_native PRIVATE tests)
+            target_link_libraries(test_wtquic_origin_native PRIVATE
+                Threads::Threads)
+            # Only the HEADERS of the facade and the client are needed. They
+            # come in as SYSTEM includes, exactly as the imported targets would
+            # supply them, so the provider's own pedantic diagnostics are not
+            # attributed to this fixture -- and no warning flag is relaxed.
+            target_include_directories(test_wtquic_origin_native SYSTEM PRIVATE
+                $<TARGET_PROPERTY:moq::adapter-wtquic-msquic-managed,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:wtq::msquic,INTERFACE_INCLUDE_DIRECTORIES>)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_wtquic_origin_native PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME wtquic_origin_native
+                COMMAND test_wtquic_origin_native)
+            set_tests_properties(wtquic_origin_native PROPERTIES TIMEOUT 120)
+        endif()
 
         # Causal whole-block cfg-ABI gate (no network): an over-read of
         # app_deadline_ctx is a heap-buffer-overflow under the canonical ASan
@@ -409,6 +556,15 @@ if(MOQ_BUILD_TESTS)
     else()
         set(_wtquic_consumer_msquic_managed 0)
     endif()
+    # The MsQuic identity is only meaningful when that optional backend
+    # exists. Evaluating $<TARGET_FILE:msquic::msquic> unconditionally makes
+    # generation fail for a core-only WTQuic install, which the backend-neutral
+    # attach adapter must still support.
+    set(_wtquic_consumer_msquic_lib "")
+    if(TARGET msquic::msquic)
+        set(_wtquic_consumer_msquic_lib
+            "-DMSQUIC_LIB=$<TARGET_FILE:msquic::msquic>")
+    endif()
     add_test(NAME wtquic_install_consumer
         COMMAND ${CMAKE_COMMAND}
             -DBUILD=${PROJECT_BINARY_DIR}
@@ -418,10 +574,20 @@ if(MOQ_BUILD_TESTS)
             -DNETWORK_MANAGED=${_wtquic_consumer_network_managed}
             -DMSQUIC_MANAGED=${_wtquic_consumer_msquic_managed}
             -DC_COMPILER=${CMAKE_C_COMPILER}
+            -DSHARED=${BUILD_SHARED_LIBS}
+            -DOPENSSL_ROOT=${OPENSSL_ROOT_DIR}
+            ${_wtquic_consumer_msquic_lib}
             "-DC_FLAGS=${CMAKE_C_FLAGS}"
             "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_install.cmake)
     set_tests_properties(wtquic_install_consumer PROPERTIES TIMEOUT 300)
+    # The loader-image helper decides what the consumer lane proved, so its
+    # own decisions are pinned against captured fixture text for both
+    # supported platforms. No process is started.
+    add_test(NAME wtquic_loader_images_selftest
+        COMMAND ${CMAKE_COMMAND}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/loader_images_selftest.cmake)
+    set_tests_properties(wtquic_loader_images_selftest PROPERTIES TIMEOUT 60)
 
     # Build-tree consumer: the same consumer project resolved against
     # ${PROJECT_BINARY_DIR} (no install step).
@@ -431,6 +597,7 @@ if(MOQ_BUILD_TESTS)
             -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
             -DWORK=${CMAKE_CURRENT_BINARY_DIR}/buildtree-consumer-work
             -DC_COMPILER=${CMAKE_C_COMPILER}
+            -DOPENSSL_ROOT=${OPENSSL_ROOT_DIR}
             "-DC_FLAGS=${CMAKE_C_FLAGS}"
             "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_buildtree.cmake)
