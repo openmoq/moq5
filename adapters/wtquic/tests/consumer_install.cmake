@@ -301,7 +301,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         # prefix. In particular, a static LibMoQ can and routinely does link a
         # shared WTQuic backend.
         set(_expect "")
-        set(_public_shared 0)
+        set(_private_prefix_shared 0)
         if(SHARED)
             set(_moq_names libmoq-adapter-wtquic-msquic-managed
                            libmoq-adapter-wtquic libmoq-core)
@@ -316,7 +316,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                 get_filename_component(_r "${_f0}" REALPATH)
                 list(APPEND _expect "${_r}")
             endforeach()
-            set(_public_shared 1)
+            set(_private_prefix_shared 1)
         endif()
         set(_wtq_names libwtquic-msquic libwtquic)
         foreach(_n IN LISTS _wtq_names)
@@ -326,7 +326,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                 list(GET _f 0 _f0)
                 get_filename_component(_r "${_f0}" REALPATH)
                 list(APPEND _expect "${_r}")
-                set(_public_shared 1)
+                set(_private_prefix_shared 1)
             endif()
         endforeach()
         if(NOT MSQUIC_LIB OR NOT EXISTS "${MSQUIC_LIB}")
@@ -341,17 +341,19 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
             list(APPEND _expect "${_msq_real}")
         endif()
         list(REMOVE_DUPLICATES _expect)
-        list(LENGTH _expect _runtime_image_count)
 
-        # (a) THE DISCRIMINATOR, and it only means something when the
-        #     selected closure has runtime images: with no runtime path
-        #     such a consumer must fail BEFORE main. If it ever succeeds,
-        #     something ambient is satisfying the loader and everything below
-        #     would prove nothing. A wholly archive-linked consumer has no
-        #     private-prefix image to find, so there it must simply run.
+        # (a) THE DISCRIMINATOR, and it only means something when a LibMoQ or
+        #     WTQuic layer comes from a private-prefix shared object: with no
+        #     runtime path such a consumer must fail BEFORE main. If it ever
+        #     succeeds, something ambient is satisfying that private prefix
+        #     and everything below would prove nothing. A closure whose
+        #     LibMoQ and WTQuic layers are archives has no private-prefix image
+        #     to find, so it must run even when its external MsQuic dependency
+        #     is shared but directly loadable (for example, by absolute Darwin
+        #     install name or the system loader cache).
         execute_process(COMMAND "${WORK}/msquic_pc_consumer"
             RESULT_VARIABLE _rc OUTPUT_VARIABLE _o ERROR_VARIABLE _o)
-        if(_runtime_image_count GREATER 0)
+        if(_private_prefix_shared)
             if(_rc EQUAL 0)
                 message(FATAL_ERROR
                     "the no-runtime-path consumer RAN; an ambient loader path "
@@ -421,7 +423,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         endif()
         string(STRIP "${_pubflags}" _pubflags)
         separate_arguments(_pubflags_list UNIX_COMMAND "${_pubflags}")
-        if(_public_shared)
+        if(_private_prefix_shared)
             execute_process(
                 COMMAND ${_cc} -std=c11 "${SRC}/main_msquic.c"
                     -o "${WORK}/msquic_pc_consumer_pub"
@@ -469,7 +471,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         # happens to be on disk: a stale shared executable must not sneak into
         # a static run, and a missing required one must refuse.
         set(_required msquic_pc_consumer_rpath)
-        if(_public_shared)
+        if(_private_prefix_shared)
             list(APPEND _required msquic_pc_consumer_pub)
         else()
             file(REMOVE "${WORK}/msquic_pc_consumer_pub")
