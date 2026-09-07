@@ -1,57 +1,195 @@
-.TH MOQ5\-RELAY 1 "2026" "MOQ5 Relay" "User Commands"
+.TH MOQ5\-RELAY 1 "September 7, 2026" "MOQ5 Relay" "User Commands"
 .SH NAME
 moq5\-relay \- deterministic Media over QUIC relay
 .SH SYNOPSIS
-.B moq5\-relay
-.I COMMAND
-.RI [ OPTIONS ]
+.nf
+\fBmoq5\-relay serve \-c\fR \fIfile\fR
+\fBmoq5\-relay capacity \-c\fR \fIfile\fR
+\fBmoq5\-relay help\fR [\fBserve\fR|\fBcapacity\fR]
+\fBmoq5\-relay\fR {\fB\-h\fR|\fB\-\-help\fR}
+\fBmoq5\-relay\fR {\fB\-V\fR|\fB\-\-version\fR}
+.fi
 .SH DESCRIPTION
 .B moq5\-relay
-serves Media over QUIC draft\-16 and draft\-18 from a single listener. Terminal
-codes are carried by meaning across that boundary: a code is decoded in the
-draft that produced it and re\-encoded for the draft that will read it, and one
-with no reviewed meaning in the target falls back to that registry's generic
-value rather than borrowing a neighbour's.
+runs a bounded Media over QUIC relay. Its raw QUIC listener supports MoQ
+draft\-16 and draft\-18. An optional WebTransport listener can feed the same
+relay runtime when the program was built with wtquic support.
+.PP
+When connections use different MoQ drafts, terminal codes are translated by
+meaning rather than copied as numbers. A code with no reviewed meaning in the
+target draft falls back to that draft's generic value.
+.PP
+Both operational commands read the same strict JSON configuration and perform
+the same semantic and capacity preflight. Unknown configuration keys and
+unrepresentable capacity requests are refused before a listener starts.
 .SH COMMANDS
 .TP
 .B serve
-Run the relay.
+Start the configured listeners and run the relay. Readiness is reported only
+after every configured listener, including the optional admin endpoint, has
+started. Startup is all\-or\-nothing.
 .TP
 .B capacity
-Validate the configuration and print the capacity ceiling, without starting a
-listener.
+Validate the configuration and print the relay\-state allocation\-request
+ceiling without opening a listener. The report identifies costs excluded from
+that ceiling, including allocator overhead and transport\-owned memory, and
+reports the admin thread's fixed stack reservation separately when applicable.
 .TP
-.B help \fR[\fICOMMAND\fR]
-Print help for the relay or for one command.
+.BR help " [" serve | capacity ]
+Print general or command\-specific help.
 .SH OPTIONS
 .TP
-.BR \-c ", " \-\-config " " \fIFILE\fR
-Relay configuration, JSON. Required by
+.BR \-c " " file ", " \-\-config " " file ", " \-\-config= file
+Read the relay configuration from
+.IR file .
+This option is required by
 .B serve
 and
 .BR capacity .
+There is no default configuration path. Repeating the option is an error.
 .TP
 .BR \-h ", " \-\-help
-Print help and exit 0. Answered from the command line alone: no configuration
-is read and no transport is started.
+Print help and exit. After
+.B serve
+or
+.BR capacity ,
+print help for that command. Help is answered from the command line alone: no
+configuration is read and no transport is started.
 .TP
 .BR \-V ", " \-\-version
-Print the version and exit 0.
+Print the MOQ5 Relay and LibMoQ version and exit. This is a global option.
+.SH CONFIGURATION
+The configuration format is documented in
+.BR moq5\-relay.json (5).
+The file is read once at startup and may be at most 65,535 bytes. Relative
+certificate and key paths are resolved from the process working directory.
+.SH LISTENERS
+The
+.B listener
+configuration is the required raw QUIC listener. Its ordered
+.B versions
+array selects the supported MoQ drafts, with the server's most preferred draft
+first. A one\-entry array retains exact\-version listener behavior; multiple
+entries are offered on one listener.
+.PP
+An optional
+.B webtransport
+object adds a WebTransport listener with its own address, TLS credential,
+request path, lane count, MoQ subprotocol list, HTTP/3 profile, and Origin
+authorization policy with its optional allowlist. Both
+listeners feed one relay runtime, allowing publishers and subscribers on
+different transports to communicate. The sum of their lane counts may not
+exceed 64. A build without wtquic support rejects this object rather than
+ignoring it.
+.SH ADMIN ENDPOINT
+An optional
+.B admin.tcp
+object enables a loopback\-only HTTP endpoint. It serves exactly three
+resources, all read\-only and all
+.BR GET :
+.B /metrics
+(the metrics exposition),
+.B /api/v1/info
+(the relay's frozen configuration and capacity model, as JSON) and
+.B /api/v1/shards
+(one coherent generation's per\-shard counters, as JSON). Any other target is
+answered 404. The endpoint has no authentication and cannot be bound to a
+non\-loopback address by the relay.
+.PP
+For
+.BR /metrics ,
+an absent
+.B Accept
+header, or an acceptable wildcard, selects OpenMetrics 1.0. Prometheus text
+format 0.0.4 can be requested explicitly. The endpoint never returns a partial
+metrics document as a successful scrape. An incomplete snapshot or temporary
+capacity exhaustion receives
+.B 503
+with
+.BR "Retry-After: 1" .
+.PP
+The endpoint owns a fixed\-size client table, bounded request storage, two
+bounded response banks, and a dedicated fixed\-stack thread. It reads copied
+snapshot rows rather than live relay structures. If the endpoint's owner exits
+unexpectedly, the relay stops rather than continuing with a dead health
+surface. Unix\-domain and remotely bound admin listeners are not supported.
+.SH SIGNALS
+.TP
+.B SIGINT, SIGTERM
+Request an orderly relay shutdown.
+.TP
+.B SIGUSR1
+Request a Prometheus 0.0.4 metrics document and a route dump on standard error.
+A multi\-lane relay also emits each shard's journal. Collection is asynchronous
+and fail\-closed; an incoherent snapshot is reported as suppressed rather than
+rendered with invented zeroes.
+.TP
+.B SIGUSR2
+Write the retained trace records as JSON Lines on standard error, once per
+shard.
+.SH OUTPUT
+Human messages are prefixed
+.BR "MOQ5 Relay:" .
+They are operator diagnostics, not a parsing interface. Versioned rows whose
+names begin with
+.B RELAY_
+are the machine\-readable contract. Trace output is JSON Lines. Metrics use
+Prometheus or OpenMetrics exposition as selected by the output surface.
+With
+.B logging.format
+set to
+.B json
+in the configuration, the standard output of
+.B serve
+carries one JSON event per line (the same versioned records, each under a
+.B schema
+member) and every human message, the capacity ceiling included, goes to
+standard error; the other commands stay text. After an output failure the
+last line may be partial and no later event is written; see
+.BR moq5-relay.json (5).
 .SH EXIT STATUS
 .TP
 .B 0
-Success, including every help and version request.
+Success, including an orderly shutdown and every help or version request.
+.TP
+.B 1
+A listener, transport, allocation, or runtime operation failed.
 .TP
 .B 2
-The command line was malformed, or the configuration was refused.
+The command line or configuration was refused.
 .SH EXAMPLES
+Run a relay using a configuration in the current directory:
+.PP
 .nf
-moq5\-relay serve --config relay.json
-moq5\-relay capacity --config relay.json
+moq5\-relay serve \-\-config relay.json
 .fi
-.SH DIAGNOSTICS
-Human diagnostics are prefixed
-.BR "MOQ5 Relay:" .
-Structured rows such as
-.B RELAY_RUN_CONFIG_V1
-are the stable machine contract; the prose is not.
+.PP
+Validate that configuration and inspect its bounded relay\-state allocation
+ceiling without opening sockets:
+.PP
+.nf
+moq5\-relay capacity \-c relay.json
+.fi
+.PP
+Scrape an enabled admin endpoint using OpenMetrics:
+.PP
+.nf
+curl \-H 'Accept: application/openmetrics\-text' \\
+  http://127.0.0.1:9109/metrics
+.fi
+.SH SECURITY
+Protect the private key named by the configuration using normal filesystem
+permissions. The bundled
+.B toy
+authorization mode is a deterministic static policy, not a cryptographic token
+verifier. The
+.B insecure_skip_verify
+transport setting is intended only for controlled development and test
+environments.
+.PP
+The admin endpoint is deliberately restricted to loopback and has no
+authentication. Put any deliberate remote exposure behind an independently
+authenticated and access\-controlled service.
+.SH SEE ALSO
+.BR moq5\-relay.json (5),
+.BR curl (1)

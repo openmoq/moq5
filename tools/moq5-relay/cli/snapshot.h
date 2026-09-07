@@ -25,17 +25,38 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ * A lane's attestation about its cross-shard plane. Three outcomes, not two,
+ * because "no shard runtime exists" and "the shard runtime refused" are
+ * different facts and only one of them is an error:
+ *
+ *   REFUSED  the lane should have supplied shard stats and could not. The
+ *            epoch is poisoned; nothing renders.
+ *   ABSENT   there is no shard runtime (the single-lane composition). The
+ *            shard-plane families are OMITTED. They are not rendered from a
+ *            zeroed struct, because `pump_turns 0` would be a fabricated
+ *            measurement rather than a missing one.
+ *   VALID    the shard runtime supplied stats.
+ *
+ * REFUSED is deliberately the ZERO value: a row that was never populated, or
+ * only partly populated, then poisons its epoch instead of quietly presenting
+ * as a legitimate ABSENT composition. Any value outside this enum is rejected
+ * rather than defaulted.
+ */
+typedef uint32_t moqr_cli_cap_t;
+
+#define MOQR_CLI_CAP_REFUSED 0u
+#define MOQR_CLI_CAP_ABSENT  1u
+#define MOQR_CLI_CAP_VALID   2u
+#define MOQR_CLI_CAP__COUNT  3u
+
 /* What one lane publishes: its shard's core/bind/cross-shard snapshots
- * plus the CLI's own merged-mask lane-wake counter. `shard_stats_valid`
- * is the lane's attestation that moqr_shards_get_stats succeeded — a
- * refused (poisoned) snapshot publishes as INVALID (fail-closed: the
- * zero default is invalid), completing the epoch while forbidding the
- * coordinator from aggregating the zeroed stand-in. */
+ * plus the CLI's own merged-mask lane-wake counter. */
 typedef struct moqr_cli_snapshot_stats {
     moqr_core_stats_t   core;
     moqr_bind_stats_t   bind;
     moqr_shards_stats_t shard;
-    bool                shard_stats_valid;
+    moqr_cli_cap_t      shard_cap;
     uint64_t            lane_wakes;   /* actual lane_wake calls issued */
 #ifdef MOQR_BIND_TESTING
     /* Verify build only (moq-relay-verify): the lane's LIVE blocked-reason
@@ -114,9 +135,10 @@ typedef moqr_result_t (*moqr_cli_produce_fn)(
  * shrinks the request-vs-emission window to the emission call itself.
  * MOQR_ERR_WOULD_BLOCK: the newest epoch is incomplete (or kept advancing)
  * — emit nothing, retry later. A complete set containing a row whose
- * shard_stats_valid is false is POISONED: MOQR_ERR_INVAL without calling
- * `produce` (the epoch completed but must be suppressed, never rendered
- * from zeroed stand-ins). Any non-OK from `produce` (e.g. the renderer's
+ * shard_cap is REFUSED (or an unknown value) is POISONED: MOQR_ERR_INVAL
+ * without calling `produce` (the epoch completed but must be suppressed,
+ * never rendered from zeroed stand-ins). A row whose shard_cap is ABSENT is
+ * rendered with its shard-plane families omitted. Any non-OK from `produce` (e.g. the renderer's
  * suppression) returns verbatim, with *out_epoch naming the produced
  * epoch.
  */

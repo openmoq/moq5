@@ -1,0 +1,2 @@
+GET /api/v1/info HTTP/1.0
+

@@ -1,5 +1,15 @@
 #include "config.h"
 
+#include "admin_listen.h"
+#include "info_doc.h"
+
+#include "broker.h"
+#include "../admin/moqr_admin.h"
+
+#include <pthread.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include "snapshot.h"
 
 #include <moqrelay/capacity.h>
@@ -23,6 +33,18 @@ cfg_err(char *err, size_t err_len, const char *msg)
 {
     if (err != NULL && err_len > 0) {
         snprintf(err, err_len, "%s", msg);
+    }
+}
+
+/* The same fixed message with an array index appended. cfg_err takes a literal
+ * message and no format precisely so a rejected value cannot be echoed back at
+ * the operator; the index is a position this parser counted, not anything the
+ * document contained. */
+static void
+cfg_err_at(char *err, size_t err_len, const char *msg, size_t index)
+{
+    if (err != NULL && err_len > 0) {
+        snprintf(err, err_len, "%s at entry %zu", msg, index);
     }
 }
 
@@ -60,6 +82,50 @@ copy_string(struct json_value_s *v, char *dst, size_t cap)
     memcpy(dst, s->string, s->string_size);
     dst[s->string_size] = '\0';
     return true;
+}
+
+/*
+ * WebTransport string values.
+ *
+ * Everything this object stores is consumed as a C string -- a host, a path,
+ * a credential path, a serialized Origin -- so a value carrying an embedded
+ * NUL would be silently truncated at the boundary that consumes it, and the
+ * operator would be running a configuration they did not write. These helpers
+ * refuse that instead. They are deliberately scoped to this object: the shared
+ * copy_string keeps its existing semantics everywhere else.
+ */
+static bool
+wt_str(struct json_value_s *v, const char **p, size_t *n)
+{
+    struct json_string_s *s = json_value_as_string(v);
+    if (s == NULL || memchr(s->string, '\0', s->string_size) != NULL) {
+        return false;
+    }
+    *p = s->string;
+    *n = s->string_size;
+    return true;
+}
+
+static bool
+wt_copy(struct json_value_s *v, char *dst, size_t cap)
+{
+    const char *p = NULL;
+    size_t n = 0;
+    if (!wt_str(v, &p, &n) || n >= cap) {
+        return false;
+    }
+    memcpy(dst, p, n);
+    dst[n] = '\0';
+    return true;
+}
+
+/* A closed-vocabulary token matches only on complete decoded length AND bytes,
+ * so a value with a trailing NUL is not the token it is a prefix of. */
+static bool
+wt_val_is(const char *p, size_t n, const char *lit)
+{
+    size_t m = strlen(lit);
+    return n == m && memcmp(p, lit, m) == 0;
 }
 
 static moqr_result_t
@@ -594,6 +660,690 @@ parse_auth(struct json_object_s *o, moqr_cli_config_t *out, char *err,
     return MOQR_OK;
 }
 
+/*
+ * The optional WebTransport listener.
+ *
+ * Its own address, TLS material and lane count, plus the HTTP/3 surface a
+ * browser needs: the request path, the ordered MoQ drafts offered as
+ * subprotocols, and the WebTransport wire profile. Unknown keys and unknown
+ * values fail closed -- a relay that silently ignored "profile": "tomorrow"
+ * would come up speaking a dialect the operator did not ask for.
+ */
+/* Loopback, decided by parsing the literal address into its BINARY form.
+ *
+ * sscanf accepts spellings the kernel will not: leading whitespace, a sign, a
+ * missing octet. Accepting them here defers the refusal to bind time, after the
+ * config has already been called valid. inet_pton accepts exactly one spelling
+ * per address, and the check then inspects the bytes rather than the text.
+ *
+ * A resolver is deliberately not used: it would accept "localhost", and
+ * whatever that maps to today or after the next /etc/hosts edit. The v1 rule is
+ * that the operator writes a literal this function recognises. IPv4-mapped
+ * forms are refused as well -- one spelling per rule is what keeps the check
+ * auditable. */
+static bool
+admin_host_is_loopback(const char *h)
+{
+    struct in_addr v4;
+    struct in6_addr v6;
+
+    if (h == NULL || h[0] == '\0') {
+        return false;
+    }
+    if (strchr(h, ':') != NULL) {
+        if (inet_pton(AF_INET6, h, &v6) != 1) {
+            return false;
+        }
+        /* ::1 only. A v4-mapped or v4-compatible address is a second spelling
+         * for a v4 address and is refused rather than translated. */
+        return IN6_IS_ADDR_LOOPBACK(&v6) ? true : false;
+    }
+    /* Reject zero-padded octets before converting. Some implementations of
+     * inet_pton accept "127.000.000.001", and other parsers read a leading
+     * zero as octal -- so the same text can denote two different addresses
+     * depending on who reads it. One spelling, or refuse. */
+    {
+        const char *p = h;
+        while (*p != '\0') {
+            if (*p == '0' && p[1] != '\0' && p[1] != '.') {
+                return false;
+            }
+            /* advance to the start of the next octet */
+            while (*p != '\0' && *p != '.') {
+                p++;
+            }
+            if (*p == '.') {
+                p++;
+            }
+        }
+    }
+    if (inet_pton(AF_INET, h, &v4) != 1) {
+        return false;
+    }
+    /* 127.0.0.0/8. 0.0.0.0 is a wildcard, not a loopback. */
+    return (ntohl(v4.s_addr) >> 24) == 127u;
+}
+
+/* Duplicate object keys are ambiguous: last-one-wins silently discards the
+ * value the operator meant. Each parser below records the keys it has seen. */
+static bool
+seen_once(uint32_t *mask, uint32_t bit)
+{
+    if ((*mask & bit) != 0u) {
+        return false;
+    }
+    *mask |= bit;
+    return true;
+}
+
+/* The strict logging section: one key, two tokens, nothing else. */
+/* A key is its exact decoded bytes: the parser's length plus a byte compare,
+ * so an embedded NUL or any suffix is a different key, not a spelling. */
+static bool
+key_is(const struct json_string_s *name, const char *lit)
+{
+    size_t n = strlen(lit);
+    return name != NULL && name->string_size == n &&
+           memcmp(name->string, lit, n) == 0;
+}
+
+static moqr_result_t
+parse_logging(struct json_object_s *o, moqr_cli_config_t *out, char *err,
+              size_t err_len)
+{
+    bool seen_format = false;
+
+    out->logging.format = MOQR_CLI_LOG_TEXT;
+    for (struct json_object_element_s *e = o->start; e != NULL; e = e->next) {
+        if (key_is(e->name, "format")) {
+            struct json_string_s *s = json_value_as_string(e->value);
+            if (seen_format) {
+                cfg_err(err, err_len, "logging.format: duplicate key");
+                return MOQR_ERR_INVAL;
+            }
+            seen_format = true;
+            if (s == NULL) {
+                cfg_err(err, err_len, "logging.format: need a string");
+                return MOQR_ERR_INVAL;
+            }
+            if (s->string_size == 4u && memcmp(s->string, "text", 4u) == 0) {
+                out->logging.format = MOQR_CLI_LOG_TEXT;
+            } else if (s->string_size == 4u &&
+                       memcmp(s->string, "json", 4u) == 0) {
+                out->logging.format = MOQR_CLI_LOG_JSON;
+            } else {
+                cfg_err(err, err_len, "logging.format: expected \"text\" or \"json\"");
+                return MOQR_ERR_INVAL;
+            }
+        } else {
+            cfg_err(err, err_len, "logging: unknown key");
+            return MOQR_ERR_INVAL;
+        }
+    }
+    return MOQR_OK;
+}
+
+#ifdef MOQR_VERIFY_SEAM
+moqr_result_t
+moqr_cli_verify_refuse_json_logging(const moqr_cli_config_t *cfg, char *err,
+                                    size_t err_len)
+{
+    if (cfg == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    if (cfg->logging.format == MOQR_CLI_LOG_JSON) {
+        cfg_err(err, err_len, "logging.format: json is not available in the "
+                              "verify and measure builds");
+        return MOQR_ERR_INVAL;
+    }
+    return MOQR_OK;
+}
+#endif
+
+static moqr_result_t
+parse_admin(struct json_object_s *o, moqr_cli_config_t *out, char *err,
+            size_t err_len)
+{
+    bool have_tcp = false;
+    bool enabled_seen = false;
+    bool enabled_val = true;
+    uint32_t seen = 0;
+
+    out->admin.enabled = false;
+    out->admin.mode = MOQR_CLI_ADMIN_OFF;
+    out->admin.port = 0;
+    out->admin.host[0] = '\0';
+
+    for (struct json_object_element_s *e = o->start; e != NULL; e = e->next) {
+        const char *k = e->name->string;
+        if (strcmp(k, "enabled") == 0) {
+            if (!seen_once(&seen, 1u << 0)) {
+                cfg_err(err, err_len, "admin.enabled: duplicate key");
+                return MOQR_ERR_INVAL;
+            }
+            if (json_value_is_true(e->value)) {
+                enabled_val = true;
+            } else if (json_value_is_false(e->value)) {
+                enabled_val = false;
+            } else {
+                cfg_err(err, err_len, "admin.enabled: need a boolean");
+                return MOQR_ERR_INVAL;
+            }
+            enabled_seen = true;
+        } else if (strcmp(k, "tcp") == 0) {
+            struct json_object_s *t = json_value_as_object(e->value);
+            bool have_port = false;
+            uint32_t tseen = 0;
+            if (!seen_once(&seen, 1u << 1)) {
+                cfg_err(err, err_len, "admin.tcp: duplicate key");
+                return MOQR_ERR_INVAL;
+            }
+            if (t == NULL) {
+                cfg_err(err, err_len, "admin.tcp: need an object");
+                return MOQR_ERR_INVAL;
+            }
+            have_tcp = true;
+            snprintf(out->admin.host, sizeof(out->admin.host), "127.0.0.1");
+            for (struct json_object_element_s *te = t->start; te != NULL;
+                 te = te->next) {
+                const char *tk = te->name->string;
+                if (strcmp(tk, "host") == 0) {
+                    if (!seen_once(&tseen, 1u << 0)) {
+                        cfg_err(err, err_len, "admin.tcp.host: duplicate key");
+                        return MOQR_ERR_INVAL;
+                    }
+                    if (!copy_string(te->value, out->admin.host,
+                                     sizeof(out->admin.host))) {
+                        cfg_err(err, err_len, "admin.tcp.host: invalid string");
+                        return MOQR_ERR_INVAL;
+                    }
+                } else if (strcmp(tk, "port") == 0) {
+                    uint64_t x = 0;
+                    if (!seen_once(&tseen, 1u << 1)) {
+                        cfg_err(err, err_len, "admin.tcp.port: duplicate key");
+                        return MOQR_ERR_INVAL;
+                    }
+                    if (!num_u64(te->value, &x) || x == 0 || x > 65535) {
+                        cfg_err(err, err_len, "admin.tcp.port: need 1..65535");
+                        return MOQR_ERR_INVAL;
+                    }
+                    out->admin.port = (int)x;
+                    have_port = true;
+                } else {
+                    cfg_err(err, err_len, "admin.tcp: unknown key");
+                    return MOQR_ERR_INVAL;
+                }
+            }
+            if (!have_port) {
+                /* No default: a listener must never be opened by accident. */
+                cfg_err(err, err_len, "admin.tcp.port is required");
+                return MOQR_ERR_INVAL;
+            }
+            if (!admin_host_is_loopback(out->admin.host)) {
+                cfg_err(err, err_len,
+                        "admin.tcp.host: only loopback literals are accepted");
+                return MOQR_ERR_INVAL;
+            }
+        } else {
+            cfg_err(err, err_len, "admin: unknown key");
+            return MOQR_ERR_INVAL;
+        }
+    }
+
+    if (enabled_seen && !enabled_val) {
+        if (have_tcp) {
+            cfg_err(err, err_len,
+                    "admin: enabled=false with an endpoint configured");
+            return MOQR_ERR_INVAL;
+        }
+        out->admin.enabled = false;
+        return MOQR_OK;
+    }
+    if (!have_tcp) {
+        /* v1 has exactly one endpoint shape; "enabled" alone opens nothing. */
+        cfg_err(err, err_len, "admin: tcp is required when enabled");
+        return MOQR_ERR_INVAL;
+    }
+    out->admin.enabled = true;
+    out->admin.mode = MOQR_CLI_ADMIN_TCP;
+    return MOQR_OK;
+}
+
+/* The recognized keys of the webtransport object, as a closed set. Each may
+ * appear at most once however the document spelled it, and a key that is not
+ * exactly one of these is unknown -- a prefix, or a name carrying an embedded
+ * NUL, matches nothing. */
+enum {
+    WT_KEY_HOST = 0,
+    WT_KEY_PORT,
+    WT_KEY_CERT,
+    WT_KEY_KEY,
+    WT_KEY_LANES,
+    WT_KEY_PATH,
+    WT_KEY_VERSIONS,
+    WT_KEY_PROFILE,
+    WT_KEY_ORIGIN_POLICY,
+    WT_KEY_ALLOWED_ORIGINS,
+    WT_KEY_COUNT
+};
+
+static const char *const k_wt_keys[WT_KEY_COUNT] = {
+    "host", "port", "cert", "key", "lanes",
+    "path", "versions", "profile", "origin_policy", "allowed_origins"
+};
+
+/* A message naming one recognized key. The key comes from the closed table by
+ * index, so nothing the document wrote can reach the operator's screen. */
+static void
+cfg_err_wt_key(char *err, size_t err_len, int ki, const char *msg)
+{
+    if (err != NULL && err_len > 0 && ki >= 0 && ki < WT_KEY_COUNT) {
+        snprintf(err, err_len, "webtransport.%s: %s", k_wt_keys[ki], msg);
+    }
+}
+
+static int
+wt_key_index(const struct json_string_s *name)
+{
+    for (int i = 0; i < WT_KEY_COUNT; i++) {
+        if (key_is(name, k_wt_keys[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static moqr_result_t
+parse_webtransport(struct json_object_s *o, moqr_cli_config_t *out, char *err,
+                   size_t err_len)
+{
+    out->wt.enabled = true;
+    out->wt.lanes = 1;
+    snprintf(out->wt.host, sizeof(out->wt.host), "0.0.0.0");
+    snprintf(out->wt.path, sizeof(out->wt.path), "/moq");
+    out->wt.profile = MOQR_CLI_WT_PROFILE_CURRENT;
+    out->wt.origin_policy = MOQR_CLI_ORIGIN_POLICY_UNSET;
+    out->wt.origin_count = 0;
+    out->wt.origin_buf[0] = '\0';
+    for (size_t i = 0; i < MOQR_CLI_MAX_ORIGINS; i++) {
+        out->wt.origins[i] = NULL;
+    }
+
+    /* The messages below name these limits in words, so a changed limit must
+     * change the text with it. */
+    _Static_assert(MOQR_CLI_MAX_ORIGINS == 8, "the refusals name 8 entries");
+    _Static_assert(MOQR_CLI_MAX_ORIGIN_BYTES == 320,
+                   "the refusals name 320 bytes per entry");
+    _Static_assert(MOQR_CLI_ORIGIN_COPY_BUDGET == 512,
+                   "the refusals name a 512-byte total");
+
+    bool have_versions = false;
+    bool have_origins = false;
+    bool seen[WT_KEY_COUNT] = { false };
+    for (struct json_object_element_s *e = o->start; e != NULL; e = e->next) {
+        int ki = wt_key_index(e->name);
+        if (ki < 0) {
+            cfg_err(err, err_len, "webtransport: unknown key");
+            return MOQR_ERR_INVAL;
+        }
+        if (seen[ki]) {
+            cfg_err_wt_key(err, err_len, ki, "duplicate key");
+            return MOQR_ERR_INVAL;
+        }
+        seen[ki] = true;
+        if (ki == WT_KEY_HOST) {
+            if (!wt_copy(e->value, out->wt.host, sizeof(out->wt.host))) {
+                cfg_err(err, err_len, "webtransport.host: invalid string");
+                return MOQR_ERR_INVAL;
+            }
+        } else if (ki == WT_KEY_PORT) {
+            uint64_t x = 0;
+            if (!num_u64(e->value, &x) || x == 0 || x > 65535) {
+                cfg_err(err, err_len, "webtransport.port: need 1..65535");
+                return MOQR_ERR_INVAL;
+            }
+            out->wt.port = (int)x;
+        } else if (ki == WT_KEY_CERT) {
+            if (!wt_copy(e->value, out->wt.cert, sizeof(out->wt.cert))) {
+                cfg_err(err, err_len, "webtransport.cert: invalid string");
+                return MOQR_ERR_INVAL;
+            }
+        } else if (ki == WT_KEY_KEY) {
+            if (!wt_copy(e->value, out->wt.key, sizeof(out->wt.key))) {
+                cfg_err(err, err_len, "webtransport.key: invalid string");
+                return MOQR_ERR_INVAL;
+            }
+        } else if (ki == WT_KEY_LANES) {
+            uint64_t x = 0;
+            if (!num_u64(e->value, &x) || x == 0 || x > MOQR_CLI_MAX_LANES) {
+                cfg_err(err, err_len,
+                        "webtransport.lanes: need 1..64");
+                return MOQR_ERR_INVAL;
+            }
+            out->wt.lanes = (uint32_t)x;
+        } else if (ki == WT_KEY_PATH) {
+            if (!wt_copy(e->value, out->wt.path, sizeof(out->wt.path))) {
+                cfg_err(err, err_len, "webtransport.path: invalid string");
+                return MOQR_ERR_INVAL;
+            }
+            /* an origin-form request target, so the browser URL and the
+             * listener agree on where the session is offered */
+            if (out->wt.path[0] != '/') {
+                cfg_err(err, err_len,
+                        "webtransport.path: must begin with '/'");
+                return MOQR_ERR_INVAL;
+            }
+        } else if (ki == WT_KEY_VERSIONS) {
+            /* The same ordered draft set the raw listener offers, carried as
+             * WebTransport subprotocols instead of ALPN. Order is preference. */
+            struct json_array_s *arr = json_value_as_array(e->value);
+            if (arr == NULL || arr->length == 0) {
+                cfg_err(err, err_len,
+                        "webtransport.versions: a non-empty array is required");
+                return MOQR_ERR_INVAL;
+            }
+            if (arr->length > MOQR_CLI_MAX_VERSIONS) {
+                cfg_err(err, err_len, "webtransport.versions: too many entries");
+                return MOQR_ERR_INVAL;
+            }
+            size_t n = 0;
+            for (struct json_array_element_s *ae = arr->start; ae != NULL;
+                 ae = ae->next) {
+                uint64_t v = 0;
+                if (!num_u64(ae->value, &v) || (v != 16 && v != 18)) {
+                    cfg_err(err, err_len,
+                            "webtransport.versions: only 16 and 18 are known");
+                    return MOQR_ERR_INVAL;
+                }
+                moq_version_t mv = (v == 16) ? MOQ_VERSION_DRAFT_16
+                                             : MOQ_VERSION_DRAFT_18;
+                for (size_t j = 0; j < n; j++) {
+                    if (out->wt.versions[j] == mv) {
+                        cfg_err(err, err_len,
+                                "webtransport.versions: duplicate entry");
+                        return MOQR_ERR_INVAL;
+                    }
+                }
+                snprintf(out->wt.subproto_buf[n],
+                         sizeof(out->wt.subproto_buf[n]),
+                         "moqt-%" PRIu64, v);
+                out->wt.subprotos[n] = out->wt.subproto_buf[n];
+                out->wt.versions[n] = mv;
+                n++;
+            }
+            out->wt.version_count = n;
+            have_versions = true;
+        } else if (ki == WT_KEY_PROFILE) {
+            const char *p = NULL;
+            size_t n = 0;
+            if (!wt_str(e->value, &p, &n)) {
+                cfg_err(err, err_len,
+                        "webtransport.profile: need a string");
+                return MOQR_ERR_INVAL;
+            }
+            if (wt_val_is(p, n, "current")) {
+                out->wt.profile = MOQR_CLI_WT_PROFILE_CURRENT;
+            } else if (wt_val_is(p, n, "d13_14_compat")) {
+                out->wt.profile = MOQR_CLI_WT_PROFILE_D13_14_COMPAT;
+            } else if (wt_val_is(p, n, "d02_rfc9297_compat")) {
+                out->wt.profile = MOQR_CLI_WT_PROFILE_D02_RFC9297_COMPAT;
+            } else {
+                cfg_err(err, err_len,
+                        "webtransport.profile: only \"current\", "
+                        "\"d13_14_compat\" and \"d02_rfc9297_compat\" "
+                        "are known");
+                return MOQR_ERR_INVAL;
+            }
+        } else if (ki == WT_KEY_ORIGIN_POLICY) {
+            const char *p = NULL;
+            size_t n = 0;
+            if (!wt_str(e->value, &p, &n)) {
+                cfg_err(err, err_len,
+                        "webtransport.origin_policy: need a string");
+                return MOQR_ERR_INVAL;
+            }
+            if (wt_val_is(p, n, "unset")) {
+                out->wt.origin_policy = MOQR_CLI_ORIGIN_POLICY_UNSET;
+            } else if (wt_val_is(p, n, "allow_any_non_opaque")) {
+                out->wt.origin_policy =
+                    MOQR_CLI_ORIGIN_POLICY_ALLOW_ANY_NON_OPAQUE;
+            } else if (wt_val_is(p, n, "allowlist")) {
+                out->wt.origin_policy = MOQR_CLI_ORIGIN_POLICY_ALLOWLIST;
+            } else if (wt_val_is(p, n, "allow_any_including_null")) {
+                out->wt.origin_policy =
+                    MOQR_CLI_ORIGIN_POLICY_ALLOW_ANY_INCLUDING_NULL;
+            } else {
+                cfg_err(err, err_len,
+                        "webtransport.origin_policy: only \"unset\", "
+                        "\"allow_any_non_opaque\", \"allowlist\" and "
+                        "\"allow_any_including_null\" are known");
+                return MOQR_ERR_INVAL;
+            }
+        } else if (ki == WT_KEY_ALLOWED_ORIGINS) {
+            /* Exact serialized-Origin bytes, stored as written. Nothing here
+             * parses the Origin grammar or normalizes a value: entries are
+             * compared byte for byte by the authorization decision, so a
+             * helpful rewrite here would silently change who is admitted. */
+            struct json_array_s *arr = json_value_as_array(e->value);
+            if (arr == NULL) {
+                cfg_err(err, err_len,
+                        "webtransport.allowed_origins: need an array");
+                return MOQR_ERR_INVAL;
+            }
+            have_origins = true;
+            if (arr->length > MOQR_CLI_MAX_ORIGINS) {
+                cfg_err(err, err_len,
+                        "webtransport.allowed_origins: at most 8 entries");
+                return MOQR_ERR_INVAL;
+            }
+            size_t used = 0;
+            size_t cnt = 0;
+            for (struct json_array_element_s *ae = arr->start; ae != NULL;
+                 ae = ae->next) {
+                const char *p = NULL;
+                size_t n = 0;
+                if (!wt_str(ae->value, &p, &n)) {
+                    cfg_err_at(err, err_len,
+                               "webtransport.allowed_origins: need a string "
+                               "with no embedded NUL", cnt);
+                    return MOQR_ERR_INVAL;
+                }
+                if (n == 0) {
+                    cfg_err_at(err, err_len,
+                               "webtransport.allowed_origins: must not be "
+                               "empty", cnt);
+                    return MOQR_ERR_INVAL;
+                }
+                if (n > MOQR_CLI_MAX_ORIGIN_BYTES) {
+                    cfg_err_at(err, err_len,
+                               "webtransport.allowed_origins: at most 320 "
+                               "bytes", cnt);
+                    return MOQR_ERR_INVAL;
+                }
+                for (size_t j = 0; j < cnt; j++) {
+                    size_t pl = strlen(out->wt.origins[j]);
+                    if (pl == n && memcmp(out->wt.origins[j], p, n) == 0) {
+                        cfg_err_at(err, err_len,
+                                   "webtransport.allowed_origins: duplicate "
+                                   "entry", cnt);
+                        return MOQR_ERR_INVAL;
+                    }
+                }
+                if (n + 1 > sizeof(out->wt.origin_buf) - used) {
+                    cfg_err(err, err_len,
+                            "webtransport.allowed_origins: at most 512 bytes "
+                            "in total including terminators");
+                    return MOQR_ERR_INVAL;
+                }
+                memcpy(&out->wt.origin_buf[used], p, n);
+                out->wt.origin_buf[used + n] = '\0';
+                out->wt.origins[cnt] = &out->wt.origin_buf[used];
+                used += n + 1;
+                cnt++;
+            }
+            out->wt.origin_count = cnt;
+        } else {
+            cfg_err(err, err_len, "webtransport: unknown key");
+            return MOQR_ERR_INVAL;
+        }
+    }
+    /*
+     * Cross-field rules, resolved only once every field of the object has been
+     * collected, so the order the operator wrote the keys in cannot decide
+     * whether the document is valid.
+     */
+    if (out->wt.origin_policy == MOQR_CLI_ORIGIN_POLICY_ALLOWLIST) {
+        if (!have_origins || out->wt.origin_count == 0) {
+            cfg_err(err, err_len,
+                    "webtransport.allowed_origins: \"allowlist\" needs 1..8 "
+                    "entries");
+            return MOQR_ERR_INVAL;
+        }
+    } else if (have_origins) {
+        /* Under every other policy -- an unset one included -- a list has no
+         * meaning, so writing one is refused rather than quietly ignored. An
+         * explicitly empty array is still a written list. */
+        cfg_err(err, err_len,
+                "webtransport.allowed_origins: only \"allowlist\" takes a "
+                "list");
+        return MOQR_ERR_INVAL;
+    }
+    if (out->wt.profile == MOQR_CLI_WT_PROFILE_D02_RFC9297_COMPAT &&
+        out->wt.origin_policy == MOQR_CLI_ORIGIN_POLICY_UNSET) {
+        cfg_err(err, err_len,
+                "webtransport.origin_policy: required when profile is "
+                "\"d02_rfc9297_compat\"");
+        return MOQR_ERR_INVAL;
+    }
+    if (!have_versions) {
+        /* the facade default, stated here so the offered set is always
+         * explicit in the resolved config rather than implied downstream */
+        out->wt.versions[0] = MOQ_VERSION_DRAFT_18;
+        out->wt.versions[1] = MOQ_VERSION_DRAFT_16;
+        snprintf(out->wt.subproto_buf[0], sizeof(out->wt.subproto_buf[0]),
+                 "moqt-18");
+        snprintf(out->wt.subproto_buf[1], sizeof(out->wt.subproto_buf[1]),
+                 "moqt-16");
+        out->wt.subprotos[0] = out->wt.subproto_buf[0];
+        out->wt.subprotos[1] = out->wt.subproto_buf[1];
+        out->wt.version_count = 2;
+    }
+    /* The ordered set label, joined in preference order exactly as written. */
+    out->wt.alpn_set[0] = '\0';
+    for (size_t i = 0; i < out->wt.version_count; i++) {
+        if (i > 0) {
+            strncat(out->wt.alpn_set, "+",
+                    sizeof(out->wt.alpn_set) - strlen(out->wt.alpn_set) - 1);
+        }
+        strncat(out->wt.alpn_set, out->wt.subproto_buf[i],
+                sizeof(out->wt.alpn_set) - strlen(out->wt.alpn_set) - 1);
+    }
+    if (out->wt.port == 0) {
+        cfg_err(err, err_len, "webtransport.port is required");
+        return MOQR_ERR_INVAL;
+    }
+    if (out->wt.cert[0] == '\0' || out->wt.key[0] == '\0') {
+        cfg_err(err, err_len,
+                "webtransport requires its own cert and key");
+        return MOQR_ERR_INVAL;
+    }
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_cli_facade_caps(const moqr_cli_config_t *cfg, const moq_alloc_t *alloc,
+                     uint32_t *out_raw_cap, uint32_t *out_wt_cap)
+{
+    if (cfg == NULL || out_raw_cap == NULL || out_wt_cap == NULL) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_shards_cfg_t scfg;
+    moqr_cli_build_shards_cfg(cfg, alloc, &scfg);
+    moqr_shards_limits_t slim;
+    if (moqr_shards_cfg_resolve(&scfg, &slim) != MOQR_OK) {
+        return MOQR_ERR_INVAL;
+    }
+    /* Each facade admits against the shards it owns, from the same
+     * usable-bindings-per-shard rule the combined ceiling is reported from. */
+    uint64_t raw64 = (uint64_t)cfg->lanes * slim.usable_bindings;
+    uint64_t wt64 = cfg->wt.enabled
+                        ? (uint64_t)cfg->wt.lanes * slim.usable_bindings
+                        : 0u;
+    if (raw64 > UINT32_MAX || wt64 > UINT32_MAX ||
+        raw64 + wt64 > UINT32_MAX) {
+        return MOQR_ERR_INVAL;
+    }
+    *out_raw_cap = (uint32_t)raw64;
+    *out_wt_cap = (uint32_t)wt64;
+    return MOQR_OK;
+}
+
+uint32_t
+moqr_cli_total_lanes(const moqr_cli_config_t *cfg)
+{
+    if (cfg == NULL) {
+        return 0;
+    }
+    return cfg->lanes + (cfg->wt.enabled ? cfg->wt.lanes : 0);
+}
+
+bool
+moqr_cli_config_has_webtransport(const moqr_cli_config_t *cfg)
+{
+    return cfg != NULL && cfg->wt.enabled;
+}
+
+moqr_result_t
+moqr_cli_shard_plan(const moqr_cli_config_t *cfg, moqr_cli_shard_plan_t *out,
+                    char *err, size_t err_len)
+{
+    if (cfg == NULL || out == NULL) {
+        cfg_err(err, err_len, "shard plan: null argument");
+        return MOQR_ERR_INVAL;
+    }
+    memset(out, 0, sizeof(*out));
+    if (cfg->lanes == 0) {
+        cfg_err(err, err_len, "listener.lanes must be at least 1");
+        return MOQR_ERR_INVAL;
+    }
+    out->raw_first = 0;
+    out->raw_count = cfg->lanes;
+    out->wt_first = cfg->lanes;
+    out->wt_count = cfg->wt.enabled ? cfg->wt.lanes : 0;
+    if (cfg->wt.enabled && cfg->wt.lanes == 0) {
+        cfg_err(err, err_len, "webtransport.lanes must be at least 1");
+        return MOQR_ERR_INVAL;
+    }
+    /* The runtime allocates one shard per lane across BOTH listeners, so the
+     * combined count is what has to fit -- refused here, before any shard,
+     * facade or listener exists. */
+    if (out->raw_count > MOQR_CLI_MAX_LANES - out->wt_count) {
+        cfg_err(err, err_len,
+                "listener.lanes + webtransport.lanes must not exceed 64");
+        return MOQR_ERR_INVAL;
+    }
+    out->total_shards = out->raw_count + out->wt_count;
+    return MOQR_OK;
+}
+
+uint32_t
+moqr_cli_shard_of_raw_lane(const moqr_cli_shard_plan_t *p, uint32_t lane)
+{
+    if (p == NULL || lane >= p->raw_count) {
+        return UINT32_MAX;
+    }
+    return p->raw_first + lane;
+}
+
+uint32_t
+moqr_cli_shard_of_wt_lane(const moqr_cli_shard_plan_t *p, uint32_t lane)
+{
+    if (p == NULL || lane >= p->wt_count) {
+        return UINT32_MAX;
+    }
+    return p->wt_first + lane;
+}
+
 moqr_result_t
 moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
                       char *err, size_t err_len)
@@ -615,6 +1365,10 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
     struct json_object_s *o = json_value_as_object(root);
     moqr_result_t rc = MOQR_OK;
     bool have_listener = false;
+    bool seen_admin = false;
+    bool seen_logging = false;
+    bool seen_wt = false;
+    out->logging.format = MOQR_CLI_LOG_TEXT;
     if (o == NULL) {
         cfg_err(err, err_len, "top level must be an object");
         rc = MOQR_ERR_INVAL;
@@ -630,6 +1384,48 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
             } else {
                 rc = parse_listener(lo, out, err, err_len);
                 have_listener = rc == MOQR_OK;
+            }
+        } else if (strcmp(k, "admin") == 0) {
+            struct json_object_s *ao = json_value_as_object(e->value);
+            if (seen_admin) {
+                cfg_err(err, err_len, "admin: duplicate key");
+                rc = MOQR_ERR_INVAL;
+                break;
+            }
+            seen_admin = true;
+            if (ao == NULL) {
+                cfg_err(err, err_len, "admin: need an object");
+                rc = MOQR_ERR_INVAL;
+            } else {
+                rc = parse_admin(ao, out, err, err_len);
+            }
+        } else if (key_is(e->name, "logging")) {
+            struct json_object_s *lg = json_value_as_object(e->value);
+            if (seen_logging) {
+                cfg_err(err, err_len, "logging: duplicate key");
+                rc = MOQR_ERR_INVAL;
+                break;
+            }
+            seen_logging = true;
+            if (lg == NULL) {
+                cfg_err(err, err_len, "logging: need an object");
+                rc = MOQR_ERR_INVAL;
+            } else {
+                rc = parse_logging(lg, out, err, err_len);
+            }
+        } else if (key_is(e->name, "webtransport")) {
+            struct json_object_s *wo = json_value_as_object(e->value);
+            if (seen_wt) {
+                cfg_err(err, err_len, "webtransport: duplicate key");
+                rc = MOQR_ERR_INVAL;
+                break;
+            }
+            seen_wt = true;
+            if (wo == NULL) {
+                cfg_err(err, err_len, "webtransport: need an object");
+                rc = MOQR_ERR_INVAL;
+            } else {
+                rc = parse_webtransport(wo, out, err, err_len);
             }
         } else if (strcmp(k, "budgets") == 0) {
             struct json_object_s *bo = json_value_as_object(e->value);
@@ -771,7 +1567,7 @@ moqr_cli_build_shards_cfg(const moqr_cli_config_t *cfg,
                           const moq_alloc_t *alloc, moqr_shards_cfg_t *out)
 {
     moqr_shards_cfg_init_sized(out, sizeof(*out), alloc);
-    out->shards = (uint16_t)cfg->lanes;
+    out->shards = (uint16_t)moqr_cli_total_lanes(cfg);
     out->trace_ring_records = cfg->telemetry.trace_ring_records;
     out->live_visibility = true;
     moqr_cli_core_cfg_from(cfg, alloc, &out->core_cfg);
@@ -787,11 +1583,12 @@ moqr_cli_build_shards_cfg(const moqr_cli_config_t *cfg,
      * `lanes` core binding slots, so each lane's binding admits only the
      * external remainder — the shard boundary then fails closed exactly
      * where the model says it will. */
-    if (cfg->lanes > 1) {
+    const uint32_t total_lanes = moqr_cli_total_lanes(cfg);
+    if (total_lanes > 1) {
         moqr_core_limits_t clim;
         if (moqr_core_limits_resolve(&out->core_cfg, &clim) == MOQR_OK &&
-            clim.max_bindings > cfg->lanes) {
-            out->bind_cfg.max_conns = clim.max_bindings - cfg->lanes;
+            clim.max_bindings > total_lanes) {
+            out->bind_cfg.max_conns = clim.max_bindings - total_lanes;
         }
     }
     /* Production admission is automatically ON exactly when the relay runs
@@ -801,7 +1598,10 @@ moqr_cli_build_shards_cfg(const moqr_cli_config_t *cfg,
      * boundary for a subscriber to reach a publisher on another lane. This
      * is the ONE place the rule lives — capacity and serve both consume
      * this output. There is no user-facing admission key or toggle. */
-    out->admit_remote_demand = cfg->lanes > 1;
+    /* Across BOTH listeners: a WebTransport subscriber reaching a raw
+     * publisher crosses shards exactly as a cross-lane subscriber does, so a
+     * one-lane-each dual config still needs owner-side admission. */
+    out->admit_remote_demand = moqr_cli_total_lanes(cfg) > 1;
 #ifdef MOQR_VERIFY_SEAM
     /* Blocked-scenario seam: constrain every shard's bind subgroup slot
      * pool. Applied in THIS builder so describe and serve stay one config —
@@ -828,7 +1628,8 @@ moqr_cli_serve_compose(const moqr_cli_config_t *cfg, const moq_alloc_t *alloc,
     }
     /* Facade admission cap from the SAME rule the capacity model reports:
      * usable external bindings per shard, times lanes (checked). */
-    uint64_t cap64 = (uint64_t)cfg->lanes * slim.usable_bindings;
+    uint64_t cap64 =
+        (uint64_t)moqr_cli_total_lanes(cfg) * slim.usable_bindings;
     *out_max_connections =
         cap64 > UINT32_MAX ? UINT32_MAX : (uint32_t)cap64;
     *out_scfg = scfg;
@@ -849,6 +1650,56 @@ moqr_cli_config_validate(const moqr_cli_config_t *cfg,
                                                            : MOQR_ERR_INVAL;
 }
 
+/* The admin endpoint's allocator-owned footprint.
+ *
+ * EXACT, and derived from the listener's own checked descriptor rather than
+ * from a second formula here. The descriptor is a size-only translation unit,
+ * so a config consumer learns the ceiling without linking socket or thread
+ * code. A refusal to bound the document is reported as UINT64_MAX -- a wrapped
+ * ceiling must never be presented as a smaller one.
+ *
+ * The thread stack is a RESERVATION, reported separately and never folded into
+ * the allocator-request total. Kernel socket buffers stay in the documented
+ * exclusions for the same reason. */
+static void
+admin_capacity(const moqr_cli_config_t *cfg, uint32_t lanes, uint64_t *out_bytes,
+               uint64_t *out_stack)
+{
+    moqr_admin_listen_footprint_t fp;
+
+    *out_bytes = 0;
+    *out_stack = 0;
+    if (cfg == NULL || !cfg->admin.enabled) {
+        return;
+    }
+    if (moqr_admin_listen_footprint(lanes, &fp) != MOQR_OK) {
+        *out_bytes = UINT64_MAX;
+        *out_stack = MOQR_CLI_ADMIN_STACK_BYTES;
+        return;
+    }
+    /* The owner context's own storage: one copied snapshot row and one render
+     * view per lane, held for the endpoint's lifetime so a scrape performs no
+     * allocation. It belongs to the coordinator rather than to the listener
+     * object, so it is a separate named term rather than a hidden one. */
+    *out_bytes = moqr_cap_add(
+        fp.total_alloc_bytes,
+        moqr_cap_mul((uint64_t)lanes,
+                     moqr_cap_add(
+                         (uint64_t)sizeof(moqr_cli_snapshot_stats_t),
+                         (uint64_t)sizeof(moqr_snapshot_view_t))));
+    /* ...and the coordinator's signal-sink body: the frozen Prometheus
+     * projection, one document wide, held so a signal dump performs no
+     * allocation and reads no live lane. Sized by the same checked bound the
+     * listener's Prometheus bank uses. */
+    *out_bytes = moqr_cap_add(*out_bytes,
+                              fp.body_cap[MOQR_OBS_FMT_PROMETHEUS_004]);
+    /* ...and the coordinator's immutable /api/v1/info document, one bound
+     * wide plus its terminator, rendered once before activation. */
+    *out_bytes = moqr_cap_add(*out_bytes,
+                              moqr_cap_add(moqr_cli_info_bound(), 1u));
+    *out_stack = fp.thread_stack_bytes;
+}
+
 moqr_result_t
 moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
                            const moq_alloc_t *alloc, size_t serve_ctx_bytes,
@@ -861,7 +1712,7 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
     if (cfg == NULL) {
         return MOQR_ERR_INVAL;
     }
-    if (cfg->lanes <= 1) {
+    if (moqr_cli_total_lanes(cfg) <= 1) {
         /* Cross-field validation FIRST, through the same shared resolver
          * lanes>1 uses: "lanes=1 accepts the object" means valid inert
          * settings — an explicit demand_channel_bytes below one resolved
@@ -897,10 +1748,23 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
         out->usable_bindings_per_shard = blim.max_conns < clim.max_bindings
                                              ? blim.max_conns
                                              : clim.max_bindings;
+        /* One permanent snapshot row: cmd_serve holds it for the life of the
+         * serve so K=1 and K>1 share one collect/render path. Counted like
+         * every other permanent request; stack objects and the renderer's
+         * transient buffers stay outside the ceiling, as the model states. */
+        out->cli_runtime_bytes = moqr_cli_snapshot_bytes(1u);
+        /* K=1 uses the same publication path, so the admin endpoint costs the
+         * same here as it does above one lane. */
+        admin_capacity(cfg, 1u, &out->admin_bytes,
+                       &out->admin_thread_stack_bytes);
+        out->cli_runtime_bytes =
+            moqr_cap_add(out->cli_runtime_bytes, out->admin_bytes);
         out->total_bytes = moqr_cap_add(
-            moqr_cap_add(out->core_structure_bytes,
-                         out->core_payload_bytes),
-            moqr_cap_add(out->bind_structure_bytes, out->trace_bytes));
+            moqr_cap_add(moqr_cap_add(out->core_structure_bytes,
+                                      out->core_payload_bytes),
+                         moqr_cap_add(out->bind_structure_bytes,
+                                      out->trace_bytes)),
+            out->cli_runtime_bytes);
         if (out->total_bytes == UINT64_MAX) {
             memset(out, 0, sizeof(*out));
             return MOQR_ERR_INVAL;
@@ -924,7 +1788,11 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
         moqr_cap_add(sc.shards_structure_bytes, sc.channel_byte_ceiling),
         moqr_cap_add(sc.canon_byte_ceiling, sc.staging_byte_ceiling));
     out->cli_runtime_bytes = moqr_cap_add(
-        serve_ctx_bytes, moqr_cli_snapshot_bytes(cfg->lanes));
+        serve_ctx_bytes, moqr_cli_snapshot_bytes(moqr_cli_total_lanes(cfg)));
+    admin_capacity(cfg, moqr_cli_total_lanes(cfg), &out->admin_bytes,
+                   &out->admin_thread_stack_bytes);
+    out->cli_runtime_bytes =
+        moqr_cap_add(out->cli_runtime_bytes, out->admin_bytes);
     out->usable_bindings_per_shard = sc.usable_bindings_per_shard;
     out->total_bytes =
         moqr_cap_add(sc.relay_alloc_ceiling, out->cli_runtime_bytes);

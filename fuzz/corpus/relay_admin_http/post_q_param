@@ -1,0 +1,4 @@
+GET /metrics HTTP/1.1
+Host: x
+Accept: text/plain;q=1;ext=1, application/openmetrics-text
+

@@ -132,12 +132,47 @@ test_bind_override_reaches_builder(void)
     return failures;
 }
 
+/* The verify and measure builds cannot promise a JSON-only stdout (their seam
+ * and RELAY_BLOCKED_V0 rows print straight to it), so a serve with
+ * logging.format=json is refused by name; text passes untouched. */
+static int
+test_json_logging_refused(void)
+{
+    int failures = 0;
+    moqr_cli_config_t cfg;
+    char err[128];
+    const char *json = "{\"listener\":{\"port\":1},\"logging\":{\"format\":\"json\"}}";
+    const char *text = "{\"listener\":{\"port\":1},\"logging\":{\"format\":\"text\"}}";
+    const char *none = "{\"listener\":{\"port\":1}}";
+
+    MOQ_TEST_CHECK(moqr_cli_config_parse(json, strlen(json), &cfg, err,
+                                         sizeof(err)) == MOQR_OK);
+    err[0] = '\0';
+    MOQ_TEST_CHECK(moqr_cli_verify_refuse_json_logging(&cfg, err, sizeof(err)) ==
+                   MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strcmp(err, "logging.format: json is not available in the "
+                               "verify and measure builds") == 0);
+    MOQ_TEST_CHECK(moqr_cli_config_parse(text, strlen(text), &cfg, err,
+                                         sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_cli_verify_refuse_json_logging(&cfg, err, sizeof(err)) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_cli_config_parse(none, strlen(none), &cfg, err,
+                                         sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_cli_verify_refuse_json_logging(&cfg, err, sizeof(err)) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_cli_verify_refuse_json_logging(NULL, err, sizeof(err)) ==
+                   MOQR_ERR_INVAL);
+    MOQ_TEST_PASS("json_logging_refused");
+    return failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
     failures += test_env_strict_parse();
     failures += test_bind_override_reaches_builder();
+    failures += test_json_logging_refused();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

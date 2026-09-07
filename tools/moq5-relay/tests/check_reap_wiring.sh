@@ -56,7 +56,7 @@ trap 'rm -f "$code"' EXIT
 body_of() {
     local fn="$1"
     local start
-    start=$(grep -n "^${fn}(moq_msquic_managed_t" "$code" | head -1 | cut -d: -f1)
+    start=$(grep -n "^${fn}(" "$code" | head -1 | cut -d: -f1)
     [ -n "$start" ] || return 1
     awk -v start="$start" '
     NR < start { next }
@@ -82,17 +82,17 @@ body_of() {
 }
 
 check_pump() {
-    local name="$1" step_pattern="$2"
+    local name="$1" step_pattern="$2" reap_pattern="${3:-moqr_relay_reap_pass[[:space:]]*(}"
     local body calls step_line reap_line
     body=$(body_of "$name") || { echo "FAIL: could not locate $name"; fail=1; return; }
 
-    calls=$(printf '%s\n' "$body" | grep -c 'moqr_relay_reap_pass[[:space:]]*(')
+    calls=$(printf '%s\n' "$body" | grep -c "$reap_pattern")
     [ "$calls" -eq 1 ] || {
         echo "FAIL: $name has $calls executable helper calls, expected exactly 1"
         fail=1; return; }
 
     step_line=$(printf '%s\n' "$body" | grep -n "$step_pattern" | head -1 | cut -d: -f1)
-    reap_line=$(printf '%s\n' "$body" | grep -n 'moqr_relay_reap_pass[[:space:]]*(' \
+    reap_line=$(printf '%s\n' "$body" | grep -n "$reap_pattern" \
                 | head -1 | cut -d: -f1)
     [ -n "$step_line" ] || { echo "FAIL: $name has no bind/shard step"; fail=1; return; }
     [ "$reap_line" -gt "$step_line" ] || {
@@ -102,7 +102,32 @@ check_pump() {
 }
 
 check_pump "relay_lane_pump"  'moqr_bind_pump[[:space:]]*('
-check_pump "relay_lanes_pump" 'moqr_shards_step_shard[[:space:]]*('
+# The lane pumps of the multi-shard compositions share ONE shard step, so the
+# "retire after stepping" ordering is pinned where it now lives -- once, rather
+# than once per transport.
+check_pump "relay_pump_shard" 'moqr_shards_step_shard[[:space:]]*(' 'reap[[:space:]]*('
+
+# Each facade pump must reach that shared step exactly once, and must hand it
+# the retirement thunk written for ITS OWN facade: a lane handle is only
+# meaningful to the facade that produced it, so a pump paired with the wrong
+# thunk would retire against a foreign connection list.
+check_delegates() {
+    local name="$1" want="$2"
+    local body n
+    body=$(body_of "$name") || { echo "FAIL: could not locate $name"; fail=1; return; }
+    n=$(printf '%s\n' "$body" | grep -c 'relay_pump_shard[[:space:]]*(')
+    [ "$n" -eq 1 ] || {
+        echo "FAIL: $name calls relay_pump_shard $n times, expected exactly 1"
+        fail=1; return; }
+    printf '%s\n' "$body" | grep -q "relay_pump_shard[[:space:]]*(.*$want" || {
+        echo "FAIL: $name does not pass $want to relay_pump_shard"
+        fail=1; return; }
+    note "$name: one shared step, retiring via $want"
+}
+check_delegates "relay_lanes_pump"    "reap_raw"
+if grep -q 'relay_wt_lanes_pump' "$code"; then
+    check_delegates "relay_wt_lanes_pump" "reap_wt"
+fi
 
 # Every binary carrying a production pump links the shared helper. Read the
 # target's own source list — brace-free but comment-stripped, and bounded to the

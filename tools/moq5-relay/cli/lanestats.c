@@ -331,3 +331,212 @@ moqr_cli_lane_stats_kind_t moqr_cli_run_config_parse(
         return MOQR_LANE_STATS_MALFORMED;
     return MOQR_LANE_STATS_ROW;
 }
+
+/* -- the same records as JSON events -----------------------------------------
+ *
+ * Driven by the SAME key tables and getters as the text formatters above, so a
+ * numeric field appears in both outputs or in neither. The envelope is
+ * `schema` (the versioned prefix) and `elapsed_us` (an unsigned integer, or
+ * `null` when the caller says the elapsed time is not available); the
+ * coordinates (`lane`, `src`/`dst`) precede the numeric fields. No clock, no
+ * I/O, nothing read that the caller did not pass. */
+#include "../admin/json_out.h"
+
+static void
+envelope(moqr_json_w_t *w, const char *schema, bool elapsed_valid,
+         uint64_t elapsed_us)
+{
+    moqr_json_object_begin(w);
+    moqr_json_key(w, "schema");
+    moqr_json_str(w, schema, strlen(schema));
+    moqr_json_key(w, "elapsed_us");
+    if (elapsed_valid) {
+        moqr_json_u64(w, elapsed_us);
+    } else {
+        moqr_json_null(w);
+    }
+}
+
+static moqr_result_t
+finish_doc(moqr_json_w_t *w, char *buf, size_t *out_len)
+{
+    size_t len = 0;
+    moqr_json_object_end(w);
+    if (!moqr_json_end(w, &len)) {
+        if (buf != NULL) {
+            buf[0] = '\0';
+        }
+        if (out_len != NULL) {
+            *out_len = 0;
+        }
+        /* The inputs are integers and program literals: the only refusal a
+         * numeric record can meet is the capacity of the caller's buffer. */
+        return MOQR_ERR_CAPACITY;
+    }
+    if (out_len != NULL) {
+        *out_len = len;
+    }
+    return MOQR_OK;
+}
+
+/* The closed refusal vocabulary of each record. */
+static bool
+refusal_word_ok(const char *which, const char *const *words, size_t n)
+{
+    if (which == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(which, words[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *const k_lane_refusals[] = { "adapter", "shard" };
+static const char *const k_pair_refusals[] = { "shard" };
+static const char *const k_cfg_refusals[] = { "resolver", "format" };
+
+static bool
+args_ok(const char *buf, size_t cap, const void *row, size_t *out_len)
+{
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    return buf != NULL && cap != 0u && row != NULL;
+}
+
+moqr_result_t
+moqr_cli_lane_stats_json(char *buf, size_t cap, bool elapsed_valid,
+                         uint64_t elapsed_us,
+                         const moqr_cli_lane_stats_row_t *row,
+                         size_t *out_len)
+{
+    moqr_json_w_t w;
+    if (!args_ok(buf, cap, row, out_len)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_json_begin(&w, buf, cap);
+    envelope(&w, MOQR_LANE_STATS_PREFIX, elapsed_valid, elapsed_us);
+    moqr_json_key(&w, "lane");
+    moqr_json_u64(&w, row->lane);
+    for (size_t i = 0; i < K_NKEYS; i++) {
+        moqr_json_key(&w, k_keys[i]);
+        moqr_json_u64(&w, *field_ptr(row, i));
+    }
+    return finish_doc(&w, buf, out_len);
+}
+
+moqr_result_t
+moqr_cli_lane_stats_refused_json(char *buf, size_t cap, bool elapsed_valid,
+                                 uint64_t elapsed_us, uint32_t lane,
+                                 const char *which, size_t *out_len)
+{
+    moqr_json_w_t w;
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (buf == NULL || cap == 0u ||
+        !refusal_word_ok(which, k_lane_refusals, 2)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_json_begin(&w, buf, cap);
+    envelope(&w, MOQR_LANE_STATS_PREFIX, elapsed_valid, elapsed_us);
+    moqr_json_key(&w, "lane");
+    moqr_json_u64(&w, lane);
+    moqr_json_key(&w, "refused");
+    moqr_json_str(&w, which, strlen(which));
+    return finish_doc(&w, buf, out_len);
+}
+
+moqr_result_t
+moqr_cli_pair_stats_json(char *buf, size_t cap, bool elapsed_valid,
+                         uint64_t elapsed_us,
+                         const moqr_cli_pair_stats_row_t *row,
+                         size_t *out_len)
+{
+    moqr_json_w_t w;
+    if (!args_ok(buf, cap, row, out_len)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_json_begin(&w, buf, cap);
+    envelope(&w, MOQR_PAIR_STATS_PREFIX, elapsed_valid, elapsed_us);
+    moqr_json_key(&w, "src");
+    moqr_json_u64(&w, row->src);
+    moqr_json_key(&w, "dst");
+    moqr_json_u64(&w, row->dst);
+    for (size_t i = 0; i < K_NPAIR; i++) {
+        moqr_json_key(&w, k_pair_keys[i]);
+        moqr_json_u64(&w, *pair_field_ptr(row, i));
+    }
+    return finish_doc(&w, buf, out_len);
+}
+
+moqr_result_t
+moqr_cli_pair_stats_refused_json(char *buf, size_t cap, bool elapsed_valid,
+                                 uint64_t elapsed_us, uint32_t src,
+                                 uint32_t dst, const char *which,
+                                 size_t *out_len)
+{
+    moqr_json_w_t w;
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (buf == NULL || cap == 0u ||
+        !refusal_word_ok(which, k_pair_refusals, 1)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_json_begin(&w, buf, cap);
+    envelope(&w, MOQR_PAIR_STATS_PREFIX, elapsed_valid, elapsed_us);
+    moqr_json_key(&w, "src");
+    moqr_json_u64(&w, src);
+    moqr_json_key(&w, "dst");
+    moqr_json_u64(&w, dst);
+    moqr_json_key(&w, "refused");
+    moqr_json_str(&w, which, strlen(which));
+    return finish_doc(&w, buf, out_len);
+}
+
+moqr_result_t
+moqr_cli_run_config_json(char *buf, size_t cap, bool elapsed_valid,
+                         uint64_t elapsed_us,
+                         const moqr_cli_run_config_row_t *row,
+                         size_t *out_len)
+{
+    moqr_json_w_t w;
+    if (!args_ok(buf, cap, row, out_len)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_json_begin(&w, buf, cap);
+    envelope(&w, MOQR_RUN_CONFIG_PREFIX, elapsed_valid, elapsed_us);
+    for (size_t i = 0; i < K_NCFG; i++) {
+        moqr_json_key(&w, k_cfg_keys[i]);
+        moqr_json_u64(&w, *cfg_field_ptr(row, i));
+    }
+    return finish_doc(&w, buf, out_len);
+}
+
+moqr_result_t
+moqr_cli_run_config_refused_json(char *buf, size_t cap, bool elapsed_valid,
+                                 uint64_t elapsed_us, const char *which,
+                                 size_t *out_len)
+{
+    moqr_json_w_t w;
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+    if (buf == NULL || cap == 0u ||
+        !refusal_word_ok(which, k_cfg_refusals, 2)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_json_begin(&w, buf, cap);
+    envelope(&w, MOQR_RUN_CONFIG_PREFIX, elapsed_valid, elapsed_us);
+    moqr_json_key(&w, "refused");
+    moqr_json_str(&w, which, strlen(which));
+    return finish_doc(&w, buf, out_len);
+}
+
+size_t moqr_cli_lane_stats_field_count(void) { return K_NKEYS; }
+size_t moqr_cli_pair_stats_field_count(void) { return K_NPAIR; }
+size_t moqr_cli_run_config_field_count(void) { return K_NCFG; }

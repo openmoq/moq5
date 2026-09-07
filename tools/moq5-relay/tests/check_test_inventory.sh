@@ -134,7 +134,12 @@ fi
 if [ ! -f "$key" ]; then
     fail "the committed test-only key is missing: $key"
 fi
-if printf '%s\n' "$cml_src" | grep -qiE 'openssl|MOQ_OPENSSL'; then
+# A dependency root forwarded to a configure-only child is not certificate
+# generation. Remove that one exact, inert CMake hint before retaining the
+# closed ban on any OpenSSL tool/reference in the relay build description.
+cml_without_crypto_hint=$(printf '%s\n' "$cml_src" |
+    sed 's/OPENSSL_ROOT_DIR//g')
+if printf '%s\n' "$cml_without_crypto_hint" | grep -qi 'openssl'; then
     fail "runtime certificate generation is back in the relay CMake"
 fi
 if printf '%s\n' "$cml_src" | grep -q 'relay_gen_certs'; then

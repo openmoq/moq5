@@ -1,0 +1,115 @@
+# HELP moqrelay_objects_ingested_total Objects ingested from upstream publishers.
+# TYPE moqrelay_objects_ingested_total counter
+moqrelay_objects_ingested_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 1234567890123456789
+# HELP moqrelay_objects_delivered_total Objects delivered to downstream subscribers.
+# TYPE moqrelay_objects_delivered_total counter
+moqrelay_objects_delivered_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 987654321098765432
+# HELP moqrelay_objects_evicted_total Object records evicted from track logs by retention.
+# TYPE moqrelay_objects_evicted_total counter
+moqrelay_objects_evicted_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 4242
+# HELP moqrelay_refusals_total Admission requests refused, by exhausted resource.
+# TYPE moqrelay_refusals_total counter
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="tracks"} 0
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="subs"} 31
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="ns_nodes"} 0
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="ns_subs"} 0
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="bindings"} 0
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="name_bytes"} 17
+moqrelay_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="fetches"} 0
+# HELP moqrelay_auth_decisions_total Authorization decisions, by action and verdict.
+# TYPE moqrelay_auth_decisions_total counter
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="client_setup",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="client_setup",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="client_setup",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="server_setup",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="server_setup",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="server_setup",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="publish_namespace",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="publish_namespace",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="publish_namespace",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="subscribe_namespace",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="subscribe_namespace",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="subscribe_namespace",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="subscribe",verdict="allow"} 120
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="subscribe",verdict="deny"} 33
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="subscribe",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="request_update",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="request_update",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="request_update",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="publish",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="publish",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="publish",verdict="defer"} 11
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="fetch",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="fetch",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="fetch",verdict="defer"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="track_status",verdict="allow"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="track_status",verdict="deny"} 0
+moqrelay_auth_decisions_total{shard="0",transport="msquic",version="moqt-18+moqt-16",action="track_status",verdict="defer"} 0
+# HELP moqrelay_auth_denials_total Authorization denials, by reason.
+# TYPE moqrelay_auth_denials_total counter
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="ok"} 0
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="no_token"} 0
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="unscoped"} 33
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="expired"} 5
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="not_yet_valid"} 0
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="bad_issuer"} 0
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="bad_audience"} 0
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="bad_signature"} 0
+moqrelay_auth_denials_total{shard="0",transport="msquic",version="moqt-18+moqt-16",reason="policy"} 0
+# HELP moqrelay_bindings Live session bindings.
+# TYPE moqrelay_bindings gauge
+moqrelay_bindings{shard="0",transport="msquic",version="moqt-18+moqt-16"} 300
+# HELP moqrelay_tracks Live tracks.
+# TYPE moqrelay_tracks gauge
+moqrelay_tracks{shard="0",transport="msquic",version="moqt-18+moqt-16"} 55
+# HELP moqrelay_subscriptions Live downstream subscriptions, by state.
+# TYPE moqrelay_subscriptions gauge
+moqrelay_subscriptions{shard="0",transport="msquic",version="moqt-18+moqt-16",state="parked"} 20
+moqrelay_subscriptions{shard="0",transport="msquic",version="moqt-18+moqt-16",state="active"} 60
+# HELP moqrelay_namespace_nodes Namespace trie nodes.
+# TYPE moqrelay_namespace_nodes gauge
+moqrelay_namespace_nodes{shard="0",transport="msquic",version="moqt-18+moqt-16"} 41
+# HELP moqrelay_namespace_subscriptions Live namespace (prefix) subscriptions.
+# TYPE moqrelay_namespace_subscriptions gauge
+moqrelay_namespace_subscriptions{shard="0",transport="msquic",version="moqt-18+moqt-16"} 27
+# HELP moqrelay_retained_bytes Payload and property bytes retained across track logs.
+# TYPE moqrelay_retained_bytes gauge
+moqrelay_retained_bytes{shard="0",transport="msquic",version="moqt-18+moqt-16"} 8388608
+# HELP moqrelay_intent_ring_highwater Peak intent-ring occupancy since start.
+# TYPE moqrelay_intent_ring_highwater gauge
+moqrelay_intent_ring_highwater{shard="0",transport="msquic",version="moqt-18+moqt-16"} 91
+# HELP moqrelay_route_epoch Monotonic route-mutation epoch (this shard).
+# TYPE moqrelay_route_epoch gauge
+moqrelay_route_epoch{shard="0",transport="msquic",version="moqt-18+moqt-16"} 424242
+# HELP moqrelay_connections Attached transport connections.
+# TYPE moqrelay_connections gauge
+moqrelay_connections{shard="0",transport="msquic",version="moqt-18+moqt-16"} 30
+# HELP moqrelay_events_translated_total Session events translated into core inputs.
+# TYPE moqrelay_events_translated_total counter
+moqrelay_events_translated_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 500000
+# HELP moqrelay_deliveries_written_total Deliveries written to downstream sessions.
+# TYPE moqrelay_deliveries_written_total counter
+moqrelay_deliveries_written_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 250000
+# HELP moqrelay_ingest_refusals_total Ingest records refused as too old or out of order.
+# TYPE moqrelay_ingest_refusals_total counter
+moqrelay_ingest_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 44
+# HELP moqrelay_session_errors_total Unexpected session-call failures.
+# TYPE moqrelay_session_errors_total counter
+moqrelay_session_errors_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 12
+# HELP moqrelay_forward_latency_seconds Object ingest-to-delivery latency (successful writes only).
+# TYPE moqrelay_forward_latency_seconds histogram
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.000100"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.000250"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.000500"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.001000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.002500"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.005000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.010000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.025000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.050000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.100000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="0.250000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="1.000000"} 0
+moqrelay_forward_latency_seconds_bucket{shard="0",transport="msquic",version="moqt-18+moqt-16",le="+Inf"} 0
+moqrelay_forward_latency_seconds_sum{shard="0",transport="msquic",version="moqt-18+moqt-16"} 0.000000
+moqrelay_forward_latency_seconds_count{shard="0",transport="msquic",version="moqt-18+moqt-16"} 0

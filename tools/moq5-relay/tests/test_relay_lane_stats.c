@@ -9,6 +9,7 @@
 
 #include "../cli/lanestats.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -508,6 +509,117 @@ static void t_k1_record_and_max_row(void)
         printf("PASS: K=1 empty pair record valid; all-max row sizing\n");
 }
 
+
+/* The JSON records: the same key tables as the text rows in the same order,
+ * the `schema`/`elapsed_us` envelope with a nullable elapsed, the closed
+ * refusal vocabulary of each family, and buffer-capacity refusal that leaves
+ * nothing behind. */
+static void t_json_records(void)
+{
+    char b[4096];
+    size_t n = 0;
+    moqr_cli_lane_stats_row_t r = sample_row(3);
+
+    CHECK(moqr_cli_lane_stats_field_count() == 39u);
+    CHECK(moqr_cli_pair_stats_field_count() == 5u);
+    CHECK(moqr_cli_run_config_field_count() == 4u);
+
+    CHECK(moqr_cli_lane_stats_json(b, sizeof(b), true, 42, &r, &n) == MOQR_OK);
+    CHECK(n == strlen(b));
+    {
+        static const char head[] = "{\"schema\":\"RELAY_LANE_STATS_V3\",\"elapsed_us\":42,"
+                                   "\"lane\":3,\"wakes_same_lane\":13,";
+        CHECK(strncmp(b, head, sizeof(head) - 1u) == 0);
+    }
+    CHECK(strstr(b, "\"wake_requests_local\":5}") != NULL);
+    CHECK(strstr(b, "eor") == NULL);
+    /* key order: every text key appears in the JSON record, in the same order */
+    {
+        char t[2048];
+        int tl = moqr_cli_lane_stats_format(t, sizeof(t), &r);
+        const char *tp;
+        const char *jp = b;
+        CHECK(tl > 0);
+        tp = strstr(t, ",lane=");
+        while (tp != NULL) {
+            const char *eq;
+            char key[80];
+            size_t kl;
+            tp++;
+            eq = strchr(tp, '=');
+            kl = (size_t)(eq - tp);
+            if (kl == 3 && memcmp(tp, "eor", 3) == 0) {
+                break;
+            }
+            (void)snprintf(key, sizeof(key), "\"%.*s\":", (int)kl, tp);
+            jp = strstr(jp, key);
+            CHECK(jp != NULL);
+            if (jp == NULL) {
+                break;
+            }
+            tp = strchr(tp, ',');
+        }
+    }
+    /* the nullable elapsed */
+    CHECK(moqr_cli_lane_stats_json(b, sizeof(b), false, 42, &r, &n) == MOQR_OK);
+    {
+        static const char head[] = "{\"schema\":\"RELAY_LANE_STATS_V3\",\"elapsed_us\":null,";
+        CHECK(strncmp(b, head, sizeof(head) - 1u) == 0);
+    }
+    /* widest counters */
+    memset(&r, 0xff, sizeof(r));
+    CHECK(moqr_cli_lane_stats_json(b, sizeof(b), true, UINT64_MAX, &r, &n) == MOQR_OK);
+    CHECK(strstr(b, "18446744073709551615") != NULL);
+    /* refusals: the closed vocabulary */
+    CHECK(moqr_cli_lane_stats_refused_json(b, sizeof(b), true, 1, 7, "adapter", &n) == MOQR_OK);
+    CHECK(strcmp(b, "{\"schema\":\"RELAY_LANE_STATS_V3\",\"elapsed_us\":1,\"lane\":7,\"refused\":\"adapter\"}") == 0);
+    CHECK(moqr_cli_lane_stats_refused_json(b, sizeof(b), true, 1, 7, "shard", &n) == MOQR_OK);
+    CHECK(moqr_cli_lane_stats_refused_json(b, sizeof(b), true, 1, 7, "resolver", &n) == MOQR_ERR_INVAL);
+    CHECK(moqr_cli_lane_stats_refused_json(b, sizeof(b), true, 1, 7, "", &n) == MOQR_ERR_INVAL);
+    CHECK(moqr_cli_lane_stats_refused_json(b, sizeof(b), true, 1, 7, NULL, &n) == MOQR_ERR_INVAL);
+    CHECK(moqr_cli_pair_stats_refused_json(b, sizeof(b), false, 0, 1, 2, "shard", &n) == MOQR_OK);
+    CHECK(strcmp(b, "{\"schema\":\"RELAY_PAIR_STATS_V1\",\"elapsed_us\":null,\"src\":1,\"dst\":2,\"refused\":\"shard\"}") == 0);
+    CHECK(moqr_cli_pair_stats_refused_json(b, sizeof(b), false, 0, 1, 2, "adapter", &n) == MOQR_ERR_INVAL);
+    CHECK(moqr_cli_run_config_refused_json(b, sizeof(b), true, 9, "resolver", &n) == MOQR_OK);
+    CHECK(strcmp(b, "{\"schema\":\"RELAY_RUN_CONFIG_V1\",\"elapsed_us\":9,\"refused\":\"resolver\"}") == 0);
+    CHECK(moqr_cli_run_config_refused_json(b, sizeof(b), true, 9, "format", &n) == MOQR_OK);
+    CHECK(moqr_cli_run_config_refused_json(b, sizeof(b), true, 9, "shard", &n) == MOQR_ERR_INVAL);
+    /* pair and run-config records */
+    {
+        moqr_cli_pair_stats_row_t pr;
+        moqr_cli_run_config_row_t rc;
+        memset(&pr, 0, sizeof(pr));
+        pr.src = 0; pr.dst = 1; pr.data_messages = 5; pr.data_bytes = 6;
+        pr.control_messages = 7; pr.refused_entries = 8; pr.refused_bytes = 9;
+        CHECK(moqr_cli_pair_stats_json(b, sizeof(b), true, 3, &pr, &n) == MOQR_OK);
+        CHECK(strcmp(b, "{\"schema\":\"RELAY_PAIR_STATS_V1\",\"elapsed_us\":3,\"src\":0,\"dst\":1,"
+                        "\"data_messages\":5,\"data_bytes\":6,\"control_messages\":7,"
+                        "\"refused_entries\":8,\"refused_bytes\":9}") == 0);
+        memset(&rc, 0, sizeof(rc));
+        rc.pump_turn_messages = 64; rc.pump_turn_bytes = 1048576;
+        rc.demand_channel_entries = 256; rc.demand_channel_bytes = 4194304;
+        CHECK(moqr_cli_run_config_json(b, sizeof(b), true, 4, &rc, &n) == MOQR_OK);
+        CHECK(strcmp(b, "{\"schema\":\"RELAY_RUN_CONFIG_V1\",\"elapsed_us\":4,"
+                        "\"pump_turn_messages\":64,\"pump_turn_bytes\":1048576,"
+                        "\"demand_channel_entries\":256,\"demand_channel_bytes\":4194304}") == 0);
+    }
+    /* capacity: exact fit accepted, one short refused and cleared */
+    {
+        moqr_cli_pair_stats_row_t pr;
+        size_t need;
+        memset(&pr, 0, sizeof(pr));
+        CHECK(moqr_cli_pair_stats_json(b, sizeof(b), true, 0, &pr, &need) == MOQR_OK);
+        memset(b, 'x', sizeof(b));
+        CHECK(moqr_cli_pair_stats_json(b, need + 1u, true, 0, &pr, &n) == MOQR_OK && n == need);
+        memset(b, 'x', sizeof(b));
+        CHECK(moqr_cli_pair_stats_json(b, need, true, 0, &pr, &n) == MOQR_ERR_CAPACITY);
+        CHECK(n == 0 && b[0] == '\0');
+        CHECK(moqr_cli_pair_stats_json(NULL, 8, true, 0, &pr, &n) == MOQR_ERR_INVAL);
+        CHECK(moqr_cli_pair_stats_json(b, 0, true, 0, &pr, &n) == MOQR_ERR_INVAL);
+        CHECK(moqr_cli_pair_stats_json(b, sizeof(b), true, 0, NULL, &n) == MOQR_ERR_INVAL);
+    }
+}
+
 int main(void)
 {
     t_fields_once_roundtrip();
@@ -521,6 +633,7 @@ int main(void)
     t_pair_record_failure_modes();
     t_run_config_record();
     t_k1_record_and_max_row();
+    t_json_records();
     if (failures == 0)
         printf("# ALL PASS\n");
     return failures;

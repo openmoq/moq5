@@ -1,0 +1,3 @@
+GET /metrics HTTP/1.1
+Accept: text/plain;version="0.0.4
+

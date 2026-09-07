@@ -2,10 +2,37 @@
   "listener": {
     "host": "127.0.0.1",
     "port": 4433,
-    "versions": [18, 16],
+    "versions": [
+      18,
+      16
+    ],
     "lanes": 2,
     "cert": "cert.pem",
     "key": "key.pem"
+  },
+  "webtransport": {
+    "host": "127.0.0.1",
+    "port": 4443,
+    "versions": [
+      18,
+      16
+    ],
+    "lanes": 2,
+    "path": "/moq",
+    "profile": "current",
+    "origin_policy": "allowlist",
+    "allowed_origins": [
+      "https://app.example",
+      "https://studio.example:8443"
+    ],
+    "cert": "cert.pem",
+    "key": "key.pem"
+  },
+  "admin": {
+    "tcp": {
+      "host": "127.0.0.1",
+      "port": 9109
+    }
   },
   "budgets": {
     "max_tracks": 256,
@@ -27,6 +54,9 @@
   },
   "telemetry": {
     "trace_ring_records": 4096
+  },
+  "logging": {
+    "format": "text"
   },
   "auth": {
     "mode": "allow_all"

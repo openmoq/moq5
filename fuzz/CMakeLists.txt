@@ -71,6 +71,24 @@ target_link_libraries(fuzz_session_data PRIVATE moq::core)
 target_compile_options(fuzz_session_data PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_session_data PRIVATE ${FUZZ_FLAGS})
 
+# The relay admin parser, built only when the relay tier is in this tree.
+if(TARGET moqr-admin)
+    add_executable(fuzz_relay_admin_http fuzz_relay_admin_http.c)
+    target_link_libraries(fuzz_relay_admin_http PRIVATE moqr-admin)
+    target_compile_options(fuzz_relay_admin_http PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_relay_admin_http PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_relay_admin_http_smoke
+             COMMAND fuzz_relay_admin_http -runs=1 -max_len=0)
+    add_test(NAME fuzz_relay_admin_http_corpus
+             COMMAND fuzz_relay_admin_http
+             ${CMAKE_CURRENT_SOURCE_DIR}/corpus/relay_admin_http -runs=0)
+    set(_fuzz_target_count 6)
+    set(_fuzz_test_count 9)
+else()
+    set(_fuzz_target_count 5)
+    set(_fuzz_test_count 7)
+endif()
+
 # Smoke tests: single-iteration startup validation.
 add_test(NAME fuzz_quic_varint_smoke
          COMMAND fuzz_quic_varint -runs=1 -max_len=0)
@@ -91,4 +109,6 @@ add_test(NAME fuzz_session_data_corpus
          COMMAND fuzz_session_data
          ${CMAKE_CURRENT_SOURCE_DIR}/corpus/session_data -runs=0)
 
-message(STATUS "Fuzz targets: 5 targets, 7 smoke tests")
+message(STATUS
+    "Fuzz targets: ${_fuzz_target_count} targets, "
+    "${_fuzz_test_count} smoke/corpus tests")

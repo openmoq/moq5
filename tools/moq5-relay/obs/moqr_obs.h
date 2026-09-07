@@ -34,6 +34,27 @@ typedef struct moqr_obs_labels {
 } moqr_obs_labels_t;
 
 /*
+ * Exposition SYNTAX. The renderer emits bytes and nothing else: mapping a
+ * format to a media type belongs to whatever surface writes those bytes, not
+ * to this layer.
+ *
+ * A format selects syntax only. It does NOT select which metric families
+ * appear -- that is fixed by which entry point is called (see below).
+ *
+ * PROMETHEUS_004 is the Prometheus text format 0.0.4 syntax.
+ * OPENMETRICS_100 differs in three ways the spec requires: a MetricFamily
+ * name carries no `_total` suffix (the suffix belongs to the sample, so
+ * `# TYPE moqrelay_x counter` with a `moqrelay_x_total{...}` line), a
+ * `# UNIT` line accompanies a family whose name ends in a base unit, and
+ * the document ends with a terminal `# EOF`.
+ */
+typedef uint32_t moqr_obs_format_t;
+
+#define MOQR_OBS_FMT_PROMETHEUS_004  0u
+#define MOQR_OBS_FMT_OPENMETRICS_100 1u
+#define MOQR_OBS_FMT__COUNT          2u
+
+/*
  * Render Prometheus text-format exposition for a snapshot of core (and,
  * when non-NULL, binding) stats into `buf`. Pure and deterministic for a
  * given snapshot. `*written` is the content length (excluding the NUL).
@@ -46,6 +67,29 @@ moqr_result_t moqr_metrics_write_prometheus(const moqr_core_stats_t *core,
                                             const moqr_obs_labels_t *labels,
                                             char *buf, size_t cap,
                                             size_t *written);
+
+/*
+ * -- Two family sets, and why the APIs are not interchangeable -------------
+ *
+ * `moqr_metrics_write_prometheus{,_multi}` render the FROZEN family set: the
+ * families the accepted build emitted, byte for byte, for consumers already
+ * parsing them. They are closed to new families.
+ *
+ * `moqr_metrics_write_ex` / `moqr_metrics_write_multi_ex` render the EXTENDED
+ * (admin-facing) family set in the requested syntax. Because the format
+ * selects syntax and not content, `_ex` with MOQR_OBS_FMT_PROMETHEUS_004 is
+ * deliberately NOT byte-equal to the legacy writer above: it carries
+ * additional families, and a family whose meaning changed when they were
+ * added carries corrected help text. That is how a new series reaches a
+ * scrape without moving ground under an existing consumer.
+ *
+ * An unknown format is MOQR_ERR_INVAL.
+ */
+moqr_result_t moqr_metrics_write_ex(const moqr_core_stats_t *core,
+                                    const moqr_bind_stats_t *bind,
+                                    const moqr_obs_labels_t *labels,
+                                    moqr_obs_format_t fmt, char *buf,
+                                    size_t cap, size_t *written);
 
 /*
  * One shard's stat snapshot inside a multi-shard exposition: the core
@@ -84,6 +128,36 @@ typedef struct moqr_snapshot_view {
 moqr_result_t moqr_metrics_write_prometheus_multi(
     const moqr_snapshot_view_t *views, uint32_t count, char *buf, size_t cap,
     size_t *written);
+
+/* The multi-shard exposition in the EXTENDED family set (see above), in the
+ * requested syntax. An unknown format is MOQR_ERR_INVAL. */
+moqr_result_t moqr_metrics_write_multi_ex(const moqr_snapshot_view_t *views,
+                                          uint32_t count,
+                                          moqr_obs_format_t fmt, char *buf,
+                                          size_t cap, size_t *written);
+
+/*
+ * Worst-case exposition length, in bytes, for `lanes` views in `fmt` --
+ * excluding the terminating NUL, so a buffer of bound + 1 can never
+ * truncate. Pure: a function of the shape of the document, never of any
+ * snapshot's values, so a caller can size a fixed buffer once at startup
+ * and reuse it for every render.
+ *
+ * This sizes the EXTENDED (`_ex`) document. The frozen legacy document is
+ * smaller, so the bound remains safe for it but is no longer exact.
+ *
+ * `with_bind` and `with_shard` say whether any view may carry binding and
+ * cross-shard-plane stats; passing true when unsure is always safe, since
+ * the bound only grows. Saturating arithmetic throughout: an overflow
+ * poisons to UINT64_MAX rather than wrapping, and is reported as
+ * MOQR_ERR_CAPACITY so the caller refuses instead of under-allocating.
+ *
+ * MOQR_ERR_INVAL on a NULL out, an unknown format, or lanes outside
+ * [1, MOQR_SHARDS_MAX].
+ */
+moqr_result_t moqr_metrics_bound(uint32_t lanes, moqr_obs_format_t fmt,
+                                 bool with_bind, bool with_shard,
+                                 uint64_t *out_bytes);
 
 #ifdef __cplusplus
 }

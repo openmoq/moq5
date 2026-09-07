@@ -1,0 +1,4 @@
+GET /api/v1/shards HTTP/1.1
+Host: x
+Accept: application/json
+

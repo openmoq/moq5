@@ -9,9 +9,19 @@
 /* Bounded append writer: snprintf-style, counts the full required length in
  * `len` even past `cap`, so callers learn the needed size on truncation. */
 typedef struct {
-    char  *buf;
-    size_t cap;
-    size_t len;
+    char             *buf;
+    size_t            cap;
+    size_t            len;
+    moqr_obs_format_t fmt;
+    /* Extended families: series that did not exist in the frozen legacy
+     * exposition. The legacy entry points render without them so their bytes
+     * stay exactly as accepted; the format-aware entry points render with
+     * them. See the note above the compatibility wrappers. */
+    bool              ext;
+    /* Sticky: a length accumulation that would wrap. Once set, the reported
+     * length is meaningless as a size, so every caller must refuse rather
+     * than allocate from it. */
+    bool              overflow;
 } mw_t;
 
 static void
@@ -23,9 +33,20 @@ mw_addf(mw_t *w, const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(dst, avail, fmt, ap);
     va_end(ap);
-    if (n > 0) {
-        w->len += (size_t)n;
+    if (n < 0) {
+        /* An encoding error cannot be turned into a length; refuse. */
+        w->overflow = true;
+        return;
     }
+    /* Checked accumulation. A wrapped length would be reported as a small
+     * buffer requirement, which is the one arithmetic mistake in this file
+     * that could hand a caller an under-sized allocation. */
+    if ((size_t)n > SIZE_MAX - w->len) {
+        w->overflow = true;
+        w->len = SIZE_MAX;
+        return;
+    }
+    w->len += (size_t)n;
 }
 
 /* Escape a label value per the Prometheus exposition format (backslash,
@@ -98,10 +119,101 @@ verdict_name(uint32_t decision)
     }
 }
 
+/* The base units that may appear as a metric-name suffix. OpenMetrics wants
+ * the unit restated in a `# UNIT` line, and requires it to be the tail of the
+ * MetricFamily name — so this table is also the authority for which names may
+ * carry one. */
+static const char *
+unit_suffix(const char *family)
+{
+    static const char *const units[] = { "seconds", "bytes", "ratio" };
+    size_t flen = strlen(family);
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        size_t ulen = strlen(units[i]);
+        /* Must be a whole trailing name segment: `..._bytes`, never
+         * `..._bytes_highwater` and never a name that merely ends in the
+         * letters. */
+        if (flen > ulen + 1 && family[flen - ulen - 1] == '_' &&
+            strcmp(family + flen - ulen, units[i]) == 0) {
+            return units[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Emit a family's metadata block.
+ *
+ * The two formats disagree about the name: Prometheus 0.0.4 names the family
+ * exactly as the sample is named, while OpenMetrics names a counter family
+ * WITHOUT the `_total` the sample carries. Everything downstream keeps
+ * emitting the full sample name, so the split lives here alone.
+ */
 static void
 header(mw_t *w, const char *name, const char *help, const char *type)
 {
-    mw_addf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+    if (w->fmt != MOQR_OBS_FMT_OPENMETRICS_100) {
+        mw_addf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+        return;
+    }
+
+    char        fam[128];
+    const char *use = name;
+    size_t      nlen = strlen(name);
+    const char *suffix = "_total";
+    size_t      slen = strlen(suffix);
+    if (strcmp(type, "counter") == 0 && nlen > slen &&
+        strcmp(name + nlen - slen, suffix) == 0 && nlen - slen < sizeof(fam)) {
+        memcpy(fam, name, nlen - slen);
+        fam[nlen - slen] = '\0';
+        use = fam;
+    }
+
+    mw_addf(w, "# HELP %s %s\n# TYPE %s %s\n", use, help, use, type);
+    const char *unit = unit_suffix(use);
+    if (unit != NULL) {
+        mw_addf(w, "# UNIT %s %s\n", use, unit);
+    }
+}
+
+/*
+ * Terminate the buffer and decide the result. Both entry points end here so
+ * the truncation and overflow contracts cannot drift apart between them.
+ *
+ * An overflowed accumulation is fail-closed: its length is not a usable size,
+ * so it is reported as capacity exhaustion with no requirement a caller could
+ * act on. Handing back a wrapped length would be the one arithmetic mistake
+ * here that yields an under-sized allocation.
+ */
+static moqr_result_t
+mw_finish(mw_t *w, char *buf, size_t cap, size_t *written, bool *poisoned)
+{
+    if (poisoned != NULL) {
+        *poisoned = w->overflow;
+    }
+    if (cap > 0) {
+        buf[w->len < cap ? w->len : cap - 1] = '\0';
+    }
+    if (w->overflow) {
+        if (written != NULL) {
+            *written = 0;
+        }
+        return MOQR_ERR_CAPACITY;
+    }
+    if (written != NULL) {
+        *written = w->len;
+    }
+    return w->len < cap ? MOQR_OK : MOQR_ERR_CAPACITY;
+}
+
+/* Close the document. OpenMetrics requires a terminal `# EOF`; 0.0.4 has no
+ * end marker at all. */
+static void
+finish(mw_t *w)
+{
+    if (w->fmt == MOQR_OBS_FMT_OPENMETRICS_100) {
+        mw_addf(w, "# EOF\n");
+    }
 }
 
 /* A single-series counter (HELP + TYPE + one value line). */
@@ -122,16 +234,15 @@ gauge1(mw_t *w, const char *name, const char *help, const char *base,
     emit(w, name, base, NULL, NULL, value);
 }
 
-moqr_result_t
-moqr_metrics_write_prometheus(const moqr_core_stats_t *core,
-                              const moqr_bind_stats_t *bind,
-                              const moqr_obs_labels_t *labels, char *buf,
-                              size_t cap, size_t *written)
+static moqr_result_t
+write_single(const moqr_core_stats_t *core, const moqr_bind_stats_t *bind,
+             const moqr_obs_labels_t *labels, moqr_obs_format_t fmt, bool ext,
+             char *buf, size_t cap, size_t *written)
 {
     if (written != NULL) {
         *written = 0;
     }
-    if (core == NULL || buf == NULL) {
+    if (core == NULL || buf == NULL || fmt >= MOQR_OBS_FMT__COUNT) {
         return MOQR_ERR_INVAL;
     }
 
@@ -145,7 +256,7 @@ moqr_metrics_write_prometheus(const moqr_core_stats_t *core,
     snprintf(base, sizeof(base), "shard=\"%u\",transport=\"%s\",version=\"%s\"",
              (unsigned)(labels != NULL ? labels->shard : 0), tr, ver);
 
-    mw_t w = { buf, cap, 0 };
+    mw_t w = { buf, cap, 0, fmt, ext, false };
 
     /* -- object flow (counters) -- */
     counter1(&w, "moqrelay_objects_ingested_total",
@@ -262,13 +373,9 @@ moqr_metrics_write_prometheus(const moqr_core_stats_t *core,
                 (unsigned long long)h->count);
     }
 
-    if (cap > 0) {
-        buf[w.len < cap ? w.len : cap - 1] = '\0';
-    }
-    if (written != NULL) {
-        *written = w.len;
-    }
-    return w.len < cap ? MOQR_OK : MOQR_ERR_CAPACITY;
+    finish(&w);
+
+    return mw_finish(&w, buf, cap, written, NULL);
 }
 
 /* -- multi-snapshot exposition (one document, N shards) ---------------------- */
@@ -426,15 +533,15 @@ static unsigned long long mvg_ch_e_hwm(const moqr_snapshot_view_t *v)
 static unsigned long long mvg_ch_b_hwm(const moqr_snapshot_view_t *v)
 { return v->shard->channel_bytes_hwm; }
 
-moqr_result_t
-moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs,
-                                    uint32_t n, char *buf, size_t cap,
-                                    size_t *written)
+static moqr_result_t
+write_multi(const moqr_snapshot_view_t *vs, uint32_t n, moqr_obs_format_t fmt,
+            bool ext, char *buf, size_t cap, size_t *written, bool *poisoned)
 {
     if (written != NULL) {
         *written = 0;
     }
-    if (vs == NULL || n == 0 || n > MV_MAX || buf == NULL) {
+    if (vs == NULL || n == 0 || n > MV_MAX || buf == NULL ||
+        fmt >= MOQR_OBS_FMT__COUNT) {
         return MOQR_ERR_INVAL;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -482,7 +589,7 @@ moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs,
     const char (*const cbases)[MV_BASE_CAP] =
         (const char (*)[MV_BASE_CAP])bases;
 
-    mw_t w = { buf, cap, 0 };
+    mw_t w = { buf, cap, 0, fmt, ext, false };
 
     /* -- object flow (counters) -- */
     mv_family(&w, "moqrelay_objects_ingested_total",
@@ -817,9 +924,18 @@ moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs,
                     "{reason=\"overrun\"} %llu\n",
                     to);
 
+            /* The legacy help text says "cross-shard", which stopped
+             * being true once the local continuation cause joined the
+             * family: a local self-wake crosses nothing. The frozen legacy
+             * exposition keeps its accepted wording; the extended one states
+             * what the family now actually counts. */
             header(&w, "moqrelay_wake_requests_total",
-                   "Cross-shard wake requests, by cause (mask-level: one "
-                   "per destination per step).", "counter");
+                   w.ext ? "Wake requests, by cause (mask-level: one per "
+                           "destination per step; the local cause is a "
+                           "self-wake and crosses no shard)."
+                         : "Cross-shard wake requests, by cause (mask-level: "
+                           "one per destination per step).",
+                   "counter");
             for (uint32_t i = 0; i < n; i++) {
                 if (vs[i].shard == NULL) {
                     continue;
@@ -830,15 +946,25 @@ moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs,
                 emit(&w, "moqrelay_wake_requests_total", bases[i], "cause",
                      "credit",
                      (unsigned long long)vs[i].shard->wake_requests_credit);
+                if (w.ext) {
+                    emit(&w, "moqrelay_wake_requests_total", bases[i],
+                         "cause", "local",
+                         (unsigned long long)vs[i].shard->wake_requests_local);
+                }
             }
             header(&w, "moqrelay_process_wake_requests_total",
-                   "Cross-shard wake requests, by cause (mask-level: one "
-                   "per destination per step).", "counter");
-            unsigned long long wp = 0, wc = 0;
+                   w.ext ? "Wake requests, by cause (mask-level: one per "
+                           "destination per step; the local cause is a "
+                           "self-wake and crosses no shard)."
+                         : "Cross-shard wake requests, by cause (mask-level: "
+                           "one per destination per step).",
+                   "counter");
+            unsigned long long wp = 0, wc = 0, wl = 0;
             for (uint32_t i = 0; i < n; i++) {
                 if (vs[i].shard != NULL) {
                     wp += vs[i].shard->wake_requests_push;
                     wc += vs[i].shard->wake_requests_credit;
+                    wl += vs[i].shard->wake_requests_local;
                 }
             }
             mw_addf(&w,
@@ -849,6 +975,12 @@ moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs,
                     "moqrelay_process_wake_requests_total{cause=\"credit\"} "
                     "%llu\n",
                     wc);
+            if (w.ext) {
+                mw_addf(&w,
+                        "moqrelay_process_wake_requests_total{cause=\"local\"} "
+                        "%llu\n",
+                        wl);
+            }
         }
     }
 
@@ -933,11 +1065,159 @@ moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs,
               "Peak inbound demand-channel logical bytes.", "gauge", vs, n,
               cbases, mv_has_shard, mvg_ch_b_hwm, MV_AGG_MAX);
 
-    if (cap > 0) {
-        buf[w.len < cap ? w.len : cap - 1] = '\0';
+    finish(&w);
+
+    return mw_finish(&w, buf, cap, written, poisoned);
+}
+
+/* -- entry points --------------------------------------------------------- */
+
+/*
+ * Two families of entry point, and the difference between them is deliberate.
+ *
+ * The legacy pair renders the FROZEN exposition: exactly the bytes the
+ * accepted build emitted, for consumers already parsing them. It is closed to
+ * new series.
+ *
+ * The `_ex` pair renders the ADMIN-FACING exposition: the same document plus
+ * extended families, in the requested format. `_ex` with
+ * MOQR_OBS_FMT_PROMETHEUS_004 is therefore NOT byte-equal to the legacy
+ * writer, and must not be — that is how a new series reaches a scrape without
+ * moving ground under an existing consumer. Frozen goldens pin the legacy
+ * bytes; the format tests pin the extended ones.
+ */
+moqr_result_t
+moqr_metrics_write_prometheus(const moqr_core_stats_t *core,
+                              const moqr_bind_stats_t *bind,
+                              const moqr_obs_labels_t *labels, char *buf,
+                              size_t cap, size_t *written)
+{
+    return write_single(core, bind, labels, MOQR_OBS_FMT_PROMETHEUS_004, false,
+                        buf, cap, written);
+}
+
+moqr_result_t
+moqr_metrics_write_prometheus_multi(const moqr_snapshot_view_t *vs, uint32_t n,
+                                    char *buf, size_t cap, size_t *written)
+{
+    return write_multi(vs, n, MOQR_OBS_FMT_PROMETHEUS_004, false, buf, cap,
+                       written, NULL);
+}
+
+moqr_result_t
+moqr_metrics_write_ex(const moqr_core_stats_t *core,
+                      const moqr_bind_stats_t *bind,
+                      const moqr_obs_labels_t *labels, moqr_obs_format_t fmt,
+                      char *buf, size_t cap, size_t *written)
+{
+    return write_single(core, bind, labels, fmt, true, buf, cap, written);
+}
+
+moqr_result_t
+moqr_metrics_write_multi_ex(const moqr_snapshot_view_t *vs, uint32_t n,
+                            moqr_obs_format_t fmt, char *buf, size_t cap,
+                            size_t *written)
+{
+    return write_multi(vs, n, fmt, true, buf, cap, written, NULL);
+}
+
+/* -- worst-case exposition size ------------------------------------------- */
+
+/*
+ * The bound is computed BY THE RENDERER, against a synthetic snapshot chosen
+ * to maximize every rendered field width. Deriving it any other way would let
+ * a hand-maintained arithmetic model drift away from the document the code
+ * actually emits; here the two cannot disagree, because they are the same
+ * code path.
+ *
+ * Choosing the worst case needs one non-obvious step. Several gauges are
+ * rendered as `core minus internal` while the internal is rendered on its own
+ * line, so the pair is zero-sum: saturating both operands makes the
+ * difference render as a single `0` digit, and saturating neither makes the
+ * internal render short instead. Neither extreme is the widest. Setting each
+ * internal to half its saturated value makes the difference AND the internal
+ * both render at full width, which is the true maximum.
+ */
+static void
+bound_worst_case(moqr_core_stats_t *core, moqr_bind_stats_t *bind,
+                 moqr_shards_stats_t *shard)
+{
+    memset(core, 0xff, sizeof(*core));
+    memset(bind, 0xff, sizeof(*bind));
+    memset(shard, 0xff, sizeof(*shard));
+    shard->pump_subs_parked = core->subs_parked / 2u;
+    shard->pump_subs_active = core->subs_active / 2u;
+    shard->internal_bindings = core->bindings / 2u;
+    shard->internal_ns_subs = core->ns_subs / 2u;
+}
+
+/*
+ * Decide the bound from one measuring render.
+ *
+ * Truncation against the one-byte sink is the ORDINARY outcome here and
+ * carries the exact length. A poisoned accumulation reports the same
+ * MOQR_ERR_CAPACITY but its length is meaningless, so the two must not be
+ * conflated: collapsing them would hand a caller a zero-byte allocation for a
+ * document that could not be measured. Poison saturates and refuses.
+ */
+static moqr_result_t
+bound_finalize(moqr_result_t rc, bool poisoned, size_t need,
+               uint64_t *out_bytes)
+{
+    if (poisoned) {
+        *out_bytes = UINT64_MAX;
+        return MOQR_ERR_CAPACITY;
     }
-    if (written != NULL) {
-        *written = w.len;
+    if (rc != MOQR_OK && rc != MOQR_ERR_CAPACITY) {
+        return rc;
     }
-    return w.len < cap ? MOQR_OK : MOQR_ERR_CAPACITY;
+    *out_bytes = (uint64_t)need;
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_metrics_bound(uint32_t lanes, moqr_obs_format_t fmt, bool with_bind,
+                   bool with_shard, uint64_t *out_bytes)
+{
+    if (out_bytes == NULL || lanes == 0 || lanes > MV_MAX ||
+        fmt >= MOQR_OBS_FMT__COUNT) {
+        return MOQR_ERR_INVAL;
+    }
+    *out_bytes = 0;
+
+    static const char worst_label[] =
+        "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\""
+        "\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"\"";
+
+    moqr_core_stats_t   core;
+    moqr_bind_stats_t   bind;
+    moqr_shards_stats_t shard;
+    bound_worst_case(&core, &bind, &shard);
+
+    /* Caller-local, never static: a shared workspace would both race
+     * between concurrent callers and briefly retain pointers to another
+     * call's stack snapshots. MV_MAX views is a few kilobytes. */
+    moqr_snapshot_view_t vs[MV_MAX];
+    memset(vs, 0, sizeof(vs));
+    for (uint32_t i = 0; i < lanes; i++) {
+        vs[i].core = &core;
+        vs[i].bind = with_bind ? &bind : NULL;
+        vs[i].shard = with_shard ? &shard : NULL;
+        vs[i].lane_wakes = UINT64_MAX;
+        /* Widest label block: the highest shard number, and tokens whose
+         * every byte escapes to two (esc_label caps the expansion, so this
+         * saturates the escaped form rather than merely being long). */
+        vs[i].labels.shard = UINT16_MAX;
+        vs[i].labels.transport = worst_label;
+        vs[i].labels.version = worst_label;
+    }
+
+    /* A one-byte sink: the writer still accumulates the full required length
+     * past its capacity, which is exactly the number we want. */
+    char   sink = 0;
+    size_t need = 0;
+    bool   poisoned = false;
+    moqr_result_t rc =
+        write_multi(vs, lanes, fmt, true, &sink, 1u, &need, &poisoned);
+    return bound_finalize(rc, poisoned, need, out_bytes);
 }

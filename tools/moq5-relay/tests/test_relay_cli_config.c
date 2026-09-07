@@ -1,7 +1,11 @@
 /* Config parser tests: strict schema, loud failures, capacity-only path. */
 
+#include "../cli/admin_listen_layout.h"
 #include "../cli/config.h"
 #include "../cli/snapshot.h"
+#include "../admin/moqr_admin.h"
+#include "../cli/info_doc.h"
+#include "../cli/shards_doc.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -9,6 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <errno.h>
 
 #include "../../../tests/unit/test_support.h"
 
@@ -185,7 +192,7 @@ test_snapshot_render_gate(void)
     MOQ_TEST_CHECK(moqr_cli_snapshot_init(&snap, 2, alloc) == MOQR_OK);
     moqr_cli_snapshot_stats_t st;
     memset(&st, 0, sizeof(st));
-    st.shard_stats_valid = true;
+    st.shard_cap = MOQR_CLI_CAP_VALID;
     moqr_cli_snapshot_stats_t rows[2];
     moqr_cli_snapshot_publish(&snap, 0, &st, 1);
     moqr_cli_snapshot_publish(&snap, 1, &st, 1);
@@ -226,9 +233,9 @@ test_snapshot_render_gate(void)
     /* A POISONED lane snapshot (shard stats refused, published invalid)
      * suppresses the complete epoch: INVAL, and the producer is never
      * called — zeroed stand-ins never render. */
-    st.shard_stats_valid = false;
+    st.shard_cap = MOQR_CLI_CAP_REFUSED;
     moqr_cli_snapshot_publish(&snap, 1, &st, 2);
-    st.shard_stats_valid = true;
+    st.shard_cap = MOQR_CLI_CAP_VALID;
     moqr_cli_snapshot_publish(&snap, 0, &st, 2);
     pr = (produce_probe_t){ 0, 0, MOQR_OK };
     e = 2;
@@ -305,7 +312,7 @@ snap_lane_run(void *arg)
         if (e != last) {
             moqr_cli_snapshot_stats_t st;
             memset(&st, 0, sizeof(st));
-            st.shard_stats_valid = true;
+            st.shard_cap = MOQR_CLI_CAP_VALID;
             st.core.ingested_total = snap_encode(t->lane, e);
             moqr_cli_snapshot_publish(t->snap, t->lane, &st, e);
             last = e;
@@ -512,7 +519,7 @@ test_snapshot_coord_failures(void)
         MOQ_TEST_CHECK(moqr_cli_snapshot_init(&snap, 2, &fa.vt) == MOQR_OK);
         moqr_cli_snapshot_stats_t st;
         memset(&st, 0, sizeof(st));
-        st.shard_stats_valid = true;
+        st.shard_cap = MOQR_CLI_CAP_VALID;
         moqr_cli_snapshot_publish(&snap, 0, &st, 1);
         moqr_cli_snapshot_publish(&snap, 1, &st, 1);
         uint64_t e = 1, got = 0;
@@ -627,8 +634,10 @@ coord_lane_run(void *arg)
             memset(&st, 0, sizeof(st));
             moqr_core_get_stats(moqr_shards_core(t->s, t->shard), &st.core);
             moqr_bind_get_stats(moqr_shards_bind(t->s, t->shard), &st.bind);
-            st.shard_stats_valid =
-                moqr_shards_get_stats(t->s, t->shard, &st.shard) == MOQR_OK;
+            st.shard_cap =
+                (moqr_shards_get_stats(t->s, t->shard, &st.shard) == MOQR_OK)
+                    ? MOQR_CLI_CAP_VALID
+                    : MOQR_CLI_CAP_REFUSED;
             moqr_cli_snapshot_publish(t->snap, t->shard, &st, e);
             last = e;
         }
@@ -708,10 +717,1187 @@ test_snapshot_coord_production(void)
     return failures;
 }
 
+
+/*
+ * F5: the single-lane composition now allocates one snapshot row for its
+ * whole lifetime, so the ceiling must count it. It is a permanent request,
+ * not a transient render buffer, and the model's rule is that permanent
+ * requests are counted.
+ */
+static int
+test_k1_counts_its_snapshot_row(void)
+{
+    int failures = 0;
+    const moq_alloc_t *alloc = moq_alloc_default();
+    moqr_cli_config_t cfg;
+    char err[256];
+    const char *json =
+        "{\"listener\":{\"port\":4433,\"cert\":\"c\",\"key\":\"k\"}}";
+    MOQ_TEST_CHECK_EQ_INT(parse(json, &cfg, err, sizeof(err)), MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(moqr_cli_total_lanes(&cfg), 1u);
+
+    moqr_cli_capacity_t cap;
+    MOQ_TEST_CHECK_EQ_INT(moqr_cli_describe_capacity(&cfg, alloc, 0, &cap),
+                          MOQR_OK);
+
+    /* Exactly one row, and exactly once. */
+    MOQ_TEST_CHECK_EQ_U64(cap.cli_runtime_bytes, moqr_cli_snapshot_bytes(1u));
+    MOQ_TEST_CHECK(cap.cli_runtime_bytes > 0u);
+
+    /* And it is inside the reported total, not reported beside it. */
+    uint64_t parts = cap.core_structure_bytes + cap.core_payload_bytes +
+                     cap.bind_structure_bytes + cap.trace_bytes +
+                     cap.cross_shard_bytes + cap.cli_runtime_bytes;
+    MOQ_TEST_CHECK_EQ_U64(cap.total_bytes, parts);
+    return failures;
+}
+
+/* -- the admin endpoint section --------------------------------------------
+ *
+ * Strict by construction: disabled by default, exactly one endpoint mode,
+ * loopback-only TCP in v1, and a UDS path that startup will refuse to share
+ * with any pre-existing entry. Every rejection below is a closed refusal, not
+ * a permissive fallback. */
+static int
+test_admin_config(void)
+{
+    int failures = 0;
+    moqr_cli_config_t cfg;
+    char err[192];
+    static const char *BASE =
+        "{\"listener\":{\"port\":4433,\"versions\":[18]},";
+
+    /* Absent: disabled, and nothing else asserted about it. */
+    {
+        const char *j = "{\"listener\":{\"port\":4433,\"versions\":[18]}}";
+        if (parse(j, &cfg, err, sizeof(err)) != MOQR_OK) {
+            printf("  a config without an admin section was rejected: %s\n", err);
+            failures++;
+        } else if (cfg.admin.enabled) {
+            printf("  the admin endpoint defaulted to enabled\n");
+            failures++;
+        }
+    }
+
+    /* Accepted shapes. */
+    static const struct { const char *name; const char *frag; } ok[] = {
+        { "tcp default host", "\"admin\":{\"tcp\":{\"port\":9109}}" },
+        { "tcp explicit v4",  "\"admin\":{\"tcp\":{\"host\":\"127.0.0.1\",\"port\":9109}}" },
+        { "tcp explicit v6",  "\"admin\":{\"tcp\":{\"host\":\"::1\",\"port\":9109}}" },
+        { "tcp loopback /8",  "\"admin\":{\"tcp\":{\"host\":\"127.9.9.9\",\"port\":1}}" },
+        { "explicit disable",  "\"admin\":{\"enabled\":false}" },
+    };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        char j[512];
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE, ok[i].frag);
+        if (parse(j, &cfg, err, sizeof(err)) != MOQR_OK) {
+            printf("  admin/%s was rejected: %s\n", ok[i].name, err);
+            failures++;
+        }
+    }
+    /* An accepted TCP section carries the documented default host. */
+    {
+        char j[512];
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE,
+                       "\"admin\":{\"tcp\":{\"port\":9109}}");
+        if (parse(j, &cfg, err, sizeof(err)) == MOQR_OK) {
+            if (!cfg.admin.enabled ||
+                cfg.admin.mode != MOQR_CLI_ADMIN_TCP ||
+                strcmp(cfg.admin.host, "127.0.0.1") != 0 ||
+                cfg.admin.port != 9109) {
+                printf("  the accepted TCP admin section did not materialise\n");
+                failures++;
+            }
+        }
+    }
+    /* v1 is TCP loopback only. UDS is DEFERRED, not hidden: pathname unlink
+     * cannot be made to target the inode this process created, and a
+     * protected-parent assumption dressed up as an inode-safe guarantee would
+     * be a false promise. `admin.uds` therefore fails through the ordinary
+     * unknown-key rule, like any other key the schema does not define. */
+    {
+        char j[512];
+        err[0] = '\0';
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE,
+                       "\"admin\":{\"uds\":{\"path\":\"/tmp/a\"}}");
+        if (parse(j, &cfg, err, sizeof(err)) == MOQR_OK) {
+            printf("  admin.uds was ACCEPTED\n");
+            failures++;
+        } else if (strstr(err, "unknown key") == NULL) {
+            printf("  admin.uds did not fail as an unknown key: %s\n", err);
+            failures++;
+        }
+    }
+
+    /* Closed refusals. Each names the rule it breaks. */
+    static const struct { const char *name; const char *frag; } bad[] = {
+        { "unknown key",        "\"admin\":{\"tcp\":{\"port\":9109},\"nope\":1}" },
+        { "unknown tcp key",    "\"admin\":{\"tcp\":{\"port\":9109,\"nope\":1}}" },
+        { "neither endpoint",   "\"admin\":{\"enabled\":true}" },
+        { "uds is unknown",     "\"admin\":{\"uds\":{\"path\":\"/tmp/a\"}}" },
+        { "uds beside tcp",     "\"admin\":{\"tcp\":{\"port\":9109},\"uds\":{\"path\":\"/tmp/a\"}}" },
+        { "port zero refused",  "\"admin\":{\"tcp\":{\"port\":0}}" },
+        { "tcp without port",   "\"admin\":{\"tcp\":{\"host\":\"127.0.0.1\"}}" },
+        { "port zero",          "\"admin\":{\"tcp\":{\"port\":0}}" },
+        { "port too large",     "\"admin\":{\"tcp\":{\"port\":65536}}" },
+        { "port not a number",  "\"admin\":{\"tcp\":{\"port\":\"9109\"}}" },
+        { "wildcard v4",        "\"admin\":{\"tcp\":{\"host\":\"0.0.0.0\",\"port\":9109}}" },
+        { "wildcard v6",        "\"admin\":{\"tcp\":{\"host\":\"::\",\"port\":9109}}" },
+        { "empty host",         "\"admin\":{\"tcp\":{\"host\":\"\",\"port\":9109}}" },
+        { "public v4",          "\"admin\":{\"tcp\":{\"host\":\"10.0.0.5\",\"port\":9109}}" },
+        { "public v4 b",        "\"admin\":{\"tcp\":{\"host\":\"192.0.2.10\",\"port\":9109}}" },
+        { "hostname",           "\"admin\":{\"tcp\":{\"host\":\"localhost\",\"port\":9109}}" },
+        { "v4-mapped",          "\"admin\":{\"tcp\":{\"host\":\"::ffff:127.0.0.1\",\"port\":9109}}" },
+        { "enabled false + tcp","\"admin\":{\"enabled\":false,\"tcp\":{\"port\":9109}}" },
+        { "admin not object",   "\"admin\":[]" },
+        /* Spellings sscanf accepts and inet_pton does not. Accepting them here
+         * defers the refusal to bind time, after readiness decisions have
+         * already been made on a config that was called valid. */
+        { "leading space",      "\"admin\":{\"tcp\":{\"host\":\" 127.0.0.1\",\"port\":9109}}" },
+        { "leading tab",        "\"admin\":{\"tcp\":{\"host\":\"\\t127.0.0.1\",\"port\":9109}}" },
+        { "signed octet",       "\"admin\":{\"tcp\":{\"host\":\"+127.0.0.1\",\"port\":9109}}" },
+        { "trailing space",     "\"admin\":{\"tcp\":{\"host\":\"127.0.0.1 \",\"port\":9109}}" },
+        { "zero-padded octets", "\"admin\":{\"tcp\":{\"host\":\"127.000.000.001\",\"port\":9109}}" },
+        { "three octets",       "\"admin\":{\"tcp\":{\"host\":\"127.0.1\",\"port\":9109}}" },
+        /* Duplicate keys: JSON objects with repeated names are ambiguous, and
+         * last-one-wins silently discards whichever the operator meant. */
+        { "duplicate admin",    "\"admin\":{\"tcp\":{\"port\":9109}},\"admin\":{\"uds\":{\"path\":\"/tmp/a\"}}" },
+        { "duplicate enabled",  "\"admin\":{\"enabled\":true,\"enabled\":false,\"tcp\":{\"port\":9109}}" },
+        { "duplicate tcp",      "\"admin\":{\"tcp\":{\"port\":9109},\"tcp\":{\"port\":9110}}" },
+        { "duplicate host",     "\"admin\":{\"tcp\":{\"host\":\"127.0.0.1\",\"host\":\"127.0.0.2\",\"port\":9109}}" },
+        { "duplicate port",     "\"admin\":{\"tcp\":{\"port\":9109,\"port\":9110}}" },
+        { "tcp not object",     "\"admin\":{\"tcp\":9109}" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char j[768];
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE, bad[i].frag);
+        err[0] = '\0';
+        if (parse(j, &cfg, err, sizeof(err)) == MOQR_OK) {
+            printf("  admin/%s was ACCEPTED\n", bad[i].name);
+            failures++;
+        } else if (strstr(err, "admin") == NULL) {
+            printf("  admin/%s reported an unrelated error: %s\n",
+                   bad[i].name, err);
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/* -- the logging section ------------------------------------------------------
+ *
+ * Strict: `format` is `"text"` (the default) or `"json"`, nothing else; every
+ * other key, type, value and duplicate refuses with a message naming the
+ * section. */
+static int
+test_logging_config(void)
+{
+    int failures = 0;
+    moqr_cli_config_t cfg;
+    char err[192];
+    static const char *BASE =
+        "{\"listener\":{\"port\":4433,\"versions\":[18]},";
+
+    /* Absent: text. */
+    if (parse("{\"listener\":{\"port\":4433,\"versions\":[18]}}", &cfg, err,
+              sizeof(err)) != MOQR_OK) {
+        printf("  a config without a logging section was rejected: %s\n", err);
+        failures++;
+    } else if (cfg.logging.format != MOQR_CLI_LOG_TEXT) {
+        printf("  logging.format did not default to text\n");
+        failures++;
+    }
+    static const struct { const char *frag; moqr_cli_log_format_t want; } ok[] = {
+        { "\"logging\":{}",                    MOQR_CLI_LOG_TEXT },
+        { "\"logging\":{\"format\":\"text\"}", MOQR_CLI_LOG_TEXT },
+        { "\"logging\":{\"format\":\"json\"}", MOQR_CLI_LOG_JSON },
+        /* escaped spellings of the SAME key bytes are the same key */
+        { "\"logging\":{\"form\\u0061t\":\"json\"}", MOQR_CLI_LOG_JSON },
+        { "\"logg\\u0069ng\":{\"format\":\"json\"}", MOQR_CLI_LOG_JSON },
+    };
+    for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++) {
+        char j[512];
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE, ok[i].frag);
+        memset(&cfg, 0xff, sizeof(cfg));
+        if (parse(j, &cfg, err, sizeof(err)) != MOQR_OK) {
+            printf("  logging/%s was rejected: %s\n", ok[i].frag, err);
+            failures++;
+        } else if (cfg.logging.format != ok[i].want) {
+            printf("  logging/%s materialised as %u\n", ok[i].frag,
+                   (unsigned)cfg.logging.format);
+            failures++;
+        }
+    }
+    static const struct { const char *name; const char *frag; } bad[] = {
+        { "unknown value",     "\"logging\":{\"format\":\"jsonl\"}" },
+        { "case",              "\"logging\":{\"format\":\"JSON\"}" },
+        { "empty value",       "\"logging\":{\"format\":\"\"}" },
+        { "not a string",      "\"logging\":{\"format\":1}" },
+        { "null",              "\"logging\":{\"format\":null}" },
+        { "unknown key",       "\"logging\":{\"format\":\"json\",\"level\":\"info\"}" },
+        { "unknown key alone", "\"logging\":{\"sink\":\"stdout\"}" },
+        { "duplicate format",  "\"logging\":{\"format\":\"text\",\"format\":\"json\"}" },
+        { "duplicate section", "\"logging\":{\"format\":\"json\"},\"logging\":{\"format\":\"text\"}" },
+        { "not an object",     "\"logging\":\"json\"" },
+        { "array",             "\"logging\":[\"json\"]" },
+        /* a key is its exact bytes: an embedded NUL or any suffix is a
+         * DIFFERENT key, not a spelling of format/logging */
+        { "format NUL alone",  "\"logging\":{\"format\\u0000\":\"json\"}" },
+        { "format NUL suffix", "\"logging\":{\"format\\u0000x\":\"json\"}" },
+        { "format suffix",     "\"logging\":{\"formatx\":\"json\"}" },
+        { "logging NUL alone", "\"logging\\u0000\":{\"format\":\"json\"}" },
+        { "logging NUL suffix","\"logging\\u0000x\":{\"format\":\"json\"}" },
+        { "logging suffix",    "\"loggingx\":{\"format\":\"json\"}" },
+        { "logging prefix NUL","\"logging\":{\"\\u0000format\":\"json\"}" },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char j[768];
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE, bad[i].frag);
+        err[0] = '\0';
+        if (parse(j, &cfg, err, sizeof(err)) == MOQR_OK) {
+            printf("  logging/%s was ACCEPTED\n", bad[i].name);
+            failures++;
+        } else if (strstr(err, "logging") == NULL &&
+                   strstr(err, "top-level") == NULL) {
+            printf("  logging/%s reported an unrelated error: %s\n",
+                   bad[i].name, err);
+            failures++;
+        }
+    }
+    /* an unknown logging key never sets the format */
+    {
+        char j[512];
+        (void)snprintf(j, sizeof(j), "%s%s}", BASE,
+                       "\"logging\":{\"format\\u0000x\":\"json\"}");
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.logging.format = MOQR_CLI_LOG_JSON;
+        if (parse(j, &cfg, err, sizeof(err)) == MOQR_OK ||
+            cfg.logging.format == MOQR_CLI_LOG_JSON) {
+            printf("  a NUL-suffixed format key selected json\n");
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/* -- the /api/v1/info document ----------------------------------------------
+ *
+ * A FINITE projection of the configuration: exact bytes for a dual-listener
+ * fixture, no secret under any key, exact-fit and one-byte-short capacity,
+ * the renderer's bound honoured, and whole-document refusal of a configured
+ * string that is not complete UTF-8. */
+static int
+info_inputs(const moqr_cli_config_t *cfg, moqr_cli_shard_plan_t *plan,
+            moqr_shards_cfg_t *scfg, moqr_shards_limits_t *lim,
+            moqr_cli_capacity_t *cap, moqr_cli_info_inputs_t *in)
+{
+    char perr[192];
+    if (moqr_cli_shard_plan(cfg, plan, perr, sizeof(perr)) != MOQR_OK) {
+        printf("  info: the shard plan refused: %s\n", perr);
+        return 1;
+    }
+    /* The same pure builders serve and capacity use, with the allocator the
+     * resolver requires to size a log record. */
+    moqr_cli_build_shards_cfg(cfg, moq_alloc_default(), scfg);
+    if (moqr_shards_cfg_resolve(scfg, lim) != MOQR_OK) {
+        printf("  info: the resolver refused\n");
+        return 1;
+    }
+    if (moqr_cli_describe_capacity(cfg, moq_alloc_default(), 0, cap) != MOQR_OK) {
+        printf("  info: describe_capacity refused\n");
+        return 1;
+    }
+    in->cfg = cfg;
+    in->plan = plan;
+    in->limits = lim;
+    in->capacity = cap;
+    in->dual_listener_build = true;
+    in->verify_build = false;
+    return 0;
+}
+
+static int
+test_info_document(void)
+{
+    int failures = 0;
+    char err[192];
+    static moqr_cli_config_t cfg;
+    moqr_cli_shard_plan_t plan;
+    moqr_shards_cfg_t scfg;
+    moqr_shards_limits_t lim;
+    moqr_cli_capacity_t cap;
+    moqr_cli_info_inputs_t in;
+    static char doc[16384];
+    static char want[16384];
+    size_t len = 0;
+    /* Distinctive values everywhere, canaries in every secret. The WT path
+     * carries a quote so escaping is exercised on a real configured string. */
+    static const char *J =
+        "{\"listener\":{\"host\":\"10.0.0.7\",\"port\":4433,"
+        "\"versions\":[16,18],\"lanes\":2,"
+        "\"cert\":\"/tmp/CANARY-raw-cert.pem\",\"key\":\"/tmp/CANARY-raw-key.pem\"},"
+        "\"webtransport\":{\"host\":\"10.0.0.8\",\"port\":4434,\"path\":\"/moq\\\"p\","
+        "\"versions\":[18],\"lanes\":1,"
+        "\"cert\":\"/tmp/CANARY-wt-cert.pem\",\"key\":\"/tmp/CANARY-wt-key.pem\"},"
+        "\"admin\":{\"tcp\":{\"port\":9109}}}";
+
+    if (parse(J, &cfg, err, sizeof(err)) != MOQR_OK) {
+        printf("  info: the dual fixture was rejected: %s\n", err);
+        return 1;
+    }
+    failures += info_inputs(&cfg, &plan, &scfg, &lim, &cap, &in);
+    if (failures != 0) {
+        return failures;
+    }
+    if (moqr_cli_info_render(&in, doc, sizeof(doc), &len) != MOQR_OK) {
+        printf("  info: the render refused a valid configuration\n");
+        return failures + 1;
+    }
+    /* The EXACT document. Numbers come from the same resolved structs the
+     * renderer was given; the structure, keys, order, escaping and every
+     * string value are stated here independently. */
+    (void)snprintf(want, sizeof(want),
+        "{\"api\":\"v1\",\"relay\":\"moq5-relay\","
+        "\"build\":{\"dual_listener\":true,\"verify\":false},"
+        "\"listeners\":["
+        "{\"kind\":\"raw\",\"host\":\"10.0.0.7\",\"port\":4433,\"transport\":\"msquic\","
+        "\"offered_versions\":[\"moqt-16\",\"moqt-18\"],\"alpn_set\":\"moqt-16+moqt-18\","
+        "\"lanes\":2,\"shards\":{\"first\":0,\"count\":2}},"
+        "{\"kind\":\"webtransport\",\"host\":\"10.0.0.8\",\"port\":4434,"
+        "\"path\":\"/moq\\\"p\",\"profile\":\"current\",\"transport\":\"wtquic-msquic\","
+        "\"offered_subprotocols\":[\"moqt-18\"],\"alpn_set\":\"moqt-18\","
+        "\"lanes\":1,\"shards\":{\"first\":2,\"count\":1}}],"
+        "\"admin\":{\"host\":\"127.0.0.1\",\"port\":9109,"
+        "\"targets\":[\"/metrics\",\"/api/v1/info\",\"/api/v1/shards\"],\"clients\":%u,\"banks\":%u},"
+        "\"insecure_skip_verify\":false,"
+        "\"budgets\":{\"core\":{\"max_bindings\":%u,\"max_tracks\":%u,\"max_subs\":%u,"
+        "\"max_ns_nodes\":%u,\"max_ns_subs\":%u,\"max_intents\":%u,"
+        "\"name_intern_bytes\":%u,\"log_max_subgroups\":%u,"
+        "\"log_max_objects_per_group\":%u,\"log_max_cursors\":%u,\"linger_us\":%llu},"
+        "\"telemetry\":{\"trace_ring_records\":%u},"
+        "\"cross_shard\":{\"pools_active\":true,"
+        "\"configured_overrides\":{\"journal_entries\":%u,\"mailbox_entries\":%u,"
+        "\"demand_channel_entries\":%u,\"pending_demands\":%u,\"subgroup_slots\":%u,"
+        "\"demand_channel_bytes\":%llu},"
+        "\"resolved\":{\"shards\":%u,\"admit\":%s,\"mailbox_cap\":%u,\"journal_cap\":%u,"
+        "\"pending_cap\":%u,\"demand_channel_cap\":%u,\"demand_channel_byte_cap\":%llu,"
+        "\"subgroup_slots\":%u,\"trace_ring\":%u,\"pump_turn_messages\":%u,"
+        "\"pump_turn_bytes\":%llu,\"usable_bindings\":%u}}},"
+        "\"capacity\":{\"model\":\"allocator-request-ceiling\",\"total_bytes\":%llu,"
+        "\"per_shard\":{\"core_structure\":%llu,\"core_payload\":%llu,"
+        "\"bind_structure\":%llu,\"trace\":%llu},"
+        "\"cross_shard_bytes\":%llu,\"cli_runtime_bytes\":%llu,\"admin_bytes\":%llu,"
+        "\"usable_bindings_per_shard\":%u,"
+        "\"reservations\":{\"admin_thread_stack_bytes\":%llu}}}",
+        (unsigned)MOQR_ADMIN_MAX_CLIENTS, (unsigned)MOQR_ADMIN_BANKS,
+        cfg.core.max_bindings, cfg.core.max_tracks, cfg.core.max_subs,
+        cfg.core.max_ns_nodes, cfg.core.max_ns_subs, cfg.core.max_intents,
+        cfg.core.name_intern_bytes, cfg.core.log_max_subgroups,
+        cfg.core.log_max_objects_per_group, cfg.core.log_max_cursors,
+        (unsigned long long)cfg.core.linger_us,
+        cfg.telemetry.trace_ring_records,
+        cfg.cross_shard.journal_entries, cfg.cross_shard.mailbox_entries,
+        cfg.cross_shard.demand_channel_entries, cfg.cross_shard.pending_demands,
+        cfg.cross_shard.subgroup_slots,
+        (unsigned long long)cfg.cross_shard.demand_channel_bytes,
+        (unsigned)lim.shards, lim.admit ? "true" : "false", lim.mbox_cap,
+        lim.jrn_cap, lim.pend_cap, lim.dch_cap,
+        (unsigned long long)lim.dch_byte_cap, lim.sg_slots, lim.trace_ring,
+        lim.pump_turn_msgs, (unsigned long long)lim.pump_turn_bytes,
+        lim.usable_bindings,
+        (unsigned long long)cap.total_bytes,
+        (unsigned long long)cap.core_structure_bytes,
+        (unsigned long long)cap.core_payload_bytes,
+        (unsigned long long)cap.bind_structure_bytes,
+        (unsigned long long)cap.trace_bytes,
+        (unsigned long long)cap.cross_shard_bytes,
+        (unsigned long long)cap.cli_runtime_bytes,
+        (unsigned long long)cap.admin_bytes,
+        cap.usable_bindings_per_shard,
+        (unsigned long long)cap.admin_thread_stack_bytes);
+    if (strcmp(doc, want) != 0 || len != strlen(want)) {
+        size_t i = 0;
+        while (doc[i] != '\0' && want[i] != '\0' && doc[i] == want[i]) {
+            i++;
+        }
+        printf("  info: the document differs from the stated bytes at %zu:\n"
+               "    got  [%.80s]\n    want [%.80s]\n", i, doc + i, want + i);
+        failures++;
+    }
+    /* No secret, under any key. The canaries were configured in every
+     * secret field; none may appear anywhere in the document. */
+    if (strstr(doc, "CANARY") != NULL || strstr(doc, ".pem") != NULL) {
+        printf("  info: a secret value reached the document\n");
+        failures++;
+    }
+    if (strstr(doc, "\"cert\"") != NULL || strstr(doc, "\"key\"") != NULL ||
+        strstr(doc, "\"auth\"") != NULL || strstr(doc, "alpns") != NULL) {
+        printf("  info: a forbidden key reached the document\n");
+        failures++;
+    }
+    /* Exact fit: a body of N bytes needs N + 1; N refuses as CAPACITY, and
+     * more room never breaks a document that fitted. */
+    {
+        size_t n2 = 0;
+        if (moqr_cli_info_render(&in, doc, len + 1u, &n2) != MOQR_OK || n2 != len) {
+            printf("  info: cap = N + 1 did not fit the document\n");
+            failures++;
+        }
+        if (moqr_cli_info_render(&in, doc, len, &n2) != MOQR_ERR_CAPACITY ||
+            doc[0] != '\0') {
+            printf("  info: cap = N was not refused as CAPACITY with nothing left\n");
+            failures++;
+        }
+        if (moqr_cli_info_render(&in, doc, len + 100u, &n2) != MOQR_OK || n2 != len) {
+            printf("  info: extra capacity broke the document\n");
+            failures++;
+        }
+    }
+    if ((uint64_t)len > moqr_cli_info_bound()) {
+        printf("  info: the document (%zu) exceeds the renderer's bound (%llu)\n",
+               len, (unsigned long long)moqr_cli_info_bound());
+        failures++;
+    }
+    return failures;
+}
+
+/* The widest configuration the parser admits still fits the bound, and one
+ * that is not complete UTF-8 is refused whole. */
+static int
+test_info_bound_and_refusal(void)
+{
+    int failures = 0;
+    char err[192];
+    static moqr_cli_config_t cfg;
+    moqr_cli_shard_plan_t plan;
+    moqr_shards_cfg_t scfg;
+    moqr_shards_limits_t lim;
+    moqr_cli_capacity_t cap;
+    moqr_cli_info_inputs_t in;
+    static char doc[65536];
+    static char j[4096];
+    size_t len = 0;
+    /* 255-byte hosts and path made entirely of quotes: every byte escapes
+     * to two; the parser admits them (they are strings of the right length). */
+    static char wide[256];
+    memset(wide, '"', 255);
+    wide[255] = '\0';
+    {
+        /* In JSON source a quote is written \" so the parser's copy is 255
+         * raw quotes. */
+        static char esc[512];
+        size_t k = 0;
+        for (size_t i = 0; i < 254; i++) {
+            esc[k++] = '\\';
+            esc[k++] = '"';
+        }
+        esc[k] = '\0';
+        /* 254 quotes: the hosts take one more byte than the path, whose
+         * leading '/' fills its array to the same 255-byte maximum. */
+        (void)snprintf(j, sizeof(j),
+            "{\"listener\":{\"host\":\"\\\"%s\",\"port\":65535,\"versions\":[16,18],\"lanes\":4},"
+            "\"webtransport\":{\"host\":\"\\\"%s\",\"port\":65535,\"path\":\"/%s\","
+            "\"versions\":[16,18],\"lanes\":2,\"cert\":\"c\",\"key\":\"k\","
+            "\"profile\":\"d02_rfc9297_compat\","
+            "\"origin_policy\":\"allowlist\","
+            "\"allowed_origins\":[\"https://zqx-info-5512.example\"]},"
+            "\"admin\":{\"tcp\":{\"port\":65535}}}", esc, esc, esc);
+    }
+    if (parse(j, &cfg, err, sizeof(err)) != MOQR_OK) {
+        printf("  info-bound: the wide fixture was rejected: %s\n", err);
+        return 1;
+    }
+    failures += info_inputs(&cfg, &plan, &scfg, &lim, &cap, &in);
+    if (failures != 0) {
+        return failures;
+    }
+    if (moqr_cli_info_render(&in, doc, sizeof(doc), &len) != MOQR_OK) {
+        printf("  info-bound: the wide configuration was refused\n");
+        failures++;
+    } else if ((uint64_t)len > moqr_cli_info_bound()) {
+        printf("  info-bound: the wide document (%zu) exceeds the bound (%llu)\n",
+               len, (unsigned long long)moqr_cli_info_bound());
+        failures++;
+    } else {
+        size_t n2 = 0;
+        /* the longest profile label reaches the document */
+        if (strstr(doc, "\"profile\":\"d02_rfc9297_compat\"") == NULL) {
+            printf("  info-bound: the document does not carry the profile\n");
+            failures++;
+        }
+        /*
+         * Authorization configuration is published nowhere.
+         *
+         * The fixture configures a policy and a distinctive Origin, so a
+         * document that names either -- by key or by value -- is leaking
+         * operator authorization state to every reader of /api/v1/info.
+         */
+        if (strstr(doc, "origin_policy") != NULL ||
+            strstr(doc, "allowed_origins") != NULL ||
+            strstr(doc, "allowlist") != NULL ||
+            strstr(doc, "zqx-info-5512") != NULL) {
+            printf("  info-bound: the document leaked Origin authorization "
+                   "configuration\n");
+            failures++;
+        }
+        /* exactly enough room, and one byte short */
+        if (moqr_cli_info_render(&in, doc, len + 1u, &n2) != MOQR_OK ||
+            n2 != len) {
+            printf("  info-bound: an exactly-sized buffer was refused\n");
+            failures++;
+        }
+        if (moqr_cli_info_render(&in, doc, len, &n2) != MOQR_ERR_CAPACITY) {
+            printf("  info-bound: a one-byte-short buffer was not refused\n");
+            failures++;
+        }
+    }
+    /* A configured host holding a raw 0xff: the parser copies it; the
+     * document boundary refuses the whole document as INVAL. */
+    {
+        static const char bad[] =
+            "{\"listener\":{\"host\":\"h\xff\",\"port\":4433,\"versions\":[18]},"
+            "\"admin\":{\"tcp\":{\"port\":9109}}}";
+        if (parse(bad, &cfg, err, sizeof(err)) != MOQR_OK) {
+            printf("  info-bound: the parser refused the 0xff fixture (%s); the "
+                   "boundary refusal cannot be reached\n", err);
+            failures++;
+        } else {
+            failures += info_inputs(&cfg, &plan, &scfg, &lim, &cap, &in);
+            memset(doc, 'x', 16);
+            if (moqr_cli_info_render(&in, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+                doc[0] != '\0' || len != 0) {
+                printf("  info-bound: a configured string that is not UTF-8 was "
+                       "not refused whole\n");
+                failures++;
+            }
+        }
+    }
+    return failures;
+}
+
+/* The bound is a maximum over SIX-byte expansion: a parser-admitted
+ * configuration whose hosts and path are entirely control bytes (written as
+ * JSON escapes in the source) renders, fits the bound, and fits the owner's
+ * bound + 1 allocation. A bound measured over two-byte quotes fails this. */
+static int
+test_info_six_byte_expansion(void)
+{
+    int failures = 0;
+    char err[192];
+    static moqr_cli_config_t cfg;
+    moqr_cli_shard_plan_t plan;
+    moqr_shards_cfg_t scfg;
+    moqr_shards_limits_t lim;
+    moqr_cli_capacity_t cap;
+    moqr_cli_info_inputs_t in;
+    static char esc[255 * 6 + 1];
+    static char j[6000];
+    static char doc[65536];
+    char *owned;
+    size_t len = 0, owned_len = 0;
+    uint64_t bound = moqr_cli_info_bound();
+
+    for (size_t i = 0; i < 255; i++) {
+        memcpy(esc + i * 6, "\\u001f", 6);
+    }
+    esc[sizeof(esc) - 1] = '\0';
+    (void)snprintf(j, sizeof(j),
+        "{\"listener\":{\"host\":\"%s\",\"port\":65535,\"versions\":[16,18],\"lanes\":4},"
+        "\"webtransport\":{\"host\":\"%s\",\"port\":65535,\"path\":\"/%s\","
+        "\"versions\":[16,18],\"lanes\":2,\"cert\":\"c\",\"key\":\"k\"},"
+        "\"admin\":{\"tcp\":{\"port\":65535}}}", esc, esc, esc + 6);
+    if (parse(j, &cfg, err, sizeof(err)) != MOQR_OK) {
+        printf("  six-byte: the control-byte fixture was rejected: %s\n", err);
+        return 1;
+    }
+    failures += info_inputs(&cfg, &plan, &scfg, &lim, &cap, &in);
+    if (failures != 0) {
+        return failures;
+    }
+    if (moqr_cli_info_render(&in, doc, sizeof(doc), &len) != MOQR_OK) {
+        printf("  six-byte: the renderer refused a valid configuration\n");
+        return failures + 1;
+    }
+    if (strstr(doc, "\\u001f\\u001f") == NULL) {
+        printf("  six-byte: the control bytes were not escaped to six\n");
+        failures++;
+    }
+    if (bound == UINT64_MAX || (uint64_t)len > bound) {
+        printf("  six-byte: the document (%zu) exceeds the bound (%llu)\n", len,
+               (unsigned long long)bound);
+        failures++;
+    }
+    /* Exactly what the owner allocates. */
+    owned = malloc((size_t)bound + 1u);
+    if (owned == NULL) {
+        printf("  six-byte: no memory for the owner-sized buffer\n");
+        return failures + 1;
+    }
+    if (moqr_cli_info_render(&in, owned, (size_t)bound + 1u, &owned_len) != MOQR_OK ||
+        owned_len != len) {
+        printf("  six-byte: the owner-sized buffer could not hold the document\n");
+        failures++;
+    }
+    free(owned);
+    /* The bound fits the machine's finite document contract. */
+    if (bound + 1u > (uint64_t)MOQR_ADMIN_MAX_STATIC_DOC) {
+        printf("  six-byte: the bound (%llu) exceeds the finite document limit\n",
+               (unsigned long long)bound);
+        failures++;
+    }
+    return failures;
+}
+
+/* Every refusal leaves nothing usable in a supplied output, the early ones
+ * included; a NULL or zero-capacity output is never written. */
+static int
+test_info_refusals_clear_output(void)
+{
+    int failures = 0;
+    char err[192];
+    static moqr_cli_config_t cfg;
+    moqr_cli_shard_plan_t plan;
+    moqr_shards_cfg_t scfg;
+    moqr_shards_limits_t lim;
+    moqr_cli_capacity_t cap;
+    moqr_cli_info_inputs_t in, broken;
+    char doc[64];
+    size_t len = 7;
+    static const char *J =
+        "{\"listener\":{\"port\":4433,\"versions\":[18]},"
+        "\"admin\":{\"tcp\":{\"port\":9109}}}";
+
+    if (parse(J, &cfg, err, sizeof(err)) != MOQR_OK) {
+        printf("  clear: fixture rejected: %s\n", err);
+        return 1;
+    }
+    failures += info_inputs(&cfg, &plan, &scfg, &lim, &cap, &in);
+    memcpy(doc, "previous", 9);
+    if (moqr_cli_info_render(NULL, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+        doc[0] != '\0' || len != 0) {
+        printf("  clear: a NULL input left [%s] (len %zu)\n", doc, len);
+        failures++;
+    }
+    broken = in;
+    broken.limits = NULL;
+    memcpy(doc, "previous", 9);
+    len = 7;
+    if (moqr_cli_info_render(&broken, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+        doc[0] != '\0' || len != 0) {
+        printf("  clear: a missing member left [%s] (len %zu)\n", doc, len);
+        failures++;
+    }
+    broken = in;
+    broken.capacity = NULL;
+    memcpy(doc, "previous", 9);
+    if (moqr_cli_info_render(&broken, doc, sizeof(doc), NULL) != MOQR_ERR_INVAL ||
+        doc[0] != '\0') {
+        printf("  clear: a missing capacity left [%s]\n", doc);
+        failures++;
+    }
+    /* No output to clear: refused without touching anything. */
+    if (moqr_cli_info_render(&in, NULL, 64, &len) != MOQR_ERR_INVAL || len != 0 ||
+        moqr_cli_info_render(&in, doc, 0, &len) != MOQR_ERR_INVAL || len != 0) {
+        printf("  clear: a NULL or zero-capacity output was not refused\n");
+        failures++;
+    }
+    return failures;
+}
+
+/* The bound is read-only and reentrant: two threads measuring at once agree
+ * with each other and with a serial measurement, every time. Under TSan this
+ * is where shared scratch would show. */
+static void *
+bound_worker(void *arg)
+{
+    uint64_t *out = (uint64_t *)arg;
+    uint64_t first = moqr_cli_info_bound();
+    for (unsigned i = 1; i < 100u; i++) {
+        if (moqr_cli_info_bound() != first) {
+            first = UINT64_MAX;
+            break;
+        }
+    }
+    *out = first;
+    return NULL;
+}
+
+/* The worker acquisition seam. Ordinarily the real pthread calls; a case can
+ * refuse the Nth create, or refuse the join, to drive the partial-acquisition
+ * paths deterministically. Every successful real join is counted, so a test
+ * can prove a worker was settled rather than assume it. */
+static unsigned g_bound_fail_create_at;   /* 0: never                     */
+static int      g_bound_fail_join;        /* nonzero: refuse every join   */
+static unsigned g_bound_creates;
+static unsigned g_bound_joins;
+
+static int
+bound_thread_create(pthread_t *th, void *(*fn)(void *), void *arg)
+{
+    if (++g_bound_creates == g_bound_fail_create_at) {
+        return EAGAIN;
+    }
+    return pthread_create(th, NULL, fn, arg);
+}
+
+static int
+bound_thread_join(pthread_t th)
+{
+    int rc;
+    if (g_bound_fail_join) {
+        return EINVAL;   /* refused: the thread is NOT proved dead */
+    }
+    rc = pthread_join(th, NULL);
+    if (rc == 0) {
+        g_bound_joins++;
+    }
+    return rc;
+}
+
+/* Run the pair. Returns 0 when both workers measured, or 1 when a worker
+ * could not be started -- and in that case every worker that WAS started has
+ * been settled before this returns, so no worker can reach the caller's
+ * storage afterwards. */
+typedef struct owned_worker {
+    pthread_t th;
+    bool      owned;
+} owned_worker_t;
+
+/* Settle every owned worker. A join that succeeds proves the worker dead and
+ * releases its claim on the caller's storage. A join that does not is not a
+ * settled worker, and returning past storage that worker can still reach is
+ * not an option: the process stops here, before any teardown. Every worker
+ * still owned at that point is detached first -- the abandonment is
+ * deliberate, not a forgotten handle. */
+static void
+bound_settle_all(owned_worker_t *w, size_t n)
+{
+    static const char msg[] =
+        "  bound: a worker could not be joined and can still reach this "
+        "frame; stopping before teardown\n";
+    for (size_t i = 0; i < n; i++) {
+        if (!w[i].owned) {
+            continue;
+        }
+        if (bound_thread_join(w[i].th) != 0) {
+            for (size_t k = 0; k < n; k++) {
+                if (w[k].owned) {
+                    (void)pthread_detach(w[k].th);
+                    w[k].owned = false;
+                }
+            }
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1u);
+            _exit(90);
+        }
+        w[i].owned = false;
+    }
+}
+
+static int
+bound_pair(uint64_t *ra, uint64_t *rb)
+{
+    owned_worker_t w[2] = { { 0 }, { 0 } };
+
+    if (bound_thread_create(&w[0].th, bound_worker, ra) != 0) {
+        printf("  bound: could not start the first worker\n");
+        return 1;   /* nothing acquired */
+    }
+    w[0].owned = true;
+    if (bound_thread_create(&w[1].th, bound_worker, rb) != 0) {
+        printf("  bound: could not start the second worker\n");
+        bound_settle_all(w, 1);   /* the first still reaches ra */
+        return 1;
+    }
+    w[1].owned = true;
+    bound_settle_all(w, 2);
+    return 0;
+}
+
+static int
+test_info_bound_is_pure(void)
+{
+    int failures = 0;
+    uint64_t ra = 0, rb = 0;
+    uint64_t serial = moqr_cli_info_bound();
+
+    if (serial == UINT64_MAX) {
+        printf("  bound: the measurement refused\n");
+        return 1;
+    }
+    g_bound_fail_create_at = 0;
+    g_bound_fail_join = 0;
+    g_bound_creates = 0;
+    g_bound_joins = 0;
+    if (bound_pair(&ra, &rb) != 0) {
+        printf("  bound: the pair refused with real threads available\n");
+        return 1;
+    }
+    if (g_bound_joins != 2u) {
+        printf("  bound: %u of 2 workers were settled\n", g_bound_joins);
+        failures++;
+    }
+    if (ra != serial || rb != serial) {
+        printf("  bound: concurrent measurements disagree (%llu, %llu, serial "
+               "%llu)\n", (unsigned long long)ra, (unsigned long long)rb,
+               (unsigned long long)serial);
+        failures++;
+    }
+    return failures;
+}
+
+/* PARTIAL ACQUISITION SETTLES WHAT IT ACQUIRED.
+ *
+ * A refused first create owns nothing. A refused second create owns one live
+ * worker holding a pointer into this frame; that worker must be joined before
+ * the frame is left. A refused join proves nothing about the worker, so the
+ * only correct outcome is a stop before teardown -- exercised in a child so
+ * the suite goes on. */
+static int
+test_info_bound_workers_settle_on_partial_acquisition(void)
+{
+    int failures = 0;
+    uint64_t serial = moqr_cli_info_bound();
+    uint64_t ra, rb;
+
+    /* First create refused: nothing was acquired, nothing to settle. */
+    ra = rb = 0;
+    g_bound_fail_create_at = 1;
+    g_bound_fail_join = 0;
+    g_bound_creates = 0;
+    g_bound_joins = 0;
+    if (bound_pair(&ra, &rb) != 1 || g_bound_creates != 1u ||
+        g_bound_joins != 0u) {
+        printf("  settle[first]: refused create 1: creates %u joins %u\n",
+               g_bound_creates, g_bound_joins);
+        failures++;
+    }
+    /* Second create refused: the first worker is live and must be settled
+     * before the pair returns -- proved by its real join and by its result
+     * having landed. */
+    ra = rb = 0;
+    g_bound_fail_create_at = 2;
+    g_bound_creates = 0;
+    g_bound_joins = 0;
+    if (bound_pair(&ra, &rb) != 1 || g_bound_creates != 2u) {
+        printf("  settle[second]: refused create 2: creates %u\n",
+               g_bound_creates);
+        failures++;
+    }
+    if (g_bound_joins != 1u || ra != serial) {
+        printf("  settle[second]: the first worker was not settled before the "
+               "pair returned (joins %u, result %llu)\n", g_bound_joins,
+               (unsigned long long)ra);
+        failures++;
+    }
+    /* A refused join: the worker is not proved dead, so the pair must stop
+     * the process before teardown rather than return past its storage. */
+    {
+        pid_t pid;
+        int status = 0;
+        fflush(stdout);
+        pid = fork();
+        if (pid < 0) {
+            printf("  settle[join]: no fork\n");
+            return failures + 1;
+        }
+        if (pid == 0) {
+            uint64_t ca = 0, cb = 0;
+            g_bound_fail_create_at = 0;
+            g_bound_fail_join = 1;
+            g_bound_creates = 0;
+            g_bound_joins = 0;
+            (void)bound_pair(&ca, &cb);
+            _exit(3);   /* returned past a worker it could not prove dead */
+        }
+        if (waitpid(pid, &status, 0) != pid) {
+            printf("  settle[join]: could not reap the child\n");
+            failures++;
+        } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 90) {
+            printf("  settle[join]: a refused join did not stop the process "
+                   "(status %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            failures++;
+        }
+    }
+    g_bound_fail_create_at = 0;
+    g_bound_fail_join = 0;
+    return failures;
+}
+
+/* -- the /api/v1/shards document, pure ----------------------------------------
+ *
+ * Max-width counters at lanes 1 and MOQR_SHARDS_MAX fit the bound; exact
+ * fit and one-byte-short; an absent row omits shard_plane; a row whose shard
+ * plane contradicts its core is refused whole; an unknown transport label is
+ * refused; a label that is not UTF-8 is refused. */
+static int
+test_shards_document_pure(void)
+{
+    int failures = 0;
+    static moqr_core_stats_t core;
+    static moqr_bind_stats_t bind;
+    static moqr_shards_stats_t shard;
+    static moqr_snapshot_view_t views[MOQR_SHARDS_MAX];
+    static char doc[1 << 20];
+    size_t len = 0;
+
+    memset(&core, 0xff, sizeof(core));
+    memset(&bind, 0xff, sizeof(bind));
+    memset(&shard, 0xff, sizeof(shard));
+    for (uint32_t i = 0; i < MOQR_SHARDS_MAX; i++) {
+        views[i].core = &core;
+        views[i].bind = &bind;
+        views[i].shard = &shard;
+        views[i].labels.shard = UINT16_MAX;
+        views[i].labels.transport = "wtquic-msquic";
+        views[i].labels.version = "moqt-16+moqt-18+moqt-16+moqt-18";
+        views[i].lane_wakes = UINT64_MAX;
+    }
+    for (uint32_t lanes = 1; lanes <= MOQR_SHARDS_MAX; lanes += MOQR_SHARDS_MAX - 1u) {
+        uint64_t bound = moqr_cli_shards_bound(lanes);
+        if (moqr_cli_shards_render(views, lanes, UINT64_MAX, doc, sizeof(doc), &len) != MOQR_OK) {
+            printf("  shards-pure: lanes %u refused\n", lanes);
+            failures++;
+            continue;
+        }
+        if (bound == UINT64_MAX || (uint64_t)len > bound) {
+            printf("  shards-pure: lanes %u: %zu bytes exceed the bound %llu\n",
+                   lanes, len, (unsigned long long)bound);
+            failures++;
+        }
+        if (moqr_cli_shards_render(views, lanes, UINT64_MAX, doc, len + 1u, NULL) != MOQR_OK ||
+            moqr_cli_shards_render(views, lanes, UINT64_MAX, doc, len, NULL) != MOQR_ERR_CAPACITY ||
+            doc[0] != '\0') {
+            printf("  shards-pure: lanes %u: exact fit / one short misbehaved\n", lanes);
+            failures++;
+        }
+        if (strstr(doc, "\"listener\":\"webtransport\"") == NULL) {
+            /* doc was cleared by the refusal above; re-render to inspect */
+        }
+    }
+    (void)moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len);
+    if (strstr(doc, "\"epoch\":9,") == NULL ||
+        strstr(doc, "\"capability\":\"valid\"") == NULL ||
+        strstr(doc, "\"shard_plane\":{") == NULL ||
+        strstr(doc, "\"lane_wakes\":18446744073709551615") == NULL ||
+        strstr(doc, "\"listener\":\"webtransport\"") == NULL) {
+        printf("  shards-pure: a valid row is wrong: [%.200s]\n", doc);
+        failures++;
+    }
+    /* Absent: no shard plane, never fabricated. */
+    views[0].shard = NULL;
+    views[0].labels.transport = "msquic";
+    if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) != MOQR_OK ||
+        strstr(doc, "\"capability\":\"absent\"") == NULL ||
+        strstr(doc, "shard_plane") != NULL || strstr(doc, "lane_wakes") != NULL ||
+        strstr(doc, "\"listener\":\"raw\"") == NULL) {
+        printf("  shards-pure: an absent row is wrong: [%.200s]\n", doc);
+        failures++;
+    }
+    /* Out-of-range lane counts refuse; so does an unknown transport. */
+    if (moqr_cli_shards_render(views, 0u, 9u, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+        moqr_cli_shards_render(views, MOQR_SHARDS_MAX + 1u, 9u, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+        moqr_cli_shards_bound(0) != UINT64_MAX ||
+        moqr_cli_shards_bound(MOQR_SHARDS_MAX + 1u) != UINT64_MAX) {
+        printf("  shards-pure: lane bounds were not enforced\n");
+        failures++;
+    }
+    views[0].labels.transport = "quiche";
+    memcpy(doc, "stale", 6);
+    if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+        doc[0] != '\0' || len != 0) {
+        printf("  shards-pure: an unknown transport was not refused whole\n");
+        failures++;
+    }
+    views[0].labels.transport = "msquic";
+    views[0].labels.version = "moqt\xff";
+    if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) != MOQR_ERR_INVAL) {
+        printf("  shards-pure: a label that is not UTF-8 was accepted\n");
+        failures++;
+    }
+    views[0].labels.version = "moqt-18";
+    /* A shard plane that contradicts its core row is refused, as the metrics
+     * renderer refuses it: more internal bindings than bindings. */
+    {
+        static moqr_core_stats_t small;
+        static moqr_shards_stats_t plane;
+        memset(&small, 0, sizeof(small));
+        memset(&plane, 0, sizeof(plane));
+        small.bindings = 2;
+        plane.internal_bindings = 3;
+        views[0].core = &small;
+        views[0].shard = &plane;
+        memcpy(doc, "stale", 6);
+        if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) != MOQR_ERR_INVAL ||
+            doc[0] != '\0') {
+            printf("  shards-pure: a contradictory shard plane was rendered\n");
+            failures++;
+        }
+        plane.internal_bindings = 2;
+        if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) != MOQR_OK) {
+            printf("  shards-pure: an equal internal count was refused\n");
+            failures++;
+        }
+    }
+    return failures;
+}
+
+/* -- admin capacity accounting ---------------------------------------------
+ *
+ * Every configured dimension must move the model, in BOTH lane-count branches,
+ * and the fixed thread stack is reported separately from allocator-owned
+ * bytes because it is not an allocator request. */
+static int
+test_admin_capacity(void)
+{
+    int failures = 0;
+    char err[192];
+    static const char *L1 = "{\"listener\":{\"port\":4433,\"versions\":[18]}";
+    static const char *L4 =
+        "{\"listener\":{\"port\":4433,\"versions\":[18],\"lanes\":4}";
+
+    for (int branch = 0; branch < 2; branch++) {
+        const char *base = branch == 0 ? L1 : L4;
+        const char *what = branch == 0 ? "lanes=1" : "lanes>1";
+        moqr_cli_config_t off_cfg, on_cfg;
+        moqr_cli_capacity_t off_cap, on_cap;
+        char j[512];
+
+        (void)snprintf(j, sizeof(j), "%s}", base);
+        if (parse(j, &off_cfg, err, sizeof(err)) != MOQR_OK) {
+            printf("  %s: disabled fixture rejected: %s\n", what, err);
+            failures++;
+            continue;
+        }
+        (void)snprintf(j, sizeof(j), "%s,\"admin\":{\"tcp\":{\"port\":9109}}}",
+                       base);
+        if (parse(j, &on_cfg, err, sizeof(err)) != MOQR_OK) {
+            printf("  %s: enabled fixture rejected: %s\n", what, err);
+            failures++;
+            continue;
+        }
+        if (moqr_cli_describe_capacity(&off_cfg, NULL, 0, &off_cap) != MOQR_OK ||
+            moqr_cli_describe_capacity(&on_cfg, NULL, 0, &on_cap) != MOQR_OK) {
+            printf("  %s: describe_capacity refused a valid config\n", what);
+            failures++;
+            continue;
+        }
+        /* Enabling the endpoint must cost allocator-owned bytes. */
+        if (on_cap.admin_bytes == 0u) {
+            printf("  %s: an enabled admin endpoint accounted 0 bytes\n", what);
+            failures++;
+        }
+        if (off_cap.admin_bytes != 0u) {
+            printf("  %s: a disabled admin endpoint accounted %llu bytes\n",
+                   what, (unsigned long long)off_cap.admin_bytes);
+            failures++;
+        }
+        if (on_cap.cli_runtime_bytes <= off_cap.cli_runtime_bytes) {
+            printf("  %s: enabling admin did not raise cli_runtime_bytes\n",
+                   what);
+            failures++;
+        }
+        if (on_cap.total_bytes <= off_cap.total_bytes) {
+            printf("  %s: enabling admin did not raise the printed ceiling\n",
+                   what);
+            failures++;
+        }
+        /* The admin term is counted exactly once. */
+        if (on_cap.cli_runtime_bytes - off_cap.cli_runtime_bytes !=
+            on_cap.admin_bytes) {
+            printf("  %s: the admin term is not counted exactly once "
+                   "(delta=%llu, term=%llu)\n", what,
+                   (unsigned long long)(on_cap.cli_runtime_bytes -
+                                        off_cap.cli_runtime_bytes),
+                   (unsigned long long)on_cap.admin_bytes);
+            failures++;
+        }
+        /* The thread stack is reported SEPARATELY: it is a reservation, not an
+         * allocator request, so it must not be folded into the ceiling. */
+        if (on_cap.admin_thread_stack_bytes == 0u) {
+            printf("  %s: no admin thread stack reservation was reported\n",
+                   what);
+            failures++;
+        }
+        if (off_cap.admin_thread_stack_bytes != 0u) {
+            printf("  %s: a disabled endpoint reserved a thread stack\n", what);
+            failures++;
+        }
+        /* Exact, not a magnitude comparison: the banks are legitimately
+         * larger than the stack, so "the delta exceeds the stack" proves
+         * nothing. The ceiling must move by the allocator term ALONE. */
+        if (on_cap.total_bytes - off_cap.total_bytes != on_cap.admin_bytes) {
+            printf("  %s: the ceiling moved by %llu, not by the allocator "
+                   "term %llu -- the stack reservation was folded in\n", what,
+                   (unsigned long long)(on_cap.total_bytes -
+                                        off_cap.total_bytes),
+                   (unsigned long long)on_cap.admin_bytes);
+            failures++;
+        }
+        /* EXACT, not bracketing. The allocator term is the one listener
+         * object plus both bodies in both banks, and nothing else. This is
+         * recomputed here from the layout and the checked renderer bound, so a
+         * dropped term, an extra term, a wrong bank count or a folded-in stack
+         * each fail on their own. */
+        {
+            uint32_t lanes = moqr_cli_total_lanes(&on_cfg);
+            uint64_t b1 = 0, b2 = 0;
+            if (moqr_metrics_bound(lanes, MOQR_OBS_FMT_OPENMETRICS_100, true,
+                                   true, &b1) != MOQR_OK ||
+                moqr_metrics_bound(lanes, MOQR_OBS_FMT_PROMETHEUS_004, true,
+                                   true, &b2) != MOQR_OK) {
+                printf("  %s: the renderer bound could not be computed\n", what);
+                failures++;
+            } else {
+                uint64_t b3 = moqr_cli_shards_bound(lanes);
+                /* Three bodies per bank: both metrics formats and the shards
+                 * JSON document, each with its terminator. */
+                uint64_t banks = ((b1 + 1u) + (b2 + 1u) + (b3 + 1u)) * MOQR_ADMIN_BANKS;
+                /* ...plus the coordinator's own frozen-projection body for
+                 * the signal sink, one Prometheus document wide. */
+                /* ...and the coordinator's immutable /api/v1/info document,
+                 * one bound wide plus its terminator. */
+                uint64_t want = banks + (b2 + 1u) + (moqr_cli_info_bound() + 1u) +
+                                (uint64_t)sizeof(struct moqr_admin_listen) +
+                                (uint64_t)lanes *
+                                    ((uint64_t)sizeof(moqr_cli_snapshot_stats_t) +
+                                     (uint64_t)sizeof(moqr_snapshot_view_t));
+                if (on_cap.admin_bytes != want) {
+                    printf("  %s: admin_bytes is %llu, not the exact term "
+                           "%llu (object %llu + banks %llu)\n", what,
+                           (unsigned long long)on_cap.admin_bytes,
+                           (unsigned long long)want,
+                           (unsigned long long)sizeof(struct moqr_admin_listen),
+                           (unsigned long long)banks);
+                    failures++;
+                }
+                if (on_cap.admin_thread_stack_bytes !=
+                    (uint64_t)MOQR_CLI_ADMIN_STACK_BYTES) {
+                    printf("  %s: the stack reservation is %llu, not %llu\n",
+                           what,
+                           (unsigned long long)on_cap.admin_thread_stack_bytes,
+                           (unsigned long long)MOQR_CLI_ADMIN_STACK_BYTES);
+                    failures++;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
+
+    failures += test_admin_config();
+    failures += test_admin_capacity();
+    failures += test_info_document();
+    failures += test_info_bound_and_refusal();
+    failures += test_info_six_byte_expansion();
+    failures += test_info_refusals_clear_output();
+    failures += test_info_bound_is_pure();
+    failures += test_shards_document_pure();
+    failures += test_info_bound_workers_settle_on_partial_acquisition();
     moqr_cli_config_t cfg;
     char err[128];
 
@@ -1057,13 +2243,16 @@ main(void)
         MOQ_TEST_CHECK_EQ_U64(p1.bind_structure_bytes,
                               p2.bind_structure_bytes);
         /* lanes=1 is the direct composition: core + bind + trace, no shard
-         * container, no CLI runtime bytes. */
+         * container, plus the one permanent snapshot row the single-lane
+         * serve keeps so every lane count renders through one path. */
         MOQ_TEST_CHECK_EQ_U64(p1.cross_shard_bytes, 0);
-        MOQ_TEST_CHECK_EQ_U64(p1.cli_runtime_bytes, 0);
+        MOQ_TEST_CHECK_EQ_U64(p1.cli_runtime_bytes,
+                              moqr_cli_snapshot_bytes(1u));
         MOQ_TEST_CHECK_EQ_U64(p1.total_bytes, p1.core_structure_bytes +
                                                   p1.core_payload_bytes +
                                                   p1.bind_structure_bytes +
-                                                  p1.trace_bytes);
+                                                  p1.trace_bytes +
+                                                  p1.cli_runtime_bytes);
         MOQ_TEST_CHECK(p2.trace_bytes > p1.trace_bytes);
         MOQ_TEST_CHECK_EQ_U64(p2.trace_bytes - p1.trace_bytes,
                               (uint64_t)(8192 - 1024) *
@@ -1614,6 +2803,8 @@ main(void)
     failures += test_snapshot_protocol_mt();
     failures += test_snapshot_coord_production();
     failures += test_snapshot_coord_failures();
+    failures += test_k1_counts_its_snapshot_row();
+    failures += test_logging_config();
 
     MOQ_TEST_PASS("relay_cli_config");
     return failures == 0 ? 0 : 1; /* exit status truncates to 8 bits */

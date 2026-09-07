@@ -60,10 +60,11 @@ strip_c() {
 
 code=$(strip_c "$src")
 
-# The readiness record is a string literal, so it cannot be found in stripped
-# source. Its LINE is located in the raw file, then required to be executable
-# (i.e. the stripped line still carries the printf call it belongs to).
-ready_raw=$(grep -n 'listening on' "$src" | cut -d: -f1)
+# The readiness record is published through the serve log (the "listening on"
+# text lives in the sink's formatter). Its LINE is located in the raw file,
+# then required to be executable (i.e. the stripped line still carries the
+# call it belongs to).
+ready_raw=$(grep -n 'moqr_cli_serve_log_readiness(&log' "$src" | cut -d: -f1)
 
 # -- function extraction ----------------------------------------------------
 # Body of a top-level function: from its definition line to the closing brace
@@ -111,9 +112,9 @@ check_path() {
         fail "$fn: expected exactly one readiness record, found $count"
         return
     fi
-    # the readiness line must still be executable after stripping (a printf
-    # call remains); a bare comment mentioning it would strip to blanks
-    if ! printf '%s\n' "$code" | sed -n "${ready_here}p" | grep -q 'printf'; then
+    # the readiness line must still be executable after stripping (the call
+    # remains); a bare comment mentioning it would strip to blanks
+    if ! printf '%s\n' "$code" | sed -n "${ready_here}p" | grep -q 'moqr_cli_serve_log_readiness('; then
         fail "$fn: the readiness record on line $ready_here is not executable"
         return
     fi

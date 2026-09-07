@@ -1,6 +1,10 @@
 #ifndef MOQR_CLI_CONN_REAP_H
 #define MOQR_CLI_CONN_REAP_H
 
+#ifdef MOQR_DUAL_LISTENER
+#include <moq/wtquic_msquic_managed.h>
+#endif
+
 /*
  * The one production retirement pass for managed connections. Every lane pump
  * calls it, so a change cannot reach one pump and miss another, and tests
@@ -52,5 +56,20 @@ typedef struct moqr_reap_stats {
  */
 bool moqr_relay_reap_pass(moqr_bind_t *bind, moq_msquic_managed_lane_t *lane,
                           moqr_reap_stats_t *st);
+
+#ifdef MOQR_DUAL_LISTENER
+/*
+ * The same retirement pass for the WebTransport facade.
+ *
+ * A separate function, and deliberately not a generic one: a lane handle is
+ * only meaningful to the facade that produced it, and the two facades' lane
+ * and connection types are unrelated. Keeping them apart at the type level is
+ * what makes "acknowledge the terminal on the facade that owns it" a
+ * compile-time property rather than a convention.
+ */
+bool moqr_relay_reap_pass_wt(moqr_bind_t *bind,
+                             moq_wtquic_msquic_managed_lane_t *lane,
+                             moqr_reap_stats_t *st);
+#endif
 
 #endif /* MOQR_CLI_CONN_REAP_H */

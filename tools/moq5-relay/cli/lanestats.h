@@ -1,6 +1,12 @@
 #ifndef MOQR_CLI_LANESTATS_H
 #define MOQR_CLI_LANESTATS_H
 
+#include <moqrelay/types.h>
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 /*
  * Per-lane attribution row: the managed-MsQuic adapter's doorbell counters
  * joined with the same lane's shard-plane counters, emitted once per lane
@@ -147,6 +153,50 @@ bool moqr_cli_pair_stats_record(const char *const *lines, size_t nlines,
 /* The run-config record (one per relay log, emitted at serve start). */
 int moqr_cli_run_config_format(char *buf, size_t n,
                                const moqr_cli_run_config_row_t *row);
+
+/*
+ * The SAME three records as JSON events, driven by the same key tables and
+ * getters as the text formatters (so a key exists in both outputs or in
+ * neither). `elapsed_valid`/`elapsed_us` are supplied by the caller and
+ * rendered as an unsigned integer, or `null` when not valid; no clock is
+ * read here. Body length excluding the terminating NUL in *out_len on
+ * MOQR_OK; MOQR_ERR_CAPACITY when the body does not fit `cap` (with room
+ * for the NUL); MOQR_ERR_INVAL for a NULL argument or a refusal reason that
+ * is not one of the closed vocabulary. Nothing usable is left on refusal.
+ */
+moqr_result_t moqr_cli_lane_stats_json(char *buf, size_t cap,
+                                       bool elapsed_valid, uint64_t elapsed_us,
+                                       const moqr_cli_lane_stats_row_t *row,
+                                       size_t *out_len);
+moqr_result_t moqr_cli_lane_stats_refused_json(char *buf, size_t cap,
+                                               bool elapsed_valid,
+                                               uint64_t elapsed_us,
+                                               uint32_t lane,
+                                               const char *which,
+                                               size_t *out_len);
+moqr_result_t moqr_cli_pair_stats_json(char *buf, size_t cap,
+                                       bool elapsed_valid, uint64_t elapsed_us,
+                                       const moqr_cli_pair_stats_row_t *row,
+                                       size_t *out_len);
+moqr_result_t moqr_cli_pair_stats_refused_json(char *buf, size_t cap,
+                                               bool elapsed_valid,
+                                               uint64_t elapsed_us,
+                                               uint32_t src, uint32_t dst,
+                                               const char *which,
+                                               size_t *out_len);
+moqr_result_t moqr_cli_run_config_json(char *buf, size_t cap,
+                                       bool elapsed_valid, uint64_t elapsed_us,
+                                       const moqr_cli_run_config_row_t *row,
+                                       size_t *out_len);
+moqr_result_t moqr_cli_run_config_refused_json(char *buf, size_t cap,
+                                               bool elapsed_valid,
+                                               uint64_t elapsed_us,
+                                               const char *which,
+                                               size_t *out_len);
+/* The number of numeric fields each record carries (39 / 5 / 4). */
+size_t moqr_cli_lane_stats_field_count(void);
+size_t moqr_cli_pair_stats_field_count(void);
+size_t moqr_cli_run_config_field_count(void);
 moqr_cli_lane_stats_kind_t moqr_cli_run_config_parse(
     const char *line, moqr_cli_run_config_row_t *row);
 

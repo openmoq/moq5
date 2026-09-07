@@ -12,9 +12,11 @@ set -u
 
 prefix="${1:-}"
 srcroot="${2:-}"
-# Where the command's shared dependencies live. A dynamically linked command
-# needs its dependencies resolvable; what it must NOT carry is a path into the
-# build tree, which is checked separately below.
+# Where the command's EXTERNAL prebuilt dependencies live, as a colon-separated
+# list of directories. A dynamically linked command needs them resolvable at run
+# time, and the relay does not install libraries it did not build. What it must
+# NOT carry is a path into the build tree, which is checked separately below and
+# is unaffected by this.
 deplib="${3:-}"
 if [ ! -d "$prefix" ] || [ ! -d "$srcroot" ]; then
     echo "FAIL: usage: $0 <staged-prefix> <source-root> [dependency-libdir]" >&2
@@ -51,6 +53,8 @@ installed=$(cd "$prefix" && find . -type f -o -type l | sed 's|^\./||' | sort)
 # -- 3. documentation and one inert example --------------------------------
 printf '%s\n' "$installed" | grep -q "share/man/man1/moq5-relay.1" ||
     fail "missing man page share/man/man1/moq5-relay.1"
+printf '%s\n' "$installed" | grep -q "share/man/man5/moq5-relay.json.5" ||
+    fail "missing man page share/man/man5/moq5-relay.json.5"
 printf '%s\n' "$installed" | grep -q "share/doc/moq5-relay/README.md" ||
     fail "missing share/doc/moq5-relay/README.md"
 printf '%s\n' "$installed" | grep -q "share/doc/moq5-relay/examples/" ||

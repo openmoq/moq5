@@ -1,0 +1,506 @@
+.TH MOQ5\-RELAY.JSON 5 "September 7, 2026" "MOQ5 Relay" "File Formats Manual"
+.SH NAME
+moq5\-relay.json \- MOQ5 Relay configuration format
+.SH SYNOPSIS
+.nf
+\fBmoq5\-relay serve \-\-config\fR \fIfile\fR
+\fBmoq5\-relay capacity \-\-config\fR \fIfile\fR
+.fi
+.SH DESCRIPTION
+The file passed to
+.BR moq5\-relay (1)
+is a JSON object describing the relay's listeners, bounded storage, telemetry,
+and authorization policy. There is no implicit file name or search path.
+.PP
+The parser is strict. Unknown keys, wrong JSON types, unsupported enum values,
+negative numbers, duplicate version entries, and values outside their bounds
+are errors. The file may be at most 65,535 bytes. Configuration is loaded once
+at startup; it is not reloaded after a signal.
+.PP
+Unless stated otherwise, pool sizes are non\-negative integers. Zero selects
+the library default. Entry counts may not exceed 1,048,576 and byte budgets may
+not exceed 1 TiB. Cross\-field validation can impose a tighter bound.
+.SH TOP-LEVEL OBJECT
+The following keys are recognized:
+.TP
+.B listener
+Required object. Configures the raw QUIC listener.
+.TP
+.B webtransport
+Optional object. Configures a second listener carrying MoQ over WebTransport.
+.TP
+.B admin
+Optional object. Configures the loopback admin endpoint.
+.TP
+.B budgets
+Optional object. Sets bounded relay pool and retention capacities.
+.TP
+.B telemetry
+Optional object. Sets observability storage bounds.
+.TP
+.B logging
+Optional object. Selects the output format for the
+.B serve
+command.
+.TP
+.B auth
+Optional object. Selects the bundled authorization policy. When absent, the
+relay allows all requests.
+.TP
+.B linger_us
+Time in microseconds to retain an upstream track after its last subscriber
+leaves. Zero, the default, unsubscribes on the next relay tick.
+.SH RAW QUIC LISTENER
+The
+.B listener
+object accepts:
+.TP
+.B transport
+Optional string. The only accepted value is
+.BR "msquic" .
+.TP
+.B host
+Local address to bind. The default is
+.BR "0.0.0.0" .
+.TP
+.B port
+Required integer from 1 through 65535.
+.TP
+.B cert
+Path to the PEM server certificate. Required by
+.B serve
+but not by
+.BR capacity .
+.TP
+.B key
+Path to the PEM private key. Required by
+.B serve
+but not by
+.BR capacity .
+.TP
+.B versions
+Ordered, nonempty array containing unique integers from the set
+.BR {18,16} .
+The first entry is the server's preferred draft. The default is
+.BR [18] .
+A single entry creates an exact\-version listener; multiple entries advertise
+multiple ALPNs on the same listener.
+.TP
+.B lanes
+Number of independent lock\-domain lanes for this listener, from 1 through 64.
+The default is 1. A multi\-lane relay enables the cross\-shard demand plane.
+.TP
+.B insecure_skip_verify
+Optional boolean transport setting. The default is false. It is intended for
+controlled demonstrations and tests, not production verification policy.
+.SH WEBTRANSPORT LISTENER
+The presence of a
+.B webtransport
+object enables the second listener. The running program must have been built
+with wtquic support; otherwise the configuration is refused.
+.TP
+.B host
+Local address to bind. The default is
+.BR "0.0.0.0" .
+.TP
+.B port
+Required integer from 1 through 65535.
+.TP
+.B cert
+Required path to this listener's PEM server certificate.
+.TP
+.B key
+Required path to this listener's PEM private key.
+.TP
+.B lanes
+Number of lanes owned by this listener, from 1 through 64. The default is 1.
+The sum of
+.B listener.lanes
+and
+.B webtransport.lanes
+must not exceed 64.
+.TP
+.B path
+Origin\-form HTTP request path. It must begin with a slash. The default is
+.BR "/moq" .
+.TP
+.B versions
+Ordered, nonempty array of unique MoQ drafts from the set
+.BR {18,16} .
+They are offered as WebTransport subprotocols, with the server's most preferred
+draft first. The default is
+.BR [18,16] .
+.TP
+.B profile
+WebTransport\-over\-HTTP/3 dialect. This is independent of the MoQ draft in
+.BR versions .
+The accepted values are:
+.RS
+.TP
+.B current
+Current WebTransport\-over\-HTTP/3 signaling. This is the default.
+.TP
+.B d13_14_compat
+Compatibility signaling for the drafts\-13/14 family.
+.TP
+.B d02_rfc9297_compat
+Opt\-in signaling using the draft\-02 request marker with RFC 9297
+quarter\-stream\-ID datagrams. The name selects what the listener emits; no
+compatibility with any particular client is promised.
+.RE
+.PP
+Selecting
+.B d02_rfc9297_compat
+requires
+.B origin_policy
+to be set to something other than
+.BR unset .
+.TP
+.B origin_policy
+How the serialized Origin a client presents is authorized. The accepted values
+are:
+.RS
+.TP
+.B unset
+No Origin rule is applied. This is the default.
+.TP
+.B allow_any_non_opaque
+Any valid tuple origin is accepted; the opaque
+.B null
+origin is rejected.
+.TP
+.B allowlist
+Only an exact byte match against
+.B allowed_origins
+is accepted.
+.TP
+.B allow_any_including_null
+Any valid tuple origin is accepted, and so is the opaque
+.B null
+origin.
+.RE
+.TP
+.B allowed_origins
+An array of 1 to 8 exact Origin strings, each at most 320 bytes and 512 bytes
+in total including terminators. Accepted only when
+.B origin_policy
+is
+.BR allowlist ,
+and required by it: writing a list under any other policy is an error rather
+than a value that is ignored, and an empty array is not a list. Entries are
+compared byte for byte and are never normalized, so the value must be written
+exactly as the client sends it.
+.SH ADMIN ENDPOINT
+The endpoint is disabled when
+.B admin
+is absent. The following forms are accepted:
+.PP
+.nf
+"admin": { "enabled": false }
+.fi
+.PP
+or:
+.PP
+.nf
+"admin": {
+  "tcp": { "host": "127.0.0.1", "port": 9109 }
+}
+.fi
+.PP
+The optional
+.B enabled
+member is a boolean. Setting it to false is valid only when no endpoint is
+configured. Setting it to true does not make the required
+.B tcp
+object optional.
+.PP
+The
+.B admin.tcp
+object accepts:
+.TP
+.B host
+Optional loopback IP literal. The default is
+.BR "127.0.0.1" .
+IPv4 addresses in 127.0.0.0/8 and the IPv6 loopback address are accepted.
+Names, wildcards, IPv4\-mapped IPv6 spellings, and non\-loopback addresses are
+refused.
+.TP
+.B port
+Required integer from 1 through 65535.
+.PP
+The endpoint serves exactly
+.BR "GET /metrics" ,
+.B "GET /api/v1/info"
+and
+.BR "GET /api/v1/shards" ;
+the two API resources are JSON only. It has no authentication and cannot be
+configured for remote binding. For
+.B /metrics
+a missing
+.B Accept
+header selects OpenMetrics 1.0; Prometheus text format 0.0.4 is also available
+through HTTP content negotiation.
+.SH BUDGETS
+Every member of
+.B budgets
+is optional. The direct pool keys are:
+.TP
+.B max_tracks
+Tracks per shard. Default 64.
+.TP
+.B max_subs
+Subscriptions per shard. Default 256.
+.TP
+.B max_bindings
+Session bindings per shard. Default 64. A multi\-shard runtime reserves binding
+slots for its managers, so the usable external count may be lower.
+.TP
+.B max_ns_nodes
+Namespace trie nodes per shard. Default 256.
+.TP
+.B max_ns_subs
+Namespace subscriptions per shard. Default 64.
+.TP
+.B max_intents
+Pending intent records per shard. Default 64.
+.TP
+.B name_intern_bytes
+Bytes reserved for interned namespaces and track names. Default 65536.
+.TP
+.B log_max_subgroups
+Subgroups represented per retained group. Default 16.
+.TP
+.B log_max_objects
+Objects represented per retained group. Default 4096.
+.TP
+.B log_max_cursors
+Concurrent retained\-log cursors. Default 64.
+.TP
+.B log_max_chunk_nodes
+Nodes available for chunked open records. Default 8192.
+.SS Retained log
+The
+.B budgets.log
+object accepts:
+.TP
+.B max_groups
+Retained groups per track. Default 8.
+.TP
+.B max_bytes
+Retained payload bytes per track. Default 8388608.
+.TP
+.B max_age_us
+Maximum retained group age in microseconds. Zero, the default, disables
+age\-based eviction; the count and byte limits still apply.
+.SS Cross-shard plane
+The
+.B budgets.cross_shard
+object is accepted at every lane count but allocates cross\-shard machinery
+only when the total lane count exceeds one. It accepts:
+.TP
+.B journal_entries
+Namespace journal entries per shard. Zero derives the default from
+.BR max_ns_nodes .
+.TP
+.B mailbox_entries
+Control entries per directed shard mailbox. Default 256.
+.TP
+.B demand_channel_entries
+Entries per directed demand channel. Zero derives the default from
+.BR pending_demands .
+.TP
+.B demand_channel_bytes
+Data bytes per directed demand channel. Zero derives the default from one
+resolved retained\-log payload budget. A nonzero value smaller than one legal
+resolved log record is refused.
+.TP
+.B pending_demands
+Remote\-demand table entries per shard. Zero derives the default from
+.BR max_tracks .
+.TP
+.B subgroup_slots
+Chunk\-progress slots per demand. Zero selects the binding's resolved open
+subgroup limit.
+.SH LOGGING
+The
+.B logging
+object accepts:
+.TP
+.B format
+.B text
+(the default) or
+.BR json .
+.IP
+.B text
+keeps standard output exactly as it is: the readiness lines, the
+.B RELAY_RUN_CONFIG_V1
+operating\-point row, the post\-join
+.B RELAY_LANE_STATS_V3
+and
+.B RELAY_PAIR_STATS_V1
+rows, the stop lines and the capacity ceiling; standard error keeps its
+existing diagnostics.
+.IP
+.B json
+applies to
+.B serve
+only:
+.BR capacity ,
+.B help
+and
+.B version
+stay text. It makes the serve's standard output carry exactly one JSON
+object per line and nothing else. Every row and banner becomes an event:
+.B RELAY_READY_V1
+(one per listener, one for the admin endpoint, one for the signal contract),
+.BR RELAY_RUN_CONFIG_V1 ,
+.BR RELAY_LANE_STATS_V3 ,
+.B RELAY_PAIR_STATS_V1
+and
+.BR RELAY_STOP_V1 ,
+each with a
+.B schema
+member naming its versioned record and an
+.B elapsed_us
+member: microseconds since the log was opened, or
+.B null
+when the monotonic clock could not supply a trustworthy sample. Numeric
+fields keep the names of the text rows; a record the relay cannot supply is
+an explicit
+.B refused
+member, never zeros. The WebTransport readiness event names that listener's
+own offered set and its configured
+.BR profile ;
+naming the configured profile says nothing about what any browser
+negotiated. The capacity ceiling and every human message move to standard
+error.
+.IP
+Each event is rendered whole, then written and flushed once. On the first
+short write, write error or failed flush the sink stops: no later record is
+submitted, and one best\-effort diagnostic goes to standard error. Bytes
+already handed to the stream cannot be taken back, so a final partial line
+may remain after an I/O failure; a consumer must treat an unterminated last
+line as absent. A successful flush hands the bytes to the operating system;
+it is not durable delivery to any reader. If standard output is a pipe whose
+reader has gone and
+.B SIGPIPE
+is unblocked at its default disposition, the process terminates on the
+write; the relay does not set that signal's disposition or mask. The verify
+and measure builds refuse
+.B json
+for
+.BR serve ;
+.B capacity
+is unaffected.
+.SH TELEMETRY
+The
+.B telemetry
+object accepts:
+.TP
+.B trace_ring_records
+Number of recent scalar trace records retained per shard. Zero selects the
+library default. The ring is always active; this key changes its bounded depth.
+.SH AUTHORIZATION
+When the
+.B auth
+object is absent, the relay installs no authorization hook and allows all
+requests. When present,
+.B auth.mode
+is required.
+.SS Allow all
+.nf
+"auth": { "mode": "allow_all" }
+.fi
+.PP
+The
+.B default
+and
+.B rules
+members are not valid in this mode.
+.SS Toy policy
+The
+.B toy
+mode is a bounded deterministic action\-and\-namespace policy. It performs no
+cryptographic token validation and is not a production identity system.
+.TP
+.B default
+Required fallback decision,
+.B allow
+or
+.BR deny .
+.TP
+.B rules
+Optional array of at most 32 rule objects. Rules are evaluated in array order;
+the first match wins.
+.PP
+Each rule accepts:
+.TP
+.B action
+Required string. One of
+.BR client_setup ,
+.BR server_setup ,
+.BR publish_namespace ,
+.BR subscribe_namespace ,
+.BR subscribe ,
+.BR request_update ,
+.BR publish ,
+.BR fetch ,
+or
+.BR track_status .
+.TP
+.B namespace_prefix
+Optional array of zero through eight strings, each at most 64 bytes. An empty
+array matches any namespace.
+.TP
+.B decision
+Required value
+.B allow
+or
+.BR deny .
+.B defer
+cannot be authored in this configuration format.
+.TP
+.B reason
+Optional reason associated with the decision. The default is
+.BR policy .
+Accepted values are
+.BR ok ,
+.BR no_token ,
+.BR unscoped ,
+.BR expired ,
+.BR not_yet_valid ,
+.BR bad_issuer ,
+.BR bad_audience ,
+.BR bad_signature ,
+and
+.BR policy .
+.SH EXAMPLE
+.nf
+{
+  "listener": {
+    "host": "0.0.0.0",
+    "port": 4433,
+    "versions": [18, 16],
+    "lanes": 2,
+    "cert": "/etc/moq5\-relay/cert.pem",
+    "key": "/etc/moq5\-relay/key.pem"
+  },
+  "admin": {
+    "tcp": { "host": "127.0.0.1", "port": 9109 }
+  },
+  "budgets": {
+    "max_tracks": 256,
+    "max_subs": 1024,
+    "log": { "max_groups": 8, "max_bytes": 8388608 }
+  },
+  "telemetry": { "trace_ring_records": 4096 },
+  "auth": { "mode": "allow_all" }
+}
+.fi
+.SH FILES
+.TP
+.I /usr/share/doc/moq5-relay/examples/relay.json
+Example configuration under a conventional system prefix. A distribution or a
+custom install prefix may place the documentation elsewhere.
+.SH SEE ALSO
+.BR moq5\-relay (1)

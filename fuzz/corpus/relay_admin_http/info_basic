@@ -1,0 +1,3 @@
+GET /api/v1/info HTTP/1.1
+Host: localhost
+

@@ -94,14 +94,21 @@ tools/moq5-relay/
              agnostic — proven over SimPair by the parity suite, driven by
              the executable over the MsQuic managed lane)
   obs/       observability serializers (moq::relay-obs; links the binding):
-             Prometheus text exporter over core + binding stat snapshots.
+             Prometheus 0.0.4 and OpenMetrics 1.0 expositions over core +
+             binding stat snapshots, selected by an explicit render mode.
              Pure — no I/O, no allocation. Trace JSONL and route dumps live
              with the core state they render.
+  admin/     the bounded HTTP surface (moqr-admin; links moq::relay-obs):
+             a sans-I/O request parser with fixed request/header bounds and
+             a deterministic multi-client state machine over preallocated
+             body banks. No socket, no thread, no per-request allocation
   shard/     bounded multi-shard runtime: placement, announce replication,
              winner enforcement, directed control/demand channels, and the
              deterministic plus concurrent per-shard step seams
   cli/       the moq5-relay executable: JSON config, capacity printout,
-             `serve` over one or more MsQuic managed lanes (one shard/lane)
+             `serve` over one or more MsQuic managed lanes (one shard/lane),
+             the snapshot broker, the loopback admin listener and its two
+             API documents, and the serve log (text or JSON events)
   tests/     unit + scenario + oracle + real-session parity + loopback
   bench/     relay benchmarks (extend benchmarks/ conventions)
 ```
@@ -137,6 +144,21 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   `moq_msquic_managed_conn_session(conn)`. It must **not** call
   `moq_msquic_managed_session()` — that is a client-only convenience and is
   NULL on a server (and outside the pump).
+- **The admin endpoint adds one CLI-owned thread.** With an `admin`
+  section configured, one further thread the CLI owns runs the bounded client
+  state machine on a loopback socket, alongside whatever threads the
+  transport keeps for its lanes. It never touches a session, core, binding,
+  journal or trace: it reads only the rows a lane copied into the snapshot,
+  and renders them into preallocated per-generation storage. Bind and thread
+  start are all-or-nothing before the readiness records, and it is cancelled
+  and joined before any facade stop, facade destroy or snapshot destroy.
+- **One broker serial, separate demand.** Publication identity and output
+  demand are distinct: the broker assigns one snapshot serial that every
+  producer joins, while demand bits say who receives that generation. A
+  scrape therefore never triggers a signal dump, and SIGUSR1 still emits
+  metrics and routes. Two body banks are pinned for the duration of a
+  client's write; a third generation while both are pinned is answered
+  `503`, never truncated. Lanes gather stats only when the serial advances.
 - **Per-connection state lives in `conn_user`** — a small tag (unattached →
   attach to the binding on first sight; attached; dead once the binding
   observes `SESSION_CLOSED` or the connection is refused). Never a map keyed
@@ -221,14 +243,21 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   `moqt-16` from one listener, and ALPN selects each connection's draft.
   A single entry keeps the exact-version representation for byte-stable
   single-draft output.
-- **Signal dumps: lanes own their traversal, the coordinator owns the
-  aggregate.** Multi-lane SIGUSR epochs are latched by lock-free atomics.
-  Each lane renders its own shard's route and journal dumps (SIGUSR1) and
-  trace (SIGUSR2) inside its pump window and PUBLISHES its metrics row; the
-  main-thread coordinator renders exactly ONE multi-shard Prometheus
-  document per epoch from the published rows — it never traverses any live
-  lane's core, bind, journal, route, or trace. Rendering waits until every
-  row carries the newest requested epoch (newest-epoch-only coalescing);
+- **Signal dumps: lanes own their traversal; who owns the aggregate depends
+  on the admin endpoint.** Multi-lane SIGUSR epochs are latched by lock-free
+  atomics. Each lane renders its own shard's route and journal dumps
+  (SIGUSR1) and trace (SIGUSR2) inside its pump window and PUBLISHES its
+  metrics row — that half is lane-owned in every composition. Exactly ONE
+  multi-shard Prometheus document per epoch is then rendered from the
+  published rows, and never by traversing a live lane's core, bind, journal,
+  route or trace. With an admin endpoint configured, the admin thread is the
+  broker's sole owner — including the transaction the latched signal demand
+  opens — and emits that document through the signal sink from the same
+  frozen rows the endpoint served; the main-thread coordinator deliberately
+  does none of it, because two owners on one broker is the defect being
+  avoided. Without an admin endpoint, the main-thread coordinator owns that
+  render itself. Rendering waits until every row carries the newest requested
+  epoch (newest-epoch-only coalescing);
   per-shard series keep their names, process aggregates use separate
   `moqrelay_process_*` names, and a lane's own metrics/stats are read
   through the stats seam (`moqr_shards_get_stats`), with route/journal epochs
@@ -265,7 +294,7 @@ contract row, not just the path text.
 | `moq_handle_pack` family | public packed-handle layout the relay's handle universe reuses | `core/include/moq/types.h:201-226` |
 | Per-request `*_cfg_init` (subscribe/publish/track-status/subscribe-namespace) | these DO fully `memset(sizeof(*cfg))`, zeroing appended fields — a plain init is safe (verified against the checkout) | `session_subscribe.c:2064`, `session_publish.c:591`, `session_track_status.c:386`, `session_namespace_sub.c:488` |
 | `SUBSCRIBE_NAMESPACE` interest | draft-18 carries no interest field on the wire; the profile requires exactly `MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE` (draft-16 accepts 0/1/2) — use NAMESPACE_STATE for portable code | `core/src/session/profile_d18.c:696`; d16 validator `session_namespace_sub.c:539` |
-| MsQuic managed (`moq_msquic_managed_t`) — the production relay transport | create/stop/destroy + `on_lane_pump` lane-thread confinement; multi-connection server; exact single version per facade; `stop`/`wait` refused inside a callback | `adapters/msquic/include/moq/msquic_managed.h` |
+| MsQuic managed (`moq_msquic_managed_t`) — the production relay transport | create/stop/destroy + `on_lane_pump` lane-thread confinement; multi-connection server; a client is exact-version, while a server offers either that one ALPN or an ordered `versions` list and selects per connection (the facade-level negotiated version is then 0; ask the connection inside the pump); `stop`/`wait` refused inside a callback | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_lane_next_conn` / `moq_msquic_managed_conn_session` | lane-local connection iteration + per-conn session, valid only inside `on_lane_pump`; a terminal conn stays visible for the batch delivering `SESSION_CLOSED`, then is reaped; `_conn_close(conn, code)` defers past the pump | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_managed_conn_user` / `_set_user` | per-connection state slot — the relay keys its per-conn binding tag here (never a pointer-keyed map: conn/session pointers can be reused by a successor connection) | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_managed_session` | CLIENT-only convenience — NULL on a SERVER and outside the pump; the relay server must NOT use it, it iterates lane conns instead | `adapters/msquic/include/moq/msquic_managed.h` |
@@ -296,11 +325,15 @@ production would allocate it. A single lane keeps admission structurally
 inert (K=1 builds no manager).
 
 The observability surface includes bounded-cardinality counters (object flow,
-refusals by resource, live entities by state, intent high-water), a Prometheus
-text exporter over core + binding snapshots, JSONL trace, and entity-detailed
-route dumps (epoch triple, announces, namespace watchers, tracks, log
-watermarks, and cursor state). SIGUSR1 emits metrics plus routes and SIGUSR2
-emits trace JSONL; each lane renders only its shard inside `on_lane_pump`. A
+refusals by resource, live entities by state, intent high-water), Prometheus
+0.0.4 and OpenMetrics 1.0 expositions over core + binding snapshots, JSONL
+trace, and entity-detailed route dumps (epoch triple, announces, namespace
+watchers, tracks, log watermarks, and cursor state). SIGUSR1 emits metrics
+plus routes and SIGUSR2 emits trace JSONL. Each lane renders only its own
+shard's routes, journal and trace inside `on_lane_pump`; the one aggregate
+metrics document is rendered from the published rows by whichever owner the
+composition gives the broker — the admin thread when an endpoint is
+configured, the main-thread coordinator otherwise. A
 fixed-bucket forward-latency histogram observes successful downstream writes
 from retained `arrival_us` to delivery time; blocked and failed writes are
 excluded, and a regressed clock saturates to zero.
@@ -344,14 +377,55 @@ Binding close retires the connection's grants, so a later tick never touches a
 torn-down session.
 
 Not yet implemented: cross-shard standalone FETCH (fetch serves only
-shard-local retained logs); an HTTP metrics endpoint (textfile + signal is the
-current surface); external selector-based auth revocation (`AUTH_REVOKE` —
-timer-driven lease revalidation is wired, immediate selector revoke is not);
-and WebTransport.
+shard-local retained logs — the cross-shard message set carries object and
+demand kinds, no fetch kind); external selector-based auth revocation
+(`AUTH_REVOKE` — timer-driven lease revalidation is wired, immediate selector
+revoke is not); qlog, OpenTelemetry export, tenancy or authorization scopes,
+and paged route/session views. A second WebTransport listener exists as
+conditional code, compiled only where the wtquic managed adapter target is
+present and absent from the raw-only build. Nothing here claims browser
+compatibility or a particular negotiated profile for it. Its Origin
+authorization policy and allowlist are resolved from configuration and handed
+to the transport. The explicit native boundary fixture has exercised all ten
+Origin-policy rows over loopback on the supported macOS MsQuic lane, with the
+client verifying a private-CA server certificate and its DNS identity before
+the Origin decision. That proves the configured authorization boundary; it is
+not evidence of browser compatibility or of a browser selecting any particular
+WebTransport profile.
 Cross-shard object admission and the process-wide multi-lane capacity
 calculation are both complete: admission is on for every multi-lane serve
 and the capacity command prints the closed-form process ceiling at any lane
 count.
+
+An optional loopback HTTP endpoint serves three read-only resources from the
+same generations: `GET /metrics` (content-negotiated between the two
+expositions; a missing or `*/*` Accept selects OpenMetrics, an unsatisfiable
+one is `406`), `GET /api/v1/info` (an immutable document of the configuration
+the process is running, from an allowlist that admits no credential path or
+authorization rule), and `GET /api/v1/shards` (one JSON row per shard from the
+frozen snapshot). Any other target is `404`. It is TCP loopback only — a
+non-loopback host is refused at parse time — has no authentication, and is off
+unless configured; the endpoint is part of the relay's health, so an owner
+that stops for any reason but shutdown stops the relay rather than leaving a
+dead surface advertised. A shard row states its capability rather than
+inventing counters: a single-lane serve composes no shard runtime and reports
+`absent` with the core and binding families only, while a refused row poisons
+the generation into a `500`. Storage for every bank, row and document is
+included in the capacity ceiling; the admin thread stack is reported beside it
+as a reservation.
+
+Serve output is text by default, byte for byte as before. `logging.format =
+json` instead makes the serve's standard output one JSON event per line — the
+same versioned records under a `schema` member, with a nullable `elapsed_us` —
+and moves every human message, the capacity ceiling included, to standard
+error. Each event is serialized completely before any of it is emitted, and
+the sink stops for the rest of the run after one diagnostic on the first
+write or flush failure, appending no later event. That is the whole
+guarantee: it is not atomic delivery to stdio or to a reader, and a failed
+write or flush can leave an incomplete final line, so a consumer must treat an
+unterminated last line as absent. A successful flush hands bytes to the
+operating system and is not durable delivery. Ordinary signal output remains
+synchronous and can block on stderr.
 
 Metric naming is deliberately clean-room: a distinct `moqrelay_*` prefix,
 concept-aligned with common relay metrics but not copied from any schema

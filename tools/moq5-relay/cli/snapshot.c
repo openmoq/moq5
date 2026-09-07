@@ -131,11 +131,14 @@ moqr_cli_snapshot_render(moqr_cli_snapshot_t *s, moqr_cli_epoch_fn requested,
         if (rc != MOQR_OK) {
             return rc;   /* incomplete (or bad args): nothing produced */
         }
-        /* A complete set with a refused (poisoned) lane snapshot never
-         * reaches the producer: suppress the whole epoch rather than
-         * render zeroed stand-ins as user-facing numbers. */
+        /* A complete set carrying a refused lane snapshot never reaches the
+         * producer: suppress the whole epoch rather than render zeroed
+         * stand-ins as user-facing numbers. An unknown capability is treated
+         * as a refusal, never as a default — a value this code does not
+         * understand is not evidence that anything is fine. */
         for (uint32_t i = 0; i < s->lanes; i++) {
-            if (!rows[i].shard_stats_valid) {
+            if (rows[i].shard_cap == MOQR_CLI_CAP_REFUSED ||
+                rows[i].shard_cap >= MOQR_CLI_CAP__COUNT) {
                 return MOQR_ERR_INVAL;
             }
         }
@@ -183,9 +186,15 @@ coord_doc_produce(void *vctx, const moqr_cli_snapshot_stats_t *rows,
     coord_doc_t *d = vctx;
     moqr_snapshot_view_t views[MOQR_SHARDS_MAX];
     for (uint32_t i = 0; i < d->lanes; i++) {
+        /* ABSENT means there is no cross-shard plane to report, so the
+         * view carries no shard pointer and the renderer omits those
+         * families entirely. Passing the zeroed struct instead would render
+         * them as measured zeros. */
+        const moqr_shards_stats_t *sh =
+            (rows[i].shard_cap == MOQR_CLI_CAP_VALID) ? &rows[i].shard : NULL;
         views[i] = (moqr_snapshot_view_t){ .core = &rows[i].core,
                                            .bind = &rows[i].bind,
-                                           .shard = &rows[i].shard,
+                                           .shard = sh,
                                            .labels = d->labels[i],
                                            .lane_wakes =
                                                rows[i].lane_wakes };
