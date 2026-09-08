@@ -427,7 +427,7 @@ test_warm_linger_and_status(void)
     moq_bytes_t nsb[2];
     MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
 
-    /* Linger is a pull-source policy.  Establish this track through the
+    /* Linger is a pull-source policy. Establish this track through the
      * announce -> upstream SUBSCRIBE path, not PUBLISH: a live push source
      * remains authoritative until PUBLISH_FINISHED or its binding closes. */
     moqr_subscribe_req_t rq;
@@ -517,7 +517,6 @@ test_stream_error_retire_linger(void)
     MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &s1) == MOQR_OK);
     moq_bytes_t nsb[2];
     MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
-
     /* This clock oracle also needs a pull source: only a pull subscription has
      * a demand-owned linger deadline to release. */
     moqr_subscribe_req_t rq;
@@ -4950,6 +4949,178 @@ test_source_failover_backpressure(void)
     return failures;
 }
 
+static int
+test_push_source_restart_resets_retained_generation(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+
+    moqr_binding_t pub1, pub2, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &pub2) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 300, &sub) == MOQR_OK);
+
+    moq_bytes_t nsb[2];
+    moqr_ns_t ns = NS2(nsb, "restart", "camera");
+    moq_bytes_t name = B("video");
+    moqr_intent_t its[16];
+
+    moqr_track_t first;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub1, ns, name, 11, &first) ==
+                   MOQR_OK);
+    size_t n = drain(c, its, 16);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_PUBLISH);
+    uint64_t first_track_gen = its[0].track_gen;
+
+    MOQ_TEST_CHECK(ing(c, &a, first, 5, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, first, 6, 0, 0, 128) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, first, first_track_gen,
+                                         pd_local(MOQR_PD_TRACK_ENDED),
+                                         CTRL_NOW) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 16), (size_t)0);
+
+    moqr_fetch_req_t fq;
+    moqr_fetch_req_init(&fq);
+    fq.ns = ns;
+    fq.name = name;
+    fq.start_group = 5;
+    fq.start_object = 0;
+    fq.end_group = 6;
+    fq.end_object = 0;
+    fq.cookie = 31;
+    moqr_fetch_t fetch;
+    moqr_fetch_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &fq, CTRL_NOW, &fetch, &plan) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(plan.admit, MOQR_FETCH_ACCEPT);
+    moqr_fetch_item_t item;
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fetch, CTRL_NOW, &item) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(item.kind, MOQR_FETCH_ITEM_OBJECT);
+    MOQ_TEST_CHECK_EQ_U64(item.rec.group_id, 5);
+
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = name;
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.filter.start_group = 5;
+    rq.filter.start_object = 0;
+    rq.cookie = 41;
+    moqr_sub_t old_sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, sub, &rq, &old_sub) == MOQR_OK);
+    n = drain(c, its, 16);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_SUB);
+    MOQ_TEST_CHECK(moqr_sub_is_valid(old_sub));
+
+    moqr_track_t second;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub2, ns, name, 22, &second) ==
+                   MOQR_OK);
+    n = drain(c, its, 16);
+    int sub_done = 0, accept_publish = 0, other = 0;
+    uint64_t second_track_gen = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (its[i].kind == MOQR_INTENT_SUB_DONE && its[i].cookie == 41) {
+            sub_done++;
+            MOQ_TEST_CHECK(its[i].pd.tag == MOQR_CODE_LOCAL);
+            MOQ_TEST_CHECK_EQ_U64(its[i].pd.value, MOQR_PD_TRACK_ENDED);
+        } else if (its[i].kind == MOQR_INTENT_ACCEPT_PUBLISH &&
+                   its[i].cookie == 22) {
+            accept_publish++;
+            second_track_gen = its[i].track_gen;
+        } else {
+            other++;
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(sub_done, 1);
+    MOQ_TEST_CHECK_EQ_INT(accept_publish, 1);
+    MOQ_TEST_CHECK_EQ_INT(other, 0);
+    MOQ_TEST_CHECK(second_track_gen != first_track_gen);
+
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fetch, CTRL_NOW, &item) ==
+                   MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, old_sub, CTRL_NOW) ==
+                   MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(ing(c, &a, first, 7, 0, 0, 128) ==
+                   MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(ing(c, &a, second, 0, 0, 0, 128) == MOQR_OK);
+
+    MOQ_TEST_CHECK(moqr_core_track_status(c, sub, ns, name, 51) == MOQR_OK);
+    n = drain(c, its, 16);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_TRACK_STATUS_OK);
+    MOQ_TEST_CHECK(its[0].has_largest);
+    MOQ_TEST_CHECK_EQ_U64(its[0].largest_group, 0);
+    MOQ_TEST_CHECK_EQ_U64(its[0].largest_object, 0);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("push_source_restart_resets_retained_generation");
+    return failures;
+}
+
+static int
+test_push_source_survives_downstream_linger(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, NULL);
+    MOQ_TEST_CHECK(c != NULL);
+
+    moqr_binding_t pub, sub_b;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 100, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 200, &sub_b) == MOQR_OK);
+
+    moq_bytes_t nsb[2];
+    moqr_ns_t ns = NS2(nsb, "push", "camera");
+    moq_bytes_t name = B("video");
+    moqr_intent_t its[8];
+
+    moqr_track_t track;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, ns, name, 11, &track) ==
+                   MOQR_OK);
+    size_t n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_PUBLISH);
+
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = name;
+    rq.filter.type = MOQR_FILTER_ABSOLUTE_START;
+    rq.cookie = 41;
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, sub_b, &rq, &sub) == MOQR_OK);
+    n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_SUB);
+
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 100) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_tick(c, 1200) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)0);
+    MOQ_TEST_CHECK(ing(c, &a, track, 0, 0, 0, 128) == MOQR_OK);
+
+    MOQ_TEST_CHECK(moqr_core_track_status(c, sub_b, ns, name, 51) == MOQR_OK);
+    n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_TRACK_STATUS_OK);
+    MOQ_TEST_CHECK(its[0].has_largest);
+    MOQ_TEST_CHECK_EQ_U64(its[0].largest_group, 0);
+    MOQ_TEST_CHECK_EQ_U64(its[0].largest_object, 0);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("push_source_survives_downstream_linger");
+    return failures;
+}
+
 /* Post-revocation re-admission at the CORE: a force-withdraw terminates the
  * generation, and a later accepted re-announcement plus a fresh downstream
  * subscription must create a fresh upstream demand and carry data — three
@@ -5719,6 +5890,8 @@ main(void)
     failures += test_source_failover();
     failures += test_readmission_core();
     failures += test_source_failover_backpressure();
+    failures += test_push_source_restart_resets_retained_generation();
+    failures += test_push_source_survives_downstream_linger();
     failures += test_root_full_track_name_core();
     failures += test_empty_namespace_field_rejected_core();
     failures += test_invalid_abandon_record_no_mutation();

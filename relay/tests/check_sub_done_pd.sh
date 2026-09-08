@@ -10,7 +10,7 @@
 # as a miswritten one, and would otherwise pass a "check what you find" scan.
 set -u
 relay_c="$1"
-expected_producers=6
+expected_producers=7
 fail=0
 
 # Executable code only, joined into one stream so a producer split across lines

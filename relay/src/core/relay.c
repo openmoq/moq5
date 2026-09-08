@@ -1515,6 +1515,57 @@ track_free_slot(moqr_core_t *c, uint32_t slot)
 }
 
 static moqr_result_t
+track_make_log(moqr_core_t *c, uint32_t slot, moqr_log_t **out)
+{
+    moqr_log_cfg_t lc;
+    moqr_log_cfg_init_sized(&lc, sizeof(lc), &c->alloc);
+    lc.budget = c->log_budget;
+    lc.max_subgroups_per_group = c->log_max_subgroups;
+    lc.max_objects_per_group = c->log_max_objects;
+    lc.max_cursors = c->log_max_cursors;
+    lc.max_chunk_nodes = c->log_max_chunk_nodes;
+    lc.trace = c->trace;
+    lc.trace_id = slot;
+    return moqr_log_create(&lc, out);
+}
+
+static void
+track_fetch_invalidate(moqr_core_t *c, uint32_t track_slot,
+                       uint32_t track_gen)
+{
+    for (uint32_t fi = 0; fi < c->max_fetches; fi++) {
+        r_fetch_t *f = &c->fetches[fi];
+        if ((f->gen & 1u) != 0 && f->track == track_slot &&
+            f->track_gen_slot == track_gen) {
+            fetch_unpin(c, f);
+            f->gen++;   /* odd -> even */
+        }
+    }
+}
+
+static void
+track_replace_retained_generation(moqr_core_t *c, uint32_t slot,
+                                  moqr_log_t *new_log)
+{
+    r_track_t *t = &c->tracks[slot];
+    uint32_t old_gen = t->gen;
+
+    track_fetch_invalidate(c, slot, old_gen);
+
+    moqr_log_stats_t ls;
+    moqr_log_get_stats(t->log, &ls);
+    c->evicted_freed += ls.evicted_records_total;
+    moqr_log_destroy(t->log);
+    t->log = new_log;
+    t->has_largest = false;
+    t->largest_group = 0;
+    t->largest_object = 0;
+    t->linger_deadline_us = 0;
+    t->gen += 2;   /* odd -> odd: keep slot, invalidate old readers/handles */
+    r_bump_route_epoch(c);
+}
+
+static moqr_result_t
 track_create(moqr_core_t *c, r_key_t *key /* adopted on OK */, uint64_t hash,
              uint32_t *out_slot)
 {
@@ -1530,17 +1581,8 @@ track_create(moqr_core_t *c, r_key_t *key /* adopted on OK */, uint64_t hash,
     }
     r_track_t *t = &c->tracks[slot];
 
-    moqr_log_cfg_t lc;
-    moqr_log_cfg_init_sized(&lc, sizeof(lc), &c->alloc);
-    lc.budget = c->log_budget;
-    lc.max_subgroups_per_group = c->log_max_subgroups;
-    lc.max_objects_per_group = c->log_max_objects;
-    lc.max_cursors = c->log_max_cursors;
-    lc.max_chunk_nodes = c->log_max_chunk_nodes;
-    lc.trace = c->trace;
-    lc.trace_id = slot;
     moqr_log_t *log = NULL;
-    moqr_result_t rc = moqr_log_create(&lc, &log);
+    moqr_result_t rc = track_make_log(c, slot, &log);
     if (rc != MOQR_OK) {
         return rc;
     }
@@ -3628,6 +3670,42 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
             it->error_code = R_ERR_INTERNAL;   /* duplicate active source */
             return MOQR_OK;
         }
+
+        /* A warm pushed track can still carry retained content from a previous
+         * source. Reacquiring the same full track name with PUBLISH creates a
+         * new source generation: old readers are terminated/staled, the log is
+         * replaced, and group 0 is compared against an empty generation. */
+        uint32_t old_subs = track_sub_count(c, tslot);
+        if (!intent_space(c, old_subs + 1u)) {
+            return MOQR_ERR_WOULD_BLOCK;
+        }
+        moqr_log_t *new_log = NULL;
+        rc = track_make_log(c, tslot, &new_log);
+        if (rc != MOQR_OK) {
+            return rc;
+        }
+        uint32_t old_track_gen = t->gen;
+        for (uint32_t i = t->subs_head; i != R_SUB_NIL;) {
+            uint32_t next = c->subs[i].track_next;
+            r_sub_t *s = &c->subs[i];
+            if ((s->gen & 1u) != 0 && s->track == tslot &&
+                s->track_gen_slot == old_track_gen) {
+                uint64_t bcookie = 0;
+                if (s->binding < c->max_bindings &&
+                    c->bindings[s->binding].gen == s->binding_gen) {
+                    bcookie = c->bindings[s->binding].cookie;
+                }
+                moqr_intent_t *it = intent_push(c, MOQR_INTENT_SUB_DONE);
+                it->binding_cookie = bcookie;
+                it->cookie = s->cookie;
+                it->sub = sub_handle(c, i);
+                it->error_code = R_DONE_TRACK_ENDED;
+                it->pd = core_local_done(MOQR_PD_TRACK_ENDED);
+                sub_retire(c, i, 0);
+            }
+            i = next;
+        }
+        track_replace_retained_generation(c, tslot, new_log);
         t->state = R_TRACK_ACTIVE;
         t->source_kind = R_TRACK_SOURCE_PUSH;
         t->track_gen++;
