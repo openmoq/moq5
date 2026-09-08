@@ -11,6 +11,7 @@
  * negotiation, TLS, the catalog subscription, and object parsing.
  *
  * Usage: media_receive <url> <namespace> [track] [--insecure-skip-verify]
+ *                      [--backend NAME] [--draft 16|18]
  *   url        moqt://host:port           (raw QUIC), or
  *              https://host:port/path     (WebTransport)
  *   namespace  slash-separated, e.g. "example" or "live/cam1"
@@ -18,6 +19,9 @@
  *              every catalog track)
  *   --insecure-skip-verify  disable TLS certificate verification; for
  *              LOCAL/self-signed testing ONLY (verification is on by default)
+ *   --backend NAME  explicit endpoint backend: auto, picoquic, msquic, mvfst,
+ *              proxygen, wtquic-msquic, or wtquic-network
+ *   --draft N  pin the offered MoQ draft to exactly 16 or 18
  */
 #include <moq/endpoint.h>
 #include <moq/media_receiver.h>
@@ -27,6 +31,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Async-signal-safe: the handler only sets a flag. The poll loop uses a short
@@ -61,14 +66,62 @@ static size_t split_namespace(char *buf, moq_bytes_t *parts, size_t max)
     return n;
 }
 
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+        "usage: %s <url> <namespace> [track] [--insecure-skip-verify]\n"
+        "       [--backend NAME] [--draft 16|18]\n"
+        "  --backend NAME  auto|picoquic|msquic|mvfst|proxygen|"
+        "wtquic-msquic|wtquic-network\n"
+        "  --draft N       offer exactly draft 16 or 18; omit to negotiate\n"
+        "  --insecure-skip-verify  disable TLS certificate verification\n"
+        "                          (LOCAL/self-signed testing ONLY)\n",
+        prog);
+}
+
+typedef struct backend_row {
+    const char *name;
+    moq_transport_backend_t backend;
+    bool raw_quic;
+    bool webtransport;
+} backend_row_t;
+
+static const backend_row_t k_backends[] = {
+    { "auto",           MOQ_TRANSPORT_BACKEND_AUTO,           true,  true  },
+    { "picoquic",       MOQ_TRANSPORT_BACKEND_PICOQUIC,       true,  true  },
+    { "msquic",         MOQ_TRANSPORT_BACKEND_MSQUIC,         true,  false },
+    { "mvfst",          MOQ_TRANSPORT_BACKEND_MVFST,          true,  false },
+    { "proxygen",       MOQ_TRANSPORT_BACKEND_PROXYGEN,       false, true  },
+    { "wtquic-msquic",  MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC,  false, true  },
+    { "wtquic-network", MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK, false, true  },
+};
+
+static int parse_draft(const char *s)
+{
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (*end != '\0' || (v != 16 && v != 18)) return -1;
+    return (int)v;
+}
+
+static const backend_row_t *find_backend(const char *name)
+{
+    for (size_t i = 0; i < sizeof(k_backends) / sizeof(k_backends[0]); i++)
+        if (strcmp(name, k_backends[i].name) == 0)
+            return &k_backends[i];
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 &&
+        (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        print_usage(argv[0]);
+        return 0;
+    }
     if (argc < 3) {
-        fprintf(stderr,
-            "usage: %s <url> <namespace> [track] [--insecure-skip-verify]\n"
-            "  --insecure-skip-verify  disable TLS certificate verification\n"
-            "                          (LOCAL/self-signed testing ONLY)\n",
-            argv[0]);
+        print_usage(argv[0]);
         return 2;
     }
     const char *url = argv[1];
@@ -77,10 +130,63 @@ int main(int argc, char **argv)
     moq_bytes_t ns_parts[32];
     size_t ns_count = split_namespace(nsbuf, ns_parts, 32);
     bool insecure_skip_verify = false;   /* TLS verification ON by default */
+    const backend_row_t *backend = &k_backends[0];
+    int draft_pin = 0;
     for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--insecure-skip-verify") == 0)
+        if (strcmp(argv[i], "--insecure-skip-verify") == 0) {
             insecure_skip_verify = true;
-        /* other positionals (e.g. track) are informational here */
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            backend = find_backend(argv[++i]);
+            if (!backend) {
+                fprintf(stderr, "unknown backend: %s\n", argv[i]);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--backend=", 10) == 0) {
+            backend = find_backend(argv[i] + 10);
+            if (!backend) {
+                fprintf(stderr, "unknown backend: %s\n", argv[i] + 10);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
+            draft_pin = parse_draft(argv[++i]);
+            if (draft_pin < 0) {
+                fprintf(stderr, "invalid draft: %s\n", argv[i]);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strncmp(argv[i], "--draft=", 8) == 0) {
+            draft_pin = parse_draft(argv[i] + 8);
+            if (draft_pin < 0) {
+                fprintf(stderr, "invalid draft: %s\n", argv[i] + 8);
+                print_usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--help") == 0 ||
+                   strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "unknown flag: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 2;
+        } else {
+            /* Other positionals (e.g. track) are informational here. */
+        }
+    }
+    {
+        bool is_wt = strncmp(url, "https://", 8) == 0;
+        if (is_wt && !backend->webtransport) {
+            fprintf(stderr, "backend %s is raw-QUIC only; use moqt://\n",
+                    backend->name);
+            return 2;
+        }
+        if (!is_wt && !backend->raw_quic) {
+            fprintf(stderr, "backend %s is WebTransport only; use https://\n",
+                    backend->name);
+            return 2;
+        }
     }
 
     signal(SIGINT, on_signal);
@@ -90,15 +196,25 @@ int main(int argc, char **argv)
      *    the operator explicitly passes --insecure-skip-verify (local/self-signed
      *    test relays). Connection completes asynchronously. */
     moq_endpoint_cfg_t ec;
-    moq_endpoint_cfg_init(&ec);
+    moq_endpoint_cfg_init_sized(&ec, sizeof(ec));
     ec.url.data = (const uint8_t *)url;
     ec.url.len = strlen(url);
+    ec.backend = backend->backend;
     ec.insecure_skip_verify = insecure_skip_verify;
+    if (draft_pin != 0) {
+        static moq_version_t pinned;
+        pinned = (moq_version_t)draft_pin;
+        ec.versions.struct_size = sizeof(moq_version_offer_t);
+        ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+        ec.versions.versions = &pinned;
+        ec.versions.version_count = 1;
+    }
 
     moq_endpoint_t *ep = NULL;
     moq_result_t rc = moq_endpoint_connect(&ec, &ep);
     if (rc != MOQ_OK) {
-        fprintf(stderr, "endpoint connect failed: %d\n", (int)rc);
+        fprintf(stderr, "endpoint connect failed: %d (%s)\n",
+                (int)rc, moq_strerror(rc));
         return 1;
     }
 
