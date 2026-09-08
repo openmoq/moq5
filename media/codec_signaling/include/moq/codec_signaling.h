@@ -102,9 +102,8 @@ MOQ_API void moq_codec_init_data_cfg_init(moq_codec_init_data_cfg_t *cfg);
  * Returns MOQ_OK on success; MOQ_ERR_INVAL for bad arguments;
  * MOQ_ERR_BUFFER if buf/cap is too small (*out_len gets the required
  * length); MOQ_ERR_PROTO if the source is malformed for its format;
- * MOQ_ERR_UNSUPPORTED for a stream this build does not parse (an HEVC SPS
- * with sub-layer profile_tier_level, i.e. sps_max_sub_layers_minus1 > 0, or
- * an AV1 sequence header carrying timing_info / a decoder model), or for a
+ * MOQ_ERR_UNSUPPORTED for a stream this build does not parse (an AV1 sequence
+ * header carrying timing_info / a decoder model), or for a
  * valid source the destination record cannot represent (a parameter set
  * longer than 65535 bytes, which the record's 16-bit length field cannot
  * hold), or an input exceeding a fixed internal limit.

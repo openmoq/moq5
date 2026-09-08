@@ -345,6 +345,19 @@ static void bw_u(bw_t *w, uint32_t v, int n)
     }
 }
 
+static void bw_ue(bw_t *w, uint32_t v)
+{
+    uint32_t code = v + 1u;
+    int bits = 0;
+    for (uint32_t t = code; t != 0; t >>= 1) {
+        bits++;
+    }
+    for (int i = 0; i < bits - 1; i++) {
+        bw_u(w, 0, 1);
+    }
+    bw_u(w, code, bits);
+}
+
 static size_t bw_len(const bw_t *w) { return (w->nbits + 7) / 8; }
 
 /* ---- AudioSpecificConfig leading fields (ISO/IEC 14496-3) ----------- */
@@ -512,6 +525,23 @@ static const uint8_t k_hevc_annexb[] = {
     0x08, 0x08, 0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03,
     0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0xc1, 0x72, 0x86,
     0x0c, 0x42, 0x24,
+};
+
+/* HEVC Annex B VPS + SPS + PPS with sps_max_sub_layers_minus1 = 1. */
+static const uint8_t k_hevc_temporal_annexb[] = {
+    0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x03, 0xff, 0xff, 0x01, 0x60,
+    0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00,
+    0x5d, 0x00, 0x00, 0x1b, 0x02, 0x40, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01,
+    0x03, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00,
+    0x00, 0x03, 0x00, 0x5d, 0x00, 0x00, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16,
+    0x20, 0x6e, 0xe4, 0x52, 0x32, 0xe7, 0xe1, 0x3d, 0x0b, 0xea, 0x1b, 0xd5,
+    0x29, 0xa8, 0x10, 0x10, 0x10, 0x1f, 0xc2, 0x01, 0x04, 0x00, 0x00, 0x00,
+    0x01, 0x44, 0x01, 0xc0, 0x72, 0xf0, 0x5b, 0x24,
+};
+
+static const uint8_t k_hevc_temporal_ptl[] = {
+    0x01, 0x60, 0x00, 0x00, 0x00, 0xb0,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x5d,
 };
 
 /* dOps for a stereo 48 kHz stream, mapping family 0. */
@@ -876,8 +906,292 @@ static size_t nal_start(const uint8_t *d, size_t len, int nth)
     abort();
 }
 
+static uint16_t rd16(const uint8_t *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static size_t append_start_code(uint8_t *dst, size_t n)
+{
+    static const uint8_t start[] = { 0x00, 0x00, 0x00, 0x01 };
+    memcpy(dst + n, start, sizeof(start));
+    return n + sizeof(start);
+}
+
+static size_t append_escaped(uint8_t *dst, size_t n, const uint8_t *src, size_t len)
+{
+    int zeros = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = src[i];
+        if (zeros >= 2 && b <= 0x03) {
+            dst[n++] = 0x03;
+            zeros = 0;
+        }
+        dst[n++] = b;
+        zeros = (b == 0) ? zeros + 1 : 0;
+    }
+    return n;
+}
+
+static size_t build_hevc_fixture(uint8_t *dst, uint32_t max_sub,
+                                 uint32_t flagged_sub,
+                                 bool sub_profile_present,
+                                 bool sub_level_present,
+                                 uint32_t chroma, uint32_t bd_luma,
+                                 uint32_t bd_chroma)
+{
+    static const uint8_t vps[] = { 0x40, 0x01 };
+    static const uint8_t pps[] = { 0x44, 0x01 };
+    bw_t rbsp;
+    bw_init(&rbsp);
+
+    bw_u(&rbsp, 0, 4);                   /* sps_video_parameter_set_id */
+    bw_u(&rbsp, max_sub, 3);             /* sps_max_sub_layers_minus1 */
+    bw_u(&rbsp, 1, 1);                   /* sps_temporal_id_nesting */
+    for (size_t i = 0; i < sizeof(k_hevc_temporal_ptl); i++) {
+        bw_u(&rbsp, k_hevc_temporal_ptl[i], 8);
+    }
+    if (max_sub > 0) {
+        for (uint32_t i = 0; i < max_sub && i < 7; i++) {
+            bw_u(&rbsp, (i == flagged_sub && sub_profile_present) ? 1u : 0u, 1);
+            bw_u(&rbsp, (i == flagged_sub && sub_level_present) ? 1u : 0u, 1);
+        }
+        for (uint32_t i = max_sub; i < 8; i++) {
+            bw_u(&rbsp, 0, 2);           /* reserved_zero_2bits */
+        }
+        if (sub_profile_present) {
+            bw_u(&rbsp, 0x9b, 8);
+            bw_u(&rbsp, 0x11223344u, 32);
+            bw_u(&rbsp, 0x556677u, 24);
+            bw_u(&rbsp, 0x8899aau, 24);
+        }
+        if (sub_level_present) {
+            bw_u(&rbsp, 0x5d, 8);
+        }
+    }
+    bw_ue(&rbsp, 0);                     /* sps_seq_parameter_set_id */
+    bw_ue(&rbsp, chroma);
+    bw_ue(&rbsp, 128);                   /* pic_width_in_luma_samples */
+    bw_ue(&rbsp, 72);                    /* pic_height_in_luma_samples */
+    bw_u(&rbsp, 0, 1);                   /* conformance_window_flag */
+    bw_ue(&rbsp, bd_luma);
+    bw_ue(&rbsp, bd_chroma);
+
+    size_t n = 0;
+    n = append_start_code(dst, n);
+    memcpy(dst + n, vps, sizeof(vps)); n += sizeof(vps);
+    n = append_start_code(dst, n);
+    dst[n++] = 0x42; dst[n++] = 0x01;
+    n = append_escaped(dst, n, rbsp.b, bw_len(&rbsp));
+    n = append_start_code(dst, n);
+    memcpy(dst + n, pps, sizeof(pps)); n += sizeof(pps);
+    return n;
+}
+
+static void expect_hvcc_temporal_sub_layers(const moq_codec_init_data_cfg_t *cfg)
+{
+    size_t vps_start = nal_start(k_hevc_temporal_annexb,
+                                 sizeof(k_hevc_temporal_annexb), 0) + 4;
+    size_t sps_start = nal_start(k_hevc_temporal_annexb,
+                                 sizeof(k_hevc_temporal_annexb), 1) + 4;
+    size_t pps_start = nal_start(k_hevc_temporal_annexb,
+                                 sizeof(k_hevc_temporal_annexb), 2) + 4;
+    const uint8_t *nal_p[3] = {
+        k_hevc_temporal_annexb + vps_start,
+        k_hevc_temporal_annexb + sps_start,
+        k_hevc_temporal_annexb + pps_start,
+    };
+    size_t nal_len[3] = {
+        sps_start - 4 - vps_start,
+        pps_start - 4 - sps_start,
+        sizeof(k_hevc_temporal_annexb) - pps_start,
+    };
+    const uint8_t nal_type[3] = { 32, 33, 34 };
+    const size_t want_len = 23 + 3 * 3 + 3 * 2 +
+                            nal_len[0] + nal_len[1] + nal_len[2];
+
+    dest_t d;
+    dest_init(&d, want_len);
+    size_t out_len = OUTLEN_SENTINEL;
+    moq_result_t rc =
+        moq_codec_init_data_build(cfg, dest_ptr(&d), d.cap, &out_len);
+    CHECKF(rc == MOQ_OK, "HEVC sub-layer PTL build returned %s", rcname(rc));
+    CHECKF(out_len == want_len, "HEVC sub-layer PTL hvcC length is %zu, want %zu",
+           out_len == OUTLEN_SENTINEL ? (size_t)0 : out_len, want_len);
+    CHECKF(guards_intact(&d), "HEVC sub-layer PTL build overwrote a guard band");
+    if (rc != MOQ_OK || out_len != want_len) {
+        return;
+    }
+
+    const uint8_t *out = dest_ptr(&d);
+    CHECKF(out[0] == 1, "HEVC sub-layer PTL hvcC version is %u, want 1", out[0]);
+    CHECKF(memcmp(out + 1, k_hevc_temporal_ptl,
+                  sizeof(k_hevc_temporal_ptl)) == 0,
+           "HEVC sub-layer PTL general profile_tier_level was not copied");
+    CHECKF(out[21] == 0x17,
+           "HEVC sub-layer PTL byte 21 is 0x%02x, want 0x17 "
+           "(two temporal layers, temporalIdNested, 4-byte NAL lengths)",
+           out[21]);
+    CHECKF(out[22] == 3, "HEVC sub-layer PTL hvcC array count is %u, want 3",
+           out[22]);
+
+    size_t o = 23;
+    for (size_t i = 0; i < 3; i++) {
+        CHECKF(o + 5 <= out_len, "HEVC sub-layer PTL array %zu header overruns", i);
+        CHECKF(out[o] == (uint8_t)(0x80 | nal_type[i]),
+               "HEVC sub-layer PTL array %zu type is 0x%02x, want 0x%02x",
+               i, out[o], (uint8_t)(0x80 | nal_type[i]));
+        o++;
+        CHECKF(rd16(out + o) == 1,
+               "HEVC sub-layer PTL array %zu count is %u, want 1",
+               i, rd16(out + o));
+        o += 2;
+        CHECKF(rd16(out + o) == nal_len[i],
+               "HEVC sub-layer PTL array %zu NAL length is %u, want %zu",
+               i, rd16(out + o), nal_len[i]);
+        o += 2;
+        CHECKF(o + nal_len[i] <= out_len,
+               "HEVC sub-layer PTL array %zu payload overruns", i);
+        if (o + nal_len[i] <= out_len) {
+            CHECKF(memcmp(out + o, nal_p[i], nal_len[i]) == 0,
+                   "HEVC sub-layer PTL array %zu payload differs", i);
+        }
+        o += nal_len[i];
+    }
+    CHECKF(o == out_len, "HEVC sub-layer PTL hvcC ended at %zu, want %zu",
+           o, out_len);
+}
+
+static void expect_hvcc_generated_profile_level(const uint8_t *src, size_t src_len,
+                                                uint32_t max_sub)
+{
+    size_t vps_start = nal_start(src, src_len, 0) + 4;
+    size_t sps_start = nal_start(src, src_len, 1) + 4;
+    size_t pps_start = nal_start(src, src_len, 2) + 4;
+    const uint8_t *nal_p[3] = {
+        src + vps_start,
+        src + sps_start,
+        src + pps_start,
+    };
+    size_t nal_len[3] = {
+        sps_start - 4 - vps_start,
+        pps_start - 4 - sps_start,
+        src_len - pps_start,
+    };
+    const uint8_t nal_type[3] = { 32, 33, 34 };
+    const size_t want_len = 23 + 3 * 3 + 3 * 2 +
+                            nal_len[0] + nal_len[1] + nal_len[2];
+
+    moq_codec_init_data_cfg_t cfg;
+    moq_codec_init_data_cfg_init(&cfg);
+    cfg.source_format = MOQ_CODEC_SOURCE_HEVC_ANNEXB;
+    cfg.source = bytes(src, src_len);
+
+    dest_t d;
+    dest_init(&d, want_len);
+    size_t out_len = OUTLEN_SENTINEL;
+    moq_result_t rc =
+        moq_codec_init_data_build(&cfg, dest_ptr(&d), d.cap, &out_len);
+    CHECKF(rc == MOQ_OK, "HEVC sub-layer profile/level build returned %s",
+           rcname(rc));
+    CHECKF(out_len == want_len,
+           "HEVC sub-layer profile/level hvcC length is %zu, want %zu",
+           out_len == OUTLEN_SENTINEL ? (size_t)0 : out_len, want_len);
+    CHECKF(guards_intact(&d),
+           "HEVC sub-layer profile/level build overwrote a guard band");
+    if (rc != MOQ_OK || out_len != want_len) {
+        return;
+    }
+
+    const uint8_t *out = dest_ptr(&d);
+    CHECKF(memcmp(out + 1, k_hevc_temporal_ptl,
+                  sizeof(k_hevc_temporal_ptl)) == 0,
+           "HEVC sub-layer profile/level general PTL was not copied");
+    CHECKF(out[15] == 0xfc, "HEVC parallelismType byte is 0x%02x, want 0xfc",
+           out[15]);
+    CHECKF(out[16] == 0xfe, "HEVC chromaFormat byte is 0x%02x, want 0xfe",
+           out[16]);
+    CHECKF(out[17] == 0xfb, "HEVC bitDepthLumaMinus8 byte is 0x%02x, want 0xfb",
+           out[17]);
+    CHECKF(out[18] == 0xfa,
+           "HEVC bitDepthChromaMinus8 byte is 0x%02x, want 0xfa", out[18]);
+    uint8_t want_temporal = (uint8_t)(0x07u | ((max_sub + 1u) << 3));
+    CHECKF(out[21] == want_temporal,
+           "HEVC sub-layer profile/level byte 21 is 0x%02x, want 0x%02x",
+           out[21], want_temporal);
+
+    size_t o = 23;
+    for (size_t i = 0; i < 3; i++) {
+        CHECKF(o + 5 <= out_len, "HEVC profile/level array %zu header overruns", i);
+        CHECKF(out[o] == (uint8_t)(0x80 | nal_type[i]),
+               "HEVC profile/level array %zu type is 0x%02x, want 0x%02x",
+               i, out[o], (uint8_t)(0x80 | nal_type[i]));
+        o++;
+        CHECKF(rd16(out + o) == 1,
+               "HEVC profile/level array %zu count is %u, want 1",
+               i, rd16(out + o));
+        o += 2;
+        CHECKF(rd16(out + o) == nal_len[i],
+               "HEVC profile/level array %zu NAL length is %u, want %zu",
+               i, rd16(out + o), nal_len[i]);
+        o += 2;
+        CHECKF(o + nal_len[i] <= out_len,
+               "HEVC profile/level array %zu payload overruns", i);
+        if (o + nal_len[i] <= out_len) {
+            CHECKF(memcmp(out + o, nal_p[i], nal_len[i]) == 0,
+                   "HEVC profile/level array %zu payload differs", i);
+        }
+        o += nal_len[i];
+    }
+    CHECKF(o == out_len, "HEVC profile/level hvcC ended at %zu, want %zu",
+           o, out_len);
+}
+
 static void rows_annexb_hevc(void)
 {
+    row("HEVC Annex B: SPS temporal sub-layer PTL is skipped into hvcC");
+    {
+        moq_codec_init_data_cfg_t cfg;
+        moq_codec_init_data_cfg_init(&cfg);
+        cfg.source_format = MOQ_CODEC_SOURCE_HEVC_ANNEXB;
+        cfg.source = bytes(k_hevc_temporal_annexb,
+                           sizeof(k_hevc_temporal_annexb));
+        expect_hvcc_temporal_sub_layers(&cfg);
+    }
+
+    row("HEVC Annex B: sub-layer profile and level PTL bodies are skipped");
+    {
+        uint8_t src[512];
+        size_t src_len = build_hevc_fixture(src, 1, 0, true, true, 2, 3, 2);
+        expect_hvcc_generated_profile_level(src, src_len, 1);
+    }
+
+    row("HEVC Annex B: last of six sub-layer profiles is skipped");
+    {
+        uint8_t src[512];
+        size_t src_len = build_hevc_fixture(src, 6, 5, true, false, 2, 3, 2);
+        expect_hvcc_generated_profile_level(src, src_len, 6);
+    }
+
+    row("HEVC Annex B: last of six sub-layer levels is skipped");
+    {
+        uint8_t src[512];
+        size_t src_len = build_hevc_fixture(src, 6, 5, false, true, 2, 3, 2);
+        expect_hvcc_generated_profile_level(src, src_len, 6);
+    }
+
+    row("HEVC Annex B: sps_max_sub_layers_minus1 7 is malformed");
+    {
+        uint8_t src[512];
+        size_t src_len = build_hevc_fixture(src, 7, 0, false, false, 1, 0, 0);
+        moq_codec_init_data_cfg_t cfg;
+        moq_codec_init_data_cfg_init(&cfg);
+        cfg.source_format = MOQ_CODEC_SOURCE_HEVC_ANNEXB;
+        cfg.source = bytes(src, src_len);
+        pin_build_fail(&cfg, MOQ_ERR_PROTO, 512,
+                       "sps_max_sub_layers_minus1 outside HEVC range");
+    }
+
     row("HEVC Annex B: no VPS");
     {
         /* SPS + PPS only. */
