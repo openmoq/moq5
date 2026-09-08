@@ -1229,14 +1229,26 @@ parse_webtransport(struct json_object_s *o, moqr_cli_config_t *out, char *err,
         out->wt.version_count = 2;
     }
     /* The ordered set label, joined in preference order exactly as written. */
-    out->wt.alpn_set[0] = '\0';
+    size_t alpn_len = 0;
     for (size_t i = 0; i < out->wt.version_count; i++) {
         if (i > 0) {
-            strncat(out->wt.alpn_set, "+",
-                    sizeof(out->wt.alpn_set) - strlen(out->wt.alpn_set) - 1);
+            if (alpn_len + 1u >= sizeof(out->wt.alpn_set)) {
+                cfg_err(err, err_len,
+                        "webtransport.versions: ALPN set too long");
+                return MOQR_ERR_INVAL;
+            }
+            out->wt.alpn_set[alpn_len++] = '+';
+            out->wt.alpn_set[alpn_len] = '\0';
         }
-        strncat(out->wt.alpn_set, out->wt.subproto_buf[i],
-                sizeof(out->wt.alpn_set) - strlen(out->wt.alpn_set) - 1);
+        size_t subproto_len = strlen(out->wt.subproto_buf[i]);
+        if (subproto_len >= sizeof(out->wt.alpn_set) - alpn_len) {
+            cfg_err(err, err_len,
+                    "webtransport.versions: ALPN set too long");
+            return MOQR_ERR_INVAL;
+        }
+        memcpy(out->wt.alpn_set + alpn_len, out->wt.subproto_buf[i],
+               subproto_len + 1u);
+        alpn_len += subproto_len;
     }
     if (out->wt.port == 0) {
         cfg_err(err, err_len, "webtransport.port is required");
