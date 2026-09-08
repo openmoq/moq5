@@ -17,8 +17,8 @@
 #include "../cli/logevent.h"
 #include "../cli/servelog.h"
 #include "../cli/snapshot.h"
-#include "../bind/moqr_bind.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_bind.h>
+#include <moq/relay/moqr_shards.h>
 
 #include <moq/msquic_managed.h>
 

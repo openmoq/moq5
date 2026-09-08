@@ -14,10 +14,13 @@
  * the owner's own signal flag plus the presence of the named line.
  */
 
-#include "../bind/moqr_bind.h"
+#include <moq/relay/moqr_bind.h>
 #include "../cli/conn_reap.h"
 #include "drain_wait.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
+#if defined(MOQR_RELAY_INSPECT) || defined(MOQR_BIND_TESTING)
+#include <moq/relay/moqr_shards_test.h>
+#endif
 
 #include <moq/msquic_managed.h>
 #include <moq/session.h>

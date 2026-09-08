@@ -28,7 +28,7 @@
 
 #include "../admin/moqr_admin.h"
 
-#include <moqrelay/types.h>
+#include <moq/relay/types.h>
 
 #include <stdbool.h>
 #include <stdint.h>

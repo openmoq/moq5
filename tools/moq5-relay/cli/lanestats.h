@@ -1,7 +1,7 @@
 #ifndef MOQR_CLI_LANESTATS_H
 #define MOQR_CLI_LANESTATS_H
 
-#include <moqrelay/types.h>
+#include <moq/relay/types.h>
 
 #include <stdbool.h>
 #include <stddef.h>

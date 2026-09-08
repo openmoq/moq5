@@ -14,7 +14,7 @@
  */
 
 #include "../cli/config.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
 
 #include <stdio.h>
 #include <string.h>

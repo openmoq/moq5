@@ -350,6 +350,8 @@ if("service" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
     endif()
 endif()
 
+include("${CMAKE_CURRENT_LIST_DIR}/libmoqRelayComponents.cmake")
+
 # Name the missing required components in the failure — the stock
 # check_required_components only flips libmoq_FOUND, which reads as an
 # anonymous "set to FALSE" at the consumer.

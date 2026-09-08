@@ -20,7 +20,7 @@
 
 #include "config.h"
 
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
 
 #include <stdbool.h>
 #include <stddef.h>

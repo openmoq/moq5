@@ -28,9 +28,15 @@
  * one publisher cancel, both drafts), and token isolation.
  */
 
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
+#if defined(MOQR_RELAY_INSPECT) || defined(MOQR_BIND_TESTING)
+#include <moq/relay/moqr_shards_test.h>
+#endif
 
-#include "../bind/moqr_bind.h"
+#include <moq/relay/moqr_bind.h>
+#ifdef MOQR_BIND_TESTING
+#include <moq/relay/moqr_bind_test.h>
+#endif
 #include "../cli/blockedstats.h"
 
 #include <moq/moq.h>

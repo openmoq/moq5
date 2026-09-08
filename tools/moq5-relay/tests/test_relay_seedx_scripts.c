@@ -26,8 +26,11 @@
  *     §10.16 NAMESPACE 0x8, §10.17 NAMESPACE_DONE 0xE
  */
 
-#include "../bind/moqr_bind.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_bind.h>
+#include <moq/relay/moqr_shards.h>
+#if defined(MOQR_RELAY_INSPECT) || defined(MOQR_BIND_TESTING)
+#include <moq/relay/moqr_shards_test.h>
+#endif
 #include "../cli/conn_reap.h"
 
 #include <moq/msquic_managed.h>

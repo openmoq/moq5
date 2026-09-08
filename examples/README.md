@@ -8,6 +8,13 @@ historical reference.
 
 ## Taxonomy
 
+### `relay/` - embedding a relay
+
+[`relay/simple-relay`](relay/simple-relay/README.md) is a complete, loopback-only
+raw-QUIC relay using the public `moq::relay` SDK and managed MsQuic adapter.
+Routing and forwarding remain in the library; the example shows transport
+composition, connection retirement and shutdown.
+
 ### `service/` — start here (consumer-facing)
 The high-level API: `moq_endpoint_t` plus `moq_media_receiver_t` /
 `moq_media_sender_t` (the `moq::service` component). You give it a URL and a

@@ -28,7 +28,10 @@
 #include "versions.h"
 #include <moq/session.h>
 
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
+#if defined(MOQR_RELAY_INSPECT) || defined(MOQR_BIND_TESTING)
+#include <moq/relay/moqr_shards_test.h>
+#endif
 
 static int g_failures;
 

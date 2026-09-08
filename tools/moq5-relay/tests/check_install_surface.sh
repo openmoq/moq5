@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # The installed surface of the relay command.
 #
-# What ships is exactly one executable plus its documentation. Relay archives,
-# relay-private headers, verify/measure builds, test seams and fixtures are
-# build-tree things and must never reach a prefix: none of them is a supported
-# interface, and installing one would make it look like a promise.
+# The command and the two public relay libraries may ship. Private policy,
+# test/inspection libraries and headers must remain in the build tree.
 #
 #   $1  staged install prefix (already populated by `cmake --install`)
 #   $2  the source tree root
@@ -63,7 +61,21 @@ printf '%s\n' "$installed" | grep -q "share/doc/moq5-relay/examples/" ||
 # -- 4. nothing private may ship -------------------------------------------
 while IFS= read -r f; do
     case "$f" in
-    *libmoq-relay*|*moqrelay/*|*moq-relay-verify*|*moq-relay-measure*|\
+    */libmoq-relay.a|*/libmoq-relay.so|*/libmoq-relay.dylib|\
+    */libmoq-relay-core.a|*/libmoq-relay-core.so|*/libmoq-relay-core.dylib|\
+    */pkgconfig/libmoq-relay.pc|*/pkgconfig/libmoq-relay-core.pc|\
+    */cmake/libmoq/libmoqRelayComponents.cmake|\
+    */cmake/libmoq/libmoqRelayTargets*.cmake|\
+    */cmake/libmoq/libmoqRelayCoreTargets*.cmake)
+        continue ;;
+    include/moq/relay/*)
+        case "${f##*/}" in
+        export.h|types.h|auth.h|capacity.h|log.h|placement.h|relay.h|trace.h|\
+        wire_codes.h|moqr_bind.h|moqr_shards.h|moqr_obs.h) continue ;;
+        *) fail "private relay header installed: $f"; continue ;;
+        esac ;;
+    *libmoq-relay*|*moqrelay/*|\
+    *moq-relay-verify*|*moq-relay-measure*|\
     *moq5-relay-verify*|*moq5-relay-measure*|*test_relay*|*bench_relay*|\
     *-test-internals*|*check_*.sh)
         fail "private artifact installed: $f" ;;
@@ -71,12 +83,6 @@ while IFS= read -r f; do
 done <<EOF
 $installed
 EOF
-
-# The relay must not add a pkg-config surface or export private CMake targets.
-printf '%s\n' "$installed" | grep -qE 'pkgconfig/.*relay' &&
-    fail "a relay pkg-config file was installed"
-printf '%s\n' "$installed" | grep -qE 'cmake/.*[Rr]elay' &&
-    fail "relay CMake targets were exported"
 
 # -- 5. the installed command answers informational requests ---------------
 if [ -x "$cmd" ]; then

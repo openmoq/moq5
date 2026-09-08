@@ -196,6 +196,7 @@ surfaces differ in maturity and intended audience:
 | **Media service API** (primary app API for media) | `<moq/endpoint.h>`, `<moq/media_receiver.h>`, `<moq/media_sender.h>` | the recommended surface for media applications; pre-1.0 |
 | **Core session API** (lower-level protocol API) | `<moq/moq.h>`, `<moq/session.h>`, `types.h`, `rcbuf.h`, `version.h` | the protocol engine; for relays, conformance, and app specialists who need direct control; pre-1.0 |
 | **Core facade API** (lower-level conveniences, used under the service tier) | `publisher.h`, `subscriber.h`, `url.h` | publish/subscribe conveniences over the session; pre-1.0 |
+| **Relay SDK** (`moq::relay-core`, `moq::relay`) | `<moq/relay/relay.h>`, `<moq/relay/moqr_bind.h>`, `<moq/relay/moqr_shards.h>` | optional transport-independent routing and host-pumped runtime; [embedding guide](relay/README.md) and [network example](examples/relay/simple-relay/README.md); pre-1.0 |
 | **Media helpers** | `loc.h`, `cmaf.h`, `msf.h`, `media_object.h`, `playback.h` | pre-1.0 media parse/pipeline helpers |
 | **Simulation harness** (`moq::sim`) | `sim.h` | deterministic SimPair testing helper; installed only when built with `MOQ_BUILD_SIM=ON`; pre-1.0 |
 | **Wire codec / tooling** | `codec.h`, `control.h`, `wire.h`, `buf.h`, `kvp.h` | draft-specific tooling for adapters/tests/tools, **not** the application API; details change across drafts |
@@ -217,6 +218,8 @@ before 1.0.
 core/           moq-core: sans-I/O engine + shared transport bridge
   include/moq/  public C headers
   src/          implementation (session, codec, wire, bridge)
+relay/          moq-relay-core + moq-relay: routing and embeddable runtime
+tools/moq5-relay/ command, configuration, listeners and administration
 service/        moq-service: high-level media tier (endpoint, media
                 receiver/sender) over the managed adapters
 sim/            moq-sim: SimPair deterministic simulation + fault injection
@@ -225,7 +228,7 @@ bindings/cpp/   moq-cpp: header-only C++20 binding
 media/          loc, cmaf, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
-examples/       service/ (start here for media apps), plus core, picoquic,
+examples/       service/ (media apps), relay/ (embedding), plus core, picoquic,
                 mvfst, pico_wt, and C++ binding examples
 docs/           integration guide, adapter contract, conformance status
 scripts/        boundary checks, coverage, seed sweeps

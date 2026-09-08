@@ -9,10 +9,10 @@
 #include "admin_listen.h"
 #include "admin_listen_layout.h"
 
-#include "../obs/moqr_obs.h"
+#include <moq/relay/moqr_obs.h>
 #include "shards_doc.h"
 
-#include <moqrelay/capacity.h>
+#include <moq/relay/capacity.h>
 
 #include <string.h>
 

@@ -12,7 +12,7 @@
 
 #include "snapshot.h"
 
-#include <moqrelay/capacity.h>
+#include <moq/relay/capacity.h>
 
 #include <ctype.h>
 #include <errno.h>

@@ -5,13 +5,18 @@
 #   2. every successor named for a retired scenario must still be a registered
 #      CTest, so the map cannot quietly point at something that has since gone.
 #
-# Argument 1 is the relay CMakeLists.txt, argument 2 the ownership map.
+# Arguments 1 and 2 are the tool and library test CMakeLists files, argument 3
+# is the ownership map, and argument 4 is the project source root.
 set -u
 
-cmakelists="${1:-}"
-ownermap="${2:-}"
-if [ ! -f "$cmakelists" ] || [ ! -f "$ownermap" ]; then
-    echo "FAIL: usage: $0 <CMakeLists.txt> <scenario_owners.md>" >&2
+tool_cmake="${1:-}"
+relay_cmake="${2:-}"
+ownermap="${3:-}"
+project_root="${4:-}"
+if [ ! -f "$tool_cmake" ] || [ ! -f "$relay_cmake" ] ||
+   [ ! -f "$ownermap" ] || [ ! -d "$project_root" ]; then
+    echo "FAIL: usage: $0 <tool-CMakeLists.txt> <relay-test-CMakeLists.txt>" \
+         "<scenario_owners.md> <project-root>" >&2
     exit 2
 fi
 
@@ -20,12 +25,19 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 
 # The CMake source with comments stripped, so prose about the retired fixture
 # cannot satisfy — or trip — the checks below.
-cml_src=$(sed 's/#.*//' "$cmakelists")
+cml_src=$(
+    sed 's/#.*//' "$tool_cmake"
+    sed 's/#.*//' "$relay_cmake"
+)
 
-# Registered CTest names, and every executable the file builds.
-registered=$(grep -o 'add_test(NAME [A-Za-z_0-9]*' "$cmakelists" |
+# Registered CTest names, and every executable the two files build.
+registered=$(
+    grep -h -o 'add_test(NAME [A-Za-z_0-9]*' \
+        "$tool_cmake" "$relay_cmake" |
              sed 's/add_test(NAME //')
-built=$(grep -o 'add_executable([A-Za-z_0-9]*' "$cmakelists" |
+built=$(
+    grep -h -o 'add_executable([A-Za-z_0-9]*' \
+        "$tool_cmake" "$relay_cmake" |
         sed 's/add_executable(//')
 
 is_registered() {
@@ -49,7 +61,7 @@ while IFS= read -r row; do
 
     if is_registered "$scenario"; then
         echo "FAIL: retired scenario '$scenario' is registered again in" \
-             "$cmakelists" >&2
+             "$tool_cmake or $relay_cmake" >&2
         failures=$((failures + 1))
     fi
     target=$(printf '%s\n' "$row" | awk -F'|' '{print $3}' |
@@ -125,8 +137,8 @@ EOF
 # certificate and key, never a certificate minted at run time. A generated
 # credential makes the physical cells depend on the host's tooling and on the
 # clock, for bytes no test ever inspects.
-cert=$(dirname "$cmakelists")/../../adapters/msquic/tests/test_only_loopback_cert.pem
-key=$(dirname "$cmakelists")/../../adapters/msquic/tests/test_only_loopback_key.pem
+cert="$project_root/adapters/msquic/tests/test_only_loopback_cert.pem"
+key="$project_root/adapters/msquic/tests/test_only_loopback_key.pem"
 
 if [ ! -f "$cert" ]; then
     fail "the committed test-only certificate is missing: $cert"

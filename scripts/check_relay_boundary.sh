@@ -2,15 +2,16 @@
 #
 # Relay boundary guard.
 #
-# tools/moq5-relay/ consumes libmoq strictly through the PUBLIC session API
-# and the managed adapter facades. This check fails the build if relay code
-# reaches below that line:
+# relay/ and tools/moq5-relay/ consume libmoq strictly through the PUBLIC
+# session API and the managed adapter facades. This check fails the build if
+# relay code reaches below that line:
 #
-#   1. Nothing under tools/moq5-relay/ may include private or wire-tooling
+#   1. Nothing under relay/ or tools/moq5-relay/ may include private or
+#      wire-tooling
 #      headers (transport bridge, wire codecs, session internals) or the
 #      publisher/subscriber facades (they own session event polling; the
 #      relay needs the raw event stream).
-#   2. The sans-I/O relay core (tools/moq5-relay/core/) additionally must not
+#   2. The sans-I/O relay core (relay/src/core/) additionally must not
 #      include adapter, service-tier, threading, or socket headers — time and
 #      I/O are inputs there, same discipline as libmoq core/.
 #
@@ -20,12 +21,28 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RELAY_DIR="tools/moq5-relay"
+RELAY_LIBRARY_DIR="relay"
+RELAY_TOOL_DIR="tools/moq5-relay"
 
-if [ ! -d "$ROOT/$RELAY_DIR" ]; then
-    echo "relay boundary: $RELAY_DIR not present; nothing to check"
+if [ ! -d "$ROOT/$RELAY_LIBRARY_DIR" ] && [ ! -d "$ROOT/$RELAY_TOOL_DIR" ]; then
+    echo "relay boundary: relay sources not present; nothing to check"
     exit 0
 fi
+
+failures=0
+
+# Forwarding implementation belongs to the top-level relay component.  Keep
+# the legacy tool-owned locations empty so a new source file cannot bypass the
+# library build or its stricter core scan.
+for legacy in core bind shard obs bench; do
+    if [ -d "$ROOT/$RELAY_TOOL_DIR/$legacy" ] &&
+       find "$ROOT/$RELAY_TOOL_DIR/$legacy" -type f \
+           \( -name '*.c' -o -name '*.h' -o -name '*.cpp' -o -name '*.hpp' \) \
+           -print -quit | grep -q .; then
+        echo "relay boundary violation: forwarding source under $RELAY_TOOL_DIR/$legacy"
+        failures=1
+    fi
+done
 
 # Headers no relay code may include (private SPI, wire tooling, internals,
 # and the event-owning facades).
@@ -58,8 +75,6 @@ FORBIDDEN_IN_CORE=(
     'netinet/'
 )
 
-failures=0
-
 scan() {
     local scope_dir="$1"
     local label="$2"
@@ -86,8 +101,9 @@ scan() {
     done
 }
 
-scan "$RELAY_DIR"       "all relay code"    "${FORBIDDEN_EVERYWHERE[@]}"
-scan "$RELAY_DIR/core"  "sans-I/O core"     "${FORBIDDEN_IN_CORE[@]}"
+scan "$RELAY_LIBRARY_DIR"          "relay library" "${FORBIDDEN_EVERYWHERE[@]}"
+scan "$RELAY_TOOL_DIR"             "relay tool"    "${FORBIDDEN_EVERYWHERE[@]}"
+scan "$RELAY_LIBRARY_DIR/src/core" "sans-I/O core" "${FORBIDDEN_IN_CORE[@]}"
 
 if [ "$failures" -ne 0 ]; then
     echo "relay boundary: FAIL"

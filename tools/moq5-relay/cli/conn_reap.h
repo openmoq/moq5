@@ -22,7 +22,7 @@
 
 #include <moq/msquic_managed.h>
 
-#include "../bind/moqr_bind.h"
+#include <moq/relay/moqr_bind.h>
 
 /*
  * Per-connection relay state is a TAG in the adapter's conn_user slot — no

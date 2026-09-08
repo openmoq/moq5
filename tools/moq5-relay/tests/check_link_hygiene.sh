@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # No relay executable may name the same static archive twice on its link line.
 #
-# The relay libraries form one linear chain, each PUBLIC-linking the next:
+# The runtime libraries PUBLIC-link their dependencies:
 #
-#     moqr-admin -> relay-obs -> relay-shard -> relay-bind -> relay-core -> moq::core
+#     moqr-admin -> relay -> relay-core -> moq::core
+#                -> private toy policy -> relay-core
 #
 # so naming a lower member beside a higher one adds nothing to the link
 # closure -- but the generator must then emit that archive twice (once where

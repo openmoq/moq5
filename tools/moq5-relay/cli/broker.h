@@ -29,7 +29,7 @@
 #ifndef MOQR_CLI_BROKER_H
 #define MOQR_CLI_BROKER_H
 
-#include <moqrelay/relay.h>
+#include <moq/relay/relay.h>
 
 #include <pthread.h>
 #include <stdbool.h>

@@ -9,10 +9,9 @@
 #                                 record and no debug counters.
 # Usage:
 #   relay_verify_hygiene.sh <moq5-relay> <moq-relay-verify> <moq-relay-measure> \
-#                           <libmoq-relay-core.a> <libmoq-relay-bind.a> \
-#                           <libmoq-relay-shard.a>
-# All six arguments are MANDATORY: the three blocked-arm binaries plus the
-# three PRODUCTION archives. Archives are checked directly because
+#                           <libmoq-relay-core> <libmoq-relay>
+# All five arguments are MANDATORY: the three blocked-arm binaries plus the
+# two PRODUCTION libraries. Archives are checked directly because
 # final-binary dead stripping can hide a debug symbol that is nonetheless
 # compiled into a production library.
 set -u
@@ -21,8 +20,7 @@ plain="${1:?plain binary}"
 verify="${2:?verify binary}"
 measure="${3:?measure binary}"
 core_a="${4:?production core archive}"
-bind_a="${5:?production bind archive}"
-shard_a="${6:?production shard archive}"
+runtime_a="${5:?production relay runtime library}"
 fail=0
 
 count_str() { strings "$1" | grep -c "$2"; }
@@ -138,17 +136,7 @@ for tool in "$verify" "$measure"; do
     fi
 done
 
-# --- production archives (all three MANDATORY; a missing file fails).
-# Checked at the archives because final-binary dead stripping can hide a
-# compiled-in symbol. Contract per archive:
-#   core / bind : NO debug symbol of ANY tier (their seams are all
-#                 TESTING-gated; a cross-tier leak is caught too).
-#   shard       : no cross-tier debug symbol, and none of the TESTING-gated
-#                 verify seams (explicit list — the seal-evidence ring and
-#                 the demand-join resolvers). The shard's remaining
-#                 moqr_shards_debug_* accessors are DELIBERATELY production
-#                 exports consumed by production-linked tests and the
-#                 measurement benches; they are outside this boundary. ---
+# --- Every production library must be free of debug symbols. ---
 scan_archive() {
     arch="$1"; shift
     if [ ! -f "$arch" ]; then
@@ -163,10 +151,7 @@ scan_archive() {
     done
 }
 scan_archive "$core_a" moqr_core_debug moqr_bind_debug moqr_shards_debug
-scan_archive "$bind_a" moqr_core_debug moqr_bind_debug moqr_shards_debug
-scan_archive "$shard_a" moqr_core_debug moqr_bind_debug \
-    moqr_shards_debug_seal_log moqr_shards_debug_track_demand \
-    moqr_shards_debug_pend_dup moqr_shards_debug_pend_drop
+scan_archive "$runtime_a" moqr_core_debug moqr_bind_debug moqr_shards_debug
 
 if [ "$fail" = "0" ]; then
     echo "PASS: relay_verify_hygiene"

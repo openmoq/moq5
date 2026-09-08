@@ -18,7 +18,7 @@
 #include "admin_listen.h"
 #include "admin_listen_layout.h"
 
-#include "../obs/moqr_obs.h"
+#include <moq/relay/moqr_obs.h>
 
 #include <arpa/inet.h>
 #include <errno.h>

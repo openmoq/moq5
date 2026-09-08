@@ -13,7 +13,7 @@
 #ifndef MOQR_CLI_SHARDS_DOC_H
 #define MOQR_CLI_SHARDS_DOC_H
 
-#include "../obs/moqr_obs.h"
+#include <moq/relay/moqr_obs.h>
 
 #include <stddef.h>
 #include <stdint.h>

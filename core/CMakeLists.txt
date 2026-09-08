@@ -48,7 +48,8 @@ set_target_properties(moq-core PROPERTIES
 install(TARGETS moq-core
     EXPORT libmoqTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 install(DIRECTORY include/moq
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
@@ -56,6 +57,9 @@ install(DIRECTORY include/moq
     PATTERN "transport_bridge.h" EXCLUDE)
 
 target_compile_definitions(moq-core PRIVATE MOQ_BUILDING)
+if(NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(moq-core PUBLIC MOQ_STATIC)
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-core PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)

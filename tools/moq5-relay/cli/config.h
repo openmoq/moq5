@@ -74,10 +74,10 @@
 
 #include <string.h>
 
-#include <moqrelay/relay.h>
+#include <moq/relay/relay.h>
 
-#include <moqr_shards.h>
-#include <moqrelay/auth_toy.h>
+#include <moq/relay/moqr_shards.h>
+#include <moq/relay/auth_toy.h>
 
 #ifdef __cplusplus
 extern "C" {

@@ -44,8 +44,8 @@
 #ifndef MOQR_ADMIN_H
 #define MOQR_ADMIN_H
 
-#include <moqr_obs.h>
-#include <moqrelay/types.h>
+#include <moq/relay/moqr_obs.h>
+#include <moq/relay/types.h>
 
 #include <stdbool.h>
 #include <stddef.h>

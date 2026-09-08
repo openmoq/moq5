@@ -1,0 +1,25 @@
+# Loaded by both build-tree and install-tree package configurations.
+if("relay-core" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS OR
+   "relay" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(@MOQ_BUILD_RELAY_CORE@ AND
+       EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqRelayCoreTargets.cmake")
+        if(NOT TARGET moq::relay-core)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqRelayCoreTargets.cmake")
+        endif()
+        set(${CMAKE_FIND_PACKAGE_NAME}_relay-core_FOUND TRUE)
+    else()
+        set(${CMAKE_FIND_PACKAGE_NAME}_relay-core_FOUND FALSE)
+    endif()
+endif()
+if("relay" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
+    if(@MOQ_BUILD_RELAY_RUNTIME@ AND TARGET moq::relay-core AND
+       EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqRelayTargets.cmake")
+        find_dependency(Threads)
+        if(NOT TARGET moq::relay)
+            include("${CMAKE_CURRENT_LIST_DIR}/libmoqRelayTargets.cmake")
+        endif()
+        set(${CMAKE_FIND_PACKAGE_NAME}_relay_FOUND TRUE)
+    else()
+        set(${CMAKE_FIND_PACKAGE_NAME}_relay_FOUND FALSE)
+    endif()
+endif()

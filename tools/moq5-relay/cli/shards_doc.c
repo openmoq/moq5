@@ -1,7 +1,7 @@
 #include "shards_doc.h"
 
 #include "../admin/json_out.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
 
 #include <string.h>
 

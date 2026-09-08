@@ -15,11 +15,14 @@
 #ifndef MOQR_CLI_SNAPSHOT_H
 #define MOQR_CLI_SNAPSHOT_H
 
-#include <moqrelay/relay.h>
+#include <moq/relay/relay.h>
 
-#include <moqr_bind.h>
-#include <moqr_obs.h>
-#include <moqr_shards.h>
+#include <moq/relay/moqr_bind.h>
+#ifdef MOQR_BIND_TESTING
+#include <moq/relay/moqr_bind_test.h>
+#endif
+#include <moq/relay/moqr_obs.h>
+#include <moq/relay/moqr_shards.h>
 
 #include <pthread.h>
 #include <stddef.h>

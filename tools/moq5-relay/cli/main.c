@@ -1,7 +1,7 @@
 /*
  * MOQ5 Relay: a deterministic MoQ relay over the MsQuic managed server.
  * Sessions live on their lane's thread; the production binding
- * (bind/moqr_bind.h) runs inside on_lane_pump and is the only code that
+ * (moq/relay/moqr_bind.h) runs inside on_lane_pump and is the only code that
  * touches them. Default is one lane / one shard (the single-core production
  * path); listener.lanes > 1 partitions connections across N independent
  * lock-domain lanes, each driving one relay shard.
@@ -54,10 +54,16 @@ static uint8_t g_test_serve_log_last_state;
 #endif
 #endif
 
-#include "../bind/moqr_bind.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_bind.h>
+#ifdef MOQR_BIND_TESTING
+#include <moq/relay/moqr_bind_test.h>
+#endif
+#include <moq/relay/moqr_shards.h>
+#if defined(MOQR_RELAY_INSPECT) || defined(MOQR_BIND_TESTING)
+#include <moq/relay/moqr_shards_test.h>
+#endif
 
-#include <moqr_obs.h>
+#include <moq/relay/moqr_obs.h>
 
 #include <moq/msquic_managed.h>
 

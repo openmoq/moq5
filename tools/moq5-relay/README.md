@@ -6,6 +6,12 @@ codes by meaning rather than forwarding raw numbers between registries.
 
 The installed command is `moq5-relay`.
 
+Forwarding code lives in the top-level `relay/` component. The command under
+`tools/moq5-relay/` composes those transport-independent libraries with
+configuration, transports, process lifecycle, and the admin endpoint. Relay
+libraries can also be installed without the command or any transport adapter.
+See [the embedding guide](../../relay/README.md) for the public components.
+
 ## Build
 
 The relay is off by default. Enable it, and the managed MsQuic transport it
@@ -85,4 +91,4 @@ are not a parsing surface.
 
 See `moq5-relay(1)` for the command reference,
 `moq5-relay.json(5)` for the configuration format, and
-`docs/architecture.md` for the internal relay design.
+`../../relay/docs/architecture.md` for the internal relay design.

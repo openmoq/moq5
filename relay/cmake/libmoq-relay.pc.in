@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/@MOQR_PC_UP@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: @MOQR_PC_NAME@
+Description: @MOQR_PC_DESCRIPTION@
+Version: @PROJECT_VERSION@
+Requires: @MOQR_PC_REQUIRES@
+Libs: -L${libdir} -l@MOQR_PC_LIBRARY@
+Libs.private: @MOQR_PC_PRIVATE@
+Cflags: -I${includedir} @MOQR_PC_DEFINES@

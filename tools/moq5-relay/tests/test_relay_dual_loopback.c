@@ -12,7 +12,7 @@
  */
 
 #include "../cli/config.h"
-#include "../shard/moqr_shards.h"
+#include <moq/relay/moqr_shards.h>
 
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>

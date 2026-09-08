@@ -22,7 +22,7 @@
 #ifndef MOQR_JSON_OUT_H
 #define MOQR_JSON_OUT_H
 
-#include <moqrelay/types.h>
+#include <moq/relay/types.h>
 
 #include <stdbool.h>
 #include <stddef.h>

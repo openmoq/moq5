@@ -19,7 +19,7 @@
  * inferred from elapsed time or activity signals.
  */
 
-#include "../bind/moqr_bind.h"
+#include <moq/relay/moqr_bind.h>
 #include "../cli/conn_reap.h"
 
 #include <moq/msquic_managed.h>

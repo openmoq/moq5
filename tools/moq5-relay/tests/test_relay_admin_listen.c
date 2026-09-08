@@ -14,7 +14,7 @@
  */
 #include "../cli/admin_listen.h"
 #include "../cli/broker.h"
-#include "../obs/moqr_obs.h"
+#include <moq/relay/moqr_obs.h>
 
 /* The listener's deterministic failure seams, compiled only into this
  * target's copy of the listener. */

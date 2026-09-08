@@ -31,7 +31,16 @@ set(MOQ_PICOQUIC_VERIFY_BACKEND "auto" CACHE STRING
 set_property(CACHE MOQ_PICOQUIC_VERIFY_BACKEND PROPERTY STRINGS
     auto openssl mbedtls)
 option(MOQ_BUILD_INTEROP_CLIENT    "Build interop test client"      OFF)
-option(MOQ_BUILD_RELAY             "Build moq-relay (deterministic relay core + tool)" OFF)
+option(MOQ_BUILD_RELAY "Build relay libraries and command (compatibility option)" OFF)
+option(MOQ_BUILD_RELAY_CORE "Build the transport-independent relay engine" ${MOQ_BUILD_RELAY})
+option(MOQ_BUILD_RELAY_RUNTIME "Build the session binding and shard runtime" ${MOQ_BUILD_RELAY})
+option(MOQ_BUILD_RELAY_TOOL "Build the moq5-relay command and administration tier" ${MOQ_BUILD_RELAY})
+if(MOQ_BUILD_RELAY_RUNTIME AND NOT MOQ_BUILD_RELAY_CORE)
+    message(FATAL_ERROR "MOQ_BUILD_RELAY_RUNTIME requires MOQ_BUILD_RELAY_CORE")
+endif()
+if(MOQ_BUILD_RELAY_TOOL AND NOT MOQ_BUILD_RELAY_RUNTIME)
+    message(FATAL_ERROR "MOQ_BUILD_RELAY_TOOL requires MOQ_BUILD_RELAY_RUNTIME")
+endif()
 option(MOQ_BUILD_ADAPTER_MVFST     "Build mvfst QUIC adapter"       OFF)
 option(MOQ_BUILD_ADAPTER_PROXYGEN  "Build proxygen WebTransport adapter" OFF)
 option(MOQ_BUILD_ADAPTER_PICO_WT   "Build picoquic WebTransport adapter" OFF)
@@ -308,8 +317,13 @@ if(MOQ_BUILD_INTEROP_CLIENT)
     endif()
 endif()
 
-if(MOQ_BUILD_RELAY)
+if(MOQ_BUILD_RELAY_CORE)
+    add_subdirectory(relay)
+endif()
+if(MOQ_BUILD_RELAY_TOOL)
     add_subdirectory(tools/moq5-relay)
+endif()
+if(MOQ_BUILD_RELAY_CORE)
     if(MOQ_BUILD_TESTS)
         add_test(NAME relay_boundary
                  COMMAND ${CMAKE_COMMAND} -E env bash
@@ -340,6 +354,7 @@ write_basic_package_version_file(
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/cmake-install/libmoqConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/libmoqConfigVersion.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayComponents.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
@@ -527,6 +542,10 @@ endif()
 # them needs a relay -- but they are always compiled for coverage.
 if(MOQ_BUILD_SERVICE AND MOQ_BUILD_EXAMPLES)
     add_subdirectory(examples/service)
+endif()
+
+if(UNIX AND MOQ_BUILD_EXAMPLES AND TARGET moq::relay AND TARGET moq::adapter-msquic-managed)
+    add_subdirectory(examples/relay/simple-relay)
 endif()
 
 # -- C++ examples ---------------------------------------------------
@@ -835,6 +854,18 @@ if(MOQ_BUILD_SERVICE)
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_service_FOUND TRUE)\n"
         "endif()\n")
 endif()
+if(MOQ_BUILD_RELAY_CORE)
+    export(EXPORT libmoqRelayCoreTargets NAMESPACE moq::
+        FILE ${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayCoreTargets.cmake)
+endif()
+if(MOQ_BUILD_RELAY_RUNTIME)
+    export(EXPORT libmoqRelayTargets NAMESPACE moq::
+        FILE ${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayTargets.cmake)
+endif()
+configure_file(cmake/libmoqRelayComponents.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayComponents.cmake @ONLY)
+string(APPEND _build_tree_config
+    "include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqRelayComponents.cmake\")\n")
 string(APPEND _build_tree_config
     "foreach(_libmoq_comp IN LISTS \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
     "  if(NOT \${CMAKE_FIND_PACKAGE_NAME}_\${_libmoq_comp}_FOUND)\n"
