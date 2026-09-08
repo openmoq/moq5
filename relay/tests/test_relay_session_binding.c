@@ -6075,6 +6075,183 @@ dataplane_source_end_oracle(bool push, uint32_t max_actions)
     return f;
 }
 
+/* A PUBLISH-created source is not a pull subscription.  The last downstream
+ * subscriber leaving must therefore not run the pull-source linger teardown:
+ * there is no upstream SUBSCRIBE to cancel, and warming the core track while
+ * the accepted PUBLISH remains live turns every later pushed object into an
+ * ingest refusal.  This is the exact lifecycle observed with the physical
+ * MoQCam publisher and moq5-relay on moqbox.
+ *
+ * Keep the policy neutral: this oracle does not require a demand-gated
+ * PUBLISH_UPDATE.  It requires only the current accepted-PUBLISH contract to
+ * stay coherent -- while that publication remains permitted to send, its
+ * backing relay track remains ACTIVE and accepts data.  Two downstream churn
+ * cycles pin the accumulation class seen on the physical Camera relay without
+ * making this deterministic unit test depend on live deployment. */
+static int
+dataplane_push_survives_downstream_linger(void)
+{
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: push-survives-linger rig create\n");
+        return 1;
+    }
+
+    conn_t *pub = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *sub = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    R_CHECK(&rig, pub != NULL && sub != NULL);
+    peer_state_t pub_ps, sub_ps;
+    memset(&pub_ps, 0, sizeof(pub_ps));
+    memset(&sub_ps, 0, sizeof(sub_ps));
+    rig_pump(&rig, 4);
+
+    moq_bytes_t nsp[2] = { B("push"), B("linger") };
+    /* Match media_sender's real topology: the catalog track advertises the
+     * namespace, while the media track is also opened with PUBLISH.  This is
+     * what makes a stale WARM transition especially destructive: a later
+     * viewer can manufacture a pull SUBSCRIBE alongside the live PUBLISH. */
+    moq_publish_namespace_cfg_t ncfg;
+    moq_publish_namespace_cfg_init(&ncfg);
+    ncfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    moq_announcement_t ann;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &ncfg, rig.now,
+                                                 &ann) == MOQ_OK);
+    rig_pump(&rig, 4);
+
+    moq_publish_cfg_t pc;
+    moq_publish_cfg_init(&pc);
+    pc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    pc.track_name = B("video");
+    moq_publication_t pubh;
+    R_CHECK(&rig, moq_session_publish(pub->peer, &pc, rig.now, &pubh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
+    R_CHECK(&rig, pub_ps.publish_ok && !pub_ps.publish_error);
+
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    sc.track_name = B("video");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t sh;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &sc, rig.now, &sh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
+    R_CHECK(&rig, sub_ps.subscribe_ok);
+    R_CHECK(&rig, pub_ps.up_subs == 0); /* PUBLISH already owns the source. */
+
+    se_send_group(&rig, pub, true, MOQ_SUBSCRIPTION_INVALID, pubh, 0, 1);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
+    R_CHECK(&rig, sub_ps.objects == 1 && sub_ps.last_group == 0);
+
+    moqr_bind_stats_t before;
+    moqr_bind_get_stats(rig.bind, &before);
+
+    /* Retire the only downstream and cross the configured 500us linger. */
+    R_CHECK(&rig, moq_session_unsubscribe(sub->peer, sh, rig.now) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
+
+    /* The accepted PUBLISH remains the source, hence the track must not have
+     * been turned WARM by a pull-only teardown. */
+    char route[4096];
+    size_t route_len = 0;
+    R_CHECK(&rig, moqr_core_route_dump_json(rig.core, route, sizeof(route),
+                                             &route_len) == MOQR_OK);
+    R_CHECK(&rig, route_len < sizeof(route));
+    R_CHECK(&rig, strstr(route,
+                         "\"name\":\"video\",\"state\":\"active\"") != NULL);
+
+    /* Data still permitted by the publication must remain acceptable.  The
+     * buggy implementation increments ingest_refusals here because the core
+     * track is WARM even though the wire publication is still established. */
+    se_send_group(&rig, pub, true, MOQ_SUBSCRIPTION_INVALID, pubh, 1, 1);
+    rig_pump(&rig, 6);
+    moqr_bind_stats_t after;
+    moqr_bind_get_stats(rig.bind, &after);
+    R_CHECK(&rig, after.ingest_refusals == before.ingest_refusals);
+
+    /* A new downstream binds directly to the still-live push source.  It must
+     * not manufacture a pull SUBSCRIBE alongside the existing PUBLISH. */
+    conn_t *sub2 = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    R_CHECK(&rig, sub2 != NULL);
+    peer_state_t sub2_ps;
+    memset(&sub2_ps, 0, sizeof(sub2_ps));
+    rig_pump(&rig, 4);
+    moq_subscription_t sh2;
+    R_CHECK(&rig, moq_session_subscribe(sub2->peer, &sc, rig.now, &sh2) ==
+                      MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
+    peer_drain(&rig, sub2, &sub2_ps, false, false, 0, 0);
+    R_CHECK(&rig, pub_ps.up_subs == 0);
+    R_CHECK(&rig, sub2_ps.subscribe_ok);
+
+    int sub2_objects = sub2_ps.objects;
+    se_send_group(&rig, pub, true, MOQ_SUBSCRIPTION_INVALID, pubh, 2, 1);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, sub2, &sub2_ps, false, false, 0, 0);
+    moqr_bind_get_stats(rig.bind, &after);
+    R_CHECK(&rig, after.ingest_refusals == before.ingest_refusals);
+    R_CHECK(&rig, sub2_ps.objects == sub2_objects + 1 &&
+                  sub2_ps.last_group == 2);
+
+    /* Repeat the churn once more.  The deployed unfixed relay failed only
+     * after accumulated viewer sessions, so keep the deterministic regression
+     * from becoming a single-transition special case. */
+    R_CHECK(&rig, moq_session_unsubscribe(sub2->peer, sh2, rig.now) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
+
+    route_len = 0;
+    R_CHECK(&rig, moqr_core_route_dump_json(rig.core, route, sizeof(route),
+                                             &route_len) == MOQR_OK);
+    R_CHECK(&rig, route_len < sizeof(route));
+    R_CHECK(&rig, strstr(route,
+                         "\"name\":\"video\",\"state\":\"active\"") != NULL);
+
+    se_send_group(&rig, pub, true, MOQ_SUBSCRIPTION_INVALID, pubh, 3, 1);
+    rig_pump(&rig, 6);
+    moqr_bind_get_stats(rig.bind, &after);
+    R_CHECK(&rig, after.ingest_refusals == before.ingest_refusals);
+
+    conn_t *sub3 = rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    R_CHECK(&rig, sub3 != NULL);
+    peer_state_t sub3_ps;
+    memset(&sub3_ps, 0, sizeof(sub3_ps));
+    rig_pump(&rig, 4);
+    moq_subscription_t sh3;
+    R_CHECK(&rig, moq_session_subscribe(sub3->peer, &sc, rig.now, &sh3) ==
+                      MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, pub, &pub_ps, false, false, 0, 0);
+    peer_drain(&rig, sub3, &sub3_ps, false, false, 0, 0);
+    R_CHECK(&rig, pub_ps.up_subs == 0);
+    R_CHECK(&rig, sub3_ps.subscribe_ok);
+
+    int sub3_objects = sub3_ps.objects;
+    se_send_group(&rig, pub, true, MOQ_SUBSCRIPTION_INVALID, pubh, 4, 1);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, sub3, &sub3_ps, false, false, 0, 0);
+    moqr_bind_get_stats(rig.bind, &after);
+    R_CHECK(&rig, after.ingest_refusals == before.ingest_refusals);
+    R_CHECK(&rig, sub3_ps.objects == sub3_objects + 1 &&
+                  sub3_ps.last_group == 4);
+
+    rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    int f = rig.failures;
+    if (f == 0) {
+        printf("PASS: dataplane_push_survives_downstream_linger\n");
+    }
+    return f;
+}
+
 /* ---- Mixed d16/d18 object bridging oracle -------------------------------- *
  * Real wire objects from a publisher on one draft must be delivered correctly to
  * a subscriber on the other draft, through the production binding — the relay
@@ -12322,6 +12499,7 @@ main(void)
     failures += dataplane_source_end_oracle(false, 3);   /* pull + backpressure */
     failures += dataplane_source_end_oracle(true, 0);    /* push            */
     failures += dataplane_source_end_oracle(true, 3);    /* push + backpressure */
+    failures += dataplane_push_survives_downstream_linger();
     failures += dataplane_mixed_draft_oracle(MOQ_VERSION_DRAFT_16,
                                              MOQ_VERSION_DRAFT_18, 0);
     failures += dataplane_mixed_draft_oracle(MOQ_VERSION_DRAFT_18,

@@ -427,14 +427,9 @@ test_warm_linger_and_status(void)
     moq_bytes_t nsb[2];
     MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
 
-    moqr_track_t track;
-    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "n", "s"),
-                                          B("t"), 5, &track) == MOQR_OK);
-    moqr_intent_t its[8];
-    (void)drain(c, its, 8);
-    MOQ_TEST_CHECK(ing(c, &a, track, 1, 0, 0, 128) == MOQR_OK);
-
-    /* Subscribe, deliver, unsubscribe -> linger -> WARM after tick. */
+    /* Linger is a pull-source policy.  Establish this track through the
+     * announce -> upstream SUBSCRIBE path, not PUBLISH: a live push source
+     * remains authoritative until PUBLISH_FINISHED or its binding closes. */
     moqr_subscribe_req_t rq;
     moqr_subscribe_req_init(&rq);
     rq.ns = NS2(nsb, "n", "s");
@@ -443,12 +438,25 @@ test_warm_linger_and_status(void)
     rq.cookie = 9;
     moqr_sub_t sub;
     MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &sub) == MOQR_OK);
-    (void)drain(c, its, 8);
+    moqr_intent_t its[8];
+    size_t n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+    moqr_track_t track = its[0].track;
+    uint64_t track_gen = its[0].track_gen;
+    MOQ_TEST_CHECK(moqr_core_upstream_ok(c, track, track_gen, 5, false, 0, 0) ==
+                   MOQR_OK);
+    n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_SUB);
+    MOQ_TEST_CHECK(ing(c, &a, track, 1, 0, 0, 128) == MOQR_OK);
+
+    /* Subscribe, deliver, unsubscribe -> linger -> WARM after tick. */
     MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 100) == MOQR_OK);
     MOQ_TEST_CHECK(moqr_core_tick(c, 500) == MOQR_OK);   /* not yet */
     MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)0);
     MOQ_TEST_CHECK(moqr_core_tick(c, 1200) == MOQR_OK);  /* past linger */
-    size_t n = drain(c, its, 8);
+    n = drain(c, its, 8);
     MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
     MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_UPSTREAM_UNSUBSCRIBE);
 
@@ -509,13 +517,9 @@ test_stream_error_retire_linger(void)
     MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &s1) == MOQR_OK);
     moq_bytes_t nsb[2];
     MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
-    moqr_track_t track;
-    MOQ_TEST_CHECK(moqr_core_publish_open(c, pub, NS2(nsb, "n", "s"),
-                                          B("t"), 5, &track) == MOQR_OK);
-    moqr_intent_t its[8];
-    (void)drain(c, its, 8);
-    MOQ_TEST_CHECK(ing(c, &a, track, 1, 0, 0, 128) == MOQR_OK);
 
+    /* This clock oracle also needs a pull source: only a pull subscription has
+     * a demand-owned linger deadline to release. */
     moqr_subscribe_req_t rq;
     moqr_subscribe_req_init(&rq);
     rq.ns = NS2(nsb, "n", "s");
@@ -524,7 +528,18 @@ test_stream_error_retire_linger(void)
     rq.cookie = 9;
     moqr_sub_t sub;
     MOQ_TEST_CHECK(moqr_core_subscribe(c, s1, &rq, &sub) == MOQR_OK);
-    (void)drain(c, its, 8);
+    moqr_intent_t its[8];
+    size_t n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
+    moqr_track_t track = its[0].track;
+    uint64_t track_gen = its[0].track_gen;
+    MOQ_TEST_CHECK(moqr_core_upstream_ok(c, track, track_gen, 5, false, 0, 0) ==
+                   MOQR_OK);
+    n = drain(c, its, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_ACCEPT_SUB);
+    MOQ_TEST_CHECK(ing(c, &a, track, 1, 0, 0, 128) == MOQR_OK);
 
     /* One outstanding delivery, failed terminally at now_us = 10000. The last
      * subscriber of the ACTIVE track retires; linger arms at 10000 + 1000. */
@@ -541,7 +556,7 @@ test_stream_error_retire_linger(void)
 
     /* Past 11000 the track warms and releases the upstream exactly once. */
     MOQ_TEST_CHECK(moqr_core_tick(c, 11500) == MOQR_OK);
-    size_t n = drain(c, its, 8);
+    n = drain(c, its, 8);
     MOQ_TEST_CHECK_EQ_SIZE(n, (size_t)1);
     MOQ_TEST_CHECK_EQ_U64(its[0].kind, MOQR_INTENT_UPSTREAM_UNSUBSCRIBE);
 

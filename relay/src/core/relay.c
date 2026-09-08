@@ -241,6 +241,11 @@ typedef uint32_t r_track_state_t;
 #define R_TRACK_ACTIVE  2u
 #define R_TRACK_WARM    3u
 
+typedef uint8_t r_track_source_t;
+#define R_TRACK_SOURCE_NONE 0u
+#define R_TRACK_SOURCE_PULL 1u
+#define R_TRACK_SOURCE_PUSH 2u
+
 typedef struct r_track {
     uint32_t        gen;          /* odd = live                            */
     /* Head of the per-track subscriber index (R_SUB_NIL when empty). */
@@ -250,6 +255,7 @@ typedef struct r_track {
     moqr_log_t     *log;
     r_track_state_t state;
     uint64_t        track_gen;    /* upstream attempt identity guard       */
+    r_track_source_t source_kind;
     bool            has_upstream_binding;
     uint32_t        up_binding;
     uint32_t        up_binding_gen;
@@ -2199,7 +2205,8 @@ sub_retire(moqr_core_t *c, uint32_t slot, uint64_t now_us)
         c->tracks[track_slot].gen == s->track_gen_slot) {
         /* Last subscriber arms the linger deadline. */
         if (track_sub_count(c, track_slot) == 1 /* this one */ &&
-            c->tracks[track_slot].state == R_TRACK_ACTIVE) {
+            c->tracks[track_slot].state == R_TRACK_ACTIVE &&
+            c->tracks[track_slot].source_kind == R_TRACK_SOURCE_PULL) {
             c->tracks[track_slot].linger_deadline_us =
                 now_us + c->linger_us;
             if (c->tracks[track_slot].linger_deadline_us == 0) {
@@ -2291,6 +2298,7 @@ track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
             return MOQR_ERR_WOULD_BLOCK;
         }
         t->state = R_TRACK_PENDING;
+        t->source_kind = R_TRACK_SOURCE_PULL;
         t->track_gen++;
         t->has_upstream_binding = true;
         t->up_binding = c->nodes[pub_node].ann_binding;
@@ -2399,6 +2407,7 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
             }
         }
         t->has_upstream_binding = false;
+        t->source_kind = R_TRACK_SOURCE_NONE;
         t->state = R_TRACK_WARM;
         t->track_gen++;   /* stale any in-flight resolution */
         moqr_log_stats_t ls;
@@ -3064,6 +3073,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         }
         r_track_t *t = &c->tracks[tslot];
         t->state = R_TRACK_PENDING;
+        t->source_kind = R_TRACK_SOURCE_PULL;
         t->track_gen++;
         t->has_upstream_binding = true;
         t->up_binding = c->nodes[pub_node].ann_binding;
@@ -3165,6 +3175,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         uint32_t pub_node = trie_longest_announce(c, req->ns);
         if (pub_node != UINT32_MAX) {
             t->state = R_TRACK_PENDING;
+            t->source_kind = R_TRACK_SOURCE_PULL;
             t->track_gen++;
             t->has_upstream_binding = true;
             t->up_binding = c->nodes[pub_node].ann_binding;
@@ -3502,6 +3513,7 @@ moqr_core_upstream_error(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
         sub_retire(c, i, now_us);
     }
     t->has_upstream_binding = false;
+    t->source_kind = R_TRACK_SOURCE_NONE;
     moqr_log_stats_t ls;
     moqr_log_get_stats(t->log, &ls);
     if (ls.record_count == 0 && track_sub_count(c, tslot) == 0 &&
@@ -3549,6 +3561,7 @@ moqr_core_upstream_cancel(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
      * the source-release rules — free when nothing is retained, else WARM
      * (a cancelled rejoin must keep the retained log it was rejoining for). */
     t->has_upstream_binding = false;
+    t->source_kind = R_TRACK_SOURCE_NONE;
     t->track_gen++;
     moqr_log_stats_t ls;
     moqr_log_get_stats(t->log, &ls);
@@ -3616,6 +3629,7 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
             return MOQR_OK;
         }
         t->state = R_TRACK_ACTIVE;
+        t->source_kind = R_TRACK_SOURCE_PUSH;
         t->track_gen++;
         t->has_upstream_binding = true;
         t->up_binding = bslot;
@@ -3636,6 +3650,7 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     }
     r_track_t *t = &c->tracks[tslot];
     t->state = R_TRACK_ACTIVE;
+    t->source_kind = R_TRACK_SOURCE_PUSH;
     t->track_gen = 1;
     t->has_upstream_binding = true;
     t->up_binding = bslot;
@@ -4084,7 +4099,9 @@ moqr_core_tick(moqr_core_t *c, uint64_t now_us)
         if (track_fetch_count(c, i) == 0) {
             (void)moqr_log_tick(t->log, now_us);
         }
-        if (t->state == R_TRACK_ACTIVE && t->linger_deadline_us != 0 &&
+        if (t->state == R_TRACK_ACTIVE &&
+            t->source_kind == R_TRACK_SOURCE_PULL &&
+            t->linger_deadline_us != 0 &&
             now_us >= t->linger_deadline_us &&
             track_sub_count(c, i) == 0) {
             if (!intent_space(c, 1)) {
@@ -4101,6 +4118,7 @@ moqr_core_tick(moqr_core_t *c, uint64_t now_us)
             }
             t->linger_deadline_us = 0;
             t->has_upstream_binding = false;
+            t->source_kind = R_TRACK_SOURCE_NONE;
             t->track_gen++;
             t->state = R_TRACK_WARM;
         }
@@ -5680,6 +5698,7 @@ moqr_core_upstream_lost(moqr_core_t *c, moqr_track_t th, uint64_t track_gen)
         return MOQR_ERR_WRONG_STATE;
     }
     t->has_upstream_binding = false;
+    t->source_kind = R_TRACK_SOURCE_NONE;
     t->track_gen++;
     moqr_log_stats_t ls;
     moqr_log_get_stats(t->log, &ls);
@@ -5750,6 +5769,7 @@ moqr_core_source_done(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
      * late upstream resolution is refused; keep retained content WARM for a
      * rejoin, or free the track when nothing remains. */
     t->has_upstream_binding = false;
+    t->source_kind = R_TRACK_SOURCE_NONE;
     t->track_gen++;
     moqr_log_stats_t ls;
     moqr_log_get_stats(t->log, &ls);

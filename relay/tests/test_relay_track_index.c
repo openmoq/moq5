@@ -15,6 +15,7 @@
 
 #include "relay.c"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +102,7 @@ typedef struct r_track_baseline {
     moqr_log_t     *log;
     r_track_state_t state;
     uint64_t        track_gen;
+    r_track_source_t source_kind;
     bool            has_upstream_binding;
     uint32_t        up_binding;
     uint32_t        up_binding_gen;
@@ -238,7 +240,7 @@ index_check_all(const moqr_core_t *c, bool *seen, char *errbuf, size_t cap)
     for (uint32_t t = 0; t < c->max_tracks; t++) {
         const char *why = index_check(c, t, seen);
         if (why != NULL) {
-            snprintf(errbuf, cap, "track %u: %s", t, why);
+            snprintf(errbuf, cap, "track %" PRIu32 ": %s", t, why);
             return errbuf;
         }
     }
@@ -252,7 +254,7 @@ index_check_all(const moqr_core_t *c, bool *seen, char *errbuf, size_t cap)
         }
         if (c->subs[i].track_next != R_SUB_NIL ||
             c->subs[i].track_prev != R_SUB_NIL) {
-            snprintf(errbuf, cap, "sub %u: orphan-links-not-cleared", i);
+            snprintf(errbuf, cap, "sub %" PRIu32 ": orphan-links-not-cleared", i);
             return errbuf;
         }
     }
