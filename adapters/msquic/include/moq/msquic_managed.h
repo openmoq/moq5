@@ -82,9 +82,11 @@
  * API — a server observes terminal by polling SESSION_CLOSED inside the
  * lane pump. The pending probes aggregate across all live connections
  * (zero at quiescence) and are valid for both. The client connection is
- * likewise not acknowledged: the facade owns its lifetime, and
- * moq_msquic_managed_session() is pump-scoped and simply reads NULL once
- * that connection is gone.
+ * likewise not acknowledged: its transport/adapter child may be reclaimed
+ * after quiescence, but the facade retains the client MoQ session until
+ * destroy() so service attachments can complete terminal cleanup. The
+ * moq_msquic_managed_session() accessor remains pump-scoped and reads NULL
+ * once the connection child is gone.
  *
  * Version: clients are exact-version and offer exactly one MoQ ALPN,
  * chosen by cfg.version (default draft-16 / "moqt-16"). Servers may
@@ -285,11 +287,13 @@ MOQ_API void moq_msquic_managed_cfg_init_sized(
 MOQ_API moq_result_t moq_msquic_managed_create(
     const moq_msquic_managed_cfg_t *cfg, moq_msquic_managed_t **out);
 
-/* Quiesce the transport and stop every lane doorbell. Idempotent.
+/* Quiesce the transport and stop every lane doorbell. Idempotent. A client's
+ * MoQ session remains valid until destroy(), although its pump-scoped accessor
+ * is no longer available after the connection child is reclaimed.
  * Refused with MOQ_ERR_WRONG_STATE from inside on_lane_pump/on_activity. */
 MOQ_API moq_result_t moq_msquic_managed_stop(moq_msquic_managed_t *m);
 
-/* After stop(). */
+/* After stop(). Releases the retained client session and all facade storage. */
 MOQ_API void moq_msquic_managed_destroy(moq_msquic_managed_t *m);
 
 /* CLIENT ONLY: the single client connection's session, valid to use
@@ -474,9 +478,9 @@ MOQ_API void *moq_msquic_managed_conn_user(
  *   MOQ_OK               accepted; also returned for a duplicate call while the
  *                        handle is still valid in the current callback.
  *   MOQ_ERR_INVAL        conn == NULL.
- *   MOQ_ERR_WRONG_STATE  the single client connection (it is not reclaimed
- *                        per-child); outside the owning lane's pump; or the
- *                        terminal has not been observed yet.
+ *   MOQ_ERR_WRONG_STATE  the single client connection (it does not use server
+ *                        acknowledgment); outside the owning lane's pump; or
+ *                        the terminal has not been observed yet.
  *
  * HANDLE LIFETIME. The handle is valid only for the current callback. After a
  * successful acknowledgment the connection may be reclaimed as soon as that

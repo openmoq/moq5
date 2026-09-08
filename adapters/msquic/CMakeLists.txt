@@ -795,6 +795,28 @@ if(MOQ_BUILD_TESTS)
             LABELS "msquic;sansio"
             TIMEOUT 30)
 
+        add_executable(test_msquic_client_session_lifetime
+            tests/test_msquic_client_session_lifetime.c
+            tests/support/fake_msq_table.c
+            msquic_adapter.c msquic_managed.c)
+        target_include_directories(test_msquic_client_session_lifetime PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(test_msquic_client_session_lifetime PRIVATE
+            MOQ_MSQUIC_TESTING MOQ_BUILDING)
+        target_link_libraries(test_msquic_client_session_lifetime PRIVATE
+            moq::core msquic::msquic Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_msquic_client_session_lifetime PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME msquic_client_session_lifetime
+            COMMAND test_msquic_client_session_lifetime)
+        set_tests_properties(msquic_client_session_lifetime PROPERTIES
+            LABELS "msquic;sansio" TIMEOUT 30)
+
         # Production-contract conformance over real MsQuic loopback:
         # every MoQ session call runs inside the managed on_lane_pump,
         # driven by per-side event-triggered scripts (see

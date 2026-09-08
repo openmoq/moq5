@@ -771,6 +771,12 @@ if(MOQ_BUILD_TESTS)
             moq::service moq::adapter-msquic-managed Threads::Threads)
         target_include_directories(test_endpoint_msquic_smoke PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_executable(test_endpoint_msquic_sender_teardown
+            tests/test_endpoint_msquic_sender_teardown.c)
+        target_link_libraries(test_endpoint_msquic_sender_teardown PRIVATE
+            moq::service moq::adapter-msquic-managed Threads::Threads)
+        target_include_directories(test_endpoint_msquic_sender_teardown PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
         find_program(MOQ_OPENSSL openssl)
         if(MOQ_OPENSSL)
             add_test(NAME service_msquic_gen_certs
@@ -787,6 +793,13 @@ if(MOQ_BUILD_TESTS)
                     --cert ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
                     --key ${CMAKE_CURRENT_BINARY_DIR}/msquic_key.pem)
             set_tests_properties(endpoint_msquic_smoke PROPERTIES
+                FIXTURES_REQUIRED service_msquic_certs
+                LABELS "network;msquic" TIMEOUT 120)
+            add_test(NAME endpoint_msquic_sender_teardown
+                COMMAND test_endpoint_msquic_sender_teardown
+                    --cert ${CMAKE_CURRENT_BINARY_DIR}/msquic_cert.pem
+                    --key ${CMAKE_CURRENT_BINARY_DIR}/msquic_key.pem)
+            set_tests_properties(endpoint_msquic_sender_teardown PROPERTIES
                 FIXTURES_REQUIRED service_msquic_certs
                 LABELS "network;msquic" TIMEOUT 120)
         endif()

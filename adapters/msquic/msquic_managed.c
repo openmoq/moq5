@@ -64,10 +64,12 @@ static _Thread_local moq_msquic_managed_t *mgd_tls_cb;
 static _Thread_local moq_msquic_managed_lane_t *mgd_tls_lane;
 
 /* One accepted (or, for a client, the one initiated) connection: its
- * own MoQ session + attach adapter conn, serialized by its OWNING
+ * MoQ session + attach adapter conn, serialized by its OWNING
  * LANE's mutex (the attach guard points at the conn, which carries its
- * lane). Freed only after SHUTDOWN_COMPLETE — MsQuic's last event —
- * and outside all locks (ConnectionClose blocks on callback drain). */
+ * lane). The transport/adapter child is freed only after SHUTDOWN_COMPLETE —
+ * MsQuic's last event — and outside all locks (ConnectionClose blocks on
+ * callback drain). A server child owns its session; the client facade retains
+ * its session storage through managed_destroy(). */
 struct moq_msquic_managed_conn {
     struct moq_msquic_managed_conn *next;
     moq_msquic_managed_t *owner;
@@ -221,6 +223,13 @@ struct moq_msquic_managed {
     uint32_t next_lane;               /* round-robin cursor (under m->mu) */
     size_t conn_count;                /* facade-wide reserve (under m->mu) */
     bool draining;                    /* refuse new accepts */
+
+    /* CLIENT: quiesced children whose transport and adapter are gone, retained
+     * solely to keep their MoQ sessions alive until destroy(). Production has
+     * one client child; using the child nodes as the private retirement list
+     * also preserves the generic multi-child test substrate without an
+     * overwriteable single-session slot. Servers leave this NULL. */
+    moq_msquic_managed_conn_t *retired_clients;
 
     /* CLIENT compat latch: the single client connection's terminal,
      * latched when it becomes reapable (client-only accessors). */
@@ -492,7 +501,6 @@ static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
         m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
-
     moq_msquic_conn_cfg_t ccfg;
     moq_msquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
     ccfg.alloc = &m->alloc;
@@ -548,15 +556,27 @@ static void mgd_release_reserve(moq_msquic_managed_t *m)
     pthread_mutex_unlock(&m->mu);
 }
 
-/* Free a fully quiesced child: SHUTDOWN_COMPLETE has been observed, so
- * no callback can fire — the blocking ConnectionClose and the adapter
- * teardown are safe. Must be called with NO locks held. */
-static void mgd_free_child(moq_msquic_managed_t *m,
-                           moq_msquic_managed_conn_t *mc)
+/* Retire a fully quiesced transport/adapter child: SHUTDOWN_COMPLETE has been
+ * observed, so no callback can fire and ConnectionClose is safe. A server
+ * releases the whole child here. A client releases the transport and adapter,
+ * then links the child storage onto the facade's private retirement list so
+ * its session remains alive until managed_destroy(). Must be called with NO
+ * locks held. */
+static void mgd_retire_child(moq_msquic_managed_t *m,
+                             moq_msquic_managed_conn_t *mc)
 {
     if (mc->connection != NULL)
         m->api->ConnectionClose(mc->connection);
     moq_msquic_conn_destroy(mc->conn);
+    mc->connection = NULL;
+    mc->conn = NULL;
+    if (m->cfg.perspective == MOQ_PERSPECTIVE_CLIENT) {
+        /* Client mode has one lane, so normal reaping has one writer. stop()
+         * joins that writer before retiring any remaining child. */
+        mc->next = m->retired_clients;
+        m->retired_clients = mc;
+        return;
+    }
     moq_session_destroy(mc->session);
     m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
 }
@@ -842,10 +862,10 @@ bool moq_msq_test_lane_inject_idle_child(moq_msquic_managed_lane_t *lane)
  * SESSION_CLOSED still needs its child, its session and its per-connection
  * state on a later pump.
  *
- * The single CLIENT connection is exempt. It is not a per-child reclamation
- * surface — the facade owns its lifetime, moq_msquic_managed_session() is
- * pump-scoped and simply reads NULL once the child is gone, so a client that
- * follows the documented handle rules cannot retain a destroyed session. */
+ * The single CLIENT connection is exempt from application acknowledgment. Its
+ * quiesced transport/adapter child may be reclaimed, but the facade retains the
+ * MoQ session until managed_destroy() so service attachments can finish their
+ * terminal cleanup after managed_stop(). */
 static bool mgd_child_reclaimable(const moq_msquic_managed_conn_t *mc)
 {
     if (!mc->reapable || !mc->conn->shutdown_complete)
@@ -890,7 +910,7 @@ static void doorbell_reap(moq_msquic_managed_lane_t *lane)
         mgd_lane_latch_flush(lane, victim);
         mgd_lane_remove(lane, victim);
         pthread_mutex_unlock(&lane->mu);
-        mgd_free_child(m, victim);
+        mgd_retire_child(m, victim);
         mgd_release_reserve(m); /* a freed slot may admit an accept */
         pthread_mutex_lock(&lane->mu);
 #ifdef MOQ_MSQUIC_TESTING
@@ -1483,6 +1503,13 @@ static void mgd_free(moq_msquic_managed_t *m)
     moq_alloc_t alloc = m->alloc;
 
     mgd_lanes_free(m);
+    while (m->retired_clients != NULL) {
+        moq_msquic_managed_conn_t *mc = m->retired_clients;
+
+        m->retired_clients = mc->next;
+        moq_session_destroy(mc->session);
+        alloc.free(mc, sizeof(*mc), alloc.ctx);
+    }
     mgd_strfree(&alloc, m->host);
     mgd_strfree(&alloc, m->cert_path);
     mgd_strfree(&alloc, m->key_path);
@@ -2044,7 +2071,7 @@ moq_result_t moq_msquic_managed_create(
                 moq_msquic_managed_conn_t *mc = m->lanes[i].conns;
 
                 m->lanes[i].conns = mc->next;
-                mgd_free_child(m, mc);
+                mgd_retire_child(m, mc);
             }
         mgd_close_transport(m);
         mgd_free(m);
@@ -2415,7 +2442,7 @@ moq_result_t moq_msquic_managed_stop(moq_msquic_managed_t *m)
             m->lanes[i].conns = mc->next;
             m->lanes[i].conn_count--;
             m->conn_count--;
-            mgd_free_child(m, mc);
+            mgd_retire_child(m, mc);
         }
     /* every connection quiesced (SHUTDOWN_COMPLETE) then freed: all sends
      * have completed or canceled, so the true pending counts are 0. The
@@ -2678,9 +2705,9 @@ moq_result_t moq_msquic_managed_conn_ack_terminal(
 {
     if (conn == NULL)
         return MOQ_ERR_INVAL;
-    /* The single client connection is not reclaimed per-child, so there is
-     * nothing to acknowledge — refuse rather than record a fact the reap
-     * gate never reads. */
+    /* A client does not participate in server child acknowledgment: its
+     * quiesced transport/adapter may be reclaimed immediately, while its MoQ
+     * session remains facade-owned through managed_destroy(). */
     if (conn->owner->cfg.perspective == MOQ_PERSPECTIVE_CLIENT)
         return MOQ_ERR_WRONG_STATE;
     /* Owning lane's pump only: that window is what makes `conn` a valid
