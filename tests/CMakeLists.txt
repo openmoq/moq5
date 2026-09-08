@@ -511,7 +511,11 @@ if(TARGET moq::msf AND TARGET moq::cmaf AND TARGET moq::loc)
         support/media_conformance.c
         support/media_builders.c)
     target_link_libraries(test_media_conformance PRIVATE
-        moq::msf moq::cmaf moq::loc)
+        moq::msf)
+    if(NOT TARGET moq::media-object)
+        # Without the normalizer, MSF does not propagate CMAF and LOC.
+        target_link_libraries(test_media_conformance PRIVATE moq::cmaf moq::loc)
+    endif()
     add_test(NAME media_conformance COMMAND test_media_conformance)
 endif()
 

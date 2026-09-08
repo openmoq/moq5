@@ -239,7 +239,7 @@ if(MOQ_BUILD_TESTS)
         ${CMAKE_SOURCE_DIR}/tests/support/np/np_tables.c
         ${CMAKE_SOURCE_DIR}/tests/support/np/np_oracle.c)
     target_link_libraries(test_negotiated_profile_offer PRIVATE
-        moq-service-test-internals moq::core)
+        moq-service-test-internals)
     target_compile_definitions(test_negotiated_profile_offer PRIVATE
         ${_MOQ_SERVICE_FACADE_DEFS})
     target_include_directories(test_negotiated_profile_offer PRIVATE
@@ -251,7 +251,7 @@ if(MOQ_BUILD_TESTS)
 
     add_executable(test_endpoint_resolve tests/test_endpoint_resolve.c)
     target_link_libraries(test_endpoint_resolve PRIVATE
-        moq-service-test-internals moq::core)
+        moq-service-test-internals)
     # The test's compile-guarded cases (#ifdef MOQ_SERVICE_HAVE_*_MANAGED) must
     # see the same facade set the linked resolver was built with, or a built
     # backend takes the "not built" branch and mismatches.
@@ -340,7 +340,7 @@ if(MOQ_BUILD_TESTS)
 
     add_executable(test_endpoint_post_contract tests/test_endpoint_post_contract.c)
     target_link_libraries(test_endpoint_post_contract PRIVATE
-        moq-service-endpoint-test-internals moq::core Threads::Threads)
+        moq-service-endpoint-test-internals)
     target_include_directories(test_endpoint_post_contract PRIVATE
         ${CMAKE_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_post_contract COMMAND test_endpoint_post_contract)
@@ -367,8 +367,7 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_media_catalog_update
             tests/test_media_catalog_update.c)
         target_link_libraries(test_media_catalog_update PRIVATE
-            moq-service-receiver-test-internals moq::core moq::msf
-            Threads::Threads)
+            moq-service-receiver-test-internals)
         target_include_directories(test_media_catalog_update PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
@@ -379,8 +378,7 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_media_catalog_publication_race
             tests/test_media_catalog_publication_race.c)
         target_link_libraries(test_media_catalog_publication_race PRIVATE
-            moq-service-receiver-test-internals moq::core moq::msf
-            Threads::Threads)
+            moq-service-receiver-test-internals)
         target_include_directories(test_media_catalog_publication_race PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_publication_race
@@ -393,8 +391,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_scripted
                 tests/test_media_receiver_scripted.c)
             target_link_libraries(test_media_receiver_scripted PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_scripted PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_scripted
@@ -402,8 +399,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_update_ack
                 tests/test_media_receiver_update_ack.c)
             target_link_libraries(test_media_receiver_update_ack PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_update_ack PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_update_ack
@@ -417,8 +413,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_largeobj
                 tests/test_media_receiver_largeobj.c)
             target_link_libraries(test_media_receiver_largeobj PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_largeobj PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_largeobj
@@ -429,8 +424,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_fetch_catalog
                 tests/test_media_receiver_fetch_catalog.c)
             target_link_libraries(test_media_receiver_fetch_catalog PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_fetch_catalog PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_fetch_catalog
@@ -440,8 +434,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_roleless
                 tests/test_media_receiver_roleless.c)
             target_link_libraries(test_media_receiver_roleless PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_roleless PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_roleless
@@ -454,8 +447,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_teardown
                 tests/test_media_receiver_teardown.c)
             target_link_libraries(test_media_receiver_teardown PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_teardown PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_teardown
@@ -466,8 +458,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_receiver_teardown_retry
                 tests/test_media_receiver_teardown_retry.c)
             target_link_libraries(test_media_receiver_teardown_retry PRIVATE
-                moq-service-receiver-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_teardown_retry PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_teardown_retry
@@ -494,8 +485,7 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_media_sender_catalog
             tests/test_media_sender_catalog.c)
         target_link_libraries(test_media_sender_catalog PRIVATE
-            moq-service-sender-test-internals moq::core moq::msf
-            Threads::Threads)
+            moq-service-sender-test-internals)
         target_include_directories(test_media_sender_catalog PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_catalog COMMAND test_media_sender_catalog)
@@ -505,8 +495,7 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_media_sender_lifecycle
             tests/test_media_sender_lifecycle.c)
         target_link_libraries(test_media_sender_lifecycle PRIVATE
-            moq-service-sender-test-internals moq::core moq::msf
-            Threads::Threads)
+            moq-service-sender-test-internals)
         target_include_directories(test_media_sender_lifecycle PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_lifecycle
@@ -516,8 +505,7 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_media_sender_pacing
             tests/test_media_sender_pacing.c)
         target_link_libraries(test_media_sender_pacing PRIVATE
-            moq-service-sender-test-internals moq::core moq::msf
-            moq::sim Threads::Threads)
+            moq-service-sender-test-internals moq::sim)
         target_include_directories(test_media_sender_pacing PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_pacing
@@ -526,8 +514,7 @@ if(MOQ_BUILD_TESTS)
         add_executable(test_media_sender_reject
             tests/test_media_sender_reject.c)
         target_link_libraries(test_media_sender_reject PRIVATE
-            moq-service-sender-test-internals moq::core moq::msf
-            moq::sim Threads::Threads)
+            moq-service-sender-test-internals moq::sim)
         target_include_directories(test_media_sender_reject PRIVATE
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_reject
@@ -558,8 +545,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_media_sender_refresh
                 tests/test_media_sender_refresh.c)
             target_link_libraries(test_media_sender_refresh PRIVATE
-                moq-service-refresh-test-internals moq::core moq::msf
-                moq::sim Threads::Threads)
+                moq-service-refresh-test-internals moq::sim)
             target_include_directories(test_media_sender_refresh PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_sender_refresh
@@ -579,8 +565,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_np_closure_sender
                 tests/test_np_closure_sender.c)
             target_link_libraries(test_np_closure_sender PRIVATE
-                moq-service-refresh-test-internals moq::core moq::msf
-                moq::sim Threads::Threads
+                moq-service-refresh-test-internals moq::sim
                 np_runner_obj np_builder_obj np_oracle_obj)
             target_include_directories(test_np_closure_sender PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit
@@ -590,8 +575,7 @@ if(MOQ_BUILD_TESTS)
             add_executable(test_np_closure_receiver
                 tests/test_np_closure_receiver.c)
             target_link_libraries(test_np_closure_receiver PRIVATE
-                moq-service-refresh-test-internals moq::core moq::msf
-                moq::sim Threads::Threads
+                moq-service-refresh-test-internals moq::sim
                 np_runner_obj np_builder_obj np_oracle_obj)
             target_include_directories(test_np_closure_receiver PRIVATE
                 ${CMAKE_SOURCE_DIR}/tests/unit
