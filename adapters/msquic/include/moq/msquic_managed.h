@@ -254,6 +254,14 @@ typedef struct moq_msquic_managed_cfg {
      * accepted connection's immutable selected draft. */
     const moq_version_t *versions;
     size_t version_count;
+    /* appended: QUIC keepalive interval in milliseconds (MsQuic's
+     * KeepAliveIntervalMs). 0 = none (the default, and what prefix-sized
+     * callers get). A nonzero value keeps an otherwise idle connection (a
+     * publisher waiting for its first subscriber) from being idle-timed-out
+     * by the peer; red5-moq-relay and moxygen close a silent connection after
+     * 30 s. Mirrors moq_pq_threaded_cfg_t / moq_pico_wt_managed_cfg_t
+     * keep_alive_interval_ms. */
+    uint32_t keep_alive_interval_ms;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(

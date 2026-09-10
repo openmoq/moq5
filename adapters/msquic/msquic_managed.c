@@ -240,6 +240,14 @@ struct moq_msquic_managed {
      * to stay data-race-free. */
     atomic_bool stop_requested;
     bool stopped;
+    /* CLIENT: the session of a connection reclaimed by the doorbell reap or
+     * by stop(). It stays allocated (no longer serviced) until destroy(), as
+     * on the picoquic facades: the service tier's media sender keeps a
+     * pointer to it and runs moq_pub_destroy() from moq_endpoint_stop()'s
+     * terminal drain (or inline once the endpoint is terminal), which is
+     * after this facade's stop. Freeing it here left that destroy reading
+     * freed memory (heap-use-after-free in track_hist_release). */
+    moq_session_t *retired_session;
     bool activity_pending;  /* coalesced for wait() */
     bool pump_exit;         /* any lane's on_lane_pump returned nonzero */
     uint16_t bound_port;
@@ -551,13 +559,24 @@ static void mgd_release_reserve(moq_msquic_managed_t *m)
 /* Free a fully quiesced child: SHUTDOWN_COMPLETE has been observed, so
  * no callback can fire — the blocking ConnectionClose and the adapter
  * teardown are safe. Must be called with NO locks held. */
+/* retire_session: a CLIENT's session is parked in m->retired_session for
+ * destroy() instead of being freed now (see the field). Servers and the
+ * create-failure path free it here. */
 static void mgd_free_child(moq_msquic_managed_t *m,
-                           moq_msquic_managed_conn_t *mc)
+                           moq_msquic_managed_conn_t *mc,
+                           bool retire_session)
 {
     if (mc->connection != NULL)
         m->api->ConnectionClose(mc->connection);
     moq_msquic_conn_destroy(mc->conn);
-    moq_session_destroy(mc->session);
+    if (retire_session && m->cfg.perspective == MOQ_PERSPECTIVE_CLIENT &&
+        mc->session != NULL) {
+        if (m->retired_session != NULL)   /* a client has one connection */
+            moq_session_destroy(m->retired_session);
+        m->retired_session = mc->session;
+    } else if (mc->session != NULL) {
+        moq_session_destroy(mc->session);
+    }
     m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
 }
 
@@ -890,7 +909,7 @@ static void doorbell_reap(moq_msquic_managed_lane_t *lane)
         mgd_lane_latch_flush(lane, victim);
         mgd_lane_remove(lane, victim);
         pthread_mutex_unlock(&lane->mu);
-        mgd_free_child(m, victim);
+        mgd_free_child(m, victim, true);
         mgd_release_reserve(m); /* a freed slot may admit an accept */
         pthread_mutex_lock(&lane->mu);
 #ifdef MOQ_MSQUIC_TESTING
@@ -1684,6 +1703,14 @@ MGD_SETTINGS_LINKAGE void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg
         out->HandshakeIdleTimeoutMs = cfg->idle_timeout_ms;
         out->IsSet.HandshakeIdleTimeoutMs = TRUE;
     }
+    if (MGD_CFG_HAS(cfg, keep_alive_interval_ms) &&
+        cfg->keep_alive_interval_ms != 0) {
+        /* MsQuic sends PING on this cadence while the connection is
+         * otherwise idle, so a quiet session (a publisher waiting for its
+         * first subscriber) survives the peer's idle timeout. */
+        out->KeepAliveIntervalMs = cfg->keep_alive_interval_ms;
+        out->IsSet.KeepAliveIntervalMs = TRUE;
+    }
     if (cfg->perspective == MOQ_PERSPECTIVE_SERVER) {
         out->MinimumMtu = MGD_LISTENER_PATH_MTU;
         out->IsSet.MinimumMtu = TRUE;
@@ -2044,7 +2071,7 @@ moq_result_t moq_msquic_managed_create(
                 moq_msquic_managed_conn_t *mc = m->lanes[i].conns;
 
                 m->lanes[i].conns = mc->next;
-                mgd_free_child(m, mc);
+                mgd_free_child(m, mc, false);
             }
         mgd_close_transport(m);
         mgd_free(m);
@@ -2415,7 +2442,7 @@ moq_result_t moq_msquic_managed_stop(moq_msquic_managed_t *m)
             m->lanes[i].conns = mc->next;
             m->lanes[i].conn_count--;
             m->conn_count--;
-            mgd_free_child(m, mc);
+            mgd_free_child(m, mc, true);
         }
     /* every connection quiesced (SHUTDOWN_COMPLETE) then freed: all sends
      * have completed or canceled, so the true pending counts are 0. The
@@ -2440,6 +2467,10 @@ void moq_msquic_managed_destroy(moq_msquic_managed_t *m)
         return;
     (void)moq_msquic_managed_stop(m);
     mgd_close_transport(m);
+    if (m->retired_session != NULL) {
+        moq_session_destroy(m->retired_session);
+        m->retired_session = NULL;
+    }
     mgd_free(m);
 }
 

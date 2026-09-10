@@ -1451,19 +1451,25 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == 19. Request-ID out of sequence → close ======================== */
+    /* == 19. Request-ID out of order is accepted; a duplicate closes ==== */
+    /* Each request rides its own bidi stream, and streams reorder; only wrong
+     * parity and duplicates are INVALID_REQUEST_ID (draft-18 section 10.1). */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
         moq_session_t *c = NULL, *sv = NULL;
         establish_pair(&alloc, 64, 64, &c, &sv, NULL, NULL);
 
-        /* Server expects next peer request_id=0; send 2 (skips 0). */
+        /* Server expects next peer request_id=0; 2 arrives first (skips 0). */
         uint8_t msg[256];
         size_t msg_len = encode_sub_ns_raw(msg, sizeof(msg), 2, "seq", 0);
         moq_stream_ref_t ref = moq_stream_ref_from_u64(1500);
-
         moq_session_on_bidi_stream_bytes(sv, ref, msg, msg_len, false, 0);
+        MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
+
+        /* The same id again on another stream is the duplicate case. */
+        moq_stream_ref_t ref2 = moq_stream_ref_from_u64(1504);
+        moq_session_on_bidi_stream_bytes(sv, ref2, msg, msg_len, false, 0);
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
 
         DRAIN_BOTH(c, sv);

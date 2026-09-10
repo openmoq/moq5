@@ -18,6 +18,10 @@ add_executable(test_bytes unit/test_bytes.c)
 target_link_libraries(test_bytes PRIVATE moq::core)
 add_test(NAME bytes COMMAND test_bytes)
 
+add_executable(test_request_id_window unit/test_request_id_window.c)
+target_link_libraries(test_request_id_window PRIVATE moq::core)
+add_test(NAME request_id_window COMMAND test_request_id_window)
+
 add_executable(test_quic_varint unit/test_quic_varint.c)
 target_link_libraries(test_quic_varint PRIVATE moq::core)
 add_test(NAME quic_varint COMMAND test_quic_varint)

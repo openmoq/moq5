@@ -10,6 +10,7 @@
  */
 
 #include "session_internal.h"
+#include "request_id_window.h"
 #include "moq/control_d18.h"
 #include "../wire/control_d18_internal.h"
 #include "moq/vi64.h"
@@ -23,7 +24,9 @@ typedef struct moq_d18_profile_state {
     /* Request IDs are parity-allocated (client even, server odd). Draft-18 has
      * no MAX_REQUEST_ID; QUIC stream limits provide flow control. */
     uint64_t      next_local_request_id;
-    uint64_t      peer_next_request_id;
+    /* Peer request ids: high-water mark + not-yet-seen ids below it; requests
+     * ride their own bidi streams and can arrive out of order. */
+    moq_request_id_window_t peer_requests;
     uint64_t      next_track_alias;
 } moq_d18_profile_state_t;
 
@@ -34,8 +37,8 @@ static void d18_init_in_place(void *profile_state, const moq_session_cfg_t *cfg)
     d18->version = MOQ_VERSION_DRAFT_18;
     d18->next_local_request_id =
         (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 0 : 1;
-    d18->peer_next_request_id =
-        (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 1 : 0;
+    moq_request_id_window_init(&d18->peer_requests,
+        (cfg->perspective == MOQ_PERSPECTIVE_CLIENT) ? 1 : 0);
     d18->next_track_alias = 1;
 }
 
@@ -457,8 +460,17 @@ static moq_result_t d18_validate_inbound_request_stream(
     uint64_t expected_parity = peer_is_client ? 0 : 1;
     if ((wire_request_id & 1) != expected_parity)
         return close_with_error(s, 0x4, "wrong request ID parity");
-    if (wire_request_id != d18->peer_next_request_id)
-        return close_with_error(s, 0x4, "request ID not next in sequence");
+    /* Only parity and duplicates are errors (section 10.1): each request has
+     * its own stream, so ids can arrive out of order. */
+    switch (moq_request_id_window_classify(&d18->peer_requests,
+                                           wire_request_id)) {
+    case MOQ_REQUEST_ID_NEW: break;
+    case MOQ_REQUEST_ID_DUPLICATE:
+        return close_with_error(s, 0x4, "duplicate request ID");
+    case MOQ_REQUEST_ID_TOO_FAR_AHEAD:
+        return close_with_error(s, 0x4, "request ID too far ahead of the "
+                                        "lowest outstanding request");
+    }
     memset(out, 0, sizeof(*out));
     out->has_request_id = true;
     out->request_id = wire_request_id;
@@ -470,9 +482,8 @@ static moq_result_t d18_validate_inbound_request_stream(
 static void d18_commit_inbound_request(moq_session_t *s,
                                        const struct moq_request_endpoint *ep)
 {
-    (void)ep;
     moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
-    d18->peer_next_request_id += 2;
+    moq_request_id_window_commit(&d18->peer_requests, ep->request_id);
 }
 
 /* Map the representable SUBSCRIBE/FETCH settings onto draft-18 Message
@@ -2927,7 +2938,7 @@ static moq_result_t d18_encode_goaway(moq_session_t *s,
         (const moq_d18_profile_state_t *)s->profile_state;
     uint64_t timeout_ms = s->goaway_timeout_us / 1000;
     return moq_d18_encode_goaway(w, args->uri, args->uri_len, timeout_ms,
-                                 d18->peer_next_request_id);
+                                 d18->peer_requests.next);
 }
 
 /* -- Vtable -------------------------------------------------------- *
