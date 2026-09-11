@@ -109,7 +109,9 @@ elseif(_moq_pq_verify_backend STREQUAL "mbedtls")
             "-DWITH_MBEDTLS=ON.")
     endif()
     target_include_directories(moq-adapter-picoquic
-        SYSTEM PRIVATE ${MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR})
+        SYSTEM PRIVATE
+            ${MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR}
+            ${PTLS_INCLUDE_DIR})
     target_compile_definitions(moq-adapter-picoquic
         PRIVATE MOQ_PICOQUIC_VERIFY_MBEDTLS)
 else()

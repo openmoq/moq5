@@ -178,6 +178,7 @@ endif()
 if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
     list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
     find_package(Picoquic REQUIRED)
+    include(MoqPicoquicPkgConfig)
 endif()
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
@@ -429,62 +430,8 @@ if(MOQ_BUILD_LOC)
 endif()
 string(APPEND LIBMOQ_PC_LIBS " -lmoq-core")
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
-    # picoquic-core and picoquic-log are mutually dependent static archives
-    # (core -> picoquic_set_qlog in log; log -> picoquic_frame_name etc. in
-    # core). A single-pass linker (GNU ld) must scan them as a group for both
-    # directions to resolve; macOS ld64 and other multi-pass linkers take the
-    # plain list. The .pc is consumed on the platform it was installed on, so
-    # gate on the build system here.
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        string(APPEND LIBMOQ_PC_LIBS
-            " -Wl,--start-group -lpicoquic-core -lpicoquic-log -Wl,--end-group")
-    else()
-        string(APPEND LIBMOQ_PC_LIBS " -lpicoquic-core -lpicoquic-log")
-    endif()
-    # picotls is not installed into the prefix, so bake its lib dir as an
-    # absolute -L (external dependency; same non-relocatable caveat as the
-    # OpenSSL -L below and the pico WT .pc files). The -L precedes its
-    # -lpicotls-* libs (matching the pico WT .pc pattern); without it a
-    # `pkg-config libmoq` link cannot find -lpicotls-*. MOQ_PTLS_LIB_DIR is
-    # normalized once by FindPicoquic and is reliable in every mode (unlike
-    # PTLS_OPENSSL_LIBRARY, which picoquic's FindPTLS may set to a bare target
-    # name that is invisible at this scope).
-    if(MOQ_PTLS_LIB_DIR)
-        string(APPEND LIBMOQ_PC_LIBS " -L${MOQ_PTLS_LIB_DIR}")
-    endif()
-    set(_libmoq_pc_has_openssl OFF)
-    if((DEFINED WITH_OPENSSL AND WITH_OPENSSL) OR MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)
-        set(_libmoq_pc_has_openssl ON)
-    endif()
-    if(_libmoq_pc_has_openssl)
-        string(APPEND LIBMOQ_PC_LIBS " -lpicotls-openssl")
-    endif()
-    string(APPEND LIBMOQ_PC_LIBS " -lpicotls-core -lpicotls-minicrypto")
-    if(DEFINED WITH_MBEDTLS AND WITH_MBEDTLS)
-        set(_libmoq_mbed_dirs "")
-        foreach(_libmoq_mbed_var MBEDTLS_LIBRARY MBEDTLS_X509 MBEDTLS_CRYPTO)
-            if(${_libmoq_mbed_var})
-                get_filename_component(_libmoq_mbed_dir "${${_libmoq_mbed_var}}" DIRECTORY)
-                list(APPEND _libmoq_mbed_dirs "${_libmoq_mbed_dir}")
-            endif()
-        endforeach()
-        if(_libmoq_mbed_dirs)
-            list(REMOVE_DUPLICATES _libmoq_mbed_dirs)
-            foreach(_libmoq_mbed_dir IN LISTS _libmoq_mbed_dirs)
-                string(APPEND LIBMOQ_PC_LIBS " -L${_libmoq_mbed_dir}")
-            endforeach()
-        endif()
-        string(APPEND LIBMOQ_PC_LIBS " -lmbedtls -lmbedx509 -lmbedcrypto")
-    endif()
-    if(_libmoq_pc_has_openssl)
-        find_package(OpenSSL QUIET)
-        if(OPENSSL_FOUND AND OPENSSL_CRYPTO_LIBRARY)
-            get_filename_component(_ssl_dir "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
-            string(APPEND LIBMOQ_PC_LIBS " -L${_ssl_dir}")
-        endif()
-        string(APPEND LIBMOQ_PC_LIBS " -lssl -lcrypto")
-    endif()
-    string(APPEND LIBMOQ_PC_LIBS " -lpthread")
+    moq_picoquic_pkgconfig_libs(_libmoq_picoquic_pc_libs)
+    string(APPEND LIBMOQ_PC_LIBS " ${_libmoq_picoquic_pc_libs}")
 endif()
 string(STRIP "${LIBMOQ_PC_LIBS}" LIBMOQ_PC_LIBS)
 
@@ -702,9 +649,7 @@ endif()
 if(MOQ_BUILD_ADAPTER_PICO_WT)
     string(APPEND _build_tree_config
         "if(\"adapter-pico-wt\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
-        "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
-        "  find_dependency(OpenSSL)\n"
-        "  find_dependency(Picoquic)\n"
+        "  _libmoq_find_adapter_picoquic_deps()\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND TRUE)\n"
         "endif()\n")
@@ -765,9 +710,7 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
         "if(\"adapter-pico-wt-managed\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
         "  if(NOT \${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND\n"
         "     AND EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake\")\n"
-        "    list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
-        "    find_dependency(OpenSSL)\n"
-        "    find_dependency(Picoquic)\n"
+        "    _libmoq_find_adapter_picoquic_deps()\n"
         "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake\")\n"
         "    set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-pico-wt_FOUND TRUE)\n"
         "  endif()\n"
@@ -807,8 +750,7 @@ if(MOQ_BUILD_SERVICE)
         "     EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtManagedTargets.cmake\")\n"
         "    if(NOT TARGET moq::adapter-pico-wt AND\n"
         "       EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake\")\n"
-        "      find_dependency(OpenSSL)\n"
-        "      find_dependency(Picoquic)\n"
+        "      _libmoq_find_adapter_picoquic_deps()\n"
         "      include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoWtAdapterTargets.cmake\")\n"
         "    endif()\n"
         "    if(NOT TARGET moq::adapter-picoquic AND\n"

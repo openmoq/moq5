@@ -6,9 +6,9 @@
 # lib/x86_64-linux-gnu all resolve to ${prefix} correctly.
 #
 # picoquic ships no pkg-config file, so its libraries (picohttp-core,
-# picoquic-core/log) and picotls + OpenSSL are embedded directly here.
-# picotls and OpenSSL are NOT installed into ${prefix}; their absolute
-# lib dirs are baked at libmoq configure time — the same relocatability
+# picoquic-core/log), picotls, and the configured TLS provider are embedded
+# directly here. Those dependencies are NOT installed into ${prefix}; their
+# absolute lib dirs are baked at libmoq configure time -- the same relocatability
 # caveat the picoquic CMake package and libmoq.pc already carry. Static
 # library: everything needed is in public Libs so a plain `--libs`
 # (without --static) links a standalone consumer.
@@ -19,5 +19,5 @@ includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 Name: libmoq-pico-wt
 Description: libmoq picoquic WebTransport adapter, attach mode (<moq/pico_wt.h>)
 Version: @PROJECT_VERSION@
-Libs: -L${libdir} -lmoq-adapter-pico-wt -lmoq-core -lpicohttp-core -lpicoquic-core -lpicoquic-log @LIBMOQ_PICOWT_PTLS_LDFLAG@ -lpicotls-openssl -lpicotls-core -lpicotls-minicrypto @LIBMOQ_PICOWT_SSL_LDFLAG@ -lssl -lcrypto -lpthread
+Libs: -L${libdir} -lmoq-adapter-pico-wt -lmoq-core -lpicohttp-core @LIBMOQ_PICOWT_DEP_LIBS@
 Cflags: -I${includedir}

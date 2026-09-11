@@ -11,7 +11,7 @@ if(NOT TARGET moq::adapter-pico-wt)
   set_target_properties(moq::adapter-pico-wt PROPERTIES
     IMPORTED_LOCATION "${_PICOWT_PREFIX}/@_picowt_libdir@/@_picowt_lib_name@"
     INTERFACE_INCLUDE_DIRECTORIES "${_PICOWT_PREFIX}/@_picowt_incdir@"
-    INTERFACE_LINK_LIBRARIES "moq::core;OpenSSL::SSL;OpenSSL::Crypto;picoquic::picohttp-core")
+    INTERFACE_LINK_LIBRARIES "moq::core;picoquic::picohttp-core")
 endif()
 
 unset(_PICOWT_PREFIX)

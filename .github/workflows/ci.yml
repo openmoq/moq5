@@ -369,6 +369,9 @@ jobs:
       - name: Set up pinned picoquic/picotls
         run: scripts/setup_picoquic_deps.sh
 
+      - name: Set up pinned mbedTLS
+        run: scripts/setup_mbedtls_deps.sh
+
       - name: Configure
         run: >
           cmake -B build/pico-wt-ci
@@ -393,6 +396,59 @@ jobs:
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
           -R '^(pico_wt_public_compile|pico_wt_loopback|pico_wt_conformance)$'
+
+      - name: Configure (mbedTLS-only)
+        run: >
+          cmake -B build/pico-wt-mbedtls-ci
+          -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
+          -DMOQ_BUILD_ADAPTER_PICO_WT=ON
+          -DMOQ_BUILD_PICO_WT_MANAGED=ON
+          -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_EXAMPLES=OFF
+          -DMOQ_WARNINGS_AS_ERRORS=ON
+          -DMOQ_PICOQUIC_VERIFY_BACKEND=mbedtls
+          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
+          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+          -DWITH_OPENSSL=OFF
+          -DWITH_MBEDTLS=ON
+          -DMBEDTLS_PREFIX="$MBEDTLS_PREFIX"
+          -DMBEDTLS_INCLUDE_DIR="$MBEDTLS_INCLUDE_DIR"
+          -DMBEDTLS_LIBRARY="$MBEDTLS_LIBRARY"
+          -DMBEDTLS_X509="$MBEDTLS_X509"
+          -DMBEDTLS_CRYPTO="$MBEDTLS_CRYPTO"
+          -DCMAKE_MODULE_PATH="$GITHUB_WORKSPACE/adapters/pico_wt/tests/forbid-openssl"
+        env:
+          CC: clang
+          CXX: clang++
+
+      - name: Build (mbedTLS-only)
+        run: cmake --build build/pico-wt-mbedtls-ci
+
+      - name: Check package metadata (mbedTLS-only)
+        run: scripts/check_pico_wt_tls_metadata.sh build/pico-wt-mbedtls-ci mbedtls
+
+      - name: Configure external CMake consumer (mbedTLS-only)
+        run: >
+          cmake -S adapters/pico_wt/tests/consumer
+          -B build/pico-wt-mbedtls-consumer
+          -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/build/pico-wt-mbedtls-ci"
+          -DCMAKE_MODULE_PATH="$GITHUB_WORKSPACE/adapters/pico_wt/tests/forbid-openssl"
+          -DMOQ_BUILD_ADAPTER_PICO_WT=ON
+          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
+          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+          -DWITH_OPENSSL=OFF
+          -DWITH_MBEDTLS=ON
+          -DMBEDTLS_PREFIX="$MBEDTLS_PREFIX"
+          -DMBEDTLS_INCLUDE_DIR="$MBEDTLS_INCLUDE_DIR"
+          -DMBEDTLS_LIBRARY="$MBEDTLS_LIBRARY"
+          -DMBEDTLS_X509="$MBEDTLS_X509"
+          -DMBEDTLS_CRYPTO="$MBEDTLS_CRYPTO"
+          -DMOQ_CONSUMER_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and run external CMake consumer (mbedTLS-only)
+        run: |
+          cmake --build build/pico-wt-mbedtls-consumer
+          build/pico-wt-mbedtls-consumer/moq_pico_wt_adapter_consumer_test
 
   sanitizers:
     name: Sanitizers (ASan/UBSan/LSan, core)

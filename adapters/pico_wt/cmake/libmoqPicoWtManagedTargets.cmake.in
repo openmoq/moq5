@@ -2,7 +2,7 @@
 # File lands at <prefix>/lib/cmake/libmoq/, so four PATH ascents reach
 # the install prefix. Link interface is the attach adapter + the base
 # picoquic adapter (for the default cert verifier the managed client now
-# installs) + Threads; moq::core / picoquic / picohttp / OpenSSL arrive
+# installs) + Threads; moq::core / picoquic / picohttp / TLS provider arrive
 # transitively through those (cf. picoquic-threaded). libmoqConfig loads
 # moq::adapter-picoquic before this file so the reference resolves.
 get_filename_component(_PICOWTM_PREFIX "${CMAKE_CURRENT_LIST_FILE}" PATH)

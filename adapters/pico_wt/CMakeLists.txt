@@ -36,8 +36,6 @@ target_include_directories(moq-adapter-pico-wt
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-find_package(OpenSSL REQUIRED)
-
 # picohttp-core is PUBLIC: <moq/pico_wt.h> publicly includes
 # pico_webtransport.h / h3zero_common.h, so consumers of the adapter
 # target must inherit picohttp-core's include dirs. Wrap in
@@ -45,8 +43,7 @@ find_package(OpenSSL REQUIRED)
 # the generated targets file (referencing picoquic::picohttp-core), so
 # the build-tree target name must never leak into an export.
 target_link_libraries(moq-adapter-pico-wt
-    PUBLIC  moq::core $<BUILD_INTERFACE:${_PICOHTTP}>
-    PRIVATE OpenSSL::SSL OpenSSL::Crypto
+    PUBLIC moq::core $<BUILD_INTERFACE:${_PICOHTTP}>
 )
 
 # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
@@ -67,7 +64,7 @@ endif()
 # adapter-pico-wt)` works against ${PROJECT_BINARY_DIR}, mirroring the
 # picoquic adapter. The install-tree counterpart is generated in the
 # install section below.
-set(_picowt_link "moq::core;OpenSSL::SSL;OpenSSL::Crypto;${_PICOHTTP}")
+set(_picowt_link "moq::core;${_PICOHTTP}")
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqPicoWtAdapterTargets.cmake"
     CONTENT "\
@@ -116,22 +113,9 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cma
 
 # -- pkg-config (for Meson/autotools consumers) -----------------------
 # Optional component .pc files (the core libmoq.pc is generated in the
-# root CMakeLists with the same relocatable-prefix + baked picotls/OpenSSL
-# -L approach). picoquic ships no .pc, so picotls + OpenSSL lib dirs are
-# baked here as absolute -L flags (same relocatability caveat as the
-# picoquic CMake package). Reused by libmoq-pico-wt-managed.pc below.
-set(LIBMOQ_PICOWT_PTLS_LDFLAG "")
-# MOQ_PTLS_LIB_DIR is normalized once by FindPicoquic and is reliable in every
-# mode (unlike PTLS_OPENSSL_LIBRARY, which picoquic's FindPTLS may set to a bare
-# target name that is invisible at this scope).
-if(MOQ_PTLS_LIB_DIR)
-    set(LIBMOQ_PICOWT_PTLS_LDFLAG "-L${MOQ_PTLS_LIB_DIR}")
-endif()
-set(LIBMOQ_PICOWT_SSL_LDFLAG "")
-if(OPENSSL_CRYPTO_LIBRARY)
-    get_filename_component(_picowt_ssldir "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
-    set(LIBMOQ_PICOWT_SSL_LDFLAG "-L${_picowt_ssldir}")
-endif()
+# root CMakeLists. PicoQUIC ships no .pc, so its selected provider closure is
+# embedded here using the same helper as libmoq.pc.
+moq_picoquic_pkgconfig_libs(LIBMOQ_PICOWT_DEP_LIBS)
 # Relocatable prefix: the .pc lands at <prefix>/<libdir>/pkgconfig, so the
 # up-path from ${pcfiledir} back to <prefix> is (libdir depth + 1) levels.
 # Computing it from CMAKE_INSTALL_LIBDIR handles lib, lib64, and multiarch
@@ -284,7 +268,6 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     target_link_libraries(test_pico_wt_loopback PRIVATE
         moq::adapter-pico-wt
         picoquic-test
-        OpenSSL::SSL OpenSSL::Crypto
     )
     target_compile_definitions(test_pico_wt_loopback PRIVATE
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
@@ -309,7 +292,6 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     target_link_libraries(test_pico_wt_d18 PRIVATE
         moq::adapter-pico-wt
         picoquic-test
-        OpenSSL::SSL OpenSSL::Crypto
     )
     target_compile_definitions(test_pico_wt_d18 PRIVATE
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
@@ -332,7 +314,6 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     target_link_libraries(test_pico_wt_protocol_nego PRIVATE
         moq::adapter-pico-wt
         picoquic-test
-        OpenSSL::SSL OpenSSL::Crypto
     )
     target_compile_definitions(test_pico_wt_protocol_nego PRIVATE
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
@@ -357,7 +338,6 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     target_link_libraries(test_pico_wt_conformance PRIVATE
         moq::adapter-pico-wt
         picoquic-test
-        OpenSSL::SSL OpenSSL::Crypto
     )
     target_compile_definitions(test_pico_wt_conformance PRIVATE
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
@@ -381,7 +361,6 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     target_link_libraries(test_pico_wt_backpressure PRIVATE
         moq::adapter-pico-wt
         picoquic-test
-        OpenSSL::SSL OpenSSL::Crypto
     )
     target_compile_definitions(test_pico_wt_backpressure PRIVATE
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
@@ -413,7 +392,6 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     target_link_libraries(test_pico_wt_rx_lifecycle PRIVATE
         moq::adapter-pico-wt
         picoquic-test
-        OpenSSL::SSL OpenSSL::Crypto
     )
     target_compile_definitions(test_pico_wt_rx_lifecycle PRIVATE
         PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
@@ -471,7 +449,7 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     target_link_libraries(moq-adapter-pico-wt-managed
         PUBLIC  moq::adapter-pico-wt moq::adapter-picoquic
         PRIVATE $<BUILD_INTERFACE:${_PICOHTTP}> ${_PICO_CORE}
-                Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+                Threads::Threads)
     # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
     target_compile_definitions(moq-adapter-pico-wt-managed PRIVATE
         MOQ_BUILDING)
@@ -488,7 +466,7 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     # mirroring the pico WT attach + picoquic-threaded patterns. The link
     # interface is moq::adapter-pico-wt + moq::adapter-picoquic (the managed
     # client installs the default cert verifier from the base picoquic adapter)
-    # + Threads; picoquic-core / picohttp-core / OpenSSL / moq::core arrive
+    # + Threads; moq::core and PicoQUIC's selected TLS provider arrive
     # transitively through those. libmoqConfig loads moq::adapter-picoquic
     # alongside the attach adapter before this file so both references resolve.
     file(GENERATE
@@ -534,7 +512,7 @@ endif()\n")
         RENAME libmoqPicoWtManagedTargets.cmake)
 
     # pkg-config: Requires libmoq-pico-wt (installed above), which pulls
-    # in the full picoquic/picotls/OpenSSL chain, so a consumer needs only
+    # in the full PicoQUIC/picotls/provider chain, so a consumer needs only
     # `pkg-config --cflags --libs libmoq-pico-wt-managed`.
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoq-pico-wt-managed.pc.in
