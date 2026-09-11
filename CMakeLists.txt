@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
+# picoquic-core and picoquic-log are mutually dependent static archives.
+# Let capable linkers de-duplicate CMake's cycle expansion, while traditional
+# one-pass linkers retain the repeated archives they need to resolve it.
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+endif()
+
 project(libmoq
     VERSION 0.1.0
     LANGUAGES C
