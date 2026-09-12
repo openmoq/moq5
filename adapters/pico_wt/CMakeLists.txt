@@ -135,10 +135,18 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoq-pico-wt.pc
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 # -- Tests -----------------------------------------------------------
-# Public-header compile/link smoke. Proves <moq/pico_wt.h> stands
-# alone (no internal header needed). Builds whenever tests are on —
-# does not require the deterministic-sim infrastructure.
 if(MOQ_BUILD_TESTS)
+    # Exercise the actual dependency parser used for WebTransport capsules.
+    add_executable(test_pico_wt_capsule_sequence tests/test_pico_wt_capsule_sequence.c)
+    target_link_libraries(test_pico_wt_capsule_sequence PRIVATE ${_PICOHTTP})
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_capsule_sequence PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_capsule_sequence COMMAND test_pico_wt_capsule_sequence)
+    set_tests_properties(pico_wt_capsule_sequence PROPERTIES TIMEOUT 30)
+
+    # Public-header smoke: no internal header or deterministic-sim dependency.
     add_executable(test_pico_wt_public_compile
         tests/test_pico_wt_public_compile.c
     )

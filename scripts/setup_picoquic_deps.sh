@@ -43,6 +43,10 @@
 #   PICOTLS_REF     picotls commit       (default: pinned below)
 #   OPENSSL_ROOT_DIR  passed to picotls' cmake if set (macOS/brew)
 #
+# The tracked capsule-parser patch is applied after checkout. Already-patched
+# inputs are accepted; conflicting inputs fail before any dependency build.
+# --self-test checks this step without fetching or building dependencies.
+#
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
 
@@ -62,13 +66,64 @@ picoquic_dir="$MOQ_DEPS_DIR/picoquic"
 picotls_dir="$MOQ_DEPS_DIR/picotls"
 picotls_build="$picotls_dir/build"
 
+log() { printf '[setup_picoquic_deps] %s\n' "$*" >&2; }
+die() { printf '[setup_picoquic_deps] ERROR: %s\n' "$*" >&2; exit 1; }
+
+apply_capsule_patch() {
+    local dir=$1
+    local patch="$repo_root/patches/picoquic/0001-h3zero-reset-capsule-value-read.patch"
+    [ -f "$patch" ] || die "missing capsule patch: $patch"
+    if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
+        git -C "$dir" apply "$patch" || die "capsule patch application failed"
+        log "applied capsule reset patch"
+    elif git -C "$dir" apply --reverse --check "$patch" >/dev/null 2>&1; then
+        log "capsule reset patch already applied"
+    else
+        die "capsule reset patch conflicts with $dir"
+    fi
+}
+
+patch_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    mkdir -p "$tmp/tree/picohttp"
+    git -C "$tmp/tree" init -q
+    # Minimal upstream context; the behavioral regression links picohttp-core.
+    printf '\t\t%s\n' \
+        '/* reset the fields to expected value */' \
+        'capsule->header_length = 0;' \
+        'capsule->header_read = 0;' \
+        'capsule->capsule_type = 0;' \
+        'capsule->capsule_length = 0;' \
+        'capsule->is_stored = 0;' > "$tmp/tree/picohttp/h3zero_common.c"
+    apply_capsule_patch "$tmp/tree"
+    grep -qF 'capsule->value_read = 0;' "$tmp/tree/picohttp/h3zero_common.c"
+    cp "$tmp/tree/picohttp/h3zero_common.c" "$tmp/expected"
+    apply_capsule_patch "$tmp/tree"
+    cmp "$tmp/expected" "$tmp/tree/picohttp/h3zero_common.c"
+    printf 'conflicting source\n' > "$tmp/tree/picohttp/h3zero_common.c"
+    if (apply_capsule_patch "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: conflicting source was accepted"
+    fi
+    grep -qF 'capsule reset patch conflicts' "$tmp/log"
+    test "$(cat "$tmp/tree/picohttp/h3zero_common.c")" = 'conflicting source'
+    if (repo_root="$tmp/missing"; apply_capsule_patch "$tmp/tree") > "$tmp/log" 2>&1; then
+        die "self-test: missing patch was accepted"
+    fi
+    grep -qF 'missing capsule patch' "$tmp/log"
+    printf 'capsule patch self-test: apply, repeat, conflict, missing PASS\n'
+)
+
+if [ "${1:-}" = "--self-test" ]; then
+    patch_selftest
+    exit $?
+fi
+
 # Only the two KEY=VALUE result lines may reach real stdout (so callers
 # can `eval "$(...)"`). Route everything else - including git/cmake and
 # git-submodule chatter, which print to stdout - to stderr via fd 3.
 exec 3>&1 1>&2
-
-log() { printf '[setup_picoquic_deps] %s\n' "$*" >&2; }
-die() { printf '[setup_picoquic_deps] ERROR: %s\n' "$*" >&2; exit 1; }
 
 command -v git   >/dev/null 2>&1 || die "git not found"
 command -v cmake >/dev/null 2>&1 || die "cmake not found"
@@ -102,6 +157,7 @@ mkdir -p "$MOQ_DEPS_DIR"
 log "deps dir: $MOQ_DEPS_DIR"
 
 fetch_at "$PICOQUIC_REPO" "$PICOQUIC_REF" "$picoquic_dir"
+apply_capsule_patch "$picoquic_dir"
 fetch_at "$PICOTLS_REPO"  "$PICOTLS_REF"  "$picotls_dir"
 
 # picotls carries minicrypto backends as submodules pinned by the parent

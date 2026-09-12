@@ -1,0 +1,18 @@
+Reset the payload cursor when reusing an accumulator for the next capsule.
+Without this, a shorter second capsule underflows the memcpy length and a
+longer one retains bytes from the preceding payload.
+
+Applies to picoquic 55b473e207e436d06ea9a2895cc1fc555d42c81c.
+Regression: adapters/pico_wt/tests/test_pico_wt_capsule_sequence.c.
+
+diff --git a/picohttp/h3zero_common.c b/picohttp/h3zero_common.c
+--- a/picohttp/h3zero_common.c
++++ b/picohttp/h3zero_common.c
+@@ -2115,6 +2115,7 @@ const uint8_t* h3zero_accumulate_capsule(const uint8_t* bytes, const uint8_t* bytes_max, h3zero_capsule_t* capsule)
+ 		/* reset the fields to expected value */
+ 		capsule->header_length = 0;
+ 		capsule->header_read = 0;
++		capsule->value_read = 0;
+ 		capsule->capsule_type = 0;
+ 		capsule->capsule_length = 0;
+ 		capsule->is_stored = 0;

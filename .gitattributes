@@ -1,1 +1,3 @@
 fuzz/corpus/relay_admin_http/* binary
+# Unified diff context prefixes a space to upstream tab indentation.
+patches/picoquic/*.patch whitespace=-space-before-tab

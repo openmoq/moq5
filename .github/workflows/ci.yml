@@ -395,7 +395,7 @@ jobs:
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pico_wt_public_compile|pico_wt_loopback|pico_wt_conformance)$'
+          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance)$'
 
       - name: Configure (mbedTLS-only)
         run: >
