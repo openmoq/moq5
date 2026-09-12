@@ -1988,6 +1988,45 @@ bind_grant_reserve(moqr_bind_t *b, moqr_park_req_t *pr,
     return moqr_core_grant_reserve(b->core, pr, lease_us, now_us, res);
 }
 
+/* Fixed diagnostic text only: never expose peer tokens or policy inputs. */
+static moq_bytes_t
+bind_subscribe_error_reason(moq_request_error_t code)
+{
+    switch (code) {
+    case MOQ_REQUEST_ERROR_DOES_NOT_EXIST:
+        return MOQ_BYTES_LITERAL("track does not exist");
+    case MOQ_REQUEST_ERROR_UNAUTHORIZED:
+        return MOQ_BYTES_LITERAL("unauthorized");
+    case MOQ_REQUEST_ERROR_TIMEOUT:
+        return MOQ_BYTES_LITERAL("timeout");
+    case MOQ_REQUEST_ERROR_NOT_SUPPORTED:
+        return MOQ_BYTES_LITERAL("not supported");
+    case MOQ_REQUEST_ERROR_INVALID_RANGE:
+        return MOQ_BYTES_LITERAL("invalid range");
+    case MOQ_REQUEST_ERROR_MALFORMED_TRACK:
+        return MOQ_BYTES_LITERAL("malformed track");
+    case MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION:
+        return MOQ_BYTES_LITERAL("duplicate subscription");
+    case MOQ_REQUEST_ERROR_UNINTERESTED:
+        return MOQ_BYTES_LITERAL("uninterested");
+    case MOQ_REQUEST_ERROR_EXCESSIVE_LOAD:
+        return MOQ_BYTES_LITERAL("excessive load");
+    case MOQ_REQUEST_ERROR_INTERNAL_ERROR:
+        return MOQ_BYTES_LITERAL("internal error");
+    default:
+        return (moq_bytes_t){ NULL, 0 };
+    }
+}
+
+static void
+bind_reject_subscribe_cfg_init(moq_reject_subscribe_cfg_t *cfg,
+                               moq_request_error_t code)
+{
+    moq_reject_subscribe_cfg_init(cfg);
+    cfg->error_code = code;
+    cfg->reason = bind_subscribe_error_reason(code);
+}
+
 /* Reject the pending session request identified by (action, session_cookie)
  * with the wire error code. Shared by the inline refuse path and deferred
  * resolution, reconstructing the handle from the stored cookie. */
@@ -2008,8 +2047,7 @@ bind_reject(moqr_bind_t *b, b_conn_t *cn, moqr_auth_action_t action,
     }
     case MOQR_AUTH_SUBSCRIBE: {
         moq_reject_subscribe_cfg_t r;
-        moq_reject_subscribe_cfg_init(&r);
-        r.error_code = err;
+        bind_reject_subscribe_cfg_init(&r, err);
         (void)moq_session_reject_subscribe(
             cn->session, (moq_subscription_t){ ._opaque = session_cookie }, &r,
             now_us);
@@ -2561,8 +2599,8 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         if (bind_grant_reserve(b, &gpr, sq->tokens, sq->token_count, slease,
                                now_us, &gres) != MOQR_OK) {
             moq_reject_subscribe_cfg_t rj;
-            moq_reject_subscribe_cfg_init(&rj);
-            rj.error_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
+            bind_reject_subscribe_cfg_init(&rj,
+                                           MOQ_REQUEST_ERROR_UNAUTHORIZED);
             (void)moq_session_reject_subscribe(cn->session, sq->sub, &rj,
                                                now_us);
             break;
@@ -2593,8 +2631,8 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                 moqr_core_grant_abort(b->core, gres);
             }
             moq_reject_subscribe_cfg_t rj;
-            moq_reject_subscribe_cfg_init(&rj);
-            rj.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+            bind_reject_subscribe_cfg_init(&rj,
+                                           MOQ_REQUEST_ERROR_INTERNAL_ERROR);
             (void)moq_session_reject_subscribe(cn->session, sq->sub, &rj,
                                                now_us);
             break;
@@ -3237,8 +3275,8 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
              * re-sends the refusal). */
             (void)moqr_core_unsubscribe(b->core, it->sub, now_us);
             moq_reject_subscribe_cfg_t rj;
-            moq_reject_subscribe_cfg_init(&rj);
-            rj.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+            bind_reject_subscribe_cfg_init(&rj,
+                                           MOQ_REQUEST_ERROR_INTERNAL_ERROR);
             if (moq_session_reject_subscribe(cn->session, ssub, &rj, now_us) ==
                 MOQ_ERR_WOULD_BLOCK) {
                 *defer = *it;
@@ -3272,8 +3310,7 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
     case MOQR_INTENT_REJECT_SUB: {
         moq_subscription_t ssub = { it->cookie };
         moq_reject_subscribe_cfg_t cfg;
-        moq_reject_subscribe_cfg_init(&cfg);
-        cfg.error_code = it->error_code;
+        bind_reject_subscribe_cfg_init(&cfg, it->error_code);
         if (moq_session_reject_subscribe(cn->session, ssub, &cfg, now_us) ==
             MOQ_ERR_WOULD_BLOCK) {
             *defer = *it;

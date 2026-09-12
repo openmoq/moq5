@@ -452,6 +452,9 @@ typedef struct peer_state {
     bool               session_closed;
     uint64_t           close_code;
     uint64_t           sub_error_code;
+    size_t             sub_error_reason_len;
+    bool               sub_error_reason_truncated;
+    uint8_t            sub_error_reason[64];
     uint64_t           publish_error_code;
     uint64_t           ts_error_code;
     int                ns_rejected;
@@ -494,6 +497,15 @@ typedef struct peer_state {
     int                dlv_overflow;         /* deliveries beyond the cap     */
 } peer_state_t;
 
+static bool
+sub_reason_eq(const peer_state_t *ps, const char *s)
+{
+    size_t len = strlen(s);
+    return !ps->sub_error_reason_truncated &&
+           ps->sub_error_reason_len == len &&
+           (len == 0 || memcmp(ps->sub_error_reason, s, len) == 0);
+}
+
 static void
 peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
            bool accept_with_largest, uint64_t lg, uint64_t lo)
@@ -522,6 +534,18 @@ peer_drain(rig_t *r, conn_t *cn, peer_state_t *ps, bool auto_accept,
             case MOQ_EVENT_SUBSCRIBE_ERROR:
                 ps->subscribe_errors++;
                 ps->sub_error_code = ev->u.subscribe_error.error_code;
+                ps->sub_error_reason_len = ev->u.subscribe_error.reason.len;
+                if (ps->sub_error_reason_len > sizeof(ps->sub_error_reason)) {
+                    ps->sub_error_reason_len = sizeof(ps->sub_error_reason);
+                    ps->sub_error_reason_truncated = true;
+                } else {
+                    ps->sub_error_reason_truncated = false;
+                }
+                if (ps->sub_error_reason_len != 0) {
+                    memcpy(ps->sub_error_reason,
+                           ev->u.subscribe_error.reason.data,
+                           ps->sub_error_reason_len);
+                }
                 break;
             case MOQ_EVENT_PUBLISH_ERROR:
                 ps->publish_error = true;
@@ -1125,6 +1149,9 @@ small_caps_flow(void)
         peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
         R_CHECK(&rig, sub_ps.subscribe_ok);            /* t1 established */
         R_CHECK(&rig, sub_ps.subscribe_errors == 1);   /* t2 refused      */
+        R_CHECK(&rig, sub_ps.sub_error_code ==
+                          MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+        R_CHECK(&rig, sub_reason_eq(&sub_ps, "internal error"));
         moqr_core_stats_t cs;
         moqr_core_get_stats(rig.core, &cs);
         R_CHECK(&rig, cs.subs == 1);   /* refused sub left no live state */
@@ -1218,6 +1245,9 @@ small_caps_flow(void)
         rig_pump(&rig, 6);   /* t2's upstream cannot be tracked -> ERROR  */
         peer_drain(&rig, sub, &sub_ps, false, false, 0, 0);
         R_CHECK(&rig, sub_ps.subscribe_errors == 1);
+        R_CHECK(&rig, sub_ps.sub_error_code ==
+                          MOQ_REQUEST_ERROR_INTERNAL_ERROR);
+        R_CHECK(&rig, sub_reason_eq(&sub_ps, "internal error"));
         failures += rig.failures;
         rig_destroy(&rig);
         R_CHECK(&rig, a.live == 0);
@@ -1937,6 +1967,7 @@ run_deny_case(moqr_auth_action_t action, moqr_auth_decision_t decision,
     case MOQR_AUTH_SUBSCRIBE:
         R_CHECK(&rig, ps.subscribe_errors == 1);
         R_CHECK(&rig, ps.sub_error_code == MOQ_REQUEST_ERROR_UNAUTHORIZED);
+        R_CHECK(&rig, sub_reason_eq(&ps, "unauthorized"));
         R_CHECK(&rig, st.subs == st0.subs); /* no subscription created */
         break;
     case MOQR_AUTH_SUBSCRIBE_NAMESPACE:
@@ -2313,6 +2344,7 @@ test_auth_defer_reject(void)
     /* UNINTERESTED (0x20): a code draft-18 assigns, so the peer reads it
      * verbatim instead of applying Section 15's unknown-code rule. */
     R_CHECK(&rig, ps.sub_error_code == 0x20);   /* custom code preserved */
+    R_CHECK(&rig, sub_reason_eq(&ps, "uninterested"));
 
     rig_destroy(&rig);
     g_test_authorize = NULL;
@@ -3010,6 +3042,7 @@ test_reval_reserve_capacity(void)
     R_CHECK(&rig, !sub_ps.subscribe_ok);
     R_CHECK(&rig, sub_ps.subscribe_errors == 1 &&
                       sub_ps.sub_error_code == 0x1u); /* UNAUTHORIZED */
+    R_CHECK(&rig, sub_reason_eq(&sub_ps, "unauthorized"));
     R_CHECK(&rig, pub_ps.up_subs == 0); /* relay never subscribed upstream */
 
     /* Neither failed request created active core state. */
