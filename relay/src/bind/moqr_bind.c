@@ -382,6 +382,15 @@ static _Atomic int bind_dbg_fail_sg_resets;
 static _Atomic int bind_dbg_fail_nsu_stores;
 static _Atomic int bind_dbg_ring_full_n;
 static _Atomic int bind_dbg_ring_full_nsu;
+static moqr_bind_debug_detach_pending_fn bind_dbg_detach_pending_fn;
+static void *bind_dbg_detach_pending_ctx;
+void
+moqr_bind_debug_on_detach_pending(moqr_bind_debug_detach_pending_fn fn,
+                                  void *ctx)
+{
+    bind_dbg_detach_pending_fn = fn;
+    bind_dbg_detach_pending_ctx = ctx;
+}
 void
 moqr_bind_debug_ring_full(int nth, bool is_nsu)
 {
@@ -1463,6 +1472,61 @@ ann_store(moqr_bind_t *b, b_conn_t *cn, uint64_t raw, moqr_ns_t ns)
     return slot;
 }
 
+static bool
+ns_equal(moqr_ns_t a, moqr_ns_t b)
+{
+    if (a.count != b.count) {
+        return false;
+    }
+    for (size_t i = 0; i < a.count; i++) {
+        if (a.parts[i].len != b.parts[i].len ||
+            memcmp(a.parts[i].data, b.parts[i].data, a.parts[i].len) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool
+conn_has_other_announce(const moqr_bind_t *b, const b_conn_t *cn,
+                        uint64_t raw, moqr_ns_t ns)
+{
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        const b_ann_t *ann = &cn->anns[i];
+        if (ann->used && ann->ann_raw != raw && ns_equal(ann->ns, ns)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The core has one source slot for an exact namespace. Drafts 16 Section 8.3
+ * and 18 Section 9.3 permit establishment time to select a publisher when an
+ * implementation cannot retain every source. This binding's deterministic
+ * policy is newest-wins across connections: retire the incumbent generation,
+ * including every track it sourced, then install the new one. A duplicate on
+ * the same connection remains a request error and never displaces itself. */
+static moqr_result_t
+bind_announce(moqr_bind_t *b, b_conn_t *cn, moqr_ns_t ns, uint64_t raw,
+              uint64_t now_us)
+{
+    moqr_result_t rc;
+    BIND_CALL_RETRY(rc, moqr_core_announce_ex(b->core, cn->binding, ns, raw));
+    if (rc != MOQR_ERR_WRONG_STATE ||
+        conn_has_other_announce(b, cn, raw, ns)) {
+        return rc;
+    }
+
+    BIND_CALL_RETRY(rc, moqr_core_force_withdraw(
+                            b->core, ns, MOQ_REQUEST_ERROR_UNINTERESTED,
+                            now_us));
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    BIND_CALL_RETRY(rc, moqr_core_announce_ex(b->core, cn->binding, ns, raw));
+    return rc;
+}
+
 #ifdef MOQR_BIND_TESTING
 /* Drive the PRODUCTION ann_store validator on one live conn slot.
  *
@@ -1565,6 +1629,12 @@ conn_detach(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                                                 now_us));
     if (rc == MOQR_ERR_WOULD_BLOCK) {
         cn->detach_pending = true;   /* retried after each pump's drain */
+#ifdef MOQR_BIND_TESTING
+        if (bind_dbg_detach_pending_fn != NULL) {
+            bind_dbg_detach_pending_fn(b, cn->session,
+                                       bind_dbg_detach_pending_ctx);
+        }
+#endif
         return;
     }
     if (rc != MOQR_OK) {
@@ -1772,7 +1842,11 @@ moqr_bind_conn_close(moqr_bind_t *b, moq_session_t *session)
         return MOQR_OK;   /* idempotent */
     }
     conn_detach(b, cn, 0);
-    return MOQR_OK;
+    /* binding_close is resumable. A connection retained for the next pump
+     * still owns its session pointer, so returning OK would falsely authorize
+     * the caller to destroy storage the binding can still reference. */
+    return conn_by_session(b, session) != NULL ? MOQR_ERR_WOULD_BLOCK
+                                                : MOQR_OK;
 }
 
 /* -- event translation (the parity-proven table) --------------------------- */
@@ -2055,8 +2129,7 @@ bind_resume(moqr_bind_t *b, b_conn_t *cn, const moqr_park_req_t *v,
                         MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
             return;
         }
-        BIND_CALL_RETRY(rc, moqr_core_announce_ex(b->core, cn->binding, v->ns,
-                                                  v->session_cookie));
+        rc = bind_announce(b, cn, v->ns, v->session_cookie, now_us);
         if (rc != MOQR_OK) {
             ann_clear_slot(b, cn, (uint32_t)ann_slot);
             if (gres.gen != 0) {
@@ -2407,8 +2480,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             break;
         }
         moqr_result_t arc;
-        BIND_CALL_RETRY(arc, moqr_core_announce_ex(b->core, cn->binding, ns,
-                                                   np->ann._opaque));
+        arc = bind_announce(b, cn, ns, np->ann._opaque, now_us);
         if (arc != MOQR_OK) {
             ann_clear_slot(b, cn, (uint32_t)ann_slot);
             if (gres.gen != 0) {
@@ -2499,11 +2571,13 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         moqr_subscribe_req_init(&req);
         req.ns = sns;
         req.name = sq->track_name;
-        req.filter.type = (moqr_filter_type_t)sq->filter;
-        req.filter.start_group = sq->start_group;
-        req.filter.start_object = sq->start_object;
-        if (sq->filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE) {
-            req.filter.end_group_delta = sq->end_group - sq->start_group;
+        if (sq->filter != MOQ_SUBSCRIBE_FILTER_NONE) {
+            req.filter.type = (moqr_filter_type_t)sq->filter;
+            req.filter.start_group = sq->start_group;
+            req.filter.start_object = sq->start_object;
+            if (sq->filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE) {
+                req.filter.end_group_delta = sq->end_group - sq->start_group;
+            }
         }
         req.subscriber_priority = sq->subscriber_priority;
         req.group_order = (moqr_group_order_t)sq->group_order;
@@ -4353,11 +4427,20 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             (moq_announcement_t){ ._opaque = rev->session_cookie }, &ccfg,
             now_us);
         if (crc == MOQ_OK) {
+            int ann_slot = ann_find(b, rcn, rev->session_cookie);
+            if (ann_slot >= 0) {
+                ann_clear_slot(b, rcn, (uint32_t)ann_slot);
+            }
             moqr_core_ack_revoked_grant(b->core, rev->binding_cookie,
                                         rev->session_cookie);
         } else if (crc != MOQ_ERR_WOULD_BLOCK) {
             /* A hard error (e.g. wrong state) can never succeed on retry: drop
-             * it rather than spin forever, and record the anomaly. */
+             * it rather than spin forever, retire the binding mirror whose
+             * core route is already gone, and record the anomaly. */
+            int ann_slot = ann_find(b, rcn, rev->session_cookie);
+            if (ann_slot >= 0) {
+                ann_clear_slot(b, rcn, (uint32_t)ann_slot);
+            }
             b->session_errors++;
             moqr_core_ack_revoked_grant(b->core, rev->binding_cookie,
                                         rev->session_cookie);

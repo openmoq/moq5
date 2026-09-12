@@ -135,8 +135,9 @@ MOQR_API void moqr_bind_destroy(moqr_bind_t *b);
 /*
  * Attach a session. The binding opens a core binding for it and starts
  * routing its events on the next pump. The session is NOT owned and must
- * stay valid until moqr_bind_conn_close or a SESSION_CLOSED event (the
- * binding detaches itself on either). Duplicate attach is INVAL.
+ * stay valid until moqr_bind_conn_is_open returns false. An explicit close or
+ * SESSION_CLOSED event starts detachment, which can remain pending while
+ * ordered relay output drains. Duplicate attach is INVAL.
  *
  * `version` is this connection's negotiated MoQ draft. One listener may carry
  * both drafts at once, and the status/reset registries disagree on several
@@ -157,7 +158,9 @@ MOQR_API bool moqr_bind_conn_is_open(const moqr_bind_t *b,
                             const moq_session_t *session);
 
 /* Detach explicitly (e.g. the transport reaped the connection without a
- * session close event having been pumped). Idempotent per session. */
+ * session close event having been pumped). Idempotent per session. Returns
+ * WOULD_BLOCK while teardown is retained for a later pump; keep the session
+ * valid and pump until moqr_bind_conn_is_open returns false. */
 MOQR_API moqr_result_t moqr_bind_conn_close(moqr_bind_t *b, moq_session_t *session);
 
 /*

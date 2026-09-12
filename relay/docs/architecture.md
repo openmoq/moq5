@@ -186,6 +186,15 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   round-trips over separate ordered demand channels. Those channels carry
   owned copies and have leaf mutexes; they never introduce a lock into a
   shard core.
+- **Exact namespaces have one active source per shard.** When another
+  connection publishes an exact namespace already owned locally, the binding
+  uses the newer PUBLISH_NAMESPACE request as the deterministic winner. It
+  force-withdraws the incumbent generation, terminates tracks sourced by that
+  generation, cancels the old request, then admits the replacement. This is
+  the relay's bounded single-source policy under the multiple-publisher rules
+  in draft-16 Section 8.3 and draft-18 Section 9.3; a duplicate on the same
+  session remains invalid. Cross-shard rendezvous applies the corresponding
+  deterministic winner policy between shards.
 - **A shard step is six phases, in order:** (1) inbound drain — control
   mailboxes plus the demand channels, applying every message class above;
   (2) the bind pump; (3) dirty journal reconcile (mirrors, winners,

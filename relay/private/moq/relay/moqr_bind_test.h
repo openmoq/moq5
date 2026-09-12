@@ -16,6 +16,12 @@ void moqr_bind_debug_fail_probe(int nth, moqr_result_t result);
  * WITHOUT calling the session, so the production close -> detach -> purge
  * path runs from inside an ordered-ring retry. */
 void moqr_bind_debug_fail_sg_reset(int nth);
+/* Observe the instant an internal detach is retained for retry. */
+typedef void (*moqr_bind_debug_detach_pending_fn)(moqr_bind_t *b,
+                                                  moq_session_t *session,
+                                                  void *ctx);
+void moqr_bind_debug_on_detach_pending(moqr_bind_debug_detach_pending_fn fn,
+                                       void *ctx);
 /* Make the next N downstream SUB_DONE terminal writes observe WOULD_BLOCK
  * without reaching the session, so the terminal is genuinely unsent and the
  * production defer/retry arm must carry the retained descriptor to the wire. */

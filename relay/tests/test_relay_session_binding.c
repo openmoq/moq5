@@ -4029,6 +4029,21 @@ intent_reentry_install_watchers(rig_t *r, moqr_binding_t watchers[])
     }
 }
 
+typedef struct detach_pending_observation {
+    int           calls;
+    moqr_result_t close_rc;
+    bool          open_after_close;
+} detach_pending_observation_t;
+
+static void
+observe_detach_pending(moqr_bind_t *bind, moq_session_t *session, void *ctx)
+{
+    detach_pending_observation_t *obs = ctx;
+    obs->calls++;
+    obs->close_rc = moqr_bind_conn_close(bind, session);
+    obs->open_after_close = moqr_bind_conn_is_open(bind, session);
+}
+
 /* The bind-owned intent scratch must not be reused by a retry helper while an
  * outer intent batch is live. This drives the real path:
  *   SUB_DONE -> injected reset failure -> conn_detach -> binding_close WOULD_BLOCK
@@ -4120,6 +4135,9 @@ intent_retry_reentry_preserves_outer_batch(void)
     moqr_bind_debug_fail_sg_reset(1);
     uint64_t suppressed0 =
         moqr_bind_debug_intent_retry_suppressed(rig.bind);
+    detach_pending_observation_t detach_obs;
+    memset(&detach_obs, 0, sizeof(detach_obs));
+    moqr_bind_debug_on_detach_pending(observe_detach_pending, &detach_obs);
     moqr_bind_debug_upstream_terminated(rig.bind, up_slot,
                                         MOQ_REQUEST_FAMILY_SUBSCRIBE,
                                         up_handle, 0, rig.now);
@@ -4137,9 +4155,13 @@ intent_retry_reentry_preserves_outer_batch(void)
 
     rig.now += 1000;
     (void)moqr_bind_pump(rig.bind, rig.now);
+    moqr_bind_debug_on_detach_pending(NULL, NULL);
 
     uint64_t suppressed1 =
         moqr_bind_debug_intent_retry_suppressed(rig.bind);
+    R_CHECK(&rig, detach_obs.calls == 1);
+    R_CHECK(&rig, detach_obs.close_rc == MOQR_ERR_WOULD_BLOCK);
+    R_CHECK(&rig, detach_obs.open_after_close);
     R_CHECK(&rig, suppressed1 == suppressed0 + 1u);
     R_CHECK(&rig, rec.status_n == REENTRY_STATUS_INTENTS);
     for (uint32_t i = 0; i < REENTRY_STATUS_INTENTS &&
@@ -12450,10 +12472,191 @@ nsu_byte_capacity_order(bool matched_control)
     return f;
 }
 
+/* An omitted SUBSCRIPTION_FILTER is explicitly unfiltered in drafts 16 and
+ * 18. The session surfaces omission as FILTER_NONE; the binding must preserve
+ * the core request initializer's live-edge default instead of forwarding zero
+ * as an invalid core filter type. */
+static int
+subscribe_omitted_filter_is_unfiltered(moq_version_t version)
+{
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: subscribe_omitted_filter rig create\n");
+        return 1;
+    }
+    conn_t *pub = rig_connect(&rig, version);
+    conn_t *sub = rig_connect(&rig, version);
+    R_CHECK(&rig, pub != NULL && sub != NULL);
+    rig_pump(&rig, 4);
+
+    moq_bytes_t parts[2] = { B("show"), B("camera") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+    moq_announcement_t ann;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pcfg, rig.now,
+                                                &ann) == MOQ_OK);
+    rig_pump(&rig, 6);
+
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+    scfg.track_name = B("video");
+    R_CHECK(&rig, scfg.filter == MOQ_SUBSCRIBE_FILTER_NONE);
+    moq_subscription_t sh;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &scfg, rig.now, &sh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 8);
+
+    peer_state_t pub_state;
+    peer_state_t sub_state;
+    memset(&pub_state, 0, sizeof(pub_state));
+    memset(&sub_state, 0, sizeof(sub_state));
+    peer_drain(&rig, pub, &pub_state, true, false, 0, 0);
+    rig_pump(&rig, 6);
+    peer_drain(&rig, sub, &sub_state, false, false, 0, 0);
+    R_CHECK(&rig, pub_state.up_seen);
+    R_CHECK(&rig, sub_state.subscribe_ok);
+    R_CHECK(&rig, sub_state.subscribe_errors == 0);
+
+    int f = rig.failures;
+    rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (f == 0 && rig.failures == 0) {
+        printf("PASS: subscribe_omitted_filter_is_unfiltered (draft=%llu)\n",
+               (unsigned long long)version);
+    }
+    return f + rig.failures;
+}
+
+/* This relay has one source slot per exact namespace. Drafts 16 and 18 permit
+ * establishment/idle time to select which publisher to reject or disconnect
+ * when an implementation cannot retain every publisher. Pin the relay's
+ * deterministic policy: a newly established publisher replaces the incumbent,
+ * the old generation is cancelled and purged, and subsequent demand is routed
+ * only to the replacement. */
+static int
+publish_namespace_newest_wins(moq_version_t version)
+{
+    ca_t a;
+    ca_init(&a);
+    rig_t rig;
+    if (rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: publish_namespace_newest_wins rig create\n");
+        return 1;
+    }
+    conn_t *old_pub = rig_connect(&rig, version);
+    conn_t *new_pub = rig_connect(&rig, version);
+    conn_t *sub = rig_connect(&rig, version);
+    R_CHECK(&rig, old_pub != NULL && new_pub != NULL && sub != NULL);
+    rig_pump(&rig, 4);
+
+    moq_bytes_t parts[2] = { B("show"), B("camera") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+    moq_announcement_t old_ann;
+    moq_announcement_t new_ann;
+    R_CHECK(&rig, moq_session_publish_namespace(old_pub->peer, &pcfg, rig.now,
+                                                &old_ann) == MOQ_OK);
+    rig_pump(&rig, 6);
+    peer_state_t old_state;
+    peer_state_t new_state;
+    memset(&old_state, 0, sizeof(old_state));
+    memset(&new_state, 0, sizeof(new_state));
+    peer_drain(&rig, old_pub, &old_state, false, false, 0, 0);
+    R_CHECK(&rig, old_state.namespace_accepted);
+
+    /* Establish an old-generation track before replacement. The takeover must
+     * retire this source and terminate its downstream subscriber, not merely
+     * swap the namespace owner while stale track state survives. */
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+    scfg.track_name = B("video");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t old_sh;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &scfg, rig.now, &old_sh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 8);
+    peer_drain(&rig, old_pub, &old_state, true, false, 0, 0);
+    R_CHECK(&rig, old_state.up_subs == 1 && old_state.up_seen);
+    rig_pump(&rig, 6);
+    peer_state_t old_sub_state;
+    memset(&old_sub_state, 0, sizeof(old_sub_state));
+    peer_drain(&rig, sub, &old_sub_state, false, false, 0, 0);
+    R_CHECK(&rig, old_sub_state.subscribe_ok);
+
+    R_CHECK(&rig, moq_session_publish_namespace(new_pub->peer, &pcfg, rig.now,
+                                                &new_ann) == MOQ_OK);
+    rig_pump(&rig, 10);
+    peer_drain(&rig, old_pub, &old_state, false, false, 0, 0);
+    peer_drain(&rig, new_pub, &new_state, false, false, 0, 0);
+    R_CHECK(&rig, old_state.ns_cancelled == 1);
+    R_CHECK(&rig, old_state.ns_cancelled_code ==
+                      (version == MOQ_VERSION_DRAFT_18
+                           ? 0u
+                           : MOQ_REQUEST_ERROR_UNINTERESTED));
+    R_CHECK(&rig, new_state.namespace_accepted);
+    R_CHECK(&rig, new_state.ns_rejected == 0);
+    peer_drain(&rig, sub, &old_sub_state, false, false, 0, 0);
+    R_CHECK(&rig, old_sub_state.done_count == 1);
+
+    /* A duplicate from the winning session is still invalid and must not
+     * evict that session's own accepted announcement. */
+    moq_announcement_t duplicate;
+    R_CHECK(&rig, moq_session_publish_namespace(new_pub->peer, &pcfg, rig.now,
+                                                &duplicate) == MOQ_ERR_INVAL);
+
+    conn_t *new_sub = rig_connect(&rig, version);
+    R_CHECK(&rig, new_sub != NULL);
+    rig_pump(&rig, 4);
+    moq_subscription_t sh;
+    R_CHECK(&rig, moq_session_subscribe(new_sub->peer, &scfg, rig.now, &sh) ==
+                      MOQ_OK);
+    rig_pump(&rig, 8);
+    peer_drain(&rig, old_pub, &old_state, true, false, 0, 0);
+    peer_drain(&rig, new_pub, &new_state, true, false, 0, 0);
+    R_CHECK(&rig, old_state.up_subs == 1);
+    R_CHECK(&rig, new_state.up_subs == 1);
+    R_CHECK(&rig, new_state.up_seen);
+
+    /* Cancellation frees the losing session's request. It may publish the
+     * namespace again later; the binding mirror must have retired the old
+     * handle or repeated reconnect/takeover cycles consume slots and refuse a
+     * publisher whose wire state is valid. */
+    memset(&old_state, 0, sizeof(old_state));
+    memset(&new_state, 0, sizeof(new_state));
+    moq_announcement_t third_ann;
+    R_CHECK(&rig, moq_session_publish_namespace(old_pub->peer, &pcfg, rig.now,
+                                                &third_ann) == MOQ_OK);
+    rig_pump(&rig, 10);
+    peer_drain(&rig, old_pub, &old_state, false, false, 0, 0);
+    peer_drain(&rig, new_pub, &new_state, false, false, 0, 0);
+    R_CHECK(&rig, old_state.namespace_accepted);
+    R_CHECK(&rig, old_state.ns_rejected == 0);
+    R_CHECK(&rig, new_state.ns_cancelled == 1);
+
+    int f = rig.failures;
+    rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (f == 0 && rig.failures == 0) {
+        printf("PASS: publish_namespace_newest_wins (draft=%llu)\n",
+               (unsigned long long)version);
+    }
+    return f + rig.failures;
+}
+
 int
 main(void)
 {
     int failures = 0;
+    failures += subscribe_omitted_filter_is_unfiltered(MOQ_VERSION_DRAFT_16);
+    failures += subscribe_omitted_filter_is_unfiltered(MOQ_VERSION_DRAFT_18);
+    failures += publish_namespace_newest_wins(MOQ_VERSION_DRAFT_16);
+    failures += publish_namespace_newest_wins(MOQ_VERSION_DRAFT_18);
     failures += forward_pause_resume_oracle(MOQ_VERSION_DRAFT_16);
     failures += forward_pause_resume_oracle(MOQ_VERSION_DRAFT_18);
     failures += forward_sibling_oracle(MOQ_VERSION_DRAFT_16);
