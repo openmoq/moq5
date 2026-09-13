@@ -33,7 +33,7 @@ jobs:
           source .deps/wtquic-ci/wtquic_deps.env
           wt_builds=(.deps/wtquic-ci/build.*)
           test "${#wt_builds[@]}" -eq 1
-          python3 scripts/test_wtquic_callback_patch.py --cc "$CC" \
+          python3 scripts/test_wtquic_callbacks.py --cc "$CC" \
             --source "${wt_builds[0]}/source" --build "${wt_builds[0]}/build" \
             --msquic-include "$PWD/.deps/msquic-ci/prefix/include"
           cmake -S . -B build/relay-setup -G Ninja \

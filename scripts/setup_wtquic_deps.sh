@@ -54,7 +54,7 @@
 #   WTQ_BUILD_NETWORK build the Network.framework `network` component
 #                     (default: ON on Apple, OFF elsewhere; Apple-only)
 #   WTQ_FETCH_ONLY    =1 -> materialize the pinned checkout and exit
-#                     (pristine upstream, no callback backport, no
+#                     (pristine upstream, no
 #                     configure/build/install, no MsQuic needed) --
 #                     for consumers that cross-compile wtquic themselves,
 #                     e.g. scripts/build_ios_xcframework.sh
@@ -96,9 +96,9 @@ WTQUIC_REPO="${WTQUIC_REPO:-https://github.com/rwl4/wtquic.git}"
 # wtquic-Network managed facade uses it to wake an otherwise-idle loop at a
 # service deadline (periodic catalog refresh), with no adapter-owned timer.
 #
-# This exact revision adds the sized Origin policy and D02 compatibility API
-# consumed by the relay. The callback backport below keeps GCC pedantic WAE.
-WTQUIC_REF="${WTQUIC_REF:-0726cc3f617e1eba53e6002900d02f9cb9902352}"
+# This revision includes the relay's Origin/D02 API and upstream typed callback
+# registration for GCC pedantic WAE. No downstream WTQuic patches are applied.
+WTQUIC_REF="${WTQUIC_REF:-da239546198d99080c120f32448cf3d8b8fc008e}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
@@ -189,12 +189,6 @@ mkdir "$run_dir/source"
 git -C "$wtquic_dir" archive HEAD | tar -x -C "$run_dir/source"
 wtquic_dir="$run_dir/source"
 wtquic_build="$run_dir/build"
-if [ "$WTQUIC_REF" = "0726cc3f617e1eba53e6002900d02f9cb9902352" ]; then
-    patch="$repo_root/cmake/patches/wtquic-0726cc3-callbacks.patch"
-    (cd "$wtquic_dir" && git apply --check "$patch" && git apply "$patch")
-else
-    log "explicit WTQUIC_REF override: caller owns compatibility; no default backport applied"
-fi
 
 # -- Configure / build / install wtquic --------------------------------
 # The libmoq adapter needs only the libraries and the CMake package:

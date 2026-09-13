@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compile the pinned WT callback backport and independent negative controls.
+"""Compile the pinned upstream WT callbacks and independent negative controls.
 
-Use a GCC compiler, the patched setup source, its configured build directory,
+Use a GCC compiler, the upstream setup source, its configured build directory,
 and the selected provider's include directory. No source tree is modified.
 """
 import argparse
@@ -27,9 +27,9 @@ def main():
         flags += ["-I", str(directory)]
     flags += ["-isystem", str(args.msquic_include.resolve())]
     cases = (
-        ("msq_conn.c", "wtq_msq_stream_cb_ptr(wtq_msq_stream_callback)",
+        ("msq_conn.c", "wtq_msq_stream_cb_ptr(\n                                         wtq_msq_stream_callback)",
          "(void *)wtq_msq_stream_callback"),
-        ("msq_listener.c", "wtq_msq_conn_cb_ptr(wtq_msq_conn_callback)",
+        ("msq_listener.c", "wtq_msq_conn_cb_ptr(\n                                        wtq_msq_conn_callback)",
          "(void *)wtq_msq_conn_callback"),
     )
     with tempfile.TemporaryDirectory(prefix="wtq-callback-proof-") as work:
