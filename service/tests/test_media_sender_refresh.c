@@ -2,7 +2,8 @@
  * Automatic independent catalog refresh: recovers late viewers joining
  * through relays that resolve Joining FETCHes locally. Drives the PRODUCTION
  * sender_hook against a real SimPair peer and a real media_receiver so the
- * refresh is exercised end to end: config/ABI resolution, the demand-gated
+ * refresh is exercised end to end: config/ABI resolution (OFF by default per
+ * MSF-01 §5, enabled only by an explicit finite interval), the demand-gated
  * periodic republish (a NEW independent group whose object 0 is the complete
  * catalog), mutation precedence, the group/deadline ceiling, WOULD_BLOCK
  * exactly-once, an idle pump progressing the refresh, and receiver-side
@@ -76,27 +77,29 @@ static moq_media_sender_t *cfg_sender(uint64_t interval, bool set_interval,
     return moq_media_sender_test_new_cfg(&cfg);
 }
 
-/* full-size zero, absent (old size), and explicit 0 all resolve to 1s. */
+/* full-size zero, absent (old size), and explicit 0 all resolve to DISABLED:
+ * MSF-01 §5 says a catalog object SHOULD be published only on availability
+ * change or cache staleness, so a timed refresh is strictly opt-in. */
 static void test_cfg_default_interval(void)
 {
-    /* full-size, field left zero -> default */
+    /* full-size, field left zero -> disabled */
     moq_media_sender_t *a = cfg_sender(0, false, sizeof(moq_media_sender_cfg_t));
     MOQ_TEST_CHECK(a != NULL);
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(a), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(a), UINT64_MAX);
     moq_media_sender_test_free(a);
 
-    /* explicit 0 -> default */
+    /* explicit 0 -> disabled */
     moq_media_sender_t *b = cfg_sender(0, true, sizeof(moq_media_sender_cfg_t));
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(b), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(b), UINT64_MAX);
     moq_media_sender_test_free(b);
 
-    /* old-size caller whose struct_size predates the field -> default */
+    /* old-size caller whose struct_size predates the field -> disabled */
     size_t old = offsetof(moq_media_sender_cfg_t, catalog_refresh_interval_us);
     moq_media_sender_t *c = cfg_sender(0, false, old);
     MOQ_TEST_CHECK(c != NULL);
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(c), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(c), UINT64_MAX);
     moq_media_sender_test_free(c);
-    MOQ_TEST_PASS("refresh_cfg_default_1s");
+    MOQ_TEST_PASS("refresh_cfg_default_disabled");
 }
 
 static void test_cfg_custom_and_disable(void)
@@ -137,8 +140,8 @@ static void test_cfg_exact_old_size(void)
     cfg->namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(cfg);
     MOQ_TEST_CHECK(s != NULL);
-    /* Gate never touched the (unallocated) field -> default. */
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), 1000000ull);
+    /* Gate never touched the (unallocated) field -> default (disabled). */
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
     moq_media_sender_test_free(s);
     free(cfg);
     MOQ_TEST_PASS("refresh_cfg_exact_old_size");
@@ -146,7 +149,8 @@ static void test_cfg_exact_old_size(void)
 
 /* Poisoned-tail read-gate: a full-size struct whose field bytes are left
  * poisoned but whose struct_size stops at the old prefix. The whole-field gate
- * must ignore the poisoned bytes and resolve the default (not the garbage). */
+ * must ignore the poisoned bytes and resolve the default, disabled (not the
+ * garbage). */
 static void test_cfg_poisoned_tail(void)
 {
     size_t old = offsetof(moq_media_sender_cfg_t, catalog_refresh_interval_us);
@@ -161,7 +165,7 @@ static void test_cfg_poisoned_tail(void)
     MOQ_TEST_CHECK(cfg.catalog_refresh_interval_us != 0);   /* really poisoned */
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
     MOQ_TEST_CHECK(s != NULL);
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
     moq_media_sender_test_free(s);
     MOQ_TEST_PASS("refresh_cfg_poisoned_tail");
 }
