@@ -14,16 +14,76 @@ See [the embedding guide](../../relay/README.md) for the public components.
 
 ## Build
 
-The relay is off by default. Enable it, and the managed MsQuic transport it
-runs on, at configure time:
+The relay command needs the raw managed MsQuic adapter even when a WebTransport
+listener is configured. `MOQ_BUILD_RELAY=ON` alone builds the transport-independent
+relay libraries and tests, not the command. Configure reports when the command
+is disabled.
+
+An installed MsQuic CMake package can be selected with `msquic_DIR`. For a
+private source build, run this from the repository root (requires Git, CMake,
+a C/C++ toolchain, Perl and make; Linux also needs libnuma development headers):
 
 ```sh
-cmake -B build -DMOQ_BUILD_RELAY=ON \
+bash scripts/setup_msquic_deps.sh
+. .deps/msquic-ci/msquic_deps.env
+```
+
+The script pins MsQuic 2.5.9 and applies the checked-in strict certificate-return
+and C11-header corrections. It fetches only the required QuicTLS and clog
+submodules, uses `QUIC_TLS_LIB=quictls`, and installs privately without sudo.
+Build sources and logs are retained under `.deps/msquic-ci/build.*`.
+
+Build a raw-QUIC relay:
+
+```sh
+cmake -S . -B build-relay -Dmsquic_DIR="$msquic_DIR" \
+               -DMOQ_BUILD_RELAY=ON \
                -DMOQ_BUILD_ADAPTER_MSQUIC=ON \
                -DMOQ_BUILD_MSQUIC_MANAGED=ON
-cmake --build build
-cmake --install build --prefix /usr/local
+cmake --build build-relay --target moq5-relay
 ```
+
+For both raw and WebTransport listeners, build WTQuic against the same provider,
+then configure a separate tree:
+
+```sh
+msquic_DIR="$msquic_DIR" bash scripts/setup_wtquic_deps.sh
+. .deps/wtquic-ci/wtquic_deps.env
+cmake -S . -B build-relay-dual \
+    -Dmsquic_DIR="$msquic_DIR" -Dwtquic_DIR="$wtquic_DIR" \
+    -DMOQ_BUILD_RELAY=ON -DMOQ_BUILD_ADAPTER_MSQUIC=ON \
+    -DMOQ_BUILD_MSQUIC_MANAGED=ON -DMOQ_BUILD_ADAPTER_WTQUIC=ON \
+    -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON
+cmake --build build-relay-dual --target moq5-relay
+```
+
+The WTQuic recipe pins `0726cc3f617e1eba53e6002900d02f9cb9902352` plus the
+checked-in typed-callback portability patch; it does not disable pedantic
+warnings. Its MsQuic backend requires at least 2.5.9. `wtquic_DIR` is discovered
+from the actual installation, including `lib64` layouts. `WTQ_MSQUIC_ROOT` is
+an alternative for a source/build tree; it is not required with an installed
+`msquic_DIR`. Both scripts accept individual extra CMake configure arguments.
+
+Use `cmake --install <build-dir> --prefix <destination>` to install. The private
+provider is not copied into the relay installation: arrange for the platform
+loader to find it as well as any shared WTQuic libraries. Do not point a server
+at a different provider merely to resolve a missing-library error.
+
+Successful compilation is not browser compatibility evidence. Match the peer's
+WebTransport profile explicitly, supply a certificate trusted by the client
+with a SAN matching its DNS name or IP address, and keep certificate and Origin
+validation enabled. A failure before MoQ readiness can originate in TLS,
+HTTP/3, WebTransport or MoQ; a zero MoQ-session count does not locate it.
+
+For local testing, match the destination address family to the listener:
+`localhost` may resolve to `::1` first while a listener bound to `127.0.0.1`
+accepts IPv4 only. Use `https://127.0.0.1:<port>/moq` with an IP SAN, or bind
+the listener to `::1` and use `https://localhost:<port>/moq` with a localhost
+DNS SAN. Neither disabling verification nor widening Origin policy fixes a
+connection sent to an address on which the relay is not listening. The service
+API's `moq_endpoint_get_terminal` distinguishes transport/TLS failures from a
+MoQ protocol fatal; `moq_endpoint_fatal_code == 0` alone does not mean success
+or prove that the relay refused a session.
 
 ## Run
 
@@ -56,6 +116,18 @@ draft is still chosen by the ordered subprotocol list.
 
 Builds without wtquic keep working unchanged and reject a `webtransport`
 config with a clear message.
+
+An explicit Origin policy requires an `Origin` header.
+`allow_any_including_null` permits the serialized value `null`; it does not
+permit the header to be absent. A native publisher that sends no Origin will
+therefore receive HTTP 403 even under that policy. The current PicoQUIC service
+client does not expose an Origin input. For an intentionally unrestricted native
+listener using `d13_14_compat`, `unset` makes no Origin requirement; this is an
+operator policy choice, not a repair to certificate verification or a substitute
+for authentication. Keep a required Origin policy intact and use a client that
+can supply it when that policy is part of the deployment's security boundary.
+Draft-02 compatibility still requires Origin and its draft-specific request
+marker; it is not a fallback for a draft-13/14 native client.
 
 ## Configuration
 

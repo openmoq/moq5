@@ -1,0 +1,72 @@
+diff --git a/backends/msquic/msq_conn.c b/backends/msquic/msq_conn.c
+index 479f0aa..2e1cc2e 100644
+--- a/backends/msquic/msq_conn.c
++++ b/backends/msquic/msq_conn.c
+@@ -805,7 +805,7 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
+          * open call (StreamShutdown), which must never happen on a
+          * stream with no callback handler set. */
+         drv->api->SetCallbackHandler(ev->PEER_STREAM_STARTED.Stream,
+-                                     (void *)wtq_msq_stream_callback, ds);
++                                     wtq_msq_stream_cb_ptr(wtq_msq_stream_callback), ds);
+ 
+         wtq_conn_t *ec = wtq_api_session_conn(drv->session);
+         wtq_estream_t *es = NULL;
+diff --git a/backends/msquic/msq_internal.h b/backends/msquic/msq_internal.h
+index ff93e57..09a4a21 100644
+--- a/backends/msquic/msq_internal.h
++++ b/backends/msquic/msq_internal.h
+@@ -66,6 +66,28 @@ extern "C" {
+ /* wtq_cfg_has() (struct_size-gated field presence) is shared with the core;
+  * it lives in api/api_internal.h, included above. */
+ 
++/* MsQuic uses a void* callback slot. Keep each function signature typed
++ * at registration, using the same union representation as libmoq. */
++static inline void *wtq_msq_conn_cb_ptr(QUIC_CONNECTION_CALLBACK_HANDLER fn)
++{
++    union { QUIC_CONNECTION_CALLBACK_HANDLER fn; void *obj; } u = { .fn = fn };
++    return u.obj;
++}
++static inline void *wtq_msq_stream_cb_ptr(QUIC_STREAM_CALLBACK_HANDLER fn)
++{
++    union { QUIC_STREAM_CALLBACK_HANDLER fn; void *obj; } u = { .fn = fn };
++    return u.obj;
++}
++_Static_assert(_Generic(&wtq_msq_conn_cb_ptr,
++                       void *(*)(QUIC_CONNECTION_CALLBACK_HANDLER): 1,
++                       default: 0), "connection callback helper type");
++_Static_assert(_Generic(&wtq_msq_stream_cb_ptr,
++                       void *(*)(QUIC_STREAM_CALLBACK_HANDLER): 1,
++                       default: 0), "stream callback helper type");
++_Static_assert(_Generic((QUIC_CONNECTION_CALLBACK_HANDLER)0,
++                       QUIC_STREAM_CALLBACK_HANDLER: 0,
++                       default: 1), "distinct callback types");
++
+ /*
+  * FROZEN v1 (07570ae) config layouts. These mirror EXACTLY the fields the
+  * client/listener configs had before the managed-domain tail was added. The
+diff --git a/backends/msquic/msq_listener.c b/backends/msquic/msq_listener.c
+index e1242e0..476566d 100644
+--- a/backends/msquic/msq_listener.c
++++ b/backends/msquic/msq_listener.c
+@@ -346,7 +346,7 @@ static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void *ctx,
+         return QUIC_STATUS_ABORTED;
+     }
+     l->env->api->SetCallbackHandler(ev->NEW_CONNECTION.Connection,
+-                                    (void *)wtq_msq_conn_callback, drv);
++                                    wtq_msq_conn_cb_ptr(wtq_msq_conn_callback), drv);
+     QUIC_STATUS status = QUIC_STATUS_SUCCESS;
+ #ifdef WTQ_MSQ_TESTING
+     if (atomic_load(&wtq_msq_test_fail_set_configuration) > 0) {
+diff --git a/tests/msquic/msquic_ops.c b/tests/msquic/msquic_ops.c
+index c4a2838..1018d4d 100644
+--- a/tests/msquic/msquic_ops.c
++++ b/tests/msquic/msquic_ops.c
+@@ -509,7 +509,7 @@ static int test_peer_stream_started_handler_before_shutdown(void)
+         WTQ_TEST_CHECK(g_ord.call[0].is_handler);
+         WTQ_TEST_CHECK(g_ord.call[0].stream == peer);
+         WTQ_TEST_CHECK(g_ord.call[0].handler ==
+-                       (void *)wtq_msq_stream_callback);
++                       wtq_msq_stream_cb_ptr(wtq_msq_stream_callback));
+ 
+         /* the handler context is the backend stream for THIS stream */
+         struct wtq_dstream *ds = g_ord.call[0].ctx;

@@ -4,16 +4,16 @@
 # (CI and reproducible local dev).
 #
 # libmoq's wtquic adapter consumes wtquic as an installed CMake package
-# (find_package(wtquic CONFIG COMPONENTS msquic)). This script
-# materializes that install at a KNOWN-GOOD pinned commit so CI and
+# (the managed MsQuic facade additionally requests COMPONENTS msquic).
+# This script materializes a pinned install so CI and
 # developers consume the same dependency input instead of relying on
 # whatever happens to be checked out next to the repo: it clones
 # (shallow, by exact commit) wtquic into a deterministic deps dir,
 # builds it, installs it into a private prefix, and prints the values
 # the libmoq configure needs:
 #
-#     CMAKE_PREFIX_PATH=<prefix>[:<existing CMAKE_PREFIX_PATH>]
-#     wtquic_DIR=<prefix>/lib/cmake/wtquic     (when that path exists)
+#     CMAKE_PREFIX_PATH=<prefix>[;<existing CMake prefix list>]
+#     wtquic_DIR=<actual installed package directory>
 #
 # Then configure libmoq, e.g.:
 #
@@ -38,8 +38,8 @@
 # and, under GitHub Actions, appended to $GITHUB_ENV so later steps see
 # them.
 #
-# wtquic's MsQuic backend is REQUIRED here (the libmoq adapter needs
-# the msquic component), so MsQuic must be discoverable through
+# wtquic's MsQuic backend is REQUIRED by this setup recipe (not by the
+# transport-independent adapter), so MsQuic must be discoverable through
 # wtquic's own mechanisms: an installed msquic CMake package (e.g.
 # Homebrew libmsquic), or WTQ_MSQUIC_ROOT / msquic_DIR, both forwarded
 # when set. The Network.framework backend (`network` component) is
@@ -54,7 +54,8 @@
 #   WTQ_BUILD_NETWORK build the Network.framework `network` component
 #                     (default: ON on Apple, OFF elsewhere; Apple-only)
 #   WTQ_FETCH_ONLY    =1 -> materialize the pinned checkout and exit
-#                     (no configure/build/install, no MsQuic needed) --
+#                     (pristine upstream, no callback backport, no
+#                     configure/build/install, no MsQuic needed) --
 #                     for consumers that cross-compile wtquic themselves,
 #                     e.g. scripts/build_ios_xcframework.sh
 #   WTQ_MSQUIC_ROOT   forwarded to wtquic's configure if set
@@ -64,6 +65,13 @@
 # (WTQ_FETCH_ONLY=1 needs only git: it stops after the pinned checkout.)
 
 set -euo pipefail
+
+if [ "${1:-}" = "--help" ]; then
+    printf '%s\n' 'Usage: bash scripts/setup_wtquic_deps.sh [extra CMake configure arguments]' \
+        'Requires MsQuic >= 2.5.9; set msquic_DIR to its installed share/msquic directory.' \
+        'Extra arguments are preserved individually, including paths with spaces.'
+    exit 0
+fi
 
 # -- Pinned, known-good dependency commit ------------------------------
 WTQUIC_REPO="${WTQUIC_REPO:-https://github.com/rwl4/wtquic.git}"
@@ -88,9 +96,9 @@ WTQUIC_REPO="${WTQUIC_REPO:-https://github.com/rwl4/wtquic.git}"
 # wtquic-Network managed facade uses it to wake an otherwise-idle loop at a
 # service deadline (periodic catalog refresh), with no adapter-owned timer.
 #
-# This is origin/main's tip. The wtquic repo squashes history to a single
-# "Initial commit"; pin the exact branch-tip SHA (fetchable via a full fetch).
-WTQUIC_REF="${WTQUIC_REF:-87a937ee22cf2398c677bbe323edd1a6880a3023}"
+# This exact revision adds the sized Origin policy and D02 compatibility API
+# consumed by the relay. The callback backport below keeps GCC pedantic WAE.
+WTQUIC_REF="${WTQUIC_REF:-0726cc3f617e1eba53e6002900d02f9cb9902352}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
@@ -133,6 +141,10 @@ fetch_at() {
         git -C "$dir" init -q
         git -C "$dir" remote add origin "$repo"
     fi
+    # Refuse before checkout, which could otherwise change a caller's dirty tree.
+    if [ -n "$(git -C "$dir" status --porcelain --untracked-files=all)" ]; then
+        die "dependency checkout is dirty: $dir"
+    fi
     git -C "$dir" remote set-url origin "$repo"
     if git -C "$dir" cat-file -e "${ref}^{commit}" 2>/dev/null; then
         log "$dir already has $ref"
@@ -170,6 +182,20 @@ if [ "${WTQ_FETCH_ONLY:-0}" = "1" ]; then
     exit 0
 fi
 
+# Build from a fresh export so the pinned checkout remains clean and repeat
+# invocations cannot accidentally reuse a source tree carrying other edits.
+run_dir=$(mktemp -d "$WTQUIC_DEPS_DIR/build.XXXXXXXX")
+mkdir "$run_dir/source"
+git -C "$wtquic_dir" archive HEAD | tar -x -C "$run_dir/source"
+wtquic_dir="$run_dir/source"
+wtquic_build="$run_dir/build"
+if [ "$WTQUIC_REF" = "0726cc3f617e1eba53e6002900d02f9cb9902352" ]; then
+    patch="$repo_root/cmake/patches/wtquic-0726cc3-callbacks.patch"
+    (cd "$wtquic_dir" && git apply --check "$patch" && git apply "$patch")
+else
+    log "explicit WTQUIC_REF override: caller owns compatibility; no default backport applied"
+fi
+
 # -- Configure / build / install wtquic --------------------------------
 # The libmoq adapter needs only the libraries and the CMake package:
 # wtquic's tests, fuzzers, benchmarks and examples stay off. The MsQuic
@@ -182,6 +208,7 @@ cmake_args=(
     -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
     -DCMAKE_INSTALL_PREFIX="$wtquic_prefix"
     -DWTQ_REQUIRE_MSQUIC=ON
+    -DWTQ_WARNINGS_AS_ERRORS=ON
     -DWTQ_BUILD_NETWORK="$WTQ_BUILD_NETWORK"
     -DWTQ_BUILD_TESTS=OFF
     -DWTQ_BUILD_SIM=OFF
@@ -194,19 +221,31 @@ fi
 if [ -n "${msquic_DIR:-}" ]; then
     cmake_args+=(-Dmsquic_DIR="$msquic_DIR")
 fi
-cmake "${cmake_args[@]}" >/dev/null
+cmake "${cmake_args[@]}" "$@" >"$run_dir/configure.log" 2>&1 || {
+    cat "$run_dir/configure.log" >&2
+    die "configure failed; retained $run_dir"
+}
 
 log "building wtquic"
-cmake --build "$wtquic_build" \
-    -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
+cmake --build "$wtquic_build" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}" \
+    >"$run_dir/build.log" 2>&1 || {
+    cat "$run_dir/build.log" >&2
+    die "build failed; retained $run_dir"
+}
 
 log "installing wtquic -> $wtquic_prefix"
-cmake --install "$wtquic_build" >/dev/null
+cmake --install "$wtquic_build" >"$run_dir/install.log" 2>&1 || {
+    cat "$run_dir/install.log" >&2
+    die "install failed; retained $run_dir"
+}
 
 # Sanity: the package the libmoq adapter resolves must exist.
-wtquic_pkg_dir="$wtquic_prefix/lib/cmake/wtquic"
-[ -f "$wtquic_pkg_dir/wtquicConfig.cmake" ] \
-    || die "install produced no wtquicConfig.cmake in $wtquic_pkg_dir"
+wtquic_pkg=$(find "$wtquic_prefix" -type f -name wtquicConfig.cmake) \
+    || die "cannot inspect the installed wtquic package"
+case "$wtquic_pkg" in
+    ''|*$'\n'*) die "install must contain exactly one wtquicConfig.cmake" ;;
+esac
+wtquic_pkg_dir=$(dirname "$wtquic_pkg")
 # When the Network.framework backend was requested, its component must have
 # installed too (libmoq's MOQ_BUILD_WTQUIC_NETWORK_MANAGED resolves
 # find_package(wtquic COMPONENTS network)).
@@ -222,13 +261,16 @@ fi
 # Nothing else reaches fd 3, so the eval consumes exactly these lines.
 result_prefix_path="$wtquic_prefix"
 if [ -n "${CMAKE_PREFIX_PATH:-}" ]; then
-    result_prefix_path="$wtquic_prefix:$CMAKE_PREFIX_PATH"
+    result_prefix_path="$wtquic_prefix;$CMAKE_PREFIX_PATH"
 fi
 
 env_file="$WTQUIC_DEPS_DIR/wtquic_deps.env"
 {
     printf 'CMAKE_PREFIX_PATH=%q\n' "$result_prefix_path"
     printf 'wtquic_DIR=%q\n'        "$wtquic_pkg_dir"
+    if [ -n "${msquic_DIR:-}" ]; then
+        printf 'msquic_DIR=%q\n' "$msquic_DIR"
+    fi
 } | tee "$env_file" >&3
 
 # GitHub Actions: make them available to subsequent steps. $GITHUB_ENV is
@@ -236,9 +278,10 @@ env_file="$WTQUIC_DEPS_DIR/wtquic_deps.env"
 # so these stay unescaped (unlike the eval/source output above).
 if [ -n "${GITHUB_ENV:-}" ]; then
     {
-        printf 'CMAKE_PREFIX_PATH=%s\n' "$result_prefix_path"
+        # CMake's environment search path uses ':' on Unix, not list ';'.
+        printf 'CMAKE_PREFIX_PATH=%s\n' "${result_prefix_path//;/:}"
         printf 'wtquic_DIR=%s\n'        "$wtquic_pkg_dir"
     } >> "$GITHUB_ENV"
 fi
 
-log "done. env written to $env_file"
+log "done. env written to $env_file; build logs retained at $run_dir"

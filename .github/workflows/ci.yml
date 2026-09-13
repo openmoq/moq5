@@ -7,6 +7,56 @@ on:
     branches: [main, master]
 
 jobs:
+  relay-setup:
+    name: Relay command from setup scripts (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CC: gcc
+      CXX: g++
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      WTQ_BUILD_NETWORK: "OFF"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libnuma-dev pkg-config perl python3
+      - name: Offline setup contract
+        run: bash scripts/selftest_dependency_setup.sh --self-test
+      - name: Build pinned dependencies and dual command
+        shell: bash
+        run: |
+          bash scripts/setup_msquic_deps.sh -G Ninja
+          source .deps/msquic-ci/msquic_deps.env
+          msquic_DIR="$msquic_DIR" bash scripts/setup_wtquic_deps.sh -G Ninja
+          source .deps/wtquic-ci/wtquic_deps.env
+          wt_builds=(.deps/wtquic-ci/build.*)
+          test "${#wt_builds[@]}" -eq 1
+          python3 scripts/test_wtquic_callback_patch.py --cc "$CC" \
+            --source "${wt_builds[0]}/source" --build "${wt_builds[0]}/build" \
+            --msquic-include "$PWD/.deps/msquic-ci/prefix/include"
+          cmake -S . -B build/relay-setup -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMOQ_WARNINGS_AS_ERRORS=ON \
+            -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_RELAY=ON -DMOQ_BUILD_ADAPTER_MSQUIC=ON \
+            -DMOQ_BUILD_MSQUIC_MANAGED=ON -DMOQ_BUILD_ADAPTER_WTQUIC=ON \
+            -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON \
+            -Dmsquic_DIR="$msquic_DIR" -Dwtquic_DIR="$wtquic_DIR"
+          cmake --build build/relay-setup --target moq5-relay
+          build/relay-setup/tools/moq5-relay/moq5-relay --version
+          build/relay-setup/tools/moq5-relay/moq5-relay capacity \
+            --config tools/moq5-relay/examples/relay.json
+      - name: Retain dependency build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-setup-logs
+          path: |
+            .deps/msquic-ci/build.*/*.log
+            .deps/wtquic-ci/build.*/*.log
+            build/relay-setup/CMakeCache.txt
+
   build-and-test:
     name: Build + Test (${{ matrix.preset }})
     runs-on: ${{ matrix.os }}
