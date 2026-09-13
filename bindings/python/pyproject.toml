@@ -1,0 +1,30 @@
+[build-system]
+requires = ["scikit-build-core>=0.11,<2"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "moq5"
+version = "0.1.0.dev0"
+description = "Python endpoint foundation for the LibMoQ media service"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.urls]
+Repository = "https://github.com/openmoq/moq5"
+
+[tool.scikit-build]
+cmake.version = ">=3.26"
+wheel.py-api = "cp312"
+wheel.packages = ["src/moq5"]
+sdist.include = ["CMakeLists.txt", "native/*.c", "native/*.map", "src/moq5/*.py", "src/moq5/py.typed", "tests/*.py", "tests/*.c", "tests/*.h", "examples/*.py", "README.md", "LICENSE.txt"]
+sdist.exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "build/**"]
+
+[tool.scikit-build.cmake.define]
+MOQ_PYTHON_BUILD_TESTS = "OFF"

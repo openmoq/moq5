@@ -1,0 +1,151 @@
+name: Python Foundation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    name: CPython 3.12 (${{ matrix.os }}, shared=${{ matrix.shared }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shared: ["OFF", "ON"]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: clang
+      CMAKE_BUILD_PARALLEL_LEVEL: "3"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Provision build dependencies
+        run: |
+          python -m pip download --only-binary=:all: \
+            --dest "$RUNNER_TEMP/python-build-deps" \
+            'build>=1.2,<2' 'scikit-build-core>=0.11,<2' 'cmake>=3.26,<4' ninja
+          python -m pip install --no-index --find-links="$RUNNER_TEMP/python-build-deps" \
+            'build>=1.2,<2' 'scikit-build-core>=0.11,<2' 'cmake>=3.26,<4' ninja
+
+      - name: Configure service SDK (no adapters, warnings as errors)
+        env:
+          SDK_SHARED: ${{ matrix.shared }}
+        run: |
+          cmake -S . -B build/python-sdk -G Ninja \
+            -Werror=dev -Werror=deprecated \
+            -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS="$SDK_SHARED" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/python-sdk" \
+            -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_SKIP_INSTALL_RPATH=ON \
+            -DMOQ_WARNINGS_AS_ERRORS=ON \
+            -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_SIM=OFF -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
+            -DMOQ_BUILD_ADAPTER_PICOQUIC=OFF -DMOQ_BUILD_ADAPTER_PICO_WT=OFF \
+            -DMOQ_BUILD_ADAPTER_MVFST=OFF -DMOQ_BUILD_ADAPTER_PROXYGEN=OFF \
+            -DMOQ_BUILD_ADAPTER_MSQUIC=OFF -DMOQ_BUILD_ADAPTER_WTQUIC=OFF \
+            -DMOQ_BUILD_PQ_THREADED=OFF -DMOQ_BUILD_PICO_WT_MANAGED=OFF \
+            -DMOQ_BUILD_MSQUIC_MANAGED=OFF \
+            -DMOQ_BUILD_WTQUIC_NETWORK_MANAGED=OFF \
+            -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=OFF
+
+      - name: Build and install service SDK
+        run: |
+          cmake --build build/python-sdk
+          cmake --install build/python-sdk
+
+      - name: Debug bridge tests (fake C provider, warnings as errors)
+        run: |
+          cmake -S bindings/python -B build/python-foundation -G Ninja \
+            -Werror=dev -Werror=deprecated \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/python-sdk" \
+            -DPython3_EXECUTABLE="$(command -v python)" \
+            -DMOQ_PYTHON_BUILD_TESTS=ON -DMOQ_PYTHON_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
+          cmake --build build/python-foundation
+          ctest --test-dir build/python-foundation -C Debug --output-on-failure \
+            --no-tests=error -R '^python_foundation$'
+
+      - name: Build wheel, sdist, and source archive
+        run: |
+          python -m build --no-isolation --wheel --sdist \
+            --outdir "$RUNNER_TEMP/python-artifacts" \
+            -C cmake.build-type=Debug \
+            -C "cmake.define.CMAKE_PREFIX_PATH=$RUNNER_TEMP/python-sdk" \
+            -C cmake.define.MOQ_PYTHON_WARNINGS_AS_ERRORS=ON \
+            -C cmake.define.MOQ_PYTHON_BUILD_TESTS=OFF \
+            -C cmake.define.CMAKE_SKIP_INSTALL_RPATH=ON \
+            bindings/python
+          # A plain source artifact has no .git, parent sources, or sibling SDK.
+          git archive --format=tar --prefix=moq5-source/ \
+            --output="$RUNNER_TEMP/python-artifacts/moq5-source.tar" \
+            HEAD:bindings/python
+
+      - name: Install each artifact in a fresh external venv and smoke the real SDK
+        env:
+          SDK_SHARED: ${{ matrix.shared }}
+        run: |
+          package_version="$(python -c \
+            'import pathlib, sys, tomllib; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["version"])' \
+            "$GITHUB_WORKSPACE/bindings/python/pyproject.toml")"
+          sdk_version="$(awk '$1 == "#define" && $2 == "MOQ_VERSION_STRING" {gsub(/"/, "", $3); print $3}' \
+            "$RUNNER_TEMP/python-sdk/include/moq/version.h")"
+          test -n "$package_version"
+          test -n "$sdk_version"
+          shopt -s nullglob
+          wheels=("$RUNNER_TEMP/python-artifacts/"*.whl)
+          sdists=("$RUNNER_TEMP/python-artifacts/"*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          artifacts=("${wheels[0]}" "${sdists[0]}" "$RUNNER_TEMP/python-artifacts/moq5-source.tar")
+          labels=(wheel sdist source)
+          mkdir -p "$RUNNER_TEMP/python-smoke"
+          cp bindings/python/tests/installed_smoke.py "$RUNNER_TEMP/python-smoke/"
+          cd "$RUNNER_TEMP/python-smoke"
+
+          # Test-process loader paths only; installed modules must have no RPATH.
+          if [[ "$SDK_SHARED" == "ON" ]]; then
+            case "$RUNNER_OS" in
+              Linux) export LD_LIBRARY_PATH="$RUNNER_TEMP/python-sdk/lib" ;;
+              macOS) export DYLD_LIBRARY_PATH="$RUNNER_TEMP/python-sdk/lib" ;;
+            esac
+          fi
+          for index in 0 1 2; do
+            venv="$RUNNER_TEMP/python-venv-${labels[$index]}"
+            python -m venv "$venv"
+            if [[ "${labels[$index]}" != "wheel" ]]; then
+              "$venv/bin/python" -m pip install --no-index \
+                --find-links="$RUNNER_TEMP/python-build-deps" \
+                'scikit-build-core>=0.11,<2' 'cmake>=3.26,<4' ninja
+            fi
+            "$venv/bin/python" -m pip install --no-index --no-deps \
+              --no-build-isolation --no-cache-dir \
+              -C cmake.build-type=Debug \
+              -C "cmake.define.CMAKE_PREFIX_PATH=$RUNNER_TEMP/python-sdk" \
+              -C cmake.define.MOQ_PYTHON_WARNINGS_AS_ERRORS=ON \
+              -C cmake.define.MOQ_PYTHON_BUILD_TESTS=OFF \
+              -C cmake.define.CMAKE_SKIP_INSTALL_RPATH=ON \
+              "${artifacts[$index]}"
+            "$venv/bin/python" -I -W error installed_smoke.py \
+              --artifact "${artifacts[$index]}" \
+              --expected-package-version "$package_version" \
+              --expected-sdk-version "$sdk_version"
+          done

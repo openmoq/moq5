@@ -1,0 +1,4 @@
+{
+    global: PyInit__native;
+    local: *;
+};

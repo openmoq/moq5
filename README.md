@@ -225,6 +225,7 @@ service/        moq-service: high-level media tier (endpoint, media
 sim/            moq-sim: SimPair deterministic simulation + fault injection
 adapters/       picoquic, mvfst, pico_wt, proxygen (+ shared conformance)
 bindings/cpp/   moq-cpp: header-only C++20 binding
+bindings/python/ CPython endpoint foundation over the installed service SDK
 media/          loc, cmaf, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
@@ -233,6 +234,10 @@ examples/       service/ (media apps), relay/ (embedding), plus core, picoquic,
 docs/           integration guide, adapter contract, conformance status
 scripts/        boundary checks, coverage, seed sweeps
 ```
+
+The [Python foundation](bindings/python/README.md) provides connection and
+endpoint lifetime management. Python media publishing/receiving and asyncio
+are separate follow-up work.
 
 ## Author
 
