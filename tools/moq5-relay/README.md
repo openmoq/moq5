@@ -57,9 +57,9 @@ cmake -S . -B build-relay-dual \
 cmake --build build-relay-dual --target moq5-relay
 ```
 
-The WTQuic recipe pins `0726cc3f617e1eba53e6002900d02f9cb9902352` plus the
-checked-in typed-callback portability patch; it does not disable pedantic
-warnings. Its MsQuic backend requires at least 2.5.9. `wtquic_DIR` is discovered
+The WTQuic recipe pins `da239546198d99080c120f32448cf3d8b8fc008e`, which includes
+the upstream typed-callback portability fix. It applies no WTQuic patches and
+keeps pedantic warnings enabled. Its MsQuic backend requires at least 2.5.9. `wtquic_DIR` is discovered
 from the actual installation, including `lib64` layouts. `WTQ_MSQUIC_ROOT` is
 an alternative for a source/build tree; it is not required with an installed
 `msquic_DIR`. Both scripts accept individual extra CMake configure arguments.
