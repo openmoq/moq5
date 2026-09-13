@@ -751,18 +751,30 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- Non-next request ID → INVALID_REQUEST_ID (0x4) -------------- */
+    /* -- Skipped request ID is accepted; a duplicate closes (0x4) ----- */
+    /* Requests on separate bidi streams can arrive out of order, so a peer
+     * id ahead of the next expected one is not an error (draft-18 section
+     * 10.1 names only wrong parity and duplicates). The skipped id may still
+     * arrive later; the same id twice is the INVALID_REQUEST_ID case. */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
         moq_session_t *c = NULL, *sv = NULL;
         establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
 
-        feed_subscribe(sv, 2, "ns", "t", NULL, 0);
+        feed_subscribe(sv, 2, "ns", "t", NULL, 0);     /* skips 0 */
+        MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
+        feed_subscribe(sv, 0, "ns", "t0", NULL, 0);    /* the gap fills */
+        MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
+        feed_subscribe(sv, 2, "ns", "t", NULL, 0);     /* duplicate */
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
         moq_event_t ev;
-        moq_session_poll_events(sv, &ev, 1);
-        MOQ_TEST_CHECK(ev.u.closed.code == 0x4);
+        uint64_t closed_code = 0;
+        while (moq_session_poll_events(sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) closed_code = ev.u.closed.code;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(closed_code == 0x4);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
