@@ -236,11 +236,14 @@ if(MOQ_BUILD_ADAPTER_WTQUIC)
     find_package(wtquic CONFIG QUIET OPTIONAL_COMPONENTS msquic network)
     if(NOT wtquic_FOUND)
         message(FATAL_ERROR
-            "MOQ_BUILD_ADAPTER_WTQUIC=ON but the wtquic package (with "
-            "its msquic component) was not found. Install wtquic "
+            "MOQ_BUILD_ADAPTER_WTQUIC=ON but the wtquic package was not found. Install wtquic "
             "(cmake --install <wtquic-build> --prefix <prefix>) and "
             "configure with -DCMAKE_PREFIX_PATH=<prefix>, or set "
-            "-Dwtquic_DIR=<prefix>/lib/cmake/wtquic.")
+            "-Dwtquic_DIR=<directory containing wtquicConfig.cmake>. "
+            "The MsQuic backend requires MsQuic >= 2.5.9: set "
+            "-Dmsquic_DIR=<prefix>/share/msquic for an installed provider, "
+            "or -DWTQ_MSQUIC_ROOT=<MsQuic source with build/bin library>. "
+            "See scripts/setup_msquic_deps.sh and scripts/setup_wtquic_deps.sh.")
     endif()
     add_subdirectory(adapters/wtquic)
 endif()
