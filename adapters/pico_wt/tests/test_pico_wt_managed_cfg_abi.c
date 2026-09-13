@@ -40,8 +40,12 @@ int main(void)
      * of the allocation. struct_size is stamped to that prefix, so the block is
      * not fully covered and create() must NOT read either field. A gate keyed on
      * app_deadline_us would read cfg->app_deadline_ctx past the allocation. */
-    size_t prefix = offsetof(moq_pico_wt_managed_cfg_t, app_deadline_us) +
-                    sizeof(((moq_pico_wt_managed_cfg_t *)0)->app_deadline_us);
+    /* volatile: the allocation is deliberately shorter than the struct, and a
+     * constant-folded size lets GCC's -Warray-bounds reject the field writes
+     * below as "partly outside array bounds" (-Werror) even though every write
+     * stays inside the prefix. */
+    volatile size_t prefix = offsetof(moq_pico_wt_managed_cfg_t, app_deadline_us) +
+                             sizeof(((moq_pico_wt_managed_cfg_t *)0)->app_deadline_us);
     unsigned char *raw = (unsigned char *)malloc(prefix);
     if (!raw) return 4;
     memset(raw, 0, prefix);
