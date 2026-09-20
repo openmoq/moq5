@@ -3,6 +3,7 @@
 # and all threading lives here.
 
 add_library(moq-service
+    src/auth_source.c
     src/endpoint.c
     src/media_receiver.c
     src/media_sender.c
@@ -219,7 +220,7 @@ if(MOQ_BUILD_TESTS)
     # not installed); tests compile the sources directly so the internal
     # symbols stay un-exported in the shared library (same pattern as
     # moq-core-test-internals).
-    add_library(moq-service-test-internals OBJECT src/endpoint.c)
+    add_library(moq-service-test-internals OBJECT src/endpoint.c src/auth_source.c)
     target_include_directories(moq-service-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(moq-service-test-internals PUBLIC moq::core
@@ -249,6 +250,12 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME negotiated_profile_offer
              COMMAND test_negotiated_profile_offer)
 
+    add_executable(test_auth_source tests/test_auth_source.c)
+    target_link_libraries(test_auth_source PRIVATE moq-service-test-internals)
+    target_include_directories(test_auth_source PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests/unit)
+    add_test(NAME auth_source COMMAND test_auth_source)
+
     add_executable(test_endpoint_resolve tests/test_endpoint_resolve.c)
     target_link_libraries(test_endpoint_resolve PRIVATE
         moq-service-test-internals)
@@ -268,7 +275,7 @@ if(MOQ_BUILD_TESTS)
     # defines, so the seam exists only in this binary -- the shipping library
     # never sees it. Own object set for exactly that reason.
     if(MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED)
-        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-hs-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -299,7 +306,7 @@ if(MOQ_BUILD_TESTS)
     # this binary -- the shipping library never sees it. Own object set for
     # exactly that reason.
     if(MOQ_BUILD_PQ_THREADED)
-        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-ka-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -328,7 +335,7 @@ if(MOQ_BUILD_TESTS)
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
     # object set so the testing define never leaks into the shipping library.
-    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c)
+    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c src/auth_source.c)
     target_include_directories(moq-service-endpoint-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
