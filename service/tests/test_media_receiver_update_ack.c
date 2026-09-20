@@ -132,6 +132,27 @@ static size_t build_publish_done(uint8_t *out, size_t out_cap,
 
 /* Learned outbound state: SUBSCRIBE request ids + the latest pending
  * REQUEST_UPDATE (id + Forward value), plus a total update counter. */
+static const uint8_t AUTH_BYTES[] = {0xd2, 0, 0xff, 0x80};
+
+static void check_auth(const moq_kvp_entry_t *params, size_t count)
+{
+    size_t tokens = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (params[i].type != MOQ_MSG_PARAM_AUTHORIZATION_TOKEN) continue;
+        tokens++;
+        moq_d16_auth_token_t token;
+        moq_result_t rc = moq_d16_auth_token_decode(params[i].value,
+                                                    params[i].value_len, &token);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) continue;
+        MOQ_TEST_CHECK(token.alias_type == MOQ_AUTH_TOKEN_USE_VALUE);
+        MOQ_TEST_CHECK_EQ_U64(token.token_type, 16);
+        MOQ_TEST_CHECK(token.token_value_len == sizeof(AUTH_BYTES) &&
+            memcmp(token.token_value, AUTH_BYTES, sizeof(AUTH_BYTES)) == 0);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(tokens, 1);
+}
+
 typedef struct {
     bool     have_catalog_rid; uint64_t catalog_rid;
     bool     have_video_rid;   uint64_t video_rid;
@@ -169,6 +190,7 @@ static void drain_and_learn(moq_session_t *client, learned_t *l)
                     sb.params = params; sb.params_cap = 16;
                     if (moq_d16_decode_subscribe(env.payload,
                             env.payload_len, ns_parts, 8, &sb) == MOQ_OK) {
+                        check_auth(sb.params, sb.params_count);
                         if (!l->have_catalog_rid) {
                             l->have_catalog_rid = true;
                             l->catalog_rid = sb.request_id;
@@ -187,6 +209,7 @@ static void drain_and_learn(moq_session_t *client, learned_t *l)
                         .params = params, .params_cap = 8 };
                     if (moq_d16_decode_request_update(env.payload,
                             env.payload_len, &upd) == MOQ_OK) {
+                        check_auth(upd.params, upd.params_count);
                         l->have_upd = true;
                         l->upd_rid = upd.request_id;
                         l->updates_seen++;
@@ -289,7 +312,13 @@ int main(void)
     moq_bytes_t ns_parts[2] = {
         MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
     moq_media_receiver_cfg_t rcfg;
-    moq_media_receiver_cfg_init_live(&rcfg);
+    moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
+    moq_auth_token_t token = {16, {AUTH_BYTES, sizeof(AUTH_BYTES)}};
+    moq_auth_source_t auth;
+    moq_auth_source_init_sized(&auth, sizeof(auth));
+    auth.tokens = &token;
+    auth.token_count = 1;
+    rcfg.request_auth = &auth;
     rcfg.namespace_.parts = ns_parts;
     rcfg.namespace_.count = 2;
     rcfg.auto_subscribe = true;

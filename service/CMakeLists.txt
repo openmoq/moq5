@@ -437,6 +437,19 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_fetch_catalog
                 COMMAND test_media_receiver_fetch_catalog)
 
+            add_executable(test_media_receiver_auth tests/test_media_receiver_auth.c)
+            target_link_libraries(test_media_receiver_auth PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_auth PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_auth COMMAND test_media_receiver_auth)
+            if(UNIX AND NOT APPLE AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                target_link_options(test_media_receiver_auth PRIVATE
+                    "-Wl,--wrap=malloc" "-Wl,--wrap=free")
+                target_compile_definitions(test_media_receiver_auth PRIVATE
+                    MOQ_RECEIVER_WRAP_ALLOC=1)
+            endif()
+
             # Roleless MSF catalog classified by codec.
             add_executable(test_media_receiver_roleless
                 tests/test_media_receiver_roleless.c)

@@ -49,7 +49,7 @@ int main(void)
 
     /* Receiver cfg (live preset): forces an overflow policy, stamps struct_size. */
     moq_media_receiver_cfg_t rcfg;
-    moq_media_receiver_cfg_init_live(&rcfg);
+    moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
     if (rcfg.struct_size != sizeof(moq_media_receiver_cfg_t))
         return 2;
 
