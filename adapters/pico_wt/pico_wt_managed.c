@@ -11,6 +11,7 @@
 #include <moq/pico_wt_managed.h>
 #include <moq/picoquic_verify.h>
 
+#include "../common/moq_setup_auth.h"
 #include "../common/moq_alpn.h"
 #include "../common/moq_pq_stream_backlog.h"
 #include "pico_wt_adapter.h"
@@ -63,6 +64,7 @@ typedef struct { int event; const void *ctx; } moq_pwt_test_ev_t;
 #endif
 
 struct moq_pico_wt_managed {
+    moq_managed_setup_t setup;
     moq_alloc_t        alloc;
 
     /* Copied config. */
@@ -264,6 +266,10 @@ static void build_session_cfg(moq_pico_wt_managed_t *m,
                                moq_perspective_t persp)
 {
     moq_session_cfg_init_sized(scfg, sizeof(*scfg), &m->alloc, persp);
+    moq_managed_setup_apply(&m->setup, scfg);
+    /* Peer credentials are independent of whether this endpoint sends any. */
+    scfg->recv_buffer_size = MOQ_MANAGED_SETUP_COPY_BUDGET;
+    if (m->setup.count) scfg->send_buffer_size = MOQ_MANAGED_SETUP_COPY_BUDGET;
     scfg->send_request_capacity = m->send_request_capacity;
     scfg->initial_request_capacity =
         m->initial_request_capacity ? m->initial_request_capacity : 64;
@@ -755,15 +761,15 @@ static int loop_callback(picoquic_quic_t *quic,
 
 /* -- cfg_init ------------------------------------------------------- */
 
-/* The pointer initializer clears and stamps the full current struct, so a caller
- * can set the appended app_deadline block directly. The sized form is the
+/* The pointer initializer preserves the pre-authentication extent, including
+ * the historical app_deadline block. The sized form is the
  * explicit caller-sized API. The whole-block read gate (through app_deadline_ctx)
  * in create() reads the block only when the caller's struct_size covers it. */
 void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
+    memset(cfg, 0, offsetof(moq_pico_wt_managed_cfg_t, setup_auth_tokens));
+    cfg->struct_size = (uint32_t)offsetof(moq_pico_wt_managed_cfg_t, setup_auth_tokens);
 }
 
 void moq_pico_wt_managed_cfg_init_sized(moq_pico_wt_managed_cfg_t *cfg,
@@ -836,6 +842,17 @@ moq_result_t moq_pico_wt_managed_create(
     if (!m) return MOQ_ERR_NOMEM;
     memset(m, 0, sizeof(*m));
     m->alloc = *cfg->alloc;
+    moq_bytes_t authority = {0}, path = {0};
+    moq_result_t setup_rc = moq_managed_setup_copy(&m->setup, &m->alloc,
+        CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_tokens : NULL,
+        CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_token_count : 0,
+        authority, path, persp);
+    if (setup_rc != MOQ_OK) {
+        moq_managed_setup_clear(&m->setup, &m->alloc);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return setup_rc;
+    }
+
     m->perspective = persp;
     m->port = port;
 
@@ -870,6 +887,7 @@ moq_result_t moq_pico_wt_managed_create(
             /* IP host authenticated by the default verifier, no expected
              * name -> cannot verify. */
             free_strings(m);
+            moq_managed_setup_clear(&m->setup, &m->alloc);
             m->alloc.free(m, sizeof(*m), m->alloc.ctx);
             return MOQ_ERR_INVAL;
         }
@@ -883,6 +901,7 @@ moq_result_t moq_pico_wt_managed_create(
     }
     if (!dup_ok) {
         free_strings(m);
+        moq_managed_setup_clear(&m->setup, &m->alloc);
         m->alloc.free(m, sizeof(*m), m->alloc.ctx);
         return MOQ_ERR_NOMEM;
     }
@@ -912,14 +931,32 @@ moq_result_t moq_pico_wt_managed_create(
         m->on_activity_ctx = cfg->on_activity_ctx;
     }
 
+    moq_session_cfg_t setup_cfg;
+    build_session_cfg(m, &setup_cfg, persp);
+    const moq_version_t setup_versions[] = {MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18};
+    for (size_t i = 0; setup_rc == MOQ_OK && i < 2; ++i) {
+        if (m->wt_protocols ? !wt_offer_contains(m->wt_protocols,
+                moq_alpn_for_version(setup_versions[i])) : i != 0) continue;
+        setup_cfg.version = setup_versions[i];
+        setup_rc = moq_managed_setup_preflight(&setup_cfg);
+    }
+    if (setup_rc != MOQ_OK) {
+        free_strings(m);
+        moq_managed_setup_clear(&m->setup, &m->alloc);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return setup_rc;
+    }
+
     if (pthread_mutex_init(&m->mutex, NULL) != 0) {
         free_strings(m);
+        moq_managed_setup_clear(&m->setup, &m->alloc);
         m->alloc.free(m, sizeof(*m), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
     if (pthread_cond_init(&m->cond, NULL) != 0) {
         pthread_mutex_destroy(&m->mutex);
         free_strings(m);
+        moq_managed_setup_clear(&m->setup, &m->alloc);
         m->alloc.free(m, sizeof(*m), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
@@ -1060,6 +1097,7 @@ fail_quic:
     pthread_cond_destroy(&m->cond);
     pthread_mutex_destroy(&m->mutex);
     free_strings(m);
+    moq_managed_setup_clear(&m->setup, &m->alloc);
     m->alloc.free(m, sizeof(*m), m->alloc.ctx);
     return MOQ_ERR_INTERNAL;
 }
@@ -1122,6 +1160,7 @@ void moq_pico_wt_managed_destroy(moq_pico_wt_managed_t *m)
     pthread_mutex_destroy(&m->mutex);
     free_strings(m);
     moq_alloc_t alloc = m->alloc;
+    moq_managed_setup_clear(&m->setup, &m->alloc);
     alloc.free(m, sizeof(*m), alloc.ctx);
 }
 

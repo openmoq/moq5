@@ -30,7 +30,7 @@ int main(void)
     /* Init contract: both initializers stamp the full current struct. */
     moq_pico_wt_managed_cfg_t a;
     moq_pico_wt_managed_cfg_init(&a);
-    if (a.struct_size != (uint32_t)sizeof(a)) return 1;
+    if (a.struct_size != (uint32_t)offsetof(moq_pico_wt_managed_cfg_t, setup_auth_tokens)) return 1;
     if (a.alloc || a.on_pump || a.app_deadline_us || a.app_deadline_ctx) return 2;
     moq_pico_wt_managed_cfg_init_sized(&a, sizeof(a));
     if (a.struct_size != (uint32_t)sizeof(a)) return 3;
@@ -46,14 +46,15 @@ int main(void)
     if (!raw) return 4;
     memset(raw, 0, prefix);
     moq_pico_wt_managed_cfg_t *cfg = (moq_pico_wt_managed_cfg_t *)raw;
-    cfg->struct_size = (uint32_t)prefix;
-    cfg->alloc = moq_alloc_default();
-    cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
-    cfg->port = 443;
-    cfg->host = "127.0.0.1";
-    cfg->insecure_skip_verify = true;      /* IP host -> "localhost" SNI, past the SNI gate */
-    cfg->on_pump = pump_cb;
-    cfg->app_deadline_us = deadline_cb;     /* a real callback, within the prefix */
+    a.struct_size = (uint32_t)prefix;
+    a.alloc = moq_alloc_default();
+    a.perspective = MOQ_PERSPECTIVE_CLIENT;
+    a.port = 443;
+    a.host = "127.0.0.1";
+    a.insecure_skip_verify = true;      /* IP host -> "localhost" SNI, past the SNI gate */
+    a.on_pump = pump_cb;
+    a.app_deadline_us = deadline_cb;     /* a real callback, within the prefix */
+    memcpy(raw, &a, prefix);
     /* app_deadline_ctx is beyond the allocation -- intentionally not set. */
 
     /* This config passes every earlier validation and reaches the app_deadline

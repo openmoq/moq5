@@ -275,6 +275,15 @@ static void detach_from_picoquic(moq_pico_wt_conn_t *conn)
     conn->endpoint_ctx.control_stream_ctx = NULL;
 
     if (cnx && h3 && ctrl) {
+        /* Detach also disables the prefix callback. Upstream deletion otherwise
+         * fetches cnx's callback context as h3zero, but a managed client uses
+         * its facade as that context. No callback may target this adapter once
+         * detached, and the explicit cleanup below handles its owned state. */
+        h3zero_stream_prefix_t *prefix = h3zero_find_stream_prefix(h3, ctrl_id);
+        if (prefix && prefix->function_ctx == conn) {
+            prefix->function_call = NULL;
+            prefix->function_ctx = NULL;
+        }
         picowt_deregister(cnx, h3, ctrl);
         h3zero_delete_stream_prefix(cnx, h3, ctrl_id);
     }

@@ -34,8 +34,8 @@ int main(void)
     moq_pico_wt_managed_cfg_t cfg;
     moq_pico_wt_managed_cfg_init(&cfg);
 
-    /* Both the pointer and sized inits stamp the full current struct. */
-    if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
+    /* The pointer init preserves the frozen pre-authentication extent. */
+    if (cfg.struct_size != offsetof(moq_pico_wt_managed_cfg_t, setup_auth_tokens))
         return 1;
     if (cfg.alloc != NULL || cfg.on_pump != NULL)
         return 2;
