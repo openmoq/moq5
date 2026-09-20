@@ -1200,6 +1200,7 @@ int main(void)
     /*     the cache, then DELETE frees that cache entry. The caller     */
     /*     later reads the freed pointer during scratch_copy.            */
     {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
         moq_session_cfg_t sx = MOQ_SESSION_CFG_INIT;
@@ -1213,8 +1214,8 @@ int main(void)
             .alias_type = MOQ_AUTH_TOKEN_REGISTER,
             .alias = 1,
             .token_type = 42,
-            .token_value = (const uint8_t *)"secret_value",
-            .token_value_len = 12,
+            .token_value = payload,
+            .token_value_len = sizeof(payload),
         };
         uint8_t tb0[64];
         moq_buf_writer_t tw0;
@@ -1269,9 +1270,10 @@ int main(void)
         MOQ_TEST_CHECK(ev1.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
         MOQ_TEST_CHECK(ev1.u.subscribe_request.token_count == 1);
         MOQ_TEST_CHECK(ev1.u.subscribe_request.tokens[0].token_type == 42);
-        MOQ_TEST_CHECK(ev1.u.subscribe_request.tokens[0].token_value.len == 12);
+        MOQ_TEST_CHECK(ev1.u.subscribe_request.tokens[0].token_value.len ==
+                       sizeof(payload));
         MOQ_TEST_CHECK(memcmp(ev1.u.subscribe_request.tokens[0].token_value.data,
-                              "secret_value", 12) == 0);
+                              payload, sizeof(payload)) == 0);
 
         /* Cache entry should be deleted. */
         MOQ_TEST_CHECK(moq_token_cache_lookup(&sv->peer_token_cache, 1,

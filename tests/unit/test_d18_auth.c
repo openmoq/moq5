@@ -976,6 +976,109 @@ int main(void)
         moq_simpair_destroy(sp);
     }
 
+    /* == Binary alias replacement and USE_ALIAS+DELETE ownership ====== */
+    {
+        const uint8_t original[] = {0x01, 0x00, 0x02};
+        const uint8_t replacement[] = {
+            0xd2, 0x84, 0x40, 0x00, 0x80, 0xff
+        };
+        moq_session_t *s = make_server_ex(1024);
+        MOQ_TEST_CHECK(s != NULL);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xE501);
+
+        moq_d18_msg_params_t p = { 0 };
+        p.auth_token_count = 1;
+        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_REGISTER;
+        p.auth_tokens[0].alias = 7;
+        p.auth_tokens[0].token_type = 3;
+        p.auth_tokens[0].token_value =
+            (moq_bytes_t){ original, sizeof(original) };
+        uint8_t msg[128];
+        size_t n = encode_subscribe(msg, sizeof(msg), 0, &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, ref, msg, n, false, 1), (int)MOQ_OK);
+
+        moq_event_t ev;
+        moq_subscription_t sub = { 0 };
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST)
+                sub = ev.u.subscribe_request.sub;
+            moq_event_cleanup(&ev);
+        }
+        moq_accept_subscribe_cfg_t acfg;
+        moq_accept_subscribe_cfg_init(&acfg);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_accept_subscribe(s, sub, &acfg, 1),
+            (int)MOQ_OK);
+        moq_action_t action;
+        while (moq_session_poll_actions(s, &action, 1) > 0)
+            moq_action_cleanup(&action);
+
+        /* DELETE then REGISTER replaces the alias transactionally. */
+        memset(&p, 0, sizeof(p));
+        p.auth_token_count = 2;
+        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_DELETE;
+        p.auth_tokens[0].alias = 7;
+        p.auth_tokens[1].alias_type = MOQ_AUTH_TOKEN_REGISTER;
+        p.auth_tokens[1].alias = 7;
+        p.auth_tokens[1].token_type = 9;
+        p.auth_tokens[1].token_value =
+            (moq_bytes_t){ replacement, sizeof(replacement) };
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        moq_d18_encode_request_update(&w, 2, &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, ref, msg, moq_buf_writer_offset(&w), false, 1), (int)MOQ_OK);
+        bool got = false;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                got = true;
+                MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_updated.token_count, 1);
+                MOQ_TEST_CHECK_EQ_SIZE(
+                    ev.u.subscribe_updated.tokens[0].token_value.len,
+                    sizeof(replacement));
+                MOQ_TEST_CHECK(memcmp(
+                    ev.u.subscribe_updated.tokens[0].token_value.data,
+                    replacement, sizeof(replacement)) == 0);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got);
+        while (moq_session_poll_actions(s, &action, 1) > 0)
+            moq_action_cleanup(&action);
+
+        /* The staged USE_ALIAS bytes survive deleting their cache entry. */
+        memset(&p, 0, sizeof(p));
+        p.auth_token_count = 2;
+        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_ALIAS;
+        p.auth_tokens[0].alias = 7;
+        p.auth_tokens[1].alias_type = MOQ_AUTH_TOKEN_DELETE;
+        p.auth_tokens[1].alias = 7;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        moq_d18_encode_request_update(&w, 4, &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, ref, msg, moq_buf_writer_offset(&w), false, 1), (int)MOQ_OK);
+        got = false;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                got = true;
+                MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_updated.token_count, 1);
+                MOQ_TEST_CHECK_EQ_SIZE(
+                    ev.u.subscribe_updated.tokens[0].token_value.len,
+                    sizeof(replacement));
+                MOQ_TEST_CHECK(memcmp(
+                    ev.u.subscribe_updated.tokens[0].token_value.data,
+                    replacement, sizeof(replacement)) == 0);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got);
+        MOQ_TEST_CHECK_EQ_INT(moq_token_cache_lookup(
+            &s->peer_token_cache, 7, NULL, NULL, NULL),
+            MOQ_TOKEN_ERR_UNKNOWN);
+        moq_session_destroy(s);
+    }
+
     /* == Send-buffer backpressure: rejects are retryable, not dropped ==== *
      *  Leave one undrained action (so begin_advance keeps send_len) and mark the
      *  send buffer all but full. The reject's REQUEST_ERROR fits in send_cap but
@@ -1209,6 +1312,7 @@ int main(void)
     /* REQUEST_OK (successful update) under exhausted send buffer: WOULD_BLOCK,
      * no event, then on retry the REQUEST_OK + SUBSCRIBE_UPDATED are produced. */
     {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
         moq_session_t *s = make_server();
         MOQ_TEST_CHECK(s != NULL);
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0xF401);
@@ -1237,7 +1341,8 @@ int main(void)
         p.auth_token_count = 1;
         p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
         p.auth_tokens[0].token_type = 13;
-        p.auth_tokens[0].token_value = MOQ_BYTES_LITERAL("rok");
+        p.auth_tokens[0].token_value =
+            (moq_bytes_t){ payload, sizeof(payload) };
         uint8_t msg[64];
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, msg, sizeof(msg));
@@ -1269,9 +1374,12 @@ int main(void)
                 MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_updated.token_count, 1);
                 MOQ_TEST_CHECK_EQ_U64(
                     ev.u.subscribe_updated.tokens[0].token_type, 13);
+                MOQ_TEST_CHECK_EQ_SIZE(
+                    ev.u.subscribe_updated.tokens[0].token_value.len,
+                    sizeof(payload));
                 MOQ_TEST_CHECK(memcmp(
                     ev.u.subscribe_updated.tokens[0].token_value.data,
-                    "rok", 3) == 0);
+                    payload, sizeof(payload)) == 0);
             }
             moq_event_cleanup(&ev);
         }
