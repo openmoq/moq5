@@ -560,6 +560,15 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     # CA with a matching SNI accepts, and custom CA with a WRONG SNI is rejected
     # on the hostname mismatch (terminal). Needs the test CA that signed the
     # server cert.
+    add_executable(test_picoquic_setup_auth ../common/test_setup_auth_loopback.c)
+    target_link_libraries(test_picoquic_setup_auth PRIVATE moq-adapter-picoquic-threaded-test-internals)
+    target_compile_options(test_picoquic_setup_auth PRIVATE -UNDEBUG)
+    target_compile_definitions(test_picoquic_setup_auth PRIVATE
+        MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+        MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    add_test(NAME picoquic_setup_auth COMMAND test_picoquic_setup_auth)
+    set_tests_properties(picoquic_setup_auth PROPERTIES TIMEOUT 45)
+
     add_executable(test_threaded_tls_handshake tests/test_threaded_tls_handshake.c)
     target_link_libraries(test_threaded_tls_handshake PRIVATE
         moq-adapter-picoquic-threaded-test-internals)
