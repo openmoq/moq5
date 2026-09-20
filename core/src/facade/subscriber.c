@@ -760,6 +760,12 @@ moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
         ucfg.end_group = cfg->end_group;
     }
 
+    if (cfg->struct_size >= offsetof(moq_sub_update_cfg_t, auth_token_count) +
+                            sizeof(cfg->auth_token_count)) {
+        ucfg.auth_tokens = cfg->auth_tokens;
+        ucfg.auth_token_count = cfg->auth_token_count;
+    }
+
     return moq_session_update_subscription(sub->session, track->handle,
                                             &ucfg, now_us);
 }
@@ -1396,11 +1402,27 @@ moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
 
 /* -- Joining fetch -------------------------------------------------- */
 
+/* Freeze the original extent, including its tail padding. */
+#define MOQ_SUB_JOIN_CFG_V0_SIZE \
+    ((offsetof(moq_sub_joining_fetch_cfg_t, subscriber_priority) + \
+      sizeof(((moq_sub_joining_fetch_cfg_t *)0)->subscriber_priority) + \
+      _Alignof(moq_sub_joining_fetch_cfg_t) - 1) & \
+     ~(size_t)(_Alignof(moq_sub_joining_fetch_cfg_t) - 1))
+_Static_assert(offsetof(moq_sub_joining_fetch_cfg_t, auth_tokens) >=
+               MOQ_SUB_JOIN_CFG_V0_SIZE, "joining FETCH auth overlaps old ABI");
+
+void moq_sub_joining_fetch_cfg_init_sized(moq_sub_joining_fetch_cfg_t *cfg,
+                                         size_t cfg_size)
+{
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+}
+
 void moq_sub_joining_fetch_cfg_init(moq_sub_joining_fetch_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    moq_sub_joining_fetch_cfg_init_sized(cfg, MOQ_SUB_JOIN_CFG_V0_SIZE);
 }
 
 moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
@@ -1410,7 +1432,7 @@ moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
 {
     if (!sub || !cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
-    if (cfg->struct_size < sizeof(moq_sub_joining_fetch_cfg_t))
+    if (cfg->struct_size < MOQ_SUB_JOIN_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (!cfg->track) return MOQ_ERR_INVAL;
     if (cfg->track->sub != sub) return MOQ_ERR_INVAL;
@@ -1421,7 +1443,7 @@ moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
     if (!r) return MOQ_ERR_WOULD_BLOCK;
 
     moq_fetch_cfg_t fcfg;
-    moq_fetch_cfg_init(&fcfg);
+    moq_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
     fcfg.is_joining = true;
     fcfg.joining_sub = cfg->track->handle;
     fcfg.joining_relative = cfg->relative;
@@ -1429,6 +1451,12 @@ moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
     fcfg.group_order = cfg->group_order;
     fcfg.has_subscriber_priority = cfg->has_subscriber_priority;
     fcfg.subscriber_priority = cfg->subscriber_priority;
+
+    if (cfg->struct_size >= offsetof(moq_sub_joining_fetch_cfg_t, auth_token_count) +
+                            sizeof(cfg->auth_token_count)) {
+        fcfg.auth_tokens = cfg->auth_tokens;
+        fcfg.auth_token_count = cfg->auth_token_count;
+    }
 
     moq_fetch_t h;
     moq_result_t rc = moq_session_fetch(sub->session, &fcfg, now_us, &h);

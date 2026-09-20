@@ -285,6 +285,19 @@ typedef struct moq_pq_threaded_cfg {
      * for the duration of _create only. Inert when insecure_skip_verify=true and
      * inert in server mode. */
     const char        *ca_file;
+    /* SETUP credentials are copied before create returns. Use the sized
+     * initializer to enable this append-only block. Both list fields must
+     * fit in struct_size. No configured credential is silently omitted. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
+    moq_bytes_t setup_authority; /* raw-QUIC client route, copied */
+    moq_bytes_t setup_path;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that

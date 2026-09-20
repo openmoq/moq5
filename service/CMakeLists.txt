@@ -3,6 +3,7 @@
 # and all threading lives here.
 
 add_library(moq-service
+    src/auth_source.c
     src/endpoint.c
     src/media_receiver.c
     src/media_sender.c
@@ -219,7 +220,7 @@ if(MOQ_BUILD_TESTS)
     # not installed); tests compile the sources directly so the internal
     # symbols stay un-exported in the shared library (same pattern as
     # moq-core-test-internals).
-    add_library(moq-service-test-internals OBJECT src/endpoint.c)
+    add_library(moq-service-test-internals OBJECT src/endpoint.c src/auth_source.c)
     target_include_directories(moq-service-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(moq-service-test-internals PUBLIC moq::core
@@ -249,6 +250,12 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME negotiated_profile_offer
              COMMAND test_negotiated_profile_offer)
 
+    add_executable(test_auth_source tests/test_auth_source.c)
+    target_link_libraries(test_auth_source PRIVATE moq-service-test-internals)
+    target_include_directories(test_auth_source PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests/unit)
+    add_test(NAME auth_source COMMAND test_auth_source)
+
     add_executable(test_endpoint_resolve tests/test_endpoint_resolve.c)
     target_link_libraries(test_endpoint_resolve PRIVATE
         moq-service-test-internals)
@@ -268,7 +275,7 @@ if(MOQ_BUILD_TESTS)
     # defines, so the seam exists only in this binary -- the shipping library
     # never sees it. Own object set for exactly that reason.
     if(MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED)
-        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-hs-test-internals OBJECT src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-hs-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -299,7 +306,7 @@ if(MOQ_BUILD_TESTS)
     # this binary -- the shipping library never sees it. Own object set for
     # exactly that reason.
     if(MOQ_BUILD_PQ_THREADED)
-        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c)
+        add_library(moq-service-ka-test-internals OBJECT src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-ka-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -309,6 +316,14 @@ if(MOQ_BUILD_TESTS)
             ${_MOQ_SERVICE_FACADE_DEFS}
             moq_pq_threaded_create=moq_test_pq_threaded_create)
         target_compile_features(moq-service-ka-test-internals PUBLIC c_std_11)
+
+        add_executable(test_endpoint_auth tests/test_endpoint_auth.c)
+        target_link_libraries(test_endpoint_auth PRIVATE
+            moq-service-ka-test-internals moq::core Threads::Threads
+            ${_MOQ_SERVICE_FACADE_LIBS})
+        target_include_directories(test_endpoint_auth PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_auth COMMAND test_endpoint_auth)
 
         add_executable(test_endpoint_keepalive_default
             tests/test_endpoint_keepalive_default.c)
@@ -328,7 +343,7 @@ if(MOQ_BUILD_TESTS)
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
     # object set so the testing define never leaks into the shipping library.
-    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c)
+    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c src/auth_source.c)
     target_include_directories(moq-service-endpoint-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -351,7 +366,7 @@ if(MOQ_BUILD_TESTS)
     # otherwise leak into the shipping receiver).
     if(TARGET moq::msf)
         add_library(moq-service-receiver-test-internals OBJECT
-            src/media_receiver.c src/endpoint.c)
+            src/media_receiver.c src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -430,6 +445,19 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_fetch_catalog
                 COMMAND test_media_receiver_fetch_catalog)
 
+            add_executable(test_media_receiver_auth tests/test_media_receiver_auth.c)
+            target_link_libraries(test_media_receiver_auth PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_auth PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_auth COMMAND test_media_receiver_auth)
+            if(UNIX AND NOT APPLE AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                target_link_options(test_media_receiver_auth PRIVATE
+                    "-Wl,--wrap=malloc" "-Wl,--wrap=free")
+                target_compile_definitions(test_media_receiver_auth PRIVATE
+                    MOQ_RECEIVER_WRAP_ALLOC=1)
+            endif()
+
             # Roleless MSF catalog classified by codec.
             add_executable(test_media_receiver_roleless
                 tests/test_media_receiver_roleless.c)
@@ -469,7 +497,7 @@ if(MOQ_BUILD_TESTS)
         # the sender would publish after add/remove, to pin coalescing and the
         # no-op dedup deterministically.
         add_library(moq-service-sender-test-internals OBJECT
-            src/media_sender.c src/endpoint.c)
+            src/media_sender.c src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-sender-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -481,6 +509,15 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-sender-test-internals
             PUBLIC c_std_11)
+
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_auth tests/test_media_sender_auth.c)
+            target_link_libraries(test_media_sender_auth PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_auth PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit ${CMAKE_SOURCE_DIR}/core/src)
+            add_test(NAME media_sender_auth COMMAND test_media_sender_auth)
+        endif()
 
         add_executable(test_media_sender_catalog
             tests/test_media_sender_catalog.c)
@@ -528,7 +565,7 @@ if(MOQ_BUILD_TESTS)
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                src/media_sender.c src/media_receiver.c src/endpoint.c)
+                src/media_sender.c src/media_receiver.c src/endpoint.c src/auth_source.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

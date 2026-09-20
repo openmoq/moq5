@@ -655,8 +655,8 @@ void moq_wtquic_network_managed_cfg_init(moq_wtquic_network_managed_cfg_t *cfg)
 {
     if (cfg == NULL)
         return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
+    memset(cfg, 0, offsetof(moq_wtquic_network_managed_cfg_t, setup_auth_tokens));
+    cfg->struct_size = (uint32_t)offsetof(moq_wtquic_network_managed_cfg_t, setup_auth_tokens);
 }
 
 void moq_wtquic_network_managed_cfg_init_sized(
@@ -689,6 +689,10 @@ moq_result_t moq_wtquic_network_managed_create(
         cfg->alloc->free == NULL || cfg->alloc->realloc == NULL ||
         cfg->host == NULL || cfg->port <= 0 || cfg->port > 65535)
         return MOQ_ERR_INVAL;
+
+    if (NWM_CFG_HAS(setup_auth_token_count) &&
+        (cfg->setup_auth_tokens != NULL || cfg->setup_auth_token_count != 0))
+        return MOQ_ERR_UNSUPPORTED;
 
     /* CLIENT-ONLY, SINGLE-LANE — explicit, not silently ignored. A
      * server perspective needs the future MsQuic-backed wtquic facade

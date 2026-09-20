@@ -198,16 +198,27 @@ typedef struct moq_wtquic_network_managed_cfg {
      * new deadline on its own.
      *
      * Set it after either initializer — moq_wtquic_network_managed_cfg_init
-     * stamps the full current struct, and moq_wtquic_network_managed_cfg_init_sized
+     * stamps the pre-authentication prefix, and moq_wtquic_network_managed_cfg_init_sized
      * stamps min(cfg_size, sizeof) — the block is honored once struct_size
      * covers through app_deadline_ctx.
      */
     uint64_t         (*app_deadline_us)(void *ctx);
     void              *app_deadline_ctx;
+    /* Reserved SETUP credential block. A configured list currently returns
+     * MOQ_ERR_UNSUPPORTED before transport startup. Use the sized initializer;
+     * both fields must fit in struct_size. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
 } moq_wtquic_network_managed_cfg_t;
 
 /* Pointer initializer: clears and stamps the FULL current struct, so a
- * current-header caller can set any field, including the appended
+ * current-header caller can set any field in that prefix, including the appended
  * app_deadline block, directly afterward. */
 MOQ_API void moq_wtquic_network_managed_cfg_init(
     moq_wtquic_network_managed_cfg_t *cfg);

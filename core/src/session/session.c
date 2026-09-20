@@ -2420,6 +2420,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         memset(s->track_hist, 0, th_bytes);
     }
 
+    moq_result_t setup_rc = session_prepare_setup(s, cfg);
+    if (setup_rc < 0) {
+        moq_session_destroy(s);
+        return setup_rc;
+    }
     *out = s;
     return MOQ_OK;
 }
@@ -2427,6 +2432,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 void moq_session_destroy(moq_session_t *s)
 {
     if (!s) return;
+    if (s->setup_wire)
+        s->alloc.free(s->setup_wire, s->setup_wire_alloc, s->alloc.ctx);
     session_sweep_discard(s);
     if (s->profile && s->profile_state)
         s->profile->destroy(s->profile_state);

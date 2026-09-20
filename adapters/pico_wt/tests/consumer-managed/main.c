@@ -20,8 +20,8 @@ int main(void)
     moq_pico_wt_managed_cfg_t cfg;
     moq_pico_wt_managed_cfg_init(&cfg);
 
-    /* The pointer init stamps the full current struct and zeroes it. */
-    if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
+    /* The pointer init stamps and clears the frozen pre-authentication prefix. */
+    if (cfg.struct_size != offsetof(moq_pico_wt_managed_cfg_t, setup_auth_tokens))
         return 1;
     if (cfg.alloc != NULL || cfg.on_pump != NULL)
         return 2;

@@ -31,6 +31,7 @@
  */
 
 #include <moq/types.h>
+#include <moq/auth.h>
 #include <moq/session.h>
 #include <moq/endpoint.h>
 #include <moq/media_object.h>
@@ -112,6 +113,11 @@ typedef struct moq_media_receiver_cfg {
                                           Overflow is terminal (§6.3): losing
                                           a discovery event is unrecoverable
                                           miswiring, never a silent drop. */
+    /* Appended: configuration and static token bytes are copied at create/attach.
+     * Selector/context must outlive the receiver. Selection runs on the owner
+     * thread; any non-OK result or empty list terminalizes with AUTH_FAILED,
+     * without sending the request or falling back to anonymous operation. */
+    const moq_auth_source_t *request_auth;
 } moq_media_receiver_cfg_t;
 
 /* Plain init leaves overflow.policy UNSET on purpose -- a deliberate
@@ -121,6 +127,15 @@ MOQ_API void moq_media_receiver_cfg_init(moq_media_receiver_cfg_t *cfg);
 MOQ_API void moq_media_receiver_cfg_init_live(moq_media_receiver_cfg_t *cfg);
 MOQ_API void moq_media_receiver_cfg_init_flow_control(
     moq_media_receiver_cfg_t *cfg);
+
+/* Pointer-only presets above preserve the original ABI extent. Use these
+ * sized variants to enable appended fields. Sizes below struct_size are no-ops. */
+MOQ_API void moq_media_receiver_cfg_init_sized(
+    moq_media_receiver_cfg_t *cfg, size_t cfg_size);
+MOQ_API void moq_media_receiver_cfg_init_live_sized(
+    moq_media_receiver_cfg_t *cfg, size_t cfg_size);
+MOQ_API void moq_media_receiver_cfg_init_flow_control_sized(
+    moq_media_receiver_cfg_t *cfg, size_t cfg_size);
 
 /* -- Track description ------------------------------------------------ *
  * Lifetimes (§6.2): every span and array in the description (name, codec, the
@@ -744,6 +759,7 @@ MOQ_API uint64_t moq_media_receiver_fatal_code(const moq_media_receiver_t *r);
 #define MOQ_MEDIA_RECEIVER_FATAL_CATALOG_REJECTED 0x4u /* the publisher refused
                                                           the catalog
                                                           subscription */
+#define MOQ_MEDIA_RECEIVER_FATAL_AUTH_FAILED        0x5u /* selection/copy failed */
 
 #ifdef __cplusplus
 }

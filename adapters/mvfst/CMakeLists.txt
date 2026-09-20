@@ -34,6 +34,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # -- Resolve mvfst --------------------------------------------------
 
+# The installed Folly export referenced by mvfst can require fmt's target
+# to exist before loading mvfst's dependency graph.
+find_package(fmt CONFIG REQUIRED)
 find_package(mvfst CONFIG REQUIRED)
 
 # mvfst's static folly/mvfst archives carry unresolved fmt references
@@ -160,6 +163,15 @@ if(MOQ_BUILD_TESTS)
 
     # Old mvfst_bridge_conformance removed — replaced by shared
     # bridge_conformance_pair in core tests (13/13 scenarios).
+
+    add_executable(test_mvfst_setup_auth ../common/test_setup_auth_loopback.c)
+    target_link_libraries(test_mvfst_setup_auth PRIVATE moq::adapter-mvfst Threads::Threads)
+    target_compile_options(test_mvfst_setup_auth PRIVATE -UNDEBUG)
+    target_compile_definitions(test_mvfst_setup_auth PRIVATE TEST_MVFST=1
+        MOQ_TEST_CERT_PATH="${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_cert.pem"
+        MOQ_TEST_KEY_PATH="${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_key.pem")
+    add_test(NAME mvfst_setup_auth COMMAND test_mvfst_setup_auth)
+    set_tests_properties(mvfst_setup_auth PROPERTIES TIMEOUT 45)
 
     add_executable(test_mvfst_managed tests/test_managed.c)
     find_package(Threads REQUIRED)

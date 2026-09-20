@@ -35,6 +35,7 @@
 
 #include <moq/types.h>
 #include <moq/session.h>
+#include <moq/auth.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -238,6 +239,13 @@ typedef struct moq_endpoint_cfg {
      * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint64_t handshake_timeout_us;
+    /* Optional connection credential source. Read only when fully covered by
+     * struct_size. connect() copies static data and calls a selector once,
+     * synchronously, with MOQ_AUTH_CLIENT_SETUP before transport creation.
+     * Selection errors are terminal; no anonymous fallback. The descriptor and
+     * static bytes may be released after connect returns; see auth.h for the
+     * selector/context lifetime and non-reentrancy contract. */
+    const moq_auth_source_t *setup_auth;
 } moq_endpoint_cfg_t;
 
 /* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).

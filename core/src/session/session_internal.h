@@ -9,6 +9,8 @@
 #include "session_transport.h"
 #include <string.h>
 
+moq_result_t session_prepare_setup(moq_session_t *s, const moq_session_cfg_t *cfg);
+
 /* -- Defaults ------------------------------------------------------ */
 
 #define MOQ_DEFAULT_MAX_ACTIONS      64
@@ -1495,6 +1497,9 @@ struct moq_session {
 
     uint8_t      *send_buf;
     size_t        send_cap;
+    uint8_t      *setup_wire;
+    size_t        setup_wire_len;
+    size_t        setup_wire_alloc;
     size_t        send_len;
 
     moq_action_t *actions;
@@ -2114,10 +2119,9 @@ void process_auth_tokens_free_staging(moq_session_t *s,
  * capability-gated). Runs AFTER alias resolution yields a concrete value;
  * structural decoding failures stay on their existing close paths.
  *
- * Deliberately minimal and deterministic -- the seam where application-
- * level token validation will plug in later, NOT application policy:
- *   - a zero-length resolved value is semantically malformed;
- *   - a value containing a NUL byte is semantically malformed.
+ * This is only a pointer/length representation check.  Payload bytes are
+ * opaque to transport; token-type verifiers own content validation, including
+ * whether an empty value is acceptable.
  */
 bool moq_auth_token_value_semantically_valid(const uint8_t *value,
                                              size_t value_len);

@@ -195,11 +195,14 @@ typedef struct moq_sub_update_cfg {
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;
+    /* Appended: borrowed for this synchronous call; gated as a complete pair. */
+    const moq_auth_token_t *auth_tokens;
+    size_t                 auth_token_count;
 } moq_sub_update_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen v0 prefix
  * (struct_size .. delivery_timeout_us -- the layout before the filter
- * append). The appended filter block stays disabled; to set it, or to
+ * append). The appended filter and auth fields stay disabled; to set them, or to
  * initialize the full current struct, use moq_sub_update_cfg_init_sized. */
 MOQ_API void moq_sub_update_cfg_init(moq_sub_update_cfg_t *cfg);
 
@@ -415,9 +418,15 @@ typedef struct moq_sub_joining_fetch_cfg {
     moq_group_order_t group_order;
     bool              has_subscriber_priority;
     uint8_t           subscriber_priority;
+    /* Appended after the frozen original layout; tokens are borrowed for the call. */
+    const moq_auth_token_t *auth_tokens;
+    size_t                 auth_token_count;
 } moq_sub_joining_fetch_cfg_t;
 
+/* Pointer-only init writes only the original configuration extent. */
 MOQ_API void moq_sub_joining_fetch_cfg_init(moq_sub_joining_fetch_cfg_t *cfg);
+MOQ_API void moq_sub_joining_fetch_cfg_init_sized(
+    moq_sub_joining_fetch_cfg_t *cfg, size_t cfg_size);
 
 MOQ_API moq_result_t moq_sub_joining_fetch(
     moq_subscriber_t *sub,

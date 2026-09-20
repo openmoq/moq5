@@ -2361,6 +2361,10 @@ moq_result_t moq_wtquic_msquic_managed_create(
         cfg->alloc->free == NULL || cfg->alloc->realloc == NULL ||
         cfg->on_lane_pump == NULL)
         return MOQ_ERR_INVAL;
+    if (MM_CFG_HAS(setup_auth_token_count) &&
+        (cfg->setup_auth_tokens != NULL || cfg->setup_auth_token_count != 0))
+        return MOQ_ERR_UNSUPPORTED;
+
     if (cfg->perspective != MOQ_PERSPECTIVE_CLIENT &&
         cfg->perspective != MOQ_PERSPECTIVE_SERVER)
         return MOQ_ERR_INVAL;

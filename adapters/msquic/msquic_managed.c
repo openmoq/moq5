@@ -1,3 +1,4 @@
+#include "../common/moq_setup_auth.h"
 /*
  * Managed MoQ-over-MsQuic facade.
  *
@@ -194,6 +195,7 @@ struct moq_msquic_managed_lane {
 };
 
 struct moq_msquic_managed {
+    moq_managed_setup_t setup;
     moq_alloc_t alloc;
     moq_msquic_managed_cfg_t cfg; /* shallow; strings owned below */
     moq_version_t version;        /* exact endpoint version, or 0 for multi-server */
@@ -497,6 +499,11 @@ static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
      * here and the session keeps its default pool. */
     if (m->cfg.max_open_subgroups != 0)
         scfg.max_open_subgroups = m->cfg.max_open_subgroups;
+    moq_managed_setup_apply(&m->setup, &scfg);
+    /* Peer credentials need the bounded receive budget even for anonymous local SETUP. */
+    scfg.recv_buffer_size = MOQ_MANAGED_SETUP_COPY_BUDGET;
+    if (m->setup.count || m->setup.authority.len || m->setup.path.len)
+        scfg.send_buffer_size = MOQ_MANAGED_SETUP_COPY_BUDGET;
     if (moq_session_create(&scfg, mgd_now_us(), &mc->session) < 0) {
         m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
@@ -1515,6 +1522,7 @@ static void mgd_free(moq_msquic_managed_t *m)
     mgd_strfree(&alloc, m->key_path);
     pthread_mutex_destroy(&m->mu);
     pthread_cond_destroy(&m->cv);
+    moq_managed_setup_clear(&m->setup, &alloc);
     alloc.free(m, sizeof(*m), alloc.ctx);
 }
 
@@ -1867,6 +1875,37 @@ moq_result_t moq_msquic_managed_create(
     /* The helper also applies the app-deadline whole-block ABI gate. */
     mgd_copy_cfg(m, cfg);
     mgd_apply_derived_cfg(m, &derived);
+    moq_bytes_t authority = {0}, path = {0};
+    if (MGD_CFG_HAS(cfg, setup_authority)) authority = cfg->setup_authority;
+    if (MGD_CFG_HAS(cfg, setup_path)) path = cfg->setup_path;
+    moq_result_t setup_rc = moq_managed_setup_copy(&m->setup, &m->alloc,
+        MGD_CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_tokens : NULL,
+        MGD_CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_token_count : 0,
+        authority, path, cfg->perspective);
+    m->cfg.setup_auth_tokens = m->setup.count ? m->setup.tokens : NULL;
+    m->cfg.setup_auth_token_count = m->setup.count;
+    m->cfg.setup_authority = m->setup.authority;
+    m->cfg.setup_path = m->setup.path;
+    moq_session_cfg_t setup_cfg;
+    moq_session_cfg_init_sized(&setup_cfg, sizeof(setup_cfg), &m->alloc, cfg->perspective);
+    moq_managed_setup_apply(&m->setup, &setup_cfg);
+    setup_cfg.send_buffer_size = MOQ_MANAGED_SETUP_COPY_BUDGET;
+    setup_cfg.send_request_capacity = m->cfg.send_request_capacity;
+    if (m->cfg.initial_request_capacity)
+        setup_cfg.initial_request_capacity = m->cfg.initial_request_capacity;
+    size_t offered_n = MGD_CFG_HAS(cfg, version_count) ? cfg->version_count : 0;
+    if (offered_n > MOQ_MSQUIC_MANAGED_MAX_VERSIONS || (offered_n && !cfg->versions))
+        setup_rc = MOQ_ERR_INVAL;
+    for (size_t i = 0; setup_rc == MOQ_OK && i < (offered_n ? offered_n : 1); ++i) {
+        setup_cfg.version = offered_n ? cfg->versions[i] : derived.version;
+        setup_rc = moq_managed_setup_preflight(&setup_cfg);
+    }
+    if (setup_rc != MOQ_OK) {
+        moq_managed_setup_clear(&m->setup, &m->alloc);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return setup_rc;
+    }
+
     m->version = multi_version_server ? (moq_version_t)0 : exact_version;
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
@@ -2127,6 +2166,37 @@ static moq_result_t mgd_test_create_lanes_only(
     m->alloc = *cfg->alloc;
     mgd_copy_cfg(m, cfg);
     mgd_apply_derived_cfg(m, &derived);
+    moq_bytes_t authority = {0}, path = {0};
+    if (MGD_CFG_HAS(cfg, setup_authority)) authority = cfg->setup_authority;
+    if (MGD_CFG_HAS(cfg, setup_path)) path = cfg->setup_path;
+    moq_result_t setup_rc = moq_managed_setup_copy(&m->setup, &m->alloc,
+        MGD_CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_tokens : NULL,
+        MGD_CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_token_count : 0,
+        authority, path, cfg->perspective);
+    m->cfg.setup_auth_tokens = m->setup.count ? m->setup.tokens : NULL;
+    m->cfg.setup_auth_token_count = m->setup.count;
+    m->cfg.setup_authority = m->setup.authority;
+    m->cfg.setup_path = m->setup.path;
+    moq_session_cfg_t setup_cfg;
+    moq_session_cfg_init_sized(&setup_cfg, sizeof(setup_cfg), &m->alloc, cfg->perspective);
+    moq_managed_setup_apply(&m->setup, &setup_cfg);
+    setup_cfg.send_buffer_size = MOQ_MANAGED_SETUP_COPY_BUDGET;
+    setup_cfg.send_request_capacity = m->cfg.send_request_capacity;
+    if (m->cfg.initial_request_capacity)
+        setup_cfg.initial_request_capacity = m->cfg.initial_request_capacity;
+    size_t offered_n = MGD_CFG_HAS(cfg, version_count) ? cfg->version_count : 0;
+    if (offered_n > MOQ_MSQUIC_MANAGED_MAX_VERSIONS || (offered_n && !cfg->versions))
+        setup_rc = MOQ_ERR_INVAL;
+    for (size_t i = 0; setup_rc == MOQ_OK && i < (offered_n ? offered_n : 1); ++i) {
+        setup_cfg.version = offered_n ? cfg->versions[i] : derived.version;
+        setup_rc = moq_managed_setup_preflight(&setup_cfg);
+    }
+    if (setup_rc != MOQ_OK) {
+        moq_managed_setup_clear(&m->setup, &m->alloc);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return setup_rc;
+    }
+
     pthread_mutex_init(&m->mu, NULL);
     pthread_cond_init(&m->cv, NULL);
     moq_result_t ar = mgd_store_alpns(m, &m->version, 1);

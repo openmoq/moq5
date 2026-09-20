@@ -348,6 +348,15 @@ if(MOQ_BUILD_TESTS)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
 
+    add_executable(test_msquic_setup_auth ../common/test_setup_auth_loopback.c)
+    target_link_libraries(test_msquic_setup_auth PRIVATE moq::adapter-msquic-managed Threads::Threads)
+    target_compile_options(test_msquic_setup_auth PRIVATE -UNDEBUG)
+    target_compile_definitions(test_msquic_setup_auth PRIVATE TEST_MSQUIC=1
+        MOQ_TEST_CERT_PATH="${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_cert.pem"
+        MOQ_TEST_KEY_PATH="${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_key.pem")
+    add_test(NAME msquic_setup_auth COMMAND test_msquic_setup_auth)
+    set_tests_properties(msquic_setup_auth PROPERTIES TIMEOUT 45)
+
         add_executable(test_msquic_loopback tests/test_msquic_loopback.c)
         target_link_libraries(test_msquic_loopback PRIVATE
             moq::adapter-msquic-managed Threads::Threads)

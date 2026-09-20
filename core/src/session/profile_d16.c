@@ -180,51 +180,94 @@ static void d16_build_local_setup(const moq_session_t *s,
     }
 }
 
+static moq_result_t d16_prepare_setup(moq_session_t *s,
+    const moq_auth_token_t *tokens, size_t count,
+    moq_bytes_t authority, moq_bytes_t path)
+{
+    const moq_d16_profile_state_t *state = s->profile_state;
+    bool request_cap = state->send_request_capacity;
+    size_t params = count + (authority.len != 0) + (path.len != 0) +
+                    s->send_auth_token_cache_size + request_cap;
+    if (params > 16) return MOQ_ERR_INVAL;
+    size_t payload = moq_quic_varint_len(params);
+    size_t token_bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t n = moq_quic_varint_len(MOQ_AUTH_TOKEN_USE_VALUE) +
+                   moq_quic_varint_len(tokens[i].token_type) + tokens[i].token_value.len;
+        token_bytes += n;
+        payload += 1 + moq_quic_varint_len(n) + n;
+    }
+    if (authority.len) payload += 1 + moq_quic_varint_len(authority.len) + authority.len;
+    if (path.len) payload += 1 + moq_quic_varint_len(path.len) + path.len;
+    if (request_cap) payload += 1 + moq_quic_varint_len(state->initial_request_capacity);
+    if (s->send_auth_token_cache_size)
+        payload += 1 + moq_quic_varint_len(s->auth_token_cache_size);
+    /* Neutral validation bounds every term and the number of terms. */
+    if (payload > 65535) return MOQ_ERR_BUFFER;
+    size_t wire_len = payload + 2 + moq_quic_varint_len(
+        s->perspective == MOQ_PERSPECTIVE_CLIENT ? MOQ_D16_CLIENT_SETUP :
+                                                  MOQ_D16_SERVER_SETUP);
+    /* Preserve deferred buffer failure for historical option-free configs. */
+    if ((count || authority.len || path.len) && wire_len > s->send_cap)
+        return MOQ_ERR_BUFFER;
+    size_t alloc_len = wire_len + token_bytes;
+    uint8_t *wire = s->alloc.alloc(alloc_len, s->alloc.ctx);
+    if (!wire) return MOQ_ERR_NOMEM;
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, wire, wire_len);
+    moq_result_t rc;
+    moq_kvp_entry_t kv[16] = {0};
+    size_t n = 0;
+    uint8_t cap_buf[8], cache_buf[8];
+    if (path.len) kv[n++] = (moq_kvp_entry_t){
+        .type = MOQ_SETUP_PARAM_PATH, .value = path.data, .value_len = path.len};
+    if (request_cap) kv[n++] = (moq_kvp_entry_t){
+        .type = MOQ_SETUP_PARAM_MAX_REQUEST_ID, .value = cap_buf,
+        .value_len = moq_quic_varint_encode(state->initial_request_capacity,
+                                           cap_buf, sizeof(cap_buf)),
+        .is_varint = true};
+    moq_buf_writer_t tw;
+    moq_buf_writer_init(&tw, wire + wire_len, token_bytes);
+    for (size_t i = 0; i < count; ++i) {
+        size_t start = tw.pos;
+        moq_d16_auth_token_t token = {
+            .alias_type = MOQ_AUTH_TOKEN_USE_VALUE,
+            .token_type = tokens[i].token_type,
+            .token_value = tokens[i].token_value.data,
+            .token_value_len = tokens[i].token_value.len};
+        rc = moq_d16_auth_token_encode(&tw, &token);
+        if (rc < 0) goto fail;
+        kv[n++] = (moq_kvp_entry_t){.type = MOQ_SETUP_PARAM_AUTHORIZATION_TOKEN,
+            .value = wire + wire_len + start, .value_len = tw.pos - start};
+    }
+    if (s->send_auth_token_cache_size) kv[n++] = (moq_kvp_entry_t){
+        .type = MOQ_SETUP_PARAM_MAX_AUTH_TOKEN_CACHE_SIZE, .value = cache_buf,
+        .value_len = moq_quic_varint_encode(s->auth_token_cache_size,
+                                           cache_buf, sizeof(cache_buf)),
+        .is_varint = true};
+    if (authority.len) kv[n++] = (moq_kvp_entry_t){
+        .type = MOQ_SETUP_PARAM_AUTHORITY, .value = authority.data,
+        .value_len = authority.len};
+    rc = s->perspective == MOQ_PERSPECTIVE_CLIENT ?
+        moq_d16_encode_client_setup(&w, kv, n) :
+        moq_d16_encode_server_setup(&w, kv, n);
+    if (rc < 0) goto fail;
+    s->setup_wire = wire;
+    s->setup_wire_len = w.pos;
+    s->setup_wire_alloc = alloc_len;
+    return MOQ_OK;
+fail:
+    s->alloc.free(wire, alloc_len, s->alloc.ctx);
+    return rc;
+}
+
 static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
                                                 const moq_setup_params_t *local,
                                                 bool is_client)
 {
-    uint8_t buf[256];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-
-    moq_kvp_entry_t params[4];
-    size_t param_count = 0;
-
-    uint8_t vbuf[8];
-    if (local->has_max_request_id) {
-        size_t vlen = moq_quic_varint_encode(local->max_request_id,
-                                              vbuf, sizeof(vbuf));
-        params[param_count].type      = MOQ_SETUP_PARAM_MAX_REQUEST_ID;
-        params[param_count].value     = vbuf;
-        params[param_count].value_len = vlen;
-        params[param_count].is_varint = true;
-        params[param_count].raw       = NULL;
-        params[param_count].raw_len   = 0;
-        param_count++;
-    }
-
-    uint8_t vbuf2[8];
-    if (local->has_max_auth_token_cache_size) {
-        size_t vlen = moq_quic_varint_encode(local->max_auth_token_cache_size,
-                                              vbuf2, sizeof(vbuf2));
-        params[param_count].type      = MOQ_SETUP_PARAM_MAX_AUTH_TOKEN_CACHE_SIZE;
-        params[param_count].value     = vbuf2;
-        params[param_count].value_len = vlen;
-        params[param_count].is_varint = true;
-        params[param_count].raw       = NULL;
-        params[param_count].raw_len   = 0;
-        param_count++;
-    }
-
-    moq_result_t rc;
-    if (is_client)
-        rc = moq_d16_encode_client_setup(&w, params, param_count);
-    else
-        rc = moq_d16_encode_server_setup(&w, params, param_count);
-    if (rc < 0) return rc;
-
-    return queue_send_control(s, buf, moq_buf_writer_offset(&w));
+    (void)local;
+    (void)is_client;
+    return queue_send_control(s, s->setup_wire, s->setup_wire_len);
 }
 
 /* -- D16 setup complete event -------------------------------------- */
@@ -340,7 +383,7 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
             tok.alias_type == MOQ_AUTH_TOKEN_USE_ALIAS)
             return close_with_error(s, 0x3, "DELETE/USE_ALIAS in CLIENT_SETUP");
 
-        /* Well-formed structure but semantically invalid value: there is no
+        /* Well-formed structure but invalid value representation: there is no
          * request to reject at SETUP time, so this is the
          * MALFORMED_AUTH_TOKEN session error (0x16). */
         if (!moq_auth_token_value_semantically_valid(tok.token_value,
@@ -604,9 +647,9 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
 
         if (tok.alias_type == MOQ_AUTH_TOKEN_DELETE) continue;
 
-        /* REGISTER / USE_VALUE carry a literal value: well-formed but
-         * semantically invalid closes with MALFORMED_AUTH_TOKEN (0x16) --
-         * there is no request to reject at SETUP time. */
+        /* REGISTER / USE_VALUE carry a literal value: a well-formed token
+         * with an invalid value representation closes with
+         * MALFORMED_AUTH_TOKEN (0x16); there is no request to reject here. */
         if (!moq_auth_token_value_semantically_valid(tok.token_value,
                                                      tok.token_value_len))
             return close_with_error(s, 0x16, "malformed auth token in SETUP");
@@ -4767,6 +4810,7 @@ static const moq_profile_ops_t d16_ops = {
     .state_align            = _Alignof(moq_d16_profile_state_t),
     .init_in_place          = d16_init_in_place,
     .destroy                = d16_destroy,
+    .prepare_setup          = d16_prepare_setup,
     .start                  = d16_start,
     .process_control_data   = d16_process_control_data,
     .has_request_capacity   = d16_has_request_capacity,

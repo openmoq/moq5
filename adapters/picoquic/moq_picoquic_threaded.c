@@ -19,6 +19,7 @@
 #include <moq/picoquic_verify.h>   /* moq_picoquic_set_cert_verifier (default) */
 #include <picoquic_packet_loop.h>
 
+#include "../common/moq_setup_auth.h"
 #include "../common/moq_alpn.h"
 #include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
@@ -71,6 +72,7 @@ struct moq_pq_threaded_lane {
 };
 
 struct moq_pq_threaded {
+    moq_managed_setup_t setup;
     moq_alloc_t         alloc;
 
     /* Copied config */
@@ -208,6 +210,7 @@ static void build_session_cfg(moq_pq_threaded_t *t,
                                 moq_perspective_t persp)
 {
     moq_session_cfg_init_sized(scfg, sizeof(*scfg), &t->alloc, persp);
+    moq_managed_setup_apply(&t->setup, scfg);
     scfg->send_request_capacity = t->send_request_capacity;
     scfg->initial_request_capacity = t->initial_request_capacity;
     if (t->max_actions) scfg->max_actions = t->max_actions;
@@ -1171,6 +1174,19 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     memset(t, 0, sizeof(*t));
 
     t->alloc = *cfg->alloc;
+    moq_bytes_t authority = {0}, path = {0};
+    if (CFG_HAS(cfg, setup_authority)) authority = cfg->setup_authority;
+    if (CFG_HAS(cfg, setup_path)) path = cfg->setup_path;
+    moq_result_t setup_rc = moq_managed_setup_copy(&t->setup, &t->alloc,
+        CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_tokens : NULL,
+        CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_token_count : 0,
+        authority, path, persp);
+    if (setup_rc != MOQ_OK) {
+        moq_managed_setup_clear(&t->setup, &t->alloc);
+        t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+        return setup_rc;
+    }
+
     t->perspective = persp;
     t->port = port;
     {   /* Characterization telemetry: opt-in, off unless env set to non-"0". */
@@ -1224,13 +1240,33 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         t->on_activity_ctx = cfg->on_activity_ctx;
     }
 
+    moq_session_cfg_t setup_cfg;
+    build_session_cfg(t, &setup_cfg, persp);
+    size_t offer_count = CFG_HAS(cfg, alpn_count) ? cfg->alpn_count : 0;
+    if (offer_count > 8 || (offer_count && !cfg->alpn_list)) setup_rc = MOQ_ERR_INVAL;
+    for (size_t i = 0; setup_rc == MOQ_OK && i < (offer_count ? offer_count : 1); ++i) {
+        if (offer_count && (!cfg->alpn_list[i] ||
+            !moq_alpn_to_version(cfg->alpn_list[i], strlen(cfg->alpn_list[i]), &setup_cfg.version))) {
+            setup_rc = MOQ_ERR_UNSUPPORTED;
+            break;
+        }
+        setup_rc = moq_managed_setup_preflight(&setup_cfg);
+    }
+    if (setup_rc != MOQ_OK) {
+        moq_managed_setup_clear(&t->setup, &t->alloc);
+        t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+        return setup_rc;
+    }
+
     /* Init mutex and condvar. */
     if (pthread_mutex_init(&t->mutex, NULL) != 0) {
+        moq_managed_setup_clear(&t->setup, &t->alloc);
         t->alloc.free(t, sizeof(*t), t->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
     if (pthread_cond_init(&t->cond, NULL) != 0) {
         pthread_mutex_destroy(&t->mutex);
+        moq_managed_setup_clear(&t->setup, &t->alloc);
         t->alloc.free(t, sizeof(*t), t->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
@@ -1513,6 +1549,7 @@ fail_cfg_strings:
     free_alpn_list(t);
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
+    moq_managed_setup_clear(&t->setup, &t->alloc);
     t->alloc.free(t, sizeof(*t), t->alloc.ctx);
     return MOQ_ERR_INTERNAL;
 }
@@ -1676,6 +1713,7 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     moq_alloc_t alloc = t->alloc;
+    moq_managed_setup_clear(&t->setup, &t->alloc);
     alloc.free(t, sizeof(*t), alloc.ctx);
 }
 

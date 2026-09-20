@@ -20,6 +20,7 @@
 #include <moq/media_object.h>
 
 #include "endpoint_internal.h"
+#include "auth_source.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -97,6 +98,9 @@ _Static_assert(offsetof(moq_media_track_event_t, parse_drop_class) ==
 /* -- Internal types --------------------------------------------------- */
 
 struct moq_media_track {
+    moq_auth_owned_list_t subscribe_auth;
+    moq_auth_owned_list_t update_auth;
+    bool update_auth_target;
     moq_media_track_desc_t desc;
     moq_rcbuf_t           *init_buf;   /* owned; desc.init/init_data borrow */
 
@@ -229,6 +233,9 @@ typedef struct receiver_event {
 } receiver_event_t;
 
 struct moq_media_receiver {
+    moq_auth_source_owned_t request_auth;
+    moq_auth_owned_list_t catalog_sub_auth;
+    moq_auth_owned_list_t catalog_fetch_auth;
     moq_alloc_t     alloc;
     moq_endpoint_t *ep;
     bool            owns_endpoint;
@@ -765,9 +772,26 @@ static bool span_eq_lit(moq_bytes_t a, const char *lit, size_t len)
     return a.len == len && memcmp(a.data, lit, len) == 0;
 }
 
+/* Selection is performed once per logical request. A nonempty owned list
+ * survives backpressure; a configured source may never degrade to anonymous. */
+static bool receiver_select_auth(moq_media_receiver_t *r, moq_auth_action_t action,
+                                  moq_bytes_t name, moq_auth_owned_list_t *list)
+{
+    if (list->count || !r->request_auth.configured) return true;
+    moq_auth_request_t request = { .action = action, .ns = r->namespace_,
+                                   .name = name };
+    if (moq_auth_source_select(&r->request_auth, &request, &r->alloc, list) != MOQ_OK) {
+        receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_AUTH_FAILED);
+        return false;
+    }
+    return true;
+}
+
 static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
     if (!t) return;
+    moq_auth_list_clear(&t->subscribe_auth, &r->alloc);
+    moq_auth_list_clear(&t->update_auth, &r->alloc);
     if (t->init_buf) moq_rcbuf_decref(t->init_buf);
     if (t->desc_depends_arr)
         r->alloc.free(t->desc_depends_arr,
@@ -1540,7 +1564,12 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
 
     if (!r->catalog_fetch_issued && moq_sub_track_is_active(r->catalog_sub)) {
         moq_sub_joining_fetch_cfg_t fcfg;
-        moq_sub_joining_fetch_cfg_init(&fcfg);
+        if (!receiver_select_auth(r, MOQ_AUTH_FETCH,
+                (moq_bytes_t){r->catalog_name, r->catalog_name_len},
+                &r->catalog_fetch_auth)) return;
+        moq_sub_joining_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
+        fcfg.auth_tokens = r->catalog_fetch_auth.tokens;
+        fcfg.auth_token_count = r->catalog_fetch_auth.count;
         fcfg.track = r->catalog_sub;
         fcfg.relative = true;     /* offset measured from the largest group */
         fcfg.joining_start = 0;   /* §5: offset = 0 -> the latest group */
@@ -1550,8 +1579,10 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
          * the flag clear so the next pump cycle retries. Any other error means
          * the FETCH cannot be placed -- give up and rely on the SUBSCRIBE path
          * rather than spin. */
-        if (rc != MOQ_ERR_WOULD_BLOCK)
+        if (rc != MOQ_ERR_WOULD_BLOCK) {
             r->catalog_fetch_issued = true;
+            moq_auth_list_clear(&r->catalog_fetch_auth, &r->alloc);
+        }
     }
 
     moq_sub_fetch_item_t item;
@@ -2240,6 +2271,8 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r)
         moq_media_track_t *t = r->tracks[i];
         if (!t->done_pending) continue;
         t->done_pending = false;
+        moq_auth_list_clear(&t->subscribe_auth, &r->alloc);
+        moq_auth_list_clear(&t->update_auth, &r->alloc);
         uint64_t status = t->done_status;
 
         /* The subscription is already complete: free its facade slot (no
@@ -2302,7 +2335,12 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         uint8_t prio = t->desired_priority;
         pthread_mutex_unlock(&r->mu);
 
-        if (!want || t->sub_track || t->ended) continue;
+        if (!want || t->sub_track || t->ended) {
+            moq_auth_list_clear(&t->subscribe_auth, &r->alloc);
+            continue;
+        }
+        if (!receiver_select_auth(r, MOQ_AUTH_SUBSCRIBE, t->desc.name,
+                                   &t->subscribe_auth)) return;
 
         moq_sub_track_cfg_t tcfg;
         moq_sub_track_cfg_init(&tcfg);
@@ -2311,8 +2349,12 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         tcfg.filter = filt ? filt : MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
         tcfg.has_subscriber_priority = has_prio;
         tcfg.subscriber_priority = prio;
+        tcfg.auth_tokens = t->subscribe_auth.tokens;
+        tcfg.auth_token_count = t->subscribe_auth.count;
         moq_result_t rc = moq_sub_subscribe(r->sub, &tcfg, now_us,
                                             &t->sub_track);
+        if (rc != MOQ_ERR_WRONG_STATE && rc != MOQ_ERR_WOULD_BLOCK)
+            moq_auth_list_clear(&t->subscribe_auth, &r->alloc);
         if (rc == MOQ_OK) {
             t->forward_sent = true;     /* a fresh SUBSCRIBE forwards by default */
             t->forward_desired = true;
@@ -2386,7 +2428,10 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
 
         bool target = want && flow_allows;
         t->forward_desired = target;
+        if (t->update_auth.count && t->update_auth_target != target)
+            moq_auth_list_clear(&t->update_auth, &r->alloc);
         if (t->forward_desired == t->forward_sent) {
+            moq_auth_list_clear(&t->update_auth, &r->alloc);
             /* Wire-neutral pass: the SNAPSHOTTED app changes are proven
              * coalesced-away; reconcile them (and only them) silently. */
             pthread_mutex_lock(&r->mu);
@@ -2397,14 +2442,26 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
             continue;
         }
         moq_sub_update_cfg_t ucfg;
-        moq_sub_update_cfg_init(&ucfg);
+        if (!receiver_select_auth(r, MOQ_AUTH_REQUEST_UPDATE, t->desc.name,
+                                   &t->update_auth)) return;
+        t->update_auth_target = target;
+        moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+        ucfg.auth_tokens = t->update_auth.tokens;
+        ucfg.auth_token_count = t->update_auth.count;
         ucfg.has_forward = true;
         ucfg.forward = t->forward_desired;
         /* WRONG_STATE = an update is still outstanding; retry next cycle
          * -- and change NOTHING: neither the pending update's attribution
          * nor reconciled_app_gen. */
-        if (moq_sub_update_subscription(r->sub, t->sub_track, &ucfg,
-                                        now_us) == MOQ_OK) {
+        moq_result_t rc = moq_sub_update_subscription(r->sub, t->sub_track,
+                                                      &ucfg, now_us);
+        if (rc != MOQ_ERR_WRONG_STATE && rc != MOQ_ERR_WOULD_BLOCK)
+            moq_auth_list_clear(&t->update_auth, &r->alloc);
+        if (rc != MOQ_OK && rc != MOQ_ERR_WRONG_STATE && rc != MOQ_ERR_WOULD_BLOCK) {
+            receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
+            return;
+        }
+        if (rc == MOQ_OK) {
             t->forward_sent = t->forward_desired;
             /* Attribution is decided ONCE, from the SNAPSHOT taken with
              * the target computation (the race rule above). */
@@ -2462,6 +2519,11 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
             return;
         }
+    }
+    if (!r->catalog_sub) {
+        if (!receiver_select_auth(r, MOQ_AUTH_SUBSCRIBE,
+                (moq_bytes_t){r->catalog_name, r->catalog_name_len},
+                &r->catalog_sub_auth)) return;
         moq_sub_track_cfg_t tcfg;
         moq_sub_track_cfg_init(&tcfg);
         /* LargestObject is mandatory for the catalog: MSF-01 §5 requires the
@@ -2473,8 +2535,13 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         tcfg.track_namespace = r->namespace_;
         tcfg.track_name = (moq_bytes_t){ r->catalog_name,
                                          r->catalog_name_len };
-        if (moq_sub_subscribe(r->sub, &tcfg, now_us,
-                              &r->catalog_sub) != MOQ_OK) {
+        tcfg.auth_tokens = r->catalog_sub_auth.tokens;
+        tcfg.auth_token_count = r->catalog_sub_auth.count;
+        moq_result_t rc = moq_sub_subscribe(r->sub, &tcfg, now_us,
+                                            &r->catalog_sub);
+        if (rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_WRONG_STATE) return;
+        moq_auth_list_clear(&r->catalog_sub_auth, &r->alloc);
+        if (rc != MOQ_OK) {
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
             return;
         }
@@ -2532,6 +2599,10 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
      * (any generation), so the hook only needs to issue the subscriptions. */
     if (r->has_effective)
         receiver_reconcile_subscriptions(r, now_us);
+    pthread_mutex_lock(&r->mu);
+    fatal = r->fatal;
+    pthread_mutex_unlock(&r->mu);
+    if (fatal) return;
 
     receiver_reconcile_delivery(r, now_us);
 }
@@ -2650,24 +2721,46 @@ static receiver_teardown_t *receiver_take_teardown(moq_media_receiver_t *r)
 
 /* -- cfg ---------------------------------------------------------------- */
 
+#define MEDIA_RECEIVER_CFG_V0_SIZE \
+    ((offsetof(moq_media_receiver_cfg_t, max_track_events) + sizeof(uint32_t) + \
+      _Alignof(moq_media_receiver_cfg_t) - 1) & \
+     ~(size_t)(_Alignof(moq_media_receiver_cfg_t) - 1))
+_Static_assert(offsetof(moq_media_receiver_cfg_t, request_auth) >=
+               MEDIA_RECEIVER_CFG_V0_SIZE, "receiver auth overlaps old ABI");
+
+static void receiver_cfg_init(moq_media_receiver_cfg_t *cfg, size_t cfg_size,
+                               moq_media_overflow_policy_t policy)
+{
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    moq_media_receiver_cfg_t defaults = {0};
+    defaults.struct_size = (uint32_t)n;
+    defaults.overflow.policy = policy;
+    memcpy(cfg, &defaults, n);
+}
+void moq_media_receiver_cfg_init_sized(moq_media_receiver_cfg_t *cfg, size_t size)
+{
+    receiver_cfg_init(cfg, size, MOQ_MEDIA_OVERFLOW_UNSET);
+}
+void moq_media_receiver_cfg_init_live_sized(moq_media_receiver_cfg_t *cfg, size_t size)
+{
+    receiver_cfg_init(cfg, size, MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME);
+}
+void moq_media_receiver_cfg_init_flow_control_sized(moq_media_receiver_cfg_t *cfg, size_t size)
+{
+    receiver_cfg_init(cfg, size, MOQ_MEDIA_OVERFLOW_FLOW_CONTROL);
+}
 void moq_media_receiver_cfg_init(moq_media_receiver_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    /* overflow.policy stays UNSET on purpose: forced choice (§6.4). */
+    moq_media_receiver_cfg_init_sized(cfg, MEDIA_RECEIVER_CFG_V0_SIZE);
 }
-
 void moq_media_receiver_cfg_init_live(moq_media_receiver_cfg_t *cfg)
 {
-    moq_media_receiver_cfg_init(cfg);
-    if (cfg) cfg->overflow.policy = MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME;
+    moq_media_receiver_cfg_init_live_sized(cfg, MEDIA_RECEIVER_CFG_V0_SIZE);
 }
-
 void moq_media_receiver_cfg_init_flow_control(moq_media_receiver_cfg_t *cfg)
 {
-    moq_media_receiver_cfg_init(cfg);
-    if (cfg) cfg->overflow.policy = MOQ_MEDIA_OVERFLOW_FLOW_CONTROL;
+    moq_media_receiver_cfg_init_flow_control_sized(cfg, MEDIA_RECEIVER_CFG_V0_SIZE);
 }
 
 /* -- Construction -------------------------------------------------------- */
@@ -2675,7 +2768,7 @@ void moq_media_receiver_cfg_init_flow_control(moq_media_receiver_cfg_t *cfg)
 static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 {
     if (!cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_media_receiver_cfg_t))
+    if (cfg->struct_size < MEDIA_RECEIVER_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (cfg->namespace_.count == 0 || !cfg->namespace_.parts)
         return MOQ_ERR_INVAL;
@@ -2702,6 +2795,9 @@ static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 
 static void receiver_free(moq_media_receiver_t *r)
 {
+    moq_auth_source_clear(&r->request_auth, &r->alloc);
+    moq_auth_list_clear(&r->catalog_sub_auth, &r->alloc);
+    moq_auth_list_clear(&r->catalog_fetch_auth, &r->alloc);
     for (size_t i = 0; i < r->track_count; i++)
         receiver_track_free(r, r->tracks[i]);
     if (r->tracks)
@@ -2847,6 +2943,15 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
         return MOQ_ERR_NOMEM;
     }
     memset(r->mts, 0, r->mt_cap * sizeof(moq_media_timeline_record_t));
+    if (cfg->struct_size >= offsetof(moq_media_receiver_cfg_t, request_auth) +
+                            sizeof(cfg->request_auth)) {
+        moq_result_t rc = moq_auth_source_copy(&r->request_auth, cfg->request_auth,
+                                               &r->alloc);
+        if (rc != MOQ_OK) {
+            receiver_free(r);
+            return rc;
+        }
+    }
     r->stats.struct_size = (uint32_t)sizeof(r->stats);
 
     /* Production always passes a real endpoint. The MOQ_MEDIA_RECEIVER_TESTING

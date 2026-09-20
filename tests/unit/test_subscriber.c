@@ -4200,7 +4200,120 @@ static void test_s4_update_ok_d18_expires_backpressure(void) {
     MOQ_TEST_PASS("s4_update_ok_d18_expires_backpressure");
 }
 
+/* New auth tails are whole-pair gated, while the old facade configs remain
+ * usable in both transport drafts. Capture resolved bytes from the real peer. */
+static void test_join_update_auth_tail(moq_version_t version)
+{
+    for (int mode = 0; mode < 5; ++mode) {
+        test_alloc_state_t as = {0}; moq_alloc_t alloc = test_allocator(&as);
+        moq_simpair_cfg_t pcfg = MOQ_SIMPAIR_CFG_INIT;
+        pcfg.alloc = &alloc; pcfg.version = version;
+        pcfg.server_send_request_capacity = true;
+        pcfg.server_initial_request_capacity = 64;
+        pcfg.client_send_request_capacity = true;
+        pcfg.client_initial_request_capacity = 64;
+        moq_simpair_t *sp = NULL;
+        MOQ_TEST_CHECK(moq_simpair_create(&pcfg, &sp) == MOQ_OK);
+        if (!sp) return;
+        moq_simpair_start(sp); moq_simpair_run_until_quiescent(sp, 16, NULL);
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        moq_sub_cfg_t cfg; moq_sub_cfg_init(&cfg);
+        moq_subscriber_t *sub = NULL;
+        MOQ_TEST_CHECK(moq_sub_create(moq_simpair_client(sp), &alloc, &cfg, &sub) == MOQ_OK);
+        moq_sub_track_cfg_t tc; moq_sub_track_cfg_init(&tc);
+        moq_bytes_t ns[] = {MOQ_BYTES_LITERAL("scope")};
+        tc.track_namespace = (moq_namespace_t){ns, 1};
+        tc.track_name = MOQ_BYTES_LITERAL("catalog");
+        tc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        moq_sub_track_t *track = NULL;
+        MOQ_TEST_CHECK(moq_sub_subscribe(sub, &tc, 0, &track) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+                moq_accept_subscribe_cfg_t acc; moq_accept_subscribe_cfg_init(&acc);
+                acc.has_largest = true; acc.largest_group = 1;
+                MOQ_TEST_CHECK(moq_session_accept_subscribe(moq_simpair_server(sp),
+                    ev.u.subscribe_request.sub, &acc, 0) == MOQ_OK);
+            }
+            moq_event_cleanup(&ev);
+        }
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        moq_sub_tick(sub, 0);
+        MOQ_TEST_CHECK(moq_sub_track_is_active(track));
+        uint8_t bytes[] = {0xa1, 0, 0xff};
+        moq_auth_token_t token = {16, {bytes, sizeof(bytes)}};
+        moq_sub_joining_fetch_cfg_t fc;
+        moq_sub_joining_fetch_cfg_init_sized(&fc, sizeof(fc));
+        if (mode == 0) moq_sub_joining_fetch_cfg_init(&fc);
+        if (mode == 1) fc.struct_size = offsetof(moq_sub_joining_fetch_cfg_t, auth_token_count);
+        if (mode == 2) fc.struct_size = sizeof(fc) - 1;
+        if (mode == 4) fc.struct_size = sizeof(fc) + 100;
+        fc.track = track; fc.relative = true;
+        fc.auth_tokens = mode < 3 ? (const moq_auth_token_t *)(uintptr_t)1 : &token;
+        fc.auth_token_count = 1;
+        moq_sub_fetch_req_t *fetch = NULL;
+        MOQ_TEST_CHECK(moq_sub_joining_fetch(sub, &fc, 0, &fetch) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        int seen = 0;
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_FETCH_REQUEST) {
+                seen++;
+                MOQ_TEST_CHECK_EQ_SIZE(ev.u.fetch_request.token_count, mode < 3 ? 0 : 1);
+                if (ev.u.fetch_request.token_count == 1) {
+                    const moq_resolved_token_t *t = ev.u.fetch_request.tokens;
+                    MOQ_TEST_CHECK_EQ_U64(t->token_type, 16);
+                    MOQ_TEST_CHECK(t->token_value.len == sizeof(bytes) &&
+                        !memcmp(t->token_value.data, bytes, sizeof(bytes)));
+                }
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(seen, 1);
+        MOQ_TEST_CHECK(moq_sub_cancel_fetch(sub, fetch, 0) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+
+        moq_sub_update_cfg_t uc;
+        moq_sub_update_cfg_init_sized(&uc, sizeof(uc));
+        if (mode == 0) moq_sub_update_cfg_init(&uc);
+        if (mode == 1) uc.struct_size = offsetof(moq_sub_update_cfg_t, auth_token_count);
+        if (mode == 2) uc.struct_size = sizeof(uc) - 1;
+        if (mode == 4) uc.struct_size = sizeof(uc) + 100;
+        uc.has_forward = true; uc.forward = (mode % 2) != 0;
+        uc.auth_tokens = mode < 3 ? (const moq_auth_token_t *)(uintptr_t)1 : &token;
+        uc.auth_token_count = 1;
+        MOQ_TEST_CHECK(moq_sub_update_subscription(sub, track, &uc, 0) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        seen = 0;
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                seen++;
+                MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_updated.token_count, mode < 3 ? 0 : 1);
+                if (ev.u.subscribe_updated.token_count == 1) {
+                    const moq_resolved_token_t *t = ev.u.subscribe_updated.tokens;
+                    MOQ_TEST_CHECK_EQ_U64(t->token_type, 16);
+                    MOQ_TEST_CHECK(t->token_value.len == sizeof(bytes) &&
+                        !memcmp(t->token_value.data, bytes, sizeof(bytes)));
+                }
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(seen, 1);
+        moq_sub_tick(sub, 0);
+        moq_sub_destroy(sub); moq_simpair_destroy(sp);
+        MOQ_TEST_CHECK_EQ_INT(as.balance, 0);
+    }
+    MOQ_TEST_PASS("join_update_auth_tail");
+}
+
 int main(void) {
+    test_join_update_auth_tail(MOQ_VERSION_DRAFT_16);
+    test_join_update_auth_tail(MOQ_VERSION_DRAFT_18);
     test_s4_update_ok_callback();
     test_s4_update_rejected();
     test_s4_update_ok_d18_expires_backpressure();

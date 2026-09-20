@@ -703,6 +703,15 @@ endif()\n")
 
         # Managed server <-> managed client, both in-process, each on
         # its own network thread, over real loopback UDP.
+    add_executable(test_pico_wt_setup_auth ../common/test_setup_auth_loopback.c)
+    target_link_libraries(test_pico_wt_setup_auth PRIVATE moq::adapter-pico-wt-managed)
+    target_compile_options(test_pico_wt_setup_auth PRIVATE -UNDEBUG)
+    target_compile_definitions(test_pico_wt_setup_auth PRIVATE TEST_PICO_WT=1
+        MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+        MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    add_test(NAME pico_wt_setup_auth COMMAND test_pico_wt_setup_auth)
+    set_tests_properties(pico_wt_setup_auth PROPERTIES TIMEOUT 45)
+
         add_executable(test_pico_wt_managed_loopback
             tests/test_pico_wt_managed_loopback.c)
         target_link_libraries(test_pico_wt_managed_loopback

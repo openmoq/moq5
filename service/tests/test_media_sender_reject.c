@@ -103,6 +103,13 @@ static void assert_terminal(moq_media_sender_t *s, moq_media_track_t *v,
 {
     MOQ_TEST_CHECK(moq_media_sender_is_fatal(s));
     MOQ_TEST_CHECK_EQ_U64(moq_media_sender_fatal_code(s), want_code);
+    moq_request_error_t peer_error = UINT64_MAX;
+    bool rejected = want_code == MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED ||
+                    want_code == MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED;
+    MOQ_TEST_CHECK(moq_media_sender_peer_request_error(s, &peer_error) == rejected);
+    if (rejected) MOQ_TEST_CHECK_EQ_U64(peer_error, MOQ_REQUEST_ERROR_UNAUTHORIZED);
+    MOQ_TEST_CHECK(!moq_media_sender_peer_request_error(s, NULL));
+    MOQ_TEST_CHECK(!moq_media_sender_peer_request_error(NULL, &peer_error));
     MOQ_TEST_CHECK(!moq_media_sender_is_ready(s));   /* never ready after */
     MOQ_TEST_CHECK_EQ_INT(cs->closed_n, 1);          /* once */
     MOQ_TEST_CHECK(cs->last_fatal);
