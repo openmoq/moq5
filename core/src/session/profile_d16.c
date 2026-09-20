@@ -340,7 +340,7 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
             tok.alias_type == MOQ_AUTH_TOKEN_USE_ALIAS)
             return close_with_error(s, 0x3, "DELETE/USE_ALIAS in CLIENT_SETUP");
 
-        /* Well-formed structure but semantically invalid value: there is no
+        /* Well-formed structure but invalid value representation: there is no
          * request to reject at SETUP time, so this is the
          * MALFORMED_AUTH_TOKEN session error (0x16). */
         if (!moq_auth_token_value_semantically_valid(tok.token_value,
@@ -604,9 +604,9 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
 
         if (tok.alias_type == MOQ_AUTH_TOKEN_DELETE) continue;
 
-        /* REGISTER / USE_VALUE carry a literal value: well-formed but
-         * semantically invalid closes with MALFORMED_AUTH_TOKEN (0x16) --
-         * there is no request to reject at SETUP time. */
+        /* REGISTER / USE_VALUE carry a literal value: a well-formed token
+         * with an invalid value representation closes with
+         * MALFORMED_AUTH_TOKEN (0x16); there is no request to reject here. */
         if (!moq_auth_token_value_semantically_valid(tok.token_value,
                                                      tok.token_value_len))
             return close_with_error(s, 0x16, "malformed auth token in SETUP");

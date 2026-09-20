@@ -485,6 +485,7 @@ int main(void)
 
     /* == 10. USE_VALUE token (no alias) in CLIENT_SETUP ================== */
     {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
 
@@ -498,8 +499,8 @@ int main(void)
         moq_d16_auth_token_t tok = {
             .alias_type = MOQ_AUTH_TOKEN_USE_VALUE,
             .token_type = 7,
-            .token_value = (const uint8_t *)"directval",
-            .token_value_len = 9,
+            .token_value = payload,
+            .token_value_len = sizeof(payload),
         };
         MOQ_TEST_CHECK(feed_client_setup_with_tokens(sv, &tok, 1, NULL, 0) == MOQ_OK);
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
@@ -509,9 +510,10 @@ int main(void)
         MOQ_TEST_CHECK(ne >= 1);
         MOQ_TEST_CHECK(evts[0].u.setup_complete.token_count == 1);
         MOQ_TEST_CHECK(evts[0].u.setup_complete.tokens[0].token_type == 7);
-        MOQ_TEST_CHECK(evts[0].u.setup_complete.tokens[0].token_value.len == 9);
+        MOQ_TEST_CHECK(evts[0].u.setup_complete.tokens[0].token_value.len ==
+                       sizeof(payload));
         MOQ_TEST_CHECK(memcmp(evts[0].u.setup_complete.tokens[0].token_value.data,
-                              "directval", 9) == 0);
+                              payload, sizeof(payload)) == 0);
 
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);
@@ -688,6 +690,7 @@ int main(void)
 
     /* == 15. REGISTER then USE_ALIAS resolves correctly ================ */
     {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
         moq_session_cfg_t sx = MOQ_SESSION_CFG_INIT;
@@ -701,8 +704,8 @@ int main(void)
             .alias_type = MOQ_AUTH_TOKEN_REGISTER,
             .alias = 1,
             .token_type = 99,
-            .token_value = (const uint8_t *)"secret",
-            .token_value_len = 6,
+            .token_value = payload,
+            .token_value_len = sizeof(payload),
         };
         uint8_t tb1[64];
         moq_buf_writer_t tw1;
@@ -753,7 +756,7 @@ int main(void)
         MOQ_TEST_CHECK(ev2.u.subscribe_request.tokens[0].token_type == 99);
         MOQ_TEST_CHECK(ev2.u.subscribe_request.tokens[0].token_value.len == 6);
         MOQ_TEST_CHECK(memcmp(ev2.u.subscribe_request.tokens[0].token_value.data,
-                              "secret", 6) == 0);
+                              payload, sizeof(payload)) == 0);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -1945,6 +1948,9 @@ int main(void)
 
     /* == 30. REGISTER, DELETE, re-REGISTER same alias ================= */
     {
+        const uint8_t replacement[] = {
+            0xd2, 0x84, 0x40, 0x00, 0x80, 0xff
+        };
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
 
@@ -1991,8 +1997,8 @@ int main(void)
 
         moq_d16_auth_token_t rereg = {
             .alias_type = MOQ_AUTH_TOKEN_REGISTER, .alias = 7,
-            .token_type = 2, .token_value = (const uint8_t *)"bb",
-            .token_value_len = 2,
+            .token_type = 2, .token_value = replacement,
+            .token_value_len = sizeof(replacement),
         };
         tvl = build_auth_token_value(tv, sizeof(tv), &rereg);
         moq_kvp_entry_t p3[1] = {{
@@ -2004,7 +2010,11 @@ int main(void)
         MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
         MOQ_TEST_CHECK(ev.u.subscribe_request.token_count == 1);
         MOQ_TEST_CHECK(ev.u.subscribe_request.tokens[0].token_type == 2);
-        MOQ_TEST_CHECK(ev.u.subscribe_request.tokens[0].token_value.len == 2);
+        MOQ_TEST_CHECK(ev.u.subscribe_request.tokens[0].token_value.len ==
+                       sizeof(replacement));
+        MOQ_TEST_CHECK(memcmp(
+            ev.u.subscribe_request.tokens[0].token_value.data,
+            replacement, sizeof(replacement)) == 0);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -2201,11 +2211,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == 33. CLIENT_SETUP zero-length USE_VALUE -> MALFORMED_AUTH_TOKEN  *
-     *  Semantic validation of the resolved value applies to SETUP tokens
-     *  too; with no request to reject, the session closes with the
-     *  MALFORMED_AUTH_TOKEN session error (0x16) -- distinct from the
-     *  structural 0x6 close. */
+    /* == 33. CLIENT_SETUP carries an empty opaque token value ========== */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -2224,22 +2230,20 @@ int main(void)
             .token_value_len = 0,
         };
         feed_client_setup_with_tokens(sv, &tok, 1, NULL, 0);
-        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
 
         moq_event_t evts[4];
         size_t ne = moq_session_poll_events(sv, evts, 4);
         MOQ_TEST_CHECK(ne >= 1);
-        MOQ_TEST_CHECK(evts[0].kind == MOQ_EVENT_SESSION_CLOSED);
-        MOQ_TEST_CHECK(evts[0].u.closed.code == 0x16);
+        MOQ_TEST_CHECK(evts[0].kind == MOQ_EVENT_SETUP_COMPLETE);
+        MOQ_TEST_CHECK(evts[0].u.setup_complete.token_count == 1);
+        MOQ_TEST_CHECK(evts[0].u.setup_complete.tokens[0].token_value.len == 0);
 
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == 34. NUL-containing USE_VALUE on SUBSCRIBE -> REQUEST_ERROR 0x4  *
-     *  The shared semantic check is request-level on request messages:
-     *  REQUEST_ERROR carrying MALFORMED_AUTH_TOKEN (0x4), session alive,
-     *  no SUBSCRIBE_REQUEST surfaced. */
+    /* == 34. Binary USE_VALUE on SUBSCRIBE is preserved exactly ======= */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -2247,13 +2251,14 @@ int main(void)
         establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
 
         uint8_t tv[32];
-        moq_d16_auth_token_t bad = {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
+        moq_d16_auth_token_t tok = {
             .alias_type = MOQ_AUTH_TOKEN_USE_VALUE,
             .token_type = 7,
-            .token_value = (const uint8_t *)"a\0b",
-            .token_value_len = 3,
+            .token_value = payload,
+            .token_value_len = sizeof(payload),
         };
-        size_t tvl = build_auth_token_value(tv, sizeof(tv), &bad);
+        size_t tvl = build_auth_token_value(tv, sizeof(tv), &tok);
         moq_kvp_entry_t params[1] = {{
             .type = MOQ_MSG_PARAM_AUTHORIZATION_TOKEN,
             .value = tv, .value_len = tvl, .is_varint = false,
@@ -2262,28 +2267,22 @@ int main(void)
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
 
         moq_event_t ev;
-        MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 0);
-
-        bool found_err = false;
-        moq_action_t acts[4];
-        size_t na = moq_session_poll_actions(sv, acts, 4);
-        for (size_t i = 0; i < na; i++) {
-            if (decode_action_msg_type(&acts[i]) == MOQ_D16_REQUEST_ERROR) {
-                moq_control_envelope_t env;
-                moq_buf_reader_t r;
-                moq_buf_reader_init(&r, acts[i].u.send_control.data,
-                                    acts[i].u.send_control.len);
-                if (moq_control_decode_envelope(&r, &env) == MOQ_OK) {
-                    moq_d16_request_error_t err;
-                    if (moq_d16_decode_request_error(env.payload,
-                            env.payload_len, &err) == MOQ_OK &&
-                        err.error_code == 0x4)
-                        found_err = true;
-                }
+        if (moq_session_poll_events(sv, &ev, 1) == 1) {
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+            MOQ_TEST_CHECK(ev.u.subscribe_request.token_count == 1);
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST &&
+                ev.u.subscribe_request.token_count == 1) {
+                MOQ_TEST_CHECK(
+                    ev.u.subscribe_request.tokens[0].token_value.len ==
+                    sizeof(payload));
+                MOQ_TEST_CHECK(memcmp(
+                    ev.u.subscribe_request.tokens[0].token_value.data,
+                    payload, sizeof(payload)) == 0);
             }
-            moq_action_cleanup(&acts[i]);
+            moq_event_cleanup(&ev);
+        } else {
+            MOQ_TEST_CHECK(false);
         }
-        MOQ_TEST_CHECK(found_err);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
@@ -2576,6 +2575,7 @@ int main(void)
      * On retry, REGISTER hits DUPLICATE → spurious session close 0x14.
      */
     {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
 
@@ -2598,8 +2598,8 @@ int main(void)
             .alias_type = MOQ_AUTH_TOKEN_REGISTER,
             .alias = 42,
             .token_type = 7,
-            .token_value = (const uint8_t *)"secret",
-            .token_value_len = 6,
+            .token_value = payload,
+            .token_value_len = sizeof(payload),
         };
         uint8_t tb[64];
         moq_buf_writer_t tw;
@@ -2631,7 +2631,7 @@ int main(void)
         MOQ_TEST_CHECK(ev.u.subscribe_request.tokens[0].token_type == 7);
         MOQ_TEST_CHECK(ev.u.subscribe_request.tokens[0].token_value.len == 6);
         MOQ_TEST_CHECK(memcmp(ev.u.subscribe_request.tokens[0].token_value.data,
-                              "secret", 6) == 0);
+                              payload, sizeof(payload)) == 0);
         moq_event_cleanup(&ev);
 
         /* Alias must be committed exactly once. */
@@ -2642,7 +2642,7 @@ int main(void)
             &rtype, &rval, &rlen) == MOQ_TOKEN_OK);
         MOQ_TEST_CHECK(rtype == 7);
         MOQ_TEST_CHECK(rlen == 6);
-        MOQ_TEST_CHECK(memcmp(rval, "secret", 6) == 0);
+        MOQ_TEST_CHECK(memcmp(rval, payload, sizeof(payload)) == 0);
 
         moq_action_t acts[8];
         size_t na = moq_session_poll_actions(sv, acts, 8);

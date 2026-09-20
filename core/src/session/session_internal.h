@@ -2114,10 +2114,9 @@ void process_auth_tokens_free_staging(moq_session_t *s,
  * capability-gated). Runs AFTER alias resolution yields a concrete value;
  * structural decoding failures stay on their existing close paths.
  *
- * Deliberately minimal and deterministic -- the seam where application-
- * level token validation will plug in later, NOT application policy:
- *   - a zero-length resolved value is semantically malformed;
- *   - a value containing a NUL byte is semantically malformed.
+ * This is only a pointer/length representation check.  Payload bytes are
+ * opaque to transport; token-type verifiers own content validation, including
+ * whether an empty value is acceptable.
  */
 bool moq_auth_token_value_semantically_valid(const uint8_t *value,
                                              size_t value_len);
