@@ -21,6 +21,7 @@
 #include <moq/types.h>
 #include <moq/session.h>
 #include <moq/endpoint.h>
+#include <moq/auth.h>
 #include <moq/media_object.h>
 #include <moq/msf.h>     /* moq_cmsf_content_protection_t (CMSF authoring) */
 
@@ -197,6 +198,9 @@ typedef struct moq_media_sender_cfg {
      * A real track add/remove/conversion generation always takes precedence
      * and resets the refresh cadence; no demand means no refresh. */
     uint64_t                             catalog_refresh_interval_us;
+    /* Copied at create/attach. Selects namespace and each actual PUBLISH
+     * resource; callbacks follow moq/auth.h's owner-thread/lifetime contract. */
+    const moq_auth_source_t *request_auth;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,
@@ -714,6 +718,7 @@ MOQ_API bool     moq_media_sender_is_fatal(const moq_media_sender_t *s);
 MOQ_API uint64_t moq_media_sender_fatal_code(const moq_media_sender_t *s);
 
 /* Sender-fatal codes (moq_media_sender_fatal_code). */
+#define MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION    0x6u /* credential source denied */
 #define MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE   0x1u /* MSF encode failed */
 #define MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED     0x2u /* publisher / track /
                                                         retained setup failed */

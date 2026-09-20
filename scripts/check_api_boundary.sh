@@ -32,7 +32,7 @@ STABLE_DOCS=(
 while IFS= read -r file; do
     # Protocol references, design notes, simulator internals, and wire-format
     # references legitimately name wire-level concepts.
-    case "$file" in docs/conformance.md|docs/*_DESIGN.md|docs/simulation.md|docs/*-wire-reference.md) continue ;; esac
+    case "$file" in docs/conformance.md|docs/*_DESIGN.md|docs/simulation.md|docs/*-wire-reference.md|docs/cat4moq-design.md|docs/superpowers/plans/*) continue ;; esac
     STABLE_DOCS+=( "$file" )
 done < <(cd "$ROOT" && find docs -type f -name '*.md' -print | sort)
 

@@ -21,6 +21,7 @@
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 
 #include "endpoint_internal.h"
+#include "auth_source.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -128,6 +129,9 @@ struct moq_media_track {
     uint8_t              *strings;           /* owned backing for the spans */
     size_t                strings_size;
 
+    moq_auth_owned_list_t publish_auth;
+    bool                  publish_auth_selected;
+    bool                  publication_started;
     moq_pub_track_t      *pub_track;         /* NULL until the hook adds it */
     size_t                active_subs;       /* mirrored subscriber count (mu);
                                                 reconciled on the network thread
@@ -291,6 +295,9 @@ struct moq_media_sender {
      * only the established session knows what was actually negotiated.
      * Zero means "not yet observed", and encoding fails closed on it -- the
      * sender never falls back to a draft. */
+    moq_auth_source_owned_t request_auth;
+    moq_auth_owned_list_t namespace_auth;
+    bool namespace_auth_selected;
     moq_version_t    transport_version;
 
     /* Namespace + catalog track name, deep-copied (same idiom as the
@@ -1698,44 +1705,77 @@ static bool removed_pubtrack_with_name(moq_media_sender_t *s,
  * sender_set_fatal while holding s->mu would deadlock. Holding s->mu across
  * moq_pub_add_track is safe: the sender installs no publisher callbacks, so the
  * facade cannot re-enter s->mu (same discipline as sender_drain / republish). */
-static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
-                                 bool advertise, uint64_t now_us)
+/* Caller holds s->mu. A selected list belongs to one logical request and is
+ * retained until admission succeeds, so transport backpressure never calls the
+ * provider twice or loses bytes borrowed from its previous invocation. */
+static moq_result_t sender_publish_track(moq_media_sender_t *s,
+                                        moq_media_track_t *t, uint64_t now_us)
 {
-    moq_pub_track_cfg_t tcfg;
-    /* Sized init: the catalog branch below sets the APPENDED
-     * has_publisher_priority tail field, which moq_pub_add_track reads only
-     * when struct_size covers it -- the pointer-only init's frozen v0
-     * struct_size would silently drop it (default priority 128, not 0). */
-    moq_pub_track_cfg_init_sized(&tcfg, sizeof(tcfg));
-    tcfg.track_namespace = s->namespace_;
-    tcfg.track_name = t->is_catalog
-        ? (moq_bytes_t){ s->catalog_name, s->catalog_name_len }
-        : t->name;
-    tcfg.advertise_namespace = advertise;
-
-    if (t->is_catalog) {
-        tcfg.has_publisher_priority = true;
-        tcfg.publisher_priority = 0;
+    if (!s->publish_tracks || t->publication_started) return MOQ_OK;
+    if (!t->publish_auth_selected) {
+        moq_auth_request_t request = {MOQ_AUTH_PUBLISH, s->namespace_,
+            t->is_catalog ? (moq_bytes_t){s->catalog_name, s->catalog_name_len} : t->name};
+        moq_result_t rc = moq_auth_source_select(&s->request_auth, &request,
+                                               &s->alloc, &t->publish_auth);
+        if (rc != MOQ_OK) {
+            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION);
+            return rc;
+        }
+        t->publish_auth_selected = true;
     }
-    /* The sender's production is strictly monotonic on every track: media
-     * emission drains group_seq in order (eviction only drops OLDER groups
-     * before emission; an abandoned group never rewinds), and catalog
-     * generations only advance, with delta objects appended to the OPEN
-     * generation group. Declaring it lets finite subscription filters
-     * auto-complete once production passes their end group. */
-    tcfg.monotonic_groups = true;
-
-    if (moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track) != MOQ_OK) {
+    moq_pub_publish_cfg_t cfg;
+    moq_pub_publish_cfg_init(&cfg);
+    cfg.auth_tokens = t->publish_auth.tokens;
+    cfg.auth_token_count = t->publish_auth.count;
+    moq_result_t rc = moq_pub_publish_track(s->pub, t->pub_track, &cfg, now_us);
+    if (rc == MOQ_OK) {
+        t->publication_started = true;
+        moq_auth_list_clear(&t->publish_auth, &s->alloc);
+    } else if (rc != MOQ_ERR_WOULD_BLOCK && rc != MOQ_ERR_REQUEST_BLOCKED) {
         sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-        return;
     }
+    return rc;
+}
 
-    if (s->publish_tracks && t->pub_track) {
-        moq_pub_publish_cfg_t pcfg;
-        moq_pub_publish_cfg_init(&pcfg);
-        if (moq_pub_publish_track(s->pub, t->pub_track, &pcfg, now_us) != MOQ_OK)
-            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+static moq_result_t sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
+                                         bool advertise, uint64_t now_us)
+{
+    if (!t->pub_track) {
+        moq_pub_track_cfg_t cfg;
+        moq_pub_track_cfg_init_sized(&cfg, sizeof(cfg));
+        cfg.track_namespace = s->namespace_;
+        cfg.track_name = t->is_catalog
+            ? (moq_bytes_t){s->catalog_name, s->catalog_name_len} : t->name;
+        cfg.advertise_namespace = advertise;
+        cfg.monotonic_groups = true;
+        if (t->is_catalog) {
+            cfg.has_publisher_priority = true;
+            cfg.publisher_priority = 0;
+        }
+        if (advertise) {
+            if (!s->namespace_auth_selected) {
+                moq_auth_request_t request = {MOQ_AUTH_PUBLISH_NAMESPACE,
+                                              s->namespace_, {NULL, 0}};
+                moq_result_t rc = moq_auth_source_select(&s->request_auth, &request,
+                                                        &s->alloc, &s->namespace_auth);
+                if (rc != MOQ_OK) {
+                    sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION);
+                    return rc;
+                }
+                s->namespace_auth_selected = true;
+            }
+            cfg.namespace_auth_tokens = s->namespace_auth.tokens;
+            cfg.namespace_auth_token_count = s->namespace_auth.count;
+        }
+        moq_result_t rc = moq_pub_add_track(s->pub, &cfg, now_us, &t->pub_track);
+        if (rc != MOQ_OK) {
+            if (rc != MOQ_ERR_WOULD_BLOCK && rc != MOQ_ERR_REQUEST_BLOCKED)
+                sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            return rc;
+        }
+        if (advertise) moq_auth_list_clear(&s->namespace_auth, &s->alloc);
     }
+    return MOQ_OK;
 }
 
 static bool rcbuf_bytes_eq(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
@@ -2407,22 +2447,31 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pthread_mutex_unlock(&s->mu);
     }
 
-    if (!s->pub) {
-        if (moq_session_state(session) != MOQ_SESS_ESTABLISHED)
-            return;
+    if (s->pub && s->catalog_published) {
+        (void)moq_pub_tick(s->pub, now_us);
+        pthread_mutex_lock(&s->mu);
+        bool stopped = s->fatal;
+        pthread_mutex_unlock(&s->mu);
+        if (stopped) return;
+    }
+    if (!s->catalog_published) {
+        if (!s->pub) {
+            if (moq_session_state(session) != MOQ_SESS_ESTABLISHED)
+                return;
 
-        moq_pub_cfg_t pcfg;
-        moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
-        pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
-        pcfg.callbacks.ctx = s;
-        pcfg.callbacks.on_closed = sender_pub_on_closed;
-        pcfg.callbacks.on_publish_finished = sender_pub_on_publish_finished;
-        pcfg.callbacks.on_publish_error = sender_pub_on_publish_error;
-        pcfg.callbacks.on_namespace_terminal =
-            sender_pub_on_namespace_terminal;
-        if (moq_pub_create(session, &s->alloc, &pcfg, &s->pub) != MOQ_OK) {
-            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-            return;
+            moq_pub_cfg_t pcfg;
+            moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
+            pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+            pcfg.callbacks.ctx = s;
+            pcfg.callbacks.on_closed = sender_pub_on_closed;
+            pcfg.callbacks.on_publish_finished = sender_pub_on_publish_finished;
+            pcfg.callbacks.on_publish_error = sender_pub_on_publish_error;
+            pcfg.callbacks.on_namespace_terminal =
+                sender_pub_on_namespace_terminal;
+            if (moq_pub_create(session, &s->alloc, &pcfg, &s->pub) != MOQ_OK) {
+                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                return;
+            }
         }
 
         /* Freeze the app's track list and build pub tracks from it. The
@@ -2433,24 +2482,10 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         s->tracks_frozen = true;
         pthread_mutex_unlock(&s->mu);
 
-        moq_pub_track_cfg_t ccfg;
-        /* Sized init: has_publisher_priority below is an appended tail field
-         * (see sender_add_pub_track). */
-        moq_pub_track_cfg_init_sized(&ccfg, sizeof(ccfg));
-        ccfg.track_namespace = s->namespace_;
-        ccfg.track_name = (moq_bytes_t){ s->catalog_name, s->catalog_name_len };
-        ccfg.advertise_namespace = true;
-        ccfg.has_publisher_priority = true;
-        ccfg.publisher_priority = 0;   /* catalog leads delivery */
-        /* Catalog generations are monotone; deltas append to the open
-         * generation group (legal: no completion evidence forms while the
-         * group's bracket never cleanly closes). */
-        ccfg.monotonic_groups = true;
-        if (moq_pub_add_track(s->pub, &ccfg, now_us,
-                              &s->catalog_track->pub_track) != MOQ_OK) {
-            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-            return;
-        }
+        pthread_mutex_lock(&s->mu);
+        moq_result_t crc = sender_add_pub_track(s, s->catalog_track, true, now_us);
+        pthread_mutex_unlock(&s->mu);
+        if (crc != MOQ_OK) return;
 
         /* Walk a snapshot so a concurrent app-thread realloc of s->tracks cannot
          * free the vector mid-walk; the per-track registration below takes s->mu
@@ -2463,6 +2498,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
             sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
             return;
         }
+        bool pending_tracks = false;
         for (size_t i = 0; i < n; i++) {
             moq_media_track_t *t = snap[i];
             if (t->is_catalog) continue;   /* creation-time immutable */
@@ -2473,15 +2509,18 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
              * concurrent remove_track in the gap could leave a removed track with
              * a publisher track. */
             pthread_mutex_lock(&s->mu);
-            if (!t->removed && !t->pub_track)
-                sender_add_pub_track(s, t, false, now_us);
+            if (!s->fatal && !t->removed && (!t->pub_track ||
+                    (s->publish_tracks && !t->publication_started))) {
+                if (sender_add_pub_track(s, t, false, now_us) != MOQ_OK)
+                    pending_tracks = true;
+            }
             pthread_mutex_unlock(&s->mu);
         }
         sender_tracks_release(s, snap, n);
         pthread_mutex_lock(&s->mu);
         fatal = s->fatal;
         pthread_mutex_unlock(&s->mu);
-        if (fatal) return;
+        if (fatal || pending_tracks) return;
 
         /* Derive the initial catalog and install it as the retained group
          * (generation 0, object 0) so an explicit Joining FETCH(offset 0) can
@@ -2520,15 +2559,6 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         s->catalog_group = 0;
         s->catalog_published = true;
 
-        if (s->publish_tracks) {
-            moq_pub_publish_cfg_t cpcfg;
-            moq_pub_publish_cfg_init(&cpcfg);
-            if (moq_pub_publish_track(s->pub, s->catalog_track->pub_track,
-                                      &cpcfg, now_us) != MOQ_OK) {
-                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-                return;
-            }
-        }
         /* Start the automatic-refresh clock from the initial catalog install. */
         sender_arm_refresh(s, now_us);
         /* Record the initial catalog's track set as the published baseline. */
@@ -2537,6 +2567,36 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
             s->tracks[i]->in_published = track_in_catalog(s->tracks[i], true);
         pthread_mutex_unlock(&s->mu);
     }
+
+    /* Install retained catalog data before any publication can yield. A peer
+     * may subscribe and join-fetch as soon as it sees the namespace, even while
+     * our initial media publications are waiting for request credit. */
+    if (s->publish_tracks && !s->ready) {
+        size_t n = 0;
+        moq_media_track_t **snap = NULL;
+        if (!sender_tracks_snapshot(s, &snap, &n)) {
+            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            return;
+        }
+        bool pending = false;
+        for (size_t i = 0; i < n; ++i) {
+            moq_media_track_t *t = snap[i];
+            pthread_mutex_lock(&s->mu);
+            if (!s->fatal && !t->removed && !t->is_catalog && t->pub_track &&
+                sender_publish_track(s, t, now_us) != MOQ_OK) pending = true;
+            pthread_mutex_unlock(&s->mu);
+        }
+        sender_tracks_release(s, snap, n);
+        pthread_mutex_lock(&s->mu);
+        fatal = s->fatal;
+        pthread_mutex_unlock(&s->mu);
+        if (fatal || pending) return;
+    }
+
+    pthread_mutex_lock(&s->mu);
+    moq_result_t cprc = sender_publish_track(s, s->catalog_track, now_us);
+    pthread_mutex_unlock(&s->mu);
+    if (cprc != MOQ_OK) return;
 
     (void)moq_pub_tick(s->pub, now_us);
 
@@ -2662,7 +2722,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                 else { sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED); break; }
                 continue;
             }
-            if (!t->pub_track) {
+            if (!t->pub_track || (s->publish_tracks && !t->publication_started)) {
                 /* Defer registering a replacement until the old same-name
                  * publisher track (if any) is actually gone. */
                 if (removed_pubtrack_with_name(s, snap, n, t->name)) continue;
@@ -2676,9 +2736,12 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                  * could never be advertised -- set catalog_dirty under the same
                  * lock. */
                 pthread_mutex_lock(&s->mu);
-                if (!t->removed && !t->pub_track) {
-                    sender_add_pub_track(s, t, false, now_us);
-                    if (t->pub_track) s->catalog_dirty = true;
+                if (!s->fatal && !t->removed && (!t->pub_track ||
+                        (s->publish_tracks && !t->publication_started))) {
+                    bool was_registered = t->pub_track != NULL;
+                    if (sender_add_pub_track(s, t, false, now_us) == MOQ_OK)
+                        (void)sender_publish_track(s, t, now_us);
+                    if (!was_registered && t->pub_track) s->catalog_dirty = true;
                 }
                 pthread_mutex_unlock(&s->mu);
             }
@@ -3169,6 +3232,7 @@ static moq_result_t sender_validate_cfg(const moq_media_sender_cfg_t *cfg)
 static void track_free(moq_media_sender_t *s, moq_media_track_t *t)
 {
     if (!t) return;
+    moq_auth_list_clear(&t->publish_auth, &s->alloc);
     if (t->cp_ref_ids)
         s->alloc.free(t->cp_ref_ids,
             t->cp_ref_id_count * sizeof(moq_bytes_t), s->alloc.ctx);
@@ -3313,6 +3377,8 @@ static bool sender_tracks_push(moq_media_sender_t *s, moq_media_track_t *t)
 
 static void sender_free(moq_media_sender_t *s)
 {
+    moq_auth_source_clear(&s->request_auth, &s->alloc);
+    moq_auth_list_clear(&s->namespace_auth, &s->alloc);
     if (s->tracks) {
         for (size_t i = 0; i < s->track_count; i++)
             track_free(s, s->tracks[i]);
@@ -3441,6 +3507,13 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
     s->stats.struct_size = (uint32_t)sizeof(s->stats);
     pthread_mutex_init(&s->mu, NULL);
     pthread_cond_init(&s->space_cv, NULL);
+
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, request_auth) +
+                            sizeof(cfg->request_auth)) {
+        moq_result_t arc = moq_auth_source_copy(&s->request_auth,
+                                               cfg->request_auth, &s->alloc);
+        if (arc != MOQ_OK) { sender_free(s); return arc; }
+    }
 
     /* Deep-copy the root content protections (validated in sender_validate_cfg;
      * sender_copy_root_cps leaves no partial state on failure). */

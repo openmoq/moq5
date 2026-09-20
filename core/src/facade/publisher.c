@@ -1674,6 +1674,12 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
             moq_publish_namespace_cfg_t nscfg;
             moq_publish_namespace_cfg_init(&nscfg);
             nscfg.track_namespace = ns;
+            if (cfg->struct_size >=
+                    offsetof(moq_pub_track_cfg_t, namespace_auth_token_count) +
+                    sizeof(cfg->namespace_auth_token_count)) {
+                nscfg.auth_tokens = cfg->namespace_auth_tokens;
+                nscfg.auth_token_count = cfg->namespace_auth_token_count;
+            }
             moq_result_t rc = moq_session_publish_namespace(pub->session,
                 &nscfg, now_us, &nse->handle);
             if (rc < 0) {

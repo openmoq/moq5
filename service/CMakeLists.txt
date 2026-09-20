@@ -358,7 +358,7 @@ if(MOQ_BUILD_TESTS)
     # otherwise leak into the shipping receiver).
     if(TARGET moq::msf)
         add_library(moq-service-receiver-test-internals OBJECT
-            src/media_receiver.c src/endpoint.c)
+            src/media_receiver.c src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -476,7 +476,7 @@ if(MOQ_BUILD_TESTS)
         # the sender would publish after add/remove, to pin coalescing and the
         # no-op dedup deterministically.
         add_library(moq-service-sender-test-internals OBJECT
-            src/media_sender.c src/endpoint.c)
+            src/media_sender.c src/endpoint.c src/auth_source.c)
         target_include_directories(moq-service-sender-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -488,6 +488,15 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-sender-test-internals
             PUBLIC c_std_11)
+
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_auth tests/test_media_sender_auth.c)
+            target_link_libraries(test_media_sender_auth PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_auth PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit ${CMAKE_SOURCE_DIR}/core/src)
+            add_test(NAME media_sender_auth COMMAND test_media_sender_auth)
+        endif()
 
         add_executable(test_media_sender_catalog
             tests/test_media_sender_catalog.c)
@@ -535,7 +544,7 @@ if(MOQ_BUILD_TESTS)
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                src/media_sender.c src/media_receiver.c src/endpoint.c)
+                src/media_sender.c src/media_receiver.c src/endpoint.c src/auth_source.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

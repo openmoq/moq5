@@ -204,7 +204,7 @@ typedef struct moq_session_cfg {
     /* Borrowed until create returns; copied into owned SETUP wire storage.
      * Tokens use USE_VALUE. Pointer/count must both be present in struct_size.
      * At most 16 tokens (draft-16 also limits all SETUP parameters to 16).
-     * Token types must fit a QUIC varint. Invalid spans/counts return INVAL;
+     * Token types must be at most 2^62 - 1. Invalid spans/counts return INVAL;
      * credentials/routes whose complete encoded SETUP exceeds the wire/send
      * budget return BUFFER from create, before any actions can be queued.
      * Raw-QUIC client routes only; servers must leave both spans empty.
