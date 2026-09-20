@@ -98,6 +98,8 @@ static void run_case(moq_version_t version, int deny_action, bool use_static,
     tc.is_live = true; tc.bitrate = 100000; tc.emit_sap_timeline = true;
     moq_media_track_t *track = NULL;
     MOQ_TEST_CHECK(moq_media_sender_add_track(s, &tc, &track) == MOQ_OK);
+    moq_media_track_t *primary_track = track;
+    MOQ_TEST_CHECK(!moq_media_sender_track_is_published(s, primary_track));
     unsigned namespaces = 0, publications = 0, fetch_objects = 0;
     bool subscribe_sent = false, fetch_sent = false;
     moq_subscription_t catalog_sub = {0};
@@ -128,6 +130,13 @@ static void run_case(moq_version_t version, int deny_action, bool use_static,
                 publications++;
                 inspect(ev.u.publish_request.tokens, ev.u.publish_request.token_count,
                         MOQ_AUTH_PUBLISH, ev.u.publish_request.track_name, use_static);
+                moq_accept_publish_cfg_t accept;
+                moq_accept_publish_cfg_init_sized(&accept, sizeof(accept));
+                /* Accepted even with Forward off: acknowledgement is distinct
+                 * from subscriber demand or permission to emit objects. */
+                accept.forward = false;
+                MOQ_TEST_CHECK(moq_session_accept_publish(sv, ev.u.publish_request.pub,
+                    &accept, moq_simpair_now_us(sp)) == MOQ_OK);
             }
             else if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK && limited_credit && !fetch_sent) {
                 moq_fetch_cfg_t fc; moq_fetch_cfg_init_sized(&fc, sizeof(fc));
@@ -159,6 +168,7 @@ static void run_case(moq_version_t version, int deny_action, bool use_static,
         if (deny_action == MOQ_AUTH_PUBLISH_NAMESPACE) MOQ_TEST_CHECK(namespaces == 0);
     } else {
         MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+        MOQ_TEST_CHECK(moq_media_sender_track_is_published(s, primary_track));
         MOQ_TEST_CHECK(namespaces == 1 && publications == 4);
         if (!use_static) {
             MOQ_TEST_CHECK(state.namespace_calls == 1);

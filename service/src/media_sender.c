@@ -132,6 +132,7 @@ struct moq_media_track {
     moq_auth_owned_list_t publish_auth;
     bool                  publish_auth_selected;
     bool                  publication_started;
+    bool                  publication_accepted;
     moq_pub_track_t      *pub_track;         /* NULL until the hook adds it */
     size_t                active_subs;       /* mirrored subscriber count (mu);
                                                 reconciled on the network thread
@@ -2317,7 +2318,10 @@ static void sender_resync_track_demand(moq_media_sender_t *s,
     size_t real = (s->pub && t->pub_track)
         ? moq_pub_active_subscriptions(s->pub, t->pub_track) : 0;
 
+    bool published = s->pub && t->pub_track &&
+        moq_pub_track_is_published(s->pub, t->pub_track);
     pthread_mutex_lock(&s->mu);
+    t->publication_accepted = published;
     size_t old = t->active_subs;
     if (real == old) { pthread_mutex_unlock(&s->mu); return; }
     t->active_subs = real;
@@ -4488,6 +4492,24 @@ bool moq_media_sender_track_has_subscriber(const moq_media_sender_t *s,
                                            const moq_media_track_t *track)
 {
     return moq_media_sender_track_subscriptions(s, track) > 0;
+}
+
+bool moq_media_sender_track_is_published(const moq_media_sender_t *s,
+                                        const moq_media_track_t *track)
+{
+    if (!s || !track) return false;
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    bool published = false;
+    pthread_mutex_lock(&ms->mu);
+    for (size_t i = 0; i < ms->track_count; ++i) {
+        if (ms->tracks[i] == track) {
+            published = !ms->fatal && !ms->closed_fired && !sender_ep_closed(ms) && !track->removed &&
+                        track->publication_accepted;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ms->mu);
+    return published;
 }
 
 bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s)

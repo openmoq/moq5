@@ -709,6 +709,13 @@ MOQ_API bool moq_media_sender_track_has_subscriber(
  * to no media) does NOT make this true. */
 MOQ_API bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s);
 
+/* Thread-safe snapshot: true after the peer accepts this track's publication,
+ * while that publication remains active. Independent of Forward and subscriber
+ * demand. False for an unowned/removed track, or a closed/fatal sender. */
+MOQ_API bool moq_media_sender_track_is_published(
+    const moq_media_sender_t *s, const moq_media_track_t *track);
+
+
 /* is_closed: clean close / drained. is_fatal: connect, certificate,
  * protocol, transport, or sender failure (catalog encode, setup, namespace
  * rejected or cancelled, PUBLISH rejected). fatal_code: the sender's own code
