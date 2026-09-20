@@ -317,6 +317,14 @@ if(MOQ_BUILD_TESTS)
             moq_pq_threaded_create=moq_test_pq_threaded_create)
         target_compile_features(moq-service-ka-test-internals PUBLIC c_std_11)
 
+        add_executable(test_endpoint_auth tests/test_endpoint_auth.c)
+        target_link_libraries(test_endpoint_auth PRIVATE
+            moq-service-ka-test-internals moq::core Threads::Threads
+            ${_MOQ_SERVICE_FACADE_LIBS})
+        target_include_directories(test_endpoint_auth PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_auth COMMAND test_endpoint_auth)
+
         add_executable(test_endpoint_keepalive_default
             tests/test_endpoint_keepalive_default.c)
         target_link_libraries(test_endpoint_keepalive_default PRIVATE

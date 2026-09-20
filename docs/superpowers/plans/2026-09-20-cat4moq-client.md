@@ -18,7 +18,7 @@
 - Client tokens stop at ingress; network relay hops use their own scoped credentials.
 - Initial transport profiles are draft 16 and draft 18; compatibility profiles are explicit.
 - Preserve frozen config floors, including old tail padding.
-- No implementation tasks below have been started; checked boxes require new evidence.
+- Checked boxes below reflect recorded tests and independent review; platform/runtime limitations are recorded separately.
 
 ## Task 1: Make inbound token payloads binary-safe
 
@@ -26,7 +26,7 @@
 
 **Interface:** existing `moq_auth_token_value_semantically_valid(const uint8_t *, size_t)` must not interpret token payload bytes. Preserve structural envelope/alias validation in `process_auth_tokens()` and existing event borrow epochs.
 
-- [ ] Replace the test expecting `a\0b` to be malformed with exact-byte acceptance. Add direct helper regression in the existing internal-auth test target:
+- [x] Replace the test expecting `a\0b` to be malformed with exact-byte acceptance. Add direct helper regression in the existing internal-auth test target:
 
   ```c
   const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
@@ -34,15 +34,15 @@
   ```
 
   This is an opaque transport fixture, not a valid signed CWT. Add actual signed CBOR vectors to interoperability coverage separately. Exercise USE_VALUE, REGISTER/USE_ALIAS, replacement, failed-transaction rollback and same bytes in incoming SETUP on both drafts. Assert byte equality on the resolved event before invalidating its borrow.
-- [ ] Run the focused tests below and record the expected binary regression failure.
-- [ ] Remove the `memchr(..., 0, ...)` content rule. Preserve pointer/length and wire-action validation. Treat token-value content, including an empty value where the envelope permits it, as the token-type verifier's decision; do not invent a generic CBOR parser in transport.
-- [ ] Run the focused tests; malformed aliases, truncated wire encodings, oversized counts and rollback must still fail with their original protocol errors.
+- [x] Run the focused tests below and record the expected binary regression failure.
+- [x] Remove the `memchr(..., 0, ...)` content rule. Preserve pointer/length and wire-action validation. Treat token-value content, including an empty value where the envelope permits it, as the token-type verifier's decision; do not invent a generic CBOR parser in transport.
+- [x] Run the focused tests; malformed aliases, truncated wire encodings, oversized counts and rollback must still fail with their original protocol errors.
 
   ```sh
   cmake --build build/dev --target test_auth_cache test_session_auth test_d18_auth test_scenario_auth -j4
   ctest --test-dir build/dev -R '^(auth_cache|session_auth|d18_auth|scenario_auth)$' --output-on-failure
   ```
-- [ ] Review and commit the tested binary-carriage change independently.
+- [x] Review and commit the tested binary-carriage change independently.
 
 ## Task 2: Own outbound SETUP tokens and raw-QUIC routing
 
@@ -59,9 +59,9 @@ moq_bytes_t setup_path;
 
 Core copies all bytes at `moq_session_create()`. `moq_session_destroy()` and every failed-create path free them. Server SETUP may carry credentials but not client route options.
 
-- [ ] Add SimPair cases configuring client and server credentials for both drafts. Modify/free the caller's buffers immediately after create, then start the session and assert the peer receives the original bytes. Include 1 KiB credentials to expose both fixed-buffer bugs, multiple tokens, zero bytes, type 1 and type 16.
-- [ ] Add raw-client authority/path round trips, forbidden server-route config, old config prefixes, partial token pointer/count tails, historical padding canaries, oversized caller structs and allocation-failure sweeps. Confirm expected failures before adding fields/encoding.
-- [ ] Deep-copy tokens/routes before returning success; check count/length arithmetic and QUIC-varint ranges. Replace `params[4]`, the 256-byte draft-16 buffer and the 32-byte draft-18 buffer with storage sized for the checked complete SETUP. Encode each token using USE_VALUE. Preflight full size against `send_buffer_size` and protocol bounds; fail with `MOQ_ERR_BUFFER` before queuing any partial SETUP if it cannot fit.
+- [x] Add SimPair cases configuring client and server credentials for both drafts. Modify/free the caller's buffers immediately after create, then start the session and assert the peer receives the original bytes. Include 1 KiB credentials to expose both fixed-buffer bugs, multiple tokens, zero bytes, type 1 and type 16.
+- [x] Add raw-client authority/path round trips, forbidden server-route config, old config prefixes, partial token pointer/count tails, historical padding canaries, oversized caller structs and allocation-failure sweeps. Confirm expected failures before adding fields/encoding.
+- [x] Deep-copy tokens/routes before returning success; check count/length arithmetic and QUIC-varint ranges. Replace `params[4]`, the 256-byte draft-16 buffer and the 32-byte draft-18 buffer with storage sized for the checked complete SETUP. Encode each token using USE_VALUE. Preflight full size against `send_buffer_size` and protocol bounds; fail with `MOQ_ERR_BUFFER` before queuing any partial SETUP if it cannot fit.
 
   The caller pattern after this task is:
 
@@ -75,8 +75,8 @@ Core copies all bytes at `moq_session_create()`. `moq_session_destroy()` and eve
   cfg.send_buffer_size = 65536;
   ```
 
-- [ ] Build the affected tests and run `ctest --test-dir build/dev -R '(auth|d18_setup|oom|session_foundation)' --output-on-failure`. Run ASan/UBSan on new ownership and truncated-config cases. Confirm an over-budget token fails deterministically without partially sending SETUP.
-- [ ] Commit core SETUP support with API ownership comments and captured-wire evidence.
+- [x] Build the affected tests and run `ctest --test-dir build/dev -R '(auth|d18_setup|oom|session_foundation)' --output-on-failure`. Run ASan/UBSan on new ownership and truncated-config cases. Confirm an over-budget token fails deterministically without partially sending SETUP.
+- [x] Commit core SETUP support with API ownership comments and captured-wire evidence.
 
 ## Task 3: Preserve SETUP through every managed adapter
 
@@ -116,9 +116,9 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
 
 **Interfaces:** implement the exact public types/signature in the design. Append `const moq_auth_source_t *setup_auth` to `moq_endpoint_cfg_t`. Private source storage clones descriptors/static bytes with the endpoint allocator and retains selector/context. Private selection returns an owned bounded token list for one logical operation; its release routine is used on every terminal path.
 
-- [ ] Add table-driven tests for null source, static binary data, provider-selected data, empty present source, both sources set, callback error, invalid pointers, type overflow, 17 tokens, 16 KiB+1 token, total >32 KiB and allocator failure at each clone. Verify provider calls receive the requested action/resource and no token data enters diagnostics.
-- [ ] Add a fake-backend endpoint test where setup provider failure produces zero transport-create calls; another where a successful CLIENT_SETUP selection reaches the facade before auto-start. Run the new tests to establish RED.
-- [ ] Implement bounded source copy/selection. Invoke setup selection synchronously before choosing/starting transport; own the selected list across deferred negotiation. Source failures are terminal; never retry as anonymous. Provision bounded SETUP send capacity for the selected list and route options. Use raw-QUIC URL authority/path for Task 2; preserve existing WebTransport CONNECT routing and SNI policy.
+- [x] Add table-driven tests for null source, static binary data, provider-selected data, empty present source, both sources set, callback error, invalid pointers, type overflow, 17 tokens, 16 KiB+1 token, total >32 KiB and allocator failure at each clone. Verify provider calls receive the requested action/resource and no token data enters diagnostics.
+- [x] Add a fake-backend endpoint test where setup provider failure produces zero transport-create calls; another where a successful CLIENT_SETUP selection reaches the facade before auto-start. Run the new tests to establish RED.
+- [x] Implement bounded source copy/selection. Invoke setup selection synchronously before choosing/starting transport; own the selected list across deferred negotiation. Source failures are terminal; never retry as anonymous. Provision bounded SETUP send capacity for the selected list and route options. Use raw-QUIC URL authority/path for Task 2; preserve existing WebTransport CONNECT routing and SNI policy.
 
   ```c
   moq_auth_source_t source;
@@ -130,8 +130,8 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
   ```
 
   All descriptors and bytes in this static-source example may be released after connect returns; the endpoint retains its own copies.
-- [ ] Register CTest `auth_source`; run it plus endpoint resolve/lifecycle/handshake/post-contract tests. Confirm old endpoint callers have absent auth and unsupported backends fail before socket creation.
-- [ ] Commit service source and endpoint integration with public thread/lifetime/error documentation.
+- [x] Register CTest `auth_source`; run it plus endpoint resolve/lifecycle/handshake/post-contract tests. Confirm old endpoint callers have absent auth and unsupported backends fail before socket creation.
+- [x] Commit service source and endpoint integration with public thread/lifetime/error documentation.
 
 ## Task 5: Authorize namespace, catalog and media sender requests
 
@@ -139,9 +139,9 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
 
 **Interfaces:** append `namespace_auth_tokens`/`namespace_auth_token_count` to `moq_pub_track_cfg_t`. Append `const moq_auth_source_t *request_auth` to sender cfg. Existing `moq_pub_publish_cfg_t.auth_tokens` carries selected PUBLISH credentials.
 
-- [ ] Inspect outbound requests in the existing simulated sender peer. Record `(action, namespace tuple, track name, type, bytes)` for initial namespace advertisement, catalog PUBLISH, media PUBLISH, generated SAP/timeline and dynamic tracks. Return distinct binary tokens from the selector for each resource and assert exact matches. Shared namespace reuse must not emit a second advertisement or replace its credentials.
-- [ ] Add failure cases: reject namespace selection before track registration; reject catalog/media selection without emitting that request; mutate original static buffers after create; WOULD_BLOCK retains the same selected bytes and calls the provider once for that request. Run tests for expected failures.
-- [ ] Use Task 4 selection/ownership helpers at `sender_hook()` and `sender_add_pub_track()`. Select namespace auth only for a new advertisement; pass it through `moq_pub_add_track()`. Populate catalog/media `moq_pub_publish_cfg_t` from the selected PUBLISH list. Preserve pending selection until the request succeeds or terminates, and release it on reject/destroy.
+- [x] Inspect outbound requests in the existing simulated sender peer. Record `(action, namespace tuple, track name, type, bytes)` for initial namespace advertisement, catalog PUBLISH, media PUBLISH, generated SAP/timeline and dynamic tracks. Return distinct binary tokens from the selector for each resource and assert exact matches. Shared namespace reuse must not emit a second advertisement or replace its credentials.
+- [x] Add failure cases: reject namespace selection before track registration; reject catalog/media selection without emitting that request; mutate original static buffers after create; WOULD_BLOCK retains the same selected bytes and calls the provider once for that request. Run tests for expected failures.
+- [x] Use Task 4 selection/ownership helpers at `sender_hook()` and `sender_add_pub_track()`. Select namespace auth only for a new advertisement; pass it through `moq_pub_add_track()`. Populate catalog/media `moq_pub_publish_cfg_t` from the selected PUBLISH list. Preserve pending selection until the request succeeds or terminates, and release it on reject/destroy.
 
   ```c
   track_cfg.namespace_auth_tokens = namespace_tokens;
@@ -151,8 +151,8 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
   ```
 
   These variables are the owned lists selected for the actual wire resource; use sized config initializers. Do not select again for each media/catalog object.
-- [ ] Run publisher and all enabled media_sender CTests. Check retained catalog Joining FETCH and payload delivery still pass with no auth. Run ownership tests under sanitizers and review asynchronous rejection handling.
-- [ ] Commit sender parity. Do not change its existing ACCEPT_ALL inbound policy or describe this task as a CAT verifier.
+- [x] Run publisher and all enabled media_sender CTests. Check retained catalog Joining FETCH and payload delivery still pass with no auth. Run ownership tests under sanitizers and review asynchronous rejection handling.
+- [x] Commit sender parity. Do not change its existing ACCEPT_ALL inbound policy or describe this task as a CAT verifier.
 
 ## Task 6: Add receiver FETCH and update credential parity
 
@@ -160,9 +160,9 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
 
 **Interfaces:** append `auth_tokens`/`auth_token_count` to subscriber joining-FETCH and update configs; append `const moq_auth_source_t *request_auth` to receiver cfg. Add `moq_sub_joining_fetch_cfg_init_sized(cfg, size)` and `moq_media_receiver_cfg_init_sized(cfg, size)`, `moq_media_receiver_cfg_init_live_sized(cfg, size)`, `moq_media_receiver_cfg_init_flow_control_sized(cfg, size)`, using the existing pointer types and `size_t` size.
 
-- [ ] Freeze current receiver/joining-FETCH config extents and add canary tests for all old initializers before extending layouts. Add captured credentials for catalog/media/manual SUBSCRIBE, catalog joining FETCH and Forward-state REQUEST_UPDATE. Inject selector denial for each path; assert no unauthorized message and no false local success.
-- [ ] Run the new tests and record missing-token failures.
-- [ ] Initialize the core joining-FETCH cfg with its sized initializer and pass credentials through both missing facade paths. Clone the receiver source at create/attach. Select by FETCH and REQUEST_UPDATE separately from SUBSCRIBE, retaining owned bytes across retries. Existing catalog-fetch parent relationship does not eliminate the separate request credential requirement.
+- [x] Freeze current receiver/joining-FETCH config extents and add canary tests for all old initializers before extending layouts. Add captured credentials for catalog/media/manual SUBSCRIBE, catalog joining FETCH and Forward-state REQUEST_UPDATE. Inject selector denial for each path; assert no unauthorized message and no false local success.
+- [x] Run the new tests and record missing-token failures.
+- [x] Initialize the core joining-FETCH cfg with its sized initializer and pass credentials through both missing facade paths. Clone the receiver source at create/attach. Select by FETCH and REQUEST_UPDATE separately from SUBSCRIBE, retaining owned bytes across retries. Existing catalog-fetch parent relationship does not eliminate the separate request credential requirement.
 
   ```c
   core_fetch_cfg.auth_tokens = joining_cfg->auth_tokens;
@@ -172,8 +172,8 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
   ```
 
   Read appended fields only when the complete pair is within `struct_size`.
-- [ ] Run subscriber and all enabled media_receiver CTests, including update acknowledgement, catalog bootstrap, teardown retry and no-auth baseline. Run config/ownership tests under sanitizers.
-- [ ] Commit receiver parity and document callback failure behavior.
+- [x] Run subscriber and all enabled media_receiver CTests, including update acknowledgement, catalog bootstrap, teardown retry and no-auth baseline. Run config/ownership tests under sanitizers.
+- [x] Commit receiver parity and document callback failure behavior.
 
 ## Task 7: Enable MoQXR and prove current-relay compatibility
 

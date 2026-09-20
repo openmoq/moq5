@@ -45,6 +45,7 @@
  */
 
 #include "endpoint_internal.h"
+#include "auth_source.h"
 
 #include "../../adapters/common/moq_alpn.h"
 
@@ -392,11 +393,14 @@ typedef struct ep_backend_vtable {
 struct moq_endpoint {
     moq_alloc_t alloc;                 /* thread-safe (libc default) */
     moq_transport_protocol_t protocol;
+    moq_auth_source_owned_t setup_source;
+    moq_auth_owned_list_t setup_tokens;
+    char *authority; size_t authority_len;
 
     /* Owned NUL-terminated copies for the facade cfgs. */
     char *host;    size_t host_len;
     char *sni;     size_t sni_len;
-    char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
+    char *path;    size_t path_len;    /* CONNECT or raw SETUP path */
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
@@ -1123,6 +1127,10 @@ static char *ep_strdup_bytes(const moq_alloc_t *a, moq_bytes_t b, size_t *len)
 
 static void ep_free_strings(moq_endpoint_t *ep)
 {
+    moq_auth_list_clear(&ep->setup_tokens, &ep->alloc);
+    moq_auth_source_clear(&ep->setup_source, &ep->alloc);
+    if (ep->authority) ep->alloc.free(ep->authority, ep->authority_len, ep->alloc.ctx);
+    ep->authority = NULL;
     if (ep->host)    ep->alloc.free(ep->host, ep->host_len, ep->alloc.ctx);
     if (ep->sni)     ep->alloc.free(ep->sni, ep->sni_len, ep->alloc.ctx);
     if (ep->path)    ep->alloc.free(ep->path, ep->path_len, ep->alloc.ctx);
@@ -1185,6 +1193,11 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
      * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
      * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
     fc.keep_alive_interval_ms = 15000;
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
+    fc.setup_authority = (moq_bytes_t){(const uint8_t *)ep->authority, ep->authority_len - 1};
+    fc.setup_path = (moq_bytes_t){(const uint8_t *)ep->path, ep->path_len - 1};
+    fc.send_buffer_size = 65536;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1219,6 +1232,8 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     fc.configure_quic_ctx = ep;
     fc.on_pump = ep_wt_pump;
     fc.on_pump_ctx = ep;
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_pico_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_pico_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1269,6 +1284,11 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
      * EventBase pump's earliest deadline. Sized init covered the block. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
     fc.app_deadline_ctx = ep;
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
+    fc.setup_authority = (moq_bytes_t){(const uint8_t *)ep->authority, ep->authority_len - 1};
+    fc.setup_path = (moq_bytes_t){(const uint8_t *)ep->path, ep->path_len - 1};
+    fc.send_buffer_size = 65536;
     moq_mvfst_managed_t *fac = NULL;
     moq_result_t crc = moq_mvfst_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1332,6 +1352,10 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
      * each lane doorbell's next-wait computation. Sized init covered the block. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
     fc.app_deadline_ctx = ep;
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
+    fc.setup_authority = (moq_bytes_t){(const uint8_t *)ep->authority, ep->authority_len - 1};
+    fc.setup_path = (moq_bytes_t){(const uint8_t *)ep->path, ep->path_len - 1};
     moq_msquic_managed_t *fac = NULL;
     moq_result_t crc = moq_msquic_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1347,7 +1371,7 @@ static moq_result_t ep_create_proxygen(moq_endpoint_t *ep,
                                        const moq_endpoint_cfg_t *cfg)
 {
     moq_proxygen_wt_managed_cfg_t fc;
-    moq_proxygen_wt_managed_cfg_init(&fc);
+    moq_proxygen_wt_managed_cfg_init_sized(&fc, sizeof(fc));
     fc.alloc = &ep->alloc;
     fc.perspective = MOQ_PERSPECTIVE_CLIENT;
     /* See the picoquic branch: grant the peer request capacity so it can
@@ -1373,6 +1397,8 @@ static moq_result_t ep_create_proxygen(moq_endpoint_t *ep,
     fc.alpn_count = ep->alpn_offer_count;
     fc.on_pump = ep_proxygen_pump;
     fc.user_ctx = ep;
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_proxygen_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_proxygen_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1415,7 +1441,7 @@ static moq_result_t ep_create_wtquic_network(moq_endpoint_t *ep,
     offer[off] = '\0';
 
     moq_wtquic_network_managed_cfg_t fc;
-    moq_wtquic_network_managed_cfg_init(&fc);
+    moq_wtquic_network_managed_cfg_init_sized(&fc, sizeof(fc));
     fc.alloc = &ep->alloc;
     fc.host = ep->host;                 /* remote + TLS server name (sni==host,
                                            enforced above) */
@@ -1436,6 +1462,8 @@ static moq_result_t ep_create_wtquic_network(moq_endpoint_t *ep,
      * the facade folds it into the native delayed doorbell. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
     fc.app_deadline_ctx = ep;
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_wtquic_network_managed_t *fac = NULL;
     moq_result_t crc = moq_wtquic_network_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1507,6 +1535,8 @@ static moq_result_t ep_create_wtquic_msquic(moq_endpoint_t *ep,
             (uint32_t)MOQ_WTQUIC_MSQUIC_WT_PROFILE_CURRENT;
         break;
     }
+    fc.setup_auth_tokens = ep->setup_tokens.count ? ep->setup_tokens.tokens : NULL;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
     moq_wtquic_msquic_managed_t *fac = NULL;
     moq_result_t crc = moq_wtquic_msquic_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1653,12 +1683,47 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     pthread_mutex_init(&ep->mu, NULL);
     ep->pump_state = MOQ_ENDPOINT_CONNECTING;
 
+    const moq_auth_source_t *source = NULL;
+    if (cfg->struct_size >= offsetof(moq_endpoint_cfg_t, setup_auth) +
+                            sizeof(cfg->setup_auth)) source = cfg->setup_auth;
+    rc = moq_auth_source_copy(&ep->setup_source, source, alloc);
+    if (rc == MOQ_OK) {
+        const moq_auth_request_t request = {MOQ_AUTH_CLIENT_SETUP, {NULL, 0}, {NULL, 0}};
+        rc = moq_auth_source_select(&ep->setup_source, &request, alloc, &ep->setup_tokens);
+    }
+    if (rc != MOQ_OK) {
+        ep_free_strings(ep);
+        pthread_mutex_destroy(&ep->mu);
+        alloc->free(ep, sizeof(*ep), alloc->ctx);
+        return rc;
+    }
+
     ep->host = ep_strdup_bytes(alloc, r.url.host, &ep->host_len);
     ep->sni  = ep_strdup_bytes(alloc, r.sni, &ep->sni_len);
     bool oom = !ep->host || !ep->sni;
     if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
         ep->path = ep_strdup_bytes(alloc, r.wt_path, &ep->path_len);
         oom = oom || !ep->path;
+    }
+    if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {
+        /* Preserve the URI authority verbatim (including IPv6 brackets and an
+         * explicit port) and the raw path plus query. These are independent of
+         * a TLS SNI override. URL parsing already validated the scheme/host. */
+        size_t start = r.url.scheme.len + 3, end = start;
+        while (end < cfg->url.len && cfg->url.data[end] != '/' &&
+               cfg->url.data[end] != '?') ++end;
+        moq_bytes_t authority = {cfg->url.data + start, end - start};
+        moq_bytes_t route = {cfg->url.data + end, cfg->url.len - end};
+        /* Bound retained routing data together with the service token limit. */
+        if (authority.len > 16384 || route.len > 16384) {
+            ep_free_strings(ep);
+            pthread_mutex_destroy(&ep->mu);
+            alloc->free(ep, sizeof(*ep), alloc->ctx);
+            return MOQ_ERR_BUFFER;
+        }
+        ep->authority = ep_strdup_bytes(alloc, authority, &ep->authority_len);
+        ep->path = ep_strdup_bytes(alloc, route, &ep->path_len);
+        oom = !ep->authority || !ep->path;
     }
     if (!oom && cfg->ca_file.len > 0) {
         ep->ca_file = ep_strdup_bytes(alloc, cfg->ca_file, &ep->ca_file_len);
