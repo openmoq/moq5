@@ -96,9 +96,9 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
 
 **Interface:** append Task 2's raw token list fields to managed configs; add route fields to raw-QUIC facades only. Each facade owns copies until all deferred sessions/worker shutdown complete. Populate the sized session cfg before `moq_session_create()` on every creation path.
 
-- [ ] Add a test for immediate and negotiated/deferred SETUP using caller bytes mutated immediately after facade construction. Capture the peer SETUP tokens, not just a successful constructor return. Check server accept paths where supported.
-- [ ] Run each available adapter fixture to expose missing tokens. Preserve the original version negotiation tests.
-- [ ] Add checked cloning and propagation. Ensure failure cleanup precedes thread/socket startup when validation fails. For a backend not yet implemented, return `MOQ_ERR_UNSUPPORTED` on any configured token list before network work. Do not treat the unsupported branch as successful parity.
+- [x] Add a test for immediate and negotiated/deferred SETUP using caller bytes mutated immediately after facade construction. Capture the peer SETUP tokens, not just a successful constructor return. Check server accept paths where supported.
+- [x] Run each available adapter fixture to expose missing tokens. Preserve the original version negotiation tests.
+- [x] Add checked cloning and propagation. Ensure failure cleanup precedes thread/socket startup when validation fails. For a backend not yet implemented, return `MOQ_ERR_UNSUPPORTED` on any configured token list before network work. Do not treat the unsupported branch as successful parity.
 
   ```c
   session_cfg.setup_auth_tokens = owned_tokens;
@@ -107,8 +107,15 @@ Extend existing config ABI tests in those adapter test directories. Add `test_se
   ```
 
   Here `owned_tokens` and `owned_token_count` are the adapter instance's retained fields, not borrowed config memory.
-- [ ] Build and run the seven backend fixture sets in their supported environments. Run Network.framework on Apple CI; record unavailable dependencies as untested. Add old/truncated config and OOM tests to each new owned path.
-- [ ] Commit backend changes in independently reviewable backend groups, retaining fail-before-I/O behavior throughout.
+- [x] Build and run the seven backend fixture sets in their supported environments. Run Network.framework on Apple CI; record unavailable dependencies as untested. Add old/truncated config and OOM tests to each new owned path.
+- [x] Commit backend changes in independently reviewable backend groups, retaining fail-before-I/O behavior throughout.
+
+Validation qualification: peer-capture fixtures ran for raw picoquic, PicoWT and
+raw MsQuic. Raw mvfst compilation is blocked by the installed Fizz API mismatch;
+its implementation is unverified at runtime. Proxygen and WTquic paths explicitly
+reject configured credentials; Apple execution was unavailable. Broad-suite
+baseline failures are recorded in the execution results, not counted as passing
+backend parity.
 
 ## Task 4: Add service sources and wire endpoint SETUP
 

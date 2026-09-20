@@ -51,6 +51,7 @@ moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         MOQ_TEST_CHECK(memcmp(cfg->setup_auth_tokens[0].token_value.data,
                               token_bytes, sizeof(token_bytes)) == 0);
         MOQ_TEST_CHECK(cfg->send_buffer_size >= 65536);
+        MOQ_TEST_CHECK(cfg->recv_buffer_size >= 65536);
     }
     MOQ_TEST_CHECK(cfg->setup_authority.len == strlen(authority));
     MOQ_TEST_CHECK(memcmp(cfg->setup_authority.data, authority, strlen(authority)) == 0);

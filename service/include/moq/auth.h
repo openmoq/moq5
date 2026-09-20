@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+/* Owned endpoint/sender/receiver sources. Backend availability is checked at
+ * connect: configured credentials never fall back to anonymous operation. */
+#define MOQ_SERVICE_AUTH_API_VERSION 1
+
 #define MOQ_AUTH_SOURCE_MAX_TOKENS 16
 #define MOQ_AUTH_SOURCE_MAX_TOKEN_BYTES 16384
 #define MOQ_AUTH_SOURCE_MAX_TOTAL_BYTES 32768

@@ -1198,6 +1198,7 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.setup_authority = (moq_bytes_t){(const uint8_t *)ep->authority, ep->authority_len - 1};
     fc.setup_path = (moq_bytes_t){(const uint8_t *)ep->path, ep->path_len - 1};
     fc.send_buffer_size = 65536;
+    fc.recv_buffer_size = 65536;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -1289,6 +1290,7 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
     fc.setup_authority = (moq_bytes_t){(const uint8_t *)ep->authority, ep->authority_len - 1};
     fc.setup_path = (moq_bytes_t){(const uint8_t *)ep->path, ep->path_len - 1};
     fc.send_buffer_size = 65536;
+    fc.recv_buffer_size = 65536;
     moq_mvfst_managed_t *fac = NULL;
     moq_result_t crc = moq_mvfst_managed_create(&fc, &fac);
     if (crc < 0) return crc;

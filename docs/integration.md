@@ -285,3 +285,28 @@ Raw-QUIC endpoints carry the URL authority and path/query independently of TLS
 SNI. WebTransport keeps routing in its HTTP CONNECT request. Credentials are
 client-to-ingress data: a forwarding relay must use its own scoped credentials
 for the next hop.
+
+
+The owned service-source API is advertised by
+`MOQ_SERVICE_AUTH_API_VERSION >= 1`. Backend scope for this milestone:
+
+| Managed backend | Credential support and validation |
+| --- | --- |
+| Raw picoquic | Implemented; peer capture on immediate and negotiated sessions, both transport versions |
+| PicoWT | Implemented; peer capture on deferred client/server sessions, both transport versions |
+| Raw MsQuic | Implemented; peer capture on client/server sessions, both transport versions |
+| Raw mvfst | Implemented; local build/runtime unverified because the installed Fizz certificate-verifier API does not match the existing adapter |
+| Proxygen WT | Configured credentials return `MOQ_ERR_UNSUPPORTED` before startup |
+| WTquic MsQuic | Configured credentials return `MOQ_ERR_UNSUPPORTED` before startup |
+| WTquic Network.framework | Configured credentials return `MOQ_ERR_UNSUPPORTED` before startup; Apple runtime not exercised here |
+
+Peer capture covers client-only, server-only and mutual large credentials;
+constructors own bytes even when sessions are deferred. The sender's
+`moq_media_sender_peer_request_error()` exposes a recorded peer refusal code
+separately from its service failure code. It never returns peer reason text.
+
+The large-credential captures above cover opening messages. Existing draft-18
+per-request receive buffers in core are capped at 4096 bytes, even when the
+session receive budget is larger. The service's 16 KiB source limit is an
+input bound, not a guarantee that every peer/request path accepts that size.
+Current-relay action tests use their normally sized signed credentials.
