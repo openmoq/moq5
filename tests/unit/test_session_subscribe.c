@@ -5015,12 +5015,8 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == Zero-length token value is semantically malformed ============= *
-     *  A well-formed Token structure whose RESOLVED value fails semantic
-     *  validation (zero-length) MUST be rejected with MALFORMED_AUTH_TOKEN
-     *  (request error 0x4) -- the request never surfaces and the session
-     *  stays alive. The sender side stays permissive: what is semantically
-     *  valid is ultimately the receiver's call. */
+    /* Empty opaque token values, including unknown token types, reach the
+     * application unchanged. Transport validation does not impose policy. */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -5041,17 +5037,20 @@ int main(void)
             MOQ_OK);
         pump_actions_to_peer(c, sv, 0);
 
-        /* The request is auto-rejected: no SUBSCRIBE_REQUEST, session alive. */
+        /* Empty opaque tokens are valid transport data, including unknown
+         * token types. The application receives the request and owns policy. */
         moq_event_t ev;
-        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 0);
-        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
-
-        /* The client observes SUBSCRIBE_ERROR with MALFORMED_AUTH_TOKEN. */
-        pump_actions_to_peer(sv, c, 0);
-        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 1);
-        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_ERROR);
-        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_error.error_code, 0x4);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+        MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_request.token_count, 1);
+        if (ev.u.subscribe_request.token_count == 1) {
+            MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_request.tokens[0].token_type, 99);
+            MOQ_TEST_CHECK_EQ_SIZE(ev.u.subscribe_request.tokens[0].token_value.len, 0);
+        }
         moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
+        pump_actions_to_peer(sv, c, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(c, &ev, 1), 0);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);

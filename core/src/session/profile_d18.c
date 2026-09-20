@@ -75,6 +75,54 @@ static moq_result_t d18_maybe_complete(moq_session_t *s)
     return MOQ_OK;
 }
 
+static moq_result_t d18_prepare_setup(moq_session_t *s,
+    const moq_auth_token_t *tokens, size_t count,
+    moq_bytes_t authority, moq_bytes_t path)
+{
+    size_t payload = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t n = moq_vi64_len(MOQ_AUTH_TOKEN_USE_VALUE) +
+                   moq_vi64_len(tokens[i].token_type) + tokens[i].token_value.len;
+        payload += 1 + moq_vi64_len(n) + n;
+    }
+    if (authority.len) payload += 1 + moq_vi64_len(authority.len) + authority.len;
+    if (path.len) payload += 1 + moq_vi64_len(path.len) + path.len;
+    if (s->send_auth_token_cache_size)
+        payload += 1 + moq_vi64_len(s->auth_token_cache_size);
+    /* Neutral validation bounds every term and the number of terms. */
+    if (payload > 65535) return MOQ_ERR_BUFFER;
+    size_t wire_len = payload + 2 + moq_vi64_len(MOQ_D18_STREAM_SETUP);
+    /* Preserve deferred buffer failure for historical option-free configs. */
+    if ((count || authority.len || path.len) && wire_len > s->send_cap)
+        return MOQ_ERR_BUFFER;
+    size_t alloc_len = wire_len;
+    uint8_t *wire = s->alloc.alloc(alloc_len, s->alloc.ctx);
+    if (!wire) return MOQ_ERR_NOMEM;
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, wire, wire_len);
+    moq_result_t rc;
+    moq_d18_setup_opts_t opts = {0};
+    opts.has_path = path.len != 0;
+    opts.has_authority = authority.len != 0;
+    opts.has_max_auth_token_cache_size = s->send_auth_token_cache_size;
+    opts.max_auth_token_cache_size = s->auth_token_cache_size;
+    opts.auth_token_count = count;
+    for (size_t i = 0; i < count; ++i) {
+        opts.auth_tokens[i].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+        opts.auth_tokens[i].token_type = tokens[i].token_type;
+        opts.auth_tokens[i].token_value = tokens[i].token_value;
+    }
+    rc = moq_d18_encode_setup_opts_routes(&w, &opts, authority, path);
+    if (rc < 0) goto fail;
+    s->setup_wire = wire;
+    s->setup_wire_len = w.pos;
+    s->setup_wire_alloc = alloc_len;
+    return MOQ_OK;
+fail:
+    s->alloc.free(wire, alloc_len, s->alloc.ctx);
+    return rc;
+}
+
 /*
  * Draft-18 start is valid for both client and server: each opens its own
  * unidirectional control channel and sends SETUP without waiting for the peer.
@@ -2970,6 +3018,7 @@ static const moq_profile_ops_t d18_ops = {
     .state_align             = _Alignof(moq_d18_profile_state_t),
     .init_in_place           = d18_init_in_place,
     .destroy                 = d18_destroy,
+    .prepare_setup          = d18_prepare_setup,
     .start                   = d18_start,
     .process_control_data    = d18_process_control_data,
     .min_track_namespace_fields = 0,
