@@ -292,6 +292,11 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME proxygen_wt_conformance COMMAND test_wt_conformance)
 
     # Managed client facade: config/validation + ABI (no network).
+    add_executable(test_proxygen_setup_auth tests/test_setup_auth.c)
+    target_link_libraries(test_proxygen_setup_auth PRIVATE moq::adapter-proxygen-wt-managed)
+    target_compile_options(test_proxygen_setup_auth PRIVATE -UNDEBUG)
+    add_test(NAME proxygen_setup_auth COMMAND test_proxygen_setup_auth)
+
     add_executable(test_wt_managed tests/test_wt_managed.cpp)
     target_link_libraries(test_wt_managed PRIVATE
         moq::adapter-proxygen-wt-managed proxygen::proxygen)

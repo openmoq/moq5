@@ -296,6 +296,17 @@ typedef struct moq_wtquic_msquic_managed_cfg {
      * policy. */
     const char *const *allowed_origins;
     size_t allowed_origin_count;
+    /* Reserved SETUP credential block. A configured list currently returns
+     * MOQ_ERR_UNSUPPORTED before transport startup. Use the sized initializer;
+     * both fields must fit in struct_size. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
 } moq_wtquic_msquic_managed_cfg_t;
 
 /* How a server path authorizes the client's serialized Origin. Facade-owned:

@@ -475,6 +475,11 @@ int main(void) { return p == 0; }
         # Causal whole-block cfg-ABI gate (no network): an over-read of
         # app_deadline_ctx is a heap-buffer-overflow under the canonical ASan
         # build. Aborts on an oversized offer before dialing.
+    add_executable(test_wtquic_msquic_managed_setup_auth tests/test_wtquic_msquic_managed_setup_auth.c)
+    target_link_libraries(test_wtquic_msquic_managed_setup_auth PRIVATE moq::adapter-wtquic-msquic-managed)
+    target_compile_options(test_wtquic_msquic_managed_setup_auth PRIVATE -UNDEBUG)
+    add_test(NAME wtquic_msquic_managed_setup_auth COMMAND test_wtquic_msquic_managed_setup_auth)
+
         add_executable(test_wtquic_msquic_managed_cfg_abi
             tests/test_wtquic_msquic_managed_cfg_abi.c)
         target_link_libraries(test_wtquic_msquic_managed_cfg_abi PRIVATE
@@ -630,6 +635,11 @@ int main(void) { return p == 0; }
     # wtq::network); no MsQuic server, no certs. Gated on the optional
     # managed target so a tests-on build without it still configures.
     if(TARGET moq-adapter-wtquic-network-managed)
+    add_executable(test_wtquic_network_managed_setup_auth tests/test_wtquic_network_managed_setup_auth.c)
+    target_link_libraries(test_wtquic_network_managed_setup_auth PRIVATE moq::adapter-wtquic-network-managed)
+    target_compile_options(test_wtquic_network_managed_setup_auth PRIVATE -UNDEBUG)
+    add_test(NAME wtquic_network_managed_setup_auth COMMAND test_wtquic_network_managed_setup_auth)
+
         add_executable(test_wtquic_network_managed_cfg_abi
             tests/test_wtquic_network_managed_cfg_abi.c)
         target_link_libraries(test_wtquic_network_managed_cfg_abi PRIVATE

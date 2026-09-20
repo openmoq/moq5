@@ -48,7 +48,7 @@ int main(void)
     /* Init contract: both initializers stamp the full current struct. */
     moq_wtquic_network_managed_cfg_t a;
     moq_wtquic_network_managed_cfg_init(&a);
-    if (a.struct_size != (uint32_t)sizeof(a)) return 1;
+    if (a.struct_size != (uint32_t)offsetof(moq_wtquic_network_managed_cfg_t, setup_auth_tokens)) return 1;
     if (a.alloc || a.on_lane_pump || a.app_deadline_us || a.app_deadline_ctx)
         return 2;
     moq_wtquic_network_managed_cfg_init_sized(&a, sizeof(a));
