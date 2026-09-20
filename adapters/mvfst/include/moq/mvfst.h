@@ -215,6 +215,19 @@ typedef struct moq_mvfst_managed_cfg {
      * moq_mvfst_managed_cfg_init_sized(). */
     uint64_t            (*app_deadline_us)(void *ctx);
     void                 *app_deadline_ctx;
+    /* SETUP credentials are copied before create returns. Use the sized
+     * initializer to enable this append-only block. Both list fields must
+     * fit in struct_size. No configured credential is silently omitted. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
+    moq_bytes_t setup_authority; /* raw-QUIC client route, copied */
+    moq_bytes_t setup_path;
 } moq_mvfst_managed_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the

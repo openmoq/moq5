@@ -18,6 +18,7 @@
 #include <moq/transport_bridge.h>
 #include <moq/rcbuf.h>
 #include "mvfst_endpoint_ops.h"
+#include "../../common/moq_setup_auth.h"
 #include "../../common/moq_alpn.h"  /* moq_alpn_to_version / _for_version */
 
 #include <quic/api/QuicSocket.h>
@@ -244,6 +245,8 @@ private:
 static constexpr size_t MOQ_MVFST_DEFAULT_MAX_CONNECTIONS = 1024;
 
 struct moq_mvfst_managed {
+    moq_managed_setup_t setup{};
+    ~moq_mvfst_managed() { moq_managed_setup_clear(&setup, &alloc); }
     moq_alloc_t alloc;
     moq_session_cfg_t session_cfg;
     std::string host;
@@ -798,6 +801,19 @@ moq_result_t moq_mvfst_managed_create(
         new (m) moq_mvfst_managed_t();
         constructed = true;
         m->alloc = *alloc;
+        moq_bytes_t authority{}, path{};
+        if (CFG_HAS(cfg, setup_authority)) authority = cfg->setup_authority;
+        if (CFG_HAS(cfg, setup_path)) path = cfg->setup_path;
+        moq_result_t setup_rc = moq_managed_setup_copy(&m->setup, alloc,
+            CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_tokens : nullptr,
+            CFG_HAS(cfg, setup_auth_token_count) ? cfg->setup_auth_token_count : 0,
+            authority, path, persp);
+        if (setup_rc != MOQ_OK) {
+            m->~moq_mvfst_managed_t();
+            alloc->free(m, sizeof(*m), alloc->ctx);
+            return setup_rc;
+        }
+
         m->perspective = persp;
         if (host) m->host = host;
         m->port = port;
@@ -825,6 +841,7 @@ moq_result_t moq_mvfst_managed_create(
         m->lane.index = 0;
 
         moq_session_cfg_init_sized(&m->session_cfg, sizeof(m->session_cfg), &m->alloc, persp);
+        moq_managed_setup_apply(&m->setup, &m->session_cfg);
         m->session_cfg.version = version;   /* exact version (16 == default) */
         if (CFG_HAS(cfg, send_request_capacity)) m->session_cfg.send_request_capacity = cfg->send_request_capacity;
         if (CFG_HAS(cfg, initial_request_capacity)) m->session_cfg.initial_request_capacity = cfg->initial_request_capacity;
@@ -835,6 +852,12 @@ moq_result_t moq_mvfst_managed_create(
         if (CFG_HAS(cfg, send_buffer_size) && cfg->send_buffer_size) m->session_cfg.send_buffer_size = cfg->send_buffer_size;
         if (CFG_HAS(cfg, recv_buffer_size) && cfg->recv_buffer_size) m->session_cfg.recv_buffer_size = cfg->recv_buffer_size;
         if (CFG_HAS(cfg, goaway_timeout_us) && cfg->goaway_timeout_us) m->session_cfg.goaway_timeout_us = cfg->goaway_timeout_us;
+        setup_rc = moq_managed_setup_preflight(&m->session_cfg);
+        if (setup_rc != MOQ_OK) {
+            m->~moq_mvfst_managed_t();
+            alloc->free(m, sizeof(*m), alloc->ctx);
+            return setup_rc;
+        }
     } catch (...) {
         if (constructed) m->~moq_mvfst_managed_t();
         alloc->free(m, sizeof(*m), alloc->ctx);
