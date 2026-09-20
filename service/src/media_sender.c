@@ -380,6 +380,8 @@ struct moq_media_sender {
     bool              ready;
     bool              fatal;
     uint64_t          fatal_code;
+    bool              has_peer_request_error;
+    moq_request_error_t peer_request_error;
 
     /* Latches so on_ready / on_closed each fire at most once (network thread). */
     bool              ready_fired;
@@ -2363,8 +2365,14 @@ static void sender_resync_demand(moq_media_sender_t *s)
 static void sender_pub_on_publish_error(void *ctx, moq_pub_track_t *track,
                                         moq_request_error_t error_code)
 {
-    (void)track; (void)error_code;
+    (void)track;
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    pthread_mutex_lock(&s->mu);
+    if (!s->has_peer_request_error) {
+        s->has_peer_request_error = true;
+        s->peer_request_error = error_code;
+    }
+    pthread_mutex_unlock(&s->mu);
     sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_PUBLISH_REJECTED);
 }
 
@@ -2378,6 +2386,12 @@ static void sender_pub_on_namespace_terminal(void *ctx,
     uint64_t code = (info->kind == MOQ_PUB_NAMESPACE_CANCELLED)
         ? MOQ_MEDIA_SENDER_FATAL_NAMESPACE_CANCELLED
         : MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED;
+    pthread_mutex_lock(&s->mu);
+    if (info->kind == MOQ_PUB_NAMESPACE_REJECTED && !s->has_peer_request_error) {
+        s->has_peer_request_error = true;
+        s->peer_request_error = info->error_code;
+    }
+    pthread_mutex_unlock(&s->mu);
     sender_set_fatal(s, code);
 }
 
@@ -4525,6 +4539,18 @@ bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s)
     }
     pthread_mutex_unlock(&ms->mu);
     return any;
+}
+
+bool moq_media_sender_peer_request_error(const moq_media_sender_t *s,
+                                         moq_request_error_t *error)
+{
+    if (!s || !error) return false;
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    pthread_mutex_lock(&ms->mu);
+    bool present = ms->has_peer_request_error;
+    if (present) *error = ms->peer_request_error;
+    pthread_mutex_unlock(&ms->mu);
+    return present;
 }
 
 bool moq_media_sender_is_closed(const moq_media_sender_t *s)

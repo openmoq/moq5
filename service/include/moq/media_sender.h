@@ -723,6 +723,11 @@ MOQ_API bool moq_media_sender_track_is_published(
 MOQ_API bool     moq_media_sender_is_closed(const moq_media_sender_t *s);
 MOQ_API bool     moq_media_sender_is_fatal(const moq_media_sender_t *s);
 MOQ_API uint64_t moq_media_sender_fatal_code(const moq_media_sender_t *s);
+/* Peer error for a rejected namespace or catalog/media publication. Returns
+ * false until one is recorded (also for NULL arguments); does not expose peer
+ * reason text or credentials. This is separate from the sender-fatal code. */
+MOQ_API bool moq_media_sender_peer_request_error(const moq_media_sender_t *s,
+                                                moq_request_error_t *error);
 
 /* Sender-fatal codes (moq_media_sender_fatal_code). */
 #define MOQ_MEDIA_SENDER_FATAL_AUTHORIZATION    0x6u /* credential source denied */
