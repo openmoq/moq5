@@ -10,6 +10,7 @@
 #include <moq/control_d18.h>
 #include <moq/sim.h>
 #include "test_support.h"
+#include <stdlib.h>
 #include "../../core/src/session/session_internal.h"
 
 /* -- Codec round-trips and malformed rejection --------------------- */
@@ -390,10 +391,140 @@ static bool drain_request_error(moq_session_t *s, moq_stream_ref_t ref,
     return seen;
 }
 
+
+/* Configured client/server SETUP is copied before startup. Exercise both wire
+ * profiles with real action delivery, including credentials beyond 256 bytes. */
+static int test_owned_setup(void)
+{
+    int failures = 0;
+    for (unsigned draft = 0; draft < 2; ++draft) {
+        moq_version_t version = draft ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
+        uint8_t *value = malloc(1024);
+        MOQ_TEST_CHECK(value != NULL);
+        if (!value) continue;
+        for (size_t i = 0; i < 1024; ++i) value[i] = (uint8_t)i;
+        uint8_t authority[] = "relay.example:4433";
+        uint8_t path[] = "/moq";
+        moq_auth_token_t tokens[] = {{16, {value, 1024}},
+                                    {1, MOQ_BYTES_LITERAL("client-cat")},
+                                    {16, {NULL, 0}}};
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        cfg.version = version;
+        cfg.setup_auth_tokens = tokens; cfg.setup_auth_token_count = 3;
+        cfg.setup_authority = (moq_bytes_t){authority, sizeof(authority)-1};
+        cfg.setup_path = (moq_bytes_t){path, sizeof(path)-1};
+        cfg.send_request_capacity = true; cfg.initial_request_capacity = 128;
+        cfg.send_auth_token_cache_size = true; cfg.auth_token_cache_size = 128;
+        moq_session_t *peers[2] = {NULL, NULL};
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &peers[0]) == MOQ_OK);
+        if (!peers[0]) { free(value); continue; }
+        size_t exact = peers[0]->setup_wire_len;
+        /* The complete frame, including route and cache/request options, is
+         * accepted at exactly the budget and refused one byte below it. */
+        cfg.send_buffer_size = (uint32_t)exact;
+        moq_session_t *boundary = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &boundary) == MOQ_OK);
+        moq_session_destroy(boundary); boundary = NULL;
+        cfg.send_buffer_size--;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &boundary) == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(boundary == NULL);
+        cfg.send_buffer_size = 4096;
+        cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &boundary) == MOQ_ERR_INVAL);
+        cfg.setup_authority = (moq_bytes_t){0}; cfg.setup_path = (moq_bytes_t){0};
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &peers[1]) == MOQ_OK);
+        memset(value, 0xcc, 1024); free(value);
+        memset(tokens, 0xff, sizeof(tokens));
+        memset(authority, 0xee, sizeof(authority)); memset(path, 0xdd, sizeof(path));
+        MOQ_TEST_CHECK(moq_session_start(peers[0], 0) == MOQ_OK);
+        if (draft) MOQ_TEST_CHECK(moq_session_start(peers[1], 0) == MOQ_OK);
+        for (size_t side = 0; side < 2; ++side) {
+            moq_action_t a;
+            bool captured = false;
+            while (moq_session_poll_actions(peers[side], &a, 1) == 1) {
+                const uint8_t *wire = NULL; size_t len = 0;
+                if (a.kind == MOQ_ACTION_SEND_CONTROL) {
+                    wire = a.u.send_control.data; len = a.u.send_control.len;
+                } else if (a.kind == MOQ_ACTION_OPEN_UNI_CONTROL) {
+                    wire = a.u.open_uni_control.data; len = a.u.open_uni_control.len;
+                }
+                if (wire) {
+                    captured = true;
+                    moq_buf_reader_t r; moq_control_envelope_t env;
+                    moq_buf_reader_init(&r, wire, len);
+                    MOQ_TEST_CHECK((draft ? moq_d18_decode_envelope(&r, &env) :
+                        moq_control_decode_envelope(&r, &env)) == MOQ_OK);
+                    bool got_path = false, got_authority = false;
+                    if (draft) {
+                        moq_buf_reader_init(&r, env.payload, env.payload_len);
+                        uint64_t type = 0, delta, n;
+                        while (moq_buf_reader_remaining(&r)) {
+                            MOQ_TEST_CHECK(moq_buf_read_vi64(&r, &delta) == MOQ_OK);
+                            type += delta;
+                            MOQ_TEST_CHECK(moq_buf_read_vi64(&r, &n) == MOQ_OK);
+                            if (!(type & 1)) continue;
+                            if (type == 1) {
+                                got_path = true;
+                                MOQ_TEST_CHECK(n == 4 && memcmp(r.data + r.pos, "/moq", 4) == 0);
+                            }
+                            if (type == 5) {
+                                got_authority = true;
+                                MOQ_TEST_CHECK(n == 18 && memcmp(r.data + r.pos, "relay.example:4433", 18) == 0);
+                            }
+                            r.pos += (size_t)n;
+                        }
+                    } else {
+                        moq_kvp_entry_t kv[16];
+                        moq_d16_setup_t setup = {.params=kv, .params_cap=16};
+                        MOQ_TEST_CHECK(moq_d16_decode_client_setup(env.payload, env.payload_len, &setup) == MOQ_OK);
+                        for (size_t i = 0; i < setup.params_count; ++i) {
+                            if (kv[i].type == 1) {
+                                got_path = true;
+                                MOQ_TEST_CHECK(kv[i].value_len == 4 && memcmp(kv[i].value, "/moq", 4) == 0);
+                            }
+                            if (kv[i].type == 5) {
+                                got_authority = true;
+                                MOQ_TEST_CHECK(kv[i].value_len == 18 && memcmp(kv[i].value, "relay.example:4433", 18) == 0);
+                            }
+                        }
+                    }
+                    MOQ_TEST_CHECK(got_path == (side == 0));
+                    MOQ_TEST_CHECK(got_authority == (side == 0));
+                    MOQ_TEST_CHECK(moq_session_on_control_bytes(peers[1-side], wire, len, 0) == MOQ_OK);
+                }
+                moq_action_cleanup(&a);
+            }
+            MOQ_TEST_CHECK(captured);
+        }
+        for (size_t side = 0; side < 2; ++side) {
+            moq_event_t e;
+            MOQ_TEST_CHECK(moq_session_state(peers[side]) == MOQ_SESS_ESTABLISHED);
+            MOQ_TEST_CHECK(moq_session_poll_events(peers[side], &e, 1) == 1);
+            MOQ_TEST_CHECK(e.kind == MOQ_EVENT_SETUP_COMPLETE);
+            MOQ_TEST_CHECK(e.u.setup_complete.token_count == 3);
+            if (e.u.setup_complete.token_count == 3) {
+                const moq_resolved_token_t *t = e.u.setup_complete.tokens;
+                MOQ_TEST_CHECK(t[0].token_type == 16 && t[0].token_value.len == 1024);
+                for (size_t i = 0; i < t[0].token_value.len; ++i)
+                    MOQ_TEST_CHECK(t[0].token_value.data[i] == (uint8_t)i);
+                MOQ_TEST_CHECK(t[1].token_type == 1 && t[1].token_value.len == 10);
+                MOQ_TEST_CHECK(memcmp(t[1].token_value.data, "client-cat", 10) == 0);
+                MOQ_TEST_CHECK(t[2].token_type == 16 && t[2].token_value.len == 0);
+            }
+            moq_event_cleanup(&e);
+            moq_session_destroy(peers[side]);
+        }
+    }
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
     failures += test_codec();
+    failures += test_owned_setup();
 
     /* == Incoming SETUP preserves an opaque binary token ============== */
     {

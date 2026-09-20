@@ -184,47 +184,9 @@ static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
                                                 const moq_setup_params_t *local,
                                                 bool is_client)
 {
-    uint8_t buf[256];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-
-    moq_kvp_entry_t params[4];
-    size_t param_count = 0;
-
-    uint8_t vbuf[8];
-    if (local->has_max_request_id) {
-        size_t vlen = moq_quic_varint_encode(local->max_request_id,
-                                              vbuf, sizeof(vbuf));
-        params[param_count].type      = MOQ_SETUP_PARAM_MAX_REQUEST_ID;
-        params[param_count].value     = vbuf;
-        params[param_count].value_len = vlen;
-        params[param_count].is_varint = true;
-        params[param_count].raw       = NULL;
-        params[param_count].raw_len   = 0;
-        param_count++;
-    }
-
-    uint8_t vbuf2[8];
-    if (local->has_max_auth_token_cache_size) {
-        size_t vlen = moq_quic_varint_encode(local->max_auth_token_cache_size,
-                                              vbuf2, sizeof(vbuf2));
-        params[param_count].type      = MOQ_SETUP_PARAM_MAX_AUTH_TOKEN_CACHE_SIZE;
-        params[param_count].value     = vbuf2;
-        params[param_count].value_len = vlen;
-        params[param_count].is_varint = true;
-        params[param_count].raw       = NULL;
-        params[param_count].raw_len   = 0;
-        param_count++;
-    }
-
-    moq_result_t rc;
-    if (is_client)
-        rc = moq_d16_encode_client_setup(&w, params, param_count);
-    else
-        rc = moq_d16_encode_server_setup(&w, params, param_count);
-    if (rc < 0) return rc;
-
-    return queue_send_control(s, buf, moq_buf_writer_offset(&w));
+    (void)local;
+    (void)is_client;
+    return queue_send_control(s, s->setup_wire, s->setup_wire_len);
 }
 
 /* -- D16 setup complete event -------------------------------------- */

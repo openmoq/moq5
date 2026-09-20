@@ -85,22 +85,9 @@ static moq_result_t d18_start(moq_session_t *s)
     if (s->state != MOQ_SESS_IDLE)
         return MOQ_ERR_WRONG_STATE;
 
-    uint8_t buf[32];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-    /* Advertise the auth-token cache size when configured (§10.3.1.3) so the
-     * peer may register aliases; no other Setup Option is sourced yet. */
-    moq_d18_setup_opts_t opts;
-    memset(&opts, 0, sizeof(opts));
-    if (s->send_auth_token_cache_size) {
-        opts.has_max_auth_token_cache_size = true;
-        opts.max_auth_token_cache_size = s->auth_token_cache_size;
-    }
-    moq_result_t rc = moq_d18_encode_setup_opts(&w, &opts);
-    if (rc < 0) return rc;
-
     moq_stream_ref_t ref = moq_stream_ref_from_u64(s->next_stream_ref);
-    rc = queue_open_uni_control(s, ref, buf, moq_buf_writer_offset(&w));
+    moq_result_t rc = queue_open_uni_control(s, ref, s->setup_wire,
+                                            s->setup_wire_len);
     if (rc < 0) return rc;
     s->next_stream_ref++;
 

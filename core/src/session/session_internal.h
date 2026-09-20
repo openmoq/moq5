@@ -9,6 +9,8 @@
 #include "session_transport.h"
 #include <string.h>
 
+moq_result_t session_prepare_setup(moq_session_t *s, const moq_session_cfg_t *cfg);
+
 /* -- Defaults ------------------------------------------------------ */
 
 #define MOQ_DEFAULT_MAX_ACTIONS      64
@@ -1495,6 +1497,9 @@ struct moq_session {
 
     uint8_t      *send_buf;
     size_t        send_cap;
+    uint8_t      *setup_wire;
+    size_t        setup_wire_len;
+    size_t        setup_wire_alloc;
     size_t        send_len;
 
     moq_action_t *actions;

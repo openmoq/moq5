@@ -2,6 +2,7 @@
 #include "test_oom_support.h"
 #include "../../core/src/session/session_internal.h"
 #include <string.h>
+#include <moq/control_d18.h>
 
 /* -- Helper: build CLIENT_SETUP with AUTH_TOKEN params --------------- */
 
@@ -83,6 +84,85 @@ static moq_result_t feed_server_setup_with_tokens(
 int main(void)
 {
     int failures = 0;
+
+    /* Every byte-truncated additive tail is read only through complete fields.
+     * malloc gives ASan an exact old-caller allocation, including padding. */
+    {
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        cfg.setup_auth_tokens = (const moq_auth_token_t *)(uintptr_t)1;
+        cfg.setup_authority.data = (const uint8_t *)(uintptr_t)1;
+        cfg.setup_path.data = (const uint8_t *)(uintptr_t)1;
+        size_t historical = offsetof(moq_session_cfg_t, setup_auth_tokens);
+        memset((uint8_t *)&cfg + offsetof(moq_session_cfg_t, reserved_setup_padding),
+               0xa5, sizeof(cfg.reserved_setup_padding));
+        for (size_t n = historical; n <= sizeof(cfg); ++n) {
+            moq_session_cfg_t *prefix = malloc(n);
+            memcpy(prefix, &cfg, n); prefix->struct_size = (uint32_t)n;
+            moq_session_t *session = NULL;
+            MOQ_TEST_CHECK(moq_session_create(prefix, 0, &session) == MOQ_OK);
+            free(prefix);
+            MOQ_TEST_CHECK(moq_session_start(session, 0) == MOQ_OK);
+            moq_session_destroy(session);
+        }
+        struct { moq_session_cfg_t cfg; uint8_t canary[16]; } future;
+        memset(&future, 0xa5, sizeof(future)); future.cfg = cfg;
+        future.cfg.struct_size = sizeof(future);
+        moq_session_t *session = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&future.cfg, 0, &session) == MOQ_OK);
+        moq_session_destroy(session);
+        for (size_t i = 0; i < sizeof(future.canary); ++i)
+            MOQ_TEST_CHECK(future.canary[i] == 0xa5);
+
+        /* Partial count must not turn a valid pointer into a token read. */
+        cfg.setup_auth_token_count = SIZE_MAX;
+        cfg.struct_size = offsetof(moq_session_cfg_t, setup_auth_token_count) +
+                          sizeof(cfg.setup_auth_token_count) - 1;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_OK);
+        moq_session_destroy(session); session = NULL;
+        cfg.struct_size = sizeof(cfg);
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_ERR_INVAL);
+        cfg.setup_auth_token_count = 1; cfg.setup_auth_tokens = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_ERR_INVAL);
+        moq_auth_token_t token = {MOQ_QUIC_VARINT_MAX + 1, {NULL, 0}};
+        cfg.setup_auth_tokens = &token;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_ERR_INVAL);
+        token.token_type = 16; token.token_value = (moq_bytes_t){(const uint8_t *)1, SIZE_MAX};
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_ERR_BUFFER);
+        token.token_value = (moq_bytes_t){NULL, 1};
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_ERR_INVAL);
+        cfg.setup_auth_token_count = 0;
+        cfg.setup_path.len = SIZE_MAX;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &session) == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(session == NULL);
+    }
+    /* A caller may release token memory as soon as create returns. */
+    {
+        moq_session_cfg_t c;
+        moq_session_cfg_init_sized(&c, sizeof(c), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        uint8_t bytes[1024]; memset(bytes, 0xa5, sizeof(bytes)); bytes[4] = 0;
+        moq_auth_token_t token = {16, {bytes, sizeof(bytes)}};
+        c.setup_auth_tokens = &token; c.setup_auth_token_count = 1;
+        moq_session_t *client = NULL, *server = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&c, 0, &client) == MOQ_OK);
+        memset(bytes, 0xcc, sizeof(bytes));
+        moq_session_cfg_t sc = MOQ_SESSION_CFG_INIT;
+        sc.alloc = moq_alloc_default(); sc.perspective = MOQ_PERSPECTIVE_SERVER;
+        MOQ_TEST_CHECK(moq_session_create(&sc, 0, &server) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_start(client, 0) == MOQ_OK);
+        pump_actions_to_peer(client, server, 0);
+        moq_event_t event;
+        MOQ_TEST_CHECK(moq_session_poll_events(server, &event, 1) == 1);
+        MOQ_TEST_CHECK(event.u.setup_complete.token_count == 1);
+        if (event.u.setup_complete.token_count == 1) {
+            MOQ_TEST_CHECK(event.u.setup_complete.tokens[0].token_value.len == 1024);
+            MOQ_TEST_CHECK(event.u.setup_complete.tokens[0].token_value.data[4] == 0);
+        }
+        moq_session_destroy(client); moq_session_destroy(server);
+    }
+
 
     /* == 1. Default max=0: REGISTER downgrades, token in event, cache empty */
     {
