@@ -190,9 +190,9 @@ backend parity.
 
 **Interface:** map `cat4moq::Credential` to raw `moq_auth_token_t`, and its resource provider to `moq_auth_select_fn`. Setup remains separately selected in MoQXR. Catch all C++ exceptions before returning through the C callback and retain byte ownership under the service contract.
 
-- [ ] Change existing fail-before-I/O tests to assert capture of selected tokens for batch, stdin, SRT and live-object paths when the new API is available. Keep fail-before-I/O expectations when building against an older libmoq or unsupported backend. Add a failure from each provider action and assert terminal error propagation.
-- [ ] Implement mapping guarded by `MOQ_SERVICE_AUTH_API_VERSION`. Profile determines the default type (1 or 16); explicit overrides survive unchanged. Legacy `AuthorizationToken` inputs are already encoded envelopes: strictly decode supported USE_VALUE forms for the selected draft, or keep a clear unsupported error before I/O for other forms. Never nest an envelope inside a new token or drop it.
-- [ ] Build MoQXR with the actual dependency selected:
+- [x] Capture selected setup/request tokens in the shared MoQXR authorization bridge for both drafts and all profiles. Verify batch, stdin, SRT and live-object paths use this same bridge; retain fail-before-I/O expectations with older libmoq. Exercise provider failures and terminal error propagation. Live authenticated media validation covers stdin; distinct positive captures for the other three input paths remain additional coverage.
+- [x] Implement mapping guarded by `MOQ_SERVICE_AUTH_API_VERSION`. Profile determines the default type (1 or 16); explicit overrides survive unchanged. Legacy `AuthorizationToken` inputs are already encoded envelopes: strictly decode supported USE_VALUE forms for the selected draft, or keep a clear unsupported error before I/O for other forms. Never nest an envelope inside a new token or drop it.
+- [x] Build MoQXR with the actual dependency selected:
 
   ```sh
   cmake -S ../moqxr -B ../moqxr/build-libmoq-cat4moq \
@@ -201,12 +201,13 @@ backend parity.
   cmake --build ../moqxr/build-libmoq-cat4moq -j4
   ctest --test-dir ../moqxr/build-libmoq-cat4moq --output-on-failure
   python3 ../moqxr/scripts/test-cat4moq-interop.py \
+    --targets moqx --publisher-backend libmoq \
     --publisher ../moqxr/build-libmoq-cat4moq/openmoq-publisher
   ```
 
   Run from the moq5 root. Record backend, transport/draft, relay revisions, issuer/validator decisions and measured subscriber catalog/media bytes. Add a WebTransport publisher run when supported; raw-QUIC publishing plus a WebTransport subscriber does not prove WebTransport publisher support.
-- [ ] Run signed negative cases (tamper, expiry, wrong namespace/action/track, profile mismatch). Prove publisher rejection independently of subscriber failure. Force a PUBLISH request for PUBLISH-action tests; namespace-only subscriber-initiated flow is valid without it. Run C4M-01 byte/claim vectors against a controlled verifier fixture; current legacy relay acceptance is not required for type 1.
-- [ ] Run the appropriate full moq5 suites, `git diff --check`, and a C++ review of changed adapters/wrappers. Report missing platform/backend coverage explicitly. Commit each repository independently with exact dependency requirements and no generated author tagline.
+- [x] Run signed negative cases (tamper, expiry, wrong namespace/action/track, profile mismatch). Prove publisher rejection independently of subscriber failure. Force a PUBLISH request for PUBLISH-action tests; namespace-only subscriber-initiated flow is valid without it. Run C4M-01 byte/claim vectors against a controlled verifier fixture; current legacy relay acceptance is not required for type 1.
+- [x] Run the appropriate full moq5 suites, `git diff --check`, and a C++ review of changed adapters/wrappers. Report missing platform/backend coverage explicitly. Commit each repository independently with exact dependency requirements and no generated author tagline.
 
 ## Review gates
 
@@ -215,3 +216,93 @@ consumes their APIs. Tasks 5 and 6 depend on Task 4 and can be reviewed separate
 Task 7 closes the managed-client milestone. The
 [relay plan](2026-09-20-cat4moq-relay.md) is separately deliverable and is not a
 prerequisite for current moqx/Red5 compatibility tests.
+
+## Execution results (2026-09-20)
+
+The managed client implementation advertises `MOQ_SERVICE_AUTH_API_VERSION 1`
+in `35b3d31`. Core and services carry opaque credentials; verification remains
+the separate relay milestone. Endpoint selection runs before I/O, and sender/
+receiver selectors use the actual namespace and track request. Sized config
+initializers preserve historical callers. Peer refusal codes are available via
+`moq_media_sender_peer_request_error()` without exposing peer reason text.
+
+### Validation and backend scope
+
+- Core/service ASan+UBSan: **152/152**, leak detection disabled. Log:
+  `/tmp/moq5-service-final-tests.log`.
+- Raw picoquic/PicoWT SETUP and endpoint auth sanitizer fixtures: **3/3**.
+  Log: `/tmp/moq5-endpoint-final-tests.log`. Runtime peer capture also passed
+  for raw MsQuic, including both drafts and asymmetric 16 KiB SETUP credentials.
+  Caller-byte mutation, allocation failures and old/truncated configurations
+  are covered. Endpoint-only source/lifecycle/resolve/handshake/post tests pass.
+- Broader picoquic/PicoWT regressions: **49/53**; raw MsQuic: **29/31**. All six
+  failures reproduce with baseline adapters matching `efc596c`:
+  `pico_wt_capsule_sequence` (chunk 36/parser crash), `pico_wt_d18` (announce
+  expectation), `pico_wt_rx_lifecycle` (pending receive),
+  `pico_wt_managed_close` (clean close incomplete),
+  `msquic_managed_shared_link` and `msquic_pinned_fail_closed` (nested consumer
+  links missing `QuicAddr*` functions). Logs:
+  `/tmp/managed-regressions-final.log`,
+  `/tmp/managed-msquic-regressions-final.log`; baseline logs:
+  `/tmp/managed-baseline-tests.log`, `/tmp/managed-baseline-close-tests.log`,
+  `/tmp/managed-baseline-msquic-tests.log`. These suites are not clean.
+- Raw mvfst owns and forwards credentials, but build/runtime validation is
+  blocked by the installed Fizz `OpenSSLCertificateVerifier` constructor API.
+  Proxygen WT and both WTquic facades explicitly reject configured credentials
+  before I/O. Those runtime dependencies and Apple CI were unavailable.
+- Large credentials above cover SETUP. Existing draft-18 per-request receive
+  buffers remain capped at 4096 bytes. The service's 16 KiB input limit is not
+  a guarantee that every action credential of that size is accepted.
+- Coordinated MoQXR build with the actual feature header: **24/24 CTests**.
+  Its adapter and translation tests also compile against old `c2900aa` headers.
+  Unit captures validate both drafts, all profiles, legacy envelope unwrapping,
+  binary ownership, actual provider resources and terminal failures. All four
+  input routes share this mapping; authenticated live media tests use stdin.
+- Controlled type-1 C4M-01 fixture: **18 MAC/type/claim decisions**, using private
+  labels -65537/-65538. Current issuer/Red5-validator fixtures: **30 decisions**.
+  Neither constitutes production C4M-01 relay support or secure peering.
+
+### Implementation decisions
+
+The requested existing `feature/cat4moq` checkout was retained because it had
+only this task's plans. Independent source-helper and sender work proceeded
+alongside isolated task implementations without overlapping files. The client
+milestone precedes the separately planned relay verifier. The unsized draft-18
+SETUP decoder-options layout remains unchanged; an additive encoder API carries
+routes. Shared MoQXR mapping tests and inspected call sites cover all four input
+routes, with real authenticated media coverage limited to stdin. These choices
+avoid an ABI break and keep the backend/runtime coverage boundaries explicit.
+
+
+### Final managed relay matrix
+
+The selected topologies passed **60/60 cases**: ten cases for each of moqx,
+Red5 `moqx` and Red5 `cose`, over both raw-QUIC and WebTransport publishing,
+transport draft 18. Subscribers used WebTransport: full Playa player for moqx,
+and Playa connection API for Red5. Each positive media case received video
+initialization (790 bytes), audio initialization (728 bytes), video groups 0/1
+(150,593 bytes), and audio groups 0/1 (17,791 bytes). Each topology also accepted
+both explicit PUBLISH requests. All eight denial cases per topology independently
+rejected the publisher and observed no catalog/media for eight seconds.
+
+| Publisher transport | Subscriber API and selected targets | Selected cases | Artifacts |
+| --- | --- | --- | --- |
+| Raw QUIC | Player, moqx | 10/10 | `/tmp/cat4moq-interop-mhkpxba7` |
+| WebTransport | Player, moqx | 10/10 | `/tmp/cat4moq-interop-tevsvrbf` |
+| Raw QUIC | Connection, both Red5 profiles | 20/20 | `/tmp/cat4moq-interop-5nuppi7o` |
+| WebTransport | Connection, both Red5 profiles | 20/20 | `/tmp/cat4moq-interop-d1lev_5v` |
+
+The last two runs also tried moqx in connection mode: wrong-action/wrong-track
+observations failed on each transport with an upstream-session-closed request
+error. Those combined runs exited 1 and are not clean all-target runs. Their
+Red5 cases passed individually; the separate moqx player runs exited 0. The
+connection fixture accepts only catalog-absent code 16 as retryable, preserving
+other errors as failed observation rather than evidence of authorization denial.
+
+Revisions: moqx `e988f967`, Red5 `43d1e97`, Playa `7b41d74`, moq5 `35b3d31`.
+The publisher was MoQXR `8a69380` plus this integration change; tested binary
+SHA-256 `c93f528249208972148d916d400e53537572be36a1d24fc2153174c8b96c6a23`.
+The type-1 fixture passed 18 decisions and current issuers passed 30 decisions.
+These are client compatibility and transport-delivery results, not production
+C4M-01 verification, authenticated SRT delivery, rendered frames or secure peering.
+Player routing loss is filed as [moq-playa #17](https://github.com/openmoq/moq-playa/issues/17).
