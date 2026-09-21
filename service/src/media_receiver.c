@@ -453,7 +453,17 @@ enum {
     MOQ_MR_WRITER_PRE  = 0,
     MOQ_MR_WRITER_POST = 1,
     MOQ_MR_READER_PRE  = 2,
-    MOQ_MR_READER_POST = 3
+    MOQ_MR_READER_POST = 3,
+    /* Live->VOD descriptor writer (receiver_reconcile): PRE before the first
+     * mutable-scalar write, POST after the last, before the intended unlock.
+     * Observation only: it neither locks nor changes the write. */
+    MOQ_MR_VOD_WRITER_PRE  = 4,
+    MOQ_MR_VOD_WRITER_POST = 5,
+    /* Description copy reader (moq_media_receiver_track_desc_copy): PRE after
+     * the argument checks, before the ownership walk; POST after the copy,
+     * before the intended unlock. */
+    MOQ_MR_DESC_READER_PRE  = 6,
+    MOQ_MR_DESC_READER_POST = 7
 };
 static void (*g_pub_phase_hook)(const moq_media_receiver_t *r, int phase,
                                 void *ctx);
@@ -1162,9 +1172,18 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
             if (mt->is_live != live->desc.is_live ||
                 mt->has_track_duration != live->desc.has_track_duration ||
                 mt->track_duration_ms != live->desc.track_duration_ms) {
+                /* The three writes are the only in-place mutation of a
+                 * published description; they are serialized against
+                 * moq_media_receiver_track_desc_copy() by r->mu so a copy
+                 * never observes a torn triple. rq_push takes r->mu itself,
+                 * so the event is queued after the unlock. */
+                pthread_mutex_lock(&r->mu);
+                PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_PRE);
                 live->desc.is_live = mt->is_live;
                 live->desc.has_track_duration = mt->has_track_duration;
                 live->desc.track_duration_ms = mt->track_duration_ms;
+                PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_POST);
+                pthread_mutex_unlock(&r->mu);
                 if (!rq_push(r, MOQ_MEDIA_TRACK_UPDATED, live))
                     return MOQ_OK;   /* overflow already terminalized */
             }
@@ -2672,6 +2691,64 @@ void moq_media_receiver_cfg_init_flow_control(moq_media_receiver_cfg_t *cfg)
 
 /* -- Construction -------------------------------------------------------- */
 
+#ifdef MOQ_MEDIA_RECEIVER_TESTING
+/* Test-only allocator injection for construction-arithmetic oracles: lets a
+ * counting/refusing allocator observe every request receiver_new makes, in
+ * order, and refuse a nominated one. NULL restores the default. Never compiled
+ * into the shipping library. */
+static const moq_alloc_t *g_test_alloc;
+void moq_media_receiver_test_set_alloc(const moq_alloc_t *alloc);
+void moq_media_receiver_test_set_alloc(const moq_alloc_t *alloc)
+{
+    g_test_alloc = alloc;
+}
+void moq_media_receiver_test_entry_sizes(size_t *event_entry, size_t *obj_entry);
+void moq_media_receiver_test_entry_sizes(size_t *event_entry, size_t *obj_entry)
+{
+    if (event_entry) *event_entry = sizeof(receiver_event_t);
+    if (obj_entry)   *obj_entry   = sizeof(receiver_obj_entry_t);
+}
+#define RECEIVER_CTOR_ALLOC() (g_test_alloc ? g_test_alloc : moq_alloc_default())
+/* Test-only endpoint boundary for the owning constructor: a counting /
+ * refusing stand-in for moq_endpoint_connect, so the owning path's ordering
+ * (preflight before any connect) is observable without an adapter. NULL
+ * restores the real call. */
+static moq_result_t (*g_test_connect)(const moq_endpoint_cfg_t *, moq_endpoint_t **, void *);
+static void *g_test_connect_ctx;
+void moq_media_receiver_test_set_connect(
+    moq_result_t (*fn)(const moq_endpoint_cfg_t *, moq_endpoint_t **, void *), void *ctx);
+void moq_media_receiver_test_set_connect(
+    moq_result_t (*fn)(const moq_endpoint_cfg_t *, moq_endpoint_t **, void *), void *ctx)
+{
+    g_test_connect = fn;
+    g_test_connect_ctx = ctx;
+}
+#define RECEIVER_CONNECT(cfg, out) \
+    (g_test_connect ? g_test_connect((cfg), (out), g_test_connect_ctx) \
+                    : moq_endpoint_connect((cfg), (out)))
+/* Test-only pre-traversal observation for configuration validation: called
+ * with the namespace part count immediately before the parts are walked.
+ * Returning false stops validation with MOQ_ERR_INVAL, which keeps a fixture
+ * with an intrinsically unrepresentable count bounded (no element is read)
+ * while still recording that the walk was about to start. NULL disables. */
+static bool (*g_test_parts_walk)(size_t count, void *ctx);
+static void *g_test_parts_walk_ctx;
+void moq_media_receiver_test_set_parts_walk_hook(bool (*fn)(size_t, void *), void *ctx);
+void moq_media_receiver_test_set_parts_walk_hook(bool (*fn)(size_t, void *), void *ctx)
+{
+    g_test_parts_walk = fn;
+    g_test_parts_walk_ctx = ctx;
+}
+#define CFG_PARTS_WALK_HOOK(count) \
+    do { if (g_test_parts_walk && !g_test_parts_walk((count), g_test_parts_walk_ctx)) \
+             return MOQ_ERR_INVAL; } while (0)
+#else
+#define RECEIVER_CTOR_ALLOC() moq_alloc_default()
+#define RECEIVER_CONNECT(cfg, out) moq_endpoint_connect((cfg), (out))
+#define CFG_PARTS_WALK_HOOK(count) ((void)0)
+#endif
+
+
 static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 {
     if (!cfg) return MOQ_ERR_INVAL;
@@ -2679,6 +2756,11 @@ static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
         return MOQ_ERR_INVAL;
     if (cfg->namespace_.count == 0 || !cfg->namespace_.parts)
         return MOQ_ERR_INVAL;
+    /* count * sizeof(moq_bytes_t) must be representable before a single part
+     * is read: an intrinsically impossible count is refused, not traversed. */
+    if (cfg->namespace_.count > SIZE_MAX / sizeof(moq_bytes_t))
+        return MOQ_ERR_INVAL;
+    CFG_PARTS_WALK_HOOK(cfg->namespace_.count);
     for (size_t i = 0; i < cfg->namespace_.count; i++) {
         if (cfg->namespace_.parts[i].len == 0 ||
             !cfg->namespace_.parts[i].data)
@@ -2741,11 +2823,110 @@ static void receiver_free(moq_media_receiver_t *r)
     r->alloc.free(r, sizeof(*r), r->alloc.ctx);
 }
 
+
+/* Every size receiver_new allocates, derived once and checked before the
+ * first allocation. A configuration whose derived capacity or byte count is
+ * not representable is refused with MOQ_ERR_INVAL and has no effect; the
+ * allocations below then use exactly these values, so validation and
+ * allocation cannot drift. Bounds are written as division/subtraction
+ * comparisons so the check itself never overflows. */
+typedef struct {
+    moq_bytes_t catalog;         /* configured or the MSF default name */
+    size_t      ns_parts_bytes;  /* namespace_.count * sizeof(moq_bytes_t) */
+    size_t      ns_bytes;        /* sum of the part lengths */
+    size_t      ns_data_bytes;   /* ns_bytes + catalog.len */
+    uint32_t    ev_cap;
+    size_t      events_bytes;
+    uint32_t    obj_cap;
+    uint32_t    ring_cap;
+    uint64_t    byte_cap;        /* FLOW_CONTROL ceiling byte_cap + byte_cap/2 must fit */
+    size_t      objs_bytes;
+    uint32_t    sap_cap;
+    size_t      saps_bytes;
+    uint32_t    mt_cap;
+    size_t      mts_bytes;
+} receiver_sizes_t;
+
+/* count * elem fits in size_t. Taking the count as uint64_t keeps the check
+ * meaningful on a 32-bit size_t without a tautological comparison on LP64. */
+static bool receiver_product_fits(uint64_t count, size_t elem)
+{
+    return count <= (uint64_t)(SIZE_MAX / elem);
+}
+
+static moq_result_t receiver_derive_sizes(const moq_media_receiver_cfg_t *cfg,
+                                          receiver_sizes_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->catalog = cfg->catalog_track;
+    if (s->catalog.len == 0)
+        s->catalog = (moq_bytes_t){
+            (const uint8_t *)MOQ_MSF_CATALOG_TRACK_NAME,
+            MOQ_MSF_CATALOG_TRACK_NAME_LEN };
+
+    if (cfg->namespace_.count > SIZE_MAX / sizeof(moq_bytes_t))
+        return MOQ_ERR_INVAL;   /* already refused by receiver_validate_cfg */
+    s->ns_parts_bytes = cfg->namespace_.count * sizeof(moq_bytes_t);
+    for (size_t i = 0; i < cfg->namespace_.count; i++) {
+        if (cfg->namespace_.parts[i].len > SIZE_MAX - s->ns_bytes)
+            return MOQ_ERR_INVAL;
+        s->ns_bytes += cfg->namespace_.parts[i].len;
+    }
+    if (s->catalog.len > SIZE_MAX - s->ns_bytes) return MOQ_ERR_INVAL;
+    s->ns_data_bytes = s->ns_bytes + s->catalog.len;
+
+    s->ev_cap = cfg->max_track_events ? cfg->max_track_events
+                                      : RECEIVER_DEFAULT_TRACK_EVENTS;
+    if (!receiver_product_fits(s->ev_cap, sizeof(receiver_event_t))) return MOQ_ERR_INVAL;
+    s->events_bytes = (size_t)s->ev_cap * sizeof(receiver_event_t);
+
+    s->obj_cap = cfg->overflow.max_objects ? cfg->overflow.max_objects
+                                           : RECEIVER_DEFAULT_MAX_OBJECTS;
+    s->byte_cap = cfg->overflow.max_bytes ? cfg->overflow.max_bytes
+                                          : RECEIVER_DEFAULT_MAX_BYTES;
+    if (cfg->overflow.policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL) {
+        /* FLOW_CONTROL absorbs in-flight overshoot past the threshold (up to
+         * the soft ceiling); the physical ring must hold it, and the byte
+         * ceiling byte_cap + byte_cap/2 is computed at service time. */
+        uint32_t half = s->obj_cap / 2;
+        if (s->obj_cap > UINT32_MAX - half - 1) return MOQ_ERR_INVAL;
+        s->ring_cap = s->obj_cap + half + 1;
+        if (s->byte_cap > UINT64_MAX - s->byte_cap / 2) return MOQ_ERR_INVAL;
+    } else {
+        s->ring_cap = s->obj_cap;
+    }
+    if (!receiver_product_fits(s->ring_cap, sizeof(receiver_obj_entry_t))) return MOQ_ERR_INVAL;
+    s->objs_bytes = (size_t)s->ring_cap * sizeof(receiver_obj_entry_t);
+
+    s->sap_cap = RECEIVER_DEFAULT_SAP_RECORDS;
+    if (!receiver_product_fits(s->sap_cap, sizeof(moq_media_sap_record_t))) return MOQ_ERR_INVAL;
+    s->saps_bytes = (size_t)s->sap_cap * sizeof(moq_media_sap_record_t);
+    s->mt_cap = RECEIVER_DEFAULT_MT_RECORDS;
+    if (!receiver_product_fits(s->mt_cap, sizeof(moq_media_timeline_record_t))) return MOQ_ERR_INVAL;
+    s->mts_bytes = (size_t)s->mt_cap * sizeof(moq_media_timeline_record_t);
+    return MOQ_OK;
+}
+
+/* The ONE preflight every constructor runs before any allocating, connecting
+ * or attaching effect: basic configuration validation (including the
+ * namespace-count bound, before any part is read) and complete size
+ * derivation. The checked sizes are then passed into receiver_new, never
+ * recomputed. */
+static moq_result_t receiver_prepare(const moq_media_receiver_cfg_t *cfg,
+                                     receiver_sizes_t *sz)
+{
+    moq_result_t rc = receiver_validate_cfg(cfg);
+    if (rc < 0) return rc;
+    return receiver_derive_sizes(cfg, sz);
+}
+
 static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
                                  const moq_media_receiver_cfg_t *cfg,
+                                 const receiver_sizes_t *szp,
                                  moq_media_receiver_t **out)
 {
-    const moq_alloc_t *alloc = moq_alloc_default();
+    const receiver_sizes_t sz = *szp;
+    const moq_alloc_t *alloc = RECEIVER_CTOR_ALLOC();
     moq_media_receiver_t *r = (moq_media_receiver_t *)alloc->alloc(
         sizeof(*r), alloc->ctx);
     if (!r) return MOQ_ERR_NOMEM;
@@ -2763,26 +2944,13 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
 
     /* Deep-copy the namespace and catalog track name into one buffer:
      * [ns part bytes...][catalog name bytes]. */
-    moq_bytes_t catalog = cfg->catalog_track;
-    if (catalog.len == 0)
-        catalog = (moq_bytes_t){
-            (const uint8_t *)MOQ_MSF_CATALOG_TRACK_NAME,
-            MOQ_MSF_CATALOG_TRACK_NAME_LEN };
-    size_t ns_bytes = 0;
-    for (size_t i = 0; i < cfg->namespace_.count; i++)
-        ns_bytes += cfg->namespace_.parts[i].len;
-
-    r->ns_parts = (moq_bytes_t *)r->alloc.alloc(
-        cfg->namespace_.count * sizeof(moq_bytes_t), r->alloc.ctx);
-    r->ns_data = (uint8_t *)r->alloc.alloc(ns_bytes + catalog.len,
-                                           r->alloc.ctx);
+    r->ns_parts = (moq_bytes_t *)r->alloc.alloc(sz.ns_parts_bytes, r->alloc.ctx);
+    r->ns_data = (uint8_t *)r->alloc.alloc(sz.ns_data_bytes, r->alloc.ctx);
     if (!r->ns_parts || !r->ns_data) {
         if (r->ns_parts)
-            r->alloc.free(r->ns_parts,
-                          cfg->namespace_.count * sizeof(moq_bytes_t),
-                          r->alloc.ctx);
+            r->alloc.free(r->ns_parts, sz.ns_parts_bytes, r->alloc.ctx);
         if (r->ns_data)
-            r->alloc.free(r->ns_data, ns_bytes + catalog.len, r->alloc.ctx);
+            r->alloc.free(r->ns_data, sz.ns_data_bytes, r->alloc.ctx);
         r->ns_parts = NULL;
         r->ns_data = NULL;
         pthread_mutex_destroy(&r->mu);
@@ -2797,56 +2965,45 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
                                         cfg->namespace_.parts[i].len };
         off += cfg->namespace_.parts[i].len;
     }
-    memcpy(r->ns_data + off, catalog.data, catalog.len);
+    memcpy(r->ns_data + off, sz.catalog.data, sz.catalog.len);
     r->catalog_name = r->ns_data + off;
-    r->catalog_name_len = catalog.len;
+    r->catalog_name_len = sz.catalog.len;
     r->namespace_ = (moq_namespace_t){ r->ns_parts, cfg->namespace_.count };
     /* receiver_free() releases ns_data with its full size. */
-    r->ns_data_size = ns_bytes + catalog.len;
+    r->ns_data_size = sz.ns_data_bytes;
 
-    r->ev_cap = cfg->max_track_events ? cfg->max_track_events
-                                      : RECEIVER_DEFAULT_TRACK_EVENTS;
-    r->events = (receiver_event_t *)r->alloc.alloc(
-        r->ev_cap * sizeof(receiver_event_t), r->alloc.ctx);
+    r->ev_cap = sz.ev_cap;
+    r->events = (receiver_event_t *)r->alloc.alloc(sz.events_bytes, r->alloc.ctx);
     if (!r->events) {
         receiver_free(r);
         return MOQ_ERR_NOMEM;
     }
 
-    r->obj_cap = cfg->overflow.max_objects ? cfg->overflow.max_objects
-                                           : RECEIVER_DEFAULT_MAX_OBJECTS;
-    r->byte_cap = cfg->overflow.max_bytes ? cfg->overflow.max_bytes
-                                          : RECEIVER_DEFAULT_MAX_BYTES;
-    /* FLOW_CONTROL absorbs in-flight overshoot past the threshold (up to
-     * the soft ceiling); the physical ring must hold it. */
-    r->ring_cap = (cfg->overflow.policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
-                      ? r->obj_cap + r->obj_cap / 2 + 1
-                      : r->obj_cap;
-    r->objs = (receiver_obj_entry_t *)r->alloc.alloc(
-        r->ring_cap * sizeof(receiver_obj_entry_t), r->alloc.ctx);
+    r->obj_cap = sz.obj_cap;
+    r->byte_cap = sz.byte_cap;
+    r->ring_cap = sz.ring_cap;
+    r->objs = (receiver_obj_entry_t *)r->alloc.alloc(sz.objs_bytes, r->alloc.ctx);
     if (!r->objs) {
         receiver_free(r);
         return MOQ_ERR_NOMEM;
     }
-    memset(r->objs, 0, r->ring_cap * sizeof(receiver_obj_entry_t));
+    memset(r->objs, 0, sz.objs_bytes);
 
-    r->sap_cap = RECEIVER_DEFAULT_SAP_RECORDS;
-    r->saps = (moq_media_sap_record_t *)r->alloc.alloc(
-        r->sap_cap * sizeof(moq_media_sap_record_t), r->alloc.ctx);
+    r->sap_cap = sz.sap_cap;
+    r->saps = (moq_media_sap_record_t *)r->alloc.alloc(sz.saps_bytes, r->alloc.ctx);
     if (!r->saps) {
         receiver_free(r);
         return MOQ_ERR_NOMEM;
     }
-    memset(r->saps, 0, r->sap_cap * sizeof(moq_media_sap_record_t));
+    memset(r->saps, 0, sz.saps_bytes);
 
-    r->mt_cap = RECEIVER_DEFAULT_MT_RECORDS;
-    r->mts = (moq_media_timeline_record_t *)r->alloc.alloc(
-        r->mt_cap * sizeof(moq_media_timeline_record_t), r->alloc.ctx);
+    r->mt_cap = sz.mt_cap;
+    r->mts = (moq_media_timeline_record_t *)r->alloc.alloc(sz.mts_bytes, r->alloc.ctx);
     if (!r->mts) {
         receiver_free(r);
         return MOQ_ERR_NOMEM;
     }
-    memset(r->mts, 0, r->mt_cap * sizeof(moq_media_timeline_record_t));
+    memset(r->mts, 0, sz.mts_bytes);
     r->stats.struct_size = (uint32_t)sizeof(r->stats);
 
     /* Production always passes a real endpoint. The MOQ_MEDIA_RECEIVER_TESTING
@@ -2876,10 +3033,11 @@ moq_result_t moq_media_receiver_attach(moq_endpoint_t *ep,
 {
     if (!ep || !out) return MOQ_ERR_INVAL;
     *out = NULL;
-    moq_result_t rc = receiver_validate_cfg(cfg);
+    receiver_sizes_t sz;
+    moq_result_t rc = receiver_prepare(cfg, &sz);
     if (rc < 0) return rc;
     if (cfg->endpoint != NULL) return MOQ_ERR_INVAL;  /* attach borrows */
-    return receiver_new(ep, false, cfg, out);
+    return receiver_new(ep, false, cfg, &sz, out);
 }
 
 moq_result_t moq_media_receiver_create(const moq_media_receiver_cfg_t *cfg,
@@ -2887,15 +3045,18 @@ moq_result_t moq_media_receiver_create(const moq_media_receiver_cfg_t *cfg,
 {
     if (!out) return MOQ_ERR_INVAL;
     *out = NULL;
-    moq_result_t rc = receiver_validate_cfg(cfg);
+    /* Everything that can be refused without effects is refused here, before
+     * the owned endpoint is connected. */
+    receiver_sizes_t sz;
+    moq_result_t rc = receiver_prepare(cfg, &sz);
     if (rc < 0) return rc;
     if (cfg->endpoint == NULL) return MOQ_ERR_INVAL;  /* create owns */
 
     moq_endpoint_t *ep = NULL;
-    rc = moq_endpoint_connect(cfg->endpoint, &ep);
+    rc = RECEIVER_CONNECT(cfg->endpoint, &ep);
     if (rc < 0) return rc;
 
-    rc = receiver_new(ep, true, cfg, out);
+    rc = receiver_new(ep, true, cfg, &sz, out);
     if (rc < 0) {
         (void)moq_endpoint_stop(ep);
         moq_endpoint_destroy(ep);
@@ -3061,6 +3222,34 @@ const moq_media_track_desc_t *moq_media_track_desc_get(
     const moq_media_track_t *track)
 {
     return track ? &track->desc : NULL;
+}
+
+moq_result_t moq_media_receiver_track_desc_copy(
+    const moq_media_receiver_t *r, const moq_media_track_t *track,
+    moq_media_track_desc_t *out, size_t out_size)
+{
+    if (!r || !track || !out) return MOQ_ERR_INVAL;
+    if (out_size < MOQ_MEDIA_TRACK_DESC_V0_SIZE) return MOQ_ERR_INVAL;
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+
+    /* Ownership is a pointer comparison against the receiver's handle table
+     * (appended under r->mu, retained until receiver_free), so an unowned
+     * pointer is never dereferenced. The copy runs under the same mutex the
+     * live->VOD writer holds, so the mutable triple is read whole. */
+    pthread_mutex_t *mu = (pthread_mutex_t *)&r->mu;
+    pthread_mutex_lock(mu);
+    PUB_PHASE_HOOK(r, MOQ_MR_DESC_READER_PRE);
+    bool owned = false;
+    for (size_t i = 0; i < r->track_count; i++) {
+        if (r->tracks[i] == track) { owned = true; break; }
+    }
+    if (owned) {
+        memcpy(out, &track->desc, n);
+        out->struct_size = (uint32_t)n;
+    }
+    PUB_PHASE_HOOK(r, MOQ_MR_DESC_READER_POST);
+    pthread_mutex_unlock(mu);
+    return owned ? MOQ_OK : MOQ_ERR_INVAL;
 }
 
 const moq_cmsf_content_protection_t *
@@ -3589,13 +3778,39 @@ void moq_media_receiver_test_push_media_timeline(moq_media_receiver_t *r,
  * scripted-peer harness can drive the REAL receiver_hook (auto-subscribe,
  * catalog ingest, object routing) against a session it owns. receiver_new with
  * ep == NULL skips the endpoint hook attach (see the if (ep) guard there). */
+moq_result_t moq_media_receiver_test_construct(
+    const moq_media_receiver_cfg_t *cfg, moq_media_receiver_t **out);
+void moq_media_receiver_test_set_fatal(moq_media_receiver_t *r, uint64_t code);
+
 moq_media_receiver_t *moq_media_receiver_test_new_cfg(
     const moq_media_receiver_cfg_t *cfg)
 {
-    if (receiver_validate_cfg(cfg) < 0) return NULL;
     moq_media_receiver_t *r = NULL;
-    if (receiver_new(NULL, false, cfg, &r) != MOQ_OK) return NULL;
+    if (moq_media_receiver_test_construct(cfg, &r) != MOQ_OK) return NULL;
     return r;
+}
+
+/* The same construction as moq_media_receiver_test_new_cfg, surfacing the
+ * REAL result (INVAL from validation vs NOMEM from the allocator) so a
+ * construction oracle can distinguish a refusal from an allocation failure.
+ * No endpoint is attached. */
+moq_result_t moq_media_receiver_test_construct(
+    const moq_media_receiver_cfg_t *cfg, moq_media_receiver_t **out)
+{
+    if (!out) return MOQ_ERR_INVAL;
+    *out = NULL;
+    receiver_sizes_t sz;
+    moq_result_t rc = receiver_prepare(cfg, &sz);
+    if (rc < 0) return rc;
+    return receiver_new(NULL, false, cfg, &sz, out);
+}
+
+/* Drive the receiver into its terminal (fatal) state through the one
+ * transition every fatal path takes, so terminal-receiver rows do not need a
+ * scripted peer. The code is reported by fatal_code() exactly as production. */
+void moq_media_receiver_test_set_fatal(moq_media_receiver_t *r, uint64_t code)
+{
+    receiver_set_fatal(r, code);
 }
 
 /* Drive the real endpoint pump hook with a caller-controlled session. The hook

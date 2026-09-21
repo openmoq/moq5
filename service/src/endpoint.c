@@ -2163,4 +2163,14 @@ void moq_endpoint_test_drain_terminal(moq_endpoint_t *ep)
 {
     ep_drain_terminal(ep);
 }
+
+/* Current media-service attachment count (the value stop() gates on). */
+int moq_endpoint_test_attachments(moq_endpoint_t *ep);
+int moq_endpoint_test_attachments(moq_endpoint_t *ep)
+{
+    pthread_mutex_lock(&ep->mu);
+    int n = ep->attachments;
+    pthread_mutex_unlock(&ep->mu);
+    return n;
+}
 #endif /* MOQ_MEDIA_SENDER_TESTING || MOQ_MEDIA_RECEIVER_TESTING */

@@ -2,9 +2,18 @@
  * White-box tests for the sender's catalog-content model (S1): the catalog the
  * sender would publish after post-ready add/remove mutations. Deterministic,
  * no network -- it pins coalescing (multiple mutations reflected in one build)
- * and the no-op dedup (an add+remove that nets to no change builds identical
- * bytes). The pump-driven wire republish (group numbering, retained group,
- * staged backpressure) is covered by the loopback tests in test_media_sender.c.
+ * and the no-op dedup (an add+remove that nets to no change resolves to the same
+ * catalog document). The pump-driven wire republish (group numbering, retained
+ * group, staged backpressure) is covered by the loopback tests in
+ * test_media_sender.c.
+ *
+ * Where two separately built catalogs are compared BYTE for byte, the sender's
+ * catalog clock is pinned first. MSF §5.1.2 generatedAt is a fresh wallclock
+ * millisecond per catalog instance, so two builds of the same resolved catalog
+ * are NOT naturally byte-equal -- they differ whenever the two builds land in
+ * different milliseconds. With that one instance-varying input held constant,
+ * the raw comparison pins what it is actually for: the same resolved catalog
+ * encodes deterministically.
  */
 #include <moq/media_sender.h>
 #include <moq/endpoint.h>
@@ -39,6 +48,10 @@ bool moq_media_sender_test_run_finish_conversions(moq_media_sender_t *s);
 size_t moq_media_sender_test_stage(moq_media_sender_t *s,
                                    moq_rcbuf_t **objs, size_t cap);
 void moq_media_sender_test_mark_registered(moq_media_sender_t *s);
+/* Pin (or release) THIS sender's catalog clock -- instance-owned, testing-only,
+ * declared here because no header exposes it. */
+void moq_media_sender_test_set_clock_ms(moq_media_sender_t *s,
+                                        bool set, uint64_t ms);
 moq_result_t moq_media_sender_test_validate_cfg(const moq_media_sender_cfg_t *cfg);
 /* Lock-order regression seams (media_sender.c + endpoint.c, _TESTING). */
 void moq_media_sender_test_set_ep(moq_media_sender_t *s, moq_endpoint_t *ep);
@@ -128,6 +141,30 @@ static bool built_track_alt_group(moq_media_sender_t *s, const char *name,
     }
     moq_rcbuf_decref(j);
     return found;
+}
+
+/* The catalog-instance timestamp this file pins wherever it compares raw bytes.
+ * Nonzero and declared: 0 is a legal epoch value, so a zero stamp could not
+ * distinguish "pinned" from "field absent". */
+#define CATALOG_PINNED_STAMP_MS 1700000000123ull
+
+/* Parsed generatedAt of one encoded catalog. Returns false unless the buffer
+ * parses AND carries the field, so a missing stamp can never be read as a
+ * matching one. */
+static bool built_stamp(const moq_rcbuf_t *j, uint64_t *out)
+{
+    if (!j) return false;
+    const uint8_t *d = moq_rcbuf_data(j);
+    size_t n = moq_rcbuf_len(j);
+    if (!d || n == 0) return false;
+    const moq_alloc_t *al = moq_alloc_default();
+    moq_msf_catalog_t c;
+    if (moq_msf_catalog_parse(al, (moq_bytes_t){ d, n }, &c) != MOQ_OK)
+        return false;
+    bool ok = c.has_generated_at;
+    if (ok) *out = c.generated_at;
+    moq_msf_catalog_cleanup(al, &c);
+    return ok;
 }
 
 /* True if the currently-built catalog contains a track named `name`. */
@@ -338,6 +375,13 @@ int main(void)
         add_trk(s, "a", false);
         moq_media_sender_test_set_ready(s);
 
+        /* Hold the one instance-varying input constant before comparing raw
+         * bytes. generatedAt is a fresh wallclock millisecond per build, so
+         * without this pin the two builds below differ whenever they land in
+         * different milliseconds -- which says nothing about the catalog. The
+         * pin stays in place through the dedup checks that follow. */
+        moq_media_sender_test_set_clock_ms(s, true, CATALOG_PINNED_STAMP_MS);
+
         /* Baseline bytes. */
         moq_rcbuf_t *b1 = NULL;
         MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_build_catalog(s, &b1),
@@ -353,6 +397,17 @@ int main(void)
                               (int)MOQ_OK);
         MOQ_TEST_CHECK(b2 != NULL);
         if (b1 && b2) {
+            /* The pin is load-bearing, so it is asserted rather than assumed:
+             * both buffers must carry the DECLARED stamp. Deleting the pin
+             * fails here even on the runs where two unpinned builds happen to
+             * share a millisecond. */
+            uint64_t s1 = 0, s2 = 0;
+            MOQ_TEST_CHECK(built_stamp(b1, &s1));
+            MOQ_TEST_CHECK(built_stamp(b2, &s2));
+            MOQ_TEST_CHECK_EQ_U64(s1, CATALOG_PINNED_STAMP_MS);
+            MOQ_TEST_CHECK_EQ_U64(s2, CATALOG_PINNED_STAMP_MS);
+            /* ... and with it held constant, the same resolved catalog encodes
+             * to the same bytes. */
             MOQ_TEST_CHECK_EQ_U64(moq_rcbuf_len(b1), moq_rcbuf_len(b2));
             MOQ_TEST_CHECK(moq_rcbuf_len(b1) == moq_rcbuf_len(b2) &&
                 memcmp(moq_rcbuf_data(b1), moq_rcbuf_data(b2),

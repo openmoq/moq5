@@ -384,10 +384,63 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME media_catalog_publication_race
             COMMAND test_media_catalog_publication_race)
 
+        # Checked construction arithmetic: ledger allocator, real result and
+        # the public pre-attachment boundary. Deterministic; no timing races.
+        add_executable(test_media_receiver_construct_arith
+            tests/test_media_receiver_construct_arith.c)
+        target_link_libraries(test_media_receiver_construct_arith PRIVATE
+            moq-service-receiver-test-internals)
+        target_include_directories(test_media_receiver_construct_arith PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME media_receiver_construct_arith
+            COMMAND test_media_receiver_construct_arith)
+        # API/export contract for the description copy operation: typed
+        # declaration + floor by the configured compiler, exact symbol by nm.
+        set(_moq_desc_copy_api_includes
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/core/include
+            ${CMAKE_SOURCE_DIR}/media/msf/include
+            ${CMAKE_SOURCE_DIR}/media/object/include
+            ${CMAKE_SOURCE_DIR}/media/loc/include
+            ${CMAKE_SOURCE_DIR}/media/cmaf/include)
+        add_test(NAME media_receiver_desc_copy_api
+            COMMAND ${CMAKE_COMMAND}
+                -DHEADER=${CMAKE_CURRENT_SOURCE_DIR}/include/moq/media_receiver.h
+                -DLIB=$<TARGET_FILE:moq-service>
+                -DNM=${CMAKE_NM}
+                -DCC=${CMAKE_C_COMPILER}
+                "-DINCLUDES=${_moq_desc_copy_api_includes}"
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/desc_copy_api
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_desc_copy_api.cmake)
+        # The gate's own controls: scratch headers/archives and wrapped tools
+        # must each be reported as the named fact (must PASS).
+        add_test(NAME media_receiver_desc_copy_api_controls
+            COMMAND ${CMAKE_COMMAND}
+                -DSCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/tests/check_desc_copy_api.cmake
+                -DHEADER=${CMAKE_CURRENT_SOURCE_DIR}/include/moq/media_receiver.h
+                -DLIB=$<TARGET_FILE:moq-service>
+                -DCC=${CMAKE_C_COMPILER}
+                -DAR=${CMAKE_AR}
+                -DNM=${CMAKE_NM}
+                "-DINCLUDES=${_moq_desc_copy_api_includes}"
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/desc_copy_api_controls
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_desc_copy_api_controls.cmake)
+
         # Scripted-peer facade test (no network): drive the REAL
         # receiver_hook with a simpair client session and inject crafted moqx
         # control + subgroup data bytes. Requires moq-sim.
         if(TARGET moq::sim)
+            # Description copy contract: writer/reader lock phase oracle,
+            # functional oracle over the public function, and a production
+            # description through the real pump hook with a scripted peer.
+            add_executable(test_media_receiver_desc_copy
+                tests/test_media_receiver_desc_copy.c)
+            target_link_libraries(test_media_receiver_desc_copy PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_desc_copy PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_desc_copy
+                COMMAND test_media_receiver_desc_copy)
             add_executable(test_media_receiver_scripted
                 tests/test_media_receiver_scripted.c)
             target_link_libraries(test_media_receiver_scripted PRIVATE
@@ -490,6 +543,25 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_catalog COMMAND test_media_sender_catalog)
 
+        # MSF 5.1.2 generatedAt must not decide no-op dedup. Deterministic:
+        # the catalog clock is pinned through the sender's instance-owned test
+        # seam, so nothing here waits on a millisecond boundary. The refresh
+        # case drives a real SimPair subscriber, so this target links moq::sim
+        # directly and is registered only when that target exists.
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_catalog_generatedat
+                tests/test_media_sender_catalog_generatedat.c)
+            # moq::core and moq::msf arrive through the test-internals target's
+            # PUBLIC interface; naming them again would put a second copy of
+            # each archive on the link line, which ld64 reports as a duplicate.
+            target_link_libraries(test_media_sender_catalog_generatedat PRIVATE
+                moq-service-sender-test-internals moq::sim Threads::Threads)
+            target_include_directories(test_media_sender_catalog_generatedat
+                PRIVATE ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_sender_catalog_generatedat
+                COMMAND test_media_sender_catalog_generatedat)
+        endif()
+
         # Lifecycle callbacks (on_ready / on_closed): deterministic, no network.
         # Drives the production fire helpers via the same test seam.
         add_executable(test_media_sender_lifecycle
@@ -500,6 +572,64 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_lifecycle
             COMMAND test_media_sender_lifecycle)
+        # Checked construction arithmetic: ledger allocator, real result and
+        # the public pre-attachment boundary. Deterministic; no timing races.
+        add_executable(test_media_sender_construct_arith
+            tests/test_media_sender_construct_arith.c)
+        target_link_libraries(test_media_sender_construct_arith PRIVATE
+            moq-service-sender-test-internals)
+        target_include_directories(test_media_sender_construct_arith PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        target_compile_options(test_media_sender_construct_arith PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME media_sender_construct_arith
+            COMMAND test_media_sender_construct_arith)
+        set_tests_properties(media_sender_construct_arith PROPERTIES TIMEOUT 30)
+        # Terminal-endpoint mutator refusals and BLOCK_TIMEOUT deadline
+        # boundaries on a bare endpoint; no network.
+        add_executable(test_media_sender_terminal_boundary
+            tests/test_media_sender_terminal_boundary.c)
+        target_link_libraries(test_media_sender_terminal_boundary PRIVATE
+            moq-service-sender-test-internals)
+        target_include_directories(test_media_sender_terminal_boundary PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        target_compile_options(test_media_sender_terminal_boundary PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME media_sender_terminal_boundary
+            COMMAND test_media_sender_terminal_boundary)
+        set_tests_properties(media_sender_terminal_boundary PROPERTIES TIMEOUT 30)
+        add_test(NAME media_sender_terminal_boundary_controls
+            COMMAND test_media_sender_terminal_boundary --controls)
+        set_tests_properties(media_sender_terminal_boundary_controls PROPERTIES TIMEOUT 30)
+        # Checked add_track arithmetic: span aggregate, ref-id count product,
+        # generated-name addition; ledger allocator and pre-traversal witness.
+        add_executable(test_media_sender_track_arith
+            tests/test_media_sender_track_arith.c)
+        target_link_libraries(test_media_sender_track_arith PRIVATE
+            moq-service-sender-test-internals)
+        target_include_directories(test_media_sender_track_arith PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        target_compile_options(test_media_sender_track_arith PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME media_sender_track_arith COMMAND test_media_sender_track_arith)
+        set_tests_properties(media_sender_track_arith PROPERTIES TIMEOUT 30)
+        # BLOCK_TIMEOUT deadline arithmetic and error handling: scripted
+        # clock/wait rail over the real public write path.
+        add_executable(test_media_sender_deadline tests/test_media_sender_deadline.c)
+        target_link_libraries(test_media_sender_deadline PRIVATE
+            moq-service-sender-test-internals)
+        target_include_directories(test_media_sender_deadline PRIVATE
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        target_compile_options(test_media_sender_deadline PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME media_sender_deadline COMMAND test_media_sender_deadline)
+        set_tests_properties(media_sender_deadline PROPERTIES TIMEOUT 30)
+        add_test(NAME media_sender_deadline_controls
+            COMMAND test_media_sender_deadline --controls)
+        set_tests_properties(media_sender_deadline_controls PROPERTIES TIMEOUT 30)
+        add_test(NAME media_sender_deadline_ceiling
+            COMMAND test_media_sender_deadline --ceiling)
+        set_tests_properties(media_sender_deadline_ceiling PROPERTIES TIMEOUT 30)
         # Pacing attribution: one production sender_hook == one drain pass,
         # driven against a real SimPair subscriber. Deterministic pump units.
         add_executable(test_media_sender_pacing

@@ -64,8 +64,8 @@ static moq_bytes_t g_ns_parts[2];
 static moq_media_sender_t *cfg_sender(uint64_t interval, bool set_interval,
                                       size_t cfg_size)
 {
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
     /* Allocate the real struct but present a caller-declared struct_size, so an
      * "old size" caller is modelled exactly (the field is beyond struct_size). */
     moq_media_sender_cfg_t cfg;
@@ -132,9 +132,17 @@ static void test_cfg_exact_old_size(void)
     moq_media_sender_cfg_t *cfg = (moq_media_sender_cfg_t *)malloc(old);
     MOQ_TEST_CHECK(cfg != NULL);
     moq_media_sender_cfg_init_live_sized(cfg, old);   /* writes only [0, old) */
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
-    cfg->namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
+    /* The allocation is EXACTLY `old` bytes, so the config must not be written
+     * through as a whole current-sized object. Copy just this member, at its
+     * own offset, after checking the whole member fits inside the allocation. */
+    {
+        const moq_namespace_t ns = { g_ns_parts, 2 };
+        const size_t ns_off = offsetof(moq_media_sender_cfg_t, namespace_);
+        MOQ_TEST_CHECK(ns_off + sizeof(ns) <= old);
+        memcpy((unsigned char *)cfg + ns_off, &ns, sizeof(ns));
+    }
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(cfg);
     MOQ_TEST_CHECK(s != NULL);
     /* Gate never touched the (unallocated) field -> default. */
@@ -153,8 +161,8 @@ static void test_cfg_poisoned_tail(void)
     moq_media_sender_cfg_t cfg;
     memset(&cfg, 0xAA, sizeof(cfg));                  /* poison incl. the field */
     moq_media_sender_cfg_init_live_sized(&cfg, old);  /* struct_size = old */
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
     cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
     MOQ_TEST_CHECK_EQ_U64((uint64_t)cfg.struct_size, (uint64_t)old);
     /* The field still holds 0xAAAA...; the gate must not read it. */
@@ -219,8 +227,8 @@ static moq_media_sender_t *ready_publish_sender(
 {
     moq_session_t *cl = moq_simpair_client(sp);
     moq_session_t *srv = moq_simpair_server(sp);
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
     moq_media_sender_cfg_t cfg;
     moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
     cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
@@ -279,8 +287,8 @@ static moq_media_sender_t *pull_catalog_sub(moq_simpair_t *sp, uint64_t interval
                                             moq_subscription_t *sub_out)
 {
     moq_session_t *srv = moq_simpair_server(sp);
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
     moq_media_sender_cfg_t cfg;
     moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
     cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
@@ -306,7 +314,7 @@ static moq_media_sender_t *pull_catalog_sub(moq_simpair_t *sp, uint64_t interval
 
     moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
     sc.track_namespace = (moq_namespace_t){ g_ns_parts, 2 };
-    sc.track_name = (moq_bytes_t)MOQ_BYTES_LITERAL("catalog");
+    sc.track_name = MOQ_BYTES_LITERAL("catalog");
     sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
     sc.has_forward = true; sc.forward = true;
     moq_subscription_t sub; memset(&sub, 0, sizeof(sub));
@@ -352,12 +360,11 @@ static void test_refresh_pull_demand(moq_version_t ver)
     test_alloc_state_t as = {0};
     moq_alloc_t alloc = test_allocator(&as);
     moq_simpair_t *sp = pair(&alloc, ver);
-    moq_session_t *cl  = moq_simpair_client(sp);   /* sender / publisher */
     moq_session_t *srv = moq_simpair_server(sp);   /* the persistent subscriber */
     uint64_t t0 = moq_simpair_now_us(sp);
 
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
     moq_media_sender_cfg_t cfg;
     moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
     cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
@@ -388,7 +395,7 @@ static void test_refresh_pull_demand(moq_version_t ver)
      * auto-accepts (ACCEPT_ALL). */
     moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
     sc.track_namespace = (moq_namespace_t){ g_ns_parts, 2 };
-    sc.track_name = (moq_bytes_t)MOQ_BYTES_LITERAL("catalog");
+    sc.track_name = MOQ_BYTES_LITERAL("catalog");
     sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
     sc.has_forward = true; sc.forward = true;
     moq_subscription_t sub; memset(&sub, 0, sizeof(sub));
@@ -542,8 +549,8 @@ static void test_refresh_no_demand(moq_version_t ver)
     moq_session_t *srv = moq_simpair_server(sp);
     uint64_t t0 = moq_simpair_now_us(sp);
 
-    g_ns_parts[0] = (moq_bytes_t)MOQ_BYTES_LITERAL("svc");
-    g_ns_parts[1] = (moq_bytes_t)MOQ_BYTES_LITERAL("demo");
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("demo");
     moq_media_sender_cfg_t cfg;
     moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
     cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };

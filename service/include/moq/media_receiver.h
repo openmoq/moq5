@@ -309,12 +309,15 @@ typedef struct moq_media_track_event {
     moq_media_track_t            *track; /* stable handle; NULL for
                                             CATALOG_READY. Valid from TRACK_ADDED
                                             until the receiver is destroyed
-                                            (handles are never recycled). After a
-                                            track ENDs OR is REMOVED from the
-                                            catalog the handle stays valid but
-                                            inert -- subscribe_track() /
-                                            unsubscribe_track() / track_state()
-                                            refuse it with MOQ_ERR_WRONG_STATE. */
+                                            (handles are never recycled). An
+                                            ENDED track stays valid: subscribe_track()
+                                            refuses it with MOQ_ERR_WRONG_STATE,
+                                            unsubscribe_track() still succeeds
+                                            (disable), track_state() reports
+                                            ENDED. A track REMOVED from the
+                                            catalog stays valid but inert: all
+                                            three refuse it with
+                                            MOQ_ERR_WRONG_STATE. */
     const moq_media_track_desc_t *desc;  /* handle-owned (see lifetime note
                                             above); NULL for CATALOG_READY */
     uint32_t config_generation;          /* reserved for dynamic config;
@@ -350,9 +353,46 @@ typedef struct moq_media_track_event {
 } moq_media_track_event_t;
 
 /* The description for a track handle (handle-owned; same lifetime as the
- * TRACK_ADDED event's desc). NULL for a NULL track. */
+ * TRACK_ADDED event's desc). NULL for a NULL track.
+ *
+ * Borrowed access is lock-free. Immutable fields (spans, arrays, structured
+ * info, catalog passthroughs) may be read through this pointer for the
+ * handle's lifetime. The mutable fields -- is_live, has_track_duration,
+ * track_duration_ms -- are rewritten in place by the service thread on a
+ * live-to-VOD conversion (MSF §11.3) and MUST NOT be read through this
+ * pointer concurrently with service: that is a data race. Read them with
+ * moq_media_receiver_track_desc_copy() instead. */
 MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
     const moq_media_track_t *track);
+
+/* Frozen v0 prefix of moq_media_receiver_track_desc_copy()'s output: the
+ * description through is_live, the last field the copy operation guarantees.
+ * Callers pass sizeof(moq_media_track_desc_t) or any size >= this value. */
+#define MOQ_MEDIA_TRACK_DESC_V0_SIZE \
+    (offsetof(moq_media_track_desc_t, is_live) + sizeof(bool))
+
+/* Copy a track's CURRENT description into `out` under the receiver mutex --
+ * the same mutex the live-to-VOD writer holds -- so the mutable triple is
+ * read coherently. This is a snapshot of the present state, not the image
+ * the TRACK_ADDED/UPDATED event carried.
+ *
+ * `track` must be a handle of `r`: membership is checked against the
+ * receiver's own handle table without dereferencing an unowned pointer.
+ * Removed and ended tracks, and a terminal (fatal/closed) receiver, remain
+ * readable until moq_media_receiver_destroy(). Spans and arrays in the copy
+ * stay BORROWED from the handle (handle lifetime), exactly as through
+ * moq_media_track_desc_get(); nested struct_size stamps (info, init) are
+ * carried verbatim and are meaningful only inside the outer prefix.
+ *
+ * Writes min(out_size, sizeof(moq_media_track_desc_t)) bytes and stamps
+ * out->struct_size with that size; bytes beyond it are untouched. Refusals
+ * write nothing: MOQ_ERR_INVAL for a NULL receiver/track/out, an out_size
+ * below MOQ_MEDIA_TRACK_DESC_V0_SIZE, or a handle `r` does not own. Never
+ * allocates. Callable from any thread. An additive public function (new
+ * export); existing struct layouts are unchanged. */
+MOQ_API moq_result_t moq_media_receiver_track_desc_copy(
+    const moq_media_receiver_t *r, const moq_media_track_t *track,
+    moq_media_track_desc_t *out, size_t out_size);
 
 /* Resolve a content-protection reference id (from
  * desc.content_protection_ref_ids, CMSF §4.1.2) to its root content protection

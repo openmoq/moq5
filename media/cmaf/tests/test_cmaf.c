@@ -1,6 +1,7 @@
 #include <moq/cmaf.h>
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ffmpeg_aac_stereo_init.h"
@@ -14,6 +15,48 @@ static int failures = 0;
         failures++; \
     } \
 } while (0)
+
+/* Capacity gate for the fixture builders below. Always active: an assert
+ * disappears under NDEBUG, which is exactly the release configuration where an
+ * undersized buffer would be written past without anyone noticing. Every step
+ * of the size arithmetic is checked for wrap BEFORE the comparison, so an
+ * absurd declared count cannot pass by overflowing into a small total. The
+ * fixture cannot continue after this, so it reports and exits. */
+static void fixture_capacity(size_t cap, size_t moof_size, size_t mdat_len,
+                             const char *what)
+{
+    size_t need = moof_size;
+    if (need > SIZE_MAX - 8 || (need += 8) > SIZE_MAX - mdat_len ||
+        (need += mdat_len) > cap) {
+        fprintf(stderr, "FAIL: %s: output buffer too small "
+                        "(need moof %zu + 8 + mdat %zu, cap %zu)\n",
+                what, moof_size, mdat_len, cap);
+        exit(1);
+    }
+}
+
+/* Per-sample record bytes, refused rather than wrapped. */
+static size_t fixture_sample_bytes(size_t sample_count, size_t per_sample,
+                                   const char *what)
+{
+    if (per_sample && sample_count > SIZE_MAX / per_sample) {
+        fprintf(stderr, "FAIL: %s: sample record size overflows\n", what);
+        exit(1);
+    }
+    return sample_count * per_sample;
+}
+
+/* Checked addition. EVERY step of a size chain goes through this: a chain that
+ * multiplies safely and then wraps in an ordinary addition would otherwise
+ * reach the capacity check as a small, acceptable-looking total. */
+static size_t fixture_add(size_t a, size_t b, const char *what)
+{
+    if (a > SIZE_MAX - b) {
+        fprintf(stderr, "FAIL: %s: box size arithmetic overflows\n", what);
+        exit(1);
+    }
+    return a + b;
+}
 
 /* -- Helpers: build synthetic ISO BMFF boxes ------------------------- */
 
@@ -240,14 +283,16 @@ static size_t build_fsf_fragment(uint8_t *buf, size_t cap,
     size_t per_sample = 0;                    /* emit EVERY declared field */
     if (trun_flags & 0x200u) per_sample += 4; /* sample_size records */
     if (trun_flags & 0x400u) per_sample += 4; /* per-sample flags records */
-    size_t trun_size = 8 + 8 + fsf_bytes + sample_count * per_sample;
+    const char *who = "build_fsf_fragment";
+    size_t trun_size = fixture_add(
+        8 + 8 + fsf_bytes,
+        fixture_sample_bytes(sample_count, per_sample, who), who);
     size_t tfdt_size = 8 + 4 + 8;
     size_t tfhd_size = 8 + 8 + 4;             /* + default_sample_flags */
     size_t mfhd_size = 8 + 8;                 /* version/flags + seq no */
-    size_t traf_size = 8 + tfhd_size + tfdt_size + trun_size;
-    size_t moof_size = 8 + mfhd_size + traf_size;
-    assert(moof_size + 8 + mdat_len <= cap &&
-           "build_fsf_fragment: output buffer too small");
+    size_t traf_size = fixture_add(8 + tfhd_size + tfdt_size, trun_size, who);
+    size_t moof_size = fixture_add(8 + mfhd_size, traf_size, who);
+    fixture_capacity(cap, moof_size, mdat_len, who);
 
     p += box_hdr(buf + p, (uint32_t)moof_size, "moof");
     p += box_hdr(buf + p, (uint32_t)mfhd_size, "mfhd");
@@ -299,18 +344,20 @@ static size_t build_fragment(uint8_t *buf, size_t cap,
     if (trun_flags & 0x200) per_sample += 4;
     if (trun_flags & 0x400) per_sample += 4;
     if (trun_flags & 0x800) per_sample += 4;
-    size_t trun_size = 8 + 8 + sample_count * per_sample;
+    const char *who = "build_fragment";
+    size_t trun_size = fixture_add(
+        8 + 8, fixture_sample_bytes(sample_count, per_sample, who), who);
 
     size_t tfdt_size = 8 + 4 + 8; /* version 1: 8-byte time */
     size_t tfhd_size = 8 + 8;     /* minimal: version+flags + track_id */
-    size_t traf_size = 8 + tfhd_size + tfdt_size + trun_size;
-    size_t moof_size = 8 + traf_size;
+    size_t traf_size = fixture_add(8 + tfhd_size + tfdt_size, trun_size, who);
+    size_t moof_size = fixture_add(8, traf_size, who);
 
     /* Guard the caller's buffer: total = moof + (mdat box header + payload).
-     * Previously `cap` was ignored, which let an undersized fixture buffer
-     * silently overflow (caught by ASAN). Assert instead of overflowing. */
-    assert(moof_size + 8 + mdat_len <= cap &&
-           "build_fragment: output buffer too small");
+     * `cap` was once ignored, which let an undersized fixture buffer overflow
+     * silently. The check refuses before any write and is active in every
+     * configuration, including NDEBUG, and every step above is wrap-checked. */
+    fixture_capacity(cap, moof_size, mdat_len, who);
 
     /* moof */
     p += box_hdr(buf + p, (uint32_t)moof_size, "moof");
@@ -672,8 +719,6 @@ int main(void)
 
     /* -- 7. fragment using tfhd defaults ----------------------------- */
     {
-        moq_cmaf_sample_t in[] = {{ 0, 0, 0, 0 }};
-        uint8_t payload[] = { 0x01 };
         uint8_t buf[256];
 
         /* Build manually: moof(traf(tfhd with defaults + tfdt + trun no per-sample)) */
