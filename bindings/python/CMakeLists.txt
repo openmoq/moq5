@@ -54,7 +54,29 @@ if(MOQ_PYTHON_BUILD_TESTS)
         get_filename_component(name "${source}" NAME)
         file(GENERATE OUTPUT "test-package/$<CONFIG>/moq5/${name}" INPUT "${source}")
     endforeach()
-    add_test(NAME python_foundation COMMAND Python3::Interpreter -I -W error
+    # Independent authority: the REAL SDK initializer, so the fixture's mirror
+    # of it cannot drift unnoticed. Never installed, never linked into a module.
+    add_executable(sender_cfg_authority tests/cfg_authority.c)
+    target_compile_features(sender_cfg_authority PRIVATE c_std_11)
+    target_link_libraries(sender_cfg_authority PRIVATE moq::service)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(sender_cfg_authority PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_PYTHON_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    # Its contract is a clean link too: the tests require this program to emit
+    # nothing on stderr, and a linker warning is not a Python warning.
+    if(APPLE)
+        target_link_options(sender_cfg_authority PRIVATE
+            $<$<BOOL:${MOQ_PYTHON_WARNINGS_AS_ERRORS}>:LINKER:-fatal_warnings>)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(sender_cfg_authority PRIVATE
+            $<$<BOOL:${MOQ_PYTHON_WARNINGS_AS_ERRORS}>:LINKER:--fatal-warnings>)
+    endif()
+
+    # -B stops this interpreter WRITING bytecode; it does not stop reads, and
+    # the environment cache-prefix form is ignored under -I. The driver itself
+    # is what guarantees the selected package imports its current source.
+    add_test(NAME python_foundation COMMAND Python3::Interpreter -I -B -W error
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.py"
         "${CMAKE_CURRENT_BINARY_DIR}/test-package/$<CONFIG>")
     set_tests_properties(python_foundation PROPERTIES TIMEOUT 30)

@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "moq5"
 version = "0.1.0.dev0"
-description = "Python endpoint foundation for the LibMoQ media service"
+description = "Python endpoint, media receiver and media sender binding for the LibMoQ service tier"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -23,8 +23,8 @@ Repository = "https://github.com/openmoq/moq5"
 cmake.version = ">=3.26"
 wheel.py-api = "cp312"
 wheel.packages = ["src/moq5"]
-sdist.include = ["CMakeLists.txt", "native/*.c", "native/*.map", "src/moq5/*.py", "src/moq5/py.typed", "tests/*.py", "tests/*.c", "tests/*.h", "examples/*.py", "README.md", "LICENSE.txt"]
-sdist.exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "build/**"]
+sdist.include = ["/CMakeLists.txt", "native/*.c", "native/*.map", "src/moq5/*.py", "src/moq5/py.typed", "tests/*.py", "tests/*.c", "tests/*.h", "examples/*.py", "/README.md", "/LICENSE.txt"]
+sdist.exclude = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "build/**", "tests/runtime/**"]
 
 [tool.scikit-build.cmake.define]
 MOQ_PYTHON_BUILD_TESTS = "OFF"

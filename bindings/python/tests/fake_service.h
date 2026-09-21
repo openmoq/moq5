@@ -3,6 +3,7 @@
 
 PyObject *test_reset(PyObject *, PyObject *);
 PyObject *test_counts(PyObject *, PyObject *);
+PyObject *test_endpoint_entries(PyObject *, PyObject *);
 PyObject *test_config(PyObject *, PyObject *);
 PyObject *test_connect_result(PyObject *, PyObject *);
 PyObject *test_stop_result(PyObject *, PyObject *);
@@ -19,10 +20,133 @@ PyObject *test_force_watchdog(PyObject *, PyObject *);
 PyObject *test_watchdog_fired(PyObject *, PyObject *);
 PyObject *test_force_pthread_error(PyObject *, PyObject *);
 PyObject *test_pthread_error(PyObject *, PyObject *);
+PyObject *test_receiver_counts(PyObject *, PyObject *);
+PyObject *test_receiver_config(PyObject *, PyObject *);
+PyObject *test_attach_result(PyObject *, PyObject *);
+PyObject *test_receiver_state(PyObject *, PyObject *);
+PyObject *test_receiver_queue(PyObject *, PyObject *);
+PyObject *test_stats(PyObject *, PyObject *);
+PyObject *test_stats_size(PyObject *, PyObject *);
+PyObject *test_new_track(PyObject *, PyObject *);
+PyObject *test_send_track_state(PyObject *, PyObject *);
+PyObject *test_subscribe_result(PyObject *, PyObject *);
+PyObject *test_subscriptions(PyObject *, PyObject *);
+PyObject *test_stats_result(PyObject *, PyObject *);
+PyObject *test_terminal_result(PyObject *, PyObject *);
+PyObject *test_track_desc(PyObject *, PyObject *);
+PyObject *test_track_current(PyObject *, PyObject *);
+PyObject *test_push_event(PyObject *, PyObject *);
+PyObject *test_poll_track_result(PyObject *, PyObject *);
+PyObject *test_desc_copy_result(PyObject *, PyObject *);
+PyObject *test_scramble_track(PyObject *, PyObject *);
+PyObject *test_layout(PyObject *, PyObject *);
+PyObject *test_push_orphan_desc(PyObject *, PyObject *);
+PyObject *test_push_object(PyObject *, PyObject *);
+PyObject *test_object_counts(PyObject *, PyObject *);
+PyObject *test_scramble_objects(PyObject *, PyObject *);
+PyObject *test_poll_object_result(PyObject *, PyObject *);
+PyObject *test_native_object_cycle(PyObject *, PyObject *);
+PyObject *test_object_settle(PyObject *, PyObject *);
+PyObject *test_native_object_hold(PyObject *, PyObject *);
+PyObject *test_native_object_cycle_split(PyObject *, PyObject *);
+/* Bridge-side, test-only: fail the Nth gated Python allocation in the bridge. */
+PyObject *test_fail_allocation_after(PyObject *, PyObject *);
+PyObject *test_sender_reset(PyObject *, PyObject *);
+PyObject *test_sender_counts(PyObject *, PyObject *);
+PyObject *test_sender_attach_result(PyObject *, PyObject *);
+PyObject *test_sender_state(PyObject *, PyObject *);
+PyObject *test_sender_config(PyObject *, PyObject *);
+PyObject *test_sender_cfg_shape(PyObject *, PyObject *);
+PyObject *test_sender_wait_hold(PyObject *, PyObject *);
+PyObject *test_sender_wait_held(PyObject *, PyObject *);
+PyObject *test_sender_wait_note_action(PyObject *, PyObject *);
+PyObject *test_sender_wait_release_held(PyObject *, PyObject *);
+PyObject *test_sender_wait_hold_report(PyObject *, PyObject *);
+PyObject *test_sender_wait_reset(PyObject *, PyObject *);
+PyObject *test_sender_wait_level(PyObject *, PyObject *);
+PyObject *test_sender_wait_counts(PyObject *, PyObject *);
+PyObject *test_sender_wait_simulate(PyObject *, PyObject *);
+PyObject *test_demand_reset(PyObject *, PyObject *);
+PyObject *test_demand_set(PyObject *, PyObject *);
+PyObject *test_demand_counts(PyObject *, PyObject *);
+PyObject *test_demand_simulate(PyObject *, PyObject *);
+PyObject *test_size_limits(PyObject *, PyObject *);
+PyObject *test_sender_stats(PyObject *, PyObject *);
+PyObject *test_sender_stats_size(PyObject *, PyObject *);
+PyObject *test_sender_stats_result(PyObject *, PyObject *);
+PyObject *test_sender_stats_calls(PyObject *, PyObject *);
+PyObject *test_sender_stats_layout(PyObject *, PyObject *);
+PyObject *test_sender_stats_fields(PyObject *, PyObject *);
+PyObject *test_sender_stats_drive(PyObject *, PyObject *);
+PyObject *test_sender_stats_snapshot(PyObject *, PyObject *);
+PyObject *test_sender_stats_last_result(PyObject *, PyObject *);
+PyObject *test_sender_stats_reset(PyObject *, PyObject *);
+PyObject *test_end_reset(PyObject *, PyObject *);
+PyObject *test_end_counts(PyObject *, PyObject *);
+PyObject *test_end_target(PyObject *, PyObject *);
+PyObject *test_end_result(PyObject *, PyObject *);
+PyObject *test_end_block(PyObject *, PyObject *);
+PyObject *test_end_requested(PyObject *, PyObject *);
+PyObject *test_end_simulate(PyObject *, PyObject *);
+PyObject *test_complete_reset(PyObject *, PyObject *);
+PyObject *test_complete_reset_entries(PyObject *, PyObject *);
+PyObject *test_complete_counts(PyObject *, PyObject *);
+PyObject *test_complete_target(PyObject *, PyObject *);
+PyObject *test_complete_result(PyObject *, PyObject *);
+PyObject *test_complete_block(PyObject *, PyObject *);
+PyObject *test_complete_simulate(PyObject *, PyObject *);
+PyObject *test_send_track_index_for(PyObject *, PyObject *);
+PyObject *test_write_reset(PyObject *, PyObject *);
+PyObject *test_write_counts(PyObject *, PyObject *);
+PyObject *test_write_result_current(PyObject *, PyObject *);
+PyObject *test_write_object(PyObject *, PyObject *);
+PyObject *test_write_result(PyObject *, PyObject *);
+const moq_alloc_t *moq5_test_counting_alloc(void);
+const moq_alloc_t *moq5_test_counting_alloc_for(int span);
+/* Recorded by the native module's fault machinery when a named site fires. */
+void moq5_test_note_fault_site(const char *name);
+/* Lets the fixture's own driver consume an armed fault, so the ordering
+ * observer can be proved without a bridge. */
+int moq5_test_site_fails(const char *name);
+PyObject *test_write_simulate_ordered(PyObject *, PyObject *);
+PyObject *test_write_stranded(PyObject *, PyObject *);
+PyObject *test_write_release_stranded(PyObject *, PyObject *);
+PyObject *test_write_settlement(PyObject *, PyObject *);
+PyObject *test_write_force_release_owned(PyObject *, PyObject *);
+PyObject *test_fault_site_inventory(PyObject *, PyObject *);
+PyObject *test_rcbuf_counts(PyObject *, PyObject *);
+PyObject *test_write_simulate(PyObject *, PyObject *);
+PyObject *test_write_block(PyObject *, PyObject *);
+PyObject *test_write_wait_entered(PyObject *, PyObject *);
+PyObject *test_write_release(PyObject *, PyObject *);
+PyObject *test_write_owned_refs(PyObject *, PyObject *);
+PyObject *test_send_track_simulate_add(PyObject *, PyObject *);
+PyObject *test_send_track_cfg_shape(PyObject *, PyObject *);
+PyObject *test_send_track_reset(PyObject *, PyObject *);
+PyObject *test_send_track_counts(PyObject *, PyObject *);
+PyObject *test_send_track_config(PyObject *, PyObject *);
+PyObject *test_send_track_results(PyObject *, PyObject *);
+PyObject *test_track_state(PyObject *, PyObject *);
+PyObject *test_sender_simulate_attach(PyObject *, PyObject *);
+PyObject *test_sender_simulate_destroy(PyObject *, PyObject *);
+PyObject *test_sender_log(PyObject *, PyObject *);
+PyObject *test_sender_snapshot(PyObject *, PyObject *);
+PyObject *test_at_boundary(PyObject *, PyObject *);
+PyObject *test_wait_budget(PyObject *, PyObject *);
+PyObject *test_loop_counts(PyObject *, PyObject *);
+PyObject *test_boundary_report(PyObject *, PyObject *);
+
+/* Bridge-side helpers the fixture uses to mint and read track capsules. */
+struct moq_media_receiver;
+struct moq_media_track;
+struct moq_media_receiver *moq5_test_receiver(PyObject *capsule);
+struct moq_media_track *moq5_test_track(PyObject *capsule);
+PyObject *moq5_test_track_capsule(PyObject *receiver_capsule, struct moq_media_track *track);
 
 #define MOQ_PYTHON_TEST_METHODS \
     {"_test_reset", test_reset, METH_NOARGS, NULL}, \
     {"_test_counts", test_counts, METH_NOARGS, NULL}, \
+    {"_test_endpoint_entries", test_endpoint_entries, METH_NOARGS, NULL}, \
     {"_test_config", test_config, METH_NOARGS, NULL}, \
     {"_test_connect_result", test_connect_result, METH_O, NULL}, \
     {"_test_stop_result", test_stop_result, METH_O, NULL}, \
@@ -38,6 +162,116 @@ PyObject *test_pthread_error(PyObject *, PyObject *);
     {"_test_force_watchdog", test_force_watchdog, METH_NOARGS, NULL}, \
     {"_test_watchdog_fired", test_watchdog_fired, METH_NOARGS, NULL}, \
     {"_test_force_pthread_error", test_force_pthread_error, METH_O, NULL}, \
-    {"_test_pthread_error", test_pthread_error, METH_NOARGS, NULL},
+    {"_test_pthread_error", test_pthread_error, METH_NOARGS, NULL}, \
+    {"_test_receiver_counts", test_receiver_counts, METH_NOARGS, NULL}, \
+    {"_test_receiver_config", test_receiver_config, METH_NOARGS, NULL}, \
+    {"_test_attach_result", test_attach_result, METH_O, NULL}, \
+    {"_test_receiver_state", test_receiver_state, METH_VARARGS, NULL}, \
+    {"_test_receiver_queue", test_receiver_queue, METH_VARARGS, NULL}, \
+    {"_test_stats", test_stats, METH_VARARGS, NULL}, \
+    {"_test_stats_size", test_stats_size, METH_O, NULL}, \
+    {"_test_new_track", test_new_track, METH_O, NULL}, \
+    {"_test_track_state", test_track_state, METH_VARARGS, NULL}, \
+    {"_test_subscribe_result", test_subscribe_result, METH_O, NULL}, \
+    {"_test_subscriptions", test_subscriptions, METH_NOARGS, NULL}, \
+    {"_test_stats_result", test_stats_result, METH_O, NULL}, \
+    {"_test_terminal_result", test_terminal_result, METH_O, NULL}, \
+    {"_test_track_desc", test_track_desc, METH_VARARGS, NULL}, \
+    {"_test_track_current", test_track_current, METH_VARARGS, NULL}, \
+    {"_test_push_event", test_push_event, METH_VARARGS, NULL}, \
+    {"_test_poll_track_result", test_poll_track_result, METH_O, NULL}, \
+    {"_test_desc_copy_result", test_desc_copy_result, METH_O, NULL}, \
+    {"_test_scramble_track", test_scramble_track, METH_O, NULL}, \
+    {"_test_layout", test_layout, METH_NOARGS, NULL}, \
+    {"_test_push_orphan_desc", test_push_orphan_desc, METH_O, NULL}, \
+    {"_test_push_object", test_push_object, METH_VARARGS, NULL}, \
+    {"_test_object_counts", test_object_counts, METH_NOARGS, NULL}, \
+    {"_test_scramble_objects", test_scramble_objects, METH_NOARGS, NULL}, \
+    {"_test_poll_object_result", test_poll_object_result, METH_O, NULL}, \
+    {"_test_native_object_cycle", test_native_object_cycle, METH_NOARGS, NULL}, \
+    {"_test_object_settle", test_object_settle, METH_NOARGS, NULL}, \
+    {"_test_native_object_hold", test_native_object_hold, METH_NOARGS, NULL}, \
+    {"_test_native_object_cycle_split", test_native_object_cycle_split, METH_NOARGS, NULL}, \
+    {"_test_fail_allocation_at", test_fail_allocation_at, METH_O, NULL}, \
+    {"_test_allocation_site_fired", test_allocation_site_fired, METH_O, NULL}, \
+    {"_test_object_progress", test_object_progress, METH_NOARGS, NULL}, \
+    {"_test_at_boundary", test_at_boundary, METH_VARARGS, NULL}, \
+    {"_test_wait_budget", test_wait_budget, METH_O, NULL}, \
+    {"_test_loop_counts", test_loop_counts, METH_NOARGS, NULL}, \
+    {"_test_boundary_report", test_boundary_report, METH_NOARGS, NULL}, \
+    {"_test_fail_allocation_after", test_fail_allocation_after, METH_O, NULL}, \
+    {"_test_sender_reset", test_sender_reset, METH_NOARGS, NULL}, \
+    {"_test_sender_counts", test_sender_counts, METH_NOARGS, NULL}, \
+    {"_test_sender_attach_result", test_sender_attach_result, METH_O, NULL}, \
+    {"_test_sender_state", test_sender_state, METH_VARARGS, NULL}, \
+    {"_test_sender_config", test_sender_config, METH_NOARGS, NULL}, \
+    {"_test_sender_cfg_shape", test_sender_cfg_shape, METH_NOARGS, NULL}, \
+    {"_test_sender_wait_hold", test_sender_wait_hold, METH_O, NULL}, \
+    {"_test_sender_wait_held", test_sender_wait_held, METH_VARARGS, NULL}, \
+    {"_test_sender_wait_note_action", test_sender_wait_note_action, METH_NOARGS, NULL}, \
+    {"_test_sender_wait_release_held", test_sender_wait_release_held, METH_NOARGS, NULL}, \
+    {"_test_sender_wait_hold_report", test_sender_wait_hold_report, METH_NOARGS, NULL}, \
+    {"_test_sender_wait_reset", test_sender_wait_reset, METH_NOARGS, NULL}, \
+    {"_test_sender_wait_level", test_sender_wait_level, METH_VARARGS, NULL}, \
+    {"_test_sender_wait_counts", test_sender_wait_counts, METH_NOARGS, NULL}, \
+    {"_test_sender_wait_simulate", test_sender_wait_simulate, METH_VARARGS, NULL}, \
+    {"_test_demand_reset", test_demand_reset, METH_NOARGS, NULL}, \
+    {"_test_demand_set", test_demand_set, METH_VARARGS, NULL}, \
+    {"_test_demand_counts", test_demand_counts, METH_NOARGS, NULL}, \
+    {"_test_demand_simulate", test_demand_simulate, METH_VARARGS, NULL}, \
+    {"_test_size_limits", test_size_limits, METH_NOARGS, NULL}, \
+    {"_test_sender_stats", test_sender_stats, METH_VARARGS, NULL}, \
+    {"_test_sender_stats_size", test_sender_stats_size, METH_O, NULL}, \
+    {"_test_sender_stats_result", test_sender_stats_result, METH_O, NULL}, \
+    {"_test_sender_stats_calls", test_sender_stats_calls, METH_NOARGS, NULL}, \
+    {"_test_sender_stats_layout", test_sender_stats_layout, METH_NOARGS, NULL}, \
+    {"_test_sender_stats_fields", test_sender_stats_fields, METH_NOARGS, NULL}, \
+    {"_test_sender_stats_drive", test_sender_stats_drive, METH_VARARGS, NULL}, \
+    {"_test_sender_stats_snapshot", test_sender_stats_snapshot, METH_NOARGS, NULL}, \
+    {"_test_sender_stats_last_result", test_sender_stats_last_result, METH_NOARGS, NULL}, \
+    {"_test_sender_stats_reset", test_sender_stats_reset, METH_NOARGS, NULL}, \
+    {"_test_end_reset", test_end_reset, METH_NOARGS, NULL}, \
+    {"_test_end_counts", test_end_counts, METH_NOARGS, NULL}, \
+    {"_test_end_target", test_end_target, METH_NOARGS, NULL}, \
+    {"_test_end_result", test_end_result, METH_VARARGS, NULL}, \
+    {"_test_end_block", test_end_block, METH_O, NULL}, \
+    {"_test_end_requested", test_end_requested, METH_O, NULL}, \
+    {"_test_end_simulate", test_end_simulate, METH_VARARGS, NULL}, \
+    {"_test_complete_reset", test_complete_reset, METH_NOARGS, NULL}, \
+    {"_test_complete_reset_entries", test_complete_reset_entries, METH_NOARGS, NULL}, \
+    {"_test_complete_counts", test_complete_counts, METH_NOARGS, NULL}, \
+    {"_test_complete_target", test_complete_target, METH_NOARGS, NULL}, \
+    {"_test_complete_result", test_complete_result, METH_VARARGS, NULL}, \
+    {"_test_complete_block", test_complete_block, METH_O, NULL}, \
+    {"_test_complete_simulate", test_complete_simulate, METH_VARARGS, NULL}, \
+    {"_test_send_track_index_for", test_send_track_index_for, METH_VARARGS, NULL}, \
+    {"_test_write_reset", test_write_reset, METH_NOARGS, NULL}, \
+    {"_test_write_counts", test_write_counts, METH_NOARGS, NULL}, \
+    {"_test_write_result_current", test_write_result_current, METH_NOARGS, NULL}, \
+    {"_test_write_object", test_write_object, METH_NOARGS, NULL}, \
+    {"_test_write_result", test_write_result, METH_VARARGS, NULL}, \
+    {"_test_rcbuf_counts", test_rcbuf_counts, METH_NOARGS, NULL}, \
+    {"_test_write_simulate", test_write_simulate, METH_VARARGS, NULL}, \
+    {"_test_write_block", test_write_block, METH_O, NULL}, \
+    {"_test_write_wait_entered", test_write_wait_entered, METH_VARARGS, NULL}, \
+    {"_test_write_release", test_write_release, METH_NOARGS, NULL}, \
+    {"_test_write_owned_refs", test_write_owned_refs, METH_NOARGS, NULL}, \
+    {"_test_write_simulate_ordered", test_write_simulate_ordered, METH_VARARGS, NULL}, \
+    {"_test_write_stranded", test_write_stranded, METH_NOARGS, NULL}, \
+    {"_test_write_release_stranded", test_write_release_stranded, METH_NOARGS, NULL}, \
+    {"_test_write_settlement", test_write_settlement, METH_NOARGS, NULL}, \
+    {"_test_write_force_release_owned", test_write_force_release_owned, METH_NOARGS, NULL}, \
+    {"_test_fault_site_inventory", test_fault_site_inventory, METH_O, NULL}, \
+    {"_test_send_track_simulate_add", test_send_track_simulate_add, METH_VARARGS, NULL}, \
+    {"_test_send_track_cfg_shape", test_send_track_cfg_shape, METH_NOARGS, NULL}, \
+    {"_test_send_track_reset", test_send_track_reset, METH_NOARGS, NULL}, \
+    {"_test_send_track_counts", test_send_track_counts, METH_NOARGS, NULL}, \
+    {"_test_send_track_config", test_send_track_config, METH_NOARGS, NULL}, \
+    {"_test_send_track_results", test_send_track_results, METH_VARARGS, NULL}, \
+    {"_test_send_track_state", test_send_track_state, METH_VARARGS, NULL}, \
+    {"_test_sender_simulate_attach", test_sender_simulate_attach, METH_VARARGS, NULL}, \
+    {"_test_sender_simulate_destroy", test_sender_simulate_destroy, METH_NOARGS, NULL}, \
+    {"_test_sender_log", test_sender_log, METH_NOARGS, NULL}, \
+    {"_test_sender_snapshot", test_sender_snapshot, METH_NOARGS, NULL},
 
 #endif

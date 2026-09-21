@@ -42,6 +42,52 @@ class MoqError(RuntimeError):
         return f"{self.operation}: {self.args[2]} (code {self.code})"
 
 
+class TrackNameBusy(MoqError):
+    """A retryable add_track refusal: the name, or a generated sibling, is
+    still held by a just-removed track whose teardown has not finished. Only
+    add_track's WOULD_BLOCK maps here; every other code stays a MoqError."""
+
+
+class BindingError(RuntimeError):
+    """Malformed native output detected by the bridge (a bad stamp, an
+    impossible span). Never carries a C result code: those are MoqError."""
+
+
+class EventLost(BindingError):
+    """A successful native poll dequeued a track event the bridge could not
+    convert. The event is consumed: `kind` is the already-validated kind (or
+    None) and `stage` names the failing field; no address is carried. A
+    MemoryError during conversion is raised as itself, not as EventLost."""
+
+    def __init__(self, kind: int | None, stage: str) -> None:
+        super().__init__(kind, stage)
+        self.kind = kind
+        self.stage = stage
+
+    def __str__(self) -> str:
+        return f"track event lost during conversion at {self.stage} (kind {self.kind})"
+
+
+class ObjectLost(BindingError):
+    """A successful native poll dequeued a media object the bridge could not
+    convert. The object is consumed and its buffers were released exactly
+    once; `stage` names the failing field or bound, and the scalar context
+    (`presentation_time_us`, `status`, `packaging`) is carried only when it
+    was validated before that stage, else None. No address is carried. A
+    MemoryError during conversion is raised as itself, not as ObjectLost."""
+
+    def __init__(self, stage: str, presentation_time_us: int | None, status: int | None,
+                 packaging: int | None) -> None:
+        super().__init__(stage, presentation_time_us, status, packaging)
+        self.stage = stage
+        self.presentation_time_us = presentation_time_us
+        self.status = status
+        self.packaging = packaging
+
+    def __str__(self) -> str:
+        return f"media object lost during conversion at {self.stage}"
+
+
 def _call(
     function: Callable[_Params, _Result],
     /,
@@ -53,11 +99,48 @@ def _call(
     except _native.Error as error:
         code, operation, message = error.args
         raise MoqError(code, operation, message) from error
+    except _native.EventLost as error:
+        kind, stage = error.args
+        raise EventLost(kind, stage) from error
+    except _native.ObjectLost as error:
+        stage, presentation_time_us, status, packaging = error.args
+        raise ObjectLost(stage, presentation_time_us, status, packaging) from error
+    except _native.BindingError as error:
+        raise BindingError(*error.args) from error
 
 
 def build_info() -> BuildInfo:
     """Copy compiled/runtime VERSION identities, Python ABI, and test marker."""
     return cast(BuildInfo, dict(_call(_native.build_info)))
+
+
+def _sliced_wait(native_wait: Callable[[object, int], int], handle: object, timeout_us: int) -> WaitResult:
+    """One public wait as bounded native wait requests against one monotonic
+    deadline (see Endpoint.wait). Shared by every owner that waits."""
+    timeout_us = _bounded_integer(timeout_us, "timeout_us", _INT64_MAX)
+    deadline_ns = _monotonic_ns() + timeout_us * 1_000
+    observed = False
+    while True:
+        remaining_ns = deadline_ns - _monotonic_ns()
+        exhausted = remaining_ns <= 0
+        if exhausted and observed:
+            return WaitResult.TIMED_OUT
+        # Round the remainder UP: a truncated slice would return before
+        # the caller's deadline. An exhausted budget still polls once.
+        slice_us = 0 if exhausted else min((remaining_ns + 999) // 1_000, _WAIT_SLICE_US)
+        result = WaitResult(_call(native_wait, handle, slice_us))
+        observed = True
+        if result is not WaitResult.TIMED_OUT:
+            return result
+        if exhausted:
+            # The one guaranteed observation timed out on an already
+            # exhausted budget: nothing can un-exhaust it, so no re-read.
+            return WaitResult.TIMED_OUT
+
+
+def _endpoint_handle(endpoint: "Endpoint") -> object:
+    """The private native handle, for package-internal attachment only."""
+    return endpoint._Endpoint__handle  # type: ignore[attr-defined]
 
 
 class Endpoint:
@@ -143,25 +226,7 @@ class Endpoint:
         slice neither shortens nor restarts the budget; the last slice is the
         exact remainder, rounded up.
         """
-        timeout_us = _bounded_integer(timeout_us, "timeout_us", _INT64_MAX)
-        deadline_ns = _monotonic_ns() + timeout_us * 1_000
-        observed = False
-        while True:
-            remaining_ns = deadline_ns - _monotonic_ns()
-            exhausted = remaining_ns <= 0
-            if exhausted and observed:
-                return WaitResult.TIMED_OUT
-            # Round the remainder UP: a truncated slice would return before
-            # the caller's deadline. An exhausted budget still polls once.
-            slice_us = 0 if exhausted else min((remaining_ns + 999) // 1_000, _WAIT_SLICE_US)
-            result = WaitResult(_call(_native.wait, self.__handle, slice_us))
-            observed = True
-            if result is not WaitResult.TIMED_OUT:
-                return result
-            if exhausted:
-                # The one guaranteed observation timed out on an already
-                # exhausted budget: nothing can un-exhaust it, so no re-read.
-                return WaitResult.TIMED_OUT
+        return _sliced_wait(_native.wait, self.__handle, timeout_us)
 
     def wake(self) -> None:
         """Request a coalesced service cycle; does not clear the interrupt latch."""
