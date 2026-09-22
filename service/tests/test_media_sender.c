@@ -40,6 +40,7 @@ typedef struct {
     uint64_t ts;
     bool     keyframe;        /* video_frame_marking.independent */
     uint8_t  first_byte;
+    uint8_t  priority;        /* publisher priority on the wire */
     moq_object_status_t status;   /* NORMAL / END_OF_TRACK (reliable terminal) */
 } srv_obj_t;
 
@@ -135,6 +136,7 @@ typedef struct {
     int          n;
     int          v_eot;           /* count of END_OF_TRACK status objects on "v" */
     int          a_count;         /* count of "a" objects (any status) */
+    uint8_t      a_priority;      /* publisher priority of the last "a" object */
     int          v_done;          /* count of SUBSCRIBE_DONE on "v" */
     uint64_t     v_done_status;   /* status code of the last "v" SUBSCRIBE_DONE */
     uint64_t     v_done_streams;  /* stream count of the last "v" done */
@@ -280,6 +282,7 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
             } else if (st->a_subscribed && moq_subscription_eq(o->sub, st->sub_a)) {
                 pthread_mutex_lock(&st->mu);
                 st->a_count++;
+                st->a_priority = o->publisher_priority;
                 pthread_mutex_unlock(&st->mu);
             } else if (st->sap_subscribed &&
                 moq_subscription_eq(o->sub, st->sub_sap)) {
@@ -324,6 +327,7 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                     r->object = o->object_id;
                     r->end_of_group = o->end_of_group;
                     r->status = o->status;
+                    r->priority = o->publisher_priority;
                     if (o->payload && moq_rcbuf_len(o->payload) > 0)
                         r->first_byte = moq_rcbuf_data(o->payload)[0];
                     if (o->properties) {
@@ -2247,6 +2251,67 @@ int main(int argc, char **argv)
         moq_media_sender_destroy(s);
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == live loopback: per-track publisher priority ===================== *
+     * "a" is added with an explicit priority and "v" without one: the peer
+     * sees each track's objects at its own priority. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.want_a = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL, *a = NULL;
+        add_video_track(s, &v);
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = MOQ_BYTES_LITERAL("a");
+        tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.codec = MOQ_BYTES_LITERAL("opus");
+        tc.samplerate = 48000;
+        tc.channel_config = MOQ_BYTES_LITERAL("2");
+        tc.bitrate = 32000;
+        tc.has_publisher_priority = true;
+        tc.publisher_priority = 64;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &a),
+                              (int)MOQ_OK);
+
+        { moq_rcbuf_t *b = mkbuf(16, 1);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, v, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+        { moq_rcbuf_t *b = mkbuf(16, 2);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, a, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+        for (int i = 0; i < 200 &&
+             (srv_count(&g_srv) < 1 || srv_a_count(&g_srv) < 1); i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(srv_count(&g_srv) >= 1);
+        MOQ_TEST_CHECK(srv_a_count(&g_srv) >= 1);
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.a_priority, 64);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.objs[0].priority, 128);
+        pthread_mutex_unlock(&g_srv.mu);
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.track_publisher_priority");
     }
 
     /* == live loopback: public end_track() drains to a real peer ========= *

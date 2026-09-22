@@ -373,6 +373,12 @@ typedef struct moq_media_track_cfg {
      * an older caller's struct_size prefix never reinterprets these bytes. */
     bool        has_alt_group;
     int         alt_group;
+
+    /* MOQT publisher priority for this track's objects (lower is sent first).
+     * has_publisher_priority=false (the default) keeps the publisher default.
+     * Generated timeline tracks always keep the default. */
+    bool        has_publisher_priority;
+    uint8_t     publisher_priority;
 } moq_media_track_cfg_t;
 
 MOQ_API void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg);
