@@ -96,6 +96,9 @@ static moq_media_track_t *add_cmaf_altgroup(moq_media_sender_t *s,
     tc.is_live = true;
     tc.has_alt_group = true;
     tc.alt_group = alt_group;
+    /* CMSF-01 3.1 requires init data; opaque bytes, this test pins altGroup. */
+    static const uint8_t cmaf_init[] = { 0x01, 0x42, 0xe0, 0x1e };
+    tc.init_data = (moq_bytes_t){ cmaf_init, sizeof(cmaf_init) };
     moq_media_track_t *t = NULL;
     MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
                           (int)MOQ_OK);
@@ -432,6 +435,34 @@ int main(void)
         MOQ_TEST_CHECK_EQ_U64(built_track_count(s), 0);
         moq_media_sender_test_free(s);
         MOQ_TEST_PASS("sender_catalog.sap_timeline_pair");
+    }
+
+    /* -- CMSF-01 3.1: a CMAF track MUST carry init data --------------- */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_sender_test_set_ready(s);
+
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = (moq_bytes_t){ (const uint8_t *)"v", 1 };
+        tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        tc.codec = (moq_bytes_t){ (const uint8_t *)"avc1.42c01e", 11 };
+        tc.bitrate = 1000000;
+        tc.is_live = true;
+
+        /* CMAF without init data is rejected. */
+        moq_media_track_t *t = NULL;
+        tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_ERR_INVAL);
+
+        /* LOC/RAW may carry it in band, so the same track is accepted. */
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.cmaf_requires_init_data");
     }
 
     /* -- 5. a generated eventtimeline track is not user-removable ------ */
@@ -1021,6 +1052,9 @@ int main(void)
         tc.is_live = true;
         tc.has_alt_group = true;   /* set, but the old prefix excludes these bytes */
         tc.alt_group = 9;
+        /* CMSF-01 3.1 requires init data; it sits in the frozen prefix. */
+        static const uint8_t old_init[] = { 0x01, 0x42, 0xe0, 0x1e };
+        tc.init_data = (moq_bytes_t){ old_init, sizeof(old_init) };
         /* Simulate a caller built against the pre-altGroup struct: its
          * struct_size stops before has_alt_group, so the prefix-safe copy in
          * add_track must NOT read these trailing bytes. */
@@ -1088,8 +1122,8 @@ int main(void)
      * generation staged (E2E case D). The emitted objects are consumed by
      * OTHER MSF-01 receivers (PlayA), whose parsers are stricter than our
      * own lenient parse -- so assert the exact wire shape, not a libmoq
-     * parse round-trip: base version String "1" (§5.1.1) and the §5.1.6
-     * deltaUpdate array with no root version. */
+     * parse round-trip: the 5.1.1 version and the 5.1.7/5.2.13
+     * initDataList + initRef carriage of the added track's init data. */
     {
         moq_media_sender_t *s = moq_media_sender_test_new();
         (void)add_trk(s, "v", false);
@@ -1098,8 +1132,8 @@ int main(void)
         moq_media_sender_test_mark_published(s);   /* baseline = {v} */
 
         /* Post-ready add shaped like a real LOC video track (the E2E case D
-         * shape): init data (inlined base64 into the delta add), width/
-         * height/framerate. */
+         * shape): init data (which forces a full generation),
+         * width/height/framerate. */
         {
             moq_media_track_cfg_t tc;
             moq_media_track_cfg_init(&tc);
@@ -1121,37 +1155,28 @@ int main(void)
 
         moq_rcbuf_t *objs[3] = { NULL, NULL, NULL };
         size_t nobj = moq_media_sender_test_stage(s, objs, 3);
-        MOQ_TEST_CHECK_EQ_INT((int)nobj, 2);       /* base + one ADD delta */
+        /* The added track carries init data, whose MSF-01 home is the root
+         * initDataList[] -- a delta cannot express that, so this is one full
+         * independent catalog, not base + delta. */
+        MOQ_TEST_CHECK_EQ_INT((int)nobj, 1);
 
-        /* Object 0 -- the independent base. §5.1.1: version is the String
-         * "1" (the exact value PlayA and the pre-rewrite libmoq agree on;
-         * "draft-01" is rejected by strict MSF-01 receivers -- the E2E case D
-         * regression). */
+        /* The independent catalog. 5.1.1: version is the draft-name String
+         * "draft-01" (the parser also accepts "1" and the MSF-00 numeric
+         * form). 5.1.7/5.2.13: init data lives in the root initDataList[],
+         * referenced by initRef; MSF-01 has no per-track initData. */
         {
-            char tmp[512];
+            char tmp[1024];
             size_t n = moq_rcbuf_len(objs[0]);
             MOQ_TEST_CHECK(n < sizeof(tmp));
             memcpy(tmp, moq_rcbuf_data(objs[0]), n); tmp[n] = '\0';
-            MOQ_TEST_CHECK(strstr(tmp, "\"version\":\"1\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "draft-01") == NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"version\":\"draft-01\"") != NULL);
             MOQ_TEST_CHECK(strstr(tmp, "\"tracks\":[") != NULL);
-        }
-
-        /* Object 1 -- the delta. §5.1.6 shape: a deltaUpdate ARRAY of
-         * {op, tracks} operations, and NO root version/tracks fields (a
-         * delta MUST NOT carry them). The added track must be the full
-         * self-contained shape (inline initData base64, no initRef). */
-        {
-            char tmp[1024];
-            size_t n = moq_rcbuf_len(objs[1]);
-            MOQ_TEST_CHECK(n < sizeof(tmp));
-            memcpy(tmp, moq_rcbuf_data(objs[1]), n); tmp[n] = '\0';
-            MOQ_TEST_CHECK(strncmp(tmp, "{\"deltaUpdate\":[{\"op\":\"add\"",
-                                   27) == 0);
-            MOQ_TEST_CHECK(strstr(tmp, "\"version\"") == NULL);
             MOQ_TEST_CHECK(strstr(tmp, "\"name\":\"late\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "\"initData\":\"AULgHg==\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "initRef") == NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"initData\"") == NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"initRef\":\"late\"") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"initDataList\":[") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"type\":\"inline\"") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "\"data\":\"AULgHg==\"") != NULL);
         }
 
         for (size_t i = 0; i < nobj; i++) moq_rcbuf_decref(objs[i]);
