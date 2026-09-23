@@ -115,6 +115,7 @@ struct moq_media_track {
     uint64_t              track_duration_ms;
     bool                  has_alt_group;       /* CMSF §3.2 (switching set) */
     int                   alt_group;
+    moq_media_init_mode_t init_mode;           /* LOC init carriage (RAW only) */
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
      * allocation; the id bytes live in `strings` with the other spans. */
@@ -937,49 +938,37 @@ static moq_result_t sender_build_catalog(moq_media_sender_t *s,
         moq_media_track_t *t = s->tracks[i];
         if (!track_in_catalog(t, only_registered)) continue;
         track_fill_msf(t, &mt[k]);
-        if (t->init_data.len > 0) {
-            if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF) {
-                /* CMSF §3.1: the init segment lives in initDataList[]; the track
-                 * references it via initRef. MSF-01 lets several tracks share one
-                 * entry, so reuse an existing entry whose raw init bytes are
-                 * identical instead of duplicating it; the entry id is the name
-                 * of the track that introduced it. */
-                size_t e = idl_count;
-                for (size_t j = 0; j < idl_count; j++) {
-                    if (idl_raw[j].len == t->init_data.len &&
-                        (t->init_data.len == 0 ||
-                         memcmp(idl_raw[j].data, t->init_data.data,
-                                t->init_data.len) == 0)) {
-                        e = j;
-                        break;
-                    }
-                }
-                if (e == idl_count) {
-                    rc = moq_msf_encode_init_data(&s->alloc, t->init_data,
-                                                  &b64[nb]);
-                    if (rc < 0) break;
-                    idl[idl_count].id   = t->name;
-                    idl[idl_count].type =
-                        (moq_bytes_t){ (const uint8_t *)"inline", 6 };
-                    idl[idl_count].data = (moq_bytes_t){
-                        moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
-                    idl_raw[idl_count] = t->init_data;
-                    nb++;
-                    idl_count++;
-                }
-                mt[k].has_init_ref = true;
-                mt[k].init_ref = idl[e].id;
-            } else {
-                /* LOC: legacy inline initData (base64), not shared. */
-                rc = moq_msf_encode_init_data(&s->alloc, t->init_data, &b64[nb]);
-                if (rc < 0) break;
-                if (moq_rcbuf_len(b64[nb]) > 0) {
-                    mt[k].has_init_data = true;
-                    mt[k].init_data = (moq_bytes_t){
-                        moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
-                    nb++;
+        /* MSF-01 5.1.7: initDataList is OPTIONAL, so an INBAND-only track
+         * contributes no entry and gets no initRef. BOTH still does. */
+        if (t->init_data.len > 0 && t->init_mode != MOQ_MEDIA_INIT_INBAND) {
+            /* MSF-01 5.1.7/5.2.13: init data lives in the root
+             * initDataList[], referenced by initRef, whatever the packaging;
+             * there is no per-track initData field. Entries are shareable, so
+             * reuse one with identical bytes; its id is the first track's. */
+            size_t e = idl_count;
+            for (size_t j = 0; j < idl_count; j++) {
+                if (idl_raw[j].len == t->init_data.len &&
+                    memcmp(idl_raw[j].data, t->init_data.data,
+                           t->init_data.len) == 0) {
+                    e = j;
+                    break;
                 }
             }
+            if (e == idl_count) {
+                rc = moq_msf_encode_init_data(&s->alloc, t->init_data,
+                                              &b64[nb]);
+                if (rc < 0) break;
+                idl[idl_count].id   = t->name;
+                idl[idl_count].type =
+                    (moq_bytes_t){ (const uint8_t *)"inline", 6 };
+                idl[idl_count].data = (moq_bytes_t){
+                    moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
+                idl_raw[idl_count] = t->init_data;
+                nb++;
+                idl_count++;
+            }
+            mt[k].has_init_ref = true;
+            mt[k].init_ref = idl[e].id;
         }
         k++;
     }
@@ -1047,6 +1036,14 @@ static bool sender_build_props(moq_media_sender_t *s,
     if (t->media_type == MOQ_MEDIA_TYPE_VIDEO) {
         h.has_video_frame_marking = true;
         h.video_frame_marking.independent = e->is_sync;
+        /* LOC-01 2.3.2.1 Video Config (ID 13). Group starts only: a delta
+         * is never the first object decoded. Bytes borrowed from the track. */
+        if (e->is_sync && t->init_data.len > 0 &&
+            (t->init_mode == MOQ_MEDIA_INIT_INBAND ||
+             t->init_mode == MOQ_MEDIA_INIT_BOTH)) {
+            h.has_video_config = true;
+            h.video_config = t->init_data;
+        }
     }
     /* Fail closed on an unobserved or unsupported draft: an object may not
      * be encoded before the session's version has been latched, and there
@@ -1747,10 +1744,9 @@ static bool rcbuf_bytes_eq(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
 
 /* Build one deltaUpdate object (ADD or REMOVE) from `tracks`, encoded to an
  * rcbuf. An ADD op carries full, self-contained tracks (packaging/isLive forced
- * on so the encoder emits them, and any init data inlined base64 so the
- * receiver's apply_delta builds a valid effective without a root initDataList);
- * a REMOVE op carries only the track name (MSF 5.1.6). Returns MOQ_OK with *out
- * set. */
+ * on so the encoder emits them) but never init data -- an init-bearing add
+ * goes to a full independent generation instead; a REMOVE op carries only the
+ * track name (MSF 5.1.6). Returns MOQ_OK with *out set. */
 static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
                                           moq_msf_delta_op_kind_t kind,
                                           moq_media_track_t *const *tracks,
@@ -1760,14 +1756,7 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
     if (n == 0) return MOQ_ERR_INVAL;
     moq_msf_track_t *mt = (moq_msf_track_t *)s->alloc.alloc(
         n * sizeof(moq_msf_track_t), s->alloc.ctx);
-    moq_rcbuf_t **b64 = (moq_rcbuf_t **)s->alloc.alloc(
-        n * sizeof(moq_rcbuf_t *), s->alloc.ctx);
-    if (!mt || !b64) {
-        if (mt) s->alloc.free(mt, n * sizeof(moq_msf_track_t), s->alloc.ctx);
-        if (b64) s->alloc.free(b64, n * sizeof(moq_rcbuf_t *), s->alloc.ctx);
-        return MOQ_ERR_NOMEM;
-    }
-    memset(b64, 0, n * sizeof(moq_rcbuf_t *));
+    if (!mt) return MOQ_ERR_NOMEM;
 
     moq_result_t rc = MOQ_OK;
     for (size_t i = 0; i < n; i++) {
@@ -1775,21 +1764,13 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
             track_fill_msf(tracks[i], &mt[i]);
             mt[i].has_packaging = true;   /* encoder emits packaging + isLive */
             mt[i].has_is_live = true;
-            /* Inline the init segment (base64) so the add is self-contained --
-             * a delta has no root initDataList for an initRef to resolve. This
-             * matches the LOC track's canonical inline-init shape; CMAF init-
-             * bearing adds never reach here (the caller falls back to a full
-             * independent generation so the track keeps its initRef shape). */
-            if (tracks[i]->init_data.len > 0) {
-                rc = moq_msf_encode_init_data(&s->alloc, tracks[i]->init_data,
-                                              &b64[i]);
-                if (rc < 0) break;
-                mt[i].has_init_data = true;
-                mt[i].init_data = (moq_bytes_t){ moq_rcbuf_data(b64[i]),
-                                                 moq_rcbuf_len(b64[i]) };
-                mt[i].has_init_ref = false;   /* inline, not a list reference */
-                mt[i].init_ref = (moq_bytes_t){ NULL, 0 };
-            }
+            /* A delta has no root initDataList to resolve an initRef, and
+             * MSF-01 has no per-track initData to inline, so an init-bearing
+             * add never reaches here -- it goes to a full generation. */
+            mt[i].has_init_data = false;
+            mt[i].init_data = (moq_bytes_t){ NULL, 0 };
+            mt[i].has_init_ref = false;
+            mt[i].init_ref = (moq_bytes_t){ NULL, 0 };
         } else { /* REMOVE: name only (MSF 5.1.6). */
             memset(&mt[i], 0, sizeof(mt[i]));
             mt[i].struct_size = sizeof(mt[i]);
@@ -1807,8 +1788,6 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
         rc = moq_msf_catalog_encode(&s->alloc, &cat, out);
     }
 
-    for (size_t i = 0; i < n; i++) if (b64[i]) moq_rcbuf_decref(b64[i]);
-    s->alloc.free(b64, n * sizeof(moq_rcbuf_t *), s->alloc.ctx);
     s->alloc.free(mt, n * sizeof(moq_msf_track_t), s->alloc.ctx);
     return rc;
 }
@@ -1882,7 +1861,7 @@ static bool sender_stage_generation(moq_media_sender_t *s)
         return false;
     }
     size_t na = 0, nr = 0;
-    bool cmaf_init_add = false;
+    bool init_add = false;
     bool meta_changed = false;
     for (size_t i = 0; i < s->track_count; i++) {
         moq_media_track_t *t = s->tracks[i];
@@ -1897,23 +1876,19 @@ static bool sender_stage_generation(moq_media_sender_t *s)
         }
         if (in_cat && !t->in_published) {
             adds[na++] = t;
-            /* A CMAF init segment lives in the independent catalog's root
-             * initDataList (referenced by initRef), a shape a deltaUpdate add
-             * cannot carry. Emitting it inline here would diverge from the
-             * track's canonical (initRef) shape in every later independent
-             * catalog, which the receiver's immutable-tuple check rejects. So a
-             * generation that adds a CMAF init-bearing track falls back to a
-             * full independent generation (LOC inline init, and init-less
-             * tracks, stay on the delta path). */
-            if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF &&
-                t->init_data.len > 0)
-                cmaf_init_add = true;
+            /* A deltaUpdate add cannot carry the root initDataList/initRef
+             * shape, and inlining it would diverge from the track's shape in
+             * later catalogs (the receiver's immutable-tuple check rejects
+             * that). So an init-bearing add forces a full generation.
+             * INBAND-only tracks add no entry, so they need no fallback. */
+            if (t->init_data.len > 0 && t->init_mode != MOQ_MEDIA_INIT_INBAND)
+                init_add = true;
         } else if (!in_cat && t->in_published) {
             rems[nr++] = t;
         }
     }
 
-    if (cmaf_init_add || meta_changed) {
+    if (init_add || meta_changed) {
         s->alloc.free(adds, s->track_count * sizeof(*adds), s->alloc.ctx);
         s->alloc.free(rems, s->track_count * sizeof(*rems), s->alloc.ctx);
         moq_rcbuf_incref(current);
@@ -3619,6 +3594,10 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         if (cfg->samplerate == 0) return MOQ_ERR_INVAL;          /* 5.2.28 */
         if (cfg->channel_config.len == 0) return MOQ_ERR_INVAL;  /* 5.2.29 */
     }
+    /* CMSF-01 3.1: a CMAF header MUST reach the catalog, and a moof is
+     * undecodable without the init moov. LOC/RAW may carry it in band. */
+    if (cfg->packaging == MOQ_MEDIA_PACKAGING_CMAF && cfg->init_data.len == 0)
+        return MOQ_ERR_INVAL;
     /* contentProtectionRefIDs: each id must be coherent AND resolve to a
      * configured root contentProtections entry (catalog coherence, not DRM
      * semantics). Root entries are immutable after construction, so this read
@@ -3633,6 +3612,23 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     }
     /* MSF §5.2.35: trackDuration MUST NOT appear on a live track. */
     if (cfg->has_track_duration && cfg->is_live) return MOQ_ERR_INVAL;
+
+    /* Init carriage (appended field; absent for an older caller => CATALOG).
+     * The in-band modes need init_data and RAW/LOC packaging. */
+    if (cfg->struct_size >= offsetof(moq_media_track_cfg_t, init_mode) +
+                            sizeof(cfg->init_mode)) {
+        switch (cfg->init_mode) {
+        case MOQ_MEDIA_INIT_CATALOG:
+            break;
+        case MOQ_MEDIA_INIT_INBAND:
+        case MOQ_MEDIA_INIT_BOTH:
+            if (cfg->packaging != MOQ_MEDIA_PACKAGING_RAW) return MOQ_ERR_INVAL;
+            if (cfg->init_data.len == 0) return MOQ_ERR_INVAL;
+            break;
+        default:
+            return MOQ_ERR_INVAL;
+        }
+    }
 
     /* add_track is legal both before and after READY : a post-ready add
      * registers the track and triggers an independent catalog republish. Once
@@ -3700,6 +3696,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->track_duration_ms = cfg->track_duration_ms;
     t->has_alt_group = cfg->has_alt_group;
     t->alt_group = cfg->alt_group;
+    /* Appended field: read only when the caller's struct_size covers it. */
+    t->init_mode = MOQ_MEDIA_INIT_CATALOG;
+    if (cfg->struct_size >= offsetof(moq_media_track_cfg_t, init_mode) +
+                            sizeof(cfg->init_mode))
+        t->init_mode = cfg->init_mode;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;

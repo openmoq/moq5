@@ -136,14 +136,9 @@ static bool get_framerate_millis(const json_object_element_t *e,
 }
 
 /*
- * MSF version handling (§5.1.1). "version" is the JSON String "1" -- the wire
- * form strict MSF-01 receivers (PlayA) accept and the form this encoder emits
- * (see the encoder). On parse this code also accepts "draft-01" (catalogs
- * emitted by intermediate libmoq builds that briefly used a draft-name string)
- * and the pre-01 numeric form (1) for LEGACY COMPATIBILITY ONLY (MSF-00
- * emitted a JSON number). Anything else -- other versions, other or malformed
- * draft strings, empty, or a non-string/non-number -- is unsupported; per
- * §5.1.1 a subscriber MUST NOT parse a version it does not understand.
+ * MSF version handling (5.1.1). Emits the draft-name String "draft-01";
+ * parsing also accepts "1" and the legacy MSF-00 numeric 1. Anything else is
+ * unsupported: a subscriber MUST NOT parse a version it does not understand.
  */
 static bool version_is_supported(const json_object_element_t *e)
 {
@@ -2026,14 +2021,9 @@ static size_t enc_catalog_to(uint8_t *buf, size_t cap,
         return b.pos;
     }
 
-    /* MSF-01 §5.1.1: version is the JSON String "1" -- the numeral, not a
-     * draft-name string. This is the wire form strict MSF-01 receivers
-     * (PlayA) accept and the form libmoq itself emitted cross-impl before
-     * the "draft-01" regression (E2E case D captured fixture). The parser
-     * still accepts "draft-01" (catalogs from intermediate builds) and
-     * legacy numeric 1 (MSF-00). */
-    enc_lit(&b, "{\"version\":\"");
-    { char num[8]; snprintf(num, sizeof(num), "%d", cat->version); enc_lit(&b, num); }
+    /* MSF-01 5.1.1: the draft-name String "draft-NN". */
+    enc_lit(&b, "{\"version\":\"draft-");
+    { char num[8]; snprintf(num, sizeof(num), "%02d", cat->version); enc_lit(&b, num); }
     enc_char(&b, '"');
 
     if (cat->has_generated_at) {

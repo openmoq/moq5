@@ -3093,10 +3093,16 @@ int main(int argc, char **argv)
                 moq_msf_catalog_find_role(&catalog, "video");
             MOQ_TEST_CHECK(vt != NULL);
             if (vt) {
-                MOQ_TEST_CHECK(vt->has_init_data && vt->init_data.len > 0);
+                /* MSF-01: init data lives in the root initDataList[], the
+                 * track points at it via initRef. */
+                MOQ_TEST_CHECK(vt->has_init_ref && vt->init_ref.len > 0);
+                const moq_msf_init_data_entry_t *ide =
+                    moq_msf_catalog_find_init_data(&catalog, vt->init_ref);
+                MOQ_TEST_CHECK(ide != NULL);
                 moq_rcbuf_t *decoded = NULL;
-                MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
-                    al, vt->init_data, &decoded), (int)MOQ_OK);
+                if (ide)
+                    MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
+                        al, ide->data, &decoded), (int)MOQ_OK);
                 if (decoded) {
                     MOQ_TEST_CHECK_EQ_U64(moq_rcbuf_len(decoded),
                                           sizeof(extradata));

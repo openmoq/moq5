@@ -574,7 +574,7 @@ int main(void)
             size_t c = n < sizeof(tmp) - 1 ? n : sizeof(tmp) - 1;
             memcpy(tmp, d, c);
             tmp[c] = '\0';
-            CHECK(strstr(tmp, "\"version\":\"1\"") != NULL);
+            CHECK(strstr(tmp, "\"version\":\"draft-01\"") != NULL);
         }
 
         moq_msf_catalog_t parsed;
@@ -1412,7 +1412,7 @@ int main(void)
         moq_rcbuf_t *enc = NULL;
         CHECK(moq_msf_catalog_encode(alloc, &cat, &enc) == MOQ_OK);
         moq_bytes_t out = { moq_rcbuf_data(enc), moq_rcbuf_len(enc) };
-        CHECK(contains_bytes(out, "\"version\":\"1\""));
+        CHECK(contains_bytes(out, "\"version\":\"draft-01\""));
         moq_rcbuf_decref(enc);   /* caller-built catalog: no cleanup */
     }
 
