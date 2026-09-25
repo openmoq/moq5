@@ -9,6 +9,9 @@ endif()
 if(POLICY CMP0179)
     cmake_policy(SET CMP0179 NEW)
 endif()
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 
 project(libmoq
     VERSION 0.1.0
@@ -609,9 +612,12 @@ if(MOQ_BUILD_ADAPTER_MVFST)
         "  endif()\n"
         "  enable_language(CXX)\n"
         "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake\")\n"
+        "  include(\"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake/MoqMvfstBoostIcu.cmake\")\n"
         "  find_dependency(fmt CONFIG)\n"
         "  find_dependency(mvfst CONFIG)\n"
+        "  moq_mvfst_patch_boost_icu_link_directories()\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake\")\n"
+        "  moq_mvfst_apply_boost_icu_link_directories(moq::adapter-mvfst)\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND TRUE)\n"
         "endif()\n")
 endif()
@@ -777,9 +783,12 @@ if(MOQ_BUILD_SERVICE)
             "    endif()\n"
             "    enable_language(CXX)\n"
             "    list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake\")\n"
+            "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake/MoqMvfstBoostIcu.cmake\")\n"
             "    find_dependency(fmt CONFIG)\n"
             "    find_dependency(mvfst CONFIG)\n"
+            "    moq_mvfst_patch_boost_icu_link_directories()\n"
             "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake\")\n"
+            "    moq_mvfst_apply_boost_icu_link_directories(moq::adapter-mvfst)\n"
             "  endif()\n")
     endif()
     if(MOQ_BUILD_ADAPTER_PROXYGEN)

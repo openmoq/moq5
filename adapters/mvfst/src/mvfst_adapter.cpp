@@ -67,6 +67,41 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
+
+namespace {
+/* fizz's OpenSSLCertificateVerifier grew a static create() factory and made
+ * its constructors protected (they now also take the CertificateAuthorities
+ * advertised in the handshake). fizz carries no version macro, so detect the
+ * factory and fall back to the public constructors of older releases. A null
+ * store selects system trust in both APIs. */
+template <typename V, typename = void>
+struct has_verifier_create : std::false_type {};
+template <typename V>
+struct has_verifier_create<V, std::void_t<decltype(V::create(
+    std::declval<std::unique_ptr<V> &>(), std::declval<fizz::Error &>(),
+    std::declval<fizz::VerificationContext>(),
+    std::declval<folly::ssl::X509StoreUniquePtr &&>()))>>
+    : std::true_type {};
+
+template <typename V = fizz::openssl::OpenSSLCertificateVerifier>
+std::shared_ptr<V> make_chain_verifier(folly::ssl::X509StoreUniquePtr store)
+{
+    if constexpr (has_verifier_create<V>::value) {
+        std::unique_ptr<V> ret;
+        fizz::Error err;
+        if (V::create(ret, err, fizz::VerificationContext::Client,
+                      std::move(store)) != fizz::Status::Success || !ret)
+            throw std::runtime_error("OpenSSLCertificateVerifier::create");
+        return std::shared_ptr<V>(std::move(ret));
+    } else {
+        if (store)
+            return std::make_shared<V>(fizz::VerificationContext::Client,
+                                       std::move(store));
+        return std::make_shared<V>(fizz::VerificationContext::Client);
+    }
+}
+} // namespace
 
 /*
  * Certificate verifier: chain validation + host/IP identity.
@@ -261,8 +296,17 @@ struct moq_mvfst_managed {
     std::string alpn = "moqt-16";
     moq_version_t cfg_version = MOQ_VERSION_DRAFT_16;
     std::atomic<int> negotiated{0};
+    std::vector<quic::QuicVersion> client_supported_versions{
+        quic::QuicVersion::QUIC_V1};
 
-    std::atomic<moq_session_t *> session{nullptr};
+    std::atomic<moq_session_t *> session{nullptr};   /* client session; freed
+                                                       * by the destructor,
+                                                       * after the thread is
+                                                       * joined */
+    ~moq_mvfst_managed() {
+        moq_session_t *s = session.exchange(nullptr);
+        if (s) moq_session_destroy(s);
+    }
     moq_perspective_t perspective = MOQ_PERSPECTIVE_CLIENT;
 
     struct start_cb
@@ -555,6 +599,8 @@ struct moq_mvfst_managed {
      * grants on the client adapter -- deterministic backpressure evidence. */
     uint64_t credit_block_count() const;
     uint64_t credit_grant_count() const;
+    bool has_client_session() const;
+    size_t client_quic_versions(uint32_t *out, size_t cap) const;
 #endif
 };
 
@@ -875,8 +921,17 @@ moq_result_t moq_mvfst_managed_create(
         if (h->transport) {
             h->transport.reset();
         }
-        moq_session_t *s = h->session.exchange(nullptr);
-        if (s) moq_session_destroy(s);
+        /* The client session is NOT destroyed here. It outlives the network
+         * thread until moq_mvfst_managed_destroy(), as it does on the
+         * picoquic facades: the service tier's media sender keeps a pointer
+         * to it and, once the endpoint is terminal, runs moq_pub_destroy()
+         * inline on the application thread (sender_destroy_pub_task cannot be
+         * posted to a dead pump). Freeing the session on a fatal loop exit
+         * left that destroy dereferencing freed memory (segfault in
+         * track_hist_release after a relay closed a draft-18 session). Nothing
+         * on this thread touches the session after adapter_ptr is gone, and
+         * moq_mvfst_managed_session() only hands it out inside the pump
+         * window. */
         if (auto *sevb = h->server_evb.load(std::memory_order_acquire)) {
             /* Barrier on server_evb: any in-flight pump callback has already
              * completed (FIFO), and scheduling is gated off, so it is safe to
@@ -1025,14 +1080,9 @@ moq_result_t moq_mvfst_managed_create(
                                     "load CA file");
                             X509_STORE_set_flags(store.get(),
                                 X509_V_FLAG_PARTIAL_CHAIN);
-                            chain = std::make_shared<fizz::openssl::
-                                OpenSSLCertificateVerifier>(
-                                    fizz::VerificationContext::Client,
-                                    std::move(store));
+                            chain = make_chain_verifier(std::move(store));
                         } else {
-                            chain = std::make_shared<fizz::openssl::
-                                OpenSSLCertificateVerifier>(
-                                    fizz::VerificationContext::Client);
+                            chain = make_chain_verifier(nullptr);
                         }
                         verifier = std::make_shared<identity_verifier>(
                             std::move(chain), server_name);
@@ -1053,6 +1103,17 @@ moq_result_t moq_mvfst_managed_create(
                         static_cast<uint16_t>(m->port), true);
                     m->transport->addNewPeerAddress(peer);
                     m->transport->setHostname(server_name);  /* SNI */
+                    /* Offer standard QUIC v1 only. mvfst's client default
+                     * puts Meta's private QuicVersion::MVFST (0xfaceb002)
+                     * first, and on the Version Negotiation packet every
+                     * non-mvfst server answers with (picoquic, quiche,
+                     * msquic) it fails the connection with
+                     * LocalErrorCode::NEW_VERSION_NEGOTIATED instead of
+                     * retrying -- so this client could only ever reach an
+                     * mvfst server. moxygen's own clients pin QUIC_V1 the
+                     * same way. */
+                    m->transport->setSupportedVersions(
+                        m->client_supported_versions);
 
                     auto ts =
                         m->transport->getTransportSettings();
@@ -2287,6 +2348,20 @@ uint64_t moq_mvfst_managed::credit_grant_count() const
            im->shared_ep_ctx.bidi_credit_grants.load(std::memory_order_relaxed);
 }
 
+bool moq_mvfst_managed::has_client_session() const
+{
+    return session.load(std::memory_order_acquire) != nullptr;
+}
+
+size_t moq_mvfst_managed::client_quic_versions(uint32_t *out, size_t cap) const
+{
+    size_t n = client_supported_versions.size();
+    size_t m = n < cap ? n : cap;
+    for (size_t i = 0; i < m; i++)
+        out[i] = static_cast<uint32_t>(client_supported_versions[i]);
+    return n;
+}
+
 /* Declared in mvfst_managed_testing.h (not in <moq/mvfst.h>). */
 extern "C" uint64_t moq_mvfst_managed_credit_block_count(
     const moq_mvfst_managed_t *m)
@@ -2298,6 +2373,18 @@ extern "C" uint64_t moq_mvfst_managed_credit_grant_count(
     const moq_mvfst_managed_t *m)
 {
     return m ? m->credit_grant_count() : 0;
+}
+
+extern "C" bool moq_mvfst_managed_test_has_client_session(
+    const moq_mvfst_managed_t *m)
+{
+    return m ? m->has_client_session() : false;
+}
+
+extern "C" size_t moq_mvfst_managed_test_client_quic_versions(
+    const moq_mvfst_managed_t *m, uint32_t *out, size_t cap)
+{
+    return m ? m->client_quic_versions(out, cap) : 0;
 }
 
 /* The earliest deadline the pump would publish to its one-shot AsyncTimeout —
