@@ -1049,17 +1049,20 @@ static moq_session_t *make_session(moq_perspective_t persp)
 }
 
 /* Session with explicit capacity knobs (for backpressure / pool-exhaustion). */
-static moq_session_t *make_session_caps(moq_perspective_t persp,
-                                        uint32_t max_events,
-                                        uint32_t send_buffer_size,
-                                        uint32_t max_ns_subs)
+static moq_session_t *make_session_caps_with_auth(moq_perspective_t persp,
+    uint32_t max_events, uint32_t send_buffer_size, uint32_t max_ns_subs,
+    const moq_alloc_t *alloc, size_t auth_cache_size)
 {
     moq_session_cfg_t cfg;
-    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), alloc, persp);
     cfg.version = MOQ_VERSION_DRAFT_18;
     if (max_events) cfg.max_events = max_events;
     if (send_buffer_size) cfg.send_buffer_size = send_buffer_size;
     if (max_ns_subs) cfg.max_namespace_subscriptions = max_ns_subs;
+    if (auth_cache_size) {
+        cfg.send_auth_token_cache_size = true;
+        cfg.auth_token_cache_size = auth_cache_size;
+    }
     moq_session_t *s = NULL;
     if (moq_session_create(&cfg, 0, &s) < 0) return NULL;
     if (moq_session_start(s, 0) < 0) { moq_session_destroy(s); return NULL; }
@@ -1075,6 +1078,15 @@ static moq_session_t *make_session_caps(moq_perspective_t persp,
     moq_action_t a2;
     while (moq_session_poll_actions(s, &a2, 1) > 0) moq_action_cleanup(&a2);
     return s;
+}
+
+static moq_session_t *make_session_caps(moq_perspective_t persp,
+                                        uint32_t max_events,
+                                        uint32_t send_buffer_size,
+                                        uint32_t max_ns_subs)
+{
+    return make_session_caps_with_auth(persp, max_events, send_buffer_size,
+                                      max_ns_subs, moq_alloc_default(), 0);
 }
 
 /* Count non-free generic subscription (staging) slots. */
@@ -2139,6 +2151,131 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(count_busy_subs(s), 0);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
+    }
+
+    /* == A blocked namespace request must revalidate before committing. == *
+     * ID 2 validates and stalls on the event queue. ID 6 and then a competing
+     * ID 2 commit on other bidis while it waits. Its empty refeed is now a
+     * duplicate, even though its first parse had once been valid. */
+    {
+        moq_session_t *s = make_session_caps(MOQ_PERSPECTIVE_SERVER, 1, 0, 0);
+        MOQ_TEST_CHECK(s != NULL);
+        moq_d18_msg_params_t p = {0};
+        uint8_t msg[128];
+        moq_event_t ev;
+        moq_stream_ref_t r0 = moq_stream_ref_from_u64(0xB100);
+        moq_stream_ref_t blocked = moq_stream_ref_from_u64(0xB102);
+        size_t n = encode_sns(msg, sizeof(msg), 0, "base", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, r0, msg, n, false, 1), (int)MOQ_OK);
+        n = encode_sns(msg, sizeof(msg), 2, "blocked", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, blocked, msg, n, false, 1), (int)MOQ_ERR_WOULD_BLOCK);
+        int32_t slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
+                                      blocked._v);
+        MOQ_TEST_CHECK(slot >= 0);
+        if (slot >= 0) {
+            MOQ_TEST_CHECK(s->ns_subs[slot].parse_complete);
+            MOQ_TEST_CHECK_EQ_INT((int)s->ns_subs[slot].state,
+                                  (int)MOQ_NS_SUB_RECVING_PUBLISHER);
+        }
+        MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+
+        n = encode_sns(msg, sizeof(msg), 6, "later", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, moq_stream_ref_from_u64(0xB106), msg, n, false, 1),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+        n = encode_sns(msg, sizeof(msg), 2, "winner", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+            s, moq_stream_ref_from_u64(0xB107), msg, n, false, 1),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+
+        (void)moq_session_on_bidi_stream_bytes(s, blocked, NULL, 0, false, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+        int got = moq_session_poll_events(s, &ev, 1);
+        MOQ_TEST_CHECK_EQ_INT(got, 1);
+        if (got == 1) {
+            MOQ_TEST_CHECK_EQ_U64(ev.kind, MOQ_EVENT_SESSION_CLOSED);
+            if (ev.kind == MOQ_EVENT_SESSION_CLOSED)
+                MOQ_TEST_CHECK_EQ_U64(ev.u.closed.code, 0x4);
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 0);
+        uint64_t close_code = 0;
+        moq_action_t act;
+        while (moq_session_poll_actions(s, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_CLOSE_SESSION)
+                close_code = act.u.close_session.code;
+            moq_action_cleanup(&act);
+        }
+        MOQ_TEST_CHECK_EQ_U64(close_code, 0x4);
+        moq_session_destroy(s);
+    }
+
+    /* The duplicate close must release auth values staged by the blocked
+     * request, including its uncommitted REGISTER value. */
+    {
+        fp_alloc_state_t fs = {0};
+        fs.log_from = UINT64_MAX;
+        moq_alloc_t alloc = fp_allocator(&fs);
+        moq_session_t *s = make_session_caps_with_auth(MOQ_PERSPECTIVE_SERVER,
+            1, 0, 0, &alloc, 4096);
+        MOQ_TEST_CHECK(s != NULL);
+        moq_d18_msg_params_t p = {0};
+        uint8_t msg[256];
+        moq_event_t ev;
+        p.auth_token_count = 1;
+        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_REGISTER;
+        p.auth_tokens[0].alias = 7;
+        p.auth_tokens[0].token_type = 1;
+        p.auth_tokens[0].token_value = MOQ_BYTES_LITERAL("base-token");
+        size_t n = encode_sns(msg, sizeof(msg), 0, "base", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s,
+            moq_stream_ref_from_u64(0xB200), msg, n, false, 1), (int)MOQ_OK);
+
+        memset(&p, 0, sizeof(p));
+        p.auth_token_count = 2;
+        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_ALIAS;
+        p.auth_tokens[0].alias = 7;
+        p.auth_tokens[1].alias_type = MOQ_AUTH_TOKEN_REGISTER;
+        p.auth_tokens[1].alias = 8;
+        p.auth_tokens[1].token_type = 2;
+        p.auth_tokens[1].token_value = MOQ_BYTES_LITERAL("blocked-token");
+        moq_stream_ref_t blocked = moq_stream_ref_from_u64(0xB202);
+        n = encode_sns(msg, sizeof(msg), 2, "blocked", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s,
+            blocked, msg, n, false, 1), (int)MOQ_ERR_WOULD_BLOCK);
+        int32_t slot = moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask,
+                                      blocked._v);
+        MOQ_TEST_CHECK(slot >= 0);
+        if (slot >= 0) {
+            MOQ_TEST_CHECK(s->ns_subs[slot].token_staged[0]);
+            MOQ_TEST_CHECK(s->ns_subs[slot].auth_txn.ov.entries[0].preowned != NULL);
+        }
+        MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+
+        memset(&p, 0, sizeof(p));
+        n = encode_sns(msg, sizeof(msg), 2, "winner", &p);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s,
+            moq_stream_ref_from_u64(0xB203), msg, n, false, 1), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(moq_session_poll_events(s, &ev, 1), 1);
+        moq_event_cleanup(&ev);
+        (void)moq_session_on_bidi_stream_bytes(s, blocked, NULL, 0, false, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+        while (moq_session_poll_events(s, &ev, 1) > 0) moq_event_cleanup(&ev);
+        moq_action_t act;
+        while (moq_session_poll_actions(s, &act, 1) > 0) moq_action_cleanup(&act);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK_EQ_INT((int)fs.balance, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)fs.live_bytes, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(fs.table_len, 0);
+        MOQ_TEST_CHECK_EQ_INT(fp_sticky_clean(&fs, "blocked-auth-destroy"), 0);
     }
 
     /* == Trailing bytes after the request are rejected on the blocked path = *

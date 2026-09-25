@@ -627,6 +627,10 @@ void ns_sub_destroy_all(moq_session_t *s)
 {
     for (size_t i = 0; i < s->ns_sub_cap; i++) {
         moq_ns_sub_entry_t *e = &s->ns_subs[i];
+        process_auth_tokens_free_staging(s, e->resolved_tokens,
+            e->token_staged, e->token_count);
+        if (!e->auth_committed)
+            process_auth_tokens_abort_txn(s, &e->auth_txn);
         ns_sub_free_prefix(s, e);
         if (e->announced_suffixes) {
             ns_suffix_set_t *set = (ns_suffix_set_t *)e->announced_suffixes;
@@ -904,8 +908,8 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
         {
             moq_result_t vrc;
             if (moq_session_uses_request_streams(s)) {
-                /* msg_type is unused by the stream-correlated validator (it keys
-                 * on id parity/sequence); the binding is to the bidi ref. */
+                /* The stream-correlated validator checks parity and duplicate
+                 * IDs; the binding is to the bidi ref. */
                 vrc = s->profile->validate_inbound_request_stream(
                     s, e->stream_ref, 0, decoded.request_id, &e->request_ep);
             } else {
@@ -962,6 +966,19 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
     /* Event push (may be retried after WOULD_BLOCK). */
     if (event_queue_full(s))
         return MOQ_ERR_WOULD_BLOCK;
+
+    /* A different request may have committed this ID while the event queue
+     * held us. Recheck before emitting an event or committing the staged ID. */
+    {
+        moq_request_endpoint_t current;
+        moq_result_t vrc = moq_session_uses_request_streams(s)
+            ? s->profile->validate_inbound_request_stream(
+                s, e->stream_ref, 0, e->request_ep.request_id, &current)
+            : s->profile->validate_inbound_request(
+                s, e->request_ep.request_id, &current);
+        if (vrc < 0) return vrc;
+        if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+    }
 
     /* Re-decode prefix from recv_buf (idempotent). */
     moq_decoded_ns_sub_request_t decoded;
