@@ -619,6 +619,81 @@ static void test_refresh_disabled(moq_version_t ver)
         "refresh_disabled_d18" : "refresh_disabled_d16");
 }
 
+/* Default-off is observable on a demanded catalog track, not just in the
+ * resolved config scalar. A real track change must still publish an update. */
+static void test_refresh_default_off(moq_version_t ver)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_t *sp = pair(&alloc, ver);
+    moq_session_t *srv = moq_simpair_server(sp);
+    uint64_t t0 = moq_simpair_now_us(sp);
+    moq_subscription_t sub;
+    moq_media_sender_t *s = pull_catalog_sub(sp, 0, t0, &sub);
+    MOQ_TEST_CHECK(s != NULL);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
+    drain_pair(sp);
+
+    int unexpected = 0;
+    for (uint64_t t = t0; t < t0 + 10000000ull; t += 1000000ull) {
+        pump(s, sp, t);
+        moq_event_t ev;
+        while (moq_session_poll_events(srv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED)
+                unexpected++;
+            moq_event_cleanup(&ev);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(unexpected, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 0);
+
+    moq_media_track_cfg_t tc; moq_media_track_cfg_init(&tc);
+    tc.name = (moq_bytes_t){ (const uint8_t *)"v2", 2 };
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
+    tc.bitrate = 800000; tc.is_live = true;
+    moq_media_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_media_sender_add_track(s, &tc, &track) == MOQ_OK);
+
+    int base = 0, delta = 0;
+    for (int i = 0; i < 16 && (base == 0 || delta == 0); i++) {
+        pump(s, sp, t0 + 11000000ull);
+        moq_event_t ev;
+        while (moq_session_poll_events(srv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                if (ev.u.object_received.group_id == 1 &&
+                    ev.u.object_received.object_id == 0)
+                    base++;
+                else if (ev.u.object_received.group_id == 1 &&
+                         ev.u.object_received.object_id == 1)
+                    delta++;
+                else
+                    unexpected++;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    pump(s, sp, t0 + 11000000ull);
+    moq_event_t ev;
+    while (moq_session_poll_events(srv, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED)
+            unexpected++;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(base, 1);
+    MOQ_TEST_CHECK_EQ_INT(delta, 1);
+    MOQ_TEST_CHECK_EQ_INT(unexpected, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 1);
+
+    moq_media_sender_test_free(s);
+    drain_pair(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_18 ?
+        "refresh_default_off_d18" : "refresh_default_off_d16");
+}
+
 /* Demand present, deadline already elapsed by the FIRST post-ready pump: the
  * refresh fires promptly (one group), not skipped. */
 static void test_refresh_demand_after_deadline(moq_version_t ver)
@@ -1005,6 +1080,7 @@ int main(void)
         test_refresh_pull_demand(ver);
         test_refresh_no_demand(ver);
         test_refresh_disabled(ver);
+        test_refresh_default_off(ver);
         test_refresh_demand_after_deadline(ver);
         test_refresh_mutation_precedence(ver);
         test_refresh_would_block(ver);
