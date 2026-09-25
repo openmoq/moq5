@@ -1328,6 +1328,9 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
     fc.version = version;
     fc.on_lane_pump = ep_msquic_pump;
     fc.on_lane_pump_user = ep;
+    /* Same idle-publisher policy as the picoquic raw-QUIC backend: emit QUIC
+     * keepalive before common relay idle timers can reap a quiet publisher. */
+    fc.keep_alive_interval_ms = 15000;
     /* app service-deadline (media_sender catalog refresh, etc.): folded into
      * each lane doorbell's next-wait computation. Sized init covered the block. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;

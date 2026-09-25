@@ -193,6 +193,19 @@ int main(void)
             offsetof(moq_msquic_managed_cfg_t, version_count) +
                 sizeof(mcfg.version_count))
             return 1;
+        if (offsetof(moq_msquic_managed_cfg_t, keep_alive_interval_ms) <
+            offsetof(moq_msquic_managed_cfg_t, version_count) +
+                sizeof(mcfg.version_count))
+            return 1;
+        if (sizeof(moq_msquic_managed_cfg_t) <
+            offsetof(moq_msquic_managed_cfg_t, keep_alive_interval_ms) +
+                sizeof(mcfg.keep_alive_interval_ms))
+            return 1;
+        if (mcfg.keep_alive_interval_ms != 0)
+            return 1;
+        mcfg.keep_alive_interval_ms = 15000;
+        if (mcfg.keep_alive_interval_ms != 15000)
+            return 1;
 
         memset(&mcfg, 0xff, sizeof(mcfg));
         moq_msquic_managed_cfg_init_sized(

@@ -46,8 +46,21 @@ int main()
     static_assert(sizeof(moq_msquic_managed_cfg_t) >=
                       offsetof(moq_msquic_managed_cfg_t, version_count) +
                           sizeof(mcfg.version_count),
-                  "version_count must be contained at the struct tail");
+                  "version_count must be contained before later tail fields");
+    static_assert(offsetof(moq_msquic_managed_cfg_t, keep_alive_interval_ms) >=
+                      offsetof(moq_msquic_managed_cfg_t, version_count) +
+                          sizeof(mcfg.version_count),
+                  "keep_alive_interval_ms must follow version_count");
+    static_assert(sizeof(moq_msquic_managed_cfg_t) >=
+                      offsetof(moq_msquic_managed_cfg_t, keep_alive_interval_ms) +
+                          sizeof(mcfg.keep_alive_interval_ms),
+                  "keep_alive_interval_ms must be contained at the struct tail");
     if (mcfg.versions != nullptr || mcfg.version_count != 0)
+        return 1;
+    if (mcfg.keep_alive_interval_ms != 0)
+        return 1;
+    mcfg.keep_alive_interval_ms = 15000;
+    if (mcfg.keep_alive_interval_ms != 15000)
         return 1;
     if (moq_msquic_managed_conn_negotiated_version(nullptr) != 0)
         return 1;

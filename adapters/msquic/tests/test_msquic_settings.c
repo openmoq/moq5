@@ -175,6 +175,7 @@ int main(void)
     CHECK(base.SendBufferingEnabled == FALSE);
     CHECK(base.IsSet.MinimumMtu == FALSE);
     CHECK(base.IsSet.MaximumMtu == FALSE);
+    CHECK(base.IsSet.KeepAliveIntervalMs == FALSE);
 
     /* -- a SERVER configuration pins both bounds ---------------------- */
     {
@@ -187,6 +188,7 @@ int main(void)
         CHECK(s.IsSet.MaximumMtu == TRUE);
         CHECK_EQ_U32(s.MinimumMtu, TS_PATH_MTU);
         CHECK_EQ_U32(s.MaximumMtu, TS_PATH_MTU);
+        CHECK(s.IsSet.KeepAliveIntervalMs == FALSE);
         /* the two bounds are mutually compatible -- a maximum below the
          * minimum is the failure mode a maximum-only change would have
          * introduced on this MsQuic revision */
@@ -230,6 +232,7 @@ int main(void)
         CHECK(s.IsSet.MaximumMtu == FALSE);
         CHECK(s.IsSet.SendBufferingEnabled == TRUE);
         CHECK(s.SendBufferingEnabled == FALSE);
+        CHECK(s.IsSet.KeepAliveIntervalMs == FALSE);
     }
 
     /* -- the configured idle timeout still bounds both phases, for both
@@ -258,6 +261,52 @@ int main(void)
         CHECK(s.IsSet.MaximumMtu == FALSE);
     }
 
+    /* -- explicit keepalive is a pure QUIC setting, independent of perspective
+     *    and MTU policy -------------------------------------------------- */
+    {
+        const uint32_t keepalive = 15000u;
+        moq_msquic_managed_cfg_t cfg;
+        QUIC_SETTINGS s;
+
+        cfg_init(&cfg, MOQ_PERSPECTIVE_SERVER, 0);
+        cfg.keep_alive_interval_ms = keepalive;
+        mgd_build_settings(&cfg, &s);
+        CHECK(s.IsSet.KeepAliveIntervalMs == TRUE);
+        CHECK_EQ_U32(s.KeepAliveIntervalMs, keepalive);
+        CHECK(s.IsSet.MinimumMtu == TRUE);
+        CHECK(s.IsSet.MaximumMtu == TRUE);
+
+        cfg_init(&cfg, MOQ_PERSPECTIVE_CLIENT, 0);
+        cfg.keep_alive_interval_ms = keepalive;
+        mgd_build_settings(&cfg, &s);
+        CHECK(s.IsSet.KeepAliveIntervalMs == TRUE);
+        CHECK_EQ_U32(s.KeepAliveIntervalMs, keepalive);
+        CHECK(s.IsSet.MinimumMtu == FALSE);
+        CHECK(s.IsSet.MaximumMtu == FALSE);
+    }
+
+    /* -- keepalive is appended: prefix and partial callers read disabled -- */
+    {
+        moq_msquic_managed_cfg_t cfg;
+        QUIC_SETTINGS s;
+
+        cfg_init(&cfg, MOQ_PERSPECTIVE_CLIENT, 0);
+        cfg.keep_alive_interval_ms = 9999u;
+        cfg.struct_size =
+            (uint32_t)offsetof(moq_msquic_managed_cfg_t,
+                               keep_alive_interval_ms);
+        mgd_build_settings(&cfg, &s);
+        CHECK(s.IsSet.KeepAliveIntervalMs == FALSE);
+
+        cfg_init(&cfg, MOQ_PERSPECTIVE_CLIENT, 0);
+        cfg.keep_alive_interval_ms = 9999u;
+        cfg.struct_size =
+            (uint32_t)(offsetof(moq_msquic_managed_cfg_t,
+                                keep_alive_interval_ms) + 1u);
+        mgd_build_settings(&cfg, &s);
+        CHECK(s.IsSet.KeepAliveIntervalMs == FALSE);
+    }
+
     /* -- a prefix-sized config is handled exactly as before ----------- */
     {
         moq_msquic_managed_cfg_t cfg;
@@ -275,6 +324,7 @@ int main(void)
         CHECK(s.IsSet.MaximumMtu == TRUE);
         CHECK_EQ_U32(s.MinimumMtu, TS_PATH_MTU);
         CHECK_EQ_U32(s.MaximumMtu, TS_PATH_MTU);
+        CHECK(s.IsSet.KeepAliveIntervalMs == FALSE);
     }
 
     /* -- 0024: the PROCESS-GLOBAL server MTU floor (pre-configuration path) -- */

@@ -324,6 +324,31 @@ if(MOQ_BUILD_TESTS)
                  COMMAND test_endpoint_keepalive_default)
     endif()
 
+    if(MOQ_BUILD_MSQUIC_MANAGED)
+        add_library(moq-service-msquic-ka-test-internals OBJECT src/endpoint.c)
+        target_include_directories(moq-service-msquic-ka-test-internals
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(moq-service-msquic-ka-test-internals
+            PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+        target_compile_definitions(moq-service-msquic-ka-test-internals PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS}
+            moq_msquic_managed_create=moq_test_msquic_managed_create)
+        target_compile_features(moq-service-msquic-ka-test-internals PUBLIC c_std_11)
+
+        add_executable(test_endpoint_msquic_keepalive_default
+            tests/test_endpoint_msquic_keepalive_default.c)
+        target_link_libraries(test_endpoint_msquic_keepalive_default PRIVATE
+            moq-service-msquic-ka-test-internals)
+        target_compile_definitions(test_endpoint_msquic_keepalive_default PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_endpoint_msquic_keepalive_default PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_msquic_keepalive_default
+                 COMMAND test_endpoint_msquic_keepalive_default)
+    endif()
+
     # White-box post() NULL-session contract test (no network, no msf): endpoint.c
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
