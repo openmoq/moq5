@@ -27,6 +27,15 @@
  *       capsule is timing-dependent over real threads; the capsule parse
  *       + close-code propagation are proven deterministically in
  *       test_pico_wt_loopback.)
+ *   --mode stop_close: server + one client; after the object the app thread
+ *       calls moq_pico_wt_managed_stop(cli). The client must send a bounded
+ *       local QUIC CONNECTION_CLOSE before its packet loop exits, so the
+ *       server reaches a clean terminal close promptly instead of retaining
+ *       the WT session until QUIC idle timeout.
+ *   --mode pump_exit_close: same peer-visible close obligation as stop_close,
+ *       but the client leaves by returning nonzero from on_pump after object
+ *       delivery. This prevents a stop-only fix from leaving callback-requested
+ *       loop termination as an abrupt ghost-session path.
  *   --mode announce: server + one client; the client REGISTERS a
  *       namespace after setup (moq_session_publish_namespace), the
  *       server must observe NAMESPACE_PUBLISHED with the exact parts
@@ -40,7 +49,8 @@
  * the main thread only creates/waits/stops/destroys and reads atomic
  * flags published through the facades' wait() barriers.
  *
- * Args: --cert <file> --key <file> [--mode loopback|bigobj|refuse|close]
+ * Args: --cert <file> --key <file>
+ *       [--mode loopback|bigobj|refuse|close|stop_close|pump_exit_close]
  */
 
 #include <moq/moq.h>
@@ -490,7 +500,8 @@ static void wait_realtime(moq_pico_wt_managed_t *cli, client_app_t *app,
 
 static run_status_t run_loopback_proto(const char *cert, const char *key,
                                        int port, int timeout_sec,
-                                       const char *wt_protocols)
+                                       const char *wt_protocols,
+                                       int expect_peer_close)
 {
     server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
     moq_pico_wt_managed_t *srv =
@@ -522,6 +533,15 @@ static run_status_t run_loopback_proto(const char *cert, const char *key,
         CHECK(moq_pico_wt_managed_wait(cli, 1000000) == MOQ_ERR_CLOSED);
         CHECK(!moq_pico_wt_managed_is_fatal(cli));
         CHECK(!moq_pico_wt_managed_is_closed(cli));
+        if (expect_peer_close) {
+            for (uint64_t waited = 0; waited < 5000 &&
+                 !moq_pico_wt_managed_is_closed(srv); waited += 100) {
+                moq_pico_wt_managed_wait(srv, 100000);
+            }
+            CHECK(moq_pico_wt_managed_is_closed(srv));
+            CHECK(!moq_pico_wt_managed_is_fatal(srv));
+            CHECK(moq_pico_wt_managed_close_code(srv) == 0);
+        }
     }
 
     moq_pico_wt_managed_stop(cli);     /* join → capp.subscribed safe */
@@ -1424,6 +1444,73 @@ static run_status_t run_close(const char *cert, const char *key,
     return RUN_OK;
 }
 
+/* Stop-close: unlike run_close, this does not use MoQ GOAWAY or a WT
+ * CLOSE_SESSION capsule. The APP thread stops the client facade directly; the
+ * packet loop must send a bounded local QUIC CONNECTION_CLOSE before exit so
+ * the server does not retain the session until idle timeout. */
+static run_status_t run_stop_close(const char *cert, const char *key,
+                                   int port, int timeout_sec)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
+    if (!srv) return RUN_RETRY;
+    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    atomic_init(&capp.got_object, 0);
+    moq_pico_wt_managed_t *cli =
+        make_client(moq_pico_wt_managed_local_port(srv), &capp);
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    wait_for_object(cli, &capp, timeout_sec);
+    if (!atomic_load(&capp.got_object)) {
+        int fatal = moq_pico_wt_managed_is_fatal(cli) ||
+                    moq_pico_wt_managed_is_fatal(srv);
+        moq_pico_wt_managed_stop(cli);
+        int setup = capp.subscribed;
+        moq_pico_wt_managed_destroy(cli);
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        if (setup || fatal) {
+            fprintf(stderr, "[stop_close] port %d HARD FAIL: no object "
+                    "(setup=%d fatal=%d)\n", port, setup, fatal);
+            return RUN_HARD;
+        }
+        fprintf(stderr, "[stop_close] port %d: no setup (retryable)\n", port);
+        return RUN_RETRY;
+    }
+
+    CHECK(moq_pico_wt_managed_stop(cli) == MOQ_OK);
+    moq_pico_wt_managed_destroy(cli);
+
+    for (uint64_t waited = 0; waited < 5000 &&
+         !moq_pico_wt_managed_is_closed(srv); waited += 100) {
+        moq_pico_wt_managed_wait(srv, 100000);
+    }
+
+    int srv_closed = moq_pico_wt_managed_is_closed(srv);
+    int srv_fatal = moq_pico_wt_managed_is_fatal(srv);
+    uint64_t code = moq_pico_wt_managed_close_code(srv);
+
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+
+    if (!srv_closed || srv_fatal) {
+        fprintf(stderr, "[stop_close] port %d HARD FAIL: server did not "
+                "observe clean stop close (closed=%d fatal=%d code=0x%llx)\n",
+                port, srv_closed, srv_fatal, (unsigned long long)code);
+        return RUN_HARD;
+    }
+    CHECK(srv_closed);
+    CHECK(!srv_fatal);
+    CHECK(code == 0);
+    return RUN_OK;
+}
+
 int main(int argc, char **argv)
 {
     const char *cert = NULL, *key = NULL, *mode = "loopback";
@@ -1434,11 +1521,14 @@ int main(int argc, char **argv)
     }
     if (!cert || !key) {
         fprintf(stderr, "usage: %s --cert <f> --key <f> "
-                        "[--mode loopback|bigobj|refuse|close]\n", argv[0]);
+                        "[--mode loopback|bigobj|refuse|close|"
+                        "stop_close|pump_exit_close]\n", argv[0]);
         return 2;
     }
     int refuse = !strcmp(mode, "refuse");
     int close_mode = !strcmp(mode, "close");
+    int stop_close = !strcmp(mode, "stop_close");
+    int pump_exit_close = !strcmp(mode, "pump_exit_close");
     int nego = !strcmp(mode, "nego");
     int nego_refuse = !strcmp(mode, "nego_refuse");
     int nego_legacy = !strcmp(mode, "nego_legacy");
@@ -1453,13 +1543,15 @@ int main(int argc, char **argv)
     int announce_done_no_rsa = !strcmp(mode, "announce_done_no_rsa");
     int loopback_18 = !strcmp(mode, "loopback_18");
     int alpn_close_18 = !strcmp(mode, "alpn_close_18");
-    if (!refuse && !close_mode && !nego && !nego_refuse && !nego_legacy &&
-        !nego_legacy_18 && !no_rsa && !bigobj && !bigobj_smallwin &&
-        !bigobj_drain && !announce && !announce_18 && !announce_done_18 &&
-        !announce_done_no_rsa && !loopback_18 && !alpn_close_18 &&
+    if (!refuse && !close_mode && !stop_close && !pump_exit_close && !nego &&
+        !nego_refuse && !nego_legacy && !nego_legacy_18 && !no_rsa &&
+        !bigobj && !bigobj_smallwin && !bigobj_drain && !announce &&
+        !announce_18 && !announce_done_18 && !announce_done_no_rsa &&
+        !loopback_18 && !alpn_close_18 &&
         strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
-                "nego|nego_refuse|nego_legacy|nego_legacy_18|"
+                "stop_close|pump_exit_close|nego|nego_refuse|nego_legacy|"
+                "nego_legacy_18|"
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
                 "announce|announce_18|announce_done_18|announce_done_no_rsa|"
                 "loopback_18|alpn_close_18)\n", mode);
@@ -1482,6 +1574,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]); i++) {
         st = refuse         ? run_refuse(cert, key, ports[i], 6)
            : close_mode     ? run_close(cert, key, ports[i], 6)
+           : stop_close     ? run_stop_close(cert, key, ports[i], 6)
            : nego           ? run_nego(cert, key, ports[i], 6)
            : nego_refuse    ? run_nego_refuse(cert, key, ports[i], 6)
            : nego_legacy    ? run_nego_legacy(cert, key, ports[i], 6)
@@ -1497,9 +1590,12 @@ int main(int argc, char **argv)
            : announce_done_no_rsa ? run_announce_done(cert, key, ports[i], 6,
                                                       "moqt-18", 1)
            : loopback_18    ? run_loopback_proto(cert, key, ports[i], 6,
-                                                 "moqt-18")
+                                                 "moqt-18", 0)
            : alpn_close_18  ? run_alpn_close_18(cert, key, ports[i], 6)
-                            : run_loopback_proto(cert, key, ports[i], 6, NULL);
+           : pump_exit_close ? run_loopback_proto(cert, key, ports[i], 6,
+                                                  NULL, 1)
+                            : run_loopback_proto(cert, key, ports[i], 6,
+                                                 NULL, 0);
         if (st != RUN_RETRY) break;
     }
 

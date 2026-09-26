@@ -178,6 +178,8 @@ typedef struct {
     volatile int      obj_written;
     volatile int      do_finish;       /* test triggers finish_subscribers(0x2) */
     volatile int      finished;        /* latched once finish succeeds */
+    volatile int      cleanup_requested;
+    volatile int      cleanup_done;
 } smoke_srv_t;
 
 static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
@@ -187,6 +189,14 @@ static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     smoke_srv_t *s = (smoke_srv_t *)ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
     if (!sess) return 0;
+
+    if (__atomic_load_n(&s->cleanup_requested, __ATOMIC_ACQUIRE)) {
+        moq_pub_destroy(s->pub);
+        s->pub = NULL;
+        s->track = NULL;
+        __atomic_store_n(&s->cleanup_done, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
 
     if (!s->pub) {
         moq_pub_cfg_t pc; moq_pub_cfg_init_sized(&pc, sizeof(pc));
@@ -1415,11 +1425,11 @@ int main(void)
         srv_cfg.port = port;
         srv_cfg.on_lane_pump = lifecycle_pump;
         srv_cfg.on_lane_pump_ctx = &lc;
-        /* The client below vanishes abruptly (its stop sends no
-         * CONNECTION_CLOSE); the first-class idle-timeout knob turns that
-         * into the transport-close path in ~1s, well inside the bounded
-         * waits -- also proving cfg.idle_timeout_ms reaches picoquic
-         * (without it, nothing here would observe the disconnect). */
+        /* The client below stops without asking the MoQ session for an
+         * application close. stop() now attempts a bounded clean transport
+         * close; the first-class idle-timeout knob remains the fallback if no
+         * close lands, well inside the bounded waits -- also proving
+         * cfg.idle_timeout_ms reaches picoquic. */
         srv_cfg.idle_timeout_ms = 1000;
         moq_pq_threaded_t *srv = NULL;
         moq_result_t src = moq_pq_threaded_create(&srv_cfg, &srv);
@@ -1445,7 +1455,7 @@ int main(void)
                     moq_pq_threaded_wait(srv, 25000);
                 CHECK(__atomic_load_n(&lc.accepted, __ATOMIC_ACQUIRE) == 1);
 
-                /* Real peer disconnect. */
+                /* Real peer terminal from stopping the client facade. */
                 moq_pq_threaded_stop(cli);
                 moq_pq_threaded_destroy(cli);
 
@@ -1933,13 +1943,27 @@ int main(void)
                 CHECK(!__atomic_load_n(&cli_state.session_closed,
                     __ATOMIC_ACQUIRE));
 
+                /* The publisher borrows the server session. Retire it on
+                 * its owning lane before a prompt client transport close
+                 * lets the server prune that session. */
+                __atomic_store_n(&srv_state.cleanup_requested, 1,
+                                 __ATOMIC_RELEASE);
+                for (int tries = 0; tries < 400; tries++) {
+                    moq_pq_threaded_wake(srv);
+                    moq_pq_threaded_wait(srv, 25000);
+                    if (__atomic_load_n(&srv_state.cleanup_done,
+                                        __ATOMIC_ACQUIRE))
+                        break;
+                }
+                CHECK(__atomic_load_n(&srv_state.cleanup_done,
+                                      __ATOMIC_ACQUIRE));
+
                 moq_pq_threaded_stop(cli);
                 moq_sub_destroy(cli_state.sub);
                 moq_pq_threaded_destroy(cli);
             }
 
             moq_pq_threaded_stop(srv);
-            moq_pub_destroy(srv_state.pub);
             moq_pq_threaded_destroy(srv);
         }
         PASS("facade_smoke_object");

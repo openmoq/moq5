@@ -9,9 +9,11 @@
  *
  * The row is selected by argv[1]:
  *
- *   peer_terminal  RED. The client vanishes abruptly (its stop sends no
- *                  CONNECTION_CLOSE), so the server sees the terminal via the
- *                  1s idle timeout. picoquic reaches
+ *   peer_terminal  The client is stopped before it requests an application
+ *                  close. This is a peer-terminal ownership row, not a
+ *                  stop-close oracle; after #17 stop() attempts a bounded
+ *                  CONNECTION_CLOSE, while the short idle timeout remains a
+ *                  fallback if no close lands. picoquic reaches
  *                  picoquic_state_disconnected, fires picoquic_callback_close,
  *                  and -- because this is a SERVER context -- DELETES the
  *                  picoquic_cnx_t (sender.c picoquic_prepare_next_packet_ex ->
@@ -302,11 +304,12 @@ int main(int argc, char **argv)
     srv_cfg.insecure_skip_verify = true;
     srv_cfg.on_lane_pump = lifecycle_pump;
     srv_cfg.on_lane_pump_ctx = &lc;
-    /* peer_terminal: the client vanishes abruptly (its stop sends no
-     * CONNECTION_CLOSE); the idle-timeout knob turns that into the
-     * transport-close path in ~1s, well inside the bounded waits below.
-     * app_close does not depend on it -- the peer's CONNECTION_CLOSE arrives
-     * immediately -- but the same bound is harmless there. */
+    /* peer_terminal: the client is stopped without asking its MoQ session for
+     * an application close. stop() now attempts a bounded clean transport
+     * close; the idle-timeout knob remains a fallback if no close lands, well
+     * inside the bounded waits below. app_close does not depend on it -- the
+     * peer's CONNECTION_CLOSE arrives immediately -- but the same bound is
+     * harmless there. */
     srv_cfg.idle_timeout_ms = 1000;
 
     moq_pq_threaded_t *srv = NULL;
@@ -356,7 +359,7 @@ int main(int argc, char **argv)
                 __atomic_store_n(&cc.armed, 1, __ATOMIC_RELEASE);
                 moq_pq_threaded_wake(cli);
             } else {
-                /* Real peer disconnect, no CONNECTION_CLOSE. */
+                /* Real peer terminal from stopping the client facade. */
                 moq_pq_threaded_stop(cli);
                 moq_pq_threaded_destroy(cli);
                 cli = NULL;

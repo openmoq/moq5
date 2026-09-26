@@ -37,6 +37,26 @@
  *                   proves at least one and at most one OBSERVED close, not
  *                   the literal call count. Counting the call itself needs an
  *                   adapter-private test seam; see the report.
+ *
+ *   stop_close      THREADED client + server over real loopback. After the
+ *                   server accepts the client, the APP thread calls
+ *                   moq_pq_threaded_stop(cli). The client must send a bounded
+ *                   local QUIC CONNECTION_CLOSE before its packet loop exits,
+ *                   so the server promptly observes exactly one
+ *                   MOQ_EVENT_SESSION_CLOSED with code 0 and prunes the
+ *                   connection. Without this, the server retains the ghost
+ *                   connection until idle timeout.
+ *
+ *   pump_exit_close Same as stop_close, except the client leaves by returning
+ *                   nonzero from on_lane_pump. This prevents a stop-only fix
+ *                   from leaving callback-requested loop termination as an
+ *                   abrupt ghost-session path.
+ *
+ *   server_pump_exit_close
+ *                   A threaded server with two accepted clients leaves by
+ *                   returning nonzero from on_lane_pump. Both clients must
+ *                   observe one clean close, proving the server pump-exit path
+ *                   closes every owned connection, not only the first.
  */
 
 #include <moq/picoquic.h>
@@ -348,11 +368,306 @@ static int row_local_close(void)
     return failures;
 }
 
+typedef struct {
+    int accepted;
+    int closed_count;
+    uint64_t closed_code;
+    int closed_code_valid;
+} srv_watch_ctx_t;
+
+static int srv_watch_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                          uint64_t now, void *vctx)
+{
+    (void)t; (void)now;
+    srv_watch_ctx_t *sw = (srv_watch_ctx_t *)vctx;
+    moq_pq_threaded_conn_t *c = NULL;
+    while ((c = moq_pq_threaded_lane_next_conn(lane, c)) != NULL) {
+        __atomic_store_n(&sw->accepted, 1, __ATOMIC_RELEASE);
+        moq_session_t *s = moq_pq_threaded_conn_session(c);
+        if (!s)
+            continue;
+        moq_event_t ev[8];
+        size_t ne = 0;
+        moq_session_poll_events_ex(s, ev, 8, sizeof(moq_event_t), &ne);
+        for (size_t i = 0; i < ne; i++) {
+            if (ev[i].kind != MOQ_EVENT_SESSION_CLOSED)
+                continue;
+            if (!__atomic_load_n(&sw->closed_code_valid,
+                                 __ATOMIC_ACQUIRE)) {
+                sw->closed_code = ev[i].u.closed.code;
+                __atomic_store_n(&sw->closed_code_valid, 1,
+                                 __ATOMIC_RELEASE);
+            }
+            __atomic_add_fetch(&sw->closed_count, 1, __ATOMIC_ACQ_REL);
+        }
+    }
+    return 0;
+}
+
+static int dummy_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                      uint64_t now, void *ctx)
+{
+    (void)t; (void)lane; (void)now; (void)ctx;
+    return 0;
+}
+
+typedef struct {
+    int armed;
+    int fired;
+} cli_exit_ctx_t;
+
+static int cli_exit_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                         uint64_t now, void *vctx)
+{
+    (void)t; (void)lane; (void)now;
+    cli_exit_ctx_t *ce = (cli_exit_ctx_t *)vctx;
+    if (__atomic_load_n(&ce->armed, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&ce->fired, 1, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
+}
+
+static int row_stop_or_pump_exit_close(int pump_exit_row)
+{
+    if (check_test_certs() != 0) {
+        failures++;
+        return failures;
+    }
+
+    int port = 0;
+    srv_watch_ctx_t sw;
+    memset(&sw, 0, sizeof(sw));
+
+    moq_pq_threaded_cfg_t srv_cfg;
+    moq_pq_threaded_cfg_init_sized(&srv_cfg, sizeof(srv_cfg));
+    srv_cfg.alloc = moq_alloc_default();
+    srv_cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    srv_cfg.cert_path = MOQ_TEST_CERT_PATH;
+    srv_cfg.key_path = MOQ_TEST_KEY_PATH;
+    srv_cfg.insecure_skip_verify = true;
+    srv_cfg.on_lane_pump = srv_watch_pump;
+    srv_cfg.on_lane_pump_ctx = &sw;
+
+    moq_pq_threaded_t *srv = NULL;
+    CHECK(create_server_on_free_port(&srv_cfg, &srv, &port) == MOQ_OK);
+    CHECK(port != 0);
+    if (!srv)
+        return failures;
+
+    moq_pq_threaded_cfg_t cli_cfg;
+    moq_pq_threaded_cfg_init_sized(&cli_cfg, sizeof(cli_cfg));
+    cli_exit_ctx_t ce;
+    memset(&ce, 0, sizeof(ce));
+    cli_cfg.alloc = moq_alloc_default();
+    cli_cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cli_cfg.host = "localhost";
+    cli_cfg.port = port;
+    cli_cfg.insecure_skip_verify = true;
+    cli_cfg.on_lane_pump = pump_exit_row ? cli_exit_pump : dummy_pump;
+    cli_cfg.on_lane_pump_ctx = pump_exit_row ? (void *)&ce : NULL;
+
+    moq_pq_threaded_t *cli = NULL;
+    CHECK(moq_pq_threaded_create(&cli_cfg, &cli) == MOQ_OK);
+
+    if (cli) {
+        for (int tries = 0; tries < 400 &&
+             !__atomic_load_n(&sw.accepted, __ATOMIC_ACQUIRE); tries++)
+            moq_pq_threaded_wait(srv, 25000);
+        CHECK(__atomic_load_n(&sw.accepted, __ATOMIC_ACQUIRE) == 1);
+        CHECK(moq_pq_threaded_conn_count(srv) == 1);
+
+        if (pump_exit_row) {
+            __atomic_store_n(&ce.armed, 1, __ATOMIC_RELEASE);
+            CHECK(moq_pq_threaded_wake(cli) == MOQ_OK);
+            for (int tries = 0; tries < 400 &&
+                 !__atomic_load_n(&ce.fired, __ATOMIC_ACQUIRE); tries++)
+                moq_pq_threaded_wait(cli, 25000);
+            CHECK(__atomic_load_n(&ce.fired, __ATOMIC_ACQUIRE) == 1);
+            CHECK(moq_pq_threaded_wait(cli, 0) == MOQ_ERR_CLOSED);
+            CHECK(moq_pq_threaded_stop(cli) == MOQ_OK);
+        } else {
+            CHECK(moq_pq_threaded_stop(cli) == MOQ_OK);
+        }
+        moq_pq_threaded_destroy(cli);
+
+        for (int tries = 0; tries < 400 &&
+             (__atomic_load_n(&sw.closed_count, __ATOMIC_ACQUIRE) == 0 ||
+              moq_pq_threaded_conn_count(srv) > 0); tries++)
+            moq_pq_threaded_wait(srv, 25000);
+
+        CHECK(__atomic_load_n(&sw.closed_count, __ATOMIC_ACQUIRE) == 1);
+        CHECK(__atomic_load_n(&sw.closed_code_valid, __ATOMIC_ACQUIRE) == 1);
+        CHECK(sw.closed_code == 0);
+        CHECK(moq_pq_threaded_conn_count(srv) == 0);
+        CHECK(!moq_pq_threaded_is_fatal(srv));
+    }
+
+    moq_pq_threaded_stop(srv);
+    moq_pq_threaded_destroy(srv);
+    return failures;
+}
+
+static int row_stop_close(void)
+{
+    return row_stop_or_pump_exit_close(0);
+}
+
+static int row_pump_exit_close(void)
+{
+    return row_stop_or_pump_exit_close(1);
+}
+
+typedef struct {
+    int accepted_count;
+    int armed;
+    int fired;
+} srv_exit_ctx_t;
+
+static int srv_exit_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                         uint64_t now, void *vctx)
+{
+    (void)t; (void)now;
+    srv_exit_ctx_t *se = (srv_exit_ctx_t *)vctx;
+    int count = 0;
+    moq_pq_threaded_conn_t *c = NULL;
+    while ((c = moq_pq_threaded_lane_next_conn(lane, c)) != NULL) {
+        count++;
+        moq_session_t *s = moq_pq_threaded_conn_session(c);
+        if (s) {
+            moq_event_t ev[8];
+            size_t ne = 0;
+            moq_session_poll_events_ex(s, ev, 8, sizeof(moq_event_t), &ne);
+        }
+    }
+    int prev = __atomic_load_n(&se->accepted_count, __ATOMIC_ACQUIRE);
+    while (count > prev &&
+           !__atomic_compare_exchange_n(&se->accepted_count, &prev, count,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+    }
+    if (count >= 2 && __atomic_load_n(&se->armed, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&se->fired, 1, __ATOMIC_RELEASE);
+        return 1;
+    }
+    return 0;
+}
+
+static int create_client_watch(int port, cli_watch_ctx_t *cw,
+                               moq_pq_threaded_t **out)
+{
+    moq_pq_threaded_cfg_t cfg;
+    moq_pq_threaded_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.alloc = moq_alloc_default();
+    cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cfg.host = "localhost";
+    cfg.port = port;
+    cfg.insecure_skip_verify = true;
+    cfg.on_lane_pump = cli_watch_pump;
+    cfg.on_lane_pump_ctx = cw;
+    return moq_pq_threaded_create(&cfg, out);
+}
+
+static int row_server_pump_exit_close(void)
+{
+    if (check_test_certs() != 0) {
+        failures++;
+        return failures;
+    }
+
+    int port = 0;
+    srv_exit_ctx_t se;
+    memset(&se, 0, sizeof(se));
+    cli_watch_ctx_t cwa, cwb;
+    memset(&cwa, 0, sizeof(cwa));
+    memset(&cwb, 0, sizeof(cwb));
+
+    moq_pq_threaded_cfg_t srv_cfg;
+    moq_pq_threaded_cfg_init_sized(&srv_cfg, sizeof(srv_cfg));
+    srv_cfg.alloc = moq_alloc_default();
+    srv_cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    srv_cfg.cert_path = MOQ_TEST_CERT_PATH;
+    srv_cfg.key_path = MOQ_TEST_KEY_PATH;
+    srv_cfg.insecure_skip_verify = true;
+    srv_cfg.on_lane_pump = srv_exit_pump;
+    srv_cfg.on_lane_pump_ctx = &se;
+    srv_cfg.max_connections = 2;
+
+    moq_pq_threaded_t *srv = NULL;
+    CHECK(create_server_on_free_port(&srv_cfg, &srv, &port) == MOQ_OK);
+    CHECK(port != 0);
+    if (!srv)
+        return failures;
+
+    moq_pq_threaded_t *a = NULL, *b = NULL;
+    CHECK(create_client_watch(port, &cwa, &a) == MOQ_OK);
+    CHECK(create_client_watch(port, &cwb, &b) == MOQ_OK);
+
+    if (a && b) {
+        for (int tries = 0; tries < 400 &&
+             __atomic_load_n(&se.accepted_count, __ATOMIC_ACQUIRE) < 2;
+             tries++)
+            moq_pq_threaded_wait(srv, 25000);
+        CHECK(moq_pq_threaded_conn_count(srv) == 2);
+        CHECK(__atomic_load_n(&se.accepted_count, __ATOMIC_ACQUIRE) == 2);
+
+        __atomic_store_n(&se.armed, 1, __ATOMIC_RELEASE);
+        CHECK(moq_pq_threaded_wake(srv) == MOQ_OK);
+        for (int tries = 0; tries < 400 &&
+             !__atomic_load_n(&se.fired, __ATOMIC_ACQUIRE); tries++)
+            moq_pq_threaded_wait(srv, 25000);
+        CHECK(__atomic_load_n(&se.fired, __ATOMIC_ACQUIRE) == 1);
+        CHECK(moq_pq_threaded_wait(srv, 0) == MOQ_ERR_CLOSED);
+        CHECK(moq_pq_threaded_stop(srv) == MOQ_OK);
+
+        for (int tries = 0; tries < 400 &&
+             (__atomic_load_n(&cwa.closed_count, __ATOMIC_ACQUIRE) == 0 ||
+              __atomic_load_n(&cwb.closed_count, __ATOMIC_ACQUIRE) == 0);
+             tries++) {
+            moq_pq_threaded_wait(a, 25000);
+            moq_pq_threaded_wait(b, 25000);
+        }
+        CHECK(__atomic_load_n(&cwa.closed_count, __ATOMIC_ACQUIRE) == 1);
+        CHECK(__atomic_load_n(&cwb.closed_count, __ATOMIC_ACQUIRE) == 1);
+        CHECK(__atomic_load_n(&cwa.closed_code_valid, __ATOMIC_ACQUIRE) == 1);
+        CHECK(__atomic_load_n(&cwb.closed_code_valid, __ATOMIC_ACQUIRE) == 1);
+        CHECK(cwa.closed_code == 0);
+        CHECK(cwb.closed_code == 0);
+    }
+
+    if (a) { moq_pq_threaded_stop(a); moq_pq_threaded_destroy(a); }
+    if (b) { moq_pq_threaded_stop(b); moq_pq_threaded_destroy(b); }
+    moq_pq_threaded_stop(srv);
+    moq_pq_threaded_destroy(srv);
+    return failures;
+}
+
 #else  /* !MOQ_TEST_CERT_PATH */
 
 static int row_local_close(void)
 {
     printf("SKIP: threaded_terminal_controls local_close "
+           "(no test certificates)\n");
+    return failures;
+}
+
+static int row_stop_close(void)
+{
+    printf("SKIP: threaded_terminal_controls stop_close "
+           "(no test certificates)\n");
+    return failures;
+}
+
+static int row_pump_exit_close(void)
+{
+    printf("SKIP: threaded_terminal_controls pump_exit_close "
+           "(no test certificates)\n");
+    return failures;
+}
+
+static int row_server_pump_exit_close(void)
+{
+    printf("SKIP: threaded_terminal_controls server_pump_exit_close "
            "(no test certificates)\n");
     return failures;
 }
@@ -366,8 +681,17 @@ int main(int argc, char **argv)
         (void)row_client_unbind();
     else if (strcmp(row, "local_close") == 0)
         (void)row_local_close();
+    else if (strcmp(row, "stop_close") == 0)
+        (void)row_stop_close();
+    else if (strcmp(row, "pump_exit_close") == 0)
+        (void)row_pump_exit_close();
+    else if (strcmp(row, "server_pump_exit_close") == 0)
+        (void)row_server_pump_exit_close();
     else {
-        fprintf(stderr, "usage: %s [client_unbind|local_close]\n", argv[0]);
+        fprintf(stderr, "usage: %s "
+                "[client_unbind|local_close|stop_close|pump_exit_close|"
+                "server_pump_exit_close]\n",
+                argv[0]);
         return 2;
     }
 

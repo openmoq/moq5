@@ -1219,6 +1219,9 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     fc.configure_quic_ctx = ep;
     fc.on_pump = ep_wt_pump;
     fc.on_pump_ctx = ep;
+    /* Same idle-publisher policy as raw QUIC: emit QUIC keepalive before
+     * common relay idle timers can reap a quiet WebTransport publisher. */
+    fc.keep_alive_interval_ms = 15000;
     moq_pico_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_pico_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;

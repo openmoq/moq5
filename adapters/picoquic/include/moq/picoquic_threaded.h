@@ -330,6 +330,12 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
 /*
  * Stop the network thread and join it.
  *
+ * If a connection is still open, stop() asks the network thread to send a
+ * best-effort QUIC CONNECTION_CLOSE with application code 0 and gives the
+ * packet loop a bounded flush window before joining. A peer that is still
+ * reachable should therefore observe a prompt clean close instead of waiting
+ * for idle timeout. This is a transport-level close, not MoQ GOAWAY.
+ *
  * Idempotent: second call returns MOQ_OK (or MOQ_ERR_CLOSED if fatal).
  * MUST NOT be called from on_lane_pump or on_activity; returns
  * MOQ_ERR_WRONG_STATE if detected.

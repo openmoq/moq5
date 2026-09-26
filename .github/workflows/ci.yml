@@ -413,8 +413,9 @@ jobs:
       # exercises the HTTP/3 + WebTransport surface: MOQ_BUILD_ADAPTER_PICO_WT
       # induces BUILD_HTTP=ON (picohttp-core) via FindPicoquic, and
       # MOQ_PICO_WT_BUILD_LOOPBACK builds picoquic-test for the deterministic
-      # loopback/conformance sim. No mvfst, no proxygen, no managed helper.
-      # Kept separate from picoquic-adapter so a WebTransport failure stays
+      # loopback/conformance sim. The managed facade adds keepalive and
+      # peer-visible stop-close regressions. No mvfst or proxygen. Kept
+      # separate from picoquic-adapter so a WebTransport failure stays
       # distinct from a raw-adapter/packaging failure.
       - name: Set up pinned picoquic/picotls
         run: scripts/setup_picoquic_deps.sh
@@ -427,6 +428,7 @@ jobs:
           cmake -B build/pico-wt-ci
           -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
           -DMOQ_BUILD_ADAPTER_PICO_WT=ON
+          -DMOQ_BUILD_PICO_WT_MANAGED=ON
           -DMOQ_PICO_WT_BUILD_LOOPBACK=ON
           -DMOQ_BUILD_TESTS=ON
           -DMOQ_WARNINGS_AS_ERRORS=ON
@@ -445,7 +447,7 @@ jobs:
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance)$'
+          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
 
       - name: Configure (mbedTLS-only)
         run: >

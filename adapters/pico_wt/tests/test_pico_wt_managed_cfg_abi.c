@@ -1,7 +1,8 @@
 /*
  * pico_wt managed cfg initializer + whole-block read-gate test.
  *
- * The pointer and sized initializers both stamp the full current struct. The
+ * The pointer initializer only stamps the original prefix through
+ * wt_protocols; the sized initializer stamps the caller's declared size. The
  * appended app_deadline callback/ctx form ONE block that create() reads only
  * when struct_size covers THROUGH app_deadline_ctx.
  *
@@ -27,13 +28,33 @@ static int      pump_cb(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
 
 int main(void)
 {
-    /* Init contract: both initializers stamp the full current struct. */
+    /* An old caller has storage only through wt_protocols. The canary
+     * represents bytes owned by whatever follows that old allocation. */
+    const size_t v0 = offsetof(moq_pico_wt_managed_cfg_t, wt_protocols) +
+                      sizeof(((moq_pico_wt_managed_cfg_t *)0)->wt_protocols);
+    union {
+        moq_pico_wt_managed_cfg_t cfg;
+        unsigned char bytes[sizeof(moq_pico_wt_managed_cfg_t) + 16];
+    } old;
+    memset(old.bytes, 0xa5, sizeof(old.bytes));
+    moq_pico_wt_managed_cfg_init(&old.cfg);
+    if (old.cfg.struct_size != v0) {
+        fprintf(stderr, "FAIL: pointer init stamped %u, v0 prefix %zu\n",
+                old.cfg.struct_size, v0);
+        return 1;
+    }
+    for (size_t i = v0; i < sizeof(old.bytes); i++) {
+        if (old.bytes[i] != 0xa5) {
+            fprintf(stderr, "FAIL: pointer init wrote past v0 at %zu\n", i);
+            return 2;
+        }
+    }
+
     moq_pico_wt_managed_cfg_t a;
-    moq_pico_wt_managed_cfg_init(&a);
-    if (a.struct_size != (uint32_t)sizeof(a)) return 1;
-    if (a.alloc || a.on_pump || a.app_deadline_us || a.app_deadline_ctx) return 2;
     moq_pico_wt_managed_cfg_init_sized(&a, sizeof(a));
     if (a.struct_size != (uint32_t)sizeof(a)) return 3;
+    if (a.alloc || a.on_pump || a.app_deadline_us || a.app_deadline_ctx ||
+        a.keep_alive_interval_ms) return 2;
 
     /* Whole-block gate, CAUSAL. Allocate exactly the prefix through
      * app_deadline_us (the block's first field) -- app_deadline_ctx is NOT part
