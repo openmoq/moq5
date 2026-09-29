@@ -879,7 +879,9 @@ typedef struct halt_report {
 static void
 halt_report_done(int done_fd)
 {
-    (void)write(done_fd, "D", 1);
+    if (write(done_fd, "D", 1) != 1) {
+        return;   /* the halting thread still stops at its deadline */
+    }
 }
 
 static void *

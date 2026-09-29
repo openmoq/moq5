@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 typedef struct moq_pico_wt_managed moq_pico_wt_managed_t;
+typedef struct st_picoquic_cnx_t picoquic_cnx_t;
 
 /* which function is bound to the WT control stream */
 typedef enum {
@@ -51,5 +52,11 @@ int    moq_pico_wt_managed_test_event_at(moq_pico_wt_managed_t *m, size_t i,
  * after quiescence, then calls moq_pico_wt_conn_destroy() directly, so the
  * facade can still be destroyed afterwards without a double free. */
 void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m);
+
+/* Keepalive seam globals (test-internals build only). */
+extern void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);
+extern unsigned moq_pico_wt_managed_test_keep_alive_calls;
+extern picoquic_cnx_t *moq_pico_wt_managed_test_keep_alive_last_cnx;
+extern uint64_t moq_pico_wt_managed_test_keep_alive_last_interval_us;
 
 #endif

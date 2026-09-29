@@ -34,8 +34,10 @@ int main(void)
     moq_pico_wt_managed_cfg_t cfg;
     moq_pico_wt_managed_cfg_init(&cfg);
 
-    /* Both the pointer and sized inits stamp the full current struct. */
-    if (cfg.struct_size != sizeof(moq_pico_wt_managed_cfg_t))
+    /* The pointer init is safe for callers with the frozen v0 prefix. */
+    if (cfg.struct_size !=
+        offsetof(moq_pico_wt_managed_cfg_t, wt_protocols) +
+        sizeof(cfg.wt_protocols))
         return 1;
     if (cfg.alloc != NULL || cfg.on_pump != NULL)
         return 2;

@@ -89,10 +89,10 @@ callback fires.
 |----------|--------|-------|
 | `create` | app | Spawns thread, blocks until init succeeds/fails |
 | `stop` | app | Joins thread, idempotent. Returns `MOQ_ERR_INVAL` if called from pump |
-| `destroy` | app | Calls `stop()` internally. `destroy(NULL)` is no-op |
+| `destroy` | app | Calls `stop()` internally, then frees the client session. `destroy(NULL)` is no-op |
 | `wake` | any | Thread-safe, coalesced |
 | `wait` | app | Returns `MOQ_OK` (activity), `MOQ_DONE` (timeout), `MOQ_ERR_CLOSED` |
-| `session` | pump | Returns NULL from wrong thread or after stop |
+| `session` | pump | Returns NULL from wrong thread or after stop (the session object itself stays allocated until `destroy`, so a service-tier consumer can still tear down after a fatal) |
 | `is_fatal` | any | Atomic read |
 | `fatal_code` | any | Atomic read |
 
@@ -151,9 +151,17 @@ The mvfst adapter is optional and does not affect normal libmoq
 builds:
 
 ```sh
-cmake -B build -DMOQ_BUILD_ADAPTER_MVFST=ON
+cmake -B build -DMOQ_BUILD_ADAPTER_MVFST=ON \
+    -DMOQ_MVFST_PREFIX=/prefix -DMOQ_FIZZ_PREFIX=/prefix -DMOQ_FOLLY_PREFIX=/prefix
 cmake --build build
 ```
+
+The prefix must also provide `fmt`'s CMake package: folly's config references
+`fmt::fmt` without finding it, so the adapter's CMake finds fmt before mvfst.
+The client offers QUIC v1 only (`QuicVersion::QUIC_V1`): mvfst's default
+offers Meta's private `MVFST` version first and treats the Version
+Negotiation packet every other QUIC server answers with as a fatal error, so
+without the pin the client could only reach an mvfst server.
 
 The mvfst adapter is consumed via CMake components:
 

@@ -7,6 +7,56 @@ on:
     branches: [main, master]
 
 jobs:
+  relay-setup:
+    name: Relay command from setup scripts (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CC: gcc
+      CXX: g++
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      WTQ_BUILD_NETWORK: "OFF"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libnuma-dev pkg-config perl python3
+      - name: Offline setup contract
+        run: bash scripts/selftest_dependency_setup.sh --self-test
+      - name: Build pinned dependencies and dual command
+        shell: bash
+        run: |
+          bash scripts/setup_msquic_deps.sh -G Ninja
+          source .deps/msquic-ci/msquic_deps.env
+          msquic_DIR="$msquic_DIR" bash scripts/setup_wtquic_deps.sh -G Ninja
+          source .deps/wtquic-ci/wtquic_deps.env
+          wt_builds=(.deps/wtquic-ci/build.*)
+          test "${#wt_builds[@]}" -eq 1
+          python3 scripts/test_wtquic_callbacks.py --cc "$CC" \
+            --source "${wt_builds[0]}/source" --build "${wt_builds[0]}/build" \
+            --msquic-include "$PWD/.deps/msquic-ci/prefix/include"
+          cmake -S . -B build/relay-setup -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMOQ_WARNINGS_AS_ERRORS=ON \
+            -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_RELAY=ON -DMOQ_BUILD_ADAPTER_MSQUIC=ON \
+            -DMOQ_BUILD_MSQUIC_MANAGED=ON -DMOQ_BUILD_ADAPTER_WTQUIC=ON \
+            -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON \
+            -Dmsquic_DIR="$msquic_DIR" -Dwtquic_DIR="$wtquic_DIR"
+          cmake --build build/relay-setup --target moq5-relay
+          build/relay-setup/tools/moq5-relay/moq5-relay --version
+          build/relay-setup/tools/moq5-relay/moq5-relay capacity \
+            --config tools/moq5-relay/examples/relay.json
+      - name: Retain dependency build logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: relay-setup-logs
+          path: |
+            .deps/msquic-ci/build.*/*.log
+            .deps/wtquic-ci/build.*/*.log
+            build/relay-setup/CMakeCache.txt
+
   build-and-test:
     name: Build + Test (${{ matrix.preset }})
     runs-on: ${{ matrix.os }}
@@ -363,8 +413,9 @@ jobs:
       # exercises the HTTP/3 + WebTransport surface: MOQ_BUILD_ADAPTER_PICO_WT
       # induces BUILD_HTTP=ON (picohttp-core) via FindPicoquic, and
       # MOQ_PICO_WT_BUILD_LOOPBACK builds picoquic-test for the deterministic
-      # loopback/conformance sim. No mvfst, no proxygen, no managed helper.
-      # Kept separate from picoquic-adapter so a WebTransport failure stays
+      # loopback/conformance sim. The managed facade adds keepalive and
+      # peer-visible stop-close regressions. No mvfst or proxygen. Kept
+      # separate from picoquic-adapter so a WebTransport failure stays
       # distinct from a raw-adapter/packaging failure.
       - name: Set up pinned picoquic/picotls
         run: scripts/setup_picoquic_deps.sh
@@ -377,6 +428,7 @@ jobs:
           cmake -B build/pico-wt-ci
           -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
           -DMOQ_BUILD_ADAPTER_PICO_WT=ON
+          -DMOQ_BUILD_PICO_WT_MANAGED=ON
           -DMOQ_PICO_WT_BUILD_LOOPBACK=ON
           -DMOQ_BUILD_TESTS=ON
           -DMOQ_WARNINGS_AS_ERRORS=ON
@@ -395,7 +447,7 @@ jobs:
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance)$'
+          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
 
       - name: Configure (mbedTLS-only)
         run: >

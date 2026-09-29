@@ -33,6 +33,21 @@ uint64_t moq_mvfst_managed_credit_block_count(const moq_mvfst_managed_t *m);
 uint64_t moq_mvfst_managed_credit_grant_count(const moq_mvfst_managed_t *m);
 
 /*
+ * True while the managed client facade still owns its session. Used to pin the
+ * stop-vs-destroy ownership boundary: stop() joins the network thread but must
+ * not free the client session a service-tier attachment may still reference.
+ */
+bool moq_mvfst_managed_test_has_client_session(const moq_mvfst_managed_t *m);
+
+/*
+ * Copy the mvfst client's configured QUIC version offer as raw uint32_t values.
+ * Returns the total number configured; copies min(total, cap) values into out.
+ * A NULL facade returns 0.
+ */
+size_t moq_mvfst_managed_test_client_quic_versions(
+    const moq_mvfst_managed_t *m, uint32_t *out, size_t cap);
+
+/*
  * The earliest deadline the pump would hand its one-shot AsyncTimeout — the
  * exact fold (min of session deadlines and the live application deadline) that
  * drives both the client and server timer reschedules. Lets a test assert the

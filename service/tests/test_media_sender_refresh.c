@@ -2,7 +2,8 @@
  * Automatic independent catalog refresh: recovers late viewers joining
  * through relays that resolve Joining FETCHes locally. Drives the PRODUCTION
  * sender_hook against a real SimPair peer and a real media_receiver so the
- * refresh is exercised end to end: config/ABI resolution, the demand-gated
+ * refresh is exercised end to end: config/ABI resolution (OFF by default per
+ * MSF-01 §5, enabled only by an explicit finite interval), the demand-gated
  * periodic republish (a NEW independent group whose object 0 is the complete
  * catalog), mutation precedence, the group/deadline ceiling, WOULD_BLOCK
  * exactly-once, an idle pump progressing the refresh, and receiver-side
@@ -76,27 +77,29 @@ static moq_media_sender_t *cfg_sender(uint64_t interval, bool set_interval,
     return moq_media_sender_test_new_cfg(&cfg);
 }
 
-/* full-size zero, absent (old size), and explicit 0 all resolve to 1s. */
+/* full-size zero, absent (old size), and explicit 0 all resolve to DISABLED:
+ * MSF-01 §5 says a catalog object SHOULD be published only on availability
+ * change or cache staleness, so a timed refresh is strictly opt-in. */
 static void test_cfg_default_interval(void)
 {
-    /* full-size, field left zero -> default */
+    /* full-size, field left zero -> disabled */
     moq_media_sender_t *a = cfg_sender(0, false, sizeof(moq_media_sender_cfg_t));
     MOQ_TEST_CHECK(a != NULL);
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(a), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(a), UINT64_MAX);
     moq_media_sender_test_free(a);
 
-    /* explicit 0 -> default */
+    /* explicit 0 -> disabled */
     moq_media_sender_t *b = cfg_sender(0, true, sizeof(moq_media_sender_cfg_t));
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(b), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(b), UINT64_MAX);
     moq_media_sender_test_free(b);
 
-    /* old-size caller whose struct_size predates the field -> default */
+    /* old-size caller whose struct_size predates the field -> disabled */
     size_t old = offsetof(moq_media_sender_cfg_t, catalog_refresh_interval_us);
     moq_media_sender_t *c = cfg_sender(0, false, old);
     MOQ_TEST_CHECK(c != NULL);
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(c), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(c), UINT64_MAX);
     moq_media_sender_test_free(c);
-    MOQ_TEST_PASS("refresh_cfg_default_1s");
+    MOQ_TEST_PASS("refresh_cfg_default_disabled");
 }
 
 static void test_cfg_custom_and_disable(void)
@@ -145,8 +148,8 @@ static void test_cfg_exact_old_size(void)
     }
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(cfg);
     MOQ_TEST_CHECK(s != NULL);
-    /* Gate never touched the (unallocated) field -> default. */
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), 1000000ull);
+    /* Gate never touched the (unallocated) field -> default (disabled). */
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
     moq_media_sender_test_free(s);
     free(cfg);
     MOQ_TEST_PASS("refresh_cfg_exact_old_size");
@@ -154,7 +157,8 @@ static void test_cfg_exact_old_size(void)
 
 /* Poisoned-tail read-gate: a full-size struct whose field bytes are left
  * poisoned but whose struct_size stops at the old prefix. The whole-field gate
- * must ignore the poisoned bytes and resolve the default (not the garbage). */
+ * must ignore the poisoned bytes and resolve the default, disabled (not the
+ * garbage). */
 static void test_cfg_poisoned_tail(void)
 {
     size_t old = offsetof(moq_media_sender_cfg_t, catalog_refresh_interval_us);
@@ -169,7 +173,7 @@ static void test_cfg_poisoned_tail(void)
     MOQ_TEST_CHECK(cfg.catalog_refresh_interval_us != 0);   /* really poisoned */
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
     MOQ_TEST_CHECK(s != NULL);
-    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), 1000000ull);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
     moq_media_sender_test_free(s);
     MOQ_TEST_PASS("refresh_cfg_poisoned_tail");
 }
@@ -622,6 +626,81 @@ static void test_refresh_disabled(moq_version_t ver)
         "refresh_disabled_d18" : "refresh_disabled_d16");
 }
 
+/* Default-off is observable on a demanded catalog track, not just in the
+ * resolved config scalar. A real track change must still publish an update. */
+static void test_refresh_default_off(moq_version_t ver)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_t *sp = pair(&alloc, ver);
+    moq_session_t *srv = moq_simpair_server(sp);
+    uint64_t t0 = moq_simpair_now_us(sp);
+    moq_subscription_t sub;
+    moq_media_sender_t *s = pull_catalog_sub(sp, 0, t0, &sub);
+    MOQ_TEST_CHECK(s != NULL);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_refresh_interval(s), UINT64_MAX);
+    drain_pair(sp);
+
+    int unexpected = 0;
+    for (uint64_t t = t0; t < t0 + 10000000ull; t += 1000000ull) {
+        pump(s, sp, t);
+        moq_event_t ev;
+        while (moq_session_poll_events(srv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED)
+                unexpected++;
+            moq_event_cleanup(&ev);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(unexpected, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 0);
+
+    moq_media_track_cfg_t tc; moq_media_track_cfg_init(&tc);
+    tc.name = (moq_bytes_t){ (const uint8_t *)"v2", 2 };
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
+    tc.bitrate = 800000; tc.is_live = true;
+    moq_media_track_t *track = NULL;
+    MOQ_TEST_CHECK(moq_media_sender_add_track(s, &tc, &track) == MOQ_OK);
+
+    int base = 0, delta = 0;
+    for (int i = 0; i < 16 && (base == 0 || delta == 0); i++) {
+        pump(s, sp, t0 + 11000000ull);
+        moq_event_t ev;
+        while (moq_session_poll_events(srv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                if (ev.u.object_received.group_id == 1 &&
+                    ev.u.object_received.object_id == 0)
+                    base++;
+                else if (ev.u.object_received.group_id == 1 &&
+                         ev.u.object_received.object_id == 1)
+                    delta++;
+                else
+                    unexpected++;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    pump(s, sp, t0 + 11000000ull);
+    moq_event_t ev;
+    while (moq_session_poll_events(srv, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED)
+            unexpected++;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(base, 1);
+    MOQ_TEST_CHECK_EQ_INT(delta, 1);
+    MOQ_TEST_CHECK_EQ_INT(unexpected, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 1);
+
+    moq_media_sender_test_free(s);
+    drain_pair(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_18 ?
+        "refresh_default_off_d18" : "refresh_default_off_d16");
+}
+
 /* Demand present, deadline already elapsed by the FIRST post-ready pump: the
  * refresh fires promptly (one group), not skipped. */
 static void test_refresh_demand_after_deadline(moq_version_t ver)
@@ -1008,6 +1087,7 @@ int main(void)
         test_refresh_pull_demand(ver);
         test_refresh_no_demand(ver);
         test_refresh_disabled(ver);
+        test_refresh_default_off(ver);
         test_refresh_demand_after_deadline(ver);
         test_refresh_mutation_precedence(ver);
         test_refresh_would_block(ver);

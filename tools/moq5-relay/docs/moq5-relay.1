@@ -81,6 +81,27 @@ listeners feed one relay runtime, allowing publishers and subscribers on
 different transports to communicate. The sum of their lane counts may not
 exceed 64. A build without wtquic support rejects this object rather than
 ignoring it.
+.PP
+Every explicit Origin policy requires an Origin header.
+.B allow_any_including_null
+accepts the serialized value
+.BR null ,
+not an absent header. A native client that omits Origin is refused with HTTP
+403 under that policy. Using
+.B unset
+on a draft\-13/14 listener removes that requirement and is an explicit operator
+policy choice; it must not silently replace a required authorization policy.
+Draft\-02 compatibility requires Origin and its request marker regardless.
+.PP
+Match local address families: a listener bound to
+.B 127.0.0.1
+does not listen on
+.BR ::1 .
+A client using
+.B localhost
+may select IPv6 first. Use a matching address and a certificate SAN for the
+name or IP that the client verifies; do not disable certificate verification
+to work around a destination mismatch.
 .SH ADMIN ENDPOINT
 An optional
 .B admin.tcp

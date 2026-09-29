@@ -9,6 +9,9 @@ endif()
 if(POLICY CMP0179)
     cmake_policy(SET CMP0179 NEW)
 endif()
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 
 project(libmoq
     VERSION 0.1.0
@@ -236,11 +239,14 @@ if(MOQ_BUILD_ADAPTER_WTQUIC)
     find_package(wtquic CONFIG QUIET OPTIONAL_COMPONENTS msquic network)
     if(NOT wtquic_FOUND)
         message(FATAL_ERROR
-            "MOQ_BUILD_ADAPTER_WTQUIC=ON but the wtquic package (with "
-            "its msquic component) was not found. Install wtquic "
+            "MOQ_BUILD_ADAPTER_WTQUIC=ON but the wtquic package was not found. Install wtquic "
             "(cmake --install <wtquic-build> --prefix <prefix>) and "
             "configure with -DCMAKE_PREFIX_PATH=<prefix>, or set "
-            "-Dwtquic_DIR=<prefix>/lib/cmake/wtquic.")
+            "-Dwtquic_DIR=<directory containing wtquicConfig.cmake>. "
+            "The MsQuic backend requires MsQuic >= 2.5.9: set "
+            "-Dmsquic_DIR=<prefix>/share/msquic for an installed provider, "
+            "or -DWTQ_MSQUIC_ROOT=<MsQuic source with build/bin library>. "
+            "See scripts/setup_msquic_deps.sh and scripts/setup_wtquic_deps.sh.")
     endif()
     add_subdirectory(adapters/wtquic)
 endif()
@@ -606,9 +612,12 @@ if(MOQ_BUILD_ADAPTER_MVFST)
         "  endif()\n"
         "  enable_language(CXX)\n"
         "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake\")\n"
+        "  include(\"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake/MoqMvfstBoostIcu.cmake\")\n"
         "  find_dependency(fmt CONFIG)\n"
         "  find_dependency(mvfst CONFIG)\n"
+        "  moq_mvfst_patch_boost_icu_link_directories()\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake\")\n"
+        "  moq_mvfst_apply_boost_icu_link_directories(moq::adapter-mvfst)\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND TRUE)\n"
         "endif()\n")
 endif()
@@ -774,9 +783,12 @@ if(MOQ_BUILD_SERVICE)
             "    endif()\n"
             "    enable_language(CXX)\n"
             "    list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake\")\n"
+            "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/adapters/mvfst/cmake/MoqMvfstBoostIcu.cmake\")\n"
             "    find_dependency(fmt CONFIG)\n"
             "    find_dependency(mvfst CONFIG)\n"
+            "    moq_mvfst_patch_boost_icu_link_directories()\n"
             "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake\")\n"
+            "    moq_mvfst_apply_boost_icu_link_directories(moq::adapter-mvfst)\n"
             "  endif()\n")
     endif()
     if(MOQ_BUILD_ADAPTER_PROXYGEN)

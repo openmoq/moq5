@@ -59,9 +59,12 @@ if("adapter-mvfst" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
         # fmt is a direct edge of the adapter target (mvfst/folly static archives
         # reference fmt::fmt); resolve it here rather than relying on Folly's
         # config to discover it transitively.
+        include("${CMAKE_CURRENT_LIST_DIR}/MoqMvfstBoostIcu.cmake")
         find_dependency(fmt CONFIG)
         find_dependency(mvfst CONFIG)
+        moq_mvfst_patch_boost_icu_link_directories()
         include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
+        moq_mvfst_apply_boost_icu_link_directories(moq::adapter-mvfst)
         set(${CMAKE_FIND_PACKAGE_NAME}_adapter-mvfst_FOUND TRUE)
     endif()
 endif()
@@ -278,9 +281,12 @@ if("service" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
                     "linking it requires a C++ compiler")
             endif()
             enable_language(CXX)
+            include("${CMAKE_CURRENT_LIST_DIR}/MoqMvfstBoostIcu.cmake")
             find_dependency(fmt CONFIG)
             find_dependency(mvfst CONFIG)
+            moq_mvfst_patch_boost_icu_link_directories()
             include("${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterMvfstTargets.cmake")
+            moq_mvfst_apply_boost_icu_link_directories(moq::adapter-mvfst)
         endif()
         # WEBTRANSPORT-over-proxygen facade: pull in the managed proxygen
         # adapter (and its attach base, which it links) if installed. CMake-only

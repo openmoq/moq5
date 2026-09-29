@@ -256,6 +256,11 @@ typedef struct moq_msquic_managed_cfg {
      * accepted connection's immutable selected draft. */
     const moq_version_t *versions;
     size_t version_count;
+    /* appended: QUIC keepalive interval in milliseconds. 0 disables keepalive
+     * and preserves MsQuic's default. Nonzero values are passed through to
+     * QUIC_SETTINGS.KeepAliveIntervalMs when this field is fully covered by
+     * struct_size. */
+    uint32_t keep_alive_interval_ms;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(

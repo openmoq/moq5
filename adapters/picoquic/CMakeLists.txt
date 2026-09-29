@@ -485,6 +485,18 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
              COMMAND test_threaded_terminal_controls local_close)
     set_tests_properties(threaded_terminal_control_local_close
         PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_stop_close
+             COMMAND test_threaded_terminal_controls stop_close)
+    set_tests_properties(threaded_terminal_control_stop_close
+        PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_pump_exit_close
+             COMMAND test_threaded_terminal_controls pump_exit_close)
+    set_tests_properties(threaded_terminal_control_pump_exit_close
+        PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_server_pump_exit_close
+             COMMAND test_threaded_terminal_controls server_pump_exit_close)
+    set_tests_properties(threaded_terminal_control_server_pump_exit_close
+        PROPERTIES TIMEOUT 120)
 
     # White-box internals variant (test-only, never installed): the threaded
     # adapter compiled with MOQ_PQ_THREADED_TESTING so the lifecycle test can

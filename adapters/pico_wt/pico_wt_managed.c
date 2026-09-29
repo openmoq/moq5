@@ -39,6 +39,9 @@
  * before the stream blocks on flow control. Sized to the session's receive
  * budget so a large object is admitted in full. */
 #define PICO_WT_MANAGED_RECV_FLOW_CONTROL (16u * 1024u * 1024u)
+#ifndef PICO_WT_MANAGED_LOCAL_CLOSE_FLUSH_US
+#define PICO_WT_MANAGED_LOCAL_CLOSE_FLUSH_US 250000ull
+#endif
 
 /* Advertise the inbound uni-stream + connection receive credit on the default
  * transport parameters, so every cnx created from this quic context (client
@@ -60,6 +63,11 @@ static void managed_raise_recv_windows(picoquic_quic_t *quic)
  * (the WT callback), read only after that thread has been joined by
  * moq_pico_wt_managed_stop(), which supplies the happens-before edge. */
 typedef struct { int event; const void *ctx; } moq_pwt_test_ev_t;
+
+void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);
+unsigned moq_pico_wt_managed_test_keep_alive_calls;
+picoquic_cnx_t *moq_pico_wt_managed_test_keep_alive_last_cnx;
+uint64_t moq_pico_wt_managed_test_keep_alive_last_interval_us;
 #endif
 
 struct moq_pico_wt_managed {
@@ -77,6 +85,7 @@ struct moq_pico_wt_managed {
     bool               send_request_capacity;
     uint64_t           initial_request_capacity;
     uint64_t           goaway_timeout_us;
+    uint32_t           keep_alive_interval_ms;
     bool               insecure_skip_verify;
     int              (*configure_quic)(picoquic_quic_t *, void *);
     void              *configure_quic_ctx;
@@ -118,11 +127,14 @@ struct moq_pico_wt_managed {
     bool               closed;
     uint64_t           close_code;
     bool               close_flush_started;       /* network thread only */
-    bool               close_flush_saw_inflight;   /* network thread only */
     uint64_t           close_flush_deadline_us;    /* network thread only */
     bool               stopped;
     bool               loop_came_up;   /* loop reached ready (latched) */
     bool               pump_exit;
+    bool               loop_running;   /* packet loop is active; stop waits
+                                         * for the callback to clear it */
+    bool               local_close_started;    /* network thread only */
+    uint64_t           local_close_deadline_us; /* network thread only */
     bool               tx_drained;      /* network thread: local stream flush
                                          * done (no queued/ready stream data or
                                          * unsent FIN). Read by drain(). */
@@ -257,6 +269,25 @@ static void mark_activity(moq_pico_wt_managed_t *m)
     pthread_mutex_unlock(&m->mutex);
     if (m->on_activity)
         m->on_activity(m, m->on_activity_ctx);
+}
+
+static void managed_arm_keep_alive(moq_pico_wt_managed_t *m,
+                                   picoquic_cnx_t *cnx)
+{
+    if (!m || !cnx || m->keep_alive_interval_ms == 0)
+        return;
+    uint64_t interval_us = (uint64_t)m->keep_alive_interval_ms * 1000u;
+#if defined(MOQ_PICO_WT_TESTING)
+    if (moq_pico_wt_managed_test_keep_alive)
+        moq_pico_wt_managed_test_keep_alive(cnx, interval_us);
+    else
+        picoquic_enable_keep_alive(cnx, interval_us);
+    moq_pico_wt_managed_test_keep_alive_calls++;
+    moq_pico_wt_managed_test_keep_alive_last_cnx = cnx;
+    moq_pico_wt_managed_test_keep_alive_last_interval_us = interval_us;
+#else
+    picoquic_enable_keep_alive(cnx, interval_us);
+#endif
 }
 
 static void build_session_cfg(moq_pico_wt_managed_t *m,
@@ -514,6 +545,7 @@ static int managed_server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
         moq_session_destroy(session);
         goto fail;
     }
+    managed_arm_keep_alive(m, cnx);
 
     /* Start the server session: uni-control-pair profiles (draft-18) send
      * their own SETUP from start; a draft-16 server defines start as
@@ -559,8 +591,53 @@ static void client_final_pump(moq_pico_wt_managed_t *m, picoquic_quic_t *quic)
         (void)m->on_pump(m, picoquic_get_quic_time(quic), m->on_pump_ctx);
 }
 
+static int loop_terminate(moq_pico_wt_managed_t *m)
+{
+    pthread_mutex_lock(&m->mutex);
+    m->loop_running = false;
+    pthread_cond_broadcast(&m->cond);
+    pthread_mutex_unlock(&m->mutex);
+    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+}
+
+static bool cnx_needs_local_close(picoquic_quic_t *quic,
+                                  picoquic_cnx_t *cnx)
+{
+    if (!cnx) return false;
+    picoquic_cnx_t *live = picoquic_get_first_cnx(quic);
+    while (live && live != cnx)
+        live = picoquic_get_next_cnx(live);
+    if (!live) return false;
+    picoquic_state_enum st = picoquic_get_cnx_state(cnx);
+    return st < picoquic_state_closing_received;
+}
+
+static int local_close_step(moq_pico_wt_managed_t *m, picoquic_quic_t *quic)
+{
+    uint64_t now = picoquic_get_quic_time(quic);
+    pthread_mutex_lock(&m->mutex);
+    bool already_terminal = m->closed || m->fatal;
+    pthread_mutex_unlock(&m->mutex);
+    if (already_terminal)
+        return loop_terminate(m);
+
+    picoquic_cnx_t *cnx = m->active_cnx ? m->active_cnx : m->cnx;
+    if (!m->local_close_started) {
+        m->local_close_started = true;
+        m->local_close_deadline_us =
+            now + PICO_WT_MANAGED_LOCAL_CLOSE_FLUSH_US;
+        if (cnx_needs_local_close(quic, cnx))
+            (void)picoquic_close(cnx, 0);
+    }
+
+    if (!cnx_needs_local_close(quic, cnx) ||
+        now >= m->local_close_deadline_us)
+        return loop_terminate(m);
+    return 0;
+}
+
 static int loop_callback(picoquic_quic_t *quic,
-    picoquic_packet_loop_cb_enum cb_mode,
+                          picoquic_packet_loop_cb_enum cb_mode,
     void *callback_ctx, void *callback_arg)
 {
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)callback_ctx;
@@ -570,6 +647,7 @@ static int loop_callback(picoquic_quic_t *quic,
         m->network_thread_id = pthread_self();
         m->network_thread_id_set = true;
         m->loop_came_up = true;
+        m->loop_running = true;
         pthread_cond_broadcast(&m->cond);
         pthread_mutex_unlock(&m->mutex);
         if (callback_arg)
@@ -591,6 +669,12 @@ static int loop_callback(picoquic_quic_t *quic,
         return 0;
     }
 
+    pthread_mutex_lock(&m->mutex);
+    bool close_requested = m->stopped || m->pump_exit;
+    pthread_mutex_unlock(&m->mutex);
+    if (close_requested)
+        return local_close_step(m, quic);
+
     /* Client connect failure: if the QUIC connection reaches the
      * disconnected state before the WT session is up (handshake
      * timeout, connection refused, cert rejected), surface it as fatal
@@ -610,7 +694,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&m->mutex);
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     /* Snapshot conn (set by the WT callback on this same thread). */
@@ -635,7 +719,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&m->mutex);
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     if (m->on_pump) {
@@ -645,7 +729,7 @@ static int loop_callback(picoquic_quic_t *quic,
             m->pump_exit = true;
             pthread_mutex_unlock(&m->mutex);
             mark_activity(m);
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return local_close_step(m, quic);
         }
     }
 
@@ -658,7 +742,7 @@ static int loop_callback(picoquic_quic_t *quic,
          * it could not have observed it. One final observing pump. */
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     /* Cache terminal state for thread-safe accessors. fatal wins over
@@ -684,7 +768,7 @@ static int loop_callback(picoquic_quic_t *quic,
     if (fatal_now) {
         client_final_pump(m, quic);
         mark_activity(m);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(m);
     }
 
     /* Clean close: wait()/wake() are already terminal (m->closed), so a
@@ -694,26 +778,18 @@ static int loop_callback(picoquic_quic_t *quic,
      * control-stream capsule, not a QUIC close, so we must drive the
      * send). We let the loop's normal send pass run — forcing an
      * immediate wake here would re-enter before the send and skip it.
-     * picoquic_is_cnx_backlog_empty tracks the retransmission backlog
-     * (sent-unacked packets), not queued-but-unsent stream data, so it
-     * reads "empty" before the queued close has been sent. Only treat
-     * empty as flushed once we have observed non-ACK backlog after the
-     * close (best available signal, not capsule-specific proof); a short
-     * cap still bounds the wait so a vanished peer cannot pin the loop
-     * open. */
+     *
+     * Do not query the picoquic cnx here: once the peer close is processed
+     * picoquic may have released it before this adapter tears down. The
+     * bounded grace period is the ownership-safe flush policy. */
     if (closed_now) {
         mark_activity(m);
         if (!m->close_flush_started) {
             m->close_flush_started = true;
             m->close_flush_deadline_us = now + 200000;  /* 200ms cap */
         }
-        bool backlog_empty = !m->active_cnx ||
-                             picoquic_is_cnx_backlog_empty(m->active_cnx);
-        if (!backlog_empty)
-            m->close_flush_saw_inflight = true;  /* non-ACK backlog seen */
-        if ((m->close_flush_saw_inflight && backlog_empty) ||
-            now >= m->close_flush_deadline_us)
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        if (now >= m->close_flush_deadline_us)
+            return loop_terminate(m);
         return 0;
     }
 
@@ -755,15 +831,15 @@ static int loop_callback(picoquic_quic_t *quic,
 
 /* -- cfg_init ------------------------------------------------------- */
 
-/* The pointer initializer clears and stamps the full current struct, so a caller
- * can set the appended app_deadline block directly. The sized form is the
- * explicit caller-sized API. The whole-block read gate (through app_deadline_ctx)
- * in create() reads the block only when the caller's struct_size covers it. */
+/* A pointer-only initializer cannot know an old caller's allocation size.
+ * Freeze it at the original prefix; the sized form enables appended fields. */
 void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
+    size_t v0 = offsetof(moq_pico_wt_managed_cfg_t, wt_protocols) +
+                sizeof(cfg->wt_protocols);
+    memset(cfg, 0, v0);
+    cfg->struct_size = (uint32_t)v0;
 }
 
 void moq_pico_wt_managed_cfg_init_sized(moq_pico_wt_managed_cfg_t *cfg,
@@ -893,6 +969,8 @@ moq_result_t moq_pico_wt_managed_create(
         m->initial_request_capacity = cfg->initial_request_capacity;
     if (CFG_HAS(cfg, goaway_timeout_us))
         m->goaway_timeout_us = cfg->goaway_timeout_us;
+    if (CFG_HAS(cfg, keep_alive_interval_ms))
+        m->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
     if (CFG_HAS(cfg, insecure_skip_verify))
         m->insecure_skip_verify = cfg->insecure_skip_verify;
     if (CFG_HAS(cfg, configure_quic)) {
@@ -1001,6 +1079,7 @@ moq_result_t moq_pico_wt_managed_create(
         picoquic_set_callback(m->cnx, managed_client_h3_callback, m);
         if (picoquic_start_client_cnx(m->cnx) != 0)
             goto fail_configure;
+        managed_arm_keep_alive(m, m->cnx);
     }
 
     memset(&m->loop_param, 0, sizeof(m->loop_param));
@@ -1089,8 +1168,20 @@ moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m)
         pthread_cond_wait(&m->cond, &m->mutex);
     pthread_mutex_unlock(&m->mutex);
 
-    if (ctx)
+    if (ctx) {
+        (void)picoquic_wake_up_network_thread(ctx);
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 3;
+        pthread_mutex_lock(&m->mutex);
+        while (m->loop_running) {
+            if (pthread_cond_timedwait(&m->cond, &m->mutex,
+                                       &deadline) == ETIMEDOUT)
+                break;
+        }
+        pthread_mutex_unlock(&m->mutex);
         picoquic_delete_network_thread(ctx);
+    }
 
     pthread_mutex_lock(&m->mutex);
     bool was_fatal = m->fatal;

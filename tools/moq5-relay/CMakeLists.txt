@@ -456,6 +456,12 @@ endif()
 # transport). The core, binding, and every test above build with zero
 # transport deps. Without the msquic-managed target the executable is simply
 # not built — there is no picoquic fallback.
+if(NOT TARGET moq::adapter-msquic-managed)
+    message(STATUS
+        "moq5-relay executable disabled: enable MOQ_BUILD_ADAPTER_MSQUIC=ON "
+        "and MOQ_BUILD_MSQUIC_MANAGED=ON with a discoverable MsQuic package "
+        "(msquic_DIR). Relay libraries and provider-free tests remain available.")
+endif()
 if(TARGET moq::adapter-msquic-managed)
     add_executable(moq5-relay cli/main.c cli/admin_listen.c cli/cliargs.c cli/config.c cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c cli/versions.c
         cli/lanestats.c cli/logevent.c cli/servelog.c cli/snapshot.c cli/broker.c cli/conn_reap.c)

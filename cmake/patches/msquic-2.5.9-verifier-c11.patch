@@ -1,0 +1,26 @@
+diff --git a/src/inc/msquic.h b/src/inc/msquic.h
+index 5879d422d..6852d4e65 100644
+--- a/src/inc/msquic.h
++++ b/src/inc/msquic.h
+@@ -158,7 +158,7 @@ typedef enum QUIC_ALLOWED_CIPHER_SUITE_FLAGS {
+     QUIC_ALLOWED_CIPHER_SUITE_CHACHA20_POLY1305_SHA256  = 0x4,  // Not supported on Schannel
+ } QUIC_ALLOWED_CIPHER_SUITE_FLAGS;
+ 
+-DEFINE_ENUM_FLAG_OPERATORS(QUIC_ALLOWED_CIPHER_SUITE_FLAGS);
++DEFINE_ENUM_FLAG_OPERATORS(QUIC_ALLOWED_CIPHER_SUITE_FLAGS)
+ 
+ typedef enum QUIC_CERTIFICATE_HASH_STORE_FLAGS {
+     QUIC_CERTIFICATE_HASH_STORE_FLAG_NONE           = 0x0000,
+diff --git a/src/platform/tls_quictls.c b/src/platform/tls_quictls.c
+index 65131bf2a..ad61b975c 100644
+--- a/src/platform/tls_quictls.c
++++ b/src/platform/tls_quictls.c
+@@ -282,7 +282,7 @@ CxPlatTlsCertificateVerifyCallback(
+                 X509_STORE_CTX_set_error(x509_ctx, X509_V_ERR_CERT_REJECTED);
+             }
+         } else {
+-            CertificateVerified = X509_verify_cert(x509_ctx);
++            CertificateVerified = X509_verify_cert(x509_ctx) == 1;
+ 
+             if (IsDeferredValidationOrClientAuth &&
+                 CertificateVerified <= 0) {

@@ -31,17 +31,22 @@ if(MOQ_MVFST_SOURCE_DIR)
     list(APPEND CMAKE_MODULE_PATH "${MOQ_MVFST_SOURCE_DIR}/cmake")
 endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(MoqMvfstBoostIcu)
 
 # -- Resolve mvfst --------------------------------------------------
 
-find_package(mvfst CONFIG REQUIRED)
-
-# mvfst's static folly/mvfst archives carry unresolved fmt references
-# (libfolly.a(json.cpp.o), libmvfst.a(QuicException.cpp.o)). fmt::fmt must be
-# in the adapter's exported link interface so a consumer naming only
+# fmt BEFORE mvfst: folly's package config references fmt::fmt but does not
+# find it itself, so find_package(mvfst) -> find_dependency(folly) fails with
+# "imported targets are referenced, but are missing: fmt::fmt" unless the
+# target already exists (seen with a moxygen getdeps-built prefix).
+# mvfst's static folly/mvfst archives also carry unresolved fmt references
+# (libfolly.a(json.cpp.o), libmvfst.a(QuicException.cpp.o)), so fmt::fmt must
+# be in the adapter's exported link interface: a consumer naming only
 # moq::adapter-mvfst links without adding fmt directly -- it cannot rely on
 # Folly's package config happening to discover fmt on the consumer side.
 find_package(fmt CONFIG REQUIRED)
+find_package(mvfst CONFIG REQUIRED)
+moq_mvfst_patch_boost_icu_link_directories()
 
 # -- Adapter library ------------------------------------------------
 
@@ -101,6 +106,7 @@ install(DIRECTORY include/moq
 # Install vendored FindSodium.cmake beside the package config files
 # so install-tree consumers can find it.
 install(FILES cmake/FindSodium.cmake
+              cmake/MoqMvfstBoostIcu.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 
 # -- Adapter target files -------------------------------------------
@@ -108,6 +114,8 @@ install(FILES cmake/FindSodium.cmake
 # Build-tree targets (absolute paths — valid on this machine).
 set(_mvfst_adapter_link
     "$<TARGET_PROPERTY:moq-adapter-mvfst-export-interface,INTERFACE_LINK_LIBRARIES>")
+set(_mvfst_adapter_link_dirs
+    "$<TARGET_PROPERTY:moq-adapter-mvfst-export-interface,INTERFACE_LINK_DIRECTORIES>")
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterMvfstTargets.cmake"
     CONTENT "\
@@ -117,6 +125,7 @@ if(NOT TARGET moq::adapter-mvfst)\n\
     IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-mvfst>\"\n\
     IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
     INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
+    INTERFACE_LINK_DIRECTORIES \"${_mvfst_adapter_link_dirs}\"\n\
     INTERFACE_LINK_LIBRARIES \"${_mvfst_adapter_link}\")\n\
 endif()\n")
 
@@ -138,6 +147,7 @@ if(NOT TARGET moq::adapter-mvfst)\n\
     IMPORTED_LOCATION \"\${_MVFST_PREFIX}/${_mvfst_adapter_libdir}/${_mvfst_adapter_lib_name}\"\n\
     IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
     INTERFACE_INCLUDE_DIRECTORIES \"\${_MVFST_PREFIX}/${_mvfst_adapter_incdir}\"\n\
+    INTERFACE_LINK_DIRECTORIES \"${_mvfst_adapter_link_dirs}\"\n\
     INTERFACE_LINK_LIBRARIES \"${_mvfst_adapter_link}\")\n\
 endif()\n\
 \n\
@@ -308,6 +318,16 @@ if(MOQ_BUILD_TESTS)
         moq-adapter-mvfst-test-internals mvfst::mvfst)
     add_test(NAME mvfst_managed_app_deadline COMMAND test_mvfst_managed_app_deadline)
     set_tests_properties(mvfst_managed_app_deadline PROPERTIES TIMEOUT 30)
+
+    # Managed client contract: the client session outlives stop() and the
+    # transport offer is standard QUIC v1. No network, no TLS.
+    add_executable(test_mvfst_managed_client_contract
+        tests/test_managed_client_contract.cpp)
+    target_link_libraries(test_mvfst_managed_client_contract PRIVATE
+        moq-adapter-mvfst-test-internals mvfst::mvfst)
+    add_test(NAME mvfst_managed_client_contract
+        COMMAND test_mvfst_managed_client_contract)
+    set_tests_properties(mvfst_managed_client_contract PROPERTIES TIMEOUT 30)
 
     # Real-transport idle app-deadline: each EventBase one-shot timer (client
     # deadline_to, server server_deadline_to) fires from the folded deadline and

@@ -40,6 +40,9 @@
 /* Default server connection cap when cfg.max_connections is 0. Mirrors the
  * mvfst managed server default. */
 #define MOQ_PQ_THREADED_DEFAULT_MAX_CONNECTIONS 1024u
+#ifndef MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US
+#define MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US 250000ull
+#endif
 
 /* One accepted server connection. Heap-owned so the public opaque handle
  * (moq_pq_threaded_conn_t*) stays stable while the internal list grows/compacts.
@@ -144,6 +147,10 @@ struct moq_pq_threaded {
                                           * service endpoint (TLS vs transport). */
     bool                stopped;
     bool                pump_exit;
+    bool                loop_running;   /* packet loop is active; stop waits
+                                          * for the callback to clear it */
+    bool                local_close_started;    /* network thread only */
+    uint64_t            local_close_deadline_us; /* network thread only */
     bool                tx_drained;     /* network thread: local stream flush
                                          * done (no queued/ready stream data or
                                          * unsent FIN). Read by drain_state. */
@@ -171,6 +178,7 @@ struct moq_pq_threaded {
     uint64_t            st_pkts_total;      /* packets sent (path-quality delta) */
     uint64_t            st_pkts_last;       /* last summed path-quality `sent` */
     uint64_t            st_pkts_max_burst;  /* max packets in one after_send */
+    picoquic_path_quality_t st_quality_last; /* last live path-quality snapshot */
     /* Per-connection stats accumulated from conns freed before stop, so a pruned
      * connection's prepare/queue counts are not lost. Final = acc + live conns. */
     uint64_t            st_acc_prepare;
@@ -764,25 +772,103 @@ static int server_callback(picoquic_cnx_t *cnx,
 /* Packet loop callback                                                */
 /* ------------------------------------------------------------------ */
 
+static bool client_cnx_is_live(picoquic_quic_t *quic,
+                               picoquic_cnx_t *cnx)
+{
+    if (!cnx) return false;
+    /* The client keeps a borrowed pointer after PicoQUIC may retire it.
+     * Compare addresses in the live list before reading connection state. */
+    for (picoquic_cnx_t *live = picoquic_get_first_cnx(quic); live;
+         live = picoquic_get_next_cnx(live))
+        if (live == cnx) return true;
+    return false;
+}
+
 /* Sum picoquic's cumulative packets-sent across the instance's connection(s),
  * via the public default-path quality accessor. Network-thread only. */
-static uint64_t pq_sum_pkts_sent(moq_pq_threaded_t *t)
+static uint64_t pq_sum_pkts_sent(moq_pq_threaded_t *t, picoquic_quic_t *quic)
 {
     uint64_t sum = 0;
     picoquic_path_quality_t q;
     if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+        bool have_snapshot = false;
         for (size_t i = 0; i < t->conn_count; i++) {
             if (!t->conns[i]->cnx) continue;
             memset(&q, 0, sizeof(q));
             picoquic_get_default_path_quality(t->conns[i]->cnx, &q);
+            if (!have_snapshot) {
+                t->st_quality_last = q;
+                have_snapshot = true;
+            }
             sum += q.sent;
         }
-    } else if (t->active_cnx) {
+    } else if (client_cnx_is_live(quic, t->active_cnx)) {
         memset(&q, 0, sizeof(q));
         picoquic_get_default_path_quality(t->active_cnx, &q);
+        t->st_quality_last = q;
         sum += q.sent;
     }
     return sum;
+}
+
+static int loop_terminate(moq_pq_threaded_t *t)
+{
+    pthread_mutex_lock(&t->mutex);
+    t->loop_running = false;
+    t->loop_exited = true;
+    pthread_cond_broadcast(&t->cond);
+    pthread_mutex_unlock(&t->mutex);
+    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+}
+
+static bool cnx_needs_local_close(picoquic_cnx_t *cnx)
+{
+    if (!cnx) return false;
+    picoquic_state_enum st = picoquic_get_cnx_state(cnx);
+    return st < picoquic_state_closing_received;
+}
+
+static bool client_cnx_needs_local_close(picoquic_quic_t *quic,
+                                         picoquic_cnx_t *cnx)
+{
+    return client_cnx_is_live(quic, cnx) && cnx_needs_local_close(cnx);
+}
+
+static int local_close_step(moq_pq_threaded_t *t, picoquic_quic_t *quic)
+{
+    uint64_t now = picoquic_get_quic_time(quic);
+    if (!t->local_close_started) {
+        t->local_close_started = true;
+        t->local_close_deadline_us =
+            now + MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US;
+
+        if (t->perspective == MOQ_PERSPECTIVE_CLIENT) {
+            if (client_cnx_needs_local_close(quic, t->active_cnx))
+                (void)picoquic_close(t->active_cnx, 0);
+        } else {
+            for (size_t i = 0; i < t->conn_count; i++) {
+                struct moq_pq_threaded_conn *c = t->conns[i];
+                if (c && cnx_needs_local_close(c->cnx))
+                    (void)picoquic_close(c->cnx, 0);
+            }
+        }
+    }
+
+    bool pending = false;
+    if (t->perspective == MOQ_PERSPECTIVE_CLIENT) {
+        pending = client_cnx_needs_local_close(quic, t->active_cnx);
+    } else {
+        for (size_t i = 0; i < t->conn_count; i++) {
+            struct moq_pq_threaded_conn *c = t->conns[i];
+            if (c && cnx_needs_local_close(c->cnx)) {
+                pending = true;
+                break;
+            }
+        }
+    }
+    if (!pending || now >= t->local_close_deadline_us)
+        return loop_terminate(t);
+    return 0;
 }
 
 static int loop_callback(picoquic_quic_t *quic,
@@ -796,6 +882,7 @@ static int loop_callback(picoquic_quic_t *quic,
         t->network_thread_id = pthread_self();
         t->network_thread_id_set = true;
         t->loop_came_up = true;
+        t->loop_running = true;
         pthread_cond_broadcast(&t->cond);
         pthread_mutex_unlock(&t->mutex);
         return 0;
@@ -811,7 +898,7 @@ static int loop_callback(picoquic_quic_t *quic,
             t->st_after_send++;
             if (callback_arg)
                 t->st_after_send_bytes += *(size_t *)callback_arg;
-            uint64_t cur = pq_sum_pkts_sent(t);
+            uint64_t cur = pq_sum_pkts_sent(t, quic);
             uint64_t d = (cur >= t->st_pkts_last) ? cur - t->st_pkts_last : 0;
             t->st_pkts_total += d;
             if (d > 0) t->st_after_send_nz++;   /* phase that actually sent */
@@ -838,19 +925,11 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
     }
 
-    /* stop() requested exit and pipe-woke the loop: leave promptly. The
-     * close-based wake inside picoquic_delete_network_thread does not
-     * reliably interrupt a blocked wait on every platform, so without
-     * this the join would stall until the loop's natural timer. */
     pthread_mutex_lock(&t->mutex);
-    bool stop_requested = t->stopped;
-    if (stop_requested) {
-        t->loop_exited = true;
-        pthread_cond_broadcast(&t->cond);
-    }
+    bool close_requested = t->stopped || t->pump_exit;
     pthread_mutex_unlock(&t->mutex);
-    if (stop_requested)
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+    if (close_requested)
+        return local_close_step(t, quic);
 
     /* Client mode (deferred-offer): before the session exists, the only
      * terminal signal is the connection dying (e.g. ALPN no-overlap ends the
@@ -868,7 +947,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
         client_final_pump(t, quic);
         mark_activity(t);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(t);
     }
 
     /* --- SERVER: service every connection, one on_lane_pump, then prune. A
@@ -895,7 +974,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 t->pump_exit = true;
                 pthread_mutex_unlock(&t->mutex);
                 mark_activity(t);
-                return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                return local_close_step(t, quic);
             }
         }
         /* Every conn dead before/during that pump was observable by it. */
@@ -923,7 +1002,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 t->pump_exit = true;
                 pthread_mutex_unlock(&t->mutex);
                 mark_activity(t);
-                return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                return local_close_step(t, quic);
             }
             server_mark_dead_observed(t);
         }
@@ -1000,7 +1079,7 @@ static int loop_callback(picoquic_quic_t *quic,
             pthread_mutex_unlock(&t->mutex);
             client_final_pump(t, quic);
             mark_activity(t);
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return loop_terminate(t);
         }
     }
 
@@ -1012,7 +1091,7 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
         client_final_pump(t, quic);
         mark_activity(t);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(t);
     }
 
     if (t->on_lane_pump) {
@@ -1024,7 +1103,7 @@ static int loop_callback(picoquic_quic_t *quic,
             t->pump_exit = true;
             pthread_mutex_unlock(&t->mutex);
             mark_activity(t);
-            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+            return local_close_step(t, quic);
         }
     }
 
@@ -1037,7 +1116,7 @@ static int loop_callback(picoquic_quic_t *quic,
          * it could not have observed it. One final observing pump. */
         client_final_pump(t, quic);
         mark_activity(t);
-        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        return loop_terminate(t);
     }
 
     /* Set app wake time for session deadlines. */
@@ -1552,21 +1631,18 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
     pthread_mutex_unlock(&t->mutex);
 
     if (ctx) {
-        /* Pipe-wake the loop so it observes t->stopped, and wait for the
-         * acknowledgment BEFORE picoquic_delete_network_thread: delete
-         * closes the wake pipe ahead of the join, and closing a polled
-         * fd is not a reliable wakeup on every platform -- the byte just
-         * written would die with the pipe and the join would sleep out
-         * the loop's natural timer (up to 10s on a quiescent
-         * connection). A loop that already exited (fatal / pump_exit)
-         * never acknowledges; those flags satisfy the wait, and a timed
-         * backstop covers any exit path that bypasses the callback. */
+        /* Pipe-wake the loop so it observes t->stopped, starts the bounded
+         * local CONNECTION_CLOSE flush on the network thread, and clears
+         * loop_running before picoquic_delete_network_thread closes the wake
+         * pipe. Closing a polled fd is not a reliable wakeup on every
+         * platform; the timed backstop covers any exit path that bypasses the
+         * callback. */
         (void)picoquic_wake_up_network_thread(ctx);
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
         deadline.tv_sec += 3;
         pthread_mutex_lock(&t->mutex);
-        while (!t->loop_exited && !t->fatal && !t->pump_exit) {
+        while (t->loop_running) {
             if (pthread_cond_timedwait(&t->cond, &t->mutex,
                                        &deadline) == ETIMEDOUT)
                 break;
@@ -1575,9 +1651,8 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
         picoquic_delete_network_thread(ctx);
     }
 
-    /* Characterization telemetry: the network thread is joined, so the loop
-     * counters and picoquic state are race-free to read here (conns are still
-     * alive; freed later in destroy). One compact, parseable line to stderr. */
+    /* Characterization telemetry: read only network-thread snapshots after
+     * join; PicoQUIC may already have freed its connection objects. */
     if (t->stats_enabled) {
         /* Seed from conns pruned before stop, then fold in the live conns. */
         moq_pq_send_stats_t agg, one;
@@ -1585,7 +1660,6 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
         agg.provided_bytes = t->st_acc_provided;
         agg.queue_would_block = t->st_acc_would_block;
         agg.queue_high_water = t->st_acc_high_water;
-        picoquic_cnx_t *rep = NULL;
         if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
             for (size_t i = 0; i < t->conn_count; i++) {
                 moq_pq_conn_get_send_stats(t->conns[i]->conn, &one);
@@ -1594,7 +1668,6 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
                 agg.queue_would_block += one.queue_would_block;
                 if (one.queue_high_water > agg.queue_high_water)
                     agg.queue_high_water = one.queue_high_water;
-                if (!rep) rep = t->conns[i]->cnx;
             }
         } else {
             moq_pq_conn_get_send_stats(t->conn, &one);
@@ -1603,10 +1676,8 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
             agg.queue_would_block += one.queue_would_block;
             if (one.queue_high_water > agg.queue_high_water)
                 agg.queue_high_water = one.queue_high_water;
-            rep = t->active_cnx;
         }
-        picoquic_path_quality_t q; memset(&q, 0, sizeof(q));
-        if (rep) picoquic_get_default_path_quality(rep, &q);
+        picoquic_path_quality_t q = t->st_quality_last;
         /* pkts/positive-send is the real cadence signal: no-output loop turns
          * (after_send with 0 packets) do not dilute it. */
         double ppw = t->st_after_send ?

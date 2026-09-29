@@ -674,6 +674,44 @@ endif()\n")
         endif()
     endif()
 
+    # Keepalive arming oracle for the managed WT client and accepted-server
+    # paths. White-box: drives the MOQ_PICO_WT_TESTING keepalive seam to prove
+    # keep_alive_interval_ms is applied with the converted microsecond interval,
+    # and that a short struct_size never reads the appended field. The client
+    # arm uses no relay or wall-clock idle timeout; the optional server arm uses
+    # local loopback only when picoquic's test certs are present.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pico_wt_managed_keepalive
+            tests/test_pico_wt_managed_keepalive.c
+            pico_wt_managed.c)
+        target_compile_definitions(test_pico_wt_managed_keepalive PRIVATE
+            MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_managed_keepalive PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pico_wt_managed_keepalive PRIVATE
+            moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_keepalive PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_keepalive
+            COMMAND test_pico_wt_managed_keepalive)
+        set_tests_properties(pico_wt_managed_keepalive PROPERTIES
+            TIMEOUT 30 LABELS "pico_wt;managed")
+        if(EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
+           EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            add_test(NAME pico_wt_managed_keepalive_server
+                COMMAND test_pico_wt_managed_keepalive --server
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(pico_wt_managed_keepalive_server PROPERTIES
+                TIMEOUT 30 LABELS "network;pico_wt;managed")
+        endif()
+    endif()
+
     # Managed client test: drives the facade against the example
     # server (built under MOQ_BUILD_ADAPTER_PICO_WT). Reuses the
     # example smoke driver. Labeled "network" so UDP-restricted
@@ -920,6 +958,30 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # Stop-close terminal semantics: app-thread stop() must send a bounded
+        # QUIC CONNECTION_CLOSE before the client packet loop exits, so the
+        # server observes a clean close promptly rather than retaining a ghost
+        # WT session until idle timeout.
+        add_test(NAME pico_wt_managed_stop_close
+            COMMAND test_pico_wt_managed_loopback --mode stop_close
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_stop_close PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
+        # Pump-exit close terminal semantics: on_pump returning nonzero must
+        # take the same bounded local CONNECTION_CLOSE path as app-thread
+        # stop(), so callback-requested loop termination is not an abrupt peer
+        # ghost-session path.
+        add_test(NAME pico_wt_managed_pump_exit_close
+            COMMAND test_pico_wt_managed_loopback --mode pump_exit_close
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_pump_exit_close PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
+
         # Edge cases: config validation, NULL safety, connect failure,
         # cert-verification failure, stop/wake/wait lifecycle, and
         # stop-from-on_pump rejection.
@@ -947,9 +1009,9 @@ endif()\n")
             TIMEOUT 60
             LABELS "network;pico_wt;managed")
 
-        # cfg init contract + whole-block field test: the pointer init stamps the
-        # full current struct (a current-header caller can set app_deadline); the
-        # sized init honors an explicit (possibly partial) size. Built normally;
+        # cfg init contract + whole-block field test: the pointer init stamps
+        # only the frozen v0 prefix; the sized init honors an explicit
+        # (possibly partial) size. Built normally;
         # the canonical ASan configuration instruments it too.
         add_executable(test_pico_wt_managed_cfg_abi
             tests/test_pico_wt_managed_cfg_abi.c)

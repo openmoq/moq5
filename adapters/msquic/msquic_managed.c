@@ -1711,6 +1711,11 @@ MGD_SETTINGS_LINKAGE void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg
         out->HandshakeIdleTimeoutMs = cfg->idle_timeout_ms;
         out->IsSet.HandshakeIdleTimeoutMs = TRUE;
     }
+    if (MGD_CFG_HAS(cfg, keep_alive_interval_ms) &&
+        cfg->keep_alive_interval_ms != 0) {
+        out->KeepAliveIntervalMs = cfg->keep_alive_interval_ms;
+        out->IsSet.KeepAliveIntervalMs = TRUE;
+    }
     if (cfg->perspective == MOQ_PERSPECTIVE_SERVER) {
         out->MinimumMtu = MGD_LISTENER_PATH_MTU;
         out->IsSet.MinimumMtu = TRUE;
