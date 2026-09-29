@@ -5,12 +5,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* White-box seam: the parser's internal overflow-safe array sizer. Not part of
- * the public API (hidden visibility); declared here so the boundary can be
- * tested directly, which a real 64-bit JSON input cannot reach. */
-extern bool moq_msf_checked_array_bytes(size_t count, size_t elem,
-                                        size_t *out_bytes);
-
 static int failures = 0;
 
 #define CHECK(expr) do { \
@@ -2839,32 +2833,9 @@ int main(void)
 
     /* -- Array-size overflow guards (parser/apply_delta hardening) ----- */
 
-    /* Direct boundary test of the internal checked sizer. A real JSON input
-     * cannot reach a SIZE_MAX-overflowing array on a 64-bit host (the JSON DOM
-     * itself would need that many elements), so exercise the helper directly. */
-    {
-        const size_t elem = sizeof(moq_msf_track_t);
-        size_t bytes = 12345;
-
-        /* Just over the representable limit -> overflow rejected. */
-        CHECK(!moq_msf_checked_array_bytes(SIZE_MAX / elem + 1, elem, &bytes));
-
-        /* Exactly the limit -> representable, computes the product. */
-        size_t boundary = SIZE_MAX / elem;
-        bytes = 0;
-        CHECK(moq_msf_checked_array_bytes(boundary, elem, &bytes));
-        CHECK(bytes == boundary * elem);
-
-        /* Small, normal counts compute as expected. */
-        bytes = 0;
-        CHECK(moq_msf_checked_array_bytes(4, elem, &bytes));
-        CHECK(bytes == 4 * elem);
-
-        /* elem == 0 never overflows (and yields 0 bytes). */
-        bytes = 1;
-        CHECK(moq_msf_checked_array_bytes(SIZE_MAX, 0, &bytes));
-        CHECK(bytes == 0);
-    }
+    /* The internal checked sizer's own boundary is exercised in
+     * test_msf_checked_array.c, which compiles msf.c directly: the helper is
+     * hidden in the shipped library this test links. */
 
     /* apply_delta: the effective-track capacity multiplication must be guarded
      * BEFORE allocation. A base whose track_count is large enough that

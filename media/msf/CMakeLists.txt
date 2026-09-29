@@ -78,4 +78,17 @@ if(MOQ_BUILD_TESTS)
     target_include_directories(test_msf_scaling PRIVATE include)
     target_link_libraries(test_msf_scaling PRIVATE moq::core)
     add_test(NAME msf_scaling COMMAND test_msf_scaling)
+
+    # The checked array sizer is hidden in the shipped library, so its boundary
+    # is exercised against msf.c compiled directly, the same way as above;
+    # test_msf keeps linking the real library for everything public.
+    add_executable(test_msf_checked_array tests/test_msf_checked_array.c src/msf.c)
+    target_compile_definitions(test_msf_checked_array PRIVATE MOQ_BUILDING)
+    target_include_directories(test_msf_checked_array PRIVATE include)
+    target_link_libraries(test_msf_checked_array PRIVATE moq::core)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_msf_checked_array PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME msf_checked_array COMMAND test_msf_checked_array)
 endif()
