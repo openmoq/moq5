@@ -31,7 +31,9 @@ static const priority_case_t cases[] = {
 
 static moq_namespace_t track_namespace(void)
 {
-    static const moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("priority") };
+    static const moq_bytes_t parts[] = {
+        { .data = (const uint8_t *)"priority", .len = sizeof("priority") - 1 }
+    };
     return (moq_namespace_t){ parts, 1 };
 }
 
