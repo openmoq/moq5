@@ -499,6 +499,14 @@ if(MOQ_BUILD_TESTS)
                 ${CMAKE_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_scripted
                 COMMAND test_media_receiver_scripted)
+            add_executable(test_media_receiver_wire_identity
+                tests/test_media_receiver_wire_identity.c)
+            target_link_libraries(test_media_receiver_wire_identity PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_wire_identity PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_wire_identity
+                COMMAND test_media_receiver_wire_identity)
             add_executable(test_media_receiver_update_ack
                 tests/test_media_receiver_update_ack.c)
             target_link_libraries(test_media_receiver_update_ack PRIVATE

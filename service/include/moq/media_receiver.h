@@ -521,9 +521,10 @@ MOQ_API moq_result_t moq_media_receiver_track_state(
     moq_media_track_state_t *out);
 
 /* -- Objects (§6.3) ---------------------------------------------------- *
- * The validated parsed shape (moq_media_parsed_object_t fields) plus
- * exactly two additions: the TRACK_ADDED handle and the config
- * generation. poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
+ * The validated parsed shape (moq_media_parsed_object_t fields) plus the
+ * track and wire metadata: the TRACK_ADDED handle, the config generation,
+ * and the object's wire identity. Objects surface in arrival order.
+ * poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
  * of the object's backing buffers to the caller: the payload/fragment
  * spans stay valid until moq_media_object_cleanup(&obj), which releases
  * them on the calling thread (legal because the handoff is a shard
@@ -583,6 +584,32 @@ typedef struct moq_media_object {
     moq_rcbuf_t          *payload_ref;
     moq_rcbuf_t          *properties_ref;
     moq_cmaf_sample_t    *samples_owned;
+
+    /* Appended after the v0 prefix: the object's wire identity, as the session
+     * delivered it. All three ids are full width and zero is a valid value.
+     * The identity is available only when the returned prefix covers the
+     * complete record, that is when the stamped struct_size reaches the end of
+     * has_subgroup. A shorter stamp, whether the caller's buffer was smaller or
+     * the library older, leaves the earlier fields as they are and says nothing
+     * about any id: it never means an id is absent. Nothing here is owned.
+     *
+     *   group_id / object_id   the object's location in its track;
+     *   has_subgroup           the wire carried a subgroup: true for an object
+     *                          from a subgroup stream (subgroup_id is the
+     *                          SUBGROUP_HEADER's value, resolved to the first
+     *                          object's id or zero per its mode), false for a
+     *                          datagram, which has no subgroup on the wire.
+     *                          subgroup_id is then zero, and only this flag
+     *                          says so: zero is also a real subgroup id;
+     *   publisher_priority     the effective priority the session delivered:
+     *                          the header or datagram byte when present, else
+     *                          the session's default for an inherited priority.
+     *                          It is not a claim that a byte was on the wire. */
+    uint64_t              group_id;
+    uint64_t              subgroup_id;
+    uint64_t              object_id;
+    uint8_t               publisher_priority;
+    bool                  has_subgroup;
 } moq_media_object_t;
 
 /* Release the buffers a successful poll transferred. Safe on a zeroed

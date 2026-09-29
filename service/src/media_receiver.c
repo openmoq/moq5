@@ -1884,6 +1884,13 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
     o->sample_count = parsed.sample_count;
     o->samples = owned;
     o->samples_owned = owned;
+    /* The wire identity, as the facade delivered it: a datagram has no
+     * subgroup on the wire, so its subgroup_id is zero and has_subgroup false. */
+    o->group_id = so->group_id;
+    o->subgroup_id = so->datagram ? 0 : so->subgroup_id;
+    o->object_id = so->object_id;
+    o->publisher_priority = so->publisher_priority;
+    o->has_subgroup = !so->datagram;
     /* Steal the facade object's refs (no moq_sub_object_cleanup). */
     o->payload_ref = so->payload;
     o->properties_ref = so->properties;
