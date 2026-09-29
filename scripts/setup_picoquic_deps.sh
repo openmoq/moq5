@@ -45,7 +45,7 @@
 #
 # The tracked capsule-parser patch is applied after checkout. Already-patched
 # inputs are accepted; conflicting inputs fail before any dependency build.
-# --self-test checks this step without fetching or building dependencies.
+# --self-test checks patching and the compiler policy with offline fixtures.
 #
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
@@ -68,6 +68,71 @@ picotls_build="$picotls_dir/build"
 
 log() { printf '[setup_picoquic_deps] %s\n' "$*" >&2; }
 die() { printf '[setup_picoquic_deps] ERROR: %s\n' "$*" >&2; exit 1; }
+
+build_picotls() {
+    local source_dir=$1 build_dir=$2
+    local cmake_args=(-S "$source_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
+        "-DCMAKE_PROJECT_picotls_INCLUDE=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake")
+    if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
+        cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
+    fi
+    cmake "${cmake_args[@]}" >/dev/null || return $?
+    # Only the library targets used by FindPTLS; not dependency CLI/test tools.
+    cmake --build "$build_dir" \
+        --target picotls-core picotls-openssl picotls-minicrypto \
+        -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
+}
+
+compiler_policy_selftest() (
+    set -eu
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    mkdir -p "$tmp/source"
+    cat > "$tmp/source/CMakeLists.txt" <<'CMAKE'
+cmake_minimum_required(VERSION 3.13)
+project(picotls C)
+foreach(target picotls-core picotls-openssl picotls-minicrypto)
+    add_library(${target} STATIC probe.c)
+    target_compile_options(${target} PRIVATE -Wall)
+endforeach()
+CMAKE
+    cat > "$tmp/source/probe.c" <<'C'
+#include <assert.h>
+#ifdef NDEBUG
+#error picotls_assertions_must_remain_enabled
+#endif
+#ifdef MOQ_EXPECT_CACHED
+#if MOQ_CACHE_FLAG != 17
+#error picotls_cached_flags_must_be_preserved
+#endif
+#elif MOQ_ENV_FLAG != 23
+#error picotls_environment_flags_must_be_preserved
+#endif
+int picotls_policy_probe(void) { int value = 1; assert(value); return 0; }
+C
+    CFLAGS='-DMOQ_ENV_FLAG=23 -fPIC' build_picotls "$tmp/source" "$tmp/build" > "$tmp/positive.log" 2>&1 || {
+        cat "$tmp/positive.log" >&2; die "self-test: assertion-enabled build failed"
+    }
+    for target in core openssl minicrypto; do
+        test -f "$tmp/build/libpicotls-$target.a" || die "self-test: missing $target archive"
+    done
+    cmake -S "$tmp/source" -B "$tmp/cached-build" \
+        '-DCMAKE_C_FLAGS=-DMOQ_CACHE_FLAG=17 -fPIC' \
+        '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG -DMOQ_EXPECT_CACHED=1' > "$tmp/cache.log" 2>&1 || {
+        cat "$tmp/cache.log" >&2; die "self-test: cache fixture configure failed"
+    }
+    build_picotls "$tmp/source" "$tmp/cached-build" >> "$tmp/cache.log" 2>&1 || {
+        cat "$tmp/cache.log" >&2; die "self-test: cached flags build failed"
+    }
+    printf '\nstatic int moq_setup_unused_function(void) { return 0; }\n' >> "$tmp/source/probe.c"
+    if CFLAGS='-DMOQ_ENV_FLAG=23' build_picotls "$tmp/source" "$tmp/warning-build" > "$tmp/warning.log" 2>&1; then
+        die "self-test: compiler warning was accepted"
+    fi
+    grep -q 'error:.*moq_setup_unused_function' "$tmp/warning.log" || {
+        cat "$tmp/warning.log" >&2; die "self-test: wrong warning refusal"
+    }
+    printf 'picotls compiler policy self-test: assertions, caller flags, three archives, warning refusal PASS\n'
+)
 
 apply_capsule_patch() {
     local dir=$1
@@ -117,6 +182,7 @@ patch_selftest() (
 
 if [ "${1:-}" = "--self-test" ]; then
     patch_selftest
+    compiler_policy_selftest
     exit $?
 fi
 
@@ -166,18 +232,7 @@ log "picotls submodules"
 git -C "$picotls_dir" submodule update --init --recursive --depth 1
 
 log "building picotls -> $picotls_build"
-cmake_args=(-S "$picotls_dir" -B "$picotls_build" -DCMAKE_BUILD_TYPE=Release)
-if [ -n "${OPENSSL_ROOT_DIR:-}" ]; then
-    cmake_args+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR")
-fi
-cmake "${cmake_args[@]}" >/dev/null
-# Build ONLY the picotls libraries that picoquic's FindPTLS consumes.
-# picotls' own test/cli executables are not needed and pull in extra
-# OpenSSL link requirements (e.g. they fail against macOS LibreSSL);
-# building just the lib targets is faster and portable.
-cmake --build "$picotls_build" \
-    --target picotls-core picotls-openssl picotls-minicrypto \
-    -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" >/dev/null
+build_picotls "$picotls_dir" "$picotls_build"
 
 # Sanity: picotls-core archive must exist where FindPicoquic expects it.
 ls "$picotls_build"/libpicotls-core.* >/dev/null 2>&1 \
