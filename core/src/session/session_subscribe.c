@@ -704,6 +704,7 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     /* Allocated: join the occupancy list the preamble scans walk. */
     sub_occ_link(s, (size_t)slot);
     entry->state = MOQ_SUB_PENDING_PUBLISHER;
+    entry->subscriber_priority = d->subscriber_priority;
     entry->role = MOQ_SUB_ROLE_PUBLISHER;
     entry->handle = handle;
     entry->request_id = d->request_id;
@@ -2765,6 +2766,8 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
     /* Commit. */
     if (d->has_forward)
         e->forward = d->forward;
+    if (d->has_subscriber_priority)
+        e->subscriber_priority = d->subscriber_priority;
     if (d->dt_has_object) {
         e->dt_sub_has_object = true;
         e->dt_sub_object_ms = d->dt_object_ms;

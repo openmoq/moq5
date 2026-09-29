@@ -39,6 +39,20 @@ extern "C" {
 
 typedef struct moq_pq_send_queue moq_pq_send_queue_t;
 
+/* Rank pending stream priority pairs (subscriber first, publisher second).
+ * key is 0x10000 | subscriber<<8 | publisher; zero is control traffic.
+ * Equal keys round-robin. Beyond 126 better pending streams ranks coalesce,
+ * never reverse. The callback must return zero on success. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
+    uint32_t key, int (*apply)(void *, uint64_t, uint8_t), void *ctx);
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+uint32_t moq_pq_send_queue_priority_key(moq_pq_send_queue_t *q, uint64_t sid);
+
 /* Create with an aggregate byte cap (0 -> MOQ_PQ_SEND_QUEUE_CAP_DEFAULT, also
  * overridable by the internal env var MOQ_PQ_STREAM_QUEUE_BYTES). Returns NULL
  * on allocation failure. */

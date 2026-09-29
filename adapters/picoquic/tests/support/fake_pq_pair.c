@@ -100,6 +100,14 @@ int picoquic_add_to_stream(picoquic_cnx_t *cnx, uint64_t stream_id,
 }
 
 /* Pull-send stubs: track active streams and capture provided bytes. */
+int picoquic_set_stream_priority(picoquic_cnx_t *cnx, uint64_t stream_id,
+    uint8_t priority)
+{
+    (void)stream_id;
+    (void)priority;
+    return side_for_cnx(cnx) ? 0 : -1;
+}
+
 int picoquic_mark_active_stream(picoquic_cnx_t *cnx, uint64_t stream_id,
     int is_active, void *v_stream_ctx)
 {

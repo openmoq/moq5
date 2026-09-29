@@ -84,6 +84,11 @@ target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
 
+add_executable(test_pq_priority ../adapters/common/test_pq_priority.c
+    ../adapters/common/moq_pq_send_queue.c)
+target_link_libraries(test_pq_priority PRIVATE moq::core)
+add_test(NAME pq_priority COMMAND test_pq_priority)
+
 # Fake-endpoint fidelity: every recorded-operation capacity loss and every
 # byte-bearing truncation is observable and sticky, so a fixture cannot
 # assert an exact operation set or exact bytes on evidence that was dropped.
@@ -231,7 +236,15 @@ add_executable(test_d18_fetch unit/test_d18_fetch.c)
 target_link_libraries(test_d18_fetch PRIVATE moq-core-test-internals)
 add_test(NAME d18_fetch COMMAND test_d18_fetch)
 
+add_executable(test_priority_layout unit/test_priority_layout.c)
+target_link_libraries(test_priority_layout PRIVATE moq::core)
+add_test(NAME priority_layout COMMAND test_priority_layout)
+
 if(TARGET moq::sim)
+    add_executable(test_priority_metadata unit/test_priority_metadata.c)
+    target_link_libraries(test_priority_metadata PRIVATE moq::sim)
+    add_test(NAME priority_metadata COMMAND test_priority_metadata)
+
     add_executable(test_simpair unit/test_simpair.c)
     target_link_libraries(test_simpair PRIVATE moq::sim)
     add_test(NAME simpair COMMAND test_simpair)

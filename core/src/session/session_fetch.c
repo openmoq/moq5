@@ -268,6 +268,7 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
     e->join_request_id = d->joining_request_id;
     e->join_start = d->joining_start;
     e->join_subscriber_priority = d->subscriber_priority;
+    e->subscriber_priority = d->subscriber_priority;
     e->join_group_order = (moq_group_order_t)d->group_order;
     for (size_t i = 0; i < n; i++) {
         e->join_tokens[i] = tmp[i];
@@ -903,6 +904,7 @@ joining_resolved: ;
     /* Allocated: join the occupancy list the preamble scans walk. */
     fetch_occ_link(s, (size_t)slot);
     entry->state = MOQ_FETCH_PENDING_PUBLISHER;
+    entry->subscriber_priority = d->subscriber_priority;
     entry->role = MOQ_FETCH_ROLE_PUBLISHER;
     entry->handle = handle;
     entry->request_id = d->request_id;
@@ -1306,6 +1308,8 @@ moq_result_t moq_session_accept_fetch(
             moq_stream_ref_from_u64(s->next_stream_ref);
         data_act.u.send_data.payload = NULL;
         data_act.u.send_data.fin = cfg->empty;
+        data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+            ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
         rc = push_action(s, &data_act);
         if (rc < 0) return rc;
 
@@ -1365,6 +1369,8 @@ moq_result_t moq_session_accept_fetch(
     data_act.u.send_data.stream_ref = moq_stream_ref_from_u64(s->next_stream_ref);
     data_act.u.send_data.payload = NULL;
     data_act.u.send_data.fin = cfg->empty;
+    data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+        ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
     rc = push_action(s, &data_act);
     if (rc < 0) return rc;
 
@@ -1893,6 +1899,8 @@ moq_result_t moq_session_write_fetch_object(
         if (rc < 0) return rc;
         a1.u.send_data.header_len = (uint8_t)moq_buf_writer_offset(&hw1);
         a1.u.send_data.stream_ref = entry->data_stream_ref;
+        a1.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+            ((uint64_t)entry->subscriber_priority << 8) | cfg->publisher_priority;
         a1.u.send_data.payload = cfg->properties;
         a1.u.send_data.fin = false;
 
@@ -1909,6 +1917,8 @@ moq_result_t moq_session_write_fetch_object(
         if (rc < 0) return rc;
         a2.u.send_data.header_len = (uint8_t)moq_buf_writer_offset(&hw2);
         a2.u.send_data.stream_ref = entry->data_stream_ref;
+        a2.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+            ((uint64_t)entry->subscriber_priority << 8) | cfg->publisher_priority;
         a2.u.send_data.payload = cfg->payload;
         a2.u.send_data.fin = false;
 
@@ -1951,6 +1961,8 @@ moq_result_t moq_session_write_fetch_object(
         if (rc < 0) return rc;
         a.u.send_data.header_len = (uint8_t)moq_buf_writer_offset(&hw);
         a.u.send_data.stream_ref = entry->data_stream_ref;
+        a.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+            ((uint64_t)entry->subscriber_priority << 8) | cfg->publisher_priority;
         a.u.send_data.payload = cfg->payload;
         a.u.send_data.fin = false;
 

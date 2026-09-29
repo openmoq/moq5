@@ -2150,6 +2150,10 @@ moq_result_t moq_session_open_pub_subgroup(
     a.u.send_data.payload = NULL;
     a.u.send_data.fin = false;
 
+    a.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+        ((uint64_t)s->publishes[pub_slot].subscriber_priority << 8) |
+        cfg->publisher_priority;
+
     rc = push_action(s, &a);
     if (rc < 0) return rc;
 
@@ -2158,6 +2162,7 @@ moq_result_t moq_session_open_pub_subgroup(
     /* Allocated: join the occupancy list the preamble scans walk. */
     sg_occ_link(s, (size_t)slot);
     entry->state = MOQ_SG_OPEN;
+    entry->publisher_priority = cfg->publisher_priority;
     entry->sub = MOQ_SUBSCRIPTION_INVALID;
     entry->pub = pub;
     entry->stream_ref = a.u.send_data.stream_ref;

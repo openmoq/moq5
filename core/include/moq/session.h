@@ -610,6 +610,12 @@ typedef struct moq_send_data_action {
     uint8_t          header_len;
     moq_rcbuf_t     *payload;       /* OWNED ref; adapter must cleanup */
     bool             fin;
+    /* Scheduling snapshot, independent of the wire bytes. Zero means absent
+     * (legacy producer). Otherwise 0x10000 | subscriber_priority << 8 |
+     * publisher_priority. Lower subscriber priority takes precedence. This
+     * snapshot survives subgroup retirement and transport backpressure.
+     * Appended at uint64 alignment, beyond the old complete struct prefix. */
+    uint64_t         scheduling_priority;
 } moq_send_data_action_t;
 
 typedef struct moq_reset_data_action {

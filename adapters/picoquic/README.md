@@ -2,6 +2,30 @@
 
 Bridges moq-core sessions to real QUIC transport via picoquic.
 
+## Stream scheduling
+
+PicoQUIC and PicoWT propagate MoQ subscriber and publisher priorities to
+`picoquic_set_stream_priority`. Lower subscriber values precede higher values;
+publisher priority breaks subscriber-priority ties. Applications choose these
+values: the adapters do not infer priority from a media codec or track name.
+
+The adapter ranks queued streams and uses even native priority values for
+round-robin service among equal ranks. Control traffic uses priority zero;
+data ranks start at two. PicoQUIC's eight-bit priority space permits 127 data
+ranks; streams with 126 or more better-ranked pending streams coalesce at 254.
+This can lose distinctions under saturation but cannot reverse them.
+
+Metadata is captured in each core action, so it survives subgroup retirement
+and a blocked transport open/write. Subsequent writes can update the priority
+of a whole queued stream (including FETCH); already queued bytes are not
+reordered within that stream. This is not an object-level scheduler. Group-order
+and subgroup-ID tie-breaks, separate request-stream ranks, and per-object
+datagram priority are not implemented by this mapping. No congestion-latency
+improvement is implied without measurement.
+
+The private bridge callback is optional and size-gated. Other adapters retain
+their existing scheduling behavior when they do not implement it.
+
 ## moq_pq_conn_t (direct adapter)
 
 The primary integration path. The application owns the picoquic

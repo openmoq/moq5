@@ -27,6 +27,7 @@ typedef struct {
     pq_chunk_t *head;
     pq_chunk_t *tail;
     uint64_t    remaining;    /* data bytes not yet provided */
+    uint32_t    priority_key;
 } pq_stream_t;
 
 struct moq_pq_send_queue {
@@ -39,6 +40,7 @@ struct moq_pq_send_queue {
      * pushes refused for hitting the cap (bridge WOULD_BLOCK). */
     uint64_t     high_water;
     uint64_t     would_block;
+    bool         priorities_dirty;
 };
 
 /* Bump the high-water mark after `queued` grows. */
@@ -95,6 +97,7 @@ static void pq_stream_clear(moq_pq_send_queue_t *q, pq_stream_t *s)
     s->remaining = 0;
     s->in_use = false;
     s->sid = 0;
+    q->priorities_dirty = true;
 }
 
 void moq_pq_send_queue_destroy(moq_pq_send_queue_t *q)
@@ -127,6 +130,7 @@ static pq_stream_t *pq_find_or_create(moq_pq_send_queue_t *q, uint64_t sid)
             memset(s, 0, sizeof(*s));
             s->in_use = true;
             s->sid = sid;
+            q->priorities_dirty = true;
             return s;
         }
     /* Grow the table. */
@@ -142,7 +146,45 @@ static pq_stream_t *pq_find_or_create(moq_pq_send_queue_t *q, uint64_t sid)
     s = &q->streams[old];
     s->in_use = true;
     s->sid = sid;
+    q->priorities_dirty = true;
     return s;
+}
+
+int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
+    uint32_t key, int (*apply)(void *, uint64_t, uint8_t), void *ctx)
+{
+    pq_stream_t *s = pq_find_or_create(q, sid);
+    if (!s) return -1;
+    if (s->priority_key != key) {
+        s->priority_key = key;
+        q->priorities_dirty = true;
+    }
+    if (!q->priorities_dirty) return 0;
+    /* Retain ranks alongside bytes, not bridge mappings: FIN can retire the
+     * latter before picoquic asks for the last queued packet. */
+    for (size_t i = 0; i < q->nstreams; ++i) {
+        const pq_stream_t *a = &q->streams[i];
+        if (!a->in_use) continue;
+        unsigned rank = 0;
+        if (a->priority_key) {
+            for (size_t j = 0; j < q->nstreams; ++j) {
+                const pq_stream_t *b = &q->streams[j];
+                if (b->in_use && b->priority_key &&
+                    b->priority_key < a->priority_key && rank < 126)
+                    ++rank;
+            }
+        }
+        uint8_t priority = a->priority_key ? (uint8_t)(2 + 2 * rank) : 0;
+        if (apply(ctx, a->sid, priority) != 0) return -1;
+    }
+    q->priorities_dirty = false;
+    return 0;
+}
+
+uint32_t moq_pq_send_queue_priority_key(moq_pq_send_queue_t *q, uint64_t sid)
+{
+    const pq_stream_t *s = pq_find(q, sid);
+    return s ? s->priority_key : 0;
 }
 
 /* Aggregate cap check: reject a non-empty-backlog push that would exceed the

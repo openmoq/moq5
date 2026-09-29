@@ -149,6 +149,7 @@ typedef enum moq_sub_role {
 } moq_sub_role_t;
 
 typedef struct moq_sub_entry {
+    uint8_t           subscriber_priority;
     moq_sub_state_t    state;
     moq_sub_role_t     role;
     uint32_t           generation;
@@ -413,6 +414,7 @@ typedef struct moq_fetch_prior_object {
 } moq_fetch_prior_object_t;
 
 typedef struct moq_fetch_entry {
+    uint8_t              subscriber_priority;
     moq_fetch_state_t  state;
     moq_fetch_role_t   role;
     uint32_t           generation;
@@ -900,6 +902,7 @@ typedef enum moq_sg_state {
 } moq_sg_state_t;
 
 typedef struct moq_sg_entry {
+    uint8_t               publisher_priority;
     moq_sg_state_t         state;
     uint32_t               generation;
     moq_subscription_t     sub;

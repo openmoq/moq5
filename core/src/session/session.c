@@ -826,6 +826,31 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a)
 {
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     s->actions[s->action_tail % s->action_cap] = *a;
+    moq_action_t *queued = &s->actions[s->action_tail % s->action_cap];
+    if (a->kind == MOQ_ACTION_SEND_DATA && !a->u.send_data.scheduling_priority) {
+        for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+            const moq_sg_entry_t *sg = &s->subgroups[i];
+            if (sg->stream_ref._v != a->u.send_data.stream_ref._v) continue;
+            uint8_t subscriber = 128;
+            int sub = sub_resolve_handle(s, sg->sub);
+            int pub = pub_resolve_handle(s, sg->pub);
+            if (sub >= 0) subscriber = s->subs[sub].subscriber_priority;
+            else if (pub >= 0) subscriber = s->publishes[pub].subscriber_priority;
+            queued->u.send_data.scheduling_priority = UINT64_C(0x10000) |
+                ((uint64_t)subscriber << 8) | sg->publisher_priority;
+            break;
+        }
+        if (!queued->u.send_data.scheduling_priority) {
+            for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+                const moq_fetch_entry_t *f = &s->fetches[i];
+                if (f->data_stream_ref._v != a->u.send_data.stream_ref._v) continue;
+                queued->u.send_data.scheduling_priority = UINT64_C(0x10000) |
+                    ((uint64_t)f->subscriber_priority << 8) |
+                    (f->prior.has_actual ? f->prior.publisher_priority : 128);
+                break;
+            }
+        }
+    }
     s->action_tail++;
     session_refresh_idle(s, s->last_now_us);
     return MOQ_OK;
@@ -2988,6 +3013,18 @@ bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
 
 /* -- Poll + observation -------------------------------------------- */
 
+/* Frozen SEND_DATA poll floor: optional scheduling metadata must not make
+ * legacy callers unable to receive and release their owned payload. */
+typedef struct {
+    moq_stream_ref_t stream_ref;
+    uint8_t header[32];
+    uint8_t header_len;
+    moq_rcbuf_t *payload;
+    bool fin;
+} send_data_action_v0_t;
+_Static_assert(offsetof(moq_send_data_action_t, scheduling_priority) >=
+               sizeof(send_data_action_v0_t), "SEND_DATA v0 prefix changed");
+
 moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
                                           void *out, size_t cap,
                                           size_t element_size,
@@ -3002,7 +3039,7 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
 
     const size_t lib_size = sizeof(moq_action_t);
     const size_t copy = lib_size < element_size ? lib_size : element_size;
-    const size_t send_data_needed = prefix + sizeof(moq_send_data_action_t);
+    const size_t send_data_needed = prefix + sizeof(send_data_action_v0_t);
 
     size_t n = 0;
     uint8_t *dst = (uint8_t *)out;

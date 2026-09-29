@@ -337,6 +337,8 @@ static void run_at_capacity(uint32_t max_events, run_result_t *out)
      */
     if (out->wire_stalled && sid != UINT64_MAX) {
         picoquic_stream_head_t *tx = data_stream(h.test_ctx->cnx_server, sid);
+        CHECK(tx != NULL);
+        if (tx) CHECK(tx->stream_priority == 2);
         uint64_t sent0 = tx ? tx->sent_offset : 0;
         uint64_t conn0 = h.test_ctx->cnx_server->maxdata_remote;
         out->conn_arrest_observed = true;

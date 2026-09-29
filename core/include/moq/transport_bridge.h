@@ -221,6 +221,11 @@ typedef struct moq_transport_endpoint_ops {
      */
     moq_transport_result_t (*abort_stream)(void *ctx, uint64_t stream_id,
                                            uint64_t error_code);
+    /* Optional scheduling hint. key is the SEND_DATA priority snapshot.
+     * Called before writes, including retries. OK or ERROR only; ERROR is
+     * fatal. Must not consume bytes. Older/other adapters may omit it. */
+    moq_transport_result_t (*set_stream_priority)(void *ctx, uint64_t stream_id,
+                                                uint32_t key);
 } moq_transport_endpoint_ops_t;
 
 #ifdef __cplusplus

@@ -57,6 +57,15 @@ uint64_t picoquic_get_data_sent(picoquic_cnx_t *c)
  * provide_stream_data_buffer so a test can drive prepare_to_send. */
 static int g_active_flag = -1;
 static uint64_t g_active_sid = 0;
+static uint8_t g_priorities[16];
+static bool g_priority_fail;
+int picoquic_set_stream_priority(picoquic_cnx_t *c, uint64_t sid, uint8_t priority)
+{
+    (void)c;
+    if (g_priority_fail) return -1;
+    if (sid < 16) g_priorities[sid] = priority;
+    return 0;
+}
 int picoquic_mark_active_stream(picoquic_cnx_t *c, uint64_t sid, int active,
     void *v) { (void)c; (void)v; g_active_flag = active; g_active_sid = sid;
                return g_send_fail ? -1 : 0; }
@@ -265,6 +274,23 @@ static void hook_fn(moq_pq_conn_t *conn, void *ctx)
 int main(void)
 {
     moq_alloc_t al = talloc();
+
+    /* Verify the endpoint actually forwards ordered ranks to PicoQUIC. */
+    {
+        moq_transport_endpoint_ops_t ops = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
+        pq_endpoint_ctx_t ep;
+        CHECK(pq_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&ep, &al) == 0);
+        CHECK(ops.set_stream_priority != NULL);
+        CHECK(ops.set_stream_priority(&ep, 2, 0x180c8) == MOQ_TRANSPORT_OK);
+        CHECK(ops.set_stream_priority(&ep, 6, 0x18010) == MOQ_TRANSPORT_OK);
+        CHECK(g_priorities[6] < g_priorities[2]);
+        CHECK(ops.set_stream_priority(&ep, 10, 0x17fff) == MOQ_TRANSPORT_OK);
+        CHECK(g_priorities[10] < g_priorities[6]);
+        g_priority_fail = true;
+        CHECK(ops.set_stream_priority(&ep, 14, 0x10000) == MOQ_TRANSPORT_ERROR);
+        g_priority_fail = false;
+        pq_endpoint_cleanup(&ep);
+    }
 
     /* -- 1. Post-retention WOULD_BLOCK: empty retry, no duplicates ---- */
     {

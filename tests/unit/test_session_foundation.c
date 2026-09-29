@@ -1304,6 +1304,56 @@ int main(void)
         MOQ_TEST_CHECK(alloc_state.balance == 0);
     }
 
+    /* The complete pre-priority SEND_DATA prefix remains a valid poll size. */
+    {
+        typedef struct {
+            moq_stream_ref_t stream_ref;
+            uint8_t header[32];
+            uint8_t header_len;
+            moq_rcbuf_t *payload;
+            bool fin;
+        } legacy_data_t;
+        const size_t legacy_size = offsetof(moq_action_t, u) + sizeof(legacy_data_t);
+        test_alloc_state_t state = {0};
+        moq_alloc_t alloc = test_allocator(&state);
+        moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+        if (!s) return 1;
+        moq_action_t sent = {0};
+        sent.kind = MOQ_ACTION_SEND_DATA;
+        sent.detail_size = sizeof(moq_send_data_action_t);
+        sent.u.send_data.fin = true;
+        sent.u.send_data.scheduling_priority = UINT64_C(0x12513);
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"old", 3,
+                                       &sent.u.send_data.payload) == MOQ_OK);
+        MOQ_TEST_CHECK(push_action(s, &sent) == MOQ_OK);
+        moq_action_t received;
+        memset(&received, 0xa5, sizeof(received));
+        size_t count = 99;
+        MOQ_TEST_CHECK(moq_session_poll_actions_ex(s, &received, 1,
+            legacy_size - 1, &count) == MOQ_ERR_ABI_MISMATCH);
+        MOQ_TEST_CHECK(count == 0);
+        moq_result_t rc = moq_session_poll_actions_ex(s, &received, 1,
+                                                    legacy_size, &count);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        MOQ_TEST_CHECK(count == 1);
+        if (rc == MOQ_OK && count == 1) {
+            MOQ_TEST_CHECK(received.u.send_data.fin);
+            MOQ_TEST_CHECK(moq_rcbuf_len(received.u.send_data.payload) == 3);
+            MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(received.u.send_data.payload),
+                                  "old", 3) == 0);
+            moq_action_cleanup(&received);
+            moq_action_cleanup(&received);
+            for (size_t i = legacy_size; i < sizeof(received); ++i)
+                MOQ_TEST_CHECK(((uint8_t *)&received)[i] == 0xa5);
+        }
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK(state.balance == 0);
+    }
+
     /* == Size-aware event poll ABI ==================================== */
     {
         typedef struct event_prefix {

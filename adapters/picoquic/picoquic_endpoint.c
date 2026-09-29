@@ -38,12 +38,28 @@ static moq_transport_result_t pq_open_bidi(void *ctx, uint64_t *out_id)
 }
 
 /* Map a queue push result to the bridge write contract. */
+static int pq_apply_priority(void *ctx, uint64_t sid, uint8_t priority)
+{
+    pq_endpoint_ctx_t *ep = ctx;
+    return ep->cnx ? picoquic_set_stream_priority(ep->cnx, sid, priority) : -1;
+}
+
+static moq_transport_result_t pq_priority(void *ctx, uint64_t sid, uint32_t key)
+{
+    pq_endpoint_ctx_t *ep = ctx;
+    return moq_pq_send_queue_priority(ep->queue, sid, key, pq_apply_priority, ep) == 0
+        ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
 static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
                                               uint64_t stream_id, int r)
 {
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;    /* cnx released */
     if (r < 0) return MOQ_TRANSPORT_ERROR;       /* allocation failure: fatal */
     if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* queue cap: retain + retry */
+    if (pq_priority(ep, stream_id,
+            moq_pq_send_queue_priority_key(ep->queue, stream_id)) != MOQ_TRANSPORT_OK)
+        return MOQ_TRANSPORT_ERROR;
     /* Bytes are queued; picoquic must poll the stream to pull them. A failure
      * to mark it active means they would never be sent -- treat as fatal. */
     if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, NULL) != 0)
@@ -213,6 +229,7 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
         .send_datagram   = pq_send_datagram,
         .max_datagram_size = pq_max_datagram_size,
         .close_transport = pq_close,
+        .set_stream_priority = pq_priority,
     };
     return 0;
 }

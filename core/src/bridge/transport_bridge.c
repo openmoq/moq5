@@ -881,6 +881,19 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
         return MOQ_OK;
     }
 
+    if (HAS_FIELD(b->ops, set_stream_priority) && b->ops->set_stream_priority) {
+        bool has_priority = p->act.detail_size >=
+            offsetof(moq_send_data_action_t, scheduling_priority) +
+                sizeof(sd->scheduling_priority);
+        uint32_t key = has_priority && sd->scheduling_priority
+            ? (uint32_t)sd->scheduling_priority : UINT32_C(0x18080);
+        if (b->ops->set_stream_priority(b->endpoint_ctx, sid, key) != MOQ_TRANSPORT_OK) {
+            bridge_cleanup_pending_item(&b->alloc, p);
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_INTERNAL;
+        }
+    }
+
     /* Phase 1: send header (if any) */
     if (p->kind == PENDING_HEADER_PAYLOAD && sd->header_len > 0) {
         size_t pay_len = sd->payload ? moq_rcbuf_len(sd->payload) : 0;
@@ -2130,33 +2143,37 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
         }
 
         case PENDING_OPEN_UNI_DATA: {
-            /* Reserve stream-map slot before opening transport stream */
-            bridge_stream_entry_t *e = bridge_alloc_stream(b);
+            /* An earlier queued action for this ref may have opened the
+             * stream since this item was retained. Reuse that mapping. */
+            bridge_stream_entry_t *e = bridge_find_by_ref(b, p->stream_ref);
             if (!e) {
-                bridge_set_fatal(b, 0x1);
-                rc = MOQ_ERR_INTERNAL;
-                goto cleanup;
+                /* Reserve stream-map slot before opening transport stream. */
+                e = bridge_alloc_stream(b);
+                if (!e) {
+                    bridge_set_fatal(b, 0x1);
+                    rc = MOQ_ERR_INTERNAL;
+                    goto cleanup;
+                }
+                uint64_t uni_id = 0;
+                moq_transport_result_t r = sanitize_stream_result(
+                    b->ops->open_uni(b->endpoint_ctx, &uni_id));
+                if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
+                    bridge_deactivate_stream(e);
+                    goto stop;
+                }
+                if (r == MOQ_TRANSPORT_ERROR) {
+                    bridge_deactivate_stream(e);
+                    bridge_set_fatal(b, 0x1);
+                    rc = MOQ_ERR_INTERNAL;
+                    goto cleanup;
+                }
+                e->ref = p->stream_ref;
+                e->transport_id = uni_id;
+                e->kind = BRIDGE_STREAM_UNI;
+                e->origin = BRIDGE_ORIGIN_LOCAL;
             }
-
-            uint64_t uni_id = 0;
-            moq_transport_result_t r = sanitize_stream_result(
-                b->ops->open_uni(b->endpoint_ctx, &uni_id));
-            if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-                bridge_deactivate_stream(e);
-                goto stop;
-            }
-            if (r == MOQ_TRANSPORT_ERROR) {
-                bridge_deactivate_stream(e);
-                bridge_set_fatal(b, 0x1);
-                rc = MOQ_ERR_INTERNAL;
-                goto cleanup;
-            }
-            e->ref = p->stream_ref;
-            e->transport_id = uni_id;
-            e->kind = BRIDGE_STREAM_UNI;
-            e->origin = BRIDGE_ORIGIN_LOCAL;
             p->kind = PENDING_HEADER_PAYLOAD;
-            bridge_item_set_sid(p, uni_id);
+            bridge_item_set_sid(p, e->transport_id);
         }
         /* fall through - reuse this item to send header+payload */
 
