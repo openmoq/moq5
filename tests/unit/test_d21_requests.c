@@ -1133,6 +1133,142 @@ static void t_range_filters_declined(void)
     moq_session_destroy(s);
 }
 
+/* -- REQUEST_UPDATE accounting (Task 6.3) --------------------------------- *
+ * We send at most one update per request until it is answered (REQUEST_OK or
+ * REQUEST_ERROR restores the credit), which satisfies any MAX_REQUEST_UPDATES the
+ * peer advertises; we advertise none, so inbound updates are not limited. An update
+ * that is not on an established subscription's bidi is a protocol violation. */
+static void t_update_credit(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_subscription_t h;
+    moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    moq_subscription_update_cfg_t u;
+    memset(&u, 0, sizeof(u));
+    u.struct_size = sizeof(u);
+    u.has_forward = true; u.forward = false;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_update_subscription(s, h, &u, 3), (int)MOQ_OK);
+    /* No credit until the first is answered. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_update_subscription(s, h, &u, 4), (int)MOQ_ERR_WRONG_STATE);
+    { uint8_t m[128]; (void)take_bidi_message(s, m, sizeof(m), NULL); }
+    uint8_t ok[16];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, ok, sizeof(ok));
+    moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE, NULL, (moq_bytes_t){ NULL, 0 });
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, ok, moq_buf_writer_offset(&w), false, 5) >= 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_update_subscription(s, h, &u, 6), (int)MOQ_OK);
+    moq_session_destroy(s);
+
+    /* REQUEST_UPDATE as the first message on a fresh request bidi. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    uint8_t msg[32];
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 0, &p), (int)MOQ_OK);
+    (void)feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x3);
+    moq_session_destroy(s);
+}
+
+/* -- PUBLISH accept sends the subscriber's choices as a REQUEST_UPDATE ----- *
+ * The PUBLISH_OK form is a bare REQUEST_OK, so a non-default priority, a forward
+ * that differs from the PUBLISH's, a filter or a new-group request is not dropped:
+ * it follows as a REQUEST_UPDATE on the same bidi (Task 6.2). */
+static size_t take_two_bidi_messages(moq_session_t *s, uint8_t *a, size_t acap, size_t *an,
+                                     uint8_t *b, size_t bcap, size_t *bn)
+{
+    size_t count = 0;
+    *an = *bn = 0;
+    moq_action_t act;
+    while (moq_session_poll_actions(s, &act, 1) > 0) {
+        const uint8_t *d = NULL; size_t len = 0;
+        if (act.kind == MOQ_ACTION_OPEN_BIDI_STREAM) { d = act.u.open_bidi_stream.data; len = act.u.open_bidi_stream.len; }
+        else if (act.kind == MOQ_ACTION_SEND_BIDI_STREAM) { d = act.u.send_bidi_stream.data; len = act.u.send_bidi_stream.len; }
+        if (d && count == 0 && len <= acap) { memcpy(a, d, len); *an = len; count++; }
+        else if (d && count == 1 && len <= bcap) { memcpy(b, d, len); *bn = len; count++; }
+        moq_action_cleanup(&act);
+    }
+    return count;
+}
+
+static moq_publication_t accept_setup_publish(moq_session_t *s, uint64_t request_id, const char *track)
+{
+    moq_bytes_t parts[1];
+    moq_d21_publish_t pub;
+    memset(&pub, 0, sizeof(pub));
+    pub.request_id = request_id;
+    pub.track_namespace = ns_live(parts);
+    pub.track_name = lit(track);
+    pub.track_alias = 3 + request_id;
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_publish(&w, &pub);
+    feed_request(s, 4 * (request_id / 2 + 1), msg, moq_buf_writer_offset(&w));
+    moq_event_t ev;
+    moq_publication_t ph = {0};
+    if (next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev)) {
+        ph = ev.u.publish_request.pub;
+        moq_event_cleanup(&ev);
+    }
+    return ph;
+}
+
+static void t_accept_publish_followup_update(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    uint8_t a[96], b[96];
+    size_t an, bn;
+    moq_control_envelope_t env;
+    moq_d21_request_update_t u;
+
+    /* Priority, a filter and a forward change (the PUBLISH defaulted to forward 1). */
+    moq_publication_t ph = accept_setup_publish(s, 0, "p0");
+    moq_accept_publish_cfg_t acc;
+    memset(&acc, 0, sizeof(acc));
+    acc.struct_size = sizeof(acc);
+    acc.has_subscriber_priority = true; acc.subscriber_priority = 9;
+    acc.has_forward = true; acc.forward = false;
+    acc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START; acc.start_group = 6; acc.start_object = 1;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_publish(s, ph, &acc, 2), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)take_two_bidi_messages(s, a, sizeof(a), &an, b, sizeof(b), &bn), 2);
+    static const uint8_t bare[] = { 0x07, 0x00, 0x01, 0x00 };
+    MOQ_TEST_CHECK(an == sizeof(bare) && memcmp(a, bare, an) == 0);
+    MOQ_TEST_CHECK(decode_msg(b, bn, MOQ_D21_REQUEST_UPDATE, &env));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_update(env.payload, env.payload_len, &u), (int)MOQ_OK);
+    MOQ_TEST_CHECK(u.params.has_subscriber_priority && u.params.subscriber_priority == 9);
+    MOQ_TEST_CHECK(u.params.has_forward && u.params.forward == 0);
+    MOQ_TEST_CHECK(u.params.has_location_filter && u.params.location_filter.field_count == 2 &&
+                   u.params.location_filter.start_group == 6 && u.params.location_filter.start_object == 1);
+    MOQ_TEST_CHECK(!u.params.has_group_order);
+    /* A second accept-time follow-up would need its own credit; the first is pending. */
+    { bool pending = false;
+      for (size_t i = 0; i < s->pub_cap; i++)
+          if (s->publishes[i].state == MOQ_PUB_ESTABLISHED && s->publishes[i].update_pending)
+              pending = true;
+      MOQ_TEST_CHECK(pending); }
+
+    /* Nothing to say: the bare OK stands alone (no update, no credit used). */
+    moq_publication_t ph2 = accept_setup_publish(s, 2, "p1");
+    memset(&acc, 0, sizeof(acc));
+    acc.struct_size = sizeof(acc);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_publish(s, ph2, &acc, 3), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)take_two_bidi_messages(s, a, sizeof(a), &an, b, sizeof(b), &bn), 1);
+
+    /* Priority 128 and a forward equal to the PUBLISH's are defaults: still bare. */
+    moq_publication_t ph3 = accept_setup_publish(s, 4, "p2");
+    memset(&acc, 0, sizeof(acc));
+    acc.struct_size = sizeof(acc);
+    acc.has_subscriber_priority = true; acc.subscriber_priority = 128;
+    acc.has_forward = true; acc.forward = true;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_publish(s, ph3, &acc, 4), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)take_two_bidi_messages(s, a, sizeof(a), &an, b, sizeof(b), &bn), 1);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1152,6 +1288,8 @@ int main(void)
     t_resolve_loc_filter_window();
     t_inbound_window();
     t_range_filters_declined();
+    t_update_credit();
+    t_accept_publish_followup_update();
     if (failures) {
         fprintf(stderr, "test_d21_requests: %d failures\n", failures);
         return 1;

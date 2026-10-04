@@ -1282,6 +1282,8 @@ moq_result_t moq_session_accept_publish(
     bool fwd_effective = true;
     if (ACC_CFG_HAS(forward) && cfg->has_forward)
         fwd_effective = cfg->forward;
+    const bool ACC_FWD_SET = ACC_CFG_HAS(forward) && cfg->has_forward;
+    const bool cfg_forward = ACC_FWD_SET ? cfg->forward : true;
 #undef ACC_CFG_HAS
     /* Same filter validity rules as the wire encoders (unknown type / inverted
      * range), applied before any advance or mutation. */
@@ -1317,7 +1319,21 @@ moq_result_t moq_session_accept_publish(
     if (has_new_group_request && !s->publishes[slot].dynamic_groups)
         return MOQ_ERR_INVAL;
 
+    /* A profile whose PUBLISH_OK cannot carry the subscriber's choices (draft 21:
+     * the OK is a bare REQUEST_OK) sends any non-default priority, a forward that
+     * differs from what the PUBLISH advertised, a filter or a new-group request as
+     * a REQUEST_UPDATE right behind it, instead of dropping them. The Forward
+     * change takes effect when that update is acknowledged. */
+    const bool carries = s->profile->publish_ok_carries_params;
+    const bool fwd_change = !carries && ACC_FWD_SET &&
+                            cfg_forward != s->publishes[slot].send_allowed;
+    const bool followup = !carries &&
+        (has_filter || has_new_group_request || fwd_change ||
+         (cfg->has_subscriber_priority && cfg->subscriber_priority != 128));
+
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_request_endpoint_t up_ep;
+    memset(&up_ep, 0, sizeof(up_ep));
     {
         uint8_t buf[256];
         moq_buf_writer_t w;
@@ -1344,12 +1360,60 @@ moq_result_t moq_session_accept_publish(
         moq_result_t rc2 = s->profile->encode_publish_ok(s, &w, &ok_args);
         if (rc2 < 0) return rc2;
 
+        uint8_t ubuf[256];
+        moq_buf_writer_t uw;
+        moq_buf_writer_init(&uw, ubuf, sizeof(ubuf));
+        if (followup) {
+            moq_result_t prc = s->profile->prepare_request(s, &up_ep);
+            if (prc < 0) return prc;
+            moq_request_update_encode_args_t uargs = {
+                .request_id = up_ep.request_id,
+                .existing_request_id = s->publishes[slot].request_id,
+                .has_subscriber_priority = cfg->has_subscriber_priority &&
+                                           cfg->subscriber_priority != 128,
+                .subscriber_priority = cfg->subscriber_priority,
+                .has_forward = fwd_change,
+                .forward = cfg_forward,
+                .has_new_group_request = has_new_group_request,
+                .new_group_request = new_group_request,
+                .has_filter = has_filter,
+                .filter = filter,
+                .filter_start_group = f_start_group,
+                .filter_start_object = f_start_object,
+                .filter_end_group = f_end_group,
+            };
+            rc2 = s->profile->encode_request_update(s, &uw, &uargs);
+            if (rc2 < 0) {
+                s->profile->abort_request(s, &up_ep);
+                return rc2;
+            }
+            /* Both messages or neither: reserve the action slots and the send
+             * space for the pair before queuing the first. */
+            if (action_queue_avail(s) < 2 ||
+                moq_buf_writer_offset(&w) + moq_buf_writer_offset(&uw) >
+                    s->send_cap - s->send_len) {
+                s->profile->abort_request(s, &up_ep);
+                return MOQ_ERR_WOULD_BLOCK;
+            }
+        }
+
         /* PUBLISH_OK carries no FIN -- the subscription lives on the bidi. A
          * send-buffer shortfall is retryable (WOULD_BLOCK), not BUFFER. */
         moq_result_t arc = queue_publish_response(s, (size_t)slot, buf,
                                                   moq_buf_writer_offset(&w),
                                                   false);
-        if (arc < 0) return arc;
+        if (arc < 0) {
+            if (followup) s->profile->abort_request(s, &up_ep);
+            return arc;
+        }
+        if (followup) {
+            arc = queue_publish_response(s, (size_t)slot, ubuf,
+                                         moq_buf_writer_offset(&uw), false);
+            if (arc < 0) {
+                s->profile->abort_request(s, &up_ep);
+                return arc;
+            }
+        }
     }
 
     /* Acceptance changes STATE only: this slot was allocated -- and linked --
@@ -1362,7 +1426,16 @@ moq_result_t moq_session_accept_publish(
      * kept for reference. (The RESOLVED window lives on the ORIGINAL
      * PUBLISHER's entry, computed when it receives this PUBLISH_OK --
      * resolution is against the publisher's registry, not ours.) */
-    s->publishes[slot].send_allowed = fwd_effective;
+    if (carries) {
+        s->publishes[slot].send_allowed = fwd_effective;
+    } else if (followup) {
+        moq_pub_entry_t *ue = &s->publishes[slot];
+        ue->update_pending = true;
+        ue->update_request_id = up_ep.request_id;
+        ue->update_has_forward = fwd_change;
+        ue->update_forward = fwd_change ? cfg_forward : false;
+        s->profile->commit_request(s, &up_ep);
+    }
     if (has_filter) {
         s->publishes[slot].filter_type = (uint32_t)filter;
         s->publishes[slot].req_start_group = f_start_group;
@@ -1813,11 +1886,17 @@ moq_result_t session_core_on_publish_request_update(
             e->dt_sub_has_object, e->dt_sub_object_ms,
             e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms);
     }
-    if (d->has_filter)
-        moq_resolve_filter_window(d->filter_type,
+    if (d->has_filter) {
+        if (d->loc_filter.present && d->loc_filter.field_count > 0)
+            moq_resolve_loc_filter_window(&d->loc_filter,
+                                  usnap_has, usnap_g, usnap_o,
+                                  s->profile->location_varint_max, &e->window);
+        else
+            moq_resolve_filter_window(d->filter_type,
                                   d->start_group, d->start_object, d->end_group,
                                   usnap_has, usnap_g, usnap_o,
                                   s->profile->location_varint_max, &e->window);
+    }
     s->profile->commit_inbound_request(s, &d->endpoint);
     auth_committed = true;
     process_auth_tokens_commit_txn(s, &d->auth_txn);
