@@ -285,6 +285,13 @@ typedef struct moq_pq_threaded_cfg {
      * for the duration of _create only. Inert when insecure_skip_verify=true and
      * inert in server mode. */
     const char        *ca_file;
+
+    /* Appended (struct_size append-only ABI) -- CLIENT only, draft 21: the AUTHORITY
+     * and PATH a native-QUIC client sends in SETUP (9.1.1, 9.1.2). NUL-terminated,
+     * copied during _create; NULL/empty = send none. Inert for servers and for
+     * drafts that do not carry them. */
+    const char        *setup_authority;
+    const char        *setup_path;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that

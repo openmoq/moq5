@@ -11645,6 +11645,64 @@ static void d21_fill_case(bool in_range)
     MOQ_TEST_PASS(in_range ? "d21_fill_served_from_retained" : "d21_fill_without_data_resets");
 }
 
+/* -- Draft 21: FIRST_OBJECT (2.2, 11.3.1) ---------------------------------- *
+ * The original publisher sets the bit on a new subgroup that begins at the first
+ * object ever published in it, and not on a stream that begins later in the group
+ * (a subscriber that joined mid-group). */
+static void d21_collect_subgroup_type_bits(moq_session_t *sv, int *firsts, int *nots)
+{
+    moq_action_t a;
+    while (moq_session_poll_actions(sv, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_DATA && a.u.send_data.header_len > 0 &&
+            a.u.send_data.header[0] >= 0x10 && a.u.send_data.header[0] < 0x80 &&
+            (a.u.send_data.header[0] & 0x10)) {          /* a SUBGROUP_HEADER type */
+            if (a.u.send_data.header[0] & 0x40) (*firsts)++; else (*nots)++;
+        }
+        moq_action_cleanup(&a);
+    }
+}
+
+static void test_d21_first_object_bit(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *sv = moq_simpair_server(sp);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    int firsts = 0, nots = 0;
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);      /* drop setup traffic */
+    firsts = nots = 0;
+
+    uint8_t d[] = { 1, 2 };
+    moq_rcbuf_t *p = NULL; moq_rcbuf_create(&alloc, d, sizeof(d), &p);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 3, 0, p, moq_simpair_now_us(sp)) == MOQ_OK);
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK_EQ_INT(firsts, 1);                         /* group 3, object 0: first ever */
+    MOQ_TEST_CHECK_EQ_INT(nots, 0);
+
+    /* A second subscriber joins after object 0: its stream starts at object 1. */
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    firsts = nots = 0;
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 3, 1, p, moq_simpair_now_us(sp)) == MOQ_OK);
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK_EQ_INT(firsts, 0);
+    MOQ_TEST_CHECK_EQ_INT(nots, 1);                           /* new stream, mid-group */
+
+    /* The next group starts clean for both. */
+    firsts = nots = 0;
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 4, 0, p, moq_simpair_now_us(sp)) == MOQ_OK);
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK_EQ_INT(firsts, 2);
+    moq_rcbuf_decref(p);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_first_object_bit");
+}
+
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
  * BEFORE the done, both complete across retries, the slot clears only after
  * success, and the track is terminal only after the final success. Server
@@ -14985,6 +15043,7 @@ int main(void) {
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, false);
     test_d21_concurrent_subscriptions();
     test_d21_no_subscription_ended();
+    test_d21_first_object_bit();
     d21_fill_case(true);
     d21_fill_case(false);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_16);

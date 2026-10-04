@@ -1394,10 +1394,13 @@ moq_result_t moq_d21_encode_setup_opts(moq_buf_writer_t *w,
                                        const moq_d21_setup_opts_t *opts)
 {
     if (!w) return MOQ_ERR_INVAL;
-    /* PATH, AUTHORITY and tokens are not sourced yet; refuse rather than
-     * silently drop a requested option. */
-    if (opts && (opts->has_path || opts->has_authority ||
-                 opts->auth_token_count > 0))
+    /* Tokens are not sourced yet; refuse rather than silently drop them. */
+    if (opts && opts->auth_token_count > 0)
+        return MOQ_ERR_INVAL;
+    if (opts && ((opts->has_path && (opts->path_value.len > 0xFFFFu ||
+                                     (opts->path_value.len > 0 && !opts->path_value.data))) ||
+                 (opts->has_authority && (opts->authority_value.len > 0xFFFFu ||
+                                          (opts->authority_value.len > 0 && !opts->authority_value.data)))))
         return MOQ_ERR_INVAL;
     if (opts && opts->has_implementation &&
         (opts->implementation.len > 0xFFFFu ||
@@ -1414,9 +1417,23 @@ moq_result_t moq_d21_encode_setup_opts(moq_buf_writer_t *w,
 #define D21_SETUP_EMIT_TYPE(t) do { \
         if ((rc = moq_buf_write_vi64(w, (t) - prev)) < 0) goto fail; \
         prev = (t); } while (0)
+    if (opts && opts->has_path) {
+        D21_SETUP_EMIT_TYPE(MOQ_D21_SETUP_OPT_PATH);
+        if ((rc = moq_buf_write_vi64(w, opts->path_value.len)) < 0) goto fail;
+        if (opts->path_value.len > 0 &&
+            (rc = moq_buf_write_raw(w, opts->path_value.data, opts->path_value.len)) < 0)
+            goto fail;
+    }
     if (opts && opts->has_max_auth_token_cache_size) {
         D21_SETUP_EMIT_TYPE(MOQ_D21_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE);
         if ((rc = moq_buf_write_vi64(w, opts->max_auth_token_cache_size)) < 0)
+            goto fail;
+    }
+    if (opts && opts->has_authority) {
+        D21_SETUP_EMIT_TYPE(MOQ_D21_SETUP_OPT_AUTHORITY);
+        if ((rc = moq_buf_write_vi64(w, opts->authority_value.len)) < 0) goto fail;
+        if (opts->authority_value.len > 0 &&
+            (rc = moq_buf_write_raw(w, opts->authority_value.data, opts->authority_value.len)) < 0)
             goto fail;
     }
     if (opts && opts->has_max_filter_ranges) {

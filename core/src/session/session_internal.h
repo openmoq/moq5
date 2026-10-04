@@ -1282,6 +1282,7 @@ typedef struct moq_subgroup_header_encode_args {
     uint8_t  publisher_priority;
     bool     has_extensions;
     bool     end_of_group;
+    bool     first_object;
 } moq_subgroup_header_encode_args_t;
 
 typedef struct moq_object_header_encode_args {
@@ -1565,6 +1566,10 @@ struct moq_session {
 
     bool                send_auth_token_cache_size;
     uint64_t            auth_token_cache_size;
+    uint8_t             setup_authority[MOQ_SETUP_AUTHORITY_MAX];
+    size_t              setup_authority_len;
+    uint8_t             setup_path[MOQ_SETUP_PATH_MAX];
+    size_t              setup_path_len;
 
     uint8_t      *send_buf;
     size_t        send_cap;

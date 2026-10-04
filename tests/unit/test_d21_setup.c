@@ -153,6 +153,54 @@ static void t_setup_emitted(void)
     }
 }
 
+/* A native-QUIC client names its URI: PATH (0x01) first, AUTHORITY (0x05) after the cache
+ * size, each a length-prefixed byte string (9.1.1, 9.1.2). A server never sends them. */
+static void t_setup_authority_path(void)
+{
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
+    cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.setup_authority = (moq_bytes_t){ (const uint8_t *)"h:4443", 6 };
+    cfg.setup_path = (moq_bytes_t){ (const uint8_t *)"/moq?x=1", 8 };
+    moq_session_t *s = NULL;
+    MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) >= 0 && s);
+    MOQ_TEST_CHECK(moq_session_start(s, 0) >= 0);
+    /* The first option bytes on the wire: Type 1, Length 8, "/moq?x=1"; then
+     * AUTHORITY as delta 4 from it, Length 6, "h:4443". */
+    static const uint8_t want_path[] = { 0x01, 0x08, '/', 'm', 'o', 'q', '?', 'x', '=', '1',
+                                         0x04, 0x06, 'h', ':', '4', '4', '4', '3' };
+    bool found = false;
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) {
+        if (a.kind == MOQ_ACTION_OPEN_UNI_CONTROL && a.u.open_uni_control.len > sizeof(want_path)) {
+            const uint8_t *d = a.u.open_uni_control.data;
+            for (size_t i = 0; i + sizeof(want_path) <= a.u.open_uni_control.len; i++)
+                if (memcmp(d + i, want_path, sizeof(want_path)) == 0) found = true;
+        }
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK(found);
+    moq_session_destroy(s);
+
+    /* A server given the same fields sends neither. */
+    cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    s = NULL;
+    MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) >= 0 && s);
+    MOQ_TEST_CHECK(moq_session_start(s, 0) >= 0);
+    moq_d21_setup_opts_t o;
+    MOQ_TEST_CHECK(capture_setup_options(s, &o));
+    MOQ_TEST_CHECK(!o.has_path && !o.has_authority);
+    moq_session_destroy(s);
+
+    /* Over-long values are refused at create. */
+    uint8_t big[MOQ_SETUP_PATH_MAX + 1];
+    memset(big, 'a', sizeof(big));
+    cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cfg.setup_path = (moq_bytes_t){ big, sizeof(big) };
+    s = NULL;
+    MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) < 0);
+}
+
 /* == B. Peer limits the session records =================================== */
 static void t_setup_peer_options(void)
 {
@@ -428,6 +476,7 @@ static void t_capabilities(void)
 int main(void)
 {
     t_setup_emitted();
+    t_setup_authority_path();
     t_setup_peer_options();
     t_setup_violations();
     t_goaway();

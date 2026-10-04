@@ -238,6 +238,10 @@ typedef struct moq_d21_auth_token {
 typedef struct moq_d21_setup_opts {
     bool     has_path;
     bool     has_authority;
+    /* Encode only (the decoder surfaces presence): the PATH / AUTHORITY values to
+     * send, borrowed. A client on native QUIC sends both (9.1.1, 9.1.2). */
+    moq_bytes_t path_value;
+    moq_bytes_t authority_value;
     bool     has_max_auth_token_cache_size;
     uint64_t max_auth_token_cache_size;
     bool     has_max_filter_ranges;

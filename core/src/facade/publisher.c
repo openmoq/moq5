@@ -123,6 +123,9 @@ typedef struct {
     /* Retained content snapshot (NULL when the op carries none). */
     moq_rcbuf_t  *payload;          /* WRITE_OBJECT payload / WRITE_DATA chunk */
     moq_rcbuf_t  *properties;
+    /* The op's object is the first published in its Group (the original publisher's
+     * FIRST_OBJECT, draft 21), judged from the track history at commit. */
+    bool          first_in_group;
 } pub_pending_op_t;
 
 typedef struct pub_ns_entry {
@@ -2055,6 +2058,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         sgcfg.publisher_priority = track->priority;
         sgcfg.object_properties = need_ext;
         sgcfg.end_of_group = want_eog;
+        sgcfg.first_object = track->op.first_in_group;
 
         moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
             ? moq_session_open_pub_subgroup(pub->session,
@@ -2216,10 +2220,13 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
         if (rr < 0) return rr;
     }
     if (st == 1) {
+        const bool first_in_group = !(track->hist && track->hist->has_largest &&
+                                      track->hist->largest_group >= obj->group_id);
         track_op_commit(track, PUB_OP_WRITE_OBJECT,
             obj->group_id, obj->object_id, obj->datagram, obj->has_status,
             obj->has_status ? obj->status : MOQ_OBJECT_NORMAL,
             want_eog, 0, obj->payload, obj->properties);
+        track->op.first_in_group = first_in_group;
         track_hist_merge(track->hist, obj->group_id, obj->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
         if (track->monotonic) {
@@ -2646,9 +2653,12 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         if (rr < 0) return rr;
     }
     if (st == 1) {
+        const bool first_in_group = !(track->hist && track->hist->has_largest &&
+                                      track->hist->largest_group >= cfg->group_id);
         track_op_commit(track, PUB_OP_BEGIN_OBJECT,
             cfg->group_id, cfg->object_id, false, false, MOQ_OBJECT_NORMAL,
             false, cfg->payload_length, NULL, begin_props);
+        track->op.first_in_group = first_in_group;
         track_hist_merge(track->hist, cfg->group_id, cfg->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
         if (track->monotonic &&
@@ -2686,6 +2696,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             sgcfg.subgroup_id = 0;
             sgcfg.publisher_priority = track->priority;
             sgcfg.object_properties = need_ext;
+            sgcfg.first_object = track->op.first_in_group;
             moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
                 ? moq_session_open_pub_subgroup(pub->session,
                     slot->pub, &sgcfg, now_us, &slot->sg)

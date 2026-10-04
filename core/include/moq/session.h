@@ -205,7 +205,18 @@ typedef struct moq_session_cfg {
      * stays ESTABLISHED. 0 selects the library default (4096). Read only when
      * struct_size covers this field; older callers get the default. */
     uint32_t           max_namespace_suffixes_per_subscription;
+
+    /* Appended (ABI-additive; draft 21): the AUTHORITY and PATH a CLIENT on native QUIC
+     * sends in SETUP (9.1.1, 9.1.2): the URI's authority, and its path-abempty plus
+     * "?query" when a query is present. Borrowed for the create call and copied
+     * (authority up to MOQ_SETUP_AUTHORITY_MAX, path up to MOQ_SETUP_PATH_MAX bytes,
+     * longer is MOQ_ERR_INVAL). Leave empty for a server and for WebTransport, which
+     * must not send them. Drafts 16 and 18 ignore these. */
+    moq_bytes_t        setup_authority;
+    moq_bytes_t        setup_path;
 } moq_session_cfg_t;
+#define MOQ_SETUP_AUTHORITY_MAX 255u
+#define MOQ_SETUP_PATH_MAX      1023u
 
 #ifdef __cplusplus
 #define MOQ_SESSION_CFG_INIT \
@@ -2910,6 +2921,11 @@ typedef struct moq_subgroup_cfg {
     bool     object_properties;
     uint8_t  _reserved_sg2[7];
     bool     end_of_group;
+    /* Appended (ABI-additive; draft 21 FIRST_OBJECT, 2.2 / 11.3.1): the first object on
+     * this stream is the first object ever published in the subgroup. The ORIGINAL
+     * publisher sets it when it opens a new subgroup; a restart after a reset, or a
+     * stream that begins mid-subgroup, leaves it false. Drafts 16/18 ignore it. */
+    bool     first_object;
 } moq_subgroup_cfg_t;
 
 MOQ_API void moq_subgroup_cfg_init(moq_subgroup_cfg_t *cfg);

@@ -399,6 +399,8 @@ struct moq_endpoint {
     char *host;    size_t host_len;
     char *sni;     size_t sni_len;
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
+    char *setup_authority; size_t setup_authority_len;  /* RAW_QUIC: SETUP AUTHORITY value */
+    char *setup_path;      size_t setup_path_len;       /* RAW_QUIC: SETUP PATH value (path[?query]) */
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
@@ -1130,7 +1132,12 @@ static void ep_free_strings(moq_endpoint_t *ep)
     if (ep->path)    ep->alloc.free(ep->path, ep->path_len, ep->alloc.ctx);
     if (ep->ca_file) ep->alloc.free(ep->ca_file, ep->ca_file_len, ep->alloc.ctx);
     if (ep->wt_offer) ep->alloc.free(ep->wt_offer, ep->wt_offer_len, ep->alloc.ctx);
+    if (ep->setup_authority)
+        ep->alloc.free(ep->setup_authority, ep->setup_authority_len, ep->alloc.ctx);
+    if (ep->setup_path)
+        ep->alloc.free(ep->setup_path, ep->setup_path_len, ep->alloc.ctx);
     ep->host = ep->sni = ep->path = ep->ca_file = NULL;
+    ep->setup_authority = ep->setup_path = NULL;
     ep->wt_offer = NULL;
 }
 
@@ -1175,6 +1182,8 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.alpn_list = ep->alpn_offer;
     fc.alpn_count = ep->alpn_offer_count;
     fc.port = (int)r->url.port;
+    fc.setup_authority = ep->setup_authority;
+    fc.setup_path = ep->setup_path;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
     fc.configure_quic = ep_configure_quic;
     fc.configure_quic_ctx = ep;
@@ -1667,6 +1676,37 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
         ep->path = ep_strdup_bytes(alloc, r.wt_path, &ep->path_len);
         oom = oom || !ep->path;
+    }
+    if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {
+        /* The SETUP AUTHORITY / PATH options a native-QUIC client sends (draft 21 9.1.1,
+         * 9.1.2): the URI's authority verbatim (an explicit port is kept), and the path
+         * with "?query" appended when the URI has a query; an empty path is sent as
+         * empty (path-abempty). Drafts 16/18 ignore both. */
+        const uint8_t *u = cfg->url.data;
+        size_t n = cfg->url.len, a = 0, b;
+        while (a + 2 < n && !(u[a] == ':' && u[a + 1] == '/' && u[a + 2] == '/')) a++;
+        a = (a + 2 < n) ? a + 3 : 0;
+        b = a;
+        while (b < n && u[b] != '/' && u[b] != '?' && u[b] != '#') b++;
+        moq_bytes_t auth = { u + a, b - a };
+        size_t plen = r.url.path.len + (r.url.query.len ? r.url.query.len + 1 : 0);
+        uint8_t pbuf[MOQ_SETUP_PATH_MAX + 1];
+        if (auth.len > MOQ_SETUP_AUTHORITY_MAX || plen > MOQ_SETUP_PATH_MAX)
+            plen = SIZE_MAX;           /* too long for SETUP: refuse the endpoint (below) */
+        size_t o = 0;
+        if (plen != SIZE_MAX && r.url.path.len) { memcpy(pbuf, r.url.path.data, r.url.path.len); o = r.url.path.len; }
+        if (plen != SIZE_MAX && r.url.query.len) {
+            pbuf[o++] = '?';
+            memcpy(pbuf + o, r.url.query.data, r.url.query.len);
+            o += r.url.query.len;
+        }
+        if (plen == SIZE_MAX) {
+            oom = true;
+        } else {
+            ep->setup_authority = ep_strdup_bytes(alloc, auth, &ep->setup_authority_len);
+            ep->setup_path = ep_strdup_bytes(alloc, (moq_bytes_t){ pbuf, o }, &ep->setup_path_len);
+            oom = oom || !ep->setup_authority || !ep->setup_path;
+        }
     }
     if (!oom && cfg->ca_file.len > 0) {
         ep->ca_file = ep_strdup_bytes(alloc, cfg->ca_file, &ep->ca_file_len);

@@ -1905,6 +1905,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
             auth_token_cache_size = cfg->auth_token_cache_size;
     }
 
+    moq_bytes_t setup_authority = { NULL, 0 }, setup_path = { NULL, 0 };
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, setup_path) + sizeof(cfg->setup_path)) {
+        setup_authority = cfg->setup_authority;
+        setup_path = cfg->setup_path;
+        if ((setup_authority.len && !setup_authority.data) ||
+            (setup_path.len && !setup_path.data) ||
+            setup_authority.len > MOQ_SETUP_AUTHORITY_MAX ||
+            setup_path.len > MOQ_SETUP_PATH_MAX)
+            return MOQ_ERR_INVAL;
+    }
+
     size_t action_cap = cfg_read_u32(cfg,
         offsetof(moq_session_cfg_t, max_actions), sizeof(cfg->max_actions));
     size_t event_cap = cfg_read_u32(cfg,
@@ -2404,6 +2415,10 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         s->session_tag = (uint16_t)((h & 0x7FFF) | 1);
     }
 
+    if (setup_authority.len) memcpy(s->setup_authority, setup_authority.data, setup_authority.len);
+    s->setup_authority_len = setup_authority.len;
+    if (setup_path.len) memcpy(s->setup_path, setup_path.data, setup_path.len);
+    s->setup_path_len = setup_path.len;
     s->send_auth_token_cache_size = send_auth_token_cache_size;
     s->auth_token_cache_size = auth_token_cache_size;
     {
