@@ -21,6 +21,8 @@
  *              LOCAL/self-signed testing ONLY (verification is on by default)
  *   --draft N  offer exactly this MoQT draft (16, 18 or 21); default is to
  *              offer every draft this build supports and negotiate one
+ *   --peer-close-ok  a session the library closed over a PEER protocol violation is
+ *              not a failure of this process (conformance probes provoke exactly that)
  *   --ca FILE  PEM CA/certificate to trust instead of the system roots (only
  *              backends that expose a CA file honor it; others reject it)
  */
@@ -91,7 +93,7 @@ static moq_version_t parse_draft(const char *s)
  * never completed (certificate, ALPN, WebTransport protocol token, timeout)
  * leaves the write loop ending early with MOQ_ERR_CLOSED; without this the
  * process would exit 0 and look like a clean run. Returns true on a failure. */
-static bool report_terminal(const moq_endpoint_t *ep)
+static bool report_terminal(const moq_endpoint_t *ep, bool peer_close_ok)
 {
     moq_endpoint_terminal_t t;
     memset(&t, 0, sizeof(t));
@@ -100,7 +102,7 @@ static bool report_terminal(const moq_endpoint_t *ep)
     fprintf(stderr, "endpoint: negotiated draft %u, terminal reason %d, "
             "detail 0x%llx\n", (unsigned)moq_endpoint_negotiated_version(ep),
             (int)t.reason, (unsigned long long)t.detail_code);
-    return t.reason == MOQ_ENDPOINT_TERMINAL_PROTOCOL ||
+    return (t.reason == MOQ_ENDPOINT_TERMINAL_PROTOCOL && !peer_close_ok) ||
            t.reason == MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE ||
            t.reason == MOQ_ENDPOINT_TERMINAL_TLS ||
            t.reason == MOQ_ENDPOINT_TERMINAL_TRANSPORT;
@@ -124,7 +126,7 @@ int main(int argc, char **argv)
     if (argc < 3) {
         fprintf(stderr,
             "usage: %s <url> <namespace> [track] [--insecure-skip-verify]\n"
-            "          [--draft N] [--ca FILE]\n"
+            "          [--draft N] [--ca FILE] [--peer-close-ok]\n"
             "  --insecure-skip-verify  disable TLS certificate verification\n"
             "                          (LOCAL/self-signed testing ONLY)\n"
             "  --draft N               offer exactly draft 16, 18 or 21\n"
@@ -142,6 +144,7 @@ int main(int argc, char **argv)
     bool insecure_skip_verify = false;   /* TLS verification ON by default */
     moq_version_t pinned = (moq_version_t)0;   /* 0 = AUTO (offer all) */
     const char *ca_file = NULL;
+    bool peer_close_ok = false;
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--insecure-skip-verify") == 0) {
             insecure_skip_verify = true;
@@ -153,6 +156,8 @@ int main(int argc, char **argv)
                         "(got \"%s\")\n", argv[i]);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--peer-close-ok") == 0) {
+            peer_close_ok = true;
         } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
             ca_file = argv[++i];
         } else {
@@ -301,7 +306,7 @@ int main(int argc, char **argv)
     }
 
     printf("wrote %llu objects\n", sent);
-    bool failed = report_terminal(ep);
+    bool failed = report_terminal(ep, peer_close_ok);
 
     /* 5. Teardown: child first, then a bounded local stream flush before the
      * endpoint's abrupt stop. The drain waits for bytes already queued in the

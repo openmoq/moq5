@@ -345,6 +345,21 @@ static moq_result_t feed_goaway(moq_session_t *s, const char *uri, uint64_t time
     return moq_session_on_control_bytes(s, buf, moq_buf_writer_offset(&w), 1);
 }
 
+/* The maximum New Session URI (8,192 bytes, 9.2) fits the control-stream buffer. */
+static void t_goaway_max_uri(void)
+{
+    static uint8_t big[8192 + 16];
+    static uint8_t uri[8192];
+    memset(uri, 'a', sizeof(uri));
+    moq_session_t *s = make_established(MOQ_PERSPECTIVE_CLIENT, 0);
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, big, sizeof(big));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&w, uri, sizeof(uri), 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_control_bytes(s, big, moq_buf_writer_offset(&w), 1), (int)MOQ_OK);
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED && s->goaway_received);
+    moq_session_destroy(s);
+}
+
 static void t_goaway(void)
 {
     /* Emitted: no Request ID, Timeout from the session's drain timeout (9.2). */
@@ -493,6 +508,7 @@ int main(void)
     t_setup_peer_options();
     t_setup_violations();
     t_goaway();
+    t_goaway_max_uri();
     t_control_messages();
     t_capabilities();
     if (failures) {

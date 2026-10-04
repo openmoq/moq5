@@ -1944,7 +1944,14 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (!event_cap)   event_cap   = MOQ_DEFAULT_MAX_EVENTS;
     if (sub_cap > 0xFFFF) return MOQ_ERR_INVAL; /* handle slot is 16-bit */
     if (!send_cap)    send_cap    = MOQ_DEFAULT_SEND_BUF;
-    if (!recv_cap)    recv_cap    = MOQ_DEFAULT_RECV_BUF;
+    if (!recv_cap) {
+        /* Draft 21 lets a GOAWAY carry a New Session URI of up to 8,192 bytes (9.2), which
+         * the control-stream reassembly buffer must hold whole. */
+        const bool is_d21 = cfg->struct_size >= offsetof(moq_session_cfg_t, version) +
+                                                sizeof(cfg->version) &&
+                            cfg->version == MOQ_VERSION_DRAFT_21;
+        recv_cap = is_d21 ? MOQ_D21_RECV_BUF : MOQ_DEFAULT_RECV_BUF;
+    }
     if (!sub_cap)     sub_cap     = MOQ_DEFAULT_MAX_SUBS;
     if (!scratch_cap) scratch_cap = MOQ_DEFAULT_OUTPUT_SCRATCH;
     if (!sg_cap)      sg_cap      = MOQ_DEFAULT_MAX_SUBGROUPS;

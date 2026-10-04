@@ -74,7 +74,7 @@ timeout_seconds=$(((timeout_ms + 999) / 1000))
 # the timeout's own status 124 is not a failure.
 set +e
 timeout --signal=INT "$timeout_seconds" "$publisher_bin" "$endpoint" "$namespace" "$track" \
-    --draft "$draft" --ca "$ca_cert"
+    --draft "$draft" --ca "$ca_cert" --peer-close-ok
 status=$?
 set -e
 ((status == 124)) && exit 0

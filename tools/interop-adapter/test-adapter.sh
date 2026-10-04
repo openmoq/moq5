@@ -40,13 +40,13 @@ expect_refused() {  # description
 # Native QUIC, draft 18: argument mapping, hex decoding, multi-field namespace.
 make_request 18 native_quic moqt://127.0.0.1:4443/moq '["6d65646961"]' 766964655f31 2500
 out=$(run_adapter)
-[[ "$out" == "<moqt://127.0.0.1:4443/moq><media><vide_1><--draft><18><--ca><$work/ca cert.pem>" ]] ||
+[[ "$out" == "<moqt://127.0.0.1:4443/moq><media><vide_1><--draft><18><--ca><$work/ca cert.pem><--peer-close-ok>" ]] ||
     { echo "FAIL: draft 18 native mapping: $out"; exit 1; }
 
 # WebTransport, draft 21, two namespace fields joined by a slash.
 make_request 21 webtransport https://127.0.0.1:4443/moq '["6d65646961","6c697665"]' 766964655f31 1000
 out=$(run_adapter)
-[[ "$out" == "<https://127.0.0.1:4443/moq><media/live><vide_1><--draft><21><--ca><$work/ca cert.pem>" ]] ||
+[[ "$out" == "<https://127.0.0.1:4443/moq><media/live><vide_1><--draft><21><--ca><$work/ca cert.pem><--peer-close-ok>" ]] ||
     { echo "FAIL: draft 21 webtransport mapping: $out"; exit 1; }
 
 # Refusals (exit 64, publisher never started).

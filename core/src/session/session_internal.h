@@ -15,6 +15,7 @@
 #define MOQ_DEFAULT_MAX_EVENTS       16
 #define MOQ_DEFAULT_SEND_BUF         4096
 #define MOQ_DEFAULT_RECV_BUF         4096
+#define MOQ_D21_RECV_BUF             8448   /* 8192-byte GOAWAY URI + framing */
 #define MOQ_DEFAULT_MAX_SUBS         64
 #define MOQ_DEFAULT_OUTPUT_SCRATCH   65536
 #define MOQ_DEFAULT_MAX_SUBGROUPS    64
