@@ -2210,6 +2210,13 @@ MOQ_API moq_result_t moq_session_write_fetch_range_before_group(
 MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
 
 /*
+ * True when the negotiated draft allows several concurrent subscriptions to the
+ * same Track on one session (draft 21 yes, drafts 16/18 no). Pure capability
+ * query; false for a NULL session.
+ */
+MOQ_API bool moq_session_allows_concurrent_subscriptions(const moq_session_t *s);
+
+/*
  * Close the fetch data stream with FIN. Publisher side. Advancing call.
  * Frees the fetch entry after queuing the final action.
  */

@@ -3326,6 +3326,7 @@ static const moq_profile_ops_t d21_ops = {
     .uses_uni_control_channel = true,
     .publish_ok_carries_params = false,
     .supports_joining_fetch  = false,
+    .allows_concurrent_subscriptions = true,
     .classify_uni_stream     = d21_classify_uni_stream,
     /* Request admission + SUBSCRIBE outbound. */
     .prepare_request         = d21_prepare_request,

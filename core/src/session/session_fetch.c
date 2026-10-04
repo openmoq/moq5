@@ -2076,6 +2076,12 @@ bool moq_session_supports_fetch_datagram(const moq_session_t *s)
     return s->profile->fetch_datagram_supported;
 }
 
+bool moq_session_allows_concurrent_subscriptions(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->allows_concurrent_subscriptions;
+}
+
 moq_result_t moq_session_end_fetch(
     moq_session_t *s,
     moq_fetch_t fetch,

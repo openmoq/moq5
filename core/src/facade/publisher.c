@@ -268,6 +268,9 @@ struct moq_pub_deferred {
     bool                forward;   /* the request's Forward state, for the slot */
 };
 
+/* Upper bound on concurrent subscription slots per Track. */
+#define PUB_MAX_CONCURRENT_SUBS 8
+
 struct moq_publisher {
     moq_session_t      *session;
     moq_alloc_t         alloc;
@@ -1456,7 +1459,10 @@ moq_result_t moq_pub_create(moq_session_t *session,
         }
     }
 
-    p->sub_slot_cap = 1;
+    /* One slot is enough for drafts 16/18 (one subscription per Track); draft 21
+     * allows concurrent subscriptions to a Track, each served from its own slot.
+     * The session capability gates how many are used. */
+    p->sub_slot_cap = PUB_MAX_CONCURRENT_SUBS;
 
     *out = p;
     return MOQ_OK;
@@ -3351,9 +3357,13 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
          * terminal. Checked before the app callback so it is never consulted. */
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
-    } else if (track_has_subscriber(track)) {
+    } else if (track_has_subscriber(track) &&
+               !moq_session_allows_concurrent_subscriptions(pub->session)) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION;
+    } else if (track_active_count(track) >= PUB_MAX_CONCURRENT_SUBS) {
+        want_accept = false;
+        reject_code = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD;
     } else if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;

@@ -542,7 +542,8 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
      * decision both compare the decoded identity against stored canonical
      * keys in place. The request's own identity key is built only in
      * funded execution below, once every selected rejection is behind us. */
-    if (sub_is_duplicate_track_id(s, &d->track_namespace, d->track_name,
+    if (!s->profile->allows_concurrent_subscriptions &&
+        sub_is_duplicate_track_id(s, &d->track_namespace, d->track_name,
                                   MOQ_SUB_ROLE_PUBLISHER)) {
         result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
                                      0x19, "duplicate subscription", 22);
@@ -2904,7 +2905,8 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         return MOQ_ERR_NOMEM;
     }
 
-    if (sub_is_duplicate_track(s, tid, tid_len, MOQ_SUB_ROLE_SUBSCRIBER)) {
+    if (!s->profile->allows_concurrent_subscriptions &&
+        sub_is_duplicate_track(s, tid, tid_len, MOQ_SUB_ROLE_SUBSCRIBER)) {
         if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return MOQ_ERR_INVAL;

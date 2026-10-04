@@ -10785,6 +10785,34 @@ typedef struct {
     struct { uint64_t g, o; bool deliver; } probes[4];
 } win_case_t;
 
+/* -- Draft 21: concurrent subscriptions to one Track ------------------- *
+ * Each subscription is served independently; an object matching several is
+ * sent once per subscription (draft 21 3.3). Drafts 16/18 still reject. */
+static void test_d21_concurrent_subscriptions(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 2, 0, 0);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 4, 0, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 2);
+
+    /* {1,0}: neither. {3,0}: first only. {5,0}: both -> two copies. */
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 1, 0, 0xC0) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 1, 0, 0xC0), 0);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 3, 0, 0xC1) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 3, 0, 0xC1), 1);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 5, 0, 0xC2) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 5, 0, 0xC2), 2);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_concurrent_subscriptions");
+}
+
 static void test_window_membership_matrix(moq_version_t ver)
 {
     static const win_case_t cases[] = {
@@ -14830,6 +14858,7 @@ int main(void) {
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_16, false);
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, true);
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, false);
+    test_d21_concurrent_subscriptions();
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_16);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_18);
     for (int v = 0; v < 2; v++) {

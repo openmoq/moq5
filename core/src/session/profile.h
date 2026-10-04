@@ -414,6 +414,14 @@ typedef struct moq_profile_ops {
     bool supports_joining_fetch;
 
     /*
+     * Capability: true when several concurrent subscriptions to the same Track
+     * are allowed on one session (draft 21 3.3: each is served independently and
+     * an object matching more than one is sent once per subscription). Drafts 16
+     * and 18 reject the second with DUPLICATE_SUBSCRIPTION.
+     */
+    bool allows_concurrent_subscriptions;
+
+    /*
      * Capability: true if this profile's FETCH-response data plane can carry a
      * descending group order. Draft-16 sets true (fetch objects carry absolute
      * Group IDs); draft-18 sets false (group deltas with ascending-only

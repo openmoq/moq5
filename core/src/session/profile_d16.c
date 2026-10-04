@@ -4839,6 +4839,7 @@ static const moq_profile_ops_t d16_ops = {
     .uses_uni_control_channel        = false,
     .publish_ok_carries_params = true,
     .supports_joining_fetch  = true,
+    .allows_concurrent_subscriptions = false,
     .classify_uni_stream             = NULL,
     .validate_inbound_request_stream = NULL,
 };
