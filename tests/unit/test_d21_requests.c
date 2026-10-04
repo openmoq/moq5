@@ -1046,6 +1046,93 @@ static void t_inbound_window(void)
     moq_session_destroy(s);
 }
 
+/* -- Range Filters are declined (Task 6.7) -------------------------------- *
+ * MAX_FILTER_RANGES is not advertised (default 0), so a peer MUST NOT send Range
+ * Filters: SUBSCRIBE, FETCH and REQUEST_UPDATE carrying one are answered with
+ * REQUEST_ERROR INVALID_FILTER (0x36) and surface no request to the application. */
+
+/* Append one Range Filter parameter (SetID 0, Start 5) to a message built with no
+ * parameters: it ends in the zero parameter count. Returns the new length. */
+static size_t add_range_filter(uint8_t *m, size_t n)
+{
+    static const uint8_t rf[] = { 0x01, 0x26, 0x02, 0x00, 0x05 };
+    m[n - 1] = rf[0];
+    memcpy(m + n, rf + 1, sizeof(rf) - 1);
+    n += sizeof(rf) - 1;
+    uint16_t len = (uint16_t)(((uint16_t)m[1] << 8 | m[2]) + (sizeof(rf) - 1));
+    m[1] = (uint8_t)(len >> 8); m[2] = (uint8_t)len;     /* 16-bit envelope length */
+    return n;
+}
+
+static bool took_invalid_filter(moq_session_t *s)
+{
+    uint8_t m[128];
+    size_t n = take_bidi_message(s, m, sizeof(m), NULL);
+    moq_control_envelope_t env;
+    moq_d21_request_error_t re;
+    return n > 0 && decode_msg(m, n, MOQ_D21_REQUEST_ERROR, &env) &&
+           moq_d21_decode_request_error(env.payload, env.payload_len, &re) == MOQ_OK &&
+           re.error_code == 0x36;
+}
+
+static void t_range_filters_declined(void)
+{
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    moq_d21_msg_params_t p;
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_event_t ev;
+
+    /* SUBSCRIBE. */
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    memset(&p, 0, sizeof(p));
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p), (int)MOQ_OK);
+    size_t n = add_range_filter(msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
+    MOQ_TEST_CHECK(took_invalid_filter(s));
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED);
+    moq_session_destroy(s);
+
+    /* FETCH. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_d21_fetch_t f;
+    memset(&f, 0, sizeof(f));
+    f.request_id = 0; f.track_namespace = ns; f.track_name = lit("v");
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_OK);
+    n = add_range_filter(msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
+    MOQ_TEST_CHECK(took_invalid_filter(s));
+    moq_session_destroy(s);
+
+    /* REQUEST_UPDATE on an accepted subscription. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    memset(&p, 0, sizeof(p));
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
+    MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
+    moq_subscription_t sub = ev.u.subscribe_request.sub;
+    moq_event_cleanup(&ev);
+    moq_accept_subscribe_cfg_t acc;
+    memset(&acc, 0, sizeof(acc));
+    acc.struct_size = sizeof(acc);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(s, sub, &acc, 2), (int)MOQ_OK);
+    { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+    memset(&p, 0, sizeof(p));
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 2, &p), (int)MOQ_OK);
+    n = add_range_filter(msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_SUBSCRIBE_UPDATED, &ev));
+    MOQ_TEST_CHECK(took_invalid_filter(s));
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1064,6 +1151,7 @@ int main(void)
     t_error_semantics();
     t_resolve_loc_filter_window();
     t_inbound_window();
+    t_range_filters_declined();
     if (failures) {
         fprintf(stderr, "test_d21_requests: %d failures\n", failures);
         return 1;

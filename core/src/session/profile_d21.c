@@ -709,6 +709,18 @@ static moq_result_t d21_resolve_auth_token_list(
                                out_staged, txn);
 }
 
+/* Range Filters (3.3.2): this implementation advertises MAX_FILTER_RANGES 0 (the
+ * default), so a peer MUST NOT send any, and a malformed one is an invalid
+ * filter either way. The request fails with REQUEST_ERROR INVALID_FILTER, carried
+ * through the same message-level reject the core uses for a bad token. A token
+ * reject already recorded takes precedence. */
+static void d21_reject_range_filters(const moq_decoded_range_filters_t *rf,
+                                     uint64_t *reject_code)
+{
+    if (*reject_code == 0 && (rf->ranges > 0 || rf->invalid))
+        *reject_code = MOQ_REQUEST_ERROR_INVALID_FILTER;
+}
+
 static moq_result_t d21_resolve_auth_tokens(moq_session_t *s,
                                             const moq_d21_msg_params_t *params,
                                             moq_resolved_token_t *out_tokens,
@@ -1667,6 +1679,7 @@ static moq_result_t d21_process_request_stream(
                                      &d.auth_reject_code);
         if (rc < 0)
             return rc;            /* NOMEM */
+        d21_reject_range_filters(&d.range_filters, &d.auth_reject_code);
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;        /* cache overflow / duplicate alias */
 
@@ -1784,6 +1797,7 @@ static moq_result_t d21_process_request_stream(
                                      &fd.auth_reject_code);
         if (rc < 0)
             return rc;            /* NOMEM */
+        d21_reject_range_filters(&fd.range_filters, &fd.auth_reject_code);
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;        /* cache overflow / duplicate alias */
 
@@ -2011,6 +2025,7 @@ static moq_result_t d21_process_request_stream(
                                      &d.auth_reject_code);
         if (rc < 0)
             return rc;            /* NOMEM */
+        d21_reject_range_filters(&d.range_filters, &d.auth_reject_code);
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;        /* cache overflow / duplicate alias */
 
@@ -2941,6 +2956,7 @@ static moq_result_t d21_process_response_stream(
                                      &d.auth_reject_code);
         if (rc < 0)
             return rc;            /* NOMEM */
+        d21_reject_range_filters(&d.range_filters, &d.auth_reject_code);
         if (s->state == MOQ_SESS_CLOSED)
             return MOQ_OK;        /* cache overflow / duplicate alias */
 
