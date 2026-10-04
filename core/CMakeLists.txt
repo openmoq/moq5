@@ -7,6 +7,7 @@ add_library(moq-core
     src/wire/buf.c
     src/wire/control_d16.c
     src/wire/control_d18.c
+    src/wire/control_d21.c
     src/base/rcbuf.c
     src/session/session.c
     src/session/session_setup.c
@@ -72,7 +73,7 @@ if(MOQ_BUILD_TESTS)
     add_library(moq-core-test-internals STATIC
         src/version.c src/types.c
         src/wire/quic_varint.c src/wire/vi64.c src/wire/kvp.c src/wire/buf.c
-        src/wire/control_d16.c src/wire/control_d18.c
+        src/wire/control_d16.c src/wire/control_d18.c src/wire/control_d21.c
         src/base/rcbuf.c
         src/session/session.c src/session/session_setup.c
         src/session/session_subscribe.c src/session/session_fetch.c
