@@ -128,6 +128,19 @@ typedef struct moq_decoded_loc_filter {
     bool     approximated;
 } moq_decoded_loc_filter_t;
 
+/* FILL_PARAMETERS as decoded (draft 21 9.20.16); defined here so a subscription
+ * entry can hold the pending fill. */
+typedef struct moq_decoded_fill {
+    bool     present;             /* FILL_PARAMETERS carried: a fill is requested */
+    moq_decoded_loc_filter_t location;   /* the fill range; absent = the subscription's */
+    bool     has_timeout;
+    uint64_t timeout_ms;
+    bool     has_priority;
+    uint8_t  priority;
+    bool     has_group_order;
+    uint8_t  group_order;
+} moq_decoded_fill_t;
+
 /*
  * Resolved subscription filter window. Stored
  * on the publisher-role entry at accept / REQUEST_UPDATE against ONE registry
@@ -239,6 +252,16 @@ typedef struct moq_sub_entry {
     uint64_t req_start_object;
     uint64_t req_end_group;
     moq_decoded_loc_filter_t req_loc;   /* draft 21: the exact filter, re-resolved on update */
+    /* Draft 21 fill (3.4): FILL_PARAMETERS on the SUBSCRIBE or latest REQUEST_UPDATE
+     * is held here until the application opens the fill stream. `fill_pending` is
+     * set only when Forward State is 1 at that point; the Largest Object the
+     * response advertised bounds the fill range. */
+    bool                 fill_pending;
+    uint64_t             fill_request_id;
+    moq_decoded_fill_t   fill_req;
+    bool                 fill_has_largest;
+    uint64_t             fill_largest_group;
+    uint64_t             fill_largest_object;
     /* Resolved subscription window (publisher role), stored against the accept /
      * REQUEST_UPDATE snapshot; reached via the package-internal accessor. */
     moq_resolved_window_t window;
@@ -443,6 +466,10 @@ typedef struct moq_fetch_entry {
     uint32_t           generation;
     moq_fetch_t        handle;
     uint64_t           request_id;
+    /* A fill fetch stream (draft 21 3.4): owned by a subscription, carries that
+     * request's id in its FETCH_HEADER, has no request bidi and no registry key. */
+    bool               is_fill;
+    moq_subscription_t fill_sub;
     /* request_stream_ref: the FETCH *request* bidi stream identity for
      * stream-correlated request profiles (the stream the FETCH request travels
      * on; FETCH_OK/REQUEST_ERROR correlate by it). Intentionally DISTINCT from
@@ -852,6 +879,19 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * no snapshot resolve to an open window from the origin (never unsatisfiable);
  * at-ceiling relative filters set `unsatisfiable`.
  */
+/* Resolve a draft-21 fill range against Largest Object (3.4 / 3.3.1). Returns
+ * false when there is nothing to fill (no content, an empty range, or a start after
+ * Largest Object); otherwise the INCLUSIVE range. `lf` may be NULL or zero-field
+ * (the whole track up to Largest Object). */
+/* Reset (and free) every open fill fetch stream owned by `sub`: the subscription
+ * ended, so its fills are cancelled (3.4.1). Best effort when the action queue is
+ * full -- the entry is freed either way. */
+void session_core_reset_fills_for_sub(moq_session_t *s, moq_subscription_t sub);
+bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,
+                            bool has_largest, uint64_t largest_group,
+                            uint64_t largest_object,
+                            uint64_t *start_group, uint64_t *start_object,
+                            uint64_t *end_group, uint64_t *end_object);
 void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
                                    bool has_snap,
                                    uint64_t snap_group, uint64_t snap_object,
@@ -2310,16 +2350,6 @@ typedef struct moq_request_update_encode_args {
  * without the wire layer changing again. `approximated` says the four-type fields
  * only approximate the request; `present` is false for profiles without these. */
 
-typedef struct moq_decoded_fill {
-    bool     present;             /* FILL_PARAMETERS carried: a fill is requested */
-    moq_decoded_loc_filter_t location;   /* the fill range; absent = the subscription's */
-    bool     has_timeout;
-    uint64_t timeout_ms;
-    bool     has_priority;
-    uint8_t  priority;
-    bool     has_group_order;
-    uint8_t  group_order;
-} moq_decoded_fill_t;
 
 /* Range Filters are parsed and counted, never applied (this implementation does not
  * advertise MAX_FILTER_RANGES): the session answers INVALID_FILTER when `ranges`

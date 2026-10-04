@@ -1283,6 +1283,17 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
     if (arc != MOQ_OK) return arc;
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
+    /* STOP_SENDING on a fill fetch stream cancels only that fill (3.4.1): the
+     * subscription continues. The transport already knows the stream is stopped,
+     * so the entry is simply released (later writes see a stale handle). */
+    for (size_t i = 0; i < s->fetch_cap; i++) {
+        moq_fetch_entry_t *fe = &s->fetches[i];
+        if (fe->state != MOQ_FETCH_FREE && fe->is_fill &&
+            fe->data_stream_ref._v == stream_ref._v) {
+            fetch_free_entry(s, (int)i);
+            return MOQ_OK;
+        }
+    }
     int slot = sg_find_by_stream_ref(s, stream_ref);
     if (slot < 0) return MOQ_OK;
     if (s->subgroups[slot].state != MOQ_SG_OPEN &&

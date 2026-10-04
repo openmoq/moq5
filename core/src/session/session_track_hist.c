@@ -381,6 +381,40 @@ void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
     }
 }
 
+bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,
+                            bool has_largest, uint64_t lg, uint64_t lo,
+                            uint64_t *sg, uint64_t *so,
+                            uint64_t *eg, uint64_t *eo)
+{
+    if (!has_largest) return false;
+    uint64_t start_g = 0, start_o = 0;
+    uint64_t end_g = lg, end_o = lo;       /* default end: Largest Object */
+    uint8_t n = (lf && lf->present) ? lf->field_count : 0;
+    if (n == 1) {
+        if (lf->start_group == 0) return false;          /* Next Group: after Largest */
+        uint64_t back = lf->start_group - 1u;
+        start_g = back > lg ? 0 : lg - back;
+    } else if (n >= 2) {
+        if (lf->start_group == 0 && lf->start_object == 0) return false;   /* Next Object */
+        start_g = lf->start_group;
+        start_o = lf->start_object;
+    }
+    if (n >= 3) {
+        uint64_t eg_req = lf->end_group_delta > UINT64_MAX - start_g
+                              ? UINT64_MAX : start_g + lf->end_group_delta;
+        /* No End Object includes the whole End Group. */
+        uint64_t eo_req = n == 4 ? lf->end_object : UINT64_MAX;
+        if (eg_req < lg || (eg_req == lg && eo_req < lo)) {
+            end_g = eg_req;
+            end_o = eo_req;
+        }                                   /* else: never beyond Largest Object */
+    }
+    if (start_g > end_g || (start_g == end_g && start_o > end_o)) return false;
+    if (start_g > lg || (start_g == lg && start_o > lo)) return false;
+    *sg = start_g; *so = start_o; *eg = end_g; *eo = end_o;
+    return true;
+}
+
 /* -- Public API ----------------------------------------------------- */
 
 moq_result_t moq_session_note_object_published(

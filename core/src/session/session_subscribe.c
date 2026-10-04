@@ -159,6 +159,8 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
     sub_occ_unlink(s, slot);
+    if (e->role == MOQ_SUB_ROLE_PUBLISHER)
+        session_core_reset_fills_for_sub(s, e->handle);
     /* Safety net for any Joining FETCHes (§10.12.2) still buffered against a
      * pending subscription: free them (dropping their entry-owned token storage)
      * with no control message. The alive teardown paths -- public reject and
@@ -213,6 +215,10 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     e->req_start_object = 0;
     e->req_end_group = 0;
     memset(&e->req_loc, 0, sizeof(e->req_loc));
+    e->fill_pending = false;
+    e->fill_request_id = 0;
+    memset(&e->fill_req, 0, sizeof(e->fill_req));
+    e->fill_has_largest = false;
     /* Release the owned deferred-done reason exactly once and clear the
      * Stream-Count gating state so a recycled slot starts ungated. */
     if (e->done_reason_buf) {
@@ -727,6 +733,9 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     entry->req_start_object = d->start_object;
     entry->req_end_group = d->end_group;
     entry->req_loc = d->loc_filter;
+    entry->fill_pending = false;
+    entry->fill_request_id = d->request_id;
+    entry->fill_req = d->fill;
     entry->forward = d->forward;
     d->endpoint.kind = MOQ_REQ_SUBSCRIPTION;
     d->endpoint.slot = slot;
@@ -2815,6 +2824,16 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
                                   usnap_has, usnap_g, usnap_o,
                                   s->profile->location_varint_max, &e->window);
     }
+    /* A fill rides this update only while Forward State is 1 (3.4.1); an update
+     * without FILL_PARAMETERS leaves any earlier, unopened fill alone. */
+    if (d->fill.present && e->forward) {
+        e->fill_pending = true;
+        e->fill_request_id = d->request_id;
+        e->fill_req = d->fill;
+        e->fill_has_largest = usnap_has;
+        e->fill_largest_group = usnap_g;
+        e->fill_largest_object = usnap_o;
+    }
     s->profile->commit_inbound_request(s, &d->endpoint);
     auth_committed = true;
     process_auth_tokens_commit_txn(s, &d->auth_txn);
@@ -3240,6 +3259,14 @@ moq_result_t moq_session_accept_subscribe(
                               s->subs[slot].req_end_group,
                               snap_has, snap_g, snap_o, loc_max,
                               &s->subs[slot].window);
+    /* FILL_PARAMETERS on the SUBSCRIBE opens a fill only when Forward State is 1
+     * (3.4.1); its range is bounded by the Largest Object this response carries. */
+    if (s->subs[slot].fill_req.present && s->subs[slot].forward) {
+        s->subs[slot].fill_pending = true;
+        s->subs[slot].fill_has_largest = snap_has;
+        s->subs[slot].fill_largest_group = snap_g;
+        s->subs[slot].fill_largest_object = snap_o;
+    }
     /* Latch whether OUR track properties advertised dynamic groups: inbound
      * new-group requests on this subscription's updates are gated on it (the
      * peer MUST NOT send one otherwise, §10.2.13). */

@@ -1493,6 +1493,224 @@ static void t_timed_out_range(void)
     moq_session_destroy(s);
 }
 
+/* -- Fill fetch streams (Task 7, draft 21 3.4) -------------------------------- */
+static void t_resolve_fill_range(void)
+{
+    uint64_t sg, so, eg, eo;
+    moq_decoded_loc_filter_t f;
+    /* Largest Object {7,2}. No filter / zero-length: the whole track up to Largest. */
+    MOQ_TEST_CHECK(moq_resolve_fill_range(NULL, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 0 && so == 0 && eg == 7 && eo == 2);
+    f = dlf(0, 0, 0, 0, 0);
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 0 && eg == 7 && eo == 2);
+    /* No content yet: nothing to fill. */
+    MOQ_TEST_CHECK(!moq_resolve_fill_range(NULL, false, 0, 0, &sg, &so, &eg, &eo));
+    /* One field is a relative start: 1 = the current group from its start. */
+    f = dlf(1, 1, 0, 0, 0);
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 7 && so == 0 && eg == 7 && eo == 2);
+    f = dlf(1, 3, 0, 0, 0);                    /* two groups back */
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 5 && so == 0 && eg == 7 && eo == 2);
+    f = dlf(1, 100, 0, 0, 0);                  /* past the origin clamps to group 0 */
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 0);
+    /* Next Group and Next Object start after Largest Object: no fill stream. */
+    f = dlf(1, 0, 0, 0, 0);
+    MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    f = dlf(2, 0, 0, 0, 0);
+    MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    /* An absolute start after Largest Object is empty too. */
+    f = dlf(2, 8, 0, 0, 0);
+    MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    f = dlf(2, 7, 3, 0, 0);
+    MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    f = dlf(2, 7, 2, 0, 0);                    /* exactly Largest Object */
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 7 && so == 2 && eg == 7 && eo == 2);
+    /* An end inside the track ends the fill there; whole End Group without an end
+     * Object; an inclusive end Object with four fields. */
+    f = dlf(3, 2, 1, 3, 0);                    /* groups 2..5 */
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 2 && so == 1 && eg == 5 && eo == UINT64_MAX);
+    f = dlf(4, 2, 1, 3, 4);
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(sg == 2 && so == 1 && eg == 5 && eo == 4);
+    /* An end past Largest Object never extends the fill beyond it. */
+    f = dlf(3, 2, 0, 50, 0);
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(eg == 7 && eo == 2);
+    f = dlf(4, 7, 0, 0, 9);                    /* end object past the last one */
+    MOQ_TEST_CHECK(moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+    MOQ_TEST_CHECK(eg == 7 && eo == 2);
+    /* An end before the start is empty. */
+    f = dlf(4, 2, 5, 0, 1);
+    MOQ_TEST_CHECK(!moq_resolve_fill_range(&f, true, 7, 2, &sg, &so, &eg, &eo));
+}
+
+/* An inbound SUBSCRIBE with FILL_PARAMETERS; `fwd` is the Forward Parameter. */
+static moq_subscription_t fill_subscribe(moq_session_t *s, uint64_t request_id, const char *track,
+                                         moq_d21_location_filter_t fill_filter, bool has_fill_filter,
+                                         bool has_fwd, uint8_t fwd)
+{
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    moq_session_note_object_published(s, &ns, lit(track), 7, 2);
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_forward = has_fwd; p.forward = fwd;
+    p.has_fill = true;
+    p.fill.has_location_filter = has_fill_filter;
+    p.fill.location_filter = fill_filter;
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_subscribe(&w, request_id, &ns, lit(track), &p);
+    feed_request(s, 4 * (request_id / 2 + 1), msg, moq_buf_writer_offset(&w));
+    moq_subscription_t sub = {0};
+    moq_event_t ev;
+    if (next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev)) {
+        sub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+        moq_accept_subscribe_cfg_t acc;
+        memset(&acc, 0, sizeof(acc));
+        acc.struct_size = sizeof(acc);
+        moq_session_accept_subscribe(s, sub, &acc, 2);
+    }
+    { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+    return sub;
+}
+
+static void t_fill_stream(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_fill_info_t info;
+    moq_fetch_t fh;
+
+    /* Forward 1 (the default) with a current-group fill: pending, then opened. */
+    moq_subscription_t a = fill_subscribe(s, 0, "f0", lf(1, 1, 0, 0, 0), true, false, 0);
+    MOQ_TEST_CHECK(moq_session_sub_fill_pending(s, a));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 3, &info, &fh), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!info.empty && info.start_group == 7 && info.start_object == 0 &&
+                   info.end_group == 7 && info.end_object == 2 && info.request_id == 0);
+    MOQ_TEST_CHECK(!moq_session_sub_fill_pending(s, a));
+    /* The stream opens with FETCH_HEADER carrying the SUBSCRIBE's Request ID. */
+    uint8_t want[8];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, want, sizeof(want));
+    moq_d21_encode_fetch_header(&w, 0);
+    bool opened = false;
+    moq_action_t act;
+    while (moq_session_poll_actions(s, &act, 1) > 0) {
+        if (act.kind == MOQ_ACTION_SEND_DATA && act.u.send_data.header_len == moq_buf_writer_offset(&w) &&
+            memcmp(act.u.send_data.header, want, act.u.send_data.header_len) == 0 && !act.u.send_data.fin)
+            opened = true;
+        moq_action_cleanup(&act);
+    }
+    MOQ_TEST_CHECK(opened);
+    /* A second open has nothing pending. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 4, &info, &fh), (int)MOQ_ERR_WRONG_STATE);
+    moq_session_destroy(s);
+
+    /* Forward 0: FILL_PARAMETERS opens nothing, and a later Forward 1 does not
+     * open one either (3.4.1). */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    a = fill_subscribe(s, 0, "f1", lf(1, 1, 0, 0, 0), true, true, 0);
+    MOQ_TEST_CHECK(!moq_session_sub_fill_pending(s, a));
+    moq_session_destroy(s);
+
+    /* Nothing to fill: Next Object. Consumes the request, opens no stream. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    a = fill_subscribe(s, 0, "f2", lf(2, 0, 0, 0, 0), true, false, 0);
+    MOQ_TEST_CHECK(moq_session_sub_fill_pending(s, a));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 3, &info, &fh), (int)MOQ_OK);
+    MOQ_TEST_CHECK(info.empty);
+    MOQ_TEST_CHECK(!moq_session_sub_fill_pending(s, a));
+    { bool data = false; moq_action_t x;
+      while (moq_session_poll_actions(s, &x, 1) > 0) { if (x.kind == MOQ_ACTION_SEND_DATA) data = true; moq_action_cleanup(&x); }
+      MOQ_TEST_CHECK(!data); }
+    moq_session_destroy(s);
+}
+
+/* Fill streams end independently of the subscription, and with it. */
+static void t_fill_lifecycle(void)
+{
+    moq_fill_info_t info;
+    moq_fetch_t fh;
+    moq_action_t act;
+
+    /* The subscriber's RESET_STREAM of the subscription resets the open fill. */
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_subscription_t a = fill_subscribe(s, 0, "l0", lf(1, 1, 0, 0, 0), true, false, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 3, &info, &fh), (int)MOQ_OK);
+    { while (moq_session_poll_actions(s, &act, 1) > 0) moq_action_cleanup(&act); }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_reset(s, moq_stream_ref_from_u64(4), 0, 4), (int)MOQ_OK);
+    bool reset = false;
+    while (moq_session_poll_actions(s, &act, 1) > 0) {
+        if (act.kind == MOQ_ACTION_RESET_DATA) reset = true;
+        moq_action_cleanup(&act);
+    }
+    MOQ_TEST_CHECK(reset);
+    /* The fetch handle is stale: the fill is gone. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(s, fh, 5), (int)MOQ_ERR_STALE_HANDLE);
+    moq_session_destroy(s);
+
+    /* STOP_SENDING on the fill stream cancels only the fill. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    a = fill_subscribe(s, 0, "l1", lf(1, 1, 0, 0, 0), true, false, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 3, &info, &fh), (int)MOQ_OK);
+    uint64_t fill_ref = 0;
+    while (moq_session_poll_actions(s, &act, 1) > 0) {
+        if (act.kind == MOQ_ACTION_SEND_DATA) fill_ref = act.u.send_data.stream_ref._v;
+        moq_action_cleanup(&act);
+    }
+    MOQ_TEST_CHECK(fill_ref != 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(s, moq_stream_ref_from_u64(fill_ref), 0, 4), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(s, fh, 5), (int)MOQ_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(moq_session_sub_resolved_window(s, a) != NULL);   /* subscription lives */
+    moq_session_destroy(s);
+
+    /* Completion is a FIN; failure is a reset that leaves the subscription alone. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    a = fill_subscribe(s, 0, "l2", lf(1, 1, 0, 0, 0), true, false, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 3, &info, &fh), (int)MOQ_OK);
+    { while (moq_session_poll_actions(s, &act, 1) > 0) moq_action_cleanup(&act); }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_reset_fill(s, fh, 0x2, 4), (int)MOQ_OK);
+    reset = false;
+    while (moq_session_poll_actions(s, &act, 1) > 0) {
+        if (act.kind == MOQ_ACTION_RESET_DATA && act.u.reset_data.error_code == 0x2) reset = true;
+        moq_action_cleanup(&act);
+    }
+    MOQ_TEST_CHECK(reset);
+    MOQ_TEST_CHECK(moq_session_sub_resolved_window(s, a) != NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_reset_fill(s, fh, 0x2, 5), (int)MOQ_ERR_STALE_HANDLE);
+
+    /* A second fill while the first is open (an update with its own Request ID). */
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_fill = true;
+    p.fill.has_location_filter = true;
+    p.fill.location_filter = lf(1, 2, 0, 0, 0);
+    uint8_t msg[64];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_request_update(&w, 2, &p);
+    feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK(moq_session_sub_fill_pending(s, a));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(s, a, 6, &info, &fh), (int)MOQ_OK);
+    MOQ_TEST_CHECK(info.request_id == 2 && info.start_group == 6 && info.end_group == 7);
+    /* An update WITHOUT FILL_PARAMETERS opens nothing new. */
+    memset(&p, 0, sizeof(p));
+    p.has_subscriber_priority = true; p.subscriber_priority = 5;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_request_update(&w, 4, &p);
+    feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK(!moq_session_sub_fill_pending(s, a));
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1516,6 +1734,9 @@ int main(void)
     t_request_stream_closure();
     t_request_goaway();
     t_timed_out_range();
+    t_resolve_fill_range();
+    t_fill_stream();
+    t_fill_lifecycle();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

@@ -2121,6 +2121,43 @@ MOQ_API moq_result_t moq_session_accept_fetch(
     const moq_accept_fetch_cfg_t *cfg,
     uint64_t now_us);
 
+/*
+ * Fill fetch streams (draft 21 3.4). A subscription whose SUBSCRIBE or latest
+ * update carried a fill request, while Forward State is 1, has a PENDING fill once
+ * it is accepted (or the update applied). The publisher opens it with
+ * moq_session_open_fill and serves it through the ordinary fetch writers
+ * (moq_session_write_fetch_object, moq_session_end_fetch); a failure is signalled
+ * with moq_session_reset_fill. Cancelling the subscription resets every open fill;
+ * resetting a fill does not touch the subscription.
+ */
+typedef struct moq_fill_info {
+    uint64_t request_id;         /* the SUBSCRIBE / update that asked for it */
+    bool     empty;              /* nothing to fill: no stream was opened */
+    uint8_t  subscriber_priority;
+    uint64_t start_group;        /* the fill range, INCLUSIVE at both ends; an */
+    uint64_t start_object;       /* end object of UINT64_MAX means the whole   */
+    uint64_t end_group;          /* end group. Valid when !empty.              */
+    uint64_t end_object;
+    bool     has_timeout;        /* FILL_TIMEOUT carried in the fill request */
+    uint64_t timeout_ms;
+} moq_fill_info_t;
+
+/* True when the subscription has an unopened fill. */
+MOQ_API bool moq_session_sub_fill_pending(moq_session_t *s, moq_subscription_t sub);
+
+/* Open the pending fill: resolves its range against the Largest Object the
+ * response advertised, and (unless the range is empty) opens the fill stream and
+ * returns its fetch handle. An empty range consumes the pending fill and opens
+ * nothing (info->empty, *out_fetch invalid). MOQ_ERR_WRONG_STATE: nothing pending.
+ * MOQ_ERR_WOULD_BLOCK: retry after draining actions; the fill stays pending. */
+MOQ_API moq_result_t moq_session_open_fill(moq_session_t *s, moq_subscription_t sub,
+                                           uint64_t now_us, moq_fill_info_t *info,
+                                           moq_fetch_t *out_fetch);
+
+/* Fail an open fill: reset its stream (there is no error response for a fill). */
+MOQ_API moq_result_t moq_session_reset_fill(moq_session_t *s, moq_fetch_t fetch,
+                                            uint64_t error_code, uint64_t now_us);
+
 typedef struct moq_reject_fetch_cfg {
     uint32_t            struct_size;
     moq_request_error_t error_code;

@@ -44,7 +44,8 @@ void fetch_free_entry(moq_session_t *s, int slot)
     if (e->join_token_count > 0)
         process_auth_tokens_free_staging(s, e->join_tokens,
             e->join_token_staged, e->join_token_count);
-    request_registry_remove_by_id(s, e->request_id);
+    if (!e->is_fill)   /* a fill borrows its subscription's id; not its key */
+        request_registry_remove_by_id(s, e->request_id);
     /* Stream-correlated profiles key the request bidi by stream_ref; remove that
      * mapping so a recycled slot never carries a stale key. */
     if (e->request_stream_ref._v != 0)
@@ -2092,6 +2093,155 @@ bool moq_session_has_subscription_ended_status(const moq_session_t *s)
 {
     if (!s) return false;
     return s->profile->publish_done_subscription_ended;
+}
+
+bool moq_session_sub_fill_pending(moq_session_t *s, moq_subscription_t sub)
+{
+    if (!s) return false;
+    int slot = sub_resolve_handle(s, sub);
+    if (slot < 0) return false;
+    const moq_sub_entry_t *e = &s->subs[slot];
+    return e->role == MOQ_SUB_ROLE_PUBLISHER && e->state == MOQ_SUB_ESTABLISHED &&
+           e->fill_pending;
+}
+
+moq_result_t moq_session_open_fill(moq_session_t *s, moq_subscription_t sub,
+                                   uint64_t now_us, moq_fill_info_t *info,
+                                   moq_fetch_t *out_fetch)
+{
+    if (!s || !info || !out_fetch) return MOQ_ERR_INVAL;
+    memset(info, 0, sizeof(*info));
+    *out_fetch = (moq_fetch_t){ 0 };
+
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int ss = sub_resolve_handle(s, sub);
+    if (ss < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_sub_entry_t *e = &s->subs[ss];
+    if (e->role != MOQ_SUB_ROLE_PUBLISHER || e->state != MOQ_SUB_ESTABLISHED ||
+        !e->fill_pending)
+        return MOQ_ERR_WRONG_STATE;
+
+    info->request_id = e->fill_request_id;
+    info->subscriber_priority = e->fill_req.has_priority ? e->fill_req.priority
+                                                         : e->subscriber_priority;
+    info->has_timeout = e->fill_req.has_timeout;
+    info->timeout_ms = e->fill_req.timeout_ms;
+
+    /* The range: FILL_PARAMETERS' Location Filter, else the subscription's own. */
+    const moq_decoded_loc_filter_t *lf = NULL;
+    if (e->fill_req.location.present) {
+        /* A zero-length filter inside FILL_PARAMETERS means the whole track. */
+        if (e->fill_req.location.field_count > 0) lf = &e->fill_req.location;
+    } else if (e->req_loc.present) {
+        lf = &e->req_loc;
+    }
+    uint64_t sg, so, eg, eo;
+    if (!moq_resolve_fill_range(lf, e->fill_has_largest, e->fill_largest_group,
+                                e->fill_largest_object, &sg, &so, &eg, &eo)) {
+        e->fill_pending = false;
+        info->empty = true;
+        return MOQ_OK;
+    }
+
+    int slot = fetch_find_free(s);
+    if (slot < 0 || action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+
+    uint8_t hdr[32];
+    moq_buf_writer_t hw;
+    moq_buf_writer_init(&hw, hdr, sizeof(hdr));
+    moq_result_t rc = s->profile->encode_fetch_header(s, &hw, e->fill_request_id);
+    if (rc < 0) return rc;
+
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_SEND_DATA;
+    a.detail_size = (uint32_t)sizeof(moq_send_data_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    memcpy(a.u.send_data.header, hdr, moq_buf_writer_offset(&hw));
+    a.u.send_data.header_len = (uint8_t)moq_buf_writer_offset(&hw);
+    a.u.send_data.stream_ref = moq_stream_ref_from_u64(s->next_stream_ref);
+    a.u.send_data.payload = NULL;
+    a.u.send_data.fin = false;
+    a.u.send_data.scheduling_priority = UINT64_C(0x10000) |
+        ((uint64_t)info->subscriber_priority << 8) | 128;
+    rc = push_action(s, &a);
+    if (rc < 0) return rc;
+
+    moq_fetch_entry_t *fe = &s->fetches[slot];
+    uint32_t gen = fe->generation | 1;         /* odd = live */
+    uint8_t *recv_buf = fe->req_recv_buf;      /* co-allocated; survives the reset */
+    size_t   recv_cap = fe->req_recv_cap;
+    memset(fe, 0, sizeof(*fe));
+    fe->generation = gen;
+    fe->req_recv_buf = recv_buf;
+    fe->req_recv_cap = recv_cap;
+    fe->occ_next = fe->occ_prev = -1;
+    fe->state = MOQ_FETCH_ACCEPTED;
+    fe->role = MOQ_FETCH_ROLE_PUBLISHER;
+    fe->request_id = e->fill_request_id;
+    fe->is_fill = true;
+    fe->fill_sub = e->handle;
+    fe->subscriber_priority = info->subscriber_priority;
+    fe->data_stream_ref = a.u.send_data.stream_ref;
+    fe->data_stream_started = true;
+    fe->start_group = sg;
+    fe->start_object = so;
+    fetch_occ_link(s, (size_t)slot);
+    fe->handle = fetch_make_handle(s, (size_t)slot);
+    s->next_stream_ref++;
+
+    e->fill_pending = false;
+    info->start_group = sg; info->start_object = so;
+    info->end_group = eg; info->end_object = eo;
+    *out_fetch = fe->handle;
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_reset_fill(moq_session_t *s, moq_fetch_t fetch,
+                                    uint64_t error_code, uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = fetch_resolve_handle(s, fetch);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_fetch_entry_t *fe = &s->fetches[slot];
+    if (!fe->is_fill || fe->state != MOQ_FETCH_ACCEPTED) return MOQ_ERR_WRONG_STATE;
+    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_RESET_DATA;
+    a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.reset_data.stream_ref = fe->data_stream_ref;
+    a.u.reset_data.error_code = error_code;
+    moq_result_t rc = push_action(s, &a);
+    if (rc < 0) return rc;
+    fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+void session_core_reset_fills_for_sub(moq_session_t *s, moq_subscription_t sub)
+{
+    for (size_t i = 0; i < s->fetch_cap; i++) {
+        moq_fetch_entry_t *fe = &s->fetches[i];
+        if (fe->state == MOQ_FETCH_FREE || !fe->is_fill) continue;
+        if (!moq_subscription_eq(fe->fill_sub, sub)) continue;
+        if (fe->data_stream_started && !fe->data_stream_fin &&
+            !action_queue_full(s)) {
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            a.kind = MOQ_ACTION_RESET_DATA;
+            a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+            a.borrow_epoch = s->borrow_epoch;
+            a.u.reset_data.stream_ref = fe->data_stream_ref;
+            a.u.reset_data.error_code = 0x1;   /* CANCELLED */
+            (void)push_action(s, &a);
+        }
+        fetch_free_entry(s, (int)i);
+    }
 }
 
 moq_result_t moq_session_end_fetch(
