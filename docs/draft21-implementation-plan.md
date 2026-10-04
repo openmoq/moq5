@@ -371,7 +371,56 @@ Produces: MOQ_VERSION_DRAFT_21, moq_d21_profile_ops(), ALPN "moqt-21".
  [x] 3.6 Commit: "Register draft-21 version, ALPN and profile skeleton"
 
 
-## TASK 4: d21 control codec (TDD, one message family per commit)
+## TASK 4: d21 control codec (TDD, one message family per commit) -- DONE
+
+RESULT: `moq_d21_*` codec complete (control_d21.h/.c, control_d21_internal.h) with
+tests/unit/test_control_d21.c (hand-derived vectors; independent oracles for the
+per-message parameter matrix and the Type Flags rules) and fuzz/fuzz_control_d21.c
+(54M inputs in 2 minutes, no finding; 26 committed seeds). Every family was
+checked with targeted mutations; two survivors were found and fixed by
+strengthening the test (a missing priority boundary, and invalid-datagram bodies
+that failed for the wrong reason). For 4b the code was written before its tests;
+the mutation checks stand in for the red step there. 129/129 tests pass.
+
+Commits: 07a5e8e (copy + 4a SETUP options), 5a826e1 (4b parameters), 6eef7b4
+(4c REQUEST_OK/ERROR, registries), 2b5f881 (4d PUBLISH family), 817b0fd (4e FETCH),
+28e615e (4f GOAWAY, namespaces), b109f6e (4g data plane), 9649382 (fuzz), plus the
+comment sweep.
+
+TASK 5 HAND-OFF: the profile (profile_d21.c) still calls the draft-18 codec. Each
+slot moves to moq_d21_* with these API changes:
+  - moq_d21_msg_params_t: no filter_type/filter_*; use has_location_filter +
+    location_filter{field_count,start_group,start_object,end_group_delta,end_object}
+    (raw wire fields; the session applies the relative/absolute rules of 9.20.10).
+    New fields: has_fill/fill, has_include_properties, has_rendezvous_timeout,
+    has_fill_timeout, has_track_namespace_prefix, range_filter_params,
+    range_filter_ranges, range_filter_invalid.
+  - Legality masks are MOQ_D21_MASK_* in the header; the old per-message macros
+    are gone.
+  - PUBLISH_OK is gone: use moq_d21_{encode,decode}_request_ok with a
+    moq_d21_request_ok_kind_t (PUBLISH, REQUEST_UPDATE, TRACK_STATUS,
+    SUBSCRIBE_NAMESPACE, SUBSCRIBE_TRACKS, PUBLISH_NAMESPACE). The old
+    publish_ok / track_status_ok / request_update_ok / zero-parameter request_ok
+    functions no longer exist. Track Properties only for TRACK_STATUS.
+  - GOAWAY: one pair, no request_id, no *_request variants.
+  - FETCH: moq_d21_fetch_t is {request_id, track_namespace, track_name, params};
+    no fetch_type, start/end or joining fields; the range is LOCATION_FILTER.
+  - PUBLISH_BLOCKED is PUBLISH_SKIPPED (same bytes). New: PUBLISH_STATE_NOTIFY.
+  - moq_d21_encode_request_error refuses REDIRECT and moq_d21_decode_request_error
+    rejects it; use the *_redirect variants for that code.
+  - Error registries: moq_d21_{request_error,publish_done,session_error}_registered
+    replace d18_request_error_registered (F9: do not copy the d18 mapper).
+  - Decode errors: PROTO for semantic violations; a truncated value is BUFFER at the
+    message level and PROTO inside a nested FILL_PARAMETERS block.
+  - NOT in the codec (profile-level, Task 5/7): the fetch OBJECT serialization,
+    including the new End of Timed-Out Range flag value 0x20C (it lives in the
+    profile file, as it does for d18), and every session rule the codec only
+    surfaces (a client's non-empty GOAWAY URI, a Track Name in a namespace
+    Redirect, range_filter_ranges against MAX_FILTER_RANGES -> INVALID_FILTER,
+    PUBLISH_STATE_NOTIFY received as a publisher, MAX_REQUEST_UPDATES).
+New draft ambiguities recorded in the wire reference: A4 (EXPIRES in
+TRACK_STATUS_OK), A5 (parameters allowed on TRACK_STATUS), A6 (duplicate known
+Setup Options).
 Files: control_d21.h/.c, test_control_d21.c, tests/vectors/d21/.
 Mirror every d18 entry point named moq_d18_* as moq_d21_* only where d21
 keeps the message; do not copy functions for removed messages.

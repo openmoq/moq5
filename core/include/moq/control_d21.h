@@ -2,25 +2,22 @@
 #define MOQ_CONTROL_D21_H
 
 /*
- * TRANSITIONAL (draft-21 conversion in progress, see
- * docs/draft21-implementation-plan.md Task 4).
- *
- * This header began as a mechanical copy of control_d18.h. Message families
- * are converted to draft 21 one at a time, each with tests that assert the
- * draft-21 bytes and cite the draft-21 section. Until a family is converted its
- * declarations still describe DRAFT-18 behavior, and any comment that cites a
- * draft-18 section number is stale. The authoritative draft-21 layouts are in
- * docs/draft21-wire-reference.md.
+ * Draft 21 codec status. Every control message and parameter here is draft-21
+ * (docs/draft21-wire-reference.md holds the authoritative layouts). The data-plane
+ * encodings (subgroup header, object datagram, fetch header and the Track
+ * Property block) are bit-for-bit those of draft 18: draft 21 restates the same
+ * Type values as Type Flags bitfields without changing any bit's meaning
+ * (11.2.1, 11.3.1), so that code is shared in shape and covered by draft-21
+ * tests rather than rewritten.
  */
 
 /*
- * Draft-18 control-message wire codec (tooling tier, not the application API).
+ * Draft-21 control-message wire codec (tooling tier, not the application API).
  *
- * Draft-18 frames each control message as Type (vi64) + Length (16-bit) +
- * payload, and carries control on a unidirectional stream that begins with a
- * SETUP message. This header currently covers the pieces needed to bring up
- * the control-channel pair (SETUP); request/data messages are added as the
- * corresponding implementation is added.
+ * Draft 21 frames each control message as Type (vi64) + Length (16-bit) +
+ * Message Body (8.1, 9), and carries control on a pair of unidirectional streams
+ * that each begin with a SETUP message (6.3). Requests travel on their own
+ * bidirectional streams, so no response carries a Request ID.
  */
 
 #include "export.h"
@@ -32,13 +29,13 @@
 extern "C" {
 #endif
 
-/* Unidirectional stream types (draft-18 §3.4). */
+/* Unidirectional stream types (draft-21 6.4.1). */
 #define MOQ_D21_STREAM_SETUP        ((uint64_t)0x2F00u)
 #define MOQ_D21_STREAM_PADDING      ((uint64_t)0x132B3E28u)
 #define MOQ_D21_STREAM_FETCH_HEADER ((uint64_t)0x05u)
 
 /*
- * Decode a draft-18 control-message envelope: Type (vi64) + Length (16-bit) +
+ * Decode a draft-21 control-message envelope: Type (vi64) + Length (16-bit) +
  * payload. On success the reader is advanced past the full envelope and *out
  * borrows the payload from the reader's buffer. Returns MOQ_ERR_BUFFER when the
  * envelope (including the declared payload length) is not yet fully available.
@@ -47,7 +44,7 @@ MOQ_API moq_result_t moq_d21_decode_envelope(moq_buf_reader_t *r,
                                               moq_control_envelope_t *out);
 
 /*
- * Encode a draft-18 SETUP message with no Setup Options: Type (vi64) = 0x2F00,
+ * Encode a draft-21 SETUP message with no Setup Options: Type (vi64) = 0x2F00,
  * Length (16) = 0. (This helper does not encode any Setup Options.)
  */
 MOQ_API moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w);
@@ -65,14 +62,15 @@ MOQ_API moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w);
 #define MOQ_D21_SETUP_OPT_MOQT_IMPLEMENTATION       ((uint64_t)0x07u)  /* bytes, 9.1.5 */
 #define MOQ_D21_SETUP_OPT_MAX_REQUEST_UPDATES       ((uint64_t)0x08u)  /* varint, 9.1.7 */
 
-/* Reason Phrase maximum length (draft-18 §1.4.4). */
+/* Reason Phrase maximum length (draft-21 8.5). */
 #define MOQ_D21_MAX_REASON 1024u
 
 /* Maximum Full Track Name length: sum of Track Namespace Field lengths plus
- * the Track Name length (draft-18 §2.4.1). */
+ * the Track Name length (draft-21 8.7). */
 #define MOQ_D21_MAX_FULL_TRACK 4096u
 
-/* Control-message type codes (draft-18 §10). */
+/* Control-message type codes (draft-21 9; 0x1E, the draft-18 PUBLISH_OK, is
+ * reserved: the answer to a PUBLISH is a REQUEST_OK). */
 #define MOQ_D21_SUBSCRIBE         ((uint64_t)0x03u)
 #define MOQ_D21_REQUEST_UPDATE    ((uint64_t)0x02u)
 #define MOQ_D21_SUBSCRIBE_OK      ((uint64_t)0x04u)
@@ -89,11 +87,11 @@ MOQ_API moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w);
 #define MOQ_D21_PUBLISH           ((uint64_t)0x1Du)
 #define MOQ_D21_GOAWAY            ((uint64_t)0x10u)
 
-/* A draft-18 decode result distinct from the generic PROTOCOL_VIOLATION: an
+/* A draft-21 decode result distinct from the generic PROTOCOL_VIOLATION: an
  * AUTHORIZATION_TOKEN whose Token structure cannot be decoded must close the
- * session with KEY_VALUE_FORMATTING_ERROR (0x06, §10.2.2) rather than 0x03. It
+ * session with KEY_VALUE_FORMATTING_ERROR (0x06, 8.9) rather than 0x03. It
  * is a negative moq_result_t-compatible value outside the shared error range, so
- * callers that only test `rc < 0` are unaffected; the D18 profile maps it to the
+ * callers that only test `rc < 0` are unaffected; the D21 profile maps it to the
  * 0x06 close code. */
 #define MOQ_D21_ERR_KVP_FORMAT (-200)
 
@@ -219,7 +217,7 @@ MOQ_API moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w);
  * static-asserts the relation. */
 #define MOQ_D21_MAX_AUTH_TOKENS 16
 
-/* One AUTHORIZATION_TOKEN Token structure (§10.2.2), decoded from / encoded to
+/* One AUTHORIZATION_TOKEN Token structure (8.9), decoded from / encoded to
  * the parameter's length-prefixed value. Integers are vi64; token_value borrows
  * from the decode buffer (REGISTER / USE_VALUE only). */
 typedef struct moq_d21_auth_token {
@@ -378,8 +376,9 @@ MOQ_API moq_result_t moq_d21_decode_msg_params(moq_buf_reader_t *r,
                                                moq_d21_msg_params_t *out);
 
 /*
- * SUBSCRIBE (draft-18 §10.7). Priority/forward/group-order/filter are carried as
- * Message Parameters; `params` supplies the ones to emit (and receives the
+ * SUBSCRIBE (draft-21 9.6). Priority, forward, group order, the Location Filter,
+ * FILL_PARAMETERS and the like are carried as Message Parameters
+ * (MOQ_D21_MASK_SUBSCRIBE); `params` supplies the ones to emit (and receives the
  * decoded ones). Unknown or non-SUBSCRIBE parameters fail the decode. Namespace
  * parts and track name borrow from the decoded buffer.
  */
@@ -402,7 +401,7 @@ MOQ_API moq_result_t moq_d21_decode_subscribe(const uint8_t *payload,
                                               moq_d21_subscribe_t *out);
 
 /*
- * PUBLISH_NAMESPACE (draft-18 §10.15): Request ID + Track Namespace (0..32
+ * PUBLISH_NAMESPACE (draft-21 9.14): Request ID + Track Namespace (0..32
  * fields) + Message Parameters. Only AUTHORIZATION_TOKEN is permitted; the
  * response is REQUEST_OK / REQUEST_ERROR on the bidi (no dedicated OK message).
  * Namespace parts borrow from the decoded buffer.
@@ -421,12 +420,11 @@ MOQ_API moq_result_t moq_d21_decode_publish_namespace(
     size_t max_parts, moq_d21_publish_namespace_t *out);
 
 /*
- * SUBSCRIBE_NAMESPACE (draft-18 §10.18): Request ID + Track Namespace Prefix
- * (0..32 fields) + Message Parameters. It is namespace-only in draft-18 (the
- * old interest field split into SUBSCRIBE_TRACKS), and only AUTHORIZATION_TOKEN
- * is permitted. The response is REQUEST_OK / REQUEST_ERROR on the bidi, then a
- * stream of NAMESPACE / NAMESPACE_DONE messages. Namespace parts borrow from the
- * decoded buffer.
+ * SUBSCRIBE_NAMESPACE (draft-21 9.15): Request ID + Track Namespace Prefix
+ * (0..32 fields) + Message Parameters. It is namespace-only (the track-level
+ * request is SUBSCRIBE_TRACKS), and only AUTHORIZATION_TOKEN is permitted. The
+ * response is REQUEST_OK / REQUEST_ERROR on the bidi, then a stream of NAMESPACE /
+ * NAMESPACE_DONE messages. Namespace parts borrow from the decoded buffer.
  */
 typedef struct moq_d21_subscribe_namespace {
     uint64_t             request_id;
@@ -442,10 +440,12 @@ MOQ_API moq_result_t moq_d21_decode_subscribe_namespace(
     size_t max_parts, moq_d21_subscribe_namespace_t *out);
 
 /*
- * SUBSCRIBE_TRACKS (draft-18 §10.19): Request ID + Track Namespace Prefix
+ * SUBSCRIBE_TRACKS (draft-21 9.18): Request ID + Track Namespace Prefix
  * (0..32 fields) + Message Parameters. Requests PUBLISH messages for all tracks
- * under the prefix (and future ones). FORWARD (§10.2.12) and AUTHORIZATION_TOKEN
- * (§10.2.2) are the only permitted parameters; the response is REQUEST_OK /
+ * under the prefix (and future ones). Any parameter valid on a subscription is
+ * valid here, plus the Track Property filter (MOQ_D21_MASK_SUBSCRIBE_TRACKS, 9.18.1);
+ * they become the initial parameters of the resulting PUBLISH messages, except that
+ * the AUTHORIZATION_TOKEN is never copied. The response is REQUEST_OK /
  * REQUEST_ERROR on the bidi, then a stream of PUBLISH_SKIPPED messages while the
  * subscription is established (the resulting PUBLISH messages travel on separate
  * bidi streams). The overlap space is independent of SUBSCRIBE_NAMESPACE.
@@ -483,7 +483,7 @@ MOQ_API moq_result_t moq_d21_decode_publish_skipped(
     size_t max_parts, moq_d21_publish_skipped_t *out);
 
 /*
- * NAMESPACE (0x8) / NAMESPACE_DONE (0xE) (draft-18 §10.16 / §10.17): a single
+ * NAMESPACE (0x8) / NAMESPACE_DONE (0xE) (draft-21 9.16 / 9.17): a single
  * Track Namespace Suffix (0..32 fields), sent on a SUBSCRIBE_NAMESPACE response
  * stream. The prefix is implied by the request, so only the suffix is carried.
  */
@@ -497,11 +497,12 @@ MOQ_API moq_result_t moq_d21_decode_namespace_msg(const uint8_t *payload,
                                                   moq_namespace_t *out_suffix);
 
 /*
- * TRACK_STATUS (draft-18 §10.14): the SUBSCRIBE layout (Request ID + Track
- * Namespace + Track Name + Message Parameters) minus the Track-delivery
- * subscriber parameters. Only AUTHORIZATION_TOKEN is permitted. Sent as the
- * first and only message on a new bidi; the response is TRACK_STATUS_OK
- * (a REQUEST_OK with params + Track Properties) or REQUEST_ERROR, then FIN.
+ * TRACK_STATUS (draft-21 9.13): the SUBSCRIBE layout (Request ID + Track
+ * Namespace + Track Name + Message Parameters) minus the subscriber's delivery
+ * parameters. Only AUTHORIZATION_TOKEN and INCLUDE_PROPERTIES are permitted
+ * (MOQ_D21_MASK_TRACK_STATUS). Sent as the first and only message on a new bidi;
+ * the response is TRACK_STATUS_OK (a REQUEST_OK with parameters and Track
+ * Properties, MOQ_D21_REQUEST_OK_TRACK_STATUS) or REQUEST_ERROR, then FIN.
  * Namespace parts and track name borrow from the decoded buffer.
  */
 typedef struct moq_d21_track_status {
@@ -523,18 +524,20 @@ MOQ_API moq_result_t moq_d21_decode_track_status(const uint8_t *payload,
                                                  moq_d21_track_status_t *out);
 
 /*
- * SUBSCRIBE_OK (draft-18 §10.8): no Request ID (the bidi stream correlates).
+ * SUBSCRIBE_OK (draft-21 9.7): no Request ID (the bidi stream correlates).
  * Carries LARGEST_OBJECT / EXPIRES as Message Parameters, then a Track
  * Properties tail. Track Properties are preserved opaquely (`track_properties`
- * borrows from the payload); their KVP structure is validated on decode and the
- * mandatory-property range is rejected, but their contents are not interpreted.
+ * borrows from the payload); their KVP structure is validated on decode and a
+ * Mandatory Track Property (3.6) is surfaced through
+ * `track_properties_unsupported`, but their contents are not otherwise
+ * interpreted.
  */
 typedef struct moq_d21_subscribe_ok {
     uint64_t             track_alias;
     moq_d21_msg_params_t params;
     moq_bytes_t          track_properties;   /* borrowed from payload */
     bool                 track_properties_unsupported;  /* mandatory prop present */
-    bool                 dynamic_groups;     /* Track Property 0x30 == 1 (§12.6) */
+    bool                 dynamic_groups;     /* Track Property 0x30 == 1 (10.6) */
 } moq_d21_subscribe_ok_t;
 
 MOQ_API moq_result_t moq_d21_encode_subscribe_ok(moq_buf_writer_t *w,
@@ -546,13 +549,15 @@ MOQ_API moq_result_t moq_d21_decode_subscribe_ok(const uint8_t *payload,
                                                  moq_d21_subscribe_ok_t *out);
 
 /*
- * PUBLISH (draft-18 §10.10): a publisher-initiated subscription. Request ID +
+ * PUBLISH (draft-21 9.8): a publisher-initiated subscription. Request ID +
  * Track Namespace + Track Name + Track Alias (publisher-chosen) + Message
- * Parameters + Track Properties. Only FORWARD (the publisher's initial forward
- * intent) and AUTHORIZATION_TOKEN are permitted; the Track Properties tail is
- * preserved opaquely (KVP structure validated). Sent as the first message on a
- * new bidi; the response is PUBLISH_OK / REQUEST_ERROR, then the subscription is
- * established. Namespace parts, track name, and properties borrow from the buffer.
+ * Parameters + Track Properties. The parameters are the subscription's initial
+ * settings (MOQ_D21_MASK_PUBLISH: forward, priority, group order, Location Filter,
+ * delivery timeouts, LARGEST_OBJECT, EXPIRES, token); the subscriber changes them
+ * with REQUEST_UPDATE. The Track Properties tail is preserved opaquely (KVP
+ * structure validated). Sent as the first message on a new bidi; the response is a
+ * REQUEST_OK (PUBLISH_OK) or REQUEST_ERROR, then the subscription is established.
+ * Namespace parts, track name, and properties borrow from the buffer.
  */
 typedef struct moq_d21_publish {
     uint64_t             request_id;
@@ -562,7 +567,7 @@ typedef struct moq_d21_publish {
     moq_d21_msg_params_t params;
     moq_bytes_t          track_properties;   /* borrowed from payload */
     bool                 track_properties_unsupported;  /* mandatory prop present */
-    bool                 dynamic_groups;     /* Track Property 0x30 == 1 (§12.6) */
+    bool                 dynamic_groups;     /* Track Property 0x30 == 1 (10.6) */
 } moq_d21_publish_t;
 
 MOQ_API moq_result_t moq_d21_encode_publish(moq_buf_writer_t *w,
@@ -682,7 +687,7 @@ MOQ_API moq_result_t moq_d21_decode_request_error(const uint8_t *payload,
                                                   moq_d21_request_error_t *out);
 
 /*
- * Redirect structure (draft-18 §10.6.1): a Connect URI (empty ⇒ reuse current
+ * Redirect structure (draft-21 9.4.1): a Connect URI (empty ⇒ reuse current
  * session URI) and an optional redirect Full Track Name (both empty ⇒ reuse the
  * original request's). All spans borrow from the payload; the namespace parts are
  * caller-supplied (see decode below).
@@ -714,9 +719,11 @@ MOQ_API moq_result_t moq_d21_decode_request_error_redirect(
     moq_d21_request_error_t *out_err, moq_d21_redirect_t *out_redirect);
 
 /*
- * REQUEST_UPDATE (draft-18 §10.9): Request ID (a fresh request id, sender
- * parity) followed by Message Parameters. Sent on the same bidi as the original
- * request; the receiver replies with exactly one REQUEST_OK or REQUEST_ERROR.
+ * REQUEST_UPDATE (draft-21 9.5): Request ID (a fresh request id, sender
+ * parity) followed by Message Parameters (MOQ_D21_MASK_REQUEST_UPDATE; the
+ * subscription parameters live here, not in PUBLISH_OK). Sent on the same bidi as
+ * the original request; the receiver replies with exactly one REQUEST_OK or
+ * REQUEST_ERROR (or one error for several coalesced updates).
  */
 typedef struct moq_d21_request_update {
     uint64_t             request_id;
@@ -807,7 +814,7 @@ MOQ_API moq_result_t moq_d21_decode_publish_state_notify(
     moq_d21_publish_state_notify_t *out);
 
 /*
- * SUBGROUP_HEADER (draft-18 §11.4.2). The type byte has the form 0b0XX1XXXX
+ * SUBGROUP_HEADER (draft-21 11.3.1). The Type Flags byte has the form 0b0XX1XXXX
  * (bit 4 always set): PROPERTIES (0x01), SUBGROUP_ID_MODE (bits 1-2: 0=zero,
  * 1=first-object, 2=present, 3=reserved/invalid), END_OF_GROUP (0x08),
  * DEFAULT_PRIORITY (0x20), FIRST_OBJECT (0x40). Integer fields are vi64; the
@@ -900,9 +907,9 @@ MOQ_API moq_result_t moq_d21_encode_subgroup_header(
 MOQ_API moq_result_t moq_d21_decode_subgroup_header(
     moq_buf_reader_t *r, moq_d21_subgroup_header_t *out);
 
-/* Validate a draft-18 Object Property KVP block (§11.2.1.2): structurally
- * well-formed, and free of any Mandatory Track Property (0x4000-0x7FFF, §2.5.1)
- * including one hidden inside IMMUTABLE_PROPERTIES (§12.7) — a mandatory property
+/* Validate an Object Property KVP block (draft-21 11.1.3): structurally
+ * well-formed, and free of any Mandatory Track Property (0x4000-0x7FFF, 3.6)
+ * including one hidden inside IMMUTABLE_PROPERTIES (10.7) — a mandatory property
  * carried as an Object Property makes the object malformed. Returns MOQ_OK or
  * MOQ_ERR_PROTO. (Track Properties, where a mandatory property yields a
  * request-level UNSUPPORTED_EXTENSION rather than a fault, are scanned by the
@@ -917,19 +924,19 @@ MOQ_API moq_result_t moq_d21_scan_dynamic_groups(const uint8_t *data,
                                                  bool *out_dynamic_groups);
 
 /*
- * OBJECT_DATAGRAM (§11.3.1): a single object in a datagram. The Type takes the
- * form 0b00X0XXXX (0x00-0x0F / 0x20-0x2F); the present fields are selected by
- * bits in the Type. Field order: Type, Track Alias, Group ID, [Object ID],
+ * OBJECT_DATAGRAM (draft-21 11.2.1): a single object in a datagram. The Type Flags
+ * take the form 0b00X0XXXX (0x00-0x0F / 0x20-0x2F); the present fields are selected
+ * by bits in the Type Flags. Field order: Type, Track Alias, Group ID, [Object ID],
  * [Publisher Priority], [Properties: vi64 length + KVP], [Object Status vi64],
  * else the rest of the datagram is the payload (no length field). Properties are
- * the draft-18 vi64 KVP block (validated with moq_d21_validate_properties).
+ * a vi64 KVP block (validated with moq_d21_validate_properties).
  */
 #define MOQ_D21_DGRAM_BIT_PROPERTIES     0x01u
 #define MOQ_D21_DGRAM_BIT_END_OF_GROUP   0x02u
 #define MOQ_D21_DGRAM_BIT_ZERO_OBJECT_ID 0x04u
 #define MOQ_D21_DGRAM_BIT_DEFAULT_PRIO   0x08u
 #define MOQ_D21_DGRAM_BIT_STATUS         0x20u
-/* Padding datagram (§11.5.2): type then all-zero bytes; the receiver discards it. */
+/* Padding datagram (11.5.2): type then all-zero bytes; the receiver discards it. */
 #define MOQ_D21_PADDING_DATAGRAM         ((uint64_t)0x132B3E29u)
 
 typedef struct moq_d21_object_datagram {

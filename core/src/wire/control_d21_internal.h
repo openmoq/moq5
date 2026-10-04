@@ -1,13 +1,11 @@
 #ifndef MOQ_WIRE_CONTROL_D21_INTERNAL_H
 #define MOQ_WIRE_CONTROL_D21_INTERNAL_H
 
-/* TRANSITIONAL: see the banner in moq/control_d21.h. */
-
 /*
- * Internal draft-18 control-codec helpers -- NOT part of the public wire codec
+ * Internal draft-21 control-codec helpers -- NOT part of the public wire codec
  * surface (no MOQ_API, so hidden from the shared-library dynamic symbol table).
  * Shared between the wire codec (control_d21.c) and the session profile
- * (profile_d18.c) without widening the public ABI.
+ * (profile_d21.c) without widening the public ABI.
  */
 
 #include "moq/control_d21.h"
@@ -16,7 +14,7 @@
 extern "C" {
 #endif
 
-/* Pure per-profile timeout scanner (§9.8, internal): extracts
+/* Pure per-profile timeout scanner (internal; 5.2 and 10.1 / 10.2): extracts
  * OBJECT/SUBGROUP delivery-timeout Track Properties (raw wire ms),
  * searching the mutable list and IMMUTABLE_PROPERTIES contents; duplicates
  * and nested immutable blocks are MOQ_ERR_PROTO; unknown properties pass

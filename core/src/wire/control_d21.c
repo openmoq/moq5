@@ -1,4 +1,3 @@
-/* TRANSITIONAL: see the banner in moq/control_d21.h. */
 #include "moq/control_d21.h"
 #include "control_d21_internal.h"
 #include "moq/vi64.h"
@@ -38,7 +37,7 @@ moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w)
     return moq_d21_encode_setup_opts(w, NULL);
 }
 
-/* -- vi64 field helpers (draft-18 uses vi64 for these lengths/counts) - */
+/* -- vi64 field helpers (draft 21 uses vi64 for these lengths/counts, 8.1) - */
 
 /* Write Type (vi64) + a reserved 16-bit Length; *len_off receives the patch
  * offset for moq_buf_patch_uint16 once the payload is written. */
@@ -78,7 +77,7 @@ static moq_result_t d21_read_span(moq_buf_reader_t *r, moq_bytes_t *out)
 static moq_result_t d21_write_namespace(moq_buf_writer_t *w,
                                         const moq_namespace_t *ns)
 {
-    if (ns->count > 32) return MOQ_ERR_INVAL;   /* draft-18: 0..32 fields */
+    if (ns->count > 32) return MOQ_ERR_INVAL;   /* 8.7: 0..32 fields */
     moq_result_t rc = moq_buf_write_vi64(w, ns->count);
     if (rc < 0) return rc;
     for (size_t i = 0; i < ns->count; i++) {
@@ -96,7 +95,7 @@ static moq_result_t d21_read_namespace(moq_buf_reader_t *r, moq_bytes_t *parts,
     uint64_t count = 0;
     moq_result_t rc = moq_buf_read_vi64(r, &count);
     if (rc < 0) return rc;
-    if (count > 32) return MOQ_ERR_PROTO;        /* draft-18: 0..32 fields */
+    if (count > 32) return MOQ_ERR_PROTO;        /* 8.7: 0..32 fields */
     if (count > max_parts) return MOQ_ERR_BUFFER;
     for (uint64_t i = 0; i < count; i++) {
         rc = d21_read_span(r, &parts[i]);
@@ -118,9 +117,9 @@ static uint64_t d21_full_track_len(const moq_namespace_t *ns,
     return total;
 }
 
-/* Message parameters each request message may carry (§10.2). The encoder
- * validates the supplied params against the message's set so it cannot emit a
- * parameter the corresponding decoder would reject. */
+/* The parameters each message may carry are the MOQ_D21_MASK_* constants in the
+ * header. Every encoder validates its params against the message's mask so it
+ * cannot emit a parameter the corresponding decoder would reject. */
 
 /* Whether `p` uses only parameters in `mask`: the encoder-side legality check,
  * so an encoder cannot emit a parameter the matching decoder would reject. */
@@ -197,7 +196,7 @@ moq_result_t moq_d21_decode_subscribe(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- PUBLISH_NAMESPACE (draft-18 §10.15) --------------------------- */
+/* -- PUBLISH_NAMESPACE (draft-21 9.14) ------------------------------ */
 
 /* PUBLISH_NAMESPACE permits only the AUTHORIZATION_TOKEN message parameter. */
 
@@ -244,11 +243,11 @@ moq_result_t moq_d21_decode_publish_namespace(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- SUBSCRIBE_NAMESPACE (draft-18 §10.18) ------------------------- */
+/* -- SUBSCRIBE_NAMESPACE (draft-21 9.15) ---------------------------- */
 
 /* SUBSCRIBE_NAMESPACE permits only the AUTHORIZATION_TOKEN message parameter
- * (it is namespace-only in draft-18; FORWARD and the interest field moved to
- * SUBSCRIBE_TRACKS). */
+ * (9.20.3); it is namespace-only, and the track-level parameters belong to
+ * SUBSCRIBE_TRACKS. */
 
 moq_result_t moq_d21_encode_subscribe_namespace(moq_buf_writer_t *w,
                                                 uint64_t request_id,
@@ -293,11 +292,12 @@ moq_result_t moq_d21_decode_subscribe_namespace(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- SUBSCRIBE_TRACKS (draft-18 §10.19) ---------------------------- */
+/* -- SUBSCRIBE_TRACKS (draft-21 9.18) ------------------------------- */
 
-/* SUBSCRIBE_TRACKS permits the FORWARD and AUTHORIZATION_TOKEN message
- * parameters (it governs the FORWARD value of the resulting PUBLISH messages;
- * §10.19). Any other parameter is a protocol violation. */
+/* SUBSCRIBE_TRACKS permits every parameter valid on a SUBSCRIBE, plus the Track
+ * Property filter (9.18.1, MOQ_D21_MASK_SUBSCRIBE_TRACKS); they become the initial
+ * subscription parameters of the PUBLISH messages it provokes, except that the
+ * AUTHORIZATION_TOKEN is never copied. Any other parameter is a violation. */
 
 moq_result_t moq_d21_encode_subscribe_tracks(moq_buf_writer_t *w,
                                              uint64_t request_id,
@@ -384,7 +384,7 @@ moq_result_t moq_d21_decode_publish_skipped(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- NAMESPACE / NAMESPACE_DONE (draft-18 §10.16 / §10.17) --------- */
+/* -- NAMESPACE / NAMESPACE_DONE (draft-21 9.16 / 9.17) -------------- */
 
 moq_result_t moq_d21_encode_namespace_msg(moq_buf_writer_t *w,
                                           const moq_namespace_t *suffix,
@@ -418,7 +418,7 @@ moq_result_t moq_d21_decode_namespace_msg(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- TRACK_STATUS (draft-18 §10.14) -------------------------------- */
+/* -- TRACK_STATUS (draft-21 9.13) ----------------------------------- */
 
 /* TRACK_STATUS is the SUBSCRIBE layout minus Track-delivery params; only the
  * AUTHORIZATION_TOKEN message parameter applies. */
@@ -473,22 +473,22 @@ moq_result_t moq_d21_decode_track_status(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- Track Properties (KVP tail, §1.4.3 / §2.5) -------------------- *
+/* -- Track Properties (KVP tail, 8.3 / 8.4) ------------------------- *
  * The tail is preserved opaquely; this validates its structure so malformed or
  * mandatory-but-unknown properties are rejected rather than passed through. Each
  * Key-Value-Pair is a Type-Delta then, for an even type, a single varint value;
  * for an odd type, a vi64 length (<= 2^16-1) and that many bytes. Mandatory
  * properties (0x4000-0x7FFF) are not understood here and so are rejected.
- * IMMUTABLE_PROPERTIES (0x0B, §12.7) wraps a nested Key-Value-Pair sequence that
+ * IMMUTABLE_PROPERTIES (0x0B, 10.7) wraps a nested Key-Value-Pair sequence that
  * is itself Track Properties, so its contents are validated recursively (a
  * mandatory unknown may not hide inside it); a nested IMMUTABLE_PROPERTIES is
  * malformed. */
 #define D21_PROP_IMMUTABLE      0x0Bu
-#define D21_PROP_DYNAMIC_GROUPS 0x30u   /* §12.6: 0/1; >1 is a violation */
+#define D21_PROP_DYNAMIC_GROUPS 0x30u   /* 10.6: 0/1; >1 is a violation */
 
 /* Validate a Property KVP block structurally. A Mandatory Track Property
- * (0x4000-0x7FFF, §2.5.1 — including one hidden inside IMMUTABLE_PROPERTIES,
- * §12.7) is handled per `out_mandatory`: when non-NULL it is recorded
+ * (0x4000-0x7FFF, 3.6 — including one hidden inside IMMUTABLE_PROPERTIES,
+ * 10.7) is handled per `out_mandatory`: when non-NULL it is recorded
  * (*out_mandatory = true) and is NOT itself an error (the caller decides — object
  * properties are malformed and close, track properties respond
  * UNSUPPORTED_EXTENSION); when NULL it is rejected (MOQ_ERR_PROTO). Malformed
@@ -503,7 +503,7 @@ static moq_result_t d21_validate_props_inner(const uint8_t *data, size_t len,
     while (moq_buf_reader_remaining(&r) > 0) {
         uint64_t delta;
         if (moq_buf_read_vi64(&r, &delta) < 0) return MOQ_ERR_PROTO;
-        if (delta > UINT64_MAX - prev) return MOQ_ERR_PROTO;   /* §1.4.3 */
+        if (delta > UINT64_MAX - prev) return MOQ_ERR_PROTO;   /* 8.3 */
         uint64_t type = prev + delta;
         prev = type;
         if (type >= 0x4000 && type <= 0x7FFF) {
@@ -516,7 +516,7 @@ static moq_result_t d21_validate_props_inner(const uint8_t *data, size_t len,
             if (vlen > 0xFFFFu) return MOQ_ERR_PROTO;
             if (vlen > moq_buf_reader_remaining(&r)) return MOQ_ERR_PROTO;
             if (type == D21_PROP_IMMUTABLE) {
-                if (nested) return MOQ_ERR_PROTO;   /* §12.7: no nesting */
+                if (nested) return MOQ_ERR_PROTO;   /* 10.7: no nesting */
                 moq_result_t rc = d21_validate_props_inner(
                     moq_buf_reader_ptr(&r), (size_t)vlen, true, out_mandatory,
                     out_dynamic_groups);
@@ -527,7 +527,7 @@ static moq_result_t d21_validate_props_inner(const uint8_t *data, size_t len,
             uint64_t v;
             if (moq_buf_read_vi64(&r, &v) < 0) return MOQ_ERR_PROTO;
             if (type == D21_PROP_DYNAMIC_GROUPS) {
-                /* §12.6: allowed values 0/1; anything larger MUST close the
+                /* 10.6: allowed values 0/1; anything larger MUST close the
                  * session with PROTOCOL_VIOLATION (the profile maps this
                  * MOQ_ERR_PROTO to the 0x3 close). Immutable Properties are
                  * themselves Track Properties, so the rule applies inside
@@ -547,10 +547,10 @@ static moq_result_t d21_validate_track_properties(const uint8_t *data,
     return d21_validate_props_inner(data, len, false, NULL, NULL);
 }
 
-/* §9.8: pure per-profile timeout scanner. Extracts OBJECT_DELIVERY_TIMEOUT
- * (0x02) and SUBGROUP_DELIVERY_TIMEOUT (0x06) Track Properties (§12.1/§12.2)
+/* Pure per-profile timeout scanner. Extracts OBJECT_DELIVERY_TIMEOUT
+ * (0x02) and SUBGROUP_DELIVERY_TIMEOUT (0x06) Track Properties (10.1 / 10.2)
  * from a property block, searching BOTH the mutable list and the contents of
- * IMMUTABLE_PROPERTIES (§12.7 processors MUST search both). The timeouts are
+ * IMMUTABLE_PROPERTIES (10.7: processors MUST search both). The timeouts are
  * single-value properties, so the same type appearing twice anywhere across
  * (mutable UNION immutable) is malformed (MOQ_ERR_PROTO), as is a nested
  * IMMUTABLE_PROPERTIES or any structural failure. Unknown properties
@@ -646,8 +646,8 @@ moq_result_t moq_d21_scan_dynamic_groups(const uint8_t *data, size_t len,
                                     out_dynamic_groups);
 }
 
-/* -- OBJECT_DATAGRAM (§11.3.1) + Padding Datagram (§11.5.2) -------- *
- * The D18 data plane is vi64 throughout (type, track alias, group/object id,
+/* -- OBJECT_DATAGRAM (11.2.1) + Padding Datagram (11.5.2) ----------- *
+ * The draft-21 data plane (unchanged from draft 18) is vi64 throughout (type, track alias, group/object id,
  * property length, object status), matching the subgroup/object codecs above;
  * publisher priority is a raw byte. */
 moq_result_t moq_d21_decode_object_datagram(
@@ -663,7 +663,7 @@ moq_result_t moq_d21_decode_object_datagram(
     uint64_t type = 0;
     if (moq_buf_read_vi64(&r, &type) < 0) return MOQ_ERR_PROTO;
     if (type == MOQ_D21_PADDING_DATAGRAM) {
-        /* §11.5.2: the padding bytes MUST all be zero; any non-zero byte is
+        /* 11.5.2: the padding bytes MUST all be zero; any non-zero byte is
          * malformed (caller closes), otherwise discard. */
         size_t rem = moq_buf_reader_remaining(&r);
         const uint8_t *p = moq_buf_reader_ptr(&r);
@@ -718,7 +718,7 @@ moq_result_t moq_d21_decode_object_datagram(
             out->object_status != MOQ_OBJECT_STATUS_END_OF_GROUP &&
             out->object_status != MOQ_OBJECT_STATUS_END_OF_TRACK)
             return MOQ_ERR_PROTO;
-        /* STATUS + PROPERTIES is permitted only on a Normal object (§11.3.1). */
+        /* STATUS + PROPERTIES is permitted only on a Normal object (11.2.1). */
         if (out->has_properties && out->object_status != MOQ_OBJECT_STATUS_NORMAL)
             return MOQ_ERR_PROTO;
         if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -778,7 +778,7 @@ moq_result_t moq_d21_encode_object_datagram(
     }
     if (dg->has_properties) {
         if (!dg->properties) { w->pos = saved; return MOQ_ERR_INVAL; }
-        /* Outbound is strict, symmetric with inbound (§2.5.1): never emit a
+        /* Outbound is strict, symmetric with inbound (3.6): never emit a
          * malformed property block or a mandatory track property as an object
          * property. Validate before writing, rolling back on failure. */
         rc = moq_d21_validate_properties(dg->properties, dg->properties_len);
@@ -854,12 +854,11 @@ moq_result_t moq_d21_decode_subscribe_ok(const uint8_t *payload,
                                      &out->dynamic_groups);
 }
 
-/* -- PUBLISH (draft-18 §10.10) ------------------------------------- */
+/* -- PUBLISH (draft-21 9.8) ----------------------------------------- */
 
-/* PUBLISH permits FORWARD (publisher's initial forward intent),
- * AUTHORIZATION_TOKEN, LARGEST_OBJECT (§10.2.11 -- MUST be included once
- * Objects have been published), and EXPIRES (§10.2.10); other parameters are a
- * violation. */
+/* PUBLISH carries the subscription's initial parameters (they are no longer in
+ * PUBLISH_OK): MOQ_D21_MASK_PUBLISH. LARGEST_OBJECT MUST be included once Objects
+ * have been published (9.20.18). Other parameters are a violation. */
 
 moq_result_t moq_d21_encode_publish(moq_buf_writer_t *w,
                                     const moq_d21_publish_t *p)
@@ -923,8 +922,6 @@ moq_result_t moq_d21_decode_publish(const uint8_t *payload, size_t payload_len,
                                      &out->track_properties_unsupported,
                                      &out->dynamic_groups);
 }
-
-/* -- PUBLISH_OK (draft-18 §10.10 / §10.5) -------------------------- */
 
 /* -- GOAWAY (draft-21 9.2) ----------------------------------------- */
 
@@ -1016,7 +1013,7 @@ moq_result_t moq_d21_decode_request_error(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- Redirect structure (draft-18 §10.6.1) ------------------------- */
+/* -- Redirect structure (draft-21 9.4.1) ---------------------------- */
 
 /* Read a Redirect from an in-progress reader (no trailing-byte check). */
 static moq_result_t d21_read_redirect(moq_buf_reader_t *r,
@@ -1069,7 +1066,7 @@ moq_result_t moq_d21_encode_request_error_redirect(
     moq_bytes_t reason, const moq_d21_redirect_t *redirect)
 {
     if (!w || !redirect) return MOQ_ERR_INVAL;
-    /* The Redirect tail is present only for the REDIRECT error code (§10.6.1). */
+    /* The Redirect tail is present only for the REDIRECT error code (9.4.1). */
     if (error_code != MOQ_D21_ERROR_REDIRECT) return MOQ_ERR_INVAL;
     if (reason.len > MOQ_D21_MAX_REASON) return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
@@ -1110,7 +1107,7 @@ moq_result_t moq_d21_decode_request_error_redirect(
     return MOQ_OK;
 }
 
-/* -- Message Parameters (draft-18 §10.2) --------------------------- */
+/* -- Message Parameters (draft-21 9.20) ----------------------------- */
 
 static moq_result_t d21_write_u8(moq_buf_writer_t *w, uint8_t v)
 {
@@ -1215,7 +1212,7 @@ static moq_result_t d21_read_range_filter(moq_buf_reader_t *r, uint64_t type,
     return MOQ_OK;
 }
 
-/* AUTHORIZATION_TOKEN (§10.2.2) Token structure, written as the length-prefixed
+/* AUTHORIZATION_TOKEN (9.20.3) Token structure (8.9), written as the length-prefixed
  * value of the parameter. Integers are vi64; the Token Value (REGISTER /
  * USE_VALUE) runs to the end of the structure. The value can be arbitrarily
  * large, so the span length is computed up front rather than staged. */
@@ -1264,7 +1261,7 @@ static moq_result_t d21_write_auth_token(moq_buf_writer_t *w,
  * length-prefixed value. A structure that cannot be decoded (bad alias type,
  * truncated field, declared length wrong, or trailing bytes) returns
  * MOQ_D21_ERR_KVP_FORMAT so the profile closes with KEY_VALUE_FORMATTING_ERROR
- * (§10.2.2) rather than the generic PROTOCOL_VIOLATION. token_value borrows from
+ * (8.9) rather than the generic PROTOCOL_VIOLATION. token_value borrows from
  * the span. */
 static moq_result_t d21_read_auth_token(moq_buf_reader_t *r,
                                         moq_d21_auth_token_t *out)
@@ -1305,11 +1302,11 @@ static moq_result_t d21_read_auth_token(moq_buf_reader_t *r,
     return MOQ_OK;
 }
 
-/* -- SETUP Options (§10.3.1) ---------------------------------------- *
- * vi64 Key-Value-Pairs (§1.4.3) spanning the SETUP payload — NOT the draft-16
+/* -- SETUP Options (9.1) -------------------------------------------- *
+ * vi64 Key-Value-Pairs (8.3) spanning the SETUP payload — NOT the draft-16
  * QUIC-varint KVP form (the two encodings diverge at values 64..127, the same
  * trap as the data-plane property work). Unknown options are self-describing and
- * skipped per §10.3 (duplicates of unknown options allowed); a duplicate known
+ * skipped per 9.1 (duplicates of unknown options allowed); a duplicate known
  * non-repeatable option closes; AUTHORIZATION_TOKEN may repeat. */
 
 moq_result_t moq_d21_decode_setup_opts(const uint8_t *payload, size_t len,
@@ -1338,7 +1335,7 @@ moq_result_t moq_d21_decode_setup_opts(const uint8_t *payload, size_t len,
 
         if (type == MOQ_D21_SETUP_OPT_AUTHORIZATION_TOKEN) {
             /* Odd type: d21_read_auth_token consumes the vi64 Length + token
-             * structure directly. May repeat (§10.3.1.4). */
+             * structure directly. May repeat (9.1.4). */
             if (out->auth_token_count >= MOQ_D21_MAX_AUTH_TOKENS)
                 return MOQ_ERR_PROTO;
             moq_result_t arc = d21_read_auth_token(
@@ -1370,7 +1367,7 @@ moq_result_t moq_d21_decode_setup_opts(const uint8_t *payload, size_t len,
             continue;
         }
 
-        /* Odd type: vi64 Length + bytes (§1.4.3: length above 2^16-1 closes). */
+        /* Odd type: vi64 Length + bytes (8.3: length above 2^16-1 closes). */
         uint64_t vlen;
         if (moq_buf_read_vi64(&r, &vlen) < 0) return MOQ_ERR_PROTO;
         if (vlen > 0xFFFFu) return MOQ_ERR_PROTO;
@@ -1952,7 +1949,7 @@ bool moq_d21_session_error_registered(uint64_t code)
     }
 }
 
-/* -- REQUEST_UPDATE (draft-18 §10.9) ------------------------------- */
+/* -- REQUEST_UPDATE (draft-21 9.5) ---------------------------------- */
 
 moq_result_t moq_d21_encode_request_update(moq_buf_writer_t *w,
                                            uint64_t request_id,
@@ -1991,8 +1988,6 @@ moq_result_t moq_d21_decode_request_update(const uint8_t *payload,
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     return MOQ_OK;
 }
-
-/* -- REQUEST_OK (draft-18 §10.5) ----------------------------------- */
 
 /* -- PUBLISH_DONE (draft-21 9.9) ----------------------------------- */
 
@@ -2072,7 +2067,7 @@ moq_result_t moq_d21_decode_publish_state_notify(
     return MOQ_OK;
 }
 
-/* -- SUBGROUP_HEADER (draft-18 §11.4.2) ---------------------------- */
+/* -- SUBGROUP_HEADER (draft-21 11.3.1) ------------------------------ */
 
 bool moq_d21_subgroup_type_valid(uint8_t type)
 {
@@ -2154,7 +2149,7 @@ moq_result_t moq_d21_decode_subgroup_header(moq_buf_reader_t *r,
     return MOQ_OK;
 }
 
-/* -- FETCH family (draft-18 §10.12 / §10.13 / §11.4.4) ------------- */
+/* -- FETCH family (draft-21 9.11 / 9.12 / 11.4.1) ------------------- */
 
 static moq_result_t d21_write_location(moq_buf_writer_t *w,
                                        moq_d21_location_t loc)
