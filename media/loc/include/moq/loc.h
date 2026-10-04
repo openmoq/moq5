@@ -53,7 +53,15 @@ extern "C" {
 typedef enum moq_loc_profile {
     MOQ_LOC_PROFILE_01 = 1,  /* draft-ietf-moq-loc-01 */
     MOQ_LOC_PROFILE_02 = 2,  /* draft-ietf-moq-loc-02; reserved, requires D18 KVP codec */
+    MOQ_LOC_PROFILE_04 = 4,  /* draft-ietf-moq-loc-04: the property ids MoQT draft 21 registers
+                              * (Timestamp 0x10, Frame Marking 0x09 as bytes, ...); requires draft 21 */
 } moq_loc_profile_t;
+/*
+ * The LOC profile a transport draft carries (drafts 16 and 18: LOC-01, draft 21:
+ * LOC-04), or 0 for a draft with none. One table, so a sender, a receiver and
+ * a test cannot disagree about which property ids ride which session.
+ */
+MOQ_API moq_loc_profile_t moq_loc_profile_for_transport(moq_version_t transport_version);
 
 /* -- Video Frame Marking (RFC 9626 §3.1) ------------------------------ */
 

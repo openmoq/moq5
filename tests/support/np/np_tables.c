@@ -63,8 +63,9 @@ static const np_cell_row_t kCells[] = {
       "renumbered property ids on any draft",
       NULL, NULL, NULL },
     { 21, "loc01", NP_C_UNSUPPORTED,
-      "draft-21 renumbers the provisional LOC property ids (Timestamp 0x10, "
-      "Video Frame Marking 0x09) and no product code emits them yet",
+      "draft 21 carries LOC-04 (Timestamp 0x10, Video Frame Marking 0x09), which "
+      "the product implements but this topology has no media row for yet; LOC-01 "
+      "is not carried on draft 21",
       NULL, NULL, NULL },
     { 21, "loc02", NP_C_UNSUPPORTED,
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "

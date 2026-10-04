@@ -549,13 +549,14 @@ static moq_bytes_t default_role(moq_media_type_t t)
  * Zero -- the never-observed value -- is not one of them. */
 static bool sender_version_usable(moq_version_t v)
 {
-    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+    return moq_loc_profile_for_transport(v) != (moq_loc_profile_t)0;
 }
 
 static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
 {
-    (void)s;   /* version-driven once LOC-02 lands; LOC-01-only for now */
-    return MOQ_LOC_PROFILE_01;
+    /* One table (moq_loc_profile_for_transport): LOC-01 ids on drafts 16/18, LOC-04
+     * ids on draft 21. The sender never tests a version itself. */
+    return moq_loc_profile_for_transport(s->transport_version);
 }
 
 /* -- Send queue (mu held by caller) ----------------------------------- *
@@ -4354,7 +4355,8 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     if (track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
         uint64_t loc_ts = obj->has_capture_time ? obj->capture_time_us
                                                 : obj->presentation_time_us;
-        uint64_t loc_ts_max = (s->transport_version == MOQ_VERSION_DRAFT_18)
+        uint64_t loc_ts_max = (s->transport_version == MOQ_VERSION_DRAFT_18 ||
+                              s->transport_version == MOQ_VERSION_DRAFT_21)
                                   ? UINT64_MAX : MOQ_QUIC_VARINT_MAX;
         if (loc_ts > loc_ts_max) {
             s->stats.last_error = MOQ_ERR_INVAL;

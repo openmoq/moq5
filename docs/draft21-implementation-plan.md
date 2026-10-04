@@ -721,18 +721,36 @@ transport is Task 10 work). The OOM sweep was not run for d21.
  [x] 8.6 R3 command + sweeps + check_profile_boundary.sh. Commit.
 
 
-## TASK 9: Service layer (media_sender) -- LOC property ids per version
- [ ] 9.1 Locate the LOC property-block emitter (service/src/media_sender.c;
+## TASK 9: Service layer (media_sender) -- LOC property ids per version -- DONE
+
+RESULT (Task 9): the ids draft 21 registers (16.8) are LOC-04's (draft-ietf-moq-loc-04
+2.3; text at ../moqxr/docs): Timestamp 0x10, Timescale 0x08, Video Frame Marking 0x09,
+Audio Level 0x0C, Video Config 0x0D, Audio Config 0x0F. NOTE the plan's earlier "d18
+0x06/0x0A/0x0D" was wrong: drafts 16/18 carry LOC-01 (0x02/0x04/0x06/0x0D). Frame
+Marking's id is odd under LOC-04, so it is a length-prefixed RFC 9626 byte string (one
+byte, a second for the layer id), not a varint. The media library has one table,
+`moq_loc_profile_for_transport` (16/18 -> LOC-01, 21 -> LOC-04); encode/parse take the
+pair and FAIL CLOSED for a profile on a draft it was not reviewed for; fields are
+sorted by id before delta encoding. media_sender, media_object and msf accept draft 21
+and select the profile through that table (no version test in the sender). Hand-derived
+byte vectors in tests/unit/test_loc.c. Smoke: the sender negotiates draft 21 against the
+runner and exits cleanly. Audio Config (0x0F) is neither emitted nor parsed (the sender has
+no audio-config source). The np topology keeps its d21/loc01 cell UNSUPPORTED (true:
+LOC-01 is not carried on draft 21) with a reason naming LOC-04; a loc04 media row would
+need corpus and closure work and is not added. 9.3: the catalog's retained group is served
+as a fill under draft 21 by the Task 7 facade path; no msf change was needed beyond
+accepting the version.
+ [x] 9.1 Locate the LOC property-block emitter (service/src/media_sender.c;
          properties are generated from typed timing fields). Failing test in
          service/tests: with a d21 session the emitted TIMESTAMP is property
          0x10, VIDEO_FRAME_MARKING 0x09, VIDEO_CONFIG/AUDIO_CONFIG as Track
          properties 0x0D/0x0F; with d18 unchanged (0x06/0x0A/0x0D).
- [ ] 9.2 Implement via a per-profile property-id table (capability on the
+ [x] 9.2 Implement via a per-profile property-id table (capability on the
          profile or a service-side table keyed by negotiated profile --
          never `if (version == 21)` in the core).
- [ ] 9.3 Catalog/MSF behavior that depended on joining FETCH: confirm still
+ [x] 9.3 Catalog/MSF behavior that depended on joining FETCH: confirm still
          correct under d21 fill semantics (Task 7.3).
- [ ] 9.4 Commit.
+ [x] 9.4 Commit.
 
 
 ## TASK 10: Interop acceptance and gap closure (the compliance gate)

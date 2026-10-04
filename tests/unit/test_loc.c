@@ -1233,6 +1233,99 @@ int main(void)
         }
     }
 
+    /* -- Draft 21 carries LOC-04 ids (MoQT 21 16.8, draft-ietf-moq-loc-04 2.3) ---- */
+    {
+        const moq_version_t D21 = MOQ_VERSION_DRAFT_21;
+        const moq_loc_profile_t P04 = MOQ_LOC_PROFILE_04;
+        MOQ_TEST_CHECK(moq_loc_profile_for_transport(D16) == P01);
+        MOQ_TEST_CHECK(moq_loc_profile_for_transport(D18) == P01);
+        MOQ_TEST_CHECK(moq_loc_profile_for_transport(D21) == P04);
+        MOQ_TEST_CHECK((int)moq_loc_profile_for_transport((moq_version_t)19) == 0);
+
+        moq_alloc_t a = *moq_alloc_default();
+        const moq_alloc_t *alloc = &a;
+        moq_rcbuf_t *out = NULL;
+        moq_loc_headers_t h;
+
+        /* Timestamp is id 0x10 (even: no length), a vi64 value. */
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true; h.timestamp = 5;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D21, P04, &h, &out) == MOQ_OK && out);
+        { static const uint8_t want[] = { 0x10, 0x05 };
+          MOQ_TEST_CHECK(moq_rcbuf_len(out) == sizeof(want) && memcmp(moq_rcbuf_data(out), want, sizeof(want)) == 0); }
+        moq_rcbuf_decref(out); out = NULL;
+        h.timestamp = 300;                         /* two-byte vi64 0x812C */
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D21, P04, &h, &out) == MOQ_OK);
+        { static const uint8_t want[] = { 0x10, 0x81, 0x2C };
+          MOQ_TEST_CHECK(moq_rcbuf_len(out) == sizeof(want) && memcmp(moq_rcbuf_data(out), want, sizeof(want)) == 0); }
+        moq_rcbuf_decref(out); out = NULL;
+
+        /* Frame marking is id 0x09 (odd): a length-prefixed RFC 9626 byte string,
+         * with the layer id as a second byte. S|I|TID 1 = 0xA1. */
+        moq_loc_headers_init(&h);
+        h.has_video_frame_marking = true;
+        h.video_frame_marking.start_of_frame = true;
+        h.video_frame_marking.independent = true;
+        h.video_frame_marking.temporal_id = 1;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D21, P04, &h, &out) == MOQ_OK);
+        { static const uint8_t want[] = { 0x09, 0x01, 0xA1 };
+          MOQ_TEST_CHECK(moq_rcbuf_len(out) == sizeof(want) && memcmp(moq_rcbuf_data(out), want, sizeof(want)) == 0); }
+        moq_rcbuf_decref(out); out = NULL;
+        h.video_frame_marking.has_layer_id = true; h.video_frame_marking.layer_id = 3;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D21, P04, &h, &out) == MOQ_OK);
+        { static const uint8_t want[] = { 0x09, 0x02, 0xA1, 0x03 };
+          MOQ_TEST_CHECK(moq_rcbuf_len(out) == sizeof(want) && memcmp(moq_rcbuf_data(out), want, sizeof(want)) == 0); }
+        moq_rcbuf_decref(out); out = NULL;
+
+        /* Several fields come out in ascending id order, not field order:
+         * Timescale 0x08 (1000 = 0x83E8), Audio Level 0x0C (voice+5 = 0x85, two-byte
+         * vi64 0x8085), Timestamp 0x10. Deltas 8, 4, 4. */
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true; h.timestamp = 5;
+        h.has_timescale = true; h.timescale = 1000;
+        h.has_audio_level = true; h.audio_level.voice_activity = true; h.audio_level.level = 5;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D21, P04, &h, &out) == MOQ_OK);
+        static const uint8_t all[] = { 0x08, 0x83, 0xE8, 0x04, 0x80, 0x85, 0x04, 0x05 };
+        MOQ_TEST_CHECK(moq_rcbuf_len(out) == sizeof(all) && memcmp(moq_rcbuf_data(out), all, sizeof(all)) == 0);
+        moq_rcbuf_decref(out); out = NULL;
+
+        /* ... and parse reads them back. */
+        moq_loc_headers_t p;
+        moq_bytes_t span = { all, sizeof(all) };
+        MOQ_TEST_CHECK(moq_loc_parse(D21, P04, span, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(p.has_timestamp && p.timestamp == 5 && p.has_timescale && p.timescale == 1000 &&
+                       p.has_audio_level && p.audio_level.voice_activity && p.audio_level.level == 5);
+        static const uint8_t fm[] = { 0x09, 0x02, 0xA1, 0x03 };
+        span = (moq_bytes_t){ fm, sizeof(fm) };
+        MOQ_TEST_CHECK(moq_loc_parse(D21, P04, span, &p) == MOQ_OK);
+        MOQ_TEST_CHECK(p.has_video_frame_marking && p.video_frame_marking.start_of_frame &&
+                       p.video_frame_marking.independent && p.video_frame_marking.temporal_id == 1 &&
+                       p.video_frame_marking.has_layer_id && p.video_frame_marking.layer_id == 3);
+        /* An empty or over-long frame marking is malformed. */
+        static const uint8_t fm0[] = { 0x09, 0x00 };
+        span = (moq_bytes_t){ fm0, sizeof(fm0) };
+        MOQ_TEST_CHECK(moq_loc_parse(D21, P04, span, &p) == MOQ_ERR_PROTO);
+        /* LOC-01's timestamp id (0x02) means nothing under LOC-04: skipped. */
+        static const uint8_t old_ts[] = { 0x02, 0x05 };
+        span = (moq_bytes_t){ old_ts, sizeof(old_ts) };
+        MOQ_TEST_CHECK(moq_loc_parse(D21, P04, span, &p) == MOQ_OK && !p.has_timestamp);
+
+        /* A profile is only valid on its own draft: fail closed, never emit another
+         * draft's ids. */
+        moq_loc_headers_init(&h);
+        h.has_timestamp = true; h.timestamp = 5;
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D21, P01, &h, &out) == MOQ_ERR_INVAL && !out);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D18, P04, &h, &out) == MOQ_ERR_INVAL && !out);
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D16, P04, &h, &out) == MOQ_ERR_INVAL && !out);
+        MOQ_TEST_CHECK(moq_loc_parse(D21, P01, span, &p) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(moq_loc_parse(D18, P04, span, &p) == MOQ_ERR_INVAL);
+        /* LOC-01 under a draft it was reviewed for is unchanged: timestamp id 0x02. */
+        MOQ_TEST_CHECK(moq_loc_encode(alloc, D18, P01, &h, &out) == MOQ_OK);
+        { static const uint8_t want[] = { 0x02, 0x05 };
+          MOQ_TEST_CHECK(moq_rcbuf_len(out) == sizeof(want) && memcmp(moq_rcbuf_data(out), want, sizeof(want)) == 0); }
+        moq_rcbuf_decref(out); out = NULL;
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

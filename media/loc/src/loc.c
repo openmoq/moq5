@@ -20,6 +20,43 @@
 #define LOC01_AUDIO_LEVEL         0x06u
 #define LOC01_VIDEO_CONFIG        0x0du
 
+/* -- Property ids per profile ----------------------------------------
+ * LOC-01 (drafts 16/18) and LOC-04 (the ids MoQT draft 21 registers in 16.8 and
+ * draft-ietf-moq-loc-04 section 2.3). Frame marking is a varint under LOC-01 but a
+ * length-prefixed byte string under LOC-04 (its id is odd). */
+typedef struct loc_ids {
+    uint64_t timestamp, timescale, frame_marking, audio_level, video_config;
+    bool     frame_marking_bytes;
+    bool     has_timescale;
+} loc_ids_t;
+
+static const loc_ids_t k_ids_01 = {
+    LOC01_CAPTURE_TIMESTAMP, 0, LOC01_VIDEO_FRAME_MARKING, LOC01_AUDIO_LEVEL,
+    LOC01_VIDEO_CONFIG, false, false };
+static const loc_ids_t k_ids_04 = {
+    0x10u, 0x08u, 0x09u, 0x0Cu, 0x0Du, true, true };
+
+/* The ids for a (transport version, profile) pair; NULL for a pair that has no
+ * reviewed meaning, which fails closed rather than emitting another draft's ids. */
+static const loc_ids_t *loc_ids_for(moq_version_t v, moq_loc_profile_t p)
+{
+    if (p == MOQ_LOC_PROFILE_01)
+        return (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18) ? &k_ids_01 : NULL;
+    if (p == MOQ_LOC_PROFILE_04)
+        return v == MOQ_VERSION_DRAFT_21 ? &k_ids_04 : NULL;
+    return NULL;
+}
+
+moq_loc_profile_t moq_loc_profile_for_transport(moq_version_t v)
+{
+    switch (v) {
+    case MOQ_VERSION_DRAFT_16:
+    case MOQ_VERSION_DRAFT_18: return MOQ_LOC_PROFILE_01;
+    case MOQ_VERSION_DRAFT_21: return MOQ_LOC_PROFILE_04;
+    default: return (moq_loc_profile_t)0;
+    }
+}
+
 /* An odd-type KVP value carries a Length; both drafts cap it at 2^16-1
  * (draft-16 section 1.4.2, draft-18 section 1.4.3). */
 #define LOC_KVP_MAX_VALUE_LEN 0xFFFFu
@@ -58,6 +95,7 @@ static const loc_int_codec_t *loc_codec_for(moq_version_t v)
     switch (v) {
     case MOQ_VERSION_DRAFT_16: return &k_codec_d16;  /* section 1.4 (i)    */
     case MOQ_VERSION_DRAFT_18: return &k_codec_d18;  /* section 1.4.1 vi64 */
+    case MOQ_VERSION_DRAFT_21: return &k_codec_d18;  /* vi64, unchanged (draft 21 8.1) */
     default: return NULL;   /* unknown/unregistered: fail closed */
     }
 }
@@ -292,7 +330,8 @@ moq_result_t moq_loc_parse(moq_version_t transport_version,
     const loc_int_codec_t *codec = loc_codec_for(transport_version);
     if (!codec) return MOQ_ERR_INVAL;
 
-    if (profile != MOQ_LOC_PROFILE_01)
+    const loc_ids_t *ids = loc_ids_for(transport_version, profile);
+    if (!ids)
         return MOQ_ERR_INVAL;
 
     if (properties.len == 0)
@@ -308,34 +347,37 @@ moq_result_t moq_loc_parse(moq_version_t transport_version,
     while ((rc = loc_kvp_next(&w, &item)) == MOQ_OK) {
         if (item.is_varint) {
             /* Duplicate known properties: the last value wins. */
-            switch (item.type) {
-            case LOC01_CAPTURE_TIMESTAMP:
+            if (item.type == ids->timestamp) {
                 out->has_timestamp = true;
                 out->timestamp = item.value;
-                break;
-            case LOC01_VIDEO_FRAME_MARKING: {
+            } else if (ids->has_timescale && item.type == ids->timescale) {
+                out->has_timescale = true;
+                out->timescale = item.value;
+            } else if (!ids->frame_marking_bytes && item.type == ids->frame_marking) {
                 moq_result_t drc = decode_video_frame_marking(
                     item.value, &out->video_frame_marking);
                 if (drc < 0) return drc;
                 out->has_video_frame_marking = true;
-                break;
-            }
-            case LOC01_AUDIO_LEVEL: {
+            } else if (item.type == ids->audio_level) {
                 moq_result_t drc = decode_audio_level(
                     item.value, &out->audio_level);
                 if (drc < 0) return drc;
                 out->has_audio_level = true;
-                break;
             }
-            default:
-                /* A well-formed unknown property is skipped, not an error. */
-                break;
-            }
+            /* A well-formed unknown property is skipped, not an error. */
         } else {
-            if (item.type == LOC01_VIDEO_CONFIG) {
+            if (item.type == ids->video_config) {
                 out->has_video_config = true;
                 out->video_config.data = item.bytes;
                 out->video_config.len = item.bytes_len;
+            } else if (ids->frame_marking_bytes && item.type == ids->frame_marking) {
+                /* RFC 9626 bytes: the first byte, then an optional layer id. */
+                if (item.bytes_len < 1 || item.bytes_len > 4) return MOQ_ERR_PROTO;
+                uint64_t v = item.bytes[0];
+                if (item.bytes_len >= 2) v = (v << 8) | item.bytes[1];
+                moq_result_t drc = decode_video_frame_marking(v, &out->video_frame_marking);
+                if (drc < 0) return drc;
+                out->has_video_frame_marking = true;
             }
         }
     }
@@ -359,7 +401,8 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     const loc_int_codec_t *codec = loc_codec_for(transport_version);
     if (!codec) return MOQ_ERR_INVAL;
 
-    if (profile != MOQ_LOC_PROFILE_01)
+    const loc_ids_t *ids = loc_ids_for(transport_version, profile);
+    if (!ids)
         return MOQ_ERR_INVAL;
 
     if (headers->has_audio_level && headers->audio_level.level > 127)
@@ -367,7 +410,7 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     if (headers->has_video_frame_marking &&
         headers->video_frame_marking.temporal_id > 7)
         return MOQ_ERR_INVAL;
-    if (headers->has_timescale)
+    if (headers->has_timescale && !ids->has_timescale)
         return MOQ_ERR_INVAL;
     /* A timestamp the SELECTED codec cannot represent is refused here
      * rather than truncated. Under draft-16 that is anything above
@@ -375,41 +418,61 @@ moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
     if (headers->has_timestamp && headers->timestamp > codec->max_value)
         return MOQ_ERR_INVAL;
 
-    /* Plan every present field in ascending LOC-01 property-ID order:
-     * 0x02 timestamp, 0x04 frame marking, 0x06 audio level,
-     * 0x0d video config. */
-    loc_kvp_item_t props[4];
+    /* Plan every present field, then order by property id: the KVP delta
+     * encoding needs ascending types, and the two profiles number them
+     * differently. */
+    loc_kvp_item_t props[5];
+    uint8_t fm_bytes[2];
     size_t prop_count = 0;
     memset(props, 0, sizeof(props));
 
     if (headers->has_timestamp) {
-        props[prop_count].type = LOC01_CAPTURE_TIMESTAMP;
+        props[prop_count].type = ids->timestamp;
         props[prop_count].is_varint = true;
         props[prop_count].value = headers->timestamp;
         prop_count++;
     }
-
-    if (headers->has_video_frame_marking) {
-        props[prop_count].type = LOC01_VIDEO_FRAME_MARKING;
+    if (headers->has_timescale) {
+        props[prop_count].type = ids->timescale;
         props[prop_count].is_varint = true;
-        props[prop_count].value = encode_video_frame_marking(
-            &headers->video_frame_marking);
+        props[prop_count].value = headers->timescale;
         prop_count++;
     }
-
+    if (headers->has_video_frame_marking) {
+        props[prop_count].type = ids->frame_marking;
+        uint64_t v = encode_video_frame_marking(&headers->video_frame_marking);
+        if (ids->frame_marking_bytes) {
+            size_t n = 0;
+            if (headers->video_frame_marking.has_layer_id) fm_bytes[n++] = (uint8_t)(v >> 8);
+            fm_bytes[n++] = (uint8_t)v;
+            if (n == 2) { /* first byte then layer id: already in that order */ }
+            props[prop_count].is_varint = false;
+            props[prop_count].bytes = fm_bytes;
+            props[prop_count].bytes_len = n;
+        } else {
+            props[prop_count].is_varint = true;
+            props[prop_count].value = v;
+        }
+        prop_count++;
+    }
     if (headers->has_audio_level) {
-        props[prop_count].type = LOC01_AUDIO_LEVEL;
+        props[prop_count].type = ids->audio_level;
         props[prop_count].is_varint = true;
         props[prop_count].value = encode_audio_level(&headers->audio_level);
         prop_count++;
     }
-
     if (headers->has_video_config) {
-        props[prop_count].type = LOC01_VIDEO_CONFIG;
+        props[prop_count].type = ids->video_config;
         props[prop_count].is_varint = false;
         props[prop_count].bytes = headers->video_config.data;
         props[prop_count].bytes_len = headers->video_config.len;
         prop_count++;
+    }
+    for (size_t a = 1; a < prop_count; a++) {          /* insertion sort by id */
+        loc_kvp_item_t k = props[a];
+        size_t b = a;
+        while (b > 0 && props[b - 1].type > k.type) { props[b] = props[b - 1]; b--; }
+        props[b] = k;
     }
 
     /* No fields present means no properties: the caller gets MOQ_OK with a

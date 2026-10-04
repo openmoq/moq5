@@ -33,6 +33,7 @@ static bool track_transport_version(const moq_media_track_info_t *track,
     switch (track->transport_version) {
     case MOQ_VERSION_DRAFT_16:
     case MOQ_VERSION_DRAFT_18:
+    case MOQ_VERSION_DRAFT_21:
         *out = track->transport_version;
         return true;
     default:
@@ -186,7 +187,8 @@ moq_result_t moq_media_object_parse(
 
         if (props.len > 0 || track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
             moq_result_t lr = moq_loc_parse(transport_version,
-                                            MOQ_LOC_PROFILE_01, props, &loc);
+                                            moq_loc_profile_for_transport(transport_version),
+                                            props, &loc);
             if (lr == MOQ_ERR_PROTO) {
                 if (drop_reason) *drop_reason = MOQ_MEDIA_DROP_MALFORMED_LOC;
                 return MOQ_ERR_PROTO;
