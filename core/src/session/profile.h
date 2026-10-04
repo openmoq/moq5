@@ -422,6 +422,14 @@ typedef struct moq_profile_ops {
     bool allows_concurrent_subscriptions;
 
     /*
+     * Capability: true when a FIN on the requester's half of an established
+     * request stream only closes that direction (draft 21 6.4.2.2) rather than
+     * being treated as a truncated message. Cancellation is then RESET_STREAM /
+     * STOP_SENDING only.
+     */
+    bool request_fin_is_not_cancel;
+
+    /*
      * Capability: true if this profile's FETCH-response data plane can carry a
      * descending group order. Draft-16 sets true (fetch objects carry absolute
      * Group IDs); draft-18 sets false (group deltas with ascending-only

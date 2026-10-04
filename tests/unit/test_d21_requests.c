@@ -1311,6 +1311,91 @@ static void t_range_filter_types(void)
     }
 }
 
+/* -- Request stream closure (Task 6.4, draft 21 6.4.2.2 / 6.4.2.3) --------- *
+ * A FIN only says "no more messages in this direction"; it is not a cancellation.
+ * A requester MAY FIN right after its SUBSCRIBE when it will not send a
+ * REQUEST_UPDATE, and the subscription must live on. Cancelling is RESET_STREAM
+ * (the peer's send half) or STOP_SENDING (asking us to stop sending). */
+static moq_subscription_t accept_new_subscription(moq_session_t *s, uint64_t request_id,
+                                                  const char *track, bool fin_with_request)
+{
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_subscribe(&w, request_id, &ns, lit(track), &p);
+    moq_session_on_bidi_stream_bytes(s, moq_stream_ref_from_u64(4 * (request_id / 2 + 1)), msg,
+                                     moq_buf_writer_offset(&w), fin_with_request, 1);
+    moq_subscription_t sub = {0};
+    moq_event_t ev;
+    if (next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev)) {
+        sub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+        moq_accept_subscribe_cfg_t acc;
+        memset(&acc, 0, sizeof(acc));
+        acc.struct_size = sizeof(acc);
+        moq_session_accept_subscribe(s, sub, &acc, 2);
+    }
+    { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+    return sub;
+}
+
+static void t_request_stream_closure(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+
+    /* FIN with the request: the subscription is established and stays so. */
+    moq_subscription_t a = accept_new_subscription(s, 0, "fin_with", true);
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK(moq_session_sub_resolved_window(s, a) != NULL || s->state != MOQ_SESS_CLOSED);
+
+    /* A FIN that arrives later, on an established subscription, is not a cancel. */
+    moq_subscription_t b = accept_new_subscription(s, 2, "fin_later", false);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(
+        s, moq_stream_ref_from_u64(8), NULL, 0, true, 3), (int)MOQ_OK);
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED);
+    { moq_event_t ev; bool cancelled = false;
+      while (moq_session_poll_events(s, &ev, 1) > 0) {
+          if (ev.kind == MOQ_EVENT_UNSUBSCRIBED) cancelled = true;
+          moq_event_cleanup(&ev);
+      }
+      MOQ_TEST_CHECK(!cancelled); }
+    (void)b;
+
+    /* RESET_STREAM from the subscriber cancels it (and only it). */
+    moq_subscription_t c = accept_new_subscription(s, 4, "reset", false);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_reset(
+        s, moq_stream_ref_from_u64(12), 0, 4), (int)MOQ_OK);
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED);
+    { moq_event_t ev; bool cancelled = false;
+      while (moq_session_poll_events(s, &ev, 1) > 0) {
+          if (ev.kind == MOQ_EVENT_UNSUBSCRIBED) cancelled = true;
+          moq_event_cleanup(&ev);
+      }
+      MOQ_TEST_CHECK(cancelled); }
+    (void)c;
+    moq_session_destroy(s);
+
+    /* The responder FINs an established subscription without PUBLISH_DONE: the
+     * request failed (the subscription ends), the session does not. */
+    s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_subscription_t h;
+    moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s, ref, NULL, 0, true, 5), (int)MOQ_OK);
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED);
+    { moq_event_t ev; bool ended = false;
+      while (moq_session_poll_events(s, &ev, 1) > 0) {
+          if (ev.kind == MOQ_EVENT_UNSUBSCRIBED) ended = true;
+          moq_event_cleanup(&ev);
+      }
+      MOQ_TEST_CHECK(ended); }
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1331,6 +1416,7 @@ int main(void)
     t_inbound_window();
     t_range_filters_declined();
     t_range_filter_types();
+    t_request_stream_closure();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

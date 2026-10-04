@@ -1643,6 +1643,17 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         }
 
         if (consumed == 0) {
+            /* Draft 21 6.4.2.2: a FIN is not a request cancellation. The
+             * requester of an established subscription that FINs with nothing
+             * buffered has only closed its direction (the FIN is latched in
+             * req_recv_fin, which the terminal path uses to free the entry). The
+             * responder's FIN before the response or PUBLISH_DONE arrived means
+             * the request failed: tear it down like a reset, not the session. */
+            if (e->req_recv_fin && s->profile->request_fin_is_not_cancel &&
+                !receiving && e->req_recv_len == 0) {
+                if (as_request) return MOQ_OK;
+                return request_stream_teardown(s, stream_ref);
+            }
             if (e->req_recv_fin) {
                 if (receiving) sub_free_entry(s, (size_t)slot);
                 return close_with_error(s, 0x3,
