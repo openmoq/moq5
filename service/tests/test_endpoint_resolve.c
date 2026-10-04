@@ -667,7 +667,7 @@ int main(void)
                               (int)MOQ_ERR_UNSUPPORTED);
 
         /* Draft 21 has a registered ALPN and a core profile, but the profile is
-         * transitional (it emits draft-18 bytes), so the endpoint refuses to
+         * not wire ready (its session semantics are unfinished), so the endpoint refuses to
          * offer it however it is asked: pinned, listed alone, or listed beside
          * a supported draft. Silently dropping it from a LIST would hide the
          * refusal. AUTO (checked above) never includes it. */

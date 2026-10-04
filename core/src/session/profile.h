@@ -86,8 +86,8 @@ typedef struct moq_profile_ops {
 
     /*
      * Capability: true when this profile is complete enough to speak to a real
-     * peer. A profile can exist before it is (draft 21 began as a copy of
-     * draft 18 and emits draft-18 bytes until its slots are converted): it can
+     * peer. A profile can exist before it is (draft 21 speaks draft-21 bytes
+     * but its session semantics are not finished): it can
      * be created for the simulator and for tests, but it must not be reachable
      * from the wire. The endpoint's supported set and the negotiated-profile
      * model's AVAILABLE state both mean "wire ready"; moq_profile_wire_ready()
@@ -397,6 +397,21 @@ typedef struct moq_profile_ops {
      * has already happened.
      */
     moq_request_error_t (*semantic_request_error)(uint64_t raw);
+
+    /*
+     * Capability: true when the subscriber's PUBLISH_OK (the answer to a PUBLISH)
+     * carries the subscriber's delivery parameters (priority, group order, forward,
+     * filter, timeouts). Draft 21 moved them to REQUEST_UPDATE, so its OK carries
+     * none and a non-default choice has to be sent as an update afterwards.
+     */
+    bool publish_ok_carries_params;
+
+    /*
+     * Capability: true when this profile has the Joining FETCH (a FETCH that names
+     * an existing subscription instead of a track). Draft 21 removed it; fill
+     * streams on a SUBSCRIBE replace it (3.4).
+     */
+    bool supports_joining_fetch;
 
     /*
      * Capability: true if this profile's FETCH-response data plane can carry a

@@ -1218,6 +1218,7 @@ moq_result_t moq_session_publish(moq_session_t *s,
         /* Retain the EXACT Largest this PUBLISH put on the wire (the same
          * snapshot the encoder used, not a later history read). It becomes the
          * Joining Location when PUBLISH_OK establishes an eligible state. */
+        entry->publish_forward = forward;
         entry->publish_has_largest = adv_has_largest;
         entry->publish_largest_group = adv_largest_group;
         entry->publish_largest_object = adv_largest_object;

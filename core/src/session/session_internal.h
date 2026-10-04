@@ -102,6 +102,14 @@ typedef struct moq_setup_params {
     uint64_t max_auth_token_cache_size;
     bool     has_path;
     bool     has_authority;
+    /* Draft 21 (9.1.6, 9.1.7). Absent means the draft's default, which is also 0:
+     * MAX_FILTER_RANGES 0 (the peer is not allowed Range Filters) and
+     * MAX_REQUEST_UPDATES 0 (unlimited outstanding updates). */
+    bool     has_max_filter_ranges;
+    uint64_t max_filter_ranges;
+    bool     has_max_request_updates;
+    uint64_t max_request_updates;
+    bool     has_implementation;      /* MOQT_IMPLEMENTATION sent (9.1.5) */
 } moq_setup_params_t;
 
 /* Forward decl: entries hold a pointer to their reserved registry record
@@ -559,6 +567,8 @@ typedef struct moq_pub_entry {
      * joining_* is the latched result; has_joining_loc gates every read.
      * Absence of a required Largest leaves no Joining Location at all -- there
      * is no fallback to stale or current state. */
+    bool               publish_forward;      /* the FORWARD value our PUBLISH advertised (draft 21: it stays
+                                                 * in force until the subscriber's REQUEST_UPDATE) */
     bool               publish_has_largest;
     uint64_t           publish_largest_group;
     uint64_t           publish_largest_object;
@@ -2271,6 +2281,43 @@ typedef struct moq_request_update_encode_args {
 
 #define MOQ_DECODED_MAX_NAMESPACE_PARTS 32
 
+/* -- Raw draft-21 filter surfaces (profile -> session core) --------------- *
+ * The core models a subscription filter as one of four types plus locations
+ * (MOQ_SUBSCRIBE_FILTER_*). Draft 21 expresses filters as a Location Filter of 0 to
+ * 4 fields (9.20.10), FILL_PARAMETERS (9.20.16) and Range Filters (9.20.11-15). The
+ * profile maps what the four types can express exactly and passes the wire fields
+ * through here in full, so the core can finish the semantics (plan Tasks 6 and 7)
+ * without the wire layer changing again. `approximated` says the four-type fields
+ * only approximate the request; `present` is false for profiles without these. */
+typedef struct moq_decoded_loc_filter {
+    bool     present;             /* a LOCATION_FILTER parameter was on the wire */
+    uint8_t  field_count;         /* 0..4; 0 = a zero-length (remove / whole) filter */
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group_delta;     /* raw delta from start_group */
+    uint64_t end_object;
+    bool     approximated;
+} moq_decoded_loc_filter_t;
+
+typedef struct moq_decoded_fill {
+    bool     present;             /* FILL_PARAMETERS carried: a fill is requested */
+    moq_decoded_loc_filter_t location;   /* the fill range; absent = the subscription's */
+    bool     has_timeout;
+    uint64_t timeout_ms;
+    bool     has_priority;
+    uint8_t  priority;
+    bool     has_group_order;
+    uint8_t  group_order;
+} moq_decoded_fill_t;
+
+/* Range Filters are parsed and counted, never applied (this implementation does not
+ * advertise MAX_FILTER_RANGES): the session answers INVALID_FILTER when `ranges`
+ * exceeds the limit it advertised, or when `invalid` is set (9.1.6, 3.3.2). */
+typedef struct moq_decoded_range_filters {
+    uint64_t ranges;
+    bool     invalid;
+} moq_decoded_range_filters_t;
+
 /* -- Decoded inbound SUBSCRIBE (profile → session core) --------------- */
 
 typedef struct moq_decoded_subscribe {
@@ -2296,6 +2343,9 @@ typedef struct moq_decoded_subscribe {
     uint64_t         start_group;
     uint64_t         start_object;
     uint64_t         end_group;
+    moq_decoded_loc_filter_t     loc_filter;      /* draft 21: the exact wire filter */
+    moq_decoded_fill_t           fill;            /* draft 21: FILL_PARAMETERS */
+    moq_decoded_range_filters_t  range_filters;   /* draft 21: parsed, never applied */
     moq_resolved_token_t tokens[MOQ_DECODED_MAX_TOKENS];
     bool             token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t           token_count;
@@ -2350,6 +2400,9 @@ typedef struct moq_decoded_request_update {
     uint64_t start_group;
     uint64_t start_object;
     uint64_t end_group;
+    moq_decoded_loc_filter_t     loc_filter;      /* draft 21: the exact wire filter */
+    moq_decoded_fill_t           fill;            /* draft 21: FILL_PARAMETERS */
+    moq_decoded_range_filters_t  range_filters;   /* draft 21: parsed, never applied */
     /* Resolved AUTHORIZATION_TOKEN parameters (both profiles; the auth
      * transaction commit/abort is a safe no-op on an empty transaction).
      * auth_reject_code is non-zero when a token failed at the message level
@@ -2501,6 +2554,11 @@ typedef struct moq_decoded_fetch {
     uint64_t         joining_request_id;
     uint64_t         joining_start;
     int              joining_sub_slot;
+    /* Draft 21: the exact wire filter that carried the range (the core's
+     * [start, end) fields above are filled from it where the model expresses it),
+     * and the parsed-but-never-applied Range Filters. */
+    moq_decoded_loc_filter_t     loc_filter;
+    moq_decoded_range_filters_t  range_filters;
     /* Publication-origin join (draft-18 5.1): the joined owner is a
      * PUBLISH-initiated subscription in the publication pool. Exactly one of
      * joining_sub_slot / joining_pub_slot is >= 0 for a joining fetch. */

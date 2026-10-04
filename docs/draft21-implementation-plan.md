@@ -467,7 +467,62 @@ docs/draft21-wire-reference.md -> see it fail -> implement -> pass -> commit.
  scripts/run_fuzzers.sh briefly (new decode paths are untrusted input).
 
 
-## TASK 5: Replace temporary d18 hooks in profile_d21.c; setup + request layer
+## TASK 5: Replace temporary d18 hooks in profile_d21.c; setup + request layer -- DONE
+
+RESULT: profile_d21.c now speaks draft 21 end to end through the moq_d21_* codec; no
+moq_d18_* call remains. New tests: test_d21_setup (SETUP on the wire, peer limits,
+violation matrix, GOAWAY, unknown control messages, capabilities) and
+test_d21_requests (the filter and fetch-range mappings as tables, outbound and
+inbound SUBSCRIBE / REQUEST_UPDATE / FETCH, the joining refusal, PUBLISH and its
+bare OK, PUBLISH_STATE_NOTIFY, error codes). Both were mutation-checked; the checks
+found one test gap (a PUBLISH-initiated NOTIFY path) and one genuine bug of mine
+(the FETCH range was written into a params struct that fill_request_params then
+cleared), both fixed. 131/131 pass; the `dev` tree's failing set equals main's.
+
+What changed in the core, additively: `moq_setup_params_t` records the peer's
+MAX_FILTER_RANGES / MAX_REQUEST_UPDATES / implementation; the decoded SUBSCRIBE,
+REQUEST_UPDATE and FETCH records carry the exact wire filter (`moq_decoded_loc_filter_t`),
+the FILL_PARAMETERS request (`moq_decoded_fill_t`) and the parsed Range Filters
+(`moq_decoded_range_filters_t`); `MOQ_FETCH_RANGE_TIMED_OUT` (0x20C);
+`MOQ_REQUEST_ERROR_INVALID_FILTER` / `_CONFLICTING_FILTERS`; `moq_pub_entry_t.publish_forward`;
+profile capabilities `publish_ok_carries_params` and `supports_joining_fetch`.
+Our SETUP now sends MOQT_IMPLEMENTATION ("libmoq/<version>") and deliberately omits
+MAX_FILTER_RANGES (default 0: the peer may not send Range Filters) and
+MAX_REQUEST_UPDATES (default: unlimited).
+
+STILL draft-18 SEMANTICS, handed to Tasks 6 and 7 (each is covered by a test that
+documents today's behavior, so the gap cannot widen silently):
+  6.1  A second concurrent subscription to the same Track is refused (draft 21
+       allows it, 3.1). Both the core and core/src/facade/publisher.c do this. The
+       core filter model has four types: a one-field relative start N>=1 and a
+       four-field range's end object are only APPROXIMATED (`loc_filter.approximated`
+       is set; raw fields are surfaced) -- extend moq_resolve_filter_window with a
+       relative-start type and an end object, then consume the raw record.
+  6.2  PUBLISH_OK cannot carry the subscriber's choices (capability false). The
+       accept path must send priority / group order / forward / filter as a
+       REQUEST_UPDATE after the OK instead of dropping them; today they are
+       dropped. The decoded PUBLISH_OK reports the forward value our PUBLISH
+       advertised (publish_forward), priority 128 and default group order. The
+       publisher's own initial parameters on an inbound PUBLISH (priority, group
+       order, timeouts, filter) are not yet surfaced.
+  6.3  The peer's MAX_REQUEST_UPDATES is recorded in s->peer_setup but not enforced;
+       no TOO_MANY_REQUEST_UPDATES close and no outstanding-update counter yet. An
+       unexpected REQUEST_UPDATE must be a session error.
+  6.5  PUBLISH_STATE_NOTIFY is validated and consumed by a subscriber (informative,
+       9.10) and closes a publisher that receives it; there is no sending API and
+       the received state is not applied.
+  6.7  Range Filters: `range_filters.ranges` / `.invalid` are surfaced on SUBSCRIBE,
+       REQUEST_UPDATE and FETCH but nothing answers INVALID_FILTER yet.
+  6.8  Delivery timeouts as Track AND Object properties and the clock start
+       (11.x) are untouched. The public send API still refuses the new TIMED_OUT
+       range kind (session_fetch.c, the checks near lines 2051 and 2064).
+  7    Joining FETCH is refused by the profile's encoder (UNSUPPORTED) but the core
+       does not yet gate on supports_joining_fetch before allocating; inbound
+       FETCH / SUBSCRIBE surface `loc_filter.approximated` and `fill` for the fill
+       implementation; a one-field relative FETCH start currently falls back to the
+       whole track.
+  Other: SUBSCRIBE_TRACKS encodes only FORWARD and decodes but ignores the other
+  parameters 9.18.1 allows; the facade still emits SUBSCRIPTION_ENDED (F7).
 Files: profile_d21.c, session_setup/session.c only if a capability is missing.
  [ ] 5.1 Tests (tests/unit/test_d21_setup.c, modeled on test_d18_setup.c and
          test_d18_setup_options.c): client+server over moq::sim complete SETUP;

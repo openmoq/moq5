@@ -3099,6 +3099,8 @@ static const moq_profile_ops_t d18_ops = {
     .semantic_request_error  = d18_semantic_request_error,
     .fetch_descending_supported = false,   /* ascending-only delta reconstruction */
     .uses_uni_control_channel = true,
+    .publish_ok_carries_params = true,
+    .supports_joining_fetch  = true,
     .classify_uni_stream     = d18_classify_uni_stream,
     /* Request admission + SUBSCRIBE outbound. */
     .prepare_request         = d18_prepare_request,

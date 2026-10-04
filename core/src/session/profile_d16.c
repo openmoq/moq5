@@ -4837,6 +4837,8 @@ static const moq_profile_ops_t d16_ops = {
     .semantic_request_error          = d16_semantic_request_error,
     .fetch_descending_supported      = true,   /* absolute Group IDs on the wire */
     .uses_uni_control_channel        = false,
+    .publish_ok_carries_params = true,
+    .supports_joining_fetch  = true,
     .classify_uni_stream             = NULL,
     .validate_inbound_request_stream = NULL,
 };

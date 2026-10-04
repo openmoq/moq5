@@ -922,6 +922,15 @@ typedef uint64_t moq_request_error_t;
  * Registered by draft-18 ONLY. A draft-16 peer does not know them, so a
  * draft-16 session treats them like any other unknown value.
  */
+/*
+ * Registered by draft-21 ONLY (16.11.2): a filter parameter the responder cannot
+ * accept (a Range Filter beyond MAX_FILTER_RANGES, an overflowing range, a Priority
+ * Filter value above 255, an odd property type) and filters that conflict across
+ * subscribers of a SUBSCRIBE_TRACKS.
+ */
+#define MOQ_REQUEST_ERROR_CONFLICTING_FILTERS        0x35u
+#define MOQ_REQUEST_ERROR_INVALID_FILTER             0x36u
+
 #define MOQ_REQUEST_ERROR_GOING_AWAY                 0x6u
 #define MOQ_REQUEST_ERROR_EXCESSIVE_LOAD             0x9u
 #define MOQ_REQUEST_ERROR_NAMESPACE_TOO_LARGE        0x31u
@@ -1339,6 +1348,10 @@ typedef struct moq_fetch_complete_event {
 typedef enum moq_fetch_range_kind {
     MOQ_FETCH_RANGE_NON_EXISTENT = 1,
     MOQ_FETCH_RANGE_UNKNOWN      = 2,
+    /* Draft 21 only (11.4.1.2): the objects up to this location timed out (a fill
+     * or relay fetch ran out of FILL_TIMEOUT). A receiver surfaces it; sending it is
+     * not part of the public send API yet. */
+    MOQ_FETCH_RANGE_TIMED_OUT    = 3,
 } moq_fetch_range_kind_t;
 
 typedef struct moq_fetch_object_event {
