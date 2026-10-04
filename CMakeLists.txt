@@ -544,6 +544,13 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME profile_boundary
              COMMAND ${CMAKE_COMMAND} -E env bash
                      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_profile_boundary.sh)
+    # No-network contract test for the interop-runner adapter (needs jq).
+    find_program(MOQ_JQ jq)
+    if(MOQ_JQ)
+        add_test(NAME interop_adapter_contract
+                 COMMAND ${CMAKE_COMMAND} -E env bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/interop-adapter/test-adapter.sh)
+    endif()
 endif()
 
 # -- C++ Binding ----------------------------------------------------

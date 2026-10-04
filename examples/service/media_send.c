@@ -13,11 +13,16 @@
  * payload; everything else stays the same.
  *
  * Usage: media_send <url> <namespace> [track] [--insecure-skip-verify]
+ *                   [--draft N] [--ca FILE]
  *   url        moqt://host:port (raw QUIC) or https://host:port/path (WT)
  *   namespace  slash-separated, e.g. "example"
  *   track      track name (default "video")
  *   --insecure-skip-verify  disable TLS certificate verification; for
  *              LOCAL/self-signed testing ONLY (verification is on by default)
+ *   --draft N  offer exactly this MoQT draft (16, 18 or 21); default is to
+ *              offer every draft this build supports and negotiate one
+ *   --ca FILE  PEM CA/certificate to trust instead of the system roots (only
+ *              backends that expose a CA file honor it; others reject it)
  */
 #include <moq/endpoint.h>
 #include <moq/media_sender.h>
@@ -71,6 +76,36 @@ static void payload_release(void *ctx, const uint8_t *data, size_t len)
     (void)len;
 }
 
+/* Strict draft parse: exactly "16", "18" or "21" -> that draft, anything else
+ * -> 0. atoi would silently accept "18junk" as 18 and "abc" as auto, which
+ * would falsify per-draft interop results. */
+static moq_version_t parse_draft(const char *s)
+{
+    if (strcmp(s, "16") == 0) return MOQ_VERSION_DRAFT_16;
+    if (strcmp(s, "18") == 0) return MOQ_VERSION_DRAFT_18;
+    if (strcmp(s, "21") == 0) return (moq_version_t)21;
+    return (moq_version_t)0;
+}
+
+/* Say why the endpoint ended and whether that was a failure. A handshake that
+ * never completed (certificate, ALPN, WebTransport protocol token, timeout)
+ * leaves the write loop ending early with MOQ_ERR_CLOSED; without this the
+ * process would exit 0 and look like a clean run. Returns true on a failure. */
+static bool report_terminal(const moq_endpoint_t *ep)
+{
+    moq_endpoint_terminal_t t;
+    memset(&t, 0, sizeof(t));
+    if (moq_endpoint_get_terminal(ep, &t, sizeof(t)) != MOQ_OK)
+        return false;
+    fprintf(stderr, "endpoint: negotiated draft %u, terminal reason %d, "
+            "detail 0x%llx\n", (unsigned)moq_endpoint_negotiated_version(ep),
+            (int)t.reason, (unsigned long long)t.detail_code);
+    return t.reason == MOQ_ENDPOINT_TERMINAL_PROTOCOL ||
+           t.reason == MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE ||
+           t.reason == MOQ_ENDPOINT_TERMINAL_TLS ||
+           t.reason == MOQ_ENDPOINT_TERMINAL_TRANSPORT;
+}
+
 static void drain_before_stop(moq_endpoint_t *ep)
 {
     moq_result_t dr = moq_endpoint_drain(ep, ENDPOINT_DRAIN_TIMEOUT_US);
@@ -89,8 +124,12 @@ int main(int argc, char **argv)
     if (argc < 3) {
         fprintf(stderr,
             "usage: %s <url> <namespace> [track] [--insecure-skip-verify]\n"
+            "          [--draft N] [--ca FILE]\n"
             "  --insecure-skip-verify  disable TLS certificate verification\n"
-            "                          (LOCAL/self-signed testing ONLY)\n",
+            "                          (LOCAL/self-signed testing ONLY)\n"
+            "  --draft N               offer exactly draft 16, 18 or 21\n"
+            "                          (default: offer every supported draft)\n"
+            "  --ca FILE               PEM certificate to trust\n",
             argv[0]);
         return 2;
     }
@@ -101,11 +140,24 @@ int main(int argc, char **argv)
     size_t ns_count = split_namespace(nsbuf, ns_parts, 32);
     const char *track = "video";
     bool insecure_skip_verify = false;   /* TLS verification ON by default */
+    moq_version_t pinned = (moq_version_t)0;   /* 0 = AUTO (offer all) */
+    const char *ca_file = NULL;
     for (int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--insecure-skip-verify") == 0)
+        if (strcmp(argv[i], "--insecure-skip-verify") == 0) {
             insecure_skip_verify = true;
-        else
+        } else if (strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
+            pinned = parse_draft(argv[++i]);
+            if (pinned == 0) {
+                fprintf(stderr,
+                        "error: --draft must be exactly 16, 18 or 21 "
+                        "(got \"%s\")\n", argv[i]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--ca") == 0 && i + 1 < argc) {
+            ca_file = argv[++i];
+        } else {
             track = argv[i];
+        }
     }
 
     signal(SIGINT, on_signal);
@@ -119,6 +171,18 @@ int main(int argc, char **argv)
      * operator explicitly opts in via --insecure-skip-verify (local/self-signed
      * testing). */
     ec.insecure_skip_verify = insecure_skip_verify;
+    if (ca_file) {
+        ec.ca_file.data = (const uint8_t *)ca_file;
+        ec.ca_file.len = strlen(ca_file);
+    }
+    /* A pinned draft is an EXACT offer: a peer that cannot speak it fails the
+     * connect instead of silently negotiating another draft. */
+    if (pinned != 0) {
+        ec.versions.struct_size = sizeof(moq_version_offer_t);
+        ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+        ec.versions.versions = &pinned;
+        ec.versions.version_count = 1;
+    }
 
     moq_endpoint_t *ep = NULL;
     moq_result_t rc = moq_endpoint_connect(&ec, &ep);
@@ -237,6 +301,7 @@ int main(int argc, char **argv)
     }
 
     printf("wrote %llu objects\n", sent);
+    bool failed = report_terminal(ep);
 
     /* 5. Teardown: child first, then a bounded local stream flush before the
      * endpoint's abrupt stop. The drain waits for bytes already queued in the
@@ -246,5 +311,5 @@ int main(int argc, char **argv)
     drain_before_stop(ep);
     moq_endpoint_stop(ep);
     moq_endpoint_destroy(ep);
-    return 0;
+    return failed ? 1 : 0;
 }

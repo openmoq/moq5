@@ -260,8 +260,28 @@ Full detail is in docs/draft21-wire-reference.md.
      (profile_d18.c:3064) needs its own d21 version; do not copy it.
 
 
-## TASK 2: Interop adapter for the moq5 publisher (the compliance gate)
+## TASK 2: Interop adapter for the moq5 publisher (the compliance gate) -- DONE (native QUIC)
 Build this BEFORE the codec so every later task has a pass/fail signal.
+
+Result: driven native-QUIC runs work. Draft 18 `subscribe-to-publisher-track`
+with moq5: 3 pass / 0 fail (same as the moqxr baseline). Draft 21 today ends as
+"publisher exited before connecting" (`connect failed: -14`, unsupported), the
+intended baseline for Tasks 3 and 8 to flip. Contract test registered with
+ctest as `interop_adapter_contract` (128/128 moq5 tests pass).
+
+KNOWN GAP (changes Task 10, see 10.1/10.4): WebTransport does not reach the
+runner from the `build/dev` backend. The runner admits only the current
+WebTransport profile (`webtransport-h3`, drafts 15/16 settings); moq5's
+picoquic WT backend speaks the legacy dialect and the handshake ends in a
+transport failure (terminal reason 5). Only the `wtquic-msquic` backend offers
+the current profile and no build tree enables it. This is not a d21 issue.
+`media_send` now also reports its terminal reason and exits 1 on a failed
+endpoint (it used to exit 0 after silently writing one object).
+
+Not covered by the adapter yet: per-scenario publisher modes. moqxr gets
+special flags for roughly 100 d21 probes where the runner is the subscriber;
+`media_send` has none, so those rows score its default behavior. Triage them in
+Task 10; add publisher modes only for rows the draft says a publisher must pass.
 
 Files:
   Create: tools/interop-adapter/run.sh, tools/interop-adapter/README.md
@@ -275,24 +295,25 @@ Interfaces:
   Produces: executable adapter `run.sh` with the same exit-code behavior as
             adapters/moqxr/run.sh (64 = refused request).
 
- [ ] 2.1 Read adapters/moqxr/run.sh and examples/harness/adapter.sh fully;
+ [x] 2.1 Read adapters/moqxr/run.sh and examples/harness/adapter.sh fully;
          copy the request validation block (jq) verbatim in structure.
- [ ] 2.2 Add `--draft N` to media_send.c, mapped to the version offer
+ [x] 2.2 Add `--draft N` to media_send.c, mapped to the version offer
          (struct moq_version_offer_t, policy PINNED) exactly as
          tools/moq-interop-client/main.c:426 parse_draft does (strict parse,
          reject junk). Test: run `media_send ... --draft 18` against
          moqxr-less runner d18 observed run; connection reaches SETUP.
- [ ] 2.3 Write run.sh: accepts draft 18 now, draft 21 once Task 3 lands
-         (gate: `[[ $draft == 18 || $draft == 21 ]]` -- ship with 21 refused
-         via exit 64 until Task 3, so a missing profile is not misreported
-         as a protocol failure).
- [ ] 2.4 Contract test, no network: capture-stub test modeled on
+ [x] 2.3 Write run.sh. Changed from the first draft of this plan: draft 21 is
+         NOT refused by the adapter. media_send's exact-offer connect fails
+         with UNSUPPORTED until the d21 profile exists, which the runner
+         records as "publisher exited before connecting" rather than a
+         protocol failure, so no separate gate is needed.
+ [x] 2.4 Contract test, no network: capture-stub test modeled on
          ../moq-contribution-interop-runner/tests/e2e/moqxr-adapter-contract.sh.
- [ ] 2.5 Run d18 reference scenario through the runner in driven mode:
+ [x] 2.5 Run d18 reference scenario through the runner in driven mode:
          POST /api/v1/runs {"draft":18,"transport":"native-quic",
            "mode":"driven","scenarios":["subscribe-to-publisher-track"], ...}
          Expected: state complete, scenario row pass. Record in baseline.
- [ ] 2.6 Commit: "Add interop-runner adapter for the moq5 publisher"
+ [x] 2.6 Commit: "Add interop-runner adapter for the moq5 publisher"
 
 
 ## TASK 3: Version registry and empty d21 profile
@@ -478,8 +499,10 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
 
 
 ## TASK 10: Interop acceptance and gap closure (the compliance gate)
- [ ] 10.1 Full driven runs, d21, both transports (the runner supports both):
-          native-quic and webtransport, all scenarios, via the Task 2 adapter.
+ [ ] 10.1 Full driven runs, d21, native QUIC, all scenarios, via the Task 2
+          adapter. WebTransport only if a wtquic-msquic build is available
+          (see the Task 2 known gap); otherwise record the WebTransport rows
+          as not exercised, never as passed.
           Mind runner requirement: QUIC DATAGRAM must be negotiated; native
           QUIC needs datagrams enabled in the moq5 adapter in use.
  [ ] 10.2 Triage every non-pass row into exactly one bucket and record it in
@@ -493,8 +516,9 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
           (POST run with "scenarios":[id]) -> commit "d21: <requirement id>".
  [ ] 10.4 Exit criteria:
             - 0 FAIL among publisher-applicable, testable MUST/MUST NOT rows
-              for d21 on native QUIC and WebTransport, or each remaining FAIL
-              is a DISPUTE with draft citation.
+              for d21 on native QUIC, or each remaining FAIL is a DISPUTE
+              with draft citation. WebTransport is reported separately and is
+              gating only if the wtquic-msquic backend is built.
             - `build/moq-interop-audit --draft 21` unchanged (173/173).
             - d16 and d18 runner results not worse than the Task 0 baseline
               (d18 re-run with the moq5 adapter).
