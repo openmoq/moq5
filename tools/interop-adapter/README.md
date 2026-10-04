@@ -58,6 +58,5 @@ Reaching the scenario timeout is the normal end of a context and exits 0.
   dialect, so the handshake ends in a transport failure (terminal reason 5) before
   any MoQT bytes. Only the `wtquic-msquic` backend offers the current profile, and
   no existing build tree enables it. Native QUIC is unaffected.
-- **Draft 21 does not connect until the d21 profile lands** (`connect failed: -14`,
-  unsupported). The run then ends as "publisher exited before connecting", which
-  is the intended baseline.
+- **Draft 21 connects** (native QUIC): the runner sees SETUP, MOQT_IMPLEMENTATION and the
+  publisher's request streams. Per-scenario scores are the Task 10 acceptance work.

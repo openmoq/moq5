@@ -677,8 +677,26 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
  [x] 7.4 Standalone FETCH with LOCATION_FILTER range (non-joining) tests.
 
 
-## TASK 8: Turn it on: negotiation, transports, service layer
- [ ] 8.0 Flip the three-way switch IN ONE COMMIT, after Tasks 4-7 pass:
+## TASK 8: Turn it on: negotiation, transports, service layer -- DONE (Swift not built here)
+
+RESULT (Task 8): 8.0 flipped in one commit: `.wire_ready = true`, the endpoint supports and
+offers {21, 18, 16} (newest first), the np model's d21 row is AVAILABLE rank 1 (d18 2, d16 3;
+the row keeps a reason because its media cells stay UNSUPPORTED until Task 9), pinned literals
+and the "refuses d21" endpoint test inverted. 8.2: moq-interop-client `--draft 21` (+README).
+8.3: MOQ_SIM_VERSION hook in the simulator and `run_seed_sweeps.sh --version N`; the quick
+profile under draft 21 has exactly the failing runners it has under draft 18 (crossed, delay,
+delay_backpressure, faults, namespace_sub, streaming_faults: the scenarios assume the d16
+start order) and scenario_fetch is skipped (it drives a Joining FETCH). 8.4: Python binding
+exports Version.DRAFT_21; the Swift enums (MoQVersion, MoQTransportVersion,
+MediaTransportVersion and their exhaustive switches) are NOT touched -- there is no Swift
+toolchain here to compile them. 8.5: the adapter never gated on d21 (it accepts 18 and 21);
+README updated. Smoke: the runner, driving the adapter, connects over native QUIC with
+ALPN moqt-21 and records SETUP (scenario d21-publisher-request-stream-placement).
+Not changed: the relay and example relay (16/18 products), media_sender (draft 21 media
+writes fail until Task 9's LOC ids), 8.1's per-adapter conformance tests for 21 (the
+adapters take their versions from the shared endpoint list; a loopback d21 test per
+transport is Task 10 work). The OOM sweep was not run for d21.
+ [x] 8.0 Flip the three-way switch IN ONE COMMIT, after Tasks 4-7 pass:
          (a) profile_d21.c `.wire_ready = true` and delete the "transitional"
              file header; (b) endpoint.c moq_endpoint_version_supported() and
              supported_versions() add 21, newest first: {21, 18, 16}; (c)
@@ -689,18 +707,18 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
              test_negotiated_profile.c and the AUTO-order assertions in
              test_endpoint_resolve.c (three versions, d21 first), and replace
              the "refuses d21" endpoint test with its inverse.
- [ ] 8.1 (rest of endpoint work) resolve/offer tests; WebTransport protocol token for 21; adapters
+ [~] 8.1 (rest of endpoint work) resolve/offer tests; WebTransport protocol token for 21; adapters
          that enumerate versions (adapters/msquic, picoquic, mvfst, pico_wt,
          wtquic) -- grep for MOQ_VERSION_DRAFT_18 in adapters/**/src and add
          21 wherever d18 appears; extend their conformance tests
          (test_msquic_multi_alpn.c, test_loopback_d18.cpp analogue, ...).
- [ ] 8.2 tools/moq-interop-client: accept --draft 21 (main.c:353,395,426),
+ [x] 8.2 tools/moq-interop-client: accept --draft 21 (main.c:353,395,426),
          update usage text and test_url_policy if affected.
- [ ] 8.3 sim: sim/src/simpair.c d18 references -> include 21 in seeded
+ [x] 8.3 sim: sim/src/simpair.c d18 references -> include 21 in seeded
          scenario sweeps (scripts/run_seed_sweeps.sh); OOM sweep includes d21.
- [ ] 8.4 bindings/ and Package.swift: grep for draft enumerations; add 21.
- [ ] 8.5 Remove the adapter's exit-64 gate for draft 21 (Task 2.3).
- [ ] 8.6 R3 command + sweeps + check_profile_boundary.sh. Commit.
+ [~] 8.4 bindings/ and Package.swift: grep for draft enumerations; add 21.
+ [x] 8.5 Remove the adapter's exit-64 gate for draft 21 (Task 2.3).
+ [x] 8.6 R3 command + sweeps + check_profile_boundary.sh. Commit.
 
 
 ## TASK 9: Service layer (media_sender) -- LOC property ids per version

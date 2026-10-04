@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include "simpair_internal.h"
 
 static bool cfg_has_field(const moq_simpair_cfg_t *cfg,
@@ -150,6 +151,14 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, version),
                       sizeof(cfg->version)))
         version = cfg->version;
+    /* Sweep hook: scenarios that do not pin a version run under MOQ_SIM_VERSION
+     * (16, 18 or 21) when it is set, so the seeded sweeps can cover every draft
+     * without each runner growing an option. An explicit cfg->version wins. */
+    if (version == 0) {
+        const char *env = getenv("MOQ_SIM_VERSION");
+        if (env && (!strcmp(env, "16") || !strcmp(env, "18") || !strcmp(env, "21")))
+            version = (moq_version_t)atoi(env);
+    }
     uint32_t server_max_subscriptions = 0;   /* 0 -> session default */
     if (cfg_has_field(cfg, offsetof(moq_simpair_cfg_t, server_max_subscriptions),
                       sizeof(cfg->server_max_subscriptions)))
