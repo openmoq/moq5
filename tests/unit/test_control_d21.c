@@ -1724,6 +1724,217 @@ static void t_fetch_header(void)
     MOQ_TEST_CHECK_EQ_U64(id, UINT64_MAX);
 }
 
+
+/* == 4f. GOAWAY, TRACK_STATUS, namespace messages, SUBSCRIBE_TRACKS ======== */
+
+static void t_goaway(void)
+{
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+
+    /* 9.2: New Session URI Length, URI, Timeout; no Request ID in either the
+     * control-stream or the request-stream form. Empty URI, 1000 ms. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&w, NULL, 0, 1000), (int)MOQ_OK);
+    static const uint8_t empty[] = { 0x10, 0x00, 0x03, 0x00, 0x83, 0xE8 };
+    check_bytes("GOAWAY empty URI", buf, moq_buf_writer_offset(&w), empty, sizeof(empty));
+
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&w, (const uint8_t *)"x", 1, 0), (int)MOQ_OK);
+    static const uint8_t with_uri[] = { 0x10, 0x00, 0x03, 0x01, 'x', 0x00 };
+    check_bytes("GOAWAY with URI", buf, moq_buf_writer_offset(&w), with_uri, sizeof(with_uri));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_GOAWAY);
+    moq_d21_goaway_t g;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_goaway(env.payload, env.payload_len, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.uri.len == 1 && g.uri.data[0] == 'x');
+    MOQ_TEST_CHECK_EQ_U64(g.timeout_ms, 0);
+
+    /* Timeout is a full-range vi64. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&w, NULL, 0, UINT64_MAX), (int)MOQ_OK);
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_GOAWAY);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_goaway(env.payload, env.payload_len, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(g.timeout_ms, UINT64_MAX);
+
+    /* The URI is at most 8192 bytes (9.2): 8192 passes, 8193 is refused on send
+     * and a violation on receipt. */
+    static uint8_t uri[8200];
+    memset(uri, 'u', sizeof(uri));
+    static uint8_t big[8300];
+    moq_buf_writer_t bw;
+    moq_buf_writer_init(&bw, big, sizeof(big));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&bw, uri, 8192, 1), (int)MOQ_OK);
+    moq_buf_writer_init(&bw, big, sizeof(big));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&bw, uri, 8193, 1), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&bw), 0);
+    {
+        static uint8_t body[8210];
+        size_t n = 0;
+        body[n++] = 0xA0; body[n++] = 0x01;          /* length 8193 */
+        memcpy(body + n, uri, 8193); n += 8193;
+        body[n++] = 0x00;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_goaway(body, n, &g), (int)MOQ_ERR_PROTO);
+    }
+
+    /* Draft 18's control-stream GOAWAY ended with a Request ID: URI (empty),
+     * Timeout 5, Request ID 3. Draft 21 has no such field, so the extra byte is
+     * trailing data and the message is a violation, not a GOAWAY about request 3. */
+    static const uint8_t d18_form[] = { 0x00, 0x05, 0x03 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_goaway(d18_form, sizeof(d18_form), &g), (int)MOQ_ERR_PROTO);
+    /* A truncated body is not a GOAWAY either. */
+    static const uint8_t trunc[] = { 0x00 };
+    MOQ_TEST_CHECK(moq_d21_decode_goaway(trunc, sizeof(trunc), &g) < 0);
+    static const uint8_t short_uri[] = { 0x05, 'a', 'b' };
+    MOQ_TEST_CHECK(moq_d21_decode_goaway(short_uri, sizeof(short_uri), &g) < 0);
+    /* A length with no data behind it is refused, not read from NULL. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_goaway(&w, NULL, 3, 0), (int)MOQ_ERR_INVAL);
+}
+
+static void t_track_status(void)
+{
+    /* 9.13: the SUBSCRIBE layout. Request ID 2, namespace [a], name t,
+     * INCLUDE_PROPERTIES = 0. Only AUTHORIZATION_TOKEN and INCLUDE_PROPERTIES
+     * are defined for it. */
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("a") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_include_properties = true; p.include_properties = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_track_status(&w, 2, &ns, MOQ_BYTES_LITERAL("t"), &p),
+                          (int)MOQ_OK);
+    static const uint8_t want[] = { 0x0D, 0x00, 0x09, 0x02, 0x01, 0x01, 'a', 0x01, 't', 0x01, 0x35, 0x00 };
+    check_bytes("TRACK_STATUS", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_TRACK_STATUS);
+    moq_bytes_t dparts[32];
+    moq_d21_track_status_t g;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_track_status(env.payload, env.payload_len, dparts, 32, &g),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(g.request_id, 2);
+    MOQ_TEST_CHECK(g.params.has_include_properties && g.params.include_properties == 0);
+
+    /* Delivery parameters belong to subscriptions, not status (9.13). */
+    static const uint8_t prio[] = { 0x02, 0x01, 0x01, 'a', 0x01, 't', 0x01, 0x20, 0x05 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_track_status(prio, sizeof(prio), dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    memset(&p, 0, sizeof(p));
+    p.has_subscriber_priority = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_track_status(&w, 2, &ns, MOQ_BYTES_LITERAL("t"), &p),
+                          (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+}
+
+static void t_namespace_family(void)
+{
+    uint8_t buf[96];
+    moq_buf_writer_t w;
+    moq_bytes_t dparts[40];
+    moq_d21_msg_params_t none;
+    memset(&none, 0, sizeof(none));
+
+    /* 9.14 PUBLISH_NAMESPACE: Request ID 8, namespace [a, b], no parameters. */
+    moq_bytes_t ab[] = { MOQ_BYTES_LITERAL("a"), MOQ_BYTES_LITERAL("b") };
+    moq_namespace_t ns_ab = { ab, 2 };
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_namespace(&w, 8, &ns_ab, &none), (int)MOQ_OK);
+    static const uint8_t pn[] = { 0x06, 0x00, 0x07, 0x08, 0x02, 0x01, 'a', 0x01, 'b', 0x00 };
+    check_bytes("PUBLISH_NAMESPACE", buf, moq_buf_writer_offset(&w), pn, sizeof(pn));
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_PUBLISH_NAMESPACE);
+    moq_d21_publish_namespace_t pnd;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_namespace(env.payload, env.payload_len, dparts, 40, &pnd),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(pnd.request_id, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(pnd.track_namespace.count, 2);
+
+    /* 9.15 SUBSCRIBE_NAMESPACE: the prefix may be empty (0 to 32 fields). */
+    moq_namespace_t root = { NULL, 0 };
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe_namespace(&w, 4, &root, &none), (int)MOQ_OK);
+    static const uint8_t sn[] = { 0x50, 0x00, 0x03, 0x04, 0x00, 0x00 };
+    check_bytes("SUBSCRIBE_NAMESPACE root", buf, moq_buf_writer_offset(&w), sn, sizeof(sn));
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_SUBSCRIBE_NAMESPACE);
+    moq_d21_subscribe_namespace_t snd;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_namespace(env.payload, env.payload_len, dparts, 40, &snd),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(snd.track_namespace_prefix.count, 0);
+
+    /* 9.18 SUBSCRIBE_TRACKS takes subscription parameters (9.18.1): FORWARD 1 and
+     * GROUP_ORDER 2 (which moved here from PUBLISH_OK). */
+    moq_bytes_t a1[] = { MOQ_BYTES_LITERAL("a") };
+    moq_namespace_t ns_a = { a1, 1 };
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_forward = true; p.forward = 1;
+    p.has_group_order = true; p.group_order = 2;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe_tracks(&w, 6, &ns_a, &p), (int)MOQ_OK);
+    static const uint8_t st[] = { 0x51, 0x00, 0x09, 0x06, 0x01, 0x01, 'a',
+                                  0x02, 0x10, 0x01, 0x12, 0x02 };
+    check_bytes("SUBSCRIBE_TRACKS", buf, moq_buf_writer_offset(&w), st, sizeof(st));
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_SUBSCRIBE_TRACKS);
+    moq_d21_subscribe_tracks_t std;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_tracks(env.payload, env.payload_len, dparts, 40, &std),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK(std.params.has_forward && std.params.forward == 1);
+    MOQ_TEST_CHECK(std.params.has_group_order && std.params.group_order == 2);
+
+    /* Namespace requests take only an AUTHORIZATION_TOKEN; anything else is a
+     * violation on receipt and refused on send. */
+    static const uint8_t pn_fwd[] = { 0x08, 0x01, 0x01, 'a', 0x01, 0x10, 0x01 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_namespace(pn_fwd, sizeof(pn_fwd), dparts, 40, &pnd),
+                          (int)MOQ_ERR_PROTO);
+    static const uint8_t sn_fwd[] = { 0x04, 0x00, 0x01, 0x10, 0x01 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_namespace(sn_fwd, sizeof(sn_fwd), dparts, 40, &snd),
+                          (int)MOQ_ERR_PROTO);
+    memset(&p, 0, sizeof(p));
+    p.has_forward = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe_namespace(&w, 4, &root, &p), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_namespace(&w, 4, &ns_a, &p), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+
+    /* 9.16 / 9.17 NAMESPACE and NAMESPACE_DONE carry only a suffix. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_namespace_msg(&w, &ns_a, false), (int)MOQ_OK);
+    static const uint8_t nm[] = { 0x08, 0x00, 0x03, 0x01, 0x01, 'a' };
+    check_bytes("NAMESPACE", buf, moq_buf_writer_offset(&w), nm, sizeof(nm));
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_namespace_msg(&w, &ns_a, true), (int)MOQ_OK);
+    static const uint8_t nd[] = { 0x0E, 0x00, 0x03, 0x01, 0x01, 'a' };
+    check_bytes("NAMESPACE_DONE", buf, moq_buf_writer_offset(&w), nd, sizeof(nd));
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_NAMESPACE_DONE);
+    moq_namespace_t suffix;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_namespace_msg(env.payload, env.payload_len, dparts, 40, &suffix),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(suffix.count, 1);
+    /* A zero-field suffix is the prefix itself (4.2). */
+    static const uint8_t rootsuf[] = { 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_namespace_msg(rootsuf, sizeof(rootsuf), dparts, 40, &suffix),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(suffix.count, 0);
+
+    /* Namespace limits hold in every message that carries one (8.7): 33 fields
+     * and an empty field are violations. */
+    uint8_t many[160];
+    size_t n = 0;
+    many[n++] = 0x04; many[n++] = 33;
+    for (int i = 0; i < 33; i++) { many[n++] = 0x01; many[n++] = 'x'; }
+    many[n++] = 0x00;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_namespace(many, n, dparts, 40, &snd), (int)MOQ_ERR_PROTO);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_tracks(many, n, dparts, 40, &std), (int)MOQ_ERR_PROTO);
+    n = 0; many[n++] = 33;
+    for (int i = 0; i < 33; i++) { many[n++] = 0x01; many[n++] = 'x'; }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_namespace_msg(many, n, dparts, 40, &suffix), (int)MOQ_ERR_PROTO);
+    static const uint8_t empty_field[] = { 0x01, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_namespace_msg(empty_field, sizeof(empty_field), dparts, 40, &suffix),
+                          (int)MOQ_ERR_PROTO);
+}
+
 int main(void)
 {
     t_setup_options_encode();
@@ -1752,6 +1963,9 @@ int main(void)
     t_fetch_rejects_draft18_forms();
     t_fetch_ok();
     t_fetch_header();
+    t_goaway();
+    t_track_status();
+    t_namespace_family();
 
     if (failures)
         fprintf(stderr, "test_control_d21: %d byte-vector failures\n", failures);

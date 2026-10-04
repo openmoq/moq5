@@ -573,34 +573,25 @@ MOQ_API moq_result_t moq_d21_decode_publish(const uint8_t *payload,
                                             moq_d21_publish_t *out);
 
 /*
- * GOAWAY (draft-18 §10.4), control-stream form: New Session URI (length-prefixed;
- * the client MUST send zero length), a Timeout (milliseconds; a drain hint), and
- * the Request ID (the smallest unprocessed peer Request ID). The request-stream
- * form (no Request ID; the stream identifies the request) uses the *_request
- * variants below. URI borrows from the payload.
+ * GOAWAY (draft-21 9.2): a New Session URI (length-prefixed) and a Timeout in
+ * milliseconds. Draft 21 removed the Request ID that draft 18 carried on the
+ * control-stream form, so the control-stream and request-stream forms are the same
+ * bytes; which one it is follows from the stream it arrives on. A client MUST send
+ * a zero-length URI and a server that receives a non-zero URI MUST close with
+ * PROTOCOL_VIOLATION (session-level rules); the URI is at most 8192 bytes. The URI
+ * borrows from the payload; a Timeout of 0 means "no specific timeout".
  */
 typedef struct moq_d21_goaway {
     moq_bytes_t uri;          /* borrowed from payload; NULL/0 if none */
     uint64_t    timeout_ms;
-    uint64_t    request_id;   /* control-stream form only; 0 for request-stream */
 } moq_d21_goaway_t;
 
 MOQ_API moq_result_t moq_d21_encode_goaway(moq_buf_writer_t *w,
                                            const uint8_t *uri, size_t uri_len,
-                                           uint64_t timeout_ms,
-                                           uint64_t request_id);
+                                           uint64_t timeout_ms);
 MOQ_API moq_result_t moq_d21_decode_goaway(const uint8_t *payload,
                                            size_t payload_len,
                                            moq_d21_goaway_t *out);
-
-/* Request-stream GOAWAY (§10.4): New Session URI + Timeout, no Request ID. */
-MOQ_API moq_result_t moq_d21_encode_goaway_request(moq_buf_writer_t *w,
-                                                   const uint8_t *uri,
-                                                   size_t uri_len,
-                                                   uint64_t timeout_ms);
-MOQ_API moq_result_t moq_d21_decode_goaway_request(const uint8_t *payload,
-                                                   size_t payload_len,
-                                                   moq_d21_goaway_t *out);
 
 /* REQUEST_ERROR codes (draft-21 16.11.2, 12.3). Draft 21 removed
  * DUPLICATE_SUBSCRIPTION (0x19) and INVALID_JOINING_REQUEST_ID (0x32) and added

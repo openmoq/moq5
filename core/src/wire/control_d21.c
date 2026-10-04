@@ -926,12 +926,11 @@ moq_result_t moq_d21_decode_publish(const uint8_t *payload, size_t payload_len,
 
 /* -- PUBLISH_OK (draft-18 §10.10 / §10.5) -------------------------- */
 
-/* -- GOAWAY (draft-18 §10.4) --------------------------------------- */
+/* -- GOAWAY (draft-21 9.2) ----------------------------------------- */
 
-/* Control-stream form: New Session URI + Timeout + Request ID. */
 moq_result_t moq_d21_encode_goaway(moq_buf_writer_t *w,
                                    const uint8_t *uri, size_t uri_len,
-                                   uint64_t timeout_ms, uint64_t request_id)
+                                   uint64_t timeout_ms)
 {
     if (!w) return MOQ_ERR_INVAL;
     if (uri_len > 0 && !uri) return MOQ_ERR_INVAL;
@@ -942,7 +941,6 @@ moq_result_t moq_d21_encode_goaway(moq_buf_writer_t *w,
     moq_bytes_t span = { uri, uri_len };
     if ((rc = d21_write_span(w, span)) < 0) goto fail;
     if ((rc = moq_buf_write_vi64(w, timeout_ms)) < 0) goto fail;
-    if ((rc = moq_buf_write_vi64(w, request_id)) < 0) goto fail;
     if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
     return MOQ_OK;
 fail:
@@ -963,58 +961,13 @@ moq_result_t moq_d21_decode_goaway(const uint8_t *payload, size_t payload_len,
     if (rc < 0) return rc;
     if (uri.len > 8192) return MOQ_ERR_PROTO;
     if ((rc = moq_buf_read_vi64(&r, &out->timeout_ms)) < 0) return rc;
-    if ((rc = moq_buf_read_vi64(&r, &out->request_id)) < 0) return rc;
-    /* Strict: nothing follows the Request ID on a control-stream GOAWAY. */
+    /* Strict: draft 21 has no Request ID, so anything after the Timeout (such as
+     * a draft-18 Request ID) is not part of a GOAWAY. */
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     out->uri.data = uri.len > 0 ? uri.data : NULL;
     out->uri.len = uri.len;
     return MOQ_OK;
 }
-
-/* Request-stream form (§10.4): New Session URI + Timeout, no Request ID (the
- * stream identifies the request being migrated). */
-moq_result_t moq_d21_encode_goaway_request(moq_buf_writer_t *w,
-                                           const uint8_t *uri, size_t uri_len,
-                                           uint64_t timeout_ms)
-{
-    if (!w) return MOQ_ERR_INVAL;
-    if (uri_len > 0 && !uri) return MOQ_ERR_INVAL;
-    if (uri_len > 8192) return MOQ_ERR_INVAL;
-    size_t saved = w->pos, len_off;
-    moq_result_t rc = d21_write_header(w, MOQ_D21_GOAWAY, &len_off);
-    if (rc < 0) return rc;
-    moq_bytes_t span = { uri, uri_len };
-    if ((rc = d21_write_span(w, span)) < 0) goto fail;
-    if ((rc = moq_buf_write_vi64(w, timeout_ms)) < 0) goto fail;
-    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
-    return MOQ_OK;
-fail:
-    w->pos = saved;
-    return rc;
-}
-
-moq_result_t moq_d21_decode_goaway_request(const uint8_t *payload,
-                                           size_t payload_len,
-                                           moq_d21_goaway_t *out)
-{
-    if (!out) return MOQ_ERR_INVAL;
-    if (!payload && payload_len > 0) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, payload, payload_len);
-    moq_bytes_t uri;
-    moq_result_t rc = d21_read_span(&r, &uri);
-    if (rc < 0) return rc;
-    if (uri.len > 8192) return MOQ_ERR_PROTO;
-    if ((rc = moq_buf_read_vi64(&r, &out->timeout_ms)) < 0) return rc;
-    /* Strict: no Request ID and nothing else on a request-stream GOAWAY. */
-    if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
-    out->uri.data = uri.len > 0 ? uri.data : NULL;
-    out->uri.len = uri.len;
-    return MOQ_OK;
-}
-
-/* -- TRACK_STATUS_OK (draft-18 §10.14 / §10.5) --------------------- */
 
 /* -- REQUEST_ERROR ------------------------------------------------- */
 
