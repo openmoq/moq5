@@ -1396,6 +1396,65 @@ static void t_request_stream_closure(void)
     moq_session_destroy(s);
 }
 
+/* -- Per-request GOAWAY (Task 6.6, 9.2) --------------------------------- *
+ * A GOAWAY on a request stream migrates only that request and leaves the session
+ * up; a client sends no URI and a server that receives one closes the session. */
+static size_t goaway_bytes(uint8_t *m, size_t cap, const char *uri, uint64_t timeout_ms)
+{
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, m, cap);
+    moq_d21_encode_goaway(&w, (const uint8_t *)uri, uri ? strlen(uri) : 0, timeout_ms);
+    return moq_buf_writer_offset(&w);
+}
+
+static void t_request_goaway(void)
+{
+    uint8_t m[128];
+    moq_event_t ev;
+
+    /* We are the subscriber; the publisher migrates the request. */
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_subscription_t h;
+    moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    size_t n = goaway_bytes(m, sizeof(m), "https://new.example/moq", 1500);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s, ref, m, n, false, 3), (int)MOQ_OK);
+    MOQ_TEST_CHECK(s->state != MOQ_SESS_CLOSED);
+    bool got = next_event(s, MOQ_EVENT_REQUEST_GOAWAY, &ev);
+    MOQ_TEST_CHECK(got);
+    if (got) {
+        MOQ_TEST_CHECK_EQ_SIZE(ev.u.request_goaway.new_session_uri.len, 23);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.request_goaway.timeout_ms, 1500);
+        moq_event_cleanup(&ev);
+    }
+    /* Only that request moved: the session is untouched. */
+    MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+    moq_session_destroy(s);
+
+    /* We are the publisher (a server): a subscriber's GOAWAY carries no URI. */
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_subscription_t sub = accept_new_subscription(s, 0, "ga", false);
+    (void)sub;
+    n = goaway_bytes(m, sizeof(m), "https://nope", 0);
+    (void)moq_session_on_bidi_stream_bytes(s, moq_stream_ref_from_u64(4), m, n, false, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x3);
+    moq_session_destroy(s);
+
+    s = make_session(MOQ_PERSPECTIVE_SERVER);
+    sub = accept_new_subscription(s, 0, "ga", false);
+    n = goaway_bytes(m, sizeof(m), NULL, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s, moq_stream_ref_from_u64(4), m, n, false, 3), (int)MOQ_OK);
+    MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+    if (next_event(s, MOQ_EVENT_REQUEST_GOAWAY, &ev)) moq_event_cleanup(&ev);
+    /* A GOAWAY is terminal on its stream: nothing may follow it. */
+    n = goaway_bytes(m, sizeof(m), NULL, 0);
+    (void)moq_session_on_bidi_stream_bytes(s, moq_stream_ref_from_u64(4), m, n, false, 4);
+    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK_EQ_U64(poll_close_code(s), 0x3);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1417,6 +1476,7 @@ int main(void)
     t_range_filters_declined();
     t_range_filter_types();
     t_request_stream_closure();
+    t_request_goaway();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {
