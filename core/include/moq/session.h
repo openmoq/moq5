@@ -77,6 +77,13 @@ typedef enum moq_version {
      * and negotiate the version independently of profile availability.
      */
     MOQ_VERSION_DRAFT_18 = 18,
+    /*
+     * Draft 21 (draft-ietf-moq-transport-21). Registered with its ALPN
+     * ("moqt-21") and a profile, but while the profile is still being
+     * converted from its draft-18 starting point the service endpoint does
+     * not offer it (see moq_endpoint_version_supported()).
+     */
+    MOQ_VERSION_DRAFT_21 = 21,
 } moq_version_t;
 
 /* -- Perspective --------------------------------------------------- */

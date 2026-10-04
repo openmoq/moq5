@@ -103,10 +103,13 @@ static_assert(sizeof("moqt-16") - 1u <= 255u,
               "an ALPN literal must fit the uint8_t wire length");
 static_assert(sizeof("moqt-18") - 1u <= 255u,
               "an ALPN literal must fit the uint8_t wire length");
+static_assert(sizeof("moqt-21") - 1u <= 255u,
+              "an ALPN literal must fit the uint8_t wire length");
 
 static const moq_alpn_entry_t moq_alpn_table[] = {
     MOQ_ALPN_ROW_(MOQ_VERSION_DRAFT_16, "moqt-16"),
     MOQ_ALPN_ROW_(MOQ_VERSION_DRAFT_18, "moqt-18"),
+    MOQ_ALPN_ROW_(MOQ_VERSION_DRAFT_21, "moqt-21"),
 };
 
 #undef MOQ_ALPN_ROW_

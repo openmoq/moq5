@@ -666,6 +666,27 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_UNSUPPORTED);
 
+        /* Draft 21 has a registered ALPN and a core profile, but the profile is
+         * transitional (it emits draft-18 bytes), so the endpoint refuses to
+         * offer it however it is asked: pinned, listed alone, or listed beside
+         * a supported draft. Silently dropping it from a LIST would hide the
+         * refusal. AUTO (checked above) never includes it. */
+        moq_version_t twenty_one = MOQ_VERSION_DRAFT_21;
+        c.versions.versions = &twenty_one;
+        c.versions.version_count = 1;
+        c.versions.policy = MOQ_VERSION_POLICY_EXACT;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c.versions.policy = MOQ_VERSION_POLICY_LIST;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        moq_version_t with21[] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_21 };
+        c.versions.versions = with21;
+        c.versions.version_count = 2;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        MOQ_TEST_CHECK(!moq_endpoint_version_supported(MOQ_VERSION_DRAFT_21));
+
         /* Undersized (but nonzero) offer struct is malformed. */
         c.versions.struct_size = 4;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),

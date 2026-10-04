@@ -282,7 +282,7 @@ uint64_t moq_simpair_seed(const moq_simpair_t *sp)
  * profiles that require a symmetric start are added here. */
 static bool version_requires_symmetric_start(moq_version_t version)
 {
-    return version == MOQ_VERSION_DRAFT_18;
+    return version == MOQ_VERSION_DRAFT_18 || version == MOQ_VERSION_DRAFT_21;
 }
 
 moq_result_t moq_simpair_start(moq_simpair_t *sp)

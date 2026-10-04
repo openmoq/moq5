@@ -316,36 +316,59 @@ Interfaces:
  [x] 2.6 Commit: "Add interop-runner adapter for the moq5 publisher"
 
 
-## TASK 3: Version registry and empty d21 profile
+## TASK 3: Version registry and empty d21 profile -- DONE
+
+Result: `MOQ_VERSION_DRAFT_21`, ALPN `moqt-21` and a core d21 profile exist and
+sessions can be created for them (simulator, tests). They are NOT wire ready:
+the profile is a copy of d18 and emits d18 bytes. moq5 `default`: 128/128 pass.
+`build/dev`: failing set identical to unmodified main (10 pre-existing failures,
+all pico_wt/media tests, one a -Werror=array-bounds compile error in
+test_pico_wt_managed_cfg_abi.c; not caused by this branch). `media_send --draft
+21` still refuses at connect (-14) and draft 18 still scores 3 pass.
+
+DESIGN CHANGE vs the original steps below: the signed negotiated-profile model
+ties three things together (core profile, model row, endpoint supported set) and
+says endpoint support == AVAILABLE. Declaring d21 AVAILABLE would have made
+`--draft 21` usable with d18 bytes. Instead the profile gained a `wire_ready`
+capability (true for d16/d18, false for d21) and `moq_profile_wire_ready()`;
+the model's AVAILABLE and the endpoint's supported set both mean "wire ready",
+and the d21 model row is ABSENT with a reason. The chain is enforced by tests:
+test_negotiated_profile (core <-> model), test_negotiated_profile_offer
+(model <-> endpoint), and a new endpoint test that refuses d21 as EXACT, LIST,
+or beside d18 (test_endpoint_resolve). Step 3.4 below was therefore NOT done
+(21 is deliberately not added to the endpoint); it moves to Task 8.
+
+Also needed beyond the plan: sim/src/simpair.c treats d21 like d18 for the
+symmetric SETUP start (without it a d21 sim pair never establishes).
 Files: session.h, profile.h, profile_d16.c (lookup), core/CMakeLists.txt,
        moq_alpn.h, endpoint.c, test_alpn.c, test_session_version.c.
 Produces: MOQ_VERSION_DRAFT_21, moq_d21_profile_ops(), ALPN "moqt-21".
 
- [ ] 3.1 Failing tests first.
+ [x] 3.1 Failing tests first.
      test_alpn.c EXPECT[] gains { MOQ_VERSION_DRAFT_21, "moqt-21", 7 }.
      test_session_version.c: for v in {16,18,21}
          ASSERT(moq_profile_lookup(v) != NULL);
          ASSERT(moq_profile_lookup(v)->version == v);
      Run: ctest -R "alpn|session_version" --output-on-failure   -> FAIL
- [ ] 3.2 Add `MOQ_VERSION_DRAFT_21 = 21` to moq_version_t with a comment in
+ [x] 3.2 Add `MOQ_VERSION_DRAFT_21 = 21` to moq_version_t with a comment in
          the existing style. Add the ALPN row and a
          static_assert(sizeof("moqt-21") - 1u <= 255u, ...).
- [ ] 3.3 Create profile_d21.c by COPYING profile_d18.c, set .version, rename
+ [x] 3.3 Create profile_d21.c by COPYING profile_d18.c, set .version, rename
          symbols d18->d21, add moq_d21_profile_ops() to profile.h, add the
          case to moq_profile_lookup. Wire codec calls still point at d18
          functions for now (temporary; Task 4 replaces them). Add to
          core/CMakeLists.txt in BOTH source lists (lines 25 and 84).
- [ ] 3.4 endpoint.c: moq_endpoint_version_supported() and
+ [-] 3.4 (MOVED to Task 8.1; see design change) endpoint.c: moq_endpoint_version_supported() and
          supported_versions() add 21, newest first: {21, 18, 16}. Update the
          comment that says "Both profiles". Update tests that assert the
          AUTO offer list (service/tests/test_negotiated_profile_offer.c,
          test_endpoint_resolve.c).
- [ ] 3.5 Run: ctest (R3 command)  and scripts/check_profile_boundary.sh
+ [x] 3.5 Run: ctest (R3 command)  and scripts/check_profile_boundary.sh
          Expected: PASS. NOTE: at this point a peer offering moqt-21 would
          negotiate a profile that speaks d18 bytes. Guard: do NOT enable 21
          in supported_versions() until Task 8; commit with 21 registered but
          not offered, and a TODO-free comment saying why.
- [ ] 3.6 Commit: "Register draft-21 version, ALPN and profile skeleton"
+ [x] 3.6 Commit: "Register draft-21 version, ALPN and profile skeleton"
 
 
 ## TASK 4: d21 control codec (TDD, one message family per commit)
@@ -469,8 +492,18 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
 
 
 ## TASK 8: Turn it on: negotiation, transports, service layer
- [ ] 8.1 endpoint.c: enable 21 in supported_versions() (newest first), update
-         resolve/offer tests; WebTransport protocol token for 21; adapters
+ [ ] 8.0 Flip the three-way switch IN ONE COMMIT, after Tasks 4-7 pass:
+         (a) profile_d21.c `.wire_ready = true` and delete the "transitional"
+             file header; (b) endpoint.c moq_endpoint_version_supported() and
+             supported_versions() add 21, newest first: {21, 18, 16}; (c)
+             tests/support/np/np_tables.c d21 row -> AVAILABLE, endpoint_offered
+             true, auto_rank 1 (renumber d18 to 2 and d16 to 3), drop its
+             unusable_reason only if a d21 media cell is SUPPORTED (otherwise
+             keep the reason); update the pinned literals in
+             test_negotiated_profile.c and the AUTO-order assertions in
+             test_endpoint_resolve.c (three versions, d21 first), and replace
+             the "refuses d21" endpoint test with its inverse.
+ [ ] 8.1 (rest of endpoint work) resolve/offer tests; WebTransport protocol token for 21; adapters
          that enumerate versions (adapters/msquic, picoquic, mvfst, pico_wt,
          wtquic) -- grep for MOQ_VERSION_DRAFT_18 in adapters/**/src and add
          21 wherever d18 appears; extend their conformance tests

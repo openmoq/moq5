@@ -84,6 +84,18 @@ typedef struct moq_profile_ops {
      */
     moq_version_t version;
 
+    /*
+     * Capability: true when this profile is complete enough to speak to a real
+     * peer. A profile can exist before it is (draft 21 began as a copy of
+     * draft 18 and emits draft-18 bytes until its slots are converted): it can
+     * be created for the simulator and for tests, but it must not be reachable
+     * from the wire. The endpoint's supported set and the negotiated-profile
+     * model's AVAILABLE state both mean "wire ready"; moq_profile_wire_ready()
+     * is the single query. Draft 16 and 18 set it; a profile that omits it
+     * reads false and stays off the wire rather than leaking out by default.
+     */
+    bool wire_ready;
+
     size_t state_size;
     size_t state_align;
 
@@ -478,8 +490,16 @@ typedef struct moq_profile_ops {
 
 const moq_profile_ops_t *moq_profile_lookup(moq_version_t version);
 
+/* True iff a profile exists for `version` AND it is wire ready (see
+ * moq_profile_ops_t.wire_ready). NULL-safe for unknown versions: false. */
+bool moq_profile_wire_ready(moq_version_t version);
+
 /* Draft-18 profile ops (defined in profile_d18.c). Returned by
  * moq_profile_lookup for MOQ_VERSION_DRAFT_18. */
 const moq_profile_ops_t *moq_d18_profile_ops(void);
+
+/* Draft-21 profile ops (defined in profile_d21.c). Returned by
+ * moq_profile_lookup for MOQ_VERSION_DRAFT_21. */
+const moq_profile_ops_t *moq_d21_profile_ops(void);
 
 #endif /* MOQ_PROFILE_H */

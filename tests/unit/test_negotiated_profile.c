@@ -49,7 +49,7 @@ static void t_tables(void)
     size_t nt = 0, nm = 0, nc = 0, np_ = 0;
     (void)np_transports(&nt); (void)np_medias(&nm);
     (void)np_cells(&nc);      (void)np_pairs(&np_);
-    MOQ_TEST_CHECK_EQ_SIZE(nt, 2);
+    MOQ_TEST_CHECK_EQ_SIZE(nt, 3);
     MOQ_TEST_CHECK_EQ_SIZE(nm, 2);
     MOQ_TEST_CHECK_EQ_SIZE(nc, nt * nm);
     MOQ_TEST_CHECK_EQ_SIZE(np_, 1);
@@ -68,6 +68,38 @@ static void t_tables(void)
         /* AUTO offers the NEWEST draft first */
         MOQ_TEST_CHECK_EQ_INT(d18->auto_rank, 1);
         MOQ_TEST_CHECK_EQ_INT(d16->auto_rank, 2);
+    }
+
+    /* Draft 21: a core profile and a registered ALPN exist, but the profile is
+     * transitional (not wire ready), so its row is ABSENT: not offered, no AUTO
+     * rank, a reason on the row, and no supported media. A regression that
+     * made it available or offered it would put a draft-18-bytes profile on
+     * the wire. The profile itself exists for the simulator and tests. */
+    MOQ_TEST_CHECK(moq_profile_lookup(MOQ_VERSION_DRAFT_21) != NULL);
+    MOQ_TEST_CHECK(!moq_profile_wire_ready(MOQ_VERSION_DRAFT_21));
+    MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_16));
+    MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_18));
+    const np_transport_row_t *d21 = np_transport_by_draft(21);
+    MOQ_TEST_CHECK(d21 != NULL);
+    if (d21) {
+        MOQ_TEST_CHECK(strcmp(d21->alpn, "moqt-21") == 0);
+        MOQ_TEST_CHECK(d21->enc == NP_ENC_VI64);
+        MOQ_TEST_CHECK_EQ_U64(d21->int_max, NP_VI64_MAX);
+        MOQ_TEST_CHECK(d21->state == NP_T_ABSENT);
+        MOQ_TEST_CHECK(!d21->endpoint_offered);
+        MOQ_TEST_CHECK_EQ_INT(d21->auto_rank, NP_AUTO_RANK_NONE);
+        MOQ_TEST_CHECK(d21->unusable_reason && d21->unusable_reason[0]);
+    }
+    {
+        const np_cell_row_t *c1 = np_cell(21, "loc01");
+        const np_cell_row_t *c2 = np_cell(21, "loc02");
+        MOQ_TEST_CHECK(c1 && c2);
+        if (c1 && c2) {
+            MOQ_TEST_CHECK(c1->state == NP_C_UNSUPPORTED);
+            MOQ_TEST_CHECK(c2->state == NP_C_UNSUPPORTED);
+            MOQ_TEST_CHECK(c1->reason && c1->reason[0]);
+            MOQ_TEST_CHECK(c2->reason && c2->reason[0]);
+        }
     }
 
     /* the reviewed media facts, including the id collision that motivates
@@ -634,9 +666,11 @@ static void t_drift_gate(void)
     for (unsigned v = 0; v <= 255; v++) {
         moq_version_t ver = (moq_version_t)v;
         const np_transport_row_t *row = np_transport_by_draft(v);
-        bool product_has_profile = (moq_profile_lookup(ver) != NULL);
+        /* AVAILABLE means wire ready: a profile that exists only for the
+         * simulator (draft 21 while transitional) is declared ABSENT. */
+        bool product_has_profile = moq_profile_wire_ready(ver);
 
-        /* declared AVAILABLE <=> the core has a profile for it */
+        /* declared AVAILABLE <=> the core has a wire-ready profile for it */
         if (row && row->state == NP_T_AVAILABLE) {
             if (!product_has_profile) {
                 fprintf(stderr, "FAIL: drift: draft %u declared AVAILABLE but "

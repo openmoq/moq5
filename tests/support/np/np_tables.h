@@ -28,8 +28,9 @@
 
 typedef enum {
     NP_T_UNKNOWN   = 0,
-    NP_T_AVAILABLE = 1,   /* a profile for this draft is linked in */
-    NP_T_ABSENT    = 2,   /* registered upstream, not built here */
+    NP_T_AVAILABLE = 1,   /* a wire-ready profile for this draft is linked in */
+    NP_T_ABSENT    = 2,   /* registered, but no wire-ready profile here: not
+                           * built, or built but still transitional */
 } np_transport_state_t;
 
 #define NP_AUTO_RANK_NONE 0   /* not in the AUTO offer at all */
@@ -47,8 +48,9 @@ typedef struct {
      * Why this transport cannot carry media, when it cannot. REQUIRED
      * non-empty in exactly two situations, and forbidden otherwise:
      *
-     *   - state == ABSENT: the ALPN is registered but no profile is built
-     *     here, so the row exists to be compared against, not used;
+     *   - state == ABSENT: the ALPN is registered but no wire-ready profile
+     *     is built here (none, or one still transitional), so the row exists
+     *     to be compared against, not used;
      *   - state == AVAILABLE with no SUPPORTED cell against an IMPLEMENTED
      *     media profile: an available transport that carries nothing is a
      *     declaration, not an oversight, and must say why.

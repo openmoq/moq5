@@ -23,6 +23,7 @@ add_library(moq-core
     src/session/session_auth.c
     src/session/profile_d16.c
     src/session/profile_d18.c
+    src/session/profile_d21.c
     src/facade/publisher.c
     src/facade/subscriber.c
     src/bridge/transport_bridge.c
@@ -82,6 +83,7 @@ if(MOQ_BUILD_TESTS)
         src/session/session_subgroup.c src/session/session_receive.c
         src/session/session_auth.c src/session/profile_d16.c
         src/session/profile_d18.c
+        src/session/profile_d21.c
         src/facade/publisher.c src/facade/subscriber.c
         src/bridge/transport_bridge.c
         src/url.c

@@ -4763,6 +4763,7 @@ static moq_request_error_t d16_semantic_request_error(uint64_t raw)
 
 static const moq_profile_ops_t d16_ops = {
     .version                = MOQ_VERSION_DRAFT_16,
+    .wire_ready             = true,
     .state_size             = sizeof(moq_d16_profile_state_t),
     .state_align            = _Alignof(moq_d16_profile_state_t),
     .init_in_place          = d16_init_in_place,
@@ -4840,6 +4841,12 @@ static const moq_profile_ops_t d16_ops = {
     .validate_inbound_request_stream = NULL,
 };
 
+bool moq_profile_wire_ready(moq_version_t version)
+{
+    const moq_profile_ops_t *p = moq_profile_lookup(version);
+    return p != NULL && p->wire_ready;
+}
+
 const moq_profile_ops_t *moq_profile_lookup(moq_version_t version)
 {
     switch (version) {
@@ -4847,6 +4854,8 @@ const moq_profile_ops_t *moq_profile_lookup(moq_version_t version)
         return &d16_ops;
     case MOQ_VERSION_DRAFT_18:
         return moq_d18_profile_ops();
+    case MOQ_VERSION_DRAFT_21:
+        return moq_d21_profile_ops();
     default:
         return NULL;
     }
