@@ -327,6 +327,60 @@ void moq_resolve_filter_window(moq_subscribe_filter_t filter,
     }
 }
 
+/* Draft-21 Location Filter -> window (9.20.10), exact for every field count the
+ * wire allows. One field is a relative start ({Largest.Group + 1 - N, 0}; 0 =
+ * Next Group), two zero fields are the Next Object, anything else starts at the
+ * absolute Location; a third field ends the window at StartGroup + delta (whole
+ * group) and a fourth makes the end Object inclusive. With no largest known the
+ * relative forms open from the origin, as the four-type resolver does. Callers
+ * pass a filter that is present with at least one field. */
+void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
+                                   bool has_snap,
+                                   uint64_t snap_group, uint64_t snap_object,
+                                   uint64_t ceiling,
+                                   moq_resolved_window_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->has_window = true;
+
+    if (lf->field_count == 1) {
+        out->filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        if (!has_snap) return;
+        if (lf->start_group == 0) {
+            out->unsatisfiable = moq_loc_successor(
+                snap_group, ceiling, ceiling,
+                &out->start_group, &out->start_object);
+        } else {
+            uint64_t back = lf->start_group - 1u;
+            out->start_group = back > snap_group ? 0 : snap_group - back;
+            out->start_object = 0;
+        }
+        return;
+    }
+    if (lf->field_count == 2 && lf->start_group == 0 && lf->start_object == 0) {
+        out->filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+        if (!has_snap) return;
+        out->unsatisfiable = moq_loc_successor(
+            snap_group, snap_object, ceiling,
+            &out->start_group, &out->start_object);
+        return;
+    }
+    out->filter = lf->field_count >= 3 ? MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE
+                                       : MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    out->start_group = lf->start_group;
+    out->start_object = lf->start_object;
+    if (lf->field_count >= 3) {
+        out->has_end = true;
+        out->end_group = lf->end_group_delta > UINT64_MAX - lf->start_group
+                             ? UINT64_MAX
+                             : lf->start_group + lf->end_group_delta;
+    }
+    if (lf->field_count == 4) {
+        out->has_end_object = true;
+        out->end_object = lf->end_object;
+    }
+}
+
 /* -- Public API ----------------------------------------------------- */
 
 moq_result_t moq_session_note_object_published(

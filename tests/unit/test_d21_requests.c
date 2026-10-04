@@ -928,6 +928,124 @@ static void t_error_semantics(void)
     MOQ_TEST_CHECK_EQ_U64(d21->semantic_request_error(UINT64_MAX), MOQ_REQUEST_ERROR_INTERNAL_ERROR);
 }
 
+/* -- exact window resolution from the wire Location Filter (Task 6.1) --- */
+static moq_decoded_loc_filter_t dlf(uint8_t n, uint64_t sg, uint64_t so, uint64_t dg, uint64_t eo)
+{
+    moq_decoded_loc_filter_t f;
+    memset(&f, 0, sizeof(f));
+    f.present = true; f.field_count = n; f.start_group = sg; f.start_object = so;
+    f.end_group_delta = dg; f.end_object = eo;
+    return f;
+}
+
+static void t_resolve_loc_filter_window(void)
+{
+    const uint64_t ceil = UINT64_MAX;
+    moq_resolved_window_t w;
+    moq_decoded_loc_filter_t f;
+
+    /* One field is a relative start from the largest {7,2}: 0 = Next Group {8,0},
+     * 1 = the current group {7,0}, 3 = two groups back {5,0}; past the origin it
+     * clamps to group 0. */
+    f = dlf(1, 0, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.has_window && !w.has_end && w.start_group == 8 && w.start_object == 0);
+    f = dlf(1, 1, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 7 && w.start_object == 0);
+    f = dlf(1, 3, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 5 && w.start_object == 0);
+    f = dlf(1, 100, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 0 && w.start_object == 0);
+    /* No largest known: open from the origin. */
+    f = dlf(1, 3, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, false, 0, 0, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 0 && w.start_object == 0 && !w.unsatisfiable);
+    /* Next Group past the ceiling cannot be represented. */
+    f = dlf(1, 0, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, UINT64_MAX, 0, ceil, &w);
+    MOQ_TEST_CHECK(w.unsatisfiable);
+
+    /* Two zero fields: the Next Object, {7,3}. */
+    f = dlf(2, 0, 0, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 7 && w.start_object == 3 && !w.has_end);
+    /* Absolute start, including group 0 object 1 and group 1 object 0. */
+    f = dlf(2, 0, 1, 0, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 0 && w.start_object == 1);
+
+    /* Three fields: end group = start + delta, whole end group. */
+    f = dlf(3, 5, 3, 4, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.start_group == 5 && w.start_object == 3 && w.has_end &&
+                   w.end_group == 9 && !w.has_end_object);
+    /* Four fields: the end Object is inclusive. */
+    f = dlf(4, 5, 3, 4, 7);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.has_end && w.end_group == 9 && w.has_end_object && w.end_object == 7);
+    /* A delta that would pass 2^64-1 saturates rather than wrapping. */
+    f = dlf(3, 5, 0, UINT64_MAX, 0);
+    moq_resolve_loc_filter_window(&f, true, 7, 2, ceil, &w);
+    MOQ_TEST_CHECK(w.has_end && w.end_group == UINT64_MAX);
+}
+
+/* An inbound SUBSCRIBE's exact filter reaches the accepted window, so a relative
+ * start and an end Object are enforced rather than approximated. */
+static void t_inbound_window(void)
+{
+    typedef struct { const char *what; moq_d21_location_filter_t f;
+                     uint64_t sg, so; bool has_end; uint64_t eg; bool has_eo; uint64_t eo; } wc_t;
+    const wc_t cases[] = {
+        { "relative 3",   lf(1,3,0,0,0),   5, 0, false, 0, false, 0 },
+        { "end object",   lf(4,5,3,4,7),   5, 3, true,  9, true,  7 },
+        { "whole end grp", lf(3,5,3,4,0),  5, 3, true,  9, false, 0 },
+    };
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_note_object_published(s, &ns, lit("w0"), 7, 2), (int)MOQ_OK);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char track[8];
+        snprintf(track, sizeof(track), "w%zu", i);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_note_object_published(s, &ns, lit(track), 7, 2), (int)MOQ_OK);
+        moq_d21_msg_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.has_location_filter = true;
+        p.location_filter = cases[i].f;
+        uint8_t msg[96];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, i * 2, &ns, lit(track), &p), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4 * (i + 1), msg, moq_buf_writer_offset(&w)), (int)MOQ_OK);
+        moq_event_t ev;
+        MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
+        moq_subscription_t sub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+        moq_accept_subscribe_cfg_t acc;
+        memset(&acc, 0, sizeof(acc));
+        acc.struct_size = sizeof(acc);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(s, sub, &acc, 2), (int)MOQ_OK);
+        const moq_resolved_window_t *rw = moq_session_sub_resolved_window(s, sub);
+        MOQ_TEST_CHECK(rw != NULL);
+        if (rw) {
+            if (rw->start_group != cases[i].sg || rw->start_object != cases[i].so ||
+                rw->has_end != cases[i].has_end || rw->end_group != cases[i].eg ||
+                rw->has_end_object != cases[i].has_eo || rw->end_object != cases[i].eo) {
+                fprintf(stderr, "FAIL: inbound window %s: %llu:%llu end %d/%llu eo %d/%llu\n", cases[i].what,
+                        (unsigned long long)rw->start_group, (unsigned long long)rw->start_object,
+                        rw->has_end, (unsigned long long)rw->end_group,
+                        rw->has_end_object, (unsigned long long)rw->end_object);
+                failures++;
+            }
+        }
+        { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+    }
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -944,6 +1062,8 @@ int main(void)
     t_accept_publish_is_bare();
     t_state_notify();
     t_error_semantics();
+    t_resolve_loc_filter_window();
+    t_inbound_window();
     if (failures) {
         fprintf(stderr, "test_d21_requests: %d failures\n", failures);
         return 1;

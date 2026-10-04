@@ -116,6 +116,18 @@ typedef struct moq_setup_params {
  * (defined below, after the entry structs). */
 typedef struct moq_track_hist moq_track_hist_t;
 
+/* Draft-21 Location Filter exactly as on the wire (see the comment where it is
+ * produced, below the decoded-message section); defined here so entries can keep it. */
+typedef struct moq_decoded_loc_filter {
+    bool     present;             /* a LOCATION_FILTER parameter was on the wire */
+    uint8_t  field_count;         /* 0..4; 0 = a zero-length (remove / whole) filter */
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group_delta;     /* raw delta from start_group */
+    uint64_t end_object;
+    bool     approximated;
+} moq_decoded_loc_filter_t;
+
 /*
  * Resolved subscription filter window. Stored
  * on the publisher-role entry at accept / REQUEST_UPDATE against ONE registry
@@ -137,6 +149,8 @@ typedef struct moq_resolved_window {
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;      /* valid iff has_end */
+    bool                   has_end_object; /* draft 21: End Object bounds End Group */
+    uint64_t               end_object;     /* valid iff has_end_object; inclusive */
 } moq_resolved_window_t;
 
 typedef enum moq_sub_state {
@@ -224,6 +238,7 @@ typedef struct moq_sub_entry {
     uint64_t req_start_group;
     uint64_t req_start_object;
     uint64_t req_end_group;
+    moq_decoded_loc_filter_t req_loc;   /* draft 21: the exact filter, re-resolved on update */
     /* Resolved subscription window (publisher role), stored against the accept /
      * REQUEST_UPDATE snapshot; reached via the package-internal accessor. */
     moq_resolved_window_t window;
@@ -837,6 +852,11 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * no snapshot resolve to an open window from the origin (never unsatisfiable);
  * at-ceiling relative filters set `unsatisfiable`.
  */
+void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
+                                   bool has_snap,
+                                   uint64_t snap_group, uint64_t snap_object,
+                                   uint64_t ceiling,
+                                   moq_resolved_window_t *out);
 void moq_resolve_filter_window(moq_subscribe_filter_t filter,
                                uint64_t raw_start_group,
                                uint64_t raw_start_object,
@@ -2289,15 +2309,6 @@ typedef struct moq_request_update_encode_args {
  * through here in full, so the core can finish the semantics (plan Tasks 6 and 7)
  * without the wire layer changing again. `approximated` says the four-type fields
  * only approximate the request; `present` is false for profiles without these. */
-typedef struct moq_decoded_loc_filter {
-    bool     present;             /* a LOCATION_FILTER parameter was on the wire */
-    uint8_t  field_count;         /* 0..4; 0 = a zero-length (remove / whole) filter */
-    uint64_t start_group;
-    uint64_t start_object;
-    uint64_t end_group_delta;     /* raw delta from start_group */
-    uint64_t end_object;
-    bool     approximated;
-} moq_decoded_loc_filter_t;
 
 typedef struct moq_decoded_fill {
     bool     present;             /* FILL_PARAMETERS carried: a fill is requested */

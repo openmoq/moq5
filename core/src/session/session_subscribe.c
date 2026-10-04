@@ -212,6 +212,7 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     e->req_start_group = 0;
     e->req_start_object = 0;
     e->req_end_group = 0;
+    memset(&e->req_loc, 0, sizeof(e->req_loc));
     /* Release the owned deferred-done reason exactly once and clear the
      * Stream-Count gating state so a recycled slot starts ungated. */
     if (e->done_reason_buf) {
@@ -725,6 +726,7 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     entry->req_start_group = d->start_group;
     entry->req_start_object = d->start_object;
     entry->req_end_group = d->end_group;
+    entry->req_loc = d->loc_filter;
     entry->forward = d->forward;
     d->endpoint.kind = MOQ_REQ_SUBSCRIPTION;
     d->endpoint.slot = slot;
@@ -2791,7 +2793,13 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
         e->req_start_group = d->start_group;
         e->req_start_object = d->start_object;
         e->req_end_group = d->end_group;
-        moq_resolve_filter_window(d->filter_type,
+        e->req_loc = d->loc_filter;
+        if (d->loc_filter.present && d->loc_filter.field_count > 0)
+            moq_resolve_loc_filter_window(&d->loc_filter,
+                                  usnap_has, usnap_g, usnap_o,
+                                  s->profile->location_varint_max, &e->window);
+        else
+            moq_resolve_filter_window(d->filter_type,
                                   d->start_group, d->start_object, d->end_group,
                                   usnap_has, usnap_g, usnap_o,
                                   s->profile->location_varint_max, &e->window);
@@ -3210,7 +3218,12 @@ moq_result_t moq_session_accept_subscribe(
      * against the SAME snapshot. The facade installs this window via
      * moq_session_sub_resolved_window. */
     if (snap_has && shist) track_hist_merge(shist, snap_g, snap_o);
-    moq_resolve_filter_window(s->subs[slot].filter_type,
+    if (s->subs[slot].req_loc.present && s->subs[slot].req_loc.field_count > 0)
+        moq_resolve_loc_filter_window(&s->subs[slot].req_loc,
+                                      snap_has, snap_g, snap_o, loc_max,
+                                      &s->subs[slot].window);
+    else
+        moq_resolve_filter_window(s->subs[slot].filter_type,
                               s->subs[slot].req_start_group,
                               s->subs[slot].req_start_object,
                               s->subs[slot].req_end_group,

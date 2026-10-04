@@ -427,6 +427,9 @@ static bool window_admits(const moq_resolved_window_t *w,
         (group_id == w->start_group && object_id < w->start_object))
         return false;
     if (w->has_end && group_id > w->end_group) return false;
+    if (w->has_end_object && group_id == w->end_group &&
+        object_id > w->end_object)
+        return false;
     return true;
 }
 
