@@ -1455,6 +1455,44 @@ static void t_request_goaway(void)
     moq_session_destroy(s);
 }
 
+/* -- End of Timed-Out Range (Task 6.8, 11.4.1.2) ------------------------- */
+static void t_timed_out_range(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_bytes_t parts[1];
+    moq_d21_fetch_t f;
+    memset(&f, 0, sizeof(f));
+    f.request_id = 0; f.track_namespace = ns_live(parts); f.track_name = lit("v");
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_fetch(&w, &f);
+    feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    moq_event_t ev;
+    MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
+    moq_fetch_t fh = ev.u.fetch_request.fetch;
+    moq_event_cleanup(&ev);
+    moq_accept_fetch_cfg_t acc;
+    moq_accept_fetch_cfg_init(&acc);
+    acc.end_group = 9; acc.end_object = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_fetch(s, fh, &acc, 2), (int)MOQ_OK);
+    { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_range(s, fh, MOQ_FETCH_RANGE_TIMED_OUT, 3, 5, 3), (int)MOQ_OK);
+    /* The marker rides the data stream: Serialization Flags 0x20C, then the Location. */
+    bool found = false;
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) {
+        if (a.kind == MOQ_ACTION_SEND_DATA && a.u.send_data.header_len == 4) {
+            static const uint8_t want[] = { 0x82, 0x0C, 0x03, 0x05 };   /* vi64 0x20C = 82 0C */
+            found = memcmp(a.u.send_data.header, want, sizeof(want)) == 0;
+        }
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK(found);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1477,6 +1515,7 @@ int main(void)
     t_range_filter_types();
     t_request_stream_closure();
     t_request_goaway();
+    t_timed_out_range();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

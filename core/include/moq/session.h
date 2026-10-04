@@ -1349,8 +1349,8 @@ typedef enum moq_fetch_range_kind {
     MOQ_FETCH_RANGE_NON_EXISTENT = 1,
     MOQ_FETCH_RANGE_UNKNOWN      = 2,
     /* Draft 21 only (11.4.1.2): the objects up to this location timed out (a fill
-     * or relay fetch ran out of FILL_TIMEOUT). A receiver surfaces it; sending it is
-     * not part of the public send API yet. */
+     * or relay fetch ran out of FILL_TIMEOUT). A receiver surfaces it, and the write_fetch_range
+     * calls send it; a draft without it refuses it with MOQ_ERR_INVAL. */
     MOQ_FETCH_RANGE_TIMED_OUT    = 3,
 } moq_fetch_range_kind_t;
 

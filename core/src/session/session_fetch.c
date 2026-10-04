@@ -2048,7 +2048,10 @@ moq_result_t moq_session_write_fetch_range(
     uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
+    /* TIMED_OUT is draft 21 only; a profile without it refuses it when it
+     * encodes the marker, before anything is queued. */
+    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN &&
+        kind != MOQ_FETCH_RANGE_TIMED_OUT)
         return MOQ_ERR_INVAL;
     return fetch_range_marker(s, fetch, kind, group_id, object_id, now_us);
 }
@@ -2061,7 +2064,10 @@ moq_result_t moq_session_write_fetch_range_before_group(
     uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN)
+    /* TIMED_OUT is draft 21 only; a profile without it refuses it when it
+     * encodes the marker, before anything is queued. */
+    if (kind != MOQ_FETCH_RANGE_NON_EXISTENT && kind != MOQ_FETCH_RANGE_UNKNOWN &&
+        kind != MOQ_FETCH_RANGE_TIMED_OUT)
         return MOQ_ERR_INVAL;
     if (first_group == 0) return MOQ_ERR_INVAL;   /* nothing precedes group 0 */
     /* The profile owns the draft's maximum encodable object id; the marker's
