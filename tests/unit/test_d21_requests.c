@@ -1053,15 +1053,20 @@ static void t_inbound_window(void)
 
 /* Append one Range Filter parameter (SetID 0, Start 5) to a message built with no
  * parameters: it ends in the zero parameter count. Returns the new length. */
-static size_t add_range_filter(uint8_t *m, size_t n)
+static size_t add_range_filter_bytes(uint8_t *m, size_t n, const uint8_t *rf, size_t rflen)
 {
-    static const uint8_t rf[] = { 0x01, 0x26, 0x02, 0x00, 0x05 };
-    m[n - 1] = rf[0];
-    memcpy(m + n, rf + 1, sizeof(rf) - 1);
-    n += sizeof(rf) - 1;
-    uint16_t len = (uint16_t)(((uint16_t)m[1] << 8 | m[2]) + (sizeof(rf) - 1));
+    m[n - 1] = 0x01;                      /* one parameter */
+    memcpy(m + n, rf, rflen);
+    n += rflen;
+    uint16_t len = (uint16_t)(((uint16_t)m[1] << 8 | m[2]) + rflen);
     m[1] = (uint8_t)(len >> 8); m[2] = (uint8_t)len;     /* 16-bit envelope length */
     return n;
+}
+
+static size_t add_range_filter(uint8_t *m, size_t n)
+{
+    static const uint8_t rf[] = { 0x26, 0x02, 0x00, 0x05 };
+    return add_range_filter_bytes(m, n, rf, sizeof(rf));
 }
 
 static bool took_invalid_filter(moq_session_t *s)
@@ -1269,6 +1274,43 @@ static void t_accept_publish_followup_update(void)
     moq_session_destroy(s);
 }
 
+/* Every Range Filter type a SUBSCRIBE may carry is declined, not just one (0x29 is
+ * allowed on SUBSCRIBE_TRACKS only; on a SUBSCRIBE it is a parameter the message
+ * does not take, which the codec refuses as a protocol violation); a Length-0 filter means "no
+ * filter" (8.6) and is not a Range Filter at all. */
+static void t_range_filter_types(void)
+{
+    static const struct { const char *what; uint8_t b[6]; size_t n; bool declined; } cases[] = {
+        { "0x25 type 1",     { 0x25, 0x02, 0x00, 0x05 },       4, true },
+        { "0x26 type 2",     { 0x26, 0x02, 0x00, 0x05 },       4, true },
+        { "0x27 type 3",     { 0x27, 0x02, 0x00, 0x05 },       4, true },
+        { "0x28 with prop",  { 0x28, 0x03, 0x00, 0x02, 0x05 }, 5, true },
+        { "0x26 length 0",   { 0x26, 0x00 },                   2, false },
+    };
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+        moq_d21_msg_params_t p;
+        memset(&p, 0, sizeof(p));
+        uint8_t msg[96];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        moq_d21_encode_subscribe(&w, 0, &ns, lit("v"), &p);
+        size_t n = add_range_filter_bytes(msg, moq_buf_writer_offset(&w), cases[i].b, cases[i].n);
+        MOQ_TEST_CHECK_EQ_INT((int)feed_request(s, 4, msg, n), (int)MOQ_OK);
+        moq_event_t ev;
+        bool surfaced = next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev);
+        if (surfaced) moq_event_cleanup(&ev);
+        if (surfaced == cases[i].declined || (cases[i].declined && !took_invalid_filter(s)) ||
+            s->state == MOQ_SESS_CLOSED) {
+            fprintf(stderr, "FAIL: range filter %s\n", cases[i].what);
+            failures++;
+        }
+        moq_session_destroy(s);
+    }
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1288,6 +1330,7 @@ int main(void)
     t_resolve_loc_filter_window();
     t_inbound_window();
     t_range_filters_declined();
+    t_range_filter_types();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {
