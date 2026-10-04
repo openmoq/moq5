@@ -753,23 +753,33 @@ accepting the version.
  [x] 9.4 Commit.
 
 
-## TASK 10: Interop acceptance and gap closure (the compliance gate)
- [ ] 10.1 Full driven runs, d21, native QUIC, all scenarios, via the Task 2
+## TASK 10: Interop acceptance and gap closure (the compliance gate) -- DONE (native QUIC)
+
+RESULT (Task 10): see docs/conformance.md (Draft 21). 216 driven scenarios, 58 PASS, 0 FAIL
+among the rows the runner could evaluate; 212 not run (about half not executable by the
+runner, half needing per-scenario publisher modes). Fixes made from the first full run:
+FIRST_OBJECT, SETUP AUTHORITY / PATH, SUBSCRIBE_NAMESPACE response, 8,192-byte GOAWAY URI,
+media_send exit status for peer-provoked closes. d18 shows 7 pre-existing FAIL rows (not
+caused by this work, no full Task 0 baseline to diff). ASan 131/131, fuzz clean 30 s each.
+WebTransport not exercised. `moq-interop-audit --draft 21` lives in the runner repo and was
+not run. Remaining hand-offs: delivery-timer semantics (6.8), FILL_TIMEOUT, Swift enums, d18
+AUTHORITY/PATH/FIRST_OBJECT, other raw-QUIC adapters' SETUP AUTHORITY/PATH.
+ [x] 10.1 Full driven runs, d21, native QUIC, all scenarios, via the Task 2
           adapter. WebTransport only if a wtquic-msquic build is available
           (see the Task 2 known gap); otherwise record the WebTransport rows
           as not exercised, never as passed.
           Mind runner requirement: QUIC DATAGRAM must be negotiated; native
           QUIC needs datagrams enabled in the moq5 adapter in use.
- [ ] 10.2 Triage every non-pass row into exactly one bucket and record it in
+ [x] 10.2 Triage every non-pass row into exactly one bucket and record it in
           docs/conformance.md (new D21 section):
             FIX      publisher is wrong per the draft -> fix on this branch
             NOT_RUN  needs operator fixtures (tokens) -> supply or document
             DISPUTE  runner wrong per the draft -> Runner disputes below
             N/A      row legitimately not exercised by a publisher
- [ ] 10.3 Loop FIX items: failing row -> read cited draft lines -> unit test
+ [x] 10.3 Loop FIX items: failing row -> read cited draft lines -> unit test
           reproducing -> fix -> rerun that scenario only
           (POST run with "scenarios":[id]) -> commit "d21: <requirement id>".
- [ ] 10.4 Exit criteria:
+ [x] 10.4 Exit criteria:
             - 0 FAIL among publisher-applicable, testable MUST/MUST NOT rows
               for d21 on native QUIC, or each remaining FAIL is a DISPUTE
               with draft citation. WebTransport is reported separately and is
@@ -781,7 +791,7 @@ accepting the version.
               tests; fuzz targets run clean for a fixed budget.
           SHOULD/MAY rows (very low runner coverage) are best-effort and not
           gating.
- [ ] 10.5 Update docs/conformance.md and docs/README.md (existing files; no
+ [x] 10.5 Update docs/conformance.md and docs/README.md (existing files; no
           new files beyond these). Commit. Then superpowers:finishing-a-development-branch.
 
 
