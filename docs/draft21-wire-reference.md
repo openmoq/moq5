@@ -312,6 +312,20 @@ Stream reset codes (16.11.4): unchanged.
   it against the draft's delta rules in 11.4.1.1; settle by a test.
 - **A3: empty 9.20.2 table.** The per-message parameter table is empty in the
   checked-in draft text; see the matrix above.
+- **A4: EXPIRES in TRACK_STATUS_OK.** 9.13 says a TRACK_STATUS_OK carries "the same
+  parameters and Track Properties it would have set in a SUBSCRIBE_OK", and a
+  SUBSCRIBE_OK may carry EXPIRES and LARGEST_OBJECT; 9.20.17 lists the messages
+  EXPIRES may appear in and TRACK_STATUS_OK is not among them (9.20.18 does list
+  it for LARGEST_OBJECT). The codec accepts both parameters on TRACK_STATUS_OK,
+  because rejecting one closes the session on a peer that followed 9.13.
+- **A5: parameters on TRACK_STATUS.** 9.13 says TRACK_STATUS is "identical to
+  SUBSCRIBE" without subscriber delivery parameters, but names no complete list.
+  The codec allows exactly the parameters whose own text names TRACK_STATUS:
+  AUTHORIZATION_TOKEN (9.20.3) and INCLUDE_PROPERTIES (9.20.22).
+- **A6: duplicate known Setup Options.** 9.1 forbids a sender from repeating an
+  option type and requires receivers to allow duplicates of unknown options; it
+  does not say what a receiver does with a duplicate known option. The codec
+  closes with PROTOCOL_VIOLATION, as it does for message parameters (9.20).
 
 ## Worked byte examples
 

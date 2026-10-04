@@ -96,40 +96,122 @@ MOQ_API moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w);
  * 0x06 close code. */
 #define MOQ_D21_ERR_KVP_FORMAT (-200)
 
-/* Message Parameter types (draft-18 §10.2). */
-#define MOQ_D21_PARAM_AUTHORIZATION_TOKEN       ((uint64_t)0x03u)  /* len-prefixed */
-#define MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT   ((uint64_t)0x02u)  /* varint ms */
-#define MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT ((uint64_t)0x06u)  /* varint ms */
-#define MOQ_D21_PARAM_EXPIRES             ((uint64_t)0x08u)  /* varint (ms) */
-#define MOQ_D21_PARAM_LARGEST_OBJECT      ((uint64_t)0x09u)  /* Location */
-#define MOQ_D21_PARAM_FORWARD             ((uint64_t)0x10u)  /* uint8 0/1 */
-#define MOQ_D21_PARAM_SUBSCRIBER_PRIORITY ((uint64_t)0x20u)  /* uint8 */
-#define MOQ_D21_PARAM_SUBSCRIPTION_FILTER ((uint64_t)0x21u)  /* len-prefixed */
-#define MOQ_D21_PARAM_GROUP_ORDER         ((uint64_t)0x22u)  /* uint8 1/2 */
-/* Defined draft-18 parameters that are accepted (decoded + form-validated) but
- * not surfaced: their semantics are not modeled yet, and a defined parameter
- * must not be treated as unknown (§10.2 closes the session for unknown only). */
-#define MOQ_D21_PARAM_RENDEZVOUS_TIMEOUT  ((uint64_t)0x04u)  /* varint ms (§10.2.6) */
-#define MOQ_D21_PARAM_FILL_TIMEOUT        ((uint64_t)0x0Au)  /* varint ms (§10.2.5) */
-#define MOQ_D21_PARAM_NEW_GROUP_REQUEST   ((uint64_t)0x32u)  /* varint (§10.2.13) */
-#define MOQ_D21_PARAM_TRACK_NAMESPACE_PREFIX ((uint64_t)0x34u) /* namespace (§10.2.14) */
+/* Message Parameter types (draft-21 section 9.20 and 16.7). */
+#define MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT   ((uint64_t)0x02u)  /* varint ms, 9.20.5 */
+#define MOQ_D21_PARAM_AUTHORIZATION_TOKEN       ((uint64_t)0x03u)  /* len-prefixed; may repeat, 9.20.3 */
+#define MOQ_D21_PARAM_RENDEZVOUS_TIMEOUT        ((uint64_t)0x04u)  /* varint ms, 9.20.7 */
+#define MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT ((uint64_t)0x06u)  /* varint ms, 9.20.4 */
+#define MOQ_D21_PARAM_EXPIRES                   ((uint64_t)0x08u)  /* varint ms, 9.20.17 */
+#define MOQ_D21_PARAM_LARGEST_OBJECT            ((uint64_t)0x09u)  /* Location, 9.20.18 */
+#define MOQ_D21_PARAM_FILL_TIMEOUT              ((uint64_t)0x0Au)  /* varint ms, 9.20.6 */
+#define MOQ_D21_PARAM_FORWARD                   ((uint64_t)0x10u)  /* uint8 0/1, 9.20.19 */
+#define MOQ_D21_PARAM_SUBSCRIBER_PRIORITY       ((uint64_t)0x20u)  /* uint8, 9.20.8 */
+#define MOQ_D21_PARAM_LOCATION_FILTER           ((uint64_t)0x21u)  /* len-prefixed, 9.20.10 */
+#define MOQ_D21_PARAM_GROUP_ORDER               ((uint64_t)0x22u)  /* uint8 1/2, 9.20.9 */
+#define MOQ_D21_PARAM_FILL_PARAMETERS           ((uint64_t)0x23u)  /* len-prefixed, nested, 9.20.16 */
+#define MOQ_D21_PARAM_SUBGROUP_FILTER           ((uint64_t)0x25u)  /* Range Filter, 9.20.11 */
+#define MOQ_D21_PARAM_OBJECTID_FILTER           ((uint64_t)0x26u)  /* Range Filter, 9.20.12 */
+#define MOQ_D21_PARAM_PRIORITY_FILTER           ((uint64_t)0x27u)  /* Range Filter, 9.20.13 */
+#define MOQ_D21_PARAM_OBJECT_PROPERTY_FILTER    ((uint64_t)0x28u)  /* Range Filter, 9.20.14 */
+#define MOQ_D21_PARAM_TRACK_PROPERTY_FILTER     ((uint64_t)0x29u)  /* Range Filter, 9.20.15 */
+#define MOQ_D21_PARAM_NEW_GROUP_REQUEST         ((uint64_t)0x32u)  /* varint, 9.20.20 */
+#define MOQ_D21_PARAM_TRACK_NAMESPACE_PREFIX    ((uint64_t)0x34u)  /* namespace, 9.20.21 */
+#define MOQ_D21_PARAM_INCLUDE_PROPERTIES        ((uint64_t)0x35u)  /* uint8 0/1, 9.20.22 */
 
-/* Which parameter types a given message permits. The decoder rejects any
- * parameter outside the allowed set (as well as any unknown type) with PROTO,
- * since draft-18 parameters are not skippable. */
-#define MOQ_D21_PARAM_BIT_FORWARD                 (1u << 0)
-#define MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY     (1u << 1)
-#define MOQ_D21_PARAM_BIT_SUBSCRIPTION_FILTER     (1u << 2)
-#define MOQ_D21_PARAM_BIT_GROUP_ORDER             (1u << 3)
-#define MOQ_D21_PARAM_BIT_EXPIRES                 (1u << 4)
-#define MOQ_D21_PARAM_BIT_LARGEST_OBJECT          (1u << 5)
-#define MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT (1u << 6)
-#define MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT (1u << 7)
-#define MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN     (1u << 8)
-#define MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT      (1u << 9)
-#define MOQ_D21_PARAM_BIT_FILL_TIMEOUT            (1u << 10)
-#define MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST       (1u << 11)
-#define MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX  (1u << 12)
+/* One bit per parameter type, for the per-message legality masks below. A
+ * defined parameter in a message that does not allow it is a PROTOCOL_VIOLATION
+ * (9.20.1); an unknown type is too (9.20: parameters cannot be skipped). */
+#define MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT   (1u << 0)
+#define MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN       (1u << 1)
+#define MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT        (1u << 2)
+#define MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT (1u << 3)
+#define MOQ_D21_PARAM_BIT_EXPIRES                   (1u << 4)
+#define MOQ_D21_PARAM_BIT_LARGEST_OBJECT            (1u << 5)
+#define MOQ_D21_PARAM_BIT_FILL_TIMEOUT              (1u << 6)
+#define MOQ_D21_PARAM_BIT_FORWARD                   (1u << 7)
+#define MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY       (1u << 8)
+#define MOQ_D21_PARAM_BIT_LOCATION_FILTER           (1u << 9)
+#define MOQ_D21_PARAM_BIT_GROUP_ORDER               (1u << 10)
+#define MOQ_D21_PARAM_BIT_FILL_PARAMETERS           (1u << 11)
+#define MOQ_D21_PARAM_BIT_SUBGROUP_FILTER           (1u << 12)
+#define MOQ_D21_PARAM_BIT_OBJECTID_FILTER           (1u << 13)
+#define MOQ_D21_PARAM_BIT_PRIORITY_FILTER           (1u << 14)
+#define MOQ_D21_PARAM_BIT_OBJECT_PROPERTY_FILTER    (1u << 15)
+#define MOQ_D21_PARAM_BIT_TRACK_PROPERTY_FILTER     (1u << 16)
+#define MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST         (1u << 17)
+#define MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX    (1u << 18)
+#define MOQ_D21_PARAM_BIT_INCLUDE_PROPERTIES        (1u << 19)
+
+/* The four Range Filters that FETCH, SUBSCRIBE and REQUEST_UPDATE accept. */
+#define MOQ_D21_PARAM_BITS_RANGE_FILTERS \
+    (MOQ_D21_PARAM_BIT_SUBGROUP_FILTER | MOQ_D21_PARAM_BIT_OBJECTID_FILTER | \
+     MOQ_D21_PARAM_BIT_PRIORITY_FILTER | MOQ_D21_PARAM_BIT_OBJECT_PROPERTY_FILTER)
+
+/*
+ * Which parameters each message permits, built from each parameter's own "MAY
+ * appear in" sentence in 9.20.3 to 9.20.22: the draft's table in 9.20.2 is empty
+ * in the checked-in text (docs/draft21-wire-reference.md, open ambiguity A3).
+ *
+ * REQUEST_OK is generic on the wire, so the caller picks the mask for the
+ * request it answers. TRACK_STATUS_OK admits EXPIRES as well as LARGEST_OBJECT:
+ * 9.13 says it carries the parameters a SUBSCRIBE_OK would, while 9.20.17 does
+ * not list it (open ambiguity A4); the permissive reading cannot close a
+ * session on a conforming peer.
+ */
+#define MOQ_D21_MASK_SUBSCRIBE \
+    (MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | \
+     MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT | MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | \
+     MOQ_D21_PARAM_BIT_FORWARD | MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | \
+     MOQ_D21_PARAM_BIT_LOCATION_FILTER | MOQ_D21_PARAM_BIT_GROUP_ORDER | \
+     MOQ_D21_PARAM_BIT_FILL_PARAMETERS | MOQ_D21_PARAM_BITS_RANGE_FILTERS | \
+     MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST | MOQ_D21_PARAM_BIT_INCLUDE_PROPERTIES)
+/* 9.18.1: any parameter valid on a subscription is valid on SUBSCRIBE_TRACKS,
+ * which also takes the Track Property filter (9.20.15). */
+#define MOQ_D21_MASK_SUBSCRIBE_TRACKS \
+    (MOQ_D21_MASK_SUBSCRIBE | MOQ_D21_PARAM_BIT_TRACK_PROPERTY_FILTER)
+/* The union over every request type an update can target; the session checks
+ * the parameter against the actual target. GROUP_ORDER and INCLUDE_PROPERTIES
+ * are not allowed (9.20.9, 9.20.22). */
+#define MOQ_D21_MASK_REQUEST_UPDATE \
+    (MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | \
+     MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | MOQ_D21_PARAM_BIT_FORWARD | \
+     MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | MOQ_D21_PARAM_BIT_LOCATION_FILTER | \
+     MOQ_D21_PARAM_BIT_FILL_PARAMETERS | MOQ_D21_PARAM_BITS_RANGE_FILTERS | \
+     MOQ_D21_PARAM_BIT_TRACK_PROPERTY_FILTER | MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST | \
+     MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX)
+#define MOQ_D21_MASK_PUBLISH \
+    (MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | \
+     MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | MOQ_D21_PARAM_BIT_EXPIRES | \
+     MOQ_D21_PARAM_BIT_LARGEST_OBJECT | MOQ_D21_PARAM_BIT_FORWARD | \
+     MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | MOQ_D21_PARAM_BIT_LOCATION_FILTER | \
+     MOQ_D21_PARAM_BIT_GROUP_ORDER)
+#define MOQ_D21_MASK_FETCH \
+    (MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | MOQ_D21_PARAM_BIT_FILL_TIMEOUT | \
+     MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | MOQ_D21_PARAM_BIT_LOCATION_FILTER | \
+     MOQ_D21_PARAM_BIT_GROUP_ORDER | MOQ_D21_PARAM_BITS_RANGE_FILTERS | \
+     MOQ_D21_PARAM_BIT_INCLUDE_PROPERTIES)
+#define MOQ_D21_MASK_TRACK_STATUS \
+    (MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | MOQ_D21_PARAM_BIT_INCLUDE_PROPERTIES)
+#define MOQ_D21_MASK_NAMESPACE_REQUEST   MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN
+#define MOQ_D21_MASK_SUBSCRIBE_OK \
+    (MOQ_D21_PARAM_BIT_EXPIRES | MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
+#define MOQ_D21_MASK_FETCH_OK            0u   /* no parameter is defined for FETCH_OK */
+#define MOQ_D21_MASK_PUBLISH_STATE_NOTIFY \
+    (MOQ_D21_PARAM_BIT_LOCATION_FILTER | MOQ_D21_PARAM_BIT_FORWARD | \
+     MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
+/* REQUEST_OK forms (9.3): the shorthand names the request it answers. */
+#define MOQ_D21_MASK_PUBLISH_OK          MOQ_D21_PARAM_BIT_EXPIRES
+#define MOQ_D21_MASK_REQUEST_UPDATE_OK \
+    (MOQ_D21_PARAM_BIT_EXPIRES | MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
+#define MOQ_D21_MASK_TRACK_STATUS_OK \
+    (MOQ_D21_PARAM_BIT_EXPIRES | MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
+#define MOQ_D21_MASK_NAMESPACE_OK        MOQ_D21_PARAM_BIT_EXPIRES
+/* What FILL_PARAMETERS may contain (9.20.16); anything else, including a nested
+ * FILL_PARAMETERS, is a PROTOCOL_VIOLATION. Track Property filters are excluded. */
+#define MOQ_D21_MASK_FILL_NESTED \
+    (MOQ_D21_PARAM_BIT_FILL_TIMEOUT | MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | \
+     MOQ_D21_PARAM_BIT_LOCATION_FILTER | MOQ_D21_PARAM_BIT_GROUP_ORDER | \
+     MOQ_D21_PARAM_BITS_RANGE_FILTERS)
 
 /* Maximum AUTHORIZATION_TOKEN parameters carried per message. Matches the
  * session-core decoded-token cap (MOQ_DECODED_MAX_TOKENS); the profile
@@ -188,10 +270,57 @@ MOQ_API moq_result_t moq_d21_encode_setup_opts(moq_buf_writer_t *w,
                                                const moq_d21_setup_opts_t *opts);
 
 /*
- * Decoded Message Parameters. Only the representable subset is carried; an
- * unknown or not-permitted parameter type fails the decode (draft-18 §10.2:
- * unknown parameters cannot be skipped and are a PROTOCOL_VIOLATION).
- * AUTHORIZATION_TOKEN may repeat (§10.2.2), so it is carried as an array.
+ * A Location Filter (9.20.10 and 3.3.1). The wire value is a vi64 byte Length
+ * followed by 0 to 4 optional vi64 fields in a fixed order; field_count says how
+ * many were present, so the session can apply the draft's rules for a relative
+ * start (one field), the Next Object (two zero fields), or an absolute range.
+ * field_count 0 is a zero-length filter: "no filter", which removes the filter
+ * in a REQUEST_UPDATE and, inside FILL_PARAMETERS, means the whole track up to
+ * Largest Object (3.4). end_group_delta is the raw delta from start_group; the
+ * decoder rejects a sum above 2^64-1 (PROTOCOL_VIOLATION).
+ */
+typedef struct moq_d21_location_filter {
+    uint8_t  field_count;       /* 0..4 */
+    uint64_t start_group;       /* field_count >= 1 */
+    uint64_t start_object;      /* field_count >= 2 */
+    uint64_t end_group_delta;   /* field_count >= 3 */
+    uint64_t end_object;        /* field_count == 4 */
+} moq_d21_location_filter_t;
+
+/* The parameters FILL_PARAMETERS may carry (9.20.16): the fill range, ordering
+ * and priority overrides for a fill fetch stream. A parameter left unset takes
+ * its value from the enclosing subscription. */
+typedef struct moq_d21_fill_params {
+    bool     has_fill_timeout;
+    uint64_t fill_timeout_ms;
+    bool     has_subscriber_priority;
+    uint8_t  subscriber_priority;
+    bool     has_group_order;
+    uint8_t  group_order;        /* 1 ascending, 2 descending */
+    bool     has_location_filter;
+    moq_d21_location_filter_t location_filter;
+    /* Range Filters are parsed for structure but never acted on; see the
+     * range_filter_* fields of moq_d21_msg_params_t. */
+    uint32_t range_filter_params;
+    uint64_t range_filter_ranges;
+    bool     range_filter_invalid;
+} moq_d21_fill_params_t;
+
+/*
+ * Decoded Message Parameters (draft-21 9.20). Only the representable subset is
+ * carried; an unknown or not-permitted parameter type fails the decode
+ * (PROTOCOL_VIOLATION). AUTHORIZATION_TOKEN may repeat (8.9), so it is carried as
+ * an array.
+ *
+ * Range Filters (3.3.2, 9.20.11 to 9.20.15) are parsed far enough to find their
+ * end and count their Ranges, then discarded: this implementation does not
+ * advertise MAX_FILTER_RANGES, so the peer MUST NOT send any (9.1.6) and the
+ * session answers REQUEST_ERROR INVALID_FILTER when range_filter_ranges exceeds
+ * the limit it advertised. range_filter_invalid is set for the conditions the
+ * draft also answers with INVALID_FILTER: a decoded value that overflows 2^64-1,
+ * a Priority Filter value above 255, or an odd Property Type in the Object or
+ * Track Property filter. Those are request errors, not session errors, so the
+ * decode itself still succeeds.
  */
 typedef struct moq_d21_msg_params {
     bool     has_forward;
@@ -200,38 +329,48 @@ typedef struct moq_d21_msg_params {
     uint8_t  subscriber_priority;
     bool     has_group_order;
     uint8_t  group_order;            /* 1 ascending, 2 descending */
-    bool     has_filter;
-    uint32_t filter_type;            /* §5.1.2: 1 next-group, 2 largest, 3/4 absolute */
-    uint64_t filter_start_group;     /* filter types 3/4 */
-    uint64_t filter_start_object;    /* filter types 3/4 */
-    uint64_t filter_end_group;       /* filter type 4 (absolute, decoded from delta) */
-    bool     has_expires;            /* response parameter (SUBSCRIBE_OK) */
+    bool     has_location_filter;
+    moq_d21_location_filter_t location_filter;
+    bool     has_expires;            /* response parameter */
     uint64_t expires_ms;
-    bool     has_largest;            /* response parameter (SUBSCRIBE_OK) */
+    bool     has_largest;            /* response parameter */
     uint64_t largest_group;
     uint64_t largest_object;
     bool     has_object_delivery_timeout;
     uint64_t object_delivery_timeout_ms;
     bool     has_subgroup_delivery_timeout;
     uint64_t subgroup_delivery_timeout_ms;
+    bool     has_rendezvous_timeout;
+    uint64_t rendezvous_timeout_ms;
+    bool     has_fill_timeout;       /* FETCH only; FILL_PARAMETERS carries its own */
+    uint64_t fill_timeout_ms;
     size_t               auth_token_count;
     moq_d21_auth_token_t auth_tokens[MOQ_D21_MAX_AUTH_TOKENS];
-    bool     has_new_group_request;  /* §10.2.13: SUBSCRIBE / PUBLISH_OK /
-                                      * REQUEST_UPDATE; the value 0 ("no group
-                                      * info") is meaningful */
+    bool     has_new_group_request;  /* the value 0 ("no group info") is meaningful */
     uint64_t new_group_request;
+    bool     has_track_namespace_prefix;   /* validated, not surfaced (9.20.21) */
+    bool     has_include_properties;
+    uint8_t  include_properties;     /* 0 or 1; absent means 1 (9.20.22) */
+    bool                  has_fill;  /* FILL_PARAMETERS present (9.20.16) */
+    moq_d21_fill_params_t fill;
+    uint32_t range_filter_params;    /* Range Filter parameters present */
+    uint64_t range_filter_ranges;    /* total Ranges across them */
+    bool     range_filter_invalid;   /* see above */
 } moq_d21_msg_params_t;
 
 /* Encode a parameter block: a vi64 count followed by the set parameters in
- * ascending Type-Delta order (OBJECT_DELIVERY_TIMEOUT, AUTHORIZATION_TOKEN
- * (repeatable), SUBGROUP_DELIVERY_TIMEOUT, EXPIRES, LARGEST_OBJECT, FORWARD,
- * SUBSCRIBER_PRIORITY, SUBSCRIPTION_FILTER, GROUP_ORDER, NEW_GROUP_REQUEST). */
+ * ascending Type-Delta order (0x02, 0x03 (repeatable), 0x04, 0x06, 0x08, 0x09,
+ * 0x0A, 0x10, 0x20, 0x21, 0x22, 0x23, 0x32, 0x35). Refuses (MOQ_ERR_INVAL, writer
+ * unchanged) a value the wire cannot carry or a field this codec never emits:
+ * Range Filters and TRACK_NAMESPACE_PREFIX. */
 MOQ_API moq_result_t moq_d21_encode_msg_params(moq_buf_writer_t *w,
                                                const moq_d21_msg_params_t *p);
 
 /* Decode `count` parameters from the reader into `out`. Enforces ascending
- * Type-Delta order, rejects duplicates, unknown types, and any type not in
- * `allowed_mask` (PROTO). */
+ * Type-Delta order and rejects duplicates (only AUTHORIZATION_TOKEN and the Range
+ * Filters may repeat), unknown types, any type not in `allowed_mask`, and
+ * out-of-range values for the enumerated parameters (PROTO). A truncated value
+ * is MOQ_ERR_BUFFER at this level and MOQ_ERR_PROTO inside a nested block. */
 MOQ_API moq_result_t moq_d21_decode_msg_params(moq_buf_reader_t *r,
                                                uint64_t count,
                                                uint32_t allowed_mask,

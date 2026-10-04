@@ -121,44 +121,28 @@ static uint64_t d21_full_track_len(const moq_namespace_t *ns,
 /* Message parameters each request message may carry (§10.2). The encoder
  * validates the supplied params against the message's set so it cannot emit a
  * parameter the corresponding decoder would reject. */
-#define D21_SUBSCRIBE_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_FORWARD | MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | \
-     MOQ_D21_PARAM_BIT_SUBSCRIPTION_FILTER | MOQ_D21_PARAM_BIT_GROUP_ORDER | \
-     MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | \
-     MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST)
-#define D21_FETCH_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | MOQ_D21_PARAM_BIT_GROUP_ORDER | \
-     MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | MOQ_D21_PARAM_BIT_FILL_TIMEOUT)
-#define D21_REQUEST_UPDATE_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_FORWARD | MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | \
-     MOQ_D21_PARAM_BIT_SUBSCRIPTION_FILTER | \
-     MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | \
-     MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST | \
-     MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX)
 
+/* Whether `p` uses only parameters in `mask`: the encoder-side legality check,
+ * so an encoder cannot emit a parameter the matching decoder would reject. */
 static bool d21_params_within_mask(const moq_d21_msg_params_t *p, uint32_t mask)
 {
-    if (p->has_forward && !(mask & MOQ_D21_PARAM_BIT_FORWARD)) return false;
-    if (p->has_subscriber_priority &&
-        !(mask & MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY)) return false;
-    if (p->has_filter && !(mask & MOQ_D21_PARAM_BIT_SUBSCRIPTION_FILTER))
-        return false;
-    if (p->has_group_order && !(mask & MOQ_D21_PARAM_BIT_GROUP_ORDER))
-        return false;
-    if (p->has_expires && !(mask & MOQ_D21_PARAM_BIT_EXPIRES)) return false;
-    if (p->has_largest && !(mask & MOQ_D21_PARAM_BIT_LARGEST_OBJECT))
-        return false;
-    if (p->has_object_delivery_timeout &&
-        !(mask & MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT)) return false;
-    if (p->has_subgroup_delivery_timeout &&
-        !(mask & MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT)) return false;
-    if (p->auth_token_count > 0 &&
-        !(mask & MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN)) return false;
+#define D21_NEEDS(flag, bit) if ((flag) && !(mask & (bit))) return false
+    D21_NEEDS(p->has_object_delivery_timeout, MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT);
+    D21_NEEDS(p->auth_token_count > 0, MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN);
+    D21_NEEDS(p->has_rendezvous_timeout, MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT);
+    D21_NEEDS(p->has_subgroup_delivery_timeout, MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT);
+    D21_NEEDS(p->has_expires, MOQ_D21_PARAM_BIT_EXPIRES);
+    D21_NEEDS(p->has_largest, MOQ_D21_PARAM_BIT_LARGEST_OBJECT);
+    D21_NEEDS(p->has_fill_timeout, MOQ_D21_PARAM_BIT_FILL_TIMEOUT);
+    D21_NEEDS(p->has_forward, MOQ_D21_PARAM_BIT_FORWARD);
+    D21_NEEDS(p->has_subscriber_priority, MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY);
+    D21_NEEDS(p->has_location_filter, MOQ_D21_PARAM_BIT_LOCATION_FILTER);
+    D21_NEEDS(p->has_group_order, MOQ_D21_PARAM_BIT_GROUP_ORDER);
+    D21_NEEDS(p->has_fill, MOQ_D21_PARAM_BIT_FILL_PARAMETERS);
+    D21_NEEDS(p->has_new_group_request, MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST);
+    D21_NEEDS(p->has_track_namespace_prefix, MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX);
+    D21_NEEDS(p->has_include_properties, MOQ_D21_PARAM_BIT_INCLUDE_PROPERTIES);
+#undef D21_NEEDS
     return true;
 }
 
@@ -170,7 +154,7 @@ moq_result_t moq_d21_encode_subscribe(moq_buf_writer_t *w, uint64_t request_id,
                                       const moq_d21_msg_params_t *params)
 {
     if (!w || !ns || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_SUBSCRIBE_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_SUBSCRIBE))
         return MOQ_ERR_INVAL;
     if (d21_full_track_len(ns, track_name) > MOQ_D21_MAX_FULL_TRACK)
         return MOQ_ERR_INVAL;
@@ -206,7 +190,7 @@ moq_result_t moq_d21_decode_subscribe(const uint8_t *payload,
         return MOQ_ERR_PROTO;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_SUBSCRIBE_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_SUBSCRIBE,
                                    &out->params);
     if (rc < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -216,7 +200,6 @@ moq_result_t moq_d21_decode_subscribe(const uint8_t *payload,
 /* -- PUBLISH_NAMESPACE (draft-18 §10.15) --------------------------- */
 
 /* PUBLISH_NAMESPACE permits only the AUTHORIZATION_TOKEN message parameter. */
-#define D21_PUBLISH_NAMESPACE_PARAM_MASK  MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN
 
 moq_result_t moq_d21_encode_publish_namespace(moq_buf_writer_t *w,
                                               uint64_t request_id,
@@ -224,7 +207,7 @@ moq_result_t moq_d21_encode_publish_namespace(moq_buf_writer_t *w,
                                               const moq_d21_msg_params_t *params)
 {
     if (!w || !ns || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_PUBLISH_NAMESPACE_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_NAMESPACE_REQUEST))
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_PUBLISH_NAMESPACE, &len_off);
@@ -254,7 +237,7 @@ moq_result_t moq_d21_decode_publish_namespace(const uint8_t *payload,
     if (rc < 0) return rc;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_PUBLISH_NAMESPACE_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_NAMESPACE_REQUEST,
                                    &out->params);
     if (rc < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -266,7 +249,6 @@ moq_result_t moq_d21_decode_publish_namespace(const uint8_t *payload,
 /* SUBSCRIBE_NAMESPACE permits only the AUTHORIZATION_TOKEN message parameter
  * (it is namespace-only in draft-18; FORWARD and the interest field moved to
  * SUBSCRIBE_TRACKS). */
-#define D21_SUBSCRIBE_NAMESPACE_PARAM_MASK  MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN
 
 moq_result_t moq_d21_encode_subscribe_namespace(moq_buf_writer_t *w,
                                                 uint64_t request_id,
@@ -274,7 +256,7 @@ moq_result_t moq_d21_encode_subscribe_namespace(moq_buf_writer_t *w,
                                                 const moq_d21_msg_params_t *params)
 {
     if (!w || !prefix || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_SUBSCRIBE_NAMESPACE_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_NAMESPACE_REQUEST))
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_SUBSCRIBE_NAMESPACE, &len_off);
@@ -304,7 +286,7 @@ moq_result_t moq_d21_decode_subscribe_namespace(const uint8_t *payload,
     if (rc < 0) return rc;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_SUBSCRIBE_NAMESPACE_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_NAMESPACE_REQUEST,
                                    &out->params);
     if (rc < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -316,8 +298,6 @@ moq_result_t moq_d21_decode_subscribe_namespace(const uint8_t *payload,
 /* SUBSCRIBE_TRACKS permits the FORWARD and AUTHORIZATION_TOKEN message
  * parameters (it governs the FORWARD value of the resulting PUBLISH messages;
  * §10.19). Any other parameter is a protocol violation. */
-#define D21_SUBSCRIBE_TRACKS_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_FORWARD | MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN)
 
 moq_result_t moq_d21_encode_subscribe_tracks(moq_buf_writer_t *w,
                                              uint64_t request_id,
@@ -325,7 +305,7 @@ moq_result_t moq_d21_encode_subscribe_tracks(moq_buf_writer_t *w,
                                              const moq_d21_msg_params_t *params)
 {
     if (!w || !prefix || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_SUBSCRIBE_TRACKS_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_SUBSCRIBE_TRACKS))
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_SUBSCRIBE_TRACKS, &len_off);
@@ -355,7 +335,7 @@ moq_result_t moq_d21_decode_subscribe_tracks(const uint8_t *payload,
     if (rc < 0) return rc;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_SUBSCRIBE_TRACKS_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_SUBSCRIBE_TRACKS,
                                    &out->params);
     if (rc < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -442,7 +422,6 @@ moq_result_t moq_d21_decode_namespace_msg(const uint8_t *payload,
 
 /* TRACK_STATUS is the SUBSCRIBE layout minus Track-delivery params; only the
  * AUTHORIZATION_TOKEN message parameter applies. */
-#define D21_TRACK_STATUS_PARAM_MASK  MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN
 
 moq_result_t moq_d21_encode_track_status(moq_buf_writer_t *w, uint64_t request_id,
                                          const moq_namespace_t *ns,
@@ -450,7 +429,7 @@ moq_result_t moq_d21_encode_track_status(moq_buf_writer_t *w, uint64_t request_i
                                          const moq_d21_msg_params_t *params)
 {
     if (!w || !ns || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_TRACK_STATUS_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_TRACK_STATUS))
         return MOQ_ERR_INVAL;
     if (d21_full_track_len(ns, track_name) > MOQ_D21_MAX_FULL_TRACK)
         return MOQ_ERR_INVAL;
@@ -487,7 +466,7 @@ moq_result_t moq_d21_decode_track_status(const uint8_t *payload,
         return MOQ_ERR_PROTO;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_TRACK_STATUS_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_TRACK_STATUS,
                                    &out->params);
     if (rc < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
@@ -823,8 +802,6 @@ moq_result_t moq_d21_encode_object_datagram(
 /* -- SUBSCRIBE_OK -------------------------------------------------- */
 
 /* SUBSCRIBE_OK carries LARGEST_OBJECT / EXPIRES message parameters. */
-#define D21_SUBSCRIBE_OK_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_EXPIRES | MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
 
 moq_result_t moq_d21_encode_subscribe_ok(moq_buf_writer_t *w,
                                          uint64_t track_alias,
@@ -832,7 +809,7 @@ moq_result_t moq_d21_encode_subscribe_ok(moq_buf_writer_t *w,
                                          moq_bytes_t track_properties)
 {
     if (!w || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_SUBSCRIBE_OK_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_SUBSCRIBE_OK))
         return MOQ_ERR_INVAL;
     if (track_properties.len > 0 &&
         d21_validate_track_properties(track_properties.data,
@@ -865,7 +842,7 @@ moq_result_t moq_d21_decode_subscribe_ok(const uint8_t *payload,
     if (rc < 0) return rc;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_SUBSCRIBE_OK_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_SUBSCRIBE_OK,
                                    &out->params);
     if (rc < 0) return rc;
     /* The remainder is the opaque Track Properties tail. */
@@ -883,15 +860,12 @@ moq_result_t moq_d21_decode_subscribe_ok(const uint8_t *payload,
  * AUTHORIZATION_TOKEN, LARGEST_OBJECT (§10.2.11 -- MUST be included once
  * Objects have been published), and EXPIRES (§10.2.10); other parameters are a
  * violation. */
-#define D21_PUBLISH_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_FORWARD | MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN | \
-     MOQ_D21_PARAM_BIT_LARGEST_OBJECT | MOQ_D21_PARAM_BIT_EXPIRES)
 
 moq_result_t moq_d21_encode_publish(moq_buf_writer_t *w,
                                     const moq_d21_publish_t *p)
 {
     if (!w || !p) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(&p->params, D21_PUBLISH_PARAM_MASK))
+    if (!d21_params_within_mask(&p->params, MOQ_D21_MASK_PUBLISH))
         return MOQ_ERR_INVAL;
     if (d21_full_track_len(&p->track_namespace, p->track_name) >
         MOQ_D21_MAX_FULL_TRACK)
@@ -938,7 +912,7 @@ moq_result_t moq_d21_decode_publish(const uint8_t *payload, size_t payload_len,
     if ((rc = moq_buf_read_vi64(&r, &out->track_alias)) < 0) return rc;
     uint64_t count;
     if ((rc = moq_buf_read_vi64(&r, &count)) < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_PUBLISH_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_PUBLISH,
                                    &out->params);
     if (rc < 0) return rc;
     /* The remainder is the opaque Track Properties tail. */
@@ -956,18 +930,12 @@ moq_result_t moq_d21_decode_publish(const uint8_t *payload, size_t payload_len,
  * its SUBSCRIPTION_FILTER choice (§10.2.9 -- omitted = unfiltered), and
  * EXPIRES (§10.2.10), with an empty Track Properties tail (a non-empty tail is
  * a PROTOCOL_VIOLATION). */
-#define D21_PUBLISH_OK_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY | MOQ_D21_PARAM_BIT_FORWARD | \
-     MOQ_D21_PARAM_BIT_GROUP_ORDER | MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT | \
-     MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST | \
-     MOQ_D21_PARAM_BIT_SUBSCRIPTION_FILTER | MOQ_D21_PARAM_BIT_EXPIRES)
 
 moq_result_t moq_d21_encode_publish_ok(moq_buf_writer_t *w,
                                        const moq_d21_msg_params_t *params)
 {
     if (!w || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_PUBLISH_OK_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_PUBLISH_OK))
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
@@ -992,7 +960,7 @@ moq_result_t moq_d21_decode_publish_ok(const uint8_t *payload,
     uint64_t count;
     moq_result_t rc = moq_buf_read_vi64(&r, &count);
     if (rc < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_PUBLISH_OK_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_PUBLISH_OK,
                                    &out->params);
     if (rc < 0) return rc;
     /* PUBLISH_OK carries an empty Track Properties tail; any remainder is a
@@ -1093,15 +1061,13 @@ moq_result_t moq_d21_decode_goaway_request(const uint8_t *payload,
 
 /* TRACK_STATUS_OK is a REQUEST_OK carrying LARGEST_OBJECT / EXPIRES parameters
  * and a Track Properties tail, with no Track Alias (§10.14). */
-#define D21_TRACK_STATUS_OK_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_EXPIRES | MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
 
 moq_result_t moq_d21_encode_track_status_ok(moq_buf_writer_t *w,
                                             const moq_d21_msg_params_t *params,
                                             moq_bytes_t track_properties)
 {
     if (!w || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, D21_TRACK_STATUS_OK_PARAM_MASK))
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_TRACK_STATUS_OK))
         return MOQ_ERR_INVAL;
     if (track_properties.len > 0 &&
         d21_validate_track_properties(track_properties.data,
@@ -1132,7 +1098,7 @@ moq_result_t moq_d21_decode_track_status_ok(const uint8_t *payload,
     uint64_t count;
     moq_result_t rc = moq_buf_read_vi64(&r, &count);
     if (rc < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, D21_TRACK_STATUS_OK_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_TRACK_STATUS_OK,
                                    &out->params);
     if (rc < 0) return rc;
     /* The remainder is the opaque Track Properties tail. TRACK_STATUS_OK is not in
@@ -1299,55 +1265,93 @@ static moq_result_t d21_read_u8(moq_buf_reader_t *r, uint8_t *out)
     return MOQ_OK;
 }
 
-/* Subscription Filter (§5.1.2) body, written as the length-prefixed value of the
- * SUBSCRIPTION_FILTER parameter: Filter Type, then Start Location (types 3/4),
- * then End Group Delta (type 4). */
-static moq_result_t d21_write_filter(moq_buf_writer_t *w,
-                                     const moq_d21_msg_params_t *p)
+/* Location Filter (draft-21 9.20.10): a vi64 byte Length, then 0 to 4 optional
+ * vi64 fields in the order StartGroup, StartObject, EndGroupDelta, EndObject. */
+static moq_result_t d21_write_location_filter(moq_buf_writer_t *w,
+                                              const moq_d21_location_filter_t *f)
 {
-    uint8_t body[48];
-    moq_buf_writer_t bw;
-    moq_buf_writer_init(&bw, body, sizeof(body));
-    moq_result_t rc = moq_buf_write_vi64(&bw, p->filter_type);
-    if (rc < 0) return rc;
-    if (p->filter_type == 3 || p->filter_type == 4) {
-        if ((rc = moq_buf_write_vi64(&bw, p->filter_start_group)) < 0) return rc;
-        if ((rc = moq_buf_write_vi64(&bw, p->filter_start_object)) < 0) return rc;
-    }
-    if (p->filter_type == 4) {
-        if (p->filter_end_group < p->filter_start_group) return MOQ_ERR_INVAL;
-        if ((rc = moq_buf_write_vi64(&bw,
-                p->filter_end_group - p->filter_start_group)) < 0) return rc;
-    }
-    moq_bytes_t span = { body, moq_buf_writer_offset(&bw) };
-    return d21_write_span(w, span);
+    if (f->field_count > 4) return MOQ_ERR_INVAL;
+    if (f->field_count >= 3 && f->end_group_delta > UINT64_MAX - f->start_group)
+        return MOQ_ERR_INVAL;   /* StartGroup + EndGroupDelta must fit 2^64-1 */
+    const uint64_t fields[4] = { f->start_group, f->start_object,
+                                 f->end_group_delta, f->end_object };
+    uint64_t blen = 0;
+    for (uint8_t i = 0; i < f->field_count; i++) blen += moq_vi64_len(fields[i]);
+    moq_result_t rc = moq_buf_write_vi64(w, blen);
+    for (uint8_t i = 0; rc >= 0 && i < f->field_count; i++)
+        rc = moq_buf_write_vi64(w, fields[i]);
+    return rc;
 }
 
-static moq_result_t d21_read_filter(moq_buf_reader_t *r,
-                                    moq_d21_msg_params_t *out)
+/* `trunc_rc` is what a value that runs past its buffer reports: MOQ_ERR_BUFFER
+ * at the message level, MOQ_ERR_PROTO inside a bounded nested block. A length
+ * that does not divide into at most four whole vi64 fields is malformed. */
+static moq_result_t d21_read_location_filter(moq_buf_reader_t *r,
+                                             moq_d21_location_filter_t *out,
+                                             moq_result_t trunc_rc)
 {
-    moq_bytes_t fb;
-    if (d21_read_span(r, &fb) < 0) return MOQ_ERR_BUFFER;
+    moq_bytes_t span;
+    if (d21_read_span(r, &span) < 0) return trunc_rc;
     moq_buf_reader_t fr;
-    moq_buf_reader_init(&fr, fb.data, fb.len);
-    uint64_t ft;
-    if (moq_buf_read_vi64(&fr, &ft) < 0) return MOQ_ERR_PROTO;
-    if (ft < 1 || ft > 4) return MOQ_ERR_PROTO;        /* §5.1.2 */
-    out->filter_type = (uint32_t)ft;
-    if (ft == 3 || ft == 4) {
-        if (moq_buf_read_vi64(&fr, &out->filter_start_group) < 0)
-            return MOQ_ERR_PROTO;
-        if (moq_buf_read_vi64(&fr, &out->filter_start_object) < 0)
-            return MOQ_ERR_PROTO;
+    moq_buf_reader_init(&fr, span.data, span.len);
+    uint64_t v[4];
+    uint8_t n = 0;
+    while (moq_buf_reader_remaining(&fr) > 0) {
+        if (n == 4) return MOQ_ERR_PROTO;                 /* a fifth field */
+        if (moq_buf_read_vi64(&fr, &v[n]) < 0) return MOQ_ERR_PROTO;
+        n++;
     }
-    if (ft == 4) {
-        uint64_t delta;
-        if (moq_buf_read_vi64(&fr, &delta) < 0) return MOQ_ERR_PROTO;
-        if (delta > UINT64_MAX - out->filter_start_group) return MOQ_ERR_PROTO;
-        out->filter_end_group = out->filter_start_group + delta;
+    /* "StartGroup + EndGroupDelta" above 2^64-1 closes the session (9.20.10). */
+    if (n >= 3 && v[2] > UINT64_MAX - v[0]) return MOQ_ERR_PROTO;
+    memset(out, 0, sizeof(*out));
+    out->field_count = n;
+    if (n >= 1) out->start_group = v[0];
+    if (n >= 2) out->start_object = v[1];
+    if (n >= 3) out->end_group_delta = v[2];
+    if (n >= 4) out->end_object = v[3];
+    return MOQ_OK;
+}
+
+/* A Range Filter parameter (9.20.11 to 9.20.15, 8.6): vi64 Length, then
+ * SetID (8), a Property Type (vi64, Object and Track Property filters only), and
+ * a run of vi64 Range values (Start, End, Start, End, ... with the last End
+ * optional). Parsed only to find the end, count the Ranges, and flag the values
+ * the draft answers with INVALID_FILTER; nothing is retained. */
+static moq_result_t d21_read_range_filter(moq_buf_reader_t *r, uint64_t type,
+                                          moq_result_t trunc_rc,
+                                          uint32_t *params, uint64_t *ranges,
+                                          bool *invalid)
+{
+    moq_bytes_t span;
+    if (d21_read_span(r, &span) < 0) return trunc_rc;
+    (*params)++;
+    if (span.len == 0) return MOQ_OK;                     /* "no filter" */
+    moq_buf_reader_t fr;
+    moq_buf_reader_init(&fr, span.data, span.len);
+    uint8_t set_id;
+    if (d21_read_u8(&fr, &set_id) < 0) return MOQ_ERR_PROTO;
+    (void)set_id;
+    if (type == MOQ_D21_PARAM_OBJECT_PROPERTY_FILTER ||
+        type == MOQ_D21_PARAM_TRACK_PROPERTY_FILTER) {
+        uint64_t property_type;
+        if (moq_buf_read_vi64(&fr, &property_type) < 0) return MOQ_ERR_PROTO;
+        if (property_type & 1u) *invalid = true;          /* must be even (9.20.14) */
     }
-    if (moq_buf_reader_remaining(&fr) != 0) return MOQ_ERR_PROTO;
-    out->has_filter = true;
+    uint64_t position = 0, values = 0;
+    while (moq_buf_reader_remaining(&fr) > 0) {
+        uint64_t v;
+        if (moq_buf_read_vi64(&fr, &v) < 0) return MOQ_ERR_PROTO;
+        if (v > UINT64_MAX - position) {                  /* delta overflow (8.6) */
+            *invalid = true;
+            position = UINT64_MAX;
+        } else {
+            position += v;
+        }
+        if (type == MOQ_D21_PARAM_PRIORITY_FILTER && position > 255u)
+            *invalid = true;                              /* Publisher Priority is 8 bits */
+        values++;
+    }
+    *ranges += (values + 1) / 2;
     return MOQ_OK;
 }
 
@@ -1585,144 +1589,208 @@ fail:
     return rc;
 }
 
+static uint64_t d21_param_count(const moq_d21_msg_params_t *p)
+{
+    return (p->has_object_delivery_timeout ? 1u : 0u) +
+           (uint64_t)p->auth_token_count +
+           (p->has_rendezvous_timeout ? 1u : 0u) +
+           (p->has_subgroup_delivery_timeout ? 1u : 0u) +
+           (p->has_expires ? 1u : 0u) +
+           (p->has_largest ? 1u : 0u) +
+           (p->has_fill_timeout ? 1u : 0u) +
+           (p->has_forward ? 1u : 0u) +
+           (p->has_subscriber_priority ? 1u : 0u) +
+           (p->has_location_filter ? 1u : 0u) +
+           (p->has_group_order ? 1u : 0u) +
+           (p->has_fill ? 1u : 0u) +
+           (p->has_new_group_request ? 1u : 0u) +
+           (p->has_include_properties ? 1u : 0u);
+}
+
+/* The value ranges the wire can carry for the enumerated parameters. */
+static bool d21_params_values_ok(const moq_d21_msg_params_t *p)
+{
+    if (p->has_forward && p->forward > 1) return false;
+    if (p->has_group_order && (p->group_order < 1 || p->group_order > 2))
+        return false;
+    if (p->has_include_properties && p->include_properties > 1) return false;
+    if (p->has_location_filter && p->location_filter.field_count > 4)
+        return false;
+    if (p->auth_token_count > MOQ_D21_MAX_AUTH_TOKENS) return false;
+    return true;
+}
+
+/* Write the parameters (no count) in ascending Type-Delta order. Each delta is
+ * the type minus the previous type (the type itself for the first parameter, and
+ * zero for a repeated AUTHORIZATION_TOKEN). `fill_scope` is true for the body of
+ * FILL_PARAMETERS, where a FILL_PARAMETERS may not nest. */
+static moq_result_t d21_write_params_body(moq_buf_writer_t *w,
+                                          const moq_d21_msg_params_t *p)
+{
+    uint64_t prev = 0;
+    moq_result_t rc = MOQ_OK;
+#define D21_PARAM_TYPE(t) do { \
+        if ((rc = moq_buf_write_vi64(w, (t) - prev)) < 0) return rc; \
+        prev = (t); } while (0)
+    if (p->has_object_delivery_timeout) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT);
+        if ((rc = moq_buf_write_vi64(w, p->object_delivery_timeout_ms)) < 0)
+            return rc;
+    }
+    for (size_t i = 0; i < p->auth_token_count; i++) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_AUTHORIZATION_TOKEN);
+        if ((rc = d21_write_auth_token(w, &p->auth_tokens[i])) < 0) return rc;
+    }
+    if (p->has_rendezvous_timeout) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_RENDEZVOUS_TIMEOUT);
+        if ((rc = moq_buf_write_vi64(w, p->rendezvous_timeout_ms)) < 0) return rc;
+    }
+    if (p->has_subgroup_delivery_timeout) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT);
+        if ((rc = moq_buf_write_vi64(w, p->subgroup_delivery_timeout_ms)) < 0)
+            return rc;
+    }
+    if (p->has_expires) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_EXPIRES);
+        if ((rc = moq_buf_write_vi64(w, p->expires_ms)) < 0) return rc;
+    }
+    if (p->has_largest) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_LARGEST_OBJECT);
+        if ((rc = moq_buf_write_vi64(w, p->largest_group)) < 0) return rc;
+        if ((rc = moq_buf_write_vi64(w, p->largest_object)) < 0) return rc;
+    }
+    if (p->has_fill_timeout) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_FILL_TIMEOUT);
+        if ((rc = moq_buf_write_vi64(w, p->fill_timeout_ms)) < 0) return rc;
+    }
+    if (p->has_forward) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_FORWARD);
+        if ((rc = d21_write_u8(w, p->forward)) < 0) return rc;
+    }
+    if (p->has_subscriber_priority) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_SUBSCRIBER_PRIORITY);
+        if ((rc = d21_write_u8(w, p->subscriber_priority)) < 0) return rc;
+    }
+    if (p->has_location_filter) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_LOCATION_FILTER);
+        if ((rc = d21_write_location_filter(w, &p->location_filter)) < 0)
+            return rc;
+    }
+    if (p->has_group_order) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_GROUP_ORDER);
+        if ((rc = d21_write_u8(w, p->group_order)) < 0) return rc;
+    }
+    if (p->has_fill) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_FILL_PARAMETERS);
+        /* The nested block is a plain parameter sequence with no count (open
+         * ambiguity A1): stage it to learn its byte length, then length-prefix
+         * it. A fill block is a handful of small parameters, so it fits. */
+        const moq_d21_fill_params_t *f = &p->fill;
+        if (f->range_filter_params != 0) return MOQ_ERR_INVAL;   /* never emitted */
+        moq_d21_msg_params_t inner;
+        memset(&inner, 0, sizeof(inner));
+        inner.has_fill_timeout = f->has_fill_timeout;
+        inner.fill_timeout_ms = f->fill_timeout_ms;
+        inner.has_subscriber_priority = f->has_subscriber_priority;
+        inner.subscriber_priority = f->subscriber_priority;
+        inner.has_group_order = f->has_group_order;
+        inner.group_order = f->group_order;
+        inner.has_location_filter = f->has_location_filter;
+        inner.location_filter = f->location_filter;
+        if (!d21_params_values_ok(&inner)) return MOQ_ERR_INVAL;
+        uint8_t staged[96];
+        moq_buf_writer_t sw;
+        moq_buf_writer_init(&sw, staged, sizeof(staged));
+        if ((rc = d21_write_params_body(&sw, &inner)) < 0) return rc;
+        moq_bytes_t span = { staged, moq_buf_writer_offset(&sw) };
+        if ((rc = d21_write_span(w, span)) < 0) return rc;
+    }
+    if (p->has_new_group_request) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_NEW_GROUP_REQUEST);
+        if ((rc = moq_buf_write_vi64(w, p->new_group_request)) < 0) return rc;
+    }
+    if (p->has_include_properties) {
+        D21_PARAM_TYPE(MOQ_D21_PARAM_INCLUDE_PROPERTIES);
+        if ((rc = d21_write_u8(w, p->include_properties)) < 0) return rc;
+    }
+#undef D21_PARAM_TYPE
+    return MOQ_OK;
+}
+
 moq_result_t moq_d21_encode_msg_params(moq_buf_writer_t *w,
                                        const moq_d21_msg_params_t *p)
 {
     if (!w || !p) return MOQ_ERR_INVAL;
-    if (p->has_forward && p->forward > 1) return MOQ_ERR_INVAL;
-    if (p->has_group_order && (p->group_order < 1 || p->group_order > 2))
+    if (!d21_params_values_ok(p)) return MOQ_ERR_INVAL;
+    /* This codec never emits Range Filters (the implementation does not use
+     * them) or a Track Namespace Prefix update; refuse rather than drop them. */
+    if (p->range_filter_params != 0 || p->has_track_namespace_prefix)
         return MOQ_ERR_INVAL;
-    if (p->has_filter && (p->filter_type < 1 || p->filter_type > 4))
-        return MOQ_ERR_INVAL;
-    if (p->auth_token_count > MOQ_D21_MAX_AUTH_TOKENS) return MOQ_ERR_INVAL;
-    uint64_t count = (p->has_object_delivery_timeout ? 1u : 0u) +
-                     (uint64_t)p->auth_token_count +
-                     (p->has_subgroup_delivery_timeout ? 1u : 0u) +
-                     (p->has_expires ? 1u : 0u) +
-                     (p->has_largest ? 1u : 0u) +
-                     (p->has_forward ? 1u : 0u) +
-                     (p->has_subscriber_priority ? 1u : 0u) +
-                     (p->has_filter ? 1u : 0u) +
-                     (p->has_group_order ? 1u : 0u) +
-                     (p->has_new_group_request ? 1u : 0u);
     size_t saved = w->pos;
-    moq_result_t rc = moq_buf_write_vi64(w, count);
+    moq_result_t rc = moq_buf_write_vi64(w, d21_param_count(p));
     if (rc < 0) return rc;
-    /* Ascending Type-Delta order: OBJECT_DELIVERY_TIMEOUT (0x02),
-     * AUTHORIZATION_TOKEN (0x03, repeatable), SUBGROUP_DELIVERY_TIMEOUT (0x06),
-     * EXPIRES (0x08), LARGEST_OBJECT (0x09), FORWARD (0x10), SUBSCRIBER_PRIORITY
-     * (0x20), SUBSCRIPTION_FILTER (0x21), GROUP_ORDER (0x22),
-     * NEW_GROUP_REQUEST (0x32). The delta is the type minus the previous type
-     * (the type itself for the first parameter; zero for a repeated
-     * AUTHORIZATION_TOKEN). */
-    uint64_t prev = 0;
-    if (p->has_object_delivery_timeout) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT - prev)) < 0) goto fail;
-        if ((rc = moq_buf_write_vi64(w, p->object_delivery_timeout_ms)) < 0)
-            goto fail;
-        prev = MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT;
-    }
-    /* AUTHORIZATION_TOKEN (0x03) is repeatable: emit each token, the first as a
-     * delta from the previous type and the rest as a zero delta. */
-    for (size_t i = 0; i < p->auth_token_count; i++) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_AUTHORIZATION_TOKEN - prev)) < 0) goto fail;
-        if ((rc = d21_write_auth_token(w, &p->auth_tokens[i])) < 0) goto fail;
-        prev = MOQ_D21_PARAM_AUTHORIZATION_TOKEN;
-    }
-    if (p->has_subgroup_delivery_timeout) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT - prev)) < 0) goto fail;
-        if ((rc = moq_buf_write_vi64(w, p->subgroup_delivery_timeout_ms)) < 0)
-            goto fail;
-        prev = MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT;
-    }
-    if (p->has_expires) {
-        if ((rc = moq_buf_write_vi64(w, MOQ_D21_PARAM_EXPIRES - prev)) < 0)
-            goto fail;
-        if ((rc = moq_buf_write_vi64(w, p->expires_ms)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_EXPIRES;
-    }
-    if (p->has_largest) {
-        if ((rc = moq_buf_write_vi64(w, MOQ_D21_PARAM_LARGEST_OBJECT - prev)) < 0)
-            goto fail;
-        if ((rc = moq_buf_write_vi64(w, p->largest_group)) < 0) goto fail;
-        if ((rc = moq_buf_write_vi64(w, p->largest_object)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_LARGEST_OBJECT;
-    }
-    if (p->has_forward) {
-        if ((rc = moq_buf_write_vi64(w, MOQ_D21_PARAM_FORWARD - prev)) < 0)
-            goto fail;
-        if ((rc = d21_write_u8(w, p->forward)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_FORWARD;
-    }
-    if (p->has_subscriber_priority) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_SUBSCRIBER_PRIORITY - prev)) < 0) goto fail;
-        if ((rc = d21_write_u8(w, p->subscriber_priority)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_SUBSCRIBER_PRIORITY;
-    }
-    if (p->has_filter) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_SUBSCRIPTION_FILTER - prev)) < 0) goto fail;
-        if ((rc = d21_write_filter(w, p)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_SUBSCRIPTION_FILTER;
-    }
-    if (p->has_group_order) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_GROUP_ORDER - prev)) < 0) goto fail;
-        if ((rc = d21_write_u8(w, p->group_order)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_GROUP_ORDER;
-    }
-    if (p->has_new_group_request) {
-        if ((rc = moq_buf_write_vi64(w,
-                MOQ_D21_PARAM_NEW_GROUP_REQUEST - prev)) < 0) goto fail;
-        if ((rc = moq_buf_write_vi64(w, p->new_group_request)) < 0) goto fail;
-        prev = MOQ_D21_PARAM_NEW_GROUP_REQUEST;
+    if ((rc = d21_write_params_body(w, p)) < 0) {
+        w->pos = saved;
+        return rc;
     }
     return MOQ_OK;
-fail:
-    w->pos = saved;
-    return rc;
 }
 
-moq_result_t moq_d21_decode_msg_params(moq_buf_reader_t *r, uint64_t count,
-                                       uint32_t allowed_mask,
-                                       moq_d21_msg_params_t *out)
+/* A Parameter Type that may repeat in one message: AUTHORIZATION_TOKEN (8.9) and
+ * the Range Filters, which the draft lets a message carry more than once with
+ * distinct keys (3.3.2). Any other repeat is a protocol violation (9.20). */
+static bool d21_type_may_repeat(uint64_t type, uint32_t mask)
 {
-    if (!r || !out) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
+    switch (type) {
+    case MOQ_D21_PARAM_AUTHORIZATION_TOKEN:
+        return (mask & MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN) != 0;
+    case MOQ_D21_PARAM_SUBGROUP_FILTER:
+        return (mask & MOQ_D21_PARAM_BIT_SUBGROUP_FILTER) != 0;
+    case MOQ_D21_PARAM_OBJECTID_FILTER:
+        return (mask & MOQ_D21_PARAM_BIT_OBJECTID_FILTER) != 0;
+    case MOQ_D21_PARAM_PRIORITY_FILTER:
+        return (mask & MOQ_D21_PARAM_BIT_PRIORITY_FILTER) != 0;
+    case MOQ_D21_PARAM_OBJECT_PROPERTY_FILTER:
+        return (mask & MOQ_D21_PARAM_BIT_OBJECT_PROPERTY_FILTER) != 0;
+    case MOQ_D21_PARAM_TRACK_PROPERTY_FILTER:
+        return (mask & MOQ_D21_PARAM_BIT_TRACK_PROPERTY_FILTER) != 0;
+    default:
+        return false;
+    }
+}
+
+/* Decode a parameter sequence. With `until_end` the sequence runs to the end of
+ * the reader (a nested FILL_PARAMETERS block, which has no count); otherwise
+ * `count` parameters are read. `out` must already be zeroed. */
+static moq_result_t d21_decode_params_inner(moq_buf_reader_t *r, uint64_t count,
+                                            bool until_end, uint32_t allowed_mask,
+                                            moq_result_t trunc_rc,
+                                            moq_d21_msg_params_t *out)
+{
     uint64_t prev = 0;
-    for (uint64_t i = 0; i < count; i++) {
+    for (uint64_t i = 0; until_end ? moq_buf_reader_remaining(r) > 0 : i < count;
+         i++) {
         uint64_t delta;
-        if (moq_buf_read_vi64(r, &delta) < 0) return MOQ_ERR_BUFFER;
+        if (moq_buf_read_vi64(r, &delta) < 0) return trunc_rc;
         uint64_t type;
         if (delta == 0) {
-            /* A zero delta repeats the previous Parameter Type. Only
-             * AUTHORIZATION_TOKEN may repeat (§10.2.2); any other zero delta is
-             * a duplicate or out-of-order parameter. */
-            if (prev != MOQ_D21_PARAM_AUTHORIZATION_TOKEN ||
-                !(allowed_mask & MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN))
-                return MOQ_ERR_PROTO;
+            if (!d21_type_may_repeat(prev, allowed_mask)) return MOQ_ERR_PROTO;
             type = prev;
         } else {
             if (delta > UINT64_MAX - prev) return MOQ_ERR_PROTO;
             type = prev + delta;
         }
         prev = type;
+#define D21_REQUIRE(bit) do { if (!(allowed_mask & (bit))) return MOQ_ERR_PROTO; } while (0)
+#define D21_READ_VI64(dst) do { if (moq_buf_read_vi64(r, &(dst)) < 0) return trunc_rc; } while (0)
         switch (type) {
-        case MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT))
-                return MOQ_ERR_PROTO;
-            if (moq_buf_read_vi64(r, &out->object_delivery_timeout_ms) < 0)
-                return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_OBJECT_DELIVERY_TIMEOUT:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_OBJECT_DELIVERY_TIMEOUT);
+            D21_READ_VI64(out->object_delivery_timeout_ms);
             out->has_object_delivery_timeout = true;
             break;
-        }
         case MOQ_D21_PARAM_AUTHORIZATION_TOKEN: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN))
-                return MOQ_ERR_PROTO;
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_AUTHORIZATION_TOKEN);
             if (out->auth_token_count >= MOQ_D21_MAX_AUTH_TOKENS)
                 return MOQ_ERR_PROTO;       /* too many auth tokens */
             moq_result_t arc = d21_read_auth_token(
@@ -1731,119 +1799,159 @@ moq_result_t moq_d21_decode_msg_params(moq_buf_reader_t *r, uint64_t count,
             out->auth_token_count++;
             break;
         }
-        case MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT))
-                return MOQ_ERR_PROTO;
-            if (moq_buf_read_vi64(r, &out->subgroup_delivery_timeout_ms) < 0)
-                return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_RENDEZVOUS_TIMEOUT:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT);
+            D21_READ_VI64(out->rendezvous_timeout_ms);
+            out->has_rendezvous_timeout = true;
+            break;
+        case MOQ_D21_PARAM_SUBGROUP_DELIVERY_TIMEOUT:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_SUBGROUP_DELIVERY_TIMEOUT);
+            D21_READ_VI64(out->subgroup_delivery_timeout_ms);
             out->has_subgroup_delivery_timeout = true;
             break;
-        }
-        case MOQ_D21_PARAM_EXPIRES: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_EXPIRES))
-                return MOQ_ERR_PROTO;
-            if (moq_buf_read_vi64(r, &out->expires_ms) < 0) return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_EXPIRES:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_EXPIRES);
+            D21_READ_VI64(out->expires_ms);
             out->has_expires = true;
             break;
-        }
-        case MOQ_D21_PARAM_LARGEST_OBJECT: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_LARGEST_OBJECT))
-                return MOQ_ERR_PROTO;
-            if (moq_buf_read_vi64(r, &out->largest_group) < 0)
-                return MOQ_ERR_BUFFER;
-            if (moq_buf_read_vi64(r, &out->largest_object) < 0)
-                return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_LARGEST_OBJECT:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_LARGEST_OBJECT);
+            D21_READ_VI64(out->largest_group);
+            D21_READ_VI64(out->largest_object);
             out->has_largest = true;
             break;
-        }
+        case MOQ_D21_PARAM_FILL_TIMEOUT:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_FILL_TIMEOUT);
+            D21_READ_VI64(out->fill_timeout_ms);
+            out->has_fill_timeout = true;
+            break;
         case MOQ_D21_PARAM_FORWARD: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_FORWARD))
-                return MOQ_ERR_PROTO;
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_FORWARD);
             uint8_t v;
-            if (d21_read_u8(r, &v) < 0) return MOQ_ERR_BUFFER;
-            if (v > 1) return MOQ_ERR_PROTO;     /* §10.2.12: only 0 or 1 */
+            if (d21_read_u8(r, &v) < 0) return trunc_rc;
+            if (v > 1) return MOQ_ERR_PROTO;       /* 9.20.19: only 0 or 1 */
             out->has_forward = true;
             out->forward = v;
             break;
         }
         case MOQ_D21_PARAM_SUBSCRIBER_PRIORITY: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY))
-                return MOQ_ERR_PROTO;
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_SUBSCRIBER_PRIORITY);
             uint8_t v;
-            if (d21_read_u8(r, &v) < 0) return MOQ_ERR_BUFFER;
+            if (d21_read_u8(r, &v) < 0) return trunc_rc;
             out->has_subscriber_priority = true;
             out->subscriber_priority = v;
             break;
         }
-        case MOQ_D21_PARAM_SUBSCRIPTION_FILTER: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_SUBSCRIPTION_FILTER))
-                return MOQ_ERR_PROTO;
-            moq_result_t frc = d21_read_filter(r, out);
+        case MOQ_D21_PARAM_LOCATION_FILTER: {
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_LOCATION_FILTER);
+            moq_result_t frc = d21_read_location_filter(r, &out->location_filter,
+                                                        trunc_rc);
             if (frc < 0) return frc;
+            out->has_location_filter = true;
             break;
         }
         case MOQ_D21_PARAM_GROUP_ORDER: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_GROUP_ORDER))
-                return MOQ_ERR_PROTO;
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_GROUP_ORDER);
             uint8_t v;
-            if (d21_read_u8(r, &v) < 0) return MOQ_ERR_BUFFER;
-            if (v < 1 || v > 2) return MOQ_ERR_PROTO;  /* §10.2.8: 1 or 2 */
+            if (d21_read_u8(r, &v) < 0) return trunc_rc;
+            if (v < 1 || v > 2) return MOQ_ERR_PROTO;   /* 9.20.9: 1 or 2 */
             out->has_group_order = true;
             out->group_order = v;
             break;
         }
-        /* Defined-but-unmodeled parameters (§10.2.5/6/14): a defined parameter
-         * must not be treated as unknown (that closes the session), so its value
-         * is decoded and form-validated, then dropped. Scope masks still apply
-         * (§10.2.1: a defined parameter in the wrong message closes).
-         * NEW_GROUP_REQUEST (§10.2.13) is modeled and stored below. */
-        case MOQ_D21_PARAM_RENDEZVOUS_TIMEOUT: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_RENDEZVOUS_TIMEOUT))
-                return MOQ_ERR_PROTO;
-            uint64_t v;
-            if (moq_buf_read_vi64(r, &v) < 0) return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_FILL_PARAMETERS: {
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_FILL_PARAMETERS);
+            moq_bytes_t span;
+            if (d21_read_span(r, &span) < 0) return trunc_rc;
+            moq_buf_reader_t fr;
+            moq_buf_reader_init(&fr, span.data, span.len);
+            moq_d21_msg_params_t inner;
+            memset(&inner, 0, sizeof(inner));
+            moq_result_t frc = d21_decode_params_inner(
+                &fr, 0, true, MOQ_D21_MASK_FILL_NESTED, MOQ_ERR_PROTO, &inner);
+            if (frc < 0) return frc;
+            moq_d21_fill_params_t *f = &out->fill;
+            memset(f, 0, sizeof(*f));
+            f->has_fill_timeout = inner.has_fill_timeout;
+            f->fill_timeout_ms = inner.fill_timeout_ms;
+            f->has_subscriber_priority = inner.has_subscriber_priority;
+            f->subscriber_priority = inner.subscriber_priority;
+            f->has_group_order = inner.has_group_order;
+            f->group_order = inner.group_order;
+            f->has_location_filter = inner.has_location_filter;
+            f->location_filter = inner.location_filter;
+            f->range_filter_params = inner.range_filter_params;
+            f->range_filter_ranges = inner.range_filter_ranges;
+            f->range_filter_invalid = inner.range_filter_invalid;
+            out->has_fill = true;
             break;
         }
-        case MOQ_D21_PARAM_FILL_TIMEOUT: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_FILL_TIMEOUT))
-                return MOQ_ERR_PROTO;
-            uint64_t v;
-            if (moq_buf_read_vi64(r, &v) < 0) return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_SUBGROUP_FILTER:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_SUBGROUP_FILTER); goto range_filter;
+        case MOQ_D21_PARAM_OBJECTID_FILTER:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_OBJECTID_FILTER); goto range_filter;
+        case MOQ_D21_PARAM_PRIORITY_FILTER:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_PRIORITY_FILTER); goto range_filter;
+        case MOQ_D21_PARAM_OBJECT_PROPERTY_FILTER:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_OBJECT_PROPERTY_FILTER); goto range_filter;
+        case MOQ_D21_PARAM_TRACK_PROPERTY_FILTER:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_TRACK_PROPERTY_FILTER);
+        range_filter: {
+            moq_result_t frc = d21_read_range_filter(
+                r, type, trunc_rc, &out->range_filter_params,
+                &out->range_filter_ranges, &out->range_filter_invalid);
+            if (frc < 0) return frc;
             break;
         }
-        case MOQ_D21_PARAM_NEW_GROUP_REQUEST: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST))
-                return MOQ_ERR_PROTO;
-            if (out->has_new_group_request) return MOQ_ERR_PROTO;  /* dup */
-            uint64_t v;
-            if (moq_buf_read_vi64(r, &v) < 0) return MOQ_ERR_BUFFER;
+        case MOQ_D21_PARAM_NEW_GROUP_REQUEST:
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_NEW_GROUP_REQUEST);
+            D21_READ_VI64(out->new_group_request);
             out->has_new_group_request = true;
-            out->new_group_request = v;
             break;
-        }
         case MOQ_D21_PARAM_TRACK_NAMESPACE_PREFIX: {
-            if (!(allowed_mask & MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX))
-                return MOQ_ERR_PROTO;
-            /* Track Namespace Prefix (§10.2.14): a Track Namespace with 0..32
-             * fields -- a zero-field (root) prefix is legal. Validate + skip. */
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_TRACK_NAMESPACE_PREFIX);
+            /* A Track Namespace with 0..32 fields (9.20.21); a zero-field root
+             * prefix is legal. Validated and skipped, not surfaced. */
             uint64_t nparts;
-            if (moq_buf_read_vi64(r, &nparts) < 0) return MOQ_ERR_BUFFER;
+            D21_READ_VI64(nparts);
             if (nparts > 32) return MOQ_ERR_PROTO;
             for (uint64_t pi = 0; pi < nparts; pi++) {
                 uint64_t plen;
-                if (moq_buf_read_vi64(r, &plen) < 0) return MOQ_ERR_BUFFER;
+                D21_READ_VI64(plen);
                 if (plen == 0) return MOQ_ERR_PROTO;
-                if (plen > moq_buf_reader_remaining(r)) return MOQ_ERR_BUFFER;
+                if (plen > moq_buf_reader_remaining(r)) return trunc_rc;
                 r->pos += (size_t)plen;
             }
+            out->has_track_namespace_prefix = true;
+            break;
+        }
+        case MOQ_D21_PARAM_INCLUDE_PROPERTIES: {
+            D21_REQUIRE(MOQ_D21_PARAM_BIT_INCLUDE_PROPERTIES);
+            uint8_t v;
+            if (d21_read_u8(r, &v) < 0) return trunc_rc;
+            if (v > 1) return MOQ_ERR_PROTO;       /* 9.20.22: only 0 or 1 */
+            out->has_include_properties = true;
+            out->include_properties = v;
             break;
         }
         default:
-            /* Unknown parameters cannot be skipped (§10.2). */
+            /* Unknown parameters cannot be skipped (9.20). */
             return MOQ_ERR_PROTO;
         }
+#undef D21_REQUIRE
+#undef D21_READ_VI64
     }
     return MOQ_OK;
+}
+
+moq_result_t moq_d21_decode_msg_params(moq_buf_reader_t *r, uint64_t count,
+                                       uint32_t allowed_mask,
+                                       moq_d21_msg_params_t *out)
+{
+    if (!r || !out) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    return d21_decode_params_inner(r, count, false, allowed_mask, MOQ_ERR_BUFFER,
+                                   out);
 }
 
 /* -- REQUEST_UPDATE (draft-18 §10.9) ------------------------------- */
@@ -1853,7 +1961,7 @@ moq_result_t moq_d21_encode_request_update(moq_buf_writer_t *w,
                                            const moq_d21_msg_params_t *p)
 {
     if (!w || !p) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(p, D21_REQUEST_UPDATE_PARAM_MASK))
+    if (!d21_params_within_mask(p, MOQ_D21_MASK_REQUEST_UPDATE))
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_UPDATE, &len_off);
@@ -1881,7 +1989,7 @@ moq_result_t moq_d21_decode_request_update(const uint8_t *payload,
     /* A subscription REQUEST_UPDATE carries FORWARD / SUBSCRIBER_PRIORITY /
      * SUBSCRIPTION_FILTER and the delivery-timeout parameters. */
     if ((rc = moq_d21_decode_msg_params(&r, count,
-            D21_REQUEST_UPDATE_PARAM_MASK, &out->params)) < 0) return rc;
+            MOQ_D21_MASK_REQUEST_UPDATE, &out->params)) < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     return MOQ_OK;
 }
@@ -1926,14 +2034,12 @@ moq_result_t moq_d21_decode_request_ok(const uint8_t *payload,
  * §10.2, where EXPIRES = 0x08 and LARGEST_OBJECT = 0x09): a REQUEST_UPDATE_OK
  * MAY carry LARGEST_OBJECT and EXPIRES; Track Properties are empty. Distinct
  * from the zero-parameter REQUEST_OK form above. */
-#define D21_REQUEST_UPDATE_OK_PARAM_MASK \
-    (MOQ_D21_PARAM_BIT_EXPIRES | MOQ_D21_PARAM_BIT_LARGEST_OBJECT)
 
 moq_result_t moq_d21_encode_request_update_ok(moq_buf_writer_t *w,
                                               const moq_d21_msg_params_t *p)
 {
     if (!w || !p) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(p, D21_REQUEST_UPDATE_OK_PARAM_MASK))
+    if (!d21_params_within_mask(p, MOQ_D21_MASK_REQUEST_UPDATE_OK))
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
@@ -1959,7 +2065,7 @@ moq_result_t moq_d21_decode_request_update_ok(const uint8_t *payload,
     moq_result_t rc = moq_buf_read_vi64(&r, &count);
     if (rc < 0) return rc;
     if ((rc = moq_d21_decode_msg_params(&r, count,
-            D21_REQUEST_UPDATE_OK_PARAM_MASK, out)) < 0) return rc;
+            MOQ_D21_MASK_REQUEST_UPDATE_OK, out)) < 0) return rc;
     /* Empty Track Properties (§10.5): any trailing bytes are a violation. */
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     return MOQ_OK;
@@ -2111,7 +2217,7 @@ moq_result_t moq_d21_encode_fetch(moq_buf_writer_t *w, const moq_d21_fetch_t *f)
     if (f->fetch_type < MOQ_D21_FETCH_TYPE_STANDALONE ||
         f->fetch_type > MOQ_D21_FETCH_TYPE_ABSOLUTE)
         return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(&f->params, D21_FETCH_PARAM_MASK))
+    if (!d21_params_within_mask(&f->params, MOQ_D21_MASK_FETCH))
         return MOQ_ERR_INVAL;
 
     size_t saved = w->pos, len_off;
@@ -2175,7 +2281,7 @@ moq_result_t moq_d21_decode_fetch(const uint8_t *payload, size_t payload_len,
     if ((rc = moq_buf_read_vi64(&r, &param_count)) < 0) return rc;
     /* FETCH carries SUBSCRIBER_PRIORITY / GROUP_ORDER and AUTHORIZATION_TOKEN
      * (no FORWARD or filter). */
-    rc = moq_d21_decode_msg_params(&r, param_count, D21_FETCH_PARAM_MASK,
+    rc = moq_d21_decode_msg_params(&r, param_count, MOQ_D21_MASK_FETCH,
                                    &out->params);
     if (rc < 0) return rc;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
