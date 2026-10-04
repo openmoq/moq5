@@ -1292,6 +1292,233 @@ static void t_code_registries(void)
     MOQ_TEST_CHECK(!moq_d21_session_error_registered(0x15));   /* VERSION_NEGOTIATION_FAILED removed */
 }
 
+
+/* == 4d. PUBLISH, PUBLISH_DONE, PUBLISH_STATE_NOTIFY, PUBLISH_SKIPPED ====== */
+
+static void t_publish(void)
+{
+    /* 9.8: Request ID 7, namespace [a], name t, alias 9. Draft 21 moves the
+     * subscription parameters onto PUBLISH itself (they are no longer in
+     * PUBLISH_OK): LARGEST_OBJECT {4,2}, FORWARD 0, SUBSCRIBER_PRIORITY 100,
+     * GROUP_ORDER 1, then a Track Property (DEFAULT_PUBLISHER_PRIORITY = 10). */
+    uint8_t buf[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("a") };
+    static const uint8_t props[] = { 0x0E, 0x0A };
+    moq_d21_publish_t p;
+    memset(&p, 0, sizeof(p));
+    p.request_id = 7;
+    p.track_namespace.parts = parts; p.track_namespace.count = 1;
+    p.track_name = MOQ_BYTES_LITERAL("t");
+    p.track_alias = 9;
+    p.params.has_largest = true; p.params.largest_group = 4; p.params.largest_object = 2;
+    p.params.has_forward = true; p.params.forward = 0;
+    p.params.has_subscriber_priority = true; p.params.subscriber_priority = 100;
+    p.params.has_group_order = true; p.params.group_order = 1;
+    p.track_properties.data = props; p.track_properties.len = sizeof(props);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &p), (int)MOQ_OK);
+    static const uint8_t want[] = {
+        0x1D, 0x00, 0x13, 0x07, 0x01, 0x01, 'a', 0x01, 't', 0x09,
+        0x04, 0x09, 0x04, 0x02, 0x07, 0x00, 0x10, 0x64, 0x02, 0x01,
+        0x0E, 0x0A };
+    check_bytes("PUBLISH", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_PUBLISH);
+    moq_bytes_t dparts[32];
+    moq_d21_publish_t g;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish(env.payload, env.payload_len,
+                                                      dparts, 32, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(g.request_id, 7);
+    MOQ_TEST_CHECK_EQ_U64(g.track_alias, 9);
+    MOQ_TEST_CHECK(g.params.has_largest && g.params.largest_group == 4 &&
+                   g.params.largest_object == 2);
+    MOQ_TEST_CHECK(g.params.has_forward && g.params.forward == 0);
+    MOQ_TEST_CHECK(g.params.has_subscriber_priority && g.params.subscriber_priority == 100);
+    MOQ_TEST_CHECK(g.params.has_group_order && g.params.group_order == 1);
+    MOQ_TEST_CHECK_EQ_SIZE(g.track_properties.len, 2);
+    MOQ_TEST_CHECK(!g.dynamic_groups && !g.track_properties_unsupported);
+
+    /* DYNAMIC_GROUPS and a Mandatory Track Property are surfaced (10.6, 3.6). */
+    static const uint8_t dyn[] = { 0x07, 0x01, 0x01, 'a', 0x01, 't', 0x09, 0x00, 0x30, 0x01 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish(dyn, sizeof(dyn), dparts, 32, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.dynamic_groups);
+    static const uint8_t mand[] = { 0x07, 0x01, 0x01, 'a', 0x01, 't', 0x09, 0x00, 0xC0, 0x40, 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish(mand, sizeof(mand), dparts, 32, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.track_properties_unsupported);
+
+    /* PUBLISH does not take FILL_PARAMETERS or INCLUDE_PROPERTIES: those are
+     * requests a subscriber makes (9.20.16, 9.20.22). */
+    static const uint8_t fill[] = { 0x07, 0x01, 0x01, 'a', 0x01, 't', 0x09, 0x01, 0x23, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish(fill, sizeof(fill), dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    memset(&p.params, 0, sizeof(p.params));
+    p.params.has_include_properties = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &p), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+
+    /* A Full Track Name over 4096 bytes closes on receipt (8.7). */
+    {
+        static uint8_t big[4200];
+        size_t n = 0;
+        big[n++] = 0x07; big[n++] = 0x01; big[n++] = 0x01; big[n++] = 'a';
+        big[n++] = 0x90; big[n++] = 0x01;            /* name length 4097 = 0x1001 -> 2-byte vi64 */
+        big[n - 2] = 0x90; big[n - 1] = 0x01;
+        memset(big + n, 'x', 4097); n += 4097;
+        big[n++] = 0x09; big[n++] = 0x00;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish(big, n, dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    }
+    /* Malformed Track Properties are refused on send and fail the decode. */
+    {
+        static const uint8_t badp[] = { 0x01, 0x05, 'a' };     /* odd type, length 5 > 1 */
+        p.track_properties.data = badp; p.track_properties.len = sizeof(badp);
+        memset(&p.params, 0, sizeof(p.params));
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &p), (int)MOQ_ERR_INVAL);
+    }
+}
+
+static void t_publish_done(void)
+{
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+
+    /* 9.9: UPDATE_FAILED (0x08), 3 streams, reason "x". */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_done(&w, MOQ_D21_PUBLISH_DONE_UPDATE_FAILED,
+        3, MOQ_BYTES_LITERAL("x")), (int)MOQ_OK);
+    static const uint8_t want[] = { 0x0B, 0x00, 0x04, 0x08, 0x03, 0x01, 'x' };
+    check_bytes("PUBLISH_DONE", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_PUBLISH_DONE);
+    moq_d21_publish_done_t d;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_done(env.payload, env.payload_len, &d), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.status_code, 8);
+    MOQ_TEST_CHECK_EQ_U64(d.stream_count, 3);
+    MOQ_TEST_CHECK(d.reason.len == 1 && d.reason.data[0] == 'x');
+
+    /* Stream Count is a full-range vi64: 2^64-1 means "could not count" (9.9). */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_done(&w, MOQ_D21_PUBLISH_DONE_TRACK_ENDED,
+        UINT64_MAX, NO_BYTES), (int)MOQ_OK);
+    static const uint8_t maxc[] = { 0x0B, 0x00, 0x0B, 0x02,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    check_bytes("PUBLISH_DONE max stream count", buf, moq_buf_writer_offset(&w), maxc, sizeof(maxc));
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_PUBLISH_DONE);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_done(env.payload, env.payload_len, &d), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.stream_count, UINT64_MAX);
+
+    /* The codec carries any status value: an unregistered one (SUBSCRIPTION_ENDED
+     * was removed, and GREASE is reserved) is handled by the session as
+     * INTERNAL_ERROR, never by closing (13). */
+    static const uint8_t ended[] = { 0x03, 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_done(ended, sizeof(ended), &d), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(d.status_code, 3);
+    MOQ_TEST_CHECK(!moq_d21_publish_done_registered(d.status_code));
+
+    /* Trailing bytes and an over-long reason (8.5) are protocol violations. */
+    static const uint8_t extra[] = { 0x02, 0x00, 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_done(extra, sizeof(extra), &d), (int)MOQ_ERR_PROTO);
+    static uint8_t reason[1025];
+    memset(reason, 'r', sizeof(reason));
+    static uint8_t body[1040];
+    size_t bn = 0;
+    body[bn++] = 0x02; body[bn++] = 0x00; body[bn++] = 0x84; body[bn++] = 0x01;
+    memcpy(body + bn, reason, 1025); bn += 1025;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_done(body, bn, &d), (int)MOQ_ERR_PROTO);
+    moq_bytes_t r1025 = { reason, 1025 };
+    moq_buf_writer_t bw;
+    static uint8_t big[1100];
+    moq_buf_writer_init(&bw, big, sizeof(big));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_done(&bw, 0, 0, r1025), (int)MOQ_ERR_INVAL);
+}
+
+static void t_publish_state_notify(void)
+{
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+
+    /* 9.10: type 0x22, no Request ID, a bare parameter block. FORWARD = 0. */
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_forward = true; p.forward = 0;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_state_notify(&w, &p), (int)MOQ_OK);
+    static const uint8_t fwd[] = { 0x22, 0x00, 0x03, 0x01, 0x10, 0x00 };
+    check_bytes("PUBLISH_STATE_NOTIFY forward", buf, moq_buf_writer_offset(&w), fwd, sizeof(fwd));
+
+    /* The three parameters it may carry (9.20.10, 9.20.18, 9.20.19), with the
+     * LARGEST_OBJECT the draft requires the publisher to include when known. */
+    memset(&p, 0, sizeof(p));
+    p.has_largest = true; p.largest_group = 9; p.largest_object = 1;
+    p.has_forward = true; p.forward = 1;
+    p.has_location_filter = true; p.location_filter.field_count = 2;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_state_notify(&w, &p), (int)MOQ_OK);
+    static const uint8_t all[] = { 0x22, 0x00, 0x0A, 0x03,
+        0x09, 0x09, 0x01, 0x07, 0x01, 0x11, 0x02, 0x00, 0x00 };
+    check_bytes("PUBLISH_STATE_NOTIFY all", buf, moq_buf_writer_offset(&w), all, sizeof(all));
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_PUBLISH_STATE_NOTIFY);
+    moq_d21_publish_state_notify_t n;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_state_notify(env.payload, env.payload_len, &n), (int)MOQ_OK);
+    MOQ_TEST_CHECK(n.params.has_largest && n.params.largest_group == 9);
+    MOQ_TEST_CHECK(n.params.has_forward && n.params.forward == 1);
+    MOQ_TEST_CHECK(n.params.has_location_filter && n.params.location_filter.field_count == 2);
+
+    /* An empty notification is valid, and nothing may follow the parameters. */
+    static const uint8_t empty[] = { 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_state_notify(empty, sizeof(empty), &n), (int)MOQ_OK);
+    static const uint8_t trailing[] = { 0x00, 0x0E, 0x05 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_state_notify(trailing, sizeof(trailing), &n),
+                          (int)MOQ_ERR_PROTO);
+
+    /* Subscriber-controlled parameters other than FORWARD and the filter are not
+     * allowed (a publisher must not change them), nor are fills or tokens. */
+    static const uint8_t prio[] = { 0x01, 0x20, 0x05 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_state_notify(prio, sizeof(prio), &n), (int)MOQ_ERR_PROTO);
+    memset(&p, 0, sizeof(p));
+    p.has_subscriber_priority = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_state_notify(&w, &p), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_state_notify(&w, NULL), (int)MOQ_ERR_INVAL);
+}
+
+static void t_publish_skipped(void)
+{
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+
+    /* 9.19: suffix [a], track name t. Renamed from PUBLISH_BLOCKED; same bytes. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("a") };
+    moq_namespace_t suffix = { parts, 1 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish_skipped(&w, &suffix, MOQ_BYTES_LITERAL("t")),
+                          (int)MOQ_OK);
+    static const uint8_t want[] = { 0x0F, 0x00, 0x05, 0x01, 0x01, 'a', 0x01, 't' };
+    check_bytes("PUBLISH_SKIPPED", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_SKIPPED, 0x0F);
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_PUBLISH_SKIPPED);
+    moq_bytes_t dparts[32];
+    moq_d21_publish_skipped_t g;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_skipped(env.payload, env.payload_len,
+                                                              dparts, 32, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(g.track_namespace_suffix.count, 1);
+    MOQ_TEST_CHECK(g.track_name.len == 1 && g.track_name.data[0] == 't');
+
+    /* A zero-field suffix is valid (the track sits directly under the prefix). */
+    static const uint8_t root[] = { 0x00, 0x01, 't' };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_skipped(root, sizeof(root), dparts, 32, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(g.track_namespace_suffix.count, 0);
+    /* 33 fields close the session (8.7). */
+    uint8_t many[120];
+    size_t n = 0;
+    many[n++] = 33;
+    for (int i = 0; i < 33; i++) { many[n++] = 0x01; many[n++] = 'x'; }
+    many[n++] = 0x01; many[n++] = 't';
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_skipped(many, n, dparts, 40, &g), (int)MOQ_ERR_PROTO);
+}
+
 int main(void)
 {
     t_setup_options_encode();
@@ -1312,6 +1539,10 @@ int main(void)
     t_request_ok();
     t_request_error();
     t_code_registries();
+    t_publish();
+    t_publish_done();
+    t_publish_state_notify();
+    t_publish_skipped();
 
     if (failures)
         fprintf(stderr, "test_control_d21: %d byte-vector failures\n", failures);

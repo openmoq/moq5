@@ -342,9 +342,9 @@ moq_result_t moq_d21_decode_subscribe_tracks(const uint8_t *payload,
     return MOQ_OK;
 }
 
-/* -- PUBLISH_BLOCKED (draft-18 §10.20) ----------------------------- */
+/* -- PUBLISH_SKIPPED (draft-21 9.19) ------------------------------- */
 
-moq_result_t moq_d21_encode_publish_blocked(moq_buf_writer_t *w,
+moq_result_t moq_d21_encode_publish_skipped(moq_buf_writer_t *w,
                                             const moq_namespace_t *suffix,
                                             moq_bytes_t track_name)
 {
@@ -352,7 +352,7 @@ moq_result_t moq_d21_encode_publish_blocked(moq_buf_writer_t *w,
     if (d21_full_track_len(suffix, track_name) > MOQ_D21_MAX_FULL_TRACK)
         return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
-    moq_result_t rc = d21_write_header(w, MOQ_D21_PUBLISH_BLOCKED, &len_off);
+    moq_result_t rc = d21_write_header(w, MOQ_D21_PUBLISH_SKIPPED, &len_off);
     if (rc < 0) return rc;
     if ((rc = d21_write_namespace(w, suffix)) < 0) goto fail;
     if ((rc = d21_write_span(w, track_name)) < 0) goto fail;
@@ -363,11 +363,11 @@ fail:
     return rc;
 }
 
-moq_result_t moq_d21_decode_publish_blocked(const uint8_t *payload,
+moq_result_t moq_d21_decode_publish_skipped(const uint8_t *payload,
                                             size_t payload_len,
                                             moq_bytes_t *parts,
                                             size_t max_parts,
-                                            moq_d21_publish_blocked_t *out)
+                                            moq_d21_publish_skipped_t *out)
 {
     if (!payload || !parts || !out) return MOQ_ERR_INVAL;
     moq_buf_reader_t r;
@@ -2041,7 +2041,7 @@ moq_result_t moq_d21_decode_request_update(const uint8_t *payload,
 
 /* -- REQUEST_OK (draft-18 §10.5) ----------------------------------- */
 
-/* -- PUBLISH_DONE (draft-18 §10.11) -------------------------------- */
+/* -- PUBLISH_DONE (draft-21 9.9) ----------------------------------- */
 
 moq_result_t moq_d21_encode_publish_done(moq_buf_writer_t *w,
                                          uint64_t status_code,
@@ -2077,6 +2077,44 @@ moq_result_t moq_d21_decode_publish_done(const uint8_t *payload,
     rc = d21_read_span(&r, &out->reason);
     if (rc < 0) return rc;
     if (out->reason.len > MOQ_D21_MAX_REASON) return MOQ_ERR_PROTO;
+    if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
+    return MOQ_OK;
+}
+
+/* -- PUBLISH_STATE_NOTIFY (draft-21 9.10) ------------------------- */
+
+moq_result_t moq_d21_encode_publish_state_notify(moq_buf_writer_t *w,
+                                                 const moq_d21_msg_params_t *params)
+{
+    if (!w || !params) return MOQ_ERR_INVAL;
+    if (!d21_params_within_mask(params, MOQ_D21_MASK_PUBLISH_STATE_NOTIFY))
+        return MOQ_ERR_INVAL;
+    size_t saved = w->pos, len_off;
+    moq_result_t rc = d21_write_header(w, MOQ_D21_PUBLISH_STATE_NOTIFY, &len_off);
+    if (rc < 0) return rc;
+    if ((rc = moq_d21_encode_msg_params(w, params)) < 0) goto fail;
+    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
+    return MOQ_OK;
+fail:
+    w->pos = saved;
+    return rc;
+}
+
+moq_result_t moq_d21_decode_publish_state_notify(
+    const uint8_t *payload, size_t payload_len,
+    moq_d21_publish_state_notify_t *out)
+{
+    if (!payload || !out) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, payload, payload_len);
+    uint64_t count;
+    moq_result_t rc = moq_buf_read_vi64(&r, &count);
+    if (rc < 0) return rc;
+    if ((rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_PUBLISH_STATE_NOTIFY,
+                                        &out->params)) < 0)
+        return rc;
+    /* The body is the parameters and nothing more. */
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     return MOQ_OK;
 }

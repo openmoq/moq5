@@ -84,7 +84,8 @@ MOQ_API moq_result_t moq_d21_encode_setup(moq_buf_writer_t *w);
 #define MOQ_D21_TRACK_STATUS      ((uint64_t)0x0Du)
 #define MOQ_D21_SUBSCRIBE_NAMESPACE ((uint64_t)0x50u)
 #define MOQ_D21_SUBSCRIBE_TRACKS  ((uint64_t)0x51u)
-#define MOQ_D21_PUBLISH_BLOCKED   ((uint64_t)0x0Fu)
+#define MOQ_D21_PUBLISH_SKIPPED   ((uint64_t)0x0Fu)
+#define MOQ_D21_PUBLISH_STATE_NOTIFY ((uint64_t)0x22u)
 #define MOQ_D21_PUBLISH           ((uint64_t)0x1Du)
 #define MOQ_D21_GOAWAY            ((uint64_t)0x10u)
 
@@ -445,7 +446,7 @@ MOQ_API moq_result_t moq_d21_decode_subscribe_namespace(
  * (0..32 fields) + Message Parameters. Requests PUBLISH messages for all tracks
  * under the prefix (and future ones). FORWARD (§10.2.12) and AUTHORIZATION_TOKEN
  * (§10.2.2) are the only permitted parameters; the response is REQUEST_OK /
- * REQUEST_ERROR on the bidi, then a stream of PUBLISH_BLOCKED messages while the
+ * REQUEST_ERROR on the bidi, then a stream of PUBLISH_SKIPPED messages while the
  * subscription is established (the resulting PUBLISH messages travel on separate
  * bidi streams). The overlap space is independent of SUBSCRIBE_NAMESPACE.
  * Namespace parts borrow from the decoded buffer.
@@ -464,22 +465,22 @@ MOQ_API moq_result_t moq_d21_decode_subscribe_tracks(
     size_t max_parts, moq_d21_subscribe_tracks_t *out);
 
 /*
- * PUBLISH_BLOCKED (draft-18 §10.20): Track Namespace Suffix (0..32 fields) +
- * Track Name. Sent by the publisher on a SUBSCRIBE_TRACKS response stream to
+ * PUBLISH_SKIPPED (draft-21 9.19, renamed from draft 18's PUBLISH_BLOCKED; the
+ * bytes are unchanged): Track Namespace Suffix (0..32 fields) + Track Name. Sent by the publisher on a SUBSCRIBE_TRACKS response stream to
  * signal it cannot open a PUBLISH for a matching track; it correlates by that
  * stream, so it carries no Request ID. The suffix is relative to the request's
  * Track Namespace Prefix. Suffix parts and track name borrow from the buffer.
  */
-typedef struct moq_d21_publish_blocked {
+typedef struct moq_d21_publish_skipped {
     moq_namespace_t track_namespace_suffix;
     moq_bytes_t     track_name;
-} moq_d21_publish_blocked_t;
+} moq_d21_publish_skipped_t;
 
-MOQ_API moq_result_t moq_d21_encode_publish_blocked(
+MOQ_API moq_result_t moq_d21_encode_publish_skipped(
     moq_buf_writer_t *w, const moq_namespace_t *suffix, moq_bytes_t track_name);
-MOQ_API moq_result_t moq_d21_decode_publish_blocked(
+MOQ_API moq_result_t moq_d21_decode_publish_skipped(
     const uint8_t *payload, size_t payload_len, moq_bytes_t *parts,
-    size_t max_parts, moq_d21_publish_blocked_t *out);
+    size_t max_parts, moq_d21_publish_skipped_t *out);
 
 /*
  * NAMESPACE (0x8) / NAMESPACE_DONE (0xE) (draft-18 §10.16 / §10.17): a single
@@ -776,8 +777,9 @@ MOQ_API moq_result_t moq_d21_decode_request_ok(const uint8_t *payload,
                                                moq_d21_request_ok_t *out);
 
 /*
- * PUBLISH_DONE (draft-18 §10.11): a publisher's final message before closing
- * (FIN) a subscription's request bidi. No Request ID (the bidi correlates).
+ * PUBLISH_DONE (draft-21 9.9): a publisher's final message before closing
+ * (FIN) a subscription's request bidi. Stream Count includes fill fetch streams;
+ * 2^64-1 means the publisher could not count. No Request ID (the bidi correlates).
  */
 #define MOQ_D21_PUBLISH_DONE   ((uint64_t)0x0Bu)
 
@@ -794,6 +796,24 @@ MOQ_API moq_result_t moq_d21_encode_publish_done(moq_buf_writer_t *w,
 MOQ_API moq_result_t moq_d21_decode_publish_done(const uint8_t *payload,
                                                  size_t payload_len,
                                                  moq_d21_publish_done_t *out);
+
+/*
+ * PUBLISH_STATE_NOTIFY (draft-21 9.10): a publisher's unilateral notice that a
+ * subscription's state changed for a reason other than a subscriber's own
+ * REQUEST_UPDATE. No Request ID (the subscription's bidi stream correlates) and no
+ * response. The body is a parameter block and nothing else (no Track Properties).
+ * It may carry only LOCATION_FILTER, FORWARD and LARGEST_OBJECT; the draft requires
+ * the publisher to include LARGEST_OBJECT when it is known.
+ */
+typedef struct moq_d21_publish_state_notify {
+    moq_d21_msg_params_t params;
+} moq_d21_publish_state_notify_t;
+
+MOQ_API moq_result_t moq_d21_encode_publish_state_notify(
+    moq_buf_writer_t *w, const moq_d21_msg_params_t *params);
+MOQ_API moq_result_t moq_d21_decode_publish_state_notify(
+    const uint8_t *payload, size_t payload_len,
+    moq_d21_publish_state_notify_t *out);
 
 /*
  * SUBGROUP_HEADER (draft-18 §11.4.2). The type byte has the form 0b0XX1XXXX
