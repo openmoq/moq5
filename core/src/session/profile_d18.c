@@ -3103,6 +3103,7 @@ static const moq_profile_ops_t d18_ops = {
     .supports_joining_fetch  = true,
     .allows_concurrent_subscriptions = false,
     .request_fin_is_not_cancel = false,
+    .publish_done_subscription_ended = true,
     .classify_uni_stream     = d18_classify_uni_stream,
     /* Request admission + SUBSCRIBE outbound. */
     .prepare_request         = d18_prepare_request,

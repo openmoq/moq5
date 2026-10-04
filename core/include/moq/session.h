@@ -2217,6 +2217,14 @@ MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
 MOQ_API bool moq_session_allows_concurrent_subscriptions(const moq_session_t *s);
 
 /*
+ * True when the negotiated draft has a "subscription ended" completion status
+ * for a subscription whose finite end was reached (drafts 16/18 yes, draft 21 no:
+ * a subscription stays open after its filter's end). Pure capability query;
+ * false for a NULL session.
+ */
+MOQ_API bool moq_session_has_subscription_ended_status(const moq_session_t *s);
+
+/*
  * Close the fetch data stream with FIN. Publisher side. Advancing call.
  * Frees the fetch entry after queuing the final action.
  */

@@ -430,6 +430,14 @@ typedef struct moq_profile_ops {
     bool request_fin_is_not_cancel;
 
     /*
+     * Capability: true when PUBLISH_DONE has a SUBSCRIPTION_ENDED status (drafts
+     * 16 and 18: sent when a finite filter end is reached). Draft 21 removed it: a
+     * subscription does not end because the Largest Object passes the end of its
+     * Location Filter (A.2, #1833), so a publisher keeps it open.
+     */
+    bool publish_done_subscription_ended;
+
+    /*
      * Capability: true if this profile's FETCH-response data plane can carry a
      * descending group order. Draft-16 sets true (fetch objects carry absolute
      * Group IDs); draft-18 sets false (group deltas with ascending-only

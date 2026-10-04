@@ -4841,6 +4841,7 @@ static const moq_profile_ops_t d16_ops = {
     .supports_joining_fetch  = true,
     .allows_concurrent_subscriptions = false,
     .request_fin_is_not_cancel = false,
+    .publish_done_subscription_ended = true,
     .classify_uni_stream             = NULL,
     .validate_inbound_request_stream = NULL,
 };

@@ -11520,6 +11520,55 @@ static void test_window_end_track(moq_version_t ver, bool excluded)
     MOQ_TEST_PASS("window_end_track");
 }
 
+/* -- Draft 21: no SUBSCRIPTION_ENDED -------------------------------------- *
+ * A subscription whose finite end is reached stays open (it simply receives
+ * nothing more); only the track ending terminates it, with TRACK_ENDED (0x2). */
+static void test_d21_no_subscription_ended(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *cl = moq_simpair_client(sp);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 0);
+
+    uint8_t d0[] = { 0xDA, 0xDB };
+    moq_rcbuf_t *p0 = NULL; moq_rcbuf_create(&alloc, d0, sizeof(d0), &p0);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 0, 0, p0, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_rcbuf_decref(p0);
+    /* Group 1 is past the end group: the write succeeds and delivers nothing. */
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 1, 0, 0xE0) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 1, 0, 0xE0), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);
+    /* Declaring the end group complete is what ends a subscription on drafts 16/18. */
+    MOQ_TEST_CHECK(moq_pub_declare_groups_complete_through(pub, track, 1,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);
+    { moq_event_t ev;
+      while (moq_session_poll_events(cl, &ev, 1) == 1) {
+          MOQ_TEST_CHECK(ev.kind != MOQ_EVENT_SUBSCRIBE_DONE);
+          moq_event_cleanup(&ev);
+      } }
+
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    int ndone = 0; uint64_t status = 0;
+    { moq_event_t ev;
+      while (moq_session_poll_events(cl, &ev, 1) == 1) {
+          if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) { ndone++; status = ev.u.subscribe_done.status_code; }
+          moq_event_cleanup(&ev);
+      } }
+    MOQ_TEST_CHECK_EQ_INT(ndone, 1);
+    MOQ_TEST_CHECK_EQ_U64(status, 0x2);
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(sp)) == MOQ_SESS_ESTABLISHED);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_no_subscription_ended");
+}
+
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
  * BEFORE the done, both complete across retries, the slot clears only after
  * success, and the track is terminal only after the final success. Server
@@ -14859,6 +14908,7 @@ int main(void) {
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, true);
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, false);
     test_d21_concurrent_subscriptions();
+    test_d21_no_subscription_ended();
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_16);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_18);
     for (int v = 0; v < 2; v++) {

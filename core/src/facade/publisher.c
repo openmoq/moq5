@@ -567,6 +567,9 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
                                           uint64_t now_us)
 {
     uint64_t through;
+    /* No SUBSCRIPTION_ENDED status (draft 21): a finite filter end does not end
+     * the subscription; the slot stays and simply receives nothing more. */
+    if (!moq_session_has_subscription_ended_status(pub->session)) return MOQ_OK;
     if (!track_complete_through(t, &through)) return MOQ_OK;
     for (size_t si = 0; si < t->slot_cap; si++) {
         pub_sub_slot_t *sl = &t->slots[si];
@@ -2363,6 +2366,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
             moq_done_subscribe_cfg_init(&dcfg);
             dcfg.status_code =
                 (term_fresh &&
+                 moq_session_has_subscription_ended_status(pub->session) &&
                  slot->window.has_window && slot->window.has_end &&
                  term_g > slot->window.end_group)
                     ? 0x3    /* SUBSCRIPTION_ENDED: past the finite end */

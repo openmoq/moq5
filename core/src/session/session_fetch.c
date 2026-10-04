@@ -2082,6 +2082,12 @@ bool moq_session_allows_concurrent_subscriptions(const moq_session_t *s)
     return s->profile->allows_concurrent_subscriptions;
 }
 
+bool moq_session_has_subscription_ended_status(const moq_session_t *s)
+{
+    if (!s) return false;
+    return s->profile->publish_done_subscription_ended;
+}
+
 moq_result_t moq_session_end_fetch(
     moq_session_t *s,
     moq_fetch_t fetch,
