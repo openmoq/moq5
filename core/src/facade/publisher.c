@@ -3421,6 +3421,71 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
      * emits it to the SUBSCRIBER role only, so it can never match a
      * publisher-role facade track. It falls through to IGNORED. */
 
+    if (event->kind == MOQ_EVENT_NS_SUB_REQUEST) {
+        /* A peer asks which namespaces under a prefix this publisher has. Exactly one
+         * response is owed (draft 21 4.1): accept when a track here lies under the
+         * prefix (then announce each such namespace's suffix), else reject. */
+        const moq_ns_sub_request_event_t *nr = &event->u.ns_sub_request;
+        *result = MOQ_PUB_EVENT_CONSUMED;
+        const moq_namespace_t *pre = &nr->track_namespace_prefix;
+        /* Decide every match BEFORE responding: the prefix is borrowed from event
+         * scratch, which the accept (an advancing call) invalidates. A track
+         * announces its suffix once, so a later track with the same namespace is
+         * not "first". */
+        size_t ntr = pub->track_count;
+        bool *first = ntr ? (bool *)pub_alloc(pub, ntr * sizeof(bool)) : NULL;
+        if (ntr && !first) return MOQ_ERR_NOMEM;
+        bool any = false;
+        size_t idx = 0;
+        for (moq_pub_track_t *t = pub->tracks; t && idx < ntr; t = t->next, idx++) {
+            first[idx] = false;
+            if (t->ended || t->ns_count < pre->count) continue;
+            bool match = true;
+            for (size_t i = 0; i < pre->count && match; i++)
+                match = t->ns_parts[i].len == pre->parts[i].len &&
+                        (pre->parts[i].len == 0 ||
+                         memcmp(t->ns_parts[i].data, pre->parts[i].data, pre->parts[i].len) == 0);
+            if (!match) continue;
+            any = true;
+            bool dup = false;
+            size_t k = 0;
+            for (moq_pub_track_t *e = pub->tracks; e != t && !dup; e = e->next, k++) {
+                if (!first[k] || e->ns_count != t->ns_count) continue;
+                dup = true;
+                for (size_t i = 0; i < t->ns_count && dup; i++)
+                    dup = e->ns_parts[i].len == t->ns_parts[i].len &&
+                          (t->ns_parts[i].len == 0 ||
+                           memcmp(e->ns_parts[i].data, t->ns_parts[i].data, t->ns_parts[i].len) == 0);
+            }
+            first[idx] = !dup;
+        }
+        moq_result_t rc;
+        if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL || !any) {
+            moq_reject_ns_sub_cfg_t rej;
+            moq_reject_ns_sub_cfg_init(&rej);
+            rej.error_code = pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL
+                ? MOQ_REQUEST_ERROR_UNAUTHORIZED : MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+            rc = moq_session_reject_ns_sub(pub->session, nr->handle, &rej, now_us);
+        } else {
+            const size_t skip = pre->count;
+            const moq_ns_sub_handle_t h = nr->handle;
+            moq_accept_ns_sub_cfg_t acc;
+            moq_accept_ns_sub_cfg_init(&acc);
+            rc = moq_session_accept_ns_sub(pub->session, h, &acc, now_us);
+            if (rc >= 0) {
+                /* Announce what already exists under the prefix (best effort). */
+                idx = 0;
+                for (moq_pub_track_t *t = pub->tracks; t && idx < ntr; t = t->next, idx++) {
+                    if (!first[idx]) continue;
+                    moq_namespace_t suffix = { t->ns_parts + skip, t->ns_count - skip };
+                    (void)moq_session_send_namespace(pub->session, h, &suffix, now_us);
+                }
+            }
+        }
+        if (first) pub_free(pub, first, ntr * sizeof(bool));
+        return rc == MOQ_ERR_WOULD_BLOCK ? rc : MOQ_OK;
+    }
+
     if (event->kind != MOQ_EVENT_SUBSCRIBE_REQUEST)
         return MOQ_OK;
 

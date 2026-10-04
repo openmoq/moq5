@@ -1568,6 +1568,8 @@ struct moq_session {
     uint64_t            auth_token_cache_size;
     uint8_t             setup_authority[MOQ_SETUP_AUTHORITY_MAX];
     size_t              setup_authority_len;
+    bool                setup_authority_present;
+    bool                setup_path_present;
     uint8_t             setup_path[MOQ_SETUP_PATH_MAX];
     size_t              setup_path_len;
 

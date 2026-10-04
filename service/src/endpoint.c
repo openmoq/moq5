@@ -1689,22 +1689,18 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
         b = a;
         while (b < n && u[b] != '/' && u[b] != '?' && u[b] != '#') b++;
         moq_bytes_t auth = { u + a, b - a };
-        size_t plen = r.url.path.len + (r.url.query.len ? r.url.query.len + 1 : 0);
-        uint8_t pbuf[MOQ_SETUP_PATH_MAX + 1];
+        /* PATH is path-abempty plus "?query" verbatim up to any '#': taken from the raw
+         * URI so a present-but-empty query ("/p?") is kept distinct from none. */
+        size_t e = b;
+        while (e < n && u[e] != '#') e++;
+        size_t plen = e - b;
         if (auth.len > MOQ_SETUP_AUTHORITY_MAX || plen > MOQ_SETUP_PATH_MAX)
             plen = SIZE_MAX;           /* too long for SETUP: refuse the endpoint (below) */
-        size_t o = 0;
-        if (plen != SIZE_MAX && r.url.path.len) { memcpy(pbuf, r.url.path.data, r.url.path.len); o = r.url.path.len; }
-        if (plen != SIZE_MAX && r.url.query.len) {
-            pbuf[o++] = '?';
-            memcpy(pbuf + o, r.url.query.data, r.url.query.len);
-            o += r.url.query.len;
-        }
         if (plen == SIZE_MAX) {
             oom = true;
         } else {
             ep->setup_authority = ep_strdup_bytes(alloc, auth, &ep->setup_authority_len);
-            ep->setup_path = ep_strdup_bytes(alloc, (moq_bytes_t){ pbuf, o }, &ep->setup_path_len);
+            ep->setup_path = ep_strdup_bytes(alloc, (moq_bytes_t){ u + b, plen }, &ep->setup_path_len);
             oom = oom || !ep->setup_authority || !ep->setup_path;
         }
     }

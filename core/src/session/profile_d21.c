@@ -123,11 +123,11 @@ static moq_result_t d21_start(moq_session_t *s)
     }
     /* A native-QUIC client names the URI it connected to (9.1.1, 9.1.2). */
     if (s->perspective == MOQ_PERSPECTIVE_CLIENT) {
-        if (s->setup_authority_len > 0) {
+        if (s->setup_authority_present) {
             opts.has_authority = true;
             opts.authority_value = (moq_bytes_t){ s->setup_authority, s->setup_authority_len };
         }
-        if (s->setup_path_len > 0) {
+        if (s->setup_path_present) {
             opts.has_path = true;
             opts.path_value = (moq_bytes_t){ s->setup_path, s->setup_path_len };
         }

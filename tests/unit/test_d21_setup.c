@@ -182,6 +182,19 @@ static void t_setup_authority_path(void)
     MOQ_TEST_CHECK(found);
     moq_session_destroy(s);
 
+    /* An empty path-abempty is still sent: PATH with length 0 (non-NULL, empty). */
+    {
+        moq_session_cfg_t c2 = cfg;
+        c2.setup_path = (moq_bytes_t){ (const uint8_t *)"", 0 };
+        moq_session_t *s2 = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&c2, 0, &s2) >= 0 && s2);
+        MOQ_TEST_CHECK(moq_session_start(s2, 0) >= 0);
+        moq_d21_setup_opts_t o2;
+        MOQ_TEST_CHECK(capture_setup_options(s2, &o2));
+        MOQ_TEST_CHECK(o2.has_path && o2.has_authority);
+        moq_session_destroy(s2);
+    }
+
     /* A server given the same fields sends neither. */
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     s = NULL;

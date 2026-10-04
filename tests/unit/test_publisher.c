@@ -11703,6 +11703,47 @@ static void test_d21_first_object_bit(void)
     MOQ_TEST_PASS("d21_first_object_bit");
 }
 
+/* -- Draft 21: SUBSCRIBE_NAMESPACE gets exactly one response ---------------- *
+ * REQUEST_OK (then NAMESPACE for what exists under the prefix) when a track here lies
+ * under it, REQUEST_ERROR when none does (4.1). */
+static void d21_ns_sub_case(const char *prefix_str, bool expect_ok)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);   /* track live/video */
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_bytes_t parts[] = { { (const uint8_t *)prefix_str, strlen(prefix_str) } };
+    moq_namespace_t pre = { parts, 1 };
+    uint8_t msg[64];
+    moq_d21_msg_params_t np;
+    memset(&np, 0, sizeof(np));
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_subscribe_namespace(&w, 0, &pre, &np) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, moq_stream_ref_from_u64(4), msg,
+        moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp)) >= 0);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    int oks = 0, errs = 0, others = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(sv, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM && a.u.send_bidi_stream.len > 0) {
+            uint8_t ty = a.u.send_bidi_stream.data[0];
+            if (ty == MOQ_D21_REQUEST_OK) oks++;
+            else if (ty == MOQ_D21_REQUEST_ERROR) errs++;
+            else others++;
+        }
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_INT(oks, expect_ok ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(errs, expect_ok ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(others, expect_ok ? 1 : 0);     /* the NAMESPACE for "video"'s parent */
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(expect_ok ? "d21_ns_sub_accepted" : "d21_ns_sub_rejected");
+}
+
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
  * BEFORE the done, both complete across retries, the slot clears only after
  * success, and the track is terminal only after the final success. Server
@@ -15044,6 +15085,8 @@ int main(void) {
     test_d21_concurrent_subscriptions();
     test_d21_no_subscription_ended();
     test_d21_first_object_bit();
+    d21_ns_sub_case("live", true);
+    d21_ns_sub_case("other", false);
     d21_fill_case(true);
     d21_fill_case(false);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_16);

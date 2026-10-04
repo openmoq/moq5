@@ -210,7 +210,8 @@ typedef struct moq_session_cfg {
      * sends in SETUP (9.1.1, 9.1.2): the URI's authority, and its path-abempty plus
      * "?query" when a query is present. Borrowed for the create call and copied
      * (authority up to MOQ_SETUP_AUTHORITY_MAX, path up to MOQ_SETUP_PATH_MAX bytes,
-     * longer is MOQ_ERR_INVAL). Leave empty for a server and for WebTransport, which
+     * longer is MOQ_ERR_INVAL). A NULL data pointer means "send none"; a non-NULL pointer with
+     * length 0 sends the option empty (an empty path-abempty is still sent). Leave NULL for a server and for WebTransport, which
      * must not send them. Drafts 16 and 18 ignore these. */
     moq_bytes_t        setup_authority;
     moq_bytes_t        setup_path;
