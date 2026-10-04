@@ -543,33 +543,91 @@ Files: profile_d21.c, session_setup/session.c only if a capability is missing.
  [ ] 5.4 Run test_d21_setup, then R3 command. Commit "d21 profile: setup".
 
 
-## TASK 6: Subscription and publish semantics (publisher role)
+## TASK 6: Subscription and publish semantics (publisher role) -- DONE (6.8 partial)
+
+RESULT (Task 6): the session core, facade and d21 profile now implement the draft-21
+request semantics below. Each item was test-first and mutation-checked
+(tests/unit/test_d21_requests.c, test_publisher.c); 131/131 pass on the default
+tree. Runner scenarios cannot score these until Task 8 turns d21 on, so Task 10
+re-verifies each against the runner.
+  6.1 DONE. Profile capability `allows_concurrent_subscriptions` (d21 true) gates the
+      core's duplicate-track rejections (inbound and outbound) and the facade's
+      DUPLICATE_SUBSCRIPTION; the facade serves up to 8 subscription slots per Track
+      (EXCESSIVE_LOAD beyond) and sends each matching object once per subscription
+      with its own alias. New `moq_resolve_loc_filter_window` resolves the exact wire
+      Location Filter (relative start, Next Object, absolute, range, inclusive end
+      Object); `moq_resolved_window_t` gained `has_end_object/end_object`, honoured
+      by the facade's membership test. GAP: the end-Object enforcement in the facade
+      (`window_admits`) has no direct test (the resolver and the session-level
+      window are tested); a raw-injection facade test is the follow-up.
+  6.2 DONE. With `publish_ok_carries_params` false the accept path sends a
+      non-default priority, a forward that differs from the PUBLISH's, a filter or a
+      new-group request as a REQUEST_UPDATE right behind the bare REQUEST_OK (both
+      messages reserved before either is queued), with the update's credit and
+      Forward effect pending until acknowledged. The publisher's own initial PUBLISH
+      parameters are still not surfaced on the request event.
+  6.3 DONE as scoped. We send one update per request until it is answered, which
+      satisfies any MAX_REQUEST_UPDATES the peer advertises; we advertise none, so
+      inbound updates are unlimited and TOO_MANY_REQUEST_UPDATES cannot arise (the
+      constant exists for when a configurable advertised limit is added). A
+      REQUEST_UPDATE as a first message is a session error (tested).
+  6.4 DONE. Profile capability `request_fin_is_not_cancel` (d21 true): a requester's
+      FIN on an established subscription closed the whole session ("truncated
+      message") and now only closes that direction; a responder FIN before the
+      response / PUBLISH_DONE fails the request (UNSUBSCRIBED surfaced), not the
+      session; RESET_STREAM cancels only its request. d16/d18 behaviour unchanged.
+  6.5 DONE as decided by F4. NOTIFY is validated and consumed on receive (Task 5);
+      sending is optional for a publisher and is not implemented. The facade no
+      longer sends the removed SUBSCRIPTION_ENDED (F7): capability
+      `publish_done_subscription_ended` (d21 false) stops the finite-end completion
+      sweep and the end-of-track status choice, and a finite end leaves the
+      subscription open.
+  6.6 DONE. The per-request GOAWAY path was already in the profile/core; tests now
+      cover a publisher migrating a subscription (event, URI, timeout, session
+      untouched), a client's non-empty URI closing the session, and a second GOAWAY
+      on one stream closing it.
+  6.7 DONE. SUBSCRIBE, FETCH, REQUEST_UPDATE (subscription and publication targets)
+      carrying any Range Filter (0x25-0x28 on SUBSCRIBE) are answered REQUEST_ERROR
+      INVALID_FILTER (0x36) through the core's message-level reject; the session
+      stays open and the application sees no request. A Length-0 filter is not a
+      Range Filter. (0x29 on SUBSCRIBE is a parameter the message does not take and
+      stays a protocol violation in the codec.)
+  6.8 PARTIAL. End of Timed-Out Range can now be sent (`write_fetch_range` accepts
+      MOQ_FETCH_RANGE_TIMED_OUT; a profile without it refuses at encode). NOT DONE:
+      the draft-21 timer semantics -- SUBGROUP_DELIVERY_TIMEOUT starting at the
+      subgroup's FIN and checked until the transport reports all data committed,
+      OBJECT_DELIVERY_TIMEOUT per object from its last header byte, and the first
+      object's properties overriding the Track-level values. The session arms one
+      subgroup timer at open (and ignores CLOSING streams in the sweep, and has no
+      timer for publication-backed subgroups); changing that needs a transport
+      "all data committed" signal and is better driven by the runner's d21 timeout
+      scenarios, so it is carried to Task 10 triage rather than guessed at here.
 One test file per bullet, each modeled on its d18 sibling; each commit
 passes R3. Map runner scenarios as acceptance for the bullet (names are
 discoverable with: curl -s localhost:8080/api/v1/scenarios | jq).
- [ ] 6.1 SUBSCRIBE / SUBSCRIBE_OK / LOCATION_FILTER semantics, multiple
+ [x] 6.1 SUBSCRIBE / SUBSCRIBE_OK / LOCATION_FILTER semantics, multiple
          concurrent subscriptions per Track (3.1.x; alias sharing vs distinct
          aliases: d21-overlapping-subscriptions-shared-alias / -distinct-aliases).
- [ ] 6.2 PUBLISH flow with REQUEST_OK as response (no PUBLISH_OK),
+ [x] 6.2 PUBLISH flow with REQUEST_OK as response (no PUBLISH_OK),
          subscription params on PUBLISH, token-not-copied rule.
          Existing d18 session code keys on PUBLISH_OK: introduce a semantic
          "publish accepted" event/record already used by the core and only
          change the profile encode/decode, not the session state machine.
- [ ] 6.3 REQUEST_UPDATE: subscription params move here; MAX_REQUEST_UPDATES
+ [x] 6.3 REQUEST_UPDATE: subscription params move here; MAX_REQUEST_UPDATES
          accounting and TOO_MANY_REQUEST_UPDATES; unexpected REQUEST_UPDATE
          => session error (test both directions).
- [ ] 6.4 PUBLISH_DONE / UNSUBSCRIBE / stream-reset code alignment and FIN vs
+ [x] 6.4 PUBLISH_DONE / UNSUBSCRIBE / stream-reset code alignment and FIN vs
          RST/STOP_SENDING semantics on request streams (A.3 #1698).
- [ ] 6.5 PUBLISH_SKIPPED (rename path), PUBLISH_STATE_NOTIFY sending and
+ [x] 6.5 PUBLISH_SKIPPED (rename path), PUBLISH_STATE_NOTIFY sending and
          tolerance on receive (Task 1.3c decides behavior).
- [ ] 6.6 GOAWAY: session GOAWAY with no request id; per-request GOAWAY;
+ [x] 6.6 GOAWAY: session GOAWAY with no request id; per-request GOAWAY;
          d21-publisher-goaway-alternate-uri, d21-publisher-client-goaway-*.
- [ ] 6.7 Range Filters (decided by the draft, F3): do not advertise
+ [x] 6.7 Range Filters (decided by the draft, F3): do not advertise
          MAX_FILTER_RANGES; on any Range Filter parameter (0x25-0x29) reply
          REQUEST_ERROR INVALID_FILTER (0x36). Tests: each of the five types
          on SUBSCRIBE and FETCH is rejected with 0x36 and the session stays
          open; a Length-0 filter (removal) is treated per 8.6.
- [ ] 6.8 Delivery timeouts as both Track and Object properties; timer starts
+ [~] 6.8 Delivery timeouts as both Track and Object properties; timer starts
          at last header byte (11.x); End of Timed-Out Range signalling when
          a fill timeout expires.
 
