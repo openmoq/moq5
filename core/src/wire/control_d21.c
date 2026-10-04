@@ -2222,31 +2222,18 @@ static moq_result_t d21_read_location(moq_buf_reader_t *r,
 moq_result_t moq_d21_encode_fetch(moq_buf_writer_t *w, const moq_d21_fetch_t *f)
 {
     if (!w || !f) return MOQ_ERR_INVAL;
-    if (f->fetch_type < MOQ_D21_FETCH_TYPE_STANDALONE ||
-        f->fetch_type > MOQ_D21_FETCH_TYPE_ABSOLUTE)
-        return MOQ_ERR_INVAL;
     if (!d21_params_within_mask(&f->params, MOQ_D21_MASK_FETCH))
+        return MOQ_ERR_INVAL;
+    if (d21_full_track_len(&f->track_namespace, f->track_name) >
+        MOQ_D21_MAX_FULL_TRACK)
         return MOQ_ERR_INVAL;
 
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_FETCH, &len_off);
     if (rc < 0) { w->pos = saved; return rc; }
     if ((rc = moq_buf_write_vi64(w, f->request_id)) < 0) goto fail;
-    if ((rc = moq_buf_write_vi64(w, f->fetch_type)) < 0) goto fail;
-    if (f->fetch_type == MOQ_D21_FETCH_TYPE_STANDALONE) {
-        if (d21_full_track_len(&f->track_namespace, f->track_name) >
-            MOQ_D21_MAX_FULL_TRACK) {
-            rc = MOQ_ERR_INVAL;
-            goto fail;
-        }
-        if ((rc = d21_write_namespace(w, &f->track_namespace)) < 0) goto fail;
-        if ((rc = d21_write_span(w, f->track_name)) < 0) goto fail;
-        if ((rc = d21_write_location(w, f->start)) < 0) goto fail;
-        if ((rc = d21_write_location(w, f->end)) < 0) goto fail;
-    } else {
-        if ((rc = moq_buf_write_vi64(w, f->joining_request_id)) < 0) goto fail;
-        if ((rc = moq_buf_write_vi64(w, f->joining_start)) < 0) goto fail;
-    }
+    if ((rc = d21_write_namespace(w, &f->track_namespace)) < 0) goto fail;
+    if ((rc = d21_write_span(w, f->track_name)) < 0) goto fail;
     if ((rc = moq_d21_encode_msg_params(w, &f->params)) < 0) goto fail;
     if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
     return MOQ_OK;
@@ -2266,29 +2253,15 @@ moq_result_t moq_d21_decode_fetch(const uint8_t *payload, size_t payload_len,
 
     moq_result_t rc = moq_buf_read_vi64(&r, &out->request_id);
     if (rc < 0) return rc;
-    if ((rc = moq_buf_read_vi64(&r, &out->fetch_type)) < 0) return rc;
-    if (out->fetch_type < MOQ_D21_FETCH_TYPE_STANDALONE ||
-        out->fetch_type > MOQ_D21_FETCH_TYPE_ABSOLUTE)
+    rc = d21_read_namespace(&r, parts, max_parts, &out->track_namespace);
+    if (rc < 0) return rc;
+    if ((rc = d21_read_span(&r, &out->track_name)) < 0) return rc;
+    if (d21_full_track_len(&out->track_namespace, out->track_name) >
+        MOQ_D21_MAX_FULL_TRACK)
         return MOQ_ERR_PROTO;
-
-    if (out->fetch_type == MOQ_D21_FETCH_TYPE_STANDALONE) {
-        rc = d21_read_namespace(&r, parts, max_parts, &out->track_namespace);
-        if (rc < 0) return rc;
-        if ((rc = d21_read_span(&r, &out->track_name)) < 0) return rc;
-        if (d21_full_track_len(&out->track_namespace, out->track_name) >
-            MOQ_D21_MAX_FULL_TRACK)
-            return MOQ_ERR_PROTO;
-        if ((rc = d21_read_location(&r, &out->start)) < 0) return rc;
-        if ((rc = d21_read_location(&r, &out->end)) < 0) return rc;
-    } else {
-        if ((rc = moq_buf_read_vi64(&r, &out->joining_request_id)) < 0) return rc;
-        if ((rc = moq_buf_read_vi64(&r, &out->joining_start)) < 0) return rc;
-    }
 
     uint64_t param_count = 0;
     if ((rc = moq_buf_read_vi64(&r, &param_count)) < 0) return rc;
-    /* FETCH carries SUBSCRIBER_PRIORITY / GROUP_ORDER and AUTHORIZATION_TOKEN
-     * (no FORWARD or filter). */
     rc = moq_d21_decode_msg_params(&r, param_count, MOQ_D21_MASK_FETCH,
                                    &out->params);
     if (rc < 0) return rc;
@@ -2338,7 +2311,8 @@ moq_result_t moq_d21_decode_fetch_ok(const uint8_t *payload, size_t payload_len,
     if ((rc = d21_read_location(&r, &out->end)) < 0) return rc;
     uint64_t param_count = 0;
     if ((rc = moq_buf_read_vi64(&r, &param_count)) < 0) return rc;
-    if (param_count != 0) return MOQ_ERR_PROTO;   /* no FETCH_OK params in scope */
+    /* No parameter is defined for FETCH_OK (9.20): any is a violation. */
+    if (param_count != 0) return MOQ_ERR_PROTO;
     /* The remainder is the opaque Track Properties tail. */
     out->track_properties.data = moq_buf_reader_ptr(&r);
     out->track_properties.len = moq_buf_reader_remaining(&r);

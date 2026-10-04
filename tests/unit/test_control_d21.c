@@ -1519,6 +1519,211 @@ static void t_publish_skipped(void)
     MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_skipped(many, n, dparts, 40, &g), (int)MOQ_ERR_PROTO);
 }
 
+
+/* == 4e. FETCH, FETCH_OK, FETCH_HEADER ===================================== */
+
+static void t_fetch(void)
+{
+    /* 9.11: Request ID 4, namespace [a], name t. There is no fetch type and no
+     * start or end field: the range travels in LOCATION_FILTER ({3,0} to group
+     * 3+2 object 7) beside SUBSCRIBER_PRIORITY 5. */
+    uint8_t buf[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("a") };
+    moq_d21_fetch_t f;
+    memset(&f, 0, sizeof(f));
+    f.request_id = 4;
+    f.track_namespace.parts = parts; f.track_namespace.count = 1;
+    f.track_name = MOQ_BYTES_LITERAL("t");
+    f.params.has_subscriber_priority = true; f.params.subscriber_priority = 5;
+    f.params.has_location_filter = true;
+    f.params.location_filter.field_count = 4;
+    f.params.location_filter.start_group = 3; f.params.location_filter.start_object = 0;
+    f.params.location_filter.end_group_delta = 2; f.params.location_filter.end_object = 7;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_OK);
+    static const uint8_t want[] = {
+        0x16, 0x00, 0x0F, 0x04, 0x01, 0x01, 'a', 0x01, 't',
+        0x02, 0x20, 0x05, 0x01, 0x04, 0x03, 0x00, 0x02, 0x07 };
+    check_bytes("FETCH", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_FETCH);
+    moq_bytes_t dparts[32];
+    moq_d21_fetch_t g;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(env.payload, env.payload_len, dparts, 32, &g),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(g.request_id, 4);
+    MOQ_TEST_CHECK_EQ_SIZE(g.track_namespace.count, 1);
+    MOQ_TEST_CHECK(g.track_name.len == 1 && g.track_name.data[0] == 't');
+    MOQ_TEST_CHECK(g.params.has_subscriber_priority && g.params.subscriber_priority == 5);
+    MOQ_TEST_CHECK(g.params.has_location_filter && g.params.location_filter.field_count == 4 &&
+                   g.params.location_filter.end_object == 7);
+
+    /* A fetch with no filter covers {0,0} to Largest Object (3.3.1); the body is
+     * just the identity and an empty parameter block. */
+    memset(&f.params, 0, sizeof(f.params));
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_OK);
+    static const uint8_t bare[] = { 0x16, 0x00, 0x07, 0x04, 0x01, 0x01, 'a', 0x01, 't', 0x00 };
+    check_bytes("FETCH bare", buf, moq_buf_writer_offset(&w), bare, sizeof(bare));
+
+    /* Its own parameters: GROUP_ORDER, FILL_TIMEOUT, INCLUDE_PROPERTIES, a token. */
+    memset(&f.params, 0, sizeof(f.params));
+    f.params.has_fill_timeout = true; f.params.fill_timeout_ms = 50;
+    f.params.has_group_order = true; f.params.group_order = 2;
+    f.params.has_include_properties = true; f.params.include_properties = 0;
+    f.params.auth_token_count = 1;
+    f.params.auth_tokens[0].alias_type = 3;            /* USE_VALUE */
+    f.params.auth_tokens[0].token_type = 1;
+    f.params.auth_tokens[0].token_value = MOQ_BYTES_LITERAL("k");
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_OK);
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_FETCH);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(env.payload, env.payload_len, dparts, 32, &g),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.params.has_fill_timeout && g.params.fill_timeout_ms == 50);
+    MOQ_TEST_CHECK(g.params.has_group_order && g.params.group_order == 2);
+    MOQ_TEST_CHECK(g.params.has_include_properties && g.params.include_properties == 0);
+    MOQ_TEST_CHECK_EQ_SIZE(g.params.auth_token_count, 1);
+
+    /* Parameters FETCH does not take: FORWARD (a subscription state) and
+     * FILL_PARAMETERS (a request for a fill) are violations on the wire and
+     * refused on send. */
+    static const uint8_t fwd[] = { 0x04, 0x01, 0x01, 'a', 0x01, 't', 0x01, 0x10, 0x01 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(fwd, sizeof(fwd), dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    static const uint8_t fill[] = { 0x04, 0x01, 0x01, 'a', 0x01, 't', 0x01, 0x23, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(fill, sizeof(fill), dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    memset(&f.params, 0, sizeof(f.params));
+    f.params.has_forward = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch(&w, &f), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+
+    /* Range Filters are permitted on FETCH and are counted, not acted on. */
+    static const uint8_t rf[] = { 0x04, 0x01, 0x01, 'a', 0x01, 't', 0x01, 0x26, 0x02, 0x00, 0x05 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(rf, sizeof(rf), dparts, 32, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)g.params.range_filter_params, 1);
+    MOQ_TEST_CHECK_EQ_U64(g.params.range_filter_ranges, 1);
+
+    /* Trailing bytes after the parameters, and a Full Track Name over 4096 bytes. */
+    static const uint8_t trail[] = { 0x04, 0x01, 0x01, 'a', 0x01, 't', 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(trail, sizeof(trail), dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    {
+        static uint8_t big[4200];
+        size_t n = 0;
+        big[n++] = 0x04; big[n++] = 0x01; big[n++] = 0x01; big[n++] = 'a';
+        big[n++] = 0x90; big[n++] = 0x01;                    /* name length 4097 */
+        memset(big + n, 'x', 4097); n += 4097;
+        big[n++] = 0x00;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch(big, n, dparts, 32, &g), (int)MOQ_ERR_PROTO);
+    }
+}
+
+/* A draft-18 FETCH must never be mistaken for a draft-21 one. Draft 18 put a
+ * Fetch Type (1 standalone, 2 relative joining, 3 absolute joining) after the
+ * Request ID; draft 21 removed it. Both legacy encodings are fed to the draft-21
+ * decoder and must fail rather than decode as some other request. */
+static void t_fetch_rejects_draft18_forms(void)
+{
+    moq_bytes_t dparts[32];
+    moq_d21_fetch_t g;
+    /* Standalone: Request ID 4, type 1, namespace [a], name t, start {0,0}, end
+     * {0,0}, zero parameters. */
+    static const uint8_t standalone[] = {
+        0x04, 0x01, 0x01, 0x01, 'a', 0x01, 't', 0x00, 0x00, 0x00, 0x00, 0x00 };
+    MOQ_TEST_CHECK(moq_d21_decode_fetch(standalone, sizeof(standalone), dparts, 32, &g) < 0);
+    /* Relative joining: Request ID 4, type 2, joining request 0, start 1, no params. */
+    static const uint8_t joining[] = { 0x04, 0x02, 0x00, 0x01, 0x00 };
+    MOQ_TEST_CHECK(moq_d21_decode_fetch(joining, sizeof(joining), dparts, 32, &g) < 0);
+    /* Absolute joining: type 3. */
+    static const uint8_t absolute[] = { 0x04, 0x03, 0x00, 0x01, 0x00 };
+    MOQ_TEST_CHECK(moq_d21_decode_fetch(absolute, sizeof(absolute), dparts, 32, &g) < 0);
+}
+
+static void t_fetch_ok(void)
+{
+    /* 9.12: End Of Track 0, End Location {5,2}, zero parameters, and a Track
+     * Property (DEFAULT_PUBLISHER_PRIORITY = 5) running to the end. */
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    static const uint8_t props[] = { 0x0E, 0x05 };
+    moq_bytes_t tp = { props, sizeof(props) };
+    moq_d21_location_t end = { 5, 2 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch_ok(&w, false, end, tp), (int)MOQ_OK);
+    static const uint8_t want[] = { 0x18, 0x00, 0x06, 0x00, 0x05, 0x02, 0x00, 0x0E, 0x05 };
+    check_bytes("FETCH_OK", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_FETCH_OK);
+    moq_d21_fetch_ok_t ok;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_ok(env.payload, env.payload_len, &ok), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!ok.end_of_track && ok.end.group == 5 && ok.end.object == 2);
+    MOQ_TEST_CHECK_EQ_SIZE(ok.track_properties.len, 2);
+    MOQ_TEST_CHECK(!ok.track_properties_unsupported);
+
+    /* End Of Track is one byte and only 0 or 1 carry meaning. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch_ok(&w, true, end, NO_BYTES), (int)MOQ_OK);
+    static const uint8_t eot[] = { 0x18, 0x00, 0x04, 0x01, 0x05, 0x02, 0x00 };
+    check_bytes("FETCH_OK end of track", buf, moq_buf_writer_offset(&w), eot, sizeof(eot));
+    static const uint8_t bad_eot[] = { 0x02, 0x05, 0x02, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_ok(bad_eot, sizeof(bad_eot), &ok), (int)MOQ_ERR_PROTO);
+
+    /* No parameter is defined for FETCH_OK (9.20), so any is a violation. */
+    static const uint8_t with_param[] = { 0x00, 0x05, 0x02, 0x01, 0x08, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_ok(with_param, sizeof(with_param), &ok), (int)MOQ_ERR_PROTO);
+
+    /* An unknown Mandatory Track Property is surfaced so the subscriber can
+     * cancel the fetch (3.6); a malformed property block is a violation. */
+    static const uint8_t mand[] = { 0x00, 0x05, 0x02, 0x00, 0xC0, 0x40, 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_ok(mand, sizeof(mand), &ok), (int)MOQ_OK);
+    MOQ_TEST_CHECK(ok.track_properties_unsupported);
+    static const uint8_t bad_props[] = { 0x00, 0x05, 0x02, 0x00, 0x01, 0x09, 'a' };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_ok(bad_props, sizeof(bad_props), &ok), (int)MOQ_ERR_PROTO);
+
+    /* The encoder refuses malformed properties and leaves the writer alone. */
+    static const uint8_t badp[] = { 0x01, 0x09, 'a' };
+    moq_bytes_t bp = { badp, sizeof(badp) };
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch_ok(&w, false, end, bp), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+}
+
+static void t_fetch_header(void)
+{
+    /* 11.4.1: the fetch data stream starts with type 0x05 and the Request ID. */
+    uint8_t buf[16];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch_header(&w, 4), (int)MOQ_OK);
+    static const uint8_t want[] = { 0x05, 0x04 };
+    check_bytes("FETCH_HEADER", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, buf, moq_buf_writer_offset(&w));
+    uint64_t id = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_header(&r, &id), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(id, 4);
+
+    /* A different stream type is a violation and leaves the reader where it was,
+     * so the caller can still classify the stream. */
+    static const uint8_t sg[] = { 0x10, 0x01 };
+    moq_buf_reader_init(&r, sg, sizeof(sg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_header(&r, &id), (int)MOQ_ERR_PROTO);
+    MOQ_TEST_CHECK_EQ_SIZE(r.pos, 0);
+    /* An incomplete header also leaves the reader alone. */
+    static const uint8_t half[] = { 0x05 };
+    moq_buf_reader_init(&r, half, sizeof(half));
+    MOQ_TEST_CHECK(moq_d21_decode_fetch_header(&r, &id) < 0);
+    MOQ_TEST_CHECK_EQ_SIZE(r.pos, 0);
+    /* The Request ID is a full-range vi64. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_fetch_header(&w, UINT64_MAX), (int)MOQ_OK);
+    moq_buf_reader_init(&r, buf, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_fetch_header(&r, &id), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(id, UINT64_MAX);
+}
+
 int main(void)
 {
     t_setup_options_encode();
@@ -1543,6 +1748,10 @@ int main(void)
     t_publish_done();
     t_publish_state_notify();
     t_publish_skipped();
+    t_fetch();
+    t_fetch_rejects_draft18_forms();
+    t_fetch_ok();
+    t_fetch_header();
 
     if (failures)
         fprintf(stderr, "test_control_d21: %d byte-vector failures\n", failures);

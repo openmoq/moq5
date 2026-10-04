@@ -846,17 +846,18 @@ typedef struct moq_d21_subgroup_header {
 MOQ_API bool moq_d21_subgroup_type_valid(uint8_t type);
 
 /*
- * FETCH family (draft-18 §10.12 / §10.13 / §11.4.4). Control messages (FETCH,
- * FETCH_OK) are framed as vi64 Type + 16-bit Length + payload; FETCH_HEADER is
- * a data-stream lead (vi64 type + Request ID, no length). A Location is a
- * (Group, Object) vi64 pair. Parameters and Track Properties are not
- * encoded/decoded yet (zero-parameter form only).
+ * FETCH family (draft-21 9.11, 9.12, 11.4.1). Control messages (FETCH, FETCH_OK)
+ * are framed as vi64 Type + 16-bit Length + payload; FETCH_HEADER is a data-stream
+ * lead (vi64 type + Request ID, no length). A Location is a (Group, Object) vi64
+ * pair.
+ *
+ * Draft 21 removed the Fetch Type, the joining variants and the start and end
+ * fields: a FETCH names a Full Track Name and carries its range in the
+ * LOCATION_FILTER parameter (no filter means {0,0} up to Largest Object, 3.3.1).
+ * A "joining" retrieval is now a SUBSCRIBE with FILL_PARAMETERS (3.4).
  */
 #define MOQ_D21_FETCH                  ((uint64_t)0x16u)
 #define MOQ_D21_FETCH_OK               ((uint64_t)0x18u)
-#define MOQ_D21_FETCH_TYPE_STANDALONE  ((uint64_t)0x1u)
-#define MOQ_D21_FETCH_TYPE_RELATIVE    ((uint64_t)0x2u)
-#define MOQ_D21_FETCH_TYPE_ABSOLUTE    ((uint64_t)0x3u)
 
 typedef struct moq_d21_location {
     uint64_t group;
@@ -865,15 +866,11 @@ typedef struct moq_d21_location {
 
 typedef struct moq_d21_fetch {
     uint64_t        request_id;
-    uint64_t        fetch_type;          /* 1=standalone, 2=relative, 3=absolute */
-    moq_namespace_t track_namespace;     /* standalone: parts in caller array */
-    moq_bytes_t     track_name;          /* standalone */
-    moq_d21_location_t start;            /* standalone */
-    moq_d21_location_t end;              /* standalone */
-    uint64_t        joining_request_id;  /* joining (type 2/3) */
-    uint64_t        joining_start;       /* joining (type 2/3) */
-    /* SUBSCRIBER_PRIORITY / GROUP_ORDER message parameters (FETCH carries no
-     * FORWARD or SUBSCRIPTION_FILTER). */
+    moq_namespace_t track_namespace;     /* parts in the caller's array */
+    moq_bytes_t     track_name;
+    /* AUTHORIZATION_TOKEN, FILL_TIMEOUT, SUBSCRIBER_PRIORITY, LOCATION_FILTER,
+     * GROUP_ORDER, the Range Filters and INCLUDE_PROPERTIES (MOQ_D21_MASK_FETCH).
+     * FETCH takes no FORWARD and no FILL_PARAMETERS. */
     moq_d21_msg_params_t params;
 } moq_d21_fetch_t;
 
@@ -884,6 +881,8 @@ MOQ_API moq_result_t moq_d21_decode_fetch(const uint8_t *payload,
                                           moq_bytes_t *parts, size_t max_parts,
                                           moq_d21_fetch_t *out);
 
+/* FETCH_OK (9.12): End Of Track (8), End Location, a parameter block (no
+ * parameter is defined for FETCH_OK, so it must be empty) and Track Properties. */
 typedef struct moq_d21_fetch_ok {
     bool               end_of_track;
     moq_d21_location_t end;
