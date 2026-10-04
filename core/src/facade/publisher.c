@@ -258,6 +258,10 @@ typedef struct {
     pub_retained_obj_t *objs;        /* incref'd snapshot; released on finish */
     size_t              obj_count;
     size_t              next_idx;    /* write cursor (resumes on WOULD_BLOCK) */
+    /* A fill fetch stream (draft 21 3.4): already open (so `accepted`), ends at
+     * its FIN, and a write failure resets it rather than FINing a partial fill. */
+    bool                is_fill;
+    size_t              end_idx;     /* fills: one past the last object in range */
 } pub_pending_fetch_t;
 
 struct moq_pub_deferred {
@@ -950,7 +954,8 @@ static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
     /* Accepted: write each remaining object from the cursor, then FIN. Each
      * write costs 2 actions with properties, 1 without; reserve per object so a
      * deferred write resumes at the same cursor (no duplicate/skip). */
-    while (pf->next_idx < pf->obj_count) {
+    const size_t end_idx = pf->is_fill ? pf->end_idx : pf->obj_count;
+    while (pf->next_idx < end_idx) {
         const pub_retained_obj_t *o = &pf->objs[pf->next_idx];
         size_t need = (o->properties ? 2u : 1u);
         if (moq_session_action_capacity(pub->session) < need) return;  /* defer */
@@ -966,7 +971,11 @@ static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
                                                          &oc, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* resume at cursor */
         if (rc < 0) {
-            (void)moq_session_end_fetch(pub->session, pf->fetch, now_us);
+            if (pf->is_fill)
+                (void)moq_session_reset_fill(pub->session, pf->fetch,
+                                             0x3 /* INTERNAL_ERROR */, now_us);
+            else
+                (void)moq_session_end_fetch(pub->session, pf->fetch, now_us);
             pending_fetch_clear(pub);
             return;
         }
@@ -1252,6 +1261,65 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
         pub->callbacks.on_closed(pub->callbacks.ctx, code);
 }
 
+/* Open and serve the fill of every subscription that has one pending (draft 21
+ * 3.4). The retained group is the only data this facade holds, so a fill is served
+ * from the part of it inside the fill range; a fill that range does not touch
+ * cannot be answered and is reset (the stream opens, then fails, 3.4.1). One fill
+ * is staged at a time through pending_fetch; the rest wait for a later pass. */
+static void pub_open_fills(moq_publisher_t *pub, uint64_t now_us)
+{
+    if (pub->pending_fetch.active) return;
+    for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
+        for (size_t i = 0; i < t->slot_cap; i++) {
+            pub_sub_slot_t *sl = &t->slots[i];
+            if (!sl->active || sl->kind != PUB_SLOT_SUBSCRIPTION) continue;
+            if (!moq_session_sub_fill_pending(pub->session, sl->sub)) continue;
+            moq_fill_info_t info;
+            moq_fetch_t fh;
+            moq_result_t rc = moq_session_open_fill(pub->session, sl->sub,
+                                                    now_us, &info, &fh);
+            if (rc < 0) return;          /* WOULD_BLOCK: stays pending, retry */
+            if (info.empty) continue;
+            bool has_data = !t->ended && pub_track_has_retained(t);
+            uint64_t g = has_data ? pub_track_retained_group(t) : 0;
+            if (!has_data || g < info.start_group || g > info.end_group) {
+                (void)moq_session_reset_fill(pub->session, fh,
+                                             0x3 /* INTERNAL_ERROR */, now_us);
+                continue;
+            }
+            pub_retained_obj_t *snap = pub_retained_snapshot(&pub->alloc,
+                t->retained, t->retained_count);
+            if (!snap) {
+                (void)moq_session_reset_fill(pub->session, fh, 0x3, now_us);
+                continue;
+            }
+            /* Keep only the objects inside the range (objects are in id order). */
+            size_t first = 0, n = t->retained_count;
+            while (first < n && g == info.start_group &&
+                   snap[first].object_id < info.start_object)
+                first++;
+            size_t last = n;
+            while (last > first && g == info.end_group &&
+                   snap[last - 1].object_id > info.end_object)
+                last--;
+            pub_pending_fetch_t *pf = &pub->pending_fetch;
+            memset(pf, 0, sizeof(*pf));
+            pf->active = true;
+            pf->accepted = true;
+            pf->is_fill = true;
+            pf->fetch = fh;
+            pf->objs = snap;
+            pf->obj_count = n;           /* what the snapshot holds (for release) */
+            pf->next_idx = first;
+            pf->end_idx = last;
+            pf->group_id = g;
+            pf->priority = t->priority;
+            serve_retained_fetch(pub, now_us);
+            return;                      /* one at a time */
+        }
+    }
+}
+
 /*
  * Progress ALL staged, action-queue-limited work: a pending subscribe accept/
  * reject (firing on_subscriber_joined exactly once on completion), a deferred
@@ -1273,6 +1341,8 @@ static moq_result_t pub_progress_staged(moq_publisher_t *pub, uint64_t now_us)
         serve_retained_fetch(pub, now_us);
         if (pub->pending_fetch.active) return MOQ_ERR_WOULD_BLOCK;
     }
+    pub_open_fills(pub, now_us);
+    if (pub->pending_fetch.active) return MOQ_ERR_WOULD_BLOCK;
 
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
         moq_result_t rrc = track_run_retires(pub, t, now_us);

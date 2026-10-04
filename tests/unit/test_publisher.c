@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <moq/control.h>
 #include <moq/control_d18.h>
+#include <moq/control_d21.h>
 #include <moq/buf.h>
 #include <string.h>
 
@@ -11569,6 +11570,81 @@ static void test_d21_no_subscription_ended(void)
     MOQ_TEST_PASS("d21_no_subscription_ended");
 }
 
+/* -- Draft 21: a fill is served from the retained group ------------------- *
+ * A SUBSCRIBE carrying FILL_PARAMETERS (injected raw: the client API has no fill
+ * request) opens a fill fetch stream after the accept. The facade writes the part
+ * of the retained group inside the fill range and FINs; a range it holds nothing
+ * for resets the stream. */
+static void d21_fill_case(bool in_range)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_rcbuf_t *p0 = NULL, *p1 = NULL, *p2 = NULL;
+    moq_rcbuf_create(&alloc, (const uint8_t *)"obj0", 4, &p0);
+    moq_rcbuf_create(&alloc, (const uint8_t *)"obj1", 4, &p1);
+    moq_rcbuf_create(&alloc, (const uint8_t *)"obj2", 4, &p2);
+    moq_pub_retained_object_t objs[3] = {
+        { .object_id = 0, .payload = p0 }, { .object_id = 1, .payload = p1 },
+        { .object_id = 2, .payload = p2, .end_of_group = true } };
+    moq_pub_retained_group_cfg_t gc; moq_pub_retained_group_cfg_init(&gc);
+    gc.group_id = 4; gc.objects = objs; gc.object_count = 3;
+    MOQ_TEST_CHECK(moq_pub_set_retained_group(pub, track, &gc) == MOQ_OK);
+    moq_rcbuf_decref(p0); moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    MOQ_TEST_CHECK(moq_session_note_object_published(sv, &ns, MOQ_BYTES_LITERAL("video"), 4, 2) == MOQ_OK);
+
+    /* Fill: object 1 onward in the current group (in range), or group 9 (nothing held). */
+    moq_d21_msg_params_t prm;
+    memset(&prm, 0, sizeof(prm));
+    prm.has_fill = true;
+    prm.fill.has_location_filter = true;
+    prm.fill.location_filter.field_count = 2;
+    prm.fill.location_filter.start_group = in_range ? 4 : 1;
+    prm.fill.location_filter.start_object = in_range ? 1 : 0;
+    if (!in_range) { prm.fill.location_filter.field_count = 3; prm.fill.location_filter.end_group_delta = 1; }
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_subscribe(&w, 0, &ns, MOQ_BYTES_LITERAL("video"), &prm) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, moq_stream_ref_from_u64(4), msg,
+        moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp)) >= 0);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    (void)moq_pub_tick(pub, moq_simpair_now_us(sp));
+
+    int objects = 0, fins = 0, resets = 0, headers = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(sv, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_DATA) {
+            if (a.u.send_data.header_len > 0) {
+                /* FETCH_HEADER opens it; objects follow with their own headers. */
+                if (a.u.send_data.payload == NULL && !a.u.send_data.fin) headers++;
+                else if (a.u.send_data.payload) objects++;
+            }
+            if (a.u.send_data.fin) fins++;
+        }
+        if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK(headers >= 1);
+    if (in_range) {
+        MOQ_TEST_CHECK_EQ_INT(objects, 2);       /* objects 1 and 2 */
+        MOQ_TEST_CHECK_EQ_INT(fins, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(objects, 0);
+        MOQ_TEST_CHECK_EQ_INT(resets, 1);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);   /* the subscription lives */
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(in_range ? "d21_fill_served_from_retained" : "d21_fill_without_data_resets");
+}
+
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
  * BEFORE the done, both complete across retries, the slot clears only after
  * success, and the track is terminal only after the final success. Server
@@ -14909,6 +14985,8 @@ int main(void) {
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, false);
     test_d21_concurrent_subscriptions();
     test_d21_no_subscription_ended();
+    d21_fill_case(true);
+    d21_fill_case(false);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_16);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_18);
     for (int v = 0; v < 2; v++) {

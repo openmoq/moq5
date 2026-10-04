@@ -632,25 +632,49 @@ discoverable with: curl -s localhost:8080/api/v1/scenarios | jq).
          a fill timeout expires.
 
 
-## TASK 7: Fill streams (replaces joining FETCH)
+## TASK 7: Fill streams (replaces joining FETCH) -- DONE (publisher side)
+
+RESULT (Task 7): tests in tests/unit/test_d21_requests.c and test_publisher.c, mutation-checked;
+131/131 pass. Design: FILL_PARAMETERS on a SUBSCRIBE or REQUEST_UPDATE is held on the
+subscription and becomes PENDING only while Forward State is 1 (at accept for the
+SUBSCRIBE, at apply for an update; an update without a fill leaves an unopened one
+alone). The application polls `moq_session_sub_fill_pending`, opens it with
+`moq_session_open_fill` (range resolved by `moq_resolve_fill_range` against the
+Largest Object the response advertised: whole track by default, relative starts,
+Next Group / Next Object and starts past Largest are empty and open nothing, ends
+never pass Largest), serves it with the ordinary fetch writers and ends it with
+`moq_session_end_fetch` (FIN) or `moq_session_reset_fill` (failure). The stream opens
+with FETCH_HEADER carrying the originating request's id, so several fills can be open
+at once. Cancelling the subscription resets every open fill; STOP_SENDING on a fill
+cancels only that fill. The facade serves fills from its retained group (the part
+inside the range; a range it holds nothing for opens and resets the stream) through
+pub_open_fills. 7.4: a one-field FETCH start is now resolved by the core relative to
+Largest (previously the whole track); with no Largest it is INVALID_RANGE. The core
+refuses a Joining FETCH on a profile without it before touching state.
+NOT DONE: FILL_TIMEOUT expiry -> End of Timed-Out Range (needs the same timer work as
+6.8), fill-vs-subscription scheduling (3.4), serving fills for non-retained live
+history (the facade keeps only the retained group), and the RECEIVING side of a fill
+stream (our subscriber API cannot send FILL_PARAMETERS yet). A subscription's own
+group-order / timeout overrides inside FILL_PARAMETERS are surfaced in
+`moq_fill_info_t` (priority, timeout) but not otherwise acted on.
 Files: session_fetch.c, session_subscribe.c, profile_d21.c,
        tests/unit/test_d21_fill.c (replaces test_d18_joining.c analogue).
- [ ] 7.1 (required, see F2) Read 3.4 completely; write failing tests from the draft's own
+ [x] 7.1 (required, see F2) Read 3.4 completely; write failing tests from the draft's own
          normative statements: fill opens only when Forward State is 1 and
          FILL_PARAMETERS is present (lines ~1333-1349); empty nested
          LOCATION_FILTER means "fill range = ..." (line ~1298); parameters in
          FILL_PARAMETERS override the subscription's for the fill (1311).
- [ ] 7.2 Implement publisher side: serve fill streams over FETCH_HEADER-typed
+ [x] 7.2 Implement publisher side: serve fill streams over FETCH_HEADER-typed
          unidirectional streams (confirm stream type in 11.x), FILL_TIMEOUT
          expiry -> End of Timed-Out Range, fill-vs-subscription scheduling
          (3.4), cancellation with concurrent fill streams
          (d21-cancel-subscription-with-concurrent-fill-streams),
          fill failing before first object (d21-fill-fails-before-first-object).
- [ ] 7.3 Existing publisher_retained_groups / catalog joining-FETCH support
+ [x] 7.3 Existing publisher_retained_groups / catalog joining-FETCH support
          (docs/publisher-retained-groups.md) must be re-expressed as fill
          under d21 while remaining joining-FETCH under d18/d16. Gate by
          capability, not version.
- [ ] 7.4 Standalone FETCH with LOCATION_FILTER range (non-joining) tests.
+ [x] 7.4 Standalone FETCH with LOCATION_FILTER range (non-joining) tests.
 
 
 ## TASK 8: Turn it on: negotiation, transports, service layer

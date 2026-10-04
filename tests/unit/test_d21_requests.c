@@ -1711,6 +1711,46 @@ static void t_fill_lifecycle(void)
     moq_session_destroy(s);
 }
 
+/* A one-field FETCH start is relative to Largest Object, resolved by the core. */
+static void t_fetch_relative_start(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    moq_session_note_object_published(s, &ns, lit("have"), 7, 2);
+    moq_d21_fetch_t f;
+    memset(&f, 0, sizeof(f));
+    f.track_namespace = ns; f.track_name = lit("have");
+    f.params.has_location_filter = true;
+    f.params.location_filter = lf(1, 2, 0, 0, 0);       /* the previous group on */
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_fetch(&w, &f);
+    feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    moq_event_t ev;
+    MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
+    MOQ_TEST_CHECK(ev.u.fetch_request.start_group == 6 && ev.u.fetch_request.start_object == 0 &&
+                   ev.u.fetch_request.end_group == 7 && ev.u.fetch_request.end_object == 3);
+    moq_event_cleanup(&ev);
+
+    /* No Largest known: nothing to fetch, answered INVALID_RANGE, no event. */
+    f.track_name = lit("none");
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    f.request_id = 2;
+    moq_d21_encode_fetch(&w, &f);
+    feed_request(s, 8, msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK(!next_event(s, MOQ_EVENT_FETCH_REQUEST, &ev));
+    uint8_t m[64];
+    size_t n = take_bidi_message(s, m, sizeof(m), NULL);
+    moq_control_envelope_t env;
+    moq_d21_request_error_t re;
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_REQUEST_ERROR, &env) &&
+                   moq_d21_decode_request_error(env.payload, env.payload_len, &re) == MOQ_OK &&
+                   re.error_code != 0);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1737,6 +1777,7 @@ int main(void)
     t_resolve_fill_range();
     t_fill_stream();
     t_fill_lifecycle();
+    t_fetch_relative_start();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

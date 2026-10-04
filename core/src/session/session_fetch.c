@@ -759,6 +759,32 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
 joining_resolved: ;
     }
 
+    /* Draft 21: a one-field Location Filter is a start RELATIVE to Largest Object
+     * ({Largest.Group + 1 - N, 0}) and the end defaults to Largest Object (9.20.10).
+     * The profile cannot know Largest, so the core resolves it from the registry.
+     * With no Largest known there is nothing to fetch. */
+    if (d->fetch_type == 1 && d->loc_filter.present &&
+        d->loc_filter.field_count == 1 && d->loc_filter.start_group != 0) {
+        const moq_track_hist_t *h = track_hist_find_id(s, &d->track_namespace,
+                                                       d->track_name);
+        uint64_t sg, so, eg, eo;
+        if (!h || !h->has_largest ||
+            !moq_resolve_fill_range(&d->loc_filter, true, h->largest_group,
+                                    h->largest_object, &sg, &so, &eg, &eo)) {
+            rc = fetch_auto_reject(s, d, MOQ_REQUEST_ERROR_INVALID_RANGE);
+            if (rc < 0) { result = rc; goto cleanup_all; }
+            s->profile->commit_inbound_request(s, &d->endpoint);
+            auth_committed = true;
+            process_auth_tokens_commit_txn(s, &d->auth_txn);
+            result = MOQ_OK;
+            goto cleanup_all;
+        }
+        d->start_group = sg;
+        d->start_object = so;
+        d->end_group = eg;
+        d->end_object = eo + 1;     /* the core's end Object is exclusive */
+    }
+
     if (event_queue_full(s)) {
         result = MOQ_ERR_WOULD_BLOCK;
         goto cleanup_all;
@@ -1433,6 +1459,11 @@ moq_result_t moq_session_fetch(moq_session_t *s,
     if (!cfg->is_joining && (has_join_pub || has_join_sub))
         return MOQ_ERR_INVAL;      /* a standalone fetch names no owner */
 #undef FETCH_CFG_HAS
+
+    /* A profile without the Joining FETCH (draft 21 replaced it with a fill on the
+     * SUBSCRIBE) refuses it before any state is touched. */
+    if (cfg->is_joining && !s->profile->supports_joining_fetch)
+        return MOQ_ERR_UNSUPPORTED;
 
     session_begin_advance(s, now_us);
 
