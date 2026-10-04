@@ -1935,6 +1935,273 @@ static void t_namespace_family(void)
                           (int)MOQ_ERR_PROTO);
 }
 
+
+/* == 4g. Data plane: Type Flags, datagrams, subgroup headers =============== */
+
+/* Draft 21 restates the draft-18 Type values as Type Flags bitfields (11.2.1,
+ * 11.3.1); the bits mean the same thing, so the codec is unchanged. These tests
+ * pin the draft-21 statement of the rules, and the oracle below is written from
+ * the draft's text, not from the codec. */
+
+/* 11.3.1: valid SUBGROUP_HEADER Type Flags are single-byte values (< 128) with
+ * bit 4 set and SUBGROUP_ID_MODE (bits 1-2) not 0b11. */
+static bool oracle_subgroup_type_valid(unsigned v)
+{
+    if (v >= 128) return false;
+    if (!(v & 0x10u)) return false;
+    if (((v >> 1) & 0x3u) == 0x3u) return false;
+    return true;
+}
+
+/* 11.2.1: valid OBJECT_DATAGRAM Type Flags use bits 0-3 and bit 5 only (bit 4 is
+ * reserved zero, any other bit is unspecified), and STATUS (0x20) with
+ * END_OF_GROUP (0x02) is invalid. */
+static bool oracle_datagram_type_valid(unsigned v)
+{
+    if (v & ~0x2Fu) return false;
+    if (v & 0x10u) return false;
+    if ((v & 0x20u) && (v & 0x02u)) return false;
+    return true;
+}
+
+static void t_subgroup_type_flags(void)
+{
+    /* Every possible single-byte value, and a few that need more than a byte. */
+    for (unsigned v = 0; v < 256; v++) {
+        MOQ_TEST_CHECK(moq_d21_subgroup_type_valid((uint8_t)v) == oracle_subgroup_type_valid(v));
+    }
+    /* The decoder agrees with the predicate, and a rejected header does not consume
+     * its bytes (so the stream can still be classified). Valid headers get a body
+     * long enough to carry any optional field. */
+    for (unsigned v = 0; v < 256; v++) {
+        uint8_t b[16] = { (uint8_t)v, 0x05, 0x03, 0x01, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        moq_buf_reader_t r;
+        moq_buf_reader_init(&r, b, sizeof(b));
+        moq_d21_subgroup_header_t h;
+        moq_result_t rc = moq_d21_decode_subgroup_header(&r, &h);
+        if (v >= 0x80) {                      /* a first byte of 0x80+ starts a longer vi64 */
+            continue;
+        }
+        if (oracle_subgroup_type_valid(v)) {
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        } else {
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_PROTO);
+            MOQ_TEST_CHECK_EQ_SIZE(r.pos, 0);
+        }
+    }
+    /* "Values of 128 or greater" are invalid however they are encoded. */
+    {
+        uint8_t b[] = { 0x80, 0x80, 0x05, 0x03 };        /* 128 as a two-byte vi64 */
+        moq_buf_reader_t r;
+        moq_buf_reader_init(&r, b, sizeof(b));
+        moq_d21_subgroup_header_t h;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subgroup_header(&r, &h), (int)MOQ_ERR_PROTO);
+        MOQ_TEST_CHECK_EQ_SIZE(r.pos, 0);
+        uint8_t big[] = { 0xC0, 0x01, 0x10, 0x05, 0x03 };    /* 0x110: bit 4 set but > 255 */
+        moq_buf_reader_init(&r, big, sizeof(big));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subgroup_header(&r, &h), (int)MOQ_ERR_PROTO);
+    }
+}
+
+static void t_subgroup_header_vectors(void)
+{
+    uint8_t buf[32];
+    moq_buf_writer_t w;
+    moq_d21_subgroup_header_t h;
+
+    /* Type 0x10: no properties, Subgroup ID 0, priority present, not first. */
+    memset(&h, 0, sizeof(h));
+    h.track_alias = 5; h.group_id = 3; h.publisher_priority = 0x80;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subgroup_header(&w, &h), (int)MOQ_OK);
+    static const uint8_t plain[] = { 0x10, 0x05, 0x03, 0x80 };
+    check_bytes("SUBGROUP_HEADER 0x10", buf, moq_buf_writer_offset(&w), plain, sizeof(plain));
+
+    /* Every flag: PROPERTIES 0x01, SUBGROUP_ID_MODE present (0b10 -> 0x04),
+     * END_OF_GROUP 0x08, DEFAULT_PRIORITY 0x20, FIRST_OBJECT 0x40 -> 0x7D. The
+     * Subgroup ID is carried and no priority byte follows. */
+    memset(&h, 0, sizeof(h));
+    h.has_properties = true; h.subgroup_id_mode = 2; h.end_of_group = true;
+    h.default_priority = true; h.first_object = true;
+    h.track_alias = 5; h.group_id = 3; h.subgroup_id = 9;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subgroup_header(&w, &h), (int)MOQ_OK);
+    static const uint8_t all[] = { 0x7D, 0x05, 0x03, 0x09 };
+    check_bytes("SUBGROUP_HEADER 0x7D", buf, moq_buf_writer_offset(&w), all, sizeof(all));
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, buf, moq_buf_writer_offset(&w));
+    moq_d21_subgroup_header_t g;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subgroup_header(&r, &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.has_properties && g.end_of_group && g.default_priority && g.first_object);
+    MOQ_TEST_CHECK_EQ_INT((int)g.subgroup_id_mode, 2);
+    MOQ_TEST_CHECK_EQ_U64(g.subgroup_id, 9);
+
+    /* Mode 0b01: the Subgroup ID is the first Object ID, and is not sent. Mode
+     * 0b11 is reserved: the encoder refuses it. */
+    memset(&h, 0, sizeof(h));
+    h.subgroup_id_mode = 1; h.default_priority = true; h.track_alias = 1; h.group_id = 1;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subgroup_header(&w, &h), (int)MOQ_OK);
+    static const uint8_t first[] = { 0x32, 0x01, 0x01 };
+    check_bytes("SUBGROUP_HEADER mode 1", buf, moq_buf_writer_offset(&w), first, sizeof(first));
+    h.subgroup_id_mode = 3;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subgroup_header(&w, &h), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+}
+
+static void t_datagram_type_flags(void)
+{
+    /* Every type value that is invalid by the draft's rules is rejected with
+     * PROTOCOL_VIOLATION. The body after each invalid type is a complete, valid
+     * continuation of that type's own flags, so nothing but the type itself can
+     * be the reason for the rejection (a garbage body would be rejected for the
+     * wrong reason and let a missing type check slip through). */
+    for (unsigned v = 0; v < 128; v++) {
+        if (oracle_datagram_type_valid(v)) continue;
+        unsigned f = v & 0x2Fu & ~0x10u;           /* the flags the body must satisfy */
+        bool props = f & 0x01, zero_oid = f & 0x04, defprio = f & 0x08, status = f & 0x20;
+        uint8_t b[32];
+        size_t n = 0;
+        b[n++] = (uint8_t)v;
+        b[n++] = 0x05;                              /* Track Alias */
+        b[n++] = 0x03;                              /* Group ID */
+        if (!zero_oid) b[n++] = 0x07;               /* Object ID */
+        if (!defprio) b[n++] = 0x80;                /* Publisher Priority */
+        if (props) { b[n++] = 0x02; b[n++] = 0x78; b[n++] = 0x01; }   /* one property */
+        if (status) b[n++] = 0x00;                  /* Object Status: Normal */
+        else { b[n++] = 'p'; b[n++] = 'q'; }        /* payload */
+        moq_d21_object_datagram_t d;
+        moq_result_t rc = moq_d21_decode_object_datagram(b, n, &d);
+        if (rc != MOQ_ERR_PROTO) {
+            fprintf(stderr, "FAIL: datagram type 0x%02X: got %d, want PROTO\n", v, (int)rc);
+            failures++;
+        }
+    }
+    /* Every valid combination of the five flags round-trips with its own type
+     * value (24 of the 32 combinations; STATUS with END_OF_GROUP is invalid). */
+    int valid = 0;
+    for (unsigned f = 0; f < 32; f++) {
+        bool props = f & 1, eog = f & 2, zero_oid = f & 4, defprio = f & 8, status = f & 16;
+        if (status && eog) continue;
+        valid++;
+        static const uint8_t prop_bytes[] = { 0x78, 0x01 };
+        moq_d21_object_datagram_t d;
+        memset(&d, 0, sizeof(d));
+        d.track_alias = 5; d.group_id = 3;
+        d.object_id = zero_oid ? 0 : 7;
+        d.default_priority = defprio; d.publisher_priority = defprio ? 128 : 9;
+        d.end_of_group = eog;
+        d.has_properties = props;
+        if (props) { d.properties = prop_bytes; d.properties_len = sizeof(prop_bytes); }
+        d.is_status = status;
+        d.object_status = status ? MOQ_OBJECT_STATUS_NORMAL : 0;
+        static const uint8_t payload[] = { 'h', 'i' };
+        if (!status) { d.payload = payload; d.payload_len = sizeof(payload); }
+        uint8_t buf[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_object_datagram(&w, &d), (int)MOQ_OK);
+        /* The type byte is the OR of the flags that are set (11.2.1). */
+        unsigned want_type = (props ? 0x01 : 0) | (eog ? 0x02 : 0) | (zero_oid ? 0x04 : 0) |
+                             (defprio ? 0x08 : 0) | (status ? 0x20 : 0);
+        MOQ_TEST_CHECK_EQ_HEX(buf[0], want_type);
+        moq_d21_object_datagram_t g;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(buf, moq_buf_writer_offset(&w), &g), (int)MOQ_OK);
+        MOQ_TEST_CHECK(g.has_properties == props && g.end_of_group == eog &&
+                       g.default_priority == defprio && g.is_status == status);
+        MOQ_TEST_CHECK_EQ_U64(g.object_id, zero_oid ? 0 : 7);
+        MOQ_TEST_CHECK_EQ_U64(g.track_alias, 5);
+        MOQ_TEST_CHECK_EQ_U64(g.group_id, 3);
+    }
+    MOQ_TEST_CHECK_EQ_INT(valid, 24);
+}
+
+static void t_datagram_vectors(void)
+{
+    moq_d21_object_datagram_t d, g;
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+
+    /* Type 0x00: Object ID and priority present, payload to the end. */
+    memset(&d, 0, sizeof(d));
+    d.track_alias = 5; d.group_id = 3; d.object_id = 7; d.publisher_priority = 0x80;
+    static const uint8_t hi[] = { 'h', 'i' };
+    d.payload = hi; d.payload_len = 2;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_object_datagram(&w, &d), (int)MOQ_OK);
+    static const uint8_t basic[] = { 0x00, 0x05, 0x03, 0x07, 0x80, 'h', 'i' };
+    check_bytes("OBJECT_DATAGRAM basic", buf, moq_buf_writer_offset(&w), basic, sizeof(basic));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(basic, sizeof(basic), &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.payload_len == 2 && memcmp(g.payload, "hi", 2) == 0);
+    MOQ_TEST_CHECK_EQ_U64(g.publisher_priority, 0x80);
+
+    /* ZERO_OBJECT_ID (0x04) and DEFAULT_PRIORITY (0x08) omit those fields; the
+     * inherited priority reads as the default 128. */
+    memset(&d, 0, sizeof(d));
+    d.track_alias = 5; d.group_id = 3; d.object_id = 0; d.default_priority = true;
+    d.payload = hi; d.payload_len = 2;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_object_datagram(&w, &d), (int)MOQ_OK);
+    static const uint8_t zero[] = { 0x0C, 0x05, 0x03, 'h', 'i' };
+    check_bytes("OBJECT_DATAGRAM 0x0C", buf, moq_buf_writer_offset(&w), zero, sizeof(zero));
+
+    /* STATUS (0x20) carries an Object Status instead of a payload: End of Track
+     * (0x4) with a zero Object ID and the default priority is type 0x2C. */
+    memset(&d, 0, sizeof(d));
+    d.track_alias = 5; d.group_id = 3; d.default_priority = true;
+    d.is_status = true; d.object_status = MOQ_OBJECT_STATUS_END_OF_TRACK;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_object_datagram(&w, &d), (int)MOQ_OK);
+    static const uint8_t eot[] = { 0x2C, 0x05, 0x03, 0x04 };
+    check_bytes("OBJECT_DATAGRAM status end of track", buf, moq_buf_writer_offset(&w), eot, sizeof(eot));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(eot, sizeof(eot), &g), (int)MOQ_OK);
+    MOQ_TEST_CHECK(g.is_status && g.object_status == MOQ_OBJECT_STATUS_END_OF_TRACK);
+
+    /* An Object Status that is not registered is a violation (11.1.2), and so is
+     * a non-Normal status that also carries Properties (11.2.1). */
+    static const uint8_t bad_status[] = { 0x2C, 0x05, 0x03, 0x05 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(bad_status, sizeof(bad_status), &g), (int)MOQ_ERR_PROTO);
+    static const uint8_t status_props_end[] = { 0x2D, 0x05, 0x03, 0x02, 0x78, 0x01, 0x03 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(status_props_end, sizeof(status_props_end), &g),
+                          (int)MOQ_ERR_PROTO);
+    /* ... but a Normal status with Properties is fine (type 0x2D, status 0). */
+    static const uint8_t status_props_ok[] = { 0x2D, 0x05, 0x03, 0x02, 0x78, 0x01, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(status_props_ok, sizeof(status_props_ok), &g), (int)MOQ_OK);
+
+    /* PROPERTIES with a length of 0 closes (11.2.1); a non-status datagram must
+     * carry a payload. */
+    static const uint8_t zero_props[] = { 0x0D, 0x05, 0x03, 0x00, 'x' };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(zero_props, sizeof(zero_props), &g), (int)MOQ_ERR_PROTO);
+    static const uint8_t no_payload[] = { 0x0C, 0x05, 0x03 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(no_payload, sizeof(no_payload), &g), (int)MOQ_ERR_PROTO);
+
+    /* A Mandatory Track Property (0x4000..0x7FFF) as an Object Property makes the
+     * object malformed (3.6): refused on receipt and on send. 0x4000 is C0 40 00. */
+    static const uint8_t mand_obj[] = { 0x0D, 0x05, 0x03, 0x04, 0xC0, 0x40, 0x00, 0x00, 'x' };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(mand_obj, sizeof(mand_obj), &g), (int)MOQ_ERR_PROTO);
+    static const uint8_t mand_props[] = { 0xC0, 0x40, 0x00, 0x00 };
+    memset(&d, 0, sizeof(d));
+    d.track_alias = 5; d.group_id = 3; d.default_priority = true;
+    d.has_properties = true; d.properties = mand_props; d.properties_len = sizeof(mand_props);
+    d.payload = hi; d.payload_len = 2;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    /* The encoder is symmetric with the decoder (PROTO, not INVAL) and rolls back. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_object_datagram(&w, &d), (int)MOQ_ERR_PROTO);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+
+    /* The padding datagram (11.5.2, type 0x132B3E29) is discarded when all zero
+     * and a violation when any byte is not. */
+    uint8_t pad[16];
+    moq_buf_writer_init(&w, pad, sizeof(pad));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_buf_write_vi64(&w, MOQ_D21_PADDING_DATAGRAM), (int)MOQ_OK);
+    size_t n = moq_buf_writer_offset(&w);
+    pad[n] = 0x00; pad[n + 1] = 0x00;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(pad, n + 2, &g), (int)MOQ_DONE);
+    pad[n + 1] = 0x01;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_object_datagram(pad, n + 2, &g), (int)MOQ_ERR_PROTO);
+}
+
 int main(void)
 {
     t_setup_options_encode();
@@ -1966,6 +2233,10 @@ int main(void)
     t_goaway();
     t_track_status();
     t_namespace_family();
+    t_subgroup_type_flags();
+    t_subgroup_header_vectors();
+    t_datagram_type_flags();
+    t_datagram_vectors();
 
     if (failures)
         fprintf(stderr, "test_control_d21: %d byte-vector failures\n", failures);
