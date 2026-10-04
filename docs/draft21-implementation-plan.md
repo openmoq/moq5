@@ -143,34 +143,48 @@ Modify
   docs/conformance.md                   add a D21 status table when done (edit existing file)
 
 
-## TASK 0: Branch, baseline, and the instrument
+## TASK 0: Branch, baseline, and the instrument -- DONE
 Files: none modified (build outputs only).
 Produces: a recorded baseline so later regressions and gains are attributable.
 
- [ ] 0.1 Branch exists: `git branch --show-current` -> feature/draft21
+ [x] 0.1 Branch exists: `git branch --show-current` -> feature/draft21
          (already created; plan file is the first change on it).
- [ ] 0.2 Build and run the existing moq5 suites, record counts.
+ [x] 0.2 Build and run the existing moq5 suites, record counts.
          cmake --preset <existing preset> && cmake --build build -j4
          ctest --test-dir build -j4 --output-on-failure
          Expected: all PASS (this is the R3 regression command for all tasks).
- [ ] 0.3 Build the runner (its build/bin is currently empty).
+ [x] 0.3 Build the runner (its build/bin is currently empty).
          cd ../moq-contribution-interop-runner
          cmake -S . -B build && cmake --build build -j4
          ctest --test-dir build -j2 --timeout 600 --output-on-failure
          build/moq-interop-audit --draft 21        # expect 173 of 173 bound
- [ ] 0.4 Make a cert (runner README quick start) in ../moq-contribution-interop-runner/work/
+ [x] 0.4 Make a cert (runner README quick start) in ../moq-contribution-interop-runner/work/
          and start the runner on 127.0.0.1:8080 with publisher ports 4443-4452.
- [ ] 0.5 Baseline the d18 path to prove the harness works end to end with a
+ [x] 0.5 Baseline the d18 path to prove the harness works end to end with a
          d18-capable publisher (Task 2 builds the adapter; until then use
          moqxr per docs/interop-notes.md: MOQXR_BIN=... draft 18, WebTransport).
          Save: results/baseline-d18-moqxr.json  (scratch dir, not committed).
- [ ] 0.6 Commit nothing yet; the first commit is Task 1.
+ [x] 0.6 (superseded: the plan itself was committed first; see git log).
 
 
-## TASK 1: Spec read-through and wire reference (no code)
+## BASELINE RECORDED (Task 0)
+
+ moq5 `default` preset: 127/127 tests pass (`ctest --test-dir build`).
+ Runner: 115/115 own tests pass; `audit --draft 21` = 173/173 required, 1/97 optional.
+ Runner driven by moqxr (`moqxr/build/openmoq-publisher`) with
+ `moqxr/tests/fixtures/locmaf-publisher.mp4`, draft 18, scenario
+ `subscribe-to-publisher-track`: native QUIC 3 pass / 0 fail, WebTransport
+ 5 pass / 0 fail (matches docs/interop-notes.md).
+ Reusable setup: `../moq-contribution-interop-runner/work/` (cert.pem, key.pem,
+ runs.sqlite3, drv-logs); runner on 127.0.0.1:8080, publisher ports 4443-4452,
+ started with MOQXR_BIN set and `--driver-fixture` the locmaf fixture.
+ Caution: never `pkill -f` a pattern that appears in your own command line.
+
+
+## TASK 1: Spec read-through and wire reference (no code) -- DONE
 Files: Create docs/draft21-wire-reference.md. Modify this plan (delta table).
 
- [ ] 1.1 Read draft sections 3 (model), 6 (sessions), 8 (wire building
+ [x] 1.1 Read draft sections 3 (model), 6 (sessions), 8 (wire building
          blocks), 9 (control messages), 10 (track properties), 11 (data
          streams), 13 (errors/grease) in the checked-in text and diff against
          docs/draft18-wire-reference.md and core/include/moq/control_d18.h.
@@ -178,12 +192,12 @@ Files: Create docs/draft21-wire-reference.md. Modify this plan (delta table).
          Namespace / Location Filter / Range Filter shared structures in
          section 8, request-stream FIN vs RST semantics from 18->19,
          Authorization Token compression section move).
- [ ] 1.2 Write docs/draft21-wire-reference.md: for each message, the exact
+ [x] 1.2 Write docs/draft21-wire-reference.md: for each message, the exact
          field order, types, and the section number, copied from the draft
          (not from d18). Include worked byte examples for LOCATION_FILTER,
          FILL_PARAMETERS (nested params), one Range Filter, GOAWAY, and
          PUBLISH_STATE_NOTIFY. These become the unit-test vectors.
- [ ] 1.3 Decide, with the draft in hand, the four open design questions and
+ [x] 1.3 Decide, with the draft in hand, the four open design questions and
          record each answer in the file with a section citation:
            a) What does a publisher that does not support fill do with a
               FILL_PARAMETERS subscription? (3.4, 9.20.16)
@@ -193,7 +207,57 @@ Files: Create docs/draft21-wire-reference.md. Modify this plan (delta table).
            c) When must PUBLISH_STATE_NOTIFY be sent/accepted? (9.10)
            d) Which Track Properties are "known" to a relay vs publisher?
               (10; only the publisher side matters for acceptance)
- [ ] 1.4 Commit: "Add draft-21 wire reference and delta notes"
+ [x] 1.4 Committed with the wire reference.
+
+
+## TASK 1 FINDINGS (these override earlier assumptions in this plan)
+
+Full detail is in docs/draft21-wire-reference.md.
+
+ F1. Data plane is bit-identical to d18 (subgroup header, datagram, fetch
+     object flags). Task 4g shrinks to adding the 0x20C End of Timed-Out Range
+     marker and confirming the invalid-flag set is unchanged. No new
+     data-plane codec is needed.
+ F2. Fill has no opt-out in the draft, so Task 7 (fill streams) is REQUIRED
+     for the publisher role, not optional.
+ F3. Decision D1 is resolved by the draft: omit MAX_FILTER_RANGES (default 0);
+     the peer MUST NOT send Range Filters and any that arrive get
+     REQUEST_ERROR INVALID_FILTER (0x36). Implementing Range Filters is not
+     required. Task 6.7 becomes "decline correctly".
+ F4. PUBLISH_STATE_NOTIFY is optional for a publisher. Task 6.5: decode and
+     apply it when received by a subscriber; receiving one as a publisher is
+     PROTOCOL_VIOLATION. Sending it is not needed for acceptance.
+ F5. Draft 9.20.2 (allowed parameters per message) is an EMPTY table in the
+     checked-in text; Task 4b builds the legality matrix from each parameter's
+     own text (matrix recorded in the wire reference).
+ F6. Open ambiguity A1: the draft does not say whether FILL_PARAMETERS' nested
+     parameter block has a Number of Parameters count. Working reading: no
+     count (same as the runner and moqxr). One pinning test; raise with the
+     draft authors. Open ambiguity A2: end-of-range Group/Object field
+     encoding; settle by test against 11.4.1.1.
+ F7. Core code that encodes draft-18 concepts and must be gated by capability:
+       core/src/facade/publisher.c   SUBSCRIPTION_ENDED (0x3) emission and
+                                     DUPLICATE_SUBSCRIPTION rejection
+       core/src/session/session_fetch.c, session_subscribe.c,
+       session_publish.c             joining-FETCH state (PENDING_JOIN,
+                                     INVALID_JOINING_REQUEST_ID)
+       core/src/facade/subscriber.c  joining-fetch use
+       moq_publish_ok_encode_args    subscription params that d21 moves to
+                                     REQUEST_UPDATE
+     New profile capabilities needed (proposed names): supports_joining_fetch
+     (false in d21), supports_fill_streams (true), allows_duplicate_
+     subscriptions (true), publish_done_subscription_ended (false).
+ F8. Multiple concurrent subscriptions per Track (3.1): an Object matching
+     several subscriptions is sent once per subscription even when they share
+     an alias. This is a publisher data-path change, not only a codec change;
+     it belongs in Task 6.1 with a test that two overlapping subscriptions on
+     one track each receive every matching Object.
+ F9. REQUEST_ERROR codes: DUPLICATE_SUBSCRIPTION 0x19 and
+     INVALID_JOINING_REQUEST_ID 0x32 are gone; CONFLICTING_FILTERS 0x35 and
+     INVALID_FILTER 0x36 are new. Session: VERSION_NEGOTIATION_FAILED 0x15
+     removed, TOO_MANY_REQUEST_UPDATES 0x1B added. PUBLISH_DONE:
+     SUBSCRIPTION_ENDED 0x3 removed. The d18 semantic_request_error mapper
+     (profile_d18.c:3064) needs its own d21 version; do not copy it.
 
 
 ## TASK 2: Interop adapter for the moq5 publisher (the compliance gate)
@@ -299,10 +363,12 @@ docs/draft21-wire-reference.md -> see it fail -> implement -> pass -> commit.
  4f  GOAWAY without Request ID (session and per-request forms),
      TRACK_STATUS, PUBLISH_NAMESPACE / SUBSCRIBE_NAMESPACE / NAMESPACE /
      NAMESPACE_DONE, SUBSCRIBE_TRACKS (Group Order param).
- 4g  Data plane: SUBGROUP_HEADER and OBJECT_DATAGRAM Type-Flags bitfield
-     (undefined bit set => PROTOCOL_VIOLATION, 11.x), End of Timed-Out
-     Range 0x20C, object properties, Mandatory Track Property restriction
-     (re-check against 10.x: d18 rejected 0x4000-0x7FFF in object props).
+ 4g  Data plane (small, see F1): reuse the d18 subgroup/datagram/fetch-object
+     codecs; add End of Timed-Out Range 0x20C to the fetch codec; add tests that
+     the invalid Type-Flags set is rejected (bit 4 on datagram, STATUS with
+     END_OF_GROUP, SUBGROUP_ID_MODE 0b11, values >= 128); keep the Mandatory
+     Track Property restriction (3.6: an Object Property in 0x4000-0x7FFF makes
+     the track malformed).
  Each: run `ctest -R control_d21`; commit "d21 codec: <family>".
  Fuzz: extend fuzz/ with a control_d21 target mirroring the d18 one and run
  scripts/run_fuzzers.sh briefly (new decode paths are untrusted input).
@@ -350,11 +416,11 @@ discoverable with: curl -s localhost:8080/api/v1/scenarios | jq).
          tolerance on receive (Task 1.3c decides behavior).
  [ ] 6.6 GOAWAY: session GOAWAY with no request id; per-request GOAWAY;
          d21-publisher-goaway-alternate-uri, d21-publisher-client-goaway-*.
- [ ] 6.7 Range Filters: either implement (OBJECTID/SUBGROUP/PRIORITY/
-         OBJECT_PROPERTY/TRACK_PROPERTY) or advertise MAX_FILTER_RANGES = 0
-         per Task 1.3b; if 0, a Range Filter on the wire gets the error the
-         draft names. Implement-vs-decline is a user decision if the draft
-         permits both (see "Decisions needed").
+ [ ] 6.7 Range Filters (decided by the draft, F3): do not advertise
+         MAX_FILTER_RANGES; on any Range Filter parameter (0x25-0x29) reply
+         REQUEST_ERROR INVALID_FILTER (0x36). Tests: each of the five types
+         on SUBSCRIBE and FETCH is rejected with 0x36 and the session stays
+         open; a Length-0 filter (removal) is treated per 8.6.
  [ ] 6.8 Delivery timeouts as both Track and Object properties; timer starts
          at last header byte (11.x); End of Timed-Out Range signalling when
          a fill timeout expires.
@@ -363,7 +429,7 @@ discoverable with: curl -s localhost:8080/api/v1/scenarios | jq).
 ## TASK 7: Fill streams (replaces joining FETCH)
 Files: session_fetch.c, session_subscribe.c, profile_d21.c,
        tests/unit/test_d21_fill.c (replaces test_d18_joining.c analogue).
- [ ] 7.1 Read 3.4 completely; write failing tests from the draft's own
+ [ ] 7.1 (required, see F2) Read 3.4 completely; write failing tests from the draft's own
          normative statements: fill opens only when Forward State is 1 and
          FILL_PARAMETERS is present (lines ~1333-1349); empty nested
          LOCATION_FILTER means "fill range = ..." (line ~1298); parameters in
@@ -460,9 +526,10 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
 
 Defaults are in brackets; I proceed with them unless told otherwise.
 
- D1. Range Filters (6.7): implement all five, or advertise
-     MAX_FILTER_RANGES=0 and decline? [Decline first; implement only if the
-     runner's range-filter rows cannot otherwise be scored.]
+ D1. RESOLVED by the draft (see F3): decline Range Filters via the
+     MAX_FILTER_RANGES default of 0. Revisit only if a runner row needs
+     range-filter behavior from a publisher; check it against 9.1.6 first,
+     as it would then be a runner dispute.
  D2. Keep d16 and d18 in the build alongside d21? [Yes; supported set
      becomes {21,18,16}.]
  D3. Is moqxr's libmoq backend (--libmoq-backend) a second publisher to
