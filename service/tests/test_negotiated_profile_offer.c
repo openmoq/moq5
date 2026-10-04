@@ -120,9 +120,7 @@ int main(void)
                 t[i].endpoint_offered = false;
                 t[i].auto_rank = NP_AUTO_RANK_NONE;
             }
-        /* the remaining rank must be renumbered to stay contiguous */
-        for (size_t i = 0; i < d.n_transports; i++)
-            if (t[i].draft == 18) t[i].auto_rank = 1;
+        /* the remaining ranks (D21 = 1, D18 = 2) stay contiguous */
 
         np_topology_t v;
         v.transports = t; v.n_transports = d.n_transports;

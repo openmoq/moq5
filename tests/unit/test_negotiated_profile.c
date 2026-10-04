@@ -65,18 +65,16 @@ static void t_tables(void)
         MOQ_TEST_CHECK(d18->enc == NP_ENC_VI64);
         MOQ_TEST_CHECK_EQ_U64(d16->int_max, NP_QUIC_VARINT_MAX);
         MOQ_TEST_CHECK_EQ_U64(d18->int_max, NP_VI64_MAX);
-        /* AUTO offers the NEWEST draft first */
-        MOQ_TEST_CHECK_EQ_INT(d18->auto_rank, 1);
-        MOQ_TEST_CHECK_EQ_INT(d16->auto_rank, 2);
+        /* AUTO offers the NEWEST draft first (21, 18, 16) */
+        MOQ_TEST_CHECK_EQ_INT(d18->auto_rank, 2);
+        MOQ_TEST_CHECK_EQ_INT(d16->auto_rank, 3);
     }
 
-    /* Draft 21: a core profile and a registered ALPN exist, but the profile is
-     * transitional (not wire ready), so its row is ABSENT: not offered, no AUTO
-     * rank, a reason on the row, and no supported media. A regression that
-     * made it available or offered it would put a draft-18-bytes profile on
-     * the wire. The profile itself exists for the simulator and tests. */
+    /* Draft 21: wire ready, AVAILABLE, offered first. Its media cells stay
+     * UNSUPPORTED until the LOC property ids are implemented for it, so the row
+     * keeps a reason. */
     MOQ_TEST_CHECK(moq_profile_lookup(MOQ_VERSION_DRAFT_21) != NULL);
-    MOQ_TEST_CHECK(!moq_profile_wire_ready(MOQ_VERSION_DRAFT_21));
+    MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_21));
     MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_16));
     MOQ_TEST_CHECK(moq_profile_wire_ready(MOQ_VERSION_DRAFT_18));
     const np_transport_row_t *d21 = np_transport_by_draft(21);
@@ -85,9 +83,9 @@ static void t_tables(void)
         MOQ_TEST_CHECK(strcmp(d21->alpn, "moqt-21") == 0);
         MOQ_TEST_CHECK(d21->enc == NP_ENC_VI64);
         MOQ_TEST_CHECK_EQ_U64(d21->int_max, NP_VI64_MAX);
-        MOQ_TEST_CHECK(d21->state == NP_T_ABSENT);
-        MOQ_TEST_CHECK(!d21->endpoint_offered);
-        MOQ_TEST_CHECK_EQ_INT(d21->auto_rank, NP_AUTO_RANK_NONE);
+        MOQ_TEST_CHECK(d21->state == NP_T_AVAILABLE);
+        MOQ_TEST_CHECK(d21->endpoint_offered);
+        MOQ_TEST_CHECK_EQ_INT(d21->auto_rank, 1);
         MOQ_TEST_CHECK(d21->unusable_reason && d21->unusable_reason[0]);
     }
     {
@@ -240,7 +238,7 @@ static void t_topology_negatives(void)
     /* AUTO ranks */
     scratch_from_declared(&s); s.t[0].auto_rank = 1;
     expect_refused("duplicate_auto_rank", &s);
-    scratch_from_declared(&s); s.t[0].auto_rank = 3;     /* 1 and 3, no 2 */
+    scratch_from_declared(&s); s.t[0].auto_rank = 4;     /* 1, 2 and 4, no 3 */
     expect_refused("non_contiguous_auto_rank", &s);
     /* an endpoint-offered AVAILABLE row that is missing from AUTO */
     scratch_from_declared(&s); s.t[0].auto_rank = NP_AUTO_RANK_NONE;
@@ -249,6 +247,7 @@ static void t_topology_negatives(void)
     scratch_from_declared(&s);
     s.t[0].auto_rank = NP_AUTO_RANK_NONE; s.t[0].endpoint_offered = false;
     s.t[1].auto_rank = NP_AUTO_RANK_NONE; s.t[1].endpoint_offered = false;
+    s.t[2].auto_rank = NP_AUTO_RANK_NONE; s.t[2].endpoint_offered = false;
     expect_refused("auto_empty", &s);
     scratch_from_declared(&s); s.t[0].state = NP_T_ABSENT;
     expect_refused("absent_transport_ranked", &s);
@@ -273,7 +272,6 @@ static void t_topology_negatives(void)
     s.c[0].state = NP_C_UNSUPPORTED;
     s.c[0].reason = "no draft-16 profile in this hypothetical";
     s.c[0].waiver = NULL;
-    s.t[1].auto_rank = 1;
     s.view.n_pairs = 0;
     MOQ_TEST_CHECK_EQ_INT(np_topology_validate(&s.view, true), 0);
     /* a ranked row that is not offered disagrees too */
@@ -327,26 +325,26 @@ static void t_topology_negatives(void)
     /* a REGISTERED-BUT-UNAVAILABLE row is representable, and must say why:
      * an ALPN registered upstream with no profile built here. */
     scratch_from_declared(&s);
-    s.t[2] = s.t[0];
-    s.t[2].draft = 20;
-    s.t[2].alpn = "moqt-20";
-    s.t[2].alpn_len = 7;
-    s.t[2].state = NP_T_ABSENT;
-    s.t[2].endpoint_offered = false;
-    s.t[2].auto_rank = NP_AUTO_RANK_NONE;
-    s.t[2].unusable_reason = "registered ALPN; the draft-20 profile is not "
+    s.t[3] = s.t[0];
+    s.t[3].draft = 20;
+    s.t[3].alpn = "moqt-20";
+    s.t[3].alpn_len = 7;
+    s.t[3].state = NP_T_ABSENT;
+    s.t[3].endpoint_offered = false;
+    s.t[3].auto_rank = NP_AUTO_RANK_NONE;
+    s.t[3].unusable_reason = "registered ALPN; the draft-20 profile is not "
                             "built in this configuration";
-    s.view.n_transports = 3;
+    s.view.n_transports = 4;
     /* its cells must still exist -- one per transport x media */
-    s.c[4] = s.c[2]; s.c[4].draft = 20; s.c[4].media = "loc01";
-    s.c[4].state = NP_C_UNSUPPORTED;
-    s.c[4].reason = "no draft-20 profile in this build";
-    s.c[4].waiver = NULL;
-    s.c[5] = s.c[2]; s.c[5].draft = 20;
-    s.view.n_cells = 6;
+    s.c[6] = s.c[2]; s.c[6].draft = 20; s.c[6].media = "loc01";
+    s.c[6].state = NP_C_UNSUPPORTED;
+    s.c[6].reason = "no draft-20 profile in this build";
+    s.c[6].waiver = NULL;
+    s.c[7] = s.c[2]; s.c[7].draft = 20;
+    s.view.n_cells = 8;
     MOQ_TEST_CHECK_EQ_INT(np_topology_validate(&s.view, true), 0);
     /* ... and dropping its reason is refused */
-    s.t[2].unusable_reason = NULL;
+    s.t[3].unusable_reason = NULL;
     expect_refused("absent_row_without_reason", &s);
     /* ... and with the pair row left behind it is refused */
     scratch_from_declared(&s);

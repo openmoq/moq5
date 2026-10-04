@@ -88,12 +88,13 @@
 
 bool moq_endpoint_version_supported(moq_version_t v)
 {
-    /* Single point of truth for the build's supported set. Both profiles are
-     * unconditionally compiled today (core/CMakeLists.txt lists profile_d16.c
-     * and profile_d18.c in every configuration); if a profile ever becomes a
+    /* Single point of truth for the build's supported set. All three profiles are
+     * unconditionally compiled today (core/CMakeLists.txt lists profile_d16.c,
+     * profile_d18.c and profile_d21.c in every configuration); if a profile ever becomes a
      * build option, thread its define through here -- the offer rules (§5.2)
      * depend on this predicate being exact. */
-    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18 ||
+           v == MOQ_VERSION_DRAFT_21;
 }
 
 /* The full supported set, NEWEST FIRST: both TLS ALPN selection and the
@@ -103,6 +104,7 @@ bool moq_endpoint_version_supported(moq_version_t v)
 static size_t supported_versions(moq_version_t *out, size_t cap)
 {
     size_t n = 0;
+    if (n < cap) out[n++] = MOQ_VERSION_DRAFT_21;
     if (n < cap) out[n++] = MOQ_VERSION_DRAFT_18;
     if (n < cap) out[n++] = MOQ_VERSION_DRAFT_16;
     return n;

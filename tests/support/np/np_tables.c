@@ -9,7 +9,7 @@
  * Transport rows: both built drafts are AVAILABLE, with the reviewed ALPN
  * literals (Step 3's canonical table is the authority the drift gate compares
  * against), the integer codec each draft specifies, and the endpoint-offer
- * facts. AUTO ranks are 1-based and D18 is offered FIRST.
+ * facts. AUTO ranks are 1-based and D21 is offered FIRST.
  *
  * Media rows: LOC-01 is implemented; LOC-02 is RESERVED with a reason. The
  * reviewed property IDs are recorded because they are the collision at the
@@ -21,17 +21,14 @@
 static const np_transport_row_t kTransports[] = {
     /* draft, state, ALPN, len, codec, max, offered, rank, unusable reason */
     { 16, NP_T_AVAILABLE, "moqt-16", 7, NP_ENC_QUIC_VARINT,
-      NP_QUIC_VARINT_MAX, true, 2, NULL },
+      NP_QUIC_VARINT_MAX, true, 3, NULL },
     { 18, NP_T_AVAILABLE, "moqt-18", 7, NP_ENC_VI64,
-      NP_VI64_MAX,        true, 1, NULL },
-    /* Draft 21 has a core profile and a registered ALPN, but the profile
-     * speaks draft-21 bytes but its session semantics are unfinished, so it is
-     * not wire ready: ABSENT here means "no wire-ready
-     * profile", the same notion the endpoint's supported set uses. LOC property
-     * ids for draft 21 are also not implemented. */
-    { 21, NP_T_ABSENT, "moqt-21", 7, NP_ENC_VI64,
-      NP_VI64_MAX,        false, NP_AUTO_RANK_NONE,
-      "draft-21 profile is not wire ready (session semantics unfinished) and "
+      NP_VI64_MAX,        true, 2, NULL },
+    /* Draft 21 is wire ready and offered first. Its media cells are still
+     * UNSUPPORTED (LOC property ids are not implemented for it), which is why the
+     * row keeps a reason. */
+    { 21, NP_T_AVAILABLE, "moqt-21", 7, NP_ENC_VI64,
+      NP_VI64_MAX,        true, 1,
       "draft-21 LOC property ids are not implemented" },
 };
 

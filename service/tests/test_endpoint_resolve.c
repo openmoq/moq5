@@ -616,9 +616,10 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)r.policy, (int)MOQ_VERSION_POLICY_AUTO);
         /* Newest first: the client's offer order is the preference order on
          * both transports (TLS ALPN and the WT protocol field). */
-        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 2);
-        MOQ_TEST_CHECK_EQ_INT((int)r.versions[0], (int)MOQ_VERSION_DRAFT_18);
-        MOQ_TEST_CHECK_EQ_INT((int)r.versions[1], (int)MOQ_VERSION_DRAFT_16);
+        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 3);
+        MOQ_TEST_CHECK_EQ_INT((int)r.versions[0], (int)MOQ_VERSION_DRAFT_21);
+        MOQ_TEST_CHECK_EQ_INT((int)r.versions[1], (int)MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK_EQ_INT((int)r.versions[2], (int)MOQ_VERSION_DRAFT_16);
 
         /* LIST with supported versions passes through verbatim. */
         moq_version_t both[] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16 };
@@ -666,26 +667,25 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
                               (int)MOQ_ERR_UNSUPPORTED);
 
-        /* Draft 21 has a registered ALPN and a core profile, but the profile is
-         * not wire ready (its session semantics are unfinished), so the endpoint refuses to
-         * offer it however it is asked: pinned, listed alone, or listed beside
-         * a supported draft. Silently dropping it from a LIST would hide the
-         * refusal. AUTO (checked above) never includes it. */
+        /* Draft 21 is wire ready: it can be pinned, listed alone, or listed beside
+         * another draft, in the caller's order. */
         moq_version_t twenty_one = MOQ_VERSION_DRAFT_21;
         c.versions.versions = &twenty_one;
         c.versions.version_count = 1;
         c.versions.policy = MOQ_VERSION_POLICY_EXACT;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
-                              (int)MOQ_ERR_UNSUPPORTED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)r.versions[0], (int)MOQ_VERSION_DRAFT_21);
         c.versions.policy = MOQ_VERSION_POLICY_LIST;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
-                              (int)MOQ_ERR_UNSUPPORTED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         moq_version_t with21[] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_21 };
         c.versions.versions = with21;
         c.versions.version_count = 2;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r),
-                              (int)MOQ_ERR_UNSUPPORTED);
-        MOQ_TEST_CHECK(!moq_endpoint_version_supported(MOQ_VERSION_DRAFT_21));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(r.version_count, 2);
+        MOQ_TEST_CHECK_EQ_INT((int)r.versions[0], (int)MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK_EQ_INT((int)r.versions[1], (int)MOQ_VERSION_DRAFT_21);
+        MOQ_TEST_CHECK(moq_endpoint_version_supported(MOQ_VERSION_DRAFT_21));
 
         /* Undersized (but nonzero) offer struct is malformed. */
         c.versions.struct_size = 4;

@@ -6,12 +6,8 @@
  * message (docs/draft21-wire-reference.md), and the data-plane encodings, which
  * draft 21 did not change, are shared in shape with draft 18.
  *
- * It is NOT yet wire ready (see .wire_ready below): the session semantics that
- * sit above the wire are still draft 18's. Open items are tracked in
- * docs/draft21-implementation-plan.md, notably concurrent subscriptions per Track
- * and the full Location Filter model (Task 6), the PUBLISH_OK follow-up
- * REQUEST_UPDATE and MAX_REQUEST_UPDATES (Task 6), and fill streams in place of
- * Joining FETCH (Task 7). Comments that still describe draft-21 behavior say so.
+ * Open items are tracked in docs/draft21-implementation-plan.md (delivery-timer
+ * semantics, FILL_TIMEOUT, the receiving side of fill streams).
  */
 
 #include "session_internal.h"
@@ -3324,7 +3320,7 @@ static const moq_profile_ops_t d21_ops = {
      * (see the file header). Flip to true in the same change that offers draft 21
      * from the service endpoint and declares it AVAILABLE in the negotiated-profile
      * model (plan Task 8). */
-    .wire_ready              = false,
+    .wire_ready              = true,
     .state_size              = sizeof(moq_d21_profile_state_t),
     .state_align             = _Alignof(moq_d21_profile_state_t),
     .init_in_place           = d21_init_in_place,
