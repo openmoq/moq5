@@ -27,18 +27,6 @@ moq_result_t moq_d21_scan_delivery_timeouts(const uint8_t *props, size_t len,
                                             bool *out_has_subgroup,
                                             uint64_t *out_subgroup_ms);
 
-/*
- * REQUEST_UPDATE_OK codec (§10.5): the REQUEST_OK form that carries
- * LARGEST_OBJECT / EXPIRES response parameters with empty Track Properties.
- * The zero-parameter moq_d21_{encode,decode}_request_ok in the public header
- * stay for the other REQUEST_OK responses.
- */
-moq_result_t moq_d21_encode_request_update_ok(moq_buf_writer_t *w,
-                                              const moq_d21_msg_params_t *p);
-moq_result_t moq_d21_decode_request_update_ok(const uint8_t *payload,
-                                              size_t payload_len,
-                                              moq_d21_msg_params_t *out);
-
 #ifdef __cplusplus
 }
 #endif

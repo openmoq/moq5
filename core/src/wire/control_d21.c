@@ -926,49 +926,6 @@ moq_result_t moq_d21_decode_publish(const uint8_t *payload, size_t payload_len,
 
 /* -- PUBLISH_OK (draft-18 §10.10 / §10.5) -------------------------- */
 
-/* PUBLISH_OK is a REQUEST_OK carrying the subscriber's delivery parameters,
- * its SUBSCRIPTION_FILTER choice (§10.2.9 -- omitted = unfiltered), and
- * EXPIRES (§10.2.10), with an empty Track Properties tail (a non-empty tail is
- * a PROTOCOL_VIOLATION). */
-
-moq_result_t moq_d21_encode_publish_ok(moq_buf_writer_t *w,
-                                       const moq_d21_msg_params_t *params)
-{
-    if (!w || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, MOQ_D21_MASK_PUBLISH_OK))
-        return MOQ_ERR_INVAL;
-    size_t saved = w->pos, len_off;
-    moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
-    if (rc < 0) return rc;
-    if ((rc = moq_d21_encode_msg_params(w, params)) < 0) goto fail;
-    /* Track Properties are empty in PUBLISH_OK (§10.5). */
-    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
-    return MOQ_OK;
-fail:
-    w->pos = saved;
-    return rc;
-}
-
-moq_result_t moq_d21_decode_publish_ok(const uint8_t *payload,
-                                       size_t payload_len,
-                                       moq_d21_publish_ok_t *out)
-{
-    if (!payload || !out) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, payload, payload_len);
-    uint64_t count;
-    moq_result_t rc = moq_buf_read_vi64(&r, &count);
-    if (rc < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_PUBLISH_OK,
-                                   &out->params);
-    if (rc < 0) return rc;
-    /* PUBLISH_OK carries an empty Track Properties tail; any remainder is a
-     * protocol violation (§10.5). */
-    if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
-    return MOQ_OK;
-}
-
 /* -- GOAWAY (draft-18 §10.4) --------------------------------------- */
 
 /* Control-stream form: New Session URI + Timeout + Request ID. */
@@ -1059,59 +1016,6 @@ moq_result_t moq_d21_decode_goaway_request(const uint8_t *payload,
 
 /* -- TRACK_STATUS_OK (draft-18 §10.14 / §10.5) --------------------- */
 
-/* TRACK_STATUS_OK is a REQUEST_OK carrying LARGEST_OBJECT / EXPIRES parameters
- * and a Track Properties tail, with no Track Alias (§10.14). */
-
-moq_result_t moq_d21_encode_track_status_ok(moq_buf_writer_t *w,
-                                            const moq_d21_msg_params_t *params,
-                                            moq_bytes_t track_properties)
-{
-    if (!w || !params) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(params, MOQ_D21_MASK_TRACK_STATUS_OK))
-        return MOQ_ERR_INVAL;
-    if (track_properties.len > 0 &&
-        d21_validate_track_properties(track_properties.data,
-                                      track_properties.len) < 0)
-        return MOQ_ERR_INVAL;
-    size_t saved = w->pos, len_off;
-    moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
-    if (rc < 0) return rc;
-    if ((rc = moq_d21_encode_msg_params(w, params)) < 0) goto fail;
-    if (track_properties.len > 0 &&
-        (rc = moq_buf_write_raw(w, track_properties.data,
-                                track_properties.len)) < 0) goto fail;
-    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
-    return MOQ_OK;
-fail:
-    w->pos = saved;
-    return rc;
-}
-
-moq_result_t moq_d21_decode_track_status_ok(const uint8_t *payload,
-                                            size_t payload_len,
-                                            moq_d21_track_status_ok_t *out)
-{
-    if (!payload || !out) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, payload, payload_len);
-    uint64_t count;
-    moq_result_t rc = moq_buf_read_vi64(&r, &count);
-    if (rc < 0) return rc;
-    rc = moq_d21_decode_msg_params(&r, count, MOQ_D21_MASK_TRACK_STATUS_OK,
-                                   &out->params);
-    if (rc < 0) return rc;
-    /* The remainder is the opaque Track Properties tail. TRACK_STATUS_OK is not in
-     * the UNSUPPORTED_EXTENSION list (§10.6), so an unknown mandatory property is
-     * accepted and surfaced (validated structurally only) rather than rejected. */
-    out->track_properties.data = moq_buf_reader_ptr(&r);
-    out->track_properties.len = moq_buf_reader_remaining(&r);
-    bool ts_mandatory_ignored = false;
-    return d21_scan_track_properties(out->track_properties.data,
-                                     out->track_properties.len,
-                                     &ts_mandatory_ignored, NULL);
-}
-
 /* -- REQUEST_ERROR ------------------------------------------------- */
 
 moq_result_t moq_d21_encode_request_error(moq_buf_writer_t *w,
@@ -1121,13 +1025,15 @@ moq_result_t moq_d21_encode_request_error(moq_buf_writer_t *w,
 {
     if (!w) return MOQ_ERR_INVAL;
     if (reason.len > MOQ_D21_MAX_REASON) return MOQ_ERR_INVAL;
+    /* REDIRECT without its Redirect is malformed (9.4.2): use the *_redirect
+     * encoder, which writes it. */
+    if (error_code == MOQ_D21_ERROR_REDIRECT) return MOQ_ERR_INVAL;
     size_t saved = w->pos, len_off;
     moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_ERROR, &len_off);
     if (rc < 0) return rc;
     if ((rc = moq_buf_write_vi64(w, error_code)) < 0) goto fail;
     if ((rc = moq_buf_write_vi64(w, retry_interval)) < 0) goto fail;
     if ((rc = d21_write_span(w, reason)) < 0) goto fail;
-    /* No Redirect (only present for the REDIRECT error code). */
     if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
     return MOQ_OK;
 fail:
@@ -1150,8 +1056,9 @@ moq_result_t moq_d21_decode_request_error(const uint8_t *payload,
     if (rc < 0) return rc;
     if (out->reason.len > MOQ_D21_MAX_REASON) return MOQ_ERR_PROTO;
     /* The base decoder does not parse a Redirect tail; reject leftover bytes
-     * rather than silently accepting them. Use the redirect-aware decoder for the
-     * REDIRECT error code. */
+     * rather than silently accepting them. A REDIRECT code always has one (9.4.2),
+     * so it must go through the redirect-aware decoder. */
+    if (out->error_code == MOQ_D21_ERROR_REDIRECT) return MOQ_ERR_PROTO;
     if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
     return MOQ_OK;
 }
@@ -1954,6 +1861,144 @@ moq_result_t moq_d21_decode_msg_params(moq_buf_reader_t *r, uint64_t count,
                                    out);
 }
 
+/* -- REQUEST_OK (draft-21 9.3) ------------------------------------ */
+
+static bool d21_request_ok_kind(moq_d21_request_ok_kind_t kind, uint32_t *mask,
+                                bool *properties_allowed)
+{
+    switch (kind) {
+    case MOQ_D21_REQUEST_OK_PUBLISH:
+        *mask = MOQ_D21_MASK_PUBLISH_OK; *properties_allowed = false; return true;
+    case MOQ_D21_REQUEST_OK_REQUEST_UPDATE:
+        *mask = MOQ_D21_MASK_REQUEST_UPDATE_OK; *properties_allowed = false; return true;
+    case MOQ_D21_REQUEST_OK_TRACK_STATUS:
+        *mask = MOQ_D21_MASK_TRACK_STATUS_OK; *properties_allowed = true; return true;
+    case MOQ_D21_REQUEST_OK_SUBSCRIBE_NAMESPACE:
+    case MOQ_D21_REQUEST_OK_SUBSCRIBE_TRACKS:
+    case MOQ_D21_REQUEST_OK_PUBLISH_NAMESPACE:
+        *mask = MOQ_D21_MASK_NAMESPACE_OK; *properties_allowed = false; return true;
+    }
+    return false;
+}
+
+moq_result_t moq_d21_encode_request_ok(moq_buf_writer_t *w,
+                                       moq_d21_request_ok_kind_t kind,
+                                       const moq_d21_msg_params_t *params,
+                                       moq_bytes_t track_properties)
+{
+    uint32_t mask;
+    bool props_ok;
+    if (!w || !d21_request_ok_kind(kind, &mask, &props_ok)) return MOQ_ERR_INVAL;
+    moq_d21_msg_params_t none;
+    if (!params) { memset(&none, 0, sizeof(none)); params = &none; }
+    if (!d21_params_within_mask(params, mask)) return MOQ_ERR_INVAL;
+    if (track_properties.len > 0) {
+        /* Track Properties are populated only for TRACK_STATUS_OK (9.3). */
+        if (!props_ok || !track_properties.data) return MOQ_ERR_INVAL;
+        if (d21_validate_track_properties(track_properties.data,
+                                          track_properties.len) < 0)
+            return MOQ_ERR_INVAL;
+    }
+    size_t saved = w->pos, len_off;
+    moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
+    if (rc < 0) return rc;
+    if ((rc = moq_d21_encode_msg_params(w, params)) < 0) goto fail;
+    if (track_properties.len > 0 &&
+        (rc = moq_buf_write_raw(w, track_properties.data,
+                                track_properties.len)) < 0) goto fail;
+    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
+    return MOQ_OK;
+fail:
+    w->pos = saved;
+    return rc;
+}
+
+moq_result_t moq_d21_decode_request_ok(const uint8_t *payload, size_t payload_len,
+                                       moq_d21_request_ok_kind_t kind,
+                                       moq_d21_request_ok_t *out)
+{
+    uint32_t mask;
+    bool props_ok;
+    if (!payload || !out || !d21_request_ok_kind(kind, &mask, &props_ok))
+        return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, payload, payload_len);
+    uint64_t count;
+    moq_result_t rc = moq_buf_read_vi64(&r, &count);
+    if (rc < 0) return rc;
+    if ((rc = moq_d21_decode_msg_params(&r, count, mask, &out->params)) < 0)
+        return rc;
+    out->track_properties.data = moq_buf_reader_ptr(&r);
+    out->track_properties.len = moq_buf_reader_remaining(&r);
+    if (out->track_properties.len == 0) return MOQ_OK;
+    /* Track Properties in any form but TRACK_STATUS_OK close the session (9.3). */
+    if (!props_ok) return MOQ_ERR_PROTO;
+    /* TRACK_STATUS_OK is not among the messages for which an unknown Mandatory
+     * Track Property is fatal (3.6 lists PUBLISH, SUBSCRIBE_OK and FETCH_OK), so
+     * the structure is checked and the property is surfaced rather than rejected. */
+    bool mandatory_ignored = false;
+    return d21_scan_track_properties(out->track_properties.data,
+                                     out->track_properties.len,
+                                     &mandatory_ignored, NULL);
+}
+
+/* -- Code registries (draft-21 16.11) ------------------------------ */
+
+bool moq_d21_request_error_registered(uint64_t code)
+{
+    switch (code) {
+    case MOQ_D21_ERROR_INTERNAL_ERROR: case MOQ_D21_ERROR_UNAUTHORIZED:
+    case MOQ_D21_ERROR_TIMEOUT: case MOQ_D21_ERROR_NOT_SUPPORTED:
+    case MOQ_D21_ERROR_MALFORMED_AUTH_TOKEN: case MOQ_D21_ERROR_EXPIRED_AUTH_TOKEN:
+    case MOQ_D21_ERROR_GOING_AWAY: case MOQ_D21_ERROR_EXCESSIVE_LOAD:
+    case MOQ_D21_ERROR_DOES_NOT_EXIST: case MOQ_D21_ERROR_INVALID_RANGE:
+    case MOQ_D21_ERROR_MALFORMED_TRACK: case MOQ_D21_ERROR_UNINTERESTED:
+    case MOQ_D21_ERROR_PREFIX_OVERLAP: case MOQ_D21_ERROR_NAMESPACE_TOO_LARGE:
+    case MOQ_D21_ERROR_UNSUPPORTED_EXTENSION: case MOQ_D21_ERROR_REDIRECT:
+    case MOQ_D21_ERROR_CONFLICTING_FILTERS: case MOQ_D21_ERROR_INVALID_FILTER:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool moq_d21_publish_done_registered(uint64_t code)
+{
+    switch (code) {
+    case MOQ_D21_PUBLISH_DONE_INTERNAL_ERROR: case MOQ_D21_PUBLISH_DONE_UNAUTHORIZED:
+    case MOQ_D21_PUBLISH_DONE_TRACK_ENDED: case MOQ_D21_PUBLISH_DONE_GOING_AWAY:
+    case MOQ_D21_PUBLISH_DONE_TOO_FAR_BEHIND: case MOQ_D21_PUBLISH_DONE_EXPIRED:
+    case MOQ_D21_PUBLISH_DONE_UPDATE_FAILED: case MOQ_D21_PUBLISH_DONE_EXCESSIVE_LOAD:
+    case MOQ_D21_PUBLISH_DONE_MALFORMED_TRACK:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool moq_d21_session_error_registered(uint64_t code)
+{
+    switch (code) {
+    case MOQ_D21_SESSION_ERR_NO_ERROR: case MOQ_D21_SESSION_ERR_INTERNAL_ERROR:
+    case MOQ_D21_SESSION_ERR_UNAUTHORIZED: case MOQ_D21_SESSION_ERR_PROTOCOL_VIOLATION:
+    case MOQ_D21_SESSION_ERR_INVALID_REQUEST_ID: case MOQ_D21_SESSION_ERR_DUPLICATE_TRACK_ALIAS:
+    case MOQ_D21_SESSION_ERR_KEY_VALUE_FORMATTING: case MOQ_D21_SESSION_ERR_INVALID_PATH:
+    case MOQ_D21_SESSION_ERR_MALFORMED_PATH: case MOQ_D21_SESSION_ERR_GOAWAY_TIMEOUT:
+    case MOQ_D21_SESSION_ERR_CONTROL_MESSAGE_TIMEOUT: case MOQ_D21_SESSION_ERR_DATA_STREAM_TIMEOUT:
+    case MOQ_D21_SESSION_ERR_AUTH_TOKEN_CACHE_OVERFLOW:
+    case MOQ_D21_SESSION_ERR_DUPLICATE_AUTH_TOKEN_ALIAS:
+    case MOQ_D21_SESSION_ERR_MALFORMED_AUTH_TOKEN:
+    case MOQ_D21_SESSION_ERR_UNKNOWN_AUTH_TOKEN_ALIAS:
+    case MOQ_D21_SESSION_ERR_EXPIRED_AUTH_TOKEN: case MOQ_D21_SESSION_ERR_INVALID_AUTHORITY:
+    case MOQ_D21_SESSION_ERR_MALFORMED_AUTHORITY:
+    case MOQ_D21_SESSION_ERR_TOO_MANY_REQUEST_UPDATES:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* -- REQUEST_UPDATE (draft-18 §10.9) ------------------------------- */
 
 moq_result_t moq_d21_encode_request_update(moq_buf_writer_t *w,
@@ -1995,81 +2040,6 @@ moq_result_t moq_d21_decode_request_update(const uint8_t *payload,
 }
 
 /* -- REQUEST_OK (draft-18 §10.5) ----------------------------------- */
-
-moq_result_t moq_d21_encode_request_ok(moq_buf_writer_t *w)
-{
-    if (!w) return MOQ_ERR_INVAL;
-    size_t saved = w->pos, len_off;
-    moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
-    if (rc < 0) return rc;
-    if ((rc = moq_buf_write_vi64(w, 0)) < 0) goto fail;  /* 0 parameters */
-    /* REQUEST_UPDATE_OK carries empty Track Properties (payload ends here). */
-    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
-    return MOQ_OK;
-fail:
-    w->pos = saved;
-    return rc;
-}
-
-moq_result_t moq_d21_decode_request_ok(const uint8_t *payload,
-                                       size_t payload_len)
-{
-    if (!payload) return MOQ_ERR_INVAL;
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, payload, payload_len);
-    uint64_t count;
-    moq_result_t rc = moq_buf_read_vi64(&r, &count);
-    if (rc < 0) return rc;
-    /* The zero-parameter, empty-properties REQUEST_OK form
-     * (PUBLISH_NAMESPACE_OK, SUBSCRIBE_NAMESPACE_OK, SUBSCRIBE_TRACKS_OK).
-     * PUBLISH_OK / SUBSCRIBE_OK are NOT this form -- they carry delivery
-     * parameters via their own decoders. A REQUEST_UPDATE_OK that carries
-     * LARGEST_OBJECT / EXPIRES uses moq_d21_decode_request_update_ok. */
-    if (count != 0) return MOQ_ERR_PROTO;
-    if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
-    return MOQ_OK;
-}
-
-/* REQUEST_UPDATE_OK response parameters (REQUEST_OK §10.5; Message Parameters
- * §10.2, where EXPIRES = 0x08 and LARGEST_OBJECT = 0x09): a REQUEST_UPDATE_OK
- * MAY carry LARGEST_OBJECT and EXPIRES; Track Properties are empty. Distinct
- * from the zero-parameter REQUEST_OK form above. */
-
-moq_result_t moq_d21_encode_request_update_ok(moq_buf_writer_t *w,
-                                              const moq_d21_msg_params_t *p)
-{
-    if (!w || !p) return MOQ_ERR_INVAL;
-    if (!d21_params_within_mask(p, MOQ_D21_MASK_REQUEST_UPDATE_OK))
-        return MOQ_ERR_INVAL;
-    size_t saved = w->pos, len_off;
-    moq_result_t rc = d21_write_header(w, MOQ_D21_REQUEST_OK, &len_off);
-    if (rc < 0) return rc;
-    if ((rc = moq_d21_encode_msg_params(w, p)) < 0) goto fail;
-    /* Track Properties are empty for REQUEST_UPDATE_OK (payload ends here). */
-    if ((rc = d21_patch_len(w, len_off)) < 0) goto fail;
-    return MOQ_OK;
-fail:
-    w->pos = saved;
-    return rc;
-}
-
-moq_result_t moq_d21_decode_request_update_ok(const uint8_t *payload,
-                                              size_t payload_len,
-                                              moq_d21_msg_params_t *out)
-{
-    if (!payload || !out) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
-    moq_buf_reader_t r;
-    moq_buf_reader_init(&r, payload, payload_len);
-    uint64_t count;
-    moq_result_t rc = moq_buf_read_vi64(&r, &count);
-    if (rc < 0) return rc;
-    if ((rc = moq_d21_decode_msg_params(&r, count,
-            MOQ_D21_MASK_REQUEST_UPDATE_OK, out)) < 0) return rc;
-    /* Empty Track Properties (§10.5): any trailing bytes are a violation. */
-    if (moq_buf_reader_remaining(&r) != 0) return MOQ_ERR_PROTO;
-    return MOQ_OK;
-}
 
 /* -- PUBLISH_DONE (draft-18 §10.11) -------------------------------- */
 

@@ -522,23 +522,6 @@ MOQ_API moq_result_t moq_d21_decode_track_status(const uint8_t *payload,
                                                  moq_d21_track_status_t *out);
 
 /*
- * TRACK_STATUS_OK (draft-18 §10.14 / §10.5): a REQUEST_OK (0x7) carrying the
- * same parameters (LARGEST_OBJECT / EXPIRES) and Track Properties a SUBSCRIBE_OK
- * would, but with no Track Alias. Track Properties borrow from the payload.
- */
-typedef struct moq_d21_track_status_ok {
-    moq_d21_msg_params_t params;
-    moq_bytes_t          track_properties;   /* borrowed from payload */
-} moq_d21_track_status_ok_t;
-
-MOQ_API moq_result_t moq_d21_encode_track_status_ok(moq_buf_writer_t *w,
-                                                    const moq_d21_msg_params_t *params,
-                                                    moq_bytes_t track_properties);
-MOQ_API moq_result_t moq_d21_decode_track_status_ok(const uint8_t *payload,
-                                                    size_t payload_len,
-                                                    moq_d21_track_status_ok_t *out);
-
-/*
  * SUBSCRIBE_OK (draft-18 §10.8): no Request ID (the bidi stream correlates).
  * Carries LARGEST_OBJECT / EXPIRES as Message Parameters, then a Track
  * Properties tail. Track Properties are preserved opaquely (`track_properties`
@@ -589,22 +572,6 @@ MOQ_API moq_result_t moq_d21_decode_publish(const uint8_t *payload,
                                             moq_d21_publish_t *out);
 
 /*
- * PUBLISH_OK (draft-18 §10.10 / §10.5): a REQUEST_OK carrying the subscriber's
- * delivery parameters (SUBSCRIBER_PRIORITY / FORWARD / GROUP_ORDER / delivery
- * timeouts) and an EMPTY Track Properties tail (a non-empty tail is a
- * PROTOCOL_VIOLATION, §10.5). No Request ID (the bidi stream correlates).
- */
-typedef struct moq_d21_publish_ok {
-    moq_d21_msg_params_t params;
-} moq_d21_publish_ok_t;
-
-MOQ_API moq_result_t moq_d21_encode_publish_ok(moq_buf_writer_t *w,
-                                               const moq_d21_msg_params_t *params);
-MOQ_API moq_result_t moq_d21_decode_publish_ok(const uint8_t *payload,
-                                               size_t payload_len,
-                                               moq_d21_publish_ok_t *out);
-
-/*
  * GOAWAY (draft-18 §10.4), control-stream form: New Session URI (length-prefixed;
  * the client MUST send zero length), a Timeout (milliseconds; a drain hint), and
  * the Request ID (the smallest unprocessed peer Request ID). The request-stream
@@ -634,15 +601,79 @@ MOQ_API moq_result_t moq_d21_decode_goaway_request(const uint8_t *payload,
                                                    size_t payload_len,
                                                    moq_d21_goaway_t *out);
 
-/* REQUEST_ERROR error code carrying a trailing Redirect structure (§10.6). */
-#define MOQ_D21_ERROR_REDIRECT ((uint64_t)0x34u)
+/* REQUEST_ERROR codes (draft-21 16.11.2, 12.3). Draft 21 removed
+ * DUPLICATE_SUBSCRIPTION (0x19) and INVALID_JOINING_REQUEST_ID (0x32) and added
+ * CONFLICTING_FILTERS and INVALID_FILTER. An unregistered code, GREASE included,
+ * is treated as INTERNAL_ERROR and never closes the session (13). */
+#define MOQ_D21_ERROR_INTERNAL_ERROR        ((uint64_t)0x00u)
+#define MOQ_D21_ERROR_UNAUTHORIZED          ((uint64_t)0x01u)
+#define MOQ_D21_ERROR_TIMEOUT               ((uint64_t)0x02u)
+#define MOQ_D21_ERROR_NOT_SUPPORTED         ((uint64_t)0x03u)
+#define MOQ_D21_ERROR_MALFORMED_AUTH_TOKEN  ((uint64_t)0x04u)
+#define MOQ_D21_ERROR_EXPIRED_AUTH_TOKEN    ((uint64_t)0x05u)
+#define MOQ_D21_ERROR_GOING_AWAY            ((uint64_t)0x06u)
+#define MOQ_D21_ERROR_EXCESSIVE_LOAD        ((uint64_t)0x09u)
+#define MOQ_D21_ERROR_DOES_NOT_EXIST        ((uint64_t)0x10u)
+#define MOQ_D21_ERROR_INVALID_RANGE         ((uint64_t)0x11u)
+#define MOQ_D21_ERROR_MALFORMED_TRACK       ((uint64_t)0x12u)
+#define MOQ_D21_ERROR_UNINTERESTED          ((uint64_t)0x20u)
+#define MOQ_D21_ERROR_PREFIX_OVERLAP        ((uint64_t)0x30u)
+#define MOQ_D21_ERROR_NAMESPACE_TOO_LARGE   ((uint64_t)0x31u)
+#define MOQ_D21_ERROR_UNSUPPORTED_EXTENSION ((uint64_t)0x33u)
+/* The code that carries a trailing Redirect structure (9.4.1). */
+#define MOQ_D21_ERROR_REDIRECT              ((uint64_t)0x34u)
+#define MOQ_D21_ERROR_CONFLICTING_FILTERS   ((uint64_t)0x35u)
+#define MOQ_D21_ERROR_INVALID_FILTER        ((uint64_t)0x36u)
+
+/* PUBLISH_DONE status codes (16.11.3). SUBSCRIPTION_ENDED (0x3) is gone: a
+ * subscription does not end because Largest Object passed the end of its Location
+ * Filter (3.3.1). */
+#define MOQ_D21_PUBLISH_DONE_INTERNAL_ERROR ((uint64_t)0x00u)
+#define MOQ_D21_PUBLISH_DONE_UNAUTHORIZED   ((uint64_t)0x01u)
+#define MOQ_D21_PUBLISH_DONE_TRACK_ENDED    ((uint64_t)0x02u)
+#define MOQ_D21_PUBLISH_DONE_GOING_AWAY     ((uint64_t)0x04u)
+#define MOQ_D21_PUBLISH_DONE_TOO_FAR_BEHIND ((uint64_t)0x05u)
+#define MOQ_D21_PUBLISH_DONE_EXPIRED        ((uint64_t)0x06u)
+#define MOQ_D21_PUBLISH_DONE_UPDATE_FAILED  ((uint64_t)0x08u)
+#define MOQ_D21_PUBLISH_DONE_EXCESSIVE_LOAD ((uint64_t)0x09u)
+#define MOQ_D21_PUBLISH_DONE_MALFORMED_TRACK ((uint64_t)0x12u)
+
+/* Session termination codes (16.11.1). VERSION_NEGOTIATION_FAILED (0x15) is gone
+ * and TOO_MANY_REQUEST_UPDATES (0x1B) is new. */
+#define MOQ_D21_SESSION_ERR_NO_ERROR                  ((uint64_t)0x00u)
+#define MOQ_D21_SESSION_ERR_INTERNAL_ERROR            ((uint64_t)0x01u)
+#define MOQ_D21_SESSION_ERR_UNAUTHORIZED              ((uint64_t)0x02u)
+#define MOQ_D21_SESSION_ERR_PROTOCOL_VIOLATION        ((uint64_t)0x03u)
+#define MOQ_D21_SESSION_ERR_INVALID_REQUEST_ID        ((uint64_t)0x04u)
+#define MOQ_D21_SESSION_ERR_DUPLICATE_TRACK_ALIAS     ((uint64_t)0x05u)
+#define MOQ_D21_SESSION_ERR_KEY_VALUE_FORMATTING      ((uint64_t)0x06u)
+#define MOQ_D21_SESSION_ERR_INVALID_PATH              ((uint64_t)0x08u)
+#define MOQ_D21_SESSION_ERR_MALFORMED_PATH            ((uint64_t)0x09u)
+#define MOQ_D21_SESSION_ERR_GOAWAY_TIMEOUT            ((uint64_t)0x10u)
+#define MOQ_D21_SESSION_ERR_CONTROL_MESSAGE_TIMEOUT   ((uint64_t)0x11u)
+#define MOQ_D21_SESSION_ERR_DATA_STREAM_TIMEOUT       ((uint64_t)0x12u)
+#define MOQ_D21_SESSION_ERR_AUTH_TOKEN_CACHE_OVERFLOW ((uint64_t)0x13u)
+#define MOQ_D21_SESSION_ERR_DUPLICATE_AUTH_TOKEN_ALIAS ((uint64_t)0x14u)
+#define MOQ_D21_SESSION_ERR_MALFORMED_AUTH_TOKEN      ((uint64_t)0x16u)
+#define MOQ_D21_SESSION_ERR_UNKNOWN_AUTH_TOKEN_ALIAS  ((uint64_t)0x17u)
+#define MOQ_D21_SESSION_ERR_EXPIRED_AUTH_TOKEN        ((uint64_t)0x18u)
+#define MOQ_D21_SESSION_ERR_INVALID_AUTHORITY         ((uint64_t)0x19u)
+#define MOQ_D21_SESSION_ERR_MALFORMED_AUTHORITY       ((uint64_t)0x1Au)
+#define MOQ_D21_SESSION_ERR_TOO_MANY_REQUEST_UPDATES  ((uint64_t)0x1Bu)
+
+/* Whether a code is in the draft-21 registry for its context (GREASE values and
+ * everything else are not). Receivers treat an unregistered value as
+ * INTERNAL_ERROR for that context. */
+MOQ_API bool moq_d21_request_error_registered(uint64_t code);
+MOQ_API bool moq_d21_publish_done_registered(uint64_t code);
+MOQ_API bool moq_d21_session_error_registered(uint64_t code);
 
 /*
- * REQUEST_ERROR (draft-18 §10.6.2): no Request ID. A trailing Redirect structure
- * is present only when the error code is REDIRECT; the base decoder below does
- * not decode it (it strict-rejects any tail). Use the redirect-aware decoder for
- * REDIRECT (it takes the namespace parts externally, like the other D18 namespace
- * decoders).
+ * REQUEST_ERROR (draft-21 9.4.2): no Request ID. A trailing Redirect structure
+ * is present exactly when the error code is REDIRECT. The plain encoder refuses
+ * the REDIRECT code and the plain decoder does not accept it (a REDIRECT without
+ * its Redirect is malformed); use the *_redirect variants, which take the
+ * namespace parts externally like the other namespace decoders.
  */
 typedef struct moq_d21_request_error {
     uint64_t    error_code;
@@ -706,23 +737,43 @@ MOQ_API moq_result_t moq_d21_decode_request_update(
     const uint8_t *payload, size_t payload_len, moq_d21_request_update_t *out);
 
 /*
- * REQUEST_OK (draft-18 §10.5): no Request ID (the bidi stream correlates).
- * The ZERO-PARAMETER form -- used for PUBLISH_NAMESPACE_OK,
- * SUBSCRIBE_NAMESPACE_OK, and SUBSCRIBE_TRACKS_OK: no parameters and empty
- * Track Properties. The decoder accepts only that form here (any
- * parameters/properties are rejected). Note: PUBLISH_OK and SUBSCRIBE_OK are
- * NOT zero-parameter -- they carry the subscriber's delivery parameters and use
- * their own encoders (moq_d21_encode_publish_ok / _subscribe_ok). The
- * REQUEST_UPDATE_OK form, which MAY carry LARGEST_OBJECT / EXPIRES parameters,
- * uses the internal moq_d21_{encode,decode}_request_update_ok variants
- * (control_d21_internal.h).
+ * REQUEST_OK (draft-21 9.3): no Request ID (the bidi stream correlates). One
+ * generic wire message answers six requests; the draft names each form by a
+ * shorthand (PUBLISH_OK, REQUEST_UPDATE_OK, TRACK_STATUS_OK, ...) and there is
+ * no separate PUBLISH_OK message in draft 21 (type 0x1E is reserved). The caller
+ * says which request it answers, which fixes the parameters the message may
+ * carry (MOQ_D21_MASK_*_OK) and whether Track Properties are allowed.
+ *
+ * Track Properties follow the parameters and run to the end of the message. They
+ * are populated only for TRACK_STATUS_OK and MUST be empty in every other form; a
+ * receiver that gets them closes with PROTOCOL_VIOLATION (9.3), and the encoder
+ * refuses to send them. Track Properties borrow from the payload on decode.
  */
-MOQ_API moq_result_t moq_d21_encode_request_ok(moq_buf_writer_t *w);
+typedef enum moq_d21_request_ok_kind {
+    MOQ_D21_REQUEST_OK_PUBLISH = 1,             /* PUBLISH_OK: EXPIRES */
+    MOQ_D21_REQUEST_OK_REQUEST_UPDATE,          /* REQUEST_UPDATE_OK: EXPIRES, LARGEST_OBJECT */
+    MOQ_D21_REQUEST_OK_TRACK_STATUS,            /* TRACK_STATUS_OK: + Track Properties */
+    MOQ_D21_REQUEST_OK_SUBSCRIBE_NAMESPACE,     /* EXPIRES */
+    MOQ_D21_REQUEST_OK_SUBSCRIBE_TRACKS,        /* EXPIRES */
+    MOQ_D21_REQUEST_OK_PUBLISH_NAMESPACE        /* EXPIRES */
+} moq_d21_request_ok_kind_t;
+
+typedef struct moq_d21_request_ok {
+    moq_d21_msg_params_t params;
+    moq_bytes_t          track_properties;   /* TRACK_STATUS_OK only; borrowed */
+} moq_d21_request_ok_t;
+
+/* `params` may be NULL (none). `track_properties` must be empty unless `kind` is
+ * TRACK_STATUS, and is structurally validated (a malformed block, or a Mandatory
+ * Track Property, is MOQ_ERR_INVAL). On failure the writer is left unchanged. */
+MOQ_API moq_result_t moq_d21_encode_request_ok(moq_buf_writer_t *w,
+                                               moq_d21_request_ok_kind_t kind,
+                                               const moq_d21_msg_params_t *params,
+                                               moq_bytes_t track_properties);
 MOQ_API moq_result_t moq_d21_decode_request_ok(const uint8_t *payload,
-                                               size_t payload_len);
-/* The REQUEST_UPDATE_OK variants that carry LARGEST_OBJECT / EXPIRES params are
- * INTERNAL (core/src/wire/control_d21_internal.h) -- not part of the public
- * codec surface (the public additions are limited to the session API). */
+                                               size_t payload_len,
+                                               moq_d21_request_ok_kind_t kind,
+                                               moq_d21_request_ok_t *out);
 
 /*
  * PUBLISH_DONE (draft-18 §10.11): a publisher's final message before closing

@@ -16,6 +16,7 @@
 #include <string.h>
 
 static int failures = 0;
+static const moq_bytes_t NO_BYTES = { NULL, 0 };
 
 /* Compare an encoded buffer to an expected byte vector, with a readable failure. */
 static void check_bytes(const char *what, const uint8_t *got, size_t got_len,
@@ -830,6 +831,467 @@ static void t_params_roundtrip(void)
     MOQ_TEST_CHECK(o.has_include_properties && o.include_properties == 0);
 }
 
+
+/* == 4c. SUBSCRIBE family, REQUEST_OK, REQUEST_ERROR ======================= */
+
+/* Frame check: Type (vi64), Length (16), then the body, with the length field
+ * agreeing with the bytes that follow it. */
+static void check_message(const char *what, const uint8_t *got, size_t got_len,
+                          const uint8_t *want, size_t want_len)
+{
+    check_bytes(what, got, got_len, want, want_len);
+}
+
+static moq_control_envelope_t decode_env(const uint8_t *b, size_t n, uint64_t want_type)
+{
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, b, n);
+    moq_control_envelope_t env;
+    memset(&env, 0, sizeof(env));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_envelope(&r, &env), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(env.msg_type, want_type);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_reader_remaining(&r), 0);
+    return env;
+}
+
+static void t_subscribe(void)
+{
+    /* 9.6: Request ID 42, namespace live/sports, name video, no parameters. */
+    uint8_t buf[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live"), MOQ_BYTES_LITERAL("sports") };
+    moq_namespace_t ns = { parts, 2 };
+    moq_d21_msg_params_t none;
+    memset(&none, 0, sizeof(none));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 42, &ns,
+        MOQ_BYTES_LITERAL("video"), &none), (int)MOQ_OK);
+    static const uint8_t want[] = {
+        0x03, 0x00, 0x15, 0x2A, 0x02,
+        0x04, 'l', 'i', 'v', 'e', 0x06, 's', 'p', 'o', 'r', 't', 's',
+        0x05, 'v', 'i', 'd', 'e', 'o', 0x00 };
+    check_message("SUBSCRIBE", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_SUBSCRIBE);
+    moq_bytes_t dparts[32];
+    moq_d21_subscribe_t sub;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(env.payload, env.payload_len,
+                                                        dparts, 32, &sub), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(sub.request_id, 42);
+    MOQ_TEST_CHECK_EQ_SIZE(sub.track_namespace.count, 2);
+    MOQ_TEST_CHECK(sub.track_name.len == 5 && memcmp(sub.track_name.data, "video", 5) == 0);
+}
+
+static void t_subscribe_params(void)
+{
+    /* FORWARD=1 then the Next Object Location Filter: 0x10, then +0x11 -> 0x21. */
+    uint8_t buf[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("a") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_forward = true; p.forward = 1;
+    p.has_location_filter = true; p.location_filter.field_count = 2;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 2, &ns,
+        MOQ_BYTES_LITERAL("t"), &p), (int)MOQ_OK);
+    static const uint8_t want[] = {
+        0x03, 0x00, 0x0D, 0x02, 0x01, 0x01, 'a', 0x01, 't',
+        0x02, 0x10, 0x01, 0x11, 0x02, 0x00, 0x00 };
+    check_message("SUBSCRIBE with filter", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_SUBSCRIBE);
+    moq_bytes_t dparts[32];
+    moq_d21_subscribe_t sub;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(env.payload, env.payload_len,
+                                                        dparts, 32, &sub), (int)MOQ_OK);
+    MOQ_TEST_CHECK(sub.params.has_forward && sub.params.forward == 1);
+    MOQ_TEST_CHECK(sub.params.has_location_filter &&
+                   sub.params.location_filter.field_count == 2);
+
+    /* SUBSCRIBE does not take EXPIRES or LARGEST_OBJECT (response parameters). */
+    memset(&p, 0, sizeof(p));
+    p.has_expires = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe(&w, 2, &ns,
+        MOQ_BYTES_LITERAL("t"), &p), (int)MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+
+    /* ... and the decoder refuses what the encoder would: EXPIRES in a SUBSCRIBE
+     * body is a PROTOCOL_VIOLATION. */
+    static const uint8_t bad[] = { 0x02, 0x01, 0x01, 'a', 0x01, 't', 0x01, 0x08, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(bad, sizeof(bad),
+                                                        dparts, 32, &sub), (int)MOQ_ERR_PROTO);
+}
+
+static void t_namespace_limits(void)
+{
+    /* 8.7: a Track Namespace Field must not be empty, and there are at most 32
+     * fields; both close the session. */
+    moq_bytes_t dparts[40];
+    moq_d21_subscribe_t sub;
+    static const uint8_t empty_field[] = { 0x02, 0x01, 0x00, 0x01, 't', 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(empty_field, sizeof(empty_field),
+                                                        dparts, 40, &sub), (int)MOQ_ERR_PROTO);
+    uint8_t many[160];
+    size_t n = 0;
+    many[n++] = 0x02;                       /* request id */
+    many[n++] = 33;                         /* 33 fields */
+    for (int i = 0; i < 33; i++) { many[n++] = 0x01; many[n++] = 'x'; }
+    many[n++] = 0x01; many[n++] = 't'; many[n++] = 0x00;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(many, n, dparts, 40, &sub),
+                          (int)MOQ_ERR_PROTO);
+    /* Exactly 32 is fine. */
+    n = 0;
+    many[n++] = 0x02;
+    many[n++] = 32;
+    for (int i = 0; i < 32; i++) { many[n++] = 0x01; many[n++] = 'x'; }
+    many[n++] = 0x01; many[n++] = 't'; many[n++] = 0x00;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(many, n, dparts, 40, &sub),
+                          (int)MOQ_OK);
+    /* Zero fields is a valid (root) namespace (8.7: between 0 and 32). */
+    static const uint8_t root[] = { 0x02, 0x00, 0x01, 't', 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe(root, sizeof(root),
+                                                        dparts, 40, &sub), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(sub.track_namespace.count, 0);
+}
+
+static void t_subscribe_ok(void)
+{
+    /* 9.7: Track Alias 5, LARGEST_OBJECT {3,1}, then a Track Property
+     * (DEFAULT_PUBLISHER_PRIORITY 0x0E = 5) that fills the rest of the message. */
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_largest = true; p.largest_group = 3; p.largest_object = 1;
+    static const uint8_t props[] = { 0x0E, 0x05 };
+    moq_bytes_t tp = { props, sizeof(props) };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_subscribe_ok(&w, 5, &p, tp), (int)MOQ_OK);
+    static const uint8_t want[] = { 0x04, 0x00, 0x07, 0x05, 0x01, 0x09, 0x03, 0x01, 0x0E, 0x05 };
+    check_message("SUBSCRIBE_OK", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_SUBSCRIBE_OK);
+    moq_d21_subscribe_ok_t ok;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_ok(env.payload, env.payload_len, &ok),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(ok.track_alias, 5);
+    MOQ_TEST_CHECK(ok.params.has_largest && ok.params.largest_group == 3 &&
+                   ok.params.largest_object == 1);
+    MOQ_TEST_CHECK_EQ_SIZE(ok.track_properties.len, 2);
+    MOQ_TEST_CHECK(!ok.dynamic_groups && !ok.track_properties_unsupported);
+
+    /* DYNAMIC_GROUPS = 1 (10.6) is surfaced; a value above 1 closes. */
+    {
+        static const uint8_t dg[] = { 0x05, 0x00, 0x30, 0x01 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_ok(dg, sizeof(dg), &ok), (int)MOQ_OK);
+        MOQ_TEST_CHECK(ok.dynamic_groups);
+        static const uint8_t dg2[] = { 0x05, 0x00, 0x30, 0x02 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_ok(dg2, sizeof(dg2), &ok),
+                              (int)MOQ_ERR_PROTO);
+    }
+    /* A Mandatory Track Property (0x4000..0x7FFF, 3.6) is surfaced as
+     * unsupported rather than rejected, so the session can cancel the
+     * subscription (UNSUPPORTED_EXTENSION). 0x4000 is C0 40 00 as a vi64. */
+    {
+        static const uint8_t mp[] = { 0x05, 0x00, 0xC0, 0x40, 0x00, 0x00 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_ok(mp, sizeof(mp), &ok), (int)MOQ_OK);
+        MOQ_TEST_CHECK(ok.track_properties_unsupported);
+    }
+    /* SUBSCRIBE_OK carries only EXPIRES and LARGEST_OBJECT (9.20). */
+    {
+        static const uint8_t fwd[] = { 0x05, 0x01, 0x10, 0x00 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_subscribe_ok(fwd, sizeof(fwd), &ok),
+                              (int)MOQ_ERR_PROTO);
+    }
+}
+
+static void t_request_update(void)
+{
+    /* 9.5: Request ID 6, FORWARD 0. */
+    uint8_t buf[32];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_forward = true; p.forward = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 6, &p), (int)MOQ_OK);
+    static const uint8_t want[] = { 0x02, 0x00, 0x04, 0x06, 0x01, 0x10, 0x00 };
+    check_message("REQUEST_UPDATE", buf, moq_buf_writer_offset(&w), want, sizeof(want));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_REQUEST_UPDATE);
+    moq_d21_request_update_t u;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_update(env.payload, env.payload_len, &u),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(u.request_id, 6);
+    MOQ_TEST_CHECK(u.params.has_forward && u.params.forward == 0);
+
+    /* GROUP_ORDER may not be updated (9.20.9 lists SUBSCRIBE, PUBLISH,
+     * SUBSCRIBE_TRACKS and FETCH only); on the wire it is a violation. */
+    static const uint8_t go[] = { 0x06, 0x01, 0x22, 0x01 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_update(go, sizeof(go), &u),
+                          (int)MOQ_ERR_PROTO);
+    memset(&p, 0, sizeof(p));
+    p.has_group_order = true; p.group_order = 1;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 6, &p), (int)MOQ_ERR_INVAL);
+
+    /* A fill is requested by an update that carries FILL_PARAMETERS (9.5.1). */
+    memset(&p, 0, sizeof(p));
+    p.has_location_filter = true; p.location_filter.field_count = 1; p.location_filter.start_group = 1;
+    p.has_fill = true; p.fill.has_location_filter = true;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_update(&w, 8, &p), (int)MOQ_OK);
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_REQUEST_UPDATE);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_update(env.payload, env.payload_len, &u),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK(u.params.has_fill && u.params.has_location_filter);
+}
+
+static void t_request_ok(void)
+{
+    /* 9.3: PUBLISH_OK is a REQUEST_OK; with no parameters and no properties the
+     * body is a bare zero count. */
+    uint8_t buf[64];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_ok(
+        &w, MOQ_D21_REQUEST_OK_PUBLISH, NULL, NO_BYTES), (int)MOQ_OK);
+    static const uint8_t pub_ok[] = { 0x07, 0x00, 0x01, 0x00 };
+    check_message("PUBLISH_OK", buf, moq_buf_writer_offset(&w), pub_ok, sizeof(pub_ok));
+
+    /* PUBLISH_OK may carry EXPIRES (9.20.17): 1000 ms is the vi64 83 E8. */
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_expires = true; p.expires_ms = 1000;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_ok(
+        &w, MOQ_D21_REQUEST_OK_PUBLISH, &p, NO_BYTES), (int)MOQ_OK);
+    static const uint8_t pub_exp[] = { 0x07, 0x00, 0x04, 0x01, 0x08, 0x83, 0xE8 };
+    check_message("PUBLISH_OK expires", buf, moq_buf_writer_offset(&w), pub_exp, sizeof(pub_exp));
+
+    /* REQUEST_UPDATE_OK: EXPIRES then LARGEST_OBJECT (+1 delta), 9.20.17/18. */
+    memset(&p, 0, sizeof(p));
+    p.has_expires = true; p.expires_ms = 1000;
+    p.has_largest = true; p.largest_group = 5; p.largest_object = 2;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_ok(
+        &w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE, &p, NO_BYTES), (int)MOQ_OK);
+    static const uint8_t upd_ok[] = { 0x07, 0x00, 0x07, 0x02, 0x08, 0x83, 0xE8, 0x01, 0x05, 0x02 };
+    check_message("REQUEST_UPDATE_OK", buf, moq_buf_writer_offset(&w), upd_ok, sizeof(upd_ok));
+
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_REQUEST_OK);
+    moq_d21_request_ok_t ok;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(env.payload, env.payload_len,
+        MOQ_D21_REQUEST_OK_REQUEST_UPDATE, &ok), (int)MOQ_OK);
+    MOQ_TEST_CHECK(ok.params.has_expires && ok.params.expires_ms == 1000);
+    MOQ_TEST_CHECK(ok.params.has_largest && ok.params.largest_group == 5 &&
+                   ok.params.largest_object == 2);
+    MOQ_TEST_CHECK_EQ_SIZE(ok.track_properties.len, 0);
+
+    /* TRACK_STATUS_OK is the one REQUEST_OK that carries Track Properties
+     * (9.3): LARGEST_OBJECT {1,0} then DEFAULT_PUBLISHER_PRIORITY. */
+    memset(&p, 0, sizeof(p));
+    p.has_largest = true; p.largest_group = 1; p.largest_object = 0;
+    static const uint8_t props[] = { 0x0E, 0x05 };
+    moq_bytes_t tp = { props, sizeof(props) };
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_ok(
+        &w, MOQ_D21_REQUEST_OK_TRACK_STATUS, &p, tp), (int)MOQ_OK);
+    static const uint8_t ts_ok[] = { 0x07, 0x00, 0x06, 0x01, 0x09, 0x01, 0x00, 0x0E, 0x05 };
+    check_message("TRACK_STATUS_OK", buf, moq_buf_writer_offset(&w), ts_ok, sizeof(ts_ok));
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_REQUEST_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(env.payload, env.payload_len,
+        MOQ_D21_REQUEST_OK_TRACK_STATUS, &ok), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(ok.track_properties.len, 2);
+
+    /* Track Properties anywhere else are a PROTOCOL_VIOLATION on receipt, and
+     * the encoder refuses to send them. */
+    static const uint8_t with_props[] = { 0x00, 0x0E, 0x05 };
+    static const moq_d21_request_ok_kind_t others[] = {
+        MOQ_D21_REQUEST_OK_PUBLISH, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+        MOQ_D21_REQUEST_OK_SUBSCRIBE_NAMESPACE, MOQ_D21_REQUEST_OK_SUBSCRIBE_TRACKS,
+        MOQ_D21_REQUEST_OK_PUBLISH_NAMESPACE };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(with_props, sizeof(with_props),
+                                                             others[i], &ok), (int)MOQ_ERR_PROTO);
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_ok(&w, others[i], NULL, tp),
+                              (int)MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_buf_writer_offset(&w), 0);
+    }
+
+    /* The parameter set depends on the request answered: PUBLISH_OK takes EXPIRES
+     * but not LARGEST_OBJECT; the namespace OKs take EXPIRES only. */
+    static const uint8_t largest[] = { 0x01, 0x09, 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(largest, sizeof(largest),
+        MOQ_D21_REQUEST_OK_PUBLISH, &ok), (int)MOQ_ERR_PROTO);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(largest, sizeof(largest),
+        MOQ_D21_REQUEST_OK_SUBSCRIBE_NAMESPACE, &ok), (int)MOQ_ERR_PROTO);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(largest, sizeof(largest),
+        MOQ_D21_REQUEST_OK_REQUEST_UPDATE, &ok), (int)MOQ_OK);
+    static const uint8_t expires[] = { 0x01, 0x08, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(expires, sizeof(expires),
+        MOQ_D21_REQUEST_OK_PUBLISH_NAMESPACE, &ok), (int)MOQ_OK);
+
+    /* TRACK_STATUS_OK property structure is checked; an unknown Mandatory Track
+     * Property is surfaced, not rejected (3.6 lists PUBLISH, SUBSCRIBE_OK and
+     * FETCH_OK only). */
+    static const uint8_t bad_props[] = { 0x00, 0x01, 0x05, 'a' };   /* odd type, length 5 > 1 */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(bad_props, sizeof(bad_props),
+        MOQ_D21_REQUEST_OK_TRACK_STATUS, &ok), (int)MOQ_ERR_PROTO);
+    static const uint8_t mand[] = { 0x00, 0xC0, 0x40, 0x00, 0x00 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_ok(mand, sizeof(mand),
+        MOQ_D21_REQUEST_OK_TRACK_STATUS, &ok), (int)MOQ_OK);
+
+    /* Truncated: a count with nothing after it. */
+    static const uint8_t trunc[] = { 0x01 };
+    MOQ_TEST_CHECK(moq_d21_decode_request_ok(trunc, sizeof(trunc),
+        MOQ_D21_REQUEST_OK_PUBLISH, &ok) < 0);
+}
+
+static void t_request_error(void)
+{
+    uint8_t buf[128];
+    moq_buf_writer_t w;
+
+    /* 9.4.2: NOT_SUPPORTED (0x03), Retry Interval 0, reason "no". */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_error(&w, 0x03, 0,
+        MOQ_BYTES_LITERAL("no")), (int)MOQ_OK);
+    static const uint8_t ne[] = { 0x05, 0x00, 0x05, 0x03, 0x00, 0x02, 'n', 'o' };
+    check_message("REQUEST_ERROR", buf, moq_buf_writer_offset(&w), ne, sizeof(ne));
+    moq_control_envelope_t env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_REQUEST_ERROR);
+    moq_d21_request_error_t e;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_error(env.payload, env.payload_len, &e),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(e.error_code, 0x03);
+    MOQ_TEST_CHECK_EQ_U64(e.retry_interval, 0);
+    MOQ_TEST_CHECK(e.reason.len == 2 && memcmp(e.reason.data, "no", 2) == 0);
+
+    /* INVALID_FILTER (0x36) is new in draft 21 (16.11.2) and Retry Interval is a
+     * raw "milliseconds plus one" integer: 1 means retry immediately. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_error(&w, MOQ_D21_ERROR_INVALID_FILTER, 1,
+        NO_BYTES), (int)MOQ_OK);
+    static const uint8_t inf[] = { 0x05, 0x00, 0x03, 0x36, 0x01, 0x00 };
+    check_message("REQUEST_ERROR INVALID_FILTER", buf, moq_buf_writer_offset(&w), inf, sizeof(inf));
+
+    /* 9.4.1: the REDIRECT code carries a Redirect: empty URI (this session),
+     * namespace [a], track name t. */
+    moq_bytes_t rparts[] = { MOQ_BYTES_LITERAL("a") };
+    moq_d21_redirect_t red;
+    memset(&red, 0, sizeof(red));
+    red.track_namespace.parts = rparts; red.track_namespace.count = 1;
+    red.track_name = MOQ_BYTES_LITERAL("t");
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_error_redirect(&w, MOQ_D21_ERROR_REDIRECT,
+        0, NO_BYTES, &red), (int)MOQ_OK);
+    static const uint8_t rd[] = { 0x05, 0x00, 0x09, 0x34, 0x00, 0x00, 0x00, 0x01, 0x01, 'a', 0x01, 't' };
+    check_message("REQUEST_ERROR REDIRECT", buf, moq_buf_writer_offset(&w), rd, sizeof(rd));
+    env = decode_env(buf, moq_buf_writer_offset(&w), MOQ_D21_REQUEST_ERROR);
+    moq_bytes_t dparts[32];
+    moq_d21_redirect_t got;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_error_redirect(env.payload, env.payload_len,
+        dparts, 32, &e, &got), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(e.error_code, MOQ_D21_ERROR_REDIRECT);
+    MOQ_TEST_CHECK_EQ_SIZE(got.connect_uri.len, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(got.track_namespace.count, 1);
+    MOQ_TEST_CHECK(got.track_name.len == 1 && got.track_name.data[0] == 't');
+
+    /* A REDIRECT code with no Redirect is malformed, so the plain encoder
+     * refuses it and the plain decoder does not accept it. */
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_error(&w, MOQ_D21_ERROR_REDIRECT, 0,
+        NO_BYTES), (int)MOQ_ERR_INVAL);
+    static const uint8_t bare_redirect[] = { 0x34, 0x00, 0x00 };
+    MOQ_TEST_CHECK(moq_d21_decode_request_error(bare_redirect, sizeof(bare_redirect), &e) < 0);
+    MOQ_TEST_CHECK(moq_d21_decode_request_error_redirect(bare_redirect, sizeof(bare_redirect),
+        dparts, 32, &e, &got) < 0);
+
+    /* A Redirect after any other code is trailing garbage. */
+    static const uint8_t extra[] = { 0x03, 0x00, 0x00, 0x00, 0x01, 0x01, 'a', 0x01, 't' };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_error_redirect(extra, sizeof(extra),
+        dparts, 32, &e, &got), (int)MOQ_ERR_PROTO);
+
+    /* The reason phrase is at most 1024 bytes (8.5): 1025 closes on receipt and is
+     * refused on send; 1024 is accepted. */
+    static uint8_t reason[1025];
+    memset(reason, 'x', sizeof(reason));
+    static uint8_t big[1100];
+    moq_buf_writer_t bw;
+    moq_buf_writer_init(&bw, big, sizeof(big));
+    moq_bytes_t r1024 = { reason, 1024 }, r1025 = { reason, 1025 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_error(&bw, 0x01, 0, r1024), (int)MOQ_OK);
+    moq_buf_writer_init(&bw, big, sizeof(big));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_request_error(&bw, 0x01, 0, r1025), (int)MOQ_ERR_INVAL);
+    {
+        uint8_t body[1040];
+        size_t bn = 0;
+        body[bn++] = 0x01; body[bn++] = 0x00;
+        body[bn++] = 0x84; body[bn++] = 0x01;           /* length 1025 as a vi64 */
+        memcpy(body + bn, reason, 1025); bn += 1025;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_request_error(body, bn, &e), (int)MOQ_ERR_PROTO);
+    }
+}
+
+/* The code registries (16.11.1 to 16.11.3): the numbers are the wire contract, so
+ * they are pinned here against the IANA tables, including what draft 21 removed
+ * and added relative to draft 18. */
+static void t_code_registries(void)
+{
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_INTERNAL_ERROR, 0x0);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_UNAUTHORIZED, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_TIMEOUT, 0x2);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_NOT_SUPPORTED, 0x3);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_MALFORMED_AUTH_TOKEN, 0x4);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_EXPIRED_AUTH_TOKEN, 0x5);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_GOING_AWAY, 0x6);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_EXCESSIVE_LOAD, 0x9);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_DOES_NOT_EXIST, 0x10);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_INVALID_RANGE, 0x11);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_MALFORMED_TRACK, 0x12);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_UNINTERESTED, 0x20);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_PREFIX_OVERLAP, 0x30);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_NAMESPACE_TOO_LARGE, 0x31);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_UNSUPPORTED_EXTENSION, 0x33);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_REDIRECT, 0x34);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_CONFLICTING_FILTERS, 0x35);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_ERROR_INVALID_FILTER, 0x36);
+
+    /* Registered codes, and the two draft 18 codes that no longer are. */
+    MOQ_TEST_CHECK(moq_d21_request_error_registered(0x36));
+    MOQ_TEST_CHECK(moq_d21_request_error_registered(0x35));
+    MOQ_TEST_CHECK(!moq_d21_request_error_registered(0x19));   /* DUPLICATE_SUBSCRIPTION */
+    MOQ_TEST_CHECK(!moq_d21_request_error_registered(0x32));   /* INVALID_JOINING_REQUEST_ID */
+    MOQ_TEST_CHECK(!moq_d21_request_error_registered(0x7));
+    MOQ_TEST_CHECK(!moq_d21_request_error_registered(0x9D));   /* GREASE: never registered */
+    MOQ_TEST_CHECK(!moq_d21_request_error_registered(UINT64_MAX));
+
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_INTERNAL_ERROR, 0x0);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_UNAUTHORIZED, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_TRACK_ENDED, 0x2);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_GOING_AWAY, 0x4);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_TOO_FAR_BEHIND, 0x5);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_EXPIRED, 0x6);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_UPDATE_FAILED, 0x8);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_EXCESSIVE_LOAD, 0x9);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_PUBLISH_DONE_MALFORMED_TRACK, 0x12);
+    MOQ_TEST_CHECK(moq_d21_publish_done_registered(0x8));
+    MOQ_TEST_CHECK(!moq_d21_publish_done_registered(0x3));     /* SUBSCRIPTION_ENDED removed */
+    MOQ_TEST_CHECK(!moq_d21_publish_done_registered(0x3F));
+
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_SESSION_ERR_TOO_MANY_REQUEST_UPDATES, 0x1B);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_SESSION_ERR_PROTOCOL_VIOLATION, 0x3);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_SESSION_ERR_KEY_VALUE_FORMATTING, 0x6);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_SESSION_ERR_INVALID_AUTHORITY, 0x19);
+    MOQ_TEST_CHECK_EQ_U64(MOQ_D21_SESSION_ERR_MALFORMED_AUTHORITY, 0x1A);
+    MOQ_TEST_CHECK(moq_d21_session_error_registered(0x1B));
+    MOQ_TEST_CHECK(!moq_d21_session_error_registered(0x15));   /* VERSION_NEGOTIATION_FAILED removed */
+}
+
 int main(void)
 {
     t_setup_options_encode();
@@ -842,6 +1304,14 @@ int main(void)
     t_params_range_filters();
     t_params_legality_matrix();
     t_params_roundtrip();
+    t_subscribe();
+    t_subscribe_params();
+    t_namespace_limits();
+    t_subscribe_ok();
+    t_request_update();
+    t_request_ok();
+    t_request_error();
+    t_code_registries();
 
     if (failures)
         fprintf(stderr, "test_control_d21: %d byte-vector failures\n", failures);
