@@ -216,12 +216,12 @@ typedef struct moq_session_cfg {
     moq_bytes_t        setup_authority;
     moq_bytes_t        setup_path;
 
-    /* Appended (ABI-additive; draft 21 9.1.7): advertise MAX_REQUEST_UPDATES, the number
-     * of REQUEST_UPDATEs the peer may have outstanding on one request stream. 0 (the
+    /* Appended (ABI-additive; draft 21 9.1.7): advertise the request-update limit, the number
+     * of updates the peer may have outstanding on one request stream. 0 (the
      * default) sends nothing, which means unlimited. This session answers each update
      * as it is processed, so it never holds more than one unanswered; the option only
      * tells a peer how far it may pipeline. No inbound counter enforces it (it could
-     * not be exceeded observably), so TOO_MANY_REQUEST_UPDATES is never sent. Draft 21
+     * not be exceeded observably), so the too-many-updates session error is never sent. Draft 21
      * only. */
     uint64_t           max_request_updates;
 } moq_session_cfg_t;
@@ -2184,7 +2184,7 @@ typedef struct moq_fill_info {
 } moq_fill_info_t;
 
 /*
- * Tell a subscriber the state of its subscription changed for a reason other than its
+ * Send a subscriber a state notice: its subscription changed for a reason other than its
  * own update (draft 21 9.10): a Forward change, a narrowed filter, a new Largest Object.
  * Informative and unanswered; it must include the Largest Object when known (that is the
  * caller's duty: pass has_largest). Publisher side of an ESTABLISHED subscription, on
