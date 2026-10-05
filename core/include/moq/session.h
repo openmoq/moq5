@@ -2372,6 +2372,9 @@ MOQ_API moq_result_t moq_session_end_fetch(
 /*
  * Cancel a pending fetch (subscriber side). Advancing call.
  * Queues cancellation bytes. Frees the fetch entry.
+ * A fill's fetch handle (MOQ_EVENT_FILL_OPENED) is refused with
+ * MOQ_ERR_WRONG_STATE and nothing is sent: the fill belongs to its
+ * subscription, and ends with it (unsubscribe).
  */
 MOQ_API moq_result_t moq_session_fetch_cancel(moq_session_t *s,
                                                moq_fetch_t fetch,

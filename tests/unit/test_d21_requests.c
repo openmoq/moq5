@@ -2225,6 +2225,76 @@ static void t_facade_fill_cancel(void)
     moq_simpair_destroy(sp);
 }
 
+/* Session level: cancelling a fill's fetch handle is refused. A fill rides its
+ * SUBSCRIBE's request stream, so a fetch cancel there would end the subscription. */
+static void t_fill_fetch_cancel_refused(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *cl = moq_simpair_client(sp), *sv = moq_simpair_server(sp);
+    moq_bytes_t parts[1];
+    moq_subscribe_cfg_t cfg;
+    moq_subscribe_cfg_init(&cfg);
+    cfg.track_namespace = ns_live(parts); cfg.track_name = lit("fc");
+    cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    cfg.fill = current_group_fill();
+    cfg.fill.present = true;
+    moq_subscription_t csub;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_subscribe(cl, &cfg, moq_simpair_now_us(sp), &csub),
+                          (int)MOQ_OK);
+    moq_subscription_t ssub = fill_take_subscribe(sp);
+    /* Open the fill but leave it unfinished, so its stream is still live. */
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    acc.has_largest = true; acc.largest_group = 3; acc.largest_object = 1;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(sv, ssub, &acc,
+                          moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_fill_info_t info; moq_fetch_t sfh;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(sv, ssub, moq_simpair_now_us(sp), &info, &sfh),
+                          (int)MOQ_OK);
+    moq_rcbuf_t *pl = NULL;
+    uint8_t d[1] = { 0 };
+    moq_rcbuf_create(moq_alloc_default(), d, sizeof(d), &pl);
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.group_id = 3; oc.object_id = 0; oc.payload = pl;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_object(sv, sfh, &oc, moq_simpair_now_us(sp)),
+                          (int)MOQ_OK);
+    moq_rcbuf_decref(pl);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+
+    moq_event_t ev;
+    moq_fetch_t cfh;
+    memset(&cfh, 0, sizeof(cfh));
+    bool opened = false;
+    while (moq_session_poll_events(cl, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_FILL_OPENED) {
+            MOQ_TEST_CHECK(moq_subscription_eq(ev.u.fill_opened.sub, csub));
+            cfh = ev.u.fill_opened.fetch;
+            opened = true;
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(opened);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch_cancel(cl, cfh, moq_simpair_now_us(sp)),
+                          (int)MOQ_ERR_WRONG_STATE);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    /* Nothing was sent: the publisher still has the subscription and the fill. */
+    MOQ_TEST_CHECK(!next_event(sv, MOQ_EVENT_UNSUBSCRIBED, &ev));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(sv, sfh, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    int complete = 0;
+    while (moq_session_poll_events(cl, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_FETCH_COMPLETE && moq_fetch_eq(ev.u.fetch_complete.fetch, cfh))
+            complete++;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(complete, 1);
+    MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+}
+
 /* Unsubscribing before the fill arrives frees its fetch slot for the next fill. */
 static void t_facade_fill_unsubscribe(void)
 {
@@ -2318,6 +2388,7 @@ int main(void)
     t_facade_fill_rejected();
     t_facade_fill_cancel();
     t_facade_fill_unsubscribe();
+    t_fill_fetch_cancel_refused();
     t_facade_fill_unsupported();
     t_delivery_timer_at_fin();
     t_update_credit();

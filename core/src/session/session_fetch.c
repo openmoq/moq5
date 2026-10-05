@@ -1831,6 +1831,11 @@ moq_result_t moq_session_fetch_cancel(moq_session_t *s,
     moq_fetch_entry_t *e = &s->fetches[slot];
     if (e->role != MOQ_FETCH_ROLE_FETCHER)
         return MOQ_ERR_WRONG_STATE;
+    /* A fill (draft 21 3.4) has no request of its own: it shares its SUBSCRIBE's
+     * (or update's) Request ID and request stream, so the request-stream cancel
+     * below would end the subscription. Refused whatever the fill's state. */
+    if (e->is_fill)
+        return MOQ_ERR_WRONG_STATE;
     if (e->state != MOQ_FETCH_PENDING_FETCHER)
         return MOQ_ERR_WRONG_STATE;
 
