@@ -2426,6 +2426,9 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->setup_authority_len = setup_authority.len;
     s->setup_authority_present = setup_authority.data != NULL;
     s->setup_path_present = setup_path.data != NULL;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, max_request_updates) +
+                            sizeof(cfg->max_request_updates))
+        s->advertise_max_request_updates = cfg->max_request_updates;
     if (setup_path.len) memcpy(s->setup_path, setup_path.data, setup_path.len);
     s->setup_path_len = setup_path.len;
     s->send_auth_token_cache_size = send_auth_token_cache_size;

@@ -153,6 +153,22 @@ static void t_setup_emitted(void)
     }
 }
 
+/* MAX_REQUEST_UPDATES is advertised only when configured (9.1.7). */
+static void t_setup_max_request_updates(void)
+{
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
+    cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.max_request_updates = 3;
+    moq_session_t *s = NULL;
+    MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) >= 0 && s);
+    MOQ_TEST_CHECK(moq_session_start(s, 0) >= 0);
+    moq_d21_setup_opts_t o;
+    MOQ_TEST_CHECK(capture_setup_options(s, &o));
+    MOQ_TEST_CHECK(o.has_max_request_updates && o.max_request_updates == 3);
+    moq_session_destroy(s);
+}
+
 /* A native-QUIC client names its URI: PATH (0x01) first, AUTHORITY (0x05) after the cache
  * size, each a length-prefixed byte string (9.1.1, 9.1.2). A server never sends them. */
 static void t_setup_authority_path(void)
@@ -505,6 +521,7 @@ int main(void)
 {
     t_setup_emitted();
     t_setup_authority_path();
+    t_setup_max_request_updates();
     t_setup_peer_options();
     t_setup_violations();
     t_goaway();

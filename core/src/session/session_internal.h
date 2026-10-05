@@ -1572,6 +1572,7 @@ struct moq_session {
     size_t              setup_authority_len;
     bool                setup_authority_present;
     bool                setup_path_present;
+    uint64_t            advertise_max_request_updates;   /* 0 = not advertised */
     uint8_t             setup_path[MOQ_SETUP_PATH_MAX];
     size_t              setup_path_len;
 

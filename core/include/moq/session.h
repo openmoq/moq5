@@ -215,6 +215,15 @@ typedef struct moq_session_cfg {
      * must not send them. Draft 16 ignores these. */
     moq_bytes_t        setup_authority;
     moq_bytes_t        setup_path;
+
+    /* Appended (ABI-additive; draft 21 9.1.7): advertise MAX_REQUEST_UPDATES, the number
+     * of REQUEST_UPDATEs the peer may have outstanding on one request stream. 0 (the
+     * default) sends nothing, which means unlimited. This session answers each update
+     * as it is processed, so it never holds more than one unanswered; the option only
+     * tells a peer how far it may pipeline. No inbound counter enforces it (it could
+     * not be exceeded observably), so TOO_MANY_REQUEST_UPDATES is never sent. Draft 21
+     * only. */
+    uint64_t           max_request_updates;
 } moq_session_cfg_t;
 #define MOQ_SETUP_AUTHORITY_MAX 255u
 #define MOQ_SETUP_PATH_MAX      1023u

@@ -132,6 +132,10 @@ static moq_result_t d21_start(moq_session_t *s)
             opts.path_value = (moq_bytes_t){ s->setup_path, s->setup_path_len };
         }
     }
+    if (s->advertise_max_request_updates > 0) {
+        opts.has_max_request_updates = true;
+        opts.max_request_updates = s->advertise_max_request_updates;
+    }
     static const char impl[] = "libmoq/" MOQ_VERSION_STRING;
     opts.has_implementation = true;
     opts.implementation.data = (const uint8_t *)impl;
