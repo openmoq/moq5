@@ -24,6 +24,15 @@ void wt_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,
                            wt_endpoint_ctx_t *ctx,
                            proxygen::WebTransport *wt);
 
+#ifdef MOQ_PROXYGEN_WT_TESTING
+/* Test-only capability override (see wt_endpoint_ops.cpp). */
+void wt_test_set_hold_input(int mode);
+/* Test-only allocation-failure injection (see wt_adapter.cpp): the next
+ * allocation at the named point fails. 1 = recording a refused chunk,
+ * 2 = the redelivery snapshot. */
+void wt_test_fail_next(int which);
+#endif
+
 } // namespace moq::wt
 
 #endif // MOQ_WT_ENDPOINT_OPS_H

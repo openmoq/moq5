@@ -15,6 +15,9 @@ endforeach()
 set(_cbuild "${WORK}/consumer-build")
 file(REMOVE_RECURSE "${_cbuild}")
 
+include("${CMAKE_CURRENT_LIST_DIR}/../../../tests/cmake/RejectConsumerWarnings.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/consumer_environment.cmake")
+
 set(_fwd "")
 if(DEFINED C_COMPILER AND NOT C_COMPILER STREQUAL "")
     list(APPEND _fwd "-DCMAKE_C_COMPILER=${C_COMPILER}")
@@ -26,7 +29,7 @@ if(DEFINED LINK_FLAGS AND NOT LINK_FLAGS STREQUAL "")
     list(APPEND _fwd "-DCMAKE_EXE_LINKER_FLAGS=${LINK_FLAGS}")
 endif()
 
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_cbuild}"
         "-Dlibmoq_DIR=${BUILD}" ${_fwd}
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
@@ -34,15 +37,16 @@ if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "consumer configure failed:\n${_out}")
 endif()
 
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} --build "${_cbuild}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
 if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "consumer build failed:\n${_out}")
 endif()
 
-execute_process(
-    COMMAND "${_cbuild}/moq_msquic_consumer_test"
+msquic_consumer_environment(_env)
+moq_consumer_execute(
+    COMMAND ${_env} "${_cbuild}/moq_msquic_consumer_test"
     RESULT_VARIABLE _rc)
 if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "consumer run failed: ${_rc}")

@@ -147,6 +147,79 @@ file is not readable.
 
 ## Building
 
+### Corrected mvfst dependency input
+
+`scripts/setup_mvfst_deps.sh` materializes only mvfst, from a caller-supplied
+offline copy of the official `v2026.05.25.00` archive (commit
+`d48af283a4d14583382288bd57b7093ffb80dbf0`). The required archive SHA256 is
+`ec88bcabc7f8689348ad7b3a5ee4313f0dd196df16959e16ea62ab6cbd46d337`.
+It does not fetch, mutate a checkout, install globally, or build the transitive
+dependency closure.
+
+Two independently retained production corrections are applied to a fresh export:
+
+- `cmake/patches/mvfst-2026.05.25-nullability.patch`: reviewed nullability
+  annotations, SHA256 `90082465ef41158ee20391f0d88234b0390f10a7c3f30795f1e9912a00015d31`.
+- `cmake/patches/mvfst-2026.05.25-hostid-guard.patch`: omit redundant default-zero
+  HostId initialization only during worker construction; ID0 and routing remain
+  unchanged. SHA256 `95c18e1adeaca4f1f11d55bd2942ca1559a7311c1fa9ad3b9c82ecfd92437a47`.
+
+The recipe verifies all three hashes and apply-checks both patches before CMake.
+It does not apply/install the separate upstream-test discovery/mock corrections
+or use their scoped diagnostic exception. Configure, build and install logs are
+captured in full; an unsuccessful command or an unplanned warning stops the run.
+
+Supply absolute existing package directories and matching OpenSSL inputs:
+
+```sh
+export MVFST_ARCHIVE=/absolute/cache/mvfst-v2026.05.25.00.tar.gz
+export folly_DIR=/absolute/folly/lib/cmake/folly
+export Fizz_DIR=/absolute/fizz/lib/cmake/fizz
+export fmt_DIR=/absolute/fmt/lib/cmake/fmt
+export OPENSSL_INCLUDE_DIR=/absolute/openssl/include
+export OPENSSL_SSL_LIBRARY=/absolute/openssl/lib/libssl.dylib
+export OPENSSL_CRYPTO_LIBRARY=/absolute/openssl/lib/libcrypto.dylib
+MVFST_DEPS_DIR="$PWD/.deps/mvfst-reviewed" MVFST_CONFIG=Debug \
+  bash scripts/setup_mvfst_deps.sh -G Ninja \
+    -DCMAKE_PREFIX_PATH=/absolute/other-selected-dependencies
+```
+
+Choose the platform's actual library files, not these illustrative paths.
+Additional arguments are ordinary CMake toolchain/dependency options (for example
+compiler, sysroot, Boost, zlib or a toolchain file). `MVFST_CONFIG` selects the
+build/install configuration, default Release; shared libraries default ON.
+The source, warning policy, tests-OFF dependency build and private installation
+destination are recipe-owned. This does not alter the adapter's normal
+`find_package` behavior or silently replace its dependencies.
+
+Each invocation creates a new `build.XXXXXXXX` under `MVFST_DEPS_DIR`, with its
+own source/build/prefix, `inputs.txt`, phase logs and `mvfst_deps.env`. Only after
+successful installation does stdout emit shell-escaped `mvfst_DIR` and
+`CMAKE_PREFIX_PATH`; source the retained env file to use that specific result.
+Failed runs are retained too. Cleanup is caller-owned: remove only a completed
+run directory when its evidence and prefix are no longer needed.
+
+The reviewed host closure is AppleClang17, C++20, Debug/shared mvfst with
+Folly/Fizz 2026.05.25.00, fmt12.2.0, OpenSSL3.6.5, Boost1.90.0_1,
+gflags2.3.0, glog0.7.1, libsodium1.0.22, and CLT MacOSX15.sdk/zlib1.2.12.
+Those are caller-provided installed inputs, not source-pinned outputs of this
+script. Their further runtime dependencies remain caller-owned. This recipe
+does not establish Linux, fully static, whole-closure reproducibility or a new
+runtime qualification; the production corrections retain their prior review.
+
+The focused offline script controls can be run without compiling a provider:
+
+```sh
+cmake -DSOURCE="$PWD" -DARCHIVE="$MVFST_ARCHIVE" \
+  -DWORK=/absolute/private/mvfst-recipe-controls \
+  -P scripts/tests/test_setup_mvfst_deps.cmake
+```
+
+These use a mock CMake to assert early identity refusal and zero-exit diagnostic
+refusal, not to claim a successful provider build.
+
+### LibMoQ adapter
+
 The mvfst adapter is optional and does not affect normal libmoq
 builds:
 

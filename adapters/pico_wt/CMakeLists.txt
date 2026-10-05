@@ -188,6 +188,13 @@ endif()
 if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     set(_picowt_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_picowt_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
+    set(_picowt_consumer_deps "")
+    foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
+                          OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+        if(${_dep})
+            string(APPEND _picowt_consumer_deps " -D${_dep}='${${_dep}}'")
+        endif()
+    endforeach()
     # Forward the parent's compile/link flags and build type so an
     # ASAN parent build produces an ASAN-consistent consumer (it links
     # the parent's instrumented .a files; mismatched instrumentation
@@ -205,10 +212,15 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
                  -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
-                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
+                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
+                 -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
+                 -DMOQ_CONSUMER_WARNINGS_AS_ERRORS='${MOQ_WARNINGS_AS_ERRORS}' \
+                 ${_picowt_consumer_deps} && \
              '${CMAKE_COMMAND}' --build '${_picowt_consumer_bld}' && \
              '${_picowt_consumer_bld}/moq_pico_wt_adapter_consumer_test'")
     set_tests_properties(pico_wt_adapter_consumer PROPERTIES TIMEOUT 180)
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+    moq_test_reject_consumer_warnings(pico_wt_adapter_consumer)
 endif()
 
 # Install-tree consumer test: installs a BUILD_HTTP picoquic and libmoq
@@ -289,10 +301,18 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     # Draft-18 over the real WT transport in the deterministic sim:
     # symmetric uni-control establish, request-bidi routing, subgroup
     # data delivery (draft-16 run as the harness control).
+    # Recompiles the adapter sources so the test build can observe the
+    # peer's RESET/STOP callbacks at their boundary (MOQ_PICO_WT_TESTING);
+    # the observers are absent from the shipped library.
     add_executable(test_pico_wt_d18
         tests/test_pico_wt_d18.c
         tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
     )
+    target_compile_definitions(test_pico_wt_d18 PRIVATE
+        MOQ_PICO_WT_TESTING)
     target_include_directories(test_pico_wt_d18 PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -357,11 +377,19 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     set_tests_properties(pico_wt_conformance PROPERTIES TIMEOUT 60)
 
     # Inbound receive backpressure + capacity invariance. Needs the adapter's
-    # internal header for the per-stream receive state assertions.
+    # internal header for the per-stream receive state assertions and the
+    # send queue's internal occupancy query, so it compiles the adapter and
+    # queue sources into the test (as the lifecycle and draft-18 tests do)
+    # instead of relying on symbols the shipped library does not export.
     add_executable(test_pico_wt_backpressure
         tests/test_pico_wt_backpressure.c
         tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
     )
+    target_compile_definitions(test_pico_wt_backpressure PRIVATE
+        MOQ_PICO_WT_TESTING)
     target_include_directories(test_pico_wt_backpressure PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
@@ -409,6 +437,43 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     endif()
     add_test(NAME pico_wt_rx_lifecycle COMMAND test_pico_wt_rx_lifecycle)
     set_tests_properties(pico_wt_rx_lifecycle PROPERTIES TIMEOUT 180)
+endif()
+
+# Receive admission does not need the picoquic simulation harness.
+if(MOQ_BUILD_TESTS)
+    # Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): the fetcher attached
+    # to the adapter through the real bridge, picoquic/h3zero stubbed, a raw
+    # publisher over the fake transport endpoint relayed in. Recompiles the
+    # adapter sources with MOQ_PICO_WT_TESTING for the capability seam; links
+    # no picoquic library (headers only), needs no simulation harness, and
+    # exports nothing.
+    if(TARGET picoquic::picoquic-core)
+        set(_PW_HOLD_CORE_INC picoquic::picoquic-core)
+    else()
+        set(_PW_HOLD_CORE_INC picoquic-core)
+    endif()
+    add_executable(test_pico_wt_hold_input
+        tests/test_pico_wt_hold_input.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_hold_input PRIVATE
+        MOQ_BUILDING MOQ_PICO_WT_TESTING)
+    target_include_directories(test_pico_wt_hold_input PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${PROJECT_SOURCE_DIR}/tests/support
+        $<TARGET_PROPERTY:${_PICOHTTP},INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:${_PW_HOLD_CORE_INC},INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    target_link_libraries(test_pico_wt_hold_input PRIVATE moq::core)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_hold_input PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_hold_input COMMAND test_pico_wt_hold_input)
 endif()
 
 # -- Managed facade -------------------------------------------------

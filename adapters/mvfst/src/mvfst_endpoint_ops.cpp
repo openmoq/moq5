@@ -7,6 +7,9 @@
  */
 
 #include "mvfst_endpoint_ops.h"
+#ifdef MOQ_MVFST_TESTING
+#include "mvfst_managed_testing.h"
+#endif
 
 #include <moq/rcbuf.h>
 #include <folly/ScopeGuard.h>
@@ -229,6 +232,15 @@ static moq_transport_result_t ep_close(void *ctx, uint64_t code,
     });
 }
 
+#ifdef MOQ_MVFST_TESTING
+/* Test-only capability override (declared in mvfst_managed_testing.h). */
+static int g_test_hold_input = -1;
+extern "C" void moq_mvfst_test_set_hold_input(int mode)
+{
+    g_test_hold_input = mode;
+}
+#endif
+
 void mvfst_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,
                               mvfst_endpoint_ctx_t *ctx,
                               std::shared_ptr<quic::QuicSocket> socket,
@@ -236,8 +248,18 @@ void mvfst_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,
                               void *cb_ctx)
 {
     *ops = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
+    /* HOLD_INPUT: the adapter keeps a refused peer uni chunk (and its FIN)
+     * paused in mvfst and redelivers it unchanged once the session can admit
+     * again; see the held-input handling in mvfst_adapter.cpp. */
     ops->capabilities = MOQ_TRANSPORT_CAP_DATAGRAM |
-                         MOQ_TRANSPORT_CAP_WRITE_PAYLOAD;
+                         MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
+                         MOQ_TRANSPORT_CAP_HOLD_INPUT;
+#ifdef MOQ_MVFST_TESTING
+    if (g_test_hold_input == 1)
+        ops->capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
+    else if (g_test_hold_input == 0)
+        ops->capabilities &= ~(uint32_t)MOQ_TRANSPORT_CAP_HOLD_INPUT;
+#endif
     ops->open_uni        = ep_open_uni;
     ops->open_bidi       = ep_open_bidi;
     ops->write           = ep_write;

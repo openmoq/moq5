@@ -565,17 +565,21 @@ int main(void) { return p == 0; }
         set(_wtquic_consumer_msquic_lib
             "-DMSQUIC_LIB=$<TARGET_FILE:msquic::msquic>")
     endif()
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+    set(_moq_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+    moq_write_consumer_context("${_moq_consumer_context}")
     add_test(NAME wtquic_install_consumer
         COMMAND ${CMAKE_COMMAND}
             -DBUILD=${PROJECT_BINARY_DIR}
             -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
             -DWORK=${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work
+            "-DCONSUMER_CONTEXT=${_moq_consumer_context}"
             -DWTQUIC_PREFIX=${_wtquic_dep_prefix}
             -DNETWORK_MANAGED=${_wtquic_consumer_network_managed}
             -DMSQUIC_MANAGED=${_wtquic_consumer_msquic_managed}
+            -DMSQUIC_DIR=${msquic_DIR}
             -DC_COMPILER=${CMAKE_C_COMPILER}
             -DSHARED=${BUILD_SHARED_LIBS}
-            -DOPENSSL_ROOT=${OPENSSL_ROOT_DIR}
             ${_wtquic_consumer_msquic_lib}
             "-DC_FLAGS=${CMAKE_C_FLAGS}"
             "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
@@ -597,7 +601,6 @@ int main(void) { return p == 0; }
             -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
             -DWORK=${CMAKE_CURRENT_BINARY_DIR}/buildtree-consumer-work
             -DC_COMPILER=${CMAKE_C_COMPILER}
-            -DOPENSSL_ROOT=${OPENSSL_ROOT_DIR}
             "-DC_FLAGS=${CMAKE_C_FLAGS}"
             "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_buildtree.cmake)
@@ -621,6 +624,52 @@ int main(void) { return p == 0; }
     target_compile_definitions(test_wtquic_keys PRIVATE MOQ_BUILDING)
     add_test(NAME wtquic_keys COMMAND test_wtquic_keys)
     set_tests_properties(wtquic_keys PROPERTIES LABELS "wtquic")
+
+    # Prospective receive-admission ownership, with a fake provider only.
+    add_executable(test_wtquic_hold_input tests/test_wtquic_hold_input.c)
+    add_executable(test_wtquic_qualification tests/test_wtquic_qualification.c)
+    target_link_libraries(test_wtquic_qualification PRIVATE moq-core-test-internals)
+    target_include_directories(test_wtquic_qualification PRIVATE
+        ${PROJECT_SOURCE_DIR}/core/include ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_wtquic_qualification PRIVATE MOQ_BUILDING)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_qualification PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_qualification COMMAND test_wtquic_qualification)
+    add_executable(test_wtquic_attach_reporting tests/test_wtquic_attach_reporting.c)
+    target_link_libraries(test_wtquic_attach_reporting PRIVATE moq::adapter-wtquic)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_attach_reporting PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_attach_reporting COMMAND test_wtquic_attach_reporting)
+    target_link_libraries(test_wtquic_hold_input PRIVATE moq-core-test-internals)
+    target_include_directories(test_wtquic_hold_input PRIVATE
+        ${PROJECT_SOURCE_DIR}/core/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_wtquic_hold_input PRIVATE MOQ_BUILDING)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_hold_input PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    foreach(_case direct replay fin_only paused terminal reuse resume_close resume_reuse pause_close pause_reuse)
+        add_test(NAME wtquic_hold_input_${_case}
+            COMMAND test_wtquic_hold_input ${_case})
+        set_tests_properties(wtquic_hold_input_${_case} PROPERTIES
+            LABELS "wtquic;admission" TIMEOUT 10)
+    endforeach()
+    foreach(_case resume_close resume_reuse pause_close pause_reuse)
+        foreach(_result state closed error)
+            add_test(NAME wtquic_hold_input_${_case}_${_result}
+                COMMAND test_wtquic_hold_input ${_case} ${_result})
+            set_tests_properties(wtquic_hold_input_${_case}_${_result} PROPERTIES
+                LABELS "wtquic;callback-generation" TIMEOUT 10)
+        endforeach()
+    endforeach()
 
     # Network-managed cfg initializer + whole-block read-gate ABI test.
     # No network: it drives create()'s config-import and aborts on a bogus
@@ -669,6 +718,19 @@ int main(void) { return p == 0; }
         endif()
         add_test(NAME wtquic_network_managed_internal
             COMMAND test_wtquic_network_managed_internal)
+        add_executable(test_wtquic_managed_reporting tests/test_wtquic_managed_reporting.c)
+        target_link_libraries(test_wtquic_managed_reporting PRIVATE
+            moq::adapter-wtquic wtq::network Threads::Threads)
+        target_compile_definitions(test_wtquic_managed_reporting PRIVATE MOQ_BUILDING)
+        if(MOQ_BUILD_SERVICE)
+            target_link_libraries(test_wtquic_managed_reporting PRIVATE moq::service)
+            target_compile_definitions(test_wtquic_managed_reporting PRIVATE MOQ_TEST_SERVICE)
+        endif()
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_wtquic_managed_reporting PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME wtquic_managed_reporting COMMAND test_wtquic_managed_reporting)
         set_tests_properties(wtquic_network_managed_internal PROPERTIES
             LABELS "wtquic")
     endif()
@@ -812,40 +874,37 @@ int main(void) { return p == 0; }
             LABELS "network;wtquic"
             TIMEOUT 600)
 
-        # Managed Network.framework client against a real MsQuic server:
-        # the full vertical (session -> bridge -> adapter -> wtq_nw_conn
-        # -> Network.framework) through the public facade only.
-        if(TARGET moq-adapter-wtquic-network-managed)
-            add_executable(test_wtquic_network_managed
-                tests/test_wtquic_network_managed.c)
-            target_link_libraries(test_wtquic_network_managed PRIVATE
-                moq::adapter-wtquic-network-managed wtq::msquic
-                Threads::Threads)
-            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-                target_compile_options(test_wtquic_network_managed PRIVATE
-                    -Wall -Wextra -Wpedantic
-                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
-            endif()
-            add_test(NAME wtquic_network_managed
-                COMMAND test_wtquic_network_managed
-                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
-                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
-            set_tests_properties(wtquic_network_managed PROPERTIES
-                FIXTURES_REQUIRED wtquic_certs
-                LABELS "network;wtquic"
-                TIMEOUT 300)
-            add_test(NAME wtquic_network_managed_tests_off
-                COMMAND ${CMAKE_COMMAND}
-                    -DSRC=${PROJECT_SOURCE_DIR}
-                    -DWORK=${CMAKE_CURRENT_BINARY_DIR}/network-tests-off-work
-                    -DWTQUIC_PREFIX=${_wtquic_dep_prefix}
-                    -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/network_managed_tests_off.cmake)
-            set_tests_properties(wtquic_network_managed_tests_off PROPERTIES
-                LABELS "wtquic"
-                TIMEOUT 600)
-        endif()
     endif()
     endif() # TARGET wtq::msquic
+
+    # Public Network rejection policy: no peer, certificates or MsQuic required.
+    if(TARGET moq-adapter-wtquic-network-managed)
+        add_executable(test_wtquic_network_managed
+            tests/test_wtquic_network_managed.c)
+        target_link_libraries(test_wtquic_network_managed PRIVATE
+            moq::adapter-wtquic-network-managed
+            Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_wtquic_network_managed PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME wtquic_network_managed
+            COMMAND test_wtquic_network_managed)
+        set_tests_properties(wtquic_network_managed PROPERTIES
+            LABELS "wtquic"
+            TIMEOUT 300)
+        add_test(NAME wtquic_network_managed_tests_off
+            COMMAND ${CMAKE_COMMAND}
+                -DSRC=${PROJECT_SOURCE_DIR}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/network-tests-off-work
+                "-DCONSUMER_CONTEXT=${_moq_consumer_context}"
+                -DWTQUIC_PREFIX=${_wtquic_dep_prefix}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/network_managed_tests_off.cmake)
+        set_tests_properties(wtquic_network_managed_tests_off PROPERTIES
+            LABELS "wtquic"
+            TIMEOUT 600)
+    endif()
 
     # Network-only tests-on lane: a fresh tree configured against a
     # prefix WITHOUT the msquic component must still generate and
@@ -856,6 +915,7 @@ int main(void) { return p == 0; }
             COMMAND ${CMAKE_COMMAND}
                 -DSRC=${PROJECT_SOURCE_DIR}
                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/network-only-work
+                "-DCONSUMER_CONTEXT=${_moq_consumer_context}"
                 -DWTQUIC_PREFIX=${_wtquic_dep_prefix}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/network_only_tests_on.cmake)
         set_tests_properties(wtquic_network_only_tests_on PROPERTIES

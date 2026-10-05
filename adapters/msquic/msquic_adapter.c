@@ -320,6 +320,35 @@ static bool resume_paused(moq_msquic_conn_t *c)
 }
 
 /*
+ * A FIN the adapter owns (it arrived bare while this stream's bytes were
+ * held) is settled here once the bridge no longer has pending input for the
+ * stream -- the held bytes were accepted and, if the session retained part
+ * of them under its own backpressure, that retained input has drained. No
+ * native callback will come for it (MsQuic re-indicates bytes, never a bare
+ * FIN), so the service pass is its only delivery path. Exactly once, in
+ * order, after every byte of the stream.
+ */
+static moq_result_t feed_stream_bytes(moq_msquic_conn_t *c,
+                                      struct moq_msq_stream *ms,
+                                      const uint8_t *data, size_t len,
+                                      bool fin);
+
+static void settle_owed_fins(moq_msquic_conn_t *c)
+{
+    for (struct moq_msq_stream *ms = c->streams; ms != NULL;
+         ms = ms->next) {
+        if (!ms->fin_held || ms->held_input || ms->fin_fed ||
+            ms->stream == NULL ||
+            moq_transport_bridge_stream_has_pending(c->bridge, ms->id))
+            continue;
+        ms->fin_held = false;
+        (void)feed_stream_bytes(c, ms, NULL, 0, true);
+        /* the FIN may have queued session work: run another pass */
+        c->service_pending = true;
+    }
+}
+
+/*
  * Feed happened: drive the bridge, give the app its slot, drive again
  * for whatever the app queued. A fatal bridge must not leave the
  * transport running: shut the connection down once with the fatal
@@ -363,6 +392,7 @@ static void conn_service(moq_msquic_conn_t *c)
                     c->bridge, 0x1, now_us());
             }
         }
+        settle_owed_fins(c);
         (void)resume_paused(c);
         if (!c->teardown_sent && c->conn != NULL &&
             moq_transport_bridge_is_fatal(c->bridge)) {
@@ -656,14 +686,21 @@ static moq_transport_result_t ep_close_transport(void *ctx, uint64_t code,
 
 /* --- stream events (MsQuic -> bridge) ----------------------------------------- */
 
-static void feed_stream_bytes(moq_msquic_conn_t *c,
-                              struct moq_msq_stream *ms,
-                              const uint8_t *data, size_t len, bool fin)
+/*
+ * Feed one buffer (or a bare FIN) to the bridge. Returns the bridge result:
+ * MOQ_ERR_INPUT_NOT_CONSUMED means the bridge took nothing of it -- the
+ * caller leaves the buffer with MsQuic and the FIN, if it rode this feed,
+ * stays owed. fin_fed is recorded only for a FIN the bridge actually took.
+ */
+static moq_result_t feed_stream_bytes(moq_msquic_conn_t *c,
+                                      struct moq_msq_stream *ms,
+                                      const uint8_t *data, size_t len,
+                                      bool fin)
 {
+    moq_result_t rc;
+
     if (ms->fin_fed)
-        return;
-    if (fin)
-        ms->fin_fed = true;
+        return MOQ_OK;
 
     /* control routing is profile-dependent: bidi-control profiles
      * (draft-16) carry control on the first client-initiated bidi
@@ -676,17 +713,42 @@ static void feed_stream_bytes(moq_msquic_conn_t *c,
             c->ctrl_latched = true;
         }
         if (c->ctrl_latched && ms->id == c->ctrl_id) {
-            (void)moq_transport_bridge_on_peer_control_bytes(
+            rc = moq_transport_bridge_on_peer_control_bytes(
                 c->bridge, ms->id, data, len, fin, now_us());
-            return;
+            if (fin)
+                ms->fin_fed = true;
+            return rc;
         }
     }
     if (ms->is_bidi)
-        (void)moq_transport_bridge_on_peer_bidi_bytes(
+        rc = moq_transport_bridge_on_peer_bidi_bytes(
             c->bridge, ms->id, data, len, fin, now_us());
     else
-        (void)moq_transport_bridge_on_peer_uni_bytes(
+        rc = moq_transport_bridge_on_peer_uni_bytes(
             c->bridge, ms->id, data, len, fin, now_us());
+    if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+        ms->held_input = true;
+        if (fin)
+            ms->fin_held = true;   /* MsQuic may not re-indicate a bare FIN */
+        return rc;
+    }
+    ms->held_input = false;
+    if (fin)
+        ms->fin_fed = true;
+    return rc;
+}
+
+/*
+ * The bridge accepted this stream's held bytes: if the peer's FIN arrived
+ * meanwhile as a bare notification the adapter owns it -- feed it now, in
+ * order, after the bytes.
+ */
+static void feed_owed_fin(moq_msquic_conn_t *c, struct moq_msq_stream *ms)
+{
+    if (!ms->fin_held || ms->held_input || ms->fin_fed)
+        return;
+    ms->fin_held = false;
+    (void)feed_stream_bytes(c, ms, NULL, 0, true);
 }
 
 static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
@@ -736,8 +798,11 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
             if (fin && ev->RECEIVE.TotalBufferLength == 0) {
                 /* a pure zero-byte FIN carries no data to hold and is the
                  * stream's terminal marker — deliver it even while paused
-                 * (0 bytes indicated: accepting 0 accepts it in full) */
-                feed_stream_bytes(c, ms, NULL, 0, true);
+                 * (0 bytes indicated: accepting 0 accepts it in full).
+                 * While this stream's bytes are held, the bridge refuses
+                 * it and the adapter keeps owning it (fin_held) until the
+                 * held bytes are accepted; nothing about the hold changes. */
+                (void)feed_stream_bytes(c, ms, NULL, 0, true);
             } else {
                 ev->RECEIVE.TotalBufferLength = 0; /* hold + disable */
                 ms->recv_disabled = true;
@@ -762,8 +827,16 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
         for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; i++) {
             const QUIC_BUFFER *b = &ev->RECEIVE.Buffers[i];
             bool last = (i + 1 == ev->RECEIVE.BufferCount);
+            moq_result_t frc = feed_stream_bytes(c, ms, b->Buffer,
+                                                 b->Length, fin && last);
 
-            feed_stream_bytes(c, ms, b->Buffer, b->Length, fin && last);
+            if (frc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                /* the bridge took none of this buffer: it contributes
+                 * nothing to the accepted prefix and stays with MsQuic,
+                 * together with every buffer after it (and the FIN) */
+                now_pending = true;
+                break;
+            }
             accepted += b->Length;
             if (moq_transport_bridge_stream_has_pending(c->bridge,
                                                         ms->id)) {
@@ -772,7 +845,11 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
             }
         }
         if (ev->RECEIVE.BufferCount == 0 && fin)
-            feed_stream_bytes(c, ms, NULL, 0, true);
+            (void)feed_stream_bytes(c, ms, NULL, 0, true);
+        /* the bytes MsQuic held were accepted: a FIN that arrived bare in
+         * the meantime follows them now */
+        if (!now_pending)
+            feed_owed_fin(c, ms);
         /* If a buffer left the bridge pending, mark the stream paused (the
          * NEXT RECEIVE is rejected wholesale above) and hold any buffers
          * we stopped short of. conn_service() below may drain the bridge
@@ -790,13 +867,23 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
     }
 
     case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+        if (ms->held_input) {
+            /* the peer finished sending, but MsQuic still holds bytes the
+             * bridge has not taken: the FIN is owed BEHIND them. Keep the
+             * pause and the disabled delivery (the held bytes still need
+             * their resume + re-indication); the bridge refuses the bare
+             * FIN and the adapter keeps owning it (fin_held). */
+            (void)feed_stream_bytes(c, ms, NULL, 0, true);
+            conn_service(c);
+            break;
+        }
         /* the receive direction is ending (FIN): no further RECEIVE will
          * come, so there is nothing to resume — clear any pause/hold
          * state before servicing so the pass does not re-enable a
          * finished stream */
         ms->paused = false;
         ms->recv_disabled = false;
-        feed_stream_bytes(c, ms, NULL, 0, true);
+        (void)feed_stream_bytes(c, ms, NULL, 0, true);
         conn_service(c);
         break;
 
@@ -808,6 +895,8 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
          * transport fatal. */
         ms->paused = false;
         ms->recv_disabled = false;
+        ms->held_input = false;   /* MsQuic drops its held bytes with the abort */
+        ms->fin_held = false;
         (void)moq_transport_bridge_on_peer_stream_reset(
             c->bridge, ms->id, ev->PEER_SEND_ABORTED.ErrorCode,
             now_us());
@@ -1068,7 +1157,8 @@ moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
     c->ops = (moq_transport_endpoint_ops_t){
         .struct_size = sizeof(moq_transport_endpoint_ops_t),
         .capabilities = MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
-                        MOQ_TRANSPORT_CAP_DATAGRAM,
+                        MOQ_TRANSPORT_CAP_DATAGRAM |
+                        MOQ_TRANSPORT_CAP_HOLD_INPUT,
         .open_uni = ep_open_uni,
         .open_bidi = ep_open_bidi,
         .write = ep_write,
@@ -1296,5 +1386,18 @@ struct moq_msq_stream *moq_msquic_test_stream_find(moq_msquic_conn_t *conn,
                                                    uint64_t id)
 {
     return stream_find(conn, id);
+}
+
+moq_transport_bridge_t *moq_msquic_test_bridge(moq_msquic_conn_t *conn)
+{
+    return conn->bridge;
+}
+
+void moq_msquic_test_set_hold_input(moq_msquic_conn_t *conn, bool on)
+{
+    if (on)
+        conn->ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
+    else
+        conn->ops.capabilities &= ~(uint32_t)MOQ_TRANSPORT_CAP_HOLD_INPUT;
 }
 #endif

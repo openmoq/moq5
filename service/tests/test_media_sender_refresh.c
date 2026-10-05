@@ -15,7 +15,8 @@
 #include <moq/sim.h>
 #include <moq/session.h>
 #include <moq/wire.h>          /* MOQ_QUIC_VARINT_MAX */
-#include "test_session_support.h"
+#include "test_support.h"
+#include "test_alloc_support.h"
 
 #include <stdlib.h>            /* malloc/free for the exact-old-size ABI canary */
 

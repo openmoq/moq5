@@ -1079,6 +1079,35 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             break;
         }
 
+        case MOQ_EVENT_FETCH_RESET: {
+            /* Same shape as FETCH_ERROR: terminal for the request, retained
+             * as the pending item under queue pressure (the code and its
+             * source flags travel with it), slot released when polled. */
+            moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
+                ev.u.fetch_reset.fetch);
+            if (r) {
+                if (fi_queue_full(sub)) {
+                    sub->pending_fi.kind = MOQ_SUB_FETCH_RESET;
+                    sub->pending_fi.request = r;
+                    sub->pending_fi.u.reset.error_code = ev.u.fetch_reset.error_code;
+                    sub->pending_fi.u.reset.data_stream = ev.u.fetch_reset.data_stream;
+                    sub->pending_fi.u.reset.stop_sending = ev.u.fetch_reset.stop_sending;
+                    sub->has_pending_fi = true;
+                    r->state = SUB_FETCH_DONE;
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
+                moq_sub_fetch_item_t *f = fi_push(sub);
+                f->kind = MOQ_SUB_FETCH_RESET;
+                f->request = r;
+                f->u.reset.error_code = ev.u.fetch_reset.error_code;
+                f->u.reset.data_stream = ev.u.fetch_reset.data_stream;
+                f->u.reset.stop_sending = ev.u.fetch_reset.stop_sending;
+                r->state = SUB_FETCH_DONE;
+            }
+            break;
+        }
+
         case MOQ_EVENT_FETCH_COMPLETE: {
             moq_sub_fetch_req_t *r = find_fetch_by_handle(sub,
                 ev.u.fetch_complete.fetch);
@@ -1479,7 +1508,8 @@ moq_result_t moq_sub_poll_fetch(moq_subscriber_t *sub,
 
     if (out->request &&
         (out->kind == MOQ_SUB_FETCH_ERROR ||
-         out->kind == MOQ_SUB_FETCH_COMPLETE))
+         out->kind == MOQ_SUB_FETCH_COMPLETE ||
+         out->kind == MOQ_SUB_FETCH_RESET))
         out->request->state = SUB_FETCH_FREE;
 
     return MOQ_OK;

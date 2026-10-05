@@ -2049,7 +2049,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     size_t off_rx_fin  = ALIGN_UP(off_rx + rx_bytes, _Alignof(uint64_t));
     size_t rx_fin_cap  = rx_cap < 16 ? 16 : rx_cap;
     size_t rx_fin_bytes = rx_fin_cap * sizeof(uint64_t);
-    size_t off_unsub_tomb = ALIGN_UP(off_rx_fin + rx_fin_bytes,
+    size_t off_rx_stopped = ALIGN_UP(off_rx_fin + rx_fin_bytes,
+                                     _Alignof(uint64_t));
+    size_t rx_stopped_cap = rx_fin_cap;
+    size_t rx_stopped_bytes = rx_stopped_cap * sizeof(uint64_t);
+    size_t off_unsub_tomb = ALIGN_UP(off_rx_stopped + rx_stopped_bytes,
                                       _Alignof(uint64_t));
     size_t unsub_tomb_cap = sub_cap + pub_cap;
     size_t unsub_tomb_bytes = unsub_tomb_cap * sizeof(uint64_t);
@@ -2060,11 +2064,18 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
                                             _Alignof(uint64_t));
     size_t fetch_cancel_tomb_cap = fetch_cap;
     size_t fetch_cancel_tomb_bytes = fetch_cancel_tomb_cap * sizeof(uint64_t);
+    /* Sibling grace cache of request IDs of locally ABORTED publisher-role
+     * fetches (see the field comment): a crossing peer FETCH_CANCEL for one of
+     * them is consumed rather than closing the session. Same bound. */
+    size_t off_fetch_abort_tomb = ALIGN_UP(off_fetch_cancel_tomb + fetch_cancel_tomb_bytes,
+                                           _Alignof(uint64_t));
+    size_t fetch_abort_tomb_cap = fetch_cap;
+    size_t fetch_abort_tomb_bytes = fetch_abort_tomb_cap * sizeof(uint64_t);
     /* Drain ring of request-bidi stream_refs locally cancelled while their
      * response was still possibly in flight (stream-correlated profiles). Late
      * response bytes on these refs are discarded until FIN/reset instead of
      * being mistaken for a new inbound request. Draft-16 leaves it empty. */
-    size_t off_drain_ref = ALIGN_UP(off_fetch_cancel_tomb + fetch_cancel_tomb_bytes,
+    size_t off_drain_ref = ALIGN_UP(off_fetch_abort_tomb + fetch_abort_tomb_bytes,
                                      _Alignof(uint64_t));
     /* Drain refs absorb late in-flight responses on locally-cancelled request
      * bidis: subscriptions (unsubscribe), fetches (fetch-cancel),
@@ -2190,11 +2201,14 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         sg_bytes  / sizeof(moq_sg_entry_t)  != sg_cap  ||
         rx_bytes  / sizeof(moq_rx_stream_t) != rx_cap  ||
         rx_fin_bytes / sizeof(uint64_t)    != rx_fin_cap ||
+        rx_stopped_bytes / sizeof(uint64_t) != rx_stopped_cap ||
         unsub_tomb_bytes / sizeof(uint64_t) != unsub_tomb_cap ||
         fetch_cancel_tomb_bytes / sizeof(uint64_t) != fetch_cancel_tomb_cap ||
+        fetch_abort_tomb_bytes / sizeof(uint64_t) != fetch_abort_tomb_cap ||
         drain_ref_bytes / sizeof(uint64_t) != drain_ref_cap ||
         off_fetch_cancel_tomb < off_unsub_tomb ||
-        off_drain_ref < off_fetch_cancel_tomb ||
+        off_fetch_abort_tomb < off_fetch_cancel_tomb ||
+        off_drain_ref < off_fetch_abort_tomb ||
         ns_sub_bytes / sizeof(moq_ns_sub_entry_t) != ns_sub_cap ||
         track_sub_bytes / sizeof(moq_track_sub_entry_t) != track_sub_cap ||
         idx_reqref_bytes / sizeof(moq_index_entry_t) != idx_reqref_cap ||
@@ -2205,7 +2219,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         off_ts < off_pub ||
         off_sg < off_pub ||
         off_rx < off_sg ||
-        off_rx_fin < off_rx || off_ns_sub < off_idx_rx ||
+        off_rx_fin < off_rx || off_rx_stopped < off_rx_fin ||
+        off_unsub_tomb < off_rx_stopped || off_ns_sub < off_idx_rx ||
         off_idx_reqref < off_idx_ns ||
         off_idx_sub_alias < off_idx_reqref ||
         off_ns_recv < off_idx_sub_alias ||
@@ -2268,6 +2283,9 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->rx_cap          = rx_cap;
     s->rx_finished     = (uint64_t *)(mem + off_rx_fin);
     s->rx_fin_cap      = rx_fin_cap;
+    s->rx_stopped_refs = (uint64_t *)(mem + off_rx_stopped);
+    s->rx_stopped_cap  = rx_stopped_cap;
+    s->rx_stopped_count = 0;
     s->max_obj_payload = max_obj_payload;
     s->max_recv_buf = max_recv_buf;
     /* Reordering buffer for data that arrives before its SUBSCRIBE_OK: a
@@ -2279,6 +2297,8 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->unsub_tomb_cap     = unsub_tomb_cap;
     s->fetch_cancel_tombs    = (uint64_t *)(mem + off_fetch_cancel_tomb);
     s->fetch_cancel_tomb_cap = fetch_cancel_tomb_cap;
+    s->fetch_abort_tombs     = (uint64_t *)(mem + off_fetch_abort_tomb);
+    s->fetch_abort_tomb_cap  = fetch_abort_tomb_cap;
     s->drain_refs         = (uint64_t *)(mem + off_drain_ref);
     s->drain_ref_reasons  = (uint8_t *)(mem + off_drain_reason);
     s->drain_ref_cap      = drain_ref_cap;
@@ -2938,13 +2958,12 @@ moq_result_t moq_session_on_bidi_stream_reset(moq_session_t *s,
                                                uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    (void)error_code;
     moq_result_t arc = session_advance_entry(s, now_us);
     if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
-    return handle_bidi_stream_reset(s, stream_ref);
+    return handle_bidi_stream_reset(s, stream_ref, error_code);
 }
 
 moq_result_t moq_session_on_bidi_stream_stop(moq_session_t *s,
@@ -2953,19 +2972,23 @@ moq_result_t moq_session_on_bidi_stream_stop(moq_session_t *s,
                                               uint64_t now_us)
 {
     if (!s) return MOQ_ERR_INVAL;
-    (void)error_code;
     moq_result_t arc = session_advance_entry(s, now_us);
     if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
-    return handle_bidi_stream_stop(s, stream_ref);
+    return handle_bidi_stream_stop(s, stream_ref, error_code);
 }
 
 bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t ref)
 {
     if (!s) return false;
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
+        return true;
+    /* A data stream STOPped while the receive pool was full: no entry, but
+     * its identity is retained and its remaining bytes are consumed here
+     * until the peer's FIN or RESET, so the bridge must keep delivering. */
+    if (rx_stopped_ref_find(s, ref._v) >= 0)
         return true;
     if (moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v) >= 0)
         return true;
@@ -2991,6 +3014,16 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
     return false;
 }
 
+bool moq_session_can_admit_data_stream(const moq_session_t *s)
+{
+    if (!s) return false;
+    /* A terminal session takes the input to report its outcome. */
+    if (!session_is_active(s)) return true;
+    for (size_t i = 0; i < s->rx_cap; i++)
+        if (!s->rx_streams[i].active) return true;
+    return false;
+}
+
 /* The bridge's narrower question for the local-closed retirement decision: is
  * the PEER's terminal still owed here? This excludes a live request-registry
  * owner -- a local-origin request bidi the app itself FIN'd must retire even
@@ -3001,6 +3034,11 @@ bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
 {
     if (!s) return false;
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
+        return true;
+    /* A data stream STOPped while the receive pool was full: no entry, but
+     * its identity is retained and its remaining bytes are consumed here
+     * until the peer's FIN or RESET, so the bridge must keep delivering. */
+    if (rx_stopped_ref_find(s, ref._v) >= 0)
         return true;
     if (moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v) >= 0)
         return true;
@@ -3062,6 +3100,12 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
 
     if (n == 0 && s->action_head < s->action_tail)
         return MOQ_ERR_ABI_MISMATCH;
+
+    /* Draining actions freed action-queue capacity: a STOP_DATA refused
+     * earlier (the entry parked in NEED_STOP) is owed regardless of whether
+     * the peer ever sends another byte on that stream. */
+    if (n > 0 && session_is_active(s))
+        session_retry_owed_stops(s);
 
     *out_count = n;
     return MOQ_OK;

@@ -72,10 +72,17 @@ typedef struct moqr_bind_limits {
 } moqr_bind_limits_t;
 
 /* Bind-tier capacity: the allocation-request ceiling of one binding's
- * tables. structure_bytes = the eager create-time tables; announce_bytes =
- * the copied peer namespace bytes ceiling (bounded by the CORE's ns-node
- * pool — a slot only exists once the core accepted the announce — times the
- * shared 4096-byte namespace cap). */
+ * tables. structure_bytes = the eager create-time tables (including the
+ * bind-wide fetch-forwarding transaction pool and each connection's
+ * pending fetch-refusal table); announce_bytes = the copied
+ * peer namespace bytes ceiling (bounded by the CORE's ns-node pool — a slot
+ * only exists once the core accepted the announce — times the shared
+ * 4096-byte namespace cap). total_bytes additionally carries the two
+ * forwarding ceilings that have no field of their own in this frozen layout:
+ * the owned track-key copies on the upstream-subscription slots (one
+ * 4096-byte namespace+name cap per slot) and the aggregate
+ * fetch_forward_bytes pool. So total_bytes >= structure_bytes +
+ * announce_bytes, with the difference being exactly those two terms. */
 typedef struct moqr_bind_capacity {
     uint64_t structure_bytes;
     uint64_t announce_bytes;
@@ -112,7 +119,21 @@ typedef struct moqr_bind_cfg {
     uint64_t                    router_cookie_base;
     moqr_bind_intent_router_fn  router;
     void                       *router_ctx;
+
+    /* Appended: aggregate byte bound, across the whole binding, of what a
+     * forwarded Joining FETCH may hold before its downstream FETCH_OK -- the
+     * transaction's owned copy of the track key (namespace + name), the
+     * payload and properties bytes of every collected object, and the owned
+     * copies of upstream Track Properties and error reasons. 0 (or a
+     * struct_size that does not reach this field) means the default,
+     * MOQR_BIND_DEF_FETCH_FORWARD_BYTES (1 MiB). Shared by every concurrent
+     * forwarded fetch, never per connection; an item that does not fit
+     * rejects that fetch before any OK. Values above UINT32_MAX are rejected
+     * at create/describe (never truncated). */
+    uint64_t                    fetch_forward_bytes;
 } moqr_bind_cfg_t;
+
+#define MOQR_BIND_DEF_FETCH_FORWARD_BYTES (1u << 20)
 
 MOQR_API void moqr_bind_cfg_init_sized(moqr_bind_cfg_t *cfg, size_t cfg_size,
                               const moq_alloc_t *alloc);

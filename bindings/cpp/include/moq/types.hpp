@@ -326,6 +326,7 @@ enum class sub_fetch_item_kind {
     object   = MOQ_SUB_FETCH_OBJECT,
     gap      = MOQ_SUB_FETCH_GAP,
     complete = MOQ_SUB_FETCH_COMPLETE,
+    reset    = MOQ_SUB_FETCH_RESET,
 };
 
 constexpr moq_sub_fetch_item_kind_t to_c(sub_fetch_item_kind v) noexcept

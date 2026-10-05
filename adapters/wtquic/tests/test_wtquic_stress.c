@@ -212,8 +212,8 @@ static void cycle_close_while_draining(void)
     total_bytes += p.client.obs.object_bytes;
 }
 
-/* A refused connect (subprotocol the server does not serve) is a fatal
- * terminal with no setup on either side — and the next cycle's fresh
+/* A refused connect (subprotocol the server does not serve) terminates
+ * bootstrap before adapter creation, with no setup on either side. The next
  * pair must be unaffected (the loop itself proves that). */
 static void cycle_refusal(void)
 {
@@ -229,12 +229,16 @@ static void cycle_refusal(void)
         wtqc_pair_teardown(&p);
         return;
     }
-    CHECK(wtqc_wait_flag(&p.client, &p.client.obs.fatal));
+    CHECK(wtqc_wait_flag(&p.client, &p.client.obs.establishment_failed));
+    CHECK(p.client.conn == NULL);
+    CHECK(p.server.conn == NULL);
     wtqc_pair_teardown(&p);
 
     CHECK(p.client.obs.setup == 0);
     CHECK(p.server.obs.setup == 0);
-    CHECK(p.client.obs.fatal);
+    CHECK(p.client.obs.establishment_failed);
+    CHECK(!p.client.obs.fatal);
+    CHECK(!p.server.obs.fatal);
 }
 
 /* A mid-track subgroup reset followed by a fresh-group publish that

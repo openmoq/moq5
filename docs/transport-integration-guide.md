@@ -1,5 +1,14 @@
 # Transport integration guide
 
+**Network policy:** `wtquic-network` / `.wtquicNetwork` currently returns
+synchronous `MOQ_ERR_UNSUPPORTED` / `.unsupported` before Network startup,
+even when packaged. No implicit fallback occurs. The current adapter requires
+admission-qualified FLOW_CONTROLLED support; native WT Network remains a
+separate delivery-only provider. Network lifecycle/queue examples below describe
+retained mechanisms, not an available LibMoQ connection path. Use a supported
+backend for media. Old Network MoQ success receipts are not current qualification;
+the registered managed/endpoint Network tests now assert the rejection contract.
+
 This guide is for an external integrator wiring libmoq into an
 application (VLC, FFmpeg, OBS, a custom player/publisher) **using only
 public headers, examples, and tests** — no private context.

@@ -96,9 +96,10 @@ WTQUIC_REPO="${WTQUIC_REPO:-https://github.com/rwl4/wtquic.git}"
 # wtquic-Network managed facade uses it to wake an otherwise-idle loop at a
 # service deadline (periodic catalog refresh), with no adapter-owned timer.
 #
-# This revision includes the relay's Origin/D02 API and upstream typed callback
-# registration for GCC pedantic WAE. No downstream WTQuic patches are applied.
-WTQUIC_REF="${WTQUIC_REF:-da239546198d99080c120f32448cf3d8b8fc008e}"
+# This revision includes the relay's Origin/D02 API, upstream typed callback
+# registration for GCC pedantic WAE, and the accounted receive/bounded stream
+# admission APIs required by the adapter. No downstream WTQuic patches apply.
+WTQUIC_REF="${WTQUIC_REF:-c4973f427226834d1bac08dcb92aeb125cd7c7c2}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)

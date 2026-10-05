@@ -8,6 +8,8 @@
 #ifndef MOQ_PICO_WT_TEST_SEAM_H
 #define MOQ_PICO_WT_TEST_SEAM_H
 
+#include <moq/pico_wt.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -52,6 +54,21 @@ int    moq_pico_wt_managed_test_event_at(moq_pico_wt_managed_t *m, size_t i,
  * after quiescence, then calls moq_pico_wt_conn_destroy() directly, so the
  * facade can still be destroyed afterwards without a double free. */
 void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m);
+
+/* Declare or withdraw MOQ_TRANSPORT_CAP_HOLD_INPUT on an attached adapter
+ * (receive-admission tests; adapter compiled with MOQ_PICO_WT_TESTING). */
+void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on);
+
+/* Receive-lifecycle observers (adapter compiled with MOQ_PICO_WT_TESTING):
+ * every stream-event callback boundary (phase 0 = entry, 1 = exit), every
+ * local STOP_SENDING the adapter issued through its endpoint, and every
+ * receive-credit grant that reached picoquic. */
+extern void (*pw_test_callback_observer)(moq_pico_wt_conn_t *conn, int event,
+                                         uint64_t stream_id, int phase);
+extern void (*pw_test_local_stop_observer)(moq_pico_wt_conn_t *conn,
+                                           uint64_t stream_id);
+extern void (*pw_test_grant_observer)(moq_pico_wt_conn_t *conn,
+                                      uint64_t stream_id, uint64_t headroom);
 
 /* Keepalive seam globals (test-internals build only). */
 extern void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);

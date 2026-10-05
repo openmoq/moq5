@@ -119,6 +119,65 @@ server); server code reaches its sessions through lane iteration.
   services session deadlines).
 - Service-tier (moq-service endpoint) wiring is deferred.
 
+## Receive admission (held input)
+
+The attach adapter declares `MOQ_TRANSPORT_CAP_HOLD_INPUT`. When the
+session has no free receive entry for a NEW peer data stream, the bridge
+refuses that stream's chunk with `MOQ_ERR_INPUT_NOT_CONSUMED` instead of
+letting the session STOP it unparsed or discarding it. The adapter honours
+the refusal with MsQuic's own partial-acceptance mechanism, in the default
+(non-multi) receive mode `moq_msquic_settings_init()` mandates:
+
+- In the RECEIVE callback the refused `QUIC_BUFFER` contributes nothing to
+  the accepted `TotalBufferLength`; buffers fed before it count exactly
+  their lengths. MsQuic keeps the refused buffer and everything after it
+  (and the event's FIN), stops indicating RECEIVE on that stream, and
+  re-indicates the held suffix once after `StreamReceiveSetEnabled(TRUE)`.
+  Nothing is copied by the adapter and nothing MsQuic already accepted is
+  ever re-fed. Retained-input backpressure (the bridge's `WOULD_BLOCK`) keeps
+  its prior accounting: the buffer that caused it counts as accepted.
+- Only the affected stream is paused; the resume happens on the service
+  pass that sees the bridge's pending state clear (the session can admit a
+  stream again). A redelivery can be refused again if another stream took
+  the entry first; it is then held again, losslessly.
+- MsQuic cannot hold a bare FIN. A zero-byte FIN receive or a
+  `PEER_SEND_SHUTDOWN` that arrives while bytes are held is refused by the
+  bridge and stays owned by the adapter (`fin_held`); it is fed, in order,
+  after every byte of the stream: right after a re-indication the bridge
+  accepts in full, or -- when the accepted redelivery lands in the
+  session's own retained backpressure -- on the service pass that sees the
+  bridge's pending input for that stream drain (no native callback ever
+  comes for it). Exactly once; a stream reset or teardown before then
+  releases it unfed. The shutdown does not clear the pause or the disabled
+  delivery while bytes are held.
+- `PEER_SEND_ABORTED` releases the hold (MsQuic drops its held bytes with
+  the abort) and the bridge retires the stream; `SHUTDOWN_COMPLETE` frees the
+  bookkeeping; a connection teardown frees every stream. No resume is ever
+  issued on a retired handle.
+
+Bounds: per stream, the bytes MsQuic holds are capped by the stream receive
+window; across the connection by the connection flow-control window; the
+number of such streams by the peer unidirectional stream count. The
+figures `moq_msquic_settings_init()` stamps are `StreamRecvWindowDefault`
+16 MiB, `ConnFlowControlWindow` 32 MiB and `PeerUnidiStreamCount` 131;
+they are that helper's defaults, not a guarantee of the attach API -- a
+caller that loads its own `QUIC_SETTINGS` into the native Configuration
+owns whatever windows it configured, and the adapter cannot read them
+back. Precondition: the default single-outstanding-RECEIVE mode
+(`StreamMultiReceiveEnabled = FALSE`, mandatory per `moq/msquic.h`); the
+partial-accept arrest relies on it, and in that mode the accepted-prefix
+decision is made synchronously per event on MsQuic's serialized
+per-connection worker (the adapter's callbacks run inline there, serialized
+by the attach guard). The adapter does not verify the setting at attach
+(MsQuic does not expose it on a connected handle); it is a documented
+caller obligation, stamped by the settings helper the managed facade uses.
+
+Proof: `msquic_hold_input` (fake API table, raw server relay, draft-16 and
+draft-18 setup and request routing; accounting, multi-buffer events, FIN
+with payload, bare FIN and shutdown while held, repeated refusal, abort
+while held, teardown, retained-input accounting with an exact held suffix,
+a FIN owed behind retained input, exact object inventories, legacy control).
+
 ## Managed server MTU policy (process-global)
 
 A managed **server** conservatively caps its initial path MTU to a

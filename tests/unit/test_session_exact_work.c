@@ -1980,13 +1980,16 @@ static void st_expect_sub_ready(state_t *v, const char *pfx, uint32_t gen,
     st_expect_reason_bytes(v, pfx, SUB_REASON);
 }
 
-static void st_expect_rx_free(state_t *v, const char *pfx)
+/* A stream the session STOPped and now holds in the discard state until the
+ * peer's FIN/RESET: identity kept (ref + index entry), bindings and buffers
+ * released. */
+static void st_expect_rx_stopped(state_t *v, const char *pfx, uint64_t ref)
 {
-    st_addp(v, pfx, "active",  0);
-    st_addp(v, pfx, "ref",     0);
+    st_addp(v, pfx, "active",  1);
+    st_addp(v, pfx, "ref",     ref);
     st_addp(v, pfx, "sub",     0);
     st_addp(v, pfx, "pub",     0);
-    st_addp(v, pfx, "parse",   0);
+    st_addp(v, pfx, "parse",   (uint64_t)MOQ_RX_STOPPED);
     st_addp(v, pfx, "in_len",  0);
     st_addp(v, pfx, "pay_buf", 0);
 }
@@ -2933,9 +2936,11 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
                   PUB_SC, PUB_REASON);
         exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + pl.r0, 0);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.rx_charged = 1;
-        wm.idx_find_ops = 1; wm.idx_remove_ops = 2; wm.idx_present_rm = 2;
+        /* The publication's by-id key is removed; the stopped stream keeps
+         * its index entry until the peer's FIN/RESET retires it. */
+        wm.idx_find_ops = 1; wm.idx_remove_ops = 1; wm.idx_present_rm = 1;
         st_expect_pub_free(&wst, "P0", pub0_gen);
-        st_expect_rx_free(&wst, "R0");
+        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("recovery", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_pub(&p->st, "P0", s, pl.p0);
@@ -2986,10 +2991,12 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + ra, 0);
         exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + rb, 0);
         wm.catchup = 1; wm.rx_rescan = 2; wm.pub_pending = 1; wm.rx_charged = 2;
-        wm.idx_find_ops = 1; wm.idx_remove_ops = 3; wm.idx_present_rm = 3;
+        /* The publication's by-id key is removed; BOTH stopped streams keep
+         * their entries (and index keys) until the peer's FIN/RESET. */
+        wm.idx_find_ops = 1; wm.idx_remove_ops = 1; wm.idx_present_rm = 1;
         st_expect_pub_free(&wst, "P0", pub0_gen);
-        st_expect_rx_free(&wst, "R0");
-        st_expect_rx_free(&wst, "R1");        /* BOTH rx entries, not just one */
+        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0);
+        st_expect_rx_stopped(&wst, "R1", RX_REF_BASE + pl.r1);   /* BOTH rx entries */
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("initial", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_pub(&p->st, "P0", s, pl.p0);
@@ -3095,12 +3102,12 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         wm.idx_remove_ops = 2; wm.idx_present_rm = 2; wm.queued_action = 1;
         st_expect_sg_free(&wst, "G0", sg0_gen);  /* cleaned exactly */
         st_expect_sg_free(&wst, "G1", sg1_gen);  /* reaped before the close */
-        st_expect_rx_free(&wst, "R0");               /* cleaned exactly */
+        st_expect_rx_released(&wst, "R0");           /* stopped, then released by the close */
         st_expect_rx_released(&wst, "R1");           /* released by the close */
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_CLOSED, now);
         PHASE("scratch_close", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_sg(&p->st, "G0", s, pl.g0); st_sg(&p->st, "G1", s, pl.g1);
-                   st_rx(&p->st, "R0", s, pl.r0);
+                   st_rx_released(&p->st, "R0", s, pl.r0);
                    st_rx_released(&p->st, "R1", s, pl.r1);
                    st_observe_cursor(&p->st, s); } while (0));
         break;
@@ -3138,7 +3145,8 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
          * The MIRROR of fwd_pending_retains: with NO forwarding-pending
          * subscriber left, the same retained deferred stream can never be
          * matched, so freeing the subscription discards it -- one STOP_DATA and
-         * the entry gone. Without this the discard scan has nothing to walk.
+         * the entry held in the stopped state until the peer retires the
+         * stream. Without this the discard scan has nothing to walk.
          */
         out_reset(&want); st_reset(&wst); model_reset(&wm);
         exp_event(&want, MOQ_EVENT_SUBSCRIBE_DONE, SYM_SUB0, SUB_STATUS,
@@ -3146,10 +3154,11 @@ static int run_case(int case_id, const caps_t *caps_in, uint32_t seed,
         exp_action(&want, MOQ_ACTION_STOP_DATA, RX_REF_BASE + pl.r0, 0);
         wm.catchup = 1; wm.rx_rescan = 1; wm.sub_pending = 1;
         /* The subscription free's by-id lookup; its by-id (present) and alias
-         * (absent) removals; and the discarded stream's own key removal. */
-        wm.idx_find_ops = 1; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
+         * (absent) removals. The discarded stream is stopped and keeps its
+         * entry (and key) until the peer's FIN/RESET. */
+        wm.idx_find_ops = 1; wm.idx_remove_ops = 2; wm.idx_present_rm = 1;
         st_expect_sub_free(&wst, "U0", sub0_gen);
-        st_expect_rx_free(&wst, "R0");
+        st_expect_rx_stopped(&wst, "R0", RX_REF_BASE + pl.r0);
         st_expect_cursor_retired(&wst, (uint64_t)MOQ_SESS_IDLE, now);
         PHASE("discard", session_begin_advance(s, now), &want, &wst, &wm,
               do { st_sub(&p->st, "U0", s, pl.u0); st_rx(&p->st, "R0", s, pl.r0);
@@ -4109,7 +4118,7 @@ static int run_placement(place_kind_t k, work_t *w_out, out_t *o_out)
     st_expect_pub_free(&wst, "P0", pub_gen);
     st_expect_sub_free(&wst, "U0", sub_gen);
     st_expect_sg_free(&wst, "G0", sg_gen);
-    st_expect_rx_free(&wst, "R0");
+    st_expect_rx_stopped(&wst, "R0", PLACE_RX_REF);   /* held for the peer's FIN/RESET */
     failures += st_check(&wst, &got, place_name(k));
     failures += check_retired(s, MOQ_REQ_PUBLISH, ps, pub_h, REQ_PUB0,
                               place_name(k));
@@ -4121,7 +4130,8 @@ static int run_placement(place_kind_t k, work_t *w_out, out_t *o_out)
      * (1 + 1 rescan), the subscription has none (1). */
     wm.catchup = 1; wm.rx_rescan = 3; wm.pub_pending = 1; wm.sub_pending = 1;
     wm.rx_charged = 1; wm.sg_charged = 1;
-    wm.idx_find_ops = 2; wm.idx_remove_ops = 4; wm.idx_present_rm = 3;
+    /* The stopped stream keeps its key: no rx index removal here. */
+    wm.idx_find_ops = 2; wm.idx_remove_ops = 3; wm.idx_present_rm = 2;
     failures += model_check(&wm, w_out, place_name(k));
 
     out_reset(o_out);
@@ -4503,8 +4513,7 @@ static int run_join_lifecycle(place_kind_t k, uint32_t fetch_cap,
     work_t before, after;
     work_read(&before);
     failures += occ_audit_named(s, "join_lifecycle.pre_teardown");
-    moq_result_t rc = request_stream_teardown(
-        s, moq_stream_ref_from_u64(REF_SUB0));
+    moq_result_t rc = request_stream_teardown(s, moq_stream_ref_from_u64(REF_SUB0), true, 0x1);
     work_read(&after);
     failures += occ_audit_named(s, "join_lifecycle.post_teardown");
     work_delta(&before, &after, w_out);
@@ -4890,12 +4899,44 @@ static int run_tomb_late_cancel(void)
     }
     MOQ_TEST_CHECK(fetch_cancel_tomb_contains(s, TOMB_REQ_ID));
 
-    /* --- PHASE 2: drain, then the SAME production ingress retries --- */
+    /* --- PHASE 2: the drain returns action capacity; the owed STOP is
+     *     issued by that poll itself, with no further peer input, and the
+     *     tombstone is consumed exactly then --- */
+    work_t bd, ad, wd;
     {
         out_t drained; out_reset(&drained);
+        work_read(&bd);
         out_capture_actions(s, &sym, &drained);
-        MOQ_TEST_CHECK_EQ_SIZE(drained.n, (size_t)c.max_actions);
+        work_read(&ad);
+        work_delta(&bd, &ad, &wd);
+        work_print("drain", &wd);
+        /* The filler actions, then the STOP queued as capacity returned. */
+        MOQ_TEST_CHECK_EQ_SIZE(drained.n, (size_t)c.max_actions + 1);
+        MOQ_TEST_CHECK(drained.n >= 1 &&
+                       drained.r[drained.n - 1].is_action &&
+                       drained.r[drained.n - 1].kind == (uint32_t)MOQ_ACTION_STOP_DATA &&
+                       drained.r[drained.n - 1].stream_ref == TOMB_REF);
+        state_t got, wst; st_reset(&got); st_reset(&wst);
+        st_rx(&got, "R0", s, (size_t)tslot);
+        st_add(&got, "tomb_count", (uint64_t)s->fetch_cancel_tomb_count);
+        st_add(&got, "idx_key",
+               moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask,
+                              TOMB_REF) >= 0 ? 1u : 0u);
+        st_add(&got, "sess.state", (uint64_t)moq_session_state(s));
+        st_expect_rx_stopped(&wst, "R0", TOMB_REF);
+        st_add(&wst, "tomb_count", 0);      /* consumed exactly once */
+        st_add(&wst, "idx_key",    1);      /* key kept with the stopped entry */
+        st_add(&wst, "sess.state", (uint64_t)MOQ_SESS_ESTABLISHED);
+        failures += st_check(&wst, &got, "tomb.drain");
+        /* The poll's retry walks the occupancy list to the owed entry and
+         * consumes the tombstone; no lookup, no index change. */
+        model_t wm; model_reset(&wm);
+        wm.tomb = 1;
+        failures += model_check(&wm, &wd, "tomb.drain");
     }
+
+    /* --- PHASE 3: the SAME production ingress re-drives (the bridge's
+     *     empty retry): a stopped entry consumes it, nothing is queued --- */
     work_t b2, a2, w2;
     work_read(&b2);
     failures += occ_audit_named(s, "tomb_late_cancel.pre_retry");
@@ -4914,32 +4955,35 @@ static int run_tomb_late_cancel(void)
                moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask,
                               TOMB_REF) >= 0 ? 1u : 0u);
         st_add(&got, "sess.state", (uint64_t)moq_session_state(s));
-        st_expect_rx_free(&wst, "R0");
-        st_add(&wst, "tomb_count", 0);      /* consumed exactly once */
-        st_add(&wst, "idx_key",    0);      /* index key retired with it */
+        /* Still STOPped and held: the entry (with its key) stays until the
+         * peer's FIN/RESET; the tombstone was consumed exactly once. */
+        st_expect_rx_stopped(&wst, "R0", TOMB_REF);
+        st_add(&wst, "tomb_count", 0);
+        st_add(&wst, "idx_key",    1);      /* key kept with the stopped entry */
         st_add(&wst, "sess.state", (uint64_t)MOQ_SESS_ESTABLISHED);
         failures += st_check(&wst, &got, "tomb.retry");
         model_t wm; model_reset(&wm);
-        wm.catchup = 1; wm.tomb = 1;
+        wm.catchup = 1;
         wm.idx_find_ops = 1;    /* the ingress resolves the stream by ref */
-        wm.idx_remove_ops = 1; wm.idx_present_rm = 1;
+        wm.idx_remove_ops = 0; wm.idx_present_rm = 0;
         failures += model_check(&wm, &w2, "tomb.retry");
         out_t want, got_out; out_reset(&want); out_reset(&got_out);
-        exp_action(&want, MOQ_ACTION_STOP_DATA, TOMB_REF, 0);
         out_capture_actions(s, &sym, &got_out);
         failures += out_check(&want, &got_out, "tomb.retry");
     }
     /*
      * The one-time consume is proven from the TERMINAL postcondition, not by
-     * feeding the retired ref again: the tombstone is gone, the rx slot is
-     * free and unkeyed, no owner was ever bound, exactly one STOP_DATA was
-     * emitted (compared above) and nothing else is queued behind it.
+     * feeding the retired ref again: the tombstone is gone, the rx entry is
+     * held stopped and keyed for the peer's FIN/RESET, no owner was ever
+     * bound, exactly one STOP_DATA was emitted (the drain's last record) and
+     * nothing else is queued behind it.
      */
     MOQ_TEST_CHECK(!fetch_cancel_tomb_contains(s, TOMB_REQ_ID));
     MOQ_TEST_CHECK_EQ_U64((uint64_t)s->fetch_cancel_tomb_count, 0u);
     MOQ_TEST_CHECK(moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask,
-                                  TOMB_REF) < 0);
-    MOQ_TEST_CHECK(!s->rx_streams[tslot].active);
+                                  TOMB_REF) == tslot);
+    MOQ_TEST_CHECK(s->rx_streams[tslot].active &&
+                   s->rx_streams[tslot].parse_state == MOQ_RX_STOPPED);
     {
         moq_action_t a;
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(s, &a, 1), (size_t)0);
@@ -4947,7 +4991,7 @@ static int run_tomb_late_cancel(void)
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(s, &e, 1), (size_t)0);
     }
 
-    producer_note(&w1); producer_note(&w2);
+    producer_note(&w1); producer_note(&wd); producer_note(&w2);
     moq_session_destroy(cl);
     moq_session_destroy(s);
     return failures;

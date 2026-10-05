@@ -269,7 +269,8 @@ int main()
         const moq_version_t bad[] = {
             static_cast<moq_version_t>(0),  static_cast<moq_version_t>(1),
             static_cast<moq_version_t>(15), static_cast<moq_version_t>(17),
-            static_cast<moq_version_t>(19), static_cast<moq_version_t>(0xffff),
+            // The enum's C++ value range is 0..31 (largest enumerator 18).
+            static_cast<moq_version_t>(19), static_cast<moq_version_t>(31),
         };
         static const unsigned char some_bytes[] = { 0x02, 0x21 };
 

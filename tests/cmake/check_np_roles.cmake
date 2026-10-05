@@ -50,18 +50,18 @@ endfunction()
 # role;file;forbidden-identifier-regex (empty = none)
 # role@file@forbidden-identifier-regex  ('@' so ';' cannot split a row)
 set(_np_roles
-    "oracle@np_oracle.c@moq_"
-    "builder@np_wire_builder.c@moq_loc_|moq_kvp_|moq_vi64_|moq_quic_varint_"
-    "adapter@np_product_adapter.c@"
-    "runner@np_closure_runner.c@moq_loc_|moq_kvp_"
+    [[oracle@np_oracle.c@moq_]]
+    [[builder@np_wire_builder.c@moq_loc_|moq_kvp_|moq_vi64_|moq_quic_varint_]]
+    [[adapter@np_product_adapter.c@]]
+    [[runner@np_closure_runner.c@moq_loc_|moq_kvp_]]
 )
 
 # The roles whose OBJECT symbols must also be audited, and the variable each
 # expects. A role listed here with a source but no object is a policy failure.
 set(_np_obj_roles
-    "oracle@NP_ORACLE_OBJ@moq_"
-    "builder@NP_BUILDER_OBJ@moq_loc_|moq_kvp_|moq_vi64_|moq_quic_varint_"
-    "runner@NP_RUNNER_OBJ@moq_loc_|moq_kvp_"
+    [[oracle@NP_ORACLE_OBJ@moq_]]
+    [[builder@NP_BUILDER_OBJ@moq_loc_|moq_kvp_|moq_vi64_|moq_quic_varint_]]
+    [[runner@NP_RUNNER_OBJ@moq_loc_|moq_kvp_]]
 )
 
 # The product-adapter boundary, DECLARED -- and it is a declaration, not an
@@ -86,6 +86,9 @@ endif()
 
 foreach(_row IN LISTS _np_roles)
     string(REGEX MATCH "^([^@]+)@([^@]+)@(.*)$" _m "${_row}")
+    if(NOT _m)
+        message(FATAL_ERROR "np-roles: invalid source role record: ${_row}")
+    endif()
     set(_role "${CMAKE_MATCH_1}")
     set(_file "${CMAKE_MATCH_2}")
     set(_forbid "${CMAKE_MATCH_3}")
@@ -124,6 +127,9 @@ message(STATUS "np-roles: product-adapter boundary (declared only): "
 # ---- OBJECT audits: undefined as well as defined symbols -------------
 foreach(_row IN LISTS _np_obj_roles)
     string(REGEX MATCH "^([^@]+)@([^@]+)@(.*)$" _m "${_row}")
+    if(NOT _m)
+        message(FATAL_ERROR "np-roles: invalid object role record: ${_row}")
+    endif()
     set(_role "${CMAKE_MATCH_1}")
     set(_var "${CMAKE_MATCH_2}")
     set(_forbid "${CMAKE_MATCH_3}")

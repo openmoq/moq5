@@ -44,7 +44,7 @@ struct subscribe_request {
     bytes_view                            track_name;
     subscribe_filter                      filter;
     uint8_t                               subscriber_priority;
-    group_order                           group_order;
+    moq::group_order                      group_order;
     bool                                  forward;
     uint64_t                              start_group;
     uint64_t                              start_object;
@@ -293,7 +293,7 @@ struct fetch_request {
     uint64_t                              end_group;
     uint64_t                              end_object;
     uint8_t                               subscriber_priority;
-    group_order                           group_order;
+    moq::group_order                      group_order;
     std::span<const moq_resolved_token_t> tokens;
 
     namespace_name track_namespace() const { return {ns_raw}; }
@@ -321,6 +321,15 @@ struct fetch_ok {
 
 struct fetch_complete {
     fetch_handle fetch;
+};
+
+// Fetcher-side stream terminal (MOQ_EVENT_FETCH_RESET): error_code is the
+// peer's QUIC STREAM application error code, not a request error.
+struct fetch_reset {
+    fetch_handle fetch;
+    uint64_t     error_code;
+    bool         data_stream;    // true: response data stream; false: request stream
+    bool         stop_sending;   // request stream only: STOP_SENDING rather than RESET_STREAM
 };
 
 struct fetch_object {
@@ -375,7 +384,7 @@ struct publish_ok {
     publication       pub;
     bool              send_allowed;
     uint8_t           subscriber_priority;
-    group_order       group_order;
+    moq::group_order  group_order;
     bool              has_delivery_timeout;
     uint64_t          delivery_timeout_ms;
     bool              has_expires;
@@ -566,6 +575,7 @@ using event_variant = std::variant<
     event::publish_updated,
     event::subscription_update_ok,
     event::publication_update_ok,
+    event::fetch_reset,
     event::unknown>;
 // clang-format on
 
@@ -812,6 +822,11 @@ public:
         }
         case MOQ_EVENT_FETCH_COMPLETE:
             return event::fetch_complete{fetch_handle(e.u.fetch_complete.fetch)};
+        case MOQ_EVENT_FETCH_RESET: {
+            auto &d = e.u.fetch_reset;
+            return event::fetch_reset{fetch_handle(d.fetch), d.error_code,
+                                      d.data_stream, d.stop_sending};
+        }
 
         case MOQ_EVENT_FETCH_OBJECT: {
             auto &d = e.u.fetch_object;

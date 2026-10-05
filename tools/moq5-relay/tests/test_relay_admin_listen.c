@@ -12,6 +12,10 @@
  * Every wait in this file is bounded and every bound fails the run. A test that
  * hangs reports nothing.
  */
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "../cli/admin_listen.h"
 #include "../cli/broker.h"
 #include <moq/relay/moqr_obs.h>

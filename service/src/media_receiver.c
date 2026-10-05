@@ -1584,7 +1584,8 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
              * items; drop our handle (only on our own fetch) so a recycled slot
              * can't later match. */
             if (item.kind == MOQ_SUB_FETCH_ERROR ||
-                item.kind == MOQ_SUB_FETCH_COMPLETE)
+                item.kind == MOQ_SUB_FETCH_COMPLETE ||
+                item.kind == MOQ_SUB_FETCH_RESET)
                 r->catalog_fetch = NULL;
         }
         moq_sub_fetch_item_cleanup(&item);
@@ -2708,6 +2709,13 @@ void moq_media_receiver_test_set_alloc(const moq_alloc_t *alloc);
 void moq_media_receiver_test_set_alloc(const moq_alloc_t *alloc)
 {
     g_test_alloc = alloc;
+}
+/* Test-only observation of the catalog Joining-FETCH correlation handle: true
+ * while the receiver still correlates fetch items to its catalog fetch. */
+bool moq_media_receiver_test_catalog_fetch_pending(const moq_media_receiver_t *r);
+bool moq_media_receiver_test_catalog_fetch_pending(const moq_media_receiver_t *r)
+{
+    return r != NULL && r->catalog_fetch != NULL;
 }
 void moq_media_receiver_test_entry_sizes(size_t *event_entry, size_t *obj_entry);
 void moq_media_receiver_test_entry_sizes(size_t *event_entry, size_t *obj_entry)

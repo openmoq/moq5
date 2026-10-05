@@ -15,7 +15,7 @@ struct subscribe_config {
     bytes_view       track;
     subscribe_filter filter   = subscribe_filter::largest_object;
     uint8_t          priority = 128;
-    group_order      group_order = group_order::default_order;
+    moq::group_order group_order = moq::group_order::default_order;
     bool             forward    = true;
     uint64_t         start_group  = 0;
     uint64_t         start_object = 0;
@@ -108,7 +108,7 @@ struct fetch_config {
     uint64_t       start_object    = 0;
     uint64_t       end_group       = 0;
     uint64_t       end_object      = 0;
-    group_order    group_order     = group_order::default_order;
+    moq::group_order group_order   = moq::group_order::default_order;
     bool           has_subscriber_priority = false;
     uint8_t        subscriber_priority     = 128;
     bool           is_joining      = false;
@@ -168,7 +168,7 @@ struct publish_config {
 struct accept_publish_config {
     bool        has_subscriber_priority = false;
     uint8_t     subscriber_priority     = 128;
-    group_order group_order             = group_order::default_order;
+    moq::group_order group_order        = moq::group_order::default_order;
     bool        has_new_group_request   = false;   /* requires dynamic_groups */
     uint64_t    new_group_request       = 0;
     /* Subscription filter sent on the response (none = unfiltered). */

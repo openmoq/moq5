@@ -11,10 +11,14 @@ foreach(_v SRC WORK WTQUIC_PREFIX)
 endforeach()
 
 set(_tree "${WORK}/tests-off-tree")
+set(_context)
+if(CONSUMER_CONTEXT)
+    list(APPEND _context -C "${CONSUMER_CONTEXT}")
+endif()
 file(REMOVE_RECURSE "${_tree}")
 
 execute_process(
-    COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_tree}"
+    COMMAND ${CMAKE_COMMAND} ${_context} -S "${SRC}" -B "${_tree}"
         -DMOQ_BUILD_TESTS=OFF
         -DMOQ_BUILD_ADAPTER_WTQUIC=ON
         -DMOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON

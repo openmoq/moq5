@@ -25,7 +25,7 @@
 #include <moq/session.h>
 #include <moq/transport_bridge.h>
 
-#include "fake_endpoint.h"
+#include "held_bridge_driver.h"
 #include "support/fake_msq_managed.h"
 
 /* lives in shared test support: the RELAY tree never includes the bridge
@@ -226,9 +226,10 @@ static bool
 shx_round(shx_driver_t *d)
 {
     bool moved = false;
+    size_t held_before = held_bridge_driver(d->bridge)->input.count;
 
     d->now += 1000;
-    (void)moq_transport_bridge_service(d->bridge, d->now);
+    (void)held_bridge_service(d->bridge, d->now);
 
     /* driver -> child: consume newly recorded endpoint ops */
     while (d->ep_cursor < d->ep.count) {
@@ -330,7 +331,7 @@ shx_round(shx_driver_t *d)
             }
         }
         if (st->uni) {
-            rc = moq_transport_bridge_on_peer_uni_bytes(
+            rc = held_bridge_uni_bytes(
                 d->bridge, drv_id, snd->bytes, snd->bytes_len, fin, d->now);
         } else if (d->ctrl_open && st->id == d->ctrl_child_id &&
                    d->version == MOQ_VERSION_DRAFT_16) {
@@ -340,8 +341,8 @@ shx_round(shx_driver_t *d)
             rc = moq_transport_bridge_on_peer_bidi_bytes(
                 d->bridge, drv_id, snd->bytes, snd->bytes_len, fin, d->now);
         }
-        (void)rc; /* WOULD_BLOCK: the bridge retains retry state; service
-                   * below re-drives it — the shuttle never re-delivers */
+        (void)rc; /* Owned WOULD_BLOCK belongs to the bridge; refused input
+                   * belongs to the bounded held driver, replayed by service. */
         (void)fake_msq_deliver_send_complete(f, false);
     }
 
@@ -378,7 +379,7 @@ shx_round(shx_driver_t *d)
                 }
             }
             if (fl & QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND) {
-                (void)moq_transport_bridge_on_peer_stream_reset(
+                (void)held_bridge_reset(
                     d->bridge, sdrv_id, code, d->now);
             }
             if (fl & QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE) {
@@ -388,9 +389,10 @@ shx_round(shx_driver_t *d)
         }
     }
 
-    (void)moq_transport_bridge_service(d->bridge, d->now);
+    (void)held_bridge_service(d->bridge, d->now);
 
     /* drain driver events into the log (payload checks read them here) */
+    moved |= held_before != held_bridge_driver(d->bridge)->input.count;
     moq_event_t evs[8];
     size_t n;
 
@@ -460,12 +462,12 @@ shx_driver_open(shx_driver_t *d, fake_mgd_t *fake, moq_version_t version,
      * alone — overlapping uni/bidi ranges would collide inside the
      * driver's own bridge (a real QUIC transport never produces that).
      * The id map below presents real QUIC client ids to the child. */
-    fake_endpoint_init(&d->ep, 1000, 2000);
+    held_endpoint_init(&d->ep, 1000, 2000);
 
     moq_transport_bridge_cfg_t bcfg;
 
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, d->sess, &d->ep.vtable, &d->ep,
+    if (held_bridge_create(&bcfg, d->sess, &d->ep.vtable, &d->ep,
                                     &d->bridge) < 0) {
         return false;
     }
@@ -489,7 +491,7 @@ static void
 shx_driver_close(shx_driver_t *d)
 {
     if (d->bridge != NULL) {
-        moq_transport_bridge_destroy(d->bridge);
+        held_bridge_destroy(d->bridge);
     }
     if (d->sess != NULL) {
         moq_session_destroy(d->sess);

@@ -19,7 +19,7 @@
 
 #include "msquic_internal.h"
 #include "support/fake_msq_table.h"
-#include "support/fake_endpoint.h" /* raw peer for the deadline pair */
+#include "support/held_bridge_driver.h" /* raw peer for the deadline pair */
 
 #include <moq/msquic_managed.h>
 #include <moq/session.h>
@@ -1382,18 +1382,18 @@ static bool peer_up(struct peer *p, fake_msq_t *child)
     scfg.initial_request_capacity = 16;
     if (moq_session_create(&scfg, 0, &p->s) < 0)
         return false;
-    fake_endpoint_init(&p->ep, 2, 0); /* client-initiated id bases */
+    held_endpoint_init(&p->ep, 2, 0); /* client-initiated id bases */
     moq_transport_bridge_cfg_t bcfg;
 
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    return moq_transport_bridge_create(&bcfg, p->s, &p->ep.vtable, &p->ep,
+    return held_bridge_create(&bcfg, p->s, &p->ep.vtable, &p->ep,
                                        &p->bridge) == MOQ_OK;
 }
 
 static void peer_down(struct peer *p)
 {
     if (p->bridge != NULL)
-        moq_transport_bridge_destroy(p->bridge);
+        held_bridge_destroy(p->bridge);
     if (p->s != NULL)
         moq_session_destroy(p->s);
     p->bridge = NULL;
@@ -1417,7 +1417,7 @@ static QUIC_STATUS deliver_peer_bidi(fake_msq_t *f, fake_msq_stream_t *st)
  * back. */
 static void peer_relay(struct peer *p, uint64_t now_us)
 {
-    if (moq_transport_bridge_service(p->bridge, now_us) != MOQ_OK)
+    if (held_bridge_service(p->bridge, now_us) != MOQ_OK)
         p->svc_bad++;
     for (size_t i = 0; i < p->ep.count; i++) {
         fake_op_t *o = &p->ep.ops[i];

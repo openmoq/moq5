@@ -25,6 +25,8 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
+#include <new>
 #include <vector>
 
 namespace moq::wt {
@@ -36,6 +38,19 @@ static uint64_t default_now_us()
         std::chrono::duration_cast<std::chrono::microseconds>(
             now.time_since_epoch()).count());
 }
+
+#ifdef MOQ_PROXYGEN_WT_TESTING
+/* Test-only failure injection (declared in wt_endpoint_ops.h): the next
+ * allocation at the named point throws std::bad_alloc, which the production
+ * catch paths below turn into a transport error. Never compiled into the
+ * shipped adapter. */
+static int g_wt_fail_next = 0;
+void wt_test_fail_next(int which) { g_wt_fail_next = which; }
+#define WT_TEST_FAIL_POINT(which) \
+    do { if (g_wt_fail_next == (which)) { g_wt_fail_next = 0; throw std::bad_alloc(); } } while (0)
+#else
+#define WT_TEST_FAIL_POINT(which) do { } while (0)
+#endif
 
 /* -- Private implementation ------------------------------------------ */
 
@@ -73,6 +88,7 @@ struct Adapter::Impl {
     {
         if (!moq_transport_bridge_is_terminal(bridge_))
             moq_transport_bridge_on_transport_error(bridge_, 0x1, safe_now());
+        held_reads_.clear();
     }
 
     moq_result_t terminalResult() const
@@ -101,8 +117,18 @@ struct Adapter::Impl {
         try {
             moq_transport_bridge_service(bridge_, now());
 
-            if (moq_transport_bridge_is_terminal(bridge_))
+            if (moq_transport_bridge_is_terminal(bridge_)) {
+                held_reads_.clear();
                 return terminalResult();
+            }
+
+            // Held chunks whose streams the bridge no longer reports pending:
+            // the session can admit again, redeliver each one unchanged.
+            redeliverHeld();
+            if (moq_transport_bridge_is_terminal(bridge_)) {
+                held_reads_.clear();
+                return terminalResult();
+            }
 
             // Process locally-opened bidi streams queued during service().
             if (!local_bidi_pending_.empty()) {
@@ -257,35 +283,105 @@ struct Adapter::Impl {
                 break;
             }
 
-            if (sd.fin) {
-                stream_kinds_.erase(id);
-                paused_reads_.erase(id);
-                waiting_reads_.erase(id);
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                // Refused at admission: the bridge took none of this chunk
+                // nor its FIN. Keep exactly it and issue no further read on
+                // the stream; service() redelivers it once admission is
+                // observed. (Only peer uni data input can return this.)
+                if (held_reads_.count(id)) {
+                    // Bytes were read past a held chunk: a contract breach,
+                    // never a silent replacement of the earlier chunk.
+                    markFatal();
+                    return;
+                }
+                // Retain the payload in adapter-owned storage. IOBuf capacity
+                // can be narrowed without releasing the backing allocation;
+                // capacity == length does not prove that backing is small.
+                // An allocation failure here lands in
+                // the catch below: a transport error, never acceptance.
+                std::unique_ptr<folly::IOBuf> keep;
+                if (sd.data) {
+                    keep = folly::IOBuf::copyBuffer(data, len);
+                    sd.data.reset();
+                }
+                WT_TEST_FAIL_POINT(1);
+                held_reads_[id] = HeldRead{std::move(keep), sd.fin};
                 if (!moq_transport_bridge_is_terminal(bridge_))
                     moq_transport_bridge_service(bridge_, now());
                 return;
             }
 
-            if (!moq_transport_bridge_is_terminal(bridge_))
-                moq_transport_bridge_service(bridge_, now());
-
-            if (moq_transport_bridge_is_terminal(bridge_))
-                return;
-
-            // Pause only if the bridge STILL has pending inbound work for
-            // this stream after service(). The synchronous service() above
-            // may have already drained the WOULD_BLOCK that `rc` reported,
-            // in which case pausing would stall the stream until an
-            // external service() call. Re-check pending, not the stale rc.
-            if (rc == MOQ_ERR_WOULD_BLOCK &&
-                moq_transport_bridge_stream_has_pending(bridge_, id)) {
-                paused_reads_.insert(id);
-                return;
-            }
-
-            startRead(id);
+            finishRead(id, rc, sd.fin);
         } catch (...) {
             markFatal();
+        }
+    }
+
+    // After the bridge took (or retained) a chunk for `id`: retire the stream
+    // on FIN, otherwise pause it while the bridge still reports pending work
+    // or issue the next read.
+    void finishRead(uint64_t id, moq_result_t rc, bool fin)
+    {
+        if (fin) {
+            stream_kinds_.erase(id);
+            paused_reads_.erase(id);
+            waiting_reads_.erase(id);
+            if (!moq_transport_bridge_is_terminal(bridge_))
+                moq_transport_bridge_service(bridge_, now());
+            return;
+        }
+
+        if (!moq_transport_bridge_is_terminal(bridge_))
+            moq_transport_bridge_service(bridge_, now());
+
+        if (moq_transport_bridge_is_terminal(bridge_))
+            return;
+
+        // Pause only if the bridge STILL has pending inbound work for
+        // this stream after service(). The synchronous service() above
+        // may have already drained the WOULD_BLOCK that `rc` reported,
+        // in which case pausing would stall the stream until an
+        // external service() call. Re-check pending, not the stale rc.
+        if (rc == MOQ_ERR_WOULD_BLOCK &&
+            moq_transport_bridge_stream_has_pending(bridge_, id)) {
+            paused_reads_.insert(id);
+            return;
+        }
+
+        startRead(id);
+    }
+
+    // Redeliver every held chunk whose stream the bridge no longer reports
+    // pending. A redelivery refused again (another stream took the entry)
+    // keeps the chunk exactly as it is; an accepted one leaves the map and
+    // the stream continues like any other read.
+    // Runs inside service()'s try: a failed snapshot allocation becomes a
+    // transport error there (markFatal), and every held chunk is released.
+    void redeliverHeld()
+    {
+        if (held_reads_.empty())
+            return;
+        WT_TEST_FAIL_POINT(2);
+        std::vector<uint64_t> ready;
+        for (auto &kv : held_reads_)
+            if (!moq_transport_bridge_stream_has_pending(bridge_, kv.first))
+                ready.push_back(kv.first);
+        for (auto id : ready) {
+            if (moq_transport_bridge_is_terminal(bridge_))
+                return;
+            auto it = held_reads_.find(id);
+            if (it == held_reads_.end())
+                continue;
+            const uint8_t *data = it->second.data ? it->second.data->data()
+                                                  : nullptr;
+            size_t len = it->second.data ? it->second.data->length() : 0;
+            bool fin = it->second.fin;
+            moq_result_t rc = moq_transport_bridge_on_peer_uni_bytes(
+                bridge_, id, data, len, fin, now());
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED)
+                continue;
+            held_reads_.erase(it);
+            finishRead(id, rc, fin);
         }
     }
 
@@ -295,6 +391,7 @@ struct Adapter::Impl {
             bool is_control = (id == peer_control_stream_id_ ||
                                id == local_control_stream_id_);
 
+            held_reads_.erase(id);
             stream_kinds_.erase(id);
             paused_reads_.erase(id);
             waiting_reads_.erase(id);
@@ -387,6 +484,7 @@ struct Adapter::Impl {
                 return;
             uint64_t code = error ? static_cast<uint64_t>(*error) : 0;
             moq_transport_bridge_on_transport_close(bridge_, code, now());
+            held_reads_.clear();
         } catch (...) {
             markFatal();
         }
@@ -416,6 +514,20 @@ struct Adapter::Impl {
     std::unordered_set<uint64_t> active_reads_;
     std::unordered_set<uint64_t> paused_reads_;
     std::unordered_set<uint64_t> waiting_reads_;
+
+    /* Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): a peer uni chunk the
+     * bridge refused whole, kept exactly as read (bytes and FIN) until a
+     * service pass sees the session able to admit again and it is redelivered.
+     * A held stream has no outstanding read, so nothing newer arrives on it;
+     * proxygen keeps the rest in its own buffers under the inbound WT
+     * per-stream/connection data windows the session advertised, and one
+     * delivery is at most what those windows let it buffer. Keyed in stream
+     * order so redelivery after capacity returns is deterministic. */
+    struct HeldRead {
+        std::unique_ptr<folly::IOBuf> data;
+        bool fin = false;
+    };
+    std::map<uint64_t, HeldRead> held_reads_;
 };
 
 /* -- Adapter: thin forwarding shell ---------------------------------- */

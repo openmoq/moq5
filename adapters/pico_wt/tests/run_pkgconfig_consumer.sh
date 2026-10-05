@@ -3,8 +3,9 @@
 # pkg-config consumer test for an installed pico WT component.
 #
 # Proves a plain external C program (no CMake) can compile, link, and run
-# using ONLY `pkg-config --cflags --libs <component>` from the installed
-# prefix — the Meson/autotools consumption path. Installs a BUILD_HTTP
+# using `pkg-config --cflags --libs <component>` from the installed prefix,
+# with an application-owned runtime search path for that temporary prefix.
+# This is the Meson/autotools consumption path. Installs a BUILD_HTTP
 # picoquic + libmoq to a temp prefix and builds the consumer against it
 # with the installed picoquic (no MOQ_PICOQUIC_SOURCE_DIR, no source-tree
 # includes).
@@ -41,7 +42,7 @@ fi
 PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"
 
 if ! command -v pkg-config >/dev/null 2>&1; then
-    echo "SKIP: pkg-config not found"; exit 0
+    echo "FAIL: pkg-config not found"; exit 1
 fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -84,11 +85,17 @@ case "$PC_CFLAGS" in
         echo "FAIL: pkg-config cflags leak a picoquic source-tree path"; exit 1;;
 esac
 
-echo "== 4. compile + link the consumer with ONLY pkg-config output =="
+echo "== 4. compile + link with pkg-config and an explicit runtime search path =="
 OUT="$WORK/consumer"
+# pkg-config supplies build metadata, not the application's loader policy.
+# Keep the temporary install location out of the installed .pc files.
+runtime_flags=()
+case "$(uname -s)" in
+    Darwin|Linux) runtime_flags=("-Wl,-rpath,$P/$LIBDIR");;
+esac
 # Intentionally no -I beyond pkg-config's, and no source dirs.
 # shellcheck disable=SC2086
-"$CC" $CFLAGS "$CONSUMER_SRC" $PC_CFLAGS $PC_LIBS $LDFLAGS -o "$OUT"
+"$CC" $CFLAGS "$CONSUMER_SRC" $PC_CFLAGS $PC_LIBS $LDFLAGS "${runtime_flags[@]}" -o "$OUT"
 
 echo "== 5. run consumer =="
 "$OUT"

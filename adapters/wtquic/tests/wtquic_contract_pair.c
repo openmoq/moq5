@@ -302,6 +302,15 @@ bool wtqc_wait_flag(wtqc_side_t *sd, const bool *field)
 
 /* --- pair lifecycle ----------------------------------------------------------- */
 
+static void wtqc_attach_failed(void *user)
+{
+    wtqc_side_t *sd = user;
+    pthread_mutex_lock(&sd->mu);
+    sd->obs.establishment_failed = true;
+    pthread_cond_broadcast(&sd->cv);
+    pthread_mutex_unlock(&sd->mu);
+}
+
 static int side_init(wtqc_side_t *sd, moq_perspective_t persp,
                      moq_session_t **ms_out)
 {
@@ -325,8 +334,9 @@ static int side_init(wtqc_side_t *sd, moq_perspective_t persp,
     ccfg.session = *ms_out;
     ccfg.hook = wtqc_hook;
     ccfg.hook_user = sd;
-    if (moq_wtquic_conn_create(&ccfg, &sd->conn) < 0)
-        return -1;
+    sd->attach.cfg = ccfg;
+    sd->attach.out = &sd->conn;
+    sd->attach.failed = wtqc_attach_failed;
     return 0;
 }
 
@@ -357,8 +367,8 @@ int wtqc_pair_setup(wtqc_pair_t *p, const wtqc_pair_cfg_t *cfg)
     lcfg.key_file = cfg->key;
     lcfg.paths = &sv;
     lcfg.path_count = 1;
-    lcfg.events = moq_wtquic_conn_events();
-    lcfg.user = p->server.conn;
+    lcfg.events = wtq_test_attach_events();
+    lcfg.user = &p->server.attach;
     if (wtq_msquic_listener_start(p->env, &lcfg, &p->listener) != WTQ_OK)
         return -1;
 
@@ -374,8 +384,8 @@ int wtqc_pair_setup(wtqc_pair_t *p, const wtqc_pair_cfg_t *cfg)
     cli.port = wtq_msquic_listener_port(p->listener);
     cli.insecure_skip_verify = true;
     cli.connect = &wcfg;
-    cli.events = moq_wtquic_conn_events();
-    cli.user = p->client.conn;
+    cli.events = wtq_test_attach_events();
+    cli.user = &p->client.attach;
     if (wtq_msquic_client_connect(p->env, &cli, &p->cs) != WTQ_OK)
         return -1;
     return 0;

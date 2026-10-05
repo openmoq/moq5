@@ -1075,15 +1075,12 @@ run_d18_reject_script(void)
 
 
 /* -- multipublisher succession (draft-16 SS8.3 / draft-18 SS9.3) --------- *
- * The compliance surface, recorded as five explicit observations plus ONE
- * exact expectation: the relay must handle the same Track from multiple
- * publishers — an implementation constrained to fewer publishers may
- * reject or cancel the extras, but silent acceptance followed by permanent
- * non-use is not an adequate capacity policy, and standing downstream
- * demand must not strand when the source ends while another publisher of
- * the namespace is live. Runs the core policy through the single binding
- * rig; the per-draft wire shape is the announce/withdraw encoding already
- * pinned by the withdrawal scripts.
+ * Both drafts permit explicit rejection/cancellation when implementation
+ * constraints limit publishers. This relay selects the newer exact-namespace
+ * owner: retire the old generation and its standing demand, then accept fresh
+ * demand against the new owner. Do not substitute transparent retargeting for
+ * the force-withdraw contract in relay/docs/architecture.md. The separate
+ * no-alternative and range-complete scripts retain their terminal oracles.
  */
 static void
 multipub_drive_pub(shx_driver_t *pub, moq_subgroup_handle_t *sgh,
@@ -1128,24 +1125,60 @@ multipub_push(shx_driver_t *pub, moq_subgroup_handle_t sgh, uint64_t oid)
     return rc == MOQ_OK;
 }
 
+/* Unique sixteen-byte payload markers, counted only in tapped data streams.
+ * Event counts below independently assert object delivery, not just bytes. */
+static int
+multipub_payload_count(const shx_driver_t *sub, uint8_t marker)
+{
+    uint8_t body[16];
+    int count = 0;
+
+    memset(body, marker, sizeof(body));
+    for (int i = 0; i < SHX_MAX_STREAMS; i++) {
+        const shx_tap_t *tap = &sub->tap[i];
+
+        if (!tap->used || (tap->id & 2u) == 0) {
+            continue;
+        }
+        for (size_t off = 0; off + sizeof(body) <= tap->len; off++) {
+            if (memcmp(tap->bytes + off, body, sizeof(body)) == 0) {
+                count++;
+                off += sizeof(body) - 1;
+            }
+        }
+    }
+    return count;
+}
+
 static int
 run_multipub_script(const char *label, moq_version_t version)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pa, pb, sub;
+    rig_t r = { 0 };
+    shx_driver_t pa = { 0 }, pb = { 0 }, sub = { 0 };
+    moq_announcement_t ann_a = { 0 }, ann_b = { 0 };
+    moq_subscription_t sh_a = { 0 }, sh_b = { 0 };
+    moq_subgroup_handle_t sgh_a = { 0 }, sgh_b = { 0 };
+    bool sg_a = false, sg_b = false;
 
-    T_CHECK(rig_up(&r, version, NULL));
-    if (r.m == NULL) {
-        rig_down(&r);
-        return g_failures - before;
-    }
-    T_CHECK(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&pb, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    T_CHECK(establish(&r, &pa));
-    T_CHECK(establish(&r, &pb));
-    T_CHECK(establish(&r, &sub));
+    /* Evaluate setup once; a failed prerequisite must not cascade through
+     * invalid handles. All partially opened drivers still reach cleanup. */
+#define MP_REQUIRE(expr)                                                  \
+    do {                                                                  \
+        if (!(expr)) {                                                    \
+            printf("FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr);        \
+            g_failures++;                                                 \
+            goto cleanup;                                                 \
+        }                                                                 \
+    } while (0)
+
+    MP_REQUIRE(rig_up(&r, version, NULL));
+    MP_REQUIRE(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
+    MP_REQUIRE(shx_driver_open(&pb, &r.fake, version, alpn_of(version)));
+    MP_REQUIRE(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
+    MP_REQUIRE(establish(&r, &pa));
+    MP_REQUIRE(establish(&r, &pb));
+    MP_REQUIRE(establish(&r, &sub));
 
     shx_driver_t *ds[3] = { &pa, &pb, &sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
@@ -1154,129 +1187,108 @@ run_multipub_script(const char *label, moq_version_t version)
 
     moq_publish_namespace_cfg_init(&pcfg);
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
-    moq_announcement_t ann_a, ann_b;
-
-    T_CHECK(moq_session_publish_namespace(pa.sess, &pcfg, pa.now, &ann_a) ==
-            MOQ_OK);
+    MP_REQUIRE(moq_session_publish_namespace(pa.sess, &pcfg, pa.now,
+                                              &ann_a) == MOQ_OK);
     pump_rounds(&r, ds, 3, 8);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
 
-    /* AUDIT 1: a SECOND publisher announces the SAME namespace while the
-     * first holds it — accepted or explicitly rejected? */
-    T_CHECK(moq_session_publish_namespace(pb.sess, &pcfg, pb.now, &ann_b) ==
-            MOQ_OK);
-    pump_rounds(&r, ds, 3, 8);
-    printf("AUDIT[%s] 1: concurrent second announce: accepted=%d "
-           "rejected=%d cancelled=%d\n", label,
-           shx_ev_count(&pb, 11 /* NAMESPACE_ACCEPTED */),
-           shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_REJECTED),
-           shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_CANCELLED));
-
-    /* establish the downstream track against the standing winner (A) */
+    /* A owns the namespace and has established downstream demand BEFORE
+     * B replaces it. The replacement must explicitly retire this generation. */
     moq_subscribe_cfg_t sc;
 
     moq_subscribe_cfg_init(&sc);
-    sc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    sc.track_namespace = pcfg.track_namespace;
     sc.track_name = (moq_bytes_t){ (const uint8_t *)"t", 1 };
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
-    moq_subscription_t sh;
-
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
-    moq_subgroup_handle_t sgh_a;
-    bool sg_a = false;
-
+    MP_REQUIRE(moq_session_subscribe(sub.sess, &sc, sub.now, &sh_a) == MOQ_OK);
     for (int i = 0; i < 24 && !sg_a; i++) {
         pump_rounds(&r, ds, 3, 2);
         multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
     }
-    T_CHECK(sg_a);
-    T_CHECK(multipub_push(&pa, sgh_a, 0));
+    MP_REQUIRE(sg_a);
+    MP_REQUIRE(multipub_push(&pa, sgh_a, 0));
     pump_rounds(&r, ds, 3, 10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 0);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x50) == 1);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 0);
 
-    /* AUDIT 2: A withdraws its namespace — is A's established upstream
-     * Track subscription still live (does a further push deliver)? */
-    pa.now += 1000;
-    T_CHECK(moq_session_publish_namespace_done(pa.sess, ann_a, pa.now) ==
-            MOQ_OK);
-    pump_rounds(&r, ds, 3, 10);
-    bool a_push_ok = multipub_push(&pa, sgh_a, 1);
+    MP_REQUIRE(moq_session_publish_namespace(pb.sess, &pcfg, pb.now,
+                                              &ann_b) == MOQ_OK);
+    pump_rounds(&r, ds, 3, 12);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_REJECTED) == 0);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_CANCELLED) == 0);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_CANCELLED) == 1);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_UNSUBSCRIBED) == 1);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    MP_REQUIRE(sub.done_status_count == 1 && sub.last_done_status == 0x2);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 0);
 
-    pump_rounds(&r, ds, 3, 10);
-    printf("AUDIT[%s] 2: post-withdraw push by A: write=%d delivered=%d "
-           "(upstream sub live=%s)\n", label, a_push_ok,
-           shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED),
-           a_push_ok && shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 2
-               ? "yes" : "no");
-
-    /* the withdrawn namespace is free again: B re-announces and must now
-     * hold it — a LIVE alternative publisher exists from here on */
-    pb.now += 1000;
-    T_CHECK(moq_session_publish_namespace(pb.sess, &pcfg, pb.now, &ann_b) ==
-            MOQ_OK);
+    /* Retired A cannot leak more payload. Standing demand ended explicitly;
+     * this policy does not silently retarget an already accepted request. */
+    MP_REQUIRE(!multipub_push(&pa, sgh_a, 1));
     pump_rounds(&r, ds, 3, 8);
-    printf("AUDIT[%s] 2b: B re-announce after A withdrew: accepted=%d "
-           "rejected=%d\n", label,
-           shx_ev_count(&pb, 11 /* NAMESPACE_ACCEPTED */),
-           shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_REJECTED));
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x51) == 0);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
 
-    /* AUDIT 3: B is (still) announced and a matching established
-     * downstream subscriber exists — does ANY request reach B, and does B
-     * receive any explicit implementation-constraint response otherwise? */
-    printf("AUDIT[%s] 3: requests to B while demand stands: subscribe=%d "
-           "(explicit constraint response to B: rejected=%d "
-           "cancelled=%d)\n", label, pb.got_subscribe ? 1 : 0,
-           shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_REJECTED),
-           shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_CANCELLED));
+    /* Fresh demand must reach only the newer owner and carry fresh bytes,
+     * never A's retained log. There is no second namespace announcement. */
+    sub.now += 1000;
+    MP_REQUIRE(moq_session_subscribe(sub.sess, &sc, sub.now, &sh_b) == MOQ_OK);
+    for (int i = 0; i < 24 && !sg_b; i++) {
+        pump_rounds(&r, ds, 3, 2);
+        multipub_drive_pub(&pb, &sgh_b, &sg_b, 2);
+    }
+    MP_REQUIRE(sg_b);
+    MP_REQUIRE(multipub_push(&pb, sgh_b, 2));
+    pump_rounds(&r, ds, 3, 12);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 2);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_ERROR) == 0);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 2);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x50) == 1);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x51) == 0);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x52) == 1);
 
-    /* AUDIT 4: A goes transport-terminal — is the standing downstream
-     * demand retargeted to B without any nudge, or terminated, or left
-     * silent? */
-    int done_before = shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE);
-
+    /* Late close of the retired publisher must not terminate B's demand. */
     fake_mgd_deliver_peer_close(pa.child, 0);
     fake_mgd_deliver_shutdown_complete(pa.child);
-    pa.child = NULL; /* the shuttle must not touch the closing conn */
-    shx_driver_t *ds2[2] = { &pb, &sub };
+    pa.child = NULL;
+    shx_driver_t *remaining[2] = { &pb, &sub };
 
-    pump_rounds(&r, ds2, 2, 12);
-    int sub_done = shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) -
-                   done_before;
+    pump_rounds(&r, remaining, 2, 12);
+    MP_REQUIRE(multipub_push(&pb, sgh_b, 3));
+    pump_rounds(&r, remaining, 2, 8);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_CANCELLED) == 1);
+    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_UNSUBSCRIBED) == 1);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_CANCELLED) == 0);
+    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 2);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    MP_REQUIRE(sub.done_status_count == 1 && sub.last_done_status == 0x2);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 3);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x50) == 1);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x51) == 0);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x52) == 1);
+    MP_REQUIRE(multipub_payload_count(&sub, 0x53) == 1);
+    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SESSION_CLOSED) == 0);
+    printf("ORACLE %s newer-owner=B retired-A=1 track-ended=0x2 "
+           "fresh-objects=2 stale-objects=0\n", label);
 
-    printf("AUDIT[%s] 4: after A terminal: retarget-to-B subscribe=%d, "
-           "downstream SUBSCRIBE_DONE=%d, downstream silent=%s\n", label,
-           pb.got_subscribe ? 1 : 0, sub_done,
-           (!pb.got_subscribe && sub_done == 0) ? "YES (stranded)" : "no");
-
-    /* With another publisher of the namespace live, the source's terminal
-     * must RETARGET the standing demand: exactly one fresh upstream
-     * SUBSCRIBE reaches B, the established subscriber sees no duplicate
-     * SUBSCRIBE_OK and no terminal, and data RESUMES from B. */
-    T_CHECK(pb.got_subscribe);
-    T_CHECK(sub_done == 0);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
-    int objs_before_b = shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED);
-    moq_subgroup_handle_t sgh_b;
-    bool sg_b = false;
-
-    for (int i = 0; i < 24 && !sg_b; i++) {
-        multipub_drive_pub(&pb, &sgh_b, &sg_b, 2);
-        pump_rounds(&r, ds2, 2, 2);
-    }
-    T_CHECK(sg_b);
-    T_CHECK(multipub_push(&pb, sgh_b, 0));
-    pump_rounds(&r, ds2, 2, 10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) ==
-            objs_before_b + 1);
-    /* and the transport path never doubles into a late terminal */
-    pump_rounds(&r, ds2, 2, 6);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == done_before);
-
-    if (pa.child != NULL) {
-        shx_driver_close(&pa);
-    }
+cleanup:
+    shx_driver_close(&pa);
     shx_driver_close(&pb);
     shx_driver_close(&sub);
     rig_down(&r);
+#undef MP_REQUIRE
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }

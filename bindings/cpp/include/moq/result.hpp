@@ -24,6 +24,7 @@ enum class errc : int {
     goaway          = MOQ_ERR_GOAWAY,
     interrupted     = MOQ_ERR_INTERRUPTED,
     unsupported     = MOQ_ERR_UNSUPPORTED,
+    input_not_consumed = MOQ_ERR_INPUT_NOT_CONSUMED,
     internal        = MOQ_ERR_INTERNAL,
 };
 

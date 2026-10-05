@@ -118,7 +118,10 @@ int main(void)
         /* The selectable backend accepts an explicit selection and resolves it
          * verbatim (built only where the facade is compiled in). */
         moq_endpoint_cfg_t w = mkcfg("https://relay.example/moq");
-        w.struct_size = sizeof(w);
+        /* mkcfg initializes only v0. Initialize the complete tail before
+         * claiming its size, including the handshake-timeout field. */
+        moq_endpoint_cfg_init_sized(&w, sizeof(w));
+        w.url = B("https://relay.example/moq");
         w.backend = MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC;
         w.wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
@@ -259,8 +262,13 @@ int main(void)
         if (raw != NULL) {
             moq_endpoint_cfg_t *old = (moq_endpoint_cfg_t *)raw;
             moq_endpoint_cfg_init(old);      /* writes exactly V0_SIZE bytes */
-            MOQ_TEST_CHECK_EQ_U64(old->struct_size, MOQ_ENDPOINT_CFG_V0_SIZE);
-            old->url = B("https://relay.example/moq");
+            /* The allocation is a frozen prefix, not a current-sized object. */
+            uint32_t written_size;
+            memcpy(&written_size, raw, sizeof(written_size));
+            MOQ_TEST_CHECK_EQ_U64(written_size, MOQ_ENDPOINT_CFG_V0_SIZE);
+            moq_bytes_t url = B("https://relay.example/moq");
+            memcpy((uint8_t *)raw + offsetof(moq_endpoint_cfg_t, url),
+                   &url, sizeof(url));
             moq_endpoint_resolved_t r;
             MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r),
                                   (int)MOQ_OK);
@@ -291,21 +299,29 @@ int main(void)
             moq_endpoint_cfg_t *old = (moq_endpoint_cfg_t *)raw;
             /* Sized init writes exactly old_size bytes -- never the new field. */
             moq_endpoint_cfg_init_sized(old, old_size);
-            MOQ_TEST_CHECK_EQ_U64(old->struct_size, (uint64_t)old_size);
-            old->url = B("https://relay.example/moq");
+            uint32_t written_size;
+            memcpy(&written_size, raw, sizeof(written_size));
+            MOQ_TEST_CHECK_EQ_U64(written_size, (uint64_t)old_size);
+            moq_bytes_t url = B("https://relay.example/moq");
+            memcpy((uint8_t *)raw + offsetof(moq_endpoint_cfg_t, url),
+                   &url, sizeof(url));
 
             moq_endpoint_resolved_t r;
             /* wt_profile behavior is unchanged at this size: it is fully
              * covered, so an EXPLICIT profile is still READ and still rejected
              * on a backend that cannot select a dialect (AUTO -> picoquic).
              * That reject is also what proves the field is read here. */
-            old->wt_profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+            uint32_t profile = (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT;
+            memcpy((uint8_t *)raw + offsetof(moq_endpoint_cfg_t, wt_profile),
+                   &profile, sizeof(profile));
             MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r),
                                   (int)MOQ_ERR_UNSUPPORTED);
 
             /* And with no explicit selection it resolves, with the new field
              * absent -> the backend's own default. */
-            old->wt_profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+            profile = (uint32_t)MOQ_WT_PROFILE_BACKEND_DEFAULT;
+            memcpy((uint8_t *)raw + offsetof(moq_endpoint_cfg_t, wt_profile),
+                   &profile, sizeof(profile));
             MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(old, &r),
                                   (int)MOQ_OK);
             MOQ_TEST_CHECK_EQ_U64(r.wt_profile,

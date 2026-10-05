@@ -133,24 +133,17 @@ if(MOQ_BUILD_TESTS)
     # Out-of-tree consumer smoke test
     set(_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
-    set(_consumer_extra "")
-    if(MOQ_PICOQUIC_SOURCE_DIR)
-        string(APPEND _consumer_extra
-            " -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}'")
-    endif()
-    if(MOQ_PICOTLS_PREFIX)
-        string(APPEND _consumer_extra
-            " -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}'")
-    endif()
+    include(${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake)
+    include(${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake)
+    set(_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+    moq_write_consumer_context("${_consumer_context}")
     add_test(NAME cpp_consumer
-        COMMAND ${CMAKE_COMMAND} -E env bash -c
-            "set -e; \
-             '${CMAKE_COMMAND}' -E rm -rf '${_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -S '${_consumer_src}' -B '${_consumer_bld}' \
-                 -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
-                 -DCMAKE_CXX_COMPILER='${CMAKE_CXX_COMPILER}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'\
-                 ${_consumer_extra} && \
-             '${CMAKE_COMMAND}' --build '${_consumer_bld}' && \
-             '${_consumer_bld}/moq_consumer_test'")
+        COMMAND ${CMAKE_COMMAND}
+            "-DSRC=${_consumer_src}" "-DWORK=${_consumer_bld}"
+            "-DBUILD=${PROJECT_BINARY_DIR}"
+            "-DCONSUMER_CONTEXT=${_consumer_context}"
+            "-DPICOQUIC_SOURCE_DIR=${MOQ_PICOQUIC_SOURCE_DIR}"
+            "-DPICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_test.cmake")
+    moq_test_reject_consumer_warnings(cpp_consumer)
 endif()

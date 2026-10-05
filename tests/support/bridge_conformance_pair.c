@@ -7,7 +7,7 @@
  */
 
 #include "bridge_conformance_pair.h"
-#include "fake_endpoint.h"
+#include "held_bridge_driver.h"
 #include <moq/moq.h>
 #include <moq/transport_bridge.h>
 #include <stdlib.h>
@@ -91,7 +91,7 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
                 }
             } else {
                 /* Uni stream */
-                rc = moq_transport_bridge_on_peer_uni_bytes(
+                rc = held_bridge_uni_bytes(
                     to_bridge, o->stream_id,
                     o->data, o->data_len, o->fin, ctx->now);
             }
@@ -106,7 +106,7 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
         }
 
         case FAKE_OP_RESET:
-            moq_transport_bridge_on_peer_stream_reset(
+            held_bridge_reset(
                 to_bridge, o->stream_id, o->error_code, ctx->now);
             delivered = true;
             break;
@@ -119,7 +119,7 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
 
         case FAKE_OP_ABORT:
             /* the whole-stream abort reaches the peer as BOTH signals */
-            moq_transport_bridge_on_peer_stream_reset(
+            held_bridge_reset(
                 to_bridge, o->stream_id, o->error_code, ctx->now);
             moq_transport_bridge_on_peer_stop_sending(
                 to_bridge, o->stream_id, o->error_code, ctx->now);
@@ -133,7 +133,7 @@ static bool deliver_ops(bridge_pair_ctx_t *ctx,
             break;
 
         case FAKE_OP_CLOSE:
-            moq_transport_bridge_on_transport_close(
+            held_bridge_close(
                 to_bridge, o->error_code, ctx->now);
             delivered = true;
             break;
@@ -182,12 +182,16 @@ static moq_adapter_pair_pump_result_t bp_pump_once(void *ctx,
     bridge_pair_ctx_t *bp = (bridge_pair_ctx_t *)ctx;
     bp->now = now_us;
     bool progress = false;
+    size_t held_before = held_bridge_driver(bp->client_bridge)->input.count +
+                         held_bridge_driver(bp->server_bridge)->input.count;
 
-    moq_transport_bridge_service(bp->client_bridge, now_us);
+    held_bridge_service(bp->client_bridge, now_us);
     progress |= deliver_ops(bp, &bp->client_ep, bp->server_bridge, true);
 
-    moq_transport_bridge_service(bp->server_bridge, now_us);
+    held_bridge_service(bp->server_bridge, now_us);
     progress |= deliver_ops(bp, &bp->server_ep, bp->client_bridge, false);
+    progress |= held_before != held_bridge_driver(bp->client_bridge)->input.count +
+                               held_bridge_driver(bp->server_bridge)->input.count;
 
     if (moq_transport_bridge_is_fatal(bp->client_bridge) ||
         moq_transport_bridge_is_fatal(bp->server_bridge)) {
@@ -329,8 +333,8 @@ static int bp_inject_bidi_fin(void *ctx, moq_adapter_pair_side_t from_side)
 static void bp_destroy(void *ctx)
 {
     bridge_pair_ctx_t *bp = (bridge_pair_ctx_t *)ctx;
-    moq_transport_bridge_destroy(bp->client_bridge);
-    moq_transport_bridge_destroy(bp->server_bridge);
+    held_bridge_destroy(bp->client_bridge);
+    held_bridge_destroy(bp->server_bridge);
     moq_session_destroy(bp->client_session);
     moq_session_destroy(bp->server_session);
     free(bp);
@@ -387,18 +391,18 @@ moq_adapter_pair_t bridge_conformance_create(void)
     bp->client_control_sid = UINT64_MAX;
     bp->server_control_sid = UINT64_MAX;
 
-    fake_endpoint_init(&bp->client_ep, 1000, 2000);
-    fake_endpoint_init(&bp->server_ep, 3000, 4000);
+    held_endpoint_init(&bp->client_ep, 1000, 2000);
+    held_endpoint_init(&bp->server_ep, 3000, 4000);
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
 
-    if (moq_transport_bridge_create(&bcfg, bp->client_session,
+    if (held_bridge_create(&bcfg, bp->client_session,
             &bp->client_ep.vtable, &bp->client_ep,
             &bp->client_bridge) < 0)
         goto fail;
 
-    if (moq_transport_bridge_create(&bcfg, bp->server_session,
+    if (held_bridge_create(&bcfg, bp->server_session,
             &bp->server_ep.vtable, &bp->server_ep,
             &bp->server_bridge) < 0)
         goto fail;
@@ -418,8 +422,8 @@ moq_adapter_pair_t bridge_conformance_create(void)
     return pair;
 
 fail:
-    if (bp->client_bridge) moq_transport_bridge_destroy(bp->client_bridge);
-    if (bp->server_bridge) moq_transport_bridge_destroy(bp->server_bridge);
+    if (bp->client_bridge) held_bridge_destroy(bp->client_bridge);
+    if (bp->server_bridge) held_bridge_destroy(bp->server_bridge);
     if (bp->client_session) moq_session_destroy(bp->client_session);
     if (bp->server_session) moq_session_destroy(bp->server_session);
     free(bp);

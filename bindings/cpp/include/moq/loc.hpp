@@ -46,10 +46,10 @@ struct headers {
     uint64_t timescale              = 0;
 
     bool                has_video_frame_marking = false;
-    video_frame_marking video_frame_marking{};
+    moq::loc::video_frame_marking video_frame_marking{};
 
     bool        has_audio_level = false;
-    audio_level audio_level{};
+    moq::loc::audio_level audio_level{};
 
     bool       has_video_config = false;
     bytes_view video_config{};

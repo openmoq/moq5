@@ -145,6 +145,43 @@ MOQ_API void moq_pico_wt_conn_notify_transport_closed(
  * automatic connection MAX_DATA advance is anchored on delivery, so freezing
  * every stream stops delivery and thereby stops the connection-level advance.
  *
+ * Receive admission: the adapter declares MOQ_TRANSPORT_CAP_HOLD_INPUT. When
+ * the session has no free receive entry for a NEW peer data stream, the
+ * bridge refuses that stream's chunk (MOQ_ERR_INPUT_NOT_CONSUMED) instead of
+ * letting the session STOP it unparsed or discard it; the adapter keeps
+ * exactly that chunk (bytes and FIN) in the stream's retention buffer under
+ * the same window budget, withholds the stream's credit, queues later bytes
+ * and a later FIN behind it in order, and redelivers it from the service
+ * sweep once the session can admit a stream again -- refused again (another
+ * stream took the entry first) it is kept as is, losslessly. Retention
+ * memory failure or a window overrun is reported through the adapter's
+ * existing transport-error path (PICO_WT_INBOUND_FATAL_CODE), never as a
+ * silent acceptance.
+ *
+ * Retained memory. The unconditional bound is what the adapter actually
+ * allocates: the sum of the retention-buffer capacities of the live receive
+ * entries (each never exceeding that stream's budget; released when the
+ * stream retires or the bytes are replayed) plus the receive table (grown by
+ * doubling, slots reused but not returned before the connection is
+ * destroyed, so its high-water capacity is retained) plus per-entry
+ * metadata. Bytes the session retained under its own WOULD_BLOCK are session
+ * memory, and bytes picoquic/h3zero hold before the callback are the
+ * provider's; neither is counted here. The budget is the QUIC stream window,
+ * which WebTransport framing shares, so retained WT payload per stream is at
+ * most that window. A tighter maximum follows from the caller's own
+ * configuration, per category: peer unidirectional WT streams are bounded by
+ * initial_max_stream_data_uni times the number of such streams picoquic lets
+ * the peer keep open at once (initial_max_stream_id_unidir governs
+ * concurrency, not lifetime: picoquic re-credits a stream as each completes);
+ * peer-initiated bidirectional streams by initial_max_stream_data_bidi_remote
+ * and initial_max_stream_id_bidir; locally initiated bidirectional streams
+ * (request streams, whose receive half this adapter also tracks) by
+ * initial_max_stream_data_bidi_local times however many such streams the
+ * PEER's MAX_STREAMS allows this endpoint to open, which is not under this
+ * endpoint's control. These are caller-configured values (picoquic's
+ * defaults, or what the managed facade or the application stamped); there
+ * is no fixed attach-wide constant under arbitrary caller settings.
+ *
  * Caller configuration
  * --------------------
  * picoquic_set_max_data_control() MUST NOT be enabled on a picoquic context

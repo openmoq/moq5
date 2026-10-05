@@ -13,13 +13,13 @@
 #   2. installed contract: install the shared tree and run the install
 #      consumer, which does find_package(... COMPONENTS adapter-msquic
 #      adapter-msquic-managed) against the relocated shared package and
-#      links BOTH components — proving the INTERFACE managed target resolves
+#      links the managed component — proving the INTERFACE managed target resolves
 #      to the one installed dylib with no duplicate/ambiguous ownership.
 #
-# Args (-D): SRC (libmoq source root), WORK (scratch dir); optional
-# MSQUIC_DIR_HINT / MSQUIC_ROOT_HINT / C_COMPILER forwarded discovery hints.
+# Args (-D): SRC (libmoq source root), WORK (scratch dir), CONSUMER_CONTEXT
+# (producer preload); optional MSQUIC_DIR_HINT / MSQUIC_ROOT_HINT discovery hints.
 
-foreach(_v SRC WORK)
+foreach(_v SRC WORK CONSUMER_CONTEXT)
     if(NOT DEFINED ${_v})
         message(FATAL_ERROR "pass -D${_v}=<path>")
     endif()
@@ -27,6 +27,9 @@ endforeach()
 
 set(_tree "${WORK}/shared-tree")
 file(REMOVE_RECURSE "${_tree}")
+
+include("${CMAKE_CURRENT_LIST_DIR}/../../../tests/cmake/RejectConsumerWarnings.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/consumer_environment.cmake")
 
 set(_fwd "")
 if(DEFINED MSQUIC_DIR_HINT AND NOT MSQUIC_DIR_HINT STREQUAL "" AND
@@ -36,14 +39,10 @@ endif()
 if(DEFINED MSQUIC_ROOT_HINT AND NOT MSQUIC_ROOT_HINT STREQUAL "")
     list(APPEND _fwd "-DMOQ_MSQUIC_ROOT=${MSQUIC_ROOT_HINT}")
 endif()
-if(DEFINED C_COMPILER AND NOT C_COMPILER STREQUAL "")
-    list(APPEND _fwd "-DCMAKE_C_COMPILER=${C_COMPILER}")
-endif()
-
 # A shared tree trimmed to core + the MsQuic adapter/managed component, so
 # the install below is self-consistent and the lane stays bounded.
-execute_process(
-    COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_tree}"
+moq_consumer_execute(
+    COMMAND ${CMAKE_COMMAND} -C "${CONSUMER_CONTEXT}" -S "${SRC}" -B "${_tree}"
         -DBUILD_SHARED_LIBS=ON
         -DMOQ_BUILD_TESTS=ON
         -DMOQ_BUILD_SIM=OFF
@@ -60,7 +59,7 @@ endif()
 # Build the shared tree. Pre-fix this fails to link the managed shared
 # object on the hidden helper; the fix makes the two units share the base
 # dylib so it resolves.
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} --build "${_tree}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
 if(NOT _rc EQUAL 0)
@@ -69,8 +68,9 @@ endif()
 
 # 1. Build-tree consumer: prove the shared object loads and both public
 #    surfaces resolved at runtime.
-execute_process(
-    COMMAND "${_tree}/adapters/msquic/test_msquic_public_compile"
+msquic_consumer_environment(_env)
+moq_consumer_execute(
+    COMMAND ${_env} "${_tree}/adapters/msquic/test_msquic_public_compile"
     RESULT_VARIABLE _rc)
 if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "shared managed build-tree consumer run failed: ${_rc}")
@@ -79,12 +79,27 @@ endif()
 # 2. Installed contract: run the install consumer against the shared tree.
 #    It installs the shared package to a scratch prefix, then builds and
 #    runs the both-component consumer against it.
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_CTEST_COMMAND} --test-dir "${_tree}"
-        -R "^msquic_install_consumer$" --output-on-failure
+        -R "^msquic_install_consumer$" -V
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
 if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "shared install consumer failed:\n${_out}")
 endif()
 
+# Bind the nested configure's provider to the original parent's artifact too.
+moq_consumer_execute(
+    COMMAND ${CMAKE_COMMAND}
+        "-DBUILD=${_tree}"
+        "-DSRC=${SRC}/adapters/msquic/tests/consumer"
+        "-DWORK=${WORK}/parent-bound-consumer"
+        "-DMSQUIC_RUNTIME_FILE=${MSQUIC_RUNTIME_FILE}"
+        "-DMSQUIC_DIR_HINT=${MSQUIC_DIR_HINT}"
+        "-DMSQUIC_ROOT_HINT=${MSQUIC_ROOT_HINT}"
+        "-DCONSUMER_CONTEXT=${CONSUMER_CONTEXT}"
+        -P "${SRC}/adapters/msquic/tests/consumer_install.cmake"
+    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR "parent-bound shared consumer failed:\n${_out}")
+endif()
 message(STATUS "msquic_managed_shared_link: OK")

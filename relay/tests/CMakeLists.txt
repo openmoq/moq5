@@ -175,6 +175,10 @@ if(TARGET moq::sim)
         moq::sim moq-relay-policy)
     moqr_test_warnings(test_relay_session_binding)
     add_test(NAME relay_session_binding COMMAND test_relay_session_binding)
+    # Core contract RED (fetcher-side late response stream after cancel):
+    # its own entry so the ordinary suite stays green while it is reported.
+    add_test(NAME relay_core_red_cancel_after_stop
+        COMMAND test_relay_session_binding --core-red-cancel-after-stop)
     set_tests_properties(relay_session_binding PROPERTIES TIMEOUT 120)
 
     add_executable(test_relay_lifecycle test_relay_lifecycle.c)
@@ -280,9 +284,13 @@ if(Python3_Interpreter_FOUND AND UNIX AND MOQR_SDK_CXX)
         ${CMAKE_CURRENT_SOURCE_DIR}/check_sdk_options.py
         --source ${PROJECT_SOURCE_DIR} --cmake ${CMAKE_COMMAND} --cc ${CMAKE_C_COMPILER})
     set_tests_properties(relay_sdk_options PROPERTIES TIMEOUT 90 LABELS "relay;boundary")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+    set(_sdk_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+    moq_write_consumer_context("${_sdk_consumer_context}")
     add_test(NAME relay_sdk_package COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_sdk_package.py
         --build ${CMAKE_BINARY_DIR} --source ${CMAKE_CURRENT_SOURCE_DIR}/..
+        --context "${_sdk_consumer_context}"
         --libdir ${CMAKE_INSTALL_LIBDIR} --includedir ${CMAKE_INSTALL_INCLUDEDIR}
         --cmake ${CMAKE_COMMAND} --cc ${CMAKE_C_COMPILER} --cxx ${MOQR_SDK_CXX}
         --runtime $<BOOL:${MOQ_BUILD_RELAY_RUNTIME}>

@@ -133,10 +133,8 @@ int main()
         MOQ_CHECK(r.ok());
         auto buf = std::move(*r);
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wself-assign-overloaded"
-        buf = buf;
-#pragma GCC diagnostic pop
+        auto &same = buf;
+        buf = same;
 
         MOQ_CHECK(buf.data()[0] == 7);
         MOQ_CHECK(moq_rcbuf_refcount(buf.raw()) == 1);

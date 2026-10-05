@@ -2853,20 +2853,28 @@ int main(void)
         MOQ_TEST_CHECK_EQ_SIZE(c->fetch_cancel_tomb_count, (size_t)1);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
 
-        /* Drain the queue and re-drive the receive: the deferred STOP now queues
-         * and the tombstone is consumed on the retry path. */
-        { moq_action_t a; while (moq_session_poll_actions(c, &a, 1) > 0)
-              moq_action_cleanup(&a); }
+        /* Draining the queue returns action capacity: the deferred STOP is
+         * queued by that drain itself (no further input on the stream) and
+         * the tombstone is consumed then, exactly once. */
+        int stops = 0;
+        { moq_action_t a; while (moq_session_poll_actions(c, &a, 1) > 0) {
+              if (a.kind == MOQ_ACTION_STOP_DATA &&
+                  a.u.stop_data.stream_ref._v == dref._v) stops++;
+              moq_action_cleanup(&a);
+          } }
+        MOQ_TEST_CHECK_EQ_INT(stops, 1);
+        MOQ_TEST_CHECK_EQ_SIZE(c->fetch_cancel_tomb_count, (size_t)0);
+
+        /* The bridge's empty re-drive lands on the stopped entry: no second
+         * STOP, nothing else queued. */
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_bytes(c, dref, NULL, 0,
             false, 3000), (int)MOQ_OK);
-
-        bool saw_stop = false;
         { moq_action_t acts[8]; size_t na = moq_session_poll_actions(c, acts, 8);
           for (size_t i = 0; i < na; i++) {
-              if (acts[i].kind == MOQ_ACTION_STOP_DATA) saw_stop = true;
+              if (acts[i].kind == MOQ_ACTION_STOP_DATA) stops++;
               moq_action_cleanup(&acts[i]);
           } }
-        MOQ_TEST_CHECK(saw_stop);
+        MOQ_TEST_CHECK_EQ_INT(stops, 1);
         MOQ_TEST_CHECK_EQ_SIZE(c->fetch_cancel_tomb_count, (size_t)0);
 
         for (size_t i = 0; i < sv_na; i++) moq_action_cleanup(&sv_acts[i]);

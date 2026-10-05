@@ -338,6 +338,26 @@ if(MOQ_BUILD_TESTS)
         PRIVATE moq::core ${_adapter_tls_link})
     add_test(NAME adapter_backpressure COMMAND test_adapter_backpressure)
 
+    # Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): the fetcher attached
+    # to the adapter through the real bridge, picoquic stubbed, a raw
+    # publisher over the fake transport endpoint relayed in. Recompiles the
+    # adapter source with MOQ_PICOQUIC_TESTING for the capability and
+    # receive-state seams; no seam symbol exists in the shipped library.
+    add_executable(test_pq_hold_input
+        tests/test_pq_hold_input.c moq_picoquic.c picoquic_endpoint.c
+        ../common/moq_pq_send_queue.c)
+    target_compile_definitions(test_pq_hold_input PRIVATE
+        MOQ_BUILDING MOQ_PICOQUIC_TESTING)
+    target_include_directories(test_pq_hold_input PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/support
+        ${PROJECT_SOURCE_DIR}/tests/support
+        $<TARGET_PROPERTY:${_PQ},INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(test_pq_hold_input
+        PRIVATE moq::core ${_adapter_tls_link})
+    add_test(NAME pq_hold_input COMMAND test_pq_hold_input)
+
     add_executable(test_pq_conformance
         tests/test_pq_conformance.c
         tests/support/fake_pq_pair.c
@@ -403,6 +423,23 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME pq_sim_flow_control COMMAND test_pq_sim_flow_control)
         set_tests_properties(pq_sim_flow_control PROPERTIES TIMEOUT 60)
+    endif()
+
+    # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
+    # configures scratch trees and reads their generated link lines, so it is
+    # independent of the host linker's warnings.
+    if(MOQ_PICOQUIC_SOURCE_DIR)
+        add_test(NAME picoquic_source_mode_link_policy
+            COMMAND ${CMAKE_COMMAND}
+                -DSRC=${CMAKE_SOURCE_DIR}
+                "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/source-mode link-policy work"
+                "-DPQ_SRC=${MOQ_PICOQUIC_SOURCE_DIR}"
+                "-DPTLS_PREFIX=${MOQ_PICOTLS_PREFIX}"
+                "-DC_COMPILER=${CMAKE_C_COMPILER}"
+                "-DCXX_COMPILER=${CMAKE_CXX_COMPILER}"
+                "-DGENERATOR=${CMAKE_GENERATOR}"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/source_mode_link_policy.cmake)
+        set_tests_properties(picoquic_source_mode_link_policy PROPERTIES TIMEOUT 900)
     endif()
 endif()
 
@@ -643,6 +680,13 @@ endif()
 if(MOQ_BUILD_TESTS)
     set(_adapter_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_adapter_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
+    set(_adapter_consumer_deps "")
+    foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
+                          OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+        if(${_dep})
+            string(APPEND _adapter_consumer_deps " -D${_dep}='${${_dep}}'")
+        endif()
+    endforeach()
     add_test(NAME adapter_consumer
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
@@ -652,7 +696,15 @@ if(MOQ_BUILD_TESTS)
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' && \
+                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
+                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
+                 -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
+                 -DMOQ_CONSUMER_WARNINGS_AS_ERRORS='${MOQ_WARNINGS_AS_ERRORS}' \
+                 ${_adapter_consumer_deps} && \
              '${CMAKE_COMMAND}' --build '${_adapter_consumer_bld}' && \
              '${_adapter_consumer_bld}/moq_adapter_consumer_test'")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+    moq_test_reject_consumer_warnings(adapter_consumer)
 endif()

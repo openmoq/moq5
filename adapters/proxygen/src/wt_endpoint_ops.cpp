@@ -204,13 +204,31 @@ static moq_transport_result_t ep_close(void *ctx, uint64_t code,
 
 /* -- Init ----------------------------------------------------------- */
 
+#ifdef MOQ_PROXYGEN_WT_TESTING
+/* Test-only: overrides whether the endpoint advertises
+ * MOQ_TRANSPORT_CAP_HOLD_INPUT (-1 = the adapter's own setting). Compiled only
+ * into test builds that define MOQ_PROXYGEN_WT_TESTING. */
+static int g_test_hold_input = -1;
+void wt_test_set_hold_input(int mode) { g_test_hold_input = mode; }
+#endif
+
 void wt_endpoint_ops_init(moq_transport_endpoint_ops_t *ops,
                            wt_endpoint_ctx_t *ctx,
                            proxygen::WebTransport *wt)
 {
     *ops = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
+    /* HOLD_INPUT: the adapter keeps a refused peer uni chunk (and its FIN)
+     * and redelivers it unchanged once the session can admit again; see
+     * the held-read handling in wt_adapter.cpp. */
     ops->capabilities = MOQ_TRANSPORT_CAP_DATAGRAM |
-                         MOQ_TRANSPORT_CAP_WRITE_PAYLOAD;
+                         MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
+                         MOQ_TRANSPORT_CAP_HOLD_INPUT;
+#ifdef MOQ_PROXYGEN_WT_TESTING
+    if (g_test_hold_input == 1)
+        ops->capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
+    else if (g_test_hold_input == 0)
+        ops->capabilities &= ~(uint32_t)MOQ_TRANSPORT_CAP_HOLD_INPUT;
+#endif
     ops->open_uni        = ep_open_uni;
     ops->open_bidi       = ep_open_bidi;
     ops->write           = ep_write;

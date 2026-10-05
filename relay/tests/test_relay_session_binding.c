@@ -181,6 +181,11 @@ static uint32_t g_test_server_max_open_subgroups = 0;
  * PREMATURELY while a correctly-clocked one still lingers. */
 static uint32_t g_test_linger_us = 0;
 
+/* Optional SimPair trace hook installed on every pair rig_connect creates
+ * while it is set (diagnostics for the forwarding rows). */
+static moq_sim_trace_fn g_test_trace_fn = NULL;
+static void *g_test_trace_ctx = NULL;
+
 static conn_t *
 rig_connect(rig_t *r, moq_version_t version)
 {
@@ -213,6 +218,8 @@ rig_connect(rig_t *r, moq_version_t version)
     cfg.client_initial_request_capacity = init_cap;
     cfg.server_send_request_capacity = true;
     cfg.server_initial_request_capacity = init_cap;
+    cfg.trace_fn = g_test_trace_fn;
+    cfg.trace_ctx = g_test_trace_ctx;
     if (moq_simpair_create(&cfg, &cn->sp) != MOQ_OK) {
         return NULL;
     }
@@ -313,6 +320,10 @@ static void *g_test_authorize_ctx = NULL;
 /* 0 = leave the cfg default; a tiny value forces grant_reserve to fail on the
  * byte budget so the reserve-capacity fail-closed path is exercised. */
 static uint32_t g_test_grant_bytes = 0;
+/* 0 = leave the defaults: the bind's aggregate fetch-forwarding byte pool and
+ * the core's concurrent-fetch pool (which sizes the forwarding transactions). */
+static uint64_t g_test_fetch_forward_bytes = 0;
+static uint32_t g_test_max_fetches = 0;
 
 static moqr_result_t
 rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
@@ -338,6 +349,9 @@ rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
     if (g_test_grant_bytes != 0) {
         cfg.grant_bytes = g_test_grant_bytes;
     }
+    if (g_test_max_fetches != 0) {
+        cfg.max_fetches = g_test_max_fetches;
+    }
     if (moqr_core_create(&cfg, &r->core) != MOQR_OK) {
         moqr_trace_destroy(r->trace);
         return MOQR_ERR_NOMEM;
@@ -351,6 +365,7 @@ rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t bind_usubs,
     bcfg.max_publishes = bind_pubs;
     bcfg.max_open_subgroups = g_test_max_open_subgroups; /* 0 = default */
     bcfg.request_grant_window = g_test_grant_window;      /* 0 = default */
+    bcfg.fetch_forward_bytes = g_test_fetch_forward_bytes; /* 0 = default */
     if (moqr_bind_create(&bcfg, &r->bind) != MOQR_OK) {
         moqr_core_destroy(r->core);
         moqr_trace_destroy(r->trace);
@@ -459,6 +474,7 @@ typedef struct peer_state {
     uint64_t           ts_error_code;
     int                ns_rejected;
     uint64_t           ns_rejected_code;
+    char               ns_rejected_reason[64];
     int                ns_sub_error;
     uint64_t           ns_sub_error_code;
     int                fetch_error;
@@ -12682,9 +12698,2691 @@ publish_namespace_newest_wins(moq_version_t version)
     return f + rig.failures;
 }
 
-int
-main(void)
+
+/* ---- Retained generation fixtures shared by the forwarding rows ---------- *
+ * (0,0) base bytes and (0,1) delta bytes of the catalog generation an origin
+ * retains, as exact seeds a downstream observation can check against. */
+#define BOOT_BASE_LEN  48
+#define BOOT_DELTA_LEN 24
+
+static void
+boot_fill(uint8_t *buf, size_t len, uint8_t seed)
 {
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = (uint8_t)(seed + (uint8_t)i);
+    }
+}
+
+static bool
+boot_payload_is(const moq_rcbuf_t *pl, uint8_t seed, size_t len)
+{
+    if (pl == NULL || moq_rcbuf_len(pl) != len) {
+        return false;
+    }
+    uint8_t want[64];
+    boot_fill(want, len, seed);
+    return memcmp(moq_rcbuf_data(pl), want, len) == 0;
+}
+
+/* ---- Forwarded Joining FETCH over the production binding -------------------- *
+ * A raw-session ORIGIN announces boot/cat and answers the relay's upstream
+ * SUBSCRIBE (catalog Largest {0, largest_object}) and its forwarded FETCH by
+ * script; raw-session DOWNSTREAM peers subscribe LargestObject and issue the
+ * Relative Joining FETCH(0) the catalog bootstrap uses. Every row asserts the
+ * exact downstream ledger, the origin's observed requests/cancellations, and
+ * the binding's forwarding gauges (transactions and pool bytes back to zero;
+ * the counting allocator back to zero after destroy). */
+
+#define JF_LEDGER 40
+#define JF_MAX_REQ 8
+
+typedef struct jf_origin {
+    conn_t            *cn;
+    bool               gone;          /* closed at the binding: not drained */
+    uint64_t           largest_object;/* catalog SUBSCRIBE_OK Largest {0, n} */
+    int                ns_accepted;
+    int                sub_requests;
+    moq_subscription_t cat_sub, live_sub;
+    bool               cat_seen, live_seen;
+    int                fetch_requests;
+    moq_fetch_t        req[JF_MAX_REQ];
+    uint64_t           req_sg[JF_MAX_REQ], req_so[JF_MAX_REQ];
+    uint64_t           req_eg[JF_MAX_REQ], req_eo[JF_MAX_REQ];
+    int                cancelled;
+} jf_origin_t;
+
+typedef struct jf_down {
+    conn_t            *cn;
+    moq_subscription_t sh;            /* the catalog subscription */
+    bool               sub_ok;
+    int                sub_err;
+    int                done;
+    moq_subscription_t live_sh;
+    bool               live_ok;
+    int                live_objects;
+    bool               live_exact;
+    moq_fetch_t        fh;
+    bool               fh_set;
+    int                ok, objects, gaps, complete, error, reset, foreign;
+    uint64_t           error_code, reset_code;
+    bool               can_retry;
+    uint8_t            reason[32];
+    size_t             reason_len;
+    bool               ok_eot;
+    uint64_t           ok_eg, ok_eo;
+    uint64_t           obj_g[8], obj_o[8];
+    size_t             obj_len[8];
+    uint8_t            obj_first[8];
+    bool               obj_exact[8];
+    size_t             props_len[8];
+    bool               props_exact[8];
+    int                ledger[JF_LEDGER];
+    int                ledger_n;
+    bool               overflow;
+    int                closed;
+    uint64_t           close_code;
+    char               close_reason[48];
+    int                ns_accepted;     /* NAMESPACE_ACCEPTED for the peer's own announces */
+    int                ns_rejected;
+    uint64_t           ns_rejected_code;
+    char               ns_rejected_reason[64];
+    /* Further requests this peer issued besides fh: their FETCH_ERROR counts. */
+    moq_fetch_t        req_fh[4];
+    int                req_err[4];
+    int                req_n;
+} jf_down_t;
+
+typedef struct jf {
+    ca_t        a;
+    rig_t       rig;
+    jf_origin_t o;
+    jf_down_t   d[4];
+    int         n_down;
+    jf_down_t   live;            /* live-path control subscriber (own conn) */
+    bool        has_live;
+    moq_version_t version;
+    const char *lbl;
+} jf_t;
+
+static const moq_bytes_t JF_NS[2] = { { (const uint8_t *)"boot", 4 },
+                                      { (const uint8_t *)"cat", 3 } };
+#define JF_KEY_LEN (4u + 3u + 7u)   /* "boot" "cat" "catalog": one owned copy */
+#define JF_PROPS_LEN 4u   /* two non-mandatory varint KVPs */
+
+static void
+jf_origin_drain(rig_t *r, jf_origin_t *o)
+{
+    if (o->gone) {
+        return;
+    }
+    moq_event_t evs[16];
+    size_t n;
+    while ((n = moq_session_poll_events(o->cn->peer, evs, 16)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            moq_event_t *ev = &evs[i];
+            switch (ev->kind) {
+            case MOQ_EVENT_NAMESPACE_ACCEPTED:
+                o->ns_accepted++;
+                break;
+            case MOQ_EVENT_SUBSCRIBE_REQUEST: {
+                const moq_subscribe_request_event_t *sq = &ev->u.subscribe_request;
+                bool is_cat = sq->track_name.len == 7 &&
+                              memcmp(sq->track_name.data, "catalog", 7) == 0;
+                o->sub_requests++;
+                moq_accept_subscribe_cfg_t ac;
+                moq_accept_subscribe_cfg_init(&ac);
+                ac.has_largest = true;
+                ac.largest_group = 0;
+                ac.largest_object = is_cat ? o->largest_object : 0;
+                R_CHECK(r, moq_session_accept_subscribe(o->cn->peer, sq->sub, &ac,
+                                                        r->now) == MOQ_OK);
+                if (is_cat) {
+                    o->cat_sub = sq->sub;
+                    o->cat_seen = true;
+                } else {
+                    o->live_sub = sq->sub;
+                    o->live_seen = true;
+                }
+                break;
+            }
+            case MOQ_EVENT_FETCH_REQUEST: {
+                const moq_fetch_request_event_t *fq = &ev->u.fetch_request;
+                if (o->fetch_requests < JF_MAX_REQ) {
+                    int k = o->fetch_requests;
+                    o->req[k] = fq->fetch;
+                    o->req_sg[k] = fq->start_group;
+                    o->req_so[k] = fq->start_object;
+                    o->req_eg[k] = fq->end_group;
+                    o->req_eo[k] = fq->end_object;
+                }
+                o->fetch_requests++;
+                break;
+            }
+            case MOQ_EVENT_FETCH_CANCELLED:
+                o->cancelled++;
+                break;
+            default:
+                break;
+            }
+            moq_event_cleanup(ev);
+        }
+    }
+}
+
+/* Well-formed object properties on both drafts: two non-mandatory KVPs with
+ * varint values (type 0x10 = object id, type 0x12 = 0x2A). */
+static void
+jf_props_fill(uint8_t *out, uint64_t oid)
+{
+    out[0] = 0x10;
+    out[1] = (uint8_t)(oid & 0x3F);
+    out[2] = 0x12;
+    out[3] = 0x2A;
+}
+
+static bool
+jf_props_is(const moq_rcbuf_t *pr, uint64_t oid)
+{
+    if (pr == NULL || moq_rcbuf_len(pr) != JF_PROPS_LEN) {
+        return false;
+    }
+    uint8_t want[JF_PROPS_LEN];
+    jf_props_fill(want, oid);
+    return memcmp(moq_rcbuf_data(pr), want, sizeof(want)) == 0;
+}
+
+static void
+jf_down_drain(rig_t *r, jf_down_t *d)
+{
+    (void)r;
+    moq_event_t evs[16];
+    size_t n;
+    while ((n = moq_session_poll_events(d->cn->peer, evs, 16)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            moq_event_t *ev = &evs[i];
+            bool fetch_item = false;
+            uint64_t h = 0;
+            switch (ev->kind) {
+            case MOQ_EVENT_SUBSCRIBE_OK:
+                if (d->fh_set == false && ev->u.subscribe_ok.sub._opaque == d->sh._opaque) {
+                    d->sub_ok = true;
+                } else if (ev->u.subscribe_ok.sub._opaque == d->live_sh._opaque) {
+                    d->live_ok = true;
+                } else if (ev->u.subscribe_ok.sub._opaque == d->sh._opaque) {
+                    d->sub_ok = true;
+                }
+                break;
+            case MOQ_EVENT_SUBSCRIBE_ERROR:
+                d->sub_err++;
+                break;
+            case MOQ_EVENT_SUBSCRIBE_DONE:
+                d->done++;
+                break;
+            case MOQ_EVENT_NAMESPACE_ACCEPTED:
+                d->ns_accepted++;
+                break;
+            case MOQ_EVENT_NAMESPACE_REJECTED: {
+                d->ns_rejected++;
+                d->ns_rejected_code = ev->u.namespace_rejected.error_code;
+                size_t n_ = ev->u.namespace_rejected.reason.len < sizeof(d->ns_rejected_reason) - 1
+                                ? ev->u.namespace_rejected.reason.len : sizeof(d->ns_rejected_reason) - 1;
+                if (n_) memcpy(d->ns_rejected_reason, ev->u.namespace_rejected.reason.data, n_);
+                d->ns_rejected_reason[n_] = '\0';
+                break;
+            }
+            case MOQ_EVENT_SESSION_CLOSED: {
+                const moq_session_closed_event_t *sc = &ev->u.closed;
+                d->closed++;
+                d->close_code = sc->code;
+                size_t n_ = sc->reason.len < sizeof(d->close_reason) - 1
+                                ? sc->reason.len : sizeof(d->close_reason) - 1;
+                if (n_ > 0) memcpy(d->close_reason, sc->reason.data, n_);
+                d->close_reason[n_] = '\0';
+                break;
+            }
+            case MOQ_EVENT_OBJECT_RECEIVED:
+                if (ev->u.object_received.sub._opaque == d->live_sh._opaque) {
+                    d->live_objects++;
+                    d->live_exact = ev->u.object_received.group_id == 1 &&
+                                    ev->u.object_received.object_id == 0 &&
+                                    boot_payload_is(ev->u.object_received.payload,
+                                                    0xC0, 32);
+                }
+                break;
+            case MOQ_EVENT_FETCH_OK:       fetch_item = true; h = ev->u.fetch_ok.fetch._opaque; break;
+            case MOQ_EVENT_FETCH_OBJECT:   fetch_item = true; h = ev->u.fetch_object.fetch._opaque; break;
+            case MOQ_EVENT_FETCH_GAP:      fetch_item = true; h = ev->u.fetch_gap.fetch._opaque; break;
+            case MOQ_EVENT_FETCH_COMPLETE: fetch_item = true; h = ev->u.fetch_complete.fetch._opaque; break;
+            case MOQ_EVENT_FETCH_ERROR:    fetch_item = true; h = ev->u.fetch_error.fetch._opaque; break;
+            case MOQ_EVENT_FETCH_RESET:    fetch_item = true; h = ev->u.fetch_reset.fetch._opaque; break;
+            default:
+                break;
+            }
+            if (fetch_item) {
+                int extra = -1;
+                for (int k = 0; k < d->req_n; k++) {
+                    if (d->req_fh[k]._opaque == h) extra = k;
+                }
+                if (extra >= 0) {
+                    if (ev->kind == MOQ_EVENT_FETCH_ERROR) d->req_err[extra]++;
+                } else if (!d->fh_set || h != d->fh._opaque) {
+                    d->foreign++;
+                } else {
+                    if (d->ledger_n < JF_LEDGER) {
+                        d->ledger[d->ledger_n++] = (int)ev->kind;
+                    } else {
+                        d->overflow = true;
+                    }
+                    switch (ev->kind) {
+                    case MOQ_EVENT_FETCH_OK:
+                        d->ok++;
+                        d->ok_eot = ev->u.fetch_ok.end_of_track;
+                        d->ok_eg = ev->u.fetch_ok.end_group;
+                        d->ok_eo = ev->u.fetch_ok.end_object;
+                        break;
+                    case MOQ_EVENT_FETCH_OBJECT: {
+                        const moq_fetch_object_event_t *fo = &ev->u.fetch_object;
+                        if (d->objects < 8) {
+                            int k = d->objects;
+                            d->obj_g[k] = fo->group_id;
+                            d->obj_o[k] = fo->object_id;
+                            d->obj_len[k] = fo->payload ? moq_rcbuf_len(fo->payload) : 0;
+                            d->obj_first[k] = d->obj_len[k] ? moq_rcbuf_data(fo->payload)[0] : 0;
+                            d->obj_exact[k] =
+                                fo->object_id == 0
+                                    ? boot_payload_is(fo->payload, 0xB0, BOOT_BASE_LEN)
+                                    : boot_payload_is(fo->payload, 0xD0, BOOT_DELTA_LEN);
+                            d->props_len[k] = fo->properties ? moq_rcbuf_len(fo->properties) : 0;
+                            d->props_exact[k] = jf_props_is(fo->properties, fo->object_id);
+                        }
+                        d->objects++;
+                        break;
+                    }
+                    case MOQ_EVENT_FETCH_GAP:      d->gaps++; break;
+                    case MOQ_EVENT_FETCH_COMPLETE: d->complete++; break;
+                    case MOQ_EVENT_FETCH_ERROR: {
+                        const moq_fetch_error_event_t *fe = &ev->u.fetch_error;
+                        d->error++;
+                        d->error_code = fe->error_code;
+                        d->can_retry = fe->can_retry;
+                        d->reason_len = fe->reason.len < sizeof(d->reason)
+                                            ? fe->reason.len : sizeof(d->reason);
+                        if (d->reason_len > 0) {
+                            memcpy(d->reason, fe->reason.data, d->reason_len);
+                        }
+                        break;
+                    }
+                    case MOQ_EVENT_FETCH_RESET:
+                        d->reset++;
+                        d->reset_code = ev->u.fetch_reset.error_code;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+            moq_event_cleanup(ev);
+        }
+    }
+}
+
+static void
+jf_cycle(jf_t *j)
+{
+    rig_cycle(&j->rig);
+    jf_origin_drain(&j->rig, &j->o);
+    for (int i = 0; i < j->n_down; i++) {
+        jf_down_drain(&j->rig, &j->d[i]);
+    }
+    if (j->has_live) {
+        jf_down_drain(&j->rig, &j->live);
+    }
+}
+
+static void
+jf_stats(jf_t *j, moqr_bind_fwd_debug_t *st)
+{
+    moqr_bind_debug_fwd_stats(j->rig.bind, st);
+}
+
+static void
+jf_subscribe_catalog(jf_t *j, jf_down_t *d)
+{
+    moq_subscribe_cfg_t sc;
+    memset(&sc, 0, sizeof(sc));
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+    sc.track_name = B("catalog");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    R_CHECK(&j->rig, moq_session_subscribe(d->cn->peer, &sc, j->rig.now, &d->sh) == MOQ_OK);
+}
+
+static void
+jf_subscribe_live(jf_t *j, jf_down_t *d)
+{
+    moq_subscribe_cfg_t sc;
+    memset(&sc, 0, sizeof(sc));
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+    sc.track_name = B("live");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    R_CHECK(&j->rig, moq_session_subscribe(d->cn->peer, &sc, j->rig.now, &d->live_sh) == MOQ_OK);
+}
+
+/* Relative Joining FETCH(0) on the catalog subscription (ascending). */
+static moq_result_t
+jf_join_ex(jf_t *j, jf_down_t *d, moq_group_order_t order)
+{
+    moq_fetch_cfg_t fc;
+    memset(&fc, 0, sizeof(fc));
+    moq_fetch_cfg_init(&fc);
+    fc.is_joining = true;
+    fc.joining_relative = true;
+    fc.joining_sub = d->sh;
+    fc.joining_start = 0;
+    fc.group_order = order;
+    memset(&d->fh, 0, sizeof(d->fh));
+    moq_result_t rc = moq_session_fetch(d->cn->peer, &fc, j->rig.now, &d->fh);
+    d->fh_set = rc == MOQ_OK;
+    return rc;
+}
+
+static void
+jf_join(jf_t *j, jf_down_t *d)
+{
+    R_CHECK(&j->rig, jf_join_ex(j, d, MOQ_GROUP_ORDER_ASCENDING) == MOQ_OK);
+}
+
+static void
+jf_reset_obs(jf_down_t *d)
+{
+    conn_t *cn = d->cn;
+    moq_subscription_t sh = d->sh, lsh = d->live_sh;
+    bool sub_ok = d->sub_ok, live_ok = d->live_ok;
+    memset(d, 0, sizeof(*d));
+    d->cn = cn;
+    d->sh = sh;
+    d->live_sh = lsh;
+    d->sub_ok = sub_ok;
+    d->live_ok = live_ok;
+}
+
+/* Rig + origin announce + n_down catalog subscriptions (each SUBSCRIBE_OK'd
+ * through the relay) + optional live-control subscriber on its own conn. */
+/* When set, jf_setup_ex fails the first JF_KEY_LEN-byte allocation while the
+ * catalog subscriptions are being established: the relay keeps the upstream
+ * subscription but could not retain its track key (no forwarding source). */
+static bool g_jf_setup_usub_key_oom = false;
+
+static bool
+jf_setup_ex(jf_t *j, moq_version_t version, int n_down, bool live_control,
+            uint64_t largest_object, bool origin_last)
+{
+    memset(j, 0, sizeof(*j));
+    ca_init(&j->a);
+    j->version = version;
+    j->lbl = version == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    if (rig_create(&j->rig, &j->a) != MOQR_OK) {
+        printf("FAIL: jf rig create\n");
+        return false;
+    }
+    /* Connection slot order is pump order: origin first by default; with
+     * origin_last the downstream peers' events are processed before the
+     * origin's in every pump. */
+    if (!origin_last) {
+        j->o.cn = rig_connect(&j->rig, version);
+    }
+    j->o.largest_object = largest_object;
+    j->n_down = n_down;
+    for (int i = 0; i < n_down; i++) {
+        j->d[i].cn = rig_connect(&j->rig, version);
+    }
+    if (origin_last) {
+        j->o.cn = rig_connect(&j->rig, version);
+    }
+    if (live_control) {
+        j->live.cn = rig_connect(&j->rig, version);
+        j->has_live = true;
+    }
+    if (j->o.cn == NULL || (live_control && j->live.cn == NULL)) {
+        printf("FAIL: jf rig connect\n");
+        return false;
+    }
+    for (int i = 0; i < n_down; i++) {
+        if (j->d[i].cn == NULL) {
+            printf("FAIL: jf rig connect (down %d)\n", i);
+            return false;
+        }
+    }
+    rig_pump(&j->rig, 4);
+    moq_publish_namespace_cfg_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+    moq_announcement_t ann;
+    R_CHECK(&j->rig, moq_session_publish_namespace(j->o.cn->peer, &pcfg, j->rig.now,
+                                                   &ann) == MOQ_OK);
+    for (int i = 0; i < 8 && j->o.ns_accepted == 0; i++) jf_cycle(j);
+    R_CHECK(&j->rig, j->o.ns_accepted == 1);
+    if (g_jf_setup_usub_key_oom) {
+        j->a.fail_size = JF_KEY_LEN;
+    }
+    for (int i = 0; i < n_down; i++) {
+        jf_subscribe_catalog(j, &j->d[i]);
+    }
+    if (live_control) {
+        jf_subscribe_live(j, &j->live);
+    }
+    bool all = false;
+    for (int i = 0; i < 16 && !all; i++) {
+        jf_cycle(j);
+        all = !live_control || j->live.live_ok;
+        for (int k = 0; k < n_down; k++) {
+            all = all && j->d[k].sub_ok;
+        }
+    }
+    j->a.fail_size = 0;
+    g_jf_setup_usub_key_oom = false;
+    R_CHECK(&j->rig, all);
+    R_CHECK(&j->rig, j->o.cat_seen == (n_down > 0));
+    R_CHECK(&j->rig, j->o.live_seen == live_control);
+    return j->rig.failures == 0;
+}
+
+static bool
+jf_setup(jf_t *j, moq_version_t version, int n_down, bool live_control,
+         uint64_t largest_object)
+{
+    return jf_setup_ex(j, version, n_down, live_control, largest_object, false);
+}
+
+/* One live object origin -> relay -> live-control subscriber, exact bytes:
+ * unrelated media progress is preserved whatever the forwarding rows did. */
+static void
+jf_live_control(jf_t *j)
+{
+    if (!j->has_live || j->o.gone) {
+        return;
+    }
+    moq_subgroup_cfg_t sgc;
+    moq_subgroup_cfg_init(&sgc);
+    sgc.group_id = 1;
+    sgc.subgroup_id = 0;
+    sgc.publisher_priority = 100;
+    moq_subgroup_handle_t sgh;
+    R_CHECK(&j->rig, moq_session_open_subgroup(j->o.cn->peer, j->o.live_sub, &sgc,
+                                               j->rig.now, &sgh) == MOQ_OK);
+    uint8_t body[32];
+    boot_fill(body, sizeof(body), 0xC0);
+    moq_rcbuf_t *pl = NULL;
+    R_CHECK(&j->rig, moq_rcbuf_create(&j->a.vt, body, sizeof(body), &pl) == MOQ_OK);
+    R_CHECK(&j->rig, moq_session_write_object(j->o.cn->peer, sgh, 0, pl, j->rig.now) == MOQ_OK);
+    moq_rcbuf_decref(pl);
+    R_CHECK(&j->rig, moq_session_close_subgroup(j->o.cn->peer, sgh, j->rig.now) == MOQ_OK);
+    for (int i = 0; i < 10 && j->live.live_objects == 0; i++) jf_cycle(j);
+    R_CHECK(&j->rig, j->live.live_objects == 1 && j->live.live_exact);
+}
+
+static int
+jf_teardown(jf_t *j, const char *row)
+{
+    moqr_bind_fwd_debug_t st;
+    jf_stats(j, &st);
+    R_CHECK(&j->rig, st.live == 0 && st.bytes_used == 0);
+    rig_destroy(&j->rig);
+    if (j->a.live != 0) {
+        printf("FAIL: %s %s leak live=%ld\n", row, j->lbl, j->a.live);
+        j->rig.failures++;
+    }
+    g_test_fetch_forward_bytes = 0;
+    g_test_max_fetches = 0;
+    g_test_max_actions = 0;
+    g_test_max_events = 0;
+    g_test_authorize = NULL;
+    g_test_authorize_ctx = NULL;
+    g_jf_setup_usub_key_oom = false;
+    if (j->rig.failures == 0) {
+        printf("PASS: %s %s\n", row, j->lbl);
+    }
+    return j->rig.failures;
+}
+
+/* Origin-side scripted answers on request k. Every call retries across
+ * cycles while the origin's own action queue refuses (never a relay path). */
+#define JF_ORIGIN_RETRY(j, expr, var)                                      \
+    do {                                                                  \
+        var = (expr);                                                     \
+        for (int r_ = 0; r_ < 8 && var == MOQ_ERR_WOULD_BLOCK; r_++) {    \
+            jf_cycle(j);                                                  \
+            var = (expr);                                                 \
+        }                                                                 \
+    } while (0)
+
+static void
+jf_origin_accept(jf_t *j, int k, uint64_t eg, uint64_t eo, bool eot, bool with_props)
+{
+    moq_accept_fetch_cfg_t ac;
+    moq_accept_fetch_cfg_init(&ac);
+    ac.end_of_track = eot;
+    ac.end_group = eg;
+    ac.end_object = eo;
+    static const uint8_t props[10] = { 0x10, 0x00, 0x12, 0x00, 0x14, 0x00,
+                                       0x16, 0x00, 0x18, 0x00 };   /* five varint KVPs */
+    if (with_props) {
+        ac.track_properties = (moq_bytes_t){ props, sizeof(props) };
+    }
+    moq_result_t rc;
+    JF_ORIGIN_RETRY(j, moq_session_accept_fetch(j->o.cn->peer, j->o.req[k], &ac, j->rig.now), rc);
+    R_CHECK(&j->rig, rc == MOQ_OK);
+}
+
+static moq_result_t
+jf_origin_write_raw(jf_t *j, int k, uint64_t g, uint64_t oid, uint8_t seed,
+                    size_t len, bool with_props)
+{
+    uint8_t body[256];
+    if (len > sizeof(body)) len = sizeof(body);
+    boot_fill(body, len, seed);
+    moq_rcbuf_t *pl = NULL, *pr = NULL;
+    if (moq_rcbuf_create(&j->a.vt, body, len, &pl) != MOQ_OK) {
+        return MOQ_ERR_NOMEM;
+    }
+    if (with_props) {
+        uint8_t props[JF_PROPS_LEN];
+        jf_props_fill(props, oid);
+        if (moq_rcbuf_create(&j->a.vt, props, sizeof(props), &pr) != MOQ_OK) {
+            moq_rcbuf_decref(pl);
+            return MOQ_ERR_NOMEM;
+        }
+    }
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.group_id = g;
+    oc.subgroup_id = 0;
+    oc.object_id = oid;
+    oc.publisher_priority = 100;
+    oc.payload = pl;
+    oc.properties = pr;
+    moq_result_t rc;
+    JF_ORIGIN_RETRY(j, moq_session_write_fetch_object(j->o.cn->peer, j->o.req[k], &oc, j->rig.now), rc);
+    moq_rcbuf_decref(pl);
+    if (pr) moq_rcbuf_decref(pr);
+    return rc;
+}
+
+/* The retained generation: (0,0) base bytes, (0,1) delta bytes (+ exact
+ * per-object properties on the delta when asked). */
+static void
+jf_origin_write_generation(jf_t *j, int k, bool with_props)
+{
+    R_CHECK(&j->rig, jf_origin_write_raw(j, k, 0, 0, 0xB0, BOOT_BASE_LEN, false) == MOQ_OK);
+    R_CHECK(&j->rig, jf_origin_write_raw(j, k, 0, 1, 0xD0, BOOT_DELTA_LEN, with_props) == MOQ_OK);
+}
+
+static void
+jf_origin_end(jf_t *j, int k)
+{
+    moq_result_t rc;
+    JF_ORIGIN_RETRY(j, moq_session_end_fetch(j->o.cn->peer, j->o.req[k], j->rig.now), rc);
+    R_CHECK(&j->rig, rc == MOQ_OK);
+}
+
+static void
+jf_origin_answer_exact(jf_t *j, int k, bool with_props)
+{
+    jf_origin_accept(j, k, 0, 2, false, false);
+    jf_origin_write_generation(j, k, with_props);
+    jf_origin_end(j, k);
+}
+
+static void
+jf_origin_reject(jf_t *j, int k, uint64_t code, const char *reason, bool can_retry,
+                 uint64_t retry_after_ms)
+{
+    moq_reject_fetch_cfg_t rj;
+    moq_reject_fetch_cfg_init(&rj);
+    rj.error_code = code;
+    rj.reason = B(reason);
+    rj.can_retry = can_retry;
+    rj.retry_after_ms = retry_after_ms;
+    moq_result_t rc;
+    JF_ORIGIN_RETRY(j, moq_session_reject_fetch(j->o.cn->peer, j->o.req[k], &rj, j->rig.now), rc);
+    R_CHECK(&j->rig, rc == MOQ_OK);
+}
+
+static void
+jf_wait_requests(jf_t *j, int n)
+{
+    for (int i = 0; i < 12 && j->o.fetch_requests < n; i++) jf_cycle(j);
+    R_CHECK(&j->rig, j->o.fetch_requests == n);
+}
+
+static void
+jf_wait_terminal(jf_t *j, jf_down_t *d)
+{
+    for (int i = 0; i < 16 && d->complete + d->error + d->reset == 0; i++) jf_cycle(j);
+}
+
+/* The exact bootstrap contract on one downstream: OK{eot=false, 0/2} ->
+ * (0,0) base -> (0,1) delta -> COMPLETE, nothing else, no foreign item. */
+static int
+jf_check_exact(jf_t *j, const jf_down_t *d, bool with_props, const char *label)
+{
+    int bad = 0;
+#define JF_EXPECT(cond)                                                   \
+    do {                                                                  \
+        if (!(cond)) {                                                    \
+            printf("FAIL: %s:%d: %s %s: %s\n", __FILE__, __LINE__, label,  \
+                   j->lbl, #cond);                                         \
+            bad++;                                                        \
+        }                                                                 \
+    } while (0)
+    JF_EXPECT(d->foreign == 0 && !d->overflow);
+    JF_EXPECT(d->ledger_n == 4);
+    JF_EXPECT(d->ledger_n >= 1 && d->ledger[0] == (int)MOQ_EVENT_FETCH_OK);
+    JF_EXPECT(d->ledger_n >= 2 && d->ledger[1] == (int)MOQ_EVENT_FETCH_OBJECT);
+    JF_EXPECT(d->ledger_n >= 3 && d->ledger[2] == (int)MOQ_EVENT_FETCH_OBJECT);
+    JF_EXPECT(d->ledger_n >= 4 && d->ledger[3] == (int)MOQ_EVENT_FETCH_COMPLETE);
+    JF_EXPECT(d->ok == 1 && d->error == 0 && d->reset == 0 && d->gaps == 0);
+    JF_EXPECT(!d->ok_eot && d->ok_eg == 0 && d->ok_eo == 2);
+    JF_EXPECT(d->objects == 2 && d->complete == 1);
+    JF_EXPECT(d->objects >= 1 && d->obj_g[0] == 0 && d->obj_o[0] == 0 &&
+              d->obj_len[0] == BOOT_BASE_LEN && d->obj_exact[0] && d->props_len[0] == 0);
+    JF_EXPECT(d->objects >= 2 && d->obj_g[1] == 0 && d->obj_o[1] == 1 &&
+              d->obj_len[1] == BOOT_DELTA_LEN && d->obj_exact[1]);
+    if (with_props) {
+        JF_EXPECT(d->objects >= 2 && d->props_len[1] == JF_PROPS_LEN && d->props_exact[1]);
+    } else {
+        JF_EXPECT(d->objects >= 2 && d->props_len[1] == 0);
+    }
+#undef JF_EXPECT
+    return bad;
+}
+
+/* A rejection before any success: exactly one FETCH_ERROR carrying `code`,
+ * nothing else ever polled for the request. */
+static int
+jf_check_rejected(jf_t *j, const jf_down_t *d, uint64_t code, const char *label)
+{
+    int bad = 0;
+    if (!(d->foreign == 0 && d->ledger_n == 1 && d->ledger[0] == (int)MOQ_EVENT_FETCH_ERROR &&
+          d->ok == 0 && d->objects == 0 && d->complete == 0 && d->reset == 0 &&
+          d->error == 1 && d->error_code == code)) {
+        printf("FAIL: %s %s: expected one FETCH_ERROR(%llu); got ledger_n=%d ok=%d objects=%d "
+               "complete=%d error=%d code=%llu reset=%d foreign=%d\n",
+               label, j->lbl, (unsigned long long)code, d->ledger_n, d->ok, d->objects,
+               d->complete, d->error, (unsigned long long)d->error_code, d->reset,
+               d->foreign);
+        bad++;
+    }
+    return bad;
+}
+
+/* -- rows ---------------------------------------------------------------- */
+
+/* Exact single receiver, with per-object properties on the delta: one
+ * upstream request carrying the normalized range [0:0, 0:2), the response
+ * relayed byte-exact in order, then the pool and transactions back to zero
+ * and the live path intact. */
+static int
+jf_exact_single(moq_version_t version, bool with_props)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    R_CHECK(&j.rig, j.o.req_sg[0] == 0 && j.o.req_so[0] == 0 &&
+                    j.o.req_eg[0] == 0 && j.o.req_eo[0] == 2);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 1 && st.live == 1 && st.bytes_used == JF_KEY_LEN);
+    jf_origin_answer_exact(&j, 0, with_props);
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_exact(&j, &j.d[0], with_props, "exact single");
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.completed == 1 && st.delivered == 1 && st.live == 0 &&
+                    st.bytes_used == 0 && st.cancelled_up == 0 && st.errors == 0 &&
+                    st.rejected_down == 0 && st.aborted == 0);
+    /* Peak pool use is exactly the owned key + the collected bytes. */
+    R_CHECK(&j.rig, st.bytes_high == JF_KEY_LEN + BOOT_BASE_LEN + BOOT_DELTA_LEN +
+                                         (with_props ? JF_PROPS_LEN : 0));
+    R_CHECK(&j.rig, j.o.cancelled == 0 && j.o.fetch_requests == 1);
+    /* The forwarded objects never entered the live log. */
+    {
+        char dump[4096];
+        size_t dn = 0;
+        if (moqr_core_route_dump_text(j.rig.core, dump, sizeof(dump), &dn) == MOQR_OK &&
+            dn < sizeof(dump)) {
+            dump[dn] = '\0';
+            const char *cat = strstr(dump, "\"catalog\"");
+            const char *log = cat ? strstr(cat, "log:") : NULL;
+            R_CHECK(&j.rig, log != NULL && strstr(log, "records=0") != NULL);
+        } else {
+            R_CHECK(&j.rig, 0);
+        }
+    }
+    jf_live_control(&j);
+    return jf_teardown(&j, with_props ? "fwd_exact_single_props" : "fwd_exact_single");
+}
+
+/* Two receivers in the same cycle: two upstream requests, each answered and
+ * relayed exactly to its own requester, no cross-talk, no duplicate. */
+static int
+jf_exact_two(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 2, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_join(&j, &j.d[1]);
+    jf_wait_requests(&j, 2);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 2 && st.live == 2 && st.bytes_used == 2 * JF_KEY_LEN);
+    jf_origin_answer_exact(&j, 0, false);
+    jf_origin_answer_exact(&j, 1, false);
+    jf_wait_terminal(&j, &j.d[0]);
+    jf_wait_terminal(&j, &j.d[1]);
+    j.rig.failures += jf_check_exact(&j, &j.d[0], false, "exact two (a)");
+    j.rig.failures += jf_check_exact(&j, &j.d[1], false, "exact two (b)");
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.completed == 2 && st.delivered == 2 && st.live == 0 &&
+                    st.bytes_used == 0 && j.o.cancelled == 0 && j.o.fetch_requests == 2);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_exact_two_receivers");
+}
+
+/* Two concurrent collections share ONE byte pool: sized for both keys and
+ * one full response, so the second response overflows mid-collection. The
+ * overflowed request is rejected before any OK, its upstream request is
+ * cancelled, the other is exact, the pool returns to zero and the live path
+ * is intact. */
+static int
+jf_shared_bound(moq_version_t version)
+{
+    g_test_fetch_forward_bytes = 2 * JF_KEY_LEN + BOOT_BASE_LEN + BOOT_DELTA_LEN + 4;
+    jf_t j;
+    if (!jf_setup(&j, version, 2, true, 1)) return 1 + j.rig.failures;
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.bytes_cap == g_test_fetch_forward_bytes);
+    jf_join(&j, &j.d[0]);
+    jf_join(&j, &j.d[1]);
+    jf_wait_requests(&j, 2);
+    /* Interleave the answers so the second collection meets the shared
+     * ceiling with the first still charged: both accepted, first written in
+     * full, then the second. */
+    jf_origin_accept(&j, 0, 0, 2, false, false);
+    jf_origin_accept(&j, 1, 0, 2, false, false);
+    jf_origin_write_generation(&j, 0, false);   /* first: fully collected, still open */
+    jf_cycle(&j);
+    jf_cycle(&j);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.live == 2 && st.bytes_used == 2 * JF_KEY_LEN + BOOT_BASE_LEN + BOOT_DELTA_LEN);
+    jf_origin_write_generation(&j, 1, false);   /* second: the delta cannot be charged */
+    jf_cycle(&j);
+    jf_cycle(&j);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.overflow == 1);
+    jf_origin_end(&j, 0);
+    jf_wait_terminal(&j, &j.d[0]);
+    jf_wait_terminal(&j, &j.d[1]);
+    j.rig.failures += jf_check_exact(&j, &j.d[0], false, "shared bound (first)");
+    j.rig.failures += jf_check_rejected(&j, &j.d[1], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                        "shared bound (second)");
+    for (int i = 0; i < 6 && j.o.cancelled == 0; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.o.cancelled == 1);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.overflow == 1 && st.cancelled_up == 1 && st.rejected_down == 1 &&
+                    st.delivered == 1 && st.live == 0 && st.bytes_used == 0 &&
+                    st.bytes_high <= st.bytes_cap);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_shared_byte_bound");
+}
+
+/* Count bound: a response of more than 64 objects (inside a wide range) is
+ * abandoned at the 65th, rejected before OK, cancelled upstream. */
+static int
+jf_count_overflow(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 80)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    R_CHECK(&j.rig, j.o.req_eg[0] == 0 && j.o.req_eo[0] == 81);
+    jf_origin_accept(&j, 0, 0, 81, false, false);
+    int written = 0;
+    for (uint64_t o = 0; o < 65; o++) {
+        if (jf_origin_write_raw(&j, 0, 0, o, (uint8_t)o, 8, false) == MOQ_OK) {
+            written++;
+        }
+        if ((o % 8) == 7) jf_cycle(&j);
+    }
+    R_CHECK(&j.rig, written == 65);
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                        "count overflow");
+    for (int i = 0; i < 6 && j.o.cancelled == 0; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.o.cancelled == 1);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.overflow == 1 && st.cancelled_up == 1 && st.live == 0 &&
+                    st.bytes_used == 0 && st.delivered == 0);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_count_overflow");
+}
+
+/* Upstream REQUEST_ERROR: the code, can_retry and reason text reach the
+ * downstream verbatim; nothing else is ever sent for the request. */
+static int
+jf_upstream_error(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    jf_origin_reject(&j, 0, MOQ_REQUEST_ERROR_UNAUTHORIZED, "origin says no", true, 250);
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_UNAUTHORIZED,
+                                        "upstream error");
+    R_CHECK(&j.rig, j.d[0].reason_len == 14 &&
+                    memcmp(j.d[0].reason, "origin says no", 14) == 0);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.errors == 1 && st.rejected_down == 1 && st.cancelled_up == 0 &&
+                    st.live == 0 && st.bytes_used == 0 && j.o.cancelled == 0);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_upstream_error_reason");
+}
+
+/* Range mismatch: an upstream object outside the pinned range (or an OK End
+ * Location past it) is never relayed as a success. */
+static int
+jf_range_mismatch(moq_version_t version, bool at_ok)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    if (at_ok) {
+        jf_origin_accept(&j, 0, 0, 9, false, false);   /* End past [0:0, 0:2) */
+    } else {
+        jf_origin_accept(&j, 0, 0, 2, false, false);
+        R_CHECK(&j.rig, jf_origin_write_raw(&j, 0, 0, 0, 0xB0, BOOT_BASE_LEN, false) == MOQ_OK);
+        R_CHECK(&j.rig, jf_origin_write_raw(&j, 0, 0, 5, 0x55, 8, false) == MOQ_OK);
+    }
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                        at_ok ? "range mismatch (ok)" : "range mismatch (object)");
+    for (int i = 0; i < 6 && j.o.cancelled == 0; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.o.cancelled == 1);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.mismatch == 1 && st.cancelled_up == 1 && st.live == 0 &&
+                    st.bytes_used == 0 && st.delivered == 0);
+    jf_live_control(&j);
+    return jf_teardown(&j, at_ok ? "fwd_range_mismatch_ok" : "fwd_range_mismatch_object");
+}
+
+/* Upstream data-stream RESET after OK + one object: rejected before any
+ * downstream OK (never a truncated success). */
+static int
+jf_upstream_reset(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    jf_origin_accept(&j, 0, 0, 2, false, false);
+    R_CHECK(&j.rig, jf_origin_write_raw(&j, 0, 0, 0, 0xB0, BOOT_BASE_LEN, false) == MOQ_OK);
+    jf_cycle(&j);
+    moq_result_t rc;
+    JF_ORIGIN_RETRY(&j, moq_session_abort_fetch(j.o.cn->peer, j.o.req[0], 0x5u, j.rig.now), rc);
+    R_CHECK(&j.rig, rc == MOQ_OK);
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                        "upstream reset");
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.resets == 1 && st.rejected_down == 1 && st.live == 0 &&
+                    st.bytes_used == 0 && st.delivered == 0);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_upstream_reset");
+}
+
+/* Source loss with the request pending upstream, then a replacement origin:
+ * the pending transaction is rejected (never re-aimed at the newcomer), a
+ * fresh subscription + join against the replacement is served exactly, and
+ * the replacement sees only that one request. */
+static int
+jf_source_loss_replacement(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 2, false, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.live == 1);
+    /* The origin goes away at the binding before answering. */
+    R_CHECK(&j.rig, moqr_bind_conn_close(j.rig.bind, j.o.cn->rsess) == MOQR_OK);
+    j.o.gone = true;
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                        "source loss");
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.lost == 1 && st.rejected_down == 1 && st.live == 0 && st.bytes_used == 0);
+    /* Replacement origin on a new connection: announce, then the second
+     * downstream (whose subscription was retired with the source) subscribes
+     * afresh and joins. */
+    jf_origin_t old = j.o;
+    memset(&j.o, 0, sizeof(j.o));
+    j.o.cn = rig_connect(&j.rig, version);
+    j.o.largest_object = 1;
+    R_CHECK(&j.rig, j.o.cn != NULL);
+    rig_pump(&j.rig, 4);
+    moq_publish_namespace_cfg_t pcfg;
+    memset(&pcfg, 0, sizeof(pcfg));
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+    moq_announcement_t ann;
+    R_CHECK(&j.rig, moq_session_publish_namespace(j.o.cn->peer, &pcfg, j.rig.now, &ann) == MOQ_OK);
+    for (int i = 0; i < 8 && j.o.ns_accepted == 0; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.o.ns_accepted == 1);
+    for (int i = 0; i < 8 && j.d[1].done == 0; i++) jf_cycle(&j);
+    jf_reset_obs(&j.d[1]);
+    j.d[1].sub_ok = false;
+    jf_subscribe_catalog(&j, &j.d[1]);
+    for (int i = 0; i < 12 && !j.d[1].sub_ok; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.d[1].sub_ok && j.o.cat_seen);
+    jf_join(&j, &j.d[1]);
+    jf_wait_requests(&j, 1);
+    jf_origin_answer_exact(&j, 0, false);
+    jf_wait_terminal(&j, &j.d[1]);
+    j.rig.failures += jf_check_exact(&j, &j.d[1], false, "replacement");
+    R_CHECK(&j.rig, j.o.fetch_requests == 1 && old.fetch_requests == 1);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 2 && st.delivered == 1 && st.live == 0 && st.bytes_used == 0);
+    return jf_teardown(&j, "fwd_source_loss_replacement");
+}
+
+/* Downstream cancel (a) before the origin answered, (b) during collection
+ * (OK + one object held open): the upstream request is cancelled, the
+ * transaction and its bytes are released, and nothing is ever written down. */
+static int
+jf_down_cancel(moq_version_t version, bool during_collection)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    if (during_collection) {
+        jf_origin_accept(&j, 0, 0, 2, false, false);
+        R_CHECK(&j.rig, jf_origin_write_raw(&j, 0, 0, 0, 0xB0, BOOT_BASE_LEN, false) == MOQ_OK);
+        jf_cycle(&j);
+        moqr_bind_fwd_debug_t mid;
+        jf_stats(&j, &mid);
+        R_CHECK(&j.rig, mid.live == 1 && mid.bytes_used == JF_KEY_LEN + BOOT_BASE_LEN);
+    }
+    R_CHECK(&j.rig, moq_session_fetch_cancel(j.d[0].cn->peer, j.d[0].fh, j.rig.now) == MOQ_OK);
+    for (int i = 0; i < 8 && j.o.cancelled == 0; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.o.cancelled == 1);
+    for (int i = 0; i < 4; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.d[0].ledger_n == 0 && j.d[0].foreign == 0);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.cancelled_down == 1 && st.cancelled_up == 1 && st.live == 0 &&
+                    st.bytes_used == 0 && st.delivered == 0 && st.rejected_down == 0);
+    jf_live_control(&j);
+    return jf_teardown(&j, during_collection ? "fwd_down_cancel_during_collection"
+                                             : "fwd_down_cancel_before_answer");
+}
+
+/* Diagnostic trace ring: SimPair inputs refused by a session and stream
+ * resets/stops, newest last. */
+typedef struct jf_trace {
+    bool armed;
+    bool verbose;   /* keep every input/action record, not only refusals/stops */
+    int  n;
+    struct {
+        int      kind, input_kind, action_kind, from, to;
+        int      result;
+        uint64_t stream, step, code;
+        uint8_t  first[6];
+        size_t   len;
+    } rec[64];
+    int refused_total;
+} jf_trace_t;
+
+static void
+jf_trace_fn(void *ctx, const moq_sim_trace_record_t *r)
+{
+    jf_trace_t *t = (jf_trace_t *)ctx;
+    if (!t->armed) return;
+    bool keep = t->verbose && (r->kind == MOQ_SIM_TRACE_INPUT || r->kind == MOQ_SIM_TRACE_ACTION);
+    if (r->kind == MOQ_SIM_TRACE_INPUT && r->result < 0) { keep = true; t->refused_total++; }
+    if (r->kind == MOQ_SIM_TRACE_INPUT &&
+        (r->input_kind == MOQ_SIM_INPUT_DATA_RESET || r->input_kind == MOQ_SIM_INPUT_DATA_STOP ||
+         r->input_kind == MOQ_SIM_INPUT_BIDI_RESET || r->input_kind == MOQ_SIM_INPUT_BIDI_STOP)) keep = true;
+    if (r->kind == MOQ_SIM_TRACE_ACTION &&
+        (r->action_kind == MOQ_ACTION_RESET_DATA || r->action_kind == MOQ_ACTION_STOP_DATA ||
+         r->action_kind == MOQ_ACTION_RESET_BIDI_STREAM || r->action_kind == MOQ_ACTION_STOP_BIDI_STREAM ||
+         r->action_kind == MOQ_ACTION_ABORT_BIDI_STREAM)) keep = true;
+    if (r->kind >= MOQ_SIM_TRACE_FAULT_DROP && r->kind <= MOQ_SIM_TRACE_DELAY_STALE) keep = true;
+    if (!keep) return;
+    int i = t->n < 64 ? t->n++ : (memmove(&t->rec[0], &t->rec[1], sizeof(t->rec[0]) * 63), 63);
+    memset(&t->rec[i], 0, sizeof(t->rec[i]));
+    t->rec[i].kind = (int)r->kind;
+    t->rec[i].input_kind = (int)r->input_kind;
+    t->rec[i].action_kind = (int)r->action_kind;
+    t->rec[i].from = (int)r->from;
+    t->rec[i].to = (int)r->to;
+    t->rec[i].result = (int)r->result;
+    t->rec[i].step = r->step;
+    t->rec[i].code = r->code;
+    if (r->struct_size >= offsetof(moq_sim_trace_record_t, stream_ref) + sizeof(r->stream_ref)) {
+        t->rec[i].stream = r->stream_ref._v;
+    }
+    t->rec[i].len = r->bytes.len;
+    size_t c = r->bytes.len < 6 ? r->bytes.len : 6;
+    if (c > 0 && r->bytes.data) memcpy(t->rec[i].first, r->bytes.data, c);
+}
+
+static void
+jf_trace_dump(const jf_trace_t *t, const char *label)
+{
+    printf("  trace %s: refused_total=%d kept=%d\n", label, t->refused_total, t->n);
+    for (int i = 0; i < t->n; i++) {
+        printf("    [%d] kind=%d in=%d act=%d %d->%d rc=%d stream=%llu step=%llu code=%llu len=%zu "
+               "first=%02x%02x%02x%02x%02x%02x\n", i, t->rec[i].kind, t->rec[i].input_kind,
+               t->rec[i].action_kind, t->rec[i].from, t->rec[i].to, t->rec[i].result,
+               (unsigned long long)t->rec[i].stream, (unsigned long long)t->rec[i].step,
+               (unsigned long long)t->rec[i].code, t->rec[i].len, t->rec[i].first[0],
+               t->rec[i].first[1], t->rec[i].first[2], t->rec[i].first[3], t->rec[i].first[4],
+               t->rec[i].first[5]);
+    }
+}
+
+/* Downstream cancel after acceptance: a 60-object response against a
+ * 32-deep relay action queue, so the relay's FETCH_OK and first objects are
+ * queued with the rest still held (WOULD_BLOCK, retried). The downstream
+ * pair is then stepped WITHOUT a bind pump: the queued OK and objects reach
+ * the peer, which cancels; the next transport step delivers the cancel to
+ * an idle relay queue, and the following pump observes FETCH_CANCELLED with
+ * items still unwritten, releases them without a write, and leaves the
+ * origin untouched. */
+static int
+jf_down_cancel_after_ok(moq_version_t version)
+{
+    static jf_trace_t tr;
+    memset(&tr, 0, sizeof(tr));
+    g_test_trace_fn = jf_trace_fn;
+    g_test_trace_ctx = &tr;
+    jf_t j;
+    g_test_max_actions = 32;
+    if (!jf_setup(&j, version, 1, false, 60)) return 1 + j.rig.failures;
+    g_test_trace_fn = NULL;
+    tr.armed = true;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    jf_origin_accept(&j, 0, 0, 61, false, false);
+    for (uint64_t o = 0; o < 60; o++) {
+        R_CHECK(&j.rig, jf_origin_write_raw(&j, 0, 0, o, (uint8_t)o, 8, false) == MOQ_OK);
+        if ((o % 8) == 7) jf_cycle(&j);
+    }
+    jf_origin_end(&j, 0);
+    moqr_bind_fwd_debug_t st;
+    for (int i = 0; i < 30; i++) {
+        jf_cycle(&j);
+        jf_stats(&j, &st);
+        if (st.completed == 1) break;
+    }
+    /* The collecting pump also accepted and started writing: the relay's
+     * queue is full, the rest of the items are held. */
+    R_CHECK(&j.rig, st.completed == 1 && st.live == 1 && st.delivered == 0 && st.retried_write > 0);
+    uint64_t holds = st.retried_write;
+    rig_step_pair(&j.rig, j.d[0].cn);          /* transport only: OK + first objects land */
+    jf_down_drain(&j.rig, &j.d[0]);
+    R_CHECK(&j.rig, j.d[0].ok == 1 && j.d[0].objects > 0 && j.d[0].objects < 60);
+    int seen = j.d[0].objects;
+    R_CHECK(&j.rig, moq_session_fetch_cancel(j.d[0].cn->peer, j.d[0].fh, j.rig.now) == MOQ_OK);
+    rig_step_pair(&j.rig, j.d[0].cn);          /* the cancel reaches an idle relay queue */
+    rig_bind_pump_once(&j.rig);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.cancelled_down == 1 && st.live == 0 && st.bytes_used == 0 &&
+                    st.delivered == 0 && st.aborted == 0);
+    for (int i = 0; i < 8; i++) jf_cycle(&j);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.cancelled_down == 1 && st.live == 0 && st.bytes_used == 0 &&
+                    st.delivered == 0 && st.aborted == 0 && st.retried_write == holds);
+    R_CHECK(&j.rig, j.d[0].foreign == 0 && j.d[0].error == 0 && j.d[0].complete == 0 &&
+                    j.d[0].closed == 0 && j.o.cancelled == 0);
+    R_CHECK(&j.rig, j.d[0].objects == seen);   /* nothing written after the cancel */
+    R_CHECK(&j.rig, moq_session_state(j.d[0].cn->rsess) == MOQ_SESS_ESTABLISHED);
+    printf("  cancel-after-ok %s: holds=%llu objects_seen_at_cancel=%d cancelled_down=%llu "
+           "peer_closed=%d\n", j.lbl, (unsigned long long)holds, seen,
+           (unsigned long long)st.cancelled_down, j.d[0].closed);
+    if (j.d[0].closed) jf_trace_dump(&tr, "cancel-after-ok");
+    return jf_teardown(&j, "fwd_down_cancel_after_ok");
+}
+
+/* Named core RED, run only through its own CTest entry (the binary's
+ * `--core-red-cancel-after-stop` argument), never in the ordinary suite:
+ * the downstream pair's sessions hold a 3-deep action queue and the pair is
+ * held unstepped while the relay accepts and starts writing the forwarded
+ * response, so FETCH_OK and the first objects sit in the relay's queue; the
+ * pair is released in the same cycle the downstream peer cancels. The
+ * contract under test is the PEER's session: having cancelled, it must
+ * absorb the late response stream (STOP at its header, discard what was
+ * already on the wire behind it) and stay established. The relay-side
+ * invariants (no write after the cancel, no relay-side close, cleanup to
+ * zero) are asserted as well. The exact SimPair action/input trace of the
+ * crossing is printed. */
+static int
+core_red_cancel_after_stop(moq_version_t version)
+{
+    static jf_trace_t tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.verbose = true;
+    g_test_trace_fn = jf_trace_fn;
+    g_test_trace_ctx = &tr;
+    jf_t j;
+    g_test_max_actions = 3;
+    if (!jf_setup(&j, version, 1, false, 1)) return 1 + j.rig.failures;
+    g_test_trace_fn = NULL;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    jf_origin_answer_exact(&j, 0, false);
+    j.d[0].cn->frozen = true;
+    moqr_bind_fwd_debug_t st;
+    int held = 0;
+    for (int i = 0; i < 12; i++) {
+        jf_cycle(&j);
+        jf_stats(&j, &st);
+        if (st.completed == 1) held++;
+        if (st.retried_accept + st.retried_write + st.retried_fin > 0 && held >= 3) break;
+    }
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.completed == 1 && st.live == 1 && st.delivered == 0);
+    tr.armed = true;   /* trace the crossing only */
+    j.d[0].cn->frozen = false;
+    R_CHECK(&j.rig, moq_session_fetch_cancel(j.d[0].cn->peer, j.d[0].fh, j.rig.now) == MOQ_OK);
+    for (int i = 0; i < 8; i++) jf_cycle(&j);
+    tr.armed = false;
+    jf_stats(&j, &st);
+    printf("  core-red cancel-after-stop %s: peer_closed=%d code=0x%llx reason=\"%s\" peer saw "
+           "ok=%d objects=%d reset=%d | relay cancelled_down=%llu down_gone=%llu down_lost=%llu "
+           "delivered=%llu aborted=%llu live=%llu relay_session_state=%d\n",
+           j.lbl, j.d[0].closed, (unsigned long long)j.d[0].close_code, j.d[0].close_reason,
+           j.d[0].ok, j.d[0].objects, j.d[0].reset, (unsigned long long)st.cancelled_down,
+           (unsigned long long)st.down_gone, (unsigned long long)st.down_lost,
+           (unsigned long long)st.delivered, (unsigned long long)st.aborted,
+           (unsigned long long)st.live, (int)moq_session_state(j.d[0].cn->rsess));
+    jf_trace_dump(&tr, "core-red cancel-after-stop");
+    /* Relay-side invariants. */
+    R_CHECK(&j.rig, st.live == 0 && st.bytes_used == 0 && st.aborted == 0);
+    R_CHECK(&j.rig, j.o.cancelled == 0 && j.d[0].foreign == 0);
+    /* The core contract under test: the cancelling peer stays established. */
+    R_CHECK(&j.rig, j.d[0].closed == 0 && moq_session_state(j.d[0].cn->peer) == MOQ_SESS_ESTABLISHED);
+    return jf_teardown(&j, "core_red_cancel_after_stop");
+}
+
+/* Queued upstream tail across pumps + immediate request-slot reuse: the
+ * origin paces a 24-object response at 4 objects per cycle, and the
+ * downstream peer's events are processed BEFORE the origin's in every pump.
+ * Two cycles in, the downstream cancels and immediately re-joins (its
+ * replacement takes the freed request slot on both sessions). The objects
+ * that arrive in the cancel's own pump still name the retired handle and are
+ * drained without matching anything; the objects the origin keeps writing
+ * afterwards reach a released transaction and are ignored. The replacement
+ * is served exactly (24 objects with the SECOND response's bytes, none of
+ * the first) and nothing leaks. */
+static int
+jf_queued_tail_reuse(moq_version_t version)
+{
+    static jf_trace_t tr;
+    memset(&tr, 0, sizeof(tr));
+    g_test_trace_fn = jf_trace_fn;
+    g_test_trace_ctx = &tr;
+    jf_t j;
+    g_test_max_events = 64;   /* the downstream peer is drained once per cycle */
+    if (!jf_setup_ex(&j, version, 1, false, 24, true)) return 1 + j.rig.failures;
+    g_test_trace_fn = NULL;
+    tr.armed = true;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    jf_origin_accept(&j, 0, 0, 25, false, false);
+    uint64_t next = 0;
+    moqr_bind_fwd_debug_t st;
+    uint64_t old_handle = j.d[0].fh._opaque;
+    bool cancelled = false;
+    for (int cyc = 0; cyc < 12; cyc++) {
+        for (int k = 0; k < 4 && next < 24; k++, next++) {
+            moq_result_t rc = jf_origin_write_raw(&j, 0, 0, next, (uint8_t)(0x30 + next), 8, false);
+            /* After the cancel the origin's writes may be refused: its
+             * request was retired by the relay's FETCH_CANCEL. */
+            R_CHECK(&j.rig, rc == MOQ_OK || cancelled);
+        }
+        if (cyc == 1) {
+            jf_stats(&j, &st);
+            R_CHECK(&j.rig, st.live == 1 && st.completed == 0 && st.bytes_used > JF_KEY_LEN);
+            R_CHECK(&j.rig, moq_session_fetch_cancel(j.d[0].cn->peer, j.d[0].fh, j.rig.now) == MOQ_OK);
+            jf_reset_obs(&j.d[0]);
+            jf_join(&j, &j.d[0]);
+            R_CHECK(&j.rig, j.d[0].fh._opaque != old_handle);
+            cancelled = true;
+        }
+        jf_cycle(&j);
+    }
+    jf_wait_requests(&j, 2);
+    for (int i = 0; i < 4; i++) jf_cycle(&j);
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.cancelled_down == 1 && st.cancelled_up == 1 && st.admitted == 2 &&
+                    st.live == 1 && st.delivered == 0);
+    R_CHECK(&j.rig, j.d[0].ledger_n == 0 && j.d[0].foreign == 0);
+    /* The replacement is answered with different bytes, paced the same way
+     * (a session queues at most 16 events between pumps). */
+    jf_origin_accept(&j, 1, 0, 25, false, false);
+    for (uint64_t o = 0; o < 24; o++) {
+        R_CHECK(&j.rig, jf_origin_write_raw(&j, 1, 0, o, (uint8_t)(0x50 + o), 8, false) == MOQ_OK);
+        if ((o % 4) == 3) jf_cycle(&j);
+    }
+    jf_origin_end(&j, 1);
+    for (int i = 0; i < 24 && j.d[0].complete + j.d[0].error + j.d[0].reset == 0; i++) jf_cycle(&j);
+    for (int i = 0; i < 4; i++) jf_cycle(&j);
+    R_CHECK(&j.rig, j.d[0].ok == 1 && j.d[0].objects == 24 && j.d[0].complete == 1 &&
+                    j.d[0].error == 0 && j.d[0].reset == 0 && j.d[0].foreign == 0);
+    if (j.rig.failures) {
+        jf_stats(&j, &st);
+        printf("  queued-tail diag: ok=%d objects=%d complete=%d error=%d code=%llu reset=%d "
+               "foreign=%d ledger_n=%d | admitted=%llu completed=%llu errors=%llu overflow=%llu "
+               "mismatch=%llu delivered=%llu aborted=%llu live=%llu bytes=%llu requests=%d "
+               "origin_cancelled=%d states d=%d o=%d\n",
+               j.d[0].ok, j.d[0].objects, j.d[0].complete, j.d[0].error,
+               (unsigned long long)j.d[0].error_code, j.d[0].reset, j.d[0].foreign,
+               j.d[0].ledger_n, (unsigned long long)st.admitted, (unsigned long long)st.completed,
+               (unsigned long long)st.errors, (unsigned long long)st.overflow,
+               (unsigned long long)st.mismatch, (unsigned long long)st.delivered,
+               (unsigned long long)st.aborted, (unsigned long long)st.live,
+               (unsigned long long)st.bytes_used, j.o.fetch_requests, j.o.cancelled,
+               (int)moq_session_state(j.d[0].cn->peer), (int)moq_session_state(j.o.cn->peer));
+        printf("  queued-tail diag: relay sessions d=%d o=%d lost=%llu stale=%llu drained=%llu "
+               "retried_send=%llu retried_cancel=%llu peer_closed d=%d(0x%llx \"%s\")\n",
+               (int)moq_session_state(j.d[0].cn->rsess), (int)moq_session_state(j.o.cn->rsess),
+               (unsigned long long)st.lost, (unsigned long long)st.stale_events_ignored,
+               (unsigned long long)st.drained_events, (unsigned long long)st.retried_send,
+               (unsigned long long)st.retried_cancel, j.d[0].closed,
+               (unsigned long long)j.d[0].close_code, j.d[0].close_reason);
+        jf_trace_dump(&tr, "queued-tail");
+    }
+    /* obj_* keeps the first 8: ids in order with the SECOND response's bytes. */
+    for (int k = 0; k < 8; k++) {
+        R_CHECK(&j.rig, j.d[0].obj_g[k] == 0 && j.d[0].obj_o[k] == (uint64_t)k &&
+                        j.d[0].obj_len[k] == 8 && j.d[0].obj_first[k] == (uint8_t)(0x50 + k));
+    }
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.drained_events > 0);
+    R_CHECK(&j.rig, st.delivered == 1 && st.live == 0 && st.bytes_used == 0);
+    printf("  queued-tail %s: drained_events=%llu stale_events_ignored=%llu origin_cancelled=%d\n",
+           j.lbl, (unsigned long long)st.drained_events,
+           (unsigned long long)st.stale_events_ignored, j.o.cancelled);
+    return jf_teardown(&j, "fwd_queued_tail_slot_reuse");
+}
+
+/* WOULD_BLOCK at the upstream request and at the upstream cancel: the relay's
+ * session toward the origin has a 3-deep action queue, filled by three
+ * upstream SUBSCRIBEs while the origin pair is held; each held pump retries
+ * exactly once (one HOLD per pump), and the step commits as soon as the pair
+ * moves. */
+static int
+jf_block_upstream(moq_version_t version, bool cancel)
+{
+    jf_t j;
+    g_test_max_actions = 3;
+    if (!jf_setup(&j, version, 1, false, 1)) return 1 + j.rig.failures;
+    const int K = 4;
+    moqr_bind_fwd_debug_t st;
+    if (!cancel) {
+        /* Hold the origin pair and fill the relay->origin queue. */
+        j.o.cn->frozen = true;
+        for (int t = 0; t < 3; t++) {
+            moq_subscribe_cfg_t sc;
+            memset(&sc, 0, sizeof(sc));
+            moq_subscribe_cfg_init(&sc);
+            sc.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+            char nm[8];
+            (void)snprintf(nm, sizeof(nm), "f%d", t);
+            sc.track_name = (moq_bytes_t){ (const uint8_t *)nm, strlen(nm) };
+            sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+            moq_subscription_t sh;
+            R_CHECK(&j.rig, moq_session_subscribe(j.d[0].cn->peer, &sc, j.rig.now, &sh) == MOQ_OK);
+            jf_cycle(&j);
+        }
+        jf_join(&j, &j.d[0]);
+        for (int i = 0; i < K; i++) jf_cycle(&j);
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.admitted == 1 && st.live == 1 && j.o.fetch_requests == 0);
+        R_CHECK(&j.rig, st.retried_send == (uint64_t)K);
+        j.o.cn->frozen = false;
+        jf_wait_requests(&j, 1);
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.retried_send == (uint64_t)K);   /* no further holds */
+        jf_origin_answer_exact(&j, 0, false);
+        jf_wait_terminal(&j, &j.d[0]);
+        j.rig.failures += jf_check_exact(&j, &j.d[0], false, "block upstream send");
+    } else {
+        jf_join(&j, &j.d[0]);
+        jf_wait_requests(&j, 1);
+        j.o.cn->frozen = true;
+        for (int t = 0; t < 3; t++) {
+            moq_subscribe_cfg_t sc;
+            memset(&sc, 0, sizeof(sc));
+            moq_subscribe_cfg_init(&sc);
+            sc.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+            char nm[8];
+            (void)snprintf(nm, sizeof(nm), "g%d", t);
+            sc.track_name = (moq_bytes_t){ (const uint8_t *)nm, strlen(nm) };
+            sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+            moq_subscription_t sh;
+            R_CHECK(&j.rig, moq_session_subscribe(j.d[0].cn->peer, &sc, j.rig.now, &sh) == MOQ_OK);
+            jf_cycle(&j);
+        }
+        R_CHECK(&j.rig, moq_session_fetch_cancel(j.d[0].cn->peer, j.d[0].fh, j.rig.now) == MOQ_OK);
+        for (int i = 0; i < K; i++) jf_cycle(&j);
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.cancelled_down == 1 && st.cancelled_up == 0 && st.live == 1);
+        R_CHECK(&j.rig, st.retried_cancel == (uint64_t)K);
+        j.o.cn->frozen = false;
+        for (int i = 0; i < 8 && j.o.cancelled == 0; i++) jf_cycle(&j);
+        R_CHECK(&j.rig, j.o.cancelled == 1);
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.retried_cancel == (uint64_t)K && st.cancelled_up == 1);
+    }
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.live == 0 && st.bytes_used == 0);
+    return jf_teardown(&j, cancel ? "fwd_block_upstream_cancel" : "fwd_block_upstream_send");
+}
+
+/* WOULD_BLOCK on the downstream side (accept / object / FIN / reject / abort
+ * steps): the downstream pair's 3-deep action queue is held unstepped. Each
+ * held pump retries exactly one step once (holds == pumps), and after the
+ * pair moves the outcome is the exact contract (or the exact rejection /
+ * the request-local abort). A permanent refusal is observed for 40 pumps
+ * with the transaction retained and no further progress. */
+static int
+jf_block_downstream(moq_version_t version, int mode)
+{
+    /* mode 0 = success path, 1 = reject path, 2 = abort path, 3 = permanent,
+     * 4 = the relay's own INTERNAL_ERROR when the upstream reason could not
+     *     be retained */
+    static const char *const names[5] = { "fwd_block_downstream_deliver",
+                                          "fwd_block_downstream_reject",
+                                          "fwd_block_downstream_abort",
+                                          "fwd_block_downstream_permanent",
+                                          "fwd_block_downstream_reject_local" };
+    jf_t j;
+    g_test_max_actions = 3;
+    if (!jf_setup(&j, version, 1, false, 1)) return 1 + j.rig.failures;
+    if (mode == 1 || mode == 2 || mode == 4) {
+        /* A one-action step (reject / abort) only blocks against a queue
+         * already full: the downstream also follows the live track, whose
+         * objects the relay queues toward it while the pair is held. */
+        jf_subscribe_live(&j, &j.d[0]);
+        for (int i = 0; i < 12 && !(j.d[0].live_ok && j.o.live_seen); i++) jf_cycle(&j);
+        R_CHECK(&j.rig, j.d[0].live_ok && j.o.live_seen);
+    }
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    j.d[0].cn->frozen = true;
+    if (mode == 1 || mode == 2 || mode == 4) {
+        for (uint64_t g = 1; g <= 4; g++) {
+            moq_subgroup_cfg_t sgc;
+            moq_subgroup_cfg_init(&sgc);
+            sgc.group_id = g;
+            sgc.subgroup_id = 0;
+            sgc.publisher_priority = 100;
+            moq_subgroup_handle_t sgh;
+            R_CHECK(&j.rig, moq_session_open_subgroup(j.o.cn->peer, j.o.live_sub, &sgc,
+                                                      j.rig.now, &sgh) == MOQ_OK);
+            uint8_t body[8];
+            memset(body, (int)g, sizeof(body));
+            moq_rcbuf_t *pl = NULL;
+            R_CHECK(&j.rig, moq_rcbuf_create(&j.a.vt, body, sizeof(body), &pl) == MOQ_OK);
+            R_CHECK(&j.rig, moq_session_write_object(j.o.cn->peer, sgh, 0, pl, j.rig.now) == MOQ_OK);
+            moq_rcbuf_decref(pl);
+            R_CHECK(&j.rig, moq_session_close_subgroup(j.o.cn->peer, sgh, j.rig.now) == MOQ_OK);
+            jf_cycle(&j);
+        }
+    }
+    if (mode == 2) {
+        moqr_bind_debug_fail_fwd_write(1);
+    }
+    if (mode == 1) {
+        jf_origin_reject(&j, 0, MOQ_REQUEST_ERROR_DOES_NOT_EXIST, "gone", false, 0);
+    } else if (mode == 4) {
+        j.a.fail_size = 9;   /* "forbidden": the reason copy is refused */
+        jf_origin_reject(&j, 0, MOQ_REQUEST_ERROR_UNAUTHORIZED, "forbidden", true, 250);
+    } else {
+        jf_origin_answer_exact(&j, 0, false);
+    }
+    moqr_bind_fwd_debug_t st;
+    /* Let the upstream side settle, counting the pumps the downstream step
+     * is held. The first held pump is the one where the upstream terminal
+     * arrived; from then on each pump holds exactly once. */
+    const int K = mode == 3 ? 40 : 5;
+    int pumps_after_terminal = 0;
+    for (int i = 0; i < 12 + K; i++) {
+        jf_cycle(&j);
+        jf_stats(&j, &st);
+        if (st.completed + st.errors == 1) {
+            pumps_after_terminal++;
+        }
+        if (pumps_after_terminal == K) break;
+    }
+    jf_stats(&j, &st);
+    uint64_t holds = st.retried_accept + st.retried_write + st.retried_fin +
+                     st.retried_reject + st.retried_abort;
+    R_CHECK(&j.rig, pumps_after_terminal == K);
+    R_CHECK(&j.rig, st.live == 1 && st.delivered == 0 && st.rejected_down == 0 &&
+                    st.aborted == 0);
+    R_CHECK(&j.rig, holds >= (uint64_t)K - 1 && holds <= (uint64_t)K);
+    if (mode == 1 || mode == 4) {
+        R_CHECK(&j.rig, st.retried_reject == holds);
+    }
+    j.a.fail_size = 0;
+    if (mode == 3) {
+        /* Permanent: the downstream goes away still blocked; cleanup to zero
+         * without any write and without touching the origin. */
+        R_CHECK(&j.rig, moqr_bind_conn_close(j.rig.bind, j.d[0].cn->rsess) == MOQR_OK);
+        for (int i = 0; i < 4; i++) jf_cycle(&j);
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.live == 0 && st.bytes_used == 0 && st.delivered == 0 &&
+                        j.o.cancelled == 0);
+        printf("  block permanent %s: holds=%llu over %d pumps\n", j.lbl,
+               (unsigned long long)holds, K);
+        moqr_bind_debug_fail_fwd_write(0);
+        return jf_teardown(&j, names[mode]);
+    }
+    j.d[0].cn->frozen = false;
+    jf_wait_terminal(&j, &j.d[0]);
+    for (int i = 0; i < 4; i++) jf_cycle(&j);
+    jf_stats(&j, &st);
+    uint64_t holds_after = st.retried_accept + st.retried_write + st.retried_fin +
+                           st.retried_reject + st.retried_abort;
+    if (mode == 0) {
+        j.rig.failures += jf_check_exact(&j, &j.d[0], false, "block downstream deliver");
+        R_CHECK(&j.rig, st.delivered == 1);
+    } else if (mode == 1) {
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_DOES_NOT_EXIST,
+                                            "block downstream reject");
+        R_CHECK(&j.rig, st.rejected_down == 1 && j.d[0].reason_len == 4 &&
+                        memcmp(j.d[0].reason, "gone", 4) == 0);
+    } else if (mode == 4) {
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                            "block downstream reject local");
+        R_CHECK(&j.rig, st.rejected_down == 1 && st.reason_unretained == 1 &&
+                        j.d[0].reason_len == 0 && !j.d[0].can_retry);
+    } else {
+        /* OK then the request-local abort: the downstream sees FETCH_OK and
+         * a RESET terminal carrying INTERNAL_ERROR (0x0), no object. */
+        R_CHECK(&j.rig, st.aborted == 1 && st.delivered == 0);
+        R_CHECK(&j.rig, j.d[0].ok == 1 && j.d[0].reset == 1 && j.d[0].reset_code == 0 &&
+                        j.d[0].objects == 0 && j.d[0].complete == 0 && j.d[0].error == 0 &&
+                        j.d[0].foreign == 0);
+        R_CHECK(&j.rig, st.retried_abort + st.retried_accept == holds_after);
+    }
+    /* Once the pair moves, at most the holds already counted plus the pumps
+     * before the step committed; no busy continuation. */
+    R_CHECK(&j.rig, holds_after - holds <= 2);
+    R_CHECK(&j.rig, st.live == 0 && st.bytes_used == 0);
+    printf("  block downstream %s mode=%d: holds=%llu (accept=%llu write=%llu fin=%llu "
+           "reject=%llu abort=%llu) after=%llu\n", j.lbl, mode, (unsigned long long)holds,
+           (unsigned long long)st.retried_accept, (unsigned long long)st.retried_write,
+           (unsigned long long)st.retried_fin, (unsigned long long)st.retried_reject,
+           (unsigned long long)st.retried_abort, (unsigned long long)holds_after);
+    moqr_bind_debug_fail_fwd_write(0);
+    return jf_teardown(&j, names[mode]);
+}
+
+/* Request-local abort without any refusal: the first forwarded write fails
+ * locally after OK; the downstream sees OK then RESET(0x0); the origin is
+ * untouched; no connection close. */
+static int
+jf_abort_after_ok(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_requests(&j, 1);
+    moqr_bind_debug_fail_fwd_write(1);
+    jf_origin_answer_exact(&j, 0, false);
+    jf_wait_terminal(&j, &j.d[0]);
+    for (int i = 0; i < 4; i++) jf_cycle(&j);
+    moqr_bind_debug_fail_fwd_write(0);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.aborted == 1 && st.delivered == 0 && st.live == 0 && st.bytes_used == 0);
+    R_CHECK(&j.rig, j.d[0].ok == 1 && j.d[0].reset == 1 && j.d[0].reset_code == 0 &&
+                    j.d[0].objects == 0 && j.d[0].complete == 0 && j.d[0].error == 0);
+    R_CHECK(&j.rig, j.o.cancelled == 0);
+    R_CHECK(&j.rig, moq_session_state(j.d[0].cn->peer) == MOQ_SESS_ESTABLISHED);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_abort_after_ok");
+}
+
+/* Authorization on the RESOLVED identity, fail-closed: a joining request is
+ * first authorized on its own empty identity (which admits nothing) and then,
+ * once resolved, on the joined track's namespace/name. The hook allows the
+ * former and denies the latter: the request is rejected with the hook's code
+ * and never reaches the origin. */
+typedef struct jf_auth {
+    int    fetch_calls;       /* MOQR_AUTH_FETCH evaluations               */
+    int    empty_calls;       /* ... on the empty identity (pre-resolution) */
+    int    resolved_calls;    /* ... on the resolved boot/cat + catalog     */
+    size_t ns_count, name_len;
+} jf_auth_t;
+
+static void
+jf_auth_hook(void *ctx, const moqr_auth_request_t *req, moqr_auth_verdict_t *out)
+{
+    jf_auth_t *a = (jf_auth_t *)ctx;
+    out->decision = MOQR_AUTH_ALLOW;
+    out->reason = MOQR_AUTH_REASON_OK;
+    if (req->action != MOQR_AUTH_FETCH) {
+        return;
+    }
+    a->fetch_calls++;
+    a->ns_count = req->ns.count;
+    a->name_len = req->name.len;
+    if (req->ns.count == 0 && req->name.len == 0) {
+        a->empty_calls++;     /* the request's own (empty) joining identity */
+        return;               /* allowed: it admits nothing by itself */
+    }
+    bool ns_exact = req->ns.count == 2 && req->ns.parts[0].len == 4 &&
+                    memcmp(req->ns.parts[0].data, "boot", 4) == 0 &&
+                    req->ns.parts[1].len == 3 && memcmp(req->ns.parts[1].data, "cat", 3) == 0;
+    bool name_exact = req->name.len == 7 && memcmp(req->name.data, "catalog", 7) == 0;
+    if (ns_exact && name_exact) {
+        a->resolved_calls++;
+    }
+    out->decision = MOQR_AUTH_DENY;
+    out->reason = MOQR_AUTH_REASON_UNSCOPED;
+    out->error_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
+}
+
+static int
+jf_auth_fail_closed(moq_version_t version)
+{
+    jf_auth_t au;
+    memset(&au, 0, sizeof(au));
+    g_test_authorize = jf_auth_hook;
+    g_test_authorize_ctx = &au;
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    jf_join(&j, &j.d[0]);
+    jf_wait_terminal(&j, &j.d[0]);
+    j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_UNAUTHORIZED,
+                                        "auth fail-closed");
+    /* Two evaluations: the empty pre-resolution identity (allowed) and the
+     * resolved track identity (denied) -- the denial is what the downstream
+     * sees, and the resolved call carried exactly boot/cat + catalog. */
+    R_CHECK(&j.rig, au.fetch_calls == 2 && au.empty_calls == 1 && au.resolved_calls == 1);
+    if (!(au.fetch_calls == 2 && au.empty_calls == 1 && au.resolved_calls == 1)) {
+        printf("  auth hook saw: calls=%d empty=%d resolved=%d last ns_count=%zu name_len=%zu\n",
+               au.fetch_calls, au.empty_calls, au.resolved_calls, au.ns_count, au.name_len);
+    }
+    R_CHECK(&j.rig, j.o.fetch_requests == 0);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 0 && st.live == 0 && st.bytes_used == 0);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_auth_fail_closed");
+}
+
+/* Transaction-count exhaustion: the pool follows the core's max_fetches (2);
+ * a third concurrent join is rejected before OK while the origin still holds
+ * the first two, which then complete exactly; live traffic unaffected. */
+static int
+jf_slot_exhaustion(moq_version_t version)
+{
+    g_test_max_fetches = 2;
+    jf_t j;
+    if (!jf_setup(&j, version, 3, true, 1)) return 1 + j.rig.failures;
+    for (int i = 0; i < 3; i++) jf_join(&j, &j.d[i]);
+    jf_wait_requests(&j, 2);
+    for (int i = 0; i < 4; i++) jf_cycle(&j);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 2 && st.rejected_no_slot == 1 && st.live == 2);
+    int rejected = -1;
+    for (int i = 0; i < 3; i++) {
+        if (j.d[i].error == 1) rejected = i;
+    }
+    R_CHECK(&j.rig, rejected >= 0);
+    if (rejected >= 0) {
+        j.rig.failures += jf_check_rejected(&j, &j.d[rejected],
+                                            MOQ_REQUEST_ERROR_INTERNAL_ERROR, "slot exhaustion");
+    }
+    jf_origin_answer_exact(&j, 0, false);
+    jf_origin_answer_exact(&j, 1, false);
+    for (int i = 0; i < 3; i++) {
+        if (i != rejected) {
+            jf_wait_terminal(&j, &j.d[i]);
+            j.rig.failures += jf_check_exact(&j, &j.d[i], false, "slot exhaustion (served)");
+        }
+    }
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.delivered == 2 && st.live == 0 && st.bytes_used == 0 &&
+                    j.o.fetch_requests == 2);
+    jf_live_control(&j);
+    return jf_teardown(&j, "fwd_slot_exhaustion");
+}
+
+/* Unsupported shape stays explicitly rejected: a DESCENDING joining fetch is
+ * answered NOT_SUPPORTED without admission or an upstream request. */
+static int
+jf_descending_rejected(moq_version_t version)
+{
+    jf_t j;
+    if (!jf_setup(&j, version, 1, false, 1)) return 1 + j.rig.failures;
+    moq_result_t rc = jf_join_ex(&j, &j.d[0], MOQ_GROUP_ORDER_DESCENDING);
+    if (version == MOQ_VERSION_DRAFT_18) {
+        /* draft-18's fetch data plane is ascending-only: the requesting
+         * session refuses up front, nothing reaches the relay. */
+        R_CHECK(&j.rig, rc == MOQ_ERR_INVAL);
+    } else {
+        R_CHECK(&j.rig, rc == MOQ_OK);
+        jf_wait_terminal(&j, &j.d[0]);
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_NOT_SUPPORTED,
+                                            "descending");
+    }
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 0 && j.o.fetch_requests == 0);
+    return jf_teardown(&j, "fwd_descending_not_supported");
+}
+
+/* OOM at every allocation attempt the exact single-receiver flow makes from
+ * the join to the terminal (the counting allocator serves the relay binding,
+ * the core AND every session, so each index fails one of them). The
+ * admissible outcomes, judged against what the origin actually managed to
+ * send: the response relayed exactly as sent (OK + every object the origin
+ * wrote + COMPLETE); a rejection before OK; no answer because the origin
+ * never completed its response (then a downstream cancel must clean the
+ * transaction up); or a session that failed under its own allocation. Never
+ * an OK followed by fewer objects than were sent while both sessions are
+ * still established. Transactions, pool bytes and the allocator return to
+ * zero every time. */
+static int
+jf_oom_sweep(moq_version_t version)
+{
+    int failures = 0;
+    long base = 0, span = 0;
+    {
+        jf_t j;
+        if (!jf_setup(&j, version, 1, false, 1)) return 1 + j.rig.failures;
+        base = j.a.attempts;
+        jf_join(&j, &j.d[0]);
+        jf_wait_requests(&j, 1);
+        jf_origin_answer_exact(&j, 0, true);
+        jf_wait_terminal(&j, &j.d[0]);
+        for (int i = 0; i < 4; i++) jf_cycle(&j);
+        span = j.a.attempts - base;
+        failures += jf_check_exact(&j, &j.d[0], true, "oom sweep baseline");
+        failures += jf_teardown(&j, "fwd_oom_sweep_baseline");
+    }
+    int exact = 0, rejected = 0, unanswered = 0, closed = 0, bind_oom = 0;
+    int stalled = 0, delivered_lost = 0;
+    for (long k = 1; k <= span; k++) {
+        jf_t j;
+        if (!jf_setup(&j, version, 1, false, 1)) { failures++; break; }
+        if (j.a.attempts != base) {
+            printf("FAIL: oom sweep %s: setup attempts %ld != %ld\n", j.lbl, j.a.attempts, base);
+            failures++;
+        }
+        j.a.fail_at = base + k;
+        moq_result_t jrc = jf_join_ex(&j, &j.d[0], MOQ_GROUP_ORDER_ASCENDING);
+        moq_result_t acc = MOQ_ERR_INVAL, w0 = MOQ_ERR_INVAL, w1 = MOQ_ERR_INVAL,
+                     fin = MOQ_ERR_INVAL;
+        if (jrc == MOQ_OK) {
+            for (int i = 0; i < 12 && j.o.fetch_requests < 1; i++) jf_cycle(&j);
+            if (j.o.fetch_requests >= 1) {
+                moq_accept_fetch_cfg_t ac;
+                moq_accept_fetch_cfg_init(&ac);
+                ac.end_group = 0;
+                ac.end_object = 2;
+                JF_ORIGIN_RETRY(&j, moq_session_accept_fetch(j.o.cn->peer, j.o.req[0], &ac, j.rig.now), acc);
+                if (acc == MOQ_OK) {
+                    w0 = jf_origin_write_raw(&j, 0, 0, 0, 0xB0, BOOT_BASE_LEN, false);
+                    w1 = jf_origin_write_raw(&j, 0, 0, 1, 0xD0, BOOT_DELTA_LEN, true);
+                    JF_ORIGIN_RETRY(&j, moq_session_end_fetch(j.o.cn->peer, j.o.req[0], j.rig.now), fin);
+                }
+            }
+            jf_wait_terminal(&j, &j.d[0]);
+        }
+        for (int i = 0; i < 8; i++) jf_cycle(&j);
+        j.a.fail_at = 0;
+        const jf_down_t *d = &j.d[0];
+        moqr_bind_fwd_debug_t st;
+        jf_stats(&j, &st);
+        bool sessions_up = moq_session_state(d->cn->peer) == MOQ_SESS_ESTABLISHED &&
+                           moq_session_state(j.o.cn->peer) == MOQ_SESS_ESTABLISHED &&
+                           d->done == 0;
+        int sent = (w0 == MOQ_OK ? 1 : 0) + (w1 == MOQ_OK ? 1 : 0);
+        bool origin_done = acc == MOQ_OK && fin == MOQ_OK;
+        bool is_exact = origin_done && d->ok == 1 && d->objects == sent && d->complete == 1 &&
+                        d->error == 0 && d->reset == 0 &&
+                        (sent < 1 || d->obj_exact[0]) &&
+                        (sent < 2 || (d->obj_exact[1] && d->props_exact[1]));
+        bool is_rejected = d->ok == 0 && d->objects == 0 && d->complete == 0 && d->error == 1;
+        bool is_unanswered = !origin_done && d->ledger_n == 0 && st.live == 1;
+        /* The simulated link drops a segment whose delay entry could not be
+         * allocated: the response never completes upstream (open
+         * transaction, still cancellable) or, once the binding wrote and
+         * finished it (delivered), never completes downstream. */
+        bool is_stalled = origin_done && sessions_up && d->ledger_n == 0 && st.live == 1 &&
+                          st.completed == 0 && st.errors + st.resets + st.lost == 0;
+        bool is_delivered_lost = origin_done && sessions_up && st.delivered == 1 &&
+                                 st.aborted == 0 && d->ok == 1 && d->complete == 0 &&
+                                 d->error == 0 && d->reset == 0;
+        if (st.rejected_oom + st.overflow > 0) bind_oom++;
+        if (is_exact) {
+            exact++;
+        } else if (is_rejected) {
+            rejected++;
+        } else if (is_unanswered || is_stalled) {
+            /* The origin never finished (or its response never arrived):
+             * the transaction is rightly still open. A downstream cancel
+             * must release it completely. */
+            if (is_unanswered) unanswered++; else stalled++;
+            (void)moq_session_fetch_cancel(d->cn->peer, d->fh, j.rig.now);
+            for (int i = 0; i < 8; i++) jf_cycle(&j);
+            jf_stats(&j, &st);
+        } else if (is_delivered_lost) {
+            delivered_lost++;
+        } else if (!sessions_up || jrc != MOQ_OK) {
+            closed++;
+        } else {
+            printf("FAIL: oom sweep %s fail_at=%ld: ok=%d objects=%d complete=%d error=%d reset=%d "
+                   "ledger_n=%d | origin acc=%d w0=%d w1=%d fin=%d | admitted=%llu completed=%llu "
+                   "errors=%llu lost=%llu overflow=%llu delivered=%llu aborted=%llu live=%llu\n",
+                   j.lbl, k, d->ok, d->objects, d->complete, d->error, d->reset, d->ledger_n,
+                   (int)acc, (int)w0, (int)w1, (int)fin, (unsigned long long)st.admitted,
+                   (unsigned long long)st.completed, (unsigned long long)st.errors,
+                   (unsigned long long)st.lost, (unsigned long long)st.overflow,
+                   (unsigned long long)st.delivered, (unsigned long long)st.aborted,
+                   (unsigned long long)st.live);
+            failures++;
+        }
+        if (st.live != 0 || st.bytes_used != 0) {
+            printf("FAIL: oom sweep %s fail_at=%ld: live=%llu bytes_used=%llu\n", j.lbl, k,
+                   (unsigned long long)st.live, (unsigned long long)st.bytes_used);
+            failures++;
+        }
+        j.rig.failures = 0;   /* per-step R_CHECKs are reported through the classes */
+        rig_destroy(&j.rig);
+        if (j.a.live != 0) {
+            printf("FAIL: oom sweep %s fail_at=%ld leaked %ld bytes\n", j.lbl, k, j.a.live);
+            failures++;
+        }
+    }
+    g_test_fetch_forward_bytes = 0;
+    printf("  oom sweep %s: span=%ld exact=%d rejected=%d unanswered=%d stalled=%d "
+           "delivered_lost=%d closed=%d (binding-side refusals observed in %d)\n",
+           version == MOQ_VERSION_DRAFT_16 ? "v16" : "v18", span, exact, rejected, unanswered,
+           stalled, delivered_lost, closed, bind_oom);
+    if (failures == 0) {
+        printf("PASS: fwd_oom_sweep %s\n", version == MOQ_VERSION_DRAFT_16 ? "v16" : "v18");
+    }
+    return failures;
+}
+
+/* The binding's OWN copies, each failed exactly once by size (one-shot):
+ * the owned key at admission, the upstream Track Properties at FETCH_OK,
+ * the error reason at FETCH_ERROR, and the upstream-subscription key copy
+ * at SUBSCRIBE time. Each is a rejection before OK (or, for the reason, a
+ * preserved error without its text), with cleanup to zero. */
+static int
+jf_oom_owned_copies(moq_version_t version)
+{
+    int failures = 0;
+    /* (a) key copy at admission: no transaction, no upstream request. */
+    {
+        jf_t j;
+        if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+        j.a.fail_size = JF_KEY_LEN;
+        jf_join(&j, &j.d[0]);
+        jf_wait_terminal(&j, &j.d[0]);
+        j.a.fail_size = 0;
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                            "oom key copy");
+        moqr_bind_fwd_debug_t st;
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.rejected_oom == 1 && st.admitted == 0 && st.live == 0 &&
+                        st.bytes_used == 0 && j.o.fetch_requests == 0);
+        jf_live_control(&j);
+        failures += jf_teardown(&j, "fwd_oom_key_copy");
+    }
+    /* (b) Track Properties copy at FETCH_OK (draft-18 carries them): the
+     *     collection is abandoned before OK and cancelled upstream. */
+    if (version == MOQ_VERSION_DRAFT_18) {
+        jf_t j;
+        if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+        jf_join(&j, &j.d[0]);
+        jf_wait_requests(&j, 1);
+        j.a.fail_size = 10;   /* the 10-byte Track Properties block */
+        jf_origin_accept(&j, 0, 0, 2, false, true);
+        jf_origin_write_generation(&j, 0, false);
+        jf_origin_end(&j, 0);
+        jf_wait_terminal(&j, &j.d[0]);
+        j.a.fail_size = 0;
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                            "oom props copy");
+        for (int i = 0; i < 6 && j.o.cancelled == 0; i++) jf_cycle(&j);
+        moqr_bind_fwd_debug_t st;
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.overflow == 1 && st.cancelled_up + st.completed == 1 &&
+                        st.live == 0 && st.bytes_used == 0 && st.delivered == 0);
+        jf_live_control(&j);
+        failures += jf_teardown(&j, "fwd_oom_props_copy");
+    }
+    /* (c) reason copy at FETCH_ERROR refused by the allocator, and (c')
+     *     refused by the aggregate budget: the complete upstream error
+     *     cannot be retained, so the downstream gets the relay's OWN
+     *     INTERNAL_ERROR with no retry metadata and no text -- never the
+     *     upstream code with its text silently removed. The upstream ERROR
+     *     already ended the request: no cancel is attempted. */
+    for (int variant = 0; variant < 2; variant++) {
+        if (variant == 1) {
+            g_test_fetch_forward_bytes = JF_KEY_LEN + 4;   /* key fits, reason does not */
+        }
+        jf_t j;
+        if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+        jf_join(&j, &j.d[0]);
+        jf_wait_requests(&j, 1);
+        if (variant == 0) {
+            j.a.fail_size = 9;   /* "forbidden" */
+        }
+        jf_origin_reject(&j, 0, MOQ_REQUEST_ERROR_UNAUTHORIZED, "forbidden", true, 250);
+        jf_wait_terminal(&j, &j.d[0]);
+        j.a.fail_size = 0;
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_INTERNAL_ERROR,
+                                            variant == 0 ? "reason copy refused (allocator)"
+                                                         : "reason copy refused (budget)");
+        R_CHECK(&j.rig, j.d[0].reason_len == 0 && !j.d[0].can_retry);
+        moqr_bind_fwd_debug_t st;
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.errors == 1 && st.reason_unretained == 1 && st.rejected_down == 1 &&
+                        st.cancelled_up == 0 && st.live == 0 && st.bytes_used == 0);
+        R_CHECK(&j.rig, j.o.cancelled == 0);
+        jf_live_control(&j);
+        failures += jf_teardown(&j, variant == 0 ? "fwd_reason_unretained_allocator"
+                                                 : "fwd_reason_unretained_budget");
+    }
+    /* (d) the upstream-subscription key copy at SUBSCRIBE time: the
+     *     subscription still serves live delivery, but a join through it
+     *     finds no forwarding source (DOES_NOT_EXIST), no upstream request. */
+    {
+        jf_t j;
+        memset(&j, 0, sizeof(j));
+        ca_init(&j.a);
+        j.version = version;
+        j.lbl = version == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+        if (rig_create(&j.rig, &j.a) != MOQR_OK) return failures + 1;
+        j.o.cn = rig_connect(&j.rig, version);
+        j.o.largest_object = 1;
+        j.d[0].cn = rig_connect(&j.rig, version);
+        j.n_down = 1;
+        R_CHECK(&j.rig, j.o.cn != NULL && j.d[0].cn != NULL);
+        rig_pump(&j.rig, 4);
+        moq_publish_namespace_cfg_t pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = (moq_bytes_t *)JF_NS, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&j.rig, moq_session_publish_namespace(j.o.cn->peer, &pcfg, j.rig.now, &ann) == MOQ_OK);
+        for (int i = 0; i < 8 && j.o.ns_accepted == 0; i++) jf_cycle(&j);
+        j.a.fail_size = JF_KEY_LEN;   /* the usub key copy is the first 14-byte alloc */
+        jf_subscribe_catalog(&j, &j.d[0]);
+        for (int i = 0; i < 16 && !j.d[0].sub_ok; i++) jf_cycle(&j);
+        j.a.fail_size = 0;
+        R_CHECK(&j.rig, j.d[0].sub_ok && j.o.cat_seen);
+        jf_join(&j, &j.d[0]);
+        jf_wait_terminal(&j, &j.d[0]);
+        j.rig.failures += jf_check_rejected(&j, &j.d[0], MOQ_REQUEST_ERROR_DOES_NOT_EXIST,
+                                            "oom usub key");
+        moqr_bind_fwd_debug_t st;
+        jf_stats(&j, &st);
+        R_CHECK(&j.rig, st.rejected_no_upstream == 1 && st.admitted == 0 && st.live == 0 &&
+                        j.o.fetch_requests == 0);
+        failures += jf_teardown(&j, "fwd_oom_usub_key");
+    }
+    return failures;
+}
+
+/* Admission refusals under downstream backpressure. The downstream pair's
+ * sessions hold a 3-deep action queue. The peer's three PUBLISH_NAMESPACEs
+ * and then its joining fetch are delivered with transport-only steps (no
+ * bind pump), so the ONE pump that processes them fills the relay's queue
+ * with the three acceptances before it reaches the FETCH_REQUEST: the
+ * refusal's moq_session_reject_fetch returns WOULD_BLOCK (observed through
+ * the refusal gauge) and the request stays pending in the session. The
+ * binding must own that refusal: after the queue drains exactly one correct
+ * rejection reaches the peer, no upstream FETCH is sent, nothing is stranded,
+ * no session closes, and unrelated traffic still flows; a cancel or a
+ * connection teardown while the refusal is held releases it without a
+ * rejection. Refusal kinds: authorization denial, unsupported shape
+ * (descending, draft-16), no forwarding source, transaction-pool exhaustion,
+ * key-copy allocation failure, unresolved join (source retired at the
+ * binding while the peer's subscription was still live). */
+enum { JR_AUTH, JR_DESCENDING, JR_NO_SOURCE, JR_POOL, JR_KEY_OOM, JR_UNRESOLVED, JR_COUNT };
+enum { JR_RELEASE, JR_CANCEL, JR_TEARDOWN };
+
+static const char *const jr_names[JR_COUNT] = {
+    "fwd_refusal_held_auth", "fwd_refusal_held_descending", "fwd_refusal_held_no_source",
+    "fwd_refusal_held_pool", "fwd_refusal_held_key_oom", "fwd_refusal_held_unresolved"
+};
+
+static int
+jf_refusal_held(moq_version_t version, int mode, int after)
+{
+    if (mode == JR_DESCENDING && version == MOQ_VERSION_DRAFT_18) {
+        return 0;   /* the requesting session refuses descending locally */
+    }
+    jf_auth_t au;
+    memset(&au, 0, sizeof(au));
+    if (mode == JR_AUTH) {
+        g_test_authorize = jf_auth_hook;
+        g_test_authorize_ctx = &au;
+    }
+    if (mode == JR_POOL) {
+        g_test_max_fetches = 2;
+    }
+    if (mode == JR_NO_SOURCE) {
+        g_jf_setup_usub_key_oom = true;
+    }
+    g_test_max_actions = 3;
+    jf_t j;
+    int n_down = mode == JR_POOL ? 3 : 1;
+    if (!jf_setup(&j, version, n_down, true, 1)) return 1 + j.rig.failures;
+    jf_down_t *d = &j.d[n_down - 1];
+    char label[96];
+    (void)snprintf(label, sizeof(label), "%s/%s", jr_names[mode],
+                   after == JR_RELEASE ? "release" : after == JR_CANCEL ? "cancel" : "teardown");
+    if (mode == JR_POOL) {
+        jf_join(&j, &j.d[0]);
+        jf_join(&j, &j.d[1]);
+        jf_wait_requests(&j, 2);   /* the origin holds both */
+    }
+    /* Three announces from the peer, delivered without a pump. */
+    static const moq_bytes_t JR_H = { (const uint8_t *)"h", 1 };
+    const char *tails[3] = { "t0", "t1", "t2" };
+    for (int t = 0; t < 3; t++) {
+        moq_bytes_t parts[2] = { JR_H, { (const uint8_t *)tails[t], 2 } };
+        moq_publish_namespace_cfg_t pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&j.rig, moq_session_publish_namespace(d->cn->peer, &pcfg, j.rig.now, &ann) == MOQ_OK);
+    }
+    rig_step_pair(&j.rig, d->cn);
+    /* The join, delivered without a pump; mode-specific pre-pump state. */
+    if (mode == JR_DESCENDING) {
+        R_CHECK(&j.rig, jf_join_ex(&j, d, MOQ_GROUP_ORDER_DESCENDING) == MOQ_OK);
+    } else {
+        jf_join(&j, d);
+    }
+    rig_step_pair(&j.rig, d->cn);
+    if (mode == JR_UNRESOLVED) {
+        R_CHECK(&j.rig, moqr_bind_conn_close(j.rig.bind, j.o.cn->rsess) == MOQR_OK);
+        j.o.gone = true;
+    }
+    if (mode == JR_KEY_OOM) {
+        j.a.fail_size = JF_KEY_LEN;
+    }
+    rig_bind_pump_once(&j.rig);
+    j.a.fail_size = 0;
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    jf_down_drain(&j.rig, d);
+    /* The refusal met WOULD_BLOCK and is held; nothing reached the peer. */
+    R_CHECK(&j.rig, st.refusals_blocked == 1 && st.refusals_sent == 0);
+    R_CHECK(&j.rig, d->ledger_n == 0 && d->foreign == 0);
+    R_CHECK(&j.rig, st.admitted == (mode == JR_POOL ? 2u : 0u));
+    uint64_t code = mode == JR_AUTH ? MOQ_REQUEST_ERROR_UNAUTHORIZED
+                  : mode == JR_DESCENDING ? MOQ_REQUEST_ERROR_NOT_SUPPORTED
+                  : mode == JR_NO_SOURCE ? MOQ_REQUEST_ERROR_DOES_NOT_EXIST
+                  : mode == JR_UNRESOLVED ? MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID
+                  : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+    if (after == JR_CANCEL) {
+        R_CHECK(&j.rig, moq_session_fetch_cancel(d->cn->peer, d->fh, j.rig.now) == MOQ_OK);
+    } else if (after == JR_TEARDOWN) {
+        R_CHECK(&j.rig, moqr_bind_conn_close(j.rig.bind, d->cn->rsess) == MOQR_OK);
+    }
+    for (int i = 0; i < 8; i++) jf_cycle(&j);
+    jf_stats(&j, &st);
+    if (after == JR_RELEASE) {
+        j.rig.failures += jf_check_rejected(&j, d, code, label);
+        R_CHECK(&j.rig, st.refusals_sent == 1 && st.refusals_pending == 0 &&
+                        st.refusals_dropped == 0);
+        R_CHECK(&j.rig, moq_session_state(d->cn->peer) == MOQ_SESS_ESTABLISHED &&
+                        moq_session_state(d->cn->rsess) == MOQ_SESS_ESTABLISHED);
+    } else {
+        R_CHECK(&j.rig, d->ledger_n == 0 && d->foreign == 0);
+        R_CHECK(&j.rig, st.refusals_sent == 0 && st.refusals_pending == 0 &&
+                        st.refusals_dropped == 1);
+    }
+    R_CHECK(&j.rig, st.refusals_unparked == 0);
+    if (mode == JR_POOL) {
+        /* The two held transactions are unaffected; afterwards the pool slot
+         * is reusable: a fresh join on the refused peer is served exactly. */
+        R_CHECK(&j.rig, j.o.fetch_requests == 2 && st.live == 2);
+        jf_origin_answer_exact(&j, 0, false);
+        jf_origin_answer_exact(&j, 1, false);
+        jf_wait_terminal(&j, &j.d[0]);
+        jf_wait_terminal(&j, &j.d[1]);
+        j.rig.failures += jf_check_exact(&j, &j.d[0], false, "refusal pool (held a)");
+        j.rig.failures += jf_check_exact(&j, &j.d[1], false, "refusal pool (held b)");
+        if (after == JR_RELEASE) {
+            jf_reset_obs(d);
+            jf_join(&j, d);
+            jf_wait_requests(&j, 3);
+            jf_origin_answer_exact(&j, 2, false);
+            jf_wait_terminal(&j, d);
+            j.rig.failures += jf_check_exact(&j, d, false, "refusal pool (after)");
+        }
+    } else if (mode != JR_UNRESOLVED) {
+        R_CHECK(&j.rig, j.o.fetch_requests == 0);
+    }
+    if (after != JR_TEARDOWN && mode != JR_UNRESOLVED) {
+        jf_live_control(&j);
+    }
+    jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.refusals_pending == 0);
+    return jf_teardown(&j, label);
+}
+
+/* Refusal capacity beyond the binding's fetch pool: the relay is declared
+ * for ONE fetch (max_fetches = 1, so two refusal entries) while the peer's
+ * session may hold 16 pending requests. Three joins arrive under the full
+ * 3-deep downstream queue (announce trick as above): two refusals are held,
+ * which leaves no entry for the third -- its event stays queued in the
+ * session (the connection's polling pauses) instead of being consumed
+ * without an owner. While they are held, the peer cancels the first, issues
+ * a fourth join that reuses that request slot, and announces one more
+ * namespace -- all queued behind. Required outcome: every request receives
+ * exactly its refusal or is retired by its cancel, no request is abandoned,
+ * no session closes, the other connection keeps flowing meanwhile, and
+ * nothing is left held. */
+static int
+jf_refusal_capacity(moq_version_t version)
+{
+    jf_auth_t au;
+    memset(&au, 0, sizeof(au));
+    g_test_authorize = jf_auth_hook;
+    g_test_authorize_ctx = &au;
+    g_test_max_fetches = 1;
+    g_test_max_actions = 3;
+    static jf_trace_t tr;
+    memset(&tr, 0, sizeof(tr));
+    tr.verbose = true;
+    g_test_trace_fn = jf_trace_fn;
+    g_test_trace_ctx = &tr;
+    jf_t j;
+    if (!jf_setup(&j, version, 1, true, 1)) return 1 + j.rig.failures;
+    g_test_trace_fn = NULL;
+    tr.armed = true;
+    jf_down_t *d = &j.d[0];
+    static const moq_bytes_t JR_H = { (const uint8_t *)"h", 1 };
+    const char *tails[4] = { "t0", "t1", "t2", "t3" };
+    for (int t = 0; t < 3; t++) {
+        moq_bytes_t parts[2] = { JR_H, { (const uint8_t *)tails[t], 2 } };
+        moq_publish_namespace_cfg_t pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&j.rig, moq_session_publish_namespace(d->cn->peer, &pcfg, j.rig.now, &ann) == MOQ_OK);
+    }
+    moqr_bind_stats_t bs0;
+    moqr_bind_get_stats(j.rig.bind, &bs0);
+    rig_step_pair(&j.rig, d->cn);
+    /* Three joins (A = d->fh, B = req_fh[0], C = req_fh[1]). */
+    jf_join(&j, d);
+    moq_fetch_t fa = d->fh;
+    moq_fetch_cfg_t fc;
+    memset(&fc, 0, sizeof(fc));
+    moq_fetch_cfg_init(&fc);
+    fc.is_joining = true;
+    fc.joining_relative = true;
+    fc.joining_sub = d->sh;
+    R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[0]) == MOQ_OK);
+    R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[1]) == MOQ_OK);
+    d->req_n = 2;
+    rig_step_pair(&j.rig, d->cn);
+    rig_bind_pump_once(&j.rig);
+    moqr_bind_fwd_debug_t st;
+    jf_stats(&j, &st);
+    jf_down_drain(&j.rig, d);
+    /* A and B refused and held (both entries); C's request stays queued in
+     * the session: the pump paused this connection rather than consume a
+     * request it could not own. */
+    R_CHECK(&j.rig, st.refusals_blocked == 2 && st.refusals_sent == 0 &&
+                    st.refusals_unparked == 0 && st.refusals_pending == 2 && st.polls_paused >= 1);
+    R_CHECK(&j.rig, d->ledger_n == 0 && d->req_err[0] == 0 && d->req_err[1] == 0 && d->ns_accepted == 0);
+    /* Held: cancel A, issue D on the freed request slot, announce t3. */
+    R_CHECK(&j.rig, moq_session_fetch_cancel(d->cn->peer, fa, j.rig.now) == MOQ_OK);
+    R_CHECK(&j.rig, moq_session_fetch(d->cn->peer, &fc, j.rig.now, &d->req_fh[2]) == MOQ_OK);
+    d->req_n = 3;
+    {
+        moq_bytes_t parts[2] = { JR_H, { (const uint8_t *)tails[3], 2 } };
+        moq_publish_namespace_cfg_t pcfg;
+        memset(&pcfg, 0, sizeof(pcfg));
+        moq_publish_namespace_cfg_init(&pcfg);
+        pcfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 2 };
+        moq_announcement_t ann;
+        R_CHECK(&j.rig, moq_session_publish_namespace(d->cn->peer, &pcfg, j.rig.now, &ann) == MOQ_OK);
+    }
+    rig_step_pair(&j.rig, d->cn);   /* delivered; the relay's queue is still full */
+    rig_bind_pump_once(&j.rig);
+    jf_stats(&j, &st);
+    jf_down_drain(&j.rig, d);
+    /* With two refusals held against a one-fetch pool the connection's
+     * event consumption was paused in that pump: the cancel, C and t3 stayed
+     * queued (t3 not accepted; the three earlier acceptances, drained by the
+     * step, are what the peer sees), and nothing was abandoned. The held
+     * refusals themselves commit in the same pump once the step emptied the
+     * queue. */
+    {
+        moqr_bind_stats_t bs1;
+        moqr_bind_get_stats(j.rig.bind, &bs1);
+        printf("  refusal capacity %s at pause: paused=%llu pending=%llu sent=%llu ns_accepted=%d ledger=%d "
+               "errB=%d errC=%d session_errors %llu->%llu\n", j.lbl, (unsigned long long)st.polls_paused,
+               (unsigned long long)st.refusals_pending, (unsigned long long)st.refusals_sent,
+               d->ns_accepted, d->ledger_n, d->req_err[0], d->req_err[1],
+               (unsigned long long)bs0.session_errors, (unsigned long long)bs1.session_errors);
+        printf("  refusal capacity %s at pause: ns_rejected=%d code=%llu reason=\"%s\"\n", j.lbl,
+               d->ns_rejected, (unsigned long long)d->ns_rejected_code, d->ns_rejected_reason);
+        if (d->ns_accepted != 3) jf_trace_dump(&tr, "refusal capacity");
+    }
+    tr.armed = false;
+    R_CHECK(&j.rig, st.polls_paused >= 2 && st.refusals_unparked == 0 && st.refusals_pending <= 2);
+    R_CHECK(&j.rig, d->ns_accepted == 3 && d->ledger_n == 0 && d->req_err[0] == 0 &&
+                    d->req_err[1] == 0 && d->req_err[2] == 0);
+    /* The other connection keeps flowing meanwhile (its own pumps drain the
+     * downstream queue too, so the refusals commit along the way). */
+    jf_live_control(&j);
+    for (int i = 0; i < 8; i++) jf_cycle(&j);
+    jf_stats(&j, &st);
+    /* A: retired by its cancel (the held refusal found the request gone);
+     * B, C and D: exactly one refusal each; t0..t3 accepted; nothing held. */
+    R_CHECK(&j.rig, d->ledger_n == 0);                       /* A: no error */
+    R_CHECK(&j.rig, d->req_err[0] == 1 && d->req_err[1] == 1 && d->req_err[2] == 1 &&
+                    d->foreign == 0);
+    R_CHECK(&j.rig, d->ns_accepted == 4);
+    R_CHECK(&j.rig, st.refusals_sent == 3 && st.refusals_gone + st.refusals_dropped == 1 &&
+                    st.refusals_pending == 0 && st.refusals_unparked == 0);
+    R_CHECK(&j.rig, moq_session_state(d->cn->peer) == MOQ_SESS_ESTABLISHED &&
+                    moq_session_state(d->cn->rsess) == MOQ_SESS_ESTABLISHED);
+    R_CHECK(&j.rig, j.o.fetch_requests == 0 && st.admitted == 0);
+    printf("  refusal capacity %s: blocked=%llu parked=%llu paused=%llu sent=%llu gone=%llu dropped=%llu\n",
+           j.lbl, (unsigned long long)st.refusals_blocked, (unsigned long long)st.refusals_parked,
+           (unsigned long long)st.polls_paused, (unsigned long long)st.refusals_sent,
+           (unsigned long long)st.refusals_gone, (unsigned long long)st.refusals_dropped);
+    return jf_teardown(&j, "fwd_refusal_capacity");
+}
+
+static int
+jf_refusals_all(moq_version_t v)
+{
+    int f = 0;
+    for (int mode = 0; mode < JR_COUNT; mode++) {
+        f += jf_refusal_held(v, mode, JR_RELEASE);
+        if (mode != JR_POOL) {
+            f += jf_refusal_held(v, mode, JR_CANCEL);
+            f += jf_refusal_held(v, mode, JR_TEARDOWN);
+        }
+    }
+    f += jf_refusal_capacity(v);
+    return f;
+}
+
+/* Config ABI of the appended fetch_forward_bytes: old-size storage (a buffer
+ * of exactly the pre-append size, so any read past it is out of bounds),
+ * poisoned tail bytes, partial-field presence, full-size zero/custom values,
+ * 32-bit representability (refused above UINT32_MAX, never truncated), and
+ * the estimator's total_bytes carrying the two forwarding ceilings. */
+static int
+jf_cfg_abi(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t ccfg;
+    moqr_core_relay_cfg_init_sized(&ccfg, sizeof(ccfg), &a.vt);
+    ccfg.log_budget.max_groups = 4;
+    ccfg.log_budget.max_bytes = 1 << 20;
+    moqr_core_t *core = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&ccfg, &core) == MOQR_OK);
+    moqr_core_limits_t lim;
+    MOQ_TEST_CHECK(moqr_core_limits_resolve(&ccfg, &lim) == MOQR_OK);
+    const size_t old_size = offsetof(moqr_bind_cfg_t, fetch_forward_bytes);
+    const size_t full = sizeof(moqr_bind_cfg_t);
+#define JF_CAP_OF(cfgp, out)                                                  \
+    do {                                                                      \
+        moqr_bind_t *b_ = NULL;                                               \
+        moqr_result_t rc_ = moqr_bind_create((cfgp), &b_);                    \
+        if (rc_ == MOQR_OK) {                                                 \
+            moqr_bind_fwd_debug_t st_;                                        \
+            moqr_bind_debug_fwd_stats(b_, &st_);                              \
+            (out) = st_.bytes_cap;                                            \
+            moqr_bind_destroy(b_);                                            \
+        } else {                                                              \
+            (out) = UINT64_MAX;                                               \
+        }                                                                     \
+    } while (0)
+    uint64_t cap;
+    /* 1. Old-size storage: the caller's struct occupies exactly old_size
+     *    bytes (a heap block of that size), so any read past it is out of
+     *    bounds; the full-size local only prepares the prefix bytes. */
+    {
+        uint8_t *buf = malloc(old_size);
+        MOQ_TEST_CHECK(buf != NULL);
+        moqr_bind_cfg_t prep;
+        moqr_bind_cfg_init_sized(&prep, old_size, &a.vt);
+        MOQ_TEST_CHECK(prep.struct_size == (uint32_t)old_size);
+        prep.core = core;
+        prep.max_conns = 2;
+        memcpy(buf, &prep, old_size);
+        const moqr_bind_cfg_t *cfg = (const moqr_bind_cfg_t *)(const void *)buf;
+        JF_CAP_OF(cfg, cap);
+        MOQ_TEST_CHECK_EQ_U64(cap, MOQR_BIND_DEF_FETCH_FORWARD_BYTES);
+        moqr_bind_capacity_t cp;
+        MOQ_TEST_CHECK(moqr_bind_capacity_describe(cfg, &lim, &cp) == MOQR_OK);
+        moqr_bind_limits_t bl;
+        MOQ_TEST_CHECK(moqr_bind_cfg_resolve(cfg, &lim, &bl) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(cp.total_bytes - cp.structure_bytes - cp.announce_bytes,
+                              MOQR_BIND_DEF_FETCH_FORWARD_BYTES +
+                                  (uint64_t)bl.max_conns * bl.n_usubs * 4096u);
+        free(buf);
+    }
+    /* 2. Poisoned tail: a full-size struct whose bytes past the old size are
+     *    garbage, with struct_size = old size. */
+    {
+        moqr_bind_cfg_t cfg;
+        memset(&cfg, 0xA5, sizeof(cfg));
+        moqr_bind_cfg_init_sized(&cfg, old_size, &a.vt);
+        MOQ_TEST_CHECK(cfg.struct_size == (uint32_t)old_size);
+        MOQ_TEST_CHECK(cfg.fetch_forward_bytes == 0xA5A5A5A5A5A5A5A5ull);
+        cfg.core = core;
+        cfg.max_conns = 2;
+        JF_CAP_OF(&cfg, cap);
+        MOQ_TEST_CHECK_EQ_U64(cap, MOQR_BIND_DEF_FETCH_FORWARD_BYTES);
+    }
+    /* 3. Partial-field presence: the struct reaches only part of the field. */
+    {
+        moqr_bind_cfg_t cfg;
+        moqr_bind_cfg_init_sized(&cfg, full, &a.vt);
+        cfg.struct_size = (uint32_t)(old_size + 4);
+        cfg.fetch_forward_bytes = 0xFFFFFFFFFFFFFFFFull;   /* would be refused if read */
+        cfg.core = core;
+        cfg.max_conns = 2;
+        JF_CAP_OF(&cfg, cap);
+        MOQ_TEST_CHECK_EQ_U64(cap, MOQR_BIND_DEF_FETCH_FORWARD_BYTES);
+    }
+    /* 4. Full size: zero = default; custom honored; UINT32_MAX honored;
+     *    UINT32_MAX + 1 refused by create, describe and resolve alike. */
+    {
+        moqr_bind_cfg_t cfg;
+        moqr_bind_cfg_init_sized(&cfg, full, &a.vt);
+        cfg.core = core;
+        cfg.max_conns = 2;
+        JF_CAP_OF(&cfg, cap);
+        MOQ_TEST_CHECK_EQ_U64(cap, MOQR_BIND_DEF_FETCH_FORWARD_BYTES);
+        cfg.fetch_forward_bytes = 65536;
+        JF_CAP_OF(&cfg, cap);
+        MOQ_TEST_CHECK_EQ_U64(cap, 65536);
+        moqr_bind_capacity_t cp;
+        MOQ_TEST_CHECK(moqr_bind_capacity_describe(&cfg, &lim, &cp) == MOQR_OK);
+        moqr_bind_limits_t bl;
+        MOQ_TEST_CHECK(moqr_bind_cfg_resolve(&cfg, &lim, &bl) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(cp.total_bytes - cp.structure_bytes - cp.announce_bytes,
+                              65536u + (uint64_t)bl.max_conns * bl.n_usubs * 4096u);
+        cfg.fetch_forward_bytes = UINT32_MAX;
+        JF_CAP_OF(&cfg, cap);
+        MOQ_TEST_CHECK_EQ_U64(cap, UINT32_MAX);
+        cfg.fetch_forward_bytes = (uint64_t)UINT32_MAX + 1u;
+        moqr_bind_t *b = (moqr_bind_t *)(void *)&cfg;   /* must be reset to NULL */
+        MOQ_TEST_CHECK(moqr_bind_create(&cfg, &b) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(b == NULL);
+        MOQ_TEST_CHECK(moqr_bind_capacity_describe(&cfg, &lim, &cp) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(cp.total_bytes == 0 && cp.structure_bytes == 0);
+        MOQ_TEST_CHECK(moqr_bind_cfg_resolve(&cfg, &lim, &bl) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(bl.max_conns == 0 && bl.n_fetches == 0);
+    }
+#undef JF_CAP_OF
+    moqr_core_destroy(core);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    if (failures == 0) {
+        MOQ_TEST_PASS("fwd_cfg_abi");
+    }
+    return failures;
+}
+
+static int
+jf_all(moq_version_t v)
+{
+    int f = 0;
+    f += jf_exact_single(v, false);
+    f += jf_exact_single(v, true);
+    f += jf_exact_two(v);
+    f += jf_shared_bound(v);
+    f += jf_count_overflow(v);
+    f += jf_upstream_error(v);
+    f += jf_range_mismatch(v, false);
+    f += jf_range_mismatch(v, true);
+    f += jf_upstream_reset(v);
+    f += jf_source_loss_replacement(v);
+    f += jf_down_cancel(v, false);
+    f += jf_down_cancel(v, true);
+    f += jf_down_cancel_after_ok(v);
+    f += jf_queued_tail_reuse(v);
+    f += jf_block_upstream(v, false);
+    f += jf_block_upstream(v, true);
+    f += jf_block_downstream(v, 0);
+    f += jf_block_downstream(v, 1);
+    f += jf_block_downstream(v, 2);
+    f += jf_block_downstream(v, 3);
+    f += jf_block_downstream(v, 4);
+    f += jf_abort_after_ok(v);
+    f += jf_auth_fail_closed(v);
+    f += jf_slot_exhaustion(v);
+    f += jf_descending_rejected(v);
+    f += jf_oom_owned_copies(v);
+    f += jf_oom_sweep(v);
+    f += jf_refusals_all(v);
+    return f;
+}
+
+/* ---- Fetcher-side FETCH lifetime probes (direct SimPair, raw sessions) ----- *
+ * What a relay that forwards an upstream FETCH must know, measured on the
+ * public session API on both drafts:
+ *   P1 cancel after FETCH_OK + one object with the response still open:
+ *      exact moq_session_fetch_cancel result, the publisher's observed
+ *      cancellation (FETCH_CANCELLED event; a later write on its handle),
+ *      delivery of objects that were ALREADY queued at the fetcher before the
+ *      cancel (old handle), their release through moq_event_cleanup, and
+ *      immediate request-slot reuse (fresh generation).
+ *   P2 cancel refused by a full action queue (WOULD_BLOCK) is retryable.
+ *   P3 error terminal (publisher rejects): slot reuse after FETCH_ERROR on
+ *      both drafts (draft-18 keeps the request bidi draining until FIN).
+ *   P4 completion terminal: OK -> object -> COMPLETE, then slot reuse; a
+ *      publisher write on the completed handle is STALE_HANDLE.
+ * The counting allocator proves reference reclamation (live == 0 at exit). */
+typedef struct probe_ev {
+    int      ok, obj, gap, complete, err, cancelled, request;
+    uint64_t err_code;
+    uint64_t last_obj_fetch;   /* handle carried by the last FETCH_OBJECT */
+    int      obj_old_handle;   /* objects that still carried a given handle */
+    moq_fetch_t last_req;      /* publisher: last FETCH_REQUEST handle      */
+    moq_fetch_t last_cancelled;
+} probe_ev_t;
+
+static void
+probe_drain(moq_session_t *sess, probe_ev_t *o, uint64_t watch_handle)
+{
+    moq_event_t evs[8];
+    size_t n;
+    while ((n = moq_session_poll_events(sess, evs, 8)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            moq_event_t *ev = &evs[i];
+            switch (ev->kind) {
+            case MOQ_EVENT_FETCH_REQUEST:
+                o->request++;
+                o->last_req = ev->u.fetch_request.fetch;
+                break;
+            case MOQ_EVENT_FETCH_OK:        o->ok++; break;
+            case MOQ_EVENT_FETCH_OBJECT:
+                o->obj++;
+                o->last_obj_fetch = ev->u.fetch_object.fetch._opaque;
+                if (ev->u.fetch_object.fetch._opaque == watch_handle) {
+                    o->obj_old_handle++;
+                }
+                break;
+            case MOQ_EVENT_FETCH_GAP:       o->gap++; break;
+            case MOQ_EVENT_FETCH_COMPLETE:  o->complete++; break;
+            case MOQ_EVENT_FETCH_ERROR:
+                o->err++;
+                o->err_code = ev->u.fetch_error.error_code;
+                break;
+            case MOQ_EVENT_FETCH_CANCELLED:
+                o->cancelled++;
+                o->last_cancelled = ev->u.fetch_cancelled.fetch;
+                break;
+            default: break;
+            }
+            moq_event_cleanup(ev);   /* releases FETCH_OBJECT refs we did not take */
+        }
+    }
+}
+
+static moq_result_t
+probe_pub_write(ca_t *a, moq_session_t *pub, moq_fetch_t fh, uint64_t oid,
+                uint64_t now)
+{
+    uint8_t body[16];
+    memset(body, (int)(0x70 + oid), sizeof(body));
+    moq_rcbuf_t *pl = NULL;
+    if (moq_rcbuf_create(&a->vt, body, sizeof(body), &pl) != MOQ_OK) {
+        return MOQ_ERR_NOMEM;
+    }
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.group_id = 0;
+    oc.subgroup_id = 0;
+    oc.object_id = oid;
+    oc.publisher_priority = 100;
+    oc.payload = pl;
+    moq_result_t rc = moq_session_write_fetch_object(pub, fh, &oc, now);
+    moq_rcbuf_decref(pl);
+    return rc;
+}
+
+static int
+fetch_lifetime_probe(moq_version_t version, bool tiny_action_queue)
+{
+    ca_t a;
+    ca_init(&a);
+    int failures = 0;
+    const char *lbl = version == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = &a.vt;
+    cfg.seed = 0x9F0BEu;
+    cfg.version = version;
+    /* Fill variant: a 3-deep action queue on BOTH sessions; the publisher's
+     * calls below retry across cycles, the fetcher fills its queue before the
+     * cancel so the cancel meets a genuinely full queue. */
+    cfg.max_actions = tiny_action_queue ? 3 : 0;
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 1024;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 1024;
+    moq_simpair_t *sp = NULL;
+    if (moq_simpair_create(&cfg, &sp) != MOQ_OK || moq_simpair_start(sp) != MOQ_OK) {
+        printf("FAIL: fetch_lifetime_probe simpair\n");
+        return 1;
+    }
+    moq_session_t *fetcher = moq_simpair_client(sp);
+    moq_session_t *pub = moq_simpair_server(sp);
+    uint64_t now = 1;
+#define PROBE_CYCLE()                                                     \
+    do {                                                                  \
+        now += 1000;                                                      \
+        (void)moq_simpair_advance_to(sp, now);                            \
+        size_t steps_ = 0;                                                \
+        (void)moq_simpair_run_until_quiescent(sp, 64, &steps_);           \
+    } while (0)
+    for (int i = 0; i < 8; i++) PROBE_CYCLE();
+    moq_bytes_t nsp[1] = { B("probe") };
+    moq_fetch_cfg_t fc;
+    memset(&fc, 0, sizeof(fc));
+    moq_fetch_cfg_init(&fc);
+    fc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    fc.track_name = B("t");
+    fc.start_group = 0; fc.start_object = 0; fc.end_group = 0; fc.end_object = 3;
+    probe_ev_t fo, po;
+    memset(&fo, 0, sizeof(fo));
+    memset(&po, 0, sizeof(po));
+
+    /* P1: OK + one object delivered, response left open, then cancel. */
+    moq_fetch_t f1;
+    if (moq_session_fetch(fetcher, &fc, now, &f1) != MOQ_OK) {
+        printf("FAIL: probe %s: initial fetch not placed\n", lbl);
+        moq_simpair_destroy(sp);
+        return 1;
+    }
+    for (int i = 0; i < 6 && po.request == 0; i++) { PROBE_CYCLE(); probe_drain(pub, &po, 0); }
+    if (po.request != 1) { printf("FAIL: probe %s: publisher saw %d requests\n", lbl, po.request); failures++; }
+    moq_accept_fetch_cfg_t ac;
+    moq_accept_fetch_cfg_init(&ac);
+    ac.end_of_track = false; ac.end_group = 0; ac.end_object = 3;
+#define PROBE_RETRY(expr, var)                                            \
+    do {                                                                  \
+        var = (expr);                                                     \
+        for (int r_ = 0; r_ < 8 && var == MOQ_ERR_WOULD_BLOCK; r_++) {    \
+            PROBE_CYCLE();                                                \
+            var = (expr);                                                 \
+        }                                                                 \
+    } while (0)
+    moq_result_t arc, w0;
+    PROBE_RETRY(moq_session_accept_fetch(pub, po.last_req, &ac, now), arc);
+    PROBE_RETRY(probe_pub_write(&a, pub, po.last_req, 0, now), w0);
+    for (int i = 0; i < 6 && !(fo.ok == 1 && fo.obj == 1); i++) { PROBE_CYCLE(); probe_drain(fetcher, &fo, f1._opaque); }
+    printf("PROBE P1 %s: accept rc=%d write0 rc=%d fetcher ok=%d obj=%d complete=%d (response open)\n",
+           lbl, (int)arc, (int)w0, fo.ok, fo.obj, fo.complete);
+    if (!(arc == MOQ_OK && w0 == MOQ_OK && fo.ok == 1 && fo.obj == 1 && fo.complete == 0)) {
+        printf("FAIL: probe %s: P1 setup\n", lbl); failures++;
+    }
+    /* Two more objects: transported so they are QUEUED at the fetcher, NOT polled. */
+    moq_result_t w1, w2;
+    PROBE_RETRY(probe_pub_write(&a, pub, po.last_req, 1, now), w1);
+    PROBE_RETRY(probe_pub_write(&a, pub, po.last_req, 2, now), w2);
+    PROBE_CYCLE(); PROBE_CYCLE();
+    /* P2 (fill variant): fill the FETCHER's action queue with control requests
+     * (no transport step) until one is refused WOULD_BLOCK, so the cancel that
+     * follows meets a genuinely full queue; one cycle drains it, then retry. */
+    moq_result_t pre = MOQ_OK;
+    int filled = 0;
+    if (tiny_action_queue) {
+        /* Distinct TRACK_STATUS requests: one control action each, no
+         * dedup, no fetch-slot consumption. */
+        for (int i = 0; i < 4096; i++) {
+            char nm[8];
+            (void)snprintf(nm, sizeof(nm), "s%04d", i);
+            moq_track_status_cfg_t tsc;
+            memset(&tsc, 0, sizeof(tsc));
+            moq_track_status_cfg_init(&tsc);
+            tsc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+            tsc.track_name = (moq_bytes_t){ (const uint8_t *)nm, strlen(nm) };
+            moq_track_status_handle_t tsh;
+            pre = moq_session_track_status(fetcher, &tsc, now, &tsh);
+            if (pre != MOQ_OK) break;
+            filled++;
+        }
+    }
+    moq_result_t c1 = moq_session_fetch_cancel(fetcher, f1, now);
+    moq_result_t c1b = MOQ_OK;
+    if (tiny_action_queue) {
+        PROBE_CYCLE();                      /* drain the action queue */
+        c1b = moq_session_fetch_cancel(fetcher, f1, now);
+    }
+    /* Immediate slot reuse: a new fetch right after the cancel. */
+    moq_fetch_t f2;
+    moq_result_t r2 = moq_session_fetch(fetcher, &fc, now, &f2);
+    /* Now poll: the two already-queued objects still carry the OLD handle. */
+    int obj_before = fo.obj;
+    probe_drain(fetcher, &fo, f1._opaque);
+    int queued_old = fo.obj - obj_before;
+    for (int i = 0; i < 6; i++) { PROBE_CYCLE(); probe_drain(pub, &po, 0); probe_drain(fetcher, &fo, f1._opaque); }
+    /* The publisher's handle for the first request (its own handle space). */
+    moq_result_t w_after = probe_pub_write(&a, pub, po.last_cancelled, 3, now);
+    moq_result_t c_again = moq_session_fetch_cancel(fetcher, f1, now);
+    printf("PROBE P1/P2 %s: fill=%d last_fill_rc=%d cancel rc=%d%s%d reuse rc=%d handle_changed=%d; queued old-handle objects "
+           "polled after cancel=%d (old-handle total %d, w1=%d w2=%d); publisher FETCH_CANCELLED=%d "
+           "(handle matches=%d) write_after=%d; second cancel=%d; publisher saw requests=%d\n",
+           lbl, filled, (int)pre, (int)c1, tiny_action_queue ? " retry rc=" : "", tiny_action_queue ? (int)c1b : 0,
+           (int)r2, (int)(r2 == MOQ_OK && f2._opaque != f1._opaque), queued_old, fo.obj_old_handle,
+           (int)w1, (int)w2, po.cancelled, (int)(po.cancelled == 1) /* its own handle space */,
+           (int)w_after, (int)c_again, po.request);
+    if (tiny_action_queue) {
+        if (!(pre == MOQ_ERR_WOULD_BLOCK && c1 == MOQ_ERR_WOULD_BLOCK && c1b == MOQ_OK)) {
+            printf("FAIL: probe %s: P2 expected fill WOULD_BLOCK, cancel WOULD_BLOCK, retry OK\n", lbl); failures++;
+        }
+    } else if (c1 != MOQ_OK) {
+        printf("FAIL: probe %s: P1 cancel after OK+object rc=%d\n", lbl, (int)c1); failures++;
+    }
+    if (!(r2 == MOQ_OK && f2._opaque != f1._opaque)) { printf("FAIL: probe %s: slot reuse\n", lbl); failures++; }
+    if (c_again != MOQ_ERR_STALE_HANDLE) { printf("FAIL: probe %s: second cancel rc=%d\n", lbl, (int)c_again); failures++; }
+    if (po.cancelled != 1) { printf("FAIL: probe %s: publisher cancelled events=%d\n", lbl, po.cancelled); failures++; }
+    if (w_after != MOQ_ERR_STALE_HANDLE && w_after != MOQ_ERR_WRONG_STATE) {
+        printf("FAIL: probe %s: publisher write after cancel rc=%d\n", lbl, (int)w_after); failures++;
+    }
+    /* P3: the publisher rejects the second request -> FETCH_ERROR terminal; reuse again. */
+    moq_reject_fetch_cfg_t rj;
+    moq_reject_fetch_cfg_init(&rj);
+    rj.error_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+    moq_result_t rj_rc = MOQ_ERR_INVAL;
+    for (int i = 0; i < 6 && po.request < 2; i++) { PROBE_CYCLE(); probe_drain(pub, &po, 0); }
+    if (po.request == 2) PROBE_RETRY(moq_session_reject_fetch(pub, po.last_req, &rj, now), rj_rc);
+    for (int i = 0; i < 6 && fo.err == 0; i++) { PROBE_CYCLE(); probe_drain(fetcher, &fo, f1._opaque); }
+    moq_fetch_t f3;
+    moq_result_t r3 = moq_session_fetch(fetcher, &fc, now, &f3);
+    printf("PROBE P3 %s: reject rc=%d fetcher err=%d code=%llu; reuse after error rc=%d handle_changed=%d\n",
+           lbl, (int)rj_rc, fo.err, (unsigned long long)fo.err_code, (int)r3,
+           (int)(r3 == MOQ_OK && f3._opaque != f2._opaque));
+    if (!(rj_rc == MOQ_OK && fo.err == 1 && fo.err_code == MOQ_REQUEST_ERROR_NOT_SUPPORTED && r3 == MOQ_OK)) {
+        printf("FAIL: probe %s: P3\n", lbl); failures++;
+    }
+    /* P4: completion terminal, then reuse; publisher write on the completed handle. */
+    for (int i = 0; i < 6 && po.request < 3; i++) { PROBE_CYCLE(); probe_drain(pub, &po, 0); }
+    moq_result_t a3 = MOQ_ERR_INVAL, w3 = MOQ_ERR_INVAL, e3 = MOQ_ERR_INVAL;
+    if (po.request == 3) {
+        PROBE_RETRY(moq_session_accept_fetch(pub, po.last_req, &ac, now), a3);
+        PROBE_RETRY(probe_pub_write(&a, pub, po.last_req, 0, now), w3);
+        PROBE_RETRY(moq_session_end_fetch(pub, po.last_req, now), e3);
+    }
+    int ok_before = fo.ok, obj_b4 = fo.obj, cmp_b4 = fo.complete;
+    for (int i = 0; i < 8 && fo.complete == cmp_b4; i++) { PROBE_CYCLE(); probe_drain(fetcher, &fo, f1._opaque); }
+    moq_result_t w_done = po.request == 3 ? probe_pub_write(&a, pub, po.last_req, 1, now) : MOQ_ERR_INVAL;
+    moq_fetch_t f4;
+    moq_result_t r4 = moq_session_fetch(fetcher, &fc, now, &f4);
+    printf("PROBE P4 %s: accept=%d write=%d end=%d fetcher ok+%d obj+%d complete+%d; publisher write after FIN=%d; reuse rc=%d handle_changed=%d\n",
+           lbl, (int)a3, (int)w3, (int)e3, fo.ok - ok_before, fo.obj - obj_b4, fo.complete - cmp_b4,
+           (int)w_done, (int)r4, (int)(r4 == MOQ_OK && f4._opaque != f3._opaque));
+    if (!(a3 == MOQ_OK && w3 == MOQ_OK && e3 == MOQ_OK && fo.ok - ok_before == 1 &&
+          fo.obj - obj_b4 == 1 && fo.complete - cmp_b4 == 1 && w_done == MOQ_ERR_STALE_HANDLE && r4 == MOQ_OK)) {
+        printf("FAIL: probe %s: P4\n", lbl); failures++;
+    }
+    /* leave f4 pending; teardown must reclaim everything */
+    for (int i = 0; i < 4; i++) { PROBE_CYCLE(); probe_drain(pub, &po, 0); probe_drain(fetcher, &fo, f1._opaque); }
+#undef PROBE_RETRY
+#undef PROBE_CYCLE
+    moq_simpair_destroy(sp);
+    if (a.live != 0) { printf("FAIL: probe %s: live allocations after teardown=%zu\n", lbl, a.live); failures++; }
+    if (failures == 0) {
+        printf("PASS: fetch_lifetime_probe %s%s\n", lbl, tiny_action_queue ? " (full action queue at cancel)" : "");
+    }
+    return failures;
+}
+
+int
+main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--core-red-cancel-after-stop") == 0) {
+        int f = core_red_cancel_after_stop(MOQ_VERSION_DRAFT_16);
+        f += core_red_cancel_after_stop(MOQ_VERSION_DRAFT_18);
+        return f == 0 ? 0 : 1;
+    }
     int failures = 0;
     failures += subscribe_omitted_filter_is_unfiltered(MOQ_VERSION_DRAFT_16);
     failures += subscribe_omitted_filter_is_unfiltered(MOQ_VERSION_DRAFT_18);
@@ -12840,6 +15538,13 @@ main(void)
     failures += nsu_case(MOQ_VERSION_DRAFT_18, true, false, 6);  /* repeated */
     failures += nsu_multipart_bytes_exact();
     failures += nsu_close_purges_held();
+    failures += jf_all(MOQ_VERSION_DRAFT_16);
+    failures += jf_all(MOQ_VERSION_DRAFT_18);
+    failures += jf_cfg_abi();
+    failures += fetch_lifetime_probe(MOQ_VERSION_DRAFT_16, false);
+    failures += fetch_lifetime_probe(MOQ_VERSION_DRAFT_18, false);
+    failures += fetch_lifetime_probe(MOQ_VERSION_DRAFT_16, true);
+    failures += fetch_lifetime_probe(MOQ_VERSION_DRAFT_18, true);
 
     uint64_t h1 = parity_hash_run();
     uint64_t h2 = parity_hash_run();

@@ -13,6 +13,10 @@ endforeach()
 
 set(_prefix "${WORK}/network-only-prefix")
 set(_tree "${WORK}/network-only-tree")
+set(_context)
+if(CONSUMER_CONTEXT)
+    list(APPEND _context -C "${CONSUMER_CONTEXT}")
+endif()
 file(REMOVE_RECURSE "${_prefix}" "${_tree}")
 
 # clone the prefix, then strip the msquic component out of it
@@ -30,13 +34,16 @@ endif()
 file(REMOVE ${_msq})
 
 execute_process(
-    COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_tree}"
+    COMMAND ${CMAKE_COMMAND} ${_context} -S "${SRC}" -B "${_tree}"
         -DMOQ_BUILD_TESTS=ON
         -DMOQ_BUILD_ADAPTER_WTQUIC=ON
         -DMOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON
+        -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=OFF
+        -DMOQ_BUILD_SERVICE=ON -DMOQ_BUILD_MSF=ON
+        -DMOQ_WARNINGS_AS_ERRORS=ON
         "-DCMAKE_PREFIX_PATH=${_prefix}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
+if(NOT _rc EQUAL 0 OR _out MATCHES "[Ww]arning([ :]|$)")
     message(FATAL_ERROR "network-only tests-on configure failed:\n${_out}")
 endif()
 if(_out MATCHES "wtq::msquic")
@@ -46,10 +53,20 @@ endif()
 execute_process(
     COMMAND ${CMAKE_COMMAND} --build "${_tree}"
         --target moq-adapter-wtquic-network-managed test_wtquic_keys
-        test_wtquic_public_compile
+        test_wtquic_public_compile test_wtquic_network_managed
+        test_endpoint_wtquic_network_smoke
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
+if(NOT _rc EQUAL 0 OR _out MATCHES "[Ww]arning([ :]|$)")
     message(FATAL_ERROR "network-only tests-on build failed:\n${_out}")
+endif()
+
+execute_process(
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir "${_tree}" -V
+        -R "^(wtquic_network_managed|endpoint_wtquic_network_smoke)$"
+    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+file(WRITE "${WORK}/network-only-policy-tests.log" "${_out}")
+if(NOT _rc EQUAL 0 OR _out MATCHES "[Ww]arning([ :]|$)")
+    message(FATAL_ERROR "network-only public policy tests failed:\n${_out}")
 endif()
 
 message(STATUS "network_only_tests_on: OK")

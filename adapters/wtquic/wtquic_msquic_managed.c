@@ -1177,6 +1177,7 @@ static void mm_on_established(wtq_session_t *s, wtq_str_t sub, void *user)
     moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
     ccfg.alloc = &m->alloc;
     ccfg.session = ms;
+    ccfg.wt_session = s;
     ccfg.hook = mm_hook;
     ccfg.hook_user = c;
     moq_wtquic_conn_t *mc = NULL;
@@ -1480,6 +1481,8 @@ static moq_result_t mm_map_wtq_result(wtq_result_t r)
         return MOQ_OK;
     case WTQ_ERR_NOMEM:
         return MOQ_ERR_NOMEM;
+    case WTQ_ERR_UNSUPPORTED:
+        return MOQ_ERR_UNSUPPORTED;
     case WTQ_ERR_INVALID_ARG:
     case WTQ_ERR_TOO_LARGE:
         return MOQ_ERR_INVAL;

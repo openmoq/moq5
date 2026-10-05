@@ -1,0 +1,14 @@
+--- a/quic/server/QuicServer.cpp
++++ b/quic/server/QuicServer.cpp
+@@ -241,7 +241,10 @@
+   worker->rejectNewConnections(rejectNewConnections_);
+   worker->setPrimingEnabledCallback(isPrimingEnabled_);
+   worker->setProcessId(processId_);
+-  worker->setHostId(hostId_);
++  // A fresh worker already has current and previous HostIds initialized to 0.
++  if (hostId_ != 0) {
++    worker->setHostId(hostId_);
++  }
+   worker->setConnectionIdVersion(cidVersion_);
+   if (healthCheckToken_) {
+     worker->setHealthCheckToken(*healthCheckToken_);

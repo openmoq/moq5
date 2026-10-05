@@ -93,6 +93,8 @@ moq_result_t moq_transport_bridge_create(
         !cfg->alloc->realloc)
         return MOQ_ERR_INVAL;
     if (!ops_valid(ops)) return MOQ_ERR_INVAL;
+    if (!(ops->capabilities & MOQ_TRANSPORT_CAP_HOLD_INPUT))
+        return MOQ_ERR_UNSUPPORTED;
 
     const moq_alloc_t *a = cfg->alloc;
     uint32_t max_s = cfg->max_streams    ? cfg->max_streams    : BRIDGE_DEFAULT_MAX_STREAMS;
@@ -518,7 +520,50 @@ static moq_result_t bridge_stop_bidi_send_half(moq_transport_bridge_t *b,
 bool bridge_stream_has_inbound_pending(const bridge_stream_entry_t *e)
 {
     return e->pending_retry || e->pending_fin ||
-           e->pending_reset || e->pending_stop;
+           e->pending_reset || e->pending_stop || e->pending_admission;
+}
+
+static moq_result_t bridge_hold_admission(bridge_stream_entry_t *e, size_t len)
+{
+    e->pending_admission = true;
+    e->held_input = true;
+    if (len > 0) e->held_payload = true;
+    return MOQ_ERR_INPUT_NOT_CONSUMED;
+}
+
+/* Admission preflight for a NEW peer uni data stream (one the session does
+ * not own yet): when the
+ * session has no receive entry to admit it, refuse the whole chunk -- bytes
+ * and FIN -- without feeding it, so the adapter keeps it and redelivers it
+ * later. Returns true when the chunk was refused this way. Streams the
+ * session already owns, and terminal
+ * sessions (the query reports admissible so the input reaches the terminal
+ * path) are never refused here. */
+static bool bridge_admission_refused(moq_transport_bridge_t *b,
+                                     bridge_stream_entry_t *e,
+                                     moq_stream_ref_t ref, size_t len)
+{
+    /* The adapter still owes a chunk that carried bytes: an empty delivery
+     * (a FIN-only notification) cannot overtake it, ready or not. */
+    if (e->held_input && e->held_payload && len == 0)
+        return true;
+    if (moq_session_has_transport_stream(b->session, ref))
+        return false;
+    if (moq_session_can_admit_data_stream(b->session)) {
+        e->pending_admission = false;
+        return false;
+    }
+    (void)bridge_hold_admission(e, len);
+    return true;
+}
+
+/* The session took the stream's input (consumed, or retained under its own
+ * backpressure): the adapter's held-chunk obligation, if any, is discharged. */
+static void bridge_admission_accepted(bridge_stream_entry_t *e)
+{
+    e->held_input = false;
+    e->held_payload = false;
+    e->pending_admission = false;
 }
 
 /* -- State queries -------------------------------------------------- */
@@ -2421,6 +2466,19 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
         bridge_stream_entry_t *e = &b->streams[i];
         if (!e->active) continue;
 
+        /* A stream refused at admission holds nothing here: when the session
+         * can admit again, clear the readiness mark so the adapter redelivers
+         * its held chunk (admission is re-checked on that delivery). The
+         * obligation itself (held_input) ends only with that chunk's
+         * acceptance, a peer RESET or teardown. */
+        if (e->pending_admission) {
+            if (moq_session_can_admit_data_stream(b->session)) {
+                e->pending_admission = false;
+                progress = true;
+            }
+            continue;
+        }
+
         if (e->pending_retry) {
             moq_result_t rc;
             if (e->kind == BRIDGE_STREAM_BIDI)
@@ -2737,21 +2795,10 @@ static moq_result_t bridge_feed_peer_control(
     return MOQ_OK;
 }
 
-/*
- * After feeding inbound bytes to the session for a peer uni data stream, the
- * session may have *dropped* the stream: it issues STOP_DATA when the bound
- * subscription went away (e.g. after SUBSCRIBE_DONE) or when rx capacity is
- * exhausted, freeing its rx entry without recording the stream as finished.
- * Once that happens the session no longer holds the stream, so replaying any
- * further inbound bytes would have it open a *fresh* rx entry and parse
- * mid-stream bytes as a leading stream type -> "unknown data stream type"
- * (0x3). Mark the bridge entry to discard the remainder instead.
- *
- * This is unambiguous on a non-FIN delivery: the session only records a stream
- * finished together with a FIN (pending_fin), so a freed entry after a non-FIN
- * feed is always a drop, never a completion -- it never masks a legitimate
- * "data after FIN" violation (which the session still reports as a hard error).
- */
+/* Accepted input can retire its session owner (for example, after a pending
+ * terminal drains). Do not reopen a parser on a later tail. Admission refusals
+ * never reach this helper: their bytes and FIN remain caller-owned. Padding
+ * and already-discarded streams retain their separate protocol discard paths. */
 static void bridge_discard_if_dropped(moq_transport_bridge_t *b,
                                       bridge_stream_entry_t *e)
 {
@@ -2772,8 +2819,11 @@ static moq_result_t bridge_feed_peer_data(
         if (fin) bridge_deactivate_stream(e);
         return MOQ_OK;
     }
+    if (bridge_admission_refused(b, e, ref, len))
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
     moq_result_t rc = moq_session_on_data_bytes(b->session, ref, data, len,
                                                 fin, now_us);
+    bridge_admission_accepted(e);
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (moq_session_has_transport_stream(b->session, ref)) {
             /* Session retained the bytes; the service tick drains them. */
@@ -2781,12 +2831,7 @@ static moq_result_t bridge_feed_peer_data(
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
-        /* Refused without registering a transport stream (rx/action capacity
-         * exhausted): discard the remainder rather than misparse later bytes.
-         * Legitimate backpressure refusal -- never fatal. */
-        e->uni_disp = BRIDGE_UNI_DISP_DISCARD;
-        if (fin) bridge_deactivate_stream(e);
-        return MOQ_OK;
+        return bridge_hold_admission(e, len);
     }
     if (rc < 0) {
         bridge_set_fatal(b, 0x1);
@@ -2830,6 +2875,14 @@ static moq_result_t bridge_uni_pair_inbound(
         ref = e->ref;
     }
 
+    /* The adapter still owes a refused chunk that carried bytes: an empty
+     * (FIN-only) delivery cannot stand in for it -- refuse it without
+     * classifying, whether or not the session is ready. A redelivery with
+     * bytes (or the retry of a refused zero-byte FIN) re-enters
+     * classification with the retained prefix and is re-checked below. */
+    if (e->held_input && e->held_payload && len == 0)
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
+
     /* Already classified: route directly. */
     if (e->uni_disp == BRIDGE_UNI_DISP_CONTROL)
         return bridge_feed_peer_control(b, stream_id, data, len, fin, now_us);
@@ -2867,6 +2920,13 @@ static moq_result_t bridge_uni_pair_inbound(
         return MOQ_ERR_PROTO;
     }
 
+    /* A data stream the session cannot admit yet: refuse this chunk whole
+     * (nothing of it fed) and keep the classification prefix bridge-owned;
+     * the redelivered chunk re-enters classification with that same prefix.
+     * Control and padding streams are never gated here. */
+    if (cls == MOQ_UNI_CLASS_DATA && bridge_admission_refused(b, e, ref, len))
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
+
     /* Classified: flush any retained prefix, then this chunk. */
     uint8_t prefix[sizeof(e->classify_buf)];
     size_t plen = e->classify_len;
@@ -2899,7 +2959,16 @@ static moq_result_t bridge_uni_pair_inbound(
     if (plen > 0) {
         moq_result_t rc = bridge_feed_peer_data(b, e, ref, prefix, plen,
                                                 false, now_us);
-        if (rc < 0) return rc;
+        if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+            /* The old prefix remains ours; none of this caller chunk was
+             * delivered. Retry classification with both in their old order. */
+            memcpy(e->classify_buf, prefix, plen);
+            e->classify_len = (uint8_t)plen;
+            e->uni_disp = BRIDGE_UNI_DISP_PENDING;
+            e->held_payload = len > 0;
+            return bridge_hold_admission(e, len);
+        }
+        if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
         e = bridge_find_by_ref(b, ref);
         if (!e) return MOQ_OK;
     }
@@ -2974,8 +3043,12 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
         ref = e->ref;
     }
 
+    if (bridge_admission_refused(b, e, ref, len))
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
+
     moq_result_t rc = moq_session_on_data_bytes(
         b->session, ref, data, len, fin, now_us);
+    bridge_admission_accepted(e);
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (moq_session_has_transport_stream(b->session, ref)) {
@@ -2985,12 +3058,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
-        /* The session WOULD_BLOCKed before registering a transport stream (rx
-         * table / action queue full) and retained nothing. Replaying later
-         * bytes would misparse; discard the remainder until FIN. Not fatal. */
-        e->uni_disp = BRIDGE_UNI_DISP_DISCARD;
-        if (fin) bridge_deactivate_stream(e);
-        return MOQ_OK;
+        return bridge_hold_admission(e, len);
     }
 
     if (rc < 0) {
@@ -3071,8 +3139,12 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
         ref = e->ref;
     }
 
+    if (bridge_admission_refused(b, e, ref, data_len))
+        return MOQ_ERR_INPUT_NOT_CONSUMED;
+
     moq_result_t rc = moq_session_on_data_rcbuf(
         b->session, ref, data, fin, now_us);
+    bridge_admission_accepted(e);
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         if (moq_session_has_transport_stream(b->session, ref)) {
@@ -3081,11 +3153,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
-        /* Refused before registering a transport stream; discard the remainder
-         * until FIN rather than misparse later bytes. Not fatal. */
-        e->uni_disp = BRIDGE_UNI_DISP_DISCARD;
-        if (fin) bridge_deactivate_stream(e);
-        return MOQ_OK;
+        return bridge_hold_admission(e, data_len);
     }
 
     if (rc < 0) {
@@ -3189,6 +3257,11 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     if (!e) return MOQ_OK;
 
     if (e->aborting) { bridge_deactivate_stream(e); return MOQ_OK; }
+
+    /* Refused at admission (ready to retry or not): the session never saw
+     * the stream, so there is nothing to reset there; retire the mapping (the
+     * adapter drops the chunk it was holding). */
+    if (e->held_input) { bridge_deactivate_stream(e); return MOQ_OK; }
 
     /* Uni-control-pair mode: the control channel lives for the session, so
      * a peer RESET of its unidirectional control stream terminates the

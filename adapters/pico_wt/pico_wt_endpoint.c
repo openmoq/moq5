@@ -276,7 +276,8 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
     *ops = (moq_transport_endpoint_ops_t){
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),
         .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM |
-                           MOQ_TRANSPORT_CAP_WRITE_PAYLOAD,
+                           MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
+                           MOQ_TRANSPORT_CAP_HOLD_INPUT,
         .open_uni        = ep_open_uni,
         .set_stream_priority = ep_priority,
         .open_bidi       = ep_open_bidi,

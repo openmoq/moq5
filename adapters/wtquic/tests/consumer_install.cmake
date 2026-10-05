@@ -7,7 +7,10 @@ include(${CMAKE_CURRENT_LIST_DIR}/loader_images.cmake)
 #
 # Args (all -D): BUILD (libmoq build dir), SRC (consumer source dir),
 # WORK (scratch dir), WTQUIC_PREFIX (wtquic install prefix), and
-# optional C_COMPILER/C_FLAGS/LINK_FLAGS/OPENSSL_ROOT forwarded from the parent.
+# optional C_COMPILER/C_FLAGS/LINK_FLAGS forwarded from the parent; MSQUIC_DIR
+# is used only for the managed MsQuic component.
+
+include("${CMAKE_CURRENT_LIST_DIR}/../../../tests/cmake/RejectConsumerWarnings.cmake")
 
 foreach(_v BUILD SRC WORK WTQUIC_PREFIX)
     if(NOT DEFINED ${_v})
@@ -19,20 +22,7 @@ set(_prefix "${WORK}/prefix")
 set(_cbuild "${WORK}/consumer-build")
 file(REMOVE_RECURSE "${_prefix}" "${_cbuild}")
 
-function(assert_child_openssl_root dir label)
-    if(DEFINED OPENSSL_ROOT AND NOT OPENSSL_ROOT STREQUAL "")
-        unset(_child_OPENSSL_ROOT_DIR)
-        load_cache("${dir}" READ_WITH_PREFIX _child_ OPENSSL_ROOT_DIR)
-        if(NOT DEFINED _child_OPENSSL_ROOT_DIR OR
-           NOT _child_OPENSSL_ROOT_DIR STREQUAL OPENSSL_ROOT)
-            message(FATAL_ERROR
-                "${label} did not retain the selected OpenSSL root: got "
-                "'${_child_OPENSSL_ROOT_DIR}', expected '${OPENSSL_ROOT}'")
-        endif()
-    endif()
-endfunction()
-
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} --install "${BUILD}" --prefix "${_prefix}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
 if(NOT _rc EQUAL 0)
@@ -40,6 +30,11 @@ if(NOT _rc EQUAL 0)
 endif()
 
 set(_fwd "")
+if(CONSUMER_CONTEXT)
+    include("${CONSUMER_CONTEXT}")
+    include("${CMAKE_CURRENT_LIST_DIR}/../../../tests/cmake/ConsumerBuildContext.cmake")
+    list(APPEND _fwd -C "${CONSUMER_CONTEXT}")
+endif()
 if(DEFINED C_COMPILER AND NOT C_COMPILER STREQUAL "")
     list(APPEND _fwd "-DCMAKE_C_COMPILER=${C_COMPILER}")
 endif()
@@ -49,31 +44,27 @@ endif()
 if(DEFINED LINK_FLAGS AND NOT LINK_FLAGS STREQUAL "")
     list(APPEND _fwd "-DCMAKE_EXE_LINKER_FLAGS=${LINK_FLAGS}")
 endif()
-if(DEFINED OPENSSL_ROOT AND NOT OPENSSL_ROOT STREQUAL "")
-    list(APPEND _fwd "-DOPENSSL_ROOT_DIR=${OPENSSL_ROOT}")
-endif()
 
 if(DEFINED NETWORK_MANAGED AND NETWORK_MANAGED)
     list(APPEND _fwd "-DWITH_NETWORK_MANAGED=ON")
 endif()
 
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_cbuild}"
         "-DCMAKE_PREFIX_PATH=${_prefix};${WTQUIC_PREFIX}" ${_fwd}
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
 if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "consumer configure failed:\n${_out}")
 endif()
-assert_child_openssl_root("${_cbuild}" "installed consumer")
 
-execute_process(
+moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} --build "${_cbuild}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
 if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "consumer build failed:\n${_out}")
 endif()
 
-execute_process(
+moq_consumer_execute(
     COMMAND "${_cbuild}/moq_wtquic_consumer_test"
     RESULT_VARIABLE _rc)
 if(NOT _rc EQUAL 0)
@@ -82,7 +73,7 @@ endif()
 
 if(DEFINED NETWORK_MANAGED AND NETWORK_MANAGED)
     foreach(_exe moq_wtquic_network_consumer_test moq_wtquic_network_consumer_test_cxx)
-        execute_process(
+        moq_consumer_execute(
             COMMAND "${_cbuild}/${_exe}"
             RESULT_VARIABLE _rc)
         if(NOT _rc EQUAL 0)
@@ -95,21 +86,20 @@ if(DEFINED NETWORK_MANAGED AND NETWORK_MANAGED)
     set(_cbuild_moved "${WORK}/consumer-build-moved")
     file(REMOVE_RECURSE "${_moved}" "${_cbuild_moved}")
     file(RENAME "${_prefix}" "${_moved}")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_cbuild_moved}"
             "-DCMAKE_PREFIX_PATH=${_moved};${WTQUIC_PREFIX}" ${_fwd}
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "relocated consumer configure failed:\n${_out}")
     endif()
-    assert_child_openssl_root("${_cbuild_moved}" "relocated consumer")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} --build "${_cbuild_moved}"
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "relocated consumer build failed:\n${_out}")
     endif()
-    execute_process(
+    moq_consumer_execute(
         COMMAND "${_cbuild_moved}/moq_wtquic_network_consumer_test"
         RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0)
@@ -118,9 +108,13 @@ if(DEFINED NETWORK_MANAGED AND NETWORK_MANAGED)
 
     # --- static pkg-config against the RELOCATED prefix ----------------------
     find_program(_pkgconf NAMES pkg-config)
-    find_program(_cc NAMES cc clang)
+    if(CONSUMER_CONTEXT)
+        set(_cc "${CMAKE_C_COMPILER}")
+    else()
+        find_program(_cc NAMES cc clang)
+    endif()
     if(_pkgconf AND _cc)
-        execute_process(
+        moq_consumer_execute(
             COMMAND ${CMAKE_COMMAND} -E env
                 "PKG_CONFIG_PATH=${_moved}/lib/pkgconfig:${WTQUIC_PREFIX}/lib/pkgconfig"
                 ${_pkgconf} --static --cflags --libs
@@ -134,28 +128,38 @@ if(DEFINED NETWORK_MANAGED AND NETWORK_MANAGED)
         separate_arguments(_flags_list UNIX_COMMAND "${_flags}")
         separate_arguments(_cflags_extra UNIX_COMMAND "${C_FLAGS}")
         separate_arguments(_lflags_extra UNIX_COMMAND "${LINK_FLAGS}")
-        execute_process(
+        if(CONSUMER_CONTEXT)
+            moq_consumer_direct_flags(C _cflags_extra)
+            moq_consumer_direct_flags(LINK _lflags_extra)
+        endif()
+        # Runtime discovery belongs to the test application, not .pc metadata.
+        set(_network_rpath "")
+        if(CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin|Linux")
+            list(APPEND _network_rpath
+                "-Wl,-rpath,${_moved}/lib" "-Wl,-rpath,${WTQUIC_PREFIX}/lib")
+        endif()
+        moq_consumer_execute(
             COMMAND ${_cc} -std=c11 "${SRC}/main_network.c"
                 -o "${WORK}/network_pc_consumer"
-                ${_cflags_extra} ${_flags_list} ${_lflags_extra}
+                ${_cflags_extra} ${_flags_list} ${_lflags_extra} ${_network_rpath}
             RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
         if(NOT _rc EQUAL 0)
             message(FATAL_ERROR "network pkg-config consumer link failed:\n${_out}")
         endif()
-        execute_process(COMMAND "${WORK}/network_pc_consumer"
+        moq_consumer_execute(COMMAND "${WORK}/network_pc_consumer"
             RESULT_VARIABLE _rc)
         if(NOT _rc EQUAL 0)
             message(FATAL_ERROR "network pkg-config consumer run failed: ${_rc}")
         endif()
     else()
-        message(STATUS "pkg-config or cc unavailable: static pc lane skipped")
+        message(FATAL_ERROR "pkg-config and cc are required for the network pc lane")
     endif()
 
     # --- missing component fails loudly ---------------------------------------
     set(_cbuild_missing "${WORK}/consumer-build-missing")
     file(REMOVE_RECURSE "${_cbuild_missing}")
     file(REMOVE "${_moved}/lib/cmake/libmoq/libmoqWtquicNetworkManagedTargets.cmake")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_cbuild_missing}"
             -DWITH_NETWORK_MANAGED=ON
             "-DCMAKE_PREFIX_PATH=${_moved};${WTQUIC_PREFIX}" ${_fwd}
@@ -174,16 +178,19 @@ endif()
 # --- adapter-wtquic-msquic-managed: self-contained (own fresh install so it is
 #     independent of the network block's destructive relocation above) --------
 if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
+    if(DEFINED MSQUIC_DIR AND NOT MSQUIC_DIR STREQUAL "")
+        list(APPEND _fwd "-Dmsquic_DIR=${MSQUIC_DIR}")
+    endif()
     set(_mpfx "${WORK}/prefix-msquic")
     set(_mbuild "${WORK}/consumer-build-msquic")
     file(REMOVE_RECURSE "${_mpfx}" "${_mbuild}")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} --install "${BUILD}" --prefix "${_mpfx}"
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "msquic-managed install failed:\n${_out}")
     endif()
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_mbuild}"
             -DWITH_MSQUIC_MANAGED=ON
             "-DCMAKE_PREFIX_PATH=${_mpfx};${WTQUIC_PREFIX}" ${_fwd}
@@ -191,15 +198,14 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "msquic-managed consumer configure failed:\n${_out}")
     endif()
-    assert_child_openssl_root("${_mbuild}" "msquic-managed consumer")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} --build "${_mbuild}"
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "msquic-managed consumer build failed:\n${_out}")
     endif()
     foreach(_exe moq_wtquic_msquic_consumer_test moq_wtquic_msquic_consumer_test_cxx)
-        execute_process(COMMAND "${_mbuild}/${_exe}" RESULT_VARIABLE _rc)
+        moq_consumer_execute(COMMAND "${_mbuild}/${_exe}" RESULT_VARIABLE _rc)
         if(NOT _rc EQUAL 0)
             message(FATAL_ERROR "${_exe} run failed: ${_rc}")
         endif()
@@ -210,7 +216,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
     set(_mbuild_moved "${WORK}/consumer-build-msquic-moved")
     file(REMOVE_RECURSE "${_mmoved}" "${_mbuild_moved}")
     file(RENAME "${_mpfx}" "${_mmoved}")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_mbuild_moved}"
             -DWITH_MSQUIC_MANAGED=ON
             "-DCMAKE_PREFIX_PATH=${_mmoved};${WTQUIC_PREFIX}" ${_fwd}
@@ -218,15 +224,13 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "relocated msquic consumer configure failed:\n${_out}")
     endif()
-    assert_child_openssl_root("${_mbuild_moved}"
-        "relocated msquic-managed consumer")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} --build "${_mbuild_moved}"
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "relocated msquic consumer build failed:\n${_out}")
     endif()
-    execute_process(COMMAND "${_mbuild_moved}/moq_wtquic_msquic_consumer_test"
+    moq_consumer_execute(COMMAND "${_mbuild_moved}/moq_wtquic_msquic_consumer_test"
         RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR "relocated msquic consumer run failed: ${_rc}")
@@ -265,7 +269,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
             "(pkg-config='${_pkgconf}' cc='${_cc}')")
     endif()
     if(_pkgconf AND _cc)
-        execute_process(
+        moq_consumer_execute(
             COMMAND ${CMAKE_COMMAND} -E env
                 "PKG_CONFIG_PATH=${_mmoved}/lib/pkgconfig:${WTQUIC_PREFIX}/lib/pkgconfig"
                 ${_pkgconf} --static --cflags --libs
@@ -279,11 +283,15 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         separate_arguments(_flags_list UNIX_COMMAND "${_flags}")
         separate_arguments(_cflags_extra UNIX_COMMAND "${C_FLAGS}")
         separate_arguments(_lflags_extra UNIX_COMMAND "${LINK_FLAGS}")
+        if(CONSUMER_CONTEXT)
+            moq_consumer_direct_flags(C _cflags_extra)
+            moq_consumer_direct_flags(LINK _lflags_extra)
+        endif()
         # NB: link with pkg-config output ALONE (no injected -L). The MsQuic
         # directory is carried transitively by wtquic-msquic.pc's Libs.private
         # (pulled in via this package's Requires:), so a real consumer needs
         # nothing out-of-band.
-        execute_process(
+        moq_consumer_execute(
             COMMAND ${_cc} -std=c11 "${SRC}/main_msquic.c"
                 -o "${WORK}/msquic_pc_consumer"
                 ${_cflags_extra} ${_flags_list} ${_lflags_extra}
@@ -351,7 +359,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         #     to find, so it must run even when its external MsQuic dependency
         #     is shared but directly loadable (for example, by absolute Darwin
         #     install name or the system loader cache).
-        execute_process(COMMAND "${WORK}/msquic_pc_consumer"
+        moq_consumer_execute(COMMAND "${WORK}/msquic_pc_consumer"
             RESULT_VARIABLE _rc OUTPUT_VARIABLE _o ERROR_VARIABLE _o)
         if(_private_prefix_shared)
             if(_rc EQUAL 0)
@@ -373,13 +381,20 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
             endif()
         else()
             if(NOT _rc EQUAL 0)
-                message(FATAL_ERROR
-                    "an archive-linked consumer needs no runtime path but "
-                    "failed: ${_rc}\n${_o}")
+                # Archive WT/LibMoQ can still depend on a private shared MsQuic
+                # with an @rpath install name. Require the exact loader failure;
+                # the consumer-owned RPATH check below must then make it run.
+                loader_is_missing_library("${_rc}" "${_o}"
+                    "${CMAKE_HOST_SYSTEM_NAME}" _is_missing)
+                if(NOT _msq_shared OR NOT _is_missing)
+                    message(FATAL_ERROR
+                        "archive consumer failed beyond external DSO discovery: "
+                        "${_rc}\n${_o}")
+                endif()
             endif()
         endif()
         # (b) the SAME link closure, plus consumer-owned RPATHs
-        execute_process(
+        moq_consumer_execute(
             COMMAND ${_cc} -std=c11 "${SRC}/main_msquic.c"
                 -o "${WORK}/msquic_pc_consumer_rpath"
                 ${_cflags_extra} ${_flags_list} ${_lflags_extra}
@@ -393,7 +408,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         if(NOT "${_out}" STREQUAL "")
             message(FATAL_ERROR "unexpected compiler/linker output:\n${_out}")
         endif()
-        execute_process(COMMAND "${WORK}/msquic_pc_consumer_rpath"
+        moq_consumer_execute(COMMAND "${WORK}/msquic_pc_consumer_rpath"
             RESULT_VARIABLE _rc OUTPUT_VARIABLE _o2 ERROR_VARIABLE _e2)
         if(NOT _rc EQUAL 0)
             message(FATAL_ERROR
@@ -413,7 +428,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         endif()
         # (e) the ORDINARY --libs closure must also link and run when either
         #     public facade layer is a shared object
-        execute_process(
+        moq_consumer_execute(
             COMMAND ${CMAKE_COMMAND} -E env
                 "PKG_CONFIG_PATH=${_mmoved}/lib/pkgconfig:${WTQUIC_PREFIX}/lib/pkgconfig"
                 ${_pkgconf} --cflags --libs libmoq-wtquic-msquic-managed
@@ -424,7 +439,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         string(STRIP "${_pubflags}" _pubflags)
         separate_arguments(_pubflags_list UNIX_COMMAND "${_pubflags}")
         if(_private_prefix_shared)
-            execute_process(
+            moq_consumer_execute(
                 COMMAND ${_cc} -std=c11 "${SRC}/main_msquic.c"
                     -o "${WORK}/msquic_pc_consumer_pub"
                     ${_cflags_extra} ${_pubflags_list} ${_lflags_extra}
@@ -440,7 +455,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                 message(FATAL_ERROR
                     "unexpected output from the --libs link:\n${_out}")
             endif()
-            execute_process(COMMAND "${WORK}/msquic_pc_consumer_pub"
+            moq_consumer_execute(COMMAND "${WORK}/msquic_pc_consumer_pub"
                 RESULT_VARIABLE _rc OUTPUT_VARIABLE _o1 ERROR_VARIABLE _e1)
             if(NOT _rc EQUAL 0)
                 message(FATAL_ERROR
@@ -454,6 +469,18 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         endif()
 
         loader_trace_env(_trace_env)
+        set(_asan_lane FALSE)
+        foreach(_flag IN LISTS _cflags_extra _lflags_extra)
+            if(_flag MATCHES "^-fsanitize=(.*)$")
+                if(",${CMAKE_MATCH_1}," MATCHES ",address,")
+                    set(_asan_lane TRUE)
+                endif()
+            elseif(_flag MATCHES "^-fno-sanitize=(.*)$")
+                if(",${CMAKE_MATCH_1}," MATCHES ",(address|all),")
+                    set(_asan_lane FALSE)
+                endif()
+            endif()
+        endforeach()
         if(_trace_env STREQUAL "")
             message(FATAL_ERROR
                 "no loaded-image inspection is implemented for host "
@@ -484,7 +511,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
             endif()
             # inherited loader overrides are scrubbed: this run must stand on
             # the consumer's own recorded paths
-            execute_process(
+            moq_consumer_execute(
                 COMMAND ${CMAKE_COMMAND} -E env
                     --unset=DYLD_LIBRARY_PATH
                     --unset=DYLD_FALLBACK_LIBRARY_PATH
@@ -504,7 +531,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                     "inspection:\n${_out}")
             endif()
             loader_only_image_records("${_loaded}" "${CMAKE_HOST_SYSTEM_NAME}"
-                _why)
+                _why "${_asan_lane}")
             if(NOT _why STREQUAL "")
                 message(FATAL_ERROR "${_exe}: ${_why}")
             endif()
@@ -545,7 +572,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
     set(_mbuild_missing "${WORK}/consumer-build-msquic-missing")
     file(REMOVE_RECURSE "${_mbuild_missing}")
     file(REMOVE "${_mmoved}/lib/cmake/libmoq/libmoqWtquicMsquicManagedTargets.cmake")
-    execute_process(
+    moq_consumer_execute(
         COMMAND ${CMAKE_COMMAND} -S "${SRC}" -B "${_mbuild_missing}"
             -DWITH_MSQUIC_MANAGED=ON
             "-DCMAKE_PREFIX_PATH=${_mmoved};${WTQUIC_PREFIX}" ${_fwd}

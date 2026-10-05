@@ -110,6 +110,7 @@ class FakeWebTransport : public proxygen::WebTransport {
     bool throw_on_next_read = false;
     std::unordered_map<uint64_t, std::deque<QueuedRead>> read_queues;
     int read_call_count = 0;
+    std::unordered_map<uint64_t, int> read_calls_by_id;
 
     /* -- Recorded calls -- */
     std::vector<RecordedWrite> writes;
@@ -137,6 +138,14 @@ class FakeWebTransport : public proxygen::WebTransport {
             qr.data = folly::IOBuf::copyBuffer(data, len);
         else if (data)
             qr.data = folly::IOBuf::create(0);
+        qr.fin = fin;
+        read_queues[id].push_back(std::move(qr));
+    }
+
+    /* Queue a caller-built buffer (any chain / backing shape) as one read. */
+    void queueReadBuf(uint64_t id, std::unique_ptr<folly::IOBuf> buf, bool fin) {
+        QueuedRead qr;
+        qr.data = std::move(buf);
         qr.fin = fin;
         read_queues[id].push_back(std::move(qr));
     }
@@ -191,6 +200,7 @@ class FakeWebTransport : public proxygen::WebTransport {
     folly::Expected<folly::SemiFuture<StreamData>, ErrorCode>
     readStreamData(uint64_t id) override {
         read_call_count++;
+        read_calls_by_id[id]++;
         if (throw_on_next_read) {
             throw_on_next_read = false;
             throw std::runtime_error("fake read exception");

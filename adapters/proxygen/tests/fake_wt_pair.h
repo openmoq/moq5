@@ -42,6 +42,7 @@ struct FakeWtPair {
 
     uint64_t *time_ptr = nullptr;
     bool init_ok = false;
+    moq_version_t version_ = (moq_version_t)0;
 
     struct TimeGuard {
         uint64_t **slot;
@@ -57,11 +58,18 @@ struct FakeWtPair {
     // client_max_data_streams / client_max_actions: 0 = library default.
     // Used by backpressure tests that must force inbound WOULD_BLOCK on
     // the client by exhausting its data-stream pool and action queue.
+    // version: 0 = the library default wire profile; MOQ_VERSION_DRAFT_18
+    // selects the symmetric draft-18 handshake (both sessions start).
+    // client_max_events: 0 = library default (tiny values force retained
+    // WOULD_BLOCK on the client once a stream is admitted).
     explicit FakeWtPair(uint64_t *external_time = nullptr,
                         uint32_t client_max_data_streams = 0,
-                        uint32_t client_max_actions = 0)
+                        uint32_t client_max_actions = 0,
+                        moq_version_t version = (moq_version_t)0,
+                        uint32_t client_max_events = 0)
     {
         time_ptr = external_time;
+        version_ = version;
 
         if (time_ptr && s_time_ptr) {
             // Only one virtual-time pair at a time. Fail cleanly.
@@ -83,6 +91,9 @@ struct FakeWtPair {
             ccfg.max_data_streams = client_max_data_streams;
         if (client_max_actions)
             ccfg.max_actions = client_max_actions;
+        if (client_max_events)
+            ccfg.max_events = client_max_events;
+        ccfg.version = version;
         if (moq_session_create(&ccfg, 0, &client_session) < 0)
             return;
 
@@ -92,6 +103,7 @@ struct FakeWtPair {
         scfg.send_request_capacity = true;
         scfg.initial_request_capacity = 64;
         scfg.goaway_timeout_us = 1000;
+        scfg.version = version;
         if (moq_session_create(&scfg, 0, &server_session) < 0) {
             moq_session_destroy(client_session);
             client_session = nullptr;
@@ -271,6 +283,10 @@ struct FakeWtPair {
     {
         moq_session_start(client_session, get_time());
         client->service();
+        if (version_ == MOQ_VERSION_DRAFT_18) {
+            moq_session_start(server_session, get_time());
+            server->service();
+        }
 
         for (int i = 0; i < max_rounds; i++) {
             pump();

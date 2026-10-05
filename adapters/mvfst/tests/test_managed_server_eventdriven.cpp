@@ -23,6 +23,7 @@
 #include <openssl/x509v3.h>
 
 #include <folly/ssl/OpenSSLPtrTypes.h>
+#include <glog/logging.h>
 
 #include <unistd.h>
 
@@ -49,12 +50,16 @@ struct test_cert { std::string cert_pem, key_pem; bool ok = false; };
 static test_cert gen_cert()
 {
     test_cert r;
-    auto pkey = folly::ssl::EvpPkeyUniquePtr(EVP_PKEY_new());
-    if (!pkey) return r;
-    auto *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-    if (!ec) return r;
-    if (!EC_KEY_generate_key(ec)) { EC_KEY_free(ec); return r; }
-    if (!EVP_PKEY_assign_EC_KEY(pkey.get(), ec)) { EC_KEY_free(ec); return r; }
+    auto key_ctx = folly::ssl::EvpPkeyCtxUniquePtr(
+        EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr));
+    if (!key_ctx || EVP_PKEY_keygen_init(key_ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_ec_paramgen_curve_nid(key_ctx.get(),
+                                              NID_X9_62_prime256v1) <= 0)
+        return r;
+    EVP_PKEY *key = nullptr;
+    const int keygen_rc = EVP_PKEY_keygen(key_ctx.get(), &key);
+    auto pkey = folly::ssl::EvpPkeyUniquePtr(key);
+    if (keygen_rc <= 0 || !pkey) return r;
     auto x509 = folly::ssl::X509UniquePtr(X509_new());
     if (!x509) return r;
     if (!ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1)) return r;
@@ -294,6 +299,7 @@ static void test_server_event_driven_no_wakes()
     moq_mvfst_managed_cfg_t scfg;
     moq_mvfst_managed_cfg_init(&scfg);
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    scfg.host = "127.0.0.1";
     scfg.port = 0;
     scfg.cert_path = tf.cert_path;
     scfg.key_path = tf.key_path;
@@ -343,9 +349,40 @@ static void test_server_event_driven_no_wakes()
     moq_mvfst_managed_destroy(srv);
 }
 
-int main()
+class warning_sink : public google::LogSink {
+public:
+    std::atomic<unsigned> count{0};
+    std::atomic<unsigned> client_factory{0};
+    std::atomic<unsigned> server_factory{0};
+    void send(google::LogSeverity severity, const char *, const char *file,
+              int line, const google::LogMessageTime &, const char *message,
+              size_t len) override {
+        if (severity < google::GLOG_WARNING) return;
+        count.fetch_add(1);
+        const char *missing_factory = "A congestion controller factory is not set. "
+                                      "Using a default per-transport instance.";
+        if (len == std::strlen(missing_factory) &&
+            std::memcmp(message, missing_factory, len) == 0) {
+            if (std::strcmp(file, "QuicClientTransportLite.cpp") == 0)
+                client_factory.fetch_add(1);
+            if (std::strcmp(file, "QuicServerTransport.cpp") == 0)
+                server_factory.fetch_add(1);
+        }
+        std::fprintf(stderr, "provider diagnostic %s:%d: %.*s\n",
+                     file, line, static_cast<int>(len), message);
+    }
+};
+
+int main(int, char **argv)
 {
+    google::InitGoogleLogging(argv[0]);
+    warning_sink warnings;
+    google::AddLogSink(&warnings);
     test_server_event_driven_no_wakes();
+    google::RemoveLogSink(&warnings);
+    MVFST_CHECK(warnings.client_factory.load() == 0);
+    MVFST_CHECK(warnings.server_factory.load() == 0);
+    MVFST_CHECK(warnings.count.load() == 0);
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

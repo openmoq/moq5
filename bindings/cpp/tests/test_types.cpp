@@ -203,6 +203,10 @@ int main()
                   MOQ_SUB_FETCH_COMPLETE);
         MOQ_CHECK(moq::sub_fetch_item_kind_from_c(MOQ_SUB_FETCH_OBJECT) ==
                   moq::sub_fetch_item_kind::object);
+        MOQ_CHECK(moq::to_c(moq::sub_fetch_item_kind::reset) ==
+                  MOQ_SUB_FETCH_RESET);
+        MOQ_CHECK(moq::sub_fetch_item_kind_from_c(MOQ_SUB_FETCH_RESET) ==
+                  moq::sub_fetch_item_kind::reset);
 
         MOQ_CHECK(moq::to_c(moq::sub_status_result_kind::ok) ==
                   MOQ_SUB_STATUS_OK);

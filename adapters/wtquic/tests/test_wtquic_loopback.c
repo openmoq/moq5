@@ -1,3 +1,4 @@
+#include "wtquic_attach_bootstrap.h"
 /*
  * MoQ over wtquic loopback: a real publish/subscribe exchange across a
  * real MsQuic connection on localhost — session setup over extended
@@ -37,6 +38,7 @@ struct app_side {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     moq_wtquic_conn_t *conn;
+    wtq_test_attach_t attach;
 
     int setup_done;
     int subscribed;      /* client sent SUBSCRIBE */
@@ -213,6 +215,15 @@ static int make_session(moq_perspective_t persp, moq_session_t **out)
     return moq_session_create(&cfg, 0, out);
 }
 
+static void attach_failure(void *user)
+{
+    struct app_side *a = user;
+    pthread_mutex_lock(&a->mu);
+    a->closed = 1;
+    pthread_cond_broadcast(&a->cv);
+    pthread_mutex_unlock(&a->mu);
+}
+
 static int make_conn(moq_session_t *s, struct app_side *a,
                      moq_wtquic_conn_t **out)
 {
@@ -223,9 +234,9 @@ static int make_conn(moq_session_t *s, struct app_side *a,
     cfg.session = s;
     cfg.hook = app_hook;
     cfg.hook_user = a;
-    if (moq_wtquic_conn_create(&cfg, out) < 0)
-        return -1;
-    a->conn = *out;
+    a->attach.cfg = cfg;
+    a->attach.out = out;
+    a->attach.failed = attach_failure;
     return 0;
 }
 
@@ -249,7 +260,7 @@ static void test_pubsub_over_msquic(void)
     CHECK(make_conn(server_ms, &sv, &server_conn) == 0);
     CHECK(make_conn(client_ms, &cl, &client_conn) == 0);
     CHECK(wtq_msquic_env_open(&ecfg, &env) == WTQ_OK);
-    if (server_conn == NULL || client_conn == NULL || env == NULL)
+    if (server_ms == NULL || client_ms == NULL || env == NULL)
         goto out;
 
     wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
@@ -265,8 +276,8 @@ static void test_pubsub_over_msquic(void)
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
-    lcfg.events = moq_wtquic_conn_events();
-    lcfg.user = server_conn;
+    lcfg.events = wtq_test_attach_events();
+    lcfg.user = &sv.attach;
     CHECK(wtq_msquic_listener_start(env, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL)
         goto out;
@@ -283,8 +294,8 @@ static void test_pubsub_over_msquic(void)
     cli.port = wtq_msquic_listener_port(listener);
     cli.insecure_skip_verify = true;
     cli.connect = &ccfg;
-    cli.events = moq_wtquic_conn_events();
-    cli.user = client_conn;
+    cli.events = wtq_test_attach_events();
+    cli.user = &cl.attach;
     CHECK(wtq_msquic_client_connect(env, &cli, &cs) == WTQ_OK);
     if (cs == NULL)
         goto out;
@@ -350,7 +361,7 @@ static void test_version_mismatch_refused(void)
     CHECK(make_conn(server_ms, &sv, &server_conn) == 0);
     CHECK(make_conn(client_ms, &cl, &client_conn) == 0);
     CHECK(wtq_msquic_env_open(&ecfg, &env) == WTQ_OK);
-    if (server_conn == NULL || client_conn == NULL || env == NULL)
+    if (server_ms == NULL || client_ms == NULL || env == NULL)
         goto out;
 
     wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
@@ -366,8 +377,8 @@ static void test_version_mismatch_refused(void)
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
-    lcfg.events = moq_wtquic_conn_events();
-    lcfg.user = server_conn;
+    lcfg.events = wtq_test_attach_events();
+    lcfg.user = &sv.attach;
     CHECK(wtq_msquic_listener_start(env, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL)
         goto out;
@@ -384,8 +395,8 @@ static void test_version_mismatch_refused(void)
     cli.port = wtq_msquic_listener_port(listener);
     cli.insecure_skip_verify = true;
     cli.connect = &ccfg;
-    cli.events = moq_wtquic_conn_events();
-    cli.user = client_conn;
+    cli.events = wtq_test_attach_events();
+    cli.user = &cl.attach;
     CHECK(wtq_msquic_client_connect(env, &cli, &cs) == WTQ_OK);
     if (cs == NULL)
         goto out;
@@ -400,7 +411,8 @@ out:
     if (cs != NULL)
         wtq_session_release(cs);
 
-    CHECK(moq_wtquic_conn_is_fatal(client_conn));
+    CHECK(client_conn == NULL && cl.attach.result == MOQ_ERR_CLOSED);
+    CHECK(cl.attach.failure_reported);
     CHECK(cl.setup_done == 0);
     CHECK(cl.got_object == 0);
 
@@ -551,7 +563,7 @@ static void test_garbage_control_torn_down(void)
     CHECK(make_session(MOQ_PERSPECTIVE_SERVER, &server_ms) >= 0);
     CHECK(make_conn(server_ms, &sv, &server_conn) == 0);
     CHECK(wtq_msquic_env_open(&ecfg, &env) == WTQ_OK);
-    if (server_conn == NULL || env == NULL)
+    if (server_ms == NULL || env == NULL)
         goto out;
 
     wtq_serve_config_t serve = WTQ_SERVE_CONFIG_INIT;
@@ -567,8 +579,8 @@ static void test_garbage_control_torn_down(void)
     lcfg.key_file = key_path;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
-    lcfg.events = moq_wtquic_conn_events();
-    lcfg.user = server_conn;
+    lcfg.events = wtq_test_attach_events();
+    lcfg.user = &sv.attach;
     CHECK(wtq_msquic_listener_start(env, &lcfg, &listener) == WTQ_OK);
     if (listener == NULL)
         goto out;

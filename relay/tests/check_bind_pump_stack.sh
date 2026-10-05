@@ -8,7 +8,7 @@ flat=$(tr '\n' ' ' < "$src")
 need() {
     local pattern=$1
     local label=$2
-    if ! rg -n -- "$pattern" "$src" >/dev/null; then
+    if ! grep -En -- "$pattern" "$src" >/dev/null; then
         echo "FAIL: missing $label"
         fail=1
     fi
@@ -16,7 +16,7 @@ need() {
 need_flat() {
     local pattern=$1
     local label=$2
-    if ! printf '%s\n' "$flat" | rg -- "$pattern" >/dev/null; then
+    if ! printf '%s\n' "$flat" | grep -E -- "$pattern" >/dev/null; then
         echo "FAIL: missing $label"
         fail=1
     fi
@@ -24,13 +24,14 @@ need_flat() {
 reject() {
     local pattern=$1
     local label=$2
-    if rg -n -- "$pattern" "$src" >/dev/null; then
+    if grep -En -- "$pattern" "$src" >/dev/null; then
         echo "FAIL: found $label"
         fail=1
     fi
 }
 
 need '^#define BIND_PUMP_EVENT_BATCH 16u$' "event batch constant"
+need '^#define BIND_PUMP_EVENT_POLL  1u$' "single-event poll constant"
 need '^#define BIND_PUMP_REVOKED_BATCH 16u$' "revoked-grant batch constant"
 need '^#define BIND_PUMP_INTENT_BATCH 32u$' "intent batch constant"
 need 'moq_event_t[[:space:]]+\*pump_events;' "bind-owned event scratch"
@@ -39,8 +40,8 @@ need 'moqr_revoked_grant_t[[:space:]]+\*pump_revoked;' \
 need 'moqr_intent_t[[:space:]]+\*pump_intents;' "bind-owned intent scratch"
 need 'bool[[:space:]]+in_pump;' "non-reentrant pump guard"
 need 'bool[[:space:]]+intent_drain_active;' "intent-drain reentry guard"
-need_flat 'moq_session_poll_events\(cn->session,[[:space:]]*b->pump_events,[[:space:]]*BIND_PUMP_EVENT_BATCH\)' \
-          "event polling through bind scratch"
+need_flat 'moq_session_poll_events\(cn->session,[[:space:]]*b->pump_events,[[:space:]]*BIND_PUMP_EVENT_POLL\)' \
+          "event polling through bind scratch, one event at a time"
 need_flat 'moqr_core_peek_revoked_grants\(b->core,[[:space:]]*b->pump_revoked,[[:space:]]*BIND_PUMP_REVOKED_BATCH\)' \
           "revocation peek through bind scratch"
 need_flat 'moqr_core_poll_intents\(b->core,[[:space:]]*b->pump_intents,[[:space:]]*BIND_PUMP_INTENT_BATCH\)' \

@@ -95,6 +95,18 @@ typedef struct {
     uint64_t               pending_reset_code;
     bool                   pending_stop;
     uint64_t               pending_stop_code;
+    /* A new peer uni data stream refused at admission (no receive entry).
+     * held_input: the adapter still owes the refused chunk -- the session
+     * never saw this stream; ended only by the chunk's acceptance, a peer
+     * RESET, or bridge teardown. held_payload: that chunk carried bytes, so
+     * an empty (FIN-only) delivery cannot stand in for it. pending_admission:
+     * readiness -- set while the session cannot admit, cleared by a service
+     * pass once it can (the adapter's cue to redeliver); it says nothing
+     * about the obligation. Nothing is retained here and service() never
+     * empty-feeds such a stream (unlike pending_retry). */
+    bool                   held_input;
+    bool                   held_payload;
+    bool                   pending_admission;
     /* Whole-stream ABORT discard lifecycle: the entry is kept (its ref
      * mapping preserved so late peer bytes are DISCARDED, never given a
      * fresh ref), and retired on the peer's FIN / RESET / stream

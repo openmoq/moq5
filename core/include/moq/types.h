@@ -42,6 +42,12 @@ typedef int moq_result_t;
  * or not implemented (e.g. a stubbed transport backend). Distinct from
  * MOQ_ERR_INVAL: the request is well-formed; this build cannot serve it. */
 #define MOQ_ERR_UNSUPPORTED     (-14)
+/* Transport-bridge inbound data only, and only to an endpoint that declared
+ * MOQ_TRANSPORT_CAP_HOLD_INPUT: the chunk (bytes and FIN) was NOT consumed --
+ * the session cannot admit a new data stream right now. The adapter keeps that
+ * exact chunk and redelivers it once the stream's pending state clears. Never
+ * returned for retained input (that stays MOQ_ERR_WOULD_BLOCK). */
+#define MOQ_ERR_INPUT_NOT_CONSUMED (-15)
 #define MOQ_ERR_INTERNAL        (-99)
 
 MOQ_API const char *moq_strerror(moq_result_t rc);

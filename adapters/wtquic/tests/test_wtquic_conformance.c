@@ -171,7 +171,7 @@ static void t_clean_close_not_fatal(void)
 }
 
 /* A client requiring a version the server does not serve is refused at
- * the WebTransport layer: fatal terminal, no setup, no clean close. */
+ * the WebTransport layer: bootstrap failure, no adapter, no setup. */
 static void t_version_refusal_fatal(void)
 {
     int before = failures;
@@ -187,11 +187,14 @@ static void t_version_refusal_fatal(void)
         wtqc_pair_teardown(&p);
         return;
     }
-    CHECK(wtqc_wait_flag(&p.client, &p.client.obs.fatal));
+    CHECK(wtqc_wait_flag(&p.client, &p.client.obs.establishment_failed));
+    CHECK(p.client.conn == NULL);
+    CHECK(p.server.conn == NULL);
     wtqc_pair_teardown(&p);
 
     CHECK(p.client.obs.setup == 0);
-    CHECK(p.client.obs.fatal);
+    CHECK(p.client.obs.establishment_failed);
+    CHECK(!p.client.obs.fatal);
     if (failures == before)
         printf("PASS: version_refusal_fatal\n");
 }

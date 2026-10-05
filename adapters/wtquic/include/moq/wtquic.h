@@ -12,11 +12,13 @@
  * on (MsQuic, Network.framework, …) is the caller's choice.
  *
  * WIRING
- *   1. Create the moq_session_t (perspective + version) and the
- *      adapter conn around it.
- *   2. Create the wtquic session (wtq_msquic_client_connect /
- *      wtq_msquic_listener_start) with the event table from
- *      moq_wtquic_conn_events() and the conn as the user context.
+ *   1. Create the moq_session_t and a bootstrap callback context.
+ *   2. Create the wtquic session with bootstrap callbacks. In established,
+ *      set cfg.wt_session to that session, create the adapter, then forward
+ *      established and subsequent events through moq_wtquic_conn_events()
+ *      with the adapter as their user argument. Keep the bootstrap context
+ *      alive until provider quiescence. Handle pre-establishment failure
+ *      without an adapter; qualification failure must close the WT session.
  *   3. Everything else happens inside wtquic's callbacks: the adapter
  *      feeds the bridge, services it, and then invokes the hook — the
  *      application's slot to poll moq session events and drive the
@@ -57,6 +59,11 @@ typedef struct moq_wtquic_conn_cfg {
     moq_session_t *session;    /* required; NOT owned; must outlive */
     moq_wtquic_hook_fn hook;   /* optional */
     void *hook_user;
+    /* Required qualified session, borrowed; create in its established callback
+     * before forwarding events. Only FLOW_CONTROLLED receive contracts with
+     * a callback quantum <=65535 are supported. The session/callback domain
+     * must remain valid until provider quiescence and adapter destruction. */
+    wtq_session_t *wt_session;
 } moq_wtquic_conn_cfg_t;
 
 MOQ_API void moq_wtquic_conn_cfg_init_sized(moq_wtquic_conn_cfg_t *cfg,
@@ -66,8 +73,8 @@ MOQ_API moq_result_t moq_wtquic_conn_create(
     const moq_wtquic_conn_cfg_t *cfg, moq_wtquic_conn_t **out);
 MOQ_API void moq_wtquic_conn_destroy(moq_wtquic_conn_t *conn);
 
-/* The wtquic event table to create the WebTransport session with; the
- * session's user context MUST be the moq_wtquic_conn_t. */
+/* Forward qualified-session events through this table with the conn as user.
+ * Before creation, use the bootstrap callbacks described above. */
 MOQ_API const wtq_session_events_t *moq_wtquic_conn_events(void);
 
 MOQ_API moq_session_t *moq_wtquic_conn_session(moq_wtquic_conn_t *conn);
@@ -81,7 +88,7 @@ MOQ_API moq_session_t *moq_wtquic_conn_session(moq_wtquic_conn_t *conn);
  * waiting for the next transport event. Reentrancy-safe: from inside the
  * hook it coalesces into the running pass instead of recursing. */
 MOQ_API void moq_wtquic_conn_service(moq_wtquic_conn_t *conn);
-/* The bound WebTransport session (NULL until its first event). */
+/* The immutable WebTransport session binding supplied at creation. */
 MOQ_API wtq_session_t *moq_wtquic_conn_wtq_session(moq_wtquic_conn_t *conn);
 
 /* The bridge went fatal (setup failure, protocol error, refused). */

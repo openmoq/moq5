@@ -324,9 +324,17 @@ Implemented: the bounded log/cursor primitive with capacity model and trace
 ring; the control plane (namespace trie, track table with coalescing,
 pull-model subscribe delivery); retained standalone FETCH through the core
 cursor and production binding, including FETCH over chunk-retained COMPLETE
-records; and chunk-through ingest/delivery with live-edge stalls, downstream
-reset propagation, and retained replay. The production session binding is
-proven against real sessions over SimPair on both drafts.
+records; bounded forwarding of an ascending Joining FETCH on a
+SUBSCRIBE-initiated subscription (one standalone upstream FETCH per request
+to the pinned source generation, the complete response collected within
+`fetch_forward_bytes` / 64 objects / 16 gaps before the downstream FETCH_OK,
+never ingested into the live log; joining-publication and descending shapes
+stay rejected NOT_SUPPORTED; a downstream FETCH refusal the session cannot
+take yet is held per connection and retried until it commits or the request
+goes away); and chunk-through ingest/delivery with
+live-edge stalls, downstream reset propagation, and retained replay. The
+production session binding is proven against real sessions over SimPair on
+both drafts.
 
 The multi-shard runtime owns one core, binding, and trace per shard. Its
 deterministic runner preserves reproducible schedule oracles; its concurrent

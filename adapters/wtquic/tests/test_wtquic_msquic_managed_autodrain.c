@@ -1,3 +1,4 @@
+#include "wtquic_attach_bootstrap.h"
 /*
  * Autonomous bounded-poll delivery over the managed wtquic-MsQuic facade.
  *
@@ -64,6 +65,7 @@ struct pub_side {
     pthread_mutex_t mu;
     moq_session_t *ms;
     moq_wtquic_conn_t *conn;
+    wtq_test_attach_t attach;
     bool have_sub;
     moq_subscription_t sub;
     bool accepted;
@@ -300,7 +302,8 @@ static int rig_up(struct rig *r, struct sub_side *sub, const char *cert,
     ccfg.session = r->pub_ms;
     ccfg.hook = pub_hook;
     ccfg.hook_user = &r->pub;
-    if (moq_wtquic_conn_create(&ccfg, &r->pub.conn) < 0) return -1;
+    r->pub.attach.cfg = ccfg;
+    r->pub.attach.out = &r->pub.conn;
 
     wtq_msquic_env_cfg_t secfg = WTQ_MSQUIC_ENV_CFG_INIT;
     secfg.tuning.idle_timeout_ms = 300000; /* HANG GUARD ONLY: keep the QUIC
@@ -319,8 +322,8 @@ static int rig_up(struct rig *r, struct sub_side *sub, const char *cert,
     lcfg.key_file = key;
     lcfg.paths = &serve;
     lcfg.path_count = 1;
-    lcfg.events = moq_wtquic_conn_events();
-    lcfg.user = r->pub.conn;
+    lcfg.events = wtq_test_attach_events();
+    lcfg.user = &r->pub.attach;
     if (wtq_msquic_listener_start(r->senv, &lcfg, &r->listener) != WTQ_OK) return -1;
     uint16_t port = wtq_msquic_listener_port(r->listener);
 

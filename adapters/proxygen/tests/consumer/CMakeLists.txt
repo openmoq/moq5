@@ -4,7 +4,10 @@ project(moq_proxygen_wt_consumer CXX)
 # Consume the proxygen WebTransport adapter as a downstream cold consumer:
 # only the public component + public header. find_dependency(proxygen
 # CONFIG) inside the libmoq config resolves proxygen/folly.
-find_package(libmoq REQUIRED COMPONENTS adapter-proxygen-wt)
+find_package(libmoq REQUIRED COMPONENTS adapter-proxygen-wt adapter-proxygen-wt-managed)
 
 add_executable(consumer main.cpp)
 target_link_libraries(consumer PRIVATE moq::adapter-proxygen-wt)
+
+add_executable(managed_consumer managed.cpp)
+target_link_libraries(managed_consumer PRIVATE moq::adapter-proxygen-wt-managed)

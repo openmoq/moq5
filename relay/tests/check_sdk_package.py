@@ -1,5 +1,6 @@
 """Installed SDK contract, with external consumers and no transport traffic."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -28,9 +29,13 @@ def main():
     p.add_argument("--shared", choices=("0", "1"), required=True)
     p.add_argument("--managed", choices=("0", "1"), default="0")
     p.add_argument("--msquic-dir", default="")
+    p.add_argument("--context", type=Path)
     args = p.parse_args()
     args.source = args.source.resolve()
     args.build = args.build.resolve()
+    context = ["-C", args.context] if args.context else []
+    direct = json.loads(Path(str(args.context) + ".json").read_text()) if args.context else {
+        "C": [], "CXX": [], "LINK": []}
     env = dict(os.environ)
     for key in list(env):
         if key.startswith(("DYLD_", "LD_", "CMAKE_", "PKG_CONFIG_")):
@@ -72,6 +77,7 @@ def main():
                 unit = work / "header.c"
                 unit.write_text(f"#include <moq/relay/{header.name}>\nint header_probe;\n")
                 run([cc, "-x", lang, "-std=c11" if lang == "c" else "-std=c++11",
+                     *direct["C" if lang == "c" else "CXX"],
                      "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-fsyntax-only",
                      "-I", inc, unit])
         for f in relocated.rglob("*"):
@@ -95,7 +101,7 @@ def main():
             "set(RELAY_COMPONENT", 'include("${CMAKE_CURRENT_LIST_DIR}/finds.cmake")\nset(RELAY_COMPONENT', 1))
         for component in components:
             build = work / (component + " build")
-            run([args.cmake, "-S", consumer, "-B", build, f"-Dlibmoq_DIR={pkg}",
+            run([args.cmake, *context, "-S", consumer, "-B", build, f"-Dlibmoq_DIR={pkg}",
                  f"-DRELAY_COMPONENT={component}", f"-DCMAKE_C_COMPILER={args.cc}",
                  f"-DCMAKE_CXX_COMPILER={args.cxx}",
                  "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF",
@@ -124,7 +130,7 @@ def main():
         saved = [(f, f.read_bytes()) for f in exports]
         for f, _ in saved:
             f.unlink()
-        missing = run([args.cmake, "-S", consumer, "-B", work / "missing runtime",
+        missing = run([args.cmake, *context, "-S", consumer, "-B", work / "missing runtime",
                        f"-Dlibmoq_DIR={pkg}", "-DRELAY_COMPONENT=relay"], ok=False)
         require(missing.returncode != 0 and "relay" in missing.stderr,
                 "missing runtime was accepted")
@@ -147,9 +153,10 @@ def main():
                         f"nonminimal pkg-config closure: {libraries}")
                 exe = work / f"pc-{component}-{static}"
                 run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
+                     *direct["C"],
                      *(["-DTEST_RUNTIME"] if component == "relay" else []),
                      consumer / "main.c", "-o", exe, *flags,
-                     "-Wl,-rpath," + str(lib)])
+                     *direct["LINK"], "-Wl,-rpath," + str(lib)])
                 run([exe])
         examples = list(relocated.rglob("in_memory.c"))
         require(len(examples) == 1, "installed deterministic example missing or duplicated")
@@ -157,7 +164,8 @@ def main():
                                 "libmoq-relay-core"]).stdout)
         exe = work / "installed-example"
         run([args.cc, "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
-             examples[0], "-o", exe, *flags, "-Wl,-rpath," + str(lib)])
+             *direct["C"], examples[0], "-o", exe, *flags,
+             *direct["LINK"], "-Wl,-rpath," + str(lib)])
         run([exe])
         if args.runtime == "1":
             sources = list(relocated.rglob("simple-relay/main.c"))
@@ -167,7 +175,7 @@ def main():
                 source = work / "network consumer"
                 shutil.copytree(sources[0].parent, source)
                 build = work / "network build"
-                run([args.cmake, "-S", source, "-B", build,
+                run([args.cmake, *context, "-S", source, "-B", build,
                      f"-Dlibmoq_DIR={pkg}", f"-Dmsquic_DIR={args.msquic_dir}",
                      f"-DCMAKE_C_COMPILER={args.cc}", "-DMOQ_WARNINGS_AS_ERRORS=ON",
                      "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF",

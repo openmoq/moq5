@@ -17,6 +17,9 @@
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
 
 #include <moq/endpoint.h>
 #include <moq/msquic_managed.h>

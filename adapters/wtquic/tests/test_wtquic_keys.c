@@ -35,14 +35,30 @@ struct wtq_stream {
     int aborts;
     int pauses;         /* wtq_stream_pause_receive calls on this stream */
     int resumes;        /* wtq_stream_resume_receive calls on this stream */
+    unsigned refs;
 };
 /* Forced return codes for the next pause/resume calls (WTQ_OK unless a case
  * overrides one to exercise the STATE/CLOSED/unexpected-failure branches). */
+wtq_result_t wtq_session_receive_contract(const wtq_session_t *s,
+    size_t *quantum, wtq_receive_pause_mode_t *mode)
+{
+    *quantum = s ? 65535 : 0;
+    *mode = s ? WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED : WTQ_RECEIVE_PAUSE_UNSUPPORTED;
+    return s ? WTQ_OK : WTQ_ERR_INVALID_ARG;
+}
+
 static wtq_result_t g_resume_rc = WTQ_OK;
 static wtq_result_t g_pause_rc = WTQ_OK;
 static struct wtq_stream g_streams[64];
 static int g_stream_n;
 static bool g_open_fail; /* force the transport to refuse an open */
+static unsigned session_refs;
+void wtq_session_add_ref(wtq_session_t *s) { (void)s; session_refs++; }
+void wtq_session_release(wtq_session_t *s) { (void)s; session_refs--; }
+wtq_result_t wtq_session_service_stream_admission(wtq_session_t *s)
+{ return s ? WTQ_OK : WTQ_ERR_INVALID_ARG; }
+void wtq_stream_add_ref(wtq_stream_t *st) { st->refs++; }
+void wtq_stream_release(wtq_stream_t *st) { st->refs--; }
 
 static struct wtq_stream *new_stream(bool bidi)
 {
@@ -194,7 +210,7 @@ int main(void)
         moq_wtquic_conn_t p;
         memset(&p, 0, sizeof(p));
         p.next_stream_key = 1;
-        p.ws = NULL;
+        p.ws = (wtq_session_t *)(void *)0x1;
         g_stream_n = 0;
         for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
             p.streams[i].in_use = true; /* table already full */
@@ -220,6 +236,7 @@ int main(void)
         moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
         ccfg.alloc = moq_alloc_default();
         ccfg.session = sess;
+        ccfg.wt_session = (wtq_session_t *)(void *)0x1;
         moq_wtquic_conn_t *pp = NULL;
         CHECK(moq_wtquic_conn_create(&ccfg, &pp) == MOQ_OK);
         pp->next_stream_key = UINT64_MAX; /* exhausted */
@@ -272,6 +289,7 @@ int main(void)
         moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
         ccfg.alloc = moq_alloc_default();
         ccfg.session = sess;
+        ccfg.wt_session = (wtq_session_t *)(void *)0x1;
         moq_wtquic_conn_t *cc = NULL;
         CHECK(moq_wtquic_conn_create(&ccfg, &cc) == MOQ_OK);
         cc->ws = (wtq_session_t *)(void *)0x1; /* "bound": teardown guard */
@@ -396,6 +414,7 @@ int main(void)
         moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
         ccfg.alloc = moq_alloc_default();
         ccfg.session = sess;
+        ccfg.wt_session = (wtq_session_t *)(void *)0x1;
         moq_wtquic_conn_t *cc = NULL;
         CHECK(moq_wtquic_conn_create(&ccfg, &cc) == MOQ_OK);
         cc->ws = (wtq_session_t *)(void *)0x1;
@@ -437,6 +456,7 @@ int main(void)
         moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
         ccfg.alloc = moq_alloc_default();
         ccfg.session = sess;
+        ccfg.wt_session = (wtq_session_t *)(void *)0x1;
         moq_wtquic_conn_t *cc = NULL;
         CHECK(moq_wtquic_conn_create(&ccfg, &cc) == MOQ_OK);
         cc->ws = (wtq_session_t *)(void *)0x1;
@@ -531,6 +551,7 @@ int main(void)
             moq_wtquic_conn_cfg_init_sized(&pccfg, sizeof(pccfg));
             pccfg.alloc = moq_alloc_default();
             pccfg.session = psess;
+            pccfg.wt_session = (wtq_session_t *)(void *)0x1;
             moq_wtquic_conn_t *pc = NULL;
             CHECK(moq_wtquic_conn_create(&pccfg, &pc) == MOQ_OK);
             pc->ws = (wtq_session_t *)(void *)0x1;

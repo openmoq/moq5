@@ -23,6 +23,7 @@ const char *moq_strerror(moq_result_t rc)
     case MOQ_ERR_GOAWAY:          return "session draining (GOAWAY)";
     case MOQ_ERR_INTERRUPTED:     return "interrupted (latch set)";
     case MOQ_ERR_UNSUPPORTED:     return "not supported by this build";
+    case MOQ_ERR_INPUT_NOT_CONSUMED: return "input not consumed (redeliver when the stream's pending state clears)";
     case MOQ_ERR_INTERNAL:        return "internal error";
     default:                    return "unknown error";
     }

@@ -223,6 +223,10 @@ MOQ_API void moq_wtquic_network_managed_cfg_init_sized(
  * negotiation, session creation, and every event happen on the
  * domain. On failure nothing is running and destroy() is not needed.
  */
+/* Current receive policy requires FLOW_CONTROLLED. Network is DELIVERY_ONLY:
+ * valid configurations return MOQ_ERR_UNSUPPORTED with NULL output, before
+ * allocation/network startup and without callbacks. Malformed configurations
+ * still return MOQ_ERR_INVAL. This is a LibMoQ policy restriction. */
 MOQ_API moq_result_t moq_wtquic_network_managed_create(
     const moq_wtquic_network_managed_cfg_t *cfg,
     moq_wtquic_network_managed_t **out);

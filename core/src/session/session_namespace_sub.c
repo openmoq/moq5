@@ -2113,7 +2113,7 @@ moq_result_t moq_session_cancel_namespace_sub(
 
 static moq_result_t bidi_stream_teardown(moq_session_t *s,
                                          moq_stream_ref_t stream_ref,
-                                         bool reset)
+                                         bool reset, uint64_t error_code)
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
 
@@ -2149,19 +2149,21 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
         noslot_carrier_remove(s, stream_ref);
         return MOQ_OK;
     }
-    return request_stream_teardown(s, stream_ref);
+    return request_stream_teardown(s, stream_ref, reset, error_code);
 }
 
 moq_result_t handle_bidi_stream_reset(moq_session_t *s,
-                                       moq_stream_ref_t stream_ref)
+                                       moq_stream_ref_t stream_ref,
+                                       uint64_t error_code)
 {
-    return bidi_stream_teardown(s, stream_ref, true);
+    return bidi_stream_teardown(s, stream_ref, true, error_code);
 }
 
 moq_result_t handle_bidi_stream_stop(moq_session_t *s,
-                                      moq_stream_ref_t stream_ref)
+                                      moq_stream_ref_t stream_ref,
+                                      uint64_t error_code)
 {
-    return bidi_stream_teardown(s, stream_ref, false);
+    return bidi_stream_teardown(s, stream_ref, false, error_code);
 }
 
 moq_result_t moq_session_request_goaway_ns_sub(

@@ -79,6 +79,143 @@ static int carrier_slab_bounds_selfcheck(void) {
     return failures;
 }
 
+/* A deferred-alias stream discarded while the action queue is full. The
+ * STOP it owes is refused; the entry must keep the stream's identity
+ * (NEED_STOP), consume mid-stream bytes meanwhile without opening a fresh
+ * entry, issue exactly one STOP once action capacity returns (no new peer
+ * input), and be released by the peer's terminal. `mode`: 0 = FIN retires
+ * it, 1 = RESET retires it, 2 = the session is torn down while the STOP is
+ * still owed (nothing leaks). */
+static int deferred_discard_owed_stop(int mode)
+{
+    int failures = 0;
+    test_alloc_state_t alloc_state = {0};
+    moq_alloc_t alloc = test_allocator(&alloc_state);
+    moq_session_cfg_t cextra = MOQ_SESSION_CFG_INIT;
+    cextra.max_actions = 1;
+    moq_session_t *c = NULL, *sv = NULL;
+    establish_pair(&alloc, 10, 10, &c, &sv, &cextra, NULL);
+
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { ns_parts, 1 };
+    moq_subscribe_cfg_t sub_cfg;
+    moq_subscribe_cfg_init(&sub_cfg);
+    sub_cfg.track_namespace = ns;
+    sub_cfg.track_name = MOQ_BYTES_LITERAL("video");
+    sub_cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t sub1;
+    MOQ_TEST_CHECK(moq_session_subscribe(c, &sub_cfg, 1000, &sub1) == MOQ_OK);
+    pump_actions_to_peer(c, sv, 1000);     /* drains the SUBSCRIBE action */
+    moq_event_t ev;
+    MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
+    moq_subscription_t server_sub = ev.u.subscribe_request.sub;
+    moq_event_cleanup(&ev);
+
+    /* Deferred subgroup stream for alias 7 (sub1 is forwarding+pending). */
+    const uint64_t REF = 55;
+    uint8_t sg[128];
+    moq_buf_writer_t sw;
+    moq_buf_writer_init(&sw, sg, sizeof(sg));
+    moq_d16_subgroup_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = 0x14;
+    hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
+    hdr.track_alias = 7;
+    hdr.publisher_priority = 128;
+    moq_d16_encode_subgroup_header(&sw, &hdr);
+    moq_d16_encode_object_fields(&sw, 0, 5, (const uint8_t *)"hello");
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF), sg,
+                                             moq_buf_writer_offset(&sw), false, 1000) == MOQ_OK);
+
+    /* Fill the client action queue with a NON-forwarding subscribe (so it
+     * does not keep a forwarding sub pending), left un-pumped. */
+    moq_subscribe_cfg_t sub2_cfg = sub_cfg;
+    sub2_cfg.track_name = MOQ_BYTES_LITERAL("audio");
+    sub2_cfg.has_forward = true;
+    sub2_cfg.forward = false;
+    moq_subscription_t sub2;
+    MOQ_TEST_CHECK(moq_session_subscribe(c, &sub2_cfg, 1000, &sub2) == MOQ_OK);
+
+    /* Reject sub1: client frees it -> no forwarding pending -> the deferred
+     * stream is discarded while the action queue is full. */
+    moq_reject_subscribe_cfg_t rej;
+    moq_reject_subscribe_cfg_init(&rej);
+    MOQ_TEST_CHECK(moq_session_reject_subscribe(sv, server_sub, &rej, 1000) == MOQ_OK);
+    pump_actions_to_peer(sv, c, 1000);
+
+    /* The STOP is owed, not lost: the entry keeps the stream's identity. */
+    int active = 0, slot = -1;
+    for (size_t i = 0; i < c->rx_cap; i++) {
+        if (!c->rx_streams[i].active) continue;
+        active++;
+        if (c->rx_streams[i].stream_ref._v == REF) slot = (int)i;
+    }
+    MOQ_TEST_CHECK_EQ_INT(active, 1);
+    MOQ_TEST_CHECK(slot >= 0 && c->rx_streams[slot].parse_state == MOQ_RX_NEED_STOP);
+    MOQ_TEST_CHECK(moq_session_has_transport_stream(c, moq_stream_ref_from_u64(REF)));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
+
+    /* Mid-stream bytes while the STOP is still refused: the same entry
+     * answers (refused again, retained), no fresh entry, nothing parsed. */
+    uint8_t more[64];
+    moq_buf_writer_t mw;
+    moq_buf_writer_init(&mw, more, sizeof(more));
+    moq_d16_encode_object_fields(&mw, 1, 5, (const uint8_t *)"world");
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF), more,
+                                             moq_buf_writer_offset(&mw), false, 1001) == MOQ_ERR_WOULD_BLOCK);
+    active = 0;
+    for (size_t i = 0; i < c->rx_cap; i++) if (c->rx_streams[i].active) active++;
+    MOQ_TEST_CHECK_EQ_INT(active, 1);
+    MOQ_TEST_CHECK(c->rx_streams[slot].parse_state == MOQ_RX_NEED_STOP);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
+
+    if (mode == 2) {
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(alloc_state.balance == 0);
+        return failures;
+    }
+
+    /* No further peer input: draining the client's actions returns capacity
+     * and the owed STOP is issued, exactly once. */
+    moq_action_t acts[4];
+    size_t n;
+    int stops = 0, other = 0;
+    while ((n = moq_session_poll_actions(c, acts, 4)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (acts[i].kind == MOQ_ACTION_STOP_DATA && acts[i].u.stop_data.stream_ref._v == REF) stops++;
+            else other++;
+            moq_action_cleanup(&acts[i]);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(stops, 1);
+    MOQ_TEST_CHECK_EQ_INT(other, 1);   /* the audio SUBSCRIBE that filled the queue */
+    MOQ_TEST_CHECK(c->rx_streams[slot].active && c->rx_streams[slot].parse_state == MOQ_RX_STOPPED);
+
+    /* The peer's terminal releases the entry; no second STOP. */
+    if (mode == 0)
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF), NULL, 0, true, 1002) == MOQ_OK);
+    else
+        MOQ_TEST_CHECK(moq_session_on_data_reset(c, moq_stream_ref_from_u64(REF), 0x1, 1002) == MOQ_OK);
+    active = 0;
+    for (size_t i = 0; i < c->rx_cap; i++) if (c->rx_streams[i].active) active++;
+    MOQ_TEST_CHECK_EQ_INT(active, 0);
+    MOQ_TEST_CHECK(!moq_session_has_transport_stream(c, moq_stream_ref_from_u64(REF)));
+    while ((n = moq_session_poll_actions(c, acts, 4)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (acts[i].kind == MOQ_ACTION_STOP_DATA) stops++;
+            moq_action_cleanup(&acts[i]);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(stops, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
+
+    moq_session_destroy(c);
+    moq_session_destroy(sv);
+    MOQ_TEST_CHECK(alloc_state.balance == 0);   /* deferred buffer freed */
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -6052,16 +6189,18 @@ int main(void)
         MOQ_TEST_CHECK(alloc_state.balance == 0);
     }
 
-    /* == Discard under action-queue pressure leaves no stale stream ===== *
-     * A deferred stream is rejected while the client's action queue is full,
-     * so rx_try_stop() cannot send STOP_DATA. With no forwarding subscription
-     * left to retry, the discard must free the entry directly (no lingering
-     * DEFERRED_ALIAS / NEED_STOP stream, no leak). */
+    /* == A locally stopped stream's FIN is not a completed stream ========= *
+     * A subscriber-role subscription with a small object-payload limit. One
+     * subgroup stream carries an object over the limit: the session STOPs it
+     * and keeps the entry until the peer's FIN. That FIN releases the entry
+     * and is remembered as the transport stream's end, but it must not count
+     * toward the subscription's processed streams (§9.8 Stream Count); a
+     * genuine stream completing with its FIN still counts. */
     {
         test_alloc_state_t alloc_state = {0};
         moq_alloc_t alloc = test_allocator(&alloc_state);
         moq_session_cfg_t cextra = MOQ_SESSION_CFG_INIT;
-        cextra.max_actions = 1;
+        cextra.max_object_payload_size = 4;
         moq_session_t *c = NULL, *sv = NULL;
         establish_pair(&alloc, 10, 10, &c, &sv, &cextra, NULL);
 
@@ -6072,15 +6211,25 @@ int main(void)
         sub_cfg.track_namespace = ns;
         sub_cfg.track_name = MOQ_BYTES_LITERAL("video");
         sub_cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
-        moq_subscription_t sub1;
-        MOQ_TEST_CHECK(moq_session_subscribe(c, &sub_cfg, 1000, &sub1) == MOQ_OK);
-        pump_actions_to_peer(c, sv, 1000);     /* drains the SUBSCRIBE action */
+        moq_subscription_t sub_h;
+        MOQ_TEST_CHECK(moq_session_subscribe(c, &sub_cfg, 1000, &sub_h) == MOQ_OK);
+        pump_actions_to_peer(c, sv, 1000);
         moq_event_t ev;
         MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
-        moq_subscription_t server_sub = ev.u.subscribe_request.sub;
+        moq_accept_subscribe_cfg_t accept;
+        moq_accept_subscribe_cfg_init(&accept);
+        MOQ_TEST_CHECK(moq_session_accept_subscribe(sv, ev.u.subscribe_request.sub, &accept, 1000) == MOQ_OK);
         moq_event_cleanup(&ev);
+        pump_actions_to_peer(sv, c, 1000);
+        MOQ_TEST_CHECK(moq_session_poll_events(c, &ev, 1) == 1 && ev.kind == MOQ_EVENT_SUBSCRIBE_OK);
+        uint64_t alias = ev.u.subscribe_ok.track_alias;
+        moq_event_cleanup(&ev);
+        int sslot = sub_resolve_handle(c, sub_h);
+        MOQ_TEST_CHECK(sslot >= 0);
+        { moq_action_t a; while (moq_session_poll_actions(c, &a, 1) > 0) moq_action_cleanup(&a); }
 
-        /* Deferred subgroup stream for alias 7 (sub1 is forwarding+pending). */
+        /* Stream A: an object over the payload limit -> STOPped, retained. */
+        const uint64_t REF_A = 71, REF_B = 72;
         uint8_t sg[128];
         moq_buf_writer_t sw;
         moq_buf_writer_init(&sw, sg, sizeof(sg));
@@ -6088,46 +6237,64 @@ int main(void)
         memset(&hdr, 0, sizeof(hdr));
         hdr.type = 0x14;
         hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
-        hdr.track_alias = 7;
+        hdr.track_alias = alias;
         hdr.publisher_priority = 128;
         moq_d16_encode_subgroup_header(&sw, &hdr);
         moq_d16_encode_object_fields(&sw, 0, 5, (const uint8_t *)"hello");
-        moq_session_on_data_bytes(c, moq_stream_ref_from_u64(55), sg,
-                                  moq_buf_writer_offset(&sw), false, 1000);
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF_A), sg,
+                                                 moq_buf_writer_offset(&sw), false, 1001) == MOQ_OK);
+        int stops = 0;
+        { moq_action_t a; while (moq_session_poll_actions(c, &a, 1) > 0) {
+              if (a.kind == MOQ_ACTION_STOP_DATA && a.u.stop_data.stream_ref._v == REF_A) stops++;
+              moq_action_cleanup(&a);
+          } }
+        MOQ_TEST_CHECK_EQ_INT(stops, 1);
+        int rslot = -1;
+        for (size_t i = 0; i < c->rx_cap; i++)
+            if (c->rx_streams[i].active && c->rx_streams[i].stream_ref._v == REF_A) rslot = (int)i;
+        MOQ_TEST_CHECK(rslot >= 0 && c->rx_streams[rslot].parse_state == MOQ_RX_STOPPED);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 0u);
 
-        /* Fill the client action queue with a NON-forwarding subscribe (so it
-         * does not keep a forwarding sub pending), left un-pumped. */
-        moq_subscribe_cfg_t sub2_cfg = sub_cfg;
-        sub2_cfg.track_name = MOQ_BYTES_LITERAL("audio");
-        sub2_cfg.has_forward = true;
-        sub2_cfg.forward = false;
-        moq_subscription_t sub2;
-        MOQ_TEST_CHECK(moq_session_subscribe(c, &sub2_cfg, 1000, &sub2) == MOQ_OK);
+        /* Its FIN releases the entry: remembered as the stream's end, not a
+         * processed stream. */
+        size_t fin_before = c->rx_fin_count;
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF_A), NULL, 0, true, 1002) == MOQ_OK);
+        MOQ_TEST_CHECK(!c->rx_streams[rslot].active);
+        MOQ_TEST_CHECK_EQ_SIZE(c->rx_fin_count, fin_before + 1);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 0u);
+        MOQ_TEST_CHECK(moq_subscription_is_valid(sub_h) && sub_resolve_handle(c, sub_h) == sslot);
 
-        /* Reject sub1: client frees it -> no forwarding pending -> discard the
-         * deferred stream while the action queue is full. */
-        moq_reject_subscribe_cfg_t rej;
-        moq_reject_subscribe_cfg_init(&rej);
-        MOQ_TEST_CHECK(moq_session_reject_subscribe(sv, server_sub, &rej,
-            1000) == MOQ_OK);
-        pump_actions_to_peer(sv, c, 1000);
-
-        /* No lingering deferred / need-stop rx stream. */
-        int stale = 0;
-        for (size_t i = 0; i < c->rx_cap; i++) {
-            if (c->rx_streams[i].active &&
-                (c->rx_streams[i].parse_state == MOQ_RX_DEFERRED_ALIAS ||
-                 c->rx_streams[i].parse_state == MOQ_RX_NEED_STOP))
-                stale++;
+        /* Stream B: a genuine stream (object within the limit) completing
+         * with its FIN counts exactly once. */
+        moq_buf_writer_init(&sw, sg, sizeof(sg));
+        moq_d16_encode_subgroup_header(&sw, &hdr);
+        moq_d16_encode_object_fields(&sw, 0, 4, (const uint8_t *)"hell");
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(c, moq_stream_ref_from_u64(REF_B), sg,
+                                                 moq_buf_writer_offset(&sw), true, 1003) == MOQ_OK);
+        int objs = 0;
+        while (moq_session_poll_events(c, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) objs++;
+            moq_event_cleanup(&ev);
         }
-        MOQ_TEST_CHECK_EQ_INT(stale, 0);
-        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c),
-                              (int)MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK_EQ_INT(objs, 1);
+        MOQ_TEST_CHECK_EQ_U64(c->subs[sslot].processed_stream_count, 1u);
+        MOQ_TEST_CHECK_EQ_SIZE(c->rx_fin_count, fin_before + 2);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);
-        MOQ_TEST_CHECK(alloc_state.balance == 0);   /* deferred buffer freed */
+        MOQ_TEST_CHECK(alloc_state.balance == 0);
     }
+
+    /* == Discard under action-queue pressure keeps the STOP owed ========== *
+     * A deferred stream is discarded while the client's action queue is
+     * full, so its STOP_DATA cannot be queued. The entry must stay owned
+     * (NEED_STOP) until action capacity returns, then issue exactly one STOP
+     * with no further peer input, and be released by the peer's FIN, its
+     * RESET, or session teardown. */
+    failures += deferred_discard_owed_stop(0);
+    failures += deferred_discard_owed_stop(1);
+    failures += deferred_discard_owed_stop(2);
 
 #ifdef MOQ_TEST_SIM
     /* == draft-18 parity (SimPair): data before SUBSCRIBE_OK is held ==== *

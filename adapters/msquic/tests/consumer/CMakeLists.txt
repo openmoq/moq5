@@ -1,13 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 project(moq_msquic_consumer LANGUAGES C)
 
-# Request BOTH components and link BOTH targets. The managed facade ships
-# inside the attach library (moq::adapter-msquic-managed is an INTERFACE
-# over it), so requesting both must resolve to one library with no
-# duplicate or ambiguous symbol ownership. main.c touches an attach and a
-# managed symbol to force real resolution of each surface.
+# Request both components, but link managed only: its interface owns attach.
+# main.c resolves symbols from both surfaces without duplicating the archive.
 find_package(libmoq REQUIRED COMPONENTS adapter-msquic adapter-msquic-managed)
 
 add_executable(moq_msquic_consumer_test main.c)
 target_link_libraries(moq_msquic_consumer_test PRIVATE
-    moq::adapter-msquic moq::adapter-msquic-managed)
+    moq::adapter-msquic-managed)
+
+# Record resolved target artifacts, not inferred package directory layouts.
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/consumer_targets.cmake" CONTENT
+"set(CONSUMER_PROVIDER_FILE [==[$<TARGET_FILE:msquic::msquic>]==])
+set(CONSUMER_ADAPTER_FILE [==[$<TARGET_FILE:moq::adapter-msquic>]==])
+set(CONSUMER_ADAPTER_TYPE [==[$<TARGET_PROPERTY:moq::adapter-msquic,TYPE>]==])
+set(CONSUMER_CORE_FILE [==[$<TARGET_FILE:moq::core>]==])
+set(CONSUMER_CORE_TYPE [==[$<TARGET_PROPERTY:moq::core,TYPE>]==])
+")

@@ -18,6 +18,9 @@
 #include <moq/transport_bridge.h>
 #include <moq/rcbuf.h>
 #include "mvfst_endpoint_ops.h"
+#ifdef MOQ_MVFST_TESTING
+#include "mvfst_managed_testing.h"
+#endif
 #include "../../common/moq_alpn.h"  /* moq_alpn_to_version / _for_version */
 
 #include <quic/api/QuicSocket.h>
@@ -25,6 +28,7 @@
 #include <quic/state/QuicStreamUtilities.h>
 
 #include <cassert>
+#include <map>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +44,8 @@
 /* -- Managed lifecycle C API ----------------------------------------- */
 
 #include <quic/client/QuicClientTransport.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/congestion_control/ServerCongestionControllerFactory.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
@@ -245,8 +251,9 @@ struct moq_mvfst_conn
 
 class managed_server_factory : public quic::QuicServerTransportFactory {
 public:
-    explicit managed_server_factory(moq_mvfst_managed *owner)
-        : owner_(owner) {}
+    managed_server_factory(moq_mvfst_managed *owner,
+                           std::shared_ptr<quic::CongestionControllerFactory> cc)
+        : owner_(owner), cc_(std::move(cc)) {}
 
     quic::QuicServerTransport::Ptr make(
         folly::EventBase *evb,
@@ -257,6 +264,7 @@ public:
 
 private:
     moq_mvfst_managed *owner_;
+    std::shared_ptr<quic::CongestionControllerFactory> cc_;
 };
 
 /*
@@ -601,6 +609,10 @@ struct moq_mvfst_managed {
     uint64_t credit_grant_count() const;
     bool has_client_session() const;
     size_t client_quic_versions(uint32_t *out, size_t cap) const;
+    /* Deliver one read result to an attach adapter exactly as mvfst's
+     * readAvailable would (the friend grant on adapter reaches impl_). */
+    static void test_inject_uni_read(moq::mvfst::adapter *a, uint64_t sid,
+                                     std::unique_ptr<folly::IOBuf> buf, bool eof);
 #endif
 };
 
@@ -661,6 +673,9 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
         auto t = quic::QuicServerTransport::make(
             sock_evb, std::move(sock),
             conn.get(), conn.get(), std::move(ctx));
+        /* Settings create the controller before QuicServerWorker supplies
+         * its factory. Use that same server-owned factory at both stages. */
+        t->setCongestionControllerFactory(cc_);
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
         ts.advertisedInitialMaxStreamsUni = 100;
@@ -995,9 +1010,11 @@ moq_result_t moq_mvfst_managed_create(
                 sctx->setCertManager(mgr);
 
                 m->server = quic::QuicServer::createQuicServer();
+                auto cc = std::make_shared<quic::ServerCongestionControllerFactory>();
+                m->server->setCongestionControllerFactory(cc);
                 m->server->setFizzContext(sctx);
                 m->server->setQuicServerTransportFactory(
-                    std::make_unique<managed_server_factory>(m));
+                    std::make_unique<managed_server_factory>(m, cc));
 
                 folly::SocketAddress bind_addr;
                 if (m->host.empty())
@@ -1097,6 +1114,8 @@ moq_result_t moq_mvfst_managed_create(
                     m->transport =
                         quic::QuicClientTransport::newClient(
                             qevb, std::move(sock), std::move(hsk));
+                    m->transport->setCongestionControllerFactory(
+                        std::make_shared<quic::DefaultCongestionControllerFactory>());
 
                     folly::SocketAddress peer(
                         m->host,
@@ -1638,6 +1657,47 @@ static void iobuf_rcbuf_release(void *ctx,
     delete static_cast<folly::IOBuf *>(ctx);
 }
 
+#ifdef MOQ_MVFST_TESTING
+/* Test-only held-input observer (declared in mvfst_managed_testing.h). */
+static moq_mvfst_test_hold_cb g_hold_cb = nullptr;
+static void *g_hold_ctx = nullptr;
+extern "C" void moq_mvfst_test_set_hold_observer(moq_mvfst_test_hold_cb cb,
+                                                 void *ctx)
+{
+    g_hold_cb = cb;
+    g_hold_ctx = ctx;
+}
+#define MVFST_HOLD_OBSERVE(id, phase, len, fin) \
+    do { if (g_hold_cb) g_hold_cb(g_hold_ctx, (id), (phase), (len), (fin), MOQ_OK, false); } while (0)
+/* Test-only failure injection: the next allocation at the named point fails
+ * (declared in mvfst_managed_testing.h). */
+static int g_test_fail_next = 0;
+extern "C" void moq_mvfst_test_fail_next(int which) { g_test_fail_next = which; }
+static bool mvfst_test_fail(int which)
+{
+    if (g_test_fail_next != which) return false;
+    g_test_fail_next = 0;
+    return true;
+}
+#define MVFST_TEST_FAIL(which) mvfst_test_fail(which)
+#else
+#define MVFST_TEST_FAIL(which) false
+#define MVFST_HOLD_OBSERVE(id, phase, len, fin) \
+    do { (void)(id); (void)(phase); (void)(len); (void)(fin); } while (0)
+enum {
+    MOQ_MVFST_TEST_HOLD_HELD = 1,
+    MOQ_MVFST_TEST_HOLD_REFUSED_AGAIN = 2,
+    MOQ_MVFST_TEST_HOLD_ACCEPTED = 3,
+    MOQ_MVFST_TEST_HOLD_DROPPED_RESET = 4,
+    MOQ_MVFST_TEST_HOLD_DROPPED_TEARDOWN = 5
+};
+enum {
+    MOQ_MVFST_TEST_FAIL_HOLD_RECORD = 1,
+    MOQ_MVFST_TEST_FAIL_HOLD_COPY = 2,
+    MOQ_MVFST_TEST_FAIL_REPLAY = 3
+};
+#endif
+
 struct __attribute__((visibility("hidden"))) adapter::impl
     : public quic::QuicSocket::ConnectionSetupCallback
     , public quic::QuicSocket::ConnectionCallback
@@ -1692,6 +1752,109 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     std::unordered_set<quic::StreamId> read_cb_streams;
     std::unordered_set<quic::StreamId> paused_read_streams;
     std::unordered_set<quic::StreamId> local_bidi_ids;
+
+    /* Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): a peer uni chunk the
+     * bridge refused whole, kept exactly as read (the rcbuf wrapping the
+     * IOBuf, or no bytes for a FIN-only read) with its FIN flag, until a
+     * service pass sees the session able to admit again and it is redelivered
+     * unchanged. The stream stays paused in mvfst meanwhile, so nothing newer
+     * is read from it: one held chunk is one read(id, 0), at most what the
+     * stream's receive flow-control window let mvfst buffer; the rest waits in
+     * mvfst under that window and the connection window. Keyed in stream order
+     * so redelivery after capacity returns is deterministic. */
+    struct held_input {
+        moq_rcbuf_t *buf;
+        bool fin;
+    };
+    std::map<quic::StreamId, held_input> held_inputs;
+
+    void drop_held(quic::StreamId id, int phase) {
+        auto it = held_inputs.find(id);
+        if (it == held_inputs.end()) return;
+        size_t len = it->second.buf ? moq_rcbuf_len(it->second.buf) : 0;
+        bool fin = it->second.fin;
+        if (it->second.buf) moq_rcbuf_decref(it->second.buf);
+        held_inputs.erase(it);
+        MVFST_HOLD_OBSERVE(id, phase, len, fin);
+    }
+
+    void drop_all_held(int phase) {
+        while (!held_inputs.empty())
+            drop_held(held_inputs.begin()->first, phase);
+    }
+
+    /* Take ownership of a refused chunk. Returns false (after releasing the
+     * chunk) when it cannot be recorded; the caller treats that as a
+     * transport error -- never as acceptance. */
+    bool hold_input(quic::StreamId id, moq_rcbuf_t *buf, bool fin) {
+        /* A second refused chunk for a stream that already holds one would
+         * mean bytes were read past the held chunk: a contract breach, never
+         * a silent replacement of the earlier chunk. */
+        if (held_inputs.count(id)) {
+            if (buf) moq_rcbuf_decref(buf);
+            return false;
+        }
+        try {
+            if (MVFST_TEST_FAIL(MOQ_MVFST_TEST_FAIL_HOLD_RECORD))
+                throw std::bad_alloc();
+            held_inputs[id] = held_input{buf, fin};
+        } catch (...) {
+            if (buf) moq_rcbuf_decref(buf);
+            return false;
+        }
+        pause_read_cb(id);
+        MVFST_HOLD_OBSERVE(id, MOQ_MVFST_TEST_HOLD_HELD,
+                           buf ? moq_rcbuf_len(buf) : 0, fin);
+        return true;
+    }
+
+    /* Redeliver every held chunk whose stream the bridge no longer reports
+     * pending. Refused again: the chunk is kept exactly as it is. Taken: the
+     * stream continues like any other read (resumed by resume_paused_reads
+     * unless the bridge retained it or it ended). */
+    void redeliver_held(uint64_t now) {
+        if (held_inputs.empty()) return;
+        /* A failed snapshot allocation propagates to the caller's catch
+         * (readAvailable / adapter::service), which records a transport
+         * error; the held chunks stay owned until teardown releases them. */
+        if (MVFST_TEST_FAIL(MOQ_MVFST_TEST_FAIL_REPLAY))
+            throw std::bad_alloc();
+        std::vector<quic::StreamId> ready;
+        for (auto &kv : held_inputs)
+            if (!moq_transport_bridge_stream_has_pending(shared_bridge, kv.first))
+                ready.push_back(kv.first);
+        for (auto id : ready) {
+            if (is_terminal()) return;
+            auto it = held_inputs.find(id);
+            if (it == held_inputs.end()) continue;
+            moq_rcbuf_t *buf = it->second.buf;
+            bool fin = it->second.fin;
+            size_t len = buf ? moq_rcbuf_len(buf) : 0;
+            moq_result_t rc = buf
+                ? moq_transport_bridge_on_peer_uni_rcbuf(shared_bridge, id, buf, fin, now)
+                : moq_transport_bridge_on_peer_uni_bytes(shared_bridge, id, nullptr, 0, fin, now);
+#ifdef MOQ_MVFST_TESTING
+            if (g_hold_cb)
+                g_hold_cb(g_hold_ctx, id, MOQ_MVFST_TEST_HOLD_REPLAY, len, fin,
+                          rc, moq_transport_bridge_stream_has_pending(shared_bridge, id));
+#endif
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                MVFST_HOLD_OBSERVE(id, MOQ_MVFST_TEST_HOLD_REFUSED_AGAIN, len, fin);
+                continue;
+            }
+            if (buf) moq_rcbuf_decref(buf);
+            held_inputs.erase(it);
+            MVFST_HOLD_OBSERVE(id, MOQ_MVFST_TEST_HOLD_ACCEPTED, len, fin);
+            if (rc == MOQ_ERR_WOULD_BLOCK) {
+                /* retained by the session: the stream stays paused until the
+                 * bridge's pending state clears */
+            } else if (rc < 0 && rc != MOQ_ERR_CLOSED) {
+                unregister_read_cb(id);
+            } else if (fin && rc >= 0) {
+                unregister_read_cb(id);
+            }
+        }
+    }
 
     /* Called from ep_open_bidi (inside bridge_service). Cannot call
      * bridge functions here (reentrancy). Just register the read
@@ -1775,6 +1938,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     }
 
     void teardown_callbacks() {
+        drop_all_held(MOQ_MVFST_TEST_HOLD_DROPPED_TEARDOWN);
         /* An armed byte-event holds a raw pointer to this impl; the
          * socket outlives us (shared_ptr member), so cancel explicitly —
          * the cancellation callback lands on the still-live impl. */
@@ -1845,6 +2009,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
      */
     moq_result_t service_all(uint64_t now) {
         if (is_terminal()) {
+            drop_all_held(MOQ_MVFST_TEST_HOLD_DROPPED_TEARDOWN);
             return is_fatal() ? MOQ_ERR_INTERNAL : MOQ_OK;
         }
 
@@ -1855,6 +2020,12 @@ struct __attribute__((visibility("hidden"))) adapter::impl
             moq_transport_bridge_on_transport_error(
                 shared_bridge, 0x1, now);
             return MOQ_ERR_INTERNAL;
+        }
+
+        redeliver_held(now);
+        if (is_terminal()) {
+            drop_all_held(MOQ_MVFST_TEST_HOLD_DROPPED_TEARDOWN);
+            return is_fatal() ? MOQ_ERR_INTERNAL : MOQ_OK;
         }
 
         resume_paused_reads();
@@ -2039,13 +2210,30 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     void readAvailable(quic::StreamId id) noexcept override {
         try {
             if (is_terminal()) return;
+            if (held_inputs.count(id))
+                return;   /* a held chunk goes first; the stream is paused */
             if (moq_transport_bridge_stream_has_pending(shared_bridge, id))
                 return;
 
             auto result = socket->read(id, 0);
             if (result.hasError()) return;
 
-            auto &[buf, eof] = *result;
+            on_read(id, std::move(result->first), result->second);
+        } catch (...) {
+            moq_transport_bridge_on_transport_error(
+                shared_bridge, 0x1, now_us_from_clock());
+        }
+    }
+
+    /* One read result for stream `id`: `buf` is what the transport handed
+     * out (a chain is coalesced below), `eof` its FIN. Routes control, bidi
+     * and uni input to the bridge and applies the hold/pause/retire rules. */
+    void on_read(quic::StreamId id, std::unique_ptr<folly::IOBuf> buf, bool eof) {
+#ifdef MOQ_MVFST_TESTING
+        MVFST_HOLD_OBSERVE(id, MOQ_MVFST_TEST_HOLD_INPUT,
+                          buf ? buf->computeChainDataLength() : 0, eof);
+#endif
+        try {
             if (!buf && !eof) return;
 
             const uint8_t *data = nullptr;
@@ -2105,13 +2293,49 @@ struct __attribute__((visibility("hidden"))) adapter::impl
                 }
                 rc = moq_transport_bridge_on_peer_uni_rcbuf(
                     shared_bridge, id, input, eof, now);
-                moq_rcbuf_decref(input);
+                if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                    /* Refused at admission: the chunk (and its FIN) is now the
+                     * adapter's to keep and redeliver unchanged. Retain exactly
+                     * the payload in adapter-owned storage. IOBuf capacity can
+                     * be narrowed without releasing its backing allocation,
+                     * so even capacity == length is not a backing-size proof.
+                     * The transport's buffer is released now. A failed copy or
+                     * record is a transport error, never acceptance. */
+                    moq_rcbuf_t *keep = nullptr;
+                    if (MVFST_TEST_FAIL(MOQ_MVFST_TEST_FAIL_HOLD_COPY) ||
+                        moq_rcbuf_create(moq_alloc_default(), raw->data(),
+                                         raw->length(), &keep) < 0) {
+                        moq_rcbuf_decref(input);
+                        moq_transport_bridge_on_transport_error(
+                            shared_bridge, 0x1, now);
+                        service_all(now);
+                        return;
+                    }
+                    moq_rcbuf_decref(input);
+                    if (!hold_input(id, keep, eof)) {
+                        moq_transport_bridge_on_transport_error(
+                            shared_bridge, 0x1, now);
+                        service_all(now);
+                        return;
+                    }
+                } else {
+                    moq_rcbuf_decref(input);
+                }
             } else {
                 rc = moq_transport_bridge_on_peer_uni_bytes(
                     shared_bridge, id, data, len, eof, now);
+                if (rc == MOQ_ERR_INPUT_NOT_CONSUMED &&
+                    !hold_input(id, nullptr, eof)) {
+                    moq_transport_bridge_on_transport_error(
+                        shared_bridge, 0x1, now);
+                    service_all(now);
+                    return;
+                }
             }
 
-            if (rc == MOQ_ERR_WOULD_BLOCK) {
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                /* held above; the stream is paused until redelivery */
+            } else if (rc == MOQ_ERR_WOULD_BLOCK) {
                 pause_read_cb(id);
             } else if (rc < 0 && rc != MOQ_ERR_CLOSED) {
                 unregister_read_cb(id);
@@ -2165,6 +2389,7 @@ struct __attribute__((visibility("hidden"))) adapter::impl
                 return;
             }
 
+            drop_held(id, MOQ_MVFST_TEST_HOLD_DROPPED_RESET);
             moq_result_t rc = moq_transport_bridge_on_peer_stream_reset(
                 shared_bridge, id, code, now);
             if (rc == MOQ_ERR_WOULD_BLOCK) {
@@ -2360,6 +2585,19 @@ size_t moq_mvfst_managed::client_quic_versions(uint32_t *out, size_t cap) const
     for (size_t i = 0; i < m; i++)
         out[i] = static_cast<uint32_t>(client_supported_versions[i]);
     return n;
+}
+
+void moq_mvfst_managed::test_inject_uni_read(moq::mvfst::adapter *a, uint64_t sid,
+                                              std::unique_ptr<folly::IOBuf> buf, bool eof)
+{
+    if (!a) return;
+    a->impl_->on_read(sid, std::move(buf), eof);
+}
+
+void moq_mvfst_test_inject_uni_read(moq::mvfst::adapter *a, uint64_t stream_id,
+                                    std::unique_ptr<folly::IOBuf> buf, bool eof)
+{
+    moq_mvfst_managed::test_inject_uni_read(a, stream_id, std::move(buf), eof);
 }
 
 /* Declared in mvfst_managed_testing.h (not in <moq/mvfst.h>). */

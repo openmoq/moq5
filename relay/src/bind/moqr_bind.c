@@ -49,6 +49,13 @@ moqr_latency_observe(moqr_latency_hist_t *h, uint64_t latency_us)
 /* Fixed pump work batches. Storage is bind-owned, not automatic, so embedded
  * callers do not inherit a hidden multi-KiB moqr_bind_pump() frame. */
 #define BIND_PUMP_EVENT_BATCH 16u
+/* Events are polled ONE at a time: a polled event borrows namespace, name
+ * and token bytes from the session's scratch, which the session reclaims at
+ * the first advancing call made once its event queue is empty. Handling an
+ * event with later events still queued keeps that scratch alive; taking a
+ * whole batch first and then advancing while handling its first event would
+ * reclaim the bytes of every later event in the batch. */
+#define BIND_PUMP_EVENT_POLL  1u
 #define BIND_PUMP_REVOKED_BATCH 16u
 #define BIND_PUMP_INTENT_BATCH 32u
 
@@ -91,12 +98,142 @@ typedef struct b_fetch {
     uint64_t        end_object;
 } b_fetch_t;
 
+/* A downstream FETCH refusal the session could not take yet (WOULD_BLOCK on
+ * moq_session_reject_fetch): the request is still pending in the session and
+ * its event has been consumed, so the binding owns the retry until the
+ * rejection commits, the peer cancels, or the connection goes away. One table
+ * per connection: the fetch pool the binding is declared for plus one poll
+ * of headroom. The pump polls a connection's next event only while at least
+ * one poll's worth of entries is free, so every FETCH_REQUEST it consumes can
+ * be owned whatever the session's own request capacity is; a connection whose
+ * refusals are all held simply leaves its remaining events queued in the
+ * session (connection-local backpressure) until a held rejection commits. */
+typedef struct b_refusal {
+    bool        used;
+    moq_fetch_t sfetch;       /* generation-qualified session handle */
+    uint64_t    error_code;
+} b_refusal_t;
+
 typedef struct b_usub {
     bool               used;
     moqr_track_t       track;
     uint64_t           track_gen;
     moq_subscription_t ssub;    /* the relay's upstream subscription      */
+    /* Owned copy of the track key this subscription was issued for (one
+     * buffer: namespace parts then name), so a forwarded Joining FETCH can
+     * name the same track upstream without consulting the core. has_key is
+     * false when the copy could not be retained: live delivery is unaffected
+     * and the subscription is simply not a forwarding source. */
+    bool               has_key;
+    uint8_t           *key;
+    size_t             key_len;
+    uint32_t           ns_count;
+    moq_bytes_t        parts[32];
+    moq_bytes_t        name;
 } b_usub_t;
+
+/* -- Forwarded Joining FETCH: bounded pre-acceptance collection ------------ *
+ * A downstream Joining FETCH on a subscription this relay serves from an
+ * upstream origin is answered by ONE standalone upstream FETCH carrying the
+ * same already-normalized absolute range (the session computed it from the
+ * joined subscription's saved Largest; it is never widened). The upstream
+ * response is collected in full -- in arrival order, within fixed item counts
+ * and the bind-wide byte pool -- and only after its COMPLETE is the downstream
+ * fetch accepted and the collection replayed verbatim (FETCH_OK end fields and
+ * Track Properties, each object's identity/priority/payload/properties, each
+ * gap marker, then FIN). Every failure before that point -- upstream error,
+ * reset, source loss or replacement, overflow, allocation refusal, downstream
+ * cancellation -- is answered BEFORE FETCH_OK with a request-local rejection
+ * (never a truncated success); after FETCH_OK a hard local write failure is
+ * answered with the request-local abort, never a connection close. Forwarded
+ * objects never enter the live log, and the joined subscription is consulted
+ * exactly once (identity resolution): a later UNSUBSCRIBE does not touch the
+ * fetch. Transactions live in ONE bind-wide pool sized by the core's fetch
+ * pool, outside every connection's tables; both sides are addressed by
+ * (cookie, binding, handle), so a reused connection slot or request slot can
+ * never match an older transaction, and an event that still names a retired
+ * handle is released untouched by the pump's event cleanup. */
+#define BF_FWD_MAX_OBJECTS 64u
+#define BF_FWD_MAX_GAPS    16u
+#define BF_FWD_MAX_ITEMS   (BF_FWD_MAX_OBJECTS + BF_FWD_MAX_GAPS)
+/* One owned track-key copy (namespace parts + name) can never exceed the
+ * core's shared full-track-name cap. */
+#define BF_FWD_KEY_MAX     4096u
+/* Data-stream reset code for the request-local abort of an accepted forwarded
+ * fetch whose remaining output cannot be encoded: INTERNAL_ERROR, 0x0 in both
+ * drafts' stream-reset registries (draft-16 10.4.3, draft-18 3.3.3). */
+#define BIND_RESET_INTERNAL 0x0u
+
+/* Upstream (fetcher-role) side of a transaction. */
+#define FW_U_UNSENT     0u   /* admitted; upstream FETCH not yet accepted by the session */
+#define FW_U_PENDING    1u   /* sent; collecting */
+#define FW_U_CANCELLING 2u   /* a cancel is owed upstream; retried until it commits */
+#define FW_U_TERMINAL   3u   /* complete / error / reset / lost / cancelled */
+/* Downstream (publisher-role) side. */
+#define FW_D_PENDING    0u   /* request admitted, nothing sent */
+#define FW_D_ACCEPTING  1u   /* FETCH_OK owed */
+#define FW_D_STREAMING  2u   /* replaying the collection, then FIN */
+#define FW_D_ABORTING   3u   /* request-local abort owed */
+#define FW_D_TERMINAL   4u
+/* Why the upstream side ended. */
+#define FW_END_NONE      0u
+#define FW_END_COMPLETE  1u
+#define FW_END_ERROR     2u   /* err_* carry the copied REQUEST_ERROR */
+#define FW_END_RESET     3u
+#define FW_END_LOST      4u   /* upstream connection gone / replaced */
+#define FW_END_CANCELLED 5u   /* cancelled by this relay (downstream gone) */
+#define FW_END_OVERFLOW  6u   /* item count / byte pool / allocation refusal */
+#define FW_END_MISMATCH  7u   /* upstream answered outside the pinned range */
+
+typedef struct b_fwd_item {
+    bool                   is_gap;
+    bool                   datagram;
+    uint8_t                publisher_priority;
+    uint8_t                range_kind;   /* moq_fetch_range_kind_t, gaps only */
+    uint64_t               group, subgroup, object;
+    moq_rcbuf_t           *payload;      /* OWNED ref stolen from the event */
+    moq_rcbuf_t           *properties;   /* OWNED ref or NULL               */
+    uint64_t               charged;      /* bytes charged to the pool       */
+} b_fwd_item_t;
+
+typedef struct b_fwd {
+    bool           used;
+    uint8_t        u, d, end;
+    bool           ufetch_live;   /* ufetch names a request the session holds */
+    /* downstream (this relay is the publisher) */
+    uint64_t       d_cookie;
+    moqr_binding_t d_binding;
+    moq_fetch_t    sfetch;
+    /* upstream (this relay is the fetcher) */
+    uint64_t       u_cookie;
+    moqr_binding_t u_binding;
+    moq_fetch_t    ufetch;
+    moqr_track_t   track;
+    uint64_t       track_gen;
+    /* the request: normalized absolute range, forwarded verbatim */
+    uint64_t       start_group, start_object, end_group, end_object;
+    bool           has_prio;
+    uint8_t        prio;
+    /* owned track key copy (charged to the pool) */
+    uint8_t       *key;
+    size_t         key_len;
+    uint32_t       ns_count;
+    moq_bytes_t    parts[32];
+    moq_bytes_t    name;
+    /* the collected response */
+    bool           ok_seen, ok_eot;
+    uint64_t       ok_end_group, ok_end_object;
+    uint8_t       *props;          /* owned copy of Track Properties */
+    size_t         props_len;
+    moq_request_error_t err_code;
+    bool           err_can_retry;
+    uint64_t       err_retry_after_ms;
+    uint8_t       *reason;         /* owned copy of the error reason */
+    size_t         reason_len;
+    uint32_t       n_items, n_objects, n_gaps, next_write;
+    uint64_t       charged;        /* every pool byte this transaction holds */
+    b_fwd_item_t   items[BF_FWD_MAX_ITEMS];
+} b_fwd_t;
 
 typedef struct b_pub {
     bool         used;
@@ -194,6 +331,7 @@ typedef struct b_conn {
     b_pub_t       *pubs;
     b_ann_t       *anns;
     b_fetch_t     *fetches;
+    b_refusal_t   *refusals;   /* pending FETCH refusals, n_fetches entries */
     uint64_t       requests_seen;    /* inbound peer requests observed (d16
                                       * request-id consumption proxy)     */
 } b_conn_t;
@@ -202,6 +340,7 @@ struct moqr_bind {
     moq_alloc_t  alloc;
     moqr_core_t *core;
     uint32_t     max_conns, n_dsubs, n_sgs, n_usubs, n_pubs, n_anns, n_fetches;
+    uint32_t     n_refusals;             /* n_fetches + BIND_PUMP_EVENT_POLL */
     uint32_t     request_grant_window;   /* d16 MAX_REQUEST_ID grant step   */
     /* Intent router for shard-manager pseudo-binding cookies (NULL = none). */
     uint64_t                    router_cookie_base;
@@ -253,6 +392,15 @@ struct moqr_bind {
     uint32_t       pending_count;
     uint32_t       pending_high_water;      /* max depth seen (telemetry)     */
     uint32_t       pending_nonscalar_blocked; /* borrowed kind hit defer: BUG */
+    /* Forwarded Joining FETCH transactions: one bind-wide pool (n_fwd =
+     * resolved core max_fetches) and the aggregate byte pool they share. */
+    b_fwd_t       *fwd;
+    uint32_t       n_fwd;
+    uint64_t       fwd_bytes_cap;
+    uint64_t       fwd_bytes_used;
+#ifdef MOQR_BIND_TESTING
+    moqr_bind_fwd_debug_t dbg_fwd;
+#endif
     b_nsu_t       *nsu;        /* payload sidecar, 1:1 with pending[]        */
     uint32_t       nsu_cap;    /* == pending_cap, by construction            */
     uint32_t       nsu_high_water;
@@ -433,6 +581,17 @@ moqr_bind_debug_fail_probe(int nth, moqr_result_t result)
 {
     bind_dbg_probe_result = result;   /* set before arming the countdown */
     atomic_store(&bind_dbg_fail_probes, nth);
+}
+
+/* Test-only write-failure injection for a forwarded fetch after its
+ * downstream FETCH_OK: the Nth next forwarded object write from now is
+ * reported MOQ_ERR_INVAL without reaching the session, so the request-local
+ * abort path (never a connection close) is observable. */
+static _Atomic int bind_dbg_fail_fwd_writes;
+void
+moqr_bind_debug_fail_fwd_write(int nth)
+{
+    atomic_store(&bind_dbg_fail_fwd_writes, nth);
 }
 
 /* Test-only reason-specific gauges: SESSION_SG re-attempts made by the
@@ -653,6 +812,25 @@ moqr_bind_debug_dl_state(const moqr_bind_t *b, uint32_t slot, bool *ready,
 }
 #endif
 
+/* The aggregate forwarding byte pool: the appended cfg field when the caller's
+ * struct reaches it and it is nonzero, else the named default. Values the
+ * accounting cannot carry on a 32-bit host are refused, never truncated. */
+static moqr_result_t
+bind_fwd_bytes_resolve(const moqr_bind_cfg_t *cfg, uint64_t *out)
+{
+    uint64_t v = BIND_CFG_HAS(cfg, fetch_forward_bytes)
+                     ? cfg->fetch_forward_bytes : 0;
+    if (v == 0) {
+        v = MOQR_BIND_DEF_FETCH_FORWARD_BYTES;
+    }
+    if (v > UINT32_MAX) {
+        *out = 0;
+        return MOQR_ERR_INVAL;
+    }
+    *out = v;
+    return MOQR_OK;
+}
+
 moqr_result_t
 moqr_bind_cfg_resolve(const moqr_bind_cfg_t *cfg,
                       const moqr_core_limits_t *lim, moqr_bind_limits_t *out)
@@ -676,6 +854,13 @@ moqr_bind_cfg_resolve(const moqr_bind_cfg_t *cfg,
                BIND_DEF_GRANT_WINDOW);
 #undef BL_RESOLVE
     out->n_fetches = lim->max_fetches;
+    {
+        uint64_t fwd_bytes;
+        if (bind_fwd_bytes_resolve(cfg, &fwd_bytes) != MOQR_OK) {
+            memset(out, 0, sizeof(*out));
+            return MOQR_ERR_INVAL;
+        }
+    }
     /* Derived count, computed WIDE: a deferral ring the 32-bit field cannot
      * represent rejects the config — never a wrapped small ring. */
     uint64_t pend = 4ull * ((uint64_t)lim->max_subs + lim->max_tracks) +
@@ -727,7 +912,11 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                     moqr_cap_mul(bl.n_pubs, sizeof(b_pub_t)),
                     moqr_cap_add(
                         moqr_cap_mul(bl.n_anns, sizeof(b_ann_t)),
-                        moqr_cap_mul(bl.n_fetches, sizeof(b_fetch_t)))))));
+                        moqr_cap_add(
+                            moqr_cap_mul(bl.n_fetches, sizeof(b_fetch_t)),
+                            moqr_cap_mul(moqr_cap_add(bl.n_fetches,
+                                                      BIND_PUMP_EVENT_POLL),
+                                         sizeof(b_refusal_t))))))));
     out->structure_bytes = moqr_cap_add(
         sizeof(moqr_bind_t),
         moqr_cap_add(moqr_cap_mul(bl.pending_cap, sizeof(moqr_intent_t)),
@@ -760,8 +949,23 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
         out->structure_bytes, moqr_cap_mul(bl.nsu_cap, sizeof(b_nsu_t)));
     out->announce_bytes = moqr_cap_add(
         out->announce_bytes, moqr_cap_mul(bl.nsu_cap, BIND_ANN_BYTES_MAX));
-    out->total_bytes =
-        moqr_cap_add(out->structure_bytes, out->announce_bytes);
+    /* Forwarded-fetch transactions: the bind-wide pool of fixed headers (one
+     * per core fetch slot) is an eager table like the rest; the owned track
+     * keys every upstream-subscription slot may hold and the aggregate
+     * fetch_forward_bytes pool are variable ceilings that this frozen output
+     * carries in total_bytes only (moqr_bind.h documents the accounting). */
+    out->structure_bytes = moqr_cap_add(
+        out->structure_bytes, moqr_cap_mul(bl.n_fetches, sizeof(b_fwd_t)));
+    uint64_t fwd_bytes = 0;
+    if (bind_fwd_bytes_resolve(cfg, &fwd_bytes) != MOQR_OK) {
+        memset(out, 0, sizeof(*out));
+        return MOQR_ERR_INVAL;
+    }
+    uint64_t forward_bytes = moqr_cap_add(
+        fwd_bytes,
+        moqr_cap_mul(moqr_cap_mul(bl.max_conns, bl.n_usubs), BF_FWD_KEY_MAX));
+    out->total_bytes = moqr_cap_add(
+        moqr_cap_add(out->structure_bytes, out->announce_bytes), forward_bytes);
     if (out->total_bytes == UINT64_MAX) {
         memset(out, 0, sizeof(*out));
         return MOQR_ERR_INVAL;   /* wrapped: refuse, never under-report */
@@ -813,6 +1017,11 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
     b->n_anns = bl.n_anns;
     b->request_grant_window = bl.request_grant_window;
     b->n_fetches = bl.n_fetches;
+    b->n_refusals = bl.n_fetches + BIND_PUMP_EVENT_POLL;
+    if (bind_fwd_bytes_resolve(cfg, &b->fwd_bytes_cap) != MOQR_OK) {
+        b->alloc.free(b, sizeof(*b), b->alloc.ctx);
+        return MOQR_ERR_INVAL;
+    }
 
     /* Intent router (multi-shard runtime; absent by default). */
     b->router_cookie_base =
@@ -867,6 +1076,18 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         return MOQR_ERR_NOMEM;
     }
     memset(b->conns, 0, (size_t)b->max_conns * sizeof(*b->conns));
+    /* Forwarded-fetch transaction pool: from here on every failure routes
+     * through moqr_bind_destroy, which frees whatever was allocated. */
+    b->n_fwd = bl.n_fetches;
+    if (b->n_fwd > 0) {
+        b->fwd = b->alloc.alloc((size_t)b->n_fwd * sizeof(*b->fwd),
+                                b->alloc.ctx);
+        if (b->fwd == NULL) {
+            moqr_bind_destroy(b);
+            return MOQR_ERR_NOMEM;
+        }
+        memset(b->fwd, 0, (size_t)b->n_fwd * sizeof(*b->fwd));
+    }
     {
         size_t dw = (size_t)bind_dl_word_count(b->max_conns) *
                     sizeof(uint64_t);
@@ -928,6 +1149,7 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         BIND_ALLOC_TABLE(pubs, b->n_pubs);
         BIND_ALLOC_TABLE(anns, b->n_anns);
         BIND_ALLOC_TABLE(fetches, b->n_fetches);
+        BIND_ALLOC_TABLE(refusals, b->n_refusals);
 #undef BIND_ALLOC_TABLE
     }
     *out = b;
@@ -1174,6 +1396,23 @@ bind_defer_push(moqr_bind_t *b, const moqr_intent_t *it)
 
 static b_conn_t *conn_by_cookie(moqr_bind_t *b, uint64_t cookie);
 static void conn_detach(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us);
+static void fwd_conn_gone(moqr_bind_t *b, const b_conn_t *cn);
+static bool fwd_result_is_gone(moq_result_t rc);
+static void bind_fetch_refuse(moqr_bind_t *b, b_conn_t *cn, moq_fetch_t fetch,
+                              uint64_t error_code, uint64_t now_us);
+static void bind_refusal_pump(moqr_bind_t *b, uint64_t now_us);
+static bool bind_refusal_drop(moqr_bind_t *b, b_conn_t *cn, uint64_t handle);
+static bool bind_refusal_can_poll(const moqr_bind_t *b, const b_conn_t *cn);
+static void bind_refusal_conn_gone(moqr_bind_t *b, b_conn_t *cn);
+static void fwd_admit(moqr_bind_t *b, b_conn_t *cn,
+                      const moq_fetch_request_event_t *fq, uint64_t now_us);
+static bool fwd_on_up_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev);
+static bool fwd_on_down_cancelled(moqr_bind_t *b, b_conn_t *cn, uint64_t handle);
+static void bind_fwd_pump(moqr_bind_t *b, uint64_t now_us);
+static void usub_store_key(moqr_bind_t *b, b_usub_t *us, const moq_bytes_t *parts,
+                           uint32_t ns_count, moq_bytes_t name);
+static void usub_release(moqr_bind_t *b, b_usub_t *us);
+static void usub_release_all(moqr_bind_t *b, b_conn_t *cn);
 
 /* The ordered ring is full for this intent: the connection it targets can no
  * longer be given output in order, so close it rather than continue a live
@@ -1614,6 +1853,8 @@ conn_detach(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         return;
     }
     cn->closed = true;   /* no new work routes to this conn */
+    fwd_conn_gone(b, cn);
+    bind_refusal_conn_gone(b, cn);
     bind_dl_clear_conn(b, cn);
     /* Retire this binding's parked (DEFERred) requests and revalidation grants
      * before the core binding close, freeing their deep-copied bytes: a later
@@ -1641,6 +1882,7 @@ conn_detach(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         b->session_errors++;
     }
     ann_clear_all(b, cn);
+    usub_release_all(b, cn);
     cn->used = false;
     cn->detach_pending = false;
     cn->session = NULL;
@@ -1671,6 +1913,7 @@ moqr_bind_destroy(moqr_bind_t *b)
                 a.free(cn->sgs, (size_t)b->n_sgs * sizeof(*cn->sgs), a.ctx);
             }
             if (cn->usubs != NULL) {
+                usub_release_all(b, cn);
                 a.free(cn->usubs, (size_t)b->n_usubs * sizeof(*cn->usubs),
                        a.ctx);
             }
@@ -1687,8 +1930,34 @@ moqr_bind_destroy(moqr_bind_t *b)
                 a.free(cn->fetches, (size_t)b->n_fetches * sizeof(*cn->fetches),
                        a.ctx);
             }
+            if (cn->refusals != NULL) {
+                a.free(cn->refusals,
+                       (size_t)b->n_refusals * sizeof(*cn->refusals), a.ctx);
+            }
         }
         a.free(b->conns, (size_t)b->max_conns * sizeof(*b->conns), a.ctx);
+    }
+    if (b->fwd != NULL) {
+        /* Memory-only: owned references the transactions still hold are
+         * released without any session call. */
+        for (uint32_t i = 0; i < b->n_fwd; i++) {
+            b_fwd_t *t = &b->fwd[i];
+            if (!t->used) {
+                continue;
+            }
+            for (uint32_t k = t->next_write; k < t->n_items; k++) {
+                if (t->items[k].payload != NULL) {
+                    moq_rcbuf_decref(t->items[k].payload);
+                }
+                if (t->items[k].properties != NULL) {
+                    moq_rcbuf_decref(t->items[k].properties);
+                }
+            }
+            if (t->props != NULL) a.free(t->props, t->props_len, a.ctx);
+            if (t->reason != NULL) a.free(t->reason, t->reason_len, a.ctx);
+            if (t->key != NULL) a.free(t->key, t->key_len, a.ctx);
+        }
+        a.free(b->fwd, (size_t)b->n_fwd * sizeof(*b->fwd), a.ctx);
     }
     {
         size_t dw = (size_t)bind_dl_word_count(b->max_conns) *
@@ -1800,9 +2069,10 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
 #endif
             memset(cn->dsubs, 0, (size_t)b->n_dsubs * sizeof(*cn->dsubs));
             memset(cn->sgs, 0, (size_t)b->n_sgs * sizeof(*cn->sgs));
-            memset(cn->usubs, 0, (size_t)b->n_usubs * sizeof(*cn->usubs));
+            usub_release_all(b, cn);   /* owned keys, then the clean table */
             memset(cn->pubs, 0, (size_t)b->n_pubs * sizeof(*cn->pubs));
             memset(cn->fetches, 0, (size_t)b->n_fetches * sizeof(*cn->fetches));
+            memset(cn->refusals, 0, (size_t)b->n_refusals * sizeof(*cn->refusals));
             return MOQR_OK;
         }
     }
@@ -2387,7 +2657,7 @@ bind_upstream_terminated(moqr_bind_t *b, b_conn_t *cn,
         if (rc != MOQR_OK && rc != MOQR_ERR_STALE_HANDLE) {
             b->session_errors++;
         }
-        cn->usubs[i].used = false;
+        usub_release(b, &cn->usubs[i]);
     }
 }
 
@@ -2401,6 +2671,32 @@ bind_upstream_terminated(moqr_bind_t *b, b_conn_t *cn,
 /* The first live upstream subscription this bind holds, as {conn slot, the
  * handle on that connection's session} — the two coordinates the termination
  * dispatch matches on. */
+void
+moqr_bind_debug_fwd_stats(const moqr_bind_t *b, moqr_bind_fwd_debug_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (b == NULL) {
+        return;
+    }
+    *out = b->dbg_fwd;
+    out->bytes_used = b->fwd_bytes_used;
+    out->bytes_cap = b->fwd_bytes_cap;
+    for (uint32_t ci = 0; ci < b->max_conns; ci++) {
+        const b_conn_t *cn = &b->conns[ci];
+        if (!cn->used || cn->refusals == NULL) {
+            continue;
+        }
+        for (uint32_t i = 0; i < b->n_refusals; i++) {
+            if (cn->refusals[i].used) {
+                out->refusals_pending++;
+            }
+        }
+    }
+}
+
 bool
 moqr_bind_debug_first_usub(const moqr_bind_t *b, uint32_t *slot,
                            uint64_t *handle_raw)
@@ -2682,7 +2978,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                 /* Only release the tracking slot once the core actually
                  * consumed the resolution (it retires the parked subs). */
                 if (urc == MOQR_OK) {
-                    cn->usubs[i].used = false;
+                    usub_release(b, &cn->usubs[i]);
                 } else {
                     b->session_errors++;
                 }
@@ -2746,7 +3042,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                 drc != MOQR_ERR_WRONG_STATE) {
                 b->session_errors++;
             }
-            cn->usubs[i].used = false;
+            usub_release(b, &cn->usubs[i]);
         }
         break;
     }
@@ -3089,6 +3385,21 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         }
         break;
     }
+    case MOQ_EVENT_FETCH_OK:
+    case MOQ_EVENT_FETCH_OBJECT:
+    case MOQ_EVENT_FETCH_GAP:
+    case MOQ_EVENT_FETCH_COMPLETE:
+    case MOQ_EVENT_FETCH_ERROR:
+    case MOQ_EVENT_FETCH_RESET:
+        /* This relay as the FETCHER of a forwarded response. An event that
+         * names no live transaction is left to the pump's event cleanup. */
+        (void)fwd_on_up_event(b, cn, ev);
+        break;
+    case MOQ_EVENT_FETCH_CANCELLED:
+        if (!bind_refusal_drop(b, cn, ev->u.fetch_cancelled.fetch._opaque)) {
+            (void)fwd_on_down_cancelled(b, cn, ev->u.fetch_cancelled.fetch._opaque);
+        }
+        break;
     case MOQ_EVENT_FETCH_REQUEST: {
         const moq_fetch_request_event_t *fq = &ev->u.fetch_request;
         moqr_ns_t fns = ns_from_event(&fq->track_namespace, nsbuf);
@@ -3102,17 +3413,23 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                            NULL);
         moq_reject_fetch_cfg_t rj;
         if (far != BIND_AUTH_ALLOW) {
-            moq_reject_fetch_cfg_init(&rj);
-            rj.error_code = ferr != 0 ? ferr : MOQ_REQUEST_ERROR_UNAUTHORIZED;
-            (void)moq_session_reject_fetch(cn->session, fq->fetch, &rj, now_us);
+            bind_fetch_refuse(b, cn, fq->fetch,
+                              ferr != 0 ? ferr : MOQ_REQUEST_ERROR_UNAUTHORIZED, now_us);
             break;
         }
-        /* Then reject unsupported shapes (joining + descending). */
-        if (fq->joining_sub._opaque != 0 ||
+        /* Then reject unsupported shapes: descending order, and a join of a
+         * PUBLISH-initiated subscription. */
+        if (fq->joining_pub._opaque != 0 ||
             fq->group_order == MOQ_GROUP_ORDER_DESCENDING) {
-            moq_reject_fetch_cfg_init(&rj);
-            rj.error_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
-            (void)moq_session_reject_fetch(cn->session, fq->fetch, &rj, now_us);
+            bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_NOT_SUPPORTED, now_us);
+            break;
+        }
+        /* An ascending join of a SUBSCRIBE-initiated subscription is forwarded
+         * upstream as a bounded transaction (its identity is resolved and
+         * authorized there; the empty-identity authorization above cannot
+         * admit a join by itself). */
+        if (fq->joining_sub._opaque != 0) {
+            fwd_admit(b, cn, fq, now_us);
             break;
         }
         /* Plan against the core retained cursor. */
@@ -3426,10 +3743,13 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         moq_subscription_t ssub;
         if (moq_session_subscribe(cn->session, &cfg, now_us, &ssub) ==
             MOQ_OK) {
+            usub_release(b, &cn->usubs[slot]);   /* a clean slot */
             cn->usubs[slot].used = true;
             cn->usubs[slot].track = it->track;
             cn->usubs[slot].track_gen = it->track_gen;
             cn->usubs[slot].ssub = ssub;
+            usub_store_key(b, &cn->usubs[slot], it->ns_parts, it->ns_count,
+                           it->name);
         } else {
             (void)moqr_core_upstream_error(
                 b->core, it->track, it->track_gen,
@@ -3450,7 +3770,7 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
                 moqr_track_eq(cn->usubs[i].track, it->track)) {
                 (void)moq_session_unsubscribe(cn->session, cn->usubs[i].ssub,
                                               now_us);
-                cn->usubs[i].used = false;
+                usub_release(b, &cn->usubs[i]);
             }
         }
         return true;
@@ -3628,6 +3948,966 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
  * inside conn_detach retires the conn's core fetch cursors. A per-fetch reset /
  * range markers is a later refinement. Returns after detaching — the caller must
  * stop touching this conn. */
+/* -- Forwarded Joining FETCH implementation (see the b_fwd_t comment) -------- */
+
+#ifdef MOQR_BIND_TESTING
+#define FWD_DBG(b, field) ((b)->dbg_fwd.field++)
+#else
+#define FWD_DBG(b, field) ((void)0)
+#endif
+
+static uint64_t
+conn_cookie(const moqr_bind_t *b, const b_conn_t *cn)
+{
+    return (uint64_t)(cn - b->conns) + 1u;
+}
+
+/* The connection a transaction side names, or NULL when that slot has been
+ * closed or reused since (cookie + core binding must both still match). */
+static b_conn_t *
+fwd_conn(moqr_bind_t *b, uint64_t cookie, moqr_binding_t binding)
+{
+    b_conn_t *cn = conn_by_cookie(b, cookie);
+    if (cn == NULL || !cn->used || cn->closed || cn->session == NULL ||
+        !moqr_binding_eq(cn->binding, binding)) {
+        return NULL;
+    }
+    return cn;
+}
+
+static bool
+fwd_charge(moqr_bind_t *b, b_fwd_t *t, uint64_t n)
+{
+    if (n > b->fwd_bytes_cap - b->fwd_bytes_used) {
+        return false;
+    }
+    b->fwd_bytes_used += n;
+    t->charged += n;
+#ifdef MOQR_BIND_TESTING
+    if (b->fwd_bytes_used > b->dbg_fwd.bytes_high) {
+        b->dbg_fwd.bytes_high = b->fwd_bytes_used;
+    }
+#endif
+    return true;
+}
+
+static void
+fwd_uncharge(moqr_bind_t *b, b_fwd_t *t, uint64_t n)
+{
+    b->fwd_bytes_used -= n;
+    t->charged -= n;
+}
+
+/* Owned, charged copy of a borrowed byte span. Empty spans copy nothing. */
+static bool
+fwd_copy(moqr_bind_t *b, b_fwd_t *t, const uint8_t *src, size_t len,
+         uint8_t **dst, size_t *dst_len)
+{
+    *dst = NULL;
+    *dst_len = 0;
+    if (len == 0) {
+        return true;
+    }
+    if (src == NULL || !fwd_charge(b, t, len)) {
+        return false;
+    }
+    uint8_t *p = b->alloc.alloc(len, b->alloc.ctx);
+    if (p == NULL) {
+        fwd_uncharge(b, t, len);
+        return false;
+    }
+    memcpy(p, src, len);
+    *dst = p;
+    *dst_len = len;
+    return true;
+}
+
+static void
+fwd_item_release(moqr_bind_t *b, b_fwd_t *t, b_fwd_item_t *it)
+{
+    if (it->payload != NULL) {
+        moq_rcbuf_decref(it->payload);
+    }
+    if (it->properties != NULL) {
+        moq_rcbuf_decref(it->properties);
+    }
+    fwd_uncharge(b, t, it->charged);
+    memset(it, 0, sizeof(*it));
+}
+
+/* Release every owned reference and copy and free the slot. Only called once
+ * BOTH sides are terminal: nothing is owed on either session any more. */
+static void
+fwd_release(moqr_bind_t *b, b_fwd_t *t)
+{
+    for (uint32_t i = t->next_write; i < t->n_items; i++) {
+        fwd_item_release(b, t, &t->items[i]);
+    }
+    if (t->props != NULL) {
+        b->alloc.free(t->props, t->props_len, b->alloc.ctx);
+        fwd_uncharge(b, t, t->props_len);
+    }
+    if (t->reason != NULL) {
+        b->alloc.free(t->reason, t->reason_len, b->alloc.ctx);
+        fwd_uncharge(b, t, t->reason_len);
+    }
+    if (t->key != NULL) {
+        b->alloc.free(t->key, t->key_len, b->alloc.ctx);
+        fwd_uncharge(b, t, t->key_len);
+    }
+    /* Invariant: every charge was matched by its release. */
+    b->fwd_bytes_used -= t->charged;
+    memset(t, 0, sizeof(*t));
+#ifdef MOQR_BIND_TESTING
+    b->dbg_fwd.live--;
+#endif
+}
+
+static b_fwd_t *
+fwd_find_up(moqr_bind_t *b, const b_conn_t *cn, uint64_t handle)
+{
+    uint64_t cookie = conn_cookie(b, cn);
+    for (uint32_t i = 0; i < b->n_fwd; i++) {
+        b_fwd_t *t = &b->fwd[i];
+        if (t->used && t->ufetch_live && t->u_cookie == cookie &&
+            moqr_binding_eq(t->u_binding, cn->binding) &&
+            t->ufetch._opaque == handle) {
+            return t;
+        }
+    }
+    return NULL;
+}
+
+static b_fwd_t *
+fwd_find_down(moqr_bind_t *b, const b_conn_t *cn, uint64_t handle)
+{
+    uint64_t cookie = conn_cookie(b, cn);
+    for (uint32_t i = 0; i < b->n_fwd; i++) {
+        b_fwd_t *t = &b->fwd[i];
+        if (t->used && t->d != FW_D_TERMINAL && t->d_cookie == cookie &&
+            moqr_binding_eq(t->d_binding, cn->binding) &&
+            t->sfetch._opaque == handle) {
+            return t;
+        }
+    }
+    return NULL;
+}
+
+/* The upstream side ends for a reason other than its own COMPLETE/ERROR/RESET:
+ * if a request is still live upstream it is cancelled (retried until the
+ * session commits it); the recorded `end` is the first one, never overwritten. */
+static void
+fwd_end_up(b_fwd_t *t, uint8_t end)
+{
+    if (t->end == FW_END_NONE) {
+        t->end = end;
+    }
+    if (t->u == FW_U_PENDING) {
+        t->u = FW_U_CANCELLING;
+    } else if (t->u == FW_U_UNSENT) {
+        t->u = FW_U_TERMINAL;
+    }
+}
+
+/* A connection is going away: every transaction naming it on either side
+ * stops addressing its session. Idempotent (a deferred detach retries). */
+static void
+fwd_conn_gone(moqr_bind_t *b, const b_conn_t *cn)
+{
+    uint64_t cookie = conn_cookie(b, cn);
+    for (uint32_t i = 0; i < b->n_fwd; i++) {
+        b_fwd_t *t = &b->fwd[i];
+        if (!t->used) {
+            continue;
+        }
+        if (t->u_cookie == cookie && moqr_binding_eq(t->u_binding, cn->binding) &&
+            t->u != FW_U_TERMINAL) {
+            if (t->end == FW_END_NONE) {
+                t->end = FW_END_LOST;
+            }
+            t->u = FW_U_TERMINAL;      /* no cancel: the session is gone */
+            t->ufetch_live = false;
+            FWD_DBG(b, lost);
+        }
+        if (t->d_cookie == cookie && moqr_binding_eq(t->d_binding, cn->binding) &&
+            t->d != FW_D_TERMINAL) {
+            t->d = FW_D_TERMINAL;      /* nothing more may be written to it */
+            fwd_end_up(t, FW_END_CANCELLED);
+            FWD_DBG(b, down_lost);
+        }
+    }
+}
+
+/* Refuse a downstream FETCH request before any transaction exists. */
+static void
+bind_fetch_refuse(moqr_bind_t *b, b_conn_t *cn, moq_fetch_t fetch,
+                  uint64_t error_code, uint64_t now_us)
+{
+    moq_reject_fetch_cfg_t rj;
+    moq_reject_fetch_cfg_init(&rj);
+    rj.error_code = error_code;
+    moq_result_t rc = moq_session_reject_fetch(cn->session, fetch, &rj, now_us);
+    if (rc == MOQ_OK) {
+        FWD_DBG(b, refusals_sent);
+        return;
+    }
+    if (rc != MOQ_ERR_WOULD_BLOCK) {
+        if (!fwd_result_is_gone(rc)) {
+            b->session_errors++;
+        }
+        return;
+    }
+    FWD_DBG(b, refusals_blocked);
+    /* The session keeps the request pending: hold the refusal and retry it
+     * every pump until it commits or the request goes away. */
+    for (uint32_t i = 0; i < b->n_refusals; i++) {
+        b_refusal_t *r = &cn->refusals[i];
+        if (!r->used) {
+            r->used = true;
+            r->sfetch = fetch;
+            r->error_code = error_code;
+            FWD_DBG(b, refusals_parked);
+            return;
+        }
+    }
+    /* Unreachable: the pump only polls an event when a poll's worth of
+     * entries is free (bind_refusal_can_poll). Counted so a regression is
+     * visible. */
+    b->session_errors++;
+    FWD_DBG(b, refusals_unparked);
+}
+
+/* Whether the pump may poll another event from this connection: a
+ * FETCH_REQUEST it polls must be ownable, so a poll's worth of refusal
+ * entries has to be free first. */
+static bool
+bind_refusal_can_poll(const moqr_bind_t *b, const b_conn_t *cn)
+{
+    uint32_t free_slots = 0;
+    for (uint32_t i = 0; i < b->n_refusals; i++) {
+        if (!cn->refusals[i].used) {
+            free_slots++;
+            if (free_slots >= BIND_PUMP_EVENT_POLL) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Retry every held refusal on every open connection (one attempt each per
+ * pump); a request the session no longer holds is simply forgotten. */
+static void
+bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
+{
+    for (uint32_t ci = 0; ci < b->max_conns; ci++) {
+        b_conn_t *cn = &b->conns[ci];
+        if (!cn->used || cn->closed || cn->session == NULL) {
+            continue;
+        }
+        for (uint32_t i = 0; i < b->n_refusals; i++) {
+            b_refusal_t *r = &cn->refusals[i];
+            if (!r->used) {
+                continue;
+            }
+            moq_reject_fetch_cfg_t rj;
+            moq_reject_fetch_cfg_init(&rj);
+            rj.error_code = r->error_code;
+            moq_result_t rc = moq_session_reject_fetch(cn->session, r->sfetch, &rj,
+                                                       now_us);
+            if (rc == MOQ_ERR_WOULD_BLOCK) {
+                FWD_DBG(b, refusals_retried);   /* HOLD */
+                continue;
+            }
+            if (rc == MOQ_OK) {
+                FWD_DBG(b, refusals_sent);
+            } else if (fwd_result_is_gone(rc)) {
+                FWD_DBG(b, refusals_gone);   /* retired by the peer meanwhile */
+            } else {
+                b->session_errors++;
+            }
+            memset(r, 0, sizeof(*r));
+        }
+    }
+}
+
+/* The peer cancelled a request whose refusal is still held: nothing is owed. */
+static bool
+bind_refusal_drop(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
+{
+    for (uint32_t i = 0; i < b->n_refusals; i++) {
+        b_refusal_t *r = &cn->refusals[i];
+        if (r->used && r->sfetch._opaque == handle) {
+            memset(r, 0, sizeof(*r));
+            FWD_DBG(b, refusals_dropped);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The connection is going away: every held refusal on it is released. */
+static void
+bind_refusal_conn_gone(moqr_bind_t *b, b_conn_t *cn)
+{
+    for (uint32_t i = 0; i < b->n_refusals; i++) {
+        b_refusal_t *r = &cn->refusals[i];
+        if (r->used) {
+            memset(r, 0, sizeof(*r));
+            FWD_DBG(b, refusals_dropped);
+        }
+    }
+}
+
+/* Admit a downstream Joining FETCH as a forwarding transaction, or reject it
+ * on the wire. The joined subscription is resolved ONCE to its track identity
+ * and generation; the resolved namespace/name is what the fetch is authorized
+ * against (fail-closed) and what the upstream request names. The upstream
+ * source is the connection whose upstream subscription carries that exact
+ * (track, generation): a replaced origin has a new generation and is never
+ * addressed by an older transaction. */
+static void
+fwd_admit(moqr_bind_t *b, b_conn_t *cn, const moq_fetch_request_event_t *fq,
+          uint64_t now_us)
+{
+    /* 1. Resolve the joined subscription. */
+    moqr_sub_t rsub = MOQR_SUB_INVALID;
+    for (uint32_t i = 0; i < b->n_dsubs; i++) {
+        if (cn->dsubs[i].used &&
+            cn->dsubs[i].sub_raw == fq->joining_sub._opaque) {
+            rsub = cn->dsubs[i].rsub;
+            break;
+        }
+    }
+    moqr_track_t track = { 0 };
+    uint64_t track_gen = 0;
+    b_conn_t *ucn = NULL;
+    const b_usub_t *us = NULL;
+    bool resolved = moqr_sub_is_valid(rsub) &&
+                    moqr_core_sub_track(b->core, rsub, &track, &track_gen) ==
+                        MOQR_OK;
+    if (resolved) {
+        for (uint32_t ci = 0; ci < b->max_conns && us == NULL; ci++) {
+            b_conn_t *c = &b->conns[ci];
+            if (!c->used || c->closed || c->session == NULL) {
+                continue;
+            }
+            for (uint32_t i = 0; i < b->n_usubs; i++) {
+                if (c->usubs[i].used && c->usubs[i].has_key &&
+                    moqr_track_eq(c->usubs[i].track, track) &&
+                    c->usubs[i].track_gen == track_gen) {
+                    ucn = c;
+                    us = &c->usubs[i];
+                    break;
+                }
+            }
+        }
+    }
+    /* 2. Authorize on the RESOLVED identity (fail-closed). An unresolvable
+     * join is authorized on the empty identity exactly as before, so the
+     * request's existence is never a pre-auth oracle. */
+    moqr_ns_t ans = us != NULL ? (moqr_ns_t){ us->parts, us->ns_count }
+                               : (moqr_ns_t){ NULL, 0 };
+    moq_bytes_t aname = us != NULL ? us->name : (moq_bytes_t){ NULL, 0 };
+    uint64_t ferr = 0;
+    uint64_t ftkt = 0;
+    if (bind_authorize(b, cn, MOQR_AUTH_FETCH, ans, aname, fq->tokens,
+                       fq->token_count, now_us, &ferr, &ftkt, NULL) !=
+        BIND_AUTH_ALLOW) {
+        bind_fetch_refuse(b, cn, fq->fetch,
+                          ferr != 0 ? ferr : MOQ_REQUEST_ERROR_UNAUTHORIZED, now_us);
+        return;
+    }
+    if (!resolved) {
+        bind_fetch_refuse(b, cn, fq->fetch,
+                          MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID, now_us);
+        return;
+    }
+    if (us == NULL) {
+        /* No upstream subscription carries this exact source generation
+         * (origin gone, replaced, or its key could not be retained). */
+        bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_DOES_NOT_EXIST, now_us);
+        FWD_DBG(b, rejected_no_upstream);
+        return;
+    }
+    /* 3. A transaction slot. */
+    b_fwd_t *t = NULL;
+    for (uint32_t i = 0; i < b->n_fwd; i++) {
+        if (!b->fwd[i].used) {
+            t = &b->fwd[i];
+            break;
+        }
+    }
+    if (t == NULL) {
+        bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+        FWD_DBG(b, rejected_no_slot);
+        return;
+    }
+    memset(t, 0, sizeof(*t));
+    t->used = true;
+#ifdef MOQR_BIND_TESTING
+    b->dbg_fwd.live++;
+#endif
+    /* 4. Owned, charged copy of the track key (one buffer; parts + name). */
+    if (!fwd_copy(b, t, us->key, us->key_len, &t->key, &t->key_len)) {
+        fwd_release(b, t);
+        bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+        FWD_DBG(b, rejected_oom);
+        return;
+    }
+    t->ns_count = us->ns_count;
+    {
+        size_t off = 0;
+        for (uint32_t i = 0; i < us->ns_count; i++) {
+            t->parts[i] = (moq_bytes_t){ t->key + off, us->parts[i].len };
+            off += us->parts[i].len;
+        }
+        t->name = (moq_bytes_t){ t->key + off, us->name.len };
+    }
+    t->d_cookie = conn_cookie(b, cn);
+    t->d_binding = cn->binding;
+    t->sfetch = fq->fetch;
+    t->u_cookie = conn_cookie(b, ucn);
+    t->u_binding = ucn->binding;
+    t->track = track;
+    t->track_gen = track_gen;
+    t->start_group = fq->start_group;
+    t->start_object = fq->start_object;
+    t->end_group = fq->end_group;
+    t->end_object = fq->end_object;
+    t->has_prio = true;
+    t->prio = fq->subscriber_priority;
+    t->u = FW_U_UNSENT;
+    t->d = FW_D_PENDING;
+    FWD_DBG(b, admitted);
+}
+
+/* An item refused by the counts or the pool: the collection is abandoned
+ * before OK (overflow terminal) and the upstream request cancelled. */
+static void
+fwd_overflow(moqr_bind_t *b, b_fwd_t *t)
+{
+    (void)b;
+    fwd_end_up(t, FW_END_OVERFLOW);
+    FWD_DBG(b, overflow);
+}
+
+/* Whether (group, object) lies inside the transaction's normalized range
+ * [start, end) -- end_object 0 meaning "through the end of end_group". */
+static bool
+fwd_in_range(const b_fwd_t *t, uint64_t group, uint64_t object)
+{
+    if (group < t->start_group ||
+        (group == t->start_group && object < t->start_object)) {
+        return false;
+    }
+    if (t->end_object == 0) {
+        return group <= t->end_group;
+    }
+    return group < t->end_group ||
+           (group == t->end_group && object < t->end_object);
+}
+
+/* Whether an upstream FETCH_OK's End Location stays within the request's
+ * end (same end_object 0 convention on both sides). */
+static bool
+fwd_end_within(const b_fwd_t *t, uint64_t end_group, uint64_t end_object)
+{
+    if (t->end_object == 0) {
+        return end_group <= t->end_group;
+    }
+    if (end_object == 0) {
+        return end_group < t->end_group;
+    }
+    return end_group < t->end_group ||
+           (end_group == t->end_group && end_object <= t->end_object);
+}
+
+/* The upstream answer does not fit the pinned range: abandoned before OK
+ * (never relayed as a narrower or wider success) and cancelled upstream. */
+static void
+fwd_mismatch(moqr_bind_t *b, b_fwd_t *t)
+{
+    (void)b;
+    fwd_end_up(t, FW_END_MISMATCH);
+    FWD_DBG(b, mismatch);
+}
+
+/* Fetcher-role events on an upstream connection. Returns true when the event
+ * belonged to a transaction (its owned references, if any, were taken). An
+ * event naming no live transaction handle is left for moq_event_cleanup. */
+static bool
+fwd_on_up_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev)
+{
+    uint64_t h;
+    switch (ev->kind) {
+    case MOQ_EVENT_FETCH_OK:       h = ev->u.fetch_ok.fetch._opaque; break;
+    case MOQ_EVENT_FETCH_OBJECT:   h = ev->u.fetch_object.fetch._opaque; break;
+    case MOQ_EVENT_FETCH_GAP:      h = ev->u.fetch_gap.fetch._opaque; break;
+    case MOQ_EVENT_FETCH_COMPLETE: h = ev->u.fetch_complete.fetch._opaque; break;
+    case MOQ_EVENT_FETCH_ERROR:    h = ev->u.fetch_error.fetch._opaque; break;
+    case MOQ_EVENT_FETCH_RESET:    h = ev->u.fetch_reset.fetch._opaque; break;
+    default:                       return false;
+    }
+    b_fwd_t *t = fwd_find_up(b, cn, h);
+    if (t == NULL) {
+        FWD_DBG(b, stale_events_ignored);
+        return false;   /* retired handle: cleaned by the pump, never matched */
+    }
+    switch (ev->kind) {
+    case MOQ_EVENT_FETCH_OK: {
+        const moq_fetch_ok_event_t *ok = &ev->u.fetch_ok;
+        if (t->u != FW_U_PENDING || t->ok_seen) {
+            FWD_DBG(b, drained_events);
+            return true;
+        }
+        if (!fwd_end_within(t, ok->end_group, ok->end_object)) {
+            fwd_mismatch(b, t);
+            return true;
+        }
+        if (!fwd_copy(b, t, ok->track_properties.data,
+                      ok->track_properties.len, &t->props, &t->props_len)) {
+            fwd_overflow(b, t);
+            return true;
+        }
+        t->ok_seen = true;
+        t->ok_eot = ok->end_of_track;
+        t->ok_end_group = ok->end_group;
+        t->ok_end_object = ok->end_object;
+        return true;
+    }
+    case MOQ_EVENT_FETCH_OBJECT: {
+        moq_fetch_object_event_t *o = &ev->u.fetch_object;
+        if (t->u != FW_U_PENDING) {
+            FWD_DBG(b, drained_events);
+            return true;   /* draining a cancelled/overflowed response */
+        }
+        if (!fwd_in_range(t, o->group_id, o->object_id)) {
+            fwd_mismatch(b, t);
+            return true;
+        }
+        if (t->n_items >= BF_FWD_MAX_ITEMS || t->n_objects >= BF_FWD_MAX_OBJECTS) {
+            fwd_overflow(b, t);
+            return true;
+        }
+        uint64_t bytes = (o->payload != NULL ? moq_rcbuf_len(o->payload) : 0) +
+                         (o->properties != NULL ? moq_rcbuf_len(o->properties) : 0);
+        if (!fwd_charge(b, t, bytes)) {
+            fwd_overflow(b, t);
+            return true;
+        }
+        b_fwd_item_t *it = &t->items[t->n_items++];
+        memset(it, 0, sizeof(*it));
+        it->group = o->group_id;
+        it->subgroup = o->subgroup_id;
+        it->object = o->object_id;
+        it->publisher_priority = o->publisher_priority;
+        it->datagram = o->datagram;
+        it->payload = o->payload;        /* ownership transferred */
+        it->properties = o->properties;
+        it->charged = bytes;
+        o->payload = NULL;
+        o->properties = NULL;
+        t->n_objects++;
+        return true;
+    }
+    case MOQ_EVENT_FETCH_GAP: {
+        const moq_fetch_gap_event_t *g = &ev->u.fetch_gap;
+        if (t->u != FW_U_PENDING) {
+            FWD_DBG(b, drained_events);
+            return true;
+        }
+        if (t->n_items >= BF_FWD_MAX_ITEMS || t->n_gaps >= BF_FWD_MAX_GAPS) {
+            fwd_overflow(b, t);
+            return true;
+        }
+        b_fwd_item_t *it = &t->items[t->n_items++];
+        memset(it, 0, sizeof(*it));
+        it->is_gap = true;
+        it->range_kind = (uint8_t)g->range_kind;
+        it->group = g->group_id;
+        it->object = g->object_id;
+        t->n_gaps++;
+        return true;
+    }
+    case MOQ_EVENT_FETCH_COMPLETE:
+        /* The session frees the fetcher entry with this terminal. */
+        t->ufetch_live = false;
+        if (t->u == FW_U_PENDING && t->end == FW_END_NONE) {
+            t->end = t->ok_seen ? FW_END_COMPLETE : FW_END_ERROR;
+            if (!t->ok_seen) {
+                t->err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+            }
+        }
+        t->u = FW_U_TERMINAL;
+        FWD_DBG(b, completed);
+        return true;
+    case MOQ_EVENT_FETCH_ERROR: {
+        const moq_fetch_error_event_t *e = &ev->u.fetch_error;
+        t->ufetch_live = false;
+        if (t->end == FW_END_NONE) {
+            t->end = FW_END_ERROR;
+            if (fwd_copy(b, t, e->reason.data, e->reason.len, &t->reason,
+                         &t->reason_len)) {
+                t->err_code = e->error_code;
+                t->err_can_retry = e->can_retry;
+                t->err_retry_after_ms = e->retry_after_ms;
+            } else {
+                /* The complete upstream error cannot be retained: answer
+                 * with the relay's own failure, never a trimmed copy. */
+                t->err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                t->err_can_retry = false;
+                t->err_retry_after_ms = 0;
+                t->reason = NULL;
+                t->reason_len = 0;
+                FWD_DBG(b, reason_unretained);
+            }
+        }
+        t->u = FW_U_TERMINAL;
+        FWD_DBG(b, errors);
+        return true;
+    }
+    case MOQ_EVENT_FETCH_RESET:
+        t->ufetch_live = false;
+        if (t->end == FW_END_NONE) {
+            t->end = FW_END_RESET;
+        }
+        t->u = FW_U_TERMINAL;
+        FWD_DBG(b, resets);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Publisher-role: the downstream subscriber cancelled its (forwarded) fetch.
+ * The session already retired its entry and reset any open data stream. */
+static bool
+fwd_on_down_cancelled(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
+{
+    b_fwd_t *t = fwd_find_down(b, cn, handle);
+    if (t == NULL) {
+        return false;
+    }
+    t->d = FW_D_TERMINAL;
+    fwd_end_up(t, FW_END_CANCELLED);
+    FWD_DBG(b, cancelled_down);
+    return true;
+}
+
+static bool
+fwd_result_is_gone(moq_result_t rc)
+{
+    return rc == MOQ_ERR_STALE_HANDLE || rc == MOQ_ERR_WRONG_STATE ||
+           rc == MOQ_ERR_CLOSED;
+}
+
+/* Drive every transaction as far as the sessions allow. Each step HOLDs on
+ * WOULD_BLOCK with no state advance and is retried by the next pump; no step
+ * loops on a refusal. */
+static void
+bind_fwd_pump(moqr_bind_t *b, uint64_t now_us)
+{
+    for (uint32_t i = 0; i < b->n_fwd; i++) {
+        b_fwd_t *t = &b->fwd[i];
+        if (!t->used) {
+            continue;
+        }
+        /* -- upstream side -- */
+        if (t->u == FW_U_UNSENT) {
+            b_conn_t *ucn = fwd_conn(b, t->u_cookie, t->u_binding);
+            if (ucn == NULL) {
+                t->end = t->end == FW_END_NONE ? FW_END_LOST : t->end;
+                t->u = FW_U_TERMINAL;
+                FWD_DBG(b, lost);
+            } else {
+                moq_fetch_cfg_t fc;
+                moq_fetch_cfg_init(&fc);
+                fc.track_namespace = (moq_namespace_t){ .parts = t->parts,
+                                                        .count = t->ns_count };
+                fc.track_name = t->name;
+                fc.start_group = t->start_group;
+                fc.start_object = t->start_object;
+                fc.end_group = t->end_group;
+                fc.end_object = t->end_object;
+                fc.group_order = MOQ_GROUP_ORDER_ASCENDING;
+                fc.has_subscriber_priority = t->has_prio;
+                fc.subscriber_priority = t->prio;
+                moq_result_t rc = moq_session_fetch(ucn->session, &fc, now_us,
+                                                    &t->ufetch);
+                if (rc == MOQ_OK) {
+                    t->ufetch_live = true;
+                    t->u = FW_U_PENDING;
+                } else if (rc == MOQ_ERR_WOULD_BLOCK ||
+                           rc == MOQ_ERR_REQUEST_BLOCKED) {
+                    FWD_DBG(b, retried_send);   /* HOLD */
+                } else {
+                    t->end = t->end == FW_END_NONE ? FW_END_ERROR : t->end;
+                    t->err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                    t->u = FW_U_TERMINAL;
+                    b->session_errors++;
+                }
+            }
+        }
+        if (t->u == FW_U_CANCELLING) {
+            b_conn_t *ucn = fwd_conn(b, t->u_cookie, t->u_binding);
+            if (ucn == NULL || !t->ufetch_live) {
+                t->u = FW_U_TERMINAL;
+                t->ufetch_live = false;
+            } else {
+                moq_result_t rc = moq_session_fetch_cancel(ucn->session,
+                                                           t->ufetch, now_us);
+                if (rc == MOQ_ERR_WOULD_BLOCK) {
+                    FWD_DBG(b, retried_cancel);   /* HOLD: ownership retained */
+                } else {
+                    if (rc != MOQ_OK && !fwd_result_is_gone(rc)) {
+                        b->session_errors++;
+                    }
+                    t->u = FW_U_TERMINAL;
+                    t->ufetch_live = false;
+                    FWD_DBG(b, cancelled_up);
+                }
+            }
+        }
+        /* -- downstream side -- */
+        b_conn_t *dcn = t->d != FW_D_TERMINAL
+                            ? fwd_conn(b, t->d_cookie, t->d_binding) : NULL;
+        if (t->d != FW_D_TERMINAL && dcn == NULL) {
+            t->d = FW_D_TERMINAL;   /* its session is gone: nothing to write */
+            fwd_end_up(t, FW_END_CANCELLED);
+            FWD_DBG(b, down_lost);
+        }
+        for (uint32_t guard = 0; guard < 256 && t->d != FW_D_TERMINAL; guard++) {
+            if (t->d == FW_D_PENDING) {
+                if (t->u != FW_U_TERMINAL) {
+                    break;   /* still collecting */
+                }
+                if (t->end == FW_END_COMPLETE && t->ok_seen) {
+                    t->d = FW_D_ACCEPTING;
+                    continue;
+                }
+                moq_reject_fetch_cfg_t rj;
+                moq_reject_fetch_cfg_init(&rj);
+                if (t->end == FW_END_ERROR) {
+                    rj.error_code = t->err_code;
+                    rj.can_retry = t->err_can_retry;
+                    rj.retry_after_ms = t->err_retry_after_ms;
+                    rj.reason = (moq_bytes_t){ t->reason, t->reason_len };
+                } else {
+                    rj.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                }
+                moq_result_t rc = moq_session_reject_fetch(dcn->session,
+                                                           t->sfetch, &rj,
+                                                           now_us);
+                if (rc == MOQ_ERR_WOULD_BLOCK) {
+                    FWD_DBG(b, retried_reject);
+                    break;
+                }
+                if (rc != MOQ_OK && !fwd_result_is_gone(rc)) {
+                    b->session_errors++;
+                }
+                t->d = FW_D_TERMINAL;
+                FWD_DBG(b, rejected_down);
+                break;
+            }
+            if (t->d == FW_D_ACCEPTING) {
+                moq_accept_fetch_cfg_t ac;
+                moq_accept_fetch_cfg_init(&ac);
+                ac.end_of_track = t->ok_eot;
+                ac.end_group = t->ok_end_group;
+                ac.end_object = t->ok_end_object;
+                ac.empty = (t->n_items == 0);
+                ac.track_properties = (moq_bytes_t){ t->props, t->props_len };
+                moq_result_t rc = moq_session_accept_fetch(dcn->session,
+                                                           t->sfetch, &ac,
+                                                           now_us);
+                if (rc == MOQ_ERR_WOULD_BLOCK) {
+                    FWD_DBG(b, retried_accept);
+                    break;
+                }
+                if (fwd_result_is_gone(rc)) {
+                    t->d = FW_D_TERMINAL;   /* peer cancelled / session closed */
+                    FWD_DBG(b, down_gone);
+                    break;
+                }
+                if (rc != MOQ_OK) {
+                    /* Locally unencodable before anything reached the wire:
+                     * the request is still open downstream, so it is answered
+                     * with a rejection rather than left pending. */
+                    b->session_errors++;
+                    t->end = FW_END_ERROR;
+                    t->err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                    t->err_can_retry = false;
+                    t->err_retry_after_ms = 0;
+                    t->d = FW_D_PENDING;
+                    continue;
+                }
+                t->d = ac.empty ? FW_D_TERMINAL : FW_D_STREAMING;
+                if (ac.empty) {
+                    FWD_DBG(b, delivered);
+                }
+                continue;
+            }
+            if (t->d == FW_D_STREAMING) {
+                if (t->next_write < t->n_items) {
+                    b_fwd_item_t *it = &t->items[t->next_write];
+                    moq_result_t rc;
+                    if (it->is_gap) {
+                        rc = moq_session_write_fetch_range(
+                            dcn->session, t->sfetch,
+                            (moq_fetch_range_kind_t)it->range_kind, it->group,
+                            it->object, now_us);
+                    } else {
+                        moq_fetch_object_cfg_t oc;
+                        moq_fetch_object_cfg_init(&oc);
+                        oc.group_id = it->group;
+                        oc.subgroup_id = it->subgroup;
+                        oc.object_id = it->object;
+                        oc.publisher_priority = it->publisher_priority;
+                        oc.datagram = moq_session_supports_fetch_datagram(
+                                          dcn->session) ? it->datagram : false;
+                        oc.payload = it->payload;
+                        oc.properties = it->properties;
+#ifdef MOQR_BIND_TESTING
+                        if (atomic_load(&bind_dbg_fail_fwd_writes) > 0 &&
+                            atomic_fetch_sub(&bind_dbg_fail_fwd_writes, 1) == 1) {
+                            rc = MOQ_ERR_INVAL;   /* injected: unencodable */
+                        } else
+#endif
+                        {
+                            rc = moq_session_write_fetch_object(
+                                dcn->session, t->sfetch, &oc, now_us);
+                        }
+                    }
+                    if (rc == MOQ_ERR_WOULD_BLOCK) {
+                        FWD_DBG(b, retried_write);
+                        break;   /* HOLD: the item is kept, retried as is */
+                    }
+                    if (rc == MOQ_OK) {
+                        fwd_item_release(b, t, it);
+                        t->next_write++;
+                        b->deliveries_written++;
+                        continue;
+                    }
+                    if (fwd_result_is_gone(rc)) {
+                        t->d = FW_D_TERMINAL;
+                        FWD_DBG(b, down_gone);
+                        break;
+                    }
+                    t->d = FW_D_ABORTING;   /* locally unencodable after OK */
+                    continue;
+                }
+                moq_result_t rc = moq_session_end_fetch(dcn->session, t->sfetch,
+                                                        now_us);
+                if (rc == MOQ_ERR_WOULD_BLOCK) {
+                    FWD_DBG(b, retried_fin);
+                    break;
+                }
+                if (rc == MOQ_OK) {
+                    t->d = FW_D_TERMINAL;
+                    FWD_DBG(b, delivered);
+                    break;
+                }
+                if (fwd_result_is_gone(rc)) {
+                    t->d = FW_D_TERMINAL;
+                    FWD_DBG(b, down_gone);
+                    break;
+                }
+                t->d = FW_D_ABORTING;
+                continue;
+            }
+            if (t->d == FW_D_ABORTING) {
+                moq_result_t rc = moq_session_abort_fetch(dcn->session, t->sfetch,
+                                                          BIND_RESET_INTERNAL,
+                                                          now_us);
+                if (rc == MOQ_ERR_WOULD_BLOCK) {
+                    FWD_DBG(b, retried_abort);
+                    break;
+                }
+                if (rc != MOQ_OK && !fwd_result_is_gone(rc)) {
+                    b->session_errors++;
+                }
+                t->d = FW_D_TERMINAL;
+                FWD_DBG(b, aborted);
+                break;
+            }
+        }
+        if (t->u == FW_U_TERMINAL && t->d == FW_D_TERMINAL) {
+            fwd_release(b, t);
+        }
+    }
+}
+
+/* Retain an owned copy of the track key an upstream subscription was issued
+ * for, so a later forwarded fetch can name it without consulting the core.
+ * Bounded by the full-track-name cap; a copy that cannot be made leaves the
+ * subscription usable for live delivery but not as a forwarding source. */
+static void
+usub_store_key(moqr_bind_t *b, b_usub_t *us, const moq_bytes_t *parts,
+               uint32_t ns_count, moq_bytes_t name)
+{
+    us->has_key = false;
+    us->key = NULL;
+    us->key_len = 0;
+    if (ns_count > 32) {
+        return;
+    }
+    size_t total = name.len;
+    for (uint32_t i = 0; i < ns_count; i++) {
+        if (parts[i].len == 0 || parts[i].data == NULL ||
+            BF_FWD_KEY_MAX - total < parts[i].len) {
+            return;
+        }
+        total += parts[i].len;
+    }
+    if (total > BF_FWD_KEY_MAX || (name.len > 0 && name.data == NULL)) {
+        return;
+    }
+    uint8_t *bytes = NULL;
+    if (total > 0) {
+        bytes = b->alloc.alloc(total, b->alloc.ctx);
+        if (bytes == NULL) {
+            return;
+        }
+    }
+    size_t off = 0;
+    for (uint32_t i = 0; i < ns_count; i++) {
+        memcpy(bytes + off, parts[i].data, parts[i].len);
+        us->parts[i] = (moq_bytes_t){ bytes + off, parts[i].len };
+        off += parts[i].len;
+    }
+    if (name.len > 0) {
+        memcpy(bytes + off, name.data, name.len);
+    }
+    us->name = (moq_bytes_t){ bytes + off, name.len };
+    us->ns_count = ns_count;
+    us->key = bytes;
+    us->key_len = total;
+    us->has_key = true;
+}
+
+static void
+usub_release(moqr_bind_t *b, b_usub_t *us)
+{
+    if (us->key != NULL) {
+        b->alloc.free(us->key, us->key_len, b->alloc.ctx);
+    }
+    memset(us, 0, sizeof(*us));
+}
+
+static void
+usub_release_all(moqr_bind_t *b, b_conn_t *cn)
+{
+    if (cn->usubs == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < b->n_usubs; i++) {
+        if (cn->usubs[i].key != NULL || cn->usubs[i].used) {
+            usub_release(b, &cn->usubs[i]);
+        }
+    }
+}
+
 static void
 bind_fetch_terminate(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
@@ -4402,18 +5682,26 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             continue;
         }
         size_t n;
-        while (cn->used && !cn->closed &&
-               (n = moq_session_poll_events(cn->session, b->pump_events,
-                                            BIND_PUMP_EVENT_BATCH)) > 0) {
+        while (cn->used && !cn->closed) {
+            if (!bind_refusal_can_poll(b, cn)) {
+                /* Held refusals leave no room to own another request: this
+                 * connection's events wait in its session until one commits. */
+                FWD_DBG(b, polls_paused);
+                break;
+            }
+            n = moq_session_poll_events(cn->session, b->pump_events,
+                                        BIND_PUMP_EVENT_POLL);
+            if (n == 0) {
+                break;
+            }
             for (size_t e = 0; e < n; e++) {
                 moq_event_t *ev = &b->pump_events[e];
                 if (bind_event_is_request(ev->kind)) {
                     cn->requests_seen++;
                 }
-                /* A fail-close mid-batch must stop translation immediately —
-                 * a DEFERRED detach (binding close held on intent space)
-                 * leaves used=true with closed=true, and no further event of
-                 * this conn, including the remainder of THIS batch, may be
+                /* A fail-close must stop translation immediately — a DEFERRED
+                 * detach (binding close held on intent space) leaves used=true
+                 * with closed=true, and no further event of this conn may be
                  * ingested. */
                 if (cn->used && !cn->closed) {
                     bind_on_event(b, cn, ev, now_us);
@@ -4499,6 +5787,10 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
     if (detach_retried) {
         (void)bind_execute_intents(b, now_us);
     }
+    /* Forwarded Joining FETCH transactions: upstream requests/cancels and
+     * downstream responses, each step bounded and retry-safe. */
+    bind_fwd_pump(b, now_us);
+    bind_refusal_pump(b, now_us);
     /* Hold delivery while an output intent is still parked: an object must
      * never overtake the ACCEPT/REJECT/DONE queued ahead of it. The backlog
      * drains first (next pump, after the transport frees queue room), then

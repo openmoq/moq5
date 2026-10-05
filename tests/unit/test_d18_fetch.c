@@ -970,7 +970,7 @@ int main(void)
         MOQ_TEST_CHECK(fe->data_stream_started);
         MOQ_TEST_CHECK(!fe->data_stream_fin);
 
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1), (int)MOQ_OK);
 
         int stops = 0, resets = 0;
         while (moq_session_poll_actions(s, &a, 1) > 0) {
@@ -1017,7 +1017,7 @@ int main(void)
         MOQ_TEST_CHECK(fe->data_stream_started);   /* opened by accept_fetch */
         MOQ_TEST_CHECK(!fe->data_stream_fin);
 
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1), (int)MOQ_OK);
 
         int stops = 0, resets = 0;
         while (moq_session_poll_actions(s, &a, 1) > 0) {
@@ -1060,7 +1060,7 @@ int main(void)
         }
         MOQ_TEST_CHECK(filled > 0);
 
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref),
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1),
                               (int)MOQ_ERR_WOULD_BLOCK);
         /* Nothing mutated: the request still resolves and the entry is intact. */
         moq_request_endpoint_t again = request_registry_find_by_streamref(s, ref);
@@ -1070,7 +1070,7 @@ int main(void)
         /* Drain one slot and retry: it completes, emitting exactly one STOP. */
         MOQ_TEST_CHECK(moq_session_poll_actions(s, &a, 1) > 0);
         moq_action_cleanup(&a);
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1), (int)MOQ_OK);
         int stops = 0, resets = 0;
         while (moq_session_poll_actions(s, &a, 1) > 0) {
             if (a.kind == MOQ_ACTION_STOP_DATA &&
@@ -1098,7 +1098,7 @@ int main(void)
         uint64_t req_id = fe->request_id;
         /* Torn down BEFORE any data uni presented its FETCH_HEADER. */
         fe->data_stream_started = false;
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1), (int)MOQ_OK);
         while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
 
         /* The data uni now arrives late. */
@@ -1172,7 +1172,7 @@ int main(void)
         MOQ_TEST_CHECK(push_event(s, &filler) >= 0);
         MOQ_TEST_CHECK(event_queue_full(s));
 
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref),
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1),
                               (int)MOQ_ERR_WOULD_BLOCK);
 
         /* Nothing mutated. */
@@ -1190,7 +1190,7 @@ int main(void)
         /* Free one event slot; the retry completes exactly once. */
         MOQ_TEST_CHECK(moq_session_poll_events(s, &e, 1) > 0);
         moq_event_cleanup(&e);
-        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)request_stream_teardown(s, ref, true, 0x1), (int)MOQ_OK);
 
         int resets = 0, stops = 0;
         while (moq_session_poll_actions(s, &a, 1) > 0) {

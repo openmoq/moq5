@@ -30,6 +30,27 @@ int moqr_bind_debug_sub_done_blocks_left(void);
 /* The first live upstream subscription: {conn slot, session handle}. */
 bool moqr_bind_debug_first_usub(const moqr_bind_t *b, uint32_t *slot,
                                 uint64_t *handle_raw);
+/* Forwarded Joining FETCH transaction gauges (test-internals build only):
+ * admission outcomes, upstream terminals, downstream terminals, how many
+ * steps HOLD-retried, events that named a retired upstream handle, live
+ * transactions, and the byte pool's current/high-water/cap. */
+typedef struct moqr_bind_fwd_debug {
+    uint64_t admitted, rejected_no_upstream, rejected_no_slot, rejected_oom;
+    uint64_t completed, errors, resets, lost, overflow, mismatch,
+             cancelled_down, cancelled_up;
+    uint64_t delivered, rejected_down, aborted, down_gone, down_lost;
+    uint64_t retried_send, retried_cancel, retried_reject, retried_accept,
+             retried_write, retried_fin, retried_abort;
+    uint64_t stale_events_ignored, drained_events;
+    uint64_t refusals_blocked, refusals_parked, refusals_sent, refusals_dropped,
+             refusals_retried, refusals_unparked, refusals_pending, refusals_gone,
+             polls_paused;
+    uint64_t reason_unretained;
+    uint64_t live;
+    uint64_t bytes_used, bytes_high, bytes_cap;
+} moqr_bind_fwd_debug_t;
+void moqr_bind_debug_fwd_stats(const moqr_bind_t *b, moqr_bind_fwd_debug_t *out);
+void moqr_bind_debug_fail_fwd_write(int nth);
 /* Drive the production upstream-termination dispatch directly, for the two
  * cause/state combinations draft-18 makes unreachable over the wire.
  * `redirect` selects REDIRECT over GOAWAY. */

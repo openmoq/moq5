@@ -523,8 +523,9 @@ static int test_idle_rx_cursor_unmoved(void)
 
 /*
  * The other half, re-proved: a BOUNDED sweep parked on an RX entry that the
- * stop then frees must resume at the successor captured before the free, and
- * each bound stream must be stopped EXACTLY once across the suspension.
+ * stop then leaves in the stopped state (held for the peer's FIN/RESET) must
+ * resume at the successor captured before the stop, and each bound stream
+ * must be stopped EXACTLY once across the suspension.
  */
 static int test_parked_rx_cursor_advances(void)
 {
@@ -551,16 +552,20 @@ static int test_parked_rx_cursor_advances(void)
     moq_result_t rc = session_begin_advance_budgeted(s, 100);
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_SESSION_SUSPENDED);
     session_budget_leave(s);
-    /* Slot 1 was stopped and freed; the cursor sits on its captured successor. */
-    MOQ_TEST_CHECK(!s->rx_streams[1].active);
-    MOQ_TEST_CHECK(s->rx_streams[4].active);
+    /* Slot 1 was stopped (held, unbound); the cursor sits on its captured
+     * successor, which is still bound and unstopped. */
+    MOQ_TEST_CHECK(s->rx_streams[1].active &&
+                   s->rx_streams[1].parse_state == MOQ_RX_STOPPED);
+    MOQ_TEST_CHECK(s->rx_streams[4].active &&
+                   s->rx_streams[4].parse_state != MOQ_RX_STOPPED);
     MOQ_TEST_CHECK_EQ_SIZE(s->sweep_rx_pos, (size_t)4);
     occ_audit(s, "parked.suspended");
 
     /* Continue unlimited: the second stream is stopped, and neither is stopped
      * twice -- exactly two STOP_DATA actions in total. */
     (void)moq_session_tick(s, 100);
-    MOQ_TEST_CHECK(!s->rx_streams[4].active);
+    MOQ_TEST_CHECK(s->rx_streams[4].active &&
+                   s->rx_streams[4].parse_state == MOQ_RX_STOPPED);
     occ_audit(s, "parked.completed");
     size_t stops = 0;
     moq_action_t a;

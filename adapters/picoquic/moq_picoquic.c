@@ -123,6 +123,15 @@ typedef struct pq_rx_stream {
     bool     buf_fin;     /* a peer FIN follows the retained bytes */
     bool     fin_blocked; /* the FIN rode the chunk that blocked (bridge retains
                              it as fin_retained; the stream is over on drain) */
+    /* Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): the bridge refused a
+     * chunk of a stream the session could not admit yet. The adapter owes
+     * exactly that chunk: it sits at the front of `buf` (held_len bytes,
+     * held_fin its FIN flag), later bytes and a later FIN queue behind it
+     * in order, and nothing counts as bridge-owned (`blocked` stays 0) until
+     * the redelivery is accepted. */
+    bool     held_input;
+    bool     held_fin;
+    size_t   held_len;
     bool     active;
 } pq_rx_stream_t;
 
@@ -399,6 +408,22 @@ static int pq_rx_on_data(moq_pq_conn_t *c, uint64_t sid, pq_rx_kind_t kind,
         if (fin) st->fin_blocked = true;
         return 0;
     }
+    if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+        /* Refused at admission: the bridge took nothing of this chunk (nor
+         * its FIN). Keep exactly this chunk under the stream's window budget
+         * and freeze the window; the post-service sweep redelivers it once
+         * the session can admit a stream again. Retention failure is the
+         * adapter's explicit failure contract, never a silent acceptance. */
+        if (!pq_rx_retain(c, st, bytes, len, fin)) {
+            moq_transport_bridge_on_transport_error(c->bridge, 0, now);
+            return -1;
+        }
+        st->paused = true;
+        st->held_input = true;
+        st->held_len = len;
+        st->held_fin = fin;
+        return 0;
+    }
     if (rc < 0)                              /* bridge already went fatal */
         return -1;
     if (fin) {                               /* stream fully consumed: retire it */
@@ -444,6 +469,43 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
             continue;
         }
 
+        if (st->held_input) {
+            /* Redeliver the refused chunk -- the same bytes and FIN flag, from
+             * the front of the retention buffer. Refused again (another stream
+             * took the entry first): keep the allocation, the accounting and
+             * the frozen window exactly as they are and wait for the next
+             * service pass. Accepted: the chunk leaves the buffer; whatever
+             * arrived behind it replays below through the ordinary path. */
+            size_t hl = st->held_len;
+            bool hfin = st->held_fin;
+            moq_result_t rc = pq_feed_bridge(c, st, st->buf, hl, hfin, now);
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED)
+                continue;
+            st->held_input = false;
+            st->held_len = 0;
+            st->held_fin = false;
+            if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) {
+                moq_transport_bridge_on_transport_error(c->bridge, 0, now);
+                return;
+            }
+            if (st->buf_len > hl)
+                memmove(st->buf, st->buf + hl, st->buf_len - hl);
+            st->buf_len -= hl;
+            if (st->buf_len == 0) {
+                c->alloc.free(st->buf, st->buf_cap, c->alloc.ctx);
+                st->buf = NULL;
+                st->buf_cap = 0;
+            }
+            if (rc == MOQ_ERR_WOULD_BLOCK) {
+                /* the session took it and retains it: bridge-owned now; the
+                 * bytes (and any FIN) queued behind it wait for the drain */
+                st->blocked = hl;
+                if (hfin) st->fin_blocked = true;
+                continue;
+            }
+            if (hfin) { pq_rx_drop(c, st->stream_id); continue; }  /* stream done */
+        }
+
         if (st->buf_len > 0 || st->buf_fin) {
             uint8_t *buf = st->buf; size_t blen = st->buf_len;
             bool bfin = st->buf_fin; size_t bcap = st->buf_cap;
@@ -472,6 +534,41 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
         }
     }
 }
+
+#ifdef MOQ_PICOQUIC_TESTING
+#include "tests/support/pq_test_seam.h"
+
+void moq_pq_test_set_hold_input(moq_pq_conn_t *conn, bool on)
+{
+    if (on)
+        conn->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
+    else
+        conn->endpoint_ops.capabilities &=
+            ~(uint32_t)MOQ_TRANSPORT_CAP_HOLD_INPUT;
+}
+
+bool moq_pq_test_rx_state(moq_pq_conn_t *conn, uint64_t stream_id,
+                          moq_pq_test_rx_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    pq_rx_stream_t *st = pq_rx_find(conn, stream_id);
+    if (st == NULL) return false;
+    out->active = st->active;
+    out->paused = st->paused;
+    out->buf_fin = st->buf_fin;
+    out->fin_blocked = st->fin_blocked;
+    out->blocked = st->blocked;
+    out->delivered = st->delivered;
+    out->granted = st->granted;
+    out->budget = st->budget;
+    out->held_input = st->held_input;
+    out->held_len = st->held_len;
+    out->held_fin = st->held_fin;
+    out->buf_len = st->buf_len;
+    out->buf = st->buf;
+    return true;
+}
+#endif
 
 /* -- Public API ----------------------------------------------------- */
 

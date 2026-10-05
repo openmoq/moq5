@@ -25,6 +25,8 @@
 #include <quic/client/QuicClientTransport.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
+#include <quic/congestion_control/ServerCongestionControllerFactory.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
 #include <quic/server/QuicServer.h>
 #include <quic/server/QuicServerTransport.h>
@@ -35,6 +37,7 @@
 #include <fizz/server/FizzServerContext.h>
 
 #include <folly/io/async/EventBase.h>
+#include <glog/logging.h>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -171,8 +174,9 @@ private:
 
 class server_transport_factory : public quic::QuicServerTransportFactory {
 public:
-    server_transport_factory(server_state &ss, server_callback &cb)
-        : ss_(ss), cb_(cb) {}
+    server_transport_factory(server_state &ss, server_callback &cb,
+                             std::shared_ptr<quic::CongestionControllerFactory> cc)
+        : ss_(ss), cb_(cb), cc_(std::move(cc)) {}
     quic::QuicServerTransport::Ptr make(
         folly::EventBase *evb,
         std::unique_ptr<quic::FollyAsyncUDPSocketAlias> sock,
@@ -182,6 +186,7 @@ public:
         ss_.evb.store(evb);
         auto t = quic::QuicServerTransport::make(
             evb, std::move(sock), &cb_, &cb_, std::move(ctx));
+        t->setCongestionControllerFactory(cc_);
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
         ts.advertisedInitialMaxStreamsUni = 100;
@@ -194,6 +199,7 @@ public:
 private:
     server_state &ss_;
     server_callback &cb_;
+    std::shared_ptr<quic::CongestionControllerFactory> cc_;
 };
 
 /* -- Helpers --------------------------------------------------------- */
@@ -223,9 +229,15 @@ public:
     std::unique_ptr<moq::mvfst::adapter> client_adapter;
     std::atomic<bool> client_setup_complete{false};
 
-    explicit loopback_pair(moq_version_t version = (moq_version_t)0) {
+    /* client_cfg_mutate: optional adjustment of the client session config
+     * (resource limits) before the client session is created. */
+    explicit loopback_pair(moq_version_t version = (moq_version_t)0,
+                           std::function<void(moq_session_cfg_t &)> client_cfg_mutate = {}) {
+        if (!google::IsGoogleLoggingInitialized())
+            google::InitGoogleLogging("mvfst_loopback_pair");
         ss.version = version;
         client_cfg_.version = version;
+        if (client_cfg_mutate) client_cfg_mutate(client_cfg_);
         const std::string alpn =
             (version == MOQ_VERSION_DRAFT_18) ? "moqt-18" : "moqt-16";
         auto cm = generate_self_signed_cert();
@@ -244,9 +256,12 @@ public:
 
         scb_ = std::make_unique<server_callback>(ss);
         server_ = quic::QuicServer::createQuicServer();
+        server_->setHostId(1);
+        auto cc_factory = std::make_shared<quic::ServerCongestionControllerFactory>();
+        server_->setCongestionControllerFactory(cc_factory);
         server_->setFizzContext(sctx);
         server_->setQuicServerTransportFactory(
-            std::make_unique<server_transport_factory>(ss, *scb_));
+            std::make_unique<server_transport_factory>(ss, *scb_, cc_factory));
         folly::SocketAddress addr("127.0.0.1", 0);
         server_->start(addr, 1);
         server_->waitUntilInitialized();
@@ -263,6 +278,8 @@ public:
         auto sock = std::make_unique<quic::FollyQuicAsyncUDPSocket>(qevb);
         client_transport_ = quic::QuicClientTransport::newClient(
             qevb, std::move(sock), std::move(hsk));
+        client_transport_->setCongestionControllerFactory(
+            std::make_shared<quic::DefaultCongestionControllerFactory>());
         client_transport_->addNewPeerAddress(server_->getAddress());
         auto ts = client_transport_->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
@@ -378,6 +395,15 @@ public:
 
     void pump_client() {
         if (client_evb_) client_evb_->loopOnce(EVLOOP_NONBLOCK);
+        /* SETUP needs peer transport parameters. Before the first credit
+         * arrives, an attach-mode service attempts a stream open with zero
+         * credit and mvfst logs STREAM_LIMIT_EXCEEDED. */
+        if (!client_peer_credit_seen_ && client_transport_) {
+            client_peer_credit_seen_ =
+                client_transport_->getNumOpenableBidirectionalStreams() > 0 ||
+                client_transport_->getNumOpenableUnidirectionalStreams() > 0;
+            if (!client_peer_credit_seen_) return;
+        }
         if (client_adapter) {
             auto rc = client_adapter->service(0);
             if (rc < 0 || client_adapter->is_fatal())
@@ -440,6 +466,7 @@ private:
     } start_cb_;
 
     std::atomic<bool> client_fatal_{false};
+    bool client_peer_credit_seen_ = false;
     std::unique_ptr<server_callback> scb_;
     std::shared_ptr<quic::QuicServer> server_;
     std::unique_ptr<folly::EventBase> client_evb_;

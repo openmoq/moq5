@@ -3,6 +3,7 @@
 
 #include <moq/codec.h>
 #include "test_support.h"
+#include "test_alloc_support.h"
 #include "../../core/src/session/session_internal.h"
 #include <stdlib.h>
 #include <string.h>
@@ -49,40 +50,6 @@ test_unsub_tomb_consume(moq_session_t *s, uint64_t request_id)
         }
     }
     return false;
-}
-
-/* -- Counting allocator -------------------------------------------- */
-
-typedef struct test_alloc_state {
-    int64_t balance;
-} test_alloc_state_t;
-
-TSS_UNUSED static void *test_alloc(size_t size, void *ctx)
-{
-    test_alloc_state_t *state = (test_alloc_state_t *)ctx;
-    void *p = malloc(size);
-    if (p) state->balance++;
-    return p;
-}
-
-TSS_UNUSED static void *test_realloc(void *ptr, size_t old_size, size_t new_size, void *ctx)
-{
-    (void)old_size; (void)ctx;
-    return realloc(ptr, new_size);
-}
-
-TSS_UNUSED static void test_free(void *ptr, size_t size, void *ctx)
-{
-    test_alloc_state_t *state = (test_alloc_state_t *)ctx;
-    (void)size;
-    if (ptr) state->balance--;
-    free(ptr);
-}
-
-TSS_UNUSED static moq_alloc_t test_allocator(test_alloc_state_t *state)
-{
-    moq_alloc_t alloc = { state, test_alloc, test_realloc, test_free };
-    return alloc;
 }
 
 /* -- Pump actions -------------------------------------------------- */

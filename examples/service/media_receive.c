@@ -21,6 +21,8 @@
  *              LOCAL/self-signed testing ONLY (verification is on by default)
  *   --backend NAME  explicit endpoint backend: auto, picoquic, msquic, mvfst,
  *              proxygen, wtquic-msquic, or wtquic-network
+ * wtquic-network is a retained selection but currently returns synchronous
+ * MOQ_ERR_UNSUPPORTED under the receive-admission policy; it cannot play media.
  *   --draft N  pin the offered MoQ draft to exactly 16 or 18
  */
 #include <moq/endpoint.h>

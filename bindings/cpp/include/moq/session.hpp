@@ -63,7 +63,7 @@ struct event_batch_guard {
 
 
 struct session_config {
-    perspective        perspective              = perspective::client;
+    moq::perspective   perspective              = moq::perspective::client;
     const moq_alloc_t *alloc                    = nullptr;
     bool               send_request_capacity    = false;
     uint64_t           initial_request_capacity = 0;

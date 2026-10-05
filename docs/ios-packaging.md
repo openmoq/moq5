@@ -78,7 +78,13 @@ swift build \
 ```
 
 `LibMoQ.xcframework` holds the libmoq/picoquic/picotls objects plus wtquic's
-core and Network.framework backend (so `.wtquicNetwork` is selectable on iOS).
+core and Network.framework backend. The `.wtquicNetwork` API selection remains
+present, but the current LibMoQ admission policy returns synchronous
+`.unsupported` before backend/network startup, even when that backend is
+packaged. Endpoint creation can allocate temporary state, releases it on failure,
+and can report allocation failure before the policy refusal. Selectability and
+link success are not runtime support. Historical
+successful Network MoQ receipts do not qualify this artifact under that policy.
 It does **not** build MsQuic, so the two MsQuic-backed backends — `.msquic`
 (direct raw QUIC) and `.wtquicMsquic` (WebTransport over MsQuic) — are absent:
 each compiles as API (the `MoQEndpoint.TransportBackend` enum always carries the
@@ -100,11 +106,13 @@ The two backend families verify server certificates differently:
   (e.g. a bundled `cacert.pem`); there is no OS default to fall back on. This
   differs from macOS, where a system OpenSSL trust store is typically
   reachable.
-- **`.wtquicNetwork` (WebTransport over Network.framework)** — verification is
+- **`.wtquicNetwork` (WebTransport over Network.framework)** — currently rejects
+  at connect with `.unsupported`, before trust evaluation. Its retained native
+  verification mechanism is
   the platform's own trust evaluation (`SecTrustEvaluateWithError` against the
   system store); **no CA file is used, and `caFileURL` is rejected as
-  unsupported** with verification on. Use system trust, or
-  `insecureSkipVerify` for local self-signed testing only.
+  unsupported** with verification on. Neither system trust nor
+  `insecureSkipVerify` bypasses the admission-policy rejection.
 - **`.wtquicMsquic` (WebTransport over MsQuic)** — not built into the iOS
   xcframework (see above), so it never reaches a trust evaluation here: it
   fails at connect with `.unsupported`. On macOS, where it is built, it uses

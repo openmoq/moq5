@@ -82,6 +82,12 @@ typedef enum moq_transport_backend {
                                            unsupported TLS config is rejected
                                            with MOQ_ERR_UNSUPPORTED at connect */
     MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK, /* WEBTRANSPORT only, when compiled in
+                                           Current receive-admission policy:
+                                           connect returns MOQ_ERR_UNSUPPORTED
+                                           synchronously, even when compiled;
+                                           no fallback or Network startup.
+                                           Remaining notes describe retained
+                                           backend mechanisms, not support.
                                            (moq_wtquic_network_managed, lane pump
                                            API; Apple-only, client-only; no
                                            network thread -- wtquic's backend

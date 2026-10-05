@@ -4,7 +4,7 @@
 #include <moq/control_d18.h>
 #include <moq/buf.h>
 #include "test_support.h"
-#include "../support/fake_endpoint.h"
+#include "../support/held_bridge_driver.h"
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/session/session_transport.h"
 #include "../../core/src/bridge/transport_bridge_internal.h"
@@ -37,6 +37,7 @@ typedef struct {
 /* When set, the next pair gives the SERVER session this allocator, so a
  * fixture can account for memory the server side owns. */
 static const moq_alloc_t *g_server_alloc_override;
+static uint32_t g_client_rx_capacity;
 
 static int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
                                bool client_streaming,
@@ -50,6 +51,7 @@ static int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
     moq_session_cfg_init_sized(&ccfg, sizeof(ccfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 10;
+    if (g_client_rx_capacity) ccfg.max_data_streams = g_client_rx_capacity;
     /* Streaming delivery is what lets a peer RESET mid-object need an event,
      * which is the only way moq_session_on_data_reset can block. */
     ccfg.streaming_objects = client_streaming;
@@ -79,23 +81,23 @@ static int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
         return -1;
     }
 
-    fake_endpoint_init(&tp->client_ep, 1000, 2000);
-    fake_endpoint_init(&tp->server_ep, 3000, 4000);
+    held_endpoint_init(&tp->client_ep, 1000, 2000);
+    held_endpoint_init(&tp->server_ep, 3000, 4000);
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
 
-    if (moq_transport_bridge_create(&bcfg, tp->client,
+    if (held_bridge_create(&bcfg, tp->client,
             &tp->client_ep.vtable, &tp->client_ep,
             &tp->client_bridge) < 0) {
         moq_session_destroy(tp->server);
         moq_session_destroy(tp->client);
         return -1;
     }
-    if (moq_transport_bridge_create(&bcfg, tp->server,
+    if (held_bridge_create(&bcfg, tp->server,
             &tp->server_ep.vtable, &tp->server_ep,
             &tp->server_bridge) < 0) {
-        moq_transport_bridge_destroy(tp->client_bridge);
+        held_bridge_destroy(tp->client_bridge);
         moq_session_destroy(tp->server);
         moq_session_destroy(tp->client);
         return -1;
@@ -128,8 +130,8 @@ static int test_pair_init(test_pair_t *tp)
 
 static void test_pair_destroy(test_pair_t *tp)
 {
-    moq_transport_bridge_destroy(tp->client_bridge);
-    moq_transport_bridge_destroy(tp->server_bridge);
+    held_bridge_destroy(tp->client_bridge);
+    held_bridge_destroy(tp->server_bridge);
     moq_session_destroy(tp->client);
     moq_session_destroy(tp->server);
 }
@@ -142,7 +144,7 @@ static size_t pump_once(test_pair_t *tp, uint64_t now)
 {
     size_t delivered = 0;
 
-    moq_transport_bridge_service(tp->client_bridge, now);
+    held_bridge_service(tp->client_bridge, now);
 
     for (size_t i = 0; i < tp->client_ep.count; i++) {
         fake_op_t *o = &tp->client_ep.ops[i];
@@ -157,7 +159,7 @@ static size_t pump_once(test_pair_t *tp, uint64_t now)
                         tp->server_bridge, o->stream_id,
                         o->data, o->data_len, o->fin, now);
                 } else if (o->stream_id >= 1000 && o->stream_id < 2000) {
-                    moq_transport_bridge_on_peer_uni_bytes(
+                    held_bridge_uni_bytes(
                         tp->server_bridge, o->stream_id,
                         o->data, o->data_len, o->fin, now);
                 } else {
@@ -170,7 +172,7 @@ static size_t pump_once(test_pair_t *tp, uint64_t now)
             break;
         case FAKE_OP_CLOSE:
             if (tp->server_bridge)
-                moq_transport_bridge_on_transport_close(
+                held_bridge_close(
                     tp->server_bridge, o->error_code, now);
             delivered++;
             break;
@@ -181,7 +183,7 @@ static size_t pump_once(test_pair_t *tp, uint64_t now)
     }
     fake_endpoint_clear_ops(&tp->client_ep);
 
-    moq_transport_bridge_service(tp->server_bridge, now);
+    held_bridge_service(tp->server_bridge, now);
 
     for (size_t i = 0; i < tp->server_ep.count; i++) {
         fake_op_t *o = &tp->server_ep.ops[i];
@@ -248,7 +250,7 @@ static int test_budget_context_paired_on_every_exit(void)
     /* Exit: fatal short-circuit (before the pass is even entered). */
     {
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 100, 200);
+        held_endpoint_init(&ep, 100, 200);
         moq_session_cfg_t cfg;
         moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
                                    MOQ_PERSPECTIVE_CLIENT);
@@ -257,23 +259,23 @@ static int test_budget_context_paired_on_every_exit(void)
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *b = NULL;
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
+        HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
                                                     &b) == MOQ_OK);
-        moq_transport_bridge_on_transport_error(b, 0x1, 1);
+        held_bridge_error(b, 0x1, 1);
         MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(b));
         moq_bridge_budgeted_result_t r;
-        (void)moq_transport_bridge_service_budgeted(b, 2, 4, &r);
+        (void)held_bridge_service_budgeted(b, 2, 4, &r);
         MOQ_TEST_CHECK(!s->budget_active);
         MOQ_TEST_CHECK(moq_session_tick(s, 3) != MOQ_SESSION_SUSPENDED);
         MOQ_TEST_CHECK(!s->budget_active);
-        moq_transport_bridge_destroy(b);
+        held_bridge_destroy(b);
         moq_session_destroy(s);
     }
 
     /* Exit: ordinary drained pass (the bottom break). */
     {
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 100, 200);
+        held_endpoint_init(&ep, 100, 200);
         moq_session_cfg_t cfg;
         moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
                                    MOQ_PERSPECTIVE_CLIENT);
@@ -282,16 +284,16 @@ static int test_budget_context_paired_on_every_exit(void)
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *b = NULL;
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
+        HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
                                                     &b) == MOQ_OK);
         MOQ_TEST_CHECK(!s->budget_active);
         moq_bridge_budgeted_result_t r;
-        MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(b, 1, 4, &r) ==
+        MOQ_TEST_CHECK(held_bridge_service_budgeted(b, 1, 4, &r) ==
                        MOQ_OK);
         MOQ_TEST_CHECK(!s->budget_active);
         MOQ_TEST_CHECK(moq_session_tick(s, 2) != MOQ_SESSION_SUSPENDED);
         MOQ_TEST_CHECK(!s->budget_active);
-        moq_transport_bridge_destroy(b);
+        held_bridge_destroy(b);
         moq_session_destroy(s);
     }
 
@@ -300,7 +302,7 @@ static int test_budget_context_paired_on_every_exit(void)
      * bracketed region rather than from a pre-enter guard. */
     {
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 100, 200);
+        held_endpoint_init(&ep, 100, 200);
         moq_session_cfg_t cfg;
         moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
                                    MOQ_PERSPECTIVE_CLIENT);
@@ -309,24 +311,24 @@ static int test_budget_context_paired_on_every_exit(void)
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *b = NULL;
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
+        HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
                                                     &b) == MOQ_OK);
         ep.fail_write = true;
         MOQ_TEST_CHECK(moq_session_start(s, 1) == MOQ_OK);
         moq_bridge_budgeted_result_t r;
-        MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(b, 2, 4, &r) ==
+        MOQ_TEST_CHECK(held_bridge_service_budgeted(b, 2, 4, &r) ==
                        MOQ_ERR_INTERNAL);
         MOQ_TEST_CHECK(!s->budget_active);
         MOQ_TEST_CHECK(moq_session_tick(s, 3) != MOQ_SESSION_SUSPENDED);
         MOQ_TEST_CHECK(!s->budget_active);
-        moq_transport_bridge_destroy(b);
+        held_bridge_destroy(b);
         moq_session_destroy(s);
     }
 
     /* Exit: outbound blocked, so the pass breaks out of Step 1. */
     {
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 100, 200);
+        held_endpoint_init(&ep, 100, 200);
         moq_session_cfg_t cfg;
         moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
                                    MOQ_PERSPECTIVE_CLIENT);
@@ -335,16 +337,16 @@ static int test_budget_context_paired_on_every_exit(void)
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *b = NULL;
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
+        HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
                                                     &b) == MOQ_OK);
         ep.block_write = true;      /* force WOULD_BLOCK on the setup write */
         MOQ_TEST_CHECK(moq_session_start(s, 1) == MOQ_OK);
         moq_bridge_budgeted_result_t r;
-        (void)moq_transport_bridge_service_budgeted(b, 2, 4, &r);
+        (void)held_bridge_service_budgeted(b, 2, 4, &r);
         MOQ_TEST_CHECK(!s->budget_active);
         MOQ_TEST_CHECK(moq_session_tick(s, 3) != MOQ_SESSION_SUSPENDED);
         MOQ_TEST_CHECK(!s->budget_active);
-        moq_transport_bridge_destroy(b);
+        held_bridge_destroy(b);
         moq_session_destroy(s);
     }
 
@@ -370,7 +372,7 @@ static int test_unlimited_service_enters_no_budget_context(void)
     int failures = 0;
 
     fake_endpoint_t ep;
-    fake_endpoint_init(&ep, 100, 200);
+    held_endpoint_init(&ep, 100, 200);
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
                                MOQ_PERSPECTIVE_CLIENT);
@@ -379,22 +381,22 @@ static int test_unlimited_service_enters_no_budget_context(void)
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
     moq_transport_bridge_t *b = NULL;
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
+    HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
                                                 &b) == MOQ_OK);
     MOQ_TEST_CHECK(moq_session_start(s, 1) == MOQ_OK);
 
     uint64_t before = session_budget_enter_count;
-    MOQ_TEST_CHECK(moq_transport_bridge_service(b, 2) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(b, 2) == MOQ_OK);
     MOQ_TEST_CHECK(session_budget_enter_count - before == 0);
     MOQ_TEST_CHECK(!s->budget_active);
 
     before = session_budget_enter_count;
     moq_bridge_budgeted_result_t r;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(b, 3, 8, &r) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(b, 3, 8, &r) == MOQ_OK);
     MOQ_TEST_CHECK(session_budget_enter_count - before == 1);
     MOQ_TEST_CHECK(!s->budget_active);
 
-    moq_transport_bridge_destroy(b);
+    held_bridge_destroy(b);
     moq_session_destroy(s);
     return failures;
 }
@@ -410,7 +412,7 @@ static int test_budgeted_service_requires_output(void)
     int failures = 0;
 
     fake_endpoint_t ep;
-    fake_endpoint_init(&ep, 100, 200);
+    held_endpoint_init(&ep, 100, 200);
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(),
                                MOQ_PERSPECTIVE_CLIENT);
@@ -419,28 +421,28 @@ static int test_budgeted_service_requires_output(void)
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
     moq_transport_bridge_t *b = NULL;
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
+    HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
                                                 &b) == MOQ_OK);
 
     uint64_t before = session_budget_enter_count;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(b, 1, 8, NULL) ==
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(b, 1, 8, NULL) ==
                    MOQ_ERR_INVAL);
     MOQ_TEST_CHECK(session_budget_enter_count - before == 0);
 
     /* NULL bridge still leaves a defined, non-suspended outcome. */
     moq_bridge_budgeted_result_t r;
     memset(&r, 0xAB, sizeof(r));
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(NULL, 1, 8, &r) ==
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(NULL, 1, 8, &r) ==
                    MOQ_ERR_INVAL);
     MOQ_TEST_CHECK(!r.suspended);
     MOQ_TEST_CHECK(r.sweep_spent == 0);
 
     /* An idle pool completes even at zero budget: no runnable work. */
     MOQ_TEST_CHECK(moq_session_start(s, 1) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(b, 2, 0, &r) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(b, 2, 0, &r) == MOQ_OK);
     MOQ_TEST_CHECK(!r.suspended);
 
-    moq_transport_bridge_destroy(b);
+    held_bridge_destroy(b);
     moq_session_destroy(s);
     return failures;
 }
@@ -496,8 +498,8 @@ static int d18_pair_init_caps(test_pair_t *tp, uint32_t client_max_events,
         return -1;
     }
 
-    fake_endpoint_init(&tp->client_ep, 1000, 2000);
-    fake_endpoint_init(&tp->server_ep, 3000, 4000);
+    held_endpoint_init(&tp->client_ep, 1000, 2000);
+    held_endpoint_init(&tp->server_ep, 3000, 4000);
     /* The bridge RETAINS the vtable pointer it is handed
      * (transport_bridge.c:108) rather than copying the table, so an op may be
      * installed after init. It is done here, before bridge creation, so the
@@ -506,15 +508,15 @@ static int d18_pair_init_caps(test_pair_t *tp, uint32_t client_max_events,
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, tp->client, &tp->client_ep.vtable,
+    if (held_bridge_create(&bcfg, tp->client, &tp->client_ep.vtable,
                                     &tp->client_ep, &tp->client_bridge) < 0) {
         moq_session_destroy(tp->server);
         moq_session_destroy(tp->client);
         return -1;
     }
-    if (moq_transport_bridge_create(&bcfg, tp->server, &tp->server_ep.vtable,
+    if (held_bridge_create(&bcfg, tp->server, &tp->server_ep.vtable,
                                     &tp->server_ep, &tp->server_bridge) < 0) {
-        moq_transport_bridge_destroy(tp->client_bridge);
+        held_bridge_destroy(tp->client_bridge);
         moq_session_destroy(tp->server);
         moq_session_destroy(tp->client);
         return -1;
@@ -544,7 +546,7 @@ static void d18_feed(moq_transport_bridge_t *to, fake_endpoint_t *from,
         fake_op_t *o = &from->ops[i];
         if (o->kind != FAKE_OP_WRITE) { (*delivered)++; continue; }
         if (o->stream_id >= uni_base && o->stream_id < uni_base + 1000)
-            moq_transport_bridge_on_peer_uni_bytes(
+            held_bridge_uni_bytes(
                 to, o->stream_id, o->data, o->data_len, o->fin, now);
         else if (o->stream_id >= bidi_base && o->stream_id < bidi_base + 1000)
             moq_transport_bridge_on_peer_bidi_bytes(
@@ -557,9 +559,9 @@ static void d18_feed(moq_transport_bridge_t *to, fake_endpoint_t *from,
 static size_t d18_shuttle(test_pair_t *tp, uint64_t now)
 {
     size_t delivered = 0;
-    moq_transport_bridge_service(tp->client_bridge, now);
+    held_bridge_service(tp->client_bridge, now);
     d18_feed(tp->server_bridge, &tp->client_ep, 1000, 2000, now, &delivered);
-    moq_transport_bridge_service(tp->server_bridge, now);
+    held_bridge_service(tp->server_bridge, now);
     d18_feed(tp->client_bridge, &tp->server_ep, 3000, 4000, now, &delivered);
     return delivered;
 }
@@ -652,7 +654,7 @@ static int uni_pending_fixture_init_ex(uni_pending_fixture_t *f,
         != MOQ_OK) goto fail;
 
     fake_endpoint_clear_ops(&f->tp.server_ep);
-    moq_transport_bridge_service(f->tp.server_bridge, 0);
+    held_bridge_service(f->tp.server_bridge, 0);
 
     uint64_t uni_sid = 0; bool have_uni = false;
     for (size_t i = 0; i < f->tp.server_ep.count; i++) {
@@ -677,7 +679,7 @@ static int uni_pending_fixture_init_ex(uni_pending_fixture_t *f,
     moq_result_t wrc = moq_session_write_object(f->tp.server, sg, 0, p, 0);
     moq_rcbuf_decref(p);
     if (wrc != MOQ_OK) goto fail;
-    moq_transport_bridge_service(f->tp.server_bridge, 0);
+    held_bridge_service(f->tp.server_bridge, 0);
     for (size_t i = 0; i < f->tp.server_ep.count; i++) {
         fake_op_t *o = &f->tp.server_ep.ops[i];
         if (o->kind == FAKE_OP_WRITE && o->stream_id == uni_sid &&
@@ -713,7 +715,7 @@ static int test_data_retry_suspension_preserves_pending(void)
     if (uni_pending_fixture_init(&f) < 0) { failures++; return failures; }
 
     /* Header + one object against a full queue: the object cannot emit. */
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(
+    MOQ_TEST_CHECK(held_bridge_uni_bytes(
                        f.tp.client_bridge, f.sid, f.obj, f.obj_len, false, 0)
                    == MOQ_ERR_WOULD_BLOCK);
     bridge_stream_entry_t *e = bridge_find_by_id(f.tp.client_bridge, f.sid);
@@ -724,7 +726,7 @@ static int test_data_retry_suspension_preserves_pending(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        f.tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -741,7 +743,7 @@ static int test_data_retry_suspension_preserves_pending(void)
     moq_event_t ev;
     while (moq_session_poll_events(f.tp.client, &ev, 1) > 0)
         moq_event_cleanup(&ev);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(f.tp.client->subgroups[0].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_retry);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
@@ -788,7 +790,7 @@ static int test_data_reset_suspension_preserves_pending(void)
     /* Truncated mid-payload: the begin chunk emits and fills the slot, and the
      * stream parks in STREAMING_PAYLOAD with nothing further to parse. */
     MOQ_TEST_CHECK(f.obj_len > f.hdr_len + 20);
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(
+    MOQ_TEST_CHECK(held_bridge_uni_bytes(
                        f.tp.client_bridge, f.sid, f.obj, f.obj_len - 20, false, 0)
                    == MOQ_OK);
     bridge_stream_entry_t *e = bridge_find_by_id(f.tp.client_bridge, f.sid);
@@ -809,7 +811,7 @@ static int test_data_reset_suspension_preserves_pending(void)
     }
     MOQ_TEST_CHECK(parked == 1);
 
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(
+    MOQ_TEST_CHECK(held_bridge_reset(
                        f.tp.client_bridge, f.sid, 0x5, 0) == MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK(e->pending_reset);
     MOQ_TEST_CHECK(e->pending_reset_code == 0x5);
@@ -819,7 +821,7 @@ static int test_data_reset_suspension_preserves_pending(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        f.tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -833,7 +835,7 @@ static int test_data_reset_suspension_preserves_pending(void)
 
     while (moq_session_poll_events(f.tp.client, &ev, 1) > 0)
         moq_event_cleanup(&ev);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(f.tp.client->subgroups[0].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_reset);
     MOQ_TEST_CHECK(!e->active);
@@ -875,7 +877,7 @@ static int d18_request_bidi_fixture(test_pair_t *tp, uint64_t *bidi_out)
         moq_event_cleanup(&ev);
 
     if (d18_server_subscribe(tp) != MOQ_OK) goto fail;
-    moq_transport_bridge_service(tp->server_bridge, 0);
+    held_bridge_service(tp->server_bridge, 0);
 
     uint64_t bidi = 0;
     for (size_t i = 0; i < tp->server_ep.count; i++) {
@@ -979,7 +981,7 @@ static int strict_feed(moq_transport_bridge_t *to, fake_endpoint_t *from,
         if (o->kind != FAKE_OP_WRITE) continue;
         moq_result_t rc = MOQ_OK;
         if (o->stream_id >= uni_base && o->stream_id < uni_base + 1000)
-            rc = moq_transport_bridge_on_peer_uni_bytes(
+            rc = held_bridge_uni_bytes(
                 to, o->stream_id, o->data, o->data_len, o->fin, now);
         else if (o->stream_id >= bidi_base && o->stream_id < bidi_base + 1000)
             rc = moq_transport_bridge_on_peer_bidi_bytes(
@@ -1001,12 +1003,12 @@ static int d18_strict_shuttle(test_pair_t *tp, int max, uint64_t now,
     for (int i = 0; i < max; i++) {
         size_t moved = 0;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp->client_bridge, now),
+            (int)held_bridge_service(tp->client_bridge, now),
             (int)MOQ_OK);
         failures += strict_feed(tp->server_bridge, &tp->client_ep, 1000, 2000,
                                 now, &moved, what);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp->server_bridge, now),
+            (int)held_bridge_service(tp->server_bridge, now),
             (int)MOQ_OK);
         failures += strict_feed(tp->client_bridge, &tp->server_ep, 3000, 4000,
                                 now, &moved, what);
@@ -1063,7 +1065,7 @@ static int test_bidi_retry_suspension_preserves_pending(void)
                    == MOQ_OK);
 
     fake_endpoint_clear_ops(&tp.client_ep);
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
     uint64_t bidi = 0;
     for (size_t i = 0; i < tp.client_ep.count; i++)
         if (tp.client_ep.ops[i].kind == FAKE_OP_WRITE &&
@@ -1086,7 +1088,7 @@ static int test_bidi_retry_suspension_preserves_pending(void)
 
     /* The acceptance comes back on the client's own bidi and cannot emit. */
     fake_endpoint_clear_ops(&tp.server_ep);
-    moq_transport_bridge_service(tp.server_bridge, 0);
+    held_bridge_service(tp.server_bridge, 0);
     bool blocked = false;
     for (size_t i = 0; i < tp.server_ep.count; i++) {
         fake_op_t *o = &tp.server_ep.ops[i];
@@ -1113,7 +1115,7 @@ static int test_bidi_retry_suspension_preserves_pending(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -1128,7 +1130,7 @@ static int test_bidi_retry_suspension_preserves_pending(void)
 
     while (moq_session_poll_events(tp.client, &ev, 1) > 0)
         moq_event_cleanup(&ev);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(tp.client->subgroups[0].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_retry);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
@@ -1138,7 +1140,7 @@ static int test_bidi_retry_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_NS_SUB_OK);
     MOQ_TEST_CHECK(ev.u.ns_sub_ok.handle._opaque == nh._opaque);
     moq_event_cleanup(&ev);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(moq_session_poll_events(tp.client, &ev, 1) == 0);
 
     test_pair_destroy(&tp);
@@ -1193,22 +1195,22 @@ static int test_pair_init_client_alloc(test_pair_t *tp,
         return -1;
     }
 
-    fake_endpoint_init(&tp->client_ep, 1000, 2000);
-    fake_endpoint_init(&tp->server_ep, 3000, 4000);
+    held_endpoint_init(&tp->client_ep, 1000, 2000);
+    held_endpoint_init(&tp->server_ep, 3000, 4000);
 
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, tp->client,
+    if (held_bridge_create(&bcfg, tp->client,
             &tp->client_ep.vtable, &tp->client_ep,
             &tp->client_bridge) < 0) {
         moq_session_destroy(tp->server);
         moq_session_destroy(tp->client);
         return -1;
     }
-    if (moq_transport_bridge_create(&bcfg, tp->server,
+    if (held_bridge_create(&bcfg, tp->server,
             &tp->server_ep.vtable, &tp->server_ep,
             &tp->server_bridge) < 0) {
-        moq_transport_bridge_destroy(tp->client_bridge);
+        held_bridge_destroy(tp->client_bridge);
         moq_session_destroy(tp->server);
         moq_session_destroy(tp->client);
         return -1;
@@ -1274,7 +1276,7 @@ static uint64_t br_ns_establish(test_pair_t *tp, int *failures_out)
     }
 
     fake_endpoint_clear_ops(&tp->client_ep);
-    moq_transport_bridge_service(tp->client_bridge, 0);
+    held_bridge_service(tp->client_bridge, 0);
     uint64_t bidi = 0;
     for (size_t i = 0; i < tp->client_ep.count; i++)
         if (tp->client_ep.ops[i].kind == FAKE_OP_WRITE &&
@@ -1301,7 +1303,7 @@ static uint64_t br_ns_establish(test_pair_t *tp, int *failures_out)
      * land on that peer-side id -- outside the server's local stream
      * ranges -- and are fed back directly. */
     fake_endpoint_clear_ops(&tp->server_ep);
-    moq_transport_bridge_service(tp->server_bridge, 0);
+    held_bridge_service(tp->server_bridge, 0);
     for (size_t i = 0; i < tp->server_ep.count; i++) {
         fake_op_t *o = &tp->server_ep.ops[i];
         if (o->kind != FAKE_OP_WRITE) continue;
@@ -1610,7 +1612,7 @@ static int test_bidi_reset_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(!e->pending_retry);
     MOQ_TEST_CHECK(tp.client->event_head != tp.client->event_tail);
 
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(
+    MOQ_TEST_CHECK(held_bridge_reset(
                        tp.client_bridge, bidi, 0x5, 0) == MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK(e->pending_reset);
     MOQ_TEST_CHECK(e->pending_reset_code == 0x5);
@@ -1619,7 +1621,7 @@ static int test_bidi_reset_suspension_preserves_pending(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -1643,7 +1645,7 @@ static int test_bidi_reset_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(moq_subscription_is_valid(want_sub));
     moq_stream_ref_t bref = e->ref;
 
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(tp.client->subgroups[0].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_reset);
     MOQ_TEST_CHECK(!e->active);
@@ -1659,7 +1661,7 @@ static int test_bidi_reset_suspension_preserves_pending(void)
                    MOQ_REQ_NONE);
 
     /* Re-servicing delivers nothing further. */
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(moq_session_poll_events(tp.client, &ev, 1) == 0);
 
     test_pair_destroy(&tp);
@@ -1689,7 +1691,7 @@ static int test_bidi_stop_suspension_preserves_pending(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -1713,7 +1715,7 @@ static int test_bidi_stop_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(moq_subscription_is_valid(want_sub));
     moq_stream_ref_t bref = e->ref;
 
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(tp.client->subgroups[0].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_stop);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
@@ -1728,7 +1730,7 @@ static int test_bidi_stop_suspension_preserves_pending(void)
                    MOQ_REQ_NONE);
 
     /* Re-servicing delivers nothing further. */
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(moq_session_poll_events(tp.client, &ev, 1) == 0);
 
     test_pair_destroy(&tp);
@@ -1791,7 +1793,7 @@ static int test_data_stop_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(moq_session_open_subgroup(tp.client, csub, &sg_cfg, 0, &sg)
                    == MOQ_OK);
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
 
     uint64_t uni_sid = 0;
     for (size_t i = 0; i < tp.client_ep.count; i++)
@@ -1844,7 +1846,7 @@ static int test_data_stop_suspension_preserves_pending(void)
     fake_endpoint_clear_ops(&tp.client_ep);
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -1865,7 +1867,7 @@ static int test_data_stop_suspension_preserves_pending(void)
         MOQ_TEST_CHECK(tp.client_ep.ops[i].kind != FAKE_OP_RESET);
 
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
 
     MOQ_TEST_CHECK(tp.client->subgroups[arm].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_stop);
@@ -1887,7 +1889,7 @@ static int test_data_stop_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(resets == 1);
 
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(tp.client_ep.count < FAKE_EP_MAX_OPS);
     for (size_t i = 0; i < tp.client_ep.count; i++)
         MOQ_TEST_CHECK(tp.client_ep.ops[i].kind != FAKE_OP_RESET);
@@ -1935,7 +1937,7 @@ static int test_tick_suspension_preserves_due_deadline(void)
     fake_endpoint_clear_ops(&tp.client_ep);
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, due, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -1962,7 +1964,7 @@ static int test_tick_suspension_preserves_due_deadline(void)
      * cursor and frees every subgroup, so the terminal path alone produces the
      * same state. What this pass pins is the terminal outcome below. */
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, due) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, due) == MOQ_OK);
 
     MOQ_TEST_CHECK(!tp.client->sweep_active);
     MOQ_TEST_CHECK(tp.client->subgroups[0].state == MOQ_SG_FREE);
@@ -1994,7 +1996,7 @@ static int test_tick_suspension_preserves_due_deadline(void)
     MOQ_TEST_CHECK(terminals == 1);
 
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, due) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, due) == MOQ_OK);
     MOQ_TEST_CHECK(tp.client_ep.count < FAKE_EP_MAX_OPS);
     for (size_t i = 0; i < tp.client_ep.count; i++)
         MOQ_TEST_CHECK(tp.client_ep.ops[i].kind != FAKE_OP_CLOSE);
@@ -2025,7 +2027,7 @@ static int test_inbound_scan_stops_at_suspension(void)
     moq_event_t ev;
     while (moq_session_poll_events(tp.client, &ev, 1) > 0)
         moq_event_cleanup(&ev);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     fake_endpoint_clear_ops(&tp.client_ep);
 
     /* Nothing else can produce work: no queued actions, no outbound pending,
@@ -2076,7 +2078,7 @@ static int test_inbound_scan_stops_at_suspension(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -2172,7 +2174,7 @@ static int test_progress_then_suspension_in_one_pass(void)
     MOQ_TEST_CHECK(moq_session_open_subgroup(tp.server, ssub, &sg_cfg, 0, &sg)
                    == MOQ_OK);
     fake_endpoint_clear_ops(&tp.server_ep);
-    moq_transport_bridge_service(tp.server_bridge, 0);
+    held_bridge_service(tp.server_bridge, 0);
 
     uint8_t hdr[256]; size_t hdr_len = 0;
     uint64_t suni = 0; bool have = false;
@@ -2189,7 +2191,7 @@ static int test_progress_then_suspension_in_one_pass(void)
     fake_endpoint_clear_ops(&tp.server_ep);
 
     const uint64_t data_sid = 7000;
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_uni_bytes(
+    MOQ_TEST_CHECK(held_bridge_uni_bytes(
                        tp.client_bridge, data_sid, hdr, hdr_len, false, 0)
                    == MOQ_OK);
     bridge_stream_entry_t *ei = bridge_find_by_id(tp.client_bridge, data_sid);
@@ -2211,7 +2213,7 @@ static int test_progress_then_suspension_in_one_pass(void)
     dc.stream_count = 1;
     MOQ_TEST_CHECK(moq_session_done_subscribe(tp.server, ssub, &dc, 0) == MOQ_OK);
     fake_endpoint_clear_ops(&tp.server_ep);
-    moq_transport_bridge_service(tp.server_bridge, 0);
+    held_bridge_service(tp.server_bridge, 0);
     for (size_t i = 0; i < tp.server_ep.count; i++) {
         fake_op_t *o = &tp.server_ep.ops[i];
         if (o->kind == FAKE_OP_WRITE && o->stream_id >= 2000 &&
@@ -2280,7 +2282,7 @@ static int test_progress_then_suspension_in_one_pass(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     /* Entry i could NOT commit: the abnormal-subgroup event is bounded, and the
@@ -2316,7 +2318,7 @@ static int test_progress_then_suspension_in_one_pass(void)
     /* Second service pass: the retained reset retries and retires the entry. */
     uint64_t suspends2 = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out2;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out2) == MOQ_OK);
 
     /* Exactly one SUBGROUP_RESET, carrying the retained code and identity. */
@@ -2354,7 +2356,7 @@ static int test_progress_then_suspension_in_one_pass(void)
     /* A further pass neither duplicates the reset nor resurrects the entry. */
     {
         moq_bridge_budgeted_result_t out3;
-        MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+        MOQ_TEST_CHECK(held_bridge_service_budgeted(
                            tp.client_bridge, 0, 0, &out3) == MOQ_OK);
         moq_event_t xev;
         int extra = 0;
@@ -2404,7 +2406,7 @@ static int test_continuation_reclaims_event_scratch(void)
     static const char uri[] = "wss://new.example.com";
     MOQ_TEST_CHECK(moq_session_goaway(tp.server, (const uint8_t *)uri,
                                       sizeof(uri) - 1, 0) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.server_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.server_bridge, 0) == MOQ_OK);
     for (size_t i = 0; i < tp.server_ep.count; i++) {
         fake_op_t *o = &tp.server_ep.ops[i];
         if (o->kind != FAKE_OP_WRITE) continue;
@@ -2483,7 +2485,7 @@ static int test_control_retry_suspension_preserves_pending(void)
 
     /* A real server GOAWAY, delivered as its actual encoded bytes with FIN. */
     MOQ_TEST_CHECK(moq_session_goaway(tp.server, NULL, 0, 0) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.server_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.server_bridge, 0) == MOQ_OK);
 
     bool fed = false;
     moq_result_t frc = MOQ_OK;
@@ -2506,7 +2508,7 @@ static int test_control_retry_suspension_preserves_pending(void)
 
     uint64_t suspends = session_budget_suspend_count;
     moq_bridge_budgeted_result_t out;
-    MOQ_TEST_CHECK(moq_transport_bridge_service_budgeted(
+    MOQ_TEST_CHECK(held_bridge_service_budgeted(
                        tp.client_bridge, 0, 0, &out) == MOQ_OK);
 
     MOQ_TEST_CHECK(out.suspended);
@@ -2528,7 +2530,7 @@ static int test_control_retry_suspension_preserves_pending(void)
     /* Unlimited service completes the sweep -- a subgroup reap emits no event,
      * so the retry still finds capacity -- and delivers the deferred FIN. */
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
 
     MOQ_TEST_CHECK(tp.client->subgroups[0].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!tp.client_bridge->pending_control);
@@ -2544,7 +2546,7 @@ static int test_control_retry_suspension_preserves_pending(void)
 
     /* Re-servicing must not close a second time. */
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     closes = 0;
     for (size_t i = 0; i < tp.client_ep.count; i++)
         if (tp.client_ep.ops[i].kind == FAKE_OP_CLOSE) closes++;
@@ -2558,7 +2560,7 @@ static int test_create_destroy(void)
 {
     int failures = 0;
     fake_endpoint_t ep;
-    fake_endpoint_init(&ep, 100, 200);
+    held_endpoint_init(&ep, 100, 200);
 
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
@@ -2568,13 +2570,13 @@ static int test_create_destroy(void)
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
     moq_transport_bridge_t *b = NULL;
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep, &b) == MOQ_OK);
+    HELD_REQUIRE(held_bridge_create(&bcfg, s, &ep.vtable, &ep, &b) == MOQ_OK);
     MOQ_TEST_CHECK(b != NULL);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(b));
     MOQ_TEST_CHECK(moq_transport_bridge_stream_count(b) == 0);
 
-    moq_transport_bridge_destroy(b);
+    held_bridge_destroy(b);
     moq_session_destroy(s);
     return failures;
 }
@@ -2592,7 +2594,7 @@ static int test_create_rejects_bad_ops(void)
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
     moq_transport_bridge_t *b = NULL;
 
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, s, &bad, &bad, &b) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(held_bridge_create(&bcfg, s, &bad, &bad, &b) == MOQ_ERR_INVAL);
     MOQ_TEST_CHECK(b == NULL);
 
     moq_session_destroy(s);
@@ -2621,7 +2623,7 @@ static int test_control_write_backpressure(void)
 
     tp.client_ep.block_write = true;
     moq_session_start(tp.client, 0);
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
 
     MOQ_TEST_CHECK(moq_transport_bridge_has_pending(tp.client_bridge));
     MOQ_TEST_CHECK(tp.client_ep.block_count > 0);
@@ -2629,7 +2631,7 @@ static int test_control_write_backpressure(void)
     tp.client_ep.block_write = false;
     tp.client_ep.block_count = 0;
 
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
     MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.client_bridge));
 
     test_pair_destroy(&tp);
@@ -2642,7 +2644,7 @@ static int test_transport_close(void)
     test_pair_t tp;
     if (test_pair_init(&tp) < 0) { failures++; return failures; }
 
-    moq_transport_bridge_on_transport_close(tp.client_bridge, 0x42, 0);
+    held_bridge_close(tp.client_bridge, 0x42, 0);
 
     MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.client_bridge));
@@ -2678,7 +2680,7 @@ static int test_inbound_uni_after_setup(void)
     /* After handshake, deliver some uni bytes to the server.
      * The session should accept them (it's established). */
     uint8_t dummy[4] = {0x01, 0x02, 0x03, 0x04};
-    moq_result_t rc = moq_transport_bridge_on_peer_uni_bytes(
+    moq_result_t rc = held_bridge_uni_bytes(
         tp.server_bridge, 5000, dummy, 4, false, 0);
     MOQ_TEST_CHECK(rc >= 0 || rc == MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
@@ -2711,7 +2713,7 @@ static int test_close_error_is_fatal_not_closed(void)
         NULL, 0, true, 0);
 
     /* service() tries close_transport → ERROR → fatal, not closed */
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
 
     MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
@@ -2731,7 +2733,7 @@ static int test_empty_uni_no_ghost_stream(void)
 
     size_t before = moq_transport_bridge_stream_count(tp.server_bridge);
 
-    moq_result_t rc = moq_transport_bridge_on_peer_uni_bytes(
+    moq_result_t rc = held_bridge_uni_bytes(
         tp.server_bridge, 9999, NULL, 0, false, 0);
     MOQ_TEST_CHECK(rc == MOQ_OK);
     MOQ_TEST_CHECK(moq_transport_bridge_stream_count(tp.server_bridge) == before);
@@ -2767,7 +2769,7 @@ static int test_truncated_vtable_rejected(void)
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
     moq_transport_bridge_t *b = NULL;
 
-    moq_result_t rc = moq_transport_bridge_create(
+    moq_result_t rc = held_bridge_create(
         &bcfg, s, &trunc, &trunc, &b);
     MOQ_TEST_CHECK(rc == MOQ_ERR_INVAL);
     MOQ_TEST_CHECK(b == NULL);
@@ -2792,7 +2794,7 @@ static int test_close_retry_after_blocked_control(void)
     /* Block writes so control setup goes pending */
     tp.client_ep.block_write = true;
     moq_session_start(tp.client, 0);
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
     MOQ_TEST_CHECK(moq_transport_bridge_has_pending(tp.client_bridge));
 
     /* Deliver control FIN while write is still blocked.
@@ -2802,7 +2804,7 @@ static int test_close_retry_after_blocked_control(void)
 
     /* Unblock and service — close must happen */
     tp.client_ep.block_write = false;
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
 
     /* Bridge must be closed (not fatal), with endpoint close observed */
     MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.client_bridge));
@@ -2835,7 +2837,7 @@ static int test_deferred_close_clears_ordinary_pending(void)
     /* real control-write backpressure, so ordinary pending is not synthetic */
     tp.client_ep.block_write = true;
     moq_session_start(tp.client, 0);
-    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    (void)held_bridge_service(tp.client_bridge, 0);
     before = tp.client_bridge->pending_count;
     if (before == 0) {
         fprintf(stderr, "CLEANUP: no ordinary pending work to clear; the "
@@ -2850,7 +2852,7 @@ static int test_deferred_close_clears_ordinary_pending(void)
     MOQ_TEST_CHECK(tp.client_bridge->needs_close);
     expected_code = tp.client_bridge->needs_close_code;
 
-    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    (void)held_bridge_service(tp.client_bridge, 0);
 
     /* the ordinary work is gone, replaced by exactly the close record */
     if (tp.client_bridge->pending_count != 1) {
@@ -2876,7 +2878,7 @@ static int test_deferred_close_clears_ordinary_pending(void)
     /* letting the close through completes cleanly, with no residue */
     tp.client_ep.block_close = false;
     tp.client_ep.block_write = false;
-    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    (void)held_bridge_service(tp.client_bridge, 0);
     MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.client_bridge));
@@ -2900,7 +2902,7 @@ static int test_close_retry_would_block(void)
     moq_transport_bridge_on_peer_control_bytes(
         tp.client_bridge, 2000, NULL, 0, true, 0);
 
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
     /* Close should be pending (WOULD_BLOCK) */
     MOQ_TEST_CHECK(moq_transport_bridge_has_pending(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
@@ -2908,7 +2910,7 @@ static int test_close_retry_would_block(void)
     /* Unblock and retry */
     tp.client_ep.block_close = false;
     fake_endpoint_clear_ops(&tp.client_ep);
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
 
     MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.client_bridge));
     MOQ_TEST_CHECK(fake_endpoint_find(&tp.client_ep, FAKE_OP_CLOSE) != NULL);
@@ -2963,7 +2965,7 @@ static int test_deferred_close_keeps_its_own_code(void)
 
     /* with nothing else queued, the close is the only retention this pass */
     moq_bridge_test_fail_retain_after(0);
-    rc = moq_transport_bridge_service(tp.client_bridge, 0);
+    rc = held_bridge_service(tp.client_bridge, 0);
 
     if (rc == MOQ_OK) {
         fprintf(stderr, "CLOSEPIN: a failed deferred-close retain was "
@@ -3004,7 +3006,7 @@ static int test_deferred_close_keeps_its_own_code(void)
     tp.client_ep.block_close = true;
     moq_transport_bridge_on_peer_control_bytes(
         tp.client_bridge, 2000, NULL, 0, true, 0);
-    (void)moq_transport_bridge_service(tp.client_bridge, 0);
+    (void)held_bridge_service(tp.client_bridge, 0);
     if (moq_transport_bridge_is_fatal(tp.client_bridge) ||
         !moq_transport_bridge_has_pending(tp.client_bridge)) {
         fprintf(stderr, "CLOSEPIN: the control FIN alone went fatal=%d "
@@ -3028,7 +3030,7 @@ static int test_reset_on_unknown_stream(void)
     if (!setup_handshake(&tp)) { failures++; test_pair_destroy(&tp); return failures; }
 
     /* Reset for an unknown stream should be a no-op (no stream to reset) */
-    moq_result_t rc = moq_transport_bridge_on_peer_stream_reset(
+    moq_result_t rc = held_bridge_reset(
         tp.server_bridge, 9999, 0x42, 0);
     MOQ_TEST_CHECK(rc == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
@@ -3050,11 +3052,11 @@ static int test_transport_close_clears_state(void)
      * With writes blocked, the control data goes to the pending queue. */
     tp.client_ep.block_write = true;
     moq_session_start(tp.client, 0);
-    moq_transport_bridge_service(tp.client_bridge, 0);
+    held_bridge_service(tp.client_bridge, 0);
     MOQ_TEST_CHECK(moq_transport_bridge_has_pending(tp.client_bridge));
 
     /* Transport close should clear everything */
-    moq_transport_bridge_on_transport_close(tp.client_bridge, 0x1, 0);
+    held_bridge_close(tp.client_bridge, 0x1, 0);
 
     MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.client_bridge));
@@ -3083,12 +3085,12 @@ static moq_result_t deliver_uni(moq_transport_bridge_t *b, bool use_rcbuf,
                                 bool fin)
 {
     if (!use_rcbuf)
-        return moq_transport_bridge_on_peer_uni_bytes(b, sid, data, len, fin, 0);
+        return held_bridge_uni_bytes(b, sid, data, len, fin, 0);
 
     moq_rcbuf_t *buf = NULL;
     if (moq_rcbuf_create(moq_alloc_default(), data, len, &buf) < 0)
         return MOQ_ERR_NOMEM;
-    moq_result_t rc = moq_transport_bridge_on_peer_uni_rcbuf(b, sid, buf, fin, 0);
+    moq_result_t rc = held_bridge_uni_rcbuf(b, sid, buf, fin, 0);
     moq_rcbuf_decref(buf);
     return rc;
 }
@@ -3228,7 +3230,7 @@ static int run_pending_retry_keeps_bytes(bool use_rcbuf_extra)
         moq_rcbuf_decref(p);
     }
     fake_endpoint_clear_ops(&tp.server_ep);
-    moq_transport_bridge_service(tp.server_bridge, 0);
+    held_bridge_service(tp.server_bridge, 0);
 
     uint8_t buf1[512]; size_t len1 = 0;
     uint64_t uni_sid = 0; bool have_uni = false;
@@ -3252,7 +3254,7 @@ static int run_pending_retry_keeps_bytes(bool use_rcbuf_extra)
         moq_rcbuf_decref(p);
     }
     MOQ_TEST_CHECK(moq_session_close_subgroup(tp.server, sg, 0) == MOQ_OK);
-    moq_transport_bridge_service(tp.server_bridge, 0);
+    held_bridge_service(tp.server_bridge, 0);
 
     uint8_t buf2[512]; size_t len2 = 0;
     for (size_t i = 0; i < tp.server_ep.count; i++) {
@@ -3269,7 +3271,7 @@ static int run_pending_retry_keeps_bytes(bool use_rcbuf_extra)
      * obj0 emits and fills the size-1 event queue; obj1 backs up into
      * PENDING_EMIT, so the bridge returns WOULD_BLOCK (pending_retry). */
     const uint64_t client_sid = 5000;
-    moq_result_t rc = moq_transport_bridge_on_peer_uni_bytes(
+    moq_result_t rc = held_bridge_uni_bytes(
         tp.client_bridge, client_sid, buf1, len1, false, 0);
     MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
 
@@ -3292,7 +3294,7 @@ static int run_pending_retry_keeps_bytes(bool use_rcbuf_extra)
             }
             moq_event_cleanup(&ev);
         }
-        moq_transport_bridge_service(tp.client_bridge, 0);
+        held_bridge_service(tp.client_bridge, 0);
     }
 
     MOQ_TEST_CHECK(got[0]);
@@ -3333,7 +3335,7 @@ static int test_terminal_facts_enqueued_then_observed(void)
     MOQ_TEST_CHECK(!observed);          /* neither fact before terminal */
 
     /* peer-side terminal: the event is enqueued, nobody has polled it */
-    moq_transport_bridge_on_transport_close(tp.client_bridge, 0x42, 0);
+    held_bridge_close(tp.client_bridge, 0x42, 0);
     observed = true;
     MOQ_TEST_CHECK(moq_transport_bridge_terminal_facts(tp.client_bridge,
                                                        &observed));
@@ -3353,7 +3355,7 @@ static int test_terminal_facts_enqueued_then_observed(void)
 
     /* monotonic + idempotent: repeating the terminal does not clear anything,
      * and a second poll (no event left) leaves both facts set */
-    moq_transport_bridge_on_transport_close(tp.client_bridge, 0x43, 0);
+    held_bridge_close(tp.client_bridge, 0x43, 0);
     n = 0;
     (void)moq_session_poll_events_ex(tp.client, &ev, 1, sizeof(ev), &n);
     observed = false;
@@ -3418,9 +3420,9 @@ static int run_already_fatal_transport_terminal(bool clean)
     MOQ_TEST_CHECK(!observed);
 
     moq_result_t rc = clean
-        ? moq_transport_bridge_on_transport_close(tp.client_bridge, later_code,
+        ? held_bridge_close(tp.client_bridge, later_code,
                                                   1000)
-        : moq_transport_bridge_on_transport_error(tp.client_bridge, later_code,
+        : held_bridge_error(tp.client_bridge, later_code,
                                                   1000);
     MOQ_TEST_CHECK(rc == MOQ_OK);
     MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(tp.client_bridge));
@@ -3442,9 +3444,9 @@ static int run_already_fatal_transport_terminal(bool clean)
     }
 
     /* The alternate flavor and repeated original flavor are idempotent. */
-    (void)moq_transport_bridge_on_transport_error(tp.client_bridge, 0x73,
+    (void)held_bridge_error(tp.client_bridge, 0x73,
                                                   1001);
-    (void)moq_transport_bridge_on_transport_close(tp.client_bridge, 0x84,
+    (void)held_bridge_close(tp.client_bridge, 0x84,
                                                   1002);
     n = 0;
     MOQ_TEST_CHECK(moq_session_poll_events_ex(tp.client, &ev, 1, sizeof(ev),
@@ -3481,11 +3483,11 @@ static int test_setup_scratch_shortfall_closes_not_fatal(void)
     if (!sv) return failures;
 
     fake_endpoint_t ep;
-    fake_endpoint_init(&ep, 3000, 4000);
+    held_endpoint_init(&ep, 3000, 4000);
     moq_transport_bridge_t *br = NULL;
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, sv, &ep.vtable, &ep,
+    HELD_REQUIRE(held_bridge_create(&bcfg, sv, &ep.vtable, &ep,
                                                &br) == MOQ_OK);
     if (!br) { moq_session_destroy(sv); return failures; }
 
@@ -3518,7 +3520,7 @@ static int test_setup_scratch_shortfall_closes_not_fatal(void)
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(br));
     MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_CLOSED);
 
-    MOQ_TEST_CHECK(moq_transport_bridge_service(br, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(br, 0) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(br));
 
     size_t closes = 0;
@@ -3530,7 +3532,7 @@ static int test_setup_scratch_shortfall_closes_not_fatal(void)
     }
     MOQ_TEST_CHECK(closes == 1);
 
-    moq_transport_bridge_destroy(br);
+    held_bridge_destroy(br);
     moq_session_destroy(sv);
     return failures;
 }
@@ -4230,7 +4232,7 @@ static int run_fin_bridge(const fin_bridge_case_t *f, fin_bridge_run_t *r)
     /* 5. Bridge service alone emits the EXACT terminal and retires the map. */
     fake_endpoint_clear_ops(&r->tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(r->tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(r->tp.server_bridge, 0), (int)MOQ_OK);
     snprintf(what, sizeof(what), "%s serviced", f->name);
     failures += f->family->check_terminal_wire(f->ctx, what);
     failures += f->family->check_retired(r->tp.server, r->ref, r->want_slot,
@@ -4248,7 +4250,7 @@ static int run_fin_bridge(const fin_bridge_case_t *f, fin_bridge_run_t *r)
      *    nothing queued, recreates no owner, and installs no drain. */
     fake_endpoint_clear_ops(&r->tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(r->tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(r->tp.server_bridge, 0), (int)MOQ_OK);
     snprintf(what, sizeof(what), "%s reserviced", f->name);
     MOQ_TEST_CHECK_EQ_SIZE(r->tp.server_ep.count, (size_t)0);
     {
@@ -4506,7 +4508,7 @@ static int nsfin_deliver(moq_transport_bridge_t *to, fake_endpoint_t *from,
                           (o->stream_id >= 4000)
             ? moq_transport_bridge_on_peer_bidi_bytes(
                   to, o->stream_id, o->data, o->data_len, o->fin, 0)
-            : moq_transport_bridge_on_peer_uni_bytes(
+            : held_bridge_uni_bytes(
                   to, o->stream_id, o->data, o->data_len, o->fin, 0);
         MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
         (*delivered)++;
@@ -4589,7 +4591,7 @@ static int nsfin_arm_build(nsfin_arm_t *a, const char *suffix_field)
     /* (3) exactly one local OPEN + one WRITE, decoded as SUBSCRIBE_NAMESPACE. */
     fake_endpoint_clear_ops(&a->tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a->tp.client_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a->tp.client_bridge, 0), (int)MOQ_OK);
     failures += nsfin_ops_exact(&a->tp.client_ep, 1, 1, a->bidi,
                                 "arm local open");
     for (size_t i = 0; i < a->tp.client_ep.count; i++) {
@@ -4718,7 +4720,7 @@ static int nsfin_arm_build(nsfin_arm_t *a, const char *suffix_field)
         (int)moq_session_accept_ns_sub(a->tp.server, sh, &ac, 0), (int)MOQ_OK);
     fake_endpoint_clear_ops(&a->tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a->tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a->tp.server_bridge, 0), (int)MOQ_OK);
     /* The acceptance rides the client's own bidi: one WRITE, no local open. */
     failures += nsfin_ops_exact(&a->tp.server_ep, 0, 1, a->bidi,
                                 "arm acceptance");
@@ -4789,7 +4791,7 @@ static int nsfin_arm_build(nsfin_arm_t *a, const char *suffix_field)
             (int)MOQ_OK);
     }
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a->tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a->tp.server_bridge, 0), (int)MOQ_OK);
     failures += nsfin_ops_exact(&a->tp.server_ep, 0, 1, a->bidi,
                                 "arm namespace");
     for (size_t i = 0; i < a->tp.server_ep.count; i++) {
@@ -5057,7 +5059,7 @@ static int test_ns_response_fin_bridge(void)
     failures += nsfin_conserved(&a, &want_blocked, &g0, &d0, budget_live,
                                 "fin released");
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
     /* (8) exact completion */
     failures += nsfin_expect_gone(&a, 1, "fin complete");
     failures += nsfin_expect_ops(&a, 1, "fin complete");
@@ -5065,7 +5067,7 @@ static int test_ns_response_fin_bridge(void)
 
     /* (9) a second service emits nothing and repeats the postcondition. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
     failures += nsfin_expect_gone(&a, 0, "fin idempotent");
     failures += nsfin_expect_ops(&a, 0, "fin idempotent");
     failures += nsfin_check_retired(&a, &live, &d0, a.budget0, "fin idempotent");
@@ -5084,7 +5086,7 @@ static int test_ns_response_reset_bridge(void)
     failures += nsfin_arm_precheck(&a, &live, &d0, &g0, "reset arm");
 
     /* (6) the peer resets while the client cannot emit. */
-    moq_result_t rc = moq_transport_bridge_on_peer_stream_reset(
+    moq_result_t rc = held_bridge_reset(
         a.tp.client_bridge, a.bidi, 0x2B, 0);
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(a.tp.client_bridge));
@@ -5114,14 +5116,14 @@ static int test_ns_response_reset_bridge(void)
     failures += nsfin_conserved(&a, &live, &g0, &d0, budget_live,
                                 "reset released");
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
     failures += nsfin_expect_gone(&a, 1, "reset complete");
     /* A reset owns physical teardown: no local close is queued. */
     failures += nsfin_expect_ops(&a, 0, "reset complete");
     failures += nsfin_check_retired(&a, &live, &d0, a.budget0, "reset complete");
 
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
     failures += nsfin_expect_gone(&a, 0, "reset idempotent");
     failures += nsfin_expect_ops(&a, 0, "reset idempotent");
     failures += nsfin_check_retired(&a, &live, &d0, a.budget0, "reset idempotent");
@@ -6624,7 +6626,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
             (int)moq_session_subscribe_namespace(tp.client, &wc, 0, &wh),
             (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.client_bridge, 0),
+            (int)held_bridge_service(tp.client_bridge, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK(tp.client_ep.count < FAKE_EP_MAX_OPS);
         MOQ_TEST_CHECK_EQ_SIZE(tp.client_ep.count, (size_t)2);
@@ -6679,7 +6681,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
             (int)MOQ_OK);
         fake_endpoint_clear_ops(&tp.server_ep);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.server_bridge, 0),
+            (int)held_bridge_service(tp.server_bridge, 0),
             (int)MOQ_OK);
         /* The rejection wire, exactly: ONE FIN'd write on the warm bidi
          * carrying one complete REQUEST_ERROR and nothing else. */
@@ -6742,7 +6744,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
         }
         fake_endpoint_clear_ops(&tp.client_ep);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.client_bridge, 0),
+            (int)held_bridge_service(tp.client_bridge, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK(tp.client_ep.count < FAKE_EP_MAX_OPS);
         MOQ_TEST_CHECK_EQ_SIZE(tp.client_ep.count, (size_t)1);
@@ -6773,7 +6775,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
          * clear or service. */
         MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.server_bridge, 0),
+            (int)held_bridge_service(tp.server_bridge, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
         /* The warm mapping is gone by BOTH saved identities; both bridges are
@@ -6834,7 +6836,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
     /* Exactly one OPEN_BIDI then one WRITE on the SAME transport id, and no
      * other op. The recorder caps silently, so headroom is asserted first. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.client_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.client_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK(tp.client_ep.count < FAKE_EP_MAX_OPS);
     MOQ_TEST_CHECK_EQ_SIZE(tp.client_ep.count, (size_t)2);
     uint64_t bidi_id = 0;
@@ -6974,7 +6976,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
     /* Service-only recovery: drains the blocker, retries NULL/0, loops, and
      * dispatches the teardown's abort. No further ingress. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
 
     const drain_spec_t want_drain[] = { { 0, MOQ_DRAIN_NORMAL } };
     drain_spec_t wd = want_drain[0];
@@ -7037,7 +7039,7 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
              * the whole postcondition, not a subset of it. */
             fake_endpoint_clear_ops(&tp.server_ep);
             MOQ_TEST_CHECK_EQ_INT(
-                (int)moq_transport_bridge_service(tp.server_bridge, 0),
+                (int)held_bridge_service(tp.server_bridge, 0),
                 (int)MOQ_OK);
         }
     }
@@ -8014,17 +8016,15 @@ static int run_nob_case(const nob_case_t *c)
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_create(&scfg, 0, &sv),
                               (int)MOQ_OK);
         if (!sv) { test_pair_destroy(&tp); return failures + 1; }
-        moq_transport_bridge_destroy(tp.server_bridge);
+        held_bridge_destroy(tp.server_bridge);
         moq_session_destroy(tp.server);
         tp.server = sv;
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-        MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_create(&bcfg, tp.server,
+        HELD_REQUIRE_EQ_INT(held_bridge_create(&bcfg, tp.server,
                                              &tp.server_ep.vtable,
                                              &tp.server_ep,
-                                             &tp.server_bridge),
-            (int)MOQ_OK);
+                                             &tp.server_bridge), MOQ_OK);
     }
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(tp.client, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(tp.server, 0), (int)MOQ_OK);
@@ -8054,7 +8054,7 @@ static int run_nob_case(const nob_case_t *c)
          * defer_dispatch STOP+RESET route -- then classify it exactly rather
          * than let it leak into the blocker/target phases. */
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
         /* Exactly one local uni open followed by one non-FIN control write on
          * the same transport id, and nothing else. */
         MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)2);
@@ -8248,7 +8248,7 @@ static int run_nob_case(const nob_case_t *c)
             (int)moq_session_accept_namespace(tp.server, ah, &ac, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
         {
             int nev = 0;
             moq_event_t ev;
@@ -8573,7 +8573,7 @@ static int run_nob_case(const nob_case_t *c)
     /* Service-only recovery. No further ingress. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
 
     /* The wire, as ONE ordered declared image per origin -- the blocker's own
      * dispatch included, byte for byte. Origins 2/3's blocker closes an
@@ -8702,7 +8702,7 @@ static int run_nob_case(const nob_case_t *c)
      * postcondition. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
     failures += nob_check_phase(&tp, &r, &before, &comp_want, 1, "reserviced");
     failures += nob_blk_check(&tp, &r, &blk_snap, "reserviced");
@@ -8724,7 +8724,7 @@ static int run_nob_case(const nob_case_t *c)
          * release the exact target NORMAL drain ref, leave no semantic owner
          * or physical mapping, stay nonfatal and open, and emit nothing. */
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_on_peer_stream_reset(
+            (int)held_bridge_reset(
                 tp.server_bridge, r.target_id, 0x1, 0),
             (int)MOQ_OK);
     } else {
@@ -8741,7 +8741,7 @@ static int run_nob_case(const nob_case_t *c)
                                 c->pre_setup ? "late-reset-pre-service"
                                              : "late-fin-pre-service");
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
     failures += nob_check_phase(&tp, &r, &before, &late_want, 0,
                                 c->pre_setup ? "late-reset-serviced"
@@ -8758,14 +8758,14 @@ static int run_nob_case(const nob_case_t *c)
         /* A REPEATED peer RESET plus service adds nothing: same ring, no op,
          * no event, nothing resurrected. */
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_on_peer_stream_reset(
+            (int)held_bridge_reset(
                 tp.server_bridge, r.target_id, 0x1, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
         failures += nob_check_phase(&tp, &r, &before, &late_want, 0,
                                     "late-reset-again-pre-service");
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(tp.server_bridge, 0),
+            (int)held_bridge_service(tp.server_bridge, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
         failures += nob_check_phase(&tp, &r, &before, &late_want, 0,
@@ -8820,12 +8820,12 @@ static int exh_setup(test_pair_t *tp, uint32_t server_send_buf,
         if (moq_session_create(&scfg, 0, &sv) != MOQ_OK || !sv) {
             test_pair_destroy(tp); return -1;
         }
-        moq_transport_bridge_destroy(tp->server_bridge);
+        held_bridge_destroy(tp->server_bridge);
         moq_session_destroy(tp->server);
         tp->server = sv;
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-        if (moq_transport_bridge_create(&bcfg, tp->server, &tp->server_ep.vtable,
+        if (held_bridge_create(&bcfg, tp->server, &tp->server_ep.vtable,
                                         &tp->server_ep, &tp->server_bridge)
             != MOQ_OK) { test_pair_destroy(tp); return -1; }
     }
@@ -8988,7 +8988,7 @@ static int exh_arm_goaway_blocker(test_pair_t *tp, uint64_t bidi_id,
     if (moq_session_accept_namespace(tp->server, ah, &ac, 0) != MOQ_OK)
         return failures + 1;
     /* Flush the REQUEST_OK so the send buffer starts empty before the GOAWAY. */
-    if (moq_transport_bridge_service(tp->server_bridge, 0) != MOQ_OK)
+    if (held_bridge_service(tp->server_bridge, 0) != MOQ_OK)
         return failures + 1;
     while (moq_session_poll_events(tp->server, &ev, 1) > 0) moq_event_cleanup(&ev);
     fake_endpoint_clear_ops(&tp->server_ep);
@@ -9266,7 +9266,7 @@ static int test_noslot_exhaustion_reset(void)
      * the retained live mapping while the NORMAL drain is still owed. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     {
         MOQ_TEST_CHECK(tp.server_ep.count < FAKE_EP_MAX_OPS);
         MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)3);
@@ -9303,10 +9303,10 @@ static int test_noslot_exhaustion_reset(void)
      * retires the mapping, nonfatal and open. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.server_bridge));
     {
@@ -9326,10 +9326,10 @@ static int test_noslot_exhaustion_reset(void)
      * carrier pool exact and the seed's pinned registry/receiving/mapping
      * inventory conserved. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     {
         nob_ring_t now;
         nob_ring_snap(tp.server, &now);
@@ -9387,7 +9387,7 @@ static int test_noslot_reset_bidi_wouldblock_then_accept(void)
     tp.server_ep.block_reset = true;
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
     {
         int found = 0;
@@ -9412,7 +9412,7 @@ static int test_noslot_reset_bidi_wouldblock_then_accept(void)
     tp.server_ep.block_reset = false;
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     {
         int rst = 0, other = 0;
         for (size_t i = 0; i < tp.server_ep.count; i++) {
@@ -9435,10 +9435,10 @@ static int test_noslot_reset_bidi_wouldblock_then_accept(void)
 
     /* Peer terminal releases exactly the target drain and retires the mapping. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.server_bridge));
     {
@@ -9454,10 +9454,10 @@ static int test_noslot_reset_bidi_wouldblock_then_accept(void)
 
     /* Repeat the terminal: inert. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     {
         nob_ring_t now;
         nob_ring_snap(tp.server, &now);
@@ -9515,7 +9515,7 @@ static int test_uni_reset_data_immediate_retire(void)
     MOQ_TEST_CHECK(moq_session_open_subgroup(tp.client, csub, &sg_cfg, 0, &sg)
                    == MOQ_OK);
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     uint64_t uni_sid = 0;
     for (size_t i = 0; i < tp.client_ep.count; i++)
         if (tp.client_ep.ops[i].kind == FAKE_OP_OPEN_UNI)
@@ -9532,7 +9532,7 @@ static int test_uni_reset_data_immediate_retire(void)
     /* Reset the subgroup -> a uni RESET_DATA action. Service and accept it. */
     MOQ_TEST_CHECK(moq_session_reset_subgroup(tp.client, sg, 0x1, 0) == MOQ_OK);
     fake_endpoint_clear_ops(&tp.client_ep);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.client_bridge));
 
@@ -9676,7 +9676,7 @@ static int test_noslot_reset_bidi_peer_before_accept(void)
     tp.server_ep.block_reset = true;
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     /* The whole pending set is exactly one item, of the exact declared RESET
      * shape (checked here and re-checked after the peer terminal by the SAME
      * checker against the SAME declared constants -- a plain reset carries no
@@ -9698,7 +9698,7 @@ static int test_noslot_reset_bidi_peer_before_accept(void)
      * endpoint op, no session event, no queued session action. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     /* Both sides stay quiet and open, the server endpoint emits nothing, and the
      * SAME single RESET survives unchanged. */
@@ -9727,7 +9727,7 @@ static int test_noslot_reset_bidi_peer_before_accept(void)
     tp.server_ep.block_reset = false;
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     {
         int rst = 0, other = 0;
         for (size_t i = 0; i < tp.server_ep.count; i++) {
@@ -9754,11 +9754,11 @@ static int test_noslot_reset_bidi_peer_before_accept(void)
      * not just endpoint count plus ring -- no output, pending empty, mapping
      * absent by both keys, exact ring_before, open/nonfatal, no session work. */
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
     {
         MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.server_bridge));
@@ -10000,7 +10000,7 @@ static int test_noslot_carrier_peer_reset(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-reset immediate");
@@ -10009,7 +10009,7 @@ static int test_noslot_carrier_peer_reset(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-reset service");
 
@@ -10017,7 +10017,7 @@ static int test_noslot_carrier_peer_reset(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-reset repeat");
@@ -10026,7 +10026,7 @@ static int test_noslot_carrier_peer_reset(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-reset repeat service");
     test_pair_destroy(&tp);
@@ -10110,7 +10110,7 @@ static int test_noslot_carrier_peer_stop(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     {
         int rst = 0, wr = 0, other_ops = 0;
         for (size_t i = 0; i < tp.server_ep.count; i++) {
@@ -10153,7 +10153,7 @@ static int test_noslot_carrier_peer_stop(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);   /* no new output */
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
@@ -10161,20 +10161,20 @@ static int test_noslot_carrier_peer_stop(void)
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-stop final service");
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_on_peer_stream_reset(tp.server_bridge, 600,
+        (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-stop final repeat");
     fake_endpoint_clear_ops(&tp.server_ep);
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-stop final repeat service");
     test_pair_destroy(&tp);
@@ -10287,7 +10287,7 @@ static int test_noslot_exhaustion_close(void)
      * other endpoint operation; the bridge is closed, not fatal, no pending. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
     MOQ_TEST_CHECK(moq_transport_bridge_is_closed(tp.server_bridge));
     MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.server_bridge));
@@ -10306,7 +10306,7 @@ static int test_noslot_exhaustion_close(void)
     /* A second service cannot resurrect the target mapping or re-close. */
     fake_endpoint_clear_ops(&tp.server_ep);
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_transport_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+        (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)0);
     MOQ_TEST_CHECK(bridge_find_by_id(tp.server_bridge, 600) == NULL ||
                    !bridge_find_by_id(tp.server_bridge, 600)->active);
@@ -10574,7 +10574,7 @@ static int local_request_bidi_fixture_ex(local_req_fixture_t *f,
     /* Blocking the write leaves the request itself queued on the bidi the open
      * already created -- the "request write still pending" state. */
     f->tp.client_ep.block_write = block_write;
-    if (moq_transport_bridge_service(f->tp.client_bridge, 0) != MOQ_OK)
+    if (held_bridge_service(f->tp.client_bridge, 0) != MOQ_OK)
         goto fail;
 
     /* A fresh draft-18 CLIENT starts at request id 0 (profile_d18.c:35-38) and
@@ -10656,7 +10656,7 @@ static int test_local_bidi_stop_keeps_response_half(void)
     MOQ_TEST_CHECK(moq_session_state(f.tp.client) == MOQ_SESS_ESTABLISHED);
 
     /* First service: exactly the declared RESET and nothing else. */
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(f.bidi, 0x1) };
@@ -10703,7 +10703,7 @@ static int test_local_bidi_stop_keeps_response_half(void)
     /* The response terminal produces no endpoint output of its own, and the
      * mapping and owner retire. */
     failures += ep_expect_none(&f.tp.client_ep, "R1 response terminal");
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     failures += ep_expect_none(&f.tp.client_ep, "R1 service after terminal");
     MOQ_TEST_CHECK(request_registry_find_by_streamref(f.tp.client, f.ref).kind
@@ -10713,7 +10713,7 @@ static int test_local_bidi_stop_keeps_response_half(void)
 
     /* Repeated service stays inert, and the mapping stays gone by BOTH
      * identities. */
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     failures += ep_expect_none(&f.tp.client_ep, "R1 repeated service");
     failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
@@ -10737,7 +10737,7 @@ static int test_local_bidi_stop_duplicate_is_idempotent(void)
                        f.tp.client_bridge, f.bidi, 0x4, 0) == MOQ_OK);
     failures += ep_expect_none(&f.tp.client_ep, "R2 callbacks");
 
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(f.bidi, 0x1) };
@@ -10748,7 +10748,7 @@ static int test_local_bidi_stop_duplicate_is_idempotent(void)
     /* A third STOP after the reset was sent adds nothing. */
     MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                        f.tp.client_bridge, f.bidi, 0x5, 0) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     failures += ep_expect_none(&f.tp.client_ep, "R2 third stop");
 
@@ -10796,15 +10796,15 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
     if (moq_session_create(&scfg, 0, &tp.server) < 0) {
         moq_session_destroy(tp.client); failures++; return failures;
     }
-    fake_endpoint_init(&tp.client_ep, 1000, 2000);
-    fake_endpoint_init(&tp.server_ep, 3000, 4000);
+    held_endpoint_init(&tp.client_ep, 1000, 2000);
+    held_endpoint_init(&tp.server_ep, 3000, 4000);
 
     moq_transport_bridge_cfg_t cbcfg, sbcfg;
     moq_transport_bridge_cfg_init(&cbcfg, &balloc);
     moq_transport_bridge_cfg_init(&sbcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&cbcfg, tp.client, &tp.client_ep.vtable,
+    if (held_bridge_create(&cbcfg, tp.client, &tp.client_ep.vtable,
                                     &tp.client_ep, &tp.client_bridge) < 0 ||
-        moq_transport_bridge_create(&sbcfg, tp.server, &tp.server_ep.vtable,
+        held_bridge_create(&sbcfg, tp.server, &tp.server_ep.vtable,
                                     &tp.server_ep, &tp.server_bridge) < 0) {
         moq_session_destroy(tp.server); moq_session_destroy(tp.client);
         failures++; return failures;
@@ -10834,10 +10834,10 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
     /* Each request is serviced and classified on its own, so a mapping is
      * bound to its own OPEN/WRITE pair rather than to a scan of the queue. */
     MOQ_TEST_CHECK(local_subscribe(&tp, k_b.ns, k_b.track, &sub_b) == 0);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     failures += classify_local_request(&tp.client_ep, &k_b, &sid_b, "R3 arm B");
     MOQ_TEST_CHECK(local_subscribe(&tp, k_c.ns, k_c.track, &sub_c) == 0);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     failures += classify_local_request(&tp.client_ep, &k_c, &sid_c, "R3 arm C");
     MOQ_TEST_CHECK(sid_b != 0 && sid_c != 0 && sid_b != sid_c);
     bridge_stream_entry_t *eb = bridge_find_by_id(tp.client_bridge, sid_b);
@@ -10848,7 +10848,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
     /* The targeted request: its own write blocks and stays pending. */
     tp.client_ep.block_write = true;
     MOQ_TEST_CHECK(local_subscribe(&tp, k_a.ns, k_a.track, &sub_a) == 0);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     uint64_t sid_a = 0;
     {
         ep_rec_t want[1];
@@ -10929,7 +10929,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
 
     /* Reset still blocked: the unrelated work goes out, the target does not. */
     tp.client_ep.block_write = false;
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     {
         ep_rec_t want[2];
         memset(want, 0, sizeof(want));
@@ -10956,7 +10956,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
                    == MOQ_REQ_SUBSCRIPTION);
 
     tp.client_ep.block_reset = false;
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(sid_a, 0x1) };
         failures += ep_expect(&tp.client_ep, want, 1, "R3 reset service");
@@ -11021,14 +11021,14 @@ static int peer_bidi_stop_then_reset(void)
                    MOQ_REQ_NONE);
 
     /* Our response send half is reset exactly once (RFC 9000 §3.5). */
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(bidi, 0x1) };
         failures += ep_expect(&tp.client_ep, want, 1, "R4 service");
     }
 
     /* The peer's own remaining direction then terminates. */
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(
+    MOQ_TEST_CHECK(held_bridge_reset(
                        tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
@@ -11045,9 +11045,9 @@ static int peer_bidi_stop_then_reset(void)
     failures += check_mapping_gone(tp.client_bridge, bidi, bref, "R4 terminal");
 
     /* Repeated terminal and repeated service are both inert. */
-    MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(
+    MOQ_TEST_CHECK(held_bridge_reset(
                        tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     failures += ep_expect_none(&tp.client_ep, "R4 repeat");
     failures += check_mapping_gone(tp.client_bridge, bidi, bref, "R4 repeat");
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
@@ -11073,7 +11073,7 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
 
         MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                            f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
-        MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+        MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                        MOQ_OK);
         {
             ep_rec_t want[1] = { ep_reset(f.bidi, 0x1) };
@@ -11082,7 +11082,7 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
         MOQ_TEST_CHECK(bridge_find_by_id(f.tp.client_bridge, f.bidi) != NULL);
 
         if (use_reset) {
-            MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(
+            MOQ_TEST_CHECK(held_bridge_reset(
                                f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
         } else {
             /* The peer's own terminal: a complete response, then FIN. The
@@ -11113,9 +11113,9 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
                        .kind == MOQ_REQ_NONE);
 
         /* A second terminal and a second service pass are both inert. */
-        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stream_reset(
+        MOQ_TEST_CHECK(held_bridge_reset(
                            f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
-        MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+        MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                        MOQ_OK);
         failures += ep_expect_none(&f.tp.client_ep, "R5 repeat");
         failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
@@ -11149,7 +11149,7 @@ static int test_local_bidi_stop_after_local_fin(void)
     if (local_request_bidi_fixture(&f) < 0) { failures++; return failures; }
 
     MOQ_TEST_CHECK(queue_close_bidi(f.tp.client, f.ref) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     {
         ep_rec_t want[1];
@@ -11169,7 +11169,7 @@ static int test_local_bidi_stop_after_local_fin(void)
 
     MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                        f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     failures += ep_expect_none(&f.tp.client_ep, "R6 stop after fin");
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
@@ -11194,7 +11194,7 @@ static int test_local_bidi_normal_fin_unchanged(void)
     if (e) MOQ_TEST_CHECK(!e->peer_stop_received);
 
     MOQ_TEST_CHECK(queue_close_bidi(f.tp.client, f.ref) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     {
         ep_rec_t want[1];
@@ -11212,7 +11212,7 @@ static int test_local_bidi_normal_fin_unchanged(void)
 
     /* A second FIN for the retired ref produces nothing. */
     MOQ_TEST_CHECK(queue_close_bidi(f.tp.client, f.ref) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_transport_bridge_service(f.tp.client_bridge, 0) ==
+    MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     failures += ep_expect_none(&f.tp.client_ep, "R7 second fin");
     failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
@@ -11399,7 +11399,7 @@ static moq_result_t hol_write_keep(hol_fix_t *f, moq_subgroup_handle_t sg,
 static void hol_service(hol_fix_t *f, int passes)
 {
     for (int i = 0; i < passes; i++)
-        (void)moq_transport_bridge_service(f->tp.server_bridge, 0);
+        (void)held_bridge_service(f->tp.server_bridge, 0);
 }
 
 /* Adapter-boundary oracle: accepted WRITE operations naming this stream. */
@@ -11651,10 +11651,10 @@ static int test_hol_service_work_is_bounded(void)
         MOQ_TEST_CHECK(hol_write(&f, a, i, 32) == MOQ_OK);
 
     fake_endpoint_clear_ops(&f.tp.server_ep);
-    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    (void)held_bridge_service(f.tp.server_bridge, 0);
     ops_first = f.tp.server_ep.count;
     fake_endpoint_clear_ops(&f.tp.server_ep);
-    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    (void)held_bridge_service(f.tp.server_bridge, 0);
     ops_second = f.tp.server_ep.count;
 
     /* one pass must terminate and must not emit unboundedly; the endpoint's
@@ -11826,9 +11826,9 @@ static int test_hol_conservation_of_owned_actions(void)
      * every owned action reaches exactly one terminal ownership state. */
     moq_session_cfg_init_sized(&scfg, sizeof(scfg), &al, MOQ_PERSPECTIVE_SERVER);
     MOQ_TEST_CHECK(moq_session_create(&scfg, 0, &pub) == MOQ_OK);
-    fake_endpoint_init(&ep, 3, 1);
+    held_endpoint_init(&ep, 3, 1);
     moq_transport_bridge_cfg_init(&bcfg, &al);
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, pub, &ep.vtable, &ep, &br)
+    HELD_REQUIRE(held_bridge_create(&bcfg, pub, &ep.vtable, &ep, &br)
                    == MOQ_OK);
 
     /* Exercise the retention paths: blocked opens, blocked writes, a blocked
@@ -11836,14 +11836,14 @@ static int test_hol_conservation_of_owned_actions(void)
     ep.block_open_uni = true;
     ep.block_write = true;
     for (int i = 0; i < 6; i++)
-        (void)moq_transport_bridge_service(br, 0);
+        (void)held_bridge_service(br, 0);
     ep.block_close = true;
     moq_session_close(pub, 0x0, NULL, 0);
     for (int i = 0; i < 6; i++)
-        (void)moq_transport_bridge_service(br, 0);
+        (void)held_bridge_service(br, 0);
 
     /* Teardown with pending work still owned: destroy must release all of it. */
-    moq_transport_bridge_destroy(br);
+    held_bridge_destroy(br);
     moq_session_destroy(pub);
 
     if (acct.live_blocks != 0 || acct.live_bytes != 0) {
@@ -12010,12 +12010,12 @@ static int hol_explore_saturation_seed(uint64_t seed, int steps)
     memset(&f, 0, sizeof(f));
     if (test_pair_init_full(&f.tp, 1, false, 0, 0, MA) < 0) return 1;
     if (!setup_handshake(&f.tp)) { test_pair_destroy(&f.tp); return 1; }
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     {
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         bcfg.max_pending = MP;
-        if (moq_transport_bridge_create(&bcfg, f.tp.server,
+        if (held_bridge_create(&bcfg, f.tp.server,
                 &f.tp.server_ep.vtable, &f.tp.server_ep,
                 &f.tp.server_bridge) != MOQ_OK) {
             test_pair_destroy(&f.tp); return 1;
@@ -12332,9 +12332,9 @@ static int test_hol_conservation_through_retry(void)
 
     moq_session_cfg_init_sized(&scfg, sizeof(scfg), &al, MOQ_PERSPECTIVE_SERVER);
     MOQ_TEST_CHECK(moq_session_create(&scfg, 0, &pub) == MOQ_OK);
-    fake_endpoint_init(&ep, 3, 1);
+    held_endpoint_init(&ep, 3, 1);
     moq_transport_bridge_cfg_init(&bcfg, &al);
-    MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, pub, &ep.vtable, &ep, &br)
+    HELD_REQUIRE(held_bridge_create(&bcfg, pub, &ep.vtable, &ep, &br)
                    == MOQ_OK);
 
     /* Drive control emission with everything blocked so items are retained and
@@ -12345,15 +12345,15 @@ static int test_hol_conservation_through_retry(void)
     ep.block_open_uni = true;
     ep.block_open_bidi = true;
     for (int pass = 0; pass < 12; pass++)
-        (void)moq_transport_bridge_service(br, 0);
+        (void)held_bridge_service(br, 0);
     /* then let it drain, so the same items go out and are cleaned once */
     ep.block_write = false;
     ep.block_open_uni = false;
     ep.block_open_bidi = false;
     for (int pass = 0; pass < 12; pass++)
-        (void)moq_transport_bridge_service(br, 0);
+        (void)held_bridge_service(br, 0);
 
-    moq_transport_bridge_destroy(br);
+    held_bridge_destroy(br);
     moq_session_destroy(pub);
 
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
@@ -12842,9 +12842,9 @@ static int hol_budget_case(uint32_t cap, unsigned *out_first,
     fake_endpoint_clear_ops(&f.tp.server_ep);
     {
         uint64_t base = f.tp.server_ep.write_calls;
-        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        (void)held_bridge_service(f.tp.server_bridge, 0);
         first = (unsigned)(f.tp.server_ep.write_calls - base);
-        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        (void)held_bridge_service(f.tp.server_bridge, 0);
         second = (unsigned)(f.tp.server_ep.write_calls - base);
     }
 
@@ -12965,11 +12965,11 @@ static int test_hol_retention_releases_owned_payload_once(void)
         g_server_alloc_override = &al;
         if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
         g_server_alloc_override = NULL;
-        moq_transport_bridge_destroy(f.tp.server_bridge);
+        held_bridge_destroy(f.tp.server_bridge);
         {
             moq_transport_bridge_cfg_t bcfg;
             moq_transport_bridge_cfg_init(&bcfg, &al);
-            MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+            HELD_REQUIRE(held_bridge_create(&bcfg, f.tp.server,
                                &f.tp.server_ep.vtable, &f.tp.server_ep,
                                &f.tp.server_bridge) == MOQ_OK);
         }
@@ -13001,7 +13001,7 @@ static int test_hol_retention_releases_owned_payload_once(void)
         }
 
         moq_bridge_test_fail_retain_after(0);
-        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        (void)held_bridge_service(f.tp.server_bridge, 0);
         MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.tp.server_bridge));
 
         rc_after = moq_rcbuf_refcount(held);
@@ -13013,11 +13013,11 @@ static int test_hol_retention_releases_owned_payload_once(void)
         }
 
         moq_rcbuf_decref(held);
-        moq_transport_bridge_destroy(f.tp.server_bridge);
+        held_bridge_destroy(f.tp.server_bridge);
         f.tp.server_bridge = NULL;
         moq_session_destroy(f.tp.client);
         moq_session_destroy(f.tp.server);
-        moq_transport_bridge_destroy(f.tp.client_bridge);
+        held_bridge_destroy(f.tp.client_bridge);
 
         if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
             fprintf(stderr, "RCONCE[%d]: live=%lld blocks %lld bytes "
@@ -13052,11 +13052,11 @@ static int test_hol_initial_retention_failure_is_fatal_not_silent(void)
     g_server_alloc_override = &al;
     if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
     g_server_alloc_override = NULL;
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     {
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, &al);
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+        HELD_REQUIRE(held_bridge_create(&bcfg, f.tp.server,
                            &f.tp.server_ep.vtable, &f.tp.server_ep,
                            &f.tp.server_bridge) == MOQ_OK);
     }
@@ -13069,7 +13069,7 @@ static int test_hol_initial_retention_failure_is_fatal_not_silent(void)
 
     /* fail the very first retention of that action */
     moq_bridge_test_fail_retain_after(0);
-    rc = moq_transport_bridge_service(f.tp.server_bridge, 0);
+    rc = held_bridge_service(f.tp.server_bridge, 0);
 
     if (rc == MOQ_OK) {
         fprintf(stderr, "RETAIN0: an initial retention failure was reported "
@@ -13099,7 +13099,7 @@ static int test_hol_initial_retention_failure_is_fatal_not_silent(void)
     writes_after_breach = f.tp.server_ep.write_calls;
     opens_after_breach = f.tp.server_ep.open_uni_calls;
     f.tp.server_ep.block_open_uni = false;
-    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    (void)held_bridge_service(f.tp.server_bridge, 0);
     if (f.tp.server_ep.write_calls != writes_after_breach ||
         f.tp.server_ep.open_uni_calls != opens_after_breach) {
         fprintf(stderr, "RETAIN0: %llu write(s) and %llu open(s) after an "
@@ -13111,11 +13111,11 @@ static int test_hol_initial_retention_failure_is_fatal_not_silent(void)
         failures++;
     }
 
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
     moq_session_destroy(f.tp.client);
     moq_session_destroy(f.tp.server);
-    moq_transport_bridge_destroy(f.tp.client_bridge);
+    held_bridge_destroy(f.tp.client_bridge);
 
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
         fprintf(stderr, "RETAIN0: live=%lld blocks %lld bytes negative=%d\n",
@@ -13149,11 +13149,11 @@ static int test_hol_retention_failure_is_fatal_not_silent(void)
     g_server_alloc_override = &al;
     if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
     g_server_alloc_override = NULL;
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     {
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, &al);
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+        HELD_REQUIRE(held_bridge_create(&bcfg, f.tp.server,
                            &f.tp.server_ep.vtable, &f.tp.server_ep,
                            &f.tp.server_bridge) == MOQ_OK);
     }
@@ -13169,7 +13169,7 @@ static int test_hol_retention_failure_is_fatal_not_silent(void)
 
     /* let the blocked head re-retain, then fail the next survivor */
     moq_bridge_test_fail_retain_after(1);
-    rc = moq_transport_bridge_service(f.tp.server_bridge, 0);
+    rc = held_bridge_service(f.tp.server_bridge, 0);
 
     if (rc == MOQ_OK) {
         fprintf(stderr, "RETAIN: a retention failure was reported as "
@@ -13190,7 +13190,7 @@ static int test_hol_retention_failure_is_fatal_not_silent(void)
 
     /* and no further work is delivered once the invariant is broken */
     f.tp.server_ep.block_write = false;
-    (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+    (void)held_bridge_service(f.tp.server_bridge, 0);
     if (f.tp.server_ep.write_calls != writes_before) {
         fprintf(stderr, "RETAIN: %llu write(s) were delivered after an "
                 "invariant breach\n",
@@ -13199,11 +13199,11 @@ static int test_hol_retention_failure_is_fatal_not_silent(void)
         failures++;
     }
 
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
     moq_session_destroy(f.tp.client);
     moq_session_destroy(f.tp.server);
-    moq_transport_bridge_destroy(f.tp.client_bridge);
+    held_bridge_destroy(f.tp.client_bridge);
 
     /* released exactly once: no leak, and no negative balance */
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
@@ -13230,11 +13230,11 @@ static int test_hol_owned_payload_conservation(void)
      * where retained items live -- give it the counting one */
     memset(&f, 0, sizeof(f));
     if (hol_init(&f) < 0) return 1;
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     {
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, &al);
-        MOQ_TEST_CHECK(moq_transport_bridge_create(&bcfg, f.tp.server,
+        HELD_REQUIRE(held_bridge_create(&bcfg, f.tp.server,
                            &f.tp.server_ep.vtable, &f.tp.server_ep,
                            &f.tp.server_bridge) == MOQ_OK);
     }
@@ -13247,7 +13247,7 @@ static int test_hol_owned_payload_conservation(void)
     MOQ_TEST_CHECK(hol_pending(&f) >= 1);
     /* many re-enqueues of the SAME owning item */
     for (pass = 0; pass < 10; pass++)
-        (void)moq_transport_bridge_service(f.tp.server_bridge, 0);
+        (void)held_bridge_service(f.tp.server_bridge, 0);
     /* then let it out, so the item is cleaned exactly once on success */
     f.tp.server_ep.block_write = false;
     hol_service(&f, 16);
@@ -13259,11 +13259,11 @@ static int test_hol_owned_payload_conservation(void)
     hol_service(&f, 4);
     MOQ_TEST_CHECK(hol_pending(&f) >= 1);
 
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
     moq_session_destroy(f.tp.client);
     moq_session_destroy(f.tp.server);
-    moq_transport_bridge_destroy(f.tp.client_bridge);
+    held_bridge_destroy(f.tp.client_bridge);
 
     if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
         fprintf(stderr, "HOL owned-payload: live=%lld blocks %lld bytes "
@@ -13312,12 +13312,12 @@ static int f1_case(uint32_t max_actions, uint32_t max_pending,
     if (test_pair_init_full(&f.tp, 1, false, 0, 0, max_actions) < 0) return -1;
     if (!setup_handshake(&f.tp)) { test_pair_destroy(&f.tp); return -1; }
     /* rebuild the publisher bridge with an explicit retention capacity */
-    moq_transport_bridge_destroy(f.tp.server_bridge);
+    held_bridge_destroy(f.tp.server_bridge);
     {
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         bcfg.max_pending = max_pending;
-        if (moq_transport_bridge_create(&bcfg, f.tp.server,
+        if (held_bridge_create(&bcfg, f.tp.server,
                 &f.tp.server_ep.vtable, &f.tp.server_ep,
                 &f.tp.server_bridge) != MOQ_OK) {
             test_pair_destroy(&f.tp);
@@ -13340,7 +13340,7 @@ static int f1_case(uint32_t max_actions, uint32_t max_pending,
         out->offered++;
     }
     for (i = 0; i < 8; i++) {
-        moq_result_t rc = moq_transport_bridge_service(f.tp.server_bridge, 0);
+        moq_result_t rc = held_bridge_service(f.tp.server_bridge, 0);
         if ((int)rc < out->worst_rc) out->worst_rc = (int)rc;
         if (hol_pending(&f) > out->max_depth) out->max_depth = hol_pending(&f);
         if (moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
@@ -13677,7 +13677,7 @@ static void priority_pump(test_pair_t *tp, bool d18, uint64_t now)
             fake_endpoint_t *from = side ? &tp->server_ep : &tp->client_ep;
             moq_transport_bridge_t *source = side ? tp->server_bridge : tp->client_bridge;
             moq_transport_bridge_t *dest = side ? tp->client_bridge : tp->server_bridge;
-            moq_transport_bridge_service(source, now);
+            held_bridge_service(source, now);
             count += from->count;
             for (size_t i = 0; i < from->count; ++i) {
                 const fake_op_t *o = &from->ops[i];
@@ -13688,7 +13688,7 @@ static void priority_pump(test_pair_t *tp, bool d18, uint64_t now)
                     moq_transport_bridge_on_peer_bidi_bytes(dest, o->stream_id,
                         o->data, o->data_len, o->fin, now);
                 else
-                    moq_transport_bridge_on_peer_uni_bytes(dest, o->stream_id,
+                    held_bridge_uni_bytes(dest, o->stream_id,
                         o->data, o->data_len, o->fin, now);
             }
             fake_endpoint_clear_ops(from);
@@ -13752,7 +13752,7 @@ static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d
     uint64_t expected_sid = tp.server_ep.next_uni_id;
     unsigned opens_before = tp.server_ep.open_uni_calls;
     tp.server_ep.block_open_uni = true;
-    moq_transport_bridge_service(tp.server_bridge, 1);
+    held_bridge_service(tp.server_bridge, 1);
     MOQ_TEST_CHECK(priority_calls == 0);
     /* A later request update must not rewrite already retained metadata. */
     moq_subscription_update_cfg_t update;
@@ -13777,7 +13777,7 @@ static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d
     MOQ_TEST_CHECK(updated);
     MOQ_TEST_CHECK(priority_calls == 0);
     tp.server_ep.block_open_uni = false;
-    moq_transport_bridge_service(tp.server_bridge, 2);
+    held_bridge_service(tp.server_bridge, 2);
     MOQ_TEST_CHECK(tp.server_ep.open_uni_calls == opens_before + 1);
     if (legacy) {
         /* A non-null poisoned tail is outside the old table's size. */
@@ -13793,9 +13793,119 @@ static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d
     return failures;
 }
 
+/* Exercise the transport recorder itself under actual admission pressure.
+ * The raw one-byte FETCH header occupies the only receive slot. The real
+ * publisher's second response must survive copied chunks plus separate FIN. */
+static int test_held_driver_replay(bool rcbuf)
+{
+    int failures = 0;
+    test_pair_t tp;
+    g_client_rx_capacity = 1;
+    HELD_REQUIRE(test_pair_init(&tp) == 0);
+    g_client_rx_capacity = 0;
+    HELD_REQUIRE(setup_handshake(&tp));
+    uint8_t partial = 0x05;
+    HELD_REQUIRE(held_bridge_uni_bytes(tp.client_bridge, 6000, &partial, 1, false, 0) == MOQ_OK);
+    moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("held") };
+    moq_fetch_cfg_t fc;
+    moq_fetch_cfg_init(&fc);
+    fc.track_namespace = (moq_namespace_t){ .parts = ns, .count = 1 };
+    fc.track_name = MOQ_BYTES_LITERAL("t");
+    fc.end_object = 1;
+    moq_fetch_t fh;
+    HELD_REQUIRE(moq_session_fetch(tp.client, &fc, 0, &fh) == MOQ_OK);
+    pump_until_quiescent(&tp, 8, 0);
+    moq_event_t ev;
+    moq_fetch_t peer = {0};
+    bool found = false;
+    while (moq_session_poll_events(tp.server, &ev, 1)) {
+        if (ev.kind == MOQ_EVENT_FETCH_REQUEST) { peer = ev.u.fetch_request.fetch; found = true; }
+        moq_event_cleanup(&ev);
+    }
+    HELD_REQUIRE(found);
+    moq_accept_fetch_cfg_t ac;
+    moq_accept_fetch_cfg_init(&ac);
+    ac.end_object = 1;
+    HELD_REQUIRE(moq_session_accept_fetch(tp.server, peer, &ac, 0) == MOQ_OK);
+    const uint8_t payload[] = { 0x12, 0x34, 0x56, 0x78 };
+    moq_rcbuf_t *rb = NULL;
+    HELD_REQUIRE(moq_rcbuf_create(moq_alloc_default(), payload, sizeof(payload), &rb) == MOQ_OK);
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.payload = rb;
+    HELD_REQUIRE(moq_session_write_fetch_object(tp.server, peer, &oc, 0) == MOQ_OK);
+    moq_rcbuf_decref(rb);
+    HELD_REQUIRE(moq_session_end_fetch(tp.server, peer, 0) == MOQ_OK);
+    HELD_REQUIRE(held_bridge_service(tp.server_bridge, 0) == MOQ_OK);
+    test_held_input_t *h = &held_bridge_driver(tp.client_bridge)->input;
+    uint64_t response_sid = 0;
+    for (size_t i = 0; i < tp.server_ep.count; i++) {
+        fake_op_t *o = &tp.server_ep.ops[i];
+        if (o->kind != FAKE_OP_WRITE) continue;
+        if (o->stream_id < 3000) {
+            HELD_REQUIRE(moq_transport_bridge_on_peer_control_bytes(tp.client_bridge,
+                o->stream_id, o->data, o->data_len, o->fin, 0) == MOQ_OK);
+            continue;
+        }
+        response_sid = o->stream_id;
+        if (o->data_len) {
+            size_t before = h->count;
+            if (rcbuf) {
+                HELD_REQUIRE(moq_rcbuf_create(moq_alloc_default(), o->data, o->data_len, &rb) == MOQ_OK);
+                HELD_REQUIRE(held_bridge_uni_rcbuf(tp.client_bridge, response_sid, rb, false, 0) == MOQ_OK);
+                moq_rcbuf_decref(rb);
+            } else {
+                HELD_REQUIRE(held_bridge_uni_bytes(tp.client_bridge, response_sid,
+                    o->data, o->data_len, false, 0) == MOQ_OK);
+            }
+            MOQ_TEST_CHECK(h->count == before + 1);
+            MOQ_TEST_CHECK(h->chunks[before].len == o->data_len && !h->chunks[before].fin);
+            MOQ_TEST_CHECK(memcmp(h->chunks[before].bytes, o->data, o->data_len) == 0);
+            memset(o->data, 0xee, o->data_len); /* Input storage is no longer borrowed. */
+        }
+        if (o->fin) HELD_REQUIRE(held_bridge_uni_bytes(tp.client_bridge, response_sid, NULL, 0, true, 0) == MOQ_OK);
+    }
+    HELD_REQUIRE(h->count >= 2);
+    MOQ_TEST_CHECK(h->chunks[h->count - 1].len == 0 && h->chunks[h->count - 1].fin);
+    size_t held = h->count;
+    HELD_REQUIRE(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(h->count == held);
+    HELD_REQUIRE(held_bridge_reset(tp.client_bridge, 6000, 1, 0) == MOQ_OK);
+    HELD_REQUIRE(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(h->count == 0);
+    int objects = 0, completed = 0;
+    while (moq_session_poll_events(tp.client, &ev, 1)) {
+        if (ev.kind == MOQ_EVENT_FETCH_OBJECT) {
+            objects++;
+            MOQ_TEST_CHECK(moq_rcbuf_len(ev.u.fetch_object.payload) == sizeof(payload));
+            MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(ev.u.fetch_object.payload), payload, sizeof(payload)) == 0);
+        } else if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) completed++;
+        else MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_FETCH_OK);
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(objects == 1 && completed == 1);
+    MOQ_TEST_CHECK(moq_session_fetch_cancel(tp.client, fh, 0) == MOQ_ERR_STALE_HANDLE);
+    HELD_REQUIRE(held_bridge_uni_bytes(tp.client_bridge, 6001, &partial, 1, false, 0) == MOQ_OK);
+    HELD_REQUIRE(held_bridge_uni_bytes(tp.client_bridge, 6002, &partial, 1, false, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(h->count == 1);
+    HELD_REQUIRE(held_bridge_reset(tp.client_bridge, 6002, 1, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(h->count == 0);
+    HELD_REQUIRE(held_bridge_uni_bytes(tp.client_bridge, 6003, &partial, 1, false, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(h->count == 1);
+    if (rcbuf) {
+        HELD_REQUIRE(held_bridge_close(tp.client_bridge, 0, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(h->count == 0);
+    }
+    test_pair_destroy(&tp);
+    MOQ_TEST_CHECK(h->count == 0);
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
+    failures += test_held_driver_replay(false);
+    failures += test_held_driver_replay(true);
     for (int d18 = 0; d18 < 2; ++d18) {
         failures += test_priority_survives_closed_subgroup(false, false, d18 != 0);
         failures += test_priority_survives_closed_subgroup(true, false, d18 != 0);

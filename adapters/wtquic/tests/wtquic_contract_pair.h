@@ -31,6 +31,7 @@
 #include <moq/wtquic.h>
 
 #include <wtquic/wtquic_msquic.h>
+#include "wtquic_attach_bootstrap.h"
 
 /* Script step triggers, evaluated in the adapter hook after each event
  * batch. A step fires once, in order. */
@@ -81,6 +82,7 @@ typedef struct wtqc_obs {
     int publish_errors;    /* publish-side call failures */
     bool closed;           /* adapter terminal, clean transport close */
     bool fatal;            /* adapter terminal, fatal */
+    bool establishment_failed; /* no adapter exists before qualification */
     int probe_rc;          /* WTQC_DO_PROBE_DEAD result */
     bool probe_ran;
 } wtqc_obs_t;
@@ -98,6 +100,7 @@ typedef struct wtqc_side {
 
     /* hook-private state */
     moq_wtquic_conn_t *conn;
+    wtq_test_attach_t attach;
     moq_subscription_t sub;      /* recorded SUBSCRIBE_REQUEST */
     bool have_sub;
     uint64_t next_group;         /* one group per publish action */

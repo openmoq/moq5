@@ -516,6 +516,9 @@ if(TARGET moq::adapter-msquic-managed)
             # directories are the one input that means the same thing in every
             # case. The search list follows as supplemental input, quoted so
             # its ";" survives as CMake list separators.
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+            set(_wt_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+            moq_write_consumer_context("${_wt_consumer_context}")
             add_test(NAME relay_wt_cfg_target_gating COMMAND ${MOQR_WIRE_BASH}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_wt_cfg_target_gating.sh
                 ${CMAKE_SOURCE_DIR}
@@ -524,7 +527,8 @@ if(TARGET moq::adapter-msquic-managed)
                 "${msquic_DIR}"
                 "${CMAKE_C_COMPILER}"
                 "${CMAKE_PREFIX_PATH}"
-                "${OPENSSL_ROOT_DIR}")
+                "${OPENSSL_ROOT_DIR}"
+                "${_wt_consumer_context}")
             set_tests_properties(relay_wt_cfg_target_gating PROPERTIES
                 LABELS "relay;tooling" TIMEOUT 300)
         endif()

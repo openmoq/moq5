@@ -159,6 +159,41 @@ expect_empty("a linux image path containing 'error' is accepted" "${_why}")
 loader_only_image_records("      99:     something unknown here" Linux _why)
 expect_nonempty("an unknown linux record is refused" "${_why}")
 
+# The sanitizer lane's captured dyld info is not an image or a warning. It
+# requires both the exact record kind and a matching PID's actual ASan image.
+set(_asan_image "dyld[123]: <8B994207-FB33-3A22-8385-7FB6F5343956> /toolchain/lib/libclang_rt.asan_osx_dynamic.dylib")
+set(_asan_info "dyld[123]: has interposing tuples so cannot be delayed: libclang_rt.asan_osx_dynamic.dylib")
+set(_asan_trace "${_darwin}\n${_asan_image}\n${_asan_info}")
+loader_only_image_records("${_asan_trace}" Darwin _why TRUE)
+expect_empty("exact ASan loader info on sanitizer lane accepted" "${_why}")
+loader_only_image_records("${_asan_trace}" Darwin _why FALSE)
+expect_nonempty("ASan info on ordinary lane refused" "${_why}")
+loader_only_image_records("${_darwin}\n${_asan_info}" Darwin _why TRUE)
+expect_nonempty("ASan info without runtime image refused" "${_why}")
+string(REPLACE "dyld[123]" "dyld[456]" _other_pid "${_asan_info}")
+loader_only_image_records("${_asan_image}\n${_other_pid}" Darwin _why TRUE)
+expect_nonempty("ASan info from unmatched PID refused" "${_why}")
+foreach(_injected
+    "arbitrary injected output"
+    "dyld[123]: arbitrary injected output"
+    "has interposing tuples so cannot be delayed: libclang_rt.asan_osx_dynamic.dylib"
+    "dyld[123]: has interposing tuples so cannot be delayed: libunknown.dylib"
+    "${_asan_info} trailing injected text"
+    "dyld[123]: warning: injected diagnostic")
+    loader_only_image_records("${_asan_trace}\n${_injected}" Darwin _why TRUE)
+    expect_nonempty("sanitizer lane rejects injected record: ${_injected}" "${_why}")
+endforeach()
+loader_parse_images("${_asan_trace}" Darwin _asan_imgs)
+list(LENGTH _asan_imgs _asan_count)
+expect("info is not parsed as an actual image" "${_asan_count}" "4")
+loader_require_images("${_asan_imgs}" "/missing/libmsquic.dylib"
+    "/p/lib;/q/lib" missing _why)
+expect_nonempty("ASan info cannot supply a missing provider image" "${_why}")
+loader_require_images("${_asan_imgs};/wrong/libwtquic.dylib"
+    "/p/lib/libmoq-core.dylib;/q/lib/libwtquic.dylib"
+    "/p/lib;/q/lib" wrong _why)
+expect_nonempty("ASan info cannot excuse a wrong provider image" "${_why}")
+
 # -- the named pre-main discriminator ---------------------------------------
 loader_is_missing_library(133
 "dyld[1]: Library not loaded: @rpath/libmoq-core.dylib

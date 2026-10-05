@@ -1827,6 +1827,92 @@ moq_result_t moq_session_fetch_cancel(moq_session_t *s,
     return MOQ_OK;
 }
 
+/* -- Fetcher-side terminal for a reset response data stream -------- */
+
+moq_result_t fetch_on_data_stream_reset(moq_session_t *s, int slot,
+                                        uint64_t error_code)
+{
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    /* Only an active fetcher-role request owes a terminal. DRAINING_RESPONSE
+     * already surfaced FETCH_ERROR (the slot merely waits for the request
+     * stream's FIN); GOAWAY_LOCAL was migrated; a publisher-role entry never
+     * receives on its own response stream. */
+    if (e->role != MOQ_FETCH_ROLE_FETCHER) return MOQ_OK;
+    if (e->state != MOQ_FETCH_PENDING_FETCHER) return MOQ_OK;
+
+    /* Stream-correlated profiles: the request bidi is still open in both
+     * directions, so retire it the way a local cancel does (one ABORT action,
+     * drain reference while the peer's FIN is unobserved) -- a late FETCH_OK
+     * or REQUEST_ERROR on it is then absorbed, never a fresh request. On the
+     * control-channel profile the cancel tombstone absorbs those instead. */
+    bool uses_streams = e->request_stream_ref._v != 0;
+    bool need_drain = uses_streams && !fetch_peer_fin_observed(e);
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (uses_streams && action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_FETCH_RESET;
+    ev.detail_size = (uint32_t)sizeof(moq_fetch_reset_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.fetch_reset.fetch = e->handle;
+    ev.u.fetch_reset.error_code = error_code;
+    ev.u.fetch_reset.data_stream = true;
+    ev.u.fetch_reset.stop_sending = false;
+    (void)push_event(s, &ev);               /* slot reserved above */
+
+    if (uses_streams) {
+        moq_stream_ref_t ref = e->request_stream_ref;
+        moq_action_t a;
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = s->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = ref;
+        a.u.abort_bidi_stream.error_code = 0x1;   /* CANCELLED */
+        (void)push_action(s, &a);           /* slot reserved above */
+        request_registry_remove_by_streamref(s, ref);
+        if (need_drain)
+            (void)drain_ref_add(s, ref);    /* slot reserved above */
+        e->request_stream_ref = moq_stream_ref_from_u64(0);
+    }
+    fetch_cancel_tomb_add(s, e->request_id);
+    fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+/* -- Locally-aborted publisher FETCH request-id grace cache -------- */
+
+void fetch_abort_tomb_add(moq_session_t *s, uint64_t request_id)
+{
+    if (s->fetch_abort_tomb_cap == 0) return;
+    for (size_t i = 0; i < s->fetch_abort_tomb_count; i++)
+        if (s->fetch_abort_tombs[i] == request_id) return;
+    if (s->fetch_abort_tomb_count >= s->fetch_abort_tomb_cap) {
+        /* Full: drop the oldest. A grace window, not unbounded state: an
+         * evicted id's late cancel is an unknown request and fails closed. */
+        memmove(&s->fetch_abort_tombs[0], &s->fetch_abort_tombs[1],
+                (s->fetch_abort_tomb_cap - 1) * sizeof(uint64_t));
+        s->fetch_abort_tomb_count = s->fetch_abort_tomb_cap - 1;
+    }
+    s->fetch_abort_tombs[s->fetch_abort_tomb_count++] = request_id;
+}
+
+bool fetch_abort_tomb_consume(moq_session_t *s, uint64_t request_id)
+{
+    for (size_t i = 0; i < s->fetch_abort_tomb_count; i++) {
+        if (s->fetch_abort_tombs[i] == request_id) {
+            memmove(&s->fetch_abort_tombs[i], &s->fetch_abort_tombs[i + 1],
+                    (s->fetch_abort_tomb_count - i - 1) * sizeof(uint64_t));
+            s->fetch_abort_tomb_count--;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* -- Publisher write APIs ------------------------------------------ */
 
 void moq_fetch_object_cfg_init(moq_fetch_object_cfg_t *cfg)
@@ -2108,6 +2194,78 @@ moq_result_t moq_session_end_fetch(
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
 
+    fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_abort_fetch(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    uint64_t error_code,
+    uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    /* A QUIC application error code travels as a varint on the wire. */
+    if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+
+    int slot = fetch_resolve_handle(s, fetch);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_fetch_entry_t *entry = &s->fetches[slot];
+    /* Publisher side only, and only once the response data stream exists: a
+     * pending fetch has nothing to reset and is answered by reject_fetch. */
+    if (entry->role != MOQ_FETCH_ROLE_PUBLISHER)
+        return MOQ_ERR_WRONG_STATE;
+    if (entry->state != MOQ_FETCH_ACCEPTED || !entry->data_stream_started)
+        return MOQ_ERR_WRONG_STATE;
+
+    /* Reserve everything before mutating. The reset is one action. On
+     * stream-correlated profiles the request bidi outlives the entry: unless
+     * the peer's FIN was already observed, its later empty FIN / RESET must be
+     * absorbed by the drain ring (an unknown request stream's empty FIN is
+     * otherwise fatal), exactly as reject_fetch arranges. */
+    moq_stream_ref_t req_ref = entry->request_stream_ref;
+    bool uses_streams = req_ref._v != 0;
+    bool need_drain = uses_streams && !fetch_peer_fin_observed(entry);
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+    /* Stream-correlated profiles terminate the request stream too (one ABORT
+     * of both directions with the same code, §5.3: the request stream's
+     * termination is what ends the fetch even when the data stream's reset
+     * is lost before its header): both actions are reserved up front so a
+     * refusal never leaves a half-aborted fetch. */
+    if (action_queue_avail(s) < (size_t)(uses_streams ? 2 : 1))
+        return MOQ_ERR_WOULD_BLOCK;
+
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_RESET_DATA;
+    a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.reset_data.stream_ref = entry->data_stream_ref;
+    a.u.reset_data.error_code = error_code;
+    moq_result_t rc = push_action(s, &a);
+    if (rc < 0) return rc;
+    if (uses_streams) {
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
+        a.borrow_epoch = s->borrow_epoch;
+        a.u.abort_bidi_stream.stream_ref = req_ref;
+        a.u.abort_bidi_stream.error_code = error_code;
+        (void)push_action(s, &a);           /* slot reserved above */
+    }
+
+    if (need_drain)
+        (void)drain_ref_add(s, req_ref);   /* slot reserved above */
+    /* Committed: remember the peer's request id so a FETCH_CANCEL that crosses
+     * the reset is absorbed (control-message cancellation profiles only; a
+     * stream-correlated cancel is a request-bidi reset the session already
+     * absorbs). Captured before the free, recorded only on success. */
+    if (!moq_session_uses_request_streams(s))
+        fetch_abort_tomb_add(s, entry->request_id);
     fetch_free_entry(s, slot);
     return MOQ_OK;
 }

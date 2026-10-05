@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+include("${MOQ_SOURCE}/tests/cmake/RejectConsumerWarnings.cmake")
+get_filename_component(WORK "${RECEIPT}" DIRECTORY)
+include("${PROBE_FILE}")
+file(WRITE "${RECEIPT}" "${out}${err}")
+if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "diagnostic control configure failed (${rc}): ${out}${err}")
+endif()

@@ -62,6 +62,15 @@ typedef struct pw_rx_stream {
     bool     paused;       /* has retained/blocked work; must not feed bridge */
     bool     buf_fin;      /* a peer FIN follows the retained bytes */
     bool     fin_blocked;  /* the FIN rode the chunk that blocked */
+    /* Receive admission (MOQ_TRANSPORT_CAP_HOLD_INPUT): the bridge refused a
+     * chunk of a stream the session could not admit yet. The adapter owes
+     * exactly that chunk: it sits at the front of `buf` (held_len bytes,
+     * held_fin its FIN flag); later bytes and a later FIN queue behind it in
+     * order, and nothing is bridge-owned (`blocked` stays 0) until the
+     * redelivery is accepted. */
+    bool     held_input;
+    bool     held_fin;
+    size_t   held_len;
     bool     active;
 } pw_rx_stream_t;
 

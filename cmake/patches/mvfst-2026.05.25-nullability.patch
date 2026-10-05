@@ -1,0 +1,61 @@
+--- a/quic/state/AckEvent.h
++++ b/quic/state/AckEvent.h
+@@ -256,7 +256,8 @@
+           OutstandingPacketMetadata& outstandingPacketMetadataIn);
+       Builder&& setDetailsPerStream(DetailsPerStream&& detailsPerStreamIn);
+       Builder&& setLastAckedPacketInfo(
+-          OutstandingPacketWrapper::LastAckedPacketInfo* lastAckedPacketInfoIn);
++          OutstandingPacketWrapper::LastAckedPacketInfo* FOLLY_NULLABLE
++              lastAckedPacketInfoIn);
+       Builder&& setAppLimited(bool appLimitedIn);
+       Builder&& setReceiveDeltaTimeStamp(
+           OptionalMicros&& receiveRelativeTimeStampUsec);
+@@ -267,9 +268,10 @@
+      private:
+       Optional<quic::PacketNum> packetNum;
+-      OutstandingPacketMetadata* outstandingPacketMetadata{nullptr};
+-      Optional<DetailsPerStream> detailsPerStream;
+-      OutstandingPacketWrapper::LastAckedPacketInfo* lastAckedPacketInfo{
++      OutstandingPacketMetadata* FOLLY_NULLABLE outstandingPacketMetadata{
+           nullptr};
++      Optional<DetailsPerStream> detailsPerStream;
++      OutstandingPacketWrapper::LastAckedPacketInfo* FOLLY_NULLABLE
++          lastAckedPacketInfo{nullptr};
+       OptionalMicros receiveRelativeTimeStampUsec;
+       bool isAppLimited{false};
+     };
+--- a/quic/state/AckEvent.cpp
++++ b/quic/state/AckEvent.cpp
+@@ -78,6 +78,7 @@
+ AckEvent::AckPacket::Builder&&
+ AckEvent::AckPacket::Builder::setLastAckedPacketInfo(
+-    OutstandingPacketWrapper::LastAckedPacketInfo* lastAckedPacketInfoIn) {
++    OutstandingPacketWrapper::LastAckedPacketInfo* FOLLY_NULLABLE
++        lastAckedPacketInfoIn) {
+   lastAckedPacketInfo = lastAckedPacketInfoIn;
+   return std::move(*this);
+ }
+--- a/quic/priority/HTTPPriorityQueue.h
++++ b/quic/priority/HTTPPriorityQueue.h
+@@ -73,3 +73,3 @@
+-    const HTTPPriority* operator->() const {
++    const HTTPPriority* FOLLY_NONNULL operator->() const {
+       return &getFields();
+     }
+--- a/quic/congestion_control/Bbr2.h
++++ b/quic/congestion_control/Bbr2.h
+@@ -211,5 +211,5 @@
+   // State used in processing the current ack
+-  const AckEvent* currentAckEvent_{nullptr};
++  const AckEvent* FOLLY_NULLABLE currentAckEvent_{nullptr};
+   Bandwidth currentBwSample_;
+   uint64_t currentAckMaxInflightBytes_{0};
+   uint64_t inflightBytesAtLastAckedPacket_{0};
+--- a/quic/congestion_control/modular/Bbr2Shared.h
++++ b/quic/congestion_control/modular/Bbr2Shared.h
+@@ -231,4 +231,4 @@
+   // Current ACK state
+-  const AckEvent* currentAckEvent_{nullptr};
++  const AckEvent* FOLLY_NULLABLE currentAckEvent_{nullptr};
+   Bandwidth currentBwSample_;
+   uint64_t currentAckMaxInflightBytes_{0};

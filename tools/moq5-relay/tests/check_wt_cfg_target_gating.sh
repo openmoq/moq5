@@ -11,7 +11,7 @@
 # Configure only: nothing is compiled, no binary runs, no listener starts.
 set -u
 usage='usage: check_wt_cfg_target_gating.sh <source-root> <cmake> <wtquic_DIR>'\
-' <msquic_DIR> [<compiler>] [<prefix-list>] [<openssl-root>]'
+' <msquic_DIR> [<compiler>] [<prefix-list>] [<openssl-root>] [<context-preload>]'
 srcroot=${1:?$usage}
 cmake_bin=${2:?$usage}
 # The package directories the PARENT already resolved. A caller may have found
@@ -26,6 +26,7 @@ cc=${5:-}
 # separators. Never treated as a single pathname.
 prefix_list=${6:-}
 openssl_root=${7:-}
+context=${8:-}
 
 fail=0
 note() { printf '  %s\n' "$*"; }
@@ -44,6 +45,7 @@ configure() {  # <dir> <tests: ON|OFF> <facade: yes|no>
                 -DMOQ_BUILD_ADAPTER_MSQUIC=ON
                 -DMOQ_BUILD_MSQUIC_MANAGED=ON)
     if [ -n "$cc" ]; then args+=("-DCMAKE_C_COMPILER=$cc"); fi
+    if [ -n "$context" ]; then args+=(-C "$context"); fi
     # The raw listener needs MsQuic in EVERY case, so the selected package
     # travels with all of them: a child left to search on its own could bind a
     # different installation than the parent chose, or none at all.

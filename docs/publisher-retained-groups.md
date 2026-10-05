@@ -260,8 +260,13 @@ FETCH directly (Joining or standalone, including a relay's upstream pull).
 They do not force a relay to cache catalog objects, and they do not make
 the origin aware of downstream subscribers hidden behind a relay.
 
-For relay topologies, the long-term fix belongs at the relay/protocol
-policy layer: either the relay must keep enough catalog objects to answer
-the FETCH, or it must fetch them upstream when requested. The
-publisher retained group is only the origin-side storage needed to answer
-the request when the request reaches the origin.
+For relay topologies the request has to reach the origin: the libmoq relay
+binding forwards an ascending Joining FETCH on a SUBSCRIBE-initiated
+subscription as one standalone upstream FETCH against the subscription's
+pinned source, collects the complete response within a bounded byte/count
+budget, and only then accepts the downstream fetch (see
+`relay/docs/architecture.md`). The publisher retained group is the
+origin-side storage that answers that upstream request; a relay that does
+not forward (or caps the response) still leaves the subscriber without a
+catalog, which is why the receiver treats a rejected catalog fetch as a
+bounded wait rather than an error.

@@ -63,8 +63,56 @@ uint64_t moq_mvfst_managed_test_earliest_deadline(moq_mvfst_managed_t *m);
  */
 void moq_mvfst_managed_test_set_running(moq_mvfst_managed_t *m, bool running);
 
+/*
+ * Receive admission (held input) observation on the attach adapter.
+ * moq_mvfst_test_set_hold_input: -1 = the adapter's own capability setting,
+ * 0 = never advertise MOQ_TRANSPORT_CAP_HOLD_INPUT, 1 = always advertise it
+ * (applies to adapters created afterwards). The observer is invoked on the
+ * adapter's thread at each held-chunk transition with the chunk's byte
+ * length and FIN flag.
+ */
+enum {
+    MOQ_MVFST_TEST_HOLD_HELD = 1,          /* refused chunk retained */
+    MOQ_MVFST_TEST_HOLD_REFUSED_AGAIN = 2, /* redelivery refused; chunk kept */
+    MOQ_MVFST_TEST_HOLD_ACCEPTED = 3,      /* redelivery taken by the bridge */
+    MOQ_MVFST_TEST_HOLD_DROPPED_RESET = 4, /* peer RESET while held */
+    MOQ_MVFST_TEST_HOLD_DROPPED_TEARDOWN = 5, /* adapter terminal/destroyed */
+    MOQ_MVFST_TEST_HOLD_REPLAY = 6,        /* actual bridge result + pending */
+    MOQ_MVFST_TEST_HOLD_INPUT = 7          /* on_read entry, including injection */
+};
+typedef void (*moq_mvfst_test_hold_cb)(void *ctx, uint64_t stream_id,
+                                        int phase, size_t len, bool fin,
+                                        moq_result_t result, bool pending);
+void moq_mvfst_test_set_hold_input(int mode);
+void moq_mvfst_test_set_hold_observer(moq_mvfst_test_hold_cb cb, void *ctx);
+
+/*
+ * Allocation-failure injection: the next allocation at the named point fails
+ * once (recording a refused chunk, re-homing it into an exact-size copy, or
+ * the redelivery snapshot). Exercises the adapter's own failure paths.
+ */
+enum {
+    MOQ_MVFST_TEST_FAIL_HOLD_RECORD = 1,
+    MOQ_MVFST_TEST_FAIL_HOLD_COPY = 2,
+    MOQ_MVFST_TEST_FAIL_REPLAY = 3
+};
+void moq_mvfst_test_fail_next(int which);
+
 #ifdef __cplusplus
 }
+
+#include <memory>
+namespace folly { class IOBuf; }
+namespace moq::mvfst { class adapter; }
+
+/*
+ * Deliver one read result (what mvfst's read(id, 0) would have returned) to
+ * an attach adapter for stream `stream_id`, through the same path as a real
+ * readAvailable. Lets a test choose the chunk, its FIN and its buffer shape
+ * (chain, oversized backing) deterministically over a live connection.
+ */
+void moq_mvfst_test_inject_uni_read(moq::mvfst::adapter *a, uint64_t stream_id,
+                                    std::unique_ptr<folly::IOBuf> buf, bool eof);
 #endif
 
 #endif /* MOQ_MVFST_MANAGED_TESTING_H */

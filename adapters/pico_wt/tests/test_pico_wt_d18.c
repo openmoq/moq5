@@ -14,6 +14,8 @@
  */
 
 #include "pico_wt_harness.h"
+#include "pico_wt_test_seam.h"
+#include "picoquic_internal.h"
 #include <moq/moq.h>
 
 #include <stdio.h>
@@ -27,6 +29,71 @@ static const char *scenario = "";
                 __LINE__, #cond); \
         failures++; \
     } } while (0)
+
+
+/* -- Peer-terminal observation ---------------------------------------- *
+ * The adapter (test build) reports every RESET/STOP_SENDING callback at
+ * its boundary. At the ENTRY of a RESET callback the native stream is still
+ * live, so picoquic's own record of the received code can be read there;
+ * after the exchange picoquic may already have deleted a fully closed
+ * stream, which makes a later getter read meaningless (it returns 0 for an
+ * unknown stream). Records are keyed by adapter connection, so client and
+ * server are told apart by identity. */
+typedef struct {
+    moq_pico_wt_conn_t *conn;
+    int      event;
+    int      phase;
+    uint64_t sid;
+    bool     stream_present;
+    uint64_t raw_code;        /* picoquic_get_remote_stream_error while live */
+    uint64_t mapped_code;     /* pico_wt_wt_err_to_moq(raw_code) */
+    bool     reset_received;
+    uint64_t reset_offset;    /* reliable prefix the RESET_STREAM_AT carried */
+} term_rec_t;
+#define TERM_MAX 64
+static term_rec_t g_term[TERM_MAX];
+static int g_term_n;
+static bool g_term_overflow;          /* sticky: the record is incomplete */
+static pico_wt_harness_t *g_term_h;
+
+static void term_observer(moq_pico_wt_conn_t *c, int event, uint64_t sid, int phase)
+{
+    if (event != (int)picohttp_callback_reset && event != (int)picohttp_callback_stop_sending) return;
+    if (g_term_n >= TERM_MAX) { g_term_overflow = true; return; }
+    picoquic_cnx_t *cnx = c == g_term_h->server_conn ? g_term_h->test_ctx->cnx_server
+                        : c == g_term_h->client_conn ? g_term_h->test_ctx->cnx_client : NULL;
+    term_rec_t *r = &g_term[g_term_n++];
+    memset(r, 0, sizeof(*r));
+    r->conn = c; r->event = event; r->phase = phase; r->sid = sid;
+    if (cnx == NULL) return;
+    picoquic_stream_head_t *st = picoquic_find_stream(cnx, sid);
+    r->stream_present = st != NULL;
+    r->raw_code = picoquic_get_remote_stream_error(cnx, sid);
+    r->mapped_code = pico_wt_wt_err_to_moq(r->raw_code);
+    if (st) { r->reset_received = st->reset_received != 0; r->reset_offset = st->reset_offset; }
+}
+static void term_install(pico_wt_harness_t *h)
+{
+    g_term_h = h; g_term_n = 0; g_term_overflow = false;
+    memset(g_term, 0, sizeof(g_term));
+    pw_test_callback_observer = term_observer;
+}
+static void term_remove(void) { pw_test_callback_observer = NULL; g_term_h = NULL; }
+
+/* Count RESET-entry records on `conn` for `sid`; the single match (if any)
+ * is copied to *out. */
+static int term_reset_entries(moq_pico_wt_conn_t *conn, uint64_t sid, term_rec_t *out)
+{
+    int n = 0;
+    for (int i = 0; i < g_term_n; i++) {
+        const term_rec_t *r = &g_term[i];
+        if (r->conn == conn && r->event == (int)picohttp_callback_reset && r->phase == 0 && r->sid == sid) {
+            if (n == 0 && out) *out = *r;
+            n++;
+        }
+    }
+    return n;
+}
 
 static int run_subscribe_object(pico_wt_harness_t *h, const char *tname)
 {
@@ -200,9 +267,11 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
     }
 
     /* Withdraw: draft-18 aborts the request bidi; the receiver sees DONE. */
+    term_install(h);
     DCHECK(moq_session_publish_namespace_done(h->client_session, ann,
                                               h->now) == MOQ_OK);
     pico_wt_harness_pump(h, 200);
+    term_remove();
 
     bool got_done = false;
     while (moq_session_poll_events(h->server_session, &ev, 1) > 0) {
@@ -217,18 +286,30 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
     DCHECK(!moq_pico_wt_conn_is_fatal(h->client_conn));
     DCHECK(!moq_pico_wt_conn_is_fatal(h->server_conn));
 
-    /* On-wire discrimination (draft-18 only): what the compliant peer sees. */
+    /* On-wire discrimination (draft-18 only): what the compliant peer saw,
+     * captured at the server's RESET callback while the stream was live. */
     if (is_d18) {
         uint64_t want = 0;
         DCHECK(pico_wt_moq_err_to_wt(0x1, &want));
-        uint64_t got_ann = picoquic_get_remote_stream_error(
-            h->test_ctx->cnx_server, ann_bidi);
-        uint64_t got_wtsession = picoquic_get_remote_stream_error(
-            h->test_ctx->cnx_server, h->server_conn->control_stream_id);
-        /* The abort lands on the request bidi with the WT-mapped code... */
-        DCHECK(got_ann == want);
-        /* ...and never touches the WT session (CONNECT) stream. */
-        DCHECK(got_wtsession == 0);
+        DCHECK(!g_term_overflow);                       /* complete record */
+        term_rec_t ann_reset;
+        memset(&ann_reset, 0, sizeof(ann_reset));
+        int n_ann = term_reset_entries(h->server_conn, ann_bidi, &ann_reset);
+        /* Exactly one RESET landed on the announce request bidi... */
+        DCHECK(n_ann == 1);
+        if (n_ann == 1) {
+            DCHECK(ann_reset.stream_present && ann_reset.reset_received);
+            /* ...carrying the WT-mapped CANCELLED code, which maps back to 0x1... */
+            DCHECK(ann_reset.raw_code == want);
+            DCHECK(ann_reset.mapped_code == 0x1);
+            /* ...as RESET_STREAM_AT with the WT preamble as its reliable prefix,
+             * exactly the size the client's endpoint recorded. */
+            DCHECK(ann_reset.reset_offset > 0 &&
+                   ann_reset.reset_offset ==
+                       h->client_conn->endpoint_ctx.last_reset_reliable_size);
+        }
+        /* ...and never touched the WT session (CONNECT) stream. */
+        DCHECK(term_reset_entries(h->server_conn, h->server_conn->control_stream_id, NULL) == 0);
 
         /* Genuine reliable-reset negotiation: both peers advertise
          * reset_stream_at and the attach path never synthesizes it, so the
@@ -278,9 +359,13 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
             /* drain the client's ACCEPTED */
             while (moq_session_poll_events(h->client_session, &ev, 1) > 0)
                 moq_event_cleanup(&ev);
+            uint64_t ann2_bidi = h->client_conn->last_opened_bidi_id;
+            DCHECK(ann2_bidi != ann_bidi && ann2_bidi != h->client_conn->control_stream_id);
+            term_install(h);
             DCHECK(moq_session_publish_namespace_done(
                 h->client_session, ann2, h->now) == MOQ_OK);
             pico_wt_harness_pump(h, 200);
+            term_remove();
             bool got_done2 = false;
             while (moq_session_poll_events(h->server_session, &ev, 1) > 0) {
                 if (ev.kind == MOQ_EVENT_NAMESPACE_DONE) got_done2 = true;
@@ -288,6 +373,20 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
             }
             DCHECK(got_done2);
             DCHECK(h->client_conn->endpoint_ctx.last_reset_reliable_size == 0);
+            /* The downgrade is a plain RESET_STREAM on the second announce
+             * bidi: same WT-mapped code, no reliable prefix, exactly one
+             * terminal, nothing on the WT session stream. */
+            DCHECK(!g_term_overflow);
+            term_rec_t ann2_reset;
+            memset(&ann2_reset, 0, sizeof(ann2_reset));
+            int n_ann2 = term_reset_entries(h->server_conn, ann2_bidi, &ann2_reset);
+            DCHECK(n_ann2 == 1);
+            if (n_ann2 == 1) {
+                DCHECK(ann2_reset.stream_present && ann2_reset.reset_received);
+                DCHECK(ann2_reset.raw_code == want && ann2_reset.mapped_code == 0x1);
+                DCHECK(ann2_reset.reset_offset == 0);
+            }
+            DCHECK(term_reset_entries(h->server_conn, h->server_conn->control_stream_id, NULL) == 0);
             DCHECK(!moq_pico_wt_conn_is_fatal(h->client_conn));
             DCHECK(!moq_pico_wt_conn_is_fatal(h->server_conn));
         }
@@ -299,6 +398,7 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
     local_failures += run_subscribe_object(h, "v2");
 
 done:
+    term_remove();
 #undef DCHECK
     return local_failures;
 }

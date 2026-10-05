@@ -3,6 +3,13 @@
 MoQ transport adapter over [wtquic](https://github.com/rwl4/wtquic), a standalone
 WebTransport-over-HTTP/3 library. Two layers ship here:
 
+**Current admission policy:** managed Network.framework creation and service
+connection return `MOQ_ERR_UNSUPPORTED` synchronously, before backend startup.
+Native Network receive pause does not satisfy LibMoQ's required bounded
+FLOW_CONTROLLED admission contract. The facade/lifecycle descriptions below
+describe retained mechanisms, not a currently reachable Network connection.
+Supported WT-MsQuic connections remain available with a qualified provider.
+
 - **Attach (`<moq/wtquic.h>`), backend-neutral** — the caller owns both the
   `moq_session_t` and the wtquic session; the adapter implements the
   transport-bridge endpoint ops on wtquic's public API and feeds wtquic's
@@ -112,6 +119,14 @@ destroyed only after the wtquic side is fully torn down
 
 ## Managed Network.framework client (Apple)
 
+**Current policy: unavailable for LibMoQ connections.** Valid public create
+calls return synchronous `MOQ_ERR_UNSUPPORTED` with NULL output, without
+allocation, callbacks or network startup. Endpoint selection propagates that
+result; it does not fall back to another backend. The final admission-qualified
+receive query is unsupported for Network; its native delivery-only pause
+semantics have not been relabeled or changed. The lifecycle description below
+documents retained mechanisms, not reachable successful public construction.
+
 `moq_wtquic_network_managed` (`<moq/wtquic_network_managed.h>`, macOS 13 / iOS 16+)
 is a managed MoQ **client** over wtquic's Network.framework backend —
 WebTransport only (not raw QUIC), one client connection, and NOT a
@@ -136,7 +151,7 @@ escape hatch: legal anywhere on the serial domain, including
 `moq_wtquic_network_managed_post()` closures — "on the domain" is deliberately
 broader than "inside the lane pump".
 
-It needs wtquic's **`network`** component in addition to `msquic`. The setup
+It needs wtquic's **`network`** component, not `msquic`. The setup
 script builds it by default on Apple (`WTQ_BUILD_NETWORK`, Apple-only). Configure
 libmoq with:
 
@@ -153,8 +168,13 @@ cmake --build build-wtquic
 `moq::adapter-wtquic-network-managed` (build tree) or
 `find_package(libmoq COMPONENTS adapter-wtquic-network-managed)`; a
 `libmoq-wtquic-network-managed.pc` is installed for pkg-config. `test_wtquic_network_managed`
-(labelled `network`) is the loopback + lifecycle suite; `consumer/main_network.c[pp]` are the
-packaging smokes. The create-time earliest-callback window is covered by composed proof,
+(labelled `wtquic`) now tests synchronous policy rejection, malformed config
+precedence, zero allocator/callback effects and repeated-call ownership without
+a server or certificates. `test_wtquic_network_managed_internal` remains a
+white-box deadline mechanism control, not a public connection proof.
+`consumer/main_network.c[pp]` are packaging smokes. Historical successful
+Network MoQ runtime receipts do not qualify the current policy.
+The retained create-time earliest-callback mechanism was covered by composed proof,
 not a single test here — wtquic's `t_earliest_callback_publication` proves the conn slot is
 published before create returns, and this facade passes that slot as `&m->conn` under its
 mutex (the deterministic seam lives in wtquic's never-installed `network-testing`
@@ -263,7 +283,30 @@ WebTransport path across 1200 B, 8 KiB and 64 KiB object sizes.
   datagrams are fed through).
 - No idle/deadline tick integration: timer-driven session closes
   (GOAWAY drain) need external service calls.
-- Held-buffer receive remains deferred in wtquic; inbound backpressure
-  uses wtquic's receive pause/resume.
+- Receive admission requires the strengthened wtquic runtime contract before
+  bridge creation. The qualified MsQuic provider uses effective peer stream
+  limits of eight uni and seven bidi, a 65535-byte callback quantum, and
+  FLOW_CONTROLLED receive pause. Old/accounted-only providers are unsupported.
+- The fixed engine pool permits twelve concurrent WT streams on a client and
+  six on a server, counting local and peer streams together. Other entries
+  preserve critical streams and complete request parser state. Additional WT
+  streams wait without a capacity-induced abort. Sixteen API/adapter records
+  are a separate limit: terminal input debt retains its stream lease until the
+  record retires. Native peer stream credit follows safe lease retirement,
+  not FIN alone. These limits do not bound all native or OS memory.
+- Adapter service invokes bounded provider admission only after bridge,
+  endpoint, replay and resume calls return. Attach callers must keep servicing
+  under their serialized lane, including when there are no incoming packets.
 - The wtquic dependency must be installed and discoverable — it is
   never vendored or built by this repository.
+# Managed Receive Policy
+
+The current LibMoQ receive policy requires FLOW_CONTROLLED. The Network
+backend truthfully provides DELIVERY_ONLY, so its managed constructor now
+returns `MOQ_ERR_UNSUPPORTED` synchronously for valid configurations, with
+NULL output and no allocation, network startup, or callbacks. The endpoint
+propagates this result without selecting another backend. This restriction
+does not indicate a Network provider failure. WT-MsQuic remains eligible;
+the real session must still pass runtime receive-contract qualification.
+Late establishment failures retain the existing generic terminal semantics,
+not a fabricated protocol error code or typed async unsupported result.

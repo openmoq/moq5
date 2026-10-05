@@ -475,6 +475,7 @@ static void nwm_established(wtq_session_t *s, wtq_str_t sub, void *user)
     moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
     ccfg.alloc = &m->alloc;
     ccfg.session = ms;
+    ccfg.wt_session = s;
     ccfg.hook = nwm_hook;
     ccfg.hook_user = m;
     moq_wtquic_conn_t *mc = NULL;
@@ -671,6 +672,34 @@ void moq_wtquic_network_managed_cfg_init_sized(
     cfg->struct_size = (uint32_t)n;
 }
 
+/* Validate borrowed tokens without copying or allocating before policy refusal. */
+static bool nwm_valid_offer(const char *p)
+{
+    const char *tokens[NW_MAX_OFFERS];
+    size_t lengths[NW_MAX_OFFERS];
+    size_t count = 0;
+    if (p == NULL)
+        return true;
+    for (;;) {
+        while (*p == ' ') p++;
+        const char *token = p;
+        while (*p && *p != ',' && *p != ' ') p++;
+        size_t len = (size_t)(p - token);
+        moq_version_t version;
+        if (!len || !moq_alpn_to_version(token, len, &version) ||
+            count == NW_MAX_OFFERS)
+            return false;
+        for (size_t i = 0; i < count; i++)
+            if (lengths[i] == len && memcmp(tokens[i], token, len) == 0)
+                return false;
+        tokens[count] = token;
+        lengths[count++] = len;
+        while (*p == ' ') p++;
+        if (*p == '\0') return true;
+        if (*p++ != ',') return false;
+    }
+}
+
 moq_result_t moq_wtquic_network_managed_create(
     const moq_wtquic_network_managed_cfg_t *cfg, moq_wtquic_network_managed_t **out)
 {
@@ -705,6 +734,15 @@ moq_result_t moq_wtquic_network_managed_create(
     }
     if (NWM_CFG_HAS(lane_count) && cfg->lane_count > 1)
         return MOQ_ERR_UNSUPPORTED;
+
+    if (!nwm_valid_offer(cfg->wt_protocols))
+        return MOQ_ERR_INVAL;
+
+    /* This fixed backend is DELIVERY_ONLY. The current adapter policy requires
+     * FLOW_CONTROLLED: reject before allocation or network startup, not as an
+     * asynchronous code-zero fatal. Retain the lifecycle implementation below
+     * for an eventual explicitly qualified policy, not an implicit fallback. */
+    return MOQ_ERR_UNSUPPORTED;
 
     moq_wtquic_network_managed_t *m =
         cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);
@@ -860,7 +898,8 @@ moq_result_t moq_wtquic_network_managed_create(
     pthread_mutex_unlock(&m->mu);
     if (wrc != WTQ_OK) {
         moq_result_t rc = wrc == WTQ_ERR_NOMEM ? MOQ_ERR_NOMEM
-                                               : MOQ_ERR_INTERNAL;
+            : wrc == WTQ_ERR_UNSUPPORTED ? MOQ_ERR_UNSUPPORTED
+            : MOQ_ERR_INTERNAL;
         moq_wtquic_network_managed_destroy(m);
         return rc;
     }

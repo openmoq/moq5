@@ -55,6 +55,36 @@ static moq_result_t pw_after_fin_service(moq_pico_wt_conn_t *c, uint64_t now)
 static void pw_rx_free_all(moq_pico_wt_conn_t *c);
 static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid);
 
+#ifdef MOQ_PICO_WT_TESTING
+#include "tests/pico_wt_test_seam.h"
+/* Test-build-only observers (never exported from the shipped library): the
+ * callback boundary of a stream event, a local STOP_SENDING the adapter
+ * issued, and a receive-credit grant that reached picoquic. */
+void (*pw_test_callback_observer)(moq_pico_wt_conn_t *, int, uint64_t, int) = NULL;
+void (*pw_test_local_stop_observer)(moq_pico_wt_conn_t *, uint64_t) = NULL;
+void (*pw_test_grant_observer)(moq_pico_wt_conn_t *, uint64_t, uint64_t) = NULL;
+#define PW_OBSERVE_CALLBACK(c, ev, sid, phase) \
+    do { if (pw_test_callback_observer) pw_test_callback_observer((c), (int)(ev), (sid), (phase)); } while (0)
+#define PW_OBSERVE_LOCAL_STOP(c, sid) \
+    do { if (pw_test_local_stop_observer) pw_test_local_stop_observer((c), (sid)); } while (0)
+#define PW_OBSERVE_GRANT(c, sid, n) \
+    do { if (pw_test_grant_observer) pw_test_grant_observer((c), (sid), (n)); } while (0)
+#else
+#define PW_OBSERVE_CALLBACK(c, ev, sid, phase) do { } while (0)
+#define PW_OBSERVE_LOCAL_STOP(c, sid) do { } while (0)
+#define PW_OBSERVE_GRANT(c, sid, n) do { } while (0)
+#endif
+#ifdef MOQ_PICO_WT_TESTING
+void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on)
+{
+    if (on)
+        conn->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
+    else
+        conn->endpoint_ops.capabilities &=
+            ~(uint32_t)MOQ_TRANSPORT_CAP_HOLD_INPUT;
+}
+#endif
+
 
 /* QUIC stream ID classification */
 #ifndef PICOQUIC_IS_BIDIR_STREAM_ID
@@ -73,6 +103,7 @@ static void on_local_stop_sending(void *ctx, uint64_t stream_id)
 {
     moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)ctx;
     if (!c) return;
+    PW_OBSERVE_LOCAL_STOP(c, stream_id);
     pw_rx_drop(c, stream_id);
 }
 
@@ -561,6 +592,7 @@ static int pw_rx_refresh_credit(moq_pico_wt_conn_t *c, pw_rx_stream_t *st)
     if (picoquic_open_flow_control(c->cnx, st->stream_id, headroom) != 0)
         return -1;
     st->granted = target;
+    PW_OBSERVE_GRANT(c, st->stream_id, headroom);
     return 0;
 }
 
@@ -616,6 +648,25 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
         st->blocked = len;
         if (fin) st->fin_blocked = true;
         /* service may clear it immediately; the sweep below resumes if so */
+        moq_transport_bridge_service(c->bridge, now);
+        pw_rx_after_service(c, now);
+        return moq_transport_bridge_is_fatal(c->bridge) ? -1 : 0;
+    }
+    if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+        /* Refused at admission: the bridge took nothing of this chunk (nor
+         * its FIN). Keep exactly this chunk under the stream's window budget
+         * and freeze the window; the post-service sweep redelivers it once
+         * the session can admit a stream again. Retention failure is the
+         * adapter's explicit failure contract, never a silent acceptance. */
+        if (!pw_rx_retain(c, st, bytes, len, fin)) {
+            moq_transport_bridge_on_transport_error(
+                c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
+            return -1;
+        }
+        st->paused = true;
+        st->held_input = true;
+        st->held_len = len;
+        st->held_fin = fin;
         moq_transport_bridge_service(c->bridge, now);
         pw_rx_after_service(c, now);
         return moq_transport_bridge_is_fatal(c->bridge) ? -1 : 0;
@@ -681,6 +732,46 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
              * (and a terminal bridge skips the sweep entirely). */
             pw_rx_drop(c, st->stream_id);
             continue;
+        }
+
+        if (st->held_input) {
+            /* Redeliver the refused chunk -- the same bytes and FIN flag, from
+             * the front of the retention buffer. Refused again (another stream
+             * took the entry first): keep the allocation, the accounting and
+             * the frozen window exactly as they are and wait for the next
+             * service pass. Accepted: the chunk leaves the buffer; whatever
+             * arrived behind it replays below through the ordinary path. */
+            size_t hl = st->held_len;
+            bool hfin = st->held_fin;
+            moq_result_t rc = pw_rx_feed(c, st, st->buf, hl, hfin, now);
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED)
+                continue;
+            st->held_input = false;
+            st->held_len = 0;
+            st->held_fin = false;
+            if (moq_transport_bridge_is_terminal(c->bridge))
+                return;
+            if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) {
+                moq_transport_bridge_on_transport_error(
+                    c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
+                return;
+            }
+            if (st->buf_len > hl)
+                memmove(st->buf, st->buf + hl, st->buf_len - hl);
+            st->buf_len -= hl;
+            if (st->buf_len == 0) {
+                c->alloc.free(st->buf, st->buf_cap, c->alloc.ctx);
+                st->buf = NULL;
+                st->buf_cap = 0;
+            }
+            if (rc == MOQ_ERR_WOULD_BLOCK) {
+                /* the session took it and retains it: bridge-owned now; the
+                 * bytes (and any FIN) queued behind it wait for the drain */
+                st->blocked = hl;
+                if (hfin) st->fin_blocked = true;
+                continue;
+            }
+            if (hfin) { pw_rx_drop(c, st->stream_id); continue; }  /* stream done */
         }
 
         if (st->buf_len > 0 || st->buf_fin) {
@@ -885,6 +976,7 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
     if (moq_transport_bridge_is_terminal(c->bridge)) return 0;
 
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+    PW_OBSERVE_CALLBACK(c, event, sid, 0);
 
     switch (event) {
     case picohttp_callback_connecting:
@@ -981,14 +1073,18 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
                 c->bridge, sid, 0, now);
             c->stop_sending_count++;
             c->last_stop_sending_stream_id = sid;
-            if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK)
+            if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) {
+                PW_OBSERVE_CALLBACK(c, event, sid, 1);
                 return -1;
+            }
             if (!moq_transport_bridge_is_terminal(c->bridge)) {
                 moq_transport_bridge_service(c->bridge, now);
                 pw_rx_after_service(c, now);
             }
-            if (moq_transport_bridge_is_terminal(c->bridge))
+            if (moq_transport_bridge_is_terminal(c->bridge)) {
+                PW_OBSERVE_CALLBACK(c, event, sid, 1);
                 return -1;
+            }
         }
         break;
     }
@@ -997,5 +1093,6 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
         break;
     }
 
+    PW_OBSERVE_CALLBACK(c, event, sid, 1);
     return 0;
 }

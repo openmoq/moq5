@@ -1785,6 +1785,14 @@ static moq_result_t d16_decode_fetch_cancel(
 
     moq_request_endpoint_t ep = request_registry_find_by_id(s, request_id);
     if (ep.kind != MOQ_REQ_FETCH) {
+        /* A cancel that crossed our own abort of that fetch: the id is no
+         * longer registered but is remembered in the bounded abort cache, so
+         * consume it (the reset already answered the request). Any other
+         * unknown id keeps failing closed. */
+        if (fetch_abort_tomb_consume(s, request_id)) {
+            *out_consumed = true;
+            return MOQ_OK;
+        }
         *out_consumed = true;
         return close_with_error(s, 0x4, "FETCH_CANCEL unknown request ID");
     }

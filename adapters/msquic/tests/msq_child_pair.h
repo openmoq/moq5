@@ -29,7 +29,7 @@
 #include "msquic_internal.h"
 
 #include "support/fake_msq_table.h"
-#include "support/fake_endpoint.h"
+#include "support/held_bridge_driver.h"
 
 #include <moq/msquic_managed.h>
 #include <moq/rcbuf.h>
@@ -218,7 +218,7 @@ static void relay(struct pair *p)
     }
     while (fake_msq_deliver_send_complete(&g_conn_fake, false))
         ;
-    (void)moq_transport_bridge_service(p->peer_bridge, 0);
+    (void)held_bridge_service(p->peer_bridge, 0);
 
     for (; p->peer_op_cur < p->peer_ep.count; p->peer_op_cur++) {
         fake_op_t *o = &p->peer_ep.ops[p->peer_op_cur];
@@ -291,12 +291,12 @@ static bool pair_up(struct pair *p, bool streaming_objects,
     scfg.initial_request_capacity = 16;
     if (moq_session_create(&scfg, 0, &p->peer) < 0)
         return false;
-    fake_endpoint_init(&p->peer_ep, 3, 1);
+    held_endpoint_init(&p->peer_ep, 3, 1);
 
     moq_transport_bridge_cfg_t bcfg;
 
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, p->peer, &p->peer_ep.vtable,
+    if (held_bridge_create(&bcfg, p->peer, &p->peer_ep.vtable,
                                     &p->peer_ep, &p->peer_bridge) != MOQ_OK)
         return false;
 
@@ -327,7 +327,7 @@ static void pair_down(struct pair *p)
         moq_msquic_managed_destroy(p->m);
     }
     if (p->peer_bridge != NULL)
-        moq_transport_bridge_destroy(p->peer_bridge);
+        held_bridge_destroy(p->peer_bridge);
     if (p->peer != NULL)
         moq_session_destroy(p->peer);
 }

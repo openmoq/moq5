@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# Historical .wtquicNetwork success proof, not a current qualification gate.
+# Current LibMoQ policy returns synchronous UNSUPPORTED; these old success
+# expectations do not apply. Run wtquic_network_managed and
+# endpoint_wtquic_network_smoke for the current public rejection contract.
+# Native WT Network provider qualification is separate and unchanged.
 # check_wtquic_network_runtime.sh - the .wtquicNetwork runtime proof.
 #
 # Network.framework does NOT establish connections inside an xctest host,

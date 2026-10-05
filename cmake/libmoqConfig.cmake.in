@@ -1,6 +1,7 @@
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
+include("${CMAKE_CURRENT_LIST_DIR}/MoqWtquicApi.cmake")
 
 set(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL @MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL@)
 macro(_libmoq_find_adapter_picoquic_deps)
@@ -114,7 +115,8 @@ endif()
 # transport backends are the consumer's choice (request wtquic's own
 # msquic/network components as needed).
 if("adapter-wtquic" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
-    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
+    moq_wtquic_component_preflight(adapter-wtquic)
+    if(NOT _libmoq_wt_api_ok OR NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake")
         set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic_FOUND FALSE)
     else()
         find_dependency(wtquic CONFIG)
@@ -126,7 +128,8 @@ endif()
 # Optional managed Network.framework client (Apple; loads the attach
 # adapter first when the consumer did not request it explicitly).
 if("adapter-wtquic-network-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
-    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicNetworkManagedTargets.cmake")
+    moq_wtquic_component_preflight(adapter-wtquic-network-managed)
+    if(NOT _libmoq_wt_api_ok OR NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicNetworkManagedTargets.cmake")
         set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-network-managed_FOUND FALSE)
     else()
         find_dependency(wtquic CONFIG COMPONENTS network)
@@ -141,7 +144,8 @@ endif()
 # Optional managed wtquic-over-MsQuic facade component (loads the attach
 # adapter first if the consumer did not request it explicitly).
 if("adapter-wtquic-msquic-managed" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
-    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicMsquicManagedTargets.cmake")
+    moq_wtquic_component_preflight(adapter-wtquic-msquic-managed)
+    if(NOT _libmoq_wt_api_ok OR NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicMsquicManagedTargets.cmake")
         set(${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-msquic-managed_FOUND FALSE)
     else()
         find_dependency(wtquic CONFIG COMPONENTS msquic)
@@ -236,7 +240,8 @@ endif()
 # before marking it found; moq::core / moq::msf / media come from the main
 # libmoqTargets export already loaded above.
 if("service" IN_LIST ${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)
-    if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake")
+    moq_wtquic_component_preflight(service)
+    if(NOT _libmoq_wt_api_ok OR NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake")
         set(${CMAKE_FIND_PACKAGE_NAME}_service_FOUND FALSE)
     else()
         find_dependency(Threads)
@@ -363,7 +368,7 @@ foreach(_libmoq_comp ${${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS})
         list(APPEND _libmoq_missing ${_libmoq_comp})
     endif()
 endforeach()
-if(_libmoq_missing)
+if(_libmoq_missing AND NOT ${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE)
     set(${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE
         "missing required libmoq component(s): ${_libmoq_missing}")
 endif()

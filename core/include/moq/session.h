@@ -399,11 +399,16 @@ MOQ_API moq_result_t moq_session_tick(moq_session_t *s, uint64_t now_us);
  * buf is borrowed for the duration of this call only. fin == true
  * means the stream has been cleanly closed after these bytes.
  *
- * Returns MOQ_ERR_WOULD_BLOCK if an event or action queue is full.
- * The caller should drain the full queue and then retry with:
- *   moq_session_on_data_bytes(s, stream_ref, NULL, 0, false, now_us)
- * This retries any pending emission for the stream and is a no-op
- * for unknown stream_refs.
+ * Returns MOQ_ERR_WOULD_BLOCK in two distinguishable cases:
+ *   - the session OWNS the stream (moq_session_has_transport_stream is
+ *     true): the bytes (and FIN) were retained; drain the full queue and
+ *     retry with
+ *       moq_session_on_data_bytes(s, stream_ref, NULL, 0, false, now_us)
+ *     which resumes the pending emission for the stream;
+ *   - the session does NOT own the stream (a new stream it could not
+ *     admit): nothing was retained; the caller must redeliver the SAME
+ *     bytes and FIN later (an empty retry on an unknown ref is a no-op).
+ *     moq_session_can_admit_data_stream() says when that is worthwhile.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -833,6 +838,25 @@ typedef uint32_t moq_event_kind_t;
 #define MOQ_EVENT_SUBSCRIPTION_UPDATE_OK     47u
 #define MOQ_EVENT_PUBLICATION_UPDATE_OK      48u
 #define MOQ_EVENT_SUBGROUP_RESET             49u
+/*
+ * Fetcher-side request-local stream terminal: the peer abruptly terminated a
+ * stream of an identified, uncompleted FETCH -- its response data stream
+ * (data_stream = true, always a RESET_STREAM) or, on stream-correlated request
+ * profiles, its request stream (data_stream = false; stop_sending tells
+ * STOP_SENDING from RESET_STREAM). RESET names the terminal category, not a
+ * claim that every input was RESET_STREAM. error_code is the peer's QUIC
+ * STREAM application error code exactly as received; it is NOT a MoQT
+ * request error. Terminal: the fetch handle is retired before this event is
+ * polled (later cancel/use -> MOQ_ERR_STALE_HANDLE); objects queued earlier
+ * for the same handle remain pollable. Emitted exactly once per fetch and
+ * never after a FETCH_ERROR, REQUEST_REDIRECT or FETCH_COMPLETE for the same
+ * handle. A data-stream reset is attributed only through the FETCH_HEADER the
+ * stream presented: a reset data stream whose header never arrived carries no
+ * request identity, so nothing is invented and nothing is reported for it.
+ * The request-stream terminal needs no data header: it is attributed by the
+ * request stream itself and may arrive before any data.
+ */
+#define MOQ_EVENT_FETCH_RESET                50u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -1329,6 +1353,14 @@ typedef struct moq_fetch_complete_event {
     moq_fetch_t fetch;
 } moq_fetch_complete_event_t;
 
+typedef struct moq_fetch_reset_event {
+    moq_fetch_t fetch;
+    uint64_t    error_code;    /* peer STREAM application error code */
+    bool        data_stream;   /* true: response data stream; false: request stream */
+    bool        stop_sending;  /* request stream only: STOP_SENDING rather than RESET_STREAM */
+    uint8_t     _pad[6];
+} moq_fetch_reset_event_t;
+
 typedef enum moq_fetch_range_kind {
     MOQ_FETCH_RANGE_NON_EXISTENT = 1,
     MOQ_FETCH_RANGE_UNKNOWN      = 2,
@@ -1653,6 +1685,7 @@ typedef struct moq_event {
         moq_subscribe_tracks_cancelled_event_t subscribe_tracks_cancelled;
         moq_subgroup_finished_event_t          subgroup_finished;
         moq_subgroup_reset_event_t             subgroup_reset;
+        moq_fetch_reset_event_t                fetch_reset;
         uint8_t                     _reserved[MOQ_EVENT_DETAIL_MAX];
     } u;
 } moq_event_t;
@@ -2196,6 +2229,35 @@ MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
 MOQ_API moq_result_t moq_session_end_fetch(
     moq_session_t *s,
     moq_fetch_t fetch,
+    uint64_t now_us);
+
+/*
+ * Abort an ACCEPTED fetch whose data stream has been opened, without
+ * completing it: queues a request-local RESET of that fetch's data stream
+ * carrying `error_code` and retires the publisher-side fetch handle.
+ * Publisher side. Advancing call. Nothing else is touched: the session stays
+ * open, no FIN is sent, no subscription is retired, and no peer-facing
+ * cancellation event is fabricated. The peer observes a reset data stream
+ * instead of a completed one.
+ *
+ * `error_code` is a QUIC STREAM reset application error code (draft-16
+ * section 10.4.3 / draft-18 section 3.3.3, e.g. INTERNAL_ERROR 0x0), not a
+ * MoQT request or session error; it must lie within the transport's
+ * representable application error range (MOQ_ERR_INVAL otherwise).
+ *
+ * A fetch that is still pending (not yet accepted) is refused
+ * (MOQ_ERR_WRONG_STATE): reject it with moq_session_reject_fetch instead. A
+ * fetcher-role handle is likewise MOQ_ERR_WRONG_STATE. Every required action
+ * (and, on stream-correlated profiles, the request-stream drain slot that
+ * absorbs the peer's late FIN) is reserved before any state changes:
+ * MOQ_ERR_WOULD_BLOCK leaves the fetch, previously queued actions and the
+ * handle exactly as they were, so the call is retried unchanged. After
+ * MOQ_OK the handle is retired: any later use is MOQ_ERR_STALE_HANDLE.
+ */
+MOQ_API moq_result_t moq_session_abort_fetch(
+    moq_session_t *s,
+    moq_fetch_t fetch,
+    uint64_t error_code,
     uint64_t now_us);
 
 /*
@@ -3067,15 +3129,35 @@ MOQ_API moq_result_t moq_session_end_object(
 MOQ_API uint64_t moq_session_next_deadline_us(const moq_session_t *s);
 
 /*
- * Transport-adapter support: returns true if the session has retained
- * receive state for a data stream (uni) or bidi stream with the given
- * ref. Adapters call this after MOQ_ERR_WOULD_BLOCK to distinguish
- * post-retention (empty retry safe) from pre-retention (bytes not
- * retained, adapter must go fatal).
+ * Transport-adapter support: returns true if the session owns the
+ * transport stream with the given ref -- it holds receive state for a
+ * peer data stream (uni), including one it has STOPped and is consuming
+ * until the peer's FIN/RESET, or owns a bidi request stream. Adapters
+ * call this after MOQ_ERR_WOULD_BLOCK to distinguish post-retention
+ * (the bytes were retained; an empty retry is safe) from pre-retention
+ * (nothing retained). What an unowned refusal means depends on the input.
+ * For a peer uni data stream the session will never parse that stream
+ * (its receive entries and stopped-identity records are exhausted); the
+ * transport bridge discards the stream's remainder until the peer's
+ * FIN/RESET. That is the current measured behaviour, not a lifecycle
+ * guarantee: a discarded stream answering a live FETCH leaves the request
+ * without a terminal. For a bidi request stream the bridge treats it as
+ * fatal. Control bytes are always retained by the session on WOULD_BLOCK.
  * Observing (does not invalidate borrows).
  */
 MOQ_API bool moq_session_has_transport_stream(const moq_session_t *s,
                                                moq_stream_ref_t ref);
+
+/*
+ * Transport-adapter support: true if the session could admit a NEW peer
+ * data stream now (a receive entry is free). Advisory observation, not a
+ * reservation: another stream may take the entry before the caller's next
+ * input, which is then refused the same way again. Reports true when the
+ * session is no longer active so that inputs still reach its terminal
+ * path (closed/fatal outcomes are never hidden behind capacity).
+ * Observing (does not invalidate borrows).
+ */
+MOQ_API bool moq_session_can_admit_data_stream(const moq_session_t *s);
 
 #ifdef __cplusplus
 }

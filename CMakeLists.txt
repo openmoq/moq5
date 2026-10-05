@@ -248,7 +248,33 @@ if(MOQ_BUILD_ADAPTER_WTQUIC)
             "or -DWTQ_MSQUIC_ROOT=<MsQuic source with build/bin library>. "
             "See scripts/setup_msquic_deps.sh and scripts/setup_wtquic_deps.sh.")
     endif()
+    include(cmake/MoqWtquicApi.cmake)
+    moq_check_wtquic_api(_moq_wt_api_ok _moq_wt_api_reason)
+    if(NOT _moq_wt_api_ok)
+        message(FATAL_ERROR "${_moq_wt_api_reason}")
+    endif()
     add_subdirectory(adapters/wtquic)
+    if(MOQ_BUILD_TESTS)
+        set(_wt_probe_context)
+        foreach(_v CMAKE_TOOLCHAIN_FILE CMAKE_C_COMPILER CMAKE_CXX_COMPILER
+                   CMAKE_C_FLAGS CMAKE_CXX_FLAGS CMAKE_EXE_LINKER_FLAGS
+                   CMAKE_OSX_SYSROOT CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET
+                   CMAKE_SYSROOT CMAKE_SYSTEM_NAME CMAKE_SYSTEM_PROCESSOR)
+            if(_v MATCHES "^CMAKE_SYSTEM_(NAME|PROCESSOR)$" AND NOT CMAKE_CROSSCOMPILING)
+                continue()
+            endif()
+            if(DEFINED ${_v} AND NOT "${${_v}}" STREQUAL "")
+                string(REPLACE ";" "\\;" _value "${${_v}}")
+                list(APPEND _wt_probe_context "-D${_v}=${_value}")
+            endif()
+        endforeach()
+        add_test(NAME wtquic_api_discovery COMMAND "${CMAKE_COMMAND}"
+            "-DMOQ_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/wtquic-api-discovery"
+            "-DGENERATOR=${CMAKE_GENERATOR}" ${_wt_probe_context}
+            "-DCONFIG=$<CONFIG>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/wtquic_api_discovery.cmake")
+    endif()
 endif()
 
 if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED AND NOT MOQ_BUILD_ADAPTER_WTQUIC)
@@ -370,6 +396,7 @@ write_basic_package_version_file(
 
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/cmake-install/libmoqConfig.cmake
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/MoqWtquicApi.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/libmoqConfigVersion.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayComponents.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
@@ -569,7 +596,8 @@ export(EXPORT libmoqTargets
     NAMESPACE moq::
     FILE ${CMAKE_CURRENT_BINARY_DIR}/libmoqTargets.cmake)
 
-set(_build_tree_config "include(CMakeFindDependencyMacro)\n")
+configure_file(cmake/MoqWtquicApi.cmake MoqWtquicApi.cmake COPYONLY)
+set(_build_tree_config "include(CMakeFindDependencyMacro)\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/MoqWtquicApi.cmake\")\n")
 string(APPEND _build_tree_config
     "set(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL ${MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL})\n"
     "macro(_libmoq_find_adapter_picoquic_deps)\n"
@@ -671,10 +699,34 @@ if(MOQ_BUILD_ADAPTER_WTQUIC)
         "  if(NOT wtquic_DIR)\n"
         "    set(wtquic_DIR \"${wtquic_DIR}\")\n"
         "  endif()\n"
-        "  find_dependency(wtquic CONFIG COMPONENTS msquic)\n"
+        "  moq_wtquic_component_preflight(adapter-wtquic)\n"
+        "  if(_libmoq_wt_api_ok)\n"
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic_FOUND TRUE)\n"
+        "  endif()\n"
         "endif()\n")
+    foreach(_backend network msquic)
+        if(_backend STREQUAL "network")
+            set(_wt_export Network)
+        else()
+            set(_wt_export Msquic)
+        endif()
+        string(APPEND _build_tree_config
+            "if(\"adapter-wtquic-${_backend}-managed\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS AND EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquic${_wt_export}ManagedTargets.cmake\")\n"
+            "  if(NOT wtquic_DIR)\n"
+            "    set(wtquic_DIR \"${wtquic_DIR}\")\n"
+            "  endif()\n"
+            "  moq_wtquic_component_preflight(adapter-wtquic-${_backend}-managed)\n"
+            "  if(_libmoq_wt_api_ok)\n"
+            "    find_dependency(wtquic CONFIG COMPONENTS ${_backend})\n"
+            "    if(NOT TARGET moq::adapter-wtquic)\n"
+            "      include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake\")\n"
+            "    endif()\n"
+            "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquic${_wt_export}ManagedTargets.cmake\")\n"
+            "    set(\${CMAKE_FIND_PACKAGE_NAME}_adapter-wtquic-${_backend}-managed_FOUND TRUE)\n"
+            "  endif()\n"
+            "endif()\n")
+    endforeach()
 endif()
 if(MOQ_BUILD_ADAPTER_MSQUIC)
     # Build trees are not relocatable, so the MsQuic discovery this
@@ -744,6 +796,11 @@ endif()
 if(MOQ_BUILD_SERVICE)
     string(APPEND _build_tree_config
         "if(\"service\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
+        "  if(NOT wtquic_DIR AND \"${MOQ_BUILD_ADAPTER_WTQUIC}\")\n"
+        "    set(wtquic_DIR \"${wtquic_DIR}\")\n"
+        "  endif()\n"
+        "  moq_wtquic_component_preflight(service)\n"
+        "  if(_libmoq_wt_api_ok)\n"
         "  find_dependency(Threads)\n"
         "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
         "  if(NOT TARGET moq::adapter-picoquic-threaded AND\n"
@@ -813,9 +870,25 @@ if(MOQ_BUILD_SERVICE)
             "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake\")\n"
             "  endif()\n")
     endif()
+    foreach(_backend network msquic)
+        if(_backend STREQUAL "network")
+            set(_wt_export Network)
+        else()
+            set(_wt_export Msquic)
+        endif()
+        string(APPEND _build_tree_config
+            "  if(EXISTS \"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquic${_wt_export}ManagedTargets.cmake\")\n"
+            "    find_dependency(wtquic CONFIG COMPONENTS ${_backend})\n"
+            "    if(NOT TARGET moq::adapter-wtquic)\n"
+            "      include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake\")\n"
+            "    endif()\n"
+            "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquic${_wt_export}ManagedTargets.cmake\")\n"
+            "  endif()\n")
+    endforeach()
     string(APPEND _build_tree_config
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_service_FOUND TRUE)\n"
+        "  endif()\n"
         "endif()\n")
 endif()
 if(MOQ_BUILD_RELAY_CORE)
@@ -835,7 +908,9 @@ string(APPEND _build_tree_config
     "  if(NOT \${CMAKE_FIND_PACKAGE_NAME}_\${_libmoq_comp}_FOUND)\n"
     "    if(\${CMAKE_FIND_PACKAGE_NAME}_FIND_REQUIRED_\${_libmoq_comp})\n"
     "      set(\${CMAKE_FIND_PACKAGE_NAME}_FOUND FALSE)\n"
-    "      set(\${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE \"Required component '\${_libmoq_comp}' not found\")\n"
+    "      if(NOT \${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE)\n"
+    "        set(\${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE \"Required component '\${_libmoq_comp}' not found\")\n"
+    "      endif()\n"
     "    endif()\n"
     "  endif()\n"
     "endforeach()\n")

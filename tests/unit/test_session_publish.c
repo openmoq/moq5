@@ -3829,6 +3829,128 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(alloc_state.balance, 0);
     }
 
+    /* == Stale binding: a FIN arriving with the refused STOP is kept ====== *
+     * A subgroup stream bound (§9.4, early objects) to a still-pending
+     * inbound PUBLISH; the app rejects the PUBLISH, which frees the
+     * publication while the stream is open. The next delivery on that stream
+     * finds its binding gone: its FIN is latched before the STOP is tried;
+     * the STOP is refused (the action queue holds the PUBLISH_ERROR); draining
+     * the queue issues exactly one STOP and the latched FIN releases the entry
+     * at once with nothing retained -- not a completion. */
+    {
+        test_alloc_state_t alloc_state = {0};
+        moq_alloc_t alloc = test_allocator(&alloc_state);
+        moq_session_t *c = NULL, *sv = NULL;
+        moq_session_cfg_t s_extra = MOQ_SESSION_CFG_INIT;
+        s_extra.max_actions = 1;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, &s_extra);
+        { moq_action_t a; while (moq_session_poll_actions(sv, &a, 1) > 0) moq_action_cleanup(&a); }
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        moq_namespace_t ns = { ns_parts, 1 };
+        uint8_t pub_buf[128];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, pub_buf, sizeof(pub_buf));
+        moq_d16_publish_t wire_pub;
+        memset(&wire_pub, 0, sizeof(wire_pub));
+        wire_pub.request_id = 0;
+        wire_pub.track_namespace = ns;
+        wire_pub.track_name = MOQ_BYTES_LITERAL("t");
+        wire_pub.track_alias = 50;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d16_encode_publish(&w, &wire_pub), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_control_bytes(sv, pub_buf, moq_buf_writer_offset(&w), 1000),
+                              (int)MOQ_OK);
+        moq_event_t ev;
+        moq_publication_t sv_pub = { 0 };
+        bool got_req = false;
+        while (moq_session_poll_events(sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_PUBLISH_REQUEST) { got_req = true; sv_pub = ev.u.publish_request.pub; }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got_req);
+
+        /* The stream's header and first object bind it to the pending
+         * publication; the object surfaces. */
+        const uint64_t REF = 61;
+        uint8_t sg[128];
+        moq_buf_writer_t sw;
+        moq_buf_writer_init(&sw, sg, sizeof(sg));
+        moq_d16_subgroup_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.type = 0x14;
+        hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
+        hdr.track_alias = 50;
+        hdr.publisher_priority = 128;
+        moq_d16_encode_subgroup_header(&sw, &hdr);
+        moq_d16_encode_object_fields(&sw, 0, 5, (const uint8_t *)"hello");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_bytes(sv, moq_stream_ref_from_u64(REF), sg,
+                                                             moq_buf_writer_offset(&sw), false, 1000), (int)MOQ_OK);
+        int objs = 0;
+        while (moq_session_poll_events(sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) objs++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(objs, 1);
+        int slot = -1;
+        for (size_t i = 0; i < sv->rx_cap; i++)
+            if (sv->rx_streams[i].active && sv->rx_streams[i].stream_ref._v == REF) slot = (int)i;
+        MOQ_TEST_CHECK(slot >= 0 && moq_publication_is_valid(sv->rx_streams[slot].pub_handle));
+
+        /* Reject: the publication is freed; its PUBLISH_ERROR fills the
+         * 1-deep action queue. */
+        moq_reject_publish_cfg_t rej;
+        moq_reject_publish_cfg_init(&rej);
+        rej.error_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_reject_publish(sv, sv_pub, &rej, 1001), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_action_capacity(sv), (size_t)0);
+
+        /* The next object arrives WITH the FIN: binding gone, STOP refused,
+         * the FIN latched on the retained entry. */
+        uint8_t more[64];
+        moq_buf_writer_t mw;
+        moq_buf_writer_init(&mw, more, sizeof(more));
+        moq_d16_encode_object_fields(&mw, 1, 5, (const uint8_t *)"world");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_bytes(sv, moq_stream_ref_from_u64(REF), more,
+                                                             moq_buf_writer_offset(&mw), true, 1002),
+                              (int)MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK(moq_session_has_transport_stream(sv, moq_stream_ref_from_u64(REF)));
+        MOQ_TEST_CHECK(sv->rx_streams[slot].active && sv->rx_streams[slot].parse_state == MOQ_RX_NEED_STOP);
+        MOQ_TEST_CHECK(sv->rx_streams[slot].pending_fin);
+        objs = 0;
+        while (moq_session_poll_events(sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) objs++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(objs, 0);   /* nothing emitted against the stale handle */
+
+        /* Draining the queue returns capacity: one STOP, the entry released
+         * by its latched FIN, no retained input or payload. */
+        int stops = 0, others = 0;
+        moq_action_t acts[4];
+        size_t n;
+        while ((n = moq_session_poll_actions(sv, acts, 4)) > 0) {
+            for (size_t i = 0; i < n; i++) {
+                if (acts[i].kind == MOQ_ACTION_STOP_DATA && acts[i].u.stop_data.stream_ref._v == REF) stops++;
+                else others++;
+                moq_action_cleanup(&acts[i]);
+            }
+        }
+        MOQ_TEST_CHECK_EQ_INT(stops, 1);
+        MOQ_TEST_CHECK_EQ_INT(others, 1);     /* the PUBLISH_ERROR */
+        MOQ_TEST_CHECK(!sv->rx_streams[slot].active);
+        MOQ_TEST_CHECK(!moq_session_has_transport_stream(sv, moq_stream_ref_from_u64(REF)));
+        MOQ_TEST_CHECK_EQ_SIZE(sv->recv_input_bytes, (size_t)0);
+        MOQ_TEST_CHECK_EQ_SIZE(sv->recv_payload_bytes, (size_t)0);
+        /* The transport FIN is remembered: later bytes are data after FIN. */
+        (void)moq_session_on_data_bytes(sv, moq_stream_ref_from_u64(REF), more, moq_buf_writer_offset(&mw),
+                                        false, 1003);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(sv), (int)MOQ_SESS_CLOSED);
+
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK_EQ_INT(alloc_state.balance, 0);
+    }
+
     MOQ_TEST_PASS("test_session_publish");
     return failures ? 1 : 0;
 }

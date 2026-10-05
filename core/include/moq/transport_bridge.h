@@ -101,14 +101,46 @@
  *     and SHOULD call service() promptly to allow retry. Pausing keeps
  *     the retry cheap (the session replays its own retained input via an
  *     empty-data retry rather than re-buffering).
- *   - MAY nonetheless deliver more bytes for the stream while it is still
- *     pending: the bridge appends them to the session's retained input
- *     when the session still owns the stream, or discards the remainder
- *     (until FIN) if the session has dropped or refused it. Delivering
- *     more bytes is therefore safe, just less efficient than pausing.
- *     Use moq_transport_bridge_stream_has_pending() to check per-stream
- *     status after service() returns.
+ *   - MAY nonetheless deliver more bytes for a RETAINED-input stream while
+ *     it is still pending: the bridge appends them to the session's retained
+ *     input when the session still owns the stream, or discards the
+ *     remainder (until FIN) if the session has dropped it. Delivering more
+ *     bytes is therefore safe for that case, just less efficient than
+ *     pausing. Use moq_transport_bridge_stream_has_pending() to check
+ *     per-stream status after service() returns.
  * Datagrams: WOULD_BLOCK means silently dropped, no retry.
+ *
+ * -- Inbound admission contract (MOQ_TRANSPORT_CAP_HOLD_INPUT) --
+ *
+ * A NEW peer unidirectional data stream (one the session does not own yet)
+ * may arrive while the session has no free receive entry. HOLD_INPUT is
+ * required at bridge creation for every endpoint, including publishers.
+ * Missing support returns MOQ_ERR_UNSUPPORTED before allocation or endpoint
+ * calls (after argument/vtable validation). There is no send-only exemption.
+ * This is a lifetime contract; changing the vtable cannot withdraw it.
+ * on_peer_uni_bytes/_rcbuf may return MOQ_ERR_INPUT_NOT_CONSUMED:
+ *   - ZERO bytes of that call's chunk were consumed, and its FIN was not
+ *     taken. Any leading bytes accepted on PREVIOUS calls (the stream-type
+ *     prefix the bridge classifies with) stay bridge-owned and are replayed
+ *     by the bridge itself; the adapter never resends them.
+ *   - The adapter keeps that exact chunk (same bytes, same FIN flag) and
+ *     delivers nothing newer on the stream. The stream reports pending via
+ *     moq_transport_bridge_stream_has_pending() until a service() pass
+ *     observes that the session can admit a stream again; the adapter then
+ *     redelivers the held chunk. Admission is not reserved: another stream
+ *     may take the entry first, in which case the redelivery is refused the
+ *     same way, losslessly. Readiness (pending cleared) does not end the
+ *     obligation: until the held chunk is accepted, a FIN-only delivery on
+ *     the stream is refused too -- the FIN belongs with the held chunk and
+ *     cannot overtake its bytes (a refused chunk that itself carried zero
+ *     bytes and the FIN is simply redelivered as such). The obligation ends
+ *     with the chunk's acceptance, a peer RESET, or bridge teardown.
+ *   - A peer RESET of a pending stream retires it; the adapter drops the
+ *     held chunk. Bridge close/fatal/destroy retires every pending stream;
+ *     held chunks are then dropped by the adapter.
+ * MOQ_ERR_INPUT_NOT_CONSUMED is never returned for control or bidi input,
+ * and never reinterprets
+ * MOQ_ERR_WOULD_BLOCK (retained input).
  */
 
 #include "export.h"
@@ -135,6 +167,9 @@ typedef enum moq_transport_result {
 typedef enum moq_transport_cap {
     MOQ_TRANSPORT_CAP_DATAGRAM      = 1u << 0,
     MOQ_TRANSPORT_CAP_WRITE_PAYLOAD = 1u << 1,
+    /* The adapter can HOLD an inbound peer uni data chunk the bridge did not
+     * consume (see "Inbound admission contract" below) and redeliver it. */
+    MOQ_TRANSPORT_CAP_HOLD_INPUT    = 1u << 2,
 } moq_transport_cap_t;
 
 /* -- Endpoint ops vtable -------------------------------------------- */
@@ -327,7 +362,10 @@ MOQ_API moq_result_t moq_transport_bridge_service(
  * Return value: MOQ_OK on success. MOQ_ERR_WOULD_BLOCK means the
  * bridge has retained internal retry state; the adapter MUST NOT
  * deliver more bytes for that stream until service() clears it.
- * Negative values other than WOULD_BLOCK indicate fatal errors.
+ * MOQ_ERR_INPUT_NOT_CONSUMED (peer uni data, MOQ_TRANSPORT_CAP_HOLD_INPUT
+ * endpoints only) means the chunk was not taken: hold it and redeliver it
+ * when the stream's pending state clears (see the admission contract
+ * above). Negative values other than these two indicate fatal errors.
  */
 
 /*

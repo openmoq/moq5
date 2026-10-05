@@ -69,6 +69,18 @@ struct moq_msq_stream {
                                   the pending-causing receive is accepted
                                   in full, so paused can be set without
                                   MsQuic being disabled yet. */
+    bool held_input;           /* the bridge did not consume this stream's
+                                  last fed buffer (MOQ_ERR_INPUT_NOT_CONSUMED):
+                                  that buffer and everything after it stay
+                                  with MsQuic (accepted length excludes
+                                  them) until the bridge accepts the
+                                  redelivery; paused + recv_disabled hold
+                                  the stream meanwhile */
+    bool fin_held;             /* the peer's FIN arrived (a zero-byte FIN
+                                  receive or PEER_SEND_SHUTDOWN) while
+                                  held_input: MsQuic cannot hold a bare
+                                  FIN, so the adapter owns it and feeds it
+                                  once the held bytes are accepted */
 };
 
 /* One accepted datagram send: the bridge's datagram contract is
@@ -207,6 +219,12 @@ void moq_msquic_test_flush(moq_msquic_conn_t *conn);
 QUIC_STREAM_CALLBACK_HANDLER moq_msquic_test_stream_callback(void);
 struct moq_msq_stream *moq_msquic_test_stream_find(moq_msquic_conn_t *conn,
                                                    uint64_t id);
+/* Declare (or withdraw) MOQ_TRANSPORT_CAP_HOLD_INPUT on the connection's
+ * endpoint ops after create, so a test can drive the bridge's not-consumed
+ * result against the receive path on its own terms. */
+void moq_msquic_test_set_hold_input(moq_msquic_conn_t *conn, bool on);
+/* The connection's bridge, for ownership queries in tests. */
+moq_transport_bridge_t *moq_msquic_test_bridge(moq_msquic_conn_t *conn);
 #endif
 
 #endif /* MOQ_MSQUIC_INTERNAL_H */

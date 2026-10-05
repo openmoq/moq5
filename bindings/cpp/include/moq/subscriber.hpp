@@ -205,7 +205,7 @@ struct sub_fetch_config {
     uint64_t       start_object = 0;
     uint64_t       end_group    = 0;
     uint64_t       end_object   = 0;
-    group_order    group_order  = group_order::default_order;
+    moq::group_order group_order = moq::group_order::default_order;
     bool           has_subscriber_priority = false;
     uint8_t        subscriber_priority     = 128;
     std::span<const moq_auth_token_t> auth_tokens = {};
@@ -215,7 +215,7 @@ struct sub_joining_fetch_config {
     subscriber_track track;
     bool             relative         = false;
     uint64_t         joining_start    = 0;
-    group_order      group_order      = group_order::default_order;
+    moq::group_order group_order      = moq::group_order::default_order;
     bool             has_subscriber_priority = false;
     uint8_t          subscriber_priority     = 128;
 };
@@ -302,6 +302,12 @@ public:
     }
     uint64_t gap_group_id() const noexcept { return item_.u.gap.group_id; }
     uint64_t gap_object_id() const noexcept { return item_.u.gap.object_id; }
+
+    // kind() == reset: the peer's STREAM error code (not a request error) and
+    // which stream of the fetch carried the terminal.
+    uint64_t reset_error_code() const noexcept { return item_.u.reset.error_code; }
+    bool     reset_data_stream() const noexcept { return item_.u.reset.data_stream; }
+    bool     reset_stop_sending() const noexcept { return item_.u.reset.stop_sending; }
 
     const moq_sub_fetch_item_t &raw() const noexcept { return item_; }
 };

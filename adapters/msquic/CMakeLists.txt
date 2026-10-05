@@ -35,6 +35,11 @@ set_target_properties(moq-adapter-msquic PROPERTIES
     C_VISIBILITY_PRESET hidden
     POSITION_INDEPENDENT_CODE ON
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Own the sibling core lookup, not the external provider lookup.
+    # Normal CMAKE_SKIP_*RPATH controls still apply.
+    set_property(TARGET moq-adapter-msquic APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(moq-adapter-msquic PRIVATE
         -Wall -Wextra -Wpedantic
@@ -227,6 +232,34 @@ if(MOQ_BUILD_TESTS)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME msquic_close_feed COMMAND test_msquic_close_feed)
+
+    # Receive admission over the fake API table: a raw server session relayed
+    # against the production adapter, proving the accepted-prefix accounting
+    # for a chunk the bridge did not consume (MOQ_TRANSPORT_CAP_HOLD_INPUT),
+    # the held FIN, retirement and teardown -- one thread, no socket.
+    add_executable(test_msquic_hold_input
+        tests/test_msquic_hold_input.c
+        tests/support/fake_msq_table.c
+        msquic_adapter.c)
+    target_include_directories(test_msquic_hold_input PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+        ${CMAKE_SOURCE_DIR}/tests/unit)
+    target_compile_definitions(test_msquic_hold_input PRIVATE
+        MOQ_MSQUIC_TESTING MOQ_BUILDING)
+    target_link_libraries(test_msquic_hold_input PRIVATE
+        moq-core-test-internals msquic::msquic)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_msquic_hold_input PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msquic_hold_input COMMAND test_msquic_hold_input)
+    set_tests_properties(msquic_hold_input PROPERTIES
+        LABELS "msquic"
+        TIMEOUT 60)
     set_tests_properties(msquic_close_feed PROPERTIES
         LABELS "msquic"
         TIMEOUT 60)
@@ -237,6 +270,9 @@ if(MOQ_BUILD_TESTS)
     # component and re-finds MsQuic. Discovery hints from this build
     # are forwarded so the consumer resolves the same MsQuic.
     if(MOQ_BUILD_MSQUIC_MANAGED)
+        include(${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake)
+        set(_msquic_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+        moq_write_consumer_context("${_msquic_consumer_context}")
         add_test(NAME msquic_adapter_consumer
             COMMAND ${CMAKE_COMMAND}
                 -DBUILD=${PROJECT_BINARY_DIR}
@@ -251,6 +287,8 @@ if(MOQ_BUILD_TESTS)
 
         add_test(NAME msquic_install_consumer
             COMMAND ${CMAKE_COMMAND}
+                "-DCONSUMER_CONTEXT=${_msquic_consumer_context}"
+                "-DMSQUIC_RUNTIME_FILE=$<TARGET_FILE:msquic::msquic>"
                 -DBUILD=${PROJECT_BINARY_DIR}
                 -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work
@@ -269,6 +307,8 @@ if(MOQ_BUILD_TESTS)
         # cross-dylib failure, so this configures a fresh shared tree.
         add_test(NAME msquic_managed_shared_link
             COMMAND ${CMAKE_COMMAND}
+                "-DCONSUMER_CONTEXT=${_msquic_consumer_context}"
+                "-DMSQUIC_RUNTIME_FILE=$<TARGET_FILE:msquic::msquic>"
                 -DSRC=${CMAKE_SOURCE_DIR}
                 -DWORK=${CMAKE_CURRENT_BINARY_DIR}/managed-shared-link-work
                 "-DMSQUIC_DIR_HINT=${msquic_DIR}"
@@ -278,6 +318,10 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(msquic_managed_shared_link PROPERTIES
             LABELS "msquic"
             TIMEOUT 600)
+        include(${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake)
+        foreach(_consumer msquic_adapter_consumer msquic_install_consumer msquic_managed_shared_link)
+            moq_test_reject_consumer_warnings(${_consumer})
+        endforeach()
     endif()
 
     # Managed loopback: real MsQuic on localhost, self-signed certs,

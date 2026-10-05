@@ -268,6 +268,35 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME proxygen_wt_adapter COMMAND test_wt_adapter)
 
+    # Receive admission (held input). Built from the adapter sources with
+    # MOQ_PROXYGEN_WT_TESTING so the test can force the capability on or off;
+    # the shipped adapter library is not linked, so no seam reaches it.
+    add_executable(test_wt_hold_input
+        tests/test_wt_hold_input.cpp
+        src/wt_adapter.cpp
+        src/wt_endpoint_ops.cpp
+    )
+    target_include_directories(test_wt_hold_input PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_wt_hold_input PRIVATE
+        moq::core
+        proxygen::proxygen
+    )
+    target_compile_definitions(test_wt_hold_input PRIVATE
+        MOQ_BUILDING MOQ_PROXYGEN_WT_TESTING)
+    if(_cares_dir)
+        target_link_directories(test_wt_hold_input PRIVATE "${_cares_dir}")
+    endif()
+    target_compile_features(test_wt_hold_input PRIVATE cxx_std_17)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_wt_hold_input PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME proxygen_wt_hold_input COMMAND test_wt_hold_input)
+    set_tests_properties(proxygen_wt_hold_input PROPERTIES TIMEOUT 60)
+
     add_executable(test_wt_conformance
         tests/test_wt_conformance.cpp
         tests/wt_conformance_pair.cpp
@@ -347,19 +376,26 @@ if(MOQ_BUILD_TESTS)
     set_tests_properties(proxygen_wt_managed_scheduler PROPERTIES TIMEOUT 40)
 
     # -- Cold-consumer tests ------------------------------------------
-    # Build-tree consumer: find_package(libmoq COMPONENTS
-    # adapter-proxygen-wt) against the build tree, include ONLY
-    # <moq/proxygen_wt.hpp>, link ONLY moq::adapter-proxygen-wt, run a
-    # no-network smoke. (proxygen resolves from the default prefix, same
-    # as the parent build.)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../mvfst/tests/consumer_context.cmake)
+    set(MOQ_ADAPTER_CONSUMER_TEST_ROOT "" CACHE PATH "Private adapter consumer test artifacts")
+    set(_consumer_root "${CMAKE_CURRENT_BINARY_DIR}")
+    if(MOQ_ADAPTER_CONSUMER_TEST_ROOT)
+        set(_consumer_root "${MOQ_ADAPTER_CONSUMER_TEST_ROOT}/proxygen")
+    endif()
+    file(MAKE_DIRECTORY "${_consumer_root}")
+    set(_consumer_cache "${_consumer_root}/parent-context.cmake")
+    moq_write_consumer_context("${_consumer_cache}")
+    # Build-tree consumers: use only the public attach/managed headers and
+    # imported targets, including a managed-create link proof with no dial.
     set(_pxg_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
-    set(_pxg_consumer_bin "${CMAKE_CURRENT_BINARY_DIR}/consumer_build")
+    set(_pxg_consumer_bin "${_consumer_root}/consumer_build")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_consumer_test.cmake"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
         "    -S \"${_pxg_consumer_src}\"\n"
         "    -B \"${_pxg_consumer_bin}\"\n"
-        "    -Dlibmoq_DIR=${PROJECT_BINARY_DIR}\n"
-        "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
+        "    \"-Dlibmoq_DIR=${PROJECT_BINARY_DIR}\"\n"
+        "    -C \"${_consumer_cache}\"\n"
+        "    -G \"${CMAKE_GENERATOR}\"\n"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -368,7 +404,10 @@ if(MOQ_BUILD_TESTS)
         "if(rc)\n  message(FATAL_ERROR \"build failed\")\nendif()\n"
         "execute_process(COMMAND \"${_pxg_consumer_bin}/consumer\"\n"
         "    RESULT_VARIABLE rc)\n"
-        "if(rc)\n  message(FATAL_ERROR \"consumer run failed\")\nendif()\n")
+        "if(rc)\n  message(FATAL_ERROR \"consumer run failed\")\nendif()\n"
+        "execute_process(COMMAND \"${_pxg_consumer_bin}/managed_consumer\"\n"
+        "    RESULT_VARIABLE rc)\n"
+        "if(rc)\n  message(FATAL_ERROR \"managed consumer run failed\")\nendif()\n")
     add_test(NAME proxygen_wt_consumer
         COMMAND ${CMAKE_COMMAND} -P
             "${CMAKE_CURRENT_BINARY_DIR}/run_consumer_test.cmake")
@@ -377,12 +416,12 @@ if(MOQ_BUILD_TESTS)
     # Install-tree consumer + negative installed-package audit. Install
     # libmoq to a temp prefix, consume via find_package from that prefix,
     # and assert the installed include tree exposes only the public header.
-    set(_pxg_install_prefix "${CMAKE_CURRENT_BINARY_DIR}/install_test_prefix")
-    set(_pxg_install_bin "${CMAKE_CURRENT_BINARY_DIR}/install_consumer_build")
+    set(_pxg_install_prefix "${_consumer_root}/install_test_prefix")
+    set(_pxg_install_bin "${_consumer_root}/install_consumer_build")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_install_consumer_test.cmake"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
         "    --build \"${PROJECT_BINARY_DIR}\"\n"
-        "    --target moq-core moq-adapter-proxygen-wt\n"
+        "    --target moq-core moq-adapter-proxygen-wt moq-adapter-proxygen-wt-managed\n"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"build failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -411,8 +450,9 @@ if(MOQ_BUILD_TESTS)
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
         "    -S \"${_pxg_consumer_src}\"\n"
         "    -B \"${_pxg_install_bin}\"\n"
-        "    -DCMAKE_PREFIX_PATH=${_pxg_install_prefix}\n"
-        "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
+        "    \"-Dlibmoq_DIR=${_pxg_install_prefix}/${CMAKE_INSTALL_LIBDIR}/cmake/libmoq\"\n"
+        "    -C \"${_consumer_cache}\"\n"
+        "    -G \"${CMAKE_GENERATOR}\"\n"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"install consumer configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -421,7 +461,10 @@ if(MOQ_BUILD_TESTS)
         "if(rc)\n  message(FATAL_ERROR \"install consumer build failed\")\nendif()\n"
         "execute_process(COMMAND \"${_pxg_install_bin}/consumer\"\n"
         "    RESULT_VARIABLE rc)\n"
-        "if(rc)\n  message(FATAL_ERROR \"install consumer run failed\")\nendif()\n")
+        "if(rc)\n  message(FATAL_ERROR \"install consumer run failed\")\nendif()\n"
+        "execute_process(COMMAND \"${_pxg_install_bin}/managed_consumer\"\n"
+        "    RESULT_VARIABLE rc)\n"
+        "if(rc)\n  message(FATAL_ERROR \"installed managed consumer run failed\")\nendif()\n")
     add_test(NAME proxygen_wt_install_consumer
         COMMAND ${CMAKE_COMMAND} -P
             "${CMAKE_CURRENT_BINARY_DIR}/run_install_consumer_test.cmake")

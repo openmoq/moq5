@@ -222,8 +222,47 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
         set(BUILD_HTTP OFF CACHE BOOL "" FORCE)
     endif()
 
+    # Run MoqPicoquicProjectPolicy.cmake inside picoquic's project() scope
+    # (link-line de-duplication policies; see that file). A caller-provided
+    # CMAKE_PROJECT_picoquic_INCLUDE -- a file, a module name or a list of
+    # them -- is composed, not replaced: the policy file includes every entry
+    # afterwards. Only the normal variable is touched, never a cache entry,
+    # and its exact prior state (unset, empty or set) comes back once picoquic
+    # has been added, so later project() calls elsewhere see the original.
+    # The hand-over variable is likewise restored to whatever the caller had.
+    if(DEFINED CMAKE_PROJECT_picoquic_INCLUDE)
+        set(_moq_pq_include_was_defined TRUE)
+        set(_moq_pq_saved_project_include "${CMAKE_PROJECT_picoquic_INCLUDE}")
+    else()
+        set(_moq_pq_include_was_defined FALSE)
+    endif()
+    if(DEFINED MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE)
+        set(_moq_pq_handover_was_defined TRUE)
+        set(_moq_pq_saved_handover "${MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE}")
+    else()
+        set(_moq_pq_handover_was_defined FALSE)
+    endif()
+    set(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE "${CMAKE_PROJECT_picoquic_INCLUDE}")
+    set(CMAKE_PROJECT_picoquic_INCLUDE
+        "${CMAKE_CURRENT_LIST_DIR}/MoqPicoquicProjectPolicy.cmake")
+
     add_subdirectory("${MOQ_PICOQUIC_SOURCE_DIR}"
         "${CMAKE_BINARY_DIR}/_deps/picoquic" EXCLUDE_FROM_ALL)
+
+    if(_moq_pq_include_was_defined)
+        set(CMAKE_PROJECT_picoquic_INCLUDE "${_moq_pq_saved_project_include}")
+    else()
+        unset(CMAKE_PROJECT_picoquic_INCLUDE)
+    endif()
+    if(_moq_pq_handover_was_defined)
+        set(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE "${_moq_pq_saved_handover}")
+    else()
+        unset(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE)
+    endif()
+    unset(_moq_pq_include_was_defined)
+    unset(_moq_pq_saved_project_include)
+    unset(_moq_pq_handover_was_defined)
+    unset(_moq_pq_saved_handover)
 
     # picoquic_BUILD_TESTS=ON (forced above for the picoquic-test simulation
     # library our loopback/sim harness links) also makes picoquic register its

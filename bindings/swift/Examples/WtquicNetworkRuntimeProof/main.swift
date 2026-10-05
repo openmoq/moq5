@@ -1,3 +1,8 @@
+// Historical success proof: NOT a qualification gate under the current policy.
+// .wtquicNetwork now throws .unsupported synchronously before network startup.
+// Current rejection gates are wtquic_network_managed and
+// endpoint_wtquic_network_smoke; old successful receipts must not be reused.
+// This retained example is not an available playback path.
 // Standalone .wtquicNetwork runtime proof (NOT an xctest -- Network.framework
 // does not establish inside an xctest host, so the proof must run as a normal
 // process). The driver scripts/check_wtquic_network_runtime.sh spawns fresh one-shot

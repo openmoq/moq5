@@ -15,11 +15,12 @@ static int rx_find_free(moq_session_t *s)
     return -1;
 }
 
-static void rx_free_entry(moq_session_t *s, size_t slot)
+/* Release everything a receive entry owns besides its identity: the object
+ * being assembled, its extensions, the staged input and any parked chunk,
+ * with their receive-budget charges. The entry stays allocated and indexed. */
+static void rx_release_resources(moq_session_t *s, size_t slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
-    rx_occ_unlink(s, slot);
-    moq_index_remove(s->idx_rx_by_ref, s->idx_rx_mask, rx->stream_ref._v);
     if (rx->payload_rcbuf) {
         /* An object assembled but not yet emitted: the payload lives inside
          * this rcbuf (payload_buf points into it), so decref rather than free
@@ -49,10 +50,21 @@ static void rx_free_entry(moq_session_t *s, size_t slot)
         s->alloc.free(rx->input_buf, rx->input_cap, s->alloc.ctx);
         rx->input_buf = NULL;
     }
+    /* The entry may stay allocated (a STOPped stream): it holds no input. */
+    rx->input_len = 0;
+    rx->input_cap = 0;
     if (rx->pending_chunk) {
         moq_rcbuf_decref(rx->pending_chunk);
         rx->pending_chunk = NULL;
     }
+}
+
+static void rx_free_entry(moq_session_t *s, size_t slot)
+{
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+    rx_occ_unlink(s, slot);
+    moq_index_remove(s->idx_rx_by_ref, s->idx_rx_mask, rx->stream_ref._v);
+    rx_release_resources(s, slot);
     memset(rx, 0, sizeof(*rx));
     rx->occ_next = -1;     /* the memset zeroed these; -1 is "unlinked" */
     rx->occ_prev = -1;
@@ -74,15 +86,30 @@ static void rx_record_reset_processed(moq_session_t *s, int slot)
         sub_note_stream_processed(s, s->rx_streams[slot].sub);
 }
 
+/* Remember that the peer FIN'd this transport stream, so later bytes on the
+ * same ref are rejected as data after FIN instead of parsed afresh. This is
+ * the transport fact only: it carries no completion side effect, so it is
+ * what a locally STOPped stream records when its FIN finally arrives. */
+static void rx_note_finished_ref(moq_session_t *s, uint64_t ref_v)
+{
+    size_t idx = (s->rx_fin_head + s->rx_fin_count) % s->rx_fin_cap;
+    if (s->rx_fin_count >= s->rx_fin_cap)
+        s->rx_fin_head = (s->rx_fin_head + 1) % s->rx_fin_cap;
+    else
+        s->rx_fin_count++;
+    s->rx_finished[idx] = ref_v;
+}
+
 static void rx_record_finished(moq_session_t *s, uint64_t ref_v)
 {
     /* A COMPLETED data stream bound to a subscriber-role publication or
      * subscription counts toward that binding's terminal-done Stream Count.
-     * This is the FIN signal (never called on a STOP); identifiable RESET
-     * terminations count via rx_record_reset_processed at the reset teardown
-     * sites. The rx is still live here (freed by the caller right after).
-     * Fetch streams carry an invalid pub_handle AND an invalid sub, so this
-     * is a no-op for them. */
+     * This is the successful-completion signal (never called for a stream
+     * the session STOPped, whose FIN only notes the transport fact);
+     * identifiable RESET terminations count via rx_record_reset_processed at
+     * the reset teardown sites. The rx is still live here (freed by the
+     * caller right after). Fetch streams carry an invalid pub_handle AND an
+     * invalid sub, so the count is a no-op for them. */
     int rxslot = rx_find_by_ref(s, moq_stream_ref_from_u64(ref_v));
     if (rxslot >= 0) {
         if (moq_publication_is_valid(s->rx_streams[rxslot].pub_handle))
@@ -90,13 +117,7 @@ static void rx_record_finished(moq_session_t *s, uint64_t ref_v)
         else if (moq_subscription_is_valid(s->rx_streams[rxslot].sub))
             sub_note_stream_processed(s, s->rx_streams[rxslot].sub);
     }
-
-    size_t idx = (s->rx_fin_head + s->rx_fin_count) % s->rx_fin_cap;
-    if (s->rx_fin_count >= s->rx_fin_cap)
-        s->rx_fin_head = (s->rx_fin_head + 1) % s->rx_fin_cap;
-    else
-        s->rx_fin_count++;
-    s->rx_finished[idx] = ref_v;
+    rx_note_finished_ref(s, ref_v);
 }
 
 /* Forward State 0 prohibits Objects, not streams: a bound stream stays
@@ -176,7 +197,10 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
 #ifdef MOQ_SESSION_SWEEP_TESTING
             session_work_rx_probes++;
 #endif
-            if (!rx->active) { RX_SCAN_ADVANCE(); continue; }
+            if (!rx->active || rx->parse_state == MOQ_RX_STOPPED) {
+                RX_SCAN_ADVANCE();   /* a stopped entry is already discarded */
+                continue;
+            }
             bool match = false;
             if (moq_subscription_is_valid(sub) &&
                 moq_subscription_is_valid(rx->sub) &&
@@ -202,13 +226,29 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
         }
 #undef RX_SCAN_ADVANCE
         /* A completed scan that stopped nothing means no bound stream remains.
-         * Otherwise rescan from zero: stopping frees entries, so the pool must
-         * settle to a clean pass before the owner may finalize. */
+         * Otherwise rescan from zero: a stopped entry no longer matches (its
+         * binding is cleared), so the pool settles to a clean pass before the
+         * owner may finalize. */
         bool found = s->sweep_rx_found;
         s->sweep_rx_pos = moq_occ_first(s->rx_occ_head, s->rx_cap);
         s->sweep_rx_found = false;
         if (!found) return MOQ_OK;
     }
+}
+
+/* -- Streams stopped without a receive entry ----------------------- *
+ * A compact, unordered set of stream refs (see rx_stopped_refs). */
+int rx_stopped_ref_find(const moq_session_t *s, uint64_t ref_v)
+{
+    for (size_t i = 0; i < s->rx_stopped_count; i++)
+        if (s->rx_stopped_refs[i] == ref_v) return (int)i;
+    return -1;
+}
+
+static void rx_stopped_ref_remove(moq_session_t *s, int idx)
+{
+    s->rx_stopped_count--;
+    s->rx_stopped_refs[idx] = s->rx_stopped_refs[s->rx_stopped_count];
 }
 
 static bool rx_is_finished(moq_session_t *s, uint64_t ref_v)
@@ -244,6 +284,24 @@ static moq_result_t rx_emit_subgroup_reset(moq_session_t *s, int slot,
                                            uint64_t error_code)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
+
+    /* A FETCH response stream: the closure is the request-local FETCH_RESET,
+     * owed only when the stream's FETCH_HEADER bound it to a live fetcher-role
+     * request. An unbound stream (header never arrived, or stale/retired
+     * handle) has no request identity to report and is released silently --
+     * a request-side terminal, not this stream, closes that request. A refusal
+     * parks the obligation exactly like the subgroup path, so the documented
+     * retry (the same reset input, or any later drive) completes it. */
+    if (rx->stream_kind == MOQ_STREAM_KIND_FETCH) {
+        int fslot = fetch_resolve_handle(s, rx->fetch);
+        if (fslot < 0) return MOQ_OK;
+        moq_result_t frc = fetch_on_data_stream_reset(s, fslot, error_code);
+        if (frc == MOQ_ERR_WOULD_BLOCK) {
+            rx->reset_error_code = error_code;
+            rx->parse_state = MOQ_RX_PENDING_RESET;
+        }
+        return frc;
+    }
 
     bool bound = moq_subscription_is_valid(rx->sub) !=
                  moq_publication_is_valid(rx->pub_handle);
@@ -347,7 +405,22 @@ static moq_result_t rx_try_stop(moq_session_t *s, int slot)
      * at FETCH_HEADER decode) means a deferred/retried stop still consumes it. */
     if (rx->stop_consumes_cancel_tomb)
         fetch_cancel_tomb_consume(s, rx->cancel_tomb_request_id);
-    rx_free_entry(s, (size_t)slot);
+    /* The peer may still deliver what it had already sent: keep the stream's
+     * identity in the stopped/discard state until its FIN or RESET, holding
+     * nothing but the entry itself. A FIN that arrived with these very bytes
+     * ends it right here. */
+    rx_release_resources(s, (size_t)slot);
+    if (rx->pending_fin) {
+        rx_note_finished_ref(s, rx->stream_ref._v);
+        rx_free_entry(s, (size_t)slot);
+        return MOQ_OK;
+    }
+    rx->sub = (moq_subscription_t){ 0 };
+    rx->pub_handle = (moq_publication_t){ 0 };
+    rx->fetch = (moq_fetch_t){ 0 };
+    rx->stop_consumes_cancel_tomb = false;
+    rx->reset_owed = false;
+    rx->parse_state = MOQ_RX_STOPPED;
     return MOQ_OK;
 }
 
@@ -721,8 +794,8 @@ static moq_result_t rx_append_input(moq_session_t *s, int slot,
  * or create one for a fresh stream. Returns the slot (>= 0) when the caller
  * should proceed with parsing, or -1 when the delivery is already fully handled
  * -- in which case *out_rc holds the result to return (session closed, an
- * ignored empty non-FIN probe, data-after-FIN close, a STOP_DATA push, or its
- * WOULD_BLOCK). Behavior is identical to the inline prologue it replaces. */
+ * ignored empty non-FIN probe, data-after-FIN close, stopped-stream discard,
+ * or an unowned admission WOULD_BLOCK). */
 static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref,
                                    size_t len, bool fin, moq_result_t *out_rc)
 {
@@ -730,6 +803,18 @@ static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref
 
     int slot = rx_find_by_ref(s, stream_ref);
     if (slot >= 0) return slot;          /* existing stream: proceed */
+
+    /* Stopped without an entry: consumed unparsed; the FIN releases the
+     * retained identity (not a completion, nothing recorded). */
+    int stopped = rx_stopped_ref_find(s, stream_ref._v);
+    if (stopped >= 0) {
+        if (fin) {
+            rx_stopped_ref_remove(s, stopped);
+            rx_note_finished_ref(s, stream_ref._v);
+        }
+        *out_rc = MOQ_OK;
+        return -1;
+    }
 
     /* Unknown stream. */
     if (len == 0 && !fin) { *out_rc = MOQ_OK; return -1; }
@@ -739,15 +824,11 @@ static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref
     }
     slot = rx_find_free(s);
     if (slot < 0) {
-        if (action_queue_full(s)) { *out_rc = MOQ_ERR_WOULD_BLOCK; return -1; }
-        moq_action_t a;
-        memset(&a, 0, sizeof(a));
-        a.kind = MOQ_ACTION_STOP_DATA;
-        a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
-        a.borrow_epoch = s->borrow_epoch;
-        a.u.stop_data.stream_ref = stream_ref;
-        a.u.stop_data.error_code = 0;
-        *out_rc = push_action(s, &a);
+        /* No parser owns this delivery, so its request is not yet known.
+         * Consume neither bytes nor FIN: the caller must retain and replay
+         * the exact delivery once an entry is available. Blindly stopping it
+         * here would discard a FETCH response without settling its request. */
+        *out_rc = MOQ_ERR_WOULD_BLOCK;
         return -1;
     }
     moq_rx_stream_t *rx = &s->rx_streams[slot];
@@ -779,8 +860,23 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
 
     moq_rx_stream_t *rx = &s->rx_streams[slot];
 
-    if (rx->parse_state == MOQ_RX_NEED_STOP)
+    /* Stopped locally: whatever the peer still delivers is consumed unparsed;
+     * its FIN releases the entry (not a completion, nothing recorded). */
+    if (rx->parse_state == MOQ_RX_STOPPED) {
+        if (fin) {
+            rx_note_finished_ref(s, rx->stream_ref._v);
+            rx_free_entry(s, (size_t)slot);
+        }
+        return MOQ_OK;
+    }
+
+    /* The STOP is still owed from an earlier refusal. A FIN arriving now is
+     * latched first: the entry is released at the STOP (or at this call's
+     * retry) and never left waiting for a terminal already delivered. */
+    if (rx->parse_state == MOQ_RX_NEED_STOP) {
+        if (fin) rx->pending_fin = true;
         return rx_try_stop(s, slot);
+    }
 
     /* All objects were emitted and the FIN seen, but SUBGROUP_FINISHED could not
      * be queued last time (event queue was full). No object bytes remain to
@@ -800,8 +896,10 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
      * bound it (e.g. a rejected pending PUBLISH), drop the stream instead of
      * emitting against a stale handle. The binding cannot change mid-call (it is
      * only freed by separate app calls), so one check per delivery suffices. */
-    if (!rx_binding_alive(s, rx))
+    if (!rx_binding_alive(s, rx)) {
+        if (fin) rx->pending_fin = true;
         return rx_try_stop(s, slot);
+    }
 
     /* If the stream is already awaiting a pending emit/chunk retry, retain any
      * newly delivered caller bytes (and a FIN) BEFORE retrying. The pending
@@ -1570,7 +1668,8 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
     }
 
 compact:
-    if (rx->active && cursor > 0) {
+    /* A stream STOPped inside the loop keeps its entry but no input. */
+    if (rx->active && rx->parse_state != MOQ_RX_STOPPED && cursor > 0) {
         size_t remaining = rx->input_len - cursor;
         if (remaining > 0)
             memmove(rx->input_buf, rx->input_buf + cursor, remaining);
@@ -1669,13 +1768,25 @@ void session_discard_deferred_streams(moq_session_t *s)
 #endif
         if (!rx->active || rx->parse_state != MOQ_RX_DEFERRED_ALIAS)
             continue;
-        /* Best-effort STOP_DATA. If the action queue is full, rx_try_stop
-         * leaves the entry in NEED_STOP without freeing -- but no forwarding
-         * subscription remains to drive a later retry, so free it directly to
-         * avoid retaining a stale stream/buffer. A late peer byte just creates
-         * a fresh entry that is STOP'd then. */
-        if (rx_try_stop(s, (int)i) != MOQ_OK && s->rx_streams[i].active)
-            rx_free_entry(s, i);
+        /* A STOP the action queue refuses stays owed on the entry
+         * (NEED_STOP): it keeps the stream's identity so later bytes are
+         * consumed, not parsed as a fresh stream, and session_retry_owed_stops
+         * issues it once a poll returns action capacity. */
+        (void)rx_try_stop(s, (int)i);
+    }
+}
+
+void session_retry_owed_stops(moq_session_t *s)
+{
+    /* Walks the rx OCCUPANCY list; the successor is captured before a stop
+     * that may free (unlink) the entry when its FIN was already latched. */
+    for (int32_t i = s->rx_occ_head, nxt; i >= 0; i = nxt) {
+        moq_rx_stream_t *rx = &s->rx_streams[i];
+        nxt = rx->occ_next;
+        if (!rx->active || rx->parse_state != MOQ_RX_NEED_STOP)
+            continue;
+        if (rx_try_stop(s, (int)i) == MOQ_ERR_WOULD_BLOCK)
+            return;                      /* capacity exhausted again */
     }
 }
 
@@ -1798,9 +1909,21 @@ moq_result_t handle_data_reset(moq_session_t *s,
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = rx_find_by_ref(s, stream_ref);
-    if (slot < 0) return MOQ_OK;
+    if (slot < 0) {
+        /* A stream stopped without an entry ends with its RESET. */
+        int stopped = rx_stopped_ref_find(s, stream_ref._v);
+        if (stopped >= 0) rx_stopped_ref_remove(s, stopped);
+        return MOQ_OK;
+    }
 
     moq_rx_stream_t *rx = &s->rx_streams[slot];
+
+    /* The peer's RESET answers our STOP: the stopped entry ends here, with no
+     * terminal to surface and nothing counted. */
+    if (rx->parse_state == MOQ_RX_STOPPED) {
+        rx_free_entry(s, (size_t)slot);
+        return MOQ_OK;
+    }
 
     /* Capture the obligation BEFORE anything that can block: a refused flush
      * below must not lose the fact that a RESET is owed, nor its cause. The

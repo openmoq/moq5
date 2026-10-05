@@ -19,7 +19,7 @@
 #include <moq/control_d18.h>
 #include <moq/vi64.h>
 #include "test_support.h"
-#include "../support/fake_endpoint.h"
+#include "../support/held_bridge_driver.h"
 #include "../../core/src/bridge/transport_bridge_internal.h"
 #include "../../core/src/session/session_internal.h"
 
@@ -35,10 +35,10 @@ static int uc_init(uc_fixture_t *f)
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
     if (moq_session_create(&cfg, 0, &f->session) < 0) return -1;
-    fake_endpoint_init(&f->ep, 1000, 2000);
+    held_endpoint_init(&f->ep, 1000, 2000);
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, f->session, &f->ep.vtable,
+    if (held_bridge_create(&bcfg, f->session, &f->ep.vtable,
                                      &f->ep, &f->bridge) < 0) {
         moq_session_destroy(f->session);
         return -1;
@@ -48,7 +48,7 @@ static int uc_init(uc_fixture_t *f)
 
 static void uc_destroy(uc_fixture_t *f)
 {
-    moq_transport_bridge_destroy(f->bridge);
+    held_bridge_destroy(f->bridge);
     moq_session_destroy(f->session);
 }
 
@@ -62,7 +62,7 @@ int main(void)
     /* == A. Draft-16 bridge defaults to bidirectional control mode ==== */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         MOQ_TEST_CHECK_EQ_INT((int)f.bridge->control_mode,
                               (int)BRIDGE_CONTROL_BIDI);
         MOQ_TEST_CHECK(!f.bridge->local_ctrl_uni_open);
@@ -77,7 +77,7 @@ int main(void)
      *  record the local control channel. */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
 
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x9001);
 
@@ -105,7 +105,7 @@ int main(void)
                               (int)MOQ_OK);
 
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
 
         /* One uni opened, two writes recorded, in order. */
@@ -135,7 +135,7 @@ int main(void)
         /* Servicing again with no new actions produces no further ops. */
         fake_endpoint_clear_ops(&f.ep);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, 0);
 
         uc_destroy(&f);
@@ -144,7 +144,7 @@ int main(void)
     /* == C. bridge_route_peer_uni decision + control acceptance ======= */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         moq_transport_bridge_t *b = f.bridge;
 
         MOQ_TEST_CHECK_EQ_INT(
@@ -189,7 +189,7 @@ int main(void)
      *  the local control state must clear and the stream must retire. */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x9100);
 
         moq_action_t a;
@@ -202,7 +202,7 @@ int main(void)
         a.u.open_uni_control.len  = sizeof(setup_bytes);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(f.bridge->local_ctrl_uni_open);
         MOQ_TEST_CHECK_EQ_SIZE(moq_transport_bridge_stream_count(f.bridge), 1);
         fake_endpoint_clear_ops(&f.ep);
@@ -220,14 +220,14 @@ int main(void)
         s.u.send_uni_control.fin  = true;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &s), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(f.bridge->local_ctrl_uni_open);
         MOQ_TEST_CHECK(moq_transport_bridge_has_pending(f.bridge));
 
         /* Unblock and retry: FIN completes. */
         f.ep.block_write = false;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         const fake_op_t *w = fake_endpoint_find(&f.ep, FAKE_OP_WRITE);
         MOQ_TEST_CHECK(w != NULL);
@@ -241,7 +241,7 @@ int main(void)
     /* == E. Duplicate local OPEN_UNI_CONTROL is rejected, not silent == */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
 
         moq_action_t a;
         memset(&a, 0, sizeof(a));
@@ -253,7 +253,7 @@ int main(void)
         a.u.open_uni_control.len  = sizeof(setup_bytes);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(f.bridge->local_ctrl_uni_open);
 
         /* Second open attempt: must not open a second uni nor silently
@@ -267,7 +267,7 @@ int main(void)
         a2.u.open_uni_control.data = more_bytes;
         a2.u.open_uni_control.len  = sizeof(more_bytes);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a2), (int)MOQ_OK);
-        moq_transport_bridge_service(f.bridge, 0);
+        held_bridge_service(f.bridge, 0);
 
         MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.bridge));
         /* Exactly one uni was ever opened (no silent second channel). */
@@ -295,19 +295,18 @@ int main(void)
         s->profile = &fake_ops;
 
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 1000, 2000);
+        held_endpoint_init(&ep, 1000, 2000);
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *bridge = NULL;
-        MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
-                                             &bridge), (int)MOQ_OK);
+        HELD_REQUIRE_EQ_INT(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
+                                             &bridge), MOQ_OK);
 
         MOQ_TEST_CHECK_EQ_INT((int)bridge->control_mode,
                               (int)BRIDGE_CONTROL_UNI_PAIR);
 
         s->profile = real;   /* restore before destroy */
-        moq_transport_bridge_destroy(bridge);
+        held_bridge_destroy(bridge);
         moq_session_destroy(s);
     }
 
@@ -317,7 +316,7 @@ int main(void)
      *  on the bidi's transport stream (not fatal, not a data-stream op). */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
 
         static const uint8_t req_bytes[] = { 0xAA, 0xBB };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7700);
@@ -333,7 +332,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &open_act),
                               (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         const fake_op_t *ob = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI);
         MOQ_TEST_CHECK(ob != NULL);
         uint64_t bidi_id = ob->stream_id;
@@ -361,7 +360,7 @@ int main(void)
                               (int)MOQ_OK);
 
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
 
         const fake_op_t *st = fake_endpoint_find(&f.ep, FAKE_OP_STOP);
@@ -384,7 +383,7 @@ int main(void)
      *  partial-failure fatal. */
     for (int native = 0; native < 2; native++) {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         if (native)
             fake_endpoint_enable_abort(&f.ep);
 
@@ -401,7 +400,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &open_act),
                               (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         const fake_op_t *ob = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI);
         MOQ_TEST_CHECK(ob != NULL);
         uint64_t bidi_id = ob->stream_id;
@@ -418,7 +417,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &abort_act),
                               (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
 
         if (native) {
@@ -461,7 +460,7 @@ int main(void)
     /* == G3. Fallback pending state: WOULD_BLOCK before either half ==== */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         static const uint8_t req_bytes[] = { 0xAA };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7702);
         moq_action_t a;
@@ -474,7 +473,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(req_bytes);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         const fake_op_t *ob = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI);
         MOQ_TEST_CHECK(ob != NULL);
         uint64_t bidi_id = ob->stream_id;
@@ -489,7 +488,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) == NULL);
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_STOP) == NULL);
@@ -497,7 +496,7 @@ int main(void)
         /* unblock: the retry applies BOTH halves, once each */
         f.ep.block_reset = false;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         const fake_op_t *rs = fake_endpoint_find(&f.ep, FAKE_OP_RESET);
         const fake_op_t *st = fake_endpoint_find(&f.ep, FAKE_OP_STOP);
         MOQ_TEST_CHECK(rs != NULL && st != NULL);
@@ -510,7 +509,7 @@ int main(void)
      *  The accepted RESET must NOT be re-sent when the STOP unblocks. */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         static const uint8_t req_bytes[] = { 0xAA };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7703);
         moq_action_t a;
@@ -523,7 +522,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(req_bytes);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         uint64_t bidi_id =
             fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
         fake_endpoint_clear_ops(&f.ep);
@@ -537,7 +536,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) != NULL);
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_STOP) == NULL);
@@ -545,7 +544,7 @@ int main(void)
 
         f.ep.block_stop = false;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         /* ONLY the remaining STOP half was retried */
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) == NULL);
         const fake_op_t *st = fake_endpoint_find(&f.ep, FAKE_OP_STOP);
@@ -557,7 +556,7 @@ int main(void)
     /* == G5. Partial runtime failure is fatal, never rolled back ======== */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         static const uint8_t req_bytes[] = { 0xAA };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7704);
         moq_action_t a;
@@ -570,7 +569,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(req_bytes);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         fake_endpoint_clear_ops(&f.ep);
 
         f.ep.fail_stop = true; /* the RESET half lands, the STOP fails */
@@ -582,7 +581,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK(
-            (int)moq_transport_bridge_service(f.bridge, 0) < 0);
+            (int)held_bridge_service(f.bridge, 0) < 0);
         MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.bridge));
         uc_destroy(&f);
     }
@@ -593,7 +592,7 @@ int main(void)
      *  the bridge uses the reset+stop fallback. */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         /* Provide a real abort_stream, then shrink struct_size to exclude
          * it: if the bridge read it anyway, FAKE_OP_ABORT would appear. */
         fake_endpoint_enable_abort(&f.ep);
@@ -612,7 +611,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(rb);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         fake_endpoint_clear_ops(&f.ep);
 
         memset(&a, 0, sizeof(a));
@@ -623,7 +622,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         /* fallback used: reset+stop, abort NOT read */
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_ABORT) == NULL);
@@ -637,7 +636,7 @@ int main(void)
      *  (no fresh ref, not fatal). Terminal input then retires it. */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         fake_endpoint_enable_abort(&f.ep);
         static const uint8_t rb[] = { 0xAA };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7706);
@@ -651,7 +650,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(rb);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         uint64_t bidi_id =
             fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
         fake_endpoint_clear_ops(&f.ep);
@@ -665,7 +664,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         /* late bytes while abort pending: discarded, not fatal */
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_transport_bridge_on_peer_bidi_bytes(
@@ -686,7 +685,7 @@ int main(void)
      *  and after an accepted abort (peer RESET retires). */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);   /* no native abort: fallback */
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);   /* no native abort: fallback */
         static const uint8_t rb[] = { 0xAA };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7707);
         moq_action_t a;
@@ -699,7 +698,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(rb);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         uint64_t bidi_id =
             fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
         fake_endpoint_clear_ops(&f.ep);
@@ -713,7 +712,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(fake_endpoint_find(&f.ep, FAKE_OP_RESET) != NULL);
         /* late bytes after RESET, before STOP: discarded */
         MOQ_TEST_CHECK_EQ_INT(
@@ -725,14 +724,14 @@ int main(void)
          * peer RESET retires the entry */
         f.ep.block_stop = false;
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_transport_bridge_on_peer_bidi_bytes(
                 f.bridge, bidi_id, rb, 1, false, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_on_peer_stream_reset(
+            (int)held_bridge_reset(
                 f.bridge, bidi_id, 0x1, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
@@ -745,7 +744,7 @@ int main(void)
      *  discarding late bytes, and retire only on a full terminal. */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
         fake_endpoint_enable_abort(&f.ep);
         static const uint8_t rb[] = { 0xAA };
         moq_stream_ref_t ref = moq_stream_ref_from_u64(0x7708);
@@ -759,7 +758,7 @@ int main(void)
         a.u.open_bidi_stream.len = sizeof(rb);
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         uint64_t bidi_id =
             fake_endpoint_find(&f.ep, FAKE_OP_OPEN_BIDI)->stream_id;
         fake_endpoint_clear_ops(&f.ep);
@@ -772,7 +771,7 @@ int main(void)
         a.u.abort_bidi_stream.error_code = 0x1;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &a), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
 
         /* peer STOP: does NOT retire the discarding entry */
         MOQ_TEST_CHECK_EQ_INT(
@@ -813,13 +812,12 @@ int main(void)
                               (int)MOQ_OK);
 
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 1000, 2000);
+        held_endpoint_init(&ep, 1000, 2000);
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *bridge = NULL;
-        MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
-                                             &bridge), (int)MOQ_OK);
+        HELD_REQUIRE_EQ_INT(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
+                                             &bridge), MOQ_OK);
         MOQ_TEST_CHECK(moq_transport_bridge_uses_uni_control(bridge));
 
         /* Peer opens its control channel: stream type alone is enough to
@@ -828,7 +826,7 @@ int main(void)
         size_t tn = moq_vi64_encode(MOQ_D18_STREAM_SETUP, type_buf,
                                     sizeof(type_buf));
         MOQ_TEST_CHECK(tn > 0);
-        moq_result_t rc = moq_transport_bridge_on_peer_uni_bytes(
+        moq_result_t rc = held_bridge_uni_bytes(
             bridge, 3, type_buf, tn, false, 0);
         MOQ_TEST_CHECK(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(bridge));
@@ -838,14 +836,14 @@ int main(void)
          * recorded immediately (terminal) and dispatched to the endpoint
          * on the next service pass, exactly like a control-channel FIN. */
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_on_peer_stream_reset(bridge, 3, 0x0, 0),
+            (int)held_bridge_reset(bridge, 3, 0x0, 0),
             (int)MOQ_OK);
         MOQ_TEST_CHECK(moq_transport_bridge_has_pending(bridge));
-        moq_transport_bridge_service(bridge, 0);
+        held_bridge_service(bridge, 0);
         MOQ_TEST_CHECK(moq_transport_bridge_is_closed(bridge));
         MOQ_TEST_CHECK_EQ_U64(moq_transport_bridge_close_code(bridge), 0x3);
 
-        moq_transport_bridge_destroy(bridge);
+        held_bridge_destroy(bridge);
         moq_session_destroy(s);
     }
 
@@ -868,20 +866,19 @@ int main(void)
                               (int)MOQ_OK);
 
         fake_endpoint_t ep;
-        fake_endpoint_init(&ep, 1000, 2000);
+        held_endpoint_init(&ep, 1000, 2000);
         moq_transport_bridge_cfg_t bcfg;
         moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
         moq_transport_bridge_t *bridge = NULL;
-        MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_create(&bcfg, s, &ep.vtable, &ep,
-                                             &bridge), (int)MOQ_OK);
+        HELD_REQUIRE_EQ_INT(held_bridge_create(&bcfg, s, &ep.vtable, &ep,
+                                             &bridge), MOQ_OK);
         MOQ_TEST_CHECK(moq_transport_bridge_uses_uni_control(bridge));
 
         /* Start: the D18 profile opens our local control uni and writes CLIENT
          * SETUP; servicing flushes it to the transport. */
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(s, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(bridge, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(bridge->local_ctrl_uni_open);
         uint64_t local_uni_id = bridge->local_ctrl_uni_stream_id;
 
@@ -893,7 +890,7 @@ int main(void)
         moq_buf_writer_init(&w, setup, sizeof(setup));
         MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup(&w), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_on_peer_uni_bytes(
+            (int)held_bridge_uni_bytes(
                 bridge, 7000, setup, moq_buf_writer_offset(&w), false, 0),
             (int)MOQ_OK);
         { moq_event_t ev;
@@ -909,11 +906,11 @@ int main(void)
             (int)moq_transport_bridge_on_peer_stop_sending(
                 bridge, local_uni_id, 0x0, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(moq_transport_bridge_has_pending(bridge));
-        moq_transport_bridge_service(bridge, 0);
+        held_bridge_service(bridge, 0);
         MOQ_TEST_CHECK(moq_transport_bridge_is_closed(bridge));
         MOQ_TEST_CHECK_EQ_U64(moq_transport_bridge_close_code(bridge), 0x3);
 
-        moq_transport_bridge_destroy(bridge);
+        held_bridge_destroy(bridge);
         moq_session_destroy(s);
     }
 
@@ -926,7 +923,7 @@ int main(void)
      *  established session is covered by the transport_bridge suite). */
     {
         uc_fixture_t f;
-        MOQ_TEST_CHECK_EQ_INT(uc_init(&f), 0);
+        HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
 
         /* Open a local data uni by sending a subgroup data object on a fresh
          * ref; servicing opens the transport uni. */
@@ -948,7 +945,7 @@ int main(void)
         sd.u.send_data.fin = false;
         MOQ_TEST_CHECK_EQ_INT((int)push_action(f.session, &sd), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_service(f.bridge, 0), (int)MOQ_OK);
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
         const fake_op_t *ou = fake_endpoint_find(&f.ep, FAKE_OP_OPEN_UNI);
         MOQ_TEST_CHECK(ou != NULL);
         uint64_t data_uni_id = ou->stream_id;

@@ -12,6 +12,7 @@
  * inspection: every retained byte must be released exactly once.
  */
 #include "pico_wt_harness.h"
+#include "pico_wt_test_seam.h"
 #include "../pico_wt_adapter.h"
 
 #include "picoquic_internal.h"
@@ -20,6 +21,8 @@
 #include <moq/rcbuf.h>
 #include <moq/session.h>
 #include <moq/transport_bridge.h>
+#include <moq/control.h>
+#include <moq/buf.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,6 +96,7 @@ static void install_acct(moq_pico_wt_conn_t *c)
 
 typedef struct {
     pico_wt_harness_t h;
+    moq_subscription_t client_sub;
     moq_subscription_t server_sub;
     moq_subgroup_handle_t sg;
     uint64_t sid;          /* the subgroup's uni stream */
@@ -163,8 +167,7 @@ static bool fixture_up_to_pause_sz(fixture_t *f, uint8_t cid,
     sc.track_namespace.count = 2;
     sc.track_name = (moq_bytes_t){(const uint8_t *)"video", 5};
     sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
-    moq_subscription_t client_sub;
-    if (moq_session_subscribe(f->h.client_session, &sc, 0, &client_sub) < 0)
+    if (moq_session_subscribe(f->h.client_session, &sc, 0, &f->client_sub) < 0)
         return false;
     moq_pico_wt_service(f->h.client_conn, f->h.now);
     if (pico_wt_harness_pump(&f->h, 4000) != 0) return false;
@@ -308,6 +311,121 @@ static uint32_t drain_and_pump(fixture_t *f, int rounds, uint32_t *out_order_ok,
     return got;
 }
 
+/* -- Adapter observers (test build only) ------------------------------- *
+ * The adapter reports every stream-event callback boundary, every local
+ * STOP_SENDING it issues and every receive-credit grant it hands picoquic.
+ * Records carry the adapter connection, so client and server sides are told
+ * apart by identity, never by output interleaving. */
+
+#define OBS_LOCAL_STOP (-1)
+typedef struct {
+    moq_pico_wt_conn_t *conn;
+    int      event;          /* picohttp_call_back_event_t, or OBS_LOCAL_STOP */
+    uint64_t sid;
+    int      phase;          /* 0 entry, 1 exit (callbacks only) */
+    bool     entry_present;  /* receive entry for sid present at this point */
+    size_t   entry_buf_len;
+    uint64_t entry_delivered; /* callback bytes delivered to that entry so far */
+    int      grants;         /* grants recorded for (conn, sid) so far */
+    size_t   acct_live;      /* allocator accounting at this point */
+} obs_rec_t;
+#define OBS_MAX 512
+#define GRANT_KEYS_MAX 64
+static obs_rec_t g_obs[OBS_MAX];
+static int g_obs_n;
+static struct { moq_pico_wt_conn_t *conn; uint64_t sid; int n; } g_grant_tab[GRANT_KEYS_MAX];
+static int g_grant_n;
+/* Sticky: once either recorder could not keep a record, the inventory is
+ * incomplete and no row may treat it as proof. */
+static bool g_obs_overflow, g_grant_overflow;
+static bool observers_complete(void) { return !g_obs_overflow && !g_grant_overflow; }
+
+static int grants_for(moq_pico_wt_conn_t *c, uint64_t sid)
+{
+    for (int i = 0; i < g_grant_n; i++)
+        if (g_grant_tab[i].conn == c && g_grant_tab[i].sid == sid) return g_grant_tab[i].n;
+    return 0;
+}
+
+static pw_rx_stream_t *entry_of(moq_pico_wt_conn_t *c, uint64_t sid)
+{
+    for (size_t i = 0; i < c->rx_count; i++)
+        if (c->rx[i].active && c->rx[i].stream_id == sid) return &c->rx[i];
+    return NULL;
+}
+
+static void obs_record(moq_pico_wt_conn_t *c, int event, uint64_t sid, int phase)
+{
+    if (g_obs_n >= OBS_MAX) { g_obs_overflow = true; return; }
+    obs_rec_t *r = &g_obs[g_obs_n++];
+    pw_rx_stream_t *e = entry_of(c, sid);
+    r->conn = c; r->event = event; r->sid = sid; r->phase = phase;
+    r->entry_present = e != NULL;
+    r->entry_buf_len = e ? e->buf_len : 0;
+    r->entry_delivered = e ? e->delivered : 0;
+    r->grants = grants_for(c, sid);
+    r->acct_live = g_acct.live;
+}
+static void obs_callback(moq_pico_wt_conn_t *c, int event, uint64_t sid, int phase)
+    { obs_record(c, event, sid, phase); }
+static void obs_local_stop(moq_pico_wt_conn_t *c, uint64_t sid)
+    { obs_record(c, OBS_LOCAL_STOP, sid, 0); }
+static void obs_grant(moq_pico_wt_conn_t *c, uint64_t sid, uint64_t headroom)
+{
+    (void)headroom;
+    for (int i = 0; i < g_grant_n; i++)
+        if (g_grant_tab[i].conn == c && g_grant_tab[i].sid == sid) { g_grant_tab[i].n++; return; }
+    if (g_grant_n < GRANT_KEYS_MAX) { g_grant_tab[g_grant_n].conn = c; g_grant_tab[g_grant_n].sid = sid; g_grant_tab[g_grant_n].n = 1; g_grant_n++; }
+    else g_grant_overflow = true;
+}
+
+static void observers_install(void)
+{
+    g_obs_n = 0; g_grant_n = 0;
+    g_obs_overflow = false; g_grant_overflow = false;
+    memset(g_obs, 0, sizeof(g_obs)); memset(g_grant_tab, 0, sizeof(g_grant_tab));
+    pw_test_callback_observer = obs_callback;
+    pw_test_local_stop_observer = obs_local_stop;
+    pw_test_grant_observer = obs_grant;
+}
+static void observers_remove(void)
+{
+    pw_test_callback_observer = NULL;
+    pw_test_local_stop_observer = NULL;
+    pw_test_grant_observer = NULL;
+}
+
+/* The recorders fail closed: past their capacity they set the sticky flag
+ * instead of silently truncating. Driven directly, without a connection. */
+static void test_observer_recorders_fail_closed(void)
+{
+    moq_pico_wt_conn_t probe_conn;
+    memset(&probe_conn, 0, sizeof(probe_conn));   /* rx_count 0: no entries to look up */
+    observers_install();
+    CHECK(observers_complete());
+    for (int i = 0; i < OBS_MAX; i++) obs_record(&probe_conn, (int)picohttp_callback_post_data, 4, 0);
+    CHECK(g_obs_n == OBS_MAX && observers_complete());      /* full, still complete */
+    obs_record(&probe_conn, (int)picohttp_callback_post_data, 4, 1);
+    CHECK(g_obs_n == OBS_MAX && g_obs_overflow && !observers_complete());   /* one more: sticky */
+    observers_install();
+    for (uint64_t sid = 0; sid < GRANT_KEYS_MAX; sid++) obs_grant(&probe_conn, sid * 4, 1);
+    CHECK(g_grant_n == GRANT_KEYS_MAX && observers_complete());
+    obs_grant(&probe_conn, 4, 1);                           /* an existing key still counts */
+    CHECK(grants_for(&probe_conn, 4) == 2 && observers_complete());
+    obs_grant(&probe_conn, (uint64_t)GRANT_KEYS_MAX * 4, 1); /* a new key past capacity: sticky */
+    CHECK(g_grant_n == GRANT_KEYS_MAX && g_grant_overflow && !observers_complete());
+    observers_remove();
+}
+
+/* first record index matching (conn, event, sid, phase), or -1 */
+static int obs_find(moq_pico_wt_conn_t *c, int event, uint64_t sid, int phase)
+{
+    for (int i = 0; i < g_obs_n; i++)
+        if (g_obs[i].conn == c && g_obs[i].event == event && g_obs[i].sid == sid && g_obs[i].phase == phase)
+            return i;
+    return -1;
+}
+
 /* ==================================================================== */
 
 /*
@@ -428,9 +546,62 @@ static void test_fin_while_paused(void)
 }
 
 /*
- * RESET while paused: RESET_STREAM aborts the PEER's sending direction, so
- * nothing more will arrive. Retained bytes are abandoned and freed, the reset
- * reaches the bridge, and the stream never receives further credit.
+ * Expected bridge-owned object inventory, derived independently of the
+ * receiver under test. The fixture's subgroup wire layout is deterministic:
+ * the publisher encodes a draft-16 subgroup header (type 0x14: subgroup id
+ * present, explicit priority) followed, per object, by the object-id delta,
+ * the payload length and the payload. The test re-encodes that layout with
+ * the public codec for the fixture's values (group 0, subgroup 0, priority
+ * 200, consecutive ids from 0, OBJ_BYTES bytes each) and asks how many whole
+ * objects fit in the first `fed` bytes -- the bytes the adapter handed the
+ * bridge (callback-delivered bytes minus the tail it still held) at the
+ * ownership boundary. The track alias is the one value the fixture does not
+ * pin; any alias below 64 encodes in one byte, which the single subscription
+ * of this fixture guarantees. Returns -1 when the layout cannot be encoded. */
+static int expected_objects_in(uint64_t fed, uint32_t published)
+{
+    uint8_t tmp[64];
+    moq_buf_writer_t w;
+    moq_d16_subgroup_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.type = 0x14;
+    hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
+    hdr.track_alias = 0;
+    hdr.group_id = 0;
+    hdr.subgroup_id = 0;
+    hdr.publisher_priority = 200;
+    moq_buf_writer_init(&w, tmp, sizeof(tmp));
+    if (moq_d16_encode_subgroup_header(&w, &hdr) < 0) return -1;
+    uint64_t off = moq_buf_writer_offset(&w);
+    int n = 0;
+    for (uint32_t i = 0; i < published; i++) {
+        moq_buf_writer_init(&w, tmp, sizeof(tmp));
+        /* object-id delta: the first object carries its id (0), each later one
+         * id - previous - 1, which is 0 for the fixture's consecutive ids */
+        if (moq_d16_encode_object_header(&w, 0, OBJ_BYTES) < 0) return -1;
+        off += moq_buf_writer_offset(&w) + OBJ_BYTES;
+        if (off > fed) break;
+        n++;
+    }
+    return n;
+}
+
+/*
+ * RESET while paused, over the real transport. The publisher resets the
+ * subgroup stream while the receiver holds retained bytes (adapter-owned,
+ * never fed) behind input the session already retains (bridge-owned), with an
+ * application that has not polled.
+ *
+ * Two ownership layers, two outcomes. At the reset callback's return the
+ * adapter's own layer is settled: its retained bytes and the receive entry
+ * are released, nothing is fatal, and no receive credit follows. The bridge-
+ * owned layer settles in order once the application drains: exactly the
+ * whole objects that fit in the bytes the bridge was given (an expectation
+ * computed from the wire layout, not from what the receiver emits) arrive
+ * first, each with the fixture's payload pattern, then exactly one
+ * SUBGROUP_RESET for this subscription/subgroup carrying the publisher's
+ * error code, after which the bridge reports no pending state and further
+ * service adds nothing. The adapter-dropped tail never arrives.
  */
 static void test_reset_while_paused(void)
 {
@@ -441,63 +612,150 @@ static void test_reset_while_paused(void)
         return;
     }
     CHECK(receiver_paused(&f));
-
+    moq_pico_wt_conn_t *c = f.h.client_conn;
     pw_rx_stream_t *st = rx_entry(&f, f.sid);
-    CHECK(st != NULL);
-    uint64_t granted_at_reset = st ? st->granted : 0;
     CHECK(st != NULL && st->buf_len > 0);   /* bytes really were retained */
-    size_t live_before = g_acct.live;
-    CHECK(live_before == 2);                /* table + retention buffer */
+    CHECK(g_acct.live == 2);                /* table + retention buffer */
+    CHECK(moq_transport_bridge_stream_has_pending(c->bridge, f.sid));   /* bridge-owned work queued */
 
-    /* Deliver the reset through the adapter's real h3zero entry point. */
-    h3zero_stream_ctx_t sctx;
-    memset(&sctx, 0, sizeof(sctx));
-    sctx.stream_id = f.sid;
-    int rc = moq_pico_wt_callback(f.h.test_ctx->cnx_client, NULL, 0,
-                                  picohttp_callback_reset, &sctx,
-                                  f.h.client_conn);
-    CHECK(rc == 0);
+    observers_install();
+    const uint64_t RESET_CODE = 0x7;
+    int grants_before = grants_for(c, f.sid);
 
-    /* Retained bytes abandoned and freed; the entry is gone. */
-    CHECK(rx_entry(&f, f.sid) == NULL);
-    CHECK(g_acct.live == live_before - 1);   /* the retention buffer went */
-
-    /* CAUSAL: the reset must reach the bridge/session, not merely clear the
-     * adapter's storage. Before the reset this stream carried retained bridge
-     * work; delivering the reset retires it there, so the bridge no longer
-     * holds pending work for it. Dropping only
-     * moq_transport_bridge_on_peer_stream_reset() -- while the adapter still
-     * frees its buffers -- leaves that pending work behind and fails here. */
-    CHECK(!moq_transport_bridge_stream_has_pending(f.h.client_conn->bridge,
-                                                   f.sid));
-    CHECK(!moq_pico_wt_conn_is_fatal(f.h.client_conn));
-
-    /* No later grant for a reset stream. */
-    for (int i = 0; i < 20; i++) {
-        moq_pico_wt_service(f.h.client_conn, f.h.now);
-        if (pico_wt_harness_pump(&f.h, 50) != 0) break;
+    /* The publisher resets the subgroup; the RESET_STREAM crosses the
+     * simulated transport into the receiver's production callback. */
+    CHECK(moq_session_reset_subgroup(f.h.server_session, f.sg, RESET_CODE, f.h.now) == MOQ_OK);
+    int exit_idx = -1;
+    for (int i = 0; i < 400 && exit_idx < 0; i++) {
+        moq_pico_wt_service(f.h.server_conn, f.h.now);
+        if (pico_wt_harness_pump(&f.h, 20) != 0) break;
+        exit_idx = obs_find(c, (int)picohttp_callback_reset, f.sid, 1);
     }
-    pw_rx_stream_t *after = rx_entry(&f, f.sid);
-    CHECK(after == NULL || after->granted == granted_at_reset);
+    int entry_idx = obs_find(c, (int)picohttp_callback_reset, f.sid, 0);
+    CHECK(exit_idx >= 0);                   /* the reset reached the receiver's callback */
+    CHECK(entry_idx >= 0 && entry_idx < exit_idx);
+    CHECK(observers_complete());
+    if (exit_idx < 0 || entry_idx < 0 || entry_idx >= exit_idx || !observers_complete()) {
+        /* prerequisite failed: unwind without touching the records */
+        observers_remove();
+        pico_wt_harness_cleanup(&f.h);
+        return;
+    }
+    const obs_rec_t *at_entry = &g_obs[entry_idx], *at_exit = &g_obs[exit_idx];
 
+    /* Adapter layer, at the callback's return: entry and retained bytes gone. */
+    CHECK(at_entry->entry_present && at_entry->entry_buf_len > 0);
+    CHECK(!at_exit->entry_present);
+    CHECK(at_exit->acct_live == at_entry->acct_live - 1);   /* exactly the retention buffer */
+    CHECK(rx_entry(&f, f.sid) == NULL);
+    CHECK(!moq_pico_wt_conn_is_fatal(c));
+    CHECK(at_exit->grants == grants_before);
+
+    /* Ownership boundary: the bytes the bridge was given are what picoquic
+     * delivered to the callback minus what the adapter still held. The
+     * expected inventory is the whole objects that fit in them. */
+    CHECK(at_entry->entry_delivered >= at_entry->entry_buf_len);
+    uint64_t fed = at_entry->entry_delivered - at_entry->entry_buf_len;
+    int expected = expected_objects_in(fed, f.published);
+    printf("reset-while-paused: delivered=%llu held=%zu fed=%llu published=%u expected_objects=%d\n",
+           (unsigned long long)at_entry->entry_delivered, at_entry->entry_buf_len, (unsigned long long)fed,
+           f.published, expected);
+    CHECK(expected >= 1 && (uint32_t)expected < f.published);   /* some accepted, the tail excluded */
+
+    /* Bridge layer: bounded poll/service to a fixed point. */
+    enum { INV_MAX = OBJ_COUNT + 8 };
+    uint64_t ids[INV_MAX];
+    int n_ids = 0, resets = 0, other = 0, reset_after_last_object = -1, bad_payload = 0, wrong_sub = 0;
+    bool inventory_overflow = false;
+    uint64_t reset_code_seen = UINT64_MAX;
+    bool reset_matches_sub = false;
+    bool pending_cleared = false;
+    for (int round = 0; round < 400 && !(pending_cleared && resets > 0); round++) {
+        moq_event_t ev;
+        while (moq_session_poll_events(f.h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                const moq_object_received_event_t *o = &ev.u.object_received;
+                if (n_ids < INV_MAX) ids[n_ids] = o->object_id; else inventory_overflow = true;
+                if (!moq_subscription_eq(o->sub, f.client_sub) || o->group_id != 0 || o->subgroup_id != 0) wrong_sub++;
+                bool good = o->payload != NULL && moq_rcbuf_len(o->payload) == OBJ_BYTES;
+                if (good) {
+                    const uint8_t *d = moq_rcbuf_data(o->payload);
+                    for (size_t k = 0; k < OBJ_BYTES; k++)
+                        if (d[k] != (uint8_t)(o->object_id & 0xff)) { good = false; break; }
+                }
+                if (!good) bad_payload++;
+                n_ids++;
+            } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                resets++;
+                reset_code_seen = ev.u.subgroup_reset.error_code;
+                reset_matches_sub = moq_subscription_eq(ev.u.subgroup_reset.sub, f.client_sub) &&
+                                    ev.u.subgroup_reset.group_id == 0 && ev.u.subgroup_reset.subgroup_id == 0;
+                reset_after_last_object = n_ids;
+            } else {
+                other++;
+            }
+            moq_event_cleanup(&ev);
+        }
+        moq_pico_wt_service(c, f.h.now);
+        pending_cleared = !moq_transport_bridge_stream_has_pending(c->bridge, f.sid);
+    }
+    CHECK(pending_cleared);                 /* a timeout here is a failure, not settlement */
+    CHECK(!inventory_overflow);             /* the finite inventory represented every observation */
+    CHECK(resets == 1);
+    CHECK(reset_matches_sub && reset_code_seen == RESET_CODE);
+    CHECK(reset_after_last_object == n_ids);   /* the terminal came after every retained object */
+    /* exact set: the expected whole objects, ids 0..expected-1 in order, each
+     * with the fixture's payload, on this subscription/group/subgroup */
+    CHECK(n_ids == expected);
+    bool exact = n_ids == expected && !inventory_overflow;
+    for (int i = 0; exact && i < n_ids; i++) if (ids[i] != (uint64_t)i) exact = false;
+    CHECK(exact);
+    CHECK(bad_payload == 0 && wrong_sub == 0);
+    CHECK(other == 0);
+
+    /* More service adds nothing: no duplicate terminal, no credit. */
+    int extra_resets = 0, extra_objects = 0;
+    for (int round = 0; round < 20; round++) {
+        moq_event_t ev;
+        while (moq_session_poll_events(f.h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) extra_resets++;
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) extra_objects++;
+            moq_event_cleanup(&ev);
+        }
+        moq_pico_wt_service(c, f.h.now);
+        CHECK(pico_wt_harness_pump(&f.h, 20) == 0);   /* the quiet tail must actually be pumped */
+    }
+    CHECK(extra_resets == 0 && extra_objects == 0);
+    CHECK(observers_complete());
+    CHECK(grants_for(c, f.sid) == grants_before);
+    CHECK(rx_entry(&f, f.sid) == NULL);
+    CHECK(!moq_pico_wt_conn_is_fatal(c));
+    CHECK(g_acct.live == 1);                /* only the receive table remains */
+
+    observers_remove();
     pico_wt_harness_cleanup(&f.h);
 }
 
 /*
  * STOP_SENDING, part 1 of 2: the real transport path on a real BIDIRECTIONAL
- * stream.
+ * stream, and the boundary between STOP alone and a later protocol terminal.
  *
  * A draft-18 FETCH request rides a client-initiated bidi, so the client tracks
- * it as a PW_RX_BIDI receive entry. The server aborts the client's SENDING half
- * with a genuine STOP_SENDING through its endpoint vtable, and the frame
- * crosses the simulated transport into the client's production callback.
+ * it as a PW_RX_BIDI receive entry. The server aborts the client's SENDING
+ * half with a genuine STOP_SENDING through its endpoint vtable. What follows
+ * on the wire is the protocol's own cancellation: the client resets its send
+ * half, the publisher resets the FETCH data stream, the fetcher's FETCH state
+ * ends on that data-stream reset and it terminates the request stream's
+ * remaining direction with its own STOP_SENDING.
  *
- * What this half proves is the transport reality: the stream is bidirectional,
- * the signal really arrives, the adapter keeps its receive entry, and STOP by
- * itself neither grants receive credit nor turns the connection fatal. It makes
- * NO claim about the request staying live -- the session may legitimately
- * cancel it, which is what STOP_SENDING asks for. The retained-state invariant
- * is proved separately in part 2.
+ * Pinned, by callback-boundary observation on the CLIENT adapter (the two
+ * sides are told apart by connection identity): at the exit of the peer-STOP
+ * callback the receive entry is still present and no receive credit was
+ * granted for it -- STOP alone retires nothing; the entry is retired only by
+ * the client's own local STOP, which comes after the data-stream RESET
+ * callback; afterwards no credit is granted to the retired stream; and the
+ * application sees exactly one FETCH_RESET for its fetch handle with
+ * data_stream set. The retained-state invariant is proved separately in part 2.
  */
 static void test_stop_sending_on_real_request_bidi(void)
 {
@@ -543,53 +801,104 @@ static void test_stop_sending_on_real_request_bidi(void)
     }
     moq_pico_wt_service(h.server_conn, h.now);
     CHECK(pico_wt_harness_pump(&h, 2000) == 0);
+    {   /* the application has its FETCH_OK; nothing else is pending */
+        moq_event_t ev;
+        while (moq_session_poll_events(h.client_session, &ev, 1) > 0) moq_event_cleanup(&ev);
+    }
 
     /* Locate the tracked BIDIRECTIONAL receive entry. */
+    moq_pico_wt_conn_t *c = h.client_conn;
     uint64_t bidi_sid = UINT64_MAX;
-    for (size_t i = 0; i < h.client_conn->rx_count; i++) {
-        pw_rx_stream_t *st = &h.client_conn->rx[i];
+    for (size_t i = 0; i < c->rx_count; i++) {
+        pw_rx_stream_t *st = &c->rx[i];
         if (st->active && st->kind == PW_RX_BIDI) bidi_sid = st->stream_id;
     }
     CHECK(bidi_sid != UINT64_MAX);
     if (bidi_sid == UINT64_MAX) { pico_wt_harness_cleanup(&h); return; }
     CHECK((bidi_sid & 2) == 0);          /* genuinely bidirectional */
 
-    uint32_t stops_before = (uint32_t)h.client_conn->stop_sending_count;
-    uint64_t granted_before = 0;
-    for (size_t i = 0; i < h.client_conn->rx_count; i++)
-        if (h.client_conn->rx[i].active &&
-            h.client_conn->rx[i].stream_id == bidi_sid)
-            granted_before = h.client_conn->rx[i].granted;
+    observers_install();
+    uint32_t stops_before = (uint32_t)c->stop_sending_count;
+    int grants_before = grants_for(c, bidi_sid);
 
     /* Real STOP_SENDING from the peer, emitted through the server's endpoint
-     * vtable and carried by the simulation -- not an injected callback. */
+     * vtable and carried by the simulation -- not an injected callback. Pump
+     * until the client has issued its own STOP of the request stream (the
+     * expected end of the exchange) or the bound runs out. */
     moq_transport_endpoint_ops_t *ops = &h.server_conn->endpoint_ops;
     CHECK(ops->stop_sending != NULL);
     moq_transport_result_t sr =
         ops->stop_sending(&h.server_conn->endpoint_ctx, bidi_sid, 0x2);
     CHECK(sr == MOQ_TRANSPORT_OK);
-    for (int i = 0; i < 40; i++) {
+    for (int i = 0; i < 80; i++) {
         moq_pico_wt_service(h.server_conn, h.now);
-        moq_pico_wt_service(h.client_conn, h.now);
-        if (pico_wt_harness_pump(&h, 50) != 0) break;
+        moq_pico_wt_service(c, h.now);
+        CHECK(pico_wt_harness_pump(&h, 20) == 0);
+        if (obs_find(c, OBS_LOCAL_STOP, bidi_sid, 0) >= 0) break;
     }
+    CHECK(observers_complete());            /* the record is a complete inventory */
 
     /* The signal crossed the transport and reached the production callback. */
-    CHECK(h.client_conn->stop_sending_count > stops_before);
-    CHECK(h.client_conn->last_stop_sending_stream_id == bidi_sid);
+    CHECK(c->stop_sending_count > stops_before);
+    CHECK(c->last_stop_sending_stream_id == bidi_sid);
 
-    /* The adapter kept its receive entry: STOP does not retire the rx side. */
-    pw_rx_stream_t *after = NULL;
-    for (size_t i = 0; i < h.client_conn->rx_count; i++)
-        if (h.client_conn->rx[i].active &&
-            h.client_conn->rx[i].stream_id == bidi_sid)
-            after = &h.client_conn->rx[i];
-    CHECK(after != NULL);
+    /* STOP alone: at the exit of the peer-STOP callback the entry is present
+     * and no credit was granted for it. */
+    int stop_exit = obs_find(c, (int)picohttp_callback_stop_sending, bidi_sid, 1);
+    CHECK(stop_exit >= 0);
+    if (stop_exit >= 0) {
+        CHECK(g_obs[stop_exit].entry_present);
+        CHECK(g_obs[stop_exit].grants == grants_before);
+    }
 
-    /* STOP alone grants no credit and is not fatal. */
-    CHECK(after == NULL || after->granted == granted_before);
-    CHECK(!moq_pico_wt_conn_is_fatal(h.client_conn));
+    /* The later terminal: the FETCH data stream's RESET (a unidirectional
+     * peer stream) reaches the client, and only once that RESET is being
+     * handled does the client's own local STOP of the request stream retire
+     * the entry -- it is generated while the RESET callback runs (entry
+     * record before it, exit record after it), never before. */
+    int data_reset_entry = -1, data_reset_exit = -1, local_stop = -1, reset_count = 0;
+    for (int i = 0; i < g_obs_n; i++) {
+        const obs_rec_t *r = &g_obs[i];
+        if (r->conn != c) continue;
+        if (r->event == (int)picohttp_callback_reset && (r->sid & 2u)) {
+            if (r->phase == 0 && data_reset_entry < 0) data_reset_entry = i;
+            if (r->phase == 1) { reset_count++; if (data_reset_exit < 0) data_reset_exit = i; }
+        }
+        if (r->event == OBS_LOCAL_STOP && r->sid == bidi_sid && local_stop < 0) local_stop = i;
+    }
+    CHECK(reset_count == 1);
+    CHECK(data_reset_entry >= 0 && data_reset_exit >= 0 && local_stop >= 0);
+    CHECK(stop_exit >= 0 && data_reset_entry > stop_exit);   /* RESET came after the STOP boundary */
+    CHECK(local_stop > data_reset_entry && local_stop < data_reset_exit);   /* retired while handling the RESET */
+    CHECK(local_stop >= 0 && g_obs[local_stop].entry_present);   /* alive until that very STOP */
+    /* no other retirement: the entry survived every record before the local STOP */
+    bool survived_until_local_stop = true;
+    for (int i = 0; i < local_stop; i++)
+        if (g_obs[i].conn == c && g_obs[i].sid == bidi_sid && !g_obs[i].entry_present)
+            survived_until_local_stop = false;
+    CHECK(survived_until_local_stop);
+    CHECK(entry_of(c, bidi_sid) == NULL);                 /* retired now */
+    CHECK(grants_for(c, bidi_sid) == grants_before);      /* no grant through STOP, none after the terminal */
+    CHECK(!moq_pico_wt_conn_is_fatal(c));
 
+    /* The application's view: exactly one FETCH_RESET for this fetch, from
+     * the data stream. */
+    int fetch_resets = 0; bool reset_for_cf = false, reset_from_data = false;
+    {
+        moq_event_t ev;
+        while (moq_session_poll_events(h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_FETCH_RESET) {
+                fetch_resets++;
+                reset_for_cf = moq_fetch_eq(ev.u.fetch_reset.fetch, cf);
+                reset_from_data = ev.u.fetch_reset.data_stream;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    CHECK(fetch_resets == 1 && reset_for_cf && reset_from_data);
+    CHECK(observers_complete());
+
+    observers_remove();
     pico_wt_harness_cleanup(&h);
 }
 
@@ -1065,6 +1374,7 @@ int main(void)
 {
     test_pre_ready_grant_is_owed();
     test_fin_while_paused();
+    test_observer_recorders_fail_closed();
     test_reset_while_paused();
     test_stop_sending_on_real_request_bidi();
     test_stop_sending_preserves_retained_bidi_state();

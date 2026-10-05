@@ -231,6 +231,10 @@ if(MOQ_BUILD_TESTS)
         tests/test_managed_server_eventdriven.cpp)
     target_link_libraries(test_mvfst_managed_server_eventdriven PRIVATE
         moq::adapter-mvfst mvfst::mvfst)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_mvfst_managed_server_eventdriven PRIVATE
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
     add_test(NAME mvfst_managed_server_eventdriven
         COMMAND test_mvfst_managed_server_eventdriven)
     set_tests_properties(mvfst_managed_server_eventdriven PROPERTIES TIMEOUT 20)
@@ -310,6 +314,24 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_managed_stream_credit COMMAND test_mvfst_managed_stream_credit)
     set_tests_properties(mvfst_managed_stream_credit PROPERTIES TIMEOUT 30)
 
+    # Receive admission (held input) over a real loopback, one wire profile
+    # per process (loopback_pair is one QuicServer per process). Observes the
+    # adapter's held-chunk transitions through the test-internals seam.
+    add_executable(test_mvfst_hold_input tests/test_hold_input.cpp)
+    target_link_libraries(test_mvfst_hold_input PRIVATE
+        moq-adapter-mvfst-test-internals mvfst::mvfst)
+    # One connection per process: the loopback schedule, then the injected
+    # rows (crafted read results through the test-internals input seam).
+    foreach(_v 16 18)
+        add_test(NAME mvfst_hold_input_d${_v} COMMAND test_mvfst_hold_input ${_v})
+        set_tests_properties(mvfst_hold_input_d${_v} PROPERTIES TIMEOUT 60)
+        foreach(_mode fin wb backing fail-hold fail-copy fail-replay)
+            add_test(NAME mvfst_hold_input_${_mode}_d${_v}
+                COMMAND test_mvfst_hold_input ${_v} ${_mode})
+            set_tests_properties(mvfst_hold_input_${_mode}_d${_v} PROPERTIES TIMEOUT 60)
+        endforeach()
+    endforeach()
+
     # Application service-deadline fold: drives compute_earliest_deadline() (the
     # shared source for the client deadline_to and server server_deadline_to
     # reschedules) through the test-internals seam. No network.
@@ -341,15 +363,25 @@ if(MOQ_BUILD_TESTS)
     set_tests_properties(mvfst_managed_app_deadline_timer PROPERTIES TIMEOUT 40)
 
     # -- Build-tree consumer tests ------------------------------------
+    include(tests/consumer_context.cmake)
+    set(MOQ_ADAPTER_CONSUMER_TEST_ROOT "" CACHE PATH "Private adapter consumer test artifacts")
+    set(_consumer_root "${CMAKE_CURRENT_BINARY_DIR}")
+    if(MOQ_ADAPTER_CONSUMER_TEST_ROOT)
+        set(_consumer_root "${MOQ_ADAPTER_CONSUMER_TEST_ROOT}/mvfst")
+    endif()
+    file(MAKE_DIRECTORY "${_consumer_root}")
+    set(_consumer_cache "${_consumer_root}/parent-context.cmake")
+    moq_write_consumer_context("${_consumer_cache}")
     # C-only consumer: configure + build against build-tree config.
     set(_c_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/c_consumer_test")
-    set(_c_consumer_bin "${CMAKE_CURRENT_BINARY_DIR}/c_consumer_build")
+    set(_c_consumer_bin "${_consumer_root}/c_consumer_build")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_c_consumer_test.cmake"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
         "    -S \"${_c_consumer_src}\"\n"
         "    -B \"${_c_consumer_bin}\"\n"
-        "    -Dlibmoq_DIR=${PROJECT_BINARY_DIR}\n"
-        "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
+        "    \"-Dlibmoq_DIR=${PROJECT_BINARY_DIR}\"\n"
+        "    -C \"${_consumer_cache}\"\n"
+        "    -G \"${CMAKE_GENERATOR}\"\n"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -364,30 +396,10 @@ if(MOQ_BUILD_TESTS)
     # -- Install-tree consumer tests ----------------------------------
     # Install to a temp prefix, then build C and C++ consumers against it.
     set(_cxx_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/cxx_consumer_test")
-    set(_install_prefix "${CMAKE_CURRENT_BINARY_DIR}/install_test_prefix")
-    set(_install_c_bin "${CMAKE_CURRENT_BINARY_DIR}/install_c_consumer_build")
-    set(_install_cxx_bin "${CMAKE_CURRENT_BINARY_DIR}/install_cxx_consumer_build")
+    set(_install_prefix "${_consumer_root}/install_test_prefix")
+    set(_install_c_bin "${_consumer_root}/install_c_consumer_build")
+    set(_install_cxx_bin "${_consumer_root}/install_cxx_consumer_build")
 
-    # The installed libmoq config re-runs find_package(mvfst) (-> fizz, folly,
-    # fmt, ...) in the consumer. Without guidance it rediscovers whatever those
-    # packages resolve to ambiently, which need not be the graph this build
-    # compiled against (e.g. a different fmt), and it loses this build's
-    # toolchain link context. Forward the exact package directories THIS build
-    # resolved plus its link flags so the consumer builds against the same graph
-    # and toolchain. Every value is a configured CMake variable (empty when a
-    # dep was found ambiently / no extra flags were set, so the forward is a
-    # no-op there) — never a hardcoded path. Each is emitted as ONE quoted
-    # argument so a value with spaces cannot split.
-    set(_fwd_pkg_dirs "")
-    foreach(_pkg mvfst folly Fizz fmt liboqs Sodium Boost Glog gflags)
-        if(DEFINED ${_pkg}_DIR AND NOT "${${_pkg}_DIR}" STREQUAL "")
-            string(APPEND _fwd_pkg_dirs "    \"-D${_pkg}_DIR=${${_pkg}_DIR}\"\n")
-        endif()
-    endforeach()
-    if(NOT "${CMAKE_EXE_LINKER_FLAGS}" STREQUAL "")
-        string(APPEND _fwd_pkg_dirs
-            "    \"-DCMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}\"\n")
-    endif()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_install_consumer_test.cmake"
         "# Build before install to ensure targets are up to date\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -407,9 +419,9 @@ if(MOQ_BUILD_TESTS)
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
         "    -S \"${_c_consumer_src}\"\n"
         "    -B \"${_install_c_bin}\"\n"
-        "    -DCMAKE_PREFIX_PATH=${_install_prefix}\n"
-        "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
-        "${_fwd_pkg_dirs}"
+        "    \"-Dlibmoq_DIR=${_install_prefix}/${CMAKE_INSTALL_LIBDIR}/cmake/libmoq\"\n"
+        "    -C \"${_consumer_cache}\"\n"
+        "    -G \"${CMAKE_GENERATOR}\"\n"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"C consumer configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
@@ -421,9 +433,9 @@ if(MOQ_BUILD_TESTS)
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"
         "    -S \"${_cxx_consumer_src}\"\n"
         "    -B \"${_install_cxx_bin}\"\n"
-        "    -DCMAKE_PREFIX_PATH=${_install_prefix}\n"
-        "    -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}\n"
-        "${_fwd_pkg_dirs}"
+        "    \"-Dlibmoq_DIR=${_install_prefix}/${CMAKE_INSTALL_LIBDIR}/cmake/libmoq\"\n"
+        "    -C \"${_consumer_cache}\"\n"
+        "    -G \"${CMAKE_GENERATOR}\"\n"
         "    RESULT_VARIABLE rc)\n"
         "if(rc)\n  message(FATAL_ERROR \"C++ consumer configure failed\")\nendif()\n"
         "execute_process(COMMAND \${CMAKE_COMMAND}\n"

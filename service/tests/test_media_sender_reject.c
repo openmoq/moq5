@@ -10,7 +10,8 @@
 #include <moq/rcbuf.h>
 #include <moq/sim.h>
 #include <moq/session.h>
-#include "test_session_support.h"
+#include "test_support.h"
+#include "test_alloc_support.h"
 
 #include <stddef.h>
 #include <stdint.h>

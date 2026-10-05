@@ -855,6 +855,40 @@ int main()
         }
     }
 
+    // FETCH_RESET converts to its own alternative with the peer's stream
+    // code and source flags intact (never to fetch_error, never to unknown),
+    // and the facade item wrapper exposes the matching accessors.
+    {
+        moq_event_t e{};
+        e.kind = MOQ_EVENT_FETCH_RESET;
+        e.detail_size = sizeof(moq_fetch_reset_event_t);
+        e.u.fetch_reset.fetch._opaque = 0x1234;
+        e.u.fetch_reset.error_code = 0x7;
+        e.u.fetch_reset.data_stream = false;
+        e.u.fetch_reset.stop_sending = true;
+        moq::polled_event pe(e);
+        moq::event_variant v = pe.variant();
+        MOQ_CHECK(std::holds_alternative<moq::event::fetch_reset>(v));
+        MOQ_CHECK(!std::holds_alternative<moq::event::fetch_error>(v));
+        MOQ_CHECK(!std::holds_alternative<moq::event::unknown>(v));
+        auto &fr = std::get<moq::event::fetch_reset>(v);
+        MOQ_CHECK(fr.fetch.raw()._opaque == 0x1234);
+        MOQ_CHECK(fr.error_code == 0x7);
+        MOQ_CHECK(!fr.data_stream);
+        MOQ_CHECK(fr.stop_sending);
+
+        moq_sub_fetch_item_t it{};
+        it.kind = MOQ_SUB_FETCH_RESET;
+        it.u.reset.error_code = 0x9;
+        it.u.reset.data_stream = true;
+        it.u.reset.stop_sending = false;
+        moq::polled_fetch_item pf(it);
+        MOQ_CHECK(pf.kind() == moq::sub_fetch_item_kind::reset);
+        MOQ_CHECK(pf.reset_error_code() == 0x9);
+        MOQ_CHECK(pf.reset_data_stream());
+        MOQ_CHECK(!pf.reset_stop_sending());
+    }
+
     MOQ_PASS("test_cpp_session");
     return failures;
 }

@@ -13,7 +13,7 @@
 #include <moq/control_d18.h>
 #include <moq/vi64.h>
 #include "test_support.h"
-#include "../support/fake_endpoint.h"
+#include "../support/held_bridge_driver.h"
 #include "../../core/src/bridge/transport_bridge_internal.h"
 #include "../../core/src/session/session_internal.h"
 
@@ -31,10 +31,10 @@ static int peer_init(d18_peer_t *p, moq_perspective_t persp,
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
     cfg.version = version;
     if (moq_session_create(&cfg, 0, &p->sess) < 0) return -1;
-    fake_endpoint_init(&p->ep, uni_base, uni_base + 1000);
+    held_endpoint_init(&p->ep, uni_base, uni_base + 1000);
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
-    if (moq_transport_bridge_create(&bcfg, p->sess, &p->ep.vtable, &p->ep,
+    if (held_bridge_create(&bcfg, p->sess, &p->ep.vtable, &p->ep,
                                     &p->bridge) < 0) {
         moq_session_destroy(p->sess);
         return -1;
@@ -44,7 +44,7 @@ static int peer_init(d18_peer_t *p, moq_perspective_t persp,
 
 static void peer_destroy(d18_peer_t *p)
 {
-    moq_transport_bridge_destroy(p->bridge);
+    held_bridge_destroy(p->bridge);
     moq_session_destroy(p->sess);
 }
 
@@ -55,7 +55,7 @@ static void deliver_uni(fake_endpoint_t *from, moq_transport_bridge_t *to,
     for (size_t i = 0; i < from->count; i++) {
         fake_op_t *o = &from->ops[i];
         if (o->kind == FAKE_OP_WRITE)
-            moq_transport_bridge_on_peer_uni_bytes(to, o->stream_id, o->data,
+            held_bridge_uni_bytes(to, o->stream_id, o->data,
                                                    o->data_len, o->fin, now);
     }
     fake_endpoint_clear_ops(from);
@@ -79,9 +79,9 @@ int main(void)
     /* == A. D18 SETUP handshake over the uni control pair ============= */
     {
         d18_peer_t c, sv;
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&c, MOQ_PERSPECTIVE_CLIENT,
+        HELD_REQUIRE_EQ_INT(peer_init(&c, MOQ_PERSPECTIVE_CLIENT,
                                         MOQ_VERSION_DRAFT_18, 1000), 0);
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
+        HELD_REQUIRE_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
                                         MOQ_VERSION_DRAFT_18, 3000), 0);
 
         /* Both sides run in uni-control-pair mode. */
@@ -96,8 +96,8 @@ int main(void)
 
         bool c_done = false, s_done = false;
         for (int i = 0; i < 8 && !(c_done && s_done); i++) {
-            moq_transport_bridge_service(c.bridge, 0);
-            moq_transport_bridge_service(sv.bridge, 0);
+            held_bridge_service(c.bridge, 0);
+            held_bridge_service(sv.bridge, 0);
             deliver_uni(&c.ep, sv.bridge, 0);
             deliver_uni(&sv.ep, c.bridge, 0);
             if (drain_setup_complete(c.sess)) c_done = true;
@@ -126,7 +126,7 @@ int main(void)
     /* == D16 stays in bidirectional control mode (unchanged) ========== */
     {
         d18_peer_t c;
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&c, MOQ_PERSPECTIVE_CLIENT,
+        HELD_REQUIRE_EQ_INT(peer_init(&c, MOQ_PERSPECTIVE_CLIENT,
                                         MOQ_VERSION_DRAFT_16, 1000), 0);
         MOQ_TEST_CHECK_EQ_INT((int)c.bridge->control_mode,
                               (int)BRIDGE_CONTROL_BIDI);
@@ -136,7 +136,7 @@ int main(void)
     /* == C. Padding stream is recognized and discarded ================ */
     {
         d18_peer_t sv;
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
+        HELD_REQUIRE_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
                                         MOQ_VERSION_DRAFT_18, 3000), 0);
 
         uint8_t pad[16];
@@ -144,7 +144,7 @@ int main(void)
         pad[n++] = 0x00;  /* a byte of padding payload (must be discarded) */
 
         MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_transport_bridge_on_peer_uni_bytes(sv.bridge, 5000,
+            (int)held_bridge_uni_bytes(sv.bridge, 5000,
                 pad, n, false, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(sv.bridge));
         /* Padding must not generate any session event. */
@@ -157,12 +157,12 @@ int main(void)
     /* == D. SETUP stream type delivered one byte at a time ============ */
     {
         d18_peer_t sv;
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
+        HELD_REQUIRE_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
                                         MOQ_VERSION_DRAFT_18, 3000), 0);
         /* Server sends its own SETUP first (so completion needs only the
          * peer SETUP we feed below). */
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(sv.sess, 0), (int)MOQ_OK);
-        moq_transport_bridge_service(sv.bridge, 0);
+        held_bridge_service(sv.bridge, 0);
 
         uint8_t setup[16];
         moq_buf_writer_t w;
@@ -173,7 +173,7 @@ int main(void)
          * classify as NEED_MORE and be retained without error. */
         for (size_t i = 0; i < slen; i++) {
             MOQ_TEST_CHECK_EQ_INT(
-                (int)moq_transport_bridge_on_peer_uni_bytes(sv.bridge, 7000,
+                (int)held_bridge_uni_bytes(sv.bridge, 7000,
                     &setup[i], 1, false, 0), (int)MOQ_OK);
             MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(sv.bridge));
         }
@@ -187,10 +187,10 @@ int main(void)
     /* == E. A non-SETUP control message closes the session =========== */
     {
         d18_peer_t sv;
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
+        HELD_REQUIRE_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
                                         MOQ_VERSION_DRAFT_18, 3000), 0);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(sv.sess, 0), (int)MOQ_OK);
-        moq_transport_bridge_service(sv.bridge, 0);
+        held_bridge_service(sv.bridge, 0);
 
         /* SETUP first establishes the peer control channel (stream 7100
          * classified as control). */
@@ -198,7 +198,7 @@ int main(void)
         moq_buf_writer_t sw;
         moq_buf_writer_init(&sw, setup, sizeof(setup));
         moq_d18_encode_setup(&sw);
-        moq_transport_bridge_on_peer_uni_bytes(sv.bridge, 7100, setup,
+        held_bridge_uni_bytes(sv.bridge, 7100, setup,
             moq_buf_writer_offset(&sw), false, 0);
         MOQ_TEST_CHECK_EQ_INT((int)sv.sess->state, (int)MOQ_SESS_ESTABLISHED);
 
@@ -209,7 +209,7 @@ int main(void)
         moq_buf_writer_init(&w, ctrl, sizeof(ctrl));
         MOQ_TEST_CHECK_EQ_INT((int)moq_buf_write_vi64(&w, 0x10), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)moq_buf_write_uint16(&w, 0), (int)MOQ_OK);
-        moq_transport_bridge_on_peer_uni_bytes(sv.bridge, 7100, ctrl,
+        held_bridge_uni_bytes(sv.bridge, 7100, ctrl,
             moq_buf_writer_offset(&w), false, 0);
 
         MOQ_TEST_CHECK_EQ_INT((int)sv.sess->state, (int)MOQ_SESS_CLOSED);
@@ -219,10 +219,10 @@ int main(void)
     /* == F. FIN on the peer control channel closes the session ======== */
     {
         d18_peer_t sv;
-        MOQ_TEST_CHECK_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
+        HELD_REQUIRE_EQ_INT(peer_init(&sv, MOQ_PERSPECTIVE_SERVER,
                                         MOQ_VERSION_DRAFT_18, 3000), 0);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_start(sv.sess, 0), (int)MOQ_OK);
-        moq_transport_bridge_service(sv.bridge, 0);
+        held_bridge_service(sv.bridge, 0);
 
         /* Deliver a SETUP then FIN the control channel; the transport-level
          * close of a control stream terminates the session. */
@@ -230,11 +230,11 @@ int main(void)
         moq_buf_writer_t w;
         moq_buf_writer_init(&w, setup, sizeof(setup));
         moq_d18_encode_setup(&w);
-        moq_transport_bridge_on_peer_uni_bytes(sv.bridge, 7200, setup,
+        held_bridge_uni_bytes(sv.bridge, 7200, setup,
             moq_buf_writer_offset(&w), false, 0);
         MOQ_TEST_CHECK_EQ_INT((int)sv.sess->state, (int)MOQ_SESS_ESTABLISHED);
 
-        moq_transport_bridge_on_peer_uni_bytes(sv.bridge, 7200, NULL, 0,
+        held_bridge_uni_bytes(sv.bridge, 7200, NULL, 0,
             true /* fin */, 0);
         /* The session was notified of the control-stream close. */
         MOQ_TEST_CHECK(moq_transport_bridge_is_terminal(sv.bridge) ||

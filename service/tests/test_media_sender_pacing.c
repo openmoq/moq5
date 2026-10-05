@@ -22,7 +22,10 @@
 #include <moq/session.h>
 #include <moq/publisher.h>   /* MOQ_PUB_DONE_TRACK_ENDED */
 #include <moq/msf.h>         /* MOQ_MSF_CATALOG_TRACK_NAME */
-#include "test_session_support.h"
+#include "test_support.h"
+#include "test_alloc_support.h"
+/* Expected handles/aliases require layout, not the private action helpers. */
+#include "../../core/src/session/session_internal.h"
 
 #include <stddef.h>
 #include <stdint.h>
