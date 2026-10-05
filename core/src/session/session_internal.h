@@ -688,6 +688,7 @@ typedef struct moq_pub_entry {
     int32_t occ_next;    /* next linked slot, -1 = end */
     int32_t occ_prev;    /* previous linked slot, -1 = head */
     bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
+    moq_publish_initial_params_t initial;   /* the peer publisher's own PUBLISH parameters */
 } moq_pub_entry_t;
 
 typedef enum moq_ts_state {
@@ -2806,6 +2807,13 @@ typedef struct moq_decoded_publish {
     uint64_t         largest_object;
     bool             has_expires;
     uint64_t         expires_ms;
+    /* Draft 21: the publisher's own initial Subscription Parameters on the PUBLISH. */
+    bool                     has_initial_params;
+    uint8_t                  subscriber_priority;
+    moq_group_order_t        group_order;
+    bool                     has_delivery_timeout;
+    uint64_t                 delivery_timeout_ms;   /* min non-zero of the two timeouts */
+    moq_decoded_loc_filter_t loc_filter;
 } moq_decoded_publish_t;
 
 typedef struct moq_decoded_publish_ok {

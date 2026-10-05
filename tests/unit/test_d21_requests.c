@@ -1751,6 +1751,49 @@ static void t_fetch_relative_start(void)
     moq_session_destroy(s);
 }
 
+/* The publisher's own initial Subscription Parameters on a PUBLISH are readable. */
+static void t_publish_initial_params(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_bytes_t parts[1];
+    moq_d21_publish_t pub;
+    memset(&pub, 0, sizeof(pub));
+    pub.track_namespace = ns_live(parts); pub.track_name = lit("ip"); pub.track_alias = 9;
+    pub.params.has_subscriber_priority = true; pub.params.subscriber_priority = 7;
+    pub.params.has_group_order = true; pub.params.group_order = MOQ_GROUP_ORDER_DESCENDING;
+    pub.params.has_object_delivery_timeout = true; pub.params.object_delivery_timeout_ms = 1500;
+    pub.params.has_location_filter = true;
+    pub.params.location_filter = lf(2, 4, 1, 0, 0);
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_encode_publish(&w, &pub), (int)MOQ_OK);
+    feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    moq_event_t ev;
+    MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev));
+    moq_publication_t ph = ev.u.publish_request.pub;
+    moq_event_cleanup(&ev);
+    moq_publish_initial_params_t ip;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_publish_initial_params(s, ph, &ip), (int)MOQ_OK);
+    MOQ_TEST_CHECK(ip.present && ip.subscriber_priority == 7 &&
+                   ip.group_order == MOQ_GROUP_ORDER_DESCENDING &&
+                   ip.has_delivery_timeout && ip.delivery_timeout_ms == 1500 &&
+                   ip.has_filter && ip.filter_field_count == 2 &&
+                   ip.filter_start_group == 4 && ip.filter_start_object == 1);
+    /* Defaults when omitted. */
+    memset(&pub.params, 0, sizeof(pub.params));
+    pub.request_id = 2; pub.track_name = lit("ip2"); pub.track_alias = 10;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_publish(&w, &pub);
+    feed_request(s, 8, msg, moq_buf_writer_offset(&w));
+    MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_PUBLISH_REQUEST, &ev));
+    ph = ev.u.publish_request.pub;
+    moq_event_cleanup(&ev);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_publish_initial_params(s, ph, &ip), (int)MOQ_OK);
+    MOQ_TEST_CHECK(ip.present && ip.subscriber_priority == 128 && !ip.has_filter && !ip.has_delivery_timeout);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1778,6 +1821,7 @@ int main(void)
     t_fill_stream();
     t_fill_lifecycle();
     t_fetch_relative_start();
+    t_publish_initial_params();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

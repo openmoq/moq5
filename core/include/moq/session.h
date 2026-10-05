@@ -1407,6 +1407,26 @@ typedef struct moq_publish_request_event {
     uint64_t           expires_ms;
 } moq_publish_request_event_t;
 
+/* The publisher's own initial Subscription Parameters on an inbound PUBLISH (draft 21
+ * 9.8). `present` is false when the draft carries none (the other fields then hold the
+ * defaults: priority 128, default group order, no timeout, no filter). Too large for
+ * the request event, so it is read with moq_session_publish_initial_params() while the
+ * request is pending or established. */
+typedef struct moq_publish_initial_params {
+    bool               present;
+    uint8_t            subscriber_priority;
+    moq_group_order_t  group_order;
+    bool               has_delivery_timeout;
+    uint64_t           delivery_timeout_ms;
+    bool               has_filter;               /* a LOCATION_FILTER was carried */
+    uint8_t            filter_field_count;       /* 0..4 fields on the wire */
+    uint64_t           filter_start_group, filter_start_object;
+    uint64_t           filter_end_group_delta, filter_end_object;
+} moq_publish_initial_params_t;
+
+MOQ_API moq_result_t moq_session_publish_initial_params(
+    moq_session_t *s, moq_publication_t pub, moq_publish_initial_params_t *out);
+
 typedef struct moq_publish_ok_event {
     moq_publication_t  pub;
     bool               send_allowed;

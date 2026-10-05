@@ -1731,6 +1731,19 @@ static moq_result_t d21_process_request_stream(
         d.largest_object = pub.params.largest_object;
         d.has_expires = pub.params.has_expires;
         d.expires_ms = pub.params.expires_ms;
+        d.has_initial_params = true;
+        d.subscriber_priority = pub.params.has_subscriber_priority
+            ? pub.params.subscriber_priority : 128;
+        d.group_order = pub.params.has_group_order
+            ? (moq_group_order_t)pub.params.group_order : MOQ_GROUP_ORDER_DEFAULT;
+        {
+            bool has_dt = false; uint64_t dt_us = 0;
+            (void)d21_map_delivery_timeout(&pub.params, &has_dt, &dt_us);
+            d.has_delivery_timeout = has_dt;
+            d.delivery_timeout_ms = dt_us / 1000u;
+        }
+        moq_d21_profile_surface_loc(&d.loc_filter, &pub.params.location_filter,
+                                    pub.params.has_location_filter, false);
 
         rc = d21_validate_inbound_request_stream(s, ref, env.msg_type,
                                                  pub.request_id, &d.endpoint);

@@ -748,6 +748,19 @@ moq_result_t session_core_on_publish(moq_session_t *s,
      * publication (send_allowed is only consumed by the publisher-role send path, so
      * setting it on this subscriber-role entry is inert there). */
     entry->send_allowed = d->forward;
+    entry->initial = (moq_publish_initial_params_t){ .present = d->has_initial_params,
+        .subscriber_priority = d->has_initial_params ? d->subscriber_priority : 128,
+        .group_order = d->has_initial_params ? d->group_order : MOQ_GROUP_ORDER_DEFAULT,
+        .has_delivery_timeout = d->has_initial_params && d->has_delivery_timeout,
+        .delivery_timeout_ms = d->has_delivery_timeout ? d->delivery_timeout_ms : 0 };
+    if (d->has_initial_params && d->loc_filter.present) {
+        entry->initial.has_filter = true;
+        entry->initial.filter_field_count = d->loc_filter.field_count;
+        entry->initial.filter_start_group = d->loc_filter.start_group;
+        entry->initial.filter_start_object = d->loc_filter.start_object;
+        entry->initial.filter_end_group_delta = d->loc_filter.end_group_delta;
+        entry->initial.filter_end_object = d->loc_filter.end_object;
+    }
     d->endpoint.kind = MOQ_REQ_PUBLISH;
     d->endpoint.slot = slot;
     if (d->endpoint.has_stream_ref) {
@@ -2276,4 +2289,15 @@ moq_result_t moq_session_request_goaway_publish(
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     return session_core_send_request_goaway(s, MOQ_REQUEST_FAMILY_PUBLISH, slot,
         cfg->new_session_uri.data, cfg->new_session_uri.len, cfg->timeout_ms);
+}
+
+moq_result_t moq_session_publish_initial_params(moq_session_t *s, moq_publication_t pub,
+                                                moq_publish_initial_params_t *out)
+{
+    if (!s || !out) return MOQ_ERR_INVAL;
+    int slot = pub_resolve_handle(s, pub);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    if (s->publishes[slot].role != MOQ_PUB_ROLE_SUBSCRIBER) return MOQ_ERR_WRONG_STATE;
+    *out = s->publishes[slot].initial;
+    return MOQ_OK;
 }
