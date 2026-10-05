@@ -79,24 +79,38 @@ per-task results are in `docs/draft21-implementation-plan.md`.
 | Area | Status |
 |------|--------|
 | Control codec, setup options, request layer | Full (draft 21 message set, REQUEST_OK for PUBLISH_OK, PUBLISH_SKIPPED, STATE_NOTIFY, GOAWAY without Request ID) |
-| SETUP AUTHORITY / PATH | Sent by a native-QUIC client (picoquic endpoint path); not yet by the other raw-QUIC adapters |
+| SETUP AUTHORITY / PATH | Sent by a native-QUIC client on the picoquic, msquic and mvfst endpoint paths (also under draft 18); not by the WebTransport paths, which must not |
 | Subscriptions | Concurrent subscriptions per Track, exact Location Filter (relative start, end Object), Range Filters declined with INVALID_FILTER |
-| PUBLISH accept | Priority / forward / filter / new-group request sent as a follow-up REQUEST_UPDATE |
-| Fill streams (replace Joining FETCH) | Publisher side: opened on SUBSCRIBE / REQUEST_UPDATE with Forward 1, reset on cancel, served from the facade's retained group |
+| PUBLISH | Accept sends non-default choices as a follow-up REQUEST_UPDATE; the publisher's initial parameters are readable (`moq_session_publish_initial_params`) |
+| Fill streams (replace Joining FETCH) | Both sides: request a fill on SUBSCRIBE / REQUEST_UPDATE, receive it as fetch events; publisher opens, serves (facade: from the retained group), resets on cancel; STOP_SENDING cancels only the fill |
 | Request streams | A FIN is not a cancellation; responder FIN without PUBLISH_DONE fails the request |
+| PUBLISH_STATE_NOTIFY | Received and validated; sendable on an established subscription (`moq_session_notify_subscription_state`) |
+| MAX_REQUEST_UPDATES | Advertised when configured (`moq_session_cfg_t::max_request_updates`); one update is processed and answered at a time, so no inbound counter enforces it and TOO_MANY_REQUEST_UPDATES is never sent |
 | Data plane | Shared with draft 18 plus FIRST_OBJECT (set by the original publisher), End of Timed-Out Range |
+| Delivery timeouts | The SUBGROUP timer starts at the subgroup's FIN, uses the first object's property override, and resets the stream on expiry (closed subgroups are kept until it fires). The per-object clock is not implemented: the session hands each object to the transport as it is written, so only an application that holds an object back (WOULD_BLOCK) could age one |
+| FILL_TIMEOUT | Carried and surfaced; not acted on. It bounds how long a relay waits for upstream sources (9.20.6), which an origin publisher never does |
 | LOC properties | LOC-04 ids (Timestamp 0x10, Frame Marking 0x09 as bytes, ...) selected by `moq_loc_profile_for_transport` |
 
-Not implemented: delivery-timeout timer semantics (subgroup timer at FIN, per-object clock,
-first-object property override), FILL_TIMEOUT expiry, the receiving side of a fill stream,
-PUBLISH_STATE_NOTIFY sending, Swift enums, per-adapter loopback tests for 21 beyond picoquic.
+Not implemented: Swift enums (to be done on a Mac), the per-object delivery clock, per-adapter
+loopback tests for 21 beyond picoquic (the other adapters take their version list from the
+shared endpoint list).
 
 ### Interop runner results (moq-contribution-interop-runner, native QUIC, driven by `tools/interop-adapter`)
 
 216 driven scenarios were run, each connected over ALPN `moqt-21`; requirements sharing scenarios
-were run together. Of the 638 catalog rows (270 testable): **58 PASS (52 MUST, 5 MUST NOT, 1
-SHOULD), 0 FAIL**, 212 not run, 103 not testable, 265 not applicable. WebTransport was not
-exercised (the picoquic WebTransport backend speaks the legacy dialect the runner rejects).
+were run together. Of the 638 catalog rows (270 testable): **57 PASS, 1 FAIL**, 212 not run, 103 not
+testable, 265 not applicable. `moq-interop-audit --draft 21` reports 173/173 required executable
+coverage. WebTransport was not exercised (the picoquic WebTransport backend speaks the legacy
+dialect the runner rejects).
+
+The one FAIL, `D21-5-2-MUST-130` (`d21-subgroup-completion-withheld-acknowledgments`): the
+runner asks for a 200 ms SUBGROUP_DELIVERY_TIMEOUT, holds each data stream at 64 bytes of flow
+control and expects a reset once the publisher has completed the subgroup. The placeholder
+`media_send` stalls under that flow control before it can finish a subgroup, so the spec's
+timer (which starts at the FIN, 5.2) never starts. The row passed in an earlier run only because
+the timer was then armed when the stream opened, which resets live subgroups early and is not
+what the draft says; that behaviour was removed. Closing the gap needs the placeholder publisher
+(or an adapter mode) to complete a subgroup while the receiver withholds credit.
 
 Rows fixed on this branch because the first full run failed them: FIRST_OBJECT on a new subgroup
 (D21-2-2-MUST-020), SETUP AUTHORITY / PATH including an empty path and a present empty query
@@ -110,15 +124,16 @@ Triage of the 212 rows not run (no row is reported as passed that was not):
 |--------|------|---------|
 | NOT_RUN: scenario not executable | about 109 | The runner has no executable profile for the scenario (100 scenario ids) or needs a different run configuration (six namespace-period probes are refused as an invalid run config) |
 | NOT_RUN: needs a publisher mode | about 103 | The scenario ran but its evaluator needs the publisher to originate something the placeholder `media_send` does not (property repeats, gap properties, padding streams, fetch data, a premature reset). The adapter has no per-scenario modes |
-| FIX | 0 | No remaining publisher-applicable testable FAIL |
+| FIX | 1 | D21-5-2-MUST-130 above |
 | DISPUTE | 0 | None raised |
 
-Draft 18 under the same adapter still has 7 FAIL rows, all existing gaps in the draft-18 profile
-that this work did not touch: SETUP AUTHORITY / PATH and FIRST_OBJECT are not sent under draft 18
-(D18-2-2-MUST-001, D18-3-2-MUST-001, D18-10-3-1-1-MUST-004, D18-10-3-1-2-MUST-004/005), a
-standalone FETCH for a track with no objects (D18-10-12-3-MUST-004) and SUBSCRIBE_TRACKS
-single response (D18-6-1-MUST-003). A full draft-18 baseline was not captured before this work,
-so "not worse" is argued from the code (the d18 profile is unchanged) rather than measured.
+Draft 18 under the same adapter: 69 PASS and 2 FAIL (a standalone FETCH for a track with no
+objects, D18-10-12-3-MUST-004, and the SUBSCRIBE_TRACKS single response, D18-6-1-MUST-003). The
+earlier 63 PASS / 7 FAIL became 69 / 2 because SETUP AUTHORITY / PATH and FIRST_OBJECT were also
+added to the draft-18 profile. A full Task 0 baseline was not captured, so "not worse" rests on
+that comparison.
 
-Also green: default tree 131/131, ASan/UBSan tree 131/131, all six fuzz targets clean for 30 s
-each, `scripts/check_profile_boundary.sh`; the `dev` tree's failing set equals `main`'s.
+Also green: default tree 131/131, ASan/UBSan tree 131/131, the simulator OOM test under drafts 18
+and 21, all six fuzz targets clean for 30 s each, `scripts/check_profile_boundary.sh`; the `dev`
+tree's failing set equals `main`'s. The seeded sweeps under draft 21 fail the same runners
+they fail under draft 18 (they assume the draft-16 start order).

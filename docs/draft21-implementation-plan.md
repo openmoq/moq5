@@ -843,3 +843,17 @@ Defaults are in brackets; I proceed with them unless told otherwise.
  - Appendix A.1 (20->21) is editorial only, so the real change surface is
    19/20; the 18->19 and 19->20 deltas must both be applied.
  - Adapters/bindings enumerate versions in many places (Task 8 grep sweep).
+
+
+## FOLLOW-UP PASS (after Task 10): items closed
+
+Closed after the first acceptance run: d18 SETUP AUTHORITY / PATH and FIRST_OBJECT; msquic and
+mvfst SETUP AUTHORITY / PATH; the facade end-Object test; the publisher's initial PUBLISH
+parameters (`moq_session_publish_initial_params`); advertising MAX_REQUEST_UPDATES (no inbound
+counter: updates are answered as processed); PUBLISH_STATE_NOTIFY sending; requesting a fill and
+receiving the fill stream (`moq_fill_request_t`, fetch events); the SUBGROUP delivery timer
+(starts at FIN, first-object override, closed subgroups kept until it fires); the OOM test under
+d21; the picoquic sim establish under d21; the runner audit (173/173). FILL_TIMEOUT is a relay's
+upstream-wait budget and does not apply to an origin publisher. Still open: Swift enums (on a Mac),
+the per-object delivery clock, D21-5-2-MUST-130 (see docs/conformance.md), per-adapter loopback
+tests for 21 beyond picoquic.
