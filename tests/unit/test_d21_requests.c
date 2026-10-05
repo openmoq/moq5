@@ -1899,6 +1899,15 @@ static void t_fill_end_to_end(void)
     MOQ_TEST_CHECK(moq_simpair_client(sp) && moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
     moq_simpair_destroy(sp);
 
+    /* A draft without fills refuses the request, before any state changes. */
+    moq_session_cfg_t c18;
+    moq_session_cfg_init_sized(&c18, sizeof(c18), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
+    c18.version = MOQ_VERSION_DRAFT_18;
+    moq_session_t *s18 = NULL;
+    MOQ_TEST_CHECK(moq_session_create(&c18, 0, &s18) >= 0);
+    moq_subscription_t h18;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_subscribe(s18, &cfg, 1, &h18), (int)MOQ_ERR_UNSUPPORTED);
+    moq_session_destroy(s18);
 }
 
 int main(void)
