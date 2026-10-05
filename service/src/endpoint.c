@@ -1260,6 +1260,8 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
      * it must use the sized initializer -- the pointer-only init stamps only the
      * frozen prefix and would leave SNI/ALPN disabled. */
     moq_mvfst_managed_cfg_init_sized(&fc, sizeof(fc));
+    fc.setup_authority = ep->setup_authority;   /* native-QUIC SETUP AUTHORITY / PATH */
+    fc.setup_path = ep->setup_path;
     fc.alloc = &ep->alloc;
     fc.perspective = MOQ_PERSPECTIVE_CLIENT;
     /* See the picoquic branch: grant the peer request capacity so it can
@@ -1329,6 +1331,8 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
     /* Sized init: this endpoint sets the appended `version` field, so the
      * pointer-only init (frozen prefix) would leave it at the default. */
     moq_msquic_managed_cfg_init_sized(&fc, sizeof(fc));
+    fc.setup_authority = ep->setup_authority;   /* native-QUIC SETUP AUTHORITY / PATH */
+    fc.setup_path = ep->setup_path;
     fc.alloc = &ep->alloc;
     fc.perspective = MOQ_PERSPECTIVE_CLIENT;
     fc.host = ep->host;                 /* remote + TLS server name (sni==host,

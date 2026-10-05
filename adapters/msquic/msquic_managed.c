@@ -203,6 +203,8 @@ struct moq_msquic_managed {
     uint32_t alpn_count;
     size_t max_connections;       /* resolved cap (0 -> 1), facade-wide */
     char *host;
+    char *setup_authority;        /* client SETUP AUTHORITY / PATH (NULL = send none) */
+    char *setup_path;
     char *cert_path;
     char *key_path;
 
@@ -497,6 +499,12 @@ static moq_result_t mgd_make_child(moq_msquic_managed_t *m,
      * here and the session keeps its default pool. */
     if (m->cfg.max_open_subgroups != 0)
         scfg.max_open_subgroups = m->cfg.max_open_subgroups;
+    if (m->setup_authority != NULL)
+        scfg.setup_authority = (moq_bytes_t){ (const uint8_t *)m->setup_authority,
+                                              strlen(m->setup_authority) };
+    if (m->setup_path != NULL)
+        scfg.setup_path = (moq_bytes_t){ (const uint8_t *)m->setup_path,
+                                         strlen(m->setup_path) };
     if (moq_session_create(&scfg, mgd_now_us(), &mc->session) < 0) {
         m->alloc.free(mc, sizeof(*mc), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
@@ -1511,6 +1519,8 @@ static void mgd_free(moq_msquic_managed_t *m)
         alloc.free(mc, sizeof(*mc), alloc.ctx);
     }
     mgd_strfree(&alloc, m->host);
+    mgd_strfree(&alloc, m->setup_authority);
+    mgd_strfree(&alloc, m->setup_path);
     mgd_strfree(&alloc, m->cert_path);
     mgd_strfree(&alloc, m->key_path);
     pthread_mutex_destroy(&m->mu);
@@ -1891,6 +1901,15 @@ moq_result_t moq_msquic_managed_create(
     m->host = mgd_strdup(&m->alloc, cfg->host);
     m->cert_path = mgd_strdup(&m->alloc, cfg->cert_path);
     m->key_path = mgd_strdup(&m->alloc, cfg->key_path);
+    if (MGD_CFG_HAS(cfg, setup_path)) {
+        m->setup_authority = mgd_strdup(&m->alloc, cfg->setup_authority);
+        m->setup_path = mgd_strdup(&m->alloc, cfg->setup_path);
+        if ((cfg->setup_authority != NULL && m->setup_authority == NULL) ||
+            (cfg->setup_path != NULL && m->setup_path == NULL)) {
+            mgd_free(m);
+            return MOQ_ERR_NOMEM;
+        }
+    }
     if ((cfg->host != NULL && m->host == NULL) ||
         (cfg->cert_path != NULL && m->cert_path == NULL) ||
         (cfg->key_path != NULL && m->key_path == NULL)) {
