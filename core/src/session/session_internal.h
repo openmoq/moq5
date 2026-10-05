@@ -7,6 +7,7 @@
 #include "moq/wire.h"
 #include "profile.h"
 #include "session_transport.h"
+#include "../internal/fill.h"
 #include <string.h>
 
 /* -- Defaults ------------------------------------------------------ */
@@ -227,6 +228,7 @@ typedef struct moq_sub_entry {
      * Joining-FETCH eligibility gate). Cleared on REQUEST_ERROR/teardown. */
     bool               update_has_filter;
     uint32_t           update_filter_type;
+    uint64_t           update_start_group, update_start_object, update_end_group;
     /* A REQUEST_UPDATE failed (REQUEST_ERROR): the subscription is awaiting the
      * mandatory terminal PUBLISH_DONE(UPDATE_FAILED). No new update may be sent,
      * and only that PUBLISH_DONE is a valid next message. */
@@ -261,7 +263,10 @@ typedef struct moq_sub_entry {
     bool                 fill_pending;
     /* Subscriber role: Request IDs of the SUBSCRIBE / updates that asked for a fill; a
      * fill stream carrying one of them is bound to this subscription. */
-    uint64_t             fill_expect_ids[4];
+    struct {
+        uint64_t request_id;
+        moq_fill_selection_t selection;
+    } fill_expect[4];
     uint8_t              fill_expect_n;
     uint64_t             fill_request_id;
     moq_decoded_fill_t   fill_req;
@@ -896,7 +901,7 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
 /* A FETCH_HEADER whose Request ID is the SUBSCRIBE / update that asked for a fill
  * (draft 21 3.4): create the subscriber-side fill fetch entry for it and return its
  * slot, or -1 when no subscription expects that id. The expectation is consumed and
- * MOQ_EVENT_FILL_OPENED is queued; -2 (nothing bound) when the event queue is full. */
+ * MOQ_EVENT_FILL_OPENED is queued; -2 (nothing bound) when event or fetch capacity is full. */
 int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id);
 void session_core_reset_fills_for_sub(moq_session_t *s, moq_subscription_t sub);
 bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,

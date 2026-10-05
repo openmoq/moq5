@@ -81,8 +81,8 @@ static void rx_record_finished(moq_session_t *s, uint64_t ref_v)
      * This is the FIN signal (never called on a STOP); identifiable RESET
      * terminations count via rx_record_reset_processed at the reset teardown
      * sites. The rx is still live here (freed by the caller right after).
-     * Fetch streams carry an invalid pub_handle AND an invalid sub, so this
-     * is a no-op for them. */
+     * Ordinary fetch streams have no subscription binding. Fill streams carry
+     * their owning subscription so they count too (draft 21 9.9). */
     int rxslot = rx_find_by_ref(s, moq_stream_ref_from_u64(ref_v));
     if (rxslot >= 0) {
         if (moq_publication_is_valid(s->rx_streams[rxslot].pub_handle))
@@ -1035,7 +1035,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 int fslot = fetch_find_by_request_id(s, fhdr.request_id);
                 if (fslot < 0) {
                     fslot = session_core_bind_fill_stream(s, fhdr.request_id);
-                    if (fslot == -2) {   /* no room for FILL_OPENED: re-drive later */
+                    if (fslot == -2) {   /* fill receive capacity full: re-drive later */
                         loop_rc = MOQ_ERR_WOULD_BLOCK;
                         goto compact;
                     }
@@ -1108,6 +1108,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 fe->data_stream_ref = stream_ref;
                 fe->data_stream_started = true;
                 rx->fetch = fe->handle;
+                if (fe->is_fill) rx->sub = fe->fill_sub;
                 cursor = post_cursor;
                 rx->hdr_len = 0;
 

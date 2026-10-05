@@ -281,11 +281,12 @@ static void t_fetch_range(void)
  * Part 2. Sessions
  * ===================================================================== */
 
-static moq_session_t *make_session(moq_perspective_t persp)
+static moq_session_t *make_session_max_fetches(moq_perspective_t persp, uint32_t max_fetches)
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
     cfg.version = MOQ_VERSION_DRAFT_21;
+    cfg.max_fetches = max_fetches;
     moq_session_t *s = NULL;
     if (moq_session_create(&cfg, 0, &s) < 0) return NULL;
     if (moq_session_start(s, 0) < 0) { moq_session_destroy(s); return NULL; }
@@ -300,6 +301,11 @@ static moq_session_t *make_session(moq_perspective_t persp)
     while (moq_session_poll_events(s, &e, 1) > 0) moq_event_cleanup(&e);
     while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
     return s;
+}
+
+static moq_session_t *make_session(moq_perspective_t persp)
+{
+    return make_session_max_fetches(persp, 0);
 }
 
 /* The first request message the session put on a bidi stream (a new stream or an
@@ -2353,6 +2359,375 @@ static void t_facade_fill_unsupported(void)
     moq_simpair_destroy(sp);
 }
 
+/* Empty fills open no stream (draft 21 3.4), and must not exhaust the
+ * subscriber's bookkeeping for later fills on the same subscription. */
+static void t_fill_after_empty_updates(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *cl = moq_simpair_client(sp), *sv = moq_simpair_server(sp);
+    moq_bytes_t parts[1];
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = ns_live(parts); sc.track_name = lit("fc");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START; sc.start_group = 9;
+    MOQ_TEST_CHECK(moq_session_note_object_published(sv, &sc.track_namespace,
+        sc.track_name, 3, 1) == MOQ_OK);
+    moq_subscription_t csub;
+    MOQ_TEST_CHECK(moq_session_subscribe(cl, &sc, moq_simpair_now_us(sp), &csub) == MOQ_OK);
+    moq_subscription_t ssub = fill_take_subscribe(sp);
+    moq_accept_subscribe_cfg_t ac;
+    moq_accept_subscribe_cfg_init(&ac);
+    MOQ_TEST_CHECK(moq_session_accept_subscribe(sv, ssub, &ac,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    moq_event_t ev;
+    while (moq_session_poll_events(cl, &ev, 1)) moq_event_cleanup(&ev);
+
+    int opened = 0, completed = 0;
+    for (int i = 0; i < 6; i++) {
+        moq_subscription_update_cfg_t uc;
+        moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+        uc.has_subscriber_priority = true; uc.subscriber_priority = 128;
+        uc.fill = current_group_fill(); uc.fill.present = true;
+        if (i < 5) uc.fill.has_location = false; /* inherit the empty live range */
+        if (i == 1) {
+            uc.has_filter = true; uc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+            uc.start_group = 10;
+        }
+        MOQ_TEST_CHECK(moq_session_update_subscription(cl, csub, &uc,
+            moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 16, NULL);
+        moq_fill_info_t info; moq_fetch_t fh;
+        moq_result_t rc = moq_session_open_fill(sv, ssub,
+            moq_simpair_now_us(sp), &info, &fh);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        MOQ_TEST_CHECK(info.empty == (i < 5));
+        if (rc == MOQ_OK && !info.empty)
+            MOQ_TEST_CHECK(moq_session_end_fetch(sv, fh, moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 16, NULL);
+        while (moq_session_poll_events(cl, &ev, 1)) {
+            if (ev.kind == MOQ_EVENT_FILL_OPENED) opened++;
+            if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) completed++;
+            moq_event_cleanup(&ev);
+        }
+    }
+    MOQ_TEST_CHECK_EQ_INT(opened, 1);
+    MOQ_TEST_CHECK_EQ_INT(completed, 1);
+    MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+}
+
+/* Do not send a request whose later fill stream cannot be tracked. A full
+ * expectation pool is local backpressure, and draining a fill allows retry. */
+static void t_fill_expectation_backpressure(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_subscription_t h; moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    uint64_t first_id = 0;
+    for (int i = 0; i < 4; i++) {
+        moq_subscription_update_cfg_t uc;
+        moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+        uc.has_subscriber_priority = true; uc.subscriber_priority = 128;
+        uc.fill = current_group_fill(); uc.fill.present = true;
+        MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_OK);
+        uint8_t msg[128];
+        size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
+        moq_control_envelope_t env; moq_d21_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        if (i == 0) first_id = update.request_id;
+        uint8_t ok[64]; moq_buf_writer_t w;
+        moq_buf_writer_init(&w, ok, sizeof(ok));
+        moq_d21_msg_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.has_largest = true; p.largest_group = 4; p.largest_object = 2;
+        MOQ_TEST_CHECK(moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+            &p, (moq_bytes_t){0}) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, ok,
+            moq_buf_writer_offset(&w), false, 11) == MOQ_OK);
+        moq_event_t ev;
+        MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIPTION_UPDATE_OK, &ev));
+        moq_event_cleanup(&ev);
+    }
+    moq_subscription_update_cfg_t uc;
+    moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+    uc.has_subscriber_priority = true; uc.subscriber_priority = 128;
+    uc.fill = current_group_fill(); uc.fill.present = true;
+    MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 12) == MOQ_ERR_WOULD_BLOCK);
+    uint8_t msg[128];
+    MOQ_TEST_CHECK_EQ_SIZE(take_bidi_message(s, msg, sizeof(msg), NULL), 0);
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, first_id) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(s, moq_stream_ref_from_u64(100),
+        msg, moq_buf_writer_offset(&w), true, 13) == MOQ_OK);
+    moq_event_t ev;
+    int opened = 0, completed = 0;
+    while (moq_session_poll_events(s, &ev, 1)) {
+        if (ev.kind == MOQ_EVENT_FILL_OPENED) opened++;
+        if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) completed++;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(opened, 1);
+    MOQ_TEST_CHECK_EQ_INT(completed, 1);
+    MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 14) == MOQ_OK);
+    MOQ_TEST_CHECK(take_bidi_message(s, msg, sizeof(msg), NULL) > 0);
+    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+    moq_session_destroy(s);
+}
+
+/* An empty selection with a Largest Object still opens no fill stream (3.4).
+ * Its facade request must complete and release the slot just like no content. */
+static void t_facade_fill_empty_range(void)
+{
+    static const struct {
+        const char *name;
+        bool own_location;
+        uint8_t fields;
+        uint64_t group, object, delta, end_object;
+        moq_subscribe_filter_t inherited;
+    } cases[] = {
+        { "after Largest", true, 2, 9, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
+        { "Next Group", true, 1, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
+        { "Next Object", true, 2, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
+        { "end before start", true, 4, 3, 1, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
+        { "inherited Next Object", false, 0, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT },
+        { "inherited Next Group", false, 0, 0, 0, 0, 0, MOQ_SUBSCRIBE_FILTER_NEXT_GROUP },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+        MOQ_TEST_CHECK(sp != NULL);
+        if (!sp) continue;
+        moq_sub_cfg_t cfg;
+        moq_sub_cfg_init_sized(&cfg, sizeof(cfg)); cfg.max_fetches = 1;
+        moq_subscriber_t *sub = NULL;
+        MOQ_TEST_CHECK(moq_sub_create(moq_simpair_client(sp), moq_alloc_default(),
+            &cfg, &sub) == MOQ_OK);
+        moq_bytes_t parts[1]; moq_sub_track_cfg_t tc;
+        fill_track_cfg(&tc, parts);
+        tc.filter = cases[i].inherited;
+        moq_fill_request_t fill;
+        memset(&fill, 0, sizeof(fill));
+        fill.has_location = cases[i].own_location; fill.field_count = cases[i].fields;
+        fill.start_group = cases[i].group; fill.start_object = cases[i].object;
+        fill.end_group_delta = cases[i].delta; fill.end_object = cases[i].end_object;
+        moq_sub_track_t *track = NULL; moq_sub_fetch_req_t *req = NULL;
+        MOQ_TEST_CHECK(moq_sub_subscribe_with_fill(sub, &tc, &fill,
+            moq_simpair_now_us(sp), &track, &req) == MOQ_OK);
+        moq_subscription_t ssub = fill_take_subscribe(sp);
+        moq_accept_subscribe_cfg_t ac; moq_accept_subscribe_cfg_init(&ac);
+        ac.has_largest = true; ac.largest_group = 3; ac.largest_object = 1;
+        moq_session_t *sv = moq_simpair_server(sp);
+        MOQ_TEST_CHECK(moq_session_accept_subscribe(sv, ssub, &ac,
+            moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_fill_info_t info; moq_fetch_t fh;
+        MOQ_TEST_CHECK(moq_session_open_fill(sv, ssub, moq_simpair_now_us(sp),
+            &info, &fh) == MOQ_OK);
+        MOQ_TEST_CHECK(info.empty);
+        moq_simpair_run_until_quiescent(sp, 16, NULL);
+        MOQ_TEST_CHECK(moq_sub_tick(sub, moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_sub_fetch_item_t it;
+        moq_result_t rc = moq_sub_poll_fetch(sub, &it);
+        if (rc != MOQ_OK) {
+            fprintf(stderr, "FAIL: empty facade fill %s did not complete\n", cases[i].name);
+            failures++;
+        } else {
+            MOQ_TEST_CHECK(it.request == req && it.kind == MOQ_SUB_FETCH_COMPLETE);
+            moq_sub_fetch_item_cleanup(&it);
+        }
+        MOQ_TEST_CHECK(moq_sub_poll_fetch(sub, &it) == MOQ_DONE);
+        moq_sub_track_t *next_track = NULL; moq_sub_fetch_req_t *next_req = NULL;
+        MOQ_TEST_CHECK(moq_sub_subscribe_with_fill(sub, &tc, &fill,
+            moq_simpair_now_us(sp), &next_track, &next_req) == MOQ_OK);
+        moq_sub_destroy(sub); moq_simpair_destroy(sp);
+    }
+}
+
+/* FILL_PARAMETERS alone is a valid REQUEST_UPDATE (draft 21 9.5.1).
+ * It requests history without changing the subscription's live parameters. */
+static void t_fill_only_update(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_subscription_t h; moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    moq_subscription_update_cfg_t uc;
+    moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+    uc.fill = current_group_fill(); uc.fill.present = true;
+    moq_result_t rc = moq_session_update_subscription(s, h, &uc, 10);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc == MOQ_OK) {
+        uint8_t msg[128];
+        size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
+        moq_control_envelope_t env; moq_d21_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        MOQ_TEST_CHECK(update.params.has_fill && update.params.fill.has_location_filter &&
+            update.params.fill.location_filter.field_count == 1 &&
+            update.params.fill.location_filter.start_group == 1);
+        MOQ_TEST_CHECK(!update.params.has_forward && !update.params.has_subscriber_priority &&
+            !update.params.has_location_filter && !update.params.has_group_order);
+    }
+    moq_session_destroy(s);
+
+    /* Truly empty updates remain invalid. Drafts without fills still refuse
+     * the same fill request without putting a message on the wire. */
+    s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+    MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_ERR_INVAL);
+    moq_session_destroy(s);
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), MOQ_PERSPECTIVE_CLIENT);
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    s = NULL;
+    MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
+    uc.fill = current_group_fill(); uc.fill.present = true;
+    MOQ_TEST_CHECK(moq_session_update_subscription(s, (moq_subscription_t){0}, &uc, 1) == MOQ_ERR_UNSUPPORTED);
+    moq_action_t action;
+    MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(s, &action, 1), 0);
+    moq_session_destroy(s);
+}
+
+/* PUBLISH_DONE's Stream Count includes fills (draft 21 9.9). A fill FIN or
+ * identifiable RESET satisfies the gate, independent of control/data order. */
+static void t_fill_stream_count(void)
+{
+    enum { FIN_BEFORE_DONE, FIN_AFTER_DONE, RESET_AFTER_DONE, HEADER_AFTER_DONE };
+    for (int scenario = FIN_BEFORE_DONE; scenario <= HEADER_AFTER_DONE; scenario++) {
+        moq_session_t *s = make_session(MOQ_PERSPECTIVE_CLIENT);
+        moq_subscription_t h; moq_stream_ref_t ref;
+        MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+        moq_subscription_update_cfg_t uc;
+        moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+        uc.fill = current_group_fill(); uc.fill.present = true;
+        MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_OK);
+        uint8_t msg[128];
+        size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
+        moq_control_envelope_t env; moq_d21_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        moq_d21_msg_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.has_largest = true; p.largest_group = 4; p.largest_object = 2;
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+            &p, (moq_bytes_t){0}) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg,
+            moq_buf_writer_offset(&w), false, 11) == MOQ_OK);
+        moq_event_t ev;
+        MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIPTION_UPDATE_OK, &ev)); moq_event_cleanup(&ev);
+        moq_stream_ref_t data_ref = moq_stream_ref_from_u64(100);
+        int opened = 0, completed = 0, done = 0, subgroup_events = 0;
+        if (scenario != HEADER_AFTER_DONE) {
+            moq_buf_writer_init(&w, msg, sizeof(msg));
+            MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, update.request_id) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_on_data_bytes(s, data_ref, msg,
+                moq_buf_writer_offset(&w), scenario == FIN_BEFORE_DONE, 12) == MOQ_OK);
+            while (moq_session_poll_events(s, &ev, 1)) {
+                if (ev.kind == MOQ_EVENT_FILL_OPENED) opened++;
+                if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) completed++;
+                moq_event_cleanup(&ev);
+            }
+        }
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d21_encode_publish_done(&w, 0, 1, (moq_bytes_t){0}) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg,
+            moq_buf_writer_offset(&w), true, 13) == MOQ_OK);
+        while (moq_session_poll_events(s, &ev, 1)) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) done++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(done, scenario == FIN_BEFORE_DONE ? 1 : 0);
+        if (scenario == RESET_AFTER_DONE) {
+            MOQ_TEST_CHECK(moq_session_on_data_reset(s, data_ref, 1, 14) == MOQ_OK);
+            /* Duplicate notification cannot count the stream twice. */
+            MOQ_TEST_CHECK(moq_session_on_data_reset(s, data_ref, 1, 15) == MOQ_OK);
+        } else if (scenario == HEADER_AFTER_DONE) {
+            moq_buf_writer_init(&w, msg, sizeof(msg));
+            MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, update.request_id) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_on_data_bytes(s, data_ref, msg,
+                moq_buf_writer_offset(&w), true, 14) == MOQ_OK);
+        } else if (scenario == FIN_AFTER_DONE) {
+            MOQ_TEST_CHECK(moq_session_on_data_bytes(s, data_ref, NULL, 0, true, 14) == MOQ_OK);
+        }
+        while (moq_session_poll_events(s, &ev, 1)) {
+            if (ev.kind == MOQ_EVENT_FILL_OPENED) opened++;
+            if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) completed++;
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) done++;
+            if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED || ev.kind == MOQ_EVENT_SUBGROUP_RESET)
+                subgroup_events++;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK_EQ_INT(opened, 1);
+        MOQ_TEST_CHECK_EQ_INT(completed, scenario == RESET_AFTER_DONE ? 0 : 1);
+        MOQ_TEST_CHECK_EQ_INT(done, 1);
+        MOQ_TEST_CHECK_EQ_INT(subgroup_events, 0);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        moq_session_destroy(s);
+    }
+}
+
+/* A recognized fill header must wait for receive capacity, not close the
+ * session as an unknown Request ID when another fill occupies the fetch pool. */
+static void t_fill_receive_capacity(void)
+{
+    moq_session_t *s = make_session_max_fetches(MOQ_PERSPECTIVE_CLIENT, 1);
+    moq_subscription_t h; moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    uint64_t ids[2];
+    for (int i = 0; i < 2; i++) {
+        moq_subscription_update_cfg_t uc;
+        moq_subscription_update_cfg_init_sized(&uc, sizeof(uc));
+        uc.fill = current_group_fill(); uc.fill.present = true;
+        MOQ_TEST_CHECK(moq_session_update_subscription(s, h, &uc, 10) == MOQ_OK);
+        uint8_t msg[128];
+        size_t n = take_bidi_message(s, msg, sizeof(msg), NULL);
+        moq_control_envelope_t env; moq_d21_request_update_t update;
+        MOQ_TEST_CHECK(decode_msg(msg, n, MOQ_D21_REQUEST_UPDATE, &env));
+        MOQ_TEST_CHECK(moq_d21_decode_request_update(env.payload, env.payload_len, &update) == MOQ_OK);
+        ids[i] = update.request_id;
+        moq_d21_msg_params_t p;
+        memset(&p, 0, sizeof(p));
+        p.has_largest = true; p.largest_group = 4; p.largest_object = 2;
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        MOQ_TEST_CHECK(moq_d21_encode_request_ok(&w, MOQ_D21_REQUEST_OK_REQUEST_UPDATE,
+            &p, (moq_bytes_t){0}) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg,
+            moq_buf_writer_offset(&w), false, 11) == MOQ_OK);
+        moq_event_t ev;
+        MOQ_TEST_CHECK(next_event(s, MOQ_EVENT_SUBSCRIPTION_UPDATE_OK, &ev)); moq_event_cleanup(&ev);
+    }
+    for (int i = 0; i < 2; i++) {
+        uint8_t hdr[32]; moq_buf_writer_t w;
+        moq_buf_writer_init(&w, hdr, sizeof(hdr));
+        MOQ_TEST_CHECK(moq_d21_encode_fetch_header(&w, ids[i]) == MOQ_OK);
+        moq_result_t rc = moq_session_on_data_bytes(s, moq_stream_ref_from_u64(100 + i),
+            hdr, moq_buf_writer_offset(&w), false, 12);
+        MOQ_TEST_CHECK(rc == (i == 0 ? MOQ_OK : MOQ_ERR_WOULD_BLOCK));
+    }
+    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(s, moq_stream_ref_from_u64(100),
+        NULL, 0, true, 13) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(s, moq_stream_ref_from_u64(101),
+        NULL, 0, true, 14) == MOQ_OK);
+    int opened = 0, completed = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(s, &ev, 1)) {
+        if (ev.kind == MOQ_EVENT_FILL_OPENED) opened++;
+        if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) completed++;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(opened, 2);
+    MOQ_TEST_CHECK_EQ_INT(completed, 2);
+    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -2383,8 +2758,14 @@ int main(void)
     t_publish_initial_params();
     t_send_state_notify();
     t_fill_end_to_end();
+    t_fill_after_empty_updates();
+    t_fill_expectation_backpressure();
+    t_fill_receive_capacity();
+    t_fill_only_update();
+    t_fill_stream_count();
     t_facade_fill();
     t_facade_fill_no_content();
+    t_facade_fill_empty_range();
     t_facade_fill_rejected();
     t_facade_fill_cancel();
     t_facade_fill_unsubscribe();

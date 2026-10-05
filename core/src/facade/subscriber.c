@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "../internal/fill.h"
 
 #define SUB_DEFAULT_MAX_TRACKS  16
 #define SUB_DEFAULT_MAX_OBJECTS 256
@@ -58,6 +59,7 @@ struct moq_sub_fetch_req {
      * MOQ_EVENT_FILL_OPENED). */
     moq_sub_track_t    *fill_track;
     bool                fill_unbound;
+    moq_fill_selection_t fill_selection;
 };
 
 struct moq_subscriber {
@@ -734,6 +736,11 @@ static moq_result_t sub_subscribe(moq_subscriber_t *sub,
         fr->state = SUB_FETCH_PENDING;
         fr->fill_track = t;
         fr->fill_unbound = true;
+        fr->fill_selection = (moq_fill_selection_t){
+            .fill = *fill, .filter = scfg.filter,
+            .start_group = scfg.start_group, .start_object = scfg.start_object,
+            .end_group = scfg.end_group,
+        };
         *out_fill = fr;
     }
     return MOQ_OK;
@@ -926,10 +933,12 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 sub->stats.subscribe_ok++;
                 if (sub->callbacks.on_subscribed)
                     sub->callbacks.on_subscribed(sub->callbacks.ctx, t);
-                /* No content yet: the publisher opens no fill stream. */
-                moq_sub_fetch_req_t *fr = ev.u.subscribe_ok.has_largest
-                    ? NULL : find_unbound_fill(sub, t);
-                if (fr && !fill_finish_unbound(sub, fr, MOQ_SUB_FETCH_COMPLETE, 0)) {
+                /* An empty range opens no stream, even when the track has content (3.4). */
+                moq_sub_fetch_req_t *fr = find_unbound_fill(sub, t);
+                if (fr && !moq_fill_selection_has_content(&fr->fill_selection,
+                        ev.u.subscribe_ok.has_largest, ev.u.subscribe_ok.largest_group,
+                        ev.u.subscribe_ok.largest_object) &&
+                    !fill_finish_unbound(sub, fr, MOQ_SUB_FETCH_COMPLETE, 0)) {
                     moq_event_cleanup(&ev);
                     return sub_would_block(sub);
                 }

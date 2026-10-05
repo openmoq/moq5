@@ -381,6 +381,38 @@ void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
     }
 }
 
+bool moq_fill_selection_has_content(const moq_fill_selection_t *selection,
+    bool has_largest, uint64_t largest_group, uint64_t largest_object)
+{
+    if (!has_largest) return false;
+    moq_resolved_window_t window;
+    if (selection->fill.has_location) {
+        if (selection->fill.field_count == 0) return true; /* whole track */
+        moq_decoded_loc_filter_t lf = {
+            .present = true,
+            .field_count = selection->fill.field_count,
+            .start_group = selection->fill.start_group,
+            .start_object = selection->fill.start_object,
+            .end_group_delta = selection->fill.end_group_delta,
+            .end_object = selection->fill.end_object,
+        };
+        moq_resolve_loc_filter_window(&lf, true, largest_group, largest_object,
+                                      UINT64_MAX, &window);
+    } else {
+        moq_resolve_filter_window(selection->filter, selection->start_group,
+            selection->start_object, selection->end_group, true,
+            largest_group, largest_object, UINT64_MAX, &window);
+    }
+    if (window.unsatisfiable || window.start_group > largest_group ||
+        (window.start_group == largest_group && window.start_object > largest_object))
+        return false;
+    if (window.has_end && (window.end_group < window.start_group ||
+        (window.end_group == window.start_group && window.has_end_object &&
+         window.end_object < window.start_object)))
+        return false;
+    return true;
+}
+
 bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,
                             bool has_largest, uint64_t lg, uint64_t lo,
                             uint64_t *sg, uint64_t *so,

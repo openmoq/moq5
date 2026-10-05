@@ -2301,10 +2301,10 @@ int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id)
             e->state == MOQ_SUB_TERMINATED)
             continue;
         for (uint8_t k = 0; k < e->fill_expect_n; k++) {
-            if (e->fill_expect_ids[k] != request_id) continue;
+            if (e->fill_expect[k].request_id != request_id) continue;
             if (event_queue_full(s)) return -2;
             int slot = fetch_find_free(s);
-            if (slot < 0) return -1;
+            if (slot < 0) return -2;
             moq_fetch_entry_t *fe = &s->fetches[slot];
             uint32_t gen = fe->generation | 1;
             uint8_t *recv_buf = fe->req_recv_buf;
@@ -2324,7 +2324,7 @@ int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id)
             fetch_occ_link(s, (size_t)slot);
             fe->handle = fetch_make_handle(s, (size_t)slot);
             for (uint8_t j = k + 1; j < e->fill_expect_n; j++)
-                e->fill_expect_ids[j - 1] = e->fill_expect_ids[j];
+                e->fill_expect[j - 1] = e->fill_expect[j];
             e->fill_expect_n--;
             /* Tell the subscriber which fetch handle carries this subscription's fill. */
             moq_event_t ev;

@@ -5,6 +5,23 @@
 
 /* -- Subscription pool --------------------------------------------- */
 
+/* Draft 21 3.4: an empty fill opens no stream. Retire only the expectation
+ * belonging to this response, using its Largest snapshot, not the registry. */
+static void sub_retire_empty_fill(moq_sub_entry_t *e, uint64_t request_id,
+    bool has_largest, uint64_t largest_group, uint64_t largest_object)
+{
+    for (uint8_t k = 0; k < e->fill_expect_n; k++) {
+        if (e->fill_expect[k].request_id != request_id) continue;
+        if (moq_fill_selection_has_content(&e->fill_expect[k].selection,
+                has_largest, largest_group, largest_object))
+            return;
+        for (uint8_t j = k + 1; j < e->fill_expect_n; j++)
+            e->fill_expect[j - 1] = e->fill_expect[j];
+        e->fill_expect_n--;
+        return;
+    }
+}
+
 static int sub_find_free(moq_session_t *s)
 {
     for (size_t i = 0; i < s->sub_cap; i++)
@@ -2237,6 +2254,8 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
     s->subs[slot].has_largest = d->has_largest;
     s->subs[slot].largest_group = d->has_largest ? d->largest_group : 0;
     s->subs[slot].largest_object = d->has_largest ? d->largest_object : 0;
+    sub_retire_empty_fill(&s->subs[slot], s->subs[slot].request_id,
+        d->has_largest, d->largest_group, d->largest_object);
     /* Merge the peer-advertised Largest Object into the registry. Monotonic; idempotent under retransmission. */
     if (d->has_largest && s->subs[slot].hist)
         track_hist_merge(s->subs[slot].hist, d->largest_group, d->largest_object);
@@ -2446,8 +2465,12 @@ moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
         e->forward = e->update_forward;
     e->update_has_forward = false;
     /* latch the acknowledged filter type (Joining-FETCH gates on it). */
-    if (e->update_has_filter)
+    if (e->update_has_filter) {
         e->filter_type = e->update_filter_type;
+        e->req_start_group = e->update_start_group;
+        e->req_start_object = e->update_start_object;
+        e->req_end_group = e->update_end_group;
+    }
     e->update_has_filter = false;
     /* §9.8: latch acknowledged timeout carriers and recompute the retained
      * legacy projection from the COMPLETE current pair. */
@@ -2464,6 +2487,8 @@ moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
             e->dt_sub_has_object, e->dt_sub_object_ms,
             e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms));
     e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
+    sub_retire_empty_fill(e, e->update_request_id,
+        has_largest, largest_group, largest_object);
     e->update_pending = false;
     e->update_request_id = 0;
     return MOQ_OK;
@@ -3064,12 +3089,20 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     entry->largest_object = 0;
     entry->hist = hist;
     entry->filter_type = cfg->filter;
+    entry->req_start_group = cfg->start_group;
+    entry->req_start_object = cfg->start_object;
+    entry->req_end_group = cfg->end_group;
     /* Commit the effective Forward State (default true) so the data-plane
      * reordering buffer only holds early data for a forwarding subscription. */
     entry->forward = cfg->has_forward ? cfg->forward : true;
     entry->fill_expect_n = 0;
     if (fill_req.present && entry->forward) {      /* a fill needs Forward State 1 */
-        entry->fill_expect_ids[0] = req_ep.request_id;
+        entry->fill_expect[0].request_id = req_ep.request_id;
+        entry->fill_expect[0].selection = (moq_fill_selection_t){
+            .fill = fill_req, .filter = cfg->filter,
+            .start_group = cfg->start_group, .start_object = cfg->start_object,
+            .end_group = cfg->end_group,
+        };
         entry->fill_expect_n = 1;
     }
     entry->handle = sub_make_handle(s, (size_t)slot);
@@ -3857,7 +3890,7 @@ moq_result_t moq_session_update_subscription(
 #undef UPD_CFG_MIN
     if (!cfg->has_subscriber_priority && !cfg->has_forward &&
         !cfg->has_delivery_timeout && auth_token_count == 0 &&
-        !has_new_group_request && !has_filter)
+        !has_new_group_request && !has_filter && !fill_req.present)
         return MOQ_ERR_INVAL;
     if (cfg->has_delivery_timeout && cfg->delivery_timeout_us < 1000)
         return MOQ_ERR_INVAL;
@@ -3917,6 +3950,10 @@ moq_result_t moq_session_update_subscription(
      * SUBSCRIBE_OK carried DYNAMIC_GROUPS == 1. Refused before any mutation. */
     if (has_new_group_request && !e->dynamic_groups)
         return MOQ_ERR_INVAL;
+
+    bool expect_fill = fill_req.present && (cfg->has_forward ? cfg->forward : e->forward);
+    if (expect_fill && e->fill_expect_n == sizeof(e->fill_expect) / sizeof(e->fill_expect[0]))
+        return MOQ_ERR_WOULD_BLOCK;
 
     moq_request_endpoint_t req_ep;
     moq_result_t prc = s->profile->prepare_request(s, &req_ep);
@@ -3991,9 +4028,15 @@ moq_result_t moq_session_update_subscription(
     e->update_request_id = req_ep.request_id;
     /* The fill this update asked for (Forward State 1 once it applies) will arrive on a
      * stream carrying this update's Request ID. */
-    if (fill_req.present && (cfg->has_forward ? cfg->forward : e->forward)) {
-        if (e->fill_expect_n < sizeof(e->fill_expect_ids) / sizeof(e->fill_expect_ids[0]))
-            e->fill_expect_ids[e->fill_expect_n++] = req_ep.request_id;
+    if (expect_fill) {
+        uint8_t k = e->fill_expect_n++;
+        e->fill_expect[k].request_id = req_ep.request_id;
+        e->fill_expect[k].selection = (moq_fill_selection_t){
+            .fill = fill_req, .filter = has_filter ? filter : e->filter_type,
+            .start_group = has_filter ? f_sg : e->req_start_group,
+            .start_object = has_filter ? f_so : e->req_start_object,
+            .end_group = has_filter ? f_eg : e->req_end_group,
+        };
     }
     /* A Forward change takes effect at the ACK (the CURRENT acknowledged
      * Forward state gates object delivery); remember it until then. */
@@ -4009,6 +4052,9 @@ moq_result_t moq_session_update_subscription(
      * side consumer is the Joining-FETCH eligibility gate); pend it here. */
     e->update_has_filter = has_filter;
     e->update_filter_type = has_filter ? filter : 0;
+    e->update_start_group = f_sg;
+    e->update_start_object = f_so;
+    e->update_end_group = f_eg;
     s->profile->commit_request(s, &req_ep);
     return MOQ_OK;
 }
