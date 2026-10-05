@@ -1519,21 +1519,44 @@ moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                                        const moq_d18_setup_opts_t *opts)
 {
     if (!w) return MOQ_ERR_INVAL;
-    /* Only cache-size emission is sourced today; refuse silently dropping any
-     * other requested option. */
-    if (opts && (opts->has_path || opts->has_authority ||
-                 opts->auth_token_count > 0))
+    /* Tokens are not sourced; refuse silently dropping them. */
+    if (opts && opts->auth_token_count > 0)
+        return MOQ_ERR_INVAL;
+    if (opts && ((opts->has_path && (opts->path_value.len > 0xFFFFu ||
+                                     (opts->path_value.len > 0 && !opts->path_value.data))) ||
+                 (opts->has_authority && (opts->authority_value.len > 0xFFFFu ||
+                                          (opts->authority_value.len > 0 && !opts->authority_value.data)))))
         return MOQ_ERR_INVAL;
 
     size_t saved = w->pos, len_off;
     moq_result_t rc = d18_write_header(w, MOQ_D18_STREAM_SETUP, &len_off);
     if (rc < 0) { w->pos = saved; return rc; }
-    if (opts && opts->has_max_auth_token_cache_size) {
-        /* First option: Delta Type == absolute type; even => vi64 value. */
-        if ((rc = moq_buf_write_vi64(
-                w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE)) < 0)
+    /* Ascending type order; each Delta Type is relative to the previous option
+     * emitted (the first is absolute). Even types carry a vi64 value, odd types a
+     * vi64 length plus bytes. */
+    uint64_t prev = 0;
+    if (opts && opts->has_path) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_PATH - prev)) < 0) goto fail;
+        prev = MOQ_D18_SETUP_OPT_PATH;
+        if ((rc = moq_buf_write_vi64(w, opts->path_value.len)) < 0) goto fail;
+        if (opts->path_value.len > 0 &&
+            (rc = moq_buf_write_raw(w, opts->path_value.data, opts->path_value.len)) < 0)
             goto fail;
+    }
+    if (opts && opts->has_max_auth_token_cache_size) {
+        if ((rc = moq_buf_write_vi64(
+                w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE - prev)) < 0)
+            goto fail;
+        prev = MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE;
         if ((rc = moq_buf_write_vi64(w, opts->max_auth_token_cache_size)) < 0)
+            goto fail;
+    }
+    if (opts && opts->has_authority) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_AUTHORITY - prev)) < 0) goto fail;
+        prev = MOQ_D18_SETUP_OPT_AUTHORITY;
+        if ((rc = moq_buf_write_vi64(w, opts->authority_value.len)) < 0) goto fail;
+        if (opts->authority_value.len > 0 &&
+            (rc = moq_buf_write_raw(w, opts->authority_value.data, opts->authority_value.len)) < 0)
             goto fail;
     }
     if ((rc = d18_patch_len(w, len_off)) < 0) goto fail;

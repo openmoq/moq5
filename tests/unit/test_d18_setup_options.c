@@ -65,6 +65,33 @@ int main(void)
 {
     /* == 1. SETUP option codec: vi64 KVP form ========================== */
 
+    /* 1z. A native-QUIC client's PATH and AUTHORITY (10.3.1.1, 10.3.1.2), in ascending
+     * type order with delta types: PATH 0x01 "/p"; cache size 0x04 (delta 3) = 100;
+     * AUTHORITY 0x05 (delta 1) "h". The envelope is a 0x2F00 type and 16-bit length. */
+    {
+        uint8_t buf[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        moq_d18_setup_opts_t o;
+        memset(&o, 0, sizeof(o));
+        o.has_path = true;      o.path_value = (moq_bytes_t){ (const uint8_t *)"/p", 2 };
+        o.has_authority = true; o.authority_value = (moq_bytes_t){ (const uint8_t *)"h", 1 };
+        o.has_max_auth_token_cache_size = true; o.max_auth_token_cache_size = 100;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), (int)MOQ_OK);
+        static const uint8_t want[] = { 0x01, 0x02, '/', 'p', 0x03, 0x64, 0x01, 0x01, 'h' };
+        size_t n = moq_buf_writer_offset(&w);
+        MOQ_TEST_CHECK(n >= sizeof(want) &&
+                       memcmp(buf + n - sizeof(want), want, sizeof(want)) == 0);
+        /* An empty path is still sent (length 0). */
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        memset(&o, 0, sizeof(o));
+        o.has_path = true; o.path_value = (moq_bytes_t){ (const uint8_t *)"", 0 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_d18_encode_setup_opts(&w, &o), (int)MOQ_OK);
+        n = moq_buf_writer_offset(&w);
+        MOQ_TEST_CHECK(n >= 2 && buf[n - 2] == 0x01 && buf[n - 1] == 0x00);
+    }
+
+
     /* 1a. Encode: MAX_AUTH_TOKEN_CACHE_SIZE 100 emits the vi64 single-byte
      * value (0x64) at the divergence boundary — a QUIC-varint encoder would
      * emit two bytes (0x40 0x64). */

@@ -103,7 +103,7 @@ static moq_result_t d18_start(moq_session_t *s)
     if (s->state != MOQ_SESS_IDLE)
         return MOQ_ERR_WRONG_STATE;
 
-    uint8_t buf[32];
+    uint8_t buf[32 + MOQ_SETUP_AUTHORITY_MAX + MOQ_SETUP_PATH_MAX];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, buf, sizeof(buf));
     /* Advertise the auth-token cache size when configured (§10.3.1.3) so the
@@ -113,6 +113,17 @@ static moq_result_t d18_start(moq_session_t *s)
     if (s->send_auth_token_cache_size) {
         opts.has_max_auth_token_cache_size = true;
         opts.max_auth_token_cache_size = s->auth_token_cache_size;
+    }
+    /* A native-QUIC client names the URI it connected to (10.3.1.1, 10.3.1.2). */
+    if (s->perspective == MOQ_PERSPECTIVE_CLIENT) {
+        if (s->setup_authority_present) {
+            opts.has_authority = true;
+            opts.authority_value = (moq_bytes_t){ s->setup_authority, s->setup_authority_len };
+        }
+        if (s->setup_path_present) {
+            opts.has_path = true;
+            opts.path_value = (moq_bytes_t){ s->setup_path, s->setup_path_len };
+        }
     }
     moq_result_t rc = moq_d18_encode_setup_opts(&w, &opts);
     if (rc < 0) return rc;
@@ -2779,7 +2790,7 @@ static moq_result_t d18_encode_subgroup_header_op(
     hdr.subgroup_id_mode = MOQ_SUBGROUP_ID_MODE_PRESENT;
     hdr.end_of_group = args->end_of_group;
     hdr.default_priority = false;
-    hdr.first_object = false;
+    hdr.first_object = args->first_object;
     hdr.track_alias = args->track_alias;
     hdr.group_id = args->group_id;
     hdr.subgroup_id = args->subgroup_id;

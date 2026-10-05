@@ -212,7 +212,7 @@ typedef struct moq_session_cfg {
      * (authority up to MOQ_SETUP_AUTHORITY_MAX, path up to MOQ_SETUP_PATH_MAX bytes,
      * longer is MOQ_ERR_INVAL). A NULL data pointer means "send none"; a non-NULL pointer with
      * length 0 sends the option empty (an empty path-abempty is still sent). Leave NULL for a server and for WebTransport, which
-     * must not send them. Drafts 16 and 18 ignore these. */
+     * must not send them. Draft 16 ignores these. */
     moq_bytes_t        setup_authority;
     moq_bytes_t        setup_path;
 } moq_session_cfg_t;
@@ -2925,7 +2925,7 @@ typedef struct moq_subgroup_cfg {
     /* Appended (ABI-additive; draft 21 FIRST_OBJECT, 2.2 / 11.3.1): the first object on
      * this stream is the first object ever published in the subgroup. The ORIGINAL
      * publisher sets it when it opens a new subgroup; a restart after a reset, or a
-     * stream that begins mid-subgroup, leaves it false. Drafts 16/18 ignore it. */
+     * stream that begins mid-subgroup, leaves it false. Draft 16 has no such bit and ignores it. */
     bool     first_object;
 } moq_subgroup_cfg_t;
 

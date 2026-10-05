@@ -11662,11 +11662,11 @@ static void d21_collect_subgroup_type_bits(moq_session_t *sv, int *firsts, int *
     }
 }
 
-static void test_d21_first_object_bit(void)
+static void test_first_object_bit(moq_version_t ver)
 {
     test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
     moq_publisher_t *pub; moq_pub_track_t *track;
-    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    windows_setup(&as, &alloc, &sp, ver, &pub, &track);
     moq_session_t *sv = moq_simpair_server(sp);
     windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
     int firsts = 0, nots = 0;
@@ -11680,27 +11680,31 @@ static void test_d21_first_object_bit(void)
     MOQ_TEST_CHECK_EQ_INT(firsts, 1);                         /* group 3, object 0: first ever */
     MOQ_TEST_CHECK_EQ_INT(nots, 0);
 
-    /* A second subscriber joins after object 0: its stream starts at object 1. */
-    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    /* Draft 21 only (concurrent subscriptions): a second subscriber joins after object
+     * 0, so its stream starts at object 1. */
+    if (ver == MOQ_VERSION_DRAFT_21)
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
     firsts = nots = 0;
     d21_collect_subgroup_type_bits(sv, &firsts, &nots);
     MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 3, 1, p, moq_simpair_now_us(sp)) == MOQ_OK);
     d21_collect_subgroup_type_bits(sv, &firsts, &nots);
-    MOQ_TEST_CHECK_EQ_INT(firsts, 0);
-    MOQ_TEST_CHECK_EQ_INT(nots, 1);                           /* new stream, mid-group */
+    if (ver == MOQ_VERSION_DRAFT_21) {
+        MOQ_TEST_CHECK_EQ_INT(firsts, 0);
+        MOQ_TEST_CHECK_EQ_INT(nots, 1);                       /* new stream, mid-group */
+    }
 
     /* The next group starts clean for both. */
     firsts = nots = 0;
     MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 4, 0, p, moq_simpair_now_us(sp)) == MOQ_OK);
     d21_collect_subgroup_type_bits(sv, &firsts, &nots);
-    MOQ_TEST_CHECK_EQ_INT(firsts, 2);
+    MOQ_TEST_CHECK_EQ_INT(firsts, ver == MOQ_VERSION_DRAFT_21 ? 2 : 1);
     moq_rcbuf_decref(p);
 
     moq_pub_destroy(pub);
     drain_all(sp);
     moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
-    MOQ_TEST_PASS("d21_first_object_bit");
+    MOQ_TEST_PASS("first_object_bit");
 }
 
 /* -- Draft 21: SUBSCRIBE_NAMESPACE gets exactly one response ---------------- *
@@ -11743,6 +11747,8 @@ static void d21_ns_sub_case(const char *prefix_str, bool expect_ok)
     MOQ_TEST_CHECK(as.balance == 0);
     MOQ_TEST_PASS(expect_ok ? "d21_ns_sub_accepted" : "d21_ns_sub_rejected");
 }
+
+static void test_d21_first_object_bit(void) { test_first_object_bit(MOQ_VERSION_DRAFT_21); }
 
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
  * BEFORE the done, both complete across retries, the slot clears only after
@@ -15085,6 +15091,7 @@ int main(void) {
     test_d21_concurrent_subscriptions();
     test_d21_no_subscription_ended();
     test_d21_first_object_bit();
+    test_first_object_bit(MOQ_VERSION_DRAFT_18);
     d21_ns_sub_case("live", true);
     d21_ns_sub_case("other", false);
     d21_fill_case(true);
