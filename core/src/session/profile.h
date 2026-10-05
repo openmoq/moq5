@@ -17,6 +17,7 @@ struct moq_decoded_object_header;
 struct moq_subgroup_header_encode_args;
 struct moq_object_header_encode_args;
 struct moq_goaway_encode_args;
+struct moq_publish_state_notify_args;
 struct moq_publish_namespace_encode_args;
 struct moq_publish_namespace_cancel_encode_args;
 struct moq_subscribe_namespace_encode_args;
@@ -253,6 +254,10 @@ typedef struct moq_profile_ops {
     moq_result_t (*encode_subscribe_tracks)(moq_session_t *s,
                                             struct moq_buf_writer *w,
                                             const struct moq_subscribe_tracks_encode_args *args);
+    /* Draft 21 only (NULL elsewhere => MOQ_ERR_UNSUPPORTED): PUBLISH_STATE_NOTIFY. */
+    moq_result_t (*encode_publish_state_notify)(moq_session_t *s,
+                                                struct moq_buf_writer *w,
+                                                const struct moq_publish_state_notify_args *args);
     moq_result_t (*encode_publish_blocked)(moq_session_t *s,
                                            struct moq_buf_writer *w,
                                            const moq_namespace_t *suffix,

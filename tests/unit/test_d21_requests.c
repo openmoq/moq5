@@ -1794,6 +1794,39 @@ static void t_publish_initial_params(void)
     moq_session_destroy(s);
 }
 
+/* A publisher can send PUBLISH_STATE_NOTIFY on an established subscription. */
+static void t_send_state_notify(void)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_subscription_t sub = accept_new_subscription(s, 0, "sn", false);
+    moq_state_notify_cfg_t c;
+    memset(&c, 0, sizeof(c));
+    c.struct_size = sizeof(c);
+    c.has_largest = true; c.largest_group = 5; c.largest_object = 1;
+    c.has_forward = true; c.forward = false;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_notify_subscription_state(s, sub, &c, 5), (int)MOQ_OK);
+    uint8_t m[64];
+    size_t n = take_bidi_message(s, m, sizeof(m), NULL);
+    moq_control_envelope_t env;
+    moq_d21_publish_state_notify_t nt;
+    MOQ_TEST_CHECK(n > 0 && decode_msg(m, n, MOQ_D21_PUBLISH_STATE_NOTIFY, &env));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_d21_decode_publish_state_notify(env.payload, env.payload_len, &nt), (int)MOQ_OK);
+    MOQ_TEST_CHECK(nt.params.has_largest && nt.params.largest_group == 5 && nt.params.largest_object == 1 &&
+                   nt.params.has_forward && nt.params.forward == 0);
+    /* Nothing to say, and a subscription that is not ours to notify, are refused. */
+    moq_state_notify_cfg_t empty;
+    memset(&empty, 0, sizeof(empty));
+    empty.struct_size = sizeof(empty);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_notify_subscription_state(s, sub, &empty, 6), (int)MOQ_ERR_INVAL);
+    moq_session_destroy(s);
+    s = make_session(MOQ_PERSPECTIVE_CLIENT);
+    moq_subscription_t h;
+    moq_stream_ref_t ref;
+    MOQ_TEST_CHECK(establish_subscription(s, &h, &ref, MOQ_SUBSCRIBE_FILTER_NONE, true));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_notify_subscription_state(s, h, &c, 7), (int)MOQ_ERR_WRONG_STATE);
+    moq_session_destroy(s);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1822,6 +1855,7 @@ int main(void)
     t_fill_lifecycle();
     t_fetch_relative_start();
     t_publish_initial_params();
+    t_send_state_notify();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

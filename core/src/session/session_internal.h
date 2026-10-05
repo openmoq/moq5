@@ -1299,6 +1299,17 @@ typedef struct moq_object_header_encode_args {
                                  (0x0 NORMAL default; 0x4 END_OF_TRACK, etc.) */
 } moq_object_header_encode_args_t;
 
+typedef struct moq_publish_state_notify_args {
+    bool     has_largest;
+    uint64_t largest_group, largest_object;
+    bool     has_forward;
+    bool     forward;
+    bool     has_filter;
+    uint8_t  filter_field_count;
+    uint64_t filter_start_group, filter_start_object;
+    uint64_t filter_end_group_delta, filter_end_object;
+} moq_publish_state_notify_args_t;
+
 typedef struct moq_goaway_encode_args {
     const uint8_t *uri;
     size_t         uri_len;

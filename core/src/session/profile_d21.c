@@ -1123,6 +1123,29 @@ static moq_result_t d21_encode_subscribe_tracks(
 /* PUBLISH_SKIPPED encode (draft-21 9.19, the draft-18 PUBLISH_BLOCKED renamed): a
  * Track Namespace Suffix + Track Name on the SUBSCRIBE_TRACKS response stream. The
  * vtable op keeps its semantic name, encode_publish_blocked. */
+static moq_result_t d21_encode_publish_state_notify(
+    moq_session_t *s, struct moq_buf_writer *w,
+    const struct moq_publish_state_notify_args *a)
+{
+    (void)s;
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.has_largest = a->has_largest;
+    p.largest_group = a->largest_group;
+    p.largest_object = a->largest_object;
+    p.has_forward = a->has_forward;
+    p.forward = a->forward ? 1u : 0u;
+    if (a->has_filter) {
+        p.has_location_filter = true;
+        p.location_filter.field_count = a->filter_field_count;
+        p.location_filter.start_group = a->filter_start_group;
+        p.location_filter.start_object = a->filter_start_object;
+        p.location_filter.end_group_delta = a->filter_end_group_delta;
+        p.location_filter.end_object = a->filter_end_object;
+    }
+    return moq_d21_encode_publish_state_notify(w, &p);
+}
+
 static moq_result_t d21_encode_publish_skipped(
     moq_session_t *s, struct moq_buf_writer *w,
     const moq_namespace_t *suffix, moq_bytes_t track_name)
@@ -3415,6 +3438,7 @@ static const moq_profile_ops_t d21_ops = {
     .encode_namespace_msg    = d21_encode_namespace_msg,
     .encode_subscribe_tracks = d21_encode_subscribe_tracks,
     .encode_publish_blocked  = d21_encode_publish_skipped,
+    .encode_publish_state_notify = d21_encode_publish_state_notify,
     .decode_ns_sub_request   = d21_decode_ns_sub_request,
     .decode_ns_sub_response  = d21_decode_ns_sub_response,
     .encode_publish_namespace   = d21_encode_publish_namespace,

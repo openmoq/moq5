@@ -2183,6 +2183,29 @@ typedef struct moq_fill_info {
     uint64_t timeout_ms;
 } moq_fill_info_t;
 
+/*
+ * Tell a subscriber the state of its subscription changed for a reason other than its
+ * own update (draft 21 9.10): a Forward change, a narrowed filter, a new Largest Object.
+ * Informative and unanswered; it must include the Largest Object when known (that is the
+ * caller's duty: pass has_largest). Publisher side of an ESTABLISHED subscription, on
+ * a profile that has it (else MOQ_ERR_UNSUPPORTED). Advancing call.
+ */
+typedef struct moq_state_notify_cfg {
+    uint32_t struct_size;
+    bool     has_largest;
+    uint64_t largest_group, largest_object;
+    bool     has_forward;
+    bool     forward;
+    bool     has_filter;
+    uint8_t  filter_field_count;     /* 0..4 fields, as in a Location Filter */
+    uint64_t filter_start_group, filter_start_object;
+    uint64_t filter_end_group_delta, filter_end_object;
+} moq_state_notify_cfg_t;
+
+MOQ_API moq_result_t moq_session_notify_subscription_state(
+    moq_session_t *s, moq_subscription_t sub, const moq_state_notify_cfg_t *cfg,
+    uint64_t now_us);
+
 /* True when the subscription has an unopened fill. */
 MOQ_API bool moq_session_sub_fill_pending(moq_session_t *s, moq_subscription_t sub);
 

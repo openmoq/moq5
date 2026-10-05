@@ -2126,6 +2126,40 @@ bool moq_session_has_subscription_ended_status(const moq_session_t *s)
     return s->profile->publish_done_subscription_ended;
 }
 
+moq_result_t moq_session_notify_subscription_state(
+    moq_session_t *s, moq_subscription_t sub, const moq_state_notify_cfg_t *cfg,
+    uint64_t now_us)
+{
+    if (!s || !cfg || cfg->struct_size < sizeof(*cfg)) return MOQ_ERR_INVAL;
+    if (!s->profile->encode_publish_state_notify) return MOQ_ERR_UNSUPPORTED;
+    if (cfg->filter_field_count > 4) return MOQ_ERR_INVAL;
+    if (!cfg->has_largest && !cfg->has_forward && !cfg->has_filter) return MOQ_ERR_INVAL;
+    session_begin_advance(s, now_us);
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int slot = sub_resolve_handle(s, sub);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_sub_entry_t *e = &s->subs[slot];
+    if (e->role != MOQ_SUB_ROLE_PUBLISHER || e->state != MOQ_SUB_ESTABLISHED ||
+        e->done_pending || e->goaway_sent)
+        return MOQ_ERR_WRONG_STATE;
+    moq_publish_state_notify_args_t a = {
+        .has_largest = cfg->has_largest,
+        .largest_group = cfg->largest_group, .largest_object = cfg->largest_object,
+        .has_forward = cfg->has_forward, .forward = cfg->forward,
+        .has_filter = cfg->has_filter, .filter_field_count = cfg->filter_field_count,
+        .filter_start_group = cfg->filter_start_group,
+        .filter_start_object = cfg->filter_start_object,
+        .filter_end_group_delta = cfg->filter_end_group_delta,
+        .filter_end_object = cfg->filter_end_object,
+    };
+    uint8_t buf[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_result_t rc = s->profile->encode_publish_state_notify(s, &w, &a);
+    if (rc < 0) return rc;
+    return queue_send_bidi(s, e->request_stream_ref, buf, moq_buf_writer_offset(&w), false);
+}
+
 bool moq_session_sub_fill_pending(moq_session_t *s, moq_subscription_t sub)
 {
     if (!s) return false;
