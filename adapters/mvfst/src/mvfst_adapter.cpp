@@ -282,6 +282,7 @@ struct moq_mvfst_managed {
     moq_alloc_t alloc;
     moq_session_cfg_t session_cfg;
     std::string host;
+    std::string setup_authority_s, setup_path_s;   /* backing for session_cfg's borrowed spans */
     int port = 0;
     bool insecure_skip_verify = false;
     std::string cert_path;
@@ -881,6 +882,18 @@ moq_result_t moq_mvfst_managed_create(
         if (CFG_HAS(cfg, send_buffer_size) && cfg->send_buffer_size) m->session_cfg.send_buffer_size = cfg->send_buffer_size;
         if (CFG_HAS(cfg, recv_buffer_size) && cfg->recv_buffer_size) m->session_cfg.recv_buffer_size = cfg->recv_buffer_size;
         if (CFG_HAS(cfg, goaway_timeout_us) && cfg->goaway_timeout_us) m->session_cfg.goaway_timeout_us = cfg->goaway_timeout_us;
+        if (CFG_HAS(cfg, setup_path)) {
+            if (cfg->setup_authority) {
+                m->setup_authority_s = cfg->setup_authority;
+                m->session_cfg.setup_authority = moq_bytes_t{
+                    reinterpret_cast<const uint8_t *>(m->setup_authority_s.c_str()), m->setup_authority_s.size()};
+            }
+            if (cfg->setup_path) {
+                m->setup_path_s = cfg->setup_path;
+                m->session_cfg.setup_path = moq_bytes_t{
+                    reinterpret_cast<const uint8_t *>(m->setup_path_s.c_str()), m->setup_path_s.size()};
+            }
+        }
     } catch (...) {
         if (constructed) m->~moq_mvfst_managed_t();
         alloc->free(m, sizeof(*m), alloc->ctx);

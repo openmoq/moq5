@@ -541,6 +541,17 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_fetch_catalog
                 COMMAND test_media_receiver_fetch_catalog)
 
+            # Late join: the catalog arrives as a past object, by Joining FETCH
+            # under draft 18 and by a fill on the SUBSCRIBE under draft 21.
+            add_executable(test_media_receiver_fill_catalog
+                tests/test_media_receiver_fill_catalog.c)
+            target_link_libraries(test_media_receiver_fill_catalog PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_fill_catalog PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_receiver_fill_catalog
+                COMMAND test_media_receiver_fill_catalog)
+
             # Roleless MSF catalog classified by codec.
             add_executable(test_media_receiver_roleless
                 tests/test_media_receiver_roleless.c)

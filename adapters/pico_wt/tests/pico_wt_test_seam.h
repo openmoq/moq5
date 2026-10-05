@@ -53,6 +53,18 @@ int    moq_pico_wt_managed_test_event_at(moq_pico_wt_managed_t *m, size_t i,
  * facade can still be destroyed afterwards without a double free. */
 void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m);
 
+/* Bootstrap fixture: borrows an established transport/adapter, but owns the
+ * preaccept FIFO. No network thread may run while these helpers are used. */
+#include <moq/pico_wt.h>
+moq_pico_wt_managed_t *moq_pico_wt_managed_test_early_create(
+    moq_pico_wt_conn_t *conn, const moq_alloc_t *alloc);
+int moq_pico_wt_managed_test_early_callback(moq_pico_wt_managed_t *m,
+    uint64_t sid, uint8_t *bytes, size_t length, int event);
+size_t moq_pico_wt_managed_test_early_pending(moq_pico_wt_managed_t *m);
+int moq_pico_wt_managed_test_early_replay(moq_pico_wt_managed_t *m,
+    moq_pico_wt_conn_t *conn);
+void moq_pico_wt_managed_test_early_destroy(moq_pico_wt_managed_t *m);
+
 /* Keepalive seam globals (test-internals build only). */
 extern void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);
 extern unsigned moq_pico_wt_managed_test_keep_alive_calls;

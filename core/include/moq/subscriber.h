@@ -25,6 +25,7 @@ extern "C" {
 
 typedef struct moq_subscriber moq_subscriber_t;
 typedef struct moq_sub_track  moq_sub_track_t;
+typedef struct moq_sub_fetch_req moq_sub_fetch_req_t;
 
 /* -- Callbacks ---------------------------------------------------- */
 
@@ -158,6 +159,28 @@ MOQ_API moq_result_t moq_sub_subscribe(
     const moq_sub_track_cfg_t *cfg,
     uint64_t now_us,
     moq_sub_track_t **out);
+
+/*
+ * Subscribe and ask for a fill (draft 21 3.4): the publisher also delivers the
+ * past Objects in fill->location (see moq_fill_request_t; fill->present is
+ * implied) on a fill stream. *out_fill receives a fetch request that carries them:
+ * poll it with moq_sub_poll_fetch like a Joining FETCH, except a fill has no
+ * MOQ_SUB_FETCH_OK. It ends with MOQ_SUB_FETCH_COMPLETE, also when the
+ * subscription is accepted with no content (nothing to fill), or with
+ * MOQ_SUB_FETCH_ERROR when the subscription is rejected. A fill needs Forward
+ * State 1, which a facade subscription always has.
+ *
+ * MOQ_ERR_UNSUPPORTED when the negotiated draft has no fills (16, 18): nothing is
+ * sent, so the caller can fall back to moq_sub_subscribe + moq_sub_joining_fetch.
+ * MOQ_ERR_WOULD_BLOCK when no track or fetch slot is free.
+ */
+MOQ_API moq_result_t moq_sub_subscribe_with_fill(
+    moq_subscriber_t *sub,
+    const moq_sub_track_cfg_t *cfg,
+    const moq_fill_request_t *fill,
+    uint64_t now_us,
+    moq_sub_track_t **out,
+    moq_sub_fetch_req_t **out_fill);
 
 MOQ_API moq_result_t moq_sub_unsubscribe(
     moq_subscriber_t *sub,
@@ -379,8 +402,6 @@ MOQ_API moq_result_t moq_sub_poll_status(
 
 /* -- Fetch -------------------------------------------------------- */
 
-typedef struct moq_sub_fetch_req moq_sub_fetch_req_t;
-
 typedef struct moq_sub_fetch_cfg {
     uint32_t               struct_size;
     moq_namespace_t        track_namespace;
@@ -429,6 +450,8 @@ MOQ_API moq_result_t moq_sub_joining_fetch(
  * Cancel a pending or active fetch. On success the request slot is
  * freed immediately — req is invalid after this call and may be
  * reused by a later moq_sub_fetch. Do not dereference or retain.
+ * Cancelling a fill (moq_sub_subscribe_with_fill) only stops delivering it;
+ * the subscription and its fill stream are left alone.
  */
 MOQ_API moq_result_t moq_sub_cancel_fetch(
     moq_subscriber_t *sub,

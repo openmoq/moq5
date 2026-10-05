@@ -88,12 +88,13 @@
 
 bool moq_endpoint_version_supported(moq_version_t v)
 {
-    /* Single point of truth for the build's supported set. Both profiles are
-     * unconditionally compiled today (core/CMakeLists.txt lists profile_d16.c
-     * and profile_d18.c in every configuration); if a profile ever becomes a
+    /* Single point of truth for the build's supported set. All three profiles are
+     * unconditionally compiled today (core/CMakeLists.txt lists profile_d16.c,
+     * profile_d18.c and profile_d21.c in every configuration); if a profile ever becomes a
      * build option, thread its define through here -- the offer rules (§5.2)
      * depend on this predicate being exact. */
-    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18 ||
+           v == MOQ_VERSION_DRAFT_21;
 }
 
 /* The full supported set, NEWEST FIRST: both TLS ALPN selection and the
@@ -103,6 +104,7 @@ bool moq_endpoint_version_supported(moq_version_t v)
 static size_t supported_versions(moq_version_t *out, size_t cap)
 {
     size_t n = 0;
+    if (n < cap) out[n++] = MOQ_VERSION_DRAFT_21;
     if (n < cap) out[n++] = MOQ_VERSION_DRAFT_18;
     if (n < cap) out[n++] = MOQ_VERSION_DRAFT_16;
     return n;
@@ -397,6 +399,8 @@ struct moq_endpoint {
     char *host;    size_t host_len;
     char *sni;     size_t sni_len;
     char *path;    size_t path_len;    /* WT path; NULL for RAW_QUIC */
+    char *setup_authority; size_t setup_authority_len;  /* RAW_QUIC: SETUP AUTHORITY value */
+    char *setup_path;      size_t setup_path_len;       /* RAW_QUIC: SETUP PATH value (path[?query]) */
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
@@ -1128,7 +1132,12 @@ static void ep_free_strings(moq_endpoint_t *ep)
     if (ep->path)    ep->alloc.free(ep->path, ep->path_len, ep->alloc.ctx);
     if (ep->ca_file) ep->alloc.free(ep->ca_file, ep->ca_file_len, ep->alloc.ctx);
     if (ep->wt_offer) ep->alloc.free(ep->wt_offer, ep->wt_offer_len, ep->alloc.ctx);
+    if (ep->setup_authority)
+        ep->alloc.free(ep->setup_authority, ep->setup_authority_len, ep->alloc.ctx);
+    if (ep->setup_path)
+        ep->alloc.free(ep->setup_path, ep->setup_path_len, ep->alloc.ctx);
     ep->host = ep->sni = ep->path = ep->ca_file = NULL;
+    ep->setup_authority = ep->setup_path = NULL;
     ep->wt_offer = NULL;
 }
 
@@ -1173,6 +1182,8 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     fc.alpn_list = ep->alpn_offer;
     fc.alpn_count = ep->alpn_offer_count;
     fc.port = (int)r->url.port;
+    fc.setup_authority = ep->setup_authority;
+    fc.setup_path = ep->setup_path;
     fc.insecure_skip_verify = cfg->insecure_skip_verify;
     fc.configure_quic = ep_configure_quic;
     fc.configure_quic_ctx = ep;
@@ -1249,6 +1260,8 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
      * it must use the sized initializer -- the pointer-only init stamps only the
      * frozen prefix and would leave SNI/ALPN disabled. */
     moq_mvfst_managed_cfg_init_sized(&fc, sizeof(fc));
+    fc.setup_authority = ep->setup_authority;   /* native-QUIC SETUP AUTHORITY / PATH */
+    fc.setup_path = ep->setup_path;
     fc.alloc = &ep->alloc;
     fc.perspective = MOQ_PERSPECTIVE_CLIENT;
     /* See the picoquic branch: grant the peer request capacity so it can
@@ -1318,6 +1331,8 @@ static moq_result_t ep_create_msquic(moq_endpoint_t *ep,
     /* Sized init: this endpoint sets the appended `version` field, so the
      * pointer-only init (frozen prefix) would leave it at the default. */
     moq_msquic_managed_cfg_init_sized(&fc, sizeof(fc));
+    fc.setup_authority = ep->setup_authority;   /* native-QUIC SETUP AUTHORITY / PATH */
+    fc.setup_path = ep->setup_path;
     fc.alloc = &ep->alloc;
     fc.perspective = MOQ_PERSPECTIVE_CLIENT;
     fc.host = ep->host;                 /* remote + TLS server name (sni==host,
@@ -1665,6 +1680,33 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
         ep->path = ep_strdup_bytes(alloc, r.wt_path, &ep->path_len);
         oom = oom || !ep->path;
+    }
+    if (!oom && r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {
+        /* The SETUP AUTHORITY / PATH options a native-QUIC client sends (draft 21 9.1.1,
+         * 9.1.2): the URI's authority verbatim (an explicit port is kept), and the path
+         * with "?query" appended when the URI has a query; an empty path is sent as
+         * empty (path-abempty). Drafts 16/18 ignore both. */
+        const uint8_t *u = cfg->url.data;
+        size_t n = cfg->url.len, a = 0, b;
+        while (a + 2 < n && !(u[a] == ':' && u[a + 1] == '/' && u[a + 2] == '/')) a++;
+        a = (a + 2 < n) ? a + 3 : 0;
+        b = a;
+        while (b < n && u[b] != '/' && u[b] != '?' && u[b] != '#') b++;
+        moq_bytes_t auth = { u + a, b - a };
+        /* PATH is path-abempty plus "?query" verbatim up to any '#': taken from the raw
+         * URI so a present-but-empty query ("/p?") is kept distinct from none. */
+        size_t e = b;
+        while (e < n && u[e] != '#') e++;
+        size_t plen = e - b;
+        if (auth.len > MOQ_SETUP_AUTHORITY_MAX || plen > MOQ_SETUP_PATH_MAX)
+            plen = SIZE_MAX;           /* too long for SETUP: refuse the endpoint (below) */
+        if (plen == SIZE_MAX) {
+            oom = true;
+        } else {
+            ep->setup_authority = ep_strdup_bytes(alloc, auth, &ep->setup_authority_len);
+            ep->setup_path = ep_strdup_bytes(alloc, (moq_bytes_t){ u + b, plen }, &ep->setup_path_len);
+            oom = oom || !ep->setup_authority || !ep->setup_path;
+        }
     }
     if (!oom && cfg->ca_file.len > 0) {
         ep->ca_file = ep_strdup_bytes(alloc, cfg->ca_file, &ep->ca_file_len);

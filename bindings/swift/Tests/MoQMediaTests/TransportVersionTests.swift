@@ -117,6 +117,48 @@ struct TransportVersionTests {
                 "draft-18 bytes must not decode to 33333 under draft-16")
     }
 
+    @Test("Draft 21 reads the timestamp at LOC-04's id, not LOC-01's")
+    func draft21UsesLoc04TimestampId() throws {
+        // Draft 21 keeps draft 18's vi64 codec (draft-21 section 8.1), so
+        // the corpus d18 value bytes are the d21 value bytes too. What
+        // changes is the property id: draft 21 registers LOC-04's (section
+        // 16.8; draft-ietf-moq-loc-04 section 2.3), where the timestamp is
+        // 0x10 rather than LOC-01's 0x02.
+        let records = try loadTimestampRecords()
+        guard let rec = records.first(where: {
+            $0.transport == "d18" && $0.value == 33333
+        }) else {
+            Issue.record("the corpus has no d18 timestamp 33333 record")
+            return
+        }
+        let loc04 = try makeObject(properties: Data([0x10] + rec.bytes),
+                                   payload: Data([0x01]))
+        let loc01 = try makeObject(properties: propertyBlock(for: rec),
+                                   payload: Data([0x01]))
+        let d21 = MediaTrackInfo(mediaType: .video, packaging: .raw,
+                                 transportVersion: .draft21)
+        let d18 = MediaTrackInfo(mediaType: .video, packaging: .raw,
+                                 transportVersion: .draft18)
+
+        let parsed = try MediaObjectParser.parse(track: d21, object: loc04)
+        #expect(parsed.hasCaptureTime)
+        #expect(parsed.captureTimeUS == 33333)
+
+        // Each id is meaningful only under its own draft. Either may throw
+        // or report no timestamp; reproducing the value would mean the
+        // version never reached the id table.
+        for (track, obj, what) in [(d21, loc01, "LOC-01 id under d21"),
+                                   (d18, loc04, "LOC-04 id under d18")] {
+            var reproduced = false
+            if let other = try? MediaObjectParser.parse(track: track,
+                                                        object: obj) {
+                reproduced = other.hasCaptureTime
+                    && other.captureTimeUS == 33333
+            }
+            #expect(!reproduced, "\(what) must not yield the timestamp")
+        }
+    }
+
     @Test("A live Session reports its draft, and it feeds the media path")
     func sessionVersionFeedsTheMediaPath() throws {
         // This is the EXACT expression shape the live examples use:
@@ -162,6 +204,7 @@ struct TransportVersionTests {
         // than an indirect parse failure somewhere downstream.
         #expect(cTransportVersion(.draft16) == MOQ_VERSION_DRAFT_16)
         #expect(cTransportVersion(.draft18) == MOQ_VERSION_DRAFT_18)
+        #expect(cTransportVersion(.draft21) == MOQ_VERSION_DRAFT_21)
         #expect(cTransportVersion(.draft16) != cTransportVersion(.draft18))
 
         // Every case the shared type declares must map to a DISTINCT C

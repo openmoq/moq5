@@ -54,6 +54,7 @@ public final class Session {
         switch moq_session_version(raw) {
         case MOQ_VERSION_DRAFT_16: return .draft16
         case MOQ_VERSION_DRAFT_18: return .draft18
+        case MOQ_VERSION_DRAFT_21: return .draft21
         default: return nil
         }
     }

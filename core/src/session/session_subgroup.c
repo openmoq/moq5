@@ -153,6 +153,14 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
             continue;                      /* costs nothing; never suspends */
         }
+        /* Draft 21: a closed subgroup whose delivery timer is armed stays until the timer
+         * resets it (5.2); reaping it now would forget the timer. */
+        if (s->subgroups[i].state == MOQ_SG_CLOSING &&
+            s->profile->subgroup_timer_at_fin &&
+            s->subgroups[i].delivery_deadline_us != UINT64_MAX) {
+            s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
+            continue;
+        }
         if (budget) {
             if (*budget == 0) return false;
             (*budget)--;
@@ -258,6 +266,10 @@ moq_result_t moq_session_open_subgroup(
     if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, end_of_group) +
         sizeof(cfg->end_of_group))
         eog = cfg->end_of_group;
+    bool first_object = false;
+    if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, first_object) +
+        sizeof(cfg->first_object))
+        first_object = cfg->first_object;
 
     moq_subgroup_header_encode_args_t hdr_args = {
         .track_alias = s->subs[sub_slot].track_alias,
@@ -266,6 +278,7 @@ moq_result_t moq_session_open_subgroup(
         .publisher_priority = cfg->publisher_priority,
         .has_extensions = has_ext,
         .end_of_group = eog,
+        .first_object = first_object,
     };
 
     moq_action_t a;
@@ -322,7 +335,9 @@ moq_result_t moq_session_open_subgroup(
             dte->dt_pub_has_subgroup, dte->dt_pub_subgroup_ms,
             dte->dt_sub_has_subgroup, dte->dt_sub_subgroup_ms);
         uint64_t sg_us = ms_to_us_sat(sg_ms);
-        if (sg_us > 0) {
+        if (s->profile->subgroup_timer_at_fin) {
+            entry->delivery_deadline_us = UINT64_MAX;   /* armed at the FIN instead */
+        } else if (sg_us > 0) {
             entry->delivery_deadline_us = deadline_add(now_us, sg_us);
             if (entry->delivery_deadline_us < s->subgroup_deadline_us)
                 s->subgroup_deadline_us = entry->delivery_deadline_us;
@@ -485,6 +500,21 @@ void moq_object_cfg_init(moq_object_cfg_t *cfg)
     cfg->struct_size = sizeof(*cfg);
 }
 
+/* Draft 21 5.2: the first object of a subgroup may carry its own SUBGROUP_DELIVERY_TIMEOUT,
+ * overriding the Track value for this subgroup; on any later object it is ignored. */
+static void sg_note_first_object_timeouts(moq_session_t *s, moq_sg_entry_t *entry,
+                                          const uint8_t *props, size_t props_len)
+{
+    if (!s->profile->subgroup_timer_at_fin || entry->has_prev_object || props_len == 0)
+        return;
+    moq_dt_scan_t sc;
+    if (session_scan_dt_props(s, props, props_len, false, &sc) < 0) return;
+    if (sc.has_subgroup) {
+        entry->ovr_has_subgroup_timeout = true;
+        entry->ovr_subgroup_timeout_ms = sc.subgroup_ms;
+    }
+}
+
 moq_result_t moq_session_write_object_ex(
     moq_session_t *s, moq_subgroup_handle_t subgroup,
     const moq_object_cfg_t *cfg, uint64_t now_us)
@@ -524,6 +554,8 @@ moq_result_t moq_session_write_object_ex(
             s, moq_rcbuf_data(cfg->properties), props_len) < 0)
         return MOQ_ERR_INVAL;
 
+    if (props_len > 0)
+        sg_note_first_object_timeouts(s, entry, moq_rcbuf_data(cfg->properties), props_len);
     bool has_props = (props_len > 0);
     size_t slots_needed = has_props ? 2 : 1;
     if (action_queue_avail(s) < slots_needed) return MOQ_ERR_WOULD_BLOCK;
@@ -654,7 +686,25 @@ moq_result_t moq_session_close_subgroup(
     if (rc < 0) return rc;
 
     s->subgroups[slot].state = MOQ_SG_CLOSING;
-    if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
+    if (s->profile->subgroup_timer_at_fin) {
+        /* The subgroup is fully published: its timer starts now (5.2). The effective value
+         * is the smaller non-zero of the publisher's (first object's property, else the
+         * Track Property) and the subscriber's. It runs until the stream is released. */
+        moq_sg_entry_t *sg = &s->subgroups[slot];
+        int ss = sub_resolve_handle(s, sg->sub);
+        uint64_t ms = 0;
+        if (ss >= 0) {
+            const moq_sub_entry_t *dte = &s->subs[ss];
+            bool ph = sg->ovr_has_subgroup_timeout || dte->dt_pub_has_subgroup;
+            uint64_t pm = sg->ovr_has_subgroup_timeout ? sg->ovr_subgroup_timeout_ms
+                                                       : dte->dt_pub_subgroup_ms;
+            ms = dt_negotiate_ms(ph, pm, dte->dt_sub_has_subgroup, dte->dt_sub_subgroup_ms);
+        }
+        uint64_t us = ms_to_us_sat(ms);
+        sg->delivery_deadline_us = us > 0 ? deadline_add(s->last_now_us, us) : UINT64_MAX;
+        if (sg->delivery_deadline_us < s->subgroup_deadline_us)
+            s->subgroup_deadline_us = sg->delivery_deadline_us;
+    } else if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
         s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
         sg_recompute_deadline(s);
     }
@@ -808,6 +858,8 @@ moq_result_t moq_session_begin_object_ex(
             s, moq_rcbuf_data(cfg->properties), props_len) < 0)
         return MOQ_ERR_INVAL;
 
+    if (props_len > 0)
+        sg_note_first_object_timeouts(s, entry, moq_rcbuf_data(cfg->properties), props_len);
     bool has_props = (props_len > 0);
     size_t slots_needed = has_props ? 2 : 1;
     if (action_queue_avail(s) < slots_needed) return MOQ_ERR_WOULD_BLOCK;
@@ -1283,6 +1335,17 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
     if (arc != MOQ_OK) return arc;
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
+    /* STOP_SENDING on a fill fetch stream cancels only that fill (3.4.1): the
+     * subscription continues. The transport already knows the stream is stopped,
+     * so the entry is simply released (later writes see a stale handle). */
+    for (size_t i = 0; i < s->fetch_cap; i++) {
+        moq_fetch_entry_t *fe = &s->fetches[i];
+        if (fe->state != MOQ_FETCH_FREE && fe->is_fill &&
+            fe->data_stream_ref._v == stream_ref._v) {
+            fetch_free_entry(s, (int)i);
+            return MOQ_OK;
+        }
+    }
     int slot = sg_find_by_stream_ref(s, stream_ref);
     if (slot < 0) return MOQ_OK;
     if (s->subgroups[slot].state != MOQ_SG_OPEN &&

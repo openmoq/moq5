@@ -17,6 +17,7 @@ struct moq_decoded_object_header;
 struct moq_subgroup_header_encode_args;
 struct moq_object_header_encode_args;
 struct moq_goaway_encode_args;
+struct moq_publish_state_notify_args;
 struct moq_publish_namespace_encode_args;
 struct moq_publish_namespace_cancel_encode_args;
 struct moq_subscribe_namespace_encode_args;
@@ -83,6 +84,18 @@ typedef struct moq_profile_ops {
      * for a session's version -- the session stores no separate copy.
      */
     moq_version_t version;
+
+    /*
+     * Capability: true when this profile is complete enough to speak to a real
+     * peer. A profile can exist before it is (draft 21 speaks draft-21 bytes
+     * but its session semantics are not finished): it can
+     * be created for the simulator and for tests, but it must not be reachable
+     * from the wire. The endpoint's supported set and the negotiated-profile
+     * model's AVAILABLE state both mean "wire ready"; moq_profile_wire_ready()
+     * is the single query. Draft 16 and 18 set it; a profile that omits it
+     * reads false and stays off the wire rather than leaking out by default.
+     */
+    bool wire_ready;
 
     size_t state_size;
     size_t state_align;
@@ -241,6 +254,10 @@ typedef struct moq_profile_ops {
     moq_result_t (*encode_subscribe_tracks)(moq_session_t *s,
                                             struct moq_buf_writer *w,
                                             const struct moq_subscribe_tracks_encode_args *args);
+    /* Draft 21 only (NULL elsewhere => MOQ_ERR_UNSUPPORTED): PUBLISH_STATE_NOTIFY. */
+    moq_result_t (*encode_publish_state_notify)(moq_session_t *s,
+                                                struct moq_buf_writer *w,
+                                                const struct moq_publish_state_notify_args *args);
     moq_result_t (*encode_publish_blocked)(moq_session_t *s,
                                            struct moq_buf_writer *w,
                                            const moq_namespace_t *suffix,
@@ -387,6 +404,57 @@ typedef struct moq_profile_ops {
     moq_request_error_t (*semantic_request_error)(uint64_t raw);
 
     /*
+     * Capability: true when the subscriber's PUBLISH_OK (the answer to a PUBLISH)
+     * carries the subscriber's delivery parameters (priority, group order, forward,
+     * filter, timeouts). Draft 21 moved them to REQUEST_UPDATE, so its OK carries
+     * none and a non-default choice has to be sent as an update afterwards.
+     */
+    bool publish_ok_carries_params;
+
+    /*
+     * Capability: true when this profile has the Joining FETCH (a FETCH that names
+     * an existing subscription instead of a track). Draft 21 removed it; fill
+     * streams on a SUBSCRIBE replace it (3.4).
+     */
+    bool supports_joining_fetch;
+
+    /* Capability: true when a subscription can ask for a fill stream (draft 21 3.4). */
+    bool supports_fill;
+
+    /*
+     * Capability: draft 21 delivery-timeout timing (5.2). The SUBGROUP timeout starts when
+     * the subgroup's last object is published (its FIN) and is checked until the transport
+     * has committed all data, and the first object's SUBGROUP_DELIVERY_TIMEOUT property
+     * overrides the Track-level value for that subgroup. Earlier drafts arm the timer when
+     * the subgroup opens and never time out a closing stream.
+     */
+    bool subgroup_timer_at_fin;
+
+    /*
+     * Capability: true when several concurrent subscriptions to the same Track
+     * are allowed on one session (draft 21 3.3: each is served independently and
+     * an object matching more than one is sent once per subscription). Drafts 16
+     * and 18 reject the second with DUPLICATE_SUBSCRIPTION.
+     */
+    bool allows_concurrent_subscriptions;
+
+    /*
+     * Capability: true when a FIN on the requester's half of an established
+     * request stream only closes that direction (draft 21 6.4.2.2) rather than
+     * being treated as a truncated message. Cancellation is then RESET_STREAM /
+     * STOP_SENDING only.
+     */
+    bool request_fin_is_not_cancel;
+
+    /*
+     * Capability: true when PUBLISH_DONE has a SUBSCRIPTION_ENDED status (drafts
+     * 16 and 18: sent when a finite filter end is reached). Draft 21 removed it: a
+     * subscription does not end because the Largest Object passes the end of its
+     * Location Filter (A.2, #1833), so a publisher keeps it open.
+     */
+    bool publish_done_subscription_ended;
+
+    /*
      * Capability: true if this profile's FETCH-response data plane can carry a
      * descending group order. Draft-16 sets true (fetch objects carry absolute
      * Group IDs); draft-18 sets false (group deltas with ascending-only
@@ -478,8 +546,16 @@ typedef struct moq_profile_ops {
 
 const moq_profile_ops_t *moq_profile_lookup(moq_version_t version);
 
+/* True iff a profile exists for `version` AND it is wire ready (see
+ * moq_profile_ops_t.wire_ready). NULL-safe for unknown versions: false. */
+bool moq_profile_wire_ready(moq_version_t version);
+
 /* Draft-18 profile ops (defined in profile_d18.c). Returned by
  * moq_profile_lookup for MOQ_VERSION_DRAFT_18. */
 const moq_profile_ops_t *moq_d18_profile_ops(void);
+
+/* Draft-21 profile ops (defined in profile_d21.c). Returned by
+ * moq_profile_lookup for MOQ_VERSION_DRAFT_21. */
+const moq_profile_ops_t *moq_d21_profile_ops(void);
 
 #endif /* MOQ_PROFILE_H */

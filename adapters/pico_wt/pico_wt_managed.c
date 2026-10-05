@@ -70,6 +70,22 @@ picoquic_cnx_t *moq_pico_wt_managed_test_keep_alive_last_cnx;
 uint64_t moq_pico_wt_managed_test_keep_alive_last_interval_us;
 #endif
 
+/* Bootstrap storage is separate from the negotiated session's receive
+ * budget. Bound streams, payload, and metadata (including empty callbacks).
+ * WT draft-15 section 4.6 calls for buffering reordered session traffic and
+ * rejecting excess streams with WT_BUFFERED_STREAM_REJECTED. */
+#define PICO_WT_EARLY_STREAMS 128u
+#define PICO_WT_EARLY_EVENTS 1024u
+#define PICO_WT_EARLY_BYTES (1024u * 1024u)
+
+typedef struct managed_early_event {
+    struct managed_early_event *next;
+    uint64_t stream_id;
+    size_t length;
+    picohttp_call_back_event_t event;
+    uint8_t bytes[];
+} managed_early_event_t;
+
 struct moq_pico_wt_managed {
     moq_alloc_t        alloc;
 
@@ -102,6 +118,14 @@ struct moq_pico_wt_managed {
     h3zero_callback_ctx_t *h3_ctx;      /* client */
     h3zero_stream_ctx_t   *ctrl_ctx;    /* client */
     picoquic_packet_loop_param_t loop_param;
+
+    /* Client network-thread-owned callbacks received before CONNECT acceptance.
+     * Store IDs, never borrowed h3zero contexts or packet buffers. */
+    managed_early_event_t *early_head;
+    managed_early_event_t *early_tail;
+    size_t early_bytes;
+    size_t early_events;
+    size_t early_streams;
 
     /* Server WT path handler (create-time, persistent for the QUIC
      * context's lifetime). */
@@ -319,6 +343,129 @@ static size_t managed_alpn_select(picoquic_quic_t *quic,
  * it is a WebTransport wire code, never a MoQ close/fatal code. */
 #define MOQ_WT_ALPN_ERROR 0x0817b3ddu
 
+static void managed_early_clear(moq_pico_wt_managed_t *m)
+{
+    while (m->early_head) {
+        managed_early_event_t *e = m->early_head;
+        m->early_head = e->next;
+        m->alloc.free(e, sizeof(*e) + e->length, m->alloc.ctx);
+    }
+    m->early_tail = NULL;
+    m->early_bytes = m->early_events = m->early_streams = 0;
+}
+
+static bool managed_early_has_stream(moq_pico_wt_managed_t *m, uint64_t sid)
+{
+    for (managed_early_event_t *e = m->early_head; e; e = e->next)
+        if (e->stream_id == sid) return true;
+    return false;
+}
+
+static void managed_early_drop_stream(moq_pico_wt_managed_t *m, uint64_t sid)
+{
+    bool found = false;
+    managed_early_event_t **link = &m->early_head;
+    m->early_tail = NULL;
+    while (*link) {
+        managed_early_event_t *e = *link;
+        if (e->stream_id == sid) {
+            *link = e->next;
+            m->early_bytes -= e->length;
+            m->early_events--;
+            m->alloc.free(e, sizeof(*e) + e->length, m->alloc.ctx);
+            found = true;
+        } else {
+            m->early_tail = e;
+            link = &e->next;
+        }
+    }
+    if (found) m->early_streams--;
+}
+
+static void managed_early_reject(moq_pico_wt_managed_t *m,
+                                  picoquic_cnx_t *cnx,
+                                  h3zero_stream_ctx_t *stream_ctx)
+{
+    uint64_t sid = stream_ctx->stream_id;
+    managed_early_drop_stream(m, sid);
+    /* The WT prefix was already parsed, so subsequent bytes on this rejected
+     * stream retain this NULL callback instead of being buffered again. */
+    stream_ctx->path_callback = NULL;
+    stream_ctx->path_callback_ctx = NULL;
+    (void)picoquic_stop_sending(cnx, sid,
+                               H3ZERO_WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+    if (PICOQUIC_IS_BIDIR_STREAM_ID(sid))
+        (void)picoquic_reset_stream(cnx, sid,
+                                   H3ZERO_WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+}
+
+static int managed_early_buffer(moq_pico_wt_managed_t *m,
+    picoquic_cnx_t *cnx, const uint8_t *bytes, size_t length,
+    picohttp_call_back_event_t event, h3zero_stream_ctx_t *stream_ctx)
+{
+    bool existing = managed_early_has_stream(m, stream_ctx->stream_id);
+    if ((!existing && m->early_streams >= PICO_WT_EARLY_STREAMS) ||
+        m->early_events >= PICO_WT_EARLY_EVENTS ||
+        length > PICO_WT_EARLY_BYTES - m->early_bytes) {
+        managed_early_reject(m, cnx, stream_ctx);
+        return 0;
+    }
+    managed_early_event_t *e = m->alloc.alloc(sizeof(*e) + length,
+                                             m->alloc.ctx);
+    if (!e) {
+        managed_early_reject(m, cnx, stream_ctx);
+        return 0;
+    }
+    e->next = NULL;
+    e->stream_id = stream_ctx->stream_id;
+    e->length = length;
+    e->event = event;
+    if (length) memcpy(e->bytes, bytes, length);
+    if (m->early_tail) m->early_tail->next = e;
+    else m->early_head = e;
+    m->early_tail = e;
+    m->early_bytes += length;
+    m->early_events++;
+    if (!existing) m->early_streams++;
+    return 0;
+}
+
+static int managed_client_wt_cb(picoquic_cnx_t *, uint8_t *, size_t,
+    picohttp_call_back_event_t, h3zero_stream_ctx_t *, void *);
+
+static int managed_early_replay(moq_pico_wt_managed_t *m,
+                                moq_pico_wt_conn_t *conn)
+{
+    /* h3zero captures prefix ownership once, when a stream's WT session ID
+     * is parsed. Rebinding only the prefix leaves these early streams with
+     * the facade callback. Transfer every surviving captured binding so
+     * future bytes and adapter detach use the same owner. */
+    for (picosplay_node_t *n = picosplay_first(&m->h3_ctx->h3_stream_tree);
+         n; n = picosplay_next(n)) {
+        h3zero_stream_ctx_t *sc = (h3zero_stream_ctx_t *)
+            ((char *)n - offsetof(h3zero_stream_ctx_t, http_stream_node));
+        if (sc->path_callback == managed_client_wt_cb &&
+            sc->path_callback_ctx == m) {
+            sc->path_callback = moq_pico_wt_callback;
+            sc->path_callback_ctx = conn;
+        }
+    }
+    int rc = 0;
+    while (m->early_head && rc == 0) {
+        managed_early_event_t *e = m->early_head;
+        h3zero_stream_ctx_t *sc = h3zero_find_stream(m->h3_ctx, e->stream_id);
+        /* A preaccept reset/release drops that stream's queue. Do not replay
+         * into a deleted transport stream if teardown won the race. */
+        if (sc)
+            rc = moq_pico_wt_callback(m->cnx, e->bytes, e->length,
+                                      e->event, sc, conn);
+        m->early_head = e->next;
+        m->alloc.free(e, sizeof(*e) + e->length, m->alloc.ctx);
+    }
+    managed_early_clear(m);
+    return rc;
+}
+
 /* -- WT client control-stream callback (network thread) ------------- */
 
 static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
@@ -326,12 +473,33 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     h3zero_stream_ctx_t *stream_ctx, void *app_ctx)
 {
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)app_ctx;
-    (void)bytes; (void)length;
+    if (m->conn)
+        return moq_pico_wt_callback(cnx, bytes, length, event,
+                                    stream_ctx, m->conn);
+    if (stream_ctx && stream_ctx != m->ctrl_ctx) {
+        if (event == picohttp_callback_post_data ||
+            event == picohttp_callback_post_fin ||
+            event == picohttp_callback_stop_sending)
+            return managed_early_buffer(m, cnx, bytes, length, event, stream_ctx);
+        if (event == picohttp_callback_reset ||
+            event == picohttp_callback_free) {
+            /* An aborted or released preaccept stream has no live owner to
+             * replay into. Drop only its queued callbacks, without retaining
+             * the borrowed context past this notification. */
+            managed_early_drop_stream(m, stream_ctx->stream_id);
+            return 0;
+        }
+    }
+    if (event == picohttp_callback_deregister) {
+        managed_early_clear(m);
+        goto fail;
+    }
 
     if (event == picohttp_callback_connecting)
         return 0;
 
     if (event == picohttp_callback_connect_refused) {
+        managed_early_clear(m);
         /* Server refused the WT session (non-2xx CONNECT response, e.g.
          * HTTP 501 for a one-connection server's second CONNECT). Latch a
          * terminal fatal so wait() returns MOQ_ERR_CLOSED promptly instead
@@ -407,7 +575,12 @@ static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
      * refuse locally (reliable-reset was never actually negotiated). */
     conn->endpoint_ctx.reset_stream_at_synthesized = m->reset_stream_at_synthesized;
 
-    moq_session_start(session, now);
+    if (moq_session_start(session, now) != MOQ_OK ||
+        managed_early_replay(m, conn) != 0) {
+        moq_pico_wt_conn_destroy(conn);
+        moq_session_destroy(session);
+        goto fail;
+    }
 
     pthread_mutex_lock(&m->mutex);
     m->session = session;
@@ -431,6 +604,7 @@ alpn_fail:
                                             MOQ_WT_ALPN_ERROR, NULL);
     /* fall through to the shared local terminal */
 fail:
+    managed_early_clear(m);
     pthread_mutex_lock(&m->mutex);
     m->fatal = true;
     m->fatal_code = 0;
@@ -1125,6 +1299,7 @@ moq_result_t moq_pico_wt_managed_create(
     return MOQ_OK;
 
 fail_configure:
+    managed_early_clear(m);
     /* A client cnx whose setup got past picowt_prepare_client_cnx owns an
      * h3zero context (and its per-stream contexts); delete it before the cnx is
      * freed, so a failed connect does not leak it. NULL for the server path. */
@@ -1194,6 +1369,7 @@ moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m)
 void moq_pico_wt_managed_destroy(moq_pico_wt_managed_t *m)
 {
     if (!m) return;
+    managed_early_clear(m);
     if (m->conn) moq_pico_wt_conn_destroy(m->conn);
     if (m->session) moq_session_destroy(m->session);
     /* The managed client owns the h3zero context returned by
@@ -1401,6 +1577,63 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
 }
 
 #if defined(MOQ_PICO_WT_TESTING)
+moq_pico_wt_managed_t *moq_pico_wt_managed_test_early_create(
+    moq_pico_wt_conn_t *conn, const moq_alloc_t *alloc)
+{
+    moq_pico_wt_managed_t *m = alloc->alloc(sizeof(*m), alloc->ctx);
+    if (!m) return NULL;
+    memset(m, 0, sizeof(*m));
+    m->alloc = *alloc;
+    m->cnx = conn->cnx;
+    m->h3_ctx = conn->h3_ctx;
+    m->ctrl_ctx = conn->control_stream_ctx;
+    pthread_mutex_init(&m->mutex, NULL);
+    pthread_cond_init(&m->cond, NULL);
+    return m;
+}
+
+int moq_pico_wt_managed_test_early_callback(moq_pico_wt_managed_t *m,
+    uint64_t sid, uint8_t *bytes, size_t length, int event)
+{
+    h3zero_stream_ctx_t *sc = h3zero_find_or_create_stream(
+        m->cnx, sid, m->h3_ctx, 1, 1);
+    if (!sc) return -1;
+    sc->path_callback = managed_client_wt_cb;
+    sc->path_callback_ctx = m;
+    return managed_client_wt_cb(m->cnx, bytes, length,
+        (picohttp_call_back_event_t)event, sc, m);
+}
+
+size_t moq_pico_wt_managed_test_early_pending(moq_pico_wt_managed_t *m)
+{
+    return m->early_events;
+}
+
+int moq_pico_wt_managed_test_early_replay(moq_pico_wt_managed_t *m,
+    moq_pico_wt_conn_t *conn)
+{
+    return managed_early_replay(m, conn);
+}
+
+void moq_pico_wt_managed_test_early_destroy(moq_pico_wt_managed_t *m)
+{
+    if (!m) return;
+    for (picosplay_node_t *n = picosplay_first(&m->h3_ctx->h3_stream_tree);
+         n; n = picosplay_next(n)) {
+        h3zero_stream_ctx_t *sc = (h3zero_stream_ctx_t *)
+            ((char *)n - offsetof(h3zero_stream_ctx_t, http_stream_node));
+        if (sc->path_callback_ctx == m) {
+            sc->path_callback = NULL;
+            sc->path_callback_ctx = NULL;
+        }
+    }
+    managed_early_clear(m);
+    pthread_cond_destroy(&m->cond);
+    pthread_mutex_destroy(&m->mutex);
+    moq_alloc_t alloc = m->alloc;
+    alloc.free(m, sizeof(*m), alloc.ctx);
+}
+
 /* TEST-ONLY ownership seam (absent from the shipped library, nothing exported).
  * Reports the WT CONTROL stream's callback/context binding together with the
  * adapter pointer, so a test can assert the invariant that

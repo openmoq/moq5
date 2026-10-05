@@ -350,7 +350,7 @@ typedef struct {
     const char *test_name;
     bool        tls_disable_verify;
     bool        verbose;
-    int         draft;   /* 0 = auto (offer every draft); 16/18 = pin exactly */
+    int         draft;   /* 0 = auto (offer every draft); 16, 18 or 21 = pin exactly */
     moq_transport_backend_t backend;   /* 0 = AUTO (picoquic); see --backend */
     const char *backend_name;          /* the selected name, for diagnostics */
     uint32_t wt_profile;               /* moq_wt_profile_t; 0 = backend default */
@@ -392,7 +392,7 @@ static void print_usage(const char *prog)
         "                          https://host:port[/path] (WebTransport;\n"
         "                          no path means the root mount \"/\")\n"
         "  --test NAME             test case name (default: run all cases)\n"
-        "  --draft N               pin the offered draft to 16 or 18\n"
+        "  --draft N               pin the offered draft to 16, 18 or 21\n"
         "                          (default: offer every draft, negotiate one)\n"
         "  --backend NAME          transport backend (testing): auto|picoquic|\n"
         "                          msquic|mvfst|proxygen|wtquic-msquic|\n"
@@ -420,7 +420,7 @@ static void print_usage(const char *prog)
         prog);
 }
 
-/* Strict draft parse: NULL/empty -> 0 (auto), exactly "16" or "18" -> that
+/* Strict draft parse: NULL/empty -> 0 (auto), exactly "16", "18" or "21" -> that
  * draft, anything else -> -1 (rejected). atoi would silently accept "16junk"
  * as 16 and "abc" as 0 (auto), falsifying per-draft interop results. */
 static int parse_draft(const char *s)
@@ -428,7 +428,7 @@ static int parse_draft(const char *s)
     if (!s || !*s) return 0;
     char *end = NULL;
     long v = strtol(s, &end, 10);
-    if (*end != '\0' || (v != 16 && v != 18)) return -1;
+    if (*end != '\0' || (v != 16 && v != 18 && v != 21)) return -1;
     return (int)v;
 }
 
@@ -477,7 +477,7 @@ static cli_opts_t parse_cli(int argc, char **argv)
     }
     opts.draft = parse_draft(draft_str);
     if (opts.draft < 0) {
-        fprintf(stderr, "error: --draft/MOQT_DRAFT must be exactly 16 or 18 "
+        fprintf(stderr, "error: --draft/MOQT_DRAFT must be exactly 16, 18 or 21 "
                 "(got \"%s\"); omit for auto-negotiation\n", draft_str);
         exit(1);
     }
@@ -572,7 +572,7 @@ static cli_opts_t parse_cli(int argc, char **argv)
 /* ------------------------------------------------------------------ */
 
 /* Draft to pin for this run: 0 = auto (offer every draft this build supports),
- * 16/18 = offer exactly that one. Set once from the CLI/env in main(). */
+ * 16, 18 or 21 = offer exactly that one. Set once from the CLI/env in main(). */
 static int g_draft_pin = 0;
 
 /* Transport backend for this run (default AUTO = picoquic); set from
@@ -599,7 +599,7 @@ static void tap_plan(int n)
      * backend/draft combination was exercised. */
     printf("# request: backend=%s wt-profile=%s draft=%s\n", g_backend_name,
            g_wt_profile_name,
-           g_draft_pin == 16 ? "16" : g_draft_pin == 18 ? "18" : "auto");
+           g_draft_pin == 16 ? "16" : g_draft_pin == 18 ? "18" : g_draft_pin == 21 ? "21" : "auto");
     fflush(stdout);
 }
 

@@ -372,8 +372,9 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
  * Per-stream bounds are direct. Connection-level arrest is DERIVATIVE: picoquic
  * grows connection MAX_DATA from delivery, so once every stream's window is
  * frozen, delivery stops and the connection stops advancing too. There is no
- * per-connection control here (picoquic_set_max_data_control is quic-wide and
- * mutually exclusive with picoquic_open_flow_control).
+ * per-connection control here. An explicit picoquic_set_max_data_control
+ * policy is quic-wide: stream-window grants still work, while picoquic
+ * advances connection MAX_DATA separately as data is received.
  */
 
 static pw_rx_stream_t *pw_rx_find(moq_pico_wt_conn_t *c, uint64_t sid)
@@ -537,7 +538,7 @@ static moq_result_t pw_rx_feed(moq_pico_wt_conn_t *c, pw_rx_stream_t *st,
  * connection credit without bound. Batching bounds this adapter's contribution
  * to <= 2x the bytes the session has taken.
  *
- * picoquic_open_flow_control SILENTLY no-ops unless the connection is exactly
+ * picoquic_open_flow_control rejects grants unless the connection is exactly
  * READY, so a pre-ready grant is left OWED (granted is not advanced) and issued
  * by the post-service sweep once ready. Returns 0, or -1 if picoquic rejected
  * the grant (the claimed window ownership no longer holds: fatal).
@@ -857,6 +858,17 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
     if (event == picohttp_callback_deregister) {
         uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
         clear_all_stream_callbacks(c);
+        /* Usually h3zero has already unlinked the prefix before notifying us.
+         * If it remains registered, clear its owner too: context destruction
+         * must never call back into an adapter freed after this notification. */
+        if (c->h3_ctx) {
+            h3zero_stream_prefix_t *prefix = h3zero_find_stream_prefix(
+                c->h3_ctx, c->control_stream_id);
+            if (prefix && prefix->function_ctx == c) {
+                prefix->function_call = NULL;
+                prefix->function_ctx = NULL;
+            }
+        }
         /* the transport is gone: drop every retained buffer now, and make sure
          * nothing can attempt a grant through the detached cnx afterwards */
         pw_rx_free_all(c);

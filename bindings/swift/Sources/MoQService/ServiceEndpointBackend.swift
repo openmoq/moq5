@@ -69,6 +69,7 @@ func cVersion(_ version: MoQVersion) -> moq_version_t {
     switch version {
     case .draft16: MOQ_VERSION_DRAFT_16
     case .draft18: MOQ_VERSION_DRAFT_18
+    case .draft21: MOQ_VERSION_DRAFT_21
     }
 }
 
@@ -77,6 +78,7 @@ func swiftVersion(_ version: moq_version_t) -> MoQVersion? {
     switch version {
     case MOQ_VERSION_DRAFT_16: .draft16
     case MOQ_VERSION_DRAFT_18: .draft18
+    case MOQ_VERSION_DRAFT_21: .draft21
     default: nil
     }
 }

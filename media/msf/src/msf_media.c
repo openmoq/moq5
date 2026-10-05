@@ -95,7 +95,8 @@ static moq_result_t msf_track_to_media_info_impl(
             return MOQ_ERR_INVAL;
         /* Zero and unsupported versions are refused rather than downgraded. */
         if (transport_version != MOQ_VERSION_DRAFT_16 &&
-            transport_version != MOQ_VERSION_DRAFT_18)
+            transport_version != MOQ_VERSION_DRAFT_18 &&
+            transport_version != MOQ_VERSION_DRAFT_21)
             return MOQ_ERR_INVAL;
 
         moq_media_track_info_init_sized(out_info, out_info_size);

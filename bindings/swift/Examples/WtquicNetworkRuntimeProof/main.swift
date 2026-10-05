@@ -7,7 +7,7 @@
 // Network.framework -> real MsQuic peer -- through the same public API
 // SimplePlayer uses (LiveMediaSession over MoQEndpoint + MediaReceiver):
 //
-//   exchange <port> <16|18>
+//   exchange <port> <16|18|21>
 //       Establish (assert the negotiated draft), watch the namespace,
 //       receive the object, verify every payload byte, stop cleanly.
 //
@@ -250,13 +250,14 @@ func u16(_ s: String) -> UInt16 { UInt16(s) ?? { fail("bad port \(s)") }() }
 if #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *) {
     switch args.count >= 2 ? args[1] : "" {
     case "exchange" where args.count == 4:
-        // exactly 16 or 18; anything else is a usage error, never a
+        // exactly 16, 18 or 21; anything else is a usage error, never a
         // silent draft-16 default
         let version: MoQVersion
         switch args[3] {
         case "16": version = .draft16
         case "18": version = .draft18
-        default: fail("bad version '\(args[3])' (want 16 or 18)")
+        case "21": version = .draft21
+        default: fail("bad version '\(args[3])' (want 16, 18 or 21)")
         }
         await exchange(port: u16(args[2]), version: version,
                        label: "exchange-d\(args[3])")
@@ -265,7 +266,7 @@ if #available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *) {
     case "untrusted" where args.count == 3:
         await runUntrusted(port: u16(args[2]))
     default:
-        fail("usage: exchange <port> <16|18> | reconnect <portA> <portB> | untrusted <port>")
+        fail("usage: exchange <port> <16|18|21> | reconnect <portA> <portB> | untrusted <port>")
     }
     exit(0)
 } else { fail("requires macOS 13 / iOS 16") }

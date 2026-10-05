@@ -56,7 +56,7 @@ moq-interop-client --relay moqt://relay.example.com:4443 --test setup-only
 # Run the whole suite (no --test / TESTCASE): one TAP line per case.
 moq-interop-client --relay moqt://relay.example.com:4443
 
-# Pin the offered draft to 16 or 18 (default: auto-negotiate, offer all):
+# Pin the offered draft to 16, 18 or 21 (default: auto-negotiate, offer all):
 moq-interop-client --relay moqt://relay:4443 --draft 18
 
 # With TLS verification disabled (for test relays with self-signed certs):

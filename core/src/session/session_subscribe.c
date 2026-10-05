@@ -5,6 +5,23 @@
 
 /* -- Subscription pool --------------------------------------------- */
 
+/* Draft 21 3.4: an empty fill opens no stream. Retire only the expectation
+ * belonging to this response, using its Largest snapshot, not the registry. */
+static void sub_retire_empty_fill(moq_sub_entry_t *e, uint64_t request_id,
+    bool has_largest, uint64_t largest_group, uint64_t largest_object)
+{
+    for (uint8_t k = 0; k < e->fill_expect_n; k++) {
+        if (e->fill_expect[k].request_id != request_id) continue;
+        if (moq_fill_selection_has_content(&e->fill_expect[k].selection,
+                has_largest, largest_group, largest_object))
+            return;
+        for (uint8_t j = k + 1; j < e->fill_expect_n; j++)
+            e->fill_expect[j - 1] = e->fill_expect[j];
+        e->fill_expect_n--;
+        return;
+    }
+}
+
 static int sub_find_free(moq_session_t *s)
 {
     for (size_t i = 0; i < s->sub_cap; i++)
@@ -159,6 +176,7 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
     sub_occ_unlink(s, slot);
+    session_core_reset_fills_for_sub(s, e->handle);
     /* Safety net for any Joining FETCHes (§10.12.2) still buffered against a
      * pending subscription: free them (dropping their entry-owned token storage)
      * with no control message. The alive teardown paths -- public reject and
@@ -212,6 +230,12 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     e->req_start_group = 0;
     e->req_start_object = 0;
     e->req_end_group = 0;
+    memset(&e->req_loc, 0, sizeof(e->req_loc));
+    e->fill_pending = false;
+    e->fill_expect_n = 0;
+    e->fill_request_id = 0;
+    memset(&e->fill_req, 0, sizeof(e->fill_req));
+    e->fill_has_largest = false;
     /* Release the owned deferred-done reason exactly once and clear the
      * Stream-Count gating state so a recycled slot starts ungated. */
     if (e->done_reason_buf) {
@@ -542,7 +566,8 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
      * decision both compare the decoded identity against stored canonical
      * keys in place. The request's own identity key is built only in
      * funded execution below, once every selected rejection is behind us. */
-    if (sub_is_duplicate_track_id(s, &d->track_namespace, d->track_name,
+    if (!s->profile->allows_concurrent_subscriptions &&
+        sub_is_duplicate_track_id(s, &d->track_namespace, d->track_name,
                                   MOQ_SUB_ROLE_PUBLISHER)) {
         result = sub_reject_terminal(s, d, reserved_slot, reject_drain,
                                      0x19, "duplicate subscription", 22);
@@ -724,6 +749,10 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     entry->req_start_group = d->start_group;
     entry->req_start_object = d->start_object;
     entry->req_end_group = d->end_group;
+    entry->req_loc = d->loc_filter;
+    entry->fill_pending = false;
+    entry->fill_request_id = d->request_id;
+    entry->fill_req = d->fill;
     entry->forward = d->forward;
     d->endpoint.kind = MOQ_REQ_SUBSCRIPTION;
     d->endpoint.slot = slot;
@@ -1640,6 +1669,17 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         }
 
         if (consumed == 0) {
+            /* Draft 21 6.4.2.2: a FIN is not a request cancellation. The
+             * requester of an established subscription that FINs with nothing
+             * buffered has only closed its direction (the FIN is latched in
+             * req_recv_fin, which the terminal path uses to free the entry). The
+             * responder's FIN before the response or PUBLISH_DONE arrived means
+             * the request failed: tear it down like a reset, not the session. */
+            if (e->req_recv_fin && s->profile->request_fin_is_not_cancel &&
+                !receiving && e->req_recv_len == 0) {
+                if (as_request) return MOQ_OK;
+                return request_stream_teardown(s, stream_ref);
+            }
             if (e->req_recv_fin) {
                 if (receiving) sub_free_entry(s, (size_t)slot);
                 return close_with_error(s, 0x3,
@@ -2214,6 +2254,8 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
     s->subs[slot].has_largest = d->has_largest;
     s->subs[slot].largest_group = d->has_largest ? d->largest_group : 0;
     s->subs[slot].largest_object = d->has_largest ? d->largest_object : 0;
+    sub_retire_empty_fill(&s->subs[slot], s->subs[slot].request_id,
+        d->has_largest, d->largest_group, d->largest_object);
     /* Merge the peer-advertised Largest Object into the registry. Monotonic; idempotent under retransmission. */
     if (d->has_largest && s->subs[slot].hist)
         track_hist_merge(s->subs[slot].hist, d->largest_group, d->largest_object);
@@ -2423,8 +2465,12 @@ moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
         e->forward = e->update_forward;
     e->update_has_forward = false;
     /* latch the acknowledged filter type (Joining-FETCH gates on it). */
-    if (e->update_has_filter)
+    if (e->update_has_filter) {
         e->filter_type = e->update_filter_type;
+        e->req_start_group = e->update_start_group;
+        e->req_start_object = e->update_start_object;
+        e->req_end_group = e->update_end_group;
+    }
     e->update_has_filter = false;
     /* §9.8: latch acknowledged timeout carriers and recompute the retained
      * legacy projection from the COMPLETE current pair. */
@@ -2441,6 +2487,8 @@ moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
             e->dt_sub_has_object, e->dt_sub_object_ms,
             e->dt_sub_has_subgroup, e->dt_sub_subgroup_ms));
     e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
+    sub_retire_empty_fill(e, e->update_request_id,
+        has_largest, largest_group, largest_object);
     e->update_pending = false;
     e->update_request_id = 0;
     return MOQ_OK;
@@ -2790,10 +2838,26 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
         e->req_start_group = d->start_group;
         e->req_start_object = d->start_object;
         e->req_end_group = d->end_group;
-        moq_resolve_filter_window(d->filter_type,
+        e->req_loc = d->loc_filter;
+        if (d->loc_filter.present && d->loc_filter.field_count > 0)
+            moq_resolve_loc_filter_window(&d->loc_filter,
+                                  usnap_has, usnap_g, usnap_o,
+                                  s->profile->location_varint_max, &e->window);
+        else
+            moq_resolve_filter_window(d->filter_type,
                                   d->start_group, d->start_object, d->end_group,
                                   usnap_has, usnap_g, usnap_o,
                                   s->profile->location_varint_max, &e->window);
+    }
+    /* A fill rides this update only while Forward State is 1 (3.4.1); an update
+     * without FILL_PARAMETERS leaves any earlier, unopened fill alone. */
+    if (d->fill.present && e->forward) {
+        e->fill_pending = true;
+        e->fill_request_id = d->request_id;
+        e->fill_req = d->fill;
+        e->fill_has_largest = usnap_has;
+        e->fill_largest_group = usnap_g;
+        e->fill_largest_object = usnap_o;
     }
     s->profile->commit_inbound_request(s, &d->endpoint);
     auth_committed = true;
@@ -2861,6 +2925,13 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         has_new_group_request = true;
         new_group_request = cfg->new_group_request;
     }
+    moq_fill_request_t fill_req;
+    memset(&fill_req, 0, sizeof(fill_req));
+    if (SUB_CFG_HAS(fill) && cfg->fill.present) {
+        if (!s->profile->supports_fill) return MOQ_ERR_UNSUPPORTED;
+        if (cfg->fill.field_count > 4) return MOQ_ERR_INVAL;
+        fill_req = cfg->fill;
+    }
 
     session_begin_advance(s, now_us);
 
@@ -2904,7 +2975,8 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         return MOQ_ERR_NOMEM;
     }
 
-    if (sub_is_duplicate_track(s, tid, tid_len, MOQ_SUB_ROLE_SUBSCRIBER)) {
+    if (!s->profile->allows_concurrent_subscriptions &&
+        sub_is_duplicate_track(s, tid, tid_len, MOQ_SUB_ROLE_SUBSCRIBER)) {
         if (tid) s->alloc.free(tid, tid_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return MOQ_ERR_INVAL;
@@ -2954,6 +3026,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
             .auth_token_count = auth_token_count,
             .has_new_group_request = has_new_group_request,
             .new_group_request = new_group_request,
+            .fill = fill_req,
         };
 
         moq_buf_writer_t w;
@@ -3016,9 +3089,22 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     entry->largest_object = 0;
     entry->hist = hist;
     entry->filter_type = cfg->filter;
+    entry->req_start_group = cfg->start_group;
+    entry->req_start_object = cfg->start_object;
+    entry->req_end_group = cfg->end_group;
     /* Commit the effective Forward State (default true) so the data-plane
      * reordering buffer only holds early data for a forwarding subscription. */
     entry->forward = cfg->has_forward ? cfg->forward : true;
+    entry->fill_expect_n = 0;
+    if (fill_req.present && entry->forward) {      /* a fill needs Forward State 1 */
+        entry->fill_expect[0].request_id = req_ep.request_id;
+        entry->fill_expect[0].selection = (moq_fill_selection_t){
+            .fill = fill_req, .filter = cfg->filter,
+            .start_group = cfg->start_group, .start_object = cfg->start_object,
+            .end_group = cfg->end_group,
+        };
+        entry->fill_expect_n = 1;
+    }
     entry->handle = sub_make_handle(s, (size_t)slot);
     req_ep.kind = MOQ_REQ_SUBSCRIPTION;
     req_ep.slot = slot;
@@ -3208,12 +3294,25 @@ moq_result_t moq_session_accept_subscribe(
      * against the SAME snapshot. The facade installs this window via
      * moq_session_sub_resolved_window. */
     if (snap_has && shist) track_hist_merge(shist, snap_g, snap_o);
-    moq_resolve_filter_window(s->subs[slot].filter_type,
+    if (s->subs[slot].req_loc.present && s->subs[slot].req_loc.field_count > 0)
+        moq_resolve_loc_filter_window(&s->subs[slot].req_loc,
+                                      snap_has, snap_g, snap_o, loc_max,
+                                      &s->subs[slot].window);
+    else
+        moq_resolve_filter_window(s->subs[slot].filter_type,
                               s->subs[slot].req_start_group,
                               s->subs[slot].req_start_object,
                               s->subs[slot].req_end_group,
                               snap_has, snap_g, snap_o, loc_max,
                               &s->subs[slot].window);
+    /* FILL_PARAMETERS on the SUBSCRIBE opens a fill only when Forward State is 1
+     * (3.4.1); its range is bounded by the Largest Object this response carries. */
+    if (s->subs[slot].fill_req.present && s->subs[slot].forward) {
+        s->subs[slot].fill_pending = true;
+        s->subs[slot].fill_has_largest = snap_has;
+        s->subs[slot].fill_largest_group = snap_g;
+        s->subs[slot].fill_largest_object = snap_o;
+    }
     /* Latch whether OUR track properties advertised dynamic groups: inbound
      * new-group requests on this subscription's updates are gated on it (the
      * peer MUST NOT send one otherwise, §10.2.13). */
@@ -3780,11 +3879,18 @@ moq_result_t moq_session_update_subscription(
         f_so = cfg->start_object;
         f_eg = cfg->end_group;
     }
+    moq_fill_request_t fill_req;
+    memset(&fill_req, 0, sizeof(fill_req));
+    if (UPD_CFG_HAS(fill) && cfg->fill.present) {
+        if (!s->profile->supports_fill) return MOQ_ERR_UNSUPPORTED;
+        if (cfg->fill.field_count > 4) return MOQ_ERR_INVAL;
+        fill_req = cfg->fill;
+    }
 #undef UPD_CFG_HAS
 #undef UPD_CFG_MIN
     if (!cfg->has_subscriber_priority && !cfg->has_forward &&
         !cfg->has_delivery_timeout && auth_token_count == 0 &&
-        !has_new_group_request && !has_filter)
+        !has_new_group_request && !has_filter && !fill_req.present)
         return MOQ_ERR_INVAL;
     if (cfg->has_delivery_timeout && cfg->delivery_timeout_us < 1000)
         return MOQ_ERR_INVAL;
@@ -3845,6 +3951,10 @@ moq_result_t moq_session_update_subscription(
     if (has_new_group_request && !e->dynamic_groups)
         return MOQ_ERR_INVAL;
 
+    bool expect_fill = fill_req.present && (cfg->has_forward ? cfg->forward : e->forward);
+    if (expect_fill && e->fill_expect_n == sizeof(e->fill_expect) / sizeof(e->fill_expect[0]))
+        return MOQ_ERR_WOULD_BLOCK;
+
     moq_request_endpoint_t req_ep;
     moq_result_t prc = s->profile->prepare_request(s, &req_ep);
     if (prc < 0) return prc;
@@ -3872,6 +3982,7 @@ moq_result_t moq_session_update_subscription(
         .filter_start_group = f_sg,
         .filter_start_object = f_so,
         .filter_end_group = f_eg,
+        .fill = fill_req,
     };
 
     moq_buf_writer_t w;
@@ -3915,6 +4026,18 @@ moq_result_t moq_session_update_subscription(
 
     e->update_pending = true;
     e->update_request_id = req_ep.request_id;
+    /* The fill this update asked for (Forward State 1 once it applies) will arrive on a
+     * stream carrying this update's Request ID. */
+    if (expect_fill) {
+        uint8_t k = e->fill_expect_n++;
+        e->fill_expect[k].request_id = req_ep.request_id;
+        e->fill_expect[k].selection = (moq_fill_selection_t){
+            .fill = fill_req, .filter = has_filter ? filter : e->filter_type,
+            .start_group = has_filter ? f_sg : e->req_start_group,
+            .start_object = has_filter ? f_so : e->req_start_object,
+            .end_group = has_filter ? f_eg : e->req_end_group,
+        };
+    }
     /* A Forward change takes effect at the ACK (the CURRENT acknowledged
      * Forward state gates object delivery); remember it until then. */
     e->update_has_forward = cfg->has_forward;
@@ -3929,6 +4052,9 @@ moq_result_t moq_session_update_subscription(
      * side consumer is the Joining-FETCH eligibility gate); pend it here. */
     e->update_has_filter = has_filter;
     e->update_filter_type = has_filter ? filter : 0;
+    e->update_start_group = f_sg;
+    e->update_start_object = f_so;
+    e->update_end_group = f_eg;
     s->profile->commit_request(s, &req_ep);
     return MOQ_OK;
 }

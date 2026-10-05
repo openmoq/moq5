@@ -51,6 +51,7 @@ class Version(IntEnum):
 
     DRAFT_16 = _constants["VERSION_DRAFT_16"]
     DRAFT_18 = _constants["VERSION_DRAFT_18"]
+    DRAFT_21 = _constants["VERSION_DRAFT_21"]
 
 
 class EndpointState(IntEnum):

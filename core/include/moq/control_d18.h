@@ -136,6 +136,10 @@ typedef struct moq_d18_auth_token {
 typedef struct moq_d18_setup_opts {
     bool     has_path;
     bool     has_authority;
+    /* Encode only (the decoder surfaces presence): the values to send, borrowed. A
+     * native-QUIC client sends both (10.3.1.1, 10.3.1.2). */
+    moq_bytes_t path_value;
+    moq_bytes_t authority_value;
     bool     has_max_auth_token_cache_size;
     uint64_t max_auth_token_cache_size;
     size_t               auth_token_count;
@@ -151,9 +155,8 @@ MOQ_API moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t le
                                                moq_d18_setup_opts_t *out);
 
 /* Encode a SETUP message carrying the given options (NULL opts == no options).
- * Only MAX_AUTH_TOKEN_CACHE_SIZE emission is supported (the only option the
- * session currently sources); PATH/AUTHORITY/token emission are rejected with
- * MOQ_ERR_INVAL until a public surface supplies them. */
+ * MAX_AUTH_TOKEN_CACHE_SIZE, PATH and AUTHORITY emission are supported; token
+ * emission is rejected with MOQ_ERR_INVAL until a public surface supplies it. */
 MOQ_API moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                                                const moq_d18_setup_opts_t *opts);
 

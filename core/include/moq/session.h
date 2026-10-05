@@ -77,6 +77,13 @@ typedef enum moq_version {
      * and negotiate the version independently of profile availability.
      */
     MOQ_VERSION_DRAFT_18 = 18,
+    /*
+     * Draft 21 (draft-ietf-moq-transport-21). Registered with its ALPN
+     * ("moqt-21") and a profile, but while the profile is still being
+     * converted from its draft-18 starting point the service endpoint does
+     * not offer it (see moq_endpoint_version_supported()).
+     */
+    MOQ_VERSION_DRAFT_21 = 21,
 } moq_version_t;
 
 /* -- Perspective --------------------------------------------------- */
@@ -198,7 +205,28 @@ typedef struct moq_session_cfg {
      * stays ESTABLISHED. 0 selects the library default (4096). Read only when
      * struct_size covers this field; older callers get the default. */
     uint32_t           max_namespace_suffixes_per_subscription;
+
+    /* Appended (ABI-additive; draft 21): the AUTHORITY and PATH a CLIENT on native QUIC
+     * sends in SETUP (9.1.1, 9.1.2): the URI's authority, and its path-abempty plus
+     * "?query" when a query is present. Borrowed for the create call and copied
+     * (authority up to MOQ_SETUP_AUTHORITY_MAX, path up to MOQ_SETUP_PATH_MAX bytes,
+     * longer is MOQ_ERR_INVAL). A NULL data pointer means "send none"; a non-NULL pointer with
+     * length 0 sends the option empty (an empty path-abempty is still sent). Leave NULL for a server and for WebTransport, which
+     * must not send them. Draft 16 ignores these. */
+    moq_bytes_t        setup_authority;
+    moq_bytes_t        setup_path;
+
+    /* Appended (ABI-additive; draft 21 9.1.7): advertise the request-update limit, the number
+     * of updates the peer may have outstanding on one request stream. 0 (the
+     * default) sends nothing, which means unlimited. This session answers each update
+     * as it is processed, so it never holds more than one unanswered; the option only
+     * tells a peer how far it may pipeline. No inbound counter enforces it (it could
+     * not be exceeded observably), so the too-many-updates session error is never sent. Draft 21
+     * only. */
+    uint64_t           max_request_updates;
 } moq_session_cfg_t;
+#define MOQ_SETUP_AUTHORITY_MAX 255u
+#define MOQ_SETUP_PATH_MAX      1023u
 
 #ifdef __cplusplus
 #define MOQ_SESSION_CFG_INIT \
@@ -833,6 +861,14 @@ typedef uint32_t moq_event_kind_t;
 #define MOQ_EVENT_SUBSCRIPTION_UPDATE_OK     47u
 #define MOQ_EVENT_PUBLICATION_UPDATE_OK      48u
 #define MOQ_EVENT_SUBGROUP_RESET             49u
+/*
+ * Draft 21 (3.4): a fill asked for with a subscription or one of its updates
+ * (moq_fill_request_t) has started arriving. Names the fetch handle its objects
+ * will carry in the MOQ_EVENT_FETCH_OBJECT / _GAP / _COMPLETE events that follow,
+ * and the subscription that asked for it. A fill has no MOQ_EVENT_FETCH_OK.
+ * Emitted once per fill, before any of its objects. Detail is plain scalars.
+ */
+#define MOQ_EVENT_FILL_OPENED                50u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -915,6 +951,15 @@ typedef uint64_t moq_request_error_t;
  * Registered by draft-18 ONLY. A draft-16 peer does not know them, so a
  * draft-16 session treats them like any other unknown value.
  */
+/*
+ * Registered by draft-21 ONLY (16.11.2): a filter parameter the responder cannot
+ * accept (a Range Filter beyond MAX_FILTER_RANGES, an overflowing range, a Priority
+ * Filter value above 255, an odd property type) and filters that conflict across
+ * subscribers of a SUBSCRIBE_TRACKS.
+ */
+#define MOQ_REQUEST_ERROR_CONFLICTING_FILTERS        0x35u
+#define MOQ_REQUEST_ERROR_INVALID_FILTER             0x36u
+
 #define MOQ_REQUEST_ERROR_GOING_AWAY                 0x6u
 #define MOQ_REQUEST_ERROR_EXCESSIVE_LOAD             0x9u
 #define MOQ_REQUEST_ERROR_NAMESPACE_TOO_LARGE        0x31u
@@ -1329,9 +1374,18 @@ typedef struct moq_fetch_complete_event {
     moq_fetch_t fetch;
 } moq_fetch_complete_event_t;
 
+typedef struct moq_fill_opened_event {
+    moq_subscription_t sub;    /* the subscription the fill belongs to */
+    moq_fetch_t        fetch;  /* the handle on the fill's fetch events */
+} moq_fill_opened_event_t;
+
 typedef enum moq_fetch_range_kind {
     MOQ_FETCH_RANGE_NON_EXISTENT = 1,
     MOQ_FETCH_RANGE_UNKNOWN      = 2,
+    /* Draft 21 only (11.4.1.2): the objects up to this location timed out (a fill
+     * or relay fetch ran out of FILL_TIMEOUT). A receiver surfaces it, and the write_fetch_range
+     * calls send it; a draft without it refuses it with MOQ_ERR_INVAL. */
+    MOQ_FETCH_RANGE_TIMED_OUT    = 3,
 } moq_fetch_range_kind_t;
 
 typedef struct moq_fetch_object_event {
@@ -1374,6 +1428,26 @@ typedef struct moq_publish_request_event {
     bool               has_expires;
     uint64_t           expires_ms;
 } moq_publish_request_event_t;
+
+/* The publisher's own initial Subscription Parameters on an inbound PUBLISH (draft 21
+ * 9.8). `present` is false when the draft carries none (the other fields then hold the
+ * defaults: priority 128, default group order, no timeout, no filter). Too large for
+ * the request event, so it is read with moq_session_publish_initial_params() while the
+ * request is pending or established. */
+typedef struct moq_publish_initial_params {
+    bool               present;
+    uint8_t            subscriber_priority;
+    moq_group_order_t  group_order;
+    bool               has_delivery_timeout;
+    uint64_t           delivery_timeout_ms;
+    bool               has_filter;               /* a LOCATION_FILTER was carried */
+    uint8_t            filter_field_count;       /* 0..4 fields on the wire */
+    uint64_t           filter_start_group, filter_start_object;
+    uint64_t           filter_end_group_delta, filter_end_object;
+} moq_publish_initial_params_t;
+
+MOQ_API moq_result_t moq_session_publish_initial_params(
+    moq_session_t *s, moq_publication_t pub, moq_publish_initial_params_t *out);
 
 typedef struct moq_publish_ok_event {
     moq_publication_t  pub;
@@ -1653,6 +1727,7 @@ typedef struct moq_event {
         moq_subscribe_tracks_cancelled_event_t subscribe_tracks_cancelled;
         moq_subgroup_finished_event_t          subgroup_finished;
         moq_subgroup_reset_event_t             subgroup_reset;
+        moq_fill_opened_event_t                fill_opened;
         uint8_t                     _reserved[MOQ_EVENT_DETAIL_MAX];
     } u;
 } moq_event_t;
@@ -1746,6 +1821,23 @@ MOQ_API uint64_t moq_session_peer_auth_token_cache_size(const moq_session_t *s);
  *   default 128), forward (false is valid, default true).
  * Default-means-unset: group_order (DEFAULT=0 uses publisher order).
  */
+/*
+ * A fill request on a subscription (draft 21 3.4): ask the publisher to also deliver a
+ * range of past Objects on a fill stream. The range is a Location Filter written as on the
+ * wire (0 to 4 fields; one field is a start relative to the Largest Object, and none =
+ * the whole track up to it); omitting it uses the subscription's own filter. Honoured
+ * only while Forward State is 1. Drafts without fills refuse it (MOQ_ERR_UNSUPPORTED).
+ * The fill's objects arrive as fetch events for the handle in the FETCH_* events.
+ */
+typedef struct moq_fill_request {
+    bool     present;
+    bool     has_location;
+    uint8_t  field_count;
+    uint64_t start_group, start_object, end_group_delta, end_object;
+    bool     has_timeout;
+    uint64_t timeout_ms;
+} moq_fill_request_t;
+
 typedef struct moq_subscribe_cfg {
     uint32_t               struct_size;
     moq_namespace_t        track_namespace;  /* borrowed for the call */
@@ -1768,6 +1860,8 @@ typedef struct moq_subscribe_cfg {
      * smaller struct send nothing. */
     bool                    has_new_group_request;
     uint64_t                new_group_request;
+    /* Appended (draft 21): ask for a fill stream. */
+    moq_fill_request_t      fill;
 } moq_subscribe_cfg_t;
 
 MOQ_API void moq_subscribe_cfg_init(moq_subscribe_cfg_t *cfg);
@@ -1917,6 +2011,8 @@ typedef struct moq_subscription_update_cfg {
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;
+    /* Appended (draft 21): ask for a fill stream with this update. */
+    moq_fill_request_t     fill;
 } moq_subscription_update_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original
@@ -2101,6 +2197,66 @@ MOQ_API moq_result_t moq_session_accept_fetch(
     const moq_accept_fetch_cfg_t *cfg,
     uint64_t now_us);
 
+/*
+ * Fill fetch streams (draft 21 3.4). A subscription whose SUBSCRIBE or latest
+ * update carried a fill request, while Forward State is 1, has a PENDING fill once
+ * it is accepted (or the update applied). The publisher opens it with
+ * moq_session_open_fill and serves it through the ordinary fetch writers
+ * (moq_session_write_fetch_object, moq_session_end_fetch); a failure is signalled
+ * with moq_session_reset_fill. Cancelling the subscription resets every open fill;
+ * resetting a fill does not touch the subscription.
+ */
+typedef struct moq_fill_info {
+    uint64_t request_id;         /* the SUBSCRIBE / update that asked for it */
+    bool     empty;              /* nothing to fill: no stream was opened */
+    uint8_t  subscriber_priority;
+    uint64_t start_group;        /* the fill range, INCLUSIVE at both ends; an */
+    uint64_t start_object;       /* end object of UINT64_MAX means the whole   */
+    uint64_t end_group;          /* end group. Valid when !empty.              */
+    uint64_t end_object;
+    bool     has_timeout;        /* FILL_TIMEOUT carried in the fill request */
+    uint64_t timeout_ms;
+} moq_fill_info_t;
+
+/*
+ * Send a subscriber a state notice: its subscription changed for a reason other than its
+ * own update (draft 21 9.10): a Forward change, a narrowed filter, a new Largest Object.
+ * Informative and unanswered; it must include the Largest Object when known (that is the
+ * caller's duty: pass has_largest). Publisher side of an ESTABLISHED subscription, on
+ * a profile that has it (else MOQ_ERR_UNSUPPORTED). Advancing call.
+ */
+typedef struct moq_state_notify_cfg {
+    uint32_t struct_size;
+    bool     has_largest;
+    uint64_t largest_group, largest_object;
+    bool     has_forward;
+    bool     forward;
+    bool     has_filter;
+    uint8_t  filter_field_count;     /* 0..4 fields, as in a Location Filter */
+    uint64_t filter_start_group, filter_start_object;
+    uint64_t filter_end_group_delta, filter_end_object;
+} moq_state_notify_cfg_t;
+
+MOQ_API moq_result_t moq_session_notify_subscription_state(
+    moq_session_t *s, moq_subscription_t sub, const moq_state_notify_cfg_t *cfg,
+    uint64_t now_us);
+
+/* True when the subscription has an unopened fill. */
+MOQ_API bool moq_session_sub_fill_pending(moq_session_t *s, moq_subscription_t sub);
+
+/* Open the pending fill: resolves its range against the Largest Object the
+ * response advertised, and (unless the range is empty) opens the fill stream and
+ * returns its fetch handle. An empty range consumes the pending fill and opens
+ * nothing (info->empty, *out_fetch invalid). MOQ_ERR_WRONG_STATE: nothing pending.
+ * MOQ_ERR_WOULD_BLOCK: retry after draining actions; the fill stays pending. */
+MOQ_API moq_result_t moq_session_open_fill(moq_session_t *s, moq_subscription_t sub,
+                                           uint64_t now_us, moq_fill_info_t *info,
+                                           moq_fetch_t *out_fetch);
+
+/* Fail an open fill: reset its stream (there is no error response for a fill). */
+MOQ_API moq_result_t moq_session_reset_fill(moq_session_t *s, moq_fetch_t fetch,
+                                            uint64_t error_code, uint64_t now_us);
+
 typedef struct moq_reject_fetch_cfg {
     uint32_t            struct_size;
     moq_request_error_t error_code;
@@ -2190,6 +2346,21 @@ MOQ_API moq_result_t moq_session_write_fetch_range_before_group(
 MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
 
 /*
+ * True when the negotiated draft allows several concurrent subscriptions to the
+ * same Track on one session (draft 21 yes, drafts 16/18 no). Pure capability
+ * query; false for a NULL session.
+ */
+MOQ_API bool moq_session_allows_concurrent_subscriptions(const moq_session_t *s);
+
+/*
+ * True when the negotiated draft has a "subscription ended" completion status
+ * for a subscription whose finite end was reached (drafts 16/18 yes, draft 21 no:
+ * a subscription stays open after its filter's end). Pure capability query;
+ * false for a NULL session.
+ */
+MOQ_API bool moq_session_has_subscription_ended_status(const moq_session_t *s);
+
+/*
  * Close the fetch data stream with FIN. Publisher side. Advancing call.
  * Frees the fetch entry after queuing the final action.
  */
@@ -2201,6 +2372,9 @@ MOQ_API moq_result_t moq_session_end_fetch(
 /*
  * Cancel a pending fetch (subscriber side). Advancing call.
  * Queues cancellation bytes. Frees the fetch entry.
+ * A fill's fetch handle (MOQ_EVENT_FILL_OPENED) is refused with
+ * MOQ_ERR_WRONG_STATE and nothing is sent: the fill belongs to its
+ * subscription, and ends with it (unsubscribe).
  */
 MOQ_API moq_result_t moq_session_fetch_cancel(moq_session_t *s,
                                                moq_fetch_t fetch,
@@ -2838,6 +3012,11 @@ typedef struct moq_subgroup_cfg {
     bool     object_properties;
     uint8_t  _reserved_sg2[7];
     bool     end_of_group;
+    /* Appended (ABI-additive; draft 21 FIRST_OBJECT, 2.2 / 11.3.1): the first object on
+     * this stream is the first object ever published in the subgroup. The ORIGINAL
+     * publisher sets it when it opens a new subgroup; a restart after a reset, or a
+     * stream that begins mid-subgroup, leaves it false. Draft 16 has no such bit and ignores it. */
+    bool     first_object;
 } moq_subgroup_cfg_t;
 
 MOQ_API void moq_subgroup_cfg_init(moq_subgroup_cfg_t *cfg);

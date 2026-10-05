@@ -123,6 +123,9 @@ typedef struct {
     /* Retained content snapshot (NULL when the op carries none). */
     moq_rcbuf_t  *payload;          /* WRITE_OBJECT payload / WRITE_DATA chunk */
     moq_rcbuf_t  *properties;
+    /* The op's object is the first published in its Group (the original publisher's
+     * FIRST_OBJECT, draft 21), judged from the track history at commit. */
+    bool          first_in_group;
 } pub_pending_op_t;
 
 typedef struct pub_ns_entry {
@@ -258,6 +261,10 @@ typedef struct {
     pub_retained_obj_t *objs;        /* incref'd snapshot; released on finish */
     size_t              obj_count;
     size_t              next_idx;    /* write cursor (resumes on WOULD_BLOCK) */
+    /* A fill fetch stream (draft 21 3.4): already open (so `accepted`), ends at
+     * its FIN, and a write failure resets it rather than FINing a partial fill. */
+    bool                is_fill;
+    size_t              end_idx;     /* fills: one past the last object in range */
 } pub_pending_fetch_t;
 
 struct moq_pub_deferred {
@@ -267,6 +274,9 @@ struct moq_pub_deferred {
     moq_pub_track_t    *track;
     bool                forward;   /* the request's Forward state, for the slot */
 };
+
+/* Upper bound on concurrent subscription slots per Track. */
+#define PUB_MAX_CONCURRENT_SUBS 8
 
 struct moq_publisher {
     moq_session_t      *session;
@@ -424,6 +434,9 @@ static bool window_admits(const moq_resolved_window_t *w,
         (group_id == w->start_group && object_id < w->start_object))
         return false;
     if (w->has_end && group_id > w->end_group) return false;
+    if (w->has_end_object && group_id == w->end_group &&
+        object_id > w->end_object)
+        return false;
     return true;
 }
 
@@ -561,6 +574,9 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
                                           uint64_t now_us)
 {
     uint64_t through;
+    /* No SUBSCRIPTION_ENDED status (draft 21): a finite filter end does not end
+     * the subscription; the slot stays and simply receives nothing more. */
+    if (!moq_session_has_subscription_ended_status(pub->session)) return MOQ_OK;
     if (!track_complete_through(t, &through)) return MOQ_OK;
     for (size_t si = 0; si < t->slot_cap; si++) {
         pub_sub_slot_t *sl = &t->slots[si];
@@ -941,7 +957,8 @@ static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
     /* Accepted: write each remaining object from the cursor, then FIN. Each
      * write costs 2 actions with properties, 1 without; reserve per object so a
      * deferred write resumes at the same cursor (no duplicate/skip). */
-    while (pf->next_idx < pf->obj_count) {
+    const size_t end_idx = pf->is_fill ? pf->end_idx : pf->obj_count;
+    while (pf->next_idx < end_idx) {
         const pub_retained_obj_t *o = &pf->objs[pf->next_idx];
         size_t need = (o->properties ? 2u : 1u);
         if (moq_session_action_capacity(pub->session) < need) return;  /* defer */
@@ -957,7 +974,11 @@ static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
                                                          &oc, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return;   /* resume at cursor */
         if (rc < 0) {
-            (void)moq_session_end_fetch(pub->session, pf->fetch, now_us);
+            if (pf->is_fill)
+                (void)moq_session_reset_fill(pub->session, pf->fetch,
+                                             0x3 /* INTERNAL_ERROR */, now_us);
+            else
+                (void)moq_session_end_fetch(pub->session, pf->fetch, now_us);
             pending_fetch_clear(pub);
             return;
         }
@@ -1243,6 +1264,65 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
         pub->callbacks.on_closed(pub->callbacks.ctx, code);
 }
 
+/* Open and serve the fill of every subscription that has one pending (draft 21
+ * 3.4). The retained group is the only data this facade holds, so a fill is served
+ * from the part of it inside the fill range; a fill that range does not touch
+ * cannot be answered and is reset (the stream opens, then fails, 3.4.1). One fill
+ * is staged at a time through pending_fetch; the rest wait for a later pass. */
+static void pub_open_fills(moq_publisher_t *pub, uint64_t now_us)
+{
+    if (pub->pending_fetch.active) return;
+    for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
+        for (size_t i = 0; i < t->slot_cap; i++) {
+            pub_sub_slot_t *sl = &t->slots[i];
+            if (!sl->active || sl->kind != PUB_SLOT_SUBSCRIPTION) continue;
+            if (!moq_session_sub_fill_pending(pub->session, sl->sub)) continue;
+            moq_fill_info_t info;
+            moq_fetch_t fh;
+            moq_result_t rc = moq_session_open_fill(pub->session, sl->sub,
+                                                    now_us, &info, &fh);
+            if (rc < 0) return;          /* WOULD_BLOCK: stays pending, retry */
+            if (info.empty) continue;
+            bool has_data = !t->ended && pub_track_has_retained(t);
+            uint64_t g = has_data ? pub_track_retained_group(t) : 0;
+            if (!has_data || g < info.start_group || g > info.end_group) {
+                (void)moq_session_reset_fill(pub->session, fh,
+                                             0x3 /* INTERNAL_ERROR */, now_us);
+                continue;
+            }
+            pub_retained_obj_t *snap = pub_retained_snapshot(&pub->alloc,
+                t->retained, t->retained_count);
+            if (!snap) {
+                (void)moq_session_reset_fill(pub->session, fh, 0x3, now_us);
+                continue;
+            }
+            /* Keep only the objects inside the range (objects are in id order). */
+            size_t first = 0, n = t->retained_count;
+            while (first < n && g == info.start_group &&
+                   snap[first].object_id < info.start_object)
+                first++;
+            size_t last = n;
+            while (last > first && g == info.end_group &&
+                   snap[last - 1].object_id > info.end_object)
+                last--;
+            pub_pending_fetch_t *pf = &pub->pending_fetch;
+            memset(pf, 0, sizeof(*pf));
+            pf->active = true;
+            pf->accepted = true;
+            pf->is_fill = true;
+            pf->fetch = fh;
+            pf->objs = snap;
+            pf->obj_count = n;           /* what the snapshot holds (for release) */
+            pf->next_idx = first;
+            pf->end_idx = last;
+            pf->group_id = g;
+            pf->priority = t->priority;
+            serve_retained_fetch(pub, now_us);
+            return;                      /* one at a time */
+        }
+    }
+}
+
 /*
  * Progress ALL staged, action-queue-limited work: a pending subscribe accept/
  * reject (firing on_subscriber_joined exactly once on completion), a deferred
@@ -1264,6 +1344,8 @@ static moq_result_t pub_progress_staged(moq_publisher_t *pub, uint64_t now_us)
         serve_retained_fetch(pub, now_us);
         if (pub->pending_fetch.active) return MOQ_ERR_WOULD_BLOCK;
     }
+    pub_open_fills(pub, now_us);
+    if (pub->pending_fetch.active) return MOQ_ERR_WOULD_BLOCK;
 
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
         moq_result_t rrc = track_run_retires(pub, t, now_us);
@@ -1456,7 +1538,10 @@ moq_result_t moq_pub_create(moq_session_t *session,
         }
     }
 
-    p->sub_slot_cap = 1;
+    /* One slot is enough for drafts 16/18 (one subscription per Track); draft 21
+     * allows concurrent subscriptions to a Track, each served from its own slot.
+     * The session capability gates how many are used. */
+    p->sub_slot_cap = PUB_MAX_CONCURRENT_SUBS;
 
     *out = p;
     return MOQ_OK;
@@ -1973,6 +2058,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         sgcfg.publisher_priority = track->priority;
         sgcfg.object_properties = need_ext;
         sgcfg.end_of_group = want_eog;
+        sgcfg.first_object = track->op.first_in_group;
 
         moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
             ? moq_session_open_pub_subgroup(pub->session,
@@ -2134,10 +2220,13 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
         if (rr < 0) return rr;
     }
     if (st == 1) {
+        const bool first_in_group = !(track->hist && track->hist->has_largest &&
+                                      track->hist->largest_group >= obj->group_id);
         track_op_commit(track, PUB_OP_WRITE_OBJECT,
             obj->group_id, obj->object_id, obj->datagram, obj->has_status,
             obj->has_status ? obj->status : MOQ_OBJECT_NORMAL,
             want_eog, 0, obj->payload, obj->properties);
+        track->op.first_in_group = first_in_group;
         track_hist_merge(track->hist, obj->group_id, obj->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
         if (track->monotonic) {
@@ -2354,6 +2443,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
             moq_done_subscribe_cfg_init(&dcfg);
             dcfg.status_code =
                 (term_fresh &&
+                 moq_session_has_subscription_ended_status(pub->session) &&
                  slot->window.has_window && slot->window.has_end &&
                  term_g > slot->window.end_group)
                     ? 0x3    /* SUBSCRIPTION_ENDED: past the finite end */
@@ -2563,9 +2653,12 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         if (rr < 0) return rr;
     }
     if (st == 1) {
+        const bool first_in_group = !(track->hist && track->hist->has_largest &&
+                                      track->hist->largest_group >= cfg->group_id);
         track_op_commit(track, PUB_OP_BEGIN_OBJECT,
             cfg->group_id, cfg->object_id, false, false, MOQ_OBJECT_NORMAL,
             false, cfg->payload_length, NULL, begin_props);
+        track->op.first_in_group = first_in_group;
         track_hist_merge(track->hist, cfg->group_id, cfg->object_id);
         MOQ_PUB_TEST_BUMP(moq_pub_test_merge_count);
         if (track->monotonic &&
@@ -2603,6 +2696,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
             sgcfg.subgroup_id = 0;
             sgcfg.publisher_priority = track->priority;
             sgcfg.object_properties = need_ext;
+            sgcfg.first_object = track->op.first_in_group;
             moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
                 ? moq_session_open_pub_subgroup(pub->session,
                     slot->pub, &sgcfg, now_us, &slot->sg)
@@ -3327,6 +3421,71 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
      * emits it to the SUBSCRIBER role only, so it can never match a
      * publisher-role facade track. It falls through to IGNORED. */
 
+    if (event->kind == MOQ_EVENT_NS_SUB_REQUEST) {
+        /* A peer asks which namespaces under a prefix this publisher has. Exactly one
+         * response is owed (draft 21 4.1): accept when a track here lies under the
+         * prefix (then announce each such namespace's suffix), else reject. */
+        const moq_ns_sub_request_event_t *nr = &event->u.ns_sub_request;
+        *result = MOQ_PUB_EVENT_CONSUMED;
+        const moq_namespace_t *pre = &nr->track_namespace_prefix;
+        /* Decide every match BEFORE responding: the prefix is borrowed from event
+         * scratch, which the accept (an advancing call) invalidates. A track
+         * announces its suffix once, so a later track with the same namespace is
+         * not "first". */
+        size_t ntr = pub->track_count;
+        bool *first = ntr ? (bool *)pub_alloc(pub, ntr * sizeof(bool)) : NULL;
+        if (ntr && !first) return MOQ_ERR_NOMEM;
+        bool any = false;
+        size_t idx = 0;
+        for (moq_pub_track_t *t = pub->tracks; t && idx < ntr; t = t->next, idx++) {
+            first[idx] = false;
+            if (t->ended || t->ns_count < pre->count) continue;
+            bool match = true;
+            for (size_t i = 0; i < pre->count && match; i++)
+                match = t->ns_parts[i].len == pre->parts[i].len &&
+                        (pre->parts[i].len == 0 ||
+                         memcmp(t->ns_parts[i].data, pre->parts[i].data, pre->parts[i].len) == 0);
+            if (!match) continue;
+            any = true;
+            bool dup = false;
+            size_t k = 0;
+            for (moq_pub_track_t *e = pub->tracks; e != t && !dup; e = e->next, k++) {
+                if (!first[k] || e->ns_count != t->ns_count) continue;
+                dup = true;
+                for (size_t i = 0; i < t->ns_count && dup; i++)
+                    dup = e->ns_parts[i].len == t->ns_parts[i].len &&
+                          (t->ns_parts[i].len == 0 ||
+                           memcmp(e->ns_parts[i].data, t->ns_parts[i].data, t->ns_parts[i].len) == 0);
+            }
+            first[idx] = !dup;
+        }
+        moq_result_t rc;
+        if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL || !any) {
+            moq_reject_ns_sub_cfg_t rej;
+            moq_reject_ns_sub_cfg_init(&rej);
+            rej.error_code = pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL
+                ? MOQ_REQUEST_ERROR_UNAUTHORIZED : MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+            rc = moq_session_reject_ns_sub(pub->session, nr->handle, &rej, now_us);
+        } else {
+            const size_t skip = pre->count;
+            const moq_ns_sub_handle_t h = nr->handle;
+            moq_accept_ns_sub_cfg_t acc;
+            moq_accept_ns_sub_cfg_init(&acc);
+            rc = moq_session_accept_ns_sub(pub->session, h, &acc, now_us);
+            if (rc >= 0) {
+                /* Announce what already exists under the prefix (best effort). */
+                idx = 0;
+                for (moq_pub_track_t *t = pub->tracks; t && idx < ntr; t = t->next, idx++) {
+                    if (!first[idx]) continue;
+                    moq_namespace_t suffix = { t->ns_parts + skip, t->ns_count - skip };
+                    (void)moq_session_send_namespace(pub->session, h, &suffix, now_us);
+                }
+            }
+        }
+        if (first) pub_free(pub, first, ntr * sizeof(bool));
+        return rc == MOQ_ERR_WOULD_BLOCK ? rc : MOQ_OK;
+    }
+
     if (event->kind != MOQ_EVENT_SUBSCRIBE_REQUEST)
         return MOQ_OK;
 
@@ -3351,9 +3510,13 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
          * terminal. Checked before the app callback so it is never consulted. */
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
-    } else if (track_has_subscriber(track)) {
+    } else if (track_has_subscriber(track) &&
+               !moq_session_allows_concurrent_subscriptions(pub->session)) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION;
+    } else if (track_active_count(track) >= PUB_MAX_CONCURRENT_SUBS) {
+        want_accept = false;
+        reject_code = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD;
     } else if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;

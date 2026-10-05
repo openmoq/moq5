@@ -4847,16 +4847,15 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT(ad, 1);
         MOQ_TEST_CHECK_EQ_U64(as, 0x2u);
 
-        /* Strict ordering (§11.3): both Track Ended signals were observed BEFORE
-         * the conversion catalog generation [1]. The pump gates the catalog
-         * republish on the finish, so the dones are emitted first; on the
-         * in-order loopback that ordering is preserved at the subscriber. */
+        /* All three signals must arrive. Track Ended and catalog objects use
+         * separate QUIC streams, so their receive callbacks need not preserve
+         * emission order, even on loopback. The sender's finish-before-catalog
+         * gate is checked separately by media_sender_catalog and the
+         * production-pump emission test in media_sender_refresh. */
         uint64_t v_seq = 0, a_seq = 0;
         srv_done_seqs(&g_srv, &v_seq, &a_seq);
         uint64_t conv_seq = cat_gen_seq(1);
         MOQ_TEST_CHECK(v_seq != 0 && a_seq != 0 && conv_seq != 0);
-        MOQ_TEST_CHECK(v_seq < conv_seq);
-        MOQ_TEST_CHECK(a_seq < conv_seq);
 
         /* Not terminal: no END_OF_TRACK was emitted, and the VOD catalog still
          * advertises both tracks -- they stay joinable (retained replay is the

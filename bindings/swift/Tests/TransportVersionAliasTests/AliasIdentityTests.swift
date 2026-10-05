@@ -47,6 +47,6 @@ struct AliasIdentityTests {
     @Test("The shared type carries one case set")
     func oneCaseSet() {
         #expect(MoQVersion.allCases == MediaTransportVersion.allCases)
-        #expect(MoQVersion.allCases.map(\.draftNumber).sorted() == [16, 18])
+        #expect(MoQVersion.allCases.map(\.draftNumber).sorted() == [16, 18, 21])
     }
 }

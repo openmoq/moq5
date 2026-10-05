@@ -22,6 +22,7 @@ typedef struct {
 static const alpn_expect_t EXPECT[] = {
     { MOQ_VERSION_DRAFT_16, "moqt-16", 7 },
     { MOQ_VERSION_DRAFT_18, "moqt-18", 7 },
+    { MOQ_VERSION_DRAFT_21, "moqt-21", 7 },
 };
 
 #define EXPECT_N (sizeof(EXPECT) / sizeof(EXPECT[0]))
@@ -91,7 +92,7 @@ static int table_problems(void)
     int failures = 0;
 
     /* 1. exact cardinality */
-    MOQ_TEST_CHECK(TABLE_N == 2);
+    MOQ_TEST_CHECK(TABLE_N == 3);
     MOQ_TEST_CHECK(TABLE_N == EXPECT_N);
 
     /* 5. every table row is well formed -- non-NULL, nonzero length, and a
@@ -203,6 +204,23 @@ int main(void)
         MOQ_TEST_CHECK(v == MOQ_VERSION_DRAFT_18);
     }
 
+    /* moqt-21 maps to DRAFT_21, and neighbouring drafts that this build does
+     * not register stay unknown (a wrong guess here would negotiate a version
+     * with no profile). */
+    {
+        moq_version_t v = (moq_version_t)0;
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-21", 7, &v) == true);
+        MOQ_TEST_CHECK(v == MOQ_VERSION_DRAFT_21);
+
+        v = (moq_version_t)0xDEAD;
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-19", 7, &v) == false);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-20", 7, &v) == false);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-22", 7, &v) == false);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-210", 8, &v) == false);
+        MOQ_TEST_CHECK(moq_alpn_to_version("moqt-2", 6, &v) == false);
+        MOQ_TEST_CHECK(v == (moq_version_t)0xDEAD);
+    }
+
     /* Unknown / unsupported / wrong-surface ALPNs return false and leave
      * *out untouched (never 0-as-D16). */
     {
@@ -242,8 +260,14 @@ int main(void)
         MOQ_TEST_CHECK(s18 != NULL);
         MOQ_TEST_CHECK(s18 && strcmp(s18, "moqt-18") == 0);
 
+        const char *s21 = moq_alpn_for_version(MOQ_VERSION_DRAFT_21);
+        MOQ_TEST_CHECK(s21 != NULL);
+        MOQ_TEST_CHECK(s21 && strcmp(s21, "moqt-21") == 0);
+
         /* Unregistered versions return NULL. */
         MOQ_TEST_CHECK(moq_alpn_for_version((moq_version_t)17) == NULL);
+        MOQ_TEST_CHECK(moq_alpn_for_version((moq_version_t)19) == NULL);
+        MOQ_TEST_CHECK(moq_alpn_for_version((moq_version_t)20) == NULL);
         MOQ_TEST_CHECK(moq_alpn_for_version((moq_version_t)0) == NULL);
     }
 

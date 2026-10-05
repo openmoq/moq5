@@ -261,6 +261,11 @@ typedef struct moq_msquic_managed_cfg {
      * QUIC_SETTINGS.KeepAliveIntervalMs when this field is fully covered by
      * struct_size. */
     uint32_t keep_alive_interval_ms;
+    /* Appended (struct_size append-only ABI) -- CLIENT only: the AUTHORITY and PATH a
+     * native-QUIC client sends in SETUP (draft 18 10.3.1, draft 21 9.1). NUL-terminated,
+     * copied at create; NULL = send none, "" sends the option empty. Drafts 16 ignores them. */
+    const char *setup_authority;
+    const char *setup_path;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(

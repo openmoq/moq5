@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <moq/control.h>
 #include <moq/control_d18.h>
+#include <moq/control_d21.h>
 #include <moq/buf.h>
 #include <string.h>
 
@@ -10785,6 +10786,34 @@ typedef struct {
     struct { uint64_t g, o; bool deliver; } probes[4];
 } win_case_t;
 
+/* -- Draft 21: concurrent subscriptions to one Track ------------------- *
+ * Each subscription is served independently; an object matching several is
+ * sent once per subscription (draft 21 3.3). Drafts 16/18 still reject. */
+static void test_d21_concurrent_subscriptions(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 2, 0, 0);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START, 4, 0, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 2);
+
+    /* {1,0}: neither. {3,0}: first only. {5,0}: both -> two copies. */
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 1, 0, 0xC0) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 1, 0, 0xC0), 0);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 3, 0, 0xC1) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 3, 0, 0xC1), 1);
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 5, 0, 0xC2) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 5, 0, 0xC2), 2);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_concurrent_subscriptions");
+}
+
 static void test_window_membership_matrix(moq_version_t ver)
 {
     static const win_case_t cases[] = {
@@ -11490,6 +11519,285 @@ static void test_window_end_track(moq_version_t ver, bool excluded)
     moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
     MOQ_TEST_PASS("window_end_track");
+}
+
+/* -- Draft 21: no SUBSCRIPTION_ENDED -------------------------------------- *
+ * A subscription whose finite end is reached stays open (it simply receives
+ * nothing more); only the track ending terminates it, with TRACK_ENDED (0x2). */
+static void test_d21_no_subscription_ended(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *cl = moq_simpair_client(sp);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE, 0, 0, 0);
+
+    uint8_t d0[] = { 0xDA, 0xDB };
+    moq_rcbuf_t *p0 = NULL; moq_rcbuf_create(&alloc, d0, sizeof(d0), &p0);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 0, 0, p0, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_rcbuf_decref(p0);
+    /* Group 1 is past the end group: the write succeeds and delivers nothing. */
+    MOQ_TEST_CHECK(windows_write_dg(pub, track, &alloc, sp, 1, 0, 0xE0) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 1, 0, 0xE0), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);
+    /* Declaring the end group complete is what ends a subscription on drafts 16/18. */
+    MOQ_TEST_CHECK(moq_pub_declare_groups_complete_through(pub, track, 1,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);
+    { moq_event_t ev;
+      while (moq_session_poll_events(cl, &ev, 1) == 1) {
+          MOQ_TEST_CHECK(ev.kind != MOQ_EVENT_SUBSCRIBE_DONE);
+          moq_event_cleanup(&ev);
+      } }
+
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    int ndone = 0; uint64_t status = 0;
+    { moq_event_t ev;
+      while (moq_session_poll_events(cl, &ev, 1) == 1) {
+          if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) { ndone++; status = ev.u.subscribe_done.status_code; }
+          moq_event_cleanup(&ev);
+      } }
+    MOQ_TEST_CHECK_EQ_INT(ndone, 1);
+    MOQ_TEST_CHECK_EQ_U64(status, 0x2);
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(sp)) == MOQ_SESS_ESTABLISHED);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_no_subscription_ended");
+}
+
+/* -- Draft 21: a fill is served from the retained group ------------------- *
+ * A SUBSCRIBE carrying FILL_PARAMETERS (injected raw: the client API has no fill
+ * request) opens a fill fetch stream after the accept. The facade writes the part
+ * of the retained group inside the fill range and FINs; a range it holds nothing
+ * for resets the stream. */
+static void d21_fill_case(bool in_range)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_rcbuf_t *p0 = NULL, *p1 = NULL, *p2 = NULL;
+    moq_rcbuf_create(&alloc, (const uint8_t *)"obj0", 4, &p0);
+    moq_rcbuf_create(&alloc, (const uint8_t *)"obj1", 4, &p1);
+    moq_rcbuf_create(&alloc, (const uint8_t *)"obj2", 4, &p2);
+    moq_pub_retained_object_t objs[3] = {
+        { .object_id = 0, .payload = p0 }, { .object_id = 1, .payload = p1 },
+        { .object_id = 2, .payload = p2, .end_of_group = true } };
+    moq_pub_retained_group_cfg_t gc; moq_pub_retained_group_cfg_init(&gc);
+    gc.group_id = 4; gc.objects = objs; gc.object_count = 3;
+    MOQ_TEST_CHECK(moq_pub_set_retained_group(pub, track, &gc) == MOQ_OK);
+    moq_rcbuf_decref(p0); moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    MOQ_TEST_CHECK(moq_session_note_object_published(sv, &ns, MOQ_BYTES_LITERAL("video"), 4, 2) == MOQ_OK);
+
+    /* Fill: object 1 onward in the current group (in range), or group 9 (nothing held). */
+    moq_d21_msg_params_t prm;
+    memset(&prm, 0, sizeof(prm));
+    prm.has_fill = true;
+    prm.fill.has_location_filter = true;
+    prm.fill.location_filter.field_count = 2;
+    prm.fill.location_filter.start_group = in_range ? 4 : 1;
+    prm.fill.location_filter.start_object = in_range ? 1 : 0;
+    if (!in_range) { prm.fill.location_filter.field_count = 3; prm.fill.location_filter.end_group_delta = 1; }
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_subscribe(&w, 0, &ns, MOQ_BYTES_LITERAL("video"), &prm) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, moq_stream_ref_from_u64(4), msg,
+        moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp)) >= 0);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    (void)moq_pub_tick(pub, moq_simpair_now_us(sp));
+
+    int objects = 0, fins = 0, resets = 0, headers = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(sv, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_DATA) {
+            if (a.u.send_data.header_len > 0) {
+                /* FETCH_HEADER opens it; objects follow with their own headers. */
+                if (a.u.send_data.payload == NULL && !a.u.send_data.fin) headers++;
+                else if (a.u.send_data.payload) objects++;
+            }
+            if (a.u.send_data.fin) fins++;
+        }
+        if (a.kind == MOQ_ACTION_RESET_DATA) resets++;
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK(headers >= 1);
+    if (in_range) {
+        MOQ_TEST_CHECK_EQ_INT(objects, 2);       /* objects 1 and 2 */
+        MOQ_TEST_CHECK_EQ_INT(fins, 1);
+        MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(objects, 0);
+        MOQ_TEST_CHECK_EQ_INT(resets, 1);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track), 1);   /* the subscription lives */
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(in_range ? "d21_fill_served_from_retained" : "d21_fill_without_data_resets");
+}
+
+/* -- Draft 21: FIRST_OBJECT (2.2, 11.3.1) ---------------------------------- *
+ * The original publisher sets the bit on a new subgroup that begins at the first
+ * object ever published in it, and not on a stream that begins later in the group
+ * (a subscriber that joined mid-group). */
+static void d21_collect_subgroup_type_bits(moq_session_t *sv, int *firsts, int *nots)
+{
+    moq_action_t a;
+    while (moq_session_poll_actions(sv, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_DATA && a.u.send_data.header_len > 0 &&
+            a.u.send_data.header[0] >= 0x10 && a.u.send_data.header[0] < 0x80 &&
+            (a.u.send_data.header[0] & 0x10)) {          /* a SUBGROUP_HEADER type */
+            if (a.u.send_data.header[0] & 0x40) (*firsts)++; else (*nots)++;
+        }
+        moq_action_cleanup(&a);
+    }
+}
+
+static void test_first_object_bit(moq_version_t ver)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, ver, &pub, &track);
+    moq_session_t *sv = moq_simpair_server(sp);
+    windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    int firsts = 0, nots = 0;
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);      /* drop setup traffic */
+    firsts = nots = 0;
+
+    uint8_t d[] = { 1, 2 };
+    moq_rcbuf_t *p = NULL; moq_rcbuf_create(&alloc, d, sizeof(d), &p);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 3, 0, p, moq_simpair_now_us(sp)) == MOQ_OK);
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK_EQ_INT(firsts, 1);                         /* group 3, object 0: first ever */
+    MOQ_TEST_CHECK_EQ_INT(nots, 0);
+
+    /* Draft 21 only (concurrent subscriptions): a second subscriber joins after object
+     * 0, so its stream starts at object 1. */
+    if (ver == MOQ_VERSION_DRAFT_21)
+        windows_subscribe(sp, pub, MOQ_SUBSCRIBE_FILTER_NONE, 0, 0, 0);
+    firsts = nots = 0;
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 3, 1, p, moq_simpair_now_us(sp)) == MOQ_OK);
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    if (ver == MOQ_VERSION_DRAFT_21) {
+        MOQ_TEST_CHECK_EQ_INT(firsts, 0);
+        MOQ_TEST_CHECK_EQ_INT(nots, 1);                       /* new stream, mid-group */
+    }
+
+    /* The next group starts clean for both. */
+    firsts = nots = 0;
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 4, 0, p, moq_simpair_now_us(sp)) == MOQ_OK);
+    d21_collect_subgroup_type_bits(sv, &firsts, &nots);
+    MOQ_TEST_CHECK_EQ_INT(firsts, ver == MOQ_VERSION_DRAFT_21 ? 2 : 1);
+    moq_rcbuf_decref(p);
+
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("first_object_bit");
+}
+
+/* -- Draft 21: SUBSCRIBE_NAMESPACE gets exactly one response ---------------- *
+ * REQUEST_OK (then NAMESPACE for what exists under the prefix) when a track here lies
+ * under it, REQUEST_ERROR when none does (4.1). */
+static void d21_ns_sub_case(const char *prefix_str, bool expect_ok)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);   /* track live/video */
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_bytes_t parts[] = { { (const uint8_t *)prefix_str, strlen(prefix_str) } };
+    moq_namespace_t pre = { parts, 1 };
+    uint8_t msg[64];
+    moq_d21_msg_params_t np;
+    memset(&np, 0, sizeof(np));
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_subscribe_namespace(&w, 0, &pre, &np) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, moq_stream_ref_from_u64(4), msg,
+        moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp)) >= 0);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    int oks = 0, errs = 0, others = 0;
+    moq_action_t a;
+    while (moq_session_poll_actions(sv, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM && a.u.send_bidi_stream.len > 0) {
+            uint8_t ty = a.u.send_bidi_stream.data[0];
+            if (ty == MOQ_D21_REQUEST_OK) oks++;
+            else if (ty == MOQ_D21_REQUEST_ERROR) errs++;
+            else others++;
+        }
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_INT(oks, expect_ok ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(errs, expect_ok ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(others, expect_ok ? 1 : 0);     /* the NAMESPACE for "video"'s parent */
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(expect_ok ? "d21_ns_sub_accepted" : "d21_ns_sub_rejected");
+}
+
+static void test_d21_first_object_bit(void) { test_first_object_bit(MOQ_VERSION_DRAFT_21); }
+
+/* -- Draft 21: the end Object of a four-field Location Filter is enforced --- *
+ * Injected raw (the client API has no end Object): start {2,0}, End Group 2, End Object 3
+ * (inclusive). Only objects {2,0..3} are sent; {2,4} and group 3 are not. */
+static void test_d21_filter_end_object(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_d21_msg_params_t prm;
+    memset(&prm, 0, sizeof(prm));
+    prm.has_location_filter = true;
+    prm.location_filter.field_count = 4;
+    prm.location_filter.start_group = 2; prm.location_filter.start_object = 0;
+    prm.location_filter.end_group_delta = 0; prm.location_filter.end_object = 3;
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_subscribe(&w, 0, &ns, MOQ_BYTES_LITERAL("video"), &prm) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, moq_stream_ref_from_u64(4), msg,
+        moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp)) >= 0);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    { moq_action_t a; while (moq_session_poll_actions(sv, &a, 1) == 1) moq_action_cleanup(&a); }
+
+    static const struct { uint64_t g, o; int want; } probes[] = {
+        { 2, 0, 1 }, { 2, 3, 1 }, { 2, 4, 0 }, { 3, 0, 0 } };
+    for (size_t i = 0; i < 4; i++) {
+        uint8_t d[2] = { (uint8_t)(0x70 + i), 0 };
+        moq_rcbuf_t *p = NULL; moq_rcbuf_create(&alloc, d, sizeof(d), &p);
+        moq_pub_object_cfg_t oc; moq_pub_object_cfg_init(&oc);
+        oc.group_id = probes[i].g; oc.object_id = probes[i].o; oc.payload = p; oc.datagram = true;
+        MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &oc, moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        int sent = 0;
+        moq_action_t a;
+        while (moq_session_poll_actions(sv, &a, 1) == 1) {
+            if (a.kind == MOQ_ACTION_SEND_DATAGRAM) sent++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(sent, probes[i].want);
+    }
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_filter_end_object");
 }
 
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
@@ -14830,6 +15138,15 @@ int main(void) {
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_16, false);
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, true);
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, false);
+    test_d21_concurrent_subscriptions();
+    test_d21_no_subscription_ended();
+    test_d21_filter_end_object();
+    test_d21_first_object_bit();
+    test_first_object_bit(MOQ_VERSION_DRAFT_18);
+    d21_ns_sub_case("live", true);
+    d21_ns_sub_case("other", false);
+    d21_fill_case(true);
+    d21_fill_case(false);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_16);
     test_window_fully_filtered_history(MOQ_VERSION_DRAFT_18);
     for (int v = 0; v < 2; v++) {

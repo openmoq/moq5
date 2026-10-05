@@ -88,6 +88,9 @@ struct moq_pq_threaded {
     uint32_t            send_buffer_size;
     uint32_t            recv_buffer_size;
     uint64_t            goaway_timeout_us;
+    bool                setup_authority_set, setup_path_set;
+    char                setup_authority[MOQ_SETUP_AUTHORITY_MAX + 1];
+    char                setup_path[MOQ_SETUP_PATH_MAX + 1];
     uint32_t            keep_alive_interval_ms;  /* 0 = keepalive disabled */
     bool                insecure_skip_verify;
     int               (*configure_quic_fn)(picoquic_quic_t *, void *);
@@ -225,6 +228,14 @@ static void build_session_cfg(moq_pq_threaded_t *t,
     if (t->send_buffer_size) scfg->send_buffer_size = t->send_buffer_size;
     if (t->recv_buffer_size) scfg->recv_buffer_size = t->recv_buffer_size;
     if (t->goaway_timeout_us) scfg->goaway_timeout_us = t->goaway_timeout_us;
+    if (persp == MOQ_PERSPECTIVE_CLIENT) {
+        if (t->setup_authority_set)
+            scfg->setup_authority = (moq_bytes_t){ (const uint8_t *)t->setup_authority,
+                                                   strlen(t->setup_authority) };
+        if (t->setup_path_set)
+            scfg->setup_path = (moq_bytes_t){ (const uint8_t *)t->setup_path,
+                                              strlen(t->setup_path) };
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1243,6 +1254,11 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
             return MOQ_ERR_INVAL;
     }
 
+    if (CFG_HAS(cfg, setup_path) &&
+        ((cfg->setup_authority && strlen(cfg->setup_authority) > MOQ_SETUP_AUTHORITY_MAX) ||
+         (cfg->setup_path && strlen(cfg->setup_path) > MOQ_SETUP_PATH_MAX)))
+        return MOQ_ERR_INVAL;
+
     /* Allocate wrapper. */
     moq_pq_threaded_t *t = (moq_pq_threaded_t *)cfg->alloc->alloc(
         sizeof(moq_pq_threaded_t), cfg->alloc->ctx);
@@ -1278,6 +1294,16 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         t->goaway_timeout_us = cfg->goaway_timeout_us;
     if (CFG_HAS(cfg, keep_alive_interval_ms))
         t->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
+    if (CFG_HAS(cfg, setup_path)) {
+        if (cfg->setup_authority) {
+            strcpy(t->setup_authority, cfg->setup_authority);
+            t->setup_authority_set = true;
+        }
+        if (cfg->setup_path) {
+            strcpy(t->setup_path, cfg->setup_path);
+            t->setup_path_set = true;
+        }
+    }
     t->max_connections =
         (CFG_HAS(cfg, max_connections) && cfg->max_connections)
             ? cfg->max_connections

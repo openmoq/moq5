@@ -7,6 +7,7 @@
 #include "moq/wire.h"
 #include "profile.h"
 #include "session_transport.h"
+#include "../internal/fill.h"
 #include <string.h>
 
 /* -- Defaults ------------------------------------------------------ */
@@ -15,6 +16,7 @@
 #define MOQ_DEFAULT_MAX_EVENTS       16
 #define MOQ_DEFAULT_SEND_BUF         4096
 #define MOQ_DEFAULT_RECV_BUF         4096
+#define MOQ_D21_RECV_BUF             8448   /* 8192-byte GOAWAY URI + framing */
 #define MOQ_DEFAULT_MAX_SUBS         64
 #define MOQ_DEFAULT_OUTPUT_SCRATCH   65536
 #define MOQ_DEFAULT_MAX_SUBGROUPS    64
@@ -77,6 +79,7 @@ _Static_assert(sizeof(moq_fetch_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_cancelled_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_complete_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
+_Static_assert(sizeof(moq_fill_opened_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_object_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_gap_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -102,11 +105,44 @@ typedef struct moq_setup_params {
     uint64_t max_auth_token_cache_size;
     bool     has_path;
     bool     has_authority;
+    /* Draft 21 (9.1.6, 9.1.7). Absent means the draft's default, which is also 0:
+     * MAX_FILTER_RANGES 0 (the peer is not allowed Range Filters) and
+     * MAX_REQUEST_UPDATES 0 (unlimited outstanding updates). */
+    bool     has_max_filter_ranges;
+    uint64_t max_filter_ranges;
+    bool     has_max_request_updates;
+    uint64_t max_request_updates;
+    bool     has_implementation;      /* MOQT_IMPLEMENTATION sent (9.1.5) */
 } moq_setup_params_t;
 
 /* Forward decl: entries hold a pointer to their reserved registry record
  * (defined below, after the entry structs). */
 typedef struct moq_track_hist moq_track_hist_t;
+
+/* Draft-21 Location Filter exactly as on the wire (see the comment where it is
+ * produced, below the decoded-message section); defined here so entries can keep it. */
+typedef struct moq_decoded_loc_filter {
+    bool     present;             /* a LOCATION_FILTER parameter was on the wire */
+    uint8_t  field_count;         /* 0..4; 0 = a zero-length (remove / whole) filter */
+    uint64_t start_group;
+    uint64_t start_object;
+    uint64_t end_group_delta;     /* raw delta from start_group */
+    uint64_t end_object;
+    bool     approximated;
+} moq_decoded_loc_filter_t;
+
+/* FILL_PARAMETERS as decoded (draft 21 9.20.16); defined here so a subscription
+ * entry can hold the pending fill. */
+typedef struct moq_decoded_fill {
+    bool     present;             /* FILL_PARAMETERS carried: a fill is requested */
+    moq_decoded_loc_filter_t location;   /* the fill range; absent = the subscription's */
+    bool     has_timeout;
+    uint64_t timeout_ms;
+    bool     has_priority;
+    uint8_t  priority;
+    bool     has_group_order;
+    uint8_t  group_order;
+} moq_decoded_fill_t;
 
 /*
  * Resolved subscription filter window. Stored
@@ -129,6 +165,8 @@ typedef struct moq_resolved_window {
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;      /* valid iff has_end */
+    bool                   has_end_object; /* draft 21: End Object bounds End Group */
+    uint64_t               end_object;     /* valid iff has_end_object; inclusive */
 } moq_resolved_window_t;
 
 typedef enum moq_sub_state {
@@ -190,6 +228,7 @@ typedef struct moq_sub_entry {
      * Joining-FETCH eligibility gate). Cleared on REQUEST_ERROR/teardown. */
     bool               update_has_filter;
     uint32_t           update_filter_type;
+    uint64_t           update_start_group, update_start_object, update_end_group;
     /* A REQUEST_UPDATE failed (REQUEST_ERROR): the subscription is awaiting the
      * mandatory terminal PUBLISH_DONE(UPDATE_FAILED). No new update may be sent,
      * and only that PUBLISH_DONE is a valid next message. */
@@ -216,6 +255,24 @@ typedef struct moq_sub_entry {
     uint64_t req_start_group;
     uint64_t req_start_object;
     uint64_t req_end_group;
+    moq_decoded_loc_filter_t req_loc;   /* draft 21: the exact filter, re-resolved on update */
+    /* Draft 21 fill (3.4): FILL_PARAMETERS on the SUBSCRIBE or latest REQUEST_UPDATE
+     * is held here until the application opens the fill stream. `fill_pending` is
+     * set only when Forward State is 1 at that point; the Largest Object the
+     * response advertised bounds the fill range. */
+    bool                 fill_pending;
+    /* Subscriber role: Request IDs of the SUBSCRIBE / updates that asked for a fill; a
+     * fill stream carrying one of them is bound to this subscription. */
+    struct {
+        uint64_t request_id;
+        moq_fill_selection_t selection;
+    } fill_expect[4];
+    uint8_t              fill_expect_n;
+    uint64_t             fill_request_id;
+    moq_decoded_fill_t   fill_req;
+    bool                 fill_has_largest;
+    uint64_t             fill_largest_group;
+    uint64_t             fill_largest_object;
     /* Resolved subscription window (publisher role), stored against the accept /
      * REQUEST_UPDATE snapshot; reached via the package-internal accessor. */
     moq_resolved_window_t window;
@@ -420,6 +477,10 @@ typedef struct moq_fetch_entry {
     uint32_t           generation;
     moq_fetch_t        handle;
     uint64_t           request_id;
+    /* A fill fetch stream (draft 21 3.4): owned by a subscription, carries that
+     * request's id in its FETCH_HEADER, has no request bidi and no registry key. */
+    bool               is_fill;
+    moq_subscription_t fill_sub;
     /* request_stream_ref: the FETCH *request* bidi stream identity for
      * stream-correlated request profiles (the stream the FETCH request travels
      * on; FETCH_OK/REQUEST_ERROR correlate by it). Intentionally DISTINCT from
@@ -559,6 +620,8 @@ typedef struct moq_pub_entry {
      * joining_* is the latched result; has_joining_loc gates every read.
      * Absence of a required Largest leaves no Joining Location at all -- there
      * is no fallback to stale or current state. */
+    bool               publish_forward;      /* the FORWARD value our PUBLISH advertised (draft 21: it stays
+                                                 * in force until the subscriber's REQUEST_UPDATE) */
     bool               publish_has_largest;
     uint64_t           publish_largest_group;
     uint64_t           publish_largest_object;
@@ -635,6 +698,7 @@ typedef struct moq_pub_entry {
     int32_t occ_next;    /* next linked slot, -1 = end */
     int32_t occ_prev;    /* previous linked slot, -1 = head */
     bool    occ_linked;  /* membership, so link/unlink are idempotent-safe */
+    moq_publish_initial_params_t initial;   /* the peer publisher's own PUBLISH parameters */
 } moq_pub_entry_t;
 
 typedef enum moq_ts_state {
@@ -827,6 +891,29 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * no snapshot resolve to an open window from the origin (never unsatisfiable);
  * at-ceiling relative filters set `unsatisfiable`.
  */
+/* Resolve a draft-21 fill range against Largest Object (3.4 / 3.3.1). Returns
+ * false when there is nothing to fill (no content, an empty range, or a start after
+ * Largest Object); otherwise the INCLUSIVE range. `lf` may be NULL or zero-field
+ * (the whole track up to Largest Object). */
+/* Reset (and free) every open fill fetch stream owned by `sub`: the subscription
+ * ended, so its fills are cancelled (3.4.1). Best effort when the action queue is
+ * full -- the entry is freed either way. */
+/* A FETCH_HEADER whose Request ID is the SUBSCRIBE / update that asked for a fill
+ * (draft 21 3.4): create the subscriber-side fill fetch entry for it and return its
+ * slot, or -1 when no subscription expects that id. The expectation is consumed and
+ * MOQ_EVENT_FILL_OPENED is queued; -2 (nothing bound) when event or fetch capacity is full. */
+int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id);
+void session_core_reset_fills_for_sub(moq_session_t *s, moq_subscription_t sub);
+bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,
+                            bool has_largest, uint64_t largest_group,
+                            uint64_t largest_object,
+                            uint64_t *start_group, uint64_t *start_object,
+                            uint64_t *end_group, uint64_t *end_object);
+void moq_resolve_loc_filter_window(const moq_decoded_loc_filter_t *lf,
+                                   bool has_snap,
+                                   uint64_t snap_group, uint64_t snap_object,
+                                   uint64_t ceiling,
+                                   moq_resolved_window_t *out);
 void moq_resolve_filter_window(moq_subscribe_filter_t filter,
                                uint64_t raw_start_group,
                                uint64_t raw_start_object,
@@ -916,6 +1003,8 @@ typedef struct moq_sg_entry {
     uint64_t               streaming_bytes_written;
     uint64_t               delivery_deadline_us;
     bool                   has_extensions;
+    bool                   ovr_has_subgroup_timeout;   /* first object's property override */
+    uint64_t               ovr_subgroup_timeout_ms;
     /*
      * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
      * is allocated (state != FREE / active). Every sweep that used to scan the
@@ -1212,6 +1301,7 @@ typedef struct moq_subgroup_header_encode_args {
     uint8_t  publisher_priority;
     bool     has_extensions;
     bool     end_of_group;
+    bool     first_object;
 } moq_subgroup_header_encode_args_t;
 
 typedef struct moq_object_header_encode_args {
@@ -1225,6 +1315,17 @@ typedef struct moq_object_header_encode_args {
     uint64_t object_status;   /* wire status emitted for a zero-length object
                                  (0x0 NORMAL default; 0x4 END_OF_TRACK, etc.) */
 } moq_object_header_encode_args_t;
+
+typedef struct moq_publish_state_notify_args {
+    bool     has_largest;
+    uint64_t largest_group, largest_object;
+    bool     has_forward;
+    bool     forward;
+    bool     has_filter;
+    uint8_t  filter_field_count;
+    uint64_t filter_start_group, filter_start_object;
+    uint64_t filter_end_group_delta, filter_end_object;
+} moq_publish_state_notify_args_t;
 
 typedef struct moq_goaway_encode_args {
     const uint8_t *uri;
@@ -1495,6 +1596,13 @@ struct moq_session {
 
     bool                send_auth_token_cache_size;
     uint64_t            auth_token_cache_size;
+    uint8_t             setup_authority[MOQ_SETUP_AUTHORITY_MAX];
+    size_t              setup_authority_len;
+    bool                setup_authority_present;
+    bool                setup_path_present;
+    uint64_t            advertise_max_request_updates;   /* 0 = not advertised */
+    uint8_t             setup_path[MOQ_SETUP_PATH_MAX];
+    size_t              setup_path_len;
 
     uint8_t      *send_buf;
     size_t        send_cap;
@@ -2179,6 +2287,7 @@ typedef struct moq_subscribe_encode_args {
     size_t                  auth_token_count;
     bool has_new_group_request;
     uint64_t new_group_request;
+    moq_fill_request_t fill;
 } moq_subscribe_encode_args_t;
 
 typedef struct moq_subscribe_ok_encode_args {
@@ -2267,9 +2376,28 @@ typedef struct moq_request_update_encode_args {
     uint64_t filter_start_group;
     uint64_t filter_start_object;
     uint64_t filter_end_group;
+    moq_fill_request_t fill;
 } moq_request_update_encode_args_t;
 
 #define MOQ_DECODED_MAX_NAMESPACE_PARTS 32
+
+/* -- Raw draft-21 filter surfaces (profile -> session core) --------------- *
+ * The core models a subscription filter as one of four types plus locations
+ * (MOQ_SUBSCRIBE_FILTER_*). Draft 21 expresses filters as a Location Filter of 0 to
+ * 4 fields (9.20.10), FILL_PARAMETERS (9.20.16) and Range Filters (9.20.11-15). The
+ * profile maps what the four types can express exactly and passes the wire fields
+ * through here in full, so the core can finish the semantics (plan Tasks 6 and 7)
+ * without the wire layer changing again. `approximated` says the four-type fields
+ * only approximate the request; `present` is false for profiles without these. */
+
+
+/* Range Filters are parsed and counted, never applied (this implementation does not
+ * advertise MAX_FILTER_RANGES): the session answers INVALID_FILTER when `ranges`
+ * exceeds the limit it advertised, or when `invalid` is set (9.1.6, 3.3.2). */
+typedef struct moq_decoded_range_filters {
+    uint64_t ranges;
+    bool     invalid;
+} moq_decoded_range_filters_t;
 
 /* -- Decoded inbound SUBSCRIBE (profile → session core) --------------- */
 
@@ -2296,6 +2424,9 @@ typedef struct moq_decoded_subscribe {
     uint64_t         start_group;
     uint64_t         start_object;
     uint64_t         end_group;
+    moq_decoded_loc_filter_t     loc_filter;      /* draft 21: the exact wire filter */
+    moq_decoded_fill_t           fill;            /* draft 21: FILL_PARAMETERS */
+    moq_decoded_range_filters_t  range_filters;   /* draft 21: parsed, never applied */
     moq_resolved_token_t tokens[MOQ_DECODED_MAX_TOKENS];
     bool             token_staged[MOQ_DECODED_MAX_TOKENS];
     size_t           token_count;
@@ -2350,6 +2481,9 @@ typedef struct moq_decoded_request_update {
     uint64_t start_group;
     uint64_t start_object;
     uint64_t end_group;
+    moq_decoded_loc_filter_t     loc_filter;      /* draft 21: the exact wire filter */
+    moq_decoded_fill_t           fill;            /* draft 21: FILL_PARAMETERS */
+    moq_decoded_range_filters_t  range_filters;   /* draft 21: parsed, never applied */
     /* Resolved AUTHORIZATION_TOKEN parameters (both profiles; the auth
      * transaction commit/abort is a safe no-op on an empty transaction).
      * auth_reject_code is non-zero when a token failed at the message level
@@ -2501,6 +2635,11 @@ typedef struct moq_decoded_fetch {
     uint64_t         joining_request_id;
     uint64_t         joining_start;
     int              joining_sub_slot;
+    /* Draft 21: the exact wire filter that carried the range (the core's
+     * [start, end) fields above are filled from it where the model expresses it),
+     * and the parsed-but-never-applied Range Filters. */
+    moq_decoded_loc_filter_t     loc_filter;
+    moq_decoded_range_filters_t  range_filters;
     /* Publication-origin join (draft-18 5.1): the joined owner is a
      * PUBLISH-initiated subscription in the publication pool. Exactly one of
      * joining_sub_slot / joining_pub_slot is >= 0 for a joining fetch. */
@@ -2699,6 +2838,13 @@ typedef struct moq_decoded_publish {
     uint64_t         largest_object;
     bool             has_expires;
     uint64_t         expires_ms;
+    /* Draft 21: the publisher's own initial Subscription Parameters on the PUBLISH. */
+    bool                     has_initial_params;
+    uint8_t                  subscriber_priority;
+    moq_group_order_t        group_order;
+    bool                     has_delivery_timeout;
+    uint64_t                 delivery_timeout_ms;   /* min non-zero of the two timeouts */
+    moq_decoded_loc_filter_t loc_filter;
 } moq_decoded_publish_t;
 
 typedef struct moq_decoded_publish_ok {

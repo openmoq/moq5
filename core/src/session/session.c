@@ -1493,7 +1493,9 @@ static moq_result_t handle_tick(moq_session_t *s)
             if (sg->state == MOQ_SG_FREE) continue;
             if (sg->delivery_deadline_us == UINT64_MAX) continue;
             if (s->last_now_us < sg->delivery_deadline_us) continue;
-            if (sg->state == MOQ_SG_CLOSING ||
+            /* A closing stream's timer (draft 21: armed at the FIN) still resets it; the
+             * reset is a no-op if the transport already committed the data. */
+            if ((sg->state == MOQ_SG_CLOSING && !s->profile->subgroup_timer_at_fin) ||
                 sg->state == MOQ_SG_RESETTING) {
                 sg->delivery_deadline_us = UINT64_MAX;
                 continue;
@@ -1905,6 +1907,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
             auth_token_cache_size = cfg->auth_token_cache_size;
     }
 
+    moq_bytes_t setup_authority = { NULL, 0 }, setup_path = { NULL, 0 };
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, setup_path) + sizeof(cfg->setup_path)) {
+        setup_authority = cfg->setup_authority;
+        setup_path = cfg->setup_path;
+        if ((setup_authority.len && !setup_authority.data) ||
+            (setup_path.len && !setup_path.data) ||
+            setup_authority.len > MOQ_SETUP_AUTHORITY_MAX ||
+            setup_path.len > MOQ_SETUP_PATH_MAX)
+            return MOQ_ERR_INVAL;
+    }
+
     size_t action_cap = cfg_read_u32(cfg,
         offsetof(moq_session_cfg_t, max_actions), sizeof(cfg->max_actions));
     size_t event_cap = cfg_read_u32(cfg,
@@ -1933,7 +1946,14 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (!event_cap)   event_cap   = MOQ_DEFAULT_MAX_EVENTS;
     if (sub_cap > 0xFFFF) return MOQ_ERR_INVAL; /* handle slot is 16-bit */
     if (!send_cap)    send_cap    = MOQ_DEFAULT_SEND_BUF;
-    if (!recv_cap)    recv_cap    = MOQ_DEFAULT_RECV_BUF;
+    if (!recv_cap) {
+        /* Draft 21 lets a GOAWAY carry a New Session URI of up to 8,192 bytes (9.2), which
+         * the control-stream reassembly buffer must hold whole. */
+        const bool is_d21 = cfg->struct_size >= offsetof(moq_session_cfg_t, version) +
+                                                sizeof(cfg->version) &&
+                            cfg->version == MOQ_VERSION_DRAFT_21;
+        recv_cap = is_d21 ? MOQ_D21_RECV_BUF : MOQ_DEFAULT_RECV_BUF;
+    }
     if (!sub_cap)     sub_cap     = MOQ_DEFAULT_MAX_SUBS;
     if (!scratch_cap) scratch_cap = MOQ_DEFAULT_OUTPUT_SCRATCH;
     if (!sg_cap)      sg_cap      = MOQ_DEFAULT_MAX_SUBGROUPS;
@@ -2404,6 +2424,15 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         s->session_tag = (uint16_t)((h & 0x7FFF) | 1);
     }
 
+    if (setup_authority.len) memcpy(s->setup_authority, setup_authority.data, setup_authority.len);
+    s->setup_authority_len = setup_authority.len;
+    s->setup_authority_present = setup_authority.data != NULL;
+    s->setup_path_present = setup_path.data != NULL;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, max_request_updates) +
+                            sizeof(cfg->max_request_updates))
+        s->advertise_max_request_updates = cfg->max_request_updates;
+    if (setup_path.len) memcpy(s->setup_path, setup_path.data, setup_path.len);
+    s->setup_path_len = setup_path.len;
     s->send_auth_token_cache_size = send_auth_token_cache_size;
     s->auth_token_cache_size = auth_token_cache_size;
     {

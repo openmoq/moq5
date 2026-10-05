@@ -358,6 +358,9 @@ struct moq_media_sender {
                                                    to WOULD_BLOCK once, AFTER the
                                                    live writes -- models
                                                    retained-install backpressure */
+    bool              test_block_finish_once;
+    void (*test_conversion_event)(void *ctx, moq_media_track_t *finished);
+    void             *test_conversion_ctx;
 #endif
 
     sender_preq_entry_t *preq;            /* ring; entries own their refs */
@@ -549,13 +552,14 @@ static moq_bytes_t default_role(moq_media_type_t t)
  * Zero -- the never-observed value -- is not one of them. */
 static bool sender_version_usable(moq_version_t v)
 {
-    return v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18;
+    return moq_loc_profile_for_transport(v) != (moq_loc_profile_t)0;
 }
 
 static moq_loc_profile_t sender_loc_profile(const moq_media_sender_t *s)
 {
-    (void)s;   /* version-driven once LOC-02 lands; LOC-01-only for now */
-    return MOQ_LOC_PROFILE_01;
+    /* One table (moq_loc_profile_for_transport): LOC-01 ids on drafts 16/18, LOC-04
+     * ids on draft 21. The sender never tests a version itself. */
+    return moq_loc_profile_for_transport(s->transport_version);
 }
 
 /* -- Send queue (mu held by caller) ----------------------------------- *
@@ -2247,6 +2251,10 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
                 pthread_mutex_unlock(&s->mu);
                 return;
             }
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            if (s->test_conversion_event)
+                s->test_conversion_event(s->test_conversion_ctx, NULL);
+#endif
             s->pending_obj_cursor++;
         }
     } else {
@@ -2348,9 +2356,20 @@ static bool sender_finish_conversions(moq_media_sender_t *s, uint64_t now_us)
             pthread_mutex_unlock(&s->mu);
             continue;
         }
-        moq_result_t fr = moq_pub_finish_subscribers(
+        moq_result_t fr;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        if (s->test_block_finish_once) {
+            s->test_block_finish_once = false;
+            fr = MOQ_ERR_WOULD_BLOCK;
+        } else
+#endif
+        fr = moq_pub_finish_subscribers(
             s->pub, t->pub_track, MOQ_PUB_DONE_TRACK_ENDED, now_us);
         if (fr == MOQ_OK) {
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            if (s->test_conversion_event)
+                s->test_conversion_event(s->test_conversion_ctx, t);
+#endif
             pthread_mutex_lock(&s->mu);
             t->vod_finish_pending = false;
             pthread_mutex_unlock(&s->mu);
@@ -4354,7 +4373,8 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     if (track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
         uint64_t loc_ts = obj->has_capture_time ? obj->capture_time_us
                                                 : obj->presentation_time_us;
-        uint64_t loc_ts_max = (s->transport_version == MOQ_VERSION_DRAFT_18)
+        uint64_t loc_ts_max = (s->transport_version == MOQ_VERSION_DRAFT_18 ||
+                              s->transport_version == MOQ_VERSION_DRAFT_21)
                                   ? UINT64_MAX : MOQ_QUIC_VARINT_MAX;
         if (loc_ts > loc_ts_max) {
             s->stats.last_error = MOQ_ERR_INVAL;
@@ -5423,6 +5443,17 @@ void moq_media_sender_test_block_retained_install_once(moq_media_sender_t *s)
     pthread_mutex_lock(&s->mu);
     s->test_block_retained_once = true;
     pthread_mutex_unlock(&s->mu);
+}
+
+/* Observe local emission order (finished track, then NULL for a catalog write)
+ * and optionally model one retryable finish. Driven only by the test thread. */
+void moq_media_sender_test_observe_conversion(
+    moq_media_sender_t *s, bool block_once,
+    void (*event)(void *, moq_media_track_t *), void *ctx)
+{
+    s->test_block_finish_once = block_once;
+    s->test_conversion_event = event;
+    s->test_conversion_ctx = ctx;
 }
 
 /* Whether the armed fault fired; on true, returns the snapshot: the cursor

@@ -9,7 +9,7 @@
  * Transport rows: both built drafts are AVAILABLE, with the reviewed ALPN
  * literals (Step 3's canonical table is the authority the drift gate compares
  * against), the integer codec each draft specifies, and the endpoint-offer
- * facts. AUTO ranks are 1-based and D18 is offered FIRST.
+ * facts. AUTO ranks are 1-based and D21 is offered FIRST.
  *
  * Media rows: LOC-01 is implemented; LOC-02 is RESERVED with a reason. The
  * reviewed property IDs are recorded because they are the collision at the
@@ -21,9 +21,15 @@
 static const np_transport_row_t kTransports[] = {
     /* draft, state, ALPN, len, codec, max, offered, rank, unusable reason */
     { 16, NP_T_AVAILABLE, "moqt-16", 7, NP_ENC_QUIC_VARINT,
-      NP_QUIC_VARINT_MAX, true, 2, NULL },
+      NP_QUIC_VARINT_MAX, true, 3, NULL },
     { 18, NP_T_AVAILABLE, "moqt-18", 7, NP_ENC_VI64,
-      NP_VI64_MAX,        true, 1, NULL },
+      NP_VI64_MAX,        true, 2, NULL },
+    /* Draft 21 is wire ready and offered first. Its media cells are still
+     * UNSUPPORTED (LOC property ids are not implemented for it), which is why the
+     * row keeps a reason. */
+    { 21, NP_T_AVAILABLE, "moqt-21", 7, NP_ENC_VI64,
+      NP_VI64_MAX,        true, 1,
+      "draft-21 LOC property ids are not implemented" },
 };
 
 static const np_media_row_t kMedias[] = {
@@ -53,6 +59,15 @@ static const np_cell_row_t kCells[] = {
       "renumbered property ids on any draft",
       NULL, NULL, NULL },
     { 18, "loc02", NP_C_UNSUPPORTED,
+      "LOC-02 is RESERVED: no product encoder or decoder exists for its "
+      "renumbered property ids on any draft",
+      NULL, NULL, NULL },
+    { 21, "loc01", NP_C_UNSUPPORTED,
+      "draft 21 carries LOC-04 (Timestamp 0x10, Video Frame Marking 0x09), which "
+      "the product implements but this topology has no media row for yet; LOC-01 "
+      "is not carried on draft 21",
+      NULL, NULL, NULL },
+    { 21, "loc02", NP_C_UNSUPPORTED,
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "
       "renumbered property ids on any draft",
       NULL, NULL, NULL },
