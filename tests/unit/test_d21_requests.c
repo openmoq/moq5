@@ -1913,13 +1913,17 @@ static void t_fill_end_to_end(void)
 /* -- Delivery timeout timing (6.8, draft 21 5.2) ------------------------------ *
  * The SUBGROUP timeout starts when the subgroup's last object is published (its FIN), the first
  * object's own property overrides the Track value, and an expired closing stream is reset. */
-static int delivery_timer_case(bool override, uint64_t open_now, uint64_t probe_after_us)
+static int delivery_timer_case(bool override, bool sub_param, uint64_t open_now, uint64_t probe_after_us)
 {
     moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
     moq_bytes_t parts[1];
     moq_namespace_t ns = ns_live(parts);
     moq_d21_msg_params_t p;
     memset(&p, 0, sizeof(p));
+    if (sub_param) {                                /* the SUBSCRIBER asks for 50 ms */
+        p.has_subgroup_delivery_timeout = true;
+        p.subgroup_delivery_timeout_ms = 50;
+    }
     uint8_t msg[96];
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, msg, sizeof(msg));
@@ -1934,7 +1938,8 @@ static int delivery_timer_case(bool override, uint64_t open_now, uint64_t probe_
     moq_accept_subscribe_cfg_t acc;
     memset(&acc, 0, sizeof(acc));
     acc.struct_size = sizeof(acc);
-    acc.track_properties = (moq_bytes_t){ track_props, sizeof(track_props) };
+    if (!sub_param)
+        acc.track_properties = (moq_bytes_t){ track_props, sizeof(track_props) };
     moq_session_accept_subscribe(s, sub, &acc, open_now);
     { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
 
@@ -1989,11 +1994,14 @@ static int delivery_timer_case(bool override, uint64_t open_now, uint64_t probe_
 static void t_delivery_timer_at_fin(void)
 {
     /* Track value 50 ms, counted from the FIN a second after the stream opened. */
-    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, 100000, 30000), 0);     /* inside it */
-    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, 100000, 60000), 1);     /* past it: reset */
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, false, 100000, 30000), 0);     /* inside it */
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, false, 100000, 60000), 1);     /* past it: reset */
     /* The first object's property (20 ms) overrides the Track value. */
-    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(true, 100000, 15000), 0);
-    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(true, 100000, 30000), 1);
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(true, false, 100000, 15000), 0);
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(true, false, 100000, 30000), 1);
+    /* The subscriber's own value counts the same way. */
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, true, 100000, 30000), 0);
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, true, 100000, 60000), 1);
 }
 
 int main(void)
