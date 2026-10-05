@@ -13,6 +13,7 @@
  */
 #include <moq/moq.h>
 #include <moq/control_d21.h>
+#include <moq/sim.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/session/profile.h"
@@ -1827,6 +1828,79 @@ static void t_send_state_notify(void)
     moq_session_destroy(s);
 }
 
+/* A subscriber asks for a fill and receives it: end to end over two sessions. */
+static void t_fill_end_to_end(void)
+{
+    moq_simpair_cfg_t sc = MOQ_SIMPAIR_CFG_INIT;
+    sc.alloc = moq_alloc_default();
+    sc.seed = 7;
+    sc.initial_now_us = 1000;
+    sc.version = MOQ_VERSION_DRAFT_21;
+    sc.client_send_request_capacity = true; sc.client_initial_request_capacity = 16;
+    sc.server_send_request_capacity = true; sc.server_initial_request_capacity = 16;
+    moq_simpair_t *sp = NULL;
+    MOQ_TEST_CHECK(moq_simpair_create(&sc, &sp) >= 0);
+    moq_simpair_start(sp);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_session_t *cl = moq_simpair_client(sp), *sv = moq_simpair_server(sp);
+    { moq_event_t e; while (moq_session_poll_events(cl, &e, 1) > 0) moq_event_cleanup(&e);
+                     while (moq_session_poll_events(sv, &e, 1) > 0) moq_event_cleanup(&e); }
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    MOQ_TEST_CHECK(moq_session_note_object_published(sv, &ns, lit("fe"), 7, 2) == MOQ_OK);
+
+    moq_subscribe_cfg_t cfg;
+    moq_subscribe_cfg_init(&cfg);
+    cfg.track_namespace = ns; cfg.track_name = lit("fe");
+    cfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;          /* Next Object live edge */
+    cfg.fill.present = true; cfg.fill.has_location = true;
+    cfg.fill.field_count = 1; cfg.fill.start_group = 1;        /* the current group, from its start */
+    moq_subscription_t csub;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_subscribe(cl, &cfg, moq_simpair_now_us(sp), &csub), (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+
+    moq_event_t ev;
+    MOQ_TEST_CHECK(next_event(sv, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
+    moq_subscription_t ssub = ev.u.subscribe_request.sub;
+    moq_event_cleanup(&ev);
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(sv, ssub, &acc, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_fill_info_t info; moq_fetch_t fh;
+    MOQ_TEST_CHECK(moq_session_sub_fill_pending(sv, ssub));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_fill(sv, ssub, moq_simpair_now_us(sp), &info, &fh), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!info.empty && info.start_group == 7 && info.end_object == 2);
+    for (uint64_t o = 0; o <= 2; o++) {
+        moq_rcbuf_t *pl = NULL;
+        uint8_t d[2] = { (uint8_t)o, 0x55 };
+        moq_rcbuf_create(moq_alloc_default(), d, sizeof(d), &pl);
+        moq_fetch_object_cfg_t oc;
+        moq_fetch_object_cfg_init(&oc);
+        oc.group_id = 7; oc.object_id = o; oc.payload = pl;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_fetch_object(sv, fh, &oc, moq_simpair_now_us(sp)), (int)MOQ_OK);
+        moq_rcbuf_decref(pl);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(sv, fh, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+
+    int objs = 0, complete = 0;
+    uint64_t first_obj = 99;
+    while (moq_session_poll_events(cl, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_FETCH_OBJECT) {
+            if (objs == 0) first_obj = ev.u.fetch_object.object_id;
+            objs++;
+        }
+        if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) complete++;
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_INT(objs, 3);
+    MOQ_TEST_CHECK_EQ_U64(first_obj, 0);
+    MOQ_TEST_CHECK_EQ_INT(complete, 1);
+    MOQ_TEST_CHECK(moq_simpair_client(sp) && moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1856,6 +1930,7 @@ int main(void)
     t_fetch_relative_start();
     t_publish_initial_params();
     t_send_state_notify();
+    t_fill_end_to_end();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

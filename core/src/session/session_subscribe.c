@@ -159,8 +159,7 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
     sub_occ_unlink(s, slot);
-    if (e->role == MOQ_SUB_ROLE_PUBLISHER)
-        session_core_reset_fills_for_sub(s, e->handle);
+    session_core_reset_fills_for_sub(s, e->handle);
     /* Safety net for any Joining FETCHes (§10.12.2) still buffered against a
      * pending subscription: free them (dropping their entry-owned token storage)
      * with no control message. The alive teardown paths -- public reject and
@@ -216,6 +215,7 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     e->req_end_group = 0;
     memset(&e->req_loc, 0, sizeof(e->req_loc));
     e->fill_pending = false;
+    e->fill_expect_n = 0;
     e->fill_request_id = 0;
     memset(&e->fill_req, 0, sizeof(e->fill_req));
     e->fill_has_largest = false;
@@ -2900,6 +2900,13 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         has_new_group_request = true;
         new_group_request = cfg->new_group_request;
     }
+    moq_fill_request_t fill_req;
+    memset(&fill_req, 0, sizeof(fill_req));
+    if (SUB_CFG_HAS(fill) && cfg->fill.present) {
+        if (!s->profile->supports_fill) return MOQ_ERR_UNSUPPORTED;
+        if (cfg->fill.field_count > 4) return MOQ_ERR_INVAL;
+        fill_req = cfg->fill;
+    }
 
     session_begin_advance(s, now_us);
 
@@ -2994,6 +3001,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
             .auth_token_count = auth_token_count,
             .has_new_group_request = has_new_group_request,
             .new_group_request = new_group_request,
+            .fill = fill_req,
         };
 
         moq_buf_writer_t w;
@@ -3059,6 +3067,11 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     /* Commit the effective Forward State (default true) so the data-plane
      * reordering buffer only holds early data for a forwarding subscription. */
     entry->forward = cfg->has_forward ? cfg->forward : true;
+    entry->fill_expect_n = 0;
+    if (fill_req.present && entry->forward) {      /* a fill needs Forward State 1 */
+        entry->fill_expect_ids[0] = req_ep.request_id;
+        entry->fill_expect_n = 1;
+    }
     entry->handle = sub_make_handle(s, (size_t)slot);
     req_ep.kind = MOQ_REQ_SUBSCRIPTION;
     req_ep.slot = slot;
@@ -3833,6 +3846,13 @@ moq_result_t moq_session_update_subscription(
         f_so = cfg->start_object;
         f_eg = cfg->end_group;
     }
+    moq_fill_request_t fill_req;
+    memset(&fill_req, 0, sizeof(fill_req));
+    if (UPD_CFG_HAS(fill) && cfg->fill.present) {
+        if (!s->profile->supports_fill) return MOQ_ERR_UNSUPPORTED;
+        if (cfg->fill.field_count > 4) return MOQ_ERR_INVAL;
+        fill_req = cfg->fill;
+    }
 #undef UPD_CFG_HAS
 #undef UPD_CFG_MIN
     if (!cfg->has_subscriber_priority && !cfg->has_forward &&
@@ -3925,6 +3945,7 @@ moq_result_t moq_session_update_subscription(
         .filter_start_group = f_sg,
         .filter_start_object = f_so,
         .filter_end_group = f_eg,
+        .fill = fill_req,
     };
 
     moq_buf_writer_t w;
@@ -3968,6 +3989,12 @@ moq_result_t moq_session_update_subscription(
 
     e->update_pending = true;
     e->update_request_id = req_ep.request_id;
+    /* The fill this update asked for (Forward State 1 once it applies) will arrive on a
+     * stream carrying this update's Request ID. */
+    if (fill_req.present && (cfg->has_forward ? cfg->forward : e->forward)) {
+        if (e->fill_expect_n < sizeof(e->fill_expect_ids) / sizeof(e->fill_expect_ids[0]))
+            e->fill_expect_ids[e->fill_expect_n++] = req_ep.request_id;
+    }
     /* A Forward change takes effect at the ACK (the CURRENT acknowledged
      * Forward state gates object delivery); remember it until then. */
     e->update_has_forward = cfg->has_forward;

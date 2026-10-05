@@ -3112,6 +3112,7 @@ static const moq_profile_ops_t d18_ops = {
     .uses_uni_control_channel = true,
     .publish_ok_carries_params = true,
     .supports_joining_fetch  = true,
+    .supports_fill = false,
     .allows_concurrent_subscriptions = false,
     .request_fin_is_not_cancel = false,
     .publish_done_subscription_ended = true,

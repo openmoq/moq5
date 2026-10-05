@@ -258,6 +258,10 @@ typedef struct moq_sub_entry {
      * set only when Forward State is 1 at that point; the Largest Object the
      * response advertised bounds the fill range. */
     bool                 fill_pending;
+    /* Subscriber role: Request IDs of the SUBSCRIBE / updates that asked for a fill; a
+     * fill stream carrying one of them is bound to this subscription. */
+    uint64_t             fill_expect_ids[4];
+    uint8_t              fill_expect_n;
     uint64_t             fill_request_id;
     moq_decoded_fill_t   fill_req;
     bool                 fill_has_largest;
@@ -888,6 +892,10 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
 /* Reset (and free) every open fill fetch stream owned by `sub`: the subscription
  * ended, so its fills are cancelled (3.4.1). Best effort when the action queue is
  * full -- the entry is freed either way. */
+/* A FETCH_HEADER whose Request ID is the SUBSCRIBE / update that asked for a fill
+ * (draft 21 3.4): create the subscriber-side fill fetch entry for it and return its
+ * slot, or -1 when no subscription expects that id. The expectation is consumed. */
+int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id);
 void session_core_reset_fills_for_sub(moq_session_t *s, moq_subscription_t sub);
 bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,
                             bool has_largest, uint64_t largest_group,
@@ -2270,6 +2278,7 @@ typedef struct moq_subscribe_encode_args {
     size_t                  auth_token_count;
     bool has_new_group_request;
     uint64_t new_group_request;
+    moq_fill_request_t fill;
 } moq_subscribe_encode_args_t;
 
 typedef struct moq_subscribe_ok_encode_args {
@@ -2358,6 +2367,7 @@ typedef struct moq_request_update_encode_args {
     uint64_t filter_start_group;
     uint64_t filter_start_object;
     uint64_t filter_end_group;
+    moq_fill_request_t fill;
 } moq_request_update_encode_args_t;
 
 #define MOQ_DECODED_MAX_NAMESPACE_PARTS 32

@@ -1807,6 +1807,23 @@ MOQ_API uint64_t moq_session_peer_auth_token_cache_size(const moq_session_t *s);
  *   default 128), forward (false is valid, default true).
  * Default-means-unset: group_order (DEFAULT=0 uses publisher order).
  */
+/*
+ * A fill request on a subscription (draft 21 3.4): ask the publisher to also deliver a
+ * range of past Objects on a fill stream. The range is a Location Filter written as on the
+ * wire (0 to 4 fields; one field is a start relative to the Largest Object, and none =
+ * the whole track up to it); omitting it uses the subscription's own filter. Honoured
+ * only while Forward State is 1. Drafts without fills refuse it (MOQ_ERR_UNSUPPORTED).
+ * The fill's objects arrive as fetch events for the handle in the FETCH_* events.
+ */
+typedef struct moq_fill_request {
+    bool     present;
+    bool     has_location;
+    uint8_t  field_count;
+    uint64_t start_group, start_object, end_group_delta, end_object;
+    bool     has_timeout;
+    uint64_t timeout_ms;
+} moq_fill_request_t;
+
 typedef struct moq_subscribe_cfg {
     uint32_t               struct_size;
     moq_namespace_t        track_namespace;  /* borrowed for the call */
@@ -1829,6 +1846,8 @@ typedef struct moq_subscribe_cfg {
      * smaller struct send nothing. */
     bool                    has_new_group_request;
     uint64_t                new_group_request;
+    /* Appended (draft 21): ask for a fill stream. */
+    moq_fill_request_t      fill;
 } moq_subscribe_cfg_t;
 
 MOQ_API void moq_subscribe_cfg_init(moq_subscribe_cfg_t *cfg);
@@ -1978,6 +1997,8 @@ typedef struct moq_subscription_update_cfg {
     uint64_t               start_group;
     uint64_t               start_object;
     uint64_t               end_group;
+    /* Appended (draft 21): ask for a fill stream with this update. */
+    moq_fill_request_t     fill;
 } moq_subscription_update_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original

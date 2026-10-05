@@ -418,6 +418,9 @@ typedef struct moq_profile_ops {
      */
     bool supports_joining_fetch;
 
+    /* Capability: true when a subscription can ask for a fill stream (draft 21 3.4). */
+    bool supports_fill;
+
     /*
      * Capability: true when several concurrent subscriptions to the same Track
      * are allowed on one session (draft 21 3.3: each is served independently and

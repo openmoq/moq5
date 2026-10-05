@@ -960,6 +960,25 @@ void moq_d21_profile_fetch_range_from_wire(const moq_d21_msg_params_t *p,
 
 /* SUBSCRIBE encode. Priority/forward/group-order/filter and authorization tokens
  * travel as Message Parameters. */
+/* A fill request rides FILL_PARAMETERS (9.20.16): its own Location Filter and timeout. */
+static void d21_apply_fill_request(moq_d21_msg_params_t *p, const moq_fill_request_t *f)
+{
+    if (!f->present) return;
+    p->has_fill = true;
+    if (f->has_location) {
+        p->fill.has_location_filter = true;
+        p->fill.location_filter.field_count = f->field_count;
+        p->fill.location_filter.start_group = f->start_group;
+        p->fill.location_filter.start_object = f->start_object;
+        p->fill.location_filter.end_group_delta = f->end_group_delta;
+        p->fill.location_filter.end_object = f->end_object;
+    }
+    if (f->has_timeout) {
+        p->fill.has_fill_timeout = true;
+        p->fill.fill_timeout_ms = f->timeout_ms;
+    }
+}
+
 static moq_result_t d21_encode_subscribe(
     moq_session_t *s, struct moq_buf_writer *w,
     const struct moq_subscribe_encode_args *args)
@@ -982,6 +1001,7 @@ static moq_result_t d21_encode_subscribe(
     }
     p.has_new_group_request = args->has_new_group_request;
     p.new_group_request = args->new_group_request;
+    d21_apply_fill_request(&p, &args->fill);
     return moq_d21_encode_subscribe(w, args->request_id,
                                     &args->track_namespace, args->track_name, &p);
 }
@@ -2185,6 +2205,7 @@ static moq_result_t d21_encode_request_update(
         p.has_location_filter = true;
         if (!emit) memset(&p.location_filter, 0, sizeof(p.location_filter));
     }
+    d21_apply_fill_request(&p, &args->fill);
     return moq_d21_encode_request_update(w, args->request_id, &p);
 }
 
@@ -3389,6 +3410,7 @@ static const moq_profile_ops_t d21_ops = {
     .uses_uni_control_channel = true,
     .publish_ok_carries_params = false,
     .supports_joining_fetch  = false,
+    .supports_fill = true,
     .allows_concurrent_subscriptions = true,
     .request_fin_is_not_cancel = true,
     .publish_done_subscription_ended = false,
