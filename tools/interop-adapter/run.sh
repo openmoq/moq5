@@ -69,11 +69,50 @@ printf 'moq5 adapter: scenario %s draft %s %s; media_send publishes placeholder 
     "$(jq -r '.scenario_id' "$request_file")" "$draft" "$transport" >&2
 
 timeout_seconds=$(((timeout_ms + 999) / 1000))
+
+# Run "$@", sending SIGINT after $1 seconds; status 124 when the deadline fired,
+# as timeout(1) reports it. macOS has no timeout(1) unless coreutils is installed
+# (timeout, or gtimeout without the g prefix), so fall back to a watchdog. The
+# background job starts with SIGINT ignored (no job control), which is fine for
+# media_send: it installs its own SIGINT handler.
+run_with_deadline() {
+    local seconds=$1 pid watchdog status
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout --signal=INT "$seconds" "$@"
+        return
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout --signal=INT "$seconds" "$@"
+        return
+    fi
+    "$@" &
+    pid=$!
+    # The watchdog's own sleep is killed with it, so no stray process holds the
+    # runner's pipes open after the publisher has exited.
+    (
+        trap 'kill "$nap" 2>/dev/null; exit 0' TERM
+        sleep "$seconds" & nap=$!
+        wait "$nap"
+        kill -INT "$pid" 2>/dev/null
+    ) >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid"
+    status=$?
+    if kill -0 "$watchdog" 2>/dev/null; then
+        kill -TERM "$watchdog" 2>/dev/null
+        wait "$watchdog"
+        return "$status"
+    fi
+    wait "$watchdog"
+    return 124
+}
+
 # SIGINT makes media_send stop writing, drain and exit cleanly. Reaching the
 # scenario timeout is the normal end of a context (the runner ends it too), so
-# the timeout's own status 124 is not a failure.
+# the deadline's status 124 is not a failure.
 set +e
-timeout --signal=INT "$timeout_seconds" "$publisher_bin" "$endpoint" "$namespace" "$track" \
+run_with_deadline "$timeout_seconds" "$publisher_bin" "$endpoint" "$namespace" "$track" \
     --draft "$draft" --ca "$ca_cert" --peer-close-ok
 status=$?
 set -e
