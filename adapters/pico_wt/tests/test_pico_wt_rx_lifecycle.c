@@ -313,7 +313,7 @@ static uint32_t drain_and_pump(fixture_t *f, int rounds, uint32_t *out_order_ok,
 /*
  * Pre-READY owed grant.
  *
- * picoquic_open_flow_control() silently no-ops unless the connection is exactly
+ * picoquic_open_flow_control() rejects grants unless the connection is exactly
  * READY (picoquic/picoquic/sender.c). A grant attempted earlier must therefore
  * be treated as OWED -- `granted` must not advance, or the window would be
  * recorded as raised while no frame was ever emitted, and the peer would stall
@@ -351,7 +351,7 @@ static void test_pre_ready_grant_is_owed(void)
     size_t saved_count = c->rx_count, saved_cap = c->rx_cap;
     c->rx = &probe; c->rx_count = 1; c->rx_cap = 1;
 
-    /* NOT READY: picoquic_open_flow_control() silently emits nothing unless the
+    /* NOT READY: picoquic_open_flow_control() rejects the grant unless the
      * connection is exactly READY, so the grant must be left OWED. Recording it
      * as issued would strand the peer behind a window that was never raised. */
     picoquic_state_enum saved_state = cnx->cnx_state;
@@ -462,14 +462,35 @@ static void test_reset_while_paused(void)
     CHECK(rx_entry(&f, f.sid) == NULL);
     CHECK(g_acct.live == live_before - 1);   /* the retention buffer went */
 
-    /* CAUSAL: the reset must reach the bridge/session, not merely clear the
-     * adapter's storage. Before the reset this stream carried retained bridge
-     * work; delivering the reset retires it there, so the bridge no longer
-     * holds pending work for it. Dropping only
-     * moq_transport_bridge_on_peer_stream_reset() -- while the adapter still
-     * frees its buffers -- leaves that pending work behind and fails here. */
+    /* The full event queue can defer the reset terminal. Drain and service
+     * until it is delivered, preserving any complete object already retained
+     * by the session before the reset. The adapter's abandoned bytes must not
+     * be replayed. Observing exactly one terminal makes this causal: dropping
+     * the bridge reset call cannot satisfy the assertion by merely freeing
+     * the adapter's storage or clearing an unrelated pending retry. */
+    uint32_t resets = 0;
+    uint64_t next_object = 0;
+    for (int i = 0; i < 20; i++) {
+        moq_event_t ev;
+        while (moq_session_poll_events(f.h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                CHECK(resets == 0);
+                CHECK(ev.u.object_received.object_id == next_object++);
+            } else if (ev.kind == MOQ_EVENT_SUBGROUP_RESET) {
+                resets++;
+                CHECK(ev.u.subgroup_reset.group_id == 0);
+                CHECK(ev.u.subgroup_reset.subgroup_id == 0);
+                CHECK(ev.u.subgroup_reset.error_code == 0);
+            }
+            moq_event_cleanup(&ev);
+        }
+        moq_pico_wt_service(f.h.client_conn, f.h.now);
+    }
+    CHECK(resets == 1);
+    CHECK(next_object > 0 && next_object < f.published);
     CHECK(!moq_transport_bridge_stream_has_pending(f.h.client_conn->bridge,
                                                    f.sid));
+    CHECK(rx_entry(&f, f.sid) == NULL);
     CHECK(!moq_pico_wt_conn_is_fatal(f.h.client_conn));
 
     /* No later grant for a reset stream. */
@@ -720,6 +741,10 @@ static void test_teardown_while_paused(void)
                                f.h.client_conn);
 
     CHECK(f.h.client_conn->cnx == NULL);
+    h3zero_stream_prefix_t *prefix = h3zero_find_stream_prefix(
+        f.h.client_h3_ctx, f.h.client_conn->control_stream_id);
+    CHECK(prefix == NULL ||
+          (prefix->function_call == NULL && prefix->function_ctx == NULL));
     CHECK(g_acct.live == 0);         /* released exactly once, at deregister */
     CHECK(g_acct.bytes_live == 0);
     CHECK(g_acct.allocs == g_acct.frees);
@@ -732,17 +757,11 @@ static void test_teardown_while_paused(void)
 }
 
 /*
- * Upstream interaction: picoquic_set_max_data_control() is a QUIC-CONTEXT-wide
- * switch, and while it is set picoquic_open_flow_control() returns SUCCESS
- * while emitting nothing (the guard on quic->max_data_limit == 0 in
- * picoquic/picoquic/sender.c). picoquic exposes no getter for max_data_limit,
- * so the adapter cannot detect this and promises no runtime detection -- a
- * nonzero max_data_control is documented invalid caller configuration.
- *
- * This proves the exclusion at its source rather than asserting an adapter
- * behaviour that cannot exist.
+ * Explicit context-wide MAX_DATA control leaves per-stream application flow
+ * control usable. open_flow_control still grants MAX_STREAM_DATA, but does
+ * not increase connection MAX_DATA: picoquic manages that window separately.
  */
-static void test_max_data_control_excludes_open_flow_control(void)
+static void test_max_data_control_preserves_stream_flow_control(void)
 {
     pico_wt_harness_t h;
     pico_wt_harness_cfg_t cfg = { .cid_byte = 0x36, .request_capacity = 10 };
@@ -767,12 +786,14 @@ static void test_max_data_control_excludes_open_flow_control(void)
     CHECK(picoquic_open_flow_control(cnx, sid, 100000) == 0);
     CHECK(st->maxdata_local > before);
 
-    /* With the QUIC-wide switch ON the same call succeeds and does nothing. */
+    /* With explicit MAX_DATA control, only the stream window advances. */
     picoquic_set_max_data_control(h.test_ctx->qclient, 1000000);
     uint64_t held = st->maxdata_local;
+    uint64_t connection_held = cnx->maxdata_local;
     int rc = picoquic_open_flow_control(cnx, sid, held + 500000);
-    CHECK(rc == 0);                       /* SUCCESS ... */
-    CHECK(st->maxdata_local == held);     /* ... and no grant was emitted */
+    CHECK(rc == 0);
+    CHECK(st->maxdata_local > held);
+    CHECK(cnx->maxdata_local == connection_held);
 
     picoquic_set_max_data_control(h.test_ctx->qclient, 0);
     pico_wt_harness_cleanup(&h);
@@ -1073,7 +1094,7 @@ int main(void)
     test_direct_control_fin_does_not_sweep();
     test_control_fin_dispatch_error_is_fatal();
     test_local_stop_sending_drops_receive_state();
-    test_max_data_control_excludes_open_flow_control();
+    test_max_data_control_preserves_stream_flow_control();
 
     if (g_failures) {
         fprintf(stderr, "FAILED: test_pico_wt_rx_lifecycle (%d)\n", g_failures);

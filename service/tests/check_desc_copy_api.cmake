@@ -45,7 +45,10 @@ endforeach()
 #           warning present, other rc)
 function(compile_probe name source out_kind out_text)
     file(WRITE "${WORK}/${name}.c" "${source}")
-    execute_process(COMMAND "${CC}" ${_cflags} ${_incs} "${WORK}/${name}.c"
+    # The named-error classifier below uses English diagnostics and ASCII
+    # quotes; GCC uses locale-dependent quotes even in English UTF-8 locales.
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env LC_ALL=C
+                            "${CC}" ${_cflags} ${_incs} "${WORK}/${name}.c"
                     RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
     set(text "${out}${err}")
     set(${out_text} "${text}" PARENT_SCOPE)

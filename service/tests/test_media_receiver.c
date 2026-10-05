@@ -44,6 +44,8 @@ typedef struct {
     atomic_bool      media_subscribed; /* latched when the media track ever
                                           has a subscriber server-side */
     atomic_bool      catalog_subscribed; /* same latch for the catalog track */
+    atomic_bool      media_paused;    /* peer's acknowledged Forward=0 */
+    atomic_int       media_forward_updates;
     int              published;
     /* Deliberately malformed normal media objects for the class-MEDIA parse
      * path. The current fixture uses garbage CMAF fragment payloads, not object
@@ -534,6 +536,10 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
 {
     if (!moq_pub_has_subscriber(st->pub, st->media_track)) return true;
     atomic_store(&st->media_subscribed, true);
+    /* Writes with Forward=0 still succeed and advance Largest, but are not
+     * delivered. Preserve this fixture's fixed object target until the peer
+     * has resumed, rather than consuming it during the resume round trip. */
+    if (atomic_load(&st->media_paused)) return true;
     int target = atomic_load(&st->publish_target);
     while (st->published < target) {
         int i = st->published;
@@ -569,8 +575,7 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
         moq_rcbuf_decref(payload);
         if (props) moq_rcbuf_decref(props);
         if (wrc == MOQ_ERR_WOULD_BLOCK) return true;   /* retry next pump */
-        /* WRONG_STATE = the subscriber paused us (forward=0): the session
-         * refuses subgroup writes until forward is restored. Retry. */
+        /* A pending track operation can require retry on a later pump. */
         if (wrc == MOQ_ERR_WRONG_STATE) return true;
         if (wrc != MOQ_OK) return false;
         st->published++;
@@ -610,6 +615,16 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
 
 static srv_state_t g_srv;
 
+static void server_subscriber_updated(void *ctx, moq_pub_track_t *track,
+                                     const moq_pub_subscribe_update_info_t *info)
+{
+    srv_state_t *st = (srv_state_t *)ctx;
+    if (track == st->media_track && info->has_forward) {
+        atomic_store(&st->media_paused, !info->forward);
+        atomic_fetch_add(&st->media_forward_updates, 1);
+    }
+}
+
 static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now_us, void *ctx)
 {
@@ -622,6 +637,8 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+        pcfg.callbacks.ctx = st;
+        pcfg.callbacks.on_subscriber_updated = server_subscriber_updated;
         if (moq_pub_create(session, moq_alloc_default(), &pcfg,
                            &st->pub) != MOQ_OK) {
             st->failed = true;
@@ -1796,6 +1813,12 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(st.pause_transitions >= 1);
         MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
 
+        /* Require the pause to reach the publisher before draining; local
+         * queue state alone does not prove that the forwarding update worked. */
+        for (int i = 0; i < 100 && !atomic_load(&g_srv.media_paused); i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(atomic_load(&g_srv.media_paused));
+
         /* Drain everything: the receiver resumes below the low-water mark
          * and new objects flow again. */
         int got = 0;
@@ -1819,6 +1842,10 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(resumed);
 
         atomic_store(&g_srv.publish_target, 9);
+        /* wait() also wakes for queued track events, so a bounded object-only
+         * poll loop can exhaust its iterations before the network runs. Wait
+         * for the receive counter before draining this fixed second batch. */
+        MOQ_TEST_CHECK(wait_received(r, 9, 200));
         got = 0;
         for (int w = 0; w < 200 && got < 3; w++) {
             if (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
@@ -1831,6 +1858,8 @@ int main(int argc, char **argv)
             }
         }
         MOQ_TEST_CHECK_EQ_INT(got, 3);
+        MOQ_TEST_CHECK(!atomic_load(&g_srv.media_paused));
+        MOQ_TEST_CHECK(atomic_load(&g_srv.media_forward_updates) >= 2);
         (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
         MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
 

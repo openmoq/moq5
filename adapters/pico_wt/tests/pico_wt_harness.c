@@ -256,6 +256,13 @@ void pico_wt_harness_cleanup(pico_wt_harness_t *h)
                              h->client_session = NULL; }
     if (h->server_session) { moq_session_destroy(h->server_session);
                              h->server_session = NULL; }
+    /* The client H3 callback retains its context on connection close; its
+     * creator owns deletion. picoquic_free alone does not release it. */
+    if (h->client_h3_ctx) {
+        h3zero_callback_delete_context(
+            h->test_ctx ? h->test_ctx->cnx_client : NULL, h->client_h3_ctx);
+        h->client_h3_ctx = NULL;
+    }
     if (h->test_ctx) { tls_api_delete_ctx(h->test_ctx);
                        h->test_ctx = NULL; }
 }

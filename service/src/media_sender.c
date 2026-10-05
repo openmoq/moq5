@@ -358,6 +358,9 @@ struct moq_media_sender {
                                                    to WOULD_BLOCK once, AFTER the
                                                    live writes -- models
                                                    retained-install backpressure */
+    bool              test_block_finish_once;
+    void (*test_conversion_event)(void *ctx, moq_media_track_t *finished);
+    void             *test_conversion_ctx;
 #endif
 
     sender_preq_entry_t *preq;            /* ring; entries own their refs */
@@ -2248,6 +2251,10 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
                 pthread_mutex_unlock(&s->mu);
                 return;
             }
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            if (s->test_conversion_event)
+                s->test_conversion_event(s->test_conversion_ctx, NULL);
+#endif
             s->pending_obj_cursor++;
         }
     } else {
@@ -2349,9 +2356,20 @@ static bool sender_finish_conversions(moq_media_sender_t *s, uint64_t now_us)
             pthread_mutex_unlock(&s->mu);
             continue;
         }
-        moq_result_t fr = moq_pub_finish_subscribers(
+        moq_result_t fr;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        if (s->test_block_finish_once) {
+            s->test_block_finish_once = false;
+            fr = MOQ_ERR_WOULD_BLOCK;
+        } else
+#endif
+        fr = moq_pub_finish_subscribers(
             s->pub, t->pub_track, MOQ_PUB_DONE_TRACK_ENDED, now_us);
         if (fr == MOQ_OK) {
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            if (s->test_conversion_event)
+                s->test_conversion_event(s->test_conversion_ctx, t);
+#endif
             pthread_mutex_lock(&s->mu);
             t->vod_finish_pending = false;
             pthread_mutex_unlock(&s->mu);
@@ -5425,6 +5443,17 @@ void moq_media_sender_test_block_retained_install_once(moq_media_sender_t *s)
     pthread_mutex_lock(&s->mu);
     s->test_block_retained_once = true;
     pthread_mutex_unlock(&s->mu);
+}
+
+/* Observe local emission order (finished track, then NULL for a catalog write)
+ * and optionally model one retryable finish. Driven only by the test thread. */
+void moq_media_sender_test_observe_conversion(
+    moq_media_sender_t *s, bool block_once,
+    void (*event)(void *, moq_media_track_t *), void *ctx)
+{
+    s->test_block_finish_once = block_once;
+    s->test_conversion_event = event;
+    s->test_conversion_ctx = ctx;
 }
 
 /* Whether the armed fault fired; on true, returns the snapshot: the cursor

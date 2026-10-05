@@ -44,6 +44,10 @@ void     moq_media_sender_test_set_catalog_group(moq_media_sender_t *s,
 uint64_t moq_media_sender_test_next_deadline_us(moq_media_sender_t *s);
 void     moq_media_sender_test_fire_closed(moq_media_sender_t *s, bool is_fatal,
                                            uint64_t fatal_code);
+void moq_media_sender_test_observe_conversion(
+    moq_media_sender_t *s, bool block_once,
+    void (*event)(void *, moq_media_track_t *), void *ctx);
+bool moq_media_sender_test_conversion_finish_pending(const moq_media_sender_t *s);
 
 /* -- media_receiver test seams (media_receiver.c) -------------------------- */
 moq_media_receiver_t *moq_media_receiver_test_new(bool auto_subscribe);
@@ -182,7 +186,7 @@ static void test_cfg_poisoned_tail(void)
  *  Behavioral (SimPair peer + PRODUCTION hook)
  * ======================================================================== */
 
-typedef struct { int ready_n; } scb_t;
+typedef struct { int ready_n; moq_media_track_t *video; } scb_t;
 static void on_ready(void *ctx, moq_media_sender_t *s)
 { (void)s; ((scb_t *)ctx)->ready_n++; }
 
@@ -241,7 +245,7 @@ static moq_media_sender_t *ready_publish_sender(
     cfg.callbacks.ctx = cb;
     cfg.callbacks.on_ready = on_ready;
     moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
-    (void)add_video(s);
+    cb->video = add_video(s);
 
     for (int cycle = 0; cycle < 12 && !cb->ready_n; cycle++) {
         moq_media_sender_test_pump(s, cl, now);
@@ -280,6 +284,60 @@ static void pump(moq_media_sender_t *s, moq_simpair_t *sp, uint64_t now)
 {
     moq_media_sender_test_pump(s, moq_simpair_client(sp), now);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
+}
+
+typedef struct {
+    moq_media_track_t *events[8];
+    size_t count;
+} conversion_events_t;
+
+static void conversion_event(void *ctx, moq_media_track_t *finished)
+{
+    conversion_events_t *events = ctx;
+    if (events->count < 8) events->events[events->count] = finished;
+    events->count++;
+}
+
+/* Verify send-side ordering through the production pump; receive order across
+ * QUIC streams cannot establish this invariant. A retryable finish must leave
+ * the catalog generation untouched until the next successful finish. */
+static void test_conversion_emission_order(moq_version_t ver)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_t *sp = pair(&alloc, ver);
+    uint64_t now = moq_simpair_now_us(sp);
+    scb_t cb = {0};
+    moq_media_sender_t *s = ready_publish_sender(sp, &cb, now, true, 0);
+    MOQ_TEST_CHECK(moq_media_sender_is_ready(s));
+    MOQ_TEST_CHECK(cb.video != NULL);
+    unsigned installs = moq_media_sender_test_retained_installs(s);
+    conversion_events_t events = {0};
+    moq_media_sender_test_observe_conversion(s, true, conversion_event, &events);
+    moq_media_vod_track_t item = { cb.video, 5000 };
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_convert_to_vod(s, &item, 1),
+                          (int)MOQ_OK);
+    pump(s, sp, now);
+    MOQ_TEST_CHECK(moq_media_sender_test_conversion_finish_pending(s));
+    MOQ_TEST_CHECK_EQ_U64(events.count, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_retained_installs(s), installs);
+
+    pump(s, sp, now);
+    MOQ_TEST_CHECK(!moq_media_sender_test_conversion_finish_pending(s));
+    MOQ_TEST_CHECK_EQ_U64(events.count, 2);
+    MOQ_TEST_CHECK(events.events[0] == cb.video);
+    MOQ_TEST_CHECK(events.events[1] == NULL);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_retained_installs(s), installs + 1);
+    pump(s, sp, now);
+    MOQ_TEST_CHECK_EQ_U64(events.count, 2); /* no duplicate finish or catalog */
+    moq_media_sender_test_free(s);
+    drain_pair(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_18 ?
+        "conversion_emission_order_d18" : "conversion_emission_order_d16");
 }
 
 /* Build a pull-mode sender (ready) with an established persistent catalog
@@ -1083,6 +1141,7 @@ int main(void)
     test_receiver_late_bootstrap();
     for (int vi = 0; vi < 2; vi++) {
         moq_version_t ver = vi ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
+        test_conversion_emission_order(ver);
         test_refresh_publish_demand(ver);
         test_refresh_pull_demand(ver);
         test_refresh_no_demand(ver);

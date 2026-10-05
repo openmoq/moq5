@@ -873,6 +873,25 @@ endif()\n")
         # the ADAPTER (so adapter teardown can clear it) and must be CLEARED
         # after detach. Recompiles the managed + adapter sources to reach the
         # private MOQ_PICO_WT_TESTING seam; nothing is exported.
+        add_executable(test_pico_wt_preaccept
+            tests/test_pico_wt_preaccept.c
+            tests/pico_wt_harness.c
+            pico_wt_managed.c)
+        target_compile_definitions(test_pico_wt_preaccept PRIVATE
+            MOQ_PICO_WT_TESTING
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        target_include_directories(test_pico_wt_preaccept PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_pico_wt_preaccept PRIVATE
+            moq::adapter-pico-wt-managed picoquic-test)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_preaccept PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>
+                -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_preaccept COMMAND test_pico_wt_preaccept)
+        set_tests_properties(pico_wt_preaccept PROPERTIES TIMEOUT 30)
+
         add_executable(test_pico_wt_ownership
             tests/test_pico_wt_ownership.c
             pico_wt_managed.c
