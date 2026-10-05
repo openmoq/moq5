@@ -3411,6 +3411,7 @@ static const moq_profile_ops_t d21_ops = {
     .publish_ok_carries_params = false,
     .supports_joining_fetch  = false,
     .supports_fill = true,
+    .subgroup_timer_at_fin = true,
     .allows_concurrent_subscriptions = true,
     .request_fin_is_not_cancel = true,
     .publish_done_subscription_ended = false,

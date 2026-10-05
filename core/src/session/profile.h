@@ -422,6 +422,15 @@ typedef struct moq_profile_ops {
     bool supports_fill;
 
     /*
+     * Capability: draft 21 delivery-timeout timing (5.2). The SUBGROUP timeout starts when
+     * the subgroup's last object is published (its FIN) and is checked until the transport
+     * has committed all data, and the first object's SUBGROUP_DELIVERY_TIMEOUT property
+     * overrides the Track-level value for that subgroup. Earlier drafts arm the timer when
+     * the subgroup opens and never time out a closing stream.
+     */
+    bool subgroup_timer_at_fin;
+
+    /*
      * Capability: true when several concurrent subscriptions to the same Track
      * are allowed on one session (draft 21 3.3: each is served independently and
      * an object matching more than one is sent once per subscription). Drafts 16

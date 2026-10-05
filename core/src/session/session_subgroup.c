@@ -327,7 +327,9 @@ moq_result_t moq_session_open_subgroup(
             dte->dt_pub_has_subgroup, dte->dt_pub_subgroup_ms,
             dte->dt_sub_has_subgroup, dte->dt_sub_subgroup_ms);
         uint64_t sg_us = ms_to_us_sat(sg_ms);
-        if (sg_us > 0) {
+        if (s->profile->subgroup_timer_at_fin) {
+            entry->delivery_deadline_us = UINT64_MAX;   /* armed at the FIN instead */
+        } else if (sg_us > 0) {
             entry->delivery_deadline_us = deadline_add(now_us, sg_us);
             if (entry->delivery_deadline_us < s->subgroup_deadline_us)
                 s->subgroup_deadline_us = entry->delivery_deadline_us;
@@ -490,6 +492,21 @@ void moq_object_cfg_init(moq_object_cfg_t *cfg)
     cfg->struct_size = sizeof(*cfg);
 }
 
+/* Draft 21 5.2: the first object of a subgroup may carry its own SUBGROUP_DELIVERY_TIMEOUT,
+ * overriding the Track value for this subgroup; on any later object it is ignored. */
+static void sg_note_first_object_timeouts(moq_session_t *s, moq_sg_entry_t *entry,
+                                          const uint8_t *props, size_t props_len)
+{
+    if (!s->profile->subgroup_timer_at_fin || entry->has_prev_object || props_len == 0)
+        return;
+    moq_dt_scan_t sc;
+    if (session_scan_dt_props(s, props, props_len, false, &sc) < 0) return;
+    if (sc.has_subgroup) {
+        entry->ovr_has_subgroup_timeout = true;
+        entry->ovr_subgroup_timeout_ms = sc.subgroup_ms;
+    }
+}
+
 moq_result_t moq_session_write_object_ex(
     moq_session_t *s, moq_subgroup_handle_t subgroup,
     const moq_object_cfg_t *cfg, uint64_t now_us)
@@ -529,6 +546,8 @@ moq_result_t moq_session_write_object_ex(
             s, moq_rcbuf_data(cfg->properties), props_len) < 0)
         return MOQ_ERR_INVAL;
 
+    if (props_len > 0)
+        sg_note_first_object_timeouts(s, entry, moq_rcbuf_data(cfg->properties), props_len);
     bool has_props = (props_len > 0);
     size_t slots_needed = has_props ? 2 : 1;
     if (action_queue_avail(s) < slots_needed) return MOQ_ERR_WOULD_BLOCK;
@@ -659,7 +678,25 @@ moq_result_t moq_session_close_subgroup(
     if (rc < 0) return rc;
 
     s->subgroups[slot].state = MOQ_SG_CLOSING;
-    if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
+    if (s->profile->subgroup_timer_at_fin) {
+        /* The subgroup is fully published: its timer starts now (5.2). The effective value
+         * is the smaller non-zero of the publisher's (first object's property, else the
+         * Track Property) and the subscriber's. It runs until the stream is released. */
+        moq_sg_entry_t *sg = &s->subgroups[slot];
+        int ss = sub_resolve_handle(s, sg->sub);
+        uint64_t ms = 0;
+        if (ss >= 0) {
+            const moq_sub_entry_t *dte = &s->subs[ss];
+            bool ph = sg->ovr_has_subgroup_timeout || dte->dt_pub_has_subgroup;
+            uint64_t pm = sg->ovr_has_subgroup_timeout ? sg->ovr_subgroup_timeout_ms
+                                                       : dte->dt_pub_subgroup_ms;
+            ms = dt_negotiate_ms(ph, pm, dte->dt_sub_has_subgroup, dte->dt_sub_subgroup_ms);
+        }
+        uint64_t us = ms_to_us_sat(ms);
+        sg->delivery_deadline_us = us > 0 ? deadline_add(s->last_now_us, us) : UINT64_MAX;
+        if (sg->delivery_deadline_us < s->subgroup_deadline_us)
+            s->subgroup_deadline_us = sg->delivery_deadline_us;
+    } else if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
         s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
         sg_recompute_deadline(s);
     }
@@ -813,6 +850,8 @@ moq_result_t moq_session_begin_object_ex(
             s, moq_rcbuf_data(cfg->properties), props_len) < 0)
         return MOQ_ERR_INVAL;
 
+    if (props_len > 0)
+        sg_note_first_object_timeouts(s, entry, moq_rcbuf_data(cfg->properties), props_len);
     bool has_props = (props_len > 0);
     size_t slots_needed = has_props ? 2 : 1;
     if (action_queue_avail(s) < slots_needed) return MOQ_ERR_WOULD_BLOCK;

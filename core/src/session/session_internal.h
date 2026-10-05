@@ -996,6 +996,8 @@ typedef struct moq_sg_entry {
     uint64_t               streaming_bytes_written;
     uint64_t               delivery_deadline_us;
     bool                   has_extensions;
+    bool                   ovr_has_subgroup_timeout;   /* first object's property override */
+    uint64_t               ovr_subgroup_timeout_ms;
     /*
      * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
      * is allocated (state != FREE / active). Every sweep that used to scan the

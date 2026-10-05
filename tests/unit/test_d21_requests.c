@@ -1910,6 +1910,85 @@ static void t_fill_end_to_end(void)
     moq_session_destroy(s18);
 }
 
+/* -- Delivery timeout timing (6.8, draft 21 5.2) ------------------------------ *
+ * The SUBGROUP timeout starts when the subgroup's last object is published (its FIN), the first
+ * object's own property overrides the Track value, and an expired closing stream is reset. */
+static int delivery_timer_case(bool override, uint64_t open_now, uint64_t probe_after_us)
+{
+    moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
+    moq_bytes_t parts[1];
+    moq_namespace_t ns = ns_live(parts);
+    moq_d21_msg_params_t p;
+    memset(&p, 0, sizeof(p));
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_d21_encode_subscribe(&w, 0, &ns, lit("dt"), &p);
+    feed_request(s, 4, msg, moq_buf_writer_offset(&w));
+    moq_event_t ev;
+    int resets = 0;
+    if (!next_event(s, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev)) { moq_session_destroy(s); return -1; }
+    moq_subscription_t sub = ev.u.subscribe_request.sub;
+    moq_event_cleanup(&ev);
+    static const uint8_t track_props[] = { 0x06, 0x32 };       /* SUBGROUP_DELIVERY_TIMEOUT = 50 ms */
+    moq_accept_subscribe_cfg_t acc;
+    memset(&acc, 0, sizeof(acc));
+    acc.struct_size = sizeof(acc);
+    acc.track_properties = (moq_bytes_t){ track_props, sizeof(track_props) };
+    moq_session_accept_subscribe(s, sub, &acc, open_now);
+    { moq_action_t a; while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a); }
+
+    moq_subgroup_cfg_t sg;
+    moq_subgroup_cfg_init(&sg);
+    sg.group_id = 1; sg.subgroup_id = 0; sg.object_properties = override;
+    moq_subgroup_handle_t h;
+    if (moq_session_open_subgroup(s, sub, &sg, open_now, &h) < 0) { moq_session_destroy(s); return -1; }
+    moq_rcbuf_t *pl = NULL, *pr = NULL;
+    uint8_t d[1] = { 1 };
+    moq_rcbuf_create(moq_alloc_default(), d, 1, &pl);
+    moq_object_cfg_t oc;
+    moq_object_cfg_init(&oc);
+    oc.object_id = 0; oc.payload = pl;
+    if (override) {
+        static const uint8_t ovr[] = { 0x06, 0x14 };           /* this subgroup: 20 ms */
+        moq_rcbuf_create(moq_alloc_default(), ovr, sizeof(ovr), &pr);
+        oc.properties = pr;
+    }
+    moq_session_write_object_ex(s, h, &oc, open_now);
+    moq_rcbuf_decref(pl);
+    if (pr) moq_rcbuf_decref(pr);
+    /* Published long before the FIN: the timer must not have started. */
+    uint64_t fin_at = open_now + 1000000;                      /* 1 s later */
+    moq_session_tick(s, open_now + 500000);
+    {
+        moq_action_t early;
+        while (moq_session_poll_actions(s, &early, 1) > 0) {
+            if (early.kind == MOQ_ACTION_RESET_DATA) resets += 100;
+            moq_action_cleanup(&early);
+        }
+    }
+    moq_session_close_subgroup(s, h, fin_at);
+    moq_session_tick(s, fin_at + probe_after_us);
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) {
+        if (a.kind == MOQ_ACTION_RESET_DATA && a.u.reset_data.error_code == MOQ_RESET_DELIVERY_TIMEOUT)
+            resets++;
+        moq_action_cleanup(&a);
+    }
+    moq_session_destroy(s);
+    return resets;
+}
+
+static void t_delivery_timer_at_fin(void)
+{
+    /* Track value 50 ms, counted from the FIN a second after the stream opened. */
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, 100000, 30000), 0);     /* inside it */
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, 100000, 60000), 1);     /* past it: reset */
+    /* The first object's property (20 ms) overrides the Track value. */
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(true, 100000, 15000), 0);
+    MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(true, 100000, 30000), 1);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -1940,6 +2019,7 @@ int main(void)
     t_publish_initial_params();
     t_send_state_notify();
     t_fill_end_to_end();
+    t_delivery_timer_at_fin();
     t_update_credit();
     t_accept_publish_followup_update();
     if (failures) {

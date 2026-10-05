@@ -1493,7 +1493,9 @@ static moq_result_t handle_tick(moq_session_t *s)
             if (sg->state == MOQ_SG_FREE) continue;
             if (sg->delivery_deadline_us == UINT64_MAX) continue;
             if (s->last_now_us < sg->delivery_deadline_us) continue;
-            if (sg->state == MOQ_SG_CLOSING ||
+            /* A closing stream's timer (draft 21: armed at the FIN) still resets it; the
+             * reset is a no-op if the transport already committed the data. */
+            if ((sg->state == MOQ_SG_CLOSING && !s->profile->subgroup_timer_at_fin) ||
                 sg->state == MOQ_SG_RESETTING) {
                 sg->delivery_deadline_us = UINT64_MAX;
                 continue;
