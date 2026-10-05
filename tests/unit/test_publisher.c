@@ -11750,6 +11750,56 @@ static void d21_ns_sub_case(const char *prefix_str, bool expect_ok)
 
 static void test_d21_first_object_bit(void) { test_first_object_bit(MOQ_VERSION_DRAFT_21); }
 
+/* -- Draft 21: the end Object of a four-field Location Filter is enforced --- *
+ * Injected raw (the client API has no end Object): start {2,0}, End Group 2, End Object 3
+ * (inclusive). Only objects {2,0..3} are sent; {2,4} and group 3 are not. */
+static void test_d21_filter_end_object(void)
+{
+    test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+    moq_publisher_t *pub; moq_pub_track_t *track;
+    windows_setup(&as, &alloc, &sp, MOQ_VERSION_DRAFT_21, &pub, &track);
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_namespace_t ns = { parts, 1 };
+    moq_d21_msg_params_t prm;
+    memset(&prm, 0, sizeof(prm));
+    prm.has_location_filter = true;
+    prm.location_filter.field_count = 4;
+    prm.location_filter.start_group = 2; prm.location_filter.start_object = 0;
+    prm.location_filter.end_group_delta = 0; prm.location_filter.end_object = 3;
+    uint8_t msg[96];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    MOQ_TEST_CHECK(moq_d21_encode_subscribe(&w, 0, &ns, MOQ_BYTES_LITERAL("video"), &prm) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(sv, moq_stream_ref_from_u64(4), msg,
+        moq_buf_writer_offset(&w), false, moq_simpair_now_us(sp)) >= 0);
+    manual_forward(pub, sv, moq_simpair_now_us(sp), 0, NULL, NULL);
+    { moq_action_t a; while (moq_session_poll_actions(sv, &a, 1) == 1) moq_action_cleanup(&a); }
+
+    static const struct { uint64_t g, o; int want; } probes[] = {
+        { 2, 0, 1 }, { 2, 3, 1 }, { 2, 4, 0 }, { 3, 0, 0 } };
+    for (size_t i = 0; i < 4; i++) {
+        uint8_t d[2] = { (uint8_t)(0x70 + i), 0 };
+        moq_rcbuf_t *p = NULL; moq_rcbuf_create(&alloc, d, sizeof(d), &p);
+        moq_pub_object_cfg_t oc; moq_pub_object_cfg_init(&oc);
+        oc.group_id = probes[i].g; oc.object_id = probes[i].o; oc.payload = p; oc.datagram = true;
+        MOQ_TEST_CHECK(moq_pub_write_object_ex(pub, track, &oc, moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_rcbuf_decref(p);
+        int sent = 0;
+        moq_action_t a;
+        while (moq_session_poll_actions(sv, &a, 1) == 1) {
+            if (a.kind == MOQ_ACTION_SEND_DATAGRAM) sent++;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK_EQ_INT(sent, probes[i].want);
+    }
+    moq_pub_destroy(pub);
+    drain_all(sp);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("d21_filter_end_object");
+}
+
 /* Excluded end_track under WOULD_BLOCK pressure: the close (FIN) is queued
  * BEFORE the done, both complete across retries, the slot clears only after
  * success, and the track is terminal only after the final success. Server
@@ -15090,6 +15140,7 @@ int main(void) {
     test_window_publication_and_coexist(MOQ_VERSION_DRAFT_18, false);
     test_d21_concurrent_subscriptions();
     test_d21_no_subscription_ended();
+    test_d21_filter_end_object();
     test_d21_first_object_bit();
     test_first_object_bit(MOQ_VERSION_DRAFT_18);
     d21_ns_sub_case("live", true);
