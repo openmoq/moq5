@@ -185,7 +185,7 @@ static void sim_pump(pq_sim_t *s, uint64_t ms)
 static int sim_handshake(pq_sim_t *s)
 {
     if (moq_session_start(s->client_session, s->now) < 0) return -1;
-    if (s->version == MOQ_VERSION_DRAFT_18 &&
+    if ((s->version == MOQ_VERSION_DRAFT_18 || s->version == MOQ_VERSION_DRAFT_21) &&
         moq_session_start(s->server_session, s->now) < 0) return -1;
 
     int cd = 0, sd = 0;
@@ -471,7 +471,8 @@ static void run_datagram_gate(uint8_t cid_byte)
 
 static void run_version(uint8_t cid_byte, moq_version_t version)
 {
-    scenario = (version == MOQ_VERSION_DRAFT_18) ? "d18" : "d16";
+    scenario = (version == MOQ_VERSION_DRAFT_21) ? "d21"
+             : (version == MOQ_VERSION_DRAFT_18) ? "d18" : "d16";
     pq_sim_t s;
     CHECK(sim_setup(&s, cid_byte, version, 0) == 0);
     if (s.test_ctx && s.client_conn && s.server_conn) {
@@ -493,6 +494,9 @@ int main(void)
     /* B + C. draft-18: symmetric uni-control establish + request-bidi
      * stream-0 routing + subgroup data delivery. */
     run_version(0x18, MOQ_VERSION_DRAFT_18);
+
+    /* draft-21: the same symmetric start, with draft-21 request streams. */
+    run_version(0x21, MOQ_VERSION_DRAFT_21);
 
     /* D. object datagram over real picoquic with QUIC DATAGRAM negotiated:
      * the peer receives it as a datagram. */

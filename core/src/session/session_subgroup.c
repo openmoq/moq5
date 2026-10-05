@@ -153,6 +153,14 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
             continue;                      /* costs nothing; never suspends */
         }
+        /* Draft 21: a closed subgroup whose delivery timer is armed stays until the timer
+         * resets it (5.2); reaping it now would forget the timer. */
+        if (s->subgroups[i].state == MOQ_SG_CLOSING &&
+            s->profile->subgroup_timer_at_fin &&
+            s->subgroups[i].delivery_deadline_us != UINT64_MAX) {
+            s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
+            continue;
+        }
         if (budget) {
             if (*budget == 0) return false;
             (*budget)--;

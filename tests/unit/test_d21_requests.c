@@ -1968,6 +1968,13 @@ static int delivery_timer_case(bool override, uint64_t open_now, uint64_t probe_
         }
     }
     moq_session_close_subgroup(s, h, fin_at);
+    /* The transport takes the FIN; housekeeping afterwards must not forget the timer. */
+    {
+        moq_action_t fa;
+        while (moq_session_poll_actions(s, &fa, 1) > 0) moq_action_cleanup(&fa);
+    }
+    moq_session_tick(s, fin_at + 1000);
+    moq_session_tick(s, fin_at + 2000);
     moq_session_tick(s, fin_at + probe_after_us);
     moq_action_t a;
     while (moq_session_poll_actions(s, &a, 1) > 0) {
