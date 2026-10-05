@@ -30,7 +30,7 @@ struct MediaOnlyConsumerTests {
         // Usable as a generic constraint witness and across a function
         // boundary without any conversion.
         #expect(roundTrip(.draft18) == .draft18)
-        #expect(Set(MediaTransportVersion.allCases).count == 2)
+        #expect(Set(MediaTransportVersion.allCases).count == 3)
     }
 
     private func roundTrip(_ v: MediaTransportVersion) -> MediaTransportVersion {

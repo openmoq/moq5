@@ -677,7 +677,7 @@ Files: session_fetch.c, session_subscribe.c, profile_d21.c,
  [x] 7.4 Standalone FETCH with LOCATION_FILTER range (non-joining) tests.
 
 
-## TASK 8: Turn it on: negotiation, transports, service layer -- DONE (Swift not built here)
+## TASK 8: Turn it on: negotiation, transports, service layer -- DONE
 
 RESULT (Task 8): 8.0 flipped in one commit: `.wire_ready = true`, the endpoint supports and
 offers {21, 18, 16} (newest first), the np model's d21 row is AVAILABLE rank 1 (d18 2, d16 3;
@@ -688,7 +688,7 @@ profile under draft 21 has exactly the failing runners it has under draft 18 (cr
 delay_backpressure, faults, namespace_sub, streaming_faults: the scenarios assume the d16
 start order) and scenario_fetch is skipped (it drives a Joining FETCH). 8.4: Python binding
 exports Version.DRAFT_21; the Swift enums (MoQVersion, MoQTransportVersion,
-MediaTransportVersion and their exhaustive switches) are NOT touched -- there is no Swift
+MediaTransportVersion and their exhaustive switches) were NOT touched then -- there was no Swift
 toolchain here to compile them. 8.5: the adapter never gated on d21 (it accepts 18 and 21);
 README updated. Smoke: the runner, driving the adapter, connects over native QUIC with
 ALPN moqt-21 and records SETUP (scenario d21-publisher-request-stream-placement).
@@ -716,7 +716,15 @@ transport is Task 10 work). The OOM sweep was not run for d21.
          update usage text and test_url_policy if affected.
  [x] 8.3 sim: sim/src/simpair.c d18 references -> include 21 in seeded
          scenario sweeps (scripts/run_seed_sweeps.sh); OOM sweep includes d21.
- [~] 8.4 bindings/ and Package.swift: grep for draft enumerations; add 21.
+ [x] 8.4 bindings/ and Package.swift: grep for draft enumerations; add 21.
+         Swift (done on a Mac, Swift 6.4): MoQTransportVersion gains .draft21 (one
+         type behind MoQVersion / MediaTransportVersion), so cTransportVersion,
+         cVersion / swiftVersion and Session.transportVersion map 21; SimplePlayer
+         and the wtquic runtime proof offer it. New test: under d21 the LOC
+         timestamp is read at LOC-04's 0x10 and not at LOC-01's 0x02 (and the
+         converse under d18). Default lane and MOQ_SERVICE=1 lane green (the
+         latter against a scratch libmoq-service prefix). Not run: the wtquic
+         runtime proof's d21 exchange (needs a WebTransport d21 server).
  [x] 8.5 Remove the adapter's exit-64 gate for draft 21 (Task 2.3).
  [x] 8.6 R3 command + sweeps + check_profile_boundary.sh. Commit.
 
@@ -762,7 +770,7 @@ FIRST_OBJECT, SETUP AUTHORITY / PATH, SUBSCRIBE_NAMESPACE response, 8,192-byte G
 media_send exit status for peer-provoked closes. d18 shows 7 pre-existing FAIL rows (not
 caused by this work, no full Task 0 baseline to diff). ASan 131/131, fuzz clean 30 s each.
 WebTransport not exercised. `moq-interop-audit --draft 21` lives in the runner repo and was
-not run. Remaining hand-offs: delivery-timer semantics (6.8), FILL_TIMEOUT, Swift enums, d18
+not run. Remaining hand-offs: delivery-timer semantics (6.8), FILL_TIMEOUT, Swift enums (closed in 8.4), d18
 AUTHORITY/PATH/FIRST_OBJECT, other raw-QUIC adapters' SETUP AUTHORITY/PATH.
  [x] 10.1 Full driven runs, d21, native QUIC, all scenarios, via the Task 2
           adapter. WebTransport only if a wtquic-msquic build is available
@@ -854,6 +862,6 @@ counter: updates are answered as processed); PUBLISH_STATE_NOTIFY sending; reque
 receiving the fill stream (`moq_fill_request_t`, fetch events); the SUBGROUP delivery timer
 (starts at FIN, first-object override, closed subgroups kept until it fires); the OOM test under
 d21; the picoquic sim establish under d21; the runner audit (173/173). FILL_TIMEOUT is a relay's
-upstream-wait budget and does not apply to an origin publisher. Still open: Swift enums (on a Mac),
+upstream-wait budget and does not apply to an origin publisher. Swift enums closed (8.4). Still open:
 the per-object delivery clock, D21-5-2-MUST-130 (see docs/conformance.md), per-adapter loopback
 tests for 21 beyond picoquic.

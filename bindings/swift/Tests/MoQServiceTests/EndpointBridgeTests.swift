@@ -88,8 +88,10 @@ struct EndpointConfigurationMappingTests {
     func versionRoundTrip() {
         #expect(cVersion(.draft16) == MOQ_VERSION_DRAFT_16)
         #expect(cVersion(.draft18) == MOQ_VERSION_DRAFT_18)
+        #expect(cVersion(.draft21) == MOQ_VERSION_DRAFT_21)
         #expect(swiftVersion(MOQ_VERSION_DRAFT_16) == .draft16)
         #expect(swiftVersion(MOQ_VERSION_DRAFT_18) == .draft18)
+        #expect(swiftVersion(MOQ_VERSION_DRAFT_21) == .draft21)
         #expect(swiftVersion(moq_version_t(rawValue: 0)) == nil)
     }
 }

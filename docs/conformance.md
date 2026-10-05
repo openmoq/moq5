@@ -91,7 +91,9 @@ per-task results are in `docs/draft21-implementation-plan.md`.
 | FILL_TIMEOUT | Carried and surfaced; not acted on. It bounds how long a relay waits for upstream sources (9.20.6), which an origin publisher never does |
 | LOC properties | LOC-04 ids (Timestamp 0x10, Frame Marking 0x09 as bytes, ...) selected by `moq_loc_profile_for_transport` |
 
-Not implemented: Swift enums (to be done on a Mac), the per-object delivery clock, per-adapter
+Swift: `.draft21` added to `MoQTransportVersion` and its C mappings (plan 8.4).
+
+Not implemented: the per-object delivery clock, per-adapter
 loopback tests for 21 beyond picoquic (the other adapters take their version list from the
 shared endpoint list).
 

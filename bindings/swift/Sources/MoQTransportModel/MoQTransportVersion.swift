@@ -21,17 +21,21 @@
 ///
 /// The draft decides the integer encoding of object-property
 /// Key-Value-Pairs (draft-ietf-moq-transport-16 section 1.4 versus
-/// draft-ietf-moq-transport-18 section 1.4.1), which is why media code
-/// needs it and why there is no default.
+/// draft-ietf-moq-transport-18 section 1.4.1) and, from draft 21, the LOC
+/// property ids (draft 21 registers LOC-04's in section 16.8; drafts 16/18
+/// carry LOC-01's), which is why media code needs it and why there is no
+/// default.
 public enum MoQTransportVersion: Sendable, Hashable, CaseIterable {
     case draft16
     case draft18
+    case draft21
 
-    /// The IETF draft number (16, 18, …) — display / logging convenience.
+    /// The IETF draft number (16, 18, 21, …) — display / logging convenience.
     public var draftNumber: Int {
         switch self {
         case .draft16: return 16
         case .draft18: return 18
+        case .draft21: return 21
         }
     }
 }

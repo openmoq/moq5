@@ -272,6 +272,7 @@ struct ErrorValueTests {
     func versionNumbers() {
         #expect(MoQVersion.draft16.draftNumber == 16)
         #expect(MoQVersion.draft18.draftNumber == 18)
+        #expect(MoQVersion.draft21.draftNumber == 21)
         #expect(MoQVersion.draft16 != MoQVersion.draft18)
     }
 }
