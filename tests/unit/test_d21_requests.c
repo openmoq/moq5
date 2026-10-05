@@ -14,6 +14,7 @@
 #include <moq/moq.h>
 #include <moq/control_d21.h>
 #include <moq/sim.h>
+#include <moq/subscriber.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/session/profile.h"
@@ -2004,6 +2005,284 @@ static void t_delivery_timer_at_fin(void)
     MOQ_TEST_CHECK_EQ_INT(delivery_timer_case(false, true, 100000, 60000), 1);
 }
 
+/* -- Subscriber facade: subscribe with a fill ------------------------------ */
+
+static moq_simpair_t *fill_pair(moq_version_t version)
+{
+    moq_simpair_cfg_t sc = MOQ_SIMPAIR_CFG_INIT;
+    sc.alloc = moq_alloc_default();
+    sc.seed = 11;
+    sc.initial_now_us = 1000;
+    sc.version = version;
+    sc.client_send_request_capacity = true; sc.client_initial_request_capacity = 16;
+    sc.server_send_request_capacity = true; sc.server_initial_request_capacity = 16;
+    moq_simpair_t *sp = NULL;
+    if (moq_simpair_create(&sc, &sp) < 0) return NULL;
+    moq_simpair_start(sp);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_event_t e;
+    while (moq_session_poll_events(moq_simpair_client(sp), &e, 1) > 0) moq_event_cleanup(&e);
+    while (moq_session_poll_events(moq_simpair_server(sp), &e, 1) > 0) moq_event_cleanup(&e);
+    return sp;
+}
+
+static moq_subscriber_t *fill_sub(moq_simpair_t *sp)
+{
+    moq_sub_cfg_t cfg;
+    moq_sub_cfg_init_sized(&cfg, sizeof(cfg));
+    moq_subscriber_t *sub = NULL;
+    if (moq_sub_create(moq_simpair_client(sp), moq_alloc_default(), &cfg, &sub) != MOQ_OK)
+        return NULL;
+    return sub;
+}
+
+/* The fill asked for: the Largest Object's group from its first object. */
+static moq_fill_request_t current_group_fill(void)
+{
+    moq_fill_request_t f;
+    memset(&f, 0, sizeof(f));
+    f.has_location = true; f.field_count = 1; f.start_group = 1;
+    return f;
+}
+
+static void fill_track_cfg(moq_sub_track_cfg_t *t, moq_bytes_t *parts)
+{
+    moq_sub_track_cfg_init(t);
+    t->track_namespace = ns_live(parts);
+    t->track_name = lit("fc");
+}
+
+/* The server takes the SUBSCRIBE off its queue. */
+static moq_subscription_t fill_take_subscribe(moq_simpair_t *sp)
+{
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_event_t ev;
+    moq_subscription_t h;
+    memset(&h, 0, sizeof(h));
+    if (next_event(moq_simpair_server(sp), MOQ_EVENT_SUBSCRIBE_REQUEST, &ev)) {
+        h = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+    }
+    return h;
+}
+
+/* Accept with Largest {3, 1} and serve objects 3/0 and 3/1 on the fill. */
+static bool fill_serve(moq_simpair_t *sp, moq_subscription_t ssub)
+{
+    moq_session_t *sv = moq_simpair_server(sp);
+    uint64_t now = moq_simpair_now_us(sp);
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    acc.has_largest = true; acc.largest_group = 3; acc.largest_object = 1;
+    if (moq_session_accept_subscribe(sv, ssub, &acc, now) != MOQ_OK) return false;
+    moq_fill_info_t info; moq_fetch_t fh;
+    if (moq_session_open_fill(sv, ssub, now, &info, &fh) != MOQ_OK || info.empty) return false;
+    for (uint64_t o = 0; o <= 1; o++) {
+        moq_rcbuf_t *pl = NULL;
+        uint8_t d[1] = { (uint8_t)o };
+        moq_rcbuf_create(moq_alloc_default(), d, sizeof(d), &pl);
+        moq_fetch_object_cfg_t oc;
+        moq_fetch_object_cfg_init(&oc);
+        oc.group_id = 3; oc.object_id = o; oc.payload = pl;
+        moq_result_t rc = moq_session_write_fetch_object(sv, fh, &oc, now);
+        moq_rcbuf_decref(pl);
+        if (rc != MOQ_OK) return false;
+    }
+    if (moq_session_end_fetch(sv, fh, now) != MOQ_OK) return false;
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    return true;
+}
+
+static void t_facade_fill(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_subscriber_t *sub = fill_sub(sp);
+    MOQ_TEST_CHECK(sub != NULL);
+    moq_bytes_t parts[1];
+    moq_sub_track_cfg_t tc;
+    fill_track_cfg(&tc, parts);
+    moq_fill_request_t fill = current_group_fill();
+    moq_sub_track_t *track = NULL;
+    moq_sub_fetch_req_t *req = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &track, &req), (int)MOQ_OK);
+    MOQ_TEST_CHECK(track != NULL && req != NULL);
+    MOQ_TEST_CHECK(fill_serve(sp, fill_take_subscribe(sp)));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_tick(sub, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    MOQ_TEST_CHECK(moq_sub_track_is_active(track));
+
+    /* Objects then COMPLETE, all on the fill's request; a fill has no OK. */
+    int objs = 0, complete = 0, other = 0;
+    uint64_t next_obj = 0;
+    moq_sub_fetch_item_t it;
+    while (moq_sub_poll_fetch(sub, &it) == MOQ_OK) {
+        if (it.request != req) other++;
+        else if (it.kind == MOQ_SUB_FETCH_OBJECT) {
+            if (it.u.object.group_id != 3 || it.u.object.object_id != next_obj) other++;
+            next_obj++;
+            objs++;
+        } else if (it.kind == MOQ_SUB_FETCH_COMPLETE) complete++;
+        else other++;
+        moq_sub_fetch_item_cleanup(&it);
+    }
+    MOQ_TEST_CHECK_EQ_INT(objs, 2);
+    MOQ_TEST_CHECK_EQ_INT(complete, 1);
+    MOQ_TEST_CHECK_EQ_INT(other, 0);
+    moq_sub_destroy(sub);
+    moq_simpair_destroy(sp);
+}
+
+/* Accepted with no content: no fill stream comes, so the fill completes empty. */
+static void t_facade_fill_no_content(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_subscriber_t *sub = fill_sub(sp);
+    moq_bytes_t parts[1];
+    moq_sub_track_cfg_t tc;
+    fill_track_cfg(&tc, parts);
+    moq_fill_request_t fill = current_group_fill();
+    moq_sub_track_t *track = NULL;
+    moq_sub_fetch_req_t *req = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &track, &req), (int)MOQ_OK);
+    moq_subscription_t ssub = fill_take_subscribe(sp);
+    moq_accept_subscribe_cfg_t acc;
+    moq_accept_subscribe_cfg_init(&acc);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_subscribe(moq_simpair_server(sp), ssub,
+        &acc, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_tick(sub, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_sub_fetch_item_t it;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_poll_fetch(sub, &it), (int)MOQ_OK);
+    MOQ_TEST_CHECK(it.request == req && it.kind == MOQ_SUB_FETCH_COMPLETE);
+    moq_sub_fetch_item_cleanup(&it);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_poll_fetch(sub, &it), (int)MOQ_DONE);
+    moq_sub_destroy(sub);
+    moq_simpair_destroy(sp);
+}
+
+/* A rejected subscription ends its fill with the rejection's error code. */
+static void t_facade_fill_rejected(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_subscriber_t *sub = fill_sub(sp);
+    moq_bytes_t parts[1];
+    moq_sub_track_cfg_t tc;
+    fill_track_cfg(&tc, parts);
+    moq_fill_request_t fill = current_group_fill();
+    moq_sub_track_t *track = NULL;
+    moq_sub_fetch_req_t *req = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &track, &req), (int)MOQ_OK);
+    moq_subscription_t ssub = fill_take_subscribe(sp);
+    moq_reject_subscribe_cfg_t rj;
+    moq_reject_subscribe_cfg_init(&rj);
+    rj.error_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_reject_subscribe(moq_simpair_server(sp), ssub,
+        &rj, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_tick(sub, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    moq_sub_fetch_item_t it;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_poll_fetch(sub, &it), (int)MOQ_OK);
+    MOQ_TEST_CHECK(it.request == req && it.kind == MOQ_SUB_FETCH_ERROR);
+    MOQ_TEST_CHECK_EQ_INT((int)it.u.error.error_code, (int)MOQ_REQUEST_ERROR_DOES_NOT_EXIST);
+    moq_sub_fetch_item_cleanup(&it);
+    moq_sub_destroy(sub);
+    moq_simpair_destroy(sp);
+}
+
+/* Cancelling a fill before it arrives drops it locally; the subscription stays. */
+static void t_facade_fill_cancel(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_subscriber_t *sub = fill_sub(sp);
+    moq_bytes_t parts[1];
+    moq_sub_track_cfg_t tc;
+    fill_track_cfg(&tc, parts);
+    moq_fill_request_t fill = current_group_fill();
+    moq_sub_track_t *track = NULL;
+    moq_sub_fetch_req_t *req = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &track, &req), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_cancel_fetch(sub, req, moq_simpair_now_us(sp)),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK(fill_serve(sp, fill_take_subscribe(sp)));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_tick(sub, moq_simpair_now_us(sp)), (int)MOQ_OK);
+    MOQ_TEST_CHECK(moq_sub_track_is_active(track));
+    moq_sub_fetch_item_t it;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_poll_fetch(sub, &it), (int)MOQ_DONE);
+    moq_event_t ev;
+    MOQ_TEST_CHECK(!next_event(moq_simpair_server(sp), MOQ_EVENT_UNSUBSCRIBED, &ev));
+    moq_sub_destroy(sub);
+    moq_simpair_destroy(sp);
+}
+
+/* Unsubscribing before the fill arrives frees its fetch slot for the next fill. */
+static void t_facade_fill_unsubscribe(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_21);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_sub_cfg_t cfg;
+    moq_sub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.max_fetches = 1;
+    moq_subscriber_t *sub = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_create(moq_simpair_client(sp), moq_alloc_default(),
+                                              &cfg, &sub), (int)MOQ_OK);
+    moq_bytes_t parts[1];
+    moq_sub_track_cfg_t tc;
+    fill_track_cfg(&tc, parts);
+    moq_fill_request_t fill = current_group_fill();
+    moq_sub_track_t *track = NULL;
+    moq_sub_fetch_req_t *req = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &track, &req), (int)MOQ_OK);
+    moq_sub_track_t *t2 = NULL;
+    moq_sub_fetch_req_t *r2 = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &t2, &r2), (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_unsubscribe(sub, track, moq_simpair_now_us(sp)),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &t2, &r2), (int)MOQ_OK);
+    moq_sub_destroy(sub);
+    moq_simpair_destroy(sp);
+}
+
+/* Draft 18 has no fills: refused with nothing sent and no slot taken. */
+static void t_facade_fill_unsupported(void)
+{
+    moq_simpair_t *sp = fill_pair(MOQ_VERSION_DRAFT_18);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_subscriber_t *sub = fill_sub(sp);
+    moq_bytes_t parts[1];
+    moq_sub_track_cfg_t tc;
+    fill_track_cfg(&tc, parts);
+    moq_fill_request_t fill = current_group_fill();
+    moq_sub_track_t *track = (moq_sub_track_t *)1;
+    moq_sub_fetch_req_t *req = (moq_sub_fetch_req_t *)1;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe_with_fill(sub, &tc, &fill,
+        moq_simpair_now_us(sp), &track, &req), (int)MOQ_ERR_UNSUPPORTED);
+    MOQ_TEST_CHECK(track == NULL && req == NULL);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_event_t ev;
+    MOQ_TEST_CHECK(!next_event(moq_simpair_server(sp), MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe(sub, &tc, moq_simpair_now_us(sp), &track),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK(fill_take_subscribe(sp)._opaque != 0);
+    moq_sub_destroy(sub);
+    moq_simpair_destroy(sp);
+}
+
 int main(void)
 {
     t_filter_to_wire();
@@ -2034,6 +2313,12 @@ int main(void)
     t_publish_initial_params();
     t_send_state_notify();
     t_fill_end_to_end();
+    t_facade_fill();
+    t_facade_fill_no_content();
+    t_facade_fill_rejected();
+    t_facade_fill_cancel();
+    t_facade_fill_unsubscribe();
+    t_facade_fill_unsupported();
     t_delivery_timer_at_fin();
     t_update_credit();
     t_accept_publish_followup_update();

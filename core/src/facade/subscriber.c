@@ -53,6 +53,11 @@ struct moq_sub_fetch_req {
     sub_fetch_state_t   state;
     moq_fetch_t         handle;
     moq_subscriber_t   *sub;
+    /* A fill (moq_sub_subscribe_with_fill): the track that asked for it, and
+     * whether its fill stream has yet to arrive (handle not known until
+     * MOQ_EVENT_FILL_OPENED). */
+    moq_sub_track_t    *fill_track;
+    bool                fill_unbound;
 };
 
 struct moq_subscriber {
@@ -230,7 +235,19 @@ static moq_sub_fetch_req_t *find_fetch_by_handle(moq_subscriber_t *s,
 {
     for (size_t i = 0; i < s->fetch_cap; i++)
         if (s->fetch_reqs[i].state != SUB_FETCH_FREE &&
+            !s->fetch_reqs[i].fill_unbound &&
             moq_fetch_eq(s->fetch_reqs[i].handle, h))
+            return &s->fetch_reqs[i];
+    return NULL;
+}
+
+/* The fill a track asked for whose stream has not arrived yet, if any. */
+static moq_sub_fetch_req_t *find_unbound_fill(moq_subscriber_t *s,
+                                              const moq_sub_track_t *t)
+{
+    for (size_t i = 0; i < s->fetch_cap; i++)
+        if (s->fetch_reqs[i].state != SUB_FETCH_FREE &&
+            s->fetch_reqs[i].fill_unbound && s->fetch_reqs[i].fill_track == t)
             return &s->fetch_reqs[i];
     return NULL;
 }
@@ -238,8 +255,11 @@ static moq_sub_fetch_req_t *find_fetch_by_handle(moq_subscriber_t *s,
 static moq_sub_fetch_req_t *alloc_fetch_req(moq_subscriber_t *s)
 {
     for (size_t i = 0; i < s->fetch_cap; i++)
-        if (s->fetch_reqs[i].state == SUB_FETCH_FREE)
+        if (s->fetch_reqs[i].state == SUB_FETCH_FREE) {
+            s->fetch_reqs[i].fill_track = NULL;
+            s->fetch_reqs[i].fill_unbound = false;
             return &s->fetch_reqs[i];
+        }
     return NULL;
 }
 
@@ -350,6 +370,45 @@ static moq_result_t sub_would_block(moq_subscriber_t *sub)
 {
     sub->stats.tick_would_blocks++;
     return MOQ_ERR_WOULD_BLOCK;
+}
+
+/* End a fill whose stream never arrived: its subscription was rejected (ERROR)
+ * or accepted with no content (COMPLETE). False when the item had to be parked
+ * in the one-deep pending slot, so the caller must return WOULD_BLOCK. */
+static bool fill_finish_unbound(moq_subscriber_t *sub, moq_sub_fetch_req_t *r,
+                                moq_sub_fetch_item_kind_t kind,
+                                moq_request_error_t error_code)
+{
+    moq_sub_fetch_item_t item;
+    memset(&item, 0, sizeof(item));
+    item.kind = kind;
+    item.request = r;
+    if (kind == MOQ_SUB_FETCH_ERROR) item.u.error.error_code = error_code;
+    r->fill_unbound = false;
+    r->state = SUB_FETCH_DONE;
+    if (fi_queue_full(sub)) {
+        sub->pending_fi = item;
+        sub->has_pending_fi = true;
+        return false;
+    }
+    *fi_push(sub) = item;
+    return true;
+}
+
+/* The track's subscription is over: drop a fill of it that has not ended (its
+ * stream is stopped with the subscription), so the slot is not held forever. */
+static void drop_fills_for_track(moq_subscriber_t *sub, const moq_sub_track_t *t)
+{
+    for (size_t i = 0; i < sub->fetch_cap; i++) {
+        moq_sub_fetch_req_t *r = &sub->fetch_reqs[i];
+        if (r->fill_track != t ||
+            (r->state != SUB_FETCH_PENDING && r->state != SUB_FETCH_ACTIVE))
+            continue;
+        purge_fetch_items_for(sub, r);
+        r->state = SUB_FETCH_FREE;
+        r->fill_track = NULL;
+        r->fill_unbound = false;
+    }
 }
 
 /* -- Public API ----------------------------------------------------- */
@@ -619,13 +678,16 @@ void moq_sub_track_cfg_init(moq_sub_track_cfg_t *cfg)
     cfg->filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
 }
 
-moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
-                                 const moq_sub_track_cfg_t *cfg,
-                                 uint64_t now_us,
-                                 moq_sub_track_t **out)
+static moq_result_t sub_subscribe(moq_subscriber_t *sub,
+                                  const moq_sub_track_cfg_t *cfg,
+                                  const moq_fill_request_t *fill,
+                                  uint64_t now_us,
+                                  moq_sub_track_t **out,
+                                  moq_sub_fetch_req_t **out_fill)
 {
     if (!sub || !cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
+    if (out_fill) *out_fill = NULL;
 #define STCFG_MIN offsetof(moq_sub_track_cfg_t, auth_tokens)
     if (cfg->struct_size < STCFG_MIN) return MOQ_ERR_INVAL;
 #define STCFG_HAS(f) \
@@ -634,6 +696,11 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
 
     moq_sub_track_t *t = alloc_track(sub);
     if (!t) return MOQ_ERR_WOULD_BLOCK;
+    moq_sub_fetch_req_t *fr = NULL;
+    if (fill) {
+        fr = alloc_fetch_req(sub);
+        if (!fr) return MOQ_ERR_WOULD_BLOCK;
+    }
 
     moq_subscribe_cfg_t scfg;
     moq_subscribe_cfg_init(&scfg);
@@ -650,6 +717,10 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
     }
 #undef STCFG_HAS
 #undef STCFG_MIN
+    if (fill) {
+        scfg.fill = *fill;
+        scfg.fill.present = true;
+    }
 
     moq_subscription_t h;
     moq_result_t rc = moq_session_subscribe(sub->session, &scfg, now_us, &h);
@@ -658,7 +729,33 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
     t->state = SUB_TRACK_PENDING;
     t->handle = h;
     *out = t;
+    if (fr) {
+        memset(&fr->handle, 0, sizeof(fr->handle));
+        fr->state = SUB_FETCH_PENDING;
+        fr->fill_track = t;
+        fr->fill_unbound = true;
+        *out_fill = fr;
+    }
     return MOQ_OK;
+}
+
+moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
+                                 const moq_sub_track_cfg_t *cfg,
+                                 uint64_t now_us,
+                                 moq_sub_track_t **out)
+{
+    return sub_subscribe(sub, cfg, NULL, now_us, out, NULL);
+}
+
+moq_result_t moq_sub_subscribe_with_fill(moq_subscriber_t *sub,
+                                         const moq_sub_track_cfg_t *cfg,
+                                         const moq_fill_request_t *fill,
+                                         uint64_t now_us,
+                                         moq_sub_track_t **out,
+                                         moq_sub_fetch_req_t **out_fill)
+{
+    if (!fill || !out_fill) return MOQ_ERR_INVAL;
+    return sub_subscribe(sub, cfg, fill, now_us, out, out_fill);
 }
 
 moq_result_t moq_sub_unsubscribe(moq_subscriber_t *sub,
@@ -676,6 +773,7 @@ moq_result_t moq_sub_unsubscribe(moq_subscriber_t *sub,
     if (rc < 0) return rc;
 
     track->state = SUB_TRACK_DONE;
+    drop_fills_for_track(sub, track);
     return MOQ_OK;
 }
 
@@ -689,6 +787,7 @@ moq_result_t moq_sub_release_track(moq_subscriber_t *sub,
      * complete here, so no session message is needed -- just free the slot. */
     if (track->state != SUB_TRACK_DONE && track->state != SUB_TRACK_ERROR)
         return MOQ_ERR_WRONG_STATE;
+    drop_fills_for_track(sub, track);
     track->state = SUB_TRACK_FREE;
     track->error_code = 0;
     return MOQ_OK;
@@ -827,6 +926,25 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 sub->stats.subscribe_ok++;
                 if (sub->callbacks.on_subscribed)
                     sub->callbacks.on_subscribed(sub->callbacks.ctx, t);
+                /* No content yet: the publisher opens no fill stream. */
+                moq_sub_fetch_req_t *fr = ev.u.subscribe_ok.has_largest
+                    ? NULL : find_unbound_fill(sub, t);
+                if (fr && !fill_finish_unbound(sub, fr, MOQ_SUB_FETCH_COMPLETE, 0)) {
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
+            }
+            break;
+        }
+
+        case MOQ_EVENT_FILL_OPENED: {
+            moq_sub_track_t *t = find_track_by_handle(sub,
+                ev.u.fill_opened.sub);
+            moq_sub_fetch_req_t *fr = t ? find_unbound_fill(sub, t) : NULL;
+            if (fr) {   /* a fill has no FETCH_OK: its objects follow directly */
+                fr->handle = ev.u.fill_opened.fetch;
+                fr->fill_unbound = false;
+                fr->state = SUB_FETCH_ACTIVE;
             }
             break;
         }
@@ -843,6 +961,12 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                         sub->callbacks.ctx, t,
                         ev.u.subscribe_error.error_code,
                         ev.u.subscribe_error.reason);
+                moq_sub_fetch_req_t *fr = find_unbound_fill(sub, t);
+                if (fr && !fill_finish_unbound(sub, fr, MOQ_SUB_FETCH_ERROR,
+                                               ev.u.subscribe_error.error_code)) {
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
             }
             break;
         }
@@ -1450,9 +1574,13 @@ moq_result_t moq_sub_cancel_fetch(moq_subscriber_t *sub,
         req->state != SUB_FETCH_ACTIVE)
         return MOQ_ERR_WRONG_STATE;
 
-    moq_result_t rc = moq_session_fetch_cancel(sub->session,
-        req->handle, now_us);
-    if (rc < 0) return rc;
+    /* A fill rides its SUBSCRIBE's request: cancelling the fetch would cancel the
+     * subscription. Drop it locally; any objects still arriving no longer match. */
+    if (!req->fill_track) {
+        moq_result_t rc = moq_session_fetch_cancel(sub->session,
+            req->handle, now_us);
+        if (rc < 0) return rc;
+    }
 
     /* Drop any queued/pending items for this request before the slot becomes
      * reusable, so a later fetch reusing the slot pointer cannot inherit them. */

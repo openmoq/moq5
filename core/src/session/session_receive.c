@@ -1033,8 +1033,13 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                     return close_with_error(s, 0x3, "malformed fetch header");
 
                 int fslot = fetch_find_by_request_id(s, fhdr.request_id);
-                if (fslot < 0)
+                if (fslot < 0) {
                     fslot = session_core_bind_fill_stream(s, fhdr.request_id);
+                    if (fslot == -2) {   /* no room for FILL_OPENED: re-drive later */
+                        loop_rc = MOQ_ERR_WOULD_BLOCK;
+                        goto compact;
+                    }
+                }
                 if (fslot < 0) {
                     /* Late data uni for a locally-cancelled fetch (its slot was
                      * freed at cancel): stop the stream. Mark the rx so the

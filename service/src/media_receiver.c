@@ -254,7 +254,8 @@ struct moq_media_receiver {
     /* Network-thread state. */
     moq_subscriber_t  *sub;
     moq_sub_track_t   *catalog_sub;
-    moq_sub_fetch_req_t *catalog_fetch;   /* joining FETCH(offset=0); MSF-01 §5 */
+    moq_sub_fetch_req_t *catalog_fetch;   /* joining FETCH(offset=0), or the fill on
+                                           * the catalog SUBSCRIBE (draft 21); MSF-01 §5 */
     bool               catalog_fetch_issued;  /* issued exactly once */
 
     /* The current effective independent catalog (MSF-01 §5). `has_effective`
@@ -1551,7 +1552,8 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
  * the receiver (receiver_on_subscribe_error). A relay/origin that does not serve
  * FETCH either errors it or leaves it unanswered; neither is fatal here -- the
  * SUBSCRIBE still delivers live catalog updates, and the unanswered request is
- * bounded (issued exactly once). */
+ * bounded (issued exactly once). Under draft 21 the same objects come from the
+ * fill requested on the catalog SUBSCRIBE (already issued, drained here). */
 static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
                                         uint64_t now_us)
 {
@@ -2499,8 +2501,23 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         tcfg.track_namespace = r->namespace_;
         tcfg.track_name = (moq_bytes_t){ r->catalog_name,
                                          r->catalog_name_len };
-        if (moq_sub_subscribe(r->sub, &tcfg, now_us,
-                              &r->catalog_sub) != MOQ_OK) {
+        /* Draft 21 has no Joining FETCH; its replacement is a fill on the
+         * SUBSCRIBE (3.4). A one-field Location Filter starting at 1 is the
+         * Largest Object's group from its first object: what the Joining
+         * FETCH(offset=0) retrieves. Drafts without fills refuse it with nothing
+         * sent, and the Joining FETCH is issued once the SUBSCRIBE is accepted. */
+        moq_fill_request_t fill;
+        memset(&fill, 0, sizeof(fill));
+        fill.has_location = true;
+        fill.field_count = 1;
+        fill.start_group = 1;
+        moq_result_t src = moq_sub_subscribe_with_fill(r->sub, &tcfg, &fill,
+            now_us, &r->catalog_sub, &r->catalog_fetch);
+        if (src == MOQ_OK)
+            r->catalog_fetch_issued = true;
+        else if (src == MOQ_ERR_UNSUPPORTED)
+            src = moq_sub_subscribe(r->sub, &tcfg, now_us, &r->catalog_sub);
+        if (src != MOQ_OK) {
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
             return;
         }

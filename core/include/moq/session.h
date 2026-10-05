@@ -861,6 +861,14 @@ typedef uint32_t moq_event_kind_t;
 #define MOQ_EVENT_SUBSCRIPTION_UPDATE_OK     47u
 #define MOQ_EVENT_PUBLICATION_UPDATE_OK      48u
 #define MOQ_EVENT_SUBGROUP_RESET             49u
+/*
+ * Draft 21 (3.4): a fill asked for with a subscription or one of its updates
+ * (moq_fill_request_t) has started arriving. Names the fetch handle its objects
+ * will carry in the MOQ_EVENT_FETCH_OBJECT / _GAP / _COMPLETE events that follow,
+ * and the subscription that asked for it. A fill has no MOQ_EVENT_FETCH_OK.
+ * Emitted once per fill, before any of its objects. Detail is plain scalars.
+ */
+#define MOQ_EVENT_FILL_OPENED                50u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -1366,6 +1374,11 @@ typedef struct moq_fetch_complete_event {
     moq_fetch_t fetch;
 } moq_fetch_complete_event_t;
 
+typedef struct moq_fill_opened_event {
+    moq_subscription_t sub;    /* the subscription the fill belongs to */
+    moq_fetch_t        fetch;  /* the handle on the fill's fetch events */
+} moq_fill_opened_event_t;
+
 typedef enum moq_fetch_range_kind {
     MOQ_FETCH_RANGE_NON_EXISTENT = 1,
     MOQ_FETCH_RANGE_UNKNOWN      = 2,
@@ -1714,6 +1727,7 @@ typedef struct moq_event {
         moq_subscribe_tracks_cancelled_event_t subscribe_tracks_cancelled;
         moq_subgroup_finished_event_t          subgroup_finished;
         moq_subgroup_reset_event_t             subgroup_reset;
+        moq_fill_opened_event_t                fill_opened;
         uint8_t                     _reserved[MOQ_EVENT_DETAIL_MAX];
     } u;
 } moq_event_t;

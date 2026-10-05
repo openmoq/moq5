@@ -82,7 +82,7 @@ per-task results are in `docs/draft21-implementation-plan.md`.
 | SETUP AUTHORITY / PATH | Sent by a native-QUIC client on the picoquic, msquic and mvfst endpoint paths (also under draft 18); not by the WebTransport paths, which must not |
 | Subscriptions | Concurrent subscriptions per Track, exact Location Filter (relative start, end Object), Range Filters declined with INVALID_FILTER |
 | PUBLISH | Accept sends non-default choices as a follow-up REQUEST_UPDATE; the publisher's initial parameters are readable (`moq_session_publish_initial_params`) |
-| Fill streams (replace Joining FETCH) | Both sides: request a fill on SUBSCRIBE / REQUEST_UPDATE, receive it as fetch events; publisher opens, serves (facade: from the retained group), resets on cancel; STOP_SENDING cancels only the fill |
+| Fill streams (replace Joining FETCH) | Both sides: request a fill on SUBSCRIBE / REQUEST_UPDATE, receive it as fetch events; publisher opens, serves (facade: from the retained group), resets on cancel; STOP_SENDING cancels only the fill. Subscriber facade: `moq_sub_subscribe_with_fill` (MOQ_EVENT_FILL_OPENED names the fill's fetch handle). The media receiver asks for a fill of the latest group on the catalog SUBSCRIBE where draft 18 sends a Joining FETCH, so a late joiner still gets the catalog |
 | Request streams | A FIN is not a cancellation; responder FIN without PUBLISH_DONE fails the request |
 | PUBLISH_STATE_NOTIFY | Received and validated; sendable on an established subscription (`moq_session_notify_subscription_state`) |
 | MAX_REQUEST_UPDATES | Advertised when configured (`moq_session_cfg_t::max_request_updates`); one update is processed and answered at a time, so no inbound counter enforces it and TOO_MANY_REQUEST_UPDATES is never sent |

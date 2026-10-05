@@ -78,6 +78,7 @@ _Static_assert(sizeof(moq_fetch_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_cancelled_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_complete_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
+_Static_assert(sizeof(moq_fill_opened_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_object_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_gap_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -894,7 +895,8 @@ bool moq_loc_successor(uint64_t group, uint64_t object, uint64_t ceiling,
  * full -- the entry is freed either way. */
 /* A FETCH_HEADER whose Request ID is the SUBSCRIBE / update that asked for a fill
  * (draft 21 3.4): create the subscriber-side fill fetch entry for it and return its
- * slot, or -1 when no subscription expects that id. The expectation is consumed. */
+ * slot, or -1 when no subscription expects that id. The expectation is consumed and
+ * MOQ_EVENT_FILL_OPENED is queued; -2 (nothing bound) when the event queue is full. */
 int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id);
 void session_core_reset_fills_for_sub(moq_session_t *s, moq_subscription_t sub);
 bool moq_resolve_fill_range(const moq_decoded_loc_filter_t *lf,

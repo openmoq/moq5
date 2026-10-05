@@ -2297,6 +2297,7 @@ int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id)
             continue;
         for (uint8_t k = 0; k < e->fill_expect_n; k++) {
             if (e->fill_expect_ids[k] != request_id) continue;
+            if (event_queue_full(s)) return -2;
             int slot = fetch_find_free(s);
             if (slot < 0) return -1;
             moq_fetch_entry_t *fe = &s->fetches[slot];
@@ -2320,6 +2321,15 @@ int session_core_bind_fill_stream(moq_session_t *s, uint64_t request_id)
             for (uint8_t j = k + 1; j < e->fill_expect_n; j++)
                 e->fill_expect_ids[j - 1] = e->fill_expect_ids[j];
             e->fill_expect_n--;
+            /* Tell the subscriber which fetch handle carries this subscription's fill. */
+            moq_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.kind = MOQ_EVENT_FILL_OPENED;
+            ev.detail_size = (uint32_t)sizeof(moq_fill_opened_event_t);
+            ev.borrow_epoch = s->borrow_epoch;
+            ev.u.fill_opened.sub = e->handle;
+            ev.u.fill_opened.fetch = fe->handle;
+            (void)push_event(s, &ev);   /* room checked above */
             return slot;
         }
     }
