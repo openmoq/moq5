@@ -4,24 +4,32 @@ Bridges moq-core sessions to real QUIC transport via picoquic.
 
 ## Stream scheduling
 
-PicoQUIC and PicoWT propagate MoQ subscriber and publisher priorities to
-`picoquic_set_stream_priority`. Lower subscriber values precede higher values;
-publisher priority breaks subscriber-priority ties. Applications choose these
-values: the adapters do not infer priority from a media codec or track name.
+PicoQUIC and PicoWT schedule data streams per MOQT 7.2: subscriber priority,
+then publisher priority, then group in the request's group order (MOQT 7.1),
+then lowest subgroup ID. Streams of different requests that tie on all of
+these share bandwidth round-robin. Applications choose the priorities: the
+adapters do not infer them from a media codec or track name.
 
 The adapter ranks queued streams and uses even native priority values for
 round-robin service among equal ranks. Control traffic uses priority zero;
 data ranks start at two. PicoQUIC's eight-bit priority space permits 127 data
-ranks; streams with 126 or more better-ranked pending streams coalesce at 254.
-This can lose distinctions under saturation but cannot reverse them.
+ranks, so a new prioritized stream waits while 126 others hold bytes in the
+queue; the bridge keeps it, in priority order. Streams already sending never
+wait.
 
-Metadata is captured in each core action, so it survives subgroup retirement
-and a blocked transport open/write. Subsequent writes can update the priority
-of a whole queued stream (including FETCH); already queued bytes are not
-reordered within that stream. This is not an object-level scheduler. Group-order
-and subgroup-ID tie-breaks, separate request-stream ranks, and per-object
-datagram priority are not implemented by this mapping. No congestion-latency
-improvement is implied without measurement.
+The core emits each stream's priority before its first write, so it survives
+subgroup retirement and a blocked transport open/write. A subscriber priority
+update re-ranks all streams of that request, including data already queued.
+A FETCH stream takes the publisher priority of its next object. This is not an
+object-level scheduler. Separate request-stream ranks and per-object datagram
+priority are not implemented. No congestion-latency improvement is implied
+without measurement.
+
+The adapter queue holds 128 KiB by default (PicoQUIC: `send_queue_cap_bytes`).
+The bridge retains the rest, up to 1 MiB in total (at least 128 KiB in the
+bridge), and hands it over in priority order. When a stream's queued bytes
+drain, the adapter reports it (`MOQ_TRANSPORT_CAP_STREAM_DRAINED`), so the
+bridge sets the priority again on the next write.
 
 The private bridge callback is optional and size-gated. Other adapters retain
 their existing scheduling behavior when they do not implement it.

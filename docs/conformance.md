@@ -41,6 +41,8 @@ Factual status of draft-ietf-moq-transport-16 support in libmoq.
 | Fetch data stream (FETCH_HEADER + objects) | Full | Full | fetch | Objects, gaps, FIN completion |
 | Object datagrams | Full | Full | object_datagram | Payload, properties, status; budget-accounted |
 | Delivery timeout (subgroup reset) | Full | Full | streaming_object | Per-subscription and per-update timeout |
+| Group order | Full | Full | — | Subscriber GROUP_ORDER, else the publisher's DEFAULT_PUBLISHER_GROUP_ORDER, else ascending. Values other than 1 and 2 close with PROTOCOL_VIOLATION. Unit test: group_order |
+| Data scheduling | — | Full | — | Subscriber priority, publisher priority, group in the request's group order, lowest subgroup. Equal priorities across requests: round-robin. FETCH: next object. Applied by adapters that implement `set_stream_priority` (picoquic, picoquic WebTransport). Unit test: scheduling |
 
 ## Auth / Security
 
@@ -56,6 +58,7 @@ Factual status of draft-ietf-moq-transport-16 support in libmoq.
 - **d18 profile**: Not implemented. Only draft-16 wire format is supported.
 - **QUIC transport**: Sans-I/O core. In-tree adapters: picoquic (raw QUIC), mvfst (raw QUIC), picoquic WebTransport, and proxygen WebTransport. The WebTransport adapters are experimental.
 - **Facades**: Publisher and subscriber facades exist; relay facade not started.
+- **Data scheduling**: Scheduling is per stream, not per object. Datagrams are not scheduled by priority. FETCH objects with different publisher priorities on one stream, and d18 SUBSCRIBE cancellation not resetting open data streams, are tracked in issue #36. Adapters without `set_stream_priority` (msquic, mvfst, proxygen, wtquic) keep their own stream scheduling.
 - **Joining fetch filter**: Only LARGEST_OBJECT filter is valid per spec; client and server both enforce this.
 
 ## Test Infrastructure
