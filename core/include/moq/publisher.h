@@ -245,22 +245,31 @@ typedef struct moq_pub_track_cfg {
      * Read only when struct_size covers the whole field: set it only with
      * moq_pub_track_cfg_init_sized(). */
     bool            monotonic_groups;
+    /* Permanently reserved, never read: the trailing padding after
+     * monotonic_groups, already covered by an older caller's struct_size. */
+    uint8_t         _reserved_track_tail2[7];
+    /* The track's DEFAULT_PUBLISHER_GROUP_ORDER (MOQT 7.1): ASCENDING or
+     * DESCENDING is advertised on every accept and publish of the track;
+     * DEFAULT (the default) advertises none. Other values: add_track fails
+     * INVAL. Read only when struct_size covers the whole field. */
+    moq_group_order_t default_group_order;
 } moq_pub_track_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original
  * prefix (struct_size .. publisher_priority, i.e. before the appended
- * max_retained_bytes, has_publisher_priority, and monotonic_groups). All
- * appended fields stay disabled — callers that want an explicit priority, a
- * retained-byte budget, or the monotonic-groups declaration (default OFF)
- * must use moq_pub_track_cfg_init_sized(). Mirrors moq_pub_cfg_init(). */
+ * max_retained_bytes, has_publisher_priority, monotonic_groups, and
+ * default_group_order). All appended fields stay disabled — callers that want
+ * an explicit priority, a retained-byte budget, the monotonic-groups
+ * declaration (default OFF), or a default group order must use
+ * moq_pub_track_cfg_init_sized(). Mirrors moq_pub_cfg_init(). */
 MOQ_API void moq_pub_track_cfg_init(moq_pub_track_cfg_t *cfg);
 
 /* Size-aware initializer: zeroes and stamps min(cfg_size, sizeof) so all
  * appended fields the caller's struct covers are active. Pass
  * sizeof(moq_pub_track_cfg_t). No-op if cfg is NULL or cfg_size cannot hold
- * struct_size. Use this whenever you set has_publisher_priority or
- * monotonic_groups (both default off; monotonic_groups is read only when
- * struct_size covers the whole field). */
+ * struct_size. Use this whenever you set has_publisher_priority,
+ * monotonic_groups, or default_group_order (all default off; the last two are
+ * read only when struct_size covers the whole field). */
 MOQ_API void moq_pub_track_cfg_init_sized(moq_pub_track_cfg_t *cfg,
                                           size_t cfg_size);
 

@@ -769,6 +769,23 @@ static moq_result_t d18_encode_publish(
     return moq_d18_encode_publish(w, &p);
 }
 
+/* Draft-18 always walks track properties strictly. */
+static moq_result_t d18_scan_group_order_op(const uint8_t *data, size_t len,
+                                            bool strict_local, uint8_t *out)
+{
+    (void)strict_local;
+    return moq_d18_scan_group_order(data, len, out);
+}
+
+static moq_result_t d18_track_properties_put_group_order(
+    const uint8_t *in, size_t in_len, uint8_t order,
+    uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    return moq_d18_track_props_put_varint(in, in_len,
+                                          MOQ_D18_PROP_GROUP_ORDER, order,
+                                          out, out_cap, out_len);
+}
+
 /* Lenient outbound-side extraction of dynamic-group support: reuses the
  * shared property walker without the mandatory/violation outcomes (a blob
  * the encoder would refuse simply reads as unsupported). */
@@ -1480,6 +1497,9 @@ static moq_result_t d18_process_request_stream(
         d.track_properties_len = pub.track_properties.len;
         d.track_properties_unsupported = pub.track_properties_unsupported;
         d.dynamic_groups = pub.dynamic_groups;
+        (void)moq_d18_scan_group_order(pub.track_properties.data,
+                                       pub.track_properties.len,
+                                       &d.publisher_group_order);
         d.has_largest = pub.params.has_largest;
         d.largest_group = pub.params.largest_group;
         d.largest_object = pub.params.largest_object;
@@ -2439,6 +2459,9 @@ static moq_result_t d18_process_response_stream(
         d.track_properties_len = ok.track_properties.len;
         d.track_properties_unsupported = ok.track_properties_unsupported;
         d.dynamic_groups = ok.dynamic_groups;
+        (void)moq_d18_scan_group_order(ok.track_properties.data,
+                                       ok.track_properties.len,
+                                       &d.publisher_group_order);
         rc = session_core_on_subscribe_ok(s, &d, slot);
         if (rc < 0)
             return rc;
@@ -3111,6 +3134,8 @@ static const moq_profile_ops_t d18_ops = {
     .process_request_stream  = d18_process_request_stream,
     .process_response_stream = d18_process_response_stream,
     .scan_delivery_timeouts  = d18_scan_delivery_timeouts_op,
+    .scan_group_order        = d18_scan_group_order_op,
+    .track_properties_put_group_order = d18_track_properties_put_group_order,
     .encode_subscribe        = d18_encode_subscribe,
     .encode_subscribe_ok     = d18_encode_subscribe_ok,
     .encode_request_error    = d18_encode_request_error,

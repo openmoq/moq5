@@ -20,7 +20,7 @@ static moq_publication_t pub_make_handle(moq_session_t *s, size_t slot)
     return h;
 }
 
-int pub_resolve_handle(moq_session_t *s, moq_publication_t h)
+int pub_resolve_handle(const moq_session_t *s, moq_publication_t h)
 {
     uint32_t pool = moq_handle_pool_tag(h._opaque);
     uint16_t tag  = moq_handle_session_tag(h._opaque);
@@ -43,6 +43,17 @@ const moq_resolved_window_t *moq_session_pub_resolved_window(
     moq_pub_entry_t *e = &s->publishes[slot];
     if (!e->window.has_window) return NULL;
     return &e->window;
+}
+
+moq_group_order_t moq_session_publication_group_order(
+    const moq_session_t *s, moq_publication_t pub)
+{
+    if (!s) return MOQ_GROUP_ORDER_DEFAULT;
+    int slot = pub_resolve_handle(s, pub);
+    if (slot < 0) return MOQ_GROUP_ORDER_DEFAULT;
+    const moq_pub_entry_t *e = &s->publishes[slot];
+    return session_effective_group_order(e->group_order,
+                                         e->publisher_group_order);
 }
 
 moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
@@ -701,6 +712,7 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     e.u.publish_request.token_count = d->token_count;
     e.u.publish_request.track_properties = ev_props;
     e.u.publish_request.dynamic_groups = d->dynamic_groups;
+    e.u.publish_request.publisher_group_order = d->publisher_group_order;
     e.u.publish_request.has_largest = d->has_largest;
     e.u.publish_request.largest_group = d->has_largest ? d->largest_group : 0;
     e.u.publish_request.largest_object = d->has_largest ? d->largest_object : 0;
@@ -742,6 +754,7 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     entry->publish_largest_object = d->has_largest ? d->largest_object : 0;
     /* Gates outbound new-group requests on the accept and later updates. */
     entry->dynamic_groups = d->dynamic_groups;
+    entry->publisher_group_order = d->publisher_group_order;
     /* Initial Forward State (§9.4): with FORWARD omitted/1 the publisher may begin
      * sending objects immediately, possibly before our PUBLISH_OK. Record it so the
      * inbound data path accepts those early objects on this still-pending
@@ -1036,6 +1049,11 @@ moq_result_t moq_session_publish(moq_session_t *s,
     if (session_scan_dt_props(s, cfg->track_properties.data,
                               cfg->track_properties.len, true, &dtscan) < 0)
         return MOQ_ERR_INVAL;
+    uint8_t pub_group_order;
+    if (session_scan_group_order(s, cfg->track_properties.data,
+                                 cfg->track_properties.len, true,
+                                 &pub_group_order) < 0)
+        return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
 
@@ -1214,6 +1232,7 @@ moq_result_t moq_session_publish(moq_session_t *s,
          * gated on it (the peer MUST NOT send one otherwise, §10.2.13). */
         entry->dynamic_groups = s->profile->track_properties_dynamic_groups(
             cfg->track_properties.data, cfg->track_properties.len);
+        entry->publisher_group_order = pub_group_order;
         entry->handle = pub_make_handle(s, (size_t)slot);
         /* Retain the EXACT Largest this PUBLISH put on the wire (the same
          * snapshot the encoder used, not a later history read). It becomes the
@@ -1362,6 +1381,7 @@ moq_result_t moq_session_accept_publish(
      * PUBLISHER's entry, computed when it receives this PUBLISH_OK --
      * resolution is against the publisher's registry, not ours.) */
     s->publishes[slot].send_allowed = fwd_effective;
+    s->publishes[slot].group_order = (uint8_t)cfg->group_order;
     if (has_filter) {
         s->publishes[slot].filter_type = (uint32_t)filter;
         s->publishes[slot].req_start_group = f_start_group;
@@ -1711,8 +1731,16 @@ moq_result_t session_core_on_publish_request_update(
         goto cleanup_all;
     }
 
+    /* 1 event + 1 action for REQUEST_OK, plus the changed subscriber
+     * priority's owner-wide key. */
+    size_t prio_slots = session_owner_priority_slots(s,
+        d->has_subscriber_priority, d->subscriber_priority,
+        s->publishes[d->target_slot].subscriber_priority);
     if (event_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
-    if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
+    if (action_queue_avail(s) < 1 + prio_slots) {
+        result = MOQ_ERR_WOULD_BLOCK;
+        goto cleanup_all;
+    }
 
     /* Copy resolved auth tokens into scratch for borrow-epoch-safe delivery. */
     moq_resolved_token_t *ev_tokens = NULL;
@@ -1745,6 +1773,11 @@ moq_result_t session_core_on_publish_request_update(
             ? queue_send_bidi(s, resp_ref, ok_buf,
                               moq_buf_writer_offset(&ow), false)
             : queue_send_control(s, ok_buf, moq_buf_writer_offset(&ow));
+        if (rc < 0) { result = rc; goto cleanup_all; }
+    }
+    if (prio_slots) {
+        rc = session_update_owner_priority(s, e->handle._opaque,
+                                           d->subscriber_priority);
         if (rc < 0) { result = rc; goto cleanup_all; }
     }
 
@@ -2113,7 +2146,9 @@ moq_result_t moq_session_open_pub_subgroup(
     int slot = sg_find_free(s);
     if (slot < 0) return MOQ_ERR_WOULD_BLOCK;
 
-    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    /* The stream's key goes out ahead of its first SEND_DATA. */
+    if (action_queue_avail(s) < (s->data_priority_updates ? 2u : 1u))
+        return MOQ_ERR_WOULD_BLOCK;
 
     bool has_ext = false;
     if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, object_properties) +
@@ -2154,6 +2189,13 @@ moq_result_t moq_session_open_pub_subgroup(
         ((uint64_t)s->publishes[pub_slot].subscriber_priority << 8) |
         cfg->publisher_priority;
 
+    const moq_pub_entry_t *pe = &s->publishes[pub_slot];
+    moq_data_priority_t key;
+    session_subgroup_data_key(pub._opaque, pe->subscriber_priority,
+                              pe->group_order, pe->publisher_group_order, cfg,
+                              &key);
+    rc = session_push_data_key(s, a.u.send_data.stream_ref, &key);
+    if (rc < 0) return rc;
     rc = push_action(s, &a);
     if (rc < 0) return rc;
 

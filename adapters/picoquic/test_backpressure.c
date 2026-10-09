@@ -385,13 +385,14 @@ int main(void)
 
     /* -- 3. Pre-retention WOULD_BLOCK → fatal ------------------------- */
     {
-        /* Create client with max_data_streams=1 and max_actions=1. */
+        /* Create client with max_data_streams=1 and max_actions=2 (the
+         * least the transport bridge takes). */
         moq_alloc_t a3 = talloc();
         moq_session_cfg_t cc; moq_session_cfg_init_sized(&cc, sizeof(cc), &a3, MOQ_PERSPECTIVE_CLIENT);
         cc.send_request_capacity = true;
         cc.initial_request_capacity = 10;
         cc.max_data_streams = 1;
-        cc.max_actions = 1;
+        cc.max_actions = 2;
 
         moq_session_cfg_t sc; moq_session_cfg_init_sized(&sc, sizeof(sc), &a3, MOQ_PERSPECTIVE_SERVER);
         sc.send_request_capacity = true;
@@ -417,9 +418,12 @@ int main(void)
         moq_subscribe_cfg_t sub; moq_subscribe_cfg_init(&sub);
         sub.track_namespace = (moq_namespace_t){ ns, 1 };
         sub.track_name = (moq_bytes_t){ (const uint8_t *)"t", 1 };
-        moq_subscription_t h;
+        moq_subscription_t h, h2;
         moq_session_subscribe(c, &sub, 0, &h);
-        /* Action queue now has SUBSCRIBE (1 slot, full). */
+        sub.track_name = (moq_bytes_t){ (const uint8_t *)"u", 1 };
+        moq_session_subscribe(c, &sub, 0, &h2);
+        /* Action queue now has two SUBSCRIBEs (2 slots, full). */
+        CHECK(moq_session_action_capacity(c) == 0);
 
         /* Second stream: no rx slot available, action queue full →
          * pre-retention WOULD_BLOCK → adapter should go fatal. */

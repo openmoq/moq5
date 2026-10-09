@@ -120,6 +120,7 @@ struct moq_media_track {
     uint64_t              track_duration_ms;
     bool                  has_alt_group;       /* CMSF §3.2 (switching set) */
     int                   alt_group;
+    moq_group_order_t     group_order;         /* MOQT 7.1; DEFAULT = none */
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
      * allocation; the id bytes live in `strings` with the other spans. */
@@ -1775,6 +1776,7 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
         tcfg.has_publisher_priority = true;
         tcfg.publisher_priority = 0;
     }
+    tcfg.default_group_order = t->group_order;
     /* The sender's production is strictly monotonic on every track: media
      * emission drains group_seq in order (eviction only drops OLDER groups
      * before emission; an abandoned group never rewinds), and catalog
@@ -4084,6 +4086,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     }
     /* MSF §5.2.35: trackDuration MUST NOT appear on a live track. */
     if (cfg->has_track_duration && cfg->is_live) return MOQ_ERR_INVAL;
+    /* Checked here: the facade rejects it later, under s->mu, as fatal. */
+    if (cfg->group_order != MOQ_GROUP_ORDER_DEFAULT &&
+        cfg->group_order != MOQ_GROUP_ORDER_ASCENDING &&
+        cfg->group_order != MOQ_GROUP_ORDER_DESCENDING)
+        return MOQ_ERR_INVAL;
 
     /* A terminal sender (fatal, or its endpoint closed) registers nothing:
      * checked here outside s->mu (sender_terminal takes it), and again inside
@@ -4151,6 +4158,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->track_duration_ms = cfg->track_duration_ms;
     t->has_alt_group = cfg->has_alt_group;
     t->alt_group = cfg->alt_group;
+    t->group_order = cfg->group_order;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;

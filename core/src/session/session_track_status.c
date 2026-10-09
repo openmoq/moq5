@@ -645,6 +645,15 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
     if (cfg->struct_size < ATS_CFG_MIN) return MOQ_ERR_INVAL;
 #define ATS_CFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_track_status_cfg_t, f) + sizeof(cfg->f))
+    if (ATS_CFG_HAS(track_properties) && cfg->track_properties.len > 0) {
+        uint8_t order;
+        if (!cfg->track_properties.data ||
+            !moq_session_uses_request_streams(s) ||
+            session_scan_group_order(s, cfg->track_properties.data,
+                                     cfg->track_properties.len, true,
+                                     &order) < 0)
+            return MOQ_ERR_INVAL;
+    }
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -669,6 +678,10 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
     if (ATS_CFG_HAS(expires_ms) && cfg->has_expires) {
         ok_args.has_expires = true;
         ok_args.expires_ms = cfg->expires_ms;
+    }
+    if (ATS_CFG_HAS(track_properties)) {
+        ok_args.track_properties = cfg->track_properties.data;
+        ok_args.track_properties_len = cfg->track_properties.len;
     }
 #undef ATS_CFG_HAS
 #undef ATS_CFG_MIN

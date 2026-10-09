@@ -217,6 +217,12 @@ struct moq_pub_track {
     bool                publish_forward;
     moq_publication_t   publication;
 
+    /* The track's DEFAULT_PUBLISHER_GROUP_ORDER (DEFAULT = none) and, for
+     * subscription accepts, its encoding as a track-properties blob. */
+    moq_group_order_t   default_group_order;
+    uint8_t             group_order_props[8];
+    size_t              group_order_props_len;
+
     /* Private reservation in the session's track-largest history registry,
      * obtained (capacity-checked) once at add_track and released at teardown.
      * Per-object admission merges the object's location into it with an
@@ -255,6 +261,8 @@ typedef struct {
     uint64_t            group_id;
     uint64_t            end_object;  /* last object_id + 1 (FETCH_OK End) */
     uint8_t             priority;
+    uint8_t             group_order_props[8];   /* the track's, for FETCH_OK */
+    size_t              group_order_props_len;
     pub_retained_obj_t *objs;        /* incref'd snapshot; released on finish */
     size_t              obj_count;
     size_t              next_idx;    /* write cursor (resumes on WOULD_BLOCK) */
@@ -885,6 +893,8 @@ static void pub_init_accept_cfg(const moq_pub_track_t *t,
                                 moq_accept_subscribe_cfg_t *acc)
 {
     moq_accept_subscribe_cfg_init(acc);
+    acc->track_properties = (moq_bytes_t){ t->group_order_props,
+                                           t->group_order_props_len };
     if (retained_can_advertise_largest(t)) {
         acc->has_largest = true;
         acc->largest_group = pub_track_retained_group(t);
@@ -925,9 +935,13 @@ static void serve_retained_fetch(moq_publisher_t *pub, uint64_t now_us)
     }
 
     if (!pf->accepted) {
-        if (moq_session_action_capacity(pub->session) < 2) return;  /* defer */
+        /* FETCH_OK + FETCH_HEADER, and the data stream's scheduling key. */
+        size_t need = pub->session->data_priority_updates ? 3 : 2;
+        if (moq_session_action_capacity(pub->session) < need) return;
         moq_accept_fetch_cfg_t acc;
         moq_accept_fetch_cfg_init(&acc);
+        acc.track_properties = (moq_bytes_t){ pf->group_order_props,
+                                              pf->group_order_props_len };
         acc.end_of_track = false;
         acc.end_group = pf->group_id;
         acc.end_object = pf->end_object;   /* End Location: last object + 1 */
@@ -1507,6 +1521,17 @@ _Static_assert(offsetof(moq_pub_track_cfg_t, monotonic_groups) ==
                MOQ_PUB_TRACK_CFG_PRE_S3_SIZE,
                "monotonic_groups must sit exactly at the v0 sizeof");
 
+/* default_group_order starts where the struct ending at monotonic_groups
+ * ended (its padding is _reserved_track_tail2). */
+#define MOQ_PUB_TRACK_CFG_PRE_GO_SIZE \
+    ((offsetof(moq_pub_track_cfg_t, monotonic_groups) + \
+      sizeof(((moq_pub_track_cfg_t *)0)->monotonic_groups) + \
+      (_Alignof(moq_pub_track_cfg_t) - 1)) & \
+     ~(size_t)(_Alignof(moq_pub_track_cfg_t) - 1))
+_Static_assert(offsetof(moq_pub_track_cfg_t, default_group_order) ==
+               MOQ_PUB_TRACK_CFG_PRE_GO_SIZE,
+               "default_group_order must sit at the old sizeof");
+
 #define MOQ_PUB_TRACK_CFG_V0_SIZE \
     (offsetof(moq_pub_track_cfg_t, max_retained_bytes))
 
@@ -1587,6 +1612,18 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
     if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, monotonic_groups) +
         sizeof(cfg->monotonic_groups))
         t->monotonic = cfg->monotonic_groups;
+    if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, default_group_order) +
+        sizeof(cfg->default_group_order) &&
+        cfg->default_group_order != MOQ_GROUP_ORDER_DEFAULT) {
+        if (moq_session_track_properties_add_group_order(pub->session,
+                NULL, 0, cfg->default_group_order, t->group_order_props,
+                sizeof(t->group_order_props),
+                &t->group_order_props_len) < 0) {
+            free_track_state(pub, t);
+            return MOQ_ERR_INVAL;
+        }
+        t->default_group_order = cfg->default_group_order;
+    }
 
     /* Sum namespace bytes with overflow check. */
     size_t total_ns_bytes = 0;
@@ -3145,6 +3182,11 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 pub->pending_fetch.end_object =
                     pub_track_retained_last_object_id(track) + 1;
                 pub->pending_fetch.priority = track->priority;
+                memcpy(pub->pending_fetch.group_order_props,
+                       track->group_order_props,
+                       sizeof(track->group_order_props));
+                pub->pending_fetch.group_order_props_len =
+                    track->group_order_props_len;
             }
         }
         serve_retained_fetch(pub, now_us);
@@ -3587,6 +3629,49 @@ void moq_pub_publish_cfg_init(moq_pub_publish_cfg_t *cfg)
     cfg->forward = true;
 }
 
+/* The PUBLISH track properties: the app's `in` plus the track's
+ * DEFAULT_PUBLISHER_GROUP_ORDER, built in `buf` or, when it does not fit, in
+ * *heap (*heap_cap bytes, the caller frees it on every return). An app blob
+ * that already carries the property must agree with the track. */
+static moq_result_t pub_publish_props(moq_publisher_t *pub,
+                                      const moq_pub_track_t *track,
+                                      moq_bytes_t in, uint8_t *buf,
+                                      size_t buf_cap, uint8_t **heap,
+                                      size_t *heap_cap, moq_bytes_t *out)
+{
+    uint8_t app_order;
+    uint8_t *dst = buf;
+    size_t cap = buf_cap;
+    size_t len = 0;
+
+    *heap = NULL;
+    *heap_cap = 0;
+    *out = in;
+    if (track->default_group_order == MOQ_GROUP_ORDER_DEFAULT)
+        return MOQ_OK;
+    if (in.len > 0 && !in.data) return MOQ_ERR_INVAL;
+    if (session_scan_group_order(pub->session, in.data, in.len, true,
+                                 &app_order) < 0)
+        return MOQ_ERR_INVAL;
+    if (app_order != MOQ_GROUP_ORDER_DEFAULT)
+        return app_order == track->default_group_order ? MOQ_OK
+                                                       : MOQ_ERR_INVAL;
+    /* The property adds two bytes. */
+    if (in.len > SIZE_MAX - 16) return MOQ_ERR_INVAL;
+    if (in.len + 16 > buf_cap) {
+        cap = in.len + 16;
+        *heap = pub_alloc(pub, cap);
+        if (!*heap) return MOQ_ERR_NOMEM;
+        *heap_cap = cap;
+        dst = *heap;
+    }
+    if (moq_session_track_properties_add_group_order(pub->session, in.data,
+            in.len, track->default_group_order, dst, cap, &len) < 0)
+        return MOQ_ERR_INVAL;
+    *out = (moq_bytes_t){ dst, len };
+    return MOQ_OK;
+}
+
 moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
                                    moq_pub_track_t *track,
                                    const moq_pub_publish_cfg_t *cfg,
@@ -3609,12 +3694,20 @@ moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
     pcfg.track_alias = cfg->track_alias;
     pcfg.has_forward = cfg->has_forward;
     pcfg.forward = cfg->forward;
-    pcfg.track_properties = cfg->track_properties;
     pcfg.auth_tokens = cfg->auth_tokens;
     pcfg.auth_token_count = cfg->auth_token_count;
 
+    uint8_t props_buf[256];
+    uint8_t *props_heap;
+    size_t props_heap_cap;
+    moq_result_t rc = pub_publish_props(pub, track, cfg->track_properties,
+                                        props_buf, sizeof(props_buf),
+                                        &props_heap, &props_heap_cap,
+                                        &pcfg.track_properties);
     moq_publication_t handle;
-    moq_result_t rc = moq_session_publish(pub->session, &pcfg, now_us, &handle);
+    if (rc == MOQ_OK)
+        rc = moq_session_publish(pub->session, &pcfg, now_us, &handle);
+    if (props_heap) pub_free(pub, props_heap, props_heap_cap);
     if (rc < 0) return rc;   /* REQUEST_BLOCKED / WOULD_BLOCK: nothing bound, retry */
 
     track->publication = handle;
