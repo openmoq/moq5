@@ -130,7 +130,7 @@ static moq_subscription_t sub_make_handle(moq_session_t *s, size_t slot)
     return h;
 }
 
-int sub_resolve_handle(moq_session_t *s, moq_subscription_t h)
+int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h)
 {
     uint32_t pool = moq_handle_pool_tag(h._opaque);
     uint16_t tag  = moq_handle_session_tag(h._opaque);
@@ -153,6 +153,17 @@ const moq_resolved_window_t *moq_session_sub_resolved_window(
     moq_sub_entry_t *e = &s->subs[slot];
     if (e->role != MOQ_SUB_ROLE_PUBLISHER || !e->window.has_window) return NULL;
     return &e->window;
+}
+
+moq_group_order_t moq_session_subscription_group_order(
+    const moq_session_t *s, moq_subscription_t sub)
+{
+    if (!s) return MOQ_GROUP_ORDER_DEFAULT;
+    int slot = sub_resolve_handle(s, sub);
+    if (slot < 0) return MOQ_GROUP_ORDER_DEFAULT;
+    const moq_sub_entry_t *e = &s->subs[slot];
+    return session_effective_group_order(e->group_order,
+                                         e->publisher_group_order);
 }
 
 static void sub_free_entry(moq_session_t *s, size_t slot)
@@ -231,6 +242,7 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     e->dt_sub_object_ms = e->dt_sub_subgroup_ms = 0;
     e->dt_upd_has_object = e->dt_upd_has_subgroup = false;
     e->dt_upd_object_ms = e->dt_upd_subgroup_ms = 0;
+    e->group_order = e->publisher_group_order = MOQ_GROUP_ORDER_DEFAULT;
     sub_alias_index_clear(s, slot);   /* remove alias while still ESTABLISHED */
     e->state = MOQ_SUB_FREE;
     e->generation++;
@@ -725,6 +737,7 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
     entry->req_start_object = d->start_object;
     entry->req_end_group = d->end_group;
     entry->forward = d->forward;
+    entry->group_order = d->group_order;
     d->endpoint.kind = MOQ_REQ_SUBSCRIPTION;
     d->endpoint.slot = slot;
     if (d->endpoint.has_stream_ref) {
@@ -2224,6 +2237,7 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
     e.u.subscribe_ok.expires_ms = d->expires_ms;
     e.u.subscribe_ok.track_properties = props;
     e.u.subscribe_ok.dynamic_groups = d->dynamic_groups;
+    e.u.subscribe_ok.publisher_group_order = d->publisher_group_order;
 
     moq_result_t rc = push_event(s, &e);
     if (rc < 0) {
@@ -2246,6 +2260,7 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
         track_hist_merge(s->subs[slot].hist, d->largest_group, d->largest_object);
     /* Gates outbound new-group requests on this subscription's updates. */
     s->subs[slot].dynamic_groups = d->dynamic_groups;
+    s->subs[slot].publisher_group_order = d->publisher_group_order;
     /* Index this established subscriber-role alias BEFORE replaying deferred
      * data below, which looks it up via sub_find_by_alias_subscriber. */
     sub_alias_index_insert(s, (size_t)slot);
@@ -2720,9 +2735,16 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
 
     moq_sub_entry_t *e = &s->subs[d->target_slot];
 
-    /* Pre-check capacity: need 1 event + 1 action for REQUEST_OK. */
+    /* Pre-check capacity: 1 event + 1 action for REQUEST_OK, plus the
+     * changed subscriber priority's owner-wide key. */
+    size_t prio_slots = session_owner_priority_slots(s,
+        d->has_subscriber_priority, d->subscriber_priority,
+        e->subscriber_priority);
     if (event_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
-    if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
+    if (action_queue_avail(s) < 1 + prio_slots) {
+        result = MOQ_ERR_WOULD_BLOCK;
+        goto cleanup_all;
+    }
 
     /* One registry snapshot: it feeds BOTH the REQUEST_OK Largest
      * Object and the stored resolved window. No app mediation on this path. */
@@ -2761,6 +2783,11 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
                                  ok_buf, ok_len, false);
         else
             rc = queue_send_control(s, ok_buf, ok_len);
+        if (rc < 0) { result = rc; goto cleanup_all; }
+    }
+    if (prio_slots) {
+        rc = session_update_owner_priority(s, e->handle._opaque,
+                                           d->subscriber_priority);
         if (rc < 0) { result = rc; goto cleanup_all; }
     }
 
@@ -3046,6 +3073,7 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     /* Commit the effective Forward State (default true) so the data-plane
      * reordering buffer only holds early data for a forwarding subscription. */
     entry->forward = cfg->has_forward ? cfg->forward : true;
+    entry->group_order = (uint8_t)cfg->group_order;
     entry->handle = sub_make_handle(s, (size_t)slot);
     req_ep.kind = MOQ_REQ_SUBSCRIPTION;
     req_ep.slot = slot;
@@ -3117,6 +3145,11 @@ moq_result_t moq_session_accept_subscribe(
     moq_dt_scan_t dtscan;
     if (session_scan_dt_props(s, cfg->track_properties.data,
                               cfg->track_properties.len, true, &dtscan) < 0)
+        return MOQ_ERR_INVAL;
+    uint8_t pub_group_order;
+    if (session_scan_group_order(s, cfg->track_properties.data,
+                                 cfg->track_properties.len, true,
+                                 &pub_group_order) < 0)
         return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
@@ -3222,6 +3255,7 @@ moq_result_t moq_session_accept_subscribe(
 
     /* Commit: all outputs reserved. */
     s->subs[slot].state = MOQ_SUB_ESTABLISHED;
+    s->subs[slot].publisher_group_order = pub_group_order;
     s->subs[slot].dt_pub_has_object   = dtscan.has_object;
     s->subs[slot].dt_pub_object_ms    = dtscan.object_ms;
     s->subs[slot].dt_pub_has_subgroup = dtscan.has_subgroup;

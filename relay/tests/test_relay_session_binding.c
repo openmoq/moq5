@@ -13266,8 +13266,9 @@ jf_origin_accept(jf_t *j, int k, uint64_t eg, uint64_t eo, bool eot, bool with_p
     ac.end_of_track = eot;
     ac.end_group = eg;
     ac.end_object = eo;
-    static const uint8_t props[10] = { 0x10, 0x00, 0x12, 0x00, 0x14, 0x00,
-                                       0x16, 0x00, 0x18, 0x00 };   /* five varint KVPs */
+    /* Five varint KVPs, types 0x10..0x18 (Type-Deltas 0x10, then 0x02). */
+    static const uint8_t props[10] = { 0x10, 0x00, 0x02, 0x00, 0x02, 0x00,
+                                       0x02, 0x00, 0x02, 0x00 };
     if (with_props) {
         ac.track_properties = (moq_bytes_t){ props, sizeof(props) };
     }

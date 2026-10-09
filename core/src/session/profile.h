@@ -474,6 +474,19 @@ typedef struct moq_profile_ops {
     moq_result_t (*scan_delivery_timeouts)(const uint8_t *data, size_t len,
                                            bool strict_local,
                                            moq_dt_scan_t *out);
+
+    /* DEFAULT_PUBLISHER_GROUP_ORDER (0x22); *out is MOQ_GROUP_ORDER_DEFAULT
+     * when omitted. strict_local as in scan_delivery_timeouts. */
+    moq_result_t (*scan_group_order)(const uint8_t *data, size_t len,
+                                     bool strict_local, uint8_t *out);
+    /* Copy `in` to `out` adding DEFAULT_PUBLISHER_GROUP_ORDER = `order`;
+     * `in` must not already carry one. */
+    moq_result_t (*track_properties_put_group_order)(const uint8_t *in,
+                                                     size_t in_len,
+                                                     uint8_t order,
+                                                     uint8_t *out,
+                                                     size_t out_cap,
+                                                     size_t *out_len);
 } moq_profile_ops_t;
 
 const moq_profile_ops_t *moq_profile_lookup(moq_version_t version);

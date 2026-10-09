@@ -423,6 +423,27 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME pq_sim_flow_control COMMAND test_pq_sim_flow_control)
         set_tests_properties(pq_sim_flow_control PROPERTIES TIMEOUT 60)
+
+        # MOQT 7.2 scheduling over real picoquic: group order and priorities
+        # decide what the subscriber receives first on a congested link.
+        add_executable(test_pq_sim_scheduling tests/test_pq_sim_scheduling.c)
+        target_include_directories(test_pq_sim_scheduling PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_sim_scheduling PRIVATE
+            moq::adapter-picoquic
+            picoquic-test
+            ${_adapter_tls_link})
+        target_compile_definitions(test_pq_sim_scheduling PRIVATE
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_sim_scheduling PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_sim_scheduling COMMAND test_pq_sim_scheduling)
+        set_tests_properties(pq_sim_scheduling PROPERTIES TIMEOUT 120)
     endif()
 
     # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
@@ -674,6 +695,22 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_INSTALL_LIBDIR}")
         set_tests_properties(adapter_threaded_install_consumer
             PROPERTIES TIMEOUT 600)
+    endif()
+
+    # End-to-end group order over real picoquic: publisher facade ->
+    # subscriber session, asserting the order groups complete in.
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        add_executable(test_group_order_e2e tests/test_group_order_e2e.c)
+        target_link_libraries(test_group_order_e2e PRIVATE
+            moq::adapter-picoquic-threaded)
+        target_include_directories(test_group_order_e2e PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        add_test(NAME group_order_e2e
+            COMMAND test_group_order_e2e
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(group_order_e2e PROPERTIES
+            LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
     endif()
 endif()
 

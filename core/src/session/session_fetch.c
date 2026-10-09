@@ -1216,6 +1216,21 @@ void moq_accept_fetch_cfg_init(moq_accept_fetch_cfg_t *cfg)
     cfg->struct_size = sizeof(moq_accept_fetch_cfg_t);
 }
 
+/* A FETCH response stream's key: its single stream needs no group order.
+ * The publisher priority is a placeholder; each object's travels in its
+ * SEND_DATA scheduling_priority. */
+static moq_result_t fetch_push_data_key(moq_session_t *s,
+                                        const moq_fetch_entry_t *e,
+                                        moq_stream_ref_t ref)
+{
+    moq_data_priority_t key;
+    memset(&key, 0, sizeof(key));
+    key.subscriber_priority = e->subscriber_priority;
+    key.publisher_priority = 128;
+    key.owner = e->handle._opaque;
+    return session_push_data_key(s, ref, &key);
+}
+
 moq_result_t moq_session_accept_fetch(
     moq_session_t *s,
     moq_fetch_t fetch,
@@ -1228,13 +1243,15 @@ moq_result_t moq_session_accept_fetch(
 #define ACCEPT_FETCH_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_fetch_cfg_t, f) + sizeof(cfg->f))
 
-    /* Track Properties on FETCH_OK are carried only by stream-correlated
-     * profiles (draft-18); reject rather than silently drop them elsewhere. */
     const uint8_t *fetch_props = NULL;
     size_t fetch_props_len = 0;
     if (ACCEPT_FETCH_HAS(track_properties) && cfg->track_properties.len > 0) {
-        if (!cfg->track_properties.data) return MOQ_ERR_INVAL;
-        if (!moq_session_uses_request_streams(s)) return MOQ_ERR_INVAL;
+        uint8_t order;
+        if (!cfg->track_properties.data ||
+            session_scan_group_order(s, cfg->track_properties.data,
+                                     cfg->track_properties.len, true,
+                                     &order) < 0)
+            return MOQ_ERR_INVAL;
         fetch_props = cfg->track_properties.data;
         fetch_props_len = cfg->track_properties.len;
     }
@@ -1252,8 +1269,10 @@ moq_result_t moq_session_accept_fetch(
     /* Stream-correlated profiles deliver FETCH_OK on the request bidi, then open
      * the response data uni with a FETCH_HEADER (carrying the Request ID). */
     if (moq_session_uses_request_streams(s)) {
-        /* Two actions: FETCH_OK on the request bidi + FETCH_HEADER on the uni. */
-        if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+        /* FETCH_OK on the request bidi + FETCH_HEADER on the uni, and the
+         * uni's key. */
+        if (action_queue_avail(s) < (s->data_priority_updates ? 3u : 2u))
+            return MOQ_ERR_WOULD_BLOCK;
         moq_accept_fetch_encode_args_t ok_args = {
             .request_id = s->fetches[slot].request_id,
             .end_of_track = cfg->end_of_track,
@@ -1310,6 +1329,9 @@ moq_result_t moq_session_accept_fetch(
         data_act.u.send_data.fin = cfg->empty;
         data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
             ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
+        rc = fetch_push_data_key(s, &s->fetches[slot],
+                                 data_act.u.send_data.stream_ref);
+        if (rc < 0) return rc;
         rc = push_action(s, &data_act);
         if (rc < 0) return rc;
 
@@ -1322,8 +1344,10 @@ moq_result_t moq_session_accept_fetch(
         return MOQ_OK;
     }
 
-    /* Pre-check: need 2 action slots before any encoding/mutation. */
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    /* Pre-check: 2 action slots (3 with the uni's key) before any
+     * encoding/mutation. */
+    if (action_queue_avail(s) < (s->data_priority_updates ? 3u : 2u))
+        return MOQ_ERR_WOULD_BLOCK;
 
     /* Encode both outputs before pushing either action. */
     moq_accept_fetch_encode_args_t ok_args = {
@@ -1331,6 +1355,8 @@ moq_result_t moq_session_accept_fetch(
         .end_of_track = cfg->end_of_track,
         .end_group = cfg->end_group,
         .end_object = cfg->end_object,
+        .track_properties = fetch_props,
+        .track_properties_len = fetch_props_len,
     };
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, s->send_buf + s->send_len,
@@ -1371,6 +1397,9 @@ moq_result_t moq_session_accept_fetch(
     data_act.u.send_data.fin = cfg->empty;
     data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
         ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
+    rc = fetch_push_data_key(s, &s->fetches[slot],
+                             data_act.u.send_data.stream_ref);
+    if (rc < 0) return rc;
     rc = push_action(s, &data_act);
     if (rc < 0) return rc;
 

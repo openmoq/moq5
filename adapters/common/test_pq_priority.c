@@ -44,5 +44,39 @@ int main(void)
     }
     assert(observed[126] == 254 && observed[139] == 254);
     moq_pq_send_queue_destroy(q);
+
+    /* A newly opened keyed stream starts only while fewer than 126 keyed
+     * streams hold bytes, so each keeps its own level; a stream that already
+     * started is never held back. */
+    q = moq_pq_send_queue_create(&alloc, 0);
+    assert(q);
+    static const uint8_t byte = 0x5a;
+    for (unsigned i = 0; i < 126; ++i) {
+        assert(moq_pq_send_queue_opened(q, 4 * i) == 0);
+        assert(moq_pq_send_queue_set_key(q, 4 * i, 0x10000 + i) == 0);
+        assert(moq_pq_send_queue_push_copy(q, 4 * i, &byte, 1, false) == 1);
+    }
+    assert(moq_pq_send_queue_opened(q, 504) == 0);
+    assert(moq_pq_send_queue_set_key(q, 504, 0x10000 + 126) == 0);
+    assert(moq_pq_send_queue_push_copy(q, 504, &byte, 1, false) == 0);
+    assert(moq_pq_send_queue_push_copy(q, 0, &byte, 1, false) == 1);
+    assert(moq_pq_send_queue_push_copy(q, 2, &byte, 1, false) == 1);
+    size_t nb = 0;
+    bool fin = false, still = false;
+    uint8_t out[8];
+    assert(moq_pq_send_queue_plan(q, 0, sizeof(out), &nb, &fin, &still));
+    moq_pq_send_queue_commit(q, 0, out, nb);
+    assert(!moq_pq_send_queue_has_data(q, 0));
+    assert(moq_pq_send_queue_push_copy(q, 504, &byte, 1, false) == 1);
+    assert(moq_pq_send_queue_set_key(q, 0, 0x10000) == 0);
+    assert(moq_pq_send_queue_push_copy(q, 0, NULL, 0, true) == 1);
+    assert(moq_pq_send_queue_opened(q, 508) == 0);
+    assert(moq_pq_send_queue_set_key(q, 508, 0x10000 + 127) == 0);
+    assert(moq_pq_send_queue_push_copy(q, 508, &byte, 1, false) == 0);
+    assert(moq_pq_send_queue_apply_priorities(q, apply, NULL) == 0);
+    for (unsigned i = 1; i <= 126; ++i)
+        assert(observed[4 * i] > observed[4 * (i - 1)]);
+    assert(observed[2] == 0);
+    moq_pq_send_queue_destroy(q);
     return 0;
 }

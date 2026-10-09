@@ -135,6 +135,9 @@ typedef struct {
     int          n;
     int          v_eot;           /* count of END_OF_TRACK status objects on "v" */
     int          a_count;         /* count of "a" objects (any status) */
+    bool         v_ok, a_ok;      /* SUBSCRIBE_OK seen on "v" / "a" */
+    moq_group_order_t v_pub_order, a_pub_order;  /* publisher preference
+                                                    carried by those OKs */
     int          v_done;          /* count of SUBSCRIBE_DONE on "v" */
     uint64_t     v_done_status;   /* status code of the last "v" SUBSCRIBE_DONE */
     uint64_t     v_done_streams;  /* stream count of the last "v" done */
@@ -264,6 +267,18 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                 st->cat_pub_lg_object = lg_object;
                 pthread_mutex_unlock(&st->mu);
             }
+        } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK) {
+            const moq_subscribe_ok_event_t *ok = &ev.u.subscribe_ok;
+            pthread_mutex_lock(&st->mu);
+            if (st->v_subscribed && moq_subscription_eq(ok->sub, st->sub_v)) {
+                st->v_ok = true;
+                st->v_pub_order = ok->publisher_group_order;
+            } else if (st->a_subscribed &&
+                       moq_subscription_eq(ok->sub, st->sub_a)) {
+                st->a_ok = true;
+                st->a_pub_order = ok->publisher_group_order;
+            }
+            pthread_mutex_unlock(&st->mu);
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
             const moq_object_received_event_t *o = &ev.u.object_received;
             /* Capture the catalog payload (so a test can verify what the sender
@@ -2247,6 +2262,75 @@ int main(int argc, char **argv)
         moq_media_sender_destroy(s);
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == live loopback: per-track group order ============================ *
+     * "a" is added with a Descending preference and "v" without one: the peer
+     * sees the preference on "a"'s SUBSCRIBE_OK only. An out-of-range value is
+     * refused at add_track. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.want_a = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL, *a = NULL;
+        add_video_track(s, &v);
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = MOQ_BYTES_LITERAL("a");
+        tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.codec = MOQ_BYTES_LITERAL("opus");
+        tc.samplerate = 48000;
+        tc.channel_config = MOQ_BYTES_LITERAL("2");
+        tc.bitrate = 32000;
+        tc.group_order = 3u;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &a),
+                              (int)MOQ_ERR_INVAL);
+        tc.group_order = MOQ_GROUP_ORDER_DESCENDING;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &a),
+                              (int)MOQ_OK);
+
+        { moq_rcbuf_t *b = mkbuf(16, 1);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, v, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+        { moq_rcbuf_t *b = mkbuf(16, 2);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, a, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+        for (int i = 0; i < 200; i++) {
+            pthread_mutex_lock(&g_srv.mu);
+            bool both = g_srv.v_ok && g_srv.a_ok;
+            pthread_mutex_unlock(&g_srv.mu);
+            if (both) break;
+            usleep(50000);
+        }
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK(g_srv.v_ok && g_srv.a_ok);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.a_pub_order,
+                              (int)MOQ_GROUP_ORDER_DESCENDING);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.v_pub_order,
+                              (int)MOQ_GROUP_ORDER_DEFAULT);
+        pthread_mutex_unlock(&g_srv.mu);
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.track_group_order");
     }
 
     /* == live loopback: public end_track() drains to a real peer ========= *

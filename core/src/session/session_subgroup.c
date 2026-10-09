@@ -220,6 +220,55 @@ void moq_subgroup_cfg_init(moq_subgroup_cfg_t *cfg)
 
 /* -- Subgroup data path -------------------------------------------- */
 
+void session_subgroup_data_key(uint64_t owner, uint8_t subscriber_priority,
+                               uint8_t group_order,
+                               uint8_t publisher_group_order,
+                               const moq_subgroup_cfg_t *cfg,
+                               moq_data_priority_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->subscriber_priority = subscriber_priority;
+    out->publisher_priority = cfg->publisher_priority;
+    out->descending = session_effective_group_order(group_order,
+                          publisher_group_order) == MOQ_GROUP_ORDER_DESCENDING;
+    out->owner = owner;
+    out->group_id = cfg->group_id;
+    out->subgroup_id = cfg->subgroup_id;
+}
+
+moq_result_t session_push_data_key(moq_session_t *s, moq_stream_ref_t ref,
+                                   const moq_data_priority_t *key)
+{
+    if (!s->data_priority_updates) return MOQ_OK;
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_SET_DATA_PRIORITY;
+    a.detail_size = (uint32_t)sizeof(moq_set_data_priority_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.set_data_priority.stream_ref = ref;
+    a.u.set_data_priority.priority = *key;
+    return push_action(s, &a);
+}
+
+moq_result_t session_update_owner_priority(moq_session_t *s, uint64_t owner,
+                                           uint8_t subscriber_priority)
+{
+    moq_data_priority_t key;
+    memset(&key, 0, sizeof(key));
+    key.owner = owner;
+    key.subscriber_priority = subscriber_priority;
+    return session_push_data_key(s, moq_stream_ref_from_u64(0), &key);
+}
+
+moq_result_t moq_session_set_data_priority_updates(moq_session_t *s,
+                                                   bool enabled)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (enabled && s->action_cap < 2) return MOQ_ERR_INVAL;
+    s->data_priority_updates = enabled;
+    return MOQ_OK;
+}
+
 moq_result_t moq_session_open_subgroup(
     moq_session_t *s, moq_subscription_t sub,
     const moq_subgroup_cfg_t *cfg, uint64_t now_us,
@@ -247,7 +296,9 @@ moq_result_t moq_session_open_subgroup(
     int slot = sg_find_free(s);
     if (slot < 0) return MOQ_ERR_WOULD_BLOCK;
 
-    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    /* The stream's key goes out ahead of its first SEND_DATA. */
+    if (action_queue_avail(s) < (s->data_priority_updates ? 2u : 1u))
+        return MOQ_ERR_WOULD_BLOCK;
 
     bool has_ext = false;
     if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, object_properties) +
@@ -288,6 +339,13 @@ moq_result_t moq_session_open_subgroup(
         ((uint64_t)s->subs[sub_slot].subscriber_priority << 8) |
         cfg->publisher_priority;
 
+    const moq_sub_entry_t *se = &s->subs[sub_slot];
+    moq_data_priority_t key;
+    session_subgroup_data_key(sub._opaque, se->subscriber_priority,
+                              se->group_order, se->publisher_group_order, cfg,
+                              &key);
+    rc = session_push_data_key(s, a.u.send_data.stream_ref, &key);
+    if (rc < 0) return rc;
     rc = push_action(s, &a);
     if (rc < 0) return rc;
 

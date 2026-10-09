@@ -375,6 +375,13 @@ typedef struct moq_media_track_cfg {
      * an older caller's struct_size prefix never reinterprets these bytes. */
     bool        has_alt_group;
     int         alt_group;
+
+    /* DEFAULT_PUBLISHER_GROUP_ORDER for this track (MOQT 7.1): ASCENDING or
+     * DESCENDING is advertised to every subscriber; DEFAULT (the default)
+     * advertises none. Other values: add_track fails MOQ_ERR_INVAL. The
+     * catalog and timeline tracks always keep DEFAULT. Appended after the
+     * alt-group fields: keep new cfg fields at the end. */
+    moq_group_order_t group_order;
 } moq_media_track_cfg_t;
 
 MOQ_API void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg);

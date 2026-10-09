@@ -170,6 +170,8 @@ typedef enum moq_transport_cap {
     /* The adapter can HOLD an inbound peer uni data chunk the bridge did not
      * consume (see "Inbound admission contract" below) and redeliver it. */
     MOQ_TRANSPORT_CAP_HOLD_INPUT    = 1u << 2,
+    /* The endpoint calls moq_transport_bridge_on_stream_drained(). */
+    MOQ_TRANSPORT_CAP_STREAM_DRAINED = 1u << 3,
 } moq_transport_cap_t;
 
 /* -- Endpoint ops vtable -------------------------------------------- */
@@ -256,9 +258,12 @@ typedef struct moq_transport_endpoint_ops {
      */
     moq_transport_result_t (*abort_stream)(void *ctx, uint64_t stream_id,
                                            uint64_t error_code);
-    /* Optional scheduling hint. key is the SEND_DATA priority snapshot.
-     * Called before writes, including retries. OK or ERROR only; ERROR is
-     * fatal. Must not consume bytes. Older/other adapters may omit it. */
+    /* Optional scheduling hint for a data stream: a lower key is served
+     * first, equal keys round-robin, zero is control. The key is
+     * subscriber_priority << 24 | publisher_priority << 16 | (position + 1),
+     * position being the stream's MOQT 7.2 place within its request. Called
+     * before writes and whenever the key changes. OK or ERROR only; ERROR is
+     * fatal. Must not consume bytes. */
     moq_transport_result_t (*set_stream_priority)(void *ctx, uint64_t stream_id,
                                                 uint32_t key);
 } moq_transport_endpoint_ops_t;
@@ -286,7 +291,14 @@ typedef struct moq_transport_bridge_cfg {
     uint32_t           max_streams;    /* 0 = default 128 */
     uint32_t           max_pending;    /* 0 = default 64 */
     uint32_t           max_tombstones; /* 0 = default 64 */
+    /* Appended: the most data bytes the bridge holds back for the endpoint,
+     * to hand over in priority order; at the limit the application sees
+     * backpressure. 0 = MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT. */
+    uint64_t           max_retained_bytes;
 } moq_transport_bridge_cfg_t;
+
+/* With the adapters' default 128 KiB send queue: 1 MiB outbound in total. */
+#define MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT ((uint64_t)(896u * 1024u))
 
 #ifdef __cplusplus
 #define MOQ_TRANSPORT_BRIDGE_CFG_INIT \
@@ -298,8 +310,21 @@ typedef struct moq_transport_bridge_cfg {
         .struct_size = sizeof(moq_transport_bridge_cfg_t) })
 #endif
 
+/* Frozen v0 prefix: through max_tombstones. Not offsetof(max_retained_bytes):
+ * where uint64_t aligns to 8 on a 32-bit ABI that adds padding an older
+ * caller's struct_size does not cover. */
+#define MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE \
+    (offsetof(moq_transport_bridge_cfg_t, max_tombstones) + sizeof(uint32_t))
+
+/* Clears and stamps only the v0 prefix; appended fields need
+ * moq_transport_bridge_cfg_init_sized(). */
 MOQ_API void moq_transport_bridge_cfg_init(
     moq_transport_bridge_cfg_t *cfg,
+    const moq_alloc_t *alloc);
+
+/* Clears and stamps min(cfg_size, sizeof); pass sizeof(*cfg). */
+MOQ_API void moq_transport_bridge_cfg_init_sized(
+    moq_transport_bridge_cfg_t *cfg, size_t cfg_size,
     const moq_alloc_t *alloc);
 
 /* -- Bridge lifecycle ----------------------------------------------- */
@@ -311,6 +336,7 @@ typedef struct moq_transport_bridge moq_transport_bridge_t;
  *
  * session: NOT owned. Must outlive the bridge. Perspective (client/
  *          server) is derived from moq_session_perspective(session).
+ *          Needs max_actions >= 2 (create returns ERR_INVAL otherwise).
  * ops:     NOT owned. Must remain valid for the bridge's lifetime.
  *          Required ops must not be NULL (create returns ERR_INVAL).
  *          Zero-init is a valid starting point but NOT a complete
@@ -446,6 +472,16 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_terminal(
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stop_sending(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     uint64_t error_code, uint64_t now_us);
+
+/*
+ * The endpoint holds no more bytes of local data stream `stream_id` (its send
+ * queue emptied). After the FIN the stream leaves the priority order;
+ * otherwise its next write sets its key again. Without
+ * MOQ_TRANSPORT_CAP_STREAM_DRAINED the bridge keys every write and drops the
+ * stream from the order at the FIN.
+ */
+MOQ_API void moq_transport_bridge_on_stream_drained(
+    moq_transport_bridge_t *brg, uint64_t stream_id);
 
 /*
  * Datagram received from peer. On WOULD_BLOCK: silently dropped

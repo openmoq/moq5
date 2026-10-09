@@ -25,6 +25,22 @@ moq_result_t moq_d18_scan_delivery_timeouts(const uint8_t *props, size_t len,
                                             bool *out_has_subgroup,
                                             uint64_t *out_subgroup_ms);
 
+/* DEFAULT_PUBLISHER_GROUP_ORDER Track Property (draft-18 12.5). */
+#define MOQ_D18_PROP_GROUP_ORDER 0x22u
+
+/* *out_group_order: 0 if omitted, else 1 (ascending) / 2 (descending); also
+ * looks inside IMMUTABLE_PROPERTIES. A bad value, a duplicate or bad structure
+ * is MOQ_ERR_PROTO. */
+moq_result_t moq_d18_scan_group_order(const uint8_t *data, size_t len,
+                                      uint8_t *out_group_order);
+
+/* Copy `in` to `out` with the even `type` = `value` inserted in order. `type`
+ * must not already be present. */
+moq_result_t moq_d18_track_props_put_varint(const uint8_t *in, size_t in_len,
+                                            uint64_t type, uint64_t value,
+                                            uint8_t *out, size_t out_cap,
+                                            size_t *out_len);
+
 /*
  * REQUEST_UPDATE_OK codec (§10.5): the REQUEST_OK form that carries
  * LARGEST_OBJECT / EXPIRES response parameters with empty Track Properties.
