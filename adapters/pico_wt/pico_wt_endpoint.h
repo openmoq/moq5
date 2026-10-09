@@ -123,10 +123,14 @@ void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx);
 /* Service an h3zero picohttp_callback_provide_data for `stream_id`: copy up to
  * `space` queued bytes into picoquic's buffer via `provide_ctx`, setting FIN
  * and still-active as the queue dictates. Reneges when nothing is queued.
- * Returns the value the WT callback should return (0). */
-int pico_wt_endpoint_on_provide_data(pico_wt_endpoint_ctx_t *ctx,
-                                     uint64_t stream_id,
-                                     void *provide_ctx, size_t space);
+ * Returns true when this call emptied the stream's queue. */
+bool pico_wt_endpoint_on_provide_data(pico_wt_endpoint_ctx_t *ctx,
+                                      uint64_t stream_id,
+                                      void *provide_ctx, size_t space);
+
+/* Apply the stream priorities recorded since the last call; call before
+ * picoquic sends. Returns 0, or -1 when picoquic refuses one (fatal). */
+int pico_wt_endpoint_apply_priorities(pico_wt_endpoint_ctx_t *ctx);
 
 /*
  * Called by the adapter when picohttp_callback_provide_datagram

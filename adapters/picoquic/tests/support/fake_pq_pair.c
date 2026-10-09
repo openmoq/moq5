@@ -157,6 +157,13 @@ uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *cnx, int is_unidir)
     return id;
 }
 
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *cnx, uint64_t stream_id,
+                                void *app_stream_ctx)
+{
+    (void)cnx; (void)stream_id; (void)app_stream_ctx;
+    return 0;
+}
+
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *cnx,
     uint64_t stream_id)
 {

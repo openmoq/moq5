@@ -53,6 +53,14 @@ static moq_result_t pw_after_fin_service(moq_pico_wt_conn_t *c, uint64_t now)
     return moq_transport_bridge_service(c->bridge, now);
 }
 static void pw_rx_free_all(moq_pico_wt_conn_t *c);
+
+/* Call before picoquic builds packets; a refusal is fatal. */
+static void pw_apply_priorities(moq_pico_wt_conn_t *c, uint64_t now)
+{
+    if (moq_transport_bridge_is_terminal(c->bridge)) return;
+    if (pico_wt_endpoint_apply_priorities(&c->endpoint_ctx) != 0)
+        moq_transport_bridge_on_transport_error(c->bridge, 0x1, now);
+}
 static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid);
 
 #ifdef MOQ_PICO_WT_TESTING
@@ -363,6 +371,7 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
     if (rc >= 0 && !moq_transport_bridge_is_terminal(conn->bridge)) {
         /* replay anything the drain unblocked and issue owed grants */
         pw_rx_after_service(conn, now_us);
+        pw_apply_priorities(conn, now_us);
         if (moq_transport_bridge_is_fatal(conn->bridge)) return -1;
     }
 
@@ -969,9 +978,14 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
      * stream. Serviced even while terminal so picoquic always gets a buffer
      * response (the queue is drained/empty by then, so it reneges). The WT
      * control stream is driven by h3zero itself, never routed here. */
-    if (event == picohttp_callback_provide_data)
-        return pico_wt_endpoint_on_provide_data(&c->endpoint_ctx, sid,
-                                                bytes, length);
+    if (event == picohttp_callback_provide_data) {
+        /* The resulting re-rank waits for the next service: changing stream
+         * priorities inside provide_data loses frames. */
+        if (pico_wt_endpoint_on_provide_data(&c->endpoint_ctx, sid, bytes,
+                                             length) && c->bridge)
+            moq_transport_bridge_on_stream_drained(c->bridge, sid);
+        return 0;
+    }
 
     if (moq_transport_bridge_is_terminal(c->bridge)) return 0;
 
@@ -1092,6 +1106,7 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
     default:
         break;
     }
+    pw_apply_priorities(c, now);
 
     PW_OBSERVE_CALLBACK(c, event, sid, 1);
     return 0;

@@ -28,7 +28,18 @@ typedef struct {
     pq_chunk_t *tail;
     uint64_t    remaining;    /* data bytes not yet provided */
     uint32_t    priority_key;
+    uint8_t     level;        /* transport priority last applied */
+    bool        level_applied;
+    bool        unstarted;    /* opened, no byte accepted yet */
 } pq_stream_t;
+
+typedef struct {
+    uint32_t key;
+    size_t   slot;
+} pq_rank_t;
+
+/* Highest data rank: picoquic level 2 + 2 * 126 = 254. */
+#define PQ_RANK_MAX 126u
 
 struct moq_pq_send_queue {
     moq_alloc_t  alloc;
@@ -41,6 +52,8 @@ struct moq_pq_send_queue {
     uint64_t     high_water;
     uint64_t     would_block;
     bool         priorities_dirty;
+    pq_rank_t   *order;       /* ranking scratch, order_cap entries */
+    size_t       order_cap;
 };
 
 /* Bump the high-water mark after `queued` grows. */
@@ -109,6 +122,9 @@ void moq_pq_send_queue_destroy(moq_pq_send_queue_t *q)
     if (q->streams)
         q->alloc.free(q->streams, q->nstreams * sizeof(pq_stream_t),
                       q->alloc.ctx);
+    if (q->order)
+        q->alloc.free(q->order, q->order_cap * sizeof(pq_rank_t),
+                      q->alloc.ctx);
     q->alloc.free(q, sizeof(*q), q->alloc.ctx);
 }
 
@@ -150,8 +166,16 @@ static pq_stream_t *pq_find_or_create(moq_pq_send_queue_t *q, uint64_t sid)
     return s;
 }
 
-int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
-    uint32_t key, int (*apply)(void *, uint64_t, uint8_t), void *ctx)
+int moq_pq_send_queue_opened(moq_pq_send_queue_t *q, uint64_t sid)
+{
+    pq_stream_t *s = pq_find_or_create(q, sid);
+    if (!s) return -1;
+    s->unstarted = true;
+    return 0;
+}
+
+int moq_pq_send_queue_set_key(moq_pq_send_queue_t *q, uint64_t sid,
+                              uint32_t key)
 {
     pq_stream_t *s = pq_find_or_create(q, sid);
     if (!s) return -1;
@@ -159,32 +183,75 @@ int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
         s->priority_key = key;
         q->priorities_dirty = true;
     }
+    return 0;
+}
+
+static int pq_rank_cmp(const void *a, const void *b)
+{
+    const pq_rank_t *x = a;
+    const pq_rank_t *y = b;
+    return (x->key > y->key) - (x->key < y->key);
+}
+
+static int pq_order_reserve(moq_pq_send_queue_t *q)
+{
+    if (q->order_cap >= q->nstreams) return 0;
+    pq_rank_t *o = (pq_rank_t *)q->alloc.realloc(
+        q->order, q->order_cap * sizeof(*o), q->nstreams * sizeof(*o),
+        q->alloc.ctx);
+    if (!o) return -1;
+    q->order = o;
+    q->order_cap = q->nstreams;
+    return 0;
+}
+
+static int pq_apply_level(pq_stream_t *s, uint8_t level,
+                          int (*apply)(void *, uint64_t, uint8_t), void *ctx)
+{
+    if (s->level_applied && s->level == level) return 0;
+    if (apply(ctx, s->sid, level) != 0) return -1;
+    s->level = level;
+    s->level_applied = true;
+    return 0;
+}
+
+int moq_pq_send_queue_apply_priorities(moq_pq_send_queue_t *q,
+    int (*apply)(void *, uint64_t, uint8_t), void *ctx)
+{
     if (!q->priorities_dirty) return 0;
+    if (pq_order_reserve(q) != 0) return -1;
     /* Retain ranks alongside bytes, not bridge mappings: FIN can retire the
      * latter before picoquic asks for the last queued packet. */
+    size_t n = 0;
     for (size_t i = 0; i < q->nstreams; ++i) {
-        const pq_stream_t *a = &q->streams[i];
-        if (!a->in_use) continue;
-        unsigned rank = 0;
-        if (a->priority_key) {
-            for (size_t j = 0; j < q->nstreams; ++j) {
-                const pq_stream_t *b = &q->streams[j];
-                if (b->in_use && b->priority_key &&
-                    b->priority_key < a->priority_key && rank < 126)
-                    ++rank;
-            }
+        pq_stream_t *s = &q->streams[i];
+        if (!s->in_use || s->unstarted) continue;
+        if (!s->priority_key) {
+            if (pq_apply_level(s, 0, apply, ctx) != 0) return -1;
+            continue;
         }
-        uint8_t priority = a->priority_key ? (uint8_t)(2 + 2 * rank) : 0;
-        if (apply(ctx, a->sid, priority) != 0) return -1;
+        q->order[n].key = s->priority_key;
+        q->order[n].slot = i;
+        ++n;
+    }
+    if (n > 1) qsort(q->order, n, sizeof(*q->order), pq_rank_cmp);
+    size_t rank = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0 && q->order[i].key != q->order[i - 1].key) rank = i;
+        const size_t r = rank < PQ_RANK_MAX ? rank : PQ_RANK_MAX;
+        if (pq_apply_level(&q->streams[q->order[i].slot], (uint8_t)(2 + 2 * r),
+                           apply, ctx) != 0)
+            return -1;
     }
     q->priorities_dirty = false;
     return 0;
 }
 
-uint32_t moq_pq_send_queue_priority_key(moq_pq_send_queue_t *q, uint64_t sid)
+int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
+    uint32_t key, int (*apply)(void *, uint64_t, uint8_t), void *ctx)
 {
-    const pq_stream_t *s = pq_find(q, sid);
-    return s ? s->priority_key : 0;
+    if (moq_pq_send_queue_set_key(q, sid, key) != 0) return -1;
+    return moq_pq_send_queue_apply_priorities(q, apply, ctx);
 }
 
 /* Aggregate cap check: reject a non-empty-backlog push that would exceed the
@@ -197,8 +264,28 @@ static bool pq_would_exceed(const moq_pq_send_queue_t *q, size_t len)
     return (uint64_t)len > q->cap - q->queued;
 }
 
-static void pq_append(pq_stream_t *s, pq_chunk_t *c)
+/* A keyed stream starts only while fewer than PQ_RANK_MAX keyed streams hold
+ * bytes, so those keep distinct levels; the bridge holds the rest in priority
+ * order. Started streams are never refused, so they always finish. */
+static bool pq_ranks_full(moq_pq_send_queue_t *q, uint64_t sid)
 {
+    const pq_stream_t *s = pq_find(q, sid);
+    if (!s || !s->unstarted || !s->priority_key) return false;
+    size_t n = 0;
+    for (size_t i = 0; i < q->nstreams; i++) {
+        const pq_stream_t *o = &q->streams[i];
+        if (o->in_use && o->priority_key && o->head) n++;
+    }
+    return n >= PQ_RANK_MAX;
+}
+
+/* Enqueue `c`; a stream's first bytes give it a rank. */
+static void pq_append(moq_pq_send_queue_t *q, pq_stream_t *s, pq_chunk_t *c)
+{
+    if (s->unstarted) {
+        s->unstarted = false;
+        q->priorities_dirty = true;
+    }
     c->next = NULL;
     if (s->tail) s->tail->next = c;
     else s->head = c;
@@ -214,7 +301,7 @@ static int pq_push_bare_fin(moq_pq_send_queue_t *q, pq_stream_t *s)
     if (!c) return -1;
     memset(c, 0, sizeof(*c));
     c->fin = true;
-    pq_append(s, c);
+    pq_append(q, s, c);
     return 1;
 }
 
@@ -225,7 +312,10 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
     /* A zero-length non-FIN write carries nothing; accept it without touching
      * a stream slot (creating one would leak an empty in_use entry). */
     if (len == 0 && !fin) return 1;
-    if (pq_would_exceed(q, len)) { q->would_block++; return 0; }
+    if (pq_would_exceed(q, len) || pq_ranks_full(q, sid)) {
+        q->would_block++;
+        return 0;
+    }
 
     pq_stream_t *s = pq_find_or_create(q, sid);
     if (!s) return -1;
@@ -246,7 +336,7 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
     c->data = c->copied;
     c->len = len;
     c->fin = fin;
-    pq_append(s, c);
+    pq_append(q, s, c);
     s->remaining += len;
     q->queued += len;
     pq_note_high_water(q);
@@ -264,7 +354,10 @@ int moq_pq_send_queue_push_rcbuf(moq_pq_send_queue_t *q, uint64_t sid,
     if (len == 0)
         return moq_pq_send_queue_push_copy(q, sid, NULL, 0, fin);
 
-    if (pq_would_exceed(q, len)) { q->would_block++; return 0; }
+    if (pq_would_exceed(q, len) || pq_ranks_full(q, sid)) {
+        q->would_block++;
+        return 0;
+    }
 
     pq_stream_t *s = pq_find_or_create(q, sid);
     if (!s) return -1;
@@ -277,7 +370,7 @@ int moq_pq_send_queue_push_rcbuf(moq_pq_send_queue_t *q, uint64_t sid,
     c->data = moq_rcbuf_data(buf);
     c->len = len;
     c->fin = fin;
-    pq_append(s, c);
+    pq_append(q, s, c);
     s->remaining += len;
     q->queued += len;
     pq_note_high_water(q);

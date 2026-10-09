@@ -59,9 +59,11 @@ static int g_active_flag = -1;
 static uint64_t g_active_sid = 0;
 static uint8_t g_priorities[16];
 static bool g_priority_fail;
+static unsigned g_priority_calls;
 int picoquic_set_stream_priority(picoquic_cnx_t *c, uint64_t sid, uint8_t priority)
 {
     (void)c;
+    g_priority_calls++;
     if (g_priority_fail) return -1;
     if (sid < 16) g_priorities[sid] = priority;
     return 0;
@@ -79,6 +81,8 @@ uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin,
       return g_provide_fail ? NULL : g_provide_buf; }
 uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *c, int uni)
     { (void)c; return uni ? g_next_uni++ : g_next_bidi++; }
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+    { (void)c; (void)sid; (void)ctx; return 0; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
     { (void)c; (void)sid; return 0x42; }
 int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
@@ -279,15 +283,18 @@ int main(void)
     {
         moq_transport_endpoint_ops_t ops = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
         pq_endpoint_ctx_t ep;
-        CHECK(pq_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&ep, &al) == 0);
+        CHECK(pq_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&ep, &al, 0) == 0);
         CHECK(ops.set_stream_priority != NULL);
         CHECK(ops.set_stream_priority(&ep, 2, 0x180c8) == MOQ_TRANSPORT_OK);
         CHECK(ops.set_stream_priority(&ep, 6, 0x18010) == MOQ_TRANSPORT_OK);
+        CHECK(pq_endpoint_apply_priorities(&ep) == 0);
         CHECK(g_priorities[6] < g_priorities[2]);
         CHECK(ops.set_stream_priority(&ep, 10, 0x17fff) == MOQ_TRANSPORT_OK);
+        CHECK(pq_endpoint_apply_priorities(&ep) == 0);
         CHECK(g_priorities[10] < g_priorities[6]);
         g_priority_fail = true;
-        CHECK(ops.set_stream_priority(&ep, 14, 0x10000) == MOQ_TRANSPORT_ERROR);
+        CHECK(ops.set_stream_priority(&ep, 14, 0x10000) == MOQ_TRANSPORT_OK);
+        CHECK(pq_endpoint_apply_priorities(&ep) == -1);
         g_priority_fail = false;
         pq_endpoint_cleanup(&ep);
     }
@@ -1124,6 +1131,52 @@ int main(void)
                         picoquic_callback_prepare_to_send, ad, NULL);
         CHECK(g_provide_nb == 0);
         CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+
+        moq_pq_conn_destroy(ad);
+        moq_session_destroy(c); moq_session_destroy(s);
+    }
+
+    /* -- 20b. Endpoint pull: priorities change only outside prepare_to_send.
+     * Draining a stream re-ranks the rest of its request; doing that while
+     * picoquic builds a packet lost a FIN, so it waits for the next service. */
+    {
+        g_active_flag = -1; g_send_fail = false;
+        moq_alloc_t a = talloc();
+        moq_session_t *c = NULL, *s = NULL;
+        moq_subscription_t ss = setup(&a, &c, &s, 0, 0);
+        moq_pq_conn_t *ad = mkad(&a, s);
+
+        uint64_t first = g_next_uni;
+        for (uint64_t g = 1; g <= 2; g++) {
+            moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+            sg.group_id = g;
+            moq_subgroup_handle_t sgh;
+            CHECK(moq_session_open_subgroup(s, ss, &sg, 0, &sgh) == MOQ_OK);
+            moq_rcbuf_t *p = NULL;
+            moq_rcbuf_create(&a, (const uint8_t *)"PAYLOAD", 7, &p);
+            moq_session_write_object(s, sgh, 0, p, 0);
+            moq_rcbuf_decref(p);
+            moq_session_close_subgroup(s, sgh, 0);
+        }
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        uint64_t sid1 = first, sid2 = g_next_uni - 1;
+        CHECK(sid1 != sid2 && sid2 < 16);
+        CHECK(g_priorities[sid1] < g_priorities[sid2]);
+
+        bool saw_fin = false;
+        for (int rounds = 0; rounds < 60 && !saw_fin; rounds++) {
+            unsigned calls = g_priority_calls;
+            g_provide_nb = 999; g_provide_fin = -1;
+            moq_pq_callback(NULL, sid1, (uint8_t *)(uintptr_t)0xABC, 64,
+                            picoquic_callback_prepare_to_send, ad, NULL);
+            CHECK(g_priority_calls == calls);
+            if (g_provide_fin == 1) saw_fin = true;
+        }
+        CHECK(saw_fin);
+        unsigned calls = g_priority_calls;
+        CHECK(moq_pq_service(ad, g_time) == 0);
+        CHECK(g_priority_calls > calls);
+        CHECK(g_priorities[sid2] == 2);
 
         moq_pq_conn_destroy(ad);
         moq_session_destroy(c); moq_session_destroy(s);

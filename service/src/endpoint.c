@@ -1185,6 +1185,9 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
      * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
      * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
     fc.keep_alive_interval_ms = 15000;
+    if (cfg->struct_size >= offsetof(moq_endpoint_cfg_t, send_queue_cap_bytes) +
+                            sizeof(cfg->send_queue_cap_bytes))
+        fc.send_queue_cap_bytes = cfg->send_queue_cap_bytes;
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;

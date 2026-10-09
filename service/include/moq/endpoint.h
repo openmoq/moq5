@@ -244,6 +244,11 @@ typedef struct moq_endpoint_cfg {
      * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint64_t handshake_timeout_us;
+    /* appended (enabled by struct_size): the transport adapter's outbound
+     * queue bound in bytes (see moq_pq_conn_cfg_t); 0 = adapter default.
+     * Honored by the picoquic backend only. Set it via
+     * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    uint64_t send_queue_cap_bytes;
 } moq_endpoint_cfg_t;
 
 /* Largest accepted moq_endpoint_cfg_t.handshake_timeout_us (see its doc above).
