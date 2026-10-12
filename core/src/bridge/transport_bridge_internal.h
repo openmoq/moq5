@@ -163,6 +163,37 @@ typedef struct {
     uint64_t              canon_sid;
 } bridge_pending_item_t;
 
+/* A local data stream's MOQT 7.2 scheduling state, from its SET_DATA_PRIORITY
+ * key until its FIN or reset leaves the bridge. Its SEND_DATA actions wait in
+ * `q` until the endpoint can take them, best key first. */
+typedef struct {
+    bool                active;
+    moq_stream_ref_t    ref;
+    moq_data_priority_t key;
+    bool                has_sid;
+    uint64_t            sid;
+    uint32_t            pos;        /* place within (owner, publisher prio) */
+    uint8_t             pub;        /* publisher priority of the next object */
+    uint32_t            applied;    /* endpoint key last set */
+    bool                keyed;      /* the endpoint holds `applied` */
+    bool                fin_handed;
+    uint64_t            served;     /* serve_seq of its last hand-off */
+    moq_action_t       *q;          /* ring of owned SEND_DATA actions */
+    uint32_t            q_cap;
+    uint32_t            q_head;
+    uint32_t            q_len;
+    uint32_t            next_free;  /* free slot list */
+    uint32_t            waiting_at; /* place in dq_waiting while q_len > 0 */
+} bridge_dstream_t;
+
+/* Open-addressing entry mapping an ID to a dstream slot. */
+typedef struct {
+    uint64_t id;
+    uint32_t slot;                  /* BRIDGE_INDEX_EMPTY when unused */
+} bridge_index_entry_t;
+
+#define BRIDGE_INDEX_EMPTY UINT32_MAX
+
 /* -- Bridge --------------------------------------------------------- */
 
 struct moq_transport_bridge {
@@ -203,14 +234,30 @@ struct moq_transport_bridge {
 
     bridge_stream_entry_t *streams;
     uint32_t               max_streams;
+    uint32_t               streams_active;
 
     bridge_pending_item_t *pending;
     uint32_t               pending_count;
     uint32_t               max_pending;
+    uint32_t               pending_writes; /* HEADER_PAYLOAD, PAYLOAD_ONLY */
+    uint32_t               pending_opens;  /* OPEN_UNI_DATA */
 
     uint64_t              *tombstones;
     uint32_t               tombstone_count;
     uint32_t               max_tombstones;
+
+    bridge_dstream_t      *dstreams;       /* dstream_cap entries, grows */
+    uint32_t               dstream_cap;
+    uint32_t               dstream_free;   /* free list; dstream_cap if empty */
+    bridge_index_entry_t  *dref_index;     /* ref -> slot */
+    bridge_index_entry_t  *dsid_index;     /* stream ID -> slot */
+    uint32_t               dindex_mask;    /* index size - 1 */
+    uint32_t              *dq_waiting;     /* slots with q_len > 0 */
+    uint32_t               dq_waiting_len;
+    uint64_t               dq_bytes;       /* bytes queued across dstreams */
+    uint32_t               dq_items;       /* actions queued across dstreams */
+    uint64_t               max_retained_bytes;
+    uint64_t               serve_seq;
 };
 
 /* -- Internal helpers ----------------------------------------------- */
@@ -223,7 +270,8 @@ bridge_stream_entry_t *bridge_find_by_ref(
 bridge_stream_entry_t *bridge_find_by_id(
     moq_transport_bridge_t *b, uint64_t transport_id);
 
-void bridge_deactivate_stream(bridge_stream_entry_t *e);
+void bridge_deactivate_stream(moq_transport_bridge_t *b,
+                              bridge_stream_entry_t *e);
 /* Retire an aborting entry on any terminal peer signal (FIN/reset/
  * stream terminal). No-op if the entry is absent or not aborting. */
 void bridge_retire_aborting(moq_transport_bridge_t *b, uint64_t transport_id);

@@ -1214,6 +1214,13 @@ static moq_result_t d16_decode_subscribe_ok(moq_session_t *s,
         *out_consumed = true;
         return close_with_error(s, 0x3, "DYNAMIC_GROUPS value above 1");
     }
+    if (moq_d16_scan_group_order_ext(ok.track_extensions,
+            ok.track_extensions_len, false,
+            &out->publisher_group_order) < 0) {
+        *out_consumed = true;
+        return close_with_error(s, 0x3,
+                                "invalid DEFAULT_PUBLISHER_GROUP_ORDER");
+    }
 
     if (unsub_tomb_consume(s, ok.request_id)) {
         *out_consumed = true;
@@ -1871,6 +1878,13 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
         *out_consumed = true;
         return close_with_error(s, 0x3, "DYNAMIC_GROUPS value above 1");
     }
+    if (moq_d16_scan_group_order_ext(pub.track_extensions,
+            pub.track_extensions_len, false,
+            &out->publisher_group_order) < 0) {
+        *out_consumed = true;
+        return close_with_error(s, 0x3,
+                                "invalid DEFAULT_PUBLISHER_GROUP_ORDER");
+    }
 
     {
         moq_result_t vrc = s->profile->validate_inbound_request(
@@ -2477,6 +2491,16 @@ static moq_result_t d16_decode_fetch_ok_inbound(
     out->end_object = ok.end_object;
     out->track_properties = ok.track_extensions;
     out->track_properties_len = ok.track_extensions_len;
+    {
+        /* Validate only: a FETCH has its own order. */
+        uint8_t group_order = 0;
+        if (moq_d16_scan_group_order_ext(ok.track_extensions,
+                ok.track_extensions_len, false, &group_order) < 0) {
+            *out_consumed = true;
+            return close_with_error(s, 0x3,
+                                    "invalid DEFAULT_PUBLISHER_GROUP_ORDER");
+        }
+    }
     return MOQ_OK;
 }
 
@@ -3742,6 +3766,20 @@ static moq_result_t d16_encode_publish_op(moq_session_t *s,
     return rc;
 }
 
+static moq_result_t d16_scan_group_order(const uint8_t *data, size_t len,
+                                         bool strict_local, uint8_t *out)
+{
+    return moq_d16_scan_group_order_ext(data, len, strict_local, out);
+}
+
+static moq_result_t d16_track_properties_put_group_order(
+    const uint8_t *in, size_t in_len, uint8_t order,
+    uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    return moq_d16_track_ext_put_varint(in, in_len, MOQ_D16_EXT_GROUP_ORDER,
+                                        order, out, out_cap, out_len);
+}
+
 /* Lenient outbound-side extraction of dynamic-group support (mirrors the
  * inbound lenient walk; a >1 value reads as unsupported here -- the peer
  * will close on receipt). */
@@ -4469,7 +4507,8 @@ static moq_result_t d16_encode_fetch_ok_op(moq_session_t *s,
         .end_group = args->end_group,
         .end_object = args->end_object,
         .params = NULL, .params_count = 0, .params_cap = 0,
-        .track_extensions = NULL, .track_extensions_len = 0,
+        .track_extensions = args->track_properties,
+        .track_extensions_len = args->track_properties_len,
     };
     return moq_d16_encode_fetch_ok(w, &ok);
 }
@@ -4810,6 +4849,8 @@ static const moq_profile_ops_t d16_ops = {
     .encode_publish         = d16_encode_publish_op,
     .track_properties_dynamic_groups = d16_track_properties_dynamic_groups,
     .scan_delivery_timeouts = d16_scan_delivery_timeouts,
+    .scan_group_order       = d16_scan_group_order,
+    .track_properties_put_group_order = d16_track_properties_put_group_order,
     .encode_publish_ok      = d16_encode_publish_ok_op,
     .encode_publish_done    = d16_encode_publish_done_op,
     .encode_publish_namespace       = d16_encode_publish_namespace_op,

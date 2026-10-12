@@ -604,6 +604,16 @@ void moq_pq_conn_cfg_init_sized(moq_pq_conn_cfg_t *cfg, size_t cfg_size)
     cfg->struct_size = (uint32_t)n;
 }
 
+/* The bridge's share of the 1 MiB outbound budget, never below one default
+ * queue. */
+static uint64_t pq_bridge_retained(uint64_t queue_cap)
+{
+    const uint64_t total = MOQ_PQ_SEND_QUEUE_CAP_DEFAULT +
+                           MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT;
+    const uint64_t floor = MOQ_PQ_SEND_QUEUE_CAP_DEFAULT;
+    return queue_cap + floor < total ? total - queue_cap : floor;
+}
+
 int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
                          moq_pq_conn_t **out)
 {
@@ -633,15 +643,21 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
         sizeof(cfg->after_callback))
         c->after_callback = cfg->after_callback;
 
+    uint64_t queue_cap = MOQ_PQ_SEND_QUEUE_CAP_DEFAULT;
+    if (cfg->struct_size >= offsetof(moq_pq_conn_cfg_t, send_queue_cap_bytes) +
+        sizeof(cfg->send_queue_cap_bytes) && cfg->send_queue_cap_bytes)
+        queue_cap = cfg->send_queue_cap_bytes;
+
     /* Initialize endpoint ops and bridge. */
     if (pq_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx, cfg->cnx,
-                         &c->alloc) != 0) {
+                         &c->alloc, queue_cap) != 0) {
         c->alloc.free(c, sizeof(*c), c->alloc.ctx);
         return -1;
     }
 
     moq_transport_bridge_cfg_t bcfg;
-    moq_transport_bridge_cfg_init(&bcfg, cfg->alloc);
+    moq_transport_bridge_cfg_init_sized(&bcfg, sizeof(bcfg), cfg->alloc);
+    bcfg.max_retained_bytes = pq_bridge_retained(queue_cap);
     moq_result_t brc = moq_transport_bridge_create(
         &bcfg, cfg->session, &c->endpoint_ops, &c->endpoint_ctx,
         &c->bridge);
@@ -761,6 +777,14 @@ bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn)
 
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
+/* Call before picoquic builds packets; a refusal is fatal. */
+static void pq_apply_priorities(moq_pq_conn_t *c, uint64_t now)
+{
+    if (moq_transport_bridge_is_terminal(c->bridge)) return;
+    if (pq_endpoint_apply_priorities(&c->endpoint_ctx) != 0)
+        moq_transport_bridge_on_transport_error(c->bridge, 0x1, now);
+}
+
 int moq_pq_callback(picoquic_cnx_t *cnx,
                       uint64_t stream_id,
                       uint8_t *bytes, size_t length,
@@ -776,8 +800,12 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
      * Serviced even while terminal so picoquic always gets a buffer response
      * (the queue is drained/empty by then, so it reneges). */
     if (event == picoquic_callback_prepare_to_send) {
-        pq_endpoint_on_prepare_to_send(&c->endpoint_ctx, stream_id,
-                                       bytes, length);
+        /* The resulting re-rank waits for the next service: changing stream
+         * priorities inside prepare_to_send loses frames (a FIN never
+         * reached the peer). */
+        if (pq_endpoint_on_prepare_to_send(&c->endpoint_ctx, stream_id,
+                                           bytes, length) && c->bridge)
+            moq_transport_bridge_on_stream_drained(c->bridge, stream_id);
         if (c->after_callback)
             c->after_callback(c, c->user_ctx);
         return 0;
@@ -907,6 +935,7 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
     default:
         break;
     }
+    pq_apply_priorities(c, now);
 
     /* After the bridge has been told, so on_transport_close ran with a live
      * endpoint, and before the hook, so the hook observes the final state. */
@@ -941,8 +970,10 @@ int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us)
          * manage). */
         if (rc >= 0 && !moq_transport_bridge_is_terminal(conn->bridge)) {
             pq_rx_after_service(conn, now_us);
-            /* The replay/credit step can itself go fatal (rejected grant,
-             * failed replay); success-after-fatal must never be reported. */
+            pq_apply_priorities(conn, now_us);
+            /* These steps can themselves go fatal (rejected grant, failed
+             * replay or priority); success-after-fatal must never be
+             * reported. */
             if (moq_transport_bridge_is_fatal(conn->bridge))
                 rc = MOQ_ERR_INTERNAL;
         }

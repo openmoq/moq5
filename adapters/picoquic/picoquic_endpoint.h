@@ -62,21 +62,28 @@ void moq_pq_conn_get_send_stats(const moq_pq_conn_t *conn,
  */
 bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn);
 
-/* Returns 0 on success, -1 on allocation failure (queue create). */
+/* Returns 0 on success, -1 on allocation failure (queue create). queue_cap
+ * bounds the outbound queue (0 = MOQ_PQ_SEND_QUEUE_CAP_DEFAULT). */
 int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
                      pq_endpoint_ctx_t *ep_ctx,
                      picoquic_cnx_t *cnx,
-                     const moq_alloc_t *alloc);
+                     const moq_alloc_t *alloc,
+                     uint64_t queue_cap);
 
 /* Release the outbound queue (decref retained rcbufs, free copies). */
 void pq_endpoint_cleanup(pq_endpoint_ctx_t *ep_ctx);
 
 /* Service a picoquic_callback_prepare_to_send for `stream_id`: copy up to
  * `max` queued bytes into picoquic's buffer via `provide_ctx`, setting FIN and
- * still-active as the queue dictates. Reneges (0,0,0) when nothing is queued. */
-void pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep_ctx,
+ * still-active as the queue dictates. Reneges (0,0,0) when nothing is queued.
+ * Returns true when this call emptied the stream's queue. */
+bool pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep_ctx,
                                     uint64_t stream_id,
                                     void *provide_ctx, size_t max);
+
+/* Apply the stream priorities recorded since the last call; call before
+ * picoquic sends. Returns 0, or -1 when picoquic refuses one (fatal). */
+int pq_endpoint_apply_priorities(pq_endpoint_ctx_t *ep_ctx);
 
 #ifdef __cplusplus
 }

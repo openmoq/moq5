@@ -32,6 +32,34 @@ static bool session_idle_expired(const moq_session_t *s)
            s->last_now_us >= s->idle_deadline_us;
 }
 
+moq_result_t session_scan_group_order(const moq_session_t *s,
+                                      const uint8_t *data, size_t len,
+                                      bool strict_local, uint8_t *out)
+{
+    *out = MOQ_GROUP_ORDER_DEFAULT;
+    if (!data || len == 0) return MOQ_OK;
+    moq_result_t rc = s->profile->scan_group_order(data, len, strict_local,
+                                                   out);
+    if (rc < 0) *out = MOQ_GROUP_ORDER_DEFAULT;
+    return rc;
+}
+
+moq_result_t moq_session_track_properties_add_group_order(
+    const moq_session_t *s, const uint8_t *in, size_t in_len,
+    moq_group_order_t order, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    if (!s || !out || !out_len || (in_len > 0 && !in)) return MOQ_ERR_INVAL;
+    if (order != MOQ_GROUP_ORDER_ASCENDING &&
+        order != MOQ_GROUP_ORDER_DESCENDING)
+        return MOQ_ERR_INVAL;
+    uint8_t existing;
+    if (session_scan_group_order(s, in, in_len, true, &existing) < 0 ||
+        existing != MOQ_GROUP_ORDER_DEFAULT)
+        return MOQ_ERR_INVAL;
+    return s->profile->track_properties_put_group_order(
+        in, in_len, (uint8_t)order, out, out_cap, out_len);
+}
+
 moq_result_t session_scan_dt_props(const moq_session_t *s,
                                    const uint8_t *data, size_t len,
                                    bool strict_local, moq_dt_scan_t *out)

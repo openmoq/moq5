@@ -84,6 +84,12 @@ target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
 
+add_executable(test_scheduling unit/test_scheduling.c)
+target_link_libraries(test_scheduling PRIVATE moq-core)
+target_include_directories(test_scheduling PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME scheduling COMMAND test_scheduling)
+
 add_executable(test_pq_priority ../adapters/common/test_pq_priority.c
     ../adapters/common/moq_pq_send_queue.c)
 target_link_libraries(test_pq_priority PRIVATE moq::core)
@@ -349,6 +355,10 @@ if(TARGET moq::sim)
     add_executable(test_session_publish_params unit/test_session_publish_params.c)
     target_link_libraries(test_session_publish_params PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_publish_params COMMAND test_session_publish_params)
+
+    add_executable(test_group_order unit/test_group_order.c)
+    target_link_libraries(test_group_order PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME group_order COMMAND test_group_order)
 
     add_executable(test_session_stream_count unit/test_session_stream_count.c)
     target_link_libraries(test_session_stream_count PRIVATE moq-core-test-internals moq::sim)

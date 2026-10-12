@@ -25,7 +25,12 @@ static moq_transport_result_t pq_open_uni(void *ctx, uint64_t *out_id)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;   /* cnx released; see the header */
-    *out_id = picoquic_get_next_local_stream_id(ep->cnx, 1);
+    uint64_t id = picoquic_get_next_local_stream_id(ep->cnx, 1);
+    /* Create it now: the next open must not get the same id. */
+    if (picoquic_set_app_stream_ctx(ep->cnx, id, NULL) != 0 ||
+        moq_pq_send_queue_opened(ep->queue, id) != 0)
+        return MOQ_TRANSPORT_ERROR;
+    *out_id = id;
     return MOQ_TRANSPORT_OK;
 }
 
@@ -33,7 +38,12 @@ static moq_transport_result_t pq_open_bidi(void *ctx, uint64_t *out_id)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;
-    *out_id = picoquic_get_next_local_stream_id(ep->cnx, 0);
+    uint64_t id = picoquic_get_next_local_stream_id(ep->cnx, 0);
+    /* Create it now: the next open must not get the same id. */
+    if (picoquic_set_app_stream_ctx(ep->cnx, id, NULL) != 0 ||
+        moq_pq_send_queue_opened(ep->queue, id) != 0)
+        return MOQ_TRANSPORT_ERROR;
+    *out_id = id;
     return MOQ_TRANSPORT_OK;
 }
 
@@ -47,8 +57,15 @@ static int pq_apply_priority(void *ctx, uint64_t sid, uint8_t priority)
 static moq_transport_result_t pq_priority(void *ctx, uint64_t sid, uint32_t key)
 {
     pq_endpoint_ctx_t *ep = ctx;
-    return moq_pq_send_queue_priority(ep->queue, sid, key, pq_apply_priority, ep) == 0
+    return moq_pq_send_queue_set_key(ep->queue, sid, key) == 0
         ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+}
+
+int pq_endpoint_apply_priorities(pq_endpoint_ctx_t *ep_ctx)
+{
+    if (!ep_ctx->cnx) return 0;
+    return moq_pq_send_queue_apply_priorities(ep_ctx->queue,
+                                              pq_apply_priority, ep_ctx);
 }
 
 static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
@@ -57,9 +74,6 @@ static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;    /* cnx released */
     if (r < 0) return MOQ_TRANSPORT_ERROR;       /* allocation failure: fatal */
     if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* queue cap: retain + retry */
-    if (pq_priority(ep, stream_id,
-            moq_pq_send_queue_priority_key(ep->queue, stream_id)) != MOQ_TRANSPORT_OK)
-        return MOQ_TRANSPORT_ERROR;
     /* Bytes are queued; picoquic must poll the stream to pull them. A failure
      * to mark it active means they would never be sent -- treat as fatal. */
     if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, NULL) != 0)
@@ -97,7 +111,7 @@ static moq_transport_result_t pq_reset(void *ctx, uint64_t stream_id,
     return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
 }
 
-void pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep,
+bool pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep,
                                     uint64_t stream_id,
                                     void *provide_ctx, size_t max)
 {
@@ -107,14 +121,14 @@ void pq_endpoint_on_prepare_to_send(pq_endpoint_ctx_t *ep,
                                 &nb, &is_fin, &still)) {
         /* Nothing queued: renege so picoquic can fill the packet otherwise. */
         (void)picoquic_provide_stream_data_buffer(provide_ctx, 0, 0, 0);
-        return;
+        return false;
     }
     uint8_t *dst = picoquic_provide_stream_data_buffer(
         provide_ctx, nb, is_fin ? 1 : 0, still ? 1 : 0);
-    if (dst) {
-        moq_pq_send_queue_commit(ep->queue, stream_id, dst, nb);
-        ep->provided_bytes += nb;
-    }
+    if (!dst) return false;
+    moq_pq_send_queue_commit(ep->queue, stream_id, dst, nb);
+    ep->provided_bytes += nb;
+    return !still;
 }
 
 void pq_endpoint_get_stats(const pq_endpoint_ctx_t *ep,
@@ -210,17 +224,19 @@ static moq_transport_result_t pq_close(void *ctx, uint64_t code,
 int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
                      pq_endpoint_ctx_t *ep_ctx,
                      picoquic_cnx_t *cnx,
-                     const moq_alloc_t *alloc)
+                     const moq_alloc_t *alloc,
+                     uint64_t queue_cap)
 {
     ep_ctx->cnx = cnx;
-    ep_ctx->queue = moq_pq_send_queue_create(alloc, 0);
+    ep_ctx->queue = moq_pq_send_queue_create(alloc, queue_cap);
     if (!ep_ctx->queue) return -1;
 
     *ops = (moq_transport_endpoint_ops_t){
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),
         .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM |
                            MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
-                           MOQ_TRANSPORT_CAP_HOLD_INPUT,
+                           MOQ_TRANSPORT_CAP_HOLD_INPUT |
+                           MOQ_TRANSPORT_CAP_STREAM_DRAINED,
         .open_uni        = pq_open_uni,
         .open_bidi       = pq_open_bidi,
         .write           = pq_write,

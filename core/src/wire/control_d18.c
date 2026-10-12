@@ -512,10 +512,15 @@ moq_result_t moq_d18_decode_track_status(const uint8_t *payload,
  * (*out_mandatory = true) and is NOT itself an error (the caller decides — object
  * properties are malformed and close, track properties respond
  * UNSUPPORTED_EXTENSION); when NULL it is rejected (MOQ_ERR_PROTO). Malformed
- * structure is always MOQ_ERR_PROTO. */
+ * structure is always MOQ_ERR_PROTO.
+ *
+ * A non-NULL `out_group_order` (track blocks only, zeroed by the caller) also
+ * enforces DEFAULT_PUBLISHER_GROUP_ORDER (draft-18 12.5): 1 or 2, at most
+ * once. */
 static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
                                              bool nested, bool *out_mandatory,
-                                             bool *out_dynamic_groups)
+                                             bool *out_dynamic_groups,
+                                             uint8_t *out_group_order)
 {
     moq_buf_reader_t r;
     moq_buf_reader_init(&r, data, len);
@@ -539,7 +544,7 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
                 if (nested) return MOQ_ERR_PROTO;   /* §12.7: no nesting */
                 moq_result_t rc = d18_validate_props_inner(
                     moq_buf_reader_ptr(&r), (size_t)vlen, true, out_mandatory,
-                    out_dynamic_groups);
+                    out_dynamic_groups, out_group_order);
                 if (rc < 0) return rc;
             }
             r.pos += (size_t)vlen;
@@ -554,6 +559,10 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
                  * them too. */
                 if (v > 1) return MOQ_ERR_PROTO;
                 if (out_dynamic_groups && v == 1) *out_dynamic_groups = true;
+            } else if (type == MOQ_D18_PROP_GROUP_ORDER && out_group_order) {
+                if (v < 1 || v > 2) return MOQ_ERR_PROTO;
+                if (*out_group_order != 0) return MOQ_ERR_PROTO; /* duplicate */
+                *out_group_order = (uint8_t)v;
             }
         }
     }
@@ -564,7 +573,9 @@ static moq_result_t d18_validate_props_inner(const uint8_t *data, size_t len,
 static moq_result_t d18_validate_track_properties(const uint8_t *data,
                                                   size_t len)
 {
-    return d18_validate_props_inner(data, len, false, NULL, NULL);
+    uint8_t group_order = 0;
+    return d18_validate_props_inner(data, len, false, NULL, NULL,
+                                    &group_order);
 }
 
 /* §9.8: pure per-profile timeout scanner. Extracts OBJECT_DELIVERY_TIMEOUT
@@ -639,15 +650,16 @@ static moq_result_t d18_scan_track_properties(const uint8_t *data, size_t len,
                                               bool *out_mandatory,
                                               bool *out_dynamic_groups)
 {
+    uint8_t group_order = 0;
     *out_mandatory = false;
     if (out_dynamic_groups) *out_dynamic_groups = false;
     return d18_validate_props_inner(data, len, false, out_mandatory,
-                                    out_dynamic_groups);
+                                    out_dynamic_groups, &group_order);
 }
 
 moq_result_t moq_d18_validate_properties(const uint8_t *data, size_t len)
 {
-    return d18_validate_props_inner(data, len, false, NULL, NULL);
+    return d18_validate_props_inner(data, len, false, NULL, NULL, NULL);
 }
 
 /* Lenient DYNAMIC_GROUPS extraction for the profile's outbound latch: walks
@@ -661,9 +673,76 @@ moq_result_t moq_d18_scan_dynamic_groups(const uint8_t *data, size_t len,
     if (!out_dynamic_groups) return MOQ_ERR_INVAL;
     if (len > 0 && !data) return MOQ_ERR_INVAL;
     bool mandatory_ignored = false;
+    uint8_t group_order = 0;
     *out_dynamic_groups = false;
     return d18_validate_props_inner(data, len, false, &mandatory_ignored,
-                                    out_dynamic_groups);
+                                    out_dynamic_groups, &group_order);
+}
+
+moq_result_t moq_d18_scan_group_order(const uint8_t *data, size_t len,
+                                      uint8_t *out_group_order)
+{
+    if (!out_group_order) return MOQ_ERR_INVAL;
+    if (len > 0 && !data) return MOQ_ERR_INVAL;
+    bool mandatory_ignored = false;
+    uint8_t group_order = 0;
+    *out_group_order = 0;
+    if (len == 0) return MOQ_OK;
+    moq_result_t rc = d18_validate_props_inner(data, len, false,
+                                               &mandatory_ignored, NULL,
+                                               &group_order);
+    if (rc == MOQ_OK) *out_group_order = group_order;
+    return rc;
+}
+
+moq_result_t moq_d18_track_props_put_varint(const uint8_t *in, size_t in_len,
+                                            uint64_t type, uint64_t value,
+                                            uint8_t *out, size_t out_cap,
+                                            size_t *out_len)
+{
+    if ((type & 1) || !out || !out_len || (in_len > 0 && !in))
+        return MOQ_ERR_INVAL;
+    moq_buf_reader_t r;
+    moq_buf_writer_t w;
+    moq_buf_reader_init(&r, in, in_len);
+    moq_buf_writer_init(&w, out, out_cap);
+    uint64_t prev_in = 0, prev_out = 0;
+    bool placed = false;
+    while (moq_buf_reader_remaining(&r) > 0) {
+        uint64_t delta;
+        if (moq_buf_read_vi64(&r, &delta) < 0) return MOQ_ERR_INVAL;
+        if (delta > UINT64_MAX - prev_in) return MOQ_ERR_INVAL;
+        uint64_t t = prev_in + delta;
+        prev_in = t;
+        size_t body = moq_buf_reader_offset(&r);
+        if (t & 1) {
+            uint64_t vlen;
+            if (moq_buf_read_vi64(&r, &vlen) < 0) return MOQ_ERR_INVAL;
+            if (vlen > moq_buf_reader_remaining(&r)) return MOQ_ERR_INVAL;
+            r.pos += (size_t)vlen;
+        } else {
+            uint64_t v;
+            if (moq_buf_read_vi64(&r, &v) < 0) return MOQ_ERR_INVAL;
+        }
+        if (!placed && type < t) {
+            if (moq_buf_write_vi64(&w, type - prev_out) < 0 ||
+                moq_buf_write_vi64(&w, value) < 0)
+                return MOQ_ERR_BUFFER;
+            prev_out = type;
+            placed = true;
+        }
+        if (moq_buf_write_vi64(&w, t - prev_out) < 0 ||
+            moq_buf_write_raw(&w, in + body,
+                              moq_buf_reader_offset(&r) - body) < 0)
+            return MOQ_ERR_BUFFER;
+        prev_out = t;
+    }
+    if (!placed &&
+        (moq_buf_write_vi64(&w, type - prev_out) < 0 ||
+         moq_buf_write_vi64(&w, value) < 0))
+        return MOQ_ERR_BUFFER;
+    *out_len = moq_buf_writer_offset(&w);
+    return MOQ_OK;
 }
 
 /* -- OBJECT_DATAGRAM (§11.3.1) + Padding Datagram (§11.5.2) -------- *

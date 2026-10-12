@@ -152,6 +152,22 @@ typedef struct moq_ns_sub_handle { uint64_t _opaque; } moq_ns_sub_handle_t;
 typedef struct moq_track_status_handle { uint64_t _opaque; } moq_track_status_handle_t;
 typedef struct moq_track_sub_handle { uint64_t _opaque; } moq_track_sub_handle_t;
 
+/*
+ * A data stream's scheduling key (MOQT 7.2): subscriber priority, then
+ * publisher priority (lower first), then, within one owner (the stream's
+ * subscription, publication or FETCH, an opaque id), group in the owner's
+ * group order, then lowest subgroup. Different owners that tie on both
+ * priorities share turns.
+ */
+typedef struct moq_data_priority {
+    uint8_t  subscriber_priority;
+    uint8_t  publisher_priority;
+    bool     descending;
+    uint64_t owner;
+    uint64_t group_id;
+    uint64_t subgroup_id;
+} moq_data_priority_t;
+
 /* C/C++ compatible zero-init sentinels. */
 #ifdef __cplusplus
 #define MOQ_SUBSCRIPTION_INVALID (moq_subscription_t{0})

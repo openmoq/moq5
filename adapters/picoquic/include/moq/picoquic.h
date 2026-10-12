@@ -115,6 +115,13 @@ typedef struct moq_pq_conn_cfg {
      * fatal. May be NULL (default).
      */
     void (*after_callback)(moq_pq_conn_t *conn, void *user_ctx);
+    /*
+     * Appended (read only when struct_size covers it): the most outbound
+     * stream bytes the adapter queues for picoquic; the bridge holds the
+     * rest, in priority order, up to 1 MiB in total (at least 128 KiB in
+     * the bridge). 0 = 128 KiB.
+     */
+    uint64_t send_queue_cap_bytes;
 } moq_pq_conn_cfg_t;
 
 /*

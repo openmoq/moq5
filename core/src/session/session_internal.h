@@ -67,6 +67,7 @@ _Static_assert(sizeof(moq_open_uni_control_action_t) <= MOQ_ACTION_DETAIL_MAX, "
 _Static_assert(sizeof(moq_send_uni_control_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_reset_bidi_stream_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_stop_bidi_stream_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
+_Static_assert(sizeof(moq_set_data_priority_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_ns_sub_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_ns_sub_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_ns_sub_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -80,6 +81,12 @@ _Static_assert(sizeof(moq_fetch_complete_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_object_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_gap_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
+/* publisher_group_order must stay inside the old padding. */
+_Static_assert(offsetof(moq_publish_request_event_t, largest_group) ==
+               ((offsetof(moq_publish_request_event_t, has_largest) +
+                 sizeof(bool) + _Alignof(uint64_t) - 1u) &
+                ~(size_t)(_Alignof(uint64_t) - 1u)),
+               "publisher_group_order moved largest_group");
 _Static_assert(sizeof(moq_publish_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_finished_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -201,6 +208,10 @@ typedef struct moq_sub_entry {
      * SUBSCRIBE_OK's track properties). Gates outbound new-group requests on
      * this subscription's updates. */
     bool dynamic_groups;
+    /* MOQT 7.1: the SUBSCRIBE's group order and the publisher's
+     * DEFAULT_PUBLISHER_GROUP_ORDER (DEFAULT = omitted). */
+    uint8_t group_order;
+    uint8_t publisher_group_order;
     /* Reserved per-track largest-location registry record. Reserved
      * at establishment (keyed by track_id_buf), released once in sub_free_entry.
      * Non-NULL on an established entry (the registry is always sized >= 1, so a
@@ -576,6 +587,8 @@ typedef struct moq_pub_entry {
      * the PUBLISH track properties). Gates outbound new-group requests on
      * the accept and this publication's updates. */
     bool dynamic_groups;
+    /* The PUBLISH's DEFAULT_PUBLISHER_GROUP_ORDER (DEFAULT = omitted). */
+    uint8_t publisher_group_order;
     /* Subscriber-role PUBLISH_DONE Stream-Count gating (draft-16 §9.15 /
      * draft-18 §10.11): PUBLISH_DONE arrives on the control channel and is likely
      * to precede late-arriving / late-opening data streams. The subscriber keeps
@@ -1613,6 +1626,7 @@ struct moq_session {
 
     moq_sg_entry_t *subgroups;
     size_t          sg_cap;
+    bool            data_priority_updates;   /* SET_DATA_PRIORITY opt-in */
     uint64_t        next_stream_ref;
 
     moq_rx_stream_t *rx_streams;
@@ -2120,7 +2134,7 @@ void sg_recompute_deadline(moq_session_t *s);
 int sg_find_free(moq_session_t *s);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
 
-int sub_resolve_handle(moq_session_t *s, moq_subscription_t h);
+int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h);
 int sub_find_by_request_id(moq_session_t *s, uint64_t request_id);
 int sub_find_by_alias_subscriber(moq_session_t *s, uint64_t alias);
 bool sub_track_alias_in_use(moq_session_t *s, uint64_t alias);
@@ -2369,6 +2383,7 @@ typedef struct moq_decoded_subscribe_ok {
     bool     has_deferred_param_error;
     const char *deferred_param_reason;
     bool     dynamic_groups;   /* Track Property/Extension 0x30 == 1 */
+    uint8_t  publisher_group_order;   /* 0x22; DEFAULT if omitted */
 } moq_decoded_subscribe_ok_t;
 
 /* -- Decoded inbound REQUEST_UPDATE (profile → session core) --------- */
@@ -2740,6 +2755,7 @@ typedef struct moq_decoded_publish {
     uint64_t         auth_reject_code;
     bool             track_properties_unsupported;  /* unknown Mandatory Track Property */
     bool             dynamic_groups;   /* Track Property/Extension 0x30 == 1 */
+    uint8_t          publisher_group_order;   /* 0x22; DEFAULT if omitted */
     /* LARGEST_OBJECT / EXPIRES advertised by the publisher:
      * largest is max-merged into the entry's history at commit AND surfaced. */
     bool             has_largest;
@@ -2838,7 +2854,7 @@ moq_result_t session_core_on_publish_error(moq_session_t *s, int slot,
     uint64_t error_code, bool can_retry, uint64_t retry_after_ms,
     const uint8_t *reason, size_t reason_len, bool free_now);
 
-int pub_resolve_handle(moq_session_t *s, moq_publication_t h);
+int pub_resolve_handle(const moq_session_t *s, moq_publication_t h);
 int pub_find_free(moq_session_t *s);
 
 /*
@@ -2984,6 +3000,51 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                                                   moq_subscription_t sub,
                                                   moq_publication_t pub,
                                                   uint32_t *budget);
+
+/* DEFAULT_PUBLISHER_GROUP_ORDER of a track-properties blob; *out is
+ * MOQ_GROUP_ORDER_DEFAULT when omitted or on failure. */
+moq_result_t session_scan_group_order(const moq_session_t *s,
+                                      const uint8_t *data, size_t len,
+                                      bool strict_local, uint8_t *out);
+
+/* MOQT 7.1: the subscriber's order, else the publisher's, else ascending. */
+static inline uint8_t session_effective_group_order(uint8_t requested,
+                                                    uint8_t publisher)
+{
+    if (requested == MOQ_GROUP_ORDER_ASCENDING ||
+        requested == MOQ_GROUP_ORDER_DESCENDING)
+        return requested;
+    if (publisher == MOQ_GROUP_ORDER_DESCENDING)
+        return MOQ_GROUP_ORDER_DESCENDING;
+    return MOQ_GROUP_ORDER_ASCENDING;
+}
+
+/* MOQT 7.2 scheduling key of a subgroup stream owned by `owner` (a subscription
+ * or publication handle), from its owner's delivery preferences. */
+void session_subgroup_data_key(uint64_t owner, uint8_t subscriber_priority,
+                               uint8_t group_order,
+                               uint8_t publisher_group_order,
+                               const moq_subgroup_cfg_t *cfg,
+                               moq_data_priority_t *out);
+
+/* Queue a SET_DATA_PRIORITY action; no-op unless data_priority_updates. */
+moq_result_t session_push_data_key(moq_session_t *s, moq_stream_ref_t ref,
+                                   const moq_data_priority_t *key);
+
+/* Action slots a subscriber priority update needs for its owner-wide key. */
+static inline size_t session_owner_priority_slots(const moq_session_t *s,
+                                                  bool has_priority,
+                                                  uint8_t new_priority,
+                                                  uint8_t old_priority)
+{
+    return s->data_priority_updates && has_priority &&
+           new_priority != old_priority ? 1u : 0u;
+}
+
+/* The owner-wide key for a changed subscriber priority. The caller reserved
+ * session_owner_priority_slots() action slots. */
+moq_result_t session_update_owner_priority(moq_session_t *s, uint64_t owner,
+                                           uint8_t subscriber_priority);
 
 moq_result_t session_scan_dt_props(const moq_session_t *s,
                                    const uint8_t *data, size_t len,

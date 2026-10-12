@@ -114,7 +114,9 @@ typedef struct moq_session_cfg {
     uint64_t           initial_request_capacity;
 
     /* Session resource limits. 0 = use library defaults. */
-    uint32_t           max_actions;         /* action queue entries   (default 64) */
+    uint32_t           max_actions;         /* action queue entries   (default 64;
+                                             * at least 2 under the transport
+                                             * bridge) */
     uint32_t           max_events;          /* event queue entries    (default 16) */
     uint32_t           send_buffer_size;    /* outbound bytes         (default 4096) */
     uint32_t           recv_buffer_size;    /* inbound bytes          (default 4096) */
@@ -595,6 +597,14 @@ typedef uint32_t moq_action_kind_t;
  * single-half-only semantics; current profiles no longer emit them.
  */
 #define MOQ_ACTION_ABORT_BIDI_STREAM 14u
+/*
+ * A data stream's scheduling key (moq_data_priority_t), before its first
+ * SEND_DATA and again when it changes. stream_ref 0 is an owner-wide
+ * subscriber priority update: every stream of priority.owner takes
+ * priority.subscriber_priority. Only after
+ * moq_session_set_data_priority_updates(s, true).
+ */
+#define MOQ_ACTION_SET_DATA_PRIORITY 15u
 
 typedef struct moq_send_control_action {
     const uint8_t *data;  /* BORROWED until next advancing call */
@@ -622,6 +632,11 @@ typedef struct moq_send_data_action {
      * Appended at uint64 alignment, beyond the old complete struct prefix. */
     uint64_t         scheduling_priority;
 } moq_send_data_action_t;
+
+typedef struct moq_set_data_priority_action {
+    moq_stream_ref_t    stream_ref;
+    moq_data_priority_t priority;
+} moq_set_data_priority_action_t;
 
 typedef struct moq_reset_data_action {
     moq_stream_ref_t stream_ref;
@@ -721,6 +736,7 @@ typedef struct moq_action {
         moq_reset_bidi_stream_action_t reset_bidi_stream;
         moq_stop_bidi_stream_action_t  stop_bidi_stream;
         moq_abort_bidi_stream_action_t abort_bidi_stream;
+        moq_set_data_priority_action_t set_data_priority;
         uint8_t                        _reserved[MOQ_ACTION_DETAIL_MAX];
     } u;
 } moq_action_t;
@@ -770,6 +786,15 @@ moq_session_poll_actions(moq_session_t *s, moq_action_t *out, size_t cap)
  * Number of action slots currently available for queuing.
  */
 MOQ_API size_t moq_session_action_capacity(const moq_session_t *s);
+
+/*
+ * Opt in to MOQ_ACTION_SET_DATA_PRIORITY (default off, so older action
+ * consumers never see it); the transport bridge turns it on. Opening a data
+ * stream then queues two actions at once, so MOQ_ERR_INVAL (and no change)
+ * when max_actions is below 2.
+ */
+MOQ_API moq_result_t moq_session_set_data_priority_updates(moq_session_t *s,
+                                                           bool enabled);
 
 /* -- Events (application notifications) ---------------------------- */
 
@@ -990,6 +1015,9 @@ typedef struct moq_subscribe_ok_event {
      * Property DYNAMIC_GROUPS == 1); omitted on the wire means false. When
      * true, new-group requests may ride this subscription's updates. */
     bool               dynamic_groups;
+    /* Appended: the publisher's DEFAULT_PUBLISHER_GROUP_ORDER, or
+     * MOQ_GROUP_ORDER_DEFAULT if it advertised none. */
+    moq_group_order_t  publisher_group_order;
 } moq_subscribe_ok_event_t;
 
 typedef struct moq_subscribe_error_event {
@@ -1399,6 +1427,10 @@ typedef struct moq_publish_request_event {
      * history at request commit, so the registry is current even if the app
      * ignores this field. */
     bool               has_largest;
+    /* Appended into the padding before largest_group (the union is at its
+     * size limit): the publisher's DEFAULT_PUBLISHER_GROUP_ORDER, or
+     * MOQ_GROUP_ORDER_DEFAULT if it advertised none. */
+    uint8_t            publisher_group_order;
     uint64_t           largest_group;
     uint64_t           largest_object;
     /* Appended: the publisher's advertised EXPIRES (milliseconds). Surfaced
@@ -1818,6 +1850,26 @@ typedef struct moq_accept_subscribe_cfg {
 } moq_accept_subscribe_cfg_t;
 
 MOQ_API void moq_accept_subscribe_cfg_init(moq_accept_subscribe_cfg_t *cfg);
+
+/*
+ * The group order in effect for a subscription (MOQT 7.1): the subscriber's,
+ * else the publisher's advertised preference, else ascending. Never DEFAULT,
+ * except for a stale handle.
+ */
+MOQ_API moq_group_order_t moq_session_subscription_group_order(
+    const moq_session_t *s, moq_subscription_t sub);
+
+/*
+ * Build the track properties a publisher passes to an accept (subscription,
+ * FETCH, TRACK_STATUS) or a PUBLISH to advertise its preferred group order
+ * (ASCENDING or DESCENDING): `in` (may be empty) is copied to `out` with the
+ * preference added, encoded for this session's draft. MOQ_ERR_INVAL if `in`
+ * already carries one or is malformed; MOQ_ERR_BUFFER if `out` is too small
+ * (the preference adds at most 16 bytes). No session state changes.
+ */
+MOQ_API moq_result_t moq_session_track_properties_add_group_order(
+    const moq_session_t *s, const uint8_t *in, size_t in_len,
+    moq_group_order_t order, uint8_t *out, size_t out_cap, size_t *out_len);
 
 /*
  * REDIRECT (§10.6.1) target, set on a reject cfg only when
@@ -2356,6 +2408,14 @@ MOQ_API moq_result_t moq_session_publish(moq_session_t *s,
                                           uint64_t now_us,
                                           moq_publication_t *out_handle);
 
+/*
+ * moq_session_subscription_group_order() for a publisher-initiated
+ * subscription. Until the subscriber's accept is known, the publisher's
+ * preference.
+ */
+MOQ_API moq_group_order_t moq_session_publication_group_order(
+    const moq_session_t *s, moq_publication_t pub);
+
 typedef struct moq_accept_publish_cfg {
     uint32_t          struct_size;
     bool              has_subscriber_priority;
@@ -2611,6 +2671,10 @@ typedef struct moq_accept_track_status_cfg {
     uint64_t largest_object;
     bool     has_expires;
     uint64_t expires_ms;
+    /* Appended: the Track Properties a SUBSCRIBE_OK would carry, for
+     * TRACK_STATUS_OK (draft-18 10.14). Draft-16's response has no such
+     * field: non-empty there is MOQ_ERR_INVAL. Borrowed for the call. */
+    moq_bytes_t track_properties;
 } moq_accept_track_status_cfg_t;
 
 MOQ_API void moq_accept_track_status_cfg_init(moq_accept_track_status_cfg_t *cfg);

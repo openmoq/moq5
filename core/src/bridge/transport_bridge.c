@@ -21,8 +21,20 @@ void moq_transport_bridge_cfg_init(moq_transport_bridge_cfg_t *cfg,
                                     const moq_alloc_t *alloc)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_transport_bridge_cfg_t);
+    memset(cfg, 0, MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE;
+    cfg->alloc = alloc;
+}
+
+void moq_transport_bridge_cfg_init_sized(moq_transport_bridge_cfg_t *cfg,
+                                         size_t cfg_size,
+                                         const moq_alloc_t *alloc)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE) return;
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
     cfg->alloc = alloc;
 }
 
@@ -56,6 +68,90 @@ static moq_transport_result_t sanitize_stream_result(
     }
 }
 
+/* -- Dstream index -------------------------------------------------- */
+
+static uint32_t bridge_index_home(uint64_t id, uint32_t mask)
+{
+    return (uint32_t)((id * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+static uint32_t bridge_index_find(const bridge_index_entry_t *t, uint32_t mask,
+                                  uint64_t id)
+{
+    for (uint32_t i = bridge_index_home(id, mask);; i = (i + 1) & mask) {
+        if (t[i].slot == BRIDGE_INDEX_EMPTY) return BRIDGE_INDEX_EMPTY;
+        if (t[i].id == id) return t[i].slot;
+    }
+}
+
+static void bridge_index_insert(bridge_index_entry_t *t, uint32_t mask,
+                                uint64_t id, uint32_t slot)
+{
+    uint32_t i = bridge_index_home(id, mask);
+    while (t[i].slot != BRIDGE_INDEX_EMPTY) i = (i + 1) & mask;
+    t[i].id = id;
+    t[i].slot = slot;
+}
+
+/* Later entries of the probe run move back into the gap when their home
+ * allows it, so lookups never stop early. */
+static void bridge_index_remove(bridge_index_entry_t *t, uint32_t mask,
+                                uint64_t id)
+{
+    uint32_t i = bridge_index_home(id, mask);
+    for (;; i = (i + 1) & mask) {
+        if (t[i].slot == BRIDGE_INDEX_EMPTY) return;
+        if (t[i].id == id) break;
+    }
+    for (uint32_t j = (i + 1) & mask; t[j].slot != BRIDGE_INDEX_EMPTY;
+         j = (j + 1) & mask) {
+        uint32_t home = bridge_index_home(t[j].id, mask);
+        if (((j - home) & mask) >= ((j - i) & mask)) {
+            t[i] = t[j];
+            i = j;
+        }
+    }
+    t[i].slot = BRIDGE_INDEX_EMPTY;
+}
+
+static void bridge_dindex_free(moq_transport_bridge_t *b)
+{
+    size_t bytes = ((size_t)b->dindex_mask + 1) * sizeof(bridge_index_entry_t);
+    if (b->dref_index) bridge_free(&b->alloc, b->dref_index, bytes);
+    if (b->dsid_index) bridge_free(&b->alloc, b->dsid_index, bytes);
+    b->dref_index = b->dsid_index = NULL;
+}
+
+/* Rebuild both indexes from the current table, sized for `cap` dstreams at
+ * most half full. False on allocation failure, leaving them untouched. */
+static bool bridge_dindex_build(moq_transport_bridge_t *b, uint32_t cap)
+{
+    uint64_t n = 1;
+    while (n < 2 * (uint64_t)cap) n <<= 1;
+    if (n > (uint64_t)1 << 31) return false;
+    size_t bytes = (size_t)n * sizeof(bridge_index_entry_t);
+    bridge_index_entry_t *r = bridge_alloc(&b->alloc, bytes);
+    bridge_index_entry_t *t = bridge_alloc(&b->alloc, bytes);
+    if (!r || !t) {
+        if (r) bridge_free(&b->alloc, r, bytes);
+        if (t) bridge_free(&b->alloc, t, bytes);
+        return false;
+    }
+    memset(r, 0xff, bytes);
+    memset(t, 0xff, bytes);
+    bridge_dindex_free(b);
+    b->dref_index = r;
+    b->dsid_index = t;
+    b->dindex_mask = (uint32_t)(n - 1);
+    for (uint32_t i = 0; i < b->dstream_cap; i++) {
+        const bridge_dstream_t *d = &b->dstreams[i];
+        if (!d->active) continue;
+        bridge_index_insert(r, b->dindex_mask, d->ref._v, i);
+        if (d->has_sid) bridge_index_insert(t, b->dindex_mask, d->sid, i);
+    }
+    return true;
+}
+
 /* -- Create / Destroy ----------------------------------------------- */
 
 #define HAS_FIELD(ops, field) \
@@ -87,7 +183,7 @@ moq_result_t moq_transport_bridge_create(
     if (!out) return MOQ_ERR_INVAL;
     *out = NULL;
     if (!cfg || !session || !ops) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_transport_bridge_cfg_t))
+    if (cfg->struct_size < MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (!cfg->alloc || !cfg->alloc->alloc || !cfg->alloc->free ||
         !cfg->alloc->realloc)
@@ -95,6 +191,8 @@ moq_result_t moq_transport_bridge_create(
     if (!ops_valid(ops)) return MOQ_ERR_INVAL;
     if (!(ops->capabilities & MOQ_TRANSPORT_CAP_HOLD_INPUT))
         return MOQ_ERR_UNSUPPORTED;
+    if (moq_session_set_data_priority_updates(session, true) != MOQ_OK)
+        return MOQ_ERR_INVAL;
 
     const moq_alloc_t *a = cfg->alloc;
     uint32_t max_s = cfg->max_streams    ? cfg->max_streams    : BRIDGE_DEFAULT_MAX_STREAMS;
@@ -102,7 +200,10 @@ moq_result_t moq_transport_bridge_create(
     uint32_t max_t = cfg->max_tombstones ? cfg->max_tombstones : BRIDGE_DEFAULT_MAX_TOMBSTONES;
 
     moq_transport_bridge_t *b = bridge_alloc(a, sizeof(*b));
-    if (!b) return MOQ_ERR_NOMEM;
+    if (!b) {
+        (void)moq_session_set_data_priority_updates(session, false);
+        return MOQ_ERR_NOMEM;
+    }
     memset(b, 0, sizeof(*b));
 
     b->alloc        = *a;
@@ -134,24 +235,49 @@ moq_result_t moq_transport_bridge_create(
     if (!b->tombstones) goto fail;
     memset(b->tombstones, 0, max_t * sizeof(uint64_t));
 
+    b->dstreams = bridge_alloc(a, max_s * sizeof(bridge_dstream_t));
+    if (!b->dstreams) goto fail;
+    memset(b->dstreams, 0, max_s * sizeof(bridge_dstream_t));
+    b->dstream_cap = max_s;
+    for (uint32_t i = 0; i < max_s; i++) b->dstreams[i].next_free = i + 1;
+    if (!bridge_dindex_build(b, max_s)) goto fail;
+    b->dq_waiting = bridge_alloc(a, max_s * sizeof(uint32_t));
+    if (!b->dq_waiting) goto fail;
+    b->max_retained_bytes = MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT;
+    if (cfg->struct_size >= offsetof(moq_transport_bridge_cfg_t,
+                                     max_retained_bytes) +
+                            sizeof(cfg->max_retained_bytes) &&
+        cfg->max_retained_bytes)
+        b->max_retained_bytes = cfg->max_retained_bytes;
+
     *out = b;
     return MOQ_OK;
 
 fail:
+    bridge_dindex_free(b);
+    if (b->dq_waiting) bridge_free(a, b->dq_waiting, max_s * sizeof(uint32_t));
+    if (b->dstreams)   bridge_free(a, b->dstreams, max_s * sizeof(bridge_dstream_t));
     if (b->tombstones) bridge_free(a, b->tombstones, max_t * sizeof(uint64_t));
     if (b->pending)    bridge_free(a, b->pending, max_p * sizeof(bridge_pending_item_t));
     if (b->streams)    bridge_free(a, b->streams, max_s * sizeof(bridge_stream_entry_t));
     bridge_free(a, b, sizeof(*b));
+    (void)moq_session_set_data_priority_updates(session, false);
     return MOQ_ERR_NOMEM;
 }
+
+static void bridge_dstreams_clear(moq_transport_bridge_t *b);
 
 void moq_transport_bridge_destroy(moq_transport_bridge_t *b)
 {
     if (!b) return;
 
     bridge_cleanup_all_pending(b);
+    bridge_dstreams_clear(b);
 
     const moq_alloc_t *a = &b->alloc;
+    bridge_dindex_free(b);
+    bridge_free(a, b->dq_waiting, b->dstream_cap * sizeof(uint32_t));
+    bridge_free(a, b->dstreams, b->dstream_cap * sizeof(bridge_dstream_t));
     bridge_free(a, b->tombstones, b->max_tombstones * sizeof(uint64_t));
     bridge_free(a, b->pending, b->max_pending * sizeof(bridge_pending_item_t));
     bridge_free(a, b->streams, b->max_streams * sizeof(bridge_stream_entry_t));
@@ -160,12 +286,18 @@ void moq_transport_bridge_destroy(moq_transport_bridge_t *b)
 
 /* -- Stream map ----------------------------------------------------- */
 
+static bool bridge_stream_map_full(const moq_transport_bridge_t *b)
+{
+    return b->streams_active == b->max_streams;
+}
+
 bridge_stream_entry_t *bridge_alloc_stream(moq_transport_bridge_t *b)
 {
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (!b->streams[i].active) {
             memset(&b->streams[i], 0, sizeof(bridge_stream_entry_t));
             b->streams[i].active = true;
+            b->streams_active++;
             return &b->streams[i];
         }
     }
@@ -192,8 +324,10 @@ bridge_stream_entry_t *bridge_find_by_id(
     return NULL;
 }
 
-void bridge_deactivate_stream(bridge_stream_entry_t *e)
+void bridge_deactivate_stream(moq_transport_bridge_t *b,
+                              bridge_stream_entry_t *e)
 {
+    b->streams_active -= e->active;
     memset(e, 0, sizeof(*e));
 }
 
@@ -201,7 +335,7 @@ void bridge_retire_aborting(moq_transport_bridge_t *b, uint64_t transport_id)
 {
     bridge_stream_entry_t *e = bridge_find_by_id(b, transport_id);
     if (e && e->aborting)
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
 }
 
 moq_stream_ref_t bridge_assign_inbound_ref(
@@ -245,12 +379,12 @@ void bridge_retire_or_tombstone(moq_transport_bridge_t *b, moq_stream_ref_t ref)
     if (!e) return;
 
     if (e->kind == BRIDGE_STREAM_UNI) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         return;
     }
 
     if (e->peer_send_closed && e->local_send_closed) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         return;
     }
 
@@ -273,7 +407,7 @@ void bridge_retire_or_tombstone(moq_transport_bridge_t *b, moq_stream_ref_t ref)
             return;
         }
         uint64_t tid = e->transport_id;
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
 
         if (b->tombstone_count >= b->max_tombstones) {
             for (uint32_t i = 1; i < b->max_tombstones; i++)
@@ -307,6 +441,55 @@ void bridge_remove_tombstone(moq_transport_bridge_t *b, uint64_t transport_id)
 
 /* -- Terminal cleanup ------------------------------------------------ */
 
+static size_t bridge_send_data_bytes(const moq_send_data_action_t *sd)
+{
+    return sd->header_len + (sd->payload ? moq_rcbuf_len(sd->payload) : 0);
+}
+
+static void bridge_dq_waiting_add(moq_transport_bridge_t *b,
+                                  bridge_dstream_t *d)
+{
+    d->waiting_at = b->dq_waiting_len;
+    b->dq_waiting[b->dq_waiting_len++] = (uint32_t)(d - b->dstreams);
+}
+
+static void bridge_dq_waiting_remove(moq_transport_bridge_t *b,
+                                     bridge_dstream_t *d)
+{
+    uint32_t last = b->dq_waiting[--b->dq_waiting_len];
+    b->dq_waiting[d->waiting_at] = last;
+    b->dstreams[last].waiting_at = d->waiting_at;
+}
+
+/* Drop `d`'s queued actions and release its queue. */
+static void bridge_dstream_release(moq_transport_bridge_t *b,
+                                   bridge_dstream_t *d)
+{
+    if (d->q_len > 0) bridge_dq_waiting_remove(b, d);
+    for (; d->q_len > 0; d->q_len--) {
+        moq_action_t *a = &d->q[d->q_head];
+        b->dq_bytes -= bridge_send_data_bytes(&a->u.send_data);
+        b->dq_items--;
+        moq_action_cleanup(a);
+        d->q_head = (d->q_head + 1) % d->q_cap;
+    }
+    if (d->q) bridge_free(&b->alloc, d->q, d->q_cap * sizeof(moq_action_t));
+    bridge_index_remove(b->dref_index, b->dindex_mask, d->ref._v);
+    if (d->has_sid)
+        bridge_index_remove(b->dsid_index, b->dindex_mask, d->sid);
+    uint32_t slot = (uint32_t)(d - b->dstreams);
+    memset(d, 0, sizeof(*d));
+    d->next_free = b->dstream_free;
+    b->dstream_free = slot;
+}
+
+static void bridge_dstreams_clear(moq_transport_bridge_t *b)
+{
+    for (uint32_t i = 0; i < b->dstream_cap; i++)
+        if (b->dstreams[i].active)
+            bridge_dstream_release(b, &b->dstreams[i]);
+}
+
 static void bridge_clear_all_state(moq_transport_bridge_t *b)
 {
     bridge_cleanup_all_pending(b);
@@ -314,8 +497,9 @@ static void bridge_clear_all_state(moq_transport_bridge_t *b)
     b->pending_control_fin = false;
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (b->streams[i].active)
-            bridge_deactivate_stream(&b->streams[i]);
+            bridge_deactivate_stream(b, &b->streams[i]);
     }
+    bridge_dstreams_clear(b);
     b->tombstone_count = 0;
 }
 
@@ -396,11 +580,23 @@ void bridge_cleanup_pending_item(const moq_alloc_t *alloc,
     }
 }
 
+/* Keep the pending write and open counts as `p` enters (+1) or leaves (-1). */
+static void bridge_pending_counts(moq_transport_bridge_t *b,
+                                  const bridge_pending_item_t *p, int delta)
+{
+    if (p->kind == PENDING_HEADER_PAYLOAD || p->kind == PENDING_PAYLOAD_ONLY)
+        b->pending_writes += (uint32_t)delta;
+    else if (p->kind == PENDING_OPEN_UNI_DATA)
+        b->pending_opens += (uint32_t)delta;
+}
+
 void bridge_cleanup_all_pending(moq_transport_bridge_t *b)
 {
     for (uint32_t i = 0; i < b->pending_count; i++)
         bridge_cleanup_pending_item(&b->alloc, &b->pending[i]);
     b->pending_count = 0;
+    b->pending_writes = 0;
+    b->pending_opens = 0;
 }
 
 static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
@@ -477,6 +673,7 @@ static void bridge_drop_pending_bidi_output(moq_transport_bridge_t *b,
     for (uint32_t src = 0; src < b->pending_count; src++) {
         bridge_pending_item_t *p = &b->pending[src];
         if (bridge_pending_is_bidi_output(p, e)) {
+            bridge_pending_counts(b, p, -1);
             bridge_cleanup_pending_item(&b->alloc, p);
             memset(p, 0, sizeof(*p));
             continue;
@@ -601,7 +798,7 @@ bool moq_transport_bridge_is_terminal(const moq_transport_bridge_t *b)
 bool moq_transport_bridge_has_pending(const moq_transport_bridge_t *b)
 {
     if (!b) return false;
-    if (b->pending_count > 0) return true;
+    if (b->pending_count > 0 || b->dq_items > 0) return true;
     if (b->pending_control) return true;
     if (b->needs_close) return true;
     for (uint32_t i = 0; i < b->max_streams; i++) {
@@ -622,7 +819,7 @@ bool moq_transport_bridge_has_outbound_pending(const moq_transport_bridge_t *b)
      * (freeing the session's receive queue), NOT by send capacity. Arming
      * connection-write-ready on inbound pending would spin, since connections
      * are almost always write-ready. */
-    return b->pending_count > 0 || b->needs_close;
+    return b->pending_count > 0 || b->dq_items > 0 || b->needs_close;
 }
 
 bool moq_transport_bridge_stream_has_pending(
@@ -774,6 +971,7 @@ static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
     }
 
     b->pending[b->pending_count++] = norm;
+    bridge_pending_counts(b, &norm, +1);
     return true;
 }
 
@@ -910,6 +1108,274 @@ static moq_result_t dispatch_close_session(moq_transport_bridge_t *b,
  *
  * Returns MOQ_OK or error.
  */
+/* -- Data-stream scheduling (MOQT 7.2) ----------------------------------- */
+
+#define BRIDGE_KEY_POS_MAX 0xFFFFu
+
+/* The endpoint key (see set_stream_priority). */
+static uint32_t bridge_key(uint8_t subscriber_priority,
+                           uint8_t publisher_priority, uint32_t pos)
+{
+    uint32_t p = pos < BRIDGE_KEY_POS_MAX ? pos + 1 : BRIDGE_KEY_POS_MAX;
+    return (uint32_t)subscriber_priority << 24 |
+           (uint32_t)publisher_priority << 16 | p;
+}
+
+static bool bridge_drained_cap(const moq_transport_bridge_t *b)
+{
+    return (b->ops->capabilities & MOQ_TRANSPORT_CAP_STREAM_DRAINED) != 0;
+}
+
+static bridge_dstream_t *bridge_dstream_find(moq_transport_bridge_t *b,
+                                             moq_stream_ref_t ref)
+{
+    uint32_t slot = bridge_index_find(b->dref_index, b->dindex_mask, ref._v);
+    return slot == BRIDGE_INDEX_EMPTY ? NULL : &b->dstreams[slot];
+}
+
+static void bridge_dstream_set_sid(moq_transport_bridge_t *b,
+                                   bridge_dstream_t *d, uint64_t sid)
+{
+    if (d->has_sid && d->sid == sid) return;
+    if (d->has_sid)
+        bridge_index_remove(b->dsid_index, b->dindex_mask, d->sid);
+    d->has_sid = true;
+    d->sid = sid;
+    bridge_index_insert(b->dsid_index, b->dindex_mask, sid,
+                        (uint32_t)(d - b->dstreams));
+}
+
+/* Whether `x` goes before `y`, both in one (owner, publisher priority)
+ * class: group in the owner's group order, then lowest subgroup. */
+static bool bridge_dstream_before(const bridge_dstream_t *x,
+                                  const bridge_dstream_t *y)
+{
+    if (x->key.group_id != y->key.group_id)
+        return x->key.descending ? x->key.group_id > y->key.group_id
+                                 : x->key.group_id < y->key.group_id;
+    return x->key.subgroup_id < y->key.subgroup_id;
+}
+
+/* Hand the endpoint `d`'s key when it changed. With the drained capability
+ * only while the endpoint holds the stream: an idle stream gets its key at
+ * its next write, so the endpoint never keeps state for it meanwhile. */
+static moq_result_t bridge_dstream_apply(moq_transport_bridge_t *b,
+                                         bridge_dstream_t *d)
+{
+    if (!d->has_sid || !HAS_FIELD(b->ops, set_stream_priority) ||
+        !b->ops->set_stream_priority)
+        return MOQ_OK;
+    if (bridge_drained_cap(b) && !d->keyed) return MOQ_OK;
+    uint32_t key = bridge_key(d->key.subscriber_priority, d->pub, d->pos);
+    if (d->keyed && key == d->applied) return MOQ_OK;
+    if (b->ops->set_stream_priority(b->endpoint_ctx, d->sid, key) !=
+        MOQ_TRANSPORT_OK) {
+        bridge_set_fatal(b, 0x1);
+        return MOQ_ERR_INTERNAL;
+    }
+    d->applied = key;
+    d->keyed = true;
+    return MOQ_OK;
+}
+
+/* Streams whose positions affect each other: same owner and publisher
+ * priority. */
+static bool bridge_dstream_peers(const bridge_dstream_t *x,
+                                 const bridge_dstream_t *y)
+{
+    return x != y && y->active && x->key.owner == y->key.owner &&
+           x->key.publisher_priority == y->key.publisher_priority;
+}
+
+/* `d` joins its owner's order: it counts the peers before it, and each peer
+ * after it moves back one. */
+static moq_result_t bridge_dstream_place(moq_transport_bridge_t *b,
+                                         bridge_dstream_t *d)
+{
+    d->pos = 0;
+    for (uint32_t i = 0; i < b->dstream_cap; i++) {
+        bridge_dstream_t *e = &b->dstreams[i];
+        if (!bridge_dstream_peers(d, e)) continue;
+        if (bridge_dstream_before(e, d)) {
+            d->pos++;
+        } else if (bridge_dstream_before(d, e)) {
+            e->pos++;
+            moq_result_t rc = bridge_dstream_apply(b, e);
+            if (rc < 0) return rc;
+        }
+    }
+    return bridge_dstream_apply(b, d);
+}
+
+/* `d` leaves its owner's order: each peer after it moves forward one. */
+static moq_result_t bridge_dstream_unplace(moq_transport_bridge_t *b,
+                                           bridge_dstream_t *d)
+{
+    for (uint32_t i = 0; i < b->dstream_cap; i++) {
+        bridge_dstream_t *e = &b->dstreams[i];
+        if (!bridge_dstream_peers(d, e) || !bridge_dstream_before(d, e))
+            continue;
+        e->pos--;
+        moq_result_t rc = bridge_dstream_apply(b, e);
+        if (rc < 0) return rc;
+    }
+    return MOQ_OK;
+}
+
+/* `d` leaves the priority order; whatever it still queues is dropped. */
+static moq_result_t bridge_dstream_free(moq_transport_bridge_t *b,
+                                        bridge_dstream_t *d)
+{
+    moq_result_t rc = bridge_dstream_unplace(b, d);
+    bridge_dstream_release(b, d);
+    return rc;
+}
+
+/* Reset: the stream leaves the order at once. */
+static moq_result_t bridge_dstream_reset(moq_transport_bridge_t *b,
+                                         moq_stream_ref_t ref)
+{
+    bridge_dstream_t *d = bridge_dstream_find(b, ref);
+    return d ? bridge_dstream_free(b, d) : MOQ_OK;
+}
+
+/* FIN handed over: the stream leaves the order once the endpoint drains it,
+ * or now without the drained capability. */
+static moq_result_t bridge_dstream_fin(moq_transport_bridge_t *b,
+                                       moq_stream_ref_t ref)
+{
+    bridge_dstream_t *d = bridge_dstream_find(b, ref);
+    if (!d) return MOQ_OK;
+    if (!bridge_drained_cap(b)) return bridge_dstream_free(b, d);
+    d->fin_handed = true;
+    return MOQ_OK;
+}
+
+void moq_transport_bridge_on_stream_drained(moq_transport_bridge_t *b,
+                                            uint64_t stream_id)
+{
+    if (!b || b->fatal || b->closed) return;
+    uint32_t slot = bridge_index_find(b->dsid_index, b->dindex_mask,
+                                      stream_id);
+    if (slot == BRIDGE_INDEX_EMPTY) return;
+    bridge_dstream_t *d = &b->dstreams[slot];
+    if (d->fin_handed)
+        (void)bridge_dstream_free(b, d);   /* a failure latches fatal */
+    else
+        d->keyed = false;
+}
+
+/* A queue for `ref`; the table doubles rather than leave a stream unkeyed.
+ * NULL (fatal latched) on allocation failure. */
+static bridge_dstream_t *bridge_dstream_new(moq_transport_bridge_t *b,
+                                            moq_stream_ref_t ref)
+{
+    uint32_t cap = b->dstream_cap;
+    if (b->dstream_free == cap) {
+        bridge_dstream_t *n = cap <= UINT32_MAX / 2
+            ? bridge_alloc(&b->alloc, 2 * (size_t)cap * sizeof(*n)) : NULL;
+        uint32_t *w = n ? bridge_alloc(&b->alloc, 2 * (size_t)cap * sizeof(*w))
+                        : NULL;
+        if (!w || !bridge_dindex_build(b, 2 * cap)) {
+            if (n) bridge_free(&b->alloc, n, 2 * (size_t)cap * sizeof(*n));
+            if (w) bridge_free(&b->alloc, w, 2 * (size_t)cap * sizeof(*w));
+            bridge_set_fatal(b, 0x1);
+            return NULL;
+        }
+        memcpy(w, b->dq_waiting, b->dq_waiting_len * sizeof(*w));
+        bridge_free(&b->alloc, b->dq_waiting, cap * sizeof(*w));
+        b->dq_waiting = w;
+        memcpy(n, b->dstreams, cap * sizeof(*n));
+        memset(n + cap, 0, cap * sizeof(*n));
+        for (uint32_t i = cap; i < 2 * cap; i++) n[i].next_free = i + 1;
+        bridge_free(&b->alloc, b->dstreams, cap * sizeof(*n));
+        b->dstreams = n;
+        b->dstream_cap = 2 * cap;
+    }
+    uint32_t slot = b->dstream_free;
+    bridge_dstream_t *d = &b->dstreams[slot];
+    b->dstream_free = d->next_free;
+    d->active = true;
+    d->ref = ref;
+    bridge_index_insert(b->dref_index, b->dindex_mask, ref._v, slot);
+    return d;
+}
+
+/* SET_DATA_PRIORITY: every keyed stream gets a queue slot. */
+static moq_result_t dispatch_set_data_priority(moq_transport_bridge_t *b,
+                                               moq_action_t *act)
+{
+    const moq_set_data_priority_action_t sp = act->u.set_data_priority;
+    moq_action_cleanup(act);
+
+    if (sp.stream_ref._v == 0) {
+        for (uint32_t i = 0; i < b->dstream_cap; i++) {
+            bridge_dstream_t *d = &b->dstreams[i];
+            if (!d->active || d->key.owner != sp.priority.owner) continue;
+            d->key.subscriber_priority = sp.priority.subscriber_priority;
+            moq_result_t rc = bridge_dstream_apply(b, d);
+            if (rc < 0) return rc;
+        }
+        return MOQ_OK;
+    }
+    bridge_dstream_t *d = bridge_dstream_find(b, sp.stream_ref);
+    if (d) {
+        moq_result_t rc = bridge_dstream_unplace(b, d);
+        if (rc < 0) return rc;
+    } else {
+        d = bridge_dstream_new(b, sp.stream_ref);
+        if (!d) return MOQ_ERR_NOMEM;
+        d->pub = sp.priority.publisher_priority;
+    }
+    d->key = sp.priority;
+    return bridge_dstream_place(b, d);
+}
+
+#define BRIDGE_DQ_INITIAL_CAP 8u
+
+/* Queue a SEND_DATA on its stream (ownership moves). Out of memory is fatal:
+ * the action cannot be kept in order any other way. */
+static moq_result_t bridge_dstream_push(moq_transport_bridge_t *b,
+                                        bridge_dstream_t *d,
+                                        moq_action_t *act)
+{
+    if (d->q_len == d->q_cap) {
+        uint32_t ncap = d->q_cap ? d->q_cap * 2 : BRIDGE_DQ_INITIAL_CAP;
+        moq_action_t *nq = bridge_alloc(&b->alloc, ncap * sizeof(*nq));
+        if (!nq) {
+            moq_action_cleanup(act);
+            bridge_set_fatal(b, 0x1);
+            return MOQ_ERR_NOMEM;
+        }
+        for (uint32_t i = 0; i < d->q_len; i++)
+            nq[i] = d->q[(d->q_head + i) % d->q_cap];
+        if (d->q) bridge_free(&b->alloc, d->q, d->q_cap * sizeof(*d->q));
+        d->q = nq;
+        d->q_cap = ncap;
+        d->q_head = 0;
+    }
+    if (d->q_len == 0) bridge_dq_waiting_add(b, d);
+    d->q[(d->q_head + d->q_len) % d->q_cap] = *act;
+    d->q_len++;
+    b->dq_bytes += bridge_send_data_bytes(&act->u.send_data);
+    b->dq_items++;
+    return MOQ_OK;
+}
+
+/* The key `d`'s next object goes out with: its publisher priority can
+ * change along a FETCH response. */
+static uint32_t bridge_dstream_head_key(const bridge_dstream_t *d)
+{
+    const moq_action_t *a = &d->q[d->q_head];
+    uint8_t pub = d->pub;
+    if (a->detail_size >= offsetof(moq_send_data_action_t,
+                                   scheduling_priority) +
+                          sizeof(a->u.send_data.scheduling_priority) &&
+        a->u.send_data.scheduling_priority)
+        pub = (uint8_t)a->u.send_data.scheduling_priority;
+    return bridge_key(d->key.subscriber_priority, pub, d->pos);
+}
+
 static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
                                           bridge_pending_item_t *p)
 {
@@ -926,16 +1392,37 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
         return MOQ_OK;
     }
 
+    bridge_dstream_t *d = bridge_dstream_find(b, p->stream_ref);
+    if (d) bridge_dstream_set_sid(b, d, sid);
     if (HAS_FIELD(b->ops, set_stream_priority) && b->ops->set_stream_priority) {
         bool has_priority = p->act.detail_size >=
             offsetof(moq_send_data_action_t, scheduling_priority) +
                 sizeof(sd->scheduling_priority);
-        uint32_t key = has_priority && sd->scheduling_priority
-            ? (uint32_t)sd->scheduling_priority : UINT32_C(0x18080);
-        if (b->ops->set_stream_priority(b->endpoint_ctx, sid, key) != MOQ_TRANSPORT_OK) {
+        uint8_t sub_prio = 128, pub_prio = 128;
+        if (has_priority && sd->scheduling_priority) {
+            sub_prio = (uint8_t)(sd->scheduling_priority >> 8);
+            pub_prio = (uint8_t)sd->scheduling_priority;
+        }
+        /* The object about to go out sets the publisher priority (it can
+         * change along a FETCH response). */
+        uint32_t key = bridge_key(sub_prio, pub_prio, 0);
+        bool call = true;
+        if (d) {
+            d->pub = pub_prio;
+            key = bridge_key(d->key.subscriber_priority, pub_prio, d->pos);
+            /* Without the drained capability the endpoint may have dropped
+             * the key with its emptied queue: key every write. */
+            call = !bridge_drained_cap(b) || !d->keyed || key != d->applied;
+        }
+        if (call && b->ops->set_stream_priority(b->endpoint_ctx, sid, key) !=
+                        MOQ_TRANSPORT_OK) {
             bridge_cleanup_pending_item(&b->alloc, p);
             bridge_set_fatal(b, 0x1);
             return MOQ_ERR_INTERNAL;
+        }
+        if (d) {
+            d->applied = key;
+            d->keyed = true;
         }
     }
 
@@ -961,10 +1448,11 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
         }
 
         if (fin_on_hdr) {
-            bridge_mark_local_close(b, p->stream_ref);
-            bridge_retire_or_tombstone(b, p->stream_ref);
+            moq_stream_ref_t ref = p->stream_ref;
+            bridge_mark_local_close(b, ref);
+            bridge_retire_or_tombstone(b, ref);
             bridge_cleanup_pending_item(&b->alloc, p);
-            return MOQ_OK;
+            return bridge_dstream_fin(b, ref);
         }
 
         p->kind = PENDING_PAYLOAD_ONLY;
@@ -1019,12 +1507,14 @@ static moq_result_t bridge_try_send_data(moq_transport_bridge_t *b,
     }
 
     /* Success — stream done if FIN */
-    if (sd->fin) {
-        bridge_mark_local_close(b, p->stream_ref);
-        bridge_retire_or_tombstone(b, p->stream_ref);
+    bool fin = sd->fin;
+    moq_stream_ref_t ref = p->stream_ref;
+    if (fin) {
+        bridge_mark_local_close(b, ref);
+        bridge_retire_or_tombstone(b, ref);
     }
     bridge_cleanup_pending_item(&b->alloc, p);
-    return MOQ_OK;
+    return fin ? bridge_dstream_fin(b, ref) : MOQ_OK;
 }
 
 /* -- Ordering domains ------------------------------------------------
@@ -1241,7 +1731,7 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
                       b->ops->open_uni(b->endpoint_ctx, &uni_id));
 
         if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-            bridge_deactivate_stream(e);
+            bridge_deactivate_stream(b, e);
             bridge_pending_item_t p;
             memset(&p, 0, sizeof(p));
             p.kind = PENDING_OPEN_UNI_DATA;
@@ -1252,7 +1742,7 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
             return MOQ_OK;
         }
         if (r == MOQ_TRANSPORT_ERROR) {
-            bridge_deactivate_stream(e);
+            bridge_deactivate_stream(b, e);
             moq_action_cleanup(act);
             bridge_set_fatal(b, 0x1);
             return MOQ_ERR_INTERNAL;
@@ -1295,6 +1785,11 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         ? act->u.reset_bidi_stream.error_code : act->u.reset_data.error_code;
     moq_action_cleanup(act);
 
+    if (!is_bidi) {
+        moq_result_t frc = bridge_dstream_reset(b, ref);
+        if (frc < 0) return frc;
+    }
+
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     if (!e) return MOQ_OK;
 
@@ -1313,7 +1808,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
      * A unidirectional RESET_DATA has no peer send half to await, so it retires
      * its mapping immediately, as before. */
     if (!is_bidi)
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
 
     moq_transport_result_t r =
         /* sid came from the live entry above, so it is known */
@@ -1517,7 +2012,7 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
                   b->ops->open_bidi(b->endpoint_ctx, &bidi_id));
 
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_OPEN_BIDI_DATA;
@@ -1539,7 +2034,7 @@ static moq_result_t dispatch_open_bidi(moq_transport_bridge_t *b,
         return MOQ_OK;
     }
     if (r == MOQ_TRANSPORT_ERROR) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         moq_action_cleanup(act);
         bridge_set_fatal(b, 0x1);
         return MOQ_ERR_INTERNAL;
@@ -1740,7 +2235,7 @@ static moq_result_t dispatch_open_uni_control(moq_transport_bridge_t *b,
         b->ops->open_uni(b->endpoint_ctx, &uni_id));
 
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_OPEN_UNI_CONTROL;
@@ -1761,7 +2256,7 @@ static moq_result_t dispatch_open_uni_control(moq_transport_bridge_t *b,
         return MOQ_OK;
     }
     if (r == MOQ_TRANSPORT_ERROR) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         moq_action_cleanup(act);
         bridge_set_fatal(b, 0x1);
         return MOQ_ERR_INTERNAL;
@@ -1862,7 +2357,7 @@ static moq_result_t dispatch_send_uni_control(moq_transport_bridge_t *b,
 
     if (fin) {
         bridge_on_local_ctrl_uni_fin(b, e->transport_id);
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
     }
     moq_action_cleanup(act);
     return MOQ_OK;
@@ -1886,8 +2381,14 @@ static moq_result_t bridge_process_action(moq_transport_bridge_t *b,
     case MOQ_ACTION_CLOSE_SESSION:
         return dispatch_close_session(b, act);
 
-    case MOQ_ACTION_SEND_DATA:
-        return dispatch_send_data(b, act);
+    case MOQ_ACTION_SEND_DATA: {
+        bridge_dstream_t *d = bridge_dstream_find(b,
+                                  act->u.send_data.stream_ref);
+        return d ? bridge_dstream_push(b, d, act) : dispatch_send_data(b, act);
+    }
+
+    case MOQ_ACTION_SET_DATA_PRIORITY:
+        return dispatch_set_data_priority(b, act);
 
     case MOQ_ACTION_RESET_DATA:
         return dispatch_reset_data(b, act);
@@ -1980,6 +2481,7 @@ static moq_result_t bridge_drain_actions(moq_transport_bridge_t *b)
      */
     while (drained < BRIDGE_DRAIN_BUDGET &&
            b->pending_count < b->max_pending &&
+           b->dq_bytes < b->max_retained_bytes &&
            moq_session_poll_actions(b->session, &act, 1) > 0) {
         uint32_t before = b->pending_count;
         moq_result_t rc = bridge_process_action(b, &act);
@@ -1995,6 +2497,49 @@ static moq_result_t bridge_drain_actions(moq_transport_bridge_t *b)
 #endif
         drained++;
         if (b->fatal || b->closed) break;
+    }
+    return MOQ_OK;
+}
+
+/* Hand queued data to the endpoint, best key first (equal keys take turns),
+ * while it accepts. A blocked open holds back only streams not yet open: the
+ * open ones are what return the credit. Sets *progress if anything went. */
+static moq_result_t bridge_pump_data(moq_transport_bridge_t *b,
+                                     bool *progress)
+{
+    *progress = false;
+    /* After a refused write, more data would only queue behind it, out of
+     * priority order. */
+    while (!b->fatal && !b->closed && b->dq_items > 0 &&
+           b->pending_count < b->max_pending && b->pending_writes == 0) {
+        /* No stream-map entry is a blocked open too: unopened streams wait
+         * and open in priority order once one frees. */
+        bool open_blocked = b->pending_opens > 0 || bridge_stream_map_full(b);
+        bridge_dstream_t *best = NULL;
+        uint32_t best_key = 0;
+        for (uint32_t i = 0; i < b->dq_waiting_len; i++) {
+            bridge_dstream_t *d = &b->dstreams[b->dq_waiting[i]];
+            if (open_blocked && !d->has_sid) continue;
+            uint32_t k = bridge_dstream_head_key(d);
+            /* Full ties: lowest slot first, whatever the list order. */
+            if (!best || k < best_key ||
+                (k == best_key && (d->served < best->served ||
+                                   (d->served == best->served && d < best)))) {
+                best = d;
+                best_key = k;
+            }
+        }
+        if (!best) break;
+
+        moq_action_t act = best->q[best->q_head];
+        best->q_head = (best->q_head + 1) % best->q_cap;
+        if (--best->q_len == 0) bridge_dq_waiting_remove(b, best);
+        b->dq_bytes -= bridge_send_data_bytes(&act.u.send_data);
+        b->dq_items--;
+        best->served = ++b->serve_seq;
+        *progress = true;
+        moq_result_t rc = dispatch_send_data(b, &act);
+        if (rc < 0) return rc;
     }
     return MOQ_OK;
 }
@@ -2017,6 +2562,8 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
     }
     memset(b->pending, 0, b->max_pending * sizeof(bridge_pending_item_t));
     b->pending_count = 0;
+    b->pending_writes = 0;
+    b->pending_opens = 0;
 
     moq_result_t rc = MOQ_OK;
     uint32_t i = 0;
@@ -2203,11 +2750,11 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                 moq_transport_result_t r = sanitize_stream_result(
                     b->ops->open_uni(b->endpoint_ctx, &uni_id));
                 if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-                    bridge_deactivate_stream(e);
+                    bridge_deactivate_stream(b, e);
                     goto stop;
                 }
                 if (r == MOQ_TRANSPORT_ERROR) {
-                    bridge_deactivate_stream(e);
+                    bridge_deactivate_stream(b, e);
                     bridge_set_fatal(b, 0x1);
                     rc = MOQ_ERR_INTERNAL;
                     goto cleanup;
@@ -2250,11 +2797,11 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
             moq_transport_result_t r = sanitize_stream_result(
                 b->ops->open_uni(b->endpoint_ctx, &uni_id));
             if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-                bridge_deactivate_stream(e);
+                bridge_deactivate_stream(b, e);
                 goto stop;
             }
             if (r == MOQ_TRANSPORT_ERROR) {
-                bridge_deactivate_stream(e);
+                bridge_deactivate_stream(b, e);
                 bridge_set_fatal(b, 0x1);
                 rc = MOQ_ERR_INTERNAL;
                 goto cleanup;
@@ -2299,11 +2846,11 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
             moq_transport_result_t r = sanitize_stream_result(
                 b->ops->open_bidi(b->endpoint_ctx, &bidi_id));
             if (r == MOQ_TRANSPORT_WOULD_BLOCK) {
-                bridge_deactivate_stream(e);
+                bridge_deactivate_stream(b, e);
                 goto stop;
             }
             if (r == MOQ_TRANSPORT_ERROR) {
-                bridge_deactivate_stream(e);
+                bridge_deactivate_stream(b, e);
                 bridge_set_fatal(b, 0x1);
                 rc = MOQ_ERR_INTERNAL;
                 goto cleanup;
@@ -2549,7 +3096,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
                 if (rc < 0)
                     bridge_set_fatal(b, 0x1);
                 else
-                    bridge_deactivate_stream(e);
+                    bridge_deactivate_stream(b, e);
             }
         }
 
@@ -2629,6 +3176,17 @@ static moq_result_t bridge_service_pass(
         if (!b->fatal && !b->closed) {
             moq_result_t rc = bridge_drain_actions(b);
             if (rc < 0) return rc;
+        }
+
+        /* Step 2b: hand queued data to the endpoint in priority order; what
+         * it frees may let more actions drain. */
+        if (!b->fatal && !b->closed) {
+            bool was_full = b->dq_bytes >= b->max_retained_bytes;
+            bool moved;
+            moq_result_t rc = bridge_pump_data(b, &moved);
+            if (rc < 0) return rc;
+            if (moved && was_full && b->dq_bytes < b->max_retained_bytes)
+                continue;
         }
 
         /* Step 3: retry inbound pending */
@@ -2816,7 +3374,7 @@ static moq_result_t bridge_feed_peer_data(
 {
     if (e->uni_disp == BRIDGE_UNI_DISP_DISCARD) {
         /* Session already dropped this stream; swallow until FIN. */
-        if (fin) bridge_deactivate_stream(e);
+        if (fin) bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
     if (bridge_admission_refused(b, e, ref, len))
@@ -2838,7 +3396,7 @@ static moq_result_t bridge_feed_peer_data(
         return rc;
     }
     if (fin) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
     bridge_discard_if_dropped(b, e);
@@ -2889,7 +3447,7 @@ static moq_result_t bridge_uni_pair_inbound(
     if (e->uni_disp == BRIDGE_UNI_DISP_DATA)
         return bridge_feed_peer_data(b, e, ref, data, len, fin, now_us);
     if (e->uni_disp == BRIDGE_UNI_DISP_DISCARD) {
-        if (fin) bridge_deactivate_stream(e);
+        if (fin) bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -2950,7 +3508,7 @@ static moq_result_t bridge_uni_pair_inbound(
     }
     if (cls == MOQ_UNI_CLASS_PADDING) {
         e->uni_disp = BRIDGE_UNI_DISP_DISCARD;
-        if (fin) bridge_deactivate_stream(e);
+        if (fin) bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -2990,7 +3548,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
          * capacity was exhausted) and is stopping it. Swallow remaining inbound
          * bytes until FIN -- replaying them would be misparsed as a fresh
          * stream. Legitimate, not a protocol violation. */
-        if (fin) bridge_deactivate_stream(e);
+        if (fin) bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -3007,7 +3565,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
             e->pending_fin = false;
             e->fin_retained = false;
             e->uni_disp = BRIDGE_UNI_DISP_DISCARD;
-            if (fin) bridge_deactivate_stream(e);
+            if (fin) bridge_deactivate_stream(b, e);
             return MOQ_OK;
         }
         moq_result_t rc = moq_session_on_data_bytes(
@@ -3020,7 +3578,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
         e->pending_retry = false;
         e->pending_fin = false;
         e->fin_retained = false;
-        if (fin) { bridge_deactivate_stream(e); return MOQ_OK; }
+        if (fin) { bridge_deactivate_stream(b, e); return MOQ_OK; }
         bridge_discard_if_dropped(b, e);
         return MOQ_OK;
     }
@@ -3067,7 +3625,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
     }
 
     if (fin) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -3086,7 +3644,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
     if (e && e->uni_disp == BRIDGE_UNI_DISP_DISCARD) {
         /* See on_peer_uni_bytes: session dropped this stream; swallow until
          * FIN rather than misparse replayed bytes as a fresh stream. */
-        if (fin) bridge_deactivate_stream(e);
+        if (fin) bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -3100,7 +3658,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
             e->pending_fin = false;
             e->fin_retained = false;
             e->uni_disp = BRIDGE_UNI_DISP_DISCARD;
-            if (fin) bridge_deactivate_stream(e);
+            if (fin) bridge_deactivate_stream(b, e);
             return MOQ_OK;
         }
         moq_result_t rc = moq_session_on_data_rcbuf(
@@ -3113,7 +3671,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
         e->pending_retry = false;
         e->pending_fin = false;
         e->fin_retained = false;
-        if (fin) { bridge_deactivate_stream(e); return MOQ_OK; }
+        if (fin) { bridge_deactivate_stream(b, e); return MOQ_OK; }
         bridge_discard_if_dropped(b, e);
         return MOQ_OK;
     }
@@ -3162,7 +3720,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
     }
 
     if (fin) {
-        bridge_deactivate_stream(e);
+        bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -3192,7 +3750,7 @@ moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
          * silently, retire on the peer's FIN — never a fresh ref, never
          * fatal. */
         if (fin)
-            bridge_deactivate_stream(e);
+            bridge_deactivate_stream(b, e);
         return MOQ_OK;
     }
 
@@ -3256,12 +3814,12 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
     if (!e) return MOQ_OK;
 
-    if (e->aborting) { bridge_deactivate_stream(e); return MOQ_OK; }
+    if (e->aborting) { bridge_deactivate_stream(b, e); return MOQ_OK; }
 
     /* Refused at admission (ready to retry or not): the session never saw
      * the stream, so there is nothing to reset there; retire the mapping (the
      * adapter drops the chunk it was holding). */
-    if (e->held_input) { bridge_deactivate_stream(e); return MOQ_OK; }
+    if (e->held_input) { bridge_deactivate_stream(b, e); return MOQ_OK; }
 
     /* Uni-control-pair mode: the control channel lives for the session, so
      * a peer RESET of its unidirectional control stream terminates the
@@ -3294,7 +3852,7 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
         return rc;
     }
 
-    bridge_deactivate_stream(e);
+    bridge_deactivate_stream(b, e);
     return MOQ_OK;
 }
 

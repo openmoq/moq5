@@ -26,6 +26,23 @@ moq_result_t moq_d16_scan_delivery_timeout_ext(const uint8_t *ext, size_t len,
                                                bool *out_has,
                                                uint64_t *out_ms);
 
+/* DEFAULT_PUBLISHER_GROUP_ORDER Track Extension (draft-16 11.1.1.2). */
+#define MOQ_D16_EXT_GROUP_ORDER 0x22u
+
+/* *out_group_order: 0 if omitted, else 1 (ascending) / 2 (descending). A
+ * value outside 1..2 is MOQ_ERR_PROTO in every mode; duplicates and bad
+ * structure only in strict mode, as in the timeout scanner. */
+moq_result_t moq_d16_scan_group_order_ext(const uint8_t *ext, size_t len,
+                                          bool strict,
+                                          uint8_t *out_group_order);
+
+/* Copy `in` to `out` with the even `type` = `value` inserted in order. `type`
+ * must not already be present. */
+moq_result_t moq_d16_track_ext_put_varint(const uint8_t *in, size_t in_len,
+                                          uint64_t type, uint64_t value,
+                                          uint8_t *out, size_t out_cap,
+                                          size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

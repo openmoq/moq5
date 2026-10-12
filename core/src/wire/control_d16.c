@@ -897,6 +897,82 @@ moq_result_t moq_d16_scan_delivery_timeout_ext(const uint8_t *ext, size_t len,
     }
 }
 
+moq_result_t moq_d16_scan_group_order_ext(const uint8_t *ext, size_t len,
+                                          bool strict,
+                                          uint8_t *out_group_order)
+{
+    *out_group_order = 0;
+    if (!ext || len == 0) return MOQ_OK;
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, ext, len);
+    uint8_t found = 0;
+    for (;;) {
+        moq_kvp_entry_t e;
+        moq_result_t rc = moq_kvp_decode_next(&dec, &e);
+        if (rc == MOQ_DONE) break;
+        if (rc < 0) {
+            if (strict) return MOQ_ERR_PROTO;
+            return MOQ_OK;                     /* lenient: stay opaque */
+        }
+        if (e.type != MOQ_D16_EXT_GROUP_ORDER) continue;
+        uint64_t v = 0;
+        size_t n = moq_quic_varint_decode(e.value, e.value_len, &v);
+        if (n == 0 || n != e.value_len) {
+            if (strict) return MOQ_ERR_PROTO;
+            return MOQ_OK;
+        }
+        if (v < 1 || v > 2) return MOQ_ERR_PROTO;   /* MUST close */
+        if (found) {
+            if (strict) return MOQ_ERR_PROTO;  /* never EMIT a duplicate */
+            continue;                          /* inbound: first value wins */
+        }
+        found = (uint8_t)v;
+    }
+    *out_group_order = found;
+    return MOQ_OK;
+}
+
+moq_result_t moq_d16_track_ext_put_varint(const uint8_t *in, size_t in_len,
+                                          uint64_t type, uint64_t value,
+                                          uint8_t *out, size_t out_cap,
+                                          size_t *out_len)
+{
+    if ((type & 1) || !out || !out_len || (in_len > 0 && !in))
+        return MOQ_ERR_INVAL;
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, in, in_len);
+    uint64_t prev_out = 0;
+    size_t pos = 0;
+    bool placed = false;
+    for (;;) {
+        moq_kvp_entry_t e;
+        moq_result_t rc = moq_kvp_decode_next(&dec, &e);
+        if (rc == MOQ_DONE) break;
+        if (rc < 0) return MOQ_ERR_INVAL;
+        if (!placed && type < e.type) {
+            size_t n = moq_kvp_encode_varint_entry(prev_out, type, value,
+                                                   out + pos, out_cap - pos);
+            if (n == 0) return MOQ_ERR_BUFFER;
+            pos += n;
+            prev_out = type;
+            placed = true;
+        }
+        size_t n = moq_kvp_encode_entry(prev_out, &e, out + pos,
+                                        out_cap - pos);
+        if (n == 0) return MOQ_ERR_BUFFER;
+        pos += n;
+        prev_out = e.type;
+    }
+    if (!placed) {
+        size_t n = moq_kvp_encode_varint_entry(prev_out, type, value,
+                                               out + pos, out_cap - pos);
+        if (n == 0) return MOQ_ERR_BUFFER;
+        pos += n;
+    }
+    *out_len = pos;
+    return MOQ_OK;
+}
+
 moq_result_t moq_d16_encode_subscribe_ok(moq_buf_writer_t *w,
                                           uint64_t request_id,
                                           uint64_t track_alias,
