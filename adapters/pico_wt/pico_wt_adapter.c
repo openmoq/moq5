@@ -1044,9 +1044,11 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
     }
 
     case picohttp_callback_provide_datagram:
+        /* Inside packet building: priorities wait for the next service. */
         pico_wt_endpoint_provide_datagram(
             &c->endpoint_ctx, bytes, length);
-        break;
+        PW_OBSERVE_CALLBACK(c, event, sid, 1);
+        return 0;
 
     /* picohttp_callback_provide_data handled above (before the terminal gate). */
 

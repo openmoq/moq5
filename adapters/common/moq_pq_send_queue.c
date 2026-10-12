@@ -31,7 +31,15 @@ typedef struct {
     uint8_t     level;        /* transport priority last applied */
     bool        level_applied;
     bool        unstarted;    /* opened, no byte accepted yet */
+    bool        counted;      /* in keyed_bytes */
+    size_t      next_free;
 } pq_stream_t;
+
+/* sid -> slot, open addressing; slot < 0 marks an empty entry. */
+typedef struct {
+    uint64_t sid;
+    int64_t  slot;
+} pq_index_t;
 
 typedef struct {
     uint32_t key;
@@ -54,6 +62,9 @@ struct moq_pq_send_queue {
     bool         priorities_dirty;
     pq_rank_t   *order;       /* ranking scratch, order_cap entries */
     size_t       order_cap;
+    pq_index_t  *index;       /* 2 * nstreams entries */
+    size_t       free_head;   /* free slot list; nstreams when empty */
+    size_t       keyed_bytes; /* keyed streams holding bytes */
 };
 
 /* Bump the high-water mark after `queued` grows. */
@@ -94,6 +105,8 @@ static void pq_chunk_free(moq_pq_send_queue_t *q, pq_chunk_t *c)
     q->alloc.free(c, sizeof(*c), q->alloc.ctx);
 }
 
+static void pq_index_remove(moq_pq_send_queue_t *q, uint64_t sid);
+
 static void pq_stream_clear(moq_pq_send_queue_t *q, pq_stream_t *s)
 {
     pq_chunk_t *c = s->head;
@@ -106,10 +119,11 @@ static void pq_stream_clear(moq_pq_send_queue_t *q, pq_stream_t *s)
         pq_chunk_free(q, c);
         c = n;
     }
-    s->head = s->tail = NULL;
-    s->remaining = 0;
-    s->in_use = false;
-    s->sid = 0;
+    q->keyed_bytes -= s->counted;
+    pq_index_remove(q, s->sid);
+    memset(s, 0, sizeof(*s));
+    s->next_free = q->free_head;
+    q->free_head = (size_t)(s - q->streams);
     q->priorities_dirty = true;
 }
 
@@ -125,43 +139,99 @@ void moq_pq_send_queue_destroy(moq_pq_send_queue_t *q)
     if (q->order)
         q->alloc.free(q->order, q->order_cap * sizeof(pq_rank_t),
                       q->alloc.ctx);
+    if (q->index)
+        q->alloc.free(q->index, 2 * q->nstreams * sizeof(pq_index_t),
+                      q->alloc.ctx);
     q->alloc.free(q, sizeof(*q), q->alloc.ctx);
+}
+
+static size_t pq_index_mask(const moq_pq_send_queue_t *q)
+{
+    return 2 * q->nstreams - 1;
+}
+
+static size_t pq_index_home(const moq_pq_send_queue_t *q, uint64_t sid)
+{
+    return (size_t)((sid * 0x9E3779B97F4A7C15ULL) >> 32) & pq_index_mask(q);
+}
+
+static void pq_index_insert(moq_pq_send_queue_t *q, uint64_t sid, size_t slot)
+{
+    size_t i = pq_index_home(q, sid);
+    while (q->index[i].slot >= 0) i = (i + 1) & pq_index_mask(q);
+    q->index[i].sid = sid;
+    q->index[i].slot = (int64_t)slot;
+}
+
+static void pq_index_remove(moq_pq_send_queue_t *q, uint64_t sid)
+{
+    size_t mask = pq_index_mask(q);
+    size_t i = pq_index_home(q, sid);
+    for (;; i = (i + 1) & mask) {
+        if (q->index[i].slot < 0) return;
+        if (q->index[i].sid == sid) break;
+    }
+    q->index[i].slot = -1;
+    /* Backshift entries whose probe chain crossed the hole. */
+    for (size_t j = (i + 1) & mask; q->index[j].slot >= 0; j = (j + 1) & mask) {
+        size_t home = pq_index_home(q, q->index[j].sid);
+        if (((j - home) & mask) >= ((j - i) & mask)) {
+            q->index[i] = q->index[j];
+            q->index[j].slot = -1;
+            i = j;
+        }
+    }
 }
 
 static pq_stream_t *pq_find(moq_pq_send_queue_t *q, uint64_t sid)
 {
-    for (size_t i = 0; i < q->nstreams; i++)
-        if (q->streams[i].in_use && q->streams[i].sid == sid)
-            return &q->streams[i];
+    if (!q->nstreams) return NULL;
+    for (size_t i = pq_index_home(q, sid); q->index[i].slot >= 0;
+         i = (i + 1) & pq_index_mask(q))
+        if (q->index[i].sid == sid) return &q->streams[q->index[i].slot];
     return NULL;
+}
+
+/* Double the slot table and rebuild the index around it. */
+static int pq_grow(moq_pq_send_queue_t *q)
+{
+    size_t old = q->nstreams;
+    size_t nn = old ? old * 2 : 8;
+    pq_index_t *ni = (pq_index_t *)q->alloc.alloc(2 * nn * sizeof(*ni),
+                                                  q->alloc.ctx);
+    if (!ni) return -1;
+    pq_stream_t *ns = (pq_stream_t *)q->alloc.realloc(
+        q->streams, old * sizeof(*ns), nn * sizeof(*ns), q->alloc.ctx);
+    if (!ns) {
+        q->alloc.free(ni, 2 * nn * sizeof(*ni), q->alloc.ctx);
+        return -1;
+    }
+    q->streams = ns;
+    if (q->index)
+        q->alloc.free(q->index, 2 * old * sizeof(*ni), q->alloc.ctx);
+    q->index = ni;
+    q->nstreams = nn;
+    for (size_t i = 0; i < 2 * nn; i++) ni[i].slot = -1;
+    for (size_t i = 0; i < old; i++)
+        if (ns[i].in_use) pq_index_insert(q, ns[i].sid, i);
+    memset(ns + old, 0, (nn - old) * sizeof(*ns));
+    for (size_t i = old; i < nn; i++) ns[i].next_free = i + 1;
+    q->free_head = old;   /* only grown when the free list is empty */
+    return 0;
 }
 
 static pq_stream_t *pq_find_or_create(moq_pq_send_queue_t *q, uint64_t sid)
 {
     pq_stream_t *s = pq_find(q, sid);
     if (s) return s;
-    for (size_t i = 0; i < q->nstreams; i++)
-        if (!q->streams[i].in_use) {
-            s = &q->streams[i];
-            memset(s, 0, sizeof(*s));
-            s->in_use = true;
-            s->sid = sid;
-            q->priorities_dirty = true;
-            return s;
-        }
-    /* Grow the table. */
-    size_t old = q->nstreams;
-    size_t nn = old ? old * 2 : 8;
-    pq_stream_t *ns = (pq_stream_t *)q->alloc.realloc(
-        q->streams, old * sizeof(pq_stream_t), nn * sizeof(pq_stream_t),
-        q->alloc.ctx);
-    if (!ns) return NULL;
-    memset(ns + old, 0, (nn - old) * sizeof(pq_stream_t));
-    q->streams = ns;
-    q->nstreams = nn;
-    s = &q->streams[old];
+    if (q->free_head >= q->nstreams && pq_grow(q) != 0) return NULL;
+    size_t slot = q->free_head;
+    s = &q->streams[slot];
+    q->free_head = s->next_free;
+    memset(s, 0, sizeof(*s));
     s->in_use = true;
     s->sid = sid;
+    pq_index_insert(q, sid, slot);
     q->priorities_dirty = true;
     return s;
 }
@@ -182,6 +252,9 @@ int moq_pq_send_queue_set_key(moq_pq_send_queue_t *q, uint64_t sid,
     if (s->priority_key != key) {
         s->priority_key = key;
         q->priorities_dirty = true;
+        bool count = key && s->head;
+        q->keyed_bytes += (size_t)count - (size_t)s->counted;
+        s->counted = count;
     }
     return 0;
 }
@@ -267,16 +340,10 @@ static bool pq_would_exceed(const moq_pq_send_queue_t *q, size_t len)
 /* A keyed stream starts only while fewer than PQ_RANK_MAX keyed streams hold
  * bytes, so those keep distinct levels; the bridge holds the rest in priority
  * order. Started streams are never refused, so they always finish. */
-static bool pq_ranks_full(moq_pq_send_queue_t *q, uint64_t sid)
+static bool pq_ranks_full(const moq_pq_send_queue_t *q, const pq_stream_t *s)
 {
-    const pq_stream_t *s = pq_find(q, sid);
-    if (!s || !s->unstarted || !s->priority_key) return false;
-    size_t n = 0;
-    for (size_t i = 0; i < q->nstreams; i++) {
-        const pq_stream_t *o = &q->streams[i];
-        if (o->in_use && o->priority_key && o->head) n++;
-    }
-    return n >= PQ_RANK_MAX;
+    return s && s->unstarted && s->priority_key &&
+           q->keyed_bytes >= PQ_RANK_MAX;
 }
 
 /* Enqueue `c`; a stream's first bytes give it a rank. */
@@ -285,6 +352,10 @@ static void pq_append(moq_pq_send_queue_t *q, pq_stream_t *s, pq_chunk_t *c)
     if (s->unstarted) {
         s->unstarted = false;
         q->priorities_dirty = true;
+    }
+    if (!s->head && s->priority_key) {
+        s->counted = true;
+        q->keyed_bytes++;
     }
     c->next = NULL;
     if (s->tail) s->tail->next = c;
@@ -312,24 +383,23 @@ int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
     /* A zero-length non-FIN write carries nothing; accept it without touching
      * a stream slot (creating one would leak an empty in_use entry). */
     if (len == 0 && !fin) return 1;
-    if (pq_would_exceed(q, len) || pq_ranks_full(q, sid)) {
+    pq_stream_t *s = pq_find(q, sid);
+    if (pq_would_exceed(q, len) || pq_ranks_full(q, s)) {
         q->would_block++;
         return 0;
     }
-
-    pq_stream_t *s = pq_find_or_create(q, sid);
-    if (!s) return -1;
+    if (!s && !(s = pq_find_or_create(q, sid))) return -1;
 
     if (len == 0)
         return pq_push_bare_fin(q, s);   /* len == 0 && fin */
 
     pq_chunk_t *c = (pq_chunk_t *)q->alloc.alloc(sizeof(*c), q->alloc.ctx);
-    if (!c) { if (!s->head) s->in_use = false; return -1; }
+    if (!c) { if (!s->head) pq_stream_clear(q, s); return -1; }
     memset(c, 0, sizeof(*c));
     c->copied = (uint8_t *)q->alloc.alloc(len, q->alloc.ctx);
     if (!c->copied) {
         q->alloc.free(c, sizeof(*c), q->alloc.ctx);
-        if (!s->head) s->in_use = false;
+        if (!s->head) pq_stream_clear(q, s);
         return -1;
     }
     memcpy(c->copied, data, len);
@@ -354,16 +424,15 @@ int moq_pq_send_queue_push_rcbuf(moq_pq_send_queue_t *q, uint64_t sid,
     if (len == 0)
         return moq_pq_send_queue_push_copy(q, sid, NULL, 0, fin);
 
-    if (pq_would_exceed(q, len) || pq_ranks_full(q, sid)) {
+    pq_stream_t *s = pq_find(q, sid);
+    if (pq_would_exceed(q, len) || pq_ranks_full(q, s)) {
         q->would_block++;
         return 0;
     }
-
-    pq_stream_t *s = pq_find_or_create(q, sid);
-    if (!s) return -1;
+    if (!s && !(s = pq_find_or_create(q, sid))) return -1;
 
     pq_chunk_t *c = (pq_chunk_t *)q->alloc.alloc(sizeof(*c), q->alloc.ctx);
-    if (!c) { if (!s->head) s->in_use = false; return -1; }
+    if (!c) { if (!s->head) pq_stream_clear(q, s); return -1; }
     memset(c, 0, sizeof(*c));
     moq_rcbuf_incref(buf);
     c->rcbuf = buf;
