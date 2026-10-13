@@ -392,6 +392,23 @@ typedef struct moq_media_track_cfg {
 #endif
     bool        has_publisher_priority;
     uint8_t     publisher_priority;
+
+    /* MSF renderGroup: tracks sharing a value are intended to be rendered
+     * together (e.g. one program's video and audio). Authoring-only, like
+     * alt_group: emitted verbatim, never inferred or checked across tracks.
+     * has_render_group=false (the default) means absent. Read only when
+     * struct_size covers the complete presence/value pair.
+     *
+     * APPENDED AFTER the publisher-priority fields, aligned so an older
+     * caller's struct_size prefix (and its tail padding) never reinterprets
+     * these bytes. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    bool        has_render_group;
+    int         render_group;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
