@@ -58,6 +58,15 @@ _Static_assert(offsetof(moq_media_track_cfg_t, has_publisher_priority) >=
                MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP,
                "publisher priority must follow the complete historical layout");
 
+#define MEDIA_TRACK_CFG_SIZE_THROUGH_PUBLISHER_PRIORITY \
+    ((offsetof(moq_media_track_cfg_t, publisher_priority) + \
+      sizeof(((moq_media_track_cfg_t *)0)->publisher_priority) + \
+      _Alignof(moq_media_track_cfg_t) - 1u) & \
+     ~((size_t)_Alignof(moq_media_track_cfg_t) - 1u))
+_Static_assert(offsetof(moq_media_track_cfg_t, has_render_group) >=
+               MEDIA_TRACK_CFG_SIZE_THROUGH_PUBLISHER_PRIORITY,
+               "render group must follow the complete publisher-priority layout");
+
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
  * appended `callbacks` field is read only when struct_size covers it, so an
@@ -131,6 +140,8 @@ struct moq_media_track {
     int                   alt_group;
     bool                  has_publisher_priority;
     uint8_t               publisher_priority;
+    bool                  has_render_group;
+    int                   render_group;
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
      * allocation; the id bytes live in `strings` with the other spans. */
@@ -883,6 +894,7 @@ static void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m)
     /* CMSF §3.2 alternate group: carried verbatim onto the catalog track entry
      * (the lower MSF encoder emits "altGroup"). */
     if (t->has_alt_group) { m->has_alt_group = true; m->alt_group = t->alt_group; }
+    if (t->has_render_group) { m->has_render_group = true; m->render_group = t->render_group; }
     /* CMSF authoring metadata (borrows the track's owned copies). */
     if (t->has_max_grp_sap) { m->has_max_grp_sap = true; m->max_grp_sap = t->max_grp_sap; }
     if (t->has_max_obj_sap) { m->has_max_obj_sap = true; m->max_obj_sap = t->max_obj_sap; }
@@ -4068,6 +4080,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         cfg_local.has_publisher_priority = false;
         cfg_local.publisher_priority = 0;
     }
+    if (cfg->struct_size < offsetof(moq_media_track_cfg_t, render_group) +
+                           sizeof(cfg->render_group)) {
+        cfg_local.has_render_group = false;
+        cfg_local.render_group = 0;
+    }
     cfg_local.struct_size = sizeof(cfg_local);
     cfg = &cfg_local;
     if (cfg->name.len == 0 || !cfg->name.data) return MOQ_ERR_INVAL;
@@ -4195,6 +4212,8 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->alt_group = cfg->alt_group;
     t->has_publisher_priority = cfg->has_publisher_priority;
     t->publisher_priority = cfg->publisher_priority;
+    t->has_render_group = cfg->has_render_group;
+    t->render_group = cfg->render_group;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;
