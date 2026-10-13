@@ -44,7 +44,7 @@ static void test_cfg_init(void)
 {
     moq_proxygen_wt_managed_cfg_t c;
     moq_proxygen_wt_managed_cfg_init(&c);
-    CHECK(c.struct_size == sizeof(moq_proxygen_wt_managed_cfg_t));
+    CHECK(c.struct_size == offsetof(moq_proxygen_wt_managed_cfg_t, setup_auth_tokens));
     CHECK(c.perspective == MOQ_PERSPECTIVE_CLIENT);
     CHECK(c.alpn_list == NULL);
     CHECK(c.alpn_count == 0);

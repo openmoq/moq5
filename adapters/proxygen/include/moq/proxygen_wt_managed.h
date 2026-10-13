@@ -96,8 +96,20 @@ typedef struct moq_proxygen_wt_managed_cfg {
 
     /* Session deadline tuning (0 = disabled). */
     uint64_t              goaway_timeout_us;
+    /* Reserved SETUP credential block. A configured list currently returns
+     * MOQ_ERR_UNSUPPORTED before transport startup. Use the sized initializer;
+     * both fields must fit in struct_size. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
 } moq_proxygen_wt_managed_cfg_t;
 
+MOQ_API void moq_proxygen_wt_managed_cfg_init_sized(moq_proxygen_wt_managed_cfg_t *cfg, size_t size);
 MOQ_API void moq_proxygen_wt_managed_cfg_init(moq_proxygen_wt_managed_cfg_t *cfg);
 
 /*

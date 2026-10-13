@@ -204,11 +204,23 @@ typedef struct moq_pico_wt_managed_cfg {
      * imply any MoQ/session deadline. */
     uint32_t           keep_alive_interval_ms;
 
+    /* SETUP credentials are copied before create returns. Use the sized
+     * initializer to enable this append-only block. Both list fields must
+     * fit in struct_size. No configured credential is silently omitted. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
 } moq_pico_wt_managed_cfg_t;
 
 /* Pointer-only initializer: clears and stamps the original frozen prefix
  * through wt_protocols. Use _init_sized(cfg, sizeof(*cfg)) before setting
- * appended fields such as app_deadline_us or keep_alive_interval_ms. */
+ * appended fields such as app_deadline_us, keep_alive_interval_ms, or
+ * SETUP credentials. */
 MOQ_API void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg);
 
 /* Explicit caller-sized initializer: clears and stamps

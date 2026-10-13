@@ -5,6 +5,14 @@ int main(void)
 {
     int failures = 0;
 
+    /* Token payloads are opaque transport bytes.  This deliberately is not a
+     * valid signed CWT; validation belongs to the token-type verifier. */
+    {
+        const uint8_t payload[] = {0xd2, 0x84, 0x40, 0x00, 0x80, 0xff};
+        MOQ_TEST_CHECK(moq_auth_token_value_semantically_valid(
+            payload, sizeof(payload)));
+    }
+
     /* == Register, lookup, delete ===================================== */
     {
         test_alloc_state_t as = {0};

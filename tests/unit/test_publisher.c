@@ -145,6 +145,70 @@ static void test_pub_callbacks_init_old_prefix_no_overflow(void) {
     MOQ_TEST_PASS("pub_callbacks_init_old_prefix_no_overflow");
 }
 
+static void test_namespace_auth(void)
+{
+    const moq_version_t versions[] = {MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18};
+    for (size_t vi = 0; vi < 2; ++vi) {
+      for (unsigned mode = 0; mode < 3; ++mode) {
+        test_alloc_state_t as = {0}; moq_alloc_t alloc = test_allocator(&as);
+        moq_simpair_cfg_t sc = MOQ_SIMPAIR_CFG_INIT;
+        sc.alloc = &alloc; sc.version = versions[vi];
+        sc.client_send_request_capacity = sc.server_send_request_capacity = true;
+        sc.client_initial_request_capacity = sc.server_initial_request_capacity = 16;
+        moq_simpair_t *sp = NULL;
+        MOQ_TEST_CHECK(moq_simpair_create(&sc, &sp) == MOQ_OK);
+        if (!sp) continue;
+        moq_simpair_start(sp); moq_simpair_run_until_quiescent(sp, 16, NULL);
+        drain_all(sp);
+        moq_pub_cfg_t pc; moq_pub_cfg_init_sized(&pc, sizeof(pc));
+        moq_publisher_t *pub = NULL;
+        MOQ_TEST_CHECK(moq_pub_create(moq_simpair_client(sp), &alloc, &pc, &pub) == MOQ_OK);
+        moq_pub_track_cfg_t tc; moq_pub_track_cfg_init_sized(&tc, sizeof(tc));
+        moq_bytes_t ns = MOQ_BYTES_LITERAL("private");
+        uint8_t data[] = {0xd2, 0x84, 0, 0xff};
+        const uint8_t expected[] = {0xd2, 0x84, 0, 0xff};
+        moq_auth_token_t tok = {1, {data, sizeof(data)}};
+        tc.track_namespace = (moq_namespace_t){&ns, 1};
+        tc.track_name = MOQ_BYTES_LITERAL("video"); tc.advertise_namespace = true;
+        tc.namespace_auth_tokens = &tok; tc.namespace_auth_token_count = 1;
+        if (mode) {
+            tc.struct_size = (uint32_t)(mode == 1
+                ? offsetof(moq_pub_track_cfg_t, namespace_auth_tokens)
+                : offsetof(moq_pub_track_cfg_t, namespace_auth_token_count) +
+                  sizeof(tc.namespace_auth_token_count) - 1);
+            tc.namespace_auth_tokens = (const moq_auth_token_t *)(uintptr_t)1;
+        }
+        moq_pub_track_t *track = NULL;
+        MOQ_TEST_CHECK(moq_pub_add_track(pub, &tc, 0, &track) == MOQ_OK);
+        memset(data, 0xaa, sizeof(data));
+        moq_simpair_run_until_quiescent(sp, 16, NULL);
+        moq_event_t ev; bool found = false;
+        while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1)) {
+            if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
+                found = true;
+                MOQ_TEST_CHECK(ev.u.namespace_published.token_count == (mode ? 0u : 1u));
+                if (ev.u.namespace_published.token_count == 1) {
+                    const moq_resolved_token_t *t = ev.u.namespace_published.tokens;
+                    MOQ_TEST_CHECK(t->token_type == 1 && t->token_value.len == sizeof(expected));
+                    if (t->token_value.len == sizeof(expected))
+                        MOQ_TEST_CHECK(memcmp(t->token_value.data, expected, sizeof(expected)) == 0);
+                }
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(found);
+        /* A second track joins the live advertisement; it cannot replace its
+         * credentials or issue a second PUBLISH_NAMESPACE. */
+        tc.track_name = MOQ_BYTES_LITERAL("audio");
+        MOQ_TEST_CHECK(moq_pub_add_track(pub, &tc, 0, &track) == MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 16, NULL);
+        MOQ_TEST_CHECK(moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 0);
+        moq_pub_destroy(pub); drain_all(sp); moq_simpair_destroy(sp);
+        MOQ_TEST_CHECK(as.balance == 0);
+      }
+    }
+}
+
 static void test_add_remove_track(void) {
     test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
     simpair_setup(&as, &alloc, &sp);
@@ -14790,6 +14854,7 @@ int main(void) {
     test_create_destroy();
     test_pub_cfg_init_old_prefix_no_overflow();
     test_pub_callbacks_init_old_prefix_no_overflow();
+    test_namespace_auth();
     test_add_remove_track();
     test_subscribe_accept_all();
     test_remove_track_retires_subscription();

@@ -1518,24 +1518,63 @@ moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
 moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                                        const moq_d18_setup_opts_t *opts)
 {
-    if (!w) return MOQ_ERR_INVAL;
-    /* Only cache-size emission is sourced today; refuse silently dropping any
-     * other requested option. */
-    if (opts && (opts->has_path || opts->has_authority ||
-                 opts->auth_token_count > 0))
-        return MOQ_ERR_INVAL;
+    if (opts && (opts->has_path || opts->has_authority)) return MOQ_ERR_INVAL;
+    return moq_d18_encode_setup_opts_routes(w, opts, (moq_bytes_t){0},
+                                            (moq_bytes_t){0});
+}
 
+moq_result_t moq_d18_encode_setup_opts_routes(moq_buf_writer_t *w,
+    const moq_d18_setup_opts_t *opts, moq_bytes_t authority, moq_bytes_t path)
+{
+    if (!w || (authority.len && !authority.data) || (path.len && !path.data))
+        return MOQ_ERR_INVAL;
+    if (authority.len > 65535 || path.len > 65535) return MOQ_ERR_BUFFER;
+    if (opts && opts->auth_token_count > MOQ_D18_MAX_AUTH_TOKENS)
+        return MOQ_ERR_INVAL;
+    if ((!opts || !opts->has_authority) && authority.len) return MOQ_ERR_INVAL;
+    if ((!opts || !opts->has_path) && path.len) return MOQ_ERR_INVAL;
+    if (opts) for (size_t i = 0; i < opts->auth_token_count; ++i) {
+        const moq_d18_auth_token_t *t = &opts->auth_tokens[i];
+        if (t->alias_type > MOQ_AUTH_TOKEN_USE_VALUE ||
+            (t->token_value.len && !t->token_value.data)) return MOQ_ERR_INVAL;
+        if (t->token_value.len > 65535) return MOQ_ERR_BUFFER;
+        size_t token_len = moq_vi64_len(t->alias_type);
+        if (t->alias_type != MOQ_AUTH_TOKEN_USE_VALUE)
+            token_len += moq_vi64_len(t->alias);
+        if (t->alias_type == MOQ_AUTH_TOKEN_REGISTER ||
+            t->alias_type == MOQ_AUTH_TOKEN_USE_VALUE)
+            token_len += moq_vi64_len(t->token_type) + t->token_value.len;
+        if (token_len > 65535) return MOQ_ERR_BUFFER;
+    }
     size_t saved = w->pos, len_off;
+    uint64_t prev = 0;
     moq_result_t rc = d18_write_header(w, MOQ_D18_STREAM_SETUP, &len_off);
-    if (rc < 0) { w->pos = saved; return rc; }
-    if (opts && opts->has_max_auth_token_cache_size) {
-        /* First option: Delta Type == absolute type; even => vi64 value. */
-        if ((rc = moq_buf_write_vi64(
-                w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE)) < 0)
+    if (rc < 0) goto fail;
+    if (opts && opts->has_path) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_PATH - prev)) < 0)
             goto fail;
+        prev = MOQ_D18_SETUP_OPT_PATH;
+        if ((rc = d18_write_span(w, path)) < 0) goto fail;
+    }
+    if (opts) for (size_t i = 0; i < opts->auth_token_count; ++i) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_AUTHORIZATION_TOKEN - prev)) < 0)
+            goto fail;
+        prev = MOQ_D18_SETUP_OPT_AUTHORIZATION_TOKEN;
+        if ((rc = d18_write_auth_token(w, &opts->auth_tokens[i])) < 0) goto fail;
+    }
+    if (opts && opts->has_max_auth_token_cache_size) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE - prev)) < 0)
+            goto fail;
+        prev = MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE;
         if ((rc = moq_buf_write_vi64(w, opts->max_auth_token_cache_size)) < 0)
             goto fail;
     }
+    if (opts && opts->has_authority) {
+        if ((rc = moq_buf_write_vi64(w, MOQ_D18_SETUP_OPT_AUTHORITY - prev)) < 0)
+            goto fail;
+        if ((rc = d18_write_span(w, authority)) < 0) goto fail;
+    }
+    if (w->pos - len_off - 2 > 65535) { rc = MOQ_ERR_BUFFER; goto fail; }
     if ((rc = d18_patch_len(w, len_off)) < 0) goto fail;
     return MOQ_OK;
 fail:

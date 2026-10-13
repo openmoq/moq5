@@ -198,6 +198,21 @@ typedef struct moq_session_cfg {
      * stays ESTABLISHED. 0 selects the library default (4096). Read only when
      * struct_size covers this field; older callers get the default. */
     uint32_t           max_namespace_suffixes_per_subscription;
+
+    /* Preserve the historical trailing padding; never interpret it as input. */
+    uint32_t           reserved_setup_padding;
+    /* Borrowed until create returns; copied into owned SETUP wire storage.
+     * Tokens use USE_VALUE. Pointer/count must both be present in struct_size.
+     * At most 16 tokens (draft-16 also limits all SETUP parameters to 16).
+     * Token types must be at most 2^62 - 1. Invalid spans/counts return INVAL;
+     * credentials/routes whose complete encoded SETUP exceeds the wire/send
+     * budget return BUFFER from create, before any actions can be queued.
+     * Raw-QUIC client routes only; servers must leave both spans empty.
+     * A zero-length route is omitted. WebTransport callers route via CONNECT. */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t             setup_auth_token_count;
+    moq_bytes_t        setup_authority;
+    moq_bytes_t        setup_path;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus

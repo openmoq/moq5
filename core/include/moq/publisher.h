@@ -245,6 +245,13 @@ typedef struct moq_pub_track_cfg {
      * Read only when struct_size covers the whole field: set it only with
      * moq_pub_track_cfg_init_sized(). */
     bool            monotonic_groups;
+    /* Preserve the previous layout's trailing padding for old full-size callers. */
+    uint8_t         _reserved_auth_tail[7];
+    /* Borrowed for add_track; used only for the first namespace advertisement.
+     * A track joining a live advertisement does not replace its credentials.
+     * Requires moq_pub_track_cfg_init_sized(). */
+    const moq_auth_token_t *namespace_auth_tokens;
+    size_t                  namespace_auth_token_count;
 } moq_pub_track_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original

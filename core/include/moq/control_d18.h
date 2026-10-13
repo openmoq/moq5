@@ -150,10 +150,14 @@ typedef struct moq_d18_setup_opts {
 MOQ_API moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
                                                moq_d18_setup_opts_t *out);
 
-/* Encode a SETUP message carrying the given options (NULL opts == no options).
- * Only MAX_AUTH_TOKEN_CACHE_SIZE emission is supported (the only option the
- * session currently sources); PATH/AUTHORITY/token emission are rejected with
- * MOQ_ERR_INVAL until a public surface supplies them. */
+/* Additive route-aware encoder. Spans are borrowed during this call; their
+ * presence is selected by opts.has_path / opts.has_authority. The historical
+ * unsized options struct and decoder ABI remain unchanged. */
+MOQ_API moq_result_t moq_d18_encode_setup_opts_routes(moq_buf_writer_t *w,
+    const moq_d18_setup_opts_t *opts, moq_bytes_t authority, moq_bytes_t path);
+
+/* Encode cache size and authorization tokens (NULL opts means no options).
+ * Route flags require the route-aware encoder above. */
 MOQ_API moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                                                const moq_d18_setup_opts_t *opts);
 

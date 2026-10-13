@@ -91,6 +91,12 @@ typedef struct moq_profile_ops {
                           const moq_session_cfg_t *cfg);
     void (*destroy)(void *profile_state);
 
+    /* Build owned SETUP bytes at create, before caller buffers expire.
+     * Inputs have bounded counts/lengths and valid spans; the profile owns
+     * wire sizing, encoding, and its own parameter-count restrictions. */
+    moq_result_t (*prepare_setup)(moq_session_t *s,
+        const moq_auth_token_t *tokens, size_t count,
+        moq_bytes_t authority, moq_bytes_t path);
     moq_result_t (*start)(moq_session_t *s);
     moq_result_t (*process_control_data)(moq_session_t *s,
                                           const uint8_t *data, size_t len,

@@ -558,9 +558,19 @@ extern "C" {
 void moq_proxygen_wt_managed_cfg_init(moq_proxygen_wt_managed_cfg_t *cfg)
 {
     if (!cfg) return;
-    std::memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    std::memset(cfg, 0, offsetof(moq_proxygen_wt_managed_cfg_t, setup_auth_tokens));
+    cfg->struct_size = offsetof(moq_proxygen_wt_managed_cfg_t, setup_auth_tokens);
     cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
+}
+
+void moq_proxygen_wt_managed_cfg_init_sized(moq_proxygen_wt_managed_cfg_t *cfg, size_t size)
+{
+    if (!cfg || size < sizeof(cfg->struct_size)) return;
+    size_t n = size < sizeof(*cfg) ? size : sizeof(*cfg);
+    std::memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_proxygen_wt_managed_cfg_t, perspective) + sizeof(cfg->perspective))
+        cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
 }
 
 #define CFG_HAS(cfg, field) \
@@ -576,6 +586,10 @@ moq_result_t moq_proxygen_wt_managed_create(
     if (cfg->struct_size < offsetof(moq_proxygen_wt_managed_cfg_t, on_pump) +
         sizeof(cfg->on_pump))
         return MOQ_ERR_INVAL;
+
+    if (CFG_HAS(cfg, setup_auth_token_count) &&
+        (cfg->setup_auth_tokens != NULL || cfg->setup_auth_token_count != 0))
+        return MOQ_ERR_UNSUPPORTED;
 
     moq_perspective_t persp = CFG_HAS(cfg, perspective)
         ? cfg->perspective : MOQ_PERSPECTIVE_CLIENT;

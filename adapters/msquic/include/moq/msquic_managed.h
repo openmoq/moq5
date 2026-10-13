@@ -261,6 +261,19 @@ typedef struct moq_msquic_managed_cfg {
      * QUIC_SETTINGS.KeepAliveIntervalMs when this field is fully covered by
      * struct_size. */
     uint32_t keep_alive_interval_ms;
+    /* SETUP credentials are copied before create returns. Use the sized
+     * initializer to enable this append-only block. Both list fields must
+     * fit in struct_size. No configured credential is silently omitted. */
+    /* Preserve the previous aggregate's trailing padding on 32-bit ABIs. */
+#if defined(__cplusplus)
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
+    moq_bytes_t setup_authority; /* raw-QUIC client route, copied */
+    moq_bytes_t setup_path;
 } moq_msquic_managed_cfg_t;
 
 MOQ_API void moq_msquic_managed_cfg_init_sized(

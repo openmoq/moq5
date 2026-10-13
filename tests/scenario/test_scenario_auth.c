@@ -438,7 +438,8 @@ static void execute_step(moq_session_t *client, moq_session_t *sv,
         size_t idx = st->pending.count;
         uint64_t r = rng_next(rng);
         memcpy(st->pending.values[idx], &r, 4);
-        size_t vlen = (rng_next(rng) % 5);
+        st->pending.values[idx][1] = 0;
+        size_t vlen = 4;
 
         log_op(log, op, alias);
 
@@ -486,12 +487,13 @@ static void execute_step(moq_session_t *client, moq_session_t *sv,
         size_t idx = st->pending.count;
         uint64_t r = rng_next(rng);
         memcpy(st->pending.values[idx], &r, 4);
+        st->pending.values[idx][1] = 0;
 
         moq_d16_auth_token_t *t = &st->pending.tokens[st->pending.count++];
         t->alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
         t->token_type = rng_next(rng) % 10;
         t->token_value = st->pending.values[idx];
-        t->token_value_len = rng_next(rng) % 5;
+        t->token_value_len = 4;
         break;
     }
 

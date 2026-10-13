@@ -390,7 +390,7 @@ jobs:
       - name: Test (in-process adapter subset)
         run: >
           ctest --test-dir build/pq-ci --output-on-failure
-          -R '^(pq_conformance|adapter_backpressure|threaded_compile|threaded_tls_policy|threaded_tls_handshake|scenario_backpressure|scenario_delay_backpressure)$'
+          -R '^(pq_conformance|adapter_backpressure|threaded_compile|threaded_tls_policy|threaded_tls_handshake|picoquic_setup_auth|scenario_backpressure|scenario_delay_backpressure)$'
 
       # Cold-consumer / packaging tier (kept separate so a packaging
       # failure is distinguishable from an adapter-behavior failure).
@@ -449,7 +449,7 @@ jobs:
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
+          -R '^(pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_setup_auth|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
 
       - name: Configure (mbedTLS-only)
         run: >

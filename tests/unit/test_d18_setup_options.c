@@ -63,6 +63,58 @@ static void put_span(moq_buf_writer_t *w, const char *b)
 
 int main(void)
 {
+    /* Captured-wire vector pins sorted delta options, repeated USE_VALUE
+     * tokens, binary bytes, empty credentials, and route spans. */
+    {
+        uint8_t buf[128]; const uint8_t value[] = {0x00, 0xff};
+        moq_d18_setup_opts_t opts = {0};
+        opts.has_path = true; opts.has_authority = true;
+        opts.has_max_auth_token_cache_size = true;
+        opts.max_auth_token_cache_size = 128;
+        opts.auth_token_count = 2;
+        opts.auth_tokens[0] = (moq_d18_auth_token_t){
+            .alias_type=MOQ_AUTH_TOKEN_USE_VALUE, .token_type=16,
+            .token_value={value, sizeof(value)}};
+        opts.auth_tokens[1] = (moq_d18_auth_token_t){
+            .alias_type=MOQ_AUTH_TOKEN_USE_VALUE, .token_type=1};
+        const uint8_t expected[] = {0x01, 0x02, '/', 'm',
+            0x02, 0x04, 0x03, 0x10, 0x00, 0xff,
+            0x00, 0x02, 0x03, 0x01, 0x01, 0x80, 0x80,
+            0x01, 0x01, 'a'};
+        moq_buf_writer_t w; moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK(moq_d18_encode_setup_opts_routes(&w, &opts,
+            MOQ_BYTES_LITERAL("a"), MOQ_BYTES_LITERAL("/m")) == MOQ_OK);
+        moq_buf_reader_t r; moq_control_envelope_t env;
+        moq_buf_reader_init(&r, buf, w.pos);
+        MOQ_TEST_CHECK(moq_d18_decode_envelope(&r, &env) == MOQ_OK);
+        MOQ_TEST_CHECK(env.payload_len == sizeof(expected));
+        MOQ_TEST_CHECK(memcmp(env.payload, expected, sizeof(expected)) == 0);
+        struct { moq_d18_setup_opts_t opts; uint8_t guard[16]; } decoded;
+        memset(&decoded, 0xa5, sizeof(decoded));
+        MOQ_TEST_CHECK(moq_d18_decode_setup_opts(env.payload, env.payload_len,
+                                                &decoded.opts) == MOQ_OK);
+        MOQ_TEST_CHECK(decoded.opts.auth_token_count == 2);
+        for (size_t i = 0; i < sizeof(decoded.guard); ++i)
+            MOQ_TEST_CHECK(decoded.guard[i] == 0xa5);
+        size_t exact = w.pos;
+        moq_buf_writer_init(&w, buf, exact - 1);
+        MOQ_TEST_CHECK(moq_d18_encode_setup_opts_routes(&w, &opts,
+            MOQ_BYTES_LITERAL("a"), MOQ_BYTES_LITERAL("/m")) == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(w.pos == 0);
+        opts.has_path = false; opts.has_authority = false;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        MOQ_TEST_CHECK(moq_d18_encode_setup_opts(&w, &opts) == MOQ_OK);
+        moq_buf_reader_init(&r, buf, w.pos);
+        MOQ_TEST_CHECK(moq_d18_decode_envelope(&r, &env) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_d18_decode_setup_opts(env.payload, env.payload_len,
+                                                &decoded.opts) == MOQ_OK);
+        MOQ_TEST_CHECK(decoded.opts.auth_token_count == 2);
+        opts.auth_token_count = MOQ_D18_MAX_AUTH_TOKENS + 1;
+        size_t saved = w.pos;
+        MOQ_TEST_CHECK(moq_d18_encode_setup_opts(&w, &opts) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(w.pos == saved);
+    }
+
     /* == 1. SETUP option codec: vi64 KVP form ========================== */
 
     /* 1a. Encode: MAX_AUTH_TOKEN_CACHE_SIZE 100 emits the vi64 single-byte
@@ -292,31 +344,18 @@ int main(void)
         moq_session_destroy(s2);
     }
 
-    /* 2c2. Semantically malformed token in SETUP closes with the
-     * MALFORMED_AUTH_TOKEN session error (0x16) -- there is no request to
-     * reject at SETUP time. Distinct from the structural 0x6 close in 2c:
-     * the Token structure here is well-formed; the RESOLVED value
-     * (zero-length) fails semantic validation. */
+    /* Empty opaque credentials are transport-valid; application policy owns
+     * semantic acceptance, including unknown token types. */
     {
         moq_session_t *s = make_started(MOQ_PERSPECTIVE_SERVER, 1024);
-        uint8_t p[16];
-        moq_buf_writer_t w;
-        moq_buf_writer_init(&w, p, sizeof(p));
-        put_vi64(&w, 0x03); put_vi64(&w, 2);
-        put_vi64(&w, MOQ_AUTH_TOKEN_USE_VALUE);
-        put_vi64(&w, 7);                       /* token type; empty value */
-        feed_setup(s, p, moq_buf_writer_offset(&w));
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
-        bool saw_close = false;
-        moq_action_t act;
-        while (moq_session_poll_actions(s, &act, 1) > 0) {
-            if (act.kind == MOQ_ACTION_CLOSE_SESSION) {
-                saw_close = true;
-                MOQ_TEST_CHECK_EQ_U64(act.u.close_session.code, 0x16);
-            }
-            moq_action_cleanup(&act);
-        }
-        MOQ_TEST_CHECK(saw_close);
+        uint8_t p[] = {0x03, 0x02, MOQ_AUTH_TOKEN_USE_VALUE, 7};
+        MOQ_TEST_CHECK(feed_setup(s, p, sizeof(p)) == MOQ_OK);
+        MOQ_TEST_CHECK(s->state == MOQ_SESS_ESTABLISHED);
+        moq_event_t e;
+        MOQ_TEST_CHECK(moq_session_poll_events(s, &e, 1) == 1);
+        MOQ_TEST_CHECK(e.u.setup_complete.token_count == 1);
+        if (e.u.setup_complete.token_count == 1)
+            MOQ_TEST_CHECK(e.u.setup_complete.tokens[0].token_value.len == 0);
         moq_session_destroy(s);
     }
 

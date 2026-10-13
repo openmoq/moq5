@@ -23,6 +23,26 @@ static uint64_t scenario_create_destroy(moq_alloc_t *alloc)
     return 1;
 }
 
+/* Both profiles own binary tokens and routes even on late create failures. */
+static uint64_t scenario_owned_setup(moq_alloc_t *alloc)
+{
+    uint8_t bytes[1024]; memset(bytes, 0xd2, sizeof(bytes)); bytes[1] = 0;
+    moq_auth_token_t tokens[] = {{16, {bytes, sizeof(bytes)}}, {1, {NULL, 0}}};
+    for (unsigned draft = 0; draft < 2; ++draft) {
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), alloc, MOQ_PERSPECTIVE_CLIENT);
+        cfg.version = draft ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
+        cfg.setup_auth_tokens = tokens; cfg.setup_auth_token_count = 2;
+        cfg.setup_authority = MOQ_BYTES_LITERAL("relay.example:4433");
+        cfg.setup_path = MOQ_BYTES_LITERAL("/moq");
+        moq_session_t *session = NULL;
+        if (moq_session_create(&cfg, 0, &session) < 0) return 0;
+        moq_session_start(session, 0);
+        moq_session_destroy(session);
+    }
+    return 1;
+}
+
 /* -- Scenario: setup handshake ------------------------------------- */
 
 static uint64_t scenario_setup_handshake(moq_alloc_t *alloc)
@@ -1846,6 +1866,7 @@ int main(void)
 {
     int failures = 0;
 
+    oom_sweep(&failures, "owned_setup", scenario_owned_setup);
     oom_sweep(&failures, "create_destroy",     scenario_create_destroy);
     oom_sweep(&failures, "setup_handshake",    scenario_setup_handshake);
     oom_sweep(&failures, "subscribe_happy",    scenario_subscribe_happy);

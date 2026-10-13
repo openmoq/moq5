@@ -215,3 +215,98 @@ moq_session_destroy(session);
 
 `destroy(NULL)` is a no-op. Destroying a session that is not in the
 `CLOSED` state is an unclean shutdown but does not leak memory.
+
+
+## Client credentials
+
+Managed clients accept externally issued credentials through
+`<moq/auth.h>`. A token contains its type and **raw serialized bytes**;
+do not base64-encode it or prepend a transport envelope. The library carries
+these opaque bytes and does not verify signatures or claims. See the
+[CAT4MoQ design](cat4moq-design.md) for the explicit C4M-01 and current-relay
+compatibility profiles and the separate verifier milestone.
+
+Use sized initializers when configuring the new fields. Pointer-only legacy
+initializers deliberately initialize only their historical configuration extent.
+The same source can supply endpoint and request credentials:
+
+```c
+moq_auth_token_t token = {token_type, {credential_bytes, credential_size}};
+moq_auth_source_t source;
+moq_auth_source_init_sized(&source, sizeof(source));
+source.tokens = &token;
+source.token_count = 1;
+
+moq_endpoint_cfg_t endpoint_cfg;
+moq_endpoint_cfg_init_sized(&endpoint_cfg, sizeof(endpoint_cfg));
+endpoint_cfg.url = MOQ_BYTES_LITERAL("moqt://relay.example:4433/moq");
+endpoint_cfg.setup_auth = &source;
+/* Set the remaining endpoint options, then connect. */
+
+moq_media_sender_cfg_t sender_cfg;
+moq_media_sender_cfg_init_live_sized(&sender_cfg, sizeof(sender_cfg));
+sender_cfg.request_auth = &source;
+/* Set the namespace, catalog and media options, then attach. */
+
+moq_media_receiver_cfg_t receiver_cfg;
+moq_media_receiver_cfg_init_live_sized(&receiver_cfg, sizeof(receiver_cfg));
+receiver_cfg.request_auth = &source;
+/* Set discovery/subscription options, then attach. */
+```
+
+Each successful connect/attach copies static descriptors and bytes, so callers
+may release them after that operation returns. Endpoint credentials are selected
+before transport creation. Sender request selection covers namespace publication
+and the actual catalog/media track requests. Receiver selection covers catalog,
+media subscriptions, joining fetches and forward updates.
+
+For resource-specific credentials, set `source.select` and `source.ctx` instead
+of a static list. The callback receives the action, namespace tuple and optional
+track name; namespace components are byte strings and must not be split on
+slashes. It writes descriptors into the supplied output array. Selected bytes
+must remain valid until the next callback for that owner or its destruction;
+the library copies them immediately and retains the selection across retries of
+the same request. Never return pointers to stack-local bytes.
+
+Selection runs synchronously during endpoint connect, or on the sender/receiver
+pump for requests. Keep callbacks nonblocking; do not perform issuer I/O, reenter
+the owner, or throw through the C callback. The callback and context must outlive
+the owner. Shared contexts need caller-provided synchronization.
+
+A null source means anonymous operation. A configured source must produce a
+nonempty list; errors, empty output and allocation failure are terminal and
+never trigger anonymous fallback. Service limits are 16 tokens, 16 KiB per token
+and 32 KiB total payload. For direct core/adapter use, provision sufficient send
+capacity for the complete opening message; oversized configurations fail before
+partially sending it. Unsupported managed backends reject configured credentials
+before network startup.
+
+Raw-QUIC endpoints carry the URL authority and path/query independently of TLS
+SNI. WebTransport keeps routing in its HTTP CONNECT request. Credentials are
+client-to-ingress data: a forwarding relay must use its own scoped credentials
+for the next hop.
+
+
+The owned service-source API is advertised by
+`MOQ_SERVICE_AUTH_API_VERSION >= 1`. Backend scope for this milestone:
+
+| Managed backend | Credential support and validation |
+| --- | --- |
+| Raw picoquic | Implemented; peer capture on immediate and negotiated sessions, both transport versions |
+| PicoWT | Implemented; peer capture on deferred client/server sessions, both transport versions |
+| Raw MsQuic | Implemented; peer capture on client/server sessions, both transport versions |
+| Raw mvfst | Implemented; local build/runtime unverified because the installed Fizz certificate-verifier API does not match the existing adapter |
+| Proxygen WT | Configured credentials return `MOQ_ERR_UNSUPPORTED` before startup |
+| WTquic MsQuic | Configured credentials return `MOQ_ERR_UNSUPPORTED` before startup |
+| WTquic Network.framework | Configured credentials return `MOQ_ERR_UNSUPPORTED` before startup; Apple runtime not exercised here |
+
+Peer capture covers client-only, server-only and mutual large credentials;
+constructors own bytes even when sessions are deferred. The sender's
+`moq_media_sender_peer_request_error()` exposes a recorded peer refusal code
+separately from its service failure code. It never returns peer reason text.
+
+The large-credential captures above cover opening messages. Existing draft-18
+per-request receive buffers in core are capped at 4096 bytes, even when the
+session receive budget is larger. The service's 16 KiB source limit is an
+input bound, not a guarantee that every peer/request path accepts that size.
+Current-relay action tests use their normally sized signed credentials.

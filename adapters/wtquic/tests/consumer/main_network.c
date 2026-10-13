@@ -16,7 +16,7 @@ int main(void)
     moq_wtquic_network_managed_t *m = NULL;
 
     moq_wtquic_network_managed_cfg_init(&cfg);
-    if (cfg.struct_size != sizeof(cfg))
+    if (cfg.struct_size != offsetof(moq_wtquic_network_managed_cfg_t, setup_auth_tokens))
         return 1;
     /* the size-aware initializer resolves from the installed archive too */
     moq_wtquic_network_managed_cfg_init_sized(&cfg, sizeof(cfg));

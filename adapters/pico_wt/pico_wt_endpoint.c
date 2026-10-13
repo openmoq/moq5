@@ -273,6 +273,14 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
     ctx->queue = moq_pq_send_queue_create(alloc, 0);
     if (!ctx->queue) return -1;
 
+    /* Keep the CONNECT response ahead of MoQ control streams: the peer cannot
+     * route a server-initiated WT stream until it has accepted that response. */
+    if (picoquic_set_stream_priority(cnx, ctx->control_stream_id, 0) != 0) {
+        moq_pq_send_queue_destroy(ctx->queue);
+        ctx->queue = NULL;
+        return -1;
+    }
+
     *ops = (moq_transport_endpoint_ops_t){
         .struct_size     = sizeof(moq_transport_endpoint_ops_t),
         .capabilities    = MOQ_TRANSPORT_CAP_DATAGRAM |
