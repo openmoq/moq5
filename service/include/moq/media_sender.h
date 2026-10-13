@@ -409,6 +409,11 @@ typedef struct moq_media_track_cfg {
 #endif
     bool        has_render_group;
     int         render_group;
+
+    /* MSF label: human-readable text for a track-selection menu. Must be
+     * well-formed UTF-8, else add_track returns MOQ_ERR_INVAL. Borrowed: the
+     * service copies it during add_track. Empty (the default) means absent. */
+    moq_bytes_t label;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \

@@ -67,6 +67,15 @@ _Static_assert(offsetof(moq_media_track_cfg_t, has_render_group) >=
                MEDIA_TRACK_CFG_SIZE_THROUGH_PUBLISHER_PRIORITY,
                "render group must follow the complete publisher-priority layout");
 
+#define MEDIA_TRACK_CFG_SIZE_THROUGH_RENDER_GROUP \
+    ((offsetof(moq_media_track_cfg_t, render_group) + \
+      sizeof(((moq_media_track_cfg_t *)0)->render_group) + \
+      _Alignof(moq_media_track_cfg_t) - 1u) & \
+     ~((size_t)_Alignof(moq_media_track_cfg_t) - 1u))
+_Static_assert(offsetof(moq_media_track_cfg_t, label) >=
+               MEDIA_TRACK_CFG_SIZE_THROUGH_RENDER_GROUP,
+               "label must follow the complete render-group layout");
+
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
  * appended `callbacks` field is read only when struct_size covers it, so an
@@ -128,6 +137,7 @@ struct moq_media_track {
     uint32_t              cmaf_init_track_id;     /* for §3.3 track_ID validation */
     moq_bytes_t           role;
     moq_bytes_t           lang;
+    moq_bytes_t           label;
     bool                  is_live;
     uint32_t              width, height;
     uint64_t              framerate_millis;
@@ -885,6 +895,7 @@ static void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m)
         m->channel_config = t->channel_config;
     }
     if (t->lang.len) { m->has_lang = true; m->lang = t->lang; }
+    if (t->label.len) { m->has_label = true; m->label = t->label; }
     /* MSF §5.2.35 track duration (VOD/non-live track; add_track enforces that it
      * is never set together with is_live). */
     if (t->has_track_duration) {
@@ -3811,6 +3822,35 @@ static bool sender_sum_fits(size_t *acc, size_t add)
     return true;
 }
 
+/* RFC 3629 well-formed UTF-8: no overlongs, surrogates or code points above
+ * U+10FFFF. A catalog is JSON, which must be UTF-8 (RFC 8259 §8.1). */
+static bool sender_utf8_valid(moq_bytes_t b)
+{
+    size_t i = 0;
+    while (i < b.len) {
+        uint8_t c = b.data[i];
+        size_t n;
+        uint8_t lo = 0x80, hi = 0xBF;
+        if (c < 0x80) { i++; continue; }
+        if (c >= 0xC2 && c <= 0xDF) n = 1;
+        else if (c >= 0xE0 && c <= 0xEF) {
+            n = 2;
+            if (c == 0xE0) lo = 0xA0;
+            else if (c == 0xED) hi = 0x9F;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            n = 3;
+            if (c == 0xF0) lo = 0x90;
+            else if (c == 0xF4) hi = 0x8F;
+        } else return false;
+        if (n > b.len - i - 1) return false;
+        if (b.data[i + 1] < lo || b.data[i + 1] > hi) return false;
+        for (size_t k = 2; k <= n; k++)
+            if ((b.data[i + k] & 0xC0) != 0x80) return false;
+        i += n + 1;
+    }
+    return true;
+}
+
 static moq_result_t sender_prepare(const moq_media_sender_cfg_t *cfg,
                                    sender_sizes_t *sz)
 {
@@ -4008,7 +4048,7 @@ void moq_media_sender_destroy(moq_media_sender_t *s)
 
 /* Every size add_track derives from a validated track cfg, each checked for
  * representability BEFORE the first allocation, copy or registration: the
- * six media spans plus the resolved ref-id bytes (one strings buffer), the
+ * seven media spans plus the resolved ref-id bytes (one strings buffer), the
  * ref-id index product, and each ENABLED generated sibling's name. An
  * unrepresentable configuration is a cfg error (MOQ_ERR_INVAL), never a
  * wrapped request. */
@@ -4030,6 +4070,7 @@ static moq_result_t track_derive_sizes(const moq_media_track_cfg_t *cfg,
         !sender_sum_fits(&media, cfg->init_data.len) ||
         !sender_sum_fits(&media, cfg->role.len) ||
         !sender_sum_fits(&media, cfg->lang.len) ||
+        !sender_sum_fits(&media, cfg->label.len) ||
         !sender_sum_fits(&media, cfg->channel_config.len))
         return MOQ_ERR_INVAL;
     /* Each resolved ref id contributes its bytes to the SAME buffer. Every
@@ -4100,8 +4141,10 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         (cfg->init_data.len && !cfg->init_data.data) ||
         (cfg->role.len && !cfg->role.data) ||
         (cfg->lang.len && !cfg->lang.data) ||
+        (cfg->label.len && !cfg->label.data) ||
         (cfg->channel_config.len && !cfg->channel_config.data))
         return MOQ_ERR_INVAL;
+    if (!sender_utf8_valid(cfg->label)) return MOQ_ERR_INVAL;
     /* MSF-01: an audio/video track has an inherent codec, so it MUST carry the
      * conditional catalog fields for that codec -- the sender never emits a
      * track that is invalid by construction. codec (5.2.18) and maximum bitrate
@@ -4192,6 +4235,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     COPY_SPAN(t->init_data, cfg->init_data);
     COPY_SPAN(t->role, cfg->role);
     COPY_SPAN(t->lang, cfg->lang);
+    COPY_SPAN(t->label, cfg->label);
     COPY_SPAN(t->channel_config, cfg->channel_config);
 #undef COPY_SPAN
     /* contentProtection ref ids: copy bytes into the shared buffer, index via
