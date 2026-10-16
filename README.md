@@ -266,6 +266,7 @@ sim/            moq-sim: SimPair deterministic simulation + fault injection
 adapters/       picoquic, pico_wt, mvfst, msquic, wtquic, proxygen (+ shared helpers)
 bindings/cpp/   moq-cpp: header-only C++20 binding
 bindings/python/ CPython endpoint, receiver and sender over the installed service SDK
+bindings/rust/  moq5-sys (raw FFI) and moq5 (safe API) over the installed service SDK
 media/          loc, cmaf, mpeg2ts, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
@@ -279,6 +280,11 @@ The [Python binding](bindings/python/README.md) provides synchronous endpoint,
 media receiver and media sender APIs over the installed service SDK. See its
 support statement for the available surface and qualification limits; asyncio
 remains separate follow-up work.
+
+The [Rust bindings](bindings/rust/README.md) are two crates: `moq5-sys`, raw
+FFI generated from the installed headers, and `moq5`, a safe API over the
+service tier (endpoint, media sender and receiver, CMAF parsing) whose types
+enforce the C API's ownership, teardown and threading rules.
 
 ## Author
 

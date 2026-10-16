@@ -1,0 +1,18 @@
+[package]
+name = "moq5-sys"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.92"
+description = "Raw FFI bindings to the libmoq (MOQ5) service tier"
+repository = "https://github.com/openmoq/moq5"
+readme = "README.md"
+keywords = ["moq", "media-over-quic", "ffi", "bindings"]
+categories = ["external-ffi-bindings", "multimedia"]
+links = "moq"
+build = "build.rs"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"

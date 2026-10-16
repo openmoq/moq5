@@ -1,0 +1,3 @@
+[workspace]
+members = ["moq5-sys", "moq5"]
+resolver = "3"
