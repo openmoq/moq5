@@ -309,7 +309,7 @@ track's description became non-live WITH a track duration, or the catalog
 latched isComplete with every wanted track removed. It is not proof of the
 publisher's wire sequence. A finite receiver campaign against our own relay on
 loopback has been run, with an independent C publisher and declared synthetic
-RAW/LOC payloads; acceptance against real media remains a later slice.
+RAW/LOC payloads; acceptance against real media has not been run.
 
 The package requires a LibMoQ service SDK that declares
 `moq_media_receiver_track_desc_copy`; building against an older SDK fails

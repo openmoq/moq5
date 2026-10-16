@@ -14,6 +14,12 @@
  * Datagram bridge: push send_datagram() buffers one datagram;
  * the pull provide_datagram callback flushes it. Single-slot,
  * lossy — excess datagrams are DROPPED.
+ *
+ * Every h3zero lookup goes through the endpoint's own h3zero context. A few
+ * h3zero helpers instead recover it from the connection's callback context,
+ * which only holds when the connection callback is h3zero's own; those
+ * helpers are not used here (see ep_send_datagram, and pico_wt_h3_delete_prefix
+ * in pico_wt_endpoint.h).
  */
 
 #include "pico_wt_endpoint.h"
@@ -106,6 +112,50 @@ static moq_transport_result_t ep_write_payload(void *ctx, uint64_t stream_id,
         moq_pq_send_queue_push_rcbuf(ep->queue, stream_id, buf, fin));
 }
 
+#if defined(MOQ_PICO_WT_TESTING)
+int (*pw_test_reset_stream_at)(picoquic_cnx_t *, uint64_t, uint64_t,
+                               uint64_t) = NULL;
+#define PW_RESET_STREAM_AT(cnx, sid, err, rs)                               \
+    (pw_test_reset_stream_at ? pw_test_reset_stream_at(cnx, sid, err, rs)  \
+                             : picoquic_reset_stream_at(cnx, sid, err, rs))
+#else
+#define PW_RESET_STREAM_AT(cnx, sid, err, rs)                               \
+    picoquic_reset_stream_at(cnx, sid, err, rs)
+#endif
+
+int pico_wt_endpoint_flush_resets(pico_wt_endpoint_ctx_t *ep)
+{
+    if (!ep || !ep->cnx) return 0;
+    int failed = 0;
+    size_t w = 0;
+    for (size_t r = 0; r < ep->deferred_count; r++) {
+        pico_wt_deferred_reset_t d = ep->deferred[r];
+        int rc = PW_RESET_STREAM_AT(ep->cnx, d.sid, d.wt_code, d.reliable_size);
+        if (rc == PICOQUIC_ERROR_OFFSET_TOO_BIG) {
+            ep->deferred[w++] = d;            /* preamble still unsent */
+        } else if (rc == 0) {
+            /* Issued: the send side is finished, as picowt_reset_stream
+             * records it. */
+            h3zero_stream_ctx_t *sc = h3zero_find_stream(ep->h3_ctx, d.sid);
+            if (sc) sc->ps.stream_state.is_fin_sent = 1;
+        } else if (rc == PICOQUIC_ERROR_INVALID_STREAM_ID ||
+                   rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
+            /* The stream already ended and retired: nothing is owed. */
+        } else {
+            /* picoquic may already have latched the reset before failing to
+             * queue its frame, so a retry could not prove it was sent. */
+            failed = 1;
+        }
+    }
+    ep->deferred_count = w;
+    return failed ? -1 : 0;
+}
+
+void pico_wt_endpoint_settle_deferred(pico_wt_endpoint_ctx_t *ep)
+{
+    if (ep) ep->deferred_count = 0;
+}
+
 static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
                                         uint64_t error_code)
 {
@@ -151,10 +201,35 @@ static moq_transport_result_t ep_reset(void *ctx, uint64_t stream_id,
     if (genuine_at) {
         /* picowt uses reliable_size = 2 + varint(control_stream_id) for a local
          * stream; mirror it as the test witness. */
-        ep->last_reset_reliable_size =
+        size_t preamble =
             2 + picoquic_frames_varint_encode_length(ep->control_stream_id);
+        ep->last_reset_reliable_size = preamble;
+        int fin_sent = sc->ps.stream_state.is_fin_sent;
         int rc = picowt_reset_stream(ep->cnx, sc, wt_code);
-        return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+        if (rc == 0) return MOQ_TRANSPORT_OK;
+        /* picoquic takes a Reliable Size only up to the bytes it has sent,
+         * and a stream reset right after it opened may still hold its
+         * preamble in picoquic's queue. WebTransport requires RESET_STREAM_AT
+         * to cover the preamble (draft-ietf-webtrans-http3 Section 4.4), so
+         * the reset waits: the queued preamble goes out on its own, and
+         * pico_wt_endpoint_flush_resets issues the reset once it has. The
+         * refusal changed nothing in picoquic; the stream's queued MoQ bytes
+         * are already dropped and it is no longer active.
+         *
+         * picowt_reset_stream marks the send side finished even when picoquic
+         * refuses, which would make a session teardown skip this stream's
+         * WT_SESSION_GONE reset; nothing was sent, so restore the flag. */
+        if (rc != PICOQUIC_ERROR_OFFSET_TOO_BIG)
+            return MOQ_TRANSPORT_ERROR;
+        sc->ps.stream_state.is_fin_sent = fin_sent;
+        /* At the bound, the bridge keeps the reset in its own bounded pending
+         * queue and retries it; by then the preamble may be out. */
+        if (ep->deferred_count >= PICO_WT_DEFERRED_RESETS_MAX)
+            return MOQ_TRANSPORT_WOULD_BLOCK;
+        ep->deferred[ep->deferred_count++] = (pico_wt_deferred_reset_t){
+            .sid = sc->stream_id, .wt_code = wt_code,
+            .reliable_size = preamble };
+        return MOQ_TRANSPORT_OK;
     }
 
     /* Plain RESET_STREAM, preserving picowt_reset_stream's bookkeeping: the
@@ -218,6 +293,10 @@ static moq_transport_result_t ep_send_datagram(void *ctx,
 {
     pico_wt_endpoint_ctx_t *ep = (pico_wt_endpoint_ctx_t *)ctx;
 
+    /* A detached endpoint no longer owns a connection: nothing to send on. */
+    if (!ep->cnx || !ep->h3_ctx)
+        return MOQ_TRANSPORT_DROPPED;
+
     /* Single-slot buffer — drop if occupied */
     if (ep->pending_dg_len > 0)
         return MOQ_TRANSPORT_DROPPED;
@@ -225,12 +304,22 @@ static moq_transport_result_t ep_send_datagram(void *ctx,
     if (len > sizeof(ep->pending_dg_buf))
         return MOQ_TRANSPORT_TOO_LARGE;
 
+    /* Readiness is declared on the WT session's stream prefix, looked up in
+     * the endpoint's own h3zero context. h3zero_set_datagram_ready() would
+     * instead fetch the h3zero context from the connection's callback context,
+     * which is not an h3zero context when the connection callback is wrapped
+     * (the managed client owns it): that lookup walks unrelated memory. */
+    h3zero_stream_prefix_t *prefix =
+        h3zero_find_stream_prefix(ep->h3_ctx, ep->control_stream_id);
+    if (!prefix)
+        return MOQ_TRANSPORT_DROPPED;
+
     if (data && len > 0)
         memcpy(ep->pending_dg_buf, data, len);
     ep->pending_dg_len = len;
 
-    int rc = h3zero_set_datagram_ready(ep->cnx, ep->control_stream_id);
-    if (rc != 0) {
+    prefix->ready_to_send_datagrams = 1;
+    if (picoquic_mark_datagram_ready(ep->cnx, 1) != 0) {
         ep->pending_dg_len = 0;
         return MOQ_TRANSPORT_DROPPED;
     }
@@ -307,6 +396,7 @@ void pico_wt_endpoint_cleanup(pico_wt_endpoint_ctx_t *ctx)
     ctx->pending_dg_len = 0;
     moq_pq_send_queue_destroy(ctx->queue);
     ctx->queue = NULL;
+    ctx->deferred_count = 0;
 }
 
 int pico_wt_endpoint_provide_datagram(pico_wt_endpoint_ctx_t *ctx,

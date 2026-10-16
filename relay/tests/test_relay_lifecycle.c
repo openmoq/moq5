@@ -2267,8 +2267,8 @@ lc_minimize(uint64_t seed, const lc_faults_t *f, int poison,
 
 /* Manufacture a synthetic failing log (poison at op T over a green seed),
  * minimize it, and prove: a clean input is refused; the minimized log is
- * strictly smaller (exactly T+1 ops); and — the load-bearing property Codex
- * flagged — it is STANDALONE-replayable: serialized, strict-parsed back, and
+ * strictly smaller (exactly T+1 ops); and — the load-bearing property — it is
+ * STANDALONE-replayable: serialized, strict-parsed back, and
  * replayed with the process-global poison arm cleared, it still reproduces
  * because poison= rides the log. A negative control (replay with poison=-1)
  * must NOT reproduce, proving the arm is sourced from the artifact, not luck. */
@@ -2331,8 +2331,8 @@ lc_minimize_selftest(void)
         /* Standalone proof: serialize, strict-parse back (enforces ops= and
          * sequential op <i> lines AND round-trips poison=), then replay with the
          * process-global arm explicitly disabled. This is exactly the
-         * `MOQ_LIFECYCLE_REPLAY=<file>` path with a hostile (cleared) env — the
-         * regression guard for Codex's finding. */
+         * `MOQ_LIFECYCLE_REPLAY=<file>` path with a hostile (cleared) env, so a
+         * log that depends on the process environment fails here. */
         g_lc_poison_at_op = -1; /* prove the arm rides the LOG, not this global */
         FILE *tf = tmpfile();
         if (tf == NULL) {
@@ -2478,7 +2478,7 @@ lc_minimize_from_file(const char *path)
         return 1;
     }
     /* The failure arm rides the log (poison=). MOQ_LIFECYCLE_POISON_AT may
-     * OVERRIDE it, which is how a captured GREEN log is turned into a failing
+     * OVERRIDE it, which is how a captured passing log is turned into a failing
      * one to minimize — the override is then stamped into the output header so
      * the minimized artifact stays standalone. */
     const char *pe = getenv("MOQ_LIFECYCLE_POISON_AT");
@@ -2540,7 +2540,7 @@ main(void)
      * reproduces standalone — MOQ_LIFECYCLE_REPLAY/MINIMIZE read the arm from the
      * FILE, never from this global. Two routes: (a) capture WITH the arm
      * (MOQ_LIFECYCLE_POISON_AT=<T> MOQ_LIFECYCLE_LOG=1 -> the dumped log already
-     * carries poison=T); (b) minimize a captured GREEN log with
+     * carries poison=T); (b) minimize a captured passing log with
      * MOQ_LIFECYCLE_POISON_AT=<T> as an override (stamped into the output). This
      * global only seeds GENERATE-mode runs (capture); replay/minimize are
      * file-driven. */

@@ -1,17 +1,15 @@
 """Per-track ending: Sender.end_track(track) -> WriteOutcome.
 
-These rows were written RED, against a method that did not exist, and each
-failed by a NAMED missing behaviour rather than skipping. The method exists
-now and they pass. The gate that made that meaningful is kept: a missing or
-inert name is still a named failure, the substrate rows still execute the
-recorder's oracles on their own, and the scoped-stand-in control still proves
-this file's bodies are satisfiable independently of the product.
+Every row fails by a NAMED missing behaviour rather than skipping: a missing
+or inert name is a named failure, the substrate rows execute the recorder's
+oracles on their own, and the scoped-stand-in control proves this file's
+bodies are satisfiable independently of the product.
 
 Scope: ONE asynchronous per-track termination request. Not a delivered
 receipt, not broadcast completion, not sender destruction and not endpoint
 teardown. No stats, demand, wait, request_complete, drain or graceful finish.
 
-The contract, re-derived from THIS worktree rather than from a sketch:
+The contract, from the sources:
 
   service/include/moq/media_sender.h:499-510
       After the track's queued objects drain the service emits a reliable
@@ -254,7 +252,7 @@ class EndGatedBase(EndFixtureBase):
     before the row acquires an endpoint."""
 
     def require_surface(self):
-        # Kept after GREEN: an inert or removed name must still fail by name,
+        # An inert or removed name must fail by name,
         # which is what the inert-surface control exercises.
         missing = missing_surface()
         if missing:
@@ -791,7 +789,7 @@ class EndControlTests(unittest.TestCase):
     The inert-name control establishes the GATE: every gated row is invoked
     and refuses by a named assertion. It does NOT execute the bodies -- each
     stops inside require_surface. The scoped stand-in control below is what
-    runs those bodies, so this RED cannot hide a broken test.
+    runs those bodies, so a gated refusal cannot hide a broken test.
     """
 
     def test_a_inert_names_are_refused_by_every_gated_row(self):
@@ -827,7 +825,7 @@ class EndControlTests(unittest.TestCase):
         The stand-in is this file's own adapter over the recorder, installed
         and removed here. It proves the rows are satisfiable and that their
         assertions are about the declared contract -- not that any product
-        exists, which is what the RED attribution reports.
+        exists; that is the inert-name control's job.
         """
         import test_send_end as module
 
@@ -883,9 +881,8 @@ class EndControlTests(unittest.TestCase):
         self.assertGreater(result.testsRun, 0)
 
     def test_c_the_bridge_is_present_and_refuses_wrong_arguments(self):
-        # This row was the RED gate's "the bridge is absent" assertion. The
-        # bridge exists now, so it pins presence, callability and that a
-        # wrong-shaped call is refused rather than crashing.
+        # Pins the bridge's presence, callability and that a wrong-shaped
+        # call is refused rather than crashing.
         missing = tuple(n for n in BRIDGE if not hasattr(_native, n))
         self.assertEqual(missing, (), f"the end bridge lost {missing}")
         for name in BRIDGE:

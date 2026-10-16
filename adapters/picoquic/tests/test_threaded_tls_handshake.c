@@ -1,6 +1,6 @@
 /*
- * Real-handshake controls for the raw threaded picoquic client's TLS policy
- * (finding 2), over a localhost loopback against the picoquic test server
+ * Real-handshake controls for the raw threaded picoquic client's TLS policy,
+ * over a localhost loopback against the picoquic test server
  * certificate (CN=test.example.com, signed by "picotls test ca"):
  *
  *   1. default client (system trust)  -> REJECTED, terminal (untrusted CA)

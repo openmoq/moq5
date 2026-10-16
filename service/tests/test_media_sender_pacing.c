@@ -41,7 +41,7 @@ static int fix_unconsumed(fix_t *fix, const char *name);
 static void expect_controls(fix_t *fix, const char *label);
 
 /* Per-scenario verdict. MOQ_TEST_PASS only prints while the GLOBAL counter is
- * zero, which would silence every control that runs after a deliberate RED
+ * zero, which would silence every control that runs after a failing
  * row -- so each scenario reports its own outcome from its own delta.
  *
  * It ALSO closes the single final invariant, which covers EVERY peer
@@ -56,7 +56,7 @@ static void report(fix_t *fix, const char *name, int before)
     failures += fix_unconsumed(fix, name);
     int n = failures - before;
     if (n == 0) printf("PASS: %s\n", name);
-    else        printf("RED: %s (%d diagnostics)\n", name, n);
+    else        printf("FAIL: %s (%d diagnostics)\n", name, n);
 }
 
 /* Test seams (media_sender.c, MOQ_MEDIA_SENDER_TESTING). */
@@ -83,10 +83,10 @@ enum { TR_MAX = 128, TERM_MAX = 32, RESET_MAX = 8, SOK_MAX = 8, STAT_MAX = 8,
  *   ARM     - namespace/catalog/subscribe handshake. Objects are FORBIDDEN, so
  *             a stray or early object can never be adopted into a later
  *             scenario's measured baseline.
- *   RELEASE - the one arm that legitimately delivers media: S4's hold-release
- *             subscription, whose SUBSCRIBE_OK arrives while the previously
- *             held FIFO drains. Admits the subscribe control plus objects and
- *             their subgroup terminals, and nothing else.
+ *   RELEASE - the one arm that legitimately delivers media: scenario 4's
+ *             hold-release subscription, whose SUBSCRIBE_OK arrives while the
+ *             previously held FIFO drains. Admits the subscribe control plus
+ *             objects and their subgroup terminals, and nothing else.
  *   PACE    - a measured drain: objects and their subgroup terminals only. */
 typedef enum { PHASE_ARM = 0, PHASE_RELEASE, PHASE_PACE } phase_t;
 
@@ -186,12 +186,14 @@ typedef struct {
     bool     matched;
 } sok_rec_t;
 
-/* Declared SUBSCRIBE_OK. The remaining body fields are fixture-wide
- * invariants enforced by the comparator: these media tracks carry no retained
- * object, no expiry, no track properties and no dynamic-groups property. */
+/* Declared SUBSCRIBE_OK. A renewal can carry the previously published largest
+ * location; other body fields remain fixture-wide empty/false invariants. */
 typedef struct {
     uint64_t sub_opaque;    /* the EXACT handle moq_session_subscribe returned */
     uint64_t track_alias;   /* declared, never adopted from the event */
+    bool     has_largest;
+    uint64_t largest_group;
+    uint64_t largest_object;
 } sok_exp_t;
 
 
@@ -1232,24 +1234,26 @@ static void expect_controls(fix_t *fix, const char *label)
         }
         sok_rec_t *r = &fix->sok[hit];
         r->matched = true;
-        /* Declared alias, plus the invariants this fixture's tracks carry:
-         * no retained object, no expiry, no track properties, no
-         * dynamically-started groups. */
-        if (r->track_alias != exp[e].track_alias || r->has_largest ||
-            r->largest_group != 0 || r->largest_object != 0 ||
+        if (r->track_alias != exp[e].track_alias ||
+            r->has_largest != exp[e].has_largest ||
+            r->largest_group != exp[e].largest_group ||
+            r->largest_object != exp[e].largest_object ||
             r->has_expires || r->expires_ms != 0 || r->props_len != 0 ||
             r->dynamic_groups) {
             fprintf(stderr, "FAIL %s: SUBSCRIBE_OK sub=%llu alias=%llu "
                     "has_largest=%d largest=%llu/%llu has_expires=%d "
                     "expires=%llu props_len=%zu dynamic_groups=%d; expected "
-                    "alias=%llu and 0/false throughout\n", label,
+                    "alias=%llu has_largest=%d largest=%llu/%llu, other fields empty\n", label,
                     (unsigned long long)r->sub_opaque,
                     (unsigned long long)r->track_alias, (int)r->has_largest,
                     (unsigned long long)r->largest_group,
                     (unsigned long long)r->largest_object,
                     (int)r->has_expires, (unsigned long long)r->expires_ms,
                     r->props_len, (int)r->dynamic_groups,
-                    (unsigned long long)exp[e].track_alias);
+                    (unsigned long long)exp[e].track_alias,
+                    (int)exp[e].has_largest,
+                    (unsigned long long)exp[e].largest_group,
+                    (unsigned long long)exp[e].largest_object);
             failures++;
         }
     }
@@ -1455,11 +1459,8 @@ static moq_media_track_t *add_track(moq_media_sender_t *s, const char *name,
 /* Build a pull-mode (advertise + answer SUBSCRIBE) sender with two tracks,
  * driven to ready against a peer that accepts the namespace. Demand is then
  * per-track and entirely the peer's choice. */
-/* The pacing scenarios run on DRAFT-16, declared here rather than defaulted.
- * Draft-18 is deliberately EXCLUDED from this target: the service-generated
- * LOC-01 property block is refused by the draft-18 profile's object-property
- * validator, and that defect is already owned by the frozen negotiated-profile
- * Step-6 sender RED -- it is not re-pinned here. */
+/* Existing pacing controls use draft-16 explicitly. Demand-recovery cases
+ * pass their own version to exercise both draft-16 and draft-18. */
 #define PACING_VERSION MOQ_VERSION_DRAFT_16
 
 /* `queue_objects` 0 keeps the library default; a nonzero value sets
@@ -1471,7 +1472,7 @@ static bool fix_init_q2(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
                         bool drop_without_demand, uint64_t now,
                         uint32_t queue_objects, bool keep_drop_policy,
                         bool publish_tracks, const char *accept_pub_name,
-                        int accept_pub_track)
+                        int accept_pub_track, uint64_t version)
 {
     memset(fix, 0, sizeof(*fix));
     fix->publish_mode = publish_tracks;
@@ -1479,7 +1480,7 @@ static bool fix_init_q2(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
     fix->accept_pub_track = accept_pub_track;
     for (int i = 0; i < SENTINEL_MAX; i++) fix->enq_ord[i] = -1;
     fix->phase = PHASE_ARM;
-    fix->sp = make_pair(alloc, max_actions, PACING_VERSION);
+    fix->sp = make_pair(alloc, max_actions, version);
     if (!fix->sp) return false;
     moq_session_t *cl = moq_simpair_client(fix->sp);
     moq_session_t *srv = moq_simpair_server(fix->sp);
@@ -1570,7 +1571,8 @@ static bool fix_init_q(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
                        uint32_t queue_objects, bool keep_drop_policy)
 {
     return fix_init_q2(fix, alloc, max_actions, drop_without_demand, now,
-                       queue_objects, keep_drop_policy, false, NULL, -1);
+                       queue_objects, keep_drop_policy, false, NULL, -1,
+                       PACING_VERSION);
 }
 
 /* Publish-mode variant: the sender PUSHES its tracks, and the peer accepts the
@@ -1581,7 +1583,8 @@ static bool fix_init_pub_act(fix_t *fix, moq_alloc_t *alloc, uint64_t now,
                              const char *accept_pub_name, int accept_pub_track)
 {
     return fix_init_q2(fix, alloc, max_actions, false, now, queue_objects,
-                       true, true, accept_pub_name, accept_pub_track);
+                       true, true, accept_pub_name, accept_pub_track,
+                       PACING_VERSION);
 }
 
 static bool fix_init(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
@@ -1702,7 +1705,7 @@ static moq_result_t write_obj(fix_t *fix, int idx, uint8_t sentinel, bool sync,
 }
 
 /* ===================================================================== *
- *  S1 -- one-at-a-time demanded control.
+ *  Scenario 1 -- one-at-a-time demanded control.
  *  Each accepted object is followed by exactly ONE production drive. Proves
  *  the object leaves in that same drive, with exact FIFO identity and exact
  *  conservation at every boundary.
@@ -1793,7 +1796,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S2 -- burst demanded control.
+ *  Scenario 2 -- burst demanded control.
  *  A GOP-shaped burst (one sync anchor + five deltas in one group) enqueued
  *  before any drive must drain as far as capacity allows in a SINGLE drive.
  * ===================================================================== */
@@ -1862,7 +1865,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S3 -- alternating demanded tracks.
+ *  Scenario 3 -- alternating demanded tracks.
  *  Both tracks have demand. Proves the drain follows write order exactly and
  *  does NOT batch per track.
  * ===================================================================== */
@@ -1919,7 +1922,7 @@ out:
 }
 
 /* ===================================================================== *
- *  S4 -- undemanded-head discriminator.
+ *  Scenario 4 -- undemanded-head discriminator.
  *  An UNDEMANDED track sits at the FIFO head with a DEMANDED track behind it.
  *  This pins what the product actually does; it changes no semantics.
  * ===================================================================== */
@@ -1951,7 +1954,7 @@ static void test_isolation(bool drop_without_demand)
     MOQ_TEST_CHECK(write_obj(&fix, 1, 0x73, true, true, 4000) == MOQ_OK);
     expect_conserved(fix.s, 4, 0, 4, 0, 4 * PAYLOAD_LEN, "iso-queued");
     /* Non-vacuity: the fixture really did queue four objects across two
-     * tracks, so an empty fixture cannot masquerade as the intended RED. */
+     * tracks, so an empty fixture cannot masquerade as the intended outcome. */
     MOQ_TEST_CHECK_EQ_INT(fix.enq_n, 4);
 
     /* Declared audio identity/order -- ordinals 1 then 3, group 0 then 1. */
@@ -2052,8 +2055,176 @@ out:
                               : "pacing_isolation_hold", before);
 }
 
+/* Demand returning after a discarded group head must not renumber its tail
+ * as object zero. Exercise separate drain passes, two discarded groups, a
+ * sync sample that does not start a group, another demanded track, and END
+ * both before and after recovery. All observations come from the real peer. */
+static void test_demand_resumes_at_group_start(uint64_t version, bool end_skipped)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    const uint64_t now = 1000;
+    const char *name = version == MOQ_VERSION_DRAFT_16
+        ? (end_skipped ? "pacing_d16_end_skipped_group" : "pacing_d16_resume_group")
+        : (end_skipped ? "pacing_d18_end_skipped_group" : "pacing_d18_resume_group");
+    if (!fix_init_q2(&fix, &alloc, 0, true, now, 0, false,
+                     false, NULL, -1, version)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 1, "a", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x50, true, true, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x51, true, true, 1000) == MOQ_OK);
+    drive(&fix, now);
+    const tr_exp_t audio_head[] = { { 1, 0, 0, 0x51, 1 } };
+    expect_from(&fix, 0, audio_head, 1, "resume-audio-head");
+    expect_conserved(fix.s, 2, 1, 0, 1, 0, "resume-first-drop");
+
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x52, true, true, 2000) == MOQ_OK);
+    drive(&fix, now);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x53, false, false, 2100) == MOQ_OK);
+    drive(&fix, now);
+    expect_conserved(fix.s, 4, 1, 0, 3, 0, "resume-second-group-drop");
+
+    set_phase(&fix, PHASE_ARM);
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x54, true, false, 2200) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 1, 0x55, true, false, 2200) == MOQ_OK);
+    int from = fix.tr.n;
+    drive(&fix, now);
+    const tr_exp_t audio_tail[] = { { 1, 0, 1, 0x55, 5 } };
+    expect_from(&fix, from, audio_tail, 1, "resume-skip-tail-audio-unaffected");
+    expect_conserved(fix.s, 6, 2, 0, 4, 0, "resume-skip-tail-stats");
+    from = fix.tr.n;
+    drive(&fix, now);
+    expect_from(&fix, from, NULL, 0, "resume-idle-no-duplicate");
+    expect_conserved(fix.s, 6, 2, 0, 4, 0, "resume-idle-stats");
+
+    if (!end_skipped) {
+        MOQ_TEST_CHECK(write_obj(&fix, 0, 0x56, true, true, 3000) == MOQ_OK);
+        MOQ_TEST_CHECK(write_obj(&fix, 0, 0x57, false, false, 3100) == MOQ_OK);
+        from = fix.tr.n;
+        drive(&fix, now);
+        const tr_exp_t recovered[] = {
+            { 0, 2, 0, 0x56, 6 }, { 0, 2, 1, 0x57, 7 }
+        };
+        expect_from(&fix, from, recovered, 2, "resume-exact-fresh-group");
+        expect_conserved(fix.s, 8, 4, 0, 4, 0, "resume-recovered-stats");
+    }
+    MOQ_TEST_CHECK(moq_media_sender_end_track(fix.s, fix.t[0]) == MOQ_OK);
+    from = fix.tr.n;
+    drive(&fix, now);
+    expect_from(&fix, from, NULL, 0, "resume-terminal-no-media");
+    const stat_exp_t terminal[] = {
+        { 0, end_skipped ? 0 : 3, 0, MOQ_OBJECT_END_OF_TRACK }
+    };
+    expect_status(&fix, terminal, 1, "resume-terminal-status");
+    if (end_skipped) {
+        const term_exp_t terms[] = { { 0, 0, 0, false, false } };
+        expect_terminals(&fix, terms, 1, "resume-skipped-terminal");
+    } else {
+        const term_exp_t terms[] = {
+            { 0, 2, 0, true, true }, { 0, 3, 0, false, false }
+        };
+        expect_terminals(&fix, terms, 2, "resume-recovered-terminal");
+    }
+    moq_media_sender_stats_t st;
+    memset(&st, 0, sizeof(st));
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 3);
+    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 0);
+    expect_conserved(fix.s, end_skipped ? 6 : 8, end_skipped ? 2 : 4,
+                     0, 4, 0, "resume-final-stats");
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, name, before);
+}
+
+static void test_demand_loss_after_emission(uint64_t version)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    const uint64_t now = 1000;
+    const char *name = version == MOQ_VERSION_DRAFT_16
+        ? "pacing_d16_demand_loss_after_emission"
+        : "pacing_d18_demand_loss_after_emission";
+    if (!fix_init_q2(&fix, &alloc, 0, true, now, 0, false,
+                     false, NULL, -1, version)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x60, true, true, 1000) == MOQ_OK);
+    drive(&fix, now);
+    const tr_exp_t head[] = { { 0, 0, 0, 0x60, 0 } };
+    expect_from(&fix, 0, head, 1, "demand-loss-head");
+    const reset_exp_t departure[] = {
+        { 0, 0, 0, 0x1, true, .sub_opaque = fix.sub[0]._opaque, .pub_opaque = 0 }
+    };
+
+    MOQ_TEST_CHECK(moq_session_unsubscribe(moq_simpair_server(fix.sp),
+                                          fix.sub[0], now) == MOQ_OK);
+    for (int i = 0; i < 8 &&
+         moq_media_sender_track_has_subscriber(fix.s, fix.t[0]); i++)
+        drive(&fix, now);
+    MOQ_TEST_CHECK(!moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x61, false, false, 1100) == MOQ_OK);
+    drive(&fix, now);
+    expect_conserved(fix.s, 2, 1, 0, 1, 0, "demand-loss-drop");
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 1);
+
+    /* Before issuing the renewed SUBSCRIBE, declare the already published
+     * largest location (group 0, object 0). */
+    fix.sok_exp[fix.sok_exp_n].has_largest = true;
+    set_phase(&fix, PHASE_ARM);
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x62, false, false, 1200) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x63, true, true, 2000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0x64, false, false, 2100) == MOQ_OK);
+    int from = fix.tr.n;
+    drive(&fix, now);
+    const tr_exp_t recovered[] = {
+        { 0, 1, 0, 0x63, 3 }, { 0, 1, 1, 0x64, 4 }
+    };
+    expect_from(&fix, from, recovered, 2, "demand-loss-no-location-reuse");
+    expect_conserved(fix.s, 5, 3, 0, 2, 0, "demand-loss-recovered");
+    MOQ_TEST_CHECK(moq_media_sender_end_track(fix.s, fix.t[0]) == MOQ_OK);
+    drive(&fix, now);
+    const stat_exp_t terminal[] = { { 0, 2, 0, MOQ_OBJECT_END_OF_TRACK } };
+    const term_exp_t terms[] = {
+        { 0, 1, 0, true, true }, { 0, 2, 0, false, false }
+    };
+    expect_status(&fix, terminal, 1, "demand-loss-terminal");
+    expect_terminals(&fix, terms, 2, "demand-loss-fin");
+    expect_resets(&fix, departure, version == MOQ_VERSION_DRAFT_16 ? 1 : 0,
+                  "demand-loss-departure");
+    /* The service discharges its abandonment once. Draft-16 reset the old
+     * stream on unsubscribe; draft-18's missing cancellation reset is the
+     * separate core limitation tracked in #36, not proof of stream retirement. */
+    moq_media_sender_stats_t st;
+    memset(&st, 0, sizeof(st));
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 1);
+    expect_conserved(fix.s, 5, 3, 0, 2, 0, "demand-loss-final");
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, name, before);
+}
+
 /* ===================================================================== *
- *  S5 -- capacity/refusal recovery.
+ *  Scenario 5 -- capacity/refusal recovery.
  *  A REAL session refusal at the head: the peer session's action ring is small,
  *  so moq_pub_write_object_ex returns MOQ_ERR_WOULD_BLOCK mid-burst. Proves the
  *  retained head resumes on later DRIVES alone -- no new media, no unrelated
@@ -2342,7 +2513,7 @@ static void test_terminal_stats(void)
 
     /* The marker still occupies a slot against the ACTIVE QUEUE object bound:
      * that bound is now 3/3, so the next media write is refused. This is what
-     * stops the fix from simply dropping the marker out of the accounting. */
+     * keeps the marker from simply dropping out of the accounting. */
     MOQ_TEST_CHECK(write_obj(&fix, 1, 0xc2, true, true, 3000) == MOQ_ERR_WOULD_BLOCK);
     expect_conserved(fix.s, 2, 0, 2, 0, 2 * PAYLOAD_LEN,
                      "termstat-after-refusal");
@@ -2946,7 +3117,7 @@ static bool evict_geometry(fix_t *fix, uint64_t now)
      *    the video APP-LEVEL group 0 is still open (no later group has been
      *    written, so a further delta still belongs to it), while the WIRE
      *    subgroup it was emitted on is driven through RESET by the post-pass
-     *    sweep -- this GREEN's general no-entry discharge, which needs no
+     *    sweep -- the sender's general no-entry discharge, which needs no
      *    queued video entry to hang off. The obligation is therefore
      *    DISCHARGED here, not carried untouched into step 5. */
     const tr_exp_t audio[2] = { { 1, 0, 0, 0x52, 2 }, { 1, 1, 0, 0x53, 3 } };
@@ -3010,7 +3181,7 @@ static bool evict_geometry_noflush(fix_t *fix, uint64_t now)
     return true;
 }
 
-/* RED A -- cross-path cumulative group identity. */
+/* Eviction: cross-path cumulative group identity. */
 static void test_evict_crosspath_group(void)
 {
     int before = failures;
@@ -3057,7 +3228,7 @@ out:
     report(&fix, "pacing_evict_crosspath_group", before);
 }
 
-/* RED B -- the armed RESET must survive removal ordering. */
+/* Eviction: the armed RESET must survive removal ordering. */
 static void test_evict_reset_survives_removal(void)
 {
     int before = failures;
@@ -3639,6 +3810,12 @@ int main(void)
     test_alternating();
     test_isolation(false);
     test_isolation(true);
+    test_demand_resumes_at_group_start(MOQ_VERSION_DRAFT_16, false);
+    test_demand_resumes_at_group_start(MOQ_VERSION_DRAFT_16, true);
+    test_demand_resumes_at_group_start(MOQ_VERSION_DRAFT_18, false);
+    test_demand_resumes_at_group_start(MOQ_VERSION_DRAFT_18, true);
+    test_demand_loss_after_emission(MOQ_VERSION_DRAFT_16);
+    test_demand_loss_after_emission(MOQ_VERSION_DRAFT_18);
     test_refusal_recovery();
     test_refusal_after_skip();
     test_end_marker_order();

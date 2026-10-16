@@ -3,8 +3,8 @@
 #
 # `out_wake_lanes` is the only notice that retiring a generation opened
 # deferred work. A loop that receives it and drops it leaves those lanes
-# unwoken until the next poll — which the dedicated admin thread in Step 3 has
-# no equivalent of. The two call sites differ (one managed lane vs every global
+# unwoken until the next poll — which the admin listener's dedicated admin
+# thread has no equivalent of. The two call sites differ (one managed lane vs every global
 # shard), so each is pinned at its OWN call site rather than by a file-wide
 # grep that a neighbouring wake could satisfy.
 set -u

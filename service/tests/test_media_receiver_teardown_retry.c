@@ -1,7 +1,7 @@
 /*
  * Receiver teardown RESUMES under transient session-queue backpressure.
  *
- * p2-medium__12 follow-up (Codex review): moq_session_unsubscribe() can return
+ * moq_session_unsubscribe() can return
  * MOQ_ERR_WOULD_BLOCK (action queue full) or MOQ_ERR_BUFFER (control send
  * scratch momentarily full) before it frees the session entry. The teardown task
  * must treat both as transient -- preserve its cursor + the subscriber and ask

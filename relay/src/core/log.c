@@ -1203,9 +1203,13 @@ moqr_log_cursor_open(moqr_log_t *log, moqr_cursor_origin_t origin,
     }
     *out = MOQR_CURSOR_INVALID;
 
+    /* Cursor generations never wrap: a free slot whose next generation would
+     * not fit a packed handle (above 0x0FFFFFFF) is retired and skipped, so a
+     * stale cursor handle can never alias a later occupant. */
     uint32_t slot = UINT32_MAX;
     for (uint32_t i = 0; i < log->max_cursors; i++) {
-        if ((log->cursors[i].generation & 1u) == 0) {
+        if ((log->cursors[i].generation & 1u) == 0 &&
+            log->cursors[i].generation < 0x0FFFFFFFu) {
             slot = i;
             break;
         }
@@ -1224,6 +1228,10 @@ moqr_log_cursor_open(moqr_log_t *log, moqr_cursor_origin_t origin,
     uint64_t h = moq_handle_pack(MOQR_HANDLE_POOL_CURSOR, log->shard_tag,
                                  c->generation, (uint32_t)slot);
     if (h == 0) {
+        /* Defensive only: the slot search above admits no generation the
+         * packer refuses and the shard tag is nonzero, so this cannot run.
+         * Kept so a future change to either fails closed (slot back to free,
+         * no zero handle) instead of handing out an invalid cursor. */
         c->generation++;   /* roll back to free (odd -> even) */
         return MOQR_ERR_INTERNAL;
     }

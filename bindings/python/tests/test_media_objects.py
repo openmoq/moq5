@@ -49,8 +49,8 @@ RAW = {"packaging": 1, "status": 0, "end_of_group": True, "datagram": True, "key
 
 
 class ObjectFixtureControls(unittest.TestCase):
-    """GREEN today: the substrate and the allocation gate, independent of the
-    absent public method."""
+    """Controls for the substrate and the allocation gate, independent of the
+    public poll_object method."""
 
     def setUp(self):
         gc.collect()
@@ -191,7 +191,7 @@ class ObjectFixtureControls(unittest.TestCase):
         self.assertEqual((after["pushed"], after["queued"], after["kept_buffers"]), (before["pushed"], before["queued"], before["kept_buffers"]))
         self.assertEqual(after["refs_created"], after["refs_released"], "buffers made before the refusal were released")
         self.assertEqual((after["sample_blocks_live"], after["sample_bad_free"]), (0, 0))
-        # a representable oversized stamp is still available to the RED rows
+        # a representable oversized stamp is still available to the oversized-stamp rows
         _native._test_push_object(a, {**CMAF, "stamp": self.layout["object_sizeof"] + 1})
         rc, stamp, *_ = _native._test_native_object_cycle()
         self.assertEqual((rc, stamp), (0, self.layout["object_sizeof"] + 1))
@@ -489,7 +489,7 @@ class MediaObjectTests(unittest.TestCase):
     def test_failed_second_of_three_is_reported_once_and_neighbours_delivered(self):
         # Three DISTINCT objects: first RAW b"first", a malformed CMAF, third
         # RAW b"third". The stage of each loss is the injected shape; which
-        # acquisition site it hits is measured at GREEN, not asserted here.
+        # acquisition site it hits is not asserted here.
         a = self.track()
         for malformed, stage in (("mdat_len_over", "bounds:mdat_len"), ("sample_count_product", "samples")):
             with self.subTest(malformed=malformed):

@@ -120,14 +120,6 @@ else()
         "Expected auto, openssl, or mbedtls.")
 endif()
 
-# Resolve picoquic-log target name before linking.
-set(_PQ_LOG "")
-if(TARGET picoquic::picoquic-log)
-    set(_PQ_LOG "picoquic::picoquic-log")
-elseif(TARGET picoquic-log)
-    set(_PQ_LOG "picoquic-log")
-endif()
-
 target_link_libraries(moq-adapter-picoquic
     PUBLIC moq::core ${_adapter_tls_link}
     PUBLIC $<BUILD_INTERFACE:${_PQ}>)
@@ -181,18 +173,14 @@ endif()\n")
 
 # Install-tree targets (relocatable via prefix detection).
 # Always use namespaced names since install-tree consumers will have
-# installed picoquic with picoquic::picoquic-core / picoquic::picoquic-log.
+# installed picoquic with picoquic::picoquic-core. The adapter needs only
+# picoquic-core: it uses nothing from picoquic-log, and picoquic-core does
+# not depend on it.
 set(_adapter_lib_name "$<TARGET_FILE_NAME:moq-adapter-picoquic>")
 set(_adapter_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-picoquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
 set(_adapter_libdir "${CMAKE_INSTALL_LIBDIR}")
 set(_adapter_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
 set(_adapter_pq_target "picoquic::picoquic-core")
-set(_adapter_pq_log "")
-set(_adapter_pq_grouped FALSE)
-if(_PQ_LOG)
-    set(_adapter_pq_log ";picoquic::picoquic-log")
-    set(_adapter_pq_grouped TRUE)   # core/log form a static-archive cycle
-endif()
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqAdapterTargets.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake.in
@@ -323,6 +311,58 @@ if(MOQ_BUILD_TESTS)
                  COMMAND test_picoquic_verify_api_${_verify_api})
     endforeach()
 
+    if(_moq_pq_verify_backend STREQUAL "openssl")
+        # The delegated-trust contract on the OpenSSL provider: the real
+        # verifier source against a tiny picoquic setter recorder, picotls and
+        # OpenSSL real, under both public setter generations.
+        foreach(_verify_callback_api IN ITEMS legacy modern)
+            add_executable(test_picoquic_verify_callback_${_verify_callback_api}
+                tests/test_verify_callback.c
+                moq_picoquic_verify.c)
+            target_include_directories(
+                test_picoquic_verify_callback_${_verify_callback_api}
+                BEFORE PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/verify_callback
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include
+                    ${PROJECT_SOURCE_DIR}/core/include
+                    ${PTLS_INCLUDE_DIR})
+            target_compile_definitions(
+                test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                    MOQ_PICOQUIC_VERIFY_OPENSSL
+                    MOQ_PICOQUIC_VERIFY_TESTING=1
+                    calloc=moq_test_verify_calloc
+                    free=moq_test_verify_free
+                    X509_STORE_new=moq_test_verify_store_new
+                    X509_STORE_free=moq_test_verify_store_free
+                    ptls_openssl_init_verify_certificate=moq_test_openssl_init_verify_certificate
+                    ptls_openssl_dispose_verify_certificate=moq_test_openssl_dispose_verify_certificate)
+            if(_verify_callback_api STREQUAL "modern")
+                target_compile_definitions(
+                    test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                        MOQ_TEST_PICOQUIC_MODERN_API
+                        picoquic_set_verify_certificate_callback_ex=moq_test_set_verify_certificate_callback_ex)
+            else()
+                target_compile_definitions(
+                    test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                        picoquic_set_verify_certificate_callback=moq_test_set_verify_certificate_callback)
+            endif()
+            target_link_libraries(
+                test_picoquic_verify_callback_${_verify_callback_api} PRIVATE
+                    moq::core ${_PQ} ${_adapter_tls_link})
+            set_target_properties(
+                test_picoquic_verify_callback_${_verify_callback_api}
+                PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(
+                    test_picoquic_verify_callback_${_verify_callback_api}
+                    PRIVATE -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME picoquic_verify_callback_${_verify_callback_api}
+                     COMMAND test_picoquic_verify_callback_${_verify_callback_api})
+        endforeach()
+    endif()
+
     # Backpressure test provides its own picoquic function stubs so it
     # can exercise moq_pq_callback/moq_pq_service without a real QUIC
     # stack. Links the adapter source directly with picoquic headers
@@ -444,12 +484,70 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME pq_sim_scheduling COMMAND test_pq_sim_scheduling)
         set_tests_properties(pq_sim_scheduling PROPERTIES TIMEOUT 120)
+        # Local-stream reset after FIN against the pinned, patched picoquic
+        # (patches/picoquic/0002): constructed stream/SACK rows plus packet
+        # rows over the simulated links. Provider-only; no adapter code.
+        add_executable(test_pq_reset_after_fin tests/test_pq_reset_after_fin.c)
+        target_include_directories(test_pq_reset_after_fin PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_reset_after_fin PRIVATE picoquic-test)
+        target_compile_definitions(test_pq_reset_after_fin PRIVATE
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_reset_after_fin PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_reset_after_fin COMMAND test_pq_reset_after_fin)
+        set_tests_properties(pq_reset_after_fin PROPERTIES TIMEOUT 120)
     endif()
 
     # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
     # configures scratch trees and reads their generated link lines, so it is
     # independent of the host linker's warnings.
     if(MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pq_close_reason tests/test_pq_close_reason.c)
+        target_include_directories(test_pq_close_reason PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_close_reason PRIVATE moq::adapter-picoquic)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_close_reason PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_close_reason COMMAND test_pq_close_reason)
+        set_tests_properties(pq_close_reason PROPERTIES TIMEOUT 30)
+        get_target_property(_pq_close_provider_type ${_PQ} TYPE)
+        if(_pq_close_provider_type STREQUAL "STATIC_LIBRARY")
+        add_library(pq_close_reason_sender OBJECT
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic/sender.c")
+        target_link_libraries(pq_close_reason_sender PRIVATE ${_PQ})
+        target_include_directories(pq_close_reason_sender PRIVATE
+            $<TARGET_PROPERTY:${_PQ},INCLUDE_DIRECTORIES>)
+        target_compile_definitions(pq_close_reason_sender PRIVATE
+            $<TARGET_PROPERTY:${_PQ},COMPILE_DEFINITIONS>
+            picoquic_string_duplicate=moq_test_reason_duplicate)
+        target_compile_options(pq_close_reason_sender PRIVATE
+            $<TARGET_PROPERTY:${_PQ},COMPILE_OPTIONS>)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(pq_close_reason_sender PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_executable(test_pq_close_reason_oom
+            tests/test_pq_close_reason_oom.c
+            $<TARGET_OBJECTS:pq_close_reason_sender>)
+        target_include_directories(test_pq_close_reason_oom PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_close_reason_oom PRIVATE ${_PQ})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_close_reason_oom PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_close_reason_oom COMMAND test_pq_close_reason_oom)
+        set_tests_properties(pq_close_reason_oom PROPERTIES TIMEOUT 30)
+        endif()
         add_test(NAME picoquic_source_mode_link_policy
             COMMAND ${CMAKE_COMMAND}
                 -DSRC=${CMAKE_SOURCE_DIR}
@@ -475,7 +573,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_compile COMMAND test_threaded_compile)
 
-    # Focused RED row for the raw threaded SERVER terminal ownership defect:
+    # Focused row for the raw threaded SERVER terminal ownership hazard:
     # the same scenario as threaded_compile's
     # server_terminal_conn_observed_before_prune, on its own, so the ASan
     # abort is attributable without running the scenarios that precede it.
@@ -494,9 +592,9 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     # Two rows, registered separately so each terminal shape is attributable:
-    #   peer_terminal -- RED: picoquic_callback_close at
+    #   peer_terminal -- the hazard: picoquic_callback_close at
     #                    picoquic_state_disconnected, cnx already deleted
-    #   app_close     -- CONTROL (passes today): APPLICATION_CLOSE at
+    #   app_close     -- CONTROL: APPLICATION_CLOSE at
     #                    picoquic_state_closing_received, cnx still live
     add_test(NAME threaded_server_terminal_uaf
              COMMAND test_threaded_server_terminal_uaf peer_terminal)
@@ -518,9 +616,9 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         TIMEOUT 120
         ENVIRONMENT "MOQ_PQ_THREADED_STATS=1")
 
-    # Terminal-ownership controls: these pass today and must keep passing, so
-    # the eventual fix cannot be obtained by unbinding a live caller-owned cnx
-    # too late, or by never unbinding at all.
+    # Terminal-ownership controls: these must always pass, so terminal
+    # ownership cannot be satisfied by unbinding a live caller-owned cnx too
+    # late, or by never unbinding at all.
     add_executable(test_threaded_terminal_controls
         tests/test_threaded_terminal_controls.c)
     target_link_libraries(test_threaded_terminal_controls
@@ -590,6 +688,21 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
 
+    # SETUP authorization tokens through the facade over real loopback: the
+    # server's SETUP_COMPLETE carries the configured tokens by value; a set
+    # whose SETUP cannot fit the session send arena is refused at create.
+    add_executable(test_threaded_setup_tokens tests/test_threaded_setup_tokens.c)
+    target_link_libraries(test_threaded_setup_tokens PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_setup_tokens PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    add_test(NAME threaded_setup_tokens COMMAND test_threaded_setup_tokens)
+    set_tests_properties(threaded_setup_tokens PROPERTIES
+        TIMEOUT 120 LABELS "network")
+
     # TLS test fixtures are REQUIRED for the threaded TLS gates, not optional.
     # The threaded adapter already requires source-tree picoquic, whose certs/
     # directory ships these files, so a missing fixture is a broken checkout and
@@ -653,6 +766,11 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
 
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+    moq_nested_cxx_args(_threaded_consumer_cxx)
+    # Forward the parent's compile/link flags and build type: the consumer
+    # links the parent's archives, so a sanitizer parent build needs a
+    # consumer instrumented the same way.
     add_test(NAME adapter_threaded_consumer
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
@@ -662,9 +780,14 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' && \
+                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${_threaded_consumer_cxx} \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
+                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
              '${CMAKE_COMMAND}' --build '${_threaded_consumer_bld}' && \
              '${_threaded_consumer_bld}/moq_adapter_threaded_consumer_test'")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+    moq_test_reject_consumer_warnings(adapter_threaded_consumer)
 
     # Install-tree consumer: installs picoquic + libmoq to a temp prefix
     # and consumes raw managed + the verifier helper against THAT prefix
@@ -677,8 +800,10 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             get_filename_component(_tom "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
             get_filename_component(_threaded_openssl_root "${_tom}" DIRECTORY)
         endif()
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+        moq_nested_cxx_env(_threaded_install_cxx_env)
         add_test(NAME adapter_threaded_install_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_threaded_install_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_threaded.sh"
                 "${CMAKE_COMMAND}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded-install"
@@ -692,7 +817,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_BUILD_TYPE}"
                 "${_threaded_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-threaded-work"
-                "${CMAKE_INSTALL_LIBDIR}")
+                "${CMAKE_INSTALL_LIBDIR}"
+                "${CMAKE_CXX_FLAGS}")
         set_tests_properties(adapter_threaded_install_consumer
             PROPERTIES TIMEOUT 600)
     endif()
@@ -718,6 +844,8 @@ if(MOQ_BUILD_TESTS)
     set(_adapter_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_adapter_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
     set(_adapter_consumer_deps "")
+    include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+    moq_nested_cxx_args(_adapter_consumer_cxx FLAGS)
     foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
                           OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
         if(${_dep})
@@ -734,7 +862,7 @@ if(MOQ_BUILD_TESTS)
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_adapter_consumer_cxx} \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                  -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
                  -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \

@@ -669,19 +669,61 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == Semantic reject: zero-length USE_VALUE -> MALFORMED_AUTH_TOKEN = *
-     *  A well-formed Token structure whose RESOLVED value fails semantic
-     *  validation (zero-length) is a request-level reject: REQUEST_ERROR
-     *  (0x4) with FIN, no event, session up -- distinct from the structural
-     *  0x6 session close above. */
+    /* == Opaque values: empty and zero-byte USE_VALUE are surfaced ===== *
+     *  Token values are opaque bytes. A well-formed Token with an empty or
+     *  zero-byte-bearing value reaches SUBSCRIBE_REQUEST exactly; no
+     *  REQUEST_ERROR, session up. */
+    {
+        static const struct { const char *data; size_t len; } vals[] = {
+            { NULL, 0 }, { "a\0b", 3 },
+        };
+        for (size_t i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+            moq_session_t *s = make_server();
+            MOQ_TEST_CHECK(s != NULL);
+            moq_d18_msg_params_t p = { 0 };
+            p.auth_token_count = 1;
+            p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+            p.auth_tokens[0].token_type = 7;
+            p.auth_tokens[0].token_value =
+                (moq_bytes_t){ (const uint8_t *)vals[i].data, vals[i].len };
+            uint8_t msg[128];
+            size_t n = encode_subscribe(msg, sizeof(msg), 0, &p);
+            moq_stream_ref_t ref = moq_stream_ref_from_u64(1);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1),
+                (int)MOQ_OK);
+            bool got = false;
+            moq_event_t ev;
+            while (moq_session_poll_events(s, &ev, 1) > 0) {
+                if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST &&
+                    ev.u.subscribe_request.token_count == 1) {
+                    const moq_bytes_t *v =
+                        &ev.u.subscribe_request.tokens[0].token_value;
+                    got = v->len == vals[i].len &&
+                          (v->len == 0 || memcmp(v->data, vals[i].data, v->len) == 0);
+                }
+                moq_event_cleanup(&ev);
+            }
+            MOQ_TEST_CHECK(got);
+            MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+            moq_session_destroy(s);
+        }
+    }
+
+    /* == Opaque is not skipped: two empty values of one type are duplicates *
+     *  Two USE_VALUE tokens with the same type and the same (empty) value are
+     *  the duplicate resolved (type, value) the request rule refuses with
+     *  MALFORMED_AUTH_TOKEN (0x4); no event, session up. */
     {
         moq_session_t *s = make_server();
         MOQ_TEST_CHECK(s != NULL);
         moq_d18_msg_params_t p = { 0 };
-        p.auth_token_count = 1;
-        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
-        p.auth_tokens[0].token_type = 7;
-        p.auth_tokens[0].token_value = (moq_bytes_t){ NULL, 0 };
+        p.auth_token_count = 2;
+        for (size_t i = 0; i < 2; i++) {
+            p.auth_tokens[i].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+            p.auth_tokens[i].token_type = 7;
+            p.auth_tokens[i].token_value = (moq_bytes_t){ NULL, 0 };
+        }
         uint8_t msg[128];
         size_t n = encode_subscribe(msg, sizeof(msg), 0, &p);
         moq_stream_ref_t ref = moq_stream_ref_from_u64(1);
@@ -700,45 +742,14 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == Semantic reject: NUL-containing USE_VALUE -> 0x4 ============= */
-    {
-        moq_session_t *s = make_server();
-        MOQ_TEST_CHECK(s != NULL);
-        moq_d18_msg_params_t p = { 0 };
-        p.auth_token_count = 1;
-        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
-        p.auth_tokens[0].token_type = 7;
-        p.auth_tokens[0].token_value = MOQ_BYTES_LITERAL("a\0b");
-        uint8_t msg[128];
-        size_t n = encode_subscribe(msg, sizeof(msg), 0, &p);
-        moq_stream_ref_t ref = moq_stream_ref_from_u64(1);
-        MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_session_on_bidi_stream_bytes(s, ref, msg, n, false, 1),
-            (int)MOQ_OK);
-        bool any_event = false;
-        moq_event_t ev;
-        while (moq_session_poll_events(s, &ev, 1) > 0) {
-            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) any_event = true;
-            moq_event_cleanup(&ev);
-        }
-        MOQ_TEST_CHECK(!any_event);
-        MOQ_TEST_CHECK(drain_request_error(s, ref, 0x4, true));
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
-        moq_session_destroy(s);
-    }
-
-    /* == Semantic reject on REGISTER still registers the alias ======== *
-     *  The spec requires a REGISTER that does not cause a Session error to
-     *  register even when the message is rejected. The malformed value
-     *  rejects the message with 0x4; a second message referencing the
-     *  alias resolves the SAME value and rejects with 0x4 again -- NOT
-     *  0x17 (unknown alias) -- and a third request with a valid token
-     *  shows the session and cache are healthy. */
+    /* == REGISTER of an empty value registers and resolves ============= *
+     *  An empty registered value is a valid opaque value: the REGISTER
+     *  request surfaces it, and a later USE_ALIAS resolves the same empty
+     *  value rather than failing as an unknown alias. */
     {
         moq_session_t *s = make_server_ex(1024);
         MOQ_TEST_CHECK(s != NULL);
 
-        /* 1: REGISTER alias 5 with a zero-length (malformed) value. */
         moq_d18_msg_params_t p = { 0 };
         p.auth_token_count = 1;
         p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_REGISTER;
@@ -751,18 +762,30 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_session_on_bidi_stream_bytes(s, ref1, msg, n, false, 1),
             (int)MOQ_OK);
-        bool any_event = false;
+        int got = 0;
+        moq_subscription_t first = { 0 };
         moq_event_t ev;
         while (moq_session_poll_events(s, &ev, 1) > 0) {
-            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) any_event = true;
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST &&
+                ev.u.subscribe_request.token_count == 1 &&
+                ev.u.subscribe_request.tokens[0].token_type == 7 &&
+                ev.u.subscribe_request.tokens[0].token_value.len == 0) {
+                first = ev.u.subscribe_request.sub;
+                got++;
+            }
             moq_event_cleanup(&ev);
         }
-        MOQ_TEST_CHECK(!any_event);
-        MOQ_TEST_CHECK(drain_request_error(s, ref1, 0x4, true));
+        MOQ_TEST_CHECK_EQ_INT(got, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
 
-        /* 2: USE_ALIAS 5 -- the alias IS registered, so the resolved value
-         * fails the same semantic check: 0x4 again, never 0x17. */
+        /* Retire the first request so the same track can be asked again. */
+        moq_reject_subscribe_cfg_t rcfg;
+        moq_reject_subscribe_cfg_init(&rcfg);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_reject_subscribe(s, first, &rcfg, 1), (int)MOQ_OK);
+        moq_action_t da;
+        while (moq_session_poll_actions(s, &da, 1) > 0) moq_action_cleanup(&da);
+
         memset(&p, 0, sizeof(p));
         p.auth_token_count = 1;
         p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_ALIAS;
@@ -772,35 +795,16 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_session_on_bidi_stream_bytes(s, ref2, msg, n, false, 1),
             (int)MOQ_OK);
-        any_event = false;
-        while (moq_session_poll_events(s, &ev, 1) > 0) {
-            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) any_event = true;
-            moq_event_cleanup(&ev);
-        }
-        MOQ_TEST_CHECK(!any_event);
-        MOQ_TEST_CHECK(drain_request_error(s, ref2, 0x4, true));
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
-
-        /* 3: a valid token still works after the rejections. */
-        memset(&p, 0, sizeof(p));
-        p.auth_token_count = 1;
-        p.auth_tokens[0].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
-        p.auth_tokens[0].token_type = 7;
-        p.auth_tokens[0].token_value = MOQ_BYTES_LITERAL("good");
-        n = encode_subscribe(msg, sizeof(msg), 4, &p);
-        moq_stream_ref_t ref3 = moq_stream_ref_from_u64(5);
-        MOQ_TEST_CHECK_EQ_INT(
-            (int)moq_session_on_bidi_stream_bytes(s, ref3, msg, n, false, 1),
-            (int)MOQ_OK);
-        bool got = false;
+        got = 0;
         while (moq_session_poll_events(s, &ev, 1) > 0) {
             if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST &&
                 ev.u.subscribe_request.token_count == 1 &&
-                ev.u.subscribe_request.tokens[0].token_value.len == 4)
-                got = true;
+                ev.u.subscribe_request.tokens[0].token_type == 7 &&
+                ev.u.subscribe_request.tokens[0].token_value.len == 0)
+                got++;
             moq_event_cleanup(&ev);
         }
-        MOQ_TEST_CHECK(got);
+        MOQ_TEST_CHECK_EQ_INT(got, 1);
         MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }

@@ -13,7 +13,7 @@
  * server-first at teardown (env_close must return). This case recompiles the
  * facade with MOQ_WTQ_MM_TESTING for the guarded child observation.
  *
- * Establishment only: no subscribe/object flow (that needs the pump slice), no
+ * Establishment only: no subscribe/object flow (that needs the pump), no
  * datagrams, no service integration. The per-call wait timeout and overall
  * deadline are pure hang guards, never timing assertions.
  *

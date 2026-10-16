@@ -17,6 +17,13 @@
 #include <stddef.h>
 #include <stdio.h>
 
+_Static_assert(_Generic(&moq_picoquic_supports_cert_verify_callback,
+                        bool (*)(void): 1, default: 0), "capability returns bool");
+_Static_assert(_Generic(&moq_picoquic_set_cert_verify_callback,
+                        moq_result_t (*)(picoquic_quic_t *,
+                                        moq_picoquic_cert_verify_fn, void *): 1,
+                        default: 0), "setter returns moq_result_t");
+
 int main(void)
 {
     moq_pq_threaded_cfg_t cfg;
@@ -31,6 +38,11 @@ int main(void)
      * NULL quic must return -1 (no network, no picoquic context). */
     if (moq_picoquic_set_cert_verifier(NULL, NULL) != -1)
         return 3;
+
+    if (moq_picoquic_set_cert_verify_callback(NULL, NULL, NULL) != MOQ_ERR_INVAL)
+        return 4;
+    printf("delegated trust supported: %d\n",
+           (int)moq_picoquic_supports_cert_verify_callback());
 
     printf("PASS: moq_adapter_threaded_install_consumer_test\n");
     return 0;

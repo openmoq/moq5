@@ -83,6 +83,14 @@ int main(void)
         moq_reject_publish_cfg_init(&rej);
         rej.error_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
         rej.reason = MOQ_BYTES_LITERAL("denied");
+        /* A retry interval whose wire form (ms + 1) does not fit is refused
+         * before any state change, never wrapped into "do not retry". */
+        rej.can_retry = true;
+        rej.retry_after_ms = MOQ_QUIC_VARINT_MAX;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_reject_publish(sv, sv_pub,
+            &rej, 2000), (int)MOQ_ERR_INVAL);
+        rej.can_retry = false;
+        rej.retry_after_ms = 0;
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_reject_publish(sv, sv_pub,
             &rej, 2000), (int)MOQ_OK);
 

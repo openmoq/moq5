@@ -32,7 +32,7 @@ moqr_test_warnings(moq-relay-core-test-internals)
 
 foreach(t IN ITEMS test_relay_scaffold test_relay_log
         test_relay_scenario test_relay_fetch test_relay_forcewithdraw
-        test_relay_upstreamcancel test_relay_capacity)
+        test_relay_upstreamcancel test_relay_capacity test_relay_track_reclaim)
     add_executable(${t} ${t}.c)
     target_link_libraries(${t} PRIVATE moq::relay-core)
     moqr_test_warnings(${t})
@@ -102,9 +102,10 @@ add_test(NAME relay_fetch COMMAND test_relay_fetch)
 add_test(NAME relay_forcewithdraw COMMAND test_relay_forcewithdraw)
 add_test(NAME relay_upstreamcancel COMMAND test_relay_upstreamcancel)
 add_test(NAME relay_capacity COMMAND test_relay_capacity)
+add_test(NAME relay_track_reclaim COMMAND test_relay_track_reclaim)
 set_tests_properties(relay_scaffold relay_log relay_control relay_scenario
     relay_fetch relay_forcewithdraw relay_upstreamcancel relay_capacity
-    relay_track_index relay_wire_codes relay_ready_set
+    relay_track_reclaim relay_track_index relay_wire_codes relay_ready_set
     PROPERTIES LABELS "relay")
 set_tests_properties(relay_scenario PROPERTIES TIMEOUT 120
     LABELS "relay;scenario")
@@ -175,10 +176,10 @@ if(TARGET moq::sim)
         moq::sim moq-relay-policy)
     moqr_test_warnings(test_relay_session_binding)
     add_test(NAME relay_session_binding COMMAND test_relay_session_binding)
-    # Core contract RED (fetcher-side late response stream after cancel):
-    # its own entry so the ordinary suite stays green while it is reported.
-    add_test(NAME relay_core_red_cancel_after_stop
-        COMMAND test_relay_session_binding --core-red-cancel-after-stop)
+    # Core contract (fetcher-side late response stream after cancel): its
+    # own entry so its result is reported apart from the ordinary suite.
+    add_test(NAME relay_core_cancel_after_stop
+        COMMAND test_relay_session_binding --core-cancel-after-stop)
     set_tests_properties(relay_session_binding PROPERTIES TIMEOUT 120)
 
     add_executable(test_relay_lifecycle test_relay_lifecycle.c)
@@ -246,7 +247,8 @@ endif()
 set(MOQR_LIBRARY_TESTS_SANSIO
     relay_track_index relay_ready_set relay_bind_layout relay_scaffold
     relay_log relay_control relay_scenario relay_fetch relay_forcewithdraw
-    relay_upstreamcancel relay_capacity relay_obs relay_route_dump
+    relay_upstreamcancel relay_capacity relay_track_reclaim relay_obs
+    relay_route_dump
     relay_shards relay_session_binding relay_lifecycle relay_ns_propagation
     relay_sched_vectors relay_seedx_units relay_migration_codes
     relay_metrics_const relay_wake_self_bit)

@@ -17,6 +17,7 @@ if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
 endif()
 
 set(FUZZ_FLAGS -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+set(FUZZ_LIB_FLAGS -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
 set(FUZZ_REQUIRED_FLAGS "-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer")
 
 include(CheckCSourceCompiles)
@@ -46,6 +47,26 @@ if(NOT MOQ_HAS_LIBFUZZER_RUNTIME)
     return()
 endif()
 
+# Instrument the in-tree libraries linked by the fuzz harnesses so coverage-
+# guided mutation and ASan/UBSan checks reach into the core, media, and relay
+# parsers rather than stopping at the harness translation units.
+foreach(_fuzz_lib
+        moq-core
+        moq-loc
+        moq-cmaf
+        moq-codec-signaling
+        moq-media-object
+        moq-msf
+        moq-relay-core
+        moq-relay
+        moq-relay-policy
+        moqr-admin)
+    if(TARGET ${_fuzz_lib})
+        target_compile_options(${_fuzz_lib} PRIVATE ${FUZZ_LIB_FLAGS})
+        target_link_options(${_fuzz_lib} PUBLIC "$<BUILD_INTERFACE:${FUZZ_LIB_FLAGS}>")
+    endif()
+endforeach()
+
 add_executable(fuzz_quic_varint fuzz_quic_varint.c)
 target_link_libraries(fuzz_quic_varint PRIVATE moq::core)
 target_compile_options(fuzz_quic_varint PRIVATE ${FUZZ_FLAGS})
@@ -61,6 +82,11 @@ target_link_libraries(fuzz_control_d16 PRIVATE moq::core)
 target_compile_options(fuzz_control_d16 PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_control_d16 PRIVATE ${FUZZ_FLAGS})
 
+add_executable(fuzz_control_d18 fuzz_control_d18.c)
+target_link_libraries(fuzz_control_d18 PRIVATE moq::core)
+target_compile_options(fuzz_control_d18 PRIVATE ${FUZZ_FLAGS})
+target_link_options(fuzz_control_d18 PRIVATE ${FUZZ_FLAGS})
+
 add_executable(fuzz_session_control fuzz_session_control.c)
 target_link_libraries(fuzz_session_control PRIVATE moq::core)
 target_compile_options(fuzz_session_control PRIVATE ${FUZZ_FLAGS})
@@ -70,6 +96,14 @@ add_executable(fuzz_session_data fuzz_session_data.c)
 target_link_libraries(fuzz_session_data PRIVATE moq::core)
 target_compile_options(fuzz_session_data PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_session_data PRIVATE ${FUZZ_FLAGS})
+
+add_executable(fuzz_session_d18 fuzz_session_d18.c)
+target_link_libraries(fuzz_session_d18 PRIVATE moq::core)
+target_compile_options(fuzz_session_d18 PRIVATE ${FUZZ_FLAGS})
+target_link_options(fuzz_session_d18 PRIVATE ${FUZZ_FLAGS})
+
+set(_fuzz_target_count 7)
+set(_fuzz_test_count 11)
 
 # The relay admin parser, built only when the relay tier is in this tree.
 if(TARGET moqr-admin)
@@ -82,11 +116,53 @@ if(TARGET moqr-admin)
     add_test(NAME fuzz_relay_admin_http_corpus
              COMMAND fuzz_relay_admin_http
              ${CMAKE_CURRENT_SOURCE_DIR}/corpus/relay_admin_http -runs=0)
-    set(_fuzz_target_count 6)
-    set(_fuzz_test_count 9)
-else()
-    set(_fuzz_target_count 5)
-    set(_fuzz_test_count 7)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
+endif()
+
+if(TARGET moq-loc)
+    add_executable(fuzz_loc fuzz_loc.c)
+    target_link_libraries(fuzz_loc PRIVATE moq::loc)
+    target_compile_options(fuzz_loc PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_loc PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_loc_smoke
+             COMMAND fuzz_loc -runs=1 -max_len=0)
+    add_test(NAME fuzz_loc_corpus
+             COMMAND fuzz_loc
+             ${CMAKE_CURRENT_SOURCE_DIR}/corpus/loc -runs=0)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
+endif()
+
+if(TARGET moq-cmaf)
+    add_executable(fuzz_cmaf fuzz_cmaf.c)
+    target_link_libraries(fuzz_cmaf PRIVATE moq::cmaf)
+    target_compile_options(fuzz_cmaf PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_cmaf PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_cmaf_smoke
+             COMMAND fuzz_cmaf -runs=1 -max_len=0)
+    add_test(NAME fuzz_cmaf_corpus
+             COMMAND fuzz_cmaf
+             ${CMAKE_CURRENT_SOURCE_DIR}/corpus/cmaf -runs=0)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
+endif()
+
+if(TARGET moq-msf)
+    add_executable(fuzz_msf fuzz_msf.c)
+    target_link_libraries(fuzz_msf PRIVATE moq::msf)
+    if(TARGET moq-media-object AND TARGET moq-cmaf)
+        target_compile_definitions(fuzz_msf PRIVATE MOQ_FUZZ_MSF_HAS_MEDIA=1)
+    endif()
+    target_compile_options(fuzz_msf PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_msf PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_msf_smoke
+             COMMAND fuzz_msf -runs=1 -max_len=0)
+    add_test(NAME fuzz_msf_corpus
+             COMMAND fuzz_msf
+             ${CMAKE_CURRENT_SOURCE_DIR}/corpus/msf -runs=0)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
 endif()
 
 # Smoke tests: single-iteration startup validation.
@@ -96,18 +172,28 @@ add_test(NAME fuzz_kvp_decode_smoke
          COMMAND fuzz_kvp_decode -runs=1 -max_len=0)
 add_test(NAME fuzz_control_d16_smoke
          COMMAND fuzz_control_d16 -runs=1 -max_len=0)
+add_test(NAME fuzz_control_d18_smoke
+         COMMAND fuzz_control_d18 -runs=1 -max_len=0)
 add_test(NAME fuzz_session_control_smoke
          COMMAND fuzz_session_control -runs=1 -max_len=0)
 add_test(NAME fuzz_session_data_smoke
          COMMAND fuzz_session_data -runs=1 -max_len=0)
+add_test(NAME fuzz_session_d18_smoke
+         COMMAND fuzz_session_d18 -runs=1 -max_len=0)
 
-# Non-empty corpus smoke: prove the session targets reach the parser.
+# Non-empty corpus smoke: prove the targets reach the parser.
+add_test(NAME fuzz_control_d18_corpus
+         COMMAND fuzz_control_d18
+         ${CMAKE_CURRENT_SOURCE_DIR}/corpus/control_d18 -runs=0)
 add_test(NAME fuzz_session_control_corpus
          COMMAND fuzz_session_control
          ${CMAKE_CURRENT_SOURCE_DIR}/corpus/session_control -runs=0)
 add_test(NAME fuzz_session_data_corpus
          COMMAND fuzz_session_data
          ${CMAKE_CURRENT_SOURCE_DIR}/corpus/session_data -runs=0)
+add_test(NAME fuzz_session_d18_corpus
+         COMMAND fuzz_session_d18
+         ${CMAKE_CURRENT_SOURCE_DIR}/corpus/session_d18 -runs=0)
 
 message(STATUS
     "Fuzz targets: ${_fuzz_target_count} targets, "

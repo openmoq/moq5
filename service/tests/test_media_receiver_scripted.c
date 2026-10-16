@@ -341,7 +341,7 @@ int main(void)
     }
 
     /* Drain media objects. Each must be the exact moqx-style frame payload, and
-     * -- the contract this fix establishes -- carry NO capture timestamp
+     * -- per the receiver's contract -- carry NO capture timestamp
      * (has_capture_time == false), since the scripted objects have no LOC
      * extension. */
     int objects = 0;

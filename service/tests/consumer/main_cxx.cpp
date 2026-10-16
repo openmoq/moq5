@@ -13,6 +13,14 @@
 
 #include <cstddef>
 
+static moq_tls_certificate_verdict_t consumerVerifyCertificate(
+    void *ctx, moq_bytes_t serverName,
+    const moq_bytes_t *certificates, std::size_t certificateCount)
+{
+    (void)ctx; (void)serverName; (void)certificates; (void)certificateCount;
+    return MOQ_TLS_CERTIFICATE_REJECT;
+}
+
 int main()
 {
     /* The pointer-only endpoint init stamps the FROZEN v0 prefix (the
@@ -26,14 +34,21 @@ int main()
     if (ec.struct_size != sizeof(moq_endpoint_cfg_t))
         return 1;
     /* The appended tail fields are reachable from C++ through the same public
-     * headers: both default to their zero value (no selection / the backend's
-     * own handshake value) and both are assignable. */
+     * headers: defaults are zero/no pointers, and assignable fields remain
+     * assignable after the SETUP-token tail was inserted before trust. */
     if (ec.wt_profile != static_cast<uint32_t>(MOQ_WT_PROFILE_BACKEND_DEFAULT))
         return 1;
     if (ec.handshake_timeout_us != 0)
         return 1;
+    if (ec.setup_auth_tokens != nullptr || ec.setup_auth_token_count != 0)
+        return 1;
     ec.handshake_timeout_us = 5000000ull;
     if (ec.handshake_timeout_us != 5000000ull)
+        return 1;
+    if (ec.verify_certificate != nullptr || ec.verify_certificate_ctx != nullptr)
+        return 1;
+    ec.verify_certificate = consumerVerifyCertificate;
+    if (ec.verify_certificate != consumerVerifyCertificate)
         return 1;
 
     moq_media_receiver_cfg_t rcfg;

@@ -375,7 +375,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G2. ABORT_BIDI_STREAM dispatch: native op vs fallback ========= *
+    /* == G.2. ABORT_BIDI_STREAM dispatch: native op vs fallback ========= *
      *  The whole-request abort must produce EQUIVALENT bridge state on a
      *  native abort_stream endpoint and on the reset+stop fallback: the
      *  stream is deactivated once, and the peer-visible teardown carries
@@ -457,7 +457,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G3. Fallback pending state: WOULD_BLOCK before either half ==== */
+    /* == G.3. Fallback pending state: WOULD_BLOCK before either half ==== */
     {
         uc_fixture_t f;
         HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
@@ -505,7 +505,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G4. Fallback pending state: WOULD_BLOCK after the RESET half === *
+    /* == G.4. Fallback pending state: WOULD_BLOCK after the RESET half === *
      *  The accepted RESET must NOT be re-sent when the STOP unblocks. */
     {
         uc_fixture_t f;
@@ -553,7 +553,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G5. Partial runtime failure is fatal, never rolled back ======== */
+    /* == G.5. Partial runtime failure is fatal, never rolled back ======== */
     {
         uc_fixture_t f;
         HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
@@ -586,7 +586,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G6. Old-prefix struct_size: abort_stream NOT read; fallback used *
+    /* == G.6. Old-prefix struct_size: abort_stream NOT read; fallback used *
      *  An ops struct declaring a struct_size that predates abort_stream
      *  must never have the field dereferenced — HAS_FIELD gates it, and
      *  the bridge uses the reset+stop fallback. */
@@ -631,7 +631,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G7. Discard: late bytes during NATIVE abort WOULD_BLOCK ======== *
+    /* == G.7. Discard: late bytes during NATIVE abort WOULD_BLOCK ======== *
      *  Before the abort op is accepted, late peer bytes must be absorbed
      *  (no fresh ref, not fatal). Terminal input then retires it. */
     {
@@ -681,7 +681,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G8. Discard: late bytes during fallback AFTER reset, before stop *
+    /* == G.8. Discard: late bytes during fallback AFTER reset, before stop *
      *  and after an accepted abort (peer RESET retires). */
     {
         uc_fixture_t f;
@@ -738,7 +738,7 @@ int main(void)
         uc_destroy(&f);
     }
 
-    /* == G9. STOP_SENDING is NOT a terminal receive-side signal ======== *
+    /* == G.9. STOP_SENDING is NOT a terminal receive-side signal ======== *
      *  After abort, a peer STOP only asks us to stop OUR send half; the
      *  peer may keep sending. The discard mapping must survive STOP, keep
      *  discarding late bytes, and retire only on a full terminal. */

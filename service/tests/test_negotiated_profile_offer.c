@@ -1,5 +1,5 @@
 /*
- * Negotiated-profile substrate (Step 5): the ENDPOINT-OFFER half of the
+ * Negotiated-profile substrate: the ENDPOINT-OFFER half of the
  * future-draft drift gate.
  *
  * The declared transport rows carry three INDEPENDENT facts -- profile

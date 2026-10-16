@@ -3,10 +3,10 @@
 # validate_git_ref.sh - validate an UNTRUSTED git ref (a workflow_dispatch
 # input) before it is used as a `git clone --branch` argument.
 #
-# Security report finding #11 (MOQ-WORKFLOW-DISPATCH-INJECTION): a manual ref
+# MOQ-WORKFLOW-DISPATCH-INJECTION: a manual ref
 # input is interpolated by GitHub expression substitution BEFORE Bash parses the
 # script, so a ref containing quotes, newlines, command substitutions, or shell
-# metacharacters can become shell source in a package-writing job. The fix keeps
+# metacharacters can become shell source in a package-writing job. The workflow keeps
 # the ref as DATA (a step-level `env:` value expanded only as "$REF") and rejects
 # anything that is not a plain branch/tag/SHA-shaped token here, before GHCR
 # login and before any package write.

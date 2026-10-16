@@ -200,6 +200,34 @@ typedef struct moq_session_cfg {
      * stays ESTABLISHED. 0 selects the library default (4096). Read only when
      * struct_size covers this field; older callers get the default. */
     uint32_t           max_namespace_suffixes_per_subscription;
+
+    /*
+     * Reserved: the 4 bytes of tail padding the layout that ended at
+     * max_namespace_suffixes_per_subscription left before its old sizeof on
+     * ABIs that align this struct to 8 bytes. setup_auth_tokens is placed AFTER
+     * this slot so its struct_size gate lands at or past that old sizeof on
+     * every ABI. This field must never become a readable config field.
+     */
+    uint32_t           _reserved_setup_auth;
+
+    /* Appended (ABI-additive): authorization tokens this side presents in
+     * its SETUP, the AUTHORIZATION TOKEN Setup Option (draft-18 §10.3.1.4) or
+     * setup parameter (draft-16 §9.3.1.5), which the peer can use to
+     * authorize the session. Each is sent by value: nothing can be
+     * registered before the session exists. The tokens and their values are
+     * copied by moq_session_create; the caller's storage need not outlive
+     * the call. At most 16 tokens, each token_type at most 2^62-1 and each value at
+     * most 65535 bytes, and together they must fit the setup message
+     * (MOQ_ERR_INVAL at create otherwise). Read only when struct_size covers
+     * setup_auth_token_count; older callers send none.
+     *
+     * Send-arena rule: the SETUP is queued in the send arena
+     * (send_buffer_size) when the session starts, and each token takes its
+     * value plus up to 32 bytes there, beside the other setup fields. The
+     * facades that carry these tokens check that rule when they are created,
+     * so a set that cannot be queued fails there rather than at start. */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t                  setup_auth_token_count;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus
@@ -2178,7 +2206,10 @@ MOQ_API void moq_accept_fetch_cfg_init(moq_accept_fetch_cfg_t *cfg);
 /*
  * Accept an incoming fetch (publisher side). Advancing call.
  * Queues a positive response and opens the fetch data stream.
- * If cfg->empty is true, the data stream is opened with FIN set.
+ * If cfg->empty is true, the data stream is opened with FIN set and the fetch
+ * is finished: the handle is retired, and on draft-18 the acceptance also
+ * ends the local half of the request stream with FIN (see
+ * moq_session_end_fetch).
  */
 MOQ_API moq_result_t moq_session_accept_fetch(
     moq_session_t *s,
@@ -2277,6 +2308,16 @@ MOQ_API bool moq_session_supports_fetch_datagram(const moq_session_t *s);
 /*
  * Close the fetch data stream with FIN. Publisher side. Advancing call.
  * Frees the fetch entry after queuing the final action.
+ *
+ * On draft-18, where the FETCH travels on its own request stream, the same
+ * commit also FINs the local half of that stream: the response is complete,
+ * so the stream has nothing left to carry. The fetcher's later FIN or RESET of
+ * its own half is absorbed as the ordinary end of the stream. A LibMoQ fetcher
+ * FINs its half once it holds both the acceptance and the end of the data
+ * stream. Every required action (and, while the fetcher's half is still open,
+ * the drain slot that absorbs its terminal) is reserved first:
+ * MOQ_ERR_WOULD_BLOCK leaves the fetch and the queued output unchanged, so the
+ * call is retried as is.
  */
 MOQ_API moq_result_t moq_session_end_fetch(
     moq_session_t *s,

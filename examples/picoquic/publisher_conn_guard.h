@@ -3,7 +3,7 @@
  * picoquic publisher example. Example support ONLY: header-only, example-local,
  * not installed, not part of any public API.
  *
- * Security report finding #9 (MOQ-EXAMPLE-PICOQUIC-CONNECTION-CONFUSION): the
+ * MOQ-EXAMPLE-PICOQUIC-CONNECTION-CONFUSION: the
  * simple publisher is singleton state -- one session/adapter/publisher/track,
  * bound to the FIRST connection. Its callback must therefore drive the adapter
  * ONLY from that owning connection; a second connection's callbacks must never

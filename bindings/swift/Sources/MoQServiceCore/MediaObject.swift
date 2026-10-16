@@ -51,7 +51,7 @@ public final class MediaObject: @unchecked Sendable {
 
     /// The decodable media bytes, copied: the RAW/LOC payload, or the CMAF
     /// mdat slice. Prefer ``withUnsafeMediaBytes(_:)`` (or the CoreMedia
-    /// helpers, in the bridge slice) to avoid the copy.
+    /// helpers in the C bridge) to avoid the copy.
     public var mediaData: Data {
         withUnsafeMediaBytes { Data($0) }
     }

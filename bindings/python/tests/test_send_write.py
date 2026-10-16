@@ -1,19 +1,16 @@
-"""The Python media-write slice: SendObject, WriteOutcome, Sender.write.
+"""The Python media-write surface: SendObject, WriteOutcome, Sender.write.
 
-These rows were written RED, against a surface that did not exist, and every
-one of them failed by a NAMED missing behaviour rather than skipping. The
-surface exists now and they pass. The gate that made that meaningful is kept
-rather than removed: a missing or inert name is still a named failure, the
-substrate rows still execute the oracles on their own, and the controls still
-prove that this file's own machinery discriminates.
+Every row fails by a NAMED missing behaviour rather than skipping: a missing
+or inert name is a named failure, the substrate rows execute the oracles on
+their own, and the controls prove that this file's own machinery
+discriminates.
 
 Scope: one object submission. No end_track, stats, demand, wait,
 request_complete, graceful finish, examples or runtime. No registry, callbacks
 or asyncio. Nothing here retries, and nothing ends or removes a track on an
 error or on collection.
 
-The contract this file encodes, re-derived from the current sources and the
-local specs rather than from the obsolete sketches in 1891-1893:
+The contract this file encodes, from the sources and the local specs:
 
   moq_media_send_object_t   service/include/moq/media_sender.h:426-470
       struct_size; payload REQUIRED; properties is the CMAF passthrough block
@@ -595,7 +592,7 @@ class WriteGatedBase(WriteFixtureBase):
     before the row acquires an endpoint."""
 
     def require_surface(self):
-        # Kept after GREEN: an inert or removed name must still fail by name,
+        # An inert or removed name must fail by name,
         # which is what the inert-surface control exercises.
         missing = missing_surface()
         if missing:
@@ -1659,7 +1656,7 @@ class WriteSignalBoundaryTests(WriteGatedBase):
     def test_c_acceptance_is_never_retried(self):
         self.require_surface()
         # Blind retry is prohibited: a second write is a NEW object. There is
-        # no receipt API and no statistics in this slice, so a caller that
+        # no delivery-receipt API, so a caller that
         # cannot tell whether acceptance happened has no way to find out, and
         # the binding must not guess on their behalf.
         with self.connect() as endpoint:
@@ -1769,8 +1766,8 @@ class WriteControlTests(unittest.TestCase):
     def test_d_the_signal_child_verdict_discriminates(self):
         """The child's verdict itself, exercised against a scoped stand-in.
 
-        A RED row cannot show that its oracle accepts the right answers and
-        rejects the wrong ones, because its surface is missing. So the four
+        A row whose surface is missing cannot show that its oracle accepts the
+        right answers and rejects the wrong ones. So the four
         answers are fed to the ACTUAL child helper through a temporary
         adapter over the substrate driver: no write bridge, no product change,
         and the stand-in is removed again here.
@@ -1866,9 +1863,8 @@ class WriteControlTests(unittest.TestCase):
         self.assertEqual(len(entered), 2, "both iterations did not execute")
 
     def test_c_the_bridge_is_present_and_callable(self):
-        # This row was the RED gate's "the bridge is absent" assertion. The
-        # bridge exists now, so it pins presence and callability instead --
-        # and that a wrong-typed call is refused rather than crashing.
+        # Pins the bridge's presence and callability, and that a wrong-typed
+        # call is refused rather than crashing.
         missing = tuple(n for n in BRIDGE if not hasattr(_native, n))
         self.assertEqual(missing, (), f"the write bridge lost {missing}")
         for name in BRIDGE:

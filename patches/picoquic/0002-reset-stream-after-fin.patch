@@ -1,0 +1,165 @@
+Let a local stream be reset after its FIN is sent, until the FIN is ACKed.
+
+RFC 9000 Section 3.1 allows RESET_STREAM in the "Data Sent" state: the FIN
+has been sent but not every byte and the FIN are acknowledged. Upstream
+refuses that reset, because its "already closed" check reads fin_offset,
+which is set only from received frames. The draft-18 subgroup
+DELIVERY_TIMEOUT needs this reset.
+
+- picoquic_reset_stream_at refuses only when no reset is pending and the
+  sent bytes and FIN are all acknowledged (sent_offset), the terminal
+  "Data Recvd" state, with PICOQUIC_ERROR_STREAM_ALREADY_CLOSED. It clears
+  the application stream context only when it accepts the reset, so a
+  refused reset leaves the stream as it was.
+- An ACK of an empty non-FIN STREAM frame records nothing, instead of
+  underflowing to a SACK range that covers the whole stream.
+- A received RESET_STREAM_AT whose Reliable Size exceeds its Final Size
+  closes the connection with FRAME_ENCODING_ERROR, as
+  draft-ietf-quic-reliable-stream-reset Section 4 requires.
+- A reset stream retires only once its reset and its reliable prefix are
+  both acknowledged (picoquic_is_stream_acked). A FIN sent before the reset
+  may already have closed the stream, so closure alone does not guarantee the
+  prefix; without this a reset ACK that arrives first retires the stream and
+  the prefix is never repeated.
+- The acknowledgement of a RESET_STREAM_AT then retires the stream through
+  that rule. Upstream also required consumed_offset >= reliable_size, but
+  consumed_offset counts received bytes, so a local stream whose reliable
+  prefix was acknowledged before the reset never retired.
+- On the receiving side, the chunk that completes the reliable prefix of a
+  received RESET_STREAM_AT is delivered (its bytes below the Reliable Size)
+  before the reset is signalled; upstream signalled the reset instead of
+  delivering it. A failed data callback fails the connection and suppresses
+  the reset event. Once the reset is signalled, nothing more is delivered on
+  that stream.
+
+Upstream already queues RESET_STREAM and RESET_STREAM_AT as soon as the
+reset is accepted, frees the unsent send queue, refuses a Reliable Size
+above the bytes sent with PICOQUIC_ERROR_OFFSET_TOO_BIG, and routes ACKs of
+RESET_STREAM_AT to the retirement handler; this patch keeps those rules.
+
+Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6.
+Tests: adapters/picoquic/tests/test_pq_reset_after_fin.c (CTest
+pq_reset_after_fin), with constructed stream/SACK rows and packet rows over
+the simulated links.
+
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index a3cb9860..1231cb27 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -97,7 +97,10 @@ int picoquic_is_stream_acked(picoquic_stream_head_t* stream)
+ 
+     if (stream->is_closed) {
+         if (stream->reset_sent) {
+-            is_acked = stream->reset_acked;
++            /* A reliable reset also needs its prefix acknowledged. The FIN may
++             * have closed the stream before the reset was requested, so
++             * closure alone does not imply that. */
++            is_acked = stream->reset_acked && picoquic_reliable_prefix_is_acked(stream);
+         } 
+         else {
+         /* Check whether the ack was already received, including the FIN bit */
+@@ -503,6 +506,12 @@ const uint8_t* picoquic_decode_reset_stream_at_frame(picoquic_cnx_t* cnx, const
+             picoquic_frame_type_reset_stream);
+         bytes = NULL;
+     }
++    else if (reliable_size > final_offset) {
++        /* draft-ietf-quic-reliable-stream-reset Section 4 */
++        picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_FRAME_FORMAT_ERROR,
++            picoquic_frame_type_reset_stream_at);
++        bytes = NULL;
++    }
+     else {
+         bytes = picoquic_apply_reset_stream_frame(cnx, bytes, error_code_64, stream_id, final_offset, reliable_size);
+     }
+@@ -537,10 +546,12 @@ int picoquic_process_ack_of_reset_stream_at_frame(picoquic_cnx_t* cnx, const uin
+             reliable_size == stream->reliable_size) {
+             /* mark reset as acked by peer */
+             stream->reset_acked = 1;
+-            /* Delete stream if closed. */
+-            if (stream->consumed_offset >= stream->reliable_size) {
+-                (void)picoquic_delete_stream_if_closed(cnx, stream);
+-            }
++            /* Delete stream if closed and acknowledged. picoquic_is_stream_acked
++             * keeps a reliable reset until its prefix is acknowledged, so a
++             * prefix acknowledged before the reset retires the stream here,
++             * and one acknowledged later retires it from the stream ACK.
++             * (consumed_offset counts received bytes, not sent ones.) */
++            (void)picoquic_delete_stream_if_closed(cnx, stream);
+         }
+     }
+     return ret;
+@@ -1255,12 +1266,33 @@ static void picoquic_stream_data_chunk_callback(picoquic_cnx_t* cnx, picoquic_st
+ {
+     picoquic_call_back_event_t fin_now = picoquic_callback_stream_data;
+     int call_back_needed = data_length > 0;
++    uint64_t previous_offset = stream->consumed_offset;
+ 
+     stream->consumed_offset += data_length;
+     cnx->data_received += data_length;
+ 
+-    if (stream->reset_received && !stream->reset_signalled && stream->consumed_offset >= stream->reset_offset) {
+-        picoquic_signal_stream_reset(cnx, stream);
++    if (stream->reset_received && stream->reset_signalled) {
++        /* Nothing past a signalled reset reaches the application. */
++    }
++    else if (stream->reset_received && stream->consumed_offset >= stream->reset_offset) {
++        /* This chunk completes the reliable prefix of a received
++         * RESET_STREAM_AT: deliver its bytes below reset_offset, then signal
++         * the reset (draft-ietf-quic-reliable-stream-reset Section 4). */
++        size_t prefix_length = (size_t)(stream->reset_offset - previous_offset);
++        if (previous_offset < stream->reset_offset && !stream->stop_sending_requested && !stream->is_discarded &&
++            cnx->callback_fn(cnx, stream->stream_id, (uint8_t*)bytes, prefix_length,
++                picoquic_callback_stream_data, cnx->callback_ctx, stream->app_stream_ctx) != 0) {
++            /* As for any failed data callback: the connection fails, and the
++             * application gets no further event for this stream. */
++            picoquic_log_app_message(cnx, "Data callback (%d, l=%zu) on stream %" PRIu64 " returns error 0x%x",
++                picoquic_callback_stream_data, prefix_length, stream->stream_id,
++                PICOQUIC_TRANSPORT_INTERNAL_ERROR);
++            picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0);
++            stream->reset_signalled = 1;
++        }
++        else {
++            picoquic_signal_stream_reset(cnx, stream);
++        }
+     }
+     else {
+         if (stream->consumed_offset >= stream->fin_offset && stream->fin_received && !stream->fin_signalled) {
+@@ -3613,7 +3645,9 @@ int picoquic_process_ack_of_stream_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
+ 
+         /* record the ack range for the stream */
+         stream = picoquic_find_stream(cnx, stream_id);
+-        if (stream != NULL) {
++        /* An empty frame without FIN acknowledges nothing; recording it would
++         * underflow to a range that covers the whole stream. */
++        if (stream != NULL && (data_length != 0 || fin)) {
+             (void)picoquic_update_sack_list(&stream->sack_list,
+                 offset, offset + data_length - ((fin) ? 0 : 1), 0);
+ 
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index c7e8fe5c..4df50160 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -459,8 +459,12 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
+     else {
+-        stream->app_stream_ctx = NULL;
+-        if (stream->fin_sent && picoquic_check_sack_list(&stream->sack_list, 0, stream->fin_offset) == 0) {
++        /* RFC 9000 Section 3.1: a reset is allowed in "Data Sent", after the
++         * FIN is sent. Only "Data Recvd", every byte and the FIN acknowledged,
++         * is terminal. sent_offset is the final size of a local send stream;
++         * fin_offset is set only from received frames. */
++        if (!stream->reset_requested && stream->fin_sent &&
++            picoquic_check_sack_list(&stream->sack_list, 0, stream->sent_offset) != 0) {
+             ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+         }
+         else if (!stream->reset_requested) {
+@@ -468,6 +472,8 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+                 ret = PICOQUIC_ERROR_OFFSET_TOO_BIG;
+             }
+             else {
++                /* Only an accepted reset releases the application context. */
++                stream->app_stream_ctx = NULL;
+                 stream->reliable_size = reliable_size;
+                 stream->local_error = local_stream_error;
+                 stream->reset_requested = 1;

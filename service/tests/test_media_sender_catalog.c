@@ -1,5 +1,5 @@
 /*
- * White-box tests for the sender's catalog-content model (S1): the catalog the
+ * White-box tests for the sender's catalog-content model: the catalog the
  * sender would publish after post-ready add/remove mutations. Deterministic,
  * no network -- it pins coalescing (multiple mutations reflected in one build)
  * and the no-op dedup (an add+remove that nets to no change resolves to the same
@@ -858,8 +858,8 @@ int main(void)
         }
 
         /* The receiver-effective catalog must show v converted to VOD and the
-         * coalesced add present. Pre-fix the delta path omitted the conversion,
-         * leaving v live with no trackDuration. */
+         * coalesced add present. A delta path that omitted the conversion would
+         * leave v live with no trackDuration. */
         const moq_msf_track_t *vt = NULL, *lt = NULL;
         for (size_t i = 0; i < eff.track_count; i++) {
             if (eff.tracks[i].name.len == 1 &&

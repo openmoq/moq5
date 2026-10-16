@@ -1361,7 +1361,7 @@ static size_t build_rows(row_t *rows)
 
 /*
  * The absolute half of the work image. Configured-capacity counters stay
- * RELATIONAL (the comparator) so no post-fix constant is baked in; everything
+ * RELATIONAL (the comparator) so no fixed capacity constant is baked in; everything
  * else -- charged transitions, deferred owners encountered, every non-capacity
  * loop site and both control loops -- is DECLARED per phase from the fixture's
  * live set and checked exactly.
@@ -3677,8 +3677,8 @@ static int run_case_entry(const caps_t *c, uint32_t seed, phase_t *ph,
 /*
  * PRODUCER COVERAGE. Every configured-capacity site must perform nonzero
  * declared work in at least one fixture. Removing a site's increment therefore
- * fails this assertion in BOTH binaries -- it is not merely a change in RED
- * prose, which is what the earlier "M2-M5 kill" claim wrongly rested on.
+ * fails this assertion in BOTH binaries, not merely a change in the failure
+ * prose.
  */
 static work_t g_producer_seen;
 

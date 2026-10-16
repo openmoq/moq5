@@ -148,7 +148,7 @@ if(TARGET moq::sim)
     add_executable(test_session_rx_admission unit/test_session_rx_admission.c)
     target_link_libraries(test_session_rx_admission PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_rx_admission COMMAND test_session_rx_admission)
-    # Core contract RED: a cancelling fetcher must absorb the late response
+    # Core contract: a cancelling fetcher must absorb the late response
     # stream (STOP at the header, discard the bytes already behind it).
     add_executable(test_session_fetch_cancel_late_bytes unit/test_session_fetch_cancel_late_bytes.c)
     target_link_libraries(test_session_fetch_cancel_late_bytes PRIVATE moq::core moq::sim)
@@ -158,7 +158,7 @@ if(TARGET moq::sim)
     add_executable(test_session_rx_stopped_stream unit/test_session_rx_stopped_stream.c)
     target_link_libraries(test_session_rx_stopped_stream PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_rx_stopped_stream COMMAND test_session_rx_stopped_stream)
-    # Former attribution RED: no-entry input is now retained by the caller,
+    # No-entry input is retained by the caller,
     # then replayed before the late FETCH_OK with exactly one completion.
     add_test(NAME session_rx_stopped_stream_replay COMMAND test_session_rx_stopped_stream --replay)
 endif()
@@ -171,6 +171,20 @@ add_test(NAME bridge_required_hold COMMAND test_bridge_required_hold)
 target_link_libraries(test_bridge_hold_input PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_hold_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME bridge_hold_input COMMAND test_bridge_hold_input)
+# FETCH and TRACK_STATUS request-stream lifecycle through two real bridges,
+# draft-16 controls and draft-18 rows: completion closes both halves, late
+# peer terminals and reordering are ordinary input, pressure is retried.
+add_executable(test_bridge_request_lifecycle unit/test_bridge_request_lifecycle.c)
+target_link_libraries(test_bridge_request_lifecycle PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_request_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_request_lifecycle COMMAND test_bridge_request_lifecycle)
+# SETUP authorization tokens (moq_session_cfg_t.setup_auth_tokens) on both
+# profiles through two real bridges: delivery by value, owned copy, refusals,
+# older cfg layouts, credential wiping and the draft-18 option codec.
+add_executable(test_session_setup_tokens unit/test_session_setup_tokens.c)
+target_link_libraries(test_session_setup_tokens PRIVATE moq-core-test-internals)
+target_include_directories(test_session_setup_tokens PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME session_setup_tokens COMMAND test_session_setup_tokens)
 # Receive-capacity saturation through the real bridge over fake endpoints:
 # fill receive entries, retain later deliveries, and replay after capacity
 # returns. No request loses its response or receives a fabricated terminal.
@@ -301,6 +315,12 @@ add_test(NAME namespace_cardinality COMMAND test_namespace_cardinality)
 add_executable(test_d18_fetch unit/test_d18_fetch.c)
 target_link_libraries(test_d18_fetch PRIVATE moq-core-test-internals)
 add_test(NAME d18_fetch COMMAND test_d18_fetch)
+
+if(TARGET moq::sim)
+    add_executable(test_request_stop_lifetime unit/test_request_stop_lifetime.c)
+    target_link_libraries(test_request_stop_lifetime PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME request_stop_lifetime COMMAND test_request_stop_lifetime)
+endif()
 
 add_executable(test_priority_layout unit/test_priority_layout.c)
 target_link_libraries(test_priority_layout PRIVATE moq::core)
@@ -609,7 +629,7 @@ endif()
 # is the shared core (PRNG, env, replay, counting allocator); each format's
 # generator+oracle is its own TU so a runner links only the libs it exercises.
 # Binary name is test_${runner} so future run_seed_sweeps.sh integration is
-# drop-in. Generate-only (byte mutation is a later slice).
+# drop-in. Generate-only: the runners do not mutate bytes.
 if(TARGET moq::loc)
     add_executable(test_scenario_media_loc
         scenario/test_scenario_media_loc.c
@@ -662,11 +682,12 @@ if(BUILD_SHARED_LIBS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_bridge_symbols.cmake)
 endif()
 
-# -- Negotiated-profile substrate (step 5) ---------------------------
+# -- Negotiated-profile substrate ------------------------------------
 #
-# Four roles, kept apart on purpose (0659/0661): the PURE ORACLE re-derives the
+# Four roles, kept apart on purpose: the PURE ORACLE re-derives the
 # draft encodings with libc only, the tables/corpus declare the topology, and
-# the future scripted builder / product adapter / closure runner are staged.
+# the scripted builder / product adapter / closure runner roles are declared
+# in cmake/check_np_roles.cmake.
 # The oracle+tables+corpus objects are built ONCE here and reused by the C++
 # reader test, so the C parser is the single parser.
 # Role 1 gets its OWN object library: the policy check scans exactly this

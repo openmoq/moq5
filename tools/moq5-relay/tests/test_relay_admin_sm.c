@@ -127,7 +127,7 @@ fx_drain(fixture_t *f, uint32_t c, char *out, size_t cap, uint64_t now)
     return total;
 }
 
-/* Settle every owed release the way Step 4 does: peek, "broker accepts", ack. */
+/* Settle every owed release the way the owner does: peek, "broker accepts", ack. */
 static uint32_t
 fx_tokens(fixture_t *f, moqr_admin_release_t *out, uint32_t cap)
 {

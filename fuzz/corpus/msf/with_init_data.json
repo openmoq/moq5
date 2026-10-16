@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "tracks": [
+    {
+      "name": "video",
+      "packaging": "loc",
+      "isLive": true,
+      "role": "video",
+      "codec": "avc1.42e01e",
+      "width": 1280,
+      "height": 720,
+      "initData": "AAAB"
+    }
+  ]
+}

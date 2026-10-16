@@ -25,7 +25,7 @@
  * peer session at the same draft, so a draft-18 failure cannot be a malformed
  * envelope or a broken fixture: object 0 travels the same stream and surfaces.
  *
- * Public API only, before the fix and after it.
+ * Public API only.
  */
 #include <moq/media_receiver.h>
 #include <moq/session.h>
@@ -43,7 +43,7 @@ static int failures = 0;
 
 static const uint64_t k_capture_us[2] = { 33, 33333 };
 static const bool     k_independent[2] = { true, false };
-static const char    *k_payload[2] = { "R0", "R1" };
+static const char    *k_payload[2] = { "P0", "P1" };
 
 static size_t build_block(np_enc_t enc, size_t i, uint8_t *out, size_t cap)
 {
@@ -110,7 +110,7 @@ static void run(moq_version_t version, const char *label)
 
     /* The scripted bytes really were admitted by the peer session at the
      * negotiated draft: a refusal here would mean the FIXTURE was malformed
-     * for that draft, which is a different finding from a decoder defect. */
+     * for that draft, which is a different failure from a decoder defect. */
     MOQ_TEST_CHECK_EQ_INT((int)res.version_before_first_write, (int)version);
     MOQ_TEST_CHECK_EQ_INT((int)res.state_before_first_write,
                           (int)MOQ_SESS_ESTABLISHED);

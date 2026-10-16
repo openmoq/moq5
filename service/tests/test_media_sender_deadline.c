@@ -56,7 +56,8 @@ static int failures = 0;
 /* Captured failure identities, for the perturbation arms only. */
 static bool g_capture;
 /* Fixture-local mutant switch: when set, cleanup follows the DECLARED
- * expectation instead of the actual result -- the behaviour 1904 removed.
+ * expectation instead of the actual result -- the unsafe rule the product
+ * must not follow.
  * Used only by an isolated sanitizer child control. */
 static bool g_expectation_driven_cleanup;
 static char g_captured[16][128];
@@ -563,12 +564,12 @@ static void test_c9_cmaf_properties_ownership(void)
     run_vector(&v);
 }
 
-/* -- RED vectors ----------------------------------------------------------- */
+/* -- clock and wait failure vectors --------------------------------------- */
 static void test_d1_initial_clock_read_failure(void)
 {
     /* The FIRST clock read fails. A correct implementation stops there: one
-     * clock call, no wait. The extra entries exist only so today's product,
-     * which ignores the failure, still terminates. */
+     * clock call, no wait. The extra entries exist only so an implementation
+     * that ignores the failure still terminates. */
     vector_t v = {
         .what = "d1.initial_clock_read_failure",
         .timeout_us = 1000000,
@@ -599,8 +600,8 @@ static void test_d2_slice_clock_read_failure(void)
 static void test_d3_unexpected_wait_error(void)
 {
     /* The wait returns EINVAL: a correct implementation returns INTERNAL after
-     * exactly one wait. Today it ignores the code and iterates again, which the
-     * exact call counts report by name. */
+     * exactly one wait. An implementation that ignores the code and iterates
+     * again is reported by name through the exact call counts. */
     vector_t v = {
         .what = "d3.unexpected_wait_error",
         .timeout_us = 1000000,
@@ -1062,7 +1063,7 @@ int main(int argc, char **argv)
         return run_guard_child();
     if (argc == 3 && strcmp(argv[1], "--control") == 0 &&
         strcmp(argv[2], "old-cleanup") == 0) {
-        /* Restores the cleanup rule 1904 removed (release by the DECLARED
+        /* Applies the unsafe cleanup rule (release by the DECLARED
          * expectation) and runs the p5 vector, whose declaration says refusal
          * while the write really succeeds. The caller's reference is then
          * released although the queue owns it, so the sender's teardown and

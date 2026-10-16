@@ -1471,6 +1471,14 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
             } else {
                 out->core.linger_us = x;
             }
+        } else if (strcmp(k, "warm_idle_us") == 0) {
+            uint64_t x = 0;
+            if (!num_u64(e->value, &x)) {
+                cfg_err(err, err_len, "warm_idle_us: need a number");
+                rc = MOQR_ERR_INVAL;
+            } else {
+                out->core.warm_idle_us = x;
+            }
         } else {
             cfg_err(err, err_len, "unknown top-level key");
             rc = MOQR_ERR_INVAL;

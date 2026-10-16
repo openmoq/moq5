@@ -1,6 +1,6 @@
 /*
  * Unit test for examples/common/moq_example_args.h — trailing-option parsing
- * for the service examples (security report finding 8: TLS verify-on default).
+ * for the service examples (TLS verification is on by default).
  * Pure C, no libmoq deps; run under CTest.
  */
 #include "../moq_example_args.h"

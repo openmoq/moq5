@@ -9,13 +9,13 @@
  *
  * Asserts (deterministic, counter/latch based -- no sleeps, no log scraping):
  *   - credit was actually blocked            (block_count > 0)
- *   - the credit-availability callback ran   (grant_count > 0)  <- the fix
+ *   - the credit-availability callback ran   (grant_count > 0)
  *   - every published object is delivered     (server receives all)
  *   - busy-retry is bounded, not per-tick spam (block_count <= bound)
  *
- * Without the fix, the credit-availability callback is not handled
- * (grant_count == 0) and the open is retried on every pump tick
- * (block_count grows without bound) -- both fail this test.
+ * If the credit-availability callback were not handled, grant_count would
+ * stay 0 and the open would be retried on every pump tick (block_count
+ * growing without bound) -- both fail this test.
  *
  * Managed client + test-controlled raw server (the test_managed_loopback
  * pattern, reversed: here the client is the publisher).

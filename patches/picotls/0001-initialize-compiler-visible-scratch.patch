@@ -1,0 +1,43 @@
+Initialize compiler-visible scratch before conditional writes.
+
+Applies to picotls f06553b877ada93c860dd1db9002eabf7365292d.
+GCC Release builds cannot prove that every live curve word is initialized
+before use, or that the cipher-selection assertion succeeded before its
+output is inspected. Keep assertions and warnings enabled; initialize the
+scratch arrays and test output explicitly instead of suppressing diagnostics.
+The corresponding micro-ecc arrays remain unchanged in upstream as audited
+on 2026-10-13. No algorithm, curve geometry, or selection policy changes.
+
+diff --git a/deps/micro-ecc/uECC.c b/deps/micro-ecc/uECC.c
+--- a/deps/micro-ecc/uECC.c
++++ b/deps/micro-ecc/uECC.c
+@@ -799,7 +799,7 @@ static void XYcZ_add(uECC_word_t * X1,
+                      uECC_word_t * Y2,
+                      uECC_Curve curve) {
+     /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+-    uECC_word_t t5[uECC_MAX_WORDS];
++    uECC_word_t t5[uECC_MAX_WORDS] = {0};
+     wordcount_t num_words = curve->num_words;
+ 
+     uECC_vli_modSub(t5, X2, X1, curve->p, num_words); /* t5 = x2 - x1 */
+@@ -830,7 +830,7 @@ static void XYcZ_addC(uECC_word_t * X1,
+                       uECC_word_t * Y2,
+                       uECC_Curve curve) {
+     /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+-    uECC_word_t t5[uECC_MAX_WORDS];
++    uECC_word_t t5[uECC_MAX_WORDS] = {0};
+     uECC_word_t t6[uECC_MAX_WORDS];
+     uECC_word_t t7[uECC_MAX_WORDS];
+     wordcount_t num_words = curve->num_words;
+diff --git a/t/picotls.c b/t/picotls.c
+--- a/t/picotls.c
++++ b/t/picotls.c
+@@ -60,7 +60,7 @@ static void test_select_cipher(void)
+ {
+ #define C(x) ((x) >> 8) & 0xff, (x) & 0xff
+ 
+-    ptls_cipher_suite_t *selected;
++    ptls_cipher_suite_t *selected = NULL;
+ 
+     {
+         ptls_cipher_suite_t *candidates[] = {&ptls_minicrypto_chacha20poly1305sha256, &ptls_minicrypto_aes128gcmsha256, NULL};

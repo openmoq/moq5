@@ -2,8 +2,8 @@
  * Draft-18 OBJECT_DATAGRAM (§11.3.1) + padding datagram (§11.5.2). The whole
  * datagram framework (public send APIs, MOQ_ACTION_SEND_DATAGRAM,
  * moq_session_on_datagram, the MOQ_EVENT_OBJECT_RECEIVED event with a `datagram`
- * flag, and SimPair routing) already exists and is draft-neutral; this slice adds
- * only the D18 wire codec + the two D18 profile ops. Covers: codec round-trips,
+ * flag, and SimPair routing) is draft-neutral; this file covers only the D18
+ * wire codec + the two D18 profile ops. Covers: codec round-trips,
  * the decode reject matrix (invalid types, empty/over-cap properties, bad
  * status/properties combos, unknown status, mandatory track property), padding
  * discard, and SimPair end-to-end delivery (object + status, properties, unknown

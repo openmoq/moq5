@@ -276,7 +276,7 @@ cap_zero_byte_fetches(void)
 }
 
 /* Overflow refuses INVAL at every layer — never an understated ceiling.
- * The core arm is the reviewer-reproduced schema-valid config: 2^20 tracks
+ * The core arm is a schema-valid config: 2^20 tracks
  * with a 2^20-group / 2^20-object / 1 TiB log wraps the per-track product. */
 static int
 cap_overflow_refused(void)

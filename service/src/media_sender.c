@@ -47,7 +47,16 @@
  * supply at least this; appended fields default absent for an older/smaller
  * cfg, and a newer/larger cfg's unknown trailing fields are ignored. */
 #define MEDIA_TRACK_CFG_MIN_SIZE \
-    offsetof(moq_media_track_cfg_t, has_track_duration)
+    MOQ_MEDIA_TRACK_CFG_V0_SIZE
+
+#define MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP \
+    ((offsetof(moq_media_track_cfg_t, alt_group) + \
+      sizeof(((moq_media_track_cfg_t *)0)->alt_group) + \
+      _Alignof(moq_media_track_cfg_t) - 1u) & \
+     ~((size_t)_Alignof(moq_media_track_cfg_t) - 1u))
+_Static_assert(offsetof(moq_media_track_cfg_t, has_publisher_priority) >=
+               MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP,
+               "publisher priority must follow the complete historical layout");
 
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
@@ -120,6 +129,8 @@ struct moq_media_track {
     uint64_t              track_duration_ms;
     bool                  has_alt_group;       /* CMSF §3.2 (switching set) */
     int                   alt_group;
+    bool                  has_publisher_priority;
+    uint8_t               publisher_priority;
     moq_group_order_t     group_order;         /* MOQT 7.1; DEFAULT = none */
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
@@ -193,6 +204,10 @@ struct moq_media_track {
     uint64_t              emit_obj;          /* next object id in emit_group */
     bool                  pending_reset;     /* a drop abandoned emit_group;
                                                 the drain must reset it */
+    bool                  skip_open;         /* a no-demand drop cut skip_group
+                                                short, so the rest of it is
+                                                dropped even once demand returns */
+    uint64_t              skip_group;
 
     /* Per-pass drain scratch (network thread, mu held). Cleared at the top of
      * every sender_drain pass; never observable outside it.
@@ -252,7 +267,7 @@ struct moq_media_track {
      * state above. A media track with emit_media_timeline owns a generated
      * sibling mediatimeline track (media_timeline) with is_media_timeline set,
      * which carries the fields below. Records are explicit §7.1.1 entries stored
-     * directly in codec form; this slice records one per media group-start. */
+     * directly in codec form; the sender records one per media group-start. */
     bool                  is_media_timeline; /* this IS a generated mediatimeline track */
     moq_media_track_t    *media_timeline;    /* media track -> its mediatimeline (else NULL) */
     moq_msf_media_timeline_record_t *mt_recs;
@@ -543,9 +558,8 @@ static moq_bytes_t default_role(moq_media_type_t t)
  * of the negotiated MoQ draft. LOC-02 (the draft-18 KVP profile) is a
  * coordinated future item -- encode, decode, and this selector must move
  * together; this is the single place the sender picks it up. The
- * standard-key validation in write() and the (next slice's) property
- * generation both key off this, so they can never disagree on the
- * profile. */
+ * standard-key validation in write() and any property generation both key
+ * off this, so they can never disagree on the profile. */
 /* Whether the latched draft names a codec the property encoder can use.
  * Zero -- the never-observed value -- is not one of them. */
 static bool sender_version_usable(moq_version_t v)
@@ -1366,7 +1380,7 @@ static void mt_history_append(moq_media_sender_t *s, moq_media_track_t *tl,
  * timeline track's OWN subscriber so it never head-of-line-blocks media (MSF
  * §7.3). Mirrors sender_emit_sap_for: the timeline shares media group ids and
  * each new media-group boundary emits an independent Object 0 carrying ALL
- * retained accessible records through that group. Since this slice records one
+ * retained accessible records through that group. Since the sender records one
  * entry per media group, the incremental branch is not normally exercised, but
  * it is kept for structural parity and safety. Serialization uses the explicit
  * §7.1.1 codec. s->mu held. */
@@ -1603,6 +1617,8 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
         if (!has_sub) {
             if (s->drop_without_demand) {
                 preq_note_dropped(s, t, e);
+                t->skip_group = e->group_seq;
+                t->skip_open = true;
                 /* Arm the wire RESET once per affected track in this pass: an
                  * open wire subgroup just lost its tail and must not be
                  * truncated. */
@@ -1619,6 +1635,17 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             wr++; rd++;
             continue;
         }
+
+        /* Demand arrived inside a group whose head was dropped. Sending the
+         * rest would start the subscriber on a mid-group object numbered 0,
+         * so it waits for the next group start instead. */
+        if (t->skip_open && e->group_seq == t->skip_group) {
+            preq_note_dropped(s, t, e);
+            preq_entry_release(s, e);
+            rd++;
+            continue;
+        }
+        t->skip_open = false;
 
         /* A drop abandoned this track's open group: reset it on the wire
          * before emitting the next (newer) group. */
@@ -1775,6 +1802,9 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
     if (t->is_catalog) {
         tcfg.has_publisher_priority = true;
         tcfg.publisher_priority = 0;
+    } else if (t->has_publisher_priority) {
+        tcfg.has_publisher_priority = true;
+        tcfg.publisher_priority = t->publisher_priority;
     }
     tcfg.default_group_order = t->group_order;
     /* The sender's production is strictly monotonic on every track: media
@@ -2980,12 +3010,19 @@ void moq_media_sender_cfg_init_lossless_sized(moq_media_sender_cfg_t *cfg,
         cfg->block_timeout_us = SENDER_DEFAULT_BLOCK_TIMEOUT_US;
 }
 
-void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg)
+void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg, size_t cfg_size)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    cfg->is_live = true;
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_media_track_cfg_t, is_live) + sizeof(cfg->is_live))
+        cfg->is_live = true;
+}
+
+void (moq_media_track_cfg_init)(moq_media_track_cfg_t *cfg)
+{
+    moq_media_track_cfg_init_sized(cfg, MEDIA_TRACK_CFG_SIZE_THROUGH_ALT_GROUP);
 }
 
 /* -- CMSF content-protection authoring (deep copy) -------------------- *
@@ -4028,6 +4065,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     memcpy(&cfg_local, cfg,
            cfg->struct_size < sizeof(cfg_local) ? cfg->struct_size
                                                 : sizeof(cfg_local));
+    if (cfg->struct_size < offsetof(moq_media_track_cfg_t, publisher_priority) +
+                           sizeof(cfg->publisher_priority)) {
+        cfg_local.has_publisher_priority = false;
+        cfg_local.publisher_priority = 0;
+    }
     cfg_local.struct_size = sizeof(cfg_local);
     cfg = &cfg_local;
     if (cfg->name.len == 0 || !cfg->name.data) return MOQ_ERR_INVAL;
@@ -4158,6 +4200,8 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->track_duration_ms = cfg->track_duration_ms;
     t->has_alt_group = cfg->has_alt_group;
     t->alt_group = cfg->alt_group;
+    t->has_publisher_priority = cfg->has_publisher_priority;
+    t->publisher_priority = cfg->publisher_priority;
     t->group_order = cfg->group_order;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;

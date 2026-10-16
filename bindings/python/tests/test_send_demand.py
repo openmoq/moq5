@@ -4,19 +4,17 @@
     Sender.has_subscriber(track) -> bool
     Sender.has_media_subscriber() -> bool
 
-These rows were written RED, against methods that did not exist, and each
-failed by a NAMED missing behaviour rather than skipping. They exist now and
-the rows pass. The gate is kept: a missing or inert name is still a named
-failure, the substrate rows still drive the ACTUAL native mirrors on their
-own, and the stand-in controls still prove these bodies are satisfiable and
-that they REJECT each named defect.
+Every row fails by a NAMED missing behaviour rather than skipping: a missing
+or inert name is a named failure, the substrate rows drive the ACTUAL native
+mirrors on their own, and the stand-in controls prove these bodies are
+satisfiable and that they REJECT each named defect.
 
 Scope: three INDEPENDENT point-in-time queries. Not events, not callbacks, not
 a cached counter, not an aggregate snapshot, not a readiness poll, not an
 atomic multi-query transaction, and never a promise that a later write will
 have demand.
 
-The contract, re-derived from THIS worktree:
+The contract, from the sources:
 
   service/include/moq/media_sender.h:685-707
       App-thread-safe snapshots that read mirrored counts under the sender's
@@ -267,7 +265,7 @@ class DemandGatedBase(DemandFixtureBase):
     before the row acquires an endpoint."""
 
     def require_surface(self):
-        # Kept after GREEN: an inert or removed name must still fail by name.
+        # An inert or removed name must fail by name.
         missing = missing_surface()
         if missing:
             self.fail("the sender demand surface is not implemented: "
@@ -993,9 +991,8 @@ class DemandControlTests(unittest.TestCase):
                          (1 << (limits()["size_t_width"] * 8 // 2)) - 1)
 
     def test_d_the_bridge_is_present_and_refuses_wrong_arguments(self):
-        # This row was the RED gate's "the bridge is absent" assertion. The
-        # bridge exists now, so it pins presence, callability and that a
-        # wrong-shaped call is refused rather than crashing.
+        # Pins the bridge's presence, callability and that a wrong-shaped
+        # call is refused rather than crashing.
         missing = tuple(n for n in BRIDGE if not hasattr(_native, n))
         self.assertEqual(missing, (), f"the demand bridge lost {missing}")
         for name in BRIDGE:

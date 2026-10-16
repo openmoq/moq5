@@ -352,6 +352,7 @@ typedef struct r_jentry {
     uint16_t echo_unann;   /* pending self-echoes of our own mirror unannounces */
     bool     dirty;        /* candidates changed → reconcile in phase 3 */
     bool     holdout;      /* a local publisher that lost to a remote winner */
+    bool     cap_blocked;  /* mirror install refused for lack of core room */
 } r_jentry;
 
 typedef struct r_ctrl_msg {   /* one namespace's latest net state (coalesced) */
@@ -654,6 +655,10 @@ struct r_mgr {
     moq_alloc_t     alloc;
     uint16_t        shard;
     moqr_core_t    *core;
+    /* Journal entries whose mirror install the core refused for room, and
+     * the core room epoch at the start of the last reconciliation pass. */
+    uint32_t        cap_blocked_count;
+    uint64_t        cap_epoch;
     /* journal: sorted-by-canon array of candidate-set entries (self-echo
      * suppression lives per-entry — see r_jentry echo counters). */
     r_jentry       *jrn;
@@ -1382,6 +1387,20 @@ mgr_reconcile_entry(r_mgr *m, r_jentry *e, uint64_t now_us)
      * occupies the trie node (a late local announce, or this shard is the local
      * loser); stop retrying and hold on NONE (the local publisher is the holdout).
      * WOULD_BLOCK is transient: stay dirty and retry next round. */
+    bool was_blocked = e->cap_blocked;
+    if (e->cap_blocked) {
+        e->cap_blocked = false;
+        m->cap_blocked_count--;
+    }
+    if (desired != R_MIRROR_NONE && was_blocked &&
+        moqr_core_announce_room(m->core, ns) == MOQR_ERR_CAPACITY) {
+        /* Still no room: stay parked without another counted refusal. The
+         * episode was counted once, by the install that first failed. */
+        e->cap_blocked = true;
+        m->cap_blocked_count++;
+        e->dirty = false;
+        return;
+    }
     if (desired != R_MIRROR_NONE) {
         moqr_result_t rc = moqr_core_announce(m->core, m->pb[desired], ns);
         if (rc == MOQR_OK) {
@@ -1391,6 +1410,17 @@ mgr_reconcile_entry(r_mgr *m, r_jentry *e, uint64_t now_us)
             m->journal_epoch++;   /* mirror install */
         } else if (rc == MOQR_ERR_WOULD_BLOCK) {
             return;   /* stay dirty; retry next round */
+        } else if (rc == MOQR_ERR_CAPACITY) {
+            /* The core holds only live namespaces right now. Room appears
+             * only when capacity is released or becomes reclaimable (a
+             * withdrawal, a freed track or reclaimed node), which moves the
+             * core's room epoch, so park the entry until that epoch moves
+             * past this refusal: bounded, no self-wake. Room
+             * that appears is noticed at this shard's next step (any wake);
+             * there is no timer for it. Retries ask moqr_core_announce_room
+             * first, so one parked episode counts one refusal. */
+            e->cap_blocked = true;
+            m->cap_blocked_count++;
         }
         /* else WRONG_STATE / permanent: leave mirror NONE, clear dirty below. */
     }
@@ -1586,6 +1616,19 @@ shard_reconcile(moqr_shards_t *s, uint16_t shard, uint64_t now_us)
     if (m == NULL) {
         return;
     }
+    uint64_t room_epoch = moqr_core_room_epoch(m->core);
+    if (m->cap_blocked_count != 0 && room_epoch != m->cap_epoch) {
+        /* Room may have appeared in the core since a mirror install was
+         * refused for room: retry those installs. */
+        for (uint32_t i = 0; i < m->jrn_len; i++) {
+            if (m->jrn[i].cap_blocked) {
+                m->jrn[i].dirty = true;
+            }
+        }
+    }
+    /* A later withdrawal may free room for an entry already visited. Only
+     * acknowledge this pass's starting epoch, so that entry retries next time. */
+    m->cap_epoch = room_epoch;
     for (uint32_t i = 0; i < m->jrn_len; i++) {
         if (m->jrn[i].dirty) {
             mgr_reconcile_entry(m, &m->jrn[i], now_us);
@@ -1826,7 +1869,7 @@ data_work_pending(const r_mgr *m, uint16_t dst)
  * the caller leaves its durable record in place and retries. */
 static bool
 demand_reply_done(moqr_shards_t *s, uint16_t shard, uint16_t dst,
-                  const r_demand_msg_t *req, bool pre_ack, uint32_t code,
+                  const r_demand_msg_t *req, bool pre_ack, uint64_t code,
                   uint64_t *pushed_dst_mask)
 {
     r_mgr *m = s->shards[shard].mgr;
@@ -2783,10 +2826,11 @@ owner_admit_demand(moqr_shards_t *s, uint16_t shard, uint16_t src,
         }
     }
     if (p == NULL) {
-        /* Table full: a bounded, wrong-with-no-better-name condition; the
-         * durable outcome is the refusing DONE itself. */
-        return demand_reply_done(s, shard, src, msg, true, R_ERR_INTERNAL,
-                                 pushed_dst_mask);
+        /* Pump-sub table full: a capacity refusal, which the requester's
+         * binding encodes per draft with a Retry Interval. The durable
+         * outcome is the refusing DONE itself. */
+        return demand_reply_done(s, shard, src, msg, true,
+                                 MOQR_REQUEST_ERROR_CAPACITY, pushed_dst_mask);
     }
     moq_bytes_t parts[R_NS_MAX_PARTS];
     moq_bytes_t name;
@@ -2803,7 +2847,10 @@ owner_admit_demand(moqr_shards_t *s, uint16_t shard, uint16_t src,
         return false;   /* intent ring full: DEMAND stays durable */
     }
     if (rc != MOQR_OK) {
-        return demand_reply_done(s, shard, src, msg, true, R_ERR_INTERNAL,
+        return demand_reply_done(s, shard, src, msg, true,
+                                 rc == MOQR_ERR_CAPACITY
+                                     ? MOQR_REQUEST_ERROR_CAPACITY
+                                     : R_ERR_INTERNAL,
                                  pushed_dst_mask);
     }
     memset(p, 0, sizeof(*p));

@@ -113,7 +113,7 @@ public:
          * (has_publisher_priority, max_retained_bytes), so the cfg must
          * advertise the full current size for add_track to honor them. The
          * later-appended monotonic_groups stays at its zeroed default (no
-         * C++ knob in this slice; opting in is a C-level cfg decision). */
+         * C++ knob; opting in is a C-level cfg decision). */
         moq_pub_track_cfg_init_sized(&c, sizeof(c));
         c.track_namespace        = cfg.ns.c_namespace();
         c.track_name             = cfg.track.raw();

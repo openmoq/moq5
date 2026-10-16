@@ -337,7 +337,7 @@ static void test_d18_subscribe_pool_exhaustion(void)
     /* PRE-SETUP exhaustion: an early SUBSCRIBE fills the one staging slot; the
      * second early SUBSCRIBE cannot be buffered, so its bidi is RESET
      * (STOP_SENDING + RESET_STREAM) and the SESSION is preserved -- NOT a
-     * PROTOCOL_VIOLATION close (the shipped behavior before this fix). */
+     * PROTOCOL_VIOLATION close. */
     {
         lc_alloc_state_t as = {0};
         moq_alloc_t alloc = lc_allocator(&as);
@@ -1524,7 +1524,7 @@ static void test_publish_established_receive_history(moq_version_t ver)
  * pool is 1; an accepted subscription fills it, so a second inbound SUBSCRIBE
  * cannot stage a slot -> REQUEST_ERROR (client SUBSCRIBE_ERROR), NO SESSION_CLOSED,
  * session stays ESTABLISHED on BOTH drafts. On draft-18 this exercises the
- * pre-parser staging path (was a PROTOCOL_VIOLATION close before the fix). */
+ * pre-parser staging path, which must not close with PROTOCOL_VIOLATION. */
 static void test_subscribe_pool_exhaustion_graceful(moq_version_t ver)
 {
     lc_alloc_state_t as = {0};

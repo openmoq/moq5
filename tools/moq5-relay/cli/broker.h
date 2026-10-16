@@ -42,9 +42,9 @@
 #define MOQR_BROKER_DEMAND__ALL   0x3u
 
 /* Banks in flight: exactly two — one being delivered while the next collects.
- * The figure is fixed because the body storage Step 3 preallocates is sized
- * from it, so a broker able to hand out more banks than there are bodies
- * would promise a generation nowhere to live. */
+ * The figure is fixed because the body storage the admin listener preallocates
+ * is sized from it, so a broker able to hand out more banks than there are
+ * bodies would promise a generation nowhere to live. */
 #define MOQR_BROKER_BANKS 2u
 
 typedef enum moqr_broker_slot_state {
@@ -102,9 +102,9 @@ void          moqr_broker_destroy(moqr_broker_t *b);
  *
  * Only SIGNAL demand is REMEMBERED across a refusal. A signal is lossy to
  * drop: nothing re-raises it, and the operator asked once. An HTTP request
- * that is refused has already been answered — Step 3 returns 503 immediately
- * — so retaining its bit would open a generation for a client that is gone,
- * doing work nobody is waiting for. Rejected HTTP demand creates no work.
+ * that is refused has already been answered — the admin listener returns 503
+ * immediately — so retaining its bit would open a generation for a client
+ * that is gone, doing work nobody is waiting for. Rejected HTTP demand creates no work.
  */
 moqr_result_t moqr_broker_request(moqr_broker_t *b, uint32_t demand,
                                   uint64_t *out_serial, bool *out_wake);

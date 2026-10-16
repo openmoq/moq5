@@ -1,7 +1,7 @@
 # =====================================================================
 # Negotiated-profile substrate: the FOUR-ROLE DEPENDENCY POLICY.
 #
-# The roles, and what each may depend on (0659/0661):
+# The roles, and what each may depend on:
 #
 #   1 PURE ORACLE          np_oracle.c
 #       libc only. NO moq_* symbol may appear, defined or undefined.
@@ -15,7 +15,7 @@
 #   4 CLOSURE RUNNER       (staged)
 #       drives roles 2 and 3 against each other; may NOT call LOC/KVP itself.
 #
-# TWO scans, because either alone can be fooled (0659 F5):
+# TWO scans, because either alone can be fooled:
 #
 #   SOURCE tokens  catch a call written in the file;
 #   OBJECT symbols catch a call that arrives through a helper or an inline

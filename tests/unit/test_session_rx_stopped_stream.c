@@ -393,7 +393,7 @@ run(moq_version_t version)
     ev_obs_t o;
     if (replay_only) goto replay;
 
-    /* S1: unbound late stream, every chunk including the FIN: exactly one STOP,
+    /* Case 1: unbound late stream, every chunk including the FIN: exactly one STOP,
      * no event, no close, entry retained until the FIN frees it. */
     {
         raw_t r;
@@ -422,11 +422,11 @@ run(moq_version_t version)
         MOQ_TEST_CHECK(o.ok == 0 && o.object == 0 && o.complete == 0 && o.reset == 0 && o.closed == 0);
         MOQ_TEST_CHECK(rx_active_count(r.c) == 0);   /* the FIN released it */
         MOQ_TEST_CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
-        printf("S1 %s: chunks=%d stops=%d active_after_fin=%d state=%d\n", lbl, fed, r.stops,
+        printf("case 1 %s: chunks=%d stops=%d active_after_fin=%d state=%d\n", lbl, fed, r.stops,
                rx_active_count(r.c), (int)moq_session_state(r.c));
         raw_close(&r);
     }
-    /* S2: RESET retirement instead of FIN. */
+    /* Case 2: RESET retirement instead of FIN. */
     {
         raw_t r;
         MOQ_TEST_CHECK(raw_open(&r, version, 0, 0));
@@ -447,7 +447,7 @@ run(moq_version_t version)
         MOQ_TEST_CHECK(o.reset == 0 && o.closed == 0 && moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
         raw_close(&r);
     }
-    /* S3: the STOP is refused by a full action queue first (3 deep): the
+    /* Case 3: the STOP is refused by a full action queue first (3 deep): the
      * entry waits in NEED_STOP, the same bytes are re-fed (bridge retry),
      * then exactly one STOP is queued; later chunks are consumed; FIN frees. */
     {
@@ -504,7 +504,7 @@ run(moq_version_t version)
         MOQ_TEST_CHECK(o.closed == 0);
         raw_close(&r);
     }
-    /* S4: two owned stopped streams exhaust admission. RESET cancels a
+    /* Case 4: two owned stopped streams exhaust admission. RESET cancels a
      * third caller-held response, then an unrelated live fetch completes on
      * released capacity. Bytes after its genuine FIN remain invalid. */
     {
@@ -555,10 +555,10 @@ run(moq_version_t version)
         (void)moq_session_on_data_bytes(r.c, moq_stream_ref_from_u64(REF_D), &late, 1, false, r.now);
         drain(r.c, &o);
         MOQ_TEST_CHECK(moq_session_state(r.c) == MOQ_SESS_CLOSED && o.closed == 1);
-        printf("S4 %s: close reason after real FIN: \"%s\"\n", lbl, o.close_reason);
+        printf("case 4 %s: close reason after real FIN: \"%s\"\n", lbl, o.close_reason);
         raw_close(&r);
     }
-    /* S5: a bound stream (OK + first object delivered) then cancel, then the
+    /* Case 5: a bound stream (OK + first object delivered) then cancel, then the
      * publisher's remaining chunks: dropped, no close, no event. */
     {
         raw_t r;
@@ -584,7 +584,7 @@ run(moq_version_t version)
         MOQ_TEST_CHECK(o.object == 1 && o.complete == 0 && o.closed == 0 && rx_active_count(r.c) == 0);
         raw_close(&r);
     }
-    /* S6: a genuinely malformed new stream is still a protocol violation. */
+    /* Case 6: a genuinely malformed new stream is still a protocol violation. */
     {
         raw_t r;
         MOQ_TEST_CHECK(raw_open(&r, version, 0, 0));
@@ -594,10 +594,10 @@ run(moq_version_t version)
         memset(&o, 0, sizeof(o));
         drain(r.c, &o);
         MOQ_TEST_CHECK(moq_session_state(r.c) == MOQ_SESS_CLOSED && o.closed == 1);
-        printf("S6 %s: malformed new stream close reason: \"%s\"\n", lbl, o.close_reason);
+        printf("case 6 %s: malformed new stream close reason: \"%s\"\n", lbl, o.close_reason);
         raw_close(&r);
     }
-    /* S7: retain the first chunk while two stopped entries hold capacity.
+    /* Case 7: retain the first chunk while two stopped entries hold capacity.
      * Replay from the header when one entry frees, then stop the cancelled
      * response exactly once and consume its tail through FIN. */
     {
@@ -646,7 +646,7 @@ run(moq_version_t version)
         memset(&o, 0, sizeof(o));
         drain(r.c, &o);
         MOQ_TEST_CHECK(o.closed == 0 && o.ok == 0 && o.object == 0 && o.complete == 0);
-        printf("S7 %s: state=%d closed=%d reason=\"%s\" stops=%d active=%d\n", lbl, (int)moq_session_state(r.c),
+        printf("case 7 %s: state=%d closed=%d reason=\"%s\" stops=%d active=%d\n", lbl, (int)moq_session_state(r.c),
                o.closed, o.close_reason, r.stops, rx_active_count(r.c));
         MOQ_TEST_CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
         /* The freed slot still serves a live request. */
@@ -658,8 +658,8 @@ run(moq_version_t version)
         MOQ_TEST_CHECK(rx_active_count(r.c) == 1);   /* only the stopped REF_B remains */
         raw_close(&r);
     }
-    /* S8: more refused identities than the former stopped-record capacity
-     * remain entirely caller-owned. RESET cancels one; freeing an actual
+    /* Case 8: seventeen refused identities (more than any fixed stopped-record
+     * capacity would hold) remain entirely caller-owned. RESET cancels one; freeing an actual
      * receive entry permits exact replay of a live response. */
     {
         raw_t r;
@@ -702,7 +702,7 @@ run(moq_version_t version)
         MOQ_TEST_CHECK(r.stops == 2);
         raw_close(&r);
     }
-    /* S9: a FIN delivered while the STOP is still refused is not lost. The
+    /* Case 9: a FIN delivered while the STOP is still refused is not lost. The
      * queue is 3 deep and full; (a) the first chunk is refused, then the same
      * bytes re-driven with the FIN are refused again; (b) the first chunk is
      * refused, then a FIN-only delivery is refused. In both, draining the
@@ -762,11 +762,11 @@ run(moq_version_t version)
         drain(r.c, &o);
         MOQ_TEST_CHECK(o.closed == 0 && o.ok == 0 && o.object == 0 && o.complete == 0);
         MOQ_TEST_CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
-        printf("S9%c %s: stops=%d active=%d fin_recorded=%d\n", variant ? 'b' : 'a', lbl, r.stops,
+        printf("case 9%c %s: stops=%d active=%d fin_recorded=%d\n", variant ? 'b' : 'a', lbl, r.stops,
                rx_active_count(r.c), (int)(r.c->rx_fin_count - fin_count_before));
         raw_close(&r);
     }
-    /* S10: owned STOPPED and deferred STOP lifetimes, plus first-header and
+    /* Case 10: owned STOPPED and deferred STOP lifetimes, plus first-header and
      * header+FIN refusal/replay. Only an accepted FIN marks the stream finished;
      * later nonempty input on that identity is always rejected. */
     for (int variant = 0; variant < 4; variant++) {
@@ -858,7 +858,7 @@ run(moq_version_t version)
         raw_drain_actions(&r, -1);
         memset(&o, 0, sizeof(o));
         drain(r.c, &o);
-        printf("S10%c %s: close reason after stopped-stream FIN: \"%s\" extra_stops=%d\n", 'a' + variant, lbl,
+        printf("case 10%c %s: close reason after stopped-stream FIN: \"%s\" extra_stops=%d\n", 'a' + variant, lbl,
                o.close_reason, r.stops - stops_before);
         MOQ_TEST_CHECK(moq_session_state(r.c) == MOQ_SESS_CLOSED && o.closed == 1);
         MOQ_TEST_CHECK(strcmp(o.close_reason, "data after FIN") == 0);
@@ -870,7 +870,7 @@ run(moq_version_t version)
     return failures - before;
 
 replay:
-    /* S11: a live response first arrives without capacity. Retain its exact
+    /* Case 11: a live response first arrives without capacity. Retain its exact
      * first chunk, replay all data after capacity returns, then deliver the
      * late FETCH_OK. Two exact objects and one COMPLETE, never local failure. */
     {
@@ -901,7 +901,7 @@ replay:
         raw_drain_actions(&r, -1);
         memset(&o, 0, sizeof(o));
         drain(r.c, &o);
-        printf("S11 %s: after no-entry live response: stops=%d owned=%d reset=%d complete=%d error=%d\n", lbl, r.stops,
+        printf("case 11 %s: after no-entry live response: stops=%d owned=%d reset=%d complete=%d error=%d\n", lbl, r.stops,
                (int)moq_session_has_transport_stream(r.c, moq_stream_ref_from_u64(REF_C)), o.reset, o.complete,
                o.error);
         MOQ_TEST_CHECK(r.stops == 2);
@@ -938,7 +938,7 @@ replay:
 
 int main(int argc, char **argv)
 {
-    replay_only = argc > 1 && (strcmp(argv[1], "--replay") == 0 || strcmp(argv[1], "--attribution-red") == 0);
+    replay_only = argc > 1 && strcmp(argv[1], "--replay") == 0;
     (void)run(MOQ_VERSION_DRAFT_16);
     (void)run(MOQ_VERSION_DRAFT_18);
     if (failures == 0)

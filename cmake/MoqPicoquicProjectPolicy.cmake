@@ -2,7 +2,7 @@
 # from source (CMAKE_PROJECT_picoquic_INCLUDE). picoquic's CMakeLists declares a
 # cmake_minimum_required below the versions that introduced link-line
 # de-duplication, so inside its directory scope CMake keeps repeating static
-# archives (picoquic-core/log and the picotls archives appear several times on
+# archives (picoquic-core and the picotls archives appear several times on
 # its test executables' link lines) and capability-aware linkers warn about
 # duplicate libraries. Set the de-duplication policies in that scope when the
 # running CMake knows them: NEW lets CMake choose per linker capability

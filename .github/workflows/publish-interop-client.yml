@@ -22,13 +22,13 @@ on:
   workflow_dispatch:
     inputs:
       picoquic_ref:
-        description: 'picoquic ref (default: master)'
+        description: 'picoquic branch/tag/full SHA override (default: a602e60babea48da7849169d716aaf68684e66d6)'
         required: false
-        default: 'master'
+        default: 'a602e60babea48da7849169d716aaf68684e66d6'
       picotls_ref:
-        description: 'picotls ref (default: master)'
+        description: 'picotls branch/tag/full SHA override (default: f06553b877ada93c860dd1db9002eabf7365292d)'
         required: false
-        default: 'master'
+        default: 'f06553b877ada93c860dd1db9002eabf7365292d'
 
 permissions:
   contents: read
@@ -53,29 +53,40 @@ jobs:
       # step-level `env:` values (data), never interpolated into the script body,
       # so a malicious ref cannot become shell source; the validator then rejects
       # anything that is not a plain branch/tag/SHA token. On a normal push the
-      # inputs are unset and both default to 'master'.
+      # inputs are unset and both use the setup script's reviewed pins.
       - name: Validate picoquic + picotls refs
+        shell: bash
         env:
-          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'master' }}
-          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'master' }}
+          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'a602e60babea48da7849169d716aaf68684e66d6' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'f06553b877ada93c860dd1db9002eabf7365292d' }}
         run: |
+          set -euo pipefail
           src/libmoq/scripts/validate_git_ref.sh "$PICOQUIC_REF" picoquic_ref
           src/libmoq/scripts/validate_git_ref.sh "$PICOTLS_REF" picotls_ref
 
       # libmoq's interop Dockerfile expects picotls/ + picoquic/ + libmoq/ as
       # siblings in the build context. moq5 does not vendor them, and both carry
-      # their OWN submodules (picotls: cifra/micro-ecc), so the clone MUST recurse.
+      # their OWN submodules (picotls: cifra/micro-ecc), so checkout MUST recurse.
       - name: Fetch picoquic + picotls (recurse submodules)
+        shell: bash
         env:
-          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'master' }}
-          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'master' }}
+          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'a602e60babea48da7849169d716aaf68684e66d6' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'f06553b877ada93c860dd1db9002eabf7365292d' }}
         run: |
-          git clone --recurse-submodules --shallow-submodules --depth 1 \
-            --branch "$PICOQUIC_REF" "$PICOQUIC_REPO" src/picoquic
-          git clone --recurse-submodules --shallow-submodules --depth 1 \
-            --branch "$PICOTLS_REF" "$PICOTLS_REPO" src/picotls
-          echo "PICOQUIC_SHA=$(git -C src/picoquic rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "PICOTLS_SHA=$(git -C src/picotls rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          set -euo pipefail
+          fetch_ref() {  # <repo> <ref> <dir>: full SHA, branch or tag
+            git init -q "$3"
+            git -C "$3" remote add origin "$1"
+            git -C "$3" fetch --depth 1 origin "$2"
+            git -C "$3" checkout -q --detach FETCH_HEAD
+            git -C "$3" submodule update --init --recursive --depth 1
+          }
+          fetch_ref "$PICOQUIC_REPO" "$PICOQUIC_REF" src/picoquic
+          fetch_ref "$PICOTLS_REPO" "$PICOTLS_REF" src/picotls
+          PICOQUIC_SHA="$(git -C src/picoquic rev-parse --short HEAD)"
+          PICOTLS_SHA="$(git -C src/picotls rev-parse --short HEAD)"
+          echo "PICOQUIC_SHA=$PICOQUIC_SHA" >> "$GITHUB_ENV"
+          echo "PICOTLS_SHA=$PICOTLS_SHA" >> "$GITHUB_ENV"
 
       - name: Compute tags
         id: tags
@@ -83,6 +94,9 @@ jobs:
           SHORT_SHA="$(git -C src/libmoq rev-parse --short HEAD)"
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "Source: libmoq=$SHORT_SHA picoquic=$PICOQUIC_SHA picotls=$PICOTLS_SHA"
+
+      - name: Check image ownership-patch recipe
+        run: python3 src/libmoq/scripts/tests/test_interop_image_recipe.py
 
       - name: Log in to GHCR
         uses: docker/login-action@v4

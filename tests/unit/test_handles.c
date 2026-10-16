@@ -113,6 +113,9 @@ int main(void)
     /* -- Overflow: generation > 28 bits returns 0 ------------------ */
 
     MOQ_TEST_CHECK(moq_handle_pack(1, 0xABCD, 0x10000000, 0) == 0);
+    /* An ODD value one past the 28-bit field: parity alone would accept it,
+     * so this pins the width check itself. */
+    MOQ_TEST_CHECK(moq_handle_pack(1, 0xABCD, 0x10000001, 0) == 0);
 
     /* -- Overflow: slot > 16 bits returns 0 ------------------------ */
 

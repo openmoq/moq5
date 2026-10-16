@@ -6,7 +6,7 @@
 # and for local short runs. This script builds nothing - point it at a build
 # tree that already has the fuzz targets:
 #
-#   CC=clang cmake -B build/fuzz-ci -DMOQ_BUILD_FUZZ=ON -DMOQ_REQUIRE_FUZZ=ON
+#   CC=clang cmake -B build/fuzz-ci -DMOQ_BUILD_FUZZ=ON -DMOQ_REQUIRE_FUZZ=ON -DMOQ_BUILD_MSF=ON
 #   cmake --build build/fuzz-ci
 #   scripts/run_fuzzers.sh --build-dir build/fuzz-ci --max-total-time 60
 #
@@ -81,15 +81,25 @@ TARGETS=(
     fuzz_quic_varint
     fuzz_kvp_decode
     fuzz_control_d16
+    fuzz_control_d18
     fuzz_session_control
     fuzz_session_data
+    fuzz_session_d18
+    fuzz_loc
+    fuzz_cmaf
+    fuzz_msf
 )
 
 # Committed seed corpus subdir for a target, or empty if none exists.
 seed_for() {
     case "$1" in
+        fuzz_control_d18)     echo "control_d18";;
         fuzz_session_control) echo "session_control";;
         fuzz_session_data)    echo "session_data";;
+        fuzz_session_d18)     echo "session_d18";;
+        fuzz_loc)             echo "loc";;
+        fuzz_cmaf)            echo "cmaf";;
+        fuzz_msf)             echo "msf";;
         *)                    echo "";;
     esac
 }

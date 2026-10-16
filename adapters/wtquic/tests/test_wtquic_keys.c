@@ -11,6 +11,9 @@
  *   - freeing a slot yields a NEW key (never reused), so a late event on
  *     the old key cannot collide;
  *   - the peer-open table-pressure path is NONFATAL (aborts the stream).
+ * It also drives the outbound datagram endpoint op against the same fake
+ * transport: capability, exact payload hand-off, size limit, and the mapping
+ * of each wtquic result onto the bridge's lossy datagram policy.
  *
  * It is MsQuic-free: the wtq_* transport calls the adapter makes are STUBBED
  * here, so the test links neither libwtquic nor libmsquic (only moq::core +
@@ -119,6 +122,29 @@ static int g_session_closes;
 wtq_result_t wtq_session_close(wtq_session_t *s, uint32_t c, const uint8_t *r,
                                size_t rl)
 { (void)s; (void)c; (void)r; (void)rl; g_session_closes++; return WTQ_OK; }
+
+/* Datagram send: records the payload it was handed and returns a forced
+ * result; the size limit is a settable value. */
+static wtq_result_t g_dgram_rc = WTQ_OK;
+static size_t g_dgram_max = 1200;
+static int g_dgram_sends;
+static uint8_t g_dgram_last[64];
+static size_t g_dgram_last_len;
+wtq_result_t wtq_session_send_datagram(wtq_session_t *s, const wtq_span_t *sp,
+                                       size_t n)
+{
+    (void)s;
+    g_dgram_sends++;
+    g_dgram_last_len = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (sp[i].len > 0 && g_dgram_last_len + sp[i].len <= sizeof(g_dgram_last))
+            memcpy(g_dgram_last + g_dgram_last_len, sp[i].data, sp[i].len);
+        g_dgram_last_len += sp[i].len;
+    }
+    return g_dgram_rc;
+}
+size_t wtq_session_datagram_max_size(const wtq_session_t *s)
+{ (void)s; return g_dgram_max; }
 
 /* Reach the adapter's static endpoint functions. */
 #include "../wtquic_adapter.c"
@@ -583,6 +609,62 @@ int main(void)
 
         g_resume_rc = WTQ_OK;
         moq_wtquic_conn_destroy(cc);
+        moq_session_destroy(sess);
+    }
+
+    /* Outbound datagrams: the endpoint declares the datagram capability,
+     * hands the exact payload to wtq_session_send_datagram, reports the
+     * session's current size limit, and maps every wtquic result onto the
+     * bridge's lossy datagram policy -- never a fatal ERROR. */
+    {
+        moq_session_cfg_t scfg;
+        moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
+                                   MOQ_PERSPECTIVE_CLIENT);
+        moq_session_t *sess = NULL;
+        CHECK(moq_session_create(&scfg, 0, &sess) == MOQ_OK);
+        moq_wtquic_conn_cfg_t ccfg;
+        moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
+        ccfg.alloc = moq_alloc_default();
+        ccfg.session = sess;
+        ccfg.wt_session = (wtq_session_t *)(void *)0x1;
+        moq_wtquic_conn_t *dc = NULL;
+        CHECK(moq_wtquic_conn_create(&ccfg, &dc) == MOQ_OK);
+        if (dc) {
+            CHECK((dc->ops.capabilities & MOQ_TRANSPORT_CAP_DATAGRAM) != 0);
+            CHECK(dc->ops.send_datagram != NULL);
+            CHECK(dc->ops.max_datagram_size != NULL);
+            g_dgram_max = 777;
+            CHECK(dc->ops.max_datagram_size(dc) == 777);
+
+            static const uint8_t pl[] = { 0x01, 0x02, 0x03, 0x04 };
+            g_dgram_sends = 0;
+            g_dgram_rc = WTQ_OK;
+            CHECK(dc->ops.send_datagram(dc, pl, sizeof(pl)) == MOQ_TRANSPORT_OK);
+            CHECK(g_dgram_sends == 1);
+            CHECK(g_dgram_last_len == sizeof(pl) &&
+                  memcmp(g_dgram_last, pl, sizeof(pl)) == 0);
+
+            const struct { wtq_result_t rc; moq_transport_result_t want; } rows[] = {
+                { WTQ_ERR_WOULD_BLOCK,    MOQ_TRANSPORT_WOULD_BLOCK },
+                { WTQ_ERR_TOO_LARGE,      MOQ_TRANSPORT_TOO_LARGE },
+                { WTQ_ERR_DGRAM_DISABLED, MOQ_TRANSPORT_DROPPED },
+                { WTQ_ERR_STATE,          MOQ_TRANSPORT_DROPPED },
+                { WTQ_ERR_CLOSED,         MOQ_TRANSPORT_DROPPED },
+                { WTQ_ERR_NOMEM,          MOQ_TRANSPORT_DROPPED },
+                { WTQ_ERR_BACKEND,        MOQ_TRANSPORT_DROPPED },
+            };
+            for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+                g_dgram_rc = rows[i].rc;
+                CHECK(dc->ops.send_datagram(dc, pl, sizeof(pl)) == rows[i].want);
+            }
+            /* A NULL payload with a length never reaches the transport. */
+            g_dgram_sends = 0;
+            CHECK(dc->ops.send_datagram(dc, NULL, 3) == MOQ_TRANSPORT_DROPPED);
+            CHECK(g_dgram_sends == 0);
+            g_dgram_rc = WTQ_OK;
+            CHECK(!moq_transport_bridge_is_fatal(dc->bridge));
+            moq_wtquic_conn_destroy(dc);
+        }
         moq_session_destroy(sess);
     }
 

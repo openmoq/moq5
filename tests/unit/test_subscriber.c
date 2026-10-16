@@ -3574,7 +3574,7 @@ static void test_subscribe_done_marks_track_done(void) {
     MOQ_TEST_PASS("subscribe_done_marks_track_done");
 }
 
-/* Reproducer for the Slice-3 SUBSCRIBE_DONE transport blocker: the publisher
+/* SUBSCRIBE_DONE over the facades: the publisher
  * facade's finish_subscribers() (Track Ended, 0x2) delivered to a subscriber
  * facade must NOT close the session, must fire on_subscribe_done exactly once
  * with the status, and the freed slot must be reusable by a later subscribe. */

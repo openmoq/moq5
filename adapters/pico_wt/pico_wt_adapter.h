@@ -59,6 +59,9 @@ typedef struct pw_rx_stream {
     uint64_t granted;      /* absolute window last advertised */
     uint8_t  kind;         /* pw_rx_kind_t */
     bool     app_fc;       /* this adapter owns the stream's window */
+    bool     rx_complete;  /* the transport already delivered every byte and
+                            * the FIN (and may have retired the stream): no
+                            * window to take or advance */
     bool     paused;       /* has retained/blocked work; must not feed bridge */
     bool     buf_fin;      /* a peer FIN follows the retained bytes */
     bool     fin_blocked;  /* the FIN rode the chunk that blocked */
@@ -114,6 +117,100 @@ struct moq_pico_wt_conn {
     pw_rx_stream_t             *rx;
     size_t                      rx_count;
     size_t                      rx_cap;
+
+    /* Set only while a host feeds a stream the transport already completed
+     * (pico_wt_conn_rx_replay_complete_begin/_end). */
+    bool                        rx_replay_complete;
+    uint64_t                    rx_replay_complete_sid;
 };
+
+/*
+ * Adapter-private fatal code recorded on the bridge when the adapter cannot
+ * honour an inbound condition at all: an allocation failure while retaining
+ * bytes, or an inability to establish or advance the owned receive window.
+ * Session backpressure is NOT such a condition -- a stream that refuses bytes
+ * is paused and its credit withheld, never torn down.
+ *
+ * Deliberately distinct from the shared bridge's codes so diagnostics and
+ * tests can identify this exact adapter-initiated teardown: the bridge uses
+ * 0x1 for generic internal fatals (NOMEM, session errors, ...) and 0x3 for the
+ * "bytes arrived on a stream with pending inbound" contract violation, so we
+ * use 0x10. The peer still sees picoquic's PICOQUIC_TRANSPORT_INTERNAL_ERROR,
+ * raised when the callback returns -1.
+ */
+#define PICO_WT_INBOUND_FATAL_CODE 0x10
+
+/* Bracket the feeding of a peer stream whose every byte, and its FIN, the
+ * transport delivered before this adapter existed, so the transport may
+ * already have retired it: the stream's receive state, created on first
+ * sight, is recorded complete, with no receive window to take or advance.
+ * Failing to create that state is the adapter's ordinary inbound failure.
+ *
+ * Inline over the private layout, like pico_wt_conn_on_quic_lost: the managed
+ * facade is a separate library from this adapter, and the adapter exports
+ * only its public API. */
+static inline void pico_wt_conn_rx_replay_complete_begin(moq_pico_wt_conn_t *c,
+                                                         uint64_t sid)
+{
+    if (!c) return;
+    c->rx_replay_complete = true;
+    c->rx_replay_complete_sid = sid;
+}
+
+static inline void pico_wt_conn_rx_replay_complete_end(moq_pico_wt_conn_t *c)
+{
+    if (c) c->rx_replay_complete = false;
+}
+
+/* Whether the QUIC connection ended in order: no transport error on either
+ * side (idle timeout, stateless reset and local failures are transport
+ * errors), and no application error on either side other than H3_NO_ERROR
+ * (0x100). Anything else -- including this side closing with an application
+ * error -- is an abrupt loss. */
+static inline bool pico_wt_quic_close_is_orderly(picoquic_cnx_t *cnx)
+{
+    if (!cnx) return false;
+    uint64_t local = 0, remote = 0, local_app = 0, remote_app = 0;
+    picoquic_get_close_reasons(cnx, &local, &remote, &local_app, &remote_app);
+    return local == 0 && remote == 0 &&
+           (local_app == 0 || local_app == H3ZERO_NO_ERROR) &&
+           (remote_app == 0 || remote_app == H3ZERO_NO_ERROR);
+}
+
+/* The QUIC connection carrying the session is gone (the managed facade sees it
+ * disconnected, or h3zero drops the session with it). A close capsule or a
+ * clean CONNECT FIN would already have closed the bridge, and that code
+ * stands. Otherwise the outcome follows how the connection ended: the peer's
+ * orderly close ends the session cleanly with code 0, while an abrupt loss is
+ * a transport-origin failure with no MoQ code, reported with the adapter's
+ * generic code.
+ *
+ * WebTransport does not list a connection close among the session's
+ * terminals; treating an orderly close as a clean end is this adapter's
+ * reading of "no session terminal, and the connection ended without error".
+ * It matters most on the server side, where h3zero delivers a close capsule
+ * (and its FIN) to the adapter but passes a bare zero-length FIN on the
+ * CONNECT stream to no callback. */
+#if defined(MOQ_PICO_WT_TEST_QUIC_LOST)
+/* Test observer (a test build that compiles the adapter and the facade
+ * together): every report of a lost connection, and whether the session had
+ * already ended when it came. */
+extern void (*pw_test_quic_lost_observer)(moq_pico_wt_conn_t *c,
+                                          bool was_terminal);
+#endif
+
+static inline void pico_wt_conn_on_quic_lost(moq_pico_wt_conn_t *c,
+                                             picoquic_cnx_t *cnx, uint64_t now)
+{
+#if defined(MOQ_PICO_WT_TEST_QUIC_LOST)
+    if (pw_test_quic_lost_observer && c)
+        pw_test_quic_lost_observer(c, moq_transport_bridge_is_terminal(c->bridge));
+#endif
+    if (!c || moq_transport_bridge_is_terminal(c->bridge)) return;
+    if (pico_wt_quic_close_is_orderly(cnx))
+        moq_transport_bridge_on_transport_close(c->bridge, 0, now);
+    else
+        moq_transport_bridge_on_transport_error(c->bridge, 0x1, now);
+}
 
 #endif /* MOQ_PICO_WT_ADAPTER_H */

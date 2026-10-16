@@ -204,6 +204,20 @@ typedef struct moq_pico_wt_managed_cfg {
      * imply any MoQ/session deadline. */
     uint32_t           keep_alive_interval_ms;
 
+    /* Reserved: covers the tail padding the layout that ended at
+     * keep_alive_interval_ms left on targets that align pointers to eight
+     * bytes, so setup_auth_tokens lands at or past that old sizeof. Never
+     * read. */
+    uint32_t           _reserved_setup_auth;
+    /* Appended: authorization tokens each session presents in its SETUP
+     * (moq_session_cfg_t.setup_auth_tokens: sent by value, at most 16, each
+     * value at most 65535 bytes). Copied during _create; a session refuses
+     * invalid tokens when it is created. The SETUP carrying them must fit the
+     * session's default 4096-byte send arena (the send-arena rule on
+     * moq_session_cfg_t.setup_auth_tokens), else MOQ_ERR_INVAL at _create. Read only when struct_size covers setup_auth_token_count. Set
+     * via moq_pico_wt_managed_cfg_init_sized. */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t             setup_auth_token_count;
 } moq_pico_wt_managed_cfg_t;
 
 /* Pointer-only initializer: clears and stamps the original frozen prefix

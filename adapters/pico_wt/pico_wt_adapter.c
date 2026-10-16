@@ -82,6 +82,10 @@ void (*pw_test_grant_observer)(moq_pico_wt_conn_t *, uint64_t, uint64_t) = NULL;
 #define PW_OBSERVE_LOCAL_STOP(c, sid) do { } while (0)
 #define PW_OBSERVE_GRANT(c, sid, n) do { } while (0)
 #endif
+
+#if defined(MOQ_PICO_WT_TEST_QUIC_LOST)
+void (*pw_test_quic_lost_observer)(moq_pico_wt_conn_t *, bool) = NULL;
+#endif
 #ifdef MOQ_PICO_WT_TESTING
 void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on)
 {
@@ -312,10 +316,13 @@ static void detach_from_picoquic(moq_pico_wt_conn_t *conn)
     conn->endpoint_ctx.cnx = NULL;
     conn->endpoint_ctx.h3_ctx = NULL;
     conn->endpoint_ctx.control_stream_ctx = NULL;
+    /* Deregistering resets every unfinished session stream with
+     * WT_SESSION_GONE, deferred ones included. */
+    pico_wt_endpoint_settle_deferred(&conn->endpoint_ctx);
 
     if (cnx && h3 && ctrl) {
         picowt_deregister(cnx, h3, ctrl);
-        h3zero_delete_stream_prefix(cnx, h3, ctrl_id);
+        pico_wt_h3_delete_prefix(cnx, h3, ctrl_id);
     }
 }
 
@@ -359,6 +366,10 @@ void moq_pico_wt_conn_notify_transport_closed(moq_pico_wt_conn_t *conn,
 }
 
 /* -- Service -------------------------------------------------------- */
+/* A deferred reset that picoquic failed to issue fails the transport with the
+ * code the bridge records when an endpoint refuses a reset on the spot. */
+#define PICO_WT_RESET_FATAL_CODE 0x1
+
 
 int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
 {
@@ -366,6 +377,11 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
     if (moq_transport_bridge_is_fatal(conn->bridge)) return -1;
     if (moq_transport_bridge_is_closed(conn->bridge)) return 0;
 
+    if (pico_wt_endpoint_flush_resets(&conn->endpoint_ctx) != 0) {
+        moq_transport_bridge_on_transport_error(
+            conn->bridge, PICO_WT_RESET_FATAL_CODE, now_us);
+        return -1;
+    }
     moq_result_t rc = moq_transport_bridge_service(
         conn->bridge, now_us);
     if (rc >= 0 && !moq_transport_bridge_is_terminal(conn->bridge)) {
@@ -379,22 +395,6 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
 }
 
 /* -- Inbound helpers ------------------------------------------------ */
-
-/*
- * Adapter-private fatal code recorded on the bridge when the adapter cannot
- * honour an inbound condition at all: an allocation failure while retaining
- * bytes, or an inability to establish or advance the owned receive window.
- * Session backpressure is NOT such a condition -- a stream that refuses bytes
- * is paused and its credit withheld, never torn down.
- *
- * Deliberately distinct from the shared bridge's codes so diagnostics and
- * tests can identify this exact adapter-initiated teardown: the bridge uses
- * 0x1 for generic internal fatals (NOMEM, session errors, ...) and 0x3 for the
- * "bytes arrived on a stream with pending inbound" contract violation, so we
- * use 0x10. The peer still sees picoquic's PICOQUIC_TRANSPORT_INTERNAL_ERROR,
- * raised when the callback returns -1.
- */
-#define PICO_WT_INBOUND_FATAL_CODE 0x10
 
 
 /* -- Inbound receive flow control ------------------------------------ *
@@ -412,8 +412,8 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
  * Per-stream bounds are direct. Connection-level arrest is DERIVATIVE: picoquic
  * grows connection MAX_DATA from delivery, so once every stream's window is
  * frozen, delivery stops and the connection stops advancing too. There is no
- * per-connection control here (picoquic_set_max_data_control is quic-wide and
- * mutually exclusive with picoquic_open_flow_control).
+ * per-connection control here (picoquic_set_max_data_control is quic-wide, and
+ * while it is set picoquic_open_flow_control no longer raises MAX_DATA).
  */
 
 static pw_rx_stream_t *pw_rx_find(moq_pico_wt_conn_t *c, uint64_t sid)
@@ -628,7 +628,10 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
             c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
         return -1;
     }
-    if (!st->app_fc) {                       /* first sight: take the window */
+    if (!st->app_fc && !st->rx_complete && c->rx_replay_complete &&
+        c->rx_replay_complete_sid == sid)
+        st->rx_complete = true;   /* complete at the transport: no window */
+    if (!st->app_fc && !st->rx_complete) {   /* first sight: take the window */
         if (c->cnx == NULL ||
             picoquic_set_app_flow_control(c->cnx, sid, 1) != 0) {
             moq_transport_bridge_on_transport_error(
@@ -937,6 +940,19 @@ static void handle_control_capsule(moq_pico_wt_conn_t *c,
         moq_transport_bridge_service(c->bridge, now);
 }
 
+/* The MoQ control channel on this conn: the draft-16 control bidi the
+ * adapter latched, or (draft-18) either stream of the unidirectional control
+ * pair as the bridge classified it. A draft-18 peer control stream reset
+ * before its first byte is not yet classified and so is not recognised here;
+ * its reset takes the data-stream path, and the session still ends by the
+ * WebTransport session terminal, as a recognised one would. */
+static bool pw_is_moq_control(const moq_pico_wt_conn_t *c, uint64_t sid)
+{
+    if (c->moq_control_stream_id != UINT64_MAX && sid == c->moq_control_stream_id)
+        return true;
+    return moq_transport_bridge_stream_is_control(c->bridge, sid);
+}
+
 /* -- Inbound: picohttp callback → bridge --------------------------- */
 
 int moq_pico_wt_callback(picoquic_cnx_t *cnx,
@@ -956,6 +972,11 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
      * picoquic-owned state so destroy is safe after this. */
     if (event == picohttp_callback_deregister) {
         uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+        /* detach_from_picoquic() clears c->cnx before it deregisters: that is
+         * this side tearing the adapter down. Any other deregistration means
+         * h3zero dropped the session with its connection, before any
+         * WebTransport terminal reached the bridge. */
+        bool local_detach = c->cnx == NULL;
         clear_all_stream_callbacks(c);
         /* the transport is gone: drop every retained buffer now, and make sure
          * nothing can attempt a grant through the detached cnx afterwards */
@@ -967,12 +988,26 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
         c->endpoint_ctx.cnx = NULL;
         c->endpoint_ctx.h3_ctx = NULL;
         c->endpoint_ctx.control_stream_ctx = NULL;
-        if (!moq_transport_bridge_is_terminal(c->bridge))
-            moq_transport_bridge_on_transport_close(c->bridge, 0, now);
+        pico_wt_endpoint_settle_deferred(&c->endpoint_ctx);
+        if (local_detach) {
+            if (!moq_transport_bridge_is_terminal(c->bridge))
+                moq_transport_bridge_on_transport_close(c->bridge, 0, now);
+        } else {
+            pico_wt_conn_on_quic_lost(c, cnx, now);
+        }
         return 0;
     }
-    if (event == picohttp_callback_free)
+    if (event == picohttp_callback_free) {
+        /* h3zero frees a stream's context as soon as the stream retires,
+         * which can happen mid-session. The adapter keeps no data-stream
+         * context, but it does hold the WT control stream's: once both
+         * directions of that stream are done the session is over, so detach
+         * now, while the context is still valid, exactly as destroy would.
+         * Deregistering the session also reports the transport close. */
+        if (stream_ctx != NULL && stream_ctx == c->control_stream_ctx)
+            detach_from_picoquic(c);
         return 0;
+    }
 
     /* Pull send: h3zero is ready to put bytes on the wire for this WT data
      * stream. Serviced even while terminal so picoquic always gets a buffer
@@ -985,6 +1020,14 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
                                              length) && c->bridge)
             moq_transport_bridge_on_stream_drained(c->bridge, sid);
         return 0;
+    }
+
+    /* Resets whose preamble picoquic has sent since the last callback. */
+    if (pico_wt_endpoint_flush_resets(&c->endpoint_ctx) != 0) {
+        moq_transport_bridge_on_transport_error(
+            c->bridge, PICO_WT_RESET_FATAL_CODE,
+            picoquic_get_quic_time(picoquic_get_quic_ctx(cnx)));
+        return -1;
     }
 
     if (moq_transport_bridge_is_terminal(c->bridge)) return 0;
@@ -1056,20 +1099,38 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
         if (!stream_ctx) break;
         /* Inbound RESET_STREAM code is in the WebTransport application-error
          * space; map it back to the MoQ code before the bridge/session see
-         * it (symmetric with ep_reset's outbound mapping). A legacy peer's
-         * raw code passes through unchanged. */
-        uint64_t error_code = pico_wt_wt_err_to_moq(
-            picoquic_get_remote_stream_error(cnx, sid));
-        if (sid == c->moq_control_stream_id) {
-            moq_transport_bridge_on_transport_error(
-                c->bridge, error_code ? error_code : 0x1, now);
-        } else if (sid != c->control_stream_id) {
+         * it (symmetric with ep_reset's outbound mapping). A code outside that
+         * space is still a reset but carries no application error code
+         * (draft-ietf-webtrans-http3-15 §4.4), so it is never reported as a
+         * MoQ code. */
+        uint64_t error_code = 0;
+        bool has_code = pico_wt_wt_err_to_moq(
+            picoquic_get_remote_stream_error(cnx, sid), &error_code);
+        if (sid == c->control_stream_id) {
+            /* The CONNECT stream reset: the WebTransport session ended
+             * abruptly, with neither a close capsule nor a clean FIN (§6).
+             * That is a transport-origin failure with no MoQ code. */
+            moq_transport_bridge_on_transport_error(c->bridge, 0x1, now);
+        } else if (pw_is_moq_control(c, sid)) {
+            /* A WebTransport application code on the MoQ control stream is a
+             * MoQ-level abort of it. Without one -- typically WT_SESSION_GONE,
+             * which a peer resets every stream with as its session ends (§6),
+             * possibly overtaking its close capsule -- the outcome belongs to
+             * the session terminal on the CONNECT stream: a close capsule
+             * stays authoritative, a clean FIN is a close with code 0, and a
+             * reset or connection loss is a transport failure. */
+            if (has_code)
+                moq_transport_bridge_on_transport_error(
+                    c->bridge, error_code ? error_code : 0x1, now);
+        } else {
             /* RESET_STREAM aborts the PEER's sending direction: nothing more
              * will arrive, so abandon retained inbound bytes and stop granting
-             * credit for this stream. */
+             * credit for this stream. With no application code the reset is
+             * delivered with the PICO_WT_RESET_NO_APP_CODE stand-in. */
             pw_rx_drop(c, sid);
             moq_transport_bridge_on_peer_stream_reset(
-                c->bridge, sid, error_code, now);
+                c->bridge, sid, has_code ? error_code : PICO_WT_RESET_NO_APP_CODE,
+                now);
             if (!moq_transport_bridge_is_terminal(c->bridge)) {
                 moq_transport_bridge_service(c->bridge, now);
                 pw_rx_after_service(c, now);
@@ -1080,7 +1141,14 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
 
     case picohttp_callback_stop_sending: {
         if (!stream_ctx) break;
-        /* picoquic has no public stop-sending error code getter. */
+        /* picoquic has no public stop-sending error code getter, so a
+         * STOP_SENDING never carries an application code here. On the MoQ
+         * control channel it is therefore no MoQ-level verdict: like a
+         * control reset without one, the outcome belongs to the WebTransport
+         * session terminal (a close capsule, a clean CONNECT FIN, a CONNECT
+         * reset or the loss of the connection). */
+        if (sid != c->control_stream_id && pw_is_moq_control(c, sid))
+            break;
         if (sid != c->control_stream_id) {
             /* STOP_SENDING aborts OUR sending direction only. On a bidi stream
              * the peer may keep sending, so inbound receive state is KEPT:

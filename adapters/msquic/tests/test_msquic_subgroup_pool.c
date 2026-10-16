@@ -14,8 +14,8 @@
  *   prefix-sized cfg (excludes the appended field): the same second open
  *     SUCCEEDS — an old caller keeps the session default pool.
  *
- * Neutering the adapter's forwarding assignment must fail the constrained
- * arm. Confinement: every moq_session_* call lives inside on_lane_pump.
+ * The constrained arm depends on the adapter forwarding the field: without
+ * that assignment it fails. Confinement: every moq_session_* call lives inside on_lane_pump.
  */
 
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)

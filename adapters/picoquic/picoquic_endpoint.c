@@ -16,6 +16,10 @@
 #include "picoquic_endpoint.h"
 #include <stddef.h>
 
+#if !defined(PICOQUIC_CLOSE_REASON_COPIED) || PICOQUIC_CLOSE_REASON_COPIED != 1
+#error picoquic_must_copy_close_reasons_apply_libmoq_picoquic_patch_0006
+#endif
+
 /* PICOQUIC_ERROR_DATAGRAM_TOO_LONG is defined in picoquic.h */
 #ifndef PICOQUIC_ERROR_DATAGRAM_TOO_LONG
 #define PICOQUIC_ERROR_DATAGRAM_TOO_LONG 0x43b
@@ -196,8 +200,8 @@ static moq_transport_result_t pq_send_datagram(void *ctx,
 
 /*
  * picoquic_close_ex accepts a reason string. We forward the reason
- * if provided; picoquic limits the reason in the CONNECTION_CLOSE
- * frame to its internal buffer size.
+ * if provided, bounded here to 255 bytes. The qualified picoquic provider
+ * copies the string before returning (patch 0006).
  */
 static moq_transport_result_t pq_close(void *ctx, uint64_t code,
                                         const uint8_t *reason,

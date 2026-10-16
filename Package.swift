@@ -9,8 +9,8 @@ let enableService = ProcessInfo.processInfo.environment["MOQ_SERVICE"] == "1"
 // NOTE: no package-wide `platforms:` floor. The MoQService model layer uses
 // Swift Duration (macOS 13 / iOS 16), but that requirement is contained to
 // the MoQServiceCore target via per-declaration @available — raising the
-// floor for the shipping MoQ/MoQMedia products is a product decision deferred
-// to the MoQService product slice.
+// floor for the shipping MoQ/MoQMedia products is a product decision this
+// package does not take.
 let package = Package(
     name: "MOQ5",
     products: [
@@ -100,13 +100,12 @@ let package = Package(
             path: "bindings/swift/Sources/MoQTransportModel"
         ),
 
-        // Pure-Swift model layer for the (future) MoQService product: public
+        // Pure-Swift model layer for the MoQService product: public
         // endpoint/receiver/sender/track/object types, configurations, errors,
         // and the package-internal backend seams. Always built; the C bridge
-        // (CMoQService system module + real backends) lands in a later slice
-        // behind an env gate, alongside the moq_swift_stack_guard collision
-        // canary + negative link test (TODO: guard belongs to that slice --
-        // there is no MoQService product to collide with yet).
+        // (CMoQService system module + real backends) is built only behind the
+        // MOQ_SERVICE env gate, where the moq_swift_stack_guard collision
+        // canary applies (see below).
         .target(
             name: "MoQServiceCore",
             dependencies: ["MoQTransportModel"],
@@ -316,7 +315,7 @@ if enableService {
                 path: "bindings/swift/Examples/WtquicNetworkRuntimeProof"
             ),
         ]
-        // Finding 5 (MOQ-SWIFT-VIDEO-DIMENSION-TRAP) security regression: a
+        // MOQ-SWIFT-VIDEO-DIMENSION-TRAP security regression: a
         // bounded subprocess that drives the REAL service CoreMedia dimension
         // conversion, so an out-of-range width/height is proven to be
         // range-rejected rather than trapping the parent test process. These import CoreMedia, so they are Apple-host
@@ -350,7 +349,7 @@ if enableService {
 // decoder TEST target must never share SwiftPM's unified test bundle with
 // MoQServiceTests, or the two stacks collide on `moq_swift_stack_guard`. So:
 //   * the library + child probe exist whenever they are needed -- the ordinary
-//     (non-service) lane runs Findings 6/7, and the transport player links the
+//     (non-service) lane runs the decoder trap probes, and the transport player links the
 //     library -- i.e. `!enableService || enableTransport`;
 //   * the decoder test target exists ONLY in the non-service lane
 //     (`!enableService`), exactly like MoQTests/MoQMediaTests above;
@@ -383,7 +382,8 @@ if !enableService || enableTransport {
     ]
 }
 if !enableService {
-    // Findings 6 & 7 security regression: valid-vector behavior-neutrality +
+    // Player decoder security regression (MOQ-SWIFTPLAYER-EMPTY-DECODER-POINTER,
+    // MOQ-SWIFTPLAYER-AAC-LENGTH-TRAP): valid-vector behavior-neutrality +
     // malformed-input rejection oracles + child-process attribution. Source-
     // stack test, so it is excluded from the MOQ_SERVICE=1 unified test bundle.
     package.targets += [

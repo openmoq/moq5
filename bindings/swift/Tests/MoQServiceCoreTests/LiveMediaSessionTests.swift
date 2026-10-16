@@ -927,14 +927,14 @@ struct LiveMediaSessionTests {
         gate.openGate()
 
         #expect(await watch.receiverBackend.awaitObjectPollBlocked())
-        /* Proof of the race the fix must survive: discovery has NOT yet added
+        /* The race the session must survive: discovery has NOT yet added
          * the audio track to the selection. */
         #expect(session.selectedTracks.count == 1)
         #expect(session.selectedTracks.first?.description.mediaType == .video)
 
         watch.receiverBackend.setObjectGate(false)
 
-        /* The fix re-derives selection from the receiver's freshest tracks, so
+        /* The session re-derives selection from the receiver's freshest tracks, so
          * the audio object is delivered rather than dropped. */
         #expect(await box.awaitCount(2))
         #expect(box.item(1)?.mediaData == Data([2, 2, 2]))

@@ -95,7 +95,7 @@ static int server_callback(picoquic_cnx_t *cnx,
     /* Singleton example: the session/adapter is bound to ONE connection. Route
      * every callback through the connection-isolation classifier so a second
      * connection can neither become the owner nor have its events dispatched
-     * into the first connection's adapter (finding #9). */
+     * into the first connection's adapter. */
     switch (pq_pub_classify(app->adapter != NULL, is_ready, cnx, app->cnx)) {
     case PQ_PUB_OWNER_READY:
         return 0;                        /* benign repeat ready from the owner */

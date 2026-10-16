@@ -2583,8 +2583,8 @@ int main(void)
 
     /* -- END_OF_GROUP marker drops stranded later same-group object --- */
     /* o0 normal, o1 END_OF_GROUP marker, o2 same-group later object. The
-     * marker closes group 1; o2 must be dropped on advance. (RED: before
-     * the fix o2 stays buffered.) */
+     * marker closes group 1; o2 must be dropped on advance, not left
+     * buffered. */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);

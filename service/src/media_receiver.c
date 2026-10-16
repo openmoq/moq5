@@ -1358,8 +1358,8 @@ static bool receiver_update_within_limits(const moq_media_receiver_t *r,
 }
 
 /* Shared independent/delta adoption: immutable check, then the no-fail commit
- * (CP slot reserved before reconcile, per R1's no-mutation-before-fallible-
- * commit rule). On ADOPT_OK the caller must NOT clean up cand. */
+ * (CP slot reserved before reconcile, so nothing is mutated before the last
+ * fallible step). On ADOPT_OK the caller must NOT clean up cand. */
 static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
                                      moq_msf_catalog_t *cand, uint64_t now_us)
 {

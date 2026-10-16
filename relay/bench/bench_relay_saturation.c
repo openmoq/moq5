@@ -1416,7 +1416,7 @@ sat_decide(const sat_life_t *v)
         return "allocator-leak";
     }
     /* The closed-form capacity model MUST have resolved (else there is no
-     * ceiling to check peak_live against — D4 requires the bound). */
+     * ceiling to check peak_live against, and the verdict requires the bound). */
     if (!v->capacity_described) {
         return "capacity-model-refused";
     }
@@ -2372,9 +2372,9 @@ sat_verify(void)
 
     /* Pure lifetime-validator gates, driven directly (no setup / stall guard in
      * the path): a good snapshot is accepted, and each targeted mutation flips
-     * exactly its gate. This is where the D9 items whose full-run neuters are
-     * pre-empted by the setup fixed-point check (missing destination) or the
-     * live stall guard (dropped terminal) are proven. */
+     * exactly its gate. This covers the gates a full run cannot reach in
+     * isolation, because the setup fixed-point check (missing destination) or
+     * the live stall guard (dropped terminal) trips first. */
     {
         sat_life_t v;
         int        ok = 1;
@@ -2911,14 +2911,14 @@ sat_verify(void)
         SAT_CHECK(o.valid);
         SAT_CHECK(o.remote_demands == 1);
         SAT_CHECK(o.cross_shard_copies >= 0);   /* attribution valid */
-        /* Finding 1 — every timed field shares ONE window [B0,B1]: the byte
-         * rate is assigned (was 0), and the window byte total is exactly the
+        /* Every timed field shares ONE window [B0,B1]: the byte rate is
+         * assigned (non-zero), and the window byte total is exactly the
          * window delivery count times the payload (same population, not a
          * lifetime sum). */
         SAT_CHECK(o.bytes_per_sec > 0.0);
         SAT_CHECK(o.objects_completed > 0);
         SAT_CHECK(o.bytes_completed == o.window_deliveries * o.payload);
-        /* Finding 3 — the data-channel HWM is read from the DESTINATION rows
+        /* The data-channel HWM is read from the DESTINATION rows
          * (owner->d channels), so with a 32-deep in-flight window it exceeds
          * the owner's own inbound max of <=1. Reading shard 0 would report <=1. */
         SAT_CHECK(o.chan_entries_hwm > 1);
@@ -2927,9 +2927,9 @@ sat_verify(void)
          * residual) exists — wake_requests_local MUST be exactly zero. Their
          * core-ready cookies alias unused bind-conn slots; a raw dl_ready scan
          * would treat those sticky bits as residual and manufacture one false
-         * local continuation per inbound pop. RED: drop the live-connection
-         * guard in moqr_bind_pump_continuation_pending and this jumps to match
-         * the credit count. */
+         * local continuation per inbound pop. Zero depends on the
+         * live-connection guard in moqr_bind_pump_continuation_pending;
+         * without it the count rises to match the credit count. */
         SAT_CHECK(o.wake_local == 0);
         if (o.valid && o.bytes_completed == o.window_deliveries * o.payload &&
             o.chan_entries_hwm > 1) {

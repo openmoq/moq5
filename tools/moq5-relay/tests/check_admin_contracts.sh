@@ -4,7 +4,7 @@
 # Two classes of defect no behavioural test can see:
 #
 #   1. A comment that states the opposite of what the code does. Every phrase
-#      below was a real contradiction found in review, not a hypothetical.
+#      below is a concrete contradiction, not a hypothetical.
 #   2. Casting away const to mutate through a pointer whose signature promised
 #      not to. The behaviour may be right; the API is a lie.
 #
@@ -44,7 +44,7 @@ grep -q 'moqr_admin_peek_abandon' "$hdr" &&
 
 # -- retired vocabulary, one decisive check per phrase -----------------------
 # Each described a mechanism that no longer exists; left in place it would send
-# a Step-4 reader down a path the code does not implement.
+# a reader down a path the code does not implement.
 check_absent() {   # file, phrase, message
     grep -qF "$2" "$1" && fail "$3"
 }

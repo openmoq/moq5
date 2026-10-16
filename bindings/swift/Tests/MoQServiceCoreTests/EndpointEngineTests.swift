@@ -512,7 +512,7 @@ struct EngineDrainTests {
         let task = Task { try await endpoint.drain(timeout: .seconds(10)) }
         #expect(await backend.awaitDrainBlocked())
         task.cancel()
-        backend.setDrainGate(false)   /* slice 1 returns .timeout */
+        backend.setDrainGate(false)   /* the first slice returns .timeout */
         await #expect(throws: CancellationError.self) { try await task.value }
         /* Exactly one slice ran: the between-slice check saw the cancel. */
         #expect(backend.snapshot().drainCalls.count == 1)

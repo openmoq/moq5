@@ -57,6 +57,7 @@
       "cacheVariables": {
         "MOQ_BUILD_SIM": "ON",
         "MOQ_BUILD_TESTS": "ON",
+        "MOQ_BUILD_MSF": "ON",
         "MOQ_BUILD_FUZZ": "ON"
       }
     },

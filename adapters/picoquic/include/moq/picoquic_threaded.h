@@ -286,6 +286,21 @@ typedef struct moq_pq_threaded_cfg {
      * inert in server mode. */
     const char        *ca_file;
 
+    /* Reserved: covers the tail padding the layout that ended at ca_file
+     * leaves on targets that align pointers to four bytes and uint64_t to
+     * eight, so setup_auth_tokens lands at or past that old sizeof. Never
+     * read. */
+    uint32_t           _reserved_setup_auth;
+    /* Appended: authorization tokens each session presents in its SETUP
+     * (moq_session_cfg_t.setup_auth_tokens: sent by value, at most 16, each
+     * value at most 65535 bytes). Copied during _create; a session refuses
+     * invalid tokens when it is created. The SETUP carrying them must fit the
+     * session send arena (send_buffer_size, default 4096; the send-arena rule
+     * on moq_session_cfg_t.setup_auth_tokens), else MOQ_ERR_INVAL at
+     * _create. Read only when struct_size covers
+     * setup_auth_token_count. Set via moq_pq_threaded_cfg_init_sized. */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t             setup_auth_token_count;
     /* Appended: every connection's moq_pq_conn_cfg_t send_queue_cap_bytes
      * (see <moq/picoquic.h>). 0 = default. Set via
      * moq_pq_threaded_cfg_init_sized. */

@@ -107,6 +107,15 @@ typedef uint32_t moqr_group_order_t;
 
 typedef uint32_t moqr_intent_kind_t;
 
+/* The REQUEST_ERROR meaning "this relay cannot admit the request right now
+ * for lack of capacity" (a pool that holds only live entries), carried as an
+ * intent's error_code where a wire number would otherwise go: the binding
+ * encodes it for the connection's draft (draft-18 EXCESSIVE_LOAD, draft-16
+ * INTERNAL_ERROR, each with a Retry Interval). It lies outside every draft's
+ * REQUEST_ERROR space (draft-16 varints stop at 2^62 - 1; draft-18 maps
+ * unregistered codes to INTERNAL_ERROR), so no peer can send it. */
+#define MOQR_REQUEST_ERROR_CAPACITY UINT64_MAX
+
 #define MOQR_INTENT_ACCEPT_SUB          1u
 #define MOQR_INTENT_REJECT_SUB          2u
 #define MOQR_INTENT_SUB_DONE            3u  /* range complete / terminated */
@@ -187,9 +196,21 @@ typedef struct moqr_core_relay_cfg {
     uint32_t          log_max_objects_per_group;
     uint32_t          log_max_cursors;
 
-    /* Lifecycle. linger_us: keep upstream after the last subscriber
-     * leaves; 0 = unsubscribe immediately at the next tick. */
+    /* Lifecycle, in microseconds of the caller's clock.
+     *
+     * linger_us: keep a pull track's UPSTREAM subscription after its last
+     * subscriber leaves; 0 = unsubscribe at the next tick. The track then
+     * turns WARM: its source is released and its retained objects are cache.
+     *
+     * warm_idle_us: how long a reclaimable track (WARM, no subscription, no
+     * fetch) keeps that cache before a tick frees it with its log and
+     * interned name. Relays MAY cache objects, and without
+     * MAX_CACHE_DURATION they can be cached until implementation constraints
+     * evict them. Independent of this bound, a full track table reclaims the
+     * least recently used reclaimable track for every new one.
+     * 0 = default (60 s); UINT64_MAX = never age out. */
     uint64_t linger_us;
+    uint64_t warm_idle_us;
 
     /* Authorization hook (control-plane only). NULL = allow-all. Invoked by
      * moqr_core_authorize before the core acts on a control request; the
@@ -249,8 +270,39 @@ MOQR_CORE_API moqr_result_t moqr_core_create(const moqr_core_relay_cfg_t *cfg,
                                moqr_core_t **out);
 MOQR_CORE_API void moqr_core_destroy(moqr_core_t *core);
 
-/* Advance virtual time: fires linger deadlines, ages logs. */
+/* Advance virtual time: fires linger deadlines, ages logs, frees tracks past
+ * the warm idle bound. */
 MOQR_CORE_API moqr_result_t moqr_core_tick(moqr_core_t *core, uint64_t now_us);
+
+/*
+ * The earliest now_us at which moqr_core_tick has time-driven work: a pull
+ * track's upstream linger expiring, or a reclaimable track reaching
+ * warm_idle_us (0 when a reclaimable track still needs the tick that arms
+ * its idle clock). UINT64_MAX = none. Pure; same clock domain as the now_us
+ * the caller passes to tick. A runtime that sleeps while idle folds this into
+ * its wake deadline so retention bounds hold without traffic.
+ */
+MOQR_CORE_API uint64_t moqr_core_next_deadline_us(const moqr_core_t *core);
+
+/* An epoch that moves whenever admission room may have appeared: a pool
+ * released capacity (a track slot, a trie node, interned name bytes, a fetch
+ * slot) or capacity became reclaimable (an announce withdrawn; a track left
+ * with no source, subscription or fetch). It never moves for a change that
+ * only consumes room (an announce, a new track, a subscription), so a caller
+ * parked on a capacity refusal retries only when the retry could succeed.
+ * 0 for NULL. */
+MOQR_CORE_API uint64_t moqr_core_room_epoch(const moqr_core_t *core);
+
+/* Whether announcing ns would find room now, without announcing or making
+ * room: MOQR_OK (room, possibly after reclaiming unreferenced trie nodes or
+ * cache), MOQR_ERR_WOULD_BLOCK (only once queued intents are polled), or
+ * MOQR_ERR_CAPACITY (no room). It checks room only: an announce it calls OK
+ * can still meet a full intent ring (WOULD_BLOCK) or an occupied namespace
+ * (WRONG_STATE). Pure: nothing changes and no refusal is counted, so a caller
+ * retrying a refused announce can wait for room without inflating the
+ * refusal metrics. MOQR_ERR_INVAL for a bad view. */
+MOQR_CORE_API moqr_result_t moqr_core_announce_room(const moqr_core_t *core,
+                                                    moqr_ns_t ns);
 
 /* Set the control-plane epoch generations (node + shard) that stamp trace
  * records and route dumps. A control input (§21.2): the shard manager sets
@@ -1126,10 +1178,17 @@ MOQR_CORE_API const char *moqr_refuse_reason_name(moqr_refuse_reason_t reason);
 typedef struct moqr_core_stats {
     uint32_t bindings;
     uint32_t tracks;
+    /* Subset of tracks that are pure cache and would be reclaimed first:
+     * WARM (source released), no subscription, no fetch. A table full of
+     * reclaimable tracks still admits every new track. */
+    uint32_t tracks_reclaimable;
     uint32_t subs;              /* all live subscriptions                 */
     uint32_t subs_parked;       /* subset awaiting upstream resolution     */
     uint32_t subs_active;       /* subset serving from a track log         */
     uint32_t ns_nodes;
+    /* Subset of ns_nodes that no announce, live track or unpolled intent
+     * references; freed when an announce needs the room. */
+    uint32_t ns_nodes_reclaimable;
     uint32_t ns_subs;
     uint64_t retained_bytes;    /* across all track logs (gauge)          */
     uint64_t ingested_total;
@@ -1137,7 +1196,14 @@ typedef struct moqr_core_stats {
     uint64_t evict_sweeps;      /* times the evict-reset sweep body ran; stays
                                  * flat under whole-object delivery (gated off
                                  * unless a sub has begun a live-edge object)   */
-    uint64_t evicted_total;     /* records evicted, incl. from freed tracks */
+    uint64_t evicted_total;     /* records evicted, incl. from freed tracks
+                                 * and the cache of reclaimed tracks          */
+    /* Reclaimable tracks freed: to admit a new track into a full table
+     * (least recently used first), or after warm_idle_us without interest. */
+    uint64_t tracks_evicted_capacity;
+    uint64_t tracks_evicted_idle;
+    /* Namespace trie nodes freed once nothing referenced them. */
+    uint64_t ns_nodes_reclaimed;
     uint64_t note_emitted_total;/* accepted moqr_core_delivery_note_emitted calls
                                  * (one per bind chunked-write WOULD_BLOCK hold) —
                                  * a call counter, not a per-begun-object count:
@@ -1154,9 +1220,9 @@ typedef struct moqr_core_stats {
 
 MOQR_CORE_API void moqr_core_get_stats(const moqr_core_t *core, moqr_core_stats_t *out);
 
-/* Version-1 stats layouts are frozen. Sized access requires the entire v1
- * object, preserves bytes beyond it, and leaves output unchanged on refusal.
- * Call on the owning shard, or after all its writers have stopped. */
+/* Sized access requires the entire record as declared by these headers,
+ * preserves bytes beyond it, and leaves output unchanged on refusal. Call on
+ * the owning shard, or after all its writers have stopped. */
 MOQR_CORE_API moqr_result_t moqr_core_get_stats_sized(
     const moqr_core_t *core, moqr_core_stats_t *out, size_t out_size);
 

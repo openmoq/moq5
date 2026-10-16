@@ -3,17 +3,18 @@ import Foundation
 @testable import MoQServiceCore
 
 /*
- * Finding 1 of the 0276 review (0277): the F4 bound fixed the synchronous
- * demand gate, but the ASYNC object waiter's level term
- * (`ReceiverAttachment.objectWaiterReady`) still reported a queued object as
- * ready while the Swift event FIFO was full. The async `objects` stream would
- * then wake, run a service-thread demand, hit the same full-FIFO gate, return
- * `.empty`, and re-park -- a hot retry -- and, worse, once the readiness term
- * required a free slot, a parked object waiter had no wake when the track-event
- * consumer freed one, so it could sit until an unrelated engine wake.
+ * Async object-waiter liveness under the track-event backlog bound. The
+ * bounded event FIFO also gates the ASYNC object waiter: its level term
+ * (`ReceiverAttachment.objectWaiterReady`) must not report a queued object as
+ * ready while the Swift event FIFO is full. Otherwise the async `objects`
+ * stream would wake, run a service-thread demand, hit the same full-FIFO gate,
+ * return `.empty`, and re-park -- a hot retry. And because the readiness term
+ * requires a free slot, a parked object waiter needs a wake when the
+ * track-event consumer frees one, or it could sit until an unrelated engine
+ * wake.
  *
- * The fix makes queued objects ready only when the FIFO has room, and has
- * `nextTrackEvent()` nudge the engine when consuming an event drops the FIFO
+ * Queued objects are therefore ready only when the FIFO has room, and
+ * `nextTrackEvent()` nudges the engine when consuming an event drops the FIFO
  * out of its full state. This test drives the REAL public surfaces -- the
  * `objects` and `trackEvents` async streams over a live engine + service
  * thread -- with deterministic handshakes (poll/wake counters), no sleeps.
@@ -45,7 +46,7 @@ private func makeAsyncBacklogRig() throws -> AsyncBacklogRig {
 
 private let kStagingCap = 64
 
-@Suite("Track-event backlog async waiter (0277 finding 1)")
+@Suite("Track-event backlog async waiter")
 struct TrackEventBacklogAsyncTests {
 
     /// The public-surface liveness regression. With the FIFO full (64 staged)
@@ -141,7 +142,7 @@ struct TrackEventBacklogAsyncTests {
         #expect(rig.receiverBackend.snapshot().violations.isEmpty)
     }
 
-    /// Terminal liveness (0279): a terminal behind a full event FIFO must not
+    /// Terminal liveness: a terminal behind a full event FIFO must not
     /// complete or hot-poll the `objects` stream while full; it completes
     /// (clean `nil`) only after the real `trackEvents` consumer frees enough
     /// capacity for `drainTrackEvents()` to reach and poll the terminal.

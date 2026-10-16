@@ -7,6 +7,7 @@ moqr_core_abandon_record
 moqr_core_ack_revoked_grant
 moqr_core_announce
 moqr_core_announce_ex
+moqr_core_announce_room
 moqr_core_append_chunk
 moqr_core_auth_begin_resolve
 moqr_core_auth_finish_resolve
@@ -35,6 +36,7 @@ moqr_core_grant_commit
 moqr_core_grant_reserve
 moqr_core_ingest
 moqr_core_limits_resolve
+moqr_core_next_deadline_us
 moqr_core_next_delivery
 moqr_core_note_track_evicted_below
 moqr_core_ns_subscribe
@@ -48,6 +50,7 @@ moqr_core_reset_subgroup
 moqr_core_retire_grants
 moqr_core_retire_parked
 moqr_core_revoke_sub
+moqr_core_room_epoch
 moqr_core_route_dump_json
 moqr_core_route_dump_text
 moqr_core_seal_subgroup

@@ -36,21 +36,20 @@ jobs:
       - name: Install LLVM/Clang
         run: sudo apt-get update && sudo apt-get install -y clang llvm
 
-      # Fuzz binaries only: moq-core plus the five targets. The media/sim/test
-      # options default ON, so disable them explicitly to keep the nightly
-      # build dependency-light and fast. MOQ_REQUIRE_FUZZ=ON keeps a missing
-      # libFuzzer a hard error, never a silent skip (CI-only flag; not in
-      # CMakePresets, so local Apple-clang dev is unaffected).
+      # Fuzz binaries only: moq-core plus in-tree media libraries (LOC, CMAF,
+      # MSF) and their ten libFuzzer targets. Disable tests/examples/sim to
+      # keep the nightly build dependency-light and fast. MOQ_REQUIRE_FUZZ=ON
+      # keeps a missing libFuzzer a hard error, never a silent skip (CI-only
+      # flag; not in CMakePresets, so local Apple-clang dev is unaffected).
       - name: Configure
         run: >
           cmake -B build/fuzz-ci
           -DMOQ_BUILD_FUZZ=ON
           -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_MSF=ON
           -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_EXAMPLES=OFF
           -DMOQ_BUILD_SIM=OFF
-          -DMOQ_BUILD_LOC=OFF
-          -DMOQ_BUILD_CMAF=OFF
-          -DMOQ_BUILD_MEDIA_OBJECT=OFF
 
       - name: Build
         run: cmake --build build/fuzz-ci

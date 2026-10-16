@@ -203,7 +203,7 @@ static moq_session_t *ns_establish_sub(moq_ns_sub_handle_t *out_h,
 /* Permanent probe-counter self-check: two distinct inbound suffixes drive at
  * least one key comparison (the 2nd insert scans the 1st). Deleting the probe
  * increment makes this fail locally by name, independent of the 1000-message
- * RED. Representation-neutral (a tree also probes >= 1 key here). */
+ * bound test. Representation-neutral (a tree also probes >= 1 key here). */
 static int test_ns_probe_selfcheck(void)
 {
     int failures = 0;
@@ -228,15 +228,15 @@ static int test_ns_probe_selfcheck(void)
     return failures;
 }
 
-/* -- MOQ-NAMESPACE-QUADRATIC-SET (security report finding 3): peer-controlled
- *    namespace enumeration has superlinear duplicate-tracking cost.
+/* -- MOQ-NAMESPACE-QUADRATIC-SET: peer-controlled namespace enumeration must
+ *    not have superlinear duplicate-tracking cost.
  *
  * Drives N distinct inbound NAMESPACE responses through the PUBLIC d18 session
  * route. The permanent assertions are REPRESENTATION-NEUTRAL security contracts
  * (a future ordered-tree membership must satisfy them); the exact current
  * measurements (probes, bytes) are reported as characterization, not asserted.
  * Wall time is not used. */
-static int test_ns_quadratic_red(void)
+static int test_ns_quadratic_bound(void)
 {
     int failures = 0;
     const int N = 1000;
@@ -276,8 +276,8 @@ static int test_ns_quadratic_red(void)
         /* Positive lower bound: a removed probe increment makes this fail. */
         MOQ_TEST_CHECK(probe >= (uint64_t)(N - 1));
 
-        /* Conservative worst-case O(N log N) ceiling: RED now (superlinear),
-         * green for a balanced ordered tree. Bound = 4*N*ceil_log2(N+1). */
+        /* Conservative worst-case O(N log N) ceiling: a superlinear set fails
+         * it, a balanced ordered tree passes. Bound = 4*N*ceil_log2(N+1). */
         uint64_t ceiling = 4u * (uint64_t)N * ns_ceil_log2((uint64_t)N + 1u);
         MOQ_TEST_CHECK(probe <= ceiling);
 
@@ -323,11 +323,11 @@ static int test_ns_quadratic_red(void)
     }
 
     moq_session_destroy(s);
-    if (!failures) MOQ_TEST_PASS("ns_quadratic_red");
+    if (!failures) MOQ_TEST_PASS("ns_quadratic_bound");
     return failures;
 }
 
-/* -- Fix C: per-subscription active-suffix cap --------------------- *
+/* -- Per-subscription active-suffix cap -------------------------- *
  * A d18 client session with a chosen suffix cap and event budget. Setup is
  * checked (encode, feed, exactly one SETUP_COMPLETE) rather than discarded, so
  * the cap rows cannot silently run on a bad session. */
@@ -1481,7 +1481,7 @@ int main(void)
     int failures = 0;
     failures += test_codec();
     failures += test_ns_probe_selfcheck();
-    failures += test_ns_quadratic_red();
+    failures += test_ns_quadratic_bound();
     failures += test_ns_suffix_cap();
     failures += test_ns_suffix_cap_abi();
 

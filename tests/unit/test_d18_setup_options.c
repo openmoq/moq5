@@ -292,11 +292,9 @@ int main(void)
         moq_session_destroy(s2);
     }
 
-    /* 2c2. Semantically malformed token in SETUP closes with the
-     * MALFORMED_AUTH_TOKEN session error (0x16) -- there is no request to
-     * reject at SETUP time. Distinct from the structural 0x6 close in 2c:
-     * the Token structure here is well-formed; the RESOLVED value
-     * (zero-length) fails semantic validation. */
+    /* 2c2. A well-formed SETUP token with an empty value is opaque: the
+     * session establishes and SETUP_COMPLETE surfaces the empty value
+     * exactly; judging it is the application's authorization policy. */
     {
         moq_session_t *s = make_started(MOQ_PERSPECTIVE_SERVER, 1024);
         uint8_t p[16];
@@ -306,17 +304,25 @@ int main(void)
         put_vi64(&w, MOQ_AUTH_TOKEN_USE_VALUE);
         put_vi64(&w, 7);                       /* token type; empty value */
         feed_setup(s, p, moq_buf_writer_offset(&w));
-        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         bool saw_close = false;
         moq_action_t act;
         while (moq_session_poll_actions(s, &act, 1) > 0) {
-            if (act.kind == MOQ_ACTION_CLOSE_SESSION) {
-                saw_close = true;
-                MOQ_TEST_CHECK_EQ_U64(act.u.close_session.code, 0x16);
-            }
+            if (act.kind == MOQ_ACTION_CLOSE_SESSION) saw_close = true;
             moq_action_cleanup(&act);
         }
-        MOQ_TEST_CHECK(saw_close);
+        MOQ_TEST_CHECK(!saw_close);
+        bool got = false;
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SETUP_COMPLETE &&
+                ev.u.setup_complete.token_count == 1 &&
+                ev.u.setup_complete.tokens[0].token_type == 7 &&
+                ev.u.setup_complete.tokens[0].token_value.len == 0)
+                got = true;
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got);
         moq_session_destroy(s);
     }
 
@@ -345,6 +351,61 @@ int main(void)
         }
         MOQ_TEST_CHECK(!complete);
         moq_session_destroy(s);
+    }
+
+    /* 2g. Sixteen SETUP tokens -- the most this side holds -- arrive whole; a
+     * seventeenth is refused before anything is published or cached. The peer
+     * broke no rule, so the close is the local-capacity INTERNAL_ERROR (0x1),
+     * the same as draft-16. Both roles, USE_VALUE and REGISTER. */
+    for (int server = 0; server < 2; server++) {
+        for (int reg = 0; reg < 2; reg++) {
+            for (size_t n = 16; n <= 17; n++) {
+                moq_session_t *s = make_started(
+                    server ? MOQ_PERSPECTIVE_SERVER : MOQ_PERSPECTIVE_CLIENT, 4096);
+                MOQ_TEST_CHECK(s != NULL);
+                if (!s) continue;
+                moq_action_t act;
+                while (moq_session_poll_actions(s, &act, 1) > 0)
+                    moq_action_cleanup(&act);
+                uint8_t p[150];
+                moq_buf_writer_t w;
+                moq_buf_writer_init(&w, p, sizeof(p));
+                for (size_t i = 0; i < n; i++) {
+                    put_vi64(&w, i == 0 ? 0x03 : 0x00);
+                    put_vi64(&w, reg ? 4 : 3);
+                    put_vi64(&w, reg ? MOQ_AUTH_TOKEN_REGISTER
+                                     : MOQ_AUTH_TOKEN_USE_VALUE);
+                    if (reg) put_vi64(&w, i);           /* alias */
+                    put_vi64(&w, 7);
+                    uint8_t v = (uint8_t)('a' + i);
+                    moq_buf_write_raw(&w, &v, 1);
+                }
+                feed_setup(s, p, moq_buf_writer_offset(&w));
+                size_t seen = SIZE_MAX;
+                moq_event_t ev;
+                while (moq_session_poll_events(s, &ev, 1) > 0) {
+                    if (ev.kind == MOQ_EVENT_SETUP_COMPLETE)
+                        seen = ev.u.setup_complete.token_count;
+                    moq_event_cleanup(&ev);
+                }
+                uint64_t code = UINT64_MAX;
+                while (moq_session_poll_actions(s, &act, 1) > 0) {
+                    if (act.kind == MOQ_ACTION_CLOSE_SESSION)
+                        code = act.u.close_session.code;
+                    moq_action_cleanup(&act);
+                }
+                if (n == 16) {
+                    MOQ_TEST_CHECK_EQ_SIZE(seen, 16);
+                    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+                } else {
+                    MOQ_TEST_CHECK_EQ_SIZE(seen, SIZE_MAX);
+                    MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+                    MOQ_TEST_CHECK_EQ_U64(code, 0x1);
+                    MOQ_TEST_CHECK_EQ_SIZE(s->peer_token_cache.used_bytes, 0);
+                }
+                moq_session_destroy(s);
+            }
+        }
     }
 
     /* 2f. §10.3.1.4: a SETUP REGISTER exceeding the advertised cache size

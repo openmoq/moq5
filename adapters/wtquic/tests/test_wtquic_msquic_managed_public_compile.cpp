@@ -1,8 +1,8 @@
 /*
  * C++17 compile-only coverage for <moq/wtquic_msquic_managed.h>: the header is
  * includable from C++ (extern "C" intact) and every public declaration is
- * well-typed. Compiled as an OBJECT and never linked/run (the managed library
- * is a later slice).
+ * well-typed. Compiled as an OBJECT and never linked/run (linking is covered
+ * by test_wtquic_msquic_managed_link.c).
  */
 #include <moq/wtquic_msquic_managed.h>
 

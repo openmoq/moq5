@@ -89,7 +89,8 @@ build(const char *json, moqr_cli_config_t *cfg, uint32_t lanes, uint32_t caps,
         printf("FAIL: the fixture was rejected: %s\n", err);
         return 1;
     }
-    rc = moqr_cli_wt_listener_create(cfg, lanes, caps, test_pump, user, out);
+    rc = moqr_cli_wt_listener_create(cfg, lanes, caps, test_pump, user,
+                                     NULL, NULL, out);
     if (rc != want) {
         printf("FAIL: create returned %d, not the transport's %d\n",
                (int)rc, (int)want);

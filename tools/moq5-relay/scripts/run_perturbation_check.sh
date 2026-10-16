@@ -25,8 +25,8 @@ outdir=""
 seed=1447
 dry_run=0
 selftest=0
-# Operating point (defaults = the wake-campaign workload the original
-# single-point gate ran; the R8H matrix sweeps subs/lanes across points).
+# Operating point (defaults = the single-point wake workload; callers may
+# sweep subs/lanes across points).
 lanes=2
 subs=16
 groups=16

@@ -24,7 +24,7 @@ namespace moq {
  *
  * All OTHER fields remain BORROWED: spans, string_views, and token arrays point
  * into session/event scratch owned by the polled_event and are valid only while
- * it is alive. This slice does not make those owning. */
+ * it is alive; they are not owning. */
 namespace event {
 
 struct setup_complete {

@@ -6,8 +6,8 @@
  *
  * Reuses the repo's scenario conventions: the MOQ_SCENARIO_* env knobs, an
  * inline splitmix64 PRNG, and the canonical "Replay:" line. This is SEEDED
- * GENERATION of valid models plus (in later slices) structured mutation of the
- * encoded bytes -- a property/seeded-mutation layer, NOT coverage-guided
+ * GENERATION of valid models plus optional structured mutation of the encoded
+ * bytes (mutate_permille) -- a property/seeded-mutation layer, NOT coverage-guided
  * fuzzing (that lives in fuzz/ under libFuzzer).
  *
  * Layout: this core TU (media_fuzz.c) owns the PRNG, env config, replay
@@ -53,8 +53,8 @@ void moq_fuzz_print_replay(const char *argv0, uint64_t seed, int steps,
                            uint32_t mutate_permille);
 
 /* Deterministic per-mille gate. IMPORTANT: when permille == 0 this draws NO
- * randomness and returns false, so the generate-only sequence is byte-identical
- * to the pre-mutation runners (existing seeds reproduce). */
+ * randomness and returns false, so the generate-only sequence never depends on
+ * the mutation gate (generate-only seeds reproduce exactly). */
 bool moq_fuzz_hit_permille(moq_fuzz_rng_t *rng, uint32_t permille);
 
 /* Flip one deterministically-chosen bit of one byte in buf[0,len). */

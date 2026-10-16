@@ -85,7 +85,7 @@ static size_t encode_request_error(uint8_t *buf, size_t cap,
  * public-route control below reads its DELTA across a small valid response
  * sequence to prove membership work is nonzero and bounded on this profile.
  * Representation-neutral: an ordered-tree membership would probe far fewer
- * keys per insert. Same counter the d18 quadratic RED measures. */
+ * keys per insert. Same counter the d18 quadratic bound test measures. */
 extern uint64_t session_ns_suffix_probe_count;
 
 static size_t encode_namespace_msg(uint8_t *buf, size_t cap,
@@ -1703,7 +1703,7 @@ int main(void)
      * A small valid draft-16 sequence proving the shared suffix-membership
      * probe delta is nonzero and bounded on the public route, with exact
      * FOUND/GONE behaviour. This is the profile-neutral counterpart to the
-     * d18 quadratic RED: a control, not a RED -- both bounds hold today.
+     * d18 quadratic bound test: a control in which both bounds hold.
      * Uses the strict, failure-safe local helpers (ns16_*). */
     {
         test_alloc_state_t as = {0};
@@ -3275,13 +3275,13 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == RED: aligned prefix copy must not overrun event scratch ======= *
+    /* == Aligned prefix copy must not overrun event scratch ============ *
      * At an unaligned event_scratch offset, the prefix-parts array is allocated
      * aligned (consuming padding), then the parts bytes are memcpy'd onto the
      * tail. The cap is sized so the aligned array fits exactly but the tail does
-     * not: the old padding-blind preflight (cur + array + tail <= cap) passes,
-     * yet the real consumption (aligned + array + tail) overruns. The fix must
-     * refuse the copy without advancing event_scratch_len past cap. */
+     * not: a padding-blind preflight (cur + array + tail <= cap) would pass,
+     * yet the real consumption (aligned + array + tail) overruns. The copy must
+     * be refused without advancing event_scratch_len past cap. */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -3308,9 +3308,10 @@ int main(void)
         sv->event_scratch_cap = A + E;      /* aligned array fits; +tail does not */
         moq_result_t hrc = handle_bidi_stream_bytes(sv, ref, msg, msg_len, false);
 
-        /* Fixed: refused with WOULD_BLOCK before overflow -- length never exceeds
-         * cap, and no NS_SUB_REQUEST event was queued. (Pre-fix: event_scratch_len
-         * overruns cap and the event is queued.) */
+        /* Refused with WOULD_BLOCK before overflow -- length never exceeds
+         * cap, and no NS_SUB_REQUEST event was queued. A padding-blind
+         * preflight would let event_scratch_len overrun cap and queue the
+         * event. */
         MOQ_TEST_CHECK(hrc == MOQ_ERR_WOULD_BLOCK);
         MOQ_TEST_CHECK(sv->event_scratch_len <= sv->event_scratch_cap);
         moq_event_t ev;
@@ -3322,7 +3323,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == RED: aligned suffix copy must not overrun event scratch ======= *
+    /* == Aligned suffix copy must not overrun event scratch ============ *
      * Same alignment hazard on the subscriber side: copy_suffix_to_event_scratch
      * allocates the suffix-parts array aligned then memcpy's the parts onto the
      * tail. With an unaligned offset and a cap that fits the aligned array but
@@ -3374,7 +3375,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == RED: aligned token copy must not overrun event scratch ======== *
+    /* == Aligned token copy must not overrun event scratch ============= *
      * The resolved-token array is allocated aligned then each token value is
      * memcpy'd onto the tail. Reuse a real client-encoded SUBSCRIBE_NAMESPACE
      * carrying one auth token (so the server resolves it), then feed those wire

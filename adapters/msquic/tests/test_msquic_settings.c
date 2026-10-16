@@ -43,7 +43,7 @@
 extern void mgd_build_settings(const moq_msquic_managed_cfg_t *cfg,
                                QUIC_SETTINGS *out);
 
-/* 0024: the process-global server MTU floor. `mgd_build_global_server_floor` is
+/* The process-global server MTU floor. `mgd_build_global_server_floor` is
  * the pure builder for the ONE global write a managed server issues. The seams
  * below are MOQ_MSQUIC_TESTING-only (absent from the production symbol surface):
  *
@@ -226,7 +226,7 @@ int main(void)
         mgd_build_settings(&cfg, &s);
 
         /* Assert the DECLARATION bits, not MsQuic's runtime defaults: the
-         * client is unchanged by this fix precisely because LibMoQ sets
+         * client keeps MsQuic's defaults precisely because LibMoQ sets
          * neither bound. */
         CHECK(s.IsSet.MinimumMtu == FALSE);
         CHECK(s.IsSet.MaximumMtu == FALSE);
@@ -327,7 +327,7 @@ int main(void)
         CHECK(s.IsSet.KeepAliveIntervalMs == FALSE);
     }
 
-    /* -- 0024: the PROCESS-GLOBAL server MTU floor (pre-configuration path) -- */
+    /* -- the PROCESS-GLOBAL server MTU floor (pre-configuration path) -- */
 
     /* Pure oracle: the global write declares ONLY MinimumMtu = 1280 and nothing
      * else. The exhaustive memcmp against a hand-zeroed reference (only those two

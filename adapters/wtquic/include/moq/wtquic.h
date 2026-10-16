@@ -27,8 +27,11 @@
  *
  * SCOPE (prototype)
  *   One WebTransport session per conn (bind a fresh conn per accepted
- *   session). No datagram publishing capability yet (inbound datagrams
- *   are fed through). No idle deadline tick: sessions relying on
+ *   session). MoQ datagrams travel as WebTransport datagrams in both
+ *   directions; outbound they follow the bridge's lossy policy (one over
+ *   the session's current datagram size limit, one refused by a full
+ *   transport queue, and any sent while the session carries no datagrams
+ *   are dropped, never fatal). No idle deadline tick: sessions relying on
  *   timer-driven closes (GOAWAY drain) need external service() calls.
  *
  * LIFETIME

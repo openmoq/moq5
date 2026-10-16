@@ -222,3 +222,31 @@ target_link_libraries(myapp PRIVATE moq::adapter-picoquic-threaded)
 
 The threaded target transitively links `moq::adapter-picoquic`
 and `Threads::Threads`.
+
+## Provider source baseline
+
+The qualified picoquic source is a602e60babea48da7849169d716aaf68684e66d6
+with the patches `scripts/setup_picoquic_deps.sh` applies, built against
+picotls f06553b877ada93c860dd1db9002eabf7365292d. Other source trees given
+through `MOQ_PICOQUIC_SOURCE_DIR` are used as they are: no version is
+checked, and no Git metadata is required.
+
+On that baseline picoquic-core needs nothing from picoquic-log, so libmoq
+links the provider's targets with picoquic's own dependency edges only
+(picoquic-log on picoquic-core, picohttp-core and the test library on
+picoquic-log). Automatic accommodation of the older core/log cycle (for
+example 55b473e2, whose core calls `picoquic_set_qlog` in the log library)
+is retired, and there is no configure-time capability check. Consumers of
+such a source tree MAY fail to link: its static archives still build with
+the symbol unresolved, and another dependency may or may not supply
+picoquic-log.
+
+## Provider close-reason ownership
+
+The adapter requires picoquic to copy accepted `picoquic_close_ex` reasons
+before returning and retain them through connection deletion callbacks.
+`scripts/setup_picoquic_deps.sh` applies patch 0006 to the pinned provider.
+External provider packages must carry the equivalent implementation and
+advertise `PICOQUIC_CLOSE_REASON_COPIED=1` in their matching public header.
+The adapter rejects headers without this contract. Rebuild private-header
+consumers and provider binaries together after applying the patch.

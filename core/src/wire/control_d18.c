@@ -40,13 +40,17 @@ moq_result_t moq_d18_encode_setup(moq_buf_writer_t *w)
 /* -- vi64 field helpers (draft-18 uses vi64 for these lengths/counts) - */
 
 /* Write Type (vi64) + a reserved 16-bit Length; *len_off receives the patch
- * offset for moq_buf_patch_uint16 once the payload is written. */
+ * offset for moq_buf_patch_uint16 once the payload is written. Rolls back
+ * w->pos if the buffer fits the type vi64 but not the 16-bit length. */
 static moq_result_t d18_write_header(moq_buf_writer_t *w, uint64_t type,
                                      size_t *len_off)
 {
+    size_t saved = w->pos;
     moq_result_t rc = moq_buf_write_vi64(w, type);
     if (rc < 0) return rc;
-    return moq_buf_reserve_uint16(w, len_off);
+    rc = moq_buf_reserve_uint16(w, len_off);
+    if (rc < 0) { w->pos = saved; return rc; }
+    return MOQ_OK;
 }
 
 /* Patch the reserved Length with the payload bytes written since len_off. */
@@ -1554,7 +1558,7 @@ moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
             /* Odd type: d18_read_auth_token consumes the vi64 Length + token
              * structure directly. May repeat (§10.3.1.4). */
             if (out->auth_token_count >= MOQ_D18_MAX_AUTH_TOKENS)
-                return MOQ_ERR_PROTO;
+                return MOQ_ERR_BUFFER;      /* local capacity, not malformed */
             moq_result_t arc = d18_read_auth_token(
                 &r, &out->auth_tokens[out->auth_token_count]);
             if (arc < 0) return arc;       /* may be MOQ_D18_ERR_KVP_FORMAT */
@@ -1598,19 +1602,37 @@ moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                                        const moq_d18_setup_opts_t *opts)
 {
     if (!w) return MOQ_ERR_INVAL;
-    /* Only cache-size emission is sourced today; refuse silently dropping any
-     * other requested option. */
+    /* PATH and AUTHORITY are not sourced on this profile; refuse silently
+     * dropping them. SETUP tokens carry a value (§10.3.1.4: nothing is
+     * registered before the peer's first message, so no alias reference). */
     if (opts && (opts->has_path || opts->has_authority ||
-                 opts->auth_token_count > 0))
+                 opts->auth_token_count > MOQ_D18_MAX_AUTH_TOKENS))
         return MOQ_ERR_INVAL;
+    for (size_t i = 0; opts && i < opts->auth_token_count; i++) {
+        const moq_d18_auth_token_t *t = &opts->auth_tokens[i];
+        if (t->alias_type != MOQ_AUTH_TOKEN_USE_VALUE &&
+            t->alias_type != MOQ_AUTH_TOKEN_REGISTER)
+            return MOQ_ERR_INVAL;
+        if (t->token_value.len > 0 && !t->token_value.data) return MOQ_ERR_INVAL;
+    }
 
     size_t saved = w->pos, len_off;
     moq_result_t rc = d18_write_header(w, MOQ_D18_STREAM_SETUP, &len_off);
     if (rc < 0) { w->pos = saved; return rc; }
+    uint64_t prev = 0;
+    /* AUTHORIZATION_TOKEN (0x03) repeats: the first as a delta from 0, the
+     * rest as a zero delta; odd type => length-prefixed Token structure. */
+    for (size_t i = 0; opts && i < opts->auth_token_count; i++) {
+        if ((rc = moq_buf_write_vi64(w,
+                MOQ_D18_SETUP_OPT_AUTHORIZATION_TOKEN - prev)) < 0)
+            goto fail;
+        if ((rc = d18_write_auth_token(w, &opts->auth_tokens[i])) < 0) goto fail;
+        prev = MOQ_D18_SETUP_OPT_AUTHORIZATION_TOKEN;
+    }
     if (opts && opts->has_max_auth_token_cache_size) {
-        /* First option: Delta Type == absolute type; even => vi64 value. */
+        /* Delta Type from the previous option; even => vi64 value. */
         if ((rc = moq_buf_write_vi64(
-                w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE)) < 0)
+                w, MOQ_D18_SETUP_OPT_MAX_AUTH_TOKEN_CACHE_SIZE - prev)) < 0)
             goto fail;
         if ((rc = moq_buf_write_vi64(w, opts->max_auth_token_cache_size)) < 0)
             goto fail;

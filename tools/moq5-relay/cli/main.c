@@ -25,6 +25,7 @@
 #ifdef MOQR_DUAL_LISTENER
 #include "wtcfg.h"
 #endif
+#include "deadline.h"
 #include "versions.h"
 #include "lanestats.h"
 #include "logevent.h"
@@ -1038,6 +1039,9 @@ typedef struct serve_ctx {
     /* The admin endpoint to notify when this lane publishes. NULL until the
      * endpoint is started, and only cleared after this lane has joined. */
     _Atomic(moqr_admin_listen_t *) admin_listen;
+    /* The lane's relay-core deadline (see deadline.h). */
+    _Atomic uint64_t          deadline[1];
+    moqr_cli_deadline_range_t deadlines;
 } serve_ctx_t;
 
 /* Render `fn` into a heap buffer, growing once on truncation (the serializers
@@ -1145,6 +1149,8 @@ relay_lane_pump(moq_msquic_managed_t *m, moq_msquic_managed_lane_t *lane,
         }
     }
     (void)moqr_bind_pump(ctx->bind, now_us);
+    moqr_cli_deadline_publish(&ctx->deadline[0],
+                              moqr_core_next_deadline_us(ctx->core), now_us);
     /* A binding this pump's own work detached must be retired now: nothing
      * else wakes this lane on its behalf. */
     if (!moqr_relay_reap_pass(ctx->bind, lane, NULL)) {
@@ -1326,6 +1332,8 @@ cmd_serve(const moqr_cli_config_t *cfg)
                     .version = cfg->alpn_set },
         .snap = &snap,
     };
+    moqr_cli_deadline_clear(ctx.deadline, 1);
+    ctx.deadlines = (moqr_cli_deadline_range_t){ ctx.deadline, 0, 1 };
 
     moq_msquic_managed_cfg_t tcfg;
     moq_msquic_managed_cfg_init_sized(&tcfg, sizeof(tcfg));
@@ -1351,6 +1359,8 @@ cmd_serve(const moqr_cli_config_t *cfg)
     tcfg.max_connections = lim.max_bindings;
     tcfg.on_lane_pump = relay_lane_pump;
     tcfg.on_lane_pump_user = &ctx;
+    tcfg.app_deadline_us = moqr_cli_deadline_query;
+    tcfg.app_deadline_ctx = &ctx.deadlines;
 
     moq_msquic_managed_t *t = NULL;
     if (moq_msquic_managed_create(&tcfg, &t) != MOQ_OK) {
@@ -1576,6 +1586,11 @@ typedef struct serve_lanes_ctx {
     /* The admin endpoint to notify when a lane publishes. NULL until the
      * endpoint is started, and only cleared after every lane has joined. */
     _Atomic(moqr_admin_listen_t *) admin_listen;
+    /* Each shard's relay-core deadline, indexed by shard, and each facade's
+     * share of them (see deadline.h). */
+    _Atomic uint64_t          deadline[MOQR_CLI_MAX_LANES];
+    moqr_cli_deadline_range_t raw_deadlines;
+    moqr_cli_deadline_range_t wt_deadlines;
 } serve_lanes_ctx_t;
 
 /* Lane i drives shard i: attach/reap this lane's connections against shard i's
@@ -1752,6 +1767,11 @@ relay_pump_shard(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
     moqr_result_t rc =
         moqr_shards_step_shard(ctx->shards, (uint16_t)shard, now_us, &mask);
     ctx->pump_turns[shard]++;
+    moqr_cli_deadline_publish(
+        &ctx->deadline[shard],
+        moqr_core_next_deadline_us(moqr_shards_core(ctx->shards,
+                                                    (uint16_t)shard)),
+        now_us);
     for (uint32_t d = 0; mask != 0 && d < ctx->lanes; d++) {
         if (mask & (1ull << d)) {
             serve_wake_shard(ctx, raw, d);
@@ -2266,6 +2286,11 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
     ctx->lanes = plan.total_shards;
     ctx->plan = plan;
     serve_lanes_fill_labels(ctx->labels, cfg, &plan);
+    moqr_cli_deadline_clear(ctx->deadline, MOQR_CLI_MAX_LANES);
+    ctx->raw_deadlines = (moqr_cli_deadline_range_t){
+        ctx->deadline, plan.raw_first, plan.raw_count };
+    ctx->wt_deadlines = (moqr_cli_deadline_range_t){
+        ctx->deadline, plan.wt_first, plan.wt_count };
 
 
     moq_msquic_managed_cfg_t tcfg;
@@ -2287,6 +2312,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
     tcfg.max_connections = raw_max_conns;
     tcfg.on_lane_pump = relay_lanes_pump;
     tcfg.on_lane_pump_user = ctx;
+    tcfg.app_deadline_us = moqr_cli_deadline_query;
+    tcfg.app_deadline_ctx = &ctx->raw_deadlines;
 #ifdef MOQR_VERIFY_SEAM
     /* Blocked-scenario seam: constrain every relay-side session's outgoing
      * subgroup pool (SESSION_SG induction; the bind override rode the shard
@@ -2323,6 +2350,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         /* This listener's own share of the plan, never the process totals. */
         if (moqr_cli_wt_listener_create(cfg, plan.wt_count, wt_max_conns,
                                         relay_wt_lanes_pump, ctx,
+                                        moqr_cli_deadline_query,
+                                        &ctx->wt_deadlines,
                                         &ctx->wt) != MOQ_OK) {
             fprintf(stderr,
                     "webtransport transport create failed (port %d)\n",

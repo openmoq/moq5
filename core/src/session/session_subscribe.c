@@ -803,11 +803,15 @@ static moq_result_t handle_fetch_response_bytes(moq_session_t *s, int fslot,
     }
 
     /* Past the first response (FETCH_OK surfaced): the response phase is done.
-     * A trailing FIN is benign; extra bytes fail closed. */
+     * A trailing FIN is benign and is recorded -- the publisher's half has
+     * ended, so the completion still owed on the data stream needs no drain
+     * reference for it; it never cancels the fetch, whose remaining objects
+     * can still be arriving on the data stream. Extra bytes fail closed. */
     if (fe->state != MOQ_FETCH_PENDING_FETCHER || fe->control_response_seen) {
         if (len > 0)
             return close_with_error(s, 0x3,
                 "unexpected bytes after fetch response");
+        if (fin) fe->req_recv_fin = true;
         return MOQ_OK;
     }
 
@@ -1163,8 +1167,9 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
  * there as transitional ownership and drive that family's own FIN handling --
  * the same handler a later wire FIN would reach. Nothing here decides the
  * outcome: a family whose teardown blocks on capacity keeps the marker and is
- * resumed by an empty re-feed, which routes back to the same handler. Families
- * outside this slice keep their existing behavior. */
+ * resumed by an empty re-feed, which routes back to the same handler. Only the
+ * families dispatched below take part; any other kind returns MOQ_OK
+ * untouched. */
 static moq_result_t request_stream_handoff_fin(moq_session_t *s,
                                                 moq_stream_ref_t stream_ref,
                                                 moq_request_endpoint_t dest)
@@ -1217,7 +1222,7 @@ static bool request_stream_handoff_fin_install(moq_session_t *s,
     }
 }
 
-/* -- No-slot admission carriers (#245b) ----------------------------- *
+/* -- No-slot admission carriers ------------------------------------ *
  * A bounded, session-owned record of a no-slot request-bidi terminal that is
  * owed but not yet emittable. Storage is arena-backed in the session slab at
  * create time (never lazily allocated), so installing one during ingress cannot
@@ -1432,7 +1437,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
     int slot = (ep.kind == MOQ_REQ_SUBSCRIPTION) ? ep.slot : -1;
 
     if (slot < 0) {
-        /* A no-slot terminal already owed on this bidi (#245b): re-drive it
+        /* A no-slot terminal already owed on this bidi: re-drive it
          * from the durable carrier, folding in whatever FIN was recorded, and
          * without ever re-staging or redelivering peer bytes. Checked BEFORE
          * the empty-input early return so the documented empty re-feed reaches
@@ -1754,12 +1759,11 @@ moq_result_t request_streams_refeed_deferred(moq_session_t *s)
  * entry untouched so the bridge re-drives the teardown once room frees. Returns
  * MOQ_OK for a ref that is not a stream-correlated request (the caller handles
  * other stream kinds). */
-moq_result_t request_stream_teardown(moq_session_t *s,
-                                     moq_stream_ref_t stream_ref,
-                                     bool reset, uint64_t error_code)
+static moq_result_t request_stream_torn_down(moq_session_t *s,
+                                             moq_request_endpoint_t ep,
+                                             bool reset, uint64_t error_code,
+                                             size_t parent_drains)
 {
-    moq_request_endpoint_t ep =
-        request_registry_find_by_streamref(s, stream_ref);
 
     if (ep.kind == MOQ_REQ_SUBSCRIPTION) {
         if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
@@ -1767,11 +1771,15 @@ moq_result_t request_stream_teardown(moq_session_t *s,
          * (§10.12.2): the subscription is gone, so each gets
          * INVALID_JOINING_REQUEST_ID on its own bidi. Reserve their capacity
          * alongside the UNSUBSCRIBED event (which uses an event slot, not contended
-         * by the reject actions) so this teardown stays retryable. */
+         * by the reject actions) so this teardown stays retryable. The drain
+         * references the caller installs once the owner is gone
+         * (`parent_drains`) are reserved in the same preflight: a join's drain
+         * must not take the slot the request's own identity needs. */
         bool has_joins = s->subs[ep.slot].state == MOQ_SUB_PENDING_PUBLISHER;
         if (has_joins) {
             moq_result_t pjrc = session_core_pending_joins_can_resolve(
-                s, s->subs[ep.slot].request_id, false /* reject-all */, 0, 0, 0, 0);
+                s, s->subs[ep.slot].request_id, false /* reject-all */, 0, 0,
+                parent_drains, 0);
             if (pjrc < 0) return pjrc;
         }
         moq_event_t e;
@@ -1886,6 +1894,71 @@ moq_result_t request_stream_teardown(moq_session_t *s,
     if (ep.kind == MOQ_REQ_PUBLISH)
         return publish_torn_down(s, ep.slot);
 
+    return MOQ_OK;
+}
+
+/* Whether the request's owner is released by the peer's STOP_SENDING. */
+static bool request_stop_frees_owner(moq_request_endpoint_t ep)
+{
+    return ep.kind == MOQ_REQ_SUBSCRIPTION || ep.kind == MOQ_REQ_FETCH ||
+           ep.kind == MOQ_REQ_TRACK_STATUS || ep.kind == MOQ_REQ_ANNOUNCEMENT ||
+           ep.kind == MOQ_REQ_SUBSCRIBE_TRACKS || ep.kind == MOQ_REQ_PUBLISH;
+}
+
+/* The peer's direction of the request stream is still open: no FIN from it
+ * has been observed. */
+static bool request_peer_direction_open(const moq_session_t *s,
+                                        moq_request_endpoint_t ep)
+{
+    switch (ep.kind) {
+    case MOQ_REQ_SUBSCRIPTION:     return !s->subs[ep.slot].req_recv_fin;
+    case MOQ_REQ_FETCH:            return !fetch_peer_fin_observed(&s->fetches[ep.slot]);
+    case MOQ_REQ_TRACK_STATUS:     return !ts_peer_fin_observed(&s->track_statuses[ep.slot]);
+    case MOQ_REQ_ANNOUNCEMENT:     return !ann_peer_fin_observed(&s->announcements[ep.slot]);
+    case MOQ_REQ_SUBSCRIBE_TRACKS: return !track_sub_peer_fin_observed(&s->track_subs[ep.slot]);
+    case MOQ_REQ_PUBLISH:          return !pub_peer_fin_observed(&s->publishes[ep.slot]);
+    default:                       return false;
+    }
+}
+
+/* A peer RESET ends its direction and the request with it. A peer
+ * STOP_SENDING on a request stream speaks only to this side's direction
+ * (draft-18 §3.3.2, RFC 9000 §3.5): the request is cancelled and its owner
+ * released exactly once, and the peer's direction keeps its identity -- a
+ * drain reference -- until the peer's FIN or RESET, so what the peer had
+ * already sent, or still sends, is discarded rather than read as a new
+ * request. The RESET_STREAM that answers the STOP is the transport binding's
+ * (moq_transport_bridge_t). The drain reference is reserved before anything
+ * changes; without room for it the signal is refused (WOULD_BLOCK), the
+ * request left as it was. */
+moq_result_t request_stream_teardown(moq_session_t *s,
+                                     moq_stream_ref_t stream_ref,
+                                     bool reset, uint64_t error_code)
+{
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, stream_ref);
+    if (reset || !moq_session_uses_request_streams(s) ||
+        !request_stop_frees_owner(ep))
+        return request_stream_torn_down(s, ep, reset, error_code, 0);
+    bool keep_identity = request_peer_direction_open(s, ep);
+    if (keep_identity && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+    moq_result_t rc;
+    if (ep.kind == MOQ_REQ_SUBSCRIPTION &&
+        s->subs[ep.slot].state == MOQ_SUB_RECVING_REQUEST) {
+        /* A request still being received was never surfaced: the STOP ends
+         * it without an event, and nothing of it is dispatched. */
+        sub_free_entry(s, (size_t)ep.slot);
+        rc = MOQ_OK;
+    } else {
+        rc = request_stream_torn_down(s, ep, reset, error_code,
+                                      keep_identity ? 1 : 0);
+    }
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED)
+        return rc;
+    if (request_registry_find_by_streamref(s, stream_ref).kind != MOQ_REQ_NONE)
+        return MOQ_OK;                      /* the family kept its owner */
+    if (keep_identity && !drain_ref_contains(s, stream_ref))
+        (void)drain_ref_add(s, stream_ref);   /* slot reserved above */
     return MOQ_OK;
 }
 

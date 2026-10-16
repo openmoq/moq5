@@ -1407,6 +1407,11 @@ moq_result_t moq_session_reject_publish(
     /* PUBLISH is not REDIRECT-eligible (§10.6 lists 5 families; PUBLISH not among
      * them); refuse a REDIRECT code rather than emit an unacceptable response. */
     if (cfg->error_code == MOQ_REQUEST_ERROR_REDIRECT) return MOQ_ERR_INVAL;
+    /* A retry is sent as milliseconds + 1 (d16 Section 9.8, d18 Section
+     * 10.6): refuse an interval whose wire form is unrepresentable rather
+     * than let it wrap to 0, which means "do not retry". */
+    if (cfg->can_retry && cfg->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
+        return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
      * before any mutation rather than truncate (draft-16 encodes a QUIC
      * varint, draft-18 a vi64 spanning the full 64-bit range). */

@@ -570,7 +570,7 @@ int main(void)
         moq_simpair_destroy(sp);
     }
     {   /* TRACK_STATUS: accept (TRACK_STATUS_OK on the request bidi) is GATED after
-         * GOAWAY — the reviewer's concrete case. The entry stays PENDING_PUBLISHER
+         * GOAWAY. The entry stays PENDING_PUBLISHER
          * but no further request-bidi message may be written. */
         moq_session_t *s = make_session(MOQ_PERSPECTIVE_SERVER);
         moq_d18_msg_params_t mp2 = {0};

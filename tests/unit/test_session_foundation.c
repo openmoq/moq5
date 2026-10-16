@@ -3058,8 +3058,8 @@ int main(void)
         MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == 1000);
         /* But the *reported* next deadline must be deferred past now so a
          * timer driver sleeps instead of busy-spinning a zero wait on the
-         * still-expired deadline (the actual bug — neuter the backoff and
-         * this returns 1000, the expired raw deadline). */
+         * still-expired deadline (without the backoff this returns 1000,
+         * the expired raw deadline). */
         MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) > 2000);
 
         /* Drain and retry. */

@@ -68,9 +68,10 @@
  * is no fixed attach-wide constant under arbitrary caller settings.
  *
  * Caller contract: do NOT enable picoquic_set_max_data_control (nonzero) on a
- * quic context whose connections are attached to this adapter. Its nonzero
- * mode silently disables picoquic_open_flow_control (the per-stream credit
- * mechanism this adapter depends on), and the conflict is not detectable
+ * quic context whose connections are attached to this adapter. In its nonzero
+ * mode picoquic_open_flow_control (the credit mechanism this adapter depends
+ * on) still grants stream windows but stops raising the connection window,
+ * which then stays at the caller's limit, and the conflict is not detectable
  * through picoquic's public API.
  *
  * One moq_pq_conn_t per MoQ session/QUIC connection. The adapter does

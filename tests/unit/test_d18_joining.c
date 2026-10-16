@@ -990,8 +990,8 @@ int main(void)
             moq_event_cleanup(&ev);
         }
         MOQ_TEST_CHECK(tok_ok);
-        /* Now the peer RESETs the fetch bidi: the entry is torn down and freed. With
-         * the fix this frees no token heap (join_token_count == 0) -- no double free,
+        /* Now the peer RESETs the fetch bidi: the entry is torn down and freed. This
+         * frees no token heap (join_token_count == 0) -- no double free,
          * no dangling (ASAN). Events are consumed without dereferencing stale data. */
         moq_session_on_bidi_stream_reset(s, jref, 0x1, 1);
         MOQ_TEST_CHECK_EQ_INT(count_pending_joins(s), 0);

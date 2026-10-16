@@ -180,15 +180,13 @@ static void d16_build_local_setup(const moq_session_t *s,
     }
 }
 
-static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
-                                                const moq_setup_params_t *local,
-                                                bool is_client)
+/* Encode this side's CLIENT_SETUP / SERVER_SETUP into `w`: MAX_REQUEST_ID,
+ * the configured AUTHORIZATION TOKENs and MAX_AUTH_TOKEN_CACHE_SIZE. */
+static moq_result_t d16_encode_setup(moq_session_t *s,
+                                     const moq_setup_params_t *local,
+                                     bool is_client, moq_buf_writer_t *w)
 {
-    uint8_t buf[256];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-
-    moq_kvp_entry_t params[4];
+    moq_kvp_entry_t params[4 + MOQ_DECODED_MAX_TOKENS];
     size_t param_count = 0;
 
     uint8_t vbuf[8];
@@ -199,6 +197,18 @@ static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
         params[param_count].value     = vbuf;
         params[param_count].value_len = vlen;
         params[param_count].is_varint = true;
+        params[param_count].raw       = NULL;
+        params[param_count].raw_len   = 0;
+        param_count++;
+    }
+
+    /* §9.3.1.5 (AUTHORIZATION TOKEN): one parameter per configured token,
+     * each a Token structure carrying its value (encoded at create). */
+    for (size_t i = 0; i < s->setup_token_count; i++) {
+        params[param_count].type      = MOQ_SETUP_PARAM_AUTHORIZATION_TOKEN;
+        params[param_count].value     = s->setup_token_wire[i].data;
+        params[param_count].value_len = s->setup_token_wire[i].len;
+        params[param_count].is_varint = false;
         params[param_count].raw       = NULL;
         params[param_count].raw_len   = 0;
         param_count++;
@@ -217,14 +227,55 @@ static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
         param_count++;
     }
 
-    moq_result_t rc;
-    if (is_client)
-        rc = moq_d16_encode_client_setup(&w, params, param_count);
-    else
-        rc = moq_d16_encode_server_setup(&w, params, param_count);
-    if (rc < 0) return rc;
+    return is_client ? moq_d16_encode_client_setup(w, params, param_count)
+                     : moq_d16_encode_server_setup(w, params, param_count);
+}
 
-    return queue_send_control(s, buf, moq_buf_writer_offset(&w));
+/* The SETUP this side will send, for create-time admission. */
+static moq_result_t d16_encode_own_setup(moq_session_t *s, moq_buf_writer_t *w)
+{
+    moq_setup_params_t local;
+    d16_build_local_setup(s, &local);
+    return d16_encode_setup(s, &local, s->perspective == MOQ_PERSPECTIVE_CLIENT, w);
+}
+
+static moq_result_t d16_encode_and_queue_setup(moq_session_t *s,
+                                                const moq_setup_params_t *local,
+                                                bool is_client)
+{
+    size_t cap = 256;
+    for (size_t i = 0; i < s->setup_token_count; i++)
+        cap += s->setup_token_wire[i].len + 16u;
+    uint8_t stack_buf[256];
+    uint8_t *buf = stack_buf;
+    if (cap > sizeof(stack_buf)) {
+        buf = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+        if (!buf) return MOQ_ERR_NOMEM;
+    }
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_result_t rc = d16_encode_setup(s, local, is_client, &w);
+    if (rc == MOQ_OK)
+        rc = queue_send_control(s, buf, moq_buf_writer_offset(&w));
+    if (buf != stack_buf) {
+        session_wipe(buf, cap);   /* the encoded SETUP carries the tokens */
+        s->alloc.free(buf, cap, s->alloc.ctx);
+    }
+    return rc;
+}
+
+/* A SETUP token's parameter value (§9.3.1.5): the Token structure with Alias
+ * Type USE_VALUE. */
+static moq_result_t d16_encode_setup_token(struct moq_buf_writer *w,
+                                           uint64_t token_type, moq_bytes_t value)
+{
+    moq_d16_auth_token_t t;
+    memset(&t, 0, sizeof(t));
+    t.alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+    t.token_type = token_type;
+    t.token_value = value.data;
+    t.token_value_len = value.len;
+    return moq_d16_auth_token_encode(w, &t);
 }
 
 /* -- D16 setup complete event -------------------------------------- */
@@ -286,6 +337,31 @@ static bool d16_setup_looks_like_version_list(const uint8_t *payload,
     return first >= 0xff000000u && first <= 0xff0000ffu;
 }
 
+/* Parameters a received SETUP may carry: each single-instance parameter
+ * this profile knows (PATH, MAX_REQUEST_ID, MAX_AUTH_TOKEN_CACHE_SIZE,
+ * AUTHORITY, MOQT_IMPLEMENTATION), the AUTHORIZATION TOKENs up to the
+ * supported count (§9.3.1.5 permits several), and room for parameters it
+ * does not know. Every SETUP this side sends fits. More is a local capacity
+ * limit, not a protocol violation of the peer. */
+#define D16_SETUP_RECV_PARAMS (5 + MOQ_DECODED_MAX_TOKENS + 11)
+_Static_assert(D16_SETUP_RECV_PARAMS >= 4 + MOQ_DECODED_MAX_TOKENS,
+               "a received SETUP must hold every SETUP this side sends");
+
+/* Whether a received SETUP's AUTHORIZATION TOKENs fit what this side resolves
+ * and stages: the resolved list surfaced in SETUP_COMPLETE and the cache
+ * overlay both hold MOQ_DECODED_MAX_TOKENS entries. Counted before any token
+ * is processed, so a SETUP with more is refused whole -- a local capacity
+ * limit, never a silently shortened list or a partial cache commit. */
+static bool d16_setup_tokens_fit(const moq_d16_setup_t *setup)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < setup->params_count; i++)
+        if (setup->params[i].type == MOQ_SETUP_PARAM_AUTHORIZATION_TOKEN) n++;
+    _Static_assert(MOQ_CACHE_OVERLAY_CAP >= MOQ_DECODED_MAX_TOKENS,
+                   "the overlay holds every token one SETUP may stage");
+    return n <= MOQ_DECODED_MAX_TOKENS;
+}
+
 static moq_result_t d16_handle_setup_client(moq_session_t *s,
                                              const moq_control_envelope_t *env)
 {
@@ -296,12 +372,15 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
 
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
-    moq_kvp_entry_t params[16];
+    moq_kvp_entry_t params[D16_SETUP_RECV_PARAMS];
     moq_d16_setup_t setup = {
-        .params = params, .params_count = 0, .params_cap = 16
+        .params = params, .params_count = 0, .params_cap = D16_SETUP_RECV_PARAMS
     };
     moq_result_t rc = moq_d16_decode_client_setup(env->payload,
                                                    env->payload_len, &setup);
+    if (rc == MOQ_ERR_BUFFER)
+        return close_with_error(s, 0x1,
+            "CLIENT_SETUP has more parameters than this side holds");
     if (rc < 0) {
         if (d16_setup_looks_like_version_list(env->payload,
                                               env->payload_len))
@@ -315,6 +394,9 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
     uint64_t err = d16_validate_peer_setup_params(&peer_tmp, setup.params,
                                                    setup.params_count, true);
     if (err) return close_with_error(s, err, "invalid setup parameter");
+    if (!d16_setup_tokens_fit(&setup))
+        return close_with_error(s, 0x1,
+            "CLIENT_SETUP has more authorization tokens than this side holds");
 
     /*
      * Phase 1: Validate and collect auth tokens WITHOUT mutating cache.
@@ -339,13 +421,6 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
         if (tok.alias_type == MOQ_AUTH_TOKEN_DELETE ||
             tok.alias_type == MOQ_AUTH_TOKEN_USE_ALIAS)
             return close_with_error(s, 0x3, "DELETE/USE_ALIAS in CLIENT_SETUP");
-
-        /* Well-formed structure but semantically invalid value: there is no
-         * request to reject at SETUP time, so this is the
-         * MALFORMED_AUTH_TOKEN session error (0x16). */
-        if (!moq_auth_token_value_semantically_valid(tok.token_value,
-                                                     tok.token_value_len))
-            return close_with_error(s, 0x16, "malformed auth token in SETUP");
 
         if (tok.alias_type == MOQ_AUTH_TOKEN_REGISTER) {
             if (moq_ov_alias_live(&ov, tok.alias, NULL, NULL, NULL))
@@ -510,12 +585,15 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
 
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
 
-    moq_kvp_entry_t params[16];
+    moq_kvp_entry_t params[D16_SETUP_RECV_PARAMS];
     moq_d16_setup_t setup = {
-        .params = params, .params_count = 0, .params_cap = 16
+        .params = params, .params_count = 0, .params_cap = D16_SETUP_RECV_PARAMS
     };
     moq_result_t rc = moq_d16_decode_server_setup(env->payload,
                                                    env->payload_len, &setup);
+    if (rc == MOQ_ERR_BUFFER)
+        return close_with_error(s, 0x1,
+            "SERVER_SETUP has more parameters than this side holds");
     if (rc < 0)
         return close_with_error(s, 0x3, "malformed SERVER_SETUP");
 
@@ -528,6 +606,9 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
                                              "invalid setup parameter";
         return close_with_error(s, err, reason);
     }
+    if (!d16_setup_tokens_fit(&setup))
+        return close_with_error(s, 0x1,
+            "SERVER_SETUP has more authorization tokens than this side holds");
 
     /*
      * Phase 1: Validate and collect auth tokens WITHOUT mutating cache.
@@ -589,10 +670,6 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
                 return close_with_error(s, 0x3,
                     "USE_ALIAS unknown auth token alias");
 
-            if (!moq_auth_token_value_semantically_valid(rval, rlen))
-                return close_with_error(s, 0x16,
-                    "malformed auth token in SETUP");
-
             if (token_count < 16) {
                 resolved[token_count].token_type = rtype;
                 resolved[token_count].token_value.data = rval;
@@ -604,13 +681,9 @@ static moq_result_t d16_handle_setup_server(moq_session_t *s,
 
         if (tok.alias_type == MOQ_AUTH_TOKEN_DELETE) continue;
 
-        /* REGISTER / USE_VALUE carry a literal value: well-formed but
-         * semantically invalid closes with MALFORMED_AUTH_TOKEN (0x16) --
-         * there is no request to reject at SETUP time. */
-        if (!moq_auth_token_value_semantically_valid(tok.token_value,
-                                                     tok.token_value_len))
-            return close_with_error(s, 0x16, "malformed auth token in SETUP");
-
+        /* REGISTER / USE_VALUE carry a literal value. Token values are
+         * opaque bytes (empty, or holding zero bytes, included): judging them
+         * is the application's authorization policy, not the session's. */
         if (token_count < 16) {
             resolved[token_count].token_type = tok.token_type;
             resolved[token_count].token_value.data = tok.token_value;
@@ -3521,6 +3594,10 @@ static moq_result_t d16_encode_request_error(moq_session_t *s,
     (void)s;
     /* Draft-16 has no REQUEST_ERROR Redirect structure; refuse a redirect tail. */
     if (args->has_redirect) return MOQ_ERR_INVAL;
+    /* Wire = milliseconds + 1; an interval with no representable wire form
+     * is refused, never wrapped to 0 ("do not retry"). */
+    if (args->can_retry && args->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
+        return MOQ_ERR_INVAL;
     uint64_t wire_retry = args->can_retry ? (args->retry_after_ms + 1) : 0;
     return moq_d16_encode_request_error(w, args->request_id, args->error_code,
         wire_retry, args->reason, args->reason_len);
@@ -4849,6 +4926,8 @@ static const moq_profile_ops_t d16_ops = {
     .encode_publish         = d16_encode_publish_op,
     .track_properties_dynamic_groups = d16_track_properties_dynamic_groups,
     .scan_delivery_timeouts = d16_scan_delivery_timeouts,
+    .encode_setup_token     = d16_encode_setup_token,
+    .encode_own_setup       = d16_encode_own_setup,
     .scan_group_order       = d16_scan_group_order,
     .track_properties_put_group_order = d16_track_properties_put_group_order,
     .encode_publish_ok      = d16_encode_publish_ok_op,

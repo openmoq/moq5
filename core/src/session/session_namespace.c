@@ -920,6 +920,11 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
     if (cfg->struct_size < offsetof(moq_reject_namespace_cfg_t, redirect))
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
+    /* A retry is sent as milliseconds + 1 (d16 Section 9.8, d18 Section
+     * 10.6): refuse an interval whose wire form is unrepresentable rather
+     * than let it wrap to 0, which means "do not retry". */
+    if (cfg->can_retry && cfg->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
+        return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
      * before any mutation rather than truncate (draft-16 encodes a QUIC
      * varint, draft-18 a vi64 spanning the full 64-bit range). */

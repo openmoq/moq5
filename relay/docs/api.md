@@ -7,13 +7,12 @@ interface. The two libraries have independent export/import macros and follow
 the project's `BUILD_SHARED_LIBS` and release policy. No independent ABI version
 or distro release is assigned by this extraction.
 
-Existing public value types are **fixed v1 layouts**, including stats, handles,
-intents, record/delivery views, limits, capacity descriptions, callback tables,
-and nested configuration templates. Their size, member offsets, array stride,
-and numeric constants cannot be changed compatibly. A future incompatible
-layout requires a new type and entry point, not an append to an unsized record.
-This also applies to records that happen to have an internal `struct_size` but
-use a fixed-size initializer. A size field alone is not an extension contract.
+The relay libraries have no released ABI yet. Public value types (stats,
+handles, intents, record/delivery views, limits, capacity descriptions,
+callback tables, configuration and nested configuration templates) follow the
+headers of the build they ship with, and may change layout between versions:
+rebuild embedders against the installed headers. A size field alone is not an
+extension contract.
 
 Configuration entry points ending in `_init_sized` accept caller byte sizes.
 They clear and initialize only the known, fully present fields. Pass the actual
@@ -23,12 +22,12 @@ Nested core/binding templates in the shard config must be initialized in full
 with the shipped initializer; they are not independently extensible tails.
 Existing enum and capacity validation continues to apply before construction.
 
-The four `_get_stats_sized` functions require space for the complete v1 record.
+The four `_get_stats_sized` functions require space for the complete record.
 An undersized buffer or NULL object/output returns `MOQR_ERR_INVAL` without
-modifying output. A valid larger allocation receives exactly the v1 record;
+modifying output. A valid larger allocation receives exactly the record;
 its tail is untouched. A shard lookup failure likewise leaves output unchanged.
-The older unsized getters remain available for a full v1 object, not a shorter
-prefix. No getter makes a mutable owner safe to read from another thread.
+The unsized getters require a full object, not a shorter prefix. No getter
+makes a mutable owner safe to read from another thread.
 
 Public declarations use only C types and opaque library objects. Test counters,
 seal/inspection hooks, binding authorization glue, and the CLI toy policy are

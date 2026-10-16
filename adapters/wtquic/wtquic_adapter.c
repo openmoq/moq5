@@ -264,7 +264,7 @@ static moq_transport_result_t ep_write(void *ctx, uint64_t stream_id,
     rec->buf = NULL;
     memcpy(rec + 1, data, len);
 
-    wtq_span_t span = { (const uint8_t *)(rec + 1), len };
+    wtq_span_t span = { .data = (const uint8_t *)(rec + 1), .len = len };
     wtq_result_t rc =
         wtq_stream_send(ms->st, &span, 1, fin ? WTQ_SEND_FIN : 0, rec);
     if (rc != WTQ_OK)
@@ -291,7 +291,7 @@ static moq_transport_result_t ep_write_payload(void *ctx,
     rec->buf = buf;
     moq_rcbuf_incref(buf); /* held until the send completion */
 
-    wtq_span_t span = { moq_rcbuf_data(buf), moq_rcbuf_len(buf) };
+    wtq_span_t span = { .data = moq_rcbuf_data(buf), .len = moq_rcbuf_len(buf) };
     wtq_result_t rc =
         wtq_stream_send(ms->st, &span, 1, fin ? WTQ_SEND_FIN : 0, rec);
     if (rc != WTQ_OK) {
@@ -345,6 +345,42 @@ static moq_transport_result_t ep_stop_sending(void *ctx,
     if (rc == WTQ_OK || rc == WTQ_ERR_STATE || rc == WTQ_ERR_CLOSED)
         return MOQ_TRANSPORT_OK;
     return MOQ_TRANSPORT_ERROR;
+}
+
+/* Outbound datagram. wtquic copies the payload during the call, so nothing
+ * outlives it. Results follow the bridge's lossy datagram policy: a datagram
+ * over wtq_session_datagram_max_size() is TOO_LARGE, a momentarily full
+ * transport queue is WOULD_BLOCK, and a session that cannot carry datagrams
+ * -- none negotiated (WTQ_ERR_DGRAM_DISABLED), not yet active, or already
+ * ended -- drops it, as does a send the transport cannot complete
+ * (WTQ_ERR_NOMEM, WTQ_ERR_BACKEND). None of these is fatal: the session's own
+ * terminal, if any, still arrives through the session callbacks. */
+static moq_transport_result_t ep_send_datagram(void *ctx,
+                                               const uint8_t *data,
+                                               size_t len)
+{
+    moq_wtquic_conn_t *c = ctx;
+
+    if (c->ws == NULL || (len > 0 && data == NULL))
+        return MOQ_TRANSPORT_DROPPED;
+    wtq_span_t span = { .data = data, .len = len };
+    switch (wtq_session_send_datagram(c->ws, &span, 1)) {
+    case WTQ_OK:
+        return MOQ_TRANSPORT_OK;
+    case WTQ_ERR_WOULD_BLOCK:
+        return MOQ_TRANSPORT_WOULD_BLOCK;
+    case WTQ_ERR_TOO_LARGE:
+        return MOQ_TRANSPORT_TOO_LARGE;
+    default:
+        return MOQ_TRANSPORT_DROPPED;
+    }
+}
+
+static size_t ep_max_datagram_size(void *ctx)
+{
+    moq_wtquic_conn_t *c = ctx;
+
+    return c->ws != NULL ? wtq_session_datagram_max_size(c->ws) : 0;
 }
 
 static moq_transport_result_t ep_close_transport(void *ctx, uint64_t code,
@@ -942,7 +978,9 @@ moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
 
     c->ops = (moq_transport_endpoint_ops_t){
         .struct_size = sizeof(moq_transport_endpoint_ops_t),
-        .capabilities = MOQ_TRANSPORT_CAP_WRITE_PAYLOAD | MOQ_TRANSPORT_CAP_HOLD_INPUT,
+        .capabilities = MOQ_TRANSPORT_CAP_DATAGRAM |
+                        MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
+                        MOQ_TRANSPORT_CAP_HOLD_INPUT,
         .open_uni = ep_open_uni,
         .open_bidi = ep_open_bidi,
         .write = ep_write,
@@ -950,6 +988,8 @@ moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
         .reset_stream = ep_reset_stream,
         .stop_sending = ep_stop_sending,
         .abort_stream = ep_abort_stream,
+        .send_datagram = ep_send_datagram,
+        .max_datagram_size = ep_max_datagram_size,
         .close_transport = ep_close_transport,
     };
 

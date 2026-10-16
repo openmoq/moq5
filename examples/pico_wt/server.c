@@ -133,6 +133,9 @@ static int server_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes, size_t length,
         return -1;
     }
 
+    if (!picowt_is_webtransport_connect(stream_ctx))
+        return -1;  /* not a WebTransport CONNECT */
+
     h3zero_callback_ctx_t *h3 =
         (h3zero_callback_ctx_t *)picoquic_get_callback_context(cnx);
     if (h3zero_declare_stream_prefix(h3, stream_ctx->stream_id,
@@ -238,7 +241,9 @@ int main(int argc, char **argv)
     s.path = path;
     s.path_table[0] = (picohttp_server_path_item_t){
         .path = path, .path_length = strlen(path),
-        .path_callback = server_wt_cb, .path_app_ctx = &s};
+        .path_callback = server_wt_cb, .path_app_ctx = &s,
+        .connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL,
+        .connect_protocol_length = sizeof(H3ZERO_WEBTRANSPORT_H3_PROTOCOL) - 1};
     s.server_param.path_table = s.path_table;
     s.server_param.path_table_nb = 1;
 

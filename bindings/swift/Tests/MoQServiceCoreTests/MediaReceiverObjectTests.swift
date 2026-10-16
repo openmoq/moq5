@@ -74,7 +74,7 @@ struct ObjectStreamTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test("Delivered objects reference the S3 MediaTrack instance and carry metadata")
+    @Test("Delivered objects reference the trackEvents MediaTrack instance and carry metadata")
     func deliveryAndIdentity() async throws {
         let rig = try makeObjectRig()
         rig.receiverBackend.scriptEvents([.added(7, name: "video")])
@@ -323,7 +323,7 @@ struct ObjectLatchTerminalTests {
         #expect(await rig.receiverBackend.awaitCondition { $0.pollCalls >= 3 })
 
         rig.endpoint.interrupt()
-        /* trackEvents still delivers through the latch (S3, poll_track is
+        /* trackEvents still delivers through the latch (poll_track is
          * not latch-gated)... */
         var eventIterator = rig.receiver.trackEvents.makeAsyncIterator()
         #expect(try await eventIterator.next() != nil)

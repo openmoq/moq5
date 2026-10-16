@@ -31,8 +31,8 @@ moqr_obs_test_accumulate(size_t start, unsigned repeat, size_t *out_len,
 }
 
 /* Drive the SHARED production tail with an already-overflowed accumulator.
- * This is the function both public entry points end in, so neutering its
- * refusal is caught here rather than passing unnoticed. */
+ * This is the function both public entry points end in, so a tail that lost
+ * its refusal is caught here rather than passing unnoticed. */
 moqr_result_t
 moqr_obs_test_finish_overflowed(size_t *written)
 {

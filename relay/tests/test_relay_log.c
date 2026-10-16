@@ -176,6 +176,56 @@ mklog(count_alloc_t *ca, uint32_t max_groups, uint64_t max_bytes,
 
 /* -- tests ----------------------------------------------------------------- */
 
+/* Cursor slot generations never wrap. The last live generation still yields
+ * a valid handle; once released the slot is retired, so the next open falls
+ * back to another slot, the old handle stays stale, and with no openable slot
+ * left the open is refused rather than minting a zero or aliased handle. */
+static int
+test_cursor_generation_exhaustion(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+
+    moqr_log_t *log = mklog(&ca, 4, 1 << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    MOQ_TEST_CHECK(log->max_cursors >= 2);
+
+    log->cursors[0].generation = 0x0FFFFFFEu;
+    moqr_cursor_t last = MOQR_CURSOR_INVALID;
+    MOQ_TEST_CHECK(moqr_log_cursor_open(log, MOQR_CURSOR_FROM_OLDEST,
+                                        &last) == MOQR_OK);
+    MOQ_TEST_CHECK(last._opaque != 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(last._opaque), 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_generation(last._opaque), 0x0FFFFFFFu);
+    MOQ_TEST_CHECK(moqr_log_cursor_close(log, last) == MOQR_OK);
+
+    moqr_cursor_t next = MOQR_CURSOR_INVALID;
+    MOQ_TEST_CHECK(moqr_log_cursor_open(log, MOQR_CURSOR_FROM_OLDEST,
+                                        &next) == MOQR_OK);
+    MOQ_TEST_CHECK(next._opaque != 0 && next._opaque != last._opaque);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(next._opaque), 1);
+    MOQ_TEST_CHECK(moqr_log_cursor_close(log, last) ==
+                   MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_log_cursor_close(log, next) == MOQR_OK);
+
+    /* Every other slot retired too: refused, nothing minted. */
+    for (uint32_t i = 1; i < log->max_cursors; i++) {
+        log->cursors[i].generation = 0x10000000u;
+    }
+    moqr_cursor_t none = MOQR_CURSOR_INVALID;
+    MOQ_TEST_CHECK(moqr_log_cursor_open(log, MOQR_CURSOR_FROM_OLDEST,
+                                        &none) == MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(none._opaque == 0);
+    MOQ_TEST_CHECK_EQ_U64(log->cursor_count, 0);
+
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("cursor_generation_exhaustion");
+    return failures;
+}
+
 static int
 test_append_and_cursor_roundtrip(void)
 {
@@ -1256,6 +1306,7 @@ main(void)
 {
     int failures = 0;
     failures += test_append_and_cursor_roundtrip();
+    failures += test_cursor_generation_exhaustion();
     failures += test_ordering_rules();
     failures += test_final_evidence_preflight();
     failures += test_final_evidence_atomicity();

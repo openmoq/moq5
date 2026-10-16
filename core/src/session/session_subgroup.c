@@ -372,8 +372,8 @@ moq_result_t moq_session_open_subgroup(
      * and subscriber-side (peer parameters/acked updates) values -- never
      * the min_nonzero legacy projection, which could wrongly shorten it
      * when the object timeout is smaller (d18 §8). Start instant (armed at
-     * open) is deliberately unchanged; the start-instant correction is a
-     * recorded backlog item (design §9.8 A2). */
+     * open) is deliberately unchanged: this site does not correct the start
+     * instant (design §9.8 A2). */
     {
         const moq_sub_entry_t *dte = &s->subs[sub_slot];
         uint64_t sg_ms = dt_negotiate_ms(

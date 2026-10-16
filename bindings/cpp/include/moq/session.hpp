@@ -90,6 +90,10 @@ struct session_config {
     bool               send_auth_token_cache_size = false;
     uint64_t           auth_token_cache_size    = 0;
     moq_version_t      version                  = {};
+    // Authorization tokens presented in this side's SETUP, sent by value
+    // (moq_session_cfg_t.setup_auth_tokens); create copies them, so the
+    // storage need only outlive the create call.
+    std::span<const moq_auth_token_t> setup_auth_tokens = {};
 };
 
 class session {
@@ -131,6 +135,8 @@ public:
         c.send_auth_token_cache_size = cfg.send_auth_token_cache_size;
         c.auth_token_cache_size    = cfg.auth_token_cache_size;
         c.version                  = cfg.version;
+        c.setup_auth_tokens        = cfg.setup_auth_tokens.data();
+        c.setup_auth_token_count   = cfg.setup_auth_tokens.size();
 
         moq_session_t *s = nullptr;
         auto rc = moq_session_create(&c, now, &s);

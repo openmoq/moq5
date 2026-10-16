@@ -1,5 +1,5 @@
-# API/export contract for the media-receiver current-description copy
-# (prerequisite A), separate from the writer-lock finding. Three named facts,
+# API/export contract for the media-receiver current-description copy,
+# separate from the writer-lock test. Three named facts,
 # each established by a tool rather than by header text:
 #
 #   api.declared / api.signature  the public header declares
@@ -21,7 +21,7 @@
 # stderr, and write
 # only symbol lines / member headers to stdout. A compiler that cannot compile
 # the header alone, or a missing library, is a tool failure (tool.*). Only
-# api.* failures are the expected named RED until prerequisite A lands.
+# api.* failures report the contract as not met.
 #
 #   cmake -DHEADER=<media_receiver.h> -DLIB=<libmoq-service.a> -DNM=<nm>
 #         -DCC=<c compiler> -DINCLUDES=<;-list> -DWORK=<scratch dir>
@@ -172,5 +172,5 @@ else()
 endif()
 
 if(_fail)
-    message(FATAL_ERROR "media_receiver_desc_copy_api: contract RED (prerequisite A not present)")
+    message(FATAL_ERROR "media_receiver_desc_copy_api: contract not met (the copy API is absent or wrong)")
 endif()

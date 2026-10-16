@@ -1190,12 +1190,13 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                                        post_cursor >= rx->input_len;
 
                 bool want_complete = is_fin_complete && fe->control_ok;
-                if (want_complete && event_queue_full(s)) {
+                if (want_complete &&
+                    !fetch_fetcher_completion_fits(s, (int)fslot, 0)) {
                     loop_rc = MOQ_ERR_WOULD_BLOCK;
                     goto compact;
                 }
 
-                /* Commit: safe to mutate — event slot reserved if needed. */
+                /* Commit: safe to mutate — completion reserved if needed. */
                 fe->data_stream_ref = stream_ref;
                 fe->data_stream_started = true;
                 rx->fetch = fe->handle;
@@ -1205,15 +1206,9 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 if (is_fin_complete) {
                     fe->data_stream_fin = true;
                     if (want_complete) {
-                        moq_event_t ev;
-                        memset(&ev, 0, sizeof(ev));
-                        ev.kind = MOQ_EVENT_FETCH_COMPLETE;
-                        ev.detail_size = (uint32_t)sizeof(moq_fetch_complete_event_t);
-                        ev.borrow_epoch = s->borrow_epoch;
-                        ev.u.fetch_complete.fetch = fe->handle;
-                        moq_result_t erc2 = push_event(s, &ev);
+                        moq_result_t erc2 =
+                            fetch_fetcher_completion_commit(s, (int)fslot);
                         if (erc2 < 0) { loop_rc = erc2; goto compact; }
-                        fetch_free_entry(s, (int)(fslot));
                     }
                     /* Fetch stream: rx_finish_stream skips the subgroup event. */
                     return rx_finish_stream(s, slot);
@@ -1314,19 +1309,13 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                         emit = fe2->control_ok;
                     }
                     if (emit) {
-                        if (event_queue_full(s)) {
+                        if (!fetch_fetcher_completion_fits(s, fslot2, 0)) {
                             loop_rc = MOQ_ERR_WOULD_BLOCK;
                             goto compact;
                         }
-                        moq_event_t fev;
-                        memset(&fev, 0, sizeof(fev));
-                        fev.kind = MOQ_EVENT_FETCH_COMPLETE;
-                        fev.detail_size = (uint32_t)sizeof(moq_fetch_complete_event_t);
-                        fev.borrow_epoch = s->borrow_epoch;
-                        fev.u.fetch_complete.fetch = rx->fetch;
-                        moq_result_t ferc = push_event(s, &fev);
+                        moq_result_t ferc =
+                            fetch_fetcher_completion_commit(s, fslot2);
                         if (ferc < 0) { loop_rc = ferc; goto compact; }
-                        fetch_free_entry(s, fslot2);
                     }
                     /* Fetch stream: rx_finish_stream skips the subgroup event. */
                     return rx_finish_stream(s, slot);

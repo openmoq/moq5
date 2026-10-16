@@ -3,22 +3,21 @@ import Foundation
 @testable import MoQServiceCore
 
 /*
- * Finding 4 (MOQ-SWIFT-TRACK-EVENT-BACKLOG) security regression.
+ * MOQ-SWIFT-TRACK-EVENT-BACKLOG security regression.
  *
- * The vulnerability (pre-fix): the Swift service layer eagerly drained the
- * bounded C track-event queue into an UNBOUNDED Swift FIFO --
- * `ReceiverAttachment.drainTrackEvents()` looped `backend.pollTrackEvent()`
- * with no capacity check and `ReceiverState.integrate` appended every event to
- * `fifo` -- moving the backlog from the bounded C layer into an unbounded Swift
- * one and defeating the C queue's capacity control.
+ * The vulnerability: a Swift service layer that eagerly drains the bounded C
+ * track-event queue into an UNBOUNDED Swift FIFO (polling
+ * `backend.pollTrackEvent()` with no capacity check and appending every event
+ * in `ReceiverState.integrate`) moves the backlog from the bounded C layer into
+ * an unbounded Swift one and defeats the C queue's capacity control.
  *
  * The Swift backend never sets `moq_media_receiver_cfg_t.max_track_events`, so
- * the C queue depth is its default of 64; the fix bounds the Swift staging at
- * the same 64, stops polling before the 65th event, and leaves the surplus in
- * the backend/C queue (end-to-end backpressure) using O(1) FIFO ops.
+ * the C queue depth is its default of 64; the Swift staging is bounded at the
+ * same 64, stops polling before the 65th event, and leaves the surplus in the
+ * backend/C queue (end-to-end backpressure) using O(1) FIFO ops.
  *
- * These tests encode that bounded contract and now pass against the fix (they
- * failed RED against the pre-fix unbounded staging). They drive the eager drain
+ * These tests pin that bounded contract; unbounded staging fails them. They
+ * drive the eager drain
  * SYNCHRONOUSLY via `ReceiverAttachment.drainTrackEvents()` -- no service
  * thread, no sleeps,
  * no wall-clock, no large allocations. `pollCalls` (backend polls) and
@@ -30,7 +29,7 @@ import Foundation
 /// backend always uses. Package-internal, no new public configuration field.
 private let kSwiftStagingCap = 64
 
-@Suite("Track-event backlog bound (finding 4)")
+@Suite("Track-event backlog bound")
 struct TrackEventBacklogTests {
 
     /// Build `total` track events: one `.added` (so the FIFO holds a real
@@ -109,7 +108,7 @@ struct TrackEventBacklogTests {
         #expect(snap.queuedEventsRemaining >= 5)
     }
 
-    // MARK: - Backlog obligations (0259 Finding 4, remaining coverage)
+    // MARK: - Backlog obligations: order, identity, re-drain
 
     /// `count` distinct added tracks: handle `i` is named `"t\(i)"`, so both
     /// event ORDER and stable track IDENTITY are observable across a
@@ -266,7 +265,7 @@ struct TrackEventBacklogTests {
         #expect(snap.queuedEventsRemaining == 1)               // handle 65's add retained
     }
 
-    /// Async-waiter liveness (0277 finding 1, synchronous half): a queued
+    /// Async-waiter liveness (synchronous half): a queued
     /// object whose delivery is blocked by a full event FIFO must NOT report
     /// its parked object waiter as ready -- `demandObject()` would only wake it
     /// into an immediate `.empty` and re-park (a hot retry). With 64 staged,
@@ -304,7 +303,7 @@ struct TrackEventBacklogTests {
         #expect(attachment.objectWaiterReady == true)
     }
 
-    /// Async-waiter liveness (0279, terminal half): a backend terminal is
+    /// Async-waiter liveness (terminal half): a backend terminal is
     /// observed only through `pollObject()`, which `demandObject()` reaches
     /// solely after `drainTrackEvents()` returns not-full -- so a terminal
     /// behind a full FIFO must NOT report the waiter ready either, or the object

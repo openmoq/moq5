@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Test for scripts/validate_git_ref.sh (security finding #11). Runs the validator
+# Test for scripts/validate_git_ref.sh (MOQ-WORKFLOW-DISPATCH-INJECTION). Runs the validator
 # against practical-valid and malicious refs and asserts accept/reject. Pure
 # shell, no build deps.
 set -uo pipefail

@@ -63,6 +63,55 @@ void fetch_free_entry(moq_session_t *s, int slot)
     e->req_recv_cap = recv_cap;
 }
 
+/* -- Fetcher-role completion --------------------------------------- *
+ * Draft-18 §5.2: the fetcher keeps FETCH state until the data stream ends. Once
+ * it also holds FETCH_OK the request stream has nothing left to carry in either
+ * direction, so the fetcher FINs its half (the request was opened without FIN)
+ * rather than leaving the stream, and its stream credit, open forever. The
+ * publisher's half may still be open -- its FIN can trail the data stream on an
+ * independent QUIC stream -- so a drain reference absorbs that FIN or RESET as
+ * the ordinary end of the stream rather than as a new request. */
+
+static bool fetch_completion_closes_request(const moq_fetch_entry_t *e)
+{
+    return e->request_stream_ref._v != 0;
+}
+
+bool fetch_fetcher_completion_fits(const moq_session_t *s, int slot,
+                                   size_t extra_events)
+{
+    const moq_fetch_entry_t *e = &s->fetches[slot];
+    bool close_half = fetch_completion_closes_request(e);
+    bool need_drain = close_half && !fetch_peer_fin_observed(e);
+    if (event_queue_avail(s) < 1 + extra_events) return false;
+    if (close_half && action_queue_avail(s) < 1) return false;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap) return false;
+    return true;
+}
+
+moq_result_t fetch_fetcher_completion_commit(moq_session_t *s, int slot)
+{
+    moq_fetch_entry_t *e = &s->fetches[slot];
+    moq_stream_ref_t req_ref = e->request_stream_ref;
+    bool close_half = fetch_completion_closes_request(e);
+    bool need_drain = close_half && !fetch_peer_fin_observed(e);
+
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_FETCH_COMPLETE;
+    ev.detail_size = (uint32_t)sizeof(moq_fetch_complete_event_t);
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.fetch_complete.fetch = e->handle;
+    moq_result_t rc = push_event(s, &ev);
+    if (rc < 0) return rc;
+    if (close_half)
+        (void)queue_close_bidi(s, req_ref);   /* reserved by _fits */
+    if (need_drain)
+        (void)drain_ref_add(s, req_ref);      /* reserved by _fits */
+    fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
 /* -- Locally-cancelled FETCH request-id grace cache ---------------- */
 
 void fetch_cancel_tomb_add(moq_session_t *s, uint64_t request_id)
@@ -1065,9 +1114,15 @@ moq_result_t session_core_on_fetch_ok(moq_session_t *s,
     if (e->control_response_seen)
         return close_with_error(s, 0x3, "duplicate control response for fetch");
 
-    /* If data FIN already arrived, we need 2 event slots: OK + COMPLETE. */
-    size_t need = e->data_stream_fin ? 2 : 1;
-    if (event_queue_avail(s) < need) return MOQ_ERR_WOULD_BLOCK;
+    /* If data FIN already arrived, FETCH_OK also completes the fetch: reserve
+     * the completion (its event, request-half FIN and drain slot) alongside
+     * FETCH_OK's own event. */
+    if (e->data_stream_fin) {
+        if (!fetch_fetcher_completion_fits(s, d->target_slot, 1))
+            return MOQ_ERR_WOULD_BLOCK;
+    } else if (event_queue_avail(s) < 1) {
+        return MOQ_ERR_WOULD_BLOCK;
+    }
 
     if (d->has_deferred_param_error)
         return close_with_error(s, 0x3, d->deferred_param_reason);
@@ -1143,18 +1198,9 @@ moq_result_t session_core_on_fetch_ok(moq_session_t *s,
     e->control_response_seen = true;
     e->control_ok = true;
 
-    /* event_queue_avail >= 2 precheck above guarantees the second slot. */
-    if (e->data_stream_fin) {
-        moq_event_t cev;
-        memset(&cev, 0, sizeof(cev));
-        cev.kind = MOQ_EVENT_FETCH_COMPLETE;
-        cev.detail_size = (uint32_t)sizeof(moq_fetch_complete_event_t);
-        cev.borrow_epoch = s->borrow_epoch;
-        cev.u.fetch_complete.fetch = e->handle;
-        moq_result_t crc = push_event(s, &cev);
-        if (crc < 0) return crc;
-        fetch_free_entry(s, d->target_slot);
-    }
+    /* The completion precheck above reserved everything this commits. */
+    if (e->data_stream_fin)
+        return fetch_fetcher_completion_commit(s, d->target_slot);
 
     return MOQ_OK;
 }
@@ -1270,8 +1316,15 @@ moq_result_t moq_session_accept_fetch(
      * the response data uni with a FETCH_HEADER (carrying the Request ID). */
     if (moq_session_uses_request_streams(s)) {
         /* FETCH_OK on the request bidi + FETCH_HEADER on the uni, and the
-         * uni's key. */
+         * uni's key. An empty fetch is finished by this call (§10.12.3: header and FIN
+         * on the data stream), so FETCH_OK also FINs the request stream's
+         * local half, and while the fetcher's half is still open a drain slot
+         * absorbs its later FIN or RESET once the entry is gone. */
+        const bool need_drain = cfg->empty &&
+                                !fetch_peer_fin_observed(&s->fetches[slot]);
         if (action_queue_avail(s) < (s->data_priority_updates ? 3u : 2u))
+            return MOQ_ERR_WOULD_BLOCK;
+        if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
             return MOQ_ERR_WOULD_BLOCK;
         moq_accept_fetch_encode_args_t ok_args = {
             .request_id = s->fetches[slot].request_id,
@@ -1296,7 +1349,8 @@ moq_result_t moq_session_accept_fetch(
         if (rc < 0) return rc;
         uint8_t hdr_len = (uint8_t)moq_buf_writer_offset(&hw);
 
-        /* FETCH_OK on the request bidi (stays open for the subscription). Post-GOAWAY
+        /* FETCH_OK on the request bidi, which stays open while the response is
+         * still to be written and ends with it for an empty fetch. Post-GOAWAY
          * gate (§10.4): a migrated request accepts no further request-bidi bytes
          * (defensive — accept on an already-ACCEPTED+migrated fetch is unreachable). */
         if (request_goaway_already_sent(s, s->fetches[slot].request_stream_ref))
@@ -1310,7 +1364,7 @@ moq_result_t moq_session_accept_fetch(
             s->fetches[slot].request_stream_ref;
         ok_act.u.send_bidi_stream.data = s->send_buf + s->send_len;
         ok_act.u.send_bidi_stream.len = ok_len;
-        ok_act.u.send_bidi_stream.fin = false;
+        ok_act.u.send_bidi_stream.fin = cfg->empty;
         rc = push_action(s, &ok_act);
         if (rc < 0) return rc;
         s->send_len += ok_len;
@@ -1339,8 +1393,11 @@ moq_result_t moq_session_accept_fetch(
         s->fetches[slot].data_stream_ref = data_act.u.send_data.stream_ref;
         s->fetches[slot].data_stream_started = true;
         s->next_stream_ref++;
-        if (cfg->empty)
+        if (cfg->empty) {
+            if (need_drain)   /* slot reserved above */
+                (void)drain_ref_add(s, s->fetches[slot].request_stream_ref);
             fetch_free_entry(s, slot);
+        }
         return MOQ_OK;
     }
 
@@ -2206,9 +2263,20 @@ moq_result_t moq_session_end_fetch(
     if (s->fetches[slot].state != MOQ_FETCH_ACCEPTED)
         return MOQ_ERR_WRONG_STATE;
 
-    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-
     moq_fetch_entry_t *entry = &s->fetches[slot];
+
+    /* The response ends here (§5.2: the publisher can destroy FETCH state once
+     * the data stream is closed with FIN). On stream-correlated profiles the
+     * request stream has nothing more to carry either, so its local half is
+     * FINed in the same commit; while the fetcher's half is still open a drain
+     * slot absorbs its later FIN or RESET once the entry is gone. Everything
+     * is reserved first: WOULD_BLOCK leaves the fetch untouched. */
+    moq_stream_ref_t req_ref = entry->request_stream_ref;
+    bool close_req = req_ref._v != 0;
+    bool need_drain = close_req && !fetch_peer_fin_observed(entry);
+    if (action_queue_avail(s) < (close_req ? 2u : 1u)) return MOQ_ERR_WOULD_BLOCK;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
 
     moq_action_t a;
     memset(&a, 0, sizeof(a));
@@ -2223,6 +2291,10 @@ moq_result_t moq_session_end_fetch(
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
 
+    if (close_req)
+        (void)queue_close_bidi(s, req_ref);   /* reserved above */
+    if (need_drain)
+        (void)drain_ref_add(s, req_ref);      /* reserved above */
     fetch_free_entry(s, slot);
     return MOQ_OK;
 }

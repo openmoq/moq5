@@ -39,6 +39,9 @@ jobs:
 
       - name: Provision build dependencies
         run: |
+          python -m venv "$RUNNER_TEMP/python-build-venv"
+          source "$RUNNER_TEMP/python-build-venv/bin/activate"
+          echo "$RUNNER_TEMP/python-build-venv/bin" >> "$GITHUB_PATH"
           python -m pip download --only-binary=:all: \
             --dest "$RUNNER_TEMP/python-build-deps" \
             'build>=1.2,<2' 'scikit-build-core>=0.11,<2' 'cmake>=3.26,<4' ninja

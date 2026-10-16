@@ -104,6 +104,11 @@ void wtq_session_events_init(wtq_session_events_t *e)
 wtq_result_t wtq_session_close(wtq_session_t *s, uint32_t code,
                               const uint8_t *r, size_t n)
 { (void)s; (void)code; (void)r; (void)n; return WTQ_OK; }
+wtq_result_t wtq_session_send_datagram(wtq_session_t *s, const wtq_span_t *sp,
+                                       size_t n)
+{ (void)s; (void)sp; (void)n; return WTQ_OK; }
+size_t wtq_session_datagram_max_size(const wtq_session_t *s)
+{ (void)s; return 0; }
 void wtq_stream_add_ref(wtq_stream_t *st)
 {
     if (st == expired && !retained) stale_calls++;
@@ -195,7 +200,9 @@ int main(int argc, char **argv)
     ev_stream_opened(ws, st, false, c);
     watched_key = stream_find_by_handle(c, st)->id;
     if (generation_case) {
-        CHECK(c->ops.capabilities == (MOQ_TRANSPORT_CAP_WRITE_PAYLOAD | MOQ_TRANSPORT_CAP_HOLD_INPUT));
+        CHECK(c->ops.capabilities == (MOQ_TRANSPORT_CAP_DATAGRAM |
+                                      MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
+                                      MOQ_TRANSPORT_CAP_HOLD_INPUT));
         resume_conn = c;
         close_on_resume = resume_close || resume_reuse;
         close_on_pause = pause_close || pause_reuse;

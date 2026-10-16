@@ -16,6 +16,7 @@
 #include "pico_wt_harness.h"
 #include "pico_wt_test_seam.h"
 #include "picoquic_internal.h"
+#include <picoquic_utils.h>
 #include <moq/moq.h>
 
 #include <stdio.h>
@@ -46,7 +47,8 @@ typedef struct {
     uint64_t sid;
     bool     stream_present;
     uint64_t raw_code;        /* picoquic_get_remote_stream_error while live */
-    uint64_t mapped_code;     /* pico_wt_wt_err_to_moq(raw_code) */
+    uint64_t mapped_code;     /* pico_wt_wt_err_to_moq(raw_code), when mapped */
+    bool     has_mapped_code; /* raw_code is a WebTransport application code */
     bool     reset_received;
     uint64_t reset_offset;    /* reliable prefix the RESET_STREAM_AT carried */
 } term_rec_t;
@@ -69,7 +71,7 @@ static void term_observer(moq_pico_wt_conn_t *c, int event, uint64_t sid, int ph
     picoquic_stream_head_t *st = picoquic_find_stream(cnx, sid);
     r->stream_present = st != NULL;
     r->raw_code = picoquic_get_remote_stream_error(cnx, sid);
-    r->mapped_code = pico_wt_wt_err_to_moq(r->raw_code);
+    r->has_mapped_code = pico_wt_wt_err_to_moq(r->raw_code, &r->mapped_code);
     if (st) { r->reset_received = st->reset_received != 0; r->reset_offset = st->reset_offset; }
 }
 static void term_install(pico_wt_harness_t *h)
@@ -301,7 +303,7 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
             DCHECK(ann_reset.stream_present && ann_reset.reset_received);
             /* ...carrying the WT-mapped CANCELLED code, which maps back to 0x1... */
             DCHECK(ann_reset.raw_code == want);
-            DCHECK(ann_reset.mapped_code == 0x1);
+            DCHECK(ann_reset.has_mapped_code && ann_reset.mapped_code == 0x1);
             /* ...as RESET_STREAM_AT with the WT preamble as its reliable prefix,
              * exactly the size the client's endpoint recorded. */
             DCHECK(ann_reset.reset_offset > 0 &&
@@ -383,7 +385,8 @@ static int run_publish_namespace_done(pico_wt_harness_t *h, bool is_d18)
             DCHECK(n_ann2 == 1);
             if (n_ann2 == 1) {
                 DCHECK(ann2_reset.stream_present && ann2_reset.reset_received);
-                DCHECK(ann2_reset.raw_code == want && ann2_reset.mapped_code == 0x1);
+                DCHECK(ann2_reset.raw_code == want && ann2_reset.has_mapped_code &&
+                       ann2_reset.mapped_code == 0x1);
                 DCHECK(ann2_reset.reset_offset == 0);
             }
             DCHECK(term_reset_entries(h->server_conn, h->server_conn->control_stream_id, NULL) == 0);
@@ -401,6 +404,235 @@ done:
     term_remove();
 #undef DCHECK
     return local_failures;
+}
+
+/*
+ * A reset requested while the stream's WebTransport preamble is still queued
+ * in picoquic. picoquic takes a Reliable Size only up to the bytes it has
+ * sent, and WebTransport needs RESET_STREAM_AT to cover the preamble
+ * (draft-ietf-webtrans-http3 Section 4.4), so the endpoint accepts the reset,
+ * holds it until the preamble is out, and then sends RESET_STREAM_AT with the
+ * preamble as its reliable prefix. The peer associates the reset with the
+ * session and neither side fails.
+ */
+static int run_reset_before_preamble(pico_wt_harness_t *h)
+{
+    int local_failures = 0;
+#define RCHECK(cond) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL[%s]: %s:%d: %s\n", scenario, __FILE__, \
+                __LINE__, #cond); \
+        local_failures++; \
+    } } while (0)
+    moq_pico_wt_conn_t *c = h->client_conn;
+    pico_wt_endpoint_ctx_t *ep = &c->endpoint_ctx;
+    uint64_t sid = 0;
+    RCHECK(c->endpoint_ops.open_uni(ep, &sid) == MOQ_TRANSPORT_OK);
+    picoquic_stream_head_t *st = picoquic_find_stream(h->test_ctx->cnx_client, sid);
+    RCHECK(st != NULL && st->sent_offset == 0 && st->send_queue != NULL);
+
+    term_install(h);
+    RCHECK(c->endpoint_ops.reset_stream(ep, sid, 0x2) == MOQ_TRANSPORT_OK);
+    RCHECK(ep->deferred_count == 1);
+    pico_wt_harness_pump(h, 200);
+    term_remove();
+    RCHECK(ep->deferred_count == 0);
+
+    size_t preamble = 2 + picoquic_frames_varint_encode_length(ep->control_stream_id);
+    RCHECK(ep->last_reset_reliable_size == preamble);
+    RCHECK(!g_term_overflow);
+    term_rec_t r;
+    memset(&r, 0, sizeof(r));
+    int n = term_reset_entries(h->server_conn, sid, &r);
+    RCHECK(n == 1);
+    if (n == 1) {
+        RCHECK(r.stream_present && r.reset_received);
+        RCHECK(r.has_mapped_code && r.mapped_code == 0x2);
+        RCHECK(r.reset_offset == preamble);
+    }
+    RCHECK(!moq_pico_wt_conn_is_fatal(h->client_conn));
+    RCHECK(!moq_pico_wt_conn_is_fatal(h->server_conn));
+#undef RCHECK
+    return local_failures;
+}
+
+/* -- Deferred resets: failure, teardown and bound ----------------------- */
+
+static int g_reset_hook_rc;
+static int reset_hook(picoquic_cnx_t *cnx, uint64_t sid, uint64_t err, uint64_t rs)
+{
+    (void)cnx; (void)sid; (void)err; (void)rs;
+    return g_reset_hook_rc;
+}
+
+static int deferred_setup(pico_wt_harness_t *h, uint8_t cid_byte)
+{
+    pico_wt_harness_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cid_byte = cid_byte;
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    if (pico_wt_harness_setup(h, &cfg) != 0) return -1;
+    return pico_wt_harness_handshake(h);
+}
+
+/* Open a client uni stream and reset it before its preamble is sent. */
+static uint64_t open_and_reset(pico_wt_harness_t *h, moq_transport_result_t *rr)
+{
+    moq_pico_wt_conn_t *c = h->client_conn;
+    uint64_t sid = 0;
+    CHECK(c->endpoint_ops.open_uni(&c->endpoint_ctx, &sid) == MOQ_TRANSPORT_OK);
+    *rr = c->endpoint_ops.reset_stream(&c->endpoint_ctx, sid, 0x2);
+    return sid;
+}
+
+/*
+ * A deferred reset whose retry picoquic fails to issue (here: the reset
+ * frame cannot be queued) is a transport failure, reported through whichever
+ * entry point ran the retry -- service (via = 0) or an h3zero callback
+ * (via = 1) -- with the bridge's failed-reset code. Controls on the same
+ * connection, before the failure: a retry while the preamble is still unsent
+ * keeps the reset deferred and fails nothing.
+ */
+static void run_deferred_reset_failure(int via)
+{
+    scenario = via ? "deferred-reset-failure-callback" : "deferred-reset-failure-service";
+    pico_wt_harness_t h;
+    CHECK(deferred_setup(&h, (uint8_t)(0x41 + via)) == 0);
+    if (h.client_conn && h.server_conn) {
+        moq_pico_wt_conn_t *c = h.client_conn;
+        moq_transport_result_t rr;
+        (void)open_and_reset(&h, &rr);
+        CHECK(rr == MOQ_TRANSPORT_OK);
+        CHECK(c->endpoint_ctx.deferred_count == 1);
+        /* Control: still unsent, so the retry keeps it. */
+        CHECK(moq_pico_wt_service(c, h.now) == 0);
+        CHECK(c->endpoint_ctx.deferred_count == 1);
+        CHECK(!moq_pico_wt_conn_is_fatal(c));
+        /* The provider now fails to issue it. */
+        g_reset_hook_rc = PICOQUIC_ERROR_MEMORY;
+        pw_test_reset_stream_at = reset_hook;
+        int rc = via ? moq_pico_wt_callback(h.test_ctx->cnx_client, NULL, 0,
+                                            picohttp_callback_connecting, NULL, c)
+                     : moq_pico_wt_service(c, h.now);
+        pw_test_reset_stream_at = NULL;
+        CHECK(rc == -1);
+        CHECK(moq_pico_wt_conn_is_fatal(c));
+        CHECK(moq_transport_bridge_fatal_code(c->bridge) == 0x1);
+        CHECK(c->endpoint_ctx.deferred_count == 0);
+    }
+    pw_test_reset_stream_at = NULL;
+    pico_wt_harness_cleanup(&h);
+}
+
+/*
+ * A deferred reset whose stream has meanwhile ended and retired is settled
+ * without error: the retry finds no stream and nothing is owed.
+ */
+static void run_deferred_reset_retired(void)
+{
+    scenario = "deferred-reset-retired";
+    pico_wt_harness_t h;
+    CHECK(deferred_setup(&h, 0x43) == 0);
+    if (h.client_conn && h.server_conn) {
+        moq_pico_wt_conn_t *c = h.client_conn;
+        moq_transport_result_t rr;
+        uint64_t sid = open_and_reset(&h, &rr);
+        CHECK(rr == MOQ_TRANSPORT_OK && c->endpoint_ctx.deferred_count == 1);
+        /* Keep the record while the stream ends some other way. */
+        g_reset_hook_rc = PICOQUIC_ERROR_OFFSET_TOO_BIG;
+        pw_test_reset_stream_at = reset_hook;
+        CHECK(picoquic_reset_stream(h.test_ctx->cnx_client, sid, 0x9) == 0);
+        for (int i = 0; i < 200 && picoquic_find_stream(h.test_ctx->cnx_client, sid); i++)
+            pico_wt_harness_pump(&h, 20);
+        pw_test_reset_stream_at = NULL;
+        CHECK(picoquic_find_stream(h.test_ctx->cnx_client, sid) == NULL);
+        CHECK(c->endpoint_ctx.deferred_count == 1);
+        CHECK(moq_pico_wt_service(c, h.now) == 0);
+        CHECK(c->endpoint_ctx.deferred_count == 0);
+        CHECK(!moq_pico_wt_conn_is_fatal(c));
+    }
+    pw_test_reset_stream_at = NULL;
+    pico_wt_harness_cleanup(&h);
+}
+
+/*
+ * Detaching the session while a reset waits for its preamble. The QUIC
+ * connection survives, and the stream's send side is still terminated:
+ * session teardown resets it with WT_SESSION_GONE (WebTransport-H3 Section
+ * 6), which needs its send side to be recorded as unfinished.
+ */
+static void run_deferred_reset_detach(void)
+{
+    scenario = "deferred-reset-detach";
+    pico_wt_harness_t h;
+    CHECK(deferred_setup(&h, 0x44) == 0);
+    if (h.client_conn && h.server_conn) {
+        moq_transport_result_t rr;
+        uint64_t sid = open_and_reset(&h, &rr);
+        CHECK(rr == MOQ_TRANSPORT_OK && h.client_conn->endpoint_ctx.deferred_count == 1);
+        h3zero_stream_ctx_t *sc = h3zero_find_stream(h.client_h3_ctx, sid);
+        CHECK(sc != NULL && !sc->ps.stream_state.is_fin_sent);
+        moq_pico_wt_conn_destroy(h.client_conn);
+        h.client_conn = NULL;
+        picoquic_cnx_t *cnx = h.test_ctx->cnx_client;
+        CHECK(picoquic_get_cnx_state(cnx) == picoquic_state_ready);
+        picoquic_stream_head_t *st = picoquic_find_stream(cnx, sid);
+        CHECK(st == NULL || (st->reset_requested &&
+                             st->local_error == H3ZERO_WEBTRANSPORT_SESSION_GONE));
+        pico_wt_harness_pump(&h, 300);
+        CHECK(picoquic_get_cnx_state(cnx) == picoquic_state_ready);
+        st = picoquic_find_stream(cnx, sid);
+        CHECK(st == NULL || (st->reset_requested && st->reset_sent));
+    }
+    pico_wt_harness_cleanup(&h);
+}
+
+/*
+ * Deferred resets are bounded. With the peer's stream credit withheld no
+ * preamble can be sent, so every reset waits; once PICO_WT_DEFERRED_RESETS_MAX
+ * wait, the next reset is refused with WOULD_BLOCK (the bridge keeps and
+ * retries it) and changes nothing. Granting credit lets the preambles out, the
+ * waiting resets are issued, and the refused one then goes through.
+ */
+static void run_deferred_reset_bound(void)
+{
+    scenario = "deferred-reset-bound";
+    pico_wt_harness_t h;
+    CHECK(deferred_setup(&h, 0x45) == 0);
+    if (h.client_conn && h.server_conn) {
+        moq_pico_wt_conn_t *c = h.client_conn;
+        picoquic_cnx_t *cnx = h.test_ctx->cnx_client;
+        uint64_t granted = cnx->max_streams_unidir_remote;
+        uint64_t next = picoquic_get_next_local_stream_id(cnx, 1);
+        cnx->max_streams_unidir_remote = STREAM_RANK_FROM_ID(next) - 1;
+        moq_transport_result_t rr = MOQ_TRANSPORT_OK;
+        for (unsigned i = 0; i < PICO_WT_DEFERRED_RESETS_MAX; i++) {
+            (void)open_and_reset(&h, &rr);
+            CHECK(rr == MOQ_TRANSPORT_OK);
+        }
+        CHECK(c->endpoint_ctx.deferred_count == PICO_WT_DEFERRED_RESETS_MAX);
+        uint64_t extra = open_and_reset(&h, &rr);
+        CHECK(rr == MOQ_TRANSPORT_WOULD_BLOCK);
+        CHECK(c->endpoint_ctx.deferred_count == PICO_WT_DEFERRED_RESETS_MAX);
+        h3zero_stream_ctx_t *sc = h3zero_find_stream(h.client_h3_ctx, extra);
+        picoquic_stream_head_t *st = picoquic_find_stream(cnx, extra);
+        CHECK(sc != NULL && !sc->ps.stream_state.is_fin_sent);
+        CHECK(st != NULL && !st->reset_requested);
+        pico_wt_harness_pump(&h, 200);
+        CHECK(c->endpoint_ctx.deferred_count == PICO_WT_DEFERRED_RESETS_MAX);
+        CHECK(!moq_pico_wt_conn_is_fatal(c));
+        /* Release: the peer's credit arrives. */
+        uint64_t withheld = cnx->max_streams_unidir_remote;
+        cnx->max_streams_unidir_remote = granted;
+        picoquic_add_output_streams(cnx, withheld, granted, 0);
+        picoquic_reinsert_by_wake_time(cnx->quic, cnx, h.now);
+        pico_wt_harness_pump(&h, 500);
+        CHECK(c->endpoint_ctx.deferred_count == 0);
+        CHECK(c->endpoint_ops.reset_stream(&c->endpoint_ctx, extra, 0x2) == MOQ_TRANSPORT_OK);
+        CHECK(c->endpoint_ctx.deferred_count == 0);
+        CHECK(!moq_pico_wt_conn_is_fatal(c));
+    }
+    pico_wt_harness_cleanup(&h);
 }
 
 static void run_version(uint8_t cid_byte, moq_version_t version)
@@ -423,15 +655,18 @@ static void run_version(uint8_t cid_byte, moq_version_t version)
         failures += run_subscribe_object(&h, "v");
         failures += run_publish_namespace_done(
             &h, version == MOQ_VERSION_DRAFT_18);
+        failures += run_reset_before_preamble(&h);
     }
     pico_wt_harness_cleanup(&h);
 }
 
 /*
  * WebTransport §4.4 error-code mapping boundaries (pure helper coverage, no
- * transport). The additive base is only correct below the first reserved
+ * transport). An additive base is only correct below the first reserved
  * GREASE point; the real mapping skips one code every 0x1e, bounds the space
- * to UINT32_MAX, and preserves non-WebTransport values unchanged.
+ * to UINT32_MAX, and reports every non-WebTransport value as carrying no
+ * application code. The adapter's encoder matches picoquic's
+ * H3ZERO_WEBTRANSPORT_APPLICATION_ERROR.
  */
 static void run_error_code_mapping(void)
 {
@@ -439,6 +674,7 @@ static void run_error_code_mapping(void)
     const uint64_t FIRST = H3ZERO_WEBTRANSPORT_APPLICATION_ERROR(0);
     const uint64_t LAST =
         FIRST + (uint64_t)UINT32_MAX + (uint64_t)UINT32_MAX / 0x1e;
+    CHECK(LAST == H3ZERO_WEBTRANSPORT_APPLICATION_ERROR_LAST);
     uint64_t out = 0;
 
     /* Exact encode + round-trip across the first GREASE skip and the edges. */
@@ -453,7 +689,11 @@ static void run_error_code_mapping(void)
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         CHECK(pico_wt_moq_err_to_wt(cases[i].n, &out));
         CHECK(out == cases[i].enc);
-        CHECK(pico_wt_wt_err_to_moq(cases[i].enc) == cases[i].n);
+        /* The provider's encoder agrees. */
+        CHECK(out == H3ZERO_WEBTRANSPORT_APPLICATION_ERROR(cases[i].n));
+        uint64_t back = UINT64_MAX;
+        CHECK(pico_wt_wt_err_to_moq(cases[i].enc, &back));
+        CHECK(back == cases[i].n);
     }
 
     /* Outbound rejects codes beyond UINT32_MAX (not WebTransport codes). */
@@ -461,14 +701,19 @@ static void run_error_code_mapping(void)
     CHECK(!pico_wt_moq_err_to_wt(UINT64_MAX, &out));
 
     /* The first reserved HTTP/3 GREASE point (FIRST + 0x1e) is not a valid
-     * WebTransport code and is preserved unchanged, never decoded. */
-    CHECK(pico_wt_wt_err_to_moq(FIRST + 0x1e) == FIRST + 0x1e);
+     * WebTransport code: no application code, and the output is untouched. */
+    out = 0xabc;
+    CHECK(!pico_wt_wt_err_to_moq(FIRST + 0x1e, &out));
+    CHECK(out == 0xabc);
 
-    /* Values outside [FIRST, LAST] pass through unchanged: a legacy peer's
-     * raw MoQ code, a plain HTTP/3 error, or anything above the range. */
-    CHECK(pico_wt_wt_err_to_moq(0x1) == 0x1);
-    CHECK(pico_wt_wt_err_to_moq(FIRST - 1) == FIRST - 1);
-    CHECK(pico_wt_wt_err_to_moq(LAST + 1) == LAST + 1);
+    /* Values outside [FIRST, LAST] carry no application code (§4.4): a bare
+     * small value a peer sent unmapped, a plain HTTP/3 error such as
+     * WT_SESSION_GONE, or anything above the range. */
+    CHECK(!pico_wt_wt_err_to_moq(0x1, &out));
+    CHECK(!pico_wt_wt_err_to_moq(0x170d7b68, &out));
+    CHECK(!pico_wt_wt_err_to_moq(FIRST - 1, &out));
+    CHECK(!pico_wt_wt_err_to_moq(LAST + 1, &out));
+    CHECK(out == 0xabc);
 }
 
 int main(void)
@@ -482,6 +727,13 @@ int main(void)
     /* Symmetric uni-control establish + request-bidi routing + subgroup
      * data delivery. */
     run_version(0x18, MOQ_VERSION_DRAFT_18);
+
+    /* Resets that wait for their WebTransport preamble. */
+    run_deferred_reset_failure(0);
+    run_deferred_reset_failure(1);
+    run_deferred_reset_retired();
+    run_deferred_reset_detach();
+    run_deferred_reset_bound();
 
     if (failures == 0)
         printf("PASS: pico_wt_d18\n");

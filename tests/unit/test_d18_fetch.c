@@ -288,7 +288,7 @@ int main(void)
         moq_session_destroy(s);
     }
 
-    /* == D2. A terminal joining reject whose FETCH already carried FIN must NOT
+    /* == D.2. A terminal joining reject whose FETCH already carried FIN must NOT
      *        leave a drain ref behind (no slot leak) — there is no late FIN to
      *        absorb. == */
     {

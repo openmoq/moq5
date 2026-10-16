@@ -28,7 +28,7 @@ uint64_t moq_mvfst_managed_credit_block_count(const moq_mvfst_managed_t *m);
 /*
  * Total peer stream-credit grants observed via mvfst's
  * onUni/BidirectionalStreamsAvailable callbacks. > 0 proves the retry was
- * driven by the credit callback path (the fix), not only the poll loop.
+ * driven by the credit callback path, not only the poll loop.
  */
 uint64_t moq_mvfst_managed_credit_grant_count(const moq_mvfst_managed_t *m);
 

@@ -304,6 +304,18 @@ write_single(const moqr_core_stats_t *core, const moqr_bind_stats_t *bind,
            (unsigned long long)core->bindings);
     gauge1(&w, "moqrelay_tracks", "Live tracks.", base,
            (unsigned long long)core->tracks);
+    if (w.ext) {
+        gauge1(&w, "moqrelay_tracks_reclaimable",
+               "Live tracks that are pure cache (source released, nothing reading): evicted first when the table is full, or after the idle bound.", base,
+               (unsigned long long)core->tracks_reclaimable);
+        header(&w, "moqrelay_track_evictions_total",
+               "Reclaimable tracks freed, by reason: capacity (to admit a new track) or idle (past the idle bound).",
+               "counter");
+        emit(&w, "moqrelay_track_evictions_total", base, "reason", "capacity",
+             (unsigned long long)core->tracks_evicted_capacity);
+        emit(&w, "moqrelay_track_evictions_total", base, "reason", "idle",
+             (unsigned long long)core->tracks_evicted_idle);
+    }
 
     header(&w, "moqrelay_subscriptions",
            "Live downstream subscriptions, by state.", "gauge");
@@ -314,6 +326,14 @@ write_single(const moqr_core_stats_t *core, const moqr_bind_stats_t *bind,
 
     gauge1(&w, "moqrelay_namespace_nodes", "Namespace trie nodes.", base,
            (unsigned long long)core->ns_nodes);
+    if (w.ext) {
+        gauge1(&w, "moqrelay_namespace_nodes_reclaimable",
+               "Namespace trie nodes nothing references; freed when an announce needs the room.", base,
+               (unsigned long long)core->ns_nodes_reclaimable);
+        counter1(&w, "moqrelay_namespace_nodes_reclaimed_total",
+                 "Namespace trie nodes freed once nothing referenced them.", base,
+                 (unsigned long long)core->ns_nodes_reclaimed);
+    }
     gauge1(&w, "moqrelay_namespace_subscriptions",
            "Live namespace (prefix) subscriptions.", base,
            (unsigned long long)core->ns_subs);
@@ -468,6 +488,12 @@ static unsigned long long mvg_tracks(const moqr_snapshot_view_t *v)
 { return v->core->tracks; }
 static unsigned long long mvg_ns_nodes(const moqr_snapshot_view_t *v)
 { return v->core->ns_nodes; }
+static unsigned long long mvg_tracks_reclaimable(const moqr_snapshot_view_t *v)
+{ return v->core->tracks_reclaimable; }
+static unsigned long long mvg_ns_reclaimable(const moqr_snapshot_view_t *v)
+{ return v->core->ns_nodes_reclaimable; }
+static unsigned long long mvg_ns_reclaimed(const moqr_snapshot_view_t *v)
+{ return v->core->ns_nodes_reclaimed; }
 static unsigned long long mvg_retained(const moqr_snapshot_view_t *v)
 { return v->core->retained_bytes; }
 static unsigned long long mvg_intent_hwm(const moqr_snapshot_view_t *v)
@@ -676,6 +702,35 @@ write_multi(const moqr_snapshot_view_t *vs, uint32_t n, moqr_obs_format_t fmt,
               vs, n, cbases, NULL, mvg_bindings, MV_AGG_SUM);
     mv_family(&w, "moqrelay_tracks", "Live tracks.", "gauge", vs, n, cbases,
               NULL, mvg_tracks, MV_AGG_SUM);
+    if (w.ext) {
+        mv_family(&w, "moqrelay_tracks_reclaimable",
+                  "Live tracks that are pure cache (source released, nothing reading): evicted first when the table is full, or after the idle bound.",
+                  "gauge", vs, n, cbases, NULL, mvg_tracks_reclaimable,
+                  MV_AGG_SUM);
+        static const char k_ev_help[] =
+            "Reclaimable tracks freed, by reason: capacity (to admit a new track) or idle (past the idle bound).";
+        header(&w, "moqrelay_track_evictions_total", k_ev_help, "counter");
+        unsigned long long cap_acc = 0, idle_acc = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            emit(&w, "moqrelay_track_evictions_total", cbases[i], "reason",
+                 "capacity",
+                 (unsigned long long)vs[i].core->tracks_evicted_capacity);
+            emit(&w, "moqrelay_track_evictions_total", cbases[i], "reason",
+                 "idle", (unsigned long long)vs[i].core->tracks_evicted_idle);
+            cap_acc += vs[i].core->tracks_evicted_capacity;
+            idle_acc += vs[i].core->tracks_evicted_idle;
+        }
+        header(&w, "moqrelay_process_track_evictions_total", k_ev_help,
+               "counter");
+        mw_addf(&w,
+                "moqrelay_process_track_evictions_total{reason=\"capacity\"} "
+                "%llu\n",
+                cap_acc);
+        mw_addf(&w,
+                "moqrelay_process_track_evictions_total{reason=\"idle\"} "
+                "%llu\n",
+                idle_acc);
+    }
 
     header(&w, "moqrelay_subscriptions",
            "Live downstream subscriptions, by state (pump subscriptions "
@@ -711,6 +766,16 @@ write_multi(const moqr_snapshot_view_t *vs, uint32_t n, moqr_obs_format_t fmt,
 
     mv_family(&w, "moqrelay_namespace_nodes", "Namespace trie nodes.",
               "gauge", vs, n, cbases, NULL, mvg_ns_nodes, MV_AGG_SUM);
+    if (w.ext) {
+        mv_family(&w, "moqrelay_namespace_nodes_reclaimable",
+                  "Namespace trie nodes nothing references; freed when an announce needs the room.",
+                  "gauge", vs, n, cbases, NULL, mvg_ns_reclaimable,
+                  MV_AGG_SUM);
+        mv_family(&w, "moqrelay_namespace_nodes_reclaimed_total",
+                  "Namespace trie nodes freed once nothing referenced them.",
+                  "counter", vs, n, cbases, NULL, mvg_ns_reclaimed,
+                  MV_AGG_SUM);
+    }
     mv_family(&w, "moqrelay_namespace_subscriptions",
               "Live namespace (prefix) subscriptions (manager watcher "
               "excluded).", "gauge", vs, n, cbases, NULL, mvg_ns_subs,

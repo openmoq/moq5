@@ -155,10 +155,49 @@ static void test_install(void)
 #endif
 }
 
+static moq_picoquic_cert_verdict_t unsupported_callback(
+    void *ctx, moq_bytes_t server_name,
+    const moq_bytes_t *certificates, size_t certificate_count)
+{
+    (void)ctx; (void)server_name; (void)certificates; (void)certificate_count;
+    return MOQ_PICOQUIC_CERT_TRUST;
+}
+
+/* The mbedTLS provider answers "no" and refuses the install, never accepting
+ * a callback it would ignore. */
+static void test_callback_unsupported(void)
+{
+    picoquic_quic_t quic = {0};
+    ptls_verify_certificate_t previous = {0};
+    quic.verifier = &previous;
+    quic.dispose = ptls_mbedtls_dispose_verify_certificate;
+    unsigned int allocated0 = allocated_count;
+    unsigned int disposed0 = disposed_count;
+    unsigned int setters0 = legacy_setter_count + extended_setter_count;
+    CHECK(!moq_picoquic_supports_cert_verify_callback(),
+          "callback.mbedtls_unsupported");
+    CHECK(moq_picoquic_set_cert_verify_callback(&quic, unsupported_callback, NULL) == MOQ_ERR_UNSUPPORTED,
+          "callback.mbedtls_refused");
+    CHECK(moq_picoquic_set_cert_verify_callback(NULL, unsupported_callback, NULL) == MOQ_ERR_INVAL,
+          "callback.null_quic_before_unsupported");
+    CHECK(moq_picoquic_set_cert_verify_callback(&quic, NULL, NULL) == MOQ_ERR_INVAL,
+          "callback.null_callback_before_unsupported");
+    CHECK(moq_picoquic_set_cert_verify_callback(NULL, NULL, NULL) == MOQ_ERR_INVAL,
+          "callback.both_null_before_unsupported");
+    CHECK(allocated_count == allocated0 && disposed_count == disposed0,
+          "callback.no_allocation_or_disposal");
+    CHECK(legacy_setter_count + extended_setter_count == setters0,
+          "callback.no_setter_call");
+    CHECK(quic.verifier == &previous &&
+          quic.dispose == ptls_mbedtls_dispose_verify_certificate,
+          "callback.mbedtls_previous_owner_preserved");
+}
+
 int main(void)
 {
     test_ca_preflight();
     test_install();
+    test_callback_unsupported();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

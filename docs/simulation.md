@@ -860,16 +860,23 @@ also fails. This holds for all scenario runner invariants
 
 ## Fuzz Targets
 
-Five fuzz targets exercise moq-core with arbitrary inputs under
-ASan and UBSan:
+Ten fuzz targets exercise `moq-core` and the media libraries (`moq-loc`,
+`moq-cmaf`, `moq-msf`) with arbitrary inputs under ASan and UBSan (plus
+`fuzz_relay_admin_http` when the relay tool tier is built):
 
 | Target | Scope |
 |--------|-------|
 | `fuzz_quic_varint` | QUIC varint roundtrip |
 | `fuzz_kvp_decode` | KVP decoder |
 | `fuzz_control_d16` | D16 control message codec + subgroup header |
-| `fuzz_session_control` | Full session state machine via `on_control_bytes` |
+| `fuzz_control_d18` | D18 control/request message codec + headers/datagrams/properties |
+| `fuzz_session_control` | Full D16 session state machine via `on_control_bytes` |
 | `fuzz_session_data` | Data parser via `on_data_bytes` with split modes |
+| `fuzz_session_d18` | Full D18 session state machine (`on_control_bytes`, `on_request_bytes`, `on_response_bytes`, `on_data_bytes`, `on_datagram`) |
+| `fuzz_loc` | LOC header extension parse/encode roundtrip (D16 QUIC-varint and D18 `vi64` KVP codecs) |
+| `fuzz_cmaf` | CMAF ISO BMFF init (`ftyp`+`moov`/CENC), fragment (`moof`+`mdat`), and object validation |
+| `fuzz_msf` | MSF-01 / CMSF-01 JSON catalog parse/encode, delta apply, media timeline, and Base64 `initData` |
+| `fuzz_relay_admin_http` | Relay admin HTTP request parser (when `moqr-admin` is built) |
 
 Fuzz targets build only when `MOQ_BUILD_FUZZ=ON` and the compiler
 provides libFuzzer. Normal and nosim CTest counts are unaffected.
@@ -904,7 +911,7 @@ Or without presets:
 ```bash
 CC=/opt/homebrew/opt/llvm/bin/clang \
   cmake -S . -B build/fuzz-check \
-  -DMOQ_BUILD_FUZZ=ON -DMOQ_BUILD_SIM=ON
+  -DMOQ_BUILD_FUZZ=ON -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_SIM=ON
 ```
 
 ### MOQ_REQUIRE_FUZZ
@@ -920,10 +927,11 @@ CC=/opt/homebrew/opt/llvm/bin/clang \
 
 ### CTest smoke tests
 
-When fuzz targets build successfully, 7 CTest tests are registered:
-5 empty-input startup smoke tests and 2 corpus smoke tests that
-feed valid protocol messages to prove the session targets reach
-the parser.
+When fuzz targets build successfully with the `fuzz` preset, 17 CTest
+tests are registered: 10 empty-input startup smoke tests and 7 corpus
+smoke tests (`control_d18`, `session_control`, `session_data`,
+`session_d18`, `loc`, `cmaf`, `msf`) that replay committed seed corpora
+to prove the targets reach their parsers and satisfy all property checks.
 
 ### Running fuzz sessions
 
@@ -933,6 +941,16 @@ build/fuzz-check/fuzz/fuzz_session_control \
   fuzz/corpus/session_control -runs=0
 build/fuzz-check/fuzz/fuzz_session_data \
   fuzz/corpus/session_data -runs=0
+build/fuzz-check/fuzz/fuzz_control_d18 \
+  fuzz/corpus/control_d18 -runs=0
+build/fuzz-check/fuzz/fuzz_session_d18 \
+  fuzz/corpus/session_d18 -runs=0
+build/fuzz-check/fuzz/fuzz_loc \
+  fuzz/corpus/loc -runs=0
+build/fuzz-check/fuzz/fuzz_cmaf \
+  fuzz/corpus/cmaf -runs=0
+build/fuzz-check/fuzz/fuzz_msf \
+  fuzz/corpus/msf -runs=0
 
 # Short fuzz session (10k iterations)
 build/fuzz-check/fuzz/fuzz_session_control -max_len=4096 -runs=10000

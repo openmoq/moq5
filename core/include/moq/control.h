@@ -507,7 +507,7 @@ MOQ_API moq_result_t moq_d16_decode_object_fields(
  * Encode object framing header only (delta + payload_len + status).
  * Does NOT write payload bytes. For SEND_DATA inline header[32].
  * Zero-length Normal: encodes explicit status 0x0.
- * No extensions in first slice.
+ * Writes no extensions.
  */
 MOQ_API moq_result_t moq_d16_encode_object_header(
     moq_buf_writer_t *w,

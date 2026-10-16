@@ -28,12 +28,12 @@ until the receiver's observations are complete -- `publish()` returning
 "submitted" does NOT release them -- and closes only when the supervisor says
 the observations are done.
 
-    python -I bindings/python/tests/runtime/run_finite_publisher.py --oracle-red
+    python -I bindings/python/tests/runtime/run_finite_publisher.py --oracle-selftest
     python -I bindings/python/tests/runtime/run_finite_publisher.py --child-controls
     env -i PATH=/usr/bin:/bin DYLD_FALLBACK_LIBRARY_PATH=<msquic dylib dir> \
       python -I bindings/python/tests/runtime/run_finite_publisher.py \
         --package <installed moq5 dir> --relay <moq5-relay> [--negative]
-    python -I bindings/python/tests/runtime/run_finite_publisher.py --verdict-red <run dir>
+    python -I bindings/python/tests/runtime/run_finite_publisher.py --verdict-mutations <run dir>
 """
 
 import datetime, importlib.util, json, os, re, select, sys, threading, time, traceback
@@ -1074,8 +1074,8 @@ def verdict(rec):
 
 
 def healthy_receipt():
-    """A receipt that is healthy in every checked respect, as the offline REDs'
-    control. Built from the declared contract, never from a run."""
+    """A receipt that is healthy in every checked respect, as the offline
+    self-checks' control. Built from the declared contract, never from a run."""
     module = "/p/moq5/_native.abi3.so"
     msquic = "/p/msquic/libmsquic.2.6.0.dylib"
     images = [module, msquic, "/usr/lib/libSystem.B.dylib",
@@ -1143,7 +1143,7 @@ def healthy_receipt():
     }
 
 
-def oracle_red():
+def oracle_selftest():
     """Offline: the ACTUAL verdict must reject each named defect, by its own
     class, while the healthy control is accepted. Every case is a receipt that
     is healthy except for the defect it is named for."""
@@ -1879,7 +1879,7 @@ def diagnostic_controls():
     return 0 if ok else 1
 
 
-def verdict_red(run_dir):
+def verdict_mutations(run_dir):
     """Post-run: the verdict must reject mutations of a REAL receipt."""
     import copy
 
@@ -1907,8 +1907,8 @@ def verdict_red(run_dir):
 
 
 def main(argv):
-    if "--oracle-red" in argv:
-        return oracle_red()
+    if "--oracle-selftest" in argv:
+        return oracle_selftest()
     if "--child-controls" in argv:
         return child_controls()
     if "--reader-controls" in argv:
@@ -1917,8 +1917,8 @@ def main(argv):
         return diagnostic_controls()
     if "--reader-child" in argv:
         return reader_child(argv[argv.index("--reader-child") + 1])
-    if "--verdict-red" in argv:
-        return verdict_red(argv[argv.index("--verdict-red") + 1])
+    if "--verdict-mutations" in argv:
+        return verdict_mutations(argv[argv.index("--verdict-mutations") + 1])
     if "--publisher" in argv:
         i = argv.index("--publisher")
         return publisher_main(Path(argv[i + 1]), int(argv[i + 2]), argv[i + 3],

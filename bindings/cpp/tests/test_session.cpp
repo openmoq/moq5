@@ -636,8 +636,8 @@ int main()
     // (which calls moq_event_cleanup / moq_action_cleanup). White-box: build the
     // polled object over a WRAPPED rcbuf whose release callback flips `freed`,
     // save the variant past the polled object's scope, and assert the buffer is
-    // NOT freed -- a deterministic lifetime check (independent of ASan). Pre-fix
-    // the variant copied an unowned raw pointer, so `freed` would already be true.
+    // NOT freed -- a deterministic lifetime check (independent of ASan). A variant
+    // that copied an unowned raw pointer would leave `freed` already true.
     {
         const moq_alloc_t *al = moq_alloc_default();
         static const uint8_t data[4] = {0xCA, 0xFE, 0xBA, 0xBE};
@@ -887,6 +887,44 @@ int main()
         MOQ_CHECK(pf.reset_error_code() == 0x9);
         MOQ_CHECK(pf.reset_data_stream());
         MOQ_CHECK(!pf.reset_stop_sending());
+    }
+
+    // -- SETUP authorization tokens through session_config ----------------
+    // The client's tokens reach the server's setup_complete by value; the
+    // session holds its own copy, so the caller's storage may change after
+    // create.
+    {
+        uint8_t value[] = {0x0a, 0x0b};
+        moq_auth_token_t tok{3, {value, sizeof(value)}};
+        moq::session_config ccfg{};
+        ccfg.perspective = moq::perspective::client;
+        ccfg.setup_auth_tokens = std::span<const moq_auth_token_t>(&tok, 1);
+        moq::session_config scfg{};
+        scfg.perspective = moq::perspective::server;
+        auto cr = moq::session::create(ccfg, 0);
+        auto sr = moq::session::create(scfg);
+        MOQ_CHECK(cr.ok());
+        MOQ_CHECK(sr.ok());
+        value[0] = 0x99;
+        auto &c = *cr;
+        auto &s = *sr;
+        c.start(0);
+        pump_control(c, s, 0);
+        bool seen = false;
+        while (auto ev = s.poll_event()) {
+            ev->visit(
+                [&](const moq::event::setup_complete &sc) {
+                    seen = true;
+                    MOQ_CHECK(sc.tokens.size() == 1);
+                    if (sc.tokens.size() == 1) {
+                        MOQ_CHECK(sc.tokens[0].token_type == 3);
+                        MOQ_CHECK(sc.tokens[0].token_value.len == 2);
+                        MOQ_CHECK(sc.tokens[0].token_value.data[0] == 0x0a);
+                    }
+                },
+                [](const auto &) {});
+        }
+        MOQ_CHECK(seen);
     }
 
     MOQ_PASS("test_cpp_session");

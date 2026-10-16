@@ -1,17 +1,15 @@
 """The sender's bounded wait: Sender.wait(timeout_us) -> WaitResult.
 
-These rows were written RED, against a method that did not exist, and each
-failed by a NAMED missing behaviour rather than skipping. The method exists
-now and they pass. The gate is kept: a missing or inert name is still a named
-failure, the substrate rows still drive the ACTUAL native mirror on their own,
-the owned-child envelope still bounds every concurrent scenario, and the
-controls still prove this file's own machinery discriminates.
+Every row fails by a NAMED missing behaviour rather than skipping: a missing
+or inert name is a named failure, the substrate rows drive the ACTUAL native
+mirror on their own, the owned-child envelope bounds every concurrent
+scenario, and the controls prove this file's own machinery discriminates.
 
 Scope: ONE bounded wait. Not a completion barrier, not a drain, not a flush,
 and not a promise about a later write. Waiting writes nothing, ends nothing,
 clears no latch and destroys no owner.
 
-The contract, re-derived from THIS worktree:
+The contract, from the sources:
 
   service/include/moq/media_sender.h:660-683
       Block until the WRITE LEVEL holds, the endpoint wakes, or the timeout
@@ -482,14 +480,14 @@ class WaitGatedBase(WaitFixtureBase):
     before the row acquires an endpoint."""
 
     def require_surface(self):
-        # Kept after GREEN: an inert or removed name must still fail by name.
+        # An inert or removed name must fail by name.
         missing = missing_surface()
         if missing:
             self.fail("the sender wait surface is not implemented: "
                       f"moq5.Sender is missing {', '.join(missing)}")
 
     def scripted(self, results, **kwargs):
-        """The SHARED scripted clock and native wait the accepted foundation
+        """The SHARED scripted clock and native wait the foundation
         rows use, aimed at the sender's own bridge."""
         script = foundation.ScriptedWait(results, **kwargs)
         return script, (
@@ -1352,8 +1350,8 @@ class WaitSubstrateBoundaryTests(WaitFixtureBase):
 
     `_test_sender_wait_simulate` releases the GIL exactly as the bridge must,
     so the held-interval, worker and settlement wiring the gated rows depend
-    on is proved HERE. It is NOT product evidence: the product's own
-    no-GIL-release discriminator is owed after GREEN.
+    on is proved HERE. It is NOT product evidence: this file does not
+    discriminate whether the product bridge itself releases the GIL.
     """
 
     # -- helpers used INSIDE the children ---------------------------------
@@ -1898,7 +1896,7 @@ def one_slice_clock(budget_us):
 
 
 class WaitNativeBoundaryTests(WaitGatedBase):
-    """What only the REAL bridge can show. RED until it exists.
+    """What only the REAL bridge can show; a missing bridge fails here.
 
     The surface check runs HERE, so a missing method is a named failure in
     this process. Everything concurrent then runs in an OWNED CHILD -- owner
@@ -2337,9 +2335,8 @@ class WaitControlTests(unittest.TestCase):
                 moq5.Sender.wait = saved
 
     def test_f_the_bridge_is_present_and_refuses_wrong_arguments(self):
-        # This row was the RED gate's "the bridge is absent" assertion. The
-        # bridge exists now, so it pins presence, callability and that a
-        # wrong-shaped call is refused rather than crashing.
+        # Pins the bridge's presence, callability and that a wrong-shaped
+        # call is refused rather than crashing.
         missing = tuple(n for n in BRIDGE if not hasattr(_native, n))
         self.assertEqual(missing, (), f"the wait bridge lost {missing}")
         for name in BRIDGE:

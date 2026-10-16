@@ -156,7 +156,7 @@ static void dump_inventory(const char *phase, const inventory_t *inv)
 #define MAX_ROWS 128
 typedef struct {
     const char *label;
-    const char *tag;            /* diagnostic prefix: NATIVE-RED / STANDIN-RED */
+    const char *tag;            /* diagnostic prefix: FAIL / CONTROL */
     bool        quiet;          /* controls: record only */
     int         fails;
     char        failed[MAX_ROWS][64];   /* copied: row names may be built in a scratch buffer */

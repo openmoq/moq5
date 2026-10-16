@@ -142,16 +142,15 @@ int main(int argc, char **argv)
         CHECK(srv_code == WT_ALPN_ERROR_CODE);
 
         /* -- callback event inventory (recorded on the network thread) -----
-         * Declared LITERALLY: this fixture produces exactly three callbacks,
-         * in this order, with these contexts. Presence-only checking would
-         * accept a reordering or a foreign extra event. */
+         * Declared LITERALLY: the facade's path callback sees exactly the
+         * CONNECT, on its own context. The body and FIN that follow reach the
+         * adapter through the control stream's own binding, never the path
+         * table. Presence-only checking would accept a foreign extra event. */
         static const struct {
             picohttp_call_back_event_t ev;
             moq_pwt_ctx_kind_t         ctx;
         } expect[] = {
             { picohttp_callback_connect,  MOQ_PWT_CTX_FACADE  },
-            { picohttp_callback_post,     MOQ_PWT_CTX_FACADE  },
-            { picohttp_callback_post_fin, MOQ_PWT_CTX_ADAPTER },
         };
         const size_t nexp = sizeof(expect) / sizeof(expect[0]);
 
@@ -186,8 +185,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "[ownership] post-body binding present=%d cb=%s ctx=%s\n",
                 present, cb_name(cb), ctx_name(ctx));
         CHECK(present == 1);
-        CHECK(cb == MOQ_PWT_CB_FACADE);      /* h3zero restored the path-table fn */
-        CHECK(ctx == MOQ_PWT_CTX_ADAPTER);   /* but kept the ADAPTER context */
+        CHECK(cb == MOQ_PWT_CB_ADAPTER);     /* the body kept the adapter's fn */
+        CHECK(ctx == MOQ_PWT_CTX_ADAPTER);   /* and the ADAPTER context */
         CHECK(ctx != MOQ_PWT_CTX_FACADE);
 
         /* -- detach the adapter, then re-read the SAME live stream --------- */

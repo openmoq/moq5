@@ -15,8 +15,7 @@
  *   --mode bigobj: server + one client; the server publishes a small
  *       control object and a 256 KiB object on one subgroup; the client
  *       verifies both arrive intact (exact length + byte pattern). The
- *       large transfer spans many packets/RTTs, so this mode waits by
- *       real elapsed time rather than an iteration count.
+ *       large transfer spans many packets/RTTs.
  *   --mode close: server + one client; after the object the client
  *       sends GOAWAY and (after the drain timer) reaches a clean
  *       terminal close — wait()/wake() return MOQ_ERR_CLOSED and the
@@ -80,11 +79,9 @@ typedef enum { RUN_OK = 1, RUN_RETRY = 0, RUN_HARD = -1 } run_status_t;
 
 /* Guards delivery of a large object over a WT subgroup stream: a small
  * control object followed by a 256 KiB object on the same subgroup, both
- * verified intact. A large object spans many packets and several RTTs, so
- * the test must wait by real elapsed time (see wait_realtime) — the
- * iteration-count loop used elsewhere assumes each wait() consumes its
- * full interval and under-budgets an active transfer. The control object
- * also proves the small path and ordering ahead of the big one. */
+ * verified intact. A large object spans many packets and several RTTs. The
+ * control object also proves the small path and ordering ahead of the big
+ * one. */
 #define BIGOBJ_SMALL          "ctrl"
 #define BIGOBJ_SMALL_LEN      4u
 #define BIGOBJ_BIG_SIZE       (256u * 1024u)
@@ -104,7 +101,15 @@ typedef struct {
     atomic_int saw_announce;     /* NAMESPACE_PUBLISHED surfaced */
     atomic_int announce_ns_ok;   /* ...with the exact expected parts */
     atomic_int saw_done;         /* NAMESPACE_DONE surfaced (withdrawal) */
+    /* datagram mode: the server subscribes to the client's track and waits
+     * for one of its objects to arrive as an intact datagram. */
+    int        subscribe_client;
+    int        subscribe_sent;
+    atomic_int got_datagram;
 } server_app_t;
+
+#define DGRAM_PAYLOAD     "managed-client-datagram"
+#define DGRAM_PAYLOAD_LEN (sizeof(DGRAM_PAYLOAD) - 1)
 
 static void serve_subscribe(moq_session_t *s, moq_subscription_t sub,
                             uint64_t now, server_app_t *a)
@@ -168,7 +173,26 @@ static int server_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
     if (!s) return 0;
     moq_event_t ev;
     while (moq_session_poll_events(s, &ev, 1) > 0) {
-        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !atomic_load(&a->published)) {
+        if (ev.kind == MOQ_EVENT_SETUP_COMPLETE && a->subscribe_client &&
+            !a->subscribe_sent) {
+            moq_subscribe_cfg_t sc;
+            moq_subscribe_cfg_init(&sc);
+            static const moq_bytes_t ns[] = { {(const uint8_t *)"dg", 2} };
+            sc.track_namespace.parts = ns;
+            sc.track_namespace.count = 1;
+            sc.track_name = (moq_bytes_t){(const uint8_t *)"t", 1};
+            sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+            moq_subscription_t sub;
+            if (moq_session_subscribe(s, &sc, now, &sub) >= 0)
+                a->subscribe_sent = 1;
+        } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED && a->subscribe_client) {
+            const moq_object_received_event_t *o = &ev.u.object_received;
+            if (o->datagram && o->payload &&
+                moq_rcbuf_len(o->payload) == DGRAM_PAYLOAD_LEN &&
+                memcmp(moq_rcbuf_data(o->payload), DGRAM_PAYLOAD,
+                       DGRAM_PAYLOAD_LEN) == 0)
+                atomic_store(&a->got_datagram, 1);
+        } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !atomic_load(&a->published)) {
             serve_subscribe(s, ev.u.subscribe_request.sub, now, a);
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED &&
                    a->expect_announce) {
@@ -229,6 +253,14 @@ typedef struct {
     int        do_done;
     int        done_sent;
     int        done_rc;          /* moq_session_publish_namespace_done() result */
+    /* datagram mode: accept the server's subscription and publish objects as
+     * datagrams (lossy, so one per pump) until the server has one. */
+    int        publish_datagram;
+    moq_subscription_t dg_sub;
+    int        dg_accepted;
+    uint64_t   dg_next_object;
+    int        dg_send_errors;
+    atomic_int *dg_delivered;    /* the server's got_datagram */
 } client_app_t;
 
 static void client_subscribe(moq_session_t *s, client_app_t *a)
@@ -254,6 +286,19 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
     if (!s) return 0;
     moq_event_t ev;
     while (moq_session_poll_events(s, &ev, 1) > 0) {
+        if (a->publish_datagram) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !a->dg_accepted) {
+                moq_accept_subscribe_cfg_t ac;
+                moq_accept_subscribe_cfg_init(&ac);
+                if (moq_session_accept_subscribe(s, ev.u.subscribe_request.sub,
+                                                 &ac, now) == MOQ_OK) {
+                    a->dg_sub = ev.u.subscribe_request.sub;
+                    a->dg_accepted = 1;
+                }
+            }
+            moq_event_cleanup(&ev);
+            continue;
+        }
         if (ev.kind == MOQ_EVENT_SETUP_COMPLETE && !a->subscribed) {
             if (a->do_announce) {
                 /* Relay-flow ordering: register the namespace first; the
@@ -325,6 +370,20 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
         }
         moq_event_cleanup(&ev);
     }
+    if (a->publish_datagram) {
+        if (a->dg_accepted && !atomic_load(a->dg_delivered)) {
+            moq_rcbuf_t *buf = NULL;
+            if (moq_rcbuf_create(moq_alloc_default(),
+                    (const uint8_t *)DGRAM_PAYLOAD, DGRAM_PAYLOAD_LEN, &buf) == MOQ_OK) {
+                if (moq_session_send_object_datagram(s, a->dg_sub, 0,
+                        a->dg_next_object++, 128, false, buf, NULL, 0,
+                        now) != MOQ_OK)
+                    a->dg_send_errors++;
+                moq_rcbuf_decref(buf);
+            }
+        }
+        return 0;
+    }
     if (a->initiate_goaway)
         return 0;  /* keep running to reach the terminal closed state */
     return atomic_load(&a->got_object) ? 1 : 0;  /* else pump-exit */
@@ -379,6 +438,8 @@ static int server_drop_reset_stream_at(picoquic_quic_t *quic, void *ctx)
  * per-create via the pointer below. */
 static uint64_t g_observed_uni_window;
 static int (*g_client_configure_quic)(picoquic_quic_t *, void *);
+/* Request credit the client grants the server (0 = none, the default). */
+static uint32_t g_client_request_capacity;
 
 static int capture_recv_window(picoquic_quic_t *quic, void *ctx)
 {
@@ -444,6 +505,10 @@ static moq_pico_wt_managed_t *make_client_ex2(int port, client_app_t *app,
     cfg.wt_protocols = wt_protocols;
     if (g_client_configure_quic)
         cfg.configure_quic = g_client_configure_quic;
+    if (g_client_request_capacity) {
+        cfg.send_request_capacity = true;
+        cfg.initial_request_capacity = g_client_request_capacity;
+    }
     moq_pico_wt_managed_t *cli = NULL;
     if (moq_pico_wt_managed_create(&cfg, &cli) != MOQ_OK)
         return NULL;
@@ -461,39 +526,108 @@ static moq_pico_wt_managed_t *make_client(int port, client_app_t *app)
     return make_client_ex(port, app, 0);
 }
 
-/* Wait up to budget for the client's object. */
+/* -- monotonic deadlines ------------------------------------------- *
+ * moq_pico_wt_managed_wait() returns early whenever the facade has activity,
+ * so a loop that counts calls as if each took its full timeout runs out of
+ * budget long before the time it stands for. Every wait in this file is
+ * bounded by a monotonic deadline instead: each call waits at most the time
+ * left, and the deadline compares whole timespecs. */
+typedef struct { struct timespec end; } mono_deadline_t;
+
+static mono_deadline_t deadline_after_ms(uint64_t ms)
+{
+    mono_deadline_t d;
+    clock_gettime(CLOCK_MONOTONIC, &d.end);
+    d.end.tv_sec += (time_t)(ms / 1000);
+    d.end.tv_nsec += (long)((ms % 1000) * 1000000);
+    if (d.end.tv_nsec >= 1000000000L) { d.end.tv_sec++; d.end.tv_nsec -= 1000000000L; }
+    return d;
+}
+
+/* Microseconds left before the deadline; 0 once it has passed. */
+static uint64_t deadline_left_us(const mono_deadline_t *d)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > d->end.tv_sec ||
+        (now.tv_sec == d->end.tv_sec && now.tv_nsec >= d->end.tv_nsec))
+        return 0;
+    int64_t us = (int64_t)(d->end.tv_sec - now.tv_sec) * 1000000 +
+                 (d->end.tv_nsec - now.tv_nsec) / 1000;
+    return us > 0 ? (uint64_t)us : 1;
+}
+
+/* The wait primitive the helpers call (a control swaps it in). */
+static moq_result_t (*g_wait_fn)(moq_pico_wt_managed_t *, uint64_t) =
+    moq_pico_wt_managed_wait;
+
+/* One wait on `m` of at most `step_us`, cut to the time left. Returns
+ * MOQ_DONE without waiting once the deadline has passed. */
+static moq_result_t wait_step(moq_pico_wt_managed_t *m, const mono_deadline_t *d,
+                              uint64_t step_us)
+{
+    uint64_t left = deadline_left_us(d);
+    if (left == 0) return MOQ_DONE;
+    return g_wait_fn(m, left < step_us ? left : step_us);
+}
+
+/* Wait on `m` until `done(ctx)` holds, the facade is terminal, or the
+ * deadline passes. Returns the last wait result (MOQ_DONE at the deadline). */
+static moq_result_t wait_until(moq_pico_wt_managed_t *m, const mono_deadline_t *d,
+                               uint64_t step_us, bool (*done)(void *), void *ctx)
+{
+    moq_result_t r = MOQ_DONE;
+    while (!(done && done(ctx))) {
+        if (deadline_left_us(d) == 0) return MOQ_DONE;
+        r = wait_step(m, d, step_us);
+        if (r == MOQ_ERR_CLOSED) break;
+    }
+    return r;
+}
+
+/* Let `m` run for `ms` of wall time. */
+static void settle(moq_pico_wt_managed_t *m, uint64_t ms)
+{
+    mono_deadline_t d = deadline_after_ms(ms);
+    (void)wait_until(m, &d, 100000, NULL, NULL);
+}
+
+static bool got_object_pred(void *ctx)
+{ return atomic_load(&((client_app_t *)ctx)->got_object) != 0; }
+
+static bool srv_closed_pred(void *ctx)
+{ return moq_pico_wt_managed_is_closed((moq_pico_wt_managed_t *)ctx); }
+
+static bool fatal_pred(void *ctx)
+{ return moq_pico_wt_managed_is_fatal((moq_pico_wt_managed_t *)ctx); }
+
+/* Wait up to timeout_sec of wall time for the client's object. */
 static void wait_for_object(moq_pico_wt_managed_t *cli, client_app_t *app,
                             int timeout_sec)
 {
-    uint64_t waited = 0, budget = (uint64_t)timeout_sec * 1000;
-    while (!atomic_load(&app->got_object) && waited < budget) {
-        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
-            break;
-        waited += 200;
-    }
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
+    (void)wait_until(cli, &d, 200000, got_object_pred, app);
 }
 
-/*
- * Wait bounded by real wall-clock. Unlike wait_for_object (which counts
- * iterations assuming each wait() blocks its full timeout), a sustained
- * large-object transfer makes wait() return early many times, so an
- * iteration count under-budgets it and gives up mid-transfer. A transfer
- * that genuinely never completes still terminates at the deadline because
- * wait() blocks ~200ms per idle call.
- */
-static void wait_realtime(moq_pico_wt_managed_t *cli, client_app_t *app,
-                          int timeout_sec)
+/* Control: the deadline holds against a wait that always returns at once (a
+ * facade with constant activity). The loop must still run for the full budget,
+ * not stop after a count of calls. */
+static moq_result_t wait_returns_at_once(moq_pico_wt_managed_t *m, uint64_t us)
+{ (void)m; (void)us; return MOQ_OK; }
+
+static void deadline_fast_wake_control(void)
 {
-    struct timespec t0;
+    g_wait_fn = wait_returns_at_once;
+    struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    while (!atomic_load(&app->got_object)) {
-        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
-            break;
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        if ((t1.tv_sec - t0.tv_sec) >= timeout_sec)
-            break;
-    }
+    mono_deadline_t d = deadline_after_ms(150);
+    moq_result_t r = wait_until(NULL, &d, 200000, NULL, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_wait_fn = moq_pico_wt_managed_wait;
+    int64_t el_us = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1000;
+    CHECK(r == MOQ_DONE);
+    CHECK(el_us >= 150000);
 }
 
 /* -- scenarios ------------------------------------------------------ */
@@ -507,7 +641,7 @@ static run_status_t run_loopback_proto(const char *cert, const char *key,
     moq_pico_wt_managed_t *srv =
         make_server_ex(cert, key, port, &sapp, wt_protocols);
     if (!srv) return RUN_RETRY;            /* bind/create — retry */
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -534,10 +668,8 @@ static run_status_t run_loopback_proto(const char *cert, const char *key,
         CHECK(!moq_pico_wt_managed_is_fatal(cli));
         CHECK(!moq_pico_wt_managed_is_closed(cli));
         if (expect_peer_close) {
-            for (uint64_t waited = 0; waited < 5000 &&
-                 !moq_pico_wt_managed_is_closed(srv); waited += 100) {
-                moq_pico_wt_managed_wait(srv, 100000);
-            }
+            mono_deadline_t d = deadline_after_ms(5000);
+            (void)wait_until(srv, &d, 100000, srv_closed_pred, srv);
             CHECK(moq_pico_wt_managed_is_closed(srv));
             CHECK(!moq_pico_wt_managed_is_fatal(srv));
             CHECK(moq_pico_wt_managed_close_code(srv) == 0);
@@ -562,6 +694,63 @@ static run_status_t run_loopback_proto(const char *cert, const char *key,
     return RUN_RETRY;
 }
 
+/* A managed client publishes object datagrams. The managed client owns the
+ * connection's callback context (it wraps h3zero's callback), so the datagram
+ * send path must reach h3zero through the endpoint's own h3zero context; the
+ * server subscribes to the client and must receive an intact datagram, with
+ * neither side fatal, then both tear down cleanly. */
+static run_status_t run_datagram(const char *cert, const char *key, int port,
+                                 int timeout_sec, const char *wt_protocols)
+{
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    sapp.subscribe_client = 1;
+    atomic_init(&sapp.got_datagram, 0);
+    moq_pico_wt_managed_t *srv =
+        make_server_ex(cert, key, port, &sapp, wt_protocols);
+    if (!srv) return RUN_RETRY;
+    settle(srv, 300);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    capp.publish_datagram = 1;
+    capp.dg_delivered = &sapp.got_datagram;
+    g_client_request_capacity = 4;   /* the server's SUBSCRIBE needs credit */
+    moq_pico_wt_managed_t *cli = make_client_ex2(
+        moq_pico_wt_managed_local_port(srv), &capp, 0, wt_protocols);
+    g_client_request_capacity = 0;
+    if (!cli) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
+    while (!atomic_load(&sapp.got_datagram) &&
+           wait_step(cli, &d, 100000) != MOQ_ERR_CLOSED &&
+           deadline_left_us(&d) > 0) {
+    }
+    int got = atomic_load(&sapp.got_datagram);
+    int fatal = moq_pico_wt_managed_is_fatal(cli) ||
+                moq_pico_wt_managed_is_fatal(srv);
+    moq_pico_wt_managed_stop(cli);
+    int accepted = capp.dg_accepted;
+    int send_errors = capp.dg_send_errors;
+    moq_pico_wt_managed_destroy(cli);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+
+    if (got) {
+        CHECK(!fatal);
+        CHECK(send_errors == 0);
+        return RUN_OK;
+    }
+    if (accepted || fatal) {
+        fprintf(stderr, "[datagram] port %d HARD FAIL: accepted=%d fatal=%d "
+                "send_errors=%d got=0\n", port, accepted, fatal, send_errors);
+        return RUN_HARD;
+    }
+    return RUN_RETRY;
+}
+
 /* Namespace registration over WT: the client registers ("pico","wt") after
  * setup; the server must surface NAMESPACE_PUBLISHED with those exact parts
  * and accept; the client must surface NAMESPACE_ACCEPTED, then subscribe and
@@ -579,7 +768,7 @@ static run_status_t run_announce(const char *cert, const char *key,
     moq_pico_wt_managed_t *srv =
         make_server_ex(cert, key, port, &sapp, wt_protocols);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -684,7 +873,7 @@ static run_status_t run_announce_done(const char *cert, const char *key,
     if (drop_rsa) scfg.configure_quic = server_drop_reset_stream_at;
     moq_pico_wt_managed_t *srv = NULL;
     if (moq_pico_wt_managed_create(&scfg, &srv) != MOQ_OK) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -703,12 +892,11 @@ static run_status_t run_announce_done(const char *cert, const char *key,
     /* Wait for BOTH the object (subscription usable) and the server observing
      * the withdrawal (DONE round-tripped): the object can beat the DONE, so
      * waiting on it alone would race the withdrawal. */
-    uint64_t waited = 0, budget = (uint64_t)timeout_sec * 1000;
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
     while ((!atomic_load(&capp.got_object) || !atomic_load(&sapp.saw_done)) &&
-           waited < budget) {
-        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
+           deadline_left_us(&d) > 0) {
+        if (wait_step(cli, &d, 200000) == MOQ_ERR_CLOSED)
             break;
-        waited += 200;
     }
 
     int got = atomic_load(&capp.got_object);
@@ -748,10 +936,7 @@ static run_status_t run_announce_done(const char *cert, const char *key,
 
 /* Large-object regression: the server publishes a small control object and
  * a 256 KiB object on one subgroup stream; the client must receive BOTH in
- * full (exact length + pattern). The transfer spans many packets/RTTs, so
- * it waits by real elapsed time (wait_realtime): the iteration-count wait
- * under-counts an active transfer (wait() returns early) and would give up
- * mid-transfer, falsely reporting non-delivery. */
+ * full (exact length + pattern). The transfer spans many packets/RTTs. */
 static run_status_t run_bigobj(const char *cert, const char *key,
                                int port, int timeout_sec, int small_window)
 {
@@ -759,7 +944,7 @@ static run_status_t run_bigobj(const char *cert, const char *key,
     sapp.big_size = BIGOBJ_BIG_SIZE;
     moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -789,7 +974,7 @@ static run_status_t run_bigobj(const char *cert, const char *key,
     else
         CHECK(g_observed_uni_window >= (1u << 20));   /* large-object credit */
 
-    wait_realtime(cli, &capp, timeout_sec);
+    wait_for_object(cli, &capp, timeout_sec);
 
     int got = atomic_load(&capp.got_object);
     int small_ok = atomic_load(&capp.small_ok);
@@ -835,7 +1020,7 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
     sapp.big_size = BIGOBJ_BIG_SIZE;
     moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -857,10 +1042,10 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
 
     /* App-thread drain: once the object is queued, poll the predicate in real
      * time until the publisher's transport reports flushed. */
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    mono_deadline_t dd = deadline_after_ms((uint64_t)timeout_sec * 1000);
     int drained = 0, published = 0;
-    for (;;) {
-        moq_pico_wt_managed_wait(cli, 20000);   /* advance the receiver ~20ms */
+    while (deadline_left_us(&dd) > 0) {
+        (void)wait_step(cli, &dd, 20000);   /* advance the receiver ~20ms */
         if (!published) published = atomic_load(&sapp.published);   /* object queued (net thr) */
         if (published) {
             moq_pico_wt_managed_wake(srv);       /* kick the publisher loop to flush */
@@ -868,16 +1053,12 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
             CHECK(ds != -2);                    /* not on the network thread */
             if (ds == 1) { drained = 1; break; }
         }
-        struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
-        double el = (double)(tn.tv_sec - t0.tv_sec) +
-                    (double)(tn.tv_nsec - t0.tv_nsec) / 1e9;
-        if (el > (double)timeout_sec) break;
     }
 
     /* drain_state==1 means the publisher's local stream backlog is flushed (all
      * reliable bytes + FIN handed to the transport); let the receiver's loop
      * surface the object event, then verify it arrived in full. */
-    if (drained) wait_realtime(cli, &capp, 2);
+    if (drained) wait_for_object(cli, &capp, 2);
 
     int got = atomic_load(&capp.got_object);
     int small_ok = atomic_load(&capp.small_ok);
@@ -926,7 +1107,7 @@ static run_status_t run_no_reset_stream_at(const char *cert, const char *key,
         fprintf(stderr, "[no_rsa] port %d: server create/bind FAILED (retryable)\n", port);
         return RUN_RETRY;
     }
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -978,7 +1159,7 @@ static run_status_t run_nego(const char *cert, const char *key,
     moq_pico_wt_managed_t *srv =
         make_server_ex(cert, key, port, &sapp, "moqt-16");
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1016,7 +1197,7 @@ static run_status_t run_nego_refuse(const char *cert, const char *key,
     moq_pico_wt_managed_t *srv =
         make_server_ex(cert, key, port, &sapp, "moqt-16");
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1028,12 +1209,8 @@ static run_status_t run_nego_refuse(const char *cert, const char *key,
         return RUN_RETRY;
     }
 
-    uint64_t waited = 0, budget = (uint64_t)timeout_sec * 1000;
-    while (!moq_pico_wt_managed_is_fatal(cli) && waited < budget) {
-        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
-            break;
-        waited += 200;
-    }
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
+    (void)wait_until(cli, &d, 200000, fatal_pred, cli);
     int fatal = moq_pico_wt_managed_is_fatal(cli);
     CHECK(fatal);
     CHECK(!atomic_load(&capp.got_object));
@@ -1058,7 +1235,7 @@ static run_status_t run_nego_legacy(const char *cert, const char *key,
     moq_pico_wt_managed_t *srv =
         make_server_ex(cert, key, port, &sapp, NULL);   /* no WT subprotocols */
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1096,7 +1273,7 @@ static run_status_t run_nego_legacy_18(const char *cert, const char *key,
     moq_pico_wt_managed_t *srv =
         make_server_ex(cert, key, port, &sapp, NULL);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1108,12 +1285,8 @@ static run_status_t run_nego_legacy_18(const char *cert, const char *key,
         return RUN_RETRY;
     }
 
-    uint64_t waited = 0, budget = (uint64_t)timeout_sec * 1000;
-    while (!moq_pico_wt_managed_is_fatal(cli) && waited < budget) {
-        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
-            break;
-        waited += 200;
-    }
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
+    (void)wait_until(cli, &d, 200000, fatal_pred, cli);
     int fatal = moq_pico_wt_managed_is_fatal(cli);
     CHECK(fatal);
     CHECK(!atomic_load(&capp.got_object));
@@ -1146,7 +1319,7 @@ static run_status_t run_alpn_close_18(const char *cert, const char *key,
     server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
     moq_pico_wt_managed_t *srv = make_server_ex(cert, key, port, &sapp, NULL);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1161,27 +1334,24 @@ static run_status_t run_alpn_close_18(const char *cert, const char *key,
     /* Bounded observation window. Both facades own autonomous network threads,
      * so moq_pico_wt_managed_wait() does NOT pump either side -- it observes
      * activity and yields bounded wall-clock opportunity for the network
-     * threads to run. The loop below is an ITERATION budget (roughly
-     * timeout_sec worth of 2x100ms waits), not a measured elapsed-time
-     * budget. */
-    const uint64_t budget = (uint64_t)timeout_sec * 1000;
-    uint64_t waited = 0;
+     * threads to run, for timeout_sec of wall time. */
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
     int srv_session_seen = 0;
-    while (waited < budget) {
+    while (deadline_left_us(&d) > 0) {
         if (moq_pico_wt_managed_session(srv) != NULL) srv_session_seen = 1;
         if (moq_pico_wt_managed_is_fatal(cli) && moq_pico_wt_managed_is_closed(srv))
             break;
-        moq_pico_wt_managed_wait(cli, 100000);
-        moq_pico_wt_managed_wait(srv, 100000);
-        waited += 200;
+        (void)wait_step(cli, &d, 100000);
+        (void)wait_step(srv, &d, 100000);
     }
     /* Extra bounded observation on the server: a capsule may land after the
      * client's local latch, so a missing capsule must not be mistaken for a
      * race. Again, this waits -- it does not pump. */
-    for (int i = 0; i < 15; i++) {
+    mono_deadline_t d2 = deadline_after_ms(1500);
+    while (deadline_left_us(&d2) > 0) {
         if (moq_pico_wt_managed_session(srv) != NULL) srv_session_seen = 1;
         if (moq_pico_wt_managed_is_closed(srv)) break;
-        moq_pico_wt_managed_wait(srv, 100000);
+        (void)wait_step(srv, &d2, 100000);
     }
 
     const int      cli_fatal   = moq_pico_wt_managed_is_fatal(cli);
@@ -1231,13 +1401,13 @@ static run_status_t run_alpn_close_18(const char *cert, const char *key,
     CHECK(cli_fcode == 0);                         /* transport-class per the header contract */
     CHECK(!atomic_load(&capp.got_object));
 
-    /* -- the WIRE obligation: this is the RED ------------------------------
+    /* -- the WIRE obligation: the load-bearing assertion -------------------
      * MULTIPLICITY LIMIT, stated: is_closed()/close_code() prove the server
      * received A close carrying the latched code. The bridge stops counting
      * once terminal, so this oracle can neither prove "exactly one" nor detect
      * a later duplicate. Exact multiplicity is measured by the lab JS oracle
      * (accepted==1, closes==1, matching==1), which must be re-run against any
-     * eventual product GREEN. */
+     * product change to this path. */
     CHECK(srv_closed);                             /* a peer WT close was observed at all */
     CHECK(srv_code == WT_ALPN_ERROR_CODE);         /* and it carried WT_ALPN_ERROR */
     CHECK(!srv_fatal);                             /* not a MoQ protocol fatal */
@@ -1255,7 +1425,7 @@ static run_status_t run_refuse(const char *cert, const char *key,
     server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
     moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
     int p = moq_pico_wt_managed_local_port(srv);
 
     /* First client: should be served. */
@@ -1305,14 +1475,11 @@ static run_status_t run_refuse(const char *cert, const char *key,
     int g2 = 0, c2_setup = 0, c2_fatal = 0, c2_session = 0;
     moq_result_t c2_wait = MOQ_OK;
     if (cli2) {
-        /* Wait for the terminal (fatal), not for an object that will
-         * never come. ~5s cap is generous; refusal lands sub-second. */
-        for (int tries = 0; tries < 50; tries++) {
-            c2_wait = moq_pico_wt_managed_wait(cli2, 100000);
-            if (c2_wait == MOQ_ERR_CLOSED ||
-                moq_pico_wt_managed_is_fatal(cli2))
-                break;
-        }
+        /* Wait for the terminal (wait() reports CLOSED), not for an object
+         * that will never come. A 5 s cap is generous; refusal lands
+         * sub-second. */
+        mono_deadline_t d = deadline_after_ms(5000);
+        c2_wait = wait_until(cli2, &d, 100000, NULL, NULL);
         g2 = atomic_load(&c2.got_object);
         c2_fatal = moq_pico_wt_managed_is_fatal(cli2);
         c2_session = (moq_pico_wt_managed_session(cli2) != NULL);
@@ -1361,7 +1528,7 @@ static run_status_t run_close(const char *cert, const char *key,
     server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
     moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1394,11 +1561,8 @@ static run_status_t run_close(const char *cert, const char *key,
     }
 
     /* (a) Client: the drain → clean close makes wait() terminal. */
-    moq_result_t wr = MOQ_DONE;
-    for (uint64_t waited = 0; waited < 5000; waited += 200) {
-        wr = moq_pico_wt_managed_wait(cli, 200000);
-        if (wr == MOQ_ERR_CLOSED) break;
-    }
+    mono_deadline_t cd = deadline_after_ms(5000);
+    moq_result_t wr = wait_until(cli, &cd, 200000, NULL, NULL);
     int is_closed = moq_pico_wt_managed_is_closed(cli);
     int is_fatal  = moq_pico_wt_managed_is_fatal(cli);
     uint64_t code = moq_pico_wt_managed_close_code(cli);
@@ -1454,7 +1618,7 @@ static run_status_t run_stop_close(const char *cert, const char *key,
     server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
     moq_pico_wt_managed_t *srv = make_server(cert, key, port, &sapp);
     if (!srv) return RUN_RETRY;
-    for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
+    settle(srv, 300);
 
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
@@ -1487,10 +1651,8 @@ static run_status_t run_stop_close(const char *cert, const char *key,
     CHECK(moq_pico_wt_managed_stop(cli) == MOQ_OK);
     moq_pico_wt_managed_destroy(cli);
 
-    for (uint64_t waited = 0; waited < 5000 &&
-         !moq_pico_wt_managed_is_closed(srv); waited += 100) {
-        moq_pico_wt_managed_wait(srv, 100000);
-    }
+    mono_deadline_t sd = deadline_after_ms(5000);
+    (void)wait_until(srv, &sd, 100000, srv_closed_pred, srv);
 
     int srv_closed = moq_pico_wt_managed_is_closed(srv);
     int srv_fatal = moq_pico_wt_managed_is_fatal(srv);
@@ -1519,6 +1681,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--key") && i + 1 < argc) key = argv[++i];
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) mode = argv[++i];
     }
+    deadline_fast_wake_control();
     if (!cert || !key) {
         fprintf(stderr, "usage: %s --cert <f> --key <f> "
                         "[--mode loopback|bigobj|refuse|close|"
@@ -1543,18 +1706,20 @@ int main(int argc, char **argv)
     int announce_done_no_rsa = !strcmp(mode, "announce_done_no_rsa");
     int loopback_18 = !strcmp(mode, "loopback_18");
     int alpn_close_18 = !strcmp(mode, "alpn_close_18");
+    int datagram = !strcmp(mode, "datagram");
+    int datagram_18 = !strcmp(mode, "datagram_18");
     if (!refuse && !close_mode && !stop_close && !pump_exit_close && !nego &&
         !nego_refuse && !nego_legacy && !nego_legacy_18 && !no_rsa &&
         !bigobj && !bigobj_smallwin && !bigobj_drain && !announce &&
         !announce_18 && !announce_done_18 && !announce_done_no_rsa &&
-        !loopback_18 && !alpn_close_18 &&
+        !loopback_18 && !alpn_close_18 && !datagram && !datagram_18 &&
         strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "stop_close|pump_exit_close|nego|nego_refuse|nego_legacy|"
                 "nego_legacy_18|"
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
                 "announce|announce_18|announce_done_18|announce_done_no_rsa|"
-                "loopback_18|alpn_close_18)\n", mode);
+                "loopback_18|alpn_close_18|datagram|datagram_18)\n", mode);
         return 2;
     }
 
@@ -1592,6 +1757,8 @@ int main(int argc, char **argv)
            : loopback_18    ? run_loopback_proto(cert, key, ports[i], 6,
                                                  "moqt-18", 0)
            : alpn_close_18  ? run_alpn_close_18(cert, key, ports[i], 6)
+           : datagram       ? run_datagram(cert, key, ports[i], 6, NULL)
+           : datagram_18    ? run_datagram(cert, key, ports[i], 6, "moqt-18")
            : pump_exit_close ? run_loopback_proto(cert, key, ports[i], 6,
                                                   NULL, 1)
                             : run_loopback_proto(cert, key, ports[i], 6,

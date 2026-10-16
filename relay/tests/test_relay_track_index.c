@@ -146,8 +146,11 @@ typedef struct r_sub_baseline {
 _Static_assert(sizeof(r_sub_t) == sizeof(r_sub_baseline_t) +
                                       2 * sizeof(uint32_t),
                "track_next/track_prev must cost exactly 8 bytes per sub");
-_Static_assert(sizeof(r_track_t) == sizeof(r_track_baseline_t),
-               "subs_head must fit existing r_track_t padding (0-byte delta)");
+/* subs_head fits former padding (0 bytes); the reclaim bookkeeping
+ * (interest_seq + idle_since_us) costs exactly 16 bytes per track. */
+_Static_assert(sizeof(r_track_t) == sizeof(r_track_baseline_t) +
+                                        2 * sizeof(uint64_t),
+               "r_track_t grows only by the two reclaim words");
 
 /* -- The oracle ------------------------------------------------------------ */
 
@@ -173,7 +176,7 @@ oracle_scan_count(const moqr_core_t *c, uint32_t tslot)
 }
 
 /* Validate one track's index against the scan oracle. Returns NULL when
- * consistent, else a static string naming the SPECIFIC violation (the RED
+ * consistent, else a static string naming the SPECIFIC violation (the failure
  * signatures key off these). */
 static const char *
 index_check(const moqr_core_t *c, uint32_t tslot, bool *seen /* max_subs */)
@@ -729,6 +732,287 @@ test_index_capacity_delta(void)
     return failures;
 }
 
+/* -- Generation exhaustion ---------------------------------------------------- */
+
+/* Slot generations never wrap. In every relay pool, the last live generation
+ * (R_GEN_LAST_LIVE) still mints a valid, nonzero handle; releasing it retires
+ * the slot, so the next admission falls back to another slot and the old
+ * handle stays stale; with no openable slot left the admission is refused,
+ * never answered with a zero or aliased handle. */
+static int
+test_generation_exhaustion_pools(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 4, 2);
+    MOQ_TEST_CHECK(c != NULL);
+    moq_bytes_t nsp[1] = { { (const uint8_t *)"g", 1 } };
+    moqr_ns_t ns = { nsp, 1 };
+    moq_bytes_t name = { (const uint8_t *)"t", 1 };
+    moqr_intent_t its[8];
+
+    /* Bindings. */
+    c->bindings[0].gen = R_GEN_LAST_LIVE - 1u;
+    moqr_binding_t b0;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &b0) == MOQR_OK);
+    MOQ_TEST_CHECK(b0._opaque != 0 && moqr_binding_is_valid(b0));
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_generation(b0._opaque), R_GEN_LAST_LIVE);
+    MOQ_TEST_CHECK(moqr_core_binding_close(c, b0, 1) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->bindings[0].gen, R_GEN_RETIRED);
+    moqr_binding_t pb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &pb) == MOQR_OK);
+    MOQ_TEST_CHECK(pb._opaque != 0 && pb._opaque != b0._opaque);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(pb._opaque), 1);
+    MOQ_TEST_CHECK(moqr_core_binding_close(c, b0, 1) ==
+                   MOQR_ERR_STALE_HANDLE);
+    for (uint32_t i = 2; i < c->max_bindings; i++) {
+        c->bindings[i].gen = R_GEN_RETIRED;
+    }
+    moqr_binding_t none = MOQR_BINDING_INVALID;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 3, &none) == MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(none._opaque == 0);
+
+    /* Subscriptions, on a live track. */
+    moqr_track_t tr;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 7, &tr) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    c->subs[0].gen = R_GEN_LAST_LIVE - 1u;
+    for (uint32_t i = 1; i < c->max_subs; i++) {
+        c->subs[i].gen = R_GEN_RETIRED;
+    }
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = name;
+    rq.cookie = 3;
+    moqr_sub_t s0;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, pb, &rq, &s0) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(s0._opaque != 0 && moqr_sub_is_valid(s0));
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_generation(s0._opaque), R_GEN_LAST_LIVE);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, s0, 3) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK_EQ_U64(c->subs[0].gen, R_GEN_RETIRED);
+    moqr_sub_t s1 = MOQR_SUB_INVALID;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, pb, &rq, &s1) == MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(s1._opaque == 0);
+    c->subs[2].gen = 6u;   /* another slot becomes openable */
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, pb, &rq, &s1) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(s1._opaque), 2);
+    MOQ_TEST_CHECK(s1._opaque != s0._opaque);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, s0, 4) == MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, s1, 5) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+
+    /* Fetch cursors: the finder skips a retired slot. */
+    c->fetches[0].gen = R_GEN_RETIRED;
+    MOQ_TEST_CHECK_EQ_U64(fetch_slot_find(c), 1);
+    c->fetches[0].gen = R_GEN_LAST_LIVE - 1u;
+    MOQ_TEST_CHECK_EQ_U64(fetch_slot_find(c), 0);
+    c->fetches[0].gen = 0;
+
+    /* Parked requests. */
+    moqr_park_req_t pr;
+    memset(&pr, 0, sizeof(pr));
+    pr.action = MOQR_AUTH_SUBSCRIBE;
+    pr.binding_cookie = 2;
+    pr.session_cookie = 9;
+    pr.ns = ns;
+    pr.name = name;
+    c->parked[0].gen = R_GEN_LAST_LIVE - 1u;
+    MOQ_TEST_CHECK(moqr_core_park(c, &pr, 41, 1) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->parked[0].gen, R_GEN_LAST_LIVE);
+    parked_free_slot(c, 0);
+    MOQ_TEST_CHECK_EQ_U64(c->parked[0].gen, R_GEN_RETIRED);
+    MOQ_TEST_CHECK(moqr_core_park(c, &pr, 42, 1) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->parked[1].gen & 1u, 1);
+    MOQ_TEST_CHECK_EQ_U64(c->parked[0].gen, R_GEN_RETIRED);
+    parked_free_slot(c, 1);
+
+    /* Revalidation grants: the reservation generation is caller-visible. */
+    moqr_grant_res_t res;
+    c->grants[0].gen = R_GEN_LAST_LIVE - 1u;
+    MOQ_TEST_CHECK(moqr_core_grant_reserve(c, &pr, 1000, 1, &res) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(res.slot, 0);
+    MOQ_TEST_CHECK_EQ_U64(res.gen, R_GEN_LAST_LIVE);
+    grant_free_slot(c, 0);
+    moqr_grant_res_t res2;
+    MOQ_TEST_CHECK(moqr_core_grant_reserve(c, &pr, 1000, 1, &res2) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(res2.slot, 1);
+    MOQ_TEST_CHECK_EQ_U64(c->grants[0].gen, R_GEN_RETIRED);
+    grant_free_slot(c, 1);
+    for (uint32_t i = 1; i < c->max_grants; i++) {
+        c->grants[i].gen = R_GEN_RETIRED;
+    }
+    MOQ_TEST_CHECK(moqr_core_grant_reserve(c, &pr, 1000, 1, &res2) ==
+                   MOQR_ERR_CAPACITY);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("generation_exhaustion_pools");
+    return failures;
+}
+
+static uint32_t
+count_kind(const moqr_intent_t *its, size_t n, moqr_intent_kind_t kind)
+{
+    uint32_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        k += its[i].kind == kind ? 1u : 0u;
+    }
+    return k;
+}
+
+static uint64_t
+records_of(const moqr_core_t *c, uint32_t slot)
+{
+    moqr_log_stats_t ls;
+    moqr_log_get_stats(c->tracks[slot].log, &ls);
+    return ls.record_count;
+}
+
+/* Tracks: creation at the last live generation; a re-PUBLISH of a retained
+ * track whose slot cannot renew moves the new source to another slot, or is
+ * refused with the retained track (cache, subscriber, handle) untouched; and
+ * demand-driven reclaim never counts a track on its last generation as a
+ * free slot, since releasing it retires the slot. */
+static int
+test_generation_exhaustion_tracks(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 4, 2);
+    MOQ_TEST_CHECK(c != NULL);
+    moq_bytes_t nsp[1] = { { (const uint8_t *)"g", 1 } };
+    moqr_ns_t ns = { nsp, 1 };
+    moq_bytes_t name = { (const uint8_t *)"t", 1 };
+    moq_bytes_t name2 = { (const uint8_t *)"u", 1 };
+    moqr_intent_t its[8];
+    moqr_pd_desc_t done;
+    MOQ_TEST_CHECK(moqr_pd_desc_local(MOQR_PD_TRACK_ENDED, &done) == MOQR_OK);
+    moqr_binding_t pb;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pb) == MOQR_OK);
+
+    /* Last valid generation: created, valid, nonzero. */
+    c->tracks[0].gen = R_GEN_LAST_LIVE - 1u;
+    c->tracks[1].gen = R_GEN_RETIRED;
+    moqr_track_t t1;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 7, &t1) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(t1._opaque != 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_generation(t1._opaque), R_GEN_LAST_LIVE);
+    MOQ_TEST_CHECK(ing(c, &a, t1, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, t1, 1, done, 2) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(c->tracks[0].state == R_TRACK_WARM);
+
+    /* A subscriber on the retained track. */
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = ns;
+    rq.name = name;
+    rq.cookie = 3;
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(c, pb, &rq, &sub) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(moqr_sub_is_valid(sub));
+
+    /* Re-PUBLISH with no other slot: refused, nothing changes. */
+    uint64_t intern_before = c->intern_used;
+    uint64_t source_gen = c->tracks[0].track_gen;
+    moqr_track_t t2 = MOQR_TRACK_INVALID;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 8, &t2) ==
+                   MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(t2._opaque == 0);
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_poll_intents(c, its, 8), 0);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks[0].gen, R_GEN_LAST_LIVE);
+    MOQ_TEST_CHECK(c->tracks[0].state == R_TRACK_WARM);
+    MOQ_TEST_CHECK_EQ_U64(records_of(c, 0), 1);
+    MOQ_TEST_CHECK_EQ_U64(track_sub_count(c, 0), 1);
+    MOQ_TEST_CHECK_EQ_U64(c->intern_used, intern_before);
+    MOQ_TEST_CHECK_EQ_U64(c->refusals[MOQR_REFUSE_TRACKS], 1);
+
+    /* Another slot opens: the new source takes it; the old slot retires. */
+    c->tracks[1].gen = 4u;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 9, &t2) == MOQR_OK);
+    size_t n = moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK_EQ_U64(count_kind(its, n, MOQR_INTENT_SUB_DONE), 1);
+    MOQ_TEST_CHECK_EQ_U64(count_kind(its, n, MOQR_INTENT_ACCEPT_PUBLISH), 1);
+    MOQ_TEST_CHECK(t2._opaque != 0 && t2._opaque != t1._opaque);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(t2._opaque), 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_generation(t2._opaque), 5u);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks[0].gen, R_GEN_RETIRED);
+    MOQ_TEST_CHECK(c->tracks[1].state == R_TRACK_ACTIVE);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks[1].track_gen, source_gen + 1u);
+    MOQ_TEST_CHECK_EQ_U64(c->intern_used, intern_before);
+    uint64_t h = 0;
+    MOQ_TEST_CHECK_EQ_U64(track_lookup(c, ns, name, &h), 1);
+    MOQ_TEST_CHECK(ing(c, &a, t1, 1, 0) == MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(c, sub, 4) == MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(ing(c, &a, t2, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(records_of(c, 1), 1);
+    bool seen[4];
+    CHECK_INDEX(c, seen);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, t2, c->tracks[1].track_gen, done, 3) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+
+    /* Reclaim: the least recently used reclaimable track is on its last
+     * generation, so the slot comes from the next one; when every
+     * reclaimable track is on its last generation the admission is refused
+     * and both retained tracks survive. */
+    ca_init(&a);
+    c = mkcore(&a, 4, 2);
+    MOQ_TEST_CHECK(c != NULL);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pb) == MOQR_OK);
+    c->tracks[0].gen = R_GEN_LAST_LIVE - 1u;
+    moqr_track_t ta, tb;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name, 7, &ta) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name2, 8, &tb) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(ta._opaque), 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(tb._opaque), 1);
+    MOQ_TEST_CHECK(ing(c, &a, ta, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, tb, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, ta, 1, done, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, tb, 1, done, 3) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK(track_reclaimable(c, 0) && track_reclaimable(c, 1));
+    MOQ_TEST_CHECK(c->tracks[0].interest_seq < c->tracks[1].interest_seq);
+
+    uint32_t saved = c->tracks[1].gen;
+    c->tracks[1].gen = R_GEN_LAST_LIVE;   /* both on their last generation */
+    moq_bytes_t name3 = { (const uint8_t *)"v", 1 };
+    moqr_track_t tc = MOQR_TRACK_INVALID;
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name3, 9, &tc) ==
+                   MOQR_ERR_CAPACITY);
+    MOQ_TEST_CHECK(tc._opaque == 0);
+    MOQ_TEST_CHECK_EQ_U64(moqr_core_poll_intents(c, its, 8), 0);
+    MOQ_TEST_CHECK(track_reclaimable(c, 0) && track_reclaimable(c, 1));
+    MOQ_TEST_CHECK_EQ_U64(c->tracks_evicted_capacity, 0);
+    c->tracks[1].gen = saved;
+
+    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, ns, name3, 9, &tc) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+    MOQ_TEST_CHECK_EQ_U64(moq_handle_slot(tc._opaque), 1);
+    MOQ_TEST_CHECK(tc._opaque != tb._opaque);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks_evicted_capacity, 1);
+    MOQ_TEST_CHECK_EQ_U64(c->tracks[0].gen, R_GEN_LAST_LIVE);
+    MOQ_TEST_CHECK_EQ_U64(records_of(c, 0), 1);
+    MOQ_TEST_CHECK(ing(c, &a, tb, 1, 0) == MOQR_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK(moqr_core_source_done(c, tc, 1, done, 4) == MOQR_OK);
+    (void)moqr_core_poll_intents(c, its, 8);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("generation_exhaustion_tracks");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -736,6 +1020,8 @@ main(void)
     failures += test_index_lifecycle();
     failures += test_index_random_churn();
     failures += test_index_capacity_delta();
+    failures += test_generation_exhaustion_pools();
+    failures += test_generation_exhaustion_tracks();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

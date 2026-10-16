@@ -27,6 +27,15 @@ Object payloads cross both libraries zero-copy (an `moq_rcbuf_t`
 reference is held from the bridge's `write_payload` until wtquic
 reports the send complete).
 
+MoQ object datagrams travel as WebTransport datagrams in both directions
+(`wtq_session_send_datagram`, which copies the payload during the call).
+Outbound they follow the bridge's lossy datagram policy: a datagram over
+`wtq_session_datagram_max_size()`, one refused by a full transport queue,
+and any sent while the session carries no datagrams (none negotiated, not
+yet active, or ended) are dropped, never fatal. Both wtquic backends
+(MsQuic and Network.framework) implement the datagram send; the MsQuic
+facade enables datagram receive through wtquic's default tuning.
+
 **Status: experimental, opt-in, default-OFF.** The picoquic adapters
 remain the default transports.
 
@@ -279,8 +288,6 @@ WebTransport path across 1200 B, 8 KiB and 64 KiB object sizes.
 
 - One WebTransport session per adapter conn (bind a fresh conn per
   accepted session).
-- No outgoing MoQ datagram publishing capability yet (inbound
-  datagrams are fed through).
 - No idle/deadline tick integration: timer-driven session closes
   (GOAWAY drain) need external service calls.
 - Receive admission requires the strengthened wtquic runtime contract before

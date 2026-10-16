@@ -23,9 +23,9 @@ sends exactly those bytes; its receipts are extra evidence, never the oracle.
 
 ## Run
 
-    # offline first: comparator RED, ownership controls with stub children, the C
-    # control reader's classification, and (after a run) verdict RED mutations
-    python -I bindings/python/tests/runtime/run_finite_receiver.py --oracle-red
+    # offline first: comparator self-checks, ownership controls with stub children,
+    # the C control reader's classification, and (after a run) verdict mutations
+    python -I bindings/python/tests/runtime/run_finite_receiver.py --oracle-selftest
     python -I bindings/python/tests/runtime/run_finite_receiver.py --child-controls
     python -I bindings/python/tests/runtime/run_finite_receiver.py --control-selftests \
         --publisher build/py-runtime-fixture/publisher/moq5_runtime_publisher
@@ -34,7 +34,7 @@ sends exactly those bytes; its receipts are extra evidence, never the oracle.
       python -I bindings/python/tests/runtime/run_finite_receiver.py \
         --package <installed moq5 dir> --relay <moq5-relay> \
         --publisher build/py-runtime-fixture/publisher/moq5_runtime_publisher [--negative] [--push]
-    python -I bindings/python/tests/runtime/run_finite_receiver.py --verdict-red <run dir>/results.json
+    python -I bindings/python/tests/runtime/run_finite_receiver.py --verdict-mutations <run dir>/results.json
 
 The supervisor is the direct owner of the relay, the publisher and the
 receiver client and settles every handle itself; the receipt keeps the
@@ -57,14 +57,14 @@ not run `receive_loop.py`, whose completion policy needs a VOD conversion or
 an isComplete catalog that a publisher which never requests completion does
 not produce, and it never requests completion to satisfy that policy.
 
-    # offline first: the verdict comparator RED and the ownership controls
-    python -I bindings/python/tests/runtime/run_finite_publisher.py --oracle-red
+    # offline first: the verdict comparator self-checks and the ownership controls
+    python -I bindings/python/tests/runtime/run_finite_publisher.py --oracle-selftest
     python -I bindings/python/tests/runtime/run_finite_publisher.py --child-controls
     # one positive campaign, and the deliberate zero-object negative
     env -i PATH=/usr/bin:/bin DYLD_FALLBACK_LIBRARY_PATH=<msquic dylib dir> \
       python -I bindings/python/tests/runtime/run_finite_publisher.py \
         --package <installed moq5 dir> --relay <moq5-relay> [--negative]
-    python -I bindings/python/tests/runtime/run_finite_publisher.py --verdict-red <run dir>
+    python -I bindings/python/tests/runtime/run_finite_publisher.py --verdict-mutations <run dir>
 
 The publisher keeps its sender and endpoint alive until the receiver reports
 its observations: `publish()` returning "submitted" does not release them.

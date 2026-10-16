@@ -2620,14 +2620,23 @@ static void tcfg_clear(void)
     tcfg_oracle_limit_reason = NULL;
 }
 
-/* Mirrors the SDK initializer: clear everything, stamp the size, is_live true.
- * A control compares this against the real SDK's own authority program. */
-void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg)
+/* Mirrors the SDK's caller-sized initializer and historical symbol. A control
+ * compares the macro's sized path against the real SDK authority program. */
+void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg, size_t cfg_size)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
-    cfg->is_live = true;
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    if (n >= offsetof(moq_media_track_cfg_t, is_live) + sizeof(cfg->is_live))
+        cfg->is_live = true;
+}
+
+void (moq_media_track_cfg_init)(moq_media_track_cfg_t *cfg)
+{
+    size_t alignment = _Alignof(moq_media_track_cfg_t);
+    size_t end = offsetof(moq_media_track_cfg_t, alt_group) + sizeof(cfg->alt_group);
+    moq_media_track_cfg_init_sized(cfg, (end + alignment - 1) & ~(alignment - 1));
 }
 
 /* Returns false when the advertised prefix is one this fixture cannot record,
@@ -3254,13 +3263,13 @@ PyObject *test_write_simulate(PyObject *self, PyObject *args)
     return PyLong_FromLong((long)rc);
 }
 
-/* Drive the PROPOSED write ordering against the recorder, so the ordering
- * observer can be proved before the bridge exists. This is a fixture driver
- * over the fake, not a Python write surface: it takes no moq5 object, returns
- * no outcome value, and the product rows stay RED.
+/* Drive a write ordering against the recorder, so the ordering observer is
+ * proved independently of the bridge. This is a fixture driver over the fake,
+ * not a Python write surface: it takes no moq5 object and returns no outcome
+ * value.
  *
  * `release_before_result` selects the ordering under test. True is the
- * proposed order -- release both spans, THEN allocate the result. False is the
+ * required order -- release both spans, THEN allocate the result. False is the
  * mutant, and the fault-site inventory tells them apart at the fault itself. */
 PyObject *test_write_simulate_ordered(PyObject *self, PyObject *args)
 {

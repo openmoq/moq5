@@ -13,7 +13,7 @@
  * byte-exact, one terminal per stream), and the adapter's state.
  *
  * Built from the adapter sources with MOQ_PROXYGEN_WT_TESTING so the
- * capability can be forced on (the RED control against an adapter that does
+ * capability can be forced on (the negative control against an adapter that does
  * not hold) or off (pre-create rejection). No production symbol is
  * added for this.
  */
@@ -670,7 +670,7 @@ static void row_d18_unavailable(void)
 int main(int argc, char **argv)
 {
     /* Default: the adapter's own capability setting. "force" advertises the
-     * capability regardless (the RED control against a non-holding adapter). */
+     * capability regardless (the negative control against a non-holding adapter). */
     if (argc > 1 && std::strcmp(argv[1], "force") == 0)
         wt_test_set_hold_input(1);
     const moq_version_t v = MOQ_VERSION_DRAFT_16;

@@ -643,8 +643,7 @@ static bool op_buf_same(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
 
 /*
  * Admission is split into a non-mutating peek and a mutating commit so that
- * per-object validation (and, in a later slice, completion-promise checks)
- * runs BEFORE any state is touched, and the exactly-once history merge runs
+ * per-object validation runs BEFORE any state is touched, and the exactly-once history merge runs
  * only on a genuinely new op. track_op_peek returns:
  *   MOQ_OK               a byte-identical op is already pending (retry/resume)
  *   1                    no op pending -- the caller should commit a new one

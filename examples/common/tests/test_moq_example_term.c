@@ -1,7 +1,7 @@
 /*
  * Unit test for examples/common/moq_example_term.h — the terminal-safe escaper
- * for peer-controlled bytes (security report finding 10). Pure C, no libmoq
- * deps; run under CTest.
+ * for peer-controlled bytes, so a peer cannot inject terminal control
+ * sequences. Pure C, no libmoq deps; run under CTest.
  */
 #include "../moq_example_term.h"
 

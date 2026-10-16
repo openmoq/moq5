@@ -3604,7 +3604,7 @@ test_shards_data_inert(void)
 /* -- capacity model: resolver parity, guards, ceiling oracle ---------------- */
 
 /* Fill a cfg tail with poison beyond a prefix-sized struct_size: resolve and
- * create must read only the prefix (R8C poisoned-tail discipline). */
+ * create must read only the prefix (poisoned-tail discipline). */
 static int
 test_shards_cap_poisoned_prefix(void)
 {
@@ -4167,8 +4167,8 @@ test_shards_cap_term_deltas(void)
                 (dj.relay_alloc_ceiling - cb.relay_alloc_ceiling));
     }
     /* Overflow: a poisoned product refuses INVAL, never wraps — at the
-     * shards layer, through a wrapped CORE component (the reviewer repro,
-     * K=1 generic shard runtime), and through a wrapped BIND component. */
+     * shards layer, through a wrapped CORE component (K=1 generic shard
+     * runtime), and through a wrapped BIND component. */
     {
         moqr_shards_cfg_t c1 = base;
         c1.demand_channel_bytes = UINT64_MAX;
@@ -6477,6 +6477,450 @@ test_shards_stats_journal_dump(void)
     return failures;
 }
 
+/* -- track-table reclaim across shards -------------------------------------- */
+
+/* Does shard i's core still hold (ns, "v")? */
+static bool
+shard_track_known(moqr_shards_t *s, uint16_t i, moqr_binding_t b,
+                  const char *p)
+{
+    moq_bytes_t nsp[1] = { { (const uint8_t *)p, (uint32_t)strlen(p) } };
+    moqr_ns_t ns = { nsp, 1 };
+    moq_bytes_t name = { (const uint8_t *)"v", 1 };
+    moqr_core_t *c = moqr_shards_core(s, i);
+    moqr_intent_t its[4];
+    (void)moqr_core_poll_intents(c, its, 4);   /* drop unrelated test intents */
+    if (moqr_core_track_status(c, b, ns, name, 1) != MOQR_OK ||
+        moqr_core_poll_intents(c, its, 4) != 1) {
+        return false;
+    }
+    return its[0].kind == MOQR_INTENT_TRACK_STATUS_OK;
+}
+
+/* Push one object into a fresh (ns, "v") track on shard i and finish it, so
+ * the track is WARM with a retained record. MOQR_ERR_CAPACITY when the table
+ * cannot admit it. */
+static moqr_result_t
+push_finished(moqr_shards_t *s, ca_t *a, uint16_t i, moqr_binding_t b,
+              const char *p)
+{
+    moqr_track_t th;
+    moqr_result_t rc = pub_track_h(s, i, b, p, &th);
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    rc = pub_obj(s, a, i, th, 0, 0, 0, 0x33, 8, 0, 0, 0, false, false);
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    moqr_pd_desc_t done;
+    (void)moqr_pd_desc_local(MOQR_PD_TRACK_ENDED, &done);
+    return moqr_core_source_done(moqr_shards_core(s, i), th, 1, done, 1000);
+}
+
+/* Cross-shard mirror interest pins the owner's track: the owner-side pump
+ * subscription a remote demand holds is an ordinary subscription, so even a
+ * WARM owner track it reads is never evicted while it stands, and the owner
+ * evicts its other, unpinned WARM track instead. Once the remote subscriber
+ * leaves, the demand and its pump subscription unwind, the track becomes
+ * reclaimable, and evicting it leaves no stranded demand or mirror state on
+ * either shard (every later step succeeds). */
+static int
+test_shards_reclaim_mirror_interest(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.max_tracks = 2;
+    cfg.core_cfg.linger_us = 0;
+    cfg.core_cfg.warm_idle_us = UINT64_MAX;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    MOQ_TEST_CHECK(s != NULL);
+    moqr_binding_t p0 = pub_open(s, 0);
+    moqr_binding_t q0 = sub_open(s, 0, 3);
+
+    /* X: WARM on the owner (shard 0), its namespace still mirrored. */
+    MOQ_TEST_CHECK(ann(s, 0, p0, "rcX") == MOQR_OK);
+    MOQ_TEST_CHECK(push_finished(s, &a, 0, p0, "rcX") == MOQR_OK);
+    step_n(s, 8);
+    /* The owner withdraws; in the one-round window a remote subscriber's
+     * demand is admitted against the WARM track's retained objects. */
+    MOQ_TEST_CHECK(unann(s, 0, p0, "rcX") == MOQR_OK);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "rcX", 7, &sub) == MOQR_OK);
+    for (int r = 0; r < 6; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_pump_subs(s, 0), 1);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_pending_demand(s, 1), 1);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(moqr_shards_core(s, 1), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.subs_active, 1);
+
+    /* Y: an unpinned WARM track fills the owner's table. */
+    MOQ_TEST_CHECK(push_finished(s, &a, 0, p0, "rcY") == MOQR_OK);
+    moqr_core_stats_t rs;
+    moqr_core_get_stats(moqr_shards_core(s, 0), &rs);
+    MOQ_TEST_CHECK_EQ_U64(rs.tracks_reclaimable, 1);   /* Y only: X is pinned */
+
+    /* Z needs a slot: Y is evicted, never the mirrored X. */
+    moqr_track_t tz;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "rcZ", &tz) == MOQR_OK);
+    MOQ_TEST_CHECK(shard_track_known(s, 0, q0, "rcX"));
+    MOQ_TEST_CHECK(!shard_track_known(s, 0, q0, "rcY"));
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_pump_subs(s, 0), 1);
+    /* W: X pinned, Z live -> refused. */
+    moqr_track_t tw;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "rcW", &tw) == MOQR_ERR_CAPACITY);
+    moqr_core_get_stats(moqr_shards_core(s, 0), &rs);
+    MOQ_TEST_CHECK_EQ_U64(rs.tracks_evicted_capacity, 1);
+    for (int r = 0; r < 4; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_pump_subs(s, 0), 1);
+
+    /* The remote subscriber leaves: the demand unwinds and X is unpinned. */
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(moqr_shards_core(s, 1), sub, 1000) ==
+                   MOQR_OK);
+    for (int r = 0; r < 10; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_pump_subs(s, 0), 0);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_pending_demand(s, 1), 0);
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "rcW", &tw) == MOQR_OK);
+    MOQ_TEST_CHECK(!shard_track_known(s, 0, q0, "rcX"));
+    /* The requester's copy of X never held a record, so it was freed the
+     * moment its demand ended; nothing is left behind on shard 1. */
+    moqr_core_get_stats(moqr_shards_core(s, 1), &rs);
+    MOQ_TEST_CHECK_EQ_U64(rs.tracks, 0);
+    for (int r = 0; r < 6; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_U64(dch_total(s, 2), 0);
+    MOQ_TEST_CHECK_EQ_U64(rdr(s, 1), 0);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_reclaim_mirror_interest");
+    return failures;
+}
+
+/* Namespace trie reclaim across shards: a namespace announced and withdrawn
+ * on its owner shard is mirrored onto the other shard and withdrawn there by
+ * the manager's own pseudo-binding. Many more distinct namespaces than either
+ * trie holds cycle through; every announce on the owner and every mirror on
+ * the peer is admitted, no ns_nodes refusal is counted anywhere, every step
+ * succeeds, and the last namespace is still mirrored. */
+static int
+test_shards_ns_reclaim_mirrors(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.max_ns_nodes = 6;   /* root + 5 */
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    MOQ_TEST_CHECK(s != NULL);
+    moqr_binding_t p0 = pub_open(s, 0);
+    char p[16];
+    for (int i = 0; i < 24; i++) {
+        snprintf(p, sizeof(p), "ms%d", i);
+        MOQ_TEST_CHECK(ann(s, 0, p0, p) == MOQR_OK);
+        for (int r = 0; r < 6; r++) {
+            MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+        }
+        moqr_shards_jinfo_t j;
+        jinfo(s, 1, p, &j);
+        MOQ_TEST_CHECK_EQ_INT(j.mirror, 0);   /* mirrored onto shard 1 */
+        if (i == 23) {
+            break;   /* leave the last one announced */
+        }
+        MOQ_TEST_CHECK(unann(s, 0, p0, p) == MOQR_OK);
+        for (int r = 0; r < 6; r++) {
+            MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+        }
+    }
+    for (uint16_t i = 0; i < 2; i++) {
+        moqr_core_stats_t st;
+        moqr_core_get_stats(moqr_shards_core(s, i), &st);
+        MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_NS_NODES], 0);
+        MOQ_TEST_CHECK(st.ns_nodes <= 6);
+        MOQ_TEST_CHECK(st.ns_nodes_reclaimed >= 18);
+    }
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_ns_reclaim_mirrors");
+    return failures;
+}
+
+/* A requester-side copy that received pumped records outlives its demand as
+ * WARM cache on the requester shard (one remote subscriber that came and
+ * went leaves exactly this behind). It is reclaimable like any local WARM
+ * track: a full requester table evicts it for a new track, and every step
+ * keeps succeeding afterwards. */
+static int
+test_shards_requester_copy_reclaimable(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.max_tracks = 1;
+    cfg.core_cfg.linger_us = 0;
+    cfg.core_cfg.warm_idle_us = UINT64_MAX;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    MOQ_TEST_CHECK(s != NULL);
+    moqr_binding_t p0 = pub_open(s, 0);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "rqA") == MOQR_OK);
+    moqr_track_t th;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "rqA", &th) == MOQR_OK);
+    step_n(s, 8);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "rqA", 7, &sub) == MOQR_OK);
+    for (int r = 0; r < 4; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, th, 1, 0, 0, 0x44, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    for (int r = 0; r < 4; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    dl_probe_t pr;
+    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+    MOQ_TEST_CHECK(pr.group == 1 && pr.first == 0x44);
+    MOQ_TEST_CHECK(moqr_core_unsubscribe(moqr_shards_core(s, 1), sub, 1000) ==
+                   MOQR_OK);
+    for (int r = 0; r < 8; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_pending_demand(s, 1), 0);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(moqr_shards_core(s, 1), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.tracks, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.tracks_reclaimable, 1);   /* cache, no reader */
+    /* A local push on the full requester table evicts the copy. */
+    moqr_binding_t p1 = pub_open_at(s, 1, 9);
+    moqr_track_t tl;
+    MOQ_TEST_CHECK(pub_track_h(s, 1, p1, "rqLocal", &tl) == MOQR_OK);
+    moqr_core_get_stats(moqr_shards_core(s, 1), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.tracks_evicted_capacity, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_TRACKS], 0);
+    for (int r = 0; r < 6; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_requester_copy_reclaimable");
+    return failures;
+}
+
+/* A remote demand the owner cannot admit for lack of room (its track table
+ * holds only live tracks) resolves at the requester with the capacity
+ * meaning, not INTERNAL_ERROR: the requester's binding then answers its
+ * subscriber with the draft's capacity code and a Retry Interval. */
+static int
+test_shards_remote_capacity_code(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.max_tracks = 1;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    MOQ_TEST_CHECK(s != NULL);
+    moqr_binding_t p0 = pub_open(s, 0);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "cx") == MOQR_OK);
+    MOQ_TEST_CHECK(pub_track(s, &a, 0, p0, "cx") == MOQR_OK);   /* live "v" */
+    step_n(s, 8);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moq_bytes_t nsp[1] = { { (const uint8_t *)"cx", 2 } };
+    moqr_subscribe_req_t rq;
+    moqr_subscribe_req_init(&rq);
+    rq.ns = (moqr_ns_t){ nsp, 1 };
+    rq.name = (moq_bytes_t){ (const uint8_t *)"w", 1 };
+    rq.cookie = 7;
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(moqr_core_subscribe(moqr_shards_core(s, 1), d1, &rq,
+                                       &sub) == MOQR_OK);
+    for (int r = 0; r < 6; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    uint64_t code = 0;
+    bool pre = false;
+    MOQ_TEST_CHECK_EQ_U64(resolved(s, 1, &code, &pre), 1);
+    MOQ_TEST_CHECK_EQ_U64(code, MOQR_REQUEST_ERROR_CAPACITY);
+    MOQ_TEST_CHECK(pre);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(moqr_shards_core(s, 0), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_TRACKS], 1);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_remote_capacity_code");
+    return failures;
+}
+
+/* A mirror install the core refused for room recovers once room appears,
+ * and waiting for that room counts one refusal, however often routes change
+ * in between.
+ * Each shard's trie holds one namespace. Shard 1 announces "a" and shard 0
+ * announces "b" before any exchange, so each shard's mirror of the other's
+ * namespace is refused. Shard 1 then withdraws "a": its trie has room, and
+ * the still-live "b" must be mirrored there without being re-announced. */
+static int
+test_shards_mirror_capacity_recovers(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.core_cfg.max_ns_nodes = 2;   /* root + one namespace */
+    cfg.journal_entries = 8;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    MOQ_TEST_CHECK(s != NULL);
+    moqr_binding_t p1 = pub_open_at(s, 1, 11);
+    moqr_binding_t p0 = pub_open_at(s, 0, 10);
+    MOQ_TEST_CHECK(ann(s, 1, p1, "a") == MOQR_OK);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "b") == MOQR_OK);
+    for (int r = 0; r < 8; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    moqr_shards_jinfo_t j;
+    jinfo(s, 1, "b", &j);
+    MOQ_TEST_CHECK(j.present && j.mirror == -1);   /* refused: no room */
+    moqr_core_stats_t st;
+    moqr_core_get_stats(moqr_shards_core(s, 1), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_NS_NODES], 1);
+    /* Room appearing elsewhere (track slots and name bytes freed) moves the
+     * core's room epoch, so the parked install looks again, through the
+     * uncounted room probe, and finds no namespace room: it is not refused
+     * again, and the episode stays one counted refusal. */
+    uint64_t room0 = moqr_core_room_epoch(moqr_shards_core(s, 1));
+    for (int k = 0; k < 6; k++) {
+        moq_bytes_t nsp[1] = { { (const uint8_t *)"a", 1 } };
+        moq_bytes_t nm = { (const uint8_t *)"churn", 5 };
+        moqr_track_t th;
+        MOQ_TEST_CHECK(moqr_core_publish_open(moqr_shards_core(s, 1), p1,
+                                              (moqr_ns_t){ nsp, 1 }, nm,
+                                              50 + (uint64_t)k, &th) ==
+                       MOQR_OK);
+        moqr_pd_desc_t done;
+        (void)moqr_pd_desc_local(MOQR_PD_TRACK_ENDED, &done);
+        MOQ_TEST_CHECK(moqr_core_source_done(moqr_shards_core(s, 1), th, 1,
+                                             done, 1000) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_room_epoch(moqr_shards_core(s, 1)) > room0);
+    moqr_core_get_stats(moqr_shards_core(s, 1), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_NS_NODES], 1);
+    jinfo(s, 1, "b", &j);
+    MOQ_TEST_CHECK(j.mirror == -1);
+    MOQ_TEST_CHECK(unann(s, 1, p1, "a") == MOQR_OK);
+    for (int r = 0; r < 8; r++) {
+        MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    }
+    jinfo(s, 1, "b", &j);
+    MOQ_TEST_CHECK_EQ_INT(j.mirror, 0);   /* now mirrored from shard 0 */
+    /* And it routes: a subscribe on shard 1 for b/v reaches shard 0. */
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "b", 7, &sub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_pending_demand(s, 1), 1);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_mirror_capacity_recovers");
+    return failures;
+}
+
+/* A withdrawal during reconciliation frees enough room for an earlier
+ * blocked entry, but not a later, larger one. The later refusal must not
+ * acknowledge that room change on behalf of the earlier entry. */
+static int
+test_shards_mirror_capacity_changes_during_reconcile(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 3, 0);
+    cfg.live_visibility = true;
+    cfg.core_cfg.max_ns_nodes = 3;   /* root + two parts */
+    cfg.journal_entries = 8;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    if (s == NULL) {
+        return failures + 1;
+    }
+    moqr_binding_t p0 = pub_open_at(s, 0, 10);
+    moqr_binding_t p1 = pub_open_at(s, 1, 11);
+    moqr_binding_t p2 = pub_open_at(s, 2, 12);
+    moqr_core_t *c2 = moqr_shards_core(s, 2);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "b") == MOQR_OK);
+    MOQ_TEST_CHECK(ann(s, 2, p2, "z") == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 0, 1000, NULL) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 2, 1000, NULL) == MOQR_OK);
+    moqr_shards_jinfo_t j;
+    jinfo(s, 2, "b", &j);
+    MOQ_TEST_CHECK(j.present && j.mirror == 0);
+
+    MOQ_TEST_CHECK(ann(s, 0, p0, "a") == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 0, 1000, NULL) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 2, 1000, NULL) == MOQR_OK);
+    jinfo(s, 2, "a", &j);
+    MOQ_TEST_CHECK(j.present && j.candidates == 1 && j.mirror == -1);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(c2, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_NS_NODES], 1);
+
+    /* Deliver both changes before shard 2 reconciles: a, b, then c/d. */
+    moq_bytes_t cd_parts[] = {
+        { (const uint8_t *)"c", 1 }, { (const uint8_t *)"d", 1 }
+    };
+    MOQ_TEST_CHECK(unann(s, 0, p0, "b") == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_announce(moqr_shards_core(s, 1), p1,
+                                      (moqr_ns_t){ cd_parts, 2 }) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 0, 1000, NULL) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 1, 1000, NULL) == MOQR_OK);
+    uint64_t room_before = moqr_core_room_epoch(c2);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 2, 1000, NULL) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_room_epoch(c2) > room_before);
+    for (int i = 0; i < 4; i++) {
+        MOQ_TEST_CHECK(moqr_shards_step_shard(s, 2, 1000, NULL) == MOQR_OK);
+    }
+    jinfo(s, 2, "a", &j);
+    MOQ_TEST_CHECK(j.present && j.mirror == 0);
+    moqr_shards_debug_journal(s, 2, cd_parts, 2, &j);
+    MOQ_TEST_CHECK(j.present && j.candidates == 2 && j.mirror == -1);
+    moqr_core_get_stats(c2, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.refusals[MOQR_REFUSE_NS_NODES], 2);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_pending_tokens(s, 2), 0);
+    moqr_binding_t d2 = sub_open(s, 2, 20);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 2, d2, "a", 7, &sub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step_shard(s, 2, 1000, NULL) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_pending_demand(s, 2), 1);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_mirror_capacity_changes_during_reconcile");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -6512,6 +6956,12 @@ main(void)
     failures += test_shards_demand_channel_full();
     failures += test_shards_demand_mailbox_isolated();
     failures += test_shards_admit_ack_lifecycle();
+    failures += test_shards_reclaim_mirror_interest();
+    failures += test_shards_ns_reclaim_mirrors();
+    failures += test_shards_requester_copy_reclaimable();
+    failures += test_shards_remote_capacity_code();
+    failures += test_shards_mirror_capacity_recovers();
+    failures += test_shards_mirror_capacity_changes_during_reconcile();
     failures += test_shards_admit_reject_code();
     failures += test_shards_admit_sub_done_code();
     failures += test_shards_admit_cancel_before_ack();

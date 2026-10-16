@@ -55,6 +55,7 @@
  */
 
 #include <moq/export.h>
+#include <moq/types.h>   /* moq_bytes_t, for the delegated-trust callback */
 
 #ifdef __cplusplus
 extern "C" {
@@ -94,6 +95,64 @@ typedef struct st_picoquic_quic_t picoquic_quic_t;
  */
 MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
                                            const char *ca_file);
+
+/* -- Delegated certificate trust ----------------------------------------- *
+ *
+ * The provider-stable shape of application-owned trust for picoquic CLIENTS.
+ * REJECT is zero so a default-initialised or unrecognised verdict fails
+ * closed. This is the adapter's one spelling of delegated trust; the service
+ * tier translates its own verdict onto it at exactly one site. */
+typedef enum moq_picoquic_cert_verdict {
+    MOQ_PICOQUIC_CERT_REJECT = 0,
+    MOQ_PICOQUIC_CERT_TRUST  = 1
+} moq_picoquic_cert_verdict_t;
+
+/* The trust decision over BORROWED spans valid for the call only:
+ * `server_name` is the exact name the handshake authenticates, `certificates`
+ * the leaf-first DER chain as received (at most 16 entries).
+ *
+ * Before the callback runs the adapter has matched the leaf against
+ * `server_name` under the same reference-identity rules as the provider's
+ * own verifier (DNS name against dNSName SANs or the subject CN, no
+ * partial-label wildcards; IP literal against iPAddress SANs) and refused a
+ * chain that does not name it, and it refuses an absent or empty name; the
+ * callback is never consulted for those. After a TRUST verdict the provider
+ * still extracts the leaf key and enforces TLS CertificateVerify. Everything
+ * else about the chain -- issuer trust, validity, purpose, constraints,
+ * revocation, application policy -- is the callback's to decide: the adapter
+ * verifies against an empty store and hands its chain-policy outcome to the
+ * delegate. Operational failures (allocation, library) are never converted
+ * into acceptance.
+ *
+ * Runs synchronously on picoquic's network thread; must not re-enter picoquic
+ * or LibMoQ. */
+typedef moq_picoquic_cert_verdict_t (*moq_picoquic_cert_verify_fn)(
+    void *ctx,
+    moq_bytes_t server_name,
+    const moq_bytes_t *certificates,
+    size_t certificate_count);
+
+/* True when this adapter build can install a delegated trust callback.
+ * Declared and DEFINED in every provider build so a consumer asks at runtime:
+ * the OpenSSL provider reports support; mbedTLS reports false rather than
+ * accepting a callback it would ignore. */
+MOQ_API bool moq_picoquic_supports_cert_verify_callback(void);
+
+/* Install a delegated trust callback on a client context. `ctx` is opaque,
+ * MAY be NULL, and stays caller-owned until the QUIC context is destroyed.
+ * Returns MOQ_OK on success; MOQ_ERR_INVAL for NULL quic or verify (checked
+ * before provider support); MOQ_ERR_UNSUPPORTED for a provider without this
+ * capability; MOQ_ERR_NOMEM for allocation failure; MOQ_ERR_WRONG_STATE when
+ * picoquic reports frozen TLS configuration; MOQ_ERR_INTERNAL for other
+ * provider initialization or installer failures. Transactional under
+ * the same ownership rules as moq_picoquic_set_cert_verifier(): on failure
+ * nothing is installed and any previously installed verifier is unchanged. On
+ * picoquic revisions with only the historical void setter, a successful return
+ * means the setter took ownership; that API has no failure outcome. */
+MOQ_API moq_result_t moq_picoquic_set_cert_verify_callback(
+    picoquic_quic_t *quic,
+    moq_picoquic_cert_verify_fn verify,
+    void *ctx);
 
 /* Preflight a CA bundle path without a QUIC context: returns 1 if `ca_file`
  * loads as a trust store (or, for backends with an implicit system store, is

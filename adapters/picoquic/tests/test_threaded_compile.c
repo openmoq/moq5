@@ -3,6 +3,7 @@
  * and server network threads, wake/wait/stop, loopback.
  */
 
+#include <time.h>
 #include <moq/picoquic_threaded.h>
 #include <moq/picoquic_verify.h>
 #include <picoquic.h>
@@ -20,6 +21,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+
+/* The smoke loops wake the lane they then wait on, so each wait returns at
+ * once: they are bounded by wall time, not by a count of waits. */
+static struct timespec smoke_deadline(int seconds)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    t.tv_sec += seconds;
+    return t;
+}
+
+static int smoke_before(const struct timespec *dl)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec < dl->tv_sec ||
+           (now.tv_sec == dl->tv_sec && now.tv_nsec < dl->tv_nsec);
+}
 
 static int failures = 0;
 
@@ -1907,7 +1927,7 @@ int main(void)
 
             if (crc == MOQ_OK) {
                 /* Drive both sides until client receives the object. */
-                for (int tries = 0; tries < 400; tries++) {
+                for (struct timespec dl = smoke_deadline(10); smoke_before(&dl);) {
                     moq_pq_threaded_wake(srv);
                     moq_pq_threaded_wake(cli);
                     moq_pq_threaded_wait(cli, 25000);
@@ -1927,7 +1947,7 @@ int main(void)
                  * verify it fires on_subscribe_done with the status WITHOUT
                  * closing the session. */
                 __atomic_store_n(&srv_state.do_finish, 1, __ATOMIC_RELEASE);
-                for (int tries = 0; tries < 400; tries++) {
+                for (struct timespec dl = smoke_deadline(10); smoke_before(&dl);) {
                     moq_pq_threaded_wake(srv);
                     moq_pq_threaded_wake(cli);
                     moq_pq_threaded_wait(cli, 25000);
@@ -1948,7 +1968,7 @@ int main(void)
                  * lets the server prune that session. */
                 __atomic_store_n(&srv_state.cleanup_requested, 1,
                                  __ATOMIC_RELEASE);
-                for (int tries = 0; tries < 400; tries++) {
+                for (struct timespec dl = smoke_deadline(10); smoke_before(&dl);) {
                     moq_pq_threaded_wake(srv);
                     moq_pq_threaded_wait(srv, 25000);
                     if (__atomic_load_n(&srv_state.cleanup_done,

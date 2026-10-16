@@ -218,9 +218,9 @@ package final class AudioDecoder {
     /// length is validated BEFORE the converter is created, so an oversized
     /// config is rejected with a typed error and `factory` is never called (the
     /// security regression asserts exactly that -- zero factory calls). This
-    /// closes MOQ-SWIFTPLAYER-AAC-LENGTH-TRAP, where the pre-fix code built the
-    /// converter first and only then reached `buildAACMagicCookie`, whose
-    /// descriptor-length `UInt8(...)` conversion overflowed on a large ASC.
+    /// guards MOQ-SWIFTPLAYER-AAC-LENGTH-TRAP: building the converter first and
+    /// only then reaching `buildAACMagicCookie` would let its descriptor-length
+    /// `UInt8(...)` conversion overflow on a large ASC.
     package func makeAACConverter(
         formatID: AudioFormatID, sampleRate: UInt32, channels ch: UInt32,
         codecConfig: Data?,

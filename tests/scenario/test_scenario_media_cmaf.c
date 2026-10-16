@@ -5,8 +5,8 @@
  * expected moq_cmaf_object_report_t and asserts moq_cmaf_validate_object()
  * reproduces it precisely (specific first-failure reason, chunk_count,
  * track_id, sap_type); valid objects also assert parse_fragment normalization.
- * Uses the MOQ_SCENARIO_* env knobs and the canonical "Replay:" output. Slice 3
- * of the seeded media-conformance extension: generate-only (no byte mutation).
+ * Uses the MOQ_SCENARIO_* env knobs and the canonical "Replay:" output.
+ * Generate-only: objects are built, never byte-mutated.
  *
  * Light ctest default (200 seeds x 32 cases). Heavier local runs:
  *   MOQ_SCENARIO_SEEDS=100000 ./build/tests/test_scenario_media_cmaf

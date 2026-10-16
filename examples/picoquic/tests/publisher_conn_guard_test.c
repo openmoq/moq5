@@ -1,8 +1,8 @@
 /*
  * Unit test for examples/picoquic/publisher_conn_guard.h - the connection-
- * isolation classifier for the singleton picoquic publisher (security report
- * finding #9, MOQ-EXAMPLE-PICOQUIC-CONNECTION-CONFUSION). Pure C, no picoquic
- * and no network: it exercises the decision the callback delegates to, so the
+ * isolation classifier for the singleton picoquic publisher
+ * (MOQ-EXAMPLE-PICOQUIC-CONNECTION-CONFUSION). Pure C, no picoquic and no
+ * network: it exercises the decision the callback delegates to, so the
  * "a second connection cannot reach the first adapter path" property is proven
  * deterministically.
  */

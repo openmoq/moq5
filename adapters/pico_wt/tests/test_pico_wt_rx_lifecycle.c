@@ -1042,16 +1042,18 @@ static void test_teardown_while_paused(void)
 
 /*
  * Upstream interaction: picoquic_set_max_data_control() is a QUIC-CONTEXT-wide
- * switch, and while it is set picoquic_open_flow_control() returns SUCCESS
- * while emitting nothing (the guard on quic->max_data_limit == 0 in
- * picoquic/picoquic/sender.c). picoquic exposes no getter for max_data_limit,
- * so the adapter cannot detect this and promises no runtime detection -- a
- * nonzero max_data_control is documented invalid caller configuration.
+ * switch. While it is set, picoquic_open_flow_control() still grants the
+ * stream window (MAX_STREAM_DATA) but no longer raises the connection window
+ * (MAX_DATA), which then stays at the caller's limit (the max_data_limit
+ * guard in picoquic/picoquic/sender.c). The adapter never raises MAX_DATA
+ * itself, so its streams would stall at that limit; picoquic exposes no
+ * getter for it, so the adapter promises no runtime detection -- a nonzero
+ * max_data_control is documented invalid caller configuration.
  *
- * This proves the exclusion at its source rather than asserting an adapter
+ * This proves both halves at their source rather than asserting an adapter
  * behaviour that cannot exist.
  */
-static void test_max_data_control_excludes_open_flow_control(void)
+static void test_max_data_control_holds_connection_window(void)
 {
     pico_wt_harness_t h;
     pico_wt_harness_cfg_t cfg = { .cid_byte = 0x36, .request_capacity = 10 };
@@ -1076,12 +1078,15 @@ static void test_max_data_control_excludes_open_flow_control(void)
     CHECK(picoquic_open_flow_control(cnx, sid, 100000) == 0);
     CHECK(st->maxdata_local > before);
 
-    /* With the QUIC-wide switch ON the same call succeeds and does nothing. */
+    /* With the QUIC-wide switch ON the stream window still grows, but the
+     * connection window does not. */
     picoquic_set_max_data_control(h.test_ctx->qclient, 1000000);
-    uint64_t held = st->maxdata_local;
-    int rc = picoquic_open_flow_control(cnx, sid, held + 500000);
-    CHECK(rc == 0);                       /* SUCCESS ... */
-    CHECK(st->maxdata_local == held);     /* ... and no grant was emitted */
+    uint64_t stream_before = st->maxdata_local;
+    uint64_t cnx_before = cnx->maxdata_local;
+    int rc = picoquic_open_flow_control(cnx, sid, stream_before + 500000);
+    CHECK(rc == 0);
+    CHECK(st->maxdata_local > stream_before);
+    CHECK(cnx->maxdata_local == cnx_before);
 
     picoquic_set_max_data_control(h.test_ctx->qclient, 0);
     pico_wt_harness_cleanup(&h);
@@ -1383,7 +1388,7 @@ int main(void)
     test_direct_control_fin_does_not_sweep();
     test_control_fin_dispatch_error_is_fatal();
     test_local_stop_sending_drops_receive_state();
-    test_max_data_control_excludes_open_flow_control();
+    test_max_data_control_holds_connection_window();
 
     if (g_failures) {
         fprintf(stderr, "FAILED: test_pico_wt_rx_lifecycle (%d)\n", g_failures);

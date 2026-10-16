@@ -293,7 +293,7 @@ response_tap(const shx_driver_t *sub)
  * Establish a publisher and a downstream SUBSCRIBE_NAMESPACE subscriber,
  * announce ns {"live","alpha"} under subscribed prefix {"live"}, prove the
  * NAMESPACE reached the subscriber, then run `withdraw`, then assert the
- * 0163 oracle: NAMESPACE first, exactly one NAMESPACE_DONE with suffix
+ * oracle: NAMESPACE first, exactly one NAMESPACE_DONE with suffix
  * "alpha", none before, and no further NAMESPACE until a fresh publication
  * (which the script then performs and proves). */
 
@@ -1611,7 +1611,7 @@ main(int argc, char **argv)
 }
 
 
-/* -- post-revocation re-admission (the 0171-D family) -------------------- *
+/* -- post-revocation re-admission ---------------------------------------- *
  * A source force-withdraw/revocation may terminate the old generation, but
  * a later ACCEPTED re-announcement plus a fresh downstream subscription
  * must create a fresh upstream demand and carry data — no stale manager,
@@ -1795,7 +1795,7 @@ moqr_readmission_main(void)
 }
 
 /* --multipub: the SS8.3/SS9.3 succession audit, a separate qualification
- * entry (expected RED while the compliance gap stands) */
+ * entry (expected to fail while the compliance gap stands) */
 int
 moqr_multipub_main(void)
 {

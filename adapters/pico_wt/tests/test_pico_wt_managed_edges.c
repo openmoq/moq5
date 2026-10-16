@@ -8,6 +8,7 @@
 
 #include <moq/moq.h>
 #include <moq/pico_wt_managed.h>
+#include "pico_wt_test_seam.h"
 #include <moq/picoquic_verify.h>   /* the helper under test */
 
 #include <picoquic.h>
@@ -135,6 +136,7 @@ static void test_connect_failure(void)
     moq_pico_wt_managed_destroy(cli);
 }
 
+
 /* -- stop/wake/wait lifecycle -------------------------------------- */
 
 static void test_lifecycle(void)
@@ -176,6 +178,63 @@ static moq_pico_wt_managed_t *make_test_server(const char *cert,
     if (moq_pico_wt_managed_create(&cfg, &srv) != MOQ_OK) return NULL;
     for (int i = 0; i < 3; i++) moq_pico_wt_managed_wait(srv, 100000);
     return srv;
+}
+
+/* A client's CONNECT waits for the server's SETTINGS
+ * (draft-ietf-webtrans-http3-15 Section 4.6), so create succeeds and the
+ * CONNECT is submitted once SETTINGS arrive. long_path = 1: a 2048-byte path
+ * cannot be prepared, so the CONNECT is still pending after SETTINGS, h3zero
+ * fails the connection, and the client ends terminally, at the transport
+ * level, with no session. long_path = 0 is the control: the same server, the
+ * CONNECT is queued once SETTINGS arrive and the session comes up. The
+ * private seam tells these apart from a handshake failure or a refused route,
+ * neither of which leaves a CONNECT pending after SETTINGS. It cannot by
+ * itself tell a preparation failure from a failure to queue the prepared
+ * CONNECT; only the path differs between the two rows. Stop and destroy then
+ * release the h3zero context the connection still carries. */
+static void test_connect_prepare(const char *cert, const char *key, int long_path)
+{
+    static char long_path_buf[2049];
+    long_path_buf[0] = '/';
+    memset(long_path_buf + 1, 'p', sizeof(long_path_buf) - 2);
+    long_path_buf[sizeof(long_path_buf) - 1] = '\0';
+    int proven = 0;
+    static const int ports[] = { 25443, 25587, 25731, 25877 };
+    for (size_t i = 0; i < sizeof(ports) / sizeof(ports[0]) && !proven; i++) {
+        moq_pico_wt_managed_t *srv = make_test_server(cert, key, ports[i]);
+        if (!srv) continue;                          /* bind — retry */
+        moq_pico_wt_managed_cfg_t cfg;
+        base_client_cfg(&cfg, moq_pico_wt_managed_local_port(srv));
+        cfg.insecure_skip_verify = true;
+        cfg.path = long_path ? long_path_buf : "/moq";
+        moq_pico_wt_managed_t *cli = NULL;
+        CHECK(moq_pico_wt_managed_create(&cfg, &cli) == MOQ_OK);
+        if (cli) {
+            int done = 0, has_session = 0;
+            for (int k = 0; k < 40 && !done; k++) {
+                moq_pico_wt_managed_wait(cli, 100000);
+                has_session = moq_pico_wt_managed_session(cli) != NULL;
+                done = moq_pico_wt_managed_is_fatal(cli) || has_session;
+            }
+            int fatal = moq_pico_wt_managed_is_fatal(cli);
+            uint64_t fcode = moq_pico_wt_managed_fatal_code(cli);
+            moq_pico_wt_managed_stop(cli);   /* joins the counting thread */
+            unsigned queued = moq_pico_wt_managed_test_connect_enqueued(cli);
+            unsigned pending = moq_pico_wt_managed_test_connect_left_pending(cli);
+            if (long_path) {
+                CHECK(pending == 1 && queued == 0);
+                CHECK(fatal && fcode == 0 && !has_session);
+            } else {
+                CHECK(queued == 1 && pending == 0);
+                CHECK(has_session && !fatal);
+            }
+            proven = 1;
+            moq_pico_wt_managed_destroy(cli);
+        }
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+    }
+    CHECK(proven);
 }
 
 /* A verify-certificate callback that rejects every server cert. Used to
@@ -512,6 +571,8 @@ int main(int argc, char **argv)
     test_null_safety();
     test_ip_host_sni_policy();
     test_connect_failure();
+    test_connect_prepare(cert, key, 0);
+    test_connect_prepare(cert, key, 1);
     test_lifecycle();
     test_cert_failure(cert, key);
     test_helper_cert_failure(cert, key);

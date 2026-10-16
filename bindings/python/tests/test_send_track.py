@@ -1,12 +1,12 @@
-"""RED for the Python send-track slice: SendTrackConfig, SendTrack, add, remove.
+"""The Python send-track surface: SendTrackConfig, SendTrack, add, remove.
 
-None of that surface exists yet. Every behavioural row runs a real body and
-fails by a NAMED missing behaviour; none skips and none is a docstring. Inert
-names do not turn them green, which the controls at the end pin.
+Every behavioural row runs a real body and fails by a NAMED missing
+behaviour; none skips and none is a docstring. Inert names do not make them
+pass, which the controls at the end pin.
 
 What this file does NOT claim. A missing-surface refusal at the top of a row
-proves the gate, not the deeper oracle below it; those oracles are written so
-they discriminate once the surface lands, and the report says so. Forcing a
+proves the gate, not the deeper oracle below it; those oracles discriminate
+only where the surface is present. Forcing a
 scripted native result proves the binding's translation of that code, never
 that the real C operation emits it in ordinary execution.
 
@@ -73,9 +73,8 @@ UINT64_MAX = 2 ** 64 - 1
 
 SURFACE = ("SendTrackConfig", "SendTrack", "TrackNameBusy")
 
-# Bridge entry points this slice will need. They do not exist yet; the rows
-# that name them are REDs against the bridge boundary, not a request to
-# implement them in this round.
+# Bridge entry points the send-track surface uses. A row that names one fails
+# by name at the bridge boundary when it is missing.
 BRIDGE = ("send_track_prepare", "send_track_activate", "send_track_name",
           "send_track_removed")
 
@@ -164,7 +163,7 @@ class SendTrackSubstrateTests(SendTrackFixtureBase):
             with self.subTest(field=ours):
                 self.assertEqual(int(mirror[ours]), authority[theirs],
                                  f"the fixture track initializer drifted at {ours}")
-        # These 13 are the fields this slice declares against. They are NOT
+        # These 13 are the fields this surface declares against. They are NOT
         # every field of the native struct, and this control does not claim to
         # compare the rest.
         self.assertEqual(authority["track_is_live"], 1,

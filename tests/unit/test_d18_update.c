@@ -7,6 +7,8 @@
  * OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT); a sub-millisecond timeout is rejected
  * locally before anything is emitted, and unknown inbound parameters fail closed.
  */
+#include <stdlib.h>
+#include <string.h>
 #include <moq/moq.h>
 #include <moq/control_d18.h>
 #include <moq/sim.h>
@@ -300,10 +302,336 @@ static int update_from_action(const moq_action_t *act, moq_stream_ref_t ref,
     return moq_d18_decode_request_update(env.payload, env.payload_len, u) == MOQ_OK;
 }
 
+typedef struct {
+    int64_t balance;
+    size_t  bytes_alloc;
+    size_t  bytes_free;
+} upd_alloc_state_t;
+
+static void *upd_test_alloc(size_t size, void *ctx)
+{
+    upd_alloc_state_t *st = (upd_alloc_state_t *)ctx;
+    void *p = malloc(size ? size : 1);
+    if (p) {
+        st->balance++;
+        st->bytes_alloc += size;
+    }
+    return p;
+}
+
+static void *upd_test_realloc(void *ptr, size_t old_size, size_t new_size,
+                              void *ctx)
+{
+    upd_alloc_state_t *st = (upd_alloc_state_t *)ctx;
+    if (!ptr) return upd_test_alloc(new_size, ctx);
+    void *np = realloc(ptr, new_size ? new_size : 1);
+    if (np) {
+        st->bytes_free += old_size;
+        st->bytes_alloc += new_size;
+    }
+    return np;
+}
+
+static void upd_test_free(void *ptr, size_t size, void *ctx)
+{
+    if (!ptr) return;
+    upd_alloc_state_t *st = (upd_alloc_state_t *)ctx;
+    st->balance--;
+    st->bytes_free += size;
+    free(ptr);
+}
+
+static moq_session_t *make_established_tracked(moq_perspective_t persp,
+                                               upd_alloc_state_t *as)
+{
+    moq_alloc_t alloc = {
+        .ctx     = as,
+        .alloc   = upd_test_alloc,
+        .realloc = upd_test_realloc,
+        .free    = upd_test_free,
+    };
+    moq_session_cfg_t cfg;
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), &alloc, persp);
+    cfg.version = MOQ_VERSION_DRAFT_18;
+    moq_session_t *s = NULL;
+    if (moq_session_create(&cfg, 0, &s) < 0) return NULL;
+    if (moq_session_start(s, 0) < 0) { moq_session_destroy(s); return NULL; }
+    moq_action_t a;
+    while (moq_session_poll_actions(s, &a, 1) > 0) moq_action_cleanup(&a);
+    uint8_t setup[16];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, setup, sizeof(setup));
+    moq_d18_encode_setup(&w);
+    moq_session_on_control_bytes(s, setup, moq_buf_writer_offset(&w), 0);
+    moq_event_t e;
+    while (moq_session_poll_events(s, &e, 1) > 0) moq_event_cleanup(&e);
+    return s;
+}
+
+/*
+ * Draft-18 §10 Table 5 ("Messages marked 'First' MUST be the first message on
+ * a new request stream") & §10.9: once a publisher-side SUBSCRIBE bidi is
+ * established, a valid REQUEST_UPDATE succeeds while any repeated initial
+ * request (SUBSCRIBE, PUBLISH, FETCH, PUBLISH_NAMESPACE, TRACK_STATUS,
+ * SUBSCRIBE_TRACKS, SUBSCRIBE_NAMESPACE) closes the session with
+ * PROTOCOL_VIOLATION (0x3) without overwriting or re-keying the original
+ * subscription slot, surfacing a spurious request event, or leaking
+ * allocations.
+ */
+static int test_established_subscribe_bidi_rules(void)
+{
+    int failures = 0;
+
+    /* 1. Valid REQUEST_UPDATE on an established publisher-side SUBSCRIBE bidi
+     *    succeeds, preserves the original subscription slot, and balances
+     *    allocations. */
+    {
+        upd_alloc_state_t as = { 0 };
+        moq_session_t *s = make_established_tracked(MOQ_PERSPECTIVE_SERVER, &as);
+        MOQ_TEST_CHECK(s != NULL);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xE001);
+        moq_subscription_t h = establish_publisher(s, "video", 0, ref);
+
+        moq_request_endpoint_t ep0 = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep0.kind, (int)MOQ_REQ_SUBSCRIPTION);
+        uint8_t *orig_tid = s->subs[ep0.slot].track_id_buf;
+        size_t orig_tid_len = s->subs[ep0.slot].track_id_len;
+        struct moq_track_hist *orig_hist = s->subs[ep0.slot].hist;
+
+        moq_d18_msg_params_t p = { 0 };
+        p.has_forward = true;
+        p.forward = 0;
+        p.has_subscriber_priority = true;
+        p.subscriber_priority = 33;
+        uint8_t upd[64];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, upd, sizeof(upd));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_d18_encode_request_update(&w, 2, &p), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(
+                s, ref, upd, moq_buf_writer_offset(&w), false, 2),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
+
+        bool saw_update = false;
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                saw_update = true;
+                MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_updated.sub._opaque,
+                                      h._opaque);
+                MOQ_TEST_CHECK(ev.u.subscribe_updated.has_forward &&
+                               !ev.u.subscribe_updated.forward);
+                MOQ_TEST_CHECK(ev.u.subscribe_updated.has_subscriber_priority &&
+                               ev.u.subscribe_updated.subscriber_priority == 33);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(saw_update);
+
+        moq_request_endpoint_t ep1 = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep1.kind, (int)MOQ_REQ_SUBSCRIPTION);
+        MOQ_TEST_CHECK_EQ_INT(ep1.slot, ep0.slot);
+        MOQ_TEST_CHECK_EQ_INT((int)s->subs[ep0.slot].state,
+                              (int)MOQ_SUB_ESTABLISHED);
+        MOQ_TEST_CHECK_EQ_U64(s->subs[ep0.slot].handle._opaque, h._opaque);
+        MOQ_TEST_CHECK(s->subs[ep0.slot].track_id_buf == orig_tid);
+        MOQ_TEST_CHECK_EQ_SIZE(s->subs[ep0.slot].track_id_len, orig_tid_len);
+        MOQ_TEST_CHECK(s->subs[ep0.slot].hist == orig_hist);
+        MOQ_TEST_CHECK_EQ_INT((int)s->sub_occ_head, ep0.slot);
+        MOQ_TEST_CHECK_EQ_INT((int)s->subs[ep0.slot].occ_next, -1);
+
+        moq_action_t act;
+        while (moq_session_poll_actions(s, &act, 1) > 0)
+            moq_action_cleanup(&act);
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK_EQ_INT((int)as.balance, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(as.bytes_alloc, as.bytes_free);
+    }
+
+    /* 2. Repeated initial requests on an established publisher-side SUBSCRIBE
+     *    bidi close with PROTOCOL_VIOLATION (0x3) without overwriting or
+     *    re-keying the original subscription slot or leaking allocations. */
+    enum {
+        CASE_SUBSCRIBE_NEW_TRACK = 0,
+        CASE_SUBSCRIBE_FUZZ_REPRO,
+        CASE_PUBLISH,
+        CASE_FETCH,
+        CASE_PUBLISH_NAMESPACE,
+        CASE_TRACK_STATUS,
+        CASE_SUBSCRIBE_TRACKS,
+        CASE_SUBSCRIBE_NAMESPACE,
+        CASE_COUNT
+    };
+
+    for (int c = 0; c < CASE_COUNT; c++) {
+        upd_alloc_state_t as = { 0 };
+        moq_session_t *s = make_established_tracked(MOQ_PERSPECTIVE_SERVER, &as);
+        MOQ_TEST_CHECK(s != NULL);
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(0xE100u + (uint64_t)c);
+        uint64_t init_req_id = (c == CASE_SUBSCRIBE_FUZZ_REPRO) ? 4 : 0;
+        moq_subscription_t h = establish_publisher(s, "video", init_req_id, ref);
+
+        moq_request_endpoint_t ep0 = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep0.kind, (int)MOQ_REQ_SUBSCRIPTION);
+        uint8_t *orig_tid = s->subs[ep0.slot].track_id_buf;
+        size_t orig_tid_len = s->subs[ep0.slot].track_id_len;
+        struct moq_track_hist *orig_hist = s->subs[ep0.slot].hist;
+
+        uint8_t msg[128];
+        size_t msg_len = 0;
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, msg, sizeof(msg));
+        moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+        moq_namespace_t ns = { parts, 1 };
+        moq_d18_msg_params_t mp = { 0 };
+
+        switch (c) {
+        case CASE_SUBSCRIBE_NEW_TRACK:
+            msg_len = make_subscribe(msg, sizeof(msg), 2, "audio");
+            break;
+        case CASE_SUBSCRIBE_FUZZ_REPRO: {
+            /* Fuzzer-discovered sequence on an established subscription bidi
+             * (initial SUBSCRIBE at request_id=4, followed on the same bidi by
+             * SUBSCRIBE at unused request_id=0 with namespace {"f\xffzz"} and
+             * track {"track"}). */
+            static const uint8_t fuzz_ns_bytes[] = { 'f', 0xff, 'z', 'z' };
+            moq_bytes_t fparts[] = { { fuzz_ns_bytes, sizeof(fuzz_ns_bytes) } };
+            moq_namespace_t fns = { fparts, 1 };
+            mp.has_forward = true;
+            mp.forward = 1;
+            mp.has_subscriber_priority = true;
+            mp.subscriber_priority = 128;
+            mp.has_group_order = true;
+            mp.group_order = MOQ_GROUP_ORDER_DESCENDING;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_subscribe(
+                    &w, 0, &fns, MOQ_BYTES_LITERAL("track"), &mp),
+                (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        }
+        case CASE_PUBLISH: {
+            moq_d18_publish_t pub;
+            memset(&pub, 0, sizeof(pub));
+            pub.request_id = 2;
+            pub.track_namespace = ns;
+            pub.track_name = MOQ_BYTES_LITERAL("audio");
+            pub.track_alias = 9;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_publish(&w, &pub), (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        }
+        case CASE_FETCH: {
+            moq_d18_fetch_t f;
+            memset(&f, 0, sizeof(f));
+            f.request_id = 2;
+            f.fetch_type = MOQ_D18_FETCH_TYPE_STANDALONE;
+            f.track_namespace = ns;
+            f.track_name = MOQ_BYTES_LITERAL("audio");
+            f.start = (moq_d18_location_t){ 0, 0 };
+            f.end   = (moq_d18_location_t){ 1, 1 };
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_fetch(&w, &f), (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        }
+        case CASE_PUBLISH_NAMESPACE:
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_publish_namespace(&w, 2, &ns, &mp),
+                (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        case CASE_TRACK_STATUS:
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_track_status(
+                    &w, 2, &ns, MOQ_BYTES_LITERAL("audio"), &mp),
+                (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        case CASE_SUBSCRIBE_TRACKS:
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_subscribe_tracks(&w, 2, &ns, &mp),
+                (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        case CASE_SUBSCRIBE_NAMESPACE:
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_d18_encode_subscribe_namespace(&w, 2, &ns, &mp),
+                (int)MOQ_OK);
+            msg_len = moq_buf_writer_offset(&w);
+            break;
+        }
+
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_on_bidi_stream_bytes(s, ref, msg, msg_len, false, 2),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_CLOSED);
+
+        /* Only MOQ_EVENT_SESSION_CLOSED(0x3) may surface; no spurious request
+         * or update event is emitted. */
+        moq_event_t ev;
+        size_t non_close_events = 0;
+        bool saw_close_ev = false;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                saw_close_ev = true;
+                MOQ_TEST_CHECK_EQ_U64(ev.u.closed.code, 0x3);
+            } else {
+                non_close_events++;
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(saw_close_ev);
+        MOQ_TEST_CHECK_EQ_SIZE(non_close_events, 0);
+
+        /* Session closes with PROTOCOL_VIOLATION (0x3) and sends no bidi reply. */
+        bool saw_close = false;
+        bool saw_bidi_reply = false;
+        moq_action_t act;
+        while (moq_session_poll_actions(s, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_CLOSE_SESSION) {
+                saw_close = true;
+                MOQ_TEST_CHECK_EQ_U64(act.u.close_session.code, 0x3);
+            }
+            if (act.kind == MOQ_ACTION_SEND_BIDI_STREAM)
+                saw_bidi_reply = true;
+            moq_action_cleanup(&act);
+        }
+        MOQ_TEST_CHECK(saw_close);
+        MOQ_TEST_CHECK(!saw_bidi_reply);
+
+        /* Original subscription slot and stream-ref binding are preserved intact
+         * until session teardown (not overwritten or re-keyed to another pool). */
+        moq_request_endpoint_t ep1 = request_registry_find_by_streamref(s, ref);
+        MOQ_TEST_CHECK_EQ_INT((int)ep1.kind, (int)MOQ_REQ_SUBSCRIPTION);
+        MOQ_TEST_CHECK_EQ_INT(ep1.slot, ep0.slot);
+        MOQ_TEST_CHECK(
+            moq_index_find(s->idx_ns_by_ref, s->idx_ns_mask, ref._v) < 0);
+        MOQ_TEST_CHECK_EQ_INT((int)s->subs[ep0.slot].state,
+                              (int)MOQ_SUB_ESTABLISHED);
+        MOQ_TEST_CHECK_EQ_U64(s->subs[ep0.slot].handle._opaque, h._opaque);
+        MOQ_TEST_CHECK(s->subs[ep0.slot].track_id_buf == orig_tid);
+        MOQ_TEST_CHECK_EQ_SIZE(s->subs[ep0.slot].track_id_len, orig_tid_len);
+        MOQ_TEST_CHECK(s->subs[ep0.slot].hist == orig_hist);
+        MOQ_TEST_CHECK_EQ_INT((int)s->sub_occ_head, ep0.slot);
+        MOQ_TEST_CHECK_EQ_INT((int)s->subs[ep0.slot].occ_next, -1);
+
+        moq_session_destroy(s);
+        MOQ_TEST_CHECK_EQ_INT((int)as.balance, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(as.bytes_alloc, as.bytes_free);
+    }
+
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
     failures += test_codec();
+    failures += test_established_subscribe_bidi_rules();
 
     /* == Outbound: priority-only update on the request bidi =========== */
     {

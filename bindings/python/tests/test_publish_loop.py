@@ -1,10 +1,10 @@
-"""RED contract for a finite publisher example: examples/publish_loop.py.
+"""Contract for a finite publisher example: examples/publish_loop.py.
 
-These rows are written RED, against a file that does not exist yet. A missing
-example is an ATTRIBUTABLE failure -- the loader fails by a named assertion
-carrying the path, never a swallowed ImportError -- and the controls at the
-bottom run every row, model AND integration, against scoped stand-ins to show
-the assertions have discriminating power before any product exists.
+A missing example is an ATTRIBUTABLE failure -- the loader fails by a named
+assertion carrying the path, never a swallowed ImportError -- and the controls
+at the bottom run every row, model AND integration, against scoped stand-ins
+to show the assertions have discriminating power independently of the
+product.
 
 Scope: ONE finite submission loop over the delivered synchronous sender
 binding (write / end_track / wait / stats / has_media_subscriber). It is not a
@@ -89,7 +89,7 @@ not emission, flush, acknowledgment or receipt; it says nothing about
 END_OF_TRACK reaching a peer or a catalog being published; and it is not a
 queue-empty completion predicate.
 
-Deferred on purpose, and not enlarged by this slice: VOD conversion, CMAF and
+Out of scope on purpose: VOD conversion, CMAF and
 richer media, SAP/timeline hints, content protections, push mode, callbacks,
 asyncio, a graceful finish or drain, and the receiver-observed runtime
 coordination, which stays a separate fixture.
@@ -1093,7 +1093,7 @@ class PublishLoopIntegrationTests(unittest.TestCase):
 class PublishLoopControlTests(unittest.TestCase):
     """This file's own machinery. Never evidence about the product.
 
-    The absence control is the RED attribution. The stand-in controls prove
+    The presence control attributes a missing example. The stand-in controls prove
     the rows have discriminating power: every row -- model AND integration --
     passes against a stand-in that follows the declared contract, and each
     deliberately wrong stand-in is caught by a NAMED assertion.
@@ -1102,10 +1102,8 @@ class PublishLoopControlTests(unittest.TestCase):
     ROW_CLASSES = ("PublishLoopModelTests", "PublishLoopIntegrationTests")
 
     def test_a_the_example_is_present_with_the_declared_signature(self):
-        # This row was the RED gate's "the example is absent" assertion. The
-        # file exists now, so it pins presence, callability, the exact
-        # parameter list and defaults, and that no test scaffolding came with
-        # it.
+        # Pins the example's presence, callability, the exact parameter list
+        # and defaults, and that no test scaffolding came with it.
         import inspect
 
         self.assertTrue(EXAMPLE.exists(), f"{EXAMPLE} is missing")

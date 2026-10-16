@@ -61,13 +61,13 @@
 
 static int failures = 0;
 
-/* MOQ_TEST_PASS is gated on the GLOBAL failure count, which a RED slice always
- * trips -- so each row reports its OWN delta. That is what makes the control's
- * success visible next to the REDs. */
+/* MOQ_TEST_PASS is gated on the GLOBAL failure count, which any failing row
+ * trips -- so each row reports its OWN delta. That is what keeps a passing
+ * control visible next to a failing row. */
 #define ROW_BEGIN(name) const char *row__ = (name); int mark__ = failures
 #define ROW_END() \
     printf("%s: %s (%d diagnostic%s)\n", \
-           failures == mark__ ? "ROW OK  " : "ROW RED ", row__, \
+           failures == mark__ ? "ROW OK  " : "ROW FAIL", row__, \
            failures - mark__, (failures - mark__) == 1 ? "" : "s")
 
 /* ---- helpers -------------------------------------------------------- */
@@ -493,7 +493,7 @@ static int take_update_ok(fix_t *f, bool *has_lg, uint64_t *g, uint64_t *o)
  * Consumer side: the peer that accepted a PUBLISH names that publication
  * directly (joining_pub) and receives the retained catalog.
  * ==================================================================== */
-static void green_consumer_joins_publication(void)
+static void consumer_joins_publication(void)
 {
     ROW_BEGIN("consumer originates a PUBLISH-joined FETCH and gets the catalog");
     fix_t f;
@@ -639,7 +639,7 @@ static void green_consumer_joins_publication(void)
  * Publisher side: a conformant Joining FETCH whose Joining Request ID is a
  * PUBLISH request id resolves against the publication pool.
  * ==================================================================== */
-static void green_publisher_resolves_publication_join(void)
+static void publisher_resolves_publication_join(void)
 {
     ROW_BEGIN("publisher resolves a PUBLISH Joining Request ID");
     fix_t f;
@@ -711,7 +711,7 @@ static void green_publisher_resolves_publication_join(void)
      * one forbidden code. */
     expect_no_wire_output(sv, ref, "publisher resolves publication join");
 
-    /* GREEN CONTRACT: the Joining Request ID resolves to the Established
+    /* CONTRACT: the Joining Request ID resolves to the Established
      * PUBLISH-initiated subscription, so no INVALID_JOINING_REQUEST_ID is
      * emitted and a FETCH_REQUEST surfaces with the range 10.12.2.1 computes
      * from the Joining Location (0,0): start {0,0}, end {0,1}. */
@@ -845,7 +845,7 @@ static void control_subscribe_origin_resolves(void)
  * Both halves are asserted: the filtered join resolves, and a non-Largest
  * filter closes the session rather than answering a request error.
  * ==================================================================== */
-static void green_d16_filtered_join(void)
+static void d16_filtered_join(void)
 {
     ROW_BEGIN("draft-16 filtered publication join resolves");
     fix_t f;
@@ -913,7 +913,7 @@ static void green_d16_filtered_join(void)
 
 /* draft-16 9.16.2: "any other value results in closing the session with a
  * PROTOCOL_VIOLATION" -- a request error would be wrong here. */
-static void green_d16_non_largest_filter_is_protocol_error(void)
+static void d16_non_largest_filter_is_protocol_error(void)
 {
     ROW_BEGIN("draft-16 non-Largest filter closes the session");
     fix_t f;
@@ -1575,7 +1575,7 @@ static uint64_t profile_loc_ceiling(moq_version_t ver)
     return ver == MOQ_VERSION_DRAFT_16 ? MOQ_QUIC_VARINT_MAX : UINT64_MAX;
 }
 
-/* Site 3: the established PUBLISH-origin join added by this slice. */
+/* Site 3: the established PUBLISH-origin join. */
 static void pub_join_end_at(moq_version_t ver, const char *label,
                             bool at_ceiling)
 {
@@ -2932,11 +2932,11 @@ static void abi_floor_init_bounds(void)
 
 int main(void)
 {
-    green_consumer_joins_publication();
-    green_publisher_resolves_publication_join();
+    consumer_joins_publication();
+    publisher_resolves_publication_join();
     control_subscribe_origin_resolves();
-    green_d16_filtered_join();
-    green_d16_non_largest_filter_is_protocol_error();
+    d16_filtered_join();
+    d16_non_largest_filter_is_protocol_error();
     gate_pending_publisher_is_invalid_joining_id();
     gate_forward_zero_is_invalid_range();
     reuse_leaves_no_stale_joining_location();

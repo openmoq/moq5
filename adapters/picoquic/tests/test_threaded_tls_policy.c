@@ -1,9 +1,9 @@
 /*
  * Deterministic policy oracle for the raw threaded picoquic CLIENT's TLS
- * certificate policy (finding 2). It proves the fail-closed default WITHOUT a
+ * certificate policy. It proves the fail-closed default WITHOUT a
  * live handshake, by inspecting the actual picotls master context in a
  * configure_quic hook and using the narrowly scoped injected installer seam --
- * exactly the seam the ruling calls for, not a mocked constructor.
+ * the seam the policy is installed through, not a mocked constructor.
  *
  * Uses only the public void picoquic_set_verify_certificate_callback() setter,
  * which is what the pinned CI picoquic exposes (the _ex reporting variant is not
@@ -64,8 +64,8 @@ static const char *last_ca_file;
 #ifdef MOQ_TEST_CERT_PATH
 
 /* The verifier pointer currently installed on the QUIC context's picotls
- * master context, or NULL. This IS the picotls master context the ruling
- * names -- not a picoquic mirror field. */
+ * master context, or NULL. This IS the picotls master context that verifies
+ * the handshake -- not a picoquic mirror field. */
 static void *installed_verifier(picoquic_quic_t *quic)
 {
     ptls_context_t *m = (ptls_context_t *)quic->tls_master_ctx;

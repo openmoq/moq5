@@ -275,7 +275,7 @@ private:
  *             natural pump exit (on_lane_pump returns nonzero).
  *
  *   thread_exited: true once the network thread has finished
- *             (session destroyed, thread about to return). Set by
+ *             (client session retained, thread about to return). Set by
  *             the thread itself. After this, wake() and wait()
  *             return MOQ_ERR_CLOSED.
  *
@@ -914,7 +914,8 @@ moq_result_t moq_mvfst_managed_create(
 
     /*
      * teardown: sole owner of thread_exited and shutdown notification.
-     * Destroys adapter, transport, session, server. Safe with nulls.
+     * Destroys adapter, transport and server; retains the client session
+     * until handle destruction. Safe with nulls.
      */
     auto teardown = [](moq_mvfst_managed_t *h) {
         /* Gate server pump scheduling: new schedule sites and already-queued

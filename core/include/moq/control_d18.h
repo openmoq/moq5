@@ -146,14 +146,17 @@ typedef struct moq_d18_setup_opts {
  * Setup Options walk: unknown options (and duplicates of unknown options) are
  * skipped; a duplicate known non-repeatable option, an over-cap value length
  * (> 2^16-1), or a Delta Type overflow is MOQ_ERR_PROTO; a malformed
- * AUTHORIZATION_TOKEN structure is MOQ_D18_ERR_KVP_FORMAT (close 0x6). */
+ * AUTHORIZATION_TOKEN structure is MOQ_D18_ERR_KVP_FORMAT (close 0x6); more
+ * than MOQ_D18_MAX_AUTH_TOKENS tokens -- a local capacity limit, not a peer
+ * error -- is MOQ_ERR_BUFFER. */
 MOQ_API moq_result_t moq_d18_decode_setup_opts(const uint8_t *payload, size_t len,
                                                moq_d18_setup_opts_t *out);
 
 /* Encode a SETUP message carrying the given options (NULL opts == no options).
- * Only MAX_AUTH_TOKEN_CACHE_SIZE emission is supported (the only option the
- * session currently sources); PATH/AUTHORITY/token emission are rejected with
- * MOQ_ERR_INVAL until a public surface supplies them. */
+ * AUTHORIZATION_TOKEN (USE_VALUE or REGISTER structures, each borrowed for the
+ * call) and MAX_AUTH_TOKEN_CACHE_SIZE are emitted; PATH/AUTHORITY are rejected
+ * with MOQ_ERR_INVAL until a public surface supplies them, as are a DELETE or
+ * USE_ALIAS token (nothing can be registered before SETUP). */
 MOQ_API moq_result_t moq_d18_encode_setup_opts(moq_buf_writer_t *w,
                                                const moq_d18_setup_opts_t *opts);
 

@@ -4,14 +4,15 @@
  * Both rows drive a real server and a real client over loopback, use bounded
  * progress conditions only (no sleeps, no timing assumptions), and inject no
  * synthetic callbacks. They differ ONLY in the shape of the peer terminal --
- * and, as measured, they differ in outcome too, which is the whole point: a
- * fix that discriminates on the callback KIND alone would be wrong.
+ * and, as measured, they differ in outcome too, which is the whole point:
+ * ownership handling that discriminates on the callback KIND alone would be
+ * wrong.
  *
  * The row is selected by argv[1]:
  *
  *   peer_terminal  The client is stopped before it requests an application
  *                  close. This is a peer-terminal ownership row, not a
- *                  stop-close oracle; after #17 stop() attempts a bounded
+ *                  stop-close oracle; stop() attempts a bounded (#17)
  *                  CONNECTION_CLOSE, while the short idle timeout remains a
  *                  fallback if no close lands. picoquic reaches
  *                  picoquic_state_disconnected, fires picoquic_callback_close,
@@ -44,8 +45,8 @@
  *
  *                  Measured consequence: on this shape LibMoQ prunes and
  *                  unbinds while the cnx is still valid, so there is no
- *                  use-after-free. That makes the row a standing obligation on
- *                  the fix rather than a defect: relinquishing ownership on
+ *                  use-after-free. The row is a standing obligation on
+ *                  terminal ownership, not a defect: relinquishing ownership on
  *                  picoquic_callback_application_close would leave picoquic
  *                  holding a callback into freed LibMoQ memory here, which
  *                  ASan would report as a use-after-free in the OTHER

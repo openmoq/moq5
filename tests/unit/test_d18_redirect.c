@@ -149,8 +149,9 @@ static size_t encode_redirect_error(uint8_t *buf, size_t cap, const char *uri,
         rd.track_namespace = (moq_namespace_t){ parts, 1 };
     }
     rd.track_name = (moq_bytes_t){ (const uint8_t *)name, name ? strlen(name) : 0 };
-    /* Non-zero Retry Interval: relays may cache the redirect for this long. */
-    moq_d18_encode_request_error_redirect(&w, MOQ_REQUEST_ERROR_REDIRECT, 7000,
+    /* Non-zero Retry Interval: relays may cache the redirect for 7000 ms
+     * (the wire value is the interval plus one, §10.6). */
+    moq_d18_encode_request_error_redirect(&w, MOQ_REQUEST_ERROR_REDIRECT, 7001,
         (moq_bytes_t){ NULL, 0 }, &rd);
     return moq_buf_writer_offset(&w);
 }
@@ -197,7 +198,8 @@ static size_t encode_redirect_shape(uint8_t *buf, size_t cap,
                                             x->part_count };
     /* Namespace-scoped families require an empty Track Name (§10.6). */
     if (!ns_scoped) rd.track_name = x->name;
-    moq_d18_encode_request_error_redirect(&w, MOQ_REQUEST_ERROR_REDIRECT, 7000,
+    /* 7000 ms: the wire Retry Interval is the interval plus one (§10.6). */
+    moq_d18_encode_request_error_redirect(&w, MOQ_REQUEST_ERROR_REDIRECT, 7001,
                                           x->reason, &rd);
     return moq_buf_writer_offset(&w);
 }

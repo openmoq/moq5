@@ -26,7 +26,7 @@ bool moq_session_uses_uni_control(const moq_session_t *s);
  * receive path, a locally-terminated request bidi in the drain ring, or a
  * no-slot admission carrier awaiting its terminal. This is deliberately
  * NARROWER than moq_session_has_transport_stream(), which additionally
- * recognises a live request-registry owner for retainability (#245a): a
+ * recognises a live request-registry owner for retainability: a
  * local-origin request bidi we ourselves FIN'd must still retire even though
  * its owner lingers awaiting a response. The bridge uses this to decide
  * whether to keep a locally-closed mapping alive or tombstone it.

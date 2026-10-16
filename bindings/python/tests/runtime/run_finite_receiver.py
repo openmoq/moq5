@@ -4,8 +4,8 @@ examples/receive_loop.py. Synthetic carrier acceptance; no decoder.
 
     run_finite_receiver.py --package <installed moq5 dir> --relay <moq5-relay> \\
         --publisher <moq5_runtime_publisher> [--negative] [--push]
-    run_finite_receiver.py --oracle-red                 comparator RED checks (no processes)
-    run_finite_receiver.py --verdict-red RESULTS.json   verdict RED mutations of a receipt (offline)
+    run_finite_receiver.py --oracle-selftest            comparator self-checks (no processes)
+    run_finite_receiver.py --verdict-mutations RESULTS.json   verdict mutations of a receipt (offline)
     run_finite_receiver.py --child-controls             bounded offline ownership controls (stub children)
     run_finite_receiver.py --control-selftests --publisher <bin>   the C control reader's classification
 
@@ -128,8 +128,8 @@ def description_image(d):
     return out
 
 
-# ------------------------------------------------------------------ oracle RED
-def oracle_red():
+# ------------------------------------------------------------- oracle selftest
+def oracle_selftest():
     import types
     track = object()
     def mk(i, is_sync, payload):
@@ -502,8 +502,8 @@ def apply_set(node, path, value):
         node[k] = value
 
 
-def verdict_red(path):
-    """RED-first: mutations of an ACTUAL receipt must each fail by name."""
+def verdict_mutations(path):
+    """Mutations of an ACTUAL receipt must each fail by name."""
     import copy
     base = json.loads(Path(path).read_text())
     base_v = verdict(base)
@@ -767,7 +767,7 @@ def child_controls():
             release.set(); w.join(10)
     old_row = delayed_latch_row(old_bounded_loop)
     new_row = delayed_latch_row(bounded_loop)
-    results["delayed_latch_old_join_RED"] = {**old_row, "ok": old_row["returned_while_latch_held"] is True and old_row["watchdog"].get("settled") is False
+    results["delayed_latch_unjoined_control"] = {**old_row, "ok": old_row["returned_while_latch_held"] is True and old_row["watchdog"].get("settled") is False
                                              and old_row["worker_settled"] and old_row["timeline"][:2] == ["latch-enter", "impl-returned"]}
     results["delayed_latch_joined_before_return"] = new_row
     results["no_test_thread_alive"] = {"active": threading.active_count(), "ok": threading.active_count() == 1}
@@ -854,10 +854,10 @@ def control_selftests(publisher_bin):
 
 
 def main(argv):
-    if argv[1:2] == ["--oracle-red"]:
-        return oracle_red()
-    if argv[1:2] == ["--verdict-red"]:
-        return verdict_red(argv[2])
+    if argv[1:2] == ["--oracle-selftest"]:
+        return oracle_selftest()
+    if argv[1:2] == ["--verdict-mutations"]:
+        return verdict_mutations(argv[2])
     if argv[1:2] == ["--child-controls"]:
         return child_controls()
     if argv[1:2] == ["--control-selftests"]:

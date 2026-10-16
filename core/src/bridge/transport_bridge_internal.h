@@ -269,6 +269,8 @@ bridge_stream_entry_t *bridge_find_by_ref(
 
 bridge_stream_entry_t *bridge_find_by_id(
     moq_transport_bridge_t *b, uint64_t transport_id);
+const bridge_stream_entry_t *bridge_find_by_id_const(
+    const moq_transport_bridge_t *b, uint64_t transport_id);
 
 void bridge_deactivate_stream(moq_transport_bridge_t *b,
                               bridge_stream_entry_t *e);

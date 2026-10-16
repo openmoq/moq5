@@ -24,6 +24,8 @@ moqr_cli_wt_listener_create(const moqr_cli_config_t *cfg,
                             uint32_t max_connections,
                             moq_wtquic_msquic_lane_pump_fn on_lane_pump,
                             void *on_lane_pump_user,
+                            uint64_t (*app_deadline_us)(void *ctx),
+                            void *app_deadline_ctx,
                             moq_wtquic_msquic_managed_t **out)
 {
     moq_wtquic_msquic_managed_cfg_t wcfg;
@@ -61,6 +63,8 @@ moqr_cli_wt_listener_create(const moqr_cli_config_t *cfg,
     wcfg.max_connections = max_connections;
     wcfg.on_lane_pump = on_lane_pump;
     wcfg.on_lane_pump_user = on_lane_pump_user;
+    wcfg.app_deadline_us = app_deadline_us;
+    wcfg.app_deadline_ctx = app_deadline_ctx;
 
     return MOQR_WT_CREATE(&wcfg, out);
 }

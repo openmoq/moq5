@@ -1134,9 +1134,9 @@ int main(void)
         MOQ_TEST_PASS("catalog_update.wait_level_triggered_on_media_timeline");
     }
 
-    /* -- inbound identity validation on receiver ingest (0319 F3) --------- *
+    /* -- inbound identity validation on receiver ingest ------------------- *
      * A duplicate Namespace|Name tuple in an INDEPENDENT catalog is rejected
-     * before adoption (previously coalesced first-wins). Both CAT2 tracks are
+     * before adoption rather than coalesced first-wins. Both CAT2 tracks are
      * name-only, so two "a" entries are the same tuple. */
     {
         moq_media_receiver_t *r = moq_media_receiver_test_new(false);

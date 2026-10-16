@@ -88,7 +88,7 @@ rig_release_cb(void *ctx, uint64_t serial, uint32_t demand, uint32_t bank)
     return moqr_broker_release(&r->b, serial, bank, &wake);
 }
 
-/* The Step 4 loop, written exactly as the header documents it. */
+/* The owner's demand loop, written exactly as the header documents it. */
 static int
 rig_pump_demands(rig_t *r, uint64_t now)
 {
@@ -131,7 +131,7 @@ rig_pump_demands(rig_t *r, uint64_t now)
     return failures;
 }
 
-/* The intended Step-4 producer order:
+/* The intended producer order:
  *   1. complete the exact broker serial;
  *   2. take THAT serial's token and keep all three fields;
  *   3. reserve/render/commit against the bank the broker named;
@@ -1497,7 +1497,7 @@ test_retirement_phases(void)
 
 /* -- the SIGNAL emitter fixture -----------------------------------------
  *
- * Test-owned, not Step 4 wiring. It receives the exact projection the owner
+ * Test-owned, not the admin listener's wiring. It receives the exact projection the owner
  * would emit, records how many times and how many bytes, and records whether
  * the bank had already been committed when it ran -- which is how the ordering
  * requirement becomes observable rather than asserted. */

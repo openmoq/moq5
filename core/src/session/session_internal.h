@@ -1020,7 +1020,7 @@ typedef struct moq_auth_txn {
 
 #define MOQ_DECODED_MAX_TOKENS 16
 
-/* -- No-slot admission carrier (#245b) ------------------------------- *
+/* -- No-slot admission carrier ------------------------------------- *
  * The minimal durable record of a no-slot request-bidi terminal owed but not
  * yet emittable for local resource pressure. The terminal is fixed and
  * content-independent, so only the stream identity and the observed FIN fact
@@ -1067,7 +1067,7 @@ typedef struct moq_ns_sub_entry {
      * not buffer the bytes, so the obligation -- not the raw bytes -- is what
      * must survive: this durable marker re-drives ns_sub_local_teardown on the
      * documented empty re-feed, with no peer-byte redelivery. Cleared in the
-     * selective free (#245c). */
+     * selective free. */
     bool                local_teardown_pending;
     bool                closing_remote_error;
     bool                forward;
@@ -1428,6 +1428,14 @@ typedef struct moq_staged_datagram {
     size_t    len;
 } moq_staged_datagram_t;
 
+/* Overwrite memory that held a credential before it is released. The stores go
+ * through a volatile pointer so they are not elided as dead before a free. */
+static inline void session_wipe(void *p, size_t n)
+{
+    volatile uint8_t *b = (volatile uint8_t *)p;
+    while (n--) *b++ = 0;
+}
+
 /* -- Peer FIN on a request bidi ------------------------------------ *
  * The peer has closed its send half when the durable latch records a wire FIN,
  * or when a same-call FIN handed over with the request still sits on the
@@ -1457,7 +1465,7 @@ static inline bool ns_sub_fin_observed(const moq_ns_sub_entry_t *e, bool fin) {
     return fin || e->pending_fin || e->handoff_fin_pending;
 }
 
-/* No-slot admission carriers (#245b). */
+/* No-slot admission carriers. */
 int  noslot_carrier_find(const moq_session_t *s, moq_stream_ref_t ref);
 bool noslot_carrier_install(moq_session_t *s, moq_stream_ref_t ref, bool fin);
 void noslot_carrier_remove(moq_session_t *s, moq_stream_ref_t ref);
@@ -1520,6 +1528,13 @@ struct moq_session {
 
     bool                send_auth_token_cache_size;
     uint64_t            auth_token_cache_size;
+    /* Authorization tokens this side presents in its SETUP, copied from the
+     * cfg into the session arena: the values, and (on profiles with
+     * encode_setup_token) each one's encoded Setup Option value. A session
+     * that holds any has its whole block wiped before it is freed. */
+    moq_auth_token_t   *setup_tokens;
+    moq_bytes_t        *setup_token_wire;
+    size_t              setup_token_count;
 
     uint8_t      *send_buf;
     size_t        send_cap;
@@ -1699,7 +1714,7 @@ struct moq_session {
     size_t           drain_ref_cap;
     size_t           drain_ref_count;
 
-    /* No-slot admission carriers (#245b). A draft-18 request bidi that arrives
+    /* No-slot admission carriers. A draft-18 request bidi that arrives
      * with the subscription pool full owes a fixed, content-independent
      * terminal (pre-setup STOP+RESET, post-setup REQUEST_ERROR+FIN). When drain/
      * action/send capacity cannot admit that terminal yet, the OPERATION -- not
@@ -2171,21 +2186,6 @@ void process_auth_tokens_free_staging(moq_session_t *s,
     moq_resolved_token_t *tokens, const bool *staged,
     size_t count);
 
-/*
- * Semantic validation of a RESOLVED token value -- the "well-formed Token
- * structure but otherwise invalid AUTHORIZATION TOKEN parameter MUST [be
- * rejected] with an MALFORMED_AUTH_TOKEN error" rule (identical text in
- * draft-16 §9.2.2.1 and draft-18 §10.2.2, so the check is shared, not
- * capability-gated). Runs AFTER alias resolution yields a concrete value;
- * structural decoding failures stay on their existing close paths.
- *
- * Deliberately minimal and deterministic -- the seam where application-
- * level token validation will plug in later, NOT application policy:
- *   - a zero-length resolved value is semantically malformed;
- *   - a value containing a NUL byte is semantically malformed.
- */
-bool moq_auth_token_value_semantically_valid(const uint8_t *value,
-                                             size_t value_len);
 
 /* Copy resolved token values + the token array into output scratch for
  * borrow-epoch-safe event delivery (session_subscribe.c; shared with the
@@ -2274,8 +2274,8 @@ typedef struct moq_request_update_ok_encode_args {
 
 /* PUBLISH_OK response: the subscriber's delivery parameters plus
  * the raw SUBSCRIPTION_FILTER and FORWARD it chose. One args struct instead of
- * a growing positional vtable signature. Outbound EXPIRES stays unsupported
- * (D2) -- no field. */
+ * a growing positional vtable signature. Outbound EXPIRES is not supported,
+ * so there is no field for it. */
 typedef struct moq_publish_ok_encode_args {
     uint64_t               request_id;
     uint8_t                subscriber_priority;  /* 128 = omitted */
@@ -2527,7 +2527,8 @@ typedef struct moq_decoded_ns_sub_response {
 
     /* For ERROR: */
     uint64_t error_code;
-    uint64_t retry_interval;         /* REQUEST_ERROR Retry Interval (0 = none) */
+    uint64_t retry_interval;         /* REQUEST_ERROR wire Retry Interval:
+                                      * milliseconds + 1; 0 = no retry */
     const uint8_t *reason;           /* borrowed from recv_buf */
     size_t reason_len;
     bool has_trailing_bytes;         /* trailing after ERROR = close */
@@ -2710,6 +2711,18 @@ moq_result_t session_core_on_fetch_cancel(moq_session_t *s,
 int fetch_resolve_handle(moq_session_t *s, moq_fetch_t h);
 int fetch_find_free(moq_session_t *s);
 void fetch_free_entry(moq_session_t *s, int slot);
+
+/* Fetcher-role completion: the FETCH holds both its FETCH_OK and its data
+ * stream's FIN. `_fits` reports whether the commit can run now -- one event,
+ * and on stream-correlated profiles one action for the FIN of the request
+ * stream's local half plus, while the publisher's half is still open, one
+ * drain slot -- beyond `extra_events` the caller reserves for itself.
+ * `_commit` then queues FETCH_COMPLETE, closes the request half, keeps the
+ * drain reference that absorbs the publisher's FIN or RESET, and frees the
+ * entry. It cannot fail after a true `_fits`. */
+bool fetch_fetcher_completion_fits(const moq_session_t *s, int slot,
+                                   size_t extra_events);
+moq_result_t fetch_fetcher_completion_commit(moq_session_t *s, int slot);
 
 /* Release a FETCH entry on a request-stream GOAWAY (§10.4 migration). If the
  * response data uni already presented its FETCH_HEADER, the cached rx handle

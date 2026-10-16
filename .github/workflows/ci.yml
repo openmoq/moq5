@@ -123,8 +123,8 @@ jobs:
         run: scripts/check_swift_buffer_sendable.sh
 
       # Runs the full ungated suite, including the security regression coverage
-      # for findings 4, 6, 7 (`TrackEventBacklogTests`, `ChildTrapProbeTests`),
-      # which now pass against the product fixes.
+      # for the track-event backlog bound and the player decoder input checks
+      # (`TrackEventBacklogTests`, `ChildTrapProbeTests`).
       - name: Swift test
         run: swift test
 
@@ -159,7 +159,7 @@ jobs:
       - name: Deterministic service tests (incl. C/C++ consumers)
         run: >
           ctest --test-dir build/service-surface --output-on-failure
-          -R 'media_sender_catalog|media_sender_lifecycle|service_consumer_cxx|endpoint_resolve'
+          -R 'media_sender_catalog|media_sender_lifecycle|media_sender_pacing|media_sender_priority|media_track_cfg_init|service_consumer_cxx|endpoint_resolve'
 
       - name: Shared service build + initializer symbol check
         run: |
@@ -172,7 +172,7 @@ jobs:
           cmake --build build/service-surface-shared -j3
           lib="$(find build/service-surface-shared/service -name 'libmoq-service.so*' -type f -print -quit)"
           test -n "$lib"
-          for sym in moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized; do
+          for sym in moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized moq_media_track_cfg_init moq_media_track_cfg_init_sized; do
             nm -D --defined-only "$lib" | grep -q " $sym\$" ||
               { echo "missing export: $sym"; exit 1; }
           done
@@ -224,11 +224,11 @@ jobs:
       # (the MoQ-linking test targets run in the ungated swift-binding job;
       # they cannot share a test bundle with MoQService -- that is the
       # duplicate-symbol canary working).
-      # Runs the gated suite, including the finding-5 video-dimension security
-      # regression coverage (`ServiceDimensionTests`, service stack), which now
-      # passes against the product guard. The finding-4/6/7 source-stack suites
-      # run in the ungated swift-binding job (they cannot share this service
-      # test bundle -- the moq_swift_stack_guard duplicate-symbol canary).
+      # Runs the gated suite, including the video-dimension security
+      # regression coverage (`ServiceDimensionTests`, service stack). The
+      # backlog and decoder source-stack suites run in the ungated
+      # swift-binding job (they cannot share this service test bundle -- the
+      # moq_swift_stack_guard duplicate-symbol canary).
       - name: Gated Swift test (MOQ_SERVICE=1)
         run: MOQ_SERVICE=1 swift test
         env:
@@ -419,6 +419,8 @@ jobs:
       # distinct from a raw-adapter/packaging failure.
       - name: Set up pinned picoquic/picotls
         run: scripts/setup_picoquic_deps.sh
+        env:
+          CFLAGS: -fPIC
 
       - name: Set up pinned mbedTLS
         run: scripts/setup_mbedtls_deps.sh
@@ -430,6 +432,9 @@ jobs:
           -DMOQ_BUILD_ADAPTER_PICO_WT=ON
           -DMOQ_BUILD_PICO_WT_MANAGED=ON
           -DMOQ_PICO_WT_BUILD_LOOPBACK=ON
+          -DMOQ_BUILD_SERVICE=ON
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_MEDIA_OBJECT=ON
           -DMOQ_BUILD_TESTS=ON
           -DMOQ_WARNINGS_AS_ERRORS=ON
           -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
@@ -444,10 +449,40 @@ jobs:
       # The 0x10 hard-failure teardown regression lives in pico_wt_loopback;
       # pico_wt_conformance covers the WebTransport scenario suite and
       # pico_wt_public_compile proves the standalone public header.
+      # pq_reset_after_fin pins the patched picoquic's reset-after-FIN
+      # behaviour; it needs picoquic-test, which this lane builds.
+      # endpoint_wt_target verifies the service CONNECT target at adapter
+      # creation without starting a transport, including allocation failures.
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi)$'
+          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
+
+      # Static archives conceal private references crossing adapter DSOs.
+      # Require complete shared-library links, including the managed facade.
+      - name: Configure shared shipping adapters
+        run: >
+          cmake -B build/pico-wt-shared-ci
+          -DBUILD_SHARED_LIBS=ON
+          -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--no-undefined
+          -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
+          -DMOQ_BUILD_PQ_THREADED=ON
+          -DMOQ_BUILD_ADAPTER_PICO_WT=ON
+          -DMOQ_BUILD_PICO_WT_MANAGED=ON
+          -DMOQ_BUILD_SERVICE=ON
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_MEDIA_OBJECT=ON
+          -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_EXAMPLES=OFF
+          -DMOQ_WARNINGS_AS_ERRORS=ON
+          -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR"
+          -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+        env:
+          CC: clang
+          CXX: clang++
+
+      - name: Build shared shipping adapters
+        run: cmake --build build/pico-wt-shared-ci
 
       - name: Configure (mbedTLS-only)
         run: >
@@ -551,6 +586,7 @@ jobs:
           cmake -B build/fuzz-ci
           -DMOQ_BUILD_FUZZ=ON
           -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_MSF=ON
           -DMOQ_BUILD_SIM=ON
           -DMOQ_BUILD_TESTS=ON
 
@@ -608,6 +644,8 @@ jobs:
         run: scripts/check_api_boundary.sh
       - name: Profile boundary
         run: scripts/check_profile_boundary.sh
+      - name: Process labels
+        run: scripts/check_process_labels.sh
 
   seed-sweep-quick:
     name: Seed Sweep (quick)

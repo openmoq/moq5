@@ -1,14 +1,14 @@
 /*
- * Negotiated-profile substrate (Step 5): the green declaration.
+ * Negotiated-profile substrate: the declared tables and their checks.
  *
  * This target owns the product-independent half: the pure oracle, the four
  * declared tables, the fail-closed corpus, the derived pair relation, and the
- * drift gate against core profile availability and the Step-3 ALPN table.
+ * drift gate against core profile availability and the canonical ALPN table.
  * The endpoint-offer/AUTO half of the drift gate needs the service tier and
  * lives in service/tests/test_negotiated_profile_offer.c.
  *
- * There are NO service closures here: LOC-01 cells carry temporary closure
- * waivers, and Step 6 replaces those with the shared send/receive functions.
+ * There are NO service closures here: LOC-01 cells carry closure waivers in
+ * place of the shared send/receive functions.
  * Nothing in this file calls a LOC, KVP or integer-codec product API.
  */
 #include "np_oracle.h"
@@ -18,7 +18,7 @@
 
 /* the drift gate's two product authorities */
 #include "profile.h"       /* moq_profile_lookup: core availability */
-#include "moq_alpn.h"      /* the Step-3 canonical ALPN table */
+#include "moq_alpn.h"      /* the canonical ALPN table */
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -625,7 +625,7 @@ static void t_corpus_negatives(void)
  * 6. The future-draft DRIFT GATE (core half)
  *
  * Sweeps every moq_version_t value 0..255 and compares the declared rows
- * against core profile availability and the Step-3 canonical ALPN table in
+ * against core profile availability and the canonical ALPN table in
  * BOTH directions. The ALPN literals are the authority: a round trip through
  * the product alone would pass with two consistently wrong strings.
  * ===================================================================== */
@@ -649,7 +649,7 @@ static void t_drift_gate(void)
             failures++;
         }
 
-        /* declared ALPN <=> the Step-3 table, in both directions */
+        /* declared ALPN <=> the canonical table, in both directions */
         const char *product_alpn = moq_alpn_for_version(ver);
         if (row) {
             MOQ_TEST_CHECK(product_alpn != NULL);

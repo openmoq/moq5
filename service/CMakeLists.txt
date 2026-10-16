@@ -39,6 +39,14 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
         list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-picoquic)
     endif()
 endif()
+if((MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED) AND
+   MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "openssl")
+    # The service honours its application certificate callback only when the
+    # selected picoquic TLS provider can apply it. PRIVATE implementation
+    # capability, mirrored into the white-box tests through
+    # _MOQ_SERVICE_FACADE_DEFS; not consumer configuration.
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_PICOQUIC_CERT_CALLBACK=1)
+endif()
 if(MOQ_BUILD_ADAPTER_MVFST)
     # RAW_QUIC over Meta's mvfst (exact-version only; see src/endpoint.c). The
     # managed C facade lives in moq::adapter-mvfst -- there is no separate
@@ -294,6 +302,38 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_handshake_timeout
                  COMMAND test_endpoint_handshake_timeout)
+
+        if(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "openssl")
+            # Application certificate callback propagation through the real
+            # endpoint create path. Private recorders observe verifier install
+            # and select the existing eager raw-QUIC session for the lane
+            # retirement test; shipping objects never see these renames.
+            add_library(moq-service-cert-test-internals OBJECT src/endpoint.c)
+            target_include_directories(moq-service-cert-test-internals
+                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_link_libraries(moq-service-cert-test-internals
+                PUBLIC moq::core Threads::Threads ${_MOQ_SERVICE_FACADE_LIBS})
+            target_compile_definitions(moq-service-cert-test-internals PRIVATE
+                ${_MOQ_SERVICE_FACADE_DEFS}
+                moq_picoquic_set_cert_verify_callback=moq_test_set_cert_verify_callback
+                moq_pq_threaded_create=moq_test_pq_threaded_create)
+            target_compile_features(moq-service-cert-test-internals PUBLIC c_std_11)
+
+            add_executable(test_endpoint_certificate_verify
+                tests/test_endpoint_certificate_verify.c)
+            target_link_libraries(test_endpoint_certificate_verify PRIVATE
+                moq-service-cert-test-internals moq::core Threads::Threads)
+            target_compile_options(test_endpoint_certificate_verify PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            target_compile_definitions(test_endpoint_certificate_verify PRIVATE
+                ${_MOQ_SERVICE_FACADE_DEFS})
+            target_include_directories(test_endpoint_certificate_verify PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            add_test(NAME endpoint_certificate_verify
+                     COMMAND test_endpoint_certificate_verify)
+        endif()
     endif()
 
     # Service picoquic keepalive default (Vojtech idle-publisher report): prove
@@ -351,6 +391,14 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_pico_wt_keepalive_default
                  COMMAND test_endpoint_pico_wt_keepalive_default)
+
+        add_executable(test_endpoint_wt_target tests/test_endpoint_wt_target.c)
+        target_link_libraries(test_endpoint_wt_target PRIVATE
+            moq-service-pico-wt-ka-test-internals)
+        target_include_directories(test_endpoint_wt_target PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_wt_target COMMAND test_endpoint_wt_target)
     endif()
 
     if(MOQ_BUILD_MSQUIC_MANAGED)
@@ -426,7 +474,7 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
 
-        # Publication-race RED (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
+        # Publication-race test (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
         # try-lock phase oracle for the effective-catalog publication vs the
         # public content-protection lookup, plus a TSan stress companion.
         add_executable(test_media_catalog_publication_race
@@ -628,6 +676,24 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_SOURCE_DIR}/tests/unit)
         add_test(NAME media_sender_catalog COMMAND test_media_sender_catalog)
 
+        add_executable(test_media_track_cfg_init tests/test_media_track_cfg_init.c)
+        target_link_libraries(test_media_track_cfg_init PRIVATE moq::service)
+        target_compile_options(test_media_track_cfg_init PRIVATE
+            $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+        add_test(NAME media_track_cfg_init COMMAND test_media_track_cfg_init)
+
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_priority
+                tests/test_media_sender_priority.c)
+            target_link_libraries(test_media_sender_priority PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_priority PRIVATE
+                ${CMAKE_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_priority PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_priority COMMAND test_media_sender_priority)
+        endif()
+
         # MSF 5.1.2 generatedAt must not decide no-op dedup. Deterministic:
         # the catalog clock is pinned through the sender's instance-owned test
         # seam, so nothing here waits on a millisecond boundary. The refresh
@@ -766,7 +832,7 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_sender_refresh
                 COMMAND test_media_sender_refresh)
 
-            # Negotiated-profile closure REDs (step 6). Two independent directions
+            # Negotiated-profile closure tests. Two independent directions
             # over the SAME substrate: a real sender's LOC-01 property bytes
             # checked against the pure oracle, and independently built bytes fed
             # to a real receiver. Both need the sender AND receiver seams plus a
@@ -776,7 +842,8 @@ if(MOQ_BUILD_TESTS)
             #
             # These tests assert the CORRECT per-draft contract, so the draft-18
             # halves FAIL until the encoder/decoder become version-aware. That is
-            # deliberate: they are the RED, not a pending feature.
+            # deliberate: the failure records the contract gap; it is not a
+            # pending feature.
             add_executable(test_np_closure_sender
                 tests/test_np_closure_sender.c)
             target_link_libraries(test_np_closure_sender PRIVATE

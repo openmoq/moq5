@@ -1,7 +1,7 @@
 # LibMoQ performance baseline
 
 Durable baseline from fresh local runs of the sans-I/O benchmarks, backing the
-performance claims from the reviewer comparison. These numbers are
+performance claims in the project comparison. These numbers are
 **indicative** — one machine, single-threaded deterministic simulation, no real
 transport. Treat the **allocation counts** and the **average** per-object
 latency as the durable signals; wall-clock throughput and **max** latency are

@@ -25,8 +25,9 @@ App thread                   Managed network thread
 
   stop() ──────────────────→ teardown adapter
                              close transport
-                             destroy session
+                             retain client session
   destroy()
+  destroy client session
 ```
 
 ## API

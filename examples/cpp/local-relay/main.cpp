@@ -150,14 +150,14 @@ std::string track_key(const moq::namespace_name &ns, moq::bytes_view track)
 }
 
 // A subscriber blocked (at open or write): the relay stashes the object it
-// owns so it can retry later. Slice 1 is single-object, so a second pending
+// owns so it can retry later. The stash holds one object, so a second pending
 // object before the first drains is a bug: fail loudly rather than queue.
 void stash_pending(Downstream *d, uint64_t group_id, uint64_t object_id,
                    moq::buffer payload)
 {
     if (d->pending) {
         std::fprintf(stderr, "FAIL: %s already has a pending object "
-                     "(Slice 1 retries one object at a time)\n", d->label);
+                     "(the stash retries one object at a time)\n", d->label);
         std::exit(1);
     }
     d->pending = Pending{ group_id, object_id, std::move(payload) };

@@ -45,6 +45,10 @@ typedef struct moqr_bind_fwd_debug {
     uint64_t refusals_blocked, refusals_parked, refusals_sent, refusals_dropped,
              refusals_retried, refusals_unparked, refusals_pending, refusals_gone,
              polls_paused;
+    /* Namespace / namespace-subscription acceptances: sent, held on
+     * WOULD_BLOCK, still held, and admissions undone because the request
+     * was gone before its acceptance committed. */
+    uint64_t accepts_sent, accepts_blocked, accepts_pending, accepts_undone;
     uint64_t reason_unretained;
     uint64_t live;
     uint64_t bytes_used, bytes_high, bytes_cap;
@@ -61,6 +65,10 @@ void moqr_bind_debug_upstream_terminated(moqr_bind_t *b, uint32_t slot,
  * allocation failure or an exhausted slot would, so the production
  * fail-closed path runs. */
 void moqr_bind_debug_fail_nsu_store(int nth);
+/* Make the Nth next retry of a held namespace / namespace-subscription
+ * acceptance observe its request as already retired, so the production undo
+ * arm runs (the session itself is not called). */
+void moqr_bind_debug_accept_gone(int nth);
 /* Make the Nth next ordered-ring insertion of the given kind observe a FULL
  * ring. This drives the SAME predicate production uses, so the injected and
  * genuinely-full cases cannot diverge; it does not bypass the fail-closed arm.

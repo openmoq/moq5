@@ -1,15 +1,17 @@
 # Build the pkg-config link closure for the configured PicoQUIC provider.
-# PicoQUIC does not ship pkg-config metadata, so consumers need its static
-# archive cycle, picotls, and the selected TLS provider spelled out here.
+# PicoQUIC does not ship pkg-config metadata, so consumers need its archives,
+# picotls, and the selected TLS provider spelled out here, each before what it
+# depends on. picoquic-core needs nothing from picoquic-log; pass WITH_LOG when
+# the caller's own archives do (picohttp-core does), so picoquic-log is listed
+# ahead of the picoquic-core it depends on.
 function(moq_picoquic_pkgconfig_libs out_var)
+    cmake_parse_arguments(_pc "WITH_LOG" "" "" ${ARGN})
     set(_libs "")
 
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        string(APPEND _libs
-            " -Wl,--start-group -lpicoquic-core -lpicoquic-log -Wl,--end-group")
-    else()
-        string(APPEND _libs " -lpicoquic-core -lpicoquic-log")
+    if(_pc_WITH_LOG)
+        string(APPEND _libs " -lpicoquic-log")
     endif()
+    string(APPEND _libs " -lpicoquic-core")
 
     if(MOQ_PTLS_LIB_DIR)
         string(APPEND _libs " -L${MOQ_PTLS_LIB_DIR}")

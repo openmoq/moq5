@@ -6,7 +6,7 @@ import Foundation
 ///
 /// Lifecycle (`established`/`drain`/`close`), the interrupt latch, and state
 /// run over the endpoint's service-thread engine. The public `connect`
-/// factory (a real transport backend) lands with the C bridge slice.
+/// factory (a real transport backend) is provided by the MoQService target.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public final class MoQEndpoint: @unchecked Sendable {
 

@@ -186,9 +186,10 @@ MOQ_API void moq_pico_wt_conn_notify_transport_closed(
  * --------------------
  * picoquic_set_max_data_control() MUST NOT be enabled on a picoquic context
  * carrying MoQ connections. It is a QUIC-context-wide switch, and while it is
- * set picoquic_open_flow_control() returns success while emitting nothing, so
- * this adapter's grants would silently never reach the peer and its streams
- * would stall permanently.
+ * set picoquic_open_flow_control() grants stream windows but no longer raises
+ * the connection window, which stays at the caller's limit. This adapter
+ * never raises the connection window itself, so its streams would stall
+ * permanently once that limit is reached.
  *
  * picoquic exposes no getter for that setting, so THIS ADAPTER MAKES NO
  * RUNTIME-DETECTION PROMISE: a nonzero max_data_control is invalid caller

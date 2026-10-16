@@ -3,10 +3,10 @@ import Foundation
 import MoQService
 import MoQServiceCore
 
-// Bounded subprocess probe for the finding 5 security regression (0259,
-// MOQ-SWIFT-VIDEO-DIMENSION-TRAP). One case per process, named by argv[1],
+// Bounded subprocess probe for the video-dimension security regression
+// (MOQ-SWIFT-VIDEO-DIMENSION-TRAP). One case per process, named by argv[1],
 // driving the REAL public service conversion `makeFormatDescription(codecConfig:)`
-// -> `makeVideoDescription`. Pre-fix, `Int32(width)` / `Int32(height)` trapped
+// -> `makeVideoDescription`. An unchecked `Int32(width)` / `Int32(height)` traps
 // for a dimension above `Int32.max`; that trap aborts the process, so a case
 // must never run inside `swift test`. A survivor prints a structured line and
 // exits 0:
@@ -38,7 +38,7 @@ let avcC = Data([
 
 /// Drive the real conversion and classify its outcome. `internalError` is a
 /// CoreMedia status-bearing failure (the representable-but-unrealistic path);
-/// `invalidArgument` is a pre-CoreMedia validation rejection (the fix's
+/// `invalidArgument` is a pre-CoreMedia validation rejection (the
 /// disposition for an out-of-range dimension).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 func classify(width: Int, height: Int) -> String {
@@ -67,17 +67,17 @@ func run(_ name: String) -> Never {
     let int32Max = Int(Int32.max)          // 2147483647
     let uint32Max = Int(UInt32.max)        // 4294967295
     switch name {
-    case "f5_valid":                  done(classify(width: 1280, height: 720))
-    case "f5_zero":                   done(classify(width: 0, height: 720))
-    case "f5_negative":               done(classify(width: -1, height: 720))
+    case "dim_valid":                 done(classify(width: 1280, height: 720))
+    case "dim_zero":                  done(classify(width: 0, height: 720))
+    case "dim_negative":              done(classify(width: -1, height: 720))
     // width oversized (height fixed valid)
-    case "f5_width_int32max":         done(classify(width: int32Max, height: 720))
-    case "f5_width_int32max_plus1":   done(classify(width: int32Max + 1, height: 720))
-    case "f5_width_uint32max":        done(classify(width: uint32Max, height: 720))
+    case "dim_width_int32max":        done(classify(width: int32Max, height: 720))
+    case "dim_width_int32max_plus1":  done(classify(width: int32Max + 1, height: 720))
+    case "dim_width_uint32max":       done(classify(width: uint32Max, height: 720))
     // height oversized (width fixed valid) -- `Int32(height)` traps independently
-    case "f5_height_int32max":        done(classify(width: 1280, height: int32Max))
-    case "f5_height_int32max_plus1":  done(classify(width: 1280, height: int32Max + 1))
-    case "f5_height_uint32max":       done(classify(width: 1280, height: uint32Max))
+    case "dim_height_int32max":       done(classify(width: 1280, height: int32Max))
+    case "dim_height_int32max_plus1": done(classify(width: 1280, height: int32Max + 1))
+    case "dim_height_uint32max":      done(classify(width: 1280, height: uint32Max))
     default:
         FileHandle.standardError.write(Data("unknown probe case: \(name)\n".utf8))
         exit(2)

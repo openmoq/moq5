@@ -410,8 +410,8 @@ static void t_budget_depth_not_size(void)
  * -> 0), NOT fed onward — StreamReceiveSetEnabled(FALSE) is asynchronous
  * and cannot stop an already-queued RECEIVE. Proof: with the stream marked
  * paused, a delivered RECEIVE leaves its bytes HELD by the transport (the
- * fake models MsQuic holding unconsumed bytes) rather than consumed. On the
- * pre-fix adapter the bytes were fed and fully consumed (held_len == 0).
+ * fake models MsQuic holding unconsumed bytes) rather than consumed. An
+ * adapter that fed them onward would leave held_len == 0.
  */
 static void t_receive_arrest_holds_while_paused(void)
 {
@@ -448,8 +448,8 @@ static void t_receive_arrest_holds_while_paused(void)
 
 /* A failed resume (StreamReceiveSetEnabled(TRUE)) is unrecoverable: the
  * stream can never deliver again, so the adapter must go fatal rather than
- * silently stall. The pre-fix adapter cleared paused before the call and
- * ignored the failure. */
+ * silently stall. Clearing paused before the call, or ignoring the failure,
+ * would leave the stream stalled. */
 static void t_receive_resume_failure_fatal(void)
 {
     int before = failures;
@@ -569,7 +569,7 @@ static void t_receive_terminal_while_paused(void)
 
     /* Arm a resume failure: if the reset path wrongly tried to re-enable
      * the aborted receive direction, the failing StreamReceiveSetEnabled
-     * would turn a valid peer reset into a transport fatal. The fix clears
+     * would turn a valid peer reset into a transport fatal. The adapter clears
      * the pause/hold state BEFORE servicing, so no resume is attempted. */
     int rse_before = st->receive_set_enabled;
     r.fake.recv_set_enabled_fails = 1;
@@ -821,7 +821,7 @@ static void rx_collect(struct rx_pair *p, int *count, uint8_t *seen,
  * (TotalBufferLength lowered) and redelivered exactly once after resume.
  * Four objects are laid into four buffers; with a 2-deep event queue
  * objects 0 and 1 fill it and object 2 backs the bridge up, so the fourth
- * buffer must be held, then delivered once. Pre-fix, every buffer was fed.
+ * buffer must be held, then delivered once; feeding every buffer fails it.
  */
 static void t_receive_multibuffer_partial_hold(void)
 {

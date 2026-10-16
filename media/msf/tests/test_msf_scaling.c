@@ -1,15 +1,15 @@
 /* Structural proof that moq_msf_catalog_apply_delta_ex resolves track
- * identities in O(n), not O(n^2), for a large valid delta (0317 item 1 /
- * test 5). Not a wall-clock benchmark: it counts identity compares through a
+ * identities in O(n), not O(n^2), for a large valid delta.
+ * Not a wall-clock benchmark: it counts identity compares through a
  * test-only counter that exists only when msf.c is compiled with
  * MOQ_MSF_TESTING (this target recompiles msf.c with that macro; the shipped
  * library never defines it, so the counter is absent there).
  *
- * The indexed apply does a small constant number of compares per op; the old
- * per-op linear scan did O(n) per op, i.e. O(n^2) overall. With N unique adds
+ * The indexed apply does a small constant number of compares per op; a
+ * per-op linear scan would do O(n) per op, i.e. O(n^2) overall. With N unique adds
  * the indexed path stays well under a linear bound that a quadratic
- * implementation blows straight through -- the RED mutant (revert an apply
- * lookup to a linear scan over eff[0..n)) drives the counter past it. */
+ * implementation blows straight through -- a linear scan over eff[0..n) in an
+ * apply lookup drives the counter past it. */
 #include <moq/msf.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,7 +67,7 @@ int main(void)
 
     /* Indexed lookup: O(n) compares. Bound generously at 16*N -- an O(n^2)
      * scan would be ~N*N/2 = 4.5M for N=3000, an order of magnitude past this.
-     * The RED mutant (linear apply lookup) exceeds it. */
+     * A linear apply lookup exceeds it. */
     printf("apply_delta compares for N=%d adds: %zu (bound %d)\n",
            N, compares, 16 * N);
     CHECK(compares < (size_t)(16 * N));
@@ -77,7 +77,7 @@ int main(void)
     /* validate_identities: N unique initDataList ids must also be O(n) via the
      * byte-span index, not an O(n^2) nested scan (the array is peer-controlled
      * with no numeric cap). Same compare counter (bs_index_add_dup increments
-     * it); the RED mutant is the nested-loop reintroduction. */
+     * it); a nested-loop scan exceeds the bound. */
     {
         moq_msf_track_t one;
         memset(&one, 0, sizeof(one));

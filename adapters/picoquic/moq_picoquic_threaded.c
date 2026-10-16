@@ -19,6 +19,7 @@
 #include <moq/picoquic_verify.h>   /* moq_picoquic_set_cert_verifier (default) */
 #include <picoquic_packet_loop.h>
 
+#include "../common/moq_setup_tokens.h"
 #include "../common/moq_alpn.h"
 #include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
@@ -120,6 +121,7 @@ struct moq_pq_threaded {
     size_t              alpn_array_bytes;
     bool                client_deferred;  /* client session awaits the
                                            * negotiated-ALPN readback */
+    moq_setup_tokens_t  setup_tokens;     /* presented in each SETUP */
 
     /* Resources (owned) */
     picoquic_quic_t    *quic;
@@ -226,6 +228,8 @@ static void build_session_cfg(moq_pq_threaded_t *t,
     if (t->send_buffer_size) scfg->send_buffer_size = t->send_buffer_size;
     if (t->recv_buffer_size) scfg->recv_buffer_size = t->recv_buffer_size;
     if (t->goaway_timeout_us) scfg->goaway_timeout_us = t->goaway_timeout_us;
+    scfg->setup_auth_tokens = t->setup_tokens.tokens;
+    scfg->setup_auth_token_count = t->setup_tokens.count;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1182,6 +1186,14 @@ void moq_pq_threaded_cfg_init(moq_pq_threaded_cfg_t *cfg)
     cfg->struct_size = (uint32_t)MOQ_PQ_THREADED_CFG_V0_SIZE;
 }
 
+/* setup_auth_tokens starts at or past the sizeof of the layout that ended at
+ * ca_file, so an old caller's tail padding is never read as the field. */
+_Static_assert(offsetof(moq_pq_threaded_cfg_t, setup_auth_tokens) >=
+               ((offsetof(moq_pq_threaded_cfg_t, ca_file) + sizeof(const char *) +
+                 _Alignof(moq_pq_threaded_cfg_t) - 1u) &
+                ~(size_t)(_Alignof(moq_pq_threaded_cfg_t) - 1u)),
+               "setup_auth_tokens must start past the previous sizeof");
+
 void moq_pq_threaded_cfg_init_sized(moq_pq_threaded_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
@@ -1338,6 +1350,22 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
             if (!t->alpn_list[i]) goto fail_cfg_strings;
             memcpy(t->alpn_list[i], a, n);
             t->alpn_count = i + 1;
+        }
+    }
+    if (CFG_HAS(cfg, setup_auth_token_count) && cfg->setup_auth_token_count > 0) {
+        size_t arena = (CFG_HAS(cfg, send_buffer_size) && cfg->send_buffer_size)
+            ? cfg->send_buffer_size : MOQ_SETUP_TOKENS_DEFAULT_ARENA;
+        moq_result_t src = moq_setup_tokens_fit(cfg->setup_auth_tokens,
+                cfg->setup_auth_token_count, 0, arena)
+            ? moq_setup_tokens_copy(&t->alloc, cfg->setup_auth_tokens,
+                                    cfg->setup_auth_token_count, &t->setup_tokens)
+            : MOQ_ERR_INVAL;
+        if (src != MOQ_OK) {
+            free_alpn_list(t);
+            pthread_cond_destroy(&t->cond);
+            pthread_mutex_destroy(&t->mutex);
+            t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+            return src;
         }
     }
     const char *sni = (CFG_HAS(cfg, sni) && cfg->sni) ? cfg->sni : cfg->host;
@@ -1596,6 +1624,7 @@ fail_configure:
 fail_quic:
 fail_cfg_strings:
     free_alpn_list(t);
+    moq_setup_tokens_free(&t->alloc, &t->setup_tokens);
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1749,6 +1778,7 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
     if (t->quic)
         picoquic_free(t->quic);
     free_alpn_list(t);
+    moq_setup_tokens_free(&t->alloc, &t->setup_tokens);
 
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);

@@ -177,6 +177,20 @@ static void no_actions(raw_t *r)
     }
 }
 
+/* A completed draft-18 fetch FINs its request stream's local half and nothing
+ * else; draft-16 has no request stream to close. */
+static void completion_fins_only(raw_t *r, size_t expected)
+{
+    moq_action_t a;
+    size_t fins = 0;
+    while (moq_session_poll_actions(r->fet, &a, 1)) {
+        MOQ_TEST_CHECK(a.kind == MOQ_ACTION_CLOSE_BIDI_STREAM);
+        if (a.kind == MOQ_ACTION_CLOSE_BIDI_STREAM) fins++;
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK(fins == expected);
+}
+
 static void run_replay(moq_version_t version, bool rcbuf, bool fragmented, bool pressure)
 {
     int before = failures;
@@ -247,7 +261,7 @@ static void run_replay(moq_version_t version, bool rcbuf, bool fragmented, bool 
     observe(r.fet, &o);
     for (int k = 0; k < 3; k++)
         MOQ_TEST_CHECK(o.objects[k] == 2 && o.complete[k] == 1 && o.ok[k] == 1);
-    no_actions(&r);
+    completion_fins_only(&r, version == MOQ_VERSION_DRAFT_18 ? 3 : 0);
     MOQ_TEST_CHECK(moq_session_state(r.fet) == MOQ_SESS_ESTABLISHED);
     raw_down(&r);
     MOQ_TEST_CHECK(r.ta.balance == 0);

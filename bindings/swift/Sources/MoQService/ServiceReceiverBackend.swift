@@ -9,8 +9,8 @@ import MoQServiceCore
 /// cross-thread finalizer (media_receiver.h zero-copy posture), so the
 /// bridge copies media/fragment bytes on the service thread and cleans the
 /// C object in the same poll job. `cleanup()` therefore has nothing left to
-/// release. Zero-copy receive is a future C API project (BACKLOG:
-/// "Thread-safe zero-copy receive export").
+/// release. Zero-copy receive would need a thread-safe zero-copy export from
+/// the C API, which it does not provide.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 final class CopiedObjectStorage: OwnedObjectStorage, Sendable {
     private let media: Data

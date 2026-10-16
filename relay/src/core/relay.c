@@ -38,6 +38,17 @@
 #define R_DEF_GRANT_BYTES  (64u * 1024u)
 #define R_DEF_FETCHES        64u
 #define R_DEF_FETCH_PIN_BYTES (8u * 1024u * 1024u)   /* floored >= log max_bytes */
+/* Default WARM-track idle retention. Longer than common QUIC idle timeouts
+ * (msquic 30 s), so a subscriber whose connection died silently and rejoins
+ * after detecting it still finds the cached objects; short enough that a
+ * relay whose sessions come and go never holds dead content (each WARM track
+ * retains up to the per-track log byte budget) for long. */
+#define R_DEF_WARM_IDLE_US (60u * 1000u * 1000u)
+
+/* Reclaim reasons, carried in e1 of the track ROUTE_REMOVE trace record
+ * (0 = an ordinary free). */
+#define R_RECLAIM_CAPACITY 1u
+#define R_RECLAIM_IDLE     2u
 
 /* A terminal this relay chose is a meaning, not a draft's number: the
  * subscriber that reads it may speak either draft. */
@@ -195,32 +206,23 @@ key_name(const r_key_t *k)
                           .len = key_rd32(k->buf + 4u * (1u + count)) };
 }
 
-static uint64_t
-key_hash(const r_key_t *k)
-{
-    uint64_t h = UINT64_C(0xCBF29CE484222325);
-    for (uint32_t i = 0; i < k->len; i++) {
-        h ^= k->buf[i];
-        h *= UINT64_C(0x100000001B3);
-    }
-    return h;
-}
-
-static bool
-key_eq(const r_key_t *a, const r_key_t *b)
-{
-    return a->len == b->len && memcmp(a->buf, b->buf, a->len) == 0;
-}
-
 /* -- pools ------------------------------------------------------------------ */
+
+#define R_NODE_NIL UINT32_MAX
 
 typedef struct r_trie_node {
     uint8_t  *part;        /* owned copy; NULL for root                    */
     uint32_t  part_len;
     uint32_t  parent;      /* UINT32_MAX for root                          */
-    uint32_t *children;    /* grown array of node indices                  */
-    uint32_t  child_count;
-    uint32_t  child_cap;
+    /* Children as an intrusive, ordered sibling list (R_NODE_NIL = none):
+     * no per-node allocation, O(1) unlink, announce fan-out order kept. */
+    uint32_t  first_child;
+    uint32_t  last_child;
+    uint32_t  next_sib;
+    uint32_t  prev_sib;
+    /* Live tracks whose src_ann_node names this node. Only a hint that lets
+     * a free or move skip the track scan when nothing refers here. */
+    uint32_t  src_refs;
     bool      has_announce;
     uint32_t  ann_binding;      /* binding slot                            */
     uint32_t  ann_binding_gen;
@@ -268,9 +270,17 @@ typedef struct r_track {
     uint32_t        src_ann_binding_gen;
     uint64_t        upstream_cookie;
     bool            has_largest;
+    uint32_t        fetch_count;      /* live fetch cursors reading it     */
     uint64_t        largest_group;
     uint64_t        largest_object;
     uint64_t        linger_deadline_us;   /* 0 = unarmed                   */
+    /* Reclaim bookkeeping. interest_seq orders tracks by their most recent
+     * interest change (create, subscribe, unsubscribe, fetch open/close,
+     * source release): the reclaimable track with the smallest value is the
+     * least recently used. idle_since_us is the tick time at which the track
+     * was first seen reclaimable (0 = unarmed); any interest change disarms it. */
+    uint64_t        interest_seq;
+    uint64_t        idle_since_us;
 } r_track_t;
 
 typedef uint32_t r_sub_state_t;
@@ -538,6 +548,13 @@ struct moqr_core {
     uint32_t log_max_subgroups, log_max_objects, log_max_cursors;
     uint32_t log_max_chunk_nodes;
     uint64_t linger_us;
+    uint64_t warm_idle_us;       /* resolved; UINT64_MAX = never             */
+    uint64_t interest_seq;       /* monotonic interest-change counter        */
+    uint64_t tracks_evicted_capacity;
+    uint64_t tracks_evicted_idle;
+    uint64_t ns_nodes_reclaimed;
+    /* Moves whenever admission room may have appeared (see r_room_changed). */
+    uint64_t room_epoch;
 
     r_binding_t   *bindings;
     /* Binding-ready set: one bit per binding slot (ceil(max_bindings/64)
@@ -599,6 +616,60 @@ struct moqr_core {
 };
 
 /* -- small helpers ------------------------------------------------------------- */
+
+/* Pool slot generations: odd = live, even = free. A live generation must fit
+ * the 28-bit generation field of a packed handle (moq_handle_pack returns 0
+ * for anything wider), so live generations run 1, 3, ... R_GEN_LAST_LIVE and
+ * never wrap: a wrap would let a handle held across 2^27 reuses of one slot
+ * alias the slot's new occupant. Releasing the last live generation leaves
+ * the slot at R_GEN_RETIRED (even, wider than any handle), and a retired slot
+ * is never handed out again, so a pool shrinks by one slot per 2^27 reuses of
+ * a single slot. Every relay pool steps generations through these helpers. */
+#define R_GEN_LAST_LIVE 0x0FFFFFFFu
+#define R_GEN_RETIRED   (R_GEN_LAST_LIVE + 1u)
+
+/* A free slot that can still take a live generation. */
+static bool
+r_gen_openable(uint32_t gen)
+{
+    return (gen & 1u) == 0 && gen < R_GEN_LAST_LIVE;
+}
+
+/* Free -> live. Precondition: r_gen_openable(gen). */
+static uint32_t
+r_gen_open(uint32_t gen)
+{
+    return gen + 1u;
+}
+
+/* Live -> free; the last live generation becomes R_GEN_RETIRED. */
+static uint32_t
+r_gen_close(uint32_t gen)
+{
+    return gen + 1u;
+}
+
+/* Whether a live slot can move straight to a fresh live generation (keeping
+ * the slot, staling every handle to the old one). */
+static bool
+r_gen_renewable(uint32_t gen)
+{
+    return (gen & 1u) != 0 && gen <= R_GEN_LAST_LIVE - 2u;
+}
+
+/* Live -> the next live generation. Precondition: r_gen_renewable(gen). */
+static uint32_t
+r_gen_renew(uint32_t gen)
+{
+    return gen + 2u;
+}
+
+/* Whether releasing a live slot leaves it openable (not retired). */
+static bool
+r_gen_reopens(uint32_t gen)
+{
+    return (gen & 1u) != 0 && r_gen_openable(r_gen_close(gen));
+}
 
 static void *
 r_alloc(moqr_core_t *c, size_t n)
@@ -809,6 +880,18 @@ r_bump_route_epoch(moqr_core_t *c)
 {
     c->route_epoch++;
     r_publish_epochs(c);
+}
+
+/* Admission room may have appeared: a pool released capacity (a track slot,
+ * a trie node, interned name bytes) or capacity became reclaimable (an
+ * announce withdrawn, so its trie path may be freed; a track left with no
+ * source, subscription or fetch). Never moved by a change that only consumes
+ * room, so a caller waiting for room (moqr_core_room_epoch) retries only
+ * when it could succeed. */
+static void
+r_room_changed(moqr_core_t *c)
+{
+    c->room_epoch++;
 }
 
 void
@@ -1084,6 +1167,9 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
         }
     }
     c->linger_us = RELAY_CFG_HAS(cfg, linger_us) ? cfg->linger_us : 0;
+    c->warm_idle_us = RELAY_CFG_HAS(cfg, warm_idle_us) && cfg->warm_idle_us != 0
+                          ? cfg->warm_idle_us
+                          : R_DEF_WARM_IDLE_US;
     c->authorize = RELAY_CFG_HAS(cfg, authorize) ? cfg->authorize : NULL;
     c->authorize_ctx =
         RELAY_CFG_HAS(cfg, authorize_ctx) ? cfg->authorize_ctx : NULL;
@@ -1154,6 +1240,10 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
 
     /* Root trie node. */
     c->nodes[0].parent = UINT32_MAX;
+    c->nodes[0].first_child = R_NODE_NIL;
+    c->nodes[0].last_child = R_NODE_NIL;
+    c->nodes[0].next_sib = R_NODE_NIL;
+    c->nodes[0].prev_sib = R_NODE_NIL;
     c->node_count = 1;
 
     *out = c;
@@ -1190,8 +1280,6 @@ moqr_core_destroy(moqr_core_t *c)
     if (c->nodes != NULL) {
         for (uint32_t i = 0; i < c->node_count; i++) {
             r_free(c, c->nodes[i].part, c->nodes[i].part_len);
-            r_free(c, c->nodes[i].children,
-                   (size_t)c->nodes[i].child_cap * sizeof(uint32_t));
         }
         a.free(c->nodes, (size_t)c->max_ns_nodes * sizeof(*c->nodes), a.ctx);
     }
@@ -1312,17 +1400,86 @@ key_release(moqr_core_t *c, r_key_t *k)
     }
 }
 
+/* The canonical key of (ns, name), computed from the views without building
+ * it: its byte length, its hash, and equality with a stored key. Lookups use
+ * these, so finding an existing track never allocates or charges name bytes
+ * (and never makes room by evicting the very cache it is about to hit). */
+static bool
+key_view_len(moqr_ns_t ns, moq_bytes_t name, uint32_t *out)
+{
+    if (ns.count > 32 || name.len > MOQ_FULL_TRACK_NAME_MAX) {
+        return false;
+    }
+    uint32_t len = 4u * (2u + (uint32_t)ns.count) + (uint32_t)name.len;
+    for (size_t i = 0; i < ns.count; i++) {
+        if (ns.parts[i].len > MOQ_FULL_TRACK_NAME_MAX) {
+            return false;
+        }
+        len += (uint32_t)ns.parts[i].len;
+    }
+    *out = len;
+    return true;
+}
+
+static uint64_t
+key_hash_bytes(uint64_t h, const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= UINT64_C(0x100000001B3);
+    }
+    return h;
+}
+
+/* FNV-1a over exactly the bytes key_build() would write for (ns, name). */
+static uint64_t
+key_view_hash(moqr_ns_t ns, moq_bytes_t name)
+{
+    uint64_t h = UINT64_C(0xCBF29CE484222325);
+    uint8_t w[4];
+    key_wr32(w, (uint32_t)ns.count);
+    h = key_hash_bytes(h, w, 4);
+    for (size_t i = 0; i < ns.count; i++) {
+        key_wr32(w, (uint32_t)ns.parts[i].len);
+        h = key_hash_bytes(h, w, 4);
+    }
+    key_wr32(w, (uint32_t)name.len);
+    h = key_hash_bytes(h, w, 4);
+    for (size_t i = 0; i < ns.count; i++) {
+        h = key_hash_bytes(h, ns.parts[i].data, ns.parts[i].len);
+    }
+    return key_hash_bytes(h, name.data, name.len);
+}
+
+static bool
+key_view_eq(const r_key_t *k, moqr_ns_t ns, moq_bytes_t name)
+{
+    if (key_part_count(k) != ns.count) {
+        return false;
+    }
+    for (uint32_t i = 0; i < ns.count; i++) {
+        moq_bytes_t p = key_part(k, i);
+        if (p.len != ns.parts[i].len ||
+            (p.len != 0 && memcmp(p.data, ns.parts[i].data, p.len) != 0)) {
+            return false;
+        }
+    }
+    moq_bytes_t n = key_name(k);
+    return n.len == name.len &&
+           (n.len == 0 || memcmp(n.data, name.data, n.len) == 0);
+}
+
 /* -- trie ----------------------------------------------------------------------------- */
 
 static uint32_t
 trie_find_child(const moqr_core_t *c, uint32_t node, moq_bytes_t part)
 {
-    const r_trie_node_t *n = &c->nodes[node];
-    for (uint32_t i = 0; i < n->child_count; i++) {
-        const r_trie_node_t *ch = &c->nodes[n->children[i]];
+    for (uint32_t k = c->nodes[node].first_child; k != R_NODE_NIL;
+         k = c->nodes[k].next_sib) {
+        const r_trie_node_t *ch = &c->nodes[k];
         if (ch->part_len == part.len &&
             (part.len == 0 || memcmp(ch->part, part.data, part.len) == 0)) {
-            return n->children[i];
+            return k;
         }
     }
     return UINT32_MAX;
@@ -1343,22 +1500,6 @@ trie_child_get_or_create(moqr_core_t *c, uint32_t node, moq_bytes_t part,
     if (c->intern_used + part.len > c->intern_budget) {
         return r_refuse(c, MOQR_REFUSE_NAME_BYTES);
     }
-    r_trie_node_t *parent = &c->nodes[node];
-    if (parent->child_count == parent->child_cap) {
-        uint32_t newcap = parent->child_cap == 0 ? 4 : parent->child_cap * 2;
-        uint32_t *nc = r_alloc(c, (size_t)newcap * sizeof(uint32_t));
-        if (nc == NULL) {
-            return MOQR_ERR_NOMEM;
-        }
-        if (parent->child_count != 0) {
-            memcpy(nc, parent->children,
-                   (size_t)parent->child_count * sizeof(uint32_t));
-        }
-        r_free(c, parent->children,
-               (size_t)parent->child_cap * sizeof(uint32_t));
-        parent->children = nc;
-        parent->child_cap = newcap;
-    }
     uint8_t *copy = NULL;
     if (part.len != 0) {
         copy = r_alloc(c, part.len);
@@ -1373,10 +1514,255 @@ trie_child_get_or_create(moqr_core_t *c, uint32_t node, moq_bytes_t part,
     nn->part = copy;
     nn->part_len = (uint32_t)part.len;
     nn->parent = node;
+    nn->first_child = R_NODE_NIL;
+    nn->last_child = R_NODE_NIL;
+    nn->next_sib = R_NODE_NIL;
+    r_trie_node_t *par = &c->nodes[node];
+    nn->prev_sib = par->last_child;   /* append: fan-out keeps creation order */
+    if (par->last_child != R_NODE_NIL) {
+        c->nodes[par->last_child].next_sib = idx;
+    } else {
+        par->first_child = idx;
+    }
+    par->last_child = idx;
     c->intern_used += (uint32_t)part.len;
-    c->nodes[node].children[c->nodes[node].child_count++] = idx;
     *out = idx;
     return MOQR_OK;
+}
+
+/* -- trie reclaim ---------------------------------------------------------------- *
+ *
+ * A trie node is only an index: it owns its part bytes, nothing else does. A
+ * node is reclaimable when it is a leaf, carries no announce, and no unpolled
+ * NS_FOUND / NS_GONE intent borrows its part bytes (intent views stay valid
+ * until the consumer polls them). A track's src_ann_node does not pin: only
+ * force-withdraw reads it, and only on a node that still carries an announce,
+ * which is never reclaimed; a freed node clears the identity of any track that
+ * named it. Namespace subscriptions hold their own prefix copy and never
+ * reference nodes.
+ *
+ * Freed slots are compacted (the last node moves into the hole and every
+ * index referring to it is rewritten), keeping the node array dense for every
+ * node_count walk; moved nodes keep their part buffers, so borrowed views into
+ * them stay valid. */
+
+/* NS_FOUND / NS_GONE intents still in the ring (only these borrow trie
+ * bytes). */
+static uint32_t
+intent_ns_count(const moqr_core_t *c)
+{
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < c->intent_count; k++) {
+        moqr_intent_kind_t kind =
+            c->intents[(c->intent_head + k) % c->max_intents].kind;
+        if (kind == MOQR_INTENT_NS_FOUND || kind == MOQR_INTENT_NS_GONE) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static bool
+intent_borrows_part(const moqr_core_t *c, const uint8_t *part)
+{
+    if (part == NULL) {
+        return false;   /* an empty part has no bytes to borrow */
+    }
+    for (uint32_t k = 0; k < c->intent_count; k++) {
+        const moqr_intent_t *it =
+            &c->intents[(c->intent_head + k) % c->max_intents];
+        if (it->kind != MOQR_INTENT_NS_FOUND &&
+            it->kind != MOQR_INTENT_NS_GONE) {
+            continue;
+        }
+        for (uint32_t i = 0; i < it->ns_count && i < 32; i++) {
+            if (it->ns_parts[i].data == part) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Set a live track's source-announce node, keeping each node's src_refs
+ * count of the tracks that name it. */
+static void
+track_src_set(moqr_core_t *c, r_track_t *t, uint32_t node)
+{
+    if (t->src_ann_node != UINT32_MAX) {
+        c->nodes[t->src_ann_node].src_refs--;
+    }
+    t->src_ann_node = node;
+    if (node != UINT32_MAX) {
+        c->nodes[node].src_refs++;
+    }
+}
+
+/* Point every live track whose src_ann_node is `from` at `to`. */
+static void
+track_src_rewrite(moqr_core_t *c, uint32_t from, uint32_t to)
+{
+    for (uint32_t t = 0; t < c->max_tracks; t++) {
+        if ((c->tracks[t].gen & 1u) != 0 &&
+            c->tracks[t].src_ann_node == from) {
+            c->tracks[t].src_ann_node = to;
+        }
+    }
+}
+
+/* Free leaf node n and compact: the last node takes slot n. */
+static void
+trie_node_free(moqr_core_t *c, uint32_t n)
+{
+    r_trie_node_t *nd = &c->nodes[n];
+    r_trie_node_t *par = &c->nodes[nd->parent];
+    if (nd->prev_sib != R_NODE_NIL) {
+        c->nodes[nd->prev_sib].next_sib = nd->next_sib;
+    } else {
+        par->first_child = nd->next_sib;
+    }
+    if (nd->next_sib != R_NODE_NIL) {
+        c->nodes[nd->next_sib].prev_sib = nd->prev_sib;
+    } else {
+        par->last_child = nd->prev_sib;
+    }
+    if (nd->src_refs != 0) {
+        track_src_rewrite(c, n, UINT32_MAX);   /* its announce is long gone */
+    }
+    c->intern_used -= nd->part_len;
+    r_free(c, nd->part, nd->part_len);
+    uint32_t last = c->node_count - 1u;
+    if (n != last) {
+        c->nodes[n] = c->nodes[last];
+        r_trie_node_t *mv = &c->nodes[n];
+        r_trie_node_t *mp = &c->nodes[mv->parent];
+        if (mv->prev_sib != R_NODE_NIL) {
+            c->nodes[mv->prev_sib].next_sib = n;
+        } else {
+            mp->first_child = n;
+        }
+        if (mv->next_sib != R_NODE_NIL) {
+            c->nodes[mv->next_sib].prev_sib = n;
+        } else {
+            mp->last_child = n;
+        }
+        for (uint32_t k = mv->first_child; k != R_NODE_NIL;
+             k = c->nodes[k].next_sib) {
+            c->nodes[k].parent = n;
+        }
+        if (mv->src_refs != 0) {
+            track_src_rewrite(c, last, n);
+        }
+    }
+    memset(&c->nodes[last], 0, sizeof(c->nodes[last]));
+    c->node_count--;
+    c->ns_nodes_reclaimed++;
+    r_room_changed(c);
+    r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 3 /* ns node */, n, last, 0, 0);
+}
+
+/* Walk node n's subtree, adding to *nodes / *bytes the size of every maximal
+ * subtree that is entirely reclaimable (no announce anywhere in it, not on
+ * the kept path, and, unless ignore_views, no part borrowed by an unpolled
+ * intent). Returns whether n's own subtree qualifies, in which case its size
+ * is included. Pure; recursion depth is bounded by the 32-part namespace
+ * limit. */
+static bool
+trie_subtree_free(const moqr_core_t *c, uint32_t n, uint32_t keep,
+                  bool ignore_views, bool check_views, uint32_t *nodes,
+                  uint64_t *bytes)
+{
+    const r_trie_node_t *nd = &c->nodes[n];
+    uint32_t below_n = 0;
+    uint64_t below_b = 0;
+    bool all = true;
+    for (uint32_t k = nd->first_child; k != R_NODE_NIL;
+         k = c->nodes[k].next_sib) {
+        uint32_t sn = 0;
+        uint64_t sb = 0;
+        if (trie_subtree_free(c, k, keep, ignore_views, check_views, &sn,
+                              &sb)) {
+            below_n += sn;
+            below_b += sb;
+        } else {
+            all = false;
+            *nodes += sn;   /* qualifying subtrees under a kept child */
+            *bytes += sb;
+        }
+    }
+    if (all && n != 0 && n != keep && !nd->has_announce &&
+        (ignore_views || !check_views || !intent_borrows_part(c, nd->part))) {
+        *nodes += below_n + 1u;
+        *bytes += below_b + nd->part_len;
+        return true;
+    }
+    *nodes += below_n;
+    *bytes += below_b;
+    return false;
+}
+
+/* Room trie reclaim can supply right now (respecting intent views) and in
+ * total (ignoring them). */
+static void
+trie_free_room(const moqr_core_t *c, uint32_t keep, uint32_t *nodes_now,
+               uint64_t *bytes_now, uint32_t *nodes_all, uint64_t *bytes_all)
+{
+    bool views = intent_ns_count(c) != 0;
+    *nodes_now = 0;
+    *bytes_now = 0;
+    (void)trie_subtree_free(c, 0, keep, false, views, nodes_now, bytes_now);
+    if (views) {
+        *nodes_all = 0;
+        *bytes_all = 0;
+        (void)trie_subtree_free(c, 0, keep, true, true, nodes_all, bytes_all);
+    } else {
+        *nodes_all = *nodes_now;
+        *bytes_all = *bytes_now;
+    }
+}
+
+/* Free every reclaimable node except *keep (a freed leaf can expose its
+ * parent, so sweep until nothing changes; *keep follows its node if
+ * compaction moves it). The route epoch is bumped before the first removal,
+ * so each trace record carries the epoch of the state it produced. */
+static uint32_t
+trie_reclaim(moqr_core_t *c, uint32_t *keep)
+{
+    uint32_t freed = 0;
+    bool views = intent_ns_count(c) != 0;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (uint32_t n = c->node_count; n-- > 1u;) {
+            const r_trie_node_t *nd = &c->nodes[n];
+            if (n == *keep || nd->has_announce ||
+                nd->first_child != R_NODE_NIL ||
+                (views && intent_borrows_part(c, nd->part))) {
+                continue;
+            }
+            if (freed == 0) {
+                r_bump_route_epoch(c);
+            }
+            if (*keep == c->node_count - 1u) {
+                *keep = n;   /* compaction moves the kept node into n */
+            }
+            trie_node_free(c, n);
+            freed++;
+            changed = true;
+        }
+    }
+    return freed;
+}
+
+/* Nodes a reclaim would free right now (stats gauge). */
+static uint32_t
+trie_reclaimable_count(const moqr_core_t *c)
+{
+    uint32_t nodes = 0;
+    uint64_t bytes = 0;
+    (void)trie_subtree_free(c, 0, R_NODE_NIL, false,
+                            intent_ns_count(c) != 0, &nodes, &bytes);
+    return nodes;
 }
 
 /* Walk ns; return node index or UINT32_MAX (no create). */
@@ -1475,12 +1861,20 @@ prefix_matches_node(const moqr_core_t *c, const r_ns_sub_t *nsub,
 
 /* -- tracks ------------------------------------------------------------------------------ */
 
+/* Find the live track for (ns, name) from the views; *hash_out receives the
+ * key hash either way. UINT32_MAX = none. */
 static uint32_t
-track_find(const moqr_core_t *c, const r_key_t *key, uint64_t hash)
+track_lookup(const moqr_core_t *c, moqr_ns_t ns, moq_bytes_t name,
+             uint64_t *hash_out)
 {
+    uint64_t hash = key_view_hash(ns, name);
+    if (hash_out != NULL) {
+        *hash_out = hash;
+    }
     for (uint32_t i = 0; i < c->max_tracks; i++) {
         const r_track_t *t = &c->tracks[i];
-        if ((t->gen & 1u) != 0 && t->hash == hash && key_eq(&t->key, key)) {
+        if ((t->gen & 1u) != 0 && t->hash == hash &&
+            key_view_eq(&t->key, ns, name)) {
             return i;
         }
     }
@@ -1488,9 +1882,76 @@ track_find(const moqr_core_t *c, const r_key_t *key, uint64_t hash)
 }
 
 static void
+track_free_slot_reason(moqr_core_t *c, uint32_t slot, uint32_t reason);
+
+static void
 track_free_slot(moqr_core_t *c, uint32_t slot)
 {
+    track_free_slot_reason(c, slot, 0);
+}
+
+/* Drop the upstream work of a track that is being freed from the intent
+ * ring. An unpolled UPSTREAM_SUBSCRIBE borrows the track's key bytes for its
+ * namespace / name views, so it must not outlive the key; with the track gone
+ * the upstream request has nothing to serve anyway. An UPSTREAM_UNSUBSCRIBE
+ * for the same attempt is dropped with it: that upstream was never sent.
+ * Order-preserving compaction of the ring. */
+static void
+intent_scrub_track(moqr_core_t *c, uint32_t slot)
+{
+    uint64_t h = r_pack(c, MOQR_HANDLE_POOL_TRACK, c->tracks[slot].gen, slot);
+    const moqr_intent_kind_t tomb = 0;   /* no intent kind is 0 */
+    bool any = false;
+    /* Mark: unsubscribes paired with a queued subscribe first (the lookup
+     * needs the subscribes intact), then the subscribes. */
+    for (uint32_t k = 0; k < c->intent_count; k++) {
+        moqr_intent_t *it = &c->intents[(c->intent_head + k) % c->max_intents];
+        if (it->kind != MOQR_INTENT_UPSTREAM_UNSUBSCRIBE ||
+            it->track._opaque != h) {
+            continue;
+        }
+        for (uint32_t j = 0; j < c->intent_count; j++) {
+            const moqr_intent_t *sb =
+                &c->intents[(c->intent_head + j) % c->max_intents];
+            if (sb->kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE &&
+                sb->track._opaque == h && sb->track_gen == it->track_gen) {
+                it->kind = tomb;
+                any = true;
+                break;
+            }
+        }
+    }
+    for (uint32_t k = 0; k < c->intent_count; k++) {
+        moqr_intent_t *it = &c->intents[(c->intent_head + k) % c->max_intents];
+        if (it->kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE &&
+            it->track._opaque == h) {
+            it->kind = tomb;
+            any = true;
+        }
+    }
+    if (!any) {
+        return;
+    }
+    uint32_t kept = 0;
+    for (uint32_t k = 0; k < c->intent_count; k++) {
+        const moqr_intent_t *it =
+            &c->intents[(c->intent_head + k) % c->max_intents];
+        if (it->kind == tomb) {
+            continue;
+        }
+        if (kept != k) {
+            c->intents[(c->intent_head + kept) % c->max_intents] = *it;
+        }
+        kept++;
+    }
+    c->intent_count = kept;
+}
+
+static void
+track_free_slot_reason(moqr_core_t *c, uint32_t slot, uint32_t reason)
+{
     r_track_t *t = &c->tracks[slot];
+    intent_scrub_track(c, slot);
     /* Fold this log's evictions into the monotonic accumulator before the
      * log (and its counters) vanish, so objects_evicted_total never drops. */
     moqr_log_stats_t ls;
@@ -1499,6 +1960,7 @@ track_free_slot(moqr_core_t *c, uint32_t slot)
     moqr_log_destroy(t->log);
     t->log = NULL;
     key_release(c, &t->key);
+    track_src_set(c, t, UINT32_MAX);
     /* The gen bump below ends every remaining member's track membership at
      * once; clear their index links now so a later retire of a stale member
      * never unlinks through a dead track's list. */
@@ -1509,9 +1971,72 @@ track_free_slot(moqr_core_t *c, uint32_t slot)
         i = next;
     }
     t->subs_head = R_SUB_NIL;
-    t->gen++;   /* odd -> even */
+    t->gen = r_gen_close(t->gen);
+    r_room_changed(c);
     r_bump_route_epoch(c);
-    r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 1 /* track */, slot, 0, 0, 0);
+    r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 1 /* track */, slot, reason, 0, 0);
+}
+
+static uint32_t track_sub_count(const moqr_core_t *c, uint32_t track_slot);
+static uint32_t track_fetch_count(const moqr_core_t *c, uint32_t track_slot);
+
+/* Record an interest change on a live track: it becomes the most recently
+ * used, and any idle-retention clock restarts. */
+static void
+track_touch(moqr_core_t *c, uint32_t slot)
+{
+    c->tracks[slot].interest_seq = ++c->interest_seq;
+    c->tracks[slot].idle_since_us = 0;
+}
+
+/* Reclaimable: the track's retained objects are pure cache. WARM means the
+ * source is released (no upstream binding, no pending upstream request, no
+ * cross-shard demand: a mirrored track is PENDING or ACTIVE while its demand
+ * stands). No subscription may read it (an owner-side cross-shard pump
+ * subscription is an ordinary subscription), and no fetch may hold it. */
+static bool
+track_reclaimable(const moqr_core_t *c, uint32_t slot)
+{
+    const r_track_t *t = &c->tracks[slot];
+    return (t->gen & 1u) != 0 && t->state == R_TRACK_WARM &&
+           !t->has_upstream_binding && t->source_kind == R_TRACK_SOURCE_NONE &&
+           track_sub_count(c, slot) == 0 && track_fetch_count(c, slot) == 0;
+}
+
+/* The least recently used reclaimable track, or UINT32_MAX when every live
+ * track is in use. With for_slot, only a track whose release leaves its slot
+ * openable qualifies: reclaiming a track on its last generation retires the
+ * slot and frees no slot. Ties cannot occur: interest_seq values are unique. */
+static uint32_t
+track_lru_reclaimable(const moqr_core_t *c, bool for_slot)
+{
+    uint32_t best = UINT32_MAX;
+    for (uint32_t i = 0; i < c->max_tracks; i++) {
+        if (track_reclaimable(c, i) &&
+            (!for_slot || r_gen_reopens(c->tracks[i].gen)) &&
+            (best == UINT32_MAX ||
+             c->tracks[i].interest_seq < c->tracks[best].interest_seq)) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+/* Free a reclaimable track and everything it owns (log, interned key; it has
+ * no subscriber links and no fetches by definition). The slot generation bump
+ * makes every outstanding handle to it MOQR_ERR_STALE_HANDLE. */
+static void
+track_reclaim(moqr_core_t *c, uint32_t slot, uint32_t reason)
+{
+    moqr_log_stats_t ls;
+    moqr_log_get_stats(c->tracks[slot].log, &ls);
+    c->evicted_freed += ls.record_count;   /* discarded cache records */
+    if (reason == R_RECLAIM_CAPACITY) {
+        c->tracks_evicted_capacity++;
+    } else {
+        c->tracks_evicted_idle++;
+    }
+    track_free_slot_reason(c, slot, reason);
 }
 
 static moqr_result_t
@@ -1529,6 +2054,22 @@ track_make_log(moqr_core_t *c, uint32_t slot, moqr_log_t **out)
     return moqr_log_create(&lc, out);
 }
 
+/* Retire a live fetch cursor: unpin, drop its read reference on the track
+ * it was opened on (when that track is still the same generation), and stale
+ * the handle. The one place a fetch ends. */
+static void
+fetch_retire(moqr_core_t *c, r_fetch_t *f)
+{
+    fetch_unpin(c, f);
+    if (f->track < c->max_tracks &&
+        c->tracks[f->track].gen == f->track_gen_slot &&
+        c->tracks[f->track].fetch_count != 0) {
+        c->tracks[f->track].fetch_count--;
+    }
+    f->gen = r_gen_close(f->gen);
+    r_room_changed(c);   /* a fetch slot, and maybe a reclaimable track */
+}
+
 static void
 track_fetch_invalidate(moqr_core_t *c, uint32_t track_slot,
                        uint32_t track_gen)
@@ -1537,8 +2078,7 @@ track_fetch_invalidate(moqr_core_t *c, uint32_t track_slot,
         r_fetch_t *f = &c->fetches[fi];
         if ((f->gen & 1u) != 0 && f->track == track_slot &&
             f->track_gen_slot == track_gen) {
-            fetch_unpin(c, f);
-            f->gen++;   /* odd -> even */
+            fetch_retire(c, f);
         }
     }
 }
@@ -1561,46 +2101,188 @@ track_replace_retained_generation(moqr_core_t *c, uint32_t slot,
     t->largest_group = 0;
     t->largest_object = 0;
     t->linger_deadline_us = 0;
-    t->gen += 2;   /* odd -> odd: keep slot, invalidate old readers/handles */
+    t->gen = r_gen_renew(t->gen);   /* keep the slot, stale old readers/handles */
     r_bump_route_epoch(c);
 }
 
-static moqr_result_t
-track_create(moqr_core_t *c, r_key_t *key /* adopted on OK */, uint64_t hash,
-             uint32_t *out_slot)
+static uint32_t
+track_free_slot_find(const moqr_core_t *c)
 {
-    uint32_t slot = UINT32_MAX;
     for (uint32_t i = 0; i < c->max_tracks; i++) {
-        if ((c->tracks[i].gen & 1u) == 0) {
-            slot = i;
-            break;
+        if (r_gen_openable(c->tracks[i].gen)) {
+            return i;
         }
     }
-    if (slot == UINT32_MAX) {
-        return r_refuse(c, MOQR_REFUSE_TRACKS);
-    }
-    r_track_t *t = &c->tracks[slot];
+    return UINT32_MAX;
+}
 
-    moqr_log_t *log = NULL;
-    moqr_result_t rc = track_make_log(c, slot, &log);
+/*
+ * Demand-driven reclaim: make room for an admission that needs a track slot
+ * (need_slot), trie nodes (need_nodes) and interned name bytes (need_bytes),
+ * by freeing unreferenced trie nodes and then least-recently-used reclaimable
+ * tracks. Every pool these draw on holds only cache or index once it is
+ * reclaimable, so a relay never refuses work while cache could make room.
+ *
+ * Preflight first, with no state change: the room reclaim can supply now is
+ * compared with the shortfall. If it suffices, reclaim runs and MOQR_OK is
+ * returned. If it would suffice only once unpolled intents release the trie
+ * bytes they borrow, MOQR_ERR_WOULD_BLOCK (nothing touched; drain and retry).
+ * Otherwise the admission is refused with MOQR_ERR_CAPACITY, counted against
+ * the first resource that cannot be met. *keep_node (R_NODE_NIL when unused)
+ * is a trie node the caller needs; it is never freed and follows compaction.
+ */
+/* The preflight alone: whether room for (slot, nodes, bytes) exists now
+ * (MOQR_OK), only once intent views drain (MOQR_ERR_WOULD_BLOCK), or not at
+ * all (MOQR_ERR_CAPACITY, with *reason the first unmet resource). Pure: no
+ * mutation, no refusal counted. */
+static moqr_result_t
+r_room_check(const moqr_core_t *c, bool need_slot, uint32_t need_nodes,
+             uint64_t need_bytes, uint32_t keep, moqr_refuse_reason_t *reason)
+{
+    bool slot_short = need_slot && track_free_slot_find(c) == UINT32_MAX;
+    uint64_t node_short =
+        (uint64_t)c->node_count + need_nodes > c->max_ns_nodes
+            ? (uint64_t)c->node_count + need_nodes - c->max_ns_nodes
+            : 0;
+    uint64_t byte_short =
+        (uint64_t)c->intern_used + need_bytes > c->intern_budget
+            ? (uint64_t)c->intern_used + need_bytes - c->intern_budget
+            : 0;
+    if (!slot_short && node_short == 0 && byte_short == 0) {
+        return MOQR_OK;
+    }
+    uint32_t tn_now = 0, tn_all = 0;
+    uint64_t tb_now = 0, tb_all = 0;
+    if (node_short != 0 || byte_short != 0) {
+        trie_free_room(c, keep, &tn_now, &tb_now, &tn_all, &tb_all);
+    }
+    uint32_t tracks = 0;   /* reclaimable tracks whose slot reopens */
+    uint64_t track_bytes = 0;
+    if (slot_short || byte_short != 0) {
+        for (uint32_t i = 0; i < c->max_tracks; i++) {
+            if (track_reclaimable(c, i)) {
+                tracks += r_gen_reopens(c->tracks[i].gen) ? 1u : 0u;
+                track_bytes += c->tracks[i].key.len;
+            }
+        }
+    }
+    bool slot_ok = !slot_short || tracks != 0;
+    if (!(slot_ok && node_short <= tn_now &&
+          byte_short <= tb_now + track_bytes)) {
+        if (slot_ok && node_short <= tn_all &&
+            byte_short <= tb_all + track_bytes) {
+            return MOQR_ERR_WOULD_BLOCK;   /* intent views hold the room */
+        }
+        *reason = node_short > tn_all ? MOQR_REFUSE_NS_NODES
+                  : !slot_ok          ? MOQR_REFUSE_TRACKS
+                                      : MOQR_REFUSE_NAME_BYTES;
+        return MOQR_ERR_CAPACITY;
+    }
+    return MOQR_OK;
+}
+
+static moqr_result_t
+r_make_room(moqr_core_t *c, bool need_slot, uint32_t need_nodes,
+            uint64_t need_bytes, uint32_t *keep_node)
+{
+    uint32_t keep = keep_node != NULL ? *keep_node : R_NODE_NIL;
+    moqr_refuse_reason_t reason = MOQR_REFUSE_TRACKS;
+    moqr_result_t rc =
+        r_room_check(c, need_slot, need_nodes, need_bytes, keep, &reason);
+    if (rc == MOQR_ERR_CAPACITY) {
+        return r_refuse(c, reason);
+    }
     if (rc != MOQR_OK) {
         return rc;
     }
+    bool slot_short = need_slot && track_free_slot_find(c) == UINT32_MAX;
+    bool node_short = (uint64_t)c->node_count + need_nodes > c->max_ns_nodes;
+    bool byte_short =
+        (uint64_t)c->intern_used + need_bytes > c->intern_budget;
+    if (!slot_short && !node_short && !byte_short) {
+        return MOQR_OK;
+    }
 
-    uint32_t gen = t->gen + 1;   /* even -> odd */
+    /* Index first: trie nodes of withdrawn namespaces are not cache. */
+    if (node_short || byte_short) {
+        (void)trie_reclaim(c, &keep);
+    }
+    for (;;) {
+        bool slot_more = slot_short && track_free_slot_find(c) == UINT32_MAX;
+        bool need_more =
+            slot_more ||
+            (uint64_t)c->intern_used + need_bytes > c->intern_budget;
+        if (!need_more) {
+            break;
+        }
+        uint32_t victim = track_lru_reclaimable(c, slot_more);
+        if (victim == UINT32_MAX) {
+            break;   /* unreachable: the preflight counted the supply */
+        }
+        track_reclaim(c, victim, R_RECLAIM_CAPACITY);
+    }
+    if (keep_node != NULL) {
+        *keep_node = keep;
+    }
+    return MOQR_OK;
+}
+
+/* Create a track for (ns, name), whose absence the caller has just
+ * established with track_lookup(): make room (slot + name bytes), intern the
+ * key, open the log, and take the slot. Room comes first so the relay never
+ * holds more than max_tracks logs or name_intern_bytes of names, even
+ * transiently; an allocation failure after an eviction therefore loses the
+ * evicted track's cache (cache only, which the relay may drop). */
+static void track_install(moqr_core_t *c, uint32_t slot, r_key_t key,
+                          uint64_t hash, moqr_log_t *log);
+
+static moqr_result_t
+track_create(moqr_core_t *c, moqr_ns_t ns, moq_bytes_t name, uint64_t hash,
+             uint32_t *out_slot)
+{
+    uint32_t key_len = 0;
+    if (!key_view_len(ns, name, &key_len)) {
+        return MOQR_ERR_INVAL;
+    }
+    moqr_result_t rc = r_make_room(c, true, 0, key_len, NULL);
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    uint32_t slot = track_free_slot_find(c);
+    r_key_t key = { NULL, 0 };
+    rc = key_build(c, ns, name, &key);
+    if (rc != MOQR_OK) {
+        return rc;
+    }
+    moqr_log_t *log = NULL;
+    rc = track_make_log(c, slot, &log);
+    if (rc != MOQR_OK) {
+        key_release(c, &key);
+        return rc;
+    }
+    track_install(c, slot, key, hash, log);
+    *out_slot = slot;
+    return MOQR_OK;
+}
+
+/* Take the openable slot `slot` for a new track that owns `key` and `log`. */
+static void
+track_install(moqr_core_t *c, uint32_t slot, r_key_t key, uint64_t hash,
+              moqr_log_t *log)
+{
+    r_track_t *t = &c->tracks[slot];
+    uint32_t gen = r_gen_open(t->gen);
     memset(t, 0, sizeof(*t));
     t->gen = gen;
     t->subs_head = R_SUB_NIL;
-    t->key = *key;
-    key->buf = NULL;   /* adopted */
+    t->key = key;
     t->hash = hash;
     t->log = log;
     t->track_gen = 0;
     t->src_ann_node = UINT32_MAX;   /* 0 is the valid root node, so set explicitly */
-    *out_slot = slot;
+    track_touch(c, slot);
     r_bump_route_epoch(c);
     r_trace(c, MOQR_TRACE_ROUTE_ADD, 1 /* track */, slot, hash, 0, 0);
-    return MOQR_OK;
 }
 
 static moqr_track_t
@@ -1983,15 +2665,8 @@ track_sub_count(const moqr_core_t *c, uint32_t track_slot)
 static uint32_t
 track_fetch_count(const moqr_core_t *c, uint32_t track_slot)
 {
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < c->max_fetches; i++) {
-        if ((c->fetches[i].gen & 1u) != 0 &&
-            c->fetches[i].track == track_slot &&
-            c->fetches[i].track_gen_slot == c->tracks[track_slot].gen) {
-            n++;
-        }
-    }
-    return n;
+    const r_track_t *t = &c->tracks[track_slot];
+    return (t->gen & 1u) != 0 ? t->fetch_count : 0;
 }
 
 /* Resolve a sub's filter start/end from a largest location. */
@@ -2043,10 +2718,15 @@ moqr_core_binding_open(moqr_core_t *c, uint64_t session_cookie,
     }
     *out = MOQR_BINDING_INVALID;
     for (uint32_t i = 0; i < c->max_bindings; i++) {
-        if ((c->bindings[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->bindings[i].gen)) {
             r_binding_t *b = &c->bindings[i];
-            uint32_t gen = b->gen + 1;
+            uint32_t gen = r_gen_open(b->gen);
+            /* The slot owns reusable pin storage across binding lifetimes. */
+            r_pin_chunk_t *pin_chunks = b->pin_chunks;
+            uint32_t pin_chunks_cap = b->pin_chunks_cap;
             memset(b, 0, sizeof(*b));
+            b->pin_chunks = pin_chunks;
+            b->pin_chunks_cap = pin_chunks_cap;
             b->gen = gen;
             b->cookie = session_cookie;
             b->subs_head = R_SUB_NIL;   /* empty (memset left it 0) */
@@ -2188,6 +2868,7 @@ track_sub_link(moqr_core_t *c, uint32_t tslot, uint32_t sslot)
         c->subs[t->subs_head].track_prev = sslot;
     }
     t->subs_head = sslot;
+    track_touch(c, tslot);
 }
 
 static void
@@ -2205,6 +2886,8 @@ track_sub_unlink(moqr_core_t *c, uint32_t tslot, uint32_t sslot)
     }
     s->track_next = R_SUB_NIL;
     s->track_prev = R_SUB_NIL;
+    track_touch(c, tslot);
+    r_room_changed(c);   /* the track may now be reclaimable */
 }
 
 /* Begun live-edge accounting: a (group,list) position transitions to begun
@@ -2271,7 +2954,7 @@ sub_retire(moqr_core_t *c, uint32_t slot, uint64_t now_us)
         ready_mark(c, s->binding);
     }
     gpos_free(c, s);
-    s->gen++;   /* odd -> even */
+    s->gen = r_gen_close(s->gen);
 }
 
 
@@ -2345,7 +3028,7 @@ track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
         t->has_upstream_binding = true;
         t->up_binding = c->nodes[pub_node].ann_binding;
         t->up_binding_gen = c->nodes[pub_node].ann_binding_gen;
-        t->src_ann_node = pub_node;
+        track_src_set(c, t, pub_node);
         t->src_ann_binding = c->nodes[pub_node].ann_binding;
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
         moqr_intent_t *up = intent_push(c, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
@@ -2451,6 +3134,8 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
         t->has_upstream_binding = false;
         t->source_kind = R_TRACK_SOURCE_NONE;
         t->state = R_TRACK_WARM;
+        track_touch(c, i);   /* source released: last use */
+        r_room_changed(c);
         t->track_gen++;   /* stale any in-flight resolution */
         moqr_log_stats_t ls;
         moqr_log_get_stats(t->log, &ls);
@@ -2480,6 +3165,7 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
             return MOQR_ERR_WOULD_BLOCK;   /* this announce next retry */
         }
         c->nodes[n].has_announce = false;
+        r_room_changed(c);
         r_bump_route_epoch(c);
         r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 0 /* announce */, n, bslot, 0,
                 0);
@@ -2512,6 +3198,7 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
             uint32_t plen = c->ns_subs[s].prefix_len;
             c->intern_used -= plen;
             r_free(c, c->ns_subs[s].prefix, plen);
+            r_room_changed(c);
             memset(&c->ns_subs[s], 0, sizeof(c->ns_subs[s]));
         }
     }
@@ -2522,8 +3209,7 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
         r_fetch_t *f = &c->fetches[fi];
         if ((f->gen & 1u) != 0 && f->binding == bslot &&
             f->binding_gen == b->gen) {
-            fetch_unpin(c, f);
-            f->gen++;   /* odd -> even */
+            fetch_retire(c, f);
         }
     }
     b->out_active = false;
@@ -2531,12 +3217,49 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
     /* The slot is reusable after the gen bump: a stale ready bit would
      * resolve to the REPLACEMENT binding's cookie on a later drain. */
     ready_clear(c, bslot);
-    b->gen++;   /* odd -> even */
+    b->gen = r_gen_close(b->gen);
     r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 2 /* binding */, bslot, 0, 0, 0);
     return MOQR_OK;
 }
 
 /* -- ops: announce / ns discovery -------------------------------------------------------------- */
+
+/* The trie nodes and name bytes announcing ns would add, and the deepest
+ * node of its path that already exists. */
+static void
+announce_need(const moqr_core_t *c, moqr_ns_t ns, uint32_t *deep,
+              uint32_t *missing, uint64_t *missing_bytes)
+{
+    *deep = 0;
+    *missing = 0;
+    *missing_bytes = 0;
+    for (size_t i = 0; i < ns.count; i++) {
+        uint32_t child = *missing == 0 ? trie_find_child(c, *deep, ns.parts[i])
+                                       : UINT32_MAX;
+        if (child != UINT32_MAX) {
+            *deep = child;
+        } else {
+            (*missing)++;
+            *missing_bytes += ns.parts[i].len;
+        }
+    }
+}
+
+moqr_result_t
+moqr_core_announce_room(const moqr_core_t *c, moqr_ns_t ns)
+{
+    if (c == NULL || !ns_view_ok(ns, 0)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t deep = 0, missing = 0;
+    uint64_t missing_bytes = 0;
+    announce_need(c, ns, &deep, &missing, &missing_bytes);
+    if (missing == 0) {
+        return MOQR_OK;
+    }
+    moqr_refuse_reason_t reason = MOQR_REFUSE_NS_NODES;
+    return r_room_check(c, false, missing, missing_bytes, deep, &reason);
+}
 
 moqr_result_t
 moqr_core_announce(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns)
@@ -2585,6 +3308,24 @@ moqr_core_announce_ex(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     }
     if (!intent_space(c, need)) {
         return MOQR_ERR_WOULD_BLOCK;
+    }
+
+    /* The nodes and name bytes this announce would add. When they are not
+     * free, make room before anything is created, keeping the deepest
+     * existing node of this namespace's path (every shallower one is an
+     * ancestor with a child). WOULD_BLOCK and CAPACITY leave state untouched. */
+    {
+        uint32_t deep = 0;
+        uint32_t missing = 0;
+        uint64_t missing_bytes = 0;
+        announce_need(c, ns, &deep, &missing, &missing_bytes);
+        if (missing != 0) {
+            moqr_result_t rrc =
+                r_make_room(c, false, missing, missing_bytes, &deep);
+            if (rrc != MOQR_OK) {
+                return rrc;
+            }
+        }
     }
 
     uint32_t node = 0;
@@ -2647,6 +3388,7 @@ moqr_core_unannounce(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns)
     }
     uint64_t ann_session_cookie = c->nodes[node].session_cookie;
     c->nodes[node].has_announce = false;
+    r_room_changed(c);
     r_bump_route_epoch(c);
     r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 0, node, bslot, 0, 0);
     for (uint32_t s = 0; s < c->max_ns_subs; s++) {
@@ -2832,8 +3574,7 @@ moqr_core_force_withdraw(moqr_core_t *c, moqr_ns_t ns, uint64_t request_error,
             r_fetch_t *f = &c->fetches[fi];
             if ((f->gen & 1u) != 0 && f->track == ti &&
                 f->track_gen_slot == tgen) {
-                fetch_unpin(c, f);
-                f->gen++;   /* odd -> even: invalidate the cursor handle */
+                fetch_retire(c, f);   /* invalidate the cursor handle */
             }
         }
         /* Release the upstream subscription: without this the binding's
@@ -2868,6 +3609,7 @@ moqr_core_force_withdraw(moqr_core_t *c, moqr_ns_t ns, uint64_t request_error,
 
     /* Clear the announce (bypass the owner check) + NS_GONE fan-out. */
     c->nodes[node].has_announce = false;
+    r_room_changed(c);
     r_bump_route_epoch(c);
     r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 0 /* announce */, node, ann_bslot, 0, 0);
     for (uint32_t si = 0; si < c->max_ns_subs; si++) {
@@ -2907,13 +3649,13 @@ moqr_core_force_withdraw(moqr_core_t *c, moqr_ns_t ns, uint64_t request_error,
     return MOQR_OK;
 }
 
-/* Collect announces under a subtree matching a new ns-sub (recursive). */
+/* Collect announces under the new ns-sub's prefix node (recursive).
+ * Counting needs no allocated subscription prefix. */
 static void
 nsub_fanout_existing(moqr_core_t *c, const r_ns_sub_t *nsub, uint32_t node,
                      bool counting, uint32_t *count)
 {
-    if (c->nodes[node].has_announce &&
-        prefix_matches_node(c, nsub, node)) {
+    if (c->nodes[node].has_announce) {
         if (counting) {
             (*count)++;
         } else {
@@ -2924,9 +3666,9 @@ nsub_fanout_existing(moqr_core_t *c, const r_ns_sub_t *nsub, uint32_t node,
             it->value = key_rd32(nsub->prefix);
         }
     }
-    for (uint32_t i = 0; i < c->nodes[node].child_count; i++) {
-        nsub_fanout_existing(c, nsub, c->nodes[node].children[i], counting,
-                             count);
+    for (uint32_t k = c->nodes[node].first_child; k != R_NODE_NIL;
+         k = c->nodes[k].next_sib) {
+        nsub_fanout_existing(c, nsub, k, counting, count);
     }
 }
 
@@ -2953,13 +3695,24 @@ moqr_core_ns_subscribe(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t prefix,
         return r_refuse(c, MOQR_REFUSE_NS_SUBS);
     }
 
+    /* Reserve fan-out before reclaiming cache or allocating the prefix. */
+    uint32_t node = trie_walk(c, prefix);
+    uint32_t need = 0;
+    if (node != UINT32_MAX) {
+        nsub_fanout_existing(c, NULL, node, /*counting=*/true, &need);
+    }
+    if (!intent_space(c, need)) {
+        return MOQR_ERR_WOULD_BLOCK;
+    }
+
     /* Build the prefix buffer (key layout without name). */
     uint32_t plen = 4u * (1u + (uint32_t)prefix.count);
     for (size_t i = 0; i < prefix.count; i++) {
         plen += (uint32_t)prefix.parts[i].len;
     }
-    if (c->intern_used + plen > c->intern_budget) {
-        return r_refuse(c, MOQR_REFUSE_NAME_BYTES);
+    moqr_result_t mrc = r_make_room(c, false, 0, plen, NULL);
+    if (mrc != MOQR_OK) {
+        return mrc;
     }
     uint8_t *pbuf = r_alloc(c, plen);
     if (pbuf == NULL) {
@@ -2983,18 +3736,17 @@ moqr_core_ns_subscribe(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t prefix,
     probe.prefix = pbuf;
     probe.prefix_len = plen;
 
-    uint32_t need = 0;
-    nsub_fanout_existing(c, &probe, 0, /*counting=*/true, &need);
-    if (!intent_space(c, need)) {
-        r_free(c, pbuf, plen);
-        return MOQR_ERR_WOULD_BLOCK;
-    }
     c->ns_subs[slot] = probe;
     c->ns_subs[slot].used = true;
     c->intern_used += plen;
     r_bump_route_epoch(c);
     r_trace(c, MOQR_TRACE_ROUTE_ADD, 2 /* ns_sub */, slot, bslot, cookie, 0);
-    nsub_fanout_existing(c, &c->ns_subs[slot], 0, /*counting=*/false, NULL);
+    /* Reclaim may have compacted the trie; re-resolve its prefix node. */
+    node = trie_walk(c, prefix);
+    if (node != UINT32_MAX) {
+        nsub_fanout_existing(c, &c->ns_subs[slot], node, /*counting=*/false,
+                             NULL);
+    }
     return MOQR_OK;
 }
 
@@ -3015,6 +3767,7 @@ moqr_core_ns_unsubscribe(moqr_core_t *c, moqr_binding_t bh, uint64_t cookie)
             s->cookie == cookie) {
             c->intern_used -= s->prefix_len;
             r_free(c, s->prefix, s->prefix_len);
+            r_room_changed(c);
             memset(s, 0, sizeof(*s));
             r_bump_route_epoch(c);
             r_trace(c, MOQR_TRACE_ROUTE_REMOVE, 2, i, bslot, cookie, 0);
@@ -3043,7 +3796,7 @@ static uint32_t
 sub_slot_find(moqr_core_t *c)
 {
     for (uint32_t i = 0; i < c->max_subs; i++) {
-        if ((c->subs[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->subs[i].gen)) {
             return i;
         }
     }
@@ -3084,19 +3837,14 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         return MOQR_ERR_WOULD_BLOCK;
     }
 
-    r_key_t key = { NULL, 0 };
-    moqr_result_t rc = key_build(c, req->ns, req->name, &key);
-    if (rc != MOQR_OK) {
-        return rc;
-    }
-    uint64_t hash = key_hash(&key);
-    uint32_t tslot = track_find(c, &key, hash);
+    uint64_t hash = 0;
+    uint32_t tslot = track_lookup(c, req->ns, req->name, &hash);
+    moqr_result_t rc;
 
     if (tslot == UINT32_MAX) {
         /* New track: needs an announced publisher. */
         uint32_t pub_node = trie_longest_announce(c, req->ns);
         if (pub_node == UINT32_MAX) {
-            key_release(c, &key);
             moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_SUB);
             it->binding_cookie = b->cookie;
             it->cookie = req->cookie;
@@ -3105,14 +3853,15 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         }
         uint32_t sslot = sub_slot_find(c);
         if (sslot == UINT32_MAX) {
-            key_release(c, &key);
             return r_refuse(c, MOQR_REFUSE_SUBS);
         }
-        rc = track_create(c, &key, hash, &tslot);
+        rc = track_create(c, req->ns, req->name, hash, &tslot);
         if (rc != MOQR_OK) {
-            key_release(c, &key);
             return rc;
         }
+        /* Making room may have compacted the trie; announced nodes are
+         * never freed, only moved, so look the publisher up again. */
+        pub_node = trie_longest_announce(c, req->ns);
         r_track_t *t = &c->tracks[tslot];
         t->state = R_TRACK_PENDING;
         t->source_kind = R_TRACK_SOURCE_PULL;
@@ -3120,12 +3869,12 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         t->has_upstream_binding = true;
         t->up_binding = c->nodes[pub_node].ann_binding;
         t->up_binding_gen = c->nodes[pub_node].ann_binding_gen;
-        t->src_ann_node = pub_node;
+        track_src_set(c, t, pub_node);
         t->src_ann_binding = c->nodes[pub_node].ann_binding;
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
 
         r_sub_t *s = &c->subs[sslot];
-        uint32_t gen = s->gen + 1;
+        uint32_t gen = r_gen_open(s->gen);
         memset(s, 0, sizeof(*s));
         s->gen = gen;
         s->binding = bslot;
@@ -3144,7 +3893,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         s->end_group = req->filter.end_group_delta;   /* delta until resolve */
         rc = gpos_alloc(c, s, t->log);
         if (rc != MOQR_OK) {
-            s->gen++;
+            s->gen = r_gen_close(s->gen);
             track_free_slot(c, tslot);
             return rc;
         }
@@ -3162,14 +3911,13 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     }
 
     /* Existing track. */
-    key_release(c, &key);
     r_track_t *t = &c->tracks[tslot];
     uint32_t sslot = sub_slot_find(c);
     if (sslot == UINT32_MAX) {
         return r_refuse(c, MOQR_REFUSE_SUBS);
     }
     r_sub_t *s = &c->subs[sslot];
-    uint32_t gen = s->gen + 1;
+    uint32_t gen = r_gen_open(s->gen);
     memset(s, 0, sizeof(*s));
     s->gen = gen;
     s->binding = bslot;
@@ -3182,7 +3930,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     s->cookie = req->cookie;
     moqr_result_t crc = gpos_alloc(c, s, t->log);
     if (crc != MOQR_OK) {
-        s->gen++;
+        s->gen = r_gen_close(s->gen);
         return crc;
     }
     sub_list_push(c, bslot, sslot);
@@ -3222,7 +3970,7 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
             t->has_upstream_binding = true;
             t->up_binding = c->nodes[pub_node].ann_binding;
             t->up_binding_gen = c->nodes[pub_node].ann_binding_gen;
-            t->src_ann_node = pub_node;
+            track_src_set(c, t, pub_node);
             t->src_ann_binding = c->nodes[pub_node].ann_binding;
             t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
             moqr_intent_t *up = intent_push(c,
@@ -3563,6 +4311,8 @@ moqr_core_upstream_error(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
         track_free_slot(c, tslot);
     } else {
         t->state = R_TRACK_WARM;
+        track_touch(c, tslot);   /* source released: last use */
+        r_room_changed(c);
     }
     return MOQR_OK;
 }
@@ -3611,6 +4361,8 @@ moqr_core_upstream_cancel(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
         track_free_slot(c, tslot);
     } else {
         t->state = R_TRACK_WARM;
+        track_touch(c, tslot);   /* source released: last use */
+        r_room_changed(c);
     }
     return MOQR_OK;
 }
@@ -3629,11 +4381,11 @@ track_set_push_source(moqr_core_t *c, r_track_t *t, moqr_ns_t ns, uint32_t bslot
     uint32_t node = trie_longest_announce(c, ns);
     if (node != UINT32_MAX && c->nodes[node].ann_binding == bslot &&
         c->nodes[node].ann_binding_gen == bgen) {
-        t->src_ann_node = node;
+        track_src_set(c, t, node);
         t->src_ann_binding = bslot;
         t->src_ann_binding_gen = bgen;
     } else {
-        t->src_ann_node = UINT32_MAX;
+        track_src_set(c, t, UINT32_MAX);
     }
 }
 
@@ -3653,15 +4405,10 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     if (!intent_space(c, 1)) {
         return MOQR_ERR_WOULD_BLOCK;
     }
-    r_key_t key = { NULL, 0 };
-    moqr_result_t rc = key_build(c, ns, name, &key);
-    if (rc != MOQR_OK) {
-        return rc;
-    }
-    uint64_t hash = key_hash(&key);
-    uint32_t tslot = track_find(c, &key, hash);
+    uint64_t hash = 0;
+    uint32_t tslot = track_lookup(c, ns, name, &hash);
+    moqr_result_t rc;
     if (tslot != UINT32_MAX) {
-        key_release(c, &key);
         r_track_t *t = &c->tracks[tslot];
         if (t->state != R_TRACK_WARM) {
             moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_PUBLISH);
@@ -3679,8 +4426,23 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         if (!intent_space(c, old_subs + 1u)) {
             return MOQR_ERR_WOULD_BLOCK;
         }
+        /* The new generation normally keeps the slot. A slot on its last
+         * live generation cannot renew; the new source then moves to another
+         * slot, found (or reclaimed) before anything changes, and when none
+         * exists the publish is refused with the retained track untouched.
+         * The slot on its last generation is never a reclaim candidate for a
+         * slot, so making room cannot free the track being replaced. */
+        bool renew = r_gen_renewable(t->gen);
+        uint32_t dst = tslot;
+        if (!renew) {
+            rc = r_make_room(c, true, 0, 0, NULL);
+            if (rc != MOQR_OK) {
+                return rc;
+            }
+            dst = track_free_slot_find(c);
+        }
         moqr_log_t *new_log = NULL;
-        rc = track_make_log(c, tslot, &new_log);
+        rc = track_make_log(c, dst, &new_log);
         if (rc != MOQR_OK) {
             return rc;
         }
@@ -3705,7 +4467,23 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
             }
             i = next;
         }
-        track_replace_retained_generation(c, tslot, new_log);
+        if (renew) {
+            track_replace_retained_generation(c, tslot, new_log);
+            track_touch(c, tslot);
+        } else {
+            /* The name moves with its interned key (no new bytes charged);
+             * the old slot retires and every handle to it goes stale. */
+            r_key_t key = t->key;
+            uint64_t thash = t->hash;
+            uint32_t source_gen = t->track_gen;
+            t->key = (r_key_t){ NULL, 0 };
+            track_fetch_invalidate(c, tslot, old_track_gen);
+            track_free_slot(c, tslot);
+            track_install(c, dst, key, thash, new_log);
+            tslot = dst;
+            t = &c->tracks[tslot];
+            t->track_gen = source_gen;
+        }
         t->state = R_TRACK_ACTIVE;
         t->source_kind = R_TRACK_SOURCE_PUSH;
         t->track_gen++;
@@ -3721,9 +4499,8 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         *out = it->track;
         return MOQR_OK;
     }
-    rc = track_create(c, &key, hash, &tslot);
+    rc = track_create(c, ns, name, hash, &tslot);
     if (rc != MOQR_OK) {
-        key_release(c, &key);
         return rc;
     }
     r_track_t *t = &c->tracks[tslot];
@@ -3989,13 +4766,7 @@ moqr_core_track_status(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     if (!intent_space(c, 1)) {
         return MOQR_ERR_WOULD_BLOCK;
     }
-    r_key_t key = { NULL, 0 };
-    moqr_result_t rc = key_build(c, ns, name, &key);
-    if (rc != MOQR_OK) {
-        return rc;
-    }
-    uint32_t tslot = track_find(c, &key, key_hash(&key));
-    key_release(c, &key);
+    uint32_t tslot = track_lookup(c, ns, name, NULL);
     if (tslot == UINT32_MAX) {
         moqr_intent_t *it = intent_push(c, MOQR_INTENT_TRACK_STATUS_ERROR);
         it->binding_cookie = b->cookie;
@@ -4199,6 +4970,8 @@ moqr_core_tick(moqr_core_t *c, uint64_t now_us)
             t->source_kind = R_TRACK_SOURCE_NONE;
             t->track_gen++;
             t->state = R_TRACK_WARM;
+            track_touch(c, i);   /* source released: last use */
+            r_room_changed(c);
         }
         if (t->state == R_TRACK_WARM && track_sub_count(c, i) == 0 &&
             track_fetch_count(c, i) == 0) {
@@ -4206,10 +4979,64 @@ moqr_core_tick(moqr_core_t *c, uint64_t now_us)
             moqr_log_get_stats(t->log, &ls);
             if (ls.record_count == 0) {
                 track_free_slot(c, i);
+                continue;
+            }
+        }
+        /* Idle retention: the first tick that finds a track reclaimable arms
+         * its clock; a later tick at least warm_idle_us after that frees it.
+         * Arming at a tick, not at the interest change, keeps the bound
+         * conservative (never early) across calls that carry no clock. */
+        if (!track_reclaimable(c, i)) {
+            t->idle_since_us = 0;
+        } else if (c->warm_idle_us != UINT64_MAX) {
+            if (t->idle_since_us == 0) {
+                t->idle_since_us = now_us != 0 ? now_us : 1;   /* armed */
+            } else if (now_us >= t->idle_since_us &&
+                       now_us - t->idle_since_us >= c->warm_idle_us) {
+                track_reclaim(c, i, R_RECLAIM_IDLE);
             }
         }
     }
     return MOQR_OK;
+}
+
+uint64_t
+moqr_core_room_epoch(const moqr_core_t *c)
+{
+    return c != NULL ? c->room_epoch : 0;
+}
+
+uint64_t
+moqr_core_next_deadline_us(const moqr_core_t *c)
+{
+    if (c == NULL) {
+        return UINT64_MAX;
+    }
+    uint64_t dl = UINT64_MAX;
+    for (uint32_t i = 0; i < c->max_tracks; i++) {
+        const r_track_t *t = &c->tracks[i];
+        if ((t->gen & 1u) == 0) {
+            continue;
+        }
+        if (t->state == R_TRACK_ACTIVE &&
+            t->source_kind == R_TRACK_SOURCE_PULL &&
+            t->linger_deadline_us != 0 && t->linger_deadline_us < dl &&
+            track_sub_count(c, i) == 0) {
+            dl = t->linger_deadline_us;
+        }
+        if (c->warm_idle_us != UINT64_MAX && track_reclaimable(c, i)) {
+            if (t->idle_since_us == 0) {
+                return 0;   /* the next tick arms its idle clock */
+            }
+            uint64_t due = t->idle_since_us > UINT64_MAX - c->warm_idle_us
+                               ? UINT64_MAX
+                               : t->idle_since_us + c->warm_idle_us;
+            if (due < dl) {
+                dl = due;
+            }
+        }
+    }
+    return dl;
 }
 
 /* -- delivery --------------------------------------------------------------------------------------------- */
@@ -5200,7 +6027,7 @@ static uint32_t
 fetch_slot_find(moqr_core_t *c)
 {
     for (uint32_t i = 0; i < c->max_fetches; i++) {
-        if ((c->fetches[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->fetches[i].gen)) {
             return i;
         }
     }
@@ -5316,14 +6143,7 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
         return MOQR_ERR_UNSUPPORTED;
     }
 
-    r_key_t key = { NULL, 0 };
-    moqr_result_t rc = key_build(c, req->ns, req->name, &key);
-    if (rc != MOQR_OK) {
-        return rc;
-    }
-    uint64_t hash = key_hash(&key);
-    uint32_t tslot = track_find(c, &key, hash);
-    key_release(c, &key);
+    uint32_t tslot = track_lookup(c, req->ns, req->name, NULL);
 
     if (tslot == UINT32_MAX) {
         out_plan->admit = MOQR_FETCH_REJECT;
@@ -5403,13 +6223,15 @@ moqr_core_fetch_open(moqr_core_t *c, moqr_binding_t bh,
         return r_refuse(c, MOQR_REFUSE_FETCHES);
     }
     r_fetch_t *f = &c->fetches[fslot];
-    uint32_t gen = f->gen + 1;   /* even -> odd */
+    uint32_t gen = r_gen_open(f->gen);
     memset(f, 0, sizeof(*f));
     f->gen = gen;
     f->binding = bslot;
     f->binding_gen = b->gen;
     f->track = tslot;
     f->track_gen_slot = t->gen;
+    t->fetch_count++;
+    track_touch(c, tslot);
     f->cookie = req->cookie;
     f->start_group = req->start_group;
     f->start_object = req->start_object;
@@ -5669,8 +6491,12 @@ moqr_core_fetch_close(moqr_core_t *c, moqr_fetch_t fh)
     if (f == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
-    fetch_unpin(c, f);
-    f->gen++;   /* odd -> even: invalidate the handle */
+    bool same_track = f->track < c->max_tracks &&
+                      c->tracks[f->track].gen == f->track_gen_slot;
+    fetch_retire(c, f);   /* invalidate the handle */
+    if (same_track) {
+        track_touch(c, f->track);   /* the reader leaves: last use */
+    }
     return MOQR_OK;
 }
 
@@ -5785,6 +6611,8 @@ moqr_core_upstream_lost(moqr_core_t *c, moqr_track_t th, uint64_t track_gen)
         track_free_slot(c, tslot);
     } else {
         t->state = R_TRACK_WARM;
+        track_touch(c, tslot);   /* source released: last use */
+        r_room_changed(c);
     }
     return MOQR_OK;
 }
@@ -5856,6 +6684,8 @@ moqr_core_source_done(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
         track_free_slot(c, tslot);
     } else {
         t->state = R_TRACK_WARM;
+        track_touch(c, tslot);   /* source released: last use */
+        r_room_changed(c);
     }
     return MOQR_OK;
 }
@@ -6082,9 +6912,15 @@ moqr_core_get_stats(const moqr_core_t *c, moqr_core_stats_t *out)
         }
     }
     out->evicted_total = c->evicted_freed;
+    out->tracks_evicted_capacity = c->tracks_evicted_capacity;
+    out->tracks_evicted_idle = c->tracks_evicted_idle;
+    out->ns_nodes_reclaimed = c->ns_nodes_reclaimed;
     for (uint32_t i = 0; i < c->max_tracks; i++) {
         if ((c->tracks[i].gen & 1u) != 0) {
             out->tracks++;
+            if (track_reclaimable(c, i)) {
+                out->tracks_reclaimable++;
+            }
             moqr_log_stats_t ls;
             moqr_log_get_stats(c->tracks[i].log, &ls);
             out->retained_bytes += ls.retained_bytes;
@@ -6097,6 +6933,7 @@ moqr_core_get_stats(const moqr_core_t *c, moqr_core_stats_t *out)
         }
     }
     out->ns_nodes = c->node_count;
+    out->ns_nodes_reclaimable = trie_reclaimable_count(c);
     out->ingested_total = c->ingested_total;
     out->delivered_total = c->delivered_total;
     out->evict_sweeps = c->evict_sweeps;
@@ -6229,8 +7066,8 @@ parked_free_slot(moqr_core_t *c, uint32_t slot)
     r_free_material(c, &p->mat, &c->parked_bytes_used);
     uint32_t gen = p->gen;
     memset(p, 0, sizeof(*p));
-    p->gen = gen + 1u; /* even = free; internal slot liveness only — external
-                        * ticket reuse is the verifier's contract (see relay.h) */
+    p->gen = r_gen_close(gen); /* internal slot liveness only — external ticket
+                                * reuse is the verifier's contract (see relay.h) */
 }
 
 /* Live (odd-gen) parked slot holding external ticket `t`, or -1. */
@@ -6264,7 +7101,7 @@ moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req, uint64_t ext_ticket,
     }
     int slot = -1;
     for (uint32_t i = 0; i < c->max_parked; i++) {
-        if ((c->parked[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->parked[i].gen)) {
             slot = (int)i;
             break;
         }
@@ -6279,9 +7116,9 @@ moqr_core_park(moqr_core_t *c, const moqr_park_req_t *req, uint64_t ext_ticket,
         return rc; /* INVAL / CAPACITY / NOMEM: fail closed, no state change */
     }
     r_parked *p = &c->parked[slot];
-    uint32_t  gen = p->gen; /* even (free) */
+    uint32_t  gen = p->gen;
     memset(p, 0, sizeof(*p));
-    p->gen = gen + 1u; /* odd = live */
+    p->gen = r_gen_open(gen);
     p->ext_ticket = ext_ticket;
     p->binding_cookie = req->binding_cookie;
     p->session_cookie = req->session_cookie;
@@ -6410,7 +7247,7 @@ grant_free_slot(moqr_core_t *c, uint32_t slot)
     r_free_material(c, &g->mat, &c->grant_bytes_used);
     uint32_t gen = g->gen;
     memset(g, 0, sizeof(*g));
-    g->gen = gen + 1u; /* even = free */
+    g->gen = r_gen_close(gen);
 }
 
 moqr_result_t
@@ -6435,7 +7272,7 @@ moqr_core_grant_reserve(moqr_core_t *c, const moqr_park_req_t *req,
     }
     int slot = -1;
     for (uint32_t i = 0; i < c->max_grants; i++) {
-        if ((c->grants[i].gen & 1u) == 0) {
+        if (r_gen_openable(c->grants[i].gen)) {
             slot = (int)i;
             break;
         }
@@ -6450,9 +7287,9 @@ moqr_core_grant_reserve(moqr_core_t *c, const moqr_park_req_t *req,
         return rc; /* INVAL / CAPACITY / NOMEM: fail closed, no state change */
     }
     r_grant *g = &c->grants[slot];
-    uint32_t gen = g->gen; /* even (free) */
+    uint32_t gen = g->gen;
     memset(g, 0, sizeof(*g));
-    g->gen = gen + 1u;      /* odd = live, but committed=false (reserved) */
+    g->gen = r_gen_open(gen);      /* live, but committed=false (reserved) */
     g->binding_cookie = req->binding_cookie;
     g->session_cookie = req->session_cookie;
     g->action = req->action;

@@ -7,7 +7,7 @@ import Foundation
 /// `.lossless` suspends in bounded sender-wait slices (Task-cancellable,
 /// never C BLOCK_TIMEOUT). ``endTrack(_:)`` returns once the reliable
 /// END_OF_TRACK marker is queued. Subscriber/demand events, removeTrack,
-/// convertToVOD, complete, and stats land in a later slice.
+/// convertToVOD, complete, and stats are not exposed here.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 public final class MediaSender: @unchecked Sendable {
 
@@ -140,7 +140,7 @@ public final class MediaSender: @unchecked Sendable {
         }
     }
 
-    /// The wiring the public attach uses once a backend exists (S6); tests
+    /// The wiring behind the public attach, parameterized by backend; tests
     /// drive it with scripted backends. Throws `.wrongState` when the
     /// endpoint already has a sender, `.closed` once it is shutting down.
     package static func attach(to endpoint: MoQEndpoint,
@@ -152,7 +152,7 @@ public final class MediaSender: @unchecked Sendable {
         let attachment = sender.attachment      /* NOT the sender: no cycle */
         try endpoint.engine.installPumpHook(
             kind: .sender,
-            run: { /* S5b: drain subscriber/demand events here */ },
+            run: { /* the sender has no per-pump work */ },
             teardown: { attachment.finalizeDetach() })
         return sender
     }

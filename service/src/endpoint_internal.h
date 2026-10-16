@@ -25,6 +25,8 @@ typedef struct moq_endpoint_resolved {
     moq_bytes_t sni;                     /* cfg->sni, or url host */
     moq_bytes_t wt_path;                 /* WEBTRANSPORT only (else empty):
                                             cfg->wt_path, or url path, or "/moq" */
+    moq_bytes_t wt_query;                /* URL query including "?", unless
+                                            wt_path was explicitly supplied */
     moq_version_policy_t policy;
     moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
     size_t        version_count;
@@ -38,6 +40,17 @@ typedef struct moq_endpoint_resolved {
      * the picoquic backends -- resolve rejects a non-zero value on any backend
      * that cannot apply it. */
     uint64_t      handshake_timeout_us;
+    /* SETUP authorization tokens, struct_size-gated and validated at resolve;
+     * BORROWED from the cfg. Only the picoquic backend carries them. */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t        setup_auth_token_count;
+    /* Application certificate trust, struct_size-gated at resolve as one pair
+     * (see moq_endpoint_cfg_t): both NULL when the cfg predates the callback
+     * or supplies none; the caller's fn/ctx only when the pair is fully
+     * covered, no other trust authority is configured, and the selected
+     * backend and provider can honour it. */
+    moq_tls_certificate_verify_fn verify_certificate;
+    void                         *verify_certificate_ctx;
 } moq_endpoint_resolved_t;
 
 /*

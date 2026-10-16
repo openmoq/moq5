@@ -93,6 +93,26 @@ static moq_result_t d18_maybe_complete(moq_session_t *s)
     return MOQ_OK;
 }
 
+/* Encode this side's SETUP into `w`: the auth-token cache size when
+ * configured (§10.3.1.3) so the peer may register aliases, and the configured
+ * authorization tokens by value (§10.3.1.4). */
+static moq_result_t d18_encode_own_setup(moq_session_t *s, moq_buf_writer_t *w)
+{
+    moq_d18_setup_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    if (s->send_auth_token_cache_size) {
+        opts.has_max_auth_token_cache_size = true;
+        opts.max_auth_token_cache_size = s->auth_token_cache_size;
+    }
+    for (size_t i = 0; i < s->setup_token_count; i++) {
+        opts.auth_tokens[i].alias_type = MOQ_AUTH_TOKEN_USE_VALUE;
+        opts.auth_tokens[i].token_type = s->setup_tokens[i].token_type;
+        opts.auth_tokens[i].token_value = s->setup_tokens[i].token_value;
+    }
+    opts.auth_token_count = s->setup_token_count;
+    return moq_d18_encode_setup_opts(w, &opts);
+}
+
 /*
  * Draft-18 start is valid for both client and server: each opens its own
  * unidirectional control channel and sends SETUP without waiting for the peer.
@@ -103,22 +123,25 @@ static moq_result_t d18_start(moq_session_t *s)
     if (s->state != MOQ_SESS_IDLE)
         return MOQ_ERR_WRONG_STATE;
 
-    uint8_t buf[32];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-    /* Advertise the auth-token cache size when configured (§10.3.1.3) so the
-     * peer may register aliases; no other Setup Option is sourced yet. */
-    moq_d18_setup_opts_t opts;
-    memset(&opts, 0, sizeof(opts));
-    if (s->send_auth_token_cache_size) {
-        opts.has_max_auth_token_cache_size = true;
-        opts.max_auth_token_cache_size = s->auth_token_cache_size;
+    size_t cap = 32;
+    for (size_t i = 0; i < s->setup_token_count; i++)
+        cap += s->setup_tokens[i].token_value.len + 32u;
+    uint8_t stack_buf[32];
+    uint8_t *buf = stack_buf;
+    if (cap > sizeof(stack_buf)) {
+        buf = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+        if (!buf) return MOQ_ERR_NOMEM;
     }
-    moq_result_t rc = moq_d18_encode_setup_opts(&w, &opts);
-    if (rc < 0) return rc;
-
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, cap);
+    moq_result_t rc = d18_encode_own_setup(s, &w);
     moq_stream_ref_t ref = moq_stream_ref_from_u64(s->next_stream_ref);
-    rc = queue_open_uni_control(s, ref, buf, moq_buf_writer_offset(&w));
+    if (rc == MOQ_OK)
+        rc = queue_open_uni_control(s, ref, buf, moq_buf_writer_offset(&w));
+    if (buf != stack_buf) {
+        session_wipe(buf, cap);   /* the encoded SETUP carries the tokens */
+        s->alloc.free(buf, cap, s->alloc.ctx);
+    }
     if (rc < 0) return rc;
     s->next_stream_ref++;
 
@@ -146,12 +169,17 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
 
     /* Decode the Setup Options (§10.3.1): unknown options are skipped, a
      * duplicate known non-repeatable option / over-cap length closes 0x3, a
-     * malformed token structure closes 0x6. */
+     * malformed token structure closes 0x6, and more tokens than this side
+     * holds closes with the local-capacity INTERNAL_ERROR (0x1), as on
+     * draft-16: the peer broke no rule. */
     moq_d18_setup_opts_t opts;
     moq_result_t orc = moq_d18_decode_setup_opts(env->payload, env->payload_len,
                                                  &opts);
     if (orc == MOQ_D18_ERR_KVP_FORMAT)
         return close_with_error(s, 0x6, "malformed auth token structure");
+    if (orc == MOQ_ERR_BUFFER)
+        return close_with_error(s, 0x1,
+            "SETUP has more authorization tokens than this side holds");
     if (orc < 0)
         return close_with_error(s, 0x3, "malformed SETUP options");
 
@@ -221,10 +249,9 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
     if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
     if (reject_code != 0) {
         /* There is no request to reject at SETUP time: an unusable token here
-         * is a session error. A request-level MALFORMED_AUTH_TOKEN (0x4 --
-         * semantically invalid or duplicate resolved value) maps to the
-         * MALFORMED_AUTH_TOKEN session error (0x16); anything else keeps the
-         * generic formatting close. */
+         * is a session error. A request-level MALFORMED_AUTH_TOKEN (0x4 -- a
+         * duplicate resolved value) maps to the MALFORMED_AUTH_TOKEN session
+         * error (0x16); anything else keeps the generic formatting close. */
         process_auth_tokens_free_staging(s, resolved, staged, token_count);
         process_auth_tokens_abort_txn(s, &txn);
         if (reject_code == 0x4)
@@ -1391,6 +1418,73 @@ static moq_result_t d18_process_request_stream(
         }
     }
 
+    /* An established publisher-side SUBSCRIBE bidi carries only a
+     * REQUEST_UPDATE (GOAWAY was handled above). It consumes a fresh peer
+     * request id; the response correlates by the stream, so the target is the
+     * committed slot, not a by-id lookup. Handle it definitively here, before
+     * the first-message branches, so a peer cannot send a second SUBSCRIBE or
+     * another initial-request message on the established bidi and overwrite or
+     * re-key the live subscription slot. */
+    if (s->subs[slot].state != MOQ_SUB_RECVING_REQUEST) {
+        if (env.msg_type != MOQ_D18_REQUEST_UPDATE ||
+            s->subs[slot].state != MOQ_SUB_ESTABLISHED ||
+            s->subs[slot].role != MOQ_SUB_ROLE_PUBLISHER)
+            return close_with_error(s, 0x3,
+                "unexpected message on subscribe request bidi");
+
+        moq_d18_request_update_t u;
+        rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
+        if (rc == MOQ_D18_ERR_KVP_FORMAT)
+            return close_with_error(s, 0x6, "malformed auth token structure");
+        if (rc < 0)
+            return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
+
+        moq_request_endpoint_t ep;
+        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
+                                                 u.request_id, &ep);
+        if (rc < 0)
+            return rc;
+        if (s->state == MOQ_SESS_CLOSED)
+            return MOQ_OK;
+
+        moq_decoded_request_update_t d;
+        memset(&d, 0, sizeof(d));
+        d.endpoint = ep;
+        d.request_id = u.request_id;
+        d.target_kind = MOQ_REQ_SUBSCRIPTION;
+        d.target_slot = slot;
+        d.has_forward = u.params.has_forward;
+        d.forward = u.params.forward != 0;
+        d.has_subscriber_priority = u.params.has_subscriber_priority;
+        d.subscriber_priority = u.params.subscriber_priority;
+        d.has_filter = u.params.has_filter;
+        d.filter_type = u.params.filter_type;
+        d.start_group = u.params.filter_start_group;
+        d.start_object = u.params.filter_start_object;
+        d.end_group = u.params.filter_end_group;
+        D18_FILL_DT(&d, &u.params);
+        (void)d18_map_delivery_timeout(&u.params, &d.has_delivery_timeout,
+                                       &d.delivery_timeout_us);
+        d.has_new_group_request = u.params.has_new_group_request;
+        d.new_group_request = u.params.new_group_request;
+
+        rc = d18_resolve_auth_tokens(s, &u.params, d.tokens, &d.token_count,
+                                     d.token_staged, &d.auth_txn,
+                                     &d.auth_reject_code);
+        if (rc < 0)
+            return rc;            /* NOMEM */
+        if (s->state == MOQ_SESS_CLOSED)
+            return MOQ_OK;        /* cache overflow / duplicate alias */
+
+        rc = session_core_on_request_update(s, &d);
+        if (rc < 0)
+            return rc;
+        if (s->state == MOQ_SESS_CLOSED)
+            return MOQ_OK;
+        *out_consumed = moq_buf_reader_offset(&r);
+        return MOQ_OK;
+    }
+
     /* The first message on a request stream is the request itself -- i.e. the
      * peer opening a NEW request. After our GOAWAY (§10.4) that is forbidden.
      * Messages on an already-committed bidi (GOAWAY / REQUEST_UPDATE /
@@ -1752,69 +1846,6 @@ static moq_result_t d18_process_request_stream(
         return MOQ_OK;
     }
 
-    /* REQUEST_UPDATE arrives on an established subscription's request bidi (the
-     * core passes the committed slot). It consumes a fresh peer request id; the
-     * response correlates by the stream, so the target is the slot, not a
-     * by-id lookup. It is not a valid first message on a fresh request bidi (a
-     * staging slot is still RECVING) -- accept it only once the subscription is
-     * established on the publisher side; otherwise it falls through to the
-     * unexpected-first-message close below. */
-    if (env.msg_type == MOQ_D18_REQUEST_UPDATE &&
-        s->subs[slot].state == MOQ_SUB_ESTABLISHED &&
-        s->subs[slot].role == MOQ_SUB_ROLE_PUBLISHER) {
-        moq_d18_request_update_t u;
-        rc = moq_d18_decode_request_update(env.payload, env.payload_len, &u);
-        if (rc == MOQ_D18_ERR_KVP_FORMAT)
-            return close_with_error(s, 0x6, "malformed auth token structure");
-        if (rc < 0)
-            return close_with_error(s, 0x3, "malformed REQUEST_UPDATE");
-
-        moq_request_endpoint_t ep;
-        rc = d18_validate_inbound_request_stream(s, ref, env.msg_type,
-                                                 u.request_id, &ep);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-
-        moq_decoded_request_update_t d;
-        memset(&d, 0, sizeof(d));
-        d.endpoint = ep;
-        d.request_id = u.request_id;
-        d.target_kind = MOQ_REQ_SUBSCRIPTION;
-        d.target_slot = slot;
-        d.has_forward = u.params.has_forward;
-        d.forward = u.params.forward != 0;
-        d.has_subscriber_priority = u.params.has_subscriber_priority;
-        d.subscriber_priority = u.params.subscriber_priority;
-        d.has_filter = u.params.has_filter;
-        d.filter_type = u.params.filter_type;
-        d.start_group = u.params.filter_start_group;
-        d.start_object = u.params.filter_start_object;
-        d.end_group = u.params.filter_end_group;
-        D18_FILL_DT(&d, &u.params);
-        (void)d18_map_delivery_timeout(&u.params, &d.has_delivery_timeout,
-                                       &d.delivery_timeout_us);
-        d.has_new_group_request = u.params.has_new_group_request;
-        d.new_group_request = u.params.new_group_request;
-
-        rc = d18_resolve_auth_tokens(s, &u.params, d.tokens, &d.token_count,
-                                     d.token_staged, &d.auth_txn,
-                                     &d.auth_reject_code);
-        if (rc < 0)
-            return rc;            /* NOMEM */
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;        /* cache overflow / duplicate alias */
-
-        rc = session_core_on_request_update(s, &d);
-        if (rc < 0)
-            return rc;
-        if (s->state == MOQ_SESS_CLOSED)
-            return MOQ_OK;
-        *out_consumed = moq_buf_reader_offset(&r);
-        return MOQ_OK;
-    }
-
     return close_with_error(s, 0x3, "unexpected first request message");
 }
 
@@ -1841,16 +1872,20 @@ static moq_result_t d18_encode_subscribe_ok(
     return moq_d18_encode_subscribe_ok(w, args->track_alias, &p, props);
 }
 
-/* REQUEST_ERROR encode. No request id (stream-correlated); retry_interval is 0
- * when retry is not offered. The optional Redirect structure (§10.6.1) is encoded
- * when args->has_redirect (an all-empty Redirect is valid). */
+/* REQUEST_ERROR encode. No request id (stream-correlated). The wire Retry
+ * Interval is "the minimum time (in milliseconds) before the request SHOULD be
+ * sent again, plus one. If the value is 0, the request SHOULD NOT be retried"
+ * (§10.6), so an offered retry of N ms is N + 1 on the wire and no retry is 0.
+ * The optional Redirect structure (§10.6.1) is encoded when args->has_redirect
+ * (an all-empty Redirect is valid). */
 static moq_result_t d18_encode_request_error(
     moq_session_t *s, struct moq_buf_writer *w,
     const struct moq_request_error_encode_args *args)
 {
     (void)s;
     moq_bytes_t reason = { args->reason, args->reason_len };
-    uint64_t retry = args->can_retry ? args->retry_after_ms : 0;
+    if (args->can_retry && args->retry_after_ms == UINT64_MAX) return MOQ_ERR_INVAL;
+    uint64_t retry = args->can_retry ? args->retry_after_ms + 1u : 0;
     if (args->has_redirect) {
         moq_d18_redirect_t rd = {
             .connect_uri     = { args->connect_uri, args->connect_uri_len },
@@ -2291,7 +2326,9 @@ static moq_result_t d18_process_response_stream(
         if (rc < 0)
             return close_with_error(s, 0x3, "malformed REQUEST_ERROR");
         size_t off = moq_buf_reader_offset(&r);
+        /* §10.6: wire Retry Interval = minimum milliseconds + 1; 0 = no retry. */
         bool can_retry = er.retry_interval != 0;
+        uint64_t retry_ms = can_retry ? er.retry_interval - 1u : 0;
 
         /* REDIRECT (§10.6) carries a Redirect tail and is valid only for SUBSCRIBE,
          * FETCH, TRACK_STATUS and PUBLISH_NAMESPACE here (SUBSCRIBE_NAMESPACE is on
@@ -2327,7 +2364,7 @@ static moq_result_t d18_process_response_stream(
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             /* Defer the free: the core drains the request stream's FIN. */
             rc = session_core_on_fetch_error(s, slot, er.error_code, can_retry,
-                er.retry_interval, er.reason.data, er.reason.len, false, redirect);
+                retry_ms, er.reason.data, er.reason.len, false, redirect);
         } else if (kind == (uint32_t)MOQ_REQ_ANNOUNCEMENT) {
             /* Terminal rejection of a pending PUBLISH_NAMESPACE. A REQUEST_ERROR
              * after the announcement is established is not a valid response. */
@@ -2341,7 +2378,7 @@ static moq_result_t d18_process_response_stream(
             d.target_slot = slot;
             d.error_code = er.error_code;
             d.can_retry = can_retry;
-            d.retry_after_ms = er.retry_interval;
+            d.retry_after_ms = retry_ms;
             d.reason = er.reason.data;
             d.reason_len = er.reason.len;
             rc = session_core_on_announcement_error(s, &d, redirect);
@@ -2350,7 +2387,7 @@ static moq_result_t d18_process_response_stream(
             if (off < len)
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             rc = session_core_on_track_status_error(s, slot, er.error_code,
-                can_retry, er.retry_interval, er.reason.data, er.reason.len,
+                can_retry, retry_ms, er.reason.data, er.reason.len,
                 redirect);
         } else if (kind == (uint32_t)MOQ_REQ_SUBSCRIBE_TRACKS) {
             /* Terminal first-response rejection of a pending SUBSCRIBE_TRACKS.
@@ -2361,7 +2398,7 @@ static moq_result_t d18_process_response_stream(
             if (off < len)
                 return close_with_error(s, 0x3, "extra bytes after REQUEST_ERROR");
             rc = session_core_on_subscribe_tracks_error(s, slot, er.error_code,
-                can_retry, er.retry_interval, er.reason.data, er.reason.len);
+                can_retry, retry_ms, er.reason.data, er.reason.len);
         } else if (kind == (uint32_t)MOQ_REQ_PUBLISH) {
             /* Terminal rejection of a pending outbound PUBLISH. REDIRECT is not
              * permitted here (excluded above). */
@@ -2373,7 +2410,7 @@ static moq_result_t d18_process_response_stream(
             /* Defer the free: the core drains the request stream's FIN and closes
              * our send half reciprocally. */
             rc = session_core_on_publish_error(s, slot, er.error_code, can_retry,
-                er.retry_interval, er.reason.data, er.reason.len, false);
+                retry_ms, er.reason.data, er.reason.len, false);
         } else if (s->subs[slot].state == MOQ_SUB_ESTABLISHED) {
             /* A REQUEST_ERROR on an established subscription is an update
              * failure: clear the pending update. The publisher must follow with
@@ -2393,7 +2430,7 @@ static moq_result_t d18_process_response_stream(
             d.target_slot = slot;
             d.error_code = er.error_code;
             d.can_retry = can_retry;
-            d.retry_after_ms = er.retry_interval;
+            d.retry_after_ms = retry_ms;
             d.reason = er.reason.data;
             d.reason_len = er.reason.len;
             rc = session_core_on_subscribe_error(s, &d, false, redirect);
@@ -3134,6 +3171,7 @@ static const moq_profile_ops_t d18_ops = {
     .process_request_stream  = d18_process_request_stream,
     .process_response_stream = d18_process_response_stream,
     .scan_delivery_timeouts  = d18_scan_delivery_timeouts_op,
+    .encode_own_setup        = d18_encode_own_setup,
     .scan_group_order        = d18_scan_group_order_op,
     .track_properties_put_group_order = d18_track_properties_put_group_order,
     .encode_subscribe        = d18_encode_subscribe,

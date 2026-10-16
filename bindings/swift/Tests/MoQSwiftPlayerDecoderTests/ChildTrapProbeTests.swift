@@ -4,36 +4,35 @@ import Testing
 @testable import MoQSwiftPlayerDecoders
 
 /*
- * 0259 findings 6 & 7 security regression for the extracted MoQSwiftPlayer
- * decoders. Every malformed-input assertion pins the post-fix behavior; these
- * pass against the fix and failed RED against the pre-fix decoders. Green rows
- * are valid/guarded controls; child-process rows carry attribution of the
- * pre-fix trap / wrong-layer disposition.
+ * Security regression for the extracted MoQSwiftPlayer decoders. Every
+ * malformed-input assertion pins the guarded behavior; an unguarded decoder
+ * fails them. Control rows are valid/guarded inputs; child-process rows
+ * attribute a trap or a wrong-layer disposition.
  *
- * Finding 6 (MOQ-SWIFTPLAYER-EMPTY-DECODER-POINTER): the avcC parser flattened
- * its parameter sets and force-unwrapped `flatBuf.baseAddress!`; the sample
- * path force-unwrapped `buf.baseAddress!`. Two failure modes:
+ * MOQ-SWIFTPLAYER-EMPTY-DECODER-POINTER: an avcC parser that flattens its
+ * parameter sets and force-unwraps `flatBuf.baseAddress!`, and a sample path
+ * that force-unwraps `buf.baseAddress!`, have two failure modes:
  *   1. a malformed-input / preflight defect -- empty and zero-count parameter
- *      sets, and an empty access unit, were NOT rejected before CoreMedia; they
- *      reached CoreMedia and surfaced a wrong-layer OSStatus
+ *      sets, and an empty access unit, that are not rejected before CoreMedia
+ *      reach it and surface a wrong-layer OSStatus
  *      (`formatDescriptionFailed`/`blockBufferFailed`) instead of a declared
- *      input error. The fix preflights and rejects them up front; and
+ *      input error. The decoder preflights and rejects them up front; and
  *   2. a latent optional force-unwrap hazard whose manifestation can vary
  *      across supported Apple toolchains/provenance (kept child-isolated).
- * The report's "deterministic macOS remote crash" is not reproduced on this
- * Apple toolchain (empty buffers gave non-NULL base addresses) and must be
- * corrected upstream; we do not fabricate a nil buffer or a trap.
+ * A deterministic crash is not reproduced on this Apple toolchain (empty
+ * buffers give non-NULL base addresses); the tests do not fabricate a nil
+ * buffer or a trap.
  *
- * Finding 7 (MOQ-SWIFTPLAYER-AAC-LENGTH-TRAP): `buildAACMagicCookie` writes
+ * MOQ-SWIFTPLAYER-AAC-LENGTH-TRAP: `buildAACMagicCookie` writes
  * each nested descriptor body via a direct `UInt8(...)`. The outer ES
  * descriptor body is `20 + ascLen`, the tightest one-byte field. Under the
- * ruled one-byte descriptor policy, ASC length 107 is the largest accepted
+ * one-byte descriptor policy, ASC length 107 is the largest accepted
  * (body == 0x7f) and 108 the first rejected -- and the decoder must reject an
  * oversized ASC BEFORE `AudioConverterNew`, which the converter-factory seam
  * makes load-bearing (zero factory calls on rejection).
  */
 
-@Suite("Player decoder trap probes (findings 6 & 7)")
+@Suite("Player decoder trap probes")
 struct ChildTrapProbeTests {
 
     // MARK: Child-process harness
@@ -154,10 +153,10 @@ struct ChildTrapProbeTests {
 
     /// The pre-CoreMedia rejection category for malformed avcC.
     private let malformedInputCategory = "malformedAVCC"
-    /// The category the fix emits for an empty access unit -- a distinct
+    /// The category the decoder emits for an empty access unit -- a distinct
     /// pre-CoreMedia input rejection (`VideoDecoderError.malformedInput`).
     private let emptyAccessUnitCategory = "malformedInput"
-    /// The category the fix emits for an oversized AAC codec config, distinct
+    /// The category the decoder emits for an oversized AAC codec config, distinct
     /// from a converter-creation failure (`AACConverterError.oversizedCodecConfig`).
     private let oversizedConfigCategory = "oversizedCodecConfig"
 
@@ -173,45 +172,45 @@ struct ChildTrapProbeTests {
         return "\(error)"
     }
 
-    // MARK: Finding 6 -- reject malformed input before CoreMedia
+    // MARK: avcC -- reject malformed input before CoreMedia
 
-    /// Green control: a genuine avcC decodes cleanly through the extraction.
+    /// Control: a genuine avcC decodes cleanly through the extraction.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Valid avcC decodes (behavior-neutral control)")
     func validAVCCDecodes() {
-        let r = runProbe("f6_valid")
+        let r = runProbe("video_valid")
         #expect(!r.trapped)
         #expect(r.category == "ok", "got \(r.category ?? "nil") / \(r.stdout)")
     }
 
-    /// Green control: a genuine NON-empty access unit builds a sample buffer
-    /// cleanly through the same `createSampleBuffer` path -- so the fix cannot
+    /// Control: a genuine NON-empty access unit builds a sample buffer
+    /// cleanly through the same `createSampleBuffer` path -- so the decoder cannot
     /// satisfy the empty-access-unit rejection below by rejecting every sample.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Valid non-empty access unit builds a sample buffer (control)")
     func validSampleBuilds() {
-        let r = runProbe("f6_valid_sample")
+        let r = runProbe("video_valid_sample")
         #expect(!r.trapped)
         #expect(r.category == "ok", "got \(r.category ?? "nil") / \(r.stdout)")
     }
 
-    /// Green control: a truncated avcC is already rejected as `malformedAVCC`
+    /// Control: a truncated avcC is already rejected as `malformedAVCC`
     /// before CoreMedia -- the shape every malformed case below must match.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Truncated avcC is rejected as malformedAVCC (control)")
     func truncatedAVCCRejected() {
-        let r = runProbe("f6_truncated")
+        let r = runProbe("video_truncated")
         #expect(!r.trapped)
         #expect(r.category == malformedInputCategory)
     }
 
     /// These malformed parameter-set shapes are rejected BEFORE CoreMedia
-    /// (`malformedAVCC`). Pre-fix they reached CoreMedia and surfaced
-    /// `formatDescriptionFailed` -- a wrong-layer failure -- so each failed RED.
+    /// (`malformedAVCC`). Reaching CoreMedia would surface
+    /// `formatDescriptionFailed` -- a wrong-layer failure -- and fail each case.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Malformed parameter sets are rejected before CoreMedia",
-          arguments: ["f6_zero_sps_count", "f6_zero_pps_count",
-                      "f6_zero_len_sps", "f6_zero_len_pps", "f6_all_empty"])
+          arguments: ["video_zero_sps_count", "video_zero_pps_count",
+                      "video_zero_len_sps", "video_zero_len_pps", "video_all_empty"])
     func malformedParamSetsRejectedPreCoreMedia(_ probeCase: String) {
         let r = runProbe(probeCase)
         #expect(!r.trapped, "\(probeCase): must not trap; got \(r.termination)")
@@ -220,22 +219,22 @@ struct ChildTrapProbeTests {
     }
 
     /// An empty access unit is rejected as a distinct pre-CoreMedia input
-    /// error, never a CoreMedia `blockBufferFailed` and never a trap. Pre-fix it
-    /// surfaced `blockBufferFailed` (wrong layer), so this failed RED.
+    /// error, never a CoreMedia `blockBufferFailed` (wrong layer) and never a
+    /// trap.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Empty access unit is a pre-CoreMedia input rejection")
     func emptyAccessUnitRejectedPreCoreMedia() {
-        let r = runProbe("f6_empty_access_unit")
+        let r = runProbe("video_empty_access_unit")
         #expect(!r.trapped)
         #expect(r.category != "blockBufferFailed",
                 "wrong-layer CoreMedia failure; want a pre-CoreMedia input rejection")
         #expect(r.category == emptyAccessUnitCategory,
-                "want declared future \(emptyAccessUnitCategory), got \(r.category ?? "nil")")
+                "want declared \(emptyAccessUnitCategory), got \(r.category ?? "nil")")
     }
 
-    // MARK: Finding 7 -- reject oversized ASC before AudioConverterNew
+    // MARK: AAC -- reject oversized ASC before AudioConverterNew
 
-    /// Green control (wire proof): ASC length 107 is accepted and the real
+    /// Control (wire proof): ASC length 107 is accepted and the real
     /// outer ES descriptor body byte is exactly the one-byte limit 0x7f, with
     /// the inner config body still under it -- derived from the nested lengths
     /// (`20 + ascLen`), not hardcoded. Independent of the converter path.
@@ -250,13 +249,13 @@ struct ChildTrapProbeTests {
         #expect(Int(cookie[6]) == 15 + ascMax)       // inner config body still < limit
     }
 
-    /// Green control (converter path): an under-limit 107-byte ASC is NOT
+    /// Control (converter path): an under-limit 107-byte ASC is NOT
     /// pre-rejected -- it reaches the converter factory. Driven deterministically
     /// with a recording factory that returns a controlled failure and NULL
     /// output (no dependence on the host CoreAudio accepting the ASBD, and no
     /// fabricated converter pointer): the factory must run exactly once and the
     /// error is `converterCreationFailed`. This blocks a "reject everything in
-    /// makeAACConverter" repair, which would make the oversized REDs vacuous.
+    /// makeAACConverter" shortcut, which would make the oversized rejections vacuous.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Under-limit 107-byte ASC reaches the converter factory (control)")
     func asc107ReachesConverterFactory() {
@@ -284,9 +283,9 @@ struct ChildTrapProbeTests {
     /// calls) and with a DISTINCT oversized-config category, not a
     /// converter-creation failure. Driven in-process with a recording factory
     /// that returns a controlled failure and a NULL converter -- so this path
-    /// never traps and no fabricated pointer is used. Pre-fix both expectations
-    /// failed RED: the factory ran once and the category was
-    /// `converterCreationFailed`. Covers 108 (first over-limit) and 236.
+    /// never traps and no fabricated pointer is used. A decoder that skips the
+    /// length check fails both expectations: the factory runs once and the
+    /// category is `converterCreationFailed`. Covers 108 (first over-limit) and 236.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Oversized ASC is rejected before AudioConverterNew, distinct category",
           arguments: [108, 236])
@@ -315,13 +314,13 @@ struct ChildTrapProbeTests {
 
     /// Attribution: the real cookie builder rejects an oversized ASC normally
     /// -- neither trapping nor silently building/truncating a cookie. Run in the
-    /// child because pre-fix `UInt8(256)` overflowed and aborted. The parent
+    /// child because an unchecked `UInt8(256)` overflows and aborts. The parent
     /// requires BOTH survival AND an explicit oversized-config rejection, so a
     /// regression that silently returned a `BUILT:` cookie would still fail.
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Cookie builder rejects an oversized ASC (not trap, not silent build)")
     func cookieBuilderRejectsOversizedNotTrap() {
-        let r = runProbe("f7_cookie_236")
+        let r = runProbe("aac_cookie_236")
         #expect(!r.trapped, "oversized ASC must be rejected, not trapped; got \(r.termination)")
         #expect(r.firstLine == "REJECTED:\(oversizedConfigCategory)",
                 "cookie builder must report an oversized rejection, not a silent build; got \(r.firstLine ?? "nil") / \(r.stdout)")

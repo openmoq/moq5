@@ -4,8 +4,8 @@
  * Generates valid LOC-01 header models and checks the producer/consumer round
  * trip: encode -> parse -> field-equal, plus deterministic re-encode, all
  * leak-balanced. Uses the repo's MOQ_SCENARIO_* env knobs and the canonical
- * "Replay:" output so a failing seed reproduces with one command. Slice 1 of
- * the seeded media-conformance extension: generate-only (no byte mutation yet).
+ * "Replay:" output so a failing seed reproduces with one command.
+ * Generate-only: headers are built, never byte-mutated.
  *
  * Light ctest default (200 seeds x 32 cases, sub-second). Heavier local runs:
  *   MOQ_SCENARIO_SEEDS=100000 ./build/tests/test_scenario_media_loc

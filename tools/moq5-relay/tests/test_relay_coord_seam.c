@@ -215,7 +215,7 @@ defer_a_signal(void *ctx)
 
 
 /*
- * F3: a failed release is not a retirement.
+ * A failed release is not a retirement.
  *
  * The coordinator's own authenticated release is made to refuse by corrupting
  * only the bank index it passes, so the slot is never touched and the
@@ -277,10 +277,10 @@ coord_release_failure_is_not_retirement(int verify_build)
 }
 
 /*
- * F6: retiring a generation can open deferred work, and `out_wake_lanes` is
+ * Retiring a generation can open deferred work, and `out_wake_lanes` is
  * the only notice its lanes will get. Relying on the main loop noticing on its
  * next poll contradicts the API contract and does not survive the dedicated
- * admin thread Step 3 introduces.
+ * admin thread of the admin listener.
  */
 static int
 coord_propagates_release_wake(int verify_build)
@@ -344,7 +344,7 @@ coord_propagates_release_wake(int verify_build)
 }
 
 /*
- * F2: the rendered body and the delivery token must name the SAME generation.
+ * The rendered body and the delivery token must name the SAME generation.
  *
  * Leave an older generation READY on one bank, open and render a newer one on
  * the reused bank, and invoke the real coordinator. Taking "oldest READY"
@@ -583,7 +583,8 @@ test_document_lifetime_without_sanitizer(void)
  * A generation nobody asked to see on stderr must produce no stderr output,
  * and must still be fully retired so the next one can start.
  */
-/* The bank count is fixed by the body storage Step 3 preallocates. */
+/* The bank count is fixed by the body storage the admin listener
+ * preallocates. */
 static int
 test_bank_count_is_exactly_two(void)
 {
@@ -866,7 +867,7 @@ test_idle_coordinator_is_a_noop(void)
 #ifdef MOQR_BIND_TESTING
 
 /*
- * F2: the verify coordinator rides the SAME generation lifecycle. Rendering
+ * The verify coordinator rides the SAME generation lifecycle. Rendering
  * without completing and retiring would leave the slot COLLECTING forever --
  * the lanes have already recorded that serial so they never republish, the
  * coordinator stays busy reprinting a finished document, and every later

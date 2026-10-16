@@ -96,7 +96,9 @@ h3zero_stream_prefix_t *h3zero_find_stream_prefix(h3zero_callback_ctx_t *ctx, ui
     { (void)ctx; (void)prefix; return &g_prefix; }
 void h3zero_delete_stream_prefix(picoquic_cnx_t *cnx, h3zero_callback_ctx_t *ctx, uint64_t prefix)
     { (void)cnx; (void)ctx; (void)prefix; }
-int h3zero_set_datagram_ready(picoquic_cnx_t *cnx, uint64_t stream_id) { (void)cnx; (void)stream_id; return 0; }
+int picoquic_mark_datagram_ready(picoquic_cnx_t *cnx, int is_ready) { (void)cnx; (void)is_ready; return 0; }
+void picoquic_get_close_reasons(picoquic_cnx_t *cnx, uint64_t *l, uint64_t *r, uint64_t *la, uint64_t *ra)
+    { (void)cnx; *l = *r = *la = *ra = 0; }
 static uint8_t g_dg_buf[2048];
 uint8_t *h3zero_provide_datagram_buffer(void *context, size_t length, int ready_to_send)
     { (void)context; (void)ready_to_send; return length <= sizeof(g_dg_buf) ? g_dg_buf : NULL; }
@@ -139,6 +141,8 @@ static struct { uint64_t sid; uint64_t code; } g_stops[SIG_MAX];
 static int g_stop_n = 0, g_stop_seen = 0;
 static int g_reset_n = 0;
 int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec) { (void)c; (void)sid; (void)ec; g_reset_n++; return 0; }
+int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint64_t reliable_size)
+    { (void)c; (void)sid; (void)ec; (void)reliable_size; g_reset_n++; return 0; }
 int picowt_reset_stream(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *stream_ctx, uint64_t local_stream_error)
     { (void)cnx; (void)stream_ctx; (void)local_stream_error; g_reset_n++; return 0; }
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)

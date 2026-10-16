@@ -616,7 +616,7 @@ retained_bootstrap_through_relay(moq_version_t version)
            log ? (int)strcspn(log, "\n") : 0, log ? log : "");
     /* EXPECTED contract (MSF-01 §5 / draft-16 §9.16.2 / draft-18 §10.12.2):
      * the exact retained generation delivered once, in order, then terminal
-     * completion. Counted into the rig's failures so the row stays RED. */
+     * completion. Counted into the rig's failures so a violation fails the row. */
     rig.failures += boot_check_contract(&o, version == MOQ_VERSION_DRAFT_16
                                                 ? "through relay v16"
                                                 : "through relay v18");

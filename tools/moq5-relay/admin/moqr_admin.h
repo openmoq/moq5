@@ -6,9 +6,10 @@
  * reads a clock: bytes arrive through `moqr_admin_on_bytes`, time arrives as an
  * explicit `now_us`, and output is handed back as a span the caller writes.
  *
- * THREADING CONTRACT. This module takes no lock of its own. Step 4 must hold
- * ONE lock across each of these transactions, because each spans a broker call
- * and an admin call that must not interleave with another:
+ * THREADING CONTRACT. This module takes no lock of its own. Its owner (the
+ * admin listener, cli/admin_listen.c) must hold ONE lock across each of these
+ * transactions, because each spans a broker call and an admin call that must
+ * not interleave with another:
  *
  *   - request/bind:      moqr_broker_request + moqr_admin_bind_serial
  *   - retirement:        moqr_admin_claim_abandon + broker complete/take
@@ -426,7 +427,7 @@ moqr_result_t moqr_admin_on_bytes(moqr_admin_t *a, uint32_t client,
  * happens to be sitting there -- which, with two banks and one slow reader, is
  * routinely an older one than the request joined.
  *
- * The Step 4 loop is:
+ * The owner's demand loop is:
  *
  *     while (moqr_admin_next_demand(a, &c)) {
  *         rc = moqr_broker_request(b, MOQR_BROKER_DEMAND_HTTP, &serial, &wake);
@@ -435,7 +436,7 @@ moqr_result_t moqr_admin_on_bytes(moqr_admin_t *a, uint32_t client,
  *     }
  *
  * The two refusals are deliberately different, and the difference is the
- * Step 2 contract: a broker that has no bank to open answers THAT request 503
+ * broker contract: a broker that has no bank to open answers THAT request 503
  * at once, because nothing is coming; a request admitted onto a collecting
  * epoch waits its bounded epoch deadline and only then answers 503.
  */
@@ -522,7 +523,7 @@ moqr_result_t moqr_admin_ack_release(moqr_admin_t *a, uint64_t serial,
  * times out too. That is not a slow scrape; it is permanent starvation.
  *
  * When the last HTTP waiter for such a generation is gone, its serial is
- * surfaced here. Step 4 retires it with the ordinary broker vocabulary --
+ * surfaced here. The owner retires it with the ordinary broker vocabulary --
  * complete it, take its token, honour any SIGNAL demand the token carries, then
  * release it -- so a demand that joined the same serial is still served. A
  * serial that has reached a bank is never abandoned: the bank owes its release.
@@ -648,9 +649,9 @@ bool moqr_admin_bank_available(const moqr_admin_t *a);
  *
  * A LEVEL-TRIGGERED predicate, not a notification. This module has no mutex and
  * no condition variable, and does not claim to synchronise anything: it exports
- * a monotonic epoch so that Step 4's own wait loop cannot lose a wake.
+ * a monotonic epoch so that the owner's own wait loop cannot lose a wake.
  *
- * The contract Step 4 must follow, holding its own lock across the sample:
+ * The contract the owner must follow, holding its own lock across the sample:
  *
  *     lock();
  *     epoch = moqr_admin_publish_epoch(a);

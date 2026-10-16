@@ -26,11 +26,13 @@
 #  11  openssl root   (may be empty)
 #  12  work dir       (created fresh; removed on success)
 #  13  install libdir (CMAKE_INSTALL_LIBDIR: lib, lib64, lib/<arch>, …)
+#  14  C++ flags (optional for older callers)
 set -euo pipefail
 
 CMAKE="$1"; CONSUMER_SRC="$2"; CONSUMER_MAIN="$3"; LIBMOQ_BUILD="$4"
 PICOQUIC_SRC="$5"; PICOTLS_PREFIX="$6"; CC="$7"; CFLAGS="$8"; LDFLAGS="$9"
 BUILD_TYPE="${10}"; OPENSSL_ROOT="${11}"; WORK="${12}"; LIBDIR="${13}"
+CXXFLAGS="${14:-}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -80,10 +82,12 @@ echo "== 3A. CMake consumer (find_package adapter-picoquic-threaded) =="
     "${ossl_arg[@]}" \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_C_FLAGS="$CFLAGS" \
+    -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 "$CMAKE" --build "$CONB"
 "$CONB/moq_adapter_threaded_install_consumer_test"
+"$CONB/moq_adapter_threaded_install_consumer_cxx_test"
 
 echo "== 3B. pkg-config consumer (libmoq) =="
 if ! command -v pkg-config >/dev/null 2>&1; then

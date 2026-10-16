@@ -858,6 +858,66 @@ int main(void)
             (int)MOQ_ERR_PROTO);
     }
 
+    /* == Header short-buffer rollback (1-2 bytes remaining) =========== *
+     * When a writer has enough room for the message type vi64 (1 byte)
+     * but not the 2-byte payload length, every encoder must return
+     * MOQ_ERR_BUFFER with w.pos restored to its initial offset. */
+    {
+        uint8_t tiny[4];
+        moq_buf_writer_t w;
+        moq_bytes_t part = MOQ_BYTES_LITERAL("ns");
+        moq_namespace_t ns = { &part, 1 };
+        moq_d18_msg_params_t params = { 0 };
+        moq_bytes_t empty = { NULL, 0 };
+        moq_d18_publish_t pub = { 0 };
+        pub.track_namespace = ns;
+        pub.track_name = MOQ_BYTES_LITERAL("t");
+        moq_d18_redirect_t redir = {
+            MOQ_BYTES_LITERAL("https://r"), ns, MOQ_BYTES_LITERAL("t")
+        };
+
+        moq_d18_fetch_t fetch = { 0 };
+        fetch.fetch_type = MOQ_D18_FETCH_TYPE_STANDALONE;
+        fetch.track_namespace = ns;
+        fetch.track_name = part;
+        moq_d18_location_t loc = { 0, 0 };
+
+        for (size_t rem = 1; rem <= 2; rem++) {
+            #define CHECK_HDR_ROLLBACK(call) do { \
+                memset(tiny, 0xAA, sizeof(tiny)); \
+                moq_buf_writer_init(&w, tiny, 1 + rem); \
+                w.pos = 1; \
+                MOQ_TEST_CHECK_EQ_INT((int)(call), (int)MOQ_ERR_BUFFER); \
+                MOQ_TEST_CHECK_EQ_SIZE(w.pos, 1); \
+            } while (0)
+
+            CHECK_HDR_ROLLBACK(moq_d18_encode_subscribe(&w, 0, &ns, part, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_subscribe_ok(&w, 0, &params, empty));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_request_error(&w, 1, 0, empty));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_request_error_redirect(
+                &w, MOQ_REQUEST_ERROR_REDIRECT, 0, empty, &redir));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_request_ok(&w));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_request_update(&w, 0, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_publish_namespace(&w, 0, &ns, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_subscribe_namespace(&w, 0, &ns, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_subscribe_tracks(&w, 0, &ns, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_publish_blocked(&w, &ns, part));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_namespace_msg(&w, &ns, false));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_namespace_msg(&w, &ns, true));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_track_status(&w, 0, &ns, part, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_track_status_ok(&w, &params, empty));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_fetch(&w, &fetch));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_fetch_ok(&w, false, loc, empty));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_publish(&w, &pub));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_publish_ok(&w, &params));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_publish_done(&w, 0, 0, empty));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_goaway(&w, NULL, 0, 0, 0));
+            CHECK_HDR_ROLLBACK(moq_d18_encode_goaway_request(&w, NULL, 0, 0));
+
+            #undef CHECK_HDR_ROLLBACK
+        }
+    }
+
     MOQ_TEST_PASS("control_d18");
     return failures != 0;
 }

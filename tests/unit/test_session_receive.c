@@ -6200,7 +6200,7 @@ int main(void)
             for (size_t _i = 0; _i < _n; _i++) moq_action_cleanup(&_a[_i]); \
     } while (0)
 
-    /* -- RED 1: partial object then RESET is observable ---------------- *
+    /* -- Case 1: partial object then RESET is observable --------------- *
      * Whole-object mode, subgroup resolved, partial payload delivered, then a
      * peer RESET with a NONZERO error code. Exactly one SUBGROUP_RESET with the
      * right identity; no OBJECT_RECEIVED (the partial is dropped) and no
@@ -6259,7 +6259,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- RED 2: header-resolved subgroup, no object, then RESET -------- *
+    /* -- Case 2: header-resolved subgroup, no object, then RESET ------- *
      * A ZERO/PRESENT-mode header resolves the subgroup ID immediately, so a
      * RESET before any object still closes the ledger. */
     {
@@ -6296,7 +6296,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- RED 3: unresolved FIRST_OBJECT subgroup must not fabricate 0 -- *
+    /* -- Case 3: unresolved FIRST_OBJECT subgroup must not fabricate 0 - *
      * Mirrors the clean-FIN guard: a FIRST_OBJECT-mode header carries only the
      * decoder default (0) until an object resolves it, so a RESET with no
      * object must emit nothing rather than let a relay seal subgroup 0. */
@@ -6352,7 +6352,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- RED 4: backpressure retains the reset exactly once ------------ *
+    /* -- Case 4: backpressure retains the reset exactly once ----------- *
      * With the event queue full the reset event parks. The retry must emit it
      * exactly once with the error code intact, even though the app freed the
      * subscription while it was parked (the owed event must not degrade to a
@@ -6441,10 +6441,10 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- RED 5: streaming mode is not regressed ------------------------ *
+    /* -- Case 5: streaming mode is unaffected -------------------------- *
      * streaming_objects=true keeps surfacing the reset as a terminal
-     * OBJECT_CHUNK, and does NOT also emit SUBGROUP_RESET (this slice adds only
-     * the missing whole-object surface). */
+     * OBJECT_CHUNK, and does NOT also emit SUBGROUP_RESET (SUBGROUP_RESET
+     * belongs to whole-object mode only). */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -6494,7 +6494,7 @@ int main(void)
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* -- RED 6: clean FIN still means SUBGROUP_FINISHED ---------------- *
+    /* -- Case 6: clean FIN means SUBGROUP_FINISHED --------------------- *
      * The new event must not leak into the graceful path. */
     {
         test_alloc_state_t as = {0};

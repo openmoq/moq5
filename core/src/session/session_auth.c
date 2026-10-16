@@ -251,24 +251,6 @@ void moq_ov_project(const moq_cache_overlay_t *ov,
     *out_active = active;
 }
 
-/* -- Semantic token-value validation -------------------------------- */
-
-/*
- * See session_internal.h. The rule is intentionally minimal (zero-length
- * or NUL-containing resolved values are malformed) and deterministic on
- * the value alone: a registered alias whose value fails here fails
- * identically on every future USE_ALIAS, which is what lets callers keep
- * the spec's REGISTER-even-on-reject behavior without re-validating
- * cache state.
- */
-bool moq_auth_token_value_semantically_valid(const uint8_t *value,
-                                             size_t value_len)
-{
-    if (value_len == 0)
-        return false;
-    return memchr(value, 0x00, value_len) == NULL;
-}
-
 /* -- Shared request-level AUTH_TOKEN processing -------------------- */
 
 /*
@@ -420,21 +402,8 @@ moq_result_t process_auth_tokens(moq_session_t *s,
         if (reject_code) continue;
         if (tok_op == MOQ_AUTH_OP_DELETE) continue;
 
-        /* Semantic validation of the RESOLVED value (well-formed structure,
-         * otherwise invalid => MALFORMED_AUTH_TOKEN, a request-level reject).
-         * A REGISTER's overlay entry above is intentionally kept: the spec
-         * requires the alias to register even when the message is rejected,
-         * and the reject path commits the txn. A future USE_ALIAS of that
-         * alias resolves to the same value and fails here again. */
-        if (!moq_auth_token_value_semantically_valid(tok_value,
-                                                     tok_value_len)) {
-            if (tok_op == MOQ_AUTH_OP_USE_ALIAS &&
-                tok_value && tok_value_len > 0)
-                s->alloc.free((void *)(uintptr_t)tok_value,
-                              tok_value_len, s->alloc.ctx);
-            reject_code = 0x4;     /* MALFORMED_AUTH_TOKEN (request error) */
-            continue;
-        }
+        /* The resolved value is opaque bytes (empty, or holding zero bytes,
+         * included): judging it is the application's authorization policy. */
 
         /* Check duplicate resolved (type, value). */
         for (size_t j = 0; j < token_count; j++) {

@@ -29,7 +29,8 @@ typedef struct shard_field {
 CF(bindings) CF(tracks) CF(subs) CF(subs_parked) CF(subs_active) CF(ns_nodes)
 CF(ns_subs) CF(retained_bytes) CF(ingested_total) CF(delivered_total)
 CF(evict_sweeps) CF(evicted_total) CF(note_emitted_total) CF(intent_highwater)
-CF(route_epoch)
+CF(route_epoch) CF(tracks_reclaimable) CF(tracks_evicted_capacity)
+CF(tracks_evicted_idle) CF(ns_nodes_reclaimable) CF(ns_nodes_reclaimed)
 
 BF(conns) BF(events_translated) BF(deliveries_written) BF(ingest_refusals)
 BF(session_errors) BF(pending_high_water) BF(pending_nonscalar_blocked)
@@ -48,9 +49,14 @@ SF(inbound_channel_entries) SF(inbound_channel_bytes) SF(journal_epoch)
 SF(channel_entries_hwm) SF(channel_bytes_hwm)
 
 static const core_field_t k_core[] = {
-    { "bindings", cf_bindings }, { "tracks", cf_tracks }, { "subs", cf_subs },
+    { "bindings", cf_bindings }, { "tracks", cf_tracks },
+    { "tracks_reclaimable", cf_tracks_reclaimable },
+    { "tracks_evicted_capacity", cf_tracks_evicted_capacity },
+    { "tracks_evicted_idle", cf_tracks_evicted_idle }, { "subs", cf_subs },
     { "subs_parked", cf_subs_parked }, { "subs_active", cf_subs_active },
-    { "ns_nodes", cf_ns_nodes }, { "ns_subs", cf_ns_subs },
+    { "ns_nodes", cf_ns_nodes },
+    { "ns_nodes_reclaimable", cf_ns_nodes_reclaimable },
+    { "ns_nodes_reclaimed", cf_ns_nodes_reclaimed }, { "ns_subs", cf_ns_subs },
     { "retained_bytes", cf_retained_bytes },
     { "ingested_total", cf_ingested_total },
     { "delivered_total", cf_delivered_total },
@@ -245,9 +251,12 @@ static const char k_version_max[] =
     C8 C8 C8 C8 C8 C8 C8 C8 "\x1f\x1f\x1f";                              /* 67 */
 
 static const moqr_core_stats_t k_core_max = {
-    .bindings = UINT32_MAX, .tracks = UINT32_MAX, .subs = UINT32_MAX,
+    .bindings = UINT32_MAX, .tracks = UINT32_MAX,
+    .tracks_reclaimable = UINT32_MAX, .tracks_evicted_capacity = UINT64_MAX,
+    .tracks_evicted_idle = UINT64_MAX, .subs = UINT32_MAX,
     .subs_parked = UINT32_MAX, .subs_active = UINT32_MAX,
-    .ns_nodes = UINT32_MAX, .ns_subs = UINT32_MAX,
+    .ns_nodes = UINT32_MAX, .ns_nodes_reclaimable = UINT32_MAX,
+    .ns_nodes_reclaimed = UINT64_MAX, .ns_subs = UINT32_MAX,
     .retained_bytes = UINT64_MAX, .ingested_total = UINT64_MAX,
     .delivered_total = UINT64_MAX, .evict_sweeps = UINT64_MAX,
     .evicted_total = UINT64_MAX, .note_emitted_total = UINT64_MAX,

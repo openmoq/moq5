@@ -1285,7 +1285,7 @@ static void scan_case(unsigned n)
     CHECK(b.deadline_class_future == a.deadline_class_future);
     CHECK(b.deadline_class_due == a.deadline_class_due);
     /* no deadline fired, so the existing counter stays flat while the scan
-     * scales -- the exact gap this slice exists to make visible */
+     * scales -- the gap these lane stats make visible */
     CHECK(b.deadline_sweeps == a.deadline_sweeps);
     CHECK(b.service_passes == a.service_passes);
 

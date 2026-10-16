@@ -87,8 +87,7 @@ fi
 
 # -- cancellation belongs to the owner -------------------------------------
 # stop() is called by another thread. If it cancelled the state machine itself,
-# two threads would mutate it at once -- which is exactly the defect the
-# structural review found.
+# two threads would mutate it at once.
 if grep -n 'moqr_admin_listen_stop' -A20 "$lst" |
    grep -qE 'moqr_admin_(cancel|close|tick|refuse|commit|abort)[ ]*\('; then
     fail "moqr_admin_listen_stop mutates the state machine from the caller's thread"

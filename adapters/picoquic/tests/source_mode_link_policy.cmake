@@ -330,16 +330,16 @@ function(_read out tree file)
     set(${out} "${_c}" PARENT_SCOPE)
 endfunction()
 
-# -- R0: default (no caller hook) ---------------------------------------------
+# -- default run (no caller hook) ---------------------------------------------
 _write_driver("${WORK}/drv-default" "" "")
-_configure_driver(R0_default "${WORK}/drv-default")
-_read(_after "${WORK}/R0_default" after.txt)
+_configure_driver(run_default "${WORK}/drv-default")
+_read(_after "${WORK}/run_default" after.txt)
 if(NOT _after MATCHES "^include=undefined:\\[\\] handover=undefined ")
-    message(FATAL_ERROR "R0: state after the integration is not the caller's (unset) state: ${_after}")
+    message(FATAL_ERROR "default run: state after the integration is not the caller's (unset) state: ${_after}")
 endif()
-_read(_sib "${WORK}/R0_default" sibling.txt)
+_read(_sib "${WORK}/run_default" sibling.txt)
 if(NOT _sib MATCHES "^include=undefined CMP0156=\\[(unknown|OLD|)\\]$")
-    message(FATAL_ERROR "R0: sibling project saw injected state: ${_sib}")
+    message(FATAL_ERROR "default run: sibling project saw injected state: ${_sib}")
 endif()
 string(REGEX MATCH "processing=\\[([^]]*)\\]" _m "${_after}")
 set(_processing "${CMAKE_MATCH_1}")
@@ -359,7 +359,7 @@ message(STATUS "link policy capability: policies known=${_policy_known}, process
 
 # Link outcome from the File API, per linker capability.
 foreach(_tgt picohttp_ct picoquic_ct)
-    _fileapi_target(_libs _art "${WORK}/R0_default" ${_tgt})
+    _fileapi_target(_libs _art "${WORK}/run_default" ${_tgt})
     _require_closure(${_tgt} "${_libs}")
     _count_repeated_archives(_rep "${_libs}")
     if(_dedup AND NOT _rep EQUAL 0)
@@ -368,85 +368,87 @@ foreach(_tgt picohttp_ct picoquic_ct)
     message(STATUS "${_tgt}: ${_rep} repeated archive(s) in its library fragments")
 endforeach()
 
-# -- R1: caller list (spaced file + module name) through the cache -----------
+# -- cached-list run: caller list (spaced file + module name) through the cache
 _write_driver("${WORK}/drv-list" "" "")
 set(_list_value "${_hooks}/hook a.cmake;MoqProbeHookB")
 # A list value must reach the cache as one entry; an initial-cache script
 # carries the semicolon intact where a -D argument would be split.
 file(WRITE "${WORK}/drv-list/initial-cache.cmake"
     "set(CMAKE_PROJECT_picoquic_INCLUDE \"${_list_value}\" CACHE STRING \"caller hook list\")\n")
-_configure_driver(R1_list "${WORK}/drv-list" -C "${WORK}/drv-list/initial-cache.cmake")
-_read(_b "${WORK}/R1_list" hookB.txt)
+_configure_driver(run_list "${WORK}/drv-list" -C "${WORK}/drv-list/initial-cache.cmake")
+_read(_b "${WORK}/run_list" hookB.txt)
 if(NOT _b MATCHES "^project=picoquic A_RAN=\\[1\\] CMP0135=\\[(NEW|unknown)\\] CMP0156=\\[")
-    message(FATAL_ERROR "R1: caller hooks did not run in order with native effects inside picoquic's scope: ${_b}")
+    message(FATAL_ERROR "cached-list run: caller hooks did not run in order with native effects inside picoquic's scope: ${_b}")
 endif()
 if(_policy_known AND NOT _b MATCHES "CMP0156=\\[NEW\\]")
-    message(FATAL_ERROR "R1: CMP0156 is not NEW inside picoquic's scope: ${_b}")
+    message(FATAL_ERROR "cached-list run: CMP0156 is not NEW inside picoquic's scope: ${_b}")
 endif()
-_read(_after "${WORK}/R1_list" after.txt)
+_read(_after "${WORK}/run_list" after.txt)
 if(NOT _after MATCHES "^include=defined:\\[${_list_value}\\] handover=undefined ")
-    message(FATAL_ERROR "R1: caller's cached CMAKE_PROJECT_picoquic_INCLUDE not seen intact after the integration: ${_after}")
+    message(FATAL_ERROR "cached-list run: caller's cached CMAKE_PROJECT_picoquic_INCLUDE not seen intact after the integration: ${_after}")
 endif()
-file(READ "${WORK}/R1_list/CMakeCache.txt" _cache_text)
+file(READ "${WORK}/run_list/CMakeCache.txt" _cache_text)
 string(FIND "${_cache_text}" "\nCMAKE_PROJECT_picoquic_INCLUDE:STRING=${_list_value}\n" _cache_pos)
 if(_cache_pos EQUAL -1)
-    message(FATAL_ERROR "R1: the caller's cache entry is not exactly the supplied list any more")
+    message(FATAL_ERROR "cached-list run: the caller's cache entry is not exactly the supplied list any more")
 endif()
 
-# -- R2: caller set the normal variable to EMPTY ------------------------------
+# -- empty-variable run: caller set the normal variable to EMPTY --------------
 _write_driver("${WORK}/drv-empty" "set(CMAKE_PROJECT_picoquic_INCLUDE \"\")" "")
-_configure_driver(R2_empty "${WORK}/drv-empty")
-_read(_after "${WORK}/R2_empty" after.txt)
+_configure_driver(run_empty "${WORK}/drv-empty")
+_read(_after "${WORK}/run_empty" after.txt)
 if(NOT _after MATCHES "^include=defined:\\[\\] handover=undefined ")
-    message(FATAL_ERROR "R2: an explicitly empty caller variable was not preserved as defined-empty: ${_after}")
+    message(FATAL_ERROR "empty-variable run: an explicitly empty caller variable was not preserved as defined-empty: ${_after}")
 endif()
 
-# -- R3: caller set a nonempty normal variable + pre-existing hand-over state --
+# -- set-variable run: caller set a nonempty normal variable + pre-existing
+#       hand-over state ------------------------------------------------------
 _write_driver("${WORK}/drv-set"
     "set(CMAKE_PROJECT_picoquic_INCLUDE \"${_hooks}/hook_status.cmake\")\nset(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE \"keep me\")"
     "")
-_configure_driver(R3_set "${WORK}/drv-set")
-_read(_after "${WORK}/R3_set" after.txt)
+_configure_driver(run_set "${WORK}/drv-set")
+_read(_after "${WORK}/run_set" after.txt)
 if(NOT _after MATCHES "^include=defined:\\[${_hooks}/hook_status\\.cmake\\] handover=defined=\\[keep me\\] ")
-    message(FATAL_ERROR "R3: caller's set variable or unrelated hand-over state not preserved: ${_after}")
+    message(FATAL_ERROR "set-variable run: caller's set variable or unrelated hand-over state not preserved: ${_after}")
 endif()
-file(READ "${WORK}/log-R3_set.txt" _log3)
+file(READ "${WORK}/log-run_set.txt" _log3)
 if(NOT _log3 MATCHES "caller hook status message")
-    message(FATAL_ERROR "R3: the caller's status hook did not run")
+    message(FATAL_ERROR "set-variable run: the caller's status hook did not run")
 endif()
 
-# -- R4: a caller hook that only WARNS (exit 0) must be caught by this gate's
-#       scanner; the clean status hook of R3 is the control. ------------------
+# -- warning-hook run: a caller hook that only WARNS (exit 0) must be caught by
+#       this gate's scanner; the clean status hook of the set-variable run is
+#       the control. -------------------------------------------------------
 _write_driver("${WORK}/drv-warn" "" "")
-_configure_driver(R4_warning "${WORK}/drv-warn" ALLOW_FAIL
+_configure_driver(run_warning "${WORK}/drv-warn" ALLOW_FAIL
     "-DCMAKE_PROJECT_picoquic_INCLUDE=${_hooks}/hook_warning.cmake")
-if(NOT R4_warning_RC EQUAL 0)
-    message(FATAL_ERROR "R4: the warning-only hook made the configure fail (${R4_warning_RC}); the negative needs exit 0")
+if(NOT run_warning_RC EQUAL 0)
+    message(FATAL_ERROR "warning-hook run: the warning-only hook made the configure fail (${run_warning_RC}); the negative needs exit 0")
 endif()
-if(NOT R4_warning_HITS)
-    message(FATAL_ERROR "R4: a CMake warning with exit 0 went undetected by the scanner")
+if(NOT run_warning_HITS)
+    message(FATAL_ERROR "warning-hook run: a CMake warning with exit 0 went undetected by the scanner")
 endif()
 
-# -- R5: actual link and execution of picoquic's HTTP test executable --------
+# -- link run: actual link and execution of picoquic's HTTP test executable --------
 # The build and the run must both be clean (exit 0, no diagnostic line) on
 # every linker family; only the archive multiplicity above depends on the
 # linker's capability. The executable is the artifact the codemodel names.
-_cmake_step(R5_build COMMAND ${CMAKE_COMMAND} --build "${WORK}/R0_default" --target picohttp_ct ALLOW_FAIL)
-_judge_step(_v "${R5_build_RC}" "${R5_build_HITS}")
+_cmake_step(link_build COMMAND ${CMAKE_COMMAND} --build "${WORK}/run_default" --target picohttp_ct ALLOW_FAIL)
+_judge_step(_v "${link_build_RC}" "${link_build_HITS}")
 if(NOT _v STREQUAL "ok")
-    message(FATAL_ERROR "R5 build of picohttp_ct: ${_v}; log ${WORK}/log-R5_build.txt")
+    message(FATAL_ERROR "link build of picohttp_ct: ${_v}; log ${WORK}/log-link_build.txt")
 endif()
-_fileapi_target(_libs _art "${WORK}/R0_default" picohttp_ct)
-get_filename_component(_art_dir "${WORK}/R0_default/${_art}" DIRECTORY)
+_fileapi_target(_libs _art "${WORK}/run_default" picohttp_ct)
+get_filename_component(_art_dir "${WORK}/run_default/${_art}" DIRECTORY)
 execute_process(
-    COMMAND "${WORK}/R0_default/${_art}" -S "${PQ_SRC}" -n -r
+    COMMAND "${WORK}/run_default/${_art}" -S "${PQ_SRC}" -n -r
     WORKING_DIRECTORY "${_art_dir}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-file(WRITE "${WORK}/log-R5_run.txt" "${_out}")
+file(WRITE "${WORK}/log-link_run.txt" "${_out}")
 _scan_for_warnings(_hits "${_out}")
 _judge_step(_v "${_rc}" "${_hits}")
 if(NOT _v STREQUAL "ok")
-    message(FATAL_ERROR "R5 run of picohttp_ct: ${_v}; log ${WORK}/log-R5_run.txt")
+    message(FATAL_ERROR "link run of picohttp_ct: ${_v}; log ${WORK}/log-link_run.txt")
 endif()
 
 message(STATUS "picoquic_source_mode_link_policy: OK (de-duplicating linker=${_dedup})")

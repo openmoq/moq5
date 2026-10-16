@@ -1,0 +1,8 @@
+# Justified true positives for scripts/check_process_labels.sh.
+# Format: path|fixed text on the line|reason
+adapters/picoquic/tests/consumer/CMakeLists.txt|/W4 /WX|MSVC warning-level and warnings-as-errors flags
+adapters/pico_wt/tests/consumer/CMakeLists.txt|/W4 /WX|MSVC warning-level and warnings-as-errors flags
+adapters/wtquic/include/moq/wtquic_msquic_managed.h|D13|WebTransport draft-13 compatibility profile (MOQ_WT_PROFILE_D13_14_COMPAT)
+adapters/wtquic/tests/test_wtquic_msquic_managed_internal.c|D13|WebTransport draft-13 compatibility profile (MOQ_WT_PROFILE_D13_14_COMPAT)
+tests/unit/test_session_exact_work.c|"R1"|local fixture name: receive entry 1, beside "R0" and publication "P0"
+tests/unit/test_session_exact_work.c|"G1"|local fixture name: subgroup 1, beside "G0"

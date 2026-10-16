@@ -1419,13 +1419,13 @@ scenario_bindsg_recovery_burst(void)
  * (any SimPair progress for that shard\'s conns rings its doorbell latch) or
  * a cross-shard push/credit wake (the step\'s pushed_dst_mask). The latch is
  * COALESCED (bool), exactly like the managed doorbell. There is no idle-cap
- * timer here on purpose: the transport evidence shows the stall outliving
- * any idle rescue, so the fixture must reveal work that only an un-rung
+ * timer here on purpose: on a real transport the stall outlives any idle
+ * rescue, so the fixture must reveal work that only an un-rung
  * doorbell would ever serve. Requires live_visibility = true. */
 typedef struct ep {
     bool owed[2];
     int  dest_passes;   /* pumps shard 0 (the destination) actually ran */
-    /* Wake-neuter seam (fixture sensitivity RED): while nonzero, the next
+    /* Wake-suppression seam (fixture sensitivity check): while nonzero, the next
      * cross-shard push wake TOWARD shard 0 is dropped instead of latched —
      * modelling a lost doorbell. Dropped wakes are counted so the test can
      * release them explicitly (re-ring) and prove recovery resumes. */
@@ -1702,7 +1702,7 @@ scenario_bindsg_recovery_paced(void)
     A_CHECK(&r, !ob.parked);
     uint64_t postfin_refusals = ob.refusals;
 
-    /* FIXTURE SENSITIVITY RED (the wake-neuter): drop the destination wake
+    /* FIXTURE SENSITIVITY (wake suppression): drop the destination wake
      * the FIRST admitted FIN's seal push earns. The seal sits ingested-side
      * of the channel with NO pump earned: the system must FREEZE in the
      * lost-doorbell shape — delivery still 4/6, every slot still held
@@ -1800,8 +1800,7 @@ scenario_bindsg_recovery_paced(void)
     /* SGDIAG→SEALLOG demand JOIN (the emitter's exact two-step): the bind
      * captured the refused delivery's TRACK at the BIND_SG refusal (NOT the
      * delivery's sub_cookie — that is the downstream subscription handle, a
-     * different id space; capturing it was RED-proven to break this very
-     * equality), and the shard's demand table resolves track → demand. The
+     * different id space; capturing it breaks this very equality), and the shard's demand table resolves track → demand. The
      * result must equal the recorder's seal attribution EXACTLY and
      * unambiguously — the diagnostic identifies the blocked demand, it
      * never asks the reader to already know it. The blocked slot is found
@@ -1990,8 +1989,8 @@ scenario_bindsg_batched_fin_wake(void)
      * the production stall (retained 4/6 forever: dl_ready=1 persisting
      * with no doorbell owed — the pre-registered DOORBELL_UNCONSUMED row;
      * the CORE ready mark was produced by the applications and CONSUMED by
-     * the same step's pump, so "mark missing" is ruled out). The fix makes
-     * the step itself request EXACTLY ONE coalesced self-wake for the
+     * the same step's pump, so "mark missing" is ruled out). The local
+     * continuation makes the step itself request EXACTLY ONE coalesced self-wake for the
      * whole six-message batch. */
     uint64_t mask = 0;
     ep_step_dest(&r, &e, &mask);
@@ -2088,8 +2087,8 @@ scenario_bindsg_batched_fin_wake(void)
  * drained, so the single bind pass closes them with NOTHING left in the ready
  * set. The step must therefore request NO local self-wake: applying inbound data
  * is not sufficient; only a pass that leaves residual work earns a continuation.
- * Before the residual-work gate this was RED (any applied batch requested one),
- * which is the spurious steady-traffic wake the gate removes. */
+ * Without the residual-work gate any applied batch would request one: the
+ * spurious steady-traffic wake the gate removes. */
 static int
 scenario_bindsg_drained_batch_no_wake(void)
 {
@@ -2173,8 +2172,8 @@ scenario_bindsg_drained_batch_no_wake(void)
      * applied) and its single bind pass closes every subgroup — but nothing was
      * pool-blocked, so those slot releases re-arm NOTHING and the pass DRAINS.
      * A drained seal-close batch must request NO local self-wake. This is the
-     * case ordinary seal-close traffic hits; before the bind_sg_waiting gate the
-     * unconditional slot-release re-arm made this RED (one wake per batch). */
+     * case ordinary seal-close traffic hits; the bind_sg_waiting gate keeps the
+     * slot-release re-arm from requesting one wake per batch. */
     uint64_t mask = 0;
     ep_step_dest(&r, &e, &mask);
     {
@@ -2221,8 +2220,9 @@ scenario_bindsg_drained_batch_no_wake(void)
  * reach the parked destination.) An ACTION_CAP park recovers only on a
  * downstream transport-capacity edge — the managed adapter arms the lane pump
  * from a transport-event batch, NOT a shard push/credit wake — so a real edge
- * (flushing the transport, then an earned pump) recovers it here. RED: widen
- * eligibility to any parked conn and the direct pin flips true. */
+ * (flushing the transport, then an earned pump) recovers it here. The direct
+ * pin stays false only while eligibility excludes ACTION_CAP parks; widening it
+ * to any parked conn flips it true. */
 static int
 scenario_actioncap_no_wake(void)
 {
@@ -2303,8 +2303,8 @@ scenario_actioncap_no_wake(void)
      * shard push/credit wake), never on an arbitrary pump. The stepper gates its
      * applied-inbound continuation on this query with an AND, so a false here
      * means NO inbound batch — however unrelated — can earn a spurious self-wake
-     * while the floor is unchanged. RED: widen eligibility to any parked conn
-     * (dl_parked without the reason check) and this flips true. */
+     * while the floor is unchanged. Eligibility for any parked conn
+     * (dl_parked without the reason check) would flip this true. */
     A_CHECK(&r, !rd);   /* ready set empty at the ACTION_CAP floor */
     A_CHECK(&r, !moqr_bind_pump_continuation_pending(b0));
 
@@ -3035,8 +3035,8 @@ scenario_seal_interval_wrap(void)
     A_CHECK(&r, cursor2 == 46);
 
     /* +33 seals: the cursor (46) is OVERWRITTEN (first becomes 47) — the
-     * REAL ring now fails the interval closed, exactly as the pure RED
-     * pinned. */
+     * REAL ring fails the interval closed, exactly as the pure recorder-level
+     * check pins. */
     seal_burst(&r, pub, pps.up_sub, 46, 79, &a);
     seal_ring_snapshot(&r, &meta, rows, &n);
     A_CHECK(&r, meta.lifetime_total == 79 && meta.first_retained_seq == 47);
@@ -3578,7 +3578,7 @@ scenario_eot_negative_no_synthesis(void)
  * group, so the seal is dropped (moqr_core_seal_subgroup returns MOQR_DONE
  * for a gone group) and the destination's downstream subgroup — already
  * opened to the client by a delivered object — dangles OPEN forever with no
- * close, no reset, no progress signal. Post-fix contract (0057): applying
+ * close, no reset, no progress signal. Contract: applying
  * the owner watermark at the destination lets the EXISTING local
  * eviction/notice machinery close the dangling below-watermark subgroup
  * (gap/resync), while the subscription itself stays LIVE — no EOT means no
@@ -3713,7 +3713,7 @@ scenario_evict_overtake_dangling_subgroup(void)
     A_CHECK(&r, objs >= 3);   /* the surviving tail reached the client */
 
     /* No terminal without a track terminal fact — the subscription must
-     * remain LIVE with or without the fix (0057 rule 3). */
+     * remain LIVE whether or not the watermark closes the subgroup. */
     A_CHECK(&r, !done);
 
     /* THE invariant (the no-EOT g64 contract): the below-watermark dangling
@@ -3732,12 +3732,12 @@ scenario_evict_overtake_dangling_subgroup(void)
 }
 
 
-/* D2 — the begun/partial whole-object reset arm: the client's subgroup had
+/* The begun/partial whole-object reset arm: the client's subgroup had
  * a complete object delivered AND partial bytes of a later object on the
  * wire when the owner's eviction killed the record. The relay's ONLY honest
  * terminal is a stream RESET (a FIN would frame the truncation as clean),
  * and libmoq's whole-object receive mode surfaces no event for a reset
- * subgroup — a known library-surface gap, queued separately. This pin
+ * subgroup — a known library-surface gap. This pin
  * therefore asserts the RELAY-side truth: the downstream slot is torn down
  * (no dangle), the subscription stays live (no EOT), no false FIN is
  * emitted for the reset subgroup, the tracked partial is cleaned up, and
@@ -4162,11 +4162,11 @@ scenario_upstream_reset_retained_then_terminal(void)
 #endif /* MOQ_EVENT_SUBGROUP_RESET */
 
 
-/* D1 — the not-begun whole-object FIN arm: subgroup 0 carries only COMPLETE
+/* The not-begun whole-object FIN arm: subgroup 0 carries only COMPLETE
  * delivered objects and its seal dies with the owner's eviction; subgroup 1
  * of the same group carries the begun/partial casualty. The reset honestly
- * terminalizes sg1 (whole-object-invisible until the queued libmoq surface
- * fix); sg0 owes the client a CLEAN, VISIBLE FIN — the watermark seals it
+ * terminalizes sg1 (invisible in whole-object mode, which has no reset
+ * event); sg0 owes the client a CLEAN, VISIBLE FIN — the watermark seals it
  * through the ordinary seal-note path and the client observes
  * SUBGROUP_FINISHED for (g0, sg0). Subscription stays live throughout. */
 static int
@@ -4283,8 +4283,8 @@ scenario_evict_overtake_notbegun_fin(void)
     A_CHECK(&r, moqr_shards_get_stats(r.s, 1, &st1) == MOQR_OK);
     A_CHECK(&r, st1.enqueued[MOQR_SHARDS_MSG_GRP_EVICT] >= 1);
     /* Casualty proof for THIS arm: the begun partial died never-forwarded
-     * (a correctly silent owner-side skip — the crossed-reset path is D2's
-     * pin), so the destination holds fewer objects than were published. */
+     * (a correctly silent owner-side skip — the crossed-reset path is the
+     * begun/partial reset arm's pin), so the destination holds fewer objects than were published. */
     {
         moqr_core_stats_t c0;
         moqr_core_get_stats(moqr_shards_core(r.s, 0), &c0);
@@ -4446,16 +4446,16 @@ main(void)
     failures += scenario_bindsg_batched_fin_wake_streamed();   /* streamed twin */
     failures += scenario_sessionsg_batched_fin_wake_streamed();   /* session pool */
     failures += scenario_bindsg_budget_chain();   /* multi-pass continuation */
-    failures += scenario_seal_interval_wrap();    /* recorder-level interval RED */
+    failures += scenario_seal_interval_wrap();    /* recorder-level interval check */
     failures += scenario_evict_overtake_gap();    /* watermark gap, not silence */
     failures += scenario_evict_overtake_dangling_subgroup();  /* no-EOT arm: gap, stay live */
-    failures += scenario_evict_reset_whole_object_pin();      /* D2: honest reset, no false FIN */
+    failures += scenario_evict_reset_whole_object_pin();      /* honest reset, no false FIN */
 #ifdef MOQ_EVENT_SUBGROUP_RESET
     failures += scenario_upstream_reset_whole_object_terminal();
     failures += scenario_upstream_reset_retained_then_terminal();
 #endif
-    failures += scenario_evict_overtake_notbegun_fin();       /* D1: dead seal, visible FIN */
-    failures += scenario_evict_reset_streaming_observed();    /* D2s: reset observable when it can be */
+    failures += scenario_evict_overtake_notbegun_fin();       /* dead seal, visible FIN */
+    failures += scenario_evict_reset_streaming_observed();    /* streaming: reset observable */
     failures += scenario_evict_overtake_silent_wait();    /* explicit terminal, never silence */
     failures += scenario_eot_complete_retires();      /* finished track completes */
     failures += scenario_eot_negative_no_synthesis(); /* fail-closed: no EOT / unknown gap */

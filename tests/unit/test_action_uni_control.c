@@ -4,9 +4,9 @@
  *
  * These are a version-neutral action-model seam: profiles that carry control
  * messages on a local unidirectional channel, rather than on the shared
- * bidirectional control channel used by draft-16, emit them. This slice adds
- * the action kinds and payload storage only -- no profile emits them yet, and
- * no wire behavior is introduced.
+ * bidirectional control channel used by draft-16, emit them. These tests cover
+ * the action kinds and payload storage only, independent of any profile's
+ * wire behavior.
  *
  * Coverage: payload round-trip through the action queue, FIFO ordering when
  * interleaved with existing actions, cleanup is a no-op (the payloads carry

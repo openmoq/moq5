@@ -6,6 +6,7 @@
 #include "../admin/moqr_admin.h"
 #include "../cli/info_doc.h"
 #include "../cli/shards_doc.h"
+#include "../cli/deadline.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -1073,7 +1074,8 @@ test_info_document(void)
         "\"budgets\":{\"core\":{\"max_bindings\":%u,\"max_tracks\":%u,\"max_subs\":%u,"
         "\"max_ns_nodes\":%u,\"max_ns_subs\":%u,\"max_intents\":%u,"
         "\"name_intern_bytes\":%u,\"log_max_subgroups\":%u,"
-        "\"log_max_objects_per_group\":%u,\"log_max_cursors\":%u,\"linger_us\":%llu},"
+        "\"log_max_objects_per_group\":%u,\"log_max_cursors\":%u,\"linger_us\":%llu,"
+        "\"warm_idle_us\":%llu},"
         "\"telemetry\":{\"trace_ring_records\":%u},"
         "\"cross_shard\":{\"pools_active\":true,"
         "\"configured_overrides\":{\"journal_entries\":%u,\"mailbox_entries\":%u,"
@@ -1095,6 +1097,7 @@ test_info_document(void)
         cfg.core.name_intern_bytes, cfg.core.log_max_subgroups,
         cfg.core.log_max_objects_per_group, cfg.core.log_max_cursors,
         (unsigned long long)cfg.core.linger_us,
+        (unsigned long long)cfg.core.warm_idle_us,
         cfg.telemetry.trace_ring_records,
         cfg.cross_shard.journal_entries, cfg.cross_shard.mailbox_entries,
         cfg.cross_shard.demand_channel_entries, cfg.cross_shard.pending_demands,
@@ -1679,10 +1682,34 @@ test_shards_document_pure(void)
         strstr(doc, "\"capability\":\"valid\"") == NULL ||
         strstr(doc, "\"shard_plane\":{") == NULL ||
         strstr(doc, "\"lane_wakes\":18446744073709551615") == NULL ||
-        strstr(doc, "\"listener\":\"webtransport\"") == NULL) {
+        strstr(doc, "\"listener\":\"webtransport\"") == NULL ||
+        /* track-table and namespace-trie reclaim, from the core row */
+        strstr(doc, "\"tracks_reclaimable\":") == NULL ||
+        strstr(doc, "\"tracks_evicted_capacity\":") == NULL ||
+        strstr(doc, "\"tracks_evicted_idle\":") == NULL ||
+        strstr(doc, "\"ns_nodes_reclaimable\":") == NULL ||
+        strstr(doc, "\"ns_nodes_reclaimed\":") == NULL) {
         printf("  shards-pure: a valid row is wrong: [%.200s]\n", doc);
         failures++;
     }
+    /* Each reclaim field carries its own core counter, not a neighbour's:
+     * distinct values, each found under its own key. */
+    core.tracks_reclaimable = 101;
+    core.tracks_evicted_capacity = 202;
+    core.tracks_evicted_idle = 303;
+    core.ns_nodes_reclaimable = 404;
+    core.ns_nodes_reclaimed = 505;
+    if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) !=
+            MOQR_OK ||
+        strstr(doc, "\"tracks_reclaimable\":101,") == NULL ||
+        strstr(doc, "\"tracks_evicted_capacity\":202,") == NULL ||
+        strstr(doc, "\"tracks_evicted_idle\":303,") == NULL ||
+        strstr(doc, "\"ns_nodes_reclaimable\":404,") == NULL ||
+        strstr(doc, "\"ns_nodes_reclaimed\":505,") == NULL) {
+        printf("  shards-pure: reclaim fields mis-mapped: [%.300s]\n", doc);
+        failures++;
+    }
+    memset(&core, 0xff, sizeof(core));
     /* Absent: no shard plane, never fabricated. */
     views[0].shard = NULL;
     views[0].labels.transport = "msquic";
@@ -1884,6 +1911,164 @@ test_admin_capacity(void)
     return failures;
 }
 
+/* -- lane deadlines through the facades' own decision loops ---------------- *
+ *
+ * A model relay core per lane: an idle-retention deadline that first needs a
+ * tick to arm it ("tick owed now", the core's 0), then falls due IDLE later,
+ * when the pump that sees it due frees the cache. The facades' loops are
+ * emulated exactly as written, on a simulated clock, with the lanes taking
+ * turns at equal instants (they run on their own threads):
+ *   msquic: query app_deadline_us, sample now, pump while deadline <= now,
+ *           else sleep until min(deadline, now + idle cap);
+ *   WebTransport: after each pump store min(app_deadline_us) and pump again
+ *           once now >= that stored time. */
+#define DL_IDLE_US   60000000u
+#define DL_CAP_US    200000u     /* msquic's idle wait cap */
+#define DL_END_US    (DL_IDLE_US + 2000000u)
+
+typedef struct {
+    bool     arm_owed;
+    uint64_t due;        /* UINT64_MAX = nothing */
+    uint32_t fired;      /* times the idle work actually ran */
+    uint64_t fired_at;
+} dl_core_t;
+
+static uint64_t
+dl_core_next(const dl_core_t *k)
+{
+    return k->arm_owed ? 0 : k->due;
+}
+
+static void
+dl_core_pump(dl_core_t *k, uint64_t now)
+{
+    if (k->arm_owed) {
+        k->arm_owed = false;
+        k->due = now + DL_IDLE_US;
+    } else if (k->due <= now) {
+        k->due = UINT64_MAX;
+        k->fired++;
+        k->fired_at = now;
+    }
+}
+
+typedef struct {
+    uint32_t pumps[2];
+    uint32_t wakes[2];
+    uint64_t steps;
+    dl_core_t core[2];
+} dl_run_t;
+
+/* Lane 0 owns the deadline; lane 1 is idle. wt selects the loop. */
+static void
+dl_simulate(bool wt, dl_run_t *r)
+{
+    _Atomic uint64_t at[2];
+    moqr_cli_deadline_clear(at, 2);
+    moqr_cli_deadline_range_t range = { at, 0, 2 };
+    memset(r, 0, sizeof(*r));
+    r->core[0].arm_owed = true;
+    r->core[0].due = UINT64_MAX;
+    r->core[1].due = UINT64_MAX;
+    uint64_t next_t[2] = { 0, 0 };
+    uint64_t wt_dl[2] = { UINT64_MAX, UINT64_MAX };
+    bool first[2] = { true, true };   /* the activation pump */
+    uint32_t turn = 0;
+    while (r->steps < 200000u) {
+        /* the lane with the earliest step; ties alternate */
+        uint32_t l = next_t[0] < next_t[1]   ? 0
+                     : next_t[1] < next_t[0] ? 1
+                                             : turn;
+        uint64_t t = next_t[l];
+        if (t > DL_END_US) {
+            break;
+        }
+        turn = 1u - l;
+        r->steps++;
+        bool pump;
+        if (first[l]) {
+            pump = true;
+            first[l] = false;
+        } else if (!wt) {
+            uint64_t d = moqr_cli_deadline_query(&range);   /* query ... */
+            uint64_t now = t;                                /* ... then now */
+            pump = d <= now;
+            if (!pump) {
+                r->wakes[l]++;
+                uint64_t until = d < now + DL_CAP_US ? d : now + DL_CAP_US;
+                next_t[l] = until;
+                continue;
+            }
+        } else {
+            pump = t >= wt_dl[l];
+        }
+        if (pump) {
+            r->pumps[l]++;
+            dl_core_pump(&r->core[l], t);
+            moqr_cli_deadline_publish(&at[l], dl_core_next(&r->core[l]), t);
+            if (wt) {
+                wt_dl[l] = moqr_cli_deadline_query(&range);   /* fold at pump */
+                next_t[l] = wt_dl[l] == UINT64_MAX ? UINT64_MAX : wt_dl[l];
+                if (next_t[l] < t) {
+                    next_t[l] = t;   /* already due: pumps again at once */
+                }
+            } else {
+                next_t[l] = t;       /* the msquic loop re-decides at once */
+            }
+        }
+    }
+}
+
+/* The owning lane's idle work fires once, within one re-wait of its due time
+ * (armed at the first pump, so due at IDLE + one re-wait floor at most), in
+ * both facades. Nothing hot-loops: the owner pumps a handful of times, the
+ * idle sibling pumps at most a few times around the shared due instant, and
+ * the msquic sibling's wakes stay at the idle-cap rate. */
+static int
+test_lane_deadline_fold(void)
+{
+    int failures = 0;
+    for (int wt = 0; wt < 2; wt++) {
+        dl_run_t r;
+        dl_simulate(wt != 0, &r);
+        if (r.core[0].fired != 1 || r.pumps[0] > 6 || r.pumps[1] > 6 ||
+            r.steps >= 200000u) {
+            printf("  %s: fired=%u at=%llu pumps=%u/%u wakes=%u/%u steps=%llu\n",
+                   wt ? "wt" : "msquic", r.core[0].fired,
+                   (unsigned long long)r.core[0].fired_at, r.pumps[0],
+                   r.pumps[1], r.wakes[0], r.wakes[1],
+                   (unsigned long long)r.steps);
+        }
+        MOQ_TEST_CHECK_EQ_U64(r.core[0].fired, 1);
+        MOQ_TEST_CHECK(r.core[0].fired_at >= DL_IDLE_US &&
+                       r.core[0].fired_at <=
+                           DL_IDLE_US + 2u * MOQR_CLI_DEADLINE_REWAIT_US);
+        MOQ_TEST_CHECK(r.pumps[0] <= 6);
+        MOQ_TEST_CHECK(r.pumps[1] <= 6);
+        MOQ_TEST_CHECK(r.steps < 200000u);
+        if (!wt) {
+            uint64_t cap_wakes = DL_END_US / DL_CAP_US + 8u;
+            MOQ_TEST_CHECK(r.wakes[1] <= cap_wakes);
+            MOQ_TEST_CHECK(r.wakes[0] <= cap_wakes);
+        }
+    }
+    /* The fold itself: plain minimum, none when nothing is published, and a
+     * publish floors to one re-wait after its pump. */
+    _Atomic uint64_t at[4];
+    moqr_cli_deadline_clear(at, 4);
+    moqr_cli_deadline_range_t raw = { at, 0, 2 };
+    moqr_cli_deadline_range_t wtr = { at, 2, 2 };
+    MOQ_TEST_CHECK_EQ_U64(moqr_cli_deadline_query(&raw), UINT64_MAX);
+    moqr_cli_deadline_publish(&at[1], 500000, 1000);
+    moqr_cli_deadline_publish(&at[2], 0, 1000);           /* tick owed now */
+    moqr_cli_deadline_publish(&at[3], UINT64_MAX, 1000);
+    MOQ_TEST_CHECK_EQ_U64(moqr_cli_deadline_query(&raw), 500000);
+    MOQ_TEST_CHECK_EQ_U64(moqr_cli_deadline_query(&wtr),
+                          1000 + MOQR_CLI_DEADLINE_REWAIT_US);
+    MOQ_TEST_PASS("lane_deadline_fold");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -1897,6 +2082,7 @@ main(void)
     failures += test_info_refusals_clear_output();
     failures += test_info_bound_is_pure();
     failures += test_shards_document_pure();
+    failures += test_lane_deadline_fold();
     failures += test_info_bound_workers_settle_on_partial_acquisition();
     moqr_cli_config_t cfg;
     char err[128];
@@ -1938,7 +2124,7 @@ main(void)
         "\"versions\":[16],\"insecure_skip_verify\":true},"
         "\"budgets\":{\"max_tracks\":7,\"max_subs\":11,"
         "\"log\":{\"max_groups\":3,\"max_bytes\":4096,\"max_age_us\":50}},"
-        "\"linger_us\":250}";
+        "\"linger_us\":250,\"warm_idle_us\":1500000}";
     MOQ_TEST_CHECK(parse(full, &cfg, err, sizeof(err)) == MOQR_OK);
     MOQ_TEST_CHECK(strcmp(cfg.host, "::1") == 0);
     MOQ_TEST_CHECK(strcmp(cfg.cert, "c.pem") == 0);
@@ -1951,6 +2137,11 @@ main(void)
     MOQ_TEST_CHECK_EQ_U64(cfg.core.log_budget.max_groups, 3);
     MOQ_TEST_CHECK_EQ_U64(cfg.core.log_budget.max_bytes, 4096);
     MOQ_TEST_CHECK_EQ_U64(cfg.core.linger_us, 250);
+    MOQ_TEST_CHECK_EQ_U64(cfg.core.warm_idle_us, 1500000);
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1},"
+                         "\"warm_idle_us\":-1}",
+                         &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "warm_idle_us") != NULL);
 
     /* Missing required listener fields. */
     MOQ_TEST_CHECK(parse("{}", &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);

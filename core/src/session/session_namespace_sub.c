@@ -606,7 +606,7 @@ void ns_sub_free_entry(moq_session_t *s, size_t slot)
                                        * owner */
     e->local_teardown_pending = false;   /* selective free: a completed or
                                           * reused slot must not carry a stale
-                                          * teardown obligation (#245c) */
+                                          * teardown obligation */
     e->state = MOQ_NS_SUB_FREE;
     e->stream_kind = MOQ_STREAM_KIND_UNKNOWN;
     memset(&e->request_ep, 0, sizeof(e->request_ep));
@@ -819,7 +819,7 @@ moq_result_t moq_session_subscribe_namespace(
  * durable in the OWNER, not here: the caller latches `local_teardown_pending`
  * (and, for a same-call FIN, the cumulative `pending_fin`) before this helper's
  * capacity refusal, so the documented empty re-feed re-enters and completes the
- * teardown with no peer bytes re-delivered (#245c). The extra bytes that reached
+ * teardown with no peer bytes re-delivered. The extra bytes that reached
  * this terminal are deliberately NOT buffered -- the marker is the carrier. */
 static moq_result_t ns_sub_local_teardown(moq_session_t *s, size_t slot,
                                           bool peer_fin_observed)
@@ -1276,8 +1276,8 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
              * teardown closes just this bidi (§10.9.1), so the bytes are NOT
              * buffered; instead the OBLIGATION is made durable before the
              * attempt, and the documented empty re-feed re-drives it with no
-             * peer-byte redelivery (#245c). The cumulative FIN is part of that
-             * obligation: it drives the teardown's drain selection (#249), so it
+             * peer-byte redelivery. The cumulative FIN is part of that
+             * obligation: it drives the teardown's FIN-aware drain selection, so it
              * too is latched in session-owned state before any capacity refusal
              * -- otherwise the empty re-feed (fin=false) would recompute a drain
              * the peer's already-closed send half made unnecessary and stall it
@@ -1863,7 +1863,8 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                 rc = session_core_emit_request_redirect(s,
                     MOQ_REQUEST_FAMILY_NS_SUB, e->handle._opaque,
                     &resp.redirect, resp.error_code,
-                    resp.retry_interval != 0, resp.retry_interval,
+                    resp.retry_interval != 0,
+                    resp.retry_interval != 0 ? resp.retry_interval - 1u : 0,
                     resp.reason, resp.reason_len);
                 /* The emitter reports a terminal close as MOQ_OK, so the
                  * teardown below runs only while the session is still open. */
@@ -2117,10 +2118,15 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
 {
     if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
 
-    /* A bidi we locally cancelled and are draining: the peer's reset/stop is the
-     * terminal we were waiting for, so retire the drain ref and we are done. */
-    if (drain_ref_remove(s, stream_ref))
+    /* A bidi whose request already ended locally and whose peer half is being
+     * drained. A RESET ends that half: retire the drain ref. A STOP_SENDING
+     * only concerns our own, already-finished half -- the peer's FIN or RESET
+     * is still owed and must still find the drain ref, or it would read as a
+     * fresh request. */
+    if (drain_ref_contains(s, stream_ref)) {
+        if (reset) (void)drain_ref_remove(s, stream_ref);
         return MOQ_OK;
+    }
 
     /* A request we migrated with an outbound GOAWAY (entry kept live, §10.4): the
      * peer's reset/stop is its old-stream close, so silently retire the request. */
@@ -2140,7 +2146,7 @@ static moq_result_t bidi_stream_teardown(moq_session_t *s,
         ns_sub_free_entry(s, (size_t)ns_slot);
         return MOQ_OK;
     }
-    /* A no-owner no-slot admission carrier (#245b): the request had no request
+    /* A no-owner no-slot admission carrier: the request had no request
      * registry owner, only a bounded carrier holding its retry identity. The
      * peer's RESET/STOP terminates that request (§3.3.2, §11.4.1), so retire the
      * exact carrier and send no now-obsolete REQUEST_ERROR/STOP+RESET terminal.

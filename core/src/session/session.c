@@ -1,5 +1,6 @@
 #include <assert.h>
 #include "session_internal.h"
+#include "../internal/validate.h"
 
 /* Bounded backoff applied to the *reported* next deadline when a subgroup
  * delivery-timeout reset cannot be enqueued because the action queue is full.
@@ -1878,6 +1879,27 @@ _Static_assert(offsetof(moq_session_cfg_t, done_wait_timeout_us) ==
                "done_wait_timeout_us must occupy the first aligned slot "
                "after the pre-append tail");
 
+/* setup_auth_tokens starts at or past the sizeof of the layout that ended at
+ * max_namespace_suffixes_per_subscription (that end rounded up to the struct
+ * alignment), so an old caller's tail padding is never read as the field. */
+_Static_assert(offsetof(moq_session_cfg_t, setup_auth_tokens) >=
+               ((offsetof(moq_session_cfg_t,
+                          max_namespace_suffixes_per_subscription) +
+                 sizeof(uint32_t) + _Alignof(moq_session_cfg_t) - 1u) &
+                ~(size_t)(_Alignof(moq_session_cfg_t) - 1u)),
+               "setup_auth_tokens must start past the previous sizeof");
+
+/* Return the session block to its allocator. The allocator is copied out
+ * first: a session that presented SETUP tokens wipes the whole block (the
+ * copies, their encodings and any SETUP still in the send arena hold the
+ * credential), and the wipe clears the session's own copy of the allocator. */
+static void session_release_block(moq_session_t *s, size_t size)
+{
+    moq_alloc_t alloc = s->alloc;
+    if (s->setup_token_count > 0) session_wipe(s, size);
+    alloc.free(s, size, alloc.ctx);
+}
+
 static size_t cfg_read_u32(const moq_session_cfg_t *cfg, size_t field_offset,
                             size_t field_size)
 {
@@ -1931,6 +1953,28 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
             offsetof(moq_session_cfg_t, auth_token_cache_size) +
             sizeof(cfg->auth_token_cache_size))
             auth_token_cache_size = cfg->auth_token_cache_size;
+    }
+
+    /* SETUP authorization tokens: validated here, copied into the arena. */
+    const moq_auth_token_t *setup_tokens_in = NULL;
+    size_t setup_token_count = 0;
+    size_t setup_token_value_bytes = 0;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, setup_auth_token_count) +
+        sizeof(cfg->setup_auth_token_count) && cfg->setup_auth_token_count > 0) {
+        setup_tokens_in = cfg->setup_auth_tokens;
+        setup_token_count = cfg->setup_auth_token_count;
+        if (setup_token_count > MOQ_DECODED_MAX_TOKENS ||
+            moq_validate_auth_tokens(setup_tokens_in, setup_token_count) < 0)
+            return MOQ_ERR_INVAL;
+        for (size_t i = 0; i < setup_token_count; i++) {
+            if (setup_tokens_in[i].token_value.len > UINT16_MAX)
+                return MOQ_ERR_INVAL;
+            setup_token_value_bytes += setup_tokens_in[i].token_value.len;
+        }
+        /* Each token adds at most its type, its alias type, a length and an
+         * option type to the setup message, whose length field is 16 bits. */
+        if (setup_token_value_bytes + setup_token_count * 32u > UINT16_MAX)
+            return MOQ_ERR_INVAL;
     }
 
     size_t action_cap = cfg_read_u32(cfg,
@@ -2195,7 +2239,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
                                     _Alignof(max_align_t));
     size_t prof_align  = profile->state_align > 0 ? profile->state_align : 1;
     size_t off_profile = ALIGN_UP(off_evscratch + scratch_cap, prof_align);
-    /* No-owner admission carriers (#245b). Allocated in the session arena at
+    /* No-owner admission carriers. Allocated in the session arena at
      * create time so installing one during ingress can NEVER fail on
      * allocation: a refused no-owner request bidi always has a durable,
      * discoverable retry identity, so the bridge never fatalizes a retainable
@@ -2207,7 +2251,19 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     size_t noslot_carrier_cap = drain_ref_cap;
     size_t noslot_carrier_bytes =
         noslot_carrier_cap * sizeof(moq_noslot_carrier_t);
-    size_t total       = off_noslot_carrier + noslot_carrier_bytes;
+    /* SETUP authorization tokens: the copied tokens, their encoded option
+     * values, then the bytes both point into (the values, then each encoded
+     * value with room for its two leading varints). */
+    size_t off_setup_tokens = ALIGN_UP(off_noslot_carrier + noslot_carrier_bytes,
+                                       _Alignof(moq_auth_token_t));
+    size_t setup_tokens_bytes = setup_token_count * sizeof(moq_auth_token_t);
+    size_t off_setup_wire = ALIGN_UP(off_setup_tokens + setup_tokens_bytes,
+                                     _Alignof(moq_bytes_t));
+    size_t setup_wire_bytes = setup_token_count * sizeof(moq_bytes_t);
+    size_t off_setup_bytes = off_setup_wire + setup_wire_bytes;
+    size_t setup_bytes_cap = setup_token_count
+        ? 2 * setup_token_value_bytes + setup_token_count * 18u : 0;
+    size_t total       = off_setup_bytes + setup_bytes_cap;
 
 #undef ALIGN_UP
 
@@ -2265,7 +2321,12 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         noslot_carrier_bytes / sizeof(moq_noslot_carrier_t) !=
             noslot_carrier_cap ||
         off_noslot_carrier < off_profile ||
-        total < off_noslot_carrier ||
+        setup_tokens_bytes / sizeof(moq_auth_token_t) != setup_token_count ||
+        setup_wire_bytes / sizeof(moq_bytes_t) != setup_token_count ||
+        off_setup_tokens < off_noslot_carrier ||
+        off_setup_wire < off_setup_tokens ||
+        off_setup_bytes < off_setup_wire ||
+        total < off_setup_bytes ||
         total > (size_t)64 * 1024 * 1024)
         return MOQ_ERR_INVAL;
 
@@ -2291,7 +2352,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->recv_cap   = recv_cap;
     s->subs       = (moq_sub_entry_t *)(mem + off_subs);
     s->sub_cap    = sub_cap;
-    /* No-slot admission carriers (#245b): arena-backed (never allocation-fails
+    /* No-slot admission carriers: arena-backed (never allocation-fails
      * during ingress), bounded by the total request-owner lifecycle capacity. */
     s->noslot_carriers      = (moq_noslot_carrier_t *)(mem + off_noslot_carrier);
     s->noslot_carrier_cap   = noslot_carrier_cap;
@@ -2417,6 +2478,36 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->profile_state      = mem + off_profile;
     profile->init_in_place(s->profile_state, cfg);
 
+    if (setup_token_count > 0) {
+        s->setup_tokens = (moq_auth_token_t *)(void *)(mem + off_setup_tokens);
+        s->setup_token_wire = (moq_bytes_t *)(void *)(mem + off_setup_wire);
+        s->setup_token_count = setup_token_count;
+        uint8_t *bytes = mem + off_setup_bytes;
+        for (size_t i = 0; i < setup_token_count; i++) {
+            size_t len = setup_tokens_in[i].token_value.len;
+            s->setup_tokens[i].token_type = setup_tokens_in[i].token_type;
+            s->setup_tokens[i].token_value.data = len ? bytes : NULL;
+            s->setup_tokens[i].token_value.len = len;
+            if (len) memcpy(bytes, setup_tokens_in[i].token_value.data, len);
+            bytes += len;
+        }
+        for (size_t i = 0; profile->encode_setup_token && i < setup_token_count; i++) {
+            size_t cap = s->setup_tokens[i].token_value.len + 18u;
+            moq_buf_writer_t tw;
+            moq_buf_writer_init(&tw, bytes, cap);
+            if (profile->encode_setup_token(&tw, s->setup_tokens[i].token_type,
+                                            s->setup_tokens[i].token_value) < 0) {
+                if (profile->destroy) profile->destroy(s->profile_state);
+                session_wipe(mem, total);
+                cfg->alloc->free(mem, total, cfg->alloc->ctx);
+                return MOQ_ERR_INVAL;
+            }
+            s->setup_token_wire[i].data = bytes;
+            s->setup_token_wire[i].len = moq_buf_writer_offset(&tw);
+            bytes += cap;
+        }
+    }
+
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, streaming_objects) +
         sizeof(cfg->streaming_objects))
         s->streaming_objects = cfg->streaming_objects;
@@ -2473,7 +2564,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
              * this late create-failure path (the normal teardown in
              * moq_session_destroy calls it, but that never runs here). */
             profile->destroy(s->profile_state);
-            s->alloc.free(s, total, s->alloc.ctx);
+            session_release_block(s, total);
             return crc;
         }
     }
@@ -2487,10 +2578,33 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         if (!s->track_hist) {
             moq_token_cache_free(&s->peer_token_cache);
             profile->destroy(s->profile_state);
-            s->alloc.free(s, total, s->alloc.ctx);
+            session_release_block(s, total);
             return MOQ_ERR_NOMEM;
         }
         memset(s->track_hist, 0, th_bytes);
+    }
+
+    /* The SETUP carrying configured tokens is encoded once here, with every
+     * other option this side sends, into a buffer as large as the SETUP
+     * message length allows: a configuration whose SETUP cannot be encoded
+     * is refused now rather than failing when the session starts. (Whether a
+     * given send arena holds it is a separate, later question.) */
+    if (s->setup_token_count > 0 && profile->encode_own_setup) {
+        size_t cap = (size_t)UINT16_MAX + 16u;
+        uint8_t *tmp = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+        if (!tmp) {
+            moq_session_destroy(s);
+            return MOQ_ERR_NOMEM;
+        }
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, tmp, cap);
+        moq_result_t erc = profile->encode_own_setup(s, &w);
+        session_wipe(tmp, cap);
+        s->alloc.free(tmp, cap, s->alloc.ctx);
+        if (erc < 0) {
+            moq_session_destroy(s);
+            return MOQ_ERR_INVAL;
+        }
     }
 
     *out = s;
@@ -2551,9 +2665,10 @@ void moq_session_destroy(moq_session_t *s)
     ns_sub_destroy_all(s);
     track_sub_destroy_all(s);
     /* noslot_carriers is arena-backed (part of the session slab); no separate
-     * free -- the slab free below reclaims it. */
-    moq_alloc_t alloc = s->alloc;
-    alloc.free(s, s->alloc_size, alloc.ctx);
+     * free -- the slab free below reclaims it. A session that presented SETUP
+     * tokens wipes the whole slab first: the copies, their encodings and any
+     * SETUP still in the send arena hold the credential. */
+    session_release_block(s, s->alloc_size);
 }
 
 moq_session_state_t moq_session_state(const moq_session_t *s)
@@ -3024,12 +3139,13 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
      * is keyed by stream ref: recognised through the request registry's
      * by-streamref lookup, which returns the packed endpoint the registry holds
      * for that ref. Without this, a retained request-stream WOULD_BLOCK is
-     * fatalized by the bridge (#245a). The lookup reports whatever ownership the
+     * fatalized by the bridge. The lookup reports whatever ownership the
      * registry carries for the ref; it does not independently revalidate a
-     * stale slot (the ordinal-0 cross-owner question is #252, out of scope). */
+     * stale slot (an ordinal-0 request id shared across owners is not
+     * disambiguated here). */
     if (request_registry_find_by_streamref(s, ref).kind != MOQ_REQ_NONE)
         return true;
-    /* A no-slot admission carrier (#245b): the request has no owner yet, but a
+    /* A no-slot admission carrier: the request has no owner yet, but a
      * fixed terminal is durably owed on this stream, so the bridge must retain
      * its retry rather than fatalize it. */
     if (noslot_carrier_find(s, ref) >= 0)
@@ -3054,9 +3170,14 @@ bool moq_session_can_admit_data_stream(const moq_session_t *s)
 
 /* The bridge's narrower question for the local-closed retirement decision: is
  * the PEER's terminal still owed here? This excludes a live request-registry
- * owner -- a local-origin request bidi the app itself FIN'd must retire even
- * while its owner lingers awaiting a response -- but keeps the peer-origin
- * receive paths and the two #245 peer-terminal-awaiting signals. */
+ * owner in general -- a local-origin request bidi the app itself FIN'd must
+ * retire even while its owner lingers awaiting a response -- but keeps the
+ * peer-origin receive paths, the two peer-terminal-awaiting signals (a no-slot
+ * admission carrier and a drain-ring entry), and the one request whose
+ * response is always owed on the peer's half after our FIN: TRACK_STATUS opens
+ * its stream with FIN as its first and only message, and TRACK_STATUS_OK or
+ * REQUEST_ERROR then arrives on that same stream (draft-18 §10.14). The
+ * requester entry lives exactly until the peer's FIN or RESET ends that half. */
 bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
                                              moq_stream_ref_t ref)
 {
@@ -3073,6 +3194,10 @@ bool moq_session_stream_awaits_peer_terminal(const moq_session_t *s,
     if (noslot_carrier_find(s, ref) >= 0)
         return true;
     if (drain_ref_contains(s, ref))
+        return true;
+    moq_request_endpoint_t ep = request_registry_find_by_streamref(s, ref);
+    if (ep.kind == MOQ_REQ_TRACK_STATUS &&
+        s->track_statuses[ep.slot].role == MOQ_TS_ROLE_REQUESTER)
         return true;
     return false;
 }

@@ -5,7 +5,7 @@ import Foundation
 /// The public model types are written against these protocols so the whole
 /// async surface is unit-testable with scripted implementations — no relay,
 /// no network, no wall-clock. The real implementations (over the C service
-/// tier via the CMoQService system module) land with the bridge slice; the
+/// tier via the CMoQService system module) live in the MoQService target; the
 /// scripted ones live in MoQServiceCoreTests.
 ///
 /// These are implementation seams, not public API: everything here is
@@ -112,8 +112,8 @@ package enum ReceiverPollResult: Sendable {
 /// One media object polled from the receiver backend with EXCLUSIVE
 /// ownership (the C `moq_media_object_t` on MOQ_OK): `storage` owns the
 /// transferred buffers and is released exactly once by ``MediaObject``'s
-/// deinit. Metadata is copied at poll time; `handleID` resolves to the S3
-/// `MediaTrack`.
+/// deinit. Metadata is copied at poll time; `handleID` resolves to the
+/// `MediaTrack` delivered by the track-event stream.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package struct ReceiverPolledObject: Sendable {
     package var handleID: UInt64
@@ -245,7 +245,7 @@ package protocol SenderBackendFactory {
 }
 
 /// Sender-side backing. Subscriber/demand events, remove/convert/complete,
-/// and stats land in a later slice.
+/// and stats are not part of this backing.
 ///
 /// Any-thread C snapshots: `isReady` (announced + catalog published, NOT
 /// demand), `isTerminal` (closed OR fatal), `isFatal`/`fatalCode` (the

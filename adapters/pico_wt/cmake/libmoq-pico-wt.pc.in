@@ -5,9 +5,9 @@
 # from CMAKE_INSTALL_LIBDIR depth, so lib, lib64, and multiarch dirs like
 # lib/x86_64-linux-gnu all resolve to ${prefix} correctly.
 #
-# picoquic ships no pkg-config file, so its libraries (picohttp-core,
-# picoquic-core/log), picotls, and the configured TLS provider are embedded
-# directly here. Those dependencies are NOT installed into ${prefix}; their
+# picoquic ships no pkg-config file, so its libraries (picohttp-core, then
+# picoquic-log and picoquic-core), picotls, and the configured TLS provider
+# are embedded directly here. Those dependencies are NOT installed into ${prefix}; their
 # absolute lib dirs are baked at libmoq configure time -- the same relocatability
 # caveat the picoquic CMake package and libmoq.pc already carry. Static
 # library: everything needed is in public Libs so a plain `--libs`

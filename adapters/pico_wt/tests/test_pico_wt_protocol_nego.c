@@ -132,7 +132,9 @@ static int run_scenario(uint8_t cid_byte, const char *offer,
 
     path_table[0] = (picohttp_server_path_item_t){
         .path = "/moq", .path_length = 4,
-        .path_callback = nego_wt_cb, .path_app_ctx = srv};
+        .path_callback = nego_wt_cb, .path_app_ctx = srv,
+        .connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL,
+        .connect_protocol_length = sizeof(H3ZERO_WEBTRANSPORT_H3_PROTOCOL) - 1};
     memset(&server_param, 0, sizeof(server_param));
     server_param.path_table = path_table;
     server_param.path_table_nb = 1;

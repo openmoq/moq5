@@ -56,9 +56,9 @@ if(NOT _rc EQUAL 0)
     message(FATAL_ERROR "shared managed configure failed:\n${_out}")
 endif()
 
-# Build the shared tree. Pre-fix this fails to link the managed shared
-# object on the hidden helper; the fix makes the two units share the base
-# dylib so it resolves.
+# Build the shared tree. The managed shared object links against the hidden
+# helper only because the two units share the base dylib; if they did not,
+# this link would fail.
 moq_consumer_execute(
     COMMAND ${CMAKE_COMMAND} --build "${_tree}"
     RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)

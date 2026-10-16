@@ -4,7 +4,8 @@
  * real MsQuic connection on localhost — session setup over extended
  * CONNECT with the MoQ subprotocol, SUBSCRIBE and its acceptance over
  * the MoQ control stream, one object delivered over a WebTransport uni
- * stream, then a clean WebTransport close. Plus a refusal case: a
+ * stream, then a clean WebTransport close; the same exchange with the
+ * object sent as a WebTransport datagram. Plus a refusal case: a
  * client requiring a MoQ version the server does not serve is refused
  * at the WebTransport layer and the MoQ session never sets up.
  *
@@ -49,7 +50,13 @@ struct app_side {
 
     uint8_t payload[64];
     size_t payload_len;
+    int got_datagram;    /* that object arrived as a datagram */
 };
+
+/* When set, the server publishes the object as a datagram (repeated a few
+ * times: datagrams are lossy) instead of on a subgroup stream. */
+static int g_publish_datagram;
+#define DATAGRAM_REPEATS 4
 
 static void side_init(struct app_side *a)
 {
@@ -96,6 +103,21 @@ static void server_handle_subscribe(moq_wtquic_conn_t *conn,
     moq_accept_subscribe_cfg_init(&acfg);
     if (moq_session_accept_subscribe(s, sub, &acfg, 0) < 0)
         return;
+
+    if (g_publish_datagram) {
+        if (moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)payload,
+                             sizeof(payload) - 1, &buf) < 0)
+            return;
+        for (uint64_t i = 0; i < DATAGRAM_REPEATS; i++)
+            (void)moq_session_send_object_datagram(s, sub, 0, i, 200, false,
+                                                   buf, NULL, 0, 0);
+        moq_rcbuf_decref(buf);
+        pthread_mutex_lock(&a->mu);
+        a->accepted = 1;
+        pthread_cond_broadcast(&a->cv);
+        pthread_mutex_unlock(&a->mu);
+        return;
+    }
 
     moq_subgroup_cfg_init(&sgcfg);
     sgcfg.group_id = 0;
@@ -177,6 +199,7 @@ static void app_hook(moq_wtquic_conn_t *conn, void *user)
                     a->payload_len = l;
                 }
                 a->got_object = 1;
+                a->got_datagram = ev.u.object_received.datagram;
             }
             pthread_cond_broadcast(&a->cv);
             pthread_mutex_unlock(&a->mu);
@@ -323,6 +346,7 @@ out:
         CHECK(memcmp(cl.payload, "hello-over-msquic",
                      cl.payload_len) == 0);
     }
+    CHECK(cl.got_datagram == g_publish_datagram);
     CHECK(!moq_wtquic_conn_is_fatal(client_conn));
     CHECK(!moq_wtquic_conn_is_fatal(server_conn));
     CHECK(moq_wtquic_conn_is_closed(client_conn));
@@ -335,7 +359,18 @@ out:
     side_destroy(&sv);
     side_destroy(&cl);
     if (failures == 0)
-        printf("PASS: pubsub_over_msquic\n");
+        printf(g_publish_datagram ? "PASS: datagram_over_msquic\n"
+                                  : "PASS: pubsub_over_msquic\n");
+}
+
+/* The same exchange with the object published as a MoQ datagram: the
+ * adapter sends it as a WebTransport datagram and the subscriber
+ * receives it, marked as datagram-delivered. */
+static void test_datagram_over_msquic(void)
+{
+    g_publish_datagram = 1;
+    test_pubsub_over_msquic();
+    g_publish_datagram = 0;
 }
 
 /* A client requiring a MoQ version the server does not serve is
@@ -499,7 +534,7 @@ static void raw_established(wtq_session_t *s, wtq_str_t sub, void *user)
             0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
             0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
         };
-        wtq_span_t span = { garbage, sizeof(garbage) };
+        wtq_span_t span = { .data = garbage, .len = sizeof(garbage) };
 
         (void)wtq_stream_send(st, &span, 1, WTQ_SEND_FIN, NULL);
     }
@@ -644,6 +679,7 @@ int main(int argc, char **argv)
 
     test_conn_cfg_validation();
     test_pubsub_over_msquic();
+    test_datagram_over_msquic();
     test_version_mismatch_refused();
     test_garbage_control_torn_down();
 

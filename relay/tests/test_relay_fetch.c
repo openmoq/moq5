@@ -929,8 +929,8 @@ test_chunk_ingest_core(void)
  * Proves: the item is served as whole-object (chunk_count presented 0) with the
  * exact coalesced bytes, re-peek is idempotent (same pin, no re-coalesce), commit
  * advances to END, and the allocator balances (the coalesced buffer is released
- * exactly once). RED: restore the `chunk_count > 0` skip in fetch_scan_next and
- * the peek returns FETCH_ITEM_END with zero objects. */
+ * exactly once). fetch_scan_next must not skip records with chunk_count > 0;
+ * a scan that skipped them would return FETCH_ITEM_END with zero objects. */
 static int
 test_chunked_complete_fetch(void)
 {
@@ -1016,9 +1016,9 @@ test_chunked_complete_fetch(void)
  * FETCH allocates two blocks — the temp buffer (r_alloc) and the owning rcbuf
  * (moq_rcbuf_create). Injecting a failure at EITHER must make fetch_peek return a
  * TERMINAL (not END, not an object), leak nothing (temp + rcbuf), leave no stale
- * pin/accounting (a retry serves the same object), and let close succeed. RED:
- * drop the `r_free(tmp)` after moq_rcbuf_create in fetch_coalesce_chunks and the
- * final a.live check catches the leaked temp. */
+ * pin/accounting (a retry serves the same object), and let close succeed. The
+ * final a.live check catches a temp that fetch_coalesce_chunks does not free
+ * after moq_rcbuf_create. */
 static int
 test_chunked_fetch_oom(void)
 {
@@ -1127,9 +1127,8 @@ test_chunked_fetch_oom(void)
  * hold the final reference PAST core teardown (after fetch_commit unpins the
  * core's ref). So the payload rcbuf must free via the allocator, not the core.
  * This takes a ref, tears the core DOWN, then does the final decref — which must
- * be clean. RED: revert fetch_coalesce_chunks to moq_rcbuf_wrap with a
- * core-pointer release callback and this decref-after-destroy is a use-after-free
- * of the core (ASan abort). */
+ * be clean. A payload wrapped with a core-pointer release callback would make
+ * this decref-after-destroy a use-after-free of the core (ASan abort). */
 static int
 test_chunked_fetch_payload_outlives_core(void)
 {

@@ -86,10 +86,10 @@ struct moq_pq_conn {
  * picoquic's own automatic MAX_DATA growth (delivery-anchored,
  * 2*offset_received > maxdata_local) remains active and is not bounded by the
  * adapter. Connection-level credit is NOT directly application-controlled:
- * picoquic's only conn-level control (picoquic_set_max_data_control) disables
- * picoquic_open_flow_control outright (mutually exclusive by the
- * max_data_limit guard) -- raw attach callers must NOT enable it (see the
- * public header). TOTAL connection arrest is therefore DERIVATIVE: once every
+ * picoquic's only conn-level control (picoquic_set_max_data_control) stops
+ * picoquic_open_flow_control from raising MAX_DATA (the max_data_limit guard),
+ * leaving the connection window at the caller's limit -- raw attach callers
+ * must NOT enable it (see the public header). TOTAL connection arrest is therefore DERIVATIVE: once every
  * stream's frozen window is exhausted, delivery stops, which stops both the
  * automatic advance (anchored to offset_received) and the adapter's bounded
  * increments.

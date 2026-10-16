@@ -11,9 +11,9 @@
  * The accessors are NULL-safe, and their defaults preserve draft-16 behavior
  * (no per-request bidi streams; every peer unidirectional stream is data).
  *
- * This slice adds only the capability flag, the hooks, and the NULL-safe
- * accessors. No profile populates them yet (draft-16 leaves them at their
- * defaults) and no wire behavior is introduced. Both the default branch (real
+ * These tests cover only the capability flag, the hooks, and the NULL-safe
+ * accessors (draft-16 leaves them at their defaults); no wire behavior is
+ * exercised. Both the default branch (real
  * draft-16 profile) and the capability-gated branch (a fake profile) are
  * exercised.
  */

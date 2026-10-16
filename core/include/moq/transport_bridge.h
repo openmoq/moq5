@@ -629,6 +629,23 @@ MOQ_API bool     moq_transport_bridge_has_events(
 MOQ_API bool     moq_transport_bridge_terminal_facts(
     const moq_transport_bridge_t *brg, bool *out_observed);
 
+/*
+ * True when `stream_id` carries this bridge's MoQ control channel: the control
+ * bidi of a bidi-control profile, or either stream of a uni-control pair (the
+ * local one once opened, the peer's once classified). A transport adapter
+ * that must decide how a transport-level terminal on a stream maps to the
+ * session (e.g. a WebTransport reset that carries no application code) asks
+ * this instead of inferring the topology. Pure read under caller-provided
+ * serialization. Private, lockstep adapter SPI, NOT application API.
+ *
+ * It answers from what the bridge has seen, not from the transport's full
+ * topology: a peer unidirectional stream is known as control only once its
+ * stream type has been read, so one reset before its first byte answers
+ * false.
+ */
+MOQ_API bool     moq_transport_bridge_stream_is_control(
+    const moq_transport_bridge_t *brg, uint64_t stream_id);
+
 MOQ_API size_t   moq_transport_bridge_stream_count(
     const moq_transport_bridge_t *brg);
 MOQ_API size_t   moq_transport_bridge_tombstone_count(

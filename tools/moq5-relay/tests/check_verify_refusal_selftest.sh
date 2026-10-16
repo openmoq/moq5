@@ -42,7 +42,7 @@ expect "the real refusal" 2 "$REAL" yes
 expect "the refusal among other output" 2 "some earlier line
 $REAL" yes
 
-# -- the two reproductions from the review -----------------------------------
+# -- two wrong-diagnostic reproductions --------------------------------------
 # A different diagnostic from the same tool is a different failure, whatever
 # status it carries. Accepting these is what let an unrelated configuration
 # error stand in for the single-lane guard.
@@ -95,8 +95,8 @@ mk() {  # <name> <body>
     printf '#!/usr/bin/env bash\n%s\n' "$2" > "$work/$1"
     chmod +x "$work/$1"
 }
-# accepts dual, and refuses raw1 with the WRONG diagnostic -- the review's
-# reproduction, at each of the two statuses it used
+# accepts dual, and refuses raw1 with the WRONG diagnostic, at each of the two
+# statuses
 for st in 1 2; do
     mk "wrong_verify_rc$st" '
 case "$*" in

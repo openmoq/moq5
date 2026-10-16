@@ -60,8 +60,22 @@ label_worst(void)
  * to have.
  */
 
+/* What the normalization removed, so the test can require the exact delta
+ * rather than "whatever happened to carry a local label". */
+typedef struct {
+    unsigned dropped_per_view;
+    unsigned dropped_process;
+    unsigned dropped_other;
+    unsigned help_rewritten;
+    unsigned dropped_reclaim;   /* lines of the track/trie reclaim families */
+} norm_stats_t;
+
+static size_t normalize_extended(const char *src, size_t n, char *dst,
+                                 size_t cap, norm_stats_t *st);
+
 /* The single-snapshot document carries no shard plane, so it has no wake
- * family and no extended series: legacy and `_ex` coincide here. */
+ * family: its only extended series are the reclaim families, and with them
+ * removed legacy and `_ex` coincide byte for byte. */
 static int
 test_p004_single_has_no_extended_series(void)
 {
@@ -82,8 +96,15 @@ test_p004_single_has_no_extended_series(void)
                                              via_ex, sizeof(via_ex), &n_ex);
     MOQ_TEST_CHECK_EQ_INT(r1, MOQR_OK);
     MOQ_TEST_CHECK_EQ_INT(r2, MOQR_OK);
-    MOQ_TEST_CHECK_EQ_U64((uint64_t)n_legacy, (uint64_t)n_ex);
-    MOQ_TEST_CHECK(memcmp(legacy, via_ex, n_legacy) == 0);
+    static char norm1[262144];
+    norm_stats_t st1;
+    size_t nn1 = normalize_extended(via_ex, n_ex, norm1, sizeof(norm1), &st1);
+    /* tracks_reclaimable 3 + track_evictions 2+2 + nodes_reclaimable 3 +
+     * nodes_reclaimed 3 records, and nothing else. */
+    MOQ_TEST_CHECK_EQ_U64(st1.dropped_reclaim, 13u);
+    MOQ_TEST_CHECK_EQ_U64(st1.help_rewritten, 0u);
+    MOQ_TEST_CHECK_EQ_U64((uint64_t)n_legacy, (uint64_t)nn1);
+    MOQ_TEST_CHECK(nn1 == n_legacy && memcmp(legacy, norm1, n_legacy) == 0);
 
     /* 0.0.4 has no OpenMetrics furniture. */
     MOQ_TEST_CHECK(!HAS(legacy, "# EOF"));
@@ -1373,17 +1394,34 @@ find_bytes(const char *hay, size_t hn, const char *needle, size_t nn)
     return NULL;
 }
 
-/* What the normalization removed, so the test can require the exact delta
- * rather than "whatever happened to carry a local label". */
-typedef struct {
-    unsigned dropped_per_view;
-    unsigned dropped_process;
-    unsigned dropped_other;
-    unsigned help_rewritten;
-} norm_stats_t;
 
 static const char kWakeFamily[] = "moqrelay_wake_requests_total";
 static const char kWakeProcFamily[] = "moqrelay_process_wake_requests_total";
+
+/* The extended set's track-table and namespace-trie reclaim families, per
+ * shard and as process aggregates. Matched by exact family name. */
+static const char *const kReclaimFamilies[] = {
+    "moqrelay_tracks_reclaimable",
+    "moqrelay_process_tracks_reclaimable",
+    "moqrelay_track_evictions_total",
+    "moqrelay_process_track_evictions_total",
+    "moqrelay_namespace_nodes_reclaimable",
+    "moqrelay_process_namespace_nodes_reclaimable",
+    "moqrelay_namespace_nodes_reclaimed_total",
+    "moqrelay_process_namespace_nodes_reclaimed_total",
+};
+
+static bool
+is_reclaim_family(const char *name)
+{
+    for (size_t k = 0; k < sizeof(kReclaimFamilies) / sizeof(*kReclaimFamilies);
+         k++) {
+        if (strcmp(name, kReclaimFamilies[k]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /* Sample or metadata name at the head of a line, up to '{' or a space. */
 static size_t
@@ -1428,6 +1466,22 @@ normalize_extended(const char *src, size_t n, char *dst, size_t cap,
 
         char name[OMV_NAME_MAX];
         line_name(line, llen, name, sizeof(name));
+
+        /* The reclaim families exist only in the extended set: drop their
+         * HELP / TYPE records and samples whole. */
+        {
+            char fam[OMV_NAME_MAX];
+            fam[0] = '\0';
+            if (llen > 7u && (strncmp(line, "# HELP ", 7) == 0 ||
+                              strncmp(line, "# TYPE ", 7) == 0)) {
+                line_name(line + 7, llen - 7u, fam, sizeof(fam));
+            }
+            if (is_reclaim_family(name) || is_reclaim_family(fam)) {
+                st->dropped_reclaim++;
+                i += llen;
+                continue;
+            }
+        }
 
         if (find_bytes(line, llen, "cause=\"local\"", 13) != NULL) {
             if (strcmp(name, kWakeFamily) == 0) {
@@ -1624,9 +1678,79 @@ test_extended_differs_only_by_known_delta(void)
     MOQ_TEST_CHECK_EQ_U64(st.dropped_process, 1u);
     MOQ_TEST_CHECK_EQ_U64(st.dropped_other, 0u);
     MOQ_TEST_CHECK_EQ_U64(st.help_rewritten, 2u);
+    /* Reclaim families over 4 views: three single-series families at
+     * HELP+TYPE+4 samples+HELP+TYPE+1 aggregate each, and the eviction vector
+     * at HELP+TYPE+8 samples+HELP+TYPE+2 aggregates. */
+    MOQ_TEST_CHECK_EQ_U64(st.dropped_reclaim, 3u * 9u + 14u);
 
     MOQ_TEST_CHECK_EQ_U64((uint64_t)nn, (uint64_t)ln);
     MOQ_TEST_CHECK(nn == ln && memcmp(norm, legacy, ln) == 0);
+    return failures;
+}
+
+/* The reclaim families each render their own core counter: distinct values,
+ * each under its own series (single snapshot and multi-shard, with the
+ * process aggregates summing like with like). */
+static int
+test_reclaim_families_map_their_counters(void)
+{
+    int failures = 0;
+    moqr_core_stats_t cs;
+    memset(&cs, 0, sizeof(cs));
+    cs.tracks_reclaimable = 101;
+    cs.tracks_evicted_capacity = 202;
+    cs.tracks_evicted_idle = 303;
+    cs.ns_nodes_reclaimable = 404;
+    cs.ns_nodes_reclaimed = 505;
+    moqr_obs_labels_t lb = { 1, "msquic", "moqt-18" };
+    static char doc[262144];
+    size_t n = 0;
+    MOQ_TEST_CHECK_EQ_INT(moqr_metrics_write_ex(&cs, NULL, &lb,
+                                                MOQR_OBS_FMT_PROMETHEUS_004,
+                                                doc, sizeof(doc), &n),
+                          MOQR_OK);
+    const char *base = "{shard=\"1\",transport=\"msquic\",version=\"moqt-18\"";
+    char want[256];
+    snprintf(want, sizeof(want), "moqrelay_tracks_reclaimable%s} 101\n", base);
+    MOQ_TEST_CHECK(HAS(doc, want));
+    snprintf(want, sizeof(want),
+             "moqrelay_track_evictions_total%s,reason=\"capacity\"} 202\n",
+             base);
+    MOQ_TEST_CHECK(HAS(doc, want));
+    snprintf(want, sizeof(want),
+             "moqrelay_track_evictions_total%s,reason=\"idle\"} 303\n", base);
+    MOQ_TEST_CHECK(HAS(doc, want));
+    snprintf(want, sizeof(want),
+             "moqrelay_namespace_nodes_reclaimable%s} 404\n", base);
+    MOQ_TEST_CHECK(HAS(doc, want));
+    snprintf(want, sizeof(want),
+             "moqrelay_namespace_nodes_reclaimed_total%s} 505\n", base);
+    MOQ_TEST_CHECK(HAS(doc, want));
+
+    /* Two shards with different values: per-shard series and sums. */
+    moqr_core_stats_t c2 = cs;
+    c2.tracks_reclaimable = 1;
+    c2.tracks_evicted_capacity = 2;
+    c2.tracks_evicted_idle = 3;
+    c2.ns_nodes_reclaimable = 4;
+    c2.ns_nodes_reclaimed = 5;
+    moqr_snapshot_view_t vs[2];
+    memset(vs, 0, sizeof(vs));
+    vs[0].core = &cs;
+    vs[0].labels = (moqr_obs_labels_t){ 0, "msquic", "moqt-18" };
+    vs[1].core = &c2;
+    vs[1].labels = (moqr_obs_labels_t){ 1, "msquic", "moqt-18" };
+    MOQ_TEST_CHECK_EQ_INT(moqr_metrics_write_multi_ex(
+                              vs, 2u, MOQR_OBS_FMT_PROMETHEUS_004, doc,
+                              sizeof(doc), &n),
+                          MOQR_OK);
+    MOQ_TEST_CHECK(HAS(doc, "moqrelay_process_tracks_reclaimable 102\n"));
+    MOQ_TEST_CHECK(HAS(doc, "moqrelay_process_track_evictions_total{reason=\"capacity\"} 204\n"));
+    MOQ_TEST_CHECK(HAS(doc, "moqrelay_process_track_evictions_total{reason=\"idle\"} 306\n"));
+    MOQ_TEST_CHECK(HAS(doc, "moqrelay_process_namespace_nodes_reclaimable 408\n"));
+    MOQ_TEST_CHECK(HAS(doc, "moqrelay_process_namespace_nodes_reclaimed_total 510\n"));
+    MOQ_TEST_CHECK(HAS(doc, "moqrelay_tracks_reclaimable{shard=\"1\",transport=\"msquic\",version=\"moqt-18\"} 1\n"));
+    MOQ_TEST_PASS("reclaim_families_map_their_counters");
     return failures;
 }
 
@@ -1634,6 +1758,7 @@ int
 main(void)
 {
     int failures = 0;
+    failures += test_reclaim_families_map_their_counters();
     failures += test_p004_single_has_no_extended_series();
     failures += test_p004_multi_legacy_omits_extended_series();
     failures += test_openmetrics_shape();

@@ -4149,7 +4149,7 @@ test_nocarrier_release_is_its_own_call(void)
  * Two sites sharing an id is not a cosmetic problem: arming one silently
  * selects whichever wrapper the owner reaches first, and an oracle that
  * compares only the integer cannot tell that it never reached the site it
- * named. That is a false green, and it is exactly what happened.
+ * named. That is a false pass.
  *
  * The values come from an enumeration in one header, so a collision cannot be
  * written; this proves the property that construction is supposed to give, and

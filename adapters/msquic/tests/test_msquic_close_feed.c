@@ -671,7 +671,7 @@ static struct drained local_close(struct rig *r, uint64_t code)
  * count moves. The bridge checks are the honest composition statement -- the
  * session terminal already committed with the local code when the
  * CLOSE_SESSION action was dispatched, and no later adapter feed may disturb
- * it. They pass today and must keep passing after the fix.
+ * it.
  */
 static void check_local_settles(struct rig *r, const char *tag,
                                 uint64_t expect_code)
@@ -1006,7 +1006,7 @@ static void t_local_close_reason_not_retained(void)
         printf("PASS: local_close_reason_not_retained\n");
 }
 
-/* --- controls: the non-local causes, on the pre-fix product -------------- */
+/* --- controls: non-local causes, which never consult the local-cause record */
 
 static void t_ctl_peer_close_cause(void)
 {

@@ -315,6 +315,15 @@ Cert handling is explicit on every client facade:
     from the `configure_quic(quic, ctx)` hook — it runs after the default
     and transactionally replaces it. The verifier types are not reachable
     from installed headers, so libmoq ships the helper below.
+    For application-owned trust, `<moq/picoquic_verify.h>` exposes the boolean
+    `moq_picoquic_supports_cert_verify_callback()` query and the
+    `moq_result_t` setter `moq_picoquic_set_cert_verify_callback()`.
+    The setter returns `MOQ_OK`, or `MOQ_ERR_INVAL`, `MOQ_ERR_UNSUPPORTED`,
+    `MOQ_ERR_NOMEM`, `MOQ_ERR_WRONG_STATE` (frozen TLS configuration), or
+    `MOQ_ERR_INTERNAL`, as documented in the header. Invalid arguments take
+    precedence over provider support. In a `configure_quic` hook, normalize
+    the setter result to `result == MOQ_OK ? 0 : -1`. Media consumers use
+    the service endpoint's `verify_certificate` configuration instead.
 - **Servers** require `cert_path` + `key_path` (`_create` fails
   `MOQ_ERR_INVAL` without them). `insecure_skip_verify` and the CA-pinning
   helper are **client-side** controls for verifying a *server* certificate;

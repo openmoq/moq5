@@ -62,7 +62,11 @@
  *         "reason": "unscoped" }        // optional; reported on deny
  *     ]
  *   },
- *   "linger_us": 500
+ *   "linger_us": 500,                   // upstream kept after last subscriber
+ *   "warm_idle_us": 60000000            // cache kept after the source is gone
+ *                                       // and nothing reads it; 0 = default
+ *                                       // (60 s); 18446744073709551615 =
+ *                                       // never (table-full LRU reclaim only)
  * }
  *
  * Unknown keys are rejected (config typos fail loudly, not silently).

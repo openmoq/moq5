@@ -49,7 +49,7 @@ int main(void)
     /* Old-ABI canary: a binary compiled against the v0 header allocated a
      * moq_pico_wt_conn_cfg_t ending at `alloc`. The legacy pointer-only
      * initializer must touch ONLY that v0 prefix, never the trailing canary.
-     * (RED: a memset(sizeof(*cfg)) zeroes a pointer-width into the canary.) */
+     * (A memset(sizeof(*cfg)) would zero a pointer-width into the canary.) */
     {
         struct old_cfg_v0 {
             uint32_t                struct_size;

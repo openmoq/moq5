@@ -308,13 +308,17 @@ static moq_result_t parse_cenc_sinf(const uint8_t *eb, size_t eb_len,
         return MOQ_ERR_PROTO;
     const uint8_t *tp = tenc + tenc_box.hdr;
     size_t tlen = tenc_box.size - tenc_box.hdr;
-    /* FullBox(4) + reserved/pattern(1) + isProtected(1) + iv_size(1)
-     * + default_KID(16) = 23 byte minimum; trailing (constant-IV) data
-     * is permitted and ignored. */
-    if (tlen < 23) return MOQ_ERR_PROTO;
-    out->default_is_protected = tp[5];
-    out->default_per_sample_iv_size = tp[6];
-    out->default_kid.data = tp + 7;
+    /* ISO/IEC 23001-7 8.2.2 TrackEncryptionBox:
+     *   FullBox(4) + reserved(1) + reserved-or-pattern(1) + isProtected(1)
+     *   + iv_size(1) + default_KID(16) = 24 byte minimum; trailing
+     *   (constant-IV) data is permitted and ignored.
+     * TWO reserved bytes precede isProtected -- in v0 both are zero, in v1 the
+     * second carries default_crypt_byte_block/default_skip_byte_block. Reading
+     * from offset 5 instead of 6 shifts every field, and the KID by one byte. */
+    if (tlen < 24) return MOQ_ERR_PROTO;
+    out->default_is_protected = tp[6];
+    out->default_per_sample_iv_size = tp[7];
+    out->default_kid.data = tp + 8;
     out->default_kid.len = 16;
 
     out->has_cenc = true;

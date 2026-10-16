@@ -5,7 +5,7 @@
  * facade: every case here is rejected (or accepted) by create() BEFORE it
  * spawns the network thread or attempts a WT CONNECT, so they run without a
  * server. Real connection coverage is the E2E moqx WebTransport cell (a live
- * relay), per the slice plan — there is no cheap in-process proxygen WT
+ * relay) — there is no cheap in-process proxygen WT
  * server for an in-tree loopback.
  */
 

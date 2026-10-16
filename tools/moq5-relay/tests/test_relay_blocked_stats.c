@@ -844,7 +844,7 @@ test_seallog_interval(void)
     return failures;
 }
 
-/* The SGDIAG→SEALLOG demand join, adversarial REDs: (1) two demands publish
+/* The SGDIAG→SEALLOG demand join, adversarial cases: (1) two demands publish
  * seals with the SAME (group, subgroup) identity, so identity alone cannot
  * attribute them — the join must run on the SGDIAG-mapped demand and the
  * WRONG demand must never satisfy the target's ownership; (2) the retained

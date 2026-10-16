@@ -176,7 +176,11 @@ typedef struct moq_media_sender_cfg {
     bool                                 publish_tracks;
 
     /* Media written while its track has no demand: false (default) holds it
-     * queued until demand appears; true drops it to stay at the live edge. */
+     * queued until demand appears; true drops it to stay at the live edge.
+     * After a no-demand drop, the remainder of that group is also discarded,
+     * even if demand returns. Media resumes at the next sync-anchored group
+     * (starts_group, or the first object after ends_group), not at a sync
+     * object within the same group. Other tracks and END_OF_TRACK still drain. */
     bool                                 drop_without_demand;
 
     /* OPT-IN interval between automatic independent catalog refreshes, in
@@ -346,7 +350,7 @@ typedef struct moq_media_track_cfg {
      * 'depends' on this track: packaging "mediatimeline", mimeType
      * "application/json", NO eventType. Its objects carry explicit §7.1.1 records
      * [mediaTime, [group,object], wallclock] describing this track's published
-     * groups. In this slice the service records ONE record per media group, at
+     * groups. The service records ONE record per media group, at
      * the group-start object (Location (group, 0)): mediaTime is that object's
      * presentation time in ms, and wallclock is the emit time in ms for a live
      * track or 0 for a non-live/VOD track. Per-object records are a future
@@ -376,6 +380,18 @@ typedef struct moq_media_track_cfg {
     bool        has_alt_group;
     int         alt_group;
 
+    /* Publisher scheduling preference (0 is highest, 255 lowest). Subscriber
+     * priority takes precedence; cross-stream arrival order is not promised.
+     * has_publisher_priority=false keeps the default 128, regardless of the
+     * value field. Generated timeline tracks always keep that default.
+     * Read only when struct_size covers the complete presence/value pair. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    bool        has_publisher_priority;
+    uint8_t     publisher_priority;
     /* DEFAULT_PUBLISHER_GROUP_ORDER for this track (MOQT 7.1): ASCENDING or
      * DESCENDING is advertised to every subscriber; DEFAULT (the default)
      * advertises none. Other values: add_track fails MOQ_ERR_INVAL. The
@@ -384,7 +400,19 @@ typedef struct moq_media_track_cfg {
     moq_group_order_t group_order;
 } moq_media_track_cfg_t;
 
+#define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
+    offsetof(moq_media_track_cfg_t, has_track_duration)
+
+/* The exported pointer-only symbol clears and stamps the complete historical
+ * layout through alt_group. Source calls use the caller-sized macro below.
+ * Initializers set is_live when its complete field fits. */
 MOQ_API void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg);
+/* Clears and stamps min(cfg_size, library size); leaves future trailing storage
+ * untouched. NULL or storage too small for struct_size is a no-op. */
+MOQ_API void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg,
+                                          size_t cfg_size);
+#define moq_media_track_cfg_init(cfg) \
+    moq_media_track_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /* Add a track. Legal both before and after readiness: a post-ready add
  * registers the track and triggers an independent catalog republish (a new

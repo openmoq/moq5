@@ -51,11 +51,12 @@ enum {
     MOQ_TEST_CENC_OMIT_SCHM    = 1u << 2,
     MOQ_TEST_CENC_OMIT_SCHI    = 1u << 3,
     MOQ_TEST_CENC_OMIT_TENC    = 1u << 4,
-    MOQ_TEST_CENC_SHORT_TENC   = 1u << 5,  /* tenc body < 23 bytes */
+    MOQ_TEST_CENC_SHORT_TENC   = 1u << 5,  /* tenc body 10 (<24 bytes) */
     MOQ_TEST_CENC_SHORT_SCHM   = 1u << 6,  /* schm body 8 (< hdr+12) */
-    MOQ_TEST_CENC_TRAILING_TENC = 1u << 7, /* tenc body 27 (23 + trailing) */
+    MOQ_TEST_CENC_TRAILING_TENC = 1u << 7, /* tenc body 28 (24 + trailing) */
     MOQ_TEST_CENC_OMIT_AVCC    = 1u << 8,  /* drop the inner avcC config box */
     MOQ_TEST_CENC_FRMA_UNKNOWN = 1u << 9,  /* frma = "zzzz" (unknown codec) */
+    MOQ_TEST_CENC_ONE_SHORT_TENC = 1u << 10, /* tenc body 23 (<24 bytes) */
 };
 
 /*

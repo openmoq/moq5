@@ -55,6 +55,19 @@ int    moq_pico_wt_managed_test_event_at(moq_pico_wt_managed_t *m, size_t i,
  * facade can still be destroyed afterwards without a double free. */
 void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m);
 
+/* The facade's adapter and its QUIC connection. Network thread only (call
+ * from on_pump): the facade publishes both from that thread. */
+moq_pico_wt_conn_t *moq_pico_wt_managed_test_conn(moq_pico_wt_managed_t *m);
+picoquic_cnx_t *moq_pico_wt_managed_test_cnx(moq_pico_wt_managed_t *m);
+
+/* A client's CONNECT, deferred until the server's SETTINGS: how often h3zero
+ * queued it on the CONNECT stream once they arrived (not proof it reached the
+ * wire), and how often it was instead still pending after them (submission
+ * failed: not prepared, or not queued). Read after stop(), which joins the
+ * network thread that counts them. */
+unsigned moq_pico_wt_managed_test_connect_enqueued(moq_pico_wt_managed_t *m);
+unsigned moq_pico_wt_managed_test_connect_left_pending(moq_pico_wt_managed_t *m);
+
 /* Declare or withdraw MOQ_TRANSPORT_CAP_HOLD_INPUT on an attached adapter
  * (receive-admission tests; adapter compiled with MOQ_PICO_WT_TESTING). */
 void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on);
@@ -75,5 +88,20 @@ extern void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);
 extern unsigned moq_pico_wt_managed_test_keep_alive_calls;
 extern picoquic_cnx_t *moq_pico_wt_managed_test_keep_alive_last_cnx;
 extern uint64_t moq_pico_wt_managed_test_keep_alive_last_interval_us;
+
+/* Pre-accept stream buffer seam: when set, a stream the managed client closes
+ * (refused while buffered, or abandoned on a failed CONNECT) is reported here
+ * with its WebTransport code instead of reaching picoquic. */
+extern void (*moq_pico_wt_managed_test_abort_stream)(picoquic_cnx_t *,
+                                                     uint64_t stream_id,
+                                                     uint64_t code);
+
+/* When set, the managed client's replay of buffered pre-accept entries
+ * delivers each one here instead of to the adapter callback. */
+struct st_h3zero_stream_ctx_t;
+extern int (*moq_pico_wt_managed_test_replay)(picoquic_cnx_t *, uint8_t *,
+                                              size_t, int /* event */,
+                                              struct st_h3zero_stream_ctx_t *,
+                                              void *conn);
 
 #endif

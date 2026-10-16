@@ -169,6 +169,52 @@ typedef enum moq_wt_profile {
     MOQ_WT_PROFILE_D13_14_COMPAT = 2
 } moq_wt_profile_t;
 
+/* Application-owned certificate trust decision. REJECT is zero so a zero,
+ * default or unrecognised result fails closed. */
+typedef enum moq_tls_certificate_verdict {
+    MOQ_TLS_CERTIFICATE_REJECT = 0,
+    MOQ_TLS_CERTIFICATE_TRUST  = 1
+} moq_tls_certificate_verdict_t;
+
+/* Synchronous client certificate trust callback.
+ *
+ * WHAT THE LIBRARY HAS ALREADY DONE when this runs: the peer's leaf has been
+ * matched against `server_name` under the transport's own reference-identity
+ * rules (a DNS name against the leaf's dNSName SANs, or its subject CN when it
+ * has none, with no partial-label wildcards; an IP literal against iPAddress
+ * SANs), and a chain whose leaf does not name `server_name` is refused before
+ * the application is consulted. Neither an absent nor an empty identity is
+ * ever presented. After a TRUST verdict the TLS stack still extracts the leaf
+ * public key and verifies the TLS CertificateVerify signature, so a verdict
+ * cannot bypass the peer's proof of key possession.
+ *
+ * WHAT THE CALLBACK OWNS: the whole chain policy. In delegated mode the
+ * library verifies against an EMPTY local trust store and treats its own
+ * chain-policy failures as the delegate's to answer, so nothing about issuer
+ * trust, validity period, purpose, name/path constraints, revocation or
+ * application policy (pinning, per-domain rules) is decided here. Return
+ * TRUST only after the application's own evaluation of `certificates` for
+ * `server_name`; any other value is REJECT. Stapled OCSP responses, SCTs and
+ * CT inputs are not carried; a policy that needs them must reject.
+ *
+ * `server_name` is the exact name being authenticated (the resolved sni: an
+ * explicit cfg sni, else the URL host). `certificates` is the leaf-first DER
+ * chain exactly as the wire carried it, at most 16 entries. Both are BORROWED
+ * for this invocation only.
+ *
+ * It runs synchronously on the transport's network thread while the handshake
+ * is in progress, must not call any moq_endpoint_*, transport-adapter or
+ * picoquic API, and must not retain a per-call JNIEnv or local references (a
+ * JNI bridge keeps a global reference and attaches the thread itself). It
+ * should return promptly; the library cannot bound arbitrary application code,
+ * and a callback that has not returned can delay a later stop() join until it
+ * does. */
+typedef moq_tls_certificate_verdict_t (*moq_tls_certificate_verify_fn)(
+    void *ctx,
+    moq_bytes_t server_name,
+    const moq_bytes_t *certificates,
+    size_t certificate_count);
+
 typedef struct moq_endpoint_cfg {
     uint32_t struct_size;             /* CFG_HAS pattern, as everywhere */
     moq_bytes_t url;                  /* moqt://host:port[/path] or https://... */
@@ -196,7 +242,10 @@ typedef struct moq_endpoint_cfg {
                                          or insecure_skip_verify) */
     bool        insecure_skip_verify; /* explicit, default false */
     /* WebTransport */
-    moq_bytes_t wt_path;              /* empty = URL path, or "/moq" */
+    /* Complete WebTransport CONNECT target override. Empty: the URL path
+     * (or "/moq" if absent) followed by the URL query, including "?" when
+     * present. URL fragments are never part of the connection target. */
+    moq_bytes_t wt_path;
     moq_perspective_t perspective;    /* client-only in v0; server reserved:
                                          MOQ_ERR_UNSUPPORTED */
     /* The allocator MUST be thread-safe (NULL = default libc allocator,
@@ -244,6 +293,76 @@ typedef struct moq_endpoint_cfg {
      * the v0 floor, connect() reads it ONLY when struct_size covers it fully --
      * set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint64_t handshake_timeout_us;
+    /* appended (enabled by struct_size): authorization tokens the session
+     * presents in its SETUP (moq_session_cfg_t.setup_auth_tokens: sent by
+     * value, at most 16, each value at most 65535 bytes), copied at connect.
+     * The SETUP carrying them must fit the session's default 4096-byte send
+     * arena (the send-arena rule on moq_session_cfg_t.setup_auth_tokens),
+     * else MOQ_ERR_INVAL at connect, rather than a connection that fails when
+     * it starts. Only the picoquic backend (raw QUIC and
+     * WebTransport) carries them; any other backend refuses a non-empty list
+     * with MOQ_ERR_UNSUPPORTED. Because it is past the v0 floor, connect()
+     * reads it ONLY when struct_size covers setup_auth_token_count -- set it
+     * via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    const moq_auth_token_t *setup_auth_tokens;
+    size_t setup_auth_token_count;
+    /* appended (enabled by struct_size): application-owned certificate trust
+     * for picoquic clients on the OpenSSL picotls provider, on both the raw
+     * QUIC (moq_pq_threaded) and WebTransport (pico WT managed) routes.
+     *
+     * NULL = today's verification (chain + server name against ca_file or the
+     * backend default roots). Non-NULL delegates the chain-policy decision to
+     * the application as documented on moq_tls_certificate_verify_fn, while
+     * the library keeps the reference-identity check and TLS CertificateVerify.
+     *
+     * READING RULE: a caller whose struct_size does not reach the END of
+     * verify_certificate keeps the older behaviour, both fields untouched. Once
+     * verify_certificate is fully covered, a non-NULL callback whose paired
+     * verify_certificate_ctx is not also fully covered is MOQ_ERR_INVAL --
+     * requested trust policy is never silently replaced by default trust, and
+     * the context is never read past the advertised size. A fully covered pair
+     * with a NULL ctx is valid (a stateless callback needs none); a non-NULL
+     * ctx with a NULL callback is MOQ_ERR_INVAL.
+     *
+     * PRECEDENCE: a callback together with a non-empty ca_file or with
+     * insecure_skip_verify is MOQ_ERR_INVAL (two trust authorities), judged
+     * before this field's own capability answer; then a built backend other
+     * than picoquic, or a picoquic build whose TLS provider cannot honour the
+     * callback (mbedTLS), is MOQ_ERR_UNSUPPORTED. An explicitly selected
+     * backend that is not compiled in is refused by backend selection before
+     * any appended field is read, as for every appended field. All of these
+     * are decided before the endpoint exists, so a refused configuration has
+     * no effect and never installs default trust in place of the requested
+     * policy.
+     *
+     * LIFETIME: the endpoint copies only the two pointers. ctx stays
+     * caller-owned, must be FULLY INITIALISED BEFORE connect() is called, and
+     * must remain valid through moq_endpoint_destroy(). The managed transport
+     * starts its network thread inside connect(), before the endpoint handle
+     * is published, so the callback may run concurrently with, and before the
+     * return of, connect() itself; nothing sequences it after the caller.
+     *
+     * What IS sequenced: a configuration or setup refusal returns an error
+     * from connect() with no endpoint and nothing retained (resolve refuses
+     * before any allocation; a facade or verifier-install failure releases
+     * the partially built endpoint before returning), whereas a REJECT
+     * verdict is an asynchronous certificate failure, observed as a terminal
+     * endpoint with reason MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE. Other
+     * handshake failures retain the endpoint's TLS or transport classification.
+     * Here asynchronous means the failure is not reported through connect()'s
+     * return value, not that it happens after connect() returns.
+     *
+     * The canonical retirement order is: destroy every attached media
+     * service, then moq_endpoint_stop() == MOQ_OK, then
+     * moq_endpoint_destroy(). A SUCCESSFUL stop joins the network thread, so
+     * a callback in flight has returned when stop returns -- and a callback
+     * that does not return delays that join until it does. A stop refused
+     * with MOQ_ERR_WRONG_STATE (attachments still present, or called from
+     * the managed context) is NOT a retirement receipt: the callback may
+     * still run and ctx must stay valid. destroy() requires a stopped
+     * endpoint and is not an implicit stop. */
+    moq_tls_certificate_verify_fn verify_certificate;
+    void                         *verify_certificate_ctx;
     /* appended (enabled by struct_size): the transport adapter's outbound
      * queue bound in bytes (see moq_pq_conn_cfg_t); 0 = adapter default.
      * Honored by the picoquic backend only. Set it via
@@ -271,17 +390,18 @@ typedef struct moq_endpoint_cfg {
  * clears and stamps ONLY the frozen v0 prefix (MOQ_ENDPOINT_CFG_V0_SIZE) and
  * leaves every appended tail field untouched. A config produced this way runs
  * with the tail ABSENT (struct_size stops at the v0 floor), which resolves to
- * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection) and to 0
- * (the backend default) for handshake_timeout_us. Because it never writes past
- * the v0 floor, it can NEVER overflow the buffer of an old caller that predates
- * a later tail field. To SET any tail field, use
- * moq_endpoint_cfg_init_sized(). */
+ * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0
+ * (the backend default) for handshake_timeout_us, to no setup tokens, and to no
+ * application certificate callback. Because it never writes past the v0 floor,
+ * it can NEVER overflow the buffer of an old caller that predates a later tail
+ * field. To SET any tail field, use moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
 
 /* Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the
  * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
- * handshake_timeout_us). Pass sizeof(moq_endpoint_cfg_t). Never writes past
- * cfg_size, so it is safe for a caller compiled against an older, smaller
+ * handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,
+ * verify_certificate + verify_certificate_ctx). Pass sizeof(moq_endpoint_cfg_t).
+ * Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller
  * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,
                                          size_t cfg_size);

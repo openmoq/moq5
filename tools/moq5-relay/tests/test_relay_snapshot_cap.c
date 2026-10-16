@@ -343,7 +343,7 @@ test_broker_ignores_stale_completion(void)
  * With every bank pinned a further demand is refused with no token. Only
  * SIGNAL demand is remembered: nothing re-raises a signal, so dropping it
  * loses the operator's request outright. A refused scrape has already been
- * answered (Step 3 returns 503 immediately), so retaining its bit would open
+ * answered (the admin listener returns 503 immediately), so retaining its bit would open
  * a generation for a client that is no longer there.
  */
 static int

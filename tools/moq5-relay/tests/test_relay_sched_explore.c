@@ -1093,7 +1093,7 @@ exec_op(exec_t *e, const seedx_rec_t *r, uint32_t index)
         (void)moq_msquic_managed_stop(e->m);
         e->cov.stops++;
         /* I7: stop returns with every child reclaimed, and no application
-         * entry occurs after the publication boundary (0168: the stop
+         * entry occurs after the publication boundary (the stop
          * atomic is acquire-checked at every doorbell loop top) */
         if (moq_msquic_managed_conn_count(e->m) != 0) {
             violate(e, INV_I7_STOP_ORDER, index, -1, -1, -1,
@@ -1514,15 +1514,15 @@ static int run_one_seed_v(uint64_t seed, bool with_replay, bool shrink,
 
 static int run_seeds(void)
 {
-    /* The committed acceptance surface: every seed must be fully green
-     * with PRNG-free replay identity. The EXPECT_RED table is the gate's
+    /* The committed acceptance surface: every seed must fully pass
+     * with PRNG-free replay identity. The EXPECT_FAIL table is the gate's
      * standing mechanism for a known deterministic defect (each listed
      * seed must fail the SAME invariant at the SAME op index on a replay
-     * of its canonical bytes, and an expected-RED seed that starts passing
+     * of its canonical bytes, and an expected-fail seed that starts passing
      * is a loud gate failure — the expectation is retired deliberately,
      * never silently). It is EMPTY: no known defect stands, and the
      * mandatory exact scripts carry the coverage the seeds may not draw. */
-    static const struct { uint32_t index; const char *reason; } EXPECT_RED[] = {
+    static const struct { uint32_t index; const char *reason; } EXPECT_FAIL[] = {
         { UINT32_MAX, "" },
     };
     sched_cov_t total;
@@ -1532,12 +1532,12 @@ static int run_seeds(void)
     memset(&total, 0, sizeof(total));
     for (uint32_t i2 = 0; i2 < SCHED_SEED_COUNT; i2++) {
         uint64_t seed = sched_seed(i2);
-        const char *expect_red = NULL;
+        const char *expect_fail = NULL;
 
-        for (size_t k = 0; k < sizeof(EXPECT_RED) / sizeof(EXPECT_RED[0]);
+        for (size_t k = 0; k < sizeof(EXPECT_FAIL) / sizeof(EXPECT_FAIL[0]);
              k++) {
-            if (EXPECT_RED[k].index == i2) {
-                expect_red = EXPECT_RED[k].reason;
+            if (EXPECT_FAIL[k].index == i2) {
+                expect_fail = EXPECT_FAIL[k].reason;
             }
         }
         static seedx_rec_t recs[SCHED_OPS_PER_SEED];
@@ -1548,27 +1548,27 @@ static int run_seeds(void)
         struct timespec t0, t1;
 
         clock_gettime(CLOCK_MONOTONIC, &t0); /* report-only measurement */
-        int rc = run_one_seed_v(seed, expect_red == NULL, false, &v);
+        int rc = run_one_seed_v(seed, expect_fail == NULL, false, &v);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
                     (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
 
         printf("TIMING seed %2u: %3u ops %7.2f ms %s\n", i2, count, ms,
-               expect_red != NULL ? "expected-red"
-                                  : (rc == 0 ? "green" : "RED"));
+               expect_fail != NULL ? "expected-fail"
+                                   : (rc == 0 ? "pass" : "FAIL"));
 
-        if (expect_red == NULL) {
+        if (expect_fail == NULL) {
             if (rc != 0) {
-                printf("FAIL: seed %u unexpectedly RED\n", i2);
+                printf("FAIL: seed %u unexpectedly failed\n", i2);
                 gate_failures++;
                 continue;
             }
         } else {
             if (!v.failed) {
-                printf("FAIL: seed %u expected RED (%s) but PASSED — "
+                printf("FAIL: seed %u expected FAIL (%s) but PASSED — "
                        "retire the expectation deliberately\n", i2,
-                       expect_red);
+                       expect_fail);
                 gate_failures++;
                 continue;
             }
@@ -1595,18 +1595,18 @@ static int run_seeds(void)
             sched_inv_t vr = run_records(er, t.recs, t.op_count, disp);
 
             if (vr != v.inv || er->fail_index != v.fail_index) {
-                printf("FAIL: seed %u expected-RED not deterministic "
+                printf("FAIL: seed %u expected-fail not deterministic "
                        "(%s@%u vs %s@%u)\n", i2, inv_name(v.inv),
                        v.fail_index, inv_name(vr), er->fail_index);
                 gate_failures++;
             } else {
-                printf("EXPECTED-RED seed %u: %s@%u (%s)\n", i2,
-                       inv_name(v.inv), v.fail_index, expect_red);
+                printf("EXPECTED-FAIL seed %u: %s@%u (%s)\n", i2,
+                       inv_name(v.inv), v.fail_index, expect_fail);
             }
             free(er);
-            continue; /* no coverage accumulation from RED seeds */
+            continue; /* no coverage accumulation from failing seeds */
         }
-        /* coverage from the green seeds */
+        /* coverage from the passing seeds */
         exec_t *ex = malloc(sizeof(*ex));
         static uint8_t disp2[SCHED_OPS_PER_SEED];
 
@@ -1633,7 +1633,7 @@ static int run_seeds(void)
         total.credit_wakes += ex->cov.credit_wakes;
         free(ex);
     }
-    /* the coverage gate over the green seeds: every operation kind
+    /* the coverage gate over the passing seeds: every operation kind
      * (reserved excluded), both lanes, both directed pairs,
      * refusal/hold/retry, cancellation, terminal, stop, wake coalescing,
      * quiescent drain, and the two mandatory arms */
@@ -1674,7 +1674,7 @@ static int run_seeds(void)
     if (missing != 0) {
         return 1;
     }
-    printf("PASS: sched_explore --seeds (%u seeds green with replay "
+    printf("PASS: sched_explore --seeds (%u seeds pass with replay "
            "identity; %" PRIu64
            " effective ops, revokes %" PRIu64 ", credit-wakes %" PRIu64
        ", held %" PRIu64 ", coalesced %" PRIu64 ")\n",

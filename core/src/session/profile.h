@@ -474,6 +474,14 @@ typedef struct moq_profile_ops {
     moq_result_t (*scan_delivery_timeouts)(const uint8_t *data, size_t len,
                                            bool strict_local,
                                            moq_dt_scan_t *out);
+    /* Encode one SETUP authorization token (by value) as its Setup Option /
+     * Setup Parameter value. NULL on profiles whose SETUP encoder writes the
+     * tokens itself. */
+    moq_result_t (*encode_setup_token)(struct moq_buf_writer *w,
+                                       uint64_t token_type, moq_bytes_t value);
+    /* Encode the complete SETUP this side will send into `w` (no queueing),
+     * so create can admit only configurations whose SETUP encodes. */
+    moq_result_t (*encode_own_setup)(moq_session_t *s, struct moq_buf_writer *w);
 
     /* DEFAULT_PUBLISHER_GROUP_ORDER (0x22); *out is MOQ_GROUP_ORDER_DEFAULT
      * when omitted. strict_local as in scan_delivery_timeouts. */

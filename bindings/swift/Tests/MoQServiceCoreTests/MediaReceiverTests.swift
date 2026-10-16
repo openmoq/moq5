@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import MoQServiceCore
 
-/* Deterministic receiver-pipeline tests over the S2 engine: scripted
+/* Deterministic receiver-pipeline tests over the endpoint engine: scripted
  * backends, condition-variable handshakes, no sleeps or wall-clock
  * dependence. The receiver backend's violations recorder trips on polls off
  * the service thread and on any call after detach. */

@@ -40,6 +40,7 @@ typedef struct {
     uint64_t ts;
     bool     keyframe;        /* video_frame_marking.independent */
     uint8_t  first_byte;
+    uint8_t  priority;        /* publisher priority on the wire */
     moq_object_status_t status;   /* NORMAL / END_OF_TRACK (reliable terminal) */
 } srv_obj_t;
 
@@ -135,6 +136,7 @@ typedef struct {
     int          n;
     int          v_eot;           /* count of END_OF_TRACK status objects on "v" */
     int          a_count;         /* count of "a" objects (any status) */
+    uint8_t      a_priority;      /* publisher priority of the last "a" object */
     bool         v_ok, a_ok;      /* SUBSCRIBE_OK seen on "v" / "a" */
     moq_group_order_t v_pub_order, a_pub_order;  /* publisher preference
                                                     carried by those OKs */
@@ -295,6 +297,7 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
             } else if (st->a_subscribed && moq_subscription_eq(o->sub, st->sub_a)) {
                 pthread_mutex_lock(&st->mu);
                 st->a_count++;
+                st->a_priority = o->publisher_priority;
                 pthread_mutex_unlock(&st->mu);
             } else if (st->sap_subscribed &&
                 moq_subscription_eq(o->sub, st->sub_sap)) {
@@ -339,6 +342,7 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                     r->object = o->object_id;
                     r->end_of_group = o->end_of_group;
                     r->status = o->status;
+                    r->priority = o->publisher_priority;
                     if (o->payload && moq_rcbuf_len(o->payload) > 0)
                         r->first_byte = moq_rcbuf_data(o->payload)[0];
                     if (o->properties) {
@@ -1548,8 +1552,8 @@ int main(int argc, char **argv)
     /* == drops still evict real media around a queued terminal (cap 2) ==== *
      * Anti-over-broad guard: a terminal marker plus an evictable media group
      * are queued; a later anchored write evicts the MEDIA group (a real drop)
-     * and succeeds, while the terminal marker is preserved. This proves the fix
-     * did not "disable all drops whenever a terminal exists". */
+     * and succeeds, while the terminal marker is preserved. This proves terminal
+     * preservation does not "disable all drops whenever a terminal exists". */
     {
         char url[64];
         moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), 9);
@@ -2262,6 +2266,67 @@ int main(int argc, char **argv)
         moq_media_sender_destroy(s);
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == live loopback: per-track publisher priority ===================== *
+     * "a" is added with an explicit priority and "v" without one: the peer
+     * sees each track's objects at its own priority. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.want_a = true;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL, *a = NULL;
+        add_video_track(s, &v);
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = MOQ_BYTES_LITERAL("a");
+        tc.media_type = MOQ_MEDIA_TYPE_AUDIO;
+        tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.codec = MOQ_BYTES_LITERAL("opus");
+        tc.samplerate = 48000;
+        tc.channel_config = MOQ_BYTES_LITERAL("2");
+        tc.bitrate = 32000;
+        tc.has_publisher_priority = true;
+        tc.publisher_priority = 64;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &a),
+                              (int)MOQ_OK);
+
+        { moq_rcbuf_t *b = mkbuf(16, 1);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, v, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+        { moq_rcbuf_t *b = mkbuf(16, 2);
+          moq_media_send_object_t o = mkobj(b, true, true, true);
+          o.presentation_time_us = 1000u;
+          if (moq_media_sender_write(s, a, &o) != MOQ_OK) moq_rcbuf_decref(b); }
+
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+        for (int i = 0; i < 200 &&
+             (srv_count(&g_srv) < 1 || srv_a_count(&g_srv) < 1); i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(srv_count(&g_srv) >= 1);
+        MOQ_TEST_CHECK(srv_a_count(&g_srv) >= 1);
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.a_priority, 64);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.objs[0].priority, 128);
+        pthread_mutex_unlock(&g_srv.mu);
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.track_publisher_priority");
     }
 
     /* == live loopback: per-track group order ============================ *
@@ -3065,6 +3130,83 @@ int main(int argc, char **argv)
         moq_media_sender_destroy(s);
         moq_pq_threaded_stop(srv);
         moq_pq_threaded_destroy(srv);
+    }
+
+    /* == drop_without_demand: demand arriving mid-group waits for the next
+     * group start. The head of a group is dropped with no demand; the
+     * subscriber must not get its tail renumbered as object 0, which a
+     * player would take for a sync sample. */
+    {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        atomic_store(&g_srv.no_subscribe, true);
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.endpoint = &ec;
+        cfg.drop_without_demand = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_create(&cfg, &s),
+                              (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        add_video_track(s, &v);
+        MOQ_TEST_CHECK(wait_ready(s, 300));
+
+        /* The first two objects of a GOP, with no demand. */
+        for (int i = 0; i < 2; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)i);
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, false);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        moq_media_sender_stats_t st;
+        for (int i = 0; i < 200; i++) {
+            (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+            if (st.objects_dropped >= 2 && st.objects_queued == 0) break;
+            usleep(50000);
+        }
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 2);
+
+        atomic_store(&g_srv.no_subscribe, false);
+        for (int i = 0; i < 200 && !moq_media_sender_track_has_subscriber(s, v);
+             i++)
+            usleep(50000);
+        MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(s, v));
+
+        /* The GOP's tail, then a fresh GOP. */
+        moq_rcbuf_t *tail = mkbuf(16, 2);
+        moq_media_send_object_t to = mkobj(tail, false, false, true);
+        moq_result_t trc = moq_media_sender_write(s, v, &to);
+        if (trc != MOQ_OK) moq_rcbuf_decref(tail);
+        MOQ_TEST_CHECK_EQ_INT((int)trc, (int)MOQ_OK);
+        for (int i = 0; i < 3; i++) {
+            moq_rcbuf_t *b = mkbuf(16, (uint8_t)(0x10 + i));
+            moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 2);
+            moq_result_t rc = moq_media_sender_write(s, v, &o);
+            if (rc != MOQ_OK) moq_rcbuf_decref(b);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+        }
+        for (int i = 0; i < 200 && srv_count(&g_srv) < 3; i++) usleep(50000);
+        usleep(200000);   /* a wrongly sent tail would have arrived by now */
+        MOQ_TEST_CHECK_EQ_INT(srv_count(&g_srv), 3);
+        pthread_mutex_lock(&g_srv.mu);
+        MOQ_TEST_CHECK_EQ_U64(g_srv.objs[0].object, 0);
+        MOQ_TEST_CHECK(g_srv.objs[0].keyframe);
+        MOQ_TEST_CHECK_EQ_INT((int)g_srv.objs[0].first_byte, 0x10);
+        pthread_mutex_unlock(&g_srv.mu);
+        (void)moq_media_sender_get_stats(s, &st, sizeof(st));
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 3);   /* the tail too */
+
+        moq_media_sender_destroy(s);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS("media_sender.no_demand_resumes_at_group_start");
     }
 
     /* == terminal: a fatal handshake makes write return CLOSED ========= *
@@ -4931,16 +5073,14 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT(ad, 1);
         MOQ_TEST_CHECK_EQ_U64(as, 0x2u);
 
-        /* Strict ordering (§11.3): both Track Ended signals were observed BEFORE
-         * the conversion catalog generation [1]. The pump gates the catalog
-         * republish on the finish, so the dones are emitted first; on the
-         * in-order loopback that ordering is preserved at the subscriber. */
+        /* MSF 11.3 orders the publisher's steps, not arrival across separate
+         * QUIC streams. SUBSCRIBE_DONE may also wait for its media streams
+         * before surfacing as an event. Require all observations, not their
+         * relative arrival order; deterministic tests check the finish gate. */
         uint64_t v_seq = 0, a_seq = 0;
         srv_done_seqs(&g_srv, &v_seq, &a_seq);
         uint64_t conv_seq = cat_gen_seq(1);
         MOQ_TEST_CHECK(v_seq != 0 && a_seq != 0 && conv_seq != 0);
-        MOQ_TEST_CHECK(v_seq < conv_seq);
-        MOQ_TEST_CHECK(a_seq < conv_seq);
 
         /* Not terminal: no END_OF_TRACK was emitted, and the VOD catalog still
          * advertises both tracks -- they stay joinable (retained replay is the

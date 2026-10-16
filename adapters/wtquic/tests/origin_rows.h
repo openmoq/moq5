@@ -59,7 +59,7 @@ typedef struct {
     row_expect_t       expect;
 } origin_row_t;
 
-/* The frozen first slice: ten CURRENT rows, in order. */
+/* The frozen origin table: ten CURRENT rows, in order. */
 const origin_row_t *origin_rows(size_t *count_out);
 
 /*
@@ -288,9 +288,9 @@ bool   origin_phase_decode(const void *buf, size_t len, origin_phase_t *out);
  * a negative break exactly ONE field instead of breaking the checksum too. */
 void   origin_phase_reseal(origin_phase_t *p);
 
-/* The expected negotiated subprotocol for every row in this slice. */
+/* The expected negotiated subprotocol for every row in this table. */
 #define ORIGIN_EXPECT_SUBPROTOCOL "moqt-18"
-/* The profile every row of this slice runs at. */
+/* The profile every row of this table runs at. */
 #define ORIGIN_EXPECT_PROFILE 0u
 
 #ifdef __cplusplus

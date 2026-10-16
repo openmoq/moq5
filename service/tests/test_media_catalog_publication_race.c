@@ -1,7 +1,6 @@
 /*
- * RED evidence for MOQ-MEDIA-CP-LOOKUP-RACE (security report finding 2): the
- * effective-catalog publication and the public content-protection lookup are
- * not serialized by a common mutex.
+ * MOQ-MEDIA-CP-LOOKUP-RACE: the effective-catalog publication and the public
+ * content-protection lookup must be serialized by a common mutex.
  *
  * PRIMARY ORACLE (deterministic, single-threaded, no timing): one phase
  * observer fires at FOUR points that bracket the two critical sections a
@@ -11,11 +10,10 @@
  * null check, before reading has_effective/selecting effective) and POST (after
  * the traversal result is selected, before the intended unlock). Each boundary
  * probes r->mu with an EXACT tri-state try-lock (moq_media_receiver_test_mu_held:
- * FREE / HELD / INVALID). The intended contract is that all four boundaries run
- * with r->mu HELD; current code holds it at NONE, so all four are RED. A
- * decorative lock around a single point cannot pass, because both ends of each
- * section are checked. A complete candidate locking repair satisfies all four
- * (see the report's anti-vacuity / boundary-kill runs).
+ * FREE / HELD / INVALID). The contract is that all four boundaries run with
+ * r->mu HELD; an unlocked section fails its boundaries. A decorative lock
+ * around a single point cannot pass, because both ends of each section are
+ * checked.
  *
  * SECONDARY (corroborating, TSan): a threaded stress with an atomic stop flag
  * (so the harness itself is race-free) alternates catalogs with materially
@@ -102,7 +100,7 @@ static void phase_hook(const moq_media_receiver_t *r, int phase, void *ctx)
  *    commit states so the writer contract is proven across every accepted
  *    catalog path, and two lookups (hit + miss) for the reader contract. Each
  *    of the four phases is an INDEPENDENT held-assertion, so a boundary moved
- *    inward fails exactly its phase (see the report's boundary kills). */
+ *    inward fails exactly its phase. */
 static void test_publication_contract(void)
 {
     phase_probe_t p;
@@ -144,7 +142,7 @@ static void test_publication_contract(void)
         MOQ_TEST_CHECK_EQ_INT(p.invalid[ph], 0);
 
     /* Each phase fired the EXACT expected number of times, and every firing
-     * observed r->mu HELD. RED now (held==0 on every phase). Six writer commits;
+     * observed r->mu HELD (an unlocked section shows held==0). Six writer commits;
      * three reader lookups (empty, hit, miss). An omitted commit path drops the
      * writer count to five; an empty path that skips POST drops the reader-post
      * count to two -- both caught by the exact seen assertions, independently of
@@ -173,9 +171,9 @@ static void test_publication_contract(void)
     MOQ_TEST_PASS("pub_race.publication_contract");
 }
 
-/* GREEN control (current semantics): a returned CP pointer stays valid across a
- * later replacement (cp_snaps retention). Holds today and after the fix; does
- * NOT satisfy the publication oracle. */
+/* Control: a returned CP pointer stays valid across a later replacement
+ * (cp_snaps retention). It holds independently of the locking and does NOT
+ * satisfy the publication oracle. */
 static void test_retained_pointer_control(void)
 {
     moq_media_receiver_test_set_pub_phase_hook(NULL, NULL);

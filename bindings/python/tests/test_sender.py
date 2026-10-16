@@ -8,8 +8,8 @@ Python sender exists: the fixture records the exact configuration it was
 handed, separates what was DECLARED from what it could safely CAPTURE,
 refuses the shapes the SDK refuses, and witnesses every API entry.
 
-BEHAVIOURAL rows are complete tests of the Python surface this slice
-specifies -- real calls, expected values and exception identities. They are
+BEHAVIOURAL rows are complete tests of the Python sender surface
+as specified -- real calls, expected values and exception identities. They are
 gated at run time on that surface existing, so a genuinely missing binding
 leaves them skipped behind ONE bootstrap failure. The gate is not a substitute
 for the assertions: the sentinel control below supplies three bogus names and

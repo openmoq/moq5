@@ -6,14 +6,13 @@
 /* =====================================================================
  * The declared topology.
  *
- * Transport rows: both built drafts are AVAILABLE, with the reviewed ALPN
- * literals (Step 3's canonical table is the authority the drift gate compares
- * against), the integer codec each draft specifies, and the endpoint-offer
+ * Transport rows: both built drafts are AVAILABLE, with their ALPN literals
+ * (the canonical table in adapters/common/moq_alpn.h is the authority the
+ * drift gate compares against), the integer codec each draft specifies, and the endpoint-offer
  * facts. AUTO ranks are 1-based and D18 is offered FIRST.
  *
  * Media rows: LOC-01 is implemented; LOC-02 is RESERVED with a reason. The
- * reviewed property IDs are recorded because they are the collision at the
- * heart of the arc -- LOC-01 Capture Timestamp is ID 2
+ * property IDs are recorded because they collide across the two profiles -- LOC-01 Capture Timestamp is ID 2
  * (draft-ietf-moq-loc-01 §2.3.1.1) while LOC-02 Timestamp is ID 0x06
  * (draft-ietf-moq-loc-02 §2.3.1.1), which is LOC-01's AUDIO LEVEL id.
  * ===================================================================== */
@@ -36,17 +35,17 @@ static const np_media_row_t kMedias[] = {
 };
 
 /*
- * Closure cells. LOC-01 is SUPPORTED on both drafts but carries a temporary
- * closure waiver with both callbacks NULL: Step 5 declares the topology and
- * leaves the service closures to Step 6, which will replace these waivers
- * with the shared send/receive functions.
+ * Closure cells. LOC-01 is SUPPORTED on both drafts but carries a closure
+ * waiver with both callbacks NULL: the tables declare the topology only, and
+ * a cell's waiver is replaced by the shared send/receive functions once the
+ * service closures exist.
  */
 static const np_cell_row_t kCells[] = {
     { 16, "loc01", NP_C_SUPPORTED, NULL,
-      "step-5 substrate: service closure callbacks land in step 6",
+      "topology only: no service closure callbacks are declared",
       NULL, NULL },
     { 18, "loc01", NP_C_SUPPORTED, NULL,
-      "step-5 substrate: service closure callbacks land in step 6",
+      "topology only: no service closure callbacks are declared",
       NULL, NULL },
     { 16, "loc02", NP_C_UNSUPPORTED,
       "LOC-02 is RESERVED: no product encoder or decoder exists for its "

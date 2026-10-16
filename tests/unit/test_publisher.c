@@ -5006,7 +5006,7 @@ static void test_write_object_ex_invalid_combos(void) {
         MOQ_TEST_CHECK(moq_pub_begin_object(pub, track, &bcfg,
             moq_simpair_now_us(sp)) == MOQ_ERR_INVAL);
     }
-    /* non-datagram status = invalid (not supported in this slice) */
+    /* non-datagram status = invalid (not supported) */
     {
         moq_pub_object_cfg_t obj; moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
         obj.has_status = true;
@@ -15732,7 +15732,7 @@ int main(void) {
     }
 
     /* -- Standalone retained FETCH authorization (CALLBACK accept) --------- *
-     * GREEN compatibility for the relay flow: a CALLBACK publisher accepts a
+     * Compatibility with the relay flow: a CALLBACK publisher accepts a
      * SUBSCRIBE via callback, then a moqx-shaped standalone FETCH pulls the
      * retained catalog. The accepted subscription authorizes the standalone
      * FETCH, so the retained object IS served. */

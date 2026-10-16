@@ -8,7 +8,7 @@
  *   - owned copies actually deep-copy (survive scribble/free of the inputs);
  *   - wt_protocol_count overflow / cap / NULL-array rejection; server lane cap.
  *
- * Client transport (authoritative per the review boundary):
+ * Client transport:
  *   - WT-Protocol negotiation: exact-token validation, offered-token
  *     enforcement, legacy draft-16 fallback, no silent downgrade, and the
  *     materialized default offer;
@@ -2452,7 +2452,7 @@ static moq_wtquic_msquic_managed_t *make_client(const moq_alloc_t *alloc,
     return m;
 }
 
-/* --- WT_ALPN_ERROR on the client negotiation-failure route (RED) --------- */
+/* --- WT_ALPN_ERROR on the client negotiation-failure route ---------------- */
 /* draft-ietf-webtrans-http3-15 3.3 + its IANA registry entry: a client that
  * REQUIRES application-protocol negotiation MUST close the WebTransport session
  * with WT_ALPN_ERROR (0x0817b3dd) when a successful response omits WT-Protocol,
@@ -2570,7 +2570,7 @@ static void alpn_run_arm(const alpn_arm_t *arm)
             void *conn = g_alpn_conn;
             moq_wtquic_msquic_managed_test_deliver_established(m, conn, arm->tok);
 
-            /* -- the WIRE obligation: this is the RED -- */
+            /* -- the WIRE obligation: the load-bearing assertion -- */
             ACHECK(g_alpn_close_calls == 1);
             ACHECK(g_alpn_close_ws == FAKE_WS);
             ACHECK(g_alpn_close_code == WT_ALPN_ERROR_CODE);

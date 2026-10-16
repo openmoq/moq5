@@ -14,6 +14,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+static moq_tls_certificate_verdict_t consumer_verify_certificate(
+    void *ctx, moq_bytes_t server_name,
+    const moq_bytes_t *certificates, size_t certificate_count)
+{
+    (void)ctx; (void)server_name; (void)certificates; (void)certificate_count;
+    return MOQ_TLS_CERTIFICATE_REJECT;
+}
+
 int main(void)
 {
     /* Endpoint cfg ABI: the pointer-only init stamps ONLY the frozen v0 prefix
@@ -38,10 +46,21 @@ int main(void)
     if (ecs.wt_profile != (uint32_t)MOQ_WT_PROFILE_D13_14_COMPAT)
         return 1;
 
-    /* The handshake bound, the next appended tail field, reached the same way:
+    /* The handshake bound, an appended tail field, reached the same way:
      * the sized init defaults it to 0 (leave the backend's own value), and a
      * caller can set a real microsecond bound. */
     if (ecs.handshake_timeout_us != 0)
+        return 1;
+    if (ecs.setup_auth_tokens != NULL || ecs.setup_auth_token_count != 0)
+        return 1;
+    /* The application certificate callback pair, appended after the SETUP-token
+     * tail: absent by default, assignable from the installed public service
+     * headers alone (no transport-private types), a NULL context allowed. */
+    if (ecs.verify_certificate != NULL || ecs.verify_certificate_ctx != NULL)
+        return 1;
+    ecs.verify_certificate = consumer_verify_certificate;
+    ecs.verify_certificate_ctx = NULL;
+    if (ecs.verify_certificate != consumer_verify_certificate)
         return 1;
     ecs.handshake_timeout_us = 5000000ull;
     if (ecs.handshake_timeout_us != 5000000ull)

@@ -660,7 +660,7 @@ int main(int argc, char **argv)
     else if (argc > 1 && std::strcmp(argv[1], "16") == 0) v = MOQ_VERSION_DRAFT_16;
     const char *mode = argc > 2 ? argv[2] : "loopback";
     /* "force": advertise the capability regardless of the adapter's own
-     * setting (the RED control against an adapter that does not hold). */
+     * setting (the negative control against an adapter that does not hold). */
     if (std::strcmp(mode, "force") == 0) { moq_mvfst_test_set_hold_input(1); mode = "loopback"; }
     moq_mvfst_test_set_hold_observer(on_hold, nullptr);
     if (std::strcmp(mode, "loopback") == 0) run(v);

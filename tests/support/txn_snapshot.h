@@ -390,7 +390,7 @@ TXS_UNUSED static void txs_img_bytes(txs_img_t *im, const uint8_t *b,
     im->len += n;
 }
 
-/* Direct-assertion guard (#279). The count-assertion macros do NOT
+/* Direct-assertion guard. The count-assertion macros do NOT
  * short-circuit, so an index after a failed count check still runs. This
  * validates count, index, container pointer and leaf pointer IN THAT ORDER,
  * fails BY NAME, and only then compares -- and it never silently skips the
@@ -427,7 +427,7 @@ TXS_UNUSED static int txs_check_part_bytes(const moq_namespace_t *ns,
     return 0;
 }
 
-/* Direct raw-span check (#279). The `if (len == want && ptr) memcmp(...)`
+/* Direct raw-span check. The `if (len == want && ptr) memcmp(...)`
  * shape silently DROPS a declared comparison when the pointer is NULL, so a
  * missing span passes. This validates the exact length, then REQUIRES the
  * pointer, then compares -- failing by name at each step and never
@@ -454,7 +454,7 @@ TXS_UNUSED static int txs_check_span_bytes(const void *got, size_t got_len,
     return 0;
 }
 
-/* -- borrowed CONTAINER guards (#279) ---------------------------------- *
+/* -- borrowed CONTAINER guards ----------------------------------------- *
  * `txs_img_bytes()` can guard a leaf `moq_bytes_t.data`, but it is reached only
  * AFTER the array has been indexed -- so it cannot protect the array itself. A
  * nonzero count with a NULL container, or an implausible count over a small

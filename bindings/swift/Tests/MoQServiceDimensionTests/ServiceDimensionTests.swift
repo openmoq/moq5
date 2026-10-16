@@ -2,23 +2,22 @@ import Foundation
 import Testing
 
 /*
- * 0259 finding 5 (MOQ-SWIFT-VIDEO-DIMENSION-TRAP) security regression, service lane.
+ * MOQ-SWIFT-VIDEO-DIMENSION-TRAP security regression, service lane.
  *
- * The vulnerability (pre-fix): `makeFormatDescription(codecConfig:)` ->
- * `makeVideoDescription` guarded `width > 0` / `height > 0` and then converted
- * with `Int32(width)` / `Int32(height)`, which TRAPPED for a dimension above
- * `Int32.max`. Per the ruling (0265/0270), an out-of-range dimension must exit
- * NORMALLY with a declared typed rejection; the fix range-checks before the
- * conversion, and these tests now pass against it (they failed RED against the
- * pre-fix trap). Representable-but-unrealistic dimensions (e.g. `Int32.max`)
- * are handled by CoreMedia and stay separate from range validation.
+ * The vulnerability: `makeFormatDescription(codecConfig:)` ->
+ * `makeVideoDescription` converting with an unchecked `Int32(width)` /
+ * `Int32(height)` TRAPS for a dimension above `Int32.max`. An out-of-range
+ * dimension must instead exit NORMALLY with a declared typed rejection, so the
+ * conversion is range-checked first; a trapping conversion fails these tests.
+ * Representable-but-unrealistic dimensions (e.g. `Int32.max`) are handled by
+ * CoreMedia and stay separate from range validation.
  *
- * A range violation aborted the process pre-fix, so each case runs in the
+ * An unchecked range violation aborts the process, so each case runs in the
  * bounded `MoQServiceTrapProbe` child (service stack only); the parent
  * classifies the termination and the structured outcome line.
  */
 
-@Suite("Service video-dimension conversion (finding 5)")
+@Suite("Service video-dimension conversion")
 struct ServiceDimensionTests {
 
     private enum Termination: Equatable {
@@ -124,12 +123,12 @@ struct ServiceDimensionTests {
     /// validation error), distinct from `internalError` (CoreMedia's status).
     private let rangeRejection = "THROWN:invalidArgument"
 
-    // MARK: Controls (green)
+    // MARK: Controls
 
     /// Valid dimensions convert cleanly through the real service path.
     @Test("Valid dimensions convert (control)")
     func validDimensions() {
-        let r = runProbe("f5_valid")
+        let r = runProbe("dim_valid")
         #expect(!r.trapped)
         #expect(r.outcome == "OK", "got \(r.outcome ?? "nil") / \(r.stdout)")
     }
@@ -137,7 +136,7 @@ struct ServiceDimensionTests {
     /// Zero / negative dimensions are already rejected with a typed error before
     /// the `Int32` conversion -- the guard the range check must extend.
     @Test("Zero and negative dimensions are typed-rejected (control)",
-          arguments: ["f5_zero", "f5_negative"])
+          arguments: ["dim_zero", "dim_negative"])
     func nonPositiveDimensionsRejected(_ probeCase: String) {
         let r = runProbe(probeCase)
         #expect(!r.trapped)
@@ -149,7 +148,7 @@ struct ServiceDimensionTests {
     /// separate from CoreMedia's own acceptance of large dimensions, for both
     /// width and height, so a repair cannot reject representable values.
     @Test("Int32.max width/height is CoreMedia-handled, not range-rejected (control)",
-          arguments: ["f5_width_int32max", "f5_height_int32max"])
+          arguments: ["dim_width_int32max", "dim_height_int32max"])
     func representableMaxDimensionNotRangeRejected(_ probeCase: String) {
         let r = runProbe(probeCase)
         #expect(!r.trapped)
@@ -160,13 +159,13 @@ struct ServiceDimensionTests {
     // MARK: out-of-range dimensions must reject, not trap
 
     /// A dimension above `Int32.max` -- in EITHER width or height -- exits
-    /// normally with the declared typed rejection. Pre-fix, `Int32(width)` /
-    /// `Int32(height)` overflowed and TRAPPED, so both `!trapped` and the
-    /// typed-rejection outcome failed RED. Width and height are independently
+    /// normally with the declared typed rejection. An unchecked `Int32(width)` /
+    /// `Int32(height)` overflows and TRAPS, failing both `!trapped` and the
+    /// typed-rejection outcome. Width and height are independently
     /// load-bearing (a width-only repair leaves the height cases failing).
     @Test("Out-of-range width/height is typed-rejected, not trapped",
-          arguments: ["f5_width_int32max_plus1", "f5_width_uint32max",
-                      "f5_height_int32max_plus1", "f5_height_uint32max"])
+          arguments: ["dim_width_int32max_plus1", "dim_width_uint32max",
+                      "dim_height_int32max_plus1", "dim_height_uint32max"])
     func outOfRangeDimensionRejectedNotTrapped(_ probeCase: String) {
         let r = runProbe(probeCase)
         #expect(!r.trapped, "\(probeCase): out-of-range dimension must be rejected, not trapped; got \(r.termination)")

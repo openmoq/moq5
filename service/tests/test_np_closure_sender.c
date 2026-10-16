@@ -23,16 +23,16 @@
  * draft specifies -- draft-16 §1.4 (i) (RFC 9000 QUIC varint) or draft-18
  * §1.4.1 (vi64) -- because draft-18 §11.2.1.2 object properties are
  * Key-Value-Pairs and §1.4.3 encodes a KVP's Delta Type and its even-Type
- * value as that draft's own integer. Draft-16 therefore passes today and
- * draft-18 does not; the draft-18 failure is the RED this file exists to
- * produce, and it is NOT normalized into an expected-error test.
+ * value as that draft's own integer. Draft-16 satisfies this and draft-18 does
+ * not yet; the draft-18 failure is the contract gap this file reports, and it
+ * is NOT normalized into an expected-error test.
  *
  * The expected bytes are built by the independent scripted builder from the
  * pure oracle. No product LOC helper, key-value-pair codec or integer codec
  * produces anything this file compares against.
  *
- * Public API only: nothing here calls a function that does not already exist
- * before the fix, and no signature is changed by it.
+ * Public API only: nothing here calls a test-only function or relies on a
+ * changed signature.
  */
 #include <moq/media_sender.h>
 #include <moq/session.h>

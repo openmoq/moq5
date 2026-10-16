@@ -2,7 +2,8 @@
 #define MOQ_TEST_NS_OWNER_INVENTORY_H
 /*
  * Test-only namespace-subscription owner inventory and outcome oracles,
- * shared by the direct-session and transport-bridge #250 suites so both hold
+ * shared by the direct-session and transport-bridge SUBSCRIBE_NAMESPACE
+ * response-stream termination suites so both hold
  * ONE field contract. Header-only and static, like tests/support/
  * ownership_graph.h: nothing here is exported and no product seam is added.
  *

@@ -1,7 +1,7 @@
 /*
  * Linked C consumer smoke: <moq/wtquic_msquic_managed.h> is usable by a program
  * linking moq::adapter-wtquic-msquic-managed. Drives a minimal create -> stop ->
- * destroy lifecycle (no transport in this slice) and the NULL-reject path.
+ * destroy lifecycle (no transport is opened) and the NULL-reject path.
  */
 #include <moq/wtquic_msquic_managed.h>
 

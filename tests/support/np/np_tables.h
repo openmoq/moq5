@@ -1,7 +1,7 @@
 /*
  * Negotiated-profile substrate: the DECLARED TOPOLOGY.
  *
- * Four separate tables, kept separate on purpose (0661 §5): a transport
+ * Four separate tables, kept separate on purpose: a transport
  * profile is not a media profile, a compatibility cell is not either of them,
  * and the canonical unordered pair relation is a fact about two transports at
  * one media profile. Collapsing any of these would let a missing row hide
@@ -82,9 +82,8 @@ typedef enum {
 } np_cell_state_t;
 
 /*
- * A cell's two closure callbacks are the future Step-6 service closures. In
- * Step 5 they are absent and a non-empty temporary WAIVER stands in their
- * place. The rule is exact and half-states fail:
+ * A cell's two closure callbacks are its service send/receive closures.
+ * Where they are absent, a non-empty WAIVER stands in their place. The rule is exact and half-states fail:
  *
  *   callbacks BOTH present  <=> waiver absent
  *   callbacks BOTH absent   <=> waiver present and non-empty
@@ -97,7 +96,7 @@ typedef struct {
     const char         *media;
     np_cell_state_t     state;
     const char         *reason;        /* required non-empty when UNSUPPORTED */
-    const char         *waiver;       /* temporary Step-5 closure waiver */
+    const char         *waiver;       /* closure waiver (no callbacks) */
     np_send_closure_fn  send_closure;
     np_recv_closure_fn  recv_closure;
 } np_cell_row_t;

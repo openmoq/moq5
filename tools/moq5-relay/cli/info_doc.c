@@ -45,7 +45,7 @@ typedef struct info_view {
     int64_t  admin_port;
     bool     insecure_skip_verify;
     /* budgets */
-    uint64_t core[11];
+    uint64_t core[12];
     uint64_t trace_ring_records;
     bool     pools_active;
     uint64_t ovr[6];
@@ -58,10 +58,11 @@ typedef struct info_view {
              cap_usable, cap_stack;
 } info_view_t;
 
-static const char *const k_core_keys[11] = {
+static const char *const k_core_keys[12] = {
     "max_bindings", "max_tracks", "max_subs", "max_ns_nodes", "max_ns_subs",
     "max_intents", "name_intern_bytes", "log_max_subgroups",
     "log_max_objects_per_group", "log_max_cursors", "linger_us",
+    "warm_idle_us",
 };
 static const char *const k_ovr_keys[6] = {
     "journal_entries", "mailbox_entries", "demand_channel_entries",
@@ -168,7 +169,7 @@ write_doc(moqr_json_w_t *w, const info_view_t *v)
     moqr_json_object_begin(w);
     moqr_json_key(w, "core");
     moqr_json_object_begin(w);
-    for (size_t i = 0; i < 11; i++) {
+    for (size_t i = 0; i < 12; i++) {
         moqr_json_key(w, k_core_keys[i]); moqr_json_u64(w, v->core[i]);
     }
     moqr_json_object_end(w);
@@ -308,6 +309,7 @@ view_from_inputs(const moqr_cli_info_inputs_t *in, info_view_t *v)
     v->core[8] = cfg->core.log_max_objects_per_group;
     v->core[9] = cfg->core.log_max_cursors;
     v->core[10] = cfg->core.linger_us;
+    v->core[11] = cfg->core.warm_idle_us;
     v->trace_ring_records = cfg->telemetry.trace_ring_records;
     v->pools_active = plan->total_shards > 1u;
     v->ovr[0] = cfg->cross_shard.journal_entries;
@@ -437,7 +439,7 @@ static const info_view_t k_max_view = {
     .admin_port = INT64_MIN,
     .insecure_skip_verify = false,
     .core = { U64MAX, U64MAX, U64MAX, U64MAX, U64MAX, U64MAX, U64MAX, U64MAX,
-              U64MAX, U64MAX, U64MAX },
+              U64MAX, U64MAX, U64MAX, U64MAX },
     .trace_ring_records = U64MAX,
     .pools_active = false,
     .ovr = { U64MAX, U64MAX, U64MAX, U64MAX, U64MAX, U64MAX },

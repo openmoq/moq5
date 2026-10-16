@@ -1462,14 +1462,23 @@ int main(void)
         uint8_t buf[1024];
         size_t len = moq_test_build_cmaf_init_cenc(
             buf, 1, 48000, 0, 0, avcc, sizeof(avcc),
-            "cbcs", 1, 0, kid, 1 /*tenc v1*/, MOQ_TEST_CENC_OK);
+            "cbcs", 1, 16, kid, 1 /*tenc v1*/, MOQ_TEST_CENC_OK);
+        size_t tenc_body = 0;
+        for (size_t i = 4; i + 28 <= len; i++) {
+            if (memcmp(buf + i, "tenc", 4) == 0) {
+                tenc_body = i + 4;
+                break;
+            }
+        }
+        CHECK(tenc_body != 0);
+        if (tenc_body != 0) buf[tenc_body + 5] = 0x19;
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
         CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
         CHECK(info.has_cenc == true);
         CHECK(memcmp(info.scheme.data, "cbcs", 4) == 0);
         CHECK(info.default_is_protected == 1);
-        CHECK(info.default_per_sample_iv_size == 0);
+        CHECK(info.default_per_sample_iv_size == 16);
         CHECK(memcmp(info.default_kid.data, kid, 16) == 0);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC);
     }
@@ -1485,6 +1494,7 @@ int main(void)
             MOQ_TEST_CENC_OMIT_SCHI,
             MOQ_TEST_CENC_OMIT_TENC,
             MOQ_TEST_CENC_SHORT_TENC,
+            MOQ_TEST_CENC_ONE_SHORT_TENC,
         };
         for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
             uint8_t buf[1024];
@@ -1531,7 +1541,7 @@ int main(void)
         CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info)
               == MOQ_ERR_PROTO);
 
-        /* (b) trailing tenc (body 27 > 23) -> OK, same fields extracted. */
+        /* (b) trailing tenc (body 28 > 24) -> OK, same fields extracted. */
         len = moq_test_build_cmaf_init_cenc(buf, 1, 90000, 64, 64,
             avcc, sizeof(avcc), "cenc", 1, 8, kid, 0,
             MOQ_TEST_CENC_TRAILING_TENC);
@@ -1776,7 +1786,7 @@ int main(void)
         CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ obj, len },
                                        &rep) == MOQ_OK);
         CHECK(rep.valid == true);
-        CHECK(rep.starts_with_sync == true);  /* the fix: fsf drives it */
+        CHECK(rep.starts_with_sync == true);  /* fsf drives it */
         CHECK(rep.sap_type == MOQ_SAP_UNKNOWN);
     }
 

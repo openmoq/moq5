@@ -46,7 +46,7 @@ endfunction()
 
 # Require picoquic::picohttp-core, or fail with an actionable message. We do not
 # synthesize an imported picohttp-core: its transitive link interface (h3zero +
-# webtransport over picoquic-core/log, picotls, OpenSSL) is build-config
+# webtransport over picoquic-log and picoquic-core, picotls, OpenSSL) is build-config
 # dependent and cannot be reconstructed reliably from an arbitrary prefix, so a
 # silently-wrong target would only move the failure to link time.
 function(_moq_pq_require_http where)
@@ -121,6 +121,101 @@ function(_moq_pq_resolve_ptls)
             endif()
         endif()
     endif()
+endfunction()
+
+# One OpenSSL link identity for source-tree picoquic and the adapter.
+#
+# picoquic-core links the OpenSSL it finds as the raw artifact paths in
+# ${OPENSSL_LIBRARIES}; moq-adapter-picoquic links the OpenSSL::SSL /
+# OpenSSL::Crypto imported targets. The two spellings of one artifact are two
+# link items, so CMake's link de-duplication (CMP0156/CMP0179, applied per
+# linker capability) cannot merge them: a static OpenSSL then reaches a
+# consumer's link line twice, which capability-aware linkers report as
+# duplicate libraries. The adapter keeps its target dependency (its verifier
+# uses OpenSSL directly); picoquic-core is given the same targets instead.
+#
+# Applies only when the adapter will link OpenSSL: the adapter is built and
+# its verifier backend resolves to openssl (the rule in
+# adapters/picoquic/CMakeLists.txt: "openssl", or "auto" unless picoquic is
+# configured WITH_OPENSSL=OFF). OpenSSL-off, mbedTLS, installed or
+# pre-existing picoquic targets are left as they are.
+function(_moq_pq_openssl_identity_wanted out_var)
+    set(${out_var} FALSE PARENT_SCOPE)
+    if(NOT MOQ_BUILD_ADAPTER_PICOQUIC)
+        return()
+    endif()
+    if(DEFINED WITH_OPENSSL AND NOT WITH_OPENSSL)
+        return()
+    endif()
+    string(TOLOWER "${MOQ_PICOQUIC_VERIFY_BACKEND}" _backend)
+    if(_backend STREQUAL "openssl" OR _backend STREQUAL "auto")
+        set(${out_var} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
+# Find OpenSSL in this (top-level) directory before picoquic is added, so the
+# imported targets are visible to the picoquic subtree and to the adapter.
+# FindOpenSSL creates OpenSSL::SSL / OpenSSL::Crypto only when they do not
+# exist yet, so the later find_package(OpenSSL) calls in both reuse them. The
+# selection inputs are the ones picoquic's own call uses (the same cache
+# entries and OPENSSL_ROOT_DIR). Called as a function, so the module's
+# OPENSSL_* result variables stay local; imported targets and cache entries
+# are directory- and project-wide by nature.
+function(_moq_pq_openssl_targets)
+    find_package(OpenSSL REQUIRED)
+endfunction()
+
+# In <target>'s LINK_LIBRARIES and INTERFACE_LINK_LIBRARIES, respell each item
+# that is exactly the artifact an OpenSSL imported target resolves to (also
+# inside $<LINK_ONLY:...>) as that target. Only imported targets with a
+# single, configuration-independent IMPORTED_LOCATION are used; every other
+# item, its position and its wrapper stay as they are.
+function(_moq_pq_openssl_respell target)
+    set(_from "")
+    set(_to "")
+    foreach(_imp IN ITEMS OpenSSL::SSL OpenSSL::Crypto)
+        if(NOT TARGET ${_imp})
+            continue()
+        endif()
+        get_target_property(_cfgs ${_imp} IMPORTED_CONFIGURATIONS)
+        get_target_property(_loc ${_imp} IMPORTED_LOCATION)
+        if(_cfgs OR NOT _loc)
+            continue()
+        endif()
+        list(APPEND _from "${_loc}")
+        list(APPEND _to "${_imp}")
+    endforeach()
+    if(NOT _from)
+        return()
+    endif()
+    foreach(_prop IN ITEMS LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+        get_target_property(_items ${target} ${_prop})
+        if(NOT _items)
+            continue()
+        endif()
+        set(_out "")
+        set(_changed FALSE)
+        foreach(_item IN LISTS _items)
+            set(_new "${_item}")
+            list(FIND _from "${_item}" _i)
+            if(_i GREATER -1)
+                list(GET _to ${_i} _new)
+            elseif(_item MATCHES "^\\$<LINK_ONLY:([^<>]+)>$")
+                list(FIND _from "${CMAKE_MATCH_1}" _i)
+                if(_i GREATER -1)
+                    list(GET _to ${_i} _imp)
+                    set(_new "$<LINK_ONLY:${_imp}>")
+                endif()
+            endif()
+            if(NOT _new STREQUAL _item)
+                set(_changed TRUE)
+            endif()
+            list(APPEND _out "${_new}")
+        endforeach()
+        if(_changed)
+            set_property(TARGET ${target} PROPERTY ${_prop} "${_out}")
+        endif()
+    endforeach()
 endfunction()
 
 # -- Already available --------------------------------------------------
@@ -246,6 +341,13 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
     set(CMAKE_PROJECT_picoquic_INCLUDE
         "${CMAKE_CURRENT_LIST_DIR}/MoqPicoquicProjectPolicy.cmake")
 
+    # Resolved before picoquic exists as a target, so that pre-existing
+    # picoquic targets (the branches above) are never touched.
+    _moq_pq_openssl_identity_wanted(_moq_pq_openssl_identity)
+    if(_moq_pq_openssl_identity)
+        _moq_pq_openssl_targets()
+    endif()
+
     add_subdirectory("${MOQ_PICOQUIC_SOURCE_DIR}"
         "${CMAKE_BINARY_DIR}/_deps/picoquic" EXCLUDE_FROM_ALL)
 
@@ -278,17 +380,23 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
     endif()
 
     if(TARGET picoquic-core)
-        # picoquic-core references picoquic-log symbols (picoquic_set_qlog)
-        # but does not link it. Upstream also declares picoquic-log -> core,
-        # so the missing core -> log edge forms a real static-archive cycle.
-        # Preserve both edges: CMake repeats the pair for traditional one-pass
-        # linkers, while CMP0156 de-duplicates it for capable linkers.
-        if(TARGET picoquic-log)
-            get_target_property(_pq_core_libs picoquic-core INTERFACE_LINK_LIBRARIES)
-            if(NOT _pq_core_libs OR NOT "picoquic-log" IN_LIST _pq_core_libs)
-                target_link_libraries(picoquic-core PUBLIC picoquic-log)
-            endif()
+        # picoquic-core was created by the add_subdirectory above. Only it is
+        # respelled: it is the provider edge the adapter's consumers link.
+        # picohttp-core and an in-tree picotls-openssl carry raw OpenSSL
+        # edges of their own and are left as they are.
+        if(_moq_pq_openssl_identity)
+            _moq_pq_openssl_respell(picoquic-core)
         endif()
+        # The provider's own edges are used as declared: picoquic-log links
+        # picoquic-core, picoquic-test links picoquic-log, and picoquic-core
+        # needs nothing from picoquic-log. That holds for the qualified source
+        # baseline (picoquic a602e60b), whose core no longer calls the log
+        # library. Automatic accommodation of the older core/log cycle (e.g.
+        # 55b473e2, whose core calls picoquic_set_qlog) is retired, and there
+        # is no configure-time capability check. Consumers of such a source
+        # tree MAY fail to link: its static archives still build with the
+        # symbol unresolved, and another dependency may or may not supply
+        # picoquic-log.
         if(NOT TARGET picoquic::picoquic-core)
             add_library(picoquic::picoquic-core ALIAS picoquic-core)
         endif()

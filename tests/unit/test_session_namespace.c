@@ -160,6 +160,14 @@ int main(void)
         moq_reject_namespace_cfg_init(&rej);
         rej.error_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
         rej.reason = MOQ_BYTES_LITERAL("no thanks");
+        /* A retry interval whose wire form (ms + 1) does not fit is refused
+         * before any state change, never wrapped into "do not retry". */
+        rej.can_retry = true;
+        rej.retry_after_ms = UINT64_MAX;
+        MOQ_TEST_CHECK(moq_session_reject_namespace(c,
+            ev.u.namespace_published.ann, &rej, 1000) == MOQ_ERR_INVAL);
+        rej.can_retry = false;
+        rej.retry_after_ms = 0;
         MOQ_TEST_CHECK(moq_session_reject_namespace(c,
             ev.u.namespace_published.ann, &rej, 1000) == MOQ_OK);
 

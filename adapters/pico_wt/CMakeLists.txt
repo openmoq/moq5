@@ -115,7 +115,8 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cma
 # Optional component .pc files (the core libmoq.pc is generated in the
 # root CMakeLists. PicoQUIC ships no .pc, so its selected provider closure is
 # embedded here using the same helper as libmoq.pc.
-moq_picoquic_pkgconfig_libs(LIBMOQ_PICOWT_DEP_LIBS)
+# picohttp-core uses picoquic-log (picoquic_set_qlog).
+moq_picoquic_pkgconfig_libs(LIBMOQ_PICOWT_DEP_LIBS WITH_LOG)
 # Relocatable prefix: the .pc lands at <prefix>/<libdir>/pkgconfig, so the
 # up-path from ${pcfiledir} back to <prefix> is (libdir depth + 1) levels.
 # Computing it from CMAKE_INSTALL_LIBDIR handles lib, lib64, and multiarch
@@ -185,6 +186,12 @@ endif()
 # build-tree package is consumable end to end. Needs picoquic source
 # (the consumer's FindPicoquic re-resolves it) and
 # MOQ_BUILD_ADAPTER_PICO_WT=ON so BUILD_HTTP defines picohttp-core.
+# Nested consumer builds configure picoquic again: give them this tree's C++
+# compiler too (see tests/cmake/NestedToolchain.cmake).
+include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+moq_nested_cxx_args(_picowt_nested_cxx FLAGS)
+moq_nested_cxx_env(_picowt_nested_cxx_env)
+
 if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     set(_picowt_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_picowt_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
@@ -210,7 +217,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                  -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
                  -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
@@ -235,7 +242,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
         get_filename_component(_picowt_openssl_root "${_o}" DIRECTORY)
     endif()
     add_test(NAME pico_wt_install_consumer
-        COMMAND bash
+        COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer.sh"
             "${CMAKE_COMMAND}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer"
@@ -255,7 +262,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
     find_program(PKG_CONFIG_EXECUTABLE pkg-config)
     if(PKG_CONFIG_EXECUTABLE)
         add_test(NAME pico_wt_pkgconfig_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                 "${CMAKE_COMMAND}"
                 "libmoq-pico-wt"
@@ -297,6 +304,29 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     endif()
     add_test(NAME pico_wt_loopback COMMAND test_pico_wt_loopback)
     set_tests_properties(pico_wt_loopback PROPERTIES TIMEOUT 30)
+
+    # One WebTransport session per QUIC connection: the client and server
+    # limits, and the slot the attach adapter releases when it detaches.
+    add_executable(test_pico_wt_one_session
+        tests/test_pico_wt_one_session.c
+        tests/pico_wt_harness.c
+    )
+    target_include_directories(test_pico_wt_one_session PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_one_session PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+    )
+    target_compile_definitions(test_pico_wt_one_session PRIVATE
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_one_session PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME pico_wt_one_session COMMAND test_pico_wt_one_session)
+    set_tests_properties(pico_wt_one_session PROPERTIES TIMEOUT 30)
 
     # Draft-18 over the real WT transport in the deterministic sim:
     # symmetric uni-control establish, request-bidi routing, subgroup
@@ -596,12 +626,10 @@ endif()\n")
 
     # Symbol-policy: covered by the same compile-flag mechanism as the
     # already-installed attach adapter (C_VISIBILITY_PRESET hidden +
-    # MOQ_API + MOQ_BUILDING). A dynamic nm export check needs a shared
-    # object; a global BUILD_SHARED_LIBS build is blocked by the picoquic
-    # core<->log static cycle, and a static-lib nm cannot validate
-    # visibility (hidden symbols stay global in the static symbol table).
-    # The attach adapter ships installed with the identical flag posture
-    # and no nm test, so the managed lib is consistent.
+    # MOQ_API + MOQ_BUILDING). Validate exports on a shared object:
+    # static-lib nm cannot validate visibility because hidden symbols
+    # remain global in the static symbol table. The Linux shared shipping
+    # CI build separately rejects unresolved cross-library references.
 
     # Build-tree consumer test: a throwaway downstream project that
     # resolves the managed facade via find_package(libmoq COMPONENTS
@@ -625,12 +653,14 @@ endif()\n")
                      -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                      -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtm_consumer_bld}' && \
                  '${_picowtm_consumer_bld}/moq_pico_wt_managed_consumer_test'")
         set_tests_properties(pico_wt_managed_consumer PROPERTIES TIMEOUT 180)
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+        moq_test_reject_consumer_warnings(pico_wt_managed_consumer)
 
         # Install-tree managed consumer: installs a BUILD_HTTP picoquic +
         # libmoq to a temp prefix and builds the managed consumer against
@@ -643,7 +673,7 @@ endif()\n")
             get_filename_component(_picowtm_openssl_root "${_om}" DIRECTORY)
         endif()
         add_test(NAME pico_wt_managed_install_consumer
-            COMMAND bash
+            COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_managed.sh"
                 "${CMAKE_COMMAND}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-managed"
@@ -665,7 +695,7 @@ endif()\n")
         find_program(PKG_CONFIG_EXECUTABLE pkg-config)
         if(PKG_CONFIG_EXECUTABLE)
             add_test(NAME pico_wt_managed_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-pico-wt-managed"
@@ -705,13 +735,15 @@ endif()\n")
                      -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                      -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtmv_consumer_bld}' && \
                  '${_picowtmv_consumer_bld}/moq_pico_wt_managed_verify_consumer_test'")
         set_tests_properties(pico_wt_managed_verify_consumer
             PROPERTIES TIMEOUT 180)
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
+        moq_test_reject_consumer_warnings(pico_wt_managed_verify_consumer)
 
         # Verifier cross-link consumer (pkg-config): the Meson/autotools
         # path — `pkg-config --cflags --libs libmoq-pico-wt-managed libmoq`
@@ -719,7 +751,7 @@ endif()\n")
         # its dependency in the static link line). Temp-prefix install.
         if(PKG_CONFIG_EXECUTABLE)
             add_test(NAME pico_wt_managed_verify_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-pico-wt-managed libmoq"
@@ -777,6 +809,34 @@ endif()\n")
         endif()
     endif()
 
+    # Managed client pre-accept stream buffer: chunk order and FIN, the stream
+    # and byte limits (WT_BUFFERED_STREAM_REJECTED), peer reset, early
+    # datagrams, and a refused CONNECT (WT_SESSION_GONE). White-box: the
+    # facade source is compiled in with MOQ_PICO_WT_TESTING; no network.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND TARGET picoquic-test)
+        add_executable(test_pico_wt_managed_early_streams
+            tests/test_pico_wt_managed_early_streams.c
+            tests/pico_wt_harness.c)
+        target_compile_definitions(test_pico_wt_managed_early_streams PRIVATE
+            MOQ_PICO_WT_TESTING
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        target_include_directories(test_pico_wt_managed_early_streams PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pico_wt_managed_early_streams PRIVATE
+            moq::adapter-pico-wt-managed picoquic-test)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_early_streams PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_early_streams
+            COMMAND test_pico_wt_managed_early_streams)
+        set_tests_properties(pico_wt_managed_early_streams PROPERTIES
+            TIMEOUT 30 LABELS "pico_wt;managed")
+    endif()
+
     # Managed client test: drives the facade against the example
     # server (built under MOQ_BUILD_ADAPTER_PICO_WT). Reuses the
     # example smoke driver. Labeled "network" so UDP-restricted
@@ -784,25 +844,27 @@ endif()\n")
     if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND
        EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
        EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
-        add_executable(test_pico_wt_managed_client
-            tests/test_pico_wt_managed_client.c)
-        target_link_libraries(test_pico_wt_managed_client
-            PRIVATE moq::adapter-pico-wt-managed)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(test_pico_wt_managed_client PRIVATE
-                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        if(MOQ_BUILD_EXAMPLES)
+            add_executable(test_pico_wt_managed_client
+                tests/test_pico_wt_managed_client.c)
+            target_link_libraries(test_pico_wt_managed_client
+                PRIVATE moq::adapter-pico-wt-managed)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_pico_wt_managed_client PRIVATE
+                    -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+            endif()
+            add_test(NAME pico_wt_managed_client
+                COMMAND bash
+                    "${PROJECT_SOURCE_DIR}/examples/pico_wt/run_smoke.sh"
+                    "$<TARGET_FILE:moq_pico_wt_server>"
+                    "$<TARGET_FILE:test_pico_wt_managed_client>"
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem"
+                    18450)
+            set_tests_properties(pico_wt_managed_client PROPERTIES
+                TIMEOUT 30
+                LABELS "network;pico_wt;managed")
         endif()
-        add_test(NAME pico_wt_managed_client
-            COMMAND bash
-                "${PROJECT_SOURCE_DIR}/examples/pico_wt/run_smoke.sh"
-                "$<TARGET_FILE:moq_pico_wt_server>"
-                "$<TARGET_FILE:test_pico_wt_managed_client>"
-                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
-                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem"
-                18450)
-        set_tests_properties(pico_wt_managed_client PROPERTIES
-            TIMEOUT 30
-            LABELS "network;pico_wt;managed")
 
         # Managed server <-> managed client, both in-process, each on
         # its own network thread, over real loopback UDP.
@@ -895,6 +957,39 @@ endif()\n")
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # SETUP authorization tokens through the managed facade: refusal of a
+        # set the send arena cannot hold, whole delivery on both drafts, and a
+        # SETUP that cannot be queued ending as a failed connection.
+        add_executable(test_pico_wt_managed_tokens
+            tests/test_pico_wt_managed_tokens.c)
+        target_link_libraries(test_pico_wt_managed_tokens
+            PRIVATE moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_tokens PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+        endif()
+        add_test(NAME pico_wt_managed_tokens
+            COMMAND test_pico_wt_managed_tokens
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_tokens PROPERTIES
+            TIMEOUT 60
+            LABELS "network;pico_wt;managed")
+
+        # A managed client publishes object datagrams to a managed server that
+        # subscribed to it. The client wraps h3zero's connection callback with
+        # its own context, so the datagram send path must use the endpoint's own
+        # h3zero context. Both drafts.
+        foreach(_dg_mode datagram datagram_18)
+            add_test(NAME pico_wt_managed_${_dg_mode}
+                COMMAND test_pico_wt_managed_loopback --mode ${_dg_mode}
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(pico_wt_managed_${_dg_mode} PROPERTIES
+                TIMEOUT 30
+                LABELS "network;pico_wt;managed")
+        endforeach()
+
         # Same withdrawal against a relay that omits the reset_stream_at
         # transport parameter (imquic/moqx). The client synthesizes the TP to
         # unblock CONNECT, so the abort must downgrade to a plain RESET_STREAM;
@@ -949,6 +1044,29 @@ endif()\n")
         target_include_directories(test_pico_wt_ownership PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(test_pico_wt_ownership PRIVATE moq::adapter-pico-wt-managed)
+        # Session-terminal arbitration through the managed facade: a control
+        # reset, close capsule and connection loss scripted from one side's
+        # network thread, for client and server receivers on both drafts.
+        add_executable(test_pico_wt_managed_arbitration
+            tests/test_pico_wt_managed_arbitration.c
+            pico_wt_managed.c
+            pico_wt_adapter.c
+            pico_wt_endpoint.c
+            ../common/moq_pq_send_queue.c
+        )
+        target_compile_definitions(test_pico_wt_managed_arbitration PRIVATE
+            MOQ_PICO_WT_TESTING MOQ_PICO_WT_TEST_QUIC_LOST)
+        target_include_directories(test_pico_wt_managed_arbitration PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_pico_wt_managed_arbitration PRIVATE
+            moq::adapter-pico-wt-managed)
+        add_test(NAME pico_wt_managed_arbitration
+            COMMAND test_pico_wt_managed_arbitration
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_arbitration PROPERTIES
+            TIMEOUT 120 LABELS "network;pico_wt;managed")
+
         add_test(NAME pico_wt_ownership
             COMMAND test_pico_wt_ownership
                 "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -1050,8 +1168,19 @@ endif()\n")
         # Edge cases: config validation, NULL safety, connect failure,
         # cert-verification failure, stop/wake/wait lifecycle, and
         # stop-from-on_pump rejection.
+        # Compiled from the facade sources with MOQ_PICO_WT_TESTING, so the
+        # CONNECT-preparation row can observe the deferred CONNECT's outcome
+        # through the private test seam.
         add_executable(test_pico_wt_managed_edges
-            tests/test_pico_wt_managed_edges.c)
+            tests/test_pico_wt_managed_edges.c
+            pico_wt_managed.c
+            pico_wt_adapter.c
+            pico_wt_endpoint.c
+            ../common/moq_pq_send_queue.c)
+        target_compile_definitions(test_pico_wt_managed_edges PRIVATE
+            MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_managed_edges PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         # Also links adapter-picoquic for moq_picoquic_set_cert_verifier
         # (<moq/picoquic_verify.h>) — exercises the documented cross-link
         # that pico WT managed consumers use for the verifier helper.

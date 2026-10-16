@@ -1,16 +1,14 @@
 """Sender statistics: Sender.stats() -> SenderStats.
 
-These rows were written RED, against a method that did not exist, and each
-failed by a NAMED missing behaviour rather than skipping. The method exists
-now and they pass. The gate is kept: a missing or inert name is still a named
-failure, the substrate rows still execute the recorder's oracles on their own,
-and the scoped stand-in control still proves these bodies are satisfiable
-independently of the product.
+Every row fails by a NAMED missing behaviour rather than skipping: a missing
+or inert name is a named failure, the substrate rows execute the recorder's
+oracles on their own, and the scoped stand-in control proves these bodies are
+satisfiable independently of the product.
 
 Scope: ONE read-only snapshot per call. No demand, wait, completion, drain or
 graceful finish, and nothing here is a readiness poll or a lifecycle barrier.
 
-The contract, re-derived from THIS worktree:
+The contract, from the sources:
 
   service/include/moq/media_sender.h:571-623
       Eleven reported values. Ten are uint64 counters plus a SIGNED
@@ -386,7 +384,7 @@ class StatsGatedBase(StatsFixtureBase):
     before the row acquires an endpoint."""
 
     def require_surface(self):
-        # Kept after GREEN: an inert or removed name must still fail by name.
+        # An inert or removed name must fail by name.
         missing = missing_surface()
         if missing:
             self.fail("the sender statistics surface is not implemented: "
@@ -1041,9 +1039,8 @@ class StatsControlTests(unittest.TestCase):
         self.assertGreater(result.testsRun, 0)
 
     def test_d_the_bridge_is_present_and_refuses_wrong_arguments(self):
-        # This row was the RED gate's "the bridge is absent" assertion. The
-        # bridge exists now, so it pins presence, callability and that a
-        # wrong-shaped call is refused rather than crashing.
+        # Pins the bridge's presence, callability and that a wrong-shaped
+        # call is refused rather than crashing.
         self.assertTrue(hasattr(_native, "sender_stats"),
                         "the stats bridge disappeared")
         self.assertTrue(callable(_native.sender_stats))

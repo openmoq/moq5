@@ -135,7 +135,7 @@ public final class MediaReceiver: @unchecked Sendable {
         }
     }
 
-    /// The wiring the public attach uses once a backend exists (S6); tests
+    /// The wiring behind the public attach, parameterized by backend; tests
     /// drive it with scripted backends. Throws `.wrongState` when the
     /// endpoint already has a receiver, `.closed` once it is shutting down.
     package static func attach(to endpoint: MoQEndpoint,

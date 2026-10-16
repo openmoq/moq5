@@ -5,8 +5,8 @@
  * depends/mimeType/eventType, contentProtections + contentProtectionRefIDs, max
  * SAP fields -- and checks the producer/consumer round trip via canonical
  * byte-equality: encode -> parse -> encode yields identical JSON. Uses the
- * MOQ_SCENARIO_* env knobs and the canonical "Replay:" output. Slice 2 of the
- * seeded media-conformance extension: generate-only (no byte mutation yet).
+ * MOQ_SCENARIO_* env knobs and the canonical "Replay:" output.
+ * Generate-only: catalogs are built, never byte-mutated.
  *
  * Light ctest default (200 seeds x 16 cases). Heavier local runs:
  *   MOQ_SCENARIO_SEEDS=100000 ./build/tests/test_scenario_media_msf

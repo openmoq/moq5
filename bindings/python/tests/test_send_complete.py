@@ -1,18 +1,16 @@
 """Broadcast completion as a REQUEST: Sender.request_complete() -> None.
 
-These rows were written RED, against a method that did not exist, and each
-failed by a NAMED missing behaviour rather than skipping. The method exists
-now and they pass. The gate that made that meaningful is kept: a missing or
-inert name is still a named failure, the substrate rows still execute the
-recorder's oracles on their own, and the scoped stand-in still proves this
-file's bodies are satisfiable independently of the product.
+Every row fails by a NAMED missing behaviour rather than skipping: a missing
+or inert name is a named failure, the substrate rows execute the recorder's
+oracles on their own, and the scoped stand-in proves this file's bodies are
+satisfiable independently of the product.
 
 Scope: ONE asynchronous request that the broadcast be permanently terminated.
 Not a graceful finish, not a flush, not a drain, not a delivery receipt, not
 sender destruction and not endpoint teardown. No finish(), no drain(), no
 completed predicate, no automatic close, no queue-empty inference.
 
-The contract, re-derived from THIS worktree rather than from a sketch:
+The contract, from the sources:
 
   service/include/moq/media_sender.h:509-527
       The service ends every active publisher track reliably (END_OF_TRACK,
@@ -139,7 +137,7 @@ PUBLIC_GATED_CLASSES = (
     "CompleteBoundaryTests",
 )
 
-# Names this slice must NOT introduce while claiming a request-only contract.
+# Names the sender must NOT expose while claiming a request-only contract.
 FORBIDDEN = ("finish", "drain", "complete", "completed", "flush",
              "wait_for_completion")
 
@@ -506,7 +504,7 @@ class CompleteSurfaceTests(CompleteGatedBase):
         for name in FORBIDDEN:
             self.assertFalse(
                 hasattr(moq5.Sender, name),
-                f"this slice introduced Sender.{name}: the request is not a "
+                f"Sender.{name} is present: the request is not a "
                 "graceful finish and has no completion predicate")
 
     def test_e_success_adds_no_accounting_of_its_own(self):
@@ -1077,7 +1075,7 @@ class CompleteControlTests(unittest.TestCase):
     The inert-name control establishes the GATE: every gated row is invoked
     and refuses by a named assertion. It does NOT execute the bodies -- each
     stops inside require_surface. The scoped stand-in control below runs those
-    bodies, so this RED cannot hide a broken test.
+    bodies, so a gated refusal cannot hide a broken test.
     """
 
     # Rows about the NATIVE entry point, which a Python stand-in cannot model:
@@ -1098,9 +1096,8 @@ class CompleteControlTests(unittest.TestCase):
     )
 
     def test_a_the_surface_and_its_bridge_are_present_and_refuse_misuse(self):
-        # This row was the RED gate's "the surface and the bridge are absent"
-        # assertion. Both exist now, so it pins presence, callability and that
-        # a wrong-shaped call is refused rather than crashing.
+        # Pins the presence and callability of the surface and the bridge,
+        # and that a wrong-shaped call is refused rather than crashing.
         self.assertEqual(missing_surface(), [],
                          "the completion surface was lost")
         missing = tuple(n for n in BRIDGE if not hasattr(_native, n))
@@ -1151,7 +1148,7 @@ class CompleteControlTests(unittest.TestCase):
         sender-level acknowledgment the track accessor combines with its own
         removal bit -- which is why it patches both names. It proves the rows
         are satisfiable and that their assertions are about that contract, not
-        that any product exists, which is what the RED attribution reports.
+        that any product exists; that is the inert-name control's job.
         """
         import test_send_complete as module
 

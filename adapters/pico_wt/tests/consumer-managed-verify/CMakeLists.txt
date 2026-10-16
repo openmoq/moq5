@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(moq_pico_wt_managed_verify_consumer_test LANGUAGES C)
 
+# Let capable linkers deduplicate archives without removing dependency edges.
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+    cmake_policy(SET CMP0179 NEW)
+endif()
+
 # WT managed + the verifier helper: the helper lives in adapter-picoquic,
 # which the managed component now depends on transitively. Requesting BOTH
 # explicitly is redundant but must still compose — that is what this test

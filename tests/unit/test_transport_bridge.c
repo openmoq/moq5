@@ -900,17 +900,18 @@ fail:
 }
 
 /*
- * BACKLOG #245(c): the bridge's own retry must complete the obligation the
- * refused call created, not silently discard it.
+ * Durable teardown obligation: the bridge's own retry must complete the
+ * obligation the refused call created, not silently discard it.
  *
  * Extra bytes on a publisher-side namespace-sub bidi tear that bidi down
  * (session_namespace_sub.c:1078-1080 -> ns_sub_local_teardown), and the
  * teardown can refuse for action capacity before recording anything durable
  * (:667-668). Bridge ingress correctly recognises the owner and retains the
- * retry (transport_bridge.c:2662-2669) -- so #245(a)'s predicate answers
- * correctly here, which this fixture also pins. Service then retries with
- * NULL/0 (:1934-1949); the session's durable marker makes that empty retry
- * complete the teardown (#245c), so pending_retry clears only once the abort
+ * retry (transport_bridge.c:2662-2669) -- so the stream-ownership predicate
+ * (moq_session_has_transport_stream) answers correctly here, which this
+ * fixture also pins. Service then retries with NULL/0 (:1934-1949); the
+ * session's durable teardown marker makes that empty retry complete the
+ * teardown, so pending_retry clears only once the abort
  * has dispatched.
  *
  * Recovery is SERVICE-ONLY: the bridge never re-delivers peer bytes, so the
@@ -2236,7 +2237,7 @@ static int test_progress_then_suspension_in_one_pass(void)
     MOQ_TEST_CHECK(!se->done_expired);
     MOQ_TEST_CHECK(se->done_deadline_us > 0);
 
-    /* Entry i takes a reset; S6 already proves real reset admission, so the
+    /* Entry i takes a reset; real reset admission has its own coverage, so the
      * flag is placed directly to keep this test on its own subject. */
     ei->pending_reset = true;
     ei->pending_reset_code = 0x9;
@@ -3172,8 +3173,8 @@ static int test_inbound_uni_rcbuf_dropped_then_discarded(void)
  * not re-deliver stream bytes, so the bridge/session must RETAIN those bytes
  * across the WOULD_BLOCK and deliver the object after the queue drains.
  *
- * Pre-fix: handle_data_bytes_impl retried the pending emit and returned
- * WOULD_BLOCK before appending the new bytes, silently dropping the object.
+ * Retrying the pending emit and returning WOULD_BLOCK before appending the
+ * new bytes would silently drop the object.
  * Run through both inbound entry points via deliver_uni(). */
 static int run_pending_retry_keeps_bytes(bool use_rcbuf_extra)
 {
@@ -4302,11 +4303,11 @@ static void probe_capture_forbidden(const moq_session_t *s, void *ctx,
 }
 
 
-/* -- #250: SUBSCRIBE_NAMESPACE response-stream termination, over the real
+/* -- SUBSCRIBE_NAMESPACE response-stream termination, over the real
  * bridge (draft-18 §10.18).
  *
- * The route is indexed by idx_ns_by_ref, so the request-stream retainability
- * gap (#245(a)) must not be on its path -- these rows PROVE that with the very
+ * The route is indexed by idx_ns_by_ref, so request-registry ownership
+ * lookup is not on its path -- these rows PROVE that with the very
  * predicate the bridge consults, and then by taking a genuine retained
  * WOULD_BLOCK rather than a fatal. Recovery is SERVICE-ONLY: the fixture never
  * re-delivers peer bytes, a FIN, or a second reset.
@@ -4632,7 +4633,8 @@ static int nsfin_arm_build(nsfin_arm_t *a, const char *suffix_field)
     MOQ_TEST_CHECK(moq_index_find(a->tp.client->idx_ns_by_ref,
                                   a->tp.client->idx_ns_mask,
                                   a->ref._v) == a->slot);
-    /* #245(a) independence, PROVEN with the predicate the bridge consults. */
+    /* Independence from the request registry, PROVEN with the predicate the
+     * bridge consults. */
     MOQ_TEST_CHECK(moq_session_has_transport_stream(a->tp.client, a->ref));
 
     /* Derive the SERVER owner BEFORE the request is delivered -- afterwards
@@ -5710,7 +5712,8 @@ static size_t encode_request_error(uint8_t *buf, size_t cap)
     moq_buf_writer_t w;
     moq_buf_writer_init(&w, buf, cap);
     moq_bytes_t reason = MOQ_BYTES_LITERAL(LSTOP_ERR_REASON);
-    if (moq_d18_encode_request_error(&w, LSTOP_ERR_CODE, LSTOP_ERR_RETRY,
+    /* Wire Retry Interval = milliseconds + 1 (d18 §10.6). */
+    if (moq_d18_encode_request_error(&w, LSTOP_ERR_CODE, LSTOP_ERR_RETRY + 1u,
                                      reason) != MOQ_OK)
         return 0;
     return moq_buf_writer_offset(&w);
@@ -5835,7 +5838,7 @@ static ep_rec_t ep_reset(uint64_t sid, uint64_t code)
     return r;
 }
 
-/* -- P3 PUBLISH: the RETAINED ingress class (#245(a)) ----------------
+/* -- P3 PUBLISH: the RETAINED ingress class -------------------------
  *
  * The counterpart to P7. Here the destination cannot take the FIN in the same
  * call -- the request event fills the ONE-slot queue, so the teardown defers --
@@ -5847,9 +5850,9 @@ static ep_rec_t ep_reset(uint64_t sid, uint64_t code)
  *
  * The semantic owner is a committed publication keyed ONLY in the request
  * stream registry (idx_req_by_streamref). moq_session_has_transport_stream()
- * now consults that registry (#245(a)), so the bridge recognises the live owner
- * and RETAINS the WOULD_BLOCK teardown instead of fatalizing the connection.
- * This case pins that landed behaviour.
+ * consults that registry, so the bridge recognises the live owner and RETAINS
+ * the WOULD_BLOCK teardown instead of fatalizing the connection. This case
+ * pins that behaviour.
  *
  * The application then rejects the surfaced owner inside that window, and the
  * bridge's own service -- with NO peer bytes redelivered -- completes the
@@ -5857,7 +5860,7 @@ static ep_rec_t ep_reset(uint64_t sid, uint64_t code)
  *
  * The fixture asserts the bridge's retention flags and the owner's own state.
  * It does NOT name, inspect or prescribe any storage for the FIN handoff
- * carrier; #249 owns that, storage-agnostic here.
+ * carrier; the FIN-aware drain selection owns that, storage-agnostic here.
  */
 #define P3_ALIAS 0x21
 static const uint8_t k_p3_ns0[]  = { 'l','i','v','e' };
@@ -6211,9 +6214,10 @@ static int p3_check_terminal_wire(void *vctx, const char *what)
                 (unsigned long long)er.error_code);
         bad++;
     }
-    if (er.retry_interval != (uint64_t)P3_RETRY_MS) {
-        fprintf(stderr, "FINBR %s: retry interval %llu, expected %d\n", what,
-                (unsigned long long)er.retry_interval, P3_RETRY_MS);
+    /* The wire Retry Interval is the interval plus one (d18 §10.6). */
+    if (er.retry_interval != (uint64_t)P3_RETRY_MS + 1u) {
+        fprintf(stderr, "FINBR %s: retry interval %llu, expected %d + 1\n",
+                what, (unsigned long long)er.retry_interval, P3_RETRY_MS);
         bad++;
     }
     if (er.reason.len != sizeof(k_p3_reason) ||
@@ -6405,7 +6409,7 @@ static int nob_ring_equals(const nob_ring_t *have, const nob_ring_t *want,
     return bad;
 }
 
-/* -- #245(c) over the PHYSICAL bridge: ns_sub local teardown ----------
+/* -- durable teardown over the PHYSICAL bridge: ns_sub local teardown -
  *
  * The publisher-side namespace-sub bidi treats extra inbound bytes as a
  * local teardown of that BIDI (draft-18 §10.9.1). The teardown needs one
@@ -6413,10 +6417,11 @@ static int nob_ring_equals(const nob_ring_t *have, const nob_ring_t *want,
  * DISCARDED (the branch never buffers them), and the bridge -- which never
  * re-delivers peer bytes -- retries with NULL/0. The session latches the
  * teardown obligation (and, with a FIN, the cumulative FIN) durably before the
- * capacity refusal (#245c), so the bridge's own empty re-drive completes the
+ * capacity refusal, so the bridge's own empty re-drive completes the
  * teardown exactly once. Every recovery assertion below pins that contract.
  *
- * The blocked half also pins #245(a)'s predicate as a GREEN CONTROL: this
+ * The blocked half also pins the stream-ownership predicate as a passing
+ * control: this
  * owner lives in idx_ns_by_ref, so the bridge's retainability check passes
  * and the refused ingress is retained rather than fatalized.
  *
@@ -6611,11 +6616,13 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
     fake_endpoint_clear_ops(&tp.server_ep);
 
     /* Burn inbound request id 0 through a COMPLETE rejected exchange first:
-     * the d18 staging cleanup's unqualified remove-by-id(0) (#252) would
+     * the d18 staging cleanup's unqualified remove-by-id(0) (it deletes by
+     * request id without checking the owner, so an ordinal-zero key of
+     * another owner goes with it) would
      * otherwise destroy the fixture owner's own by-id key and make the
      * declared topology unassertable. The whole warm exchange is DECODED and
      * CLASSIFIED -- its request id, its rejection wire, its retirement -- so
-     * the #252 avoidance cannot drift silently. The fixture subject then
+     * the ordinal-zero avoidance cannot drift silently. The fixture subject then
      * arrives at request id 2, asserted explicitly. */
     {
         moq_bytes_t warm_parts[] = { MOQ_BYTES_LITERAL("warm") };
@@ -6939,7 +6946,8 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
     failures += txs_check_eq(tp.server, &sref, 1, &nslb_before,
                              "blocked-session");
 
-    /* Blocked state: the bridge holds the retry -- #245(a)'s predicate answers
+    /* Blocked state: the bridge holds the retry -- the stream-ownership
+     * predicate answers
      * correctly on this route, retaining rather than fatalizing -- and NOTHING
      * else moved. On the FIN row the bridge additionally retains the FIN
      * (fin_retained), which its own FIN-less retry then re-drives against the
@@ -7056,10 +7064,10 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
 /* Two rows over the physical bridge: the no-FIN teardown (the peer send half
  * stays open, so exactly one NORMAL drain is owed and recovered), and the
  * extra-bytes+FIN teardown against a FULL drain ring. The FIN row pins
- * #245(c)'s cumulative-FIN retention: the bridge re-drives the pending bidi
- * with NULL,0,false, so unless the session latched the FIN before the capacity
- * refusal the drain selector would recompute need_drain=true and stall against
- * the exhausted ring -- which the landed fix prevents. */
+ * cumulative-FIN retention: the bridge re-drives the pending bidi with
+ * NULL,0,false, so the session must latch the FIN before the capacity refusal;
+ * otherwise the drain selector would recompute need_drain=true and stall
+ * against the exhausted ring. */
 static int test_ns_sub_local_teardown_bridge_retry(void)
 {
     int failures = 0;
@@ -7068,13 +7076,13 @@ static int test_ns_sub_local_teardown_bridge_retry(void)
     return failures;
 }
 
-/* -- #245(b) over the PHYSICAL bridge: the no-owner admission blockers --
+/* -- no-slot admission over the PHYSICAL bridge: no-owner blockers ----
  *
  * handle_request_stream_bytes()'s no-slot admission path returns WOULD_BLOCK
- * with NO owner in any registry. Before #245(b) the bridge's retainability
- * check answered false and the unowned WOULD_BLOCK became MOQ_ERR_INTERNAL,
- * fatalizing the connection -- local resource pressure destroying it. The
- * landed contract never fatalizes this path: the ingress either completes
+ * with NO owner in any registry. The no-slot carrier makes the bridge's
+ * retainability check answer true, so local resource pressure never turns the
+ * unowned WOULD_BLOCK into MOQ_ERR_INTERNAL and a fatal connection. The
+ * contract never fatalizes this path: the ingress either completes
  * immediately (MOQ_OK, obligation queued) or is retained (the no-slot carrier)
  * and completed by SERVICE ONLY, with no peer bytes re-delivered.
  *
@@ -7864,8 +7872,8 @@ static int nob_check_no_events(test_pair_t *tp, const char *what)
 /* The bridge completion-session helper must itself discriminate: it accepts
  * the exact derived state and rejects an unrelated event_scratch_len change
  * and a non-CLOSED session-state change. Quiet: only failures print. The nob
- * deep phases that consume this helper are live now that #245(b) retains the
- * ingress; this probe additionally pins the helper's own discrimination. */
+ * deep phases that consume this helper rely on the no-slot carrier retaining
+ * the ingress; this probe additionally pins the helper's own discrimination. */
 static int nob_session_selfcheck(void)
 {
     int failures = 0;
@@ -8117,7 +8125,8 @@ static int run_nob_case(const nob_case_t *c)
         MOQ_TEST_CHECK(tp.server->state != MOQ_SESS_ESTABLISHED);
         /* The local SETUP flush leaves no residual outbound work: the action
          * ring and the bridge outbound-pending queue are both empty, so the
-         * blocked-point and recovery oracles measure only #245 state. */
+         * blocked-point and recovery oracles measure only the retained
+         * admission state. */
         MOQ_TEST_CHECK_EQ_SIZE(
             tp.server->action_tail - tp.server->action_head, (size_t)0);
         MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.server_bridge));
@@ -8384,9 +8393,9 @@ static int run_nob_case(const nob_case_t *c)
     og_capture(tp.server, &g0);
 
     /* The target: a complete SUBSCRIBE on a fresh bidi, refused for capacity.
-     * The landed contract: never fatal; either completed now or retained (the
-     * no-slot carrier). Before #245(b) this returned MOQ_ERR_INTERNAL and
-     * latched the bridge fatal. */
+     * The contract: never fatal; either completed now or retained (the
+     * no-slot carrier), never MOQ_ERR_INTERNAL with the bridge latched
+     * fatal. */
     uint8_t tgt[128];
     size_t tgt_len;
     {
@@ -9182,7 +9191,7 @@ static int exh_check_seed(test_pair_t *tp, moq_stream_ref_t seed_ref,
     return bad;
 }
 
-/* #245b carrier pool full, the post-SETUP REQUEST_ERROR blocked
+/* No-slot carrier pool full, the post-SETUP REQUEST_ERROR blocked
  * on the send buffer, but two action slots and a NORMAL drain slot free. The
  * refused no-FIN target is dropped via exactly STOP+RESET(CANCELLED), the
  * session stays ESTABLISHED/nonfatal, exactly one NORMAL drain is added, no
@@ -9995,7 +10004,7 @@ static int carrier_target_arm(test_pair_t *tp, moq_stream_ref_t *other,
     return 0;
 }
 
-/* #245b: a retained no-slot carrier is RETIRED when a peer RESET terminates the
+/* A retained no-slot carrier is RETIRED when a peer RESET terminates the
  * request (draft-18 sections 3.3.2, 11.4.1). The full retired postcondition is
  * reasserted at the immediate RESET, after first service, at the repeated RESET
  * before service, and after repeat service -- never merely count/carrier/ring. */
@@ -10046,7 +10055,7 @@ static int test_noslot_carrier_peer_reset(void)
     return failures;
 }
 
-/* #245b: peer STOP_SENDING terminates the request and retires the exact carrier,
+/* Peer STOP_SENDING terminates the request and retires the exact carrier,
  * while the bridge preserves its half-close lifecycle. The literal lifecycle is
  * pinned end to end: the half-closed mapping and its send-half RESET pending
  * item after STOP; exactly one RESET(600,0x1) on first service with the mapping
@@ -10194,7 +10203,7 @@ static int test_noslot_carrier_peer_stop(void)
     return failures;
 }
 
-/* #245b carrier pool full AND the whole per-stream terminal is
+/* No-slot carrier pool full AND the whole per-stream terminal is
  * inadmissible (full drain ring, even with action slots free). The refused
  * no-FIN target closes the session with the draft-18 Session INTERNAL_ERROR
  * (0x1) -- no partial STOP/RESET, no protocol-violation/unauthorized code, no
@@ -10654,7 +10663,7 @@ static int test_local_bidi_stop_keeps_response_half(void)
 
     /* The callback itself touches the transport not at all: the reset is
      * queued, never issued re-entrantly. */
-    failures += ep_expect_none(&f.tp.client_ep, "R1 callback");
+    failures += ep_expect_none(&f.tp.client_ep, "case 1 callback");
 
     bridge_stream_entry_t *e = bridge_find_by_id(f.tp.client_bridge, f.bidi);
     MOQ_TEST_CHECK(e != NULL && e->active);
@@ -10673,7 +10682,7 @@ static int test_local_bidi_stop_keeps_response_half(void)
                    MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(f.bidi, 0x1) };
-        failures += ep_expect(&f.tp.client_ep, want, 1, "R1 service");
+        failures += ep_expect(&f.tp.client_ep, want, 1, "case 1 service");
     }
 
     /* The peer rejects the request on its still-open send half (§3.3.2). */
@@ -10715,22 +10724,22 @@ static int test_local_bidi_stop_keeps_response_half(void)
 
     /* The response terminal produces no endpoint output of its own, and the
      * mapping and owner retire. */
-    failures += ep_expect_none(&f.tp.client_ep, "R1 response terminal");
+    failures += ep_expect_none(&f.tp.client_ep, "case 1 response terminal");
     MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
-    failures += ep_expect_none(&f.tp.client_ep, "R1 service after terminal");
+    failures += ep_expect_none(&f.tp.client_ep, "case 1 service after terminal");
     MOQ_TEST_CHECK(request_registry_find_by_streamref(f.tp.client, f.ref).kind
                    == MOQ_REQ_NONE);
     failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
-                                   "R1 terminal");
+                                   "case 1 terminal");
 
     /* Repeated service stays inert, and the mapping stays gone by BOTH
      * identities. */
     MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
-    failures += ep_expect_none(&f.tp.client_ep, "R1 repeated service");
+    failures += ep_expect_none(&f.tp.client_ep, "case 1 repeated service");
     failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
-                                   "R1 repeated service");
+                                   "case 1 repeated service");
 
     test_pair_destroy(&f.tp);
     return failures;
@@ -10748,13 +10757,13 @@ static int test_local_bidi_stop_duplicate_is_idempotent(void)
                        f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
     MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                        f.tp.client_bridge, f.bidi, 0x4, 0) == MOQ_OK);
-    failures += ep_expect_none(&f.tp.client_ep, "R2 callbacks");
+    failures += ep_expect_none(&f.tp.client_ep, "case 2 callbacks");
 
     MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(f.bidi, 0x1) };
-        failures += ep_expect(&f.tp.client_ep, want, 1, "R2 service");
+        failures += ep_expect(&f.tp.client_ep, want, 1, "case 2 service");
     }
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
 
@@ -10763,7 +10772,7 @@ static int test_local_bidi_stop_duplicate_is_idempotent(void)
                        f.tp.client_bridge, f.bidi, 0x5, 0) == MOQ_OK);
     MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
-    failures += ep_expect_none(&f.tp.client_ep, "R2 third stop");
+    failures += ep_expect_none(&f.tp.client_ep, "case 2 third stop");
 
     bridge_stream_entry_t *e = bridge_find_by_id(f.tp.client_bridge, f.bidi);
     MOQ_TEST_CHECK(e != NULL && e->active);
@@ -10848,10 +10857,10 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
      * bound to its own OPEN/WRITE pair rather than to a scan of the queue. */
     MOQ_TEST_CHECK(local_subscribe(&tp, k_b.ns, k_b.track, &sub_b) == 0);
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
-    failures += classify_local_request(&tp.client_ep, &k_b, &sid_b, "R3 arm B");
+    failures += classify_local_request(&tp.client_ep, &k_b, &sid_b, "case 3 arm B");
     MOQ_TEST_CHECK(local_subscribe(&tp, k_c.ns, k_c.track, &sub_c) == 0);
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
-    failures += classify_local_request(&tp.client_ep, &k_c, &sid_c, "R3 arm C");
+    failures += classify_local_request(&tp.client_ep, &k_c, &sid_c, "case 3 arm C");
     MOQ_TEST_CHECK(sid_b != 0 && sid_c != 0 && sid_b != sid_c);
     bridge_stream_entry_t *eb = bridge_find_by_id(tp.client_bridge, sid_b);
     bridge_stream_entry_t *ec = bridge_find_by_id(tp.client_bridge, sid_c);
@@ -10870,7 +10879,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
         want[0].stream_id = tp.client_ep.count ? tp.client_ep.ops[0].stream_id
                                                : 0;
         sid_a = want[0].stream_id;
-        failures += ep_expect(&tp.client_ep, want, 1, "R3 arm A open");
+        failures += ep_expect(&tp.client_ep, want, 1, "case 3 arm A open");
     }
     MOQ_TEST_CHECK(sid_a != 0 && sid_a != sid_b && sid_a != sid_c);
     bridge_stream_entry_t *ea = bridge_find_by_id(tp.client_bridge, sid_a);
@@ -10882,7 +10891,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
                            ea->ref._v);
     failures += check_subscribe_bytes(tp.client_bridge->pending[0].data,
                                       tp.client_bridge->pending[0].data_len,
-                                      &k_a, "R3 arm A request");
+                                      &k_a, "case 3 arm A request");
 
     /* Two unrelated records, one owning bytes from the bridge's allocator. */
     static const uint8_t k_unrelated[] = { 0xA1, 0xB2, 0xC3, 0xD4, 0xE5 };
@@ -10913,7 +10922,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
     tp.client_ep.block_reset = true;
     MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                        tp.client_bridge, sid_a, 0x1, 0) == MOQ_OK);
-    failures += ep_expect_none(&tp.client_ep, "R3 callback");
+    failures += ep_expect_none(&tp.client_ep, "case 3 callback");
 
     /* Exactly the targeted item left; the unrelated records kept their order,
      * their complete contents and their buffer; the RESET took the tail. */
@@ -10938,7 +10947,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
     }
     /* Exactly one block freed: the targeted write's own buffer. */
     MOQ_TEST_CHECK(fs.balance == balance_before - 1);
-    MOQ_TEST_CHECK(fp_sticky_clean(&fs, "R3 compaction") == 0);
+    MOQ_TEST_CHECK(fp_sticky_clean(&fs, "case 3 compaction") == 0);
 
     /* Reset still blocked: the unrelated work goes out, the target does not. */
     tp.client_ep.block_write = false;
@@ -10956,7 +10965,7 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
         want[1].stream_id = sid_c;
         want[1].check_fin = true;
         want[1].fin = true;
-        failures += ep_expect(&tp.client_ep, want, 2, "R3 blocked service");
+        failures += ep_expect(&tp.client_ep, want, 2, "case 3 blocked service");
     }
     MOQ_TEST_CHECK(tp.client_bridge->pending_count == 1);
     MOQ_TEST_CHECK(tp.client_bridge->pending[0].kind == PENDING_RESET_STREAM);
@@ -10972,25 +10981,21 @@ static int test_local_bidi_stop_blocked_reset_retries(void)
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(sid_a, 0x1) };
-        failures += ep_expect(&tp.client_ep, want, 1, "R3 reset service");
+        failures += ep_expect(&tp.client_ep, want, 1, "case 3 reset service");
     }
     MOQ_TEST_CHECK(tp.client_bridge->pending_count == 0);
 
     test_pair_destroy(&tp);
-    MOQ_TEST_CHECK(br_alloc_zeroed(&fs, "R3 teardown") == 0);
+    MOQ_TEST_CHECK(br_alloc_zeroed(&fs, "case 3 teardown") == 0);
     return failures;
 }
 
 /* 4. Control: a PEER-opened request bidi keeps requester-cancellation, and its
- *    own physical RESET then retires the stream exactly once.
- *
- * Only RESET is exercised. The peer-FIN variant is BACKLOG #257, a separate
- * pre-existing defect: the STOP correctly retires the peer-origin request
- * owner, but the bridge keeps no discard mapping for the peer's still-open
- * sending direction, so its later legal empty FIN reaches the ownerless
- * request parser and closes 0x3. That outcome is not encoded here as a green
- * expectation, and this slice does not fix it. */
-static int peer_bidi_stop_then_reset(void)
+ *    own physical terminal -- RESET or FIN -- then retires the stream exactly
+ *    once. The STOP retires the request owner, while the session keeps the
+ *    peer's still-open sending direction as a drain reference, so its later
+ *    legal empty FIN is absorbed rather than read as a new request. */
+static int peer_bidi_stop_then_terminal(bool use_fin)
 {
     int failures = 0;
     test_pair_t tp;
@@ -11014,7 +11019,7 @@ static int peer_bidi_stop_then_reset(void)
 
     MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                        tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
-    failures += ep_expect_none(&tp.client_ep, "R4 callback");
+    failures += ep_expect_none(&tp.client_ep, "case 4 callback");
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
 
@@ -11037,12 +11042,16 @@ static int peer_bidi_stop_then_reset(void)
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
     {
         ep_rec_t want[1] = { ep_reset(bidi, 0x1) };
-        failures += ep_expect(&tp.client_ep, want, 1, "R4 service");
+        failures += ep_expect(&tp.client_ep, want, 1, "case 4 service");
     }
 
     /* The peer's own remaining direction then terminates. */
-    MOQ_TEST_CHECK(held_bridge_reset(
-                       tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
+    if (use_fin)
+        MOQ_TEST_CHECK(moq_transport_bridge_on_peer_bidi_bytes(
+                           tp.client_bridge, bidi, NULL, 0, true, 0) == MOQ_OK);
+    else
+        MOQ_TEST_CHECK(held_bridge_reset(
+                           tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
     {
@@ -11053,16 +11062,16 @@ static int peer_bidi_stop_then_reset(void)
         }
         MOQ_TEST_CHECK(extra == 0);
     }
-    failures += ep_expect_none(&tp.client_ep, "R4 terminal");
+    failures += ep_expect_none(&tp.client_ep, "case 4 terminal");
 
-    failures += check_mapping_gone(tp.client_bridge, bidi, bref, "R4 terminal");
+    failures += check_mapping_gone(tp.client_bridge, bidi, bref, "case 4 terminal");
 
     /* Repeated terminal and repeated service are both inert. */
     MOQ_TEST_CHECK(held_bridge_reset(
                        tp.client_bridge, bidi, 0x1, 0) == MOQ_OK);
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
-    failures += ep_expect_none(&tp.client_ep, "R4 repeat");
-    failures += check_mapping_gone(tp.client_bridge, bidi, bref, "R4 repeat");
+    failures += ep_expect_none(&tp.client_ep, "case 4 repeat");
+    failures += check_mapping_gone(tp.client_bridge, bidi, bref, "case 4 repeat");
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
 
@@ -11072,7 +11081,8 @@ static int peer_bidi_stop_then_reset(void)
 
 static int test_peer_bidi_stop_is_request_cancellation(void)
 {
-    return peer_bidi_stop_then_reset();
+    return peer_bidi_stop_then_terminal(false) +
+           peer_bidi_stop_then_terminal(true);
 }
 
 /* 5. Peer FIN and peer RESET each retire a preserved mapping exactly once. */
@@ -11090,7 +11100,7 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
                        MOQ_OK);
         {
             ep_rec_t want[1] = { ep_reset(f.bidi, 0x1) };
-            failures += ep_expect(&f.tp.client_ep, want, 1, "R5 service");
+            failures += ep_expect(&f.tp.client_ep, want, 1, "case 5 service");
         }
         MOQ_TEST_CHECK(bridge_find_by_id(f.tp.client_bridge, f.bidi) != NULL);
 
@@ -11118,10 +11128,10 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
         }
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
         MOQ_TEST_CHECK(moq_session_state(f.tp.client) == MOQ_SESS_ESTABLISHED);
-        failures += ep_expect_none(&f.tp.client_ep, "R5 terminal");
+        failures += ep_expect_none(&f.tp.client_ep, "case 5 terminal");
 
         failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
-                                       "R5 terminal");
+                                       "case 5 terminal");
         MOQ_TEST_CHECK(request_registry_find_by_streamref(f.tp.client, f.ref)
                        .kind == MOQ_REQ_NONE);
 
@@ -11130,9 +11140,9 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
                            f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
         MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                        MOQ_OK);
-        failures += ep_expect_none(&f.tp.client_ep, "R5 repeat");
+        failures += ep_expect_none(&f.tp.client_ep, "case 5 repeat");
         failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
-                                       "R5 repeat");
+                                       "case 5 repeat");
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
 
         test_pair_destroy(&f.tp);
@@ -11148,12 +11158,12 @@ static int test_local_bidi_stop_then_peer_terminal_retires_once(void)
  * deferral, so this row does not claim the current outcome is conformant --
  * it pins what the product does.
  *
- * The cause is BACKLOG #245(a): moq_session_has_transport_stream() does not
- * consult the draft-18 request registry, so an ordinary FIN on a local-origin
- * request bidi retires and tombstones the mapping through the pre-existing
- * path, and by the time the STOP arrives there is no stream left to reset.
- * Retaining every local-FIN mapping instead is exactly the broadening this
- * slice must not do, and fixing #245(a) is not this task's scope.
+ * The cause: moq_session_has_transport_stream() does not keep a local-origin
+ * request bidi's mapping alive after its local FIN, so an ordinary FIN retires
+ * and tombstones the mapping through the ordinary half-close path, and by the
+ * time the STOP arrives there is no stream left to reset.
+ * Retaining every local-FIN mapping instead would broaden retention to every
+ * local-origin stream, so this row pins the current mapping lifetime.
  */
 static int test_local_bidi_stop_after_local_fin(void)
 {
@@ -11173,7 +11183,7 @@ static int test_local_bidi_stop_after_local_fin(void)
         want[0].fin = true;
         want[0].data_len = 0;
         want[0].data = (const uint8_t *)"";   /* empty FIN, payload compared */
-        failures += ep_expect(&f.tp.client_ep, want, 1, "R6 fin");
+        failures += ep_expect(&f.tp.client_ep, want, 1, "case 6 fin");
     }
 
     /* The ordinary FIN retired the mapping: pre-existing tombstone behaviour,
@@ -11184,7 +11194,7 @@ static int test_local_bidi_stop_after_local_fin(void)
                        f.tp.client_bridge, f.bidi, 0x1, 0) == MOQ_OK);
     MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
-    failures += ep_expect_none(&f.tp.client_ep, "R6 stop after fin");
+    failures += ep_expect_none(&f.tp.client_ep, "case 6 stop after fin");
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(f.tp.client) == MOQ_SESS_ESTABLISHED);
 
@@ -11216,20 +11226,20 @@ static int test_local_bidi_normal_fin_unchanged(void)
         want[0].stream_id = f.bidi;
         want[0].check_fin = true;
         want[0].fin = true;
-        failures += ep_expect(&f.tp.client_ep, want, 1, "R7 fin");
+        failures += ep_expect(&f.tp.client_ep, want, 1, "case 7 fin");
     }
 
-    /* Retired and tombstoned exactly as before this slice, by both identities. */
-    failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref, "R7 fin");
+    /* Retired and tombstoned through the ordinary local-FIN path, by both identities. */
+    failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref, "case 7 fin");
     MOQ_TEST_CHECK(bridge_is_tombstoned(f.tp.client_bridge, f.bidi));
 
     /* A second FIN for the retired ref produces nothing. */
     MOQ_TEST_CHECK(queue_close_bidi(f.tp.client, f.ref) == MOQ_OK);
     MOQ_TEST_CHECK(held_bridge_service(f.tp.client_bridge, 0) ==
                    MOQ_OK);
-    failures += ep_expect_none(&f.tp.client_ep, "R7 second fin");
+    failures += ep_expect_none(&f.tp.client_ep, "case 7 second fin");
     failures += check_mapping_gone(f.tp.client_bridge, f.bidi, f.ref,
-                                   "R7 second fin");
+                                   "case 7 second fin");
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.tp.client_bridge));
     MOQ_TEST_CHECK(moq_session_state(f.tp.client) == MOQ_SESS_ESTABLISHED);
 
@@ -11783,7 +11793,8 @@ static int test_hol_close_intent_not_deferred(void)
     }
 
     /* and it does happen once credit returns, so the intent was merely
-     * deferred rather than lost -- which is what makes this a HOL finding */
+     * deferred rather than lost -- which is what makes this head-of-line
+     * blocking */
     f.tp.server_ep.block_open_uni = false;
     hol_service(&f, 16);
     close_after_credit = hol_count_kind(&f, FAKE_OP_CLOSE);
@@ -13300,12 +13311,13 @@ static int test_hol_owned_payload_conservation(void)
 }
 
 /* ============== retention capacity at the drain boundary =================
- * Removing G2 let one pass retain up to BRIDGE_DRAIN_BUDGET actions into a
- * queue that holds max_pending. Because the domain gate guarantees that every
+ * Without the drain loop's `pending_count < max_pending` stop condition, one
+ * pass could retain up to BRIDGE_DRAIN_BUDGET actions into a queue that holds
+ * max_pending. Because the domain gate guarantees that every
  * later action for a blocked stream is retained rather than dispatched, the
  * queue fills deterministically -- and every enqueue-failure branch takes the
  * connection fatal. So a blocked stream with more queued work than the pending
- * capacity destroyed the connection and lost its objects.
+ * capacity would destroy the connection and lose its objects.
  *
  * The fixture records both public knobs and asserts their coupling, because
  * the defect only exists when max_actions > max_pending.

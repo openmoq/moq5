@@ -1060,7 +1060,7 @@ static int sp_directional_checks(void)
 
     /* -- matured-delay target attribution (load-bearing): a delayed control
      *    action matures to its target's direction ONLY. Two arms, one per
-     *    direction; neutering the matured-side attribution fails at least one. */
+     *    direction; a wrong matured-side attribution fails at least one. */
     failures += sp_matured_arm(true);    /* client -> server */
     failures += sp_matured_arm(false);   /* server -> client */
 
@@ -4529,7 +4529,7 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* S1: SPLIT_CONTROL / SPLIT_BIDI deterministic chunking           */
+    /* SPLIT_CONTROL / SPLIT_BIDI deterministic chunking               */
     /* ================================================================ */
 
     /* == SPLIT_CONTROL: REQUEST_UPDATE split over control stream ====== */
@@ -4849,7 +4849,7 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* S2a: DELAY fault — control + bidi                               */
+    /* DELAY fault — control + bidi                                    */
     /* ================================================================ */
 
     /* == Delayed control does not arrive at same time ================= */
@@ -5566,10 +5566,10 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* S2b: data stream delay                                          */
+    /* data stream delay                                               */
     /* ================================================================ */
 
-    /* S2b: data stream delay tests.
+    /* Data stream delay tests.
      * STOP_DATA delay is implemented but not directly testable here
      * because STOP requires INJECT_STOP (transport-level injection).
      * The STOP delay path shares the same deliver_or_delay pattern
@@ -6289,7 +6289,7 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* S5: DELAY + injection coverage                                  */
+    /* DELAY + injection coverage                                      */
     /* ================================================================ */
 
     /* == DELAY + INJECT_STOP: delayed data + injected stop ============ */
@@ -6522,7 +6522,7 @@ int main(void)
     }
 
     /* ================================================================ */
-    /* S6: delay fault OOM coverage                                    */
+    /* delay fault OOM coverage                                        */
     /* ================================================================ */
 
     /* == Control delay OOM: propagates NOMEM, clean balance =========== */

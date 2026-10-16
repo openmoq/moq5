@@ -1793,8 +1793,9 @@ static void test_fetch(void)
 /* -- FETCH (P2 pending-join) ----------------------------------------- */
 
 /* A Joining FETCH buffered against a still-pending subscription. Its FIN is
- * carried today by a direct req_recv_fin copy, so these rows are REGRESSIONS,
- * not REDs: they pin the behaviour the handoff-marker conversion must keep.
+ * carried by a direct req_recv_fin copy, so these rows are REGRESSION guards,
+ * not expected failures: they pin the behaviour any handoff-marker
+ * representation must keep.
  * Its two obligations are exercised separately -- the internal rejection
  * itself, reached before the join is ever application-visible, and the
  * drain accounting in the reject-all preflight. */
@@ -4453,7 +4454,8 @@ static void check_nss_retired(moq_session_t *s, moq_stream_ref_t ref)
 /* Retire inbound request id 0 through this family's own public sequence -- a
  * complete SUBSCRIBE_NAMESPACE, its application rejection and the peer's FIN --
  * so every measured P6 owner carries a NONZERO request id. Without it the
- * ordinal-zero key of BACKLOG #252 sits in the graph and masks the topology
+ * ordinal-zero key sits in the graph, where the staging cleanup's unqualified
+ * remove-by-id(0) can delete another owner's edge, and masks the topology
  * these rows assert. It encodes its own message rather than borrowing the
  * family feed, so the shared fixture context is never mutated, and nothing
  * about the burned exchange is measured. */
@@ -4926,7 +4928,8 @@ static void run_nss_action_blocked(const fin_owner_case_t *f, bool then_reject)
     moq_stream_ref_t blocker = moq_stream_ref_from_u64(0x77);
     uint64_t saved_id = c->request_id;
 
-    /* #252 would destroy the pending request-id edge at ordinal zero, so the
+    /* The staging cleanup's unqualified remove-by-id(0) would destroy the
+     * pending request-id edge at ordinal zero, so the
      * measured owner uses a nonzero id and its topology asserts absolutely. */
     nss_burn_request(s, moq_stream_ref_from_u64(ref._v + 8), 0, 0);
     c->request_id = 2;
@@ -6888,7 +6891,7 @@ typedef struct req_seed_snap {
     int      ns_got_response;
     int      ns_parse_complete;
     int      ns_closing_remote_error;
-    /* The durable local-teardown obligation marker (#245c). Distinct from the
+    /* The durable local-teardown obligation marker. Distinct from the
      * `fin` latch above: `fin` records that the peer's send half closed, while
      * this records that an extra-bytes/re-fed teardown is owed on this bidi. A
      * capacity-refused teardown must retain BOTH before the empty re-feed. */
@@ -7571,7 +7574,7 @@ static int rfin_declare_staging_slot(const moq_session_t *s, uint32_t *out_gen)
 
 /* The DECLARED staging owner inventory -- the fields listed below, against
  * values declared before the call. Deliberately not the whole
- * `moq_sub_entry_t`: unrelated subscription coverage is not this slice's. */
+ * `moq_sub_entry_t`: unrelated subscription state has its own coverage. */
 static void rfin_check_staging(const moq_session_t *s, moq_stream_ref_t ref,
                                int slot, uint32_t gen,
                                const uint8_t *want_buf, size_t want_len)
@@ -8815,9 +8818,10 @@ static void run_ns_goaway_latched(void)
 
 /* Draft-18 defines no post-request message on a publisher-side namespace-sub
  * bidi, so extra bytes terminate that BIDI rather than the session (§10.9.1).
- * Two landed obligations meet here and are kept apart:
+ * Two obligations meet here and are kept apart:
  *
- *   #245(c) -- the refused call's obligation is RETAINED durably in owner state.
+ *   Durable teardown -- the refused call's obligation is RETAINED in owner
+ *   state.
  *   The branch (`if (len > 0) return ns_sub_local_teardown(...)`) deliberately
  *   does NOT append those bytes to the entry; instead the refusal installs the
  *   `local_teardown_pending` marker, which carries the semantic retry, and the
@@ -8825,7 +8829,7 @@ static void run_ns_goaway_latched(void)
  *   marker. The oracle pins the marker, not raw bytes -- recv_len is not
  *   required to grow.
  *
- *   #249 -- the drain selector is FIN-aware: the cumulative peer FIN is latched
+ *   FIN-aware drain -- the drain selector is FIN-aware: the cumulative peer FIN is latched
  *   into `pending_fin` BEFORE the capacity refusal, so a same-call FIN owes no
  *   drain and a genuinely open peer half owes exactly one. */
 
@@ -8894,7 +8898,8 @@ static int nsl_graph_equal(const og_graph_t *g0, const moq_session_t *s,
 /* An inbound SUBSCRIBE_NAMESPACE the application has not answered: a
  * publisher-side entry in PENDING_PUBLISHER, whose bidi treats further bytes as
  * a local teardown. Returns the entry's own buffered length so a later oracle
- * can require it UNCHANGED without assuming how the fix stores its obligation. */
+ * can require it UNCHANGED without assuming how the session stores its
+ * obligation. */
 static moq_stream_ref_t arm_pending_publisher_ns_sub_at(moq_session_t *s,
                                                         uint64_t ref_v,
                                                         uint64_t request_id,
@@ -8928,7 +8933,7 @@ static moq_stream_ref_t arm_pending_publisher_ns_sub(moq_session_t *s,
     return arm_pending_publisher_ns_sub_at(s, 1, 0, out_recv_len);
 }
 
-/* #245(c) -- the refused call's obligation is RETAINED, isolated with NO peer
+/* Durable teardown -- the refused call's obligation is RETAINED, isolated with NO peer
  * FIN so the drain selector plays no part. The publisher-side branch
  * (`if (len > 0) return ns_sub_local_teardown(...)`) deliberately does NOT
  * append those bytes to the entry; the refusal installs the durable
@@ -8966,7 +8971,7 @@ static void run_nsl_retry_obligation(void)
     MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
 
     /* Everything about the owner is required unchanged EXCEPT the retained
-     * teardown itself, whose representation the fix chooses. The bytes the
+     * teardown itself, whose representation is the session's own. The bytes the
      * entry already held are compared byte for byte; only what lies beyond that
      * prefix is left free. */
     {
@@ -9046,7 +9051,7 @@ static void run_nsl_retry_obligation(void)
     moq_session_destroy(s);
 }
 
-/* #245(c) + #249 cumulative-FIN retention: an extra-bytes+FIN teardown that
+/* Durable teardown + FIN-aware drain, cumulative-FIN retention: an extra-bytes+FIN teardown that
  * blocks on its action slot must retain the FIN durably in session-owned state,
  * not just the teardown obligation. The peer's send half is already closed, so
  * the eventual abort owes NO drain -- but the empty re-feed carries fin=false,
@@ -9332,7 +9337,7 @@ static void test_ns_sub_local_teardown(void)
     run_nsl_reuse_after_teardown();
 }
 
-/* -- #245(b): the no-owner admission blockers ------------------------
+/* -- No-slot admission: the no-owner admission blockers -------------
  *
  * handle_request_stream_bytes()'s no-slot path returns MOQ_ERR_WOULD_BLOCK on
  * capacity shortfalls BEFORE any staging entry or registry owner exists.
@@ -9358,7 +9363,7 @@ static void test_ns_sub_local_teardown(void)
  * arms require the same exact final output, cleanup and exactly-once
  * postconditions. Any other return fails the permanent outcome validator.
  * The WOULD_BLOCK arm completes on the documented empty re-feed through its
- * durable no-slot carrier (#245b), and its cumulative FIN is retained in the
+ * durable no-slot carrier, and its cumulative FIN is retained in the
  * carrier so the completion owes no drain the peer already made unnecessary.
  *
  * Terminal obligations, exact:
@@ -11478,7 +11483,8 @@ static size_t enc_sns_overlap(uint8_t *buf, size_t cap, uint64_t rid)
 
 /* Consume and retire inbound request id 0 through a complete, exactly checked
  * exchange, so no fixture in this family carries the ordinal-zero key whose
- * cross-owner deletion is BACKLOG #252. */
+ * cross-owner deletion (the staging cleanup's unqualified remove-by-id(0)) would
+ * otherwise mask the asserted topology. */
 static void nsr_burn_request_id_0(moq_session_t *s)
 {
     moq_stream_ref_t ref = moq_stream_ref_from_u64(9);
@@ -14157,7 +14163,7 @@ static size_t enc_announcement_error(uint8_t *buf, size_t cap)
     moq_buf_writer_init(&w, buf, cap);
     MOQ_TEST_CHECK_EQ_INT(
         (int)moq_d18_encode_request_error(
-            &w, R3_ERROR_CODE, R3_RETRY_MS,
+            &w, R3_ERROR_CODE, R3_RETRY_MS + 1u,   /* wire = ms + 1, §10.6 */
             (moq_bytes_t){ (const uint8_t *)k_r3_reason,
                            sizeof(k_r3_reason) - 1 }), (int)MOQ_OK);
     return moq_buf_writer_offset(&w);
@@ -14506,7 +14512,7 @@ static txs_op_hooks_t r1_hooks = {
  *
  * Two arms, and they differ in WHERE the peer FIN comes from -- which the
  * fixture asserts rather than assumes, because the two are not the same fact.
- * Both are GREEN: whichever way the FIN arrives, it ends up in the DURABLE
+ * Both pass: whichever way the FIN arrives, it ends up in the DURABLE
  * latch, and the FIN rows are drainless under the unified rule.
  *
  *   T5-MARKER      the FIN rides the inbound PUBLISH_NAMESPACE that CREATES the
@@ -14518,7 +14524,7 @@ static txs_op_hooks_t r1_hooks = {
  *                  `handle_announcement_stream_bytes` latches on the entry
  *                  (:121) -- a durable latch reached by a different route.
  *
- * Neither arm forges the latch from a same-call FIN by hand: the landed handoff
+ * Neither arm forges the latch from a same-call FIN by hand: the handoff
  * consumes the transitional marker into the latch, and both arms assert
  * `handoff_fin_pending` is cleared to prove that consumption is synchronous. */
 #define T5_TOK_TYPE 11
