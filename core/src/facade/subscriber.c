@@ -133,6 +133,16 @@ struct moq_sub_fill_req {
     sub_delivery_failure_t delivery_failure;
 };
 
+/* A queued stream terminal, with the object and chunk queue positions it
+ * waits behind. The facade's queues are strictly FIFO, so a position is the
+ * ingress sequence of what was queued there: the terminal is pollable once
+ * both heads have reached them. */
+typedef struct sub_stream_terminal_entry {
+    moq_sub_stream_terminal_t rec;
+    size_t                    obj_seq;
+    size_t                    chunk_seq;
+} sub_stream_terminal_entry_t;
+
 /* A queued Group end, with the object and chunk queue positions it waits
  * behind: it is pollable once both heads have reached them. */
 typedef struct sub_group_end_entry {
@@ -218,6 +228,17 @@ struct moq_subscriber {
     size_t                 ge_tail;
     bool                   has_pending_ge;
     sub_group_end_entry_t  pending_ge;
+
+    /* Stream terminals (surface_stream_terminals): a ring of st_cap
+     * entries plus the one-deep pending slot, whose positions are taken
+     * when it enters the ring. */
+    bool                         surface_stream_terminals;
+    sub_stream_terminal_entry_t *stream_terminals;
+    size_t                       st_cap;
+    size_t                       st_head;
+    size_t                       st_tail;
+    bool                         has_pending_st;
+    moq_sub_stream_terminal_t    pending_st;
 
     moq_sub_stats_t     stats;
 };
@@ -568,6 +589,46 @@ static void ge_push(moq_subscriber_t *s, const sub_group_end_entry_t *e)
 {
     s->group_ends[s->ge_tail % s->ge_cap] = *e;
     s->ge_tail++;
+}
+
+static bool st_queue_full(const moq_subscriber_t *s)
+{
+    return (s->st_tail - s->st_head) >= s->st_cap;
+}
+
+/* Queue a terminal behind everything queued so far. */
+static void st_push(moq_subscriber_t *s, const moq_sub_stream_terminal_t *rec)
+{
+    sub_stream_terminal_entry_t *e = &s->stream_terminals[s->st_tail % s->st_cap];
+    e->rec = *rec;
+    e->obj_seq = s->obj_tail;
+    e->chunk_seq = s->chunk_tail;
+    s->st_tail++;
+}
+
+/* Queue `rec`, or hold it in the pending slot when the lane is full; true
+ * when it was held, so the caller returns WOULD_BLOCK. */
+static bool st_offer(moq_subscriber_t *s, const moq_sub_stream_terminal_t *rec)
+{
+    if (st_queue_full(s)) {
+        s->pending_st = *rec;
+        s->has_pending_st = true;
+        return true;
+    }
+    st_push(s, rec);
+    return false;
+}
+
+static void st_record(moq_sub_stream_terminal_t *rec, moq_sub_track_t *t,
+                      moq_sub_stream_terminal_kind_t kind,
+                      uint64_t group_id, uint64_t subgroup_id)
+{
+    memset(rec, 0, sizeof(*rec));
+    rec->struct_size = (uint32_t)sizeof(*rec);
+    rec->kind = kind;
+    rec->track = t;
+    rec->group_id = group_id;
+    rec->subgroup_id = subgroup_id;
 }
 
 static void chunk_release_refs(moq_sub_chunk_t *c)
@@ -958,6 +1019,17 @@ _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) >=
 _Static_assert(offsetof(moq_sub_cfg_t, surface_group_ends) ==
                offsetof(moq_sub_cfg_t, _reserved_group_ends) + sizeof(uint32_t),
                "surface_group_ends must follow its reserved slot");
+/* The stream-terminal block starts at the complete sizeof of the layout
+ * that ends with max_fill_items, which has no tail padding. */
+_Static_assert(offsetof(moq_sub_cfg_t, max_stream_terminals) ==
+               offsetof(moq_sub_cfg_t, max_fill_items) + sizeof(uint32_t),
+               "max_stream_terminals follows max_fill_items");
+_Static_assert((offsetof(moq_sub_cfg_t, max_fill_items) + sizeof(uint32_t)) %
+               _Alignof(moq_sub_cfg_t) == 0,
+               "max_fill_items ends the old layout without tail padding");
+_Static_assert(sizeof(moq_sub_stream_terminal_t) ==
+               MOQ_SUB_STREAM_TERMINAL_V0_SIZE,
+               "stream terminal record v0 size");
 /* The fill limits start past the complete sizeof of the layout that ends
  * with surface_group_ends (its tail padding included), on every target. */
 _Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
@@ -980,6 +1052,10 @@ _Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
     bool streaming = SUB_CFG_HAS(streaming_objects) && cfg->streaming_objects;
     bool group_ends = SUB_CFG_HAS(surface_group_ends) &&
                       cfg->surface_group_ends;
+    bool stream_terminals = SUB_CFG_HAS(surface_stream_terminals) &&
+                            cfg->surface_stream_terminals;
+    size_t stc = stream_terminals && cfg->max_stream_terminals
+        ? cfg->max_stream_terminals : oc;
     size_t flc = SUB_CFG_HAS(max_fills) && cfg->max_fills
         ? cfg->max_fills : SUB_DEFAULT_MAX_FILLS;
     size_t flic = SUB_CFG_HAS(max_fill_items) && cfg->max_fill_items
@@ -996,7 +1072,8 @@ _Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
         fc > SIZE_MAX / sizeof(moq_sub_fetch_req_t) ||
         cc > SIZE_MAX / sizeof(moq_sub_chunk_t) ||
         flc > SIZE_MAX / sizeof(moq_sub_fill_req_t) ||
-        hc > SIZE_MAX / sizeof(sub_history_slot_t))
+        hc > SIZE_MAX / sizeof(sub_history_slot_t) ||
+        stc > SIZE_MAX / sizeof(sub_stream_terminal_entry_t))
         return MOQ_ERR_NOMEM;
     size_t qbytes = SUB_DEFAULT_MAX_QUEUED_BYTES;
     if (SUB_CFG_HAS(max_queued_object_bytes) && cfg->max_queued_object_bytes) {
@@ -1185,6 +1262,19 @@ _Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
     for (size_t i = 0; i < flc; i++)
         s->fill_reqs[i].sub = s;
 
+    /* Last: everything above is in place, so destroy unwinds a failure. */
+    if (stream_terminals) {
+        s->stream_terminals = (sub_stream_terminal_entry_t *)alloc->alloc(
+            stc * sizeof(sub_stream_terminal_entry_t), alloc->ctx);
+        if (!s->stream_terminals) {
+            moq_sub_destroy(s);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(s->stream_terminals, 0, stc * sizeof(sub_stream_terminal_entry_t));
+        s->st_cap = stc;
+        s->surface_stream_terminals = true;
+    }
+
     *out = s;
     return MOQ_OK;
 }
@@ -1229,6 +1319,9 @@ void moq_sub_destroy(moq_subscriber_t *sub)
     }
 
     moq_alloc_t alloc = sub->alloc;
+    if (sub->stream_terminals)
+        alloc.free(sub->stream_terminals,
+            sub->st_cap * sizeof(sub_stream_terminal_entry_t), alloc.ctx);
     if (sub->group_ends)
         alloc.free(sub->group_ends,
             sub->ge_cap * sizeof(sub_group_end_entry_t), alloc.ctx);
@@ -1369,6 +1462,45 @@ moq_result_t moq_sub_unsubscribe(moq_subscriber_t *sub,
     return MOQ_OK;
 }
 
+/* A queued or held stream terminal names `track`. */
+static bool track_has_stream_terminals(const moq_subscriber_t *s,
+                                       const moq_sub_track_t *track)
+{
+    if (s->has_pending_st && s->pending_st.track == track) return true;
+    for (size_t n = 0; n < s->st_tail - s->st_head; n++)
+        if (s->stream_terminals[(s->st_head + n) % s->st_cap].rec.track == track)
+            return true;
+    return false;
+}
+
+bool moq_sub_track_has_queued_input(const moq_subscriber_t *s,
+                                    const moq_sub_track_t *track)
+{
+    if (!s || !track) return false;
+    /* Only an owned slot is read: the pointer is compared first. */
+    bool owned = false;
+    for (size_t i = 0; i < s->track_cap && !owned; i++)
+        owned = &s->tracks[i] == track;
+    if (!owned || track->state == SUB_TRACK_FREE) return false;
+    if ((s->has_pending && s->pending.track == track) ||
+        (s->has_pending_chunk && s->pending_chunk.track == track) ||
+        (s->has_pending_fli && s->pending_fli.track == track &&
+         s->pending_fli.kind == MOQ_SUB_FILL_OBJECT))
+        return true;
+    for (size_t n = 0; n < s->obj_tail - s->obj_head; n++)
+        if (s->objects[(s->obj_head + n) % s->obj_cap].track == track) return true;
+    for (size_t n = 0; n < s->chunk_tail - s->chunk_head; n++)
+        if (s->chunks[(s->chunk_head + n) % s->chunk_cap].track == track) return true;
+    size_t idx = s->fill_queue.head;
+    for (size_t n = 0; n < s->fill_queue.count; n++) {
+        const sub_history_slot_t *slot = &s->history[idx];
+        if (slot->u.fill.track == track && slot->u.fill.kind == MOQ_SUB_FILL_OBJECT)
+            return true;
+        idx = slot->next;
+    }
+    return false;
+}
+
 static bool track_has_facade_refs(const moq_subscriber_t *s,
     const moq_sub_track_t *track)
 {
@@ -1394,6 +1526,7 @@ static bool track_has_facade_refs(const moq_subscriber_t *s,
     for (size_t n = 0; n < s->ge_tail - s->ge_head; n++)
         if (s->group_ends[(s->ge_head + n) % s->ge_cap].end.track == track)
             return true;
+    if (track_has_stream_terminals(s, track)) return true;
     for (size_t i = 0; i < s->history_cap; i++)
         if (s->history[i].kind == SUB_HISTORY_FILL &&
             s->history[i].u.fill.track == track)
@@ -1416,6 +1549,9 @@ moq_result_t moq_sub_release_track(moq_subscriber_t *sub,
         return MOQ_ERR_WRONG_STATE;
     if (moq_session_supports_fill(sub->session) &&
         track_has_facade_refs(sub, track))
+        return MOQ_ERR_WRONG_STATE;
+    /* On every profile: a stream terminal names the slot it was queued for. */
+    if (track_has_stream_terminals(sub, track))
         return MOQ_ERR_WRONG_STATE;
     track_result_release(sub, track);
     track->state = SUB_TRACK_FREE;
@@ -1570,6 +1706,27 @@ static void fill_sub_object(moq_sub_object_t *o, moq_sub_track_t *t,
     o->properties = obj->properties;
 }
 
+/* The lane record of a SUBGROUP_FINISHED; true when it was held for a full
+ * lane (or must wait behind another held record), so the caller returns
+ * WOULD_BLOCK. */
+static bool stream_finished_terminal(moq_subscriber_t *sub, moq_sub_track_t *t,
+                                     const moq_event_t *ev)
+{
+    if (!sub->surface_stream_terminals) return false;
+    const moq_subgroup_finished_event_t *f = &ev->u.subgroup_finished;
+    moq_sub_stream_terminal_t st;
+    st_record(&st, t, f->end_of_group ? MOQ_SUB_STREAM_FIN_END_OF_GROUP
+                                      : MOQ_SUB_STREAM_FIN,
+              f->group_id, f->subgroup_id);
+    if (ev->detail_size >= offsetof(moq_subgroup_finished_event_t,
+                                    last_object_id) + sizeof(uint64_t) &&
+        f->has_last_object) {
+        st.has_last_object = true;
+        st.last_object_id = f->last_object_id;
+    }
+    return st_offer(sub, &st);
+}
+
 moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 {
     if (!sub) return MOQ_ERR_INVAL;
@@ -1613,6 +1770,15 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         ge_push(sub, &sub->pending_ge);
         memset(&sub->pending_ge, 0, sizeof(sub->pending_ge));
         sub->has_pending_ge = false;
+    }
+
+    /* After the pending chunk: a reset that cut an object short follows
+     * that object's terminal chunk. */
+    if (sub->has_pending_st) {
+        if (st_queue_full(sub)) return sub_would_block(sub);
+        st_push(sub, &sub->pending_st);
+        memset(&sub->pending_st, 0, sizeof(sub->pending_st));
+        sub->has_pending_st = false;
     }
 
     if (sub->has_pending_fli) {
@@ -1727,9 +1893,25 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 sc.end_of_group = ck->end_of_group;
                 sc.chunk = ck->chunk;
                 sc.properties = ck->properties;
+                /* A reset that cut this object short is the stream's
+                 * terminal, queued behind the chunk. */
+                bool cut = sub->surface_stream_terminals && ck->end &&
+                           ck->terminal == MOQ_OBJECT_TERMINAL_RESET;
+                moq_sub_stream_terminal_t st;
+                if (cut) {
+                    st_record(&st, t, MOQ_SUB_STREAM_RESET,
+                              ck->group_id, ck->subgroup_id);
+                    st.error_code = ck->error_code;
+                    st.has_cut_object = true;
+                    st.cut_object_id = ck->object_id;
+                }
                 if (chunk_queue_full(sub)) {
                     sub->pending_chunk = sc;
                     sub->has_pending_chunk = true;
+                    if (cut) {
+                        sub->pending_st = st;
+                        sub->has_pending_st = true;
+                    }
                     ck->chunk = NULL;
                     ck->properties = NULL;
                     moq_event_cleanup(&ev);
@@ -1739,6 +1921,10 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 *dst = sc;
                 ck->chunk = NULL;
                 ck->properties = NULL;
+                if (cut && st_offer(sub, &st)) {
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
+                }
             }
             break;
         }
@@ -2201,10 +2387,15 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     if (ge_queue_full(sub)) {
                         sub->pending_ge = ge;
                         sub->has_pending_ge = true;
+                        stream_finished_terminal(sub, t, &ev);
                         moq_event_cleanup(&ev);
                         return sub_would_block(sub);
                     }
                     ge_push(sub, &ge);
+                }
+                if (stream_finished_terminal(sub, t, &ev)) {
+                    moq_event_cleanup(&ev);
+                    return sub_would_block(sub);
                 }
             }
             break;
@@ -2213,8 +2404,27 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         case MOQ_EVENT_SUBGROUP_RESET: {
             moq_sub_track_t *t = find_track_by_handle(sub,
                 ev.u.subgroup_reset.sub);
-            if (t && t->state == SUB_TRACK_ACTIVE)
+            if (t && t->state == SUB_TRACK_ACTIVE) {
                 sub->stats.subgroup_resets++;
+                if (sub->surface_stream_terminals) {
+                    const moq_subgroup_reset_event_t *r = &ev.u.subgroup_reset;
+                    moq_sub_stream_terminal_t st;
+                    st_record(&st, t, MOQ_SUB_STREAM_RESET,
+                              r->group_id, r->subgroup_id);
+                    st.error_code = r->error_code;
+                    if (ev.detail_size >= offsetof(moq_subgroup_reset_event_t,
+                                                   last_object_id) +
+                                          sizeof(uint64_t) &&
+                        r->has_last_object) {
+                        st.has_last_object = true;
+                        st.last_object_id = r->last_object_id;
+                    }
+                    if (st_offer(sub, &st)) {
+                        moq_event_cleanup(&ev);
+                        return sub_would_block(sub);
+                    }
+                }
+            }
             break;
         }
 
@@ -2436,6 +2646,25 @@ moq_result_t moq_sub_poll_group_end(moq_subscriber_t *sub,
         return MOQ_DONE;
     *out = e->end;
     sub->ge_head++;
+    return MOQ_OK;
+}
+
+moq_result_t moq_sub_poll_stream_terminal(moq_subscriber_t *sub,
+                                          moq_sub_stream_terminal_t *out,
+                                          size_t out_size)
+{
+    if (!sub || !out) return MOQ_ERR_INVAL;
+    if (out_size < MOQ_SUB_STREAM_TERMINAL_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    if (sub->st_head >= sub->st_tail) return MOQ_DONE;
+    const sub_stream_terminal_entry_t *e =
+        &sub->stream_terminals[sub->st_head % sub->st_cap];
+    /* Held until the objects and chunks queued before it are polled. */
+    if (sub->obj_head < e->obj_seq || sub->chunk_head < e->chunk_seq)
+        return MOQ_DONE;
+    size_t n = out_size < sizeof(e->rec) ? out_size : sizeof(e->rec);
+    memcpy(out, &e->rec, n);
+    out->struct_size = (uint32_t)n;
+    sub->st_head++;
     return MOQ_OK;
 }
 

@@ -404,6 +404,8 @@ static moq_result_t rx_fan_closure(moq_session_t *s, moq_rx_stream_t *rx,
             e.u.subgroup_reset.subgroup_id = rx->subgroup_id;
             e.u.subgroup_reset.error_code = error_code;
             e.u.subgroup_reset.end_of_group = rx->end_of_group;
+            e.u.subgroup_reset.has_last_object = rx->has_last_complete;
+            e.u.subgroup_reset.last_object_id = rx->last_complete_object_id;
         } else {
             e.kind = MOQ_EVENT_SUBGROUP_FINISHED;
             e.detail_size = (uint32_t)sizeof(moq_subgroup_finished_event_t);
@@ -412,6 +414,8 @@ static moq_result_t rx_fan_closure(moq_session_t *s, moq_rx_stream_t *rx,
             e.u.subgroup_finished.group_id = rx->group_id;
             e.u.subgroup_finished.subgroup_id = rx->subgroup_id;
             e.u.subgroup_finished.end_of_group = rx->end_of_group;
+            e.u.subgroup_finished.has_last_object = rx->has_last_complete;
+            e.u.subgroup_finished.last_object_id = rx->last_complete_object_id;
         }
         moq_result_t rc = push_event(s, &e);
         if (rc < 0) return rc;
@@ -931,6 +935,8 @@ static moq_result_t rx_emit_subgroup_reset(moq_session_t *s, int slot,
     e.u.subgroup_reset.subgroup_id = rx->subgroup_id;
     e.u.subgroup_reset.error_code = error_code;
     e.u.subgroup_reset.end_of_group = rx->end_of_group;
+    e.u.subgroup_reset.has_last_object = rx->has_last_complete;
+    e.u.subgroup_reset.last_object_id = rx->last_complete_object_id;
     moq_result_t rc = push_event(s, &e);
     if (rc < 0) {
         rx->reset_error_code = error_code;
@@ -1115,6 +1121,8 @@ static moq_result_t rx_finish_stream(moq_session_t *s, int slot)
         e.u.subgroup_finished.group_id = rx->group_id;
         e.u.subgroup_finished.subgroup_id = rx->subgroup_id;
         e.u.subgroup_finished.end_of_group = rx->end_of_group;
+        e.u.subgroup_finished.has_last_object = rx->has_last_complete;
+        e.u.subgroup_finished.last_object_id = rx->last_complete_object_id;
         moq_result_t rc = push_event(s, &e);
         if (rc < 0) {
             rx->parse_state = MOQ_RX_PENDING_FINISHED;
@@ -1209,6 +1217,15 @@ static bool rx_binding_alive(moq_session_t *s, const moq_rx_stream_t *rx)
  * event as the poll releases it per event); the stream's own references are
  * released once every subscription has its event. Resumable under
  * WOULD_BLOCK: a served subscription is never served twice. */
+/* The stream's current Object has been carried completely: its last
+ * byte left the parser as an event, or was consumed for a suppressed one.
+ * What a subgroup terminal reports as the stream's last Object. */
+static void rx_note_complete(moq_rx_stream_t *rx)
+{
+    rx->has_last_complete = true;
+    rx->last_complete_object_id = rx->cur_object_id;
+}
+
 static moq_result_t rx_fan_push_chunk(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
@@ -1358,6 +1375,7 @@ static moq_result_t rx_fan_emit_object(moq_session_t *s, int slot)
         rx->cur_extensions = NULL;
     }
     rx->payload_written = 0;
+    rx_note_complete(rx);
     if (rx->pending_fin && rx->hdr_len == 0 && rx->input_len == 0)
         return rx_finish_stream(s, slot);
     rx->parse_state = MOQ_RX_AWAITING_OBJECT;
@@ -1388,6 +1406,8 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
             moq_rcbuf_decref(rx->cur_extensions);
             rx->cur_extensions = NULL;
         }
+        if (rx->pending_end && rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL)
+            rx_note_complete(rx);
         return MOQ_OK;
     }
 
@@ -1398,7 +1418,13 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
         if (rc < 0) return rc;
     }
 
-    if (rx->fan_shared) return rx_fan_push_chunk(s, slot);
+    if (rx->fan_shared) {
+        moq_result_t frc = rx_fan_push_chunk(s, slot);
+        if (frc >= 0 && rx->pending_end &&
+            rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL)
+            rx_note_complete(rx);
+        return frc;
+    }
 
     if (event_queue_full(s))
         return MOQ_ERR_WOULD_BLOCK;
@@ -1443,6 +1469,8 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
     rx->pending_chunk = NULL;
     if (rx->pending_begin)
         rx->cur_extensions = NULL;
+    if (rx->pending_end && rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL)
+        rx_note_complete(rx);
 
     return MOQ_OK;
 }
@@ -1573,6 +1601,7 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
             rx->cur_extensions = NULL;
         }
         rx->payload_written = 0;
+        rx_note_complete(rx);
         if (rx->pending_fin && rx->hdr_len == 0 && rx->input_len == 0)
             return rx_finish_stream(s, slot);
         rx->parse_state = MOQ_RX_AWAITING_OBJECT;
@@ -1639,6 +1668,7 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
     rx->payload_rcbuf = NULL;
     rx->payload_buf = NULL;
     rx->payload_written = 0;
+    rx_note_complete(rx);
 
     /* (Received-object history is fed at object ADMISSION in the header-parse
      * loop, before delivery -- see the track_hist_merge there -- so both the

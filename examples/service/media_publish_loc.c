@@ -50,6 +50,9 @@
 #define FRAME_DUR_US   (1000000ull / VIDEO_FPS)
 
 static volatile sig_atomic_t g_stop = 0;
+
+/* How long the final drain may take before the example stops anyway. */
+enum { ENDPOINT_DRAIN_TIMEOUT_US = 5000000 };
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 static size_t split_namespace(char *buf, moq_bytes_t *parts, size_t max)
@@ -425,14 +428,30 @@ int main(int argc, char **argv)
 
     free(pb);
 
-    if (st.track_added)
-        moq_media_sender_end_track(tx, st.trk);
+    /* 4. End the track, then drain while the sender is still attached, so
+     * its queued objects and the track's end reach the transport (and, where
+     * the backend observes it, the peer's acknowledgement); then tear down,
+     * child first. Destroying the sender first would discard what it still
+     * had queued. The exit status says whether that finite end completed. */
+    int status = 0;
+    if (st.track_added) {
+        moq_result_t erc = moq_media_sender_end_track(tx, st.trk);
+        if (erc != MOQ_OK) {
+            fprintf(stderr, "end_track: %d (%s)\n", (int)erc, moq_strerror(erc));
+            status = 1;
+        }
+    }
+    moq_result_t drc = moq_endpoint_drain(ep, ENDPOINT_DRAIN_TIMEOUT_US);
+    if (drc != MOQ_OK) {
+        fprintf(stderr, "drain: %d (%s)\n", (int)drc, moq_strerror(drc));
+        status = 1;
+    }
 
-    fprintf(stderr, "done: sent=%llu dropped=%llu\n", st.sent, st.dropped);
+    fprintf(stderr, "done: sent=%llu dropped=%llu%s\n", st.sent, st.dropped,
+            status ? " (end not completed)" : "");
 
-    /* 4. Teardown: child first, then the endpoint. */
     moq_media_sender_destroy(tx);
     moq_endpoint_stop(ep);
     moq_endpoint_destroy(ep);
-    return 0;
+    return status;
 }

@@ -20,6 +20,7 @@
 #include <moq/media_object.h>
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 
+#include "media_receiver_internal.h"
 #include "endpoint_internal.h"
 
 #ifdef MOQ_SERVICE_HAVE_MPEG2TS
@@ -42,6 +43,7 @@
 #define RECEIVER_PARSE_STACK_SAMPLES 64u
 #define RECEIVER_DEFAULT_SAP_RECORDS 256u  /* bounded SAP-record queue depth */
 #define RECEIVER_DEFAULT_MT_RECORDS  256u  /* bounded media-timeline queue depth */
+#define RECEIVER_DEFAULT_STREAM_TERMINALS 64u /* stream-terminal lane depth */
 #define RECEIVER_DEFAULT_TS_SLOTS    64u      /* MPEG2TS reorder slots per track */
 #define RECEIVER_DEFAULT_TS_WINDOW_US 300000u /* MPEG2TS reorder window */
 /* Receiver-lifetime caps on retained catalog-update state (availability): a peer
@@ -68,16 +70,34 @@
 #define MEDIA_TRACK_EVENT_V0_SIZE \
     (offsetof(moq_media_track_event_t, config_generation) + sizeof(uint32_t))
 
-/* ABI boundary: the appended detail block must start exactly at the
- * v0 sizeof (the align-rounded end of config_generation) -- the
- * _reserved_track_ev spacer occupies the old trailing padding, and this
- * equality pin keeps it honest under any layout change. */
-_Static_assert(offsetof(moq_media_track_event_t, has_largest) ==
-               ((offsetof(moq_media_track_event_t, config_generation) +
-                 sizeof(((moq_media_track_event_t *)0)->config_generation) +
-                 (_Alignof(moq_media_track_event_t) - 1)) &
-                ~(size_t)(_Alignof(moq_media_track_event_t) - 1)),
-               "UPDATE_OK detail block must sit exactly at the v0 sizeof");
+/* ABI boundary: the v0 event, exactly as it was, and the appended UPDATE_OK
+ * block starting at or after its complete allocation (sizeof, padding
+ * included), so a v0 caller's storage is never written past. With the
+ * _reserved_track_ev spacer the block starts exactly at the old sizeof where
+ * v0 ended in four bytes of padding (LP64), and four bytes past it where v0
+ * ended at config_generation (32-bit targets). The exact offsets are pinned
+ * per platform in tests/unit/test_abi_layout_d22.c. */
+typedef struct media_track_event_v0 {
+    uint32_t                      struct_size;
+    moq_media_track_event_kind_t  kind;
+    moq_media_track_t            *track;
+    const moq_media_track_desc_t *desc;
+    uint32_t                      config_generation;
+} media_track_event_v0_t;
+_Static_assert(offsetof(moq_media_track_event_t, kind) ==
+                   offsetof(media_track_event_v0_t, kind) &&
+               offsetof(moq_media_track_event_t, track) ==
+                   offsetof(media_track_event_v0_t, track) &&
+               offsetof(moq_media_track_event_t, desc) ==
+                   offsetof(media_track_event_v0_t, desc) &&
+               offsetof(moq_media_track_event_t, config_generation) ==
+                   offsetof(media_track_event_v0_t, config_generation),
+               "v0 event fields keep their offsets");
+_Static_assert(MEDIA_TRACK_EVENT_V0_SIZE <= sizeof(media_track_event_v0_t),
+               "the v0 floor lies within the v0 allocation");
+_Static_assert(offsetof(moq_media_track_event_t, has_largest) >=
+                   sizeof(media_track_event_v0_t),
+               "UPDATE_OK detail block must start past the complete v0 allocation");
 /* The parse-drop detail block is a SECOND appended generation: it must start at
  * the align-rounded end of the UPDATE_OK block (right after expires_ms), so an
  * older caller passing the UPDATE_OK-generation sizeof is never written past. */
@@ -110,6 +130,17 @@ _Static_assert(offsetof(moq_media_track_event_t, fill_unreported_loss_causes) ==
 /* The whole loss summary: an event is written with it only when this covers it. */
 #define MEDIA_TRACK_EVENT_FILL_LOSS_END \
     (offsetof(moq_media_track_event_t, fill_unreported_loss_object) + sizeof(uint64_t))
+_Static_assert(offsetof(moq_media_track_event_t, has_done_status) ==
+               ((MEDIA_TRACK_EVENT_FILL_LOSS_END + _Alignof(moq_media_track_event_t) - 1) &
+                ~(size_t)(_Alignof(moq_media_track_event_t) - 1)),
+               "the done status must follow the complete fill loss allocation");
+#define MEDIA_TRACK_EVENT_DONE_END \
+    (offsetof(moq_media_track_event_t, done_status) + sizeof(uint64_t))
+_Static_assert(offsetof(moq_media_track_desc_t, has_render_group) ==
+               ((offsetof(moq_media_track_desc_t, alt_group) + sizeof(int) +
+                 _Alignof(moq_media_track_desc_t) - 1) &
+                ~(size_t)(_Alignof(moq_media_track_desc_t) - 1)),
+               "the render group must follow the complete alt_group allocation");
 #define MEDIA_OBJECT_V0_SIZE \
     (offsetof(moq_media_object_t, samples_owned) + sizeof(moq_cmaf_sample_t *))
 /* ABI boundaries of the appended blocks: each starts at the sizeof of the
@@ -291,6 +322,9 @@ struct moq_media_track {
     moq_result_t     local_result;
     moq_media_track_event_kind_t local_failure_kind;
     bool             local_failure_pending;
+    /* A LIVE delivery failure recorded but not yet published: the facade
+     * still holds input it admitted for the track, which is taken first. */
+    bool             delivery_failure_staged;
     bool             delivery_failed; /* preserves already-admitted objects */
     /* Coalesced parse-drop diagnostic state (all under r->mu). A malformed
      * media/SAP/media-timeline object for this track bumps parse_drops and, if
@@ -324,6 +358,8 @@ struct moq_media_track {
                                           group. */
     uint64_t         drop_below_group;
     bool             walk_key_seen;    /* compaction-walk scratch */
+    /* Stream-terminal lane (r->mu): the track's queued LIVE entries. */
+    uint32_t         st_queued;
     uint64_t         walk_key_group;
     bool             forward_sent;     /* last forward state sent (pause) */
     bool             forward_desired;
@@ -395,6 +431,8 @@ typedef struct receiver_event {
     int32_t local_result;
     uint32_t delivery_origin;
     uint64_t delivery_initiating_request_id;
+    bool     has_done_status;              /* TRACK_ENDED from a done */
+    uint64_t done_status;
 } receiver_event_t;
 
 /* Identity/intent only, not a second item queue. The facade keeps each child
@@ -451,6 +489,11 @@ typedef struct receiver_fill_dom {
     uint64_t error_code;
     uint32_t ready_seq;            /* event-queue position it is served at */
     uint64_t ready_order;          /* oldest READY first among equal ones */
+    /* An MPEG2TS fill: its loss is also carried as Location-tracked gaps.
+     * With the stream-terminal lane, every fill's record orders its terminal
+     * and keys its loss records. */
+    bool ts;
+    uint32_t st_owed;              /* its RECEIVER_DROP records not yet polled */
 } receiver_fill_dom_t;
 
 struct moq_media_receiver {
@@ -598,7 +641,48 @@ struct moq_media_receiver {
     bool             fatal;
     uint64_t         fatal_code;
     moq_media_receiver_stats_t stats;    /* counter fields only */
+    uint64_t         track_events_polled;
+
+    /* Stream-terminal lane (surface_stream_terminals), mu-protected. Each
+     * Object taken in gets the next ingress sequence; a record waits for
+     * every queued or held Object of its track below its barrier. */
+    bool             st_enabled;
+    struct receiver_st_entry *st;
+    uint32_t         st_cap, st_head, st_tail;
+    bool             st_blocked;       /* intake stopped for lane room */
+    bool             st_collect;       /* an admission's policy drops are recorded */
+    uint64_t         ingress_seq;      /* next sequence to hand out */
+    uint64_t         intake_seq;       /* the Object being taken in */
+    /* Delivery domains with queued entries: a track's LIVE entries, or one
+     * fill's. */
+    uint32_t         domains_queued;
+    uint32_t         st_admit_from;    /* lane tail when the admission began */
+    /* Lane slots reserved for records owed later: one for the admission in
+     * progress (st_adm), and one per Object, status Object or END_OF_TRACK
+     * a reorder window holds or has parked. */
+    uint32_t         st_reserved;
+    bool             st_adm;
+    /* Reorder windows whose next release waits for room; ts_wake asks the
+     * application's next poll to wake the network thread. Intake waits for
+     * them: the application's polls can return the room before the window
+     * resumes, and an intake then must not replace what the window has
+     * parked. */
+    uint32_t         ts_stalled;
+    bool             ts_wake;
+    /* A stream terminal taken from the facade that waits for lane room or
+     * for its track's pending records; intake stops while it does. */
+    bool             st_has_held;
+    moq_media_stream_terminal_t st_held;
 };
+
+typedef struct receiver_st_entry {
+    moq_media_stream_terminal_t rec;
+    uint64_t                    barrier;
+    uint8_t                     dom;     /* RECEIVER_DROP: its fill record + 1 */
+    /* Clear while an MPEG2TS reorder window may still hold Objects of the
+     * track taken in before it; the network thread sets it. */
+    bool                        ready;
+} receiver_st_entry_t;
 
 typedef struct receiver_obj_entry {
     moq_media_object_t obj;
@@ -619,7 +703,12 @@ typedef struct receiver_obj_entry {
      * application polls it; otherwise the payload skips them. */
     bool               join_candidate;
     uint32_t           join_psi_len;
+    /* Ingress sequence (stream-terminal lane). */
+    uint64_t           seq;
 } receiver_obj_entry_t;
+
+static bool track_is_ts(const moq_media_track_t *t);
+static void dom_ready_locked(moq_media_receiver_t *r, receiver_fill_dom_t *d);
 
 /* Release one queue entry's owned buffers (any thread that has exclusive
  * access: the network thread for evictions, the destroying thread once
@@ -651,6 +740,14 @@ static void obj_uncharge_locked(moq_media_receiver_t *r, uint64_t budget)
 
 static void obj_unqueue_locked(moq_media_receiver_t *r, receiver_obj_entry_t *e)
 {
+    if (r->st_enabled && !e->catalog && !e->dom && e->obj.track) {
+        moq_media_track_t *t = e->obj.track;
+        assert(t->st_queued > 0);
+        if (--t->st_queued == 0) {
+            assert(r->domains_queued > 0);
+            r->domains_queued--;
+        }
+    }
     if (e->catalog) {
         assert(r->catalog_objects_queued > 0);
         r->catalog_objects_queued--;
@@ -676,6 +773,165 @@ static bool obj_resume_ready_locked(const moq_media_receiver_t *r)
     return r->obj_tail - r->obj_head <= r->obj_cap / 2 &&
         (r->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC ||
          r->obj_budget_total <= r->byte_cap / 2);
+}
+
+/* -- Stream-terminal lane (r->mu) -------------------------------------- */
+
+static uint32_t st_free_locked(const moq_media_receiver_t *r)
+{
+    return r->st_cap - (r->st_tail - r->st_head);
+}
+
+/* Free slots that no owed record has reserved. */
+static uint32_t st_unreserved_locked(const moq_media_receiver_t *r)
+{
+    uint32_t f = st_free_locked(r);
+    assert(f >= r->st_reserved);
+    return f - r->st_reserved;
+}
+
+/* Room for an intake: a RECEIVER_DROP per delivery domain with queued
+ * entries, and the slot the admission reserves for its own record (its
+ * drop or its END_OF_TRACK). A reorder window keeps that slot for the
+ * Object while it holds it. Intake takes this room before it can destroy
+ * anything, so no record ever waits for room; a lane of one record takes
+ * in one Object at a time. */
+static bool st_room_locked(const moq_media_receiver_t *r)
+{
+    return !r->st_enabled || st_unreserved_locked(r) > r->domains_queued;
+}
+
+/* The admission in progress gives up its reserved slot, which its own
+ * record then takes. */
+static void st_adm_release_locked(moq_media_receiver_t *r)
+{
+    if (!r->st_adm) return;
+    assert(r->st_reserved > 0);
+    r->st_adm = false;
+    r->st_reserved--;
+}
+
+/* Whether the lane's head record may be polled: the network thread found
+ * it clear of reorder windows, and no queued entry of its track was taken
+ * in before it. */
+static bool st_head_pollable_locked(const moq_media_receiver_t *r)
+{
+    if (!r->st_enabled || r->st_head == r->st_tail) return false;
+    const receiver_st_entry_t *e = &r->st[r->st_head % r->st_cap];
+    if (!e->ready) return false;
+    for (uint32_t i = r->obj_head; i != r->obj_tail; i++) {
+        const receiver_obj_entry_t *o = &r->objs[i % r->ring_cap];
+        if (!o->catalog && o->obj.track == e->rec.track && o->seq < e->barrier)
+            return false;
+    }
+    return true;
+}
+
+/* Queue a record behind everything taken in so far; during an admission,
+ * behind everything taken in before the Object being admitted, which its
+ * drops precede. The caller has checked room. A fill's loss record keeps
+ * its fill's terminal back until it is polled. */
+static void st_push_locked(moq_media_receiver_t *r,
+                           const moq_media_stream_terminal_t *rec, uint8_t dom)
+{
+    assert(st_free_locked(r) > r->st_reserved);
+    receiver_st_entry_t *e = &r->st[r->st_tail % r->st_cap];
+    e->rec = *rec;
+    e->rec.struct_size = (uint32_t)sizeof(e->rec);
+    e->barrier = r->st_collect ? r->intake_seq : r->ingress_seq;
+    e->dom = dom;
+    e->ready = !track_is_ts(rec->track);
+    if (dom) r->fill_doms[dom - 1].st_owed++;
+    r->st_tail++;
+}
+
+/* Place the held stream terminal when the lane has room for it. */
+static void st_place_held_locked(moq_media_receiver_t *r)
+{
+    if (!r->st_enabled || !r->st_has_held || st_unreserved_locked(r) == 0)
+        return;
+    st_push_locked(r, &r->st_held, 0);
+    r->st_has_held = false;
+}
+
+/* Take in the next Object only with room for its records and while no
+ * reorder window waits for room; on success it gets the next ingress
+ * sequence and its reserved slot. */
+static bool receiver_intake_begin(moq_media_receiver_t *r)
+{
+    if (!r->st_enabled) return true;
+    pthread_mutex_lock(&r->mu);
+    st_place_held_locked(r);
+    bool ok = !r->st_has_held && r->ts_stalled == 0 && st_room_locked(r);
+    if (ok) {
+        r->intake_seq = r->ingress_seq++;
+        r->st_adm = true;
+        r->st_reserved++;
+    } else {
+        r->st_blocked = true;
+    }
+    pthread_mutex_unlock(&r->mu);
+    return ok;
+}
+
+/* The intake of one Object is over: a slot it neither used nor passed to a
+ * reorder window returns, and a held stream terminal may take it. */
+static void receiver_intake_end(moq_media_receiver_t *r)
+{
+    if (!r->st_enabled) return;
+    pthread_mutex_lock(&r->mu);
+    st_adm_release_locked(r);
+    st_place_held_locked(r);
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* An overflow-policy drop of an Object of `t` in `group`, from delivery
+ * domain `dom` (0 for LIVE, else its fill record + 1), while an admission
+ * is recording them: one RECEIVER_DROP per track and domain per admission,
+ * its range growing with each drop. The admission reserved the room. */
+static void st_note_drop_locked(moq_media_receiver_t *r, moq_media_track_t *t,
+                                uint8_t dom, uint32_t origin,
+                                uint64_t initiating_request_id, uint64_t group)
+{
+    if (!r->st_enabled || !r->st_collect || !t) return;
+    for (uint32_t i = r->st_admit_from; i != r->st_tail; i++) {
+        receiver_st_entry_t *e = &r->st[i % r->st_cap];
+        if (e->rec.kind != MOQ_MEDIA_STREAM_RECEIVER_DROP ||
+            e->rec.track != t || e->dom != dom)
+            continue;
+        if (group < e->rec.group_id) e->rec.group_id = group;
+        if (group > e->rec.last_group_id) e->rec.last_group_id = group;
+        return;
+    }
+    moq_media_stream_terminal_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.kind = MOQ_MEDIA_STREAM_RECEIVER_DROP;
+    rec.track = t;
+    rec.group_id = group;
+    rec.last_group_id = group;
+    rec.delivery_origin = origin;
+    rec.initiating_request_id =
+        origin == MOQ_MEDIA_DELIVERY_FILL ? initiating_request_id : 0;
+    st_push_locked(r, &rec, dom);
+}
+
+/* A media track's END_OF_TRACK, at its Location, in the slot the admission
+ * it comes from reserved. */
+static void st_end_of_track(moq_media_receiver_t *r, moq_media_track_t *t,
+                            uint64_t group, uint64_t object)
+{
+    pthread_mutex_lock(&r->mu);
+    st_adm_release_locked(r);
+    if (r->st_enabled) {
+        moq_media_stream_terminal_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.kind = MOQ_MEDIA_STREAM_END_OF_TRACK;
+        rec.track = t;
+        rec.group_id = group;
+        rec.object_id = object;
+        st_push_locked(r, &rec, 0);
+    }
+    pthread_mutex_unlock(&r->mu);
 }
 
 /* -- Event queue (r->mu) ----------------------------------------------- */
@@ -935,6 +1191,8 @@ static void dom_apply_carry(receiver_obj_entry_t *e)
 static void dom_note_loss_locked(moq_media_receiver_t *r, size_t idx,
                                  const receiver_loss_carry_t *c, uint32_t from)
 {
+    /* Only an MPEG2TS fill reports loss as Location-tracked gaps. */
+    if (!r->fill_doms[idx].ts) return;
     for (uint32_t i = from; i != r->obj_tail; i++) {
         receiver_obj_entry_t *n = &r->objs[i % r->ring_cap];
         if (n->dom == idx + 1) {
@@ -969,7 +1227,12 @@ static void dom_unqueue_locked(moq_media_receiver_t *r, const receiver_obj_entry
     receiver_fill_dom_t *d = &r->fill_doms[e->dom - 1];
     assert(d->queued > 0);
     d->queued--;
-    if (d->queued == 0 && d->state == DOM_RETIRED) dom_ready_locked(r, d);
+    if (r->st_enabled && d->queued == 0) {
+        assert(r->domains_queued > 0);
+        r->domains_queued--;
+    }
+    if (d->queued == 0 && d->st_owed == 0 && d->state == DOM_RETIRED)
+        dom_ready_locked(r, d);
 }
 
 /* A queue entry at ring position `idx` is being dropped: carry its loss to
@@ -979,6 +1242,9 @@ static void dom_unqueue_locked(moq_media_receiver_t *r, const receiver_obj_entry
 static void obj_note_drop_locked(moq_media_receiver_t *r,
                                  const receiver_obj_entry_t *e, uint32_t idx)
 {
+    if (!e->catalog)
+        st_note_drop_locked(r, e->obj.track, e->dom, e->obj.delivery_origin,
+                            e->obj.initiating_request_id, e->group_id);
     if (e->dom) {
         receiver_loss_carry_t c = e->carry;
         if (!c.causes) {
@@ -1487,6 +1753,9 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     d->track_duration_ms = mt->track_duration_ms;
     d->is_live = mt->is_live;                 /* §5.2.7 (mutable via §11.3) */
     d->has_alt_group = mt->has_alt_group;     d->alt_group = mt->alt_group;
+    d->has_render_group = mt->has_render_group;
+    d->render_group = mt->render_group;
+    d->has_label = mt->has_label;
 
     t->is_event_timeline = span_eq_lit(d->packaging, "eventtimeline", 13);
     t->is_media_timeline = span_eq_lit(d->packaging, "mediatimeline", 13);
@@ -1811,6 +2080,11 @@ static uint64_t est_catalog_retained_bytes(const moq_msf_catalog_t *c)
     return b;
 }
 
+static bool receiver_facade_drained(moq_media_receiver_t *r);
+static void receiver_retire_subscription(moq_media_receiver_t *r,
+                                         moq_sub_track_t **slot,
+                                         uint64_t now_us, bool drained);
+
 /* Diff a candidate catalog against the live handles: add new tuples, remove
  * gone ones, leave survivors untouched. Returns MOQ_ERR_NOMEM on a build/grow
  * failure (caller terminalizes). */
@@ -1889,10 +2163,13 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
         t->desired_subscribed = false;
         obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
         pthread_mutex_unlock(&r->mu);
-        if (t->sub_track && t->local_result == MOQ_OK) {
-            (void)moq_sub_unsubscribe(r->sub, t->sub_track, now_us);
-            t->sub_track = NULL;
-        }
+        /* The facade slot stays mapped until it is released: stream
+         * terminals still queued for it reach the lane under the removed
+         * handle. receiver_retire_tracks retries a refused unsubscribe or
+         * release on every pass. */
+        if (t->sub_track && t->local_result == MOQ_OK)
+            receiver_retire_subscription(r, &t->sub_track, now_us,
+                                         receiver_facade_drained(r));
         receiver_ts_free(r, t);
         if (!rq_push(r, MOQ_MEDIA_TRACK_REMOVED, t))
             return MOQ_OK;   /* overflow already terminalized */
@@ -2093,6 +2370,9 @@ static void receiver_on_media_object_with_origin(moq_media_receiver_t *r,
     moq_media_track_t *track, moq_sub_object_t *so, uint32_t delivery_origin,
     uint64_t initiating_request_id, uint64_t now_us);
 static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
+    moq_media_track_t *track, moq_sub_object_t *so, size_t dom,
+    uint64_t initiating_request_id);
+static void receiver_on_fill_media_object(moq_media_receiver_t *r,
     moq_media_track_t *track, moq_sub_object_t *so, size_t dom,
     uint64_t initiating_request_id);
 static moq_result_t receiver_fill_ts_payload(moq_media_receiver_t *r,
@@ -2509,11 +2789,13 @@ static bool receiver_fill_poll_ready(moq_media_receiver_t *r)
 
 /* The facade's fill queue is read only while its next item, whatever it
  * is, can be taken: the event ring has room for an ordinary terminal and a
- * fill record is free for a CREATED of an MPEG2TS track. The item is never
+ * fill record is free for a CREATED that takes one (an MPEG2TS track's, or
+ * any media track's with the stream-terminal lane). The item is never
  * inspected first and none is skipped or held back. A full record pool
  * frees by application polling alone: at most RECEIVER_SUB_MAX_FILLS
  * records are LIVE, and every other one is READY (freed by poll_track) or
- * waits only for its queued Objects to be polled or dropped. */
+ * waits only for its queued Objects to be polled or dropped and for its
+ * RECEIVER_DROP records to be polled. */
 static bool receiver_fill_items_ready(moq_media_receiver_t *r)
 {
     pthread_mutex_lock(&r->mu);
@@ -2608,7 +2890,8 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
         /* A failed catalog's retirement discards every fill Object, so its
          * fills take no record. Otherwise the gate held one free; were none
          * free, the fill would keep the immediate terminal of other tracks. */
-        if (!r->catalog_ack_failed && track && track_is_ts(track) &&
+        if (!r->catalog_ack_failed && track &&
+            (track_is_ts(track) || r->st_enabled) &&
             dom_find_locked(r, item->request) < 0) {
             receiver_fill_dom_t *d = NULL;
             for (size_t i = 0; i < RECEIVER_FILL_DOMS && !d; i++)
@@ -2620,6 +2903,7 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
                 d->track = track;
                 d->gen = track->ts_gen;
                 d->initiating_request_id = item->initiating_request_id;
+                d->ts = track_is_ts(track);
             }
         }
     } else {
@@ -2629,7 +2913,8 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
             item->u.terminal.reason == MOQ_FILL_LOCAL_CANCELLED;
         int dom = dom_find_locked(r, item->request);
         if (dom >= 0) {
-            /* An MPEG2TS fill's terminal waits for its queued Objects. */
+            /* The fill's terminal waits for its queued Objects and for its
+             * loss records on the lane. */
             receiver_fill_dom_t *d = &r->fill_doms[dom];
             d->state = DOM_RETIRED;
             d->token = (moq_sub_fill_t){0};
@@ -2638,7 +2923,7 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
             d->error_domain = item->u.terminal.error_domain;
             d->error_code = item->u.terminal.error_code;
             d->initiating_request_id = item->initiating_request_id;
-            if (d->queued == 0) dom_ready_locked(r, d);
+            if (d->queued == 0 && d->st_owed == 0) dom_ready_locked(r, d);
         } else if (track && !duplicate) {
             assert(r->ev_tail - r->ev_head < r->ev_cap);
             receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
@@ -2724,9 +3009,12 @@ static void receiver_take_fill_item(moq_media_receiver_t *r,
             if (t->is_sap_timeline || t->is_media_timeline ||
                 t->is_event_timeline)
                 moq_sub_object_cleanup(&so);
-            else if (dom >= 0)
+            else if (dom >= 0 && track_is_ts(t))
                 receiver_on_fill_ts_object(r, t, &so, (size_t)dom,
                                            fi->initiating_request_id);
+            else if (dom >= 0)
+                receiver_on_fill_media_object(r, t, &so, (size_t)dom,
+                                              fi->initiating_request_id);
             else
                 receiver_on_media_object_with_origin(r, t, &so,
                     MOQ_MEDIA_DELIVERY_FILL, fi->initiating_request_id, now_us);
@@ -2790,9 +3078,12 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
      * live-object conversion and preserve their distinct origin/terminal;
      * a failed media fill does not end its parent subscription. */
     moq_sub_fill_item_t fi;
-    while (receiver_fill_items_ready(r) &&
-           moq_sub_poll_fill(r->sub, &fi, sizeof(fi)) == MOQ_OK)
+    while (receiver_fill_items_ready(r) && receiver_intake_begin(r) &&
+           moq_sub_poll_fill(r->sub, &fi, sizeof(fi)) == MOQ_OK) {
         receiver_take_fill_item(r, &fi, now_us);
+        receiver_intake_end(r);
+    }
+    receiver_intake_end(r);
 }
 
 /* Mark a media track ended (network thread) and emit TRACK_ENDED exactly once.
@@ -2807,6 +3098,23 @@ static void receiver_mark_track_ended(moq_media_receiver_t *r,
     pthread_mutex_unlock(&r->mu);
     if (first)
         (void)rq_push(r, MOQ_MEDIA_TRACK_ENDED, t);
+}
+
+/* As receiver_mark_track_ended, for an end its subscription's done gave,
+ * with that done's status. */
+static void receiver_mark_track_done(moq_media_receiver_t *r,
+                                     moq_media_track_t *t, uint64_t status)
+{
+    pthread_mutex_lock(&r->mu);
+    bool first = !t->ended && t->local_result == MOQ_OK;
+    if (first) t->ended = true;
+    pthread_mutex_unlock(&r->mu);
+    if (!first || !rq_push(r, MOQ_MEDIA_TRACK_ENDED, t)) return;
+    pthread_mutex_lock(&r->mu);
+    receiver_event_t *e = &r->events[(r->ev_tail - 1) % r->ev_cap];
+    e->has_done_status = true;
+    e->done_status = status;
+    pthread_mutex_unlock(&r->mu);
 }
 
 static void receiver_mark_track_local_failure(moq_media_receiver_t *r,
@@ -2860,8 +3168,7 @@ static void receiver_inspect_delivery_failures(moq_media_receiver_t *r)
             track->local_result = failure.local_result;
             track->local_failure_kind = MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE;
             track->delivery_failed = true;
-            track->local_failure_pending = true;
-            r->local_failure_pending_count++;
+            track->delivery_failure_staged = true;
             track->upd_notify_app = false;
             track->update_inflight = false;
             track->upd_sent_app_gen = 0;
@@ -2892,6 +3199,33 @@ static void receiver_inspect_delivery_failures(moq_media_receiver_t *r)
         pthread_mutex_unlock(&r->mu);
         if (wake) moq_endpoint_wake(r->ep);
     }
+}
+
+/* Publish each staged LIVE delivery failure once its track can deliver
+ * nothing more: no input it admitted is still in the facade (transferred
+ * into the receiver's queues, where the application takes it before the
+ * failure takes effect, or disposed of), and no fill of it is still open.
+ * A failed subscription is cancelled by the facade's own retry, which
+ * cancels its fills locally; a fill slot stays until its terminal is
+ * taken, so an empty queue alone cannot rule out a fill's later Object.
+ * Executor only; the facade is not read from any other thread. */
+static void receiver_publish_delivery_failures(moq_media_receiver_t *r)
+{
+    bool wake = false;
+    for (size_t i = 0; i < r->track_count; i++) {
+        moq_media_track_t *t = r->tracks[i];
+        if (!t->delivery_failure_staged) continue;
+        if (t->sub_track && (moq_sub_track_has_queued_input(r->sub, t->sub_track) ||
+                             moq_sub_fill_is_valid(moq_sub_track_fill(t->sub_track))))
+            continue;
+        pthread_mutex_lock(&r->mu);
+        t->delivery_failure_staged = false;
+        t->local_failure_pending = true;
+        r->local_failure_pending_count++;
+        pthread_mutex_unlock(&r->mu);
+        wake = true;
+    }
+    if (wake) moq_endpoint_wake(r->ep);
 }
 
 /* Neither tick's result nor on_subscribed identifies every retained error:
@@ -3177,6 +3511,7 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
 
     /* A terminal-status object is track-event data, never an object. */
     if (parsed.status == MOQ_OBJECT_END_OF_TRACK) {
+        st_end_of_track(r, track, so->group_id, so->object_id);
         receiver_mark_track_ended(r, track);
         if (heap_samples)
             r->alloc.free(heap_samples,
@@ -3253,12 +3588,24 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
      * preserves delivery. A straggler of evicted content is dropped even when
      * there is room; otherwise the overflow policy makes room and re-checks
      * the incoming object against the filter the eviction may have armed. */
-    bool keep = budget_valid && track->desired_subscribed &&
-                (track->local_result == MOQ_OK || track->delivery_failed) &&
+    bool wanted = track->desired_subscribed &&
+                  (track->local_result == MOQ_OK || track->delivery_failed);
+    /* What the overflow policy drops here, the incoming Object included, is
+     * safety loss recorded on the stream-terminal lane. */
+    r->st_collect = wanted;
+    r->st_admit_from = r->st_tail;
+    bool keep = wanted && budget_valid &&
                 !obj_filtered_locked(r, track, so->group_id,
                                      parsed.keyframe) &&
                 obj_make_room_locked(r, track, so->group_id,
                                      parsed.keyframe, budget);
+    /* Its own drop, if any, takes the slot the admission reserved. */
+    st_adm_release_locked(r);
+    if (wanted && !keep)
+        st_note_drop_locked(r, track, dom ? (uint8_t)(dom->idx + 1) : 0,
+                            delivery_origin, initiating_request_id,
+                            so->group_id);
+    r->st_collect = false;
     if (!keep) {
         r->stats.objects_dropped++;
         if (parsed.keyframe) r->stats.keyframes_dropped++;
@@ -3371,12 +3718,15 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
         e->gen = d->gen;
         e->dom = (uint8_t)(dom->idx + 1);
         e->pos = dom->pos;
-        o->has_loss_report = true;
-        if (d->pending.causes) {
-            e->carry = d->pending;
-            memset(&d->pending, 0, sizeof(d->pending));
-            dom_apply_carry(e);
+        if (d->ts) {
+            o->has_loss_report = true;
+            if (d->pending.causes) {
+                e->carry = d->pending;
+                memset(&d->pending, 0, sizeof(d->pending));
+                dom_apply_carry(e);
+            }
         }
+        if (r->st_enabled && d->queued == 0) r->domains_queued++;
         d->queued++;
     }
     o->delivery_origin = delivery_origin;
@@ -3396,6 +3746,9 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
     }
     o->properties_ref = so->properties;
     o->track_properties_ref = track_copy;
+    e->seq = r->intake_seq;
+    if (r->st_enabled && !e->dom && track->st_queued++ == 0)
+        r->domains_queued++;
     r->obj_sizes_total += need;
     r->obj_tail++;
     pthread_mutex_unlock(&r->mu);
@@ -3448,6 +3801,29 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
  * it takes the next delivery position of its fill record, gets the payload
  * transform a LIVE Object gets, and a drop on the way is a local drop of
  * that fill. */
+/* A fill Object of a RAW or CMAF track with its fill record (the
+ * stream-terminal lane): the record keys its loss and holds the fill's
+ * terminal until its queued Objects have left. */
+static void receiver_on_fill_media_object(moq_media_receiver_t *r,
+    moq_media_track_t *track, moq_sub_object_t *so, size_t dom,
+    uint64_t initiating_request_id)
+{
+    pthread_mutex_lock(&r->mu);
+    receiver_fill_dom_t *d = &r->fill_doms[dom];
+    receiver_dom_ref_t ref = { dom, d->next_pos++ };
+    if ((track->local_result != MOQ_OK && !track->delivery_failed) ||
+        !track->desired_subscribed) {
+        r->stats.objects_received++;
+        r->stats.objects_dropped++;
+        pthread_mutex_unlock(&r->mu);
+        moq_sub_object_cleanup(so);
+        return;
+    }
+    pthread_mutex_unlock(&r->mu);
+    receiver_deliver_object(r, track, so, NULL, NULL, MOQ_MEDIA_DELIVERY_FILL,
+                            initiating_request_id, &ref, NULL);
+}
+
 static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
     moq_media_track_t *track, moq_sub_object_t *so, size_t dom,
     uint64_t initiating_request_id)
@@ -3518,6 +3894,18 @@ typedef struct receiver_ts {
     moq_mpeg2ts_receiver_t      rx;
     moq_mpeg2ts_reorder_slot_t *slots;
     size_t                      slot_count;
+    /* A delivery the window released that waits for lane room; a status
+     * Object that goes out once what was due at its arrival has; an end
+     * that waits for the finished window to empty. Each keeps the slot its
+     * intake reserved. */
+    bool                        has_parked;
+    bool                        stalled;
+    moq_mpeg2ts_delivery_t      parked;
+    bool                        has_status;
+    moq_sub_object_t            status;
+    uint64_t                    status_seq, status_us;
+    bool                        end_pending;
+    uint64_t                    end_group, end_object;
 } receiver_ts_t;
 
 /* The window ctx of a track's END_OF_TRACK (an address no holder has). */
@@ -3528,6 +3916,7 @@ static const char receiver_ts_end_mark;
 typedef struct receiver_ts_held {
     moq_rcbuf_t *payload;
     moq_rcbuf_t *properties;
+    uint64_t     seq;          /* its ingress sequence */
     uint64_t     subgroup_id;
     uint8_t      priority;
     bool         datagram;
@@ -3540,6 +3929,85 @@ static void ts_held_free(moq_media_receiver_t *r, receiver_ts_held_t *h)
     if (h->payload) moq_rcbuf_decref(h->payload);
     if (h->properties) moq_rcbuf_decref(h->properties);
     r->alloc.free(h, sizeof(*h), r->alloc.ctx);
+}
+
+/* The intake's reserved slot passes to what the window now holds. */
+static void ts_keep_slot(moq_media_receiver_t *r)
+{
+    pthread_mutex_lock(&r->mu);
+    if (r->st_enabled) {
+        assert(r->st_adm);
+        r->st_adm = false;
+    }
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* What the window held leaves it with no record: its slot returns. */
+static void ts_drop_slot(moq_media_receiver_t *r)
+{
+    pthread_mutex_lock(&r->mu);
+    if (r->st_enabled) {
+        assert(r->st_reserved > 0);
+        r->st_reserved--;
+    }
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* An admission on a held item's behalf: it takes the item's reserved slot
+ * and the ingress sequence the item was taken in with. receiver_ts_adm_end
+ * restores the intake in progress, on every exit. */
+typedef struct { bool adm; uint64_t seq; } receiver_ts_adm_t;
+
+static receiver_ts_adm_t receiver_ts_adm_begin(moq_media_receiver_t *r,
+                                               uint64_t seq)
+{
+    pthread_mutex_lock(&r->mu);
+    receiver_ts_adm_t saved = { r->st_adm, r->intake_seq };
+    r->st_adm = r->st_enabled;
+    r->intake_seq = seq;
+    pthread_mutex_unlock(&r->mu);
+    return saved;
+}
+
+static void receiver_ts_adm_end(moq_media_receiver_t *r, receiver_ts_adm_t saved)
+{
+    pthread_mutex_lock(&r->mu);
+    st_adm_release_locked(r);
+    r->st_adm = saved.adm;
+    r->intake_seq = saved.seq;
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* The byte charge an Object of `t` with `payload_len` octets takes in the
+ * queue (receiver_deliver_object's budget). */
+static uint64_t receiver_charge(moq_media_receiver_t *r, moq_media_track_t *t,
+                                size_t payload_len)
+{
+    uint64_t need = (uint64_t)payload_len;
+    if (r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+        t->sub_track) {
+        moq_sub_track_result_t result;
+        if (moq_sub_get_track_result(r->sub, t->sub_track, &result,
+                                     sizeof(result)) == MOQ_OK &&
+            result.track_properties.len <= UINT64_MAX - need)
+            need += result.track_properties.len;
+    }
+    return need;
+}
+
+/* Whether a held item charging `need` may go to the queue now: one that
+ * fits the queue as it is destroys nothing and needs only its own reserved
+ * slot; otherwise the overflow policy may drop from every delivery domain
+ * with queued entries, and each needs room for its RECEIVER_DROP. */
+static bool receiver_release_room(moq_media_receiver_t *r, uint64_t need)
+{
+    if (!r->st_enabled) return true;
+    pthread_mutex_lock(&r->mu);
+    bool fits = r->obj_tail - r->obj_head < r->obj_cap &&
+                obj_bytes_fit(r, need, r->byte_cap);
+    bool ok = fits || st_unreserved_locked(r) >= r->domains_queued;
+    pthread_mutex_unlock(&r->mu);
+    return ok;
 }
 
 /* The payload the app receives for an Object of a TS track, LIVE or fill:
@@ -3593,51 +4061,47 @@ static moq_result_t receiver_ts_payload(moq_media_receiver_t *r,
     return rc;
 }
 
-/* Hand one released Object to the common queue, or drop a rejected one. */
-static void receiver_ts_release(moq_media_receiver_t *r, moq_media_track_t *t,
+/* Hand one released Object to the common queue, or drop a rejected one.
+ * False when it needs lane room that is not there yet: nothing changed. */
+static bool receiver_ts_release(moq_media_receiver_t *r, moq_media_track_t *t,
                                 const moq_mpeg2ts_delivery_t *d)
 {
     if (d->ctx == RECEIVER_TS_END_MARK) {
         /* The track's END_OF_TRACK, released in Location order. */
+        receiver_ts_adm_t saved = receiver_ts_adm_begin(r, r->ingress_seq);
+        st_end_of_track(r, t, d->group, d->object);
+        receiver_ts_adm_end(r, saved);
         receiver_mark_track_ended(r, t);
-        return;
+        return true;
     }
     receiver_ts_held_t *h = (receiver_ts_held_t *)d->ctx;
-    if (!d->result.accepted && d->result.gap) {
-        /* The window reports a gap before a rejected Object on that Object's
-         * result, which never reaches the app: the gap passes, in order, to
-         * the track's next queued Object. */
-        pthread_mutex_lock(&r->mu);
-        ts_note_loss_locked(r, t, t->ts_gen, d->result.gap_group,
-                            d->result.gap_object, r->obj_tail);
-        pthread_mutex_unlock(&r->mu);
-    }
     if (!h) {
         /* The placeholder of an Object lost at intake (counted there): the
-         * window has opened its loss run at this Location. */
-        return;
+         * window has opened its loss run at this Location. A gap it reports
+         * passes to the track's next queued Object. */
+        if (!d->result.accepted && d->result.gap) {
+            pthread_mutex_lock(&r->mu);
+            ts_note_loss_locked(r, t, t->ts_gen, d->result.gap_group,
+                                d->result.gap_object, r->obj_tail);
+            pthread_mutex_unlock(&r->mu);
+        }
+        return true;
     }
     if (!d->result.accepted) {
         /* Object Payload Format: a subscriber MUST reject it. The window
-         * reports it as part of the gap on the next Object. */
+         * reports a gap before it on its own result, which never reaches the
+         * app: that gap, and the Object, go with the track's next queued
+         * Object. */
+        pthread_mutex_lock(&r->mu);
+        if (d->result.gap)
+            ts_note_loss_locked(r, t, t->ts_gen, d->result.gap_group,
+                                d->result.gap_object, r->obj_tail);
+        pthread_mutex_unlock(&r->mu);
         receiver_note_parse_drop(r, t, MOQ_MEDIA_PARSE_DROP_MEDIA);
         ts_held_free(r, h);
-        return;
+        ts_drop_slot(r);
+        return true;
     }
-    moq_sub_object_t so;
-    memset(&so, 0, sizeof(so));
-    so.track = t->sub_track;
-    so.group_id = d->group;
-    so.subgroup_id = h->subgroup_id;
-    so.object_id = d->object;
-    so.publisher_priority = h->priority;
-    so.status = MOQ_OBJECT_NORMAL;
-    so.end_of_group = h->end_of_group;
-    so.datagram = h->datagram;
-    so.payload = h->payload;
-    so.properties = h->properties;
-    r->alloc.free(h, sizeof(*h), r->alloc.ctx);
-
     receiver_loss_t loss;
     loss.gap = d->result.gap;
     loss.gap_group = d->result.gap_group;
@@ -3652,28 +4116,141 @@ static void receiver_ts_release(moq_media_receiver_t *r, moq_media_track_t *t,
     pthread_mutex_unlock(&r->mu);
     moq_rcbuf_t *deliver = NULL;
     receiver_join_t jr = { 0 };
-    if (receiver_ts_payload(r, t, join, so.payload, &deliver, &jr.psi_len) != MOQ_OK) {
+    moq_result_t prc = receiver_ts_payload(r, t, join, h->payload, &deliver,
+                                           &jr.psi_len);
+    if (prc == MOQ_OK) {
+        const moq_rcbuf_t *q = deliver ? deliver : h->payload;
+        if (!receiver_release_room(r, receiver_charge(r, t, moq_rcbuf_len(q)))) {
+            if (deliver) moq_rcbuf_decref(deliver);
+            return false;
+        }
+    }
+
+    moq_sub_object_t so;
+    memset(&so, 0, sizeof(so));
+    so.track = t->sub_track;
+    so.group_id = d->group;
+    so.subgroup_id = h->subgroup_id;
+    so.object_id = d->object;
+    so.publisher_priority = h->priority;
+    so.status = MOQ_OBJECT_NORMAL;
+    so.end_of_group = h->end_of_group;
+    so.datagram = h->datagram;
+    so.payload = h->payload;
+    so.properties = h->properties;
+    uint64_t seq = h->seq;
+    r->alloc.free(h, sizeof(*h), r->alloc.ctx);
+
+    receiver_ts_adm_t saved = receiver_ts_adm_begin(r, seq);
+    if (prc != MOQ_OK) {
         pthread_mutex_lock(&r->mu);
         r->stats.objects_received++;
         r->stats.objects_dropped++;
         receiver_loss_dropped_locked(r, t, &so, &loss, NULL);
         pthread_mutex_unlock(&r->mu);
         moq_sub_object_cleanup(&so);
-        return;
+    } else {
+        receiver_deliver_object(r, t, &so, &loss, deliver,
+                                MOQ_MEDIA_DELIVERY_LIVE, 0, NULL,
+                                join ? &jr : NULL);
     }
-    receiver_deliver_object(r, t, &so, &loss, deliver, MOQ_MEDIA_DELIVERY_LIVE, 0,
-                            NULL, join ? &jr : NULL);
+    receiver_ts_adm_end(r, saved);
+    return true;
 }
 
-/* Release every Object the track's window has due at now_us. */
-static void receiver_ts_drain(moq_media_receiver_t *r, moq_media_track_t *t,
+/* A parked status Object goes to the queue under its own sequence. False
+ * when it needs lane room that is not there yet. */
+static bool receiver_ts_release_status(moq_media_receiver_t *r,
+                                       moq_media_track_t *t, receiver_ts_t *ts)
+{
+    size_t len = ts->status.payload ? moq_rcbuf_len(ts->status.payload) : 0;
+    if (!receiver_release_room(r, receiver_charge(r, t, len))) return false;
+    moq_sub_object_t so = ts->status;
+    ts->has_status = false;
+    memset(&ts->status, 0, sizeof(ts->status));
+    receiver_ts_adm_t saved = receiver_ts_adm_begin(r, ts->status_seq);
+    receiver_deliver_object(r, t, &so, NULL, NULL, MOQ_MEDIA_DELIVERY_LIVE, 0,
+                            NULL, NULL);
+    receiver_ts_adm_end(r, saved);
+    return true;
+}
+
+static void ts_set_stalled(moq_media_receiver_t *r, receiver_ts_t *ts,
+                           bool stalled)
+{
+    pthread_mutex_lock(&r->mu);
+    if (stalled != ts->stalled) {
+        ts->stalled = stalled;
+        if (stalled) r->ts_stalled++;
+        else r->ts_stalled--;
+    }
+    if (stalled) {
+        r->ts_wake = true;
+        r->st_blocked = true;
+    }
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* Release every Object the track's window has due at now_us, in Location
+ * order, each with the room its admission needs; a parked status Object
+ * after everything that was due when it arrived; then a pending end once
+ * the finished window is empty. True when it stopped for room: what it
+ * stopped at stays parked, and the application's next poll wakes the
+ * network thread to resume. */
+static bool receiver_ts_drain(moq_media_receiver_t *r, moq_media_track_t *t,
                               uint64_t now_us)
 {
     receiver_ts_t *ts = (receiver_ts_t *)t->ts;
-    if (!ts) return;
-    moq_mpeg2ts_delivery_t d;
-    while (moq_mpeg2ts_receiver_poll(&ts->rx, now_us, &d, sizeof(d)) == MOQ_OK)
-        receiver_ts_release(r, t, &d);
+    if (!ts) return false;
+    for (;;) {
+        if (!ts->has_parked) {
+            uint64_t at = ts->has_status && ts->status_us < now_us
+                ? ts->status_us : now_us;
+            if (moq_mpeg2ts_receiver_poll(&ts->rx, at, &ts->parked,
+                                          sizeof(ts->parked)) != MOQ_OK) {
+                if (!ts->has_status) break;
+                if (!receiver_ts_release_status(r, t, ts)) {
+                    ts_set_stalled(r, ts, true);
+                    return true;
+                }
+                continue;
+            }
+            ts->has_parked = true;
+        }
+        if (!receiver_ts_release(r, t, &ts->parked)) {
+            ts_set_stalled(r, ts, true);
+            return true;
+        }
+        ts->has_parked = false;
+    }
+    ts_set_stalled(r, ts, false);
+    if (ts->end_pending) {
+        ts->end_pending = false;
+        receiver_ts_adm_t saved = receiver_ts_adm_begin(r, r->ingress_seq);
+        st_end_of_track(r, t, ts->end_group, ts->end_object);
+        receiver_ts_adm_end(r, saved);
+        receiver_mark_track_ended(r, t);
+    }
+    return false;
+}
+
+/* Whether `t`'s window holds, or has parked, an Object taken in before
+ * `barrier` (network thread). */
+static bool ts_holds_before(const moq_media_track_t *t, uint64_t barrier)
+{
+    const receiver_ts_t *ts = (const receiver_ts_t *)t->ts;
+    if (!ts) return false;
+    if (ts->has_status && ts->status_seq < barrier) return true;
+    if (ts->has_parked && ts->parked.ctx &&
+        ts->parked.ctx != RECEIVER_TS_END_MARK &&
+        ((const receiver_ts_held_t *)ts->parked.ctx)->seq < barrier)
+        return true;
+    for (size_t i = 0; i < ts->slot_count; i++) {
+        const moq_mpeg2ts_reorder_slot_t *sl = &ts->slots[i];
+        if (!sl->used || !sl->ctx || sl->ctx == RECEIVER_TS_END_MARK) continue;
+        if (((const receiver_ts_held_t *)sl->ctx)->seq < barrier) return true;
+    }
+    return false;
 }
 
 /* The track's subscription is being issued: a fresh window for it. Returns
@@ -3723,14 +4300,35 @@ static bool receiver_ts_start(moq_media_receiver_t *r, moq_media_track_t *t,
     return true;
 }
 
-/* The subscription ended: every held Object is released, in order. */
-static void receiver_ts_finish(moq_media_receiver_t *r, moq_media_track_t *t,
+/* The subscription ended: every held Object is released, in order. True
+ * when that stopped for lane room; it resumes with the window's next
+ * drain. */
+static bool receiver_ts_finish(moq_media_receiver_t *r, moq_media_track_t *t,
                                uint64_t now_us)
 {
     receiver_ts_t *ts = (receiver_ts_t *)t->ts;
-    if (!ts) return;
+    if (!ts) return false;
     moq_mpeg2ts_receiver_finish(&ts->rx);
-    receiver_ts_drain(r, t, now_us);
+    return receiver_ts_drain(r, t, now_us);
+}
+
+/* The track ends at (g, o) after everything its finished window holds:
+ * now, or once a stopped drain completes, keeping the intake's slot for
+ * the END_OF_TRACK. */
+static void receiver_ts_end_now(moq_media_receiver_t *r, moq_media_track_t *t,
+                                uint64_t g, uint64_t o, uint64_t now_us)
+{
+    receiver_ts_t *ts = (receiver_ts_t *)t->ts;
+    if (receiver_ts_finish(r, t, now_us)) {
+        assert(!ts->end_pending);
+        ts->end_pending = true;
+        ts->end_group = g;
+        ts->end_object = o;
+        ts_keep_slot(r);
+        return;
+    }
+    st_end_of_track(r, t, g, o);
+    receiver_mark_track_ended(r, t);
 }
 
 /* One arriving Object of a TS track. Objects are offered even while the app
@@ -3761,8 +4359,7 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
             const moq_mpeg2ts_reorder_slot_t *sl = &ts->slots[i];
             if (sl->used && sl->group == g && sl->object == o) {
                 if (sl->ctx == RECEIVER_TS_END_MARK) return;
-                receiver_ts_finish(r, t, now_us);
-                receiver_mark_track_ended(r, t);
+                receiver_ts_end_now(r, t, g, o, now_us);
                 return;
             }
         }
@@ -3775,6 +4372,7 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
                                                      (moq_bytes_t){ NULL, 0 },
                                                      RECEIVER_TS_END_MARK);
         if (rc == MOQ_OK) {
+            ts_keep_slot(r);
             receiver_ts_drain(r, t, now_us);
             return;
         }
@@ -3784,9 +4382,8 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
          * were already delivered and the END_OF_TRACK now declares them
          * non-existent; what was delivered cannot be taken back, so the
          * track ends now. */
-        if (t->ended) return;
-        receiver_ts_finish(r, t, now_us);
-        receiver_mark_track_ended(r, t);
+        if (t->ended || ts->end_pending) return;
+        receiver_ts_end_now(r, t, g, o, now_us);
         return;
     }
     if (so->status != MOQ_OBJECT_NORMAL) {
@@ -3795,9 +4392,17 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
         if (so->status == MOQ_OBJECT_END_OF_GROUP)
             moq_mpeg2ts_receiver_end_group_at(&ts->rx, so->group_id,
                                               so->object_id);
+        /* It goes out after what is due now, as its own admission. Intake
+         * waits while a window waits, so no status is parked here yet. */
+        assert(!ts->has_status);
+        ts->has_status = true;
+        ts->status = *so;
+        pthread_mutex_lock(&r->mu);
+        ts->status_seq = r->intake_seq;
+        pthread_mutex_unlock(&r->mu);
+        ts->status_us = now_us;
+        ts_keep_slot(r);
         receiver_ts_drain(r, t, now_us);
-        receiver_deliver_object(r, t, so, NULL, NULL, MOQ_MEDIA_DELIVERY_LIVE, 0,
-                                NULL, NULL);
         return;
     }
 
@@ -3826,6 +4431,9 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
     }
     h->payload = so->payload;
     h->properties = so->properties;
+    pthread_mutex_lock(&r->mu);
+    h->seq = r->intake_seq;
+    pthread_mutex_unlock(&r->mu);
     h->subgroup_id = so->datagram ? 0 : so->subgroup_id;
     h->priority = so->publisher_priority;
     h->datagram = so->datagram;
@@ -3845,6 +4453,7 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
         ts_held_free(r, h);
         return;
     }
+    ts_keep_slot(r);
     receiver_ts_drain(r, t, now_us);
 }
 
@@ -3870,11 +4479,25 @@ static void receiver_ts_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
     receiver_ts_t *ts = (receiver_ts_t *)t->ts;
     if (!ts) return;
-    /* Release the held payloads without delivering them. */
+    /* Release the held payloads without delivering them, with the slots
+     * they reserved. */
+    if (ts->has_parked && ts->parked.ctx) {
+        ts_held_free(r, (receiver_ts_held_t *)ts->parked.ctx);
+        ts_drop_slot(r);
+    }
+    if (ts->has_status) {
+        moq_sub_object_cleanup(&ts->status);
+        ts_drop_slot(r);
+    }
+    if (ts->end_pending) ts_drop_slot(r);
+    ts_set_stalled(r, ts, false);
     moq_mpeg2ts_receiver_finish(&ts->rx);
     moq_mpeg2ts_delivery_t d;
-    while (moq_mpeg2ts_receiver_poll(&ts->rx, UINT64_MAX, &d, sizeof(d)) == MOQ_OK)
+    while (moq_mpeg2ts_receiver_poll(&ts->rx, UINT64_MAX, &d, sizeof(d)) == MOQ_OK) {
+        if (!d.ctx) continue;
         ts_held_free(r, (receiver_ts_held_t *)d.ctx);
+        ts_drop_slot(r);
+    }
     r->alloc.free(ts->slots,
                   ts->slot_count * sizeof(moq_mpeg2ts_reorder_slot_t),
                   r->alloc.ctx);
@@ -3909,10 +4532,11 @@ static void receiver_on_ts_group_end(moq_media_receiver_t *r,
 {
     (void)r; (void)t; (void)group; (void)now_us;
 }
-static void receiver_ts_drain(moq_media_receiver_t *r, moq_media_track_t *t,
+static bool receiver_ts_drain(moq_media_receiver_t *r, moq_media_track_t *t,
                               uint64_t now_us)
 {
     (void)r; (void)t; (void)now_us;
+    return false;
 }
 static bool receiver_ts_start(moq_media_receiver_t *r, moq_media_track_t *t,
                               uint32_t program_number)
@@ -3920,10 +4544,11 @@ static bool receiver_ts_start(moq_media_receiver_t *r, moq_media_track_t *t,
     (void)r; (void)t; (void)program_number;
     return false;
 }
-static void receiver_ts_finish(moq_media_receiver_t *r, moq_media_track_t *t,
+static bool receiver_ts_finish(moq_media_receiver_t *r, moq_media_track_t *t,
                                uint64_t now_us)
 {
     (void)r; (void)t; (void)now_us;
+    return false;
 }
 static uint64_t receiver_ts_deadline(const moq_media_track_t *t)
 {
@@ -4327,15 +4952,18 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
 
         /* Every Object the subscription delivered is released before the
          * track is re-armed or ends: none is lost behind TRACK_ENDED. A
-         * re-armed subscription starts a fresh window, so the finished one
-         * is freed once the facade slot is released. */
-        receiver_ts_finish(r, t, now_us);
+         * release that waits for lane room keeps the done for a later pass.
+         * A re-armed subscription starts a fresh window, so the finished
+         * one is freed once the facade slot is released. */
+        if (receiver_ts_finish(r, t, now_us)) continue;
 
         /* The subscription is already complete: free its facade slot (no
          * UNSUBSCRIBE is sent) and drop our handle so reconcile may re-subscribe. */
         if (t->sub_track) {
+            /* A refused release keeps the mapping, on every draft: queued
+             * facade records still name this slot. Retried next pass. */
             moq_result_t rc = moq_sub_release_track(r->sub, t->sub_track);
-            if (r->joins_by_fill && rc != MOQ_OK) continue;
+            if (rc != MOQ_OK) continue;
             t->sub_track = NULL;
         }
         receiver_ts_free(r, t);
@@ -4360,7 +4988,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
             t->requested = false;
             pthread_mutex_unlock(&r->mu);
         } else {
-            receiver_mark_track_ended(r, t);   /* terminal: end exactly once */
+            receiver_mark_track_done(r, t, status); /* terminal: end exactly once */
         }
     }
 }
@@ -4560,6 +5188,49 @@ static void receiver_poll_group_ends(moq_media_receiver_t *r, uint64_t now_us)
     }
 }
 
+/* Move the facade's pollable stream terminals of media tracks onto the
+ * lane, in order. Each is pollable from the facade only once its stream's
+ * Objects were taken in, so its barrier follows them. One that cannot go
+ * on the lane yet is held, and intake stops until it does. */
+static void receiver_poll_stream_terminals(moq_media_receiver_t *r)
+{
+    if (!r->st_enabled) return;
+    for (;;) {
+        pthread_mutex_lock(&r->mu);
+        st_place_held_locked(r);
+        bool held = r->st_has_held;
+        if (held) r->st_blocked = true;
+        pthread_mutex_unlock(&r->mu);
+        if (held) return;
+        moq_sub_stream_terminal_t st;
+        if (moq_sub_poll_stream_terminal(r->sub, &st, sizeof(st)) != MOQ_OK)
+            return;
+        moq_media_track_t *t = track_for_sub(r, st.track);
+        if (!t || t->is_sap_timeline || t->is_media_timeline ||
+            t->is_event_timeline)
+            continue;
+        moq_media_stream_terminal_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.kind = st.kind == MOQ_SUB_STREAM_FIN_END_OF_GROUP
+            ? MOQ_MEDIA_STREAM_FIN_END_OF_GROUP
+            : st.kind == MOQ_SUB_STREAM_FIN ? MOQ_MEDIA_STREAM_FIN
+                                            : MOQ_MEDIA_STREAM_RESET;
+        rec.track = t;
+        rec.group_id = st.group_id;
+        rec.subgroup_id = st.subgroup_id;
+        rec.error_code = st.error_code;
+        rec.has_last_object = st.has_last_object;
+        rec.last_object_id = st.last_object_id;
+        rec.has_cut_object = st.has_cut_object;
+        rec.cut_object_id = st.cut_object_id;
+        pthread_mutex_lock(&r->mu);
+        r->st_held = rec;
+        r->st_has_held = true;
+        st_place_held_locked(r);
+        pthread_mutex_unlock(&r->mu);
+    }
+}
+
 /* Pending facade items are not necessarily pollable yet. Conservatively keep
  * terminal handles until a later tick has exposed and drained those borrows. */
 static bool receiver_facade_drained(moq_media_receiver_t *r)
@@ -4586,13 +5257,16 @@ static void receiver_retire_subscription(moq_media_receiver_t *r,
     if (moq_sub_release_track(r->sub, t) == MOQ_OK) *slot = NULL;
 }
 
-static void receiver_retire_failed_tracks(moq_media_receiver_t *r, uint64_t now_us)
+/* Retire the subscriptions of failed and removed tracks. */
+static void receiver_retire_tracks(moq_media_receiver_t *r, uint64_t now_us)
 {
     bool drained = receiver_facade_drained(r);
     for (size_t i = 0; i < r->track_count; i++)
-        if (r->tracks[i]->local_result != MOQ_OK)
+        if (r->tracks[i]->local_result != MOQ_OK || r->tracks[i]->removed)
             receiver_retire_subscription(r, &r->tracks[i]->sub_track, now_us, drained);
 }
+
+static void receiver_st_mark_ready(moq_media_receiver_t *r);
 
 /* A catalog ACK/bootstrap/delivery failure is receiver-local, not an endpoint/session failure.
  * Keep running on the executor after fatalization until cancellation and child
@@ -4625,10 +5299,75 @@ static void receiver_retire_failed_catalog(moq_media_receiver_t *r, uint64_t now
     }
     /* A fill record made ready by a terminal read here wakes its waiters. */
     receiver_dom_wake(r);
+    /* The stream terminals and Group ends of the discarded media go with
+     * it, unapplied: they name the subscriptions released below. */
+    moq_sub_stream_terminal_t st;
+    while (moq_sub_poll_stream_terminal(r->sub, &st, sizeof(st)) == MOQ_OK) {}
+    moq_sub_group_end_t ge;
+    while (moq_sub_poll_group_end(r->sub, &ge) == MOQ_OK) {}
+    /* So do what the reorder windows hold or have parked, with the lane
+     * slots they reserved; records already on the lane that waited for
+     * them become pollable. */
+    for (size_t i = 0; i < r->track_count; i++) receiver_ts_free(r, r->tracks[i]);
+    receiver_st_mark_ready(r);
     bool drained = receiver_facade_drained(r);
     receiver_retire_subscription(r, &r->catalog_sub, now_us, drained);
     for (size_t i = 0; i < r->track_count; i++)
         receiver_retire_subscription(r, &r->tracks[i]->sub_track, now_us, drained);
+}
+
+/* Reorder windows release on time as well as on arrival; cache the next
+ * time one is due for the endpoint's wake (receiver_next_deadline_us). A
+ * window stopped for lane room has no deadline: the application's poll
+ * wakes it. */
+static void receiver_ts_timers(moq_media_receiver_t *r, uint64_t now_us)
+{
+    uint64_t deadline = UINT64_MAX;
+    for (size_t i = 0; i < r->track_count; i++) {
+        moq_media_track_t *t = r->tracks[i];
+        if (!t->ts) continue;
+        if (receiver_ts_drain(r, t, now_us)) continue;
+        uint64_t d = receiver_ts_deadline(t);
+        if (d < deadline) deadline = d;
+    }
+    pthread_mutex_lock(&r->mu);
+    r->ts_deadline_us = deadline;
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* Resume the windows stopped for lane room before intake, which waits for
+ * them (network thread): the application's poll that returned the room
+ * woke this pass. */
+static void receiver_ts_resume(moq_media_receiver_t *r, uint64_t now_us)
+{
+    pthread_mutex_lock(&r->mu);
+    uint32_t stalled = r->ts_stalled;
+    pthread_mutex_unlock(&r->mu);
+    if (stalled == 0) return;
+    for (size_t i = 0; i < r->track_count; i++)
+        if (r->tracks[i]->ts) (void)receiver_ts_drain(r, r->tracks[i], now_us);
+}
+
+/* Mark ready the records of MPEG2TS tracks whose reorder window holds no
+ * Object taken in before them, after this pass's window progress (network
+ * thread). Nothing joins a window below a record's barrier later, so a
+ * record once ready stays ready. */
+static void receiver_st_mark_ready(moq_media_receiver_t *r)
+{
+    if (!r->st_enabled) return;
+    bool woke = false;
+    pthread_mutex_lock(&r->mu);
+    for (uint32_t i = r->st_head; i != r->st_tail; i++) {
+        receiver_st_entry_t *e = &r->st[i % r->st_cap];
+        if (e->ready) continue;
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+        if (ts_holds_before(e->rec.track, e->barrier)) continue;
+#endif
+        e->ready = true;
+        woke = true;
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (woke) moq_endpoint_wake(r->ep);
 }
 
 /* The endpoint pump hook: runs on the network thread under the endpoint
@@ -4710,6 +5449,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         /* Group ends let a TS track's reorder window release the next Group
          * at once instead of after the window. */
         scfg.surface_group_ends = true;
+        scfg.surface_stream_terminals = r->st_enabled;
         scfg.on_goaway = receiver_on_goaway;
         if (moq_sub_create(session, &r->alloc, &scfg, &r->sub) != MOQ_OK) {
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
@@ -4761,8 +5501,10 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         return;
     }
 
+    receiver_ts_resume(r, now_us);
     moq_sub_object_t obj;
-    while (moq_sub_poll_object(r->sub, &obj) == MOQ_OK) {
+    while (receiver_intake_begin(r) &&
+           moq_sub_poll_object(r->sub, &obj) == MOQ_OK) {
         if (obj.track == r->catalog_sub) {
             if (r->catalog_bootstrap.active)
                 receiver_bootstrap_stage_live(r, &obj);
@@ -4772,13 +5514,17 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             moq_sub_object_cleanup(&obj);
             /* Every polled Object can make a Group end ready, whichever
              * track it belongs to. */
+            receiver_intake_end(r);
             receiver_poll_group_ends(r, now_us);
+            receiver_poll_stream_terminals(r);
             continue;
         }
         moq_media_track_t *t = track_for_sub(r, obj.track);
         if (!t || (t->local_result != MOQ_OK && !t->delivery_failed)) {
             moq_sub_object_cleanup(&obj);
+            receiver_intake_end(r);
             receiver_poll_group_ends(r, now_us);
+            receiver_poll_stream_terminals(r);
             continue;
         }
         /* Ownership of obj's refs passes to the intake. A CMSF SAP timeline is
@@ -4796,9 +5542,13 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             receiver_on_ts_object(r, t, &obj, now_us);
         else
             receiver_on_media_object(r, t, &obj, now_us);
+        receiver_intake_end(r);
         receiver_poll_group_ends(r, now_us);
+        receiver_poll_stream_terminals(r);
     }
+    receiver_intake_end(r);
     receiver_poll_group_ends(r, now_us);
+    receiver_poll_stream_terminals(r);
 
     /* Process subscription completions recorded during the tick, now that this
      * tick's objects are drained: a "Track Ended" (live->VOD) re-arms the track
@@ -4813,7 +5563,8 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     r->catalog_done_pending = false;
     receiver_cancel_fills(r, now_us);
     if (r->joins_by_fill) receiver_process_subscription_dones(r, now_us);
-    receiver_retire_failed_tracks(r, now_us);
+    receiver_retire_tracks(r, now_us);
+    receiver_publish_delivery_failures(r);
 
     /* Catalog handling above may have terminalized (e.g. track-event
      * queue overflow): a terminal receiver must not start media
@@ -4833,19 +5584,8 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
 
     receiver_reconcile_delivery(r, now_us);
 
-    /* Reorder windows release on time as well as on arrival; cache the next
-     * time one is due for the endpoint's wake (receiver_next_deadline_us). */
-    uint64_t deadline = UINT64_MAX;
-    for (size_t i = 0; i < r->track_count; i++) {
-        moq_media_track_t *t = r->tracks[i];
-        if (!t->ts) continue;
-        receiver_ts_drain(r, t, now_us);
-        uint64_t d = receiver_ts_deadline(t);
-        if (d < deadline) deadline = d;
-    }
-    pthread_mutex_lock(&r->mu);
-    r->ts_deadline_us = deadline;
-    pthread_mutex_unlock(&r->mu);
+    receiver_ts_timers(r, now_us);
+    receiver_st_mark_ready(r);
     /* Evictions and purges in this pass may have made a fill terminal ready. */
     receiver_dom_wake(r);
 }
@@ -5083,6 +5823,13 @@ static void receiver_cfg_read(const moq_media_receiver_cfg_t *in,
     RCFG_COPY(mpeg2ts_strip_prefix);
     RCFG_COPY(mpeg2ts_join_psi);
 #undef RCFG_COPY
+    {
+        const size_t end = offsetof(moq_media_receiver_cfg_t,
+                                    surface_stream_terminals) + sizeof(bool);
+        const size_t at = offsetof(moq_media_receiver_cfg_t, max_stream_terminals);
+        if (size >= end)
+            memcpy((uint8_t *)out + at, (const uint8_t *)in + at, end - at);
+    }
     out->companion_profile = receiver_cfg_companion(in);
     out->struct_size = (uint32_t)sizeof(*out);
 }
@@ -5209,6 +5956,10 @@ static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 
 static void receiver_free(moq_media_receiver_t *r)
 {
+    /* Tracks are freed before the queue: unqueueing must not count. */
+    r->st_enabled = false;
+    if (r->st)
+        r->alloc.free(r->st, r->st_cap * sizeof(receiver_st_entry_t), r->alloc.ctx);
     receiver_bootstrap_discard(r);
     for (size_t i = 0; i < r->track_count; i++)
         receiver_track_free(r, r->tracks[i]);
@@ -5273,6 +6024,8 @@ typedef struct {
     size_t      saps_bytes;
     uint32_t    mt_cap;
     size_t      mts_bytes;
+    uint32_t    st_cap;          /* 0 when the lane is off */
+    size_t      st_bytes;
 } receiver_sizes_t;
 
 /* count * elem fits in size_t. Taking the count as uint64_t keeps the check
@@ -5332,6 +6085,13 @@ static moq_result_t receiver_derive_sizes(const moq_media_receiver_cfg_t *cfg,
     s->mt_cap = RECEIVER_DEFAULT_MT_RECORDS;
     if (!receiver_product_fits(s->mt_cap, sizeof(moq_media_timeline_record_t))) return MOQ_ERR_INVAL;
     s->mts_bytes = (size_t)s->mt_cap * sizeof(moq_media_timeline_record_t);
+    if (cfg->surface_stream_terminals) {
+        s->st_cap = cfg->max_stream_terminals ? cfg->max_stream_terminals
+                                              : RECEIVER_DEFAULT_STREAM_TERMINALS;
+        if (!receiver_product_fits(s->st_cap, sizeof(receiver_st_entry_t)))
+            return MOQ_ERR_INVAL;
+        s->st_bytes = (size_t)s->st_cap * sizeof(receiver_st_entry_t);
+    }
     return MOQ_OK;
 }
 
@@ -5447,6 +6207,16 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
         return MOQ_ERR_NOMEM;
     }
     memset(r->mts, 0, sz.mts_bytes);
+    if (sz.st_cap) {
+        r->st = (receiver_st_entry_t *)r->alloc.alloc(sz.st_bytes, r->alloc.ctx);
+        if (!r->st) {
+            receiver_free(r);
+            return MOQ_ERR_NOMEM;
+        }
+        memset(r->st, 0, sz.st_bytes);
+        r->st_cap = sz.st_cap;
+        r->st_enabled = true;
+    }
     r->stats.struct_size = (uint32_t)sizeof(r->stats);
 
     /* Production always passes a real endpoint. The MOQ_MEDIA_RECEIVER_TESTING
@@ -5561,6 +6331,37 @@ static bool receiver_terminal(const moq_media_receiver_t *r)
     return fatal || moq_endpoint_is_closed(r->ep);
 }
 
+size_t moq_media_receiver_track_input_internal(moq_media_receiver_t *r,
+                                              const moq_media_track_t *track)
+{
+    if (!r || !track) return 0;
+    size_t n = 0;
+    pthread_mutex_lock(&r->mu);
+    for (uint32_t i = r->obj_head; i != r->obj_tail; i++) {
+        const receiver_obj_entry_t *e = &r->objs[i % r->ring_cap];
+        if (!e->catalog && e->obj.track == track) n++;
+    }
+    if (r->st_enabled)
+        for (uint32_t i = r->st_head; i != r->st_tail; i++)
+            if (r->st[i % r->st_cap].rec.track == track) n++;
+    pthread_mutex_unlock(&r->mu);
+    return n;
+}
+
+bool moq_media_receiver_has_input_internal(moq_media_receiver_t *r)
+{
+    if (!r) return false;
+    pthread_mutex_lock(&r->mu);
+    bool have = (r->ev_tail != r->ev_head) ||
+                (r->obj_tail - r->obj_head != r->catalog_objects_queued) ||
+                (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head) ||
+                (r->parse_drop_pending_count > 0) ||
+                (r->local_failure_pending_count > 0) ||
+                (r->fill_ready_count > 0) || st_head_pollable_locked(r);
+    pthread_mutex_unlock(&r->mu);
+    return have;
+}
+
 moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
                                      uint64_t timeout_us)
 {
@@ -5572,7 +6373,7 @@ moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
                 (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head) ||
                 (r->parse_drop_pending_count > 0) ||
                 (r->local_failure_pending_count > 0) ||
-                (r->fill_ready_count > 0);
+                (r->fill_ready_count > 0) || st_head_pollable_locked(r);
     pthread_mutex_unlock(&r->mu);
     if (have) return MOQ_OK;
     if (receiver_terminal(r)) return MOQ_ERR_CLOSED;
@@ -5586,16 +6387,33 @@ moq_result_t moq_media_receiver_wait(moq_media_receiver_t *r,
            (r->sap_tail != r->sap_head) || (r->mt_tail != r->mt_head) ||
            (r->parse_drop_pending_count > 0) ||
            (r->local_failure_pending_count > 0) ||
-           (r->fill_ready_count > 0);
+           (r->fill_ready_count > 0) || st_head_pollable_locked(r);
     pthread_mutex_unlock(&r->mu);
     if (have) return MOQ_OK;
     if (receiver_terminal(r)) return MOQ_ERR_CLOSED;
     return rc < 0 ? rc : MOQ_OK;
 }
 
+static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
+                                        moq_media_track_event_t *ev,
+                                        size_t ev_size);
+
 moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
                                            moq_media_track_event_t *ev,
                                            size_t ev_size)
+{
+    moq_result_t rc = receiver_poll_track(r, ev, ev_size);
+    if (rc == MOQ_OK) {
+        pthread_mutex_lock(&r->mu);
+        r->track_events_polled++;
+        pthread_mutex_unlock(&r->mu);
+    }
+    return rc;
+}
+
+static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
+                                        moq_media_track_event_t *ev,
+                                        size_t ev_size)
 {
     /* Require the frozen v0 floor (not sizeof(current)), so an older caller is
      * still served by a future library; copy only n = min(caller, current)
@@ -5669,6 +6487,10 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
         full.local_result = e.local_result;
         full.delivery_origin = e.delivery_origin;
         full.delivery_initiating_request_id = e.delivery_initiating_request_id;
+        if (n >= MEDIA_TRACK_EVENT_DONE_END) {
+            full.has_done_status = e.has_done_status;
+            full.done_status = e.done_status;
+        }
         memcpy(ev, &full, n);
         return MOQ_OK;
     }
@@ -6160,9 +6982,53 @@ moq_result_t moq_media_receiver_track_state(
     return MOQ_OK;
 }
 
+/* What a queued entry's object holds: its buffers and owned sample table. */
+static uint64_t entry_charge(const moq_media_object_t *o)
+{
+    uint64_t c = 0;
+    if (o->payload_ref) c += moq_rcbuf_len(o->payload_ref);
+    if (o->properties_ref) c += moq_rcbuf_len(o->properties_ref);
+    if (o->track_properties_ref) c += moq_rcbuf_len(o->track_properties_ref);
+    if (o->samples_owned) c += (uint64_t)o->sample_count * sizeof(moq_cmaf_sample_t);
+    return c;
+}
+
+uint64_t moq_media_object_charge(const moq_media_object_t *obj)
+{
+    if (!obj || obj->struct_size < MEDIA_OBJECT_V0_SIZE) return 0;
+    uint64_t c = 0;
+    if (obj->payload_ref) c += moq_rcbuf_len(obj->payload_ref);
+    if (obj->properties_ref) c += moq_rcbuf_len(obj->properties_ref);
+    if (obj->struct_size >= MEDIA_OBJECT_METADATA_SIZE && obj->track_properties_ref)
+        c += moq_rcbuf_len(obj->track_properties_ref);
+    if (obj->samples_owned)
+        c += (uint64_t)obj->sample_count * sizeof(moq_cmaf_sample_t);
+    return c;
+}
+
+static moq_result_t receiver_poll_object(moq_media_receiver_t *r,
+                                         uint64_t max_charge, uint64_t *charge,
+                                         moq_media_object_t *obj,
+                                         size_t obj_size);
+
 moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,
                                             moq_media_object_t *obj,
                                             size_t obj_size)
+{
+    return receiver_poll_object(r, UINT64_MAX, NULL, obj, obj_size);
+}
+
+moq_result_t moq_media_receiver_poll_object_within(
+    moq_media_receiver_t *r, uint64_t max_charge, uint64_t *charge,
+    moq_media_object_t *obj, size_t obj_size)
+{
+    return receiver_poll_object(r, max_charge, charge, obj, obj_size);
+}
+
+static moq_result_t receiver_poll_object(moq_media_receiver_t *r,
+                                         uint64_t max_charge, uint64_t *charge,
+                                         moq_media_object_t *obj,
+                                         size_t obj_size)
 {
     /* See poll_track: frozen v0 floor, copy clamped to min(caller, current). The
      * ref fields live in the v0 prefix, so n >= v0 always carries ownership. */
@@ -6196,6 +7062,12 @@ moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,
         return MOQ_DONE;
     }
     receiver_obj_entry_t *e = &r->objs[r->obj_head % r->ring_cap];
+    uint64_t c = entry_charge(&e->obj);
+    if (charge) *charge = c;
+    if (c > max_charge) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_ERR_BUFFER;
+    }
     memcpy(obj, &e->obj, n);            /* exclusive ownership transfers */
     obj->struct_size = (uint32_t)n;
     /* The join PSI goes out with the first Object of the current
@@ -6225,6 +7097,16 @@ moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,
      * terminal made ready here wakes waiters and a gated executor. */
     bool nudge = r->fill_dom_wake;
     r->fill_dom_wake = false;
+    /* A stopped intake resumes once its lane room returns; a window
+     * stopped for room may now fit the queue. */
+    if (r->st_blocked && st_room_locked(r)) {
+        r->st_blocked = false;
+        nudge = true;
+    }
+    if (r->ts_wake) {
+        r->ts_wake = false;
+        nudge = true;
+    }
     if (r->overflow.policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL &&
         r->paused && !r->resume_nudged &&
         obj_resume_ready_locked(r)) {
@@ -6234,6 +7116,46 @@ moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,
     pthread_mutex_unlock(&r->mu);
     if (nudge)
         moq_endpoint_wake(r->ep);
+    return MOQ_OK;
+}
+
+moq_result_t moq_media_receiver_poll_stream_terminal(
+    moq_media_receiver_t *r, moq_media_stream_terminal_t *out, size_t out_size)
+{
+    if (!r || !out) return MOQ_ERR_INVAL;
+    if (out_size < MOQ_MEDIA_STREAM_TERMINAL_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    pthread_mutex_lock(&r->mu);
+    if (!st_head_pollable_locked(r)) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_DONE;
+    }
+    receiver_st_entry_t *e = &r->st[r->st_head % r->st_cap];
+    size_t n = out_size < sizeof(e->rec) ? out_size : sizeof(e->rec);
+    memcpy(out, &e->rec, n);
+    out->struct_size = (uint32_t)n;
+    uint8_t dom = e->dom;
+    memset(e, 0, sizeof(*e));
+    r->st_head++;
+    /* A fill's last owed loss record makes its retired record ready. */
+    if (dom) {
+        receiver_fill_dom_t *d = &r->fill_doms[dom - 1];
+        assert(d->st_owed > 0);
+        if (--d->st_owed == 0 && d->queued == 0 && d->state == DOM_RETIRED)
+            dom_ready_locked(r, d);
+    }
+    /* Room returned: place the held terminal, and wake the network
+     * thread when a stopped intake or reorder window can resume, or a
+     * gated executor has a record back. */
+    st_place_held_locked(r);
+    bool wake = r->fill_dom_wake;
+    r->fill_dom_wake = false;
+    if (r->st_blocked || r->ts_wake) {
+        r->st_blocked = false;
+        r->ts_wake = false;
+        wake = true;
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (wake) moq_endpoint_wake(r->ep);
     return MOQ_OK;
 }
 
@@ -6323,6 +7245,38 @@ moq_result_t moq_media_receiver_get_stats(const moq_media_receiver_t *r,
     size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
     snap.struct_size = (uint32_t)n;
     memcpy(out, &snap, n);
+    return MOQ_OK;
+}
+
+moq_endpoint_t *moq_media_receiver_endpoint_internal(const moq_media_receiver_t *r)
+{
+    return r ? r->ep : NULL;
+}
+
+moq_result_t moq_media_receiver_get_info(const moq_media_receiver_t *r,
+                                         moq_media_receiver_info_t *out,
+                                         size_t out_size)
+{
+    if (!r || !out) return MOQ_ERR_INVAL;
+    if (out_size < MOQ_MEDIA_RECEIVER_INFO_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    moq_media_receiver_info_t full;
+    memset(&full, 0, sizeof(full));
+    pthread_mutex_t *mu = (pthread_mutex_t *)&r->mu;
+    pthread_mutex_lock(mu);
+    full.time_mode = (uint32_t)r->time_mode;
+    full.overflow_policy = (uint32_t)r->overflow.policy;
+    full.max_objects = r->obj_cap;
+    full.max_bytes = r->byte_cap;
+    full.auto_subscribe = r->auto_subscribe;
+    full.surface_stream_terminals = r->st_enabled;
+    full.companion_profile = r->companion_profile;
+    full.transport_version = (uint32_t)r->transport_version;
+    full.max_stream_terminals = r->st_enabled ? r->st_cap : 0;
+    full.track_events_polled = r->track_events_polled;
+    pthread_mutex_unlock(mu);
+    size_t n = out_size < sizeof(full) ? out_size : sizeof(full);
+    full.struct_size = (uint32_t)n;
+    memcpy(out, &full, n);
     return MOQ_OK;
 }
 
@@ -6580,10 +7534,129 @@ void moq_media_receiver_test_set_ep(moq_media_receiver_t *r, moq_endpoint_t *ep)
 /* Drive the real endpoint pump hook with a caller-controlled session. The hook
  * itself ignores the endpoint argument (receiver_hook does (void)ep;), so a
  * NULL endpoint is sound here. */
+/* Run the receiver on `ep` (a bare test endpoint), so its closed state is
+ * the endpoint's. The caller keeps `ep` and clears this before freeing it. */
+void moq_media_receiver_test_set_endpoint(moq_media_receiver_t *r, moq_endpoint_t *ep);
+void moq_media_receiver_test_set_endpoint(moq_media_receiver_t *r, moq_endpoint_t *ep)
+{
+    r->ep = ep;
+}
+
 void moq_media_receiver_test_pump(moq_media_receiver_t *r,
                                   moq_session_t *session, uint64_t now_us)
 {
     receiver_hook(NULL, session, now_us, r);
+}
+
+/* A delivery-capacity failure of `track`, as the facade reports one. LIVE
+ * fails the track and keeps the objects already admitted (staged, then
+ * published by the next pump once the facade holds none); FILL fails only
+ * a child, without ending its parent. */
+void moq_media_receiver_test_fail_delivery(moq_media_receiver_t *r, moq_media_track_t *track,
+                                           bool fill);
+void moq_media_receiver_test_fail_delivery(moq_media_receiver_t *r, moq_media_track_t *track,
+                                           bool fill)
+{
+    pthread_mutex_lock(&r->mu);
+    if (!fill) {
+        if (track->local_result == MOQ_OK) {
+            track->local_result = MOQ_ERR_NOMEM;
+            track->local_failure_kind = MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE;
+            track->delivery_failed = true;
+            track->delivery_failure_staged = true;
+            track->upd_notify_app = false;
+            track->update_inflight = false;
+            track->upd_sent_app_gen = 0;
+        }
+    } else if (r->ev_tail - r->ev_head < r->ev_cap) {
+        receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
+        *event = (receiver_event_t){ .kind = MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE,
+            .track = track, .local_result = MOQ_ERR_NOMEM,
+            .delivery_origin = MOQ_MEDIA_DELIVERY_FILL,
+            .delivery_initiating_request_id = 1 };
+    }
+    pthread_mutex_unlock(&r->mu);
+    moq_endpoint_wake(r->ep);
+}
+
+/* Fail `track` locally, as a retention failure of its initial metadata
+ * does: MOQ_MEDIA_TRACK_LOCAL_FAILURE, without TRACK_ENDED. */
+void moq_media_receiver_test_fail_track(moq_media_receiver_t *r, moq_media_track_t *track);
+void moq_media_receiver_test_fail_track(moq_media_receiver_t *r, moq_media_track_t *track)
+{
+    receiver_mark_track_local_failure(r, track, MOQ_ERR_NOMEM,
+                                      MOQ_MEDIA_TRACK_LOCAL_FAILURE);
+}
+
+/* Queue `track`'s END_OF_TRACK at (group, object) on the stream-terminal
+ * lane behind everything taken in so far, as its peer's End of Track
+ * arriving before objects still in flight on other streams. False without
+ * lane room. */
+bool moq_media_receiver_test_end_of_track(moq_media_receiver_t *r, moq_media_track_t *track,
+                                          uint64_t group, uint64_t object);
+bool moq_media_receiver_test_end_of_track(moq_media_receiver_t *r, moq_media_track_t *track,
+                                          uint64_t group, uint64_t object)
+{
+    pthread_mutex_lock(&r->mu);
+    bool ok = r->st_enabled && st_free_locked(r) > r->st_reserved;
+    if (ok) {
+        moq_media_stream_terminal_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.kind = MOQ_MEDIA_STREAM_END_OF_TRACK;
+        rec.track = track;
+        rec.group_id = group;
+        rec.object_id = object;
+        st_push_locked(r, &rec, 0);
+    }
+    pthread_mutex_unlock(&r->mu);
+    return ok;
+}
+
+/* Queue a RAW LOC-less media object for `track` at (group, object), taken
+ * in behind everything so far, with `payload` (a ref is taken) and
+ * `time_us` as its capture, decode and presentation time: an object
+ * reaching the receiver by another route, or after the application's view
+ * of its track has moved on. False when the object queue is full. */
+bool moq_media_receiver_test_inject_object(moq_media_receiver_t *r, moq_media_track_t *track,
+                                           uint64_t group, uint64_t object, bool keyframe,
+                                           uint64_t time_us, moq_rcbuf_t *payload);
+bool moq_media_receiver_test_inject_object(moq_media_receiver_t *r, moq_media_track_t *track,
+                                           uint64_t group, uint64_t object, bool keyframe,
+                                           uint64_t time_us, moq_rcbuf_t *payload)
+{
+    pthread_mutex_lock(&r->mu);
+    if (r->obj_tail - r->obj_head >= r->obj_cap) {
+        pthread_mutex_unlock(&r->mu);
+        return false;
+    }
+    receiver_obj_entry_t *e = &r->objs[r->obj_tail % r->ring_cap];
+    memset(e, 0, sizeof(*e));
+    size_t len = moq_rcbuf_len(payload);
+    e->group_id = group;
+    e->budget = len;
+    e->gen = track->ts_gen;
+    moq_media_object_t *o = &e->obj;
+    o->track = track;
+    o->packaging = MOQ_MEDIA_PACKAGING_RAW;
+    o->status = MOQ_OBJECT_NORMAL;
+    o->keyframe = keyframe;
+    o->has_capture_time = true;
+    o->capture_time_us = time_us;
+    o->decode_time_us = time_us;
+    o->presentation_time_us = time_us;
+    moq_rcbuf_incref(payload);
+    o->payload_ref = payload;
+    o->payload = (moq_bytes_t){ moq_rcbuf_data(payload), len };
+    o->group_id = group;
+    o->object_id = object;
+    o->has_subgroup = true;
+    e->seq = r->ingress_seq++;
+    if (r->st_enabled && track->st_queued++ == 0) r->domains_queued++;
+    r->obj_budget_total += len;
+    r->obj_sizes_total += len;
+    r->obj_tail++;
+    pthread_mutex_unlock(&r->mu);
+    return true;
 }
 
 /* Run the production subscriber-teardown path (live-handle snapshot + per-handle

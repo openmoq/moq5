@@ -232,6 +232,7 @@ MOQ_API uint64_t moq_track_sub_handle_id_for_trace(moq_track_sub_handle_t h);
 #define MOQ_HANDLE_POOL_PLAYBACK_TRACK 8u
 #define MOQ_HANDLE_POOL_SUBSCRIBE_TRACKS 9u
 #define MOQ_HANDLE_POOL_FILL          10u
+#define MOQ_HANDLE_POOL_PLAYBACK_COMMAND_HOLD 11u
 
 /*
  * Pack handle fields into a 64-bit opaque value.

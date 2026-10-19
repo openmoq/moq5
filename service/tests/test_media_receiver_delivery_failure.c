@@ -144,6 +144,9 @@ static void delivery_live(void)
     pump(&f);
     DELIVERY_NEED(f.tick_result == MOQ_ERR_BUFFER);
     MOQ_TEST_CHECK(f.query_result == MOQ_OK); /* ACK is still immutable/successful. */
+    /* The notice follows the failed subscription's local cancellation, which
+     * also settles its fill: network and pump, no peer action. */
+    settle(&f);
     MOQ_TEST_CHECK(moq_media_receiver_wait(f.r, 0) == MOQ_OK);
     delivery_drain(&f);
     MOQ_TEST_CHECK(delivery_notices == 1 && delivery_last_origin == MOQ_MEDIA_DELIVERY_LIVE &&
@@ -334,6 +337,7 @@ static void delivery_metadata_floor(void)
     f.ledger.fail = false;
     DELIVERY_NEED(f.tick_result == MOQ_ERR_BUFFER && f.query_result == MOQ_OK);
     MOQ_TEST_CHECK(f.ledger.calls == calls);
+    settle(&f);   /* local cancellation settles the fill; then the notice */
     MOQ_TEST_CHECK(moq_media_receiver_wait(f.r, 0) == MOQ_OK);
     delivery_drain(&f);
     MOQ_TEST_CHECK(delivery_notices == 1 && delivery_last_origin == MOQ_MEDIA_DELIVERY_LIVE);
@@ -341,6 +345,108 @@ static void delivery_metadata_floor(void)
 done:
     finish(&f);
 }
+
+/* Bytes carrying the late fill Object's marker that reached the client. */
+static const char late_marker[] = "late-fill-object-marker";
+static unsigned late_ingress;
+static void count_late_ingress(void *ctx, const moq_sim_trace_record_t *r)
+{
+    (void)ctx;
+    if (r->kind != MOQ_SIM_TRACE_INPUT || r->to != MOQ_PERSPECTIVE_CLIENT) return;
+    size_t m = sizeof(late_marker) - 1;
+    for (size_t i = 0; i + m <= r->bytes.len; i++)
+        if (memcmp(r->bytes.data + i, late_marker, m) == 0) { late_ingress++; return; }
+}
+
+/* A failed subscription's notice waits for everything it could still
+ * deliver, and the existing local cancellation settles that: a real D22
+ * capacity failure (an oversize Object) after an earlier Object, with the
+ * track's join fill live (opened, or never opened) and the action queue
+ * full, so cancellation is refused for credit. The facade then holds
+ * nothing for the track, yet its fill could still deliver: no notice. Once
+ * credit returns the failed subscription is cancelled, its fill with it
+ * (locally: no peer FIN or RESET). With the child opened, the publisher
+ * then writes a valid fill Object: it can, not having seen the cancel yet,
+ * and its bytes reach the client only after the cancellation committed.
+ * They arrive, and deliver nothing: no Object, no second notice, no parent
+ * failure. Then the child's terminal is reported, then the one LIVE
+ * notice. The earlier Object was kept, and the healthy sibling plays on. */
+static void delivery_parent_cancellation_frontier(bool open_child)
+{
+    fixture_t f;
+    moq_media_object_t early = {0}, late = {0}, good = {0};
+    late_ingress = 0;
+    fixture_trace = count_late_ingress;
+    fixture_trace_ctx = NULL;
+    bool started = delivery_start(&f, MOQ_VERSION_DRAFT_22, false);
+    fixture_trace = NULL;
+    DELIVERY_NEED(started);
+    moq_fill_t child = f.peer[1].fill;
+    DELIVERY_NEED(moq_fill_is_valid(child));
+    if (open_child)
+        DELIVERY_NEED(moq_session_open_fill(server(&f), child, now(&f)) == MOQ_OK);
+    send_payload(&f, 1, 1, "early", 5, true);
+    delivery_big_live(&f, 1, 2);
+    fill_action_queue(&f);
+    pump(&f);
+    DELIVERY_NEED(f.tick_result == MOQ_ERR_BUFFER);
+    pump(&f);
+    delivery_drain(&f);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(f.r->sub, f.bad->sub_track));
+    MOQ_TEST_CHECK(moq_sub_fill_is_valid(moq_sub_track_fill(f.bad->sub_track)));
+    MOQ_TEST_CHECK(delivery_notices == 0 && delivery_terminals == 0);
+    DELIVERY_NEED(moq_media_receiver_poll_object(f.r, &early, sizeof(early)) == MOQ_OK);
+    MOQ_TEST_CHECK(early.track == f.bad && early.payload.len == 5 &&
+        memcmp(early.payload.data, "early", 5) == 0);
+    /* Credit back (the queued requests go out; no fill bytes exist yet),
+     * then the facade's retry cancels the failed subscription locally. */
+    network(&f);
+    pump(&f);
+    MOQ_TEST_CHECK(f.bad->sub_track == NULL ||
+                   moq_sub_track_get_state(f.bad->sub_track) != MOQ_SUB_TRACK_ACTIVE);
+    if (open_child) {
+        /* The publisher has not seen the cancel: the child is writable. */
+        moq_fetch_object_cfg_t oc;
+        moq_fetch_object_cfg_init(&oc);
+        oc.object_id = 1;
+        moq_loc_metadata_t loc;
+        moq_loc_metadata_init_sized(&loc, sizeof(loc));
+        loc.present = MOQ_LOC_METADATA_HAS_TIMESTAMP;
+        loc.timestamp = 12346;
+        MOQ_TEST_CHECK(moq_loc_encode_metadata(moq_alloc_default(), f.version,
+            MOQ_LOC_PROFILE_04, &loc, &oc.properties) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)late_marker,
+            sizeof(late_marker) - 1, &oc.payload) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_fill_object(server(&f), child, &oc, now(&f)) ==
+                       MOQ_OK);
+        moq_rcbuf_decref(oc.payload);
+        moq_rcbuf_decref(oc.properties);
+        MOQ_TEST_CHECK(late_ingress == 0);
+    }
+    settle(&f); delivery_drain(&f);
+    if (open_child) MOQ_TEST_CHECK(late_ingress > 0);   /* the bytes did arrive */
+    MOQ_TEST_CHECK(delivery_terminals == 1);
+    MOQ_TEST_CHECK(delivery_notices == 1 && delivery_last_origin == MOQ_MEDIA_DELIVERY_LIVE &&
+        delivery_ends == 0);
+    MOQ_TEST_CHECK(!moq_sub_fill_is_valid(moq_sub_track_fill(f.bad->sub_track)));
+    if (moq_media_receiver_poll_object(f.r, &late, sizeof(late)) == MOQ_OK)
+        MOQ_TEST_CHECK(late.track != f.bad);
+    send_payload(&f, 2, 1, "good", 4, true); settle(&f);
+    moq_media_object_t any = {0};
+    while (moq_media_receiver_poll_object(f.r, &any, sizeof(any)) == MOQ_OK) {
+        if (any.track == f.good) good = any;
+        else { MOQ_TEST_CHECK(any.track != f.bad); moq_media_object_cleanup(&any); }
+        memset(&any, 0, sizeof(any));
+    }
+    MOQ_TEST_CHECK(good.track == f.good && good.payload.len == 4);
+done:
+    moq_media_object_cleanup(&early);
+    moq_media_object_cleanup(&late);
+    moq_media_object_cleanup(&good);
+    finish(&f);
+}
+static void delivery_parent_cancellation_opened(void) { delivery_parent_cancellation_frontier(true); }
+static void delivery_parent_cancellation_unopened(void) { delivery_parent_cancellation_frontier(false); }
 
 static void delivery_live_cancel_refusal(void)
 {
@@ -482,7 +588,13 @@ static void delivery_sizes(void)
     for (size_t size = floor; size <= sizeof(moq_media_track_event_t) + 17; size++) {
         fixture_t f;
         DELIVERY_NEED(delivery_start(&f, MOQ_VERSION_DRAFT_22, false));
-        delivery_big_live(&f, 1, 1); pump(&f);
+        /* The track's join fill ends first, so the failure notice is the one
+         * event left to poll at each size. */
+        DELIVERY_NEED(moq_session_open_fill(server(&f), f.peer[1].fill, now(&f)) == MOQ_OK);
+        DELIVERY_NEED(moq_session_end_fill(server(&f), f.peer[1].fill, now(&f)) == MOQ_OK);
+        settle(&f); delivery_drain(&f);
+        DELIVERY_NEED(!moq_sub_fill_is_valid(moq_sub_track_fill(f.bad->sub_track)));
+        delivery_big_live(&f, 1, 1); settle(&f);
         unsigned char *storage = malloc(size + 16);
         DELIVERY_NEED(storage != NULL);
         memset(storage, 0xa5, size + 16);
@@ -552,6 +664,8 @@ int main(void)
     delivery_run("temporary_byte_pressure_without_new_input", delivery_temporary_pressure);
     delivery_run("retained_ack_floor_is_causal", delivery_metadata_floor);
     delivery_run("live_cancel_refusal_keeps_identity_and_sibling_progress", delivery_live_cancel_refusal);
+    delivery_run("failed_parent_waits_for_its_open_child", delivery_parent_cancellation_opened);
+    delivery_run("failed_parent_waits_for_its_unopened_child", delivery_parent_cancellation_unopened);
     delivery_run("catalog_dependency_capacity_failure", delivery_catalog);
     delivery_run("zero_initiator_and_healthy_sibling_fill", delivery_zero_initiator);
     delivery_run("old_partial_future_output_guards", delivery_sizes);

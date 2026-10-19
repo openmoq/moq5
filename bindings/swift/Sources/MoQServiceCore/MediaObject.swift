@@ -21,6 +21,10 @@ public final class MediaObject: @unchecked Sendable {
     public let endsGroup: Bool
     public let isDatagram: Bool
     public let presentationTime: Duration
+    /// On CMAF the tfdt/trun decode time. On RAW/LOC a copy of the LOC media
+    /// time (as `presentationTime`, with a zero `compositionOffset`): LOC has
+    /// no decode timestamp, decode order is object order, and with frame
+    /// reordering this can decrease, so it is not evidence of a decode clock.
     public let decodeTime: Duration
     public let compositionOffset: Duration
     public let captureTime: Date?

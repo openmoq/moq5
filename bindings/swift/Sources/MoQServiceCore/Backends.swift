@@ -327,3 +327,29 @@ package protocol OwnedObjectStorage: AnyObject, Sendable {
     /// thread (exclusive ownership + thread-safe allocator make this legal).
     func cleanup()
 }
+
+/// The token of an attachment's pump-hook installation, set once it is
+/// installed: the attachment removes its own hook, never a later one's.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+package final class PumpHookOwnership: @unchecked Sendable {
+    private let lock = NSLock()
+    private var held: EndpointEngine.PumpHookToken?
+
+    package init() {}
+
+    package var token: EndpointEngine.PumpHookToken? {
+        lock.lock(); defer { lock.unlock() }
+        return held
+    }
+
+    package func set(_ token: EndpointEngine.PumpHookToken) {
+        lock.lock(); defer { lock.unlock() }
+        held = token
+    }
+
+    /// Remove the hook this attachment installed, if it is still the one
+    /// installed.
+    package func remove(from engine: EndpointEngine, kind: EndpointEngine.PumpHookKind) {
+        if let token { engine.removePumpHook(kind: kind, token: token) }
+    }
+}

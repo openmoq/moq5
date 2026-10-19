@@ -113,7 +113,7 @@ public final class MediaReceiver: @unchecked Sendable {
         let attachment = self.attachment
         let engine = endpoint.engine
         if engine.post({ attachment.finalizeDetach() }) {
-            engine.removePumpHook(kind: .receiver)
+            attachment.hook.remove(from: engine, kind: .receiver)
         }
     }
 
@@ -151,10 +151,11 @@ public final class MediaReceiver: @unchecked Sendable {
         let receiver = MediaReceiver(
             endpoint: endpoint, configuration: configuration, backend: backend)
         let attachment = receiver.attachment    /* NOT the receiver: no cycle */
-        try endpoint.engine.installPumpHook(
+        let token = try endpoint.engine.installPumpHook(
             kind: .receiver,
             run: { attachment.drainTrackEvents() },
             teardown: { attachment.finalizeDetach() })
+        attachment.hook.set(token)
         return receiver
     }
 
@@ -168,7 +169,7 @@ public final class MediaReceiver: @unchecked Sendable {
         let engine = endpoint.engine
         await engine.postAndWait {
             attachment.finalizeDetach()
-            engine.removePumpHook(kind: .receiver)
+            attachment.hook.remove(from: engine, kind: .receiver)
         }
         /* A false return means the engine is shutting down (or gone): its
          * teardown pass performs the same detach. */
@@ -405,6 +406,9 @@ public final class MediaReceiver: @unchecked Sendable {
 /// backstops must stay reachable when an app forgets close()).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package final class ReceiverAttachment: @unchecked Sendable {
+
+    /// Which installation of the receiver hook is this attachment's.
+    package let hook = PumpHookOwnership()
 
     package let backend: any ReceiverBackend
     fileprivate let state = ReceiverState()

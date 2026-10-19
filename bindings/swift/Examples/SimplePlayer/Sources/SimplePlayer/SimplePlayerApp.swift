@@ -4,9 +4,9 @@
  * A universal SwiftUI player (iPhone / iPad / macOS) showing the complete
  * receive path on one screen:
  *
- *   configure -> connect -> established -> MediaReceiver.attach(.live) ->
- *   firstVideoTrack -> makeFormatDescription -> for-await objects ->
- *   makeSampleBuffer -> AVSampleBufferDisplayLayer
+ *   configure -> connect -> established -> MediaPlayer.attach ->
+ *   for-await outputs (CONFIGURE -> makeFormatDescription, TIMELINE ->
+ *   the clock, UNIT -> makeSampleBuffer) -> AVSampleBufferDisplayLayer
  *
  * Reading order: PlayerModel.swift (the state machine and playback loop),
  * ContentView.swift (how the UI renders that state), VideoSurface.swift

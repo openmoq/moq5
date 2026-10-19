@@ -27,12 +27,13 @@ enum PlayerState: Equatable {
 /// The app-level playback state and loop. `@MainActor` so the `@Published`
 /// UI state and the display layer are touched only on the main thread.
 ///
-/// The whole connect → established → discover → select → receive lifecycle —
-/// and the serialized-reconnect teardown that a disconnect→reconnect needs to
-/// avoid running two live sessions at once — now lives in the SDK's
-/// ``LiveMediaSession``. This model just maps ``WatchState`` onto `PlayerState`
-/// for the UI and drives the app-only render pipeline from the session's
-/// object stream. No generation tokens, no manual endpoint/receiver teardown.
+/// One watch is: connect the endpoint, wait for establishment, attach a
+/// ``MediaPlayer`` (automatic selection), and render its outputs. The player
+/// owns what used to be hand-rolled here -- track selection, decode order,
+/// gaps and recovery, the presentation timeline, how a track ends -- so this
+/// model only maps the watch's phases onto `PlayerState` and feeds the
+/// render pipeline. Reconnects serialize: a new watch waits for the previous
+/// one to close its endpoint.
 @MainActor
 final class PlayerModel: ObservableObject {
 
@@ -119,6 +120,10 @@ final class PlayerModel: ObservableObject {
     private var activeBackend: BackendChoice = .picoquic
 
     #if canImport(AVFoundation)
+    /// Called with each video sample once it is enqueued, in enqueue (decode)
+    /// order; for tests that check what reached the renderer.
+    var onVideoSampleEnqueued: ((CMSampleBuffer) -> Void)?
+
     /// The render target the view hosts. Sample buffers are enqueued on
     /// iOS 17 / macOS 14 and newer (the sampleBufferRenderer API); older
     /// systems still count samples — this is an example, not a shipping
@@ -128,36 +133,27 @@ final class PlayerModel: ObservableObject {
 
     private let defaults = UserDefaults.standard
 
-    /// The SDK watch handle: one reusable session for the model's life.
-    /// `LiveMediaSession()` wires `MoQEndpoint.connect` as its endpoint factory.
-    private let session = LiveMediaSession()
-
-    /// Maps the session's `WatchState` onto `PlayerState`; recreated per
-    /// connect so a superseded watch's buffered states never reach the UI.
-    private var stateObserver: Task<Void, Never>?
-    /// The per-watch object → render loop; nil while there is nothing to render.
-    private var renderTask: Task<Void, Never>?
-    /// The last render task after cancellation, so the next one waits for it to
-    /// release the session's single-consumer object claim before iterating.
-    private var previousRender: Task<Void, Never>?
-
     #if canImport(AVFoundation) && canImport(CoreMedia)
-    /// The A/V render + sync pipeline for the active watch; nil while idle.
-    private var pipeline: RenderPipeline?
+    /// The render sink for the active watch; nil while idle.
+    private var sink: (any RenderSink)?
+    /// Makes a watch's render sink: the A/V pipeline on the display layer.
+    var makeSink: @MainActor (PlayerModel) -> any RenderSink = { model in
+        RenderPipeline(displayLayer: model.displayLayer)
+    }
     #endif
 
-    /// Video is required, audio optional — expressed over the whole track
-    /// snapshot so no-video is a clean `noMatchingTracks` (a "No video" failure)
-    /// while a stream that carries audio gets both tracks selected.
-    private static let videoRequiredSelector = TrackSelector { tracks in
-        guard let video = tracks.first(where: { $0.description.mediaType == .video })
-        else { return [] }
-        var selection = [video]
-        if let audio = tracks.first(where: { $0.description.mediaType == .audio }) {
-            selection.append(audio)
-        }
-        return selection
-    }
+    /// How a watch reaches a relay: the real endpoint and player by default.
+    var connector = WatchConnector.live
+
+    /// The running watch. A new connect() waits for the previous watch's
+    /// task, whose unwind closes its player and endpoint, so two live
+    /// endpoints never overlap.
+    private var watchTask: Task<Void, Never>?
+    /// Identifies the current watch: a superseded watch's late phases and
+    /// outputs never reach the UI.
+    private var watchID = 0
+    /// The watch whose terminal phase was applied: its first one stands.
+    private var finishedWatchID = 0
 
     init() {
         urlText = defaults.string(forKey: "SimplePlayer.url")
@@ -187,49 +183,136 @@ final class PlayerModel: ObservableObject {
         activeBackend = backend        // latch: describe() uses this, not the live picker
         beginWatchUIState()
 
-        // start() supersedes any prior watch AND serializes behind an in-flight
-        // stop()'s teardown, so a disconnect→reconnect never runs two live
-        // endpoints at once — the SDK owns what used to be hand-rolled here.
-        session.start(configuration)
-        observeState()
+        watchID += 1
+        let id = watchID
+        let previous = watchTask
+        previous?.cancel()
+        watchTask = Task { [weak self] in
+            await previous?.value      // the previous endpoint is closed first
+            guard !Task.isCancelled else { return }
+            await self?.watch(configuration, id: id)
+        }
     }
 
     func disconnect() {
         isRunning = false
         state = .idle
-        cancelObserver()
-        cancelRender()
+        watchID += 1                   // the cancelled watch's late phases are ignored
+        watchTask?.cancel()            // kept: the next connect() waits for its unwind
         teardownPipeline()
-        // beginStop() applies the supersede SYNCHRONOUSLY (teardown proceeds on
-        // its own), so an immediate reconnect's start() serializes behind it.
-        // A deferred `Task { await stop() }` would instead let that start() run
-        // first and then be cancelled by the late stop — the disconnect race.
-        session.beginStop()
     }
 
-    // -- State observation ------------------------------------------------
+    /// Wait for the current watch to finish its unwind.
+    func watchCompleted() async {
+        await watchTask?.value
+    }
 
-    private func observeState() {
-        cancelObserver()
-        stateObserver = Task { [weak self, session] in
-            for await watchState in session.stateUpdates() {
-                guard let self else { break }
-                if self.apply(watchState) { break }   // stop on a terminal state
+    // -- The watch ---------------------------------------------------------
+
+    /// What one watch runs with: the endpoint, the player, and how long
+    /// establishment may take.
+    struct WatchConfiguration {
+        var endpoint: MoQEndpoint.Configuration
+        var player: MediaPlayer.Configuration
+        var establishmentTimeout: Duration
+    }
+
+    /// The lifecycle phases a watch reports to the UI, in order.
+    enum WatchPhase {
+        case connecting
+        case established
+        /// Connected and attached; the publisher has produced nothing yet.
+        case waitingForMedia
+        /// Video units are being presented.
+        case receiving
+        /// The catalog offers nothing this player can select.
+        case noPlayableTracks
+        case ended
+        /// A track ended in failure (its END said so), or what the watch
+        /// enqueued did not present, without a service error to report.
+        case trackFailed(TrackFailure)
+        case failed(MoQServiceError)
+    }
+
+    /// One watch: connect, establish, attach the player, render its outputs
+    /// until every selected track has ended and what it rendered has
+    /// presented, then close everything it opened, once.
+    private func watch(_ configuration: WatchConfiguration, id: Int) async {
+        let endpoint: any WatchEndpoint
+        do {
+            endpoint = try connector.connect(configuration.endpoint)
+        } catch {
+            report(.failed(serviceError(error)), id: id)
+            return
+        }
+        var player: (any WatchPlayer)?
+        do {
+            try await endpoint.established(within: configuration.establishmentTimeout)
+            report(.established, id: id)
+            if id == watchID, let version = endpoint.negotiatedVersion {
+                negotiatedVersion = version
             }
+            let attached = try await endpoint.attachPlayer(configuration.player)
+            player = attached
+            report(.waitingForMedia, id: id)
+            let render = Task { @MainActor [weak self] in
+                guard let self else { return }
+                try await self.render(attached, id: id)
+            }
+            let events = Task { @MainActor [weak self] in
+                await self?.observe(attached, id: id, render: render)
+            }
+            defer { events.cancel() }
+            try await withTaskCancellationHandler {
+                try await render.value
+            } onCancel: {
+                render.cancel()
+            }
+            report(.ended, id: id)
+        } catch is CancellationError {
+            // Superseded, disconnected, or ended by observe().
+        } catch let failure as TrackFailure {
+            report(.trackFailed(failure), id: id)
+        } catch {
+            report(.failed(serviceError(error)), id: id)
+        }
+        await player?.close()
+        await endpoint.close()
+    }
+
+    private func serviceError(_ error: any Error) -> MoQServiceError {
+        error as? MoQServiceError ?? .internalError(-1)
+    }
+
+    /// Apply a phase for the current watch only; after its terminal phase,
+    /// nothing more.
+    private func report(_ phase: WatchPhase, id: Int) {
+        guard id == watchID, finishedWatchID != id else { return }
+        if apply(phase) { finishedWatchID = id }
+    }
+
+    /// Player events: a catalog with nothing selectable ends the watch;
+    /// the rest is diagnostics this example does not show.
+    private func observe(_ player: any WatchPlayer, id: Int,
+                         render: Task<Void, any Error>) async {
+        do {
+            while let event = try await player.nextEvent() {
+                guard id == watchID else { return }
+                if case .ready = event,
+                   let selected = try? await player.tracksSelected(), selected == 0 {
+                    report(.noPlayableTracks, id: id)
+                    render.cancel()
+                    return
+                }
+            }
+        } catch {
+            // The outputs loop reports how the watch ended.
         }
     }
 
-    private func cancelObserver() {
-        stateObserver?.cancel()
-        stateObserver = nil
-    }
-
-    /// Per-watch UI reset, applied SYNCHRONOUSLY before `session.start()`:
-    /// the new watch's `.connecting` emission can be coalesced away
-    /// (`bufferingNewest(1)`), so nothing downstream may be trusted to
-    /// clear the previous watch's surface — in particular the
-    /// establishment latch, or a pre-establishment failure of the NEW
-    /// watch would be classified with the OLD watch's phase.
+    /// Per-watch UI reset, applied SYNCHRONOUSLY in connect(), before the
+    /// watch task runs, so nothing from the previous watch -- in particular
+    /// the establishment latch -- survives into the new one.
     func beginWatchUIState() {
         state = .connecting
         sampleCount = 0
@@ -238,54 +321,49 @@ final class PlayerModel: ObservableObject {
         establishmentLatched = false
     }
 
-    /// Durable establishment latch for failure classification. The state
-    /// stream coalesces (`bufferingNewest(1)`), so `.established` itself
-    /// may never be OBSERVED -- any post-establishment state implies it,
-    /// and once latched it stays true for the watch (a UI state variable
-    /// alone would misclassify a media failure as a transport one).
+    /// Durable establishment latch for failure classification: once a watch
+    /// is past establishment, an `.unsupported` is about the media, not
+    /// the transport configuration.
     private var establishmentLatched = false
 
-    /// Map one `WatchState` onto the UI. Returns `true` for a terminal state,
-    /// which ends the observer (a superseded watch's late states can't leak).
-    func apply(_ watchState: WatchState) -> Bool {
-        switch watchState {
+    /// Map one watch phase onto the UI. Returns `true` for a terminal phase.
+    @discardableResult
+    func apply(_ phase: WatchPhase) -> Bool {
+        switch phase {
         case .connecting:
             state = .connecting
             establishmentLatched = false
             sampleCount = 0
             trackName = nil
             negotiatedVersion = nil
-            cancelRender()
             teardownPipeline()
             return false
         case .established:
             state = .established
             establishmentLatched = true
-            refreshVersion()
             return false
-        case .awaitingCatalog:
+        case .waitingForMedia:
             state = .waitingForMedia
             establishmentLatched = true
-            refreshVersion()
             return false
-        case .awaitingFirstObject(let tracks):
-            state = .waitingForMedia
-            establishmentLatched = true
-            refreshVersion()
-            trackName = trackName ?? videoName(in: tracks)
-            startRender()
-            return false
-        case .receiving(let tracks):
+        case .receiving:
             state = .playing
             establishmentLatched = true
-            trackName = trackName ?? videoName(in: tracks)
-            startRender()
             return false
-        case .noMatchingTracks:
-            finishWatch(.failed("No video track in the stream catalog"))
+        case .noPlayableTracks:
+            finishWatch(.failed("No playable track in the stream catalog"))
             return true
         case .ended:
             finishWatch(.ended)
+            return true
+        case .trackFailed(.fatal):
+            finishWatch(.failed("The stream failed"))
+            return true
+        case .trackFailed(.local):
+            finishWatch(.failed("A track could not be received on this device"))
+            return true
+        case .trackFailed(.presentation):
+            finishWatch(.failed("The stream's last frames could not be presented"))
             return true
         case .failed(let error):
             finishWatch(.failed(describe(
@@ -297,132 +375,207 @@ final class PlayerModel: ObservableObject {
     private func finishWatch(_ terminal: PlayerState) {
         state = terminal
         isRunning = false
-        cancelRender()
         teardownPipeline()
     }
 
-    /// Read the negotiated version off the live endpoint (the durable fact),
-    /// not the transient `.established` payload — a coalescing state stream may
-    /// drop that state, but the endpoint keeps answering.
-    private func refreshVersion() {
-        if negotiatedVersion == nil,
-           let version = session.endpoint?.negotiatedWireVersion {
-            negotiatedVersion = "draft\(version.draftNumber)"
-        }
-    }
+    // -- Rendering (app-only; the player vends decode-order units) ---------
 
-    private func videoName(in tracks: [MediaTrack]) -> String? {
-        tracks.first { $0.description.mediaType == .video }?.description.name
-    }
-
-    // -- Rendering (app-only; the SDK vends objects, not sample buffers) ---
-
-    /// Start the object → render loop for the current watch (idempotent within
-    /// a watch). It serializes behind the previous watch's render task so the
-    /// session's single-consumer object claim is released before re-iterating.
-    private func startRender() {
-        guard renderTask == nil else { return }
-        let cleanup = previousRender
-        renderTask = Task { [weak self] in
-            await cleanup?.value
-            guard let self, !Task.isCancelled else { return }
-            await self.renderObjects()
-        }
-    }
-
-    private func cancelRender() {
-        guard let task = renderTask else { return }
-        task.cancel()
-        previousRender = task        // its unwind releases the object claim
-        renderTask = nil
-    }
-
-    #if canImport(CoreMedia)
-    /// Route each object to the video or audio renderer by media type, building
-    /// each renderer's format description once. Audio is best-effort — a stream
-    /// can carry an audio track whose catalog lacks the fields CoreMedia needs,
-    /// so we fall back to video-only rather than fail the whole session. The
-    /// object stream ends (or throws) when the watch ends; the state observer
-    /// owns the resulting `PlayerState`, so errors here are swallowed.
-    private func renderObjects() async {
-        var videoFormat: CMFormatDescription?
-        var audioFormat: CMFormatDescription?
-        #if canImport(AVFoundation)
-        let pipeline = RenderPipeline(displayLayer: displayLayer)
-        self.pipeline = pipeline
-        #endif
-        do {
-            for try await object in session.objects {
-                let description = object.track.description
-                switch description.mediaType {
+    #if canImport(AVFoundation) && canImport(CoreMedia)
+    /// Render the player's outputs until every selected track has ended: a
+    /// CONFIGURE builds the track's format description, the TIMELINE starts
+    /// the clock, a DISCONTINUITY flushes the renderer, and each UNIT is
+    /// enqueued once its renderer has room (no further output is pulled
+    /// meanwhile -- the player's backpressure). Audio is best-effort: a codec
+    /// CoreMedia cannot describe here plays video only. A video renderer
+    /// that fails is flushed and reported, and the player resumes the track
+    /// at its next independent unit. Once every track has ended, the watch
+    /// finishes as finishMedia says.
+    private func render(_ player: any WatchPlayer, id: Int) async throws {
+        let sink = makeSink(self)
+        self.sink = sink
+        var formats: [UInt64: (video: Bool, format: CMFormatDescription, config: Bool)] = [:]
+        var ends = TrackEnds()
+        var presentedBy: Duration?
+        while let output = try await player.nextOutput() {
+            guard id == watchID else { return }
+            switch output {
+            case .configure(let configuration):
+                switch configuration.mediaType {
                 case .video:
-                    if videoFormat == nil {
-                        videoFormat = try description.makeFormatDescription()
-                    }
-                    let sample = try object.makeSampleBuffer(
-                        formatDescription: videoFormat!)
-                    #if canImport(AVFoundation)
-                    pipeline.enqueueVideo(sample)
-                    #endif
-                    sampleCount += 1
+                    formats[configuration.trackID] =
+                        (true, try configuration.makeFormatDescription(),
+                         configuration.hasCodecConfig)
+                    trackName = trackName ?? configuration.trackName
                 case .audio:
-                    if audioFormat == nil,
-                       let format = try? description.makeFormatDescription() {
-                        audioFormat = format
-                        #if canImport(AVFoundation)
-                        pipeline.attachAudio()
-                        #endif
+                    if let format = try? configuration.makeFormatDescription() {
+                        formats[configuration.trackID] = (false, format, true)
+                        sink.attachAudio()
+                    } else {
+                        formats[configuration.trackID] = nil
                     }
-                    if let audioFormat {
-                        let sample = try object.makeSampleBuffer(
-                            formatDescription: audioFormat)
-                        #if canImport(AVFoundation)
-                        pipeline.enqueueAudio(sample)
-                        #endif
-                    }
+                default:
+                    formats[configuration.trackID] = nil
                 }
+            case .timeline(let timeline):
+                sink.apply(timeline)
+            case .discontinuity(let trackID):
+                if let entry = formats[trackID] {
+                    sink.renderer(video: entry.video)?.flush()
+                }
+            case .unit(let unit):
+                guard let entry = formats[unit.trackID], sink.drives(unit.timelineID),
+                      let renderer = sink.renderer(video: entry.video) else { continue }
+                let framing = entry.video
+                    ? Self.locFraming(of: unit.data, hasVideoConfig: entry.config)
+                    : .lengthPrefixed
+                let sample = try unit.makeSampleBuffer(entry.format, framing)
+                switch await enqueueWhenReady(sample, into: renderer) {
+                case .cancelled:
+                    return
+                case .failed:
+                    renderer.flush()
+                    if entry.video {
+                        try await player.reportDecodeError(
+                            trackID: unit.trackID, generation: unit.configurationGeneration)
+                    }
+                case .enqueued:
+                    presentedBy = max(presentedBy ?? unit.presentedBy, unit.presentedBy)
+                    guard entry.video else { break }
+                    sampleCount += 1
+                    onVideoSampleEnqueued?(sample)
+                    if state != .playing { report(.receiving, id: id) }
+                }
+            case .end(let trackID, let cause):
+                ends.end(trackID, cause: cause)
+                guard ends.count >= (try await player.tracksSelected()) else { break }
+                try await finishMedia(player, ends: ends, sink: sink, presentedBy: presentedBy)
+                return
+            case .other:
+                break
             }
-        } catch {
-            // Terminal/interrupted object stream; the state observer maps it.
         }
+    }
+
+    /// Every selected track ended. A FATAL end fails the watch with the
+    /// player's fatal error, which its outputs report next; a local failure
+    /// fails it too. Otherwise the media finished once what was enqueued
+    /// has presented (the clock reaches the last unit's end); a renderer
+    /// that fails first, or a clock that does not get there, fails the
+    /// watch. Only then does it report and tear its renderers down.
+    private func finishMedia(_ player: any WatchPlayer, ends: TrackEnds, sink: any RenderSink,
+                             presentedBy: Duration?) async throws {
+        switch ends.failure {
+        case .fatal:
+            _ = try await player.nextOutput()
+            throw TrackFailure.fatal
+        case .local:
+            throw TrackFailure.local
+        case nil:
+            guard let presentedBy else { return }
+            switch await sink.settle(through: presentedBy) {
+            case .presented: return
+            case .cancelled: throw CancellationError()
+            case .failed, .notPresented: throw TrackFailure.presentation
+            }
+        }
+    }
+
+    /// The NAL framing of an H.264/HEVC unit under LOC (LOC-04 §2.1.3-2.1.4):
+    /// a leading 4-byte value of 1 is a start code, never a length; a
+    /// 3-byte start code may begin a unit only on a track with no Video
+    /// Config; anything else is a 4-byte length prefix.
+    static func locFraming(of data: Data, hasVideoConfig: Bool) -> NALFraming {
+        if data.count >= 4 && data.starts(with: [0, 0, 0, 1]) { return .annexB }
+        if !hasVideoConfig && data.count >= 3 && data.starts(with: [0, 0, 1]) {
+            return .annexB
+        }
+        return .lengthPrefixed
     }
     #else
-    /// Non-CoreMedia platforms (Linux): count video access units so the UI has
-    /// a liveness signal, without any rendering.
-    private func renderObjects() async {
-        do {
-            for try await object in session.objects
-                where object.track.description.mediaType == .video {
-                if !object.mediaData.isEmpty { sampleCount += 1 }
+    /// Non-CoreMedia platforms (Linux): count video units so the UI has a
+    /// liveness signal, without any rendering.
+    private func render(_ player: any WatchPlayer, id: Int) async throws {
+        var video: Set<UInt64> = []
+        var ends = TrackEnds()
+        while let output = try await player.nextOutput() {
+            guard id == watchID else { return }
+            switch output {
+            case .configure(let configuration) where configuration.mediaType == .video:
+                video.insert(configuration.trackID)
+                trackName = trackName ?? configuration.trackName
+            case .unit(let unit) where video.contains(unit.trackID):
+                sampleCount += 1
+                if state != .playing { report(.receiving, id: id) }
+            case .end(let trackID, let cause):
+                ends.end(trackID, cause: cause)
+                guard ends.count >= (try await player.tracksSelected()) else { break }
+                switch ends.failure {
+                case .fatal:
+                    _ = try await player.nextOutput()
+                    throw TrackFailure.fatal
+                case .local:
+                    throw TrackFailure.local
+                case nil:
+                    return
+                }
+            default:
+                break
             }
-        } catch {
-            // Terminal/interrupted object stream; the state observer maps it.
         }
     }
     #endif
 
-    /// Tear down the active render pipeline, freeing the shared display layer
+    /// The tracks whose END was rendered: the watch is over once every
+    /// selected track has one.
+    /// The selected tracks' ENDs: how many tracks ended, and whether one
+    /// ended in failure (FATAL above a local failure).
+    struct TrackEnds {
+        enum Failure { case local, fatal }
+        private var ended: Set<UInt64> = []
+        private(set) var failure: Failure?
+
+        var count: Int { ended.count }
+
+        /// Record track `id`'s END; a repeated END is the same track.
+        mutating func end(_ id: UInt64, cause: PlayerEndCause) {
+            ended.insert(id)
+            switch cause {
+            case .fatal: failure = .fatal
+            case .localFailure: if failure == nil { failure = .local }
+            default: break
+            }
+        }
+    }
+
+    /// A watch that did not finish: its tracks ended in failure, or what it
+    /// enqueued did not present.
+    enum TrackFailure: Error { case local, fatal, presentation }
+
+    /// Tear down the active render sink, freeing the shared display layer
     /// to join a fresh pipeline on the next watch.
     private func teardownPipeline() {
         #if canImport(AVFoundation) && canImport(CoreMedia)
-        pipeline?.stop()
-        pipeline = nil
+        sink?.stop()
+        sink = nil
         #endif
     }
 
     // -- Configuration mapping --------------------------------------------
 
-    func makeWatchConfiguration(url: URL) -> LiveMediaSession.Configuration {
-        LiveMediaSession.Configuration(
+    func makeWatchConfiguration(url: URL) -> WatchConfiguration {
+        var player = MediaPlayer.Configuration(namespace: MediaNamespace(namespaceText))
+        player.companionProfile = version == .draft22
+            ? .draft22MSF01LOC04Public : .legacyMSF01LOC01
+        // A startup buffer: the first unit presents this far after it is
+        // released, so arriving media lands ahead of the clock.
+        player.cushion = .milliseconds(300)
+        return WatchConfiguration(
             endpoint: makeConfiguration(url: url),
-            namespace: MediaNamespace(namespaceText),
-            selector: Self.videoRequiredSelector,
+            player: player,
             // Bound establishment so an unreachable relay (or an experimental
             // backend that wedges before it establishes) surfaces a clear
             // failure instead of an indefinite "Connecting...".
-            establishmentTimeout: .seconds(15),
-            companionProfile: version == .draft22
-                ? .draft22MSF01LOC04Public : .legacyMSF01LOC01)
+            establishmentTimeout: .seconds(15))
     }
 
     /// The Advanced panel maps 1:1 onto `MoQEndpoint.Configuration`; nothing

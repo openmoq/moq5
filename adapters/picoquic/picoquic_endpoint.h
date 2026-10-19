@@ -93,6 +93,14 @@ void moq_pq_conn_get_send_stats(const moq_pq_conn_t *conn,
  */
 bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn);
 
+/*
+ * True while the connection's bridge holds an outbound action the transport
+ * has not taken (moq_transport_bridge_has_outbound_pending), which a graceful
+ * drain must wait out (implemented in moq_picoquic.c). PRIVATE, like
+ * moq_pq_conn_cnx_released. A NULL conn reports false. Network thread only.
+ */
+bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn);
+
 /* Returns 0 on success, -1 on allocation failure (queue create). */
 int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
                      pq_endpoint_ctx_t *ep_ctx,

@@ -519,6 +519,21 @@ Implications:
   (no `.pc` — see "Why mvfst is CMake-only" below); a Meson/autotools build
   cannot pull mvfst via `pkg-config`. VLC's MoQ module is gated on
   `libmoq_dep` + `picoquic_dep` for this reason.
+- **Where those `.pc` files expect PicoQUIC:** picoquic ships no `.pc`, so
+  `libmoq.pc` and `libmoq-pico-wt.pc` name its headers and archives
+  themselves.
+  - Built against an **installed picoquic package**, they carry that
+    package's own include and library directories: relative to `${prefix}`
+    when it was installed under LibMoQ's prefix, as fixed absolute paths when
+    it lives elsewhere (those do not move with the prefix).
+  - Built from a **picoquic source tree** (`MOQ_PICOQUIC_SOURCE_DIR`), nothing
+    of picoquic is installed with LibMoQ: install picoquic (with
+    `BUILD_HTTP=ON` for pico WT) into the **same prefix** with its default
+    layout. Its archives are then found in LibMoQ's `${libdir}`, and its
+    headers in `${prefix}/include`, which the `.pc` names whenever LibMoQ's
+    own `CMAKE_INSTALL_INCLUDEDIR` is something else. A picoquic installed
+    elsewhere, or with a different include directory, is not described by
+    these files.
 - **CMake consumers:** use `find_package(libmoq COMPONENTS ...)` with the
   component names above. mvfst additionally needs a C++ compiler (the
   config errors out otherwise) and a discoverable `mvfst` package.

@@ -3899,6 +3899,7 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
         }
         moq_finish_publish_cfg_t fcfg;
         moq_finish_publish_cfg_init(&fcfg);
+        fcfg.status_code = MOQ_PUB_DONE_TRACK_ENDED;   /* not INTERNAL_ERROR (0) */
         fcfg.stream_count = psl ? psl->streams_opened : 0;   /* exact */
         moq_result_t rc = moq_session_finish_publish(pub->session,
             track->publication, &fcfg, now_us);
@@ -6353,6 +6354,10 @@ moq_result_t moq_pub_unpublish_track(moq_publisher_t *pub,
 
     moq_finish_publish_cfg_t fcfg;
     moq_finish_publish_cfg_init(&fcfg);
+    /* A normal end: the track is no longer being published (TRACK_ENDED).
+     * The zeroed default is INTERNAL_ERROR, which would report this normal
+     * end as an error. */
+    fcfg.status_code = MOQ_PUB_DONE_TRACK_ENDED;
     /* Exact stream count: the facade opened every stream for this
      * publication; a zero would let the peer finalize before in-flight
      * streams arrive. */

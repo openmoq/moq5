@@ -1908,6 +1908,11 @@ typedef struct moq_rx_stream {
                                                  stream's first under that
                                                  bit */
     uint64_t               prev_object_id;
+    /* The last Object the stream carried completely: an Object is complete
+     * once the next one's header parses, or once the stream ends with no
+     * payload of it outstanding. What a subgroup terminal reports. */
+    bool                   has_last_complete;
+    uint64_t               last_complete_object_id;
 
     uint8_t                hdr_buf[MOQ_RX_HDR_BUF];
     uint8_t                hdr_len;

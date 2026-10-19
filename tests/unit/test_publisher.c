@@ -7534,6 +7534,26 @@ static void test_publish_track_accepted(void) {
 
 /* Write objects on a published track: they must reach the publication's data
  * stream (the write fan-out routes to the publication slot). */
+/* The status of the one PUBLISH_FINISHED the client has surfaced for its
+ * accepted publication -- a completion message, not a stream signal, whose
+ * Stream Count is the one data stream the test opened; ~0 when there is
+ * none, and a second one fails. */
+static uint64_t client_publication_done_status(moq_simpair_t *sp) {
+    int done_n = 0; uint64_t status = ~0ull;
+    moq_event_t d[16]; size_t ne;
+    while ((ne = moq_session_poll_events(moq_simpair_client(sp), d, 16)) > 0)
+        for (size_t i = 0; i < ne; i++) {
+            if (d[i].kind == MOQ_EVENT_PUBLISH_FINISHED) {
+                done_n++; status = d[i].u.publish_finished.status_code;
+                MOQ_TEST_CHECK_EQ_INT(d[i].u.publish_finished.cause, 0);
+                MOQ_TEST_CHECK_EQ_U64(d[i].u.publish_finished.stream_count, 1);
+            }
+            moq_event_cleanup(&d[i]);
+        }
+    MOQ_TEST_CHECK_EQ_INT(done_n, 1);
+    return status;
+}
+
 static void test_publish_track_write(void) {
     test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
     simpair_setup(&as, &alloc, &sp);
@@ -7572,6 +7592,8 @@ static void test_publish_track_write(void) {
     rc = moq_pub_end_track(pub, track, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
     MOQ_TEST_CHECK(!moq_pub_track_is_published(pub, track));
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    MOQ_TEST_CHECK_EQ_U64(client_publication_done_status(sp), 0x2);
 
     moq_pub_destroy(pub);
     drain_all(sp);
@@ -7579,6 +7601,7 @@ static void test_publish_track_write(void) {
     MOQ_TEST_CHECK(as.balance == 0);
     MOQ_TEST_PASS("publish_track_write");
 }
+
 
 /* Coexistence: one track is BOTH advertised (receives SUBSCRIBE) AND published.
  * Proves PUBLISH is an operation, not an exclusive mode. */
@@ -10674,6 +10697,54 @@ static void windows_setup(test_alloc_state_t *as, moq_alloc_t *alloc,
     tcfg.track_name = MOQ_BYTES_LITERAL("video");
     *track = NULL;
     moq_pub_add_track(*pub, &tcfg, moq_simpair_now_us(*sp), track);
+}
+
+/* A publisher-initiated publication the application ends normally --
+ * end_track, unpublish_track or remove_track -- completes with TRACK_ENDED
+ * (0x2) on every draft: the track is no longer being published. Status 0
+ * is INTERNAL_ERROR and would mislabel that normal end as an error. The
+ * subscriber sees exactly one completion message carrying the exact count
+ * of data streams opened (one subgroup here). */
+static void test_publication_end_status(moq_version_t ver)
+{
+    for (int how = 0; how < 3; how++) {
+        test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
+        moq_publisher_t *pub; moq_pub_track_t *track;
+        windows_setup(&as, &alloc, &sp, ver, &pub, &track);
+        MOQ_TEST_CHECK(pub != NULL && track != NULL);
+        if (!pub || !track) { moq_simpair_destroy(sp); continue; }
+        moq_pub_publish_cfg_t pcfg; moq_pub_publish_cfg_init(&pcfg);
+        MOQ_TEST_CHECK_EQ_INT(moq_pub_publish_track(pub, track, &pcfg,
+            moq_simpair_now_us(sp)), MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        MOQ_TEST_CHECK(client_accept_publish(sp));
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        moq_pub_tick(pub, moq_simpair_now_us(sp));
+        MOQ_TEST_CHECK(moq_pub_track_is_published(pub, track));
+        moq_rcbuf_t *payload = NULL;
+        MOQ_TEST_CHECK_EQ_INT(moq_rcbuf_create(&alloc, (const uint8_t *)"abcd",
+                                               4, &payload), MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT(moq_pub_write_object(pub, track, 0, 0, payload,
+            moq_simpair_now_us(sp)), MOQ_OK);
+        moq_rcbuf_decref(payload);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+
+        uint64_t now = moq_simpair_now_us(sp);
+        moq_result_t rc = how == 0 ? moq_pub_end_track(pub, track, now)
+                        : how == 1 ? moq_pub_unpublish_track(pub, track, now)
+                                   : moq_pub_remove_track(pub, track, now);
+        MOQ_TEST_CHECK_EQ_INT(rc, MOQ_OK);
+        moq_simpair_run_until_quiescent(sp, 8, NULL);
+        MOQ_TEST_CHECK_EQ_U64(client_publication_done_status(sp), 0x2);
+
+        moq_pub_destroy(pub);
+        drain_all(sp);
+        moq_simpair_destroy(sp);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+    MOQ_TEST_PASS(ver == MOQ_VERSION_DRAFT_16 ? "publication_end_status_d16"
+                : ver == MOQ_VERSION_DRAFT_18 ? "publication_end_status_d18"
+                                              : "publication_end_status_d22");
 }
 
 /* Client subscribes with a filter; the facade accepts (manual_forward). */
@@ -17191,6 +17262,9 @@ int main(void) {
     test_ns_refcount_would_block_retry();
     test_publish_track_accepted();
     test_publish_track_write();
+    test_publication_end_status(MOQ_VERSION_DRAFT_16);
+    test_publication_end_status(MOQ_VERSION_DRAFT_18);
+    test_publication_end_status(MOQ_VERSION_DRAFT_22);
     test_publish_and_subscribe_coexist();
     test_fanout_delivery_sub_first();
     test_fanout_delivery_pub_first();

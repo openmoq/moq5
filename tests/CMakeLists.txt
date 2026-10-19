@@ -6,6 +6,10 @@ add_test(NAME cmake_apple_abi_rules
     COMMAND ${CMAKE_COMMAND}
         "-DTEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/apple-abi-rules"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AppleAbiProbeRulesTest.cmake")
+add_test(NAME cmake_picoquic_pkgconfig_provenance
+    COMMAND ${CMAKE_COMMAND} "-DSRC=${PROJECT_SOURCE_DIR}"
+        "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/picoquic-pkgconfig-provenance"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicPkgConfigProvenanceTest.cmake")
 add_test(NAME cmake_consumer_preload_argv
     COMMAND ${CMAKE_COMMAND} "-DCTEST=${CMAKE_CTEST_COMMAND}"
         "-DTEST_BUILD=${PROJECT_BINARY_DIR}"
@@ -154,6 +158,15 @@ endif()
 if(NOT WIN32)
     add_executable(moq_port_shadow support/port_shadow.c)
 endif()
+
+# FindPicoquic's one OpenSSL link identity, against a stand-in provider.
+add_test(NAME picoquic_openssl_link_identity
+    COMMAND ${CMAKE_COMMAND}
+        "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/picoquic-openssl-identity"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicOpenSSLIdentityTest.cmake")
+set_tests_properties(picoquic_openssl_link_identity PROPERTIES TIMEOUT 120)
 
 # -- C tests --------------------------------------------------------
 add_test(NAME picoquic_version_metadata
@@ -351,6 +364,10 @@ add_test(NAME bridge_hold_input COMMAND test_bridge_hold_input)
 # FETCH and TRACK_STATUS request-stream lifecycle through two real bridges,
 # draft-16 controls and draft-18 rows: completion closes both halves, late
 # peer terminals and reordering are ordinary input, pressure is retried.
+add_executable(test_bridge_budget_pending_output unit/test_bridge_budget_pending_output.c)
+target_link_libraries(test_bridge_budget_pending_output PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_budget_pending_output PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_budget_pending_output COMMAND test_bridge_budget_pending_output)
 add_executable(test_bridge_request_lifecycle unit/test_bridge_request_lifecycle.c)
 target_link_libraries(test_bridge_request_lifecycle PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_request_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
@@ -475,6 +492,9 @@ add_test(NAME session_subgroup COMMAND test_session_subgroup)
 add_executable(test_session_receive unit/test_session_receive.c)
 target_link_libraries(test_session_receive PRIVATE moq-core-test-internals)
 add_test(NAME session_receive COMMAND test_session_receive)
+add_executable(test_subgroup_terminal_last_object unit/test_subgroup_terminal_last_object.c)
+target_link_libraries(test_subgroup_terminal_last_object PRIVATE moq-core-test-internals)
+add_test(NAME subgroup_terminal_last_object COMMAND test_subgroup_terminal_last_object)
 
 add_executable(test_session_namespace unit/test_session_namespace.c)
 target_link_libraries(test_session_namespace PRIVATE moq-core-test-internals)
@@ -995,6 +1015,9 @@ if(TARGET moq::sim)
     add_executable(test_subscriber_group_end unit/test_subscriber_group_end.c)
     target_link_libraries(test_subscriber_group_end PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME subscriber_group_end COMMAND test_subscriber_group_end)
+    add_executable(test_subscriber_stream_terminals unit/test_subscriber_stream_terminals.c)
+    target_link_libraries(test_subscriber_stream_terminals PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME subscriber_stream_terminals COMMAND test_subscriber_stream_terminals)
 
     add_executable(test_subscriber_track_result unit/test_subscriber_track_result.c)
     target_link_libraries(test_subscriber_track_result PRIVATE moq::core moq::sim)
@@ -1085,6 +1108,10 @@ if(TARGET moq::sim)
     add_executable(test_ownership_graph unit/test_ownership_graph.c)
     target_link_libraries(test_ownership_graph PRIVATE moq-core-test-internals)
     add_test(NAME ownership_graph COMMAND test_ownership_graph)
+
+    add_executable(test_session_pending_output unit/test_session_pending_output.c)
+    target_link_libraries(test_session_pending_output PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_pending_output COMMAND test_session_pending_output)
 
     add_executable(test_d18_fin_handoff unit/test_d18_fin_handoff.c)
     target_link_libraries(test_d18_fin_handoff PRIVATE moq-core-test-internals)
@@ -1625,6 +1652,35 @@ if(TARGET moq::relay AND TARGET moq::sim AND TARGET moq-service-receiver-test-in
     add_test(NAME media_receiver_finite_tail_ordering
         COMMAND test_media_receiver_finite_tail_ordering)
     set_tests_properties(media_receiver_finite_tail_ordering PROPERTIES TIMEOUT 120)
+endif()
+
+# The receiver's stream-terminal lane over a real publisher and SimPair.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_stream_terminals
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_stream_terminals.c)
+    target_link_libraries(test_media_receiver_stream_terminals PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    if(TARGET moq::mpeg2ts)
+        target_include_directories(test_media_receiver_stream_terminals PRIVATE
+            ${PROJECT_SOURCE_DIR}/service/tests
+            ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+        target_compile_definitions(test_media_receiver_stream_terminals PRIVATE
+            MOQ_TEST_HAVE_TS=1)
+    endif()
+    add_test(NAME media_receiver_stream_terminals
+        COMMAND test_media_receiver_stream_terminals)
+    set_tests_properties(media_receiver_stream_terminals PROPERTIES TIMEOUT 120)
+endif()
+
+# The receiver surfaces the media player is built on.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_player_support
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_player_support.c)
+    target_link_libraries(test_media_receiver_player_support PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    add_test(NAME media_receiver_player_support
+        COMMAND test_media_receiver_player_support)
+    set_tests_properties(media_receiver_player_support PROPERTIES TIMEOUT 120)
 endif()
 
 # -- Version lanes --------------------------------------------------

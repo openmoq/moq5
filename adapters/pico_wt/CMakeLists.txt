@@ -117,6 +117,11 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cma
 # embedded here using the same helper as libmoq.pc.
 # picohttp-core uses picoquic-log (picoquic_set_qlog).
 moq_picoquic_pkgconfig_libs(LIBMOQ_PICOWT_DEP_LIBS WITH_LOG)
+moq_picoquic_pkgconfig_cflags(_picowt_dep_cflags)
+set(LIBMOQ_PICOWT_DEP_CFLAGS "")
+if(_picowt_dep_cflags)
+    set(LIBMOQ_PICOWT_DEP_CFLAGS " ${_picowt_dep_cflags}")
+endif()
 # Relocatable prefix: the .pc lands at <prefix>/<libdir>/pkgconfig, so the
 # up-path from ${pcfiledir} back to <prefix> is (libdir depth + 1) levels.
 # Computing it from CMAKE_INSTALL_LIBDIR handles lib, lib64, and multiarch
@@ -263,6 +268,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
             "${CMAKE_BUILD_TYPE}"
             "${_picowt_openssl_root}"
             "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work"
+            "${CMAKE_INSTALL_INCLUDEDIR}"
             "${_picowt_abi_context}")
     set_tests_properties(pico_wt_install_consumer PROPERTIES TIMEOUT 600)
 
@@ -688,6 +694,29 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
 
+    # Test-internals build of the managed facade: the same source with its
+    # MOQ_PICO_WT_TESTING seams (stage hook, drain facts), never installed or
+    # exported. A test that drives the facade through the service tier links
+    # this in place of moq::adapter-pico-wt-managed.
+    if(MOQ_BUILD_TESTS)
+        add_library(moq-adapter-pico-wt-managed-test-internals STATIC
+            pico_wt_managed.c)
+        target_include_directories(moq-adapter-pico-wt-managed-test-internals
+            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(moq-adapter-pico-wt-managed-test-internals
+            PUBLIC  moq::adapter-pico-wt moq::adapter-picoquic
+            PRIVATE $<BUILD_INTERFACE:${_PICOHTTP}> ${_PICO_CORE}
+                    Threads::Threads)
+        target_compile_definitions(moq-adapter-pico-wt-managed-test-internals
+            PRIVATE MOQ_PICO_WT_TESTING)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(moq-adapter-pico-wt-managed-test-internals PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+    endif()
+
     # -- Build-tree package target --------------------------------------
     # Build-tree imported target so `find_package(libmoq COMPONENTS
     # adapter-pico-wt-managed)` works against ${PROJECT_BINARY_DIR},
@@ -815,6 +844,7 @@ endif()\n")
                 "${_picowtm_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work"
                 "${_picowtm_install_staging}"
+                "${CMAKE_INSTALL_INCLUDEDIR}"
                 "${_picowt_abi_context}")
         set_tests_properties(pico_wt_managed_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
@@ -940,6 +970,37 @@ endif()\n")
             set_tests_properties(pico_wt_managed_keepalive_server PROPERTIES
                 TIMEOUT 30 LABELS "network;pico_wt;managed")
         endif()
+    endif()
+
+    # The managed drain holds while the session retains reliable lifecycle
+    # output: a draft-18 rejection that reaches a client whose event queue is
+    # full. White-box: drives the MOQ_PICO_WT_TESTING stage hook and drain
+    # facts over local loopback.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND
+       EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
+       EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        add_executable(test_pico_wt_managed_drain_retained
+            tests/test_pico_wt_managed_drain_retained.c
+            pico_wt_managed.c)
+        target_compile_definitions(test_pico_wt_managed_drain_retained PRIVATE
+            MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_managed_drain_retained PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pico_wt_managed_drain_retained PRIVATE
+            moq::adapter-pico-wt-managed Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_drain_retained PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pico_wt_managed_drain_retained
+            COMMAND test_pico_wt_managed_drain_retained
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained PROPERTIES
+            TIMEOUT 120 LABELS "network;pico_wt;managed")
     endif()
 
     # Managed client pre-accept stream buffer: chunk order and FIN, the stream

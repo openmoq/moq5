@@ -48,9 +48,15 @@
 #                              else <repo>/../picoquic)
 #   MOQ_PICOTLS_SOURCE_DIR     picotls checkout  (default: <repo>/.deps/picoquic-ci/picotls,
 #                              else <repo>/../picotls)
-#   MOQ_WTQUIC_SOURCE_DIR      wtquic checkout   (default: <repo>/.deps/wtquic-ci/wtquic,
-#                              else <repo>/../wtquic; materialize the
-#                              pinned checkout with scripts/setup_wtquic_deps.sh)
+#   WTQUIC_DEPS_DIR            where scripts/setup_wtquic_deps.sh materialized the
+#                              pinned wtquic (default: <repo>/.deps/wtquic-ci); its
+#                              wtquic/ checkout is verified against the pin (exact
+#                              HEAD, clean tree) before anything compiles
+#   MOQ_WTQUIC_SOURCE_DIR      EXPLICIT UNVERIFIED wtquic override for local
+#                              development; the artifact is labeled a local
+#                              development build, never a pinned one
+#   MOQ_IOS_PREFLIGHT_ONLY     =1 -> resolve and verify the dependencies, report
+#                              their provenance, and exit before compiling
 #   MOQ_IOS_DEPLOYMENT_TARGET  min iOS version   (default: 16.0)
 #   MOQ_IOS_JOBS               parallel build jobs (default: hw.ncpu)
 #
@@ -118,12 +124,13 @@ if [ -n "${MOQ_WTQUIC_SOURCE_DIR:-}" ]; then
     log "WARNING: sources are NOT verified against the dependency pin"
     log "WARNING: ($wtquic_pin); the artifact is a local development"
     log "WARNING: build, not a pinned release build."
-elif [ -d "$repo_root/.deps/wtquic-ci/wtquic" ]; then
-    wtquic_src="$repo_root/.deps/wtquic-ci/wtquic"
+elif [ -d "${WTQUIC_DEPS_DIR:-$repo_root/.deps/wtquic-ci}/wtquic" ]; then
+    wtquic_src="${WTQUIC_DEPS_DIR:-$repo_root/.deps/wtquic-ci}/wtquic"
     wtquic_pinned=1
 else
-    die "pinned wtquic checkout not found; run scripts/setup_wtquic_deps.sh
-  (or set MOQ_WTQUIC_SOURCE_DIR as an explicit UNVERIFIED override)"
+    die "pinned wtquic checkout not found under ${WTQUIC_DEPS_DIR:-$repo_root/.deps/wtquic-ci};
+  run scripts/setup_wtquic_deps.sh (WTQUIC_DEPS_DIR selects where), or set
+  MOQ_WTQUIC_SOURCE_DIR as an explicit UNVERIFIED override"
 fi
 if [ "$wtquic_pinned" = 1 ]; then
     actual=$(git -C "$wtquic_src" rev-parse HEAD 2>/dev/null || echo unknown)
@@ -146,6 +153,14 @@ Remove/clean $wtquic_src (setup_wtquic_deps.sh re-materializes it), or
 set MOQ_WTQUIC_SOURCE_DIR explicitly for an unverified local build."
     fi
     log "wtquic pin verified: $wtquic_pin (clean checkout)"
+fi
+if [ "${MOQ_IOS_PREFLIGHT_ONLY:-0}" = 1 ]; then
+    if [ "$wtquic_pinned" = 1 ]; then
+        log "preflight: wtquic PINNED $wtquic_pin at $wtquic_src"
+    else
+        log "preflight: wtquic UNVERIFIED override at $wtquic_src"
+    fi
+    exit 0
 fi
 
 # OpenSSL prefix. Default: REQUIRE an iOS-built OpenSSL 3.x via

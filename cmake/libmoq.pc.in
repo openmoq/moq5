@@ -9,4 +9,4 @@ Name: libmoq
 Description: Sans-I/O Media over QUIC Transport library
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} @LIBMOQ_PC_LIBS@
-Cflags: -I${includedir}
+Cflags: -I${includedir}@LIBMOQ_PC_CFLAGS@

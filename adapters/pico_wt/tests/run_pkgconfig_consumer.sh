@@ -44,7 +44,14 @@ PQB="$WORK/pq-build"
 if [ -z "$PICOTLS_PREFIX" ]; then
     PICOTLS_PREFIX="$(cd "$PICOQUIC_SRC/../picotls/build" && pwd)"
 fi
-PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"
+# picotls as picoquic's child build looks for it: an installed prefix keeps
+# headers and libraries in include/ and lib/; a checkout build directory
+# holds the libraries itself, with the headers in ../include.
+if [ -f "$PICOTLS_PREFIX/include/picotls.h" ] && [ -d "$PICOTLS_PREFIX/lib" ]; then
+    PTLS_SRC="$PICOTLS_PREFIX"; PTLS_LIB="$PICOTLS_PREFIX/lib"
+else
+    PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"; PTLS_LIB="$PICOTLS_PREFIX"
+fi
 
 if ! command -v pkg-config >/dev/null 2>&1; then
     echo "FAIL: pkg-config not found"; exit 1
@@ -63,7 +70,7 @@ echo "== 1. install picoquic (BUILD_HTTP=ON) -> $P =="
     -DBUILD_PICO_SIM=OFF -Dpicoquic_BUILD_TESTS=OFF -DBUILD_LOGLIB=ON \
     -DCMAKE_INSTALL_PREFIX="$P" \
     -DPTLS_PREFIX="$PTLS_SRC" \
-    -DCMAKE_LIBRARY_PATH="$PICOTLS_PREFIX" \
+    -DCMAKE_LIBRARY_PATH="$PTLS_LIB" \
     "${ossl_arg[@]}" \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"

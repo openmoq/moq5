@@ -3,6 +3,7 @@
 #include "../bridge/transport_bridge_internal.h"
 #include "../internal/validate.h"
 #include "session_event_admission.h"
+#include "session_outbound_internal.h"
 
 /* Bounded backoff applied to the *reported* next deadline when a subgroup
  * delivery-timeout reset cannot be enqueued because the action queue is full.
@@ -912,6 +913,11 @@ size_t moq_session_action_capacity(const moq_session_t *s)
     if (!s) return 0;
     size_t used = s->action_tail - s->action_head;
     return used >= s->action_cap ? 0 : s->action_cap - used;
+}
+
+bool moq_session_has_pending_output(const moq_session_t *s)
+{
+    return s && session_has_outbound_obligation(s);
 }
 
 /* The scheduling record of a SEND_DATA action, from the stream it rides:

@@ -10,6 +10,7 @@
 - [Memory](memory.md) — Allocator contract, borrow/owned rules, scratch arena, receive budget, rcbuf ownership, FFI guidance
 - [Integration](integration.md) — Adapter loop, control/data byte feeding, action/event polling, cleanup obligations, backpressure retry
 - [Integration patterns](integration-patterns.md) — Service-tier and media patterns
+- [Media player](media-player.md) — Decode-order media for an application's decoders: outputs, selection and timelines, how a track ends, bounds
 - [Simulation](simulation.md) — SimPair, seeds, traces, OOM sweep, deterministic testing
 - [API Boundaries](api-boundaries.md) — Header tiers, naming policy, examples policy
 - [Publisher Retained Catalog Groups](publisher-retained-groups.md) — Origin-local cache support for catalog Joining FETCH, and what it does not guarantee through relays

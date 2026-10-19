@@ -14,6 +14,7 @@
 #include <moq/moq.h>
 #include <moq/pico_wt_managed.h>
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -36,10 +37,14 @@ static uint8_t big_byte(size_t i) { return (uint8_t)((i * 37u + 5u) % 255u + 1u)
 
 /* -- an allocator that counts, and can refuse one allocation ---------- */
 
-/* Global state: the facade is given a NULL allocator context. */
+/* Global state: the facade is given a NULL allocator context. The refused
+ * allocation is the first in range made off the creating thread: create's own
+ * allocations run on the caller, the SETUP buffer on the network thread,
+ * which may queue it before create returns. */
 static struct {
     atomic_long outstanding;      /* bytes allocated and not yet freed */
     atomic_int  armed;            /* refuse the next allocation in range */
+    pthread_t   creator;          /* made off this thread */
     atomic_int  refused;
     size_t      lo, hi;           /* the size range refused when armed */
 } g_ta;
@@ -47,7 +52,8 @@ static struct {
 static void *ta_alloc(size_t size, void *ctx)
 {
     (void)ctx;
-    if (size >= g_ta.lo && size <= g_ta.hi) {
+    if (size >= g_ta.lo && size <= g_ta.hi &&
+        !pthread_equal(pthread_self(), g_ta.creator)) {
         int one = 1;
         if (atomic_compare_exchange_strong(&g_ta.armed, &one, 0)) {
             atomic_fetch_add(&g_ta.refused, 1);
@@ -177,21 +183,22 @@ static void run_setup_alloc_failure(int port, const char *proto)
 {
     /* A 1000-byte value: draft-18 asks 32 + 1000 + 32 bytes for its SETUP,
      * draft-16 256 + the encoded token + 16; nothing else this client
-     * allocates after create falls in the range. */
+     * allocates off the creating thread falls in the range. */
     atomic_store(&g_ta.outstanding, 0);
     atomic_store(&g_ta.armed, 0);
     atomic_store(&g_ta.refused, 0);
     g_ta.lo = 1060;
     g_ta.hi = 1300;
+    g_ta.creator = pthread_self();
     moq_alloc_t alloc = { .alloc = ta_alloc, .realloc = ta_realloc, .free = ta_free,
                           .ctx = NULL };
     moq_auth_token_t tok = { 5, { g_big, 1000 } };
     moq_pico_wt_managed_cfg_t cfg;
     client_cfg(&cfg, &alloc, port, proto, &tok, 1);
     moq_pico_wt_managed_t *cli = NULL;
+    atomic_store(&g_ta.armed, 1);
     CHECK(moq_pico_wt_managed_create(&cfg, &cli) == MOQ_OK);
     if (!cli) return;
-    atomic_store(&g_ta.armed, 1);
     bool fatal = false;
     for (int i = 0; i < 200 && !fatal; i++) {
         moq_pico_wt_managed_wait(cli, 25000);

@@ -67,4 +67,46 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_playback_scenario PRIVATE moq-playback-test-internals)
     target_compile_definitions(test_playback_scenario PRIVATE MOQ_PLAYBACK_TESTING)
     add_test(NAME playback_scenario COMMAND test_playback_scenario)
+
+    add_executable(test_playback_input tests/test_playback_input.c)
+    target_link_libraries(test_playback_input PRIVATE
+        moq-playback-test-internals moq::loc)
+    target_compile_definitions(test_playback_input PRIVATE MOQ_PLAYBACK_TESTING)
+    add_test(NAME playback_input COMMAND test_playback_input)
+
+    add_executable(test_playback_parsed tests/test_playback_parsed.c)
+    target_link_libraries(test_playback_parsed PRIVATE
+        moq-playback-test-internals moq::loc)
+    target_compile_definitions(test_playback_parsed PRIVATE MOQ_PLAYBACK_TESTING)
+    add_test(NAME playback_parsed COMMAND test_playback_parsed)
+
+    add_executable(test_playback_admission tests/test_playback_admission.c)
+    target_link_libraries(test_playback_admission PRIVATE
+        moq-playback-test-internals moq::loc)
+    target_compile_definitions(test_playback_admission PRIVATE MOQ_PLAYBACK_TESTING)
+    add_test(NAME playback_admission COMMAND test_playback_admission)
+
+    add_executable(test_playback_facts tests/test_playback_facts.c)
+    target_link_libraries(test_playback_facts PRIVATE
+        moq-playback-test-internals moq::loc)
+    target_compile_definitions(test_playback_facts PRIVATE MOQ_PLAYBACK_TESTING)
+    add_test(NAME playback_facts COMMAND test_playback_facts)
+
+    add_executable(test_playback_drain tests/test_playback_drain.c)
+    target_link_libraries(test_playback_drain PRIVATE moq::playback moq::loc)
+    add_test(NAME playback_drain COMMAND test_playback_drain)
+
+    # Public-interface ABI rows against the production library, and the
+    # same rows compiled with -fshort-enums: the playback header's layout
+    # must not depend on the consumer's enum width.
+    add_executable(test_playback_abi tests/test_playback_abi.c)
+    target_link_libraries(test_playback_abi PRIVATE moq::playback)
+    add_test(NAME playback_abi COMMAND test_playback_abi)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        add_executable(test_playback_abi_short_enums tests/test_playback_abi.c)
+        target_link_libraries(test_playback_abi_short_enums PRIVATE moq::playback)
+        target_compile_options(test_playback_abi_short_enums PRIVATE -fshort-enums)
+        add_test(NAME playback_abi_short_enums
+                 COMMAND test_playback_abi_short_enums)
+    endif()
 endif()

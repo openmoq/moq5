@@ -131,10 +131,20 @@ typedef void (*moq_endpoint_hook_fn)(moq_endpoint_t *ep,
  *                      already cached during its pump: it MUST NOT re-enter the
  *                      endpoint, the session, the adapter, or the publisher/
  *                      receiver facade. NULL = the hook has no time-based
- *                      deadline. */
+ *                      deadline.
+ *   has_pending_output — optional; true while the hook owes outbound work its
+ *                      pump has not yet handed to the session (end-of-track
+ *                      markers, objects for a subscribed track, an unfinished
+ *                      write, an owed reset). Queried right after the hook's
+ *                      pump, inside the same pump cycle and under ep->mu, so
+ *                      moq_endpoint_drain() succeeds only once every hook is
+ *                      quiet as well as the transport. It may read the session
+ *                      facade (it runs where pump does) but must not block or
+ *                      re-enter the endpoint. NULL = the hook owes no output. */
 typedef struct moq_endpoint_hook_ops {
     moq_endpoint_hook_fn pump;
     uint64_t (*next_deadline_us)(void *ctx);
+    bool (*has_pending_output)(void *ctx);
 } moq_endpoint_hook_ops_t;
 
 moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,

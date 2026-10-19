@@ -10,6 +10,36 @@ should use. They use **only public headers** and link **`moq::service`** — no
   `auto_subscribe = true` (see *Subscription modes* below).
 - `media_send.c` — connect an endpoint, attach a sender, add a track, and write
   media objects (placeholder payloads; see the note below).
+- `media_player.c` — play a namespace through `moq_media_player`: track
+  selection, ordering and timing done for you, with decoder-ready access units
+  out (CONFIGURE / TIMELINE / UNIT / DISCONTINUITY / END). Built when the
+  playback engine is (`MOQ_BUILD_PLAYBACK=ON`). See *Receiver objects or
+  player access units?* below.
+
+### Receiver objects or player access units?
+
+Both read the same catalog and media; they differ in what they hand you.
+
+- **The receiver** (`media_receive.c`) gives you **objects**: every track the
+  catalog describes, any packaging (RAW/LOC, CMAF/CMSF, MPEG-TS), each object
+  with its timing metadata, in arrival order per track. You choose and
+  subscribe tracks, reorder, wait out gaps, map times to a clock and decide
+  when to present. Use it for remuxing, recording, relaying into another
+  framework that does its own buffering, or a packaging the player does not
+  play.
+- **The player** (`media_player.c`) gives you **access units for a decoder**:
+  RAW/LOC video (the units as published, e.g. H.264 Annex-B), and AAC-LC
+  (`mp4a.40.2`) or Opus audio. It selects tracks (AUTO plays one
+  catalog render group; MANUAL takes your selection), puts units in decode
+  order, settles gaps, losses and ends, maps each track onto a timeline and
+  says how every track ended. You feed its CONFIGURE to your decoder, its
+  UNITs to the decoder in order, and present at each unit's time on its
+  TIMELINE. The example has no decoder: it prints and checks the outputs,
+  and `--dump DIR` writes the encoded units and their boundaries to files,
+  which is not rendering.
+
+Both run on one owner thread of yours; see `docs/media-player.md` for the
+player's contracts.
 
 These C examples leave the media companion at its default, AUTO, which follows
 the draft the endpoint negotiates. On drafts 16/18 that is the legacy profile:
@@ -78,14 +108,22 @@ start point or priority would require the subscription to end first.
    `cfg->endpoint`.
 3. Drive from your own thread: receiver `poll_track` / `poll_object` / `wait`;
    sender `add_track` (before readiness) then `write`.
-4. Teardown, in order: destroy the child (`*_destroy`), then call
-   `moq_endpoint_drain(ep, timeout_us)` if you have reliable stream bytes that
-   should be flushed before shutdown, then `moq_endpoint_stop`, then
-   `moq_endpoint_destroy`. (`stop` refuses with `MOQ_ERR_WRONG_STATE` while a
-   child is still attached and remains an abrupt stop when you skip the drain.)
-   `moq_endpoint_drain` is a **local stream flush**: it waits until the transport
-   has no queued/ready reliable stream bytes or unsent FIN, not until packets
-   are ACKed or the peer application has consumed the media.
+4. Teardown, in order: for a finite publication, end its tracks
+   (`moq_media_sender_end_track`) and call `moq_endpoint_drain(ep, timeout_us)`
+   while the sender is **still attached** -- destroying it first discards what
+   it still has queued, end-of-track markers included -- then destroy the
+   child (`*_destroy`), then `moq_endpoint_stop`, then `moq_endpoint_destroy`.
+   (`stop` refuses with `MOQ_ERR_WRONG_STATE` while a child is still attached
+   and remains an abrupt stop when you skip the drain.) `moq_endpoint_drain`
+   succeeds once the attached services have handed over the output they owe
+   (media retained for a track nobody has subscribed to, and an end-of-track
+   marker queued behind it, are not owed; an accepted publication paused at
+   Forward 0 still owes its end, so its drain times out) and the
+   transport has flushed it: on the picoquic backends that also means the peer
+   has acknowledged every stream's sent bytes, FIN and RESET (MsQuic may wait
+   for acknowledgement too).
+   It is transport acknowledgement, not the peer application having consumed
+   the media.
 
 For WebTransport interop with deployed relays that negotiate WT but omit the
 `reset_stream_at` transport parameter required by draft-ietf-webtrans-http3, the
@@ -113,9 +151,12 @@ latch: every blocking call on the endpoint and its attachments returns
 
 For a finite stream (a file, a clip, a stopped capture) call
 `moq_media_sender_end_track(s, track)` to signal a clean end-of-stream. After the
-track's already-queued objects drain, the service emits a reliable
-`END_OF_TRACK` over a subgroup **stream** (not a QUIC datagram, so it does not
-depend on datagram negotiation). Receivers surface `MOQ_MEDIA_TRACK_ENDED` and
+track's already-queued objects drain, the service ends each subscription
+with a reliable `END_OF_TRACK` over a subgroup **stream** (not a QUIC datagram,
+so it does not depend on datagram negotiation). A track this sender published
+itself (`publish_tracks`) ends instead with its publication's completion,
+reporting that the track ended, after its streams close; how a relay carries
+that end on to its own subscribers is up to the relay. Receivers surface `MOQ_MEDIA_TRACK_ENDED` and
 `moq_media_receiver_track_state` returns `ENDED` — the EOS signal a
 GStreamer/FFmpeg/VLC/OBS integration forwards downstream, rather than treating
 connection teardown as the end. Ending one track does **not** end other tracks or
@@ -231,6 +272,9 @@ cmake --preset rc-static -DMOQ_BUILD_SERVICE=ON -DMOQ_BUILD_MSF=ON
 cmake --build build/rc-static --target moq_example_media_receive moq_example_media_send
 ```
 
+Add `-DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_PLAYBACK=ON` and the
+`moq_example_media_player` target for the player example.
+
 This builds the binaries, but with no transport facade compiled in `connect()`
 returns `MOQ_ERR_UNSUPPORTED` at runtime.
 
@@ -272,6 +316,26 @@ ffmpeg ... -f h264 pipe:1 \
   | ./build/rc-static/examples/service/moq_example_media_publish_loc \
       moqt://localhost:4433 example video --insecure-skip-verify
 ```
+
+Play what is published with the player example: AUTO selection, or name the
+tracks to play (each track without a catalog render group gets a timeline of
+its own):
+
+```
+./build/rc-static/examples/service/moq_example_media_player moqt://localhost:4433 example \
+    --insecure-skip-verify
+./build/rc-static/examples/service/moq_example_media_player moqt://localhost:4433 example \
+    --track video --track audio --seconds 60 --insecure-skip-verify
+```
+
+For a finite publication, `--finite --dump DIR` turns it into a check: it
+succeeds only if every track ends by the publisher's END_OF_TRACK with every
+location settled, and writes each track's units with their boundaries and
+decoder configurations. `scripts/check_media_player_dump.py` then decodes the
+dump and compares it with the published file, and
+`scripts/live_media_player_cases.sh` runs a table of such cases (drafts,
+transports, media, joins, interruption, publisher loss, decoder pressure)
+against a relay.
 
 ### Consuming an installed libmoq (Meson / pkg-config)
 

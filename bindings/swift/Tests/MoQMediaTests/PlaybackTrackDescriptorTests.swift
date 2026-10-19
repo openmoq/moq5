@@ -1,5 +1,8 @@
 import Testing
 import Foundation
+import CMoQLOC
+import CMoQCore
+@testable import MoQ
 @testable import MoQMedia
 
 // MARK: - CMAF Init Builders (minimal, for descriptor tests)
@@ -174,6 +177,51 @@ struct DescriptorLOCTests {
         #expect(desc.configuration.channelCount == 2)
         #expect(desc.codecKind == nil)
         #expect(desc.codecConfig == Data(asc))
+    }
+
+    @Test("Descriptor carries the negotiated version into the pipeline")
+    func locVersionReachesPipeline() throws {
+        let avcc: [UInt8] = [0x01, 0x64, 0x00, 0x28, 0xFF]
+        let track = MSFTrack(
+            name: "video-0", packaging: "loc", isLive: true,
+            role: "video", codec: "avc1.640028",
+            initData: Data(avcc).base64EncodedString(),
+            width: 1920, height: 1080)
+        #expect(try track.playbackDescriptor(transportVersion: .draft16)
+                    .configuration.wireVersion == .draft16)
+        let desc = try track.playbackDescriptor(transportVersion: .draft18)
+        #expect(desc.configuration.wireVersion == .draft18)
+
+        // A draft-18 LOC timestamp survives only the draft-18 codec.
+        let ts: UInt64 = 1_700_000_000_000_000
+        var h = moq_loc_headers_t()
+        moq_loc_headers_init(&h)
+        h.has_timestamp = true
+        h.timestamp = ts
+        h.has_video_frame_marking = true
+        h.video_frame_marking.independent = true
+        var p: OpaquePointer?
+        #expect(moq_loc_encode(moq_alloc_default()!, MOQ_VERSION_DRAFT_18,
+                               MOQ_LOC_PROFILE_01, &h, &p) == MOQ_OK)
+        let props = Buffer(adopting: p!)
+
+        let pb = try PlaybackPipeline(configuration: .init())
+        let pbTrack = try pb.addTrack(desc.configuration)
+        let obj = FacadeReceivedObject(
+            track: SubscribedTrack(OpaquePointer(bitPattern: 1)!),
+            groupID: 1, subgroupID: 0, objectID: 0,
+            publisherPriority: 128, status: .normal,
+            endOfGroup: false, isDatagram: false,
+            payload: try Buffer(Data([0x00, 0x00, 0x01, 0x65])),
+            properties: props)
+        try pb.push(object: obj, track: pbTrack, now: 0)
+        try pb.tick(now: 0)
+
+        var dts: UInt64?
+        try pb.drainCommands { cmd in
+            if case .decodeVideo(_, _, _, let d, _, _, _, _, _, _) = cmd { dts = d }
+        }
+        #expect(dts == ts)
     }
 }
 

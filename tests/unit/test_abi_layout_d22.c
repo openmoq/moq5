@@ -542,7 +542,22 @@ PIN_THROUGH(moq_sub_cfg_t, surface_group_ends, 120, 80, 88, 8, 4, 8);
 PIN_AFTER(moq_sub_cfg_t, surface_group_ends, max_fills);
 PIN_AT(moq_sub_cfg_t, max_fills, 120, 80, 88);
 PIN_AT(moq_sub_cfg_t, max_fill_items, 124, 84, 92);
-PIN_SIZE(moq_sub_cfg_t, 128, 88, 96);
+/* The stream-terminal block starts at the complete sizeof through
+ * max_fill_items (128/88/96), which has no tail padding. */
+PIN_THROUGH(moq_sub_cfg_t, max_fill_items, 128, 88, 96, 8, 4, 8);
+PIN_AFTER(moq_sub_cfg_t, max_fill_items, max_stream_terminals);
+PIN_AT(moq_sub_cfg_t, max_stream_terminals, 128, 88, 96);
+PIN_AT(moq_sub_cfg_t, surface_stream_terminals, 132, 92, 100);
+PIN_SIZE(moq_sub_cfg_t, 136, 96, 104);
+PIN_AT(moq_sub_stream_terminal_t, track, 8, 8, 8);
+PIN_AT(moq_sub_stream_terminal_t, group_id, 16, 12, 16);
+PIN_AT(moq_sub_stream_terminal_t, subgroup_id, 24, 20, 24);
+PIN_AT(moq_sub_stream_terminal_t, error_code, 32, 28, 32);
+PIN_AT(moq_sub_stream_terminal_t, has_last_object, 40, 36, 40);
+PIN_AT(moq_sub_stream_terminal_t, has_cut_object, 41, 37, 41);
+PIN_AT(moq_sub_stream_terminal_t, last_object_id, 48, 44, 48);
+PIN_AT(moq_sub_stream_terminal_t, cut_object_id, 56, 52, 56);
+PIN_SIZE(moq_sub_stream_terminal_t, 64, 60, 64);
 PIN_AT(moq_sub_track_cfg_t, location, 64, 36, 36);
 PIN_AT(moq_sub_track_cfg_t, fill, 72, 40, 40);
 PIN_AT(moq_sub_track_cfg_t, rendezvous_timeout_ms, 80, 44, 44);
@@ -775,6 +790,13 @@ PIN_SIZE(moq_endpoint_cfg_t, 200,
 #endif
 
 #ifdef ABI_HAVE_MEDIA_RECEIVER
+/* The v0 event ends after config_generation; the UPDATE_OK block follows
+ * the reserved spacer: at the old sizeof on LP64, past it on 32-bit. */
+PIN_AT(moq_media_track_event_t, desc, 16, 12, 12);
+PIN_AT(moq_media_track_event_t, config_generation, 24, 16, 16);
+PIN_AT(moq_media_track_event_t, _reserved_track_ev, 28, 20, 20);
+PIN_AT(moq_media_track_event_t, has_largest, 32, 24, 24);
+PIN_AT(moq_media_track_event_t, largest_group, 40, 28, 32);
 PIN_THROUGH(moq_media_track_event_t, _reserved_local_failure, 104, 84, 96, 8, 4, 8);
 PIN_AFTER(moq_media_track_event_t, _reserved_local_failure, initiating_request_id);
 PIN_AT(moq_media_track_event_t, initiating_request_id, 104, 84, 96);
@@ -794,7 +816,12 @@ PIN_AT(moq_media_track_event_t, fill_unreported_loss_causes, 144, 124, 136);
 PIN_AT(moq_media_track_event_t, _reserved_fill_loss, 148, 128, 140);
 PIN_AT(moq_media_track_event_t, fill_unreported_loss_group, 152, 132, 144);
 PIN_AT(moq_media_track_event_t, fill_unreported_loss_object, 160, 140, 152);
-PIN_SIZE(moq_media_track_event_t, 168, 148, 160);
+PIN_THROUGH(moq_media_track_event_t, fill_unreported_loss_object,
+            168, 148, 160, 8, 4, 8);
+PIN_AFTER(moq_media_track_event_t, fill_unreported_loss_object, has_done_status);
+PIN_AT(moq_media_track_event_t, has_done_status, 168, 148, 160);
+PIN_AT(moq_media_track_event_t, done_status, 176, 156, 168);
+PIN_SIZE(moq_media_track_event_t, 184, 164, 176);
 #endif
 #ifdef ABI_HAVE_SIM
 PIN_AT(moq_simpair_cfg_t, server_defer_subscription_updates, 168, 136, 152);
@@ -970,7 +997,40 @@ PIN_THROUGH(moq_media_receiver_cfg_t, mpeg2ts_join_psi,
 PIN_AFTER(moq_media_receiver_cfg_t, mpeg2ts_join_psi, companion_profile);
 PIN_AT(moq_media_receiver_cfg_t, companion_profile,
        104, 72 - ABI_RECEIVER_ENUM_SHIFT, 80);
-PIN_SIZE(moq_media_receiver_cfg_t, 112, 76 - ABI_RECEIVER_ENUM_SHIFT, 88);
+/* The stream-terminal block starts at the complete sizeof through
+ * companion_profile (112 LP64, 76 i386, 88 ARM), past its tail padding,
+ * which the reserved spacer covers. */
+PIN_THROUGH(moq_media_receiver_cfg_t, companion_profile,
+            112, 76 - ABI_RECEIVER_ENUM_SHIFT, 88, 8, 4, 8);
+PIN_AFTER(moq_media_receiver_cfg_t, companion_profile, max_stream_terminals);
+PIN_AT(moq_media_receiver_cfg_t, max_stream_terminals,
+       112, 80 - ABI_RECEIVER_ENUM_SHIFT, 88);
+PIN_AT(moq_media_receiver_cfg_t, surface_stream_terminals,
+       116, 84 - ABI_RECEIVER_ENUM_SHIFT, 92);
+PIN_SIZE(moq_media_receiver_cfg_t, 120, 88 - ABI_RECEIVER_ENUM_SHIFT, 96);
+/* The descriptor's render-group block starts at the complete sizeof
+ * through alt_group. */
+PIN_THROUGH(moq_media_track_desc_t, alt_group, 512, 356, 368, 8, 4, 8);
+PIN_AFTER(moq_media_track_desc_t, alt_group, has_render_group);
+PIN_AT(moq_media_track_desc_t, has_render_group, 512, 356, 368);
+PIN_AT(moq_media_track_desc_t, render_group, 516, 360, 372);
+PIN_AT(moq_media_track_desc_t, has_label, 520, 364, 376);
+PIN_SIZE(moq_media_track_desc_t, 528, 368, 384);
+PIN_AT(moq_media_receiver_info_t, max_bytes, 16, 16, 16);
+PIN_AT(moq_media_receiver_info_t, companion_profile, 28, 28, 28);
+PIN_AT(moq_media_receiver_info_t, track_events_polled, 40, 40, 40);
+PIN_SIZE(moq_media_receiver_info_t, 48, 48, 48);
+PIN_AT(moq_media_stream_terminal_t, track, 8, 8, 8);
+PIN_AT(moq_media_stream_terminal_t, group_id, 16, 12, 16);
+PIN_AT(moq_media_stream_terminal_t, object_id, 32, 28, 32);
+PIN_AT(moq_media_stream_terminal_t, last_group_id, 40, 36, 40);
+PIN_AT(moq_media_stream_terminal_t, error_code, 48, 44, 48);
+PIN_AT(moq_media_stream_terminal_t, has_last_object, 56, 52, 56);
+PIN_AT(moq_media_stream_terminal_t, delivery_origin, 60, 56, 60);
+PIN_AT(moq_media_stream_terminal_t, last_object_id, 64, 60, 64);
+PIN_AT(moq_media_stream_terminal_t, cut_object_id, 72, 68, 72);
+PIN_AT(moq_media_stream_terminal_t, initiating_request_id, 80, 76, 80);
+PIN_SIZE(moq_media_stream_terminal_t, 88, 84, 88);
 /* The other appends after the MPEG2TS fields start past the complete
  * sizeof of the layout before them. */
 PIN_AFTER(moq_media_receiver_track_subscribe_cfg_t, mpeg2ts_program_number, location);

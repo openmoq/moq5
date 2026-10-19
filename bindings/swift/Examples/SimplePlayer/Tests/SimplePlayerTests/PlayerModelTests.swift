@@ -1,5 +1,6 @@
-// Load-bearing model tests: the endpoint-configuration mapping (backend
-// selection, the .wtquicNetwork CA-file suppression) and the PHASE-AWARE
+// Load-bearing model tests: the watch-configuration mapping (backend
+// selection, the .wtquicNetwork CA-file suppression, the player's companion
+// profile and startup cushion) and the PHASE-AWARE
 // unsupported messaging (pre-establishment backend/config rejection vs
 // post-establishment unsupported media). Pure model logic: no
 // connection is ever attempted.
@@ -26,7 +27,7 @@ final class PlayerModelTests: XCTestCase {
         let cfg = m.makeWatchConfiguration(url: URL(string: "moqt://relay.example:4443")!)
         XCTAssertEqual(cfg.endpoint.versions, .automatic)
         XCTAssertEqual(cfg.endpoint.wireVersions, .list([.draft22]))
-        XCTAssertEqual(cfg.companionProfile, .draft22MSF01LOC04Public)
+        XCTAssertEqual(cfg.player.companionProfile, .draft22MSF01LOC04Public)
         XCTAssertNil(cfg.endpoint.preferredVersion)
         XCTAssertNil(cfg.endpoint.preferredWireVersion)
     }
@@ -37,8 +38,10 @@ final class PlayerModelTests: XCTestCase {
         let cfg = m.makeWatchConfiguration(url: URL(string: "moqt://relay.example:4443")!)
         XCTAssertEqual(cfg.endpoint.versions, .automatic)
         XCTAssertNil(cfg.endpoint.wireVersions)
-        XCTAssertEqual(cfg.companionProfile, .legacyMSF01LOC01)
+        XCTAssertEqual(cfg.player.companionProfile, .legacyMSF01LOC01)
         XCTAssertEqual(cfg.establishmentTimeout, .seconds(15))
+        XCTAssertEqual(cfg.player.selection, .automatic)
+        XCTAssertEqual(cfg.player.cushion, .milliseconds(300))
     }
 
     func testLegacySelectionsKeepTheirOfferAndCompanion() {
@@ -49,7 +52,7 @@ final class PlayerModelTests: XCTestCase {
             let cfg = m.makeWatchConfiguration(url: URL(string: "moqt://relay.example:4443")!)
             XCTAssertEqual(cfg.endpoint.versions, .list([version]))
             XCTAssertNil(cfg.endpoint.wireVersions)
-            XCTAssertEqual(cfg.companionProfile, .legacyMSF01LOC01)
+            XCTAssertEqual(cfg.player.companionProfile, .legacyMSF01LOC01)
         }
     }
 
@@ -138,30 +141,40 @@ final class PlayerModelTests: XCTestCase {
         XCTAssertFalse(message.contains("transport configuration"))
     }
 
-    // MARK: The coalescing path
+    // MARK: The establishment latch
 
-    /// `stateUpdates()` buffers only the newest state, so `.established`
-    /// can be coalesced away entirely: the model must classify a later
-    /// media `.unsupported` from any establishment-IMPLYING state, never
-    /// from having literally observed `.established`.
-    func testCoalescedEstablishmentStillClassifiesMediaFailure() {
+    /// A media `.unsupported` is classified from any establishment-IMPLYING
+    /// phase, never from having literally observed `.established`.
+    func testImpliedEstablishmentStillClassifiesMediaFailure() {
         let m = model(backend: .wtquicNetwork)
         _ = m.apply(.connecting)
-        // .established was coalesced away; the newest state implies it
-        _ = m.apply(.awaitingCatalog)
+        // no .established: the later phase implies it
+        _ = m.apply(.waitingForMedia)
         _ = m.apply(.failed(.unsupported))
         guard case .failed(let message) = m.state else {
             return XCTFail("expected .failed, got \(m.state)")
         }
         XCTAssertTrue(message.contains("media format"),
-                      "coalesced establishment misclassified: \(message)")
+                      "implied establishment misclassified: \(message)")
     }
 
     /// And a genuinely pre-establishment failure still blames the
     /// transport configuration (the latch resets per watch).
+    /// A catalog with nothing playable fails the watch with its own message.
+    func testNoPlayableTracksFailsTheWatch() {
+        let m = model(backend: .picoquic)
+        _ = m.apply(.waitingForMedia)
+        XCTAssertTrue(m.apply(.noPlayableTracks))
+        guard case .failed(let message) = m.state else {
+            return XCTFail("expected .failed, got \(m.state)")
+        }
+        XCTAssertTrue(message.contains("No playable track"))
+        XCTAssertFalse(m.isRunning)
+    }
+
     func testConnectPhaseFailureStillBlamesConfiguration() {
         let m = model(backend: .wtquicNetwork)
-        _ = m.apply(.awaitingCatalog)          // stale prior watch
+        _ = m.apply(.waitingForMedia)          // stale prior watch
         _ = m.apply(.connecting)               // new watch resets the latch
         _ = m.apply(.failed(.unsupported))
         guard case .failed(let message) = m.state else {
@@ -171,23 +184,21 @@ final class PlayerModelTests: XCTestCase {
                       "pre-establishment misclassified: \(message)")
     }
 
-    /// The hard coalescing case: the NEW watch's `.connecting` is itself
-    /// coalesced away (bufferingNewest(1) keeps only the newest state),
-    /// so the connect() call's SYNCHRONOUS reset is the only thing that
-    /// can clear the prior watch's establishment latch — a
-    /// pre-establishment failure of the new watch must still blame the
-    /// transport configuration.
-    func testSynchronousResetSurvivesCoalescedConnecting() {
+    /// A new watch can fail before it reports `.connecting`, so the
+    /// connect() call's SYNCHRONOUS reset is what clears the prior watch's
+    /// establishment latch: a pre-establishment failure of the new watch
+    /// must still blame the transport configuration.
+    func testSynchronousResetSurvivesUnreportedConnecting() {
         let m = model(backend: .wtquicNetwork)
-        _ = m.apply(.awaitingCatalog)          // prior watch established
-        m.beginWatchUIState()                  // what connect() runs pre-start()
+        _ = m.apply(.waitingForMedia)          // prior watch established
+        m.beginWatchUIState()                  // what connect() runs first
         // no .connecting is ever applied: straight to the failure
         _ = m.apply(.failed(.unsupported))
         guard case .failed(let message) = m.state else {
             return XCTFail("expected .failed, got \(m.state)")
         }
         XCTAssertTrue(message.contains("transport configuration"),
-                      "coalesced .connecting misclassified: \(message)")
+                      "unreported .connecting misclassified: \(message)")
         XCTAssertFalse(message.contains("media format"))
     }
 }

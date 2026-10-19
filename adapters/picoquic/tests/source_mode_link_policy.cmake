@@ -28,6 +28,10 @@
 # Args (-D): SRC (repo root), WORK (scratch dir), PQ_SRC (picoquic source),
 # PTLS_PREFIX (picotls build); optional C_COMPILER, CXX_COMPILER, GENERATOR.
 
+# A -P script starts with no policies set; this sets the project's, so its
+# if(IN_LIST) and friends mean the same on every supported CMake.
+cmake_minimum_required(VERSION 3.20)
+
 foreach(_v SRC WORK PQ_SRC PTLS_PREFIX)
     if(NOT DEFINED ${_v})
         message(FATAL_ERROR "pass -D${_v}=<path>")

@@ -249,6 +249,7 @@ jobs:
             -DMOQ_BUILD_TESTS=OFF \
             -DMOQ_BUILD_MSF=ON \
             -DMOQ_BUILD_MEDIA_OBJECT=ON \
+            -DMOQ_BUILD_PLAYBACK=ON \
             -DMOQ_BUILD_SERVICE=ON \
             -DMOQ_BUILD_ADAPTER_PICOQUIC=ON \
             -DMOQ_BUILD_PQ_THREADED=ON \
@@ -412,9 +413,13 @@ jobs:
 
       # Prove the binary lane: MoQService compiles for the iOS simulator against
       # the xcframeworks (`import CMoQService` resolves from LibMoQ.xcframework).
+      # These iOS builds run the toolchain's swift rather than the xcrun shim:
+      # the shim exports SDKROOT for the macOS SDK, which the final link's
+      # clang then prefers over the simulator --sysroot
+      # (-Wincompatible-sysroot).
       - name: Build MoQService (iOS simulator)
         run: >
-          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
+          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 env -u SDKROOT "$(xcrun --find swift)" build
           --triple arm64-apple-ios16.0-simulator
           --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
           --target MoQService
@@ -425,7 +430,7 @@ jobs:
       - name: Consumer cold-build smoke (iOS simulator)
         run: >
           cd bindings/swift/Tests/fixtures/ServiceConsumer &&
-          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
+          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 env -u SDKROOT "$(xcrun --find swift)" build
           --triple arm64-apple-ios16.0-simulator
           --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
 
@@ -436,7 +441,7 @@ jobs:
       - name: SimplePlayer example build (iOS simulator)
         run: >
           cd bindings/swift/Examples/SimplePlayer &&
-          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 swift build
+          MOQ_SERVICE=1 MOQ_SERVICE_IOS=1 env -u SDKROOT "$(xcrun --find swift)" build
           --triple arm64-apple-ios16.0-simulator
           --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)"
 

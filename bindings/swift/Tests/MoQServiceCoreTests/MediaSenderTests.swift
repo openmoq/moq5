@@ -50,6 +50,21 @@ private func frame(_ bytes: [UInt8], sync: Bool = false) -> OutgoingObject {
 struct SenderAttachTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Closing a sender again never removes a later sender's hook")
+    func closeAgainKeepsTheLaterHook() async throws {
+        let rig = try makeSenderRig()
+        await rig.sender.close()
+        let laterBackend = ScriptedSenderBackend()
+        let later = try MediaSender.attach(
+            to: rig.endpoint, configuration: .live(namespace: "live/x"),
+            backend: laterBackend)
+        await rig.sender.close()                   /* again: a no-op */
+        await rig.endpoint.close()
+        #expect(laterBackend.snapshot().detachCalls == 1)
+        _ = later
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("One sender per endpoint; close frees the slot; public attach is TODO")
     func attachSlot() async throws {
         let rig = try makeSenderRig()

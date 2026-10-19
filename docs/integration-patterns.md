@@ -379,21 +379,59 @@ moq_playback_track_cfg_t ptc; moq_playback_track_cfg_init(&ptc);
 ptc.media_type = MOQ_PLAYBACK_MEDIA_VIDEO;
 ptc.packaging  = MOQ_PLAYBACK_PACKAGING_CMAF;
 ptc.timescale  = 90000;
+ptc.transport_version = (uint32_t)moq_session_version(session);
 if (moq_playback_add_track(rx->playback, &ptc, &rx->pb_track) != MOQ_OK)
     return 1;
 
-/* Feed objects in on_lane_pump. */
-moq_playback_push_sub_object(rx->playback, rx->pb_track,
-    &sub_object, now);  /* returns MOQ_OK or error */
+/* One pump step. rx->video_track is the media track's subscription, made
+ * once the catalog names the track; rx->pb_track is its playback track.
+ * The queues are bounded and every refusal is
+ * MOQ_ERR_WOULD_BLOCK with nothing taken, so the step drains first and
+ * retries; a held subscriber object stays owned by the caller until the
+ * push accepts it. */
+static int pump_playback(rx_t *rx, uint64_t now)
+{
+    /* Drain both queues. Commands own rcbuf refs (e.g. a DECODE payload);
+     * the queue consumer calls moq_playback_cmd_cleanup(&cmd) after use. */
+    moq_playback_cmd_t cmd;
+    while (moq_playback_poll_command(rx->playback, &cmd, sizeof(cmd)) == MOQ_OK)
+        app_queue_push(&rx->cmd_queue, &cmd);
+    moq_playback_event_t ev;
+    while (moq_playback_poll_event(rx->playback, &ev, sizeof(ev)) == MOQ_OK)
+        app_log_playback_event(&ev);   /* drops, gaps, track end */
 
-/* Tick and drain commands. */
-moq_playback_tick(rx->playback, now);
-moq_playback_cmd_t cmd;
-while (moq_playback_poll_command(rx->playback, &cmd) == MOQ_OK) {
-    app_queue_push(&rx->cmd_queue, &cmd);
-    /* Commands own rcbuf refs (e.g. DECODE payload).
-     * The queue consumer must call moq_playback_cmd_cleanup(&cmd)
-     * after processing each command. */
+    /* Push the held object (if any), then new ones. Only objects of the
+     * media track reach playback: the catalog and any other track are
+     * routed first, and only a media object is ever held for retry. */
+    while (rx->have_held || moq_sub_poll_object(rx->sub, &rx->held) == MOQ_OK) {
+        if (!rx->have_held) {
+            if (rx->held.track == rx->catalog_track)
+                handle_catalog(rx, &rx->held, now);
+            if (rx->held.track != rx->video_track) {
+                moq_sub_object_cleanup(&rx->held);
+                continue;
+            }
+            rx->have_held = true;
+        }
+        moq_result_t rc = moq_playback_push_sub_object(rx->playback,
+                                                       rx->pb_track,
+                                                       &rx->held, now);
+        if (rc == MOQ_ERR_WOULD_BLOCK)
+            break;                      /* keep it; retry next step */
+        moq_sub_object_cleanup(&rx->held);
+        rx->have_held = false;
+        if (rc != MOQ_OK)
+            return -1;                  /* caller error or ended track */
+    }
+
+    /* tick may have released some objects before it returns WOULD_BLOCK;
+     * that progress stands. It also makes room for a refused push when
+     * tracks still waiting for a keyframe fill the buffer. Drain on the
+     * next step and tick again. */
+    moq_result_t trc = moq_playback_tick(rx->playback, now);
+    if (trc != MOQ_OK && trc != MOQ_ERR_WOULD_BLOCK)
+        return -1;
+    return 0;
 }
 ```
 

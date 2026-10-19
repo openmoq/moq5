@@ -344,39 +344,19 @@ extension MediaObject {
     /// The media bytes as a `CMBlockBuffer` (COPIED into CoreMedia-owned
     /// memory; the returned buffer does not keep this object alive).
     public func makeBlockBuffer() throws -> CMBlockBuffer {
-        try withUnsafeMediaBytes { raw in
-            var block: CMBlockBuffer?
-            var status = CMBlockBufferCreateWithMemoryBlock(
-                allocator: kCFAllocatorDefault,
-                memoryBlock: nil,
-                blockLength: raw.count,
-                blockAllocator: kCFAllocatorDefault,
-                customBlockSource: nil,
-                offsetToData: 0,
-                dataLength: raw.count,
-                flags: kCMBlockBufferAssureMemoryNowFlag,
-                blockBufferOut: &block)
-            guard status == noErr, let block else {
-                throw MoQServiceError.internalError(status)
-            }
-            if let base = raw.baseAddress, raw.count > 0 {
-                status = CMBlockBufferReplaceDataBytes(
-                    with: base, blockBuffer: block,
-                    offsetIntoDestination: 0, dataLength: raw.count)
-                guard status == noErr else {
-                    throw MoQServiceError.internalError(status)
-                }
-            }
-            return block
-        }
+        try withUnsafeMediaBytes { try makeCopiedBlockBuffer($0) }
     }
 
     /// One-sample `CMSampleBuffer` for a RAW/LOC object (one access unit
     /// per object, the LOC contract), ready for
     /// `AVSampleBufferDisplayLayer`/`AVSampleBufferAudioRenderer` flows.
     ///
-    /// Timing: pts/dts from the object's timestamps (µs timescale). Video
-    /// duration derives from the track's `framerateMillis` when present;
+    /// Timing: pts from the object's presentation time (µs timescale); dts
+    /// `.invalid`, since LOC carries no decode timestamp (the object's decode
+    /// time copies its LOC media time and can decrease with frame
+    /// reordering), so samples are enqueued in object order, which is decode
+    /// order. Video duration derives from the track's `framerateMillis` when
+    /// present;
     /// audio duration is always `.invalid` (the model carries no audio
     /// sample timing, and video framerate must never be applied to audio).
     /// Non-keyframe VIDEO samples carry NotSync/DependsOnOthers
@@ -414,34 +394,252 @@ extension MediaObject {
                 value: Int64(1_000_000_000 / framerateMillis),
                 timescale: 1_000_000)
         }
-        var timing = CMSampleTimingInfo(
+        let timing = CMSampleTimingInfo(
             duration: duration,
             presentationTimeStamp: presentationTime.cmTime,
-            decodeTimeStamp: decodeTime.cmTime)
-        var sampleSize = CMBlockBufferGetDataLength(block)
+            decodeTimeStamp: decodeTimeStamp(decodeTime, packaging: track.description.packaging))
+        return try makeSingleSampleBuffer(
+            block: block, formatDescription: formatDescription, timing: timing,
+            nonSyncVideo: mediaType == kCMMediaType_Video && !isKeyframe)
+    }
+}
 
-        var sample: CMSampleBuffer?
-        let status = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: block,
-            formatDescription: formatDescription,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
-            sampleBufferOut: &sample)
-        guard status == noErr, let sample else {
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension PlayerDecoderConfiguration {
+
+    /// A `CMFormatDescription` for this configuration (H.264, HEVC or AAC,
+    /// under the same strict extradata policy as
+    /// ``TrackDescription/makeFormatDescription(codecConfig:)``). Throws
+    /// ``MoQServiceError/unsupported`` for another codec family or media
+    /// type, and ``MoQServiceError/invalidArgument(_:)`` when the stream
+    /// carries no decoder configuration.
+    public func makeFormatDescription() throws -> CMFormatDescription {
+        guard let mediaType else { throw MoQServiceError.unsupported }
+        guard let codecConfig else {
+            throw MoQServiceError.invalidArgument(
+                "the configuration carries no decoder configuration")
+        }
+        var description = track.description
+            ?? TrackDescription(name: track.name ?? "", mediaType: mediaType, packaging: .raw)
+        description.mediaType = mediaType
+        description.codec = codec
+        description.width = width ?? description.width
+        description.height = height ?? description.height
+        description.samplerate = sampleRate ?? description.samplerate
+        if let channelCount { description.channelConfig = String(channelCount) }
+        return try description.makeFormatDescription(codecConfig: codecConfig)
+    }
+}
+
+/// How a video unit's NAL units are delimited in its bytes. LOC allows
+/// either for H.264 and HEVC (LOC-04 §2.1); which one a unit uses is a
+/// property of its source, decided by the caller.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public enum NALFraming: Sendable, Hashable {
+    /// Use the bytes as they are: big-endian lengths of the width the
+    /// format description's avcC / hvcC declares.
+    case lengthPrefixed
+    /// The bytes are an Annex-B stream (3- or 4-byte start codes); each
+    /// start code is rewritten as a big-endian length of the width the
+    /// format description's avcC / hvcC declares (1, 2 or 4 bytes), so the
+    /// bytes and their description agree.
+    case annexB
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+extension PlayerUnit {
+
+    /// A one-sample `CMSampleBuffer` (bytes COPIED) with this unit's
+    /// presentation time in media time, and its decode time where the
+    /// packaging has a decode clock: on RAW/LOC the decode timestamp is
+    /// `.invalid` (the unit's `decodeTime` copies its LOC media time), and
+    /// units are enqueued in output order, which is decode order. Present it on the player's
+    /// clock through its ``PlayerTimeline``. A video unit that is not
+    /// independent carries NotSync/DependsOnOthers. `framing` names how the
+    /// unit's NAL units are delimited; `.annexB` rewrites them, and throws
+    /// ``MoQServiceError/invalidArgument(_:)`` for bytes that do not begin
+    /// with a start code, for a description that is not H.264 or HEVC
+    /// (avcC / hvcC), and for a NAL unit longer than the description's
+    /// length width can express.
+    public func makeSampleBuffer(
+        formatDescription: CMFormatDescription,
+        framing: NALFraming = .lengthPrefixed) throws -> CMSampleBuffer {
+        let bytes: Data
+        switch framing {
+        case .lengthPrefixed:
+            bytes = data
+        case .annexB:
+            guard let width = nalLengthSize(of: formatDescription) else {
+                throw MoQServiceError.invalidArgument(
+                    "Annex-B units need an H.264 or HEVC description (avcC / hvcC)")
+            }
+            guard let converted = lengthPrefixedNALs(fromAnnexB: data) else {
+                throw MoQServiceError.invalidArgument(
+                    "the unit does not begin with an Annex-B start code")
+            }
+            guard let fitted = converted.width(width) else {
+                throw MoQServiceError.invalidArgument(
+                    "a NAL unit is longer than the description's \(width)-byte lengths")
+            }
+            bytes = fitted
+        }
+        let block = try bytes.withUnsafeBytes { try makeCopiedBlockBuffer($0) }
+        let timing = CMSampleTimingInfo(
+            duration: sampleDuration?.cmTime ?? .invalid,
+            presentationTimeStamp: presentationTime.cmTime,
+            decodeTimeStamp: decodeTimeStamp(decodeTime, packaging: track.description?.packaging))
+        let video = CMFormatDescriptionGetMediaType(formatDescription) == kCMMediaType_Video
+        return try makeSingleSampleBuffer(
+            block: block, formatDescription: formatDescription, timing: timing,
+            nonSyncVideo: video && isIndependent == false)
+    }
+}
+
+/// The NAL length width an avcC or hvcC description declares
+/// (lengthSizeMinusOne + 1: 1, 2 or 4 bytes); nil for any other
+/// description, or a width that is not one of those.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func nalLengthSize(of description: CMFormatDescription) -> Int? {
+    let atoms = CMFormatDescriptionGetExtension(
+        description, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms)
+        as? NSDictionary
+    let size: Int
+    switch CMFormatDescriptionGetMediaSubType(description) {
+    case kCMVideoCodecType_H264:
+        guard let avcC = atoms?["avcC"] as? Data, avcC.count > 4 else { return nil }
+        size = Int(avcC[avcC.startIndex + 4] & 0x03) + 1
+    case kCMVideoCodecType_HEVC:
+        guard let hvcC = atoms?["hvcC"] as? Data, hvcC.count > 21 else { return nil }
+        size = Int(hvcC[hvcC.startIndex + 21] & 0x03) + 1
+    default:
+        return nil
+    }
+    return size == 3 ? nil : size
+}
+
+/// The NAL units of an Annex-B stream, start codes removed.
+struct LengthPrefixedNALs: Equatable {
+    let units: [Data]
+
+    /// The units with `width`-byte big-endian lengths; nil when one is too
+    /// long for the width.
+    func width(_ width: Int) -> Data? {
+        let limit: UInt64 = width >= 4 ? UInt64(UInt32.max) : (UInt64(1) << (8 * width)) - 1
+        var out = Data()
+        for unit in units {
+            let length = UInt64(unit.count)
+            guard length <= limit else { return nil }
+            for k in stride(from: width - 1, through: 0, by: -1) {
+                out.append(UInt8(truncatingIfNeeded: length >> (8 * UInt64(k))))
+            }
+            out.append(unit)
+        }
+        return out
+    }
+}
+
+/// Split an Annex-B byte stream at its start codes (3- or 4-byte); nil
+/// when it does not begin with one.
+func lengthPrefixedNALs(fromAnnexB annexB: Data) -> LengthPrefixedNALs? {
+    let bytes = [UInt8](annexB)
+    /* (start code offset, NAL offset) of every start code. */
+    var codes: [(code: Int, nal: Int)] = []
+    var i = 0
+    while i + 3 <= bytes.count {
+        if bytes[i] == 0, bytes[i + 1] == 0 {
+            if bytes[i + 2] == 1 {
+                codes.append((i, i + 3))
+                i += 3
+                continue
+            }
+            if i + 4 <= bytes.count, bytes[i + 2] == 0, bytes[i + 3] == 1 {
+                codes.append((i, i + 4))
+                i += 4
+                continue
+            }
+        }
+        i += 1
+    }
+    guard let first = codes.first, first.code == 0 else { return nil }
+    var units: [Data] = []
+    units.reserveCapacity(codes.count)
+    for (k, code) in codes.enumerated() {
+        let end = k + 1 < codes.count ? codes[k + 1].code : bytes.count
+        units.append(Data(bytes[code.nal..<end]))
+    }
+    return LengthPrefixedNALs(units: units)
+}
+
+/// `raw` COPIED into a CoreMedia-owned block buffer.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func makeCopiedBlockBuffer(_ raw: UnsafeRawBufferPointer) throws -> CMBlockBuffer {
+    var block: CMBlockBuffer?
+    var status = CMBlockBufferCreateWithMemoryBlock(
+        allocator: kCFAllocatorDefault,
+        memoryBlock: nil,
+        blockLength: raw.count,
+        blockAllocator: kCFAllocatorDefault,
+        customBlockSource: nil,
+        offsetToData: 0,
+        dataLength: raw.count,
+        flags: kCMBlockBufferAssureMemoryNowFlag,
+        blockBufferOut: &block)
+    guard status == noErr, let block else {
+        throw MoQServiceError.internalError(status)
+    }
+    if let base = raw.baseAddress, raw.count > 0 {
+        status = CMBlockBufferReplaceDataBytes(
+            with: base, blockBuffer: block,
+            offsetIntoDestination: 0, dataLength: raw.count)
+        guard status == noErr else {
             throw MoQServiceError.internalError(status)
         }
-
-        if mediaType == kCMMediaType_Video && !isKeyframe,
-           let attachments = CMSampleBufferGetSampleAttachmentsArray(
-               sample, createIfNecessary: true) as? [NSMutableDictionary],
-           let first = attachments.first {
-            first[kCMSampleAttachmentKey_NotSync] = kCFBooleanTrue
-            first[kCMSampleAttachmentKey_DependsOnOthers] = kCFBooleanTrue
-        }
-        return sample
     }
+    return block
+}
+
+/// The CoreMedia decode timestamp for a sample of `packaging`. CMAF's decode
+/// time is its tfdt/trun decode clock. RAW (LOC) has no decode timestamp:
+/// its decode time is a copy of the LOC media time, which can decrease in
+/// decode order with B-frames, so the sample says its decode time is
+/// unknown. An unknown packaging asserts no clock either. A new packaging
+/// must decide here.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func decodeTimeStamp(_ decodeTime: Duration, packaging: MediaPackaging?) -> CMTime {
+    switch packaging {
+    case .cmaf?: return decodeTime.cmTime
+    case .raw?, nil: return .invalid
+    }
+}
+
+/// A one-sample buffer over `block`; a video sample that is not a sync
+/// sample carries NotSync/DependsOnOthers.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func makeSingleSampleBuffer(
+    block: CMBlockBuffer, formatDescription: CMFormatDescription,
+    timing: CMSampleTimingInfo, nonSyncVideo: Bool) throws -> CMSampleBuffer {
+    var timing = timing
+    var sampleSize = CMBlockBufferGetDataLength(block)
+    var sample: CMSampleBuffer?
+    let status = CMSampleBufferCreateReady(
+        allocator: kCFAllocatorDefault,
+        dataBuffer: block,
+        formatDescription: formatDescription,
+        sampleCount: 1,
+        sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+        sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
+        sampleBufferOut: &sample)
+    guard status == noErr, let sample else {
+        throw MoQServiceError.internalError(status)
+    }
+    if nonSyncVideo,
+       let attachments = CMSampleBufferGetSampleAttachmentsArray(
+           sample, createIfNecessary: true) as? [NSMutableDictionary],
+       let first = attachments.first {
+        first[kCMSampleAttachmentKey_NotSync] = kCFBooleanTrue
+        first[kCMSampleAttachmentKey_DependsOnOthers] = kCFBooleanTrue
+    }
+    return sample
 }
 
 #endif  /* canImport(CoreMedia) */

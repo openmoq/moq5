@@ -4,25 +4,37 @@ The official MoQService example app: a universal SwiftUI player (iPhone /
 iPad / macOS) that shows the complete receive path on one screen —
 
 ```
-configure -> connect -> established -> MediaReceiver.attach(.live)
-  -> catalog -> select video (+ audio) tracks -> makeFormatDescription
-  -> for-await objects, routed by role -> makeSampleBuffer -> RenderPipeline
+configure -> connect -> established -> MediaPlayer.attach (automatic selection)
+  -> for-await outputs: CONFIGURE -> makeFormatDescription
+                        TIMELINE  -> the synchronizer's clock
+                        UNIT      -> makeSampleBuffer -> RenderPipeline
+                        DISCONTINUITY -> flush
 ```
 
-Audio and video share one `AVSampleBufferRenderSynchronizer`: when the stream
-carries audio, the synchronizer slaves its clock to the audio renderer (video
-is timed to audio); with no audio, video runs on its own timeline.
+The media player does the work between the network and the renderers:
+track selection, decode order, gap recovery, and the presentation timeline.
+Audio and video share one `AVSampleBufferRenderSynchronizer`, started on the
+player's `TIMELINE` mapping (media time onto the host clock), so each sample
+presents at its own presentation time; when the stream carries audio the
+synchronizer follows the audio device's clock. Each unit is enqueued only
+when its renderer has room, and no further output is pulled meanwhile: the
+player, and behind it the receiver, back up instead of the app buffering.
 
-Reading order: `PlayerModel.swift` (state machine + strictly-serial session
-lifecycle + object loop), `RenderPipeline.swift` (the A/V sync + render layer),
+H.264/HEVC units that arrive as Annex-B under an avcC/hvcC configuration
+are converted to length prefixes (`makeSampleBuffer(formatDescription:framing:
+.annexB)`); CoreMedia decodes nothing otherwise.
+
+Reading order: `PlayerModel.swift` (state machine + strictly-serial watch
+lifecycle + output loop), `RenderPipeline.swift` (the A/V sync + render layer),
 `ContentView.swift` (the cinematic-dark UI), `VideoSurface.swift` (the only
 platform-conditional file: `UIViewRepresentable` on iOS, `NSViewRepresentable`
 on macOS, same layer either way).
 
 ## Build
 
-macOS (pkg-config lane; needs a CMake-installed service prefix). The default
-backend is the picoquic family, so build the service with
+macOS (pkg-config lane; needs a CMake-installed service prefix built with
+the playback engine, `MOQ_BUILD_PLAYBACK=ON`, which the media player needs).
+The default backend is the picoquic family, so build the service with
 `MOQ_BUILD_PICO_WT_MANAGED=ON` for WebTransport `https://` relays and
 `MOQ_BUILD_PQ_THREADED=ON` for raw-QUIC `moqt://` relays; add
 `MOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON` only for Network packaging/policy checks.

@@ -646,13 +646,23 @@ endfunction()
 # duplicate libraries. The adapter keeps its target dependency (its verifier
 # uses OpenSSL directly); picoquic-core is given the same targets instead.
 #
-# Applies only when the adapter will link OpenSSL: the adapter is built and
-# its verifier backend resolves to openssl (the rule in
-# adapters/picoquic/CMakeLists.txt: "openssl", or "auto" unless picoquic is
-# configured WITH_OPENSSL=OFF). OpenSSL-off, mbedTLS, installed or
-# pre-existing picoquic targets are left as they are.
+# Applies only when the adapter will link OpenSSL. In libmoq's own build:
+# the adapter is built and its verifier backend resolves to openssl (the
+# rule in adapters/picoquic/CMakeLists.txt: "openssl", or "auto" unless
+# picoquic is configured WITH_OPENSSL=OFF). In a consumer of the installed
+# package, which has none of those options: the installed adapter recorded
+# that it links OpenSSL (libmoqConfig sets _LIBMOQ_ADAPTER_PICOQUIC_NEEDS_
+# OPENSSL and finds OpenSSL before picoquic). OpenSSL-off, mbedTLS,
+# installed or pre-existing picoquic targets are left as they are.
 function(_moq_pq_openssl_identity_wanted out_var)
     set(${out_var} FALSE PARENT_SCOPE)
+    if(DEFINED WITH_OPENSSL AND NOT WITH_OPENSSL)
+        return()
+    endif()
+    if(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)
+        set(${out_var} TRUE PARENT_SCOPE)
+        return()
+    endif()
     if(NOT MOQ_BUILD_ADAPTER_PICOQUIC)
         return()
     endif()
@@ -859,12 +869,16 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
     endif()
 
     if(TARGET picoquic-core)
-        # picoquic-core was created by the add_subdirectory above. Only it is
-        # respelled: it is the provider edge the adapter's consumers link.
-        # picohttp-core and an in-tree picotls-openssl carry raw OpenSSL
-        # edges of their own and are left as they are.
+        # picoquic-core and picohttp-core were created by the add_subdirectory
+        # above. They are respelled: they are the provider edges the
+        # adapters' consumers link (picohttp-core under WebTransport and the
+        # service tier). An in-tree picotls-openssl carries raw OpenSSL edges
+        # of its own and is left as it is.
         if(_moq_pq_openssl_identity)
             _moq_pq_openssl_respell(picoquic-core)
+            if(TARGET picohttp-core)
+                _moq_pq_openssl_respell(picohttp-core)
+            endif()
         endif()
         # The provider's own edges are used as declared: picoquic-log links
         # picoquic-core, picoquic-test links picoquic-log, and picoquic-core

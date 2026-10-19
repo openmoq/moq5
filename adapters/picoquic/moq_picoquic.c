@@ -998,6 +998,12 @@ bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn)
     return !conn || conn->cnx == NULL;
 }
 
+bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn)
+{
+    return conn && conn->bridge &&
+           moq_transport_bridge_has_outbound_pending(conn->bridge);
+}
+
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
 int moq_pq_callback(picoquic_cnx_t *cnx,

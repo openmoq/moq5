@@ -24,6 +24,9 @@
 #include "../common/moq_adapter_binding.h"
 #include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
+#ifdef MOQ_PQ_THREADED_TESTING
+#include <picoquic_internal.h>   /* stream iteration, for a test seam only */
+#endif
 
 #include <errno.h>
 #include <time.h>
@@ -164,9 +167,22 @@ struct moq_pq_threaded {
      * pump exit, the recorded fatal code for a client service fatal. */
     uint64_t            local_close_code;       /* network thread only */
     bool                fatal_close;            /* network thread only */
-    bool                tx_drained;     /* network thread: local stream flush
-                                         * done (no queued/ready stream data or
-                                         * unsent FIN). Read by drain_state. */
+#ifdef MOQ_PQ_THREADED_TESTING
+    /* Test-only pass stages: called on the network thread with no facade
+     * lock held, at (1) after the pass's pump returns, before the post-pump
+     * service, and (2) after the drain snapshot is published. */
+    void              (*test_stage)(struct moq_pq_threaded *t, int stage,
+                                    void *ctx);
+    void               *test_stage_ctx;
+    uint64_t            test_pass_gen;  /* the current pass's pass_gen */
+#endif
+    bool                tx_drained;     /* network thread: the stream output
+                                         * is flushed and acknowledged, as of a
+                                         * pass no wake overtook. Read by
+                                         * drain_state. */
+    uint64_t            drain_gen;      /* advanced by every wake (mutex): a
+                                         * pass publishes tx_drained only if
+                                         * none arrived since it began */
     bool                loop_exited;    /* loop acknowledged stop request */
     bool                loop_came_up;   /* packet loop reached its ready
                                            callback (latched; a later loop
@@ -465,6 +481,113 @@ static void server_service_all(moq_pq_threaded_t *t, uint64_t now)
 }
 
 #ifdef MOQ_PQ_THREADED_TESTING
+/* Test seam (never shipped; the test-internals build only): a network-thread
+ * hook run at a pass's drain stages -- 1 after the pump, before the post-pump
+ * service; 2 after the drain state is published, mutex released. */
+void moq_pq_threaded_test_set_stage_hook(
+    moq_pq_threaded_t *t, void (*fn)(moq_pq_threaded_t *, int, void *), void *ctx);
+void moq_pq_threaded_test_set_stage_hook(
+    moq_pq_threaded_t *t, void (*fn)(moq_pq_threaded_t *, int, void *), void *ctx)
+{
+    /* Before the network thread runs passes, or while one is parked in it. */
+    t->test_stage = fn;
+    t->test_stage_ctx = ctx;
+}
+/* Test-only, network thread (inside a stage): the drain inputs the
+ * single-connection pass published from, for the row to assert. */
+typedef struct {
+    size_t connections;           /* live connections the pass covered */
+    bool   ready;                 /* every one ready */
+    bool   session_pending;       /* any session holds pending output */
+    bool   bridge_pending;        /* any bridge holds outbound actions */
+    bool   backlog_empty;         /* no stream backlog anywhere */
+    bool   acked;                 /* every send half acknowledged */
+    bool   gen_unchanged;         /* no wake since the pass began */
+} moq_pq_threaded_test_drain_facts_t;
+void moq_pq_threaded_test_drain_facts(moq_pq_threaded_t *t,
+                                      moq_pq_threaded_test_drain_facts_t *out);
+void moq_pq_threaded_test_drain_facts(moq_pq_threaded_t *t,
+                                      moq_pq_threaded_test_drain_facts_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->ready = out->backlog_empty = out->acked = true;
+    if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+        for (size_t i = 0; i < t->conn_count; i++) {
+            struct moq_pq_threaded_conn *c = t->conns[i];
+            if (!c->cnx) continue;
+            out->connections++;
+            out->ready &= picoquic_get_cnx_state(c->cnx) == picoquic_state_ready;
+            out->session_pending |=
+                moq_session_has_pending_output(moq_pq_conn_session(c->conn));
+            out->bridge_pending |= moq_pq_conn_outbound_pending(c->conn);
+            out->backlog_empty &= moq_pq_cnx_stream_backlog_empty(c->cnx);
+            out->acked &= moq_pq_cnx_streams_acked(c->cnx) != 0;
+        }
+    } else if (t->active_cnx && t->conn) {
+        out->connections = 1;
+        out->ready = picoquic_get_cnx_state(t->active_cnx) == picoquic_state_ready;
+        out->session_pending =
+            moq_session_has_pending_output(moq_pq_conn_session(t->conn));
+        out->bridge_pending = moq_pq_conn_outbound_pending(t->conn);
+        out->backlog_empty = moq_pq_cnx_stream_backlog_empty(t->active_cnx);
+        out->acked = moq_pq_cnx_streams_acked(t->active_cnx) != 0;
+    }
+    pthread_mutex_lock(&t->mutex);
+    out->gen_unchanged = t->drain_gen == t->test_pass_gen;
+    pthread_mutex_unlock(&t->mutex);
+}
+/* Test-only: the wake generation (every wake advances it), read under the
+ * facade mutex from any thread -- how a test sees a drain loop's kicks. */
+uint64_t moq_pq_threaded_test_drain_gen(moq_pq_threaded_t *t);
+uint64_t moq_pq_threaded_test_drain_gen(moq_pq_threaded_t *t)
+{
+    pthread_mutex_lock(&t->mutex);
+    uint64_t g = t->drain_gen;
+    pthread_mutex_unlock(&t->mutex);
+    return g;
+}
+/* Test-only: the peer-to-local direction of each bidirectional stream picoquic
+ * still holds, by initiator -- open (neither FIN nor RESET received), ended by
+ * a FIN, or ended by a RESET. A stream picoquic has already deleted is in
+ * none of the three. Network thread (or a connection no thread drives). */
+typedef struct {
+    size_t open, fin, reset;
+} moq_pq_threaded_test_bidi_halves_t;
+void moq_pq_threaded_test_cnx_bidi_halves(picoquic_cnx_t *cnx, bool client_initiated,
+                                          moq_pq_threaded_test_bidi_halves_t *out);
+void moq_pq_threaded_test_cnx_bidi_halves(picoquic_cnx_t *cnx, bool client_initiated,
+                                          moq_pq_threaded_test_bidi_halves_t *out)
+{
+    for (picoquic_stream_head_t *st = picoquic_first_stream(cnx); st;
+         st = picoquic_next_stream(st)) {
+        if (!PICOQUIC_IS_BIDIR_STREAM_ID(st->stream_id) ||
+            (bool)PICOQUIC_IS_CLIENT_STREAM_ID(st->stream_id) != client_initiated)
+            continue;
+        if (st->reset_received) out->reset++;
+        else if (st->fin_received) out->fin++;
+        else out->open++;
+    }
+}
+/* The same over every live connection of the facade, for the streams the
+ * peer initiated or those this side initiated. */
+void moq_pq_threaded_test_bidi_halves(moq_pq_threaded_t *t, bool peer_initiated,
+                                      moq_pq_threaded_test_bidi_halves_t *out);
+void moq_pq_threaded_test_bidi_halves(moq_pq_threaded_t *t, bool peer_initiated,
+                                      moq_pq_threaded_test_bidi_halves_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    bool server = t->perspective == MOQ_PERSPECTIVE_SERVER;
+    bool client_initiated = server ? peer_initiated : !peer_initiated;
+    if (!server) {
+        if (t->active_cnx)
+            moq_pq_threaded_test_cnx_bidi_halves(t->active_cnx, client_initiated, out);
+        return;
+    }
+    for (size_t i = 0; i < t->conn_count; i++)
+        if (t->conns[i]->cnx)
+            moq_pq_threaded_test_cnx_bidi_halves(t->conns[i]->cnx, client_initiated, out);
+}
+
 /* Test seam (never shipped; the test-internals build only): model a
  * transport close that surfaces in the NEXT service pass, queuing the real
  * MOQ_EVENT_SESSION_CLOSED. Armed from on_lane_pump, that is the post-pump
@@ -1004,9 +1127,15 @@ static int loop_callback(picoquic_quic_t *quic,
         pthread_mutex_unlock(&t->mutex);
     }
 
+    /* pass_gen: the wake generation this pass began under; work admitted
+     * before a later wake is not covered by what this pass observes. */
     pthread_mutex_lock(&t->mutex);
     bool close_requested = t->stopped || t->pump_exit;
+    uint64_t pass_gen = t->drain_gen;
     pthread_mutex_unlock(&t->mutex);
+#ifdef MOQ_PQ_THREADED_TESTING
+    t->test_pass_gen = pass_gen;
+#endif
     if (close_requested || t->fatal_close)
         return local_close_step(t, quic);
 
@@ -1059,6 +1188,9 @@ static int loop_callback(picoquic_quic_t *quic,
         /* Every conn dead before/during that pump was observable by it. */
         server_mark_dead_observed(t);
 
+#ifdef MOQ_PQ_THREADED_TESTING
+        if (t->test_stage) t->test_stage(t, 1, t->test_stage_ctx);
+#endif
         server_service_all(t, snow);
 
         /* Terminal-conn observation window: a conn that turned dead in the
@@ -1109,12 +1241,18 @@ static int loop_callback(picoquic_quic_t *quic,
                                             dl == UINT64_MAX ? 0 : dl);
             }
             if (!(picoquic_get_cnx_state(c->cnx) == picoquic_state_ready &&
-                  moq_pq_cnx_stream_backlog_empty(c->cnx)))
+                  !moq_session_has_pending_output(sess) &&
+                  !moq_pq_conn_outbound_pending(c->conn) &&
+                  moq_pq_cnx_stream_backlog_empty(c->cnx) &&
+                  moq_pq_cnx_streams_acked(c->cnx)))
                 all_drained = false;
         }
         pthread_mutex_lock(&t->mutex);
-        t->tx_drained = all_drained;
+        t->tx_drained = all_drained && t->drain_gen == pass_gen;
         pthread_mutex_unlock(&t->mutex);
+#ifdef MOQ_PQ_THREADED_TESTING
+        if (t->test_stage) t->test_stage(t, 2, t->test_stage_ctx);
+#endif
 
         mark_activity(t);
         return 0;
@@ -1183,6 +1321,9 @@ static int loop_callback(picoquic_quic_t *quic,
         }
     }
 
+#ifdef MOQ_PQ_THREADED_TESTING
+    if (t->test_stage) t->test_stage(t, 1, t->test_stage_ctx);
+#endif
     if (moq_pq_service(t->conn, now) < 0) {
         client_service_fatal(t);
         /* The pump earlier in THIS cycle ran before the fatal was latched:
@@ -1206,21 +1347,34 @@ static int loop_callback(picoquic_quic_t *quic,
         }
     }
 
-    /* Publish graceful-drain state (network thread) for moq_endpoint_drain():
-     * local stream flush is done once no stream has queued/ready reliable data
-     * or an unsent FIN -- every reliable stream byte + FIN handed to the
-     * transport. Deliberately NOT the packet-ACK backlog, which can stay
-     * non-empty on an idle connection after the bytes are sent. The probe is
-     * network-thread-only and side-effect free. */
+    /* Publish graceful-drain state (network thread) for moq_endpoint_drain().
+     * Drained: the session holds no pending output
+     * (moq_session_has_pending_output: no unpolled action, no retained
+     * FIN/RESET/STOP, response or cancellation -- a pass that stopped at the
+     * bridge's budget leaves some), the bridge holds no outbound action, no
+     * stream has queued/ready
+     * reliable data or an unsent FIN (every byte and FIN handed to picoquic),
+     * and the peer has acknowledged every stream's send half
+     * (moq_pq_cnx_streams_acked: sent bytes, FIN, RESET and reliable prefix --
+     * never a peer FIN, and not the packet backlog, which ACK-only packets keep
+     * non-empty on an idle connection). Published only when no wake arrived
+     * since the pass began, so it never predates work queued before that
+     * wake. Network-thread-only and side-effect free. */
     {
         bool drained =
             t->active_cnx &&
             picoquic_get_cnx_state(t->active_cnx) == picoquic_state_ready &&
-            moq_pq_cnx_stream_backlog_empty(t->active_cnx);
+            !moq_session_has_pending_output(moq_pq_conn_session(t->conn)) &&
+            !moq_pq_conn_outbound_pending(t->conn) &&
+            moq_pq_cnx_stream_backlog_empty(t->active_cnx) &&
+            moq_pq_cnx_streams_acked(t->active_cnx);
         pthread_mutex_lock(&t->mutex);
-        t->tx_drained = drained;
+        t->tx_drained = drained && t->drain_gen == pass_gen;
         pthread_mutex_unlock(&t->mutex);
     }
+#ifdef MOQ_PQ_THREADED_TESTING
+    if (t->test_stage) t->test_stage(t, 2, t->test_stage_ctx);
+#endif
 
     mark_activity(t);
     return 0;
@@ -2100,6 +2254,10 @@ moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
     if (!t) return MOQ_ERR_INVAL;
 
     pthread_mutex_lock(&t->mutex);
+    /* Whatever the caller queued before this wake is unobserved until a pass
+     * that begins after it: the cached drain state no longer stands. */
+    t->drain_gen++;
+    t->tx_drained = false;
     if (t->stopped || t->fatal || t->pump_exit || !t->thread_ctx) {
         pthread_mutex_unlock(&t->mutex);
         return MOQ_ERR_CLOSED;

@@ -723,10 +723,16 @@ static int row_pump_exit_close(void)
     return row_stop_or_pump_exit_close(1);
 }
 
+/* fired is set on entering the exit return, not after it: the close it
+ * causes follows the callback's return. With gated set, the callback holds
+ * that return until released, so a test can observe the server still open
+ * after fired. */
 typedef struct {
     int accepted_count;
     int armed;
     int fired;
+    int gated;
+    int released;
 } srv_exit_ctx_t;
 
 static int srv_exit_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
@@ -753,6 +759,10 @@ static int srv_exit_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     }
     if (count >= 2 && __atomic_load_n(&se->armed, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&se->fired, 1, __ATOMIC_RELEASE);
+        /* Bounded: a test that never releases fails on its own checks. */
+        for (int i = 0; i < 4000 && __atomic_load_n(&se->gated, __ATOMIC_ACQUIRE) &&
+             !__atomic_load_n(&se->released, __ATOMIC_ACQUIRE); i++)
+            usleep(1000);
         return 1;
     }
     return 0;
@@ -816,13 +826,22 @@ static int row_server_pump_exit_close(void)
         CHECK(moq_pq_threaded_conn_count(srv) == 2);
         CHECK(__atomic_load_n(&se.accepted_count, __ATOMIC_ACQUIRE) == 2);
 
+        /* The callback enters its exit return and is held there: entering
+         * it does not close the server. */
+        __atomic_store_n(&se.gated, 1, __ATOMIC_RELEASE);
         __atomic_store_n(&se.armed, 1, __ATOMIC_RELEASE);
         CHECK(moq_pq_threaded_wake(srv) == MOQ_OK);
         for (int tries = 0; tries < 400 &&
              !__atomic_load_n(&se.fired, __ATOMIC_ACQUIRE); tries++)
             moq_pq_threaded_wait(srv, 25000);
         CHECK(__atomic_load_n(&se.fired, __ATOMIC_ACQUIRE) == 1);
-        CHECK(moq_pq_threaded_wait(srv, 0) == MOQ_ERR_CLOSED);
+        CHECK(moq_pq_threaded_wait(srv, 0) != MOQ_ERR_CLOSED);
+        /* Its nonzero return closes the server, within the same bound. */
+        __atomic_store_n(&se.released, 1, __ATOMIC_RELEASE);
+        moq_result_t closed = moq_pq_threaded_wait(srv, 0);
+        for (int tries = 0; tries < 400 && closed != MOQ_ERR_CLOSED; tries++)
+            closed = moq_pq_threaded_wait(srv, 25000);
+        CHECK(closed == MOQ_ERR_CLOSED);
         CHECK(moq_pq_threaded_stop(srv) == MOQ_OK);
 
         for (int tries = 0; tries < 400 &&

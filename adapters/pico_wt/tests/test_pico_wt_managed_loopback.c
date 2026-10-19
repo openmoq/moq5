@@ -262,6 +262,13 @@ typedef struct {
     uint64_t   dg_next_object;
     int        dg_send_errors;
     atomic_int *dg_delivered;    /* the server's got_datagram */
+    /* bigobj drain mode: keep pumping after the objects -- until the test
+     * stops the client -- so the subgroup's FIN arrives and its data is
+     * acknowledged, and record that FIN: SUBGROUP_FINISHED for this
+     * subscription's group 0 / subgroup 0, last Object 1. */
+    int        keep_until_stopped;
+    moq_subscription_t sub;
+    atomic_int fin_ok;
 } client_app_t;
 
 static void client_subscribe(moq_session_t *s, client_app_t *a)
@@ -276,8 +283,10 @@ static void client_subscribe(moq_session_t *s, client_app_t *a)
     sc.track_name = (moq_bytes_t){(const uint8_t *)"video", 5};
     sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
     moq_subscription_t sub;
-    if (moq_session_subscribe(s, &sc, 0, &sub) >= 0)
+    if (moq_session_subscribe(s, &sc, 0, &sub) >= 0) {
         a->subscribed = 1;
+        a->sub = sub;
+    }
 }
 
 static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
@@ -334,6 +343,11 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
             }
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_REJECTED && a->do_announce) {
             atomic_store(&a->ns_rejected, 1);
+        } else if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED && a->keep_until_stopped) {
+            const moq_subgroup_finished_event_t *f = &ev.u.subgroup_finished;
+            if (moq_subscription_eq(f->sub, a->sub) && f->group_id == 0 && f->subgroup_id == 0 &&
+                f->has_last_object && f->last_object_id == 1)
+                atomic_store(&a->fin_ok, 1);
         } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
             if (a->expect_big > 0) {
                 /* Verify each object's length and pattern; only signal
@@ -385,8 +399,8 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
         }
         return 0;
     }
-    if (a->initiate_goaway)
-        return 0;  /* keep running to reach the terminal closed state */
+    if (a->initiate_goaway || a->keep_until_stopped)
+        return 0;  /* keep running: the closed state, or the drain's FIN/ACKs */
     return atomic_load(&a->got_object) ? 1 : 0;  /* else pump-exit */
 }
 
@@ -1023,12 +1037,23 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
     if (!srv) return RUN_RETRY;
     settle(srv, 300);
 
+    /* The original fixture's client stopped pumping once it had the objects
+     * (pump-exit, a local close); MOQ_LOOPBACK_DRAIN_PUMP_EXIT restores that
+     * as a control. MOQ_LOOPBACK_DRAIN_WAKE_EACH_READ restores the original
+     * observation pattern: a wake before every probe. */
+    const char *pe = getenv("MOQ_LOOPBACK_DRAIN_PUMP_EXIT");
+    const char *we = getenv("MOQ_LOOPBACK_DRAIN_WAKE_EACH_READ");
+    bool pump_exit = pe && *pe == '1';
+    bool wake_each_read = we && *we == '1';
+
     client_app_t capp; memset(&capp, 0, sizeof(capp));
     atomic_init(&capp.got_object, 0);
     atomic_init(&capp.small_ok, 0);
     atomic_init(&capp.big_ok, 0);
     atomic_init(&capp.big_bad, 0);
+    atomic_init(&capp.fin_ok, 0);
     capp.expect_big = BIGOBJ_BIG_SIZE;
+    capp.keep_until_stopped = !pump_exit;
     g_observed_uni_window = 0;
     g_client_configure_quic = force_small_recv_window;
     moq_pico_wt_managed_t *cli =
@@ -1041,30 +1066,38 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
     }
     CHECK(g_observed_uni_window == 65535);   /* window actually constrained */
 
-    /* App-thread drain: once the object is queued, poll the predicate in real
-     * time until the publisher's transport reports flushed. */
+    /* Once the batch (both objects, then the subgroup close) is admitted,
+     * start a fresh observation with one wake, then poll it: a probe never
+     * destroys the observation it reads. drain_state 1 means the publisher's
+     * stream output is flushed and acknowledged by the peer. */
     mono_deadline_t dd = deadline_after_ms((uint64_t)timeout_sec * 1000);
     int drained = 0, published = 0;
     while (deadline_left_us(&dd) > 0) {
-        (void)wait_step(cli, &dd, 20000);   /* advance the receiver ~20ms */
-        if (!published) published = atomic_load(&sapp.published);   /* object queued (net thr) */
-        if (published) {
-            moq_pico_wt_managed_wake(srv);       /* kick the publisher loop to flush */
-            int ds = moq_pico_wt_managed_drain_state(srv);
-            CHECK(ds != -2);                    /* not on the network thread */
-            if (ds == 1) { drained = 1; break; }
+        (void)wait_step(cli, &dd, 20000);
+        if (!published) {
+            published = atomic_load(&sapp.published);
+            if (published) moq_pico_wt_managed_wake(srv);
+            continue;
         }
+        if (wake_each_read) moq_pico_wt_managed_wake(srv);
+        int ds = moq_pico_wt_managed_drain_state(srv);
+        CHECK(ds != -2);                    /* not on the network thread */
+        if (ds == 1) { drained = 1; break; }
     }
 
-    /* drain_state==1 means the publisher's local stream backlog is flushed (all
-     * reliable bytes + FIN handed to the transport); let the receiver's loop
-     * surface the object event, then verify it arrived in full. */
-    if (drained) wait_for_object(cli, &capp, 2);
+    /* Acknowledged at the publisher means delivered to the client's
+     * transport: its FIN event follows on the client's own pump. */
+    if (drained) {
+        mono_deadline_t fd = deadline_after_ms(2000);
+        while (!atomic_load(&capp.fin_ok) && deadline_left_us(&fd) > 0)
+            (void)wait_step(cli, &fd, 20000);
+    }
 
     int got = atomic_load(&capp.got_object);
     int small_ok = atomic_load(&capp.small_ok);
     int big_ok = atomic_load(&capp.big_ok);
     int big_bad = atomic_load(&capp.big_bad);
+    int fin_ok = atomic_load(&capp.fin_ok);
     int reached_setup = capp.subscribed;
     int fatal = moq_pico_wt_managed_is_fatal(cli) ||
                 moq_pico_wt_managed_is_fatal(srv);
@@ -1074,17 +1107,20 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
     moq_pico_wt_managed_stop(srv);
     moq_pico_wt_managed_destroy(srv);
 
-    if (drained && got) {
+    fprintf(stderr, "[bigobj_drain] pump_exit=%d wake_each_read=%d: drained=%d "
+            "got=%d big_ok=%d fin_ok=%d\n", pump_exit, wake_each_read, drained,
+            got, big_ok, fin_ok);
+    if (drained && got && fin_ok) {
         CHECK(small_ok);
-        CHECK(big_ok);     /* full 256 KiB delivered once drain reported flushed */
+        CHECK(big_ok);     /* full 256 KiB delivered and its subgroup FINed */
         CHECK(!big_bad);
         return RUN_OK;
     }
     if (reached_setup || fatal) {
         fprintf(stderr, "[bigobj_drain] port %d HARD FAIL: setup=%d fatal=%d "
-                "drained=%d got=%d small_ok=%d big_ok=%d big_bad=%d\n",
+                "drained=%d got=%d small_ok=%d big_ok=%d big_bad=%d fin_ok=%d\n",
                 port, reached_setup, fatal, drained, got, small_ok, big_ok,
-                big_bad);
+                big_bad, fin_ok);
         return RUN_HARD;
     }
     fprintf(stderr, "[bigobj_drain] port %d: no setup reached (retryable)\n", port);

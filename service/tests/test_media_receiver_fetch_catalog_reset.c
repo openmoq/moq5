@@ -50,7 +50,9 @@ static int failures = 0;
 /* -- Test seam (media_receiver.c, MOQ_MEDIA_RECEIVER_TESTING) ----------- */
 moq_media_receiver_t *moq_media_receiver_test_new_cfg(
     const moq_media_receiver_cfg_t *cfg);
-void moq_media_receiver_test_free(moq_media_receiver_t *r);
+void moq_media_receiver_test_destroy_with_session(moq_media_receiver_t *r,
+                                                  moq_session_t *session,
+                                                  uint64_t now_us);
 void moq_media_receiver_test_pump(moq_media_receiver_t *r,
                                   moq_session_t *session, uint64_t now_us);
 bool moq_media_receiver_test_catalog_fetch_pending(const moq_media_receiver_t *r);
@@ -387,7 +389,7 @@ int main(void)
     MOQ_TEST_CHECK(track_added);
     MOQ_TEST_CHECK(catalog_ready);
 
-    moq_media_receiver_test_free(r);
+    moq_media_receiver_test_destroy_with_session(r, client, now);
     moq_simpair_destroy(sp);
 
     if (failures == 0)

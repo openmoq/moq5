@@ -494,6 +494,12 @@ struct moq_media_sender {
     /* Test-only: attempts of the pending-reset transition. Never in the
      * shipping library (this whole field is behind the testing define). */
     uint32_t          test_reset_attempts;
+    /* Test-only: refuse this many removed-track teardown END attempts as
+     * moq_pub_end_track's WOULD_BLOCK would, leaving the teardown to retry. */
+    uint32_t          test_refuse_teardown_end;
+    /* Test-only: refuse this many pending-reset attempts as
+     * moq_pub_reset_group's WOULD_BLOCK would, keeping the obligation. */
+    uint32_t          test_refuse_reset;
     /* Test-only injected catalog clock. MSF §5.1.2 generatedAt is a wallclock
      * millisecond, so a test that needs two builds to differ -- or to be
      * identical -- cannot get there by waiting without becoming timing
@@ -1815,6 +1821,10 @@ static moq_result_t sender_flush_reset(moq_media_sender_t *s,
     t->drain_reset_tried = true;
 #ifdef MOQ_MEDIA_SENDER_TESTING
     s->test_reset_attempts++;
+    if (s->test_refuse_reset) {
+        s->test_refuse_reset--;
+        return MOQ_ERR_WOULD_BLOCK;                  /* retryable, untouched */
+    }
 #endif
     moq_result_t rrc = moq_pub_reset_group(s->pub, t->pub_track, 0x10, now_us);
     if (rrc == MOQ_ERR_WOULD_BLOCK) return rrc;      /* retryable, untouched */
@@ -2498,6 +2508,65 @@ static void sender_recompute_wake_deadline(moq_media_sender_t *s)
 /* Managed-adapter wake query (moq_endpoint_hook_ops.next_deadline_us): a PURE
  * cached-scalar read under s->mu -- no publisher/session/endpoint/adapter
  * re-entry, safe to call after the pump's exclusive window has closed. */
+/* Output this sender owes and has not yet handed to the session:
+ *   - a queued END_OF_TRACK marker -- unless it waits behind media of its
+ *     own track that is retained for a track nobody has subscribed to and
+ *     that has no established publication: the default no-demand policy
+ *     holds that media, and the marker after it, for a joiner. An accepted
+ *     PUBLISH is established even at Forward 0 (no demand): its terminal
+ *     control message is owed regardless of Forward, so its held END stays
+ *     owed and the drain stays pending rather than reporting completion;
+ *   - a queued object of a track that has demand;
+ *   - a catalog generation still being written, or a republish a post-ready
+ *     catalog change has made owed (catalog_dirty);
+ *   - a reset owed for an abandoned group (pending_reset), which also keeps
+ *     a partially emitted object's obligation when its subscriber leaves;
+ *   - a removed track not yet torn down: catalog_dirty covers the pump
+ *     that tears it down, and this covers a teardown refused and retried
+ *     after the republish committed;
+ *   - the PUBLISH_DONE a live->VOD conversion armed, through catalog_dirty:
+ *     conversion is post-ready only, dirties the catalog, and the republish
+ *     stays gated (catalog_dirty kept) until every PUBLISH_DONE is sent.
+ * An object queued for a track nobody subscribes to is retained for a
+ * future joiner, not owed: it stays owned and counted in objects_queued, it
+ * is neither claimed delivered nor discarded, and it does not hold a drain.
+ * Called inside the pump cycle right after sender_hook (endpoint hook
+ * contract), so the publisher demand read is legal; s->mu nests inside
+ * ep->mu. */
+static bool sender_has_pending_output(void *ctx)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    pthread_mutex_lock(&s->mu);
+    bool pending = s->pending_obj_count > 0 || (s->ready && s->catalog_dirty);
+    for (uint32_t i = s->preq_head; !pending && i != s->preq_tail; i++) {
+        const sender_preq_entry_t *e = &s->preq[i % s->ring_cap];
+        if (sender_track_demand(s, e->track)) {
+            pending = true;
+        } else if (e->is_end) {
+            /* An established publication owes its terminal regardless of
+             * Forward; otherwise an END behind its own track's retained
+             * media is held with that media. */
+            bool published = s->publish_tracks && e->track &&
+                e->track->pub_track &&
+                moq_pub_track_is_published(s->pub, e->track->pub_track);
+            bool held_behind_retained = false;
+            for (uint32_t j = s->preq_head;
+                 !published && j != i && !held_behind_retained; j++) {
+                const sender_preq_entry_t *p = &s->preq[j % s->ring_cap];
+                held_behind_retained = p->track == e->track && !p->is_end;
+            }
+            if (!held_behind_retained) pending = true;
+        }
+    }
+    for (size_t i = 0; !pending && i < s->track_count; i++) {
+        const moq_media_track_t *t = s->tracks[i];
+        if (t->pending_reset || (t->removed && t->pub_track))
+            pending = true;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return pending;
+}
+
 static uint64_t sender_next_deadline_us(void *ctx)
 {
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
@@ -3258,6 +3327,13 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                 }
                 /* 1) reliable END_OF_TRACK to active subscribers. */
                 if (!t->pub_ended) {
+#ifdef MOQ_MEDIA_SENDER_TESTING
+                    pthread_mutex_lock(&s->mu);
+                    bool refuse = s->test_refuse_teardown_end > 0;
+                    if (refuse) s->test_refuse_teardown_end--;
+                    pthread_mutex_unlock(&s->mu);
+                    if (refuse) continue;                /* refused: retry */
+#endif
                     moq_result_t e = moq_pub_end_track(s->pub, t->pub_track,
                                                        now_us);
                     if (e == MOQ_OK) t->pub_ended = true;
@@ -4556,6 +4632,7 @@ static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
         moq_endpoint_hook_ops_t ops = {
             .pump = sender_hook,
             .next_deadline_us = sender_next_deadline_us,
+            .has_pending_output = sender_has_pending_output,
         };
         moq_result_t arc = moq_endpoint_attach_hook(
             ep, MOQ_ENDPOINT_HOOK_SENDER, &ops, s);
@@ -6715,6 +6792,31 @@ uint32_t moq_media_sender_test_reset_attempts(const moq_media_sender_t *s)
 
 /* Drive the production sender_hook with a caller-controlled session (the hook
  * ignores its endpoint argument -- (void)ep). */
+/* Refuse the next `n` removed-track teardown END attempts (retryable). */
+void moq_media_sender_test_refuse_teardown_end(moq_media_sender_t *s, uint32_t n);
+void moq_media_sender_test_refuse_teardown_end(moq_media_sender_t *s, uint32_t n)
+{
+    pthread_mutex_lock(&s->mu);
+    s->test_refuse_teardown_end = n;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* Refuse the next `n` pending-reset attempts (retryable). */
+void moq_media_sender_test_refuse_reset(moq_media_sender_t *s, uint32_t n);
+void moq_media_sender_test_refuse_reset(moq_media_sender_t *s, uint32_t n)
+{
+    pthread_mutex_lock(&s->mu);
+    s->test_refuse_reset = n;
+    pthread_mutex_unlock(&s->mu);
+}
+
+/* The owed-output answer the endpoint's drain reads after each pump. */
+bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s);
+bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s)
+{
+    return sender_has_pending_output(s);
+}
+
 void moq_media_sender_test_pump(moq_media_sender_t *s,
                                 moq_session_t *session, uint64_t now_us)
 {

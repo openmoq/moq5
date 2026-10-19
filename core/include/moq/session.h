@@ -971,6 +971,27 @@ moq_session_poll_actions(moq_session_t *s, moq_action_t *out, size_t cap)
  */
 MOQ_API size_t moq_session_action_capacity(const moq_session_t *s);
 
+/*
+ * Whether the session still holds outbound work it has not handed over:
+ * an action not yet polled, or accepted outbound work it retains to emit
+ * later (a FIN, RESET or STOP owed on a stream, a response, a cancellation,
+ * fill work). A queued datagram counts as output; this says nothing about
+ * its delivery. false for NULL.
+ *
+ * Pure observation: it does not poll, allocate, read a clock, retry,
+ * mutate, transfer ownership or invalidate borrows. Call it serialized with
+ * every other call on the session, on its owning serialized executor -- for
+ * a session a managed adapter owns, within that adapter's documented
+ * session-access window; it is not a cross-thread accessor.
+ *
+ * Not counted: answers the application has not supplied yet, timers alone,
+ * receive-only backpressure, and the send scratch arena. It says nothing
+ * about work already polled (handed to a bridge or provider), transport
+ * acknowledgement, peer consumption, or output the session may produce
+ * later.
+ */
+MOQ_API bool moq_session_has_pending_output(const moq_session_t *s);
+
 /* -- Events (application notifications) ---------------------------- */
 
 /*
@@ -1377,6 +1398,14 @@ typedef struct moq_subgroup_finished_event {
     uint64_t           subgroup_id;
     bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
     uint8_t            _pad[7];
+    /* Appended: the last Object the stream carried, by Object ID. A FINed
+     * stream carried every Object it began, so with end_of_group set no
+     * Object above it exists in the Group. has_last_object is false for a
+     * stream that carried no Object. Read only when detail_size covers
+     * last_object_id. */
+    bool               has_last_object;
+    uint8_t            _pad_last[7];
+    uint64_t           last_object_id;
 } moq_subgroup_finished_event_t;
 
 /*
@@ -1422,6 +1451,14 @@ typedef struct moq_subgroup_reset_event {
     uint64_t           error_code;    /* RESET_STREAM application error code */
     bool               end_of_group;  /* subgroup header END_OF_GROUP bit */
     uint8_t            _pad[7];
+    /* Appended: the last Object the stream carried completely, by Object ID.
+     * An Object whose payload the reset cut short is not counted, so the
+     * Objects of this subgroup after it are the ones the stream left
+     * undelivered. has_last_object is false when no Object completed. Read
+     * only when detail_size covers last_object_id. */
+    bool               has_last_object;
+    uint8_t            _pad_last[7];
+    uint64_t           last_object_id;
 } moq_subgroup_reset_event_t;
 
 /* -- Namespace event detail structs -------------------------------- */

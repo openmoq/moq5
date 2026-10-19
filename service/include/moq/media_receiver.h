@@ -176,6 +176,17 @@ typedef struct moq_media_receiver_cfg {
     _Alignas(uint64_t)
 #endif
     moq_media_companion_profile_t companion_profile;
+    /* Permanently reserved, never read: covers the tail padding after
+     * companion_profile, so the block below starts at the complete sizeof
+     * of the layout that ends with it on every target. */
+    uint8_t  _reserved_companion[4];
+    /* Appended: the stream-terminal lane (moq_media_receiver_poll_stream_
+     * terminal), max_stream_terminals records deep (0 = 64). false (the
+     * default) keeps the lane, its intake rule and its records off; nothing
+     * else changes. Read as one block, only when struct_size covers
+     * surface_stream_terminals. */
+    uint32_t max_stream_terminals;
+    bool     surface_stream_terminals;
 } moq_media_receiver_cfg_t;
 
 /* Frozen v0 sizeof includes tail padding. Use the original embedded
@@ -374,6 +385,14 @@ typedef struct moq_media_track_desc {
     /* MSF altGroup, for every packaging (0 / false when absent). */
     bool                     has_alt_group;
     int                      alt_group;
+    /* Appended after alt_group, at the complete sizeof of the layout that
+     * ends with it; read only when struct_size covers them. Immutable.
+     * MSF renderGroup (0 / false when absent; zero is a value when present),
+     * and whether the catalog carried a label at all: `label` is empty both
+     * when it was absent and when it was empty. */
+    bool                     has_render_group;
+    int                      render_group;
+    bool                     has_label;
 } moq_media_track_desc_t;
 
 /* -- Track discovery events (§6.2) ------------------------------------ */
@@ -476,11 +495,13 @@ typedef struct moq_media_track_event {
                                             above); NULL for CATALOG_READY */
     uint32_t config_generation;          /* reserved for dynamic config;
                                             always 0 today */
-    /* Permanently reserved, never read: the v0 struct ended in four
-     * bytes of trailing padding after config_generation; the appended
-     * fields below start at the old sizeof so an old caller's storage is
-     * never written past its struct_size (poll_track stamps
-     * min(your sizeof, the library's) and copies only that much). */
+    /* Permanently reserved, never read. On LP64 the v0 struct ended in
+     * four bytes of trailing padding after config_generation, which this
+     * spacer occupies, so the appended fields below start at the old
+     * sizeof; on 32-bit targets v0 ended at config_generation and they
+     * start four bytes past it. Either way an old caller's storage is never
+     * written past its struct_size (poll_track stamps min(your sizeof, the
+     * library's) and copies only that much). */
     uint8_t  _reserved_track_ev[4];
     /* Appended , valid for MOQ_MEDIA_TRACK_UPDATE_OK only; zero for
      * every other kind. Copied per event at queue time (never derived from
@@ -573,6 +594,21 @@ typedef struct moq_media_track_event {
     uint32_t _reserved_fill_loss;         /* zero; never read */
     uint64_t fill_unreported_loss_group;
     uint64_t fill_unreported_loss_object;
+    /* Appended after the complete fill-loss allocation. Valid only for
+     * TRACK_ENDED; zero for every other event. Written and readable only
+     * when struct_size covers the whole block, through done_status.
+     * has_done_status: the track ended because its subscription completed
+     * (PUBLISH_DONE, or SUBSCRIBE_DONE on drafts 16/18); done_status is
+     * that message's status code. TRACK_ENDED (0x2) and, on drafts 16/18,
+     * SUBSCRIPTION_ENDED (0x3) report a normal end; any other code an
+     * error. A first TRACK_ENDED re-arms the track for VOD and raises no
+     * event. false: the track ended with no done status -- at its
+     * END_OF_TRACK, or because the peer refused its subscription (a VOD
+     * re-subscription included). Neither value says whether the
+     * END_OF_TRACK arrived: that comes on the stream-terminal lane. */
+    bool     has_done_status;
+    uint8_t  _reserved_done[7];           /* zero; never read */
+    uint64_t done_status;
 } moq_media_track_event_t;
 
 /* Causes in fill_unreported_loss_causes. */
@@ -883,6 +919,10 @@ typedef struct moq_media_object {
 
     bool                  has_capture_time;
     uint64_t              capture_time_us;
+    /* RAW (LOC): decode_time_us copies the LOC media time, as does
+     * presentation_time_us (composition_offset_us 0). It may decrease in
+     * decode order (object order) with frame reordering and is not evidence
+     * of a known decode clock. CMAF: the tfdt/trun decode time. */
     uint64_t              decode_time_us;
     int64_t               composition_offset_us;
     uint64_t              presentation_time_us;
@@ -1032,6 +1072,135 @@ MOQ_API void moq_media_object_cleanup(moq_media_object_t *obj);
 MOQ_API moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,
                                                     moq_media_object_t *obj,
                                                     size_t obj_size);
+
+/* Poll the next Object only when everything it carries fits in
+ * `max_charge` bytes: its payload, properties and private track-properties
+ * buffers and its owned sample table, as moq_media_object_charge measures
+ * them. The check and the transfer are one step: no other Object can
+ * replace the head between them. `charge` (optional) receives that
+ * Object's charge on MOQ_OK and on MOQ_ERR_BUFFER. MOQ_ERR_BUFFER: the next
+ * Object is larger than `max_charge`; nothing is dequeued and nothing
+ * changes. Every other result is poll_object's. */
+MOQ_API moq_result_t moq_media_receiver_poll_object_within(
+    moq_media_receiver_t *r, uint64_t max_charge, uint64_t *charge,
+    moq_media_object_t *obj, size_t obj_size);
+
+/* The bytes a polled object holds until cleanup, as poll_object_within
+ * charges them; 0 for NULL. Reads only what its stamped struct_size
+ * covers. */
+MOQ_API uint64_t moq_media_object_charge(const moq_media_object_t *obj);
+
+/* -- Stream terminals -------------------------------------------------- *
+ * With moq_media_receiver_cfg_t.surface_stream_terminals, the receiver keeps
+ * an ordered lane of delivery facts for its media tracks, of every
+ * packaging, so a consumer can tell where delivery ended, what was lost and
+ * where the track ends, relative to the objects it polls:
+ *
+ *   - FIN_END_OF_GROUP / FIN / RESET: how the stream carrying a subgroup
+ *     ended, with the last Object it carried (completely, for RESET), or
+ *     for a RESET that cut an Object short, that Object;
+ *   - RECEIVER_DROP: the receiver's overflow policy dropped Objects of the
+ *     track in groups group_id..last_group_id (its safety loss, beyond the
+ *     drop counters), from one delivery domain: the LIVE subscription, or
+ *     one fill, named by its initiating request ID. The drops of one
+ *     admission are one record per track and domain;
+ *   - END_OF_TRACK: the track's END_OF_TRACK, at its Location.
+ *
+ * Ordering: every terminal is one record, never coalesced, in the order the
+ * receiver learned of it. A record is pollable once every Object of its
+ * track the receiver took in before it has left the receiver (polled,
+ * dropped, evicted or purged), including Objects an MPEG2TS reorder window
+ * still holds, and the lane is read in order. To apply each fact in order,
+ * poll terminals after each polled Object (or poll Objects until none is
+ * queued, then terminals); a record never comes back ahead of an Object it
+ * follows. A consumer that moves polled Objects into its own pending
+ * storage must settle those before applying a later terminal.
+ *
+ * Fill terminals: with the lane on, a fill's MOQ_MEDIA_TRACK_FILL_TERMINAL
+ * is pollable only once every Object of the fill has left the receiver and
+ * every RECEIVER_DROP of the fill has been polled, so a fill does not
+ * report completion while its Objects can still be lost or before its loss.
+ *
+ * Exact debt: the receiver takes in an Object only while the lane has room
+ * for every record that admission can produce: a RECEIVER_DROP per
+ * delivery domain with queued Objects, and one for the Object itself. It
+ * takes in a stream terminal only while it has room for that record.
+ * Otherwise intake stops, under every overflow policy: the next Object
+ * waits upstream, so the subscription backs up as it does under
+ * FLOW_CONTROL, and no record is ever lost or merged with another
+ * admission's.
+ *
+ * MPEG2TS: an Object, status Object or END_OF_TRACK that a reorder window
+ * holds keeps the lane slot its intake reserved for its own record, so a
+ * record waiting for it never takes the room its release needs. A release
+ * that fits the queue destroys nothing and needs no more; one that would
+ * evict also needs a RECEIVER_DROP per delivery domain with queued Objects.
+ * Until the lane has that, the window waits, reports no deadline, and the
+ * application's next poll wakes the network thread to resume it; a
+ * subscription that completes meanwhile is retired once its window has
+ * released everything.
+ *
+ * Retirement: a track removed from the catalog keeps reporting the stream
+ * terminals already received for it, under its removed handle, until its
+ * subscription is released; a track added back is a new handle. A receiver
+ * whose catalog failed discards its media, with the stream terminals it has
+ * not yet put on the lane and what its MPEG2TS reorder windows hold; the
+ * records already on the lane stay, and become pollable as the media they
+ * follow leaves.
+ *
+ * Capacity: a lane of one record works, taking in one Object at a time;
+ * every reserved slot counts against max_stream_terminals, so a deeper lane
+ * lets more Objects be queued or held at once. Polling Objects and records
+ * always lets intake resume. A consumer that enables the lane polls it.
+ *
+ * Records name the stable track handle and carry plain values only. */
+typedef uint32_t moq_media_stream_terminal_kind_t;
+#define MOQ_MEDIA_STREAM_FIN_END_OF_GROUP 1u
+#define MOQ_MEDIA_STREAM_FIN              2u
+#define MOQ_MEDIA_STREAM_RESET            3u
+#define MOQ_MEDIA_STREAM_RECEIVER_DROP    4u
+#define MOQ_MEDIA_STREAM_END_OF_TRACK     5u
+
+typedef struct moq_media_stream_terminal {
+    uint32_t                         struct_size;
+    moq_media_stream_terminal_kind_t kind;
+    moq_media_track_t               *track;
+    /* FIN_END_OF_GROUP, FIN, RESET: the subgroup. END_OF_TRACK: its
+     * Location (group_id, object_id). RECEIVER_DROP: the first group. */
+    uint64_t                         group_id;
+    uint64_t                         subgroup_id;
+    uint64_t                         object_id;
+    /* RECEIVER_DROP: the last group of the range. */
+    uint64_t                         last_group_id;
+    /* RESET: the peer's RESET_STREAM code. */
+    uint64_t                         error_code;
+    /* FIN_END_OF_GROUP, FIN, RESET: as moq_sub_stream_terminal_t. */
+    bool                             has_last_object;
+    bool                             has_cut_object;
+    uint8_t                          _reserved[2];
+    /* RECEIVER_DROP: whose Objects were dropped, a MOQ_MEDIA_DELIVERY_*
+     * value, and for FILL the fill's initiating request ID (zero is a
+     * valid ID). Drops of one admission are one record per track and
+     * delivery domain. */
+    uint32_t                         delivery_origin;
+    uint64_t                         last_object_id;
+    uint64_t                         cut_object_id;
+    uint64_t                         initiating_request_id;
+} moq_media_stream_terminal_t;
+
+/* Frozen v0 floor: the complete layout through initiating_request_id. */
+#define MOQ_MEDIA_STREAM_TERMINAL_V0_SIZE \
+    (offsetof(moq_media_stream_terminal_t, initiating_request_id) + \
+     sizeof(uint64_t))
+
+/* Poll the next stream terminal. `out_size` is the caller's sizeof; one
+ * below the v0 floor is MOQ_ERR_ABI_MISMATCH and dequeues nothing. MOQ_OK
+ * fills out; MOQ_DONE when no record is pollable now (none queued, the lane
+ * is disabled, or the head record still waits for its track's Objects);
+ * MOQ_ERR_INVAL for a NULL argument. moq_media_receiver_wait() returns when
+ * a record is pollable. */
+MOQ_API moq_result_t moq_media_receiver_poll_stream_terminal(
+    moq_media_receiver_t *r, moq_media_stream_terminal_t *out, size_t out_size);
 
 /* -- SAP event-timeline records (CMSF §3.6.1) ------------------------- *
  * A CMSF SAP-type timeline track (packaging "eventtimeline", eventType
@@ -1208,6 +1377,40 @@ MOQ_API moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
  * protocol, transport, or receiver failure (catalog unusable, track-event
  * overflow). fatal_code: the receiver's own code when receiver-fatal,
  * otherwise the endpoint's. */
+/* -- Receiver information --------------------------------------------- *
+ * What a component built on a receiver needs to know about it, as one
+ * sized snapshot. Configuration values are the effective ones: a defaulted
+ * zero is reported as the value it selected. */
+typedef struct moq_media_receiver_info {
+    uint32_t                      struct_size;
+    uint32_t                      time_mode;        /* moq_media_time_mode_t */
+    uint32_t                      overflow_policy;  /* moq_media_overflow_policy_t */
+    uint32_t                      max_objects;
+    uint64_t                      max_bytes;
+    bool                          auto_subscribe;
+    bool                          surface_stream_terminals;
+    uint8_t                       _reserved_flags[2];   /* zero; never read */
+    /* MOQ_MEDIA_COMPANION_AUTO until the first session resolves it. */
+    moq_media_companion_profile_t companion_profile;
+    /* The negotiated draft (a moq_version_t value); 0 until a session has
+     * been observed. */
+    uint32_t                      transport_version;
+    uint32_t                      max_stream_terminals; /* 0 with the lane off */
+    /* Track events poll_track has returned so far. */
+    uint64_t                      track_events_polled;
+} moq_media_receiver_info_t;
+
+/* Frozen v0 floor: the complete layout through track_events_polled. */
+#define MOQ_MEDIA_RECEIVER_INFO_V0_SIZE \
+    (offsetof(moq_media_receiver_info_t, track_events_polled) + sizeof(uint64_t))
+
+/* Fill `out` with min(out_size, sizeof) bytes and stamp struct_size with
+ * that count. MOQ_ERR_INVAL for a NULL argument; MOQ_ERR_ABI_MISMATCH below
+ * the v0 floor (nothing written). Observes only; any thread. */
+MOQ_API moq_result_t moq_media_receiver_get_info(
+    const moq_media_receiver_t *r, moq_media_receiver_info_t *out,
+    size_t out_size);
+
 MOQ_API bool     moq_media_receiver_is_closed(const moq_media_receiver_t *r);
 MOQ_API bool     moq_media_receiver_is_fatal(const moq_media_receiver_t *r);
 MOQ_API uint64_t moq_media_receiver_fatal_code(const moq_media_receiver_t *r);

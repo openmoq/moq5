@@ -2,6 +2,7 @@ import CMoQPlayback
 import CMoQCore
 import Foundation
 import MoQ
+import MoQTransportModel
 
 // MARK: - Playback Track Handle
 
@@ -35,6 +36,13 @@ public struct PlaybackTrackConfiguration: Sendable {
     public var channelCount: UInt32
     public var targetLatencyUS: UInt64
     public var isLive: Bool
+    /// The draft the track's session negotiated. It selects the LOC
+    /// companion and its property codec (LOC-01 on 16 and 18, LOC-04 on
+    /// 22); objects parsed with the wrong one lose their timing.
+    public var wireVersion: WireVersion
+    /// Draft 22 only: the track's LOC-04 properties. An object's own LOC
+    /// fields win; an absent timescale or codec configuration is inherited.
+    public var trackProperties: Data?
 
     public init(
         mediaType: MediaType,
@@ -47,7 +55,9 @@ public struct PlaybackTrackConfiguration: Sendable {
         samplerate: UInt32 = 0,
         channelCount: UInt32 = 0,
         targetLatencyUS: UInt64 = 0,
-        isLive: Bool = true
+        isLive: Bool = true,
+        wireVersion: WireVersion = .draft16,
+        trackProperties: Data? = nil
     ) {
         self.mediaType = mediaType
         self.packaging = packaging
@@ -60,6 +70,8 @@ public struct PlaybackTrackConfiguration: Sendable {
         self.channelCount = channelCount
         self.targetLatencyUS = targetLatencyUS
         self.isLive = isLive
+        self.wireVersion = wireVersion
+        self.trackProperties = trackProperties
     }
 }
 
@@ -280,7 +292,7 @@ public final class PlaybackPipeline {
 
     public init(configuration: PlaybackConfiguration = .live) throws {
         var cfg = moq_playback_cfg_t()
-        moq_playback_cfg_init(&cfg)
+        moq_playback_cfg_init_sized(&cfg, MemoryLayout<moq_playback_cfg_t>.size)
         cfg.max_tracks = configuration.maxTracks
         cfg.max_buffered_objects = configuration.maxBufferedObjects
         cfg.max_buffered_bytes = configuration.maxBufferedBytes
@@ -313,11 +325,14 @@ public final class PlaybackPipeline {
     ) throws -> PlaybackTrack {
         var codecBytes = config.codec.map { Array($0.utf8) } ?? []
         var initBytes = config.initData.map { Array($0) } ?? []
+        var propBytes = config.trackProperties.map { Array($0) } ?? []
 
         return try codecBytes.withUnsafeMutableBufferPointer { codecPtr in
             try initBytes.withUnsafeMutableBufferPointer { initPtr in
+              try propBytes.withUnsafeMutableBufferPointer { propPtr in
                 var cfg = moq_playback_track_cfg_t()
-                moq_playback_track_cfg_init(&cfg)
+                moq_playback_track_cfg_init_sized(
+                    &cfg, MemoryLayout<moq_playback_track_cfg_t>.size)
                 cfg.media_type = config.mediaType == .video
                     ? MOQ_PLAYBACK_MEDIA_VIDEO : MOQ_PLAYBACK_MEDIA_AUDIO
                 cfg.packaging = config.packaging == .raw
@@ -333,11 +348,15 @@ public final class PlaybackPipeline {
                 cfg.channel_count = config.channelCount
                 cfg.target_latency_us = config.targetLatencyUS
                 cfg.is_live = config.isLive
+                cfg.transport_version = config.wireVersion.rawValue
+                cfg.track_properties = moq_bytes_t(
+                    data: propPtr.baseAddress, len: propPtr.count)
 
                 var handle = moq_playback_track_t(_opaque: 0)
                 try MoQError.check(
                     moq_playback_add_track(raw, &cfg, &handle))
                 return PlaybackTrack(handle)
+              }
             }
         }
     }
@@ -354,7 +373,7 @@ public final class PlaybackPipeline {
         now: UInt64
     ) throws {
         var obj = moq_playback_object_t()
-        moq_playback_object_init(&obj)
+        moq_playback_object_init_sized(&obj, MemoryLayout<moq_playback_object_t>.size)
         obj.track = track.raw
         obj.group_id = object.groupID
         obj.subgroup_id = object.subgroupID
@@ -378,9 +397,14 @@ public final class PlaybackPipeline {
 
     public func pollCommand() throws -> PlaybackCommand? {
         var cmd = moq_playback_cmd_t()
-        let rc = moq_playback_poll_command(raw, &cmd)
+        let rc = moq_playback_poll_command(
+            raw, &cmd, MemoryLayout<moq_playback_cmd_t>.size)
         if rc == MOQ_DONE { return nil }
         try MoQError.check(rc)
+        // The polled command owns its refs from here on. Cleanup runs on
+        // every exit, including a throw while converting; refs adopted into
+        // a Buffer are nil'ed first, so they are not released twice.
+        defer { moq_playback_cmd_cleanup(&cmd) }
 
         let track = PlaybackTrack(cmd.track)
         let result: PlaybackCommand
@@ -484,15 +508,14 @@ public final class PlaybackPipeline {
             case MOQ_PLAYBACK_RESET_DECODE_ERROR:  reason = .decodeError
             case MOQ_PLAYBACK_RESET_TRACK_SWITCH:  reason = .trackSwitch
             case MOQ_PLAYBACK_RESET_CONFIG_CHANGE: reason = .configChange
-            default: reason = .unknown(cmd.u.reset.reason.rawValue)
+            default: reason = .unknown(cmd.u.reset.reason)
             }
             result = .reset(track: track, reason: reason)
 
         default:
-            result = .unknown(cmd.kind.rawValue)
+            result = .unknown(cmd.kind)
         }
 
-        moq_playback_cmd_cleanup(&cmd)
         return result
     }
 
@@ -508,7 +531,8 @@ public final class PlaybackPipeline {
 
     public func pollEvent() throws -> PlaybackEvent? {
         var evt = moq_playback_event_t()
-        let rc = moq_playback_poll_event(raw, &evt)
+        let rc = moq_playback_poll_event(
+            raw, &evt, MemoryLayout<moq_playback_event_t>.size)
         if rc == MOQ_DONE { return nil }
         try MoQError.check(rc)
 
@@ -535,7 +559,7 @@ public final class PlaybackPipeline {
             case MOQ_PLAYBACK_DROP_UNSUPPORTED_MULTI_SAMPLE: dr = .unsupportedMultiSample
             case MOQ_PLAYBACK_DROP_STALE:                    dr = .stale
             case MOQ_PLAYBACK_DROP_KEYFRAME_WAIT:            dr = .keyframeWait
-            default: dr = .unknown(evt.u.object_dropped.reason.rawValue)
+            default: dr = .unknown(evt.u.object_dropped.reason)
             }
             return .objectDropped(
                 track: track, reason: dr,
@@ -554,7 +578,7 @@ public final class PlaybackPipeline {
                 fromGroup: evt.u.partial_group_abandoned.from_group_id,
                 toGroup: evt.u.partial_group_abandoned.to_group_id)
         default:
-            return .unknown(evt.kind.rawValue)
+            return .unknown(evt.kind)
         }
     }
 

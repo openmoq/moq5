@@ -484,6 +484,21 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME pq_conformance COMMAND test_pq_conformance)
 
+    # The send-half acknowledgement a graceful drain waits for, over
+    # picoquic's own SACK ranges (its private stream state: source tree only).
+    if(MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pq_stream_acked tests/test_pq_stream_acked.c)
+        target_include_directories(test_pq_stream_acked PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_stream_acked PRIVATE $<BUILD_INTERFACE:${_PQ}>)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_stream_acked PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_stream_acked COMMAND test_pq_stream_acked)
+    endif()
+
     # Real-transport establishment in the deterministic simulator: genuine
     # QUIC packets and stream ids through the actual adapter + picoquic
     # stack (the seam the fake-pair suite cannot cover). Requires the
@@ -647,11 +662,17 @@ if(MOQ_BUILD_TESTS)
             picoquic_string_duplicate=moq_test_reason_duplicate)
         target_compile_options(pq_close_reason_sender PRIVATE
             $<TARGET_PROPERTY:${_PQ},COMPILE_OPTIONS>)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(pq_close_reason_sender PRIVATE
-                -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
-        endif()
+        # Upstream picoquic's own source, rebuilt only to rename its string
+        # duplicator: it is compiled as the provider compiles it (options,
+        # definitions, include paths, language standard), not under
+        # LibMoQ's warning policy, which governs LibMoQ's own sources.
+        foreach(_pq_lang_prop C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS)
+            get_target_property(_pq_lang_value ${_PQ} ${_pq_lang_prop})
+            if(NOT _pq_lang_value STREQUAL "_pq_lang_value-NOTFOUND")
+                set_target_properties(pq_close_reason_sender PROPERTIES
+                    ${_pq_lang_prop} "${_pq_lang_value}")
+            endif()
+        endforeach()
         add_executable(test_pq_close_reason_oom
             tests/test_pq_close_reason_oom.c
             $<TARGET_OBJECTS:pq_close_reason_sender>)
@@ -828,6 +849,61 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
 
+    # The drain gate on session pending output at a parked pass boundary,
+    # for the client single-connection and server aggregate paths (stage
+    # hooks of the test-internals build).
+    add_executable(test_threaded_drain_gates tests/test_threaded_drain_gates.c)
+    target_link_libraries(test_threaded_drain_gates PRIVATE
+        moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_drain_gates PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_drain_gates PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_drain_gates COMMAND test_threaded_drain_gates)
+    set_tests_properties(threaded_drain_gates PROPERTIES TIMEOUT 120)
+
+    # What does and does not hold the drain: receive-only backlog, an open
+    # idle draft-18 request stream and a future timer do not; an unACKed FIN
+    # does.
+    add_executable(test_threaded_drain_controls tests/test_threaded_drain_controls.c)
+    target_link_libraries(test_threaded_drain_controls PRIVATE
+        moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+    target_include_directories(test_threaded_drain_controls PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_drain_controls PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_drain_controls PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_drain_controls COMMAND test_threaded_drain_controls)
+    set_tests_properties(threaded_drain_controls PROPERTIES TIMEOUT 180)
+
+    # The drain holds while the session retains reliable lifecycle output: a
+    # draft-18 rejection that reaches a client whose event queue is full.
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        add_executable(test_threaded_drain_retained tests/test_threaded_drain_retained.c)
+        target_link_libraries(test_threaded_drain_retained PRIVATE
+            moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_threaded_drain_retained PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME threaded_drain_retained
+            COMMAND test_threaded_drain_retained
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(threaded_drain_retained PROPERTIES TIMEOUT 120)
+    endif()
+
     # SETUP authorization tokens through the facade over real loopback: the
     # server's SETUP_COMPLETE carries the configured tokens by value; a set
     # whose SETUP cannot fit the session send arena is refused at create.
@@ -979,6 +1055,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_INSTALL_LIBDIR}"
                 "${CMAKE_CXX_FLAGS}"
                 "${_threaded_install_staging}"
+                "${CMAKE_INSTALL_INCLUDEDIR}"
                 "${_picoquic_abi_context}")
         set_tests_properties(adapter_threaded_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
