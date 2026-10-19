@@ -931,17 +931,19 @@ static moq_endpoint_cfg_t ep_cfg(char *urlbuf, size_t cap, int port)
     return c;
 }
 
-/* Start a media server + a create-owned receiver for the data path. */
-static bool start_media_pair(const char *cert, const char *key,
-                             moq_media_overflow_policy_t policy,
-                             uint32_t max_objects, uint64_t max_bytes,
-                             moq_media_time_mode_t time_mode,
-                             moq_pq_threaded_t **out_srv,
-                             moq_media_receiver_t **out_r)
+/* Start a media server serving catalog_json + a create-owned receiver for the
+ * data path. */
+static bool start_media_pair_catalog(const char *cert, const char *key,
+                                     const char *catalog_json,
+                                     moq_media_overflow_policy_t policy,
+                                     uint32_t max_objects, uint64_t max_bytes,
+                                     moq_media_time_mode_t time_mode,
+                                     moq_pq_threaded_t **out_srv,
+                                     moq_media_receiver_t **out_r)
 {
     int port = 0;
     memset(&g_srv, 0, sizeof(g_srv));
-    g_srv.catalog_json = k_media_catalog_json;
+    g_srv.catalog_json = catalog_json;
     g_srv.media_track_name = "v";
     moq_pq_threaded_t *srv = start_server_with(cert, key, server_pump,
                                                &g_srv, &port);
@@ -967,6 +969,19 @@ static bool start_media_pair(const char *cert, const char *key,
     *out_srv = srv;
     *out_r = r;
     return true;
+}
+
+/* Start a media server serving the live LOC catalog + a receiver. */
+static bool start_media_pair(const char *cert, const char *key,
+                             moq_media_overflow_policy_t policy,
+                             uint32_t max_objects, uint64_t max_bytes,
+                             moq_media_time_mode_t time_mode,
+                             moq_pq_threaded_t **out_srv,
+                             moq_media_receiver_t **out_r)
+{
+    return start_media_pair_catalog(cert, key, k_media_catalog_json, policy,
+                                    max_objects, max_bytes, time_mode,
+                                    out_srv, out_r);
 }
 
 /* Drain track events until CATALOG_READY; return the single track handle.
@@ -1699,6 +1714,60 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_track_state(r, track, &ts), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)ts, (int)MOQ_MEDIA_TRACK_STATE_ENDED);
+
+        moq_media_receiver_destroy(r);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_CHECK(!g_srv.failed);
+    }
+
+    /* == a track that was never live ends on Track Ended: the live->VOD
+     *    re-arm (MSF §11.3) applies only to a track that was live, so a
+     *    VOD track finished with Track Ended terminalizes (TRACK_ENDED)
+     *    instead of re-subscribing for a conversion that cannot follow. */
+    {
+        moq_pq_threaded_t *srv = NULL;
+        moq_media_receiver_t *r = NULL;
+        MOQ_TEST_CHECK(start_media_pair_catalog(cert, key,
+            k_media_vod_catalog_json, MOQ_MEDIA_OVERFLOW_DROP_GROUP, 0, 0,
+            MOQ_MEDIA_TIME_RAW, &srv, &r));
+        if (!srv || !r) return 1;
+
+        moq_media_track_t *track = drain_until_ready(r);
+        MOQ_TEST_CHECK(track != NULL);
+        const moq_media_track_desc_t *d = moq_media_track_desc_get(track);
+        MOQ_TEST_CHECK(d && !d->is_live);
+
+        atomic_store(&g_srv.publish_target, 6);
+        MOQ_TEST_CHECK(wait_received(r, 6, 200));
+
+        g_srv.vod_catalog_json = NULL;
+        g_srv.convert_status = MOQ_PUB_DONE_TRACK_ENDED;
+        atomic_store(&g_srv.convert_after, 6);
+
+        int ended = 0;
+        for (int i = 0; i < 300 && ended == 0; i++) {
+            (void)moq_media_receiver_wait(r, 100000);
+            moq_media_object_t obj;
+            while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK)
+                moq_media_object_cleanup(&obj);
+            moq_media_track_event_t ev;
+            while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+                if (ev.track == track && ev.kind == MOQ_MEDIA_TRACK_ENDED) ended++;
+            }
+            if (moq_media_receiver_is_fatal(r)) break;
+        }
+        MOQ_TEST_CHECK_EQ_INT(ended, 1);
+        MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+
+        moq_media_track_state_t ts = MOQ_MEDIA_TRACK_STATE_ACTIVE;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_receiver_track_state(r, track, &ts), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)ts, (int)MOQ_MEDIA_TRACK_STATE_ENDED);
+
+        /* No re-subscribe: give a re-arm time to reach the server. */
+        for (int i = 0; i < 10; i++) (void)moq_media_receiver_wait(r, 50000);
+        MOQ_TEST_CHECK(!atomic_load(&g_srv.media_rejoined));
 
         moq_media_receiver_destroy(r);
         moq_pq_threaded_stop(srv);

@@ -310,10 +310,15 @@ struct moq_media_track {
      * delivered in the same tick as the done is not lost. vod_rearmed is a
      * one-shot guard: a "Track Ended" (live->VOD step 1) re-subscribes once for
      * the now-VOD content; any further done is treated as terminal, so a peer
-     * that keeps finishing cannot spin a re-subscribe loop (MSF §11.3). */
+     * that keeps finishing cannot spin a re-subscribe loop (MSF §11.3).
+     * was_live records whether the catalog that created the track declared it
+     * live (a later generation cannot turn a VOD track live). Only such a track
+     * can convert, and the conversion catalog may land before the done, so the
+     * current is_live cannot decide. */
     bool             done_pending;
     uint64_t         done_status;
     bool             vod_rearmed;
+    bool             was_live;
     bool             has_drop_filter;  /* monotonic: arrivals with
                                           group_id <= drop_below_group are
                                           stragglers of evicted content.
@@ -1486,6 +1491,7 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     d->has_track_duration = mt->has_track_duration;
     d->track_duration_ms = mt->track_duration_ms;
     d->is_live = mt->is_live;                 /* §5.2.7 (mutable via §11.3) */
+    t->was_live = mt->is_live;
     d->has_alt_group = mt->has_alt_group;     d->alt_group = mt->alt_group;
 
     t->is_event_timeline = span_eq_lit(d->packaging, "eventtimeline", 13);
@@ -4310,8 +4316,10 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
  * cleared so reconcile re-subscribes for the VOD content (auto- or
  * explicitly-subscribed alike -- both reconcile on desired_subscribed).
  * vod_rearmed makes that re-arm one-shot, so a peer that keeps finishing before
- * the VOD catalog arrives cannot spin a re-subscribe loop. Any other status, or
- * a repeat done after re-arm, is terminal: the track ends exactly once. */
+ * the VOD catalog arrives cannot spin a re-subscribe loop. Only a track that
+ * some catalog declared live can convert: Track Ended on a track that was never
+ * live is terminal, like any other status or a repeat done after re-arm, and the
+ * track ends exactly once. */
 static void receiver_process_subscription_dones(moq_media_receiver_t *r,
                                                 uint64_t now_us)
 {
@@ -4350,7 +4358,8 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         t->upd_sent_app_gen = 0;
         pthread_mutex_unlock(&r->mu);
 
-        if (status == RECEIVER_DONE_TRACK_ENDED && !t->vod_rearmed && !t->ended) {
+        if (status == RECEIVER_DONE_TRACK_ENDED && t->was_live && !t->vod_rearmed &&
+            !t->ended) {
             /* Re-arm for VOD: keep desired_subscribed; reset the lifecycle flags
              * so the track_state accessor reads PENDING again until the VOD
              * SUBSCRIBE_OK lands. Delivered media stays in the object queue. */
