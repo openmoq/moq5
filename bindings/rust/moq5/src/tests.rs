@@ -157,10 +157,18 @@ unsafe extern "C" fn add_track(
     let c = &*c;
     let name =
         String::from_utf8_lossy(std::slice::from_raw_parts(c.name.data, c.name.len)).into_owned();
-    log(format!(
+    let mut line = format!(
         "add_track {name} refs={}",
         c.content_protection_ref_id_count
-    ));
+    );
+    if c.has_render_group {
+        line += &format!(" render={}", c.render_group);
+    }
+    if c.has_label {
+        let label = crate::types::bytes(c.label);
+        line += &format!(" label={:?}", String::from_utf8_lossy(label));
+    }
+    log(line);
     let i = fake(|f| {
         f.tracks_added += 1;
         f.tracks_added - 1
@@ -487,6 +495,25 @@ fn write_transfers_on_success_and_returns_on_failure() {
     assert_eq!(
         take_log(),
         ["write rc=0", &format!("write rc={MOQ_ERR_WOULD_BLOCK}")]
+    );
+}
+
+#[test]
+fn track_label_and_render_group_reach_libmoq() {
+    let _s = suite();
+    let ep = endpoint();
+    let sender = MediaSender::attach(&ep, SenderConfig::live(ns())).unwrap();
+    take_log();
+    sender
+        .add_track(video().label("Main camera").render_group(-3))
+        .unwrap();
+    sender.add_track(video().label("")).unwrap();
+    assert_eq!(
+        take_log(),
+        [
+            "add_track video refs=0 render=-3 label=\"Main camera\"",
+            "add_track video refs=0 label=\"\"",
+        ]
     );
 }
 
