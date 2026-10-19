@@ -509,6 +509,8 @@ pub struct TrackConfig {
     track_duration_ms: Option<u64>,
     media_timeline: Option<u32>,
     alt_group: Option<i32>,
+    render_group: Option<i32>,
+    label: Option<String>,
 }
 
 impl TrackConfig {
@@ -542,6 +544,8 @@ impl TrackConfig {
             track_duration_ms: None,
             media_timeline: None,
             alt_group: None,
+            render_group: None,
+            label: None,
         }
     }
 
@@ -630,6 +634,16 @@ impl TrackConfig {
         self.alt_group = Some(group);
         self
     }
+    /// MSF renderGroup: tracks sharing a value are meant to render together.
+    pub fn render_group(mut self, group: i32) -> Self {
+        self.render_group = Some(group);
+        self
+    }
+    /// MSF label: human-readable track-selection text.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
 }
 
 /// A track cfg in libmoq's form, owning what its pointers reach.
@@ -690,6 +704,14 @@ impl PreparedTrack {
         if let Some(g) = cfg.alt_group {
             raw.has_alt_group = true;
             raw.alt_group = g;
+        }
+        if let Some(g) = cfg.render_group {
+            raw.has_render_group = true;
+            raw.render_group = g;
+        }
+        if let Some(l) = &cfg.label {
+            raw.has_label = true;
+            raw.label = span(l.as_bytes());
         }
         PreparedTrack {
             raw,

@@ -284,6 +284,9 @@ pub enum TrackEventKind {
     /// Local delivery capacity refused the track's objects: a live track
     /// fails, a fill fails only that fill.
     DeliveryLocalFailure,
+    /// A local UPDATE admission (pause/resume) failed permanently; that
+    /// track generation has failed (not a peer rejection).
+    UpdateLocalFailure,
     /// A kind this crate does not know yet.
     Other(u32),
 }
@@ -309,6 +312,7 @@ impl<'r> TrackEvent<'r> {
             sys::MOQ_MEDIA_TRACK_LOCAL_FAILURE => TrackEventKind::LocalFailure,
             sys::MOQ_MEDIA_TRACK_FILL_TERMINAL => TrackEventKind::FillTerminal,
             sys::MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE => TrackEventKind::DeliveryLocalFailure,
+            sys::MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE => TrackEventKind::UpdateLocalFailure,
             k => TrackEventKind::Other(k),
         }
     }
