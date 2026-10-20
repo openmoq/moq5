@@ -598,6 +598,91 @@ static void test_write_single_sub(void) {
     MOQ_TEST_PASS("write_single_sub");
 }
 
+/* end_track queues a terminal subgroup -- open, END_OF_TRACK object, FIN --
+ * in one go. With stream keys (as under the transport bridge) the open takes
+ * one slot more, so with three slots free the call waits rather than strand
+ * the subgroup without its FIN. */
+static void test_end_track_with_stream_keys(void)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_cfg_t scfg_pair = MOQ_SIMPAIR_CFG_INIT;
+    scfg_pair.alloc = &alloc;
+    scfg_pair.seed = 42;
+    scfg_pair.initial_now_us = 1000;
+    scfg_pair.client_send_request_capacity = true;
+    scfg_pair.client_initial_request_capacity = 16;
+    scfg_pair.server_send_request_capacity = true;
+    scfg_pair.server_initial_request_capacity = 16;
+    scfg_pair.max_actions = 4;
+    moq_simpair_t *sp = NULL;
+    MOQ_TEST_CHECK(moq_simpair_create(&scfg_pair, &sp) == MOQ_OK);
+    if (!sp) return;
+    moq_simpair_start(sp);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_session_t *srv = moq_simpair_server(sp);
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+        moq_event_cleanup(&ev);
+    while (moq_session_poll_events(srv, &ev, 1) == 1) moq_event_cleanup(&ev);
+    MOQ_TEST_CHECK(moq_session_set_data_priority_updates(srv, true) == MOQ_OK);
+
+    moq_pub_cfg_t cfg;
+    moq_pub_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    moq_publisher_t *pub = NULL;
+    moq_pub_create(srv, &alloc, &cfg, &pub);
+    moq_pub_track_cfg_t tcfg;
+    moq_pub_track_cfg_init(&tcfg);
+    moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("live") };
+    tcfg.track_namespace.parts = ns_parts;
+    tcfg.track_namespace.count = 1;
+    tcfg.track_name = MOQ_BYTES_LITERAL("video");
+    moq_pub_track_t *track = NULL;
+    moq_pub_add_track(pub, &tcfg, moq_simpair_now_us(sp), &track);
+
+    moq_subscribe_cfg_t sub;
+    moq_subscribe_cfg_init(&sub);
+    sub.track_namespace.parts = ns_parts;
+    sub.track_namespace.count = 1;
+    sub.track_name = MOQ_BYTES_LITERAL("video");
+    moq_subscription_t sub_h;
+    moq_session_subscribe(moq_simpair_client(sp), &sub, moq_simpair_now_us(sp),
+                          &sub_h);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    while (moq_session_poll_events(srv, &ev, 1) == 1) {
+        moq_pub_event_result_t res;
+        moq_pub_handle_event(pub, &ev, moq_simpair_now_us(sp), &res);
+        moq_event_cleanup(&ev);
+    }
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+
+    /* One unrelated action leaves three slots. */
+    moq_subscribe_cfg_t other = sub;
+    other.track_name = MOQ_BYTES_LITERAL("other");
+    moq_subscription_t other_h;
+    MOQ_TEST_CHECK(moq_session_subscribe(srv, &other, moq_simpair_now_us(sp),
+                                         &other_h) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_session_action_capacity(srv), 3);
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) ==
+                   MOQ_ERR_WOULD_BLOCK);
+    moq_action_t act;
+    MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(srv, &act, 1), 1);
+    moq_action_cleanup(&act);
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) ==
+                   MOQ_OK);
+    bool fin = false;
+    while (moq_session_poll_actions(srv, &act, 1) == 1) {
+        if (act.kind == MOQ_ACTION_SEND_DATA && act.u.send_data.fin) fin = true;
+        moq_action_cleanup(&act);
+    }
+    MOQ_TEST_CHECK(fin);
+
+    moq_pub_destroy(pub);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_PASS("end_track_with_stream_keys");
+}
+
 /* moq_pub_end_track: reliable terminal + the now-defined write-after-end
  * contract (WRONG_STATE, not undefined) + idempotency, end to end over the
  * SimPair wire. */
@@ -16910,6 +16995,7 @@ int main(void) {
     test_subscribe_duplicate_rejected();
     test_write_single_sub();
     test_end_track();
+    test_end_track_with_stream_keys();
     test_finish_subscribers();
     test_finish_subscribers_skips_publication();
     test_finish_subscribers_pub_mid_object();
