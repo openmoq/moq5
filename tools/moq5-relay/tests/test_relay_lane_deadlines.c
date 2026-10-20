@@ -8,6 +8,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lanedeadline.h"
@@ -140,6 +141,24 @@ t_bounds(void)
     MOQ_TEST_CHECK_EQ_U64(
         moqr_cli_lane_deadlines_at(&d, MOQR_CLI_LANE_DEADLINE_SLOTS),
         UINT64_MAX);
+
+    /* `count` is a plain field: one set past the capacity without init still
+     * never reaches beyond the table. The table is allocated at its exact
+     * size, so an access past it is outside the allocation. */
+    moqr_cli_lane_deadlines_t *h = malloc(sizeof(*h));
+    MOQ_TEST_CHECK(h != NULL);
+    if (h != NULL) {
+        moqr_cli_lane_deadlines_init(h, MOQR_CLI_LANE_DEADLINE_SLOTS);
+        h->count = MOQR_CLI_LANE_DEADLINE_SLOTS + 7u;
+        moqr_cli_lane_deadlines_publish(h, MOQR_CLI_LANE_DEADLINE_SLOTS, 10, 1);
+        MOQ_TEST_CHECK_EQ_U64(
+            moqr_cli_lane_deadlines_at(h, MOQR_CLI_LANE_DEADLINE_SLOTS),
+            UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_U64(
+            moqr_cli_lane_deadlines_at(h, MOQR_CLI_LANE_DEADLINE_SLOTS - 1u),
+            UINT64_MAX);
+        free(h);
+    }
     return failures;
 }
 
