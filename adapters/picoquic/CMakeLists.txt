@@ -635,6 +635,32 @@ if(MOQ_BUILD_TESTS)
         moq_add_picoquic_terminal_tests(pq moq::adapter-picoquic ${_adapter_tls_link})
     endif()
 
+    # Source-mode builds carry patches/picoquic (see patches/picoquic/series);
+    # the contract below holds only with 0011 applied.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND _PQ)
+        # The stateless-reset contract patches/picoquic/0011 carries: detection
+        # after a NAT rebinding and behind another connection's ID, and a
+        # context that never sends a reset. Public picoquic API only, so a
+        # picoquic without the patch fails here, not in a relay.
+        add_executable(test_pq_stateless_reset_contract
+            tests/test_pq_stateless_reset_contract.c)
+        target_compile_definitions(test_pq_stateless_reset_contract PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        target_include_directories(test_pq_stateless_reset_contract PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_stateless_reset_contract PRIVATE
+            ${_PQ} ${_adapter_tls_link})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_stateless_reset_contract PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_stateless_reset_contract
+            COMMAND test_pq_stateless_reset_contract)
+        set_tests_properties(pq_stateless_reset_contract PROPERTIES TIMEOUT 120)
+    endif()
+
     # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
     # configures scratch trees and reads their generated link lines, so it is
     # independent of the host linker's warnings.
