@@ -734,6 +734,14 @@ struct moqr_core {
     uint64_t   fetch_pin_cap;            /* total pinnable payload bytes;
                                           * floored >= per-track log max_bytes */
     uint64_t   fetch_pin_used;
+
+#ifdef MOQR_CORE_TESTING
+    /* moqr_core_debug_hold_binding_close: the binding closes still to refuse
+     * before any effect, how many were refused, and the cookie of the last. */
+    uint32_t   dbg_close_hold;
+    uint32_t   dbg_close_held;
+    uint64_t   dbg_close_held_cookie;
+#endif
 };
 
 /* -- small helpers ------------------------------------------------------------- */
@@ -3567,6 +3575,14 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
     if (b == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
+#ifdef MOQR_CORE_TESTING
+    if (c->dbg_close_hold > 0) {
+        c->dbg_close_hold--;
+        c->dbg_close_held++;
+        c->dbg_close_held_cookie = b->cookie;
+        return MOQR_ERR_WOULD_BLOCK;   /* before any effect */
+    }
+#endif
 
     /* Resumable close. The atomic worst case (parked-sub rejects +
      * per-announce NS_GONE fan-out over possibly many announced namespaces)
@@ -9595,6 +9611,33 @@ moqr_core_debug_begun_ledger(const moqr_core_t *c, moqr_sub_t sh,
     *out_sub_begun = s->begun_count;
     *out_binding_begun_subs = b->begun_subs;
     return true;
+}
+
+/* Test-only: the next `attempts` calls of moqr_core_binding_close on this core
+ * (any live binding) return MOQR_ERR_WOULD_BLOCK before any effect, as a close
+ * that cannot yet make progress does; 0 releases the hold. The core's owner
+ * thread only, like every other core call. Never compiled into a production
+ * core. */
+void
+moqr_core_debug_hold_binding_close(moqr_core_t *c, uint32_t attempts)
+{
+    if (c != NULL) {
+        c->dbg_close_hold = attempts;
+    }
+}
+
+/* Test-only: how many closes the hold refused, and the cookie of the binding
+ * the last one named. */
+uint32_t
+moqr_core_debug_binding_close_held(const moqr_core_t *c, uint64_t *out_cookie)
+{
+    if (c == NULL) {
+        return 0;
+    }
+    if (out_cookie != NULL) {
+        *out_cookie = c->dbg_close_held_cookie;
+    }
+    return c->dbg_close_held;
 }
 #endif /* MOQR_CORE_TESTING */
 
