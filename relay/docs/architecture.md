@@ -134,15 +134,45 @@ raw MsQuic managed adapter the executable is not built. Tests carry the
 
 ## The production runtime (MsQuic managed lanes)
 
-`moq5-relay serve` runs over the **MsQuic managed** server, gated on
-`moq::adapter-msquic-managed` — there is no picoquic fallback for the
-production executable. `listener.lanes` defaults to 1 and is bounded at 64.
+`moq5-relay serve` runs over the **MsQuic managed** server by default, gated on
+`moq::adapter-msquic-managed`. Where the threaded PicoQUIC server is also built,
+`listener.transport: "picoquic"` serves raw QUIC on it instead; it is never
+chosen implicitly (see below). `listener.lanes` defaults to 1 and is bounded at 64.
 Lane count 1 keeps the direct single-core path; lane count greater than 1
 instantiates `moqr_shards_t` with exactly one shard per lane:
 
 ```
 MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace }  ->  sessions
 ```
+
+**The PicoQUIC listener** (`listener.transport: "picoquic"`) runs the same
+shard runtime, binding, core, auth, cache, retrieval, admin endpoint and
+metrics; only the facade differs. It is one `moq_pq_threaded_t` -- one
+picoquic context and network thread -- on the listener port, and it runs the
+shard runtime at its one lane (no cross-shard plane at one shard). What it is
+and is not:
+
+- Raw QUIC only, drafts 16, 18 and 22 as configured. A `webtransport` object
+  beside it is refused at load; WebTransport is the wtquic-MsQuic listener's.
+- One lane. `listener.lanes` above 1 is refused at load: several picoquic
+  contexts on one port would be routed by the kernel on each datagram's
+  address, not its connection ID, so a connection whose packets reach another
+  context (a NAT rebinding, a socket joining the port) would be lost. One
+  context validates and follows a client's new path itself (RFC 9000,
+  Section 9). Several lanes need connection-ID routing between contexts.
+- The facade is created with `retain_terminal_until_ack`, so a closed
+  connection and its session stay valid until the binding has detached and
+  the reap pass acknowledges it (`moqr_relay_reap_pass_pq`).
+- Tuning (`relay_pq_configure`, through the facade's `configure_quic`): the
+  configured congestion controller (`listener.picoquic.congestion`, default
+  BBR), 8192 concurrent unidirectional and 1024 bidirectional streams, 64 MiB
+  connection and 16 MiB request/control-stream credit, NEW_TOKEN issuance
+  (cookie mode 2), datagram priority above media streams and below control,
+  a 10 s handshake timeout, and the socket buffer size
+  (`listener.picoquic.socket_buffer_bytes`, default 4 MiB).
+- Lane doorbell statistics are an MsQuic facade's; the PicoQUIC lane row
+  reports them as refused, never as zeros, and the single shard's cross-shard
+  plane as absent.
 
 - **`on_lane_pump` is the only session-access window.** Every `moq_session_*`
   and `moqr_bind_*` call happens inside it, under that lane's lock domain.
@@ -338,7 +368,8 @@ contract row, not just the path text.
 | `moq_msquic_lane_next_conn` / `moq_msquic_managed_conn_session` | lane-local connection iteration + per-conn session, valid only inside `on_lane_pump`; a terminal conn stays visible for the batch delivering `SESSION_CLOSED`, then is reaped; `_conn_close(conn, code)` defers past the pump | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_managed_conn_user` / `_set_user` | per-connection state slot — the relay keys its per-conn binding tag here (never a pointer-keyed map: conn/session pointers can be reused by a successor connection) | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_managed_session` | CLIENT-only convenience — NULL on a SERVER and outside the pump; the relay server must NOT use it, it iterates lane conns instead | `adapters/msquic/include/moq/msquic_managed.h` |
-| Other managed adapters (`moq_pq_threaded_t`, `moq_mvfst_managed_t`) — NOT the production relay transport | historical / non-production: same create/stop/destroy + `on_pump` confinement shape; the executable no longer links picoquic-threaded | `adapters/picoquic/include/moq/picoquic_threaded.h`, `adapters/mvfst/include/moq/mvfst.h` |
+| `moq_pq_threaded_t` — the PicoQUIC relay transport (`listener.transport: "picoquic"`) | one network thread and one lane; the relay runs one facade; `on_lane_pump` confinement, run with or without connections; per-connection slot `moq_picoquic_threaded_conn_user`/`_set_user`; terminal connections retained until `moq_picoquic_threaded_conn_ack_terminal` | `adapters/picoquic/include/moq/picoquic_threaded.h` |
+| `moq_mvfst_managed_t` — NOT a relay transport | same create/stop/destroy + `on_pump` confinement shape | `adapters/mvfst/include/moq/mvfst.h` |
 
 ## Draft-22 behaviour
 

@@ -6,7 +6,15 @@
  *
  * {
  *   "listener": {
- *     "transport": "msquic",            // optional; only value accepted
+ *     "transport": "msquic",            // optional; "msquic" (default) or
+ *                                       // "picoquic": raw QUIC only (no
+ *                                       // webtransport object), one lane
+ *     "picoquic": {                     // optional; transport "picoquic" only
+ *       "congestion": "bbr",            // bbr (default), bbr1, cubic, dcubic,
+ *                                       // newreno, prague
+ *       "socket_buffer_bytes": 4194304  // UDP send/receive buffers; default
+ *                                       // 4 MiB; 0 = the OS default
+ *     },
  *     "host": "0.0.0.0",                // optional
  *     "port": 4443,                     // required, 1..65535
  *     "cert": "/path/cert.pem",         // required for serve
@@ -341,6 +349,20 @@ typedef struct moqr_cli_admin {
  * the caller keeps alive for as long as anything borrows from it. A failed
  * parse must not be used to start a listener.
  */
+/* The raw-QUIC listener's transport. */
+typedef enum moqr_cli_transport {
+    MOQR_CLI_TRANSPORT_MSQUIC = 0,     /* the default */
+    MOQR_CLI_TRANSPORT_PICOQUIC = 1
+} moqr_cli_transport_t;
+
+/* listener.picoquic: the PicoQUIC listener's tuning. */
+typedef struct moqr_cli_picoquic {
+    char     congestion[16];      /* a picoquic algorithm name */
+    uint32_t socket_buffer_bytes; /* 0 = the operating-system default */
+} moqr_cli_picoquic_t;
+
+#define MOQR_CLI_PICOQUIC_DEFAULT_SOCKET_BUFFER (4u * 1024u * 1024u)
+
 typedef struct moqr_cli_config {
     char     host[256];
     int      port;
@@ -360,6 +382,8 @@ typedef struct moqr_cli_config {
      * telemetry name the SET, never just the first entry. */
     char     alpn_set[MOQR_CLI_MAX_VERSIONS * 17];
     uint32_t lanes;               /* connection lock-domain lanes; 1..64, def 1 */
+    moqr_cli_transport_t transport; /* listener.transport */
+    moqr_cli_picoquic_t  picoquic;  /* listener.picoquic (transport picoquic) */
     bool     insecure_skip_verify;
     moqr_cli_telemetry_t telemetry;
     moqr_cli_auth_t      auth;
@@ -422,6 +446,13 @@ moqr_result_t moqr_cli_facade_caps(const moqr_cli_config_t *cfg,
 
 /* True when the parsed config carries a WebTransport listener. */
 bool moqr_cli_config_has_webtransport(const moqr_cli_config_t *cfg);
+
+/* Whether serve runs the shard runtime rather than the direct single-lane
+ * composition: more than one lane across both listeners, or a PicoQUIC raw
+ * listener, whose facades are its lanes at every count. Serve's dispatch and
+ * the capacity model both ask this, so the ceiling describes the composition
+ * that runs. */
+bool moqr_cli_uses_shard_runtime(const moqr_cli_config_t *cfg);
 
 /* Resolve the plan, or refuse with a reason. Refuses before anything is
  * allocated: a combined lane count past the runtime cap, or a listener with no

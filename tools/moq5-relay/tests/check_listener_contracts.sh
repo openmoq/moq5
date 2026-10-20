@@ -309,7 +309,7 @@ activation_order=$(awk '
     active {
         if (/moq_wtquic_msquic_managed_destroy\(ctx->wt\)/ && !cleared)
             wt=1
-        if (/moq_msquic_managed_destroy\(t\)/ && !cleared)
+        if (/moq_msquic_managed_destroy\(t\)|relay_raw_destroy\(ctx\)/ && !cleared)
             raw=1
         if (/atomic_store_explicit\(&ctx(->|\.)admin_listen, NULL/) {
             if (!raw || (arm == 2 && !wt)) bad=1

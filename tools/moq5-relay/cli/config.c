@@ -184,9 +184,65 @@ wt_val_is(const char *p, size_t n, const char *lit)
     return n == m && memcmp(p, lit, m) == 0;
 }
 
+/* The congestion controllers a picoquic listener may name: picoquic's own
+ * algorithm identifiers, as a closed set so a typo is refused at load. */
+static const char *const k_pq_congestion[] = {
+    "bbr", "bbr1", "cubic", "dcubic", "newreno", "prague"
+};
+
+static moqr_result_t
+parse_picoquic(struct json_object_s *o, moqr_cli_picoquic_t *out,
+               char *err, size_t err_len)
+{
+    bool seen_congestion = false, seen_buffer = false;
+    for (struct json_object_element_s *e = o->start; e != NULL;
+         e = e->next) {
+        const char *k = e->name->string;
+        if (strcmp(k, "congestion") == 0) {
+            if (seen_congestion) {
+                cfg_err(err, err_len, "listener.picoquic.congestion: duplicate key");
+                return MOQR_ERR_INVAL;
+            }
+            seen_congestion = true;
+            char c[sizeof(out->congestion)];
+            bool ok = copy_string(e->value, c, sizeof(c));
+            bool known = false;
+            for (size_t i = 0; ok && i < sizeof(k_pq_congestion) /
+                                         sizeof(k_pq_congestion[0]); i++) {
+                known = known || strcmp(c, k_pq_congestion[i]) == 0;
+            }
+            if (!known) {
+                cfg_err(err, err_len,
+                        "listener.picoquic.congestion: need bbr, bbr1, cubic, "
+                        "dcubic, newreno or prague");
+                return MOQR_ERR_INVAL;
+            }
+            memcpy(out->congestion, c, sizeof(c));
+        } else if (strcmp(k, "socket_buffer_bytes") == 0) {
+            if (seen_buffer) {
+                cfg_err(err, err_len,
+                        "listener.picoquic.socket_buffer_bytes: duplicate key");
+                return MOQR_ERR_INVAL;
+            }
+            seen_buffer = true;
+            uint64_t n = 0;
+            if (!num_u64(e->value, &n) || n > INT32_MAX) {
+                cfg_err(err, err_len,
+                        "listener.picoquic.socket_buffer_bytes: need 0..2147483647");
+                return MOQR_ERR_INVAL;
+            }
+            out->socket_buffer_bytes = (uint32_t)n;
+        } else {
+            cfg_err(err, err_len, "listener.picoquic: unknown key");
+            return MOQR_ERR_INVAL;
+        }
+    }
+    return MOQR_OK;
+}
+
 static moqr_result_t
 parse_listener(struct json_object_s *o, moqr_cli_config_t *out,
-               char *err, size_t err_len)
+               bool *seen_picoquic, char *err, size_t err_len)
 {
     bool have_port = false;
     for (struct json_object_element_s *e = o->start; e != NULL;
@@ -194,11 +250,29 @@ parse_listener(struct json_object_s *o, moqr_cli_config_t *out,
         const char *k = e->name->string;
         if (strcmp(k, "transport") == 0) {
             char t[32];
-            if (!copy_string(e->value, t, sizeof(t)) ||
-                strcmp(t, "msquic") != 0) {
+            if (copy_string(e->value, t, sizeof(t)) &&
+                strcmp(t, "msquic") == 0) {
+                out->transport = MOQR_CLI_TRANSPORT_MSQUIC;
+            } else if (copy_string(e->value, t, sizeof(t)) &&
+                       strcmp(t, "picoquic") == 0) {
+                out->transport = MOQR_CLI_TRANSPORT_PICOQUIC;
+            } else {
                 cfg_err(err, err_len,
-                        "listener.transport: only \"msquic\" is supported");
+                        "listener.transport: need \"msquic\" or \"picoquic\"");
                 return MOQR_ERR_INVAL;
+            }
+        } else if (strcmp(k, "picoquic") == 0) {
+            struct json_object_s *po = json_value_as_object(e->value);
+            if (po == NULL || *seen_picoquic) {
+                cfg_err(err, err_len, po == NULL
+                            ? "listener.picoquic: need an object"
+                            : "listener.picoquic: duplicate key");
+                return MOQR_ERR_INVAL;
+            }
+            *seen_picoquic = true;
+            moqr_result_t prc = parse_picoquic(po, &out->picoquic, err, err_len);
+            if (prc != MOQR_OK) {
+                return prc;
             }
         } else if (strcmp(k, "host") == 0) {
             if (!copy_string(e->value, out->host, sizeof(out->host))) {
@@ -1353,6 +1427,14 @@ moqr_cli_total_lanes(const moqr_cli_config_t *cfg)
 }
 
 bool
+moqr_cli_uses_shard_runtime(const moqr_cli_config_t *cfg)
+{
+    return cfg != NULL &&
+           (moqr_cli_total_lanes(cfg) > 1 ||
+            cfg->transport == MOQR_CLI_TRANSPORT_PICOQUIC);
+}
+
+bool
 moqr_cli_config_has_webtransport(const moqr_cli_config_t *cfg)
 {
     return cfg != NULL && cfg->wt.enabled;
@@ -1420,6 +1502,8 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
     moqr_core_relay_cfg_init_sized(&out->core, sizeof(out->core), NULL);
     snprintf(out->host, sizeof(out->host), "0.0.0.0");
     out->lanes = 1;   /* default single-lane; listener.lanes overrides */
+    snprintf(out->picoquic.congestion, sizeof(out->picoquic.congestion), "bbr");
+    out->picoquic.socket_buffer_bytes = MOQR_CLI_PICOQUIC_DEFAULT_SOCKET_BUFFER;
     cfg_err(err, err_len, "ok");
 
     struct json_value_s *root = json_parse(json, len);
@@ -1433,6 +1517,7 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
     bool seen_admin = false;
     bool seen_logging = false;
     bool seen_wt = false;
+    bool seen_picoquic = false;
     out->logging.format = MOQR_CLI_LOG_TEXT;
     if (o == NULL) {
         cfg_err(err, err_len, "top level must be an object");
@@ -1447,7 +1532,7 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
                 cfg_err(err, err_len, "listener: need an object");
                 rc = MOQR_ERR_INVAL;
             } else {
-                rc = parse_listener(lo, out, err, err_len);
+                rc = parse_listener(lo, out, &seen_picoquic, err, err_len);
                 have_listener = rc == MOQR_OK;
             }
         } else if (strcmp(k, "admin") == 0) {
@@ -1539,6 +1624,30 @@ moqr_cli_config_parse(const char *json, size_t len, moqr_cli_config_t *out,
     }
     if (rc == MOQR_OK && !have_listener) {
         cfg_err(err, err_len, "listener is required");
+        rc = MOQR_ERR_INVAL;
+    }
+    if (rc == MOQR_OK && seen_picoquic &&
+        out->transport != MOQR_CLI_TRANSPORT_PICOQUIC) {
+        cfg_err(err, err_len,
+                "listener.picoquic: requires listener.transport \"picoquic\"");
+        rc = MOQR_ERR_INVAL;
+    }
+    if (rc == MOQR_OK && out->transport == MOQR_CLI_TRANSPORT_PICOQUIC &&
+        out->lanes > 1) {
+        /* Independent picoquic contexts on one port are routed by the kernel
+         * on each datagram's address, not its connection ID: a connection
+         * whose packets arrive on another lane (a NAT rebinding, or a socket
+         * joining the port) is lost. One lane is one context. */
+        cfg_err(err, err_len,
+                "listener.lanes: a picoquic listener serves one lane");
+        rc = MOQR_ERR_INVAL;
+    }
+    if (rc == MOQR_OK && out->transport == MOQR_CLI_TRANSPORT_PICOQUIC &&
+        out->wt.enabled) {
+        /* The PicoQUIC listener serves raw QUIC; WebTransport is the
+         * wtquic-MsQuic listener's, and is not implied by this one. */
+        cfg_err(err, err_len,
+                "webtransport: not served with listener.transport \"picoquic\"");
         rc = MOQR_ERR_INVAL;
     }
     if (rc == MOQR_OK && out->alpn_count == 0) {
@@ -1794,7 +1903,7 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
     if (cfg == NULL) {
         return MOQR_ERR_INVAL;
     }
-    if (moqr_cli_total_lanes(cfg) <= 1) {
+    if (!moqr_cli_uses_shard_runtime(cfg)) {
         /* Cross-field validation FIRST, through the same shared resolver
          * lanes>1 uses: "lanes=1 accepts the object" means valid inert
          * settings — an explicit demand_channel_bytes below one resolved
@@ -1853,8 +1962,8 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
         }
         return MOQR_OK;
     }
-    /* lanes > 1: the SAME builder serve consumes, described whole, plus the
-     * CLI's own multi-lane context and snapshot rows. */
+    /* The shard runtime: the SAME builder serve consumes, described whole,
+     * plus the CLI's own multi-lane context and snapshot rows. */
     moqr_shards_cfg_t scfg;
     moqr_cli_build_shards_cfg(cfg, alloc, &scfg);
     moqr_shards_capacity_t sc;

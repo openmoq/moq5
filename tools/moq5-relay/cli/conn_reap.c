@@ -102,3 +102,52 @@ bool moqr_relay_reap_pass_wt(moqr_bind_t *bind,
     return true;
 }
 #endif /* MOQR_DUAL_LISTENER */
+
+#ifdef MOQR_HAVE_PICOQUIC
+bool moqr_relay_reap_pass_pq(moqr_bind_t *bind, moq_pq_threaded_lane_t *lane,
+                             moqr_reap_stats_t *st)
+{
+    if (bind == NULL || lane == NULL) {
+        return false;
+    }
+    for (moq_pq_threaded_conn_t *conn = moq_pq_threaded_lane_next_conn(lane,
+                                                                       NULL);
+         conn != NULL; conn = moq_pq_threaded_lane_next_conn(lane, conn)) {
+        moq_session_t *s = moq_pq_threaded_conn_session(conn);
+
+        if (s == NULL) {
+            continue;
+        }
+        void *tag = moq_picoquic_threaded_conn_user(conn);
+        if (tag == MOQR_CONN_OPENED && !moqr_bind_conn_is_open(bind, s)) {
+            moq_picoquic_threaded_conn_set_user(conn, MOQR_CONN_DEAD);
+            tag = MOQR_CONN_DEAD;
+        }
+        if (tag != MOQR_CONN_DEAD) {
+            continue;
+        }
+        moq_event_t evs[16];
+        size_t n;
+        while ((n = moq_session_poll_events(s, evs, 16)) > 0) {
+            for (size_t e = 0; e < n; e++) {
+                moq_event_cleanup(&evs[e]);
+            }
+        }
+        moq_result_t rc = moq_picoquic_threaded_conn_ack_terminal(conn);
+        if (rc == MOQ_OK) {
+            if (st != NULL) {
+                st->acked++;
+            }
+        } else if (rc == MOQ_ERR_WRONG_STATE) {
+            /* Not terminal yet, or its SESSION_CLOSED is still to come: the
+             * connection is retained and the next pump retries. */
+            if (st != NULL) {
+                st->retained++;
+            }
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+#endif /* MOQR_HAVE_PICOQUIC */

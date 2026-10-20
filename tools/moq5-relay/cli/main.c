@@ -68,6 +68,13 @@ static uint8_t g_test_serve_log_last_state;
 #include <moq/relay/moqr_obs.h>
 
 #include <moq/msquic_managed.h>
+#ifdef MOQR_HAVE_PICOQUIC
+#include <moq/picoquic_threaded.h>
+#include <picoquic.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 
 #include <inttypes.h>
 #include <signal.h>
@@ -1242,7 +1249,7 @@ print_capacity(const moqr_cli_config_t *cfg, size_t serve_ctx_bytes, FILE *out)
            cap.total_bytes);
     fprintf(out, "  (allocator requests only — excludes malloc metadata, "
            "size-class rounding,\n   fragmentation, thread stacks, "
-           "transient diagnostics, and MsQuic/session\n   memory that "
+           "transient diagnostics, and transport/session\n   memory that "
            "remains adapter-owned)\n");
     fprintf(out, "  per shard: structure %" PRIu64 " + payloads %" PRIu64
            " + binding %" PRIu64 " + trace %" PRIu64 " bytes\n",
@@ -1255,7 +1262,7 @@ print_capacity(const moqr_cli_config_t *cfg, size_t serve_ctx_bytes, FILE *out)
     }
     if (cap.cli_runtime_bytes != 0) {
         fprintf(out, "  cli runtime: %" PRIu64 " bytes (snapshot rows, plus the "
-               "serve context at lanes > 1; included above)\n",
+               "serve context on the shard runtime; included above)\n",
                cap.cli_runtime_bytes);
     }
     if (cap.admin_bytes != 0) {
@@ -1589,6 +1596,15 @@ cmd_serve(const moqr_cli_config_t *cfg)
 
 /* -- multi-lane serve (listener.lanes > 1) --------------------------------- */
 
+/* Whether serve runs the shard runtime (cmd_serve_lanes): more than one lane
+ * across both listeners, or any PicoQUIC listener, whose facades are its
+ * lanes at every count. */
+static bool
+relay_uses_shard_runtime(const moqr_cli_config_t *cfg)
+{
+    return moqr_cli_uses_shard_runtime(cfg);
+}
+
 /* Lane-local state, indexed by shard == lane index. Written/read only on the
  * owning lane's pump, or by the main thread after every lane has joined. */
 typedef struct serve_lanes_ctx {
@@ -1600,9 +1616,26 @@ typedef struct serve_lanes_ctx {
      * owns the destination shard instead of the same-numbered lane on the
      * wrong facade. */
     moqr_cli_shard_plan_t plan;
-    moq_msquic_managed_t *raw;
+    moq_msquic_managed_t *raw;   /* NULL when the raw lanes are PicoQUIC */
 #ifdef MOQR_DUAL_LISTENER
     moq_wtquic_msquic_managed_t *wt;   /* NULL unless configured */
+#endif
+#ifdef MOQR_HAVE_PICOQUIC
+    /* listener.transport "picoquic": one facade -- one network thread, one
+     * lane -- per raw lane (the configuration admits one). pq_lane[i] is
+     * what facade i's callbacks are handed. A facade's lane pumps from the
+     * moment it is created, before the main thread has stored its handle, so
+     * the handles are published atomically: a wake aimed at a facade not yet
+     * stored finds none, and the wake of every lane after the last create
+     * replays it. */
+    _Atomic(moq_pq_threaded_t *) pq[MOQR_CLI_MAX_LANES];
+    _Atomic uint32_t             pq_count;
+    struct relay_pq_lane {
+        struct serve_lanes_ctx    *ctx;
+        uint32_t                   index;   /* raw lane == facade index */
+        moqr_cli_deadline_range_t  deadline;
+    } pq_lane[MOQR_CLI_MAX_LANES];
+    const moqr_cli_config_t *cfg;   /* for the facades' configure_quic */
 #endif
     moqr_obs_labels_t    labels[MOQR_CLI_MAX_LANES];
     /* Routes and metrics are driven by different requesters now, so a lane
@@ -1655,6 +1688,11 @@ relay_wt_lane_deadline(void *vctx, uint32_t lane_index)
  * binding, step the shard, then wake exactly the destination lanes whose
  * control mailboxes accepted a cross-shard push. Every session touched here is
  * owned by this lane, under this lane's lock domain. */
+#if defined(MOQR_HAVE_PICOQUIC) && defined(MOQR_PUMP_TESTING)
+/* Test counter: wakes for a PicoQUIC lane whose facade was not yet published. */
+_Atomic unsigned g_test_pq_wakes_unpublished;
+#endif
+
 /* Wake the lane that owns a GLOBAL shard, on whichever facade that is. The
  * cross-shard mask is expressed in global shards, so this is the only place
  * allowed to turn one into a lane handle.
@@ -1666,6 +1704,22 @@ static bool
 serve_wake_shard_checked(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
                          uint32_t shard)
 {
+#ifdef MOQR_HAVE_PICOQUIC
+    if (ctx->cfg != NULL && ctx->cfg->transport == MOQR_CLI_TRANSPORT_PICOQUIC &&
+        shard >= ctx->plan.raw_first &&
+        shard < ctx->plan.raw_first + ctx->plan.raw_count) {
+        uint32_t i = shard - ctx->plan.raw_first;
+        moq_pq_threaded_t *f = atomic_load_explicit(&ctx->pq[i],
+                                                    memory_order_acquire);
+#ifdef MOQR_PUMP_TESTING
+        if (f == NULL) {
+            atomic_fetch_add(&g_test_pq_wakes_unpublished, 1u);
+        }
+#endif
+        return f != NULL &&
+               moq_pq_threaded_lane_wake(moq_pq_threaded_lane(f, 0)) == MOQ_OK;
+    }
+#endif
     if (raw != NULL && shard >= ctx->plan.raw_first &&
         shard < ctx->plan.raw_first + ctx->plan.raw_count) {
         return moq_msquic_lane_wake(
@@ -1707,7 +1761,9 @@ serve_lanes_fill_labels(moqr_obs_labels_t *labels,
     for (uint32_t i = 0; i < plan->raw_count; i++) {
         labels[plan->raw_first + i] =
             (moqr_obs_labels_t){ .shard = (uint16_t)(plan->raw_first + i),
-                                 .transport = "msquic",
+                                 .transport =
+                                     cfg->transport == MOQR_CLI_TRANSPORT_PICOQUIC
+                                         ? "picoquic" : "msquic",
                                  .version = cfg->alpn_set };
     }
     for (uint32_t i = 0; i < plan->wt_count; i++) {
@@ -1884,14 +1940,19 @@ relay_pump_shard(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
         moqr_core_get_stats(moqr_shards_core(ctx->shards, (uint16_t)shard),
                             &st.core);
         moqr_bind_get_stats(bind, &st.bind);
-        /* This composition owns a shard runtime, so stats are expected: a
-         * refusal poisons the epoch rather than publishing zeros. ABSENT is
-         * for the single-lane composition, which has no shard plane at all. */
-        st.shard_cap =
-            (moqr_shards_get_stats(ctx->shards, (uint16_t)shard, &st.shard) ==
-             MOQR_OK)
-                ? MOQR_CLI_CAP_VALID
-                : MOQR_CLI_CAP_REFUSED;
+        /* With more than one shard there is a cross-shard plane and its stats
+         * are expected: a refusal poisons the epoch rather than publishing
+         * zeros. One shard has no plane at all (no manager), whichever
+         * composition runs it: ABSENT, never zeros presented as VALID. */
+        if (moqr_shards_count(ctx->shards) <= 1) {
+            st.shard_cap = MOQR_CLI_CAP_ABSENT;
+        } else {
+            st.shard_cap =
+                (moqr_shards_get_stats(ctx->shards, (uint16_t)shard,
+                                       &st.shard) == MOQR_OK)
+                    ? MOQR_CLI_CAP_VALID
+                    : MOQR_CLI_CAP_REFUSED;
+        }
         st.lane_wakes = ctx->wake_pushes[shard];
 #ifdef MOQR_BIND_TESTING
         /* Verify build: the LIVE blocked-reason aggregate for this lane,
@@ -2095,6 +2156,298 @@ relay_wt_lanes_pump(moq_wtquic_msquic_managed_t *m,
                             lane);
 }
 #endif /* MOQR_DUAL_LISTENER */
+
+#ifdef MOQR_HAVE_PICOQUIC
+/* PicoQUIC: the lane came from moq_pq_threaded_lane(). */
+static bool
+reap_pq(moqr_bind_t *bind, void *lane)
+{
+    return moqr_relay_reap_pass_pq(bind, (moq_pq_threaded_lane_t *)lane, NULL);
+}
+
+/* The PicoQUIC lane pump: facade i is raw lane i, and drives that lane's
+ * shard exactly as relay_lanes_pump drives a MsQuic lane's. */
+static int
+relay_pq_lanes_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                    uint64_t now_us, void *vctx)
+{
+    struct relay_pq_lane *pl = vctx;
+    serve_lanes_ctx_t *ctx = pl->ctx;
+    (void)t;
+    uint32_t shard = moqr_cli_shard_of_raw_lane(&ctx->plan, pl->index);
+    if (shard == UINT32_MAX || shard >= moqr_shards_count(ctx->shards)) {
+        return 0;
+    }
+    moqr_bind_t *bind = moqr_shards_bind(ctx->shards, (uint16_t)shard);
+    for (moq_pq_threaded_conn_t *conn = moq_pq_threaded_lane_next_conn(lane,
+                                                                       NULL);
+         conn != NULL; conn = moq_pq_threaded_lane_next_conn(lane, conn)) {
+        void *tag = moq_picoquic_threaded_conn_user(conn);
+        if (tag == RELAY_CONN_DEAD) {
+            continue;
+        }
+        moq_session_t *s = moq_pq_threaded_conn_session(conn);
+        if (s == NULL) {
+            continue;
+        }
+        if (tag == NULL) {
+            if (moqr_bind_conn_open(bind, s, moq_session_version(s)) ==
+                MOQR_OK) {
+                moq_picoquic_threaded_conn_set_user(conn, RELAY_CONN_OPENED);
+            } else {
+                moq_picoquic_threaded_conn_set_user(conn, RELAY_CONN_DEAD);
+                (void)moq_pq_threaded_conn_close(conn, 0);
+            }
+        }
+    }
+    return relay_pump_shard(ctx, ctx->raw, shard, now_us, bind, reap_pq,
+                            lane);
+}
+
+/* The facade's service deadline: its shard's relay-core deadline or its next
+ * fill deadline, whichever is first. picoquic folds this into the loop's
+ * next wake after every pump; a change made from another lane is followed by
+ * that lane's wake of this one. */
+static uint64_t
+relay_pq_deadline(void *vctx)
+{
+    struct relay_pq_lane *pl = vctx;
+    uint64_t core = moqr_cli_deadline_query(&pl->deadline);
+    uint64_t fill = moqr_cli_lane_deadlines_at(
+        &pl->ctx->fill_deadlines,
+        moqr_cli_shard_of_raw_lane(&pl->ctx->plan, pl->index));
+    return core < fill ? core : fill;
+}
+
+/* Relay-grade picoquic tuning, applied to each facade's context before any
+ * connection exists (the facade's configure_quic hook; it runs after the
+ * facade's own defaults and so overrides them). Every call is picoquic's
+ * public API. */
+static int
+relay_pq_configure(picoquic_quic_t *quic, void *vctx)
+{
+    struct relay_pq_lane *pl = vctx;
+    const moqr_cli_config_t *cfg = pl->ctx->cfg;
+    if (picoquic_set_default_congestion_algorithm_by_name(
+            quic, cfg->picoquic.congestion) != 0) {
+        fprintf(stderr, "MOQ5 Relay: picoquic congestion \"%s\" unavailable\n",
+                cfg->picoquic.congestion);
+        return -1;
+    }
+    /* A relay fans many groups in at once (one unidirectional stream each)
+     * and, on draft-18, carries one bidirectional stream per request. */
+    if (picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_streams_uni,
+                                      8192) != 0 ||
+        picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_streams_bidi,
+                                      1024) != 0 ||
+        /* Connection credit well above one stream's: many subgroups arrive
+         * concurrently. Request and control streams get the media window. */
+        picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_data,
+                                      64u * 1024u * 1024u) != 0 ||
+        picoquic_set_default_tp_value(quic,
+            picoquic_tp_initial_max_stream_data_bidi_local,
+            16u * 1024u * 1024u) != 0 ||
+        picoquic_set_default_tp_value(quic,
+            picoquic_tp_initial_max_stream_data_bidi_remote,
+            16u * 1024u * 1024u) != 0) {
+        return -1;
+    }
+    /* Issue NEW_TOKEN after each handshake so a returning client is not sent
+     * a Retry when the half-open threshold trips under load (RFC 9000,
+     * Section 8.1.3). */
+    picoquic_set_cookie_mode(quic, 2);
+    /* Datagram objects are latency-sensitive: above every media stream
+     * (stream priority 2 and up) but below the control and request streams
+     * (priority 0). */
+    picoquic_set_default_datagram_priority(quic, 1);
+    /* A handshake that has not completed in 10 s is not a client worth the
+     * half-open slot it holds. */
+    picoquic_set_default_handshake_timeout(quic, 10u * 1000u * 1000u);
+    return 0;
+}
+
+/* The listener address as picoquic's bind address. An address literal,
+ * wildcards included, is bound exactly and keeps its family: "0.0.0.0" listens
+ * on every IPv4 address and nothing else, "::" on every IPv6 address. An empty
+ * host (no entry) listens on both families. */
+static bool
+relay_pq_bind_addr(const char *host, struct sockaddr_storage *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (host[0] == '\0') {
+        return true;
+    }
+    struct sockaddr_in *v4 = (struct sockaddr_in *)out;
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)out;
+    if (inet_pton(AF_INET, host, &v4->sin_addr) == 1) {
+        v4->sin_family = AF_INET;
+        return true;
+    }
+    if (inet_pton(AF_INET6, host, &v6->sin6_addr) == 1) {
+        v6->sin6_family = AF_INET6;
+        return true;
+    }
+    return false;   /* a name, not an address: picoquic binds addresses */
+}
+#endif /* MOQR_HAVE_PICOQUIC */
+
+/* The raw listener's facades, whichever transport serves them. Every
+ * lifecycle step goes through these so the serve composition reads the same
+ * for both. */
+static void
+relay_raw_stop(serve_lanes_ctx_t *ctx)
+{
+#ifdef MOQR_HAVE_PICOQUIC
+    for (uint32_t i = 0; i < atomic_load(&ctx->pq_count); i++) {
+        moq_pq_threaded_t *f = atomic_load(&ctx->pq[i]);
+        if (f != NULL) {
+            (void)moq_pq_threaded_stop(f);
+        }
+    }
+#endif
+    if (ctx->raw != NULL) {
+        (void)moq_msquic_managed_stop(ctx->raw);
+    }
+}
+
+/* After relay_raw_stop: every lane has joined. */
+static void
+relay_raw_destroy(serve_lanes_ctx_t *ctx)
+{
+#ifdef MOQR_HAVE_PICOQUIC
+    for (uint32_t i = 0; i < atomic_load(&ctx->pq_count); i++) {
+        moq_pq_threaded_destroy(atomic_load(&ctx->pq[i]));
+        atomic_store(&ctx->pq[i], NULL);
+    }
+    atomic_store(&ctx->pq_count, 0);
+#endif
+    if (ctx->raw != NULL) {
+        moq_msquic_managed_destroy(ctx->raw);
+        ctx->raw = NULL;
+    }
+}
+
+/* The coordinator's wait: MOQ_ERR_CLOSED once the raw listener is terminal
+ * (for PicoQUIC, any one of its facades: a relay that has lost a lane is not
+ * serving its configuration). */
+static moq_result_t
+relay_raw_wait(serve_lanes_ctx_t *ctx, uint64_t timeout_us)
+{
+#ifdef MOQR_HAVE_PICOQUIC
+    uint32_t n = atomic_load(&ctx->pq_count);
+    if (n > 0) {
+        moq_result_t rc = moq_pq_threaded_wait(atomic_load(&ctx->pq[0]),
+                                               timeout_us);
+        for (uint32_t i = 0; i < n; i++) {
+            moq_pq_threaded_t *f = atomic_load(&ctx->pq[i]);
+            if (moq_pq_threaded_is_fatal(f) ||
+                moq_pq_threaded_wait(f, 0) == MOQ_ERR_CLOSED) {
+                return MOQ_ERR_CLOSED;
+            }
+        }
+        return rc;
+    }
+#endif
+    return moq_msquic_managed_wait(ctx->raw, timeout_us);
+}
+
+/* A raw lane's doorbell counters. The PicoQUIC facade keeps none, so its
+ * rows report the refusal rather than zeros. */
+static bool
+relay_raw_lane_stats(serve_lanes_ctx_t *ctx, uint32_t lane,
+                     moq_msquic_lane_stats_t *out)
+{
+    if (ctx->raw == NULL) {
+        return false;
+    }
+    return moq_msquic_lane_get_stats(moq_msquic_managed_lane(ctx->raw, lane),
+                                     out, sizeof(*out)) == MOQ_OK;
+}
+
+#ifdef MOQR_HAVE_PICOQUIC
+#ifdef MOQR_PUMP_TESTING
+/* Test seam: called on the main thread once facade i is created and running,
+ * before its handle is published to the wakers. */
+void (*g_test_pq_before_lane_publish)(uint32_t lane);
+#endif
+
+/* One PicoQUIC facade per raw lane on the listener port (the configuration
+ * admits one lane). It serves the configured drafts, grants the same
+ * request credit as the MsQuic listener, delivers objects as chunks, and keeps
+ * a terminal connection until the relay acknowledges it. On failure every
+ * facade already created is stopped and destroyed, and false is returned. */
+static bool
+relay_pq_create_lanes(serve_lanes_ctx_t *ctx, const moqr_cli_config_t *cfg,
+                      uint32_t max_conns_total)
+{
+    struct sockaddr_storage bind_addr;
+    if (!relay_pq_bind_addr(cfg->host, &bind_addr)) {
+        fprintf(stderr, "listener.host: the picoquic listener needs an IP "
+                        "address, not a name\n");
+        return false;
+    }
+    uint32_t per_lane = max_conns_total / cfg->lanes;
+    ctx->cfg = cfg;
+    /* picoquic resolves a congestion controller by name only among the
+     * algorithms the application registered (a process-wide list); serve
+     * registers picoquic's full set once, here on the main thread, before
+     * any facade or network thread exists. */
+    picoquic_register_all_congestion_control_algorithms();
+    for (uint32_t i = 0; i < cfg->lanes; i++) {
+        struct relay_pq_lane *pl = &ctx->pq_lane[i];
+        pl->ctx = ctx;
+        pl->index = i;
+        pl->deadline = (moqr_cli_deadline_range_t){
+            ctx->deadline, ctx->plan.raw_first + i, 1 };
+        moq_pq_threaded_cfg_t pc;
+        moq_pq_threaded_cfg_init_sized(&pc, sizeof(pc));
+        pc.alloc = moq_alloc_default();
+        pc.perspective = MOQ_PERSPECTIVE_SERVER;
+        pc.cert_path = cfg->cert;
+        pc.key_path = cfg->key;
+        pc.port = cfg->port;
+        pc.alpn_list = cfg->alpns;
+        pc.alpn_count = cfg->alpn_count;
+        pc.send_request_capacity = true;
+        pc.initial_request_capacity = 1024;
+        pc.streaming_objects = true;
+        pc.max_connections = per_lane > 0 ? per_lane : 1;
+        pc.lane_count = 1;
+        pc.on_lane_pump = relay_pq_lanes_pump;
+        pc.on_lane_pump_ctx = pl;
+        pc.app_deadline_us = relay_pq_deadline;
+        pc.app_deadline_ctx = pl;
+        pc.configure_quic = relay_pq_configure;
+        pc.configure_quic_ctx = pl;
+        pc.retain_terminal_until_ack = true;
+        pc.socket_buffer_bytes = cfg->picoquic.socket_buffer_bytes;
+        pc.bind_address = bind_addr.ss_family != 0
+                              ? (const struct sockaddr *)&bind_addr : NULL;
+        moq_pq_threaded_t *f = NULL;
+        if (moq_pq_threaded_create(&pc, &f) != MOQ_OK) {
+            fprintf(stderr, "picoquic lane %u create failed (port %d)\n", i,
+                    cfg->port);
+            relay_raw_stop(ctx);
+            relay_raw_destroy(ctx);
+            return false;
+        }
+#ifdef MOQR_PUMP_TESTING
+        if (g_test_pq_before_lane_publish != NULL) {
+            g_test_pq_before_lane_publish(i);
+        }
+#endif
+        atomic_store_explicit(&ctx->pq[i], f, memory_order_release);
+        atomic_store_explicit(&ctx->pq_count, i + 1, memory_order_release);
+    }
+    /* A lane that already pumped may have woken one not yet created; that
+     * wake found no facade. Wake every lane once, now that all exist, so the
+     * work it announced is taken up. */
+    for (uint32_t i = 0; i < cfg->lanes; i++) {
+        (void)serve_wake_shard_checked(ctx, NULL, ctx->plan.raw_first + i);
+    }
+    return true;
+}
+#endif
 
 #ifndef MOQR_BIND_TESTING
 static uint64_t
@@ -2356,58 +2709,70 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         ctx->deadline, plan.wt_first, plan.wt_count };
 
 
-    moq_msquic_managed_cfg_t tcfg;
-    moq_msquic_managed_cfg_init_sized(&tcfg, sizeof(tcfg));
-    tcfg.alloc = moq_alloc_default();
-    tcfg.perspective = MOQ_PERSPECTIVE_SERVER;
-    tcfg.host = cfg->host;
-    tcfg.port = (uint16_t)cfg->port;
-    tcfg.cert_path = cfg->cert;
-    tcfg.key_path = cfg->key;
-    tcfg.insecure_skip_verify = cfg->insecure_skip_verify;
-    tcfg.send_request_capacity = true;
-    tcfg.initial_request_capacity = 1024;
-    tcfg.streaming_objects = true;
-    moqr_cli_apply_versions(cfg, &tcfg);
-    tcfg.lane_count = cfg->lanes;
-    /* Facade admission cap: the seam's usable-bindings-per-shard x lanes
-     * rule (the strict per-lane clamp, not lanes x max_bindings). */
-    tcfg.max_connections = raw_max_conns;
-    tcfg.on_lane_pump = relay_lanes_pump;
-    tcfg.on_lane_pump_user = ctx;
-    tcfg.app_deadline_us = moqr_cli_deadline_query;
-    tcfg.app_deadline_ctx = &ctx->raw_deadlines;
-    /* Before either facade exists: their lanes may pump, and the callback
-     * run, before create returns. */
+    /* Before any facade exists: their lanes may pump, and the callbacks run,
+     * before create returns. */
     moqr_cli_lane_deadlines_init(&ctx->fill_deadlines, plan.total_shards);
-    tcfg.app_lane_deadline_us = relay_raw_lane_deadline;
-    tcfg.app_lane_deadline_ctx = ctx;
+    moq_msquic_managed_t *t = NULL;
+    if (cfg->transport == MOQR_CLI_TRANSPORT_PICOQUIC) {
+#ifdef MOQR_HAVE_PICOQUIC
+        if (!relay_pq_create_lanes(ctx, cfg, raw_max_conns)) {
+            moqr_cli_snapshot_destroy(&snap);
+            moqr_broker_destroy(&g_metrics_broker);
+            moqr_shards_destroy(shards);
+            free(ctx);
+            return serve_done(&log, 1);
+        }
+#endif
+    } else {
+        moq_msquic_managed_cfg_t tcfg;
+        moq_msquic_managed_cfg_init_sized(&tcfg, sizeof(tcfg));
+        tcfg.alloc = moq_alloc_default();
+        tcfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        tcfg.host = cfg->host;
+        tcfg.port = (uint16_t)cfg->port;
+        tcfg.cert_path = cfg->cert;
+        tcfg.key_path = cfg->key;
+        tcfg.insecure_skip_verify = cfg->insecure_skip_verify;
+        tcfg.send_request_capacity = true;
+        tcfg.initial_request_capacity = 1024;
+        tcfg.streaming_objects = true;
+        moqr_cli_apply_versions(cfg, &tcfg);
+        tcfg.lane_count = cfg->lanes;
+        /* Facade admission cap: the seam's usable-bindings-per-shard x lanes
+         * rule (the strict per-lane clamp, not lanes x max_bindings). */
+        tcfg.max_connections = raw_max_conns;
+        tcfg.on_lane_pump = relay_lanes_pump;
+        tcfg.on_lane_pump_user = ctx;
+        tcfg.app_deadline_us = moqr_cli_deadline_query;
+        tcfg.app_deadline_ctx = &ctx->raw_deadlines;
+        tcfg.app_lane_deadline_us = relay_raw_lane_deadline;
+        tcfg.app_lane_deadline_ctx = ctx;
 #ifdef MOQR_VERIFY_SEAM
-    /* Blocked-scenario seam: constrain every relay-side session's outgoing
-     * subgroup pool (SESSION_SG induction; the bind override rode the shard
-     * builder above). Echoed so the gauntlet asserts the constraint applied
-     * rather than trusting the environment reached the process. */
-    tcfg.max_open_subgroups = moqr_cli_verify_session_max_sgs();
-    if (moqr_cli_verify_bind_max_sgs() != 0 ||
-        moqr_cli_verify_session_max_sgs() != 0) {
-        printf(MOQR_SEAM_NAME ": seam bind_max_open_subgroups=%u "
-               "session_max_open_subgroups=%u (0=default)\n",
-               moqr_cli_verify_bind_max_sgs(),
-               moqr_cli_verify_session_max_sgs());
-    }
+        /* Blocked-scenario seam: constrain every relay-side session's outgoing
+         * subgroup pool (SESSION_SG induction; the bind override rode the shard
+         * builder above). Echoed so the gauntlet asserts the constraint applied
+         * rather than trusting the environment reached the process. */
+        tcfg.max_open_subgroups = moqr_cli_verify_session_max_sgs();
+        if (moqr_cli_verify_bind_max_sgs() != 0 ||
+            moqr_cli_verify_session_max_sgs() != 0) {
+            printf(MOQR_SEAM_NAME ": seam bind_max_open_subgroups=%u "
+                   "session_max_open_subgroups=%u (0=default)\n",
+                   moqr_cli_verify_bind_max_sgs(),
+                   moqr_cli_verify_session_max_sgs());
+        }
 #endif
 
-    moq_msquic_managed_t *t = NULL;
-    if (moq_msquic_managed_create(&tcfg, &t) != MOQ_OK) {
-        fprintf(stderr, "transport create failed (port %d)\n", cfg->port);
-        moqr_cli_snapshot_destroy(&snap);
-        moqr_broker_destroy(&g_metrics_broker);
-        moqr_shards_destroy(shards);
-        free(ctx);
-        return serve_done(&log, 1);
-    }
+        if (moq_msquic_managed_create(&tcfg, &t) != MOQ_OK) {
+            fprintf(stderr, "transport create failed (port %d)\n", cfg->port);
+            moqr_cli_snapshot_destroy(&snap);
+            moqr_broker_destroy(&g_metrics_broker);
+            moqr_shards_destroy(shards);
+            free(ctx);
+            return serve_done(&log, 1);
+        }
 
-    ctx->raw = t;
+        ctx->raw = t;
+    }
 
 #ifdef MOQR_DUAL_LISTENER
     /* The optional second listener. Startup is all-or-nothing: if this one
@@ -2425,8 +2790,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
             fprintf(stderr,
                     "webtransport transport create failed (port %d)\n",
                     cfg->wt.port);
-            (void)moq_msquic_managed_stop(t);
-            moq_msquic_managed_destroy(t);
+            relay_raw_stop(ctx);
+            relay_raw_destroy(ctx);
             moqr_cli_snapshot_destroy(&snap);
             moqr_broker_destroy(&g_metrics_broker);
             moqr_shards_destroy(shards);
@@ -2453,8 +2818,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
             ctx->wt = NULL;
         }
 #endif
-        (void)moq_msquic_managed_stop(t);
-        moq_msquic_managed_destroy(t);
+        relay_raw_stop(ctx);
+        relay_raw_destroy(ctx);
         /* Facades stopped and lanes joined: nothing can reach the broker or
          * the snapshot any more, so both are safe to tear down here. */
         moqr_cli_snapshot_destroy(&snap);
@@ -2489,8 +2854,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
             moq_wtquic_msquic_managed_destroy(ctx->wt);
         }
 #endif
-        (void)moq_msquic_managed_stop(t);
-        moq_msquic_managed_destroy(t);
+        relay_raw_stop(ctx);
+        relay_raw_destroy(ctx);
         moqr_cli_snapshot_destroy(&snap);
         moqr_broker_destroy(&g_metrics_broker);
         moqr_shards_destroy(shards);
@@ -2513,8 +2878,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
             moq_wtquic_msquic_managed_destroy(ctx->wt);
         }
 #endif
-        (void)moq_msquic_managed_stop(t);
-        moq_msquic_managed_destroy(t);
+        relay_raw_stop(ctx);
+        relay_raw_destroy(ctx);
         atomic_store_explicit(&ctx->admin_listen, NULL, memory_order_release);
         admin_endpoint_destroy(admin_l, &admin_owner);
         moqr_cli_snapshot_destroy(&snap);
@@ -2539,7 +2904,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
     uint64_t fail_told = 0;
     unsigned woken_trace = 0;
     while (!atomic_load(&g_stop)) {
-        if (moq_msquic_managed_wait(t, 500 * 1000) == MOQ_ERR_CLOSED) {
+        if (relay_raw_wait(ctx, 500 * 1000) == MOQ_ERR_CLOSED) {
             break;
         }
         /* An endpoint whose owner has died is a dead admin surface (every
@@ -2634,16 +2999,15 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         (void)moq_wtquic_msquic_managed_stop(ctx->wt);
     }
 #endif
-    (void)moq_msquic_managed_stop(t);   /* joins every lane; safe to read now */
+    relay_raw_stop(ctx);   /* joins every lane; safe to read now */
 
     /* A global shard's doorbell counters live in the facade that owns it, so
      * the WebTransport range must be read from the WebTransport facade -- the
      * raw facade has no lane for those shards at all. */
     #define MOQR_ADAPTER_STATS_FOR(shard_ix, out_ad)                          \
         (((shard_ix) < plan.raw_first + plan.raw_count)                       \
-             ? moq_msquic_lane_get_stats(                                     \
-                   moq_msquic_managed_lane(t, (shard_ix) - plan.raw_first),   \
-                   &(out_ad), sizeof(out_ad)) == MOQ_OK                       \
+             ? relay_raw_lane_stats(ctx, (shard_ix) - plan.raw_first,        \
+                                    &(out_ad))                                \
              : moqr_wt_lane_stats(ctx, &plan, (shard_ix), &(out_ad)))
 
     /* Per-lane attribution rows: the adapter's doorbell counters joined with
@@ -2659,7 +3023,9 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         bool ad_ok = MOQR_ADAPTER_STATS_FOR(i, ad);
         bool sh_ok =
             moqr_shards_get_stats(shards, (uint16_t)i, &ss) == MOQR_OK;
-        moqr_cli_serve_log_lane(&log, i, ad_ok, &ad, sh_ok, &ss);
+        /* One shard has no cross-shard plane: the lanes=1 record form. */
+        moqr_cli_serve_log_lane(&log, i, ad_ok, &ad, sh_ok,
+                                plan.total_shards > 1 ? &ss : NULL);
     }
     /* Per-directed-pair rows, in the deterministic record order the parser
      * enforces (src-major, ascending, self skipped): exactly K*(K-1) rows
@@ -2710,7 +3076,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         ctx->wt = NULL;
     }
 #endif
-    moq_msquic_managed_destroy(t);
+    relay_raw_destroy(ctx);
     /* Every facade lane has joined, so nothing can publish or notify any more;
      * only now is the endpoint object safe to release. */
     atomic_store_explicit(&ctx->admin_listen, NULL, memory_order_release);
@@ -2803,12 +3169,33 @@ main(int argc, char **argv)
      * in the verify build, the lanes coordinator that emits
      * RELAY_BLOCKED_V0). A constrained single-lane serve would silently
      * ignore the bind override — refuse. */
+    /* The session-side constraint rides the MsQuic facade's configuration;
+     * the PicoQUIC facade has no such input, so a constrained PicoQUIC serve
+     * would run unconstrained -- refuse. */
+    if (cfg.transport == MOQR_CLI_TRANSPORT_PICOQUIC &&
+        moqr_cli_verify_session_max_sgs() != 0) {
+        fprintf(stderr, MOQR_SEAM_NAME ": MOQR_VERIFY_SESSION_MAX_OPEN_SUBGROUPS "
+                        "is not applied by the picoquic listener\n");
+        return 2;
+    }
     if (moqr_cli_total_lanes(&cfg) <= 1 &&
         (moqr_cli_verify_bind_max_sgs() != 0 ||
                            moqr_cli_verify_session_max_sgs() != 0)) {
         fprintf(stderr, MOQR_SEAM_NAME ": MOQR_VERIFY_*_MAX_OPEN_SUBGROUPS "
                         "requires a multi-shard relay: "
                         "listener.lanes + webtransport.lanes > 1\n");
+        return 2;
+    }
+#endif
+
+#ifndef MOQR_HAVE_PICOQUIC
+    /* Like a webtransport object above: a build without the PicoQUIC server
+     * cannot serve listener.transport "picoquic", for any command, and never
+     * falls back to MsQuic in its place. */
+    if (cfg.transport == MOQR_CLI_TRANSPORT_PICOQUIC) {
+        fprintf(stderr, "config error: this build has no PicoQUIC listener "
+                        "support; listener.transport \"picoquic\" cannot be "
+                        "served\n");
         return 2;
     }
 #endif
@@ -2820,7 +3207,7 @@ main(int argc, char **argv)
      * banner. The in-command print re-renders the same pure function. */
     {
         moqr_cli_capacity_t pre;
-        size_t ctxb = moqr_cli_total_lanes(&cfg) > 1
+        size_t ctxb = relay_uses_shard_runtime(&cfg)
                           ? sizeof(serve_lanes_ctx_t)
                           : 0;
         if (moqr_cli_describe_capacity(&cfg, moq_alloc_default(), ctxb,
@@ -2838,7 +3225,7 @@ main(int argc, char **argv)
          * builder serve consumes, so the printed ceiling is the config the
          * process would actually run. */
         return print_capacity(&cfg,
-                              moqr_cli_total_lanes(&cfg) > 1
+                              relay_uses_shard_runtime(&cfg)
                                   ? sizeof(serve_lanes_ctx_t)
                                   : 0,
                               stdout) != 0
@@ -2846,8 +3233,9 @@ main(int argc, char **argv)
                    : 0;
     }
     /* The composition follows the shards the process will allocate, across
-     * both listeners: the single-facade path owns exactly one. */
-    return moqr_cli_total_lanes(&cfg) > 1 ? cmd_serve_lanes(&cfg)
+     * both listeners: the single-facade path owns exactly one, and only for
+     * the MsQuic listener. */
+    return relay_uses_shard_runtime(&cfg) ? cmd_serve_lanes(&cfg)
                                           : cmd_serve(&cfg);
 }
 
@@ -2916,11 +3304,18 @@ int moqr_test_cmd_serve_lanes(const moqr_cli_config_t *cfg)
 {
     return cmd_serve_lanes(cfg);
 }
+#ifdef MOQR_HAVE_PICOQUIC
+/* The PicoQUIC listener's host-to-bind-address mapping. */
+bool moqr_test_pq_bind_addr(const char *host, struct sockaddr_storage *out)
+{
+    return relay_pq_bind_addr(host, out);
+}
+#endif
 
 int moqr_test_serve_print_capacity(const moqr_cli_config_t *cfg, FILE *out)
 {
     return print_capacity(cfg,
-                          moqr_cli_total_lanes(cfg) > 1
+                          moqr_cli_uses_shard_runtime(cfg)
                               ? sizeof(serve_lanes_ctx_t)
                               : 0,
                           out);

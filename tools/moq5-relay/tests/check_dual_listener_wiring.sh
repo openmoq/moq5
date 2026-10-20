@@ -45,7 +45,7 @@ live_bad=0
 for d in $(grep -n 'moqr_shards_destroy[[:space:]]*(' "$code" | cut -d: -f1); do
     [ -n "$ready_l" ] && [ "$d" -gt "$ready_l" ] || continue
     awk -v a="$ready_l" -v b="$d" 'NR>a && NR<b' "$code" \
-        | grep -q 'moq_msquic_managed_stop[[:space:]]*(' || {
+        | grep -qE '(moq_msquic_managed_stop|relay_raw_stop)[[:space:]]*\(' || {
             echo "FAIL: live-path shard destroy at +$d does not stop the raw facade"
             live_bad=1; }
     awk -v a="$ready_l" -v b="$d" 'NR>a && NR<b' "$code" \
@@ -63,7 +63,7 @@ done
 n_wt_stop=$(awk -v a="$ready_l" 'NR>a' "$code" \
             | grep -c 'moq_wtquic_msquic_managed_stop[[:space:]]*(')
 n_raw_stop=$(awk -v a="$ready_l" 'NR>a' "$code" \
-             | grep -c 'moq_msquic_managed_stop[[:space:]]*(')
+             | grep -cE '(moq_msquic_managed_stop|relay_raw_stop)[[:space:]]*\(')
 [ "$n_wt_stop" -ge "$n_destroy" ] || {
     echo "FAIL: $n_destroy live-path teardowns but only $n_wt_stop WebTransport stops"
     live_bad=1; }
@@ -72,6 +72,23 @@ n_raw_stop=$(awk -v a="$ready_l" 'NR>a' "$code" \
     live_bad=1; }
 [ "$live_bad" -eq 0 ] && note "teardown: every live-path shard destroy stops both facades first"
 [ "$live_bad" -eq 0 ] || fail=1
+
+# The raw listener's stop and destroy go through two helpers, so the checks
+# above accept them only because these bodies do the work: every MsQuic and
+# every PicoQUIC facade is stopped, and destroyed.
+helper=$(mktemp)
+awk '/^relay_raw_stop\(/,/^}/' "$full" > "$helper"
+grep -q 'moq_msquic_managed_stop[[:space:]]*(ctx->raw)' "$helper" &&
+    grep -q 'i < atomic_load(&ctx->pq_count)' "$helper" &&
+    grep -q 'moq_pq_threaded_t \*f = atomic_load(&ctx->pq\[i\]);' "$helper" &&
+    grep -q 'moq_pq_threaded_stop[[:space:]]*(f)' "$helper" || {
+        echo "FAIL: relay_raw_stop does not stop every raw facade"; fail=1; }
+awk '/^relay_raw_destroy\(/,/^}/' "$full" > "$helper"
+grep -q 'moq_msquic_managed_destroy[[:space:]]*(ctx->raw)' "$helper" &&
+    grep -q 'i < atomic_load(&ctx->pq_count)' "$helper" &&
+    grep -q 'moq_pq_threaded_destroy[[:space:]]*(atomic_load(&ctx->pq\[i\]))' "$helper" || {
+        echo "FAIL: relay_raw_destroy does not destroy every raw facade"; fail=1; }
+rm -f "$helper"
 
 # -- 2. startup is all-or-nothing -------------------------------------------
 # The WebTransport create failure branch must tear the raw facade down and
@@ -90,7 +107,7 @@ else
         fail=1; }
     # the failure arm, bounded to the 20 lines after the create
     arm=$(awk -v s="$wt_create" 'NR>=s && NR<s+20' "$code")
-    printf '%s\n' "$arm" | grep -q 'moq_msquic_managed_stop[[:space:]]*(' || {
+    printf '%s\n' "$arm" | grep -qE '(moq_msquic_managed_stop|relay_raw_stop)[[:space:]]*\(' || {
         echo "FAIL: WebTransport create failure does not stop the raw facade"; fail=1; }
     printf '%s\n' "$arm" | grep -q 'moqr_shards_destroy[[:space:]]*(' || {
         echo "FAIL: WebTransport create failure does not destroy the shards"; fail=1; }
@@ -119,8 +136,10 @@ awk '
 grep -q 'serve_lanes_fill_labels[[:space:]]*(' "$code" || {
     echo "FAIL: the multi-shard composition does not build its lane labels";
     fail=1; }
-grep -q '\.transport = "msquic"' "$labels" || {
+grep -q '"msquic"' "$labels" || {
     echo "FAIL: raw lanes are not labelled msquic"; fail=1; }
+grep -q '? "picoquic" : "msquic"' "$labels" || {
+    echo "FAIL: PicoQUIC raw lanes are not labelled picoquic"; fail=1; }
 grep -q '\.transport = "wtquic-msquic"' "$labels" || {
     echo "FAIL: WebTransport lanes are not labelled wtquic-msquic"; fail=1; }
 # and they are labelled at their GLOBAL shard index, not a per-facade one
@@ -128,7 +147,7 @@ grep -q 'labels\[plan->wt_first + i\]' "$labels" || {
     echo "FAIL: WebTransport labels are not indexed by global shard"; fail=1; }
 grep -q 'labels\[plan->raw_first + i\]' "$labels" || {
     echo "FAIL: raw labels are not indexed by global shard"; fail=1; }
-note "labels: raw=msquic, wt=wtquic-msquic, indexed by global shard"
+note "labels: raw=msquic|picoquic, wt=wtquic-msquic, indexed by global shard"
 
 # -- 4. each pump addresses only its own shard range ------------------------
 grep -q 'moqr_cli_shard_of_wt_lane[[:space:]]*(' "$full" || {
@@ -145,9 +164,27 @@ if grep -qE 'return \(?cfg\.lanes > 1\)? \? cmd_serve_lanes' "$full"; then
     echo "FAIL: serve dispatch classifies the process from raw lanes alone"
     fail=1
 else
-    grep -q 'moqr_cli_total_lanes(&cfg) > 1 ? cmd_serve_lanes' "$full" || {
-        echo "FAIL: serve dispatch does not use the total-lane authority"; fail=1; }
-    note "dispatch: composition chosen from total lanes"
+    grep -q 'relay_uses_shard_runtime(&cfg) ? cmd_serve_lanes' "$full" || {
+        echo "FAIL: serve dispatch does not use the shard-runtime predicate"; fail=1; }
+    # the predicate is the total-lane authority, plus PicoQUIC at any count
+    # serve's predicate is the shared one capacity also asks, and that one
+    # is the total-lane authority plus PicoQUIC at any count
+    pred=$(awk '/^relay_uses_shard_runtime\(/,/^}/' "$full")
+    printf '%s\n' "$pred" | grep -q 'return moqr_cli_uses_shard_runtime(cfg);' || {
+        echo "FAIL: serve's shard-runtime predicate is not the shared one"
+        fail=1; }
+    config_c="$(dirname "$main_c")/config.c"
+    shared=$(awk '/^moqr_cli_uses_shard_runtime\(/,/^}/' "$config_c")
+    printf '%s\n' "$shared" | grep -q 'moqr_cli_total_lanes(cfg) > 1' || {
+        echo "FAIL: the shard-runtime predicate does not use the total-lane authority"
+        fail=1; }
+    printf '%s\n' "$shared" | grep -q 'MOQR_CLI_TRANSPORT_PICOQUIC' || {
+        echo "FAIL: the shard-runtime predicate does not route PicoQUIC to it"
+        fail=1; }
+    grep -q 'if (!moqr_cli_uses_shard_runtime(cfg))' "$config_c" || {
+        echo "FAIL: the capacity model does not choose its composition by the shared predicate"
+        fail=1; }
+    note "dispatch: composition chosen from total lanes, PicoQUIC always sharded"
 fi
 
 # -- 11. no process-composition decision is left on raw lanes ---------------

@@ -7,6 +7,7 @@
 #include "../cli/info_doc.h"
 #include "../cli/shards_doc.h"
 #include "../cli/deadline.h"
+#include <moq/rcbuf.h>
 
 #include <pthread.h>
 #include <sched.h>
@@ -720,6 +721,56 @@ test_snapshot_coord_production(void)
 
 
 /*
+ * At one lane the ceiling follows the composition that runs: the direct
+ * composition for MsQuic (no cross-shard plane), and the shard runtime for
+ * PicoQUIC, described by the same builder serve consumes.
+ */
+static int
+test_k1_capacity_follows_composition(void)
+{
+    int failures = 0;
+    const moq_alloc_t *alloc = moq_alloc_default();
+    char err[256];
+    static moqr_cli_config_t msq, pq;
+    MOQ_TEST_CHECK_EQ_INT(parse("{\"listener\":{\"port\":4433,\"cert\":\"c\","
+                                "\"key\":\"k\"}}", &msq, err, sizeof(err)),
+                          MOQR_OK);
+    MOQ_TEST_CHECK_EQ_INT(parse("{\"listener\":{\"port\":4433,\"cert\":\"c\","
+                                "\"key\":\"k\",\"transport\":\"picoquic\"}}",
+                                &pq, err, sizeof(err)),
+                          MOQR_OK);
+    MOQ_TEST_CHECK(!moqr_cli_uses_shard_runtime(&msq));
+    MOQ_TEST_CHECK(moqr_cli_uses_shard_runtime(&pq));
+
+    moqr_cli_capacity_t cm, cp;
+    MOQ_TEST_CHECK_EQ_INT(moqr_cli_describe_capacity(&msq, alloc, 0, &cm),
+                          MOQR_OK);
+    MOQ_TEST_CHECK_EQ_INT(moqr_cli_describe_capacity(&pq, alloc, 512, &cp),
+                          MOQR_OK);
+    /* MsQuic: the direct model, unchanged -- no shard container. */
+    MOQ_TEST_CHECK_EQ_U64(cm.cross_shard_bytes, 0u);
+    MOQ_TEST_CHECK_EQ_U64(cm.cli_runtime_bytes,
+                          moqr_cli_snapshot_bytes(1u) + cm.admin_bytes);
+    /* PicoQUIC: the shard builder's own description, term for term, plus
+     * the serve context it was told about. */
+    moqr_shards_cfg_t sc;
+    moqr_cli_build_shards_cfg(&pq, alloc, &sc);
+    MOQ_TEST_CHECK_EQ_U64(sc.shards, 1u);
+    MOQ_TEST_CHECK(!sc.admit_remote_demand);
+    moqr_shards_capacity_t sh;
+    MOQ_TEST_CHECK_EQ_INT(moqr_shards_capacity_describe(&sc, &sh), MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(cp.core_structure_bytes, sh.core_structure_bytes);
+    MOQ_TEST_CHECK_EQ_U64(cp.bind_structure_bytes, sh.bind_structure_bytes);
+    MOQ_TEST_CHECK_EQ_U64(cp.cross_shard_bytes,
+                          sh.shards_structure_bytes + sh.channel_byte_ceiling +
+                              sh.canon_byte_ceiling + sh.staging_byte_ceiling);
+    MOQ_TEST_CHECK(cp.cross_shard_bytes > 0u);
+    MOQ_TEST_CHECK_EQ_U64(cp.cli_runtime_bytes,
+                          512u + moqr_cli_snapshot_bytes(1u) + cp.admin_bytes);
+    return failures;
+}
+
+/*
  * F5: the single-lane composition now allocates one snapshot row for its
  * whole lifetime, so the ceiling must count it. It is a permanent request,
  * not a transient render buffer, and the model's rule is that permanent
@@ -1015,6 +1066,51 @@ info_inputs(const moqr_cli_config_t *cfg, moqr_cli_shard_plan_t *plan,
     in->dual_listener_build = true;
     in->verify_build = false;
     return 0;
+}
+
+/* The raw listener's transport is the configured one. */
+static int
+test_info_document_picoquic(void)
+{
+    int failures = 0;
+    char err[192];
+    static moqr_cli_config_t cfg;
+    moqr_cli_shard_plan_t plan;
+    moqr_shards_cfg_t scfg;
+    moqr_shards_limits_t lim;
+    moqr_cli_capacity_t cap;
+    moqr_cli_info_inputs_t in;
+    static char doc[16384];
+    size_t len = 0;
+    static const char *J =
+        "{\"listener\":{\"transport\":\"picoquic\",\"host\":\"10.0.0.7\","
+        "\"port\":4433,\"versions\":[18],\"lanes\":1,"
+        "\"cert\":\"/tmp/c.pem\",\"key\":\"/tmp/k.pem\"},"
+        "\"admin\":{\"tcp\":{\"port\":9109}}}";
+    if (parse(J, &cfg, err, sizeof(err)) != MOQR_OK) {
+        printf("  info: the picoquic fixture was rejected: %s\n", err);
+        return 1;
+    }
+    failures += info_inputs(&cfg, &plan, &scfg, &lim, &cap, &in);
+    if (failures != 0) {
+        return failures;
+    }
+    if (moqr_cli_info_render(&in, doc, sizeof(doc), &len) != MOQR_OK) {
+        printf("  info: the render refused the picoquic configuration\n");
+        return failures + 1;
+    }
+    if (strstr(doc, "{\"kind\":\"raw\",\"host\":\"10.0.0.7\",\"port\":4433,"
+                    "\"transport\":\"picoquic\",") == NULL ||
+        strstr(doc, "\"msquic\"") != NULL) {
+        printf("  info: the raw listener does not name picoquic: %s\n", doc);
+        failures++;
+    }
+    /* The bound covers the longest backend label. */
+    if ((uint64_t)len > moqr_cli_info_bound()) {
+        printf("  info: picoquic document %zu exceeds the bound\n", len);
+        failures++;
+    }
+    return failures;
 }
 
 static int
@@ -1710,6 +1806,23 @@ test_shards_document_pure(void)
         failures++;
     }
     memset(&core, 0xff, sizeof(core));
+    /* Both raw backends' labels are raw listeners. */
+    views[0].labels.transport = "picoquic";
+    if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) !=
+            MOQR_OK ||
+        strstr(doc, "\"listener\":\"raw\"") == NULL ||
+        strstr(doc, "\"transport\":\"picoquic\"") == NULL) {
+        printf("  shards-pure: a picoquic row is wrong: [%.300s]\n", doc);
+        failures++;
+    }
+    views[0].labels.transport = "msquic";
+    if (moqr_cli_shards_render(views, 1u, 9u, doc, sizeof(doc), &len) !=
+            MOQR_OK ||
+        strstr(doc, "\"listener\":\"raw\"") == NULL) {
+        printf("  shards-pure: an msquic row is wrong: [%.300s]\n", doc);
+        failures++;
+    }
+    views[0].labels.transport = "wtquic-msquic";
     /* Absent: no shard plane, never fabricated. */
     views[0].shard = NULL;
     views[0].labels.transport = "msquic";
@@ -2077,6 +2190,8 @@ main(void)
     failures += test_admin_config();
     failures += test_admin_capacity();
     failures += test_info_document();
+    failures += test_k1_capacity_follows_composition();
+    failures += test_info_document_picoquic();
     failures += test_info_bound_and_refusal();
     failures += test_info_six_byte_expansion();
     failures += test_info_refusals_clear_output();
@@ -2152,14 +2267,85 @@ main(void)
                          sizeof(err)) == MOQR_ERR_INVAL);
     MOQ_TEST_CHECK(strstr(err, "port") != NULL);
 
-    /* Bad transport (picoquic is no longer a production transport). */
+    /* listener.transport: "msquic" (the default) or "picoquic"; anything else
+     * fails closed. */
     MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1,\"transport\":\"tcp\"}}",
                          &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
     MOQ_TEST_CHECK(strstr(err, "transport") != NULL);
+    MOQ_TEST_CHECK(parse("{\"listener\":{\"port\":1}}", &cfg, err,
+                         sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.transport == MOQR_CLI_TRANSPORT_MSQUIC);
     MOQ_TEST_CHECK(
         parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\"}}", &cfg,
-              err, sizeof(err)) == MOQR_ERR_INVAL);
-    MOQ_TEST_CHECK(strstr(err, "transport") != NULL);
+              err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(cfg.transport == MOQR_CLI_TRANSPORT_PICOQUIC);
+    MOQ_TEST_CHECK(strcmp(cfg.picoquic.congestion, "bbr") == 0);
+    MOQ_TEST_CHECK(cfg.picoquic.socket_buffer_bytes ==
+                   MOQR_CLI_PICOQUIC_DEFAULT_SOCKET_BUFFER);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{\"congestion\":\"cubic\","
+              "\"socket_buffer_bytes\":0}}}",
+              &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(strcmp(cfg.picoquic.congestion, "cubic") == 0);
+    MOQ_TEST_CHECK(cfg.picoquic.socket_buffer_bytes == 0);
+    /* The tuning object names the transport it tunes. */
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,"
+              "\"picoquic\":{\"congestion\":\"bbr\"}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "listener.picoquic") != NULL);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{\"congestion\":\"reno\"}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "congestion") != NULL);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{\"socket_buffer_bytes\":2147483648}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "socket_buffer_bytes") != NULL);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{\"gso\":true}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "unknown key") != NULL);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{},\"picoquic\":{}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "duplicate") != NULL);
+    /* One lane: independent picoquic contexts on one port are routed by
+     * address, not connection ID. MsQuic keeps its lanes. */
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"lanes\":2}}", &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "a picoquic listener serves one lane") != NULL);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"lanes\":1}}", &cfg, err, sizeof(err)) == MOQR_OK);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"lanes\":2}}", &cfg, err,
+              sizeof(err)) == MOQR_OK);
+    /* Each tuning key once. */
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{\"congestion\":\"bbr\",\"congestion\":\"cubic\"}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "congestion: duplicate") != NULL);
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\","
+              "\"picoquic\":{\"socket_buffer_bytes\":1,"
+              "\"socket_buffer_bytes\":2}}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "socket_buffer_bytes: duplicate") != NULL);
+    /* The PicoQUIC listener serves raw QUIC; a WebTransport listener is not
+     * implied by it and is refused beside it. */
+    MOQ_TEST_CHECK(
+        parse("{\"listener\":{\"port\":1,\"transport\":\"picoquic\"},"
+              "\"webtransport\":{\"port\":2,\"cert\":\"c\",\"key\":\"k\"}}",
+              &cfg, err, sizeof(err)) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(strstr(err, "not served with listener.transport") != NULL);
 
     /* listener.versions is an ORDERED, non-empty set. Everything malformed
      * fails closed; a multi-entry list is accepted and keeps its order. */

@@ -4,6 +4,9 @@
 #ifdef MOQR_DUAL_LISTENER
 #include <moq/wtquic_msquic_managed.h>
 #endif
+#ifdef MOQR_HAVE_PICOQUIC
+#include <moq/picoquic_threaded.h>
+#endif
 
 /*
  * The one production retirement pass for managed connections. Every lane pump
@@ -69,6 +72,14 @@ bool moqr_relay_reap_pass(moqr_bind_t *bind, moq_msquic_managed_lane_t *lane,
  */
 bool moqr_relay_reap_pass_wt(moqr_bind_t *bind,
                              moq_wtquic_msquic_managed_lane_t *lane,
+                             moqr_reap_stats_t *st);
+#endif
+
+#ifdef MOQR_HAVE_PICOQUIC
+/* The same pass over a PicoQUIC facade's single lane. The facade must have
+ * been created with cfg.retain_terminal_until_ack, so a terminal connection
+ * and its session stay valid until this pass acknowledges it. */
+bool moqr_relay_reap_pass_pq(moqr_bind_t *bind, moq_pq_threaded_lane_t *lane,
                              moqr_reap_stats_t *st);
 #endif
 
