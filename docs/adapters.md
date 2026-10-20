@@ -25,6 +25,7 @@ performs the corresponding transport writes:
 | `SEND_BIDI_STREAM` | Write bytes to an existing bidirectional stream |
 | `CLOSE_BIDI_STREAM` | Send FIN on a bidirectional stream |
 | `RESET_BIDI_STREAM` / `STOP_BIDI_STREAM` / `ABORT_BIDI_STREAM` | Reset our half, stop the peer's half, or both, of a request stream |
+| `SET_DATA_PRIORITY` | Only after `moq_session_set_data_priority_updates(s, true)`: set a data stream's priority before its first write; `stream_ref` 0 sets the subscriber priority of every stream of `priority.owner` |
 
 Each action carries a `stream_ref` that the adapter maps to a
 transport-level stream ID. The mapping is adapter-owned; the session

@@ -94,6 +94,8 @@ draft-18's integer encoding in [draft18-wire-reference.md](draft18-wire-referenc
 | Fetch data stream | Full | Full | `scenario_fetch` | Objects, gaps, FIN completion |
 | Object datagrams | Full | Full | `session_datagram`, `scenario_object_datagram` | Budget-accounted |
 | Delivery timeout | Full | Full | `scenario_streaming_object` | Per subscription and per update |
+| Group order | Full | Full | `group_order`, `group_order_default` | The subscriber's GROUP_ORDER, else the track's DEFAULT_PUBLISHER_GROUP_ORDER, else Ascending. The publisher facade and media sender advertise a track's `group_order` |
+| Data scheduling at the transport | n/a | Full | `scheduling`, `pq_sim_scheduling`, `group_order_e2e` | Each data stream's key reaches the adapter in MOQT 7.2 order: subscriber priority, publisher priority, group in the request's group order, lowest subgroup; equal priorities across requests take turns. Applied by adapters that implement `set_stream_priority` (picoquic, PicoWT) |
 | Reliable size on resets | n/a | Full | `reset_reliable_size` | Draft-16's text asks for it as draft-22's does; see [adapters.md](adapters.md#reliable-resets) |
 
 ### Auth
@@ -532,6 +534,19 @@ Each of these is a stated limit or open decision a user can run into.
 - **A PUBLISH accept with a non-default group order is refused on 22**,
   because GROUP_ORDER cannot travel on the REQUEST_UPDATE that carries the
   subscriber's choices.
+- **Transport scheduling is per stream.** Datagrams are not scheduled by
+  priority at the transport. A FETCH or fill stream carries objects of
+  several groups, so it is placed by its priorities only, and fill streams
+  take each write's priority as they did before stream keys. A FETCH whose
+  objects carry different publisher priorities takes, while several of them
+  wait at the transport, the priority of the last one handed over, not of
+  the next to go (issue #36). With
+  `max_actions` below 4 the bridge keys no stream: the group order is not
+  applied at the transport. An adapter that sets priorities without the
+  stream-drained notice loses the order whenever its transport still holds a
+  stream's data past that stream's FIN. Adapters without
+  `set_stream_priority` (msquic, mvfst, proxygen, wtquic) keep their own
+  stream scheduling.
 - **A received data stream reset before the session admitted it loses its
   header.** No in-tree stack reports the reliable size of a received reset,
   so a stream refused for want of a receive slot and then reset cannot be
