@@ -401,8 +401,11 @@ int main()
 
         auto payload = moq::buffer::create(
             reinterpret_cast<const uint8_t *>("\x42"), 1).value();
-        auto props = moq::buffer::create(
-            reinterpret_cast<const uint8_t *>("\xAA\xBB"), 2).value();
+        // One well-formed property: even type 0x02, varint value 5. The
+        // receiver parses properties as a Key-Value-Pair sequence, so
+        // unparseable bytes would make the Track malformed instead.
+        static const uint8_t prop_bytes[] = {0x02, 0x05};
+        auto props = moq::buffer::create(prop_bytes, sizeof(prop_bytes)).value();
 
         auto wr = pub.write_object(track,
             {.group_id = 0, .object_id = 0,
@@ -419,7 +422,9 @@ int main()
                 MOQ_CHECK(obj.datagram);
                 MOQ_CHECK(obj.payload_data.size() == 1);
                 MOQ_CHECK(obj.payload_data[0] == 0x42);
-                MOQ_CHECK(obj.properties_data.size() == 2);
+                MOQ_CHECK(obj.properties_data.size() == sizeof(prop_bytes) &&
+                          std::equal(obj.properties_data.begin(),
+                                     obj.properties_data.end(), prop_bytes));
             },
             [&](const auto &) { MOQ_CHECK(false); });
     }
