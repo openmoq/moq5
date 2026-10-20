@@ -4,3 +4,5 @@
 0006-own-application-close-reason.patch
 0007-stream-terminal-observation.patch
 0008-use-declared-project-version.patch
+0009-return-stream-credit-at-final-size.patch
+0010-classify-terminal-stream-reset-and-stop.patch

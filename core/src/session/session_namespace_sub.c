@@ -942,9 +942,11 @@ static moq_result_t ns_sub_reject_update(moq_session_t *s, size_t slot)
      * transaction borrows the same owner storage only for this call. */
     e->token_count = 0;
     uint64_t reject_code = 0;
-    rc = process_auth_tokens(s, tokens.in, tokens.count, e->resolved_tokens,
-        &e->token_count, MOQ_DECODED_MAX_TOKENS, &reject_code,
-        e->token_staged, &e->auth_txn);
+    rc = process_auth_tokens(s, tokens.in, tokens.count,
+        &(moq_auth_resolve_out_t){
+            .tokens = e->resolved_tokens, .token_count = &e->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &reject_code,
+            .staged = e->token_staged, .txn = &e->auth_txn });
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) goto abort;
     rc = ns_sub_send_request_error(s, slot, &endpoint,
         reject_code ? reject_code : MOQ_REQUEST_ERROR_NOT_SUPPORTED,
@@ -1062,8 +1064,10 @@ moq_result_t ns_sub_process_recving_publisher(moq_session_t *s,
             uint64_t auth_reject_code = 0;
             moq_result_t arc = process_auth_tokens(s,
                 decoded.auth_tokens, decoded.auth_token_count,
-                e->resolved_tokens, &e->token_count, MOQ_DECODED_MAX_TOKENS,
-                &auth_reject_code, e->token_staged, &e->auth_txn);
+                &(moq_auth_resolve_out_t){
+                    .tokens = e->resolved_tokens, .token_count = &e->token_count,
+                    .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &auth_reject_code,
+                    .staged = e->token_staged, .txn = &e->auth_txn });
             if (arc < 0) return arc;
             if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
             e->auth_processed = true;

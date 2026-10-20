@@ -542,6 +542,32 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME pico_wt_rx_lifecycle COMMAND test_pico_wt_rx_lifecycle)
+
+    # The end of a stopped WT data stream over real picoquic + h3zero.
+    add_executable(test_pico_wt_stop_release
+        tests/test_pico_wt_stop_release.c
+        tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_stop_release PRIVATE
+        MOQ_PICO_WT_TESTING
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    target_include_directories(test_pico_wt_stop_release PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_stop_release PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_stop_release PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_stop_release COMMAND test_pico_wt_stop_release)
+    set_tests_properties(pico_wt_stop_release PROPERTIES TIMEOUT 120)
     set_tests_properties(pico_wt_rx_lifecycle PROPERTIES TIMEOUT 180)
 endif()
 

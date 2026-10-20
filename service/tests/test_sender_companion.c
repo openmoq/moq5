@@ -147,12 +147,13 @@ static void *resize(void *p, size_t old, size_t n, void *ctx)
     return realloc(p, n);
 }
 static moq_bytes_t ns_part = {(const uint8_t *)"companion", 9};
-static moq_media_sender_cfg_t *config(size_t tail, uint32_t profile, uint32_t budget)
+static old_sender_cfg_t *config(size_t tail, uint32_t profile, uint32_t budget)
 {
     size_t n = sizeof(old_sender_cfg_t) + tail;
-    moq_media_sender_cfg_t *cfg = calloc(1, n);
+    old_sender_cfg_t *cfg = calloc(1, n);
     REQUIRE(cfg);
-    moq_media_sender_cfg_init_live_sized(cfg, sizeof(old_sender_cfg_t));
+    moq_media_sender_cfg_init_live_sized((moq_media_sender_cfg_t *)cfg,
+                                        sizeof(old_sender_cfg_t));
     cfg->struct_size = (uint32_t)n;
     cfg->namespace_ = (moq_namespace_t){&ns_part, 1};
     cfg->backpressure = MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK;
@@ -162,10 +163,10 @@ static moq_media_sender_cfg_t *config(size_t tail, uint32_t profile, uint32_t bu
                       tail < sizeof(profile) ? tail : sizeof(profile));
     return cfg;
 }
-static moq_media_send_object_t *object(size_t tail, moq_media_metadata_t *meta)
+static old_send_object_t *object(size_t tail, moq_media_metadata_t *meta)
 {
     size_t n = sizeof(old_send_object_t) + tail;
-    moq_media_send_object_t *o = calloc(1, n);
+    old_send_object_t *o = calloc(1, n);
     REQUIRE(o);
     o->struct_size = (uint32_t)n;
     o->is_sync = o->starts_group = o->ends_group = true;
@@ -201,13 +202,13 @@ static void drain_events(moq_session_t *s)
     moq_event_t e;
     while (moq_session_poll_events(s, &e, 1)) moq_event_cleanup(&e);
 }
-static bool start(fixture_t *f, moq_media_sender_cfg_t *cfg, moq_version_t version,
+static bool start(fixture_t *f, old_sender_cfg_t *cfg, moq_version_t version,
                   moq_media_packaging_t packaging)
 {
 #define START_STEP(expr) do { bool ok = (expr); CHECK(ok); if (!ok) return false; } while (0)
     f->alloc = (moq_alloc_t){.ctx=&f->memory,.alloc=allocate,.realloc=resize,.free=release};
     moq_media_sender_test_set_alloc(&f->alloc);
-    START_STEP(moq_media_sender_test_construct(cfg, &f->sender) == MOQ_OK);
+    START_STEP(moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &f->sender) == MOQ_OK);
     moq_media_track_cfg_t tc;
     moq_media_track_cfg_init(&tc);
     tc.name = MOQ_BYTES_LITERAL("v"); tc.codec = MOQ_BYTES_LITERAL("av01");
@@ -243,11 +244,11 @@ static moq_media_sender_stats_t stats(fixture_t *f)
     REQUIRE(moq_media_sender_get_stats(f->sender, &st, sizeof(st)) == MOQ_OK);
     return st;
 }
-static moq_result_t write_object(fixture_t *f, moq_media_send_object_t *o)
+static moq_result_t write_object(fixture_t *f, old_send_object_t *o)
 {
     const uint8_t data[] = {0xa1,0xb2,0xc3,0xd4};
     REQUIRE(moq_rcbuf_create(&f->alloc, data, sizeof(data), &o->payload) == MOQ_OK);
-    moq_result_t rc = moq_media_sender_write(f->sender, f->track, o);
+    moq_result_t rc = moq_media_sender_write(f->sender, f->track, (const moq_media_send_object_t *)o);
     if (rc != MOQ_OK) moq_rcbuf_decref(o->payload);
     return rc;
 }
@@ -319,38 +320,38 @@ static void configuration_controls(void)
     /* A partially covered field is absent (AUTO); a covered unknown value
      * is refused. */
     for (size_t tail = 0; tail < 9; ++tail) {
-        moq_media_sender_cfg_t *cfg = config(tail, tail < 4 ? UINT32_MAX :
+        old_sender_cfg_t *cfg = config(tail, tail < 4 ? UINT32_MAX :
                                              MOQ_MEDIA_COMPANION_AUTO + 1u, 1024);
         moq_media_sender_t *s = NULL;
-        moq_result_t rc = moq_media_sender_test_construct(cfg, &s);
+        moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &s);
         CHECK(rc == (tail < 4 ? MOQ_OK : MOQ_ERR_INVAL));
         if (s) CHECK(moq_media_sender_test_companion(s) == MOQ_MEDIA_COMPANION_AUTO);
         if (s) moq_media_sender_test_free(s);
         free(cfg);
     }
     {
-        moq_media_sender_cfg_t *cfg = config(8, UINT32_MAX, 1024);
+        old_sender_cfg_t *cfg = config(8, UINT32_MAX, 1024);
         moq_media_sender_t *s = NULL;
-        CHECK(moq_media_sender_test_construct(cfg, &s) == MOQ_ERR_INVAL && !s);
+        CHECK(moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &s) == MOQ_ERR_INVAL && !s);
         free(cfg);
     }
     /* Every known value is kept as configured until a session is observed. */
     const uint32_t known[] = {MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01,
         MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_MEDIA_COMPANION_AUTO};
     for (size_t k = 0; k < sizeof(known) / sizeof(*known); ++k) {
-        moq_media_sender_cfg_t *cfg = config(4, known[k], 1024);
+        old_sender_cfg_t *cfg = config(4, known[k], 1024);
         moq_media_sender_t *s = NULL;
-        CHECK(moq_media_sender_test_construct(cfg, &s) == MOQ_OK);
+        CHECK(moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &s) == MOQ_OK);
         if (s) {
             CHECK(moq_media_sender_test_companion(s) == known[k]);
             moq_media_sender_test_free(s);
         }
         free(cfg);
     }
-    moq_media_sender_cfg_t *cfg = config(4, 0, 1024);
+    old_sender_cfg_t *cfg = config(4, 0, 1024);
     cfg->struct_size = (uint32_t)offsetof(moq_media_sender_cfg_t, callbacks) - 1;
     moq_media_sender_t *s = NULL;
-    CHECK(moq_media_sender_test_construct(cfg, &s) == MOQ_ERR_INVAL);
+    CHECK(moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &s) == MOQ_ERR_INVAL);
     free(cfg);
     const size_t cap = sizeof(moq_media_sender_cfg_t) + 16;
     uint8_t *p = malloc(cap); REQUIRE(p);
@@ -382,7 +383,7 @@ static void configuration_controls(void)
 static void mismatch(moq_version_t version, size_t tail, uint32_t profile)
 {
     label = "negotiated-companion-mismatch-without-endpoint-fatal"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(tail,profile,1024);
+    old_sender_cfg_t *cfg = config(tail,profile,1024);
     fixture_t f = {0}; bool started = start(&f,cfg,version,MOQ_MEDIA_PACKAGING_RAW); free(cfg);
     if (!started) { finish(&f); return; }
     CHECK(stats(&f).last_error == MOQ_ERR_UNSUPPORTED);
@@ -393,7 +394,7 @@ static void mismatch(moq_version_t version, size_t tail, uint32_t profile)
     CHECK(actions == 0);
     if (actions) moq_action_cleanup(&a);
     moq_media_metadata_t m; metadata(&m,false,7,0);
-    moq_media_send_object_t *o = object(sizeof(void *), &m);
+    old_send_object_t *o = object(sizeof(void *), &m);
     CHECK(write_object(&f,o) == MOQ_ERR_UNSUPPORTED); free(o);
     CHECK(stats(&f).objects_written == 0 && stats(&f).bytes_queued == 0);
     finish(&f);
@@ -404,7 +405,7 @@ static void wire_control(moq_version_t version, size_t cfg_tail, uint32_t profil
     bool d22 = cfg_tail >= sizeof(profile) && profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
     label = d22 ? packaging == MOQ_MEDIA_PACKAGING_CMAF ? "d22-cmaf-old-object-literal-passthrough" :
         "d22-authoritative-owned-metadata-literal-drain" : "legacy-raw-cmaf-unchanged"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(cfg_tail,profile,1024);
+    old_sender_cfg_t *cfg = config(cfg_tail,profile,1024);
     fixture_t f = {0}; bool started = start(&f,cfg,version,packaging); free(cfg);
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m; metadata(&m,application,7,1000000);
@@ -416,7 +417,7 @@ static void wire_control(moq_version_t version, size_t cfg_tail, uint32_t profil
         m.loc.video_config = (moq_bytes_t){config_bytes,sizeof(config_bytes)};
         m.loc.audio_config = (moq_bytes_t){NULL,0};
     }
-    moq_media_send_object_t *o = object(d22 && packaging == MOQ_MEDIA_PACKAGING_RAW ? sizeof(void *) + 8 : 0,&m);
+    old_send_object_t *o = object(d22 && packaging == MOQ_MEDIA_PACKAGING_RAW ? sizeof(void *) + 8 : 0,&m);
     const uint8_t cmaf_props[] = {0x78,1};
     moq_rcbuf_t *props_observer = NULL;
     if (packaging == MOQ_MEDIA_PACKAGING_CMAF) {
@@ -452,7 +453,7 @@ static void wire_control(moq_version_t version, size_t cfg_tail, uint32_t profil
 static void refusal(unsigned kind)
 {
     label = "d22-refusal-before-payload-transfer"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,kind == 10 ? 5 : 1024);
+    old_sender_cfg_t *cfg = config(4,1,kind == 10 ? 5 : 1024);
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW); free(cfg);
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m; metadata(&m,true,7,1000000);
@@ -473,7 +474,7 @@ static void refusal(unsigned kind)
     case 14: m.loc.timestamp = (UINT64_MAX / 1000000u) * 3 + 2; m.loc.timescale = 3; break;
     default: break;
     }
-    moq_media_send_object_t *o = object(tail,kind == 12 ? NULL : &m);
+    old_send_object_t *o = object(tail,kind == 12 ? NULL : &m);
     if (kind == 13) o->struct_size = (uint32_t)sizeof(old_send_object_t) - 1;
     moq_result_t rc = write_object(&f,o);
     CHECK(rc == (kind == 10 ? MOQ_ERR_WOULD_BLOCK : MOQ_ERR_INVAL));
@@ -484,7 +485,7 @@ static void refusal(unsigned kind)
 static void allocation_refusal(bool large, unsigned offset)
 {
     label = "generated-property-allocation-refusal-retry"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,1024);
+    old_sender_cfg_t *cfg = config(4,1,1024);
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW); free(cfg);
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m; metadata(&m,false,7,0);
@@ -493,19 +494,19 @@ static void allocation_refusal(bool large, unsigned offset)
         m.loc.present |= MOQ_LOC_METADATA_HAS_VIDEO_CONFIG;
         m.loc.video_config = (moq_bytes_t){config_bytes,sizeof(config_bytes)};
     }
-    moq_media_send_object_t *o = object(sizeof(void *),&m);
+    old_send_object_t *o = object(sizeof(void *),&m);
     const uint8_t data[] = {0xa1,0xb2,0xc3,0xd4};
     REQUIRE(moq_rcbuf_create(&f.alloc,data,sizeof(data),&o->payload) == MOQ_OK);
     size_t live = f.memory.live;
     f.memory.fail = f.memory.calls + offset;
-    moq_result_t rc = moq_media_sender_write(f.sender,f.track,o);
+    moq_result_t rc = moq_media_sender_write(f.sender,f.track, (const moq_media_send_object_t *)o);
     CHECK(rc == MOQ_ERR_NOMEM);
     CHECK(f.memory.calls == f.memory.fail);
     CHECK(f.memory.live == live);
     CHECK(stats(&f).objects_written == 0 && stats(&f).bytes_queued == 0);
     f.memory.fail = 0;
     if (rc != MOQ_OK) {
-        rc = moq_media_sender_write(f.sender,f.track,o);
+        rc = moq_media_sender_write(f.sender,f.track, (const moq_media_send_object_t *)o);
         CHECK(rc == MOQ_OK);
         if (rc != MOQ_OK) moq_rcbuf_decref(o->payload);
     }
@@ -530,13 +531,13 @@ static int timeout_clock(struct timespec *out, void *ctx)
 static void timeout_refusal(void)
 {
     label = "generated-properties-released-on-scripted-timeout"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,5);
+    old_sender_cfg_t *cfg = config(4,1,5);
     cfg->backpressure = MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT;
     cfg->block_timeout_us = 1;
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW); free(cfg);
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m; metadata(&m,false,7,0);
-    moq_media_send_object_t *o = object(sizeof(void *),&m);
+    old_send_object_t *o = object(sizeof(void *),&m);
     unsigned calls = 0;
     moq_media_sender_test_set_clock_hook(timeout_clock,&calls);
     CHECK(write_object(&f,o) == MOQ_ERR_WOULD_BLOCK);
@@ -549,7 +550,7 @@ static void timeout_refusal(void)
 static void time_endpoints(unsigned kind)
 {
     label = "explicit-zero-and-full-width-usable-time"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,1024);
+    old_sender_cfg_t *cfg = config(4,1,1024);
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW); free(cfg);
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m;
@@ -563,7 +564,7 @@ static void time_endpoints(unsigned kind)
     oracle[n++] = kind >= 2 ? 8 : 0x10;
     if (kind) for (unsigned i = 0; i < 9; ++i) oracle[n++] = 0xff;
     else oracle[n++] = 0;
-    moq_media_send_object_t *o = object(sizeof(void *),&m);
+    old_send_object_t *o = object(sizeof(void *),&m);
     moq_result_t rc = write_object(&f,o);
     CHECK(rc == MOQ_OK);
     if (rc == MOQ_OK) expect_wire(&f,oracle,n);
@@ -573,11 +574,11 @@ static void time_endpoints(unsigned kind)
 static void unobserved_and_future_metadata(void)
 {
     label = "explicit-d22-needs-observed-version-and-accepts-future-metadata"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,1024);
+    old_sender_cfg_t *cfg = config(4,1,1024);
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW);
     if (!started) { free(cfg); finish(&f); return; }
     moq_media_sender_t *unobserved = NULL;
-    REQUIRE(moq_media_sender_test_construct(cfg,&unobserved) == MOQ_OK);
+    REQUIRE(moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg,&unobserved) == MOQ_OK);
     free(cfg);
     moq_media_track_cfg_t tc; moq_media_track_cfg_init(&tc);
     tc.name = MOQ_BYTES_LITERAL("v"); tc.codec = MOQ_BYTES_LITERAL("av01");
@@ -587,10 +588,10 @@ static void unobserved_and_future_metadata(void)
     struct { moq_media_metadata_t m; uint8_t future[16]; } meta;
     metadata(&meta.m,false,7,0); memset(meta.future,0xa5,sizeof(meta.future));
     meta.m.struct_size = sizeof(meta); meta.m.loc.struct_size = sizeof(meta.m.loc) + 16;
-    moq_media_send_object_t *o = object(sizeof(void *),&meta.m);
+    old_send_object_t *o = object(sizeof(void *),&meta.m);
     const uint8_t data[] = {0xa1,0xb2,0xc3,0xd4};
     REQUIRE(moq_rcbuf_create(&f.alloc,data,sizeof(data),&o->payload) == MOQ_OK);
-    moq_result_t rc = moq_media_sender_write(unobserved,track,o);
+    moq_result_t rc = moq_media_sender_write(unobserved,track, (const moq_media_send_object_t *)o);
     CHECK(rc == MOQ_ERR_UNSUPPORTED);
     if (rc != MOQ_OK) moq_rcbuf_decref(o->payload);
     moq_media_sender_test_free(unobserved);
@@ -602,7 +603,7 @@ static void unobserved_and_future_metadata(void)
     free(o); finish(&f);
 }
 
-static moq_result_t observed_write(fixture_t *f, moq_media_send_object_t *o,
+static moq_result_t observed_write(fixture_t *f, old_send_object_t *o,
                                    moq_rcbuf_t **observer)
 {
     const uint8_t data[] = {0xa1,0xb2,0xc3,0xd4};
@@ -610,7 +611,7 @@ static moq_result_t observed_write(fixture_t *f, moq_media_send_object_t *o,
     CHECK(rc == MOQ_OK);
     if (rc != MOQ_OK) return rc;
     *observer = moq_rcbuf_incref(o->payload);
-    rc = moq_media_sender_write(f->sender,f->track,o);
+    rc = moq_media_sender_write(f->sender,f->track, (const moq_media_send_object_t *)o);
     if (rc != MOQ_OK) moq_rcbuf_decref(o->payload);
     return rc;
 }
@@ -620,13 +621,13 @@ static void drop_properties(moq_media_send_backpressure_t policy)
     label = policy == MOQ_MEDIA_SEND_BP_DROP_GROUP ? "owned-properties-drop-group" :
                                                     "owned-properties-drop-to-keyframe";
     ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,12);
+    old_sender_cfg_t *cfg = config(4,1,12);
     cfg->backpressure = policy;
     cfg->pre_ready_max_objects = cfg->queue_max_objects = 2;
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW);
     free(cfg);
     moq_rcbuf_t *a = NULL, *b = NULL, *c = NULL, *oversize = NULL;
-    moq_media_send_object_t *o = NULL;
+    old_send_object_t *o = NULL;
     if (!started) goto cleanup;
     moq_media_metadata_t m; metadata(&m,false,7,0);
     o = object(sizeof(void *),&m); o->ends_group = false;
@@ -709,14 +710,14 @@ static void blocking_properties(enum blocking_exit kind)
     static const char *names[] = {"owned-properties-block-interrupted", "owned-properties-block-closed",
         "owned-properties-origin-clock-error", "owned-properties-slice-clock-error", "owned-properties-wait-error"};
     label = names[kind]; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4,1,6);
+    old_sender_cfg_t *cfg = config(4,1,6);
     cfg->backpressure = MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT; cfg->block_timeout_us = 1000000;
     cfg->pre_ready_max_objects = cfg->queue_max_objects = 1;
     fixture_t f = {0}; bool started = start(&f,cfg,MOQ_VERSION_DRAFT_22,MOQ_MEDIA_PACKAGING_RAW);
     free(cfg);
     moq_endpoint_t *ep = NULL;
     moq_rcbuf_t *filler = NULL, *incoming = NULL;
-    moq_media_send_object_t *o = NULL;
+    old_send_object_t *o = NULL;
     if (!started) goto cleanup;
     moq_media_metadata_t m; metadata(&m,false,7,0);
     o = object(sizeof(void *),&m);
@@ -738,7 +739,7 @@ static void blocking_properties(enum blocking_exit kind)
     blocking_script_t script = {.kind=kind,.ep=ep};
     moq_media_sender_test_set_clock_hook(blocking_clock,&script);
     moq_media_sender_test_set_cond_wait_hook(blocking_wait,&script);
-    rc = moq_media_sender_write(f.sender,f.track,o);
+    rc = moq_media_sender_write(f.sender,f.track, (const moq_media_send_object_t *)o);
     moq_media_sender_test_set_clock_hook(NULL,NULL);
     moq_media_sender_test_set_cond_wait_hook(NULL,NULL);
     moq_result_t expected = kind == EXIT_INTERRUPT ? MOQ_ERR_INTERRUPTED :
@@ -777,7 +778,7 @@ static void group_ids(bool d22)
     label = d22 ? "d22-group-ids-start-at-instance-wallclock"
                 : "legacy-group-ids-unchanged"; ++rows;
     const uint64_t base = 1700000000123ull;
-    moq_media_sender_cfg_t *cfg = config(4, d22 ? 1 : 0, 1024);
+    old_sender_cfg_t *cfg = config(4, d22 ? 1 : 0, 1024);
     g_clock_rc = 0; g_clock_ts = ms_clock(base);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
     fixture_t f = {0};
@@ -788,7 +789,7 @@ static void group_ids(bool d22)
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m; metadata(&m,false,7,0);
     for (unsigned g = 0; g < 2; ++g) {
-        moq_media_send_object_t *o = object(d22 ? sizeof(void *) : 0, &m);
+        old_send_object_t *o = object(d22 ? sizeof(void *) : 0, &m);
         CHECK(write_object(&f, o) == MOQ_OK);
         free(o);
     }
@@ -839,14 +840,14 @@ static void group_base_refusal(unsigned kind)
     default: g_clock_ts = ms_clock(MOQ_QUIC_VARINT_MAX + 1u);
              want = MOQ_ERR_LIMIT; break;
     }
-    moq_media_sender_cfg_t *cfg = kind == 5 ? config(0, 0, 1024) :
+    old_sender_cfg_t *cfg = kind == 5 ? config(0, 0, 1024) :
         config(4, kind == 4 ? 0 : kind == 6 ? MOQ_MEDIA_COMPANION_AUTO : 1, 1024);
     allocation_t memory = {0};
     moq_alloc_t alloc = {.ctx=&memory,.alloc=allocate,.realloc=resize,.free=release};
     moq_media_sender_test_set_alloc(&alloc);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
     moq_media_sender_t *s = (moq_media_sender_t *)(uintptr_t)1;
-    CHECK(moq_media_sender_test_construct(cfg, &s) == want);
+    CHECK(moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &s) == want);
     moq_media_sender_test_set_clock_hook(NULL, NULL);
     if (want == MOQ_OK) CHECK(s != NULL);
     else CHECK(s == NULL);
@@ -866,7 +867,7 @@ static void group_base_refusal(unsigned kind)
 static void group_id_ceiling(void)
 {
     label = "group-id-final-valid-and-exhaustion"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4, 1, 1024);
+    old_sender_cfg_t *cfg = config(4, 1, 1024);
     g_clock_rc = 0; g_clock_ts = ms_clock(MOQ_QUIC_VARINT_MAX);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
     fixture_t f = {0};
@@ -875,7 +876,7 @@ static void group_id_ceiling(void)
     free(cfg);
     if (!started) { finish(&f); return; }
     moq_media_metadata_t m; metadata(&m,false,7,0);
-    moq_media_send_object_t *o = object(sizeof(void *), &m);
+    old_send_object_t *o = object(sizeof(void *), &m);
     o->ends_group = false;
     CHECK(write_object(&f, o) == MOQ_OK);             /* opens group MAX */
     o->is_sync = false; o->starts_group = false;
@@ -920,7 +921,7 @@ static void group_id_ceiling(void)
 static void catalog_last_group(void)
 {
     label = "catalog-final-generation"; ++rows;
-    moq_media_sender_cfg_t *cfg = config(4, 1, 1024);
+    old_sender_cfg_t *cfg = config(4, 1, 1024);
     g_clock_rc = 0; g_clock_ts = ms_clock(MOQ_QUIC_VARINT_MAX - 1u);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
     fixture_t f = {0};
@@ -956,14 +957,14 @@ static void catalog_last_group(void)
 
 /* An AUTO sender: construct with a scripted Group ID base, register one video
  * track before any session exists, then observe a `version` session. */
-static bool start_auto(fixture_t *f, moq_media_sender_cfg_t *cfg, uint64_t base,
+static bool start_auto(fixture_t *f, old_sender_cfg_t *cfg, uint64_t base,
                        moq_media_packaging_t packaging, moq_bytes_t init)
 {
     f->alloc = (moq_alloc_t){.ctx=&f->memory,.alloc=allocate,.realloc=resize,.free=release};
     moq_media_sender_test_set_alloc(&f->alloc);
     g_clock_rc = 0; g_clock_ts = ms_clock(base);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
-    moq_result_t rc = moq_media_sender_test_construct(cfg, &f->sender);
+    moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &f->sender);
     moq_media_sender_test_set_clock_hook(NULL, NULL);
     CHECK(rc == MOQ_OK);
     if (rc != MOQ_OK) return false;
@@ -1011,9 +1012,9 @@ static void auto_resolution(moq_version_t version, bool before_latch, bool with_
     const bool d22 = version == MOQ_VERSION_DRAFT_22;
     const uint64_t base = 1700000000123ull;
     static const uint8_t init[] = {0x01,0x02,0x03};
-    moq_media_sender_cfg_t *cfg = config(0, 0, 1024);   /* field absent */
+    old_sender_cfg_t *cfg = config(0, 0, 1024);   /* field absent */
     fixture_t f = {0};
-    moq_media_send_object_t *o = NULL;
+    old_send_object_t *o = NULL;
     bool started = start_auto(&f, cfg, base, MOQ_MEDIA_PACKAGING_RAW,
                               (moq_bytes_t){init, sizeof(init)});
     free(cfg);
@@ -1112,7 +1113,7 @@ static void auto_cmaf_without_init(moq_version_t version)
     label = version == MOQ_VERSION_DRAFT_22 ? "auto-draft22-cmaf-without-init-blocks"
                                             : "auto-legacy-cmaf-without-init-publishes"; ++rows;
     const bool d22 = version == MOQ_VERSION_DRAFT_22;
-    moq_media_sender_cfg_t *cfg = config(4, MOQ_MEDIA_COMPANION_AUTO, 1024);
+    old_sender_cfg_t *cfg = config(4, MOQ_MEDIA_COMPANION_AUTO, 1024);
     fixture_t f = {0};
     bool started = start_auto(&f, cfg, 1700000000123ull, MOQ_MEDIA_PACKAGING_CMAF,
                               (moq_bytes_t){NULL, 0});
@@ -1129,7 +1130,7 @@ static void auto_cmaf_without_init(moq_version_t version)
     if (actions) moq_action_cleanup(&a);
     if (d22) {
         CHECK(stats(&f).last_error == MOQ_ERR_UNSUPPORTED);
-        moq_media_send_object_t *o = object(0, NULL);
+        old_send_object_t *o = object(0, NULL);
         CHECK(write_object(&f, o) == MOQ_ERR_UNSUPPORTED);
         free(o);
         CHECK(stats(&f).objects_written == 0);
@@ -1176,12 +1177,12 @@ static bool scaled_start(scaled_t *x, uint32_t companion, const moq_version_t *o
     fixture_t *f = &x->f;
     f->alloc = (moq_alloc_t){.ctx=&f->memory,.alloc=allocate,.realloc=resize,.free=release};
     moq_media_sender_test_set_alloc(&f->alloc);
-    moq_media_sender_cfg_t *cfg = config(4, companion, budget);
+    old_sender_cfg_t *cfg = config(4, companion, budget);
     if (max_objects) cfg->pre_ready_max_objects = cfg->queue_max_objects = max_objects;
     if (bp) cfg->backpressure = bp;
     g_clock_rc = 0; g_clock_ts = ms_clock(1700000000123ull);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
-    moq_result_t rc = moq_media_sender_test_construct(cfg, &f->sender);
+    moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &f->sender);
     moq_media_sender_test_set_clock_hook(NULL, NULL);
     free(cfg);
     CHECK(rc == MOQ_OK);
@@ -1236,7 +1237,7 @@ static void scaled_finish(scaled_t *x)
 /* A typed write: capture time 48000 (or none), no metadata tail. */
 static moq_result_t typed_write(fixture_t *f, bool capture)
 {
-    moq_media_send_object_t *o = object(0, NULL);
+    old_send_object_t *o = object(0, NULL);
     o->has_capture_time = capture;
     o->capture_time_us = capture ? 48000u : 0u;
     o->presentation_time_us = 17;
@@ -1364,7 +1365,7 @@ static void scale_metadata_boundaries(void)
         if (scaled_start(&x, MOQ_MEDIA_COMPANION_AUTO, NULL, 0, k_scale48k,
                          sizeof(k_scale48k), MOQ_MEDIA_TYPE_VIDEO,
                          MOQ_VERSION_DRAFT_22, 1024, 0, 0)) {
-            moq_media_send_object_t *o = object(r[i].tail,
+            old_send_object_t *o = object(r[i].tail,
                 r[i].meta == 1 ? &valid : r[i].meta == 2 ? &invalid : NULL);
             o->capture_time_us = 48000;
             moq_result_t rc = write_object(&x.f, o);
@@ -1399,7 +1400,7 @@ static void scale_metadata_boundaries(void)
 static moq_result_t meta_write(fixture_t *f, moq_media_metadata_t *m,
                                bool sync, bool ends, moq_rcbuf_t **observer)
 {
-    moq_media_send_object_t *o = object(sizeof(void *), m);
+    old_send_object_t *o = object(sizeof(void *), m);
     o->is_sync = o->starts_group = sync;
     o->ends_group = ends;
     moq_result_t rc = observed_write(f, o, observer);
@@ -1433,7 +1434,7 @@ static void scale_refusal_owns_nothing(void)
     CHECK(before.objects_queued == 2);
     CHECK(b && c && moq_rcbuf_refcount(b) == 2 && moq_rcbuf_refcount(c) == 2);
     /* The refused typed capture time: a sync object opening a new group. */
-    moq_media_send_object_t *o = object(0, NULL);
+    old_send_object_t *o = object(0, NULL);
     o->capture_time_us = 48000;
     moq_result_t rc = observed_write(f, o, &incoming);
     free(o);

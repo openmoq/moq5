@@ -357,6 +357,40 @@ static void conn_feed_close(moq_msquic_conn_t *c)
 }
 
 /*
+ * Report every stream MsQuic retired outside connection teardown to the
+ * bridge as a whole-stream terminal, then drop its record. A stream the bridge
+ * is discarding after a whole-request abort is retired by it; for any other
+ * stream the report is a no-op (its own FIN/reset/commit already settled it).
+ * The terminal says only that the transport finished with the stream: it is
+ * never a FIN, a reset, or evidence that anything was delivered or
+ * acknowledged.
+ *
+ * Runs only from the service loop, never inside an endpoint op or a bridge
+ * call, so a stream MsQuic completed inline (from within an op) cannot reach a
+ * bridge frame that still owns its mapping. The record stays linked, with its
+ * handle already gone, until its report returns: an op the report triggers
+ * finds it and treats the stream as gone. A bridge already terminal ignores
+ * the report.
+ */
+static void conn_feed_terminals(moq_msquic_conn_t *c)
+{
+    while (c->terminals_owed > 0 && c->in_op == 0) {
+        struct moq_msq_stream *ms = c->streams;
+        while (ms != NULL && !ms->terminal_owed)
+            ms = ms->next;
+        if (ms == NULL) {          /* defensive: the count drifted */
+            c->terminals_owed = 0;
+            return;
+        }
+        (void)moq_transport_bridge_on_peer_stream_terminal(c->bridge, ms->id,
+                                                           now_us());
+        ms->terminal_owed = false;
+        c->terminals_owed--;
+        stream_free(c, ms);
+    }
+}
+
+/*
  * A stream whose bridge state has drained may take bytes again. Re-enable
  * MsQuic delivery for any receive we rejected while paused, then clear the
  * paused mark. Ordering matters: publish the cleared state ONLY after the
@@ -435,6 +469,7 @@ static void conn_service(moq_msquic_conn_t *c)
     do {
         c->service_pending = false;
         conn_feed_close(c);
+        conn_feed_terminals(c);
         (void)moq_transport_bridge_service(c->bridge, now_us());
         batch_flush(c); /* everything this pass staged goes out */
         /* a batch the bridge already counted as written could not be
@@ -1136,11 +1171,31 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
          * byte/FIN ACK evidence and cannot repair a previously recorded loss. */
         stream_record_output_loss(c, ms);
         /* all this stream's events (completions included) precede
-         * this one; the handle dies here, the bookkeeping with it */
+         * this one; the handle dies here */
         if (ms->stream != NULL &&
             !ev->SHUTDOWN_COMPLETE.AppCloseInProgress)
             c->api->StreamClose(ms->stream);
-        stream_free(c, ms);
+        ms->stream = NULL;
+        /* The bridge hears that the transport is done with the stream (it
+         * retires a stream it is discarding after an abort, which MsQuic
+         * otherwise reports nothing more for once our receive side was
+         * aborted), except while the connection itself is shutting down:
+         * that is the connection's terminal, fed once, never an isolated
+         * stream completion. The report waits for conn_feed_terminals. */
+        if (!ev->SHUTDOWN_COMPLETE.ConnectionShutdown && !c->close_pending &&
+            !c->shutdown_complete && !c->teardown_sent &&
+            !moq_transport_bridge_is_terminal(c->bridge)) {
+            ms->terminal_owed = true;
+            c->terminals_owed++;
+        } else {
+            stream_free(c, ms);
+        }
+        /* inside an endpoint op (an inline completion): the frame that
+         * called the op services afterwards; nothing re-enters it here */
+        if (c->in_op > 0) {
+            c->service_pending = true;
+            break;
+        }
         /* a freed stream may unblock a pending open via credit */
         conn_service(c);
         break;
@@ -1401,6 +1456,45 @@ void moq_msquic_conn_cfg_init_sized(moq_msquic_conn_cfg_t *cfg,
     ((cfg)->struct_size >=                                               \
      offsetof(moq_msquic_conn_cfg_t, field) + sizeof((cfg)->field))
 
+/* Endpoint ops as the bridge sees them: each runs with in_op raised, so a
+ * stream MsQuic completes inline from inside the op is held for the service
+ * loop instead of reaching the bridge from within the bridge frame that
+ * called the op. */
+#define MSQ_OP(ret, name, params, args)                                      \
+    static ret op_##name params                                              \
+    {                                                                        \
+        moq_msquic_conn_t *c_ = ctx;                                         \
+        c_->in_op++;                                                         \
+        ret r_ = ep_##name args;                                             \
+        c_->in_op--;                                                         \
+        return r_;                                                           \
+    }
+MSQ_OP(moq_transport_result_t, open_uni, (void *ctx, uint64_t *out_id),
+       (ctx, out_id))
+MSQ_OP(moq_transport_result_t, open_bidi, (void *ctx, uint64_t *out_id),
+       (ctx, out_id))
+MSQ_OP(moq_transport_result_t, write,
+       (void *ctx, uint64_t stream_id, const uint8_t *data, size_t len, bool fin),
+       (ctx, stream_id, data, len, fin))
+MSQ_OP(moq_transport_result_t, write_payload,
+       (void *ctx, uint64_t stream_id, moq_rcbuf_t *buf, bool fin),
+       (ctx, stream_id, buf, fin))
+MSQ_OP(moq_transport_result_t, reset_stream,
+       (void *ctx, uint64_t stream_id, uint64_t error_code),
+       (ctx, stream_id, error_code))
+MSQ_OP(moq_transport_result_t, reset_stream_at,
+       (void *ctx, uint64_t stream_id, uint64_t error_code, uint64_t reliable_size),
+       (ctx, stream_id, error_code, reliable_size))
+MSQ_OP(moq_transport_result_t, stop_sending,
+       (void *ctx, uint64_t stream_id, uint64_t error_code),
+       (ctx, stream_id, error_code))
+MSQ_OP(moq_transport_result_t, send_datagram,
+       (void *ctx, const uint8_t *data, size_t len), (ctx, data, len))
+MSQ_OP(moq_transport_result_t, close_transport,
+       (void *ctx, uint64_t code, const uint8_t *reason, size_t reason_len),
+       (ctx, code, reason, reason_len))
+#undef MSQ_OP
+
 moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
                                     moq_msquic_conn_t **out)
 {
@@ -1445,16 +1539,16 @@ moq_result_t moq_msquic_conn_create(const moq_msquic_conn_cfg_t *cfg,
                         MOQ_TRANSPORT_CAP_HOLD_INPUT |
                         MOQ_TRANSPORT_CAP_COMMIT_REPORT |
                         MOQ_TRANSPORT_CAP_RELIABLE_RESET,
-        .open_uni = ep_open_uni,
-        .open_bidi = ep_open_bidi,
-        .write = ep_write,
-        .write_payload = ep_write_payload,
-        .reset_stream = ep_reset_stream,
-        .reset_stream_at = ep_reset_stream_at,
-        .stop_sending = ep_stop_sending,
-        .send_datagram = ep_send_datagram,
+        .open_uni = op_open_uni,
+        .open_bidi = op_open_bidi,
+        .write = op_write,
+        .write_payload = op_write_payload,
+        .reset_stream = op_reset_stream,
+        .reset_stream_at = op_reset_stream_at,
+        .stop_sending = op_stop_sending,
+        .send_datagram = op_send_datagram,
         .max_datagram_size = ep_max_datagram_size,
-        .close_transport = ep_close_transport,
+        .close_transport = op_close_transport,
     };
 
     moq_transport_bridge_cfg_t bcfg;
@@ -1519,6 +1613,7 @@ void moq_msq_conn_service_wake(moq_msquic_conn_t *c)
     }
     /* anything terminal-ish pending takes the full, ordered path */
     if ((c->close_pending && !c->close_fed) || c->flush_failed ||
+        c->terminals_owed > 0 ||
         (!c->teardown_sent && c->conn != NULL &&
          moq_transport_bridge_is_fatal(c->bridge))) {
         conn_service(c);

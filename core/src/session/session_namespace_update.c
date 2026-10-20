@@ -303,9 +303,11 @@ moq_result_t ns_update_admit(moq_session_t *s, moq_request_family_t family,
                                              a->d.request_id, &a->endpoint);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     uint64_t reject = 0;
-    rc = process_auth_tokens(s, tk.in, tk.count, a->tokens, &a->token_count,
-                             MOQ_DECODED_MAX_TOKENS, &reject, a->token_staged,
-                             &a->auth_txn);
+    rc = process_auth_tokens(s, tk.in, tk.count,
+        &(moq_auth_resolve_out_t){
+            .tokens = a->tokens, .token_count = &a->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &reject,
+            .staged = a->token_staged, .txn = &a->auth_txn });
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
         process_auth_tokens_free_staging(s, a->tokens, a->token_staged,
                                          a->token_count);

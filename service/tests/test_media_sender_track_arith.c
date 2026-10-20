@@ -46,6 +46,11 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int failures = 0;
 
@@ -305,6 +310,100 @@ static void test_a1_span_aggregate_wrap(void)
     finish(what, s);
 }
 
+/* Only this exact protected-byte fault identifies premature label traversal.
+ * Other signals/addresses and timeout are fixture failures, not that oracle. */
+enum { LABEL_READ_EARLY = 90, LABEL_OTHER_FAULT = 91, LABEL_TIMEOUT = 92 };
+static const void *label_guard_address;
+static void label_guard_fault(int sig, siginfo_t *info, void *ctx)
+{
+    (void)ctx;
+    if (sig == SIGALRM) _exit(LABEL_TIMEOUT);
+    _exit(info && info->si_addr == label_guard_address
+              ? LABEL_READ_EARLY : LABEL_OTHER_FAULT);
+}
+
+static void test_a1_label_aggregate_before_read(void)
+{
+    const char *what = "a1.spans.label_overflow_before_read";
+    long page = sysconf(_SC_PAGESIZE);
+    ROW(what, "fixture.page_size", page > 0 && (size_t)page <= SIZE_MAX / 2);
+    if (page <= 0 || (size_t)page > SIZE_MAX / 2) return;
+    size_t bytes = (size_t)page * 2;
+    uint8_t *mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ROW(what, "fixture.mapping", mem != MAP_FAILED);
+    if (mem == MAP_FAILED) return;
+    uint8_t *label = mem + (size_t)page - 1;
+    *label = 'A';
+    int protected = mprotect(mem + (size_t)page, (size_t)page, PROT_NONE);
+    ROW(what, "fixture.guard", protected == 0);
+    if (protected != 0) {
+        ROW(what, "fixture.unmap", munmap(mem, bytes) == 0);
+        return;
+    }
+    /* Keep the parent ledger and process intact if the label is read too early.
+     * A valid one-byte control must reach the nominated allocator refusal;
+     * invalid UTF-8 at byte zero cannot accidentally satisfy the INVAL row. */
+    fflush(NULL);
+    pid_t pid = fork();
+    ROW(what, "fixture.fork", pid >= 0);
+    if (pid == 0) {
+        int prior_failures = failures;
+        label_guard_address = mem + (size_t)page;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = label_guard_fault;
+        sa.sa_flags = SA_SIGINFO;
+        if (sigemptyset(&sa.sa_mask) != 0 ||
+            sigaction(SIGSEGV, &sa, NULL) != 0 ||
+            sigaction(SIGBUS, &sa, NULL) != 0 ||
+            sigaction(SIGALRM, &sa, NULL) != 0)
+            _exit(LABEL_OTHER_FAULT);
+        alarm(5);
+        moq_media_sender_t *s = ledger_sender(what);
+        if (!s) _exit(LABEL_OTHER_FAULT);
+        moq_media_track_cfg_t tc;
+        track_cfg(&tc);
+        tc.has_label = true;
+        tc.label = (moq_bytes_t){ label, 1 };
+        snap_t before = snap();
+        refuse_from_next();
+        moq_media_track_t *t = NULL;
+        moq_result_t rc = moq_media_sender_add_track(s, &tc, &t);
+        refuse_never();
+        ROW(what, "control.reaches_allocator", rc == MOQ_ERR_NOMEM &&
+            g_ledger.requests > before.requests && g_ledger.refused > 0);
+        ROW(what, "control.no_handle", t == NULL);
+        ROW(what, "control.registry_empty", moq_media_sender_test_track_count(s) == 0);
+        ROW(what, "control.no_leak", outstanding() == before.supplied - before.freed);
+        if (failures != prior_failures) {
+            finish(what, s);
+            _exit(LABEL_OTHER_FAULT);
+        }
+        /* name + codec already total 16. Adding SIZE_MAX-5 cannot fit.
+         * The first label byte is readable ASCII; byte two is the guard. */
+        tc.label.len = SIZE_MAX - NAME_LEN;
+        expect_refused(s, &tc, what);
+        finish(what, s);
+        alarm(0);
+        _exit(failures == prior_failures ? 0 : 1);
+    }
+    if (pid > 0) {
+        int status = 0;
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        ROW(what, "fixture.wait", waited == pid);
+        if (waited == pid) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == LABEL_READ_EARLY)
+                fprintf(stderr, "  %s: UTF-8 traversal reached label byte two before aggregate rejection\n", what);
+            ROW(what, "no_label_read_before_overflow_rejection",
+                !(WIFEXITED(status) && WEXITSTATUS(status) == LABEL_READ_EARLY));
+            ROW(what, "child_completed_checks", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+    ROW(what, "fixture.unmap", munmap(mem, bytes) == 0);
+}
+
 static void test_a2_ref_count_unrepresentable(void)
 {
     /* REF_COUNT_MAX + 1 is the FIRST count whose index product cannot fit
@@ -494,12 +593,16 @@ static void test_r1_boundary_span_reaches_exact_nominated_request(void)
 }
 
 /* -- valid controls: exact requests, registry and catalog effects ---------- */
-static void test_c1_defaults_exact_requests(void)
+static const uint8_t OWNED_LABEL[] = { 'L', 0, 'Z', 0xc3, 0xb1 };
+
+static void test_c1_defaults_exact_requests(bool labeled)
 {
-    const char *what = "c1.defaults";
+    const char *what = labeled ? "c1.label" : "c1.defaults";
     moq_media_sender_t *s = ledger_sender(what); if (!s) return;
     size_t track_size = 0; moq_media_sender_test_entry_sizes(NULL, &track_size);
     moq_media_track_cfg_t tc; track_cfg(&tc);
+    if (labeled) tc.has_label = true;
+    if (labeled) tc.label = (moq_bytes_t){ OWNED_LABEL, sizeof(OWNED_LABEL) };
     snap_t a = snap();
     moq_media_track_t *t = NULL;
     moq_result_t rc = moq_media_sender_add_track(s, &tc, &t);
@@ -508,7 +611,8 @@ static void test_c1_defaults_exact_requests(void)
     ROW(what, "three_requests", b.requests - a.requests == 3 && b.supplied - a.supplied == 3);
     if (b.requests - a.requests == 3) {
         ROW(what, "size.track", g_ledger.requested[a.requests] == track_size);
-        ROW(what, "size.strings", g_ledger.requested[a.requests + 1] == NAME_LEN + CODEC_LEN);
+        ROW(what, "size.strings", g_ledger.requested[a.requests + 1] ==
+            NAME_LEN + CODEC_LEN + (labeled ? sizeof(OWNED_LABEL) : 0));
         ROW(what, "size.registry", g_ledger.requested[a.requests + 2] == 4 * sizeof(void *));
     }
     ROW(what, "registered_one", moq_media_sender_test_track_count(s) == 1);
@@ -525,15 +629,17 @@ static void test_c1_defaults_exact_requests(void)
     finish(what, s);
 }
 
-static void test_c2_generated_timelines_exact_requests(void)
+static void test_c2_generated_timelines_exact_requests(bool labeled)
 {
     /* Both generated siblings: media track (struct, strings), SAP timeline
      * (struct, name 5+4, depends index), media timeline (struct, name 5+9,
      * depends index), then the registry vector: 9 requests, 3 registered. */
-    const char *what = "c2.timelines";
+    const char *what = labeled ? "c2.timelines_label" : "c2.timelines";
     moq_media_sender_t *s = ledger_sender(what); if (!s) return;
     size_t track_size = 0; moq_media_sender_test_entry_sizes(NULL, &track_size);
     moq_media_track_cfg_t tc; track_cfg(&tc);
+    if (labeled) tc.has_label = true;
+    if (labeled) tc.label = (moq_bytes_t){ OWNED_LABEL, sizeof(OWNED_LABEL) };
     tc.emit_sap_timeline = true;
     tc.emit_media_timeline = true;
     snap_t a = snap();
@@ -545,7 +651,8 @@ static void test_c2_generated_timelines_exact_requests(void)
     if (b.requests - a.requests == 9) {
         const size_t *r = &g_ledger.requested[a.requests];
         ROW(what, "size.track", r[0] == track_size);
-        ROW(what, "size.strings", r[1] == NAME_LEN + CODEC_LEN);
+        ROW(what, "size.strings", r[1] == NAME_LEN + CODEC_LEN +
+            (labeled ? sizeof(OWNED_LABEL) : 0));
         ROW(what, "size.sap_track", r[2] == track_size);
         ROW(what, "size.sap_name", r[3] == NAME_LEN + SAP_SUFFIX);
         ROW(what, "size.sap_depends", r[4] == sizeof(moq_bytes_t));
@@ -558,16 +665,18 @@ static void test_c2_generated_timelines_exact_requests(void)
     finish(what, s);
 }
 
-static void test_c3_nomem_once_unwinds_exactly(void)
+static void test_c3_nomem_once_unwinds_exactly(bool labeled)
 {
     /* Refuse exactly one of the nine requests of the timeline configuration:
      * NOMEM, no handle, registry unchanged, catalog not dirtied, every
      * supplied block freed with its exact size. */
     for (int at = 0; at < 9; at++) {
         char what[48];
-        snprintf(what, sizeof(what), "c3.nomem_once_at_offset_%d", at);
+        snprintf(what, sizeof(what), "c3.%snomem_once_at_offset_%d", labeled ? "label_" : "", at);
         moq_media_sender_t *s = ledger_sender(what); if (!s) continue;
         moq_media_track_cfg_t tc; track_cfg(&tc);
+        if (labeled) tc.has_label = true;
+        if (labeled) tc.label = (moq_bytes_t){ OWNED_LABEL, sizeof(OWNED_LABEL) };
         tc.emit_sap_timeline = true;
         tc.emit_media_timeline = true;
         snap_t a = snap();
@@ -583,22 +692,72 @@ static void test_c3_nomem_once_unwinds_exactly(void)
         ROW(what, "catalog_not_dirtied", !moq_media_sender_test_catalog_dirty(s));
         ROW(what, "unwound_exactly", (b.supplied - b.freed) == (a.supplied - a.freed));
         ROW(what, "exact_frees", b.bad_free == a.bad_free);
+        if (labeled) {
+            ROW(what, "strings_request_reached", b.requests - a.requests >= 2);
+            if (b.requests - a.requests >= 2)
+                ROW(what, "strings_request_includes_label",
+                    g_ledger.requested[a.requests + 1] == NAME_LEN + CODEC_LEN + sizeof(OWNED_LABEL));
+        }
         finish(what, s);
     }
+}
+
+static void test_label_collision_unwinds_and_retry(void)
+{
+    const char *what = "label.collision_retry";
+    moq_media_sender_t *s = ledger_sender(what); if (!s) return;
+    moq_media_track_cfg_t tc; track_cfg(&tc);
+    tc.has_label = true;
+    tc.label = (moq_bytes_t){ OWNED_LABEL, sizeof(OWNED_LABEL) };
+    moq_media_track_t *original = NULL;
+    moq_result_t rc = moq_media_sender_add_track(s, &tc, &original);
+    ROW(what, "initial_ok", rc == MOQ_OK && original != NULL);
+    if (rc != MOQ_OK) { finish(what, s); return; }
+    size_t track_size = 0;
+    moq_media_sender_test_entry_sizes(NULL, &track_size);
+    snap_t a = snap();
+    moq_media_track_t *duplicate = original;
+    rc = moq_media_sender_add_track(s, &tc, &duplicate);
+    snap_t b = snap();
+    ROW(what, "collision_inval_null", rc == MOQ_ERR_INVAL && duplicate == NULL);
+    ROW(what, "copied_before_collision", b.requests - a.requests == 2 &&
+        b.supplied - a.supplied == 2);
+    if (b.requests - a.requests == 2) {
+        ROW(what, "track_request", g_ledger.requested[a.requests] == track_size);
+        ROW(what, "strings_request", g_ledger.requested[a.requests + 1] ==
+            NAME_LEN + CODEC_LEN + sizeof(OWNED_LABEL));
+    }
+    ROW(what, "registry_unchanged", moq_media_sender_test_track_count(s) == 1);
+    ROW(what, "catalog_not_dirtied", !moq_media_sender_test_catalog_dirty(s));
+    ROW(what, "unwound_exactly", b.supplied - b.freed == a.supplied - a.freed);
+    ROW(what, "exact_frees", b.bad_free == a.bad_free);
+    static const uint8_t retry_name[] = "retry";
+    tc.name = (moq_bytes_t){ retry_name, sizeof(retry_name) - 1 };
+    moq_media_track_t *retry = NULL;
+    rc = moq_media_sender_add_track(s, &tc, &retry);
+    ROW(what, "retry_ok", rc == MOQ_OK && retry != NULL && retry != original);
+    ROW(what, "registry_two", moq_media_sender_test_track_count(s) == 2);
+    ROW(what, "retry_not_dirty", !moq_media_sender_test_catalog_dirty(s));
+    finish(what, s);
 }
 
 int main(void)
 {
     test_a1_span_aggregate_wrap();
+    test_a1_label_aggregate_before_read();
     test_a2_ref_count_unrepresentable();
     test_a3a_sap_name_addition_wrap();
     test_a3b_media_timeline_name_addition_wrap();
     test_a4_resolved_ref_bytes_overflow_aggregate();
     test_r1_boundary_span_reaches_exact_nominated_request();
     test_r3_timeline_names_disabled_are_representable();
-    test_c1_defaults_exact_requests();
-    test_c2_generated_timelines_exact_requests();
-    test_c3_nomem_once_unwinds_exactly();
+    test_c1_defaults_exact_requests(false);
+    test_c1_defaults_exact_requests(true);
+    test_c2_generated_timelines_exact_requests(false);
+    test_c2_generated_timelines_exact_requests(true);
+    test_c3_nomem_once_unwinds_exactly(false);
+    test_c3_nomem_once_unwinds_exactly(true);
+    test_label_collision_unwinds_and_retry();
     test_c4_valid_resolved_ref_exact_requests();
     fprintf(stderr, "track_arith: sizeof(size_t)=%zu sizeof(moq_bytes_t)=%zu REF_COUNT_MAX+1=%zu;"
             " compile-time boundary assertions only -- no ILP32 execution\n",

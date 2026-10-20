@@ -675,7 +675,7 @@ row_retained_pressure(moq_version_t version)
     int before = failures;
     pair_t p;
     MOQ_TEST_CHECK(pair_open(&p, version, 4, true, 1));
-    moq_fetch_t fh[4], sfh[4];
+    moq_fetch_t fh[4] = {{0}}, sfh[4] = {{0}};
     /* one request at a time: the tiny event queue holds one event */
     MOQ_TEST_CHECK(issue_fetch(p.c, p.now, &fh[0]) == MOQ_OK);
     pump(&p, 6);

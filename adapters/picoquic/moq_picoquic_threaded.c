@@ -161,6 +161,10 @@ struct moq_pq_threaded {
                                           * for the callback to clear it */
     bool                local_close_started;    /* network thread only */
     uint64_t            local_close_deadline_us; /* network thread only */
+    /* The application error code the local close carries: 0 for a stop or a
+     * pump exit, the recorded fatal code for a client service fatal. */
+    uint64_t            local_close_code;       /* network thread only */
+    bool                fatal_close;            /* network thread only */
     bool                tx_drained;     /* network thread: local stream flush
                                          * done (no queued/ready stream data or
                                          * unsent FIN). Read by drain_state. */
@@ -897,6 +901,21 @@ static bool client_cnx_needs_local_close(picoquic_quic_t *quic,
     return client_cnx_is_live(quic, cnx) && cnx_needs_local_close(cnx);
 }
 
+/* The client's bridge failed a service pass. moq_pq_service reports the
+ * fatal and leaves the cnx open, so the connection is closed here, carrying
+ * the recorded fatal code, through the bounded local close: the packet loop
+ * keeps running until the CONNECTION_CLOSE is out or the flush bound passes,
+ * and only then terminates. Network thread. */
+static void client_service_fatal(moq_pq_threaded_t *t)
+{
+    pthread_mutex_lock(&t->mutex);
+    t->fatal = true;
+    t->fatal_code = moq_pq_conn_fatal_code(t->conn);
+    pthread_mutex_unlock(&t->mutex);
+    if (!t->local_close_started) t->local_close_code = t->fatal_code;
+    t->fatal_close = true;
+}
+
 static int local_close_step(moq_pq_threaded_t *t, picoquic_quic_t *quic)
 {
     uint64_t now = picoquic_get_quic_time(quic);
@@ -907,12 +926,12 @@ static int local_close_step(moq_pq_threaded_t *t, picoquic_quic_t *quic)
 
         if (t->perspective == MOQ_PERSPECTIVE_CLIENT) {
             if (client_cnx_needs_local_close(quic, t->active_cnx))
-                (void)picoquic_close(t->active_cnx, 0);
+                (void)picoquic_close(t->active_cnx, t->local_close_code);
         } else {
             for (size_t i = 0; i < t->conn_count; i++) {
                 struct moq_pq_threaded_conn *c = t->conns[i];
                 if (c && cnx_needs_local_close(c->cnx))
-                    (void)picoquic_close(c->cnx, 0);
+                    (void)picoquic_close(c->cnx, t->local_close_code);
             }
         }
     }
@@ -991,7 +1010,7 @@ static int loop_callback(picoquic_quic_t *quic,
     pthread_mutex_lock(&t->mutex);
     bool close_requested = t->stopped || t->pump_exit;
     pthread_mutex_unlock(&t->mutex);
-    if (close_requested)
+    if (close_requested || t->fatal_close)
         return local_close_step(t, quic);
 
     /* Client mode (deferred-offer): before the session exists, the only
@@ -1148,13 +1167,10 @@ static int loop_callback(picoquic_quic_t *quic,
 
     /* service → on_lane_pump → service */
     if (moq_pq_service(t->conn, now) < 0) {
-        pthread_mutex_lock(&t->mutex);
-        t->fatal = true;
-        t->fatal_code = moq_pq_conn_fatal_code(t->conn);
-        pthread_mutex_unlock(&t->mutex);
+        client_service_fatal(t);
         client_final_pump(t, quic);
         mark_activity(t);
-        return loop_terminate(t);
+        return local_close_step(t, quic);
     }
 
     if (t->on_lane_pump) {
@@ -1171,15 +1187,12 @@ static int loop_callback(picoquic_quic_t *quic,
     }
 
     if (moq_pq_service(t->conn, now) < 0) {
-        pthread_mutex_lock(&t->mutex);
-        t->fatal = true;
-        t->fatal_code = moq_pq_conn_fatal_code(t->conn);
-        pthread_mutex_unlock(&t->mutex);
+        client_service_fatal(t);
         /* The pump earlier in THIS cycle ran before the fatal was latched:
          * it could not have observed it. One final observing pump. */
         client_final_pump(t, quic);
         mark_activity(t);
-        return loop_terminate(t);
+        return local_close_step(t, quic);
     }
 
     /* Set app wake time for session deadlines. */

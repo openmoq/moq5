@@ -471,6 +471,31 @@ static bool ts_is(moq_media_receiver_t *r, moq_media_track_t *t,
     return moq_media_receiver_track_state(r, t, &got) == MOQ_OK && got == want;
 }
 
+static bool wait_track_state(moq_media_receiver_t *r, moq_media_track_t *t,
+                              moq_media_track_state_t want)
+{
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+        MOQ_TEST_CHECK(false);
+        return false;
+    }
+    deadline.tv_sec += 10;
+    for (;;) {
+        if (ts_is(r, t, want)) return true;
+        if (moq_media_receiver_is_fatal(r) || moq_media_receiver_is_closed(r))
+            return false;
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            MOQ_TEST_CHECK(false);
+            return false;
+        }
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            return false;
+        (void)moq_media_receiver_wait(r, 50000);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *cert = NULL, *key = NULL;
@@ -496,12 +521,13 @@ int main(int argc, char **argv)
         moq_media_track_t *v = NULL, *a = NULL;
         MOQ_TEST_CHECK(discover(r, &v, &a));
 
-        /* No subscription yet: poll_object yields DONE, not objects, and the
-         * track reports DISCOVERED. */
+        /* No subscription yet: poll_object yields DONE, not objects, and both
+         * tracks report DISCOVERED. */
         moq_media_object_t obj;
         MOQ_TEST_CHECK_EQ_INT((int)moq_media_receiver_poll_object(r, &obj, sizeof(obj)),
                               (int)MOQ_DONE);
         MOQ_TEST_CHECK(ts_is(r, v, MOQ_MEDIA_TRACK_STATE_DISCOVERED));
+        MOQ_TEST_CHECK(ts_is(r, a, MOQ_MEDIA_TRACK_STATE_DISCOVERED));
 
         /* cfg validation: a struct_size too small and an unknown start mode are
          * both MOQ_ERR_INVAL (and must not record desired state). */
@@ -528,8 +554,12 @@ int main(int argc, char **argv)
         ok.priority = 100;
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_subscribe_track(r, a, &ok), (int)MOQ_OK);
+        /* Establish the subscription before disabling it: otherwise the two
+         * intents may coalesce before the hook issues anything on the wire. */
+        MOQ_TEST_CHECK(wait_track_state(r, a, MOQ_MEDIA_TRACK_STATE_ACTIVE));
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_unsubscribe_track(r, a), (int)MOQ_OK);
+        MOQ_TEST_CHECK(ts_is(r, a, MOQ_MEDIA_TRACK_STATE_PAUSED_APP));
 
         /* Subscribe only "v"; objects for it begin, none for "a". */
         MOQ_TEST_CHECK_EQ_INT(
@@ -538,9 +568,9 @@ int main(int argc, char **argv)
         poll_counts(r, v, a, 6, 120, &nv, &na);
         MOQ_TEST_CHECK(nv > 0);
         MOQ_TEST_CHECK_EQ_INT(na, 0);
-        /* Delivering now: ACTIVE; the unsubscribed audio is still DISCOVERED. */
+        /* Delivering now: ACTIVE; the established audio subscription is paused. */
         MOQ_TEST_CHECK(ts_is(r, v, MOQ_MEDIA_TRACK_STATE_ACTIVE));
-        MOQ_TEST_CHECK(ts_is(r, a, MOQ_MEDIA_TRACK_STATE_DISCOVERED));
+        MOQ_TEST_CHECK(ts_is(r, a, MOQ_MEDIA_TRACK_STATE_PAUSED_APP));
 
         destroy_fixture(srv, r);
     }

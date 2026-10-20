@@ -372,6 +372,111 @@ static moq_media_sender_t *make_d22_sender(void)
     return moq_media_sender_test_new_cfg(&cfg);
 }
 
+static void check_catalog_metadata(const moq_msf_track_t *t, int group,
+                                    int alt, moq_bytes_t label)
+{
+    MOQ_TEST_CHECK(t != NULL);
+    if (!t) return;
+    MOQ_TEST_CHECK(t->has_render_group && t->render_group == group);
+    MOQ_TEST_CHECK(t->has_alt_group && t->alt_group == alt);
+    MOQ_TEST_CHECK(t->has_label && t->label.len == label.len);
+    if (t->has_label && t->label.len == label.len && label.len)
+        MOQ_TEST_CHECK(memcmp(t->label.data, label.data, label.len) == 0);
+    const moq_msf_mpeg2ts_t *r = moq_msf_track_mpeg2ts(t);
+    MOQ_TEST_CHECK(r && r->has_packet_size && r->packet_size == 188);
+    MOQ_TEST_CHECK(moq_msf_track_mpeg2ts_check(t, NULL) == MOQ_OK);
+}
+
+static void test_catalog_metadata(void)
+{
+    int before = failures;
+    moq_media_sender_t *s = make_sender(MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK, 0);
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) return;
+    static const uint8_t expected[] = { 'B', 0, 0xf0, 0x90, 0x80, 0x80 };
+    uint8_t borrowed[sizeof(expected)];
+    memcpy(borrowed, expected, sizeof(expected));
+    moq_msf_mpeg2ts_t rec;
+    ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
+    moq_msf_track_ext_t ext = {
+        .kind = MOQ_MSF_EXT_MPEG2TS, .u = { .mpeg2ts = &rec }
+    };
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = (moq_bytes_t){ (const uint8_t *)"base", 4 };
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_MPEG2TS;
+    tc.bitrate = 3000000;
+    tc.extensions = &ext;
+    tc.extension_count = 1;
+    tc.mpeg2ts_app_objects = true;
+    tc.has_render_group = true;
+    tc.render_group = -2;
+    tc.has_alt_group = true;
+    tc.alt_group = 9;
+    tc.has_label = true;
+    tc.label = (moq_bytes_t){ borrowed, sizeof(borrowed) };
+    moq_media_track_t *track = NULL;
+    moq_result_t rc = moq_media_sender_add_track(s, &tc, &track);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) { moq_media_sender_test_free(s); return; }
+    memset(borrowed, 'X', sizeof(borrowed));
+    moq_media_sender_test_set_ready(s);
+    moq_media_sender_test_mark_registered(s);
+    moq_media_sender_test_mark_published(s);
+    tc.name = (moq_bytes_t){ (const uint8_t *)"late", 4 };
+    tc.render_group = 0;
+    tc.alt_group = 10;
+    tc.label = (moq_bytes_t){ NULL, 0 };
+    rc = moq_media_sender_add_track(s, &tc, &track);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    memset(&rec, 0xa5, sizeof(rec));
+    memset(&ext, 0xa5, sizeof(ext));
+    moq_media_sender_test_mark_registered(s);
+    moq_rcbuf_t *objs[3] = { NULL, NULL, NULL };
+    size_t n = moq_media_sender_test_stage(s, objs, 3);
+    MOQ_TEST_CHECK(n == 2 && objs[0] && objs[1]);
+    const moq_alloc_t *al = moq_alloc_default();
+    moq_msf_catalog_t base = {0}, delta = {0}, merged = {0};
+    if (n == 2 && objs[0] && objs[1]) {
+        moq_result_t br = moq_msf_catalog_parse(al,
+            (moq_bytes_t){ moq_rcbuf_data(objs[0]), moq_rcbuf_len(objs[0]) }, &base);
+        moq_result_t dr = moq_msf_catalog_parse(al,
+            (moq_bytes_t){ moq_rcbuf_data(objs[1]), moq_rcbuf_len(objs[1]) }, &delta);
+        MOQ_TEST_CHECK(br == MOQ_OK && dr == MOQ_OK);
+        const moq_bytes_t label = { expected, sizeof(expected) };
+        const moq_bytes_t empty = { NULL, 0 };
+        if (br == MOQ_OK) {
+            MOQ_TEST_CHECK(base.track_count == 1);
+            check_catalog_metadata(find_track(&base, "base"), -2, 9, label);
+        }
+        if (dr == MOQ_OK) {
+            MOQ_TEST_CHECK(delta.delta_update_count == 1);
+            if (delta.delta_update_count == 1) {
+                const moq_msf_delta_op_t *op = &delta.delta_update[0];
+                MOQ_TEST_CHECK(op->op == MOQ_MSF_DELTA_OP_ADD && op->track_count == 1);
+                if (op->track_count == 1)
+                    check_catalog_metadata(&op->tracks[0], 0, 10, empty);
+            }
+        }
+        if (br == MOQ_OK && dr == MOQ_OK) {
+            rc = moq_msf_catalog_apply_delta(al, &base, &delta, &merged);
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            if (rc == MOQ_OK) {
+                MOQ_TEST_CHECK(merged.track_count == 2);
+                check_catalog_metadata(find_track(&merged, "base"), -2, 9, label);
+                check_catalog_metadata(find_track(&merged, "late"), 0, 10, empty);
+            }
+        }
+    }
+    moq_msf_catalog_cleanup(al, &merged);
+    moq_msf_catalog_cleanup(al, &delta);
+    moq_msf_catalog_cleanup(al, &base);
+    for (size_t i = 0; i < 3; i++) moq_rcbuf_decref(objs[i]);
+    moq_media_sender_test_free(s);
+    if (failures == before) printf("PASS: ts_catalog_metadata_base_add\n");
+}
+
 static void test_catalog_late_add(bool raw, bool with_init, bool d22)
 {
     int before = failures;
@@ -1894,6 +1999,7 @@ int main(void)
 #ifdef MOQ_TEST_HAVE_MPEG2TS
     test_add_track_rules();
     test_catalog_entry();
+    test_catalog_metadata();
     test_catalog_late_add(false, true, false);
     test_catalog_late_add(false, false, false);
     test_catalog_late_add(true, true, false);

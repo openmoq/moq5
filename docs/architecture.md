@@ -113,8 +113,10 @@ ALPN (`moqt-16`, `moqt-18`, `moqt-22`) over raw QUIC, the WebTransport
 protocol token over WebTransport. The sans-I/O core never sees either; the
 adapter or host maps the negotiated version to `cfg.version` before creating
 the session. `moq_versions_supported()` lists the wire-ready versions newest
-first; the service endpoint and the relay CLI put draft-18 first in their
-default offers ([conformance.md](conformance.md#versions-and-the-default-offer)).
+first. The service endpoint's AUTO offer and the relay CLI's default offer
+prefer the newest supported draft: `[22, 18, 16]`. Endpoint AUTO also filters
+the offer to drafts its selected backend can carry
+([conformance.md](conformance.md#versions-and-the-default-offer)).
 
 The session core never tests a draft number. Wherever drafts differ in
 behaviour, the profile declares a capability and the core asks it;

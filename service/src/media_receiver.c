@@ -286,9 +286,10 @@ struct moq_media_track {
     /* Data path (network-thread state). */
     moq_sub_track_t *sub_track;        /* non-NULL while subscribed */
     bool             ended;            /* TRACK_ENDED emitted */
-    /* ACK retention and LIVE delivery failure are permanent for this generation.
+    /* ACK retention, UPDATE admission and LIVE delivery failures are permanent.
      * App-visible state and its allocation-free observation are mu-protected. */
     moq_result_t     local_result;
+    moq_media_track_event_kind_t local_failure_kind;
     bool             local_failure_pending;
     bool             delivery_failed; /* preserves already-admitted objects */
     /* Coalesced parse-drop diagnostic state (all under r->mu). A malformed
@@ -342,6 +343,7 @@ struct moq_media_track {
     uint64_t         app_gen;
     uint64_t         reconciled_app_gen;
     bool             upd_notify_app;
+    bool             update_inflight;  /* includes silent flow-only updates */
     uint64_t         upd_sent_app_gen;
 
     /* Subscription lifecycle, mu-published so the public track_state accessor
@@ -2809,16 +2811,19 @@ static void receiver_mark_track_ended(moq_media_receiver_t *r,
 
 static void receiver_mark_track_local_failure(moq_media_receiver_t *r,
                                                moq_media_track_t *t,
-                                               moq_result_t result)
+                                               moq_result_t result,
+                                               moq_media_track_event_kind_t kind)
 {
     pthread_mutex_lock(&r->mu);
     bool first = t->local_result == MOQ_OK;
     if (first) {
         t->local_result = result;
+        t->local_failure_kind = kind;
         t->local_failure_pending = true;
         r->local_failure_pending_count++;
         t->desired_subscribed = false;
         t->upd_notify_app = false;
+        t->update_inflight = false;
         t->upd_sent_app_gen = 0;
         obj_compact_locked(r, keep_not_track, t);
     }
@@ -2853,10 +2858,12 @@ static void receiver_inspect_delivery_failures(moq_media_receiver_t *r)
         if (failure.owner_kind == MOQ_SUB_LOCAL_FAILURE_TRACK &&
             track->local_result == MOQ_OK) {
             track->local_result = failure.local_result;
+            track->local_failure_kind = MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE;
             track->delivery_failed = true;
             track->local_failure_pending = true;
             r->local_failure_pending_count++;
             track->upd_notify_app = false;
+            track->update_inflight = false;
             track->upd_sent_app_gen = 0;
             /* Keep app intent and admitted data. Facade cancellation stops
              * new intake; an explicit app unsubscribe still purges as usual. */
@@ -2923,7 +2930,7 @@ static void receiver_inspect_ack_results(moq_media_receiver_t *r, uint64_t now_u
         moq_result_t rc = moq_sub_get_track_result(r->sub, t->sub_track,
                                                    &result, sizeof(result));
         if (rc == MOQ_ERR_NOMEM || rc == MOQ_ERR_BUFFER)
-            receiver_mark_track_local_failure(r, t, rc);
+            receiver_mark_track_local_failure(r, t, rc, MOQ_MEDIA_TRACK_LOCAL_FAILURE);
     }
 }
 
@@ -2988,6 +2995,7 @@ static void receiver_on_update_ok(void *ctx, moq_sub_track_t *track,
     pthread_mutex_lock(&r->mu);
     bool notify = t->upd_notify_app;
     t->upd_notify_app = false;
+    t->update_inflight = false;
     t->upd_sent_app_gen = 0;
     if (!notify) { pthread_mutex_unlock(&r->mu); return; }
     if (r->ev_tail - r->ev_head >= r->ev_cap) {
@@ -4338,6 +4346,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
          * SUBSCRIBE default below/at establish). */
         pthread_mutex_lock(&r->mu);
         t->upd_notify_app = false;
+        t->update_inflight = false;
         t->upd_sent_app_gen = 0;
         pthread_mutex_unlock(&r->mu);
 
@@ -4506,15 +4515,18 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
             pthread_mutex_unlock(&r->mu);
             continue;
         }
+        /* The initial response must establish the track before UPDATE is
+         * admissible. Preserve this pass's intent until that response lands. */
+        if (moq_sub_track_get_state(t->sub_track) == MOQ_SUB_TRACK_PENDING ||
+            t->update_inflight)
+            continue;
         moq_sub_update_cfg_t ucfg;
         moq_sub_update_cfg_init(&ucfg);
         ucfg.has_forward = true;
         ucfg.forward = t->forward_desired;
-        /* WRONG_STATE = an update is still outstanding; retry next cycle
-         * -- and change NOTHING: neither the pending update's attribution
-         * nor reconciled_app_gen. */
-        if (moq_sub_update_subscription(r->sub, t->sub_track, &ucfg,
-                                        now_us) == MOQ_OK) {
+        moq_result_t rc = moq_sub_update_subscription(r->sub, t->sub_track,
+                                                      &ucfg, now_us);
+        if (rc == MOQ_OK) {
             t->forward_sent = t->forward_desired;
             /* Attribution is decided ONCE, from the SNAPSHOT taken with
              * the target computation (the race rule above). */
@@ -4523,7 +4535,12 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
                                  &t->upd_notify_app,
                                  &t->reconciled_app_gen);
             t->upd_sent_app_gen = gen_snap;
+            t->update_inflight = true;
             pthread_mutex_unlock(&r->mu);
+        } else if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK &&
+                   rc != MOQ_ERR_REQUEST_BLOCKED) {
+            receiver_mark_track_local_failure(r, t, rc,
+                                               MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
         }
     }
 }
@@ -4983,7 +5000,14 @@ void moq_media_receiver_cfg_init_flow_control(moq_media_receiver_cfg_t *cfg)
 
 /* min(cfg_size, sizeof) cleared and stamped; the preset is applied only
  * when that prefix covers overflow.policy. Returns the stamped size, 0 when
- * nothing was written. */
+ * nothing was written. The caller's object may be an older, smaller record,
+ * so every store goes through its bytes at the field's offset, never
+ * through an lvalue of the current record type. */
+_Static_assert(sizeof(((moq_media_receiver_cfg_t *)0)->struct_size) == sizeof(uint32_t),
+               "struct_size is stored as a uint32_t");
+_Static_assert(sizeof(((moq_media_overflow_cfg_t *)0)->policy) ==
+               sizeof(moq_media_overflow_policy_t),
+               "overflow.policy is stored as the policy type");
 static size_t receiver_cfg_init_prefix(moq_media_receiver_cfg_t *cfg,
                                        size_t cfg_size,
                                        moq_media_overflow_policy_t policy)
@@ -4991,15 +5015,18 @@ static size_t receiver_cfg_init_prefix(moq_media_receiver_cfg_t *cfg,
     if (!cfg) return 0;
     size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
     if (n < sizeof(cfg->struct_size)) return 0;
-    memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
-    if (n >= offsetof(moq_media_receiver_cfg_t, overflow) +
-             offsetof(moq_media_overflow_cfg_t, policy) +
-             sizeof(cfg->overflow.policy))
-        cfg->overflow.policy = policy;
-    if (n >= offsetof(moq_media_receiver_cfg_t, companion_profile) +
-             sizeof(cfg->companion_profile))
-        cfg->companion_profile = MOQ_MEDIA_COMPANION_AUTO;
+    unsigned char *bytes = (unsigned char *)cfg;
+    memset(bytes, 0, n);
+    const uint32_t stamp = (uint32_t)n;
+    memcpy(bytes + offsetof(moq_media_receiver_cfg_t, struct_size), &stamp, sizeof(stamp));
+    const size_t policy_at = offsetof(moq_media_receiver_cfg_t, overflow) +
+                             offsetof(moq_media_overflow_cfg_t, policy);
+    if (n >= policy_at + sizeof(policy))
+        memcpy(bytes + policy_at, &policy, sizeof(policy));
+    const moq_media_companion_profile_t companion = MOQ_MEDIA_COMPANION_AUTO;
+    const size_t companion_at = offsetof(moq_media_receiver_cfg_t, companion_profile);
+    if (n >= companion_at + sizeof(companion))
+        memcpy(bytes + companion_at, &companion, sizeof(companion));
     return n;
 }
 
@@ -5023,6 +5050,17 @@ void moq_media_receiver_cfg_init_flow_control_sized(
                                    MOQ_MEDIA_OVERFLOW_FLOW_CONTROL);
 }
 
+static moq_media_companion_profile_t receiver_cfg_companion(const void *cfg)
+{
+    uint32_t size;
+    memcpy(&size, cfg, sizeof(size));
+    moq_media_companion_profile_t profile = MOQ_MEDIA_COMPANION_AUTO;
+    const size_t offset = offsetof(moq_media_receiver_cfg_t, companion_profile);
+    if (size >= offset + sizeof(profile))
+        memcpy(&profile, (const uint8_t *)cfg + offset, sizeof(profile));
+    return profile;
+}
+
 /* Read a caller's cfg into a full current struct: the v0 prefix, then each
  * appended field only when struct_size covers all of it (half a field is
  * not a field). Fields left out keep their zero default, except
@@ -5031,21 +5069,21 @@ void moq_media_receiver_cfg_init_flow_control_sized(
 static void receiver_cfg_read(const moq_media_receiver_cfg_t *in,
                               moq_media_receiver_cfg_t *out)
 {
+    uint32_t size;
+    memcpy(&size, in, sizeof(size));
     memset(out, 0, sizeof(*out));
     memcpy(out, in, MOQ_MEDIA_RECEIVER_CFG_V0_SIZE);
-#define RCFG_HAS(f) \
-    (in->struct_size >= offsetof(moq_media_receiver_cfg_t, f) + sizeof(in->f))
-    if (RCFG_HAS(mpeg2ts_reorder_slots))
-        out->mpeg2ts_reorder_slots = in->mpeg2ts_reorder_slots;
-    if (RCFG_HAS(mpeg2ts_reorder_window_us))
-        out->mpeg2ts_reorder_window_us = in->mpeg2ts_reorder_window_us;
-    if (RCFG_HAS(mpeg2ts_strip_prefix))
-        out->mpeg2ts_strip_prefix = in->mpeg2ts_strip_prefix;
-    if (RCFG_HAS(mpeg2ts_join_psi))
-        out->mpeg2ts_join_psi = in->mpeg2ts_join_psi;
-    out->companion_profile = RCFG_HAS(companion_profile)
-        ? in->companion_profile : MOQ_MEDIA_COMPANION_AUTO;
-#undef RCFG_HAS
+#define RCFG_COPY(f) do { \
+    const size_t offset = offsetof(moq_media_receiver_cfg_t, f); \
+    if (size >= offset + sizeof(out->f)) \
+        memcpy(&out->f, (const uint8_t *)in + offset, sizeof(out->f)); \
+} while (0)
+    RCFG_COPY(mpeg2ts_reorder_slots);
+    RCFG_COPY(mpeg2ts_reorder_window_us);
+    RCFG_COPY(mpeg2ts_strip_prefix);
+    RCFG_COPY(mpeg2ts_join_psi);
+#undef RCFG_COPY
+    out->companion_profile = receiver_cfg_companion(in);
     out->struct_size = (uint32_t)sizeof(*out);
 }
 
@@ -5127,15 +5165,6 @@ void moq_media_receiver_test_set_parts_walk_hook(bool (*fn)(size_t, void *), voi
 #define CFG_PARTS_WALK_HOOK(count) ((void)0)
 #endif
 
-
-static moq_media_companion_profile_t receiver_cfg_companion(
-    const moq_media_receiver_cfg_t *cfg)
-{
-    if (cfg->struct_size >= offsetof(moq_media_receiver_cfg_t, companion_profile) +
-                            sizeof(cfg->companion_profile))
-        return cfg->companion_profile;
-    return MOQ_MEDIA_COMPANION_AUTO;
-}
 
 static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 {
@@ -5652,14 +5681,14 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
             t->local_failure_pending = false;
             r->local_failure_pending_count--;
             moq_result_t result = t->local_result;
+            moq_media_track_event_kind_t kind = t->local_failure_kind;
             bool delivery = t->delivery_failed;
             pthread_mutex_unlock(&r->mu);
 
             moq_media_track_event_t full;
             memset(&full, 0, sizeof(full));
             full.struct_size = (uint32_t)n;
-            full.kind = delivery ? MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE
-                                 : MOQ_MEDIA_TRACK_LOCAL_FAILURE;
+            full.kind = kind;
             full.track = t;
             full.desc = &t->desc;
             full.local_result = (int32_t)result;

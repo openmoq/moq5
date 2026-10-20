@@ -379,6 +379,7 @@ class ExtendedTrackEventKind(IntEnum):
     LOCAL_FAILURE = _constants["MEDIA_TRACK_LOCAL_FAILURE"]
     FILL_TERMINAL = _constants["MEDIA_TRACK_FILL_TERMINAL"]
     DELIVERY_LOCAL_FAILURE = _constants["MEDIA_TRACK_DELIVERY_LOCAL_FAILURE"]
+    UPDATE_LOCAL_FAILURE = _constants["MEDIA_TRACK_UPDATE_LOCAL_FAILURE"]
 
 
 class ExtendedTrackState(IntEnum):
@@ -839,7 +840,8 @@ class TrackEvent:
     """One dequeued track event. `track`/`description` are None for
     CATALOG_READY; `largest`/`expires_ms` are UPDATE_OK observations present
     only when the native stamped prefix covers them; `parse_drop` is present
-    for PARSE_DROP only. DELIVERY_LOCAL_FAILURE carries local_result and
+    for PARSE_DROP only. UPDATE_LOCAL_FAILURE carries the local UPDATE
+    admission result, not a peer error. DELIVERY_LOCAL_FAILURE carries local_result and
     delivery_origin; only FILL has a delivery_initiating_request_id (zero is
     valid). Absent complete fields remain None. The keyword-only views
     preserve legacy equality/hash and positional construction/patterns."""

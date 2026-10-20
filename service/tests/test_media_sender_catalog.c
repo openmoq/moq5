@@ -30,8 +30,10 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <limits.h>
 
 static int failures = 0;
 
@@ -148,6 +150,116 @@ static bool built_track_alt_group(moq_media_sender_t *s, const char *name,
     }
     moq_rcbuf_decref(j);
     return found;
+}
+
+typedef struct built_meta {
+    bool has_render_group; int render_group;
+    bool has_label; char label[64];
+    bool has_lang;  char lang[16];
+} built_meta_t;
+
+static bool exact_track_meta(const moq_msf_track_t *tracks, size_t count,
+                             const char *name, moq_bytes_t label, int group)
+{
+    for (size_t i = 0; i < count; i++) {
+        const moq_msf_track_t *t = &tracks[i];
+        if (t->name.len == strlen(name) &&
+            memcmp(t->name.data, name, t->name.len) == 0)
+            return t->has_render_group && t->render_group == group &&
+                t->has_label && t->label.len == label.len &&
+                (label.len == 0 ||
+                 memcmp(t->label.data, label.data, label.len) == 0);
+    }
+    return false;
+}
+
+static bool built_exact_meta(moq_media_sender_t *s, const char *name,
+                             moq_bytes_t label, int group)
+{
+    moq_rcbuf_t *json = NULL;
+    moq_result_t rc = moq_media_sender_test_build_catalog(s, &json);
+    bool ok = false;
+    if (rc == MOQ_OK && json) {
+        moq_msf_catalog_t c;
+        const moq_alloc_t *al = moq_alloc_default();
+        if (moq_msf_catalog_parse(al, (moq_bytes_t){ moq_rcbuf_data(json),
+                moq_rcbuf_len(json) }, &c) == MOQ_OK) {
+            ok = exact_track_meta(c.tracks, c.track_count, name, label, group);
+            moq_msf_catalog_cleanup(al, &c);
+        }
+    }
+    moq_rcbuf_decref(json);
+    return ok;
+}
+
+static void copy_cstr(char *dst, size_t cap, moq_bytes_t src)
+{
+    size_t n = src.len < cap - 1 ? src.len : cap - 1;
+    if (n) memcpy(dst, src.data, n);
+    dst[n] = '\0';
+}
+
+static bool span_has(const uint8_t *d, size_t n, const char *needle)
+{
+    size_t k = strlen(needle);
+    for (size_t i = 0; k <= n && i <= n - k; i++)
+        if (memcmp(d + i, needle, k) == 0) return true;
+    return false;
+}
+
+/* Like built_track_alt_group, for renderGroup/label/lang. raw_has_keys, when
+ * non-NULL, reports either key anywhere in the raw JSON. */
+static bool built_track_meta(moq_media_sender_t *s, const char *name,
+                             built_meta_t *m, bool *raw_has_keys)
+{
+    memset(m, 0, sizeof(*m));
+    moq_rcbuf_t *j = NULL;
+    if (moq_media_sender_test_build_catalog(s, &j) != MOQ_OK || !j) return false;
+    if (raw_has_keys)
+        *raw_has_keys =
+            span_has(moq_rcbuf_data(j), moq_rcbuf_len(j), "\"renderGroup\"") ||
+            span_has(moq_rcbuf_data(j), moq_rcbuf_len(j), "\"label\"");
+    const moq_alloc_t *al = moq_alloc_default();
+    moq_msf_catalog_t c;
+    bool found = false;
+    if (moq_msf_catalog_parse(al,
+            (moq_bytes_t){ moq_rcbuf_data(j), moq_rcbuf_len(j) }, &c) == MOQ_OK) {
+        size_t nl = strlen(name);
+        for (size_t i = 0; i < c.track_count; i++) {
+            const moq_msf_track_t *t = &c.tracks[i];
+            if (t->name.len != nl || memcmp(t->name.data, name, nl) != 0)
+                continue;
+            found = true;
+            m->has_render_group = t->has_render_group;
+            m->render_group = t->render_group;
+            m->has_label = t->has_label;
+            if (t->has_label) copy_cstr(m->label, sizeof(m->label), t->label);
+            m->has_lang = t->has_lang;
+            if (t->has_lang) copy_cstr(m->lang, sizeof(m->lang), t->lang);
+            break;
+        }
+        moq_msf_catalog_cleanup(al, &c);
+    }
+    moq_rcbuf_decref(j);
+    return found;
+}
+
+static void meta_track_cfg(moq_media_track_cfg_t *tc, const char *name,
+                           moq_media_type_t type)
+{
+    moq_media_track_cfg_init(tc);
+    tc->name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    tc->media_type = type;
+    tc->packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc->bitrate = 128000;
+    tc->is_live = true;
+    if (type == MOQ_MEDIA_TYPE_AUDIO) {
+        tc->codec = (moq_bytes_t){ (const uint8_t *)"mp4a.40.2", 9 };
+        tc->samplerate = 48000;
+        tc->channel_config = (moq_bytes_t){ (const uint8_t *)"2", 1 };
+    } else {
+        tc->codec = (moq_bytes_t){ (const uint8_t *)"avc1.640028", 11 };
+    }
 }
 
 /* The catalog-instance timestamp this file pins wherever it compares raw bytes.
@@ -384,8 +496,140 @@ static void w6_expect_json(const moq_rcbuf_t *j, const char *want)
     MOQ_TEST_CHECK(same);
 }
 
+/* Allocate only the declared prefix, so an appended-field overread is visible
+ * to memory instrumentation rather than hidden in a full-size fixture. */
+static moq_result_t add_exact_prefix(moq_media_sender_t *s,
+                                     const moq_media_track_cfg_t *cfg,
+                                     moq_media_track_t **out)
+{
+    void *storage = malloc(cfg->struct_size);
+    MOQ_TEST_CHECK(storage != NULL);
+    if (!storage) { *out = NULL; return MOQ_ERR_NOMEM; }
+    memcpy(storage, cfg, cfg->struct_size);
+    moq_result_t rc = moq_media_sender_add_track(s,
+        (const moq_media_track_cfg_t *)storage, out);
+    free(storage);
+    return rc;
+}
+
+static void test_label_presence_and_prefixes(void)
+{
+    for (int mode = 0; mode < 4; mode++) {
+        bool present = mode == 3;
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        meta_track_cfg(&tc, "empty", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_label = present;
+        /* Absent values are never interpreted, even if incoherent or huge. */
+        if (mode == 0) tc.label = (moq_bytes_t){ NULL, SIZE_MAX };
+        if (mode == 1) memset(&tc.label, 0xa5, sizeof(tc.label));
+        if (mode == 2)
+            tc.label = (moq_bytes_t){ (const uint8_t *)"\xff", 1 };
+        moq_media_track_t *t = NULL;
+        MOQ_TEST_CHECK(moq_media_sender_add_track(s, &tc, &t) == MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+        built_meta_t m;
+        bool raw = false;
+        MOQ_TEST_CHECK(built_track_meta(s, "empty", &m, &raw));
+        MOQ_TEST_CHECK(m.has_label == present);
+        MOQ_TEST_CHECK(!m.has_render_group);
+        MOQ_TEST_CHECK(raw == present);
+        if (present) {
+            moq_rcbuf_t *j = NULL;
+            MOQ_TEST_CHECK(moq_media_sender_test_build_catalog(s, &j) == MOQ_OK);
+            if (j) MOQ_TEST_CHECK(span_has(moq_rcbuf_data(j), moq_rcbuf_len(j),
+                                          "\"label\":\"\""));
+            moq_rcbuf_decref(j);
+        }
+        moq_media_sender_test_free(s);
+    }
+    const size_t first = offsetof(moq_media_track_cfg_t, has_label);
+    const size_t end = offsetof(moq_media_track_cfg_t, label) +
+                       sizeof(((moq_media_track_cfg_t *)0)->label);
+    for (size_t cut = first; cut < end; cut++) {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        meta_track_cfg(&tc, "partial", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_render_group = true;
+        tc.render_group = -1;
+        tc.has_label = true;
+        memset(&tc.label, 0xa5, sizeof(tc.label));
+        tc.struct_size = (uint32_t)cut;
+        moq_media_track_t *t = NULL;
+        MOQ_TEST_CHECK(add_exact_prefix(s, &tc, &t) == MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+        built_meta_t m;
+        MOQ_TEST_CHECK(built_track_meta(s, "partial", &m, NULL));
+        MOQ_TEST_CHECK(!m.has_label);
+        MOQ_TEST_CHECK(m.has_render_group && m.render_group == -1);
+        moq_media_sender_test_free(s);
+    }
+    MOQ_TEST_PASS("sender_catalog.label_presence_complete_block");
+}
+
+static void test_metadata_older_layouts(void)
+{
+    const size_t align = _Alignof(moq_media_track_cfg_t);
+    const size_t tail = offsetof(moq_media_track_cfg_t, dynamic_groups) +
+                        sizeof(((moq_media_track_cfg_t *)0)->dynamic_groups);
+    const size_t old_size = (tail + align - 1) / align * align;
+    const size_t prefixes[] = {
+        MOQ_MEDIA_TRACK_CFG_V0_SIZE,
+        offsetof(moq_media_track_cfg_t, extensions),
+        offsetof(moq_media_track_cfg_t, track_properties),
+        old_size
+    };
+    MOQ_TEST_CHECK(offsetof(moq_media_track_cfg_t, has_render_group) >= old_size);
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        meta_track_cfg(&tc, "older", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_alt_group = true;
+        tc.alt_group = 4;
+        memset((uint8_t *)&tc + tail, 0xa5, sizeof(tc) - tail);
+        tc.has_render_group = true;
+        tc.render_group = 9;
+        tc.has_label = true;
+        tc.struct_size = (uint32_t)prefixes[i];
+        moq_media_track_t *t = NULL;
+        MOQ_TEST_CHECK(add_exact_prefix(s, &tc, &t) == MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+        built_meta_t m;
+        bool raw = true;
+        MOQ_TEST_CHECK(built_track_meta(s, "older", &m, &raw));
+        MOQ_TEST_CHECK(!raw && !m.has_render_group && !m.has_label);
+        if (i > 0) {
+            bool has_alt = false;
+            int alt = 0;
+            MOQ_TEST_CHECK(built_track_alt_group(s, "older", &has_alt, &alt));
+            MOQ_TEST_CHECK(has_alt && alt == 4);
+        }
+        moq_media_sender_test_free(s);
+    }
+    const size_t end = offsetof(moq_media_track_cfg_t, render_group) + sizeof(int);
+    for (size_t cut = offsetof(moq_media_track_cfg_t, has_render_group);
+         cut < end; cut++) {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        meta_track_cfg(&tc, "group_cut", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_render_group = true;
+        tc.render_group = 9;
+        tc.struct_size = (uint32_t)cut;
+        moq_media_track_t *t = NULL;
+        MOQ_TEST_CHECK(add_exact_prefix(s, &tc, &t) == MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+        built_meta_t m;
+        MOQ_TEST_CHECK(built_track_meta(s, "group_cut", &m, NULL));
+        MOQ_TEST_CHECK(!m.has_render_group && !m.has_label);
+        moq_media_sender_test_free(s);
+    }
+    MOQ_TEST_PASS("sender_catalog.metadata_older_layouts");
+}
+
 int main(void)
 {
+    test_label_presence_and_prefixes();
+    test_metadata_older_layouts();
     /* -- 1. coalescing: two post-ready adds both appear in one build ---- */
     {
         moq_media_sender_t *s = moq_media_sender_test_new();
@@ -1162,6 +1406,246 @@ int main(void)
         MOQ_TEST_PASS("sender_catalog.alt_group_abi_old_prefix");
     }
 
+    /* -- MSF renderGroup + label: one program, two audio languages ---------- */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        moq_media_track_t *t = NULL;
+        char label_buf[] = "Main Camera";   /* scribbled below: must be copied */
+        meta_track_cfg(&tc, "video_main", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_render_group = true; tc.render_group = 2;
+        tc.has_alt_group = true;    tc.alt_group = 1;
+        tc.has_label = true;
+        tc.label = (moq_bytes_t){ (const uint8_t *)label_buf, strlen(label_buf) };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        memset(label_buf, 'X', sizeof(label_buf) - 1);
+
+        meta_track_cfg(&tc, "audio_en", MOQ_MEDIA_TYPE_AUDIO);
+        tc.has_render_group = true; tc.render_group = 2;
+        tc.has_alt_group = true;    tc.alt_group = 3;
+        tc.lang = (moq_bytes_t){ (const uint8_t *)"en", 2 };
+        tc.has_label = true;
+        tc.label = (moq_bytes_t){ (const uint8_t *)"English", 7 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+
+        static const char es_label[] = "Espa\xc3\xb1ol \"es\"";
+        meta_track_cfg(&tc, "audio_es", MOQ_MEDIA_TYPE_AUDIO);
+        tc.has_render_group = true; tc.render_group = 2;
+        tc.has_alt_group = true;    tc.alt_group = 3;
+        tc.lang = (moq_bytes_t){ (const uint8_t *)"es", 2 };
+        tc.has_label = true;
+        tc.label = (moq_bytes_t){ (const uint8_t *)es_label, strlen(es_label) };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+
+        built_meta_t m;
+        MOQ_TEST_CHECK(built_track_meta(s, "video_main", &m, NULL));
+        MOQ_TEST_CHECK(m.has_render_group && m.render_group == 2);
+        MOQ_TEST_CHECK(m.has_label && strcmp(m.label, "Main Camera") == 0);
+        MOQ_TEST_CHECK(!m.has_lang);
+        MOQ_TEST_CHECK(built_track_meta(s, "audio_en", &m, NULL));
+        MOQ_TEST_CHECK(m.has_render_group && m.render_group == 2);
+        MOQ_TEST_CHECK(m.has_label && strcmp(m.label, "English") == 0);
+        MOQ_TEST_CHECK(m.has_lang && strcmp(m.lang, "en") == 0);
+        MOQ_TEST_CHECK(built_track_meta(s, "audio_es", &m, NULL));
+        MOQ_TEST_CHECK(m.has_render_group && m.render_group == 2);
+        MOQ_TEST_CHECK(m.has_label && strcmp(m.label, es_label) == 0);
+        MOQ_TEST_CHECK(m.has_lang && strcmp(m.lang, "es") == 0);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.render_group_label");
+    }
+
+    /* Exact byte spans, UTF-8 boundaries and signed render-group domain. */
+    {
+        static const uint8_t boundaries[] = {
+            0xc2, 0x80, 0xdf, 0xbf, 0xe0, 0xa0, 0x80, 0xed, 0x9f, 0xbf,
+            0xee, 0x80, 0x80, 0xef, 0xbf, 0xbf, 0xf0, 0x90, 0x80, 0x80,
+            0xf4, 0x8f, 0xbf, 0xbf
+        };
+        static const uint8_t embedded[] = { 'A', 0, 'Z' };
+        uint8_t long_label[96];
+        memset(long_label, 'L', sizeof(long_label));
+        long_label[sizeof(long_label) - 1] = 'Z';
+        const moq_bytes_t labels[] = {
+            { boundaries, sizeof(boundaries) }, { embedded, sizeof(embedded) },
+            { long_label, sizeof(long_label) }, { boundaries, sizeof(boundaries) }
+        };
+        const int groups[] = { 0, -1, INT_MIN, INT_MAX };
+        for (size_t i = 0; i < sizeof(groups) / sizeof(groups[0]); i++) {
+            moq_media_sender_t *s = moq_media_sender_test_new();
+            moq_media_track_cfg_t tc;
+            moq_media_track_t *t = NULL;
+            uint8_t borrowed[sizeof(long_label)];
+            memcpy(borrowed, labels[i].data, labels[i].len);
+            meta_track_cfg(&tc, "exact", MOQ_MEDIA_TYPE_VIDEO);
+            tc.has_render_group = true;
+            tc.render_group = groups[i];
+            tc.has_label = true;
+            tc.label = (moq_bytes_t){ borrowed, labels[i].len };
+            MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                                  (int)MOQ_OK);
+            memset(borrowed, 'X', sizeof(borrowed));
+            moq_media_sender_test_set_ready(s);
+            MOQ_TEST_CHECK(built_exact_meta(s, "exact", labels[i], groups[i]));
+            moq_media_sender_test_free(s);
+        }
+        MOQ_TEST_PASS("sender_catalog.label_exact_spans_signed_groups");
+    }
+
+    /* -- Unset renderGroup/label leave no key in the catalog at all ---------- */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        moq_media_track_t *t = NULL;
+        meta_track_cfg(&tc, "v", MOQ_MEDIA_TYPE_VIDEO);
+        tc.render_group = 5;   /* without has_render_group: still absent */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+
+        built_meta_t m;
+        bool raw = true;
+        MOQ_TEST_CHECK(built_track_meta(s, "v", &m, &raw));
+        MOQ_TEST_CHECK(!raw);
+        MOQ_TEST_CHECK(!m.has_render_group && !m.has_label);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.render_group_label_absent_by_default");
+    }
+
+    /* -- ABI: a pre-renderGroup cfg prefix keeps altGroup, drops the rest ---- */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        moq_media_track_t *t = NULL;
+        meta_track_cfg(&tc, "old", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_alt_group = true;    tc.alt_group = 4;
+        /* A caller built before renderGroup: its size ends after the padded
+         * publisher-priority pair. Poison its tail padding too. */
+        size_t end = offsetof(moq_media_track_cfg_t, publisher_priority) +
+                     sizeof(tc.publisher_priority);
+        size_t align = _Alignof(moq_media_track_cfg_t);
+        size_t legacy_size = (end + align - 1) / align * align;
+        MOQ_TEST_CHECK(legacy_size <=
+                       offsetof(moq_media_track_cfg_t, has_render_group));
+        memset((uint8_t *)&tc + end, 0xa5, sizeof(tc) - end);
+        tc.has_render_group = true; tc.render_group = 9;  /* beyond the prefix */
+        tc.has_label = true;
+        tc.label = (moq_bytes_t){ (const uint8_t *)"nope", 4 };
+        tc.struct_size = (uint32_t)legacy_size;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+
+        bool ha = false; int av = 0;
+        MOQ_TEST_CHECK(built_track_alt_group(s, "old", &ha, &av));
+        MOQ_TEST_CHECK(ha && av == 4);
+        built_meta_t m;
+        bool raw = true;
+        MOQ_TEST_CHECK(built_track_meta(s, "old", &m, &raw));
+        MOQ_TEST_CHECK(!raw);
+        MOQ_TEST_CHECK(!m.has_render_group && !m.has_label);
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.render_group_label_abi_old_prefix");
+    }
+
+    /* -- A struct_size ending inside the renderGroup pair drops the pair ----- */
+    {
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        moq_media_track_cfg_t tc;
+        moq_media_track_t *t = NULL;
+        meta_track_cfg(&tc, "cut", MOQ_MEDIA_TYPE_VIDEO);
+        tc.has_render_group = true; tc.render_group = 9;
+        tc.struct_size = (uint32_t)offsetof(moq_media_track_cfg_t, render_group);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                              (int)MOQ_OK);
+        moq_media_sender_test_set_ready(s);
+
+        built_meta_t m;
+        MOQ_TEST_CHECK(built_track_meta(s, "cut", &m, NULL));
+        MOQ_TEST_CHECK(!m.has_render_group);   /* not renderGroup 0 */
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.render_group_truncated_pair");
+    }
+
+    /* Partial spans are absent, including a nonzero fragment of their length.
+     * NULL in the length-cut rows makes an ungated read fail coherency before
+     * any traversal, independent of byte order or the fragment's magnitude. */
+    {
+        const size_t label_at = offsetof(moq_media_track_cfg_t, label);
+        const size_t pointer_at = label_at + offsetof(moq_bytes_t, data);
+        const size_t length_at = label_at + offsetof(moq_bytes_t, len);
+        const size_t cuts[] = {
+            pointer_at + 1,
+            pointer_at + sizeof(((moq_bytes_t *)0)->data) - 1,
+            length_at + 1,
+            length_at + sizeof(((moq_bytes_t *)0)->len) - 1,
+        };
+        static const uint8_t label[] = "abc";
+        for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]); i++) {
+            moq_media_sender_t *s = moq_media_sender_test_new();
+            moq_media_track_cfg_t tc;
+            moq_media_track_t *t = NULL;
+            meta_track_cfg(&tc, "label_cut", MOQ_MEDIA_TYPE_VIDEO);
+            tc.has_render_group = true;
+            tc.render_group = 2;
+            tc.has_label = true;
+            tc.label = (moq_bytes_t){ label, sizeof(label) - 1 };
+            if (cuts[i] > length_at) {
+                tc.label.data = NULL;
+                tc.label.len = 0;
+                ((unsigned char *)&tc.label.len)[0] = 1;
+                size_t fragment = 0;
+                memcpy(&fragment, &tc.label.len, cuts[i] - length_at);
+                MOQ_TEST_CHECK(fragment != 0);
+            }
+            tc.struct_size = (uint32_t)cuts[i];
+            moq_result_t rc = moq_media_sender_add_track(s, &tc, &t);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+            MOQ_TEST_CHECK(t != NULL);
+            if (rc == MOQ_OK) {
+                moq_media_sender_test_set_ready(s);
+                built_meta_t m;
+                MOQ_TEST_CHECK(built_track_meta(s, "label_cut", &m, NULL));
+                MOQ_TEST_CHECK(m.has_render_group && m.render_group == 2);
+                MOQ_TEST_CHECK(!m.has_label);
+            }
+            moq_media_sender_test_free(s);
+        }
+        MOQ_TEST_PASS("sender_catalog.label_truncated_span_absent");
+    }
+
+    /* -- A label with no bytes or ill-formed UTF-8 is a malformed cfg -------- */
+    {
+        static const struct { const char *data; size_t len; } bad[] = {
+            { NULL, 3 },
+            { "\xff", 1 },               /* never valid */
+            { "\xc0\xaf", 2 },           /* overlong '/' */
+            { "\xed\xa0\x80", 3 },       /* UTF-16 surrogate */
+            { "\xf4\x90\x80\x80", 4 },   /* above U+10FFFF */
+            { "ok\xe2\x82", 4 },         /* truncated sequence */
+            { "\x80", 1 },               /* isolated continuation */
+            { "\xe0\x9f\xbf", 3 },       /* three-byte overlong */
+            { "\xf0\x8f\xbf\xbf", 4 },   /* four-byte overlong */
+            { "\xe2\x82\x41", 3 },       /* invalid later continuation */
+        };
+        moq_media_sender_t *s = moq_media_sender_test_new();
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            moq_media_track_cfg_t tc;
+            moq_media_track_t *t = NULL;
+            meta_track_cfg(&tc, "bad", MOQ_MEDIA_TYPE_VIDEO);
+            tc.has_label = true;
+            tc.label = (moq_bytes_t){ (const uint8_t *)bad[i].data, bad[i].len };
+            MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc, &t),
+                                  (int)MOQ_ERR_INVAL);
+            MOQ_TEST_CHECK(t == NULL);
+        }
+        moq_media_sender_test_free(s);
+        MOQ_TEST_PASS("sender_catalog.label_malformed_rejected");
+    }
+
     /* -- CMSF §4.1.1.4.5: pssh must be valid Base64 at create/attach -------
      * Mirrors the strict MSF catalog encoder so a bad contentProtection fails
      * the public authoring API (create/attach) rather than late at publish. */
@@ -1220,7 +1704,23 @@ int main(void)
         (void)add_trk(s, "v", false);
         moq_media_sender_test_set_ready(s);
         moq_media_sender_test_mark_registered(s);
-        moq_media_sender_test_mark_published(s);   /* baseline = {v} */
+        /* Add metadata before committing the baseline. */
+        static const uint8_t base_label[] = { 'B', 0, 'Z' };
+        static const uint8_t late_label[] = { 'L', 0xf0, 0x90, 0x80, 0x80 };
+        uint8_t borrowed_base[sizeof(base_label)];
+        memcpy(borrowed_base, base_label, sizeof(base_label));
+        moq_media_track_cfg_t base_cfg;
+        moq_media_track_t *base_track = NULL;
+        meta_track_cfg(&base_cfg, "base_meta", MOQ_MEDIA_TYPE_VIDEO);
+        base_cfg.has_render_group = true;
+        base_cfg.render_group = -1;
+        base_cfg.has_label = true;
+        base_cfg.label = (moq_bytes_t){ borrowed_base, sizeof(borrowed_base) };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &base_cfg,
+                              &base_track), (int)MOQ_OK);
+        memset(borrowed_base, 'X', sizeof(borrowed_base));
+        moq_media_sender_test_mark_registered(s);
+        moq_media_sender_test_mark_published(s);   /* baseline = {v, base_meta} */
 
         /* Post-ready add shaped like a real LOC video track (the E2E case D
          * shape): init data (inlined base64 into the delta add), width/
@@ -1238,45 +1738,92 @@ int main(void)
             tc.init_data = (moq_bytes_t){ init_data, sizeof(init_data) };
             tc.width = 320; tc.height = 240;
             tc.framerate_millis = 30000;
+            uint8_t borrowed_late[sizeof(late_label)];
+            memcpy(borrowed_late, late_label, sizeof(late_label));
+            tc.has_render_group = true;
+            tc.render_group = 0;
+            tc.has_label = true;
+            tc.label = (moq_bytes_t){ borrowed_late, sizeof(borrowed_late) };
             moq_media_track_t *late = NULL;
             MOQ_TEST_CHECK_EQ_INT(
                 (int)moq_media_sender_add_track(s, &tc, &late), (int)MOQ_OK);
+            memset(borrowed_late, 'X', sizeof(borrowed_late));
         }
         moq_media_sender_test_mark_registered(s);
 
         moq_rcbuf_t *objs[3] = { NULL, NULL, NULL };
         size_t nobj = moq_media_sender_test_stage(s, objs, 3);
         MOQ_TEST_CHECK_EQ_INT((int)nobj, 2);       /* base + one ADD delta */
+        MOQ_TEST_CHECK(objs[0] != NULL && objs[1] != NULL);
+        if (nobj == 2 && objs[0] && objs[1]) {
+            /* Object 0 -- the independent base. §5.1.1: version is the String
+             * "1" (the exact value PlayA and the pre-rewrite libmoq agree on;
+             * "draft-01" is rejected by strict MSF-01 receivers -- the E2E case D
+             * regression). */
+            {
+                char tmp[2048];
+                size_t n = moq_rcbuf_len(objs[0]);
+                MOQ_TEST_CHECK(n < sizeof(tmp));
+                if (n < sizeof(tmp)) {
+                    memcpy(tmp, moq_rcbuf_data(objs[0]), n); tmp[n] = '\0';
+                    MOQ_TEST_CHECK(strstr(tmp, "\"version\":\"1\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(tmp, "draft-01") == NULL);
+                    MOQ_TEST_CHECK(strstr(tmp, "\"tracks\":[") != NULL);
+                }
+            }
 
-        /* Object 0 -- the independent base. §5.1.1: version is the String
-         * "1" (the exact value PlayA and the pre-rewrite libmoq agree on;
-         * "draft-01" is rejected by strict MSF-01 receivers -- the E2E case D
-         * regression). */
-        {
-            char tmp[512];
-            size_t n = moq_rcbuf_len(objs[0]);
-            MOQ_TEST_CHECK(n < sizeof(tmp));
-            memcpy(tmp, moq_rcbuf_data(objs[0]), n); tmp[n] = '\0';
-            MOQ_TEST_CHECK(strstr(tmp, "\"version\":\"1\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "draft-01") == NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "\"tracks\":[") != NULL);
-        }
+            /* Object 1 -- the delta. §5.1.6 shape: a deltaUpdate ARRAY of
+             * {op, tracks} operations, and NO root version/tracks fields (a
+             * delta MUST NOT carry them). The added track must be the full
+             * self-contained shape (inline initData base64, no initRef). */
+            {
+                char tmp[1024];
+                size_t n = moq_rcbuf_len(objs[1]);
+                MOQ_TEST_CHECK(n < sizeof(tmp));
+                if (n < sizeof(tmp)) {
+                    memcpy(tmp, moq_rcbuf_data(objs[1]), n); tmp[n] = '\0';
+                    MOQ_TEST_CHECK(strncmp(tmp, "{\"deltaUpdate\":[{\"op\":\"add\"",
+                                           27) == 0);
+                    MOQ_TEST_CHECK(strstr(tmp, "\"version\"") == NULL);
+                    MOQ_TEST_CHECK(strstr(tmp, "\"name\":\"late\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(tmp, "\"initData\":\"AULgHg==\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(tmp, "initRef") == NULL);
+                }
+            }
 
-        /* Object 1 -- the delta. §5.1.6 shape: a deltaUpdate ARRAY of
-         * {op, tracks} operations, and NO root version/tracks fields (a
-         * delta MUST NOT carry them). The added track must be the full
-         * self-contained shape (inline initData base64, no initRef). */
-        {
-            char tmp[1024];
-            size_t n = moq_rcbuf_len(objs[1]);
-            MOQ_TEST_CHECK(n < sizeof(tmp));
-            memcpy(tmp, moq_rcbuf_data(objs[1]), n); tmp[n] = '\0';
-            MOQ_TEST_CHECK(strncmp(tmp, "{\"deltaUpdate\":[{\"op\":\"add\"",
-                                   27) == 0);
-            MOQ_TEST_CHECK(strstr(tmp, "\"version\"") == NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "\"name\":\"late\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "\"initData\":\"AULgHg==\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "initRef") == NULL);
+            const moq_alloc_t *al = moq_alloc_default();
+            moq_msf_catalog_t base, delta, merged;
+            moq_result_t br = moq_msf_catalog_parse(al,
+                (moq_bytes_t){ moq_rcbuf_data(objs[0]), moq_rcbuf_len(objs[0]) }, &base);
+            moq_result_t dr = moq_msf_catalog_parse(al,
+                (moq_bytes_t){ moq_rcbuf_data(objs[1]), moq_rcbuf_len(objs[1]) }, &delta);
+            MOQ_TEST_CHECK(br == MOQ_OK && dr == MOQ_OK);
+            const moq_bytes_t bl = { base_label, sizeof(base_label) };
+            const moq_bytes_t ll = { late_label, sizeof(late_label) };
+            if (br == MOQ_OK) {
+                MOQ_TEST_CHECK(base.track_count == 2);
+                MOQ_TEST_CHECK(exact_track_meta(base.tracks, base.track_count, "base_meta", bl, -1));
+            }
+            if (dr == MOQ_OK) {
+                MOQ_TEST_CHECK(delta.delta_update_count == 1);
+                if (delta.delta_update_count == 1) {
+                    const moq_msf_delta_op_t *op = &delta.delta_update[0];
+                    MOQ_TEST_CHECK(op->op == MOQ_MSF_DELTA_OP_ADD && op->track_count == 1);
+                    MOQ_TEST_CHECK(exact_track_meta(op->tracks, op->track_count, "late", ll, 0));
+                }
+            }
+            if (br == MOQ_OK && dr == MOQ_OK) {
+                moq_result_t mr = moq_msf_catalog_apply_delta(al, &base, &delta, &merged);
+                MOQ_TEST_CHECK(mr == MOQ_OK);
+                if (mr == MOQ_OK) {
+                    MOQ_TEST_CHECK(merged.track_count == 3);
+                    MOQ_TEST_CHECK(exact_track_meta(merged.tracks, merged.track_count, "base_meta", bl, -1));
+                    MOQ_TEST_CHECK(exact_track_meta(merged.tracks, merged.track_count, "late", ll, 0));
+                    moq_msf_catalog_cleanup(al, &merged);
+                }
+            }
+            if (dr == MOQ_OK) moq_msf_catalog_cleanup(al, &delta);
+            if (br == MOQ_OK) moq_msf_catalog_cleanup(al, &base);
         }
 
         for (size_t i = 0; i < nobj; i++) moq_rcbuf_decref(objs[i]);

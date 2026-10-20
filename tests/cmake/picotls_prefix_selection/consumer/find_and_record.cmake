@@ -1,0 +1,88 @@
+# find_package(Picoquic) and the record the driver reads.
+set(_moq_hook_state_before "")
+foreach(_moq_v CMAKE_PROJECT_picotls_INCLUDE MOQ_PICOTLS_CALLER_PROJECT_INCLUDE)
+    if(DEFINED ${_moq_v})
+        string(APPEND _moq_hook_state_before "${_moq_v}=[${${_moq_v}}] ")
+    else()
+        string(APPEND _moq_hook_state_before "${_moq_v}=unset ")
+    endif()
+    if(DEFINED CACHE{${_moq_v}})
+        string(APPEND _moq_hook_state_before "cache:[$CACHE{${_moq_v}}] ")
+    endif()
+endforeach()
+find_package(Picoquic REQUIRED)
+if(MOQ_TEST_FIND_TWICE)
+    find_package(Picoquic REQUIRED)
+endif()
+set(_moq_hook_state_after "")
+foreach(_moq_v CMAKE_PROJECT_picotls_INCLUDE MOQ_PICOTLS_CALLER_PROJECT_INCLUDE)
+    if(DEFINED ${_moq_v})
+        string(APPEND _moq_hook_state_after "${_moq_v}=[${${_moq_v}}] ")
+    else()
+        string(APPEND _moq_hook_state_after "${_moq_v}=unset ")
+    endif()
+    if(DEFINED CACHE{${_moq_v}})
+        string(APPEND _moq_hook_state_after "cache:[$CACHE{${_moq_v}}] ")
+    endif()
+endforeach()
+# The caller's hook bindings after find_package, checked by behaviour: a
+# cache-only binding must still follow its cache entry.
+set(_moq_binding "ok")
+if(MOQ_TEST_BINDING)
+    set(_moq_binding "")
+    set(_moq_normal "${MOQ_TEST_HOOK_DIR}/noop_normal.cmake")
+    set(_moq_cached "${MOQ_TEST_HOOK_DIR}/noop_cache.cmake")
+    foreach(_moq_v IN LISTS _moq_binding_vars)
+        if(MOQ_TEST_BINDING STREQUAL "unset")
+            if(DEFINED ${_moq_v})
+                list(APPEND _moq_binding "${_moq_v} is now defined")
+            endif()
+        elseif(MOQ_TEST_BINDING STREQUAL "empty")
+            if(NOT DEFINED ${_moq_v} OR NOT "${${_moq_v}}" STREQUAL "" OR DEFINED CACHE{${_moq_v}})
+                list(APPEND _moq_binding "${_moq_v} is no longer an empty normal variable")
+            endif()
+        elseif(MOQ_TEST_BINDING STREQUAL "set")
+            if(NOT "${${_moq_v}}" STREQUAL "${_moq_normal}" OR DEFINED CACHE{${_moq_v}})
+                list(APPEND _moq_binding "${_moq_v} is '${${_moq_v}}', not the normal value alone")
+            endif()
+        elseif(MOQ_TEST_BINDING STREQUAL "cache")
+            set_property(CACHE ${_moq_v} PROPERTY VALUE "changed")
+            if(NOT "${${_moq_v}}" STREQUAL "changed")
+                list(APPEND _moq_binding "${_moq_v} no longer follows its cache entry ('${${_moq_v}}')")
+            endif()
+        elseif(MOQ_TEST_BINDING STREQUAL "over")
+            if(NOT "${${_moq_v}}" STREQUAL "${_moq_normal}" OR NOT "$CACHE{${_moq_v}}" STREQUAL "${_moq_cached}")
+                list(APPEND _moq_binding "${_moq_v} is '${${_moq_v}}' over cache '$CACHE{${_moq_v}}'")
+            endif()
+            unset(${_moq_v})
+            if(NOT "${${_moq_v}}" STREQUAL "${_moq_cached}")
+                list(APPEND _moq_binding "${_moq_v} does not fall back to its cache entry")
+            endif()
+        endif()
+    endforeach()
+    if(NOT _moq_binding)
+        set(_moq_binding "ok")
+    endif()
+endif()
+set(pc_libs "")
+include("${MOQ_TEST_MODULE_DIR}/MoqPicoquicPkgConfig.cmake" OPTIONAL RESULT_VARIABLE pc_module)
+if(pc_module)
+    moq_picoquic_pkgconfig_libs(pc_libs)
+endif()
+get_property(_moq_order GLOBAL PROPERTY MOQ_TEST_HOOK_ORDER)
+get_property(_moq_ptls_options GLOBAL PROPERTY MOQ_TEST_PTLS_OPTIONS)
+get_property(_moq_ptls_scope GLOBAL PROPERTY MOQ_TEST_PTLS_SCOPE)
+file(APPEND "${MOQ_TEST_RESULT}"
+    "SELINC=${PTLS_INCLUDE_DIR}\n"
+    "LIBDIR=${MOQ_PTLS_LIB_DIR}\n"
+    "UNRESOLVED=$CACHE{MOQ_PTLS_LIB_DIR_UNRESOLVED}\n"
+    "CCORE=$CACHE{PTLS_CORE_LIBRARY}\n"
+    "CMINICRYPTO=$CACHE{PTLS_MINICRYPTO_LIBRARY}\n"
+    "COPENSSL=$CACHE{PTLS_OPENSSL_LIBRARY}\n"
+    "PCLIBS=${pc_libs}\n"
+    "HOOKORDER=${_moq_order}\n"
+    "PTLSOPTIONS=${_moq_ptls_options}\n"
+    "PTLSSCOPE=${_moq_ptls_scope}\n"
+    "HOOKBEFORE=${_moq_hook_state_before}\n"
+    "HOOKAFTER=${_moq_hook_state_after}\n"
+    "BINDING=${_moq_binding}\n")

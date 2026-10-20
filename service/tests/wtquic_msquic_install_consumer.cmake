@@ -16,7 +16,8 @@
 # (scratch), WTQUIC_PREFIX (wtquic install prefix), PICOQUIC_SOURCE_DIR + PICOTLS
 # _PREFIX (used ONLY to materialize the installed picoquic, never handed to the
 # consumer); optional MSQUIC_DIR_HINT, C_COMPILER, BUILD_TYPE, OPENSSL_ROOT,
-# DO_PKGCONFIG (ON/OFF), LIBDIR (defaults to lib).
+# DO_PKGCONFIG (ON/OFF), LIBDIR (defaults to lib), CONSUMER_CONTEXT (test-owned
+# producer toolchain, compile and link flags; never installed).
 
 foreach(_v BUILD SRC WORK WTQUIC_PREFIX PICOQUIC_SOURCE_DIR PICOTLS_PREFIX)
     if(NOT DEFINED ${_v} OR "${${_v}}" STREQUAL "")
@@ -25,6 +26,12 @@ foreach(_v BUILD SRC WORK WTQUIC_PREFIX PICOQUIC_SOURCE_DIR PICOTLS_PREFIX)
 endforeach()
 if(NOT DEFINED LIBDIR)
     set(LIBDIR lib)
+endif()
+set(_context)
+if(CONSUMER_CONTEXT)
+    include("${CONSUMER_CONTEXT}")
+    include("${CMAKE_CURRENT_LIST_DIR}/../../tests/cmake/ConsumerBuildContext.cmake")
+    list(APPEND _context -C "${CONSUMER_CONTEXT}")
 endif()
 
 set(_prefix "${WORK}/prefix")       # installed picoquic + libmoq (positive)
@@ -41,7 +48,7 @@ file(REMOVE_RECURSE "${_prefix}" "${_bare}" "${_pqbuild}"
 # path in at picoquic-build time (CMAKE_LIBRARY_PATH); its exported targets then
 # carry absolute picotls paths and the relocated consumer needs no picotls hint.
 get_filename_component(_ptls_src "${PICOTLS_PREFIX}" DIRECTORY)
-set(_pq_cfg
+set(_pq_cfg ${_context}
     -S "${PICOQUIC_SOURCE_DIR}" -B "${_pqbuild}"
     -DBUILD_HTTP=ON -DBUILD_DEMO=OFF -DBUILD_PQBENCH=OFF
     -DBUILD_PICO_SIM=OFF -Dpicoquic_BUILD_TESTS=OFF -DBUILD_LOGLIB=ON
@@ -100,7 +107,7 @@ target_link_libraries(consumer PRIVATE moq::service)
 
 # Only installed-prefix hints -- NO MOQ_PICOQUIC_SOURCE_DIR, so the consumer must
 # discover the installed picoquic, not fall back to a source tree.
-set(_fwd "")
+set(_fwd ${_context})
 if(DEFINED MSQUIC_DIR_HINT AND NOT MSQUIC_DIR_HINT STREQUAL "" AND
    NOT MSQUIC_DIR_HINT MATCHES "NOTFOUND")
     list(APPEND _fwd "-Dmsquic_DIR=${MSQUIC_DIR_HINT}")
@@ -164,9 +171,13 @@ if(DO_PKGCONFIG)
     if(NOT DEFINED C_COMPILER OR C_COMPILER STREQUAL "")
         set(C_COMPILER cc)
     endif()
+    if(CONSUMER_CONTEXT)
+        moq_consumer_direct_flags(C _cflags_extra)
+        moq_consumer_direct_flags(LINK _lflags_extra)
+    endif()
     execute_process(
         COMMAND ${C_COMPILER} "${SRC}/main.c" -o "${WORK}/pc-consumer"
-            ${_flag_list}
+            ${_cflags_extra} ${_flag_list} ${_lflags_extra}
         RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
     if(NOT _rc EQUAL 0)
         message(FATAL_ERROR

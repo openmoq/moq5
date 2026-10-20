@@ -16,15 +16,28 @@ int main(void)
         scenario = "legacy-attachment";
 #ifdef MOQ_TERMINAL_WT
         pico_wt_harness_t p;
-        bool ok = open_harness(&p, 0x73, versions[i], true, 0);
-        CHECK(ok == (versions[i] != MOQ_VERSION_DRAFT_22));
+        if (versions[i] == MOQ_VERSION_DRAFT_22) {
+            /* At the client constructor, and only there. */
+            pico_wt_harness_cfg_t cfg = { .cid_byte = 0x73, .request_capacity = 16,
+                                          .version = versions[i] };
+            const char *why = pico_wt_harness_check_attach_refusal(
+                &p, pico_wt_harness_setup(&p, &cfg));
+            if (why) fprintf(stderr, "legacy d22: %s\n", why);
+            CHECK(why == NULL);
+        } else {
+            CHECK(open_harness(&p, 0x73, versions[i], true, 0));
+        }
         pico_wt_harness_cleanup(&p);
 #else
-        pq_sim_t p;
-        int rc = sim_setup(&p, 0x73, versions[i], true, 0);
-        if (rc == 0) rc = sim_handshake(&p);
-        CHECK((rc == 0) == (versions[i] != MOQ_VERSION_DRAFT_22));
-        sim_cleanup(&p);
+        if (versions[i] == MOQ_VERSION_DRAFT_22) {
+            check_d22_refused();   /* at the constructor, and only there */
+        } else {
+            pq_sim_t p;
+            int rc = sim_setup(&p, 0x73, versions[i], true, 0);
+            if (rc == 0) rc = sim_handshake(&p);
+            CHECK(rc == 0);
+            sim_cleanup(&p);
+        }
 #endif
         printf("legacy d%u attachment checked\n", (unsigned)versions[i]);
     }

@@ -428,12 +428,13 @@ moq_result_t moq_session_note_object_published(
     return rc;
 }
 
-void moq_location_filter_from_core(uint32_t filter_type, uint64_t start_group,
-                                   uint64_t start_object, uint64_t end_group,
-                                   uint64_t end_object,
+void moq_location_filter_from_core(const moq_core_filter_t *filter,
                                    moq_location_filter_cfg_t *out,
                                    size_t out_size)
 {
+    const uint32_t filter_type = filter->type;
+    const uint64_t start_group = filter->start_group, start_object = filter->start_object;
+    const uint64_t end_group = filter->end_group, end_object = filter->end_object;
     moq_location_filter_cfg_t v;
     moq_location_filter_cfg_init(&v);
     switch (filter_type) {

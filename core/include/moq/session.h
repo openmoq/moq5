@@ -211,8 +211,8 @@ typedef struct moq_session_cfg {
     uint32_t           max_namespace_subscriptions;  /* ns_sub pool (default 16) */
 
     /*
-     * Reserved: the 4 bytes of tail padding the pre-version layout left after
-     * max_namespace_subscriptions (it ended the struct at this 8-byte boundary).
+     * Reserved: covers the pre-version layout's tail padding after
+     * max_namespace_subscriptions on targets where it had any.
      * `version` is placed AFTER this slot so its struct_size gate threshold lands
      * past that old sizeof -- otherwise an old caller passing sizeof(pre-version
      * struct) would have its uninitialized tail bytes read as `version`. This
@@ -2661,8 +2661,9 @@ moq_session_poll_events(moq_session_t *s, moq_event_t *out, size_t cap)
 
 /*
  * Release owned resources in a polled event. Idempotent.
- * OBJECT_RECEIVED: decrefs payload and properties, sets both NULL.
- * All other kinds (including SUBGROUP_FINISHED, which owns none): no-op.
+ * OBJECT_RECEIVED, FETCH_OBJECT and FILL_OBJECT: decrefs payload and
+ * properties, sets both NULL. OBJECT_CHUNK: decrefs chunk and properties,
+ * sets both NULL. All other kinds (including SUBGROUP_FINISHED): no-op.
  * Callers MUST call this after processing or dropping every polled event.
  */
 MOQ_API void moq_event_cleanup(moq_event_t *event);
@@ -3227,7 +3228,10 @@ MOQ_API moq_result_t moq_session_notify_publication_state(moq_session_t *s,
  * Returns MOQ_ERR_WRONG_STATE if the subscription is not ESTABLISHED
  * with role SUBSCRIBER.
  * Returns MOQ_ERR_REQUEST_BLOCKED if no request capacity.
- * Returns MOQ_ERR_WOULD_BLOCK if the action queue is full.
+ * Returns MOQ_ERR_WOULD_BLOCK if the action queue is full, or queued output
+ * occupies send-buffer space the update would fit after a drain.
+ * Returns MOQ_ERR_BUFFER if the encoded update exceeds the session's send
+ * capacity. Returns MOQ_ERR_NOMEM if the capacity-probe allocation fails.
  * An empty refresh is valid on typed-options profiles; legacy profiles return
  * MOQ_ERR_INVAL. An ACK without EXPIRES makes no renewal or timer promise.
  */

@@ -5,8 +5,8 @@
  * the codec adapters that feed the shared request-stream engine, and the
  * outbound encoders for every request family. The data-plane framing is
  * draft-18's, which draft-22 did not change; those vtable slots are taken
- * from the draft-18 table at first use. Registry availability permits explicit
- * selection; it does not enable this profile in default endpoint offers.
+ * from the draft-18 table at first use. The profile is wire-ready and included
+ * in default offers when the selected transport backend can carry it.
  */
 
 #include "session_internal.h"
@@ -211,8 +211,11 @@ static moq_result_t d22_handle_setup(moq_session_t *s,
      * before any token takes effect and may run again if this SETUP has to
      * be retried before it commits. */
     const char *reason = NULL;
-    uint64_t target_err = moq_binding_judge_peer_target(
-        s, opts.has_path, opts.path, opts.has_authority, opts.authority, &reason);
+    const moq_binding_peer_target_t target = {
+        .has_path = opts.has_path, .has_authority = opts.has_authority,
+        .path = opts.path, .authority = opts.authority,
+    };
+    uint64_t target_err = moq_binding_judge_peer_target(s, &target, &reason);
     if (target_err) return close_with_error(s, target_err, reason);
     moq_setup_workspace_t workspace;
     rc = session_setup_workspace_acquire(s, &workspace);
@@ -436,35 +439,42 @@ static moq_result_t d22_ns_parts(const moq_d22_namespace_t *ns, moq_bytes_t *par
     return MOQ_OK;
 }
 
-/* A location filter onto the core's filter record: the public forms where
- * they exist, the internal forms for a relative start and an object end. */
-static void d22_filter_to_record(const moq_d22_location_filter_t *f, bool *has_filter,
-                                 uint32_t *type, uint64_t *sg, uint64_t *so,
-                                 uint64_t *eg, uint64_t *eo)
+/* A location filter as the core's filter record: the public forms where
+ * they exist, the internal forms for a relative start and an object end.
+ * Fields a form does not carry are 0. */
+typedef struct d22_filter_record {
+    bool     present;
+    uint32_t type;
+    uint64_t start_group, start_object, end_group, end_object;
+} d22_filter_record_t;
+
+static d22_filter_record_t d22_filter_record(const moq_d22_location_filter_t *f)
 {
-    *has_filter = true; *sg = 0; *so = 0; *eg = 0; *eo = 0;
+    d22_filter_record_t r = { .present = true };
     switch (f->type) {
     case MOQ_D22_FILTER_NONE:
-        *has_filter = false; *type = MOQ_SUBSCRIBE_FILTER_NONE; break;
+        r.present = false; r.type = MOQ_SUBSCRIBE_FILTER_NONE; break;
     case MOQ_D22_FILTER_NEXT_OBJECT:
-        *type = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT; break;
+        r.type = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT; break;
     case MOQ_D22_FILTER_RELATIVE:
-        *type = MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL;
-        *sg = f->start_group;
+        r.type = MOQ_SUBSCRIBE_FILTER_RELATIVE_GROUP_INTERNAL;
+        r.start_group = f->start_group;
         break;
     case MOQ_D22_FILTER_ABSOLUTE:
-        *type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
-        *sg = f->start_group; *so = f->start_object; break;
+        r.type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        r.start_group = f->start_group; r.start_object = f->start_object; break;
     case MOQ_D22_FILTER_GROUP_END:
-        *type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
-        *sg = f->start_group; *so = f->start_object;
-        *eg = f->start_group + f->end_group_delta; break;
+        r.type = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_RANGE;
+        r.start_group = f->start_group; r.start_object = f->start_object;
+        r.end_group = f->start_group + f->end_group_delta; break;
     case MOQ_D22_FILTER_RANGE:
     default:
-        *type = MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL;
-        *sg = f->start_group; *so = f->start_object;
-        *eg = f->start_group + f->end_group_delta; *eo = f->end_object; break;
+        r.type = MOQ_SUBSCRIBE_FILTER_OBJECT_END_INTERNAL;
+        r.start_group = f->start_group; r.start_object = f->start_object;
+        r.end_group = f->start_group + f->end_group_delta;
+        r.end_object = f->end_object; break;
     }
+    return r;
 }
 
 /* The FILL_PARAMETERS value (Section 9.20.15): a Number of Parameters and
@@ -502,10 +512,10 @@ static moq_result_t d22_scan_fill(moq_bytes_t body, moq_fill_input_t *out)
             out->has_group_order = true;
             out->group_order = (uint32_t)pv.value.integer; break;
         case D22_PARAM_LOCATION_FILTER: {
-            bool present;
-            d22_filter_to_record(&pv.value.filter, &present, &out->filter_type,
-                                 &out->start_group, &out->start_object,
-                                 &out->end_group, &out->end_object);
+            const d22_filter_record_t fr = d22_filter_record(&pv.value.filter);
+            out->filter_type = fr.type;
+            out->start_group = fr.start_group; out->start_object = fr.start_object;
+            out->end_group = fr.end_group; out->end_object = fr.end_object;
             /* An explicit empty filter selects the whole track. */
             out->has_location = true;
             break;
@@ -578,11 +588,14 @@ static moq_result_t d22_rq_subscribe(const uint8_t *p, size_t n,
     /* §9.20.21: 0 asks for empty Track Properties in the answer; 1 is the
      * default. */
     d->omit_track_properties = v.has_include_properties && !v.include_properties;
-    if (v.has_filter)
-        d22_filter_to_record(&v.filter, &d->has_filter, &d->filter_type,
-                             &d->start_group, &d->start_object, &d->end_group, &d->end_object);
-    else
+    if (v.has_filter) {
+        const d22_filter_record_t fr = d22_filter_record(&v.filter);
+        d->has_filter = fr.present; d->filter_type = fr.type;
+        d->start_group = fr.start_group; d->start_object = fr.start_object;
+        d->end_group = fr.end_group; d->end_object = fr.end_object;
+    } else {
         d->filter_type = MOQ_SUBSCRIBE_FILTER_NONE;
+    }
     /* Initial admission distinguishes omitted and explicitly selected NONE. */
     d->has_filter = v.has_filter;
     d->has_rendezvous_timeout = v.has_rendezvous_timeout;
@@ -638,10 +651,12 @@ static moq_result_t d22_rq_publish(const uint8_t *p, size_t n,
     d->subscriber_priority = v.priority;
     d->has_group_order = v.has_group_order;
     d->group_order = v.group_order;
-    if (v.has_filter)
-        d22_filter_to_record(&v.filter, &d->has_filter, &d->filter_type,
-                             &d->filter_start_group, &d->filter_start_object,
-                             &d->filter_end_group, &d->filter_end_object);
+    if (v.has_filter) {
+        const d22_filter_record_t fr = d22_filter_record(&v.filter);
+        d->has_filter = fr.present; d->filter_type = fr.type;
+        d->filter_start_group = fr.start_group; d->filter_start_object = fr.start_object;
+        d->filter_end_group = fr.end_group; d->filter_end_object = fr.end_object;
+    }
     d->initial.struct_size = sizeof(d->initial);
     d->initial.subscriber_priority = v.has_priority ? v.priority : 128;
     d->initial.group_order = v.has_group_order ? v.group_order : MOQ_GROUP_ORDER_DEFAULT;
@@ -650,8 +665,10 @@ static moq_result_t d22_rq_publish(const uint8_t *p, size_t n,
     if (v.has_filter) {
         /* Presence survives explicit NONE, unlike the legacy raw-filter flag. */
         d->initial.flags |= MOQ_PUBLISH_INITIAL_HAS_LOCATION;
-        moq_location_filter_from_core(d->filter_type, d->filter_start_group,
-            d->filter_start_object, d->filter_end_group, d->filter_end_object,
+        moq_location_filter_from_core(&(moq_core_filter_t){
+            .type = d->filter_type,
+            .start_group = d->filter_start_group, .start_object = d->filter_start_object,
+            .end_group = d->filter_end_group, .end_object = d->filter_end_object },
             &d->initial.location, sizeof(d->initial.location));
     }
     if (v.has_object_dt) {
@@ -721,10 +738,12 @@ static moq_result_t d22_rq_fetch(const uint8_t *p, size_t n,
     /* The filter as sent, and the request's FILL_TIMEOUT, for the event's
      * options (the relay-facing details of the request). */
     fd->has_options = true;
-    if (v.has_filter && v.filter.type != MOQ_D22_FILTER_NONE)
-        d22_filter_to_record(&v.filter, &fd->has_location, &fd->location_type,
-                             &fd->location_start_group, &fd->location_start_object,
-                             &fd->location_end_group, &fd->location_end_object);
+    if (v.has_filter && v.filter.type != MOQ_D22_FILTER_NONE) {
+        const d22_filter_record_t fr = d22_filter_record(&v.filter);
+        fd->has_location = fr.present; fd->location_type = fr.type;
+        fd->location_start_group = fr.start_group; fd->location_start_object = fr.start_object;
+        fd->location_end_group = fr.end_group; fd->location_end_object = fr.end_object;
+    }
     fd->has_fill_timeout = v.has_fill_timeout;
     fd->fill_timeout_ms = v.fill_timeout_ms;
     fd->subscriber_priority = v.has_priority ? v.priority : 128;
@@ -836,8 +855,10 @@ static moq_result_t d22_rq_request_update(const uint8_t *p, size_t n,
     d->has_subscriber_priority = v.has_priority;
     d->subscriber_priority = v.priority;
     if (v.has_filter) {
-        d22_filter_to_record(&v.filter, &d->has_filter, &d->filter_type,
-                             &d->start_group, &d->start_object, &d->end_group, &d->end_object);
+        const d22_filter_record_t fr = d22_filter_record(&v.filter);
+        d->has_filter = fr.present; d->filter_type = fr.type;
+        d->start_group = fr.start_group; d->start_object = fr.start_object;
+        d->end_group = fr.end_group; d->end_object = fr.end_object;
         /* A selected NONE removes the restriction of either subscription
          * establishment path; omission alone means unchanged. */
         if ((target_family == MOQ_REQUEST_FAMILY_SUBSCRIBE ||
@@ -931,10 +952,12 @@ static moq_result_t d22_rq_state_notify(const uint8_t *p, size_t n,
     out->has_largest = v.has_largest;
     out->largest_group = v.largest_group;
     out->largest_object = v.largest_object;
-    if (v.has_filter)
-        d22_filter_to_record(&v.filter, &out->has_filter, &out->filter_type,
-                             &out->start_group, &out->start_object,
-                             &out->end_group, &out->end_object);
+    if (v.has_filter) {
+        const d22_filter_record_t fr = d22_filter_record(&v.filter);
+        out->has_filter = fr.present; out->filter_type = fr.type;
+        out->start_group = fr.start_group; out->start_object = fr.start_object;
+        out->end_group = fr.end_group; out->end_object = fr.end_object;
+    }
     out->has_filter = v.has_filter;
     return MOQ_OK;
 }

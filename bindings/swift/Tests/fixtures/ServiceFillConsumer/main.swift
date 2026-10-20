@@ -30,6 +30,10 @@ func fillConsumer(_ receiver: MediaReceiver, _ track: MediaTrack) async throws {
         let result: Int32? = localResult
         _ = parent === track
         _ = result
+    case .updateLocalFailure(let parent, let localResult):
+        let result: Int32? = localResult
+        _ = parent === track
+        _ = result
     case .deliveryLocalFailure(let parent, let localResult, let origin, let initiatingID):
         let result: Int32? = localResult
         let deliveryOrigin: UInt32? = origin

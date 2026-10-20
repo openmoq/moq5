@@ -1834,7 +1834,7 @@ relay_bind_test_jf_origin_drain(rig_t *r, jf_origin_t *o)
                 moq_accept_subscribe_cfg_t ac;
                 moq_accept_subscribe_cfg_init(&ac);
                 ac.has_largest = true;
-                ac.largest_group = 0;
+                ac.largest_group = is_cat ? o->largest_group : 0;
                 ac.largest_object = is_cat ? o->largest_object : 0;
                 R_CHECK(r, moq_session_accept_subscribe(o->cn->peer, sq->sub, &ac,
                                                         r->now) == MOQ_OK);
@@ -2103,8 +2103,8 @@ relay_bind_test_jf_join(jf_t *j, jf_down_t *d)
 bool relay_bind_test_jf_setup_usub_key_oom = false;
 
 bool
-relay_bind_test_jf_setup_ex(jf_t *j, moq_version_t version, int n_down, bool live_control,
-                            uint64_t largest_object, bool origin_last)
+relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool live_control,
+                            uint64_t largest_group, uint64_t largest_object, bool origin_last)
 {
     memset(j, 0, sizeof(*j));
     relay_bind_test_ca_init(&j->a);
@@ -2120,6 +2120,7 @@ relay_bind_test_jf_setup_ex(jf_t *j, moq_version_t version, int n_down, bool liv
     if (!origin_last) {
         j->o.cn = relay_bind_test_rig_connect(&j->rig, version);
     }
+    j->o.largest_group = largest_group;
     j->o.largest_object = largest_object;
     j->n_down = n_down;
     for (int i = 0; i < n_down; i++) {
@@ -2175,6 +2176,14 @@ relay_bind_test_jf_setup_ex(jf_t *j, moq_version_t version, int n_down, bool liv
     R_CHECK(&j->rig, j->o.cat_seen == (n_down > 0));
     R_CHECK(&j->rig, j->o.live_seen == live_control);
     return j->rig.failures == 0;
+}
+
+bool
+relay_bind_test_jf_setup_ex(jf_t *j, moq_version_t version, int n_down, bool live_control,
+                            uint64_t largest_object, bool origin_last)
+{
+    return relay_bind_test_jf_setup_at(j, version, n_down, live_control, 0,
+                                      largest_object, origin_last);
 }
 
 bool

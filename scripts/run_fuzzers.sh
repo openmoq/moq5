@@ -82,6 +82,7 @@ TARGETS=(
     fuzz_kvp_decode
     fuzz_control_d16
     fuzz_control_d18
+    fuzz_control_d22
     fuzz_session_control
     fuzz_session_data
     fuzz_session_d18
@@ -94,6 +95,7 @@ TARGETS=(
 seed_for() {
     case "$1" in
         fuzz_control_d18)     echo "control_d18";;
+        fuzz_control_d22)     echo "control_d22";;
         fuzz_session_control) echo "session_control";;
         fuzz_session_data)    echo "session_data";;
         fuzz_session_d18)     echo "session_d18";;
@@ -214,6 +216,22 @@ STUBEOF
             fi
         done
     done
+
+    # Pin the D22 regression independently of TARGETS and seed_for: walking
+    # those tables alone cannot detect that the nightly omitted the target.
+    t=fuzz_control_d22
+    n=0
+    [ -f "$tmp/count_$t" ] && n="$(wc -l < "$tmp/count_$t" | tr -d ' ')"
+    if [ "$n" != 1 ]; then
+        echo "FAIL: nightly must run $t exactly once (saw $n)"
+        fail=1
+    fi
+    a2=""
+    [ -f "$tmp/argv_$t" ] && a2="$(sed -n '2p' "$tmp/argv_$t")"
+    if [ "$a2" != "$CORPUS_ROOT/control_d22" ]; then
+        echo "FAIL: nightly must seed $t from control_d22"
+        fail=1
+    fi
 
     if [ "$fail" -ne 0 ]; then
         echo "SELF-TEST FAILED"

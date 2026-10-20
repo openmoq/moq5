@@ -7,15 +7,19 @@ registries.
 
 The installed command is `moq5-relay`.
 
-By default the native listener offers exactly draft 18 and the WebTransport
-listener offers drafts 18 and 16 in that order. Draft-22
-requires an explicit `listener.versions` / `webtransport.versions` list
-containing 22; put 22 first to prefer it. On draft-22 connections the relay
-answers subscriber updates itself, serves fills from its retained log and ends each at its deadline with
-Timed-Out markers, using the relay library's default fill wait (1 s when a
-fill names no FILL_TIMEOUT, at most 10 s when it does); the command has no
-configuration key for these. All six semantic Location Filter forms are
-supported, including Absolute Range with an inclusive object-level end.
+By default both the native and WebTransport listeners offer every supported
+draft, newest first: `[22, 18, 16]`. An explicit `listener.versions` or
+`webtransport.versions` list chooses the offered set and preference order.
+On draft-22 connections the relay answers subscriber updates itself. Fills
+serve retained Objects and retrieve missing ranges upstream with FETCH,
+including ranges from before the relay subscribed, in the fill's Group Order.
+Unavailable ranges are marked Timed-Out when the fill's deadline expires;
+a successful response ends with FIN. FILL_TIMEOUT is hop-local: upstream
+FETCHes omit it, and the relay enforces the original deadline. The default
+fill wait is 1 s when a fill names no FILL_TIMEOUT, at most 10 s when it does;
+the command has no configuration key for these. All six semantic Location
+Filter forms are supported, including Absolute Range with an inclusive
+object-level end.
 Range Filters are a separate feature and are not supported. Behaviour and limits:
 [relay/docs/architecture.md](../../relay/docs/architecture.md#draft-22-behaviour).
 

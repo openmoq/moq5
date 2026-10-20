@@ -1,5 +1,6 @@
 #include <assert.h>
 #include "session_internal.h"
+#include "../bridge/transport_bridge_internal.h"
 #include "../internal/validate.h"
 #include "session_event_admission.h"
 
@@ -1463,6 +1464,28 @@ moq_event_scratch_verdict_t event_scratch_classify_bytes(
 }
 
 /* -- Send helper --------------------------------------------------- */
+
+moq_result_t send_probe_begin(moq_session_t *s, moq_buf_writer_t *probe)
+{
+    /* Same bounded envelope allowance as SETUP preflight: a 16-bit payload
+     * plus room for either profile's type and length framing. */
+    size_t cap = (size_t)UINT16_MAX + 16u;
+    if (cap > s->send_cap) cap = s->send_cap;
+    uint8_t *bytes = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+    if (!bytes) return MOQ_ERR_NOMEM;
+    moq_buf_writer_init(probe, bytes, cap);
+    return MOQ_OK;
+}
+
+moq_result_t send_probe_end(moq_session_t *s, moq_buf_writer_t *probe,
+                            moq_result_t encoded)
+{
+    session_wipe(probe->data, probe->cap);
+    s->alloc.free(probe->data, probe->cap, s->alloc.ctx);
+    /* Only a successful exact encoding proves drain-retry can help. This is
+     * a local capacity classification, not a protocol-defined error code. */
+    return encoded == MOQ_OK ? MOQ_ERR_WOULD_BLOCK : encoded;
+}
 
 static moq_result_t commit_send_control_tail(moq_session_t *s, size_t len)
 {
@@ -3784,7 +3807,10 @@ moq_result_t moq_session_on_bidi_stream_stop(moq_session_t *s,
     return handle_bidi_stream_stop(s, stream_ref, error_code);
 }
 
-bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t ref)
+/* Ownership other than a locally-ended request's drain identity. The public
+ * query includes that identity; local retirement must check without it. */
+static bool session_has_live_transport_owner(const moq_session_t *s,
+                                              moq_stream_ref_t ref)
 {
     if (!s) return false;
     if (moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v) >= 0)
@@ -3811,12 +3837,59 @@ bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t r
      * its retry rather than fatalize it. */
     if (noslot_carrier_find(s, ref) >= 0)
         return true;
-    /* A locally-terminated request bidi still in the drain ring: the owner is
-     * gone but the stream stays live until the peer's FIN/RESET, which the
-     * drain ring absorbs. */
-    if (drain_ref_contains(s, ref))
-        return true;
     return false;
+}
+
+bool moq_session_has_transport_stream(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    /* A locally-terminated request bidi keeps its drain identity until a
+     * genuine terminal ends what it must absorb. Preserve the public query. */
+    return s && (session_has_live_transport_owner(s, ref) ||
+                 drain_ref_contains(s, ref));
+}
+
+static bool session_has_queued_bidi_action(const moq_session_t *s,
+                                           moq_stream_ref_t ref)
+{
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        moq_stream_ref_t r = { 0 };
+        switch (a->kind) {
+        case MOQ_ACTION_OPEN_BIDI_STREAM:  r = a->u.open_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_SEND_BIDI_STREAM:  r = a->u.send_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_CLOSE_BIDI_STREAM: r = a->u.close_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_RESET_BIDI_STREAM: r = a->u.reset_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_STOP_BIDI_STREAM:  r = a->u.stop_bidi_stream.stream_ref; break;
+        case MOQ_ACTION_ABORT_BIDI_STREAM: r = a->u.abort_bidi_stream.stream_ref; break;
+        default: continue;
+        }
+        if (r._v == ref._v) return true;
+    }
+    return false;
+}
+
+bool bridge_session_bidi_owner_ended(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    return !moq_session_has_transport_stream(s, ref) &&
+           !session_has_queued_bidi_action(s, ref);
+}
+
+moq_result_t bridge_session_on_bidi_retired(moq_session_t *s,
+                                            moq_stream_ref_t ref,
+                                            uint64_t now_us)
+{
+    if (!s || ref._v == 0) return MOQ_ERR_INVAL;
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    /* A cancelled request identity can predate SETUP completion. Only the
+     * terminal session state forbids settling it; live owners still guard it. */
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+    if (session_has_live_transport_owner(s, ref) ||
+        session_has_queued_bidi_action(s, ref))
+        return MOQ_ERR_WRONG_STATE;
+    /* The bridge proved local abort completion plus a genuine terminal.
+     * Release only its drain identity: no peer lifetime fact or event. */
+    return drain_ref_remove(s, ref) ? MOQ_OK : MOQ_ERR_STALE_HANDLE;
 }
 
 bool moq_session_can_admit_data_stream(const moq_session_t *s)
@@ -3982,12 +4055,19 @@ static size_t event_min_poll_size(uint32_t kind)
     }
 }
 
+/* An admission filter for the poll: `admit` decides each head event, and
+ * `discarded` reports that one was dropped. */
+typedef struct session_poll_admission {
+    session_event_admission_t (*admit)(void *, const moq_event_t *);
+    void *ctx;
+    bool discarded;
+} session_poll_admission_t;
+
 static moq_result_t session_poll_events_impl(moq_session_t *s,
                                          void *out, size_t cap,
                                          size_t element_size,
                                          size_t *out_count,
-    session_event_admission_t (*admit)(void *, const moq_event_t *),
-    void *admit_ctx, bool *discarded)
+                                         session_poll_admission_t *adm)
 {
     if (out_count) *out_count = 0;
     if (!s || !out || !out_count) return MOQ_ERR_INVAL;
@@ -3998,7 +4078,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
 
     const size_t lib_size = sizeof(moq_event_t);
     const size_t copy = lib_size < element_size ? lib_size : element_size;
-    if (!admit || s->event_head == s->event_tail) {
+    if (!adm || s->event_head == s->event_tail) {
         ts_retry_pending(s);
         ann_retry_pending(s);
         ns_sub_retry_pending(s);
@@ -4013,8 +4093,8 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
         if (element_size < event_min_poll_size(head->kind))
             break;
 
-        session_event_admission_t decision = admit
-            ? admit(admit_ctx, head) : SESSION_EVENT_TAKE;
+        session_event_admission_t decision = adm
+            ? adm->admit(adm->ctx, head) : SESSION_EVENT_TAKE;
         if (decision == SESSION_EVENT_LEAVE) {
             *out_count = n;
             return MOQ_ERR_WOULD_BLOCK;
@@ -4094,7 +4174,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
             event_location_retire(s, head->u.publish_state.location);
         if (decision == SESSION_EVENT_DISCARD) {
             moq_event_cleanup((moq_event_t *)out);
-            *discarded = true;
+            adm->discarded = true;
         }
         s->event_head++;
         /* Advance the progress token on event TRANSFER too (not only enqueue):
@@ -4150,8 +4230,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
 moq_result_t moq_session_poll_events_ex(moq_session_t *s,
     void *out, size_t cap, size_t element_size, size_t *out_count)
 {
-    return session_poll_events_impl(s, out, cap, element_size, out_count,
-                                    NULL, NULL, NULL);
+    return session_poll_events_impl(s, out, cap, element_size, out_count, NULL);
 }
 
 moq_result_t session_poll_event_admitted(moq_session_t *s, moq_event_t *out,
@@ -4159,11 +4238,10 @@ moq_result_t session_poll_event_admitted(moq_session_t *s, moq_event_t *out,
 {
     if (!admit) return MOQ_ERR_INVAL;
     size_t count = 0;
-    bool discarded = false;
-    moq_result_t rc = session_poll_events_impl(s, out, 1, sizeof(*out), &count,
-                                               admit, ctx, &discarded);
+    session_poll_admission_t adm = { .admit = admit, .ctx = ctx, .discarded = false };
+    moq_result_t rc = session_poll_events_impl(s, out, 1, sizeof(*out), &count, &adm);
     if (rc != MOQ_OK) return rc;
-    if (discarded) return MOQ_ERR_BUFFER;
+    if (adm.discarded) return MOQ_ERR_BUFFER;
     return count ? MOQ_OK : MOQ_DONE;
 }
 

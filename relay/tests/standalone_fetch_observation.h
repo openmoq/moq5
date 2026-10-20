@@ -132,7 +132,7 @@ rfs_request_exact(const rfs_request_t *r, uint64_t g, uint64_t object,
 {
     return r->fetch._opaque != 0 && r->sg == g && r->so == object &&
         r->eg == g && r->eo == object + 1 && r->order == order &&
-        r->priority == 61 && r->timeout && r->timeout_ms <= 100;
+        r->priority == 61 && !r->timeout && r->timeout_ms == 0;
 }
 
 static inline void

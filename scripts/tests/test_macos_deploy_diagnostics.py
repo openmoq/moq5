@@ -17,6 +17,46 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_diagnostic_markers_not_test_names(self):
+        lane = str(SCRIPTS / "check_macos_deploy_lane.sh")
+        clean = (
+            '\u25c7 Test "Reasons and error domains are independent, preserving future values and zero" started.\n',
+            '\u2714 Test "Reasons and error domains are independent, preserving future values and zero" passed after 0.205 seconds.\n',
+            "All tests passed; error handling exercised.\n",
+        )
+        diagnostics = (
+            "file.swift:12:3: error: injected\n",
+            "file.c:12:3: fatal error: injected\n",
+            "file.c:12:3: warning: injected\n",
+            "ld: warning: injected\n",
+            "WARNING injected\n",
+            "CMake Error at CMakeLists.txt:12 (message):\n  injected\n",
+            "CMake Error: injected\n",
+            "CMake Warning (dev) at CMakeLists.txt:12 (message):\n  injected\n",
+            "error: injected\n",
+            "file.c(12): error C2065: injected\n",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "build.log"
+            for line, expected in [(s, 0) for s in clean] + [(s, 1) for s in diagnostics]:
+                with self.subTest(line=line):
+                    path.write_text(line)
+                    result = subprocess.run(
+                        ["bash", lane, "diagnostic-logs", str(path)],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected:
+                        self.assertIn("diagnostic match", result.stderr)
+                    else:
+                        self.assertEqual(result.stderr, "")
+            missing = subprocess.run(
+                ["bash", lane, "diagnostic-logs", str(path.with_name("absent.log"))],
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("diagnostic scanner status 2", missing.stderr)
+
     def test_workflow_pipeline_status(self):
         workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
         job = workflow.split("\n  swift-service-binding:\n", 1)[1].split("\n  swift-service-ios:\n", 1)[0]
@@ -101,7 +141,15 @@ class DiagnosticTests(unittest.TestCase):
             source = (SCRIPTS / name).read_text()
             match = re.search(r"^run_logged\(\) \{\n.*?^\}", source, re.M | re.S)
             self.assertIsNotNone(match)
-            for command, expected, command_status in rows:
+            script_rows = rows
+            if name == "check_macos_deploy_lane.sh":
+                script_rows += (
+                    ("printf 'All tests passed; error handling exercised.\\n'", 0, 0),
+                    ("printf 'error: injected\\n' >&2", 1, 0),
+                    ("printf 'CMake Error at CMakeLists.txt:12 (message):\\n'", 1, 0),
+                    ("printf 'file.c(12): error C2065: injected\\n'", 1, 0),
+                )
+            for command, expected, command_status in script_rows:
                 with self.subTest(script=name, command=command), tempfile.TemporaryDirectory() as tmp:
                     base = Path(tmp) / "probe"
                     arg = "probe" if name == "build_macos_openssl.sh" else str(base)

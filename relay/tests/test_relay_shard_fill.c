@@ -654,8 +654,8 @@ sf_subscribe_cfg(moq_subscribe_cfg_t *scfg)
 /* Subscribe Next Object with a fill over {0,0}..Largest carrying the given
  * FILL_TIMEOUT (or none). */
 static void
-sf_subscribe_fill(sfrig_t *r, sfconn_t *cn, bool has_timeout,
-                  uint64_t timeout_ms)
+sf_subscribe_fill_ordered(sfrig_t *r, sfconn_t *cn, bool has_timeout,
+                          uint64_t timeout_ms, bool descending)
 {
     moq_location_filter_cfg_t loc, floc;
     moq_location_filter_cfg_init(&loc);
@@ -671,8 +671,17 @@ sf_subscribe_fill(sfrig_t *r, sfconn_t *cn, bool has_timeout,
     sf_subscribe_cfg(&scfg);
     scfg.location = &loc;
     scfg.fill = &fill;
+    scfg.group_order = descending ? MOQ_GROUP_ORDER_DESCENDING
+                                  : MOQ_GROUP_ORDER_ASCENDING;
     moq_subscription_t h;
     SF_CHECK(r, moq_session_subscribe(cn->peer, &scfg, r->now, &h) == MOQ_OK);
+}
+
+static void
+sf_subscribe_fill(sfrig_t *r, sfconn_t *cn, bool has_timeout,
+                  uint64_t timeout_ms)
+{
+    sf_subscribe_fill_ordered(r, cn, has_timeout, timeout_ms, false);
 }
 
 /* The origin layout every case starts from: the publisher and a priming
@@ -1322,7 +1331,7 @@ cross_shard_fill_matches_owner(bool earned, bool live_first, bool has_timeout,
  * from its own log: both shards answer {0,0}, {0,1} Timed-Out at the
  * deadline, {0,2}, {1,0}, {1,1}, FIN. */
 static int
-cross_shard_fill_split(const char *label)
+cross_shard_fill_split(bool descending, const char *label)
 {
     ca_t a;
     ca_init(&a);
@@ -1361,8 +1370,8 @@ cross_shard_fill_split(const char *label)
     sfrig_pump(&r, 4);
     const uint64_t wait_us = 100000u;
     uint64_t t0 = r.now;
-    sf_subscribe_fill(&r, of, true, wait_us / 1000u);
-    sf_subscribe_fill(&r, rf, true, wait_us / 1000u);
+    sf_subscribe_fill_ordered(&r, of, true, wait_us / 1000u, descending);
+    sf_subscribe_fill_ordered(&r, rf, true, wait_us / 1000u, descending);
     sfps_t ops, rps;
     memset(&ops, 0, sizeof(ops));
     memset(&rps, 0, sizeof(rps));
@@ -1386,8 +1395,18 @@ cross_shard_fill_split(const char *label)
         { SF_IT_OBJ, 1, 1, 0 },
         { SF_IT_TERM, 0, 0, MOQ_FILL_COMPLETE },
     };
-    sf_expect_items(&r, &ops, want, 7, "owner shard");
-    sf_expect_items(&r, &rps, want, 7, "other shard");
+    static const sf_item_t want_descending[] = {
+        { SF_IT_OBJ, 1, 0, 0 },
+        { SF_IT_OBJ, 1, 1, 0 },
+        { SF_IT_OBJ, 0, 0, 0 },
+        { SF_IT_GAP, 0, 1, MOQ_FETCH_RANGE_TIMED_OUT },
+        { SF_IT_OBJ, 0, 2, 0 },
+        { SF_IT_GAP, 0, UINT64_MAX, MOQ_FETCH_RANGE_TIMED_OUT },
+        { SF_IT_TERM, 0, 0, MOQ_FILL_COMPLETE },
+    };
+    const sf_item_t *expected = descending ? want_descending : want;
+    sf_expect_items(&r, &ops, expected, 7, "owner shard");
+    sf_expect_items(&r, &rps, expected, 7, "other shard");
     sf_expect_same_items(&r, &ops, &rps);
     SF_CHECK(&r, rps.largest_group == 1 && rps.largest_object == 1);
     SF_CHECK(&r, rps.fill_term_at >= t0 + wait_us &&
@@ -3392,6 +3411,9 @@ cleanup:
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--descending-fill") == 0) {
+        return cross_shard_fill_split(true, "cross_shard_fill_split_descending") != 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--retained-empty") == 0) {
         return cross_shard_retained_origin(false, "cross_shard_retained_empty") ? 1 : 0;
     }
@@ -3445,7 +3467,8 @@ main(int argc, char **argv)
     failures += cross_shard_fill_in_progress(true, "cross_shard_fill_in_progress");
     failures += cross_shard_fill_in_progress(false,
                                              "cross_shard_fill_in_progress_deadline");
-    failures += cross_shard_fill_split("cross_shard_fill_split");
+    failures += cross_shard_fill_split(false, "cross_shard_fill_split");
+    failures += cross_shard_fill_split(true, "cross_shard_fill_split_descending");
     failures += cross_shard_answer_after_deadline(
         "cross_shard_answer_after_deadline");
     failures += cross_shard_full_channel_defers(

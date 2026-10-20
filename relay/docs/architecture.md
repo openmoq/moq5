@@ -277,8 +277,8 @@ MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace
   on or off (K=1 builds no manager, so admission storage is zero).
 - **Multi-version listener: one endpoint can serve several drafts.**
   `listener.versions` is an ordered, non-empty set of known drafts (22, 18,
-  16), most preferred first. The default is `[18, 22, 16]`: every draft the
-  core reports wire-ready, draft-18 first; `[22, 18, 16]` prefers draft-22.
+  16), most preferred first. The default is `[22, 18, 16]`: every draft the
+  core reports wire-ready, newest first.
   One listener offers `moqt-22`, `moqt-18` and `moqt-16`, and ALPN selects
   each connection's draft.
   A single entry keeps the exact-version representation for byte-stable
@@ -369,13 +369,17 @@ sessions of different drafts. What is specific to draft-22 sessions:
   them asks for a fill). On draft-22 a subscription stays established after
   the Largest Object passes its filter's end, since draft-22 has no
   SUBSCRIPTION_ENDED status.
-- **Fills.** A fill is served from the retained log on a fetch stream that
-  opens with its header at once, and every Location in its range is served
-  or marked (§3.2.2): a run upstream may still deliver is waited on until the
-  fill's deadline and then marked End of Timed-Out Range; a run with nothing
-  to wait on is marked End of Unknown Range while the wait budget lasts and
-  Timed-Out once it is spent; Locations past a known End of Group or End of
-  Track are left unmarked. The stream then ends with FIN. The wait is
+- **Fills.** A fill opens its fetch stream with the header at once. It serves
+  retained Objects and retrieves missing runs upstream with FETCH, through the
+  same bounded retrieval cursor used by standalone FETCH. This includes a
+  range advertised by the origin's Largest Object before the relay subscribed
+  upstream, even when the relay's log is empty. Retrieved Objects go straight
+  to the fill response; they are not ingested into the live log. Coverage uses
+  Objects, explicit gaps and implicit non-existence (§3.2.2); unavailable runs are marked Timed-Out
+  when the original deadline expires. Locations past a known End of Group or
+  End of Track are left unmarked. An upstream retrieval failure resets only
+  the fill with UNKNOWN_OBJECT_STATUS; a local failure uses INTERNAL_ERROR.
+  A successful response ends with FIN. The wait is
   min(FILL_TIMEOUT, maximum), or the default when the fill carries none; a
   FILL_TIMEOUT of 0 reports everything unavailable as Timed-Out at once
   (§9.20.5). The defaults are 1000 ms and a
@@ -386,6 +390,14 @@ sessions of different drafts. What is specific to draft-22 sessions:
   `moqr_shards_cfg_t`. On a shard that does not own the track, the part of
   the range before the shard's own feed began is retrieved from the owner
   (above, "A fill is answered the same on every shard").
+  Fills inherit or override Group Order (§3.4): descending fills visit newer
+  groups first, with Objects ascending inside each group, including when an
+  older prefix comes from another shard and a newer suffix is held locally.
+  FILL_TIMEOUT is hop-local (§9.20). New upstream FETCHes omit it; the relay
+  enforces the original absolute deadline itself and cancels unfinished
+  retrieval. This is the same policy for every origin, not a retry after a
+  refusal. A zero budget sends no upstream FETCH. A live-log route dump alone
+  establishes neither successful nor failed fill delivery.
 - **Fill deadlines wake the runtime.** `moqr_bind_next_deadline_us` reports
   the nearest fill deadline; the `moq5-relay` command maps each lane to its
   own shard's deadline through the MsQuic and WebTransport facades'
@@ -400,10 +412,10 @@ sessions of different drafts. What is specific to draft-22 sessions:
   the cache, and each run the cache does not hold is retrieved with one
   upstream FETCH for exactly that run, through the same retrieval cursor and
   bounded collector pool fills use. FILL_TIMEOUT is one total budget for all
-  of a request's upstream FETCHes (§9.20.5): each upstream FETCH carries the
-  remaining budget, and a run still unavailable at the deadline is marked End
-  of Timed-Out Range while the response continues; a FILL_TIMEOUT of 0 asks
-  nothing upstream. A run with no connection to retrieve it from is marked
+  of a request's upstream FETCHes (§9.20.5), enforced locally rather than
+  forwarded as an upstream parameter. A run still unavailable at the deadline
+  is marked End of Timed-Out Range while the response continues; a FILL_TIMEOUT
+  of 0 asks nothing upstream. A run with no connection to retrieve it from is marked
   End of Unknown Range at once (Timed-Out once the budget is spent), and an
   Object still arriving is waited for up to the deadline. Retrieved Objects
   are not ingested into the live log. An upstream FETCH that fails resets the
@@ -504,9 +516,9 @@ synchronous ALLOW and equally for an async ALLOW that resolves a parked DEFER,
 so an async-approved subscription is revalidatable, not permanently authorized.
 On each `tick`, a due grant re-invokes the hook off the control-plane clock
 (never on the object path): a renewed ALLOW reschedules, an ALLOW without a
-lease clears the grant, and a DENY/DEFER revokes — a subscribe by a wire
-SUBSCRIBE_DONE, an announce by withdrawing the namespace and cancelling it
-toward the publisher. The announce cancel is backpressure-safe: the revoked
+lease clears the grant, and a DENY/DEFER revokes — a subscribe by its profile's
+PUBLISH_DONE terminal, an announce by withdrawing the namespace and cancelling
+it toward the publisher. The announce cancel is backpressure-safe: the revoked
 grant is the durable record (peeked, not drained) and the cancel is retried on
 the next pump until it lands, so a session-queue WOULD_BLOCK never drops it. The
 denial code is preserved (the verifier's custom code, else UNAUTHORIZED), except

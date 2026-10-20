@@ -385,11 +385,13 @@ void bridge_deactivate_stream(moq_transport_bridge_t *b,
     memset(e, 0, sizeof(*e));
 }
 
-void bridge_retire_aborting(moq_transport_bridge_t *b, uint64_t transport_id)
+static void bridge_note_aborting_terminal(moq_transport_bridge_t *b,
+                                           bridge_stream_entry_t *e)
 {
-    bridge_stream_entry_t *e = bridge_find_by_id(b, transport_id);
-    if (e && e->aborting)
-        bridge_deactivate_stream(b, e);
+    if (e && e->active && e->kind == BRIDGE_STREAM_BIDI && e->aborting) {
+        e->transport_final = true;
+        b->local_retire_due = true;
+    }
 }
 
 moq_stream_ref_t bridge_assign_inbound_ref(
@@ -431,6 +433,9 @@ void bridge_retire_or_tombstone(moq_transport_bridge_t *b, moq_stream_ref_t ref)
 {
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     if (!e) return;
+    /* An abort's drain identity and mapping end together in service, never
+     * while an older pending close/reset still borrows this entry. */
+    if (e->aborting) return;
 
     if (e->kind == BRIDGE_STREAM_UNI) {
         bridge_deactivate_stream(b, e);
@@ -470,6 +475,65 @@ void bridge_retire_or_tombstone(moq_transport_bridge_t *b, moq_stream_ref_t ref)
         }
         b->tombstones[b->tombstone_count++] = tid;
     }
+}
+
+/* A pending item that resets (or aborts) this stream, named by its
+ * transport id: the reset is owed whatever happens to the mapping. */
+static bool bridge_pending_resets_stream(const moq_transport_bridge_t *b,
+                                         const bridge_stream_entry_t *e)
+{
+    for (uint32_t i = 0; i < b->pending_count; i++) {
+        const bridge_pending_item_t *p = &b->pending[i];
+        if ((p->kind == PENDING_RESET_STREAM || p->kind == PENDING_ABORT_STREAM) &&
+            p->has_stream_id && p->stream_id == e->transport_id)
+            return true;
+    }
+    return false;
+}
+
+/* Any pending item for this stream, by ref or transport id: an existing
+ * output or close obligation that keeps its own order. */
+static bool bridge_pending_touches_stream(const moq_transport_bridge_t *b,
+                                          const bridge_stream_entry_t *e)
+{
+    for (uint32_t i = 0; i < b->pending_count; i++) {
+        const bridge_pending_item_t *p = &b->pending[i];
+        if ((p->stream_ref._v != 0 && p->stream_ref._v == e->ref._v) ||
+            (p->has_stream_id && p->stream_id == e->transport_id) ||
+            (p->canon_ref != 0 && p->canon_ref == e->ref._v) ||
+            (p->canon_have_sid && p->canon_sid == e->transport_id))
+            return true;
+    }
+    return false;
+}
+
+/* The session accepted the peer's RESET of this stream. A uni (receive-only
+ * here) is over. A bidi's RESET ends only the PEER's sending direction: our
+ * own send half is independent (RFC 9000 §3.5). If it is still open, the
+ * mapping stays for it: output or a close the session already queued keeps
+ * its order, and once the request has no owner left the service pass cancels
+ * the half (bridge_settle_bidi_cancel). Nothing more is read from the peer's
+ * direction, so its inbound retry state is dropped. */
+static void bridge_peer_reset_accepted(moq_transport_bridge_t *b,
+                                       bridge_stream_entry_t *e)
+{
+    if (e->kind != BRIDGE_STREAM_BIDI) {
+        bridge_deactivate_stream(b, e);
+        return;
+    }
+    e->peer_send_closed = true;
+    e->peer_reset_accepted = true;
+    e->pending_retry = false;
+    e->pending_fin = false;
+    e->fin_retained = false;
+    /* Our half's reset is already owed and retained by transport id: that
+     * obligation outlives the mapping, which retires now. */
+    if (!e->local_send_closed && bridge_pending_resets_stream(b, e)) {
+        bridge_deactivate_stream(b, e);
+        return;
+    }
+    bridge_retire_or_tombstone(b, e->ref);
+    if (e->active && !e->local_send_closed) b->bidi_cancel_due = true;
 }
 
 bool bridge_is_tombstoned(const moq_transport_bridge_t *b, uint64_t transport_id)
@@ -850,6 +914,12 @@ static moq_result_t bridge_stop_bidi_send_half(moq_transport_bridge_t *b,
                                                 uint64_t error_code)
 {
     if (e->peer_stop_received) return MOQ_OK;
+    /* We already cancelled this half after the request ended: that reset
+     * (owed or sent) answers the STOP too. */
+    if (e->local_cancel_queued) {
+        e->peer_stop_received = true;
+        return MOQ_OK;
+    }
 
     bridge_drop_pending_bidi_output(b, e);
     e->peer_stop_received = true;
@@ -2626,6 +2696,12 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
 
     uint64_t sid = e->transport_id;
     if (!is_bidi && e->fin_reset_pending) return MOQ_OK;
+    /* Our send half was already reset in answer to the peer's STOP_SENDING:
+     * one reset per half, never a second. */
+    if (is_bidi && (e->peer_stop_received || e->local_cancel_queued)) {
+        bridge_retire_or_tombstone(b, ref);
+        return MOQ_OK;
+    }
     const bool retained_fin = !is_bidi && e->awaiting_commit &&
                               e->subgroup_header_len != 0;
 
@@ -2693,6 +2769,130 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
     return MOQ_OK;
 }
 
+/* -- Local receive retirement ---------------------------------------- *
+ * A peer data stream the session stopped is released once the endpoint has
+ * accepted that STOP and the adapter reports the transport finished with the
+ * stream: after a local receive abort some transports never surface the
+ * peer's FIN or RESET, so without this the mapping and the session's stopped
+ * owner would wait forever. The release claims no FIN, no reset and no
+ * delivery. It is bounded by the stream map itself: two bits per entry. */
+
+/* A peer-origin unidirectional data stream: not control, not aborting. */
+static bool bridge_is_peer_data_receive(const bridge_stream_entry_t *e)
+{
+    return e->active && e->kind == BRIDGE_STREAM_UNI &&
+           e->origin == BRIDGE_ORIGIN_PEER &&
+           e->uni_disp != BRIDGE_UNI_DISP_CONTROL && !e->aborting;
+}
+
+/* The endpoint accepted the session's STOP_DATA for this stream. */
+static void bridge_note_data_stop_accepted(moq_transport_bridge_t *b,
+                                           bridge_stream_entry_t *e)
+{
+    if (!bridge_is_peer_data_receive(e)) return;
+    e->local_stop_accepted = true;
+    if (e->transport_final) b->local_retire_due = true;
+}
+
+/* Inbound obligations this bridge still owes the session for the stream: the
+ * real FIN or RESET (and any bytes before it) go first and settle the stream
+ * themselves; an admission-held stream was never seen by the session. */
+static bool bridge_inbound_owed(const bridge_stream_entry_t *e)
+{
+    return e->pending_retry || e->pending_fin || e->fin_retained ||
+           e->pending_reset || e->pending_stop || e->held_input ||
+           e->held_payload || e->pending_admission;
+}
+
+/* Our request-cancellation policy after the request has ended: when the
+ * peer's accepted RESET left the request with no owner at the session and our
+ * own send half is still open with no output or close of its own pending,
+ * cancel that half too -- a reset with CANCELLED, queued through the ordinary
+ * pending machinery (never issued from the endpoint's callback). Draft-18
+ * §3.3.2 and draft-22 §6.4.2.3: a request is cancelled by abruptly
+ * terminating any direction still open. This is that policy, not a QUIC rule
+ * that one direction's RESET resets the other. A FIN or close already owed
+ * keeps its order; a live owner (a retained response, deferred teardown) is
+ * waited for. A cancellation needs one retention slot; with none free it stays
+ * due (the stream keeps its mapping and the pass yields), exactly like an
+ * action the drain step does not poll at saturation, and is queued once the
+ * retained work ahead of it drains. Sets *queued when a reset was queued. */
+static moq_result_t bridge_settle_bidi_cancel(moq_transport_bridge_t *b,
+                                              bool *queued)
+{
+    b->bidi_cancel_due = false;
+    for (uint32_t i = 0; i < b->max_streams; i++) {
+        bridge_stream_entry_t *e = &b->streams[i];
+        if (!e->active || e->kind != BRIDGE_STREAM_BIDI || !e->peer_reset_accepted ||
+            e->local_send_closed || e->local_cancel_queued || e->peer_stop_received ||
+            e->aborting)
+            continue;
+        if (bridge_pending_touches_stream(b, e) ||
+            !bridge_session_bidi_owner_ended(b->session, e->ref)) {
+            b->bidi_cancel_due = true;     /* decided once they settle */
+            continue;
+        }
+        if (b->pending_count >= b->max_pending) {
+            b->bidi_cancel_due = true;     /* backpressure, not a failure */
+            break;
+        }
+        bridge_pending_item_t p;
+        memset(&p, 0, sizeof(p));
+        p.kind = PENDING_RESET_STREAM;
+        bridge_item_set_sid(&p, e->transport_id);
+        p.stream_ref = e->ref;            /* the retry closes our half here */
+        p.error_code = MOQ_STREAM_ERROR_CANCELLED;
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
+        e->local_cancel_queued = true;
+        *queued = true;
+    }
+    return MOQ_OK;
+}
+
+/* Service-pass step: release stopped data owners or aborted request drain
+ * identities once their terminal and remaining obligations permit it. */
+static moq_result_t bridge_settle_local_retire(moq_transport_bridge_t *b,
+                                               uint64_t now_us,
+                                               bool *released)
+{
+    b->local_retire_due = false;
+    for (uint32_t i = 0; i < b->max_streams; i++) {
+        bridge_stream_entry_t *e = &b->streams[i];
+        bool aborted_bidi = e->active && e->kind == BRIDGE_STREAM_BIDI &&
+                            e->aborting;
+        if (!e->transport_final) continue;
+        if (!aborted_bidi &&
+            (!bridge_is_peer_data_receive(e) || !e->local_stop_accepted))
+            continue;
+        if (aborted_bidi ? bridge_pending_touches_stream(b, e)
+                         : bridge_inbound_owed(e)) {
+            b->local_retire_due = true;   /* recheck once they settle */
+            continue;
+        }
+        moq_result_t rc = aborted_bidi
+            ? bridge_session_on_bidi_retired(b->session, e->ref, now_us)
+            : bridge_session_on_data_retired(b->session, e->ref, now_us);
+        if (rc == MOQ_OK || rc == MOQ_ERR_STALE_HANDLE) {
+            bridge_deactivate_stream(b, e);
+            *released = true;
+        } else if (rc == MOQ_SESSION_SUSPENDED || rc == MOQ_ERR_WOULD_BLOCK) {
+            b->local_retire_due = true;
+            return rc == MOQ_SESSION_SUSPENDED ? rc : MOQ_OK;
+        } else if (rc == MOQ_ERR_CLOSED) {
+            return MOQ_OK;
+        } else if (rc == MOQ_ERR_WRONG_STATE && aborted_bidi) {
+            b->local_retire_due = true;   /* live owner or queued action */
+        } else if (rc != MOQ_ERR_WRONG_STATE) {
+            /* WRONG_STATE: a live owner the report must not release; it is
+             * left as it is. Anything else is an invariant break. */
+            bridge_set_fatal(b, 0x1);
+            return rc;
+        }
+    }
+    return MOQ_OK;
+}
+
 static moq_result_t dispatch_stop_data(moq_transport_bridge_t *b,
                                         moq_action_t *act)
 {
@@ -2703,6 +2903,7 @@ static moq_result_t dispatch_stop_data(moq_transport_bridge_t *b,
         ? act->u.stop_bidi_stream.stream_ref : act->u.stop_data.stream_ref;
     uint64_t error_code = (act->kind == MOQ_ACTION_STOP_BIDI_STREAM)
         ? act->u.stop_bidi_stream.error_code : act->u.stop_data.error_code;
+    bool data_stop = act->kind == MOQ_ACTION_STOP_DATA;
     moq_action_cleanup(act);
 
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
@@ -2721,6 +2922,7 @@ static moq_result_t dispatch_stop_data(moq_transport_bridge_t *b,
         p.kind = PENDING_STOP_SENDING;
         bridge_item_set_sid(&p, e->transport_id);
         p.error_code = error_code;
+        p.data_stop = data_stop;
         if (!bridge_enqueue_pending(b, &p))
             return bridge_retention_failed(b, &p);
         return MOQ_OK;
@@ -2729,14 +2931,15 @@ static moq_result_t dispatch_stop_data(moq_transport_bridge_t *b,
         bridge_set_fatal(b, 0x1);
         return MOQ_ERR_INTERNAL;
     }
+    if (data_stop) bridge_note_data_stop_accepted(b, e);
     return MOQ_OK;
 }
 
 /*
  * Whole-request teardown: ONE transaction aborting both halves with one
- * code. Deactivates/tombstones the stream exactly once, then either the
- * endpoint's native abort_stream, or the sequential reset+stop fallback
- * with EXPLICIT pending state: a WOULD_BLOCK before the RESET was
+ * code. Keeps the discard mapping until service settles its terminal, using
+ * either the endpoint's native abort_stream, or the sequential reset+stop
+ * fallback with EXPLICIT pending state: a WOULD_BLOCK before the RESET was
  * accepted retries the whole abort; a WOULD_BLOCK after it retries only
  * the remaining STOP half. A runtime failure after partial application
  * is fatal — never rolled back.
@@ -2759,13 +2962,21 @@ static moq_result_t dispatch_abort_bidi(moq_transport_bridge_t *b,
     /*
      * KEEP the entry, marked aborting: its ref mapping stays live so late
      * peer bytes are discarded (not handed a fresh inbound ref), and it
-     * is retired on the peer's FIN / RESET / stream terminal. Clear any
-     * inbound pending state — we are tearing the stream down. */
+     * is retired by service after a genuine FIN / RESET / stream terminal
+     * and completion of outbound obligations. Clear inbound pending state
+     * after preserving any real terminal — we are tearing the stream down. */
+    bool peer_terminal = e->peer_send_closed || e->peer_reset_accepted ||
+                         e->pending_fin || e->fin_retained || e->pending_reset;
     e->aborting = true;
     e->pending_retry = false;
     e->pending_fin = false;
+    e->fin_retained = false;
     e->pending_reset = false;
     e->pending_stop = false;
+    /* A peer half already ended before its abort action was dispatched needs
+     * no second terminal. A retained FIN/RESET is genuine too, but is settled
+     * only as the local abort's drain identity, never delivered to the core. */
+    if (peer_terminal) bridge_note_aborting_terminal(b, e);
     return bridge_abort_apply(b, sid, error_code, false);
 }
 
@@ -3615,6 +3826,10 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                 rc = MOQ_ERR_INTERNAL;
                 goto cleanup;
             }
+            if (p->data_stop) {
+                bridge_stream_entry_t *se = bridge_find_by_id(b, p->stream_id);
+                if (se) bridge_note_data_stop_accepted(b, se);
+            }
             bridge_cleanup_pending_item(&b->alloc, p);
             break;
         }
@@ -4040,8 +4255,18 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
                 if (rc < 0)
                     bridge_set_fatal(b, 0x1);
                 else
-                    bridge_deactivate_stream(b, e);
+                    bridge_peer_reset_accepted(b, e);
             }
+        }
+
+        if (e->pending_stop && e->active && e->peer_reset_accepted) {
+            /* The peer's RESET ended the request first: the STOP's answer
+             * (our half's reset) is already queued, and the request is not
+             * cancelled a second time. */
+            e->pending_stop = false;
+            progress = true;
+            bridge_retire_or_tombstone(b, e->ref);
+            continue;
         }
 
         if (e->pending_stop && e->active) {
@@ -4154,6 +4379,28 @@ static moq_result_t bridge_service_pass(
             }
             if (in.progress && !b->fatal && !b->closed)
                 continue;
+        }
+
+        /* Step 3b: settle locally-stopped data and locally-aborted request
+         * identities after their genuine terminal, outside endpoint ops. */
+        if (!b->fatal && !b->closed && b->local_retire_due) {
+            bool released = false;
+            moq_result_t lrc = bridge_settle_local_retire(b, now_us, &released);
+            if (lrc == MOQ_SESSION_SUSPENDED) {
+                *suspended = true;
+                break;
+            }
+            if (lrc < 0) return lrc;
+            if (released && !b->fatal && !b->closed) continue;
+        }
+
+        /* Step 3c: our own cancellation of a request bidi the peer's RESET
+         * ended. */
+        if (!b->fatal && !b->closed && b->bidi_cancel_due) {
+            bool queued = false;
+            moq_result_t crc = bridge_settle_bidi_cancel(b, &queued);
+            if (crc < 0) return crc;
+            if (queued && !b->fatal && !b->closed) continue;
         }
 
         /* Step 4: tick deadlines — only if outbound is clear */
@@ -4738,12 +4985,16 @@ moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
 
     if (e && e->aborting) {
         /* Discarding after a whole-stream abort: absorb late bytes
-         * silently, retire on the peer's FIN — never a fresh ref, never
-         * fatal. */
-        if (fin)
-            bridge_deactivate_stream(b, e);
+         * silently, latch the peer's FIN for service — never a fresh ref,
+         * never an advancing session call from an endpoint callback. */
+        if (fin) bridge_note_aborting_terminal(b, e);
         return MOQ_OK;
     }
+
+    /* The peer's half ended with a RESET the session accepted; the mapping
+     * is kept for our own send half only. Nothing more can arrive on the
+     * peer's half, and nothing is parsed as a new request. */
+    if (e && e->peer_reset_accepted) return MOQ_OK;
 
     if (e && e->pending_retry) {
         if (len > 0) {
@@ -4856,7 +5107,14 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
     if (!e) return MOQ_OK;
 
-    if (e->aborting) { bridge_deactivate_stream(b, e); return MOQ_OK; }
+    if (e->aborting) {
+        bridge_note_aborting_terminal(b, e);
+        return MOQ_OK;
+    }
+
+    /* The peer's half already ended with an accepted RESET; this one repeats
+     * it. The mapping is held for our own send half only. */
+    if (e->peer_reset_accepted) return MOQ_OK;
 
     /* Refused at admission (ready to retry or not): the session never saw
      * the stream, so there is nothing to reset there; retire the mapping (the
@@ -4875,17 +5133,24 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
         return MOQ_OK;
     }
 
+    /* A reset still owed from an earlier refusal keeps its first code: a
+     * repeat delivers that cause, never its own. */
+    uint64_t cause = e->pending_reset ? e->pending_reset_code : error_code;
     moq_result_t rc;
     if (e->kind == BRIDGE_STREAM_BIDI)
         rc = moq_session_on_bidi_stream_reset(
-            b->session, e->ref, error_code, now_us);
+            b->session, e->ref, cause, now_us);
     else
         rc = moq_session_on_data_reset(
-            b->session, e->ref, error_code, now_us);
+            b->session, e->ref, cause, now_us);
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
-        e->pending_reset = true;
-        e->pending_reset_code = error_code;
+        /* The first peer code is the stream's cause; a repeat while it is
+         * still owed does not overwrite it. */
+        if (!e->pending_reset) {
+            e->pending_reset = true;
+            e->pending_reset_code = error_code;
+        }
         return MOQ_ERR_WOULD_BLOCK;
     }
 
@@ -4894,7 +5159,8 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
         return rc;
     }
 
-    bridge_deactivate_stream(b, e);
+    e->pending_reset = false;            /* delivered once, here */
+    bridge_peer_reset_accepted(b, e);
     return MOQ_OK;
 }
 
@@ -4903,9 +5169,19 @@ moq_result_t moq_transport_bridge_on_peer_stream_terminal(
 {
     (void)now_us;
     if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
-    /* Retire a stream we are discarding after a whole-stream abort. Any
-     * other stream: harmless no-op (its own lifecycle already fired). */
-    bridge_retire_aborting(b, stream_id);
+    /* Latch only: an endpoint op may still have this entry borrowed. */
+    bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
+    bridge_note_aborting_terminal(b, e);
+    /* A peer data stream: keep the fact that the transport is done with it.
+     * It is acted on only by a service pass (never from inside this call, so
+     * a report made from within an endpoint op cannot reach the frame that
+     * called the op), and only once the session's STOP of the stream was
+     * accepted: the report alone never releases a live owner. An unknown
+     * stream allocates nothing. Any other stream: harmless no-op. */
+    if (e && bridge_is_peer_data_receive(e) && !e->transport_final) {
+        e->transport_final = true;
+        if (e->local_stop_accepted) b->local_retire_due = true;
+    }
     return MOQ_OK;
 }
 
@@ -4978,6 +5254,13 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
         if (rc < 0) return rc;
 
         if (e->origin == BRIDGE_ORIGIN_LOCAL) {
+            bridge_retire_or_tombstone(b, e->ref);
+            return MOQ_OK;
+        }
+        /* The peer's RESET already ended this request at the session: its
+         * STOP only answers our send half (reset above), and the request is
+         * not cancelled a second time. */
+        if (e->peer_reset_accepted) {
             bridge_retire_or_tombstone(b, e->ref);
             return MOQ_OK;
         }

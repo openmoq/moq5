@@ -1066,7 +1066,8 @@ MOQR_CORE_API moqr_result_t moqr_core_sub_state(const moqr_core_t *core, moqr_su
 /* Relay-initiated subscription termination (e.g. an auth grant revalidated to
  * DENY). Unlike moqr_core_unsubscribe (a silent local retire), this reserves
  * intent space, queues MOQR_INTENT_SUB_DONE carrying `status` (the
- * SUBSCRIBE_DONE status_code the binding forwards via moq_session_done_subscribe),
+ * subscription-terminal descriptor the binding maps through
+ * moq_session_done_subscribe for the subscriber's wire profile),
  * then retires the sub — so the subscriber is told on the wire. Returns
  * MOQR_ERR_STALE_HANDLE (unknown sub) or MOQR_ERR_WOULD_BLOCK (intent ring
  * full; retry after a drain). */
@@ -1670,14 +1671,14 @@ MOQR_CORE_API moqr_result_t moqr_core_upstream_lost(moqr_core_t *core, moqr_trac
 
 /*
  * The track's SOURCE finished gracefully — an upstream subscription that got
- * SUBSCRIBE_DONE, or a push publisher that finished (PUBLISH_FINISHED):
- * terminate every downstream subscriber on the track with a wire SUBSCRIBE_DONE
- * carrying `status` (so none hangs behind a sourceless ACTIVE track), then
- * release the source like moqr_core_upstream_lost (WARM if retained content
- * remains, else freed). Generation-guarded; MOQR_ERR_STALE_HANDLE for a stale
- * track, MOQR_ERR_WRONG_STATE when not ACTIVE, MOQR_ERR_WOULD_BLOCK when the
- * intent ring can't hold one SUB_DONE per downstream sub (no state change —
- * retry after a drain).
+ * its terminal, or a push publisher that finished (PUBLISH_FINISHED):
+ * terminate every downstream subscriber on the track with PUBLISH_DONE
+ * carrying `status` for its wire profile (so none hangs behind a sourceless
+ * ACTIVE track), then release the source like moqr_core_upstream_lost (WARM
+ * if retained content remains, else freed). Generation-guarded;
+ * MOQR_ERR_STALE_HANDLE for a stale track, MOQR_ERR_WRONG_STATE when not
+ * ACTIVE, MOQR_ERR_WOULD_BLOCK when the intent ring can't hold one SUB_DONE
+ * per downstream sub (no state change — retry after a drain).
  */
 MOQR_CORE_API moqr_result_t moqr_core_source_done(moqr_core_t *core, moqr_track_t track,
                                     uint64_t track_gen, moqr_pd_desc_t status,
@@ -1685,17 +1686,17 @@ MOQR_CORE_API moqr_result_t moqr_core_source_done(moqr_core_t *core, moqr_track_
 
 /*
  * The track's SOURCE finished gracefully and no further objects will be
- * admitted for it: an upstream subscription that got SUBSCRIBE_DONE, or a
+ * admitted for it: an upstream subscription that got its terminal, or a
  * push publisher that finished (PUBLISH_FINISHED). Unlike
  * moqr_core_source_done, which terminates every downstream subscriber at
  * once (for failures such as a malformed track), each forwarding subscriber
  * first receives what was already admitted -- records, seals and FINs in
- * their usual order -- and is then terminated with a wire SUBSCRIBE_DONE
- * carrying `status` from moqr_core_next_delivery, so the terminal follows the
- * data it closes. A paused subscriber (Forward=0) asked for nothing further
- * and is terminated by its binding's next delivery scan. The source is
- * released as by moqr_core_source_done. Every terminal comes from the
- * delivery scans, so this call queues no intent and never returns
+ * their usual order -- and is then terminated with PUBLISH_DONE carrying
+ * `status` for its wire profile from moqr_core_next_delivery, so the terminal
+ * follows the data it closes. A paused subscriber (Forward=0) asked for
+ * nothing further and is terminated by its binding's next delivery scan.
+ * The source is released as by moqr_core_source_done. Every terminal comes
+ * from the delivery scans, so this call queues no intent and never returns
  * MOQR_ERR_WOULD_BLOCK: MOQR_OK, MOQR_ERR_INVAL, MOQR_ERR_STALE_HANDLE or
  * MOQR_ERR_WRONG_STATE (the track is not ACTIVE).
  */

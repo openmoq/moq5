@@ -98,6 +98,12 @@ struct moq_msq_stream {
     bool flush_control;        /* session-control role captured before retirement */
     bool flush_withdrawn;      /* ordinary send intent superseded by reset/STOP */
     bool send_shutdown_complete; /* either completion kind, not STOP/acceptance */
+    bool terminal_owed;        /* MsQuic retired the stream (SHUTDOWN_COMPLETE
+                                  outside connection teardown) and its handle
+                                  is gone; the record is kept, by id, only
+                                  until the bridge hears of it from
+                                  conn_feed_terminals, outside any endpoint-op
+                                  or bridge frame */
 };
 
 /* One accepted datagram send: the bridge's datagram contract is
@@ -196,6 +202,11 @@ struct moq_msquic_conn {
     bool close_clean;
     uint64_t close_code;
     bool shutdown_complete;        /* conn SHUTDOWN_COMPLETE observed */
+    uint32_t terminals_owed;       /* records with terminal_owed set */
+    int in_op;                     /* endpoint-op depth: an op may call into
+                                      MsQuic, which can complete a stream
+                                      inline; nothing reaches the bridge
+                                      while this is nonzero */
     /* QUIC_CONNECTION_EVENT_RELIABLE_RESET_NEGOTIATED said yes: data-stream
      * resets may keep a prefix (RESET_STREAM_AT). */
     bool reliable_reset;

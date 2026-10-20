@@ -3,6 +3,7 @@
  * another seam. Link endpoint support, not a second media_receiver object. */
 #include <moq/media_receiver.h>
 #include <stddef.h>
+#include "receiver_legacy_ts_caller.h"
 
 typedef struct frozen_receiver_cfg {
     uint32_t struct_size;
@@ -34,24 +35,6 @@ typedef struct frozen_media_object {
     uint8_t publisher_priority;
     bool has_subgroup;
 } frozen_media_object_t;
-
-/* The receiver config a caller built with the MPEG2TS-era header knows:
- * through mpeg2ts_join_psi, with that layout's own tail padding. */
-typedef struct ts_receiver_cfg {
-    uint32_t struct_size;
-    const moq_endpoint_cfg_t *endpoint;
-    moq_namespace_t namespace_;
-    moq_bytes_t catalog_track;
-    bool auto_subscribe;
-    moq_media_time_mode_t time_mode;
-    moq_media_overflow_cfg_t overflow;
-    uint32_t max_track_events;
-    uint8_t reserved_cfg[4];
-    uint32_t mpeg2ts_reorder_slots;
-    uint64_t mpeg2ts_reorder_window_us;
-    bool mpeg2ts_strip_prefix;
-    bool mpeg2ts_join_psi;
-} ts_receiver_cfg_t;
 
 /* The object as it stood before metadata: the frozen fields, the reserved
  * slot over their tail padding, then the loss report. */
@@ -169,37 +152,31 @@ static void test_old_initializers(void)
     MOQ_TEST_PASS("receiver_old_initializers");
 }
 
-/* A caller built with the MPEG2TS-era header passes its complete sizeof,
- * tail padding uninitialized: its companion is the AUTO default, and nothing
- * past it is read. The allocation is exactly the old size. */
+/* The old caller is in another TU; these private implementation observations
+ * remain here, without exporting a product seam. */
+static unsigned ts_probe_calls;
+static void probe_ts_sized_caller(const void *old)
+{
+    ts_probe_calls++;
+    MOQ_TEST_CHECK(receiver_cfg_companion(old) == MOQ_MEDIA_COMPANION_AUTO);
+    moq_media_receiver_t *r = NULL;
+    moq_result_t rc = moq_media_receiver_test_construct(
+        (const moq_media_receiver_cfg_t *)old, &r);
+    MOQ_TEST_CHECK(rc == MOQ_OK && r != NULL);
+    if (r) {
+        MOQ_TEST_CHECK(r->companion_profile == MOQ_MEDIA_COMPANION_AUTO);
+        moq_media_receiver_test_free(r);
+    }
+}
+
+/* Exact old-size allocation and both padding patterns cross the real C ABI. */
 static void test_ts_sized_caller(void)
 {
-    const size_t end = offsetof(ts_receiver_cfg_t, mpeg2ts_join_psi) + sizeof(bool);
-    for (unsigned round = 0; round < 2; round++) {
-        ts_receiver_cfg_t *old = malloc(sizeof(*old));
-        MOQ_TEST_CHECK(old != NULL);
-        if (!old) return;
-        memset(old, 0xa5, sizeof(*old));
-        moq_media_receiver_cfg_init_live_sized((moq_media_receiver_cfg_t *)old,
-                                               sizeof(*old));
-        MOQ_TEST_CHECK(old->struct_size == sizeof(*old));
-        old->namespace_ = (moq_namespace_t){ ns, 1 };
-        old->auto_subscribe = true;
-        /* Uninitialized padding: every byte reads as the D22 profile's low
-         * byte or as garbage, never as a field. */
-        memset((unsigned char *)old + end, round ? 0x01 : 0xa5, sizeof(*old) - end);
-        MOQ_TEST_CHECK(receiver_cfg_companion((const moq_media_receiver_cfg_t *)old) ==
-                       MOQ_MEDIA_COMPANION_AUTO);
-        moq_media_receiver_t *r = NULL;
-        moq_result_t rc = moq_media_receiver_test_construct(
-            (moq_media_receiver_cfg_t *)old, &r);
-        MOQ_TEST_CHECK(rc == MOQ_OK && r != NULL);
-        if (r) {
-            MOQ_TEST_CHECK(r->companion_profile == MOQ_MEDIA_COMPANION_AUTO);
-            moq_media_receiver_test_free(r);
-        }
-        free(old);
-    }
+    ts_probe_calls = 0;
+    int caller_failures = moq_test_receiver_legacy_ts_caller(
+        (moq_namespace_t){ ns, 1 }, probe_ts_sized_caller);
+    failures += caller_failures;
+    MOQ_TEST_CHECK(ts_probe_calls == 2);
     MOQ_TEST_PASS("receiver_ts_sized_caller_is_auto");
 }
 

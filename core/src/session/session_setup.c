@@ -88,9 +88,11 @@ moq_result_t session_setup_complete_peer(moq_session_t *s,
     moq_resolved_token_t *resolved = auth->resolved_tokens;
     bool *staged = auth->token_staged;
     uint64_t reject_code = 0;
-    moq_result_t arc = process_auth_tokens(s, tokens, count, resolved,
-                                           &auth->token_count, MOQ_DECODED_MAX_TOKENS,
-                                           &reject_code, staged, &auth->auth_txn);
+    moq_result_t arc = process_auth_tokens(s, tokens, count,
+        &(moq_auth_resolve_out_t){
+            .tokens = resolved, .token_count = &auth->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &reject_code,
+            .staged = staged, .txn = &auth->auth_txn });
     if (arc < 0) {
         session_setup_workspace_release(s, workspace);
         return arc;

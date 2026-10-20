@@ -102,6 +102,15 @@ check_pump() {
 }
 
 check_pump "relay_lane_pump"  'moqr_bind_pump[[:space:]]*('
+# Binding-only continuation is not a session event. The single-lane pump
+# must request its own next turn, just as the sharded step's wake mask does.
+single_body=$(body_of "relay_lane_pump")
+if ! printf '%s\n' "$single_body" | grep -q 'if[[:space:]]*(moqr_bind_pump_budget_pending(ctx->bind))'; then
+    echo "FAIL: single-lane binding continuation is not checked"; fail=1
+fi
+if ! printf '%s\n' "$single_body" | grep -q 'moq_msquic_lane_wake(lane)'; then
+    echo "FAIL: single-lane binding continuation does not wake its lane"; fail=1
+fi
 # The lane pumps of the multi-shard compositions share ONE shard step, so the
 # "retire after stepping" ordering is pinned where it now lives -- once, rather
 # than once per transport.

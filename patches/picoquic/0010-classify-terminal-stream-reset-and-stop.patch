@@ -1,0 +1,115 @@
+Classify a reset or stop of a terminal or unknown stream by the ID's state.
+
+Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6, after 0002,
+0006, 0007, 0008 and 0009; it also applies without 0007.
+
+picoquic_reset_stream_at and picoquic_stop_sending answered every stream they
+no longer hold with PICOQUIC_ERROR_INVALID_STREAM_ID, whether the ID was
+opened and has since been retired or was never opened, and the stop cleared
+the stream's application context before refusing a part the peer had reset.
+Stream IDs are never reused (RFC 9000 Section 2.1), and picoquic already keeps
+each type's creation boundary.
+
+Both now check the 62-bit range and the direction first: a reset needs a
+sending part (not a peer-initiated unidirectional stream, Section 19.4), a stop
+a receiving part (not a local unidirectional one, Section 19.5); otherwise
+PICOQUIC_ERROR_INVALID_STREAM_ID, for a live stream as well. An absent ID below
+its type's boundary answers PICOQUIC_ERROR_STREAM_ALREADY_CLOSED: that part is
+terminal and no frame is sent (Section 3.3); any other absent ID stays
+PICOQUIC_ERROR_INVALID_STREAM_ID. A stop of a live stream whose receiving part
+is terminal -- reset by the peer, or read up to its final size (Section 3.2) --
+answers PICOQUIC_ERROR_STREAM_ALREADY_CLOSED before the stream or its context
+changes. The reset of a live stream keeps 0002's rules. Nothing is created,
+allocated or queued on any refusal. PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED
+advertises the contract in picoquic.h.
+Tests: adapters/picoquic/tests/test_pq_stop_release.c (reset and stop
+contract rows) and test_pq_hold_input.c (call order, bounded).
+
+Upstream picoquic/streams.c and picoquic/frames.c are unchanged since the pin
+as of 2026-10-16 (master c124cbe975f71b150ea929d325804335d2bdaa34, 15 commits
+ahead; the audit commands are recorded in 0009).
+
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1658,6 +1658,17 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t * cnx, uint64_t stream_id, co
+ 
+ /* Reset a stream, indicating that no more data will be sent on 
+  * that stream and that any data currently queued can be abandoned. */
++#define PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED 1
++/* picoquic_reset_stream, picoquic_reset_stream_at and picoquic_stop_sending
++ * classify the stream ID before touching anything. A part already terminal
++ * answers PICOQUIC_ERROR_STREAM_ALREADY_CLOSED with no frame and no change to
++ * the stream or its application context: for a reset, a sending part whose
++ * bytes and FIN are all acknowledged; for a stop, a receiving part reset by
++ * the peer or read up to its final size; for either, a stream opened and
++ * since retired. An ID never opened, out of range, or naming a part this
++ * endpoint does not have (a reset of a peer-initiated unidirectional stream,
++ * a stop of a local one) answers PICOQUIC_ERROR_INVALID_STREAM_ID. Neither
++ * answer creates a stream. */
+ int picoquic_reset_stream(picoquic_cnx_t* cnx,
+     uint64_t stream_id, uint64_t local_stream_error);
+ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -492,9 +492,19 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+     if (reliable_size > 0 && !cnx->is_reset_stream_at_enabled) {
+         ret = PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION;
+     }
+-    else if ((stream = picoquic_find_stream(cnx, stream_id)) == NULL) {
++    else if (stream_id >= ((uint64_t)1 << 62) ||
++        (!IS_BIDIR_STREAM_ID(stream_id) && !IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode))) {
++        /* Not a stream this endpoint can send on (RFC 9000 Sections 2.1, 19.4). */
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
++    else if ((stream = picoquic_find_stream(cnx, stream_id)) == NULL) {
++        /* Stream IDs are never reused (RFC 9000 Section 2.1): an absent ID
++         * below its type's creation boundary was opened and has since been
++         * retired, so its sending part is already terminal and no frame is
++         * due. Any other absent ID was never opened. */
++        ret = (stream_id < cnx->next_stream_id[STREAM_TYPE_FROM_ID(stream_id)]) ?
++            PICOQUIC_ERROR_STREAM_ALREADY_CLOSED : PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
+     else {
+         /* RFC 9000 Section 3.1: a reset is allowed in "Data Sent", after the
+          * FIN is sent. Only "Data Recvd", every byte and the FIN acknowledged,
+@@ -575,18 +585,31 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+     picoquic_stream_head_t* stream = NULL;
+     PICOQUIC_THREAD_CHECK(cnx->quic);
+ 
+-    stream = picoquic_find_stream(cnx, stream_id);
+-
+-    if (stream == NULL) {
++    if (stream_id >= ((uint64_t)1 << 62) ||
++        (!IS_BIDIR_STREAM_ID(stream_id) && IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode))) {
++        /* Not a stream this endpoint can receive on (RFC 9000 Sections 2.1,
++         * 19.5). */
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
++    else if ((stream = picoquic_find_stream(cnx, stream_id)) == NULL) {
++        /* As for a reset: an absent ID below its type's creation boundary
++         * was opened and has since been retired, so its receiving part is
++         * already terminal and no frame is due. */
++        ret = (stream_id < cnx->next_stream_id[STREAM_TYPE_FROM_ID(stream_id)]) ?
++            PICOQUIC_ERROR_STREAM_ALREADY_CLOSED : PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
++    else if (stream->reset_received ||
++        (stream->fin_received && stream->consumed_offset >= stream->fin_offset)) {
++        /* The receiving part is terminal -- "Reset Recvd", or every byte
++         * up to the final size delivered (RFC 9000 Section 3.2): nothing is
++         * left to stop. Answered before the stream or its application
++         * context changes. */
++        ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
++    }
+     else {
+         stream->app_stream_ctx = NULL;
+ 
+-        if (stream->reset_received) {
+-            ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+-        }
+-        else if (!stream->stop_sending_requested) {
++        if (!stream->stop_sending_requested) {
+             uint8_t buffer[128];
+             uint8_t* bytes;
+             int more_data = 0;

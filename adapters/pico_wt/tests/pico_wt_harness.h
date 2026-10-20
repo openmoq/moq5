@@ -32,10 +32,32 @@ typedef struct {
     int connect_accepted;
 } pico_wt_wt_cb_ctx_t;
 
+/* The setup step a harness last entered; a failed setup stops at it. */
+typedef enum {
+    PICO_WT_HARNESS_TRANSPORT = 1,  /* QUIC + HTTP/3 connection */
+    PICO_WT_HARNESS_CONNECT,        /* WT CONNECT accepted on both ends */
+    PICO_WT_HARNESS_SESSIONS,       /* the MoQ session pair */
+    PICO_WT_HARNESS_CLIENT_ATTACH,  /* client adapter constructor */
+    PICO_WT_HARNESS_SERVER_ATTACH,  /* server adapter constructor */
+    PICO_WT_HARNESS_READY
+} pico_wt_harness_phase_t;
+
+/* Who owned the client WT session's callbacks before its adapter was
+ * constructed: the stream prefix's data-stream callback and the control
+ * stream's path callback. */
+typedef struct {
+    picohttp_post_data_cb_fn prefix_cb;
+    void *prefix_ctx;
+    picohttp_post_data_cb_fn ctrl_cb;
+    void *ctrl_ctx;
+} pico_wt_harness_owner_t;
+
 typedef struct {
     picoquic_test_tls_api_ctx_t *test_ctx;
     uint64_t now;
     uint64_t loss_mask;
+    pico_wt_harness_phase_t phase;
+    pico_wt_harness_owner_t pre_attach;
 
     pico_wt_wt_cb_ctx_t client_wt;
     pico_wt_wt_cb_ctx_t server_wt;
@@ -75,6 +97,28 @@ int pico_wt_harness_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
  */
 int pico_wt_harness_setup(pico_wt_harness_t *h,
                           const pico_wt_harness_cfg_t *cfg);
+
+/*
+ * Capability refusal at the client adapter's constructor. `setup_rc` is the
+ * result pico_wt_harness_setup returned for `h`. Returns NULL when that setup
+ * failed exactly at the client constructor with every earlier step in place
+ * and the refusal left the WT session's callbacks with their owner, and a
+ * direct constructor call for the same session then shows the documented
+ * refusal -- -1, a stale *out cleared, nothing requested from the config's
+ * allocator, no callback taken -- while a draft-16 session attaches with the
+ * same inputs. Otherwise returns the first property that did not hold.
+ */
+const char *pico_wt_harness_check_attach_refusal(pico_wt_harness_t *h,
+                                                 int setup_rc);
+
+/*
+ * True when `h` failed at the client adapter's constructor with every
+ * earlier step in place and the callbacks still with their owner -- the
+ * phase half of pico_wt_harness_check_attach_refusal, with no constructor
+ * call. A setup failure anywhere else is never reported as the refusal.
+ */
+bool pico_wt_harness_refused_at_attach(const pico_wt_harness_t *h,
+                                       int setup_rc);
 
 /*
  * One sim round: service both adapters, advance time up to

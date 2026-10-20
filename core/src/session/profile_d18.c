@@ -179,8 +179,11 @@ static moq_result_t d18_handle_setup(moq_session_t *s,
      * named target. The policy runs before any token takes effect and may run
      * again if this SETUP has to be retried before it commits. */
     const char *reason = NULL;
-    uint64_t target_err = moq_binding_judge_peer_target(
-        s, opts.has_path, opts.path, opts.has_authority, opts.authority, &reason);
+    const moq_binding_peer_target_t target = {
+        .has_path = opts.has_path, .has_authority = opts.has_authority,
+        .path = opts.path, .authority = opts.authority,
+    };
+    uint64_t target_err = moq_binding_judge_peer_target(s, &target, &reason);
     if (target_err) return close_with_error(s, target_err, reason);
 
     /* SETUP auth tokens (§10.3.1.4): functionally equivalent to the message

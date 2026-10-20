@@ -1350,6 +1350,147 @@ jf_check_rejected(jf_t *j, const jf_down_t *d, uint64_t code, const char *label)
 
 /* -- rows ---------------------------------------------------------------- */
 
+typedef struct jf_singleton_trace {
+    bool armed;
+    int requests;
+    moq_stream_ref_t request_ref;
+} jf_singleton_trace_t;
+
+static void
+jf_singleton_trace(void *ctx, const moq_sim_trace_record_t *r)
+{
+    jf_singleton_trace_t *t = ctx;
+    if (t->armed && r->kind == MOQ_SIM_TRACE_ACTION &&
+        r->from == MOQ_PERSPECTIVE_SERVER &&
+        r->action_kind == MOQ_ACTION_OPEN_BIDI_STREAM &&
+        r->detail_bytes.len > 0 && r->detail_bytes.data[0] == 0x16) {
+        t->request_ref = r->stream_ref;
+        t->requests++;
+    }
+}
+
+/* Issue #51: Largest {2,0}, no live catalog tail, Joining FETCH(0) forwarded
+ * as standalone [2:0,2:1). Literal peers bypass the local object encoder and
+ * independently finish the response half before or after the data stream.
+ * The response is still collected until both FETCH_OK and data FIN exist. */
+static int
+jf_exact_group2_singleton(moq_version_t version, int wire_order)
+{
+    jf_singleton_trace_t tr = {0};
+    relay_bind_test_trace_fn = jf_singleton_trace;
+    relay_bind_test_trace_ctx = &tr;
+    jf_t j;
+    bool ready = relay_bind_test_jf_setup_at(&j, version, 1, true, 2, 0, false);
+    relay_bind_test_trace_fn = NULL;
+    relay_bind_test_trace_ctx = NULL;
+    if (!ready) return 1 + j.rig.failures;
+    tr.armed = true;
+    relay_bind_test_jf_join(&j, &j.d[0]);
+    relay_bind_test_jf_wait_requests(&j, 1);
+    tr.armed = false;
+    R_CHECK(&j.rig, j.o.req_sg[0] == 2 && j.o.req_so[0] == 0 &&
+                    j.o.req_eg[0] == 2 && j.o.req_eo[0] == 1);
+
+    if (wire_order == 0) {
+        relay_bind_test_jf_origin_accept(&j, 0, 2, 1, false, false);
+        R_CHECK(&j.rig, relay_bind_test_jf_origin_write_raw(
+            &j, 0, 2, 0, 0xB0, BOOT_BASE_LEN, false) == MOQ_OK);
+        for (int i = 0; i < 3; i++) relay_bind_test_jf_cycle(&j);
+        R_CHECK(&j.rig, j.d[0].ledger_n == 0);
+        relay_bind_test_jf_live_control(&j);
+        relay_bind_test_jf_origin_end(&j, 0);
+    } else {
+        /* Accept only to obtain the allocated request ID from FETCH_HEADER;
+         * consume, cleanup and replace both actions rather than delivering a
+         * second response through SimPair. All wire bytes below are literal. */
+        relay_bind_test_jf_origin_accept(&j, 0, 2, 1, false, false);
+        moq_action_t actions[8];
+        size_t n = moq_session_poll_actions(j.o.cn->peer, actions, 8);
+        int headers = 0, responses = 0;
+        uint8_t request_id = 0;
+        for (size_t i = 0; i < n; i++) {
+            const moq_action_t *a = &actions[i];
+            if (a->kind == MOQ_ACTION_SEND_DATA) {
+                headers++;
+                R_CHECK(&j.rig, a->u.send_data.header_len == 2 &&
+                                a->u.send_data.header[0] == 0x05 &&
+                                a->u.send_data.header[1] < 64 &&
+                                a->u.send_data.payload == NULL && !a->u.send_data.fin);
+                request_id = a->u.send_data.header[1];
+            } else if (a->kind == MOQ_ACTION_SEND_CONTROL ||
+                       a->kind == MOQ_ACTION_SEND_BIDI_STREAM) {
+                responses++;
+            } else {
+                R_CHECK(&j.rig, 0);
+            }
+            moq_action_cleanup(&actions[i]);
+        }
+        R_CHECK(&j.rig, n == 2 && headers == 1 && responses == 1);
+        uint8_t ok16[] = { 0x18, 0x00, 0x05, request_id, 0x00, 0x02, 0x01, 0x00 };
+        static const uint8_t ok18[] = { 0x18, 0x00, 0x04, 0x00, 0x02, 0x01, 0x00 };
+        uint8_t data[2 + 5 + BOOT_BASE_LEN] = {
+            0x05, request_id, 0x1c, 0x02, 0x00, 0x00, BOOT_BASE_LEN
+        };
+        relay_bind_test_boot_fill(data + 7, BOOT_BASE_LEN, 0xB0);
+        const moq_stream_ref_t data_ref = moq_stream_ref_from_u64(UINT64_C(0x51000051));
+        if (version == MOQ_VERSION_DRAFT_18)
+            R_CHECK(&j.rig, tr.requests == 1 && tr.request_ref._v != 0);
+
+        if (wire_order == 2) {
+            R_CHECK(&j.rig, moq_session_on_data_bytes(j.o.cn->rsess,
+                data_ref, data, sizeof(data), true, j.rig.now) == MOQ_OK);
+            for (int i = 0; i < 3; i++) relay_bind_test_jf_cycle(&j);
+            R_CHECK(&j.rig, j.d[0].ledger_n == 0);
+        }
+        if (version == MOQ_VERSION_DRAFT_16) {
+            R_CHECK(&j.rig, moq_session_on_control_bytes(j.o.cn->rsess,
+                ok16, sizeof(ok16), j.rig.now) == MOQ_OK);
+        } else {
+            R_CHECK(&j.rig, moq_session_on_bidi_stream_bytes(j.o.cn->rsess,
+                tr.request_ref, ok18, sizeof(ok18), true, j.rig.now) == MOQ_OK);
+        }
+        if (wire_order == 1) {
+            /* Preserve the real writer's separate header/object/length writes,
+             * and prove that no terminal is inferred from a complete payload. */
+            R_CHECK(&j.rig, moq_session_on_data_bytes(j.o.cn->rsess,
+                data_ref, data, 2, false, j.rig.now) == MOQ_OK);
+            R_CHECK(&j.rig, moq_session_on_data_bytes(j.o.cn->rsess,
+                data_ref, data + 2, 4, false, j.rig.now) == MOQ_OK);
+            R_CHECK(&j.rig, moq_session_on_data_bytes(j.o.cn->rsess,
+                data_ref, data + 6, sizeof(data) - 6, false, j.rig.now) == MOQ_OK);
+            for (int i = 0; i < 3; i++) relay_bind_test_jf_cycle(&j);
+            R_CHECK(&j.rig, j.d[0].ledger_n == 0);
+            relay_bind_test_jf_live_control(&j);
+            R_CHECK(&j.rig, moq_session_on_data_bytes(j.o.cn->rsess,
+                data_ref, NULL, 0, true, j.rig.now) == MOQ_OK);
+        }
+    }
+
+    jf_wait_terminal(&j, &j.d[0]);
+    for (int i = 0; i < 3; i++) relay_bind_test_jf_cycle(&j);
+    jf_down_t *d = &j.d[0];
+    R_CHECK(&j.rig, d->ledger_n == 3 && d->ledger[0] == MOQ_EVENT_FETCH_OK &&
+                    d->ledger[1] == MOQ_EVENT_FETCH_OBJECT &&
+                    d->ledger[2] == MOQ_EVENT_FETCH_COMPLETE);
+    R_CHECK(&j.rig, d->ok == 1 && d->objects == 1 && d->complete == 1 &&
+                    d->gaps == 0 && d->error == 0 && d->reset == 0 &&
+                    d->foreign == 0 && !d->overflow && d->closed == 0);
+    R_CHECK(&j.rig, !d->ok_eot && d->ok_eg == 2 && d->ok_eo == 1 &&
+                    d->obj_g[0] == 2 && d->obj_o[0] == 0 &&
+                    d->obj_len[0] == BOOT_BASE_LEN && d->obj_exact[0] &&
+                    d->props_len[0] == 0);
+    moqr_bind_fwd_debug_t st;
+    relay_bind_test_jf_stats(&j, &st);
+    R_CHECK(&j.rig, st.admitted == 1 && st.completed == 1 && st.delivered == 1 &&
+                    st.live == 0 && st.bytes_used == 0 && st.cancelled_up == 0 &&
+                    st.errors == 0 && st.rejected_down == 0 && st.aborted == 0);
+    R_CHECK(&j.rig, j.o.fetch_requests == 1 && j.o.cancelled == 0);
+    if (wire_order == 2) relay_bind_test_jf_live_control(&j);
+    return relay_bind_test_jf_teardown(&j, wire_order == 0 ? "fwd_group2_singleton"
+        : wire_order == 1 ? "fwd_group2_literal_response_fin_first"
+                          : "fwd_group2_literal_data_fin_first");
+}
+
 /* Exact single receiver, with per-object properties on the delta: one
  * upstream request carrying the normalized range [0:0, 0:2), the response
  * relayed byte-exact in order, then the pool and transactions back to zero
@@ -3022,6 +3163,9 @@ static int
 jf_all(moq_version_t v)
 {
     int f = 0;
+    f += jf_exact_group2_singleton(v, 0);
+    f += jf_exact_group2_singleton(v, 1);
+    f += jf_exact_group2_singleton(v, 2);
     f += jf_exact_single(v, false);
     f += jf_exact_single(v, true);
     f += jf_exact_two(v);
@@ -3327,6 +3471,14 @@ fetch_lifetime_probe(moq_version_t version, bool tiny_action_queue)
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--late-subscriber") == 0) {
+        int f = 0;
+        for (int order = 0; order < 3; order++) {
+            f += jf_exact_group2_singleton(MOQ_VERSION_DRAFT_16, order);
+            f += jf_exact_group2_singleton(MOQ_VERSION_DRAFT_18, order);
+        }
+        return f == 0 ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--fetch-capacity-abi") == 0) {
         return jf_cfg_abi() == 0 ? 0 : 1;
     }

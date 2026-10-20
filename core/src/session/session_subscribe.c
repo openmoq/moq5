@@ -897,8 +897,10 @@ moq_result_t session_core_on_subscribe(moq_session_t *s,
         moq_location_filter_cfg_init(&ev_options->location);
         if (d->has_filter) {
             ev_options->flags |= MOQ_SUBSCRIPTION_ADMISSION_LOCATION;
-            moq_location_filter_from_core(d->filter_type, d->start_group,
-                d->start_object, d->end_group, d->end_object,
+            moq_location_filter_from_core(&(moq_core_filter_t){
+                .type = d->filter_type,
+                .start_group = d->start_group, .start_object = d->start_object,
+                .end_group = d->end_group, .end_object = d->end_object },
                 &ev_options->location, sizeof(ev_options->location));
         }
         if (d->fill.requested)
@@ -3017,6 +3019,13 @@ bool unsub_tomb_add(moq_session_t *s, uint64_t request_id)
     return true;
 }
 
+bool unsub_tomb_contains(const moq_session_t *s, uint64_t request_id)
+{
+    for (size_t i = 0; i < s->unsub_tomb_count; i++)
+        if (s->unsub_tombstones[i] == request_id) return true;
+    return false;
+}
+
 bool unsub_tomb_consume(moq_session_t *s, uint64_t request_id)
 {
     for (size_t i = 0; i < s->unsub_tomb_count; i++) {
@@ -3753,8 +3762,10 @@ moq_result_t session_update_stage_options(moq_session_t *s,
     v->initiating_request_id = u->request_id;
     if (u->has_filter) {
         v->flags |= MOQ_SUBSCRIPTION_UPDATE_OPTIONS_LOCATION;
-        moq_location_filter_from_core(u->filter_type, u->start_group,
-            u->start_object, u->end_group, u->end_object,
+        moq_location_filter_from_core(&(moq_core_filter_t){
+            .type = u->filter_type,
+            .start_group = u->start_group, .start_object = u->start_object,
+            .end_group = u->end_group, .end_object = u->end_object },
             &v->location, sizeof(v->location));
     }
     if (u->dt_has_object) {
@@ -4046,6 +4057,23 @@ static moq_result_t session_owed_update_reserve(moq_session_t *s, moq_owed_updat
 uint64_t session_owed_update_id(const moq_owed_update_t *o, uint32_t i)
 {
     return i + 1 < o->count ? o->prior_ids[i] : o->rec.request_id;
+}
+
+static bool owed_update_holds(const moq_owed_update_t *o, uint64_t request_id)
+{
+    if (!o->owed) return false;
+    for (uint32_t i = 0; i < o->count; i++)
+        if (session_owed_update_id(o, i) == request_id) return true;
+    return false;
+}
+
+bool session_owed_update_covers(const moq_session_t *s, uint64_t request_id)
+{
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (owed_update_holds(&s->subs[i].owed_update, request_id)) return true;
+    for (size_t i = 0; i < s->pub_cap; i++)
+        if (owed_update_holds(&s->publishes[i].owed_update, request_id)) return true;
+    return false;
 }
 
 bool session_owed_update_at_bound(const moq_session_t *s, const moq_owed_update_t *o)
@@ -4728,10 +4756,11 @@ moq_result_t session_owed_update_observe(const moq_owed_update_t *o,
     if (out_update_request_id) *out_update_request_id = u->request_id;
     if (out_has_filter) *out_has_filter = u->has_filter;
     if (out_filter && u->has_filter)
-        moq_location_filter_from_core(u->filter_type, u->start_group,
-                                      u->start_object, u->end_group,
-                                      u->end_object, out_filter,
-                                      out_filter_size);
+        moq_location_filter_from_core(&(moq_core_filter_t){
+            .type = u->filter_type,
+            .start_group = u->start_group, .start_object = u->start_object,
+            .end_group = u->end_group, .end_object = u->end_object },
+            out_filter, out_filter_size);
     return MOQ_OK;
 }
 
@@ -6186,6 +6215,14 @@ moq_result_t moq_session_update_subscription(
                          s->send_cap - s->send_len);
 
     moq_result_t rc = s->profile->encode_request_update(s, &w, &args);
+    if (rc == MOQ_ERR_BUFFER && s->send_len > 0) {
+        moq_buf_writer_t probe;
+        rc = send_probe_begin(s, &probe);
+        if (rc == MOQ_OK) {
+            rc = s->profile->encode_request_update(s, &probe, &args);
+            rc = send_probe_end(s, &probe, rc);
+        }
+    }
     if (rc < 0) {
         s->profile->abort_request(s, &req_ep);
         return rc;
@@ -6276,9 +6313,11 @@ moq_result_t moq_session_subscription_filter_sized(moq_session_t *s,
     int slot = sub_resolve_handle(s, sub);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     const moq_sub_entry_t *e = &s->subs[slot];
-    moq_location_filter_from_core(e->filter_type, e->req_start_group,
-                                  e->req_start_object, e->req_end_group,
-                                  e->req_end_object, out, out_size);
+    moq_location_filter_from_core(&(moq_core_filter_t){
+        .type = e->filter_type,
+        .start_group = e->req_start_group, .start_object = e->req_start_object,
+        .end_group = e->req_end_group, .end_object = e->req_end_object },
+        out, out_size);
     return MOQ_OK;
 }
 
@@ -6301,8 +6340,10 @@ moq_result_t session_core_on_publish_state_notify(moq_session_t *s,
     if (d->has_filter) {
         location = event_location_alloc(s);
         if (!location) return MOQ_ERR_WOULD_BLOCK;
-        moq_location_filter_from_core(d->filter_type, d->start_group,
-            d->start_object, d->end_group, d->end_object,
+        moq_location_filter_from_core(&(moq_core_filter_t){
+            .type = d->filter_type,
+            .start_group = d->start_group, .start_object = d->start_object,
+            .end_group = d->end_group, .end_object = d->end_object },
             location, sizeof(*location));
     }
     moq_event_t ev;
@@ -6368,11 +6409,16 @@ bool session_publish_state_matches(const moq_publish_state_encode_args_t *args,
     /* Compare semantic intent, not a window resolved against today's Largest.
      * Conversion also drops inactive fields and equates relative-zero forms. */
     moq_location_filter_cfg_t selected, current;
-    moq_location_filter_from_core(args->filter, args->start_group,
-        args->start_object, args->end_group, args->end_object,
+    moq_location_filter_from_core(&(moq_core_filter_t){
+        .type = args->filter,
+        .start_group = args->start_group, .start_object = args->start_object,
+        .end_group = args->end_group, .end_object = args->end_object },
         &selected, sizeof(selected));
-    moq_location_filter_from_core(filter_type, start_group, start_object,
-        end_group, end_object, &current, sizeof(current));
+    moq_location_filter_from_core(&(moq_core_filter_t){
+        .type = filter_type,
+        .start_group = start_group, .start_object = start_object,
+        .end_group = end_group, .end_object = end_object },
+        &current, sizeof(current));
     return selected.kind == current.kind &&
         selected.relative_group_offset == current.relative_group_offset &&
         selected.start_group == current.start_group &&

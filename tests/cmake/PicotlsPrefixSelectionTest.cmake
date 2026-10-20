@@ -16,10 +16,49 @@
 #               refused while it stays, accepted once it is dropped (-U)
 #   installed   installed-layout prefix nested under an unrelated include
 #   invalid     a prefix that is not a picotls tree
+#   fetch_*     PICOQUIC_FETCH_PTLS with a stand-in picotls F
+#               (picotls_prefix_selection/picotls): headers, library
+#               directory, cache entries and the parsed pkg-config -L tokens
+#               follow the picotls picoquic builds, for the configuration and
+#               generator in use -- default, custom, config-specific, relative
+#               and shared output locations; archives in different
+#               directories, and multi-config generators, select no library
+#               directory and refuse an explicit one; with or without a prefix
+#               naming F; a prefix naming another picotls and explicit library
+#               selections from another picotls are refused; the mbedTLS
+#               configuration, which needs PTLS_INCLUDE_DIR while picoquic is
+#               added, configures cold without OpenSSL, from a local source or
+#               from a (local) clone; repeated find_package
+#   fetch_policy  LibMoQ's picotls policy in a Release build: F compiles with
+#               NDEBUG undefined and warnings as errors, other directories
+#               keep the configuration's flags; caller hooks (a file and a
+#               module) run first, in order and in picotls's scope; the hook
+#               variables are left as they were; the isolation probes show
+#               exactly their one intended warning
+#   binding_*   the caller's bindings of both hook families and their
+#               hand-over variables survive find_package by behaviour: unset,
+#               empty, normal, cache-only (still follows set_property(CACHE))
+#               and normal over cache (falls back to the cache entry)
+#   nested_*    find_package beneath a directory holding the PTLS_*_LIBRARY
+#               values the fetched FindPTLS sets: accepted; a conflicting one,
+#               or a conflicting cache entry under a matching one, refused
+#   swap_*      prebuilt A -> fetched F -> prebuilt A reconfigures leave
+#               nothing of the other behind
+#   unrelated_* a picotls populated through FetchContent but not linked by the
+#               selected picoquic (installed package, or a pre-existing
+#               prebuilt-linked target) does not displace prefix A
+#   pre_*       a pre-existing picoquic that links F, directly or through the
+#               picotls::core alias, selects F
+# Every configure and build, refusals included, keeps its output and status
+# under MOQ_WORK/logs and passes one diagnostic check: no warnings, except a
+# probe's single intended one. An expected refusal is evidence only for its
+# own error. control_* cases and checks show a stray warning is caught beside
+# an expected refusal and beside a probe's intended warning.
 # Installed-package cases (cfg_*): cold, A->B reconfigure, stale cached
 # selections, a conflicting explicit library directory, and an installed
 # prefix nested under an unrelated include.
-# Adapter cases (adapter_*), run when MOQ_OPENSSL_ROOT is given: libmoq itself
+# Adapter cases (adapter_*), run when MOQ_OPENSSL_ROOT is given and the
+# generator is single-config: libmoq itself
 # configured with the picoquic adapter and its OpenSSL verifier, reading the
 # adapter's include directories from the File API codemodel.
 #   adapter_incomplete   verifier headers cached from A, prefix B selected
@@ -90,8 +129,72 @@ if(DEFINED MOQ_CONTEXT AND NOT MOQ_CONTEXT STREQUAL "")
     set(context_args -C "${MOQ_CONTEXT}")
 endif()
 
+# Every configure and build keeps its output and status under logs/.
+file(MAKE_DIRECTORY "${MOQ_WORK}/logs")
+function(_pt_keep name kind rc out)
+    file(WRITE "${MOQ_WORK}/logs/${name}.${kind}.log" "${out}")
+    file(WRITE "${MOQ_WORK}/logs/${name}.${kind}.status" "${rc}\n")
+endfunction()
+
+# Sets <out_var> to the diagnostic lines in <text> that are warnings: CMake
+# warning banners and compiler "warning:" lines.
+function(_pt_warnings out_var text)
+    string(REPLACE ";" "<semicolon>" text "${text}")
+    string(REPLACE "\n" ";" lines "${text}")
+    set(found "")
+    foreach(line IN LISTS lines)
+        if(line MATCHES "CMake (Deprecation )?Warning|(^|[^A-Za-z0-9_])[Ww]arning:")
+            string(STRIP "${line}" line)
+            list(APPEND found "${line}")
+        endif()
+    endforeach()
+    set(${out_var} "${found}" PARENT_SCOPE)
+endfunction()
+
+# The one diagnostic check: <text> may contain no warnings except, with
+# EXACT <regex>, exactly one line matching it. Sets <out_var> to what is
+# wrong, or "".
+function(_pt_diagnostics out_var text)
+    cmake_parse_arguments(_d "" "EXACT" "" ${ARGN})
+    _pt_warnings(lines "${text}")
+    set(problems "")
+    if(DEFINED _d_EXACT)
+        set(matched 0)
+        set(rest "")
+        foreach(line IN LISTS lines)
+            if(line MATCHES "${_d_EXACT}")
+                math(EXPR matched "${matched} + 1")
+            else()
+                list(APPEND rest "${line}")
+            endif()
+        endforeach()
+        if(NOT matched EQUAL 1)
+            list(APPEND problems "expected exactly one warning matching '${_d_EXACT}', saw ${matched}")
+        endif()
+        set(lines "${rest}")
+    endif()
+    if(lines)
+        list(JOIN lines " | " joined)
+        list(APPEND problems "unexpected warnings: ${joined}")
+    endif()
+    set(${out_var} "${problems}" PARENT_SCOPE)
+endfunction()
+
+# A gate result for case <name>: a failure normally; with PT_CONTROL set the
+# case is a control whose stray warning the gate must catch.
+macro(_pt_gate name problems)
+    if(PT_CONTROL)
+        if("${problems}" STREQUAL "")
+            list(APPEND failures "${name}: control's stray warning was not caught")
+        endif()
+    elseif(NOT "${problems}" STREQUAL "")
+        list(APPEND failures "${name}: ${problems}")
+    endif()
+endmacro()
+
 # _pt_configure(<case> <build-dir> OK|<expected error text> <args>...)
-# Leaves the provider's record in pt_<case>_<KEY> for the checks below.
+# Leaves the provider's record in pt_<case>_<KEY> for the checks below. A
+# refusal is evidence only for its own error: other warnings still fail.
 function(_pt_configure name build expect)
     set(result "${MOQ_WORK}/result-${name}.txt")
     file(REMOVE "${result}")
@@ -100,14 +203,19 @@ function(_pt_configure name build expect)
             -S "${MOQ_WORK}/src/proj" -B "${MOQ_WORK}/${build}"
             "-DMOQ_TEST_MODULE_DIR=${MOQ_MODULE_DIR}"
             "-DMOQ_TEST_RESULT=${result}"
+            "-DMOQ_TEST_FIXTURE=${fixture}"
             ${ARGN}
         RESULT_VARIABLE rc
         OUTPUT_VARIABLE out
         ERROR_VARIABLE out)
+    _pt_keep(${name} configure "${rc}" "${out}")
     string(REGEX REPLACE "[ \t\r\n]+" " " flat "${out}")
+    _pt_diagnostics(problems "${out}")
+    _pt_gate(${name} "${problems}")
     if(expect STREQUAL "OK")
         if(NOT rc EQUAL 0)
-            set(failures ${failures} "${name}: configure failed: ${out}" PARENT_SCOPE)
+            list(APPEND failures "${name}: configure failed (see logs/${name}.configure.log)")
+            set(failures "${failures}" PARENT_SCOPE)
             return()
         endif()
         file(STRINGS "${result}" lines)
@@ -119,12 +227,29 @@ function(_pt_configure name build expect)
     else()
         string(FIND "${flat}" "${expect}" at)
         if(rc EQUAL 0)
-            set(failures ${failures} "${name}: configure succeeded; expected a refusal containing '${expect}'" PARENT_SCOPE)
+            list(APPEND failures "${name}: configure succeeded; expected a refusal containing '${expect}'")
         elseif(at EQUAL -1)
-            set(failures ${failures} "${name}: refusal does not contain '${expect}': ${out}" PARENT_SCOPE)
+            list(APPEND failures "${name}: refusal does not contain '${expect}' (see logs/${name}.configure.log)")
         endif()
     endif()
+    set(failures "${failures}" PARENT_SCOPE)
 endfunction()
+
+# Controls for the check itself.
+_pt_diagnostics(problems "CMake Error at x:\n  refused\nCMake Warning:\n  stray\n")
+if(problems STREQUAL "")
+    list(APPEND failures "control: a warning beside an error was not caught")
+endif()
+_pt_diagnostics(problems "a.c:1:2: warning: moq-isolation-probe\na.c:2:2: warning: unrelated\n1 warning generated.\n"
+    EXACT "moq-isolation-probe")
+if(problems STREQUAL "")
+    list(APPEND failures "control: an extra warning beside the intended one was not caught")
+endif()
+_pt_diagnostics(problems "a.c:1:2: warning: moq-isolation-probe [-W#warnings]\n1 warning generated.\n"
+    EXACT "moq-isolation-probe")
+if(NOT problems STREQUAL "")
+    list(APPEND failures "control: the intended warning alone was rejected: ${problems}")
+endif()
 
 # _pt_expect(<case> <KEY> <expected path or NONE>)
 function(_pt_expect name key expected)
@@ -193,6 +318,269 @@ _pt_expect_tree(installed "${pt}/nest/inst/include" "${pt}/nest/inst/lib")
 
 _pt_configure(invalid b-invalid "is not a picotls tree" "-DMOQ_PICOTLS_PREFIX=${pt}/empty" ${SRC})
 
+# PICOQUIC_FETCH_PTLS: picoquic builds the stand-in picotls F, from
+# FETCHCONTENT_SOURCE_DIR_PICOTLS or cloned from a local repository.
+file(COPY "${fixture}/picotls/" DESTINATION "${pt}/F")
+file(WRITE "${pt}/F/include/picotls.h" "")
+file(WRITE "${pt}/F/include/picotls/minicrypto.h" "")
+file(WRITE "${pt}/F/include/picotls/openssl.h" "")
+file(COPY "${pt}/F/" DESTINATION "${pt}/F-repo")
+foreach(step "init -q" "add -A"
+        "-c user.name=fixture -c user.email=fixture@example.invalid commit -q -m fixture")
+    separate_arguments(step_args UNIX_COMMAND "${step}")
+    execute_process(COMMAND git -C "${pt}/F-repo" ${step_args} RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR "fixture picotls repository: git ${step} failed")
+    endif()
+endforeach()
+execute_process(COMMAND git -C "${pt}/F-repo" rev-parse HEAD
+    OUTPUT_VARIABLE F_TAG OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(FETCH -DPICOQUIC_FETCH_PTLS=ON "-DFETCHCONTENT_SOURCE_DIR_PICOTLS=${pt}/F")
+set(CLONE -DPICOQUIC_FETCH_PTLS=ON "-DMOQ_TEST_PICOTLS_REPO=${pt}/F-repo"
+    "-DMOQ_TEST_PICOTLS_TAG=${F_TAG}")
+set(multi_config FALSE)
+if(DEFINED MOQ_GENERATOR AND MOQ_GENERATOR MATCHES "Multi-Config|^Xcode$|^Visual Studio")
+    set(multi_config TRUE)
+endif()
+# A Release build: a configure-time choice for single-config generators; a
+# multi-config tree builds it with --config Release.
+set(RELEASE -DCMAKE_BUILD_TYPE=Release)
+if(multi_config)
+    set(RELEASE "")
+endif()
+
+# _pt_expect_fetched(<case> <build-dir> [DIR <dir under the picotls build>]
+#                    [UNRESOLVED] [INCLUDE <dir>]): every selection is F's;
+# DIR is where its archives go, UNRESOLVED means no directory is known (so
+# none is selected or exported). Multi-config generators are UNRESOLVED.
+function(_pt_expect_fetched name build)
+    cmake_parse_arguments(_e "UNRESOLVED" "DIR;INCLUDE" "" ${ARGN})
+    set(fail "")
+    if(NOT DEFINED _e_INCLUDE)
+        set(_e_INCLUDE "${pt}/F/include")
+    endif()
+    get_filename_component(inc "${_e_INCLUDE}" REALPATH)
+    get_filename_component(sel "${pt_${name}_SELINC}" REALPATH)
+    if(NOT sel STREQUAL inc)
+        list(APPEND fail "${name}: PTLS_INCLUDE_DIR is '${pt_${name}_SELINC}', expected ${inc}")
+    endif()
+    foreach(key CCORE CMINICRYPTO COPENSSL)
+        if(NOT "${pt_${name}_${key}}" STREQUAL "")
+            list(APPEND fail "${name}: cached ${key} is '${pt_${name}_${key}}', expected none")
+        endif()
+    endforeach()
+    separate_arguments(tokens UNIX_COMMAND "${pt_${name}_PCLIBS}")
+    set(search "")
+    foreach(token IN LISTS tokens)
+        if(token MATCHES "^-L(.*)$")
+            get_filename_component(dir "${CMAKE_MATCH_1}" REALPATH)
+            list(APPEND search "${dir}")
+        endif()
+    endforeach()
+    if(_e_UNRESOLVED OR multi_config)
+        if(NOT "${pt_${name}_LIBDIR}" STREQUAL "")
+            list(APPEND fail "${name}: MOQ_PTLS_LIB_DIR is '${pt_${name}_LIBDIR}', expected none")
+        endif()
+        if("${pt_${name}_UNRESOLVED}" STREQUAL "")
+            list(APPEND fail "${name}: no MOQ_PTLS_LIB_DIR_UNRESOLVED reason recorded")
+        endif()
+        if(search)
+            list(APPEND fail "${name}: pkg-config closure has search directories (${search}), expected none")
+        endif()
+    else()
+        set(want "${MOQ_WORK}/${build}/_deps/picotls-build")
+        if(DEFINED _e_DIR)
+            set(want "${want}/${_e_DIR}")
+        endif()
+        get_filename_component(want "${want}" REALPATH)
+        get_filename_component(got "${pt_${name}_LIBDIR}" REALPATH)
+        if("${pt_${name}_LIBDIR}" STREQUAL "" OR NOT got STREQUAL want)
+            list(APPEND fail "${name}: MOQ_PTLS_LIB_DIR is '${pt_${name}_LIBDIR}', expected ${want}")
+        endif()
+        if(NOT "${pt_${name}_UNRESOLVED}" STREQUAL "")
+            list(APPEND fail "${name}: unexpected unresolved library directory: ${pt_${name}_UNRESOLVED}")
+        endif()
+        if(NOT search STREQUAL want)
+            list(APPEND fail "${name}: pkg-config search directories are '${search}', expected exactly ${want}")
+        endif()
+    endif()
+    set(failures ${failures} ${fail} PARENT_SCOPE)
+endfunction()
+
+_pt_configure(fetch_source b-fetch-source OK "-DMOQ_PICOTLS_PREFIX=${pt}/F" ${FETCH} ${SRC})
+_pt_expect_fetched(fetch_source b-fetch-source)
+if(NOT pt_fetch_source_HOOKBEFORE STREQUAL pt_fetch_source_HOOKAFTER)
+    list(APPEND failures "fetch_source: hook state '${pt_fetch_source_HOOKBEFORE}' became '${pt_fetch_source_HOOKAFTER}'")
+endif()
+_pt_configure(fetch_noprefix b-fetch-noprefix OK ${FETCH} ${SRC})
+_pt_expect_fetched(fetch_noprefix b-fetch-noprefix)
+_pt_configure(fetch_twice b-fetch-twice OK -DMOQ_TEST_FIND_TWICE=ON ${FETCH} ${SRC})
+_pt_expect_fetched(fetch_twice b-fetch-twice)
+foreach(layout custom config relative shared)
+    set(dir_custom custom)
+    set(dir_config cfg)
+    set(dir_relative rel)
+    set(dir_shared shlib)
+    _pt_configure(fetch_${layout} b-fetch-${layout} OK ${RELEASE}
+        -DMOQ_TEST_PTLS_LAYOUT=${layout} ${FETCH} ${SRC})
+    _pt_expect_fetched(fetch_${layout} b-fetch-${layout} DIR ${dir_${layout}})
+endforeach()
+_pt_configure(fetch_split b-fetch-split OK -DMOQ_TEST_PTLS_LAYOUT=split ${FETCH} ${SRC})
+_pt_expect_fetched(fetch_split b-fetch-split UNRESOLVED)
+_pt_configure(fetch_split_explicit b-fetch-split-explicit
+    "cannot be checked against the picotls picoquic builds"
+    -DMOQ_TEST_PTLS_LAYOUT=split "-DMOQ_PTLS_LIB_DIR=${pt}/A/build" ${FETCH} ${SRC})
+_pt_configure(fetch_other b-fetch-other
+    "names a different picotls than the one picoquic builds"
+    "-DMOQ_PICOTLS_PREFIX=${pt}/B/build" ${FETCH} ${SRC})
+# Control: an unrelated warning cannot ride along with an expected refusal.
+set(PT_CONTROL TRUE)
+_pt_configure(control_refusal b-control-refusal
+    "names a different picotls than the one picoquic builds"
+    "-DCMAKE_PROJECT_INCLUDE=${fixture}/hooks/stray_warning.cmake"
+    "-DMOQ_PICOTLS_PREFIX=${pt}/B/build" ${FETCH} ${SRC})
+set(PT_CONTROL FALSE)
+if(multi_config)
+    set(libdir_refusal "MOQ_PTLS_LIB_DIR=${pt}/A/build cannot be checked against the picotls picoquic builds")
+else()
+    set(libdir_refusal "MOQ_PTLS_LIB_DIR=${pt}/A/build conflicts with the picotls picoquic builds")
+endif()
+_pt_configure(fetch_explicit_libdir b-fetch-explicit-libdir "${libdir_refusal}"
+    "-DMOQ_PTLS_LIB_DIR=${pt}/A/build" ${FETCH} ${SRC})
+_pt_configure(fetch_explicit_core b-fetch-explicit-core
+    "PTLS_CORE_LIBRARY=${pt}/A/build/libpicotls-core.a is set, but picoquic links the picotls targets"
+    "-DPTLS_CORE_LIBRARY=${pt}/A/build/libpicotls-core.a" ${FETCH} ${SRC})
+# Cold, no OpenSSL: picoquic's fetched mbedTLS configuration needs
+# PTLS_INCLUDE_DIR while it is being added, from a local source and from a
+# clone whose source exists only once FetchContent has populated it.
+_pt_configure(fetch_mbedtls b-fetch-mbedtls OK -DWITH_MBEDTLS=ON -DWITH_OPENSSL=OFF ${FETCH} ${SRC})
+_pt_expect(fetch_mbedtls SELINC "${pt}/F/include")
+_pt_expect(fetch_mbedtls INC "${pt}/F/include")
+_pt_configure(fetch_clone_mbedtls b-fetch-clone-mbedtls OK -DWITH_MBEDTLS=ON -DWITH_OPENSSL=OFF
+    ${CLONE} ${SRC})
+_pt_expect_fetched(fetch_clone_mbedtls b-fetch-clone-mbedtls
+    INCLUDE "${MOQ_WORK}/b-fetch-clone-mbedtls/_deps/picotls-src/include")
+_pt_expect(fetch_clone_mbedtls INC "${MOQ_WORK}/b-fetch-clone-mbedtls/_deps/picotls-src/include")
+
+# LibMoQ's picotls policy, observed in compiles of a Release build: picotls
+# keeps assertions and treats warnings as errors; the consumer's and
+# picoquic's directories keep the configuration's flags. Caller hooks (a file
+# and a module name) run first, in picotls's scope; the cached hook list comes
+# back as it was.
+set(hooks "${fixture}/hooks")
+file(WRITE "${MOQ_WORK}/caller-hooks.cmake"
+    "set(CMAKE_PROJECT_picotls_INCLUDE [==[${hooks}/caller_hook_a.cmake;moq_test_hook_b]==] CACHE STRING \"caller hooks\")\n")
+_pt_configure(fetch_policy b-fetch-policy OK ${RELEASE}
+    "-DMOQ_TEST_HOOK_DIR=${hooks}" -C "${MOQ_WORK}/caller-hooks.cmake"
+    ${FETCH} ${SRC})
+if(NOT pt_fetch_policy_HOOKORDER STREQUAL "A[];B[]")
+    list(APPEND failures "fetch_policy: caller hooks ran as '${pt_fetch_policy_HOOKORDER}', expected A then B before LibMoQ's policy")
+endif()
+if(NOT pt_fetch_policy_PTLSSCOPE STREQUAL "set-by-hook-a")
+    list(APPEND failures "fetch_policy: a caller hook's variable did not reach picotls's scope ('${pt_fetch_policy_PTLSSCOPE}')")
+endif()
+if(NOT pt_fetch_policy_HOOKBEFORE STREQUAL pt_fetch_policy_HOOKAFTER)
+    list(APPEND failures "fetch_policy: hook state '${pt_fetch_policy_HOOKBEFORE}' became '${pt_fetch_policy_HOOKAFTER}'")
+endif()
+# _pt_build(<case> <target> OK|<expected error text> [EXACT <warning regex>])
+function(_pt_build name target expect)
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" --build "${MOQ_WORK}/b-fetch-policy" --config Release
+            --target ${target}
+        RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+    _pt_keep(${name}-${target} build "${rc}" "${out}")
+    _pt_diagnostics(problems "${out}" ${ARGN})
+    _pt_gate(${name}-${target} "${problems}")
+    if(expect STREQUAL "OK" AND NOT rc EQUAL 0)
+        list(APPEND failures "${name}: building ${target} failed (see logs/${name}-${target}.build.log)")
+    elseif(NOT expect STREQUAL "OK")
+        string(FIND "${out}" "${expect}" at)
+        if(rc EQUAL 0 OR at EQUAL -1)
+            list(APPEND failures "${name}: building ${target} was expected to fail with '${expect}' (rc ${rc})")
+        endif()
+    endif()
+    set(failures "${failures}" PARENT_SCOPE)
+endfunction()
+_pt_build(fetch_policy picotls-ndebug-probe OK)
+_pt_build(fetch_policy picotls-werror-probe "moq-werror-probe")
+_pt_build(fetch_policy consumer-isolation-probe OK EXACT "moq-isolation-probe")
+_pt_build(fetch_policy picoquic-isolation-probe OK EXACT "moq-isolation-probe")
+# Controls: an unrelated warning beside the intended one is caught.
+set(PT_CONTROL TRUE)
+_pt_build(control_probe consumer-isolation-extra-probe OK EXACT "moq-isolation-probe")
+set(PT_CONTROL FALSE)
+# The caller's bindings of both hook families after find_package, by
+# behaviour: unset, empty, normal, cache-only (must still follow its cache
+# entry) and normal over cache (must fall back to the cache entry).
+file(WRITE "${MOQ_WORK}/binding-cache.cmake" "")
+foreach(v CMAKE_PROJECT_picoquic_INCLUDE MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE
+        CMAKE_PROJECT_picotls_INCLUDE MOQ_PICOTLS_CALLER_PROJECT_INCLUDE)
+    file(APPEND "${MOQ_WORK}/binding-cache.cmake"
+        "set(${v} [==[${hooks}/noop_cache.cmake]==] CACHE STRING \"caller binding\")\n")
+endforeach()
+foreach(state unset empty set cache over)
+    set(preload "")
+    if(state MATCHES "^(cache|over)$")
+        set(preload -C "${MOQ_WORK}/binding-cache.cmake")
+    endif()
+    _pt_configure(binding_${state} b-binding-${state} OK ${preload}
+        "-DMOQ_TEST_HOOK_DIR=${hooks}" -DMOQ_TEST_BINDING=${state} ${FETCH} ${SRC})
+    if(NOT pt_binding_${state}_BINDING STREQUAL "ok")
+        list(APPEND failures "binding_${state}: ${pt_binding_${state}_BINDING}")
+    endif()
+endforeach()
+
+# Beneath a directory holding the fetched FindPTLS's PTLS_*_LIBRARY values.
+_pt_configure(nested_ok b-nested-ok OK -DMOQ_TEST_NESTED=ON ${FETCH} ${SRC})
+_pt_expect_fetched(nested_ok b-nested-ok)
+_pt_configure(nested_conflict b-nested-conflict "visible from an enclosing directory"
+    -DMOQ_TEST_NESTED=ON "-DMOQ_TEST_NESTED_CORE=${pt}/A/build/libpicotls-core.a"
+    ${FETCH} ${SRC})
+_pt_configure(nested_hidden b-nested-hidden
+    "PTLS_CORE_LIBRARY=${pt}/A/build/libpicotls-core.a is set, but picoquic links the picotls targets"
+    -DMOQ_TEST_NESTED=ON "-DPTLS_CORE_LIBRARY=${pt}/A/build/libpicotls-core.a" ${FETCH} ${SRC})
+
+# Prebuilt A -> fetched F -> prebuilt A, in one tree.
+_pt_configure(swap_a b-swap OK "${A}" ${SRC})
+_pt_expect_tree(swap_a "${pt}/A/include" "${pt}/A/build")
+_pt_configure(swap_f b-swap OK "-DMOQ_PICOTLS_PREFIX=${pt}/F" ${FETCH} ${SRC})
+_pt_expect_fetched(swap_f b-swap)
+_pt_configure(swap_back b-swap OK "${A}" -DPICOQUIC_FETCH_PTLS=OFF
+    -UFETCHCONTENT_SOURCE_DIR_PICOTLS ${SRC})
+_pt_expect_tree(swap_back "${pt}/A/include" "${pt}/A/build")
+_pt_expect(swap_back CCORE "${pt}/A/build/libpicotls-core.a")
+separate_arguments(swap_tokens UNIX_COMMAND "${pt_swap_back_PCLIBS}")
+set(swap_search "")
+foreach(token IN LISTS swap_tokens)
+    if(token MATCHES "^-L(.*)$")
+        get_filename_component(dir "${CMAKE_MATCH_1}" REALPATH)
+        list(APPEND swap_search "${dir}")
+    endif()
+endforeach()
+get_filename_component(swap_want "${pt}/A/build" REALPATH)
+if(NOT swap_search STREQUAL swap_want)
+    list(APPEND failures "swap_back: pkg-config search directories are '${swap_search}', expected exactly ${swap_want}")
+endif()
+
+# A populated picotls that the selected picoquic does not link.
+_pt_configure(unrelated_cfg b-unrelated-cfg OK -DMOQ_TEST_UNRELATED_FETCH=ON
+    -DMOQ_TEST_FIND_TWICE=ON "${A}" "-DFETCHCONTENT_SOURCE_DIR_PICOTLS=${pt}/F" ${CFG})
+_pt_expect(unrelated_cfg SELINC "${pt}/A/include")
+_pt_expect(unrelated_cfg LIBDIR "${pt}/A/build")
+_pt_configure(unrelated_pre b-unrelated-pre OK -DMOQ_TEST_UNRELATED_FETCH=ON
+    -DMOQ_TEST_PRE_ADD=ON -DMOQ_TEST_FIND_TWICE=ON "${A}"
+    "-DFETCHCONTENT_SOURCE_DIR_PICOTLS=${pt}/F"
+    "-DMOQ_PICOQUIC_SOURCE_DIR=${MOQ_WORK}/fakepq")
+_pt_expect(unrelated_pre SELINC "${pt}/A/include")
+_pt_expect(unrelated_pre LIBDIR "${pt}/A/build")
+# A pre-existing picoquic that does link the picotls it built.
+_pt_configure(pre_fetch b-pre-fetch OK -DMOQ_TEST_PRE_ADD=ON -DMOQ_TEST_FIND_TWICE=ON
+    ${FETCH} "-DMOQ_PICOQUIC_SOURCE_DIR=${MOQ_WORK}/fakepq")
+_pt_expect(pre_fetch SELINC "${pt}/F/include")
+_pt_configure(pre_alias b-pre-alias OK -DMOQ_TEST_PRE_ADD=ON -DMOQ_TEST_PQ_LINK_ALIAS=ON
+    ${FETCH} "-DMOQ_PICOQUIC_SOURCE_DIR=${MOQ_WORK}/fakepq")
+_pt_expect(pre_alias SELINC "${pt}/F/include")
+
 # Installed picoquic CONFIG package: only the directories libmoq reads.
 macro(_pt_expect_dirs name inc libdir)
     _pt_expect(${name} SELINC "${inc}")
@@ -219,7 +607,12 @@ _pt_configure(cfg_installed b-cfg-installed OK "-DMOQ_PICOTLS_PREFIX=${pt}/nest/
 _pt_expect_dirs(cfg_installed "${pt}/nest/inst/include" "${pt}/nest/inst/lib")
 
 # Adapter: the verifier's picotls headers follow the selection.
-if(DEFINED MOQ_OPENSSL_ROOT AND NOT MOQ_OPENSSL_ROOT STREQUAL "")
+# The adapter's build-tree targets file is generated once for every
+# configuration, so libmoq with the picoquic adapter configures only under a
+# single-config generator.
+if(multi_config)
+    message(STATUS "picotls prefix selection: adapter cases need a single-config generator; not run")
+elseif(DEFINED MOQ_OPENSSL_ROOT AND NOT MOQ_OPENSSL_ROOT STREQUAL "")
     # _pt_adapter(<case> <build-dir> OK|<expected error text> <args>...)
     # Leaves the adapter's include directories under the picotls trees in
     # pt_<case>_ADAPTER_INC.
@@ -228,6 +621,12 @@ if(DEFINED MOQ_OPENSSL_ROOT AND NOT MOQ_OPENSSL_ROOT STREQUAL "")
         file(REMOVE_RECURSE "${dir}")
         file(MAKE_DIRECTORY "${dir}/.cmake/api/v1/query")
         file(WRITE "${dir}/.cmake/api/v1/query/codemodel-v2" "")
+        # The stand-in picoquic's inputs, for the source-tree cases only.
+        set(provider_args "")
+        if("${ARGN}" MATCHES "-DMOQ_PICOQUIC_SOURCE_DIR=")
+            set(provider_args "-DMOQ_TEST_RESULT=${MOQ_WORK}/result-${name}.txt"
+                "-DMOQ_TEST_FIXTURE=${fixture}")
+        endif()
         execute_process(
             COMMAND "${CMAKE_COMMAND}" ${generator_args} ${context_args}
                 -S "${MOQ_SOURCE}" -B "${dir}"
@@ -236,11 +635,15 @@ if(DEFINED MOQ_OPENSSL_ROOT AND NOT MOQ_OPENSSL_ROOT STREQUAL "")
                 -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
                 -DMOQ_PICOQUIC_VERIFY_BACKEND=openssl
                 "-DOPENSSL_ROOT_DIR=${MOQ_OPENSSL_ROOT}"
-                "-DMOQ_TEST_RESULT=${MOQ_WORK}/result-${name}.txt"
+                ${provider_args}
                 ${ARGN}
             RESULT_VARIABLE rc
             OUTPUT_VARIABLE out
             ERROR_VARIABLE out)
+        _pt_keep(${name} configure "${rc}" "${out}")
+        _pt_diagnostics(problems "${out}")
+        _pt_gate(${name} "${problems}")
+        set(failures "${failures}" PARENT_SCOPE)
         string(REGEX REPLACE "[ \t\r\n]+" " " flat "${out}")
         if(NOT expect STREQUAL "OK")
             string(FIND "${flat}" "${expect}" at)

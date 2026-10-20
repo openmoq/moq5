@@ -229,6 +229,29 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME msquic_commit COMMAND test_msquic_commit)
     set_tests_properties(msquic_commit PROPERTIES LABELS "msquic;sansio" TIMEOUT 60)
 
+    # A cancelled request bidi is retired by the stream's transport terminal
+    # (SHUTDOWN_COMPLETE outside connection teardown), reported outside any
+    # endpoint-op or bridge frame. Same white-box rig as the commit test.
+    add_executable(test_msquic_stream_terminal
+        tests/test_msquic_stream_terminal.c
+        tests/support/fake_msq_table.c
+        msquic_adapter.c)
+    target_include_directories(test_msquic_stream_terminal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/tests/unit)
+    target_compile_definitions(test_msquic_stream_terminal PRIVATE
+        MOQ_MSQUIC_TESTING MOQ_BUILDING)
+    target_link_libraries(test_msquic_stream_terminal PRIVATE moq::core msquic::msquic)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_msquic_stream_terminal PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msquic_stream_terminal COMMAND test_msquic_stream_terminal)
+    set_tests_properties(msquic_stream_terminal PROPERTIES LABELS "msquic;sansio" TIMEOUT 60)
+
     # The transport terminal always reaches the session, exactly once --
     # including when the bridge already latched a terminal of its own, whose
     # latch tells the session nothing. Same white-box rig as the units: the

@@ -1164,6 +1164,11 @@ relay_lane_pump(moq_msquic_managed_t *m, moq_msquic_managed_lane_t *lane,
         }
     }
     (void)moqr_bind_pump(ctx->bind, now_us);
+    /* Retrieval can enqueue origin work after its dispatch pass, and a
+     * bounded fill pass can leave another group ready with no new event. */
+    if (moqr_bind_pump_budget_pending(ctx->bind)) {
+        (void)moq_msquic_lane_wake(lane);
+    }
     moqr_cli_deadline_publish(&ctx->deadline[0],
                               moqr_core_next_deadline_us(ctx->core), now_us);
     /* A binding this pump's own work detached must be retired now: nothing

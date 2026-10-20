@@ -4990,6 +4990,30 @@ static int nsfin_expect_ops(nsfin_arm_t *a, size_t want_fin_writes,
     return failures;
 }
 
+/* The client's endpoint did exactly one thing: reset our half of the
+ * request bidi with CANCELLED. */
+static int nsfin_expect_cancel(nsfin_arm_t *a, const char *what)
+{
+    int failures = 0;
+    size_t resets = 0, other = 0;
+    MOQ_TEST_CHECK(a->tp.client_ep.count < FAKE_EP_MAX_OPS);
+    for (size_t i = 0; i < a->tp.client_ep.count; i++) {
+        fake_op_t *o = &a->tp.client_ep.ops[i];
+        if (o->kind == FAKE_OP_RESET && o->stream_id == a->bidi &&
+            o->error_code == MOQ_STREAM_ERROR_CANCELLED)
+            resets++;
+        else
+            other++;
+    }
+    if (resets != 1 || other != 0) {
+        fprintf(stderr, "NSFIN %s: %zu CANCELLED resets and %zu other ops,"
+                " expected 1/0\n", what, resets, other);
+        failures++;
+    }
+    fake_endpoint_clear_ops(&a->tp.client_ep);
+    return failures;
+}
+
 /* Release ONLY the blocker: exactly the declared NAMESPACE_FOUND. */
 static int nsfin_release_blocker(nsfin_arm_t *a)
 {
@@ -5121,8 +5145,9 @@ static int test_ns_response_reset_bridge(void)
     MOQ_TEST_CHECK_EQ_INT(
         (int)held_bridge_service(a.tp.client_bridge, 0), (int)MOQ_OK);
     failures += nsfin_expect_gone(&a, 1, "reset complete");
-    /* A reset owns physical teardown: no local close is queued. */
-    failures += nsfin_expect_ops(&a, 0, "reset complete");
+    /* The peer's reset ends the request: the session queues no close, and
+     * our still-open half is cancelled once, with CANCELLED. */
+    failures += nsfin_expect_cancel(&a, "reset complete");
     failures += nsfin_check_retired(&a, &live, &d0, a.budget0, "reset complete");
 
     MOQ_TEST_CHECK_EQ_INT(
@@ -7036,11 +7061,16 @@ static int run_nslb_teardown(bool fin, bool fill_ring)
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.server_bridge));
         MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(tp.server_bridge));
 
-        /* dispatch_abort_bidi keeps the entry as a discard tombstone until a
-         * peer terminal signal, so it stays active with its mapping intact.
-         * The bridge cleared its retained FIN on the successful retry. */
-        failures += nslb_check_entry(tp.server_bridge, bidi_id, sref._v, 0, 1,
-                                     0, fin ? 1 : 0, what);
+        /* Without a peer terminal the discard mapping remains. A FIN already
+         * retained before the abort is sufficient: after service settles the
+         * abort, neither a mapping nor a second terminal is owed. */
+        if (fin) {
+            MOQ_TEST_CHECK(bridge_find_by_id(tp.server_bridge, bidi_id) == NULL);
+            MOQ_TEST_CHECK(bridge_find_by_ref(tp.server_bridge, sref) == NULL);
+        } else {
+            failures += nslb_check_entry(tp.server_bridge, bidi_id, sref._v,
+                                         0, 1, 0, 0, what);
+        }
         MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(tp.server_bridge));
         MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(
                            tp.server_bridge, bidi_id));
@@ -9998,10 +10028,60 @@ static int carrier_target_arm(test_pair_t *tp, moq_stream_ref_t *other,
     return 0;
 }
 
+/* The immediate RESET retired the carrier but our half of the request bidi is
+ * still open: its cancellation is owed to the service pass, not issued inside
+ * the callback. */
+static int carrier_cancel_owed(test_pair_t *tp, moq_stream_ref_t tgt_ref,
+                               moq_stream_ref_t other, moq_stream_ref_t seed_ref,
+                               const nob_ring_t *ring_before, const char *what)
+{
+    int bad = 0;
+    if (noslot_carrier_find(tp->server, tgt_ref) >= 0) {
+        fprintf(stderr, "NOB %s: target carrier still present\n", what);
+        bad++;
+    }
+    exh_carrier_snap_t want;
+    memset(&want, 0, sizeof(want));
+    want.count = 1; want.ref[0] = other._v; want.fin[0] = 0;
+    bad += exh_carrier_equals(tp->server, &want, what);
+    {
+        nob_ring_t now;
+        nob_ring_snap(tp->server, &now);
+        bad += nob_ring_equals(&now, ring_before, what);
+    }
+    if (moq_session_has_transport_stream(tp->server, tgt_ref)) {
+        fprintf(stderr, "NOB %s: retainability identity still present\n", what);
+        bad++;
+    }
+    bad += exh_check_seed(tp, seed_ref, what);
+    if (moq_transport_bridge_is_fatal(tp->server_bridge) ||
+        moq_transport_bridge_is_closed(tp->server_bridge) ||
+        (int)tp->server->state != (int)MOQ_SESS_ESTABLISHED ||
+        tp->server->event_tail != tp->server->event_head ||
+        tp->server->action_tail != tp->server->action_head) {
+        fprintf(stderr, "NOB %s: server not open/established/empty\n", what);
+        bad++;
+    }
+    bridge_stream_entry_t *e = bridge_find_by_id(tp->server_bridge, 600);
+    if (!e || !e->active || e->ref._v != tgt_ref._v || !e->peer_reset_accepted ||
+        e->local_send_closed) {
+        fprintf(stderr, "NOB %s: our open half is not kept for its cancel\n", what);
+        bad++;
+    }
+    if (tp->server_ep.count != 0 || tp->client_ep.count != 0 ||
+        tp->server_bridge->pending_count != 0) {
+        fprintf(stderr, "NOB %s: output inside the callback\n", what);
+        bad++;
+    }
+    return bad;
+}
+
 /* A retained no-slot carrier is RETIRED when a peer RESET terminates the
- * request (draft-18 sections 3.3.2, 11.4.1). The full retired postcondition is
- * reasserted at the immediate RESET, after first service, at the repeated RESET
- * before service, and after repeat service -- never merely count/carrier/ring. */
+ * request (draft-18 sections 3.3.2, 11.4.1); the request is then over, and
+ * the service pass cancels our still-open half once, with CANCELLED. The full
+ * retired postcondition is reasserted after that service, at the repeated
+ * RESET before service, and after repeat service -- never merely
+ * count/carrier/ring. */
 static int test_noslot_carrier_peer_reset(void)
 {
     int failures = 0;
@@ -10018,14 +10098,20 @@ static int test_noslot_carrier_peer_reset(void)
     MOQ_TEST_CHECK_EQ_INT(
         (int)held_bridge_reset(tp.server_bridge, 600,
                                                        0x1, 0), (int)MOQ_OK);
-    failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
-                                     "carrier-reset immediate");
+    failures += carrier_cancel_owed(&tp, tgt_ref, other, seed_ref, &ring_before,
+                                    "carrier-reset immediate");
 
-    /* First service. */
-    fake_endpoint_clear_ops(&tp.server_ep);
+    /* First service: exactly our half's CANCELLED reset, then retired. */
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK_EQ_INT(
         (int)held_bridge_service(tp.server_bridge, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(tp.server_ep.count, (size_t)1);
+    if (tp.server_ep.count == 1) {
+        MOQ_TEST_CHECK_EQ_INT((int)tp.server_ep.ops[0].kind, (int)FAKE_OP_RESET);
+        MOQ_TEST_CHECK(tp.server_ep.ops[0].stream_id == 600);
+        MOQ_TEST_CHECK(tp.server_ep.ops[0].error_code == MOQ_STREAM_ERROR_CANCELLED);
+    }
+    fake_endpoint_clear_ops(&tp.server_ep);
     failures += carrier_retired_post(&tp, tgt_ref, other, seed_ref, &ring_before,
                                      "carrier-reset service");
 

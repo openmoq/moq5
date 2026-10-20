@@ -87,6 +87,8 @@ public enum ExtendedTrackEvent: Sendable {
     /// Nil means the native sized output omitted the complete local result.
     /// Present values retain their exact signed native result, including zero.
     case localFailure(MediaTrack, localResult: Int32?)
+    /// An UPDATE failed before admission, not a peer rejection or track end.
+    case updateLocalFailure(MediaTrack, localResult: Int32?)
     /// Local capacity refusal. Origin is the native MOQ_MEDIA_DELIVERY_* value;
     /// only FILL carries an initiating ID. Nil denotes an absent complete field.
     /// LIVE fails this generation; FILL leaves its parent active.

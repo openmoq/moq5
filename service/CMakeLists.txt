@@ -619,7 +619,8 @@ if(MOQ_BUILD_TESTS)
             # This fixture includes the production receiver conversion, so link
             # endpoint-only support rather than a second receiver object.
             add_executable(test_media_receiver_companion
-                tests/test_media_receiver_companion.c)
+                tests/test_media_receiver_companion.c
+                tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_companion PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_companion PRIVATE
@@ -678,6 +679,21 @@ if(MOQ_BUILD_TESTS)
                 COMMAND test_media_receiver_delivery_failure)
             set_tests_properties(media_receiver_delivery_failure PROPERTIES TIMEOUT 30)
 
+            add_executable(test_media_receiver_update_failure
+                tests/test_media_receiver_update_failure.c)
+            target_link_libraries(test_media_receiver_update_failure PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_update_failure PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_update_failure PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_update_failure
+                COMMAND test_media_receiver_update_failure)
+            set_tests_properties(media_receiver_update_failure PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_receiver_metadata_copy
                 tests/test_media_receiver_metadata_copy.c)
             target_link_libraries(test_media_receiver_metadata_copy PRIVATE
@@ -694,7 +710,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_metadata_copy PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_origin
-                tests/test_media_receiver_origin.c)
+                tests/test_media_receiver_origin.c
+                tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_origin PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_origin PRIVATE
@@ -708,7 +725,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_origin PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_fill_control
-                tests/test_media_receiver_fill_control.c)
+                tests/test_media_receiver_fill_control.c
+                tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_fill_control PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_fill_control PRIVATE
@@ -1624,11 +1642,15 @@ if(MOQ_BUILD_TESTS)
                 get_filename_component(_svc_wtqm_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
                 get_filename_component(_svc_wtqm_ossl "${_svc_wtqm_o}" DIRECTORY)
             endif()
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+            set(_svc_wtqm_context "${CMAKE_CURRENT_BINARY_DIR}/wtquic-msquic-consumer-context.cmake")
+            moq_write_consumer_context("${_svc_wtqm_context}")
             add_test(NAME service_wtquic_msquic_install_consumer
                 COMMAND ${CMAKE_COMMAND}
                     -DBUILD=${PROJECT_BINARY_DIR}
                     -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer
                     -DWORK=${CMAKE_CURRENT_BINARY_DIR}/wtquic-msquic-consumer-work
+                    "-DCONSUMER_CONTEXT=${_svc_wtqm_context}"
                     "-DWTQUIC_PREFIX=${_svc_wtqm_prefix}"
                     "-DMSQUIC_DIR_HINT=${msquic_DIR}"
                     "-DPICOQUIC_SOURCE_DIR=${MOQ_PICOQUIC_SOURCE_DIR}"

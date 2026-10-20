@@ -1169,7 +1169,7 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     case MOQ_MEDIA_TRACK_ADDED: case MOQ_MEDIA_TRACK_UPDATED: case MOQ_MEDIA_TRACK_REMOVED:
     case MOQ_MEDIA_TRACK_ENDED: case MOQ_MEDIA_TRACK_UPDATE_OK: case MOQ_MEDIA_TRACK_PARSE_DROP:
     case MOQ_MEDIA_TRACK_LOCAL_FAILURE: case MOQ_MEDIA_TRACK_FILL_TERMINAL:
-    case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE:
+    case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE: case MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE:
         track_scoped = true; global = false; break;
     case MOQ_MEDIA_CATALOG_READY:
         track_scoped = false; global = true; break;
@@ -1241,7 +1241,8 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     }
     if (!drop) goto out;
     local_result = (ev.kind == MOQ_MEDIA_TRACK_LOCAL_FAILURE ||
-                    ev.kind == MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE) &&
+                    ev.kind == MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE ||
+                    ev.kind == MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE) &&
                    COVERS(ev.struct_size, moq_media_track_event_t, local_result)
                        ? PyLong_FromLong(ev.local_result) : Py_NewRef(Py_None);
     if (!local_result) goto out;
@@ -2795,7 +2796,7 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(FILL_LOCAL_ABORTED); ADD(FILL_PARENT_REJECTED); ADD(FILL_PARENT_TERMINATED);
     ADD(FILL_ERROR_NONE); ADD(FILL_ERROR_STREAM); ADD(FILL_ERROR_PARENT_REQUEST); ADD(FILL_ERROR_PARENT_DONE);
     ADD(MEDIA_TRACK_LOCAL_FAILURE); ADD(MEDIA_TRACK_FILL_TERMINAL); ADD(MEDIA_TRACK_STATE_FAILED);
-    ADD(MEDIA_TRACK_DELIVERY_LOCAL_FAILURE);
+    ADD(MEDIA_TRACK_DELIVERY_LOCAL_FAILURE); ADD(MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
     ADD(MEDIA_TRACK_ADDED); ADD(MEDIA_TRACK_UPDATED); ADD(MEDIA_TRACK_REMOVED); ADD(MEDIA_TRACK_ENDED);
     ADD(MEDIA_CATALOG_READY); ADD(MEDIA_TRACK_UPDATE_OK); ADD(MEDIA_TRACK_PARSE_DROP);
     ADD(MEDIA_TRACK_STATE_DISCOVERED); ADD(MEDIA_TRACK_STATE_PENDING); ADD(MEDIA_TRACK_STATE_ACTIVE);

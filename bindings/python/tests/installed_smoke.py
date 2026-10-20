@@ -42,7 +42,12 @@ INSTALLED_FILES = (
 PUBLIC_NAMES = frozenset({
     "Backend", "Backpressure", "BindingError", "BuildInfo",
     "CATALOG_REFRESH_DISABLED", "Cenc", "CmafInit", "CmafSample", "CodecKind",
-    "Endpoint", "EndpointConfig", "EndpointState", "EventLost", "FatalOrigin",
+    "CompanionProfile", "DeliveryOrigin",
+    "Endpoint", "EndpointConfig", "EndpointState", "EventLost",
+    "ExtendedTrackEventKind", "ExtendedTrackState", "FatalOrigin",
+    "FillConfig", "FillErrorDomain", "FillGroupOrder", "FillReason",
+    "FillTerminal", "LocMetadata", "LocationFilter", "LocationFilterKind",
+    "MediaMetadata", "MediaTimeDomain",
     "MediaObject", "MediaTemplate", "MediaType", "MoqError", "ObjectLost",
     "ObjectStatus", "OverflowPolicy", "Packaging", "ParseDrop",
     "ParseDropClass", "PollOutcome", "Protocol", "Receiver", "ReceiverConfig",

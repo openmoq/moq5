@@ -40,6 +40,7 @@ awk -F '\t' '
         inherited["d22_encode_namespace_msg"]=1
         inherited["d22_encode_subscribe_tracks"]=1
         inherited["d22_encode_publish_blocked"]=1
+        inherited["d22_encode_namespace_update"]=1
         inherited["d22_decode_ns_sub_request"]=1
         inherited["d22_encode_track_status"]=1
         inherited["d22_encode_track_status_ok"]=1

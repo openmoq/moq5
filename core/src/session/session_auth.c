@@ -318,12 +318,10 @@ static void ov_project_after(const moq_cache_overlay_t *ov,
 
 moq_result_t process_auth_tokens(moq_session_t *s,
     const moq_decoded_auth_token_t *tokens_in, size_t tokens_in_count,
-    moq_resolved_token_t *out_tokens, size_t *out_token_count,
-    size_t max_tokens, uint64_t *out_reject_code, bool *out_staged,
-    moq_auth_txn_t *txn)
+    const moq_auth_resolve_out_t *out)
 {
-    return process_auth_tokens_after(s, tokens_in, tokens_in_count, out_tokens,
-        out_token_count, max_tokens, out_reject_code, out_staged, txn, NULL);
+    return process_auth_tokens_after(s, tokens_in, tokens_in_count, out->tokens,
+        out->token_count, out->max_tokens, out->reject_code, out->staged, out->txn, NULL);
 }
 
 moq_result_t process_auth_tokens_after(moq_session_t *s,

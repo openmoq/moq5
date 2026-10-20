@@ -64,6 +64,13 @@ static bool data_terminal(const moq_fill_entry_t *e)
     return e->stream_bound && (e->data_fin || e->data_reset);
 }
 
+/* The bound stream is over: its FIN or RESET, or a local receive retirement
+ * of a stream we stopped. Only the first two are a peer outcome. */
+static bool stream_ended(const moq_fill_entry_t *e)
+{
+    return data_terminal(e) || (e->stream_bound && e->data_local_retired);
+}
+
 static bool no_stream_proven(const moq_fill_entry_t *e)
 {
     return e->control == MOQ_FILL_CONTROL_ACCEPTED && e->delivery_known &&
@@ -79,7 +86,7 @@ static bool stopping(const moq_fill_entry_t *e)
 
 static bool data_settled(const moq_fill_entry_t *e)
 {
-    if (e->stream_bound) return data_terminal(e) && e->stream_accounted;
+    if (e->stream_bound) return stream_ended(e) && e->stream_accounted;
     if (no_stream_proven(e)) return true;
     /* Only an outgoing unopened obligation can be removed by parent/request
      * cancellation. An unbound receiver still owns a possible late header. */
@@ -90,7 +97,7 @@ static bool data_settled(const moq_fill_entry_t *e)
 
 static uint32_t next_action(const moq_fill_entry_t *e)
 {
-    if (data_terminal(e)) return MOQ_FILL_ACTION_NONE;
+    if (stream_ended(e)) return MOQ_FILL_ACTION_NONE;
     if (e->role == MOQ_FILL_SUBSCRIBER)
         return e->stream_bound && stopping(e) && !e->stop_committed ?
             MOQ_FILL_ACTION_STOP : MOQ_FILL_ACTION_NONE;
@@ -345,7 +352,7 @@ static moq_result_t receive_terminal(moq_fill_table_t *t,
     if (e->role != MOQ_FILL_SUBSCRIBER || !e->stream_bound ||
         e->stream._v != stream._v) return MOQ_ERR_WRONG_STATE;
     /* Repeated terminal callbacks never recount; retain the first outcome. */
-    if (data_terminal(e)) return MOQ_OK;
+    if (stream_ended(e)) return MOQ_OK;
     if (reset) e->data_reset = true;
     else e->data_fin = true;
     reason_first(e, reset ? MOQ_FILL_TERM_RESET : MOQ_FILL_TERM_COMPLETE);
@@ -359,6 +366,19 @@ moq_result_t moq_fill_peer_fin(moq_fill_table_t *t,
 moq_result_t moq_fill_peer_reset(moq_fill_table_t *t,
     moq_fill_ref_t ref, moq_stream_ref_t stream)
 { return receive_terminal(t, ref, stream, true); }
+
+moq_result_t moq_fill_local_retired(moq_fill_table_t *t,
+    moq_fill_ref_t ref, moq_stream_ref_t stream)
+{
+    moq_fill_entry_t *e = lookup_mut(t, ref);
+    if (!e) return MOQ_ERR_STALE_HANDLE;
+    if (e->role != MOQ_FILL_SUBSCRIBER || !e->stream_bound ||
+        e->stream._v != stream._v || !e->stop_committed)
+        return MOQ_ERR_WRONG_STATE;
+    if (stream_ended(e)) return MOQ_OK;
+    e->data_local_retired = true;
+    return MOQ_OK;
+}
 
 moq_result_t moq_fill_peer_stop(moq_fill_table_t *t,
     moq_fill_ref_t ref, moq_stream_ref_t stream)
@@ -402,7 +422,7 @@ moq_result_t moq_fill_next(const moq_fill_table_t *t,
     const moq_fill_entry_t *e = lookup(t, ref);
     if (!e) return MOQ_ERR_STALE_HANDLE;
     *out = (moq_fill_work_t){.action = next_action(e),
-        .account_stream = data_terminal(e) && !e->stream_accounted,
+        .account_stream = stream_ended(e) && !e->stream_accounted,
         .publish_terminal = terminal_ready(e), .terminal_reason = e->terminal_reason,
         .reclaimable = reclaimable(e)};
     return MOQ_OK;
@@ -413,7 +433,7 @@ moq_result_t moq_fill_stream_accounted(moq_fill_table_t *t,
 {
     moq_fill_entry_t *e = lookup_mut(t, ref);
     if (!e) return MOQ_ERR_STALE_HANDLE;
-    if (!data_terminal(e) || e->stream_accounted) return MOQ_ERR_WRONG_STATE;
+    if (!stream_ended(e) || e->stream_accounted) return MOQ_ERR_WRONG_STATE;
     e->stream_accounted = true;
     return MOQ_OK;
 }

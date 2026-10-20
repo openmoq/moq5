@@ -195,12 +195,14 @@ int main() {
 
 ### Server mode details
 
-- Session and adapter are created lazily on the network thread
-  when the first client connection fires `picoquic_callback_ready`.
+- Each client's session and adapter are created lazily on the network thread
+  when its connection becomes ready.
 - `_session()` and `_conn()` return NULL until that happens.
 - `on_lane_pump` is not called until session/adapter exist.
-- v0 supports one active server connection. Additional connections
-  are ignored by the helper without replacing the existing session.
+- Up to `cfg.max_connections` clients are accepted concurrently (0 selects
+  the default of 1024); connections beyond the cap are rejected. Iterate them
+  with `moq_pq_threaded_lane_next_conn()`. The legacy `_session()` and `_conn()`
+  accessors return the first live connection.
 - `_stop()` before any client connects is safe and clean.
 
 ### Lifecycle summary
@@ -263,4 +265,27 @@ the FIN of a local unidirectional stream are acknowledged
 adapters report commitment to the bridge (`MOQ_TRANSPORT_CAP_COMMIT_REPORT`).
 A reset accepted on the stream wins over any later ACK. A provider header
 without the macro builds the adapters without commit reports. The patches
-apply in file order: 0002, 0006, 0007.
+apply in the order declared by `patches/picoquic/series`; use
+`scripts/setup_picoquic_deps.sh` to prepare the complete provider input.
+
+## Provider terminal cancellation
+
+The raw and WebTransport adapters require
+`PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED=1` in the provider's matching public
+header. Patch 0010 supplies this contract for the pinned source. An external
+provider must carry the equivalent implementation, not only define the macro.
+Rebuild the provider and adapters together; an installed provider's headers and
+libraries must describe the same implementation.
+
+Reset and STOP operations distinguish a terminal direction from an invalid
+stream ID before changing stream state or its application context. A terminal
+direction returns `PICOQUIC_ERROR_STREAM_ALREADY_CLOSED`, which the adapter
+treats as an OK no-op: no extra frame, callback or stream creation. Unknown,
+out-of-range and wrong-direction IDs remain errors. A FIN that has been sent
+but not acknowledged is still resettable; a FIN acknowledged through its final
+byte is terminal. STOP ends only the receive direction of a bidirectional
+stream, never its independent send direction.
+
+This cancellation contract is required whether or not terminal observation is
+enabled. Omitting patch 0007 is supported for drafts 16 and 18, but does not
+remove the close-reason or terminal-cancellation requirements.

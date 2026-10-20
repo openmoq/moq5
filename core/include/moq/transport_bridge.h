@@ -552,9 +552,30 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_reset(
 /*
  * The peer's transport stream has fully terminated (both directions
  * done, as the adapter's stream-closed signal reports). Backend-neutral:
- * every adapter that learns of stream termination should call this. It
- * retires a stream the bridge is discarding after a whole-stream abort;
- * on any other stream it is a harmless no-op.
+ * every adapter that learns of stream termination should call this,
+ * except while the connection itself is shutting down (that is the
+ * connection's terminal, reported once through on_transport_close /
+ * on_transport_error, never as per-stream completions).
+ *
+ * It says only that the transport is finished with the stream: it is not a
+ * FIN, not a reset, and not evidence that any byte was delivered or
+ * acknowledged. The callback only latches retirement work; service performs
+ * settlement outside endpoint-op frames, once pending ownership permits it:
+ *   - a bidi the bridge is discarding after a whole-stream abort: its drain
+ *     identity and mapping are released after outbound obligations settle,
+ *     with no live session owner or same-ref queued action remaining. Genuine
+ *     peer FIN/RESET reports on an already-aborting bidi use this same
+ *     deferred settlement; accepting our abort alone, or receiving a peer
+ *     STOP_SENDING, is not a terminal. No peer FIN/reset is fabricated;
+ *   - a peer data stream the session stopped, once the endpoint accepted
+ *     that STOP_SENDING (after a local receive abort some transports never
+ *     report the peer's FIN or RESET). The mapping and the session's stopped
+ *     owner are released by an eligible service pass, with no event; a FIN or
+ *     RESET the bridge still owes the session is delivered first. The report
+ *     may arrive before or after the STOP is accepted.
+ * A live stream, a control stream or a stream the session has not admitted
+ * is never released by it, and an unknown stream allocates nothing; a
+ * repeated report is harmless.
  */
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_terminal(
     moq_transport_bridge_t *b, uint64_t stream_id, uint64_t now_us);

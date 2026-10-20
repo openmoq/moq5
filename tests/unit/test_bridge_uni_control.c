@@ -424,8 +424,8 @@ int main(void)
     /* == G.2. ABORT_BIDI_STREAM dispatch: native op vs fallback ========= *
      *  The whole-request abort must produce EQUIVALENT bridge state on a
      *  native abort_stream endpoint and on the reset+stop fallback: the
-     *  stream is deactivated once, and the peer-visible teardown carries
-     *  the one code. Plus the fallback's explicit pending state and the
+     *  stream is deactivated once in service, and the peer-visible teardown
+     *  carries the one code. Plus the fallback's explicit pending state and the
      *  partial-failure fatal. */
     for (int native = 0; native < 2; native++) {
         uc_fixture_t f;
@@ -484,7 +484,7 @@ int main(void)
         }
         /* EQUIVALENT bridge state: the entry is KEPT in the discard
          * lifecycle (same ref) until a terminal peer signal, and both
-         * paths retire it on FIN. */
+         * paths latch FIN and retire it in service. */
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
         /* late peer bytes are DISCARDED (no fresh ref, not fatal) */
@@ -494,12 +494,22 @@ int main(void)
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
-        /* peer FIN retires the discarding entry */
+        /* Peer FIN latches the terminal without invalidating the callback's
+         * entry or producing any new output. Service then retires it once. */
+        size_t abort_ops = f.ep.count;
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_transport_bridge_on_peer_bidi_bytes(
                 f.bridge, bidi_id, NULL, 0, true, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, ref._v);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(f.bridge));
+        MOQ_TEST_CHECK(f.session->event_head == f.session->event_tail);
         uc_destroy(&f);
     }
 
@@ -679,7 +689,8 @@ int main(void)
 
     /* == G.7. Discard: late bytes during NATIVE abort WOULD_BLOCK ======== *
      *  Before the abort op is accepted, late peer bytes must be absorbed
-     *  (no fresh ref, not fatal). Terminal input then retires it. */
+     *  (no fresh ref, not fatal). Terminal input is latched; retirement waits
+     *  for the pending abort to be accepted by a service pass. */
     {
         uc_fixture_t f;
         HELD_REQUIRE_EQ_INT(uc_init(&f), 0);
@@ -718,17 +729,38 @@ int main(void)
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
-        /* the backend-neutral terminal retires it */
+        /* The backend-neutral terminal cannot overtake the blocked abort. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_transport_bridge_on_peer_stream_terminal(
                 f.bridge, bidi_id, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, ref._v);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, ref._v);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_pending(f.bridge));
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, 0);
+        f.ep.block_abort = false;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, 1);
+        const fake_op_t *ab = fake_endpoint_find(&f.ep, FAKE_OP_ABORT);
+        MOQ_TEST_CHECK(ab != NULL);
+        if (ab) {
+            MOQ_TEST_CHECK_EQ_U64(ab->stream_id, bidi_id);
+            MOQ_TEST_CHECK_EQ_U64(ab->error_code, 0x1);
+        }
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(f.bridge));
+        MOQ_TEST_CHECK(f.session->event_head == f.session->event_tail);
         uc_destroy(&f);
     }
 
     /* == G.8. Discard: late bytes during fallback AFTER reset, before stop *
-     *  and after an accepted abort (peer RESET retires). */
+     *  and after an accepted abort (peer RESET latches service retirement). */
     {
         uc_fixture_t f;
         HELD_REQUIRE_EQ_INT(uc_init(&f), 0);   /* no native abort: fallback */
@@ -767,7 +799,7 @@ int main(void)
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
 
         /* finish the abort, then late bytes after ACCEPTED abort: discarded;
-         * peer RESET retires the entry */
+         * peer RESET latches the terminal, service retires the entry */
         f.ep.block_stop = false;
         MOQ_TEST_CHECK_EQ_INT(
             (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
@@ -776,11 +808,20 @@ int main(void)
                 f.bridge, bidi_id, rb, 1, false, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        size_t abort_ops = f.ep.count;
         MOQ_TEST_CHECK_EQ_INT(
             (int)held_bridge_reset(
                 f.bridge, bidi_id, 0x1, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, ref._v);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(f.bridge));
+        MOQ_TEST_CHECK(f.session->event_head == f.session->event_tail);
         uc_destroy(&f);
     }
 
@@ -826,6 +867,12 @@ int main(void)
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
+        size_t abort_ops = f.ep.count;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, ref._v);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
         /* late peer bytes AFTER the STOP: still discarded on the SAME
          * mapping (no fresh ref, not fatal) */
         MOQ_TEST_CHECK_EQ_INT(
@@ -834,12 +881,20 @@ int main(void)
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(f.bridge));
         MOQ_TEST_CHECK(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v != 0);
-        /* only a full-stream terminal retires it */
+        /* Only a full-stream terminal permits service to retire it. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_transport_bridge_on_peer_stream_terminal(
                 f.bridge, bidi_id, 0), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(
+            moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, ref._v);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_service(f.bridge, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(
             moq_transport_bridge_find_ref(f.bridge, bidi_id)._v, 0);
+        MOQ_TEST_CHECK_EQ_SIZE(f.ep.count, abort_ops);
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(f.bridge));
+        MOQ_TEST_CHECK(f.session->event_head == f.session->event_tail);
         uc_destroy(&f);
     }
 

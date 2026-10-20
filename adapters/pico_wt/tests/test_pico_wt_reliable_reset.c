@@ -159,13 +159,46 @@ static int run_failed_fill(uint8_t cid, bool reliable)
     return got;
 }
 
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+#define WT_HAVE_D22 1
+#else
+#define WT_HAVE_D22 0     /* draft-22 refuses to attach to this provider */
+#endif
+
 int main(void)
 {
+    if (!WT_HAVE_D22) {
+        /* Without the provider's stream terminal contract draft-22 refuses
+         * at the client adapter's constructor, and only there. */
+        scenario = "d22_refused";
+        pico_wt_harness_t h;
+        pico_wt_harness_cfg_t cfg = { .cid_byte = 0x3f, .request_capacity = 16,
+                                      .version = MOQ_VERSION_DRAFT_22 };
+        const char *why = pico_wt_harness_check_attach_refusal(
+            &h, pico_wt_harness_setup(&h, &cfg));
+        if (why) fprintf(stderr, "d22_refused: %s\n", why);
+        CHECK(why == NULL);
+        pico_wt_harness_cleanup(&h);
+    }
+    {
+        /* A setup failure before the constructor is not that refusal. */
+        scenario = "unrelated_setup_failure";
+        pico_wt_harness_t h;
+        pico_wt_harness_cfg_t cfg = { .cid_byte = 0x3e, .request_capacity = 16,
+                                      .version = (moq_version_t)17 };
+        int rc = pico_wt_harness_setup(&h, &cfg);   /* no such profile */
+        CHECK(rc == -1);
+        CHECK(h.phase == PICO_WT_HARNESS_SESSIONS);
+        CHECK(!pico_wt_harness_refused_at_attach(&h, rc));
+        CHECK(pico_wt_harness_check_attach_refusal(&h, rc) != NULL);
+        pico_wt_harness_cleanup(&h);
+    }
     static const struct { const char *name; moq_version_t v; } dc[] = {
         { "done_count_d16", MOQ_VERSION_DRAFT_16 },
         { "done_count_d22", MOQ_VERSION_DRAFT_22 },
     };
     for (size_t i = 0; i < sizeof(dc) / sizeof(dc[0]); i++) {
+        if (dc[i].v == MOQ_VERSION_DRAFT_22 && !WT_HAVE_D22) continue;
         for (int reliable = 1; reliable >= 0; reliable--) {
             scenario = dc[i].name;
             int got = 0;
@@ -176,7 +209,7 @@ int main(void)
             if (reliable) CHECK(got == RUNS);
         }
     }
-    for (int reliable = 1; reliable >= 0; reliable--) {
+    for (int reliable = 1; reliable >= 0 && WT_HAVE_D22; reliable--) {
         scenario = "failed_fill_d22";
         int got = 0;
         for (int r = 0; r < RUNS; r++)

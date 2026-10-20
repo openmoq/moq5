@@ -215,7 +215,7 @@ build_slice() {
         -DWTQ_BUILD_MSQUIC=OFF \
         -DWTQ_BUILD_PICOQUIC=OFF \
         -DWTQ_BUILD_TESTS=OFF -DWTQ_BUILD_SIM=OFF \
-        -DWTQ_BUILD_FUZZ=OFF -DWTQ_BUILD_NW_EXPERIMENTAL=OFF \
+        -DWTQ_BUILD_FUZZ=OFF \
         -DWTQ_BUILD_BENCHMARKS=OFF -DWTQ_BUILD_EXAMPLES=OFF \
         >&2
     log "[$slice] build + install wtquic -> $wtq_prefix"

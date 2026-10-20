@@ -182,14 +182,14 @@ typedef struct b_fetch {
     bool            fetch_timed_out_ok;
     /* FETCH: held at an Object still arriving, waiting until the deadline. */
     bool            fetch_held_pending;
-    /* fill: the generation-pinned parent and remaining inclusive range. A
-     * source claim can serve a prefix before local retrieval takes over. */
+    /* fill: the generation-pinned parent and remaining inclusive window.
+     * Descending fills visit one group per window; source claims serve a
+     * prefix within that window before local retrieval takes over. */
     moqr_sub_t      fill_rsub;
     moqr_track_t    fill_track;
     uint64_t        fill_track_gen;
     uint64_t        fill_start_group, fill_start_object;
     uint64_t        fill_end_group, fill_end_object;
-    uint32_t        fill_group_order;
     uint8_t         fill_priority;
     /* fill: the part of the range read through the binding's fill source
      * (fill_src_open) rather than the log, by its claim handle; the claimed
@@ -199,21 +199,22 @@ typedef struct b_fetch {
     bool            fill_src_used;
     uint64_t        fill_src_handle;
     uint64_t        fill_src_end_group, fill_src_end_object;
-    /* A draft-22 standalone FETCH served through retrieval: from this core
-     * (cfetch is its retrieval owner, read by the cursor below) or from the
-     * shard that owns the track (sa_remote, by sa_handle). sa_start/sa_end
-     * are the admitted inclusive range, sa_next the Location the next item
-     * starts at in sa_order (sa_done once the last was covered). A run known
-     * not to exist is only written when an unknown or timed-out run follows
-     * it (sa_ne_*); otherwise its absence from the stream says so. */
+    /* A standalone FETCH reads from its core retrieval owner (cfetch), or
+     * from the owning shard (sa_remote, by sa_handle). */
     bool            standalone;
     bool            sa_remote;
-    bool            sa_done;
-    bool            sa_ne_pending;
-    moqr_group_order_t sa_order;
+    /* Shared FETCH/fill response state: immutable inclusive bounds and
+     * delivery order, plus the next Location and completion flag. For a
+     * fill, the frontier covers the current reader's part of its window.
+     * Non-existent runs need an explicit end only before an unknown or
+     * timed-out run; a following Object or final FIN implies them. */
+    bool            response_done;
+    bool            response_ne_pending;
+    moqr_group_order_t response_order;
     uint64_t        sa_handle;
     uint64_t        sa_abort_code;
-    moqr_retrieve_location_t sa_start, sa_end, sa_next, sa_ne_end;
+    moqr_retrieve_location_t response_start, response_end;
+    moqr_retrieve_location_t response_next, response_ne_end;
     moqr_retrieve_cursor_t retrieval;
     /* fill: the reset code its abort sends; zero is this relay's
      * INTERNAL_ERROR (bind_fill_fail_code). */
@@ -9168,23 +9169,24 @@ bind_refusal_drop(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
 /* -- fill fetch streams --------------------------------------------------------- *
  * A subscription that asked for a fill is owed a fill fetch stream: the
  * FETCH response for the fill range, opened by the publisher. The relay
- * answers it from the same retained cursor that serves a FETCH over that
- * range, written through the session's fill family, with the cursor
- * reporting the Locations it does not hold. Such a run is waited for -- the
- * upstream subscription may still deliver it -- until the fill's deadline:
+ * answers it from the same retrieval cursor that serves a FETCH over that
+ * range, written through the session's fill family. The cursor serves cached
+ * Objects and retrieves missing runs upstream, within the fill's deadline:
  * its processing time plus the FILL_TIMEOUT it carried (capped at the relay's
- * maximum) or, absent one, the relay's own wait. Past the deadline the run is
- * written as one End of Timed-Out Range at its last Location and the fill
+ * maximum) or, absent one, the relay's own wait. Past the deadline each run
+ * is written as End of Timed-Out Range at its last Location and the fill
  * continues; a timeout of zero therefore serves what is held and marks the
- * rest at once. The stream ends normally after the range end.
+ * rest at once. The stream ends normally after the range end. Descending
+ * fills visit one group window at a time, newest first, without reversing
+ * Object order inside a group.
  *
  * The same holds when the log of the shard serving the fill holds nothing of
  * the range when the request arrives: the Largest Object the range is bounded
  * by can be known (an upstream's or another shard's acceptance carries it)
  * before any Object of the range is retained here. The stream is opened with
- * its header at once and the fill waits, retrying its cursor every pump; one
- * that opens before the deadline is served as above, and at the deadline the
- * whole range is one End of Timed-Out Range at its last Location, then FIN.
+ * its header at once and the cursor retrieves that missing range too. If no
+ * source is available, it retries until the deadline; unserved windows are
+ * then marked Timed-Out, followed by FIN.
  * Ending it without a marker would claim the range holds no Objects
  * (Section 3.2.2 of draft-ietf-moq-transport-22), and resetting it would
  * give up before the wait Section 9.20.5 allows.
@@ -9195,18 +9197,40 @@ bind_refusal_drop(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
  * read through the source with the same item contract and the same deadline
  * handling, and whatever follows it is served from the log as above.
  *
- * Only a fill the relay cannot take on at all (its subscription untracked or
- * its track unresolvable, no free fill slot, the core's cursor pool refusing)
- * is failed on that stream alone -- opened with its header and reset at
- * once -- and never touches the subscription. */
+ * An upstream failure leaves the Object state unknown and resets the fill
+ * with UNKNOWN_OBJECT_STATUS; local admission or retrieval failures use
+ * INTERNAL_ERROR. Neither failure touches the subscription. */
+
+/* Both standalone FETCH and subscription fills use the same retrieval
+ * outcomes: an upstream failure leaves Object status unknown; local failures
+ * are this relay's own. */
+static moqr_reset_cause_t
+bind_retrieve_error_cause(const moqr_retrieve_item_t *it)
+{
+    switch (it->error_kind) {
+    case MOQR_RETRIEVE_RESPONSE:
+    case MOQR_RETRIEVE_RESET:
+    case MOQR_RETRIEVE_SOURCE_LOST:
+    case MOQR_RETRIEVE_MALFORMED:
+        return MOQR_RESET_UNKNOWN_OBJECT_STATUS;
+    default:
+        return MOQR_RESET_INTERNAL_ERROR;
+    }
+}
+
+static uint64_t
+bind_retrieve_reset_code(const moqr_bind_t *b, const b_conn_t *cn,
+                         moqr_reset_cause_t cause)
+{
+    uint64_t code = BIND_RESET_INTERNAL;
+    (void)moqr_reset_encode(moqr_bind_conn_version(b, cn->session), cause, &code);
+    return code;
+}
 
 static uint64_t
 bind_fill_fail_code(const moqr_bind_t *b, const b_conn_t *cn)
 {
-    uint64_t code = 0;
-    (void)moqr_reset_encode(moqr_bind_conn_version(b, cn->session),
-                            MOQR_RESET_INTERNAL_ERROR, &code);
-    return code;
+    return bind_retrieve_reset_code(b, cn, MOQR_RESET_INTERNAL_ERROR);
 }
 
 /* Fail a fill on the wire. The reset is an obligation: a WOULD_BLOCK holds it
@@ -9310,7 +9334,9 @@ bind_fill_cursor_open(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
         q.start_object = bf->fill_start_object;
         q.end_group = bf->fill_end_group;
         q.end_object = bf->fill_end_object;
-        q.group_order = (moqr_group_order_t)bf->fill_group_order;
+        /* Descending fills visit one group at a time. A source's historical
+         * prefix must precede the local suffix WITHIN that group. */
+        q.group_order = MOQR_GROUP_ORDER_ASCENDING;
         q.subscriber_priority = bf->fill_priority;
         q.deadline_us = bf->fill_deadline_us;
         moqr_bind_fill_claim_t claim;
@@ -9347,7 +9373,7 @@ bind_fill_cursor_open(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
     req.child = bf->sfill._opaque;
     req.start = retrieve_loc(bf->fill_start_group, bf->fill_start_object);
     req.end = retrieve_loc(bf->fill_end_group, bf->fill_end_object);
-    req.group_order = (moqr_group_order_t)bf->fill_group_order;
+    req.group_order = MOQR_GROUP_ORDER_ASCENDING;
     req.subscriber_priority = bf->fill_priority;
     req.deadline_us = bf->fill_deadline_us;
     (void)now_us;
@@ -9382,13 +9408,14 @@ bind_fill_commit(moqr_bind_t *b, b_fetch_t *bf)
 
 /* The fill source has served its claimed part. The claim ends; a range that
  * continues past it is the log's from the Location after the claimed end.
- * Returns true when the whole range is done. */
+ * Returns true when the whole current window is done. */
 static bool
 bind_fill_source_done(moqr_bind_t *b, b_fetch_t *bf)
 {
     b->fill_src.close(b->fill_src.ctx, bf->fill_src_handle);
     bf->fill_src_open = false;
     bf->fill_src_used = true;
+    bf->response_done = false;
     uint64_t eg = bf->fill_src_end_group;
     uint64_t eo = bf->fill_src_end_object;
     if (eg > bf->fill_end_group ||
@@ -9403,7 +9430,53 @@ bind_fill_source_done(moqr_bind_t *b, b_fetch_t *bf)
         bf->fill_start_group = eg;
         bf->fill_start_object = eo + 1u;
     }
+    bf->response_next = retrieve_loc(bf->fill_start_group, bf->fill_start_object);
     return false;
+}
+
+/* The current group window is covered. Descending orders groups only: each
+ * reader and source claim within one window still runs in Object order. */
+static void
+bind_fill_window_done(moqr_bind_t *b, b_fetch_t *bf)
+{
+    moqr_bind_retrieve_close(b, &bf->retrieval);
+    moqr_retrieve_location_t next;
+    moqr_retrieve_location_t end = retrieve_loc(bf->fill_end_group,
+                                                 bf->fill_end_object);
+    if (moqr_retrieve_after(bf->response_start, bf->response_end, bf->response_order, end, &next)) {
+        moqr_retrieve_location_t window = moqr_retrieve_window_end(
+            bf->response_end, bf->response_order, next.group);
+        bf->fill_start_group = next.group;
+        bf->fill_start_object = next.object;
+        bf->fill_end_group = window.group;
+        bf->fill_end_object = window.object;
+        bf->fill_src_used = false;
+        bf->response_next = next;
+        bf->response_done = false;
+    } else {
+        bf->response_ne_pending = false;
+        bf->state = BF_NEEDS_FIN;
+    }
+}
+
+/* Unmarked runs are non-existent by default. Retain their end only when a
+ * subsequent marked run needs to distinguish the two, as for standalone
+ * FETCH. A following Object or final FIN needs no explicit marker. */
+static moq_result_t
+bind_fill_write_range(b_conn_t *cn, b_fetch_t *bf,
+                      moq_fetch_range_kind_t kind,
+                      moqr_retrieve_location_t end, uint64_t now_us)
+{
+    if (kind == MOQ_FETCH_RANGE_NON_EXISTENT) return MOQ_OK;
+    if (bf->response_ne_pending) {
+        moq_result_t rc = moq_session_write_fill_range(cn->session, bf->sfill,
+            MOQ_FETCH_RANGE_NON_EXISTENT, bf->response_ne_end.group,
+            bf->response_ne_end.object, now_us);
+        if (rc != MOQ_OK) return rc;
+        bf->response_ne_pending = false;
+    }
+    return moq_session_write_fill_range(cn->session, bf->sfill, kind,
+                                         end.group, end.object, now_us);
 }
 
 static void
@@ -9452,8 +9525,17 @@ bind_fill_request(moqr_bind_t *b, b_conn_t *cn,
     bf->fill_start_object = fr->start_object;
     bf->fill_end_group = fr->end_group;
     bf->fill_end_object = fr->end_object;
-    bf->fill_group_order = fr->group_order;
     bf->fill_priority = fr->subscriber_priority;
+    bf->response_start = retrieve_loc(fr->start_group, fr->start_object);
+    bf->response_end = retrieve_loc(fr->end_group, fr->end_object);
+    bf->response_order = (moqr_group_order_t)fr->group_order;
+    bf->response_next = moqr_retrieve_first(bf->response_start, bf->response_end, bf->response_order);
+    moqr_retrieve_location_t window = moqr_retrieve_window_end(
+        bf->response_end, bf->response_order, bf->response_next.group);
+    bf->fill_start_group = bf->response_next.group;
+    bf->fill_start_object = bf->response_next.object;
+    bf->fill_end_group = window.group;
+    bf->fill_end_object = window.object;
     if (bind_fill_cursor_open(b, cn, bf, now_us) == BIND_FILL_FAILED) {
         memset(bf, 0, sizeof(*bf));
         bind_fill_fail(b, cn, fr->fill, now_us);
@@ -9494,7 +9576,14 @@ bind_fill_retrieve_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
         ? b->retrieve_source_peek(b->fill_src.ctx, bf->fill_src_handle, now_us, &it)
         : moqr_bind_retrieve_peek(b, &bf->retrieval, now_us, &it);
     if (prc == MOQR_ERR_WOULD_BLOCK) return false;
-    if (prc != MOQR_OK || it.kind == MOQR_RETRIEVE_ERROR) {
+    if (prc != MOQR_OK) {
+        bf->state = BF_FILL_NEEDS_ABORT;
+        return true;
+    }
+    if (it.kind == MOQR_RETRIEVE_ERROR) {
+        bf->fill_abort_code = bind_retrieve_reset_code(b, cn,
+            bind_retrieve_error_cause(&it));
+        bf->fill_abort_code_set = true;
         bf->state = BF_FILL_NEEDS_ABORT;
         return true;
     }
@@ -9502,12 +9591,12 @@ bind_fill_retrieve_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
         moqr_retrieve_location_t end = bf->fill_src_open
             ? retrieve_loc(bf->fill_src_end_group, bf->fill_src_end_object)
             : retrieve_loc(bf->fill_end_group, bf->fill_end_object);
-        if (retrieve_loc_cmp(it.end, end) != 0) {
+        if (!bf->response_done || retrieve_loc_cmp(it.end, end) != 0) {
             bf->state = BF_FILL_NEEDS_ABORT;
             return true;
         }
         if (bf->fill_src_open && !bind_fill_source_done(b, bf)) return true;
-        bf->state = BF_NEEDS_FIN;
+        bind_fill_window_done(b, bf);
         return true;
     }
     moqr_retrieve_location_t start = retrieve_loc(bf->fill_start_group,
@@ -9515,24 +9604,15 @@ bind_fill_retrieve_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
     moqr_retrieve_location_t end = bf->fill_src_open
         ? retrieve_loc(bf->fill_src_end_group, bf->fill_src_end_object)
         : retrieve_loc(bf->fill_end_group, bf->fill_end_object);
-    if (retrieve_loc_cmp(it.start, start) != 0 ||
+    if (bf->response_done || retrieve_loc_cmp(it.start, bf->response_next) != 0 ||
+        retrieve_loc_cmp(it.start, start) != 0 ||
         retrieve_loc_cmp(it.end, start) < 0 || retrieve_loc_cmp(it.end, end) > 0) {
         bf->state = BF_FILL_NEEDS_ABORT;
         return true;
     }
     moq_result_t rc;
     if (it.kind == MOQR_RETRIEVE_GAP) {
-        /* D22 refuses Range Filters, so FIN implies a non-existent suffix.
-         * Only the whole fill's end qualifies, not a partial source claim.
-         * Keep the common commit and validated END/FIN path below. */
-        bool implicit_terminal = cn->wire_draft == B_DRAFT_22 &&
-            bf->fill_group_order == MOQ_GROUP_ORDER_ASCENDING &&
-            it.gap_kind == MOQ_FETCH_RANGE_NON_EXISTENT &&
-            it.end.group == bf->fill_end_group &&
-            it.end.object == bf->fill_end_object;
-        rc = implicit_terminal ? MOQ_OK
-            : moq_session_write_fill_range(cn->session, bf->sfill, it.gap_kind,
-                                            it.end.group, it.end.object, now_us);
+        rc = bind_fill_write_range(cn, bf, it.gap_kind, it.end, now_us);
     } else if (it.kind == MOQR_RETRIEVE_OBJECT) {
         if (retrieve_loc_cmp(it.end, start) != 0 ||
             it.object.group_id != it.end.group ||
@@ -9560,15 +9640,24 @@ bind_fill_retrieve_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
         bf->state = BF_FILL_NEEDS_ABORT;
         return true;
     }
-    if (it.kind == MOQR_RETRIEVE_OBJECT) b->deliveries_written++;
+    if (it.kind == MOQR_RETRIEVE_OBJECT) {
+        bf->response_ne_pending = false;
+        b->deliveries_written++;
+    } else if (it.gap_kind == MOQ_FETCH_RANGE_NON_EXISTENT) {
+        bf->response_ne_pending = true;
+        bf->response_ne_end = it.end;
+    }
     if (bind_fill_commit(b, bf) != MOQR_OK) {
         bf->state = BF_FILL_NEEDS_ABORT;
         return true;
     }
-    if (retrieve_loc_cmp(it.end, end) < 0) {
-        bf->fill_start_group = it.end.object == UINT64_MAX ? it.end.group + 1u
-                                                          : it.end.group;
-        bf->fill_start_object = it.end.object == UINT64_MAX ? 0 : it.end.object + 1u;
+    moqr_retrieve_location_t next;
+    if (moqr_retrieve_after(start, end, MOQR_GROUP_ORDER_ASCENDING, it.end, &next)) {
+        bf->response_next = next;
+        bf->fill_start_group = next.group;
+        bf->fill_start_object = next.object;
+    } else {
+        bf->response_done = true;
     }
     return true;
 }
@@ -9603,21 +9692,19 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
             return true;
         }
         if (opened == BIND_FILL_NOT_HELD) {
-            /* Nothing of the range is held here yet. Upstream may still
-             * deliver it, so the fill waits until its deadline; then the
-             * whole range is one End of Timed-Out Range at its last
-             * Location and the stream ends. */
+            /* The source cannot claim this window yet. Wait only until
+             * the original deadline, then classify this window and move
+             * to the next group in the fill's delivery order. */
             if (now_us < bf->fill_deadline_us) {
                 return false;
             }
-            rc = moq_session_write_fill_range(cn->session, bf->sfill,
-                                              MOQ_FETCH_RANGE_TIMED_OUT,
-                                              bf->fill_end_group,
-                                              bf->fill_end_object, now_us);
+            rc = bind_fill_write_range(cn, bf, MOQ_FETCH_RANGE_TIMED_OUT,
+                retrieve_loc(bf->fill_end_group, bf->fill_end_object), now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) {
                 return false;
             }
-            bf->state = rc == MOQ_OK ? BF_NEEDS_FIN : BF_FILL_NEEDS_ABORT;
+            if (rc == MOQ_OK) bind_fill_window_done(b, bf);
+            else bf->state = BF_FILL_NEEDS_ABORT;
             return true;
         }
         if (!bf->fill_src_open || b->retrieve_source_peek != NULL) {
@@ -9638,7 +9725,7 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
             if (bf->fill_src_open && !bind_fill_source_done(b, bf)) {
                 return true;   /* the rest of the range is the log's */
             }
-            bf->state = BF_NEEDS_FIN;
+            bind_fill_window_done(b, bf);
             return true;
         }
         if (it.kind == MOQR_FETCH_ITEM_GAP ||
@@ -9651,10 +9738,8 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
             if (now_us < bf->fill_deadline_us) {
                 return false;
             }
-            rc = moq_session_write_fill_range(cn->session, bf->sfill,
-                                              MOQ_FETCH_RANGE_TIMED_OUT,
-                                              it.rec.group_id, it.rec.object_id,
-                                              now_us);
+            rc = bind_fill_write_range(cn, bf, MOQ_FETCH_RANGE_TIMED_OUT,
+                retrieve_loc(it.rec.group_id, it.rec.object_id), now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) {
                 return false;
             }
@@ -9685,10 +9770,9 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
                 mg = it.marker_group - 1u;
                 mo = UINT64_MAX;
             }
-            rc = moq_session_write_fill_range(
-                cn->session, bf->sfill,
-                bind_fill_unserved_kind(now_us >= bf->fill_deadline_us), mg, mo,
-                now_us);
+            rc = bind_fill_write_range(cn, bf,
+                bind_fill_unserved_kind(now_us >= bf->fill_deadline_us),
+                retrieve_loc(mg, mo), now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) {
                 return false;
             }
@@ -9718,6 +9802,7 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
             bf->state = BF_FILL_NEEDS_ABORT;
             return true;
         }
+        bf->response_ne_pending = false;
         if (bind_fill_commit(b, bf) != MOQR_OK) bf->state = BF_FILL_NEEDS_ABORT;
         b->deliveries_written++;
         return true;
@@ -9768,39 +9853,12 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
  * request-local, never a session close or a FIN over missing Objects. The
  * subscriber's cancellation retires the request and its upstream work. */
 
-/* Resolve a stream reset meaning for this connection's draft. */
-static uint64_t
-bind_standalone_reset_code(const moqr_bind_t *b, const b_conn_t *cn,
-                           moqr_reset_cause_t cause)
-{
-    uint64_t code = BIND_RESET_INTERNAL;
-    (void)moqr_reset_encode(moqr_bind_conn_version(b, cn->session), cause, &code);
-    return code;
-}
-
 static void
 bind_standalone_abort(moqr_bind_t *b, const b_conn_t *cn, b_fetch_t *bf,
                       moqr_reset_cause_t cause)
 {
-    bf->sa_abort_code = bind_standalone_reset_code(b, cn, cause);
+    bf->sa_abort_code = bind_retrieve_reset_code(b, cn, cause);
     bf->state = BF_FETCH_NEEDS_ABORT;
-}
-
-/* An upstream that answered with an error, reset its response, went away or
- * answered outside the request leaves the run's state undetermined; a local
- * failure is this relay's own. */
-static moqr_reset_cause_t
-bind_standalone_error_cause(const moqr_retrieve_item_t *it)
-{
-    switch (it->error_kind) {
-    case MOQR_RETRIEVE_RESPONSE:
-    case MOQR_RETRIEVE_RESET:
-    case MOQR_RETRIEVE_SOURCE_LOST:
-    case MOQR_RETRIEVE_MALFORMED:
-        return MOQR_RESET_UNKNOWN_OBJECT_STATUS;
-    default:
-        return MOQR_RESET_INTERNAL_ERROR;
-    }
 }
 
 static b_fetch_t *
@@ -9866,7 +9924,7 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
                 bf->standalone = true;
                 bf->sa_remote = true;
                 bf->sa_handle = handle;
-                bf->sa_order = order;
+                bf->response_order = order;
                 bf->state = BF_FETCH_NEEDS_PLAN;
                 bf->sfetch = fq->fetch;
                 bf->fill_deadline_us = deadline;
@@ -9886,10 +9944,10 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
     bf->end_group = plan.wire.end_group;
     bf->end_object = plan.wire.end_object;
     bf->fill_deadline_us = deadline;
-    bf->sa_order = order;
-    bf->sa_start = retrieve_loc(plan.start_group, plan.start_object);
-    bf->sa_end = retrieve_loc(plan.end_group, plan.end_object);
-    bf->sa_next = moqr_retrieve_first(bf->sa_start, bf->sa_end, order);
+    bf->response_order = order;
+    bf->response_start = retrieve_loc(plan.start_group, plan.start_object);
+    bf->response_end = retrieve_loc(plan.end_group, plan.end_object);
+    bf->response_next = moqr_retrieve_first(bf->response_start, bf->response_end, order);
     moqr_retrieve_request_t r;
     memset(&r, 0, sizeof(r));
     r.binding = cn->binding;
@@ -9899,8 +9957,8 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
     r.track_gen = plan.track_gen;
     r.source = conn_cookie(b, cn);
     r.child = fq->fetch._opaque;
-    r.start = bf->sa_start;
-    r.end = bf->sa_end;
+    r.start = bf->response_start;
+    r.end = bf->response_end;
     r.group_order = order;
     r.subscriber_priority = req.subscriber_priority;
     r.deadline_us = deadline;
@@ -9975,22 +10033,22 @@ bind_standalone_item(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         return true;
     }
     if (it.kind == MOQR_RETRIEVE_ERROR) {
-        bind_standalone_abort(b, cn, bf, bind_standalone_error_cause(&it));
+        bind_standalone_abort(b, cn, bf, bind_retrieve_error_cause(&it));
         return true;
     }
     if (it.kind == MOQR_RETRIEVE_END) {
-        if (!bf->sa_done) {
+        if (!bf->response_done) {
             bind_standalone_abort(b, cn, bf, MOQR_RESET_INTERNAL_ERROR);
             return true;
         }
         /* A run known not to exist at the end of the range is what FIN says. */
-        bf->sa_ne_pending = false;
+        bf->response_ne_pending = false;
         bf->state = BF_NEEDS_FIN;
         return true;
     }
     moqr_retrieve_location_t window = moqr_retrieve_window_end(
-        bf->sa_end, bf->sa_order, bf->sa_next.group);
-    if (bf->sa_done || retrieve_loc_cmp(it.start, bf->sa_next) != 0 ||
+        bf->response_end, bf->response_order, bf->response_next.group);
+    if (bf->response_done || retrieve_loc_cmp(it.start, bf->response_next) != 0 ||
         retrieve_loc_cmp(it.end, it.start) < 0 ||
         retrieve_loc_cmp(it.end, window) > 0) {
         bind_standalone_abort(b, cn, bf, MOQR_RESET_INTERNAL_ERROR);
@@ -10021,18 +10079,18 @@ bind_standalone_item(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
              * exist (3.2.2). Held back in case a marked run follows. */
             rc = MOQ_OK;
         } else {
-            if (bf->sa_ne_pending) {
+            if (bf->response_ne_pending) {
                 /* Split the known non-existent run from the marked one. */
                 rc = bind_fetch_write_range(cn, bf->sfetch,
                                             MOQ_FETCH_RANGE_NON_EXISTENT,
-                                            bf->sa_ne_end, now_us);
+                                            bf->response_ne_end, now_us);
                 if (rc == MOQ_ERR_WOULD_BLOCK) return false;
                 if (rc != MOQ_OK) {
                     if (fwd_result_is_gone(rc)) bind_fill_release(b, bf);
                     else bind_standalone_abort(b, cn, bf, MOQR_RESET_INTERNAL_ERROR);
                     return true;
                 }
-                bf->sa_ne_pending = false;
+                bf->response_ne_pending = false;
             }
             rc = bind_fetch_write_range(cn, bf->sfetch, it.gap_kind, it.end, now_us);
         }
@@ -10047,21 +10105,21 @@ bind_standalone_item(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         return true;
     }
     if (it.kind == MOQR_RETRIEVE_OBJECT) {
-        bf->sa_ne_pending = false;
+        bf->response_ne_pending = false;
         b->deliveries_written++;
     } else if (it.gap_kind == MOQ_FETCH_RANGE_NON_EXISTENT) {
-        bf->sa_ne_pending = true;
-        bf->sa_ne_end = it.end;
+        bf->response_ne_pending = true;
+        bf->response_ne_end = it.end;
     }
     if (bind_standalone_commit(b, bf) != MOQR_OK) {
         bind_standalone_abort(b, cn, bf, MOQR_RESET_INTERNAL_ERROR);
         return true;
     }
     moqr_retrieve_location_t next;
-    if (moqr_retrieve_after(bf->sa_start, bf->sa_end, bf->sa_order, it.end, &next)) {
-        bf->sa_next = next;
+    if (moqr_retrieve_after(bf->response_start, bf->response_end, bf->response_order, it.end, &next)) {
+        bf->response_next = next;
     } else {
-        bf->sa_done = true;
+        bf->response_done = true;
     }
     return true;
 }
@@ -10091,9 +10149,9 @@ bind_standalone_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         bf->eot = plan.wire.end_of_track;
         bf->end_group = plan.wire.end_group;
         bf->end_object = plan.wire.end_object;
-        bf->sa_start = plan.start;
-        bf->sa_end = plan.end;
-        bf->sa_next = moqr_retrieve_first(plan.start, plan.end, bf->sa_order);
+        bf->response_start = plan.start;
+        bf->response_end = plan.end;
+        bf->response_next = moqr_retrieve_first(plan.start, plan.end, bf->response_order);
         bf->state = BF_NEEDS_OK;
         return true;
     }
@@ -10641,18 +10699,11 @@ bind_fwd_pump(moqr_bind_t *b, uint64_t now_us)
                 FWD_DBG(b, lost);
             } else {
                 moq_fetch_cfg_t fc;
-                if (t->consumer == FW_CONSUMER_FILL) {
-                    moq_fetch_cfg_init_sized(&fc, sizeof(fc));
-                    if (ucn->wire_draft == B_DRAFT_22) {
-                        fc.has_fill_timeout = true;
-                        /* Floor, never extend the parent's remaining budget.
-                         * A sub-millisecond remainder becomes a cache-only
-                         * request upstream while our absolute timer remains. */
-                        fc.fill_timeout_ms = (t->retrieval.deadline_us - now_us) / 1000u;
-                    }
-                } else {
-                    moq_fetch_cfg_init(&fc);
-                }
+                /* D22 section 9.20 parameters apply to this hop. Enforce the
+                 * consumer's absolute deadline locally rather than forward
+                 * FILL_TIMEOUT; expiry above prevents an unsent dispatch
+                 * and retains cancellation of any request already sent. */
+                moq_fetch_cfg_init(&fc);
                 fc.track_namespace = (moq_namespace_t){ .parts = t->parts,
                                                         .count = t->ns_count };
                 fc.track_name = t->name;
@@ -11338,11 +11389,13 @@ bind_fetch_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             continue;
         }
         if (bf->fill) {
-            for (uint32_t guard = 0; guard < 512 && bf->used; guard++) {
+            uint32_t guard = 0;
+            for (; guard < 512 && bf->used; guard++) {
                 if (!bind_fill_step(b, cn, bf, now_us)) {
                     break;
                 }
             }
+            if (guard == 512 && bf->used) b->budget_pending = true;
             continue;
         }
         if (bf->standalone) {

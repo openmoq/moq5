@@ -576,7 +576,7 @@ static int test_subscriber_cfgs(void)
     const size_t told = SIZEOF_THROUGH(moq_sub_track_cfg_t, auth_token_count);
     const size_t uend = FIELD_END(moq_sub_update_cfg_t, end_group);
     const size_t uold = SIZEOF_THROUGH(moq_sub_update_cfg_t, end_group);
-    tally_t ref;
+    tally_t ref = {0};
     digest_t want_sub, want_upd, got;
     for (int view = -1; view < 2; view++) {
         moq_simpair_t *sp = mk_pair();
@@ -697,7 +697,7 @@ static int test_publisher_cfg(void)
     int failures = 0;
     const size_t end = FIELD_END(test_pub_cfg_callbacks_t, callbacks);
     const size_t old = sizeof(test_pub_cfg_callbacks_t);
-    tally_t ref;
+    tally_t ref = {0};
     for (int view = -1; view < 2; view++) {
         moq_simpair_t *sp = mk_pair();
         MOQ_TEST_CHECK(sp != NULL);

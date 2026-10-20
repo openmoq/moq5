@@ -1084,9 +1084,12 @@ uint8_t *moq_build_track_key(moq_session_t *s,
  * mapping writes min(out_size, sizeof current) bytes of `out` and stamps that
  * count; the caller has checked out_size against the v0 size. The inverse
  * refuses an unknown kind or an end before the start. */
-void moq_location_filter_from_core(uint32_t filter_type, uint64_t start_group,
-                                   uint64_t start_object, uint64_t end_group,
-                                   uint64_t end_object,
+typedef struct moq_core_filter {
+    uint32_t type;
+    uint64_t start_group, start_object, end_group, end_object;
+} moq_core_filter_t;
+
+void moq_location_filter_from_core(const moq_core_filter_t *filter,
                                    moq_location_filter_cfg_t *out,
                                    size_t out_size);
 moq_result_t moq_location_filter_to_core(const moq_location_filter_cfg_t *cfg,
@@ -2762,6 +2765,13 @@ moq_event_scratch_verdict_t setup_event_scratch_classify(
     size_t token_count);
 uint8_t *scratch_copy(moq_session_t *s, const uint8_t *data, size_t len);
 
+/* Probe only after BUFFER with occupied send bytes. Call the same typed
+ * encoder/arguments without changing the session's output scratch budget or
+ * cursor, then end the probe on every encoder result. Never queue its bytes. */
+moq_result_t send_probe_begin(moq_session_t *s, moq_buf_writer_t *probe);
+moq_result_t send_probe_end(moq_session_t *s, moq_buf_writer_t *probe,
+                            moq_result_t encoded);
+
 /* queue_send_control for a request cancellation (UNSUBSCRIBE,
  * FETCH_CANCEL): a send buffer too full now because it still holds earlier
  * output is MOQ_ERR_WOULD_BLOCK -- the buffer is released as actions are
@@ -3048,13 +3058,21 @@ moq_result_t session_setup_complete_peer(moq_session_t *s,
                                          bool *setup_received,
                                          bool setup_sent);
 
+/* Where process_auth_tokens resolves into: up to max_tokens entries of
+ * `tokens` (count in *token_count), the request refusal code, the per-token
+ * staging flags and the transaction. */
+typedef struct moq_auth_resolve_out {
+    moq_resolved_token_t *tokens;
+    size_t               *token_count;
+    size_t                max_tokens;
+    uint64_t             *reject_code;
+    bool                 *staged;
+    moq_auth_txn_t       *txn;
+} moq_auth_resolve_out_t;
+
 moq_result_t process_auth_tokens(moq_session_t *s,
     const moq_decoded_auth_token_t *tokens_in, size_t tokens_in_count,
-    moq_resolved_token_t *out_tokens, size_t *out_token_count,
-    size_t max_tokens,
-    uint64_t *out_reject_code,
-    bool *out_staged,
-    moq_auth_txn_t *txn);
+    const moq_auth_resolve_out_t *out);
 
 /* Borrows one prepared prefix during this call only; commit prefix before txn.
  * Abort/free each transaction independently. No prefix allocation is adopted. */
@@ -3881,6 +3899,10 @@ void fill_rx_peer_reset(moq_session_t *s, const moq_rx_stream_t *rx, uint64_t er
 /* The session itself stopped the stream (budget or expiry): the child is
  * cancelled locally and its STOP recorded. */
 void fill_rx_local_stop(moq_session_t *s, const moq_rx_stream_t *rx);
+/* The stopped stream was retired by the transport with no peer FIN or RESET
+ * (local receive retirement): the child's stream is over, with the reason
+ * its cancellation recorded. */
+void fill_rx_local_retired(moq_session_t *s, const moq_rx_stream_t *rx);
 /* The identity a bound rx's fill events carry (zeroed when the child is gone). */
 void fill_rx_identity(const moq_session_t *s, const moq_rx_stream_t *rx,
                       moq_fill_t *fill, moq_subscription_t *sub,
@@ -4637,6 +4659,11 @@ moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
     bool has_expires, uint64_t expires_ms);
 bool unsub_tomb_add(moq_session_t *s, uint64_t request_id);
 bool unsub_tomb_consume(moq_session_t *s, uint64_t request_id);
+/* True when a reply tombstone holds `request_id`; consumes nothing. */
+bool unsub_tomb_contains(const moq_session_t *s, uint64_t request_id);
+/* True when `request_id` is one of the inbound updates a subscription or a
+ * publication still owes its answer to (every id of the owed run). */
+bool session_owed_update_covers(const moq_session_t *s, uint64_t request_id);
 
 /* Locally-cancelled FETCH request-id grace cache. add() dedupes and drops the
  * oldest entry when full (never fails). contains() peeks without removing;

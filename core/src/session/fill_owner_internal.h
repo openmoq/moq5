@@ -78,6 +78,10 @@ typedef struct moq_fill_entry {
     moq_stream_ref_t stream;
     bool data_fin;
     bool data_reset;
+    /* A receiving child whose stream we stopped, retired by the transport
+     * with no peer FIN or RESET ever reaching us: its stream ended, but this
+     * says nothing of how (no COMPLETE, no stream error). */
+    bool data_local_retired;
     bool stop_committed;
     bool peer_stop;
     bool cancel_requested;
@@ -169,6 +173,13 @@ moq_result_t moq_fill_header_committed(moq_fill_table_t *t,
 moq_result_t moq_fill_peer_fin(moq_fill_table_t *t,
     moq_fill_ref_t ref, moq_stream_ref_t stream);
 moq_result_t moq_fill_peer_reset(moq_fill_table_t *t,
+    moq_fill_ref_t ref, moq_stream_ref_t stream);
+/* The bound stream of a receiving child we stopped ended without a peer
+ * FIN or RESET (local receive retirement). Requires the matching child
+ * (generation, parent), the bound stream ref and the committed local STOP;
+ * keeps the terminal reason the cancellation recorded. A child whose peer
+ * terminal is already in is unchanged. */
+moq_result_t moq_fill_local_retired(moq_fill_table_t *t,
     moq_fill_ref_t ref, moq_stream_ref_t stream);
 moq_result_t moq_fill_peer_stop(moq_fill_table_t *t,
     moq_fill_ref_t ref, moq_stream_ref_t stream);

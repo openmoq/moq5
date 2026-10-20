@@ -81,9 +81,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-core PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
-# Static library for white-box tests that access internal symbols.
+# Static library for white-box tests and fuzzers that access internal symbols.
 # Identical sources but without hidden visibility. Not installed.
-if(MOQ_BUILD_TESTS)
+if(MOQ_BUILD_TESTS OR MOQ_BUILD_FUZZ)
     add_library(moq-core-test-internals STATIC
         src/version.c src/types.c
         src/wire/quic_varint.c src/wire/vi64.c src/wire/kvp.c src/wire/buf.c

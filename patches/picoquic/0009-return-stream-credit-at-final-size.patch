@@ -1,0 +1,69 @@
+Return a peer stream's credit once its receive half is complete.
+
+Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6, after 0002,
+0006, 0007 and 0008; it also applies without 0007.
+
+picoquic replenishes MAX_STREAMS for a peer-initiated stream once its
+receive half is complete. That timing is this provider's policy, which LibMoQ
+relies on; RFC 9000 Section 4.6 grants cumulative permission and does not fix
+when a receiver replenishes it. Upstream evaluates completion on the frame
+that carries the FIN before storing that frame's final size, so it compares
+the consumed offset with the old fin_offset -- the bytes delivered so far --
+and counts a FIN that arrives past a gap prematurely, while bytes below the
+final size (Section 4.5) are still missing. It also treats a reset as complete
+only once the consumed offset reaches the reset's final size, which counts
+bytes that will never arrive, so such a stream is deleted uncounted. The FIN
+check now runs after the final size is stored, and a reset is complete once
+its reliable prefix (zero for RESET_STREAM) is consumed. Duplicate terminals
+are counted once (max_stream_updated).
+Tests: adapters/picoquic/tests/test_pq_provider_stream_credit.c.
+
+Upstream picoquic/frames.c is unchanged since the pin as of 2026-10-16:
+  $ gh api repos/private-octopus/picoquic/commits/master --jq '.sha'
+  c124cbe975f71b150ea929d325804335d2bdaa34
+  $ gh api repos/private-octopus/picoquic/compare/a602e60babea48da7849169d716aaf68684e66d6...master \
+      --jq '.ahead_by, .behind_by, ([.files[].filename | select(. == "picoquic/frames.c")] | length)'
+  15
+  0
+  0
+  $ gh api 'repos/private-octopus/picoquic/contents/picoquic/frames.c?ref=master' --jq .sha
+  a3cb98609da691a6241e179c976d266b5335bbb7
+  $ gh api 'repos/private-octopus/picoquic/contents/picoquic/frames.c?ref=a602e60babea48da7849169d716aaf68684e66d6' --jq .sha
+  a3cb98609da691a6241e179c976d266b5335bbb7
+
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -1482,12 +1482,17 @@ static int picoquic_stream_network_input(picoquic_cnx_t* cnx, uint64_t stream_id
+             stream->fin_received = 1;
+             should_notify = 1;
+             cnx->latest_receive_time = current_time;
+-            picoquic_update_max_stream_ID_local(cnx, stream);
+         }
+ 
+         if (new_fin_offset > stream->fin_offset) {
+             ret = picoquic_flow_control_check_stream_offset(cnx, stream, new_fin_offset);
+         }
++
++        if (ret == 0 && fin) {
++            /* Only now does fin_offset hold the final size: a FIN past a gap
++             * leaves the stream incomplete and uncounted. */
++            picoquic_update_max_stream_ID_local(cnx, stream);
++        }
+     }
+ 
+     /* If the application provided a direct receive callback, it wil receive the data as they
+@@ -4706,8 +4711,11 @@ void picoquic_update_max_stream_ID_local(picoquic_cnx_t* cnx, picoquic_stream_he
+ {
+     if (cnx->client_mode != IS_CLIENT_STREAM_ID(stream->stream_id) && !stream->max_stream_updated) {
+         /* This is a remotely initiated stream */
+-        if (stream->consumed_offset >= stream->fin_offset && (stream->fin_received || stream->reset_received)) {
+-            /* Receive is complete */
++        if ((stream->fin_received && stream->consumed_offset >= stream->fin_offset) ||
++            (stream->reset_received && stream->consumed_offset >= stream->reset_offset)) {
++            /* Receive is complete: every byte up to the FIN consumed, or a
++             * reset received with its reliable prefix (if any) consumed --
++             * a reset's final size counts bytes that will never arrive. */
+             if (IS_BIDIR_STREAM_ID(stream->stream_id)) {
+                 if (stream->fin_sent || stream->reset_sent)
+                 {

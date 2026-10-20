@@ -54,7 +54,33 @@ static uint64_t g_tp_streams_uni = 64;   /* initial_max_stream_id_unidir */
 static uint32_t g_client_max_events = 64;   /* the fetcher session's event queue */
 static picoquic_state_enum g_cnx_state = picoquic_state_ready;
 
+/* The order of the provider calls the endpoint makes, cleared per step:
+ * C stream context set, M active mark, R reset, S stop. Every stub returns
+ * at once and allocates nothing, so an ordering that would create streams
+ * at a real provider is only recorded here. */
+static char g_calls[32];
+static int g_calls_n = 0;
+static void call_log(char c)
+    { if (g_calls_n < (int)sizeof(g_calls) - 1) { g_calls[g_calls_n++] = c; g_calls[g_calls_n] = 0; } }
+static void calls_clear(void) { g_calls_n = 0; g_calls[0] = 0; }
+static int g_reset_rc = 0;   /* what the next resets answer */
+static int g_stop_rc = 0;    /* what the next stops answer, unless refused */
+
 picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c) { (void)c; return NULL; }
+/* Per-stream context: the adapter watches stopped streams through it; no
+ * release ever arrives here. */
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+{
+    (void)c; (void)ctx;
+    call_log('C');
+    if (sid < ((uint64_t)1 << 62) && (sid & 1u) == 0) {
+        uint64_t *next = (sid & 2u) ? &g_next_uni : &g_next_bidi;
+        if (sid >= *next) *next = sid + 4;
+    }
+    return 0;
+}
+void picoquic_unlink_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid)
+{ (void)c; (void)sid; }
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
 int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
 { (void)c; (void)sid; return 0; }
@@ -86,7 +112,7 @@ static void act_set(uint64_t sid, int on)
     if (on && g_active_n < ACT_MAX) g_active[g_active_n++] = sid;
 }
 int picoquic_mark_active_stream(picoquic_cnx_t *c, uint64_t sid, int active, void *v)
-    { (void)c; (void)v; act_set(sid, active); return 0; }
+    { (void)c; (void)v; call_log('M'); act_set(sid, active); return 0; }
 
 static uint8_t g_provide_buf[4096];
 static size_t g_provide_nb; static int g_provide_fin; static int g_provide_still;
@@ -94,9 +120,7 @@ uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin, i
     { (void)ctx; g_provide_nb = nb; g_provide_fin = is_fin; g_provide_still = is_still_active;
       return nb <= sizeof(g_provide_buf) ? g_provide_buf : NULL; }
 uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *c, int uni)
-    { (void)c; uint64_t id = uni ? g_next_uni : g_next_bidi; if (uni) g_next_uni += 4; else g_next_bidi += 4; return id; }
-int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
-    { (void)c; (void)sid; (void)ctx; return 0; }
+    { (void)c; return uni ? g_next_uni : g_next_bidi; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
     { (void)c; (void)sid; return g_reset_code; }
 
@@ -105,17 +129,24 @@ uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
 static struct { uint64_t sid; uint64_t code; } g_stops[SIG_MAX];
 static int g_stop_n = 0, g_stop_seen = 0;
 static int g_reset_n = 0;
+static uint64_t g_last_reset_sid, g_last_reset_code, g_last_stop_sid;
 int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; (void)sid; (void)ec; g_reset_n++; return 0; }
+{
+    (void)c;
+    call_log('R');
+    g_last_reset_sid = sid;
+    g_last_reset_code = ec;
+    g_reset_n++;
+    return g_reset_rc;
+}
 int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint64_t rs)
-    { (void)c; (void)sid; (void)ec; (void)rs; g_reset_n++; return 0; }
-/* g_stop_refused: picoquic refuses every STOP_SENDING, as it does for a
- * stream it already released (INVALID_STREAM_ID). A refused call is still
- * counted. */
+    { (void)rs; return picoquic_reset_stream(c, sid, ec); }
+/* A genuine provider failure, separate from a terminal no-op. A refused call
+ * is still counted. */
 static bool g_stop_refused = false;
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; }
-      return g_stop_refused ? -1 : 0; }
+    { (void)c; call_log('S'); g_last_stop_sid = sid; if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; }
+      return g_stop_refused ? -1 : g_stop_rc; }
 int picoquic_close(picoquic_cnx_t *c, uint64_t ec) { (void)c; (void)ec; return 0; }
 int picoquic_close_ex(picoquic_cnx_t *c, uint64_t ec, const char *r) { (void)c; (void)ec; (void)r; return 0; }
 uint64_t picoquic_get_application_error(picoquic_cnx_t *c) { (void)c; return 0; }
@@ -1319,6 +1350,122 @@ static int row_d22_attach_refused(void)
 }
 #endif
 
+/* The endpoint's reset and stop contract against the provider's answers,
+ * with nothing real behind it: every refusal is classified by the provider
+ * before the endpoint marks, binds or drops anything, so an ID the provider
+ * never opened -- even one past the 62-bit range -- cannot be created by the
+ * endpoint's own bookkeeping. A part already ended is a no-op; an accepted
+ * reset abandons the stream's queue and active mark only afterwards. */
+static int g_rx_stopped_n = 0;
+static int count_rx_stopped(void *owner, uint64_t sid)
+    { (void)owner; (void)sid; g_rx_stopped_n++; return 0; }
+
+static int row_endpoint_classification(void)
+{
+    int before = failures;
+    moq_transport_endpoint_ops_t ops;
+    pq_endpoint_ctx_t ep;
+    memset(&ops, 0, sizeof(ops));
+    memset(&ep, 0, sizeof(ep));
+    static int cnx_tag;
+    CHECK(pq_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&cnx_tag,
+                           moq_alloc_default(), 0) == 0);
+    ep.rx_stopped = count_rx_stopped;
+    g_rx_stopped_n = 0;
+    g_active_n = 0;
+    g_reset_rc = g_stop_rc = 0;
+    g_stop_refused = false;
+
+    /* An open reserves its ID at the provider before returning it. */
+    uint64_t uni = UINT64_MAX, bidi = UINT64_MAX, bidi2 = UINT64_MAX;
+    calls_clear();
+    CHECK(ops.open_uni(&ep, &uni) == MOQ_TRANSPORT_OK);
+    CHECK(g_calls[0] == 'C');
+    calls_clear();
+    CHECK(ops.open_bidi(&ep, &bidi) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "C") == 0);
+    CHECK(ops.open_bidi(&ep, &bidi2) == MOQ_TRANSPORT_OK);
+    CHECK(bidi2 != bidi);
+
+    static const uint8_t bytes[3] = { 1, 2, 3 };
+    CHECK(ops.write(&ep, uni, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == uni);
+
+    /* Past the 62-bit range, and refused: classified first, nothing marked
+     * or bound. */
+    const uint64_t huge = ((uint64_t)1 << 62) | 3;
+    g_reset_rc = PICOQUIC_ERROR_INVALID_STREAM_ID;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, huge, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(g_last_reset_sid == huge && g_last_reset_code == 0x1);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == uni);
+    /* A refused reset of a stream with queued bytes leaves them queued. */
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, uni, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(moq_pq_send_queue_has_data(ep.queue, uni));
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == uni);
+
+    /* A sending part already ended: OK, and nothing else happens. */
+    g_reset_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, uni, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(moq_pq_send_queue_has_data(ep.queue, uni));
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == uni);
+
+    /* Accepted: only then are the queue and the active mark abandoned. */
+    g_reset_rc = 0;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, uni, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "RM") == 0);
+    CHECK(!moq_pq_send_queue_has_data(ep.queue, uni));
+    CHECK(g_active_n == 0);
+
+    CHECK(ops.write(&ep, bidi, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+
+    /* STOP: a receiving part already terminal is a no-op with no watch; an
+     * unknown, out-of-range or send-only ID, or a provider failure, stays an
+     * ERROR with no watch; an accepted stop is watched. */
+    g_stop_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "S") == 0);
+    CHECK(g_rx_stopped_n == 0);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == bidi);
+    g_stop_rc = PICOQUIC_ERROR_INVALID_STREAM_ID;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, huge, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "S") == 0);
+    CHECK(g_last_stop_sid == huge);
+    CHECK(g_rx_stopped_n == 0);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == bidi);
+    g_stop_rc = 0;
+    g_stop_refused = true;
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(g_rx_stopped_n == 0);
+    g_stop_refused = false;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "S") == 0);
+    CHECK(g_rx_stopped_n == 1);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == bidi);
+
+    g_reset_rc = 0;
+    g_stop_rc = 0;
+    pq_endpoint_cleanup(&ep);
+    g_active_n = 0;
+    return failures - before;
+}
+
 int main(void)
 {
     moq_version_t versions[3] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18,
@@ -1347,6 +1494,7 @@ int main(void)
         (void)row_deferred_behind_control(versions[i], false);
         (void)row_deferred_behind_control(versions[i], true);
     }
+    (void)row_endpoint_classification();
     if (failures == 0) printf("PASS: test_pq_hold_input\n");
     else fprintf(stderr, "FAILED: test_pq_hold_input (%d)\n", failures);
     return failures ? 1 : 0;

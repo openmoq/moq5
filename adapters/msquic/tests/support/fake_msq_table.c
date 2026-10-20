@@ -143,7 +143,11 @@ static QUIC_STATUS QUIC_API f_stream_shutdown(
     } else {
         st->shutdown_log_overflow = true;
     }
-    return st->owner->stream_shutdown_status;
+    QUIC_STATUS status = st->owner->stream_shutdown_status;
+    if (QUIC_SUCCEEDED(status) && st->owner->on_stream_shutdown != NULL)
+        st->owner->on_stream_shutdown(st, flags,
+                                      st->owner->on_stream_shutdown_ctx);
+    return status;
 }
 
 static void QUIC_API f_stream_close(HQUIC h)

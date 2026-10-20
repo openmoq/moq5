@@ -529,13 +529,36 @@ typedef struct moq_media_track_cfg {
      * track_properties: subscribers may then ask the sender to start a new
      * group, which moq_media_sender_take_new_group_request() reports. */
     bool        dynamic_groups;
+
+    /* Preserve the tail padding of the layout through dynamic_groups. This
+     * storage is reserved and is never read. */
+    uint8_t     _reserved_dynamic_groups[7];
+
+    /* MSF-01 section 5.2.11 renderGroup: tracks sharing a value are intended
+     * to render together. Independent of alt_group; emitted verbatim without
+     * inferring groups or synchronizing tracks. Every int value is accepted.
+     * Appended after the complete layout through dynamic_groups. Read only
+     * when struct_size covers the whole presence/value pair; false means
+     * absent and the value is ignored. */
+    bool        has_render_group;
+    int         render_group;
+
+    /* MSF-01 section 5.2.10 label: human-readable track-selection text.
+     * Borrowed for the call; add_track deep-copies the bytes. Read only when
+     * struct_size covers this entire presence/span block. With has_label
+     * false the span is ignored. With it true, an empty span emits "", and
+     * nonempty text must have a non-NULL pointer and well-formed UTF-8 or
+     * add_track returns MOQ_ERR_INVAL. Embedded NUL bytes are preserved. */
+    bool        has_label;
+    moq_bytes_t label;
+
     /* The track's group order (MOQT 7.1), ASCENDING or DESCENDING,
      * advertised as DEFAULT_PUBLISHER_GROUP_ORDER and added to
      * track_properties as dynamic_groups is; a subscriber's own order takes
      * precedence. DEFAULT (the default) advertises none. Other values:
      * add_track fails MOQ_ERR_INVAL. The catalog and timeline tracks always
-     * keep DEFAULT. Aligned past dynamic_groups on every target, so a
-     * caller's struct_size that ends there never covers it. */
+     * keep DEFAULT. Aligned past label on every target, so a caller's
+     * struct_size that ends there never covers it. */
 #ifdef __cplusplus
     alignas(uint64_t)
 #else

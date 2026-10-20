@@ -51,6 +51,23 @@ static uint64_t g_tp_streams_uni = 64;   /* initial_max_stream_id_unidir */
 static uint32_t g_client_max_events = 64;   /* the fetcher session's event queue */
 static picoquic_state_enum g_cnx_state = picoquic_state_ready;
 
+/* The order of the provider calls the endpoint makes, cleared per step:
+ * C stream context set, M active mark, R reset, S stop. Every stub returns
+ * at once and allocates nothing, so an ordering that would create streams
+ * at a real provider is only recorded here. */
+static char g_calls[32];
+static int g_calls_n = 0;
+static void call_log(char c)
+    { if (g_calls_n < (int)sizeof(g_calls) - 1) { g_calls[g_calls_n++] = c; g_calls[g_calls_n] = 0; } }
+static void calls_clear(void) { g_calls_n = 0; g_calls[0] = 0; }
+static int g_reset_rc = 0;   /* what the next resets answer */
+static int g_reset_at_rc = 0;
+static int g_stop_rc = 0;    /* what the next stops answer, unless refused */
+static int g_stream_ctx_rc = 0;
+static void *g_last_stream_ctx;
+static uint64_t g_last_reset_code, g_last_reliable_size;
+static bool g_reset_at_enabled = false;
+
 picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c) { (void)c; return NULL; }
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
 int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
@@ -75,6 +92,7 @@ picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c, int ge
       tp.initial_max_stream_data_bidi_remote = g_rx_window;
       tp.initial_max_stream_data_bidi_local = g_rx_window;
       tp.initial_max_stream_id_unidir = g_tp_streams_uni;
+      tp.is_reset_stream_at_enabled = g_reset_at_enabled;
       return &tp; }
 
 /* h3zero stream contexts: a pool keyed by stream id */
@@ -142,7 +160,7 @@ static void act_set(uint64_t sid, int on)
     if (on && g_active_n < ACT_MAX) g_active[g_active_n++] = sid;
 }
 int picoquic_mark_active_stream(picoquic_cnx_t *c, uint64_t sid, int active, void *v)
-    { (void)c; (void)v; act_set(sid, active); return 0; }
+    { (void)c; (void)v; call_log('M'); act_set(sid, active); return 0; }
 static uint8_t g_provide_buf[4096];
 static size_t g_provide_nb; static int g_provide_fin; static int g_provide_still;
 uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin, int is_still_active)
@@ -154,18 +172,29 @@ uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin, i
 static struct { uint64_t sid; uint64_t code; } g_stops[SIG_MAX];
 static int g_stop_n = 0, g_stop_seen = 0;
 static int g_reset_n = 0;
-int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec) { (void)c; (void)sid; (void)ec; g_reset_n++; return 0; }
+int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
+    { (void)c; (void)sid; call_log('R'); g_reset_n++;
+      g_last_reset_code = ec; g_last_reliable_size = 0; return g_reset_rc; }
 int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint64_t reliable_size)
-    { (void)c; (void)sid; (void)ec; (void)reliable_size; g_reset_n++; return 0; }
+    { (void)c; (void)sid; call_log('R'); g_reset_n++;
+      g_last_reset_code = ec; g_last_reliable_size = reliable_size; return g_reset_at_rc; }
 int picowt_reset_stream(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *stream_ctx, uint64_t local_stream_error)
-    { (void)cnx; (void)stream_ctx; (void)local_stream_error; g_reset_n++; return 0; }
+    { int rc = picoquic_reset_stream_at(cnx, stream_ctx->stream_id,
+          local_stream_error, 2 + picoquic_frames_varint_encode_length(
+              stream_ctx->ps.stream_state.control_stream_id));
+      stream_ctx->ps.stream_state.is_fin_sent = 1;   /* as picowt marks it */
+      return rc; }
 /* g_stop_refused: picoquic refuses every STOP_SENDING, as it does for a
  * stream it already released (INVALID_STREAM_ID). A refused call is still
  * counted. */
 static bool g_stop_refused = false;
+/* The endpoint puts h3zero's stream record back as the QUIC stream context
+ * after a STOP or reset; nothing reads it here. */
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+    { (void)c; (void)sid; call_log('C'); g_last_stream_ctx = ctx; return g_stream_ctx_rc; }
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; }
-      return g_stop_refused ? -1 : 0; }
+    { (void)c; call_log('S'); if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; }
+      return g_stop_refused ? -1 : g_stop_rc; }
 
 /* Flow-control instrumentation: app-flow-control takeover and grants per stream. */
 #define FC_MAX 64
@@ -1424,6 +1453,286 @@ static int row_d22_attach_refused(void)
 }
 #endif
 
+/* The endpoint's reset and stop contract against the provider's answers,
+ * with nothing real behind it: picoquic classifies every reset and stop
+ * before the endpoint marks, binds or drops anything, so an ID the provider
+ * never opened -- even one past the 62-bit range -- cannot be created by the
+ * endpoint's own bookkeeping. A part already ended is a no-op that leaves
+ * h3zero's record as it was; an accepted reset abandons the stream's queue
+ * and active mark only afterwards, then restores h3zero's record. */
+static int g_local_stops = 0;
+static void count_local_stop(void *ctx, uint64_t sid)
+    { (void)ctx; (void)sid; g_local_stops++; }
+
+static int row_endpoint_classification(void)
+{
+    int before = failures;
+    g_sc_n = 0;
+    g_next_uni = 2;
+    g_next_bidi = 4;
+    g_active_n = 0;
+    g_tp_null = false;
+    g_reset_at_enabled = false;
+    g_reset_rc = g_reset_at_rc = g_stop_rc = g_stream_ctx_rc = 0;
+    g_stop_refused = false;
+    moq_transport_endpoint_ops_t ops;
+    pico_wt_endpoint_ctx_t ep;
+    memset(&ops, 0, sizeof(ops));
+    static int cnx_tag;
+    h3zero_stream_ctx_t *control = sc_get(0);
+    CHECK(control != NULL);
+    if (control == NULL) return failures - before;
+    int rc = pico_wt_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&cnx_tag, &g_h3,
+                                    control, moq_alloc_default());
+    CHECK(rc == 0);
+    if (rc != 0) return failures - before;
+    ep.on_local_stop_sending = count_local_stop;
+    g_local_stops = 0;
+
+    uint64_t uni = UINT64_MAX, bidi = UINT64_MAX;
+    CHECK(ops.open_uni(&ep, &uni) == MOQ_TRANSPORT_OK);
+    CHECK(ops.open_bidi(&ep, &bidi) == MOQ_TRANSPORT_OK);
+    /* Use a bidi so an accepted reset must keep h3zero's receive owner. */
+    h3zero_stream_ctx_t *usc = h3zero_find_stream(&g_h3, bidi);
+    CHECK(usc != NULL);
+    if (usc == NULL) { pico_wt_endpoint_cleanup(&ep); return failures - before; }
+    static const uint8_t bytes[3] = { 1, 2, 3 };
+    CHECK(ops.write(&ep, bidi, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+    usc->ps.stream_state.is_fin_sent = 0;
+
+    /* No h3zero record and past the 62-bit range: classified first. */
+    const uint64_t huge = ((uint64_t)1 << 62) | 2;
+    g_reset_rc = PICOQUIC_ERROR_INVALID_STREAM_ID;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, huge, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    /* A refused reset of a stream h3zero holds leaves its queue and state. */
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, bidi, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(usc->ps.stream_state.is_fin_sent == 0);
+    CHECK(g_active_n == 1 && g_active[0] == bidi);
+
+    /* A sending part already ended, with and without an h3zero record: OK,
+     * and nothing else happens. */
+    g_reset_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(usc->ps.stream_state.is_fin_sent == 0);
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, bidi + 400, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "R") == 0);
+
+    /* Accepted: the queue and active mark go only afterwards, and h3zero's
+     * record is put back as the stream's context. */
+    g_reset_rc = 0;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "RMC") == 0);
+    CHECK(g_last_stream_ctx == usc);
+    CHECK(!moq_pq_send_queue_has_data(ep.queue, bidi));
+    CHECK(g_active_n == 0);
+    CHECK(usc->ps.stream_state.is_fin_sent == 1);
+    uint64_t wt_code = 0;
+    CHECK(pico_wt_moq_err_to_wt(0x1, &wt_code));
+    CHECK(g_last_reset_code == wt_code && g_last_reliable_size == 0);
+
+    /* picowt changes is_fin_sent even on refusal: every no-op/error restores
+     * it, leaves the queued bytes alone, and does not publish a new witness. */
+    g_reset_at_enabled = true;
+    const size_t preamble = 2 + picoquic_frames_varint_encode_length(ep.control_stream_id);
+    CHECK(ops.write(&ep, bidi, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+    usc->ps.stream_state.is_fin_sent = 0;
+    ep.last_reset_reliable_size = 99;
+    const int refused[] = { PICOQUIC_ERROR_INVALID_STREAM_ID,
+                            PICOQUIC_ERROR_STREAM_ALREADY_CLOSED };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        g_reset_at_rc = refused[i];
+        calls_clear();
+        CHECK(ops.reset_stream(&ep, bidi, 0x1) ==
+              (i == 0 ? MOQ_TRANSPORT_ERROR : MOQ_TRANSPORT_OK));
+        CHECK(strcmp(g_calls, "R") == 0);
+        CHECK(usc->ps.stream_state.is_fin_sent == 0);
+        CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+        CHECK(g_active_n == 1 && g_active[0] == bidi);
+        CHECK(ep.last_reset_reliable_size == 99 && ep.deferred_count == 0);
+    }
+    /* The WT wire preamble is retained on the accepted reliable reset. */
+    g_reset_at_rc = 0;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "RMC") == 0 && g_last_stream_ctx == usc);
+    CHECK(g_last_reset_code == wt_code && g_last_reliable_size == preamble);
+    CHECK(ep.last_reset_reliable_size == preamble);
+    CHECK(!moq_pq_send_queue_has_data(ep.queue, bidi));
+
+    /* An explicit MoQ reliable prefix adds to, never replaces, the WT
+     * preamble. Both terminal and failed immediate issues do no bookkeeping. */
+    usc->ps.stream_state.is_fin_sent = 0;
+    ep.last_reset_reliable_size = 99;
+    g_reset_at_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    calls_clear();
+    CHECK(ops.reset_stream_at(&ep, bidi, 0x1, 2) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(usc->ps.stream_state.is_fin_sent == 0 && ep.last_reset_reliable_size == 99);
+    g_reset_at_rc = g_reset_rc = PICOQUIC_ERROR_INVALID_STREAM_ID;
+    calls_clear();
+    CHECK(ops.reset_stream_at(&ep, bidi, 0x1, 2) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "RR") == 0);
+    CHECK(usc->ps.stream_state.is_fin_sent == 0 && ep.last_reset_reliable_size == 99);
+    g_reset_at_rc = 0;
+    calls_clear();
+    CHECK(ops.reset_stream_at(&ep, bidi, 0x1, 2) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "RMC") == 0 && g_last_stream_ctx == usc);
+    CHECK(g_last_reliable_size == preamble + 2 && g_last_reset_code == wt_code);
+    CHECK(ep.reliable_resets == 1);
+
+    /* STOP: a receiving part already terminal is a no-op that neither
+     * restores a context nor reports a local stop; unknown or out-of-range
+     * IDs and provider failures stay ERRORs; an accepted stop restores and
+     * reports. */
+    g_stop_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "S") == 0);
+    CHECK(g_local_stops == 0);
+    g_stop_rc = PICOQUIC_ERROR_INVALID_STREAM_ID;
+    const uint64_t bad_stops[] = { huge, uni, bidi + 400 };
+    for (size_t i = 0; i < sizeof(bad_stops) / sizeof(bad_stops[0]); i++) {
+        calls_clear();
+        CHECK(ops.stop_sending(&ep, bad_stops[i], 0x1) == MOQ_TRANSPORT_ERROR);
+        CHECK(strcmp(g_calls, "S") == 0);
+        CHECK(g_local_stops == 0);
+    }
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, (uint64_t)UINT32_MAX + 1) == MOQ_TRANSPORT_ERROR);
+    CHECK(g_calls_n == 0 && g_local_stops == 0);
+    g_stop_rc = 0;
+    g_stop_refused = true;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "S") == 0);
+    CHECK(g_local_stops == 0);
+    g_stop_refused = false;
+    g_stream_ctx_rc = -1;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_ERROR);
+    CHECK(strcmp(g_calls, "SC") == 0 && g_local_stops == 0);
+    g_stream_ctx_rc = 0;
+    calls_clear();
+    CHECK(ops.stop_sending(&ep, bidi, 0x1) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "SC") == 0);
+    CHECK(g_last_stream_ctx == usc);
+    CHECK(g_local_stops == 1);
+
+    g_reset_rc = 0;
+    g_reset_at_rc = 0;
+    g_stop_rc = 0;
+    g_reset_at_enabled = false;
+    pico_wt_endpoint_cleanup(&ep);
+    if (failures == before) printf("PASS: pico_wt endpoint terminal classification\n");
+    return failures - before;
+}
+
+/* Fill the real bounded deferral array through endpoint calls, then pin the
+ * all-or-nothing refusal and retry without any provider stream allocation. */
+static int row_endpoint_deferred_capacity(void)
+{
+    int before = failures;
+    g_sc_n = g_active_n = 0;
+    g_next_bidi = 4;
+    g_tp_null = false;
+    g_reset_at_enabled = true;
+    g_reset_at_rc = PICOQUIC_ERROR_OFFSET_TOO_BIG;
+    g_reset_rc = g_stream_ctx_rc = 0;
+    h3zero_stream_ctx_t *control = sc_get(0);
+    CHECK(control != NULL);
+    if (control == NULL) return failures - before;
+    moq_transport_endpoint_ops_t ops;
+    pico_wt_endpoint_ctx_t ep;
+    memset(&ops, 0, sizeof(ops));
+    int rc = pico_wt_endpoint_init(&ops, &ep, CNX, &g_h3, control,
+                                    moq_alloc_default());
+    CHECK(rc == 0);
+    if (rc != 0) return failures - before;
+    static const uint8_t bytes[] = { 4, 3, 2, 1 };
+    const size_t preamble = 2 + picoquic_frames_varint_encode_length(ep.control_stream_id);
+    for (size_t i = 0; i < PICO_WT_DEFERRED_RESETS_MAX; i++) {
+        uint64_t sid = UINT64_MAX;
+        CHECK(ops.open_bidi(&ep, &sid) == MOQ_TRANSPORT_OK);
+        CHECK(ops.write(&ep, sid, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+        calls_clear();
+        CHECK(ops.reset_stream(&ep, sid, 0x2) == MOQ_TRANSPORT_OK);
+        CHECK(strcmp(g_calls, "RMC") == 0);
+        CHECK(ep.deferred_count == i + 1);
+        CHECK(ep.deferred[i].sid == sid && ep.deferred[i].reliable_size == preamble);
+    }
+    pico_wt_deferred_reset_t saved[PICO_WT_DEFERRED_RESETS_MAX];
+    memcpy(saved, ep.deferred, sizeof(saved));
+    uint64_t sid = UINT64_MAX;
+    CHECK(ops.open_bidi(&ep, &sid) == MOQ_TRANSPORT_OK);
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(&g_h3, sid);
+    CHECK(sc != NULL);
+    if (sc == NULL) { pico_wt_endpoint_cleanup(&ep); return failures - before; }
+    CHECK(ops.write(&ep, sid, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+    ep.last_reset_reliable_size = 99;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, sid, 0x2) == MOQ_TRANSPORT_WOULD_BLOCK);
+    CHECK(strcmp(g_calls, "R") == 0);
+    CHECK(ep.deferred_count == PICO_WT_DEFERRED_RESETS_MAX);
+    CHECK(memcmp(saved, ep.deferred, sizeof(saved)) == 0);
+    CHECK(ep.last_reset_reliable_size == 99);
+    CHECK(sc->ps.stream_state.is_fin_sent == 0);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    CHECK(g_active_n == 1 && g_active[0] == sid);
+    size_t nb = 0;
+    bool fin = true, still = true;
+    CHECK(moq_pq_send_queue_plan(ep.queue, sid, sizeof(bytes), &nb, &fin, &still));
+    CHECK(nb == sizeof(bytes) && !fin && !still);
+
+    /* Once room returns, this exact request is accepted and the WT preamble
+     * remains the reliable size; the queued MoQ bytes can now be abandoned. */
+    g_reset_at_rc = 0;
+    int resets = g_reset_n;
+    CHECK(pico_wt_endpoint_flush_resets(&ep) == 0);
+    CHECK(ep.deferred_count == 0);
+    CHECK(g_reset_n - resets == (int)PICO_WT_DEFERRED_RESETS_MAX);
+    CHECK(moq_pq_send_queue_queued_bytes(ep.queue) == sizeof(bytes));
+    g_reset_at_rc = PICOQUIC_ERROR_OFFSET_TOO_BIG;
+    calls_clear();
+    CHECK(ops.reset_stream(&ep, sid, 0x2) == MOQ_TRANSPORT_OK);
+    CHECK(strcmp(g_calls, "RMC") == 0 && g_last_stream_ctx == sc);
+    CHECK(ep.deferred_count == 1 && ep.deferred[0].sid == sid);
+    CHECK(ep.deferred[0].reliable_size == preamble);
+    CHECK(ep.last_reset_reliable_size == preamble);
+    CHECK(!moq_pq_send_queue_has_data(ep.queue, sid) && g_active_n == 0);
+
+    /* A deferred stream that ended needs no new mark, context or FIN flag.
+     * A genuine retry failure, unlike that terminal answer, remains fatal. */
+    g_reset_at_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    calls_clear();
+    CHECK(pico_wt_endpoint_flush_resets(&ep) == 0);
+    CHECK(strcmp(g_calls, "R") == 0 && ep.deferred_count == 0);
+    CHECK(sc->ps.stream_state.is_fin_sent == 0);
+    g_reset_at_rc = PICOQUIC_ERROR_OFFSET_TOO_BIG;
+    CHECK(ops.reset_stream(&ep, sid, 0x2) == MOQ_TRANSPORT_OK);
+    g_reset_at_rc = PICOQUIC_ERROR_INVALID_STREAM_ID;
+    calls_clear();
+    CHECK(pico_wt_endpoint_flush_resets(&ep) == -1);
+    CHECK(strcmp(g_calls, "R") == 0 && ep.deferred_count == 0);
+    CHECK(sc->ps.stream_state.is_fin_sent == 0);
+
+    pico_wt_endpoint_cleanup(&ep);
+    g_reset_at_enabled = false;
+    g_reset_at_rc = 0;
+    if (failures == before) printf("PASS: pico_wt endpoint deferred reset capacity\n");
+    return failures - before;
+}
+
 int main(void)
 {
     moq_version_t versions[3] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18,
@@ -1452,6 +1761,8 @@ int main(void)
         (void)row_deferred_behind_control(versions[i], false);
         (void)row_deferred_behind_control(versions[i], true);
     }
+    (void)row_endpoint_classification();
+    (void)row_endpoint_deferred_capacity();
     if (failures == 0) printf("PASS: test_pico_wt_hold_input\n");
     else fprintf(stderr, "FAILED: test_pico_wt_hold_input (%d)\n", failures);
     return failures ? 1 : 0;

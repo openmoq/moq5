@@ -371,6 +371,21 @@ add_test(NAME session_setup_tokens COMMAND test_session_setup_tokens)
 # Receive-capacity saturation through the real bridge over fake endpoints:
 # fill receive entries, retain later deliveries, and replay after capacity
 # returns. No request loses its response or receives a fabricated terminal.
+# Local receive retirement: a stopped peer data stream whose FIN or RESET the
+# transport never reports is released by the transport's terminal report, after
+# the STOP was accepted, with no FIN, reset or delivery claimed.
+add_executable(test_bridge_local_retire unit/test_bridge_local_retire.c)
+target_link_libraries(test_bridge_local_retire PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_local_retire PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_local_retire COMMAND test_bridge_local_retire)
+
+# A peer RESET of a request bidi ends only the peer's half: our send half keeps
+# its mapping until it is closed, or reset once in answer to a later STOP.
+add_executable(test_bridge_bidi_reset_half unit/test_bridge_bidi_reset_half.c)
+target_link_libraries(test_bridge_bidi_reset_half PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_bidi_reset_half PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_bidi_reset_half COMMAND test_bridge_bidi_reset_half)
+
 add_executable(test_bridge_rx_saturation unit/test_bridge_rx_saturation.c)
 target_link_libraries(test_bridge_rx_saturation PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_rx_saturation PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
@@ -810,6 +825,12 @@ if(TARGET moq::sim)
     add_executable(test_d22_facade_surfaces unit/test_d22_facade_surfaces.c)
     target_link_libraries(test_d22_facade_surfaces PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d22_facade_surfaces COMMAND test_d22_facade_surfaces)
+    add_executable(test_d16_cancel_crossing_done unit/test_d16_cancel_crossing_done.c)
+    target_link_libraries(test_d16_cancel_crossing_done PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME d16_cancel_crossing_done COMMAND test_d16_cancel_crossing_done)
+    add_executable(test_d16_obsolete_done unit/test_d16_obsolete_done.c)
+    target_link_libraries(test_d16_obsolete_done PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME d16_obsolete_done COMMAND test_d16_obsolete_done)
 
     add_executable(test_subscription_update_answer unit/test_subscription_update_answer.c)
     target_link_libraries(test_subscription_update_answer PRIVATE moq-core-test-internals moq::sim)
@@ -1025,6 +1046,15 @@ if(TARGET moq::sim)
     add_executable(test_d18_update unit/test_d18_update.c)
     target_link_libraries(test_d18_update PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d18_update COMMAND test_d18_update)
+
+    add_executable(test_update_capacity unit/test_update_capacity.c)
+    target_link_libraries(test_update_capacity PRIVATE moq-core-test-internals moq::sim)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_update_capacity PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME update_capacity COMMAND test_update_capacity)
+    set_tests_properties(update_capacity PROPERTIES TIMEOUT 30)
 
     add_executable(test_d18_publish_done unit/test_d18_publish_done.c)
     target_link_libraries(test_d18_publish_done PRIVATE moq-core-test-internals moq::sim)

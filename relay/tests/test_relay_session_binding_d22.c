@@ -348,6 +348,164 @@ draft22_fill_served(void)
     return f + rig.failures;
 }
 
+/* The origin advertises a catalog published before the relay subscribed:
+ * Largest is {2,0}, but the relay has never ingested an Object. A relative
+ * fill must retrieve that exact Object, not wait for it on the live feed. */
+static int
+draft22_fill_before_upstream_subscription(bool refuse_fetch, bool descending)
+{
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    rig_t rig;
+    if (relay_bind_test_rig_create(&rig, &a) != MOQR_OK) return 1;
+    d22_track_t t;
+    memset(&t, 0, sizeof(t));
+    t.nsp[0] = B("late");
+    t.nsp[1] = B("catalog");
+    t.pub = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_22);
+    conn_t *sub = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_22);
+    R_CHECK(&rig, t.pub != NULL && sub != NULL);
+    if (t.pub == NULL || sub == NULL) goto done;
+    relay_bind_test_rig_pump(&rig, 4);
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = t.nsp, .count = 2 };
+    moq_announcement_t ann;
+    R_CHECK(&rig, moq_session_publish_namespace(t.pub->peer, &pcfg,
+                                                rig.now, &ann) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 4);
+    moq_location_filter_cfg_t loc, floc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT;
+    moq_location_filter_cfg_init(&floc);
+    floc.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+    floc.relative_group_offset = 1;
+    moq_fill_cfg_t fill;
+    moq_fill_cfg_init(&fill);
+    fill.location = &floc;
+    fill.has_fill_timeout = true;
+    fill.fill_timeout_ms = 500;
+    moq_subscription_t h;
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = t.nsp, .count = 2 };
+    scfg.track_name = B("v");
+    scfg.location = &loc;
+    scfg.fill = &fill;
+    scfg.group_order = descending ? MOQ_GROUP_ORDER_DESCENDING
+                                  : MOQ_GROUP_ORDER_ASCENDING;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &scfg, rig.now, &h) == MOQ_OK);
+    static const uint8_t body[] = "retained catalog";
+    unsigned requests = 0, objects = 0, terminals = 0, acks = 0;
+    moq_subscription_t upstream = {0};
+    for (unsigned cycle = 0; cycle < 40; cycle++) {
+        relay_bind_test_rig_cycle(&rig);
+        moq_event_t ev;
+        while (moq_session_poll_events(t.pub->peer, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+                upstream = ev.u.subscribe_request.sub;
+                moq_accept_subscribe_cfg_t ac;
+                moq_accept_subscribe_cfg_init(&ac);
+                ac.has_largest = true;
+                ac.largest_group = 2;
+                R_CHECK(&rig, moq_session_accept_subscribe(t.pub->peer,
+                    upstream, &ac, rig.now) == MOQ_OK);
+            } else if (ev.kind == MOQ_EVENT_FETCH_REQUEST) {
+                const moq_fetch_request_event_t *q = &ev.u.fetch_request;
+                moq_fetch_t fh = q->fetch;
+                requests++;
+                R_CHECK(&rig, requests == 1 && q->start_group == 2 &&
+                    q->start_object == 0 && q->end_group == 2 &&
+                    q->end_object == 1 && q->track_name.len == 1 &&
+                    q->track_name.data[0] == 'v');
+                /* A single-group origin request uses Object order; the
+                 * fill's descending order chooses which group comes next. */
+                R_CHECK(&rig, q->group_order == MOQ_GROUP_ORDER_ASCENDING);
+                R_CHECK(&rig, q->options != NULL &&
+                    (q->options->flags & MOQ_FETCH_REQUEST_HAS_FILL_TIMEOUT) == 0);
+                if (refuse_fetch) {
+                    moq_reject_fetch_cfg_t reject;
+                    moq_reject_fetch_cfg_init(&reject);
+                    reject.error_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
+                    reject.reason = B("FETCH not supported");
+                    R_CHECK(&rig, moq_session_reject_fetch(t.pub->peer, fh,
+                        &reject, rig.now) == MOQ_OK);
+                    moq_event_cleanup(&ev);
+                    continue;
+                }
+                moq_accept_fetch_cfg_t ac;
+                moq_accept_fetch_cfg_init(&ac);
+                ac.end_group = 2;
+                ac.end_object = 1;
+                R_CHECK(&rig, moq_session_accept_fetch(t.pub->peer, fh,
+                                                        &ac, rig.now) == MOQ_OK);
+                moq_fetch_object_cfg_t oc;
+                moq_fetch_object_cfg_init(&oc);
+                oc.group_id = 2;
+                R_CHECK(&rig, moq_rcbuf_create(&a.vt, body, sizeof(body),
+                                                 &oc.payload) == MOQ_OK);
+                moq_result_t rc = moq_session_write_fetch_object(t.pub->peer,
+                    fh, &oc, rig.now);
+                moq_rcbuf_decref(oc.payload);
+                R_CHECK(&rig, rc == MOQ_OK);
+                R_CHECK(&rig, moq_session_end_fetch(t.pub->peer, fh,
+                                                     rig.now) == MOQ_OK);
+            }
+            moq_event_cleanup(&ev);
+        }
+        while (moq_session_poll_events(sub->peer, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK) {
+                acks++;
+                R_CHECK(&rig, ev.u.subscribe_ok.has_largest &&
+                    ev.u.subscribe_ok.largest_group == 2 &&
+                    ev.u.subscribe_ok.largest_object == 0);
+            } else if (ev.kind == MOQ_EVENT_FILL_OBJECT) {
+                objects++;
+                R_CHECK(&rig, ev.u.fill_object.group_id == 2 &&
+                    ev.u.fill_object.object_id == 0 &&
+                    moq_rcbuf_len(ev.u.fill_object.payload) == sizeof(body) &&
+                    memcmp(moq_rcbuf_data(ev.u.fill_object.payload), body,
+                           sizeof(body)) == 0);
+            } else if (ev.kind == MOQ_EVENT_FILL_TERMINAL) {
+                terminals++;
+                R_CHECK(&rig, ev.u.fill_terminal.reason ==
+                    (refuse_fetch ? MOQ_FILL_PEER_CANCELLED_OR_RESET
+                                    : MOQ_FILL_COMPLETE));
+                R_CHECK(&rig, ev.u.fill_terminal.error_domain ==
+                    (refuse_fetch ? MOQ_FILL_ERROR_STREAM : MOQ_FILL_ERROR_NONE));
+                R_CHECK(&rig, ev.u.fill_terminal.error_code ==
+                    (refuse_fetch ? MOQ_STREAM_ERROR_UNKNOWN_OBJECT_STATUS : 0));
+            } else {
+                R_CHECK(&rig, ev.kind != MOQ_EVENT_OBJECT_RECEIVED &&
+                    ev.kind != MOQ_EVENT_FILL_GAP &&
+                    ev.kind != MOQ_EVENT_SUBSCRIBE_ERROR &&
+                    ev.kind != MOQ_EVENT_SESSION_CLOSED);
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    R_CHECK(&rig, requests == 1 && objects == (refuse_fetch ? 0u : 1u) &&
+        terminals == 1 && acks == 1);
+    moqr_bind_fwd_debug_t st;
+    moqr_bind_debug_fwd_stats(rig.bind, &st);
+    R_CHECK(&rig, st.live == 0 && st.bytes_used == 0);
+    R_CHECK(&rig, moq_session_state(sub->peer) == MOQ_SESS_ESTABLISHED &&
+        moq_session_state(t.pub->peer) == MOQ_SESS_ESTABLISHED);
+    relay_bind_test_pub_subgroup_n(&rig, t.pub, upstream, 3, 0, 1, false);
+    relay_bind_test_rig_pump(&rig, 8);
+    peer_state_t ps = {0};
+    relay_bind_test_peer_drain(&rig, sub, &ps, false, false, 0, 0);
+    R_CHECK(&rig, ps.objects == 1 && ps.dlv_n == 1 && ps.dlv[0].group == 3);
+done:
+    relay_bind_test_rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (rig.failures == 0)
+        printf("PASS: draft22_fill_before_upstream_subscription(%s,%s)\n",
+               refuse_fetch ? "origin-refuses-fetch" : "exact-object",
+               descending ? "descending" : "ascending");
+    return rig.failures;
+}
+
 /* Withhold that same origin response: at the original observation times,
  * the fill must still owe group 0's tail, not invent Unknown or complete. */
 static int
@@ -529,6 +687,8 @@ draft22_fill_timeout_zero_partial(void)
     d22_track_t t;
     relay_bind_test_d22_hole_setup(&rig, &t);
     R_CHECK(&rig, t.prime_ps.objects == 5);
+    moqr_bind_fwd_debug_t before, after;
+    moqr_bind_debug_fwd_stats(rig.bind, &before);
     conn_t *sub = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_22);
     R_CHECK(&rig, sub != NULL);
     relay_bind_test_rig_pump(&rig, 4);
@@ -550,6 +710,8 @@ draft22_fill_timeout_zero_partial(void)
     R_CHECK(&rig, s_ps.fill_term_reason == MOQ_FILL_COMPLETE);
     R_CHECK(&rig, !s_ps.done_seen && !s_ps.session_closed);
     R_CHECK(&rig, moqr_bind_next_deadline_us(rig.bind) == UINT64_MAX);
+    moqr_bind_debug_fwd_stats(rig.bind, &after);
+    R_CHECK(&rig, after.admitted == before.admitted && after.live == 0);
 
     /* The subscription lives on at the live edge. */
     relay_bind_test_pub_subgroup_n(&rig, t.pub, t.pub_ps.up_sub, 2, 0, 3, false);
@@ -2459,7 +2621,10 @@ draft22_fill_terminal_gap(d22_gap_policy_mode_t mode)
     relay_bind_test_peer_drain(&rig, sub, &ps, false, false, 0, 0);
     d22_gap_t want[2];
     int gaps = 0;
-    if (mode == D22_GAP_NONTERMINAL_NI || mode == D22_GAP_CAPPED_CLAIM) {
+    /* Only the marked Unknown run needs a preceding explicit Non-Existent
+     * split (§3.2.2). In capped-claim, the following Object proves the gap
+     * implicitly even though the two readers supplied different pieces. */
+    if (mode == D22_GAP_NONTERMINAL_NI) {
         want[gaps++] = (d22_gap_t){ MOQ_FETCH_RANGE_NON_EXISTENT, 0, 0 };
     }
     if (mode == D22_GAP_NONTERMINAL_NI || mode == D22_GAP_TERMINAL_UNKNOWN) {
@@ -2896,6 +3061,13 @@ arena_short_tail_terminal(moq_version_t v)
 int
 main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--late-subscriber") == 0) {
+        int failures = draft22_fill_before_upstream_subscription(false, false);
+        failures += draft22_fill_before_upstream_subscription(true, false);
+        failures += draft22_fill_before_upstream_subscription(false, true);
+        failures += draft22_fill_before_upstream_subscription(true, true);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && strcmp(argv[1], "--fill-terminal-gap") == 0) {
         return draft22_fill_terminal_gap_all() == 0 ? 0 : 1;
     }
@@ -2921,6 +3093,10 @@ main(int argc, char **argv)
     failures += draft_range_end(MOQ_VERSION_DRAFT_18);
     failures += draft_range_end(MOQ_VERSION_DRAFT_22);
     failures += draft22_fill_served();
+    failures += draft22_fill_before_upstream_subscription(false, false);
+    failures += draft22_fill_before_upstream_subscription(true, false);
+    failures += draft22_fill_before_upstream_subscription(false, true);
+    failures += draft22_fill_before_upstream_subscription(true, true);
     failures += draft22_fill_origin_unanswered();
     failures += draft22_fill_terminal_gap_all();
     failures += draft22_fill_failed_on_wire();

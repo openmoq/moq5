@@ -114,10 +114,13 @@ bool moq_binding_sends_target(const moq_session_t *s)
 #define BINDING_MALFORMED_AUTHORITY UINT64_C(0x1a)
 
 uint64_t moq_binding_judge_peer_target(const moq_session_t *s,
-                                       bool has_path, moq_bytes_t path,
-                                       bool has_authority, moq_bytes_t authority,
+                                       const moq_binding_peer_target_t *target,
                                        const char **reason)
 {
+    const bool has_path = target->has_path;
+    const bool has_authority = target->has_authority;
+    const moq_bytes_t path = target->path;
+    const moq_bytes_t authority = target->authority;
     bool peer_is_client = s->perspective == MOQ_PERSPECTIVE_SERVER;
     if (has_path && !peer_is_client) {
         *reason = "PATH from server";

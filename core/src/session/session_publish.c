@@ -73,9 +73,11 @@ moq_result_t moq_session_publication_filter_sized(moq_session_t *s,
     int slot = pub_resolve_handle(s, pub);
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
     const moq_pub_entry_t *e = &s->publishes[slot];
-    moq_location_filter_from_core(e->filter_type, e->req_start_group,
-                                  e->req_start_object, e->req_end_group,
-                                  e->req_end_object, out, out_size);
+    moq_location_filter_from_core(&(moq_core_filter_t){
+        .type = e->filter_type,
+        .start_group = e->req_start_group, .start_object = e->req_start_object,
+        .end_group = e->req_end_group, .end_object = e->req_end_object },
+        out, out_size);
     return MOQ_OK;
 }
 
@@ -1399,8 +1401,11 @@ moq_result_t moq_session_publish(moq_session_t *s,
             if (lrc < 0) return lrc;
             moq_local_filter_normalize(s, &filter_type, &start_group);
             initial.flags |= MOQ_PUBLISH_INITIAL_HAS_LOCATION;
-            moq_location_filter_from_core(filter_type, start_group, start_object,
-                end_group, end_object, &initial.location, sizeof(initial.location));
+            moq_location_filter_from_core(&(moq_core_filter_t){
+                .type = filter_type,
+                .start_group = start_group, .start_object = start_object,
+                .end_group = end_group, .end_object = end_object },
+                &initial.location, sizeof(initial.location));
         }
         if (has_object_dt) {
             initial.flags |= MOQ_PUBLISH_INITIAL_HAS_OBJECT_TIMEOUT;

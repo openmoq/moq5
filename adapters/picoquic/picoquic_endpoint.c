@@ -25,40 +25,43 @@
 #if !defined(PICOQUIC_CLOSE_REASON_COPIED) || PICOQUIC_CLOSE_REASON_COPIED != 1
 #error picoquic_must_copy_close_reasons_apply_libmoq_picoquic_patch_0006
 #endif
+#if !defined(PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED) || PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED != 1
+#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0010
+#endif
 
 /* PICOQUIC_ERROR_DATAGRAM_TOO_LONG is defined in picoquic.h */
 #ifndef PICOQUIC_ERROR_DATAGRAM_TOO_LONG
 #define PICOQUIC_ERROR_DATAGRAM_TOO_LONG 0x43b
 #endif
 
-static moq_transport_result_t pq_open_uni(void *ctx, uint64_t *out_id)
+/* An opened stream exists at the provider before its first write: the ID is
+ * reserved below picoquic's creation boundary, so the next open gets a fresh
+ * ID and a reset before any write finds the stream. The stream sends nothing
+ * until it is written or reset. */
+static moq_transport_result_t pq_open(pq_endpoint_ctx_t *ep, int is_unidir,
+                                      uint64_t *out_id)
 {
-    pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;   /* cnx released; see the header */
-    uint64_t id = picoquic_get_next_local_stream_id(ep->cnx, 1);
-    /* Create it now: the next open must not get the same id. */
-    if (picoquic_set_app_stream_ctx(ep->cnx, id, NULL) != 0 ||
-        moq_pq_send_queue_opened(ep->queue, id) != 0)
+    uint64_t sid = picoquic_get_next_local_stream_id(ep->cnx, is_unidir);
+    if (picoquic_set_app_stream_ctx(ep->cnx, sid, NULL) != 0 ||
+        moq_pq_send_queue_opened(ep->queue, sid) != 0)
         return MOQ_TRANSPORT_ERROR;
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
-    if (picoquic_enable_stream_send_commit(ep->cnx, id) != 0)
+    if (is_unidir && picoquic_enable_stream_send_commit(ep->cnx, sid) != 0)
         return MOQ_TRANSPORT_ERROR;
 #endif
-    *out_id = id;
+    *out_id = sid;
     return MOQ_TRANSPORT_OK;
+}
+
+static moq_transport_result_t pq_open_uni(void *ctx, uint64_t *out_id)
+{
+    return pq_open((pq_endpoint_ctx_t *)ctx, 1, out_id);
 }
 
 static moq_transport_result_t pq_open_bidi(void *ctx, uint64_t *out_id)
 {
-    pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
-    if (!ep->cnx) return MOQ_TRANSPORT_ERROR;
-    uint64_t id = picoquic_get_next_local_stream_id(ep->cnx, 0);
-    /* Create it now: the next open must not get the same id. */
-    if (picoquic_set_app_stream_ctx(ep->cnx, id, NULL) != 0 ||
-        moq_pq_send_queue_opened(ep->queue, id) != 0)
-        return MOQ_TRANSPORT_ERROR;
-    *out_id = id;
-    return MOQ_TRANSPORT_OK;
+    return pq_open((pq_endpoint_ctx_t *)ctx, 0, out_id);
 }
 
 static int pq_apply_priority(void *ctx, uint64_t sid, uint8_t priority)
@@ -81,6 +84,13 @@ int pq_endpoint_apply_priorities(pq_endpoint_ctx_t *ep_ctx)
                                               pq_apply_priority, ep_ctx);
 }
 
+/* picoquic clears a stream's application context on a reset and on an
+ * active mark; the attaching adapter restores what it keeps there. */
+static int pq_rebind(pq_endpoint_ctx_t *ep, uint64_t stream_id)
+{
+    return ep->rx_rebind ? ep->rx_rebind(ep->rx_owner, stream_id) : 0;
+}
+
 /* Map a queue push result to the bridge write contract. */
 static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
                                               uint64_t stream_id, int r)
@@ -90,7 +100,8 @@ static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
     if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* queue cap: retain + retry */
     /* Bytes are queued; picoquic must poll the stream to pull them. A failure
      * to mark it active means they would never be sent -- treat as fatal. */
-    if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, NULL) != 0)
+    if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, NULL) != 0 ||
+        pq_rebind(ep, stream_id) != 0)
         return MOQ_TRANSPORT_ERROR;
     return MOQ_TRANSPORT_OK;
 }
@@ -112,17 +123,36 @@ static moq_transport_result_t pq_write_payload(void *ctx, uint64_t stream_id,
         moq_pq_send_queue_push_rcbuf(ep->queue, stream_id, buf, fin));
 }
 
+/* The outcome of a reset picoquic was asked for: 0 when it took the reset,
+ * PICOQUIC_ERROR_STREAM_ALREADY_CLOSED when the stream's sending part has
+ * already ended -- every byte and the FIN acknowledged, or the stream opened
+ * and since retired (PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED) -- or any other
+ * refusal, including a stream never opened or one this endpoint cannot send
+ * on.
+ * Only an accepted reset touches the stream: its queued bytes are abandoned
+ * and its active mark cleared, so no prepare_to_send lands for it, and the
+ * attaching adapter restores the context picoquic cleared. A terminal
+ * sending part gets no frame, and nothing about it changes. */
+static int pq_after_reset(pq_endpoint_ctx_t *ep, uint64_t sid, int rc)
+{
+    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) return 0;
+    if (rc != 0) return rc;
+    moq_pq_send_queue_drop(ep->queue, sid);
+    (void)picoquic_mark_active_stream(ep->cnx, sid, 0, NULL);
+    return pq_rebind(ep, sid);
+}
+
+/* Idempotent (the bridge contract): a stream whose sending part has already
+ * ended needs no reset, and the call is a no-op. The classification is
+ * picoquic's, made before anything could create the stream. */
 static moq_transport_result_t pq_reset(void *ctx, uint64_t stream_id,
                                         uint64_t error_code)
 {
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
-    /* Abandon anything still queued for this stream and clear the active mark
-     * before resetting, so no prepare_to_send lands for a reset stream. */
-    moq_pq_send_queue_drop(ep->queue, stream_id);
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;
-    picoquic_mark_active_stream(ep->cnx, stream_id, 0, NULL);
     int rc = picoquic_reset_stream(ep->cnx, stream_id, error_code);
-    return rc == 0 ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
+    return pq_after_reset(ep, stream_id, rc) == 0
+        ? MOQ_TRANSPORT_OK : MOQ_TRANSPORT_ERROR;
 }
 
 /* Both endpoints advertised reset_stream_at (picoquic latches the same
@@ -140,13 +170,12 @@ static bool pq_reset_at_negotiated(picoquic_cnx_t *cnx)
 static int pq_issue_reset_at(pq_endpoint_ctx_t *ep, uint64_t sid,
                              uint64_t error_code, uint64_t reliable_size)
 {
-    moq_pq_send_queue_drop(ep->queue, sid);
-    picoquic_mark_active_stream(ep->cnx, sid, 0, NULL);
-    if (picoquic_reset_stream_at(ep->cnx, sid, error_code, reliable_size) == 0) {
+    int rc = picoquic_reset_stream_at(ep->cnx, sid, error_code, reliable_size);
+    if (rc == 0)
         ep->reliable_resets++;
-        return 0;
-    }
-    return picoquic_reset_stream(ep->cnx, sid, error_code);
+    else if (rc != PICOQUIC_ERROR_STREAM_ALREADY_CLOSED)
+        rc = picoquic_reset_stream(ep->cnx, sid, error_code);
+    return pq_after_reset(ep, sid, rc);
 }
 
 static moq_transport_result_t pq_reset_at(void *ctx, uint64_t stream_id,
@@ -234,14 +263,20 @@ static moq_transport_result_t pq_stop_sending(void *ctx, uint64_t stream_id,
      * nothing left to stop, and picoquic may already have released the
      * stream, so its refusal would not be a failure of this cancellation.
      * The adapter discarded what it held; the stop is complete with no
-     * frame. Only that positive fact skips the call: any refusal of a STOP
-     * picoquic does receive stays an ERROR. */
+     * frame. Only that positive fact skips the provider call; otherwise the
+     * provider must distinguish a terminal no-op from a genuine refusal. */
     if (ep->rx_terminal_discard &&
         ep->rx_terminal_discard(ep->rx_owner, stream_id))
         return MOQ_TRANSPORT_OK;
+    /* Idempotent as a reset is: picoquic answers a receiving part already
+     * terminal -- reset by the peer, read to its final size, or retired with
+     * the stream -- before changing anything, and nothing is sent, watched or
+     * reported for it. Any other refusal stays an ERROR. */
     int rc = picoquic_stop_sending(ep->cnx, stream_id, error_code);
+    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) return MOQ_TRANSPORT_OK;
     if (rc != 0) return MOQ_TRANSPORT_ERROR;
-    if (ep->rx_stopped) ep->rx_stopped(ep->rx_owner, stream_id);
+    if (ep->rx_stopped && ep->rx_stopped(ep->rx_owner, stream_id) != 0)
+        return MOQ_TRANSPORT_ERROR;
     return MOQ_TRANSPORT_OK;
 }
 
@@ -329,6 +364,7 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
     ep_ctx->reliable_resets = 0;
     ep_ctx->rx_terminal_discard = NULL;
     ep_ctx->rx_stopped = NULL;
+    ep_ctx->rx_rebind = NULL;
     ep_ctx->rx_owner = NULL;
     ep_ctx->queue = moq_pq_send_queue_create(alloc, queue_cap);
     if (!ep_ctx->queue) return -1;

@@ -133,6 +133,10 @@ int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec,
 int picowt_reset_stream(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *stream_ctx,
                         uint64_t local_stream_error)
 { (void)cnx; (void)stream_ctx; (void)local_stream_error; g_plain_resets++; return 0; }
+/* The endpoint puts h3zero's stream record back as the QUIC stream context
+ * after a STOP or reset; nothing reads it here. */
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+{ (void)c; (void)sid; (void)ctx; return 0; }
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
 { (void)c; (void)sid; (void)ec; return 0; }
 int picowt_send_close_session_message(picoquic_cnx_t *cnx,

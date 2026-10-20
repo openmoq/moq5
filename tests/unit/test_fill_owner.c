@@ -540,6 +540,50 @@ static int test_release_unbound(void)
     return failures;
 }
 
+/* A cancelled receiving child whose stopped stream the transport retired with
+ * no peer FIN or RESET (local receive retirement): the stream is over and is
+ * accounted once, the terminal keeps the cancellation's reason, and the child
+ * becomes reclaimable. Refused without the committed STOP, for another stream
+ * or for a stale child; a later peer terminal changes nothing. */
+static int test_local_retired_stopped_stream(void)
+{
+    int failures = 0;
+    moq_fill_entry_t storage[1];
+    moq_fill_table_t t;
+    REQUIRE(moq_fill_table_init(&t, storage, 1) == MOQ_OK);
+    moq_fill_ref_t ref;
+    REQUIRE(admit(&t, parent, 10, MOQ_FILL_SUBSCRIBER, &delivery, &ref) == MOQ_OK);
+    REQUIRE(moq_fill_control_response(&t, ref, 10, true) == MOQ_OK);
+    REQUIRE(moq_fill_bind_received(&t, ref, (moq_stream_ref_t){99}) == MOQ_OK);
+    UNCHANGED(moq_fill_local_retired(&t, ref, (moq_stream_ref_t){99}), MOQ_ERR_WRONG_STATE);
+    REQUIRE(moq_fill_cancel(&t, ref) == MOQ_OK);
+    UNCHANGED(moq_fill_local_retired(&t, ref, (moq_stream_ref_t){99}), MOQ_ERR_WRONG_STATE);
+    REQUIRE(moq_fill_action_committed(&t, ref, MOQ_FILL_ACTION_STOP) == MOQ_OK);
+    UNCHANGED(moq_fill_reclaim(&t, ref), MOQ_ERR_WOULD_BLOCK);
+    UNCHANGED(moq_fill_local_retired(&t, ref, (moq_stream_ref_t){98}), MOQ_ERR_WRONG_STATE);
+    moq_fill_ref_t stale = ref;
+    ++stale.generation;
+    UNCHANGED(moq_fill_local_retired(&t, stale, (moq_stream_ref_t){99}), MOQ_ERR_STALE_HANDLE);
+    REQUIRE(moq_fill_local_retired(&t, ref, (moq_stream_ref_t){99}) == MOQ_OK);
+    UNCHANGED(moq_fill_local_retired(&t, ref, (moq_stream_ref_t){99}), MOQ_OK);
+    MOQ_TEST_CHECK(!storage[ref.slot].data_fin && !storage[ref.slot].data_reset);
+    failures += work(&t, ref, MOQ_FILL_ACTION_NONE, true, true, false);
+    moq_fill_work_t w;
+    REQUIRE(moq_fill_next(&t, ref, &w) == MOQ_OK);
+    MOQ_TEST_CHECK(w.terminal_reason == MOQ_FILL_TERM_CANCELLED);
+    REQUIRE(moq_fill_stream_accounted(&t, ref) == MOQ_OK);
+    UNCHANGED(moq_fill_stream_accounted(&t, ref), MOQ_ERR_WRONG_STATE);
+    /* A peer terminal after the retirement neither recounts nor rewrites. */
+    UNCHANGED(moq_fill_peer_fin(&t, ref, (moq_stream_ref_t){99}), MOQ_OK);
+    UNCHANGED(moq_fill_peer_reset(&t, ref, (moq_stream_ref_t){99}), MOQ_OK);
+    REQUIRE(publish_retire(&t, ref) == MOQ_OK);
+    MOQ_TEST_CHECK(storage[ref.slot].terminal_reason == MOQ_FILL_TERM_CANCELLED);
+    failures += work(&t, ref, MOQ_FILL_ACTION_NONE, false, false, true);
+    REQUIRE(moq_fill_reclaim(&t, ref) == MOQ_OK);
+    MOQ_TEST_CHECK(t.live == 0);
+    return failures;
+}
+
 int main(void)
 {
     int failures = test_reservation();
@@ -552,6 +596,7 @@ int main(void)
     failures += test_ordinary_reuse_stale_and_exhaustion();
     failures += test_role_and_control_reset_boundaries();
     failures += test_release_unbound();
+    failures += test_local_retired_stopped_stream();
     printf("fill owner: %d failures\n", failures);
     return failures ? 1 : 0;
 }

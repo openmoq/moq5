@@ -80,7 +80,7 @@ run_logged() {
     printf '%s\n' "$status" >"$path.status" || return $?
     cat "$path" "$path.stderr" >&2 || return $?
     [ "$status" -eq 0 ] || return "$status"
-    if grep -Ei '(^|[^[:alnum:]_])(warning|error|fatal error)(:|[[:space:]])' \
+    if grep -Ei '(^|[^[:alnum:]_])(warning(:|[[:space:]])|fatal error(:|[[:space:]])|error(:|[[:space:]]+[[:alpha:]]+[[:digit:]]+:))|(^|[[:space:]])CMake Error([[:space:]]|$)' \
             "$path" "$path.stderr" >&2; then
         log "FAIL: diagnostics in $path"
         return 1
@@ -246,7 +246,9 @@ check_consumer_cmake() {
 
 case "${1:-}" in
 diagnostic-logs) shift
-            scan_logs '(^|[^[:alnum:]_])(warning|error|fatal error)(:|[[:space:]])' "$@" ;;
+            # Error severities have a delimiter; prose such as Swift test
+            # names containing "error domains" is not a diagnostic.
+            scan_logs '(^|[^[:alnum:]_])(warning(:|[[:space:]])|fatal error(:|[[:space:]])|error(:|[[:space:]]+[[:alpha:]]+[[:digit:]]+:))|(^|[[:space:]])CMake Error([[:space:]]|$)' "$@" ;;
 probe-logs) [ $# -eq 2 ] || fail "usage: probe-logs <CMakeFiles-directory>"
             check_probe_logs "$2" ;;
 resolution) [ $# -eq 6 ] || fail "usage: resolution <target> <openssl-prefix> <picotls-build> <libmoq-build> <install-prefix>"

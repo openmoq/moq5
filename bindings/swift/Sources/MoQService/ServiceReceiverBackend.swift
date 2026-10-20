@@ -407,6 +407,11 @@ func copyReceiverTrackEvent(_ event: moq_media_track_event_t) -> ReceiverPolledE
             ? event.local_result : nil
         return ReceiverPolledEvent(kind: .localFailure(localResult: localResult),
                                    handleID: handleID, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE:
+        let localResult = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.local_result)
+            ? event.local_result : nil
+        return ReceiverPolledEvent(kind: .updateLocalFailure(localResult: localResult),
+                                   handleID: handleID, trackDescription: nil)
     case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE:
         let localResult = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.local_result)
             ? event.local_result : nil

@@ -690,6 +690,9 @@ private final class ReceiverState: @unchecked Sendable {
         case .localFailure(let localResult):
             guard let track = tracksByID[polled.handleID] else { return }
             fifo.append(.localFailure(track, localResult: localResult))
+        case .updateLocalFailure(let localResult):
+            guard let track = tracksByID[polled.handleID] else { return }
+            fifo.append(.updateLocalFailure(track, localResult: localResult))
         case .deliveryLocalFailure(let localResult, let origin, let initiatingRequestID):
             guard let track = tracksByID[polled.handleID] else { return }
             fifo.append(.deliveryLocalFailure(track, localResult: localResult,

@@ -165,6 +165,7 @@ size_t wtq_session_datagram_max_size(const wtq_session_t *s)
 
 static moq_wtquic_conn_t *g_conn;
 static uint64_t g_abort_key;
+static moq_stream_ref_t g_abort_ref;
 static int g_intact_during_op; /* -1 unset; 1 mapping intact; 0 retired */
 static int g_terminal_raised;  /* synchronous on_stream_closed firings */
 static size_t g_queued_after;  /* queue depth right after the firing   */
@@ -180,7 +181,8 @@ static void test_abort_terminal_hook(wtq_stream_t *st)
     /* the bridge mapping MUST still be present here: the terminal was
      * deferred, not fed to the bridge during the endpoint op */
     g_intact_during_op =
-        (moq_transport_bridge_find_ref(g_conn->bridge, g_abort_key)._v != 0)
+        (moq_transport_bridge_find_ref(g_conn->bridge, g_abort_key)._v ==
+         g_abort_ref._v)
             ? 1 : 0;
 }
 
@@ -317,14 +319,18 @@ int main(void)
 
     /* Deferred stream-terminal: a synchronous on_stream_closed fired from
      * inside the abort endpoint op must NOT re-enter the bridge. The
-     * aborting mapping stays intact during the op, is retired afterward by
-     * the drain, and the terminal is delivered exactly once. */
+     * aborting mapping stays intact during the op; feeding the terminal
+     * latches retirement, which the adapter's internal next service pass
+     * settles, with no external pump or traffic and no duplicate terminal. */
     {
         moq_session_cfg_t scfg;
         moq_session_t *sess = NULL;
         moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
                                    MOQ_PERSPECTIVE_CLIENT);
         CHECK(moq_session_create(&scfg, 0, &sess) == MOQ_OK);
+        /* This pure adapter rig issues endpoint actions before SETUP. Ending
+         * an unowned transport identity must not require establishment. */
+        CHECK(moq_session_state(sess) == MOQ_SESS_IDLE);
         moq_wtquic_conn_cfg_t ccfg;
         moq_wtquic_conn_cfg_init_sized(&ccfg, sizeof(ccfg));
         ccfg.alloc = moq_alloc_default();
@@ -354,6 +360,12 @@ int main(void)
         for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
             if (cc->streams[i].in_use) { g_abort_key = cc->streams[i].id; active++; }
         CHECK(active == 1);
+        g_abort_ref = ref;
+        CHECK(moq_transport_bridge_find_ref(cc->bridge, g_abort_key)._v == ref._v);
+        struct moq_wtq_stream *mapped = stream_find(cc, g_abort_key);
+        struct wtq_stream *target = mapped ? mapped->st : NULL;
+        CHECK(target != NULL && target->native_id == WTQ_STREAM_ID_UNKNOWN);
+        g_session_closes = 0;
 
         /* 2. Abort it: arm the synchronous terminal, then service. */
         g_raise_terminal = true;
@@ -365,15 +377,15 @@ int main(void)
         a.u.abort_bidi_stream.stream_ref = ref;
         a.u.abort_bidi_stream.error_code = 0x1;
         CHECK(push_action(sess, &a) == MOQ_OK);
-        conn_service(cc);
+        moq_wtquic_conn_service(cc);
 
         /* the synchronous terminal ran EXACTLY ONCE, queued exactly one
          * entry, and the mapping was INTACT during the endpoint op */
         CHECK(g_terminal_raised == 1);
         CHECK(g_queued_after == 1);
         CHECK(g_intact_during_op == 1);
-        /* afterward: the drain delivered it exactly once (queue emptied,
-         * mapping retired) and the adapter slot was cleared */
+        /* After the ONE public service call: the drain fed it exactly once,
+         * then an internal service pass retired the mapping. */
         CHECK(cc->term_count == 0);
         CHECK(!cc->term_overflow);
         CHECK(moq_transport_bridge_find_ref(cc->bridge, g_abort_key)._v == 0);
@@ -381,6 +393,10 @@ int main(void)
         for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
             if (cc->streams[i].in_use) still++;
         CHECK(still == 0);
+        CHECK(target != NULL && target->aborts == 1);
+        CHECK(g_stream_n == 1 && cc->next_stream_key == g_abort_key + 1);
+        CHECK(g_session_closes == 0 && !cc->service_pending);
+        CHECK(moq_session_state(sess) == MOQ_SESS_IDLE);
 
         /* 3. MULTIPLE synchronous terminals before one drain: two streams
          * aborted in the same service pass — both terminals queue, none
@@ -407,10 +423,27 @@ int main(void)
                 else k2 = cc->streams[i].id;
             }
         CHECK(k1 != 0 && k2 != 0 && k1 != k2);
+        CHECK(moq_transport_bridge_find_ref(cc->bridge, k1)._v == r1._v);
+        CHECK(moq_transport_bridge_find_ref(cc->bridge, k2)._v == r2._v);
+        struct moq_wtq_stream *mapped1 = stream_find(cc, k1);
+        struct moq_wtq_stream *mapped2 = stream_find(cc, k2);
+        struct wtq_stream *target1 = mapped1 ? mapped1->st : NULL;
+        struct wtq_stream *target2 = mapped2 ? mapped2->st : NULL;
+        CHECK(target1 != NULL && target2 != NULL && target1 != target2);
+
+        /* A terminal report alone cannot release an un-aborted live mapping. */
+        CHECK(moq_transport_bridge_on_peer_stream_terminal(cc->bridge, k2,
+                                                           now_us()) == MOQ_OK);
+        moq_wtquic_conn_service(cc);
+        CHECK(moq_transport_bridge_find_ref(cc->bridge, k1)._v == r1._v);
+        CHECK(moq_transport_bridge_find_ref(cc->bridge, k2)._v == r2._v);
+        CHECK(target1 != NULL && target1->aborts == 0);
+        CHECK(target2 != NULL && target2->aborts == 0);
 
         g_raise_terminal = true;
         g_terminal_raised = 0;
         g_abort_key = k1; /* the hook watches the FIRST aborted mapping */
+        g_abort_ref = r1;
         memset(&a, 0, sizeof(a));
         a.kind = MOQ_ACTION_ABORT_BIDI_STREAM;
         a.detail_size = (uint32_t)sizeof(moq_abort_bidi_stream_action_t);
@@ -420,7 +453,7 @@ int main(void)
         CHECK(push_action(sess, &a) == MOQ_OK);
         a.u.abort_bidi_stream.stream_ref = r2;
         CHECK(push_action(sess, &a) == MOQ_OK);
-        conn_service(cc);
+        moq_wtquic_conn_service(cc);
 
         CHECK(g_terminal_raised == 2);   /* both fired synchronously */
         CHECK(g_intact_during_op == 1);  /* first mapping intact through
@@ -434,6 +467,11 @@ int main(void)
         for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
             if (cc->streams[i].in_use) still++;
         CHECK(still == 0);
+        CHECK(target1 != NULL && target1->aborts == 1);
+        CHECK(target2 != NULL && target2->aborts == 1);
+        CHECK(g_stream_n == 3 && cc->next_stream_key == k2 + 1);
+        CHECK(g_session_closes == 0 && !cc->service_pending);
+        CHECK(moq_session_state(sess) == MOQ_SESS_IDLE);
 
         g_raise_terminal = false;
         g_conn = NULL;

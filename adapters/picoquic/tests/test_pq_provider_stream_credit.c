@@ -22,22 +22,21 @@
  * fix when a receiver replenishes it, so neither early credit nor the moment
  * this provider replenishes is itself an RFC rule.
  *
- * Expected status with the provider pinned at the time of writing: the policy
- * rows fail. picoquic_update_max_stream_ID_local counts a stream once
- * consumed_offset >= fin_offset with a FIN or reset received. For a gapped
- * FIN the count runs before the FIN's offset is stored, so it compares the
- * delivered length with itself and counts early. For a reset whose final size
- * is past the delivered bytes, the final size is stored first, the count does
- * not apply, and the stream is then deleted without being counted. Those
- * failures are the evidence that the policy is not met; they are not a test
- * defect. The control rows hold either way.
+ * The pinned provider meets this policy through the tracked picoquic patch
+ * 0009-return-stream-credit-at-final-size.patch, which counts a stream once
+ * every byte up to its FIN is consumed (evaluated after the FIN's final size
+ * is stored) or once a reset's reliable prefix is consumed. A provider
+ * without it fails the policy rows: it counts a gapped FIN early, comparing
+ * the delivered length with itself, and deletes a stream reset past its
+ * delivered bytes without counting it. The control rows hold either way.
  *
  * Method: decoder and producer testing after a simulated handshake. Each row
  * builds a fresh client/server pair over the tls_api simulated links in
- * virtual time, then hands a fixed handful of frames for client uni streams
- * to the server connection's own frame decoders, as received packets would
- * be. The MAX_STREAMS producer is called directly and the bytes it generates
- * are not transmitted, so this does not test delivery of credit to the peer.
+ * virtual time. Most rows hand a fixed handful of frames for client uni
+ * streams to the server connection's own frame decoders, as received packets
+ * would be, and call the MAX_STREAMS producer directly without transmitting
+ * what it generates; credit_reaches_peer instead runs real packets and pins
+ * that the replacement grant reaches the client and admits its next stream.
  * The application callbacks count bytes, reset and FIN events; they do not
  * compare payload contents. Every row prints the values it observed, so the
  * counterexample stays visible whatever the result.
@@ -358,6 +357,99 @@ done:
     teardown(&p);
 }
 
+/* Control: a FIN past a gap that is never filled. However long the
+ * connection runs, the stream stays live and uncounted and the grant stays
+ * where it was. */
+static void unfinished_gap(void)
+{
+    pair_t p; row = "unfinished_gap";
+    if (setup(&p) != 0) return;
+    INJECT(&p, S2_BYTE0);
+    INJECT(&p, S2_FIN_AT2);
+    uint64_t limit = p.now + 500000;
+    for (unsigned i = 0; i < 200 && p.now < limit; i++) {
+        int active = 0;
+        REQUIRE(tls_api_one_sim_round(p.tls, &p.now, limit, &active) == 0);
+    }
+    observe(&p, "after the wait");
+    CHECK(picoquic_find_stream(p.tls->cnx_server, 2) != NULL);
+    CHECK(credit(&p) == 0);
+    CHECK(p.tls->cnx_server->max_streams_unidir_local == 1);
+    CHECK(p.tls->cnx_client->max_streams_unidir_remote == 1);
+done:
+    teardown(&p);
+}
+
+/* Control: a gapped FIN, then a RESET_STREAM with the same final size, then
+ * the missing byte. The reset ends reception; the stream is counted once,
+ * and the late byte for the retired stream counts nothing more. */
+static void duplicate_terminal(void)
+{
+    pair_t p; row = "duplicate_terminal";
+    if (setup(&p) != 0) return;
+    INJECT(&p, S2_BYTE0);
+    INJECT(&p, S2_FIN_AT2);
+    static const uint8_t reset_f2[] = { 0x04, 0x02, 0x07, 0x02 };
+    INJECT(&p, reset_f2);
+    observe(&p, "after reset");
+    REQUIRE(p.resets == 1 && p.wrong_reset_codes == 0);
+    CHECK(credit(&p) == 1);
+    INJECT(&p, S2_BYTE1);
+    observe(&p, "after late byte");
+    CHECK(credit(&p) == 1);                  /* exactly once */
+    CHECK(p.fins == 0);
+done:
+    teardown(&p);
+}
+
+/* Control over real packets in virtual time: with a local uni limit of one,
+ * the client opens stream 2, sends a byte and its FIN. The replacement
+ * MAX_STREAMS the server owes must reach the client, which can then open
+ * stream 6, whose byte the server receives. */
+static size_t s6_data;
+static int callback6(picoquic_cnx_t *cnx, uint64_t sid, uint8_t *bytes,
+                     size_t length, picoquic_call_back_event_t event,
+                     void *context, void *stream_context)
+{
+    pair_t *p = context;
+    if (cnx == p->tls->cnx_server && sid == 6 &&
+        (event == picoquic_callback_stream_data ||
+         event == picoquic_callback_stream_fin))
+        s6_data += length;
+    return callback(cnx, sid, bytes, length, event, context, stream_context);
+}
+
+static void credit_reaches_peer(void)
+{
+    pair_t p; row = "credit_reaches_peer";
+    s6_data = 0;
+    if (setup(&p) != 0) return;
+    picoquic_set_callback(p.tls->cnx_server, callback6, &p);
+    picoquic_cnx_t *c = p.tls->cnx_client;
+    REQUIRE(c->max_streams_unidir_remote == 1);
+    static const uint8_t one = 0x5a;
+    REQUIRE(picoquic_add_to_stream(c, 2, &one, 1, 1) == 0);
+    uint64_t limit = p.now + 2000000;
+    for (unsigned i = 0; i < 2000 && p.now < limit &&
+                         c->max_streams_unidir_remote < 2; i++) {
+        int active = 0;
+        REQUIRE(tls_api_one_sim_round(p.tls, &p.now, limit, &active) == 0);
+    }
+    observe(&p, "after stream 2");
+    CHECK(p.fins == 1 && p.data == 1);
+    CHECK(credit(&p) == 1);
+    CHECK(c->max_streams_unidir_remote == 2);
+    REQUIRE(picoquic_add_to_stream(c, 6, &one, 1, 1) == 0);
+    limit = p.now + 2000000;
+    for (unsigned i = 0; i < 2000 && p.now < limit && s6_data == 0; i++) {
+        int active = 0;
+        REQUIRE(tls_api_one_sim_round(p.tls, &p.now, limit, &active) == 0);
+    }
+    CHECK(s6_data == 1);
+done:
+    teardown(&p);
+}
+
 int main(void)
 {
     printf("provider source: %s\n", PICOQUIC_SOURCE_DIR);
@@ -369,6 +461,9 @@ int main(void)
     reset_fully_consumed();
     reliable_reset_past_delivered();
     reliable_reset_fully_consumed();
+    unfinished_gap();
+    duplicate_terminal();
+    credit_reaches_peer();
 
     if (prerequisite_failures) {
         fprintf(stderr, "test_pq_provider_stream_credit: %d PREREQUISITE failure(s), "
@@ -382,6 +477,6 @@ int main(void)
                 policy_failures);
         return 1;
     }
-    printf("test_pq_provider_stream_credit: policy holds (7 rows)\n");
+    printf("test_pq_provider_stream_credit: policy holds (10 rows)\n");
     return 0;
 }

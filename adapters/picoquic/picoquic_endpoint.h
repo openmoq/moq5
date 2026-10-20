@@ -47,9 +47,15 @@ typedef struct {
      * adapter's own record shows the stream's receive half already terminal
      * at the transport, in which case the adapter has discarded what it held
      * for the stream and no STOP_SENDING is sent. rx_stopped: told after an
-     * accepted STOP_SENDING, so the adapter drops what it held. */
+     * accepted STOP_SENDING, so the adapter drops what it held or arranges
+     * to learn how the stopped receive half ends; nonzero when it cannot,
+     * and the STOP is then a failure. rx_rebind: told after any call that
+     * clears picoquic's per-stream context (a reset, an active mark), so the
+     * adapter restores what a stopped receive half needs; nonzero likewise
+     * fails the call. */
     bool               (*rx_terminal_discard)(void *owner, uint64_t stream_id);
-    void               (*rx_stopped)(void *owner, uint64_t stream_id);
+    int                (*rx_stopped)(void *owner, uint64_t stream_id);
+    int                (*rx_rebind)(void *owner, uint64_t stream_id);
     void                *rx_owner;
 } pq_endpoint_ctx_t;
 

@@ -167,7 +167,7 @@ static void test_setup_token_copy_wiped(void)
     uint8_t value[40];
     for (size_t i = 0; i < sizeof(value); i++) value[i] = k_secret[i % sizeof(k_secret)];
     moq_auth_token_t in[2] = { { 3, { value, sizeof(value) } }, { 4, { value, 8 } } };
-    moq_setup_tokens_t copy;
+    moq_setup_tokens_t copy = {0};
     MOQ_TEST_CHECK_EQ_INT((int)moq_setup_tokens_copy(&a, in, 2, &copy), MOQ_OK);
     MOQ_TEST_CHECK(copy.count == 2 && copy.tokens[0].token_value.data != value);
     value[0] = 0;   /* the copy is the copy's own */

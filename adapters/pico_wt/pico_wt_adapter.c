@@ -519,6 +519,48 @@ static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid)
     memset(st, 0, sizeof(*st));   /* active = false */
 }
 
+/* The stream's whole terminal goes to the bridge: h3zero released it, both
+ * directions over at the transport. That fact names no cause -- FIN or
+ * RESET -- commits no bytes, and says nothing about our own sends having
+ * been received; the bridge and session decide what it settles. */
+static void pw_report_stream_terminal(moq_pico_wt_conn_t *c, uint64_t sid,
+                                      uint64_t now)
+{
+    c->stream_terminal_count++;
+    (void)moq_transport_bridge_on_peer_stream_terminal(c->bridge, sid, now);
+}
+
+/* h3zero released a WT data stream of this session (picohttp_callback_free,
+ * from picoquic's stream release). The adapter lets go of its own record of
+ * the stream, after any work it still owes the bridge for it: a stream still
+ * paused keeps that work, and its terminal follows the replay. Nothing is
+ * reported for a connection on its way out or a bridge already terminal. */
+static void pw_on_stream_released(moq_pico_wt_conn_t *c, picoquic_cnx_t *cnx,
+                                  uint64_t sid)
+{
+    if (c->cnx == NULL || moq_transport_bridge_is_terminal(c->bridge) ||
+        picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting)
+        return;
+    pw_rx_stream_t *st = pw_rx_find(c, sid);
+    if (st != NULL && st->paused) {
+        st->released = true;
+        return;
+    }
+    if (st != NULL) pw_rx_drop(c, sid);
+    pw_report_stream_terminal(c, sid,
+                              picoquic_get_quic_time(picoquic_get_quic_ctx(cnx)));
+}
+
+/* The adapter's record of a stream ends; a release h3zero announced while
+ * work was still owed is reported now, after that work. */
+static void pw_rx_retire(moq_pico_wt_conn_t *c, uint64_t sid, uint64_t now)
+{
+    pw_rx_stream_t *st = pw_rx_find(c, sid);
+    bool released = st != NULL && st->released;
+    pw_rx_drop(c, sid);
+    if (released) pw_report_stream_terminal(c, sid, now);
+}
+
 /* Asked before a STOP_SENDING (pico_wt_endpoint_ctx_t.rx_terminal_discard).
  * True only for a stream this adapter still holds a refused chunk of whose
  * receive half its own record shows terminal at the transport: the held
@@ -530,16 +572,29 @@ static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid)
  * then release the stream, so a STOP_SENDING would have nothing to stop. A
  * peer RESET needs no fact here: its callback drops this state and settles
  * the bridge's hold before any cancellation can be issued. The held bytes are
- * discarded -- never delivered: the session never admitted the stream. */
+ * discarded -- never delivered: the session never admitted the stream.
+ *
+ * Also true for a stream picoquic already retired while this adapter still
+ * owed the bridge its retained bytes (`released`): there is no stream left to
+ * stop. Those bytes and the real FIN behind them are kept, to settle the
+ * bridge's discarding entry in order, and the stream's terminal follows them
+ * (pw_rx_after_service). A held stream that was released keeps its terminal
+ * fact too: it is reported as the held record goes. */
 static bool pw_rx_terminal_discard(void *ctx, uint64_t sid)
 {
     moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)ctx;
     if (!c) return false;
     pw_rx_stream_t *st = pw_rx_find(c, sid);
-    if (st == NULL || !st->held_input ||
-        !(st->held_fin || st->buf_fin || st->rx_complete))
+    if (st == NULL) return false;
+    if (!st->held_input)
+        return st->released;
+    if (!(st->held_fin || st->buf_fin || st->rx_complete))
         return false;
+    bool released = st->released;
     pw_rx_drop(c, sid);
+    if (released && c->cnx != NULL)
+        pw_report_stream_terminal(c, sid, picoquic_get_quic_time(
+                                              picoquic_get_quic_ctx(c->cnx)));
     return true;
 }
 
@@ -806,7 +861,7 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
              * below: this FIN was delivered by the bridge service that runs
              * BEFORE this sweep, so a close it initiated is already dispatched
              * (and a terminal bridge skips the sweep entirely). */
-            pw_rx_drop(c, st->stream_id);
+            pw_rx_retire(c, st->stream_id, now);
             continue;
         }
 
@@ -847,7 +902,7 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
                 if (hfin) st->fin_blocked = true;
                 continue;
             }
-            if (hfin) { pw_rx_drop(c, st->stream_id); continue; }  /* stream done */
+            if (hfin) { pw_rx_retire(c, st->stream_id, now); continue; }  /* stream done */
         }
 
         if (st->buf_len > 0 || st->buf_fin) {
@@ -870,7 +925,7 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
                 return;
             }
             if (bfin) {
-                pw_rx_drop(c, st->stream_id);          /* stream done */
+                pw_rx_retire(c, st->stream_id, now);          /* stream done */
                 /* A control FIN retained while paused is replayed HERE, inside
                  * the sweep. On the control stream that only sets the bridge's
                  * deferred close; without dispatching it now, a later stream in
@@ -892,6 +947,11 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
         }
 
         st->paused = false;
+        if (st->released) {
+            /* h3zero released the stream while this work was owed. */
+            pw_rx_retire(c, st->stream_id, now);
+            continue;
+        }
         if (pw_rx_refresh_credit(c, st) != 0) {
             moq_transport_bridge_on_transport_error(
                 c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
@@ -1070,6 +1130,15 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
          * Deregistering the session also reports the transport close. */
         if (stream_ctx != NULL && stream_ctx == c->control_stream_ctx)
             detach_from_picoquic(c);
+        else if (stream_ctx != NULL && stream_ctx->path_callback_ctx == c) {
+            /* h3zero announces a released stream's free twice (once from
+             * its release dispatch, again as it deletes the record); the
+             * record is going, so this adapter's callback leaves it now, as
+             * clear_all_stream_callbacks does for every stream at detach. */
+            stream_ctx->path_callback = NULL;
+            stream_ctx->path_callback_ctx = NULL;
+            pw_on_stream_released(c, cnx, stream_ctx->stream_id);
+        }
         return 0;
     }
 

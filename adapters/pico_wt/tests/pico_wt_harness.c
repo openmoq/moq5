@@ -113,6 +113,18 @@ static int harness_bind_session(moq_session_t *session, picoquic_cnx_t *cnx,
     return moq_session_bind_transport(session, &b, sizeof(b)) == MOQ_OK ? 0 : -1;
 }
 
+static pico_wt_harness_owner_t harness_owner(h3zero_callback_ctx_t *h3_ctx,
+                                            const h3zero_stream_ctx_t *ctrl)
+{
+    pico_wt_harness_owner_t o = {0};
+    h3zero_stream_prefix_t *pfx = h3zero_find_stream_prefix(h3_ctx,
+                                                            ctrl->stream_id);
+    if (pfx) { o.prefix_cb = pfx->function_call; o.prefix_ctx = pfx->function_ctx; }
+    o.ctrl_cb = ctrl->path_callback;
+    o.ctrl_ctx = ctrl->path_callback_ctx;
+    return o;
+}
+
 static int harness_attach_adapter(moq_session_t *session,
                                    picoquic_cnx_t *cnx,
                                    h3zero_callback_ctx_t *h3_ctx,
@@ -150,6 +162,7 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
     h->server_param.path_table = h->path_table;
     h->server_param.path_table_nb = 1;
 
+    h->phase = PICO_WT_HARNESS_TRANSPORT;
     if (tls_api_init_ctx_ex(&h->test_ctx,
             PICOQUIC_INTERNAL_TEST_VERSION_1,
             PICOQUIC_TEST_SNI, "h3", &h->now,
@@ -187,6 +200,7 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
         return -1;
 
     /* Drive the WT CONNECT to acceptance on both ends. */
+    h->phase = PICO_WT_HARNESS_CONNECT;
     for (int i = 0; i < 2048; i++) {
         if (h->server_wt.connect_received &&
             h->client_wt.connect_accepted)
@@ -198,6 +212,7 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
         return -1;
 
     h->version = cfg->version;
+    h->phase = PICO_WT_HARNESS_SESSIONS;
     if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, cap, 0,
                                cfg->max_events, cfg->version, 0,
                                &h->client_session) != 0)
@@ -209,15 +224,112 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
                                &h->server_session) != 0)
         return -1;
 
+    h->phase = PICO_WT_HARNESS_CLIENT_ATTACH;
+    h->pre_attach = harness_owner(h->client_h3_ctx, h->client_ctrl_ctx);
     if (harness_attach_adapter(h->client_session, h->test_ctx->cnx_client,
             h->client_h3_ctx, h->client_ctrl_ctx, &h->client_conn) != 0)
         return -1;
+    h->phase = PICO_WT_HARNESS_SERVER_ATTACH;
     if (harness_attach_adapter(h->server_session, h->test_ctx->cnx_server,
             h->server_wt.h3_ctx, h->server_wt.ctrl_ctx,
             &h->server_conn) != 0)
         return -1;
 
+    h->phase = PICO_WT_HARNESS_READY;
     return 0;
+}
+
+static bool harness_owner_eq(const pico_wt_harness_owner_t *a,
+                             const pico_wt_harness_owner_t *b)
+{
+    return a->prefix_cb == b->prefix_cb && a->prefix_ctx == b->prefix_ctx &&
+           a->ctrl_cb == b->ctrl_cb && a->ctrl_ctx == b->ctrl_ctx;
+}
+
+bool pico_wt_harness_refused_at_attach(const pico_wt_harness_t *h,
+                                       int setup_rc)
+{
+    if (setup_rc != -1 || h->phase != PICO_WT_HARNESS_CLIENT_ATTACH)
+        return false;
+    if (!h->test_ctx || !h->client_wt.connect_accepted ||
+        !h->server_wt.connect_received || !h->client_session ||
+        !h->server_session || h->client_conn || h->server_conn)
+        return false;
+    pico_wt_harness_owner_t now = harness_owner(h->client_h3_ctx,
+                                                h->client_ctrl_ctx);
+    return now.prefix_cb != NULL && harness_owner_eq(&now, &h->pre_attach);
+}
+
+typedef struct {
+    unsigned calls;   /* alloc + realloc requests made through this allocator */
+} harness_count_alloc_t;
+
+static void *harness_count_alloc(size_t n, void *ctx)
+{
+    ((harness_count_alloc_t *)ctx)->calls++;
+    return moq_alloc_default()->alloc(n, moq_alloc_default()->ctx);
+}
+static void *harness_count_realloc(void *p, size_t old, size_t n, void *ctx)
+{
+    ((harness_count_alloc_t *)ctx)->calls++;
+    return moq_alloc_default()->realloc(p, old, n, moq_alloc_default()->ctx);
+}
+static void harness_count_free(void *p, size_t n, void *ctx)
+{
+    (void)ctx;
+    moq_alloc_default()->free(p, n, moq_alloc_default()->ctx);
+}
+
+const char *pico_wt_harness_check_attach_refusal(pico_wt_harness_t *h,
+                                                 int setup_rc)
+{
+    if (setup_rc != -1) return "setup did not fail";
+    if (h->phase != PICO_WT_HARNESS_CLIENT_ATTACH)
+        return "setup failed before or after the client constructor";
+    if (!pico_wt_harness_refused_at_attach(h, setup_rc))
+        return "a prerequisite is missing or a callback was taken";
+
+    harness_count_alloc_t counts = {0};
+    const moq_alloc_t a = { .alloc = harness_count_alloc,
+                            .realloc = harness_count_realloc,
+                            .free = harness_count_free, .ctx = &counts };
+    moq_pico_wt_conn_cfg_t cfg;
+    moq_pico_wt_conn_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.session = h->client_session;
+    cfg.cnx = h->test_ctx->cnx_client;
+    cfg.h3_ctx = h->client_h3_ctx;
+    cfg.ctrl_ctx = h->client_ctrl_ctx;
+    cfg.alloc = &a;
+    moq_pico_wt_conn_t *out = (moq_pico_wt_conn_t *)&counts; /* stale value */
+    if (moq_pico_wt_conn_create(&cfg, &out) != -1) {
+        if (out != NULL && out != (moq_pico_wt_conn_t *)&counts)
+            moq_pico_wt_conn_destroy(out);
+        return "constructor did not return -1";
+    }
+    if (out != NULL) return "refusal left *out set";
+    if (counts.calls != 0) return "refusal allocated";
+    pico_wt_harness_owner_t now = harness_owner(h->client_h3_ctx,
+                                                h->client_ctrl_ctx);
+    if (!harness_owner_eq(&now, &h->pre_attach))
+        return "refusal took over a WT callback";
+
+    /* The same inputs with a supported version attach. */
+    moq_session_t *d16 = NULL;
+    if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, 16, 0, 0,
+                               MOQ_VERSION_DRAFT_16, 0, &d16) != 0)
+        return "draft-16 session refused";
+    cfg.session = d16;
+    int rc = moq_pico_wt_conn_create(&cfg, &out);
+    bool took = false;
+    if (rc == 0 && out != NULL) {
+        now = harness_owner(h->client_h3_ctx, h->client_ctrl_ctx);
+        took = now.prefix_ctx == (void *)out && now.ctrl_ctx == (void *)out;
+        moq_pico_wt_conn_destroy(out);
+    }
+    moq_session_destroy(d16);
+    if (rc != 0 || out == NULL)
+        return "the same inputs refuse a supported version";
+    return took ? NULL : "supported attach did not take the callbacks";
 }
 
 int pico_wt_harness_sim_round(pico_wt_harness_t *h,

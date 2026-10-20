@@ -57,6 +57,24 @@
  *                   returning nonzero from on_lane_pump. Both clients must
  *                   observe one clean close, proving the server pump-exit path
  *                   closes every owned connection, not only the first.
+ *
+ *   client_fatal_close
+ *                   A threaded client whose adapter fails a service pass (its
+ *                   transport parameters are changed under the attached
+ *                   adapter, which fails the bridge closed with code 0) must
+ *                   still close its QUIC connection: the server promptly
+ *                   observes exactly one MOQ_EVENT_SESSION_CLOSED carrying the
+ *                   client's recorded fatal code and prunes the connection,
+ *                   while the client reports fatal and its final observing
+ *                   pump runs. Without the close the server keeps the
+ *                   connection until its idle timeout.
+ *
+ *   client_fatal_close_code
+ *                   The same, through a failure with a nonzero recorded code:
+ *                   the client's allocator refuses the copy of a control
+ *                   write, the endpoint reports the write failed, and the
+ *                   bridge fails closed with 0x1. The server must see exactly
+ *                   that code.
  */
 
 #include <moq/picoquic.h>
@@ -513,6 +531,193 @@ static int row_stop_close(void)
     return row_stop_or_pump_exit_close(0);
 }
 
+typedef struct {
+    picoquic_quic_t *quic;
+    int armed;
+    int tampered;
+    int pumps_after_fatal;
+    int saw_fatal;
+    int oom;            /* fail through the allocator instead */
+} cli_fatal_ctx_t;
+
+/* The client's allocator: refuses every request while g_refuse_alloc is set,
+ * so the next write the endpoint must copy fails as an allocation failure. */
+static int g_refuse_alloc;
+static int g_refused_n;          /* requests refused */
+static void *refusing_alloc(size_t n, void *ctx)
+{
+    (void)ctx;
+    if (__atomic_load_n(&g_refuse_alloc, __ATOMIC_ACQUIRE)) {
+        g_refused_n++;
+        return NULL;
+    }
+    return moq_alloc_default()->alloc(n, moq_alloc_default()->ctx);
+}
+static void *refusing_realloc(void *p, size_t old, size_t n, void *ctx)
+{
+    (void)ctx;
+    if (__atomic_load_n(&g_refuse_alloc, __ATOMIC_ACQUIRE)) return NULL;
+    return moq_alloc_default()->realloc(p, old, n, moq_alloc_default()->ctx);
+}
+static void refusing_free(void *p, size_t n, void *ctx)
+{
+    (void)ctx;
+    moq_alloc_default()->free(p, n, moq_alloc_default()->ctx);
+}
+static const moq_alloc_t g_refusing_alloc = {
+    .alloc = refusing_alloc, .realloc = refusing_realloc,
+    .free = refusing_free, .ctx = NULL };
+
+static int cli_fatal_configure(picoquic_quic_t *quic, void *vctx)
+{
+    ((cli_fatal_ctx_t *)vctx)->quic = quic;
+    return 0;
+}
+
+static int cli_fatal_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
+                          uint64_t now, void *vctx)
+{
+    (void)lane; (void)now;
+    cli_fatal_ctx_t *cf = (cli_fatal_ctx_t *)vctx;
+    if (moq_pq_threaded_is_fatal(t)) {
+        __atomic_add_fetch(&cf->pumps_after_fatal, 1, __ATOMIC_ACQ_REL);
+        return 0;
+    }
+    if (!__atomic_load_n(&cf->armed, __ATOMIC_ACQUIRE) || cf->tampered)
+        return 0;
+    if (cf->oom) {
+        /* A SUBSCRIBE: its bytes reach the endpoint as a control write the
+         * adapter must copy into its send queue. */
+        moq_session_t *s = moq_pq_threaded_session(t);
+        if (!s || moq_session_state(s) != MOQ_SESS_ESTABLISHED)
+            return 0;
+        moq_bytes_t ns = MOQ_BYTES_LITERAL("fatal");
+        moq_subscribe_cfg_t sc;
+        moq_subscribe_cfg_init(&sc);
+        sc.track_namespace = (moq_namespace_t){ &ns, 1 };
+        sc.track_name = MOQ_BYTES_LITERAL("track");
+        moq_subscription_t sub;
+        moq_result_t rc = moq_session_subscribe(s, &sc, now, &sub);
+        /* The SUBSCRIBE is queued; the service pass after this pump hands
+         * its bytes to the endpoint, whose copy is now refused. */
+        if (rc == MOQ_OK)
+            __atomic_store_n(&g_refuse_alloc, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&cf->tampered, rc == MOQ_OK ? 1 : -1,
+                         __ATOMIC_RELEASE);
+        return 0;
+    }
+    /* The attach contract fixes the transport parameters; changing the
+     * peer-unidirectional stream credit under the adapter fails its next
+     * service pass. */
+    picoquic_cnx_t *cnx = cf->quic ? picoquic_get_first_cnx(cf->quic) : NULL;
+    if (!cnx)
+        return 0;
+    picoquic_tp_t tp = *picoquic_get_transport_parameters(cnx, 1);
+    tp.initial_max_stream_id_unidir += 1;
+    picoquic_set_transport_parameters(cnx, &tp);
+    __atomic_store_n(&cf->tampered, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static int row_client_fatal_close_impl(int oom)
+{
+    if (check_test_certs() != 0) {
+        failures++;
+        return failures;
+    }
+
+    int port = 0;
+    srv_watch_ctx_t sw;
+    memset(&sw, 0, sizeof(sw));
+
+    moq_pq_threaded_cfg_t srv_cfg;
+    moq_pq_threaded_cfg_init_sized(&srv_cfg, sizeof(srv_cfg));
+    srv_cfg.alloc = moq_alloc_default();
+    srv_cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+    srv_cfg.cert_path = MOQ_TEST_CERT_PATH;
+    srv_cfg.key_path = MOQ_TEST_KEY_PATH;
+    srv_cfg.insecure_skip_verify = true;
+    srv_cfg.on_lane_pump = srv_watch_pump;
+    srv_cfg.on_lane_pump_ctx = &sw;
+    /* Request credit, so the client's SUBSCRIBE is admitted locally. */
+    srv_cfg.send_request_capacity = true;
+    srv_cfg.initial_request_capacity = 16;
+
+    moq_pq_threaded_t *srv = NULL;
+    CHECK(create_server_on_free_port(&srv_cfg, &srv, &port) == MOQ_OK);
+    CHECK(port != 0);
+    if (!srv)
+        return failures;
+
+    cli_fatal_ctx_t cf;
+    memset(&cf, 0, sizeof(cf));
+    cf.oom = oom;
+    moq_pq_threaded_cfg_t cli_cfg;
+    moq_pq_threaded_cfg_init_sized(&cli_cfg, sizeof(cli_cfg));
+    cli_cfg.alloc = oom ? &g_refusing_alloc : moq_alloc_default();
+    cli_cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cli_cfg.host = "localhost";
+    cli_cfg.port = port;
+    cli_cfg.insecure_skip_verify = true;
+    cli_cfg.on_lane_pump = cli_fatal_pump;
+    cli_cfg.on_lane_pump_ctx = &cf;
+    cli_cfg.configure_quic = cli_fatal_configure;
+    cli_cfg.configure_quic_ctx = &cf;
+
+    moq_pq_threaded_t *cli = NULL;
+    CHECK(moq_pq_threaded_create(&cli_cfg, &cli) == MOQ_OK);
+
+    if (cli) {
+        for (int tries = 0; tries < 400 &&
+             !__atomic_load_n(&sw.accepted, __ATOMIC_ACQUIRE); tries++)
+            moq_pq_threaded_wait(srv, 25000);
+        CHECK(__atomic_load_n(&sw.accepted, __ATOMIC_ACQUIRE) == 1);
+        CHECK(moq_pq_threaded_conn_count(srv) == 1);
+
+        __atomic_store_n(&cf.armed, 1, __ATOMIC_RELEASE);
+        CHECK(moq_pq_threaded_wake(cli) == MOQ_OK);
+        for (int tries = 0; tries < 400 && !moq_pq_threaded_is_fatal(cli);
+             tries++)
+            moq_pq_threaded_wait(cli, 25000);
+        CHECK(moq_pq_threaded_is_fatal(cli));
+        /* The SUBSCRIBE was admitted, and the one refused request was the
+         * endpoint's copy of its bytes. */
+        if (oom) CHECK(__atomic_load_n(&cf.tampered, __ATOMIC_ACQUIRE) == 1 &&
+                       g_refused_n == 1);
+        uint64_t code = moq_pq_threaded_fatal_code(cli);
+        CHECK(code == (oom ? 0x1u : 0u));
+
+        /* Well inside the idle timeout: the close reached the server. The
+         * client is left running meanwhile, so nothing but its own fatal
+         * handling can have sent it. */
+        for (int tries = 0; tries < 80 &&
+             (__atomic_load_n(&sw.closed_count, __ATOMIC_ACQUIRE) == 0 ||
+              moq_pq_threaded_conn_count(srv) > 0); tries++)
+            moq_pq_threaded_wait(srv, 25000);
+
+        CHECK(__atomic_load_n(&sw.closed_count, __ATOMIC_ACQUIRE) == 1);
+        CHECK(__atomic_load_n(&sw.closed_code_valid, __ATOMIC_ACQUIRE) == 1);
+        CHECK(sw.closed_code == code);
+        CHECK(moq_pq_threaded_conn_count(srv) == 0);
+        CHECK(!moq_pq_threaded_is_fatal(srv));
+        printf("  client_fatal_close: client fatal code 0x%llx, server saw "
+               "%d close(s) with code 0x%llx\n", (unsigned long long)code,
+               __atomic_load_n(&sw.closed_count, __ATOMIC_ACQUIRE),
+               (unsigned long long)sw.closed_code);
+
+        /* stop() on a facade that went fatal reports it. Once it has
+         * joined the network thread, the final observing pump has run. */
+        CHECK(moq_pq_threaded_stop(cli) == MOQ_ERR_CLOSED);
+        __atomic_store_n(&g_refuse_alloc, 0, __ATOMIC_RELEASE);
+        CHECK(__atomic_load_n(&cf.pumps_after_fatal, __ATOMIC_ACQUIRE) >= 1);
+        moq_pq_threaded_destroy(cli);
+    }
+
+    moq_pq_threaded_stop(srv);
+    moq_pq_threaded_destroy(srv);
+    return failures;
+}
+
 static int row_pump_exit_close(void)
 {
     return row_stop_or_pump_exit_close(1);
@@ -642,6 +847,16 @@ static int row_server_pump_exit_close(void)
     return failures;
 }
 
+static int row_client_fatal_close(void)
+{
+    return row_client_fatal_close_impl(0);
+}
+
+static int row_client_fatal_close_code(void)
+{
+    return row_client_fatal_close_impl(1);
+}
+
 #else  /* !MOQ_TEST_CERT_PATH */
 
 static int row_local_close(void)
@@ -672,6 +887,20 @@ static int row_server_pump_exit_close(void)
     return failures;
 }
 
+static int row_client_fatal_close(void)
+{
+    printf("SKIP: threaded_terminal_controls client_fatal_close "
+           "(no test certificates)\n");
+    return failures;
+}
+
+static int row_client_fatal_close_code(void)
+{
+    printf("SKIP: threaded_terminal_controls client_fatal_close_code "
+           "(no test certificates)\n");
+    return failures;
+}
+
 #endif
 
 int main(int argc, char **argv)
@@ -687,10 +916,15 @@ int main(int argc, char **argv)
         (void)row_pump_exit_close();
     else if (strcmp(row, "server_pump_exit_close") == 0)
         (void)row_server_pump_exit_close();
+    else if (strcmp(row, "client_fatal_close") == 0)
+        (void)row_client_fatal_close();
+    else if (strcmp(row, "client_fatal_close_code") == 0)
+        (void)row_client_fatal_close_code();
     else {
         fprintf(stderr, "usage: %s "
                 "[client_unbind|local_close|stop_close|pump_exit_close|"
-                "server_pump_exit_close]\n",
+                "server_pump_exit_close|client_fatal_close|"
+                "client_fatal_close_code]\n",
                 argv[0]);
         return 2;
     }

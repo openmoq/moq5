@@ -37,7 +37,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang llvm
 
       # Fuzz binaries only: moq-core plus in-tree media libraries (LOC, CMAF,
-      # MSF) and their ten libFuzzer targets. Disable tests/examples/sim to
+      # MSF) and their libFuzzer targets. Disable tests/examples/sim to
       # keep the nightly build dependency-light and fast. MOQ_REQUIRE_FUZZ=ON
       # keeps a missing libFuzzer a hard error, never a silent skip (CI-only
       # flag; not in CMakePresets, so local Apple-clang dev is unaffected).

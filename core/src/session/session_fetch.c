@@ -1197,9 +1197,10 @@ joining_resolved: ;
         ev_opts->fill_timeout_ms = d->has_fill_timeout ? d->fill_timeout_ms : 0;
         moq_location_filter_cfg_init(&ev_opts->location);
         if (d->has_location) {
-            moq_location_filter_from_core(d->location_type,
-                d->location_start_group, d->location_start_object,
-                d->location_end_group, d->location_end_object,
+            moq_location_filter_from_core(&(moq_core_filter_t){
+                .type = d->location_type,
+                .start_group = d->location_start_group, .start_object = d->location_start_object,
+                .end_group = d->location_end_group, .end_object = d->location_end_object },
                 &ev_opts->location, sizeof(ev_opts->location));
         }
     }

@@ -762,7 +762,7 @@ static void optional_server_output(moq_version_t v)
         } else {
             CHECK("server output start", moq_session_start(f.s, 0) == MOQ_OK);
         }
-        setup_target_t t;
+        setup_target_t t = {0};
         CHECK("server output setup", moq_session_poll_actions(f.s, &a, 1) == 1 &&
             decode_server_target(v, &a, &t));
         CHECK("server setup names no target", !t.has_path && !t.has_authority);

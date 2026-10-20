@@ -74,6 +74,9 @@ typedef struct pw_rx_stream {
     bool     held_input;
     bool     held_fin;
     size_t   held_len;
+    /* h3zero released the stream while retained work was still owed to the
+     * bridge: its terminal follows that work (pw_rx_after_service). */
+    bool     released;
     bool     active;
 } pw_rx_stream_t;
 
@@ -111,6 +114,10 @@ struct moq_pico_wt_conn {
     /* Inbound stop_sending tracking (internal, test-visible). */
     size_t                      stop_sending_count;
     uint64_t                    last_stop_sending_stream_id;
+
+    /* Whole-stream terminals reported from h3zero's stream release
+     * (internal, test-visible). */
+    size_t                      stream_terminal_count;
 
     /* Inbound receive-flow-control state, one entry per tracked WT data
      * stream. Grown on demand; slots are reused after a stream retires. */

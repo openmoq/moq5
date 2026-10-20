@@ -440,9 +440,11 @@ static moq_result_t d16_handle_setup_client(moq_session_t *s,
             }
         }
         const char *reason = NULL;
-        err = moq_binding_judge_peer_target(s, peer_tmp.has_path, path,
-                                            peer_tmp.has_authority, authority,
-                                            &reason);
+        const moq_binding_peer_target_t target = {
+            .has_path = peer_tmp.has_path, .has_authority = peer_tmp.has_authority,
+            .path = path, .authority = authority,
+        };
+        err = moq_binding_judge_peer_target(s, &target, &reason);
         if (err) return close_with_error(s, err, reason);
     }
     if (!d16_setup_tokens_fit(&setup))
@@ -1121,9 +1123,10 @@ static moq_result_t d16_decode_subscribe(moq_session_t *s,
     uint64_t auth_reject_code = 0;
 
     rc = process_auth_tokens(s, auth_in, auth_in_count,
-        out->tokens, &out->token_count, MOQ_DECODED_MAX_TOKENS,
-        &auth_reject_code, out->token_staged,
-        &out->auth_txn);
+        &(moq_auth_resolve_out_t){
+            .tokens = out->tokens, .token_count = &out->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &auth_reject_code,
+            .staged = out->token_staged, .txn = &out->auth_txn });
     if (rc < 0) {
         *out_consumed = true;
         return rc;
@@ -1628,9 +1631,10 @@ static moq_result_t d16_decode_request_update(moq_session_t *s,
             return close_with_error(s, 0x6, "malformed auth token structure");
         }
         rc = process_auth_tokens(s, auth_in, auth_in_count,
-            out->tokens, &out->token_count, MOQ_DECODED_MAX_TOKENS,
-            &out->auth_reject_code, out->token_staged,
-            &out->auth_txn);
+            &(moq_auth_resolve_out_t){
+                .tokens = out->tokens, .token_count = &out->token_count,
+                .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &out->auth_reject_code,
+                .staged = out->token_staged, .txn = &out->auth_txn });
         if (rc < 0) {
             *out_consumed = true;
             return rc;
@@ -1720,8 +1724,10 @@ static moq_result_t d16_decode_publish_namespace(
 
     uint64_t auth_reject_code = 0;
     rc = process_auth_tokens(s, auth_in, auth_in_count,
-        out->tokens, &out->token_count, MOQ_DECODED_MAX_TOKENS,
-        &auth_reject_code, out->token_staged, &out->auth_txn);
+        &(moq_auth_resolve_out_t){
+            .tokens = out->tokens, .token_count = &out->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &auth_reject_code,
+            .staged = out->token_staged, .txn = &out->auth_txn });
     if (rc < 0) { *out_consumed = true; return rc; }
 
     if (s->state == MOQ_SESS_CLOSED) {
@@ -1843,8 +1849,10 @@ static moq_result_t d16_decode_fetch(moq_session_t *s,
     out->token_count = 0;
     uint64_t auth_reject_code = 0;
     rc = process_auth_tokens(s, auth_in, auth_in_count,
-        out->tokens, &out->token_count, MOQ_DECODED_MAX_TOKENS,
-        &auth_reject_code, out->token_staged, &out->auth_txn);
+        &(moq_auth_resolve_out_t){
+            .tokens = out->tokens, .token_count = &out->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &auth_reject_code,
+            .staged = out->token_staged, .txn = &out->auth_txn });
     if (rc < 0) { *out_consumed = true; return rc; }
     if (s->state == MOQ_SESS_CLOSED) { *out_consumed = true; return MOQ_OK; }
 
@@ -2072,9 +2080,10 @@ static moq_result_t d16_decode_publish(moq_session_t *s,
     uint64_t auth_reject_code = 0;
 
     rc = process_auth_tokens(s, auth_in, auth_in_count,
-        out->tokens, &out->token_count, MOQ_DECODED_MAX_TOKENS,
-        &auth_reject_code, out->token_staged,
-        &out->auth_txn);
+        &(moq_auth_resolve_out_t){
+            .tokens = out->tokens, .token_count = &out->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &auth_reject_code,
+            .staged = out->token_staged, .txn = &out->auth_txn });
     if (rc < 0) {
         *out_consumed = true;
         return rc;
@@ -2330,6 +2339,31 @@ static moq_result_t d16_decode_publish_ok_inbound(
 
 /* -- D16 inbound PUBLISH_DONE decode ------------------------------ */
 
+/* A subscription terminal (PUBLISH_DONE or UNSUBSCRIBE) whose Request ID
+ * has no registry owner. The two terminals can lawfully cross: §5.1.1 lets
+ * a subscriber dispose of its subscription state once it sends UNSUBSCRIBE,
+ * and lets a publisher delete it after sending PUBLISH_DONE (§5.1.1, §9.15), while
+ * §9.12 lets the subscriber send UNSUBSCRIBE without having seen that DONE.
+ * So the peer's terminal can name a subscription this side already retired.
+ * This side's interoperability policy absorbs such a terminal, with no
+ * effect, when its id was committed earlier in its origin's sequence (§9.1:
+ * each origin's ids are consecutive, committed in order) and is not an
+ * outstanding obligation: a reply tombstone still awaiting its OK/ERROR, or
+ * an inbound update still owed an answer. The test proves the id was
+ * issued, not that it named a subscription or which side held which role;
+ * an id at or past its origin's next id is never absorbed. */
+static bool d16_terminal_id_is_obsolete(const moq_session_t *s, uint64_t request_id)
+{
+    const moq_d16_profile_state_t *d16 =
+        (const moq_d16_profile_state_t *)s->profile_state;
+    if (unsub_tomb_contains(s, request_id)) return false;
+    if (session_owed_update_covers(s, request_id)) return false;
+    uint64_t local_parity = (s->perspective == MOQ_PERSPECTIVE_CLIENT) ? 0 : 1;
+    uint64_t next = (request_id & 1) == local_parity ? d16->next_local_request_id
+                                                     : d16->peer_next_request_id;
+    return request_id < next;
+}
+
 static moq_result_t d16_decode_publish_done_inbound(
     moq_session_t *s,
     const moq_control_envelope_t *env,
@@ -2394,6 +2428,10 @@ static moq_result_t d16_decode_publish_done_inbound(
             return session_core_on_subscribe_done(s, slot, &decoded,
                                                   true /* free_now */);
         }
+    }
+    if (ep.kind == MOQ_REQ_NONE && d16_terminal_id_is_obsolete(s, done.request_id)) {
+        *out_consumed = true;   /* absorbed: no event, action or state */
+        return MOQ_OK;
     }
     if (ep.kind != MOQ_REQ_PUBLISH) {
         *out_consumed = true;
@@ -2470,6 +2508,13 @@ static moq_result_t d16_decode_unsubscribe(
         *out_consumed = true;
         return session_core_on_publish_unsubscribed(s, ep.slot,
                                                     request_terminal_by_message(), 0);
+    }
+    /* A crossing UNSUBSCRIBE for a subscription this side already ended
+     * with PUBLISH_DONE: our PUBLISH (this side's origin) or a SUBSCRIBE we
+     * served (the peer's). */
+    if (ep.kind == MOQ_REQ_NONE && d16_terminal_id_is_obsolete(s, request_id)) {
+        *out_consumed = true;   /* absorbed: no event, action or state */
+        return MOQ_OK;
     }
 
     /* Subscription path: validate peer parity. */
@@ -2733,9 +2778,10 @@ static moq_result_t d16_decode_track_status_request(moq_session_t *s,
     uint64_t auth_reject_code = 0;
 
     rc = process_auth_tokens(s, auth_in, auth_in_count,
-        out->tokens, &out->token_count, MOQ_DECODED_MAX_TOKENS,
-        &auth_reject_code, out->token_staged,
-        &out->auth_txn);
+        &(moq_auth_resolve_out_t){
+            .tokens = out->tokens, .token_count = &out->token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = &auth_reject_code,
+            .staged = out->token_staged, .txn = &out->auth_txn });
     if (rc < 0) {
         *out_consumed = true;
         return rc;

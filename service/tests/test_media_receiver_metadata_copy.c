@@ -236,7 +236,7 @@ static void policy_boundaries(moq_media_overflow_policy_t policy)
     uint32_t count = policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL ? 3 : 2;
     MOQ_TEST_CHECK(f.r->obj_tail - f.r->obj_head == count);
     MOQ_TEST_CHECK(charged(f.r) == count * cost);
-    moq_media_receiver_stats_t stats;
+    moq_media_receiver_stats_t stats = {0};
     MOQ_TEST_CHECK(moq_media_receiver_get_stats(f.r, &stats, sizeof(stats)) == MOQ_OK);
     MOQ_TEST_CHECK(stats.bytes_queued == count && stats.overflow_events == 1);
     if (policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL) {

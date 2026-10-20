@@ -634,6 +634,12 @@ void fill_rx_peer_reset(moq_session_t *s, const moq_rx_stream_t *rx, uint64_t er
     }
 }
 
+void fill_rx_local_retired(moq_session_t *s, const moq_rx_stream_t *rx)
+{
+    if (!rx_entry(s, rx)) return;
+    (void)moq_fill_local_retired(&s->fills, rx->fill_ref, rx->stream_ref);
+}
+
 void fill_rx_local_stop(moq_session_t *s, const moq_rx_stream_t *rx)
 {
     if (!rx_entry(s, rx)) return;

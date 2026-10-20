@@ -429,6 +429,8 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
     install(FILES
         cmake/FindPicoquic.cmake
         cmake/MoqPicoquicProjectPolicy.cmake
+        cmake/MoqPicotlsProjectPolicy.cmake
+        cmake/MoqPicotlsBuildPolicy.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 

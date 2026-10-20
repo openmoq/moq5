@@ -412,8 +412,9 @@ rfs_case(const char *row)
         RFS_NEED(moqr_bind_next_deadline_us(t.rig.bind) == deadline,
             "no-deadline-renewal");
         if (two) {
-            RFS_NEED(t.origin_obs.requests[1].timeout_ms <= 20,
-                "remaining-budget-forwarded");
+            RFS_NEED(!t.origin_obs.requests[1].timeout &&
+                t.origin_obs.requests[1].timeout_ms == 0,
+                "timeout-budget-remains-hop-local");
             t.rig.now = deadline - 1001;
             rfs_pump(&t, 1);
             RFS_NEED(rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_COMPLETE) == 0,
@@ -603,7 +604,7 @@ rfs_request_span(const rfs_request_t *r, uint64_t g, uint64_t first,
 {
     return r->fetch._opaque != 0 && r->sg == g && r->so == first && r->eg == g &&
         r->eo == raw_end && r->order == order && r->priority == 61 &&
-        r->timeout && r->timeout_ms <= 100;
+        !r->timeout && r->timeout_ms == 0;
 }
 
 /* Descending group order over three groups: group 2 is fully cached, group 1

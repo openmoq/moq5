@@ -88,6 +88,7 @@ package struct ReceiverPolledEvent: Sendable {
         case added, updated, removed, ended, catalogReady, parseDrop
         case fillTerminal(MediaFillTerminal)
         case localFailure(localResult: Int32?)
+        case updateLocalFailure(localResult: Int32?)
         case deliveryLocalFailure(localResult: Int32?, origin: UInt32?, initiatingRequestID: UInt64?)
     }
     package var kind: Kind

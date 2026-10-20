@@ -439,9 +439,11 @@ static moq_result_t rs_resolve_tokens(moq_session_t *s, const moq_request_tokens
     /* A rejection already decided by the decoder (a refused filter) stands
      * unless a token fails too; the token's code then takes precedence. */
     uint64_t preset = *out_reject_code;
-    moq_result_t rc = process_auth_tokens(s, tk->in, tk->count, out_tokens,
-                                          out_token_count, MOQ_DECODED_MAX_TOKENS,
-                                          out_reject_code, out_staged, txn);
+    moq_result_t rc = process_auth_tokens(s, tk->in, tk->count,
+        &(moq_auth_resolve_out_t){
+            .tokens = out_tokens, .token_count = out_token_count,
+            .max_tokens = MOQ_DECODED_MAX_TOKENS, .reject_code = out_reject_code,
+            .staged = out_staged, .txn = txn });
     if (*out_reject_code == 0) *out_reject_code = preset;
     return rc;
 }

@@ -747,6 +747,12 @@ static void run_error_code_mapping(void)
     CHECK(out == 0xabc);
 }
 
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+#define WT_HAVE_D22 1
+#else
+#define WT_HAVE_D22 0     /* draft-22 refuses to attach to this provider */
+#endif
+
 int main(void)
 {
     /* Pure §4.4 mapping boundaries (no transport). */
@@ -767,8 +773,24 @@ int main(void)
     run_deferred_reset_bound();
 
     /* Draft-22: the attaching harness binds both sessions to the
-     * WebTransport session before starting them. */
-    run_version(0x22, MOQ_VERSION_DRAFT_22);
+     * WebTransport session before starting them. Without the provider's
+     * stream terminal contract draft-22 refuses at the client adapter's
+     * constructor, and only there. */
+    if (WT_HAVE_D22) {
+        run_version(0x22, MOQ_VERSION_DRAFT_22);
+    } else {
+        scenario = "d22_refused";
+        pico_wt_harness_t h;
+        pico_wt_harness_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.cid_byte = 0x22;
+        cfg.version = MOQ_VERSION_DRAFT_22;
+        const char *why = pico_wt_harness_check_attach_refusal(
+            &h, pico_wt_harness_setup(&h, &cfg));
+        if (why) fprintf(stderr, "d22_refused: %s\n", why);
+        CHECK(why == NULL);
+        pico_wt_harness_cleanup(&h);
+    }
 
     if (failures == 0)
         printf("PASS: pico_wt_d18\n");

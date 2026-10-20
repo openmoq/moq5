@@ -276,7 +276,7 @@ typedef struct peer_state {
 
 /* ---- Forwarded Joining FETCH over the production binding -------------------- *
  * A raw-session ORIGIN announces boot/cat and answers the relay's upstream
- * SUBSCRIBE (catalog Largest {0, largest_object}) and its forwarded FETCH by
+ * SUBSCRIBE (catalog Largest {largest_group, largest_object}) and its forwarded FETCH by
  * script; raw-session DOWNSTREAM peers subscribe LargestObject and issue the
  * Relative Joining FETCH(0) the catalog bootstrap uses. Every row asserts the
  * exact downstream ledger, the origin's observed requests/cancellations, and
@@ -289,7 +289,7 @@ typedef struct peer_state {
 typedef struct jf_origin {
     conn_t            *cn;
     bool               gone;          /* closed at the binding: not drained */
-    uint64_t           largest_object;/* catalog SUBSCRIBE_OK Largest {0, n} */
+    uint64_t           largest_group, largest_object;
     int                ns_accepted;
     int                sub_requests;
     moq_subscription_t cat_sub, live_sub;
@@ -574,6 +574,10 @@ relay_bind_test_jf_join_ex(jf_t *j, jf_down_t *d, moq_group_order_t order);
 
 void
 relay_bind_test_jf_join(jf_t *j, jf_down_t *d);
+
+bool
+relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool live_control,
+                            uint64_t largest_group, uint64_t largest_object, bool origin_last);
 
 bool
 relay_bind_test_jf_setup_ex(jf_t *j, moq_version_t version, int n_down, bool live_control,

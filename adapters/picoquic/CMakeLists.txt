@@ -75,7 +75,9 @@ if(_moq_pq_verify_backend STREQUAL "openssl")
                 "-DMOQ_PICOQUIC_VERIFY_BACKEND=mbedtls with an mbedTLS "
                 "picoquic build.")
         endif()
-        set(MOQ_PTLS_OPENSSL_INCLUDE_DIR "${PTLS_INCLUDE_DIR}")
+        # The cache records the directory the verifier compiles against.
+        set(MOQ_PTLS_OPENSSL_INCLUDE_DIR "${PTLS_INCLUDE_DIR}" CACHE PATH
+            "Directory containing <picotls/openssl.h> for the cert verifier" FORCE)
     else()
         find_path(MOQ_PTLS_OPENSSL_INCLUDE_DIR
             NAMES picotls/openssl.h
@@ -571,8 +573,9 @@ if(MOQ_BUILD_TESTS)
         # Provider-capacity policy regression: picoquic's peer uni stream
         # credit around a gapped FIN and around RESET_STREAM /
         # RESET_STREAM_AT, by decoder and producer testing after a simulated
-        # handshake. Provider-only; no adapter code. Its policy rows fail
-        # while the provider does not meet the policy.
+        # handshake, plus one real-packet row for the grant reaching the peer.
+        # Provider-only; no adapter code. A provider without picoquic patch
+        # 0009 fails its policy rows.
         add_executable(test_pq_provider_stream_credit
             tests/test_pq_provider_stream_credit.c)
         target_include_directories(test_pq_provider_stream_credit PRIVATE
@@ -608,6 +611,31 @@ if(MOQ_BUILD_TESTS)
         endif()
         add_test(NAME pq_sim_reliable_reset COMMAND test_pq_sim_reliable_reset)
         set_tests_properties(pq_sim_reliable_reset PROPERTIES TIMEOUT 120)
+
+        # The end of a locally stopped receive half over real picoquic: a FIN
+        # picoquic withholds after STOP_SENDING still retires the stream.
+        add_executable(test_pq_stop_release
+            tests/test_pq_stop_release.c moq_picoquic.c picoquic_endpoint.c
+            ../common/moq_pq_send_queue.c)
+        target_compile_definitions(test_pq_stop_release PRIVATE
+            MOQ_BUILDING MOQ_PICOQUIC_TESTING
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        target_include_directories(test_pq_stop_release PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/support
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_stop_release PRIVATE
+            moq::core
+            picoquic-test
+            ${_adapter_tls_link})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_stop_release PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_stop_release COMMAND test_pq_stop_release)
+        set_tests_properties(pq_stop_release PROPERTIES TIMEOUT 120)
 
         include(${PROJECT_SOURCE_DIR}/cmake/MoqPicoquicTerminalTests.cmake)
         moq_add_picoquic_terminal_tests(pq moq::adapter-picoquic ${_adapter_tls_link})
@@ -769,6 +797,14 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     add_test(NAME threaded_terminal_control_pump_exit_close
              COMMAND test_threaded_terminal_controls pump_exit_close)
     set_tests_properties(threaded_terminal_control_pump_exit_close
+        PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_client_fatal_close
+             COMMAND test_threaded_terminal_controls client_fatal_close)
+    set_tests_properties(threaded_terminal_control_client_fatal_close
+        PROPERTIES TIMEOUT 120)
+    add_test(NAME threaded_terminal_control_client_fatal_close_code
+             COMMAND test_threaded_terminal_controls client_fatal_close_code)
+    set_tests_properties(threaded_terminal_control_client_fatal_close_code
         PROPERTIES TIMEOUT 120)
     add_test(NAME threaded_terminal_control_server_pump_exit_close
              COMMAND test_threaded_terminal_controls server_pump_exit_close)

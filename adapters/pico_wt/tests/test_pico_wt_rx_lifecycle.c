@@ -546,6 +546,69 @@ static void test_fin_while_paused(void)
 }
 
 /*
+ * A stream that completed at the transport while the receiver was paused:
+ * picoquic delivered every byte and the FIN into the adapter's retention and
+ * retired the stream, and h3zero released it. The release is latched behind
+ * the retained bytes. The subscriber then cancels before any replay. The
+ * cancellation must neither fail nor lose the stream's end: the STOP has
+ * nothing left to stop, the bytes the session had not taken are discarded
+ * (not delivered), no FIN is reported as an object completion, and the
+ * stream's whole terminal still reaches the bridge, exactly once, so the
+ * bridge holds no mapping for it afterwards.
+ */
+static void test_release_latched_then_cancel(void)
+{
+    fixture_t f;
+    /* Small objects: the whole subgroup and its FIN fit in the receive
+     * window, so picoquic can deliver all of it while the session holds. */
+    if (!fixture_up_to_pause_sz(&f, 0x3a, 1, true, 64)) {
+        CHECK(0);
+        pico_wt_harness_cleanup(&f.h);
+        return;
+    }
+    for (int i = 0; i < 20; i++) {
+        moq_pico_wt_service(f.h.server_conn, f.h.now);
+        if (pico_wt_harness_pump(&f.h, 50) != 0) break;
+    }
+    pw_rx_stream_t *st = rx_entry(&f, f.sid);
+    CHECK(st != NULL && st->paused);
+    CHECK(st != NULL && (st->buf_fin || st->fin_blocked));
+    CHECK(st != NULL && st->released);
+    CHECK(picoquic_find_stream(f.h.test_ctx->cnx_client, f.sid) == NULL);
+    size_t terminals = f.h.client_conn->stream_terminal_count;
+    size_t streams = moq_transport_bridge_stream_count(f.h.client_conn->bridge);
+
+    /* The session took one object before it paused (a one-entry queue). */
+    uint32_t delivered = 0, finished = 0;
+    moq_event_t ev;
+    CHECK(moq_session_unsubscribe(f.h.client_session, f.client_sub,
+                                  f.h.now) == MOQ_OK);
+    for (int i = 0; i < 40; i++) {
+        while (moq_session_poll_events(f.h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) delivered++;
+            if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED) finished++;
+            moq_event_cleanup(&ev);
+        }
+        moq_pico_wt_service(f.h.client_conn, f.h.now);
+        if (pico_wt_harness_pump(&f.h, 50) != 0) break;
+    }
+    printf("  release_latched_then_cancel: published %u, delivered %u after "
+           "the cancel, terminals %zu -> %zu, bridge streams %zu -> %zu\n",
+           f.published, delivered, terminals,
+           f.h.client_conn->stream_terminal_count, streams,
+           moq_transport_bridge_stream_count(f.h.client_conn->bridge));
+    CHECK(!moq_pico_wt_conn_is_fatal(f.h.client_conn));
+    CHECK(delivered == 1);           /* only what was queued before it: the
+                                      * rest of the retained bytes go to the
+                                      * stopped stream and are discarded */
+    CHECK(finished == 0);
+    CHECK(rx_entry(&f, f.sid) == NULL);
+    CHECK(f.h.client_conn->stream_terminal_count == terminals + 1);
+    CHECK(moq_transport_bridge_find_ref(f.h.client_conn->bridge, f.sid)._v == 0);
+    pico_wt_harness_cleanup(&f.h);
+}
+
+/*
  * Expected bridge-owned object inventory, derived independently of the
  * receiver under test. The fixture's subgroup wire layout is deterministic:
  * the publisher encodes a draft-16 subgroup header (type 0x14: subgroup id
@@ -1390,6 +1453,7 @@ int main(void)
 {
     test_pre_ready_grant_is_owed();
     test_fin_while_paused();
+    test_release_latched_then_cancel();
     test_observer_recorders_fail_closed();
     test_reset_while_paused();
     test_stop_sending_on_real_request_bidi();

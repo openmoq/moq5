@@ -498,8 +498,8 @@ jobs:
 
       - name: Test (in-process adapter subset)
         run: >
-          ctest --test-dir build/pq-ci --output-on-failure
-          -R '^(pq_conformance|adapter_backpressure|pq_send_queue_offsets|threaded_compile|threaded_tls_policy|threaded_tls_handshake|scenario_backpressure|scenario_delay_backpressure)$'
+          ctest --test-dir build/pq-ci --output-on-failure --no-tests=error
+          -R '^(pq_conformance|adapter_backpressure|pq_send_queue_offsets|pq_hold_input|threaded_compile|threaded_tls_policy|threaded_tls_handshake|scenario_backpressure|scenario_delay_backpressure|threaded_terminal_control_.*)$'
 
       # Cold-consumer / packaging tier (kept separate so a packaging
       # failure is distinguishable from an adapter-behavior failure).
@@ -566,8 +566,8 @@ jobs:
       # creation without starting a transport, including allocation failures.
       - name: Test (pico_wt regression + conformance)
         run: >
-          ctest --test-dir build/pico-wt-ci --output-on-failure
-          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_loopback_private|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_reset_after_fin|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
+          ctest --test-dir build/pico-wt-ci --output-on-failure --no-tests=error
+          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pq_provider_stream_credit|pq_sim_reliable_reset|pq_stop_release|pq_terminal|pq_terminal_provider|pico_wt_terminal|pico_wt_reliable_reset|pico_wt_d18|pico_wt_stop_release|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_loopback_private|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_reset_after_fin|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target)$'
 
       # Static archives conceal private references crossing adapter DSOs.
       # Require complete shared-library links, including the managed facade.
@@ -714,6 +714,26 @@ jobs:
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build/fuzz-ci -R '^cmaf_packager' --output-on-failure --no-tests=error
+
+      # The nightly deliberately disables tests. Its private D22 codec target
+      # must not depend on the test suite being enabled.
+      - name: Configure nightly fuzz configuration
+        run: >
+          cmake -B build/fuzz-nightly
+          -DMOQ_BUILD_FUZZ=ON
+          -DMOQ_REQUIRE_FUZZ=ON
+          -DMOQ_BUILD_MSF=ON
+          -DMOQ_BUILD_TESTS=OFF
+          -DMOQ_BUILD_EXAMPLES=OFF
+          -DMOQ_BUILD_SIM=OFF
+
+      - name: Build and replay nightly D22 fuzzer
+        run: |
+          cmake --build build/fuzz-nightly --target fuzz_control_d22
+          build/fuzz-nightly/fuzz/fuzz_control_d22 fuzz/corpus/control_d22 -runs=0
+
+      - name: Test nightly runner
+        run: bash scripts/run_fuzzers.sh --self-test
 
   hardening:
     name: Hardening (FORTIFY/stack-protector, Linux)

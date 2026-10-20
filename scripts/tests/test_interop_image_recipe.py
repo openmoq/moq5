@@ -17,10 +17,14 @@ WORKFLOW = ROOT / ".github/workflows/publish-interop-client.yml"
 SETUP = (ROOT / "scripts/setup_picoquic_deps.sh").read_text()
 
 
-def setup_patches(dependency):
-    body = re.search(rf"^{dependency.upper()}_PATCHES=\((.*?)\)", SETUP, re.M | re.S)
-    return shlex.split(body.group(1))
-
+def series_patches(dependency):
+    # The same reading as provider_patches.sh read_patch_series.
+    names = []
+    for line in (ROOT / "patches" / dependency / "series").read_text().splitlines():
+        line = re.sub(r"\s", "", line.split("#", 1)[0])
+        if line:
+            names.append(line)
+    return names
 
 def workflow_step(name):
     # Extract the repository's literal step/run blocks, not arbitrary YAML.
@@ -64,14 +68,20 @@ class OwnershipPatchRecipe(unittest.TestCase):
         self.provider = self.root / self.dependency
         self.provider.mkdir()
         subprocess.run(["git", "init", "-q", str(self.provider)], check=True)
-        self.names = setup_patches(self.dependency)
+        self.names = series_patches(self.dependency)
+        self.assertGreaterEqual(len(self.names), 2)
+        patch_dir = self.root / "libmoq/patches" / self.dependency
+        patch_dir.mkdir(parents=True)
+        (patch_dir / "series").write_text("".join(n + "\n" for n in self.names), encoding="ascii")
+        scripts = self.root / "libmoq/scripts"
+        scripts.mkdir()
+        shutil.copy(ROOT / "scripts/provider_patches.sh", scripts / "provider_patches.sh")
         self.sources = []
         self.patches = []
         for i, name in enumerate(self.names):
             source = self.provider / f"part{i}.c"
             source.write_text("borrowed\n", encoding="ascii")
-            patch = self.root / "libmoq/patches" / self.dependency / name
-            patch.parent.mkdir(parents=True, exist_ok=True)
+            patch = patch_dir / name
             patch.write_text(
                 f"diff --git a/part{i}.c b/part{i}.c\n"
                 f"--- a/part{i}.c\n+++ b/part{i}.c\n"
@@ -80,117 +90,154 @@ class OwnershipPatchRecipe(unittest.TestCase):
             self.sources.append(source)
             self.patches.append(patch)
         self.source = self.sources[0]
+        self.command = " ".join(shlex.quote(a) for a in self.dockerfile_apply()).replace(
+            "/src", str(self.root))
+
+    def dockerfile_apply(self):
+        # The Dockerfile's provider_patches.sh invocation for this provider.
         lines = (ROOT / "tools/moq-interop-client/Dockerfile").read_text().splitlines()
-        start = lines.index(f"RUN cd /src/{self.dependency} \\")
+        start = next(i for i, line in enumerate(lines) if "provider_patches.sh apply" in line)
         command = []
         for line in lines[start:]:
             command.append(line.removesuffix("\\"))
             if not line.endswith("\\"):
                 break
-        self.command = " ".join(command)[4:].replace("/src", str(self.root))
+        steps = [shlex.split(s) for s in " ".join(command).removeprefix("RUN ").split("&&")]
+        matching = [s for s in steps if s[-1] == f"/src/{self.dependency}"]
+        self.assertEqual(len(matching), 1, steps)
+        return matching[0]
 
     def run_recipe(self, env=None):
         return subprocess.run(
             ["/bin/sh", "-c", self.command], capture_output=True, text=True,
-            env=env, timeout=10,
+            env=env, timeout=30,
         )
 
     def diagnostic(self, index, suffix):
-        return f"{self.dependency} patch {self.patches[index].stem} {suffix}"
+        return f"[provider_patches] {self.dependency} patch {self.names[index]} {suffix}"
 
-    def test_patch_list_matches_setup_in_order(self):
-        match = re.search(r"for name in (.*?); do", self.command)
-        self.assertIsNotNone(match)
-        self.assertEqual([name + ".patch" for name in shlex.split(match.group(1))], self.names)
+    def states(self):
+        return [s.read_text() for s in self.sources]
+
+    def test_recipe_applies_the_tracked_series(self):
+        self.assertEqual(self.dockerfile_apply(), [
+            "bash", "/src/libmoq/scripts/provider_patches.sh", "apply",
+            f"/src/libmoq/patches/{self.dependency}", f"/src/{self.dependency}"])
+        self.assertIn(f'read_patch_series "$repo_root/patches/{self.dependency}/series"', SETUP)
         for name in self.names:
             self.assertTrue((ROOT / "patches" / self.dependency / name).is_file(), name)
 
     def test_clean_and_already_applied(self):
-        already = "".join(self.diagnostic(i, "already applied") + "\n"
-                          for i in range(len(self.names)))
-        for expected_output in ("", already):
+        for suffix in ("", "already applied"):
             result = self.run_recipe()
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stderr, "")
-            self.assertEqual(result.stdout, expected_output)
-            self.assertEqual([s.read_text() for s in self.sources], ["owned\n"] * len(self.names))
+            self.assertEqual(result.stdout, "")
+            expected = "".join(
+                (self.diagnostic(i, suffix) if suffix else
+                 f"[provider_patches] applied {self.dependency} patch {self.names[i]}") + "\n"
+                for i in range(len(self.names)))
+            self.assertEqual(result.stderr, expected)
+            self.assertEqual(self.states(), ["owned\n"] * len(self.names))
 
-    def test_each_patch_already_applied_independently(self):
-        for index in range(len(self.names)):
-            with self.subTest(index=index):
+    def test_applied_prefix_completes(self):
+        for count in range(1, len(self.names)):
+            with self.subTest(count=count):
                 for i, source in enumerate(self.sources):
-                    source.write_text("owned\n" if i == index else "borrowed\n", encoding="ascii")
+                    source.write_text("owned\n" if i < count else "borrowed\n", encoding="ascii")
                 result = self.run_recipe()
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, self.diagnostic(index, "already applied") + "\n")
-                self.assertEqual(result.stderr, "")
-                self.assertTrue(all(s.read_text() == "owned\n" for s in self.sources))
+                for i in range(count):
+                    self.assertIn(self.diagnostic(i, "already applied"), result.stderr)
+                self.assertEqual(self.states(), ["owned\n"] * len(self.names))
+
+    def test_out_of_order_application_is_refused_unchanged(self):
+        for index in range(1, len(self.names)):
+            with self.subTest(index=index):
+                expected = ["owned\n" if i == index else "borrowed\n"
+                            for i in range(len(self.names))]
+                for source, text in zip(self.sources, expected):
+                    source.write_text(text, encoding="ascii")
+                result = self.run_recipe()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("conflicts", result.stderr)
+                self.assertEqual(self.states(), expected)
 
     def test_conflict_is_unchanged(self):
         for index in range(len(self.names)):
             with self.subTest(index=index):
-                for i, source in enumerate(self.sources):
-                    source.write_text("conflict\n" if i == index else "borrowed\n", encoding="ascii")
+                expected = ["conflict\n" if i == index else "borrowed\n"
+                            for i in range(len(self.names))]
+                for source, text in zip(self.sources, expected):
+                    source.write_text(text, encoding="ascii")
                 result = self.run_recipe()
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(self.diagnostic(index, "conflicts"), result.stderr)
-                expected = ["owned\n"] * index + ["conflict\n"] + ["borrowed\n"] * (len(self.names) - index - 1)
-                self.assertEqual([s.read_text() for s in self.sources], expected)
+                self.assertIn(
+                    f"ERROR: {self.dependency} patch {self.names[index]} conflicts", result.stderr)
+                self.assertEqual(self.states(), expected)
 
     def test_missing_second_patch_fails(self):
         self.patches[1].unlink()
         result = self.run_recipe()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(self.diagnostic(1, "missing"), result.stderr)
-        self.assertEqual(self.sources[1].read_text(), "borrowed\n")
+        self.assertIn(f"missing {self.dependency} patch", result.stderr)
+        self.assertEqual(self.states(), ["borrowed\n"] * len(self.names))
 
     def test_apply_failure_is_not_masked_by_next_patch(self):
         bindir = self.root / "bin"
         bindir.mkdir()
         shim = bindir / "git"
+        # Fail only the real (non-trial, non-check) apply of the chosen patch.
         shim.write_text(
-            '#!/bin/sh\nif [ "$1" = apply ] && '
-            '[ "$2" = "$RECIPE_FAIL_PATCH" ]; then exit 23; fi\n'
+            '#!/bin/sh\nif [ "$1" = -C ] && [ "$2" = "$RECIPE_PROVIDER" ] && '
+            '[ "$3" = apply ] && [ "$4" = "$RECIPE_FAIL_PATCH" ]; then exit 23; fi\n'
             'exec "$RECIPE_REAL_GIT" "$@"\n', encoding="ascii",
         )
         shim.chmod(0o755)
         env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"],
-                   RECIPE_REAL_GIT=shutil.which("git"), RECIPE_FAIL_PATCH=str(self.patches[0]))
+                   RECIPE_REAL_GIT=shutil.which("git"), RECIPE_PROVIDER=str(self.provider),
+                   RECIPE_FAIL_PATCH=str(self.patches[0]))
         result = self.run_recipe(env)
         self.assertNotEqual(result.returncode, 0)
-        self.assertTrue(all(s.read_text() == "borrowed\n" for s in self.sources))
+        self.assertIn(f"{self.dependency} patch {self.names[0]} failed to apply", result.stderr)
+        self.assertEqual(self.states(), ["borrowed\n"] * len(self.names))
 
     def test_missing_repository(self):
         (self.provider / ".git").rename(self.root / "saved-git")
         result = self.run_recipe()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be its own git root", result.stderr)
-        self.assertEqual(self.source.read_text(), "borrowed\n")
+        self.assertIn("is not its own git root", result.stderr)
+        self.assertEqual(self.states(), ["borrowed\n"] * len(self.names))
 
     def test_enclosing_repository_is_not_provider(self):
         (self.provider / ".git").rename(self.root / "saved-git")
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         result = self.run_recipe()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be its own git root", result.stderr)
-        self.assertEqual(self.source.read_text(), "borrowed\n")
+        self.assertIn("is not its own git root", result.stderr)
+        self.assertEqual(self.states(), ["borrowed\n"] * len(self.names))
 
     def test_unavailable_worktree_gitfile(self):
         (self.provider / ".git").rename(self.root / "saved-git")
         (self.provider / ".git").write_text("gitdir: /missing/host/worktree\n", encoding="ascii")
         result = self.run_recipe()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be its own git root", result.stderr)
-        self.assertEqual(self.source.read_text(), "borrowed\n")
+        self.assertIn("is not its own git root", result.stderr)
+        self.assertEqual(self.states(), ["borrowed\n"] * len(self.names))
 
-    def test_resolvable_gitfile_is_not_independent(self):
-        (self.provider / ".git").rename(self.root / "saved-git")
-        (self.provider / ".git").write_text("gitdir: ../saved-git\n", encoding="ascii")
+
+    def test_linked_worktree_is_its_own_root(self):
+        # A linked worktree's gitfile resolves to its own top level, so it is
+        # a valid provider checkout.
+        main = self.root / "provider-main"
+        shutil.move(str(self.provider), str(main))
+        git = ["git", "-C", str(main), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "base"], check=True)
+        subprocess.run(git + ["worktree", "add", "-q", "--detach", str(self.provider)], check=True)
+        self.assertTrue((self.provider / ".git").is_file())
         result = self.run_recipe()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must be its own git root", result.stderr)
-        self.assertTrue(all(s.read_text() == "borrowed\n" for s in self.sources))
-
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.states(), ["owned\n"] * len(self.names))
 
 class PicotlsPatchRecipe(OwnershipPatchRecipe):
     dependency = "picotls"

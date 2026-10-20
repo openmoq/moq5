@@ -239,7 +239,8 @@ static void settle(fixture_t *f)
 {
     for (unsigned i = 0; i < 8; i++) { network(f); pump(f); }
 }
-static bool start(fixture_t *f, moq_version_t version, uint64_t budget)
+static bool start_configured(fixture_t *f, moq_version_t version, uint64_t budget,
+                             bool small_flow_queue)
 {
     memset(f, 0, sizeof(*f)); current = f;
     f->version = version; f->facade_budget = budget;
@@ -267,6 +268,10 @@ static bool start(fixture_t *f, moq_version_t version, uint64_t budget)
     moq_alloc_t alloc = {.ctx = &f->ledger, .alloc = ledger_alloc, .free = ledger_free};
     moq_media_receiver_cfg_t cfg;
     moq_media_receiver_cfg_init_live_sized(&cfg, sizeof(cfg));
+    if (small_flow_queue) {
+        cfg.overflow.policy = MOQ_MEDIA_OVERFLOW_FLOW_CONTROL;
+        cfg.overflow.max_objects = 2;
+    }
     moq_bytes_t ns[] = {MOQ_BYTES_LITERAL("ack-failure")};
     cfg.namespace_ = (moq_namespace_t){ns, 1};
     cfg.auto_subscribe = true;
@@ -281,6 +286,10 @@ static bool start(fixture_t *f, moq_version_t version, uint64_t budget)
     f->r->ep = f->ep;
     pump(f); network(f);
     return f->peer[0].requests == 1 && !moq_media_receiver_is_fatal(f->r);
+}
+static bool start(fixture_t *f, moq_version_t version, uint64_t budget)
+{
+    return start_configured(f, version, budget, false);
 }
 static void finish(fixture_t *f)
 {

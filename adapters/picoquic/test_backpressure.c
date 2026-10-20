@@ -43,6 +43,12 @@ picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c)
     { (void)c; return NULL; }
 uint64_t picoquic_get_quic_time(picoquic_quic_t *q)
     { (void)q; return g_time; }
+/* Per-stream context: the adapter watches stopped streams through it; no
+ * release ever arrives here. */
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+    { (void)c; (void)sid; (void)ctx; return 0; }
+void picoquic_unlink_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid)
+    { (void)c; (void)sid; }
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
 /* The provider's terminal-observation contract (patch 0007): opt-in and the
  * exact STOP code, inert here. */
@@ -91,8 +97,6 @@ uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin,
       return g_provide_fail ? NULL : g_provide_buf; }
 uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *c, int uni)
     { (void)c; return uni ? g_next_uni++ : g_next_bidi++; }
-int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
-    { (void)c; (void)sid; (void)ctx; return 0; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
     { (void)c; (void)sid; return 0x42; }
 /* g_reset_fail makes picoquic refuse a plain RESET_STREAM as well. */

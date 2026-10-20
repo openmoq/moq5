@@ -33,6 +33,7 @@
 #include <picoquic_utils.h>
 
 #include "../../../tests/unit/test_binding_support.h"
+#include "support/pq_attach_refusal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,11 +50,23 @@ static const char *scenario = "reliable_reset";
 
 #define RUNS 10
 
+/* The setup step a sim pair last entered; a failed setup stops at it. */
+typedef enum {
+    SIM_TRANSPORT = 1,   /* test QUIC context and client connection */
+    SIM_SESSION,         /* client MoQ session */
+    SIM_ATTACH,          /* client adapter constructor */
+    SIM_CONNECT,         /* QUIC handshake and server attach */
+    SIM_READY
+} sim_phase_t;
+
 typedef struct {
     picoquic_test_tls_api_ctx_t *test_ctx;
     uint64_t now;
     uint64_t loss;
     moq_version_t version;
+    sim_phase_t phase;
+    picoquic_stream_data_cb_fn pre_attach_cb;   /* client callback owner */
+    void *pre_attach_ctx;                       /* before the constructor */
     uint32_t server_fills;
 
     moq_session_t *client_session;
@@ -116,6 +129,7 @@ static int sim_setup(pq_sim_t *s, uint8_t cid_byte, moq_version_t version,
     picoquic_connection_id_t cid = {
         .id = {0x6d, 0x72, 0x72, cid_byte, 0, 0, 0, 0}, .id_len = 8
     };
+    s->phase = SIM_TRANSPORT;
     if (tls_api_init_ctx_ex(&s->test_ctx, PICOQUIC_INTERNAL_TEST_VERSION_1,
                             PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &s->now,
                             NULL, NULL, 0, 1, 0, &cid) != 0)
@@ -131,13 +145,19 @@ static int sim_setup(pq_sim_t *s, uint8_t cid_byte, moq_version_t version,
         picoquic_set_transport_parameters(s->test_ctx->cnx_client, &tp);
         picoquic_set_default_tp_value(s->test_ctx->qserver, picoquic_tp_reset_stream_at, 1);
     }
+    s->phase = SIM_SESSION;
     if (sim_create_session(s, MOQ_PERSPECTIVE_CLIENT, &s->client_session) != 0) return -1;
+    s->phase = SIM_ATTACH;
+    s->pre_attach_cb = picoquic_get_callback_function(s->test_ctx->cnx_client);
+    s->pre_attach_ctx = picoquic_get_callback_context(s->test_ctx->cnx_client);
     if (sim_attach_conn(s->client_session, s->test_ctx->cnx_client, &s->client_conn) != 0)
         return -1;
+    s->phase = SIM_CONNECT;
     picoquic_set_default_callback(s->test_ctx->qserver, sim_server_cb, s);
     if (picoquic_start_client_cnx(s->test_ctx->cnx_client) != 0) return -1;
     if (tls_api_connection_loop(s->test_ctx, &s->loss, 0, &s->now) != 0) return -1;
     if (s->server_create_failed || !s->server_conn) return -1;
+    s->phase = SIM_READY;
     return 0;
 }
 
@@ -314,11 +334,11 @@ static int run_failed_fill(uint8_t cid, bool reliable)
  * proof of transmission; a reset beyond the peer's stream credit is queued
  * later). The provider's ACK-boundary rows (empty and last-byte reliable
  * prefixes) are pinned by test_pq_reset_after_fin.c. */
-static void check_reset_frame_type(uint64_t prefix)
+static void check_reset_frame_type(uint64_t prefix, moq_version_t v)
 {
     pq_sim_t s;
     scenario = prefix == 0 ? "prefix_zero" : "prefix_last_byte";
-    if (sim_setup(&s, 0x70, MOQ_VERSION_DRAFT_22, true, 0) != 0 ||
+    if (sim_setup(&s, 0x70, v, true, 0) != 0 ||
         sim_handshake(&s) != 0) {
         CHECK(false); sim_cleanup(&s); return;
     }
@@ -347,15 +367,79 @@ static void check_reset_frame_type(uint64_t prefix)
     sim_cleanup(&s);
 }
 
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+#define SIM_HAVE_D22 1
+#else
+#define SIM_HAVE_D22 0     /* draft-22 refuses to attach to this provider */
+#endif
+
+/* A setup that failed at the client adapter's constructor with every earlier
+ * step in place, leaving the connection's callback with its owner. */
+static bool sim_refused_at_attach(const pq_sim_t *s, int rc)
+{
+    return rc == -1 && s->phase == SIM_ATTACH && s->test_ctx != NULL &&
+           s->client_session != NULL && s->client_conn == NULL &&
+           s->server_session == NULL && s->server_conn == NULL &&
+           picoquic_get_callback_function(s->test_ctx->cnx_client) == s->pre_attach_cb &&
+           picoquic_get_callback_context(s->test_ctx->cnx_client) == s->pre_attach_ctx;
+}
+
+#if !SIM_HAVE_D22
+/* Without the provider's stream terminal contract draft-22 refuses at the
+ * constructor, and only there: the documented -1, *out cleared, nothing
+ * allocated, no callback taken; the same connection accepts draft-16. */
+static void check_d22_refused(void)
+{
+    pq_sim_t s;
+    scenario = "d22_refused";
+    int rc = sim_setup(&s, 0x71, MOQ_VERSION_DRAFT_22, true, 0);
+    CHECK(sim_refused_at_attach(&s, rc));
+    if (s.phase == SIM_ATTACH && s.client_session != NULL) {
+        pq_sim_t d16;
+        memset(&d16, 0, sizeof(d16));
+        d16.version = MOQ_VERSION_DRAFT_16;
+        moq_session_t *ok = NULL;
+        CHECK(sim_create_session(&d16, MOQ_PERSPECTIVE_CLIENT, &ok) == 0);
+        const char *why = pq_check_constructor_refusal(s.test_ctx->cnx_client,
+                                                       s.client_session, ok);
+        if (why) fprintf(stderr, "d22_refused: %s\n", why);
+        CHECK(why == NULL);
+        if (ok) moq_session_destroy(ok);
+    }
+    sim_cleanup(&s);
+}
+#endif
+
+/* A setup failure before the constructor is not the capability refusal. */
+static void check_unrelated_setup_failure(void)
+{
+    pq_sim_t s;
+    scenario = "unrelated_setup_failure";
+    int rc = sim_setup(&s, 0x72, (moq_version_t)17, true, 0);   /* no such profile */
+    CHECK(rc == -1);
+    CHECK(s.phase == SIM_SESSION);
+    CHECK(!sim_refused_at_attach(&s, rc));
+    sim_cleanup(&s);
+}
+
 int main(void)
 {
-    check_reset_frame_type(0);
-    check_reset_frame_type(5);
+    /* The frame type is the provider's; any session that attaches carries
+     * the reset. */
+    moq_version_t frame_v = SIM_HAVE_D22 ? MOQ_VERSION_DRAFT_22
+                                         : MOQ_VERSION_DRAFT_16;
+    check_reset_frame_type(0, frame_v);
+    check_reset_frame_type(5, frame_v);
+#if !SIM_HAVE_D22
+    check_d22_refused();
+#endif
+    check_unrelated_setup_failure();
     static const struct { const char *name; moq_version_t v; } dc[] = {
         { "done_count_d16", MOQ_VERSION_DRAFT_16 },
         { "done_count_d22", MOQ_VERSION_DRAFT_22 },
     };
     for (size_t i = 0; i < sizeof(dc) / sizeof(dc[0]); i++) {
+        if (dc[i].v == MOQ_VERSION_DRAFT_22 && !SIM_HAVE_D22) continue;
         for (int reliable = 1; reliable >= 0; reliable--) {
             scenario = dc[i].name;
             int got = 0;
@@ -366,7 +450,7 @@ int main(void)
             if (reliable) CHECK(got == RUNS);
         }
     }
-    for (int reliable = 1; reliable >= 0; reliable--) {
+    for (int reliable = 1; reliable >= 0 && SIM_HAVE_D22; reliable--) {
         scenario = "failed_fill_d22";
         int got = 0;
         for (int r = 0; r < RUNS; r++)

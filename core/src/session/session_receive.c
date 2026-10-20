@@ -1,4 +1,5 @@
 #include "session_internal.h"
+#include "../bridge/transport_bridge_internal.h"
 #include "../base/rcbuf_internal.h"
 
 /* -- Receive data stream pool -------------------------------------- */
@@ -3172,4 +3173,42 @@ void rx_fill_stopped(moq_session_t *s, moq_stream_ref_t ref)
     rx->stop_consumes_cancel_tomb = false;
     rx->reset_owed = false;
     rx->parse_state = MOQ_RX_STOPPED;
+}
+
+/* -- Local receive retirement --------------------------------------- *
+ * The bridge's half is in transport_bridge.c. A stream this side stopped is
+ * kept, as a STOPPED entry or an identity-only record, until the peer's FIN
+ * or RESET; once the transport reports it finished with the stream after our
+ * accepted STOP, neither will come. Release the owner then -- no event, no
+ * FIN fact (rx_note_finished_ref is the peer's FIN only), no reset cause. A
+ * still-bound entry is a processed stream for its binding's Stream Count,
+ * counted once here exactly as the peer's terminal would have counted it; an
+ * identity-only record lost its binding and counts nothing. A bound fill
+ * child's stream is settled locally, keeping its cancellation's reason. */
+moq_result_t bridge_session_on_data_retired(moq_session_t *s,
+                                            moq_stream_ref_t ref,
+                                            uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+
+    int slot = rx_find_by_ref(s, ref);
+    if (slot >= 0) {
+        moq_rx_stream_t *rx = &s->rx_streams[slot];
+        if (rx->parse_state != MOQ_RX_STOPPED) return MOQ_ERR_WRONG_STATE;
+        bool fill = rx->fill_bound;
+        if (fill) fill_rx_local_retired(s, rx);
+        rx_record_terminal_processed(s, slot);
+        rx_free_entry(s, (size_t)slot);
+        if (fill) fill_service(s);
+        return MOQ_OK;
+    }
+    int stopped = rx_stopped_ref_find(s, ref._v);
+    if (stopped >= 0) {
+        rx_stopped_ref_remove(s, stopped);
+        return MOQ_OK;
+    }
+    return MOQ_ERR_STALE_HANDLE;
 }

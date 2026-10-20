@@ -294,8 +294,11 @@ or that the native stamped prefixes (event, description, nested `info` and
 integers. `TrackEvent.largest` / `expires_ms` are `UPDATE_OK` observations,
 `parse_drop` a coalesced `PARSE_DROP` snapshot.
 
-`TrackEvent.kind_extended` adds `ExtendedTrackEventKind.LOCAL_FAILURE` and
-`FILL_TERMINAL`. The original `TrackEventKind` members and `kind` enum/int
+`TrackEvent.kind_extended` adds `ExtendedTrackEventKind.LOCAL_FAILURE`,
+`UPDATE_LOCAL_FAILURE`, `DELIVERY_LOCAL_FAILURE` and `FILL_TERMINAL`.
+`UPDATE_LOCAL_FAILURE` reports a permanent local UPDATE admission refusal;
+ordinary capacity pressure and outstanding responses are retried instead.
+The original `TrackEventKind` members and `kind` enum/int
 behavior are unchanged. `local_result` is the exact signed local failure,
 not a fabricated peer END_OF_TRACK. `track_state_extended(track)` names the
 corresponding `ExtendedTrackState.FAILED`, while `track_state()` preserves

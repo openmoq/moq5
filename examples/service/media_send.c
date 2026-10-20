@@ -8,8 +8,9 @@
  * IMPORTANT: the payloads here are placeholder bytes, NOT a real codec
  * bitstream. This example demonstrates the service SEND LIFECYCLE -- connect,
  * attach, add track, write in decode order with typed timing, clean teardown
- * -- and the service generates the LOC-01 property block from the typed
- * fields. A real sender supplies encoded access units (e.g. H.264 AUs) as the
+ * -- and the service generates the companion's LOC property block from the
+ * typed fields (LOC-01 on drafts 16/18, LOC-04 on draft-22 under AUTO).
+ * A real sender supplies encoded access units (e.g. H.264 AUs) as the
  * payload; everything else stays the same.
  *
  * Usage: media_send <url> <namespace> [track] [--insecure-skip-verify]
@@ -159,14 +160,11 @@ int main(int argc, char **argv)
 
     /* Decoder init config. A real sender passes the encoder's extradata here
      * -- e.g. H.264/HEVC SPS/PPS/VPS, an AAC AudioSpecificConfig, or a CMAF
-     * init segment. How the service publishes it depends on packaging:
-     *   - RAW/LOC (this example): the init bytes are base64'd INLINE on the
-     *     catalog track entry.
-     *   - CMAF: the init segment is published in the catalog's MSF-01
-     *     initDataList and the track points at it via initRef. The emitter
-     *     deduplicates: tracks whose CMAF init segment bytes are identical
-     *     share one initDataList entry, whose id is the name of the first
-     *     track that introduced that init segment.
+     * init segment. Under AUTO, the draft-22 companion carries every track's
+     * init bytes in the catalog's root initDataList, referenced by initRef.
+     * The legacy companion on drafts 16/18 keeps RAW/LOC init bytes inline on
+     * the track entry; CMAF and MPEG-TS use initDataList/initRef there too.
+     * Tracks with identical init bytes share a list entry with a stable id.
      * Either way the receiver resolves it to desc.init_data at TRACK_ADDED; it
      * is NOT per-object LOC metadata. These are placeholder bytes (the payloads
      * below are placeholders too); leave init_data empty if the codec carries

@@ -48,7 +48,15 @@ struct moq_pq_conn {
      * the attach contract (see <moq/picoquic.h>), and a change of this value
      * found by a service pass fails the connection closed. */
     uint64_t                    tp_max_streams_uni;
+#ifdef MOQ_PICOQUIC_TESTING
+    uint64_t                    release_terminals;   /* test witness */
+#endif
 };
+
+#ifdef MOQ_PICOQUIC_TESTING
+static int g_pq_test_fail_stream_ctx = 0;
+void (*moq_pq_test_terminal_observer)(moq_pq_conn_t *, uint64_t) = NULL;
+#endif
 
 /* -- Per-stream receive backpressure --------------------------------- *
  * Raw picoquic auto-grows each stream's receive window as bytes are consumed
@@ -140,6 +148,16 @@ typedef struct pq_rx_stream {
     bool     held_input;
     bool     held_fin;
     size_t   held_len;
+    /* This adapter STOPped the receive half and neither its FIN nor a RESET
+     * has reached the adapter. From the STOP on picoquic delivers no more
+     * bytes and no FIN, only a RESET, so for a peer that ends the stream with
+     * its FIN the stream's release is the one remaining signal: the stream
+     * carries this connection as its picoquic context to receive it
+     * (pq_rx_on_release). */
+    bool     release_watch;
+    /* picoquic released the stream while retained bytes were still owed to
+     * the bridge: its terminal follows them (pq_rx_after_service). */
+    bool     released;
     bool     active;
 } pq_rx_stream_t;
 
@@ -247,6 +265,20 @@ static void pq_rx_drop(moq_pq_conn_t *c, uint64_t stream_id)
     memset(st, 0, sizeof(*st));   /* active = false */
 }
 
+/* Attach `ctx` as picoquic's context for a stream. A refusal is reported, so
+ * a stopped receive half is never left without the signal that ends it. */
+static int pq_set_stream_ctx(moq_pq_conn_t *c, uint64_t stream_id, void *ctx)
+{
+#ifdef MOQ_PICOQUIC_TESTING
+    if (g_pq_test_fail_stream_ctx > 0) {
+        g_pq_test_fail_stream_ctx--;
+        return -1;
+    }
+#endif
+    if (c->cnx == NULL) return -1;
+    return picoquic_set_app_stream_ctx(c->cnx, stream_id, ctx) == 0 ? 0 : -1;
+}
+
 /* Asked before a STOP_SENDING (pq_endpoint_ctx_t.rx_terminal_discard). True
  * only for a stream this adapter still holds a refused chunk of whose receive
  * half its own record shows terminal at the transport: the held chunk carried
@@ -269,14 +301,58 @@ static bool pq_rx_terminal_discard(void *owner, uint64_t stream_id)
 /* Told after an accepted STOP_SENDING (pq_endpoint_ctx_t.rx_stopped): the
  * cancellation discharges a held chunk, so it and anything retained behind it
  * are dropped and no later service pass redelivers them. A stream the session
- * itself stops keeps its state: its remaining bytes and FIN still settle the
- * bridge's discarding entry. */
-static void pq_rx_stopped(void *owner, uint64_t stream_id)
+ * itself stops keeps its state: what the adapter retained still settles the
+ * bridge's discarding entry, and when that does not include the FIN the
+ * stream is watched for picoquic's release (release_watch). Nonzero when the
+ * watch cannot be attached. */
+static int pq_rx_stopped(void *owner, uint64_t stream_id)
 {
     moq_pq_conn_t *c = (moq_pq_conn_t *)owner;
     pq_rx_stream_t *st = pq_rx_find(c, stream_id);
-    if (st != NULL && st->held_input)
+    if (st == NULL) {
+        /* A bidi whose receive half delivered nothing yet still owes its
+         * whole-stream end; an untracked uni already reported its own. */
+        if (!PICOQUIC_IS_BIDIR_STREAM_ID(stream_id)) return 0;
+        st = pq_rx_get(c, stream_id, PQ_RX_BIDI);
+        if (st == NULL) return -1;
+        if (pq_set_stream_ctx(c, stream_id, c) != 0) {
+            pq_rx_drop(c, stream_id);
+            return -1;
+        }
+        st->release_watch = true;
+        return 0;
+    }
+    if (st->held_input) {
         pq_rx_drop(c, stream_id);
+        return 0;
+    }
+    if (st->buf_fin || st->fin_blocked) return 0;
+    if (pq_set_stream_ctx(c, stream_id, c) != 0) return -1;
+    st->release_watch = true;
+    return 0;
+}
+
+/* Told after a call that cleared picoquic's context for the stream
+ * (pq_endpoint_ctx_t.rx_rebind): a watched stopped receive half gets its
+ * mark back. */
+static int pq_rx_rebind(void *owner, uint64_t stream_id)
+{
+    moq_pq_conn_t *c = (moq_pq_conn_t *)owner;
+    pq_rx_stream_t *st = pq_rx_find(c, stream_id);
+    if (st == NULL || !st->release_watch) return 0;
+    return pq_set_stream_ctx(c, stream_id, c);
+}
+
+/* Withdraw the mark of every stopped receive half from picoquic before the
+ * adapter lets go of the connection, so no release names it afterwards. */
+static void pq_rx_unbind_all(moq_pq_conn_t *c, picoquic_cnx_t *cnx)
+{
+    for (size_t i = 0; i < c->rx_count; i++) {
+        if (c->rx[i].active && c->rx[i].release_watch) {
+            picoquic_unlink_app_stream_ctx(cnx, c->rx[i].stream_id);
+            c->rx[i].release_watch = false;
+        }
+    }
 }
 
 static void pq_rx_free_all(moq_pq_conn_t *c)
@@ -477,6 +553,41 @@ static int pq_rx_on_data(moq_pq_conn_t *c, uint64_t sid, pq_rx_kind_t kind,
     return 0;
 }
 
+/* The stream's whole terminal goes to the bridge: picoquic has retired it,
+ * both directions over at the transport. That fact names no cause -- FIN or
+ * RESET -- commits no bytes, and says nothing about our own sends having
+ * been received; the bridge and session decide what it settles. */
+static void pq_rx_report_terminal(moq_pq_conn_t *c, uint64_t sid, uint64_t now)
+{
+#ifdef MOQ_PICOQUIC_TESTING
+    c->release_terminals++;
+    if (moq_pq_test_terminal_observer) moq_pq_test_terminal_observer(c, sid);
+#endif
+    (void)moq_transport_bridge_on_peer_stream_terminal(c->bridge, sid, now);
+}
+
+/* picoquic retired a stream that carries this connection as its context.
+ * The adapter lets go of its own record of a watched stream, after any bytes
+ * it still owes the bridge for it: a stream still paused keeps them, and its
+ * terminal follows their replay. A stream the adapter tracks without a watch
+ * keeps its record -- the release alone ends nothing the adapter owns.
+ * Nothing is reported once the connection is on its way out. */
+static void pq_rx_on_release(moq_pq_conn_t *c, picoquic_cnx_t *cnx,
+                             uint64_t sid, uint64_t now)
+{
+    if (picoquic_get_cnx_state(cnx) >= picoquic_state_disconnecting) return;
+    pq_rx_stream_t *st = pq_rx_find(c, sid);
+    if (st != NULL && st->release_watch) {
+        st->release_watch = false;
+        if (st->paused) {
+            st->released = true;
+            return;
+        }
+        pq_rx_drop(c, sid);
+    }
+    pq_rx_report_terminal(c, sid, now);
+}
+
 /* After service() drained retained bridge work: for each paused stream whose
  * pending state cleared, replay any bytes retained while it was paused and, if
  * that drains too, resume the window. Called on the picoquic loop thread. */
@@ -580,6 +691,13 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
         }
 
         st->paused = false;
+        if (st->released) {
+            /* picoquic retired the stream while these bytes were owed. */
+            uint64_t sid = st->stream_id;
+            pq_rx_drop(c, sid);
+            pq_rx_report_terminal(c, sid, now);
+            continue;
+        }
         if (pq_rx_refresh_credit(c, st) != 0) {   /* released credit: advance */
             moq_transport_bridge_on_transport_error(c->bridge, 0, now);
             return;
@@ -625,7 +743,45 @@ bool moq_pq_test_rx_state(moq_pq_conn_t *conn, uint64_t stream_id,
     out->held_fin = st->held_fin;
     out->buf_len = st->buf_len;
     out->buf = st->buf;
+    out->release_watch = st->release_watch;
+    out->released = st->released;
     return true;
+}
+
+const void *moq_pq_test_rx_base(moq_pq_conn_t *conn)
+{
+    return conn->rx;
+}
+
+bool moq_pq_test_bridge_pending(moq_pq_conn_t *conn, uint64_t stream_id)
+{
+    return moq_transport_bridge_stream_has_pending(conn->bridge, stream_id);
+}
+
+size_t moq_pq_test_rx_active(moq_pq_conn_t *conn)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < conn->rx_count; i++)
+        n += conn->rx[i].active;
+    return n;
+}
+
+void moq_pq_test_endpoint(moq_pq_conn_t *conn,
+                          const moq_transport_endpoint_ops_t **ops,
+                          void **ctx)
+{
+    *ops = &conn->endpoint_ops;
+    *ctx = &conn->endpoint_ctx;
+}
+
+void moq_pq_test_fail_stream_ctx(int n)
+{
+    g_pq_test_fail_stream_ctx = n;
+}
+
+uint64_t moq_pq_test_release_terminals(moq_pq_conn_t *conn)
+{
+    return conn->release_terminals;
 }
 #endif
 
@@ -727,6 +883,7 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
     }
     c->endpoint_ctx.rx_terminal_discard = pq_rx_terminal_discard;
     c->endpoint_ctx.rx_stopped = pq_rx_stopped;
+    c->endpoint_ctx.rx_rebind = pq_rx_rebind;
     c->endpoint_ctx.rx_owner = c;
 #ifdef MOQ_PICOQUIC_TESTING
     if (g_pq_test_hold_bidi)
@@ -759,8 +916,10 @@ void moq_pq_conn_destroy(moq_pq_conn_t *conn)
      * touching it here would be a use-after-free. The live case is the raw
      * facade's contract and must not regress: a caller-owned client cnx
      * outlives its adapter and MUST be unbound on destroy. */
-    if (conn->cnx)
+    if (conn->cnx) {
+        pq_rx_unbind_all(conn, conn->cnx);
         picoquic_set_callback(conn->cnx, NULL, NULL);
+    }
     pq_rx_free_all(conn);
     moq_transport_bridge_destroy(conn->bridge);
     pq_endpoint_cleanup(&conn->endpoint_ctx);
@@ -842,6 +1001,7 @@ void moq_pq_conn_get_send_stats(const moq_pq_conn_t *c,
 static void pq_release_cnx(moq_pq_conn_t *c, picoquic_cnx_t *cnx)
 {
     if (!c || !c->cnx) return;          /* idempotent */
+    pq_rx_unbind_all(c, cnx);
     picoquic_set_callback(cnx, NULL, NULL);
     c->cnx = NULL;
     c->endpoint_ctx.cnx = NULL;         /* every endpoint op dereferences this */
@@ -932,7 +1092,6 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
         return 0;
     }
     uint64_t now = pq_now_us(cnx);
-    (void)stream_ctx;
 
     switch (event) {
     case picoquic_callback_stream_data:
@@ -988,7 +1147,11 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
     case picoquic_callback_stream_reset: {
         uint64_t error_code = picoquic_get_remote_stream_error(
             cnx, stream_id);
-        /* Abandon any retained/paused receive state: the stream is gone. */
+        /* Abandon any retained/paused receive state: the stream is gone. A
+         * stopped half owed its end has it now, so its mark goes too. */
+        pq_rx_stream_t *rst = pq_rx_find(c, stream_id);
+        if (rst != NULL && rst->release_watch)
+            picoquic_unlink_app_stream_ctx(cnx, stream_id);
         pq_rx_drop(c, stream_id);
         moq_transport_bridge_on_peer_stream_reset(
             c->bridge, stream_id, error_code, now);
@@ -1014,6 +1177,11 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
         moq_transport_bridge_on_local_stream_committed(c->bridge, stream_id, now);
         break;
 #endif
+
+    case picoquic_callback_stream_released:
+        if (stream_ctx == (void *)c)
+            pq_rx_on_release(c, cnx, stream_id, now);
+        break;
 
     case picoquic_callback_datagram:
         moq_transport_bridge_on_peer_datagram(

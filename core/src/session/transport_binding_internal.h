@@ -32,9 +32,15 @@ bool moq_binding_sends_target(const moq_session_t *s);
  * with *reason set. Side-effect free apart from the policy call, which may
  * run again if the SETUP has to be retried before it commits.
  */
+typedef struct moq_binding_peer_target {
+    bool        has_path;
+    bool        has_authority;
+    moq_bytes_t path;        /* read only when has_path */
+    moq_bytes_t authority;   /* read only when has_authority */
+} moq_binding_peer_target_t;
+
 uint64_t moq_binding_judge_peer_target(const moq_session_t *s,
-                                       bool has_path, moq_bytes_t path,
-                                       bool has_authority, moq_bytes_t authority,
+                                       const moq_binding_peer_target_t *target,
                                        const char **reason);
 
 #endif

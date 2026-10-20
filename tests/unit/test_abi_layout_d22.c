@@ -1002,7 +1002,7 @@ PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           track_properties);
 PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           dynamic_groups);
-PIN_AFTER(moq_media_track_cfg_t, dynamic_groups, group_order);
+PIN_AFTER(moq_media_track_cfg_t, label, group_order);
 _Static_assert(offsetof(moq_media_track_cfg_t, track_properties) ==
                ABI_SIZEOF_THROUGH(moq_media_track_cfg_t,
                                   mpeg2ts_forward_before_random_access),

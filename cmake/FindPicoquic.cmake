@@ -91,8 +91,10 @@ endfunction()
 #
 # With FROM_PREFIX (installed CONFIG package or an existing picoquic target)
 # and a MOQ_PICOTLS_PREFIX, both follow that prefix under the same derived /
-# explicit rule as source-tree mode (see _moq_pq_ptls_select). In source-tree
-# mode they were already selected before picoquic was added.
+# explicit rule as source-tree mode (see _moq_pq_ptls_select). A picoquic
+# target that links a picotls built in this tree follows that picotls instead
+# (_moq_pq_ptls_built_by). In source-tree mode they were already selected
+# when picoquic was added.
 function(_moq_pq_resolve_ptls)
     if("${ARGV0}" STREQUAL "FROM_PREFIX" AND MOQ_PICOTLS_PREFIX)
         _moq_pq_ptls_dirs_from_prefix()
@@ -188,12 +190,17 @@ function(_moq_pq_ptls_find_lib name dirs out_var)
     set(${out_var} "${found}" PARENT_SCOPE)
 endfunction()
 
-# Selects cache entry `var` (of `type`) from `candidate`, the prefix's own
-# file or "" when the prefix lacks it. `what` names it in diagnostics.
-function(_moq_pq_ptls_select var type candidate required what doc)
+# Sets <out_var> TRUE when cache entry `var` is an explicit caller selection
+# (see above), FALSE when it is derived or absent. The value judged is the
+# variable's visible value, or [VALUE <value>] (its cache entry's, say).
+function(_moq_pq_ptls_classify var out_var)
+    cmake_parse_arguments(_c "" "VALUE" "" ${ARGN})
     set(record _MOQ_PQ_PTLS_SELECTED_${var})
     set(explicit_record _MOQ_PQ_PTLS_EXPLICIT_${var})
     set(current "${${var}}")
+    if(DEFINED _c_VALUE)
+        set(current "${_c_VALUE}")
+    endif()
     set(explicit FALSE)
     if(current STREQUAL "" OR current MATCHES "-NOTFOUND$")
         unset(${explicit_record} CACHE)
@@ -211,6 +218,20 @@ function(_moq_pq_ptls_select var type candidate required what doc)
             endif()
         endif()
     endif()
+    set(${out_var} ${explicit} PARENT_SCOPE)
+endfunction()
+
+# Selects cache entry `var` (of `type`) from `candidate`, the selected
+# picotls's own file or "" when it lacks one. `what` names it in diagnostics;
+# _moq_pq_ptls_authority, when the caller sets it, names the selected picotls.
+function(_moq_pq_ptls_select var type candidate required what doc)
+    set(record _MOQ_PQ_PTLS_SELECTED_${var})
+    set(explicit_record _MOQ_PQ_PTLS_EXPLICIT_${var})
+    set(current "${${var}}")
+    if(NOT DEFINED _moq_pq_ptls_authority)
+        set(_moq_pq_ptls_authority "MOQ_PICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}")
+    endif()
+    _moq_pq_ptls_classify(${var} explicit)
 
     if(explicit)
         if(candidate)
@@ -219,10 +240,9 @@ function(_moq_pq_ptls_select var type candidate required what doc)
             if(NOT chosen STREQUAL provided)
                 message(FATAL_ERROR
                     "${var}=${current} conflicts with "
-                    "MOQ_PICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}, whose ${what} is "
+                    "${_moq_pq_ptls_authority}, whose ${what} is "
                     "${candidate}. Name one picotls: drop the override "
-                    "(-U${var}) or point MOQ_PICOTLS_PREFIX at the tree it "
-                    "belongs to.")
+                    "(-U${var}) or select the picotls it belongs to.")
             endif()
         elseif(NOT EXISTS "${current}")
             message(FATAL_ERROR "${var}=${current} does not exist")
@@ -241,7 +261,7 @@ function(_moq_pq_ptls_select var type candidate required what doc)
         unset(${record} CACHE)
         if(required)
             message(FATAL_ERROR
-                "MOQ_PICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX} provides no ${what}; "
+                "${_moq_pq_ptls_authority} provides no ${what}; "
                 "pass -D${var}=<path> to name it explicitly.")
         endif()
     endif()
@@ -333,6 +353,286 @@ function(_moq_pq_ptls_from_prefix)
         "library directory" "picotls library directory (libpicotls-*.a)")
 
     set(_moq_ptls_build_form ${build_form} PARENT_SCOPE)
+endfunction()
+
+# -- picotls built in this tree (PICOQUIC_FETCH_PTLS) ----------------------
+#
+# With PICOQUIC_FETCH_PTLS picoquic builds picotls itself through
+# FetchContent. That picotls is identified by the build, not by global
+# FetchContent state: _moq_pq_ptls_built_by reports the source of the
+# picotls-core target a given picoquic target actually links (directly or
+# through an alias), and only such a target selects it. Its selections follow
+# it under the derived/explicit rule above:
+#   PTLS_INCLUDE_DIR   <picotls source>/include. When FindPicoquic adds
+#                      picoquic, MoqPicotlsProjectPolicy.cmake selects it
+#                      inside picotls's project(), before picoquic's FindPTLS
+#                      needs it; it is checked again against the targets.
+#   MOQ_PTLS_LIB_DIR   the one directory the picotls archives the
+#                      pkg-config closure names (core, minicrypto, and
+#                      openssl when built) are written to, for the
+#                      configuration being built. Where that directory is not
+#                      known at configure time -- multi-config generators,
+#                      generator expressions, targets written to different
+#                      directories, unsupported artifact types -- nothing is
+#                      selected, MOQ_PTLS_LIB_DIR_UNRESOLVED records why, and
+#                      an explicit MOQ_PTLS_LIB_DIR is refused because it
+#                      cannot be checked. The generated pkg-config closure
+#                      then names the picotls libraries without a search
+#                      directory for them: not a complete export.
+#   PTLS_*_LIBRARY     no file selection: picoquic links the picotls
+#                      targets. Derived cache entries are dropped; an explicit
+#                      one naming anything else is refused. The values the
+#                      fetched FindPTLS sets (the target names), cached or
+#                      inherited from an enclosing directory, are accepted.
+# A MOQ_PICOTLS_PREFIX that names another picotls tree is refused.
+
+# Sets <out_var> to the real (non-alias) name of target <name>, or "" when
+# <name> is not a target.
+function(_moq_pq_real_target name out_var)
+    set(${out_var} "" PARENT_SCOPE)
+    if(NOT TARGET "${name}")
+        return()
+    endif()
+    get_target_property(aliased "${name}" ALIASED_TARGET)
+    if(aliased)
+        set(${out_var} "${aliased}" PARENT_SCOPE)
+    else()
+        set(${out_var} "${name}" PARENT_SCOPE)
+    endif()
+endfunction()
+
+# Sets <out_var> to the source directory of the in-tree picotls-core that
+# <target> links, or "" when it links none (an imported or prebuilt-linked
+# picoquic, or a picoquic target that does not exist).
+function(_moq_pq_ptls_built_by target out_var)
+    set(${out_var} "" PARENT_SCOPE)
+    _moq_pq_real_target("${target}" target)
+    if(NOT target OR NOT TARGET picotls-core)
+        return()
+    endif()
+    get_target_property(imported ${target} IMPORTED)
+    get_target_property(ptls_imported picotls-core IMPORTED)
+    if(imported OR ptls_imported)
+        return()
+    endif()
+    set(items "")
+    foreach(prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+        get_target_property(value ${target} ${prop})
+        if(value)
+            list(APPEND items ${value})
+        endif()
+    endforeach()
+    foreach(item IN LISTS items)
+        string(REGEX REPLACE "^\\$<LINK_ONLY:(.*)>$" "\\1" item "${item}")
+        _moq_pq_real_target("${item}" real)
+        if(real STREQUAL "picotls-core")
+            get_target_property(source picotls-core SOURCE_DIR)
+            set(${out_var} "${source}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+endfunction()
+
+# Validates a picotls source tree and that a MOQ_PICOTLS_PREFIX names it too.
+function(_moq_pq_ptls_check_source source)
+    if(NOT EXISTS "${source}/include/picotls/minicrypto.h")
+        message(FATAL_ERROR
+            "the picotls picoquic builds (PICOQUIC_FETCH_PTLS) has no "
+            "include/picotls/minicrypto.h: ${source}")
+    endif()
+    get_filename_component(real "${source}" REALPATH)
+    if(MOQ_PICOTLS_PREFIX)
+        get_filename_component(prefix "${MOQ_PICOTLS_PREFIX}" REALPATH)
+        get_filename_component(prefix_parent "${MOQ_PICOTLS_PREFIX}/.." REALPATH)
+        if(NOT prefix STREQUAL real AND NOT prefix_parent STREQUAL real)
+            message(FATAL_ERROR
+                "MOQ_PICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX} names a different picotls "
+                "than the one picoquic builds with PICOQUIC_FETCH_PTLS (${real}). "
+                "Point both at the same picotls, or drop MOQ_PICOTLS_PREFIX.")
+        endif()
+    endif()
+endfunction()
+
+# Selects PTLS_INCLUDE_DIR from the picotls source tree <source>.
+function(_moq_pq_ptls_headers_from_source source)
+    _moq_pq_ptls_check_source("${source}")
+    get_filename_component(real "${source}" REALPATH)
+    set(_moq_pq_ptls_authority
+        "the picotls picoquic builds (PICOQUIC_FETCH_PTLS, ${real})")
+    _moq_pq_ptls_select(PTLS_INCLUDE_DIR PATH "${real}/include" TRUE
+        "headers (picotls/minicrypto.h)"
+        "picotls include directory (picotls/minicrypto.h)")
+endfunction()
+
+# Sets <out_var> TRUE when <value> names target <target> (itself or an alias).
+function(_moq_pq_names_target value target out_var)
+    set(${out_var} FALSE PARENT_SCOPE)
+    if(value STREQUAL target)
+        set(${out_var} TRUE PARENT_SCOPE)
+        return()
+    endif()
+    _moq_pq_real_target("${value}" real)
+    if(real STREQUAL target)
+        set(${out_var} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
+# PTLS_<lib>_LIBRARY when picoquic links picotls target <target>: the cache
+# entry is judged first (an inherited normal variable must not hide it), then
+# any normal variable visible from an enclosing directory.
+function(_moq_pq_ptls_fetched_library var target)
+    if(DEFINED CACHE{${var}})
+        set(cached "$CACHE{${var}}")
+        _moq_pq_names_target("${cached}" ${target} matches)
+        if(NOT matches)
+            set(explicit FALSE)
+            if(NOT cached STREQUAL "" AND NOT cached MATCHES "-NOTFOUND$")
+                _moq_pq_ptls_classify(${var} explicit VALUE "${cached}")
+            endif()
+            if(explicit)
+                message(FATAL_ERROR
+                    "${var}=${cached} is set, but picoquic links the picotls "
+                    "targets it builds (${_moq_pq_ptls_authority}); drop it "
+                    "(-U${var}).")
+            endif()
+            unset(${var} CACHE)
+            unset(_MOQ_PQ_PTLS_SELECTED_${var} CACHE)
+            unset(_MOQ_PQ_PTLS_EXPLICIT_${var} CACHE)
+        endif()
+    endif()
+    if(DEFINED ${var})
+        set(value "${${var}}")
+        if(NOT value STREQUAL "" AND NOT value MATCHES "-NOTFOUND$")
+            _moq_pq_names_target("${value}" ${target} matches)
+            if(NOT matches)
+                message(FATAL_ERROR
+                    "${var}=${value}, visible from an enclosing directory, names "
+                    "something other than the picotls target picoquic links "
+                    "(${target}, ${_moq_pq_ptls_authority}); unset it where it "
+                    "is set.")
+            endif()
+        endif()
+    endif()
+endfunction()
+
+# Sets <out_dir> to the directory target <target>'s linkable artifact is
+# written to for the configuration being built, or leaves it "" and sets
+# <out_reason> when that is not known at configure time.
+function(_moq_pq_ptls_output_dir target out_dir out_reason)
+    set(${out_dir} "" PARENT_SCOPE)
+    set(${out_reason} "" PARENT_SCOPE)
+    get_property(multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(multi_config)
+        set(${out_reason} "multi-config generator" PARENT_SCOPE)
+        return()
+    endif()
+    get_target_property(type ${target} TYPE)
+    if(type STREQUAL "STATIC_LIBRARY")
+        set(kind ARCHIVE)
+    elseif(type STREQUAL "SHARED_LIBRARY")
+        if(DEFINED CMAKE_IMPORT_LIBRARY_SUFFIX AND NOT CMAKE_IMPORT_LIBRARY_SUFFIX STREQUAL "")
+            set(kind ARCHIVE)
+        else()
+            set(kind LIBRARY)
+        endif()
+    else()
+        set(${out_reason} "${target} is a ${type}" PARENT_SCOPE)
+        return()
+    endif()
+    set(dir "")
+    if(CMAKE_BUILD_TYPE)
+        string(TOUPPER "${CMAKE_BUILD_TYPE}" config)
+        get_target_property(dir ${target} ${kind}_OUTPUT_DIRECTORY_${config})
+    endif()
+    if(NOT dir)
+        get_target_property(dir ${target} ${kind}_OUTPUT_DIRECTORY)
+    endif()
+    get_target_property(binary_dir ${target} BINARY_DIR)
+    if(NOT dir)
+        set(dir "${binary_dir}")
+    endif()
+    if(dir MATCHES "\\$<")
+        set(${out_reason} "${target}'s output directory is a generator expression" PARENT_SCOPE)
+        return()
+    endif()
+    get_filename_component(dir "${dir}" ABSOLUTE BASE_DIR "${binary_dir}")
+    set(${out_dir} "${dir}" PARENT_SCOPE)
+endfunction()
+
+# Every selection from the in-tree picotls at <source> (picotls-core's
+# source directory).
+function(_moq_pq_ptls_from_built source)
+    _moq_pq_ptls_headers_from_source("${source}")
+    get_filename_component(real "${source}" REALPATH)
+    set(_moq_pq_ptls_authority
+        "the picotls picoquic builds (PICOQUIC_FETCH_PTLS, ${real})")
+    foreach(lib core minicrypto openssl fusion)
+        string(TOUPPER "PTLS_${lib}_LIBRARY" var)
+        _moq_pq_ptls_fetched_library(${var} picotls-${lib})
+    endforeach()
+    unset(PTLS_PREFIX CACHE)
+
+    set(dirs "")
+    set(reason "")
+    foreach(target picotls-core picotls-minicrypto picotls-openssl)
+        if(NOT TARGET ${target})
+            if(target STREQUAL "picotls-openssl")
+                continue()
+            endif()
+            set(reason "no ${target} target")
+            break()
+        endif()
+        _moq_pq_ptls_output_dir(${target} dir reason)
+        if(reason)
+            break()
+        endif()
+        list(APPEND dirs "${dir}")
+    endforeach()
+    list(REMOVE_DUPLICATES dirs)
+    list(LENGTH dirs count)
+    if(NOT reason AND NOT count EQUAL 1)
+        set(reason "the picotls archives are written to different directories (${dirs})")
+    endif()
+    if(reason)
+        _moq_pq_ptls_classify(MOQ_PTLS_LIB_DIR explicit)
+        if(explicit)
+            message(FATAL_ERROR
+                "MOQ_PTLS_LIB_DIR=${MOQ_PTLS_LIB_DIR} cannot be checked against "
+                "${_moq_pq_ptls_authority}: ${reason}. Drop it (-UMOQ_PTLS_LIB_DIR).")
+        endif()
+        unset(MOQ_PTLS_LIB_DIR CACHE)
+        unset(_MOQ_PQ_PTLS_SELECTED_MOQ_PTLS_LIB_DIR CACHE)
+        set(MOQ_PTLS_LIB_DIR_UNRESOLVED "${reason}" CACHE INTERNAL
+            "why no picotls library directory is selected")
+    else()
+        unset(MOQ_PTLS_LIB_DIR_UNRESOLVED CACHE)
+        _moq_pq_ptls_select(MOQ_PTLS_LIB_DIR PATH "${dirs}" FALSE
+            "library directory (picotls archives)"
+            "picotls library directory (libpicotls-*.a)")
+    endif()
+endfunction()
+
+# Adds MOQ_PICOQUIC_SOURCE_DIR with LibMoQ's project hooks: picoquic's
+# project() runs MoqPicoquicProjectPolicy.cmake (link-line de-duplication
+# policies) and, with PICOQUIC_FETCH_PTLS, picotls's project() runs
+# MoqPicotlsProjectPolicy.cmake (LibMoQ's picotls policy and header
+# selection). Each composes with the caller's CMAKE_PROJECT_<name>_INCLUDE --
+# a file, a module name or a list of them -- which it includes first, handed
+# over as MOQ_PICO{QUIC,TLS}_CALLER_PROJECT_INCLUDE. The hook variables are set
+# only in this function's scope, which the added directories inherit, so the
+# caller's bindings (unset, cache-only, normal, normal over cache) are never
+# touched.
+function(_moq_pq_add_picoquic_source)
+    set(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE "${CMAKE_PROJECT_picoquic_INCLUDE}")
+    set(CMAKE_PROJECT_picoquic_INCLUDE
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MoqPicoquicProjectPolicy.cmake")
+    if(PICOQUIC_FETCH_PTLS)
+        set(MOQ_PICOTLS_CALLER_PROJECT_INCLUDE "${CMAKE_PROJECT_picotls_INCLUDE}")
+        set(CMAKE_PROJECT_picotls_INCLUDE
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MoqPicotlsProjectPolicy.cmake")
+    endif()
+    add_subdirectory("${MOQ_PICOQUIC_SOURCE_DIR}"
+        "${CMAKE_BINARY_DIR}/_deps/picoquic" EXCLUDE_FROM_ALL)
 endfunction()
 
 # One OpenSSL link identity for source-tree picoquic and the adapter.
@@ -448,7 +748,13 @@ if(TARGET picoquic::picoquic-core OR TARGET picoquic-core)
         endif()
         _moq_pq_require_http("the already-available picoquic")
     endif()
-    _moq_pq_resolve_ptls(FROM_PREFIX)
+    _moq_pq_ptls_built_by(picoquic::picoquic-core _moq_pq_ptls_source)
+    if(_moq_pq_ptls_source)
+        _moq_pq_ptls_from_built("${_moq_pq_ptls_source}")
+    else()
+        _moq_pq_resolve_ptls(FROM_PREFIX)
+    endif()
+    unset(_moq_pq_ptls_source)
     set(Picoquic_FOUND TRUE)
     return()
 endif()
@@ -485,8 +791,10 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
             "  ${MOQ_PICOQUIC_SOURCE_DIR}")
     endif()
 
-    # Resolve picotls build prefix for picoquic's FindPTLS.
-    if(NOT MOQ_PICOTLS_PREFIX)
+    # With PICOQUIC_FETCH_PTLS picoquic builds picotls itself (see "picotls
+    # built in this tree" above). Otherwise MOQ_PICOTLS_PREFIX names a
+    # prebuilt picotls.
+    if(NOT PICOQUIC_FETCH_PTLS AND NOT MOQ_PICOTLS_PREFIX)
         set(_ptls_build "${MOQ_PICOQUIC_SOURCE_DIR}/../picotls/build")
         if(EXISTS "${_ptls_build}")
             get_filename_component(MOQ_PICOTLS_PREFIX "${_ptls_build}" ABSOLUTE)
@@ -500,11 +808,13 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
 
     # MOQ_PICOTLS_PREFIX decides picotls for the source build; see
     # _moq_pq_ptls_from_prefix. PTLS_PREFIX tells picoquic's FindPTLS the same.
-    _moq_pq_ptls_from_prefix()
-    if(_moq_ptls_build_form)
-        list(APPEND CMAKE_LIBRARY_PATH "${MOQ_PICOTLS_PREFIX}")
+    if(NOT PICOQUIC_FETCH_PTLS)
+        _moq_pq_ptls_from_prefix()
+        if(_moq_ptls_build_form)
+            list(APPEND CMAKE_LIBRARY_PATH "${MOQ_PICOTLS_PREFIX}")
+        endif()
+        unset(_moq_ptls_build_form)
     endif()
-    unset(_moq_ptls_build_form)
 
     # Disable picoquic extras.
     set(BUILD_DEMO OFF CACHE BOOL "" FORCE)
@@ -526,30 +836,6 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
         set(BUILD_HTTP OFF CACHE BOOL "" FORCE)
     endif()
 
-    # Run MoqPicoquicProjectPolicy.cmake inside picoquic's project() scope
-    # (link-line de-duplication policies; see that file). A caller-provided
-    # CMAKE_PROJECT_picoquic_INCLUDE -- a file, a module name or a list of
-    # them -- is composed, not replaced: the policy file includes every entry
-    # afterwards. Only the normal variable is touched, never a cache entry,
-    # and its exact prior state (unset, empty or set) comes back once picoquic
-    # has been added, so later project() calls elsewhere see the original.
-    # The hand-over variable is likewise restored to whatever the caller had.
-    if(DEFINED CMAKE_PROJECT_picoquic_INCLUDE)
-        set(_moq_pq_include_was_defined TRUE)
-        set(_moq_pq_saved_project_include "${CMAKE_PROJECT_picoquic_INCLUDE}")
-    else()
-        set(_moq_pq_include_was_defined FALSE)
-    endif()
-    if(DEFINED MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE)
-        set(_moq_pq_handover_was_defined TRUE)
-        set(_moq_pq_saved_handover "${MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE}")
-    else()
-        set(_moq_pq_handover_was_defined FALSE)
-    endif()
-    set(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE "${CMAKE_PROJECT_picoquic_INCLUDE}")
-    set(CMAKE_PROJECT_picoquic_INCLUDE
-        "${CMAKE_CURRENT_LIST_DIR}/MoqPicoquicProjectPolicy.cmake")
-
     # Resolved before picoquic exists as a target, so that pre-existing
     # picoquic targets (the branches above) are never touched.
     _moq_pq_openssl_identity_wanted(_moq_pq_openssl_identity)
@@ -557,23 +843,7 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
         _moq_pq_openssl_targets()
     endif()
 
-    add_subdirectory("${MOQ_PICOQUIC_SOURCE_DIR}"
-        "${CMAKE_BINARY_DIR}/_deps/picoquic" EXCLUDE_FROM_ALL)
-
-    if(_moq_pq_include_was_defined)
-        set(CMAKE_PROJECT_picoquic_INCLUDE "${_moq_pq_saved_project_include}")
-    else()
-        unset(CMAKE_PROJECT_picoquic_INCLUDE)
-    endif()
-    if(_moq_pq_handover_was_defined)
-        set(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE "${_moq_pq_saved_handover}")
-    else()
-        unset(MOQ_PICOQUIC_CALLER_PROJECT_INCLUDE)
-    endif()
-    unset(_moq_pq_include_was_defined)
-    unset(_moq_pq_saved_project_include)
-    unset(_moq_pq_handover_was_defined)
-    unset(_moq_pq_saved_handover)
+    _moq_pq_add_picoquic_source()
 
     # picoquic_BUILD_TESTS=ON (forced above for the picoquic-test simulation
     # library our loopback/sim harness links) also makes picoquic register its
@@ -654,7 +924,29 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
     # scope, so PTLS_INCLUDE_DIR / picotls lib paths set there are not reliably
     # visible here (and PTLS_OPENSSL_LIBRARY may be a bare target name). Resolve
     # both directly so .pc generation and the verifier helper see them.
-    _moq_pq_resolve_ptls()
+    if(PICOQUIC_FETCH_PTLS)
+        _moq_pq_ptls_built_by(picoquic-core _moq_pq_ptls_source)
+        if(NOT _moq_pq_ptls_source)
+            message(FATAL_ERROR
+                "PICOQUIC_FETCH_PTLS is set, but picoquic-core does not link a "
+                "picotls-core built in this tree.")
+        endif()
+        if(FETCHCONTENT_SOURCE_DIR_PICOTLS)
+            get_filename_component(_moq_ptls_a "${FETCHCONTENT_SOURCE_DIR_PICOTLS}" REALPATH)
+            get_filename_component(_moq_ptls_b "${_moq_pq_ptls_source}" REALPATH)
+            if(NOT _moq_ptls_a STREQUAL _moq_ptls_b)
+                message(FATAL_ERROR
+                    "picoquic built picotls from ${_moq_pq_ptls_source}, not from "
+                    "FETCHCONTENT_SOURCE_DIR_PICOTLS=${FETCHCONTENT_SOURCE_DIR_PICOTLS}.")
+            endif()
+            unset(_moq_ptls_a)
+            unset(_moq_ptls_b)
+        endif()
+        _moq_pq_ptls_from_built("${_moq_pq_ptls_source}")
+        unset(_moq_pq_ptls_source)
+    else()
+        _moq_pq_resolve_ptls()
+    endif()
 
     return()
 endif()

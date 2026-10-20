@@ -42,7 +42,9 @@
  * The adapter never binds or starts the session; the managed facade in
  * <moq/proxygen_wt_managed.h> does.
  *
- * Experimental: C++ only; no managed client/server. API may evolve.
+ * Experimental: this attach adapter is C++ only. A managed client is available
+ * through <moq/proxygen_wt_managed.h>; a managed server is not supported.
+ * API may evolve.
  */
 
 #include <moq/session.h>   /* moq_session_t, moq_alloc_t, moq_result_t, MOQ_API */

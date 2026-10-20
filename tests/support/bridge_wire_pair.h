@@ -82,7 +82,8 @@ BWP_UNUSED static bool is_bidi_id(uint64_t id)
     return (id >= 2000 && id < 3000) || (id >= 4000 && id < 5000);
 }
 
-BWP_UNUSED static bool d18(const rl_pair_t *p) { return p->ver == MOQ_VERSION_DRAFT_18; }
+/* Draft-18 and later: a uni control pair, and every bidi is a request stream. */
+BWP_UNUSED static bool d18(const rl_pair_t *p) { return p->ver != MOQ_VERSION_DRAFT_16; }
 
 BWP_UNUSED static bool wire_holds(const rl_pair_t *p, const wire_t *w, bool from_client,
                        uint64_t sid)

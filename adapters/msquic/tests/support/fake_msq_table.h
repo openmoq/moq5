@@ -171,6 +171,13 @@ struct fake_msq {
     uint32_t last_stream_param;
     uint64_t last_stream_param_u64;
     int stream_setparam_fails;
+
+    /* Called after a StreamShutdown the fake accepted, on the caller's stack:
+     * lets a test complete the stream inline, as MsQuic does for a shutdown
+     * executed on the connection's worker. */
+    void (*on_stream_shutdown)(fake_msq_stream_t *st,
+                               QUIC_STREAM_SHUTDOWN_FLAGS flags, void *ctx);
+    void *on_stream_shutdown_ctx;
 };
 
 void fake_msq_init(fake_msq_t *f, bool is_client);
