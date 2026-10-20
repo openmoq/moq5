@@ -112,6 +112,11 @@ typedef struct {
      * destination snapshot is stamped; a widening installed later never joins
      * an already pending operation or an open streaming bracket. */
     moq_resolved_window_t window;
+    /* The group whose stream went away mid-group (a delivery timeout or the
+     * peer's STOP_SENDING): MOQT 8 opens no new stream for it, so the rest of
+     * its objects are dropped for this destination. */
+    bool                  group_dropped;
+    uint64_t              dropped_group;
 } pub_sub_slot_t;
 
 /* One in-flight fan-out operation per track. The op's payload/properties are
@@ -554,6 +559,22 @@ static void track_clear_slot(moq_publisher_t *pub, pub_sub_slot_t *s)
 {
     (void)pub;
     memset(s, 0, sizeof(*s));
+}
+
+/* A stale subgroup handle means its stream is gone, not the destination:
+ * keep the slot and drop the rest of that group. */
+static void slot_stream_lost(pub_sub_slot_t *s)
+{
+    s->sg_open = false;
+    s->streaming = false;
+    s->needs_reset = false;
+    s->group_dropped = true;
+    s->dropped_group = s->cur_group;
+}
+
+static bool slot_group_dropped(const pub_sub_slot_t *s, uint64_t group)
+{
+    return s->group_dropped && s->dropped_group == group;
 }
 
 static pub_sub_slot_t *track_find_slot_by_sub(moq_pub_track_t *t,
@@ -4093,6 +4114,8 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
 {
     bool need_ext = (obj->properties != NULL);
 
+    if (slot_group_dropped(slot, obj->group_id)) return MOQ_OK;
+
     bool want_eog = false;
     if (obj->struct_size >= offsetof(moq_pub_object_cfg_t, end_of_group) +
         sizeof(obj->end_of_group))
@@ -4114,11 +4137,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
     if (slot->sg_open && !same_sg) {
         moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
-            return MOQ_OK;
-        }
-        if (rc < 0) return rc;
+        if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
         slot->sg_open = false;
     }
 
@@ -4162,7 +4181,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
             slot->sg, &ocfg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            slot_stream_lost(slot);
             return MOQ_OK;
         }
         if (rc == MOQ_OK) slot->sg_last = obj->object_id;
@@ -4173,7 +4192,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         slot->sg, obj->object_id, obj->payload, now_us);
     if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
     if (rc == MOQ_ERR_STALE_HANDLE) {
-        track_clear_slot(pub, slot);
+        slot_stream_lost(slot);
         return MOQ_OK;
     }
     if (rc == MOQ_OK) slot->sg_last = obj->object_id;
@@ -4511,7 +4530,8 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
                      slot_eligible(track, slot);
 
         if (!term_fresh || !in_op ||
-            !window_admits(&slot->window, term_g, term_o)) {
+            !window_admits(&slot->window, term_g, term_o) ||
+            slot_group_dropped(slot, term_g)) {
             /* Terminal control: close any open subgroup FIRST (streams close
              * before the done, same normative ordering as
              * finish_subscribers; a Forward-0 slot's open subgroup was
@@ -4531,11 +4551,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
             if (slot->sg_open) {
                 moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
                 if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-                if (rc == MOQ_ERR_STALE_HANDLE) {
-                    track_clear_slot(pub, slot);
-                    continue;
-                }
-                if (rc < 0) return rc;
+                if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
                 slot->sg_open = false;
             }
             moq_done_subscribe_cfg_t dcfg;
@@ -4568,11 +4584,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
         if (slot->sg_open) {
             moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-            if (rc == MOQ_ERR_STALE_HANDLE) {
-                track_clear_slot(pub, slot);
-                continue;
-            }
-            if (rc < 0) return rc;
+            if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
             slot->sg_open = false;
         }
 
@@ -4784,7 +4796,8 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
     for (size_t si = 0; si < track->slot_cap; si++) {
         pub_sub_slot_t *slot = &track->slots[si];
         if (!slot_op_pending(track, slot)) continue;
-        if (slot->streaming) {              /* this slot's begin already done */
+        if (slot->streaming ||              /* this slot's begin already done */
+            slot_group_dropped(slot, cfg->group_id)) {
             slot->done_op = track->cur_op;
             continue;
         }
@@ -4793,11 +4806,7 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
                               slot->cur_gen != track->op.subgroup)) {
             moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-            if (rc == MOQ_ERR_STALE_HANDLE) {
-                track_clear_slot(pub, slot);
-                continue;
-            }
-            if (rc < 0) return rc;
+            if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
             slot->sg_open = false;
         }
 
@@ -4842,7 +4851,8 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         }
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            slot_stream_lost(slot);
+            slot->done_op = track->cur_op;
             continue;
         }
         if (rc < 0) return rc;
@@ -4928,7 +4938,8 @@ moq_result_t moq_pub_write_data(moq_publisher_t *pub,
             slot->sg, track->op.payload, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            slot_stream_lost(slot);
+            slot->done_op = track->cur_op;
             continue;
         }
         if (rc < 0) return rc;
@@ -4969,7 +4980,8 @@ moq_result_t moq_pub_end_object(moq_publisher_t *pub,
             slot->sg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            slot_stream_lost(slot);
+            slot->done_op = track->cur_op;
             continue;
         }
         if (rc < 0) return rc;
@@ -5012,11 +5024,7 @@ moq_result_t moq_pub_end_group(moq_publisher_t *pub,
         }
         moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
-            continue;
-        }
-        if (rc < 0) return rc;
+        if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
         slot->sg_open = false;
         if (slot->active) slot->done_op = track->cur_op;
     }
@@ -5097,8 +5105,7 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
         moq_result_t rc = moq_session_reset_subgroup(pub->session,
             sl->sg, error_code, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rc == MOQ_ERR_STALE_HANDLE) { track_clear_slot(pub, sl); continue; }
-        if (rc < 0) return rc;
+        if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
         sl->sg_open = false;
         sl->streaming = false;   /* any in-flight streaming object is gone */
         sl->needs_reset = false;

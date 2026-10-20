@@ -3008,21 +3008,33 @@ static void test_end_group_stale_handle(void) {
           for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
     }
 
-    /* end_group should hit STALE_HANDLE from close_subgroup,
-     * clear sg_open + has_sub, and return OK. */
+    /* end_group hits STALE_HANDLE from close_subgroup and returns OK. A
+     * STOP_SENDING on a data stream has no impact on the subscription
+     * (MOQT 11.4.3 in draft-18, 10.4.3 in draft-16). */
     moq_result_t rc = moq_pub_end_group(pub, track,
         moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 0);
+    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 1);
 
-    /* Subsequent write is a no-op (no subscription). */
+    /* The next group still goes to the subscriber on a new stream. */
     moq_rcbuf_t *p2 = NULL;
     moq_rcbuf_create(&alloc, d, 1, &p2);
     rc = moq_pub_write_object(pub, track, 1, 0, p2,
         moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 0);
+    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 1);
     moq_rcbuf_decref(p2);
+    { moq_action_t acts[8];
+      size_t na = moq_session_poll_actions(moq_simpair_server(sp), acts, 8);
+      bool sent = false;
+      for (size_t i = 0; i < na; i++) {
+          if (acts[i].kind == MOQ_ACTION_SEND_DATA &&
+              acts[i].u.send_data.stream_ref._v != sender_ref._v)
+              sent = true;
+          moq_action_cleanup(&acts[i]);
+      }
+      MOQ_TEST_CHECK(sent);
+    }
 
     moq_pub_remove_track(pub, track, moq_simpair_now_us(sp));
     moq_pub_destroy(pub);
