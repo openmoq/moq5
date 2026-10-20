@@ -2209,6 +2209,8 @@ struct moq_session {
     size_t        action_head;
     size_t        action_tail;
     moq_action_meta_t *action_meta;   /* parallel to actions */
+    /* The delivery deadline of the last action polled (UINT64_MAX: none). */
+    uint64_t           last_poll_deadline_us;
 
     moq_event_t  *events;
     size_t        event_cap;

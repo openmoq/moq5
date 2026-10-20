@@ -1011,6 +1011,11 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a)
     return push_action_ex(s, a, NULL, UINT64_MAX);
 }
 
+uint64_t bridge_session_polled_deadline(const moq_session_t *s)
+{
+    return s->last_poll_deadline_us;
+}
+
 uint64_t session_queued_data_deadline(const moq_session_t *s)
 {
     uint64_t d = UINT64_MAX;
@@ -3157,6 +3162,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->idle_deadline_us = UINT64_MAX;
     s->done_wait_timeout_us = done_wait_us;
     s->expiry_retry_deadline_us = UINT64_MAX;
+    s->last_poll_deadline_us = UINT64_MAX;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, goaway_timeout_us) +
         sizeof(cfg->goaway_timeout_us))
         s->goaway_timeout_us = cfg->goaway_timeout_us;
@@ -3995,6 +4001,8 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
             element_size < send_data_needed)
             break;
 
+        s->last_poll_deadline_us =
+            s->action_meta[idx % s->action_cap].deadline_us;
         moq_action_t taken;
         action_take(s, idx, &taken);
         memset(dst, 0, element_size);

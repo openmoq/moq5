@@ -269,6 +269,7 @@ typedef struct {
     uint64_t            reset_reliable;
     uint64_t            served;     /* serve_seq of its last hand-off */
     moq_action_t       *q;          /* ring of owned SEND_DATA actions */
+    uint64_t           *qdl;        /* their delivery deadlines, as q */
     uint32_t            q_cap;
     uint32_t            q_head;
     uint32_t            q_len;
@@ -288,6 +289,12 @@ typedef struct {
     bool                fin_handed;
     /* A reset waiting behind the queued prefix its reliable size covers. */
     bool                has_reset;
+    /* OBJECT_DELIVERY_TIMEOUT passed in the bridge: the stream was reset and
+     * left the order; what the session still sends for it is dropped. */
+    bool                expired;
+    bool                expiry_owed; /* the session is not told yet */
+    bool                expiry_reset; /* the bridge's own reset is going out */
+    bool                fin_dropped; /* its FIN went with the expired data */
 } bridge_dstream_t;
 
 /* Open-addressing entry mapping an ID to a dstream slot. */
@@ -384,6 +391,13 @@ struct moq_transport_bridge {
     bool                   pump_handed_back;
     uint64_t               dq_bytes;       /* bytes queued across dstreams */
     uint32_t               dq_items;       /* actions queued across dstreams */
+    uint32_t               dq_timed;       /* of which with a deadline */
+    uint32_t               expiry_owed;    /* dstreams with expiry_owed */
+    uint64_t               poll_deadline_us; /* of the action in dispatch */
+    /* The session wakes the bridge at the earlier of these (UINT64_MAX:
+     * none): the oldest hold's age and the earliest queued deadline. */
+    uint64_t               hold_due_us;
+    uint64_t               expiry_due_us;
     uint64_t               max_retained_bytes;
     uint64_t               serve_seq;
 };
@@ -412,6 +426,10 @@ uint8_t bridge_session_subgroup_header_size(
 moq_result_t bridge_session_on_subgroup_stop(
     moq_session_t *s, moq_stream_ref_t ref, uint64_t error_code,
     uint64_t now_us, uint8_t retained_header_len);
+
+/* OBJECT_DELIVERY_TIMEOUT deadline of the action the last poll returned, on
+ * the session clock; UINT64_MAX for none. */
+uint64_t bridge_session_polled_deadline(const moq_session_t *s);
 
 /* A reset action retains its stream identity even after its core slot reaps. */
 bool bridge_session_has_queued_data_reset(

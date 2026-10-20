@@ -258,6 +258,7 @@ moq_result_t moq_transport_bridge_create(
     b->dskip = bridge_alloc(a, max_s * sizeof(uint32_t));
     if (!b->dskip) goto fail;
     b->max_retained_bytes = MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT;
+    b->poll_deadline_us = b->hold_due_us = b->expiry_due_us = UINT64_MAX;
     if (cfg->struct_size >= offsetof(moq_transport_bridge_cfg_t,
                                      max_retained_bytes) +
                             sizeof(cfg->max_retained_bytes) &&
@@ -303,6 +304,7 @@ fail:
 }
 
 static void bridge_dstreams_clear(moq_transport_bridge_t *b);
+static void bridge_publish_deadline(moq_transport_bridge_t *b);
 
 void moq_transport_bridge_destroy(moq_transport_bridge_t *b)
 {
@@ -657,20 +659,24 @@ static void bridge_owner_unlink(moq_transport_bridge_t *b, bridge_dstream_t *d)
     d->owner_prev = d->owner_next = BRIDGE_INDEX_EMPTY;
 }
 
-/* Drop `d`'s queued actions and release its queue. */
+/* Drop `d`'s queued actions and release its queue. An expired stream has
+ * already left its owner's list. */
 static void bridge_dstream_release(moq_transport_bridge_t *b,
                                    bridge_dstream_t *d)
 {
     if (d->heap_at != BRIDGE_INDEX_EMPTY) bridge_dheap_remove(b, d);
-    bridge_owner_unlink(b, d);
+    if (!d->expired) bridge_owner_unlink(b, d);
+    b->expiry_owed -= d->expiry_owed;
     for (; d->q_len > 0; d->q_len--) {
         moq_action_t *a = &d->q[d->q_head];
         b->dq_bytes -= bridge_send_data_bytes(&a->u.send_data);
         b->dq_items--;
+        b->dq_timed -= d->qdl[d->q_head] != UINT64_MAX;
         moq_action_cleanup(a);
         d->q_head = (d->q_head + 1) % d->q_cap;
     }
     if (d->q) bridge_free(&b->alloc, d->q, d->q_cap * sizeof(moq_action_t));
+    if (d->qdl) bridge_free(&b->alloc, d->qdl, d->q_cap * sizeof(uint64_t));
     bridge_index_remove(b->dref_index, b->dindex_mask, d->ref._v);
     if (d->has_sid)
         bridge_index_remove(b->dsid_index, b->dindex_mask, d->sid);
@@ -698,8 +704,10 @@ static void bridge_clear_all_state(moq_transport_bridge_t *b)
     }
     bridge_dstreams_clear(b);
     b->tombstone_count = 0;
-    if (b->holds) {
+    if (b->holds)
         memset(b->holds, 0, b->max_holds * sizeof(bridge_hold_t));
+    if (b->holds || b->expiry_due_us != UINT64_MAX) {
+        b->hold_due_us = b->expiry_due_us = UINT64_MAX;
         moq_session_set_owner_deadline(b->session, b, false, 0);
     }
 }
@@ -968,23 +976,31 @@ static bool bridge_hold_class_waiting(const moq_transport_bridge_t *b,
     return false;
 }
 
+/* The session wakes the bridge for its earliest hold age or queued delivery
+ * deadline. */
+static void bridge_publish_deadline(moq_transport_bridge_t *b)
+{
+    uint64_t d = b->hold_due_us < b->expiry_due_us ? b->hold_due_us
+                                                   : b->expiry_due_us;
+    moq_session_set_owner_deadline(b->session, b, d != UINT64_MAX, d);
+}
+
 /* Publish the earliest hold age of every RECORDED hold to the session, or
  * clear it. CANCELLING holds have no time deadline: their owed operations
  * retry on every service pass. */
 static void bridge_hold_publish_deadline(moq_transport_bridge_t *b)
 {
     if (!b->holds) return;
-    bool has = false;
     uint64_t d = UINT64_MAX;
     for (uint32_t i = 0; i < b->max_holds; i++) {
         const bridge_hold_t *h = &b->holds[i];
         if (h->state != BRIDGE_HOLD_RECORDED) continue;
         uint64_t due = h->first_refusal_us > UINT64_MAX - BRIDGE_HOLD_AGE_US
             ? UINT64_MAX : h->first_refusal_us + BRIDGE_HOLD_AGE_US;
-        if (!has || due < d) d = due;
-        has = true;
+        if (due < d) d = due;
     }
-    moq_session_set_owner_deadline(b->session, b, has, d);
+    b->hold_due_us = d;
+    bridge_publish_deadline(b);
 }
 
 /* Record a newly refused stream. NULL when every record is in use. */
@@ -2064,55 +2080,75 @@ static moq_result_t dispatch_set_data_priority(moq_transport_bridge_t *b,
 
 #define BRIDGE_DQ_INITIAL_CAP 8u
 
-/* Queue a SEND_DATA on its stream (ownership moves). Out of memory is fatal:
- * the action cannot be kept in order any other way. */
+/* Queue a SEND_DATA on its stream (ownership moves) with its delivery
+ * deadline (UINT64_MAX: none). Out of memory is fatal: the action cannot be
+ * kept in order any other way. */
 static moq_result_t bridge_dstream_push(moq_transport_bridge_t *b,
                                         bridge_dstream_t *d,
-                                        moq_action_t *act)
+                                        moq_action_t *act, uint64_t deadline)
 {
     if (d->q_len == d->q_cap) {
         uint32_t ncap = d->q_cap ? d->q_cap * 2 : BRIDGE_DQ_INITIAL_CAP;
         moq_action_t *nq = bridge_alloc(&b->alloc, ncap * sizeof(*nq));
-        if (!nq) {
+        uint64_t *ndl = nq ? bridge_alloc(&b->alloc, ncap * sizeof(*ndl))
+                           : NULL;
+        if (!ndl) {
+            if (nq) bridge_free(&b->alloc, nq, ncap * sizeof(*nq));
             moq_action_cleanup(act);
             bridge_set_fatal(b, 0x1);
             return MOQ_ERR_NOMEM;
         }
-        for (uint32_t i = 0; i < d->q_len; i++)
+        for (uint32_t i = 0; i < d->q_len; i++) {
             nq[i] = d->q[(d->q_head + i) % d->q_cap];
+            ndl[i] = d->qdl[(d->q_head + i) % d->q_cap];
+        }
         if (d->q) bridge_free(&b->alloc, d->q, d->q_cap * sizeof(*d->q));
+        if (d->qdl) bridge_free(&b->alloc, d->qdl, d->q_cap * sizeof(*ndl));
         d->q = nq;
+        d->qdl = ndl;
         d->q_cap = ncap;
         d->q_head = 0;
     }
-    d->q[(d->q_head + d->q_len) % d->q_cap] = *act;
+    uint32_t at = (d->q_head + d->q_len) % d->q_cap;
+    d->q[at] = *act;
+    d->qdl[at] = deadline;
     d->q_len++;
     b->dq_bytes += bridge_send_data_bytes(&act->u.send_data);
     b->dq_items++;
+    b->dq_timed += deadline != UINT64_MAX;
+    if (deadline < b->expiry_due_us) {
+        b->expiry_due_us = deadline;
+        bridge_publish_deadline(b);
+    }
     if (d->q_len == 1) bridge_dstream_requeue(b, d);
     return MOQ_OK;
 }
 
-/* Take `d`'s oldest queued action (ownership moves to *out). */
+/* Take `d`'s oldest queued action (ownership moves to *out) and its
+ * deadline. */
 static void bridge_dstream_pop(moq_transport_bridge_t *b, bridge_dstream_t *d,
-                               moq_action_t *out)
+                               moq_action_t *out, uint64_t *deadline)
 {
     *out = d->q[d->q_head];
+    *deadline = d->qdl[d->q_head];
     d->q_head = (d->q_head + 1) % d->q_cap;
     d->q_len--;
     b->dq_bytes -= bridge_send_data_bytes(&out->u.send_data);
     b->dq_items--;
+    b->dq_timed -= *deadline != UINT64_MAX;
 }
 
 /* Put `act` back as `d`'s oldest queued action (ownership moves back). */
 static void bridge_dstream_unpop(moq_transport_bridge_t *b, bridge_dstream_t *d,
-                                 const moq_action_t *act)
+                                 const moq_action_t *act, uint64_t deadline)
 {
     d->q_head = (d->q_head + d->q_cap - 1) % d->q_cap;
     d->q[d->q_head] = *act;
+    d->qdl[d->q_head] = deadline;
     d->q_len++;
     b->dq_bytes += bridge_send_data_bytes(&act->u.send_data);
     b->dq_items++;
+    b->dq_timed += deadline != UINT64_MAX;
 }
 
 /* Drop all but `d`'s oldest `keep` queued actions. */
@@ -2120,10 +2156,11 @@ static void bridge_dstream_truncate(moq_transport_bridge_t *b,
                                     bridge_dstream_t *d, uint32_t keep)
 {
     for (uint32_t i = keep; i < d->q_len; i++) {
-        moq_action_t *a = &d->q[(d->q_head + i) % d->q_cap];
-        b->dq_bytes -= bridge_send_data_bytes(&a->u.send_data);
+        uint32_t at = (d->q_head + i) % d->q_cap;
+        b->dq_bytes -= bridge_send_data_bytes(&d->q[at].u.send_data);
         b->dq_items--;
-        moq_action_cleanup(a);
+        b->dq_timed -= d->qdl[at] != UINT64_MAX;
+        moq_action_cleanup(&d->q[at]);
     }
     d->q_len = keep;
 }
@@ -2622,6 +2659,11 @@ static moq_result_t bridge_dstream_reset(moq_transport_bridge_t *b,
     *deferred = false;
     bridge_dstream_t *d = bridge_dstream_find(b, ref);
     if (!d) return MOQ_OK;
+    if (d->expired) {
+        /* The session's reset after the bridge's own: nothing more comes. */
+        if (!d->expiry_reset) bridge_dstream_release(b, d);
+        return MOQ_OK;
+    }
     if (d->has_reset) {
         *deferred = d->q_len > 0;
         return *deferred ? MOQ_OK : bridge_dstream_free(b, d);
@@ -3454,7 +3496,16 @@ static moq_result_t bridge_process_action(moq_transport_bridge_t *b,
     case MOQ_ACTION_SEND_DATA: {
         bridge_dstream_t *d = bridge_dstream_find(b,
                                   act->u.send_data.stream_ref);
-        return d ? bridge_dstream_push(b, d, act) : dispatch_send_data(b, act);
+        if (d && d->expired) {
+            /* Never a new stream for a subgroup that timed out; after its
+             * FIN nothing more comes for it. */
+            bool fin = act->u.send_data.fin;
+            moq_action_cleanup(act);
+            if (fin) bridge_dstream_release(b, d);
+            return MOQ_OK;
+        }
+        return d ? bridge_dstream_push(b, d, act, b->poll_deadline_us)
+                 : dispatch_send_data(b, act);
     }
 
     case MOQ_ACTION_SET_DATA_PRIORITY:
@@ -3554,7 +3605,9 @@ static moq_result_t bridge_drain_actions(moq_transport_bridge_t *b)
            b->dq_bytes < b->max_retained_bytes &&
            moq_session_poll_actions(b->session, &act, 1) > 0) {
         uint32_t before = b->pending_count;
+        b->poll_deadline_us = bridge_session_polled_deadline(b->session);
         moq_result_t rc = bridge_process_action(b, &act);
+        b->poll_deadline_us = UINT64_MAX;
         if (rc < 0) return rc;
 #ifdef MOQ_BRIDGE_SCAN_COUNTERS
         if (b->pending_count > before) {
@@ -3567,6 +3620,99 @@ static moq_result_t bridge_drain_actions(moq_transport_bridge_t *b)
 #endif
         drained++;
         if (b->fatal || b->closed) break;
+    }
+    return MOQ_OK;
+}
+
+/* -- Delivery timeouts of queued data ------------------------------- *
+ * OBJECT_DELIVERY_TIMEOUT (draft-18 8, draft-22 5.2) is checked "before
+ * attempting to pass" an object to the transport. The session checks what it
+ * hands over; the objects the bridge then holds are checked here, so none
+ * reaches the endpoint after its deadline. */
+
+/* Tell the session the subgroup timed out; retried while it cannot queue. */
+static void bridge_dstream_notify_expired(moq_transport_bridge_t *b,
+                                          bridge_dstream_t *d, uint64_t now_us)
+{
+    moq_result_t rc = bridge_session_on_subgroup_stop(
+        b->session, d->ref, MOQ_RESET_DELIVERY_TIMEOUT, now_us, 0);
+    if (rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_SESSION_SUSPENDED) return;
+    d->expiry_owed = false;
+    b->expiry_owed--;
+    if (d->fin_dropped) bridge_dstream_release(b, d);
+}
+
+/* `d`'s next object timed out: what it queues is dropped, the stream is reset
+ * with DELIVERY_TIMEOUT and leaves the order, and the session ends the
+ * subgroup. `d` stays until nothing more can come for it, dropping it. */
+static moq_result_t bridge_dstream_expire(moq_transport_bridge_t *b,
+                                          bridge_dstream_t *d, uint64_t now_us)
+{
+    for (uint32_t i = 0; i < d->q_len && !d->fin_dropped; i++)
+        d->fin_dropped = d->q[(d->q_head + i) % d->q_cap].u.send_data.fin;
+    bridge_dstream_truncate(b, d, 0);
+    if (d->heap_at != BRIDGE_INDEX_EMPTY) bridge_dheap_remove(b, d);
+    moq_result_t rc = bridge_dstream_unplace(b, d);
+    if (rc < 0) return rc;
+    bridge_owner_unlink(b, d);
+    d->expired = true;
+
+    const bridge_stream_entry_t *e = bridge_find_by_ref(b, d->ref);
+    moq_action_t r;
+    memset(&r, 0, sizeof(r));
+    r.kind = MOQ_ACTION_RESET_DATA;
+    r.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+    r.u.reset_data.stream_ref = d->ref;
+    r.u.reset_data.error_code = MOQ_RESET_DELIVERY_TIMEOUT;
+    r.u.reset_data.reliable_size = e ? e->subgroup_header_len : 0;
+    uint32_t slot = (uint32_t)(d - b->dstreams);
+    d->expiry_reset = true;
+    rc = dispatch_reset_data(b, &r);
+    d = &b->dstreams[slot];
+    d->expiry_reset = false;
+    if (rc < 0) return rc;
+    d->expiry_owed = true;
+    b->expiry_owed++;
+    bridge_dstream_notify_expired(b, d, now_us);
+    return MOQ_OK;
+}
+
+/* The deadline of `d`'s next object: a header that waits for its first
+ * payload byte carries none. UINT64_MAX for none. */
+static uint64_t bridge_dstream_deadline(const bridge_dstream_t *d)
+{
+    for (uint32_t i = 0; i < d->q_len; i++) {
+        uint64_t dl = d->qdl[(d->q_head + i) % d->q_cap];
+        if (dl != UINT64_MAX) return dl;
+    }
+    return UINT64_MAX;
+}
+
+/* Expire the queued streams whose next object is due, and wake the bridge
+ * for the earliest deadline left. A stream with a reset already waiting is
+ * left to it. */
+static moq_result_t bridge_expire_due(moq_transport_bridge_t *b,
+                                      uint64_t now_us)
+{
+    for (uint32_t i = 0; b->expiry_owed && i < b->dstream_cap; i++)
+        if (b->dstreams[i].active && b->dstreams[i].expiry_owed)
+            bridge_dstream_notify_expired(b, &b->dstreams[i], now_us);
+    uint64_t next = UINT64_MAX;
+    for (uint32_t i = 0; b->dq_timed && i < b->dstream_cap; i++) {
+        bridge_dstream_t *d = &b->dstreams[i];
+        if (!d->active || d->expired || d->has_reset || d->q_len == 0)
+            continue;
+        uint64_t dl = bridge_dstream_deadline(d);
+        if (dl > now_us) {
+            if (dl < next) next = dl;
+            continue;
+        }
+        moq_result_t rc = bridge_dstream_expire(b, d, now_us);
+        if (rc < 0) return rc;
+    }
+    if (next != b->expiry_due_us) {
+        b->expiry_due_us = next;
+        bridge_publish_deadline(b);
     }
     return MOQ_OK;
 }
@@ -3617,14 +3763,15 @@ static moq_result_t bridge_pump_data(moq_transport_bridge_t *b,
             continue;
         }
         moq_action_t act;
-        bridge_dstream_pop(b, d, &act);
+        uint64_t deadline;
+        bridge_dstream_pop(b, d, &act, &deadline);
         b->pump_hand_back = true;
         b->pump_handed_back = false;
         rc = dispatch_send_data(b, &act);
         b->pump_hand_back = false;
         if (rc < 0) break;
         if (b->pump_handed_back) {
-            bridge_dstream_unpop(b, d, &act);
+            bridge_dstream_unpop(b, d, &act, deadline);
             if (d->heap_at != BRIDGE_INDEX_EMPTY) bridge_dheap_remove(b, d);
             b->dskip[nskip++] = (uint32_t)(d - b->dstreams);
             continue;
@@ -4337,6 +4484,14 @@ static moq_result_t bridge_service_pass(
             bool moved = false;
             moq_result_t hrc = bridge_hold_maintain(b, now_us, &moved);
             if (hrc < 0) return hrc;
+        }
+
+        /* Queued objects past their delivery timeout never reach the
+         * endpoint. */
+        if (!b->fatal && !b->closed && (b->dq_timed || b->expiry_owed ||
+                                        b->expiry_due_us != UINT64_MAX)) {
+            moq_result_t erc = bridge_expire_due(b, now_us);
+            if (erc < 0) return erc;
         }
 
         /* Step 1: retry outbound pending FIFO */
