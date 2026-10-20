@@ -52,6 +52,7 @@ endif()
 # The complete private SPI surface (core/src/spi/core_spi.h MOQ_API symbols).
 set(BASE_SYMBOLS
     moq_core_internal_track_max_cache_duration
+    moq_core_internal_track_properties_validate
 )
 set(FAMILY_PREFIX "moq_core_internal_")
 

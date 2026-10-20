@@ -2190,7 +2190,9 @@ static moq_result_t serve_retained_fetch(moq_publisher_t *pub,
     }
 
     if (!pf->accepted) {
-        if (moq_session_action_capacity(pub->session) < 2) return MOQ_ERR_WOULD_BLOCK;
+        /* FETCH_OK + FETCH_HEADER, and the data stream's scheduling key. */
+        size_t need = pub->session->data_priority_updates ? 3 : 2;
+        if (moq_session_action_capacity(pub->session) < need) return MOQ_ERR_WOULD_BLOCK;
         moq_accept_fetch_cfg_t acc;
         moq_accept_fetch_cfg_init(&acc);
         acc.end_of_track = false;
@@ -3562,6 +3564,12 @@ _Static_assert(offsetof(moq_pub_track_cfg_t, monotonic_groups) >=
                sizeof(pub_track_cfg_pre_monotonic_t),
                "monotonic_groups must not reuse historical storage");
 
+/* group_order starts at the sizeof of the layout that ended at
+ * dynamic_groups (96 / 60 / 64), behind _reserved_track_tail3. */
+_Static_assert(offsetof(moq_pub_track_cfg_t, group_order) ==
+               (sizeof(void *) == 8 ? 96 : 64),
+               "group_order must retain its frozen offset");
+
 #define MOQ_PUB_TRACK_CFG_V0_SIZE (sizeof(void *) == 8 ? 48u : 24u)
 _Static_assert(offsetof(moq_pub_track_cfg_t, max_retained_bytes) ==
                MOQ_PUB_TRACK_CFG_V0_SIZE, "frozen original track cfg prefix");
@@ -3590,35 +3598,20 @@ static bool pub_track_cfg_normalize(const void *storage, moq_pub_track_cfg_t *cf
 }
 
 /* Own the track's Track Properties: the caller's set, with DYNAMIC_GROUPS = 1
- * added in the session's encoding when declared, validated as the session
- * validates an accept's properties. MOQ_ERR_INVAL for a set the session would
- * refuse; MOQ_ERR_NOMEM. Nothing is allocated for an empty set. */
+ * and DEFAULT_PUBLISHER_GROUP_ORDER added in the session's encoding when
+ * declared, validated as the session validates an accept's properties.
+ * MOQ_ERR_INVAL for a set the session would refuse; MOQ_ERR_NOMEM. Nothing is
+ * allocated for an empty set. */
 static moq_result_t track_set_properties(moq_publisher_t *pub, moq_pub_track_t *t,
-                                         moq_bytes_t in, bool dynamic)
+                                         moq_bytes_t in, bool dynamic,
+                                         moq_group_order_t group_order)
 {
     const moq_profile_ops_t *p = pub->session->profile;
-    if (in.len > 0 && !in.data) return MOQ_ERR_INVAL;
-    /* The added pair is two integers, and the delta that follows it can only
-     * shrink: 2 x 8 bytes cover it in either integer encoding. */
-    if (dynamic && in.len > SIZE_MAX - 16) return MOQ_ERR_INVAL;
-    size_t cap = in.len + (dynamic ? 16 : 0);
-    if (cap == 0) return MOQ_OK;
-    uint8_t *buf = (uint8_t *)pub_alloc(pub, cap);
-    if (!buf) return MOQ_ERR_NOMEM;
-    size_t n = in.len;
-    moq_result_t rc = MOQ_OK;
-    if (dynamic)
-        rc = p->track_properties_add_dynamic_groups(in.data, in.len, buf, cap, &n);
-    else
-        memcpy(buf, in.data, in.len);
-    /* The same checks moq_track_properties_validate() applies before a
-     * session exists. */
-    if (rc == MOQ_OK && moq_profile_check_track_properties(p, buf, n) < 0)
-        rc = MOQ_ERR_INVAL;
-    if (rc < 0) {
-        pub_free(pub, buf, cap);
-        return MOQ_ERR_INVAL;
-    }
+    uint8_t *buf;
+    size_t cap, n;
+    moq_result_t rc = moq_profile_build_track_properties(p, &pub->alloc,
+        in.data, in.len, dynamic, group_order, &buf, &cap, &n);
+    if (rc < 0 || !buf) return rc;
     t->props = buf;
     t->props_len = n;
     t->props_cap = cap;
@@ -3775,13 +3768,17 @@ moq_result_t moq_pub_add_track(moq_publisher_t *pub,
     {
         moq_bytes_t in = { NULL, 0 };
         bool dynamic = false;
+        moq_group_order_t order = MOQ_GROUP_ORDER_DEFAULT;
         if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, track_properties) +
                                 sizeof(cfg->track_properties))
             in = cfg->track_properties;
         if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, dynamic_groups) +
                                 sizeof(cfg->dynamic_groups))
             dynamic = cfg->dynamic_groups;
-        moq_result_t prc = track_set_properties(pub, t, in, dynamic);
+        if (cfg->struct_size >= offsetof(moq_pub_track_cfg_t, group_order) +
+                                sizeof(cfg->group_order))
+            order = cfg->group_order;
+        moq_result_t prc = track_set_properties(pub, t, in, dynamic, order);
         if (prc < 0) {
             free_track_state(pub, t);
             return prc;
@@ -4580,9 +4577,11 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
         }
 
         /* Open -> status object -> FIN must queue atomically per slot
-         * (open emits its header eagerly; a mid-triple WOULD_BLOCK would
-         * strand an empty terminal subgroup). Preflight the triple. */
-        if (moq_session_action_capacity(pub->session) < 3)
+         * (open emits its header eagerly, and its key with it; a mid-triple
+         * WOULD_BLOCK would strand an empty terminal subgroup). Preflight
+         * the triple. */
+        size_t need = pub->session->data_priority_updates ? 4 : 3;
+        if (moq_session_action_capacity(pub->session) < need)
             return MOQ_ERR_WOULD_BLOCK;
 
         moq_subgroup_cfg_t sgcfg;

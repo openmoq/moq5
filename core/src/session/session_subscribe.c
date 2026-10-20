@@ -232,7 +232,7 @@ static moq_subscription_t sub_make_handle(moq_session_t *s, size_t slot)
     return h;
 }
 
-int sub_resolve_handle(moq_session_t *s, moq_subscription_t h)
+int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h)
 {
     uint32_t pool = moq_handle_pool_tag(h._opaque);
     uint16_t tag  = moq_handle_session_tag(h._opaque);
@@ -261,6 +261,16 @@ const moq_resolved_window_t *moq_session_sub_resolved_window(
     moq_sub_entry_t *e = &s->subs[slot];
     if (e->role != MOQ_SUB_ROLE_PUBLISHER || !e->window.has_window) return NULL;
     return &e->window;
+}
+
+moq_group_order_t moq_session_subscription_group_order(
+    const moq_session_t *s, moq_subscription_t sub)
+{
+    if (!s) return MOQ_GROUP_ORDER_DEFAULT;
+    int slot = sub_resolve_handle(s, sub);
+    if (slot < 0) return MOQ_GROUP_ORDER_DEFAULT;
+    const moq_sub_entry_t *e = &s->subs[slot];
+    return session_group_order(e->group_order, e->track_group_order);
 }
 
 static void sub_free_entry(moq_session_t *s, size_t slot)
@@ -3227,6 +3237,8 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
         }
     }
 
+    const uint8_t track_order = s->profile->track_properties_group_order(
+        d->track_properties, d->track_properties_len);
     moq_event_t e;
     memset(&e, 0, sizeof(e));
     e.kind = MOQ_EVENT_SUBSCRIBE_OK;
@@ -3241,6 +3253,7 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
     e.u.subscribe_ok.expires_ms = d->expires_ms;
     e.u.subscribe_ok.track_properties = props;
     e.u.subscribe_ok.dynamic_groups = d->dynamic_groups;
+    e.u.subscribe_ok.publisher_group_order = track_order;
 
     moq_result_t rc = push_event(s, &e);
     if (rc < 0) {
@@ -3256,8 +3269,7 @@ moq_result_t session_core_on_subscribe_ok(moq_session_t *s,
     sub_leave_pending(&s->subs[slot]);
     s->subs[slot].state = MOQ_SUB_ESTABLISHED;
     s->subs[slot].track_alias = d->track_alias;
-    s->subs[slot].track_group_order = s->profile->track_properties_group_order(
-        d->track_properties, d->track_properties_len);
+    s->subs[slot].track_group_order = track_order;
     s->subs[slot].default_publisher_priority = default_priority;
     s->subs[slot].has_largest = d->has_largest;
     s->subs[slot].largest_group = d->has_largest ? d->largest_group : 0;
@@ -3847,6 +3859,16 @@ moq_result_t session_update_freeze_fill(const moq_sub_update_snapshot_t *v,
     return MOQ_OK;
 }
 
+/* Action slots the update's subscriber priority change needs. */
+static size_t sub_update_priority_slots(const moq_session_t *s,
+                                        const moq_sub_entry_t *e,
+                                        const moq_sub_update_t *u)
+{
+    return session_owner_priority_slots(s, u->has_subscriber_priority,
+                                        u->subscriber_priority,
+                                        e->subscriber_priority);
+}
+
 /* Take the Largest snapshot and admit the update's fill request. The fill
  * child inherits the update's own values where set, else the subscription's
  * current ones. A pool with no slot for it does not hold the update up: when
@@ -3941,6 +3963,9 @@ static void sub_update_commit(moq_session_t *s, size_t slot, const moq_sub_updat
     memset(&e->update_snapshot, 0, sizeof(e->update_snapshot));
     if (u->has_forward)
         e->forward = u->forward;
+    if (sub_update_priority_slots(s, e, u))
+        (void)session_update_owner_priority(s, e->handle._opaque,
+                                            u->subscriber_priority);
     if (u->has_subscriber_priority)
         e->subscriber_priority = u->subscriber_priority;
     if (u->dt_has_object) {
@@ -4404,7 +4429,12 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
         return MOQ_OK;
     }
 
-    if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
+    /* Plus the changed subscriber priority's owner-wide key. */
+    size_t ok_actions = 1 + sub_update_priority_slots(s, e, &u);
+    if (action_queue_avail(s) < ok_actions) {
+        result = MOQ_ERR_WOULD_BLOCK;
+        goto cleanup_all;
+    }
 
     moq_subscription_update_options_t *options = NULL;
     rc = session_update_stage_options(s, &u, d->tokens, d->token_count, &options);
@@ -4418,7 +4448,7 @@ moq_result_t session_core_on_request_update(moq_session_t *s,
     if (rc < 0) { result = rc; goto cleanup_all; }
 
     moq_update_plan_t plan;
-    rc = sub_update_prepare(s, (size_t)d->target_slot, &u, 1, &plan);
+    rc = sub_update_prepare(s, (size_t)d->target_slot, &u, ok_actions, &plan);
     if (rc < 0) { result = rc; goto cleanup_all; }
 
     rc = sub_update_queue_ok(s, (size_t)d->target_slot, d->request_id, &plan);
@@ -4571,10 +4601,12 @@ moq_result_t session_accept_subscription_update_receipt(
     uint32_t n = e->owed_update.count;
 
     /* The whole answer is reserved before anything is queued: one REQUEST_OK
-     * per covered update, every byte of them, and the fill. */
-    if (action_queue_avail(s) < n) return MOQ_ERR_WOULD_BLOCK;
+     * per covered update, every byte of them, the subscriber priority's
+     * owner-wide key, and the fill. */
+    size_t ok_actions = n + sub_update_priority_slots(s, e, &e->owed_update.rec);
+    if (action_queue_avail(s) < ok_actions) return MOQ_ERR_WOULD_BLOCK;
     moq_update_plan_t plan;
-    rc = sub_update_prepare(s, (size_t)slot, &e->owed_update.rec, n, &plan);
+    rc = sub_update_prepare(s, (size_t)slot, &e->owed_update.rec, ok_actions, &plan);
     if (rc < 0) return rc;
     rc = session_update_accept_fits(s, &e->owed_update, &plan);
     if (rc < 0) return rc;

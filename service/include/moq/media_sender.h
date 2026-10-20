@@ -529,6 +529,19 @@ typedef struct moq_media_track_cfg {
      * track_properties: subscribers may then ask the sender to start a new
      * group, which moq_media_sender_take_new_group_request() reports. */
     bool        dynamic_groups;
+    /* The track's group order (MOQT 7.1), ASCENDING or DESCENDING,
+     * advertised as DEFAULT_PUBLISHER_GROUP_ORDER and added to
+     * track_properties as dynamic_groups is; a subscriber's own order takes
+     * precedence. DEFAULT (the default) advertises none. Other values:
+     * add_track fails MOQ_ERR_INVAL. The catalog and timeline tracks always
+     * keep DEFAULT. Aligned past dynamic_groups on every target, so a
+     * caller's struct_size that ends there never covers it. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    moq_group_order_t group_order;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \

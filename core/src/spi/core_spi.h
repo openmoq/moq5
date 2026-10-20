@@ -2,13 +2,14 @@
 #define MOQ_CORE_SPI_H
 
 /*
- * Same-build interface between libmoq-core and the relay built with it. Each
- * symbol here is exported from the core library so a shared relay library
- * can call it, which makes it a private same-build ABI: a binary dependency
- * between a core and a relay built together, not a stable or public ABI. No
- * installed header declares it, and it changes with the core it ships beside.
- * tests/cmake/check_core_spi_symbols.cmake pins the exact exported set. Wire
- * decoding stays in the core; the relay receives values, never wire forms.
+ * Same-build interface between libmoq-core and the relay and media service
+ * built with it. Each symbol here is exported from the core library so a
+ * shared relay or service library can call it, which makes it a private
+ * same-build ABI: a binary dependency between components built together, not
+ * a stable or public ABI. No installed header declares it, and it changes with
+ * the core it ships beside. tests/cmake/check_core_spi_symbols.cmake pins the
+ * exact exported set. Wire decoding stays in the core; callers receive
+ * values, never wire forms.
  */
 
 #include <moq/export.h>
@@ -37,6 +38,15 @@ MOQ_API bool moq_core_internal_track_max_cache_duration(moq_version_t version,
                                                         const uint8_t *props,
                                                         size_t len,
                                                         uint64_t *out_ms);
+
+/* moq_track_properties_validate() with the track's group order as well,
+ * checked as the publisher facade adds it (DEFAULT_PUBLISHER_GROUP_ORDER,
+ * draft-22 10.5): a set that already carries another order, or an order
+ * other than the three defined, is MOQ_ERR_INVAL. MOQ_GROUP_ORDER_DEFAULT
+ * checks nothing more. */
+MOQ_API moq_result_t moq_core_internal_track_properties_validate(
+    moq_version_t version, const uint8_t *props, size_t len,
+    bool dynamic_groups, moq_group_order_t group_order);
 
 #ifdef __cplusplus
 }

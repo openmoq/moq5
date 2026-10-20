@@ -42,6 +42,7 @@ endif()
 # adapter-ABI change.
 set(BASE_SYMBOLS
     moq_transport_bridge_cfg_init
+    moq_transport_bridge_cfg_init_sized
     moq_transport_bridge_create
     moq_transport_bridge_destroy
     moq_transport_bridge_service
@@ -54,6 +55,7 @@ set(BASE_SYMBOLS
     moq_transport_bridge_on_peer_stream_terminal
     moq_transport_bridge_on_local_stream_committed
     moq_transport_bridge_on_peer_datagram
+    moq_transport_bridge_on_stream_drained
     moq_transport_bridge_on_transport_close
     moq_transport_bridge_on_transport_error
     moq_transport_bridge_is_fatal

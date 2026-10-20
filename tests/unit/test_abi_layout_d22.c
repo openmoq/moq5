@@ -954,7 +954,12 @@ PIN_THROUGH(moq_pub_track_cfg_t, monotonic_groups, 72, 44, 48, 8, 4, 8);
 PIN_AFTER(moq_pub_track_cfg_t, monotonic_groups, track_properties);
 PIN_AT(moq_pub_track_cfg_t, track_properties, 72, 48, 48);
 PIN_AT(moq_pub_track_cfg_t, dynamic_groups, 88, 56, 56);
-PIN_SIZE(moq_pub_track_cfg_t, 96, 60, 64);
+/* group_order follows another reservation past the layout that ends at
+ * dynamic_groups. */
+PIN_THROUGH(moq_pub_track_cfg_t, dynamic_groups, 96, 60, 64, 8, 4, 8);
+PIN_AFTER(moq_pub_track_cfg_t, dynamic_groups, group_order);
+PIN_AT(moq_pub_track_cfg_t, group_order, 96, 64, 64);
+PIN_SIZE(moq_pub_track_cfg_t, 104, 68, 72);
 PIN_AT(moq_pub_new_group_request_info_t, requested_group, 8, 8, 8);
 PIN_AT(moq_pub_new_group_request_info_t, current_group, 16, 16, 16);
 PIN_SIZE(moq_pub_new_group_request_info_t, 24, 24, 24);
@@ -991,6 +996,7 @@ PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           track_properties);
 PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           dynamic_groups);
+PIN_AFTER(moq_media_track_cfg_t, dynamic_groups, group_order);
 _Static_assert(offsetof(moq_media_track_cfg_t, track_properties) ==
                ABI_SIZEOF_THROUGH(moq_media_track_cfg_t,
                                   mpeg2ts_forward_before_random_access),

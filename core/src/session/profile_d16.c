@@ -3985,6 +3985,18 @@ static uint8_t d16_track_properties_group_order(const uint8_t *data, size_t len)
     }
 }
 
+/* DEFAULT_PUBLISHER_GROUP_ORDER = `order` added to a Track Extension list. */
+static moq_result_t d16_track_properties_add_group_order(const uint8_t *in,
+                                                         size_t len,
+                                                         uint8_t order,
+                                                         uint8_t *out,
+                                                         size_t cap,
+                                                         size_t *out_len)
+{
+    return moq_kvp_list_add_int(in, len, false, D16_EXT_GROUP_ORDER, order,
+                                out, cap, out_len);
+}
+
 /* §11.1.1 MAX_CACHE_DURATION Track Extension (0x04), milliseconds. */
 #define D16_EXT_MAX_CACHE_DURATION 0x04u
 static bool d16_track_properties_max_cache(const uint8_t *data, size_t len,
@@ -5082,6 +5094,7 @@ static const moq_profile_ops_t d16_ops = {
     .track_properties_add_dynamic_groups = d16_track_properties_add_dynamic_groups,
     .validate_track_properties = d16_validate_track_properties,
     .track_properties_group_order = d16_track_properties_group_order,
+    .track_properties_add_group_order = d16_track_properties_add_group_order,
     .track_properties_max_cache = d16_track_properties_max_cache,
     /* §2.4.2: "When a subscriber detects a Malformed Track, it MUST
      * UNSUBSCRIBE any subscription and FETCH_CANCEL any fetch for that Track

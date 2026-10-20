@@ -27,6 +27,7 @@
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 
 #include "endpoint_internal.h"
+#include "../../core/src/spi/core_spi.h"
 
 #ifdef MOQ_SERVICE_HAVE_MPEG2TS
 #include <moq/mpeg2ts.h>
@@ -96,6 +97,10 @@ _Static_assert(offsetof(moq_media_track_cfg_t, dynamic_groups) ==
                offsetof(moq_media_track_cfg_t, track_properties) +
                sizeof(moq_bytes_t),
                "dynamic_groups must directly follow track_properties");
+_Static_assert(offsetof(moq_media_track_cfg_t, group_order) ==
+               ((offsetof(moq_media_track_cfg_t, dynamic_groups) + sizeof(bool) +
+                 _Alignof(uint64_t) - 1u) & ~((size_t)_Alignof(uint64_t) - 1u)),
+               "group_order must begin at the aligned end of dynamic_groups");
 
 /* Minimum accepted moq_media_sender_cfg_t size: the prefix through the last
  * pre-callbacks field. A create/attach caller must supply at least this; the
@@ -180,6 +185,7 @@ struct moq_media_track {
     int                   alt_group;
     bool                  has_publisher_priority;
     uint8_t               publisher_priority;
+    moq_group_order_t     group_order;         /* MOQT 7.1; DEFAULT = none */
 
     /* CMSF authoring metadata (copied at add_track). cp_ref_ids is its own
      * allocation; the id bytes live in `strings` with the other spans. */
@@ -2130,6 +2136,7 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
         tcfg.has_publisher_priority = true;
         tcfg.publisher_priority = t->publisher_priority;
     }
+    tcfg.group_order = t->group_order;
     /* The sender's production is strictly monotonic on every track: media
      * emission drains group_seq in order (eviction only drops OLDER groups
      * before emission; an abandoned group never rewinds), and catalog
@@ -5024,6 +5031,8 @@ static void sender_track_cfg_read(const moq_media_track_cfg_t *in,
         out->track_properties = in->track_properties;
     if (TCFG_HAS(dynamic_groups))
         out->dynamic_groups = in->dynamic_groups;
+    if (TCFG_HAS(group_order))
+        out->group_order = in->group_order;
 #undef TCFG_HAS
     out->struct_size = (uint32_t)sizeof(*out);
 }
@@ -5120,6 +5129,8 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     }
     /* MSF §5.2.35: trackDuration MUST NOT appear on a live track. */
     if (cfg->has_track_duration && cfg->is_live) return MOQ_ERR_INVAL;
+    /* Also when no version is known yet to check the properties against. */
+    if (cfg->group_order > MOQ_GROUP_ORDER_DESCENDING) return MOQ_ERR_INVAL;
 
     /* A terminal sender (fatal, or its endpoint closed) registers nothing:
      * checked here outside s->mu (sender_terminal takes it), and again inside
@@ -5142,16 +5153,18 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
      * failing the sender when the track activates: against the negotiated
      * version once known, before that against every version the endpoint
      * offers (any may be negotiated). */
-    if (cfg->track_properties.len > 0 || cfg->dynamic_groups) {
+    if (cfg->track_properties.len > 0 || cfg->dynamic_groups ||
+        cfg->group_order != MOQ_GROUP_ORDER_DEFAULT) {
         moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
         size_t nv = 1;
         if (negotiated) versions[0] = negotiated;
         else nv = moq_endpoint_offered_versions_internal(s->ep, versions,
                                                          MOQ_ENDPOINT_MAX_VERSIONS);
         for (size_t i = 0; i < nv && i < MOQ_ENDPOINT_MAX_VERSIONS; i++) {
-            moq_result_t vrc = moq_track_properties_validate(versions[i],
-                cfg->track_properties.data, cfg->track_properties.len,
-                cfg->dynamic_groups);
+            moq_result_t vrc = moq_core_internal_track_properties_validate(
+                versions[i], cfg->track_properties.data,
+                cfg->track_properties.len, cfg->dynamic_groups,
+                cfg->group_order);
             if (vrc == MOQ_ERR_INVAL || vrc == MOQ_ERR_NOMEM) return vrc;
         }
     }
@@ -5217,6 +5230,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     t->alt_group = cfg->alt_group;
     t->has_publisher_priority = cfg->has_publisher_priority;
     t->publisher_priority = cfg->publisher_priority;
+    t->group_order = cfg->group_order;
     t->has_max_grp_sap = cfg->has_max_grp_sap;
     t->max_grp_sap = cfg->max_grp_sap;
     t->has_max_obj_sap = cfg->has_max_obj_sap;

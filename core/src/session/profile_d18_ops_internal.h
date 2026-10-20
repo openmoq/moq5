@@ -28,6 +28,12 @@ moq_result_t moq_d18_op_track_properties_add_dynamic_groups(const uint8_t *in,
                                                             size_t *out_len);
 uint8_t moq_d18_op_track_properties_group_order(const uint8_t *data,
                                                 size_t len);
+moq_result_t moq_d18_op_track_properties_add_group_order(const uint8_t *in,
+                                                         size_t len,
+                                                         uint8_t order,
+                                                         uint8_t *out,
+                                                         size_t cap,
+                                                         size_t *out_len);
 bool moq_d18_op_track_properties_max_cache(const uint8_t *data, size_t len,
                                            uint64_t *out_ms);
 moq_result_t moq_d18_op_decode_subgroup_header(

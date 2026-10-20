@@ -547,6 +547,22 @@ uint8_t moq_d18_op_track_properties_group_order(const uint8_t *data, size_t len)
     return d18_props_group_order(data, len, false);
 }
 
+/* DEFAULT_PUBLISHER_GROUP_ORDER = `order` added to a Track Property list,
+ * which draft-22 shares, looked up together with IMMUTABLE_PROPERTIES as
+ * DYNAMIC_GROUPS is. */
+moq_result_t moq_d18_op_track_properties_add_group_order(const uint8_t *in,
+                                                         size_t len,
+                                                         uint8_t order,
+                                                         uint8_t *out,
+                                                         size_t cap,
+                                                         size_t *out_len)
+{
+    if (!out_len) return MOQ_ERR_INVAL;
+    return moq_kvp_list_merge_int(in, len, true, D18_PROP_GROUP_ORDER, order,
+                                  D18_PROP_IMMUTABLE_PROPERTIES, out, cap,
+                                  out_len);
+}
+
 /* §12.3 MAX_CACHE_DURATION (0x04): an integer of milliseconds. */
 #define D18_PROP_MAX_CACHE_DURATION 0x04u
 static bool d18_props_max_cache(const uint8_t *data, size_t len, bool nested,
@@ -2384,6 +2400,7 @@ static const moq_profile_ops_t d18_ops = {
     .track_properties_dynamic_groups = moq_d18_op_track_properties_dynamic_groups,
     .track_properties_add_dynamic_groups = moq_d18_op_track_properties_add_dynamic_groups,
     .track_properties_group_order = moq_d18_op_track_properties_group_order,
+    .track_properties_add_group_order = moq_d18_op_track_properties_add_group_order,
     .track_properties_max_cache = moq_d18_op_track_properties_max_cache,
     .encode_publish_ok       = d18_encode_publish_ok,
     .encode_track_status     = d18_encode_track_status,
