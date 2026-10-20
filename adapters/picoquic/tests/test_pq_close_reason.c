@@ -43,7 +43,7 @@ static void close_endpoint(picoquic_cnx_t *cnx)
 {
     pq_endpoint_ctx_t ep = {0};
     moq_transport_endpoint_ops_t ops = {0};
-    CHECK(pq_endpoint_init(&ops, &ep, cnx, moq_alloc_default()) == 0);
+    CHECK(pq_endpoint_init(&ops, &ep, cnx, moq_alloc_default(), 0) == 0);
     if (!ep.queue) return;
     static const uint8_t reason[] = "deferred adapter reason";
     CHECK(ops.close_transport(&ep, 42, reason, sizeof(reason) - 1) == MOQ_TRANSPORT_OK);
@@ -139,7 +139,7 @@ int main(void)
         cnx->cnx_state = picoquic_state_ready;
         pq_endpoint_ctx_t ep = {0};
         moq_transport_endpoint_ops_t ops = {0};
-        CHECK(pq_endpoint_init(&ops, &ep, cnx, moq_alloc_default()) == 0);
+        CHECK(pq_endpoint_init(&ops, &ep, cnx, moq_alloc_default(), 0) == 0);
         if (!ep.queue) { picoquic_free(quic); return 2; }
         CHECK(ops.close_transport(&ep, 42, (const uint8_t *)expected,
             lengths[i]) == MOQ_TRANSPORT_OK);

@@ -422,6 +422,12 @@ typedef struct moq_endpoint_cfg {
      * reserved in v0, so today these fields can only be left zero. */
     moq_uri_accept_fn accept_uri;
     void *accept_uri_ctx;
+    /* appended (enabled by struct_size): the transport adapter's outbound
+     * queue bound in bytes (see moq_pq_conn_cfg_t); 0 = adapter default.
+     * Honored by raw QUIC over picoquic only; WebTransport and the other
+     * backends ignore it. Set it via moq_endpoint_cfg_init_sized(&cfg,
+     * sizeof cfg). */
+    uint64_t send_queue_cap_bytes;
 } moq_endpoint_cfg_t;
 
 #define MOQ_ENDPOINT_URI_LEGACY   UINT32_C(0)
@@ -450,7 +456,7 @@ typedef struct moq_endpoint_cfg {
  * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0
  * (the backend default) for handshake_timeout_us, to no setup tokens, to no
  * application certificate callback, LEGACY for uri_mode, the library default
- * for preferred_version and no URI policy. Because it never writes past the v0
+ * for preferred_version, no URI policy and the adapter's default queue bound. Because it never writes past the v0
  * floor, it can NEVER overflow the buffer of an old caller that predates a
  * later tail field. To SET any tail field, use moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
@@ -459,7 +465,7 @@ MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
  * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
  * handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,
  * verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,
- * accept_uri). Pass sizeof(moq_endpoint_cfg_t).
+ * accept_uri, send_queue_cap_bytes). Pass sizeof(moq_endpoint_cfg_t).
  * Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller
  * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,

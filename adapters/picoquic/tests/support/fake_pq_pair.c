@@ -157,11 +157,15 @@ uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *cnx, int is_unidir)
     return id;
 }
 
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *cnx, uint64_t stream_id,
+                                void *app_stream_ctx)
+{
+    (void)cnx; (void)stream_id; (void)app_stream_ctx;
+    return 0;
+}
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
 /* The provider's terminal-observation contract (patch 0007): opt-in and the
  * exact STOP code, inert here. */
-int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
-    { (void)c; (void)sid; (void)ctx; return 0; }
 int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
     { (void)c; (void)sid; return 0; }
 int picoquic_get_remote_stop_error(picoquic_cnx_t *c, uint64_t sid,

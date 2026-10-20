@@ -56,8 +56,6 @@ static picoquic_state_enum g_cnx_state = picoquic_state_ready;
 
 picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c) { (void)c; return NULL; }
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
-int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
-{ (void)c; (void)sid; (void)ctx; return 0; }
 int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
 { (void)c; (void)sid; return 0; }
 int picoquic_get_remote_stop_error(picoquic_cnx_t *c, uint64_t sid, uint64_t *out)
@@ -97,6 +95,8 @@ uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin, i
       return nb <= sizeof(g_provide_buf) ? g_provide_buf : NULL; }
 uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t *c, int uni)
     { (void)c; uint64_t id = uni ? g_next_uni : g_next_bidi; if (uni) g_next_uni += 4; else g_next_bidi += 4; return id; }
+int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
+    { (void)c; (void)sid; (void)ctx; return 0; }
 uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t *c, uint64_t sid)
     { (void)c; (void)sid; return g_reset_code; }
 

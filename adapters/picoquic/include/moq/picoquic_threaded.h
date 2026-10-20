@@ -320,6 +320,10 @@ typedef struct moq_pq_threaded_cfg {
      * carrying the target and any setup_auth_tokens must fit the session
      * send arena together. Set via moq_pq_threaded_cfg_init_sized. */
     const moq_connection_target_t *target;
+    /* Appended: every connection's moq_pq_conn_cfg_t send_queue_cap_bytes
+     * (see <moq/picoquic.h>). 0 = default. Set via
+     * moq_pq_threaded_cfg_init_sized. */
+    uint64_t           send_queue_cap_bytes;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
