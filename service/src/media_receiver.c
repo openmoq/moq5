@@ -314,6 +314,12 @@ struct moq_media_track {
     bool             done_pending;
     uint64_t         done_status;
     bool             vod_rearmed;
+    /* A catalog dropped the track while its subscription was delivering.
+     * MOQT keeps a subscription until its PUBLISH_DONE, and a catalog that
+     * drops a track (such as the isComplete catalog of MSF §11.3) promises
+     * no NEW content: what is already sent is still delivered, and the
+     * removal completes when the done is processed. */
+    bool             removal_pending;
     bool             has_drop_filter;  /* monotonic: arrivals with
                                           group_id <= drop_below_group are
                                           stragglers of evicted content.
@@ -1826,6 +1832,7 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
             r, mt->name, mt->has_namespace, mt->namespace_);
         if (live) {
             live->recon_seen = true;
+            live->removal_pending = false;   /* listed again */
             /* live->VOD conversion (§11.3): the immutable check already proved
              * any change is the sanctioned is_live true->false / trackDuration
              * absent->present. If is_live or duration actually changed, update
@@ -1884,6 +1891,14 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
         if (t->removed || t->recon_seen) continue;
+        /* A delivering subscription ends at its PUBLISH_DONE. A VOD re-arm
+         * has delivered nothing and expects a conversion the catalog rules
+         * out, so it is removed at once. desired_subscribed stays: clearing
+         * it would stop forwarding before the last objects arrive. */
+        if (t->sub_track && t->local_result == MOQ_OK && !t->ended && !t->vod_rearmed) {
+            t->removal_pending = true;
+            continue;
+        }
         pthread_mutex_lock(&r->mu);
         t->removed = true;
         t->desired_subscribed = false;
@@ -4350,7 +4365,17 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         t->upd_sent_app_gen = 0;
         pthread_mutex_unlock(&r->mu);
 
-        if (status == RECEIVER_DONE_TRACK_ENDED && !t->vod_rearmed && !t->ended) {
+        if (t->removal_pending) {
+            /* The catalog dropped the track: its delivered objects stay
+             * queued, and the removal completes now (no VOD re-arm). */
+            pthread_mutex_lock(&r->mu);
+            t->removed = true;
+            t->desired_subscribed = false;
+            pthread_mutex_unlock(&r->mu);
+            t->removal_pending = false;
+            if (!rq_push(r, MOQ_MEDIA_TRACK_REMOVED, t))
+                return;   /* overflow already terminalized */
+        } else if (status == RECEIVER_DONE_TRACK_ENDED && !t->vod_rearmed && !t->ended) {
             /* Re-arm for VOD: keep desired_subscribed; reset the lifecycle flags
              * so the track_state accessor reads PENDING again until the VOD
              * SUBSCRIBE_OK lands. Delivered media stays in the object queue. */

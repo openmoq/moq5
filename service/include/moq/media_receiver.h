@@ -388,7 +388,11 @@ typedef enum moq_media_track_event_kind {
                                     changes remain immutable-tuple violations
                                     (§5.3) and are dropped. The handle's desc is
                                     updated in place before this fires. */
-    MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog generation */
+    MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog generation.
+                                    A track whose subscription is still
+                                    delivering keeps delivering: this fires at
+                                    its PUBLISH_DONE, after its last Object, and
+                                    until then only a session close ends it. */
     MOQ_MEDIA_TRACK_ENDED,       /* peer end-of-track / rejection */
     MOQ_MEDIA_CATALOG_READY,     /* first (independent) catalog enumerated; fires
                                     exactly once per connection (later generations

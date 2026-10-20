@@ -67,6 +67,9 @@ typedef struct {
     atomic_bool      converted;          /* latched once conversion is published */
     atomic_bool      media_rejoined;     /* latched when the media track regains a
                                             subscriber after the conversion */
+    atomic_bool      hold_finish;        /* publish the conversion catalog but
+                                            finish the subscribers only once the
+                                            test clears this */
 } srv_state_t;
 
 /* One LOC media catalog: a single RAW video track. Objects are grouped in
@@ -97,6 +100,11 @@ static const char k_media_vod_catalog_json[] =
     "\"role\":\"video\",\"codec\":\"av01\",\"timescale\":1000000,"
     "\"trackDuration\":8072340}"
     "]}";
+
+/* The MSF §11.3 catalog that ends a live broadcast for good: isComplete and
+ * no track, so "v" leaves the catalog. */
+static const char k_media_complete_catalog_json[] =
+    "{\"version\":1,\"generatedAt\":2,\"isComplete\":true,\"tracks\":[]}";
 
 /* Two-track variant: "v" plus a second track, for scenarios that need a
  * TRACK_ADDED overflow while a subscribable media track exists. */
@@ -699,7 +707,7 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
          * on the catalog publish below retries ONLY the catalog -- never a second
          * finish_subscribers, which could complete a subscriber that has already
          * re-joined (mirrors media_sender.c clearing vod_finish_pending). */
-        if (!atomic_load(&st->finish_done)) {
+        if (!atomic_load(&st->finish_done) && !atomic_load(&st->hold_finish)) {
             moq_result_t fr = moq_pub_finish_subscribers(
                 st->pub, st->media_track, st->convert_status, now_us);
             if (fr == MOQ_ERR_WOULD_BLOCK || fr == MOQ_ERR_WRONG_STATE) {
@@ -749,6 +757,19 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
             if (src != MOQ_OK) { st->failed = true; return -1; }
         }
         atomic_store(&st->converted, true);
+    }
+
+    /* A held finish runs once the test releases it, after the catalog. */
+    if (st->media_track && atomic_load(&st->converted) &&
+        !atomic_load(&st->hold_finish) && !atomic_load(&st->finish_done)) {
+        moq_result_t fr = moq_pub_finish_subscribers(
+            st->pub, st->media_track, st->convert_status, now_us);
+        if (fr == MOQ_OK)
+            atomic_store(&st->finish_done, true);
+        else if (fr != MOQ_ERR_WOULD_BLOCK && fr != MOQ_ERR_WRONG_STATE) {
+            st->failed = true;
+            return -1;
+        }
     }
 
     (void)moq_pub_tick(st->pub, now_us);
@@ -1699,6 +1720,126 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_track_state(r, track, &ts), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)ts, (int)MOQ_MEDIA_TRACK_STATE_ENDED);
+
+        moq_media_receiver_destroy(r);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_CHECK(!g_srv.failed);
+    }
+
+    /* == a catalog that drops a subscribed track keeps delivering it: MOQT
+     *    keeps a subscription until its PUBLISH_DONE, and the isComplete
+     *    catalog of MSF §11.3 promises no NEW content. Objects queued before
+     *    the catalog and Objects that arrive after it, before the done, are
+     *    delivered; the removal completes at the done (TRACK_REMOVED, no
+     *    TRACK_ENDED, no re-subscribe). ================================ */
+    {
+        moq_pq_threaded_t *srv = NULL;
+        moq_media_receiver_t *r = NULL;
+        MOQ_TEST_CHECK(start_media_pair(cert, key,
+            MOQ_MEDIA_OVERFLOW_DROP_GROUP, 0, 0, MOQ_MEDIA_TIME_RAW, &srv, &r));
+        if (!srv || !r) return 1;
+
+        moq_media_track_t *track = drain_until_ready(r);
+        MOQ_TEST_CHECK(track != NULL);
+        atomic_store(&g_srv.publish_target, 6);
+        MOQ_TEST_CHECK(wait_received(r, 6, 200));   /* queued, not polled */
+
+        g_srv.vod_catalog_json = k_media_complete_catalog_json;
+        g_srv.convert_status = MOQ_PUB_DONE_TRACK_ENDED;
+        atomic_store(&g_srv.hold_finish, true);
+        atomic_store(&g_srv.convert_after, 6);
+
+        moq_media_receiver_stats_t st;
+        bool complete = false;
+        for (int i = 0; i < 200 && !complete; i++) {
+            usleep(50000);   /* wait() returns at once while objects are queued */
+            (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
+            complete = st.catalog_complete;
+        }
+        MOQ_TEST_CHECK(complete);
+
+        /* Objects still in flight when the catalog lands (openmoq/moq2ts#8). */
+        atomic_store(&g_srv.publish_target, 9);
+        MOQ_TEST_CHECK(wait_received(r, 9, 200));
+
+        int removed = 0, ended = 0, got = 0;
+        moq_media_track_event_t ev;
+        while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+            if (ev.track != track) continue;
+            if (ev.kind == MOQ_MEDIA_TRACK_REMOVED) removed++;
+            if (ev.kind == MOQ_MEDIA_TRACK_ENDED) ended++;
+        }
+        MOQ_TEST_CHECK_EQ_INT(removed, 0);
+        moq_media_object_t obj;
+        while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
+            if (obj.track == track) got++;
+            moq_media_object_cleanup(&obj);
+        }
+        MOQ_TEST_CHECK_EQ_INT(got, 9);
+
+        atomic_store(&g_srv.hold_finish, false);
+        for (int i = 0; i < 200 && removed == 0; i++) {
+            (void)moq_media_receiver_wait(r, 50000);
+            while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK)
+                moq_media_object_cleanup(&obj);
+            while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+                if (ev.track != track) continue;
+                if (ev.kind == MOQ_MEDIA_TRACK_REMOVED) removed++;
+                if (ev.kind == MOQ_MEDIA_TRACK_ENDED) ended++;
+            }
+            if (moq_media_receiver_is_fatal(r)) break;
+        }
+        MOQ_TEST_CHECK_EQ_INT(removed, 1);
+        MOQ_TEST_CHECK_EQ_INT(ended, 0);
+        MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+
+        moq_media_receiver_destroy(r);
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_CHECK(!g_srv.failed);
+    }
+
+    /* == MSF §11.3 order: PUBLISH_DONE (Track Ended) on the media track, then
+     *    the isComplete catalog. Every object is delivered, and the catalog
+     *    ends the track (TRACK_REMOVED) even though the done re-armed it for
+     *    a VOD conversion that the catalog rules out. ================== */
+    {
+        moq_pq_threaded_t *srv = NULL;
+        moq_media_receiver_t *r = NULL;
+        MOQ_TEST_CHECK(start_media_pair(cert, key,
+            MOQ_MEDIA_OVERFLOW_DROP_GROUP, 0, 0, MOQ_MEDIA_TIME_RAW, &srv, &r));
+        if (!srv || !r) return 1;
+
+        moq_media_track_t *track = drain_until_ready(r);
+        MOQ_TEST_CHECK(track != NULL);
+        atomic_store(&g_srv.publish_target, 6);
+        MOQ_TEST_CHECK(wait_received(r, 6, 200));
+
+        g_srv.vod_catalog_json = k_media_complete_catalog_json;
+        g_srv.convert_status = MOQ_PUB_DONE_TRACK_ENDED;
+        atomic_store(&g_srv.convert_after, 6);
+
+        int removed = 0, ended = 0, got = 0;
+        for (int i = 0; i < 300 && removed == 0; i++) {
+            (void)moq_media_receiver_wait(r, 50000);
+            moq_media_object_t obj;
+            while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
+                if (obj.track == track) got++;
+                moq_media_object_cleanup(&obj);
+            }
+            moq_media_track_event_t ev;
+            while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+                if (ev.track != track) continue;
+                if (ev.kind == MOQ_MEDIA_TRACK_REMOVED) removed++;
+                if (ev.kind == MOQ_MEDIA_TRACK_ENDED) ended++;
+            }
+            if (moq_media_receiver_is_fatal(r)) break;
+        }
+        MOQ_TEST_CHECK_EQ_INT(got, 6);
+        MOQ_TEST_CHECK_EQ_INT(removed, 1);
+        MOQ_TEST_CHECK_EQ_INT(ended, 0);
+        MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
 
         moq_media_receiver_destroy(r);
         moq_pq_threaded_stop(srv);
