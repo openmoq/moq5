@@ -36,8 +36,9 @@
  *   _create builds picoquic context and starts listening. A per-connection
  *   session and adapter are created lazily on the network thread as each client
  *   connects, up to cfg.max_connections (default 1024); a connection past the
- *   cap is rejected. Before the first client, on_lane_pump is not called and the
- *   legacy _session()/_conn() return NULL. Iterate connections with
+ *   cap is rejected. on_lane_pump runs whether or not a connection exists;
+ *   with none, lane iteration is empty and the legacy _session()/_conn()
+ *   return NULL. Iterate connections with
  *   moq_pq_threaded_lane_next_conn() (per-connection API below); the legacy
  *   _session()/_conn() return the FIRST live connection for single-connection
  *   convenience.
@@ -150,8 +151,9 @@ typedef struct moq_pq_threaded_cfg {
      * moq_pq_threaded_lane_next_conn().  All session/adapter/facade calls
      * are safe.
      *
-     * For server mode, on_lane_pump is NOT called until the first inbound
-     * connection has been accepted. Normally once per loop iteration;
+     * In server mode on_lane_pump runs once per loop iteration -- after
+     * receiving, after sending, on a wake, and when app_deadline_us is due --
+     * with or without accepted connections (with none, iteration is empty);
      * when a connection turns terminal in the post-pump service pass,
      * ONE extra sequential invocation runs in the same iteration so the
      * dead connection is observable before it is pruned (the terminal-
@@ -244,9 +246,10 @@ typedef struct moq_pq_threaded_cfg {
     /* Appended (struct_size append-only ABI, read as ONE block through
      * app_deadline_ctx). Optional application service-deadline query: returns
      * the app's earliest pending time-based deadline (µs, this facade's clock),
-     * or UINT64_MAX for none. Folded into the packet loop's next wake after each
-     * pump, so a purely time-based service deadline (e.g. a periodic catalog
-     * refresh) wakes an otherwise-idle managed loop. MUST be pure/non-blocking
+     * or UINT64_MAX for none. Read before every wait of the packet loop (and
+     * after each pump), so a purely time-based service deadline (e.g. a
+     * periodic catalog refresh) wakes an otherwise-idle managed loop, a server
+     * with no connection included. MUST be pure/non-blocking
      * and MUST NOT re-enter the facade. NULL = none. The fold happens only
      * during a pump, so when application state changes the value this query
      * would return, the owner MUST issue a facade/lane wake (moq_pq_threaded_wake
@@ -320,6 +323,45 @@ typedef struct moq_pq_threaded_cfg {
      * carrying the target and any setup_auth_tokens must fit the session
      * send arena together. Set via moq_pq_threaded_cfg_init_sized. */
     const moq_connection_target_t *target;
+
+    /* Reserved: covers the tail padding the layout that ended at `target`
+     * leaves on targets that align pointers to four bytes and uint64_t to
+     * eight, so retain_terminal_until_ack lands at or past that old sizeof.
+     * Never read. */
+    uint32_t           _reserved_retain;
+    /* Appended (struct_size append-only ABI) — terminal retention.
+     * SERVER mode only: true on a client fails _create with MOQ_ERR_INVAL.
+     * false (the default): a terminal connection leaves iteration as described
+     * at moq_pq_threaded_lane_next_conn, and its session is destroyed then.
+     * true: a terminal connection -- closed by the peer, by the transport, by
+     * a service or bridge failure, or by moq_pq_threaded_conn_close -- stays
+     * in iteration, its MoQ session valid and closed, until the application
+     * acknowledges it with moq_picoquic_threaded_conn_ack_terminal; see there.
+     * The QUIC connection itself is closed and released exactly as with
+     * false; only this facade's record and the MoQ session are kept. Read
+     * only when struct_size covers it. Set via moq_pq_threaded_cfg_init_sized. */
+    bool               retain_terminal_until_ack;
+
+    /* Appended (struct_size append-only ABI) — object delivery, forwarded to
+     * moq_session_cfg_t.streaming_objects for every session this facade
+     * creates: true delivers objects as MOQ_EVENT_OBJECT_CHUNK as their bytes
+     * arrive, false (the default) as whole MOQ_EVENT_OBJECT_RECEIVED. */
+    bool               streaming_objects;
+
+    /* Appended (struct_size append-only ABI) — UDP socket buffer size for
+     * the facade's sockets, applied to both send and receive buffers
+     * (picoquic's socket_buffer_size). 0 = the operating-system default.
+     * At most INT32_MAX (what the socket option carries); a larger value
+     * fails _create with MOQ_ERR_INVAL. The operating system may grant less
+     * than it is asked for. */
+    uint32_t           socket_buffer_bytes;
+
+    /* Appended (struct_size append-only ABI) — SERVER listening address.
+     * NULL (the default) listens on every local address. Otherwise an
+     * AF_INET or AF_INET6 address (its port ignored; `port` applies) that the
+     * facade's sockets bind to and send from, and no socket is opened for the
+     * other family. Copied during _create. A client ignores it. */
+    const struct sockaddr *bind_address;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
@@ -461,6 +503,8 @@ moq_result_t moq_pq_threaded_lane_wake(moq_pq_threaded_lane_t *lane);
  * never survives into a later loop iteration. App-requested closes
  * (moq_pq_threaded_conn_close) disappear after the current on_lane_pump, as
  * before -- the app initiated those.
+ * With cfg.retain_terminal_until_ack, every terminal connection instead stays
+ * in iteration until it is acknowledged (moq_picoquic_threaded_conn_ack_terminal).
  */
 moq_pq_threaded_conn_t *moq_pq_threaded_lane_next_conn(
     moq_pq_threaded_lane_t *lane, moq_pq_threaded_conn_t *prev);
@@ -482,7 +526,56 @@ moq_result_t moq_pq_threaded_conn_close(
     moq_pq_threaded_conn_t *conn, uint64_t error_code);
 
 /*
- * Number of active server connections. Safe from any thread.
+ * Opaque per-connection application slot; the facade never reads it, and
+ * never frees what it points to. NULL until set. Valid only inside
+ * on_lane_pump for a handle in the current iteration: outside it, set is a
+ * no-op and get returns NULL. Connection and session POINTER VALUES are not
+ * identities across a connection and its successor (a reclaimed record's
+ * memory may be reused), so per-connection state belongs here, not in maps
+ * keyed by address.
+ */
+MOQ_API void moq_picoquic_threaded_conn_set_user(moq_pq_threaded_conn_t *conn,
+                                                 void *user);
+MOQ_API void *moq_picoquic_threaded_conn_user(const moq_pq_threaded_conn_t *conn);
+
+/*
+ * SERVER, with cfg.retain_terminal_until_ack: tell the facade this terminal
+ * connection may be reclaimed. Before that, the connection stays in iteration
+ * with its session valid, and keeps counting toward cfg.max_connections.
+ *
+ * WHEN IT MAY BE CALLED. Only inside on_lane_pump, for a handle in the
+ * current iteration, once the connection is terminal AND its
+ * MOQ_EVENT_SESSION_CLOSED has been transferred to the application by a poll
+ * of its session; a queued-but-unpolled event is not enough. The pump that
+ * acknowledges need not be the one that polled.
+ *
+ * RESULTS.
+ *   MOQ_OK               accepted; also for a repeated call on the same handle
+ *                        within the callback.
+ *   MOQ_ERR_INVAL        conn == NULL.
+ *   MOQ_ERR_WRONG_STATE  outside on_lane_pump; retention not enabled (or a
+ *                        client facade); the connection is not terminal; or
+ *                        its SESSION_CLOSED has not been polled yet.
+ *
+ * HANDLE LIFETIME. After MOQ_OK the record and its session are reclaimed once
+ * the current on_lane_pump returns, never during it: the current iteration
+ * stays valid, and the handle must not be kept past the callback.
+ *
+ * IF IT IS NEVER CALLED. A terminal connection is never reclaimed because
+ * time passed; once retained connections reach cfg.max_connections, new
+ * connections are refused. A connection that failed before its MoQ session
+ * existed (an unmappable ALPN, a session or adapter that could not be
+ * created) was never accepted: it has no record, counts toward nothing and
+ * needs no acknowledgment. moq_pq_threaded_stop()/destroy() reclaim every
+ * record without acknowledgment.
+ */
+MOQ_API moq_result_t moq_picoquic_threaded_conn_ack_terminal(
+    moq_pq_threaded_conn_t *conn);
+
+/*
+ * Number of server connections in iteration: live, and with
+ * cfg.retain_terminal_until_ack also terminal ones not yet acknowledged.
+ * Safe from any thread.
  */
 size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
 

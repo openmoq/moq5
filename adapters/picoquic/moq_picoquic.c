@@ -1004,6 +1004,19 @@ bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn)
            moq_transport_bridge_has_outbound_pending(conn->bridge);
 }
 
+bool moq_pq_conn_terminal_observed(const moq_pq_conn_t *conn)
+{
+    bool observed = false;
+    if (!conn || !conn->bridge) return false;
+    (void)moq_transport_bridge_terminal_facts(conn->bridge, &observed);
+    return observed;
+}
+
+void moq_pq_conn_release_transport(moq_pq_conn_t *conn)
+{
+    if (conn && conn->cnx) pq_release_cnx(conn, conn->cnx);
+}
+
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
 int moq_pq_callback(picoquic_cnx_t *cnx,

@@ -849,6 +849,61 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
 
+    # Terminal retention until the application acknowledges, for every
+    # terminal cause, plus the per-connection user slot (test-internals for
+    # the service-failure seam).
+    add_executable(test_threaded_retain_terminal
+        tests/test_threaded_retain_terminal.c)
+    target_link_libraries(test_threaded_retain_terminal PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_retain_terminal PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_retain_terminal PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    foreach(_row peer_close app_close service_fatal cap cap_legacy legacy prefix
+                 client stop)
+        add_test(NAME threaded_retain_terminal_${_row}
+                 COMMAND test_threaded_retain_terminal ${_row})
+        set_tests_properties(threaded_retain_terminal_${_row}
+            PROPERTIES TIMEOUT 120)
+    endforeach()
+
+    # The facade's wake scheduling against a model of picoquic's select.
+    add_executable(test_pq_wake_sched tests/test_pq_wake_sched.c)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pq_wake_sched PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pq_wake_sched COMMAND test_pq_wake_sched)
+
+    # The streaming_objects, socket_buffer_bytes and bind_address options, and
+    # the server's pump and wake behaviour.
+    add_executable(test_threaded_server_options
+        tests/test_threaded_server_options.c)
+    target_link_libraries(test_threaded_server_options PRIVATE
+        moq::adapter-picoquic-threaded Threads::Threads)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_server_options PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_server_options PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    foreach(_row streaming_on streaming_off socket_buffer wake_pressure bind_v4
+                 bind_v6 socket_buffer_limit idle_wake idle_deadline)
+        add_test(NAME threaded_server_options_${_row}
+                 COMMAND test_threaded_server_options ${_row})
+        set_tests_properties(threaded_server_options_${_row}
+            PROPERTIES TIMEOUT 120)
+    endforeach()
+
     # The drain gate on session pending output at a parked pass boundary,
     # for the client single-connection and server aggregate paths (stage
     # hooks of the test-internals build).

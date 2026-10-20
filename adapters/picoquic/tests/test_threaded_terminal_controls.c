@@ -502,7 +502,14 @@ static int row_stop_or_pump_exit_close(int pump_exit_row)
                  !__atomic_load_n(&ce.fired, __ATOMIC_ACQUIRE); tries++)
                 moq_pq_threaded_wait(cli, 25000);
             CHECK(__atomic_load_n(&ce.fired, __ATOMIC_ACQUIRE) == 1);
-            CHECK(moq_pq_threaded_wait(cli, 0) == MOQ_ERR_CLOSED);
+            /* `fired` is set inside the pump, before it returns nonzero; the
+             * facade latches the exit only after the callback returns. */
+            moq_result_t wrc = MOQ_OK;
+            for (int tries = 0; tries < 400 &&
+                 (wrc = moq_pq_threaded_wait(cli, 25000)) != MOQ_ERR_CLOSED;
+                 tries++)
+                ;
+            CHECK(wrc == MOQ_ERR_CLOSED);
             CHECK(moq_pq_threaded_stop(cli) == MOQ_OK);
         } else {
             CHECK(moq_pq_threaded_stop(cli) == MOQ_OK);
