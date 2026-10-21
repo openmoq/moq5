@@ -7,3 +7,4 @@
 0009-return-stream-credit-at-final-size.patch
 0010-classify-terminal-stream-reset-and-stop.patch
 0011-stateless-reset-detection.patch
+0012-per-thread-public-random.patch

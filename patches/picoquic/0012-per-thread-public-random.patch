@@ -1,0 +1,711 @@
+Keep the public random generator's state per thread
+
+Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6, after 0002,
+0006, 0007, 0008, 0009, 0010 and 0011.
+
+picoquic_public_random_64() and the functions built on it draw from one
+xorshift1024* state shared by the whole process, with no synchronization:
+path challenges, the spin bit policy of a new connection, sequence number
+holes, stateless reset padding, version negotiation, and the placeholder
+reset secret of a new remote connection ID all go through it. A process
+that runs several QUIC contexts on several threads, each context used from
+one thread, races on that state: ThreadSanitizer reports every draw, and
+between the index's increment and its mask the stored index is one past the
+array, so another thread's draw can read seed[16].
+
+The state is now per thread (PTLS_THREADLOCAL, as picotls keeps its own
+per-thread state). A thread's state is seeded from the crypto random
+provider the first time the thread draws, so no thread draws the default
+sequence; if no provider is loaded yet the clock seeds it provisionally, and
+a provider, once available, replaces that on the next draw. An explicit seed
+(picoquic_public_random_seed_64) defines the thread's sequence instead: it
+mixes into the current state (reset first restores the known one), consumes
+no crypto-provider entropy, and is final, so a later draw does not reseed
+over it. picoquic_public_random_seed() still mixes a context's crypto random
+into the calling thread's state. The explicitly seeded deterministic sequences the tests rely on are
+unchanged; an unseeded first draw now seeds from the crypto provider (or,
+with none loaded, provisionally from the clock) rather than the default
+array, as above.
+
+Test: public_random_thread (util_test.c) pins the reset sequence to a known
+answer and checks it is reproducible; that a reseed on another thread leaves
+this thread's sequence on its exact continuation (it used to restart it);
+that the same seed with reset gives the same sequence on any thread, and two
+threads that never seed draw different sequences; that two threads drawing in
+lockstep, and a reseed on one overlapping the other's draws, each keep their
+own sequence; and, through a counting crypto provider, that an explicit seed
+pulls no provider entropy and is deterministic while a provider-less first
+draw is provisional and a later provider upgrades it exactly once. A
+half-created worker pair settles through a barrier abort rather than hanging.
+
+Upstream picoquic/tls_api.c is unchanged in the lines this patch touches
+since the pin as of 2026-10-20 (master
+5fc4330fdab47458a596f95bfc757fab284f7882).
+
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index c7eb9365..64c04ee9 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -181,6 +181,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(public_random_thread)
++        {
++            int ret = util_public_random_thread_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(is_path_sane)
+         {
+             int ret = util_is_path_sane_test();
+diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
+index 217f8bd6..754a5c2d 100644
+--- a/picoquic/tls_api.c
++++ b/picoquic/tls_api.c
+@@ -1022,49 +1022,112 @@ uint64_t picoquic_crypto_uniform_random(picoquic_quic_t* quic, uint64_t rnd_max)
+  * generator. The 16 rounds of the xorshift process give a pretty good hash, but
+  * that can probably be broken by linear analysis. Or at least we have no proof
+  * that it cannot be broken.
++ *
++ * The state is per thread. A process that runs several QUIC contexts, each on
++ * its own thread, draws from independent sequences without any synchronization
++ * in the generator. A thread's state is seeded from the crypto random provider
++ * the first time the thread draws from it, so the default state is never drawn
++ * from; if no provider is loaded yet, the clock seeds it provisionally and a
++ * provider, once available, replaces that on the next draw. Seeding explicitly
++ * (picoquic_public_random_seed_64) defines the state instead -- consuming no
++ * provider entropy and, with reset, giving a reproducible sequence -- on that
++ * thread only.
+  */
+ 
+-static uint64_t public_random_seed[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+-static int public_random_index = 0;
++typedef enum {
++    public_random_unseeded = 0,  /* the default array, never drawn from */
++    public_random_provisional,   /* clock-seeded: no crypto provider was loaded yet */
++    public_random_seeded         /* seeded from the crypto provider or a caller */
++} picoquic_public_random_kind_t;
++
++typedef struct st_picoquic_public_random_state_t {
++    uint64_t seed[16];
++    int index;
++    uint64_t obfuscator;
++    picoquic_public_random_kind_t kind;
++} picoquic_public_random_state_t;
++
++static PTLS_THREADLOCAL picoquic_public_random_state_t public_random_state = {
++    { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, 0, 0x5555555555555555ull,
++    public_random_unseeded };
+ static const uint64_t public_random_multiplier = 1181783497276652981ull;
+-static uint64_t public_random_obfuscator = 0x5555555555555555ull;
+ 
+-static uint64_t picoquic_public_random_step(void)
++static uint64_t picoquic_public_random_step(picoquic_public_random_state_t* state)
+ {
+     uint64_t s1;
+-    const uint64_t s0 = public_random_seed[public_random_index++];
+-    public_random_index &= 15;
+-    s1 = public_random_seed[public_random_index];
++    const uint64_t s0 = state->seed[state->index++];
++    state->index &= 15;
++    s1 = state->seed[state->index];
+     s1 ^= (s1 << 31); // a
+     s1 ^= (s1 >> 11); // b
+     s1 ^= (s0 ^ (s0 >> 30)); // c
+-    public_random_seed[public_random_index] = s1;
++    state->seed[state->index] = s1;
+     return s1;
+ }
+ 
++static void picoquic_public_random_mix(picoquic_public_random_state_t* state, uint64_t seed)
++{
++    state->seed[state->index] ^= seed;
++
++    for (int i = 0; i < 16; i++) {
++        (void)picoquic_public_random_step(state);
++    }
++}
++
++/* The calling thread's state, seeded from the crypto provider when it has not
++ * yet been seeded from a definitive source. A state the clock seeded before
++ * any provider was loaded is provisional, and is upgraded to the provider the
++ * moment one is available. An explicitly seeded state is left as the caller
++ * set it: this function never overwrites it, and never consumes provider
++ * entropy on its behalf. */
++static picoquic_public_random_state_t* picoquic_public_random_seeded_state(void)
++{
++    picoquic_public_random_state_t* state = &public_random_state;
++
++    if (state->kind != public_random_seeded) {
++        if (picoquic_crypto_random_provider_fn != NULL) {
++            uint64_t seed[2] = { 0, 0 };
++            picoquic_crypto_random_provider_fn(seed, sizeof(seed));
++            state->obfuscator = seed[1];
++            picoquic_public_random_mix(state, seed[0]);
++            state->kind = public_random_seeded;
++        }
++        else if (state->kind == public_random_unseeded) {
++            /* No crypto provider yet: the clock is what there is, for now. */
++            picoquic_public_random_mix(state, picoquic_current_time());
++            state->kind = public_random_provisional;
++        }
++    }
++
++    return state;
++}
++
+ uint64_t picoquic_public_random_64(void)
+ {
+-    uint64_t s1 = picoquic_public_random_step();
++    picoquic_public_random_state_t* state = picoquic_public_random_seeded_state();
++    uint64_t s1 = picoquic_public_random_step(state);
+     s1 *= public_random_multiplier;
+-    s1 ^= public_random_obfuscator;
++    s1 ^= state->obfuscator;
+     return s1;
+ }
+ 
+ void picoquic_public_random_seed_64(uint64_t seed, int reset)
+ {
++    picoquic_public_random_state_t* state = &public_random_state;
++
+     if (reset) {
+-        public_random_index = 0;
++        state->index = 0;
+         for (uint64_t i = 0; i < 16; i++) {
+-            public_random_seed[i] = i + 1u;
++            state->seed[i] = i + 1u;
+         }
+-        public_random_obfuscator = 0x5555555555555555ull;
++        state->obfuscator = 0x5555555555555555ull;
+     }
+ 
+-    public_random_seed[public_random_index] ^= seed;
+-
+-    for (int i = 0; i < 16; i++) {
+-        (void)picoquic_public_random_step();
+-    }
++    /* An explicit seed defines the sequence on the calling thread: it mixes
++     * into the current state (a reset first restores the known one), consumes
++     * no provider entropy, and is final -- no later draw reseeds over it. */
++    picoquic_public_random_mix(state, seed);
++    state->kind = public_random_seeded;
+ }
+ 
+ 
+@@ -1074,7 +1137,7 @@ void picoquic_public_random_seed(picoquic_quic_t* quic)
+     picoquic_crypto_random(quic, &seed, sizeof(seed));
+ 
+     picoquic_public_random_seed_64(seed[0], 0);
+-    public_random_obfuscator = seed[1];
++    public_random_state.obfuscator = seed[1];
+ }
+ 
+ void picoquic_public_random(void* buf, size_t len)
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 61b71efd..edc80643 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -124,6 +124,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "util_memcmp", util_memcmp_test },
+     { "threading", util_threading_test },
+     { "wait_thread", util_wait_thread_test },
++    { "public_random_thread", util_public_random_thread_test },
+     { "is_path_sane", util_is_path_sane_test },
+     { "set_addr_port", util_set_addr_port_test },
+     { "picohash", picohash_test },
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index d9b7773c..8cfa6ad3 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -45,6 +45,7 @@ int util_uint8_to_str_test(void);
+ int util_memcmp_test(void);
+ int util_threading_test(void);
+ int util_wait_thread_test(void);
++int util_public_random_thread_test(void);
+ int util_is_path_sane_test(void);
+ int util_set_addr_port_test(void);
+ int picohash_test(void);
+diff --git a/picoquictest/util_test.c b/picoquictest/util_test.c
+index 8c047c4f..4e32d004 100644
+--- a/picoquictest/util_test.c
++++ b/picoquictest/util_test.c
+@@ -25,7 +25,14 @@
+ #include <malloc.h>
+ #endif
+ #include <string.h>
++#include <stdatomic.h>
+ #include "picoquictest_internal.h"
++#include "tls_api.h"
++
++/* The crypto random provider hook (defined in tls_api.c). Declared here with a
++ * compatible type to avoid the full provider-API header's picotls dependencies. */
++typedef void (*picoquic_test_crypto_random_provider_t)(void* buf, size_t len);
++extern picoquic_test_crypto_random_provider_t picoquic_crypto_random_provider_fn;
+ 
+ static const picoquic_connection_id_t expected_cnxid[4] = {
+     { { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0 } , 16 },
+@@ -551,6 +558,461 @@ int util_wait_thread_test(void)
+     return ret;
+ }
+ 
++/* The public random generator keeps one state per thread. A thread that draws
++ * from it, or reseeds it, does not move another thread's sequence, even while
++ * the two run at once; a reseed with reset gives the same sequence on every
++ * thread; a thread that never seeds does not draw the default sequence; and
++ * the reset sequence is the fixed xorshift1024* known answer. */
++#define PUBLIC_RANDOM_THREAD_TEST_SEED 0x5EED5EED5EED5EEDull
++#define PUBLIC_RANDOM_THREAD_TEST_DRAWS 16
++
++/* picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1) then that
++ * many draws. Pins the reset sequence to the upstream algorithm: any change to
++ * the generator's arithmetic breaks it. */
++static const uint64_t public_random_reset_kat[PUBLIC_RANDOM_THREAD_TEST_DRAWS] = {
++    0xd03c7d9501909fe6ull, 0x6f5c8a40624ba349ull, 0x9a620fee58657207ull,
++    0xeca80db85c32cabaull, 0x9e3a87641cf8fd1bull, 0x5555996d657c6518ull,
++    0x840a507335c0e4d6ull, 0xa59c0b2bda53176full, 0xcdf655c5641009f6ull,
++    0x66f4149ab8ca4f99ull, 0xd1839865ca1e4ecfull, 0xb0c216c8ce6c6162ull,
++    0x905261b9557899abull, 0xaccd7ba7b3fc01a8ull, 0x82ed72be3516fa7eull,
++    0xa73acd4148d06249ull
++};
++
++typedef struct st_public_random_thread_ctx_t {
++    int reseed_before;
++    int reseed_after;
++    uint64_t draws[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++} public_random_thread_ctx_t;
++
++static picoquic_thread_return_t public_random_thread_function(void* vctx)
++{
++    public_random_thread_ctx_t* ctx = (public_random_thread_ctx_t*)vctx;
++
++    if (ctx->reseed_before) {
++        picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++    }
++    for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++        ctx->draws[i] = picoquic_public_random_64();
++    }
++    if (ctx->reseed_after) {
++        picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++    }
++    picoquic_thread_do_return;
++}
++
++/* Join a worker whose context lives on the caller's stack. A failed wait does
++ * not prove the worker has finished, so returning -- unwinding the context it
++ * may still write, or restoring the provider it may still read -- is not safe:
++ * the run fails closed instead. */
++static void public_random_join_or_abort(picoquic_thread_t thread)
++{
++    if (picoquic_wait_thread(thread) != 0) {
++        fprintf(stderr, "public_random_thread: cannot join a worker that "
++            "uses this stack; aborting\n");
++        abort();
++    }
++#ifdef _WINDOWS
++    CloseHandle(thread);
++#endif
++}
++
++static int public_random_thread_run(public_random_thread_ctx_t* ctx)
++{
++    picoquic_thread_t thread;
++    int ret = picoquic_create_thread(&thread, public_random_thread_function, ctx);
++
++    if (ret != 0) {
++        DBG_PRINTF("Create thread returns %d (0x%x)", ret, ret);
++    }
++    else {
++        public_random_join_or_abort(thread);
++    }
++
++    return ret;
++}
++
++/* A reusable two-party barrier with an abort path, so a waiting party is
++ * released when its peer could not start and a half-created pair never hangs. */
++typedef struct st_public_random_barrier_t {
++    _Atomic int arrived;
++    _Atomic unsigned generation;
++    _Atomic int aborted;
++    int parties;
++} public_random_barrier_t;
++
++static void public_random_barrier_init(public_random_barrier_t* b, int parties)
++{
++    atomic_store(&b->arrived, 0);
++    atomic_store(&b->generation, 0);
++    atomic_store(&b->aborted, 0);
++    b->parties = parties;
++}
++
++/* 0 when every party arrived, -1 when the barrier was aborted. */
++static int public_random_barrier_wait(public_random_barrier_t* b)
++{
++    unsigned gen = atomic_load(&b->generation);
++    if (atomic_fetch_add(&b->arrived, 1) + 1 == b->parties) {
++        atomic_store(&b->arrived, 0);
++        atomic_fetch_add(&b->generation, 1);
++        return 0;
++    }
++    while (atomic_load(&b->generation) == gen) {
++        if (atomic_load(&b->aborted)) {
++            return -1;
++        }
++    }
++    return 0;
++}
++
++/* A deterministic crypto provider that counts its calls, so a test sees
++ * exactly when the generator pulls provider entropy. */
++static _Atomic int public_random_provider_calls;
++static void public_random_counting_provider(void* buf, size_t len)
++{
++    atomic_fetch_add(&public_random_provider_calls, 1);
++    memset(buf, 0x5A, len);
++}
++
++/* A lockstep worker: each step it syncs at the barrier, then either draws
++ * (recording) or reseeds, so one thread's reseeds overlap another's draws. It
++ * stops without hanging if the barrier is aborted. */
++typedef struct st_public_random_lockstep_ctx_t {
++    uint64_t seed;
++    int reseed_each_step;
++    public_random_barrier_t* barrier;
++    uint64_t draws[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++} public_random_lockstep_ctx_t;
++
++static picoquic_thread_return_t public_random_lockstep_function(void* vctx)
++{
++    public_random_lockstep_ctx_t* ctx = (public_random_lockstep_ctx_t*)vctx;
++
++    picoquic_public_random_seed_64(ctx->seed, 1);
++    for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++        if (public_random_barrier_wait(ctx->barrier) != 0) {
++            break;
++        }
++        if (ctx->reseed_each_step) {
++            picoquic_public_random_seed_64(ctx->seed, 1);
++        }
++        else {
++            ctx->draws[i] = picoquic_public_random_64();
++        }
++    }
++    picoquic_thread_do_return;
++}
++
++/* A test can fail the second worker's creation here, so the half-created
++ * unwind is exercised through this real helper and its barrier abort. */
++static _Atomic int public_random_fail_second_create;
++
++/* Run two lockstep workers against one barrier. Only successfully created
++ * workers are joined; if one cannot start, the barrier is aborted so the other
++ * settles instead of hanging. Returns 0 only when both ran and joined. */
++static int public_random_lockstep_pair(
++    uint64_t seed_a, int reseed_a, uint64_t seed_b, int reseed_b,
++    uint64_t out_a[PUBLIC_RANDOM_THREAD_TEST_DRAWS],
++    uint64_t out_b[PUBLIC_RANDOM_THREAD_TEST_DRAWS])
++{
++    public_random_barrier_t barrier;
++    public_random_lockstep_ctx_t a;
++    public_random_lockstep_ctx_t b;
++    picoquic_thread_t ta;
++    picoquic_thread_t tb;
++    int created_a = 0;
++    int created_b = 0;
++    int ret = 0;
++
++    public_random_barrier_init(&barrier, 2);
++    memset(&a, 0, sizeof(a));
++    memset(&b, 0, sizeof(b));
++    a.seed = seed_a; a.reseed_each_step = reseed_a; a.barrier = &barrier;
++    b.seed = seed_b; b.reseed_each_step = reseed_b; b.barrier = &barrier;
++
++    if (picoquic_create_thread(&ta, public_random_lockstep_function, &a) == 0) {
++        created_a = 1;
++    }
++    else {
++        ret = -1;
++    }
++    if (created_a) {
++        if (!atomic_load(&public_random_fail_second_create) &&
++            picoquic_create_thread(&tb, public_random_lockstep_function, &b) == 0) {
++            created_b = 1;
++        }
++        else {
++            ret = -1;
++        }
++    }
++    if (!created_a || !created_b) {
++        atomic_store(&barrier.aborted, 1);
++    }
++    if (created_b) {
++        public_random_join_or_abort(tb);
++    }
++    if (created_a) {
++        public_random_join_or_abort(ta);
++    }
++    if (ret == 0 && out_a != NULL) {
++        memcpy(out_a, a.draws, sizeof(a.draws));
++    }
++    if (ret == 0 && out_b != NULL) {
++        memcpy(out_b, b.draws, sizeof(b.draws));
++    }
++    return ret;
++}
++
++/* The seeding transitions, observed through the counting provider. */
++typedef struct st_public_random_seed_ctx_t {
++    int reset;
++    int calls_at_start;
++    int calls_after_explicit;
++    int calls_provisional;
++    int calls_after_upgrade;
++    int calls_after_seeded;
++    uint64_t explicit_draw;
++} public_random_seed_ctx_t;
++
++/* A fresh thread that seeds explicitly defines its sequence from that seed
++ * alone and pulls no provider entropy; the counting provider is installed
++ * before this runs. */
++static picoquic_thread_return_t public_random_explicit_seed_function(void* vctx)
++{
++    public_random_seed_ctx_t* c = (public_random_seed_ctx_t*)vctx;
++
++    c->calls_at_start = atomic_load(&public_random_provider_calls);
++    picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, c->reset);
++    c->explicit_draw = picoquic_public_random_64();
++    c->calls_after_explicit = atomic_load(&public_random_provider_calls);
++    picoquic_thread_do_return;
++}
++
++/* A fresh thread with no provider draws provisionally (clock), pulling none;
++ * once a provider is installed the next draw upgrades to it exactly once, and
++ * later draws do not pull it again. */
++static picoquic_thread_return_t public_random_upgrade_function(void* vctx)
++{
++    public_random_seed_ctx_t* c = (public_random_seed_ctx_t*)vctx;
++
++    (void)picoquic_public_random_64();
++    c->calls_provisional = atomic_load(&public_random_provider_calls);
++    picoquic_crypto_random_provider_fn = public_random_counting_provider;
++    (void)picoquic_public_random_64();
++    c->calls_after_upgrade = atomic_load(&public_random_provider_calls);
++    (void)picoquic_public_random_64();
++    c->calls_after_seeded = atomic_load(&public_random_provider_calls);
++    picoquic_thread_do_return;
++}
++
++int util_public_random_thread_test(void)
++{
++    int ret = 0;
++    uint64_t first[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    uint64_t ref[2 * PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    uint64_t second[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    uint64_t iso_b[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    uint64_t iso_a[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    uint64_t draws_a[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    uint64_t draws_b[PUBLIC_RANDOM_THREAD_TEST_DRAWS];
++    public_random_thread_ctx_t fresh1;
++    public_random_thread_ctx_t fresh2;
++    public_random_thread_ctx_t reseeding;
++    public_random_thread_ctx_t reseeded;
++
++    memset(&fresh1, 0, sizeof(fresh1));
++    memset(&fresh2, 0, sizeof(fresh2));
++    memset(&reseeding, 0, sizeof(reseeding));
++    memset(&reseeded, 0, sizeof(reseeded));
++    reseeding.reseed_after = 1;
++    reseeded.reseed_before = 1;
++
++    /* The crypto random provider seeds a thread's state on its first draw. */
++    picoquic_tls_api_init();
++
++    /* The reset sequence is the pinned known answer, and reproducible. */
++    picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++    for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++        first[i] = picoquic_public_random_64();
++    }
++    if (memcmp(first, public_random_reset_kat, sizeof(first)) != 0) {
++        DBG_PRINTF("%s", "The reset sequence changed from the known answer");
++        ret = -1;
++    }
++    if (ret == 0) {
++        picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++        for (int i = 0; i < 2 * PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++            ref[i] = picoquic_public_random_64();
++        }
++        if (memcmp(ref, first, sizeof(first)) != 0) {
++            DBG_PRINTF("%s", "The reset sequence was not reproducible");
++            ret = -1;
++        }
++    }
++
++    /* Two threads that never seed draw different sequences (and so neither
++     * draws the default array). */
++    if (ret == 0) {
++        ret = public_random_thread_run(&fresh1);
++    }
++    if (ret == 0) {
++        ret = public_random_thread_run(&fresh2);
++    }
++    if (ret == 0 && memcmp(fresh1.draws, fresh2.draws, sizeof(fresh1.draws)) == 0) {
++        DBG_PRINTF("%s", "Two unseeded threads drew the same sequence");
++        ret = -1;
++    }
++
++    /* A reseed on another thread does not move this thread's sequence: after
++     * one, this thread's next draws are exactly the reference continuation. */
++    if (ret == 0) {
++        picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++        for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++            (void)picoquic_public_random_64();
++        }
++        ret = public_random_thread_run(&reseeding);
++    }
++    if (ret == 0) {
++        for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++            second[i] = picoquic_public_random_64();
++        }
++        if (memcmp(second, ref + PUBLIC_RANDOM_THREAD_TEST_DRAWS, sizeof(second)) != 0) {
++            DBG_PRINTF("%s", "A reseed on another thread moved this thread's sequence");
++            ret = -1;
++        }
++    }
++
++    /* The same seed with reset gives the same sequence on any thread. */
++    if (ret == 0) {
++        ret = public_random_thread_run(&reseeded);
++    }
++    if (ret == 0 && memcmp(first, reseeded.draws, sizeof(first)) != 0) {
++        DBG_PRINTF("%s", "The same seed gave another thread a different sequence");
++        ret = -1;
++    }
++
++    /* Two threads drawing in lockstep each keep their own isolated sequence. */
++    if (ret == 0) {
++        uint64_t seed_b = PUBLIC_RANDOM_THREAD_TEST_SEED ^ 0xFFFFFFFFFFFFFFFFull;
++
++        picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++        for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++            iso_a[i] = picoquic_public_random_64();
++        }
++        picoquic_public_random_seed_64(seed_b, 1);
++        for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++            iso_b[i] = picoquic_public_random_64();
++        }
++        ret = public_random_lockstep_pair(PUBLIC_RANDOM_THREAD_TEST_SEED, 0,
++                                          seed_b, 0, draws_a, draws_b);
++        if (ret == 0 &&
++            (memcmp(draws_a, iso_a, sizeof(iso_a)) != 0 ||
++             memcmp(draws_b, iso_b, sizeof(iso_b)) != 0)) {
++            DBG_PRINTF("%s", "Concurrent draws disturbed a thread's sequence");
++            ret = -1;
++        }
++    }
++
++    /* A reseed on one thread, overlapping another thread's draws in lockstep,
++     * does not disturb the drawing thread's sequence. */
++    if (ret == 0) {
++        uint64_t seed_b = PUBLIC_RANDOM_THREAD_TEST_SEED ^ 0x0123456789ABCDEFull;
++
++        picoquic_public_random_seed_64(PUBLIC_RANDOM_THREAD_TEST_SEED, 1);
++        for (int i = 0; i < PUBLIC_RANDOM_THREAD_TEST_DRAWS; i++) {
++            iso_a[i] = picoquic_public_random_64();
++        }
++        ret = public_random_lockstep_pair(PUBLIC_RANDOM_THREAD_TEST_SEED, 0,
++                                          seed_b, 1, draws_a, NULL);
++        if (ret == 0 && memcmp(draws_a, iso_a, sizeof(iso_a)) != 0) {
++            DBG_PRINTF("%s", "A reseed overlapping this thread's draws disturbed it");
++            ret = -1;
++        }
++    }
++
++    /* A half-created worker pair settles rather than hanging: the pair helper
++     * cannot start the second worker, so it aborts the barrier and the first
++     * worker is released instead of waiting for a peer that never arrives. The
++     * failure is driven through the real helper, so its own abort is what this
++     * pins: the call returns, reporting the half start, rather than deadlocking.
++     */
++    if (ret == 0) {
++        atomic_store(&public_random_fail_second_create, 1);
++        int settled = public_random_lockstep_pair(
++            PUBLIC_RANDOM_THREAD_TEST_SEED, 0, PUBLIC_RANDOM_THREAD_TEST_SEED, 0,
++            NULL, NULL);
++        atomic_store(&public_random_fail_second_create, 0);
++        if (settled != -1) {
++            DBG_PRINTF("A half-created pair did not settle (ret %d)", settled);
++            ret = -1;
++        }
++    }
++
++    /* The seeding transitions through the counting provider: an explicit seed
++     * pulls nothing and is deterministic; a provider-less first draw is
++     * provisional, and a later provider upgrades it exactly once. */
++    if (ret == 0) {
++        picoquic_test_crypto_random_provider_t saved = picoquic_crypto_random_provider_fn;
++        public_random_seed_ctx_t ea;
++        public_random_seed_ctx_t up;
++        picoquic_thread_t te;
++        picoquic_thread_t tu;
++
++        /* An explicit seed defines a fresh thread's sequence from the seed
++         * alone -- it pulls no provider entropy -- whether or not reset is
++         * asked. On a fresh thread, whose state is already the reset base, it
++         * is the deterministic reset sequence in both cases. */
++        for (int reset = 1; ret == 0 && reset >= 0; reset--) {
++            memset(&ea, 0, sizeof(ea));
++            ea.reset = reset;
++            picoquic_crypto_random_provider_fn = public_random_counting_provider;
++            atomic_store(&public_random_provider_calls, 0);
++            if (picoquic_create_thread(&te, public_random_explicit_seed_function,
++                                       &ea) == 0) {
++                public_random_join_or_abort(te);
++                if (ret == 0 && ea.calls_after_explicit != ea.calls_at_start) {
++                    DBG_PRINTF("An explicit seed (reset %d) pulled provider entropy",
++                               reset);
++                    ret = -1;
++                }
++                else if (ret == 0 &&
++                         ea.explicit_draw != public_random_reset_kat[0]) {
++                    DBG_PRINTF("An explicit seed (reset %d) was not deterministic",
++                               reset);
++                    ret = -1;
++                }
++            }
++            else {
++                ret = -1;
++            }
++        }
++
++        if (ret == 0) {
++            memset(&up, 0, sizeof(up));
++            picoquic_crypto_random_provider_fn = NULL;
++            atomic_store(&public_random_provider_calls, 0);
++            if (picoquic_create_thread(&tu, public_random_upgrade_function,
++                                       &up) == 0) {
++                public_random_join_or_abort(tu);
++                if (ret == 0 && (up.calls_provisional != 0 ||
++                    up.calls_after_upgrade != 1 ||
++                    up.calls_after_seeded != 1)) {
++                    DBG_PRINTF("%s",
++                        "The provisional-to-provider upgrade mis-pulled the provider");
++                    ret = -1;
++                }
++            }
++            else {
++                ret = -1;
++            }
++        }
++
++        picoquic_crypto_random_provider_fn = saved;
++    }
++
++    return ret;
++}
++
+ /* picoquic_is_path_sane rejects traversal and other unsafe path components;
+  * a leading '/' is accepted but not required, so both URL paths (h3zero) and 
+  * bare relative file names (the sample server) validate correctly. */
