@@ -86,6 +86,7 @@ TARGETS=(
     fuzz_session_control
     fuzz_session_data
     fuzz_session_d18
+    fuzz_pq_cid_route
     fuzz_loc
     fuzz_cmaf
     fuzz_msf
@@ -99,6 +100,7 @@ seed_for() {
         fuzz_session_control) echo "session_control";;
         fuzz_session_data)    echo "session_data";;
         fuzz_session_d18)     echo "session_d18";;
+        fuzz_pq_cid_route)    echo "pq_cid_route";;
         fuzz_loc)             echo "loc";;
         fuzz_cmaf)            echo "cmaf";;
         fuzz_msf)             echo "msf";;

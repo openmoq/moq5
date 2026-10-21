@@ -76,12 +76,18 @@ extern "C" {
 typedef struct moq_pq_threaded moq_pq_threaded_t;
 
 /* A lane is an exclusive access window over a set of the facade's
- * connections. picoquic_threaded runs a single network thread per facade,
- * so there is exactly ONE lane; cfg.lane_count > 1 is rejected at create()
- * with MOQ_ERR_UNSUPPORTED (the adapter does not fake concurrency behind
- * one serialized domain). The lane exists so the managed API matches the
- * shared lane shape across the msquic, mvfst, and picoquic adapters. */
+ * connections, served by one network thread. A facade has one lane, or, for
+ * a SERVER with cfg.lane_count > 1, a lane group: lane_count lanes on the
+ * one listener port, each with its own picoquic context, thread and
+ * connections. A connection is owned by one lane for its whole life; the
+ * group routes every datagram to its owner by connection ID whatever socket
+ * the kernel delivered it to, so a connection survives the peer's NAT
+ * rebinding and migration without changing lane. The lane shape matches the
+ * msquic and mvfst managed adapters. */
 typedef struct moq_pq_threaded_lane moq_pq_threaded_lane_t;
+
+/* The most lanes a group may have. */
+#define MOQ_PQ_THREADED_MAX_LANES 64u
 
 /* -- Configuration ------------------------------------------------ */
 
@@ -236,11 +242,23 @@ typedef struct moq_pq_threaded_cfg {
 
     /* Appended (struct_size append-only ABI) — lane count.
      *
-     * picoquic_threaded runs a single network thread per facade, so it
-     * supports exactly ONE lane. 0 or 1 = the single lane (the previous
-     * behavior). Any value > 1 fails create() with MOQ_ERR_UNSUPPORTED —
-     * the adapter does not fake concurrency behind one serialized domain.
-     * This is enforced for client and server facades alike. */
+     * 0 or 1 = one lane on one network thread. A SERVER with 2 ..
+     * MOQ_PQ_THREADED_MAX_LANES creates a lane group (see the lane
+     * typedef): lane_count contexts and threads on the listener port.
+     * A client's value > 1, or a server's beyond the maximum, fails
+     * create() with MOQ_ERR_UNSUPPORTED or MOQ_ERR_INVAL.
+     *
+     * At more than one lane: on_lane_pump and on_activity run on each
+     * lane's thread, concurrently, with the shared context (key by
+     * moq_pq_threaded_lane_index); configure_quic runs once per lane's
+     * context on the creating thread, before any lane starts;
+     * max_connections is the group's total; app_deadline_us is folded by
+     * every lane (so it must be thread-safe) and app_lane_deadline_us by
+     * its lane only; a nonzero pump return or a lane's fatal error stops
+     * the whole group. The facade-level moq_pq_threaded_session, _conn and
+     * _negotiated_version return NULL / 0 for a group: a connection and its
+     * version are reached inside its lane's pump. Every per-connection call
+     * is valid only on the owning lane's thread, inside its pump. */
     uint32_t           lane_count;
 
     /* Appended (struct_size append-only ABI, read as ONE block through
@@ -362,6 +380,17 @@ typedef struct moq_pq_threaded_cfg {
      * facade's sockets bind to and send from, and no socket is opened for the
      * other family. Copied during _create. A client ignores it. */
     const struct sockaddr *bind_address;
+
+    /* Appended (ONE ABI block, read only when struct_size covers THROUGH
+     * app_lane_deadline_ctx). A per-lane application deadline query, with
+     * the app_deadline_us contract: the earliest pending time-based deadline
+     * of lane `lane_index` (µs, this facade's clock) or UINT64_MAX, pure and
+     * non-blocking, folded into that lane's wait after every pump; a
+     * changed deadline is announced with a lane wake. A lane pumps for an
+     * instant once. With one lane it is queried with lane_index 0. NULL =
+     * none. Set via moq_pq_threaded_cfg_init_sized. */
+    uint64_t         (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
+    void              *app_lane_deadline_ctx;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
@@ -457,15 +486,15 @@ typedef struct moq_pq_threaded_conn moq_pq_threaded_conn_t;
 
 /* -- Lanes ---------------------------------------------------------- */
 
-/* Number of lanes (always 1 for picoquic_threaded). */
+/* Number of lanes: 1, or cfg.lane_count for a lane group. */
 uint32_t moq_pq_threaded_lane_count(const moq_pq_threaded_t *t);
 
-/* The lane at `index` (only 0 is valid), or NULL if out of range. The
+/* The lane at `index` (0 .. lane_count-1), or NULL if out of range. The
  * returned pointer is stable for the facade's lifetime. */
 moq_pq_threaded_lane_t *moq_pq_threaded_lane(
     moq_pq_threaded_t *t, uint32_t index);
 
-/* The lane's index (0). */
+/* The lane's index. */
 uint32_t moq_pq_threaded_lane_index(const moq_pq_threaded_lane_t *lane);
 
 /* The lane that owns this connection. Valid inside on_lane_pump. */
@@ -473,8 +502,42 @@ moq_pq_threaded_lane_t *moq_pq_threaded_conn_lane(
     moq_pq_threaded_conn_t *conn);
 
 /* Ask the adapter to run this lane's pump. Safe from any thread;
- * coalesced. Same delivery as moq_pq_threaded_wake() (one lane). */
+ * coalesced. moq_pq_threaded_wake() wakes every lane. */
 moq_result_t moq_pq_threaded_lane_wake(moq_pq_threaded_lane_t *lane);
+
+/* A lane group's per-lane routing counters. Each field is a saturating
+ * count written by the lane itself, except the drops, which the lane that
+ * dropped a datagram destined here adds. A read is exact per field, not a
+ * snapshot across fields. Valid from create until destroy, from any
+ * thread. A facade with one lane has no routing plane: MOQ_ERR_UNSUPPORTED. */
+typedef struct moq_picoquic_threaded_lane_stats {
+    uint32_t struct_size;          /* set by the library: bytes written */
+    uint32_t reserved0;            /* written 0 */
+    uint64_t datagrams_received;   /* read from this lane's sockets */
+    uint64_t forwarded_out;        /* routed by this lane to another, enqueued */
+    uint64_t forwarded_in;         /* injected on this lane from its inbox */
+    uint64_t inbox_full_drops;     /* destined here; inbox full */
+    uint64_t inbox_closed_drops;   /* destined here; admission closed */
+    uint64_t inbox_discarded;      /* left in this lane's inbox at its exit */
+    uint64_t oversize_drops;       /* received here; larger than advertised */
+    uint64_t reset_fanout_out;     /* candidates this lane offered to others */
+    uint64_t reset_fanout_in;      /* candidates injected here, detection only */
+    uint64_t reset_fanout_skipped; /* candidates not offered: budget */
+    uint64_t detection_drops;      /* destined here; detection ring full or closed */
+    uint64_t detection_discarded;  /* left in this lane's detection ring at its exit */
+    uint64_t budget_rearms;        /* turns that ended with work remaining */
+} moq_picoquic_threaded_lane_stats_t;
+
+/* The frozen v0 floor of the record: out_size below it is MOQ_ERR_INVAL. */
+#define MOQ_PICOQUIC_THREADED_LANE_STATS_V0_SIZE \
+    (offsetof(moq_picoquic_threaded_lane_stats_t, budget_rearms) + sizeof(uint64_t))
+
+/* Write min(out_size, the library's record) bytes of `lane`'s counters into
+ * `out`, stamping struct_size with the bytes written; a longer caller record
+ * keeps its tail untouched. The caller need not initialise `out`. */
+MOQ_API moq_result_t moq_picoquic_threaded_lane_get_stats(
+    const moq_pq_threaded_lane_t *lane,
+    moq_picoquic_threaded_lane_stats_t *out, size_t out_size);
 
 /* -- Per-connection API (server multi-connection) ------------------- *
  * Mirrors the shared managed per-connection model. A moq_pq_threaded_conn_t
