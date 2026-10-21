@@ -7,6 +7,9 @@
  *   - each delivery is kept -- bytes, a FIN, or the peer's STOP_SENDING -- in
  *     arrival order, and replayed in that order onto the stream rebound to
  *     the adapter;
+ *   - a stream whose only early delivery is empty (a uni stream whose first
+ *     packet held just its WebTransport header) keeps no entry but is still
+ *     rebound to the adapter on replay;
  *   - a stream beyond MOQ_PWM_EARLY_MAX_STREAMS, or one whose entry would pass
  *     MOQ_PWM_EARLY_MAX_ENTRIES or MOQ_PWM_EARLY_MAX_BYTES (payload plus node
  *     storage), is closed once with WT_BUFFERED_STREAM_REJECTED and detached
@@ -198,6 +201,33 @@ static void test_order_and_replay(void)
     }
     CHECK(m->early_head == NULL && m->early_entries == 0 &&
           m->early_bytes == 0 && m->early_ended);
+    CHECK(g_live == 0);
+    shell_free(m);
+}
+
+/* A stream whose only early delivery is empty -- a uni stream whose first
+ * packet carried just the WebTransport stream header -- keeps no entry but is
+ * still the session's: replay rebinds it to the adapter, so its later bytes
+ * reach the session instead of the facade. */
+static void test_header_only_stream(void)
+{
+    moq_pico_wt_managed_t *m = shell();
+    h3zero_stream_ctx_t *u = stream(m, 0), *v = stream(m, 1);
+    CHECK(deliver(m, u, NULL, 0, DATA) == 0);
+    CHECK(deliver(m, v, "z", 1, DATA) == 0);
+    CHECK(entries(m) == 1 && m->early_entries == 1);
+    CHECK(m->early_nstreams == 2);
+    CHECK(g_naborts == 0);
+
+    moq_pico_wt_managed_test_replay = rec_replay;
+    void *conn = (void *)(uintptr_t)0x2000;
+    pwm_early_replay(m, g_cnx, (moq_pico_wt_conn_t *)conn);
+    moq_pico_wt_managed_test_replay = NULL;
+
+    CHECK(u->path_callback == moq_pico_wt_callback && u->path_callback_ctx == conn);
+    CHECK(v->path_callback == moq_pico_wt_callback && v->path_callback_ctx == conn);
+    CHECK(g_ndeliv == 1);   /* the empty delivery is not replayed */
+    CHECK(g_ndeliv < 1 || g_deliv[0].sid == v->stream_id);
     CHECK(g_live == 0);
     shell_free(m);
 }
@@ -973,6 +1003,7 @@ int main(void)
 {
     moq_pico_wt_managed_test_abort_stream = rec_abort;
     test_order_and_replay();
+    test_header_only_stream();
     test_stream_limit();
     test_entry_and_storage_limits();
     test_reset_and_freed_context();

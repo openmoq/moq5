@@ -527,14 +527,15 @@ static void pwm_early_refuse(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
 /* Buffer one delivery made before the CONNECT response. A stream beyond the
  * stream limit, or one whose entry would pass the entry or storage limit, is
  * refused with WT_BUFFERED_STREAM_REJECTED; other streams keep theirs. An
- * empty delivery that is neither a FIN nor a STOP carries nothing and is not
- * kept. Returns 0: a refused stream never closes the connection. */
+ * empty delivery that is neither a FIN nor a STOP carries nothing and keeps no
+ * entry, but it still registers its stream: a uni stream whose first packet
+ * held only its WebTransport header arrives that way, and replay must rebind
+ * it to the session or its later bytes are lost. Returns 0: a refused stream
+ * never closes the connection. */
 static int pwm_early_buffer(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
                             h3zero_stream_ctx_t *sc, const uint8_t *bytes,
                             size_t len, pwm_early_kind_t kind)
 {
-    if (kind == PWM_EARLY_DATA && len == 0)
-        return 0;
     size_t slot = pwm_early_slot(m, sc->stream_id);
     if (slot == SIZE_MAX) {
         if (m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS) {
@@ -547,6 +548,8 @@ static int pwm_early_buffer(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
         m->early_streams[slot].sc = sc;
         m->early_streams[slot].retired = false;
     }
+    if (kind == PWM_EARLY_DATA && len == 0)
+        return 0;
     pwm_early_chunk_t *ch = NULL;
     if (m->early_entries < MOQ_PWM_EARLY_MAX_ENTRIES &&
         len <= MOQ_PWM_EARLY_MAX_BYTES - sizeof(pwm_early_chunk_t) &&
