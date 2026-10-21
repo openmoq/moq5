@@ -15,12 +15,24 @@
 #      include adapter, service-tier, threading, or socket headers — time and
 #      I/O are inputs there, same discipline as libmoq core/.
 #
+# One exception, by file and header (ALLOWED below): the property codec
+# translation primitive, relay/src/core/props_codec.c, re-encodes Object and
+# Track Property integers between draft-16 (i) and draft-18/22 (vi64) for
+# cross-draft forwarding, using libmoq's existing integer codecs from
+# moq/vi64.h and moq/wire.h rather than a second implementation. Every other
+# forbidden header stays forbidden in that file, and those two stay forbidden
+# everywhere else.
+#
 # Exit 0 if clean, 1 if violations found.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# The guard's own self-test points it at a fixture tree.
+if [ -n "${MOQ_RELAY_BOUNDARY_ROOT:-}" ]; then
+    ROOT="$(cd "$MOQ_RELAY_BOUNDARY_ROOT" && pwd)"
+fi
 RELAY_LIBRARY_DIR="relay"
 RELAY_TOOL_DIR="tools/moq5-relay"
 
@@ -60,6 +72,12 @@ FORBIDDEN_EVERYWHERE=(
     'session_internal\.h'
 )
 
+# The only permitted forbidden-header uses: "file<TAB>pattern", exact.
+ALLOWED=(
+    "relay/src/core/props_codec.c	moq/wire\\.h"
+    "relay/src/core/props_codec.c	moq/vi64\\.h"
+)
+
 # Additionally forbidden in the sans-I/O relay core.
 FORBIDDEN_IN_CORE=(
     'moq/endpoint\.h'
@@ -91,8 +109,23 @@ scan() {
     for pat in "${patterns[@]}"; do
         local hits
         hits="$(cd "$ROOT" && echo "$files" | \
-            xargs grep -nE "^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"].*${pat}" \
+            xargs grep -HnE "^[[:space:]]*#[[:space:]]*include[[:space:]]*[<\"].*${pat}" \
             2>/dev/null || true)"
+        local allowed
+        for allowed in "${ALLOWED[@]}"; do
+            local afile="${allowed%%	*}" apat="${allowed#*	}"
+            if [ "$apat" = "$pat" ] && [ -n "$hits" ]; then
+                local kept="" line
+                while IFS= read -r line; do
+                    case "$line" in
+                        "${afile}:"*) ;;                 # this file only
+                        *) kept="${kept:+$kept
+}$line" ;;
+                    esac
+                done <<< "$hits"
+                hits="$kept"
+            fi
+        done
         if [ -n "$hits" ]; then
             echo "relay boundary violation ($label): forbidden include '${pat}':"
             echo "$hits"

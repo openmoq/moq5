@@ -4585,6 +4585,31 @@ static moq_result_t d16_encode_object_payload_prefix_op(moq_session_t *s,
 
 /* -- D16 inbound data-plane decode --------------------------------- */
 
+/* §11.2: an Object makes its Track malformed when one of its Extension
+ * Headers cannot be parsed, or when Immutable Extensions (0xB) contain
+ * another Immutable Extensions key. The contents of Immutable Extensions are
+ * read as the same Key-Value-Pair sequence; every other odd-typed value stays
+ * opaque. MOQ_MALFORMED_NONE when neither applies. */
+#define D16_EXT_IMMUTABLE 0x0Bu
+static uint8_t d16_object_extensions_malformed(const uint8_t *data, size_t len)
+{
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, data, len);
+    moq_kvp_entry_t e;
+    moq_result_t rc;
+    while ((rc = moq_kvp_decode_next(&dec, &e)) == MOQ_OK) {
+        if (e.type != D16_EXT_IMMUTABLE) continue;
+        moq_kvp_decoder_t inner;
+        moq_kvp_decoder_init(&inner, e.value, e.value_len);
+        moq_kvp_entry_t ie;
+        moq_result_t irc;
+        while ((irc = moq_kvp_decode_next(&inner, &ie)) == MOQ_OK)
+            if (ie.type == D16_EXT_IMMUTABLE) return MOQ_MALFORMED_NESTED_IMMUTABLE;
+        if (irc != MOQ_DONE) return MOQ_MALFORMED_PROPS_UNPARSEABLE;
+    }
+    return rc == MOQ_DONE ? MOQ_MALFORMED_NONE : MOQ_MALFORMED_PROPS_UNPARSEABLE;
+}
+
 static moq_result_t d16_decode_object_header(moq_session_t *s,
                                               moq_buf_reader_t *r,
                                               bool has_extensions,
@@ -4608,17 +4633,12 @@ static moq_result_t d16_decode_object_header(moq_session_t *s,
             return MOQ_ERR_BUFFER;
         if (ext_len > 0) {
             const uint8_t *ext_ptr = moq_buf_reader_ptr(r);
-            moq_kvp_decoder_t kvp_dec;
-            moq_kvp_decoder_init(&kvp_dec, ext_ptr, (size_t)ext_len);
-            moq_kvp_entry_t kvp_entry;
-            moq_result_t kvp_rc;
-            while ((kvp_rc = moq_kvp_decode_next(&kvp_dec, &kvp_entry)) == MOQ_OK)
-                ;
-            /* §11.2 "A Key-Value-Pair cannot be parsed" makes the Track
-             * malformed (§2.4.2), not the session. */
-            if (kvp_rc != MOQ_DONE) {
+            /* A §11.2 violation makes the Track malformed (§2.4.2), not the
+             * session. */
+            uint8_t why = d16_object_extensions_malformed(ext_ptr, (size_t)ext_len);
+            if (why != MOQ_MALFORMED_NONE) {
                 if (!track_scoped) return MOQ_ERR_PROTO;
-                out->malformed = MOQ_MALFORMED_PROPS_UNPARSEABLE;
+                out->malformed = why;
             }
             out->has_properties = true;
             out->properties = ext_ptr;
@@ -4856,6 +4876,9 @@ static moq_result_t d16_decode_fetch_object_op(moq_session_t *s,
     out->payload_len = wire_out.payload_len;
     out->properties = wire_out.extensions;
     out->properties_len = wire_out.extensions_len;
+    if (wire_out.extensions_len > 0)
+        out->malformed = d16_object_extensions_malformed(wire_out.extensions,
+                                                         wire_out.extensions_len);
     return MOQ_OK;
 }
 
@@ -5034,6 +5057,7 @@ static moq_result_t d16_decode_object_datagram_op(moq_session_t *s,
     if (dg.has_extensions) {
         out->properties     = dg.extensions;
         out->properties_len = dg.extensions_len;
+        out->malformed = d16_object_extensions_malformed(dg.extensions, dg.extensions_len);
     }
     out->payload     = dg.payload;
     out->payload_len = dg.payload_len;

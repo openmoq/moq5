@@ -26,11 +26,19 @@
  *   delivered exactly once when only one event slot is free;
  * - in streaming receive, a copy of an object that begins on a second
  *   stream while the object is still being surfaced from the first is
- *   consumed without events, so chunk runs never interleave.
+ *   consumed without events, so chunk runs never interleave;
+ * - draft-16 reads inside Immutable Extensions (§11.2): an Immutable entry
+ *   nested in another, or an inner Key-Value-Pair that cannot be parsed,
+ *   makes the Track malformed, as an outer pair that cannot be parsed does,
+ *   on a subgroup stream (whole, streaming, and arriving a byte at a time),
+ *   a datagram and a FETCH response alike; a
+ *   valid Immutable block and an odd-typed value whose bytes merely look
+ *   like one are delivered.
  */
 #include <moq/moq.h>
 #include <moq/sim.h>
 #include <moq/fill.h>
+#include <moq/codec.h>
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"
 #include <stdio.h>
@@ -255,6 +263,7 @@ typedef struct rec {
     term_t   t[32];
     size_t   n;
     size_t   objects;           /* OBJECT_RECEIVED + begin chunks */
+    size_t   fetch_objects;     /* FETCH_OBJECT */
     uint64_t object_owner[32];  /* the sub or pub handle of each object */
     size_t   fill_terminals;
     size_t   stop_data;
@@ -291,6 +300,9 @@ static void rec_events(moq_session_t *s, rec_t *r)
         case MOQ_EVENT_OBJECT_CHUNK:
             if (ev.u.object_chunk.begin)
                 rec_object(r, ev.u.object_chunk.sub, ev.u.object_chunk.pub);
+            break;
+        case MOQ_EVENT_FETCH_OBJECT:
+            r->fetch_objects++;
             break;
         case MOQ_EVENT_UNSUBSCRIBED:
             rec_term(r, ev.kind, ev.u.unsubscribed.sub._opaque, ev.u.unsubscribed.cause,
@@ -734,6 +746,172 @@ static void test_history_discarded_on_alias_reuse(void)
     MOQ_TEST_CHECK(sub_resolve_handle(p.c, d) >= 0);
     pr_close(&p);
 }
+
+/* -- Draft-16 Immutable Extensions ------------------------------------------------------ */
+
+typedef struct d16_block {
+    const char   *name;
+    uint8_t       b[8];
+    size_t        n;
+    bool          malformed;
+} d16_block_t;
+
+static const d16_block_t k_d16_blocks[] = {
+    /* Immutable (0x0B) Length 3 holding Immutable Length 1 00. */
+    { "nested immutable", { 0x0B, 0x03, 0x0B, 0x01, 0x00 }, 5, true },
+    /* Immutable Length 2 holding an odd type declaring five bytes, none present. */
+    { "truncated inner pair", { 0x0B, 0x02, 0x21, 0x05 }, 4, true },
+    /* An odd type declaring five bytes with one present, outside Immutable. */
+    { "truncated outer pair", { 0x21, 0x05, 0x00 }, 3, true },
+    /* Immutable Length 2 holding Type 0x02 = 5. */
+    { "valid immutable", { 0x0B, 0x02, 0x02, 0x05 }, 4, false },
+    /* Type 0x21 with three opaque bytes spelling an Immutable entry. */
+    { "opaque odd value", { 0x21, 0x03, 0x0B, 0x01, 0x00 }, 5, false },
+};
+
+static void d16_expect(const char *family, const d16_block_t *k, const rec_t *r,
+                       uint32_t kind, uint64_t h, size_t delivered, uint64_t other)
+{
+    char what[96];
+    snprintf(what, sizeof(what), "d16 %s, %s", family, k->name);
+    if (k->malformed) {
+        expect_one(what, r, kind, h);
+    } else {
+        expect_none(what, r, kind, h);
+    }
+    if (delivered != (k->malformed ? 0u : 1u)) {
+        fprintf(stderr, "FAIL %s: %zu object(s) delivered\n", what, delivered);
+        failures++;
+    }
+    snprintf(what, sizeof(what), "d16 %s, %s: other Track", family, k->name);
+    expect_none(what, r, MOQ_EVENT_UNSUBSCRIBED, other);
+    if (r->close_code != UINT64_MAX) {
+        fprintf(stderr, "FAIL %s: session closed 0x%llx\n", what,
+                (unsigned long long)r->close_code);
+        failures++;
+    }
+}
+
+/* A subgroup stream: `split` feeds it one byte at a time, and no verdict is
+ * reached before the property block's last byte has arrived. */
+static void test_d16_immutable_subgroup(bool streaming, bool split)
+{
+    const char *family = split ? (streaming ? "subgroup, streaming, bytewise" : "subgroup, bytewise")
+                               : (streaming ? "subgroup, streaming" : "subgroup");
+    for (size_t i = 0; i < sizeof(k_d16_blocks) / sizeof(k_d16_blocks[0]); i++) {
+        const d16_block_t *k = &k_d16_blocks[i];
+        pr_t p;
+        moq_subscription_t a, u;
+        if (!pr_open(&p, MOQ_VERSION_DRAFT_16, 0, 0, streaming) || !sub_track(&p, "v", 7, &a) ||
+            !sub_track(&p, "u", 11, &u)) {
+            fprintf(stderr, "FAIL d16 %s fixture\n", family); failures++; pr_close(&p); return;
+        }
+        wire_t w = {0};
+        sg_header(&w, 7, 1, 0, 0);
+        size_t block_end = w.n + 2 + k->n;   /* object delta, Length, block */
+        sg_object(&w, 0, k->b, k->n);
+        uint64_t sid = new_stream(&p);
+        rec_t r;
+        rec_init(&r);
+        if (split) {
+            for (size_t b = 0; b < w.n; b++) {
+                (void)moq_session_on_data_bytes(p.c, moq_stream_ref_from_u64(sid), &w.b[b], 1,
+                                                false, now(&p));
+                rec_events(p.c, &r);
+                rec_actions(p.c, &r);
+                if (b + 1 < block_end && r.n != 0) {
+                    fprintf(stderr, "FAIL d16 %s, %s: verdict after %zu of %zu bytes\n", family,
+                            k->name, b + 1, block_end);
+                    failures++;
+                }
+            }
+        } else {
+            (void)feed(&p, sid, &w, false);
+        }
+        rec_events(p.c, &r);
+        rec_actions(p.c, &r);
+        rec_events(p.c, &r);
+        d16_expect(family, k, &r, MOQ_EVENT_UNSUBSCRIBED, a._opaque, objects_for(&r, a._opaque),
+                   u._opaque);
+        MOQ_TEST_CHECK((sub_resolve_handle(p.c, a) >= 0) == !k->malformed);
+        MOQ_TEST_CHECK(sub_resolve_handle(p.c, u) >= 0);
+        pr_close(&p);
+    }
+}
+
+static void test_d16_immutable_datagram(void)
+{
+    for (size_t i = 0; i < sizeof(k_d16_blocks) / sizeof(k_d16_blocks[0]); i++) {
+        const d16_block_t *k = &k_d16_blocks[i];
+        pr_t p;
+        moq_subscription_t a, u;
+        if (!pr_open(&p, MOQ_VERSION_DRAFT_16, 0, 0, false) || !sub_track(&p, "v", 7, &a) ||
+            !sub_track(&p, "u", 11, &u)) {
+            fprintf(stderr, "FAIL d16 datagram fixture\n"); failures++; pr_close(&p); return;
+        }
+        /* Extensions datagram on alias 7, {2,5}, priority 3, payload "hi". */
+        wire_t w = {0};
+        put(&w, MOQ_D16_DGRAM_FLAG_EXTENSIONS); put(&w, 7); put(&w, 2); put(&w, 5); put(&w, 3);
+        put(&w, (uint8_t)k->n);
+        for (size_t b = 0; b < k->n; b++) put(&w, k->b[b]);
+        put(&w, 'h'); put(&w, 'i');
+        (void)moq_session_on_datagram(p.c, w.b, w.n, now(&p));
+        rec_t r;
+        rec_init(&r);
+        rec_events(p.c, &r);
+        rec_actions(p.c, &r);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(p.c, now(&p)), (int)MOQ_OK);
+        rec_events(p.c, &r);
+        d16_expect("datagram", k, &r, MOQ_EVENT_UNSUBSCRIBED, a._opaque,
+                   objects_for(&r, a._opaque), u._opaque);
+        MOQ_TEST_CHECK(sub_resolve_handle(p.c, u) >= 0);
+        pr_close(&p);
+    }
+}
+
+static void test_d16_immutable_fetch(void)
+{
+    for (size_t i = 0; i < sizeof(k_d16_blocks) / sizeof(k_d16_blocks[0]); i++) {
+        const d16_block_t *k = &k_d16_blocks[i];
+        pr_t p;
+        moq_subscription_t u;
+        moq_fetch_t f;
+        if (!pr_open(&p, MOQ_VERSION_DRAFT_16, 0, 0, false) ||
+            !fetch_track(&p, "v", true, &f, NULL) || !sub_track(&p, "u", 11, &u)) {
+            fprintf(stderr, "FAIL d16 FETCH fixture\n"); failures++; pr_close(&p); return;
+        }
+        int fs = fetch_resolve_handle(p.c, f);
+        MOQ_TEST_CHECK(fs >= 0);
+        if (fs < 0) { pr_close(&p); return; }
+        MOQ_TEST_CHECK(p.c->fetches[fs].data_stream_started);
+        /* One object {1, 0, 4} with every field present, on the response's
+         * data stream (its FETCH_HEADER already read). */
+        wire_t w = {0};
+        put(&w, MOQ_D16_FETCH_FLAG_GROUP_ID | MOQ_D16_FETCH_FLAG_OBJECT_ID |
+                    MOQ_D16_FETCH_FLAG_PRIORITY | MOQ_D16_FETCH_FLAG_EXTENSIONS |
+                    MOQ_D16_FETCH_FLAG_SUBGROUP_MASK);
+        put(&w, 1); put(&w, 0); put(&w, 4); put(&w, 0x80);
+        put(&w, (uint8_t)k->n);
+        for (size_t b = 0; b < k->n; b++) put(&w, k->b[b]);
+        put(&w, 0x01); put(&w, 'A');
+        (void)moq_session_on_data_bytes(p.c, p.c->fetches[fs].data_stream_ref, w.b, w.n, false,
+                                        now(&p));
+        rec_t r;
+        rec_init(&r);
+        rec_events(p.c, &r);
+        rec_actions(p.c, &r);
+        rec_events(p.c, &r);
+        d16_expect("FETCH", k, &r, MOQ_EVENT_FETCH_RESET, f._opaque, r.fetch_objects,
+                   u._opaque);
+        MOQ_TEST_CHECK((fetch_resolve_handle(p.c, f) >= 0) == !k->malformed);
+        pr_close(&p);
+    }
+}
+
+static void t_d16_sg(void) { test_d16_immutable_subgroup(false, false); }
+static void t_d16_sg_split(void) { test_d16_immutable_subgroup(false, true); }
+static void t_d16_sg_stream(void) { test_d16_immutable_subgroup(true, false); }
+static void t_d16_sg_stream_split(void) { test_d16_immutable_subgroup(true, true); }
 
 /* -- Datagrams under pressure ------------------------------------------------------------ */
 
@@ -1555,6 +1733,12 @@ static const named_t k_tests[] = {
     { "d16_cancel_arena_occupied", t_arena_occupied },
     { "d16_cancel_never_fits", t_arena_never },
     { "d16_cancel_refusal_classes", test_d16_cancel_refusal_classes },
+    { "d16_immutable_subgroup", t_d16_sg },
+    { "d16_immutable_subgroup_bytewise", t_d16_sg_split },
+    { "d16_immutable_subgroup_streaming", t_d16_sg_stream },
+    { "d16_immutable_subgroup_streaming_bytewise", t_d16_sg_stream_split },
+    { "d16_immutable_datagram", test_d16_immutable_datagram },
+    { "d16_immutable_fetch", test_d16_immutable_fetch },
     { "late_recipient_copy", t_late_recipient },
     { "both_recipients_copy", t_both_recipients },
     { "after_verdict_whole", t_av_whole },

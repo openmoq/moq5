@@ -22,6 +22,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,9 @@ size_t moq_media_sender_test_stage(moq_media_sender_t *s,
 void moq_media_sender_test_pump(moq_media_sender_t *s, moq_session_t *session,
                                 uint64_t now_us);
 void moq_media_sender_test_set_ts_yield_hook(void (*fn)(void *), void *ctx);
+bool moq_media_sender_test_complete_ts_step(moq_media_sender_t *s);
+bool moq_media_sender_test_complete_failed(moq_media_sender_t *s);
+bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s);
 
 
 static moq_bytes_t g_ns_parts[2] = { { (const uint8_t *)"svc", 3 },
@@ -1769,6 +1773,232 @@ static void test_track_stats_sum(void)
     if (failures == before) printf("PASS: ts_track_stats_sum\n");
 }
 
+/* -- complete() on a byte-stream track -------------------------------------- *
+ * complete() finishes the source as end_track does, but asynchronously, on
+ * the drain: the held Objects, then the packetizer's last ones, admitted
+ * without evicting queued media or waiting; a full queue keeps them parked
+ * for a later pump; a trailing partial packet is discarded and counted; a
+ * lost Object fails the completion; an in-flight writer keeps the source
+ * until its call returns, taking no byte after complete(). The step is run
+ * through a seam (the drain's own call, without a publisher). A failed
+ * completion owes nothing further, so once its queued media is settled it
+ * reports no work -- while another track's sendable end still does, and a
+ * healthy completion parked behind a full queue stays work. */
+typedef enum { TSC_TRAILING, TSC_FULL, TSC_FULL_DROP, TSC_FULL_BLOCK, TSC_NOMEM, TSC_REPEAT,
+               TSC_INFLIGHT, TSC_NOMEM_SIBLING } tsc_row_t;
+
+typedef struct tsc_hook {
+    moq_media_sender_t *s;
+    unsigned calls;
+    bool step_while_busy;
+} tsc_hook_t;
+
+static void tsc_complete_in_yield(void *ctx)
+{
+    tsc_hook_t *h = ctx;
+    if (h->calls++ != 1) return;   /* after the first Object was queued */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(h->s), (int)MOQ_OK);
+    /* The writer holds the source: the step leaves it alone. */
+    h->step_while_busy = moq_media_sender_test_complete_ts_step(h->s);
+}
+
+static moq_media_sender_t *tsc_sender(tsc_row_t row)
+{
+    if (row == TSC_NOMEM || row == TSC_NOMEM_SIBLING) return make_gated_sender();
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    cfg.backpressure = row == TSC_FULL_DROP    ? MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME
+                     : row == TSC_FULL_BLOCK ? MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT
+                                             : MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK;
+    cfg.block_timeout_us = 20000;
+    cfg.companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    if (row == TSC_FULL || row == TSC_FULL_DROP || row == TSC_FULL_BLOCK)
+        cfg.queue_max_objects = 2;
+    return moq_media_sender_test_new_cfg(&cfg);
+}
+
+static void test_complete_ts(tsc_row_t row)
+{
+    static const char *const names[] = { "trailing", "full", "full_drop", "full_block",
+                                         "nomem", "repeat", "inflight", "nomem_sibling" };
+    bool nomem = row == TSC_NOMEM || row == TSC_NOMEM_SIBLING;
+    /* full_drop: the same under a drop policy (nothing lost); full_block:
+     * under BLOCK_TIMEOUT, where a write waits for room -- the completion,
+     * on the network thread, never does. */
+    bool full = row == TSC_FULL || row == TSC_FULL_DROP || row == TSC_FULL_BLOCK;
+    int before = failures;
+    static uint8_t stream[STREAM_MAX];
+    size_t len = make_stream(stream, 188, false);
+    moq_media_sender_t *s = tsc_sender(row);
+    if (!s) { failures++; return; }
+    moq_msf_mpeg2ts_t rec;
+    ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
+    moq_media_track_t *t = add_bytes_track(s, &rec, full || nomem ? 3 : 64);
+    /* An unrelated track whose end is queued and sendable throughout. */
+    if (row == TSC_NOMEM_SIBLING) {
+        moq_msf_track_ext_t ext = { .kind = MOQ_MSF_EXT_MPEG2TS,
+                                    .u = { .mpeg2ts = &rec } };
+        ts_track_opts_t o;
+        memset(&o, 0, sizeof(o));
+        o.name = "side"; o.ext = &ext; o.ext_count = 1;
+        moq_media_track_t *u = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)add_track(s, &o, &u), (int)MOQ_OK);
+        MOQ_TEST_CHECK(u != NULL && moq_media_sender_end_track(s, u) == MOQ_OK);
+    }
+    moq_media_sender_test_set_ready(s);
+    static uint8_t taken[STREAM_MAX + 4 * 188];
+    size_t taken_len = 0, consumed = 0;
+    if (row == TSC_FULL) {
+        /* Fill the two-Object queue and hold Objects back. */
+        size_t off = 0;
+        for (int i = 0; i < 8 && off < len; i++) {
+            size_t c = 0;
+            if (write_ts(s, t, stream + off, len - off, false, &c) == MOQ_ERR_WOULD_BLOCK) break;
+            off += c;
+        }
+        consumed = off;
+    } else if (row == TSC_FULL_DROP || row == TSC_FULL_BLOCK) {
+        /* Exactly the queue's two Objects plus one complete Object the
+         * packetizer still holds (the flush hands it over). */
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 9 * 188, false, &consumed),
+                              (int)MOQ_OK);
+    } else if (nomem) {
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 4 * 188, false, &consumed),
+                              (int)MOQ_OK);
+    } else if (row == TSC_INFLIGHT) {
+        tsc_hook_t h = { s, 0, true };
+        moq_media_sender_test_set_ts_yield_hook(tsc_complete_in_yield, &h);
+        moq_result_t rc = write_ts(s, t, stream, len, false, &consumed);
+        moq_media_sender_test_set_ts_yield_hook(NULL, NULL);
+        /* Stopped at the next yield: what it took is reported, no more. */
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK(consumed > 0 && consumed < len);
+        MOQ_TEST_CHECK(!h.step_while_busy);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, len, false, &consumed), (int)MOQ_OK);
+        /* ...and 100 bytes of a packet that never completes. */
+        size_t c = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 100, false, &c), (int)MOQ_OK);
+    }
+    moq_media_sender_track_stats_t st0;
+    MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st0, sizeof(st0)) == MOQ_OK);
+
+    if (row != TSC_INFLIGHT)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+    if (row == TSC_REPEAT)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+    /* No byte is taken once complete() latched. */
+    size_t late = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 188, false, &late),
+                          (int)MOQ_ERR_WRONG_STATE);
+    moq_media_sender_stats_t ss0;
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss0, sizeof(ss0)) == MOQ_OK);
+    if (nomem) g_refuse = true;
+    bool done = moq_media_sender_test_complete_ts_step(s);
+    if (nomem) {
+        g_refuse = false;
+        /* The last Object could not be copied: the completion fails and stays
+         * failed -- no end, no terminal catalog. */
+        MOQ_TEST_CHECK(!done && moq_media_sender_test_complete_failed(s));
+        MOQ_TEST_CHECK(!moq_media_sender_test_complete_ts_step(s));
+        moq_media_sender_stats_t ss;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss, sizeof(ss)) == MOQ_OK &&
+                       ss.last_error == MOQ_ERR_NOMEM);
+        /* Settle what was really queued; then only the failed completion's
+         * obligations are left, which are no work -- unless another track's
+         * end is still to send. */
+        moq_rcbuf_t *hp = NULL;
+        while (moq_media_sender_test_emit_head(s, &hp)) {
+            if (hp) moq_rcbuf_decref(hp);
+            hp = NULL;
+        }
+        moq_media_sender_track_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_has_pending_output(s),
+                              (int)(row == TSC_NOMEM_SIBLING));
+        MOQ_TEST_CHECK(moq_media_sender_test_complete_failed(s));
+        /* The completion's failure, exact and sticky through a repeated
+         * complete() and a refused write (neither records a failure). */
+        MOQ_TEST_CHECK_EQ_INT((int)ss.completion_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+        size_t late2 = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 188, false, &late2),
+                              (int)MOQ_ERR_WRONG_STATE);
+        moq_media_sender_stats_t ss2;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss2, sizeof(ss2)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)ss2.completion_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)ss2.last_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_U64(ss2.struct_size, sizeof(ss2));
+        /* An older caller's output, through sap_records_evicted or only the
+         * frozen v0 prefix: exactly that prefix is written and stamped, and
+         * nothing past it. */
+        static const size_t prefixes[2] = {
+            offsetof(moq_media_sender_stats_t, completion_error),
+            offsetof(moq_media_sender_stats_t, last_error) + sizeof(moq_result_t) };
+        for (int k = 0; k < 2; k++) {
+            unsigned char buf[sizeof(moq_media_sender_stats_t) + 16];
+            memset(buf, 0xA5, sizeof(buf));
+            MOQ_TEST_CHECK(moq_media_sender_get_stats(
+                s, (moq_media_sender_stats_t *)(void *)buf, prefixes[k]) == MOQ_OK);
+            uint32_t stamped;
+            memcpy(&stamped, buf, sizeof(stamped));
+            MOQ_TEST_CHECK_EQ_U64(stamped, prefixes[k]);
+            bool untouched = true;
+            for (size_t b = prefixes[k]; b < sizeof(buf); b++) untouched &= buf[b] == 0xA5;
+            MOQ_TEST_CHECK(untouched);
+        }
+    } else if (full) {
+        /* The queue is full: the held and last Objects stay parked, nothing
+         * is evicted, and each drained Object lets the next one in. */
+        moq_media_sender_track_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK(!done && st.objects_dropped == 0 && st.mpeg2ts_objects_parked >= 1);
+        /* Parked behind the full queue, the healthy completion is work. */
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(s));
+        for (int i = 0; i < 64 && !done; i++) {
+            take_head(s, taken, &taken_len);
+            done = moq_media_sender_test_complete_ts_step(s);
+        }
+        MOQ_TEST_CHECK(done && !moq_media_sender_test_complete_failed(s));
+        moq_media_sender_stats_t ss1;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss1, sizeof(ss1)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(ss1.backpressure_stalls, ss0.backpressure_stalls);
+    } else {
+        MOQ_TEST_CHECK(done && !moq_media_sender_test_complete_failed(s));
+    }
+    if (!nomem) {
+        /* A healthy completion records no failure. */
+        moq_media_sender_stats_t ssh;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ssh, sizeof(ssh)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)ssh.completion_error, (int)MOQ_OK);
+    }
+    if (row == TSC_REPEAT)
+        MOQ_TEST_CHECK(moq_media_sender_test_complete_ts_step(s));   /* idempotent */
+    if (!nomem) {
+        /* Every whole packet taken reaches the queue, in order: what was
+         * drained, then what is still queued. */
+        static obj_log_t lg;
+        memset(&lg, 0, sizeof(lg));
+        log_queue(s, &lg);
+        static uint8_t all[STREAM_MAX + 4 * 188];
+        memcpy(all, taken, taken_len);
+        memcpy(all + taken_len, lg.bytes, lg.len);
+        size_t whole = consumed - consumed % 188;
+        MOQ_TEST_CHECK_EQ_U64(taken_len + lg.len, whole);
+        MOQ_TEST_CHECK(taken_len + lg.len == whole && memcmp(all, stream, whole) == 0);
+        moq_media_sender_track_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.mpeg2ts_objects_parked, 0);
+        if (row == TSC_TRAILING || row == TSC_REPEAT)
+            MOQ_TEST_CHECK_EQ_U64(st.mpeg2ts_partial_bytes_discarded, 100);
+    }
+    moq_media_sender_test_free(s);
+    if (failures == before) printf("PASS: ts_complete_%s\n", names[row]);
+}
+
 #endif /* MOQ_TEST_HAVE_MPEG2TS */
 
 /* Every build has the TS entry points; without moq::mpeg2ts they refuse. */
@@ -2016,6 +2246,7 @@ int main(void)
     test_continuation_discard();
     test_lost_group_start();
     test_end_track_nomem();
+    for (int r = TSC_TRAILING; r <= TSC_NOMEM_SIBLING; r++) test_complete_ts((tsc_row_t)r);
     test_interrupt_keeps_output();
     test_proto_discards_carry();
     test_keyframe_stats();

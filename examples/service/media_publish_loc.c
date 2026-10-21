@@ -14,6 +14,10 @@
  * of every access unit so AUs can be split cheaply; ffmpeg inserts these with
  *   -bsf:v h264_metadata=aud=insert
  *
+ * When the input ends, the broadcast is complete (MSF 11.3): the track ends
+ * with END_OF_TRACK, then a final catalog states isComplete. A signal or an
+ * input/send failure ends the track alone, and a failure exits non-zero.
+ *
  * Usage: media_publish_loc <url> <namespace> [track] [--insecure-skip-verify]
  *   url        moqt://host:port[/path]  (raw QUIC), or https://host:port/path (WT)
  *   namespace  slash-separated, e.g. "demo"
@@ -379,19 +383,20 @@ int main(int argc, char **argv)
     /* 4. Read Annex-B from stdin (pb already holds the pre-read bytes from
      *    phase 1). Continue splitting on AUDs and emitting. */
     bool eof = false;
+    bool failed = false;   /* a read, allocation or send failure: not EOF */
 
-    while (!g_stop && !eof) {
+    while (!g_stop && !eof && !failed) {
         uint8_t chunk2[65536];
         size_t got = fread(chunk2, 1, sizeof(chunk2), stdin);
         if (got == 0) {
             if (feof(stdin)) eof = true;
-            else if (ferror(stdin)) break;
+            else if (ferror(stdin)) { failed = true; break; }
         }
         if (got > 0) {
             if (pb_len + got > pb_cap) {
                 size_t ncap = (pb_len + got) * 2;
                 uint8_t *np = (uint8_t *)realloc(pb, ncap);
-                if (!np) { fprintf(stderr, "oom\n"); break; }
+                if (!np) { fprintf(stderr, "oom\n"); failed = true; break; }
                 pb = np; pb_cap = ncap;
             }
             memcpy(pb + pb_len, chunk2, got);
@@ -410,14 +415,15 @@ int main(int argc, char **argv)
         long next;
         while ((next = find_nal(pb, pb_len, search, 9)) >= 0) {
             if (emit_au(&st, track, pb + au_start, (size_t)(next - au_start)) != 0) {
-                g_stop = 1; break;
+                failed = true; break;
             }
             au_start = next;
             search = (size_t)au_start + 4;
         }
 
-        if (eof && !g_stop) {
-            emit_au(&st, track, pb + au_start, pb_len - (size_t)au_start);
+        if (eof && !g_stop && !failed) {
+            if (emit_au(&st, track, pb + au_start, pb_len - (size_t)au_start) != 0)
+                failed = true;
             pb_len = 0;
         } else if (au_start > 0) {
             /* Keep the in-progress AU; drop everything before it. */
@@ -428,16 +434,27 @@ int main(int argc, char **argv)
 
     free(pb);
 
-    /* 4. End the track, then drain while the sender is still attached, so
-     * its queued objects and the track's end reach the transport (and, where
-     * the backend observes it, the peer's acknowledgement); then tear down,
-     * child first. Destroying the sender first would discard what it still
-     * had queued. The exit status says whether that finite end completed. */
+    /* 4. End, then drain while the sender is still attached, so its queued
+     * objects and the end reach the transport (and, where the backend
+     * observes it, the peer's acknowledgement); then tear down, child first.
+     * Destroying the sender first would discard what it still had queued.
+     * The whole input published is the broadcast's permanent end (MSF 11.3):
+     * complete() sends the accepted media, ends the track after it, then
+     * publishes the terminal catalog, all reached by the one drain. Anything
+     * else (a signal, a read or send failure) ends the track alone. The exit
+     * status says whether that end completed, and whether the input did. */
     int status = 0;
+    bool input_complete = eof && !g_stop && !failed;
+    if (failed) {
+        fprintf(stderr, "input: not fully published\n");
+        status = 1;
+    }
     if (st.track_added) {
-        moq_result_t erc = moq_media_sender_end_track(tx, st.trk);
+        moq_result_t erc = input_complete ? moq_media_sender_complete(tx)
+                                          : moq_media_sender_end_track(tx, st.trk);
         if (erc != MOQ_OK) {
-            fprintf(stderr, "end_track: %d (%s)\n", (int)erc, moq_strerror(erc));
+            fprintf(stderr, "%s: %d (%s)\n", input_complete ? "complete" : "end_track",
+                    (int)erc, moq_strerror(erc));
             status = 1;
         }
     }

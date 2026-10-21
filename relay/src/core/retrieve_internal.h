@@ -115,6 +115,16 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_source_abort(
     moqr_core_t *core, moqr_track_t track, uint64_t track_gen,
     moqr_pd_desc_t status);
 
+/* End one ACTIVE subscription alone with `status` (moqr_core_internal_
+ * source_abort's per-subscription form): its binding's next delivery scan
+ * retires it with a SUB_DONE before delivering anything else for it, and
+ * keeps it marked while the intent ring is full. MOQR_OK,
+ * MOQR_ERR_INVAL, MOQR_ERR_STALE_HANDLE or MOQR_ERR_WRONG_STATE (not
+ * ACTIVE). */
+MOQR_CORE_API moqr_result_t moqr_core_internal_sub_fail(moqr_core_t *core,
+                                                       moqr_sub_t sub,
+                                                       moqr_pd_desc_t status);
+
 /* Hold one free subscription slot for a later moqr_core_subscribe made with
  * req->reserved, so that no other request takes it meanwhile: the binding
  * reserves before it offers a discovered track on the wire, and subscribes

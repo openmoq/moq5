@@ -9570,6 +9570,36 @@ moqr_core_source_finish(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
  * the binding marked until the ring has room), and the source is released
  * now, so no ACTIVE source is left without an owner to retry it. Queues no
  * intent; never WOULD_BLOCK. */
+/* One subscription cannot be served on its binding's draft (Object
+ * Properties its destination cannot represent): it alone ends, with
+ * `status`, by its binding's next delivery scan before anything else is
+ * delivered for it -- the same per-subscription retirement a failed source
+ * gives -- and a full intent ring keeps it marked for a later scan. The
+ * track and every other subscription are untouched. */
+moqr_result_t
+moqr_core_internal_sub_fail(moqr_core_t *c, moqr_sub_t sh, moqr_pd_desc_t status)
+{
+    if (c == NULL || !moqr_pd_desc_valid(status)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t slot = 0;
+    r_sub_t *s = sub_resolve(c, sh, &slot);
+    if (s == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (s->state != R_SUB_ACTIVE) {
+        return MOQR_ERR_WRONG_STATE;
+    }
+    s->src_done = true;
+    s->src_abort = true;
+    s->src_done_pd = status;
+    if (s->binding < c->max_bindings &&
+        c->bindings[s->binding].gen == s->binding_gen) {
+        ready_mark(c, s->binding);
+    }
+    return MOQR_OK;
+}
+
 moqr_result_t
 moqr_core_internal_source_abort(moqr_core_t *c, moqr_track_t th,
                                 uint64_t track_gen, moqr_pd_desc_t status)

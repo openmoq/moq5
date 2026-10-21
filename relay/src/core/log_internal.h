@@ -76,6 +76,7 @@ typedef struct moqr_rec {
     bool              first_object;  /* first object ever published in its
                                       * subgroup (upstream FIRST_OBJECT)    */
     bool              subgroup_properties; /* upstream header PROPERTIES     */
+    uint8_t           properties_codec;    /* MOQR_PROPS_CODEC_* at ingest   */
     bool              follows_gap;   /* not known to continue the stream the
                                       * list's previous record was on: an
                                       * earlier object of the subgroup was

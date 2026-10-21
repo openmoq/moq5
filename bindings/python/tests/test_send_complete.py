@@ -515,7 +515,7 @@ class CompleteSurfaceTests(CompleteGatedBase):
         self.require_surface()
         endpoint, sender = self.live()
         self.track(sender, name=b"one")
-        _native._test_sender_stats(7, 3, 4, 900, 0, 0, 0, 0, 0, 0, 0)
+        _native._test_sender_stats(7, 3, 4, 900, 0, 0, 0, 0, 0, 0, 0, 0)
         before = sender.stats()
         self.request(sender)
         after = sender.stats()

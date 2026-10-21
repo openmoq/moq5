@@ -740,6 +740,14 @@ group_retains_beyond(const moqr_group_t *g, uint64_t final_q)
     (offsetof(moqr_log_append_desc_t, field) +                \
          sizeof(((moqr_log_append_desc_t *)0)->field) <= (desc)->struct_size)
 
+/* A stated properties codec is one of MOQR_PROPS_CODEC_*. */
+static bool
+log_desc_codec_valid(const moqr_log_append_desc_t *desc)
+{
+    return !LOG_DESC_HAS(desc, properties_codec) ||
+           desc->properties_codec <= MOQR_PROPS_CODEC_VI64;
+}
+
 static bool
 log_hole_has(const moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
 {
@@ -935,7 +943,7 @@ moqr_result_t
 moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
 {
     if (log == NULL || desc == NULL ||
-        desc->struct_size < LOG_DESC_MIN_SIZE) {
+        desc->struct_size < LOG_DESC_MIN_SIZE || !log_desc_codec_valid(desc)) {
         return MOQR_ERR_INVAL;
     }
     /* Status objects carry no payload (mirrors the session's
@@ -1183,6 +1191,8 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     rec.first_object = LOG_DESC_HAS(desc, first_object) && desc->first_object;
     rec.subgroup_properties = LOG_DESC_HAS(desc, subgroup_properties) &&
                               desc->subgroup_properties;
+    rec.properties_codec = LOG_DESC_HAS(desc, properties_codec)
+                               ? desc->properties_codec : MOQR_PROPS_CODEC_UNKNOWN;
     rec.follows_gap = !desc->datagram_pref && sg->gap_pending;
     rec.gap_reset = moqr_reset_desc_none();
     /* An append to a subgroup whose upstream stream already ended (a RESET,
@@ -1288,7 +1298,7 @@ moqr_result_t
 moqr_log_open_record(moqr_log_t *log, const moqr_log_append_desc_t *desc)
 {
     if (log == NULL || desc == NULL ||
-        desc->struct_size < LOG_DESC_MIN_SIZE) {
+        desc->struct_size < LOG_DESC_MIN_SIZE || !log_desc_codec_valid(desc)) {
         return MOQR_ERR_INVAL;
     }
     if (desc->obj_state != MOQR_OBJ_OPEN) {
@@ -1666,6 +1676,7 @@ view_fill(moqr_record_view_t *out, const moqr_rec_t *rec)
     out->first_object = rec->first_object;
     out->payload = rec->payload;
     out->properties = rec->properties;
+    out->properties_codec = rec->properties_codec;
     out->chunk_count = rec->chunk_count;
     out->declared_len = rec->declared_len;
     out->_chunk_head = rec->chunk_head;

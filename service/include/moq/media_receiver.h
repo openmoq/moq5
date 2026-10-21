@@ -816,7 +816,17 @@ MOQ_API moq_result_t moq_media_receiver_subscribe_track(
  * cheaply -- repeated enable/disable never accumulates state. The catalog track
  * and the track's TRACK_ADDED handle remain valid -- only delivery stops.
  * Atomic like subscribe_track: MOQ_OK / MOQ_ERR_INVAL / MOQ_ERR_CLOSED; a no-op
- * (and MOQ_OK) for an already-unsubscribed or locally failed track. */
+ * (and MOQ_OK) for an already-unsubscribed or locally failed track.
+ *
+ * A track a later catalog removed is MOQ_ERR_WRONG_STATE, with one exception:
+ * a track a terminal catalog (isComplete) removed while its subscription was
+ * still delivering -- it stays wanted, and its TRACK_REMOVED waits for the
+ * subscription's done (its END_OF_TRACK alone can overtake its last Objects).
+ * Unsubscribing such a track is the same disable: its queued objects
+ * are purged, nothing more of it is delivered, and the receiver then retires
+ * its subscription and emits TRACK_REMOVED. Cancellation does not synthesize
+ * TRACK_ENDED or retract an end already reported. It cannot be subscribed
+ * again. */
 MOQ_API moq_result_t moq_media_receiver_unsubscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track);
 

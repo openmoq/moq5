@@ -20,4 +20,10 @@ bool moq_media_receiver_has_input_internal(moq_media_receiver_t *r);
 size_t moq_media_receiver_track_input_internal(moq_media_receiver_t *r,
                                               const moq_media_track_t *track);
 
+/* Whether `track` was removed by a terminal (isComplete) catalog, as
+ * recorded at its removal; false for a withdrawal, a track not removed, a
+ * foreign handle or NULL. It never changes once the track is removed. */
+bool moq_media_receiver_track_removed_by_completion_internal(
+    moq_media_receiver_t *r, const moq_media_track_t *track);
+
 #endif /* MOQ_MEDIA_RECEIVER_INTERNAL_H */

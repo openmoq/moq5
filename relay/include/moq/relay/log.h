@@ -134,6 +134,17 @@ MOQR_CORE_API void moqr_log_destroy(moqr_log_t *log);
 
 /* -- Append (ingest) ---------------------------------------------------- */
 
+/* The integer encoding of a record's Object Property bytes: the codec of the
+ * wire draft that carried them. A Key-Value-Pair's Delta Type, odd-type
+ * Length and even-type value are draft-16 (i), the QUIC variable-length
+ * integer, and draft-18/draft-22 (vi64). UNKNOWN states nothing: the log
+ * keeps such bytes opaquely, and a protocol-aware consumer must not convert
+ * or forward a nonempty UNKNOWN block onto any draft. An empty block needs
+ * no codec. Any other value is an invalid argument. */
+#define MOQR_PROPS_CODEC_UNKNOWN     0u
+#define MOQR_PROPS_CODEC_QUIC_VARINT 1u   /* draft-16                      */
+#define MOQR_PROPS_CODEC_VI64        2u   /* draft-18 and draft-22         */
+
 typedef struct moqr_log_append_desc {
     uint32_t          struct_size;
     uint64_t          group_id;
@@ -170,6 +181,13 @@ typedef struct moqr_log_append_desc {
      * otherwise the record is appended with the flag clear. */
     uint8_t           _reserved_desc[7];
     bool              subgroup_properties;
+    /* Never read: the descriptor's tail before properties_codec, which lies
+     * past the size every earlier descriptor was built with. */
+    uint8_t           _reserved_tail[7];
+    /* Appended. The codec of `properties` (MOQR_PROPS_CODEC_*). Read only
+     * when struct_size covers it; otherwise UNKNOWN. Any value other than
+     * the three codecs is MOQR_ERR_INVAL. */
+    uint8_t           properties_codec;
 } moqr_log_append_desc_t;
 
 /* The symbol clears and stamps the descriptor as a caller built before any
@@ -330,6 +348,10 @@ typedef struct moqr_record_view {
                                       * padding, layout unchanged          */
     const moq_rcbuf_t *payload;      /* BORROWED; NULL for status/chunked   */
     const moq_rcbuf_t *properties;   /* BORROWED; NULL if none             */
+    /* The codec `properties` was stated in at ingest (MOQR_PROPS_CODEC_*),
+     * fixed for the record's life. This field changed the view's layout:
+     * code reading views is rebuilt against this header. */
+    uint8_t            properties_codec;
     /* Chunked records (chunk_count > 0): payload is NULL and the retained
      * bytes-so-far live in a chunk list read via moqr_log_view_chunk;
      * declared_len is the wire payload length. Whole-object records have

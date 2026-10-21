@@ -96,6 +96,9 @@ typedef struct {
     uint64_t              done_wait_left_us; /* of the tail wait */
     uint64_t              done_wait_step_us; /* when it was last marked */
     bool                  done_wait_frozen;  /* since then: held up locally */
+    /* The receiver reported a normal end of the track (its END_OF_TRACK,
+     * or a normal or statusless done). */
+    bool                  peer_ended;
 } player_track_t;
 
 /* The object held for the engine. */
@@ -1277,7 +1280,17 @@ static void take_track_events(moq_media_player_t *p, uint64_t now_us)
             moq_media_player_event_t rm =
                 ev_make(MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED, ev.track, 0);
             ev_push(p, &rm);
-            if (t) track_trigger(p, t, MOQ_MEDIA_PLAYER_END_REMOVED, now_us);
+            /* A completed broadcast (MSF 11.3) removes every track; for one
+             * the peer has already ended, that removal is not news. Its end
+             * is its END_OF_TRACK, COMPLETE only if every location up to it
+             * is accounted for, or the normal done's bounded wait. Why the
+             * track was removed is what the receiver recorded at the
+             * removal, not the current catalog: a withdrawal stays a cause
+             * even when a terminal catalog follows before this is read. */
+            if (t && !(t->peer_ended &&
+                       moq_media_receiver_track_removed_by_completion_internal(
+                           p->r, ev.track)))
+                track_trigger(p, t, MOQ_MEDIA_PLAYER_END_REMOVED, now_us);
             break;
         }
         case MOQ_MEDIA_TRACK_ENDED:
@@ -1288,10 +1301,12 @@ static void take_track_events(moq_media_player_t *p, uint64_t now_us)
             if (!t) break;
             if (ev.has_done_status &&
                 ev.done_status != PLAYER_DONE_TRACK_ENDED &&
-                ev.done_status != PLAYER_DONE_SUBSCRIPTION_ENDED)
+                ev.done_status != PLAYER_DONE_SUBSCRIPTION_ENDED) {
                 track_trigger(p, t, MOQ_MEDIA_PLAYER_END_PEER_DONE, now_us);
-            else
+            } else {
+                t->peer_ended = true;
                 done_hint(p, t, now_us);
+            }
             break;
         case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE:
             /* A fill child's failure ends the fill, not its track: what the

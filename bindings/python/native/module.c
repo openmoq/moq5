@@ -2472,9 +2472,9 @@ static PyObject *sender_has_media_subscriber_py(PyObject *module,
 
 /* -- sender statistics ----------------------------------------------------- *
  * A read-only snapshot, taken anew on every call. The frozen v0 prefix ends at
- * last_error; sap_records_evicted is appended after it and is read ONLY when
- * the stamped prefix covers the whole field -- absence is None, never a
- * fabricated zero. The native result is checked FIRST; a malformed stamp on a
+ * last_error; sap_records_evicted and then completion_error are appended after
+ * it, and each is read ONLY when the stamped prefix covers the whole field --
+ * absence is None, never a fabricated zero. The native result is checked FIRST; a malformed stamp on a
  * SUCCESSFUL call is a binding fault, never a native error code. Nothing is
  * recomputed, repaired or cached, and no native pointer is retained. */
 #define SENDER_STATS_V0_SIZE \
@@ -2511,11 +2511,22 @@ static PyObject *sender_stats_py(PyObject *module, PyObject *capsule)
         Py_INCREF(evicted);
     }
     if (!evicted) return NULL;
+    PyObject *completion = Py_None;
+    if (st.struct_size >= SENDER_STATS_FIELD_END(completion_error)) {
+        completion = PyLong_FromLong((long)st.completion_error);   /* signed DATA */
+        if (!completion) {
+            Py_DECREF(evicted);
+            return NULL;
+        }
+    } else {
+        Py_INCREF(completion);
+    }
     if (site_fails("sender_stats_result")) {
         Py_DECREF(evicted);
+        Py_DECREF(completion);
         return NULL;
     }
-    PyObject *result = Py_BuildValue("(KKKKKKKKKiO)",
+    PyObject *result = Py_BuildValue("(KKKKKKKKKiOO)",
         (unsigned long long)st.objects_written,
         (unsigned long long)st.objects_sent,
         (unsigned long long)st.objects_queued,
@@ -2526,8 +2537,9 @@ static PyObject *sender_stats_py(PyObject *module, PyObject *capsule)
         (unsigned long long)st.groups_abandoned,
         (unsigned long long)st.backpressure_stalls,
         (int)st.last_error,                  /* signed: historical DATA */
-        evicted);
+        evicted, completion);
     Py_DECREF(evicted);
+    Py_DECREF(completion);
     return result;
 }
 

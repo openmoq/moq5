@@ -61,11 +61,13 @@ bool moqr_bind_debug_sg_handle(const moqr_bind_t *b,
 bool moqr_bind_debug_first_usub(const moqr_bind_t *b, uint32_t *slot,
                                 uint64_t *handle_raw);
 /* Forwarded Joining FETCH transaction gauges (test-internals build only):
- * admission outcomes, upstream terminals, downstream terminals, how many
+ * admission outcomes (joins_retrieved: joins answered through the
+ * standalone retrieval path rather than one upstream transaction), upstream
+ * terminals, downstream terminals, how many
  * steps HOLD-retried, events that named a retired upstream handle, live
  * transactions, and the byte pool's current/high-water/cap. */
 typedef struct moqr_bind_fwd_debug {
-    uint64_t admitted, rejected_no_upstream, rejected_no_slot, rejected_oom;
+    uint64_t admitted, joins_retrieved, rejected_no_slot, rejected_oom;
     uint64_t completed, errors, resets, lost, overflow, mismatch,
              cancelled_down, cancelled_up;
     uint64_t delivered, rejected_down, aborted, down_gone, down_lost;
@@ -80,6 +82,19 @@ typedef struct moqr_bind_fwd_debug {
      * was gone before its acceptance committed. */
     uint64_t accepts_sent, accepts_blocked, accepts_pending, accepts_undone;
     uint64_t reason_unretained;
+    /* Object Properties re-encoded for a destination's draft, refused
+     * there (not representable, unknown codec, or no memory), and found
+     * malformed in their own codec while being converted. */
+    uint64_t props_converted, props_refused, props_malformed;
+    /* Track Property sets re-encoded for a destination's draft, and sets
+     * that could not be stated there. */
+    uint64_t track_props_converted, track_props_refused;
+    /* Discovery offers not made because the Track Properties they were to
+     * state could not be (reported as PUBLISH_BLOCKED instead). */
+    uint64_t publish_withheld;
+    /* Discovery offers or PUBLISH_BLOCKED reports that met WOULD_BLOCK and
+     * were made again on a later pump. */
+    uint64_t discovery_retried;
     uint64_t live;
     uint64_t bytes_used, bytes_high, bytes_cap;
 } moqr_bind_fwd_debug_t;

@@ -11,13 +11,15 @@ graceful finish, and nothing here is a readiness poll or a lifecycle barrier.
 The contract, from the sources:
 
   service/include/moq/media_sender.h:571-623
-      Eleven reported values. Ten are uint64 counters plus a SIGNED
-      last_error: objects_written, objects_sent, objects_queued, bytes_queued,
-      objects_dropped, groups_dropped, keyframes_dropped, groups_abandoned,
-      backpressure_stalls, last_error, and the appended sap_records_evicted.
+      Twelve reported values: uint64 counters plus a SIGNED last_error and a
+      SIGNED completion_error: objects_written, objects_sent, objects_queued,
+      bytes_queued, objects_dropped, groups_dropped, keyframes_dropped,
+      groups_abandoned, backpressure_stalls, last_error, and the appended
+      sap_records_evicted and completion_error.
   service/src/media_sender.c:39-43
       The frozen v0 floor is offsetof(last_error) + sizeof(moq_result_t): v0
-      ENDS at last_error, and sap_records_evicted is appended after it.
+      ENDS at last_error; sap_records_evicted, then completion_error, are
+      appended after it.
   service/src/media_sender.c:4779-4805
       out_size below the v0 floor, or a NULL argument, is INVAL. Otherwise the
       library writes min(out_size, its own sizeof) bytes and STAMPS
@@ -41,13 +43,18 @@ What the values mean, as the header defines them:
     one queued object; `groups_abandoned` counts open wire subgroups actually
     driven through the RESET lifecycle. They are different facts, and one
     partially emitted group can contribute to BOTH.
-  * `last_error` is the last non-OK write() return, 0 for none. It is DATA: a
-    recorded historical failure is not an exception, and it is signed.
+  * `last_error` is the most recent failure the service recorded, 0 for none.
+    It is DATA: a recorded historical failure is not an exception, and it is
+    signed.
+  * `completion_error` is the first failure that stopped complete(), sticky;
+    0 is no recorded completion failure, NOT a completed broadcast. Signed
+    DATA, never raised.
 
 Python shape, following Receiver.stats and ReceiverStats: a frozen, slotted
 snapshot of ordinary ints, taken anew on every call, retaining no native
-pointer. `sap_records_evicted` is None when the stamped prefix does not cover
-the whole appended field, and a stamped zero is a present zero.
+pointer. Each appended field (`sap_records_evicted`, `completion_error`) is
+None when the stamped prefix does not cover the whole field, and a stamped
+zero is a present zero.
 """
 
 import dataclasses
@@ -74,7 +81,7 @@ UNKNOWN_CODE = -23456
 FIELDS = ("objects_written", "objects_sent", "objects_queued", "bytes_queued",
           "objects_dropped", "groups_dropped", "keyframes_dropped",
           "groups_abandoned", "backpressure_stalls", "last_error",
-          "sap_records_evicted")
+          "sap_records_evicted", "completion_error")
 
 # Independently declared, DISTINCT values. Each is chosen to kill a different
 # mistake: narrowing to 32 bits, signed reinterpretation of a high uint64, and
@@ -91,6 +98,7 @@ SCRIPTED = {
     "backpressure_stalls": 2 ** 44 + 15,
     "last_error": UNKNOWN_CODE,            # signed, and not a known code
     "sap_records_evicted": 2 ** 45 + 16,
+    "completion_error": UNKNOWN_CODE - 1,  # signed, distinct from last_error
 }
 
 
@@ -167,6 +175,12 @@ class StatsSubstrateTests(StatsFixtureBase):
                              "the appended field overlaps the v0 prefix")
         case.assertEqual(layout["sap_offset"] + 8, layout["sap_end"],
                          "the appended field is not a uint64")
+        case.assertLessEqual(layout["sap_end"], layout["ce_offset"],
+                             "completion_error overlaps sap_records_evicted")
+        case.assertEqual(layout["ce_offset"] + 4, layout["ce_end"],
+                         "completion_error is not a 32-bit result")
+        case.assertLessEqual(layout["ce_end"], layout["sizeof"],
+                             "completion_error lies past the struct")
         case.assertLessEqual(layout["sap_end"], layout["sizeof"],
                              "the appended field runs past the struct")
 
@@ -187,21 +201,33 @@ class StatsSubstrateTests(StatsFixtureBase):
                 self.test_a_the_layout_facts_come_from_the_sdk()
 
         for name, layout in (
-                ("padded", {"sizeof": 96, "v0_end": 84, "sap_offset": 88,
-                            "sap_end": 96}),
-                ("packed", {"sizeof": 96, "v0_end": 88, "sap_offset": 88,
-                            "sap_end": 96}),
-                ("trailing padding", {"sizeof": 104, "v0_end": 84,
-                                      "sap_offset": 88, "sap_end": 96})):
+                ("padded", {"sizeof": 104, "v0_end": 84, "sap_offset": 88,
+                            "sap_end": 96, "ce_offset": 96, "ce_end": 100}),
+                ("packed", {"sizeof": 100, "v0_end": 88, "sap_offset": 88,
+                            "sap_end": 96, "ce_offset": 96, "ce_end": 100}),
+                ("trailing padding", {"sizeof": 112, "v0_end": 84,
+                                      "sap_offset": 88, "sap_end": 96,
+                                      "ce_offset": 96, "ce_end": 100})):
             with self.subTest(layout=name):
                 run(layout)                          # the ACTUAL row, passing
         for name, layout in (
-                ("overlapping", {"sizeof": 96, "v0_end": 92, "sap_offset": 88,
-                                 "sap_end": 96}),
-                ("not a uint64", {"sizeof": 96, "v0_end": 84,
-                                  "sap_offset": 88, "sap_end": 92}),
+                ("overlapping", {"sizeof": 104, "v0_end": 92, "sap_offset": 88,
+                                 "sap_end": 96, "ce_offset": 96, "ce_end": 100}),
+                ("not a uint64", {"sizeof": 104, "v0_end": 84,
+                                  "sap_offset": 88, "sap_end": 92,
+                                  "ce_offset": 96, "ce_end": 100}),
                 ("past the struct", {"sizeof": 90, "v0_end": 84,
-                                     "sap_offset": 88, "sap_end": 96})):
+                                     "sap_offset": 88, "sap_end": 96,
+                                     "ce_offset": 96, "ce_end": 100}),
+                ("completion_error overlapping", {"sizeof": 104, "v0_end": 84,
+                                                  "sap_offset": 88, "sap_end": 96,
+                                                  "ce_offset": 92, "ce_end": 96}),
+                ("completion_error not 32-bit", {"sizeof": 104, "v0_end": 84,
+                                                 "sap_offset": 88, "sap_end": 96,
+                                                 "ce_offset": 96, "ce_end": 104}),
+                ("completion_error past the struct", {"sizeof": 98, "v0_end": 84,
+                                                      "sap_offset": 88, "sap_end": 96,
+                                                      "ce_offset": 96, "ce_end": 100})):
             with self.subTest(rejects=name):
                 with self.assertRaises(AssertionError):
                     run(layout)                      # the ACTUAL row, failing
@@ -235,7 +261,7 @@ class StatsSubstrateTests(StatsFixtureBase):
         covered = bytearray(b"\x00" * size)      # 1 where a FIELD lives
         for name, value in values.items():
             offset, width = fields[name]
-            signed = name == "last_error"
+            signed = name in ("last_error", "completion_error")
             image[offset:offset + width] = int(value).to_bytes(
                 width, sys.byteorder, signed=signed)
             covered[offset:offset + width] = b"\x01" * width
@@ -269,6 +295,7 @@ class StatsSubstrateTests(StatsFixtureBase):
                 ("full stamp, full capacity", layout["sizeof"], layout["sizeof"]),
                 ("v0 stamp, full capacity", layout["v0_end"], layout["sizeof"]),
                 ("partial appended field", layout["sap_end"] - 1, layout["sizeof"]),
+                ("partial completion_error", layout["ce_end"] - 1, layout["sizeof"]),
                 ("stamp beyond the struct", layout["sizeof"] + 64, layout["sizeof"]),
                 ("full stamp, v0 capacity", layout["sizeof"], layout["v0_end"]),
                 ("stamp beyond both", layout["sizeof"] + 64, layout["v0_end"]),
@@ -531,6 +558,8 @@ class StatsSizeTests(StatsGatedBase):
                 stats = sender.stats()
                 self.assertEqual(stats.sap_records_evicted,
                                  SCRIPTED["sap_records_evicted"])
+                self.assertEqual(stats.completion_error,
+                                 SCRIPTED["completion_error"])
             finally:
                 sender.close()
 
@@ -550,6 +579,7 @@ class StatsSizeTests(StatsGatedBase):
                 # same assertion the full-inventory row uses
                 expected = dict(SCRIPTED)
                 expected["sap_records_evicted"] = None
+                expected["completion_error"] = None
                 assert_fields(self, stats, expected)
             finally:
                 sender.close()
@@ -567,9 +597,22 @@ class StatsSizeTests(StatsGatedBase):
                                   "a PARTIALLY covered appended field was "
                                   "read anyway")
                 _native._test_sender_stats_size(layout["sap_end"])
-                self.assertEqual(sender.stats().sap_records_evicted,
+                stats = sender.stats()
+                self.assertEqual(stats.sap_records_evicted,
                                  SCRIPTED["sap_records_evicted"],
                                  "the exactly covered field was refused")
+                # through sap_records_evicted only: completion_error absent
+                self.assertIsNone(stats.completion_error,
+                                  "an uncovered completion_error was read")
+                _native._test_sender_stats_size(layout["ce_end"] - 1)
+                self.assertIsNone(sender.stats().completion_error,
+                                  "a PARTIALLY covered completion_error was "
+                                  "read anyway")
+                _native._test_sender_stats_size(layout["ce_end"])
+                self.assertEqual(sender.stats().completion_error,
+                                 SCRIPTED["completion_error"],
+                                 "the exactly covered completion_error was "
+                                 "refused")
             finally:
                 sender.close()
 
@@ -579,12 +622,15 @@ class StatsSizeTests(StatsGatedBase):
         with self.connect() as endpoint:
             sender = self.attach(endpoint)
             try:
-                script(sap_records_evicted=0)
+                script(sap_records_evicted=0, completion_error=0)
                 _native._test_sender_stats_size(layout["sizeof"])
                 stats = sender.stats()
                 self.assertEqual(stats.sap_records_evicted, 0,
                                  "a stamped zero was reported as absence")
                 self.assertIsNotNone(stats.sap_records_evicted)
+                self.assertEqual(stats.completion_error, 0,
+                                 "a stamped zero was reported as absence")
+                self.assertIsNotNone(stats.completion_error)
             finally:
                 sender.close()
 
@@ -632,6 +678,8 @@ class StatsSizeTests(StatsGatedBase):
                 for _ in range(3):
                     stats = sender.stats()
                     self.assertIsNone(stats.sap_records_evicted,
+                                      "uncovered storage was reported")
+                    self.assertIsNone(stats.completion_error,
                                       "uncovered storage was reported")
             finally:
                 sender.close()
@@ -945,6 +993,8 @@ class StatsControlTests(unittest.TestCase):
                             ("objects_queued", -(2 ** 63) + 9),
                             ("last_error", -UNKNOWN_CODE),
                             ("sap_records_evicted", None),
+                            ("completion_error", None),
+                            ("completion_error", SCRIPTED["last_error"]),
                             ("groups_dropped", float(SCRIPTED["groups_dropped"]))):
             with self.subTest(field=name):
                 broken = dict(SCRIPTED)
@@ -956,6 +1006,7 @@ class StatsControlTests(unittest.TestCase):
         # absence is expected must fail too
         expected_absent = dict(SCRIPTED)
         expected_absent["sap_records_evicted"] = None
+        expected_absent["completion_error"] = None
         assert_fields(self, Observation(expected_absent), expected_absent)
         with self.assertRaises(AssertionError):
             assert_fields(self, Observation(SCRIPTED), expected_absent)
@@ -1002,6 +1053,8 @@ class StatsControlTests(unittest.TestCase):
             values.pop("struct_size")
             if stamp < layout["sap_end"]:
                 values["sap_records_evicted"] = None
+            if stamp < layout["ce_end"]:
+                values["completion_error"] = None
             return build(values)
 
         saved = getattr(moq5.Sender, "stats", None)

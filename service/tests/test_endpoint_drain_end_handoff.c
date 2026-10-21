@@ -726,7 +726,9 @@ static void run_row(const char *cert, const char *key, row_mode_t mode)
         pthread_mutex_lock(&g_peer.mu);
         MOQ_TEST_CHECK_EQ_INT(g_peer.finished, 1);
         MOQ_TEST_CHECK_EQ_U64(g_peer.fin_status, 0x2);   /* TRACK_ENDED */
-        MOQ_TEST_CHECK_EQ_U64(g_peer.fin_streams, 3);
+        /* The media's streams plus the END_OF_TRACK's own: PUBLISH_DONE's
+         * Stream Count includes the end's stream. */
+        MOQ_TEST_CHECK_EQ_U64(g_peer.fin_streams, 4);
         MOQ_TEST_CHECK_EQ_INT(g_peer.objs, OBJECTS);
         pthread_mutex_unlock(&g_peer.mu);
     } else if (mode == MODE_INTERRUPT) {

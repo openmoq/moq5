@@ -4000,15 +4000,21 @@ test_shards_cap_admission_delta(void)
     moqr_shards_capacity_t con, coff;
     MOQ_TEST_CHECK(moqr_shards_capacity_describe(&on, &con) == MOQR_OK);
     MOQ_TEST_CHECK(moqr_shards_capacity_describe(&off, &coff) == MOQR_OK);
-    /* The delta lives in the structure term and, for the full-track key a
-     * requester retrieval slot holds while it routes a standalone FETCH to
-     * the owning shard, in the canon term: exactly K x max_fetches x 4232.
+    /* The delta lives in the structure term and, for what retrieval slots
+     * own, in the canon term: the full-track key a requester slot holds while
+     * it routes a standalone FETCH to the owning shard, K x max_fetches x
+     * 4232, and one Track Properties copy per owner and requester slot.
      * Channels and staging are admission-independent. The structure delta
      * scales exactly with K — pinning it as K x (progress tables + row
      * bitmap + retrieval tables), with no other term able to absorb it. */
     moqr_core_limits_t cl;
     MOQ_TEST_CHECK(moqr_core_limits_resolve(&on.core_cfg, &cl) == MOQR_OK);
-    const uint64_t keys = 2ull * cl.max_fetches * 4232ull;
+    /* And each retrieval slot, owner and requester side, may hold one
+     * Track Properties copy of a full set (2^16 bytes) plus its header. */
+    size_t hdr = 0;
+    MOQ_TEST_CHECK(moq_rcbuf_allocation_size(0, &hdr) == MOQ_OK);
+    const uint64_t keys = 2ull * cl.max_fetches * 4232ull +
+                          2ull * 2ull * cl.max_fetches * ((1ull << 16) + hdr);
     MOQ_TEST_CHECK(keys > 0);
     MOQ_TEST_CHECK_EQ_U64(con.channel_byte_ceiling, coff.channel_byte_ceiling);
     MOQ_TEST_CHECK_EQ_U64(con.canon_byte_ceiling - coff.canon_byte_ceiling, keys);

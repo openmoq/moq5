@@ -1372,6 +1372,159 @@ static void write_catalog(pf_t *f, uint64_t g, const char *json)
     CHECK(moq_pub_end_group(f->pub, f->catalog, f->now) == MOQ_OK);
 }
 
+/* A completed broadcast (MSF 11.3): the track's END_OF_TRACK, and the
+ * terminal catalog (isComplete, no tracks) removing it, in either order.
+ * The removal of a track the peer already ended is no cause: every unit
+ * played, the end is END{PEER_END_OF_TRACK, COMPLETE}, and TRACK_REMOVED
+ * is still reported once. `gap`: object 0/1 never sent, so the end is
+ * not COMPLETE -- coverage, not the removal, decides it. */
+static void test_complete_broadcast(moq_version_t ver, bool catalog_first, bool gap)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "complete_broadcast_%s%s_%s",
+             catalog_first ? "catalog_first" : "end_first", gap ? "_gap" : "",
+             vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char terminal[] = "{\"version\":1,\"isComplete\":true,\"tracks\":[]}";
+    pf_opts_t o = { .gap_timeout_us = gap ? 200000 : 0 };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, k_cat_v, k_v, 1, gap ? &o : NULL));
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    if (!gap) write_loc(&f, "video", 0, 1, false, 0, 0);
+    write_loc(&f, "video", 0, 2, false, 0, 0);
+    end_group(&f, "video");
+    cycles(&f, 8);
+    /* The track ends as a completing media sender ends it: END_OF_TRACK,
+     * then its removal, which completes the subscription with TRACK_ENDED
+     * and the exact Stream Count. */
+    if (catalog_first) {
+        write_catalog(&f, 1, terminal);
+        cycles(&f, 8);
+        CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+        CHECK(moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+    } else {
+        /* The end, and the terminal catalog right behind it, as a publisher
+         * completing the broadcast sends them: the removal reaches the
+         * player while it is still settling the END_OF_TRACK. */
+        CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+        CHECK(moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+        write_catalog(&f, 1, terminal);
+    }
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 8 * (TAIL_US / 1000); i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+        outputs(&f, &log);
+    }
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED) == 1);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 1);
+    if (gap) CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, NULL) >= 1);
+    else     CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, NULL) == 3);
+    const moq_media_player_output_t *e = last_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END);
+    REQUIRE(e != NULL);
+    CHECK(e->u.end.cause == MOQ_MEDIA_PLAYER_END_PEER_END_OF_TRACK);
+    CHECK(e->u.end.disposition ==
+          (gap ? MOQ_MEDIA_PLAYER_END_TAIL_CUTOFF : MOQ_MEDIA_PLAYER_END_COMPLETE));
+    if (failures != before && e)
+        fprintf(stderr, "  %s: END cause=%u disposition=%u\n", row,
+                (unsigned)e->u.end.cause, (unsigned)e->u.end.disposition);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* One step of the network and the receiver, with no player tick: the
+ * receiver's events queue for the player's next tick. */
+static void net_step(pf_t *f)
+{
+    f->now += 1000;
+    CHECK(moq_simpair_advance_to(f->sp, f->now) == MOQ_OK);
+    CHECK(moq_simpair_run_until_quiescent(f->sp, 64, NULL) >= 0);
+    if (f->pub) CHECK(moq_pub_tick(f->pub, f->now) >= 0);
+    CHECK(moq_session_process_pending(f->rx, f->now) >= 0);
+    moq_media_receiver_test_pump(f->r, f->rx, f->now);
+}
+
+/* A withdrawal the player has not yet read, then a terminal catalog: the
+ * peer ended video with a normal done, a catalog update withdrew it, and
+ * the broadcast then completed -- all taken in by the receiver while the
+ * player was not ticked. The withdrawal is still a cause when the player
+ * reads it: END{REMOVED}, as if no terminal catalog had followed. */
+static void test_withdrawal_then_complete(moq_version_t ver)
+{
+    static char label[64];
+    snprintf(label, sizeof(label), "withdrawal_then_complete_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char cat[] = CATALOG(LOC_VIDEO("video", "") "," LOC_VIDEO("other", ""));
+    static const char cat2[] = CATALOG(LOC_VIDEO("other", ""));
+    static const char terminal[] = "{\"version\":1,\"isComplete\":true,\"tracks\":[]}";
+    static const char *const names[] = { "video", "other" };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, cat, names, 2, NULL));
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    end_group(&f, "video");
+    cycles(&f, 8);
+    /* From here on the player is not ticked until all three are in. */
+    if (ver == MOQ_VERSION_DRAFT_22) {
+        CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x2u, f.now) == MOQ_OK);
+        for (unsigned i = 0; i < 24; i++) net_step(&f);
+        CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x2u, f.now) == MOQ_OK);
+    } else {
+        CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x3u, f.now) == MOQ_OK);
+    }
+    bool ended = false;
+    for (unsigned i = 0; i < 64 && !ended; i++) {
+        net_step(&f);
+        moq_media_track_state_t state;
+        ended = moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) ==
+                    MOQ_OK && state == MOQ_MEDIA_TRACK_STATE_ENDED;
+    }
+    REQUIRE(ended);
+    write_catalog(&f, 1, cat2);
+    for (unsigned i = 0; i < 16; i++) net_step(&f);
+    write_catalog(&f, 2, terminal);
+    for (unsigned i = 0; i < 16; i++) net_step(&f);
+    {   /* Non-vacuity: the receiver has adopted the terminal catalog. */
+        moq_media_receiver_stats_t st;
+        memset(&st, 0, sizeof(st));
+        CHECK(moq_media_receiver_get_stats(f.r, &st, sizeof(st)) == MOQ_OK);
+        CHECK(st.catalog_complete);
+    }
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 4 * (TAIL_US / 1000); i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+        outputs(&f, &log);
+    }
+    /* video by the withdrawal, other by the terminal catalog. */
+    size_t removed_video = 0;
+    for (size_t i = 0; i < evl.n; i++)
+        removed_video += evl.ev[i].kind == MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED &&
+                         evl.ev[i].track == pf_track(&f, "video");
+    CHECK(removed_video == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED) == 2);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 1);
+    const moq_media_player_output_t *e = last_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END);
+    REQUIRE(e != NULL);
+    CHECK(e->track == pf_track(&f, "video"));
+    CHECK(e->u.end.cause == MOQ_MEDIA_PLAYER_END_REMOVED);
+    CHECK(e->u.end.disposition == MOQ_MEDIA_PLAYER_END_TAIL_CUTOFF);
+    if (failures != before && e)
+        fprintf(stderr, "  %s: END cause=%u disposition=%u\n", row,
+                (unsigned)e->u.end.cause, (unsigned)e->u.end.disposition);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
 /* A catalog update removes the selected track: TRACK_REMOVED, then after
  * the tail wait END{REMOVED, TAIL_CUTOFF}. */
 static void test_removed(moq_version_t ver)
@@ -4239,6 +4392,10 @@ int main(void)
         test_end_gap_then_done(vers[i]);
         test_done_then_removed(vers[i]);
         test_removed(vers[i]);
+        for (int c = 0; c < 2; c++)
+            for (int g = 0; g < 2; g++)
+                test_complete_broadcast(vers[i], c != 0, g != 0);
+        test_withdrawal_then_complete(vers[i]);
         test_audio_gap(vers[i]);
         test_deselect(vers[i]);
         test_cause_precedence(vers[i]);

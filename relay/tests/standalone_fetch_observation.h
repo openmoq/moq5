@@ -12,6 +12,8 @@ typedef struct rfs_event {
     uint64_t fetch, group, object, code;
     size_t bytes, properties;
     uint8_t body[333], props[16];
+    bool can_retry;              /* FETCH_ERROR's retry hint */
+    uint64_t retry_after_ms;
 } rfs_event_t;
 typedef struct rfs_request {
     moq_fetch_t fetch;
@@ -96,6 +98,8 @@ rfs_observe(rfs_observation_t *o, const moq_event_t *ev, uint64_t now)
     case MOQ_EVENT_FETCH_COMPLETE: r.fetch = ev->u.fetch_complete.fetch._opaque; break;
     case MOQ_EVENT_FETCH_ERROR:
         r.fetch = ev->u.fetch_error.fetch._opaque; r.code = ev->u.fetch_error.error_code;
+        r.can_retry = ev->u.fetch_error.can_retry;
+        r.retry_after_ms = ev->u.fetch_error.retry_after_ms;
         break;
     case MOQ_EVENT_FETCH_RESET:
         r.fetch = ev->u.fetch_reset.fetch._opaque; r.code = ev->u.fetch_reset.error_code;

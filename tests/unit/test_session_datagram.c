@@ -40,7 +40,7 @@ int main(void)
 
         moq_rcbuf_t *pay = NULL;
         moq_rcbuf_create(&alloc, (const uint8_t *)"pubdata", 7, &pay);
-        uint8_t props[] = { 0xAA, 0xBB };
+        uint8_t props[] = { 0x02, 0x05 };   /* one pair: Type 0x02 = 5 */
         MOQ_TEST_CHECK(moq_session_send_pub_object_datagram(c, cpub,
             5, 3, 200, true, pay, props, 2, 2000) == MOQ_OK);
         moq_rcbuf_decref(pay);

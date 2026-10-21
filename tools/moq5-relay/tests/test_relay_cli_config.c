@@ -2878,13 +2878,19 @@ main(void)
         /* Besides the shard structure, only the canon term moves: by one
          * full-track key (4232 bytes) per requester retrieval slot, the key
          * a routed standalone FETCH holds until its REQ carries it --
-         * K x fetches x 4232. Every other term is byte-equal. */
+         * K x fetches x 4232 -- and by one Track Properties copy of a full
+         * set (2^16 bytes plus its rcbuf header) per owner and requester
+         * retrieval slot -- K x 2 x fetches x (2^16 + header). Every other
+         * term is byte-equal. */
         uint64_t keys = 0;
         {
             moqr_core_limits_t kl;
             MOQ_TEST_CHECK(moqr_core_limits_resolve(&on.core_cfg, &kl) ==
                            MOQR_OK);
-            keys = (uint64_t)on.shards * kl.max_fetches * 4232u;
+            size_t hdr = 0;
+            MOQ_TEST_CHECK(moq_rcbuf_allocation_size(0, &hdr) == MOQ_OK);
+            keys = (uint64_t)on.shards * kl.max_fetches * 4232u +
+                   (uint64_t)on.shards * 2u * kl.max_fetches * ((1ull << 16) + hdr);
         }
         MOQ_TEST_CHECK(keys > 0);
         MOQ_TEST_CHECK_EQ_U64(cap_on.channel_byte_ceiling,

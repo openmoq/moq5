@@ -1672,6 +1672,19 @@ if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
     set_tests_properties(media_receiver_stream_terminals PROPERTIES TIMEOUT 120)
 endif()
 
+# A completed broadcast on the receiver over a real publisher and SimPair.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_completion
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_completion.c)
+    target_link_libraries(test_media_receiver_completion PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    target_include_directories(test_media_receiver_completion PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/unit)
+    add_test(NAME media_receiver_completion
+        COMMAND test_media_receiver_completion)
+    set_tests_properties(media_receiver_completion PROPERTIES TIMEOUT 120)
+endif()
+
 # The receiver surfaces the media player is built on.
 if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
     add_executable(test_media_receiver_player_support

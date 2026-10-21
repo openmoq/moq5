@@ -317,6 +317,23 @@ struct moq_media_track {
     /* Data path (network-thread state). */
     moq_sub_track_t *sub_track;        /* non-NULL while subscribed */
     bool             ended;            /* TRACK_ENDED emitted */
+    /* Removed by a terminal (isComplete) catalog while its subscription has
+     * not ended: the broadcast completed, so the media it already sent -- and
+     * its END_OF_TRACK, which can trail the catalog on another stream -- is
+     * still delivered. The subscription stays until it is over at the
+     * facade (its done, with every counted stream processed, or a refusal)
+     * or the track fails locally; TRACK_REMOVED follows that. */
+    bool             completion_pending;
+    /* The application unsubscribed a completion_pending track: its queued
+     * objects were purged, and the network thread retires the subscription
+     * and removes the track without an end (receiver_settle_completions).
+     * Set and read under mu. */
+    bool             completion_cancelled;
+    /* Set once, at the removal itself, when a terminal (isComplete) catalog
+     * removed the track; a withdrawal leaves it false. Never changes after,
+     * so a consumer reading it at a queued TRACK_REMOVED learns why that
+     * removal happened, whatever later catalogs did. Under mu. */
+    bool             removed_by_completion;
     /* ACK retention, UPDATE admission and LIVE delivery failures are permanent.
      * App-visible state and its allocation-free observation are mu-protected. */
     moq_result_t     local_result;
@@ -2154,14 +2171,34 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
             return MOQ_OK;   /* overflow already terminalized */
     }
 
-    /* Removed tuples: live, non-removed, not seen this pass. */
+    /* Removed tuples: live, non-removed, not seen this pass. A terminal
+     * catalog (isComplete, MSF 5.1.3 / 11.3) completes the broadcast rather
+     * than withdrawing the track: what the track already delivered stays
+     * queued for the application, and a track whose subscription has not
+     * ended keeps it until its subscription's done is processed, with every
+     * stream the done counts taken in. Every such track settles in
+     * receiver_settle_completions, one already over at once: its
+     * TRACK_REMOVED then follows the commit that latches
+     * stats.catalog_complete, so a consumer reading it at that event sees
+     * the broadcast complete. */
+    bool completing = cand->is_complete;
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
         if (t->removed || t->recon_seen) continue;
         pthread_mutex_lock(&r->mu);
         t->removed = true;
-        t->desired_subscribed = false;
-        obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
+        t->removed_by_completion = completing;
+        /* Keep wanted media in flight after completion; do not revive a
+         * subscription the application already cancelled. */
+        if (!completing) t->desired_subscribed = false;
+        if (completing && t->local_result == MOQ_OK) {
+            t->completion_pending = true;
+            t->completion_cancelled = !t->desired_subscribed;
+            pthread_mutex_unlock(&r->mu);
+            continue;
+        }
+        if (!completing)
+            obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
         pthread_mutex_unlock(&r->mu);
         /* The facade slot stays mapped until it is released: stream
          * terminals still queued for it reach the lane under the removed
@@ -2302,6 +2339,8 @@ static bool receiver_update_within_limits(const moq_media_receiver_t *r,
 /* Shared independent/delta adoption: immutable check, then the no-fail commit
  * (CP slot reserved before reconcile, so nothing is mutated before the last
  * fallible step). On ADOPT_OK the caller must NOT clean up cand. */
+static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us);
+
 static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
                                      moq_msf_catalog_t *cand, uint64_t now_us)
 {
@@ -2312,6 +2351,10 @@ static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
     if (receiver_reserve_cp_snap(r) != MOQ_OK) return ADOPT_NOMEM;
     if (receiver_reconcile(r, cand, now_us) != MOQ_OK) return ADOPT_NOMEM;
     receiver_commit_effective(r, cand);   /* no-fail (slot reserved) */
+    /* A terminal catalog's removals settle after its commit, so a track
+     * that is already over (never subscribed, or its subscription done) is
+     * removed in this same adoption, with stats.catalog_complete set. */
+    if (cand->is_complete) receiver_settle_completions(r, now_us);
     return ADOPT_OK;
 }
 
@@ -3093,7 +3136,7 @@ static void receiver_mark_track_ended(moq_media_receiver_t *r,
                                       moq_media_track_t *t)
 {
     pthread_mutex_lock(&r->mu);
-    bool first = !t->ended && t->local_result == MOQ_OK;
+    bool first = !t->ended && t->local_result == MOQ_OK && !t->completion_cancelled;
     if (first) t->ended = true;
     pthread_mutex_unlock(&r->mu);
     if (first)
@@ -3106,7 +3149,7 @@ static void receiver_mark_track_done(moq_media_receiver_t *r,
                                      moq_media_track_t *t, uint64_t status)
 {
     pthread_mutex_lock(&r->mu);
-    bool first = !t->ended && t->local_result == MOQ_OK;
+    bool first = !t->ended && t->local_result == MOQ_OK && !t->completion_cancelled;
     if (first) t->ended = true;
     pthread_mutex_unlock(&r->mu);
     if (!first || !rq_push(r, MOQ_MEDIA_TRACK_ENDED, t)) return;
@@ -4978,7 +5021,8 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         t->upd_sent_app_gen = 0;
         pthread_mutex_unlock(&r->mu);
 
-        if (status == RECEIVER_DONE_TRACK_ENDED && !t->vod_rearmed && !t->ended) {
+        if (status == RECEIVER_DONE_TRACK_ENDED && !t->vod_rearmed && !t->ended &&
+            !t->removed) {
             /* Re-arm for VOD: keep desired_subscribed; reset the lifecycle flags
              * so the track_state accessor reads PENDING again until the VOD
              * SUBSCRIBE_OK lands. Delivered media stays in the object queue. */
@@ -5258,11 +5302,53 @@ static void receiver_retire_subscription(moq_media_receiver_t *r,
 }
 
 /* Retire the subscriptions of failed and removed tracks. */
+/* Settle the tracks a terminal catalog removed while their subscriptions
+ * were still delivering (completion_pending): once the subscription is over
+ * at the facade -- its done, which the facade surfaces only after every
+ * stream the done counts has been processed, or a refusal -- or the track
+ * failed locally, the subscription is released and TRACK_REMOVED follows.
+ * An END_OF_TRACK alone is not enough: it travels on its own stream and
+ * can overtake the track's last Objects, and ending the subscription on it
+ * would make the peer stop their stream. No timer settles it: the catalog
+ * says the broadcast completed, not that its last objects were delivered.
+ * Its delivered media stays queued for the application either way. The
+ * application's unsubscribe (completion_cancelled) settles it too, without
+ * synthesizing an end: its queued media was purged by that call, and a refused
+ * unsubscribe or release is retried by receiver_retire_tracks. */
+static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us)
+{
+    for (size_t i = 0; i < r->track_count; i++) {
+        moq_media_track_t *t = r->tracks[i];
+        pthread_mutex_lock(&r->mu);
+        bool pending = t->completion_pending;
+        bool cancelled = t->completion_cancelled;
+        pthread_mutex_unlock(&r->mu);
+        if (!pending) continue;
+        if (!cancelled && t->local_result == MOQ_OK && t->sub_track) {
+            /* Live, or its done still to be processed (which releases the
+             * slot once what it delivered has been taken in). */
+            moq_sub_track_state_t st = moq_sub_track_get_state(t->sub_track);
+            if (st == MOQ_SUB_TRACK_PENDING || st == MOQ_SUB_TRACK_ACTIVE ||
+                t->done_pending)
+                continue;
+        }
+        pthread_mutex_lock(&r->mu);
+        t->completion_pending = false;
+        pthread_mutex_unlock(&r->mu);
+        if (t->sub_track && t->local_result == MOQ_OK)
+            receiver_retire_subscription(r, &t->sub_track, now_us,
+                                         receiver_facade_drained(r));
+        receiver_ts_free(r, t);
+        if (!rq_push(r, MOQ_MEDIA_TRACK_REMOVED, t)) return;   /* overflow terminalized */
+    }
+}
+
 static void receiver_retire_tracks(moq_media_receiver_t *r, uint64_t now_us)
 {
     bool drained = receiver_facade_drained(r);
     for (size_t i = 0; i < r->track_count; i++)
-        if (r->tracks[i]->local_result != MOQ_OK || r->tracks[i]->removed)
+        if ((r->tracks[i]->local_result != MOQ_OK || r->tracks[i]->removed) &&
+            !r->tracks[i]->completion_pending)
             receiver_retire_subscription(r, &r->tracks[i]->sub_track, now_us, drained);
 }
 
@@ -5563,6 +5649,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     r->catalog_done_pending = false;
     receiver_cancel_fills(r, now_us);
     if (r->joins_by_fill) receiver_process_subscription_dones(r, now_us);
+    receiver_settle_completions(r, now_us);
     receiver_retire_tracks(r, now_us);
     receiver_publish_delivery_failures(r);
 
@@ -6331,6 +6418,22 @@ static bool receiver_terminal(const moq_media_receiver_t *r)
     return fatal || moq_endpoint_is_closed(r->ep);
 }
 
+bool moq_media_receiver_track_removed_by_completion_internal(
+    moq_media_receiver_t *r, const moq_media_track_t *track)
+{
+    if (!r || !track) return false;
+    bool by_completion = false;
+    pthread_mutex_lock(&r->mu);
+    for (size_t i = 0; i < r->track_count; i++)
+        if (r->tracks[i] == track) {
+            by_completion = r->tracks[i]->removed &&
+                            r->tracks[i]->removed_by_completion;
+            break;
+        }
+    pthread_mutex_unlock(&r->mu);
+    return by_completion;
+}
+
 size_t moq_media_receiver_track_input_internal(moq_media_receiver_t *r,
                                               const moq_media_track_t *track)
 {
@@ -6877,10 +6980,13 @@ moq_result_t moq_media_receiver_unsubscribe_track(
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_INVAL;
     }
-    if (track->removed) {
+    if (track->removed && !track->completion_pending) {
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_WRONG_STATE;
     }
+    /* A terminal catalog removed it while its tail is still owed: the same
+     * disable, and the network thread then removes the track, with no end. */
+    if (track->removed) track->completion_cancelled = true;
     if (track->desired_subscribed)
         track->app_gen++;          /* state-changing app intent */
     track->desired_subscribed = false;
@@ -6952,7 +7058,9 @@ moq_result_t moq_media_receiver_track_state(
         pthread_mutex_unlock(&rr->mu);
         return MOQ_ERR_INVAL;                 /* foreign handle: programmer error */
     }
-    if (track->removed) {
+    /* A track a terminal catalog removed is reported removed once its
+     * TRACK_REMOVED follows its end (completion_pending clears then). */
+    if (track->removed && !track->completion_pending) {
         pthread_mutex_unlock(&rr->mu);
         return MOQ_ERR_WRONG_STATE;           /* removed from catalog: terminal */
     }

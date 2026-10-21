@@ -886,9 +886,10 @@ class Backpressure(IntEnum):
 class SenderStats:
     """A copied stats snapshot, taken anew on every call.
 
-    The v0 fields (through `last_error`) are always present. The appended
-    `sap_records_evicted` is None when the native stamped prefix does not
-    cover the WHOLE field, never zero; a stamped zero is a present zero.
+    The v0 fields (through `last_error`) are always present. Each appended
+    field (`sap_records_evicted`, `completion_error`) is None when the native
+    stamped prefix does not cover the WHOLE field, never zero; a stamped zero
+    is a present zero.
 
     `objects_written`, `objects_sent`, `objects_queued`, `objects_dropped` and
     `bytes_queued` are ONE population: media objects accepted by write() and
@@ -903,8 +904,15 @@ class SenderStats:
     through the RESET lifecycle. They are different facts, and one partially
     emitted group can contribute to both.
 
-    `last_error` is the last non-OK write() return, 0 for none. It is DATA: a
-    recorded historical failure is reported here, not raised.
+    `last_error` is the most recent failure the service recorded -- a non-OK
+    write, an unusable draft for the companion, or the failure that stopped a
+    graceful completion -- 0 for none; a later one overwrites it. It is DATA:
+    a recorded historical failure is reported here, not raised.
+
+    `completion_error` is the first failure that stopped complete(), exactly
+    as it occurred and never overwritten; such a completion publishes no
+    terminal catalog. 0 means no completion failure has been recorded -- NOT
+    that a completion succeeded, or that complete() was called. Also DATA.
     """
 
     objects_written: int
@@ -918,6 +926,7 @@ class SenderStats:
     backpressure_stalls: int
     last_error: int
     sap_records_evicted: int | None
+    completion_error: int | None
 
 
 class SapType(IntEnum):

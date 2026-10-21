@@ -847,8 +847,14 @@ MOQ_API moq_result_t moq_media_sender_write_mpeg2ts(
 
 /* End a finite track: after this track's already-queued objects drain, the
  * service emits a reliable END_OF_TRACK status object (a subgroup-stream object,
- * NOT a datagram), which surfaces on receivers as MOQ_MEDIA_TRACK_ENDED. Ending
- * one track does NOT end other tracks or close the session/endpoint.
+ * NOT a datagram), which surfaces on receivers as MOQ_MEDIA_TRACK_ENDED. A
+ * published track (publish_tracks) carries it on its publication before the
+ * publication's terminal done, so a relay forwards and retains the end. Two
+ * cases end by control message alone, with no status object: a destination
+ * that is not receiving the track (Forward 0, or a window that excludes the
+ * terminal Location), and a track whose last group is at the group-id ceiling
+ * (see moq_pub_end_track). Ending one track does NOT end other tracks or
+ * close the session/endpoint.
  *
  * After end_track, moq_media_sender_write() for this track returns
  * MOQ_ERR_WRONG_STATE. end_track is IDEMPOTENT: a second call returns MOQ_OK and
@@ -879,6 +885,23 @@ MOQ_API moq_result_t moq_media_sender_end_track(
  * live-written to active subscribers and retained (for a Joining FETCH) so a
  * later joiner still learns the broadcast completed. The namespace/endpoint stay up (this is
  * not destroy()): call moq_media_sender_destroy() when finished.
+ *
+ * The completion is asynchronous: complete() freezes new input and returns,
+ * and the network thread then sends the accepted media, finishes a byte-stream
+ * MPEG2TS track's source, ends each track after its own media and each
+ * generated timeline after its records, and only then publishes the terminal
+ * catalog. Media retained for a track nobody has subscribed to, or a
+ * timeline's records kept for a timeline nobody has subscribed to, hold the
+ * completion until a subscriber takes them. An Object complete() owed that is
+ * lost (a TS track's last Objects that could not be copied) fails it: no
+ * further completion end and no terminal catalog follow, and the failure is
+ * recorded, sticky, in stats.completion_error (and, until a later failure,
+ * stats.last_error). Output the sender had already accepted and
+ * that is still sendable -- queued media with demand, a generated timeline's
+ * records for its subscriber, an end_track marker -- is still sent and still
+ * owed to moq_endpoint_drain(). A successful drain says that owed output was
+ * handed over; it is NOT proof that the broadcast completed: a held
+ * completion owes nothing more yet, and a failed one never will.
  *
  * Legal only after readiness; pre-ready returns MOQ_ERR_WRONG_STATE. IDEMPOTENT:
  * a second call returns MOQ_OK and does nothing. After completion, add_track,
@@ -966,11 +989,34 @@ typedef struct moq_media_sender_stats {
                                      groups_dropped -- they are two different
                                      facts about it */
     uint64_t backpressure_stalls; /* BLOCK_TIMEOUT waits entered */
-    moq_result_t last_error;      /* last non-OK write() return (0 = none) */
+    moq_result_t last_error;      /* the most recent failure the sender
+                                     recorded (0 = none): a non-OK write() or
+                                     write_mpeg2ts() return, an unusable draft
+                                     for the companion (UNSUPPORTED), or the
+                                     failure that stopped a graceful
+                                     completion (moq_media_sender_complete).
+                                     A later one overwrites it; the
+                                     completion's own failure is kept in
+                                     completion_error */
     /* Generated SAP event-timeline records aged out of the bounded history
      * (see moq_media_track_cfg_t.sap_timeline_history_groups). Appended after
      * last_error so the frozen v0 stats size is unchanged. */
     uint64_t sap_records_evicted;
+    /* The first failure that stopped a graceful completion
+     * (moq_media_sender_complete) before its terminal catalog was committed
+     * -- an Object it owed that was lost, an end, or the terminal catalog
+     * that could not be built, written or retained -- exactly as it
+     * occurred, and sticky:
+     * nothing later -- a repeated complete(), a refused operation, a later
+     * last_error -- changes it. Failure before terminal publication prevents
+     * that publication; a later retention failure cannot retract a live
+     * catalog already accepted by the publisher. Successful completion
+     * requires both steps. MOQ_OK (0) means no such failure was recorded; it does
+     * NOT mean a completion succeeded, or that complete() was called. A
+     * completion waiting for room or for a subscriber has not failed, and a
+     * failure after the terminal catalog committed is not the completion's.
+     * Appended after sap_records_evicted. */
+    moq_result_t completion_error;
 } moq_media_sender_stats_t;
 
 /* Snapshot stats into *out. Pass `out_size = sizeof(*out)` as YOU compiled it.

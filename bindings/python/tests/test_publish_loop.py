@@ -1074,7 +1074,7 @@ class PublishLoopIntegrationTests(unittest.TestCase):
 
     def test_f_drops_observed_through_the_real_statistics(self):
         endpoint, sender, tracks = self.live()
-        _native._test_sender_stats(0, 0, 0, 0, 4, 1, 2, 0, 0, 0, 0)
+        _native._test_sender_stats(0, 0, 0, 0, 4, 1, 2, 0, 0, 0, 0, 0)
         observer = WriteObserver(sender)
         seen = []
         record = self.run_loop(observer, ((tracks[0], self.submission(0)),),

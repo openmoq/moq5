@@ -404,14 +404,17 @@ def check_sender_values() -> None:
                       "bytes_queued", "objects_dropped", "groups_dropped",
                       "keyframes_dropped", "groups_abandoned",
                       "backpressure_stalls", "last_error",
-                      "sap_records_evicted"],
+                      "sap_records_evicted", "completion_error"],
             f"unexpected SenderStats fields: {names}")
-    absent = SenderStats(*([0] * 10), None)
-    present = SenderStats(*([0] * 10), 0)
-    require(absent.sap_records_evicted is None,
+    absent = SenderStats(*([0] * 10), None, None)
+    present = SenderStats(*([0] * 10), 0, 0)
+    require(absent.sap_records_evicted is None
+            and absent.completion_error is None,
             "absence was not preserved")
     require(present.sap_records_evicted == 0
-            and present.sap_records_evicted is not None,
+            and present.sap_records_evicted is not None
+            and present.completion_error == 0
+            and present.completion_error is not None,
             "a present zero was collapsed into absence")
     require(absent != present,
             "absence and a present zero compare equal")

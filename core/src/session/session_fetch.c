@@ -2017,9 +2017,8 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         cfg->group_order != MOQ_GROUP_ORDER_ASCENDING &&
         cfg->group_order != MOQ_GROUP_ORDER_DESCENDING)
         return MOQ_ERR_INVAL;
-    /* A profile whose fetch data plane cannot reconstruct a descending response
-     * (draft-18: ascending-only group deltas) must not request one it would
-     * mis-decode; refuse up front rather than desync on the reply. */
+    /* A profile whose fetch data plane cannot reconstruct a descending
+     * response must not request one; refused before anything is sent. */
     if (cfg->group_order == MOQ_GROUP_ORDER_DESCENDING &&
         !s->profile->fetch_descending_supported)
         return MOQ_ERR_INVAL;

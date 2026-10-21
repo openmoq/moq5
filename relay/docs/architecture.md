@@ -69,7 +69,12 @@ Consequences, each load-bearing:
 2. Public libmoq API only. Never `transport_bridge.h` / `wire.h` / `codec.h`
    / `control*.h` / `session_internal.h`, and not the publisher/subscriber
    facades (they own session event polling; the relay needs raw events).
-   Enforced by `scripts/check_relay_boundary.sh` (`relay_boundary` ctest).
+   One exception, by file: `relay/src/core/props_codec.c`, the property codec
+   translation primitive, uses `moq/vi64.h` and `moq/wire.h` (and nothing
+   else forbidden) to re-encode Object and Track Property integers between
+   draft-16 (i) and draft-18/22 (vi64) when a relay forwards across drafts.
+   Enforced by `scripts/check_relay_boundary.sh` (`relay_boundary` ctest),
+   whose exception and its neighbors `relay_boundary_selftest` checks.
 3. Single-writer per shard. Cross-shard = bounded mailboxes + explicit
    `moq_rcbuf_clone` only.
 4. Everything bounded; every bound is a capacity-model term.
@@ -437,8 +442,8 @@ sessions of different drafts. What is specific to draft-22 sessions:
 - **FETCH ranges** are resolved by the relay against its own Largest
   (`moq_session_set_defer_fetch_ranges`, described under "Status").
 - **Standalone FETCH retrieves what the relay does not hold** (§3.2.3). A
-  draft-22 standalone FETCH is admitted once and answered with FETCH_OK at
-  once. Its range is then covered in the requested group order -- descending
+  standalone FETCH, on every draft, is admitted once and answered with
+  FETCH_OK at once. Its range is then covered in the requested group order -- descending
   orders groups, each group's Objects stay in Object order (§3.2.1) -- from
   the cache, and each run the cache does not hold is retrieved with one
   upstream FETCH for exactly that run, through the same retrieval cursor and
@@ -448,19 +453,24 @@ sessions of different drafts. What is specific to draft-22 sessions:
   is marked End of Timed-Out Range while the response continues; a FILL_TIMEOUT
   of 0 asks nothing upstream. A run with no connection to retrieve it from is marked
   End of Unknown Range at once (Timed-Out once the budget is spent), and an
-  Object still arriving is waited for up to the deadline. Retrieved Objects
+  Object still arriving is waited for up to the deadline. A draft without End
+  of Timed-Out Range (draft-16, draft-18) gets End of Unknown Range instead:
+  never a FIN that would say the Objects do not exist (draft-16 §9.16.3,
+  draft-18 §10.12.3). Retrieved Objects
   are not ingested into the live log. An upstream FETCH that fails resets the
   response with UNKNOWN_OBJECT_STATUS (§3.2.2); a local failure resets it
-  with INTERNAL_ERROR; a request the relay cannot take on (no FETCH slot) is
-  refused with REQUEST_ERROR INTERNAL_ERROR. All of these are request-local:
+  with INTERNAL_ERROR; a request the relay cannot take on (no FETCH slot, or
+  a full FETCH pool) is refused as capacity, with its retry hint. All of these
+  are request-local:
   the session, its subscriptions and its other FETCHes are unaffected, and a
   reset the session cannot take yet is retried until it commits. The
   subscriber's cancellation retires the request at once and cancels its
   upstream FETCH. On a shard that does not own the track the FETCH is routed
   to the owning shard, which admits it against its own log and answers it
   from its cache and upstream across the shard channels (above), so the
-  response is the same whichever shard the subscriber landed on. Draft-16 and
-  draft-18 FETCH are served from the retained log as before.
+  response is the same whichever shard the subscriber landed on. The binding
+  serves every draft's FETCH this way; the core's retained-only
+  `moqr_core_fetch_open` stays available to embedders that choose it.
 
 Tests: `relay_session_binding_fetch`, `relay_session_binding_d22`,
 `relay_shard_fill`,

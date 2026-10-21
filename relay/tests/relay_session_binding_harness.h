@@ -321,11 +321,16 @@ typedef struct jf_down {
     bool               ok_eot;
     uint64_t           ok_eg, ok_eo;
     uint64_t           obj_g[8], obj_o[8];
+    uint32_t           gap_kind[4];      /* each FETCH_GAP's range kind      */
+    uint64_t           gap_g[4], gap_o[4]; /* and its inclusive end          */
     size_t             obj_len[8];
     uint8_t            obj_first[8];
     bool               obj_exact[8];
     size_t             props_len[8];
     bool               props_exact[8];
+    uint8_t            props[8][16];     /* each object's properties, as received */
+    uint8_t            ok_props[16];     /* FETCH_OK Track Properties, as received */
+    size_t             ok_props_len;
     int                ledger[JF_LEDGER];
     int                ledger_n;
     bool               overflow;
@@ -336,9 +341,12 @@ typedef struct jf_down {
     int                ns_rejected;
     uint64_t           ns_rejected_code;
     char               ns_rejected_reason[64];
-    /* Further requests this peer issued besides fh: their FETCH_ERROR counts. */
+    /* Further requests this peer issued besides fh: their FETCH_ERROR counts,
+     * the last error's code, and every other event of theirs. */
     moq_fetch_t        req_fh[4];
     int                req_err[4];
+    uint64_t           req_code[4];
+    int                req_other[4];
     int                req_n;
 } jf_down_t;
 
@@ -424,6 +432,7 @@ extern const char *relay_bind_test_rv_deny_track;
 extern bool relay_bind_test_rv_second_track;
 extern const moq_bytes_t relay_bind_test_JF_NS[2];
 extern bool relay_bind_test_jf_setup_usub_key_oom;
+extern moq_version_t relay_bind_test_jf_origin_version;
 
 /* Rig, peer and per-family fixture helpers, and the flows more than one suite
  * runs (documented at their definitions). */

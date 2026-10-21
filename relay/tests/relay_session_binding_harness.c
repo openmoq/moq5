@@ -1966,7 +1966,12 @@ relay_bind_test_jf_down_drain(rig_t *r, jf_down_t *d)
                     if (d->req_fh[k]._opaque == h) extra = k;
                 }
                 if (extra >= 0) {
-                    if (ev->kind == MOQ_EVENT_FETCH_ERROR) d->req_err[extra]++;
+                    if (ev->kind == MOQ_EVENT_FETCH_ERROR) {
+                        d->req_err[extra]++;
+                        d->req_code[extra] = ev->u.fetch_error.error_code;
+                    } else {
+                        d->req_other[extra]++;
+                    }
                 } else if (!d->fh_set || h != d->fh._opaque) {
                     d->foreign++;
                 } else {
@@ -1981,6 +1986,10 @@ relay_bind_test_jf_down_drain(rig_t *r, jf_down_t *d)
                         d->ok_eot = ev->u.fetch_ok.end_of_track;
                         d->ok_eg = ev->u.fetch_ok.end_group;
                         d->ok_eo = ev->u.fetch_ok.end_object;
+                        d->ok_props_len = ev->u.fetch_ok.track_properties.len;
+                        if (d->ok_props_len != 0 && d->ok_props_len <= sizeof(d->ok_props))
+                            memcpy(d->ok_props, ev->u.fetch_ok.track_properties.data,
+                                   d->ok_props_len);
                         break;
                     case MOQ_EVENT_FETCH_OBJECT: {
                         const moq_fetch_object_event_t *fo = &ev->u.fetch_object;
@@ -1996,11 +2005,21 @@ relay_bind_test_jf_down_drain(rig_t *r, jf_down_t *d)
                                     : boot_payload_is(fo->payload, 0xD0, BOOT_DELTA_LEN);
                             d->props_len[k] = fo->properties ? moq_rcbuf_len(fo->properties) : 0;
                             d->props_exact[k] = jf_props_is(fo->properties, fo->object_id);
+                            if (d->props_len[k] != 0 && d->props_len[k] <= sizeof(d->props[k]))
+                                memcpy(d->props[k], moq_rcbuf_data(fo->properties),
+                                       d->props_len[k]);
                         }
                         d->objects++;
                         break;
                     }
-                    case MOQ_EVENT_FETCH_GAP:      d->gaps++; break;
+                    case MOQ_EVENT_FETCH_GAP:
+                        if (d->gaps < 4) {
+                            d->gap_kind[d->gaps] = (uint32_t)ev->u.fetch_gap.range_kind;
+                            d->gap_g[d->gaps] = ev->u.fetch_gap.group_id;
+                            d->gap_o[d->gaps] = ev->u.fetch_gap.object_id;
+                        }
+                        d->gaps++;
+                        break;
                     case MOQ_EVENT_FETCH_COMPLETE: d->complete++; break;
                     case MOQ_EVENT_FETCH_ERROR: {
                         const moq_fetch_error_event_t *fe = &ev->u.fetch_error;
@@ -2101,6 +2120,9 @@ relay_bind_test_jf_join(jf_t *j, jf_down_t *d)
  * catalog subscriptions are being established: the relay keeps the upstream
  * subscription but could not retain its track key (no forwarding source). */
 bool relay_bind_test_jf_setup_usub_key_oom = false;
+/* The origin's draft when nonzero; otherwise every jf connection speaks the
+ * setup's version. */
+moq_version_t relay_bind_test_jf_origin_version = 0;
 
 bool
 relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool live_control,
@@ -2117,8 +2139,10 @@ relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool liv
     /* Connection slot order is pump order: origin first by default; with
      * origin_last the downstream peers' events are processed before the
      * origin's in every pump. */
+    moq_version_t ov = relay_bind_test_jf_origin_version != 0
+                           ? relay_bind_test_jf_origin_version : version;
     if (!origin_last) {
-        j->o.cn = relay_bind_test_rig_connect(&j->rig, version);
+        j->o.cn = relay_bind_test_rig_connect(&j->rig, ov);
     }
     j->o.largest_group = largest_group;
     j->o.largest_object = largest_object;
@@ -2127,7 +2151,7 @@ relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool liv
         j->d[i].cn = relay_bind_test_rig_connect(&j->rig, version);
     }
     if (origin_last) {
-        j->o.cn = relay_bind_test_rig_connect(&j->rig, version);
+        j->o.cn = relay_bind_test_rig_connect(&j->rig, ov);
     }
     if (live_control) {
         j->live.cn = relay_bind_test_rig_connect(&j->rig, version);

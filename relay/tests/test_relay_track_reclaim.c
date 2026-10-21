@@ -643,38 +643,44 @@ test_stale_handles(void)
     moq_bytes_t nsb[1];
     moqr_intent_t its[8];
     MOQ_TEST_CHECK(moqr_core_announce(c, pb, NS1(nsb, "s")) == MOQR_OK);
-    moqr_track_t old;
-    failures += pull_cycle(c, &a, sb, "s", "old", 10, &old);
-    moqr_track_t fresh;
-    MOQ_TEST_CHECK(moqr_core_publish_open(c, pb, NS1(nsb, "s"), B("new"), 2,
-                                          &fresh) == MOQR_OK);
-    MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
-    MOQ_TEST_CHECK(old._opaque != fresh._opaque);
+    /* Both handles stay zero unless their setup succeeds; the stale-handle
+     * and trace checks below need both. */
+    moqr_track_t old = { 0 }, fresh = { 0 };
+    int cycle_failures = pull_cycle(c, &a, sb, "s", "old", 10, &old);
+    failures += cycle_failures;
+    bool fresh_ok = moqr_core_publish_open(c, pb, NS1(nsb, "s"), B("new"), 2,
+                                           &fresh) == MOQR_OK;
+    MOQ_TEST_CHECK(fresh_ok);
+    if (cycle_failures == 0 && fresh_ok) {
+        MOQ_TEST_CHECK_EQ_SIZE(drain(c, its, 8), (size_t)1);
+        MOQ_TEST_CHECK(old._opaque != fresh._opaque);
 
-    MOQ_TEST_CHECK(ing(c, &a, old, 1, 0) == MOQR_ERR_STALE_HANDLE);
-    MOQ_TEST_CHECK(moqr_core_upstream_ok(c, old, 1, 0, false, 0, 0) ==
-                   MOQR_ERR_STALE_HANDLE);
-    MOQ_TEST_CHECK(moqr_core_upstream_error(c, old, 1, 0x10, 11) ==
-                   MOQR_ERR_STALE_HANDLE);
-    MOQ_TEST_CHECK(moqr_core_upstream_lost(c, old, 1) ==
-                   MOQR_ERR_STALE_HANDLE);
-    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, old, 0, 0) ==
-                   MOQR_ERR_STALE_HANDLE);
-    MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, old, 1) ==
-                   MOQR_ERR_STALE_HANDLE);
-    MOQ_TEST_CHECK(ing(c, &a, fresh, 0, 0) == MOQR_OK);
+        MOQ_TEST_CHECK(ing(c, &a, old, 1, 0) == MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_upstream_ok(c, old, 1, 0, false, 0, 0) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_upstream_error(c, old, 1, 0x10, 11) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_upstream_lost(c, old, 1) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, old, 0, 0) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, old, 1) ==
+                       MOQR_ERR_STALE_HANDLE);
+        MOQ_TEST_CHECK(ing(c, &a, fresh, 0, 0) == MOQR_OK);
 
-    /* Exactly one track ROUTE_REMOVE, tagged with the capacity reason. */
-    moqr_trace_rec_t recs[256];
-    size_t n = moqr_trace_read(tr, recs, 256);
-    int removes = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (recs[i].kind == MOQR_TRACE_ROUTE_REMOVE && recs[i].detail == 1) {
-            removes++;
-            MOQ_TEST_CHECK_EQ_U64(recs[i].e1, 1);
+        /* Exactly one track ROUTE_REMOVE, tagged with the capacity reason. */
+        moqr_trace_rec_t recs[256];
+        size_t n = moqr_trace_read(tr, recs, 256);
+        int removes = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].kind == MOQR_TRACE_ROUTE_REMOVE &&
+                recs[i].detail == 1) {
+                removes++;
+                MOQ_TEST_CHECK_EQ_U64(recs[i].e1, 1);
+            }
         }
+        MOQ_TEST_CHECK_EQ_INT(removes, 1);
     }
-    MOQ_TEST_CHECK_EQ_INT(removes, 1);
 
     moqr_core_destroy(c);
     moqr_trace_destroy(tr);

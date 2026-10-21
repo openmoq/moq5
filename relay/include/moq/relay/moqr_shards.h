@@ -213,7 +213,8 @@ typedef struct moqr_shards_capacity {
     uint64_t channel_byte_ceiling;   /* K^2 x (data cap + control-exempt
                                         canon/Track Properties + headers)  */
     uint64_t canon_byte_ceiling;     /* mailbox + journal + pending keys,
-                                        + routed FETCH keys (admission)    */
+                                        + routed FETCH keys and their Track
+                                        Properties copies (admission)      */
     uint64_t staging_byte_ceiling;   /* one/shard, incl. metadata + header */
     uint64_t relay_alloc_ceiling;    /* total of the above                 */
     uint32_t usable_bindings_per_shard;

@@ -912,6 +912,18 @@ MOQ_API moq_result_t moq_pub_write_object(
  * (always on draft-22), carrying the EXACT count of streams the facade
  * opened for it -- retryably and idempotently across WOULD_BLOCK.
  *
+ * A published track (moq_pub_publish_track) is ended the same way on its
+ * publication: the END_OF_TRACK status object first, on a fresh subgroup of
+ * the publication, then the publication's terminal done (TRACK_ENDED) whose
+ * stream count includes that stream. The publication receives the status
+ * object only when it was accepted and forwarding (Forward 1) when the
+ * operation began, and its window admits the terminal Location; otherwise --
+ * and under the ceiling fallback -- the done alone ends it. A destination a
+ * Forward or filter cut reset mid-terminal is ended by its done (never a
+ * clean close of the reset stream). Each step of the terminal (open, status
+ * object, FIN, done) is taken once, so end_track completes through any
+ * action queue size by retrying on MOQ_ERR_WOULD_BLOCK.
+ *
  * After end_track succeeds the track is terminal: moq_pub_write_object[_ex],
  * moq_pub_begin_object, and moq_pub_set_retained_group all return
  * MOQ_ERR_WRONG_STATE, and a repeated end_track is an idempotent MOQ_OK.

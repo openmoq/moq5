@@ -2265,7 +2265,8 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_accept_fetch(sv, sv_fetch, &acfg, 2000), (int)MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_create(&alloc, (const uint8_t *)"meta", 4, &props), (int)MOQ_OK);
+        /* One pair: Type 0x21 holding "me". */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_create(&alloc, (const uint8_t *)"\x21\x02me", 4, &props), (int)MOQ_OK);
 
         moq_fetch_object_cfg_t ocfg;
         moq_fetch_object_cfg_init(&ocfg);
@@ -2307,7 +2308,7 @@ int main(void)
         MOQ_TEST_CHECK(evts[1].u.fetch_object.payload == NULL);
         MOQ_TEST_CHECK(evts[1].u.fetch_object.properties != NULL);
         MOQ_TEST_CHECK_EQ_SIZE(moq_rcbuf_len(evts[1].u.fetch_object.properties), 4);
-        MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(evts[1].u.fetch_object.properties), "meta", 4) == 0);
+        MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(evts[1].u.fetch_object.properties), "\x21\x02me", 4) == 0);
         MOQ_TEST_CHECK_EQ_INT((int)evts[2].kind, (int)MOQ_EVENT_FETCH_COMPLETE);
 
         for (size_t i = 0; i < ne; i++) moq_event_cleanup(&evts[i]);

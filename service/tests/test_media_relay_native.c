@@ -1,6 +1,11 @@
 /* Public service clients only. The opaque helper owns the real relay host.
  * Run one finite row per process:
- * CERT KEY d18_raw|d22_raw|d22_wt|d22_split|d22_cmaf. */
+ * CERT KEY d18_raw|d22_raw|d22_wt|d22_split|d22_cmaf|d18_push|d22_push.
+ * The _push rows publish the tracks with PUBLISH (publish_tracks): the media
+ * reaches the relay without demand, so the receiver subscribes before it is
+ * written, and the track's end reaches it through the relay as the
+ * publication's END_OF_TRACK. The _complete rows end the broadcast instead
+ * (MSF 11.3): the same END_OF_TRACK, then the terminal isComplete catalog. */
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -37,6 +42,10 @@ typedef struct viewer {
     moq_media_track_t *track;
     unsigned catalogs, added, ended, objects;
     bool cmaf;
+    /* A completed broadcast's terminal catalog removes the track: once, and
+     * only after the track's own END_OF_TRACK ended it. */
+    bool removal_expected;
+    unsigned removed;
 } viewer_t;
 
 /* The Group ID every object of the run carries. Legacy numbering starts at
@@ -241,7 +250,9 @@ static bool poll_tracks(viewer_t *v)
                     desc.track_duration_ms == 2000);
             REQUIRE(desc.has_bitrate && desc.bitrate == 1500000);
         } else if (ev.kind == MOQ_MEDIA_TRACK_ENDED) {
-            REQUIRE(ev.track == v->track && ++v->ended == 1);
+            REQUIRE(ev.track == v->track && ++v->ended == 1 && v->removed == 0);
+        } else if (ev.kind == MOQ_MEDIA_TRACK_REMOVED && v->removal_expected) {
+            REQUIRE(ev.track == v->track && ++v->removed == 1 && v->ended == 1);
         } else {
             fprintf(stderr, "unexpected track event=%u local=%d fill=%u/%u/%"
                     PRIu64 "\n", (unsigned)ev.kind, ev.local_result,
@@ -369,16 +380,36 @@ int main(int argc, char **argv)
 {
     if (argc != 4 || (strcmp(argv[3], "d18_raw") != 0 &&
         strcmp(argv[3], "d22_raw") != 0 && strcmp(argv[3], "d22_wt") != 0 &&
-        strcmp(argv[3], "d22_split") != 0 && strcmp(argv[3], "d22_cmaf") != 0)) {
-        fprintf(stderr, "usage: %s CERT KEY "
-                "d18_raw|d22_raw|d22_wt|d22_split|d22_cmaf\n",
+        strcmp(argv[3], "d22_split") != 0 && strcmp(argv[3], "d22_cmaf") != 0 &&
+        strcmp(argv[3], "d18_push") != 0 && strcmp(argv[3], "d22_push") != 0 &&
+        strcmp(argv[3], "d18_complete") != 0 && strcmp(argv[3], "d22_complete") != 0 &&
+        strcmp(argv[3], "d18_complete_now") != 0 &&
+        strcmp(argv[3], "d22_complete_now") != 0 &&
+        strcmp(argv[3], "d18_complete_slow") != 0 &&
+        strcmp(argv[3], "d22_complete_slow") != 0)) {
+        fprintf(stderr, "usage: %s CERT KEY d18_raw|d22_raw|d22_wt|d22_split|"
+                "d22_cmaf|d18_push|d22_push|d18_complete|d22_complete|"
+                "d18_complete_now|d22_complete_now|d18_complete_slow|"
+                "d22_complete_slow\n",
                 argv[0]);
         return 2;
     }
     bool cmaf = strcmp(argv[3], "d22_cmaf") == 0;
+    /* _complete_now: complete() straight after the writes, with no end_track
+     * or wait: the accepted media and the track's end still go out first. */
+    /* _complete_slow: the same, and the application polls no media until the
+     * receiver has adopted the terminal catalog. */
+    bool complete_slow = strcmp(argv[3], "d18_complete_slow") == 0 ||
+                         strcmp(argv[3], "d22_complete_slow") == 0;
+    bool complete_now = complete_slow || strcmp(argv[3], "d18_complete_now") == 0 ||
+                        strcmp(argv[3], "d22_complete_now") == 0;
+    bool complete = complete_now || strcmp(argv[3], "d18_complete") == 0 ||
+                    strcmp(argv[3], "d22_complete") == 0;
+    bool push = complete || strcmp(argv[3], "d18_push") == 0 ||
+                strcmp(argv[3], "d22_push") == 0;
     bool wt_sender = strcmp(argv[3], "d22_wt") == 0;
     bool wt_receiver = wt_sender || strcmp(argv[3], "d22_split") == 0;
-    moq_version_t version = strcmp(argv[3], "d18_raw") == 0
+    moq_version_t version = strncmp(argv[3], "d18_", 4) == 0
         ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_22;
     media_relay_native_host_t *host = NULL;
     moq_endpoint_t *sender_ep = NULL;
@@ -397,7 +428,7 @@ int main(int argc, char **argv)
     REQUIRE(!cmaf || sc.validate_cmaf);
     sc.namespace_ = ns;
     sc.backpressure = MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK;
-    sc.publish_tracks = false;
+    sc.publish_tracks = push;
     sc.catalog_refresh_interval_us = UINT64_MAX;
     if (version == MOQ_VERSION_DRAFT_22)
         sc.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
@@ -440,7 +471,30 @@ int main(int argc, char **argv)
     REQUIRE(discover(&late, host, sender, version));
     REQUIRE(viewer_close(&prime));
     REQUIRE(!moq_media_sender_track_has_subscriber(sender, track));
-    phase = "queued finite tail before media demand";
+    /* Only the catalog needs history here. Explicit NONE suppresses the
+     * media subscription's implicit current-group fill on draft 22. */
+    moq_location_filter_cfg_t location = { .struct_size = sizeof(location),
+                                         .kind = MOQ_LOCATION_FILTER_NONE };
+    moq_media_receiver_track_subscribe_cfg_t subscription;
+    moq_media_receiver_track_subscribe_cfg_init_sized(&subscription,
+                                                    sizeof(subscription));
+    subscription.location = &location;
+    late.removal_expected = complete;
+    if (push) {
+        phase = "live subscription before the pushed media";
+        REQUIRE(moq_media_receiver_subscribe_track(late.receiver, late.track,
+                                                   &subscription) == MOQ_OK);
+        deadline = now_us() + DEADLINE_US;
+        moq_media_track_state_t st = MOQ_MEDIA_TRACK_STATE_PENDING;
+        while (moq_media_receiver_track_state(late.receiver, late.track, &st) ==
+                   MOQ_OK && st != MOQ_MEDIA_TRACK_STATE_ACTIVE) {
+            REQUIRE(healthy(host, sender, &late) && poll_tracks(&late));
+            REQUIRE(now_us() < deadline);
+            moq_result_t wrc = moq_media_receiver_wait(late.receiver, 20000);
+            REQUIRE(wrc == MOQ_OK || wrc == MOQ_DONE);
+        }
+    }
+    phase = push ? "pushed finite tail" : "queued finite tail before media demand";
     for (unsigned i = 0; i < OBJECTS; ++i) {
         uint8_t data[PAYLOAD_SIZE];
         uint8_t fragment[NATIVE_CMAF_FRAGMENT_SIZE];
@@ -482,21 +536,32 @@ int main(int argc, char **argv)
     }
     moq_media_sender_stats_t ss;
     REQUIRE(moq_media_sender_get_stats(sender, &ss, sizeof(ss)) == MOQ_OK);
-    REQUIRE(ss.objects_written == OBJECTS && ss.objects_queued == OBJECTS &&
-            ss.objects_sent == 0 && ss.objects_dropped == 0);
-    REQUIRE(moq_media_sender_end_track(sender, track) == MOQ_OK);
-    REQUIRE(moq_media_sender_end_track(sender, track) == MOQ_OK);
-    /* Only the catalog needs history here. Explicit NONE suppresses the
-     * media subscription's implicit current-group fill on draft 22. */
-    moq_location_filter_cfg_t location = { .struct_size = sizeof(location),
-                                         .kind = MOQ_LOCATION_FILTER_NONE };
-    moq_media_receiver_track_subscribe_cfg_t subscription;
-    moq_media_receiver_track_subscribe_cfg_init_sized(&subscription,
-                                                    sizeof(subscription));
-    subscription.location = &location;
-    REQUIRE(moq_media_receiver_subscribe_track(late.receiver, late.track,
-                                               &subscription) ==
-            MOQ_OK);
+    REQUIRE(ss.objects_written == OBJECTS && ss.objects_dropped == 0);
+    REQUIRE(push || (ss.objects_queued == OBJECTS && ss.objects_sent == 0));
+    if (complete_now) {
+        REQUIRE(moq_media_sender_complete(sender) == MOQ_OK);
+        REQUIRE(moq_media_sender_complete(sender) == MOQ_OK);
+        REQUIRE(moq_media_sender_end_track(sender, track) == MOQ_ERR_WRONG_STATE);
+    } else {
+        REQUIRE(moq_media_sender_end_track(sender, track) == MOQ_OK);
+        REQUIRE(moq_media_sender_end_track(sender, track) == MOQ_OK);
+    }
+    if (!push)
+        REQUIRE(moq_media_receiver_subscribe_track(late.receiver, late.track,
+                                                   &subscription) ==
+                MOQ_OK);
+    if (complete_slow) {
+        phase = "terminal catalog adopted before any poll";
+        deadline = now_us() + DEADLINE_US;
+        moq_media_receiver_stats_t early;
+        while (moq_media_receiver_get_stats(late.receiver, &early, sizeof(early)) ==
+                   MOQ_OK && !early.catalog_complete) {
+            REQUIRE(healthy(host, sender, &late) && now_us() < deadline);
+            moq_result_t wrc = moq_media_receiver_wait(late.receiver, 20000);
+            REQUIRE(wrc == MOQ_OK || wrc == MOQ_DONE);
+        }
+        REQUIRE(early.objects_dropped == 0);
+    }
     phase = "live tail and END_OF_TRACK";
     deadline = now_us() + DEADLINE_US;
     while (late.objects < OBJECTS || late.ended == 0) {
@@ -519,9 +584,21 @@ int main(int argc, char **argv)
         REQUIRE(rc == MOQ_OK || rc == MOQ_DONE);
     }
     REQUIRE(late.objects == OBJECTS && late.ended == 1);
+    if (complete && !complete_now) {
+        /* MSF 11.3 in its order: the track's end, received; then the
+         * broadcast's terminal catalog. */
+        REQUIRE(moq_media_sender_complete(sender) == MOQ_OK);
+        REQUIRE(moq_media_sender_complete(sender) == MOQ_OK);
+    }
     moq_media_track_state_t state;
-    REQUIRE(moq_media_receiver_track_state(late.receiver, late.track, &state) ==
-            MOQ_OK && state == MOQ_MEDIA_TRACK_STATE_ENDED);
+    if (late.removed == 0) {
+        REQUIRE(moq_media_receiver_track_state(late.receiver, late.track, &state) ==
+                MOQ_OK && state == MOQ_MEDIA_TRACK_STATE_ENDED);
+    } else {
+        /* The terminal catalog's removal already followed the end. */
+        REQUIRE(complete && moq_media_receiver_track_state(late.receiver, late.track,
+                                                           &state) == MOQ_ERR_WRONG_STATE);
+    }
     REQUIRE(moq_media_receiver_subscribe_track(late.receiver, late.track, NULL) ==
             MOQ_ERR_WRONG_STATE);
     REQUIRE(moq_endpoint_state(sender_ep) == MOQ_ENDPOINT_ESTABLISHED &&
@@ -535,6 +612,25 @@ int main(int argc, char **argv)
     REQUIRE(rs.objects_received == OBJECTS && rs.objects_queued == 0 &&
             rs.objects_dropped == 0 && rs.parse_drops == 0 &&
             rs.overflow_events == 0 && rs.catalog_drops == 0);
+    if (complete) {
+        phase = "terminal catalog";
+        deadline = now_us() + DEADLINE_US;
+        while (moq_media_receiver_get_stats(late.receiver, &rs, sizeof(rs)) == MOQ_OK &&
+               !rs.catalog_complete) {
+            REQUIRE(healthy(host, sender, &late) && poll_tracks(&late));
+            REQUIRE(now_us() < deadline);
+            moq_result_t wrc = moq_media_receiver_wait(late.receiver, 20000);
+            REQUIRE(wrc == MOQ_OK || wrc == MOQ_DONE);
+        }
+        REQUIRE(rs.catalog_complete && rs.catalog_drops == 0);
+        while (late.removed == 0) {
+            REQUIRE(healthy(host, sender, &late) && poll_tracks(&late));
+            REQUIRE(now_us() < deadline);
+            moq_result_t wrc = moq_media_receiver_wait(late.receiver, 20000);
+            REQUIRE(wrc == MOQ_OK || wrc == MOQ_DONE);
+        }
+        REQUIRE(late.ended == 1 && late.removed == 1);
+    }
     moq_media_sender_destroy(sender);
     sender = NULL;
     REQUIRE(moq_endpoint_drain(sender_ep, DEADLINE_US) == MOQ_OK);

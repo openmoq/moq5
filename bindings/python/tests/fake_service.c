@@ -4466,10 +4466,10 @@ PyObject *test_sender_stats(PyObject *self, PyObject *args)
 {
     (void)self;
     unsigned long long v[9], evicted;
-    long long last_error;
-    if (!PyArg_ParseTuple(args, "KKKKKKKKKLK", &v[0], &v[1], &v[2], &v[3],
+    long long last_error, completion_error;
+    if (!PyArg_ParseTuple(args, "KKKKKKKKKLKL", &v[0], &v[1], &v[2], &v[3],
                           &v[4], &v[5], &v[6], &v[7], &v[8], &last_error,
-                          &evicted))
+                          &evicted, &completion_error))
         return NULL;
     pthread_mutex_lock(&mutex);
     scripted_sender_stats.objects_written = v[0];
@@ -4483,6 +4483,7 @@ PyObject *test_sender_stats(PyObject *self, PyObject *args)
     scripted_sender_stats.backpressure_stalls = v[8];
     scripted_sender_stats.last_error = (moq_result_t)last_error;
     scripted_sender_stats.sap_records_evicted = evicted;
+    scripted_sender_stats.completion_error = (moq_result_t)completion_error;
     sender_stats_size = (uint32_t)sizeof(scripted_sender_stats);
     pthread_mutex_unlock(&mutex);
     Py_RETURN_NONE;
@@ -4533,19 +4534,19 @@ PyObject *test_sender_stats_fields(PyObject *self, PyObject *args)
     (Py_ssize_t)sizeof(((moq_media_sender_stats_t *)0)->name)
     return Py_BuildValue(
         "{s:(nn),s:(nn),s:(nn),s:(nn),s:(nn),s:(nn),s:(nn),s:(nn),s:(nn),"
-        "s:(nn),s:(nn),s:(nn)}",
+        "s:(nn),s:(nn),s:(nn),s:(nn)}",
         FIELD(struct_size), FIELD(objects_written), FIELD(objects_sent),
         FIELD(objects_queued), FIELD(bytes_queued), FIELD(objects_dropped),
         FIELD(groups_dropped), FIELD(keyframes_dropped),
         FIELD(groups_abandoned), FIELD(backpressure_stalls),
-        FIELD(last_error), FIELD(sap_records_evicted));
+        FIELD(last_error), FIELD(sap_records_evicted), FIELD(completion_error));
 #undef FIELD
 }
 
 PyObject *test_sender_stats_layout(PyObject *self, PyObject *args)
 {
     (void)self; (void)args;
-    return Py_BuildValue("{s:n,s:n,s:n,s:n}",
+    return Py_BuildValue("{s:n,s:n,s:n,s:n,s:n,s:n}",
         "sizeof", (Py_ssize_t)sizeof(moq_media_sender_stats_t),
         "v0_end", (Py_ssize_t)(offsetof(moq_media_sender_stats_t, last_error)
                                + sizeof(moq_result_t)),
@@ -4553,7 +4554,12 @@ PyObject *test_sender_stats_layout(PyObject *self, PyObject *args)
         (Py_ssize_t)offsetof(moq_media_sender_stats_t, sap_records_evicted),
         "sap_end",
         (Py_ssize_t)(offsetof(moq_media_sender_stats_t, sap_records_evicted)
-                     + sizeof(uint64_t)));
+                     + sizeof(uint64_t)),
+        "ce_offset",
+        (Py_ssize_t)offsetof(moq_media_sender_stats_t, completion_error),
+        "ce_end",
+        (Py_ssize_t)(offsetof(moq_media_sender_stats_t, completion_error)
+                     + sizeof(moq_result_t)));
 }
 
 /* The scripted snapshot as the recorder would deliver it, for a scoped
@@ -4573,7 +4579,7 @@ PyObject *test_sender_stats_snapshot(PyObject *self, PyObject *args)
         Py_RETURN_NONE;
     }
     PyObject *r = Py_BuildValue(
-        "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:K,s:I}",
+        "{s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:i,s:K,s:i,s:I}",
         "objects_written", (unsigned long long)scripted_sender_stats.objects_written,
         "objects_sent", (unsigned long long)scripted_sender_stats.objects_sent,
         "objects_queued", (unsigned long long)scripted_sender_stats.objects_queued,
@@ -4585,6 +4591,7 @@ PyObject *test_sender_stats_snapshot(PyObject *self, PyObject *args)
         "backpressure_stalls", (unsigned long long)scripted_sender_stats.backpressure_stalls,
         "last_error", (int)scripted_sender_stats.last_error,
         "sap_records_evicted", (unsigned long long)scripted_sender_stats.sap_records_evicted,
+        "completion_error", (int)scripted_sender_stats.completion_error,
         "struct_size", (unsigned int)sender_stats_size);
     pthread_mutex_unlock(&mutex);
     return r;

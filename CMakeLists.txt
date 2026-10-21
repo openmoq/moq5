@@ -398,6 +398,11 @@ if(MOQ_BUILD_RELAY_CORE)
         # a static source-layering check: deterministic, no physical surface — the
         # "boundary" it checks is the code layering, not a transport
         set_tests_properties(relay_boundary PROPERTIES LABELS "relay;sansio")
+        # The guard's own self-test: its one exception and its neighbors.
+        add_test(NAME relay_boundary_selftest
+                 COMMAND ${CMAKE_COMMAND} -E env bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_relay_boundary.sh)
+        set_tests_properties(relay_boundary_selftest PROPERTIES LABELS "relay;sansio")
     endif()
 endif()
 

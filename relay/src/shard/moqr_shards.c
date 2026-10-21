@@ -153,6 +153,10 @@ cap_mul(uint64_t a, uint64_t b)
  * protocol meaning of its own (pump-sub table full, subscribe hard error),
  * mirroring MOQ_REQUEST_ERROR_INTERNAL (moq/session.h). */
 #define R_ERR_INTERNAL       0x0u
+/* Wire REQUEST_ERROR code for a Joining FETCH whose joined subscription's
+ * track is no longer the one its name resolves to, mirroring
+ * MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID (moq/session.h). */
+#define R_ERR_INVALID_JOINING 0x32u
 
 #define SHARDS_CFG_HAS(cfg, field)                       \
     (offsetof(moqr_shards_cfg_t, field) +                \
@@ -577,6 +581,11 @@ typedef struct r_demand_msg {
     bool         adv_subgroup_end;
     moq_rcbuf_t *payload;
     moq_rcbuf_t *props;
+    /* OBJ / OBJ_OPEN / FILL_ITEM: the codec `props` were stated in at the
+     * owner (MOQR_PROPS_CODEC_*), and whether the upstream subgroup header
+     * set PROPERTIES; the requester's ingest states both as received. */
+    uint8_t      props_codec;
+    bool         subgroup_props;
     uint64_t     bytes_accounted;   /* gauge contribution fixed at push (an
                                      * ownership transfer nulls the refs
                                      * before pop, so pop cannot recount) */
@@ -598,13 +607,18 @@ typedef struct r_demand_msg {
      * fill_end_group/fill_end_object. OPEN: the admission (error_code on
      * REJECT); on ACCEPT the inclusive range group_id/object_id ..
      * fill_end_group/fill_end_object, End Of Track, and the FETCH_OK End
-     * Location's raw object field (its group is fill_end_group). */
+     * Location's raw object field (its group is fill_end_group).
+     * fetch_capacity: a REJECT because the owner had no room for it. */
     bool         fetch_standalone;
     bool         fetch_eot;
+    bool         fetch_capacity;
     uint32_t     fetch_admit;
     uint32_t     fetch_range_form;
     uint64_t     fetch_relative_start;
     uint64_t     fetch_end_raw_object;
+    /* REQ of a Joining FETCH: the demand whose feed the joined subscription
+     * reads (0 for any other FETCH). */
+    uint64_t     fetch_join_demand;
 } r_demand_msg_t;
 
 /* Whether a message kind is DATA (byte-gated, counted against the data
@@ -804,6 +818,7 @@ typedef struct r_fitem {
     uint64_t     declared_len;
     moq_rcbuf_t *payload;       /* owned clone (OBJECT)                   */
     moq_rcbuf_t *props;         /* OBJECT properties / ERROR reason       */
+    uint8_t      props_codec;   /* OBJECT properties' MOQR_PROPS_CODEC_*  */
     uint64_t     charged;       /* bytes still charged to the channel     */
 } r_fitem_t;
 
@@ -841,7 +856,9 @@ typedef struct r_fret {
     uint32_t  canon_len;
     uint32_t  range_form;
     uint64_t  relative_start;
+    uint64_t  join_demand_id;   /* a Joining FETCH's feeding demand, or 0 */
     moqr_retrieve_standalone_plan_t plan;
+    moq_rcbuf_t *meta_props;    /* owns plan.meta_bytes while open        */
 } r_fret_t;
 
 typedef struct r_oret {
@@ -863,6 +880,12 @@ typedef struct r_oret {
     bool         standalone;
     moqr_fetch_t owner;
     moqr_core_retrieve_plan_t plan;
+    /* Its Track Properties, from this binding's reply pin at admission, as
+     * an owned clone (never the pin itself) until OPEN carries them. */
+    moqr_bind_meta_state_t meta_state;
+    moq_version_t meta_version;
+    moq_rcbuf_t *meta_props;
+    bool         capacity;         /* refused for room (the owner's pool) */
     moqr_retrieve_cursor_t cursor; /* fixed row: never copied while live */
 } r_oret_t;
 
@@ -1779,6 +1802,7 @@ mgr_free(r_mgr *m)
                 moq_rcbuf_decref(m->fret[i].win[k].payload);
                 moq_rcbuf_decref(m->fret[i].win[k].props);
             }
+            moq_rcbuf_decref(m->fret[i].meta_props);
             sh_free(a, m->fret[i].canon, m->fret[i].canon_len);
         }
         sh_free(a, m->fret, (size_t)m->fill_cap * sizeof(m->fret[0]));
@@ -1787,6 +1811,7 @@ mgr_free(r_mgr *m)
         for (uint32_t i = 0; i < m->fill_cap; i++) {
             /* bind_destroy already released collector/cached copies. */
             moqr_bind_retrieve_forget(&m->oret[i].cursor);
+            moq_rcbuf_decref(m->oret[i].meta_props);
         }
         sh_free(a, m->oret, (size_t)m->fill_cap * sizeof(m->oret[0]));
     }
@@ -2191,10 +2216,27 @@ shards_fill_open(void *ctx, const moqr_bind_fill_query_t *q,
     return MOQR_OK;
 }
 
+/* Whether the owner's outstanding delivery toward `src` came from an
+ * upstream subgroup whose header set PROPERTIES (false for a notice). */
+static bool
+shard_delivery_subgroup_props(r_mgr *m, uint16_t src)
+{
+    bool sgp = false, follows_gap = false;
+    moqr_reset_desc_t gap_reset;
+    if (moqr_core_internal_delivery_flags(m->core, m->pb[src], &sgp, &follows_gap,
+                                          &gap_reset) != MOQR_OK) {
+        return false;
+    }
+    return sgp;
+}
+
 /* The standalone FETCH source's open: ask the shard that owns the track
  * (named by its binding cookie here) to admit and answer the request. The
  * key is copied now; the REQ carries it. No free retrieval slot refuses this
- * request alone. */
+ * request alone. A Joining FETCH names the accepted demand that feeds the
+ * joined track here: the owner answers it only while that demand's
+ * subscription there still reads the track the name resolves to. With no
+ * such demand, the subscription it joins is no longer fed (STALE_HANDLE). */
 static moqr_result_t
 shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
                uint64_t *handle)
@@ -2218,6 +2260,19 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     if (f == NULL) {
         return MOQR_ERR_CAPACITY;
     }
+    uint64_t join_demand = 0;
+    if (q->join) {
+        for (uint32_t i = 0; i < m->pend_len && join_demand == 0; i++) {
+            const r_pdemand *d = &m->pend[i];
+            if (d->state == D_ST_ACKED && moqr_track_eq(d->track, q->join_track) &&
+                d->origin == (uint16_t)(q->remote_cookie - base)) {
+                join_demand = d->demand_id;
+            }
+        }
+        if (join_demand == 0) {
+            return MOQR_ERR_STALE_HANDLE;
+        }
+    }
     uint32_t clen = 0;
     uint8_t *canon = canon2_build(q->ns.parts, (uint32_t)q->ns.count, q->name,
                                   &clen, &m->alloc);
@@ -2240,6 +2295,7 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     f->end_object = q->end_object;
     f->range_form = q->range_form;
     f->relative_start = q->relative_start;
+    f->join_demand_id = join_demand;
     f->deadline_us = q->deadline_us;
     f->order = (uint8_t)q->group_order;
     f->prio = q->subscriber_priority;
@@ -2332,6 +2388,7 @@ shards_fill_retrieve_peek(void *ctx, uint64_t handle, uint64_t now_us,
             out->object.obj_state = MOQR_OBJ_COMPLETE;
             out->object.payload = it->payload;
             out->object.properties = it->props;
+            out->object.properties_codec = it->props_codec;
         } else if (it->result.kind == MOQR_RETRIEVE_ERROR && it->props != NULL) {
             out->reason = (moq_bytes_t){ moq_rcbuf_data(it->props),
                                          moq_rcbuf_len(it->props) };
@@ -2434,6 +2491,9 @@ shards_fill_close(void *ctx, uint64_t handle)
         return;
     }
     fret_drop_window(f);
+    moq_rcbuf_decref(f->meta_props);
+    f->meta_props = NULL;
+    f->plan.meta_bytes = (moq_bytes_t){ NULL, 0 };
     if (f->req_owed) {
         f->req_owed = false;
     } else if (!f->ended && !f->abandoned) {
@@ -2498,6 +2558,7 @@ oret_free(r_mgr *m, r_oret_t *o)
     if (o->standalone && moqr_fetch_is_valid(o->owner)) {
         (void)moqr_core_fetch_close(m->core, o->owner);
     }
+    moq_rcbuf_decref(o->meta_props);
     memset(o, 0, sizeof(*o));
 }
 
@@ -3039,6 +3100,7 @@ requester_fill_phase(moqr_shards_t *s, uint16_t shard,
                 msg.fetch_standalone = true;
                 msg.fetch_range_form = f->range_form;
                 msg.fetch_relative_start = f->relative_start;
+                msg.fetch_join_demand = f->join_demand_id;
                 msg.canon = f->canon;
                 msg.canon_len = f->canon_len;
             }
@@ -3113,6 +3175,35 @@ owner_fill_push(moqr_shards_t *s, uint16_t shard, uint16_t dst,
     return true;
 }
 
+/* owner_fill_push with *props (an owned reference, or NULL) moved into the
+ * message as its properties: on success the channel owns it and *props is
+ * NULL; on a refused push it is handed back to *props, never released. */
+static bool
+owner_fill_push_props(moqr_shards_t *s, uint16_t shard, uint16_t dst,
+                      r_demand_msg_t *msg, moq_rcbuf_t **props, dp_budget_t *bud,
+                      uint64_t *pushed_dst_mask, uint64_t *pending)
+{
+    msg->props = *props;
+    *props = NULL;
+    r_mgr *m = s->shards[shard].mgr;
+    uint64_t lb = dmsg_logical_bytes(msg);
+    if (!dp_admit(bud, lb) ||
+        !dch_push_arb(s, shard, dst, msg, true, ctrl_work_pending(m, dst))) {
+        *props = msg->props;
+        msg->props = NULL;
+        dmsg_release(&s->alloc, msg);
+        *pending |= 1ull << dst;
+        return false;
+    }
+    dp_spend(bud, lb);
+    m->pump_messages++;
+    m->pump_bytes += lb;
+    if (pushed_dst_mask != NULL) {
+        *pushed_dst_mask |= 1ull << dst;
+    }
+    return true;
+}
+
 /* Shared coverage runs only in the owner data phase. Peeking at zero credit
  * still observes hard errors/deadlines; successful FIFO transfer is the sole
  * permission to commit. All cursor allocations remain bind-owned. */
@@ -3144,6 +3235,7 @@ owner_fill_pass(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 msg.fetch_standalone = true;
                 msg.fetch_admit = MOQR_FETCH_REJECT;
                 msg.error_code = o->plan.wire.error_code;
+                msg.fetch_capacity = o->capacity;
                 if (owner_fill_push(s, shard, dst, &msg, bud,
                                     pushed_dst_mask, pending)) oret_free(m, o);
                 break;
@@ -3170,9 +3262,13 @@ owner_fill_pass(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     msg.fill_end_group = o->plan.end_group;
                     msg.fill_end_object = o->plan.end_object;
                     msg.fetch_end_raw_object = o->plan.wire.end_object;
+                    msg.metadata.state = o->meta_state;
+                    msg.metadata.wire_version = o->meta_version;
                 }
-                if (!owner_fill_push(s, shard, dst, &msg, bud,
-                                     pushed_dst_mask, pending)) break;
+                /* The clone moves into the message whole: once pushed, this
+                 * lane never touches it again; refused, it comes back. */
+                if (!owner_fill_push_props(s, shard, dst, &msg, &o->meta_props, bud,
+                                           pushed_dst_mask, pending)) break;
                 o->open_sent = true;
                 continue;
             }
@@ -3215,6 +3311,7 @@ owner_fill_pass(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 msg.datagram_pref = it.object.datagram_pref;
                 msg.end_of_group = it.object.end_of_group;
                 msg.declared_len = it.object.declared_len;
+                msg.props_codec = it.object.properties_codec;
                 if ((it.object.payload != NULL &&
                      moq_rcbuf_clone(&s->alloc, it.object.payload,
                                      &msg.payload) != MOQ_OK) ||
@@ -3847,6 +3944,8 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     om.prio = d.rec.publisher_priority;
                     om.end_of_group = d.rec.end_of_group;
                     om.first_object = d.rec.first_object;
+                    om.props_codec = d.rec.properties_codec;
+                    om.subgroup_props = shard_delivery_subgroup_props(m, src);
                     if (d.rec.properties != NULL &&
                         moq_rcbuf_clone(&s->alloc, d.rec.properties,
                                         &om.props) != MOQ_OK) {
@@ -4043,6 +4142,8 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
             msg.end_of_group = d.rec.end_of_group;
             msg.first_object = d.rec.first_object;
             msg.adv_subgroup_end = d.subgroup_end;
+            msg.props_codec = d.rec.properties_codec;
+            msg.subgroup_props = shard_delivery_subgroup_props(m, src);
             bool oom = false;
             if (d.rec.payload != NULL &&
                 moq_rcbuf_clone(&s->alloc, d.rec.payload, &msg.payload) !=
@@ -4190,7 +4291,10 @@ owner_admit_demand(moqr_shards_t *s, uint16_t shard, uint16_t src,
 /* Owner role: admit a standalone FETCH another shard routed here, exactly as
  * a FETCH this shard received would be admitted (the requester's pseudo-
  * binding stands for its connection). The answer, OPEN with the admission,
- * is pushed by the data phase. */
+ * is pushed by the data phase. A Joining FETCH is answered only from the
+ * track its feeding demand's pump-sub reads: once that demand no longer
+ * serves, or the name resolves to a replacement, the join is refused, never
+ * served the replacement's Objects. */
 static bool
 owner_sa_accept(moqr_shards_t *s, uint16_t shard, uint16_t src,
                 const r_demand_msg_t *msg, r_oret_t *o, uint64_t now_us)
@@ -4222,14 +4326,48 @@ owner_sa_accept(moqr_shards_t *s, uint16_t shard, uint16_t src,
     o->order = msg->fill_order;
     o->prio = msg->prio;
     o->credit = msg->fill_credit;
+    const r_psub *joined = msg->fetch_join_demand != 0
+                               ? owner_fill_psub(m, src, msg->fetch_join_demand)
+                               : NULL;
+    if (msg->fetch_join_demand != 0 && joined == NULL) {
+        o->owner = MOQR_FETCH_INVALID;
+        o->plan.wire.admit = MOQR_FETCH_REJECT;
+        o->plan.wire.error_code = R_ERR_INVALID_JOINING;
+        return true;
+    }
     moqr_result_t rc = moqr_core_internal_retrieve_open(m->core, m->pb[src], &req,
                                                         now_us, &o->owner, &o->plan);
-    if (rc != MOQR_OK) {
+    if (rc == MOQR_OK && joined != NULL && o->plan.wire.admit == MOQR_FETCH_ACCEPT &&
+        !moqr_track_eq(o->plan.track, joined->otrack)) {
+        (void)moqr_core_fetch_close(m->core, o->owner);
+        memset(&o->plan, 0, sizeof(o->plan));
+        o->owner = MOQR_FETCH_INVALID;
+        o->plan.wire.admit = MOQR_FETCH_REJECT;
+        o->plan.wire.error_code = R_ERR_INVALID_JOINING;
+    } else if (rc != MOQR_OK) {
         memset(&o->plan, 0, sizeof(o->plan));
         o->owner = MOQR_FETCH_INVALID;
         o->plan.wire.admit = MOQR_FETCH_REJECT;
         o->plan.wire.error_code = R_ERR_INTERNAL;
+        o->capacity = rc == MOQR_ERR_CAPACITY;   /* the owner's FETCH pool */
     } else if (o->plan.wire.admit == MOQR_FETCH_ACCEPT) {
+        /* The answer's Track Properties are fixed here, at admission. A copy
+         * that cannot be made is UNAVAILABLE: the requester refuses rather
+         * than answer without them. */
+        moqr_bind_meta_ref_t pin;
+        moqr_bind_t *bind = s->shards[shard].bind;
+        (void)moqr_bind_meta_reply(bind, o->plan.track, &pin);
+        o->meta_state = pin.state;
+        o->meta_version = pin.wire_version;
+        if (pin.state == MOQR_BIND_META_PRESENT &&
+            (pin.bytes.len == 0 || pin.bytes.data == NULL ||
+             pin.bytes.len > MOQR_BIND_META_SET_MAX ||
+             moq_rcbuf_create(&m->alloc, pin.bytes.data, pin.bytes.len,
+                              &o->meta_props) != MOQ_OK)) {
+            o->meta_state = MOQR_BIND_META_UNAVAILABLE;
+            o->meta_props = NULL;
+        }
+        moqr_bind_meta_release(bind, &pin);
         o->start_group = o->plan.start_group;
         o->start_object = o->plan.start_object;
         o->end_group = o->plan.end_group;
@@ -4547,6 +4685,8 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 desc.first_object = msg->first_object;
                 desc.payload = msg->payload;
                 desc.properties = msg->props;
+                desc.properties_codec = msg->props_codec;
+                desc.subgroup_properties = msg->subgroup_props;
                 desc.now_us = now_us;
                 moqr_result_t rc = moqr_core_ingest(m->core, d->track, &desc);
                 if (rc == MOQR_OK) {
@@ -4631,6 +4771,8 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     desc.obj_state = MOQR_OBJ_OPEN;
                     desc.declared_len = msg->declared_len;
                     desc.properties = msg->props;
+                    desc.properties_codec = msg->props_codec;
+                    desc.subgroup_properties = msg->subgroup_props;
                     desc.now_us = now_us;
                     moqr_result_t rc =
                         moqr_core_ingest(m->core, d->track, &desc);
@@ -5025,12 +5167,23 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                                 msg->group_id, msg->object_id };
                             f->plan.end = (moqr_retrieve_location_t){
                                 msg->fill_end_group, msg->fill_end_object };
+                            f->plan.meta_state = msg->metadata.state;
+                            f->plan.meta_wire_version = msg->metadata.wire_version;
+                            if (msg->props != NULL) {
+                                /* Moved out of the message before its pop. */
+                                f->meta_props = msg->props;
+                                msg->props = NULL;
+                                f->plan.meta_bytes = (moq_bytes_t){
+                                    moq_rcbuf_data(f->meta_props),
+                                    moq_rcbuf_len(f->meta_props) };
+                            }
                             f->start_group = msg->group_id;
                             f->start_object = msg->object_id;
                             f->end_group = msg->fill_end_group;
                             f->end_object = msg->fill_end_object;
                         } else {
                             f->plan.wire.error_code = msg->error_code;
+                            f->plan.capacity = msg->fetch_capacity;
                             f->ended = true;
                             f->more_owed = false;
                         }
@@ -5065,6 +5218,7 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 it->declared_len = msg->declared_len;
                 it->payload = msg->payload;
                 it->props = msg->props;
+                it->props_codec = msg->props_codec;
                 msg->payload = NULL;   /* moved into the window */
                 msg->props = NULL;
                 it->charged = dch_hold_head(s, src, shard);
@@ -5514,6 +5668,17 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
             out->canon_byte_ceiling,
             cap_mul(K, cap_mul(shards_fill_slots(&lim, &clim),
                                R_CANON_FT_MAX)));
+        /* Each standalone retrieval slot, owner and requester side, holds
+         * at most one Track Properties copy of at most a full set: the
+         * owner's from admission until OPEN carries it, the requester's from
+         * OPEN until the request closes. In between it is the channel's,
+         * inside channel_byte_ceiling, and never in two places at once. */
+        if (lim.admit) {
+            out->canon_byte_ceiling = cap_add(
+                out->canon_byte_ceiling,
+                cap_mul(K, cap_mul(cap_mul(2u, shards_fill_slots(&lim, &clim)),
+                                   cap_add(MOQR_BIND_META_SET_MAX, hdr))));
+        }
         /* Allocate-before-push staging: one message's owned material per
          * concurrently stepping source shard (a channel-bounded record/reason +
          * two clone headers, a full-track DEMAND key, or P-sized metadata
@@ -6057,6 +6222,27 @@ moqr_shards_debug_remote_demand_refused(moqr_shards_t *s, uint16_t shard)
         return 0;
     }
     return s->shards[shard].mgr->remote_demand_refused;
+}
+
+void
+moqr_shards_debug_retrieval_meta(moqr_shards_t *s, uint16_t shard, uint32_t *owner_held,
+                                 uint32_t *requester_held, uint32_t *max_refs)
+{
+    *owner_held = *requester_held = *max_refs = 0;
+    if (s == NULL || shard >= s->shard_count || s->shards[shard].mgr == NULL) return;
+    r_mgr *m = s->shards[shard].mgr;
+    for (uint32_t i = 0; m->oret != NULL && i < m->fill_cap; i++) {
+        if (m->oret[i].meta_props == NULL) continue;
+        (*owner_held)++;
+        uint32_t n = moq_rcbuf_refcount(m->oret[i].meta_props);
+        if (n > *max_refs) *max_refs = n;
+    }
+    for (uint32_t i = 0; m->fret != NULL && i < m->fill_cap; i++) {
+        if (m->fret[i].meta_props == NULL) continue;
+        (*requester_held)++;
+        uint32_t n = moq_rcbuf_refcount(m->fret[i].meta_props);
+        if (n > *max_refs) *max_refs = n;
+    }
 }
 
 uint32_t

@@ -1121,34 +1121,28 @@ relay_max_cache_duration(moq_version_t v)
         relay_bind_test_rig_pump(&w.rig, 8);
         relay_bind_test_peer_drain(&w.rig, late, &l_ps, false, false, 0, 0);
     }
-    if (v == MOQ_VERSION_DRAFT_22) {
-        /* Draft-22: the expired Object is unknown, so the relay asks the
-         * origin for it within the FETCH's wait budget; nothing past it is
-         * served and the FETCH does not end meanwhile. This origin never
-         * answers: once the budget is spent the run is Timed-Out from
-         * {0,0} (object 1 has expired by then as well). */
-        R_CHECK(&w.rig, l_ps.fdlv_n == 0 && l_ps.fgap_n == 0 &&
-                            l_ps.fetch_complete == 0);
-        w.rig.now += 60000000;
-        for (int i = 0; i < 6; i++) {
-            relay_bind_test_rig_pump(&w.rig, 8);
-            relay_bind_test_peer_drain(&w.rig, late, &l_ps, false, false, 0, 0);
-        }
-        R_CHECK(&w.rig, l_ps.fdlv_n == 0);
-        R_CHECK(&w.rig, l_ps.fgap_n >= 1 &&
-                            l_ps.fgap[0].kind == MOQ_FETCH_RANGE_TIMED_OUT &&
-                            l_ps.fgap[0].group == 0 && l_ps.fgap[0].object == 0);
-        R_CHECK(&w.rig, l_ps.fetch_complete == 1);
-    } else {
-        /* The expired Object is reported unknown, never passed over as
-         * if it did not exist; the fresh one is served after it. */
-        R_CHECK(&w.rig, l_ps.fgap_n == 1 &&
-                            l_ps.fgap[0].kind == MOQ_FETCH_RANGE_UNKNOWN &&
-                            l_ps.fgap[0].group == 0 && l_ps.fgap[0].object == 0);
-        R_CHECK(&w.rig, l_ps.fdlv_n == 1);
-        R_CHECK(&w.rig, l_ps.fdlv_n < 1 || l_ps.fdlv[0].object == 1);
-        R_CHECK(&w.rig, l_ps.fetch_complete == 1);
+    /* The expired Object is unknown, so the relay asks the origin for it
+     * within the FETCH's wait budget; nothing past it is served and the FETCH
+     * does not end meanwhile. This origin never answers: once the budget is
+     * spent the run from {0,0} is Timed-Out on draft-22, and on the drafts
+     * without that marker it is Unknown -- never passed over as if it did not
+     * exist (object 1 has expired by then as well). */
+    R_CHECK(&w.rig, l_ps.fdlv_n == 0 && l_ps.fgap_n == 0 && l_ps.fetch_complete == 0);
+    w.rig.now += 60000000;
+    for (int i = 0; i < 6; i++) {
+        relay_bind_test_rig_pump(&w.rig, 8);
+        relay_bind_test_peer_drain(&w.rig, late, &l_ps, false, false, 0, 0);
     }
+    printf("relay_max_cache_duration(d%u): objects=%d gaps=%d kind=%u at %llu:%llu complete=%d\n",
+           (unsigned)v, l_ps.fdlv_n, l_ps.fgap_n, l_ps.fgap_n ? (unsigned)l_ps.fgap[0].kind : 0u,
+           l_ps.fgap_n ? (unsigned long long)l_ps.fgap[0].group : 0ull,
+           l_ps.fgap_n ? (unsigned long long)l_ps.fgap[0].object : 0ull, l_ps.fetch_complete);
+    R_CHECK(&w.rig, l_ps.fdlv_n == 0);
+    R_CHECK(&w.rig, l_ps.fgap_n >= 1 &&
+                        l_ps.fgap[0].kind == (v == MOQ_VERSION_DRAFT_22 ? MOQ_FETCH_RANGE_TIMED_OUT
+                                                                       : MOQ_FETCH_RANGE_UNKNOWN) &&
+                        l_ps.fgap[0].group == 0 && l_ps.fgap[0].object == 0);
+    R_CHECK(&w.rig, l_ps.fetch_complete == 1);
     return mrig_close(&w, &a, "relay_max_cache_duration", v);
 }
 

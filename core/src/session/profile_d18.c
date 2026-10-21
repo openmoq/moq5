@@ -1192,8 +1192,8 @@ static moq_result_t d18_object_props(const uint8_t *pp, size_t len,
  * FETCH_HEADER (Request ID) leads a fetch data uni; objects follow with a vi64
  * Serialization Flags field. Object Properties (0x20) and the Datagram forwarding-
  * preference bit (0x40, §11.4.4.1 -- the subgroup LSBs are ignored) are supported
- * in both directions. Group reconstruction uses the request's retained order;
- * draft-18's local descending-request refusal remains a separate policy. */
+ * in both directions. Group reconstruction uses the request's retained order:
+ * a descending response's Group ID Delta counts down (11.4.4.1). */
 #define D18_FETCH_OBJ_SUBGROUP_MASK  0x03u
 #define D18_FETCH_OBJ_OBJECT_DELTA   0x04u
 #define D18_FETCH_OBJ_GROUP_DELTA    0x08u
@@ -2314,7 +2314,7 @@ static const moq_profile_ops_t d18_ops = {
     .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */
     .request_error_wire_max  = MOQ_VI64_MAX,
     .semantic_request_error  = d18_semantic_request_error,
-    .fetch_descending_supported = false,   /* retained local selection policy */
+    .fetch_descending_supported = true,   /* response deltas in request order */
     .uses_uni_control_channel = true,
     .wire_ready               = true,
     .request_retains_pending_original_input = false,

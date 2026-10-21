@@ -103,6 +103,16 @@ typedef struct {
      * done can report it instead of the unknown sentinel. Cleared with the
      * slot. */
     uint64_t              streams_opened;
+    /* An end_track terminal in progress on this destination: the open
+     * subgroup (sg) is the terminal one (eot_sg), its END_OF_TRACK has been
+     * queued (eot_written), its FIN has been queued (eot_done). Each step
+     * of open -> status object -> FIN is taken once, so a refusal for room
+     * resumes at the next step. A terminal stream a Forward or filter cut
+     * reset before its FIN (eot_sg without sg_open or eot_done) is not
+     * continued: the destination ends by its terminal control message. */
+    bool                  eot_sg;
+    bool                  eot_written;
+    bool                  eot_done;
     /* Resolved subscription-filter window, COPIED by value from the session's
      * internal accessor (moq_session_{sub,pub}_resolved_window) when the slot
      * is installed and whenever an update carries a filter -- never a retained
@@ -4417,6 +4427,101 @@ moq_result_t moq_pub_write_object(moq_publisher_t *pub,
     return moq_pub_write_object_ex(pub, track, &obj, now_us);
 }
 
+/* One destination's END_OF_TRACK for an end_track operation: one empty
+ * status object at the frozen terminal Location, alone on a fresh subgroup
+ * that is FIN'd. Every step -- closing the data subgroup still open, opening
+ * the terminal one, queuing the status object, the FIN -- is recorded as it
+ * succeeds (eot_sg, eot_written), so a refusal for room at any of them
+ * resumes at that step and nothing is sent twice, however small the action
+ * queue. MOQ_OK once the FIN is queued. A stale parent clears the slot;
+ * a stale terminal subgroup leaves its parent and stream count intact, with
+ * sg_open false, for the caller's control-only end. Otherwise return the refusal,
+ * WOULD_BLOCK included. */
+static moq_result_t slot_end_of_track(moq_publisher_t *pub, moq_pub_track_t *track,
+                                      pub_sub_slot_t *slot, uint64_t term_g,
+                                      uint64_t term_o, uint64_t now_us)
+{
+    if (slot->sg_open && !slot->eot_sg) {
+        moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
+        if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
+        slot->sg_open = false;
+    }
+    if (!slot->eot_sg) {
+        moq_subgroup_cfg_t sgcfg;
+        moq_subgroup_cfg_init(&sgcfg);
+        sgcfg.group_id = term_g;
+        sgcfg.subgroup_id = 0;
+        sgcfg.publisher_priority = track->priority;
+        sgcfg.object_properties = false;
+        /* The terminal status object starts its subgroup unless a stream
+         * object was already published in that group. */
+        sgcfg.first_object = hist_find(track, term_g) < 0 &&
+                             !hist_sealed(track, term_g);
+        moq_result_t rc = (slot->kind == PUB_SLOT_PUBLICATION)
+            ? moq_session_open_pub_subgroup(pub->session, slot->pub, &sgcfg,
+                                            now_us, &slot->sg)
+            : moq_session_open_subgroup(pub->session, slot->sub, &sgcfg,
+                                        now_us, &slot->sg);
+        if (rc == MOQ_ERR_STALE_HANDLE) { track_clear_slot(pub, slot); return rc; }
+        if (rc < 0) return rc;
+        slot->sg_open = true;
+        slot->eot_sg = true;
+        slot->cur_group = term_g;
+        slot->sg_omitted = false;   /* fresh terminal, not the old data subgroup */
+        slot->streams_opened++;
+    }
+    if (!slot->eot_written) {
+        moq_result_t rc = moq_session_write_status_object(pub->session, slot->sg,
+            term_o, MOQ_OBJECT_END_OF_TRACK, now_us);
+        if (rc == MOQ_ERR_STALE_HANDLE) { slot->sg_open = false; return rc; }
+        if (rc < 0) return rc;
+        slot->eot_written = true;
+    }
+    moq_result_t rc = moq_session_close_subgroup(pub->session, slot->sg, now_us);
+    if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
+    slot->sg_open = false;
+    if (rc == MOQ_ERR_STALE_HANDLE) return rc;
+    slot->eot_done = true;
+    return MOQ_OK;
+}
+
+/* The publication's part of an end_track operation, before its
+ * PUBLISH_DONE: the END_OF_TRACK (slot_end_of_track) when a fresh terminal
+ * exists and the publication was a destination of the operation that still
+ * admits the Location (accepted, Forward 1, inside its window); otherwise a
+ * control-only end. The slot is then marked served for the operation. */
+static moq_result_t publication_end_of_track(moq_publisher_t *pub,
+                                             moq_pub_track_t *track,
+                                             bool term_fresh, uint64_t term_g,
+                                             uint64_t term_o, uint64_t now_us)
+{
+    pub_sub_slot_t *psl = track_find_publication_slot(track);
+    if (!psl || !term_fresh || psl->eot_done) return MOQ_OK;
+    if (psl->eot_sg) {
+        /* Reset by a cut before its FIN: PUBLISH_DONE alone ends it. */
+        if (!psl->sg_open) return MOQ_OK;
+    } else {
+        if (psl->target_op != track->cur_op || psl->done_op == track->cur_op)
+            return MOQ_OK;
+        if (!slot_eligible(track, psl)) {
+            psl->done_op = track->cur_op;   /* control-only end */
+            return MOQ_OK;
+        }
+    }
+    /* A header already sent does not grandfather an unsent Object across
+     * a same-group Start Location update. Unpublish settles the open stream
+     * under window_owes, including its below-Start FIN exception. */
+    if (!psl->eot_written && !window_admits(&psl->window, term_g, term_o)) {
+        psl->done_op = track->cur_op;
+        return MOQ_OK;
+    }
+    moq_result_t rc = slot_end_of_track(pub, track, psl, term_g, term_o, now_us);
+    if (rc == MOQ_ERR_STALE_HANDLE) return MOQ_OK;
+    if (rc != MOQ_OK) return rc;
+    psl->done_op = track->cur_op;
+    return MOQ_OK;
+}
+
 moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
                                uint64_t now_us)
 {
@@ -4479,12 +4584,8 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
         }
     }
 
-    /* End the publication (PUBLISH_DONE) first, then the subscription slots. */
-    {
-        moq_result_t rc = moq_pub_unpublish_track(pub, track, now_us);
-        if (rc != MOQ_OK) return rc;
-    }
-
+    /* The operation (and with it the terminal plan and its destinations)
+     * begins before any effect, so every retry resumes the same one. */
     moq_result_t st = track_op_begin(track, PUB_OP_END_TRACK,
         term_g, term_o, false, term_fresh,
         term_fresh ? MOQ_OBJECT_END_OF_TRACK : MOQ_OBJECT_NORMAL,
@@ -4496,26 +4597,52 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
     if (st == 1 && term_fresh && track->hist)
         track_hist_merge(track->hist, term_g, term_o);
 
+    /* The publication ends on the data plane first -- its END_OF_TRACK status
+     * object on a stream of its own -- then with PUBLISH_DONE, whose Stream
+     * Count includes that stream. Then the subscription slots. */
+    {
+        moq_result_t rc = publication_end_of_track(pub, track, term_fresh,
+                                                   term_g, term_o, now_us);
+        if (rc != MOQ_OK) return rc;
+        rc = moq_pub_unpublish_track(pub, track, now_us);
+        if (rc != MOQ_OK) return rc;
+    }
+
     for (size_t si = 0; si < track->slot_cap; si++) {
         pub_sub_slot_t *slot = &track->slots[si];
         if (!slot->active) continue;
-        /* Publication termination is PUBLISH_DONE (the unpublish above),
-         * never an END_OF_TRACK status object. */
+        /* The publication was ended above (its END_OF_TRACK, then
+         * PUBLISH_DONE). */
         if (slot->kind == PUB_SLOT_PUBLICATION) {
             slot->done_op = track->cur_op;
             continue;
         }
-        if (slot->done_op == track->cur_op) continue;   /* served this op */
+        /* Served: its END_OF_TRACK was FIN'd. A destination merely
+         * excluded from the operation (done_op, e.g. a Forward cut mid-op)
+         * still owes its terminal control message below. */
+        if (slot->eot_done) continue;
         /* In the operation = stamped at admission AND still eligible. A slot
          * OUTSIDE the operation (Forward 0 at admission, or lazily retired)
          * cannot receive the status OBJECT -- but both drafts require the
          * terminal control message REGARDLESS of Forward state, so it takes
          * the terminal-control path below instead of being skipped. */
-        bool in_op = (slot->target_op == track->cur_op) &&
-                     slot_eligible(track, slot);
+        bool in_op = slot->eot_sg
+            ? slot->sg_open    /* a terminal under way, unless a cut reset it */
+            : (slot->target_op == track->cur_op &&
+               slot->done_op != track->cur_op && slot_eligible(track, slot));
 
-        if (!term_fresh || !in_op ||
-            !window_admits(&slot->window, term_g, term_o)) {
+        if (term_fresh && in_op && window_admits(&slot->window, term_g, term_o)) {
+            moq_result_t rc = slot_end_of_track(pub, track, slot, term_g, term_o,
+                                               now_us);
+            if (rc == MOQ_OK) {
+                slot->done_op = track->cur_op;
+                continue;
+            }
+            if (rc != MOQ_ERR_STALE_HANDLE) return rc;
+            if (!slot->active) continue;   /* parent, not just its stream, gone */
+            /* A peer-stopped terminal still owes its parent's done. */
+        }
+        {
             /* Terminal control: close any open subgroup FIRST (streams close
              * before the done, same normative ordering as
              * finish_subscribers; a Forward-0 slot's open subgroup was
@@ -4535,11 +4662,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
             if (slot->sg_open) {
                 moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
                 if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-                if (rc == MOQ_ERR_STALE_HANDLE) {
-                    track_clear_slot(pub, slot);
-                    continue;
-                }
-                if (rc < 0) return rc;
+                if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
                 slot->sg_open = false;
             }
             moq_done_subscribe_cfg_t dcfg;
@@ -4563,59 +4686,6 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
             track_clear_slot(pub, slot);   /* subscription freed */
             continue;
         }
-
-        /* The terminal END_OF_TRACK goes on a fresh non-extension subgroup
-         * at the canonical terminal Location: close any open subgroup (it
-         * may carry extensions) first. Closing the prior subgroup is
-         * independently retry-safe -- it clears sg_open, so a retry skips
-         * this block. */
-        if (slot->sg_open) {
-            moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
-            if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-            if (rc == MOQ_ERR_STALE_HANDLE) {
-                track_clear_slot(pub, slot);
-                continue;
-            }
-            if (rc < 0) return rc;
-            slot->sg_open = false;
-        }
-
-        /* Open -> status object -> FIN must queue atomically per slot
-         * (open emits its header eagerly; a mid-triple WOULD_BLOCK would
-         * strand an empty terminal subgroup). Preflight the triple. */
-        if (moq_session_action_capacity(pub->session) < 3)
-            return MOQ_ERR_WOULD_BLOCK;
-
-        moq_subgroup_cfg_t sgcfg;
-        moq_subgroup_cfg_init(&sgcfg);
-        sgcfg.group_id = term_g;
-        sgcfg.subgroup_id = 0;
-        sgcfg.publisher_priority = track->priority;
-        sgcfg.object_properties = false;
-        /* The terminal status object starts its subgroup unless a stream
-         * object was already published in that group. */
-        sgcfg.first_object = hist_find(track, term_g) < 0 &&
-                             !hist_sealed(track, term_g);
-        moq_subgroup_handle_t sg;
-        moq_result_t rc = moq_session_open_subgroup(pub->session, slot->sub,
-            &sgcfg, now_us, &sg);
-        if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
-            continue;
-        }
-        if (rc < 0) return rc;
-        slot->streams_opened++;
-
-        /* Capacity reserved: the remaining two actions cannot WOULD_BLOCK. */
-        rc = moq_session_write_status_object(pub->session, sg, term_o,
-                                             MOQ_OBJECT_END_OF_TRACK, now_us);
-        if (rc < 0) {
-            (void)moq_session_close_subgroup(pub->session, sg, now_us);
-            return rc;
-        }
-        slot->cur_group = sgcfg.group_id;
-        (void)moq_session_close_subgroup(pub->session, sg, now_us);  /* FIN */
-        if (slot->active) slot->done_op = track->cur_op;
     }
 
     /* §10: end_track's per-slot closes are clean FINs -- promote the
@@ -6490,3 +6560,26 @@ moq_result_t moq_pub_tick(moq_publisher_t *pub, uint64_t now_us)
      * retirements etc.). */
     return pub_progress_staged(pub, now_us);
 }
+
+#ifdef MOQ_PUB_TESTING
+/* White-box observation of a track's subscription destination slot,
+ * compiled ONLY into moq-core-test-internals: the resolved window installed
+ * for it and its terminal stream state. The track's first active
+ * subscription slot; false once it has none. */
+bool moq_pub_test_sub_slot(moq_pub_track_t *t, moq_resolved_window_t *window,
+                           bool *eot_sg, bool *eot_done, bool *sg_open);
+bool moq_pub_test_sub_slot(moq_pub_track_t *t, moq_resolved_window_t *window,
+                           bool *eot_sg, bool *eot_done, bool *sg_open)
+{
+    pub_sub_slot_t *sl = NULL;
+    for (size_t i = 0; t && !sl && i < t->slot_cap; i++)
+        if (t->slots[i].active && t->slots[i].kind == PUB_SLOT_SUBSCRIPTION)
+            sl = &t->slots[i];
+    if (!sl) return false;
+    *window = sl->window;
+    *eot_sg = sl->eot_sg;
+    *eot_done = sl->eot_done;
+    *sg_open = sl->sg_open;
+    return true;
+}
+#endif

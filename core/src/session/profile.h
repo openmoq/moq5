@@ -468,10 +468,9 @@ typedef struct moq_profile_ops {
     moq_request_error_t (*semantic_request_error)(uint64_t raw);
 
     /*
-     * Local FETCH selection policy. Draft-16 uses absolute Group IDs; draft-22
-     * retains order for its delta-based response. Draft-18 keeps its existing
-     * local descending refusal even though an admitted peer request's order is
-     * supported by the shared data-plane codec.
+     * Whether this side may request a descending FETCH. Draft-16 uses
+     * absolute Group IDs; draft-18 and draft-22 read the response's Group ID
+     * deltas in the request's retained order.
      */
     bool fetch_descending_supported;
 

@@ -297,8 +297,10 @@ cleanup:
 
 /* The owning shard's FETCH pool bounds routed requests too. With one FETCH
  * slot per shard, a FETCH on shard 0 waiting on upstream holds the owner's
- * slot, so a routed FETCH from shard 1 is refused (INTERNAL_ERROR) at once,
- * without an upstream request and without touching the subscriber's session;
+ * slot, so a routed FETCH from shard 1 is refused at once as capacity --
+ * EXCESSIVE_LOAD with a retry hint, as a full pool on the subscriber's own
+ * shard is -- without an upstream request and without touching the
+ * subscriber's session;
  * once the first FETCH completes the slot is free again and a routed FETCH
  * is served. */
 static int
@@ -321,7 +323,11 @@ rfs_shard_capacity(void)
     RSX_FIX(rfs_shard_fetch(&x, x.consumer, "v", 0, 0, 0, 3, false, 100, &refused));
     rfs_shard_steps(&x, 16);
     const rfs_event_t *err = rfs_nth(&x.obs, refused, MOQ_EVENT_FETCH_ERROR, 0);
-    RSX_NEED(err != NULL && err->code == MOQ_REQUEST_ERROR_INTERNAL_ERROR &&
+    printf("OBS: %s refusal code=%llu retry=%d/%llu\n", row,
+        err ? (unsigned long long)err->code : 0ull, err ? (int)err->can_retry : 0,
+        err ? (unsigned long long)err->retry_after_ms : 0ull);
+    RSX_NEED(err != NULL && err->code == MOQ_REQUEST_ERROR_EXCESSIVE_LOAD &&
+        err->can_retry && err->retry_after_ms >= 750 && err->retry_after_ms <= 1250 &&
         rfs_count(&x.obs, refused, MOQ_EVENT_FETCH_OK) == 0 && x.origin.requests == 1,
         "owner-capacity-refusal");
     sf_retained_accept(&x.r, &x.origin);
@@ -343,6 +349,155 @@ cleanup:
     return rfs_shard_finish(&x, row, missing);
 }
 
+/* The subscriber's own shard is out of room to route: with one retrieval
+ * slot per shard, a first routed FETCH from shard 1 holds shard 1's slot
+ * while the owner waits on upstream, so a second one, from another
+ * connection on shard 1, is refused as capacity there -- EXCESSIVE_LOAD with
+ * a retry hint -- before it reaches the owner; the first is answered once
+ * the origin answers. */
+static int
+rfs_shard_capacity_requester(void)
+{
+    const char *row = "cross-capacity-requester";
+    const char *missing = NULL;
+    rfs_shard_rig_t x;
+    moq_fetch_t first = {0}, refused = {0};
+    RSX_FIX(rfs_shard_setup(&x, 1));
+    static const uint64_t islands[] = { 0, 2 };
+    sf_pub_ids(&x.r, x.origin.cn, x.origin.sub, 0, 0, islands, 2);
+    rfs_shard_steps(&x, 12);
+    sf_retained_keep(&x.r, &x.origin, 0xa1);
+    RSX_FIX(x.r.failures == 0 && x.prime_obs.objects == 2);
+    RSX_FIX(rfs_shard_fetch(&x, x.consumer, "v", 0, 0, 0, 3, false, 100, &first));
+    rfs_shard_steps(&x, 16);
+    RSX_NEED(x.origin.requests == 1 &&
+        rfs_count(&x.obs, first, MOQ_EVENT_FETCH_COMPLETE) == 0, "first-routed-waits");
+    sfconn_t *other = sfrig_connect(&x.r, 1);
+    RSX_FIX(other != NULL && other->shard == 1);
+    rfs_observation_t oobs;
+    memset(&oobs, 0, sizeof(oobs));
+    for (int i = 0; i < 20; i++) {
+        if (i == 4)
+            RSX_FIX(rfs_shard_fetch(&x, other, "v", 0, 0, 0, 3, false, 100, &refused));
+        rfs_shard_steps(&x, 1);
+        moq_event_t ev;
+        while (moq_session_poll_events(other->peer, &ev, 1) == 1) {
+            (void)rfs_observe(&oobs, &ev, x.r.now);
+            moq_event_cleanup(&ev);
+        }
+    }
+    const rfs_event_t *err = rfs_nth(&oobs, refused, MOQ_EVENT_FETCH_ERROR, 0);
+    printf("OBS: %s refusal code=%llu retry=%d/%llu\n", row,
+        err ? (unsigned long long)err->code : 0ull, err ? (int)err->can_retry : 0,
+        err ? (unsigned long long)err->retry_after_ms : 0ull);
+    RSX_NEED(err != NULL && err->code == MOQ_REQUEST_ERROR_EXCESSIVE_LOAD &&
+        err->can_retry && err->retry_after_ms >= 750 && err->retry_after_ms <= 1250 &&
+        rfs_count(&oobs, refused, MOQ_EVENT_FETCH_OK) == 0 && x.origin.requests == 1 &&
+        oobs.closed == 0, "requester-capacity-refusal");
+    sf_retained_accept(&x.r, &x.origin);
+    sf_retained_write(&x.r, &x.origin, true);
+    rfs_shard_steps(&x, 24);
+    RSX_NEED(rfs_count(&x.obs, first, MOQ_EVENT_FETCH_COMPLETE) == 1 &&
+        rfs_count(&x.obs, first, MOQ_EVENT_FETCH_OBJECT) == 3, "first-answered");
+    RSX_NEED(x.obs.closed == 0 && moq_session_state(x.consumer->peer) ==
+        MOQ_SESS_ESTABLISHED, "request-local-lifetime");
+    sf_expect_channels_idle(&x.r);
+cleanup:
+    return rfs_shard_finish(&x, row, missing);
+}
+
+/* The owner is out of retrieval rows while its FETCH pool is not the
+ * question: three shards, one slot each. A fill subscriber on shard 2 waits
+ * for 0:1 from upstream through the owner's only retrieval row; a FETCH of
+ * the cached 0:0 from shard 1, whose own row is free, then finds no row at
+ * the owner and is refused as capacity -- EXCESSIVE_LOAD with a retry hint
+ * -- without an upstream request; the fill completes once the origin
+ * answers. (With two shards this state cannot be reached apart from the
+ * requester's own: every routed request holds a row on both sides.) */
+static int
+rfs_shard_capacity_owner_rows(void)
+{
+    const char *row = "cross-capacity-owner-rows";
+    const char *missing = NULL;
+    ca_t a;
+    ca_init(&a);
+    sfrig_t r = {0};
+    sf_retained_origin_t origin = {0};
+    sfconn_t *prime = NULL, *filler = NULL, *consumer = NULL;
+    sfps_t prime_obs = {0}, fill_obs = {0};
+    rfs_observation_t obs = {0};
+    moq_fetch_t refused = {0};
+#define ORW_FIX(e) do { if (!(e)) { \
+    printf("FIXTURE: %s:%d: %s\n", row, __LINE__, #e); r.failures++; goto cleanup; \
+} } while (0)
+#define ORW_NEED(e, label) do { if (!(e) && missing == NULL) missing = label; } while (0)
+    g_sf_shards = 3;
+    moqr_result_t crc = sfrig_create_ex(&r, &a, true, 1, 1);
+    g_sf_shards = 2;
+    ORW_FIX(crc == MOQR_OK);
+    sf_retained_announce(&r, &origin, true, 0xa1);
+    ORW_FIX(r.failures == 0 && origin.cn != NULL);
+    prime = sfrig_connect(&r, 0);
+    filler = sfrig_connect(&r, 2);
+    consumer = sfrig_connect(&r, 1);
+    ORW_FIX(prime != NULL && filler != NULL && consumer != NULL &&
+            filler->shard == 2 && consumer->shard == 1);
+    sfrig_pump(&r, 4);
+#define RSX_STEP(n) do { for (unsigned i_ = 0; i_ < (n); i_++) { \
+        sfrig_cycle(&r, 1000); sf_retained_drain(&r, &origin); \
+        sfps_drain(&r, prime, &prime_obs); sfps_drain(&r, filler, &fill_obs); \
+        moq_event_t ev_; \
+        while (moq_session_poll_events(consumer->peer, &ev_, 1) == 1) { \
+            (void)rfs_observe(&obs, &ev_, r.now); moq_event_cleanup(&ev_); } } } while (0)
+    ORW_FIX(sf_retained_subscribe(&r, prime, false)._opaque != 0);
+    RSX_STEP(16);
+    ORW_FIX(r.failures == 0 && origin.subscribes == 1 && prime_obs.subscribe_ok);
+    static const uint64_t islands[] = { 0, 2 };
+    sf_pub_ids(&r, origin.cn, origin.sub, 0, 0, islands, 2);
+    RSX_STEP(12);
+    sf_retained_keep(&r, &origin, 0xa1);
+    ORW_FIX(sf_retained_subscribe(&r, filler, true)._opaque != 0);
+    RSX_STEP(16);
+    ORW_NEED(origin.requests == 1 && fill_obs.fill_terminals == 0, "fill-waits-upstream");
+    moq_bytes_t ns[] = { B("live"), B("cam") };
+    moq_fetch_cfg_t cfg;
+    moq_fetch_cfg_init_sized(&cfg, sizeof(cfg));
+    cfg.track_namespace = (moq_namespace_t){ .parts = ns, .count = 2 };
+    cfg.track_name = B("v"); cfg.end_group = 0; cfg.end_object = 1;
+    cfg.group_order = MOQ_GROUP_ORDER_ASCENDING;
+    cfg.has_fill_timeout = true; cfg.fill_timeout_ms = 100;
+    ORW_FIX(moq_session_fetch(consumer->peer, &cfg, r.now, &refused) == MOQ_OK);
+    RSX_STEP(16);
+    const rfs_event_t *err = rfs_nth(&obs, refused, MOQ_EVENT_FETCH_ERROR, 0);
+    printf("OBS: %s refusal code=%llu retry=%d/%llu\n", row,
+        err ? (unsigned long long)err->code : 0ull, err ? (int)err->can_retry : 0,
+        err ? (unsigned long long)err->retry_after_ms : 0ull);
+    ORW_NEED(err != NULL && err->code == MOQ_REQUEST_ERROR_EXCESSIVE_LOAD &&
+        err->can_retry && err->retry_after_ms >= 750 && err->retry_after_ms <= 1250 &&
+        rfs_count(&obs, refused, MOQ_EVENT_FETCH_OK) == 0 && origin.requests == 1,
+        "owner-rows-capacity-refusal");
+    sf_retained_accept(&r, &origin);
+    sf_retained_write(&r, &origin, true);
+    RSX_STEP(24);
+    ORW_NEED(fill_obs.fill_terminals == 1, "fill-completes");
+    ORW_NEED(obs.closed == 0 && moq_session_state(consumer->peer) == MOQ_SESS_ESTABLISHED,
+        "request-local-lifetime");
+    sf_expect_channels_idle(&r);
+#undef RSX_STEP
+cleanup:
+#undef ORW_FIX
+#undef ORW_NEED
+    printf("OBS: %s origin_requests=%u downstream_events=%u closed=%u\n", row,
+        origin.requests, obs.n, obs.closed);
+    moq_rcbuf_decref(origin.payload);
+    if (r.s != NULL) sfrig_destroy(&r);
+    int errors = r.failures + obs.invalid + (a.live != 0);
+    printf("%s: standalone_shard(%s) causal=%s fixture_failures=%d\n",
+        errors ? "FIXTURE" : missing != NULL ? "FAIL" : "PASS", row,
+        missing != NULL ? missing : "none", errors);
+    return errors ? 2 : missing != NULL ? 1 : 0;
+}
+
 #undef RSX_FIX
 #undef RSX_NEED
 
@@ -353,6 +508,8 @@ main(int argc, char **argv)
     if (strcmp(argv[1], "cross-absent") == 0) return rfs_shard_absent();
     if (strcmp(argv[1], "cross-descending") == 0) return rfs_shard_descending();
     if (strcmp(argv[1], "cross-capacity") == 0) return rfs_shard_capacity();
+    if (strcmp(argv[1], "cross-capacity-requester") == 0) return rfs_shard_capacity_requester();
+    if (strcmp(argv[1], "cross-capacity-owner-rows") == 0) return rfs_shard_capacity_owner_rows();
     if (strcmp(argv[1], "cross-gap") != 0 && strcmp(argv[1], "cross-cache") != 0 &&
         strcmp(argv[1], "cross-cancel") != 0) return 2;
     return rfs_shard_case(argv[1]);

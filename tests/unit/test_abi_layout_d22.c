@@ -444,13 +444,18 @@ PIN_AFTER(moqr_fetch_req_t, report_unknown, range_form);
 PIN_AFTER(moqr_fetch_req_t, report_unknown, report_pending);
 
 /* The subgroup PROPERTIES form joins the append descriptor at or past its
- * previous sizeof (the extent through first_object); the record view, a
- * caller-sized output with no size field, does not change. */
+ * previous sizeof (the extent through first_object), and the properties
+ * codec past the sizeof that carried subgroup_properties. The record view,
+ * a caller-sized output with no size field, carries the codec beside the
+ * properties it describes: a layout change its readers rebuild for. */
 PIN_THROUGH(moqr_log_append_desc_t, first_object, 88, 64, 80, 8, 4, 8);
 PIN_AFTER(moqr_log_append_desc_t, first_object, subgroup_properties);
 PIN_AT(moqr_log_append_desc_t, subgroup_properties, 88, 68, 80);
-PIN_SIZE(moqr_log_append_desc_t, 96, 72, 88);
-PIN_SIZE(moqr_record_view_t, 104, 84, 96);
+PIN_AFTER(moqr_log_append_desc_t, subgroup_properties, properties_codec);
+PIN_AT(moqr_log_append_desc_t, properties_codec, 96, 76, 88);
+PIN_SIZE(moqr_log_append_desc_t, 104, 80, 96);
+PIN_AT(moqr_record_view_t, properties_codec, 64, 56, 56);
+PIN_SIZE(moqr_record_view_t, 104, 88, 96);
 #endif
 
 /* -- Adapters without a transport SDK in their public header -------------- */

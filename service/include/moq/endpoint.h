@@ -529,7 +529,14 @@ MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
  *     has no established publication, together with an END_OF_TRACK queued
  *     behind that media -- both stay owned by the sender, are neither
  *     delivered nor discarded by this, and go out (media, then END) if a
- *     subscriber arrives. An accepted publication paused at Forward 0
+ *     subscriber arrives. A graceful completion (moq_media_sender_complete)
+ *     waiting on such media, or on a generated timeline's records kept for
+ *     a timeline nobody has subscribed to, is held with them the same way:
+ *     its terminal catalog is owed once they have gone out. A failed
+ *     completion owes no further end and no terminal catalog; output it had
+ *     already accepted and that is still sendable stays owed. A drain
+ *     success is never proof that a broadcast completed. An accepted
+ *     publication paused at Forward 0
  *     still owes its terminal: a drain with it held times out (MOQ_DONE)
  *     rather than reporting success.
  *   - Local flush: each still-required reliable stream byte and FIN has been

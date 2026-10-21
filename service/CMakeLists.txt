@@ -1235,7 +1235,13 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_sender_pacing PRIVATE
                 moq-service-sender-test-internals moq::sim)
             target_include_directories(test_media_sender_pacing PRIVATE
-                ${PROJECT_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+            # The timeline-retry row beside a failed MPEG2TS completion.
+            if(TARGET moq::mpeg2ts)
+                target_compile_definitions(test_media_sender_pacing PRIVATE
+                    MOQ_TEST_HAVE_MPEG2TS)
+            endif()
             if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
                 target_compile_options(test_media_sender_pacing PRIVATE -Wall -Wextra -Wpedantic
                     $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)

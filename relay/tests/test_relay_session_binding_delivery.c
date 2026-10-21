@@ -4326,6 +4326,112 @@ forward_begin_zero_reset(moq_version_t version)
     return rig.failures;
 }
 
+/* Object Properties across drafts. A Key-Value-Pair's Delta Type, Length
+ * and even-type value are integers in the draft's own encoding: draft-16
+ * (i), the QUIC variable-length integer; draft-18 (vi64) (draft-16 1.4.2,
+ * draft-18 1.4.1/1.4.3). Values below 64 encode alike, so a value of 1000 is
+ * used: 0x43E8 on draft-16, 0x83E8 on draft-18. The subscriber receives the
+ * publisher's property -- type 0x10, value 1000 -- in its own draft's
+ * encoding, and the Track stays well-formed. */
+static int
+dataplane_mixed_draft_properties(moq_version_t pub_ver, moq_version_t sub_ver)
+{
+    static const uint8_t d16_props[3] = { 0x10, 0x43, 0xE8 };
+    static const uint8_t d18_props[3] = { 0x10, 0x83, 0xE8 };
+    const uint8_t *sent = pub_ver == MOQ_VERSION_DRAFT_16 ? d16_props : d18_props;
+    const uint8_t *want = sub_ver == MOQ_VERSION_DRAFT_16 ? d16_props : d18_props;
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    rig_t rig;
+    if (relay_bind_test_rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: dataplane_mixed_draft_properties rig create\n");
+        return 1;
+    }
+    conn_t *pub = relay_bind_test_rig_connect(&rig, pub_ver);
+    conn_t *sub = relay_bind_test_rig_connect(&rig, sub_ver);
+    R_CHECK(&rig, pub && sub);
+    relay_bind_test_rig_pump(&rig, 4);
+    moq_bytes_t nsp[2] = { B("live"), B("cam") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    moq_announcement_t ann;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pcfg, rig.now, &ann) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 4);
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
+    scfg.track_name = B("v");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    moq_subscription_t sh;
+    R_CHECK(&rig, moq_session_subscribe(sub->peer, &scfg, rig.now, &sh) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 6);
+    peer_state_t pub_ps, s_ps;
+    memset(&pub_ps, 0, sizeof(pub_ps));
+    memset(&s_ps, 0, sizeof(s_ps));
+    relay_bind_test_peer_drain(&rig, pub, &pub_ps, true, false, 0, 0);
+    R_CHECK(&rig, pub_ps.up_seen);
+    relay_bind_test_rig_pump(&rig, 6);
+    relay_bind_test_peer_drain(&rig, sub, &s_ps, false, false, 0, 0);
+
+    moq_subgroup_cfg_t sgc;
+    moq_subgroup_cfg_init(&sgc);
+    sgc.object_properties = true;
+    moq_subgroup_handle_t sgh;
+    R_CHECK(&rig, moq_session_open_subgroup(pub->peer, pub_ps.up_sub, &sgc, rig.now, &sgh) ==
+                      MOQ_OK);
+    uint8_t body[4] = { 0xA0, 0x0B, 0x1E, 0xC7 };
+    moq_rcbuf_t *pl = NULL, *pr = NULL;
+    R_CHECK(&rig, moq_rcbuf_create(&a.vt, body, sizeof(body), &pl) == MOQ_OK);
+    R_CHECK(&rig, moq_rcbuf_create(&a.vt, sent, 3, &pr) == MOQ_OK);
+    moq_object_cfg_t oc;
+    moq_object_cfg_init(&oc);
+    oc.object_id = 0;
+    oc.payload = pl;
+    oc.properties = pr;
+    R_CHECK(&rig, moq_session_write_object_ex(pub->peer, sgh, &oc, rig.now) == MOQ_OK);
+    moq_rcbuf_decref(pl);
+    moq_rcbuf_decref(pr);
+    R_CHECK(&rig, moq_session_close_subgroup(pub->peer, sgh, rig.now) == MOQ_OK);
+
+    int objects = 0, exact = 0, unsubscribed = 0, done = 0;
+    size_t got_len = 0;
+    uint8_t got[8] = { 0 };
+    for (int k = 0; k < 24; k++) {
+        relay_bind_test_rig_pump(&rig, 1);
+        moq_event_t ev;
+        while (moq_session_poll_events(sub->peer, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                const moq_object_received_event_t *o = &ev.u.object_received;
+                objects++;
+                got_len = o->properties != NULL ? moq_rcbuf_len(o->properties) : 0;
+                if (got_len <= sizeof(got) && got_len != 0)
+                    memcpy(got, moq_rcbuf_data(o->properties), got_len);
+                exact += o->payload != NULL && moq_rcbuf_len(o->payload) == sizeof(body) &&
+                         memcmp(moq_rcbuf_data(o->payload), body, sizeof(body)) == 0 &&
+                         got_len == 3 && memcmp(got, want, 3) == 0;
+            } else if (ev.kind == MOQ_EVENT_UNSUBSCRIBED) {
+                unsubscribed++;
+            } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+                done++;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    printf("mixed_draft_properties pub=%d sub=%d: objects=%d exact=%d props=%zu[%02x %02x %02x] "
+           "unsubscribed=%d done=%d\n", (int)pub_ver, (int)sub_ver, objects, exact, got_len,
+           got[0], got[1], got[2], unsubscribed, done);
+    R_CHECK(&rig, objects == 1 && exact == 1 && unsubscribed == 0 && done == 0);
+    R_CHECK(&rig, moq_session_state(sub->peer) == MOQ_SESS_ESTABLISHED);
+    relay_bind_test_rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (rig.failures == 0) {
+        printf("PASS: dataplane_mixed_draft_properties (pub=%d sub=%d)\n", (int)pub_ver,
+               (int)sub_ver);
+    }
+    return rig.failures;
+}
+
 int
 main(void)
 {
@@ -4393,6 +4499,10 @@ main(void)
                                                              MOQ_VERSION_DRAFT_18, 3);
     failures += relay_bind_test_dataplane_mixed_draft_oracle(MOQ_VERSION_DRAFT_18,
                                                              MOQ_VERSION_DRAFT_16, 3);
+    failures += dataplane_mixed_draft_properties(MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16);
+    failures += dataplane_mixed_draft_properties(MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18);
+    failures += dataplane_mixed_draft_properties(MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_18);
+    failures += dataplane_mixed_draft_properties(MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_16);
     failures += chunk_ingest_flow();   /* chunked COMPLETE delivery + abandon-skip */
     failures += chunk_delivery_backpressure();   /* WOULD_BLOCK resume */
     failures += chunk_liveedge_case(false);   /* live edge + clean complete */

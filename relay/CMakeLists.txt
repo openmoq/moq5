@@ -2,7 +2,8 @@
 set(MOQ_RELAY_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(MOQR_CORE_SOURCES
     src/core/wire_codes.c src/core/capacity.c src/core/log.c
-    src/core/relay.c src/core/trace.c src/core/types.c src/core/stats.c)
+    src/core/relay.c src/core/trace.c src/core/types.c src/core/stats.c
+    src/core/props_codec.c)
 add_library(moq-relay-core ${MOQR_CORE_SOURCES})
 add_library(moq::relay-core ALIAS moq-relay-core)
 target_link_libraries(moq-relay-core PUBLIC moq::core)

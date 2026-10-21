@@ -306,7 +306,10 @@ typedef uint32_t moq_media_player_discontinuity_t;
 typedef uint32_t moq_media_player_end_cause_t;
 #define MOQ_MEDIA_PLAYER_END_PEER_END_OF_TRACK 1u /* its END_OF_TRACK */
 #define MOQ_MEDIA_PLAYER_END_PEER_DONE         2u /* delivery ended, no END_OF_TRACK */
-#define MOQ_MEDIA_PLAYER_END_REMOVED           3u /* left the catalog */
+#define MOQ_MEDIA_PLAYER_END_REMOVED           3u /* withdrawn from the catalog;
+                                                  * not a completed broadcast's
+                                                  * removal of a track the peer
+                                                  * had already ended */
 #define MOQ_MEDIA_PLAYER_END_LOCAL_FAILURE     4u /* receiver-local failure */
 #define MOQ_MEDIA_PLAYER_END_CLOSED            5u /* the receiver closed */
 #define MOQ_MEDIA_PLAYER_END_FATAL             6u /* the receiver failed */

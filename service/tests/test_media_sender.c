@@ -3145,12 +3145,15 @@ int main(int argc, char **argv)
                 if (!finished) usleep(10000);
             }
             pthread_mutex_lock(&g_srv.mu);
+            /* A publication ends on its data plane first: its END_OF_TRACK
+             * on a stream of its own, then PUBLISH_DONE, whose Stream Count
+             * includes that stream (three media streams and the end's). */
             MOQ_TEST_CHECK_EQ_INT(g_srv.pv_objs, 12);
-            MOQ_TEST_CHECK_EQ_INT(g_srv.pv_eot, 0);
+            MOQ_TEST_CHECK_EQ_INT(g_srv.pv_eot, 1);
             MOQ_TEST_CHECK_EQ_INT(g_srv.pv_finished, 1);
             MOQ_TEST_CHECK_EQ_INT(g_srv.pv_fin_cause, 0);
             MOQ_TEST_CHECK_EQ_U64(g_srv.pv_fin_status, 0x2);
-            MOQ_TEST_CHECK_EQ_U64(g_srv.pv_fin_streams, 3);
+            MOQ_TEST_CHECK_EQ_U64(g_srv.pv_fin_streams, 4);
             pthread_mutex_unlock(&g_srv.mu);
             MOQ_TEST_CHECK_EQ_INT((int)atomic_load(&g_srv.session_version),
                                   d18 ? (int)MOQ_VERSION_DRAFT_18 : (int)MOQ_VERSION_DRAFT_16);

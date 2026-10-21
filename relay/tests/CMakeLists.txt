@@ -22,7 +22,8 @@ add_library(moq-relay-core-test-internals STATIC
     ${MOQR_TEST_CORE_DIR}/relay.c
     ${MOQR_TEST_CORE_DIR}/trace.c
     ${MOQR_TEST_CORE_DIR}/types.c
-    ${MOQR_TEST_CORE_DIR}/stats.c)
+    ${MOQR_TEST_CORE_DIR}/stats.c
+    ${MOQR_TEST_CORE_DIR}/props_codec.c)
 target_compile_definitions(moq-relay-core-test-internals PRIVATE
     MOQR_CORE_TESTING MOQ_RELAY_CORE_STATIC)
 target_include_directories(moq-relay-core-test-internals PUBLIC
@@ -43,6 +44,12 @@ target_link_libraries(test_relay_control PRIVATE
     moq-relay-core-test-internals)
 target_compile_definitions(test_relay_control PRIVATE MOQR_CORE_TESTING)
 moqr_test_warnings(test_relay_control)
+
+add_executable(test_relay_props_codec test_relay_props_codec.c)
+target_link_libraries(test_relay_props_codec PRIVATE moq::relay-core)
+target_include_directories(test_relay_props_codec PRIVATE ${MOQR_TEST_CORE_DIR})
+moqr_test_warnings(test_relay_props_codec)
+add_test(NAME relay_props_codec COMMAND test_relay_props_codec)
 
 # White-box core and binding tests compile the production source into their
 # own translation units; no production target exposes these internals.
@@ -200,6 +207,15 @@ if(TARGET moq::sim)
         add_test(NAME ${_test} COMMAND ${_exe})
         set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
     endforeach()
+    # Object Properties across drafts, by delivery family (same rig).
+    add_executable(test_relay_props_delivery test_relay_props_delivery.c
+        $<TARGET_OBJECTS:moq-relay-session-binding-harness>
+        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+    target_compile_definitions(test_relay_props_delivery PRIVATE MOQR_BIND_TESTING)
+    target_link_libraries(test_relay_props_delivery PRIVATE moq::sim moq-relay-policy)
+    moqr_test_warnings(test_relay_props_delivery)
+    add_test(NAME relay_props_delivery COMMAND test_relay_props_delivery)
+    set_tests_properties(relay_props_delivery PROPERTIES TIMEOUT 120 LABELS "relay;sansio")
     add_test(NAME relay_metadata_lifetime
         COMMAND test_relay_session_binding_metadata --metadata-lifetime)
     add_test(NAME relay_direct_core_publisher
@@ -222,13 +238,41 @@ if(TARGET moq::sim)
             absent-source source-error source-reset total-deadline
             cancel-reuse capacity-recovery descending cancel-cached
             coalesce-oom coalesce-control legacy descending-groups
-            evicted-range abort-blocked d18-origin source-lost expired-zero
+            evicted-range abort-blocked d18-origin d16-origin d18-descending-wire
+            d18-descending-wire-d18-origin source-lost expired-zero
             expired-budget)
         string(REPLACE "-" "_" _row "${row}")
         add_test(NAME relay_standalone_fetch_${_row}
             COMMAND test_relay_standalone_fetch ${row})
         set_tests_properties(relay_standalone_fetch_${_row} PROPERTIES
             TIMEOUT 60 LABELS "relay;sansio;d22")
+    endforeach()
+    # A draft-18 origin and subscriber: the relay's own upstream FETCH is a
+    # draft-18 one, descending included.
+    foreach(row IN ITEMS publish-gap descending total-deadline source-error)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_standalone_fetch_d18x_${_row}
+            COMMAND test_relay_standalone_fetch d18x:${row})
+        set_tests_properties(relay_standalone_fetch_d18x_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio")
+    endforeach()
+    # The same retrieval rows for draft-16 and draft-18 FETCH subscribers.
+    # A draft-18 session does not originate a descending FETCH (its local
+    # policy), so that row runs for draft-16 only.
+    foreach(draft IN ITEMS d16 d18)
+        set(_rows publish-gap pull-gap cached-only absent-source source-error
+            source-reset total-deadline cancel-reuse capacity-recovery
+            cancel-cached abort-blocked)
+        if(draft STREQUAL "d16")
+            list(APPEND _rows descending)
+        endif()
+        foreach(row IN LISTS _rows)
+            string(REPLACE "-" "_" _row "${row}")
+            add_test(NAME relay_standalone_fetch_${draft}_${_row}
+                COMMAND test_relay_standalone_fetch ${draft}:${row})
+            set_tests_properties(relay_standalone_fetch_${draft}_${_row} PROPERTIES
+                TIMEOUT 60 LABELS "relay;sansio")
+        endforeach()
     endforeach()
 
     add_executable(test_relay_unfiltered test_relay_unfiltered.c
@@ -279,12 +323,47 @@ if(TARGET moq::sim)
         moq::relay moq::sim)
     moqr_test_warnings(test_relay_standalone_fetch_shard)
     foreach(row IN ITEMS cross-gap cross-cache cross-cancel cross-absent
-            cross-descending cross-capacity)
+            cross-descending cross-capacity cross-capacity-requester
+            cross-capacity-owner-rows)
         string(REPLACE "-" "_" _row "${row}")
         add_test(NAME relay_standalone_fetch_shard_${_row}
             COMMAND test_relay_standalone_fetch_shard ${row})
         set_tests_properties(relay_standalone_fetch_shard_${_row} PROPERTIES
             TIMEOUT 60 LABELS "relay;sansio;d22")
+    endforeach()
+
+    # Cross-shard standalone FETCH Track Properties, which reach the
+    # binding's private metadata calls: built from the bind and shard test
+    # objects, as the CLI's cross-shard composition tests are.
+    if(TARGET moq-relay-bind-test-internals AND TARGET moq-relay-shard-test-internals)
+        add_executable(test_relay_props_shard test_relay_props_shard.c
+            $<TARGET_OBJECTS:moq-relay-bind-test-internals>
+            $<TARGET_OBJECTS:moq-relay-shard-test-internals>)
+        target_compile_definitions(test_relay_props_shard PRIVATE MOQR_BIND_TESTING)
+        target_link_libraries(test_relay_props_shard PRIVATE moq::relay moq::sim)
+        moqr_test_warnings(test_relay_props_shard)
+        # plainNN-*: property-less controls, a draft-NN fetcher on the owner
+        # shard (local) or the other one (cross).
+        foreach(row IN ITEMS same convert to16 to18 immutable oom parked cancel ceiling
+                plain16-local plain16-cross plain18-local plain18-cross plain22-cross)
+            string(REPLACE "-" "_" _row "${row}")
+            add_test(NAME relay_props_shard_${_row}
+                COMMAND test_relay_props_shard ${row})
+            set_tests_properties(relay_props_shard_${_row} PROPERTIES
+                TIMEOUT 60 LABELS "relay;sansio")
+        endforeach()
+    endif()
+
+    add_executable(test_relay_join_shard test_relay_join_shard.c)
+    target_link_libraries(test_relay_join_shard PRIVATE moq-relay-inspect moq::sim)
+    moqr_test_warnings(test_relay_join_shard)
+    foreach(row IN ITEMS cached hole saved-largest cancel publish-queued
+            replaced-while-queued)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_join_shard_${_row}
+            COMMAND test_relay_join_shard ${row})
+        set_tests_properties(relay_join_shard_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio")
     endforeach()
 
     add_executable(test_relay_shard_fill test_relay_shard_fill.c)
@@ -293,6 +372,9 @@ if(TARGET moq::sim)
     moqr_test_warnings(test_relay_shard_fill)
     add_test(NAME relay_shard_fill COMMAND test_relay_shard_fill)
     set_tests_properties(relay_shard_fill PROPERTIES TIMEOUT 60)
+    add_test(NAME relay_shard_fill_mixed_draft
+        COMMAND test_relay_shard_fill --mixed-draft)
+    set_tests_properties(relay_shard_fill_mixed_draft PROPERTIES TIMEOUT 60)
 
 endif()
 
