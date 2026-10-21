@@ -12,9 +12,21 @@
  * reports a missing observation and fails, rather than passing on what it
  * cannot see.
  */
+#if defined(MOQ_FAKE_MSQ_POSIX_GUARDS) && defined(__linux__) && \
+    !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef MOQ_FAKE_MSQ_POSIX_GUARDS
+#include <errno.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "support/fake_msq_table.h"
 
@@ -173,14 +185,244 @@ done:
         printf("PASS: overflow_is_observable\n");
 }
 
-int main(void)
+static void t_counting_allocator(void)
+{
+    int before = failures;
+    fake_msq_count_alloc_t counted;
+    fake_msq_count_alloc_init(&counted);
+    const moq_alloc_t *a = &counted.api;
+    CHECK(atomic_load(&counted.live_bytes) == 0);
+    void *empty = a->realloc(NULL, 0, 0, a->ctx);
+    CHECK(empty == NULL);
+    a->free(empty, 0, a->ctx);
+    CHECK(atomic_load(&counted.live_bytes) == 0);
+
+    size_t size = 16;
+    unsigned char *p = a->alloc(size, a->ctx);
+    CHECK(p != NULL);
+    if (p == NULL) goto done;
+    memset(p, 0x51, size);
+    CHECK(atomic_load(&counted.live_bytes) == 16);
+
+    unsigned char *q = a->realloc(p, size, 64, a->ctx);
+    CHECK(q != NULL);
+    if (q == NULL) goto done;
+    p = q;
+    size = 64;
+    CHECK(atomic_load(&counted.live_bytes) == 64);
+    for (size_t i = 0; i < 16; ++i) CHECK(p[i] == 0x51);
+
+    q = a->realloc(p, size, 8, a->ctx);
+    CHECK(q != NULL);
+    if (q == NULL) goto done;
+    p = q;
+    size = 8;
+    CHECK(atomic_load(&counted.live_bytes) == 8);
+    for (size_t i = 0; i < size; ++i) CHECK(p[i] == 0x51);
+
+    p = a->realloc(p, size, 0, a->ctx);
+    size = 0;
+    CHECK(p == NULL);
+    CHECK(atomic_load(&counted.live_bytes) == 0);
+    a->free(p, size, a->ctx);
+    p = NULL;
+
+    size = 24;
+    p = a->realloc(NULL, 0, size, a->ctx);
+    CHECK(p != NULL);
+    if (p == NULL) goto done;
+    CHECK(atomic_load(&counted.live_bytes) == 24);
+
+done:
+    a->free(p, size, a->ctx);
+    CHECK(atomic_load(&counted.live_bytes) == 0);
+    if (failures == before)
+        printf("PASS: counting_allocator (alloc, grow, shrink, zero-release)\n");
+}
+
+#ifdef MOQ_FAKE_MSQ_POSIX_GUARDS
+enum guard_case {
+    FINAL_PENDING_SEND, CLOSE_PENDING_DGRAM, FINAL_BAD_COUNTS,
+    STREAM_CLOSE_PENDING, SEND_AFTER_FINAL, SEND_AFTER_CLOSE,
+    SEND_AFTER_STREAM_CLOSE, DGRAM_AFTER_FINAL, DGRAM_AFTER_CLOSE,
+    CANCEL_CLOSED_STREAM, CLOSE_AFTER_FINAL_PENDING
+};
+
+static QUIC_STATUS QUIC_API forbidden_callback(HQUIC stream, void *ctx,
+                                               QUIC_STREAM_EVENT *ev)
+{
+    (void)stream; (void)ctx; (void)ev;
+    _exit(92); /* A removed guard must fail before touching a stale context. */
+}
+
+static void exercise_guard(enum guard_case which)
+{
+    fake_msq_stream_t *st = open_stream();
+    uint8_t byte = 0x51;
+    QUIC_BUFFER buf = { .Length = 1, .Buffer = &byte };
+    const QUIC_API_TABLE *api = fake_msq_table(&g_fake);
+    bool dgram = which == CLOSE_PENDING_DGRAM || which == DGRAM_AFTER_FINAL ||
+                 which == DGRAM_AFTER_CLOSE;
+    if (st == NULL)
+        _exit(91);
+    st->cb = forbidden_callback;
+    QUIC_STATUS status = dgram
+        ? api->DatagramSend(fake_msq_conn_handle(&g_fake), &buf, 1,
+                            QUIC_SEND_FLAG_NONE, st)
+        : api->StreamSend((HQUIC)st, &buf, 1, QUIC_SEND_FLAG_NONE, st);
+    if (status != QUIC_STATUS_SUCCESS)
+        _exit(91);
+
+    /* Deliberately corrupt only the lifecycle fact each guard must reject. */
+    switch (which) {
+    case FINAL_PENDING_SEND:
+        fake_msq_mark_shutdown_complete(&g_fake);
+        break;
+    case CLOSE_PENDING_DGRAM:
+        fake_msq_mark_connection_closed(&g_fake);
+        break;
+    case FINAL_BAD_COUNTS:
+        g_fake.sends[0].completed = true;
+        fake_msq_mark_shutdown_complete(&g_fake);
+        break;
+    case STREAM_CLOSE_PENDING:
+        api->StreamClose((HQUIC)st);
+        break;
+    case SEND_AFTER_FINAL:
+    case SEND_AFTER_CLOSE:
+        g_fake.shutdown_complete = which == SEND_AFTER_FINAL;
+        g_fake.connection_closed = which == SEND_AFTER_CLOSE;
+        (void)fake_msq_deliver_send_complete(&g_fake, true);
+        break;
+    case SEND_AFTER_STREAM_CLOSE:
+        st->closed = true;
+        (void)fake_msq_deliver_send_complete(&g_fake, true);
+        break;
+    case DGRAM_AFTER_FINAL:
+    case DGRAM_AFTER_CLOSE:
+        g_fake.shutdown_complete = which == DGRAM_AFTER_FINAL;
+        g_fake.connection_closed = which == DGRAM_AFTER_CLOSE;
+        (void)fake_msq_next_dgram_ctx(&g_fake);
+        break;
+    case CANCEL_CLOSED_STREAM:
+        st->closed = true;
+        fake_msq_cancel_stream(st);
+        break;
+    case CLOSE_AFTER_FINAL_PENDING:
+        g_fake.shutdown_complete = true;
+        api->ConnectionClose(fake_msq_conn_handle(&g_fake));
+        break;
+    }
+    _exit(90); /* Returning, a signal other than ABRT, or a callback is failure. */
+}
+
+static void t_terminal_guards(void)
+{
+    static const struct {
+        enum guard_case which;
+        const char *name;
+        const char *condition;
+    } rows[] = {
+        { FINAL_PENDING_SEND, "final-pending-send",
+          "fake_msq_pending_sends(f) == 0 && fake_msq_pending_dgrams(f) == 0" },
+        { CLOSE_PENDING_DGRAM, "close-pending-dgram",
+          "fake_msq_pending_sends(f) == 0 && fake_msq_pending_dgrams(f) == 0" },
+        { FINAL_BAD_COUNTS, "final-bad-counts",
+          "f->send_completions == (unsigned)f->send_count && f->dgram_completions == (unsigned)f->dgram_count" },
+        { STREAM_CLOSE_PENDING, "stream-close-pending",
+          "st->owner->sends[i].stream != st || st->owner->sends[i].completed" },
+        { SEND_AFTER_FINAL, "send-after-final",
+          "!f->shutdown_complete && !f->connection_closed" },
+        { SEND_AFTER_CLOSE, "send-after-close",
+          "!f->shutdown_complete && !f->connection_closed" },
+        { SEND_AFTER_STREAM_CLOSE, "send-after-stream-close",
+          "!s->stream->closed && s->stream->cb != NULL" },
+        { DGRAM_AFTER_FINAL, "dgram-after-final",
+          "!f->shutdown_complete && !f->connection_closed" },
+        { DGRAM_AFTER_CLOSE, "dgram-after-close",
+          "!f->shutdown_complete && !f->connection_closed" },
+        { CANCEL_CLOSED_STREAM, "cancel-closed-stream",
+          "!st->closed && st->cb != NULL" },
+        { CLOSE_AFTER_FINAL_PENDING, "close-after-final-pending",
+          "fake_msq_pending_sends(f) == 0 && fake_msq_pending_dgrams(f) == 0" },
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        int before = failures;
+        FILE *log = tmpfile();
+        CHECK(log != NULL);
+        if (log == NULL)
+            return;
+        fflush(stdout);
+        pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct rlimit no_core = { .rlim_cur = 0, .rlim_max = 0 };
+            if (dup2(fileno(log), STDERR_FILENO) < 0 ||
+                setrlimit(RLIMIT_CORE, &no_core) != 0)
+                _exit(91);
+            alarm(2); /* Hang guard only; elapsed time never means success. */
+            exercise_guard(rows[i].which);
+        }
+        if (pid < 0) {
+            fclose(log);
+            return;
+        }
+        int status = 0;
+        pid_t reaped;
+        do {
+            reaped = waitpid(pid, &status, 0);
+        } while (reaped < 0 && errno == EINTR);
+        CHECK(reaped == pid);
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+        rewind(log);
+        char output[1024];
+        size_t n = fread(output, 1, sizeof(output) - 1, log);
+        output[n] = '\0';
+        CHECK(fgetc(log) == EOF && !ferror(log));
+        const char *detail = strstr(output, ": requirement failed: ");
+        CHECK(strncmp(output, "fake_msq_table: ", 16) == 0);
+        CHECK(strstr(output, "fake_msq_table.c:") != NULL);
+        CHECK(detail != NULL);
+        if (detail != NULL) {
+            detail += strlen(": requirement failed: ");
+            size_t len = strlen(rows[i].condition);
+            CHECK(strncmp(detail, rows[i].condition, len) == 0 &&
+                  strcmp(detail + len, "\n") == 0);
+        }
+        fclose(log);
+        if (failures == before)
+            printf("PASS: terminal_guard[%s]\n", rows[i].name);
+        else
+            fprintf(stderr, "guard[%s] unexpected output: %s\n",
+                    rows[i].name, output);
+    }
+}
+
+#endif
+
+int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    t_ordered_history_is_retained();
-    t_overflow_is_observable();
+    const char *name = "fake_msq_history";
+    if (argc == 1) {
+        t_ordered_history_is_retained();
+        t_overflow_is_observable();
+        t_counting_allocator();
+    } else if (argc == 2 && strcmp(argv[1], "--terminal-guards") == 0) {
+#ifdef MOQ_FAKE_MSQ_POSIX_GUARDS
+        name = "fake_msq_history_terminal_guards";
+        t_terminal_guards();
+#else
+        fprintf(stderr, "FAIL: terminal guards unavailable on this platform\n");
+        return 1;
+#endif
+    } else {
+        fprintf(stderr, "FAIL: fake_msq_history: unsupported arguments\n");
+        return 1;
+    }
     if (failures == 0)
-        printf("PASS: fake_msq_history\n");
+        printf("PASS: %s\n", name);
     else
-        fprintf(stderr, "FAIL: fake_msq_history (%d)\n", failures);
+        fprintf(stderr, "FAIL: %s (%d)\n", name, failures);
     return failures != 0;
 }

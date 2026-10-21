@@ -3051,7 +3051,8 @@ static void test_env_cfg_forwarding(void)
 /* --- create-unwind OOM: facade allocations + real env_open --------------- */
 /* The fake connect (installed globally) allocates nothing, so injected OOM
  * exercises the facade's own allocations and the real env_open — never
- * wtquic's connect internals (not OOM-hardened at the pinned revision). */
+ * wtquic's connect internals, whose OOM coverage belongs in wtquic's own
+ * suite and is not yet there at the pinned revision. */
 static void test_create_unwind(void)
 {
     bool saw_success = false;

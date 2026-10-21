@@ -299,6 +299,7 @@ static fake_msq_t g_table_fake;
 static fake_msq_t g_conn_fake[MAX_CONNS];
 
 struct rig {
+    fake_msq_count_alloc_t alloc;
     moq_msquic_managed_t *m;
     moq_msquic_managed_lane_t *lane[MAX_LANES];
     uint32_t lane_count;
@@ -316,11 +317,12 @@ static bool rig_up_chooser(struct rig *r, uint32_t lane_count,
     moq_msquic_managed_cfg_t cfg;
 
     memset(r, 0, sizeof(*r));
+    fake_msq_count_alloc_init(&r->alloc);
     fake_msq_init(&g_table_fake, false);
     for (int i = 0; i < MAX_CONNS; i++)
         fake_msq_init(&g_conn_fake[i], false);
     moq_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
-    cfg.alloc = moq_alloc_default();
+    cfg.alloc = &r->alloc.api;
     cfg.perspective = MOQ_PERSPECTIVE_SERVER;
     cfg.max_connections = max_conns;
     cfg.lane_count = lane_count;
@@ -397,11 +399,20 @@ static void deliver_shutdown_complete(struct rig *r, int slot)
 
     memset(&ev, 0, sizeof(ev));
     ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE;
-    if (r->adapter[slot] != NULL)
+    if (r->adapter[slot] != NULL) {
+        fake_msq_cancel_pending(&g_conn_fake[slot], moq_msquic_conn_callback(),
+                                r->adapter[slot]);
+        fake_msq_mark_shutdown_complete(&g_conn_fake[slot]);
         (void)moq_msquic_conn_callback()(
             fake_msq_conn_handle(&g_conn_fake[slot]), r->adapter[slot], &ev);
-    else if (fake_msq_conn_cb_installed(&g_conn_fake[slot]))
+    } else if (fake_msq_conn_cb_installed(&g_conn_fake[slot])) {
+        fake_msq_cancel_pending(&g_conn_fake[slot], g_conn_fake[slot].conn_cb,
+                                g_conn_fake[slot].conn_ctx);
+        fake_msq_mark_shutdown_complete(&g_conn_fake[slot]);
         (void)fake_msq_deliver_conn_event(&g_conn_fake[slot], &ev);
+    }
+    CHECK(fake_msq_pending_sends(&g_conn_fake[slot]) == 0);
+    CHECK(fake_msq_pending_dgrams(&g_conn_fake[slot]) == 0);
     r->live[slot] = false;
 }
 
@@ -418,6 +429,7 @@ static void rig_down(struct rig *r)
     (void)moq_msquic_managed_stop(r->m);
     moq_msquic_managed_destroy(r->m);
     r->m = NULL;
+    CHECK(atomic_load(&r->alloc.live_bytes) == 0);
 }
 
 /* Every operation the shared fake records for a connection identity that
@@ -580,6 +592,7 @@ static void t_stop_is_idempotent(void)
 
     moq_msquic_managed_destroy(r.m);
     r.m = NULL;
+    CHECK(atomic_load(&r.alloc.live_bytes) == 0);
     if (failures == before)
         printf("PASS: stop_is_idempotent\n");
 }
@@ -717,6 +730,7 @@ static void t_pending_counters_sum_across_lanes(void)
 
     moq_msquic_managed_destroy(r.m);
     r.m = NULL;
+    CHECK(atomic_load(&r.alloc.live_bytes) == 0);
     rig_down(&r);
     CHECK(r.m == NULL);
     if (failures == before)

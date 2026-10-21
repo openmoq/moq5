@@ -64,8 +64,8 @@ backend token yet. A future CLI would spell them in lowercase (e.g. `msquic`,
 `wtquic-network`, `wtquic-msquic`) and must never accept bare `wtquic`, which
 identifies no upstream transport.
 
-`wtq_nw_*` and `wtq::network` are **upstream wtquic** names (Network.framework
-backend); libmoq does not rename them.
+`wtq_nw_*` and `wtq::network` are wtquic's own names (Network.framework
+backend); libmoq uses them as is.
 
 ## Building
 
@@ -309,13 +309,17 @@ WebTransport path across 1200 B, 8 KiB and 64 KiB object sizes.
   bridge creation. The qualified MsQuic provider uses effective peer stream
   limits of eight uni and seven bidi, a 65535-byte callback quantum, and
   FLOW_CONTROLLED receive pause. Old/accounted-only providers are unsupported.
-- The fixed engine pool permits twelve concurrent WT streams on a client and
-  six on a server, counting local and peer streams together. Other entries
-  preserve critical streams and complete request parser state. Additional WT
-  streams wait without a capacity-induced abort. Sixteen API/adapter records
-  are a separate limit: terminal input debt retains its stream lease until the
-  record retires. Native peer stream credit follows safe lease retirement,
-  not FIN alone. These limits do not bound all native or OS memory.
+- **Open wtquic defect, being corrected in wtquic:** the fixed engine pool
+  admits twelve concurrent WT streams on a client and six on a server,
+  counting local and peer streams together. A further WT stream waits for an
+  entry instead of being admitted. A draft-18 peer carries each request on its
+  own long-lived stream, so a publisher with a few tracks fills a server
+  session and its media streams wait until requests close. The remaining
+  entries preserve critical streams and request parser state. Sixteen
+  API/adapter records are a separate bound: terminal input debt retains its
+  stream lease until the record retires. Native peer stream credit follows
+  safe lease retirement, not FIN alone. These bounds do not bound all native
+  or OS memory.
 - Adapter service invokes bounded provider admission only after bridge,
   endpoint, replay and resume calls return. Attach callers must keep servicing
   under their serialized lane, including when there are no incoming packets.

@@ -92,4 +92,15 @@ expect child_no_fusion "$(pc_selected "$work/child-ok.txt" PTLS_FUSION_LIBRARY "
 printf '%s\n' 'PTLS_FUSION_LIBRARY:FILEPATH=/checkout/picotls/build/libpicotls-fusion.a' > "$work/child-fusion.txt"
 expect child_found_foreign_fusion "$(pc_selected "$work/child-fusion.txt" PTLS_FUSION_LIBRARY "" && echo yes || echo no)" no
 
+# A combined service SDK also needs the parent's installed WT package. The
+# comparison preserves spaces and refuses a different ambient package.
+printf '%s\n' 'wtquic_DIR:PATH=/selected sdk/lib/cmake/wtquic' > "$work/wt-selected.txt"
+printf '%s\n' 'wtquic_DIR:PATH=/ambient/lib/cmake/wtquic' > "$work/wt-foreign.txt"
+expect child_wt_selected \
+    "$(pc_selected "$work/wt-selected.txt" wtquic_DIR '/selected sdk/lib/cmake/wtquic' && echo yes || echo no)" yes
+expect child_wt_foreign \
+    "$(pc_selected "$work/wt-foreign.txt" wtquic_DIR '/selected sdk/lib/cmake/wtquic' && echo yes || echo no)" no
+expect child_wt_absent \
+    "$(pc_selected "$work/child-ok.txt" wtquic_DIR '/selected sdk/lib/cmake/wtquic' && echo yes || echo no)" no
+
 if [ "$fails" -eq 0 ]; then echo "PASS: player consumer lib"; else echo "FAIL: $fails"; exit 1; fi

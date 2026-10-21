@@ -152,7 +152,11 @@ static QUIC_STATUS QUIC_API f_stream_shutdown(
 
 static void QUIC_API f_stream_close(HQUIC h)
 {
-    stream_of(h)->closed = true;
+    fake_msq_stream_t *st = stream_of(h);
+    for (int i = 0; i < st->owner->send_count; i++)
+        FAKE_MSQ_REQUIRE(st->owner->sends[i].stream != st ||
+                         st->owner->sends[i].completed);
+    st->closed = true;
 }
 
 static QUIC_STATUS QUIC_API f_stream_receive_set_enabled(HQUIC h,
@@ -217,6 +221,9 @@ static void QUIC_API f_conn_close(HQUIC conn)
 {
     fake_msq_t *f = (fake_msq_t *)conn;
 
+    if (!f->shutdown_complete)
+        fake_msq_cancel_pending(f, f->conn_cb, f->conn_ctx);
+    fake_msq_mark_connection_closed(f);
     atomic_fetch_add(&f->conn_closes, 1);
 }
 
@@ -340,6 +347,10 @@ QUIC_STATUS fake_msq_deliver_conn_event(fake_msq_t *f,
                                         QUIC_CONNECTION_EVENT *ev)
 {
     FAKE_MSQ_REQUIRE(f->conn_cb != NULL);
+    if (ev->Type == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) {
+        fake_msq_cancel_pending(f, f->conn_cb, f->conn_ctx);
+        fake_msq_mark_shutdown_complete(f);
+    }
     return f->conn_cb(fake_msq_conn_handle(f), f->conn_ctx, ev);
 }
 
@@ -386,7 +397,11 @@ bool fake_msq_deliver_send_complete(fake_msq_t *f, bool canceled)
 
         if (s->completed)
             continue;
+        FAKE_MSQ_REQUIRE(!f->shutdown_complete && !f->connection_closed);
+        FAKE_MSQ_REQUIRE(!s->stream->closed && s->stream->cb != NULL);
         s->completed = true;
+        f->send_completions++;
+        if (canceled) f->send_cancellations++;
         QUIC_STREAM_EVENT ev;
         memset(&ev, 0, sizeof(ev));
         ev.Type = QUIC_STREAM_EVENT_SEND_COMPLETE;
@@ -524,7 +539,9 @@ void *fake_msq_next_dgram_ctx(fake_msq_t *f)
 {
     for (int i = 0; i < f->dgram_count; i++)
         if (!f->dgrams[i].completed) {
+            FAKE_MSQ_REQUIRE(!f->shutdown_complete && !f->connection_closed);
             f->dgrams[i].completed = true;
+            f->dgram_completions++;
             return f->dgrams[i].client_ctx;
         }
     return NULL;
@@ -538,4 +555,113 @@ int fake_msq_pending_dgrams(fake_msq_t *f)
         if (!f->dgrams[i].completed)
             n++;
     return n;
+}
+
+void fake_msq_cancel_stream(fake_msq_stream_t *st)
+{
+    fake_msq_t *f = st->owner;
+    /* Re-scan the live count: a completion can enqueue another send. */
+    for (int i = 0; i < f->send_count; i++) {
+        fake_msq_send_t *s = &f->sends[i];
+        if (s->completed || s->stream != st) continue;
+        FAKE_MSQ_REQUIRE(!f->shutdown_complete && !f->connection_closed);
+        FAKE_MSQ_REQUIRE(!st->closed && st->cb != NULL);
+        s->completed = true;
+        f->send_completions++;
+        f->send_cancellations++;
+        QUIC_STREAM_EVENT ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.Type = QUIC_STREAM_EVENT_SEND_COMPLETE;
+        ev.SEND_COMPLETE.Canceled = TRUE;
+        ev.SEND_COMPLETE.ClientContext = s->client_ctx;
+        st->cb((HQUIC)st, st->ctx, &ev);
+    }
+}
+
+void fake_msq_cancel_pending(fake_msq_t *f,
+                              QUIC_CONNECTION_CALLBACK_HANDLER cb, void *ctx)
+{
+    /* The fixed history caps bound the number of accepted operations even
+     * when a completion callback queues work of the other kind. */
+    for (unsigned turn = 0;
+         turn <= FAKE_MSQ_MAX_SENDS + FAKE_MSQ_MAX_DGRAMS; turn++) {
+        if (fake_msq_deliver_send_complete(f, true)) continue;
+        if (fake_msq_pending_dgrams(f) != 0) {
+            void *client_ctx = fake_msq_next_dgram_ctx(f);
+            FAKE_MSQ_REQUIRE(cb != NULL);
+            f->dgram_cancellations++;
+            QUIC_CONNECTION_EVENT ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.Type = QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED;
+            ev.DATAGRAM_SEND_STATE_CHANGED.State = QUIC_DATAGRAM_SEND_CANCELED;
+            ev.DATAGRAM_SEND_STATE_CHANGED.ClientContext = client_ctx;
+            cb(fake_msq_conn_handle(f), ctx, &ev);
+            continue;
+        }
+        FAKE_MSQ_REQUIRE(fake_msq_pending_sends(f) == 0 &&
+                         fake_msq_pending_dgrams(f) == 0);
+        return;
+    }
+    FAKE_MSQ_REQUIRE(0 && "teardown did not reach quiescence");
+}
+
+static void require_settled(fake_msq_t *f)
+{
+    FAKE_MSQ_REQUIRE(fake_msq_pending_sends(f) == 0 &&
+                     fake_msq_pending_dgrams(f) == 0);
+    FAKE_MSQ_REQUIRE(f->send_completions == (unsigned)f->send_count &&
+                     f->dgram_completions == (unsigned)f->dgram_count);
+}
+
+void fake_msq_mark_shutdown_complete(fake_msq_t *f)
+{
+    require_settled(f);
+    f->shutdown_complete = true;
+}
+
+void fake_msq_mark_connection_closed(fake_msq_t *f)
+{
+    require_settled(f);
+    f->connection_closed = true;
+}
+
+static void *count_alloc(size_t n, void *ctx)
+{
+    fake_msq_count_alloc_t *a = ctx;
+    void *p = malloc(n);
+    if (p != NULL) atomic_fetch_add(&a->live_bytes, n);
+    return p;
+}
+
+static void count_free(void *p, size_t n, void *ctx)
+{
+    fake_msq_count_alloc_t *a = ctx;
+    if (p != NULL) {
+        size_t old = atomic_fetch_sub(&a->live_bytes, n);
+        FAKE_MSQ_REQUIRE(old >= n);
+    }
+    free(p);
+}
+
+static void *count_realloc(void *p, size_t old_n, size_t new_n, void *ctx)
+{
+    if (new_n == 0) {
+        count_free(p, old_n, ctx);
+        return NULL;
+    }
+    fake_msq_count_alloc_t *a = ctx;
+    if (p == NULL) old_n = 0;
+    void *q = realloc(p, new_n);
+    if (q != NULL) {
+        atomic_fetch_sub(&a->live_bytes, old_n);
+        atomic_fetch_add(&a->live_bytes, new_n);
+    }
+    return q;
+}
+
+void fake_msq_count_alloc_init(fake_msq_count_alloc_t *a)
+{
+    atomic_init(&a->live_bytes, 0);
+    a->api = (moq_alloc_t){ .ctx = a, .alloc = count_alloc,
+                           .realloc = count_realloc, .free = count_free };
 }

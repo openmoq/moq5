@@ -44,6 +44,94 @@ loader_artifact_is_shared("/p/lib/libx.1.dylib" _v)
 expect("versioned Darwin shared library is a runtime image" "${_v}" "1")
 loader_artifact_is_shared("/p/lib/libx.so" _v)
 expect("Linux shared library is a runtime image" "${_v}" "1")
+
+# A consumer can report the libraries actually mapped in its own process,
+# without enabling loader debug output during sanitizer initialization.
+set(_image_list "MOQ_LOADED_IMAGE\t/p/lib/libmoq-core.so\nMOQ_LOADED_IMAGE\t/q/error directory/libmsquic.so")
+loader_only_image_records("${_image_list}" ImageList _why)
+expect_empty("direct image report accepted" "${_why}")
+loader_parse_images("${_image_list}" ImageList _reported)
+expect("direct image report paths preserved" "${_reported}"
+       "/p/lib/libmoq-core.so;/q/error directory/libmsquic.so")
+loader_parse_image_report(0 "${_image_list}" "" _accepted _why)
+expect_empty("successful report with empty stderr accepted" "${_why}")
+expect("successful report returns its images" "${_accepted}" "${_reported}")
+foreach(_status 1 139 "Process terminated")
+    loader_parse_image_report("${_status}" "${_image_list}" "" _accepted _why)
+    expect_nonempty("failed process cannot supply trusted images: ${_status}" "${_why}")
+    expect("failed process returns no trusted images" "${_accepted}" "")
+endforeach()
+foreach(_stderr "warning: unexpected output" "AddressSanitizer: failure"
+                 "MOQ_LOADED_IMAGE\t/foreign/libmsquic.so" " ")
+    loader_parse_image_report(0 "${_image_list}" "${_stderr}" _accepted _why)
+    expect_nonempty("stderr is not an image channel: ${_stderr}" "${_why}")
+    expect("stderr failure returns no trusted images" "${_accepted}" "")
+endforeach()
+loader_parse_image_report(0 "" "" _accepted _why)
+expect_nonempty("empty direct report refused" "${_why}")
+expect("empty report returns no trusted images" "${_accepted}" "")
+foreach(_bad_report
+    "MOQ_LOADED_IMAGE\trelative.so"
+    "MOQ_LOADED_IMAGE\t"
+    " MOQ_LOADED_IMAGE\t/foreign/libmsquic.so"
+    "prefix MOQ_LOADED_IMAGE\t/p/lib/libmsquic.so"
+    "MOQ_LOADED_IMAGE_OTHER\t/p/lib/libmsquic.so"
+    "MOQ_LOADED_IMAGE\t/p/lib/libmsquic.so\nwarning: unexpected output"
+    "MOQ_LOADED_IMAGE\t/p/lib/libmsquic.so\nERROR: AddressSanitizer: injected"
+    "MOQ_LOADED_IMAGE\t/p/lib/libmsquic.so\n123: program: error: symbol lookup error: undefined symbol: needed (fatal)")
+    loader_only_image_records("${_bad_report}" ImageList _why)
+    expect_nonempty("malformed image report or adjacent diagnostic refused: ${_bad_report}"
+                    "${_why}")
+endforeach()
+foreach(_padded "/foreign/libmsquic.so" "/p/lib/libmoq-core.so")
+    loader_only_image_records("${_image_list}\n MOQ_LOADED_IMAGE\t${_padded}"
+                              ImageList _why)
+    expect_nonempty("padded foreign or duplicate image cannot disappear: ${_padded}" "${_why}")
+endforeach()
+loader_parse_images("MOQ_LOADED_IMAGE\t/path;with__SEMI__/libmsquic.so " ImageList _opaque)
+expect("direct image path preserves separators and trailing space" "${_opaque}"
+       "/path\\;with__SEMI__/libmsquic.so ")
+loader_require_images("${_reported};/p/lib/libmoq-core.so"
+    "/p/lib/libmoq-core.so;/q/error directory/libmsquic.so" "/p/lib" duplicate_report _why)
+expect_nonempty("duplicate direct image remains a failure" "${_why}")
+loader_require_images("${_reported};/foreign/libmsquic.so"
+    "/p/lib/libmoq-core.so;/q/error directory/libmsquic.so" "/p/lib" foreign_report _why)
+expect_nonempty("foreign direct image remains a failure" "${_why}")
+
+# Keep these records in scalars: putting the counterexamples in a CMake list
+# would corrupt them before they reached the parser under test.
+set(_boundary_open "${_image_list}\nMOQ_LOADED_IMAGE\t/foreign/[scratch/libmsquic.so\nMOQ_LOADED_IMAGE\t/usr/lib/libc.so.6")
+set(_boundary_close "${_image_list}\nMOQ_LOADED_IMAGE\t/foreign/]scratch/libmsquic.so\nMOQ_LOADED_IMAGE\t/usr/lib/libc.so.6")
+set(_boundary_backslash "${_image_list}\nMOQ_LOADED_IMAGE\t/foreign/libmsquic.so\\\nMOQ_LOADED_IMAGE\t/usr/lib/libc.so.6")
+set(_boundary_balanced "${_image_list}\nMOQ_LOADED_IMAGE\t/foreign/[scratch]/libmsquic.so")
+set(_boundary_tab "${_image_list}\nMOQ_LOADED_IMAGE\t/foreign/libmsquic.so\textra")
+string(REPLACE "libmoq-core" "libmoq-\rcore" _boundary_cr "${_image_list}")
+set(_boundary_blank "${_image_list}\n\nMOQ_LOADED_IMAGE\t/usr/lib/libc.so.6")
+set(_boundary_whitespace "${_image_list}\n \nMOQ_LOADED_IMAGE\t/usr/lib/libc.so.6")
+set(_boundary_root "${_image_list}\nMOQ_LOADED_IMAGE\t/")
+foreach(_case IN ITEMS open close backslash balanced tab cr blank whitespace root)
+    set(_raw "${_boundary_${_case}}")
+    loader_parse_image_report(0 "${_raw}" "" _accepted _why)
+    set(_membership_why "${_why}")
+    if(_membership_why STREQUAL "")
+        loader_require_images("${_accepted}" "${_reported}" "/p/lib"
+                              "boundary ${_case}" _membership_why)
+    endif()
+    expect_nonempty("boundary ${_case}: parse-to-membership refuses report" "${_membership_why}")
+    expect_nonempty("boundary ${_case}: malformed raw report refused by parser" "${_why}")
+    expect("boundary ${_case}: no trusted images" "${_accepted}" "")
+    loader_parse_images("${_raw}" ImageList _direct)
+    expect("boundary ${_case}: direct extraction also fails closed" "${_direct}" "")
+endforeach()
+loader_parse_image_report(0
+    "MOQ_LOADED_IMAGE\t/path;with__SEMI__/space directory/libmsquic.so \n"
+    "" _accepted _why)
+expect_empty("opaque path full report accepted" "${_why}")
+expect("opaque path full report preserves bytes" "${_accepted}"
+       "/path\\;with__SEMI__/space directory/libmsquic.so ")
+loader_require_images("${_accepted}"
+    "/path\\;with__SEMI__/space directory/libmsquic.so " "" opaque_report _why)
+expect_empty("opaque path full membership accepted" "${_why}")
 loader_artifact_is_shared("/p/lib/libx.so.2.5.9" _v)
 expect("versioned Linux shared library is a runtime image" "${_v}" "1")
 
@@ -135,6 +223,32 @@ ld: warning: something unexpected" Darwin _why)
 expect_nonempty("an injected warning in the trace is refused" "${_why}")
 loader_only_image_records("${_linux}" Linux _why)
 expect_empty("a clean linux trace is accepted" "${_why}")
+
+# glibc runs an executable's preinit array before its library initializers.
+# This is loader metadata, not an additional shared-library image.
+set(_linux_preinit
+"      54152:\tcalling preinit: /work/tree-relay-asan-lsan/adapters/msquic/install-consumer-work/consumer-build/moq_msquic_consumer_test")
+loader_only_image_records("${_linux_preinit}\n${_linux}" Linux _why)
+expect_empty("glibc executable preinit is accepted" "${_why}")
+loader_parse_images("${_linux_preinit}\n${_linux}" Linux _preinit_imgs)
+expect("preinit is not a shared-library image" "${_preinit_imgs}" "${_l}")
+set(_linux_preinit_nested
+    "      54152: calling preinit: /work/calling init: /p/lib/libmsquic.so")
+loader_only_image_records("${_linux_preinit_nested}" Linux _why)
+expect_empty("preinit path with nested record words is accepted" "${_why}")
+loader_parse_images("${_linux_preinit_nested}\n${_linux}" Linux _nested_imgs)
+expect("preinit path cannot fabricate a library image" "${_nested_imgs}" "${_l}")
+foreach(_bad_preinit
+    "      54152: calling preinit: relative-program"
+    "      54152: calling preinit:"
+    "calling preinit: /work/consumer"
+    "      54152: calling preinit failed: /work/consumer"
+    "      54152: calling preinit: /work/consumer\nAddressSanitizer: injected failure"
+    "      54152: calling preinit: /work/consumer\n      54152: warning: injected failure")
+    loader_only_image_records("${_bad_preinit}" Linux _why)
+    expect_nonempty("invalid preinit or adjacent diagnostic is refused: ${_bad_preinit}"
+                    "${_why}")
+endforeach()
 # other loader record kinds are fine; a loader WARNING is not
 loader_only_image_records("${_darwin}
 dyld[123]: move loaded to delayed: XPCSupport" Darwin _why)

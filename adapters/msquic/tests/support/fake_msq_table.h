@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include <msquic.h>
+#include <moq/types.h>
 
 #define FAKE_MSQ_MAX_STREAMS 64
 #define FAKE_MSQ_MAX_SENDS 256
@@ -135,6 +136,12 @@ struct fake_msq {
 
     fake_msq_dgram_t dgrams[FAKE_MSQ_MAX_DGRAMS];
     int dgram_count;
+    unsigned send_completions;
+    unsigned send_cancellations;
+    unsigned dgram_completions;
+    unsigned dgram_cancellations;
+    bool shutdown_complete;     /* no subsequent send completion is legal */
+    bool connection_closed;
 
     int stream_start_fails;    /* make the next N StreamStart calls fail
                                   synchronously with a hard refusal
@@ -212,6 +219,26 @@ void fake_msq_deliver_start_complete(fake_msq_stream_t *st,
 /* Deliver SEND_COMPLETE for the oldest uncompleted send (FIFO);
  * returns false when none is pending. */
 bool fake_msq_deliver_send_complete(fake_msq_t *f, bool canceled);
+
+/* Explicit teardown only: drain accepted operations, including operations
+ * queued by their callbacks, before final shutdown or adapter destruction.
+ * Does not synthesize stream/connection terminals or change half-close state.
+ * cb/ctx are the live connection handler for datagram final notifications. */
+void fake_msq_cancel_pending(fake_msq_t *f,
+                              QUIC_CONNECTION_CALLBACK_HANDLER cb, void *ctx);
+void fake_msq_cancel_stream(fake_msq_stream_t *st);
+/* Validate ownership before final delivery/close and forbid later send finals.
+ * Repeated connection-terminal notifications remain usable by idempotence rows. */
+void fake_msq_mark_shutdown_complete(fake_msq_t *f);
+void fake_msq_mark_connection_closed(fake_msq_t *f);
+
+/* Shared counting allocator for fixture-owned session/adapter/facade storage.
+ * Initialize before create; inspect live_bytes only after callbacks quiesce. */
+typedef struct fake_msq_count_alloc {
+    moq_alloc_t api;
+    _Atomic size_t live_bytes;
+} fake_msq_count_alloc_t;
+void fake_msq_count_alloc_init(fake_msq_count_alloc_t *a);
 
 /* Deliver stream bytes / FIN into the adapter's stream callback as one
  * single-buffer RECEIVE event. Honors the partial-acceptance model: if

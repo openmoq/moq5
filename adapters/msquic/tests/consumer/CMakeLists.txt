@@ -8,6 +8,15 @@ find_package(libmoq REQUIRED COMPONENTS adapter-msquic adapter-msquic-managed)
 add_executable(moq_msquic_consumer_test main.c)
 target_link_libraries(moq_msquic_consumer_test PRIVATE
     moq::adapter-msquic-managed)
+if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$" AND NOT MSVC
+   AND NOT CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(moq_msquic_consumer_test PRIVATE
+        -Wall -Wextra -Wpedantic -Werror)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(moq_msquic_consumer_test PRIVATE _GNU_SOURCE)
+    target_link_libraries(moq_msquic_consumer_test PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 # Record resolved target artifacts, not inferred package directory layouts.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/consumer_targets.cmake" CONTENT

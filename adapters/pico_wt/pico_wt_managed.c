@@ -321,6 +321,10 @@ static void allow_peer_missing_reset_stream_at(moq_pico_wt_managed_t *m,
         m->conn->endpoint_ctx.reset_stream_at_synthesized = true;
 }
 
+static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
+    size_t length, picohttp_call_back_event_t event,
+    h3zero_stream_ctx_t *stream_ctx, void *app_ctx);
+
 static int managed_client_h3_callback(picoquic_cnx_t *cnx,
     uint64_t stream_id, uint8_t *bytes, size_t length,
     picoquic_call_back_event_t fin_or_event, void *callback_ctx,
@@ -356,8 +360,10 @@ static int managed_client_h3_callback(picoquic_cnx_t *cnx,
         fin_or_event != picoquic_callback_stateless_reset &&
         m->ctrl_ctx != NULL && !m->h3_ctx->settings.settings_received &&
         m->h3_ctx->pending_wt_connect == m->ctrl_ctx;
+#endif
     int rc = h3zero_callback(cnx, stream_id, bytes, length, fin_or_event,
                              m->h3_ctx, v_stream_ctx);
+#if defined(MOQ_PICO_WT_TESTING)
     if (connect_pending && m->h3_ctx->settings.settings_received) {
         if (m->h3_ctx->pending_wt_connect == NULL) {
             if (rc == 0 && !m->fatal)
@@ -366,11 +372,22 @@ static int managed_client_h3_callback(picoquic_cnx_t *cnx,
             m->test_connect_left_pending++;
         }
     }
-    return rc;
-#else
-    return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event,
-                           m->h3_ctx, v_stream_ctx);
 #endif
+    /* h3zero binds a complete WT header to its session prefix, but emits no
+     * path callback without payload or FIN. Admit that stream now so CONNECT
+     * acceptance can rebind it too. Re-find it: parsing may create or delete
+     * the context supplied by picoquic. Partial headers and refused streams
+     * have no facade binding; repeated DATA does not add another slot. */
+    if (rc == 0 && fin_or_event == picoquic_callback_stream_data &&
+        m->conn == NULL) {
+        h3zero_stream_ctx_t *sc = h3zero_find_stream(m->h3_ctx, stream_id);
+        if (sc != NULL && sc != m->ctrl_ctx &&
+            sc->path_callback == managed_client_wt_cb &&
+            sc->path_callback_ctx == m)
+            rc = managed_client_wt_cb(cnx, NULL, 0,
+                picohttp_callback_post_data, sc, m);
+    }
+    return rc;
 }
 
 static void mark_activity(moq_pico_wt_managed_t *m)
@@ -528,10 +545,10 @@ static void pwm_early_refuse(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
  * stream limit, or one whose entry would pass the entry or storage limit, is
  * refused with WT_BUFFERED_STREAM_REJECTED; other streams keep theirs. An
  * empty delivery that is neither a FIN nor a STOP carries nothing and keeps no
- * entry, but it still registers its stream: a uni stream whose first packet
- * held only its WebTransport header arrives that way, and replay must rebind
- * it to the session or its later bytes are lost. Returns 0: a refused stream
- * never closes the connection. */
+ * entry, but it still registers its stream. The receive wrapper uses this to
+ * admit a parsed header with no payload or FIN, so replay can rebind it to
+ * the session before later bytes arrive. Returns 0: a refused stream never
+ * closes the connection. */
 static int pwm_early_buffer(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
                             h3zero_stream_ctx_t *sc, const uint8_t *bytes,
                             size_t len, pwm_early_kind_t kind)

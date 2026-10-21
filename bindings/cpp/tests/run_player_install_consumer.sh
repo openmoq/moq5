@@ -34,6 +34,7 @@
 #  15  work dir (created fresh; removed on success unless retained below)
 #  16  the parent's picotls selection preload (header and component
 #      libraries), given to the child picoquic build and verified there
+#  17  selected wtquic package dir, empty when service has no managed WT backend
 # Test-only: MOQ_TEST_KEEP_WORK=1 retains successful work and prints its path.
 set -euo pipefail
 
@@ -42,6 +43,7 @@ CONFIG="$5"; GENERATOR="$6"; CONTEXT="$7"; OPENSSL_PRELOAD="$8"
 STAGING_CHECK="$9"; INCDIR="${10}"; LIBDIR="${11}"
 PTLS_INCLUDE_DIR="${12}"; PTLS_LIB_DIR="${13}"; PICOTLS_PREFIX="${14}"
 WORK="${15}"; PICOTLS_PRELOAD="${16}"
+WTQUIC_DIR="${17:-}"
 
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=player_consumer_lib.sh
@@ -116,13 +118,23 @@ echo "== 3. configure the C++ player consumer against the install prefix =="
 # Deliberately NOT passing MOQ_PICOQUIC_SOURCE_DIR: the consumer resolves the
 # INSTALLED picoquic and its exported picohttp-core. Both packages are pinned
 # to the prefix; the package registry is not consulted.
+transport_args=()
+if [ -n "$WTQUIC_DIR" ]; then
+    transport_args+=("-Dwtquic_DIR=$WTQUIC_DIR")
+fi
 "$CMAKE" -C "$PRELOAD" -G "$GENERATOR" -S "$CONSUMER_SRC" -B "$CONB" \
     -DCMAKE_PREFIX_PATH="$P" \
     -Dlibmoq_DIR="$P/$LIBDIR/cmake/libmoq" \
     -Dpicoquic_DIR="$P/$LIBDIR/cmake/picoquic" \
     -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF \
     -DMOQ_PICOTLS_PREFIX="$PICOTLS_PREFIX" -DPTLS_INCLUDE_DIR="$PTLS_INCLUDE_DIR" \
+    ${transport_args[@]+"${transport_args[@]}"} \
     ${cfg_args[@]+"${cfg_args[@]}"}
+if [ -n "$WTQUIC_DIR" ] &&
+   ! pc_selected "$CONB/CMakeCache.txt" wtquic_DIR "$WTQUIC_DIR"; then
+    echo "FAIL: player consumer did not select the parent's wtquic package"
+    exit 1
+fi
 "$CMAKE" --build "$CONB" ${step_args[@]+"${step_args[@]}"}
 
 # Each named libmoq and picoquic target the consumer linked has its file in

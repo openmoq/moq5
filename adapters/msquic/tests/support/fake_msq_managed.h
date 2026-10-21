@@ -73,7 +73,9 @@ void fake_mgd_deliver_peer_recv_aborted(fake_mgd_conn_t *c,
 /* Deliver the transport terminal: SHUTDOWN_INITIATED_BY_PEER (optional,
  * orderly close with `code`) then SHUTDOWN_COMPLETE. This is exactly the
  * worker batch that makes terminal/reapable state and the queued
- * SESSION_CLOSED visible — delivered synchronously on the caller's thread. */
+ * SESSION_CLOSED visible — delivered synchronously on the caller's thread.
+ * The final helper cancels every accepted send/datagram to quiescence first;
+ * the peer-close helper alone deliberately leaves those operations pending. */
 void fake_mgd_deliver_peer_close(fake_mgd_conn_t *c, uint64_t code);
 void fake_mgd_deliver_shutdown_complete(fake_mgd_conn_t *c);
 

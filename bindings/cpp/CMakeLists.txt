@@ -276,6 +276,18 @@ if(MOQ_BUILD_TESTS)
         file(WRITE "${_cpp_player_picotls_context}" "${_cpp_player_picotls}")
         include(${PROJECT_SOURCE_DIR}/tests/cmake/PicoquicInstallStaging.cmake)
         moq_picoquic_install_staging(_cpp_player_install_staging)
+        # Service imports the managed WT components when they were installed.
+        # Pin their package just as the runner pins its installed picoquic;
+        # an ambient WT SDK must not satisfy this producer's consumer test.
+        set(_cpp_player_wtquic_dir "")
+        if(TARGET moq::adapter-wtquic-msquic-managed OR
+           TARGET moq::adapter-wtquic-network-managed)
+            if(NOT wtquic_DIR OR wtquic_DIR MATCHES "-NOTFOUND$")
+                message(FATAL_ERROR
+                    "The installed player consumer requires the selected wtquic_DIR")
+            endif()
+            set(_cpp_player_wtquic_dir "${wtquic_DIR}")
+        endif()
         add_test(NAME cpp_player_install_consumer
             COMMAND bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_player_install_consumer.sh"
@@ -294,7 +306,8 @@ if(MOQ_BUILD_TESTS)
                 "${MOQ_PTLS_LIB_DIR}"
                 "${MOQ_PICOTLS_PREFIX}"
                 "${CMAKE_CURRENT_BINARY_DIR}/player-install-consumer-work-$<CONFIG>"
-                "${_cpp_player_picotls_context}")
+                "${_cpp_player_picotls_context}"
+                "${_cpp_player_wtquic_dir}")
         set_tests_properties(cpp_player_install_consumer
             PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
         moq_test_reject_consumer_warnings(cpp_player_install_consumer)
