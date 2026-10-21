@@ -1,0 +1,25 @@
+De-duplicate libraries on link lines where the linker does not need repeats.
+
+Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001.
+
+picoquic's targets list the same static archives more than once, and Apple's
+linker warns about each repeat. CMake 3.29 and later (policy CMP0156, set NEW when available) drop repeats
+for linkers that do not need them and keep them for linkers that do.
+Tests: adapters/picoquic's source-mode link policy check
+(picoquic_source_mode_link_policy).
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a7d2c346..37456ec2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,10 @@
+ cmake_minimum_required(VERSION 3.13)
++# De-duplicate libraries on link lines when the linker does not need the
++# repeats (CMake 3.29 and later). Apple's linker warns about repeated static
++# libraries; linkers that need repeats keep them.
++if(POLICY CMP0156)
++    cmake_policy(SET CMP0156 NEW)
++endif()
+ 
+ # Building tests by default depends on whether this is a subproject
+ if(DEFINED PROJECT_NAME)

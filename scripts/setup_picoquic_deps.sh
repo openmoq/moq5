@@ -65,9 +65,9 @@ set -euo pipefail
 
 # -- Pinned, known-good dependency commits -----------------------------
 PICOQUIC_REPO="${PICOQUIC_REPO:-https://github.com/private-octopus/picoquic}"
-PICOQUIC_REF="${PICOQUIC_REF:-a602e60babea48da7849169d716aaf68684e66d6}"
+PICOQUIC_REF="${PICOQUIC_REF:-7e77d01d9ec4fd03f71529637549863917aeb793}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
-PICOTLS_REF="${PICOTLS_REF:-f06553b877ada93c860dd1db9002eabf7365292d}"
+PICOTLS_REF="${PICOTLS_REF:-7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)
@@ -332,7 +332,7 @@ patch_selftest() (
     for name in "${PICOQUIC_PATCHES[@]}"; do
         [ -f "$repo_root/patches/picoquic/$name" ] || die "self-test: missing $name"
     done
-    local close_patch=0006-own-application-close-reason.patch
+    local close_patch=0005-own-application-close-reason.patch
     local patch="$repo_root/patches/picoquic/$close_patch"
     mkdir -p "$tmp/tree"
     git -C "$tmp/tree" init -q

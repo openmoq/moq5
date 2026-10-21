@@ -574,7 +574,7 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(pq_sim_flow_control PROPERTIES TIMEOUT 60)
 
         # Local-stream reset after FIN against the pinned, patched picoquic
-        # (patches/picoquic/0002): constructed stream/SACK rows plus packet
+        # (patches/picoquic/0003): constructed stream/SACK rows plus packet
         # rows over the simulated links. Provider-only; no adapter code.
         add_executable(test_pq_reset_after_fin tests/test_pq_reset_after_fin.c)
         target_include_directories(test_pq_reset_after_fin PRIVATE
@@ -595,7 +595,7 @@ if(MOQ_BUILD_TESTS)
         # RESET_STREAM_AT, by decoder and producer testing after a simulated
         # handshake, plus one real-packet row for the grant reaching the peer.
         # Provider-only; no adapter code. A provider without picoquic patch
-        # 0009 fails its policy rows.
+        # 0003 fails its policy rows.
         add_executable(test_pq_provider_stream_credit
             tests/test_pq_provider_stream_credit.c)
         target_include_directories(test_pq_provider_stream_credit PRIVATE
@@ -662,9 +662,9 @@ if(MOQ_BUILD_TESTS)
     endif()
 
     # Source-mode builds carry patches/picoquic (see patches/picoquic/series);
-    # the contract below holds only with 0011 applied.
+    # the contract below holds only with 0004 and 0009 applied.
     if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND _PQ)
-        # The stateless-reset contract patches/picoquic/0011 carries: detection
+        # The stateless-reset contract patches/picoquic/0009 carries: detection
         # after a NAT rebinding and behind another connection's ID, and a
         # context that never sends a reset. Public picoquic API only, so a
         # picoquic without the patch fails here, not in a relay.

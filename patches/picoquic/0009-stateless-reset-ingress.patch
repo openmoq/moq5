@@ -1,99 +1,62 @@
-Detect stateless resets after a path change or behind another connection's ID
+Detect stateless resets behind another connection's ID; allow not sending them.
 
-Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6, after 0002,
-0006, 0007, 0008, 0009 and 0010.
+Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+0008.
 
-RFC 9000 Section 10.3.1 has an endpoint compare a datagram's last 16 bytes
-with every stateless reset token associated with the remote address it
-arrived from, for the connection IDs in use, whenever the first packet cannot
-be associated with a connection or cannot be decrypted, and compare without
-leaking the token's value. Upstream falls short in three ways, each pinned by
-a test here:
-
-- The (address, token) pair a connection registers for that comparison is set
-  at the ready transition and renewed only with a connection ID rotation, not
-  when the default path's first tuple changes. After a NAT rebinding the
-  server sends to the new address with a new client-issued connection ID, and
-  a reset from that address carrying that ID's token is not recognized.
-  picoquic_register_net_secret_for_path re-registers the pair whenever the
-  default path's first tuple changes: a tuple promoted on NAT rebinding
-  (picoquic_set_first_tuple), one promoted once its challenge is verified, a
-  first tuple whose challenge failed, and a first tuple deleted while the path
-  lives. The pair in use is registered; the previous tuple's pair is not kept
-  while its own challenge runs.
 - A packet associated with a connection by its leading bytes but not
   decryptable was compared with that connection's token only, so a reset for
-  connection B whose leading bytes happen to name connection A was missed. The
-  comparison now falls through to the pairs registered for the remote
-  address, and the connection it names is the one reset.
-- That comparison used memcmp, and the registered-pair comparison was constant
-  time only on Apple and 32-bit Windows. Both use
-  picoquic_constant_time_memcmp on every platform.
+  connection B whose leading bytes happen to name connection A was missed
+  (RFC 9000 Section 10.3.1). The comparison in
+  picoquic_parse_header_and_decrypt now falls through to the pairs
+  registered for the remote address, and the connection it names is the one
+  reset. Its direct comparison uses picoquic_constant_time_memcmp.
+- picoquic_set_stateless_reset_sending(quic, 0) makes a context never answer
+  an unassociated packet with a stateless reset (Section 10.3, a MAY) while
+  it keeps receiving and detecting them: an application running several
+  contexts on one port leaves the answer to the context that owns the
+  connection. picoquic_set_default_stateless_reset_min_interval remains a
+  rate limit and cannot disable sending.
 
-picoquic_set_stateless_reset_sending(quic, 0) makes a context never answer an
-unassociated packet with a stateless reset (Section 10.3, a MAY) while it
-keeps receiving and detecting them: an application running several contexts
-on one port leaves the answer to the context that owns the connection.
-picoquic_set_default_stateless_reset_min_interval remains a rate limit and
-cannot disable sending.
-
+The registered-pair refresh and the table comparison come from 0004.
 Tests (picoquic_ct): stateless_reset_after_rebinding,
-stateless_reset_other_cnx_prefix and stateless_reset_sending_disabled fail
-without the corrections, each at the assertion it names; the existing
-stateless_reset, nat_rebinding and migration tests still pass. LibMoQ's
-compare/picoquic-reset reproducer reports neither finding against a picoquic
-built with this patch.
-
-Upstream picoquic/packet.c, quicctx.c, paths.c and frames.c are unchanged in
-the lines this patch touches since the pin as of 2026-10-19 (master
-5fc4330fdab47458a596f95bfc757fab284f7882); the patch applies to that master.
+stateless_reset_other_cnx_prefix and stateless_reset_sending_disabled, each
+through picoquic_incoming_packet. In LibMoQ:
+adapters/picoquic/tests/test_pq_stateless_reset_contract.c.
 
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index d6a87888..c7eb9365 100644
+index a6d214ef..68bf66cc 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
-@@ -1292,6 +1292,27 @@ namespace UnitTest1
- 			Assert::AreEqual(ret, 0);
- 		}
+@@ -1367,6 +1367,27 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
  
-+		TEST_METHOD(stateless_reset_after_rebinding)
-+		{
-+			int ret = stateless_reset_after_rebinding_test();
++        TEST_METHOD(stateless_reset_after_rebinding)
++        {
++            int ret = stateless_reset_after_rebinding_test();
 +
-+			Assert::AreEqual(ret, 0);
-+		}
++            Assert::AreEqual(ret, 0);
++        }
 +
-+		TEST_METHOD(stateless_reset_other_cnx_prefix)
-+		{
-+			int ret = stateless_reset_other_cnx_prefix_test();
++        TEST_METHOD(stateless_reset_other_cnx_prefix)
++        {
++            int ret = stateless_reset_other_cnx_prefix_test();
 +
-+			Assert::AreEqual(ret, 0);
-+		}
++            Assert::AreEqual(ret, 0);
++        }
 +
-+		TEST_METHOD(stateless_reset_sending_disabled)
-+		{
-+			int ret = stateless_reset_sending_disabled_test();
++        TEST_METHOD(stateless_reset_sending_disabled)
++        {
++            int ret = stateless_reset_sending_disabled_test();
 +
-+			Assert::AreEqual(ret, 0);
-+		}
++            Assert::AreEqual(ret, 0);
++        }
 +
- 		TEST_METHOD(test_very_long_max)
- 		{
- 			int ret = tls_api_very_long_max_test();
-diff --git a/picoquic/frames.c b/picoquic/frames.c
-index c654584a..82feb07a 100644
---- a/picoquic/frames.c
-+++ b/picoquic/frames.c
-@@ -5055,6 +5055,7 @@ const uint8_t* picoquic_decode_path_response_frame(picoquic_cnx_t* cnx, const ui
-                         picoquic_log_app_message(cnx, "Migration to server preferred address successful on path %" PRIu64, path_x->unique_path_id);
-                     }
-                     picoquic_reset_path_mtu(path_x);
-+                    picoquic_register_net_secret_for_path(cnx, path_x);
-                 }
-                 if (cnx->are_path_callbacks_enabled && cnx->callback_fn != NULL &&
-                     cnx->callback_fn(cnx, path_x->unique_path_id, NULL, 0, picoquic_callback_path_available,
+         TEST_METHOD(stateless_reset_detect)
+         {
+             int ret = stateless_reset_detect_test();
 diff --git a/picoquic/packet.c b/picoquic/packet.c
-index b48885d3..fc3b6bb5 100644
+index eb2a4f1b..1c5d5ecb 100644
 --- a/picoquic/packet.c
 +++ b/picoquic/packet.c
 @@ -833,11 +833,32 @@ int picoquic_parse_header_and_decrypt(
@@ -132,7 +95,7 @@ index b48885d3..fc3b6bb5 100644
                              picoquic_log_app_message(*pcnx, "Decrypt error, matching reset secret, ret = %d", ret);
                          }
                          else {
-@@ -1114,6 +1135,7 @@ void picoquic_process_unexpected_cnxid(
+@@ -1112,6 +1133,7 @@ void picoquic_process_unexpected_cnxid(
      if (length > PICOQUIC_RESET_PACKET_MIN_SIZE && 
          length <= PICOQUIC_MAX_PACKET_SIZE &&
          ph->ptype == picoquic_packet_1rtt_protected &&
@@ -140,20 +103,8 @@ index b48885d3..fc3b6bb5 100644
          quic->stateless_reset_next_time <= current_time) {
          picoquic_stateless_packet_t* sp = picoquic_create_stateless_packet(quic);
          if (sp != NULL) {
-diff --git a/picoquic/paths.c b/picoquic/paths.c
-index 0b5b6d35..d8b5ae87 100644
---- a/picoquic/paths.c
-+++ b/picoquic/paths.c
-@@ -67,6 +67,7 @@ static void picoquic_set_tuple_challenge_failed(picoquic_path_t* path_x, picoqui
-         previous_tuple->next_tuple = tuple;
-     }
-     tuple->next_tuple = NULL;
-+    picoquic_register_net_secret_for_path(path_x->cnx, path_x);
- }
- 
- /* picoquic_check_tuple_challenge_expired:
 diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
-index fa02b52e..2992a23e 100644
+index 19215218..486c1e2d 100644
 --- a/picoquic/picoquic.h
 +++ b/picoquic/picoquic.h
 @@ -998,6 +998,14 @@ void picoquic_set_default_callback(picoquic_quic_t * quic, picoquic_stream_data_
@@ -172,10 +123,10 @@ index fa02b52e..2992a23e 100644
  * If that number is too high, the maximum number of open files will be hit 
  * at random places in the code. A small value means that some connections may
 diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
-index d0e0adcc..84bc07a4 100644
+index c5a81396..ea258b0b 100644
 --- a/picoquic/picoquic_internal.h
 +++ b/picoquic/picoquic_internal.h
-@@ -570,6 +570,7 @@ typedef struct st_picoquic_quic_t {
+@@ -572,6 +572,7 @@ typedef struct st_picoquic_quic_t {
      uint64_t cwin_max; /* max value of cwin per connection */
      /* Flags */
      unsigned int check_token : 1;
@@ -183,80 +134,11 @@ index d0e0adcc..84bc07a4 100644
      unsigned int force_check_token : 1;
      unsigned int provide_token : 1;
      unsigned int unconditional_cnx_id : 1;
-@@ -1604,6 +1605,7 @@ int picoquic_register_cnx_id(picoquic_quic_t* quic, picoquic_cnx_t* cnx, picoqui
- 
- /* Register or update default address and reset secret */
- int picoquic_register_net_secret(picoquic_cnx_t* cnx);
-+void picoquic_register_net_secret_for_path(picoquic_cnx_t* cnx, picoquic_path_t* path_x);
- 
- /* Registration of initial connection ID and peer IP */
- int picoquic_register_net_icid(picoquic_cnx_t* cnx);
 diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
-index c83f9150..8763426d 100644
+index 2c84a945..1e502969 100644
 --- a/picoquic/quicctx.c
 +++ b/picoquic/quicctx.c
-@@ -363,11 +363,8 @@ static int picoquic_net_secret_compare(const void* key1, const void* key2)
-     int ret = picoquic_compare_addr((struct sockaddr*) & cnx1->registered_secret_addr, (struct sockaddr*) & cnx2->registered_secret_addr);
- 
-     if (ret == 0) {
--#ifdef PICOQUIC_USE_CONSTANT_TIME_MEMCMP
-+        /* RFC 9000 section 10.3.1: compared without leaking the token's value. */
-         ret = picoquic_constant_time_memcmp(cnx1->registered_reset_secret, cnx2->registered_reset_secret, PICOQUIC_RESET_SECRET_SIZE);
--#else
--        ret = memcmp(cnx1->registered_reset_secret, cnx2->registered_reset_secret, PICOQUIC_RESET_SECRET_SIZE);
--#endif
-     }
-     return ret;
- }
-@@ -1410,6 +1407,20 @@ int picoquic_register_net_secret(picoquic_cnx_t* cnx)
-     return ret;
- }
- 
-+/* The default path's first tuple changed: the connection now sends to that
-+ * tuple's address with its remote connection ID. Register that pair, so a
-+ * stateless reset arriving from that address with that connection ID's
-+ * token is recognized (RFC 9000 section 10.3.1). Only a connection that has
-+ * registered once, at the ready transition, re-registers here. */
-+void picoquic_register_net_secret_for_path(picoquic_cnx_t* cnx, picoquic_path_t* path_x)
-+{
-+    if (cnx != NULL && cnx->nb_paths > 0 && path_x == cnx->path[0] &&
-+        cnx->registered_secret_addr.ss_family != 0 &&
-+        path_x->first_tuple != NULL && path_x->first_tuple->p_remote_cnxid != NULL) {
-+        (void)picoquic_register_net_secret(cnx);
-+    }
-+}
-+
- void picoquic_init_transport_parameters(picoquic_tp_t* tp)
- {
-     memset(tp, 0, sizeof(picoquic_tp_t));
-@@ -1857,6 +1868,7 @@ void picoquic_unchain_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
- 
- void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int is_deleting_path)
- {
-+    int was_first = (path_x->first_tuple == tuple);
-     /* TODO: dereference local CID, retire remote CID ??? */
-     /* Dereference the remote CID */
-     if (tuple->p_remote_cnxid != NULL) {
-@@ -1864,6 +1876,10 @@ void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int
-     }
-     /* Remove from chain to the path */
-     picoquic_unchain_tuple(path_x, tuple);
-+    /* The next tuple, if any, is now the one in use */
-+    if (was_first && !is_deleting_path) {
-+        picoquic_register_net_secret_for_path(path_x->cnx, path_x);
-+    }
-     /* And finally free */
-     free(tuple);
- }
-@@ -1874,6 +1890,7 @@ void picoquic_set_first_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
-     picoquic_unchain_tuple(path_x, tuple);
-     path_x->first_tuple = tuple;
-     tuple->next_tuple = old_first;
-+    picoquic_register_net_secret_for_path(path_x->cnx, path_x);
- }
- 
- /* Set default interface -- to call just after creating a connection context */
-@@ -4509,6 +4526,12 @@ void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, ui
+@@ -4542,6 +4542,12 @@ void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, ui
      quic->stateless_reset_min_interval = min_interval_usec;
  }
  
@@ -270,38 +152,38 @@ index c83f9150..8763426d 100644
      picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
  {
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index e3dae494..61b71efd 100644
+index 68cc9118..a43d12fa 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
-@@ -300,6 +300,9 @@ static const picoquic_test_def_t test_table[] = {
+@@ -314,6 +314,9 @@ static const picoquic_test_def_t test_table[] = {
      { "stateless_reset_bad", stateless_reset_bad_test },
      { "stateless_reset_client", stateless_reset_client_test },
      { "stateless_reset_handshake", stateless_reset_handshake_test },
 +    { "stateless_reset_after_rebinding", stateless_reset_after_rebinding_test },
 +    { "stateless_reset_other_cnx_prefix", stateless_reset_other_cnx_prefix_test },
 +    { "stateless_reset_sending_disabled", stateless_reset_sending_disabled_test },
-     { "immediate_close", immediate_close_test },
-     { "tls_api_very_long_stream", tls_api_very_long_stream_test },
-     { "tls_api_very_long_max", tls_api_very_long_max_test },
+     { "stateless_reset_detect", stateless_reset_detect_test },
+     { "stateless_reset_detect_callback", stateless_reset_detect_callback_test },
+     { "stateless_reset_detect_vn", stateless_reset_detect_vn_test },
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index b281eec6..d9b7773c 100644
+index fc7791b5..59e05516 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
-@@ -113,6 +113,9 @@ int stateless_reset_test(void);
+@@ -115,6 +115,9 @@ int stateless_reset_test(void);
  int stateless_reset_bad_test(void);
  int stateless_reset_client_test(void);
  int stateless_reset_handshake_test(void);
 +int stateless_reset_after_rebinding_test(void);
 +int stateless_reset_other_cnx_prefix_test(void);
 +int stateless_reset_sending_disabled_test(void);
- int immediate_close_test(void);
- int sim_link_test(void);
- int tls_api_very_long_stream_test(void);
+ int stateless_reset_detect_test(void);
+ int stateless_reset_detect_callback_test(void);
+ int stateless_reset_detect_vn_test(void);
 diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
-index 7b219ee1..7434740e 100644
+index 90db7ef4..9c99827b 100644
 --- a/picoquictest/tls_api_test.c
 +++ b/picoquictest/tls_api_test.c
-@@ -3618,6 +3618,289 @@ int stateless_reset_client_test(void)
+@@ -3622,6 +3622,289 @@ int stateless_reset_client_test(void)
  }
  
  

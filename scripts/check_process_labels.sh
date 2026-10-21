@@ -20,7 +20,7 @@
 #     "Apple M1 Max" and "Cortex-M3" do not match);
 #   - commit citations: a 7-12 digit hex hash with at least one letter and
 #     one digit, directly after "from", "since", "as of", "at", "baseline",
-#     "complete" or "commit" (a dependency pin such as "picoquic a602e60b" or
+#     "complete" or "commit" (a dependency pin such as "picoquic 7e77d01d" or
 #     "e.g. 55b473e2" is not a citation of this tree's history);
 #   - any of the labels above in a file name.
 #
@@ -117,7 +117,7 @@ if [ "$SELF_TEST" -eq 1 ]; then
     classify 0 '| Machine | Apple M1 Max, macOS (Darwin 24.6.0), arm64 |'
     classify 0 'built for a Cortex-M3 with arm-none-eabi-gcc'
     classify 0 'draft-ietf-moq-transport-22 section 9.4 and RFC 9000 Section 4.6'
-    classify 0 'baseline (picoquic a602e60b), whose core no longer calls'
+    classify 0 'baseline (picoquic 7e77d01d), whose core no longer calls'
     classify 0 'older core/log cycle (e.g. 55b473e2, whose core calls'
     classify 0 '/* picoquic 33afc776 introduced the error-reporting setter */'
     classify 0 '/* s1 parks ticket 5000. */'

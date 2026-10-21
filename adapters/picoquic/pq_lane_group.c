@@ -470,7 +470,7 @@ static int lane_send(struct pq_lane *ln, uint64_t now, size_t *bytes_sent)
         (void)picoquic_packet_loop_do_udp_send(quic, last, s->fd,
                                                &ln->send_param, buf, len,
                                                &peer, &local, if_index, 0, NULL,
-                                               &log_cid, now);
+                                               &log_cid, now, NULL);
         n++;
         *bytes_sent += len;
     }

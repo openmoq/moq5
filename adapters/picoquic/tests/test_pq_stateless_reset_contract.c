@@ -1,6 +1,6 @@
 /*
  * The stateless-reset contract LibMoQ requires of picoquic, carried by
- * patches/picoquic/0011-stateless-reset-detection.patch (RFC 9000 section
+ * patches/picoquic/0009-stateless-reset-ingress.patch (RFC 9000 section
  * 10.3.1, and the no-send policy of section 10.3): public API only, simulated
  * time, a fixed-latency in-process link between a server context and a client
  * context.

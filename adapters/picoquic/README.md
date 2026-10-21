@@ -219,9 +219,9 @@ and `Threads::Threads`.
 
 ## Provider source baseline
 
-The qualified picoquic source is a602e60babea48da7849169d716aaf68684e66d6
+The qualified picoquic source is 7e77d01d9ec4fd03f71529637549863917aeb793
 with the patches `scripts/setup_picoquic_deps.sh` applies, built against
-picotls f06553b877ada93c860dd1db9002eabf7365292d. Other source trees given
+picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1. Other source trees given
 through `MOQ_PICOQUIC_SOURCE_DIR` are used as they are: no version is
 checked, and no Git metadata is required.
 
@@ -239,7 +239,7 @@ picoquic-log.
 
 The adapter requires picoquic to copy accepted `picoquic_close_ex` reasons
 before returning and retain them through connection deletion callbacks.
-`scripts/setup_picoquic_deps.sh` applies patch 0006 to the pinned provider.
+`scripts/setup_picoquic_deps.sh` applies patch 0005 to the pinned provider.
 External provider packages must carry the equivalent implementation and
 advertise `PICOQUIC_CLOSE_REASON_COPIED=1` in their matching public header.
 The adapter rejects headers without this contract. Rebuild private-header
@@ -247,7 +247,7 @@ consumers and provider binaries together after applying the patch.
 
 ## Provider terminal observation
 
-`scripts/setup_picoquic_deps.sh` also applies patch 0007, which advertises
+`scripts/setup_picoquic_deps.sh` also applies patch 0006, which advertises
 `PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION` 1: the exact STOP_SENDING error
 (`picoquic_get_remote_stop_error`) and an opt-in callback once every byte and
 the FIN of a local unidirectional stream are acknowledged
@@ -262,7 +262,7 @@ apply in the order declared by `patches/picoquic/series`; use
 
 The raw and WebTransport adapters require
 `PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED=1` in the provider's matching public
-header. Patch 0010 supplies this contract for the pinned source. An external
+header. Patch 0008 supplies this contract for the pinned source. An external
 provider must carry the equivalent implementation, not only define the macro.
 Rebuild the provider and adapters together; an installed provider's headers and
 libraries must describe the same implementation.
@@ -277,5 +277,5 @@ byte is terminal. STOP ends only the receive direction of a bidirectional
 stream, never its independent send direction.
 
 This cancellation contract is required whether or not terminal observation is
-enabled. Omitting patch 0007 is supported for drafts 16 and 18, but does not
+enabled. Omitting patch 0006 is supported for drafts 16 and 18, but does not
 remove the close-reason or terminal-cancellation requirements.

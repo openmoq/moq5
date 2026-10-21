@@ -23,10 +23,10 @@
 #include <stddef.h>
 
 #if !defined(PICOQUIC_CLOSE_REASON_COPIED) || PICOQUIC_CLOSE_REASON_COPIED != 1
-#error picoquic_must_copy_close_reasons_apply_libmoq_picoquic_patch_0006
+#error picoquic_must_copy_close_reasons_apply_libmoq_picoquic_patch_0005
 #endif
 #if !defined(PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED) || PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED != 1
-#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0010
+#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0008
 #endif
 
 /* PICOQUIC_ERROR_DATAGRAM_TOO_LONG is defined in picoquic.h */
@@ -322,7 +322,7 @@ static moq_transport_result_t pq_send_datagram(void *ctx,
 /*
  * picoquic_close_ex accepts a reason string. We forward the reason
  * if provided, bounded here to 255 bytes. The qualified picoquic provider
- * copies the string before returning (patch 0006).
+ * copies the string before returning (patch 0005).
  */
 static moq_transport_result_t pq_close(void *ctx, uint64_t code,
                                         const uint8_t *reason,

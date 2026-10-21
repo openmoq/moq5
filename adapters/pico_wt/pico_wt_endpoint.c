@@ -34,7 +34,7 @@
 #include <stddef.h>
 
 #if !defined(PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED) || PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED != 1
-#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0010
+#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0008
 #endif
 
 /* -- Endpoint ops --------------------------------------------------- */

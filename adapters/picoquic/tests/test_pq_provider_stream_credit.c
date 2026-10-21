@@ -23,7 +23,7 @@
  * this provider replenishes is itself an RFC rule.
  *
  * The pinned provider meets this policy through the tracked picoquic patch
- * 0009-return-stream-credit-at-final-size.patch, which counts a stream once
+ * 0003-align-stream-reset-stop-and-credit.patch, which counts a stream once
  * every byte up to its FIN is consumed (evaluated after the FIN's final size
  * is stored) or once a reset's reliable prefix is consumed. A provider
  * without it fails the policy rows: it counts a gapped FIN early, comparing

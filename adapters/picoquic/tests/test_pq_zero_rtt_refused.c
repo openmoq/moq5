@@ -9,7 +9,7 @@
  * (resumed_ticket_id is set) -- but 0-RTT is not available on it, because the
  * ticket the refusing server issued carries max_early_data_size 0. Had the
  * group accepted 0-RTT, the ticket would permit it and is_0rtt_available would
- * be true; that is the RED.
+ * be true, failing the check.
  *
  * White-box: links the threaded adapter's test-internals archive and reads the
  * client connection's resumption fields, which have no public getters.

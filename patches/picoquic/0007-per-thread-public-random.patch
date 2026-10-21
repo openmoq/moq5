@@ -1,7 +1,7 @@
 Keep the public random generator's state per thread
 
-Applies to picoquic a602e60babea48da7849169d716aaf68684e66d6, after 0002,
-0006, 0007, 0008, 0009, 0010 and 0011.
+Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+0006.
 
 picoquic_public_random_64() and the functions built on it draw from one
 xorshift1024* state shared by the whole process, with no synchronization:
@@ -38,15 +38,11 @@ pulls no provider entropy and is deterministic while a provider-less first
 draw is provisional and a later provider upgrades it exactly once. A
 half-created worker pair settles through a barrier abort rather than hanging.
 
-Upstream picoquic/tls_api.c is unchanged in the lines this patch touches
-since the pin as of 2026-10-20 (master
-5fc4330fdab47458a596f95bfc757fab284f7882).
-
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index c7eb9365..64c04ee9 100644
+index 22cdd2f8..a6d214ef 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
-@@ -181,6 +181,13 @@ namespace UnitTest1
+@@ -188,6 +188,13 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -205,10 +201,10 @@ index 217f8bd6..754a5c2d 100644
  
  void picoquic_public_random(void* buf, size_t len)
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index 61b71efd..edc80643 100644
+index 21a7fba3..68cc9118 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
-@@ -124,6 +124,7 @@ static const picoquic_test_def_t test_table[] = {
+@@ -125,6 +125,7 @@ static const picoquic_test_def_t test_table[] = {
      { "util_memcmp", util_memcmp_test },
      { "threading", util_threading_test },
      { "wait_thread", util_wait_thread_test },
@@ -217,10 +213,10 @@ index 61b71efd..edc80643 100644
      { "set_addr_port", util_set_addr_port_test },
      { "picohash", picohash_test },
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index d9b7773c..8cfa6ad3 100644
+index 192a2ae9..fc7791b5 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
-@@ -45,6 +45,7 @@ int util_uint8_to_str_test(void);
+@@ -46,6 +46,7 @@ int util_uint8_to_str_test(void);
  int util_memcmp_test(void);
  int util_threading_test(void);
  int util_wait_thread_test(void);
@@ -229,7 +225,7 @@ index d9b7773c..8cfa6ad3 100644
  int util_set_addr_port_test(void);
  int picohash_test(void);
 diff --git a/picoquictest/util_test.c b/picoquictest/util_test.c
-index 8c047c4f..4e32d004 100644
+index 9df33358..717fa341 100644
 --- a/picoquictest/util_test.c
 +++ b/picoquictest/util_test.c
 @@ -25,7 +25,14 @@
@@ -247,7 +243,7 @@ index 8c047c4f..4e32d004 100644
  
  static const picoquic_connection_id_t expected_cnxid[4] = {
      { { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 0, 0, 0 } , 16 },
-@@ -551,6 +558,461 @@ int util_wait_thread_test(void)
+@@ -615,6 +622,461 @@ int util_wait_thread_test(void)
      return ret;
  }
  

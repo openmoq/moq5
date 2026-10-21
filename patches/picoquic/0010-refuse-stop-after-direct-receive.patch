@@ -1,0 +1,205 @@
+Refuse STOP_SENDING for a receive half completed through direct receive.
+
+Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+0009.
+
+Direct receive marks a completed receive half with fin_received and
+fin_signalled without advancing consumed_offset. The stop refusal in 0008
+read only the consumed offset, so it accepted a stop of that terminal half
+and cleared its context. picoquic_stop_sending now also accepts the provider's
+completed-receive fact, so the stop answers
+PICOQUIC_ERROR_STREAM_ALREADY_CLOSED with the stream, its context, the
+miscellaneous queue and the stream credit unchanged. A stop of an incomplete
+receive half is accepted as before.
+Tests (picoquic_ct): direct_receive_close_check, with unidirectional and
+bidirectional completed streams through both preparation APIs and an
+incomplete control.
+
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index 8e9a25f3..7eefc623 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -610,11 +610,12 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+             PICOQUIC_ERROR_STREAM_ALREADY_CLOSED : PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
+     else if (stream->reset_received ||
+-        (stream->fin_received && stream->consumed_offset >= stream->fin_offset)) {
++        (stream->fin_received && (stream->fin_signalled || stream->consumed_offset >= stream->fin_offset))) {
+         /* The receiving part is terminal -- "Reset Recvd", or every byte
+          * up to the final size delivered (RFC 9000 Section 3.2): nothing is
+-         * left to stop. Refused before the stream or its application context
+-         * changes. */
++         * left to stop. A direct receive records its completion in
++         * fin_signalled without advancing consumed_offset. Refused before
++         * the stream or its application context changes. */
+         ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+     }
+     else {
+diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
+index 9c99827b..bfbe4055 100644
+--- a/picoquictest/tls_api_test.c
++++ b/picoquictest/tls_api_test.c
+@@ -13043,6 +13043,144 @@ static int close_check_test_teardown_pending(void)
+     return ret;
+ }
+ 
++static int close_check_test_misc_count(picoquic_cnx_t* cnx)
++{
++    int n = 0;
++    for (picoquic_misc_frame_header_t* m = cnx->first_misc_frame; m != NULL; m = m->next_misc_frame) {
++        n++;
++    }
++    return n;
++}
++
++/* STOP_SENDING of a stream whose direct receive is complete, while the stream
++ * is retained, for its deferred close check or for a send half still open.
++ * Direct receive records completion without advancing the consumed offset.
++ * The stop is refused as for any terminal receiving part, before the stream,
++ * its application context or the frame queue changes. */
++static int close_check_test_stop_after_complete(int use_next_packet_api, int bidir)
++{
++    char const* scenario = (bidir) ? "stop after complete direct receive, send half open" :
++        ((use_next_packet_api) ? "stop after complete direct receive, next packet API" :
++            "stop after complete direct receive, connection API");
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    uint64_t simulated_time = 0;
++    uint64_t const sid = (bidir) ? 1 : 3;
++    uint64_t credit_before = 0;
++    uint64_t credit_after_marking = 0;
++    size_t send_length = 0;
++    uint64_t loss_mask = 0;
++    close_check_test_ctx_t ctx = { 0 };
++    int ret = close_check_test_connect(&test_ctx, &simulated_time, &loss_mask);
++
++    ctx.mark_on_release_of = UINT64_MAX;
++    ctx.mark_on_data_of = UINT64_MAX;
++    if (ret == 0) {
++        ret = close_check_test_queue_peer_data(test_ctx, &simulated_time, sid, 64, 1);
++    }
++    if (ret == 0) {
++        picoquic_cnx_t* cnx = test_ctx->cnx_client;
++        picoquic_stream_head_t* stream;
++
++        picoquic_set_callback(cnx, close_check_test_cb, &ctx);
++        credit_before = (bidir) ? cnx->max_streams_bidir_local_computed : cnx->max_streams_unidir_local_computed;
++        if (picoquic_set_app_stream_ctx(cnx, sid, &ctx.stream_marker) != 0 ||
++            close_check_test_expect(picoquic_mark_direct_receive_stream(cnx, sid, close_check_test_direct_fn, &ctx) == 0,
++                scenario, "marking failed") != 0) {
++            ret = -1;
++        }
++        else if ((stream = picoquic_find_stream(cnx, sid)) == NULL ||
++            close_check_test_expect(stream->fin_received && stream->fin_signalled &&
++                stream->consumed_offset < stream->fin_offset && ctx.nb_direct_fins[sid] == 1 && ctx.nb_released == 0,
++                scenario, "prerequisite: complete, retained, consumed offset below the final size") != 0) {
++            ret = -1;
++        }
++        else {
++            int misc_before = close_check_test_misc_count(cnx);
++            picoquic_misc_frame_header_t* first_misc_before = cnx->first_misc_frame;
++            uint64_t stop_error_before = stream->local_stop_error;
++
++            credit_after_marking = (bidir) ? cnx->max_streams_bidir_local_computed : cnx->max_streams_unidir_local_computed;
++            if (close_check_test_expect(picoquic_stop_sending(cnx, sid, 0x17) == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED,
++                    scenario, "stop not refused") != 0 ||
++                close_check_test_expect(picoquic_find_stream(cnx, sid) == stream && stream->app_stream_ctx == &ctx.stream_marker,
++                    scenario, "application context cleared by the refused stop") != 0 ||
++                close_check_test_expect(!stream->stop_sending_requested && stream->local_stop_error == stop_error_before,
++                    scenario, "stop state changed by the refused stop") != 0 ||
++                close_check_test_expect(close_check_test_misc_count(cnx) == misc_before && cnx->first_misc_frame == first_misc_before,
++                    scenario, "frame queue changed by the refused stop") != 0 ||
++                close_check_test_expect(((bidir) ? cnx->max_streams_bidir_local_computed : cnx->max_streams_unidir_local_computed) ==
++                    credit_after_marking, scenario, "credit changed by the refused stop") != 0) {
++                ret = -1;
++            }
++        }
++    }
++    if (ret == 0) {
++        picoquic_cnx_t* cnx = test_ctx->cnx_client;
++
++        if (close_check_test_prepare(test_ctx, simulated_time, use_next_packet_api, &send_length) != 0) {
++            ret = -1;
++        }
++        else if (bidir) {
++            /* The send half is still open: the stream stays, with its correlation. */
++            picoquic_stream_head_t* stream = picoquic_find_stream(cnx, sid);
++            if (close_check_test_expect(stream != NULL && stream->app_stream_ctx == &ctx.stream_marker && ctx.nb_released == 0,
++                scenario, "stream or its correlation lost while the send half is open") != 0) {
++                ret = -1;
++            }
++        }
++        else if (close_check_test_expect(picoquic_find_stream(cnx, sid) == NULL, scenario, "not retired by the preparation") != 0 ||
++            close_check_test_expect(ctx.nb_released == 1 && ctx.released[0] == sid, scenario, "not released once") != 0 ||
++            close_check_test_expect(cnx->nb_close_checks == 0 && cnx->first_close_check == NULL, scenario, "queue not empty") != 0 ||
++            close_check_test_expect(cnx->max_streams_unidir_local_computed == credit_before + 1, scenario, "credit not counted once") != 0) {
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
++/* Control: a direct receive that has not completed is not terminal, and the
++ * stop is accepted as before. */
++static int close_check_test_stop_incomplete(void)
++{
++    char const* scenario = "stop of incomplete direct receive";
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    uint64_t simulated_time = 0;
++    uint64_t const sid = 3;
++    uint64_t loss_mask = 0;
++    close_check_test_ctx_t ctx = { 0 };
++    int ret = close_check_test_connect(&test_ctx, &simulated_time, &loss_mask);
++
++    ctx.mark_on_release_of = UINT64_MAX;
++    ctx.mark_on_data_of = UINT64_MAX;
++    if (ret == 0) {
++        ret = close_check_test_queue_peer_data(test_ctx, &simulated_time, sid, 64, 0);
++    }
++    if (ret == 0) {
++        picoquic_cnx_t* cnx = test_ctx->cnx_client;
++        picoquic_stream_head_t* stream;
++
++        picoquic_set_callback(cnx, close_check_test_cb, &ctx);
++        if (picoquic_set_app_stream_ctx(cnx, sid, &ctx.stream_marker) != 0 ||
++            picoquic_mark_direct_receive_stream(cnx, sid, close_check_test_direct_fn, &ctx) != 0 ||
++            (stream = picoquic_find_stream(cnx, sid)) == NULL ||
++            close_check_test_expect(!stream->fin_received && !stream->fin_signalled, scenario, "prerequisite: incomplete") != 0) {
++            ret = -1;
++        }
++        else if (close_check_test_expect(picoquic_stop_sending(cnx, sid, 0x17) == 0, scenario, "stop refused") != 0 ||
++            close_check_test_expect(stream->stop_sending_requested && stream->local_stop_error == 0x17 && stream->app_stream_ctx == NULL,
++                scenario, "stop not accepted as before") != 0) {
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
+ int direct_receive_close_check_test(void)
+ {
+     int ret = 0;
+@@ -13072,6 +13210,18 @@ int direct_receive_close_check_test(void)
+     if (close_check_test_teardown_pending() != 0) {
+         ret = -1;
+     }
++    if (close_check_test_stop_after_complete(0, 0) != 0) {
++        ret = -1;
++    }
++    if (close_check_test_stop_after_complete(1, 0) != 0) {
++        ret = -1;
++    }
++    if (close_check_test_stop_after_complete(0, 1) != 0) {
++        ret = -1;
++    }
++    if (close_check_test_stop_incomplete() != 0) {
++        ret = -1;
++    }
+     return ret;
+ }
+ 
