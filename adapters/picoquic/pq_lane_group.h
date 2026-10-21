@@ -13,9 +13,11 @@
  * ID: a connection ID the group issued names its owner lane (an encrypted
  * lane tag), a client-chosen one hashes to its owner, so a connection is
  * served by one lane whatever socket the kernel delivers to. A datagram for
- * another lane is copied into that lane's inbox; one no lane can attribute is
- * offered to every lane as a stateless-reset candidate, with reset sending
- * disabled for that look, so only a connection's owner ever answers.
+ * another lane is copied into that lane's inbox. Each datagram its owner lane
+ * handles, and each one no lane can attribute, is compared with the receiving
+ * lane's registered reset tokens and offered to the other lanes as a
+ * stateless-reset candidate: the comparison is detection only, never
+ * processing it as a packet, so only a datagram's owner ever answers it.
  */
 
 #include "pq_threaded_internal.h"

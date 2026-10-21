@@ -13,6 +13,27 @@
  *              the server from the client's tuple, ends the connection on the
  *              lane that owns it, whichever lane received the reset; the
  *              clients' next packets are answered with the server's resets
+ *   reset_crosslane
+ *              a reset carrying client B's token behind client A's live
+ *              group CID, A and B on different lanes: lane A ties it to A's
+ *              connection, yet B's connection still ends, because every
+ *              candidate is compared on the other lanes whatever lane A made
+ *              of it
+ *   reset_local
+ *              the same, with A and B on one lane, the reset read from that
+ *              lane's socket and too short for picoquic's ordinary ingress
+ *              to consider: the lane's own detection-only comparison ends
+ *              B's connection
+ *   reset_forwarded
+ *              reset_local's reset received by another lane and forwarded to
+ *              the owner: the owner's lookup on its inbox ends B
+ *   reset_controls
+ *              an unsupported-version Initial draws exactly one Version
+ *              Negotiation, from its owner, and nothing from the lanes that
+ *              compare it; wrong address, one byte below the smallest reset,
+ *              and a version-zero datagram end nothing; a 21-byte reset no
+ *              lane owns ends its connection, a repeat does not reduce the
+ *              connection count again, and the group goes on detecting
  *   stop_load  16 clients streaming when the server stops: the stop completes
  *              within its bound
  *   deadline   a per-lane deadline wakes its lane alone, and once
@@ -32,8 +53,8 @@
 #include <tls_api.h>   /* picoquic_create_cnxid_reset_secret */
 #include "../pq_threaded_internal.h"   /* white-box: a connection's cnx, to read
                                         * the server CID that routes to its lane */
-
-#define PQ_GROUP_CID_LEN 17u   /* adapter-internal; restated for the assert */
+#include "../pq_cid_route.h"   /* white-box: the group CID length and the
+                                * route kinds a lane reports */
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -123,7 +144,10 @@ typedef struct {
     _Atomic uint32_t   lane;
     _Atomic int        server_cid_len;
     uint8_t            server_cid[PICOQUIC_CONNECTION_ID_MAX_SIZE];
+    _Atomic(picoquic_cnx_t *) cnx;   /* the connection, for the owner probe */
 } conn_rec_t;
+
+static pthread_mutex_t g_cid_mu = PTHREAD_MUTEX_INITIALIZER;
 
 #define MAX_RECS 256
 static conn_rec_t g_recs[MAX_RECS];
@@ -168,6 +192,10 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
          * safe to read after. This first CID is retired once the client
          * rebinds, which is exactly the "verifiable CID its lane no longer
          * owns" the cross-lane row needs. */
+        {
+            picoquic_cnx_t *cnx = ((struct moq_pq_threaded_conn *)c)->cnx;
+            atomic_store(&rec->cnx, cnx);
+        }
         if (atomic_load_explicit(&rec->server_cid_len, memory_order_relaxed) == 0) {
             picoquic_cnx_t *cnx = ((struct moq_pq_threaded_conn *)c)->cnx;
             if (cnx) {
@@ -471,6 +499,9 @@ typedef struct {
      * that routes a datagram to the lane that owns this connection. */
     uint8_t server_dcid[PICOQUIC_CONNECTION_ID_MAX_SIZE];
     _Atomic int server_dcid_seen;
+    /* The group CID of its latest short header towards the server, under
+     * g_cid_mu: the one it is sending on now. */
+    uint8_t cur_server_dcid[PICOQUIC_CONNECTION_ID_MAX_SIZE];
 } proxy_client_t;
 
 typedef struct {
@@ -551,6 +582,11 @@ static void *proxy_main(void *arg)
                         (size_t)got > 1u + PQ_GROUP_CID_LEN) {
                         memcpy(c->server_dcid, buf + 1, PQ_GROUP_CID_LEN);
                         atomic_store(&c->server_dcid_seen, 1);
+                    }
+                    if (!(buf[0] & 0x80) && (size_t)got > 1u + PQ_GROUP_CID_LEN) {
+                        pthread_mutex_lock(&g_cid_mu);
+                        memcpy(c->cur_server_dcid, buf + 1, PQ_GROUP_CID_LEN);
+                        pthread_mutex_unlock(&g_cid_mu);
                     }
                     (void)sendto(c->sfd, buf, (size_t)got, 0, (struct sockaddr *)&server, sizeof(server));
                 }
@@ -784,15 +820,120 @@ static void row_reset(void)
     stop(&srv);
 }
 
-/* A stateless reset whose CID prefix verifies to one lane but whose token
- * belongs to a connection another lane owns still ends that connection. The
- * routed lane cannot associate the datagram -- the prefix is a CID it issued
- * but retired once the client rebound -- so it offers it to the other lanes
- * for detection, and the owner recognises its token. Without that, the reset
- * reaches only the routed lane and the real connection lingers. */
-static void row_reset_crosslane(void)
+/* The owner lane's view of one watched datagram, from the test-internals
+ * probe the group calls on the owner's thread before it injects a datagram it
+ * owns (when 0) and after its own reset lookup (when 1). */
+extern void (*_Atomic moq_pq_threaded_test_owner_probe)(
+    uint32_t lane, picoquic_quic_t *quic, const uint8_t *bytes, size_t len,
+    int site, int when);
+extern int moq_pq_threaded_test_dispatch_on_lane(
+    moq_pq_threaded_t *group, uint32_t lane, const uint8_t *bytes, size_t len,
+    const struct sockaddr_storage *from, const struct sockaddr_storage *to);
+
+#define SITE_SOCKET 0
+#define SITE_INBOX  1
+#define SITE_DETECT 2   /* a detection copy, compared on a lane that does not own it */
+
+static struct {
+    uint8_t bytes[PICOQUIC_MAX_PACKET_SIZE];
+    size_t len;
+    picoquic_connection_id_t a_cid;   /* the prefix: A's live group CID */
+    picoquic_cnx_t *a_cnx, *b_cnx;    /* B's only when it shares A's lane */
+    _Atomic int before, after;        /* calls before / after */
+    _Atomic int site, lane;
+    _Atomic int a_live_before;        /* the prefix resolves to A, ready */
+    _Atomic int a_ready_after;
+    _Atomic int b_ended_after;        /* B disconnected after the lookup */
+    _Atomic int compared[MOQ_PQ_THREADED_MAX_LANES];   /* detection copies, per lane */
+} g_probe;
+
+/* Whether `cnx` is still one of `quic`'s connections, so its fields may be
+ * read. */
+static bool cnx_present(picoquic_quic_t *quic, const picoquic_cnx_t *cnx)
+{
+    for (picoquic_cnx_t *c = picoquic_get_first_cnx(quic); c;
+         c = picoquic_get_next_cnx(c))
+        if (c == cnx) return true;
+    return false;
+}
+
+static void watch_probe(uint32_t lane, picoquic_quic_t *quic,
+                        const uint8_t *bytes, size_t len, int site, int when)
+{
+    if (len != g_probe.len || memcmp(bytes, g_probe.bytes, len) != 0) return;
+    if (site == SITE_DETECT) {
+        if (lane < MOQ_PQ_THREADED_MAX_LANES)
+            atomic_fetch_add(&g_probe.compared[lane], 1);
+        return;
+    }
+    if (when == 0) {
+        atomic_store(&g_probe.site, site);
+        atomic_store(&g_probe.lane, (int)lane);
+        bool live = g_probe.a_cnx && cnx_present(quic, g_probe.a_cnx) &&
+                    picoquic_cnx_by_id(quic, g_probe.a_cid, NULL) == g_probe.a_cnx &&
+                    picoquic_get_cnx_state(g_probe.a_cnx) == picoquic_state_ready;
+        atomic_store(&g_probe.a_live_before, live);
+        atomic_fetch_add(&g_probe.before, 1);
+    } else {
+        atomic_store(&g_probe.a_ready_after,
+                     g_probe.a_cnx && cnx_present(quic, g_probe.a_cnx) &&
+                     picoquic_get_cnx_state(g_probe.a_cnx) == picoquic_state_ready);
+        if (g_probe.b_cnx)
+            atomic_store(&g_probe.b_ended_after,
+                         cnx_present(quic, g_probe.b_cnx) &&
+                         picoquic_get_cnx_state(g_probe.b_cnx) ==
+                             picoquic_state_disconnected);
+        atomic_fetch_add(&g_probe.after, 1);
+    }
+}
+
+static void probe_watch(const uint8_t *bytes, size_t len)
+{
+    memset(&g_probe, 0, sizeof(g_probe));
+    memcpy(g_probe.bytes, bytes, len);
+    g_probe.len = len;
+    atomic_store(&g_probe.site, -1);
+    atomic_store(&g_probe.lane, -1);
+}
+
+static struct sockaddr_storage loopback(int port)
+{
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    struct sockaddr_in *a = (struct sockaddr_in *)&ss;
+    a->sin_family = AF_INET;
+#ifdef __APPLE__
+    a->sin_len = sizeof(*a);
+#endif
+    a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a->sin_port = htons((uint16_t)port);
+    return ss;
+}
+
+typedef enum {
+    LIVE_CROSS,      /* B on another lane; A's lane receives it from its socket */
+    LIVE_SOCKET,     /* B on A's lane; A's lane receives it from its socket */
+    LIVE_FORWARDED   /* B on A's lane; another lane receives and forwards it */
+} live_mode_t;
+
+/* A stateless reset carrying client B's token behind client A's live group
+ * CID still ends B's connection. The CID routes the datagram to A's lane,
+ * whose context ties it to A's connection although it cannot decrypt it. The
+ * test hands the datagram to the receiving lane it names, so each path is
+ * taken deliberately, and watches it on A's lane: just before A's lane
+ * injects it, the prefix must resolve to A's connection, ready; after A's
+ * lane's own lookup, A must still be ready.
+ *
+ * LIVE_CROSS: B is on another lane, so only the comparison on the other lanes
+ * can end it. LIVE_SOCKET and LIVE_FORWARDED: B shares A's lane and the reset
+ * is `len` bytes, below the size picoquic's ordinary ingress treats as a reset
+ * candidate, so only A's lane's own detection-only lookup can end B -- the one
+ * on the datagrams it reads from its socket, or the one on those its inbox
+ * delivers. B's connection is read on A's lane right after that lookup. */
+static void reset_behind_live_cid(const char *row, live_mode_t mode, size_t len)
 {
     enum { N = PROXY_MAX_CLIENTS, OBJECTS = 20, SWITCH_AFTER = 8 };
+    const bool same_lane = mode != LIVE_CROSS;
     static srv_ctx_t s;
     memset(&s, 0, sizeof(s));
     s.objects_per_sub = OBJECTS;
@@ -822,8 +963,8 @@ static void row_reset_crosslane(void)
             nap_ms(5);
         CHECK(atomic_load(&p.nclients) == i + 1);
     }
-    /* Establish and rebind every client: each then has a client-issued ID
-     * (so a token) and a retired first server CID. */
+    /* Establish every client and rebind them: the server then addresses each
+     * by a client-issued ID it has a token for. */
     for (struct timespec dl = deadline_in(30); time_before(&dl);) {
         int done = 0;
         for (int i = 0; i < N; i++) {
@@ -837,12 +978,11 @@ static void row_reset_crosslane(void)
         moq_pq_threaded_wait(cli[0], 10000);
     }
 
-    /* Map each client to the lane that owns it, by matching the first server
-     * CID it addressed to the one the server recorded for that connection. */
-    uint32_t cli_lane[N];
-    bool known[N];
+    /* Map each client to its server record, by matching the first server CID
+     * it addressed to the one the server recorded for that connection. */
+    conn_rec_t *rec_of[N];
     for (int i = 0; i < N; i++) {
-        known[i] = false;
+        rec_of[i] = NULL;
         if (!atomic_load(&p.clients[i].server_dcid_seen)) continue;
         unsigned nrec = atomic_load(&g_rec_next);
         for (unsigned r = 0; r < nrec; r++) {
@@ -850,63 +990,419 @@ static void row_reset_crosslane(void)
                                      memory_order_acquire) == (int)PQ_GROUP_CID_LEN &&
                 memcmp(g_recs[r].server_cid, p.clients[i].server_dcid,
                        PQ_GROUP_CID_LEN) == 0) {
-                cli_lane[i] = atomic_load_explicit(&g_recs[r].lane,
-                                                   memory_order_relaxed);
-                known[i] = true;
+                rec_of[i] = &g_recs[r];
                 break;
             }
         }
     }
 
-    /* A victim B and a prefix from a client A on a different lane. */
+    /* A victim B and a prefix from a client A, on a different lane or on
+     * B's. With more clients than lanes, some lane holds two of them. */
     int vb = -1, pa = -1;
-    for (int i = 0; i < N && vb < 0; i++)
-        if (cli[i] && known[i] && atomic_load(&p.clients[i].dcid_seen)) vb = i;
-    if (vb >= 0)
-        for (int i = 0; i < N; i++)
-            if (cli[i] && known[i] && cli_lane[i] != cli_lane[vb]) { pa = i; break; }
-    printf("reset_crosslane: victim=%d(lane %d) prefix=%d(lane %d)\n",
-           vb, vb >= 0 ? (int)cli_lane[vb] : -1, pa,
-           pa >= 0 ? (int)cli_lane[pa] : -1);
-    CHECK(vb >= 0 && pa >= 0);   /* two clients on different lanes */
+    for (int b = 0; b < N && pa < 0; b++) {
+        if (!cli[b] || !rec_of[b] || !atomic_load(&p.clients[b].dcid_seen))
+            continue;
+        for (int a = 0; a < N; a++) {
+            if (a == b || !cli[a] || !rec_of[a]) continue;
+            if ((atomic_load(&rec_of[a]->lane) == atomic_load(&rec_of[b]->lane)) ==
+                same_lane) {
+                vb = b;
+                pa = a;
+                break;
+            }
+        }
+    }
+    CHECK(vb >= 0 && pa >= 0);
+    if (vb < 0 || pa < 0) goto out;
+    {
+        uint32_t lane_a = atomic_load(&rec_of[pa]->lane);
+        uint32_t lane_b = atomic_load(&rec_of[vb]->lane);
+        uint32_t recv_lane = mode == LIVE_FORWARDED ? (lane_a + 1) % LANES : lane_a;
 
-    if (vb >= 0 && pa >= 0) {
-        struct sockaddr_in server;
-        memset(&server, 0, sizeof(server));
-        server.sin_family = AF_INET;
-        server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        server.sin_port = htons((uint16_t)port);
+        /* The group CID A is sending on now, as the proxy last saw it. */
+        picoquic_connection_id_t acid;
+        memset(&acid, 0, sizeof(acid));
+        acid.id_len = PQ_GROUP_CID_LEN;
+        pthread_mutex_lock(&g_cid_mu);
+        memcpy(acid.id, p.clients[pa].cur_server_dcid, PQ_GROUP_CID_LEN);
+        pthread_mutex_unlock(&g_cid_mu);
+
         picoquic_connection_id_t bcid;
         memset(&bcid, 0, sizeof(bcid));
         bcid.id_len = p.clients[vb].cid_len;
         memcpy(bcid.id, p.clients[vb].dcid, p.clients[vb].cid_len);
         uint8_t reset[64];
+        CHECK(len <= sizeof(reset));
         for (size_t k = 0; k < sizeof(reset); k++) reset[k] = (uint8_t)rand();
         reset[0] = 0x40 | (reset[0] & 0x3F);
-        /* The prefix verifies to lane A, which retired it; the token is the
-         * one B advertised for the ID the server addresses it by. */
-        memcpy(reset + 1, p.clients[pa].server_dcid, PQ_GROUP_CID_LEN);
+        memcpy(reset + 1, acid.id, PQ_GROUP_CID_LEN);
         CHECK(picoquic_create_cnxid_reset_secret(
                   c[vb].quic, &bcid,
-                  reset + sizeof(reset) - PICOQUIC_RESET_SECRET_SIZE) == 0);
-        ssize_t w = sendto(p.clients[vb].sfd, reset, sizeof(reset), 0,
-                           (struct sockaddr *)&server, sizeof(server));
-        CHECK(w == (ssize_t)sizeof(reset));
+                  reset + len - PICOQUIC_RESET_SECRET_SIZE) == 0);
 
-        int closed = 0;
-        for (struct timespec dl = deadline_in(15); time_before(&dl);) {
-            if (atomic_load(&c[vb].closed) ||
-                moq_pq_threaded_wait(cli[vb], 0) == MOQ_ERR_CLOSED) {
-                closed = 1;
-                break;
+        probe_watch(reset, len);
+        g_probe.a_cid = acid;
+        g_probe.a_cnx = atomic_load(&rec_of[pa]->cnx);
+        g_probe.b_cnx = same_lane ? atomic_load(&rec_of[vb]->cnx) : NULL;
+        atomic_store(&g_probe.b_ended_after, -1);
+        atomic_store(&moq_pq_threaded_test_owner_probe, watch_probe);
+
+        /* From B's address as the server knows it: the proxy socket B's
+         * traffic arrives from. */
+        struct sockaddr_storage from, to = loopback(port);
+        socklen_t flen = sizeof(from);
+        memset(&from, 0, sizeof(from));
+        CHECK(getsockname(p.clients[vb].sfd, (struct sockaddr *)&from, &flen) == 0);
+        ((struct sockaddr_in *)&from)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int route = moq_pq_threaded_test_dispatch_on_lane(srv, recv_lane, reset,
+                                                          len, &from, &to);
+        for (struct timespec dl = deadline_in(5);
+             time_before(&dl) && atomic_load(&g_probe.after) == 0;)
+            nap_ms(1);
+        atomic_store(&moq_pq_threaded_test_owner_probe, NULL);
+
+        printf("%s: A=%d(lane %u) B=%d(lane %u), %zu bytes received on lane %u, "
+               "route %d, owner site %d on lane %d, A live before %d, A ready "
+               "after %d, B ended after %d\n", row, pa, lane_a, vb, lane_b, len,
+               recv_lane, route, atomic_load(&g_probe.site),
+               atomic_load(&g_probe.lane), atomic_load(&g_probe.a_live_before),
+               atomic_load(&g_probe.a_ready_after),
+               atomic_load(&g_probe.b_ended_after));
+        CHECK(route == (mode == LIVE_FORWARDED ? PQ_ROUTE_LANE : PQ_ROUTE_LOCAL));
+        CHECK(atomic_load(&g_probe.before) == 1);
+        CHECK(atomic_load(&g_probe.after) == 1);
+        CHECK(atomic_load(&g_probe.site) ==
+              (mode == LIVE_FORWARDED ? SITE_INBOX : SITE_SOCKET));
+        CHECK(atomic_load(&g_probe.lane) == (int)lane_a);
+        CHECK(atomic_load(&g_probe.a_live_before) == 1);   /* the prerequisite */
+        CHECK(atomic_load(&g_probe.a_ready_after) == 1);   /* A unaffected */
+
+        if (same_lane) {
+            CHECK(atomic_load(&g_probe.b_ended_after) == 1);   /* B ended */
+        } else {
+            /* B ends on its own lane, from the comparison offered there. */
+            int closed = 0;
+            for (struct timespec dl = deadline_in(15); time_before(&dl);) {
+                if (atomic_load(&c[vb].closed) ||
+                    moq_pq_threaded_wait(cli[vb], 0) == MOQ_ERR_CLOSED) {
+                    closed = 1;
+                    break;
+                }
+                moq_pq_threaded_wake(cli[vb]);
+                nap_ms(10);
             }
-            moq_pq_threaded_wake(cli[vb]);
-            nap_ms(10);
+            printf("%s: B closed=%d\n", row, closed);
+            CHECK(closed == 1);
         }
-        printf("reset_crosslane: victim closed=%d\n", closed);
-        CHECK(closed == 1);
+        CHECK(!atomic_load(&c[pa].closed));
     }
+out:
+    for (int i = 0; i < N; i++) stop(&cli[i]);
+    atomic_store(&p.stop, 1);
+    pthread_join(p.thread, NULL);
+    close(p.cfd);
+    stop(&srv);
+}
 
+static void row_reset_crosslane(void)
+{
+    reset_behind_live_cid("reset_crosslane", LIVE_CROSS, 64);
+}
+
+/* 1 header byte, A's group CID, 2 bytes of padding, B's token: at least the
+ * detection floor and below picoquic's ingress reset size. */
+#define RESET_LOCAL_LEN (1u + PQ_GROUP_CID_LEN + 2u + PICOQUIC_RESET_SECRET_SIZE)
+_Static_assert(RESET_LOCAL_LEN >= PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE &&
+               RESET_LOCAL_LEN < PICOQUIC_RESET_PACKET_MIN_SIZE,
+               "reset_local's size is visible to detection only");
+
+static void row_reset_local(void)
+{
+    reset_behind_live_cid("reset_local", LIVE_SOCKET, RESET_LOCAL_LEN);
+}
+
+static void row_reset_forwarded(void)
+{
+    reset_behind_live_cid("reset_forwarded", LIVE_FORWARDED, RESET_LOCAL_LEN);
+}
+
+/* Send `len` bytes ending in the token client `i` advertised for the ID the
+ * server addresses it by, from socket `fd`. Byte 0 is `first`; the rest of the
+ * prefix is random. */
+static bool send_token_datagram(const proxy_t *p, cli_ctx_t *c, int i, int fd,
+                                int port, uint8_t first, size_t len)
+{
+    const proxy_client_t *pc = &p->clients[i];
+    picoquic_connection_id_t cid;
+    memset(&cid, 0, sizeof(cid));
+    cid.id_len = pc->cid_len;
+    memcpy(cid.id, pc->dcid, pc->cid_len);
+    uint8_t dg[64];
+    if (len > sizeof(dg) || len < PICOQUIC_RESET_SECRET_SIZE) return false;
+    for (size_t k = 0; k < len; k++) dg[k] = (uint8_t)rand();
+    dg[0] = first;
+    if (picoquic_create_cnxid_reset_secret(
+            c[i].quic, &cid, dg + len - PICOQUIC_RESET_SECRET_SIZE) != 0)
+        return false;
+    struct sockaddr_in server;
+    memset(&server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server.sin_port = htons((uint16_t)port);
+    return sendto(fd, dg, len, 0, (struct sockaddr *)&server,
+                  sizeof(server)) == (ssize_t)len;
+}
+
+/* The server's connection count once it reaches `want`, or after `ms`. */
+static size_t conn_count_after(moq_pq_threaded_t *srv, size_t want, int ms)
+{
+    uint64_t end = mono_us() + (uint64_t)ms * 1000u;
+    while (mono_us() < end && moq_pq_threaded_conn_count(srv) != want)
+        nap_ms(5);
+    return moq_pq_threaded_conn_count(srv);
+}
+
+/* The sum of the lanes' reset_fanout_in: detection copies compared so far. */
+static uint64_t fanout_in_sum(moq_pq_threaded_t *srv)
+{
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < LANES; i++) {
+        moq_picoquic_threaded_lane_stats_t st;
+        moq_pq_threaded_lane_t *l = moq_pq_threaded_lane(srv, i);
+        if (l && moq_picoquic_threaded_lane_get_stats(l, &st, sizeof(st)) == MOQ_OK)
+            sum += st.reset_fanout_in;
+    }
+    return sum;
+}
+
+static uint32_t be32_at(const uint8_t *b)
+{
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+}
+
+#define VN_CID_LEN 8u
+
+/* Whether `b` is exactly the Version Negotiation picoquic answers `init`
+ * with: version 0, the connection IDs swapped, every supported version in
+ * order, then one reserved version other than the one offered (RFC 9000
+ * section 17.2.1, RFC 9000 section 15). */
+static bool vn_exact(const uint8_t *b, size_t len, const uint8_t *init,
+                     uint32_t offered)
+{
+    size_t want = 1 + 4 + 1 + VN_CID_LEN + 1 + VN_CID_LEN +
+                  4 * (picoquic_nb_supported_versions + 1);
+    if (len != want || !(b[0] & 0x80) || be32_at(b + 1) != 0) return false;
+    if (b[5] != VN_CID_LEN || memcmp(b + 6, init + 7 + VN_CID_LEN, VN_CID_LEN) != 0)
+        return false;
+    const uint8_t *q = b + 6 + VN_CID_LEN;
+    if (q[0] != VN_CID_LEN || memcmp(q + 1, init + 6, VN_CID_LEN) != 0)
+        return false;
+    q += 1 + VN_CID_LEN;
+    for (size_t i = 0; i < picoquic_nb_supported_versions; i++, q += 4)
+        if (be32_at(q) != picoquic_supported_versions[i].version) return false;
+    uint32_t grease = be32_at(q);
+    return (grease & 0x0F0F0F0Fu) == 0x0A0A0A0Au && grease != offered;
+}
+
+/* What the group's detection compares, on whichever lanes the datagram
+ * reaches.
+ *
+ * First, an Initial of an unsupported version from an address no connection
+ * is on, ending in victim B's token with one bit changed. The lane that owns
+ * it injects it once and answers with exactly the Version Negotiation picoquic
+ * is configured to send; the lanes it is offered to compare it, detection
+ * only -- each other lane is seen comparing that copy, once -- and send
+ * nothing and create no connection: the stranger's socket receives that one
+ * datagram and nothing else, during the comparisons and after them.
+ *
+ * Then, held to the server's connection count: a token match from an address
+ * the connection is not on, a datagram one byte shorter than the smallest
+ * reset, and a version-zero datagram with an empty destination ID and no
+ * matching token end nothing. A 21-byte reset with B's token -- too short to
+ * carry a group CID, so no lane owns it -- ends B, which shows the negatives
+ * sent before it had a live connection to miss. The same reset again does not
+ * reduce the count again, and the group still detects: victim C's reset ends
+ * C. */
+static void row_reset_controls(void)
+{
+    enum { N = PROXY_MAX_CLIENTS, OBJECTS = 20, SWITCH_AFTER = 8 };
+    enum { NEG_MS = 500, POS_MS = 5000 };
+    static srv_ctx_t s;
+    memset(&s, 0, sizeof(s));
+    s.objects_per_sub = OBJECTS;
+    atomic_store(&s.deadline_at, UINT64_MAX);
+    int port = 0;
+    moq_pq_threaded_t *srv = server_on_free_port(LANES, 16, &s, false, &port);
+    CHECK(srv != NULL);
+    if (!srv) return;
+    static proxy_t p;
+    memset(&p, 0, sizeof(p));
+    p.server_port = port;
+    p.switch_after = SWITCH_AFTER;
+    p.client_port = pick_free_udp_port();
+    p.cfd = udp_loopback_socket(p.client_port);
+    CHECK(p.cfd >= 0);
+    CHECK(pthread_create(&p.thread, NULL, proxy_main, &p) == 0);
+    static cli_ctx_t c[N];
+    moq_pq_threaded_t *cli[N];
+    memset(c, 0, sizeof(c));
+    for (int i = 0; i < N; i++) {
+        cli[i] = client_create(p.client_port, &c[i]);
+        CHECK(cli[i] != NULL);
+        for (struct timespec dl = deadline_in(10);
+             cli[i] && time_before(&dl) && atomic_load(&p.nclients) < i + 1;)
+            nap_ms(5);
+        CHECK(atomic_load(&p.nclients) == i + 1);
+    }
+    for (struct timespec dl = deadline_in(30); time_before(&dl);) {
+        int done = 0;
+        for (int i = 0; i < N; i++) {
+            if (!cli[i]) { done++; continue; }
+            if (atomic_load(&c[i].whole) >= OBJECTS &&
+                atomic_load(&p.clients[i].dcid_seen)) done++;
+            else moq_pq_threaded_wake(cli[i]);
+        }
+        if (done == N) break;
+        moq_pq_threaded_wait(cli[0], 10000);
+    }
+    int vb = -1, vc = -1;
+    for (int i = 0; i < N; i++) {
+        if (!cli[i] || !atomic_load(&p.clients[i].dcid_seen)) continue;
+        if (vb < 0) vb = i;
+        else if (vc < 0) vc = i;
+    }
+    CHECK(vb >= 0 && vc >= 0);
+    CHECK(moq_pq_threaded_conn_count(srv) == N);
+    int stranger = udp_loopback_socket(0);
+    CHECK(stranger >= 0);
+
+    if (vb >= 0 && vc >= 0 && stranger >= 0 &&
+        moq_pq_threaded_conn_count(srv) == N) {
+        int bfd = p.clients[vb].sfd, cfd = p.clients[vc].sfd;
+        size_t wrong_addr, short20, vn, first21, repeat21, other21;
+        {
+            enum { INIT_LEN = 1200 };
+            const uint32_t offered = 0x1a2a3a4au;   /* reserved: unsupported */
+            uint8_t init[INIT_LEN];
+            for (size_t k = 0; k < sizeof(init); k++) init[k] = (uint8_t)rand();
+            init[0] = 0xC0 | (init[0] & 0x0F);      /* long header, Initial */
+            init[1] = (uint8_t)(offered >> 24);
+            init[2] = (uint8_t)(offered >> 16);
+            init[3] = (uint8_t)(offered >> 8);
+            init[4] = (uint8_t)offered;
+            init[5] = VN_CID_LEN;
+            init[6 + VN_CID_LEN] = VN_CID_LEN;
+            picoquic_connection_id_t bcid;
+            memset(&bcid, 0, sizeof(bcid));
+            bcid.id_len = p.clients[vb].cid_len;
+            memcpy(bcid.id, p.clients[vb].dcid, p.clients[vb].cid_len);
+            uint8_t *tok = init + INIT_LEN - PICOQUIC_RESET_SECRET_SIZE;
+            CHECK(picoquic_create_cnxid_reset_secret(c[vb].quic, &bcid, tok) == 0);
+            tok[0] ^= 0x01;   /* a known token, one bit off: no match */
+
+            probe_watch(init, sizeof(init));
+            atomic_store(&moq_pq_threaded_test_owner_probe, watch_probe);
+            uint64_t fanned = fanout_in_sum(srv);
+            struct sockaddr_storage to = loopback(port);
+            CHECK(sendto(stranger, init, sizeof(init), 0, (struct sockaddr *)&to,
+                         sizeof(struct sockaddr_in)) == (ssize_t)sizeof(init));
+            /* Collect what comes back until the owner has injected the
+             * Initial once and every other lane has compared its copy (a
+             * bounded wait), then for NEG_MS more: the silence checked covers
+             * the time after those comparisons, not only before them. */
+            int replies = 0, exact = 0;
+            bool settled = false;
+            uint64_t settle_by = mono_us() + 5000000u, end = 0;
+            for (;;) {
+                uint64_t now_us = mono_us();
+                if (end == 0) {
+                    int owner = atomic_load(&g_probe.lane);
+                    bool all = atomic_load(&g_probe.before) == 1 && owner >= 0;
+                    for (uint32_t l = 0; all && l < LANES; l++)
+                        if ((int)l != owner && atomic_load(&g_probe.compared[l]) == 0)
+                            all = false;
+                    if (all || now_us >= settle_by) {
+                        settled = all;
+                        end = now_us + (uint64_t)NEG_MS * 1000u;
+                    }
+                }
+                if (end != 0 && now_us >= end) break;
+                struct pollfd pf = { .fd = stranger, .events = POLLIN };
+                if (poll(&pf, 1, 20) <= 0) continue;
+                uint8_t rb[PICOQUIC_MAX_PACKET_SIZE];
+                ssize_t got = recv(stranger, rb, sizeof(rb), MSG_DONTWAIT);
+                if (got <= 0) continue;
+                replies++;
+                if (vn_exact(rb, (size_t)got, init, offered)) exact++;
+            }
+            atomic_store(&moq_pq_threaded_test_owner_probe, NULL);
+            int owner = atomic_load(&g_probe.lane);
+            uint64_t compared = fanout_in_sum(srv) - fanned;
+            size_t conns = moq_pq_threaded_conn_count(srv);
+            printf("reset_controls: unsupported-version Initial: owner injected "
+                   "%d time(s) on lane %d, its copy compared per lane",
+                   atomic_load(&g_probe.before), owner);
+            for (uint32_t l = 0; l < LANES; l++)
+                printf(" %d", atomic_load(&g_probe.compared[l]));
+            printf(" (settled %d), %d datagram(s) back, %d exact VN, %llu "
+                   "detection copies compared in all, %zu connections\n",
+                   settled, replies, exact, (unsigned long long)compared, conns);
+            CHECK(atomic_load(&g_probe.before) == 1);   /* owner processed it */
+            CHECK(settled);
+            for (uint32_t l = 0; l < LANES; l++)   /* its copy, on each other lane */
+                CHECK(atomic_load(&g_probe.compared[l]) == ((int)l == owner ? 0 : 1));
+            CHECK(exact == 1);                          /* its VN, exactly */
+            CHECK(replies == 1);       /* nothing from the detection copies */
+            CHECK(compared >= LANES - 1);   /* accounting: copies were compared */
+            CHECK(conns == N);              /* no connection created */
+        }
+        CHECK(send_token_datagram(&p, c, vb, stranger, port, 0x40, 64));
+        wrong_addr = conn_count_after(srv, N - 1, NEG_MS);
+        CHECK(send_token_datagram(&p, c, vb, bfd, port, 0x40,
+                                  PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE - 1));
+        short20 = conn_count_after(srv, N - 1, NEG_MS);
+        {
+            /* Version 0 and an empty destination ID, then random bytes: the
+             * trailer is no client's token. Only the connection count is
+             * held here. */
+            uint8_t dg[64];
+            for (size_t k = 0; k < sizeof(dg); k++) dg[k] = (uint8_t)rand();
+            dg[0] = 0x80 | (dg[0] & 0x7F);
+            memset(dg + 1, 0, 4);
+            dg[5] = 0;
+            struct sockaddr_in server;
+            memset(&server, 0, sizeof(server));
+            server.sin_family = AF_INET;
+            server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            server.sin_port = htons((uint16_t)port);
+            CHECK(sendto(bfd, dg, sizeof(dg), 0, (struct sockaddr *)&server,
+                         sizeof(server)) == (ssize_t)sizeof(dg));
+        }
+        vn = conn_count_after(srv, N - 1, NEG_MS);
+        CHECK(send_token_datagram(&p, c, vb, bfd, port, 0x40,
+                                  PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE));
+        first21 = conn_count_after(srv, N - 1, POS_MS);
+        CHECK(send_token_datagram(&p, c, vb, bfd, port, 0x40,
+                                  PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE));
+        repeat21 = conn_count_after(srv, N - 2, NEG_MS);
+        CHECK(send_token_datagram(&p, c, vc, cfd, port, 0x40,
+                                  PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE));
+        other21 = conn_count_after(srv, N - 2, POS_MS);
+        printf("reset_controls: server connections of %d: wrong address %zu, "
+               "%d bytes %zu, version-zero datagram %zu, %d-byte reset "
+               "%zu, repeated %zu, second victim %zu\n", N, wrong_addr,
+               PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE - 1, short20, vn,
+               PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE, first21, repeat21,
+               other21);
+        CHECK(wrong_addr == N);
+        CHECK(short20 == N);
+        CHECK(vn == N);
+        CHECK(first21 == N - 1);
+        CHECK(repeat21 == N - 1);
+        CHECK(other21 == N - 2);
+    }
+    if (stranger >= 0) close(stranger);
     for (int i = 0; i < N; i++) stop(&cli[i]);
     atomic_store(&p.stop, 1);
     pthread_join(p.thread, NULL);
@@ -1415,6 +1911,9 @@ int main(int argc, char **argv)
     else if (strcmp(row, "rebind") == 0) row_rebind();
     else if (strcmp(row, "reset") == 0) row_reset();
     else if (strcmp(row, "reset_crosslane") == 0) row_reset_crosslane();
+    else if (strcmp(row, "reset_local") == 0) row_reset_local();
+    else if (strcmp(row, "reset_forwarded") == 0) row_reset_forwarded();
+    else if (strcmp(row, "reset_controls") == 0) row_reset_controls();
     else if (strcmp(row, "stop_load") == 0) row_stop_load();
     else if (strcmp(row, "deadline") == 0) row_deadline();
     else if (strcmp(row, "deadline_one") == 0) row_deadline_one();

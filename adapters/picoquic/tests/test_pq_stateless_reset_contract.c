@@ -25,6 +25,11 @@
  *            it: B detected, A unaffected. Then B's unmodified reset: detected.
  *   case 3   the restarted client context has reset sending disabled: no reset
  *            is produced, and the server connection stays up.
+ *   case 4   the server context has reset sending disabled: a genuine reset
+ *            it receives is still detected -- the reset callback runs and the
+ *            connection is disconnected. A probe for an unknown connection
+ *            then draws no reset from it, and draws one once sending is
+ *            enabled again, so the switch was in effect.
  *
  * Exit status: 0 when every case holds; 1 when a case fails with every
  * prerequisite and control holding; 2 when a prerequisite or control did not
@@ -399,7 +404,7 @@ int main(int argc, char **argv)
     memset(g_seed_client, 0xC1, sizeof(g_seed_client));
     memset(g_seed_server, 0x5E, sizeof(g_seed_server));
     net_t n;
-    bool f1 = false, f2 = false, no_send_violated = false;
+    bool f1 = false, f2 = false, f4 = false, no_send_violated = false;
 
     /* -- case 0: the client's initial CID carries no token -------------------- */
     setup(&n);
@@ -570,15 +575,62 @@ int main(int argc, char **argv)
     picoquic_free(n.client);
     picoquic_free(n.server);
 
+    /* -- case 4: reception while the receiver's sending is disabled -------- */
+    setup(&n);
+    picoquic_set_stateless_reset_sending(n.server, 0);
+    picoquic_cnx_t *c4 = connect_one(&n);
+    picoquic_cnx_t *s4 = c4 ? server_for(&n, c4) : NULL;
+    printf("case 4 (server with reset sending disabled receives a reset): "
+           "established %s\n", s4 ? "yes" : "NO");
+    REQUIRE(s4 != NULL, "case 4 connection");
+    if (s4) {
+        bool ref = server_refresh(&n, s4);
+        printf("  server CID refresh: %s\n", ref ? "yes" : "NO");
+        REQUIRE(ref, "case 4 CID refresh");
+        client_restart(&n);
+        bool got = capture_reset(&n, s4);
+        printf("  reset produced: %s (%zu bytes)\n", got ? "yes" : "NO",
+               n.cap_len);
+        REQUIRE(got && reset_shape(n.cap, n.cap_len), "case 4 reset capture");
+        if (got) {
+            deliver_captured(&n, n.cap, n.cap_len);
+            report("after reset (RFC: detected; sending is not reception)", s4);
+            /* Both facts: the reset callback, and the connection terminal. */
+            f4 = !detected(s4) ||
+                 picoquic_get_cnx_state(s4) != picoquic_state_disconnected;
+        }
+        /* A short-header datagram for a connection ID the server never
+         * issued, long enough to be answered with a reset. */
+        uint8_t probe[64];
+        for (size_t k = 0; k < sizeof(probe); k++)
+            probe[k] = (uint8_t)(0xA5 ^ (k * 29));
+        probe[0] = 0x40 | (probe[0] & 0x3F);
+        size_t queued = g_tail;
+        deliver_captured(&n, probe, sizeof(probe));
+        send_side(&n, 1);
+        bool silent = g_tail == queued;
+        picoquic_set_stateless_reset_sending(n.server, 1);
+        queued = g_tail;
+        deliver_captured(&n, probe, sizeof(probe));
+        send_side(&n, 1);
+        bool answered = g_tail != queued;
+        printf("  unknown-CID probe: sending disabled %s, enabled %s\n",
+               silent ? "silent" : "ANSWERED", answered ? "answered" : "SILENT");
+        REQUIRE(silent && answered, "case 4 sending switch in effect");
+    }
+    picoquic_free(n.client);
+    picoquic_free(n.server);
+
     if (g_harness_failures) {
         printf("RESULT: harness invalid (%d prerequisite/control failures); "
                "this run proves nothing\n", g_harness_failures);
         return 2;
     }
     printf("RESULT: rebinding detection %s; other-connection prefix detection %s; "
-           "no-send policy %s\n", f1 ? "FAILED" : "ok", f2 ? "FAILED" : "ok",
-           no_send_violated ? "FAILED" : "ok");
-    if (f1 || f2 || no_send_violated) {
+           "no-send policy %s; detection with sending disabled %s\n",
+           f1 ? "FAILED" : "ok", f2 ? "FAILED" : "ok",
+           no_send_violated ? "FAILED" : "ok", f4 ? "FAILED" : "ok");
+    if (f1 || f2 || no_send_violated || f4) {
         printf("FAILED: picoquic stateless-reset contract\n");
         return 1;
     }

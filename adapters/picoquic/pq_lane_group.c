@@ -7,8 +7,9 @@
  * lane's sockets and wake pipe, the wake-up callback when the application
  * woke the lane, then up to PQ_GROUP_RECV_BUDGET datagrams read and routed,
  * up to PQ_GROUP_INJECT_BUDGET forwarded datagrams injected, the
- * stateless-reset candidates other lanes offered looked at with reset
- * sending disabled, the after-receive callback once for all of them, then up
+ * stateless-reset candidates other lanes offered compared with this lane's
+ * registered reset tokens, the after-receive callback once for all of them,
+ * then up
  * to PQ_GROUP_SEND_BUDGET packets sent and the after-send callback, which
  * pumps. A turn that stops at a budget with work left makes the next wait
  * zero, so a refilling socket or inbox cannot starve the pump, the deadlines
@@ -49,6 +50,9 @@
 /* The routing module's restated constants must be picoquic's. */
 _Static_assert(PQ_ROUTE_RESET_MIN_LEN == PICOQUIC_RESET_PACKET_MIN_SIZE,
                "reset minimum");
+_Static_assert(PQ_ROUTE_RESET_DETECT_MIN_LEN ==
+                   PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE,
+               "reset detection minimum");
 _Static_assert(PQ_INBOX_PAYLOAD == PICOQUIC_MAX_PACKET_SIZE, "slot payload");
 
 enum {
@@ -318,33 +322,67 @@ static void group_request_stop(struct pq_lane_group *g, bool fatal)
     }
 }
 
-/* Inject one datagram into the lane's context; `detect_only` looks for a
- * stateless reset without ever answering with one. */
-/* Hand a datagram to this lane's context. Returns the connection it was
- * associated with, or NULL when the context tied it to none -- the signal
- * that a verifiable-CID datagram the router sent here may in fact be a
- * stateless reset for a connection another lane owns. */
-static picoquic_cnx_t *lane_inject(struct pq_lane *ln, uint8_t *bytes,
-                                   size_t len, struct sockaddr_storage *from,
-                                   struct sockaddr_storage *to, int if_index,
-                                   unsigned char ecn, uint64_t now,
-                                   bool detect_only)
+#ifdef MOQ_PQ_THREADED_TESTING
+/* Called on the owner lane's thread around each datagram it owns: before it
+ * is injected (when 0) and after the owner's own reset lookup (when 1),
+ * with the site it arrived by (0 the lane's socket, 1 its inbox). Also called
+ * on a lane once it has compared a detection copy another lane offered it
+ * (site 2, when 1). A test reads the lane's connection state here, serialized
+ * with the context. Defined only in the test-internals archive, never the
+ * shipped library. */
+void (*_Atomic moq_pq_threaded_test_owner_probe)(uint32_t lane,
+                                                picoquic_quic_t *quic,
+                                                const uint8_t *bytes,
+                                                size_t len, int site,
+                                                int when);
+#endif
+
+static void owner_probe(struct pq_lane *ln, const uint8_t *bytes, size_t len,
+                        int site, int when)
 {
-    picoquic_quic_t *quic = ln->facade->quic;
-    picoquic_cnx_t *first = NULL;
-    /* A detection copy must not draw a reset of its own, so reset sending is
-     * off across the inject, then restored to the group's policy, which the
-     * group enforces on at context create -- the lane answers unknown
-     * connection IDs it owns with resets. */
-    if (detect_only) picoquic_set_stateless_reset_sending(quic, 0);
-    (void)picoquic_incoming_packet_ex(quic, bytes, len, (struct sockaddr *)from,
-                                      (struct sockaddr *)to, if_index, ecn,
-                                      &first, now);
-    if (detect_only) picoquic_set_stateless_reset_sending(quic, 1);
-    return first;
+#ifdef MOQ_PQ_THREADED_TESTING
+    void (*fn)(uint32_t, picoquic_quic_t *, const uint8_t *, size_t, int, int) =
+        atomic_load(&moq_pq_threaded_test_owner_probe);
+    if (fn) fn(ln->index, ln->facade->quic, bytes, len, site, when);
+#else
+    (void)ln; (void)bytes; (void)len; (void)site; (void)when;
+#endif
 }
 
-/* Offer a reset candidate to every other lane, within this turn's budget. */
+/* Hand a datagram to this lane's context for ordinary processing: this lane
+ * owns it. Ordinary ingress is not this lane's reset detection -- it only
+ * compares tokens on the paths its header parse reaches -- so the owner also
+ * runs lane_detect on every datagram it injects. */
+static void lane_inject(struct pq_lane *ln, uint8_t *bytes, size_t len,
+                        struct sockaddr_storage *from,
+                        struct sockaddr_storage *to, int if_index,
+                        unsigned char ecn, uint64_t now)
+{
+    picoquic_cnx_t *first = NULL;
+    (void)picoquic_incoming_packet_ex(ln->facade->quic, bytes, len,
+                                      (struct sockaddr *)from,
+                                      (struct sockaddr *)to, if_index, ecn,
+                                      &first, now);
+}
+
+/* Compare a datagram's trailing bytes with the reset tokens this lane's
+ * context has registered for the sender's address: detection only. No packet
+ * is processed, no connection created, nothing sent; a match resets its
+ * connection once (a repeat finds it already disconnected). Shorter input
+ * cannot match. */
+static void lane_detect(struct pq_lane *ln, const uint8_t *bytes, size_t len,
+                        const struct sockaddr_storage *from, uint64_t now)
+{
+    picoquic_reset_detection_enum d = picoquic_reset_detection_none;
+    if (len < PQ_ROUTE_RESET_DETECT_MIN_LEN) return;
+    (void)picoquic_detect_stateless_reset(ln->facade->quic, bytes, len,
+                                          (const struct sockaddr *)from, now,
+                                          &d);
+}
+
+/* Offer a datagram to every other lane for reset detection, within this
+ * turn's budget. Only the lane that owns the datagram -- the one that hands it
+ * to its context -- offers it, so a forwarded datagram is offered once. */
 static void lane_fanout(struct pq_lane *ln, const uint8_t *bytes, size_t len,
                         const struct sockaddr_storage *from,
                         const struct sockaddr_storage *to, int if_index,
@@ -365,12 +403,57 @@ static void lane_fanout(struct pq_lane *ln, const uint8_t *bytes, size_t len,
     }
 }
 
+/* Route one datagram this lane read from its socket and act on the route.
+ * Returns the route taken. */
+static pq_route_kind_t lane_dispatch(struct pq_lane *ln, uint8_t *buf,
+                                     size_t len, struct sockaddr_storage *from,
+                                     struct sockaddr_storage *to, int if_index,
+                                     unsigned char ecn, uint64_t now,
+                                     size_t *bytes_total, int *fanout)
+{
+    struct pq_lane_group *g = ln->g;
+    pq_route_t r = pq_cid_route(buf, len, ln->index, g->count, &k_route_ops,
+                                &ln->crypto);
+    switch (r.kind) {
+    case PQ_ROUTE_LOCAL:
+        owner_probe(ln, buf, len, 0, 0);
+        lane_inject(ln, buf, len, from, to, if_index, ecn, now);
+        *bytes_total += len;
+        /* Whatever this lane made of it, the datagram may also be a reset
+         * whose token this lane or another holds: association to a
+         * connection here does not rule that out, so every candidate is
+         * compared here and offered to the others. */
+        lane_detect(ln, buf, len, from, now);
+        owner_probe(ln, buf, len, 0, 1);
+        if (len >= PQ_ROUTE_RESET_DETECT_MIN_LEN)
+            lane_fanout(ln, buf, len, from, to, if_index, ecn, fanout);
+        break;
+    case PQ_ROUTE_LANE: {
+        struct pq_lane *owner = &g->lanes[r.lane];
+        if (pq_inbox_push(&owner->inbox, buf, len, from, to, if_index, ecn)) {
+            st_add(ln, ST_FWD_OUT, 1);
+            lane_signal(owner);
+        }
+        break;
+    }
+    case PQ_ROUTE_DETECT:
+        /* No owner: compare it here and on every other lane, detection
+         * only. */
+        lane_detect(ln, buf, len, from, now);
+        lane_fanout(ln, buf, len, from, to, if_index, ecn, fanout);
+        break;
+    case PQ_ROUTE_DROP:
+    default:
+        break;
+    }
+    return r.kind;
+}
+
 /* Read this turn's datagrams from one socket. Returns the datagrams read. */
 static int lane_receive(struct pq_lane *ln, struct pq_lane_socket *s,
                         int budget, uint64_t now, size_t *bytes_total,
                         int *fanout)
 {
-    struct pq_lane_group *g = ln->g;
     uint8_t buf[PICOQUIC_MAX_PACKET_SIZE + 1];
     int n = 0;
     while (n < budget) {
@@ -394,41 +477,8 @@ static int lane_receive(struct pq_lane *ln, struct pq_lane_socket *s,
         } else if (to.ss_family == AF_INET6) {
             ((struct sockaddr_in6 *)&to)->sin6_port = s->n_port;
         }
-        pq_route_t r = pq_cid_route(buf, (size_t)got, ln->index, g->count,
-                                    &k_route_ops, &ln->crypto);
-        switch (r.kind) {
-        case PQ_ROUTE_LOCAL: {
-            picoquic_cnx_t *first = lane_inject(ln, buf, (size_t)got, &from,
-                                                &to, if_index, ecn, now, false);
-            *bytes_total += (size_t)got;
-            /* Routed here by its CID but tied to no connection: it may be a
-             * reset for a connection another lane owns (its token, over a
-             * coincidental or retired CID). Offer it to the others for
-             * detection only -- no lane answers a copy with a reset. */
-            if (!first && (size_t)got >= PQ_ROUTE_RESET_DETECT_MIN_LEN)
-                lane_fanout(ln, buf, (size_t)got, &from, &to, if_index, ecn,
-                            fanout);
-            break;
-        }
-        case PQ_ROUTE_LANE: {
-            struct pq_lane *owner = &g->lanes[r.lane];
-            if (pq_inbox_push(&owner->inbox, buf, (size_t)got, &from, &to,
-                              if_index, ecn)) {
-                st_add(ln, ST_FWD_OUT, 1);
-                lane_signal(owner);
-            }
-            break;
-        }
-        case PQ_ROUTE_DETECT:
-            lane_inject(ln, buf, (size_t)got, &from, &to, if_index, ecn, now,
-                        true);
-            lane_fanout(ln, buf, (size_t)got, &from, &to, if_index, ecn,
-                        fanout);
-            break;
-        case PQ_ROUTE_DROP:
-        default:
-            break;
-        }
+        (void)lane_dispatch(ln, buf, (size_t)got, &from, &to, if_index, ecn,
+                            now, bytes_total, fanout);
     }
     return n;
 }
@@ -569,6 +619,60 @@ int moq_pq_threaded_test_set_detect_drops(moq_pq_threaded_lane_t *lane,
     atomic_store(&ln->detect.closed_drops, closed);
     return 0;
 }
+
+/* One datagram a test hands to a chosen lane, which dispatches it on its own
+ * thread exactly as a datagram read from its socket, so a test decides which
+ * lane receives it instead of the kernel. One at a time. */
+static uint8_t test_dg_bytes[PICOQUIC_MAX_PACKET_SIZE];
+static size_t test_dg_len;
+static struct sockaddr_storage test_dg_from, test_dg_to;
+static _Atomic uint32_t test_dg_lane;    /* lane index + 1; 0 = none pending */
+static _Atomic int test_dg_route;        /* route kind + 1 once dispatched */
+
+static int lane_take_test_datagram(struct pq_lane *ln, uint64_t now,
+                                   size_t *bytes_total, int *fanout)
+{
+    if (atomic_load_explicit(&test_dg_lane, memory_order_acquire) !=
+        ln->index + 1)
+        return 0;
+    pq_route_kind_t k = lane_dispatch(ln, test_dg_bytes, test_dg_len,
+                                      &test_dg_from, &test_dg_to, 0, 0, now,
+                                      bytes_total, fanout);
+    atomic_store_explicit(&test_dg_lane, 0, memory_order_relaxed);
+    atomic_store_explicit(&test_dg_route, (int)k + 1, memory_order_release);
+    return 1;
+}
+
+/* Dispatch `len` bytes on group lane `lane` as if its socket received them
+ * from `from` at `to`, and wait (bounded) for it. Returns the route the lane
+ * took, or -1. */
+int moq_pq_threaded_test_dispatch_on_lane(moq_pq_threaded_t *group,
+                                          uint32_t lane, const uint8_t *bytes,
+                                          size_t len,
+                                          const struct sockaddr_storage *from,
+                                          const struct sockaddr_storage *to)
+{
+    struct pq_lane_group *g = group ? group->group_ctx : NULL;
+    if (!g || lane >= g->count || !bytes || len == 0 ||
+        len > sizeof(test_dg_bytes) || !from || !to ||
+        atomic_load(&test_dg_lane) != 0)
+        return -1;
+    memcpy(test_dg_bytes, bytes, len);
+    test_dg_len = len;
+    test_dg_from = *from;
+    test_dg_to = *to;
+    atomic_store_explicit(&test_dg_route, 0, memory_order_relaxed);
+    atomic_store_explicit(&test_dg_lane, lane + 1, memory_order_release);
+    lane_signal(&g->lanes[lane]);
+    for (int i = 0; i < 5000; i++) {
+        int r = atomic_load_explicit(&test_dg_route, memory_order_acquire);
+        if (r != 0) return r - 1;
+        struct timespec ts = { 0, 1000000 };
+        nanosleep(&ts, NULL);
+    }
+    atomic_store(&test_dg_lane, 0);
+    return -1;
+}
 #endif
 
 static void *lane_main(void *arg)
@@ -645,20 +749,26 @@ static void *lane_main(void *arg)
         size_t bytes_recv = 0;
         int fanout = 0;
         int received = lane_recv_turn(ln, pfd, now, &bytes_recv, &fanout);
+#ifdef MOQ_PQ_THREADED_TESTING
+        received += lane_take_test_datagram(ln, now, &bytes_recv, &fanout);
+#endif
         int injected = 0;
         {
             pq_inbox_slot_t slot;
             while (injected < PQ_GROUP_INJECT_BUDGET &&
                    pq_inbox_pop(&ln->inbox, &slot)) {
-                picoquic_cnx_t *first =
-                    lane_inject(ln, slot.bytes, slot.len, &slot.from, &slot.to,
-                                slot.if_index, slot.ecn, now, false);
+                owner_probe(ln, slot.bytes, slot.len, 1, 0);
+                lane_inject(ln, slot.bytes, slot.len, &slot.from, &slot.to,
+                            slot.if_index, slot.ecn, now);
                 st_add(ln, ST_FWD_IN, 1);
                 bytes_recv += slot.len;
                 injected++;
-                /* Forwarded here by its CID but tied to no connection: as in
-                 * the local case, it may be a reset another lane owns. */
-                if (!first && slot.len >= PQ_ROUTE_RESET_DETECT_MIN_LEN)
+                /* This lane owns a forwarded datagram, so it, not the lane
+                 * that forwarded it, compares it and offers it for
+                 * detection. */
+                lane_detect(ln, slot.bytes, slot.len, &slot.from, now);
+                owner_probe(ln, slot.bytes, slot.len, 1, 1);
+                if (slot.len >= PQ_ROUTE_RESET_DETECT_MIN_LEN)
                     lane_fanout(ln, slot.bytes, slot.len, &slot.from, &slot.to,
                                 slot.if_index, slot.ecn, &fanout);
             }
@@ -668,8 +778,9 @@ static void *lane_main(void *arg)
             pq_inbox_slot_t slot;
             while (detected < PQ_GROUP_DETECT_BUDGET &&
                    pq_inbox_pop(&ln->detect, &slot)) {
-                lane_inject(ln, slot.bytes, slot.len, &slot.from, &slot.to,
-                            slot.if_index, slot.ecn, now, true);
+                /* Detection only, and never offered on again. */
+                lane_detect(ln, slot.bytes, slot.len, &slot.from, now);
+                owner_probe(ln, slot.bytes, slot.len, 2, 1);
                 st_add(ln, ST_FANOUT_IN, 1);
                 detected++;
             }

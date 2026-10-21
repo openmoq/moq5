@@ -521,7 +521,7 @@ typedef struct moq_picoquic_threaded_lane_stats {
     uint64_t inbox_discarded;      /* left in this lane's inbox at its exit */
     uint64_t oversize_drops;       /* received here; larger than advertised */
     uint64_t reset_fanout_out;     /* candidates this lane offered to others */
-    uint64_t reset_fanout_in;      /* candidates injected here, detection only */
+    uint64_t reset_fanout_in;      /* candidates compared here with this lane's tokens */
     uint64_t reset_fanout_skipped; /* candidates not offered: budget */
     uint64_t detection_drops;      /* destined here; detection ring full or closed */
     uint64_t detection_discarded;  /* left in this lane's detection ring at its exit */

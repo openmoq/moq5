@@ -1006,7 +1006,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             -Wall -Wextra -Wpedantic
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
-    foreach(_row spread rebind reset stop_load deadline deadline_one admission limits invariants oom bind_specific)
+    foreach(_row spread rebind reset reset_crosslane reset_local reset_forwarded reset_controls stop_load deadline deadline_one admission limits invariants oom bind_specific)
         add_test(NAME threaded_lane_group_${_row}
             COMMAND test_threaded_lane_group ${_row})
         set_tests_properties(threaded_lane_group_${_row} PROPERTIES TIMEOUT 120)
