@@ -18,6 +18,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 #define CHECK(expr)                                                     \
@@ -42,6 +43,7 @@ static struct sockaddr_storage addr(uint16_t port)
 typedef struct {
     pq_inbox_t *b;
     _Atomic int stop;
+    _Atomic int pushed;   /* set after its first push returns */
     uint64_t attempted;
     uint64_t accepted;
 } producer_t;
@@ -56,6 +58,7 @@ static void *producer_main(void *arg)
         p->attempted++;
         if (pq_inbox_push(p->b, dg, sizeof(dg), &from, &to, 0, 0))
             p->accepted++;
+        atomic_store(&p->pushed, 1);
     }
     return NULL;
 }
@@ -145,7 +148,19 @@ int main(void)
         prod[i].b = &b;
         CHECK(pthread_create(&th[i], NULL, producer_main, &prod[i]) == 0);
     }
+    /* The close must fall while every producer is running, and each must
+     * then be refused at least once; both waits are bounded (5 s). */
+    const struct timespec ms = { .tv_sec = 0, .tv_nsec = 1000000 };
     uint64_t popped = 0;
+    bool all_pushed = false;
+    for (int round = 0; round < 5000 && !all_pushed; round++) {
+        while (pq_inbox_pop(&b, &out)) popped++;
+        all_pushed = true;
+        for (int i = 0; i < 3; i++)
+            if (!atomic_load(&prod[i].pushed)) all_pushed = false;
+        if (!all_pushed) nanosleep(&ms, NULL);
+    }
+    CHECK(all_pushed);
     for (int round = 0; round < 2000; round++) {
         while (pq_inbox_pop(&b, &out)) popped++;
     }
@@ -154,6 +169,8 @@ int main(void)
     for (int spin = 0; spin < 1000; spin++) {
         while (pq_inbox_pop(&b, &out)) { popped++; landed_after_close++; }
     }
+    for (int round = 0; round < 5000 && atomic_load(&b.closed_drops) == 0; round++)
+        nanosleep(&ms, NULL);
     for (int i = 0; i < 3; i++) atomic_store(&prod[i].stop, 1);
     for (int i = 0; i < 3; i++) pthread_join(th[i], NULL);
     while (pq_inbox_pop(&b, &out)) popped++;

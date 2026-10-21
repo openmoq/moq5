@@ -38,6 +38,9 @@ int main(void)
 
     uint8_t random[PQ_GROUP_CID_LEN], cid[PQ_GROUP_CID_LEN], cid2[PQ_GROUP_CID_LEN];
     uint32_t lane = 99;
+    /* A visible lane tag would show in every ID; random IDs match the tag's
+     * plaintext form (cid[1] == lane, cid[2] == 0) one time in 65536. */
+    unsigned samples = 0, tag_visible = 0;
     for (uint32_t lanes = 2; lanes <= 64; lanes *= 2) {
         for (uint32_t l = 0; l < lanes; l++) {
             pq_group_random(random, sizeof(random));
@@ -45,10 +48,11 @@ int main(void)
             CHECK((cid[0] & 0x07) == 0);
             CHECK(pq_group_cid_verify(&a, cid, lanes, &lane) && lane == l);
             CHECK(pq_group_cid_verify(&b, cid, lanes, &lane) && lane == l);
-            /* the lane tag is not visible */
-            CHECK(cid[1] != l || cid[2] != 0);
+            samples++;
+            if (cid[1] == l && cid[2] == 0) tag_visible++;
         }
     }
+    CHECK(tag_visible < samples / 2);   /* the lane tag is not visible */
     /* an ID of lane 5 in a group of 4 does not verify */
     pq_group_random(random, sizeof(random));
     pq_group_cid_make(&a, 5, random, cid);
