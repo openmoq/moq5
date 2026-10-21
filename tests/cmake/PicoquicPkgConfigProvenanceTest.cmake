@@ -11,6 +11,14 @@ foreach(_v SRC WORK)
         message(FATAL_ERROR "pass -D${_v}=<path>")
     endif()
 endforeach()
+# Developer warnings are errors. CMake 4.4 names that category "author" and
+# deprecates -Werror=dev with a notice of its own; earlier versions ignore
+# -Werror=author.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.4)
+    set(werror_author -Werror=author)
+else()
+    set(werror_author -Werror=dev)
+endif()
 file(REMOVE_RECURSE "${WORK}")
 set(root "${WORK}/root")
 file(MAKE_DIRECTORY "${root}/prefix/deps/include" "${root}/prefix/deps/lib"
@@ -19,7 +27,7 @@ file(MAKE_DIRECTORY "${root}/prefix/deps/include" "${root}/prefix/deps/lib"
 
 function(configure_driver name)
     execute_process(
-        COMMAND "${CMAKE_COMMAND}" -Werror=dev
+        COMMAND "${CMAKE_COMMAND}" ${werror_author}
             -S "${SRC}/tests/cmake/picoquic_pkgconfig_provenance"
             -B "${WORK}/${name}" "-DMOQ_SOURCE_DIR=${SRC}" "-DROOT=${root}" ${ARGN}
         RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
@@ -52,7 +60,7 @@ foreach(dir include sdk/include)
 endforeach()
 ")
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" -Werror=dev -S "${WORK}/source-mode" -B "${WORK}/source-mode/build"
+    COMMAND "${CMAKE_COMMAND}" ${werror_author} -S "${WORK}/source-mode" -B "${WORK}/source-mode/build"
     RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0 OR NOT err STREQUAL "")
     message(FATAL_ERROR "source mode: (${rc})\n${out}\n${err}")

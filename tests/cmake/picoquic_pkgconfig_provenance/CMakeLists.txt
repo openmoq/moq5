@@ -64,7 +64,8 @@ expect("external cflags" "${c}" "-I${real_root}/ext/include")
 expect("external libs" "${l}" "-L${real_root}/ext/lib -lpicoquic-core")
 
 # 5. A future prefix that does not exist yet: the same answers, and no
-#    diagnostics (the test runs this configure with -Werror=dev).
+#    diagnostics (the test runs this configure with developer warnings as
+#    errors).
 set(CMAKE_INSTALL_PREFIX "${ROOT}/not-yet/prefix")
 moq_picoquic_pkgconfig_cflags(c)
 pq_libs(l)

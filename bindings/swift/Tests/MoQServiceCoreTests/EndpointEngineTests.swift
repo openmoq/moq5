@@ -618,10 +618,11 @@ struct PumpHookDeadlineTests {
         let due = EndpointEngine.monotonicMicroseconds() + 5_000_000
         let timed = try engine.installPumpHook(kind: .receiver, run: {}, teardown: {},
                                                deadline: { due })
-        let entries = backend.snapshot().waitEntries
-        #expect(await backend.awaitParked(entries: entries + 1))
-        let capped = try #require(backend.snapshot().waitTimeouts.last)
-        #expect(capped <= 5_000_000 && capped > 4_000_000)
+        /* Every earlier park used the 60 s slice, so a capped park can only
+         * follow the install, however soon the engine re-parks after it. */
+        #expect(await backend.awaitCondition { s in
+            s.waitTimeouts.contains { $0 <= 5_000_000 && $0 > 4_000_000 }
+        })
         engine.removePumpHook(kind: .receiver, token: timed)
         await endpoint.close()
         #expect(backend.snapshot().violations.isEmpty)
