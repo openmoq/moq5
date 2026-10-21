@@ -77,7 +77,8 @@ static void track_cfg(moq_sub_track_cfg_t *t, const char *name)
 /* The facade carries the independent delivery timeouts a subscribe and an
  * update ask for, and an update's semantic Location Filter, exactly as the
  * session's own cfgs do (draft-22 §9.20.4/§9.20.7 OBJECT/SUBGROUP_DELIVERY_
- * TIMEOUT, §9.20.9 LOCATION_FILTER); drafts without them refuse. */
+ * TIMEOUT, §9.20.9 LOCATION_FILTER); draft-18 carries the timeouts too
+ * (10.2.3, 10.2.4). */
 static int test_subscriber_options(void)
 {
     int failures = 0;
@@ -167,15 +168,17 @@ static int test_subscriber_options(void)
     moq_sub_destroy(sub);
     destroy(c, sv);
 
-    /* Draft-18 defines the independent timeouts, but this library does not
-     * send them there: refused before sending. */
+    /* Draft-18 defines the independent timeouts too (10.2.3, 10.2.4). */
     MOQ_TEST_CHECK(pair(&c, &sv, MOQ_VERSION_DRAFT_18));
     memset(&o, 0, sizeof(o));
     sub = make_sub(c, &o);
     track_cfg(&tc, "v");
     tc.object_delivery_timeout_ms = &object_ms;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe(sub, &tc, 2, &t), MOQ_ERR_UNSUPPORTED);
-    /* A caller whose struct ends before the timeout pointers sends none. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe(sub, &tc, 2, &t), MOQ_OK);
+    /* A caller whose struct ends before the timeout pointers sends none; a
+     * second track, as draft-18 has one subscription per track. */
+    track_cfg(&tc, "w");
+    tc.object_delivery_timeout_ms = &object_ms;
     tc.struct_size = (uint32_t)offsetof(moq_sub_track_cfg_t, object_delivery_timeout_ms);
     MOQ_TEST_CHECK_EQ_INT((int)moq_sub_subscribe(sub, &tc, 3, &t), MOQ_OK);
     moq_sub_destroy(sub);

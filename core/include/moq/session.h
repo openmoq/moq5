@@ -2770,7 +2770,8 @@ typedef struct moq_subscribe_cfg {
      * through subgroup_delivery_timeout_ms; a torn block is ignored. Unknown
      * flags or nonzero reserved are INVAL. Selected fields are exact
      * milliseconds, including 0 and UINT64_MAX. An absent field is omitted;
-     * its value is ignored. Selected timeouts are UNSUPPORTED on draft-16/18
+     * its value is ignored. Draft-16 has one DELIVERY_TIMEOUT (9.2.2.2):
+     * both selected values must be equal and neither 0, or MOQ_ERR_INVAL
      * before advancing the session or consuming request/stream credit. */
 #ifdef __cplusplus
     alignas(uint64_t)
@@ -2859,6 +2860,19 @@ MOQ_API moq_group_order_t moq_session_subscription_group_order(
 MOQ_API moq_result_t moq_session_track_properties_add_group_order(
     const moq_session_t *s, const uint8_t *in, size_t in_len,
     moq_group_order_t order, uint8_t *out, size_t out_cap, size_t *out_len);
+
+/*
+ * As moq_session_track_properties_add_group_order(), for the publisher's
+ * delivery timeouts: OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT (draft-18 12.1 and
+ * 12.2, draft-22 10.1 and 10.2), or draft-16's single delivery timeout
+ * (11.1), whose selected values must then be equal and neither 0.
+ * At least one is selected. A set already carrying the same value is copied
+ * unchanged; another value is MOQ_ERR_INVAL. They add at most 32 bytes.
+ */
+MOQ_API moq_result_t moq_session_track_properties_add_delivery_timeouts(
+    const moq_session_t *s, const uint8_t *in, size_t in_len,
+    bool has_object, uint64_t object_ms, bool has_subgroup,
+    uint64_t subgroup_ms, uint8_t *out, size_t out_cap, size_t *out_len);
 
 /*
  * REDIRECT (§10.6.1) target, set on a reject cfg only when
@@ -3078,7 +3092,9 @@ typedef struct moq_subscription_update_cfg {
      * or nonzero reserved are INVAL when covered; a torn block is ignored.
      * Exact milliseconds, including 0 and UINT64_MAX; an absent counterpart
      * remains unchanged. The generic delivery_timeout_us is UNSUPPORTED on
-     * typed-options profiles, even when selected with a zero value. */
+     * typed-options profiles, even when selected with a zero value, and
+     * MOQ_ERR_INVAL together with these. Draft-16 has one DELIVERY_TIMEOUT:
+     * both selected values must be equal and neither 0. */
     uint32_t delivery_timeout_flags;
     uint32_t reserved;
     uint64_t object_delivery_timeout_ms;
@@ -4080,7 +4096,27 @@ typedef struct moq_accept_publish_cfg {
      * padding; both fields must be covered before either is consulted. */
     uint64_t          expires_ms;
     bool              has_expires;
+    /* Appended: the subscriber's delivery timeouts in its acceptance
+     * (draft-16 9.2.2.2, draft-18 10.2.3 and 10.2.4), MOQ_ACCEPT_PUBLISH_-
+     * {OBJECT,SUBGROUP}_DELIVERY_TIMEOUT flags. Read as one block through
+     * subgroup_delivery_timeout_ms; a torn block is ignored. Unknown flags
+     * or nonzero reserved are INVAL. Draft-16 has one DELIVERY_TIMEOUT: both
+     * selected values must be equal and neither 0. Draft-22's answer carries
+     * none (MOQ_ERR_INVAL): send them with moq_session_update_publication().
+     * Aligned past the layout through has_expires. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    uint32_t          delivery_timeout_flags;
+    uint32_t          reserved;
+    uint64_t          object_delivery_timeout_ms;
+    uint64_t          subgroup_delivery_timeout_ms;
 } moq_accept_publish_cfg_t;
+
+#define MOQ_ACCEPT_PUBLISH_OBJECT_DELIVERY_TIMEOUT   0x01u
+#define MOQ_ACCEPT_PUBLISH_SUBGROUP_DELIVERY_TIMEOUT 0x02u
 
 /*
  * Frozen v0 prefix: everything through group_order. Pinned so a later append
@@ -5048,13 +5084,16 @@ typedef struct moq_publication_update_cfg {
      * borrowed only for this call and normalized before effects. NULL location
      * leaves the filter unchanged; explicit NONE removes the constraint.
      * A fill is an independent request, never sticky or a cancellation of an
-     * earlier fill. Selected typed fields are UNSUPPORTED on draft-16/18. */
+     * earlier fill. A selected location or fill is UNSUPPORTED on
+     * draft-16/18. */
     const moq_location_filter_cfg_t *location;
     const moq_fill_cfg_t *fill;
     /* MOQ_SUBSCRIPTION_UPDATE_{OBJECT,SUBGROUP}_DELIVERY_TIMEOUT flags.
      * Read as one complete block through subgroup_delivery_timeout_ms.
      * Omitted carriers retain their previous values; selected zero and
-     * UINT64_MAX are exact milliseconds. Unknown flags/reserved are INVAL. */
+     * UINT64_MAX are exact milliseconds. Unknown flags/reserved are INVAL,
+     * and so is selecting them with delivery_timeout_us. Draft-16 has one
+     * DELIVERY_TIMEOUT: both selected values must be equal and neither 0. */
     uint32_t delivery_timeout_flags;
     uint32_t reserved;
     uint64_t object_delivery_timeout_ms;

@@ -4873,8 +4873,14 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
         if (timeout_flags & MOQ_SUBSCRIBE_SUBGROUP_DELIVERY_TIMEOUT)
             subgroup_ms = cfg->subgroup_delivery_timeout_ms;
     }
-    if (timeout_flags && !s->profile->subscription_admission_options)
-        return MOQ_ERR_UNSUPPORTED;
+    {
+        moq_result_t drc = session_check_dt_selection(s,
+            (timeout_flags & MOQ_SUBSCRIBE_OBJECT_DELIVERY_TIMEOUT) != 0,
+            object_ms,
+            (timeout_flags & MOQ_SUBSCRIBE_SUBGROUP_DELIVERY_TIMEOUT) != 0,
+            subgroup_ms);
+        if (drc < 0) return drc;
+    }
 
     bool has_rendezvous_timeout = SUB_CFG_HAS(rendezvous_timeout_ms) && cfg->has_rendezvous_timeout;
     uint64_t rendezvous_timeout_ms = has_rendezvous_timeout ? cfg->rendezvous_timeout_ms : 0;
@@ -6063,8 +6069,17 @@ moq_result_t moq_session_update_subscription(
         if (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_SUBGROUP_DELIVERY_TIMEOUT)
             subgroup_ms = cfg->subgroup_delivery_timeout_ms;
     }
-    if (!typed_options && (has_location || has_fill || timeout_flags))
+    if (!typed_options && (has_location || has_fill))
         return MOQ_ERR_UNSUPPORTED;
+    if (timeout_flags && has_generic_timeout) return MOQ_ERR_INVAL;
+    {
+        moq_result_t drc = session_check_dt_selection(s,
+            (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_OBJECT_DELIVERY_TIMEOUT) != 0,
+            object_ms,
+            (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_SUBGROUP_DELIVERY_TIMEOUT) != 0,
+            subgroup_ms);
+        if (drc < 0) return drc;
+    }
     if (has_location) {
         moq_result_t lrc = moq_location_filter_to_core(cfg->location, &filter,
                                                        &f_sg, &f_so, &f_eg, &f_eo);
@@ -6089,7 +6104,7 @@ moq_result_t moq_session_update_subscription(
 #undef UPD_CFG_HAS
 #undef UPD_CFG_MIN
     if (!typed_options && !has_priority && !has_forward &&
-        !has_generic_timeout && auth_token_count == 0 &&
+        !has_generic_timeout && !timeout_flags && auth_token_count == 0 &&
         !has_new_group_request && !has_filter && !has_fill)
         return MOQ_ERR_INVAL;
     if (has_generic_timeout && generic_timeout_us < 1000)

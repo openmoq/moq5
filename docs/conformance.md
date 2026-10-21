@@ -379,12 +379,19 @@ drops the rest of that group for the subscriber and keeps the subscription,
 as after a STOP_SENDING on one subgroup stream. Tests: `scheduling`,
 `publisher_stream_loss`.
 
-Initial SUBSCRIBE and subscription UPDATE expose independent, presence-selected
-`object_delivery_timeout_ms` and `subgroup_delivery_timeout_ms`, including
-exact 0 and UINT64_MAX. Incoming typed options preserve both. Selecting either
-new initial timeout is refused on drafts 16/18; their legacy API is unchanged.
-Draft-22 subscription UPDATE refuses the old generic `delivery_timeout_us`
-selection. Tests: `subscription_timeout_input`,
+Initial SUBSCRIBE, subscription and publication UPDATE, and the acceptance of
+a PUBLISH expose independent, presence-selected `object_delivery_timeout_ms`
+and `subgroup_delivery_timeout_ms` on every draft that carries them there:
+draft-16 9.2.2.2 and draft-18 10.2.3/10.2.4 allow them in SUBSCRIBE,
+PUBLISH_OK and REQUEST_UPDATE. Draft-18 sends each type as its own parameter;
+draft-16 has one DELIVERY_TIMEOUT, so both selected values must be equal and
+not 0. Draft-22 answers a PUBLISH with a REQUEST_OK that carries no choice, so
+its acceptance refuses them and they follow in a publication UPDATE. Draft-22
+subscription UPDATE refuses the old generic `delivery_timeout_us` selection;
+on drafts 16 and 18 it cannot be combined with the typed one. The publisher's
+own values go in its Track Properties through
+`moq_session_track_properties_add_delivery_timeouts()`. Tests:
+`delivery_timeout_params`, `subscription_timeout_input`,
 `subscription_admission_options`, `subscription_update_options`.
 The FIN-started timer/commit-report path has focused core/bridge coverage in
 `subgroup_commit_timer`. `msquic_commit` and `wtquic_commit` exercise adapter

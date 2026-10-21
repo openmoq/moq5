@@ -28,6 +28,9 @@ moq_result_t moq_d18_op_track_properties_add_dynamic_groups(const uint8_t *in,
                                                             size_t *out_len);
 uint8_t moq_d18_op_track_properties_group_order(const uint8_t *data,
                                                 size_t len);
+moq_result_t moq_d18_op_track_properties_add_delivery_timeout(
+    const uint8_t *in, size_t len, bool subgroup, uint64_t ms, uint8_t *out,
+    size_t cap, size_t *out_len);
 moq_result_t moq_d18_op_track_properties_add_group_order(const uint8_t *in,
                                                          size_t len,
                                                          uint8_t order,

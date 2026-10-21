@@ -1750,13 +1750,34 @@ moq_result_t moq_session_accept_publish(
     bool fwd_effective = fwd_chosen ? cfg->forward : true;
     const bool has_expires = ACC_CFG_HAS(has_expires) && cfg->has_expires;
     const uint64_t expires_ms = has_expires ? cfg->expires_ms : 0;
+    /* TIMEOUT block: gated on subgroup_delivery_timeout_ms (its last). */
+    bool dt_obj = false, dt_sg = false;
+    uint64_t dt_obj_ms = 0, dt_sg_ms = 0;
+    if (ACC_CFG_HAS(subgroup_delivery_timeout_ms)) {
+        if ((cfg->delivery_timeout_flags &
+             ~(MOQ_ACCEPT_PUBLISH_OBJECT_DELIVERY_TIMEOUT |
+               MOQ_ACCEPT_PUBLISH_SUBGROUP_DELIVERY_TIMEOUT)) || cfg->reserved)
+            return MOQ_ERR_INVAL;
+        dt_obj = (cfg->delivery_timeout_flags &
+                  MOQ_ACCEPT_PUBLISH_OBJECT_DELIVERY_TIMEOUT) != 0;
+        dt_sg = (cfg->delivery_timeout_flags &
+                 MOQ_ACCEPT_PUBLISH_SUBGROUP_DELIVERY_TIMEOUT) != 0;
+        dt_obj_ms = dt_obj ? cfg->object_delivery_timeout_ms : 0;
+        dt_sg_ms = dt_sg ? cfg->subgroup_delivery_timeout_ms : 0;
+    }
 #undef ACC_CFG_HAS
     /* D22 9.3 restricts PUBLISH_OK to EXPIRES, even for explicit choices
      * equal to the initial setting. Refuse before any advancing effects. */
     const bool bare_response = !s->profile->publish_ok_carries_params;
     if (bare_response && (cfg->has_subscriber_priority ||
         cfg->group_order != MOQ_GROUP_ORDER_DEFAULT || fwd_chosen ||
-        has_filter || has_new_group_request)) return MOQ_ERR_INVAL;
+        has_filter || has_new_group_request || dt_obj || dt_sg))
+        return MOQ_ERR_INVAL;
+    {
+        moq_result_t drc = session_check_dt_selection(s, dt_obj, dt_obj_ms,
+                                                      dt_sg, dt_sg_ms);
+        if (drc < 0) return drc;
+    }
     if (has_expires && !s->profile->publish_initial_parameters)
         return MOQ_ERR_UNSUPPORTED;
     /* Same filter validity rules as the wire encoders (unknown type / inverted
@@ -1821,6 +1842,10 @@ moq_result_t moq_session_accept_publish(
             .forward = fwd_effective,
             .has_expires = has_expires,
             .expires_ms = expires_ms,
+            .dt_has_object = dt_obj,
+            .dt_object_ms = dt_obj_ms,
+            .dt_has_subgroup = dt_sg,
+            .dt_subgroup_ms = dt_sg_ms,
         };
         moq_result_t rc2 = s->profile->encode_publish_ok(s, &w, &ok_args);
         if (rc2 < 0) return rc2;
@@ -1844,6 +1869,13 @@ moq_result_t moq_session_accept_publish(
     s->publishes[slot].send_allowed = fwd_effective;
     if (cfg->group_order != MOQ_GROUP_ORDER_DEFAULT)
         s->publishes[slot].group_order = (uint8_t)cfg->group_order;
+    if (dt_obj || dt_sg) {
+        moq_pub_entry_t *pe = &s->publishes[slot];
+        pe->dt_sub_has_object = dt_obj;
+        pe->dt_sub_object_ms = dt_obj_ms;
+        pe->dt_sub_has_subgroup = dt_sg;
+        pe->dt_sub_subgroup_ms = dt_sg_ms;
+    }
     if (has_filter) {
         s->publishes[slot].filter_type = (uint32_t)filter;
         s->publishes[slot].req_start_group = f_start_group;
@@ -3232,8 +3264,17 @@ moq_result_t moq_session_update_publication(
         if (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_SUBGROUP_DELIVERY_TIMEOUT)
             subgroup_ms = cfg->subgroup_delivery_timeout_ms;
     }
-    if (!typed_options && (has_location || has_fill || timeout_flags))
+    if (!typed_options && (has_location || has_fill))
         return MOQ_ERR_UNSUPPORTED;
+    if (timeout_flags && has_generic_timeout) return MOQ_ERR_INVAL;
+    {
+        moq_result_t drc = session_check_dt_selection(s,
+            (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_OBJECT_DELIVERY_TIMEOUT) != 0,
+            object_ms,
+            (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_SUBGROUP_DELIVERY_TIMEOUT) != 0,
+            subgroup_ms);
+        if (drc < 0) return drc;
+    }
     uint32_t filter = 0;
     uint64_t f_sg = 0, f_so = 0, f_eg = 0, f_eo = 0;
     if (has_location) {
@@ -3252,7 +3293,7 @@ moq_result_t moq_session_update_publication(
 #undef UPD_CFG_HAS
 #undef UPD_CFG_MIN
     if (!typed_options && !has_priority && !has_forward &&
-        !has_generic_timeout && auth_token_count == 0 &&
+        !has_generic_timeout && !timeout_flags && auth_token_count == 0 &&
         !has_new_group_request && !has_fill)
         return MOQ_ERR_INVAL;
     if (has_generic_timeout && generic_timeout_us < 1000)

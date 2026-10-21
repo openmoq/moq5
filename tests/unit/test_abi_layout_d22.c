@@ -159,6 +159,11 @@ PIN_AFTER(moq_sub_track_cfg_t, auth_token_count, fill);
 PIN_THROUGH(moq_sub_track_cfg_t, fill, 80, 44, 44, 8, 4, 4);
 PIN_AFTER(moq_sub_track_cfg_t, fill, rendezvous_timeout_ms);
 
+/* The subscriber's delivery timeouts on an accepted PUBLISH start past the
+ * layout that ends at the expiry pair. */
+PIN_AFTER(moq_accept_publish_cfg_t, has_expires, delivery_timeout_flags);
+PIN_AFTER(moq_accept_publish_cfg_t, has_expires, subgroup_delivery_timeout_ms);
+
 /* SUBSCRIBE_TRACKS options and the rendezvous wait extend these layouts. */
 PIN_THROUGH(moq_subscribe_cfg_t, subgroup_delivery_timeout_ms, 160, 112, 112, 8, 4, 8);
 PIN_AFTER(moq_subscribe_cfg_t, subgroup_delivery_timeout_ms, has_rendezvous_timeout);

@@ -380,6 +380,19 @@ static moq_result_t d18_map_delivery_timeout(const moq_d18_msg_params_t *p,
 }
 
 
+/* The sender's per-type carriers (dt_* fields) into a message's parameters:
+ * each type is its own parameter (10.2.3, 10.2.4). */
+#define D18_PUT_DT(p, src) do {                                            \
+        if ((src)->dt_has_object) {                                        \
+            (p)->has_object_delivery_timeout = true;                       \
+            (p)->object_delivery_timeout_ms = (src)->dt_object_ms;         \
+        }                                                                  \
+        if ((src)->dt_has_subgroup) {                                      \
+            (p)->has_subgroup_delivery_timeout = true;                     \
+            (p)->subgroup_delivery_timeout_ms = (src)->dt_subgroup_ms;     \
+        }                                                                  \
+    } while (0)
+
 /* Copy this message's exact per-type carriers into a decoded struct's dt_*
  * fields (all decoded shapes share the field names via macro). */
 #define D18_FILL_DT(dst, p) do {                                           \
@@ -442,6 +455,7 @@ static moq_result_t d18_encode_subscribe(
     }
     p.has_new_group_request = args->has_new_group_request;
     p.new_group_request = args->new_group_request;
+    D18_PUT_DT(&p, args);
     return moq_d18_encode_subscribe(w, args->request_id,
                                     &args->track_namespace, args->track_name, &p);
 }
@@ -567,6 +581,23 @@ moq_result_t moq_d18_op_track_properties_add_group_order(const uint8_t *in,
 }
 
 /* §12.3 MAX_CACHE_DURATION (0x04): an integer of milliseconds. */
+#define D18_PROP_OBJECT_DELIVERY_TIMEOUT 0x02u
+#define D18_PROP_SUBGROUP_DELIVERY_TIMEOUT 0x06u
+
+/* OBJECT_ or SUBGROUP_DELIVERY_TIMEOUT = `ms` added to a Track Property list
+ * (12.1, 12.2), looked up together with Immutable Properties. */
+moq_result_t moq_d18_op_track_properties_add_delivery_timeout(
+    const uint8_t *in, size_t len, bool subgroup, uint64_t ms, uint8_t *out,
+    size_t cap, size_t *out_len)
+{
+    if (!out_len) return MOQ_ERR_INVAL;
+    return moq_kvp_list_merge_int(in, len, true,
+                                  subgroup ? D18_PROP_SUBGROUP_DELIVERY_TIMEOUT
+                                           : D18_PROP_OBJECT_DELIVERY_TIMEOUT,
+                                  ms, D18_PROP_IMMUTABLE_PROPERTIES, out, cap,
+                                  out_len);
+}
+
 #define D18_PROP_MAX_CACHE_DURATION 0x04u
 static bool d18_props_max_cache(const uint8_t *data, size_t len, bool nested,
                                 uint64_t *out_ms)
@@ -643,6 +674,7 @@ static moq_result_t d18_encode_publish_ok(
     }
     p.has_new_group_request = args->has_new_group_request;
     p.new_group_request = args->new_group_request;
+    D18_PUT_DT(&p, args);
     return moq_d18_encode_publish_ok(w, &p);
 }
 
@@ -1033,6 +1065,7 @@ static moq_result_t d18_encode_request_update(
         p.has_subgroup_delivery_timeout = true;
         p.subgroup_delivery_timeout_ms = ms;
     }
+    D18_PUT_DT(&p, args);
     moq_result_t arc = d18_fill_auth_tokens(&p, args->auth_tokens,
                                             args->auth_token_count);
     if (arc < 0) return arc;
@@ -2404,6 +2437,8 @@ static const moq_profile_ops_t d18_ops = {
     .track_properties_add_dynamic_groups = moq_d18_op_track_properties_add_dynamic_groups,
     .track_properties_group_order = moq_d18_op_track_properties_group_order,
     .track_properties_add_group_order = moq_d18_op_track_properties_add_group_order,
+    .track_properties_add_delivery_timeout =
+        moq_d18_op_track_properties_add_delivery_timeout,
     .track_properties_max_cache = moq_d18_op_track_properties_max_cache,
     .encode_publish_ok       = d18_encode_publish_ok,
     .encode_track_status     = d18_encode_track_status,
