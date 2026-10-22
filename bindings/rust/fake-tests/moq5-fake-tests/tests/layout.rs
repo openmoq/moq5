@@ -1,6 +1,7 @@
 //! The generated types against the C compiler's view of the same headers:
 //! sizeof, alignof and offsetof for every record the safe crate reads or
-//! writes, and the frozen v0 floors and restated constants.
+//! writes (with the `player` feature, the player's records and the fields of
+//! their unions' members), and the frozen v0 floors and restated constants.
 
 use std::collections::BTreeMap;
 use std::ffi::CStr;
@@ -152,7 +153,48 @@ fn rust_side() -> BTreeMap<String, Entry> {
             paused, catalog_drops, catalog_complete, gaps_reported, gap_tails_unknown,
             reorder_refused, tracks_malformed,
         }
+        moq_location_filter_cfg_t {
+            struct_size, kind, relative_group_offset, start_group, start_object, end_group,
+            end_object,
+        }
+        moq_fill_cfg_t {
+            struct_size, has_subscriber_priority, subscriber_priority, has_group_order,
+            has_fill_timeout, fill_timeout_ms, group_order, location,
+        }
+        moq_media_receiver_info_t {
+            struct_size, time_mode, overflow_policy, max_objects, max_bytes, auto_subscribe,
+            surface_stream_terminals, companion_profile, transport_version,
+            max_stream_terminals, track_events_polled,
+        }
+        moq_media_send_mpeg2ts_t { struct_size, data, end_object }
+        moq_media_sender_track_stats_t {
+            struct_size, objects_written, objects_sent, objects_queued, objects_dropped,
+            bytes_queued, groups_dropped, keyframes_dropped, groups_abandoned, mpeg2ts_groups,
+            mpeg2ts_objects, mpeg2ts_packets_in, mpeg2ts_packets_dropped_before_random_access,
+            mpeg2ts_max_group_27mhz, mpeg2ts_groups_over_2s, mpeg2ts_peak_rate_bps,
+            mpeg2ts_source_pcr_discontinuities, mpeg2ts_mux_rate_below_peak,
+            mpeg2ts_program_gone, mpeg2ts_objects_parked, mpeg2ts_partial_bytes_discarded,
+            mpeg2ts_continuation_objects_discarded,
+        }
+        moq_msf_mpeg2ts_t {
+            struct_size, has_mode, mode, mode_name, has_packet_size, packet_size, has_es_pid,
+            es_pid, has_program_number, program_number, has_pcr_pid, pcr_pid, has_mux_rate,
+            mux_rate, has_si_pids, si_pids, si_pid_count, has_random_access, random_access,
+            has_timestamp_mode, timestamp_mode, timestamp_mode_name, has_scte35_pid,
+            scte35_pid, malformed,
+        }
+        moq_msf_track_ext_t { kind, u }
+        moq_loc_metadata_t {
+            struct_size, present, timestamp, timescale, marking_len, marking, audio_level,
+            reserved, video_config, audio_config,
+        }
+        moq_media_metadata_t {
+            struct_size, time_domain, time_us, loc, has_time_us, independence_known,
+            independent, reserved,
+        }
     };
+    #[cfg(feature = "player")]
+    player_side(&mut v);
     for (name, value) in [
         ("MOQ_ENDPOINT_CFG_V0_SIZE", sys::MOQ_ENDPOINT_CFG_V0_SIZE),
         (
@@ -219,10 +261,168 @@ fn rust_side() -> BTreeMap<String, Entry> {
             "MOQ_ENDPOINT_URI_STANDARD",
             sys::MOQ_ENDPOINT_URI_STANDARD as usize,
         ),
+        ("MOQ_LOC_METADATA_V0_SIZE", sys::MOQ_LOC_METADATA_V0_SIZE),
+        ("MOQ_MSF_MPEG2TS_V0_SIZE", sys::MOQ_MSF_MPEG2TS_V0_SIZE),
+        (
+            "MOQ_LOCATION_FILTER_CFG_V0_SIZE",
+            sys::MOQ_LOCATION_FILTER_CFG_V0_SIZE as usize,
+        ),
+        ("MOQ_FILL_CFG_V0_SIZE", sys::MOQ_FILL_CFG_V0_SIZE as usize),
+        (
+            "MOQ_LOC_METADATA_HAS_TIMESTAMP",
+            sys::MOQ_LOC_METADATA_HAS_TIMESTAMP as usize,
+        ),
+        (
+            "MOQ_LOC_METADATA_HAS_TIMESCALE",
+            sys::MOQ_LOC_METADATA_HAS_TIMESCALE as usize,
+        ),
+        (
+            "MOQ_LOC_METADATA_HAS_MARKING",
+            sys::MOQ_LOC_METADATA_HAS_MARKING as usize,
+        ),
+        (
+            "MOQ_LOC_METADATA_HAS_AUDIO_LEVEL",
+            sys::MOQ_LOC_METADATA_HAS_AUDIO_LEVEL as usize,
+        ),
+        (
+            "MOQ_LOC_METADATA_HAS_VIDEO_CONFIG",
+            sys::MOQ_LOC_METADATA_HAS_VIDEO_CONFIG as usize,
+        ),
+        (
+            "MOQ_LOC_METADATA_HAS_AUDIO_CONFIG",
+            sys::MOQ_LOC_METADATA_HAS_AUDIO_CONFIG as usize,
+        ),
+        (
+            "MOQ_LOC_METADATA_PRESENT_MASK",
+            sys::MOQ_LOC_METADATA_PRESENT_MASK as usize,
+        ),
     ] {
         v.insert(name.into(), Entry::Value(value));
     }
     v
+}
+
+/// The player's records, its union members' fields named
+/// `record.u.member.field` (the union's offset plus the field's in the
+/// member, which starts the union), and its floors.
+#[cfg(feature = "player")]
+fn player_side(v: &mut BTreeMap<String, Entry>) {
+    v.extend(layout! {
+        moq_playback_cfg_t {
+            struct_size, max_tracks, max_buffered_objects, max_buffered_bytes,
+            max_backlog_groups, max_commands, max_events, gap_timeout_us, max_release_per_tick,
+            max_track_config_bytes, max_samples_per_object, ignore_eog_bit,
+            infer_end_of_group_from_next_group, max_known_ranges, max_held_commands,
+        }
+        moq_media_player_cfg_t {
+            struct_size, selection, receiver, playback, preferred_lang, end_tail_wait_us,
+            cushion_us, max_outputs, max_events, timing_policy, max_held_bytes,
+            assume_shared_epoch,
+        }
+        moq_media_player_select_cfg_t { struct_size, start, independent_timing, shared_epoch }
+        moq_media_timeline_t {
+            domain, timeline_id, timeline_epoch, anchor_media_us, anchor_local_us, rate,
+        }
+        moq_media_player_output_t {
+            struct_size, kind, detail_size, timeline_id, configuration_generation, track, u,
+        }
+        moq_media_player_event_t { struct_size, kind, detail_size, track, u }
+        moq_media_player_feedback_t { struct_size, kind, track, configuration_generation, u }
+        moq_media_player_stats_t {
+            struct_size, tracks_selected, outputs_queued, events_queued, events_dropped,
+            held_objects, held_bytes, objects_taken, objects_pushed, objects_dropped,
+            objects_discarded, terminals_taken, units_output, configures_output,
+            discontinuities_output, ends_output, timeline_records_discarded, feedback_stale,
+            outputs_bytes, selections_failed,
+        }
+    });
+    macro_rules! members {
+        ($record:ident.u { $($member:ident: $member_ty:ident { $($field:ident),* $(,)? })* }) => {
+            $($(
+                v.insert(
+                    format!(
+                        "{}.u.{}.{}",
+                        stringify!($record),
+                        stringify!($member),
+                        stringify!($field)
+                    ),
+                    Entry::Field {
+                        offset: offset_of!(sys::$record, u) + offset_of!(sys::$member_ty, $field),
+                    },
+                );
+            )*)*
+        };
+    }
+    members!(moq_media_player_output_t.u {
+        configure: moq_media_player_output__bindgen_ty_1__bindgen_ty_1 {
+            media_type, packaging, codec, codec_config, timescale, width, height, samplerate,
+            channel_count,
+        }
+        unit: moq_media_player_output__bindgen_ty_1__bindgen_ty_2 {
+            group_id, object_id, decode_time_us, presentation_time_us, composition_offset_us,
+            has_capture_time, independence_known, independent, present, sample_duration_us,
+            capture_time_us, payload, offset, len,
+        }
+        discontinuity: moq_media_player_output__bindgen_ty_1__bindgen_ty_3 {
+            reason, decoder_reset_required,
+        }
+        end: moq_media_player_output__bindgen_ty_1__bindgen_ty_4 { cause, disposition }
+    });
+    members!(moq_media_player_event_t.u {
+        gap: moq_media_player_event__bindgen_ty_1__bindgen_ty_1 {
+            group_id, object_id, cause, crossed, hole_start_us, hole_duration_us,
+        }
+        skip: moq_media_player_event__bindgen_ty_1__bindgen_ty_2 { from_group_id, to_group_id }
+        shed: moq_media_player_event__bindgen_ty_1__bindgen_ty_3 {
+            dropped_groups, remaining_groups,
+        }
+        drop: moq_media_player_event__bindgen_ty_1__bindgen_ty_4 { reason, group_id, object_id }
+        loss: moq_media_player_event__bindgen_ty_1__bindgen_ty_5 {
+            kind, group_id, last_group_id, error_code,
+        }
+        knowledge_forgotten: moq_media_player_event__bindgen_ty_1__bindgen_ty_6 {
+            first_group_id, last_group_id,
+        }
+        sync: moq_media_player_event__bindgen_ty_1__bindgen_ty_7 {
+            has_render_group, render_group, reason,
+        }
+        started: moq_media_player_event__bindgen_ty_1__bindgen_ty_8 { timeline_id }
+    });
+    members!(moq_media_player_feedback_t.u {
+        decoder_queue: moq_media_player_feedback__bindgen_ty_1__bindgen_ty_1 {
+            depth, max_recommended,
+        }
+        decode_error: moq_media_player_feedback__bindgen_ty_1__bindgen_ty_2 { message }
+    });
+    for (name, value) in [
+        (
+            "MOQ_MEDIA_PLAYER_CFG_V0_SIZE",
+            sys::MOQ_MEDIA_PLAYER_CFG_V0_SIZE,
+        ),
+        (
+            "MOQ_MEDIA_PLAYER_SELECT_CFG_V0_SIZE",
+            sys::MOQ_MEDIA_PLAYER_SELECT_CFG_V0_SIZE,
+        ),
+        (
+            "MOQ_MEDIA_PLAYER_FEEDBACK_V0_SIZE",
+            sys::MOQ_MEDIA_PLAYER_FEEDBACK_V0_SIZE,
+        ),
+        (
+            "MOQ_MEDIA_PLAYER_STATS_V0_SIZE",
+            sys::MOQ_MEDIA_PLAYER_STATS_V0_SIZE,
+        ),
+        ("MOQ_PLAYBACK_CFG_V0_SIZE", sys::MOQ_PLAYBACK_CFG_V0_SIZE),
+        (
+            "MOQ_MEDIA_PLAYER_OUTPUT_DETAIL_MAX",
+            sys::MOQ_MEDIA_PLAYER_OUTPUT_DETAIL_MAX as usize,
+        ),
+        (
+            "MOQ_MEDIA_PLAYER_EVENT_DETAIL_MAX",
+            sys::MOQ_MEDIA_PLAYER_EVENT_DETAIL_MAX as usize,
+        ),
+    ] {
+        v.insert(name.into(), Entry::Value(value));
+    }
 }
 
 fn c_side() -> BTreeMap<String, Entry> {
@@ -309,5 +509,50 @@ fn the_floors_lie_within_the_records() {
     assert_eq!(
         size_of::<moq5::cmaf::CmafSample>(),
         size_of::<sys::moq_cmaf_sample_t>()
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_RECEIVER_INFO_V0_SIZE,
+        size_of::<sys::moq_media_receiver_info_t>()
+    );
+    assert_eq!(
+        sys::MOQ_MSF_MPEG2TS_V0_SIZE,
+        offset_of!(sys::moq_msf_mpeg2ts_t, malformed) + size_of::<u32>()
+    );
+    assert_eq!(
+        sys::MOQ_LOC_METADATA_V0_SIZE,
+        offset_of!(sys::moq_loc_metadata_t, audio_config) + size_of::<sys::moq_bytes_t>()
+    );
+    assert_eq!(
+        sys::MOQ_LOCATION_FILTER_CFG_V0_SIZE as usize,
+        size_of::<sys::moq_location_filter_cfg_t>()
+    );
+    assert!(sys::MOQ_FILL_CFG_V0_SIZE as usize <= size_of::<sys::moq_fill_cfg_t>());
+}
+
+#[cfg(feature = "player")]
+#[test]
+fn the_player_floors_are_the_frozen_records() {
+    // Outputs and events are frozen layouts whose union reserves are
+    // pinned; the configuration and statistics floors are the whole
+    // current records.
+    assert_eq!(
+        sys::MOQ_MEDIA_PLAYER_OUTPUT_DETAIL_MAX as usize,
+        size_of::<sys::moq_media_player_output__bindgen_ty_1>()
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_PLAYER_EVENT_DETAIL_MAX as usize,
+        size_of::<sys::moq_media_player_event__bindgen_ty_1>()
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_PLAYER_CFG_V0_SIZE,
+        offset_of!(sys::moq_media_player_cfg_t, assume_shared_epoch) + 1
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_PLAYER_STATS_V0_SIZE,
+        size_of::<sys::moq_media_player_stats_t>()
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_PLAYER_FEEDBACK_V0_SIZE,
+        size_of::<sys::moq_media_player_feedback_t>()
     );
 }

@@ -1,6 +1,9 @@
 //! Links an installed libmoq SDK through moq5 and exercises what needs no
 //! peer: the version string, a configuration the service refuses, buffers
-//! and the CMAF parser. Exit status is the result.
+//! and the CMAF parser. With the `player` feature it also links the player,
+//! whose every use needs a peer's receiver (the relay rows play): its entry
+//! points are kept so that they are linked from the SDK, and the runner
+//! proves them resolved. Exit status is the result.
 
 use std::process::ExitCode;
 
@@ -40,6 +43,15 @@ fn main() -> ExitCode {
     }
     if Namespace::parse("live/demo").is_err() {
         return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "player")]
+    {
+        use moq5::player::{Player, PlayerConfig};
+        use moq5::ReceiverConfig;
+        let create: fn(&Endpoint, &ReceiverConfig, &PlayerConfig) -> moq5::Result<Player> =
+            Player::create;
+        std::hint::black_box(create);
+        println!("player linked");
     }
     println!("moq5 consumer: OK");
     ExitCode::SUCCESS

@@ -38,8 +38,17 @@ for d in lib/pkgconfig lib64/pkgconfig; do
     [ -f "$PREFIX/$d/libmoq.pc" ] && SDK_PC="$PREFIX/$d" && break
 done
 [ -n "$SDK_PC" ] || { echo "run.sh: no libmoq.pc under $PREFIX" >&2; exit 2; }
+# The SDK's headers, where its own pkg-config metadata places them (the
+# service's includedir); never a fixed path or another SDK's.
+sdk_pc_path=$(moq5_sdk_pkgconfig "$PREFIX")
+SDK_INCLUDE=$(PKG_CONFIG_PATH=$sdk_pc_path "${PKG_CONFIG:-pkg-config}" --variable=includedir libmoq-service)
+[ -n "$SDK_INCLUDE" ] && [ -d "$SDK_INCLUDE/moq" ] ||
+    { echo "run.sh: the SDK's libmoq-service.pc places its headers in '$SDK_INCLUDE', which holds no moq/" >&2; exit 2; }
 
 cflags=(${MOQ5_FAKE_CFLAGS:-})
+# The player's fakes, for an SDK that carries the player (the `player`
+# feature's rows need them; without the feature nothing references them).
+if [ -f "$SDK_INCLUDE/moq/media_player.h" ]; then cflags+=(-DMOQ5_FAKE_PLAYER); fi
 provider_libs="-L$WORK -lmoq5-fake-service"
 case ${MOQ5_FAKE_SANITIZE:-} in
     "") ;;
@@ -93,7 +102,7 @@ case ${MOQ5_FAKE_SANITIZE:-} in
 esac
 
 "$CC" -std=c11 -Wall -Wextra -Wpedantic -Werror -O1 -g -fPIC ${cflags[@]+"${cflags[@]}"} \
-    "-I$PREFIX/include" -c "$HERE/fake_service.c" -o "$WORK/fake_service.o"
+    "-I$SDK_INCLUDE" -c "$HERE/fake_service.c" -o "$WORK/fake_service.o"
 rm -f "$WORK/libmoq5-fake-service.a"
 "$AR" rcs "$WORK/libmoq5-fake-service.a" "$WORK/fake_service.o"
 
@@ -104,7 +113,7 @@ Description: moq5 fake service provider
 Version: 0.0.0
 Requires: libmoq
 Libs: $provider_libs
-Cflags: -I$PREFIX/include
+Cflags: -I$SDK_INCLUDE
 EOF
 
 export PKG_CONFIG_PATH="$WORK/pkgconfig:$SDK_PC${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"

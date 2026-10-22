@@ -107,8 +107,10 @@ pub enum Packaging {
     Raw,
     /// CMAF: one moof+mdat fragment per object.
     Cmaf,
-    /// MPEG-2 transport stream packets. Sending needs the packaging
-    /// extension record, which this crate does not expose yet.
+    /// MPEG-2 transport stream packets (draft-gregoire-moq-msfts). A track
+    /// is added with its record ([`SendTrackConfig::mpeg2ts`]).
+    ///
+    /// [`SendTrackConfig::mpeg2ts`]: crate::SendTrackConfig::mpeg2ts
     Mpeg2ts,
     /// A packaging this crate does not know.
     Other(u32),
@@ -241,10 +243,163 @@ impl CompanionProfile {
         }
     }
 
+    pub(crate) fn from_raw(code: sys::moq_media_companion_profile_t) -> CompanionProfile {
+        match code {
+            sys::MOQ_MEDIA_COMPANION_AUTO => CompanionProfile::Auto,
+            sys::MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 => CompanionProfile::LegacyMsf01Loc01,
+            sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC => {
+                CompanionProfile::D22Msf01Loc04Public
+            }
+            code => CompanionProfile::Other(code),
+        }
+    }
+
     /// The `MOQ_MEDIA_COMPANION_*` value.
     #[must_use]
     pub fn code(self) -> u32 {
         self.raw()
+    }
+}
+
+/// The clock a timestamp is in (`moq_media_time_domain_t`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TimeDomain {
+    /// No clock is known.
+    None,
+    /// Microseconds since the Unix epoch: a capture clock.
+    UnixMicros,
+    /// The application's own media time (LOC with a Timescale), with an
+    /// epoch only the application knows.
+    ApplicationMedia,
+    /// A domain this crate does not know.
+    Other(u32),
+}
+
+impl TimeDomain {
+    pub(crate) fn from_raw(code: sys::moq_media_time_domain_t) -> TimeDomain {
+        match code {
+            sys::MOQ_MEDIA_TIME_DOMAIN_NONE => TimeDomain::None,
+            sys::MOQ_MEDIA_TIME_DOMAIN_UNIX_US => TimeDomain::UnixMicros,
+            sys::MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA => TimeDomain::ApplicationMedia,
+            code => TimeDomain::Other(code),
+        }
+    }
+
+    /// The `MOQ_MEDIA_TIME_DOMAIN_*` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            TimeDomain::None => sys::MOQ_MEDIA_TIME_DOMAIN_NONE,
+            TimeDomain::UnixMicros => sys::MOQ_MEDIA_TIME_DOMAIN_UNIX_US,
+            TimeDomain::ApplicationMedia => sys::MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA,
+            TimeDomain::Other(code) => code,
+        }
+    }
+}
+
+/// The order in which a delivery serves groups (`MOQ_GROUP_ORDER_*`). A
+/// request that leaves it out inherits it; there is no explicit default.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GroupOrder {
+    /// Lowest group first.
+    Ascending,
+    /// Highest group first.
+    Descending,
+}
+
+impl GroupOrder {
+    /// The `MOQ_GROUP_ORDER_*` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            GroupOrder::Ascending => sys::MOQ_GROUP_ORDER_ASCENDING,
+            GroupOrder::Descending => sys::MOQ_GROUP_ORDER_DESCENDING,
+        }
+    }
+}
+
+/// Which objects of a track a request covers (`moq_location_filter_cfg_t`),
+/// independent of any draft's wire codes. Groups and objects are absolute
+/// Locations; an end is inclusive. Which forms a request may carry depends
+/// on the negotiated draft (see where each is accepted).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LocationFilter {
+    /// No location constraint, stated explicitly: not the same as leaving
+    /// the filter out, which inherits.
+    Unconstrained,
+    /// From the next object published.
+    NextObject,
+    /// From a group relative to the current one: 0 is the next group, 1
+    /// the current group, 2 the one before. The group is clamped to the
+    /// valid range.
+    RelativeGroup {
+        /// The offset back from the next group.
+        offset: u64,
+    },
+    /// From a Location, open-ended.
+    AbsoluteStart(Location),
+    /// From a Location through every object of `end_group`. A request
+    /// with `end_group` below the start group is refused.
+    GroupEnd {
+        /// The first object covered.
+        start: Location,
+        /// The last group covered, absolute.
+        end_group: u64,
+    },
+    /// From a Location through `end`, inclusive. An `end` before `start`
+    /// within one group is an empty filter, not an invalid one.
+    ObjectEnd {
+        /// The first object covered.
+        start: Location,
+        /// The last object covered.
+        end: Location,
+    },
+}
+
+impl LocationFilter {
+    /// The C configuration for this filter, sized and stamped by the
+    /// library's initializer.
+    pub(crate) fn raw(self) -> sys::moq_location_filter_cfg_t {
+        let mut raw = sys::moq_location_filter_cfg_t::default();
+        // SAFETY: a writable struct of exactly the size passed.
+        unsafe { sys::moq_location_filter_cfg_init_sized(&mut raw, std::mem::size_of_val(&raw)) };
+        raw.kind = self.code();
+        match self {
+            LocationFilter::Unconstrained | LocationFilter::NextObject => {}
+            LocationFilter::RelativeGroup { offset } => raw.relative_group_offset = offset,
+            LocationFilter::AbsoluteStart(start) => {
+                raw.start_group = start.group_id;
+                raw.start_object = start.object_id;
+            }
+            LocationFilter::GroupEnd { start, end_group } => {
+                raw.start_group = start.group_id;
+                raw.start_object = start.object_id;
+                raw.end_group = end_group;
+            }
+            LocationFilter::ObjectEnd { start, end } => {
+                raw.start_group = start.group_id;
+                raw.start_object = start.object_id;
+                raw.end_group = end.group_id;
+                raw.end_object = end.object_id;
+            }
+        }
+        raw
+    }
+
+    /// The `MOQ_LOCATION_FILTER_*` kind.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            LocationFilter::Unconstrained => sys::MOQ_LOCATION_FILTER_NONE,
+            LocationFilter::NextObject => sys::MOQ_LOCATION_FILTER_NEXT_OBJECT,
+            LocationFilter::RelativeGroup { .. } => sys::MOQ_LOCATION_FILTER_RELATIVE_GROUP,
+            LocationFilter::AbsoluteStart(_) => sys::MOQ_LOCATION_FILTER_ABSOLUTE_START,
+            LocationFilter::GroupEnd { .. } => sys::MOQ_LOCATION_FILTER_GROUP_END,
+            LocationFilter::ObjectEnd { .. } => sys::MOQ_LOCATION_FILTER_OBJECT_END,
+        }
     }
 }
 

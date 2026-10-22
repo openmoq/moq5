@@ -16,9 +16,12 @@
 # and inventoried under <work-dir>;
 # the consumer's verbose log must name the extracted moq5-sys, link from the
 # SDK's own library directory and from no directory outside its closure.
-# The packaged consumer runs with the SDK's loader path.
+# The packaged consumer runs with the SDK's loader path. With
+# MOQ5_RUST_PLAYER=1 the extracted moq5-sys and the consumer are built with
+# the player.
 #
-# Environment: CARGO (default cargo), LIBCLANG_PATH as bindgen needs it,
+# Environment: MOQ5_RUST_PLAYER (1 or 0, default 0), CARGO (default cargo),
+# LIBCLANG_PATH as bindgen needs it,
 # PKG_CONFIG (default pkg-config), PYTHON (default python3), RUSTFMT,
 # MOQ5_SDK_PKG_CONFIG_PATH (the pkg-config directories of the SDK's
 # dependency prefixes, the clean build's PKG_CONFIG_PATH),
@@ -31,6 +34,12 @@ shopt -s inherit_errexit 2>/dev/null || true
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 PREFIX=${1:?sdk prefix}; WORK=${2:?work dir}
 CARGO=${CARGO:-cargo}
+features=()
+case ${MOQ5_RUST_PLAYER:-0} in
+    0) ;;
+    1) features=(--features player) ;;
+    *) echo "package_check.sh: MOQ5_RUST_PLAYER must be 1 or 0" >&2; exit 2 ;;
+esac
 # shellcheck source=sdk_paths.sh
 . "$HERE/scripts/sdk_paths.sh"
 # shellcheck source=cargo_step.sh
@@ -73,10 +82,15 @@ done
 grep -q '^build.rs$' "$WORK/moq5-sys.files"
 grep -q '^build_sysroot.rs$' "$WORK/moq5-sys.files"
 grep -q '^wrapper.h$' "$WORK/moq5-sys.files"
+grep -q '^wrapper_player.h$' "$WORK/moq5-sys.files"
 grep -q '^docs/bindings.rs$' "$WORK/moq5-sys.files"
 grep -q '^docs/preambles.md$' "$WORK/moq5-sys.files"
+grep -q '^docs/bindings_player.rs$' "$WORK/moq5-sys.files"
+grep -q '^docs/preambles_player.md$' "$WORK/moq5-sys.files"
 grep -q '^src/lib.rs$' "$WORK/moq5.files"
+grep -q '^src/player.rs$' "$WORK/moq5.files"
 grep -q '^tests/compile_fail/buffer_cloned.rs$' "$WORK/moq5.files"
+grep -q '^tests/compile_fail/player_output_sent_to_thread.rs$' "$WORK/moq5.files"
 if grep -qE 'fake|consumer/' "$WORK/moq5-sys.files" "$WORK/moq5.files"; then
     echo "package_check.sh: a package lists a test workspace file" >&2; exit 1
 fi
@@ -88,7 +102,7 @@ done
 # The extracted moq5-sys builds on its own against the SDK (what cargo's
 # verification would have done), with its diagnostics classified.
 "${clean[@]}" "CARGO_TARGET_DIR=$WORK/sys-target" "$CARGO" build -vv --message-format=json \
-    --manifest-path "$WORK/extracted/moq5-sys-$version/Cargo.toml" \
+    --manifest-path "$WORK/extracted/moq5-sys-$version/Cargo.toml" ${features[@]+"${features[@]}"} \
     > "$WORK/moq5-sys.build.json" 2> "$WORK/moq5-sys.build.log" || {
     echo "package_check.sh: the extracted moq5-sys did not build (see $WORK/moq5-sys.build.log)" >&2
     tail -40 "$WORK/moq5-sys.build.log" >&2; exit 1; }
@@ -105,6 +119,9 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[features]
+player = ["moq5/player"]
+
 [dependencies]
 moq5 = { path = "$WORK/extracted/moq5-$version" }
 
@@ -116,7 +133,7 @@ EOF
 cp "$HERE/consumer/src/main.rs" "$WORK/consumer/src/main.rs"
 cd "$WORK/consumer"
 "${clean[@]}" "CARGO_TARGET_DIR=$WORK/consumer-target" "$CARGO" build -vv --message-format=json \
-    > "$WORK/consumer.build.json" 2> "$WORK/consumer.build.log" || {
+    ${features[@]+"${features[@]}"} > "$WORK/consumer.build.json" 2> "$WORK/consumer.build.log" || {
     echo "package_check.sh: the consumer build failed (see $WORK/consumer.build.log)" >&2
     tail -40 "$WORK/consumer.build.log" >&2; exit 1; }
 classify "$WORK/consumer.build.json" "$WORK/consumer.build.log" "$WORK/consumer.diagnostics.txt" "package consumer"
@@ -132,4 +149,8 @@ fi
 env -i "PATH=$PATH" "LD_LIBRARY_PATH=$closure" "DYLD_LIBRARY_PATH=$closure" \
     "$WORK/consumer-target/debug/moq5-package-consumer" | tee "$WORK/consumer.run.log"
 grep -q '^moq5 consumer: OK$' "$WORK/consumer.run.log"
+if [ ${#features[@]} != 0 ]; then
+    grep -q '^player linked$' "$WORK/consumer.run.log" ||
+        { echo "package_check.sh: the packaged consumer ran without the player" >&2; exit 1; }
+fi
 echo "package_check.sh: OK ($WORK)"

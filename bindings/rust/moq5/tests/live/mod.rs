@@ -11,8 +11,12 @@
 //! - `MOQ5_RELAY_DRAFT`: the draft both ends offer (default 22).
 //! - `MOQ5_RELAY_WORK`: where the relay's configuration and log go
 //!   (default: a directory under the system temp dir).
+//! - `MOQ5_EXPECT_MPEG2TS`: whether the SDK carries MPEG-TS (1 or 0); the
+//!   MPEG-TS row requires it and asserts the behavior of either.
 
 #![allow(dead_code)]
+
+pub mod ts;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,34 @@ use moq5::{
 
 pub const STEP: Duration = Duration::from_millis(100);
 pub const DEADLINE: Duration = Duration::from_secs(20);
+
+/// Whether the SDK carries MPEG-TS, as the row states it: the MPEG-TS row
+/// asserts real delivery with it and the refusal without it, and runs only
+/// when told which.
+pub fn expect_mpeg2ts() -> bool {
+    match std::env::var("MOQ5_EXPECT_MPEG2TS").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        other => panic!(
+            "MOQ5_EXPECT_MPEG2TS states whether the SDK carries MPEG-TS (1 or 0), not {other:?}"
+        ),
+    }
+}
+
+/// Wait until `track` has a subscriber at the sender.
+pub fn subscribed(sender: &Sender, track: moq5::SendTrack) {
+    let started = Instant::now();
+    while !sender
+        .track_has_subscriber(track)
+        .expect("a track of this sender")
+    {
+        match sender.wait(STEP) {
+            Ok(_) => {}
+            Err(error) => panic!("sender wait: {error}"),
+        }
+        assert!(started.elapsed() < DEADLINE, "no subscriber on the track");
+    }
+}
 
 pub fn draft() -> Version {
     match std::env::var("MOQ5_RELAY_DRAFT") {

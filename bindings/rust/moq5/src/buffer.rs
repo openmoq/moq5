@@ -22,6 +22,10 @@ use crate::{ffi, sys};
 /// reference, an application thread or the service's network thread, and is
 /// correct on both: it runs no application code, reaches no endpoint, and
 /// cannot unwind.
+///
+/// [`slice`](Buffer::slice) narrows a buffer to a range of its bytes without
+/// copying. It consumes the buffer, so the slice is again the only
+/// reference to the storage.
 pub struct Buffer(NonNull<sys::moq_rcbuf_t>);
 
 // SAFETY: a Buffer is the only reference to its rcbuf, so moving it moves
@@ -167,6 +171,55 @@ impl Buffer {
         unsafe { Buffer::wrap(data, len, release, context) }
     }
 
+    /// Narrow the buffer to `range` of its bytes without copying
+    /// (`moq_rcbuf_slice`). The buffer is consumed: its storage outlives it
+    /// through the slice, which is again the only reference to it. That is
+    /// what keeps a `Buffer` movable between threads, since libmoq's
+    /// refcounts are not atomic, so two buffers never share storage. To send
+    /// several ranges of one container, copy each range or adopt each
+    /// container separately.
+    ///
+    /// A range outside the buffer is [`Error::INVAL`] and a failed
+    /// allocation of the slice [`Error::NOMEM`]; either way the buffer comes
+    /// back in the error, unchanged.
+    pub fn slice(self, range: Range<usize>) -> std::result::Result<Buffer, SliceError> {
+        if let Err(error) = checked(&range, self.len()) {
+            return Err(SliceError {
+                error,
+                buffer: self,
+            });
+        }
+        let mut raw = ptr::null_mut();
+        // SAFETY: a live rcbuf this buffer owns and a range within it; the
+        // default allocator is static. The slice takes its own reference to
+        // the storage.
+        let code = unsafe {
+            sys::moq_rcbuf_slice(
+                sys::moq_alloc_default(),
+                self.0.as_ptr(),
+                range.start,
+                range.end - range.start,
+                &mut raw,
+            )
+        };
+        if code != sys::MOQ_OK {
+            return Err(SliceError {
+                error: Error::from_code(code),
+                buffer: self,
+            });
+        }
+        let Some(slice) = NonNull::new(raw) else {
+            return Err(SliceError {
+                error: Error::INTERNAL,
+                buffer: self,
+            });
+        };
+        // The slice's reference keeps the storage; this one is released, so
+        // the slice is the only reference left.
+        drop(self);
+        Ok(Buffer(slice))
+    }
+
     /// The bytes.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
@@ -224,6 +277,33 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         // SAFETY: the sole reference; decref releases it.
         unsafe { sys::moq_rcbuf_decref(self.0.as_ptr()) }
+    }
+}
+
+/// A failed [`slice`](Buffer::slice): the error and the buffer, which the
+/// caller still owns. Converting it into an [`Error`] drops the buffer. The
+/// pair is the whole record (destructure it freely); it is not
+/// `#[non_exhaustive]`.
+#[derive(Debug)]
+#[must_use]
+pub struct SliceError {
+    /// Why the slice was refused.
+    pub error: Error,
+    /// The buffer, untouched.
+    pub buffer: Buffer,
+}
+
+impl fmt::Display for SliceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "buffer slice failed: {}", self.error)
+    }
+}
+
+impl std::error::Error for SliceError {}
+
+impl From<SliceError> for Error {
+    fn from(failure: SliceError) -> Error {
+        failure.error
     }
 }
 
@@ -306,6 +386,62 @@ mod tests {
             format!("{:?}", Buffer::from_vec(vec![0; 2]).expect("a vec")),
             "Buffer { len: 2 }"
         );
+    }
+
+    #[test]
+    fn slices_narrow_without_copying() {
+        let buffer = Buffer::copy_from(b"0123456789").expect("a copy");
+        let start = buffer.as_slice().as_ptr();
+        let slice = buffer.slice(2..8).expect("a range within the buffer");
+        assert_eq!(slice.as_slice(), b"234567");
+        // SAFETY: only compared, never dereferenced.
+        assert_eq!(
+            slice.as_slice().as_ptr(),
+            unsafe { start.add(2) },
+            "no copy"
+        );
+        // A slice of a slice refers to the same storage.
+        let inner = slice.slice(1..3).expect("a range within the slice");
+        assert_eq!(inner.as_slice(), b"34");
+        // SAFETY: as above.
+        assert_eq!(inner.as_slice().as_ptr(), unsafe { start.add(3) });
+        // SAFETY: a live rcbuf this buffer owns.
+        assert_eq!(unsafe { sys::moq_rcbuf_refcount(inner.as_ptr()) }, 1);
+        let empty = inner.slice(2..2).expect("an empty range at the end");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_refused_slice_returns_the_buffer() {
+        let buffer = Buffer::copy_from(b"abc").expect("a copy");
+        let raw = buffer.as_ptr();
+        let failure = buffer.slice(1..4).unwrap_err();
+        assert_eq!(failure.error, Error::INVAL);
+        assert_eq!(failure.buffer.as_ptr(), raw, "the same buffer");
+        assert_eq!(failure.buffer.as_slice(), b"abc");
+        let (start, end) = (2, 1);
+        let failure = failure.buffer.slice(start..end).unwrap_err();
+        assert_eq!(failure.error, Error::INVAL);
+        assert_eq!(Error::from(failure), Error::INVAL);
+    }
+
+    #[test]
+    fn a_sliced_container_is_released_once_with_the_slice() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RELEASES: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn count(_context: *mut c_void, _data: *const u8, len: usize) {
+            assert_eq!(len, 4, "the whole container is released");
+            RELEASES.fetch_add(1, Ordering::SeqCst);
+        }
+        static DATA: [u8; 4] = [1, 2, 3, 4];
+        // SAFETY: static bytes; the release only counts.
+        let buffer = unsafe { Buffer::wrap_raw(DATA.as_ptr(), 4, Some(count), ptr::null_mut()) }
+            .expect("a wrap");
+        let slice = buffer.slice(1..3).expect("a range");
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 0, "the slice keeps it");
+        assert_eq!(slice.as_slice(), [2, 3]);
+        drop(slice);
+        assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
     }
 
     #[test]

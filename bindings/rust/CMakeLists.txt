@@ -1,8 +1,9 @@
 # The Rust binding's qualification rows (MOQ_BUILD_RUST_BINDING): cargo over
 # an SDK staged from this tree. ON means every row is required -- a missing
 # tool or input is a configure error, never a skipped row; the relay rows
-# (MOQ_RUST_RELAY_ROWS=OFF) and the cross-build row (MOQ_RUST_CROSS_BUILD=OFF)
-# alone can be left out explicitly.
+# (MOQ_RUST_RELAY_ROWS=OFF), the cross-build row (MOQ_RUST_CROSS_BUILD=OFF)
+# and the player's rows (MOQ_RUST_PLAYER=OFF) alone can be left out
+# explicitly.
 if(NOT MOQ_BUILD_TESTS)
     message(FATAL_ERROR
         "MOQ_BUILD_RUST_BINDING=ON requires MOQ_BUILD_TESTS=ON: the binding is qualified through ctest rows")
@@ -125,6 +126,60 @@ if(MOQ_RUST_CROSS_BUILD)
     endif()
 endif()
 
+# What the SDK carries beyond the service, stated so that a feature it lacks
+# is never a skipped row: the media player (moq5's `player` feature, over
+# <moq/media_player.h>; MOQ_BUILD_PLAYBACK) and MPEG-TS (MOQ_BUILD_MPEG2TS).
+# Each defaults to what this tree builds, or for a named SDK to the headers
+# its own pkg-config metadata places (scripts/sdk_features.cmake), and every
+# row checks the statement against the SDK it links. MOQ_RUST_PLAYER=OFF
+# leaves the player's rows out explicitly; MOQ_RUST_MPEG2TS is the outcome
+# the MPEG-TS relay rows require: the stream, or the SDK's refusal.
+include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/sdk_features.cmake")
+set(_rust_player_default OFF)
+set(_rust_mpeg2ts_default OFF)
+if(MOQ_RUST_SDK_PREFIX)
+    moq_rust_sdk_carries("${MOQ_RUST_SDK_PREFIX}" "${MOQ_PKG_CONFIG}" "${MOQ_RUST_SDK_PKG_CONFIG_PATH}"
+        _rust_player_default _rust_mpeg2ts_default _rust_sdk_includedir)
+    message(STATUS "Rust rows: ${MOQ_RUST_SDK_PREFIX} keeps its headers in "
+        "'${_rust_sdk_includedir}' (player ${_rust_player_default}, MPEG-TS ${_rust_mpeg2ts_default})")
+else()
+    if(TARGET moq::playback)
+        set(_rust_player_default ON)
+    endif()
+    if(TARGET moq::mpeg2ts)
+        set(_rust_mpeg2ts_default ON)
+    endif()
+endif()
+option(MOQ_RUST_PLAYER
+    "Qualify moq5's player feature (needs an SDK with the player: MOQ_BUILD_PLAYBACK=ON)" ${_rust_player_default})
+option(MOQ_RUST_MPEG2TS
+    "The SDK carries MPEG-TS (MOQ_BUILD_MPEG2TS=ON): the MPEG-TS relay rows require the stream, not the refusal"
+    ${_rust_mpeg2ts_default})
+if(NOT MOQ_RUST_SDK_PREFIX)
+    if(MOQ_RUST_PLAYER AND NOT TARGET moq::playback)
+        message(FATAL_ERROR
+            "MOQ_RUST_PLAYER=ON needs the player in the staged SDK (MOQ_BUILD_PLAYBACK=ON); set MOQ_RUST_PLAYER=OFF to leave the player's rows out explicitly")
+    endif()
+    if(MOQ_RUST_MPEG2TS AND NOT TARGET moq::mpeg2ts)
+        message(FATAL_ERROR
+            "MOQ_RUST_MPEG2TS=ON states that the staged SDK carries MPEG-TS, which needs MOQ_BUILD_MPEG2TS=ON")
+    endif()
+    if(NOT MOQ_RUST_MPEG2TS AND TARGET moq::mpeg2ts)
+        message(FATAL_ERROR
+            "MOQ_RUST_MPEG2TS=OFF states that the staged SDK refuses MPEG-TS, but this tree builds it (MOQ_BUILD_MPEG2TS=ON)")
+    endif()
+endif()
+if(MOQ_RUST_PLAYER)
+    set(_rust_player 1)
+else()
+    set(_rust_player 0)
+endif()
+if(MOQ_RUST_MPEG2TS)
+    set(_rust_mpeg2ts 1)
+else()
+    set(_rust_mpeg2ts 0)
+endif()
+
 set(_rust_src "${CMAKE_CURRENT_SOURCE_DIR}")
 set(_rust_work "${CMAKE_CURRENT_BINARY_DIR}/work")
 if(MOQ_RUST_SDK_PREFIX)
@@ -144,7 +199,9 @@ set(_rust_env
     "MOQ5_RUST_TOOLCHAIN=${MOQ_RUST_TOOLCHAIN}"
     "MOQ5_RUST_WORK=${_rust_work}"
     "MOQ5_RUST_SDK=${_rust_sdk}"
-    "MOQ5_RUST_SOURCE=${PROJECT_SOURCE_DIR}")
+    "MOQ5_RUST_SOURCE=${PROJECT_SOURCE_DIR}"
+    "MOQ5_RUST_PLAYER=${_rust_player}"
+    "MOQ5_RUST_MPEG2TS=${_rust_mpeg2ts}")
 if(MOQ_RUST_LIBCLANG_PATH)
     list(APPEND _rust_env "LIBCLANG_PATH=${MOQ_RUST_LIBCLANG_PATH}")
 endif()

@@ -513,12 +513,15 @@ typedef struct moq_media_track_cfg {
      * the sender gives for the track (SUBSCRIBE_OK, TRACK_STATUS_OK, the
      * PUBLISH of a publish_tracks sender). Opaque and in the negotiated
      * draft's encoding; a property whose type and value are both below 64
-     * encodes identically on drafts 16, 18 and 22. Copied by add_track; the
-     * session checks them when the track reaches it, and a set it refuses
-     * makes the sender fatal with MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED. Empty
-     * states none. Aligned past the MPEG2TS block on every target, so a
-     * caller's struct_size that ends at or before that block never covers
-     * it. */
+     * encodes identically on drafts 16, 18 and 22. add_track checks them,
+     * with DYNAMIC_GROUPS added when dynamic_groups is set, before it
+     * registers the track, as moq_track_properties_validate() does: against
+     * the negotiated draft once known, before that against every draft the
+     * endpoint offers. A set that fails returns MOQ_ERR_INVAL (MOQ_ERR_NOMEM
+     * when the check cannot allocate) and changes nothing; otherwise
+     * add_track copies it. Empty states none. Aligned past the MPEG2TS block
+     * on every target, so a caller's struct_size that ends at or before that
+     * block never covers it. */
 #ifdef __cplusplus
     alignas(uint64_t)
 #else

@@ -13,6 +13,11 @@ links = "moq"
 build = "build.rs"
 publish = false
 
+[features]
+# The media player (media_player.h), which an SDK carries only when built
+# with MOQ_BUILD_PLAYBACK=ON; without such an SDK the feature fails the build.
+player = []
+
 [dependencies]
 
 [dev-dependencies]
@@ -38,7 +43,8 @@ shlex = "2"
 # The snapshot carries the layouts of the targets it is generated and
 # verified on (tests/snapshot.rs), so documentation builds are restricted
 # to those; docs.rs's default set includes 32-bit targets the snapshot's
-# layout assertions would not compile on.
-all-features = false
+# layout assertions would not compile on. The player's snapshot is
+# documented too.
+features = ["player"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

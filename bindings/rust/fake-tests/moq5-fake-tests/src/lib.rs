@@ -41,6 +41,14 @@ extern "C" {
     pub fn moq5_fake_set_track_state(r: *mut sys::moq_media_receiver_t, index: usize, state: u32);
 }
 
+// The player's controls: the provider queues what the tests push for the
+// player attached last.
+#[cfg(feature = "player")]
+extern "C" {
+    pub fn moq5_fake_push_player_output(out: *const sys::moq_media_player_output_t);
+    pub fn moq5_fake_push_player_event(ev: *const sys::moq_media_player_event_t);
+}
+
 /// One entry of the C layout table.
 #[repr(C)]
 pub struct LayoutEntry {

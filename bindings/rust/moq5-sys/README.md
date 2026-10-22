@@ -2,7 +2,12 @@
 
 Raw FFI bindings to libmoq, the MOQ5 Media over QUIC library, generated with
 bindgen from the installed service-tier headers (`types`, `rcbuf`, `version`,
-`endpoint`, `cmaf`, `msf`, `media_object`, `media_sender`, `media_receiver`).
+`endpoint`, `cmaf`, `msf`, `media_object`, `media_sender`, `media_receiver`),
+and with the `player` feature from the player's (`playback`,
+`media_player`), generated into a second file beside the base bindings
+that reuses the base items rather than generating them again. The feature
+needs an SDK built with the player
+(`MOQ_BUILD_PLAYBACK=ON`); the build fails, naming that remedy, without one.
 The headers' comments are the documentation of every generated item (clang
 parses them all, not only doc comments), and each header's file preamble
 (for `rcbuf.h`, the threading contract: refcount operations are not atomic,
@@ -83,44 +88,58 @@ declaration or constant the safe crate uses is missing from the installed
 headers (`wrapper.h` restates the ones bindgen cannot evaluate), the layout
 row compares every record with the C compiler's view, and appended fields in
 a newer SDK are tolerated by the `struct_size` contract. The qualified
-baseline is libmoq commit `5942fcc2` (the tree these crates are developed
+baseline is libmoq commit `174b6428` (the tree these crates are developed
 in), installed as: the no-adapter service SDK (`MOQ_BUILD_MSF=ON`,
 `MOQ_BUILD_MEDIA_OBJECT=ON`, `MOQ_BUILD_SERVICE=ON`, static and
 `BUILD_SHARED_LIBS=ON`), the picoquic raw-QUIC plus PicoWT managed SDK
 (`MOQ_BUILD_ADAPTER_PICOQUIC`, `MOQ_BUILD_PQ_THREADED`,
-`MOQ_BUILD_ADAPTER_PICO_WT`, `MOQ_BUILD_PICO_WT_MANAGED`), and the WTQuic
-managed SDK (`MOQ_BUILD_ADAPTER_WTQUIC`, `MOQ_BUILD_WTQUIC_MSQUIC_MANAGED`).
-The rows of [`../README.md`](../README.md) ran on this matrix; each cell
-says how far that configuration was taken:
+`MOQ_BUILD_ADAPTER_PICO_WT`, `MOQ_BUILD_PICO_WT_MANAGED`), each of those
+with the player and MPEG-TS (`MOQ_BUILD_PLAYBACK=ON`,
+`MOQ_BUILD_MPEG2TS=ON`), the picoquic SDK also without them, the static
+no-adapter SDK with them also installed with its headers under `headers/`
+(`CMAKE_INSTALL_INCLUDEDIR`: the build finds them, as everything here does,
+where the SDK's pkg-config metadata places them), and the WTQuic managed SDK
+(`MOQ_BUILD_ADAPTER_WTQUIC`, `MOQ_BUILD_WTQUIC_MSQUIC_MANAGED`) without
+them. The rows of [`../README.md`](../README.md) ran on this matrix;
+each cell says how far that configuration was taken. Where the SDK carries
+the player, every build ran with and without the `player` feature:
 
 | Host | SDK | Rows run | Snapshot equality | Cross check |
 |---|---|---|---|---|
-| macOS 15, aarch64, Apple clang, Homebrew LLVM libclang | no-adapter, static | all, natively | `aarch64-apple-darwin` | `x86_64-apple-darwin`: a target SDK built from the tree, the crates checked against it, not linked or run |
-| macOS 15, aarch64 | no-adapter, shared | all, natively | `aarch64-apple-darwin` | as above |
-| macOS 15, aarch64 | WTQuic managed, static (`MOQ_RUST_SDK_PKG_CONFIG_PATH` for the wtquic install) | all, natively | `aarch64-apple-darwin` | refusal row only |
-| macOS 15, aarch64 | picoquic plus PicoWT managed, static, from the relay tree (`MOQ_RUST_SDK_PREFIX`) | all and the relay rows on drafts 22 and 18, natively; the native peer once more under ThreadSanitizer | `aarch64-apple-darwin` | refusal row only |
-| Ubuntu 24.04 container, aarch64, clang | no-adapter, static and shared | all, natively | `aarch64-unknown-linux-gnu` | refusal row only |
-| Ubuntu 24.04 container, aarch64, gcc-built SDK, clang rows | picoquic plus PicoWT managed, static, from the relay tree | all and the relay rows on drafts 22 and 18, natively | `aarch64-unknown-linux-gnu` | refusal row only |
-| Ubuntu 24.04 container, x86_64 under emulation on an aarch64 host, clang | no-adapter, static | all, under emulation | `x86_64-unknown-linux-gnu` | refusal row only |
+| macOS 15, aarch64, Apple clang, Homebrew LLVM libclang | no-adapter with the player and MPEG-TS, static | all, natively | `aarch64-apple-darwin`, the player's too | `x86_64-apple-darwin`: a target SDK built from the tree with the player and MPEG-TS, the crates checked against it without and with the player, not linked or run |
+| macOS 15, aarch64 | no-adapter with the player and MPEG-TS, shared | all, natively | as above | as above |
+| macOS 15, aarch64 | WTQuic managed, static (`MOQ_RUST_SDK_PKG_CONFIG_PATH` for the wtquic install), without the player and MPEG-TS, both stated | all, natively, the player's builds left out | `aarch64-apple-darwin` | refusal row only |
+| macOS 15, aarch64 | no-adapter with the player and MPEG-TS, static, its headers installed under `headers/` (`CMAKE_INSTALL_INCLUDEDIR=headers`, `MOQ_RUST_SDK_PREFIX`) | all, natively | `aarch64-apple-darwin`, the player's too | refusal row only |
+| macOS 15, aarch64 | picoquic plus PicoWT managed with the player and MPEG-TS, static, from the relay tree (`MOQ_RUST_SDK_PREFIX`) | all and the relay rows on drafts 22 and 18, natively; the relay rows once more with the native peer under ThreadSanitizer | `aarch64-apple-darwin`, the player's too | refusal row only |
+| macOS 15, aarch64 | picoquic plus PicoWT managed without the player and MPEG-TS, both stated, static | the relay rows on drafts 22 and 18 (the MPEG-TS rows requiring the refusal, the player's left out) | -- | -- |
+| Ubuntu 24.04 container, aarch64, clang | no-adapter with the player and MPEG-TS, static and shared | all, natively | `aarch64-unknown-linux-gnu`, the player's too | refusal row only |
+| Ubuntu 24.04 container, aarch64, gcc (the SDK, the relay, and the rows' C: the CTest environment carries the tree's compiler) | picoquic plus PicoWT managed with the player and MPEG-TS, static, from the relay tree | all and the relay rows on drafts 22 and 18, natively | `aarch64-unknown-linux-gnu`, the player's too | refusal row only |
+| Ubuntu 24.04 container, x86_64 under emulation on an aarch64 host, clang | no-adapter with the player and MPEG-TS, static | all, under emulation | `x86_64-unknown-linux-gnu`, the player's too | refusal row only |
 
-The `rust_doc` row builds the `cfg(docsrs)` snapshot for all three docs.rs
-targets on every host above. Unrun: Windows (any configuration), Linux
-x86_64 with a shared or a picoquic SDK, native (unemulated) x86_64 Linux
-hardware, macOS x86_64 at run time (checked only), the WTQuic managed SDK on
-Linux, and every target outside the docs.rs list.
+The `rust_doc` row builds the `cfg(docsrs)` snapshots, the player's
+included, for all three docs.rs targets on every host above. Unrun: Windows
+(any configuration), Linux x86_64 with a shared or a picoquic SDK, native
+(unemulated) x86_64 Linux hardware, macOS x86_64 at run time (checked only),
+the WTQuic managed SDK on Linux or with the player or MPEG-TS, the native
+peer under ThreadSanitizer on Linux, and every target outside the docs.rs
+list.
 
 ## The docs.rs snapshot
 
 `docs/bindings.rs` is a snapshot of the generated bindings, and
 `docs/preambles.md` of the header preambles, compiled only under
-`cfg(docsrs)`, where no SDK exists to generate them from. The bindings'
+`cfg(docsrs)`, where no SDK exists to generate them from;
+`docs/bindings_player.rs` and `docs/preambles_player.md` are the player's,
+compiled with the `player` feature, which both manifests document. The
+bindings'
 header records the libmoq commit, the SDK's `Requires` closure and the
 generating target and tooling (bindgen 0.73, the output formatted by the
 toolchain's rustfmt, on which rustfmt 1.9 and 1.10 agree byte for byte);
-`scripts/update_snapshot.sh <sdk-prefix>` regenerates both from a build
-against an installed SDK, and `tests/snapshot.rs` holds both byte for byte
-equal to a fresh generation on every target the tests run on. The snapshot
-carries those targets' layouts (its layout assertions are compiled into
+`scripts/update_snapshot.sh <sdk-prefix>` regenerates all four from a build
+against an installed SDK with the player, and `tests/snapshot.rs` holds
+them byte for byte equal to a fresh generation on every target the tests
+run on (the player's pair under the feature). The snapshots
+carry those targets' layouts (their layout assertions are compiled into
 every build), so both manifests restrict docs.rs to them
 (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `aarch64-apple-darwin`, the targets of the matrix above); a target outside

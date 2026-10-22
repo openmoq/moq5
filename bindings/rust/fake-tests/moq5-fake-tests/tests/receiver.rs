@@ -1,7 +1,9 @@
 //! Receiver rows: configuration mapping through the sized presets, track
-//! events with every stamped field, description snapshots, owned objects
-//! and their release, the stream-terminal lane, timeline records,
-//! subscriptions, state, content protection and the stamped statistics.
+//! events with every stamped field, description snapshots and their
+//! extension records, owned objects and their release (whole or within a
+//! charge), draft-22 metadata, the stream-terminal lane, timeline records,
+//! subscriptions with locations and fills, fill cancellation, state, content
+//! protection, the receiver's information and the stamped statistics.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,10 +11,11 @@ use std::time::Duration;
 
 use moq5::cmaf::CmafSample;
 use moq5::{
-    CompanionProfile, DeliveryOrigin, Endpoint, EndpointConfig, Error, Location, MediaType,
-    Namespace, ObjectStatus, Packaging, ParseDropClass, Receiver, ReceiverConfig, SapType,
-    StartMode, StreamTerminalKind, SubscribeOptions, TimeMode, Track, TrackEventKind, TrackState,
-    Version, WaitResult,
+    CompanionProfile, DeliveryOrigin, Endpoint, EndpointConfig, Error, FillError, FillOptions,
+    FillReason, GroupOrder, Location, LocationFilter, MediaType, Mpeg2tsKeys, Mpeg2tsMode,
+    Mpeg2tsTimestampMode, Namespace, ObjectStatus, OverflowPolicy, Packaging, ParseDropClass,
+    PollWithin, Receiver, ReceiverConfig, SapType, StartMode, StreamTerminalKind, SubscribeOptions,
+    TimeDomain, TimeMode, Track, TrackEventKind, TrackExtension, TrackState, Version, WaitResult,
 };
 use moq5_fake_tests as fake;
 use moq5_fake_tests::{sys, Suite};
@@ -56,7 +59,7 @@ fn raw_event(receiver: &Receiver, kind: u32, index: usize) -> sys::moq_media_tra
     }
 }
 
-/// The handle the receiver reports for the provider'stats track `index`.
+/// The handle the receiver reports for the provider's track `index`.
 fn track(receiver: &Receiver, index: usize) -> Track {
     push_event(raw_event(receiver, sys::MOQ_MEDIA_TRACK_ADDED, index));
     receiver
@@ -166,7 +169,7 @@ fn attach_maps_the_presets_and_every_field() {
     assert_eq!(
         fake::field(&line_text, "mpeg2ts"),
         "0/0/0/0",
-        "left at the initializer'stats defaults"
+        "left at the initializer's defaults"
     );
     assert_eq!(
         fake::field(&line_text, "companion"),
@@ -215,7 +218,7 @@ fn attach_maps_the_presets_and_every_field() {
     assert_eq!(
         fake::field(&line_text, "terminals"),
         "on:8",
-        "the lane'stats two settings travel together"
+        "the lane's two settings travel together"
     );
     drop(receiver);
     s.set(
@@ -327,14 +330,12 @@ fn events_carry_every_stamped_field() {
     let terminal = event
         .fill_terminal()
         .expect("a FillTerminal event reports its terminal");
+    assert_eq!(terminal.initiating_request_id, 0, "zero is a valid ID");
+    assert_eq!(terminal.reason, FillReason::LocalCancelled);
     assert_eq!(
-        (
-            terminal.initiating_request_id,
-            terminal.reason,
-            terminal.error_domain,
-            terminal.error_code
-        ),
-        (0, 3, 1, 0)
+        terminal.error,
+        FillError::Stream(0),
+        "a stream code of zero is still a failure"
     );
     let loss = event
         .fill_unreported_loss()
@@ -507,7 +508,7 @@ fn descriptions_are_current_snapshots() {
     );
     assert!(format!("{description:?}").contains("video"));
 
-    // The service rewrites the handle'stats description in place on a
+    // The service rewrites the handle's description in place on a
     // live-to-VOD conversion: a new query shows it, the old copy does not.
     set_description(&receiver, 0, &raw_description(false));
     let later = receiver
@@ -981,6 +982,7 @@ fn subscriptions_and_state() {
             Some(SubscribeOptions {
                 start: StartMode::NextGroup,
                 priority: Some(5),
+                ..SubscribeOptions::default()
             })
         ),
         Ok(())
@@ -1132,4 +1134,629 @@ fn receiver_holds_its_endpoint() {
     assert!(s.take_log().is_empty());
     drop(receiver);
     assert_eq!(s.take_log(), ["receiver_destroy", "stop", "destroy"]);
+}
+
+#[test]
+fn attach_maps_the_mpeg2ts_settings() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = Receiver::attach(
+        &endpoint,
+        &ReceiverConfig::live(namespace())
+            .mpeg2ts_reorder(32, Duration::from_millis(250))
+            .mpeg2ts_strip_prefix(true)
+            .mpeg2ts_join_psi(true),
+    )
+    .expect("the provider accepts the receiver attach");
+    let line_text = fake::line(&s.take_log(), "receiver_attach ");
+    assert_eq!(fake::field(&line_text, "mpeg2ts"), "32/250000/1/1");
+    drop(receiver);
+    let attaches = s.get("receiver_attach");
+    assert_eq!(
+        Receiver::attach(
+            &endpoint,
+            &ReceiverConfig::live(namespace()).mpeg2ts_reorder(0, Duration::from_nanos(1500)),
+        )
+        .err(),
+        Some(Error::INVAL),
+        "an inexact window is refused"
+    );
+    assert_eq!(s.get("receiver_attach"), attaches, "before the service");
+}
+
+fn at(group_id: u64, object_id: u64) -> Location {
+    Location {
+        group_id,
+        object_id,
+    }
+}
+
+#[test]
+fn subscriptions_carry_locations_and_fills() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let track = track(&receiver, 0);
+    s.take_log();
+    let filter_size = std::mem::size_of::<sys::moq_location_filter_cfg_t>();
+    let forms = [
+        (
+            LocationFilter::Unconstrained,
+            sys::MOQ_LOCATION_FILTER_NONE,
+            "0:0.0:0.0".to_owned(),
+        ),
+        (
+            LocationFilter::NextObject,
+            sys::MOQ_LOCATION_FILTER_NEXT_OBJECT,
+            "0:0.0:0.0".to_owned(),
+        ),
+        (
+            LocationFilter::RelativeGroup { offset: 2 },
+            sys::MOQ_LOCATION_FILTER_RELATIVE_GROUP,
+            "2:0.0:0.0".to_owned(),
+        ),
+        (
+            LocationFilter::AbsoluteStart(at(5, 1)),
+            sys::MOQ_LOCATION_FILTER_ABSOLUTE_START,
+            "0:5.1:0.0".to_owned(),
+        ),
+        (
+            LocationFilter::GroupEnd {
+                start: at(5, 1),
+                end_group: 9,
+            },
+            sys::MOQ_LOCATION_FILTER_GROUP_END,
+            "0:5.1:9.0".to_owned(),
+        ),
+        (
+            LocationFilter::ObjectEnd {
+                start: at(5, 1),
+                end: at(9, u64::MAX),
+            },
+            sys::MOQ_LOCATION_FILTER_OBJECT_END,
+            format!("0:5.1:9.{}", u64::MAX),
+        ),
+    ];
+    for (filter, kind, fields) in forms {
+        assert_eq!(filter.code(), kind);
+        receiver
+            .subscribe_track(
+                track,
+                Some(SubscribeOptions {
+                    location: Some(filter),
+                    ..SubscribeOptions::default()
+                }),
+            )
+            .expect("the provider accepts the subscription");
+        let line_text = fake::line(&s.take_log(), "subscribe ");
+        assert_eq!(fake::field(&line_text, "location"), "1", "{filter:?}");
+        assert_eq!(
+            fake::field(&line_text, "loc"),
+            format!("{kind}:{fields}:struct={filter_size}"),
+            "{filter:?}"
+        );
+        assert_eq!(fake::field(&line_text, "fill"), "0");
+        assert_eq!(fake::field(&line_text, "fill_cfg"), "none");
+        assert_eq!(fake::field(&line_text, "program"), "0");
+    }
+
+    // A fill with every override and a location of its own, and the
+    // MPEG-TS program.
+    let fill_size = std::mem::size_of::<sys::moq_fill_cfg_t>();
+    receiver
+        .subscribe_track(
+            track,
+            Some(SubscribeOptions {
+                mpeg2ts_program: std::num::NonZeroU32::new(7),
+                fill: Some(FillOptions {
+                    subscriber_priority: Some(3),
+                    group_order: Some(GroupOrder::Descending),
+                    timeout: Some(Duration::from_millis(1500)),
+                    location: Some(LocationFilter::AbsoluteStart(at(4, 0))),
+                }),
+                ..SubscribeOptions::default()
+            }),
+        )
+        .expect("the provider accepts the subscription");
+    let line_text = fake::line(&s.take_log(), "subscribe ");
+    assert_eq!(fake::field(&line_text, "program"), "7");
+    assert_eq!(fake::field(&line_text, "location"), "0");
+    assert_eq!(fake::field(&line_text, "fill"), "1");
+    assert_eq!(
+        fake::field(&line_text, "fill_cfg"),
+        format!(
+            "3/{}/1500/{}:0:4.0:0.0:struct={filter_size}/struct={fill_size}",
+            sys::MOQ_GROUP_ORDER_DESCENDING,
+            sys::MOQ_LOCATION_FILTER_ABSOLUTE_START
+        )
+    );
+    // A bare fill inherits everything; a zero timeout is a value.
+    receiver
+        .subscribe_track(
+            track,
+            Some(SubscribeOptions {
+                fill: Some(FillOptions::default()),
+                ..SubscribeOptions::default()
+            }),
+        )
+        .expect("the provider accepts the subscription");
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "subscribe "), "fill_cfg"),
+        format!("-/-/-/none/struct={fill_size}")
+    );
+    receiver
+        .subscribe_track(
+            track,
+            Some(SubscribeOptions {
+                fill: Some(FillOptions {
+                    timeout: Some(Duration::ZERO),
+                    ..FillOptions::default()
+                }),
+                ..SubscribeOptions::default()
+            }),
+        )
+        .expect("the provider accepts the subscription");
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "subscribe "), "fill_cfg"),
+        format!("-/-/0/none/struct={fill_size}")
+    );
+    // A timeout finer than a millisecond is refused before the service.
+    assert_eq!(
+        receiver.subscribe_track(
+            track,
+            Some(SubscribeOptions {
+                fill: Some(FillOptions {
+                    timeout: Some(Duration::from_micros(1500)),
+                    ..FillOptions::default()
+                }),
+                ..SubscribeOptions::default()
+            }),
+        ),
+        Err(Error::INVAL)
+    );
+    assert!(s.take_log().is_empty());
+}
+
+#[test]
+fn fill_cancellation_reaches_the_service() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let track = track(&receiver, 0);
+    s.take_log();
+    assert_eq!(receiver.cancel_fill(track, 0), Ok(()), "zero is a valid ID");
+    assert_eq!(s.take_log(), ["cancel_fill track=0 id=0"]);
+    for code in [
+        sys::MOQ_ERR_STALE_HANDLE,
+        sys::MOQ_ERR_UNSUPPORTED,
+        sys::MOQ_ERR_CLOSED,
+    ] {
+        s.set("cancel_fill_result", i64::from(code));
+        assert_eq!(
+            receiver.cancel_fill(track, u64::MAX),
+            Err(Error::from_code(code))
+        );
+    }
+    assert_eq!(s.get("cancel_fill"), 4);
+    // A track of another receiver never reaches the service.
+    drop(receiver);
+    let second = attach(&s, &endpoint);
+    assert_eq!(second.cancel_fill(track, 1), Err(Error::INVAL));
+    assert_eq!(s.get("cancel_fill"), 4);
+}
+
+static TRACK_PROPERTIES: [u8; 3] = [7, 7, 7];
+
+/// An object whose charge is its 4-byte payload and its 3 bytes of track
+/// properties; the payload's release is counted.
+fn push_charged_object(receiver: &Receiver) {
+    let mut payload = std::ptr::null_mut();
+    let mut properties = std::ptr::null_mut();
+    // SAFETY: static bytes; the release only counts. The properties are a
+    // copy the object owns.
+    unsafe {
+        assert_eq!(
+            sys::moq_rcbuf_wrap(
+                sys::moq_alloc_default(),
+                PAYLOAD.as_ptr(),
+                PAYLOAD.len(),
+                Some(count_release),
+                std::ptr::null_mut(),
+                &mut payload,
+            ),
+            sys::MOQ_OK
+        );
+        assert_eq!(
+            sys::moq_rcbuf_create(
+                sys::moq_alloc_default(),
+                TRACK_PROPERTIES.as_ptr(),
+                TRACK_PROPERTIES.len(),
+                &mut properties,
+            ),
+            sys::MOQ_OK
+        );
+    }
+    let object = sys::moq_media_object_t {
+        track: raw_track(receiver, 0),
+        packaging: sys::MOQ_MEDIA_PACKAGING_RAW,
+        payload: fake::span(&PAYLOAD),
+        payload_ref: payload,
+        track_properties_ref: properties,
+        ..Default::default()
+    };
+    // SAFETY: the provider copies the record and takes the references.
+    unsafe { fake::moq5_fake_push_object(&object) };
+}
+
+#[test]
+fn bounded_polls_take_only_what_fits() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    RELEASES.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        receiver.poll_object_within(u64::MAX),
+        Ok(PollWithin::Empty)
+    ));
+    push_charged_object(&receiver);
+    match receiver.poll_object_within(6) {
+        Ok(PollWithin::TooLarge { charge }) => assert_eq!(charge, 7),
+        other => panic!("a 7-byte object within 6: {other:?}"),
+    }
+    assert_eq!(s.get("object_cleanup"), 0, "nothing was dequeued");
+    let (object, charge) = match receiver.poll_object_within(7) {
+        Ok(PollWithin::Taken { object, charge }) => (object, charge),
+        other => panic!("a 7-byte object within 7: {other:?}"),
+    };
+    assert_eq!(charge, 7);
+    assert_eq!(object.charge(), 7, "the object's own measure agrees");
+    assert_eq!(object.payload(), PAYLOAD);
+    assert_eq!(object.track_properties(), Some(&TRACK_PROPERTIES[..]));
+    assert!(matches!(
+        receiver.poll_object_within(u64::MAX),
+        Ok(PollWithin::Empty)
+    ));
+    drop(object);
+    assert_eq!(s.get("object_cleanup"), 1);
+    assert_eq!(RELEASES.load(Ordering::SeqCst), 1, "released once");
+
+    // A record stamped outside the contract is released, not handed out.
+    let v0 = std::mem::offset_of!(sys::moq_media_object_t, samples_owned) + 8;
+    s.set("poll_object_stamp", (v0 - 1) as i64);
+    push_charged_object(&receiver);
+    assert_eq!(
+        receiver.poll_object_within(u64::MAX).err(),
+        Some(Error::ABI_MISMATCH)
+    );
+    assert_eq!(RELEASES.load(Ordering::SeqCst), 2);
+    s.set("poll_object_stamp", v0 as i64);
+    push_charged_object(&receiver);
+    let object = match receiver.poll_object_within(u64::MAX) {
+        Ok(PollWithin::Taken { object, .. }) => object,
+        other => panic!("a v0 record: {other:?}"),
+    };
+    assert_eq!(
+        object.track_properties(),
+        None,
+        "not reported under a v0 stamp"
+    );
+    assert!(object.metadata().is_none());
+    drop(object);
+    s.set("poll_object_stamp", 0);
+    endpoint.set_interrupted(true);
+    assert_eq!(
+        receiver.poll_object_within(0).err(),
+        Some(Error::INTERRUPTED)
+    );
+    endpoint.set_interrupted(false);
+    s.set("poll_object_result", i64::from(sys::MOQ_ERR_CLOSED));
+    assert_eq!(receiver.poll_object_within(0).err(), Some(Error::CLOSED));
+}
+
+#[test]
+fn objects_report_their_draft22_metadata() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let mut loc = sys::moq_loc_metadata_t::default();
+    // SAFETY: a writable struct of exactly the size passed.
+    unsafe { sys::moq_loc_metadata_init_sized(&mut loc, std::mem::size_of_val(&loc)) };
+    loc.present = sys::MOQ_LOC_METADATA_HAS_TIMESTAMP
+        | sys::MOQ_LOC_METADATA_HAS_TIMESCALE
+        | sys::MOQ_LOC_METADATA_HAS_MARKING
+        | sys::MOQ_LOC_METADATA_HAS_VIDEO_CONFIG;
+    loc.timestamp = 90;
+    loc.timescale = 90_000;
+    loc.marking_len = 1;
+    loc.marking[0] = 0x20;
+    loc.video_config = fake::span(CONFIG);
+    let metadata = sys::moq_media_metadata_t {
+        struct_size: std::mem::size_of::<sys::moq_media_metadata_t>() as u32,
+        time_domain: sys::MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA,
+        time_us: 1000,
+        loc,
+        has_time_us: 1,
+        independence_known: 1,
+        independent: 1,
+        ..Default::default()
+    };
+    // The full record, then one stamped through everything before the
+    // metadata block.
+    let short_of_metadata = std::mem::offset_of!(sys::moq_media_object_t, metadata) as i64;
+    for (stamp, expected) in [(0, true), (short_of_metadata, false)] {
+        s.set("poll_object_stamp", stamp);
+        // SAFETY: the provider copies the record.
+        unsafe {
+            fake::moq5_fake_push_object(&sys::moq_media_object_t {
+                track: raw_track(&receiver, 0),
+                metadata,
+                ..Default::default()
+            })
+        };
+        let object = receiver
+            .poll_object()
+            .expect("poll_object on a live receiver")
+            .expect("the pushed object is pollable");
+        if !expected {
+            assert!(
+                object.metadata().is_none(),
+                "a stamp short of the block reports none"
+            );
+            continue;
+        }
+        let view = object.metadata().expect("a draft-22 object's metadata");
+        assert_eq!(view.time_domain(), TimeDomain::ApplicationMedia);
+        assert_eq!(view.time_us(), Some(1000));
+        assert_eq!(view.independent(), Some(true));
+        assert_eq!(view.timestamp(), Some(90));
+        assert_eq!(view.timescale(), Some(90_000));
+        assert_eq!(view.marking(), Some(&[0x20][..]));
+        assert_eq!(view.audio_level(), None);
+        assert_eq!(view.video_config(), Some(CONFIG));
+        assert_eq!(view.audio_config(), None);
+        assert!(format!("{view:?}").contains("ApplicationMedia"));
+    }
+    s.set("poll_object_stamp", 0);
+    // A legacy object's block is zero: no metadata.
+    // SAFETY: as above.
+    unsafe {
+        fake::moq5_fake_push_object(&sys::moq_media_object_t {
+            track: raw_track(&receiver, 0),
+            ..Default::default()
+        })
+    };
+    let object = receiver
+        .poll_object()
+        .expect("poll_object on a live receiver")
+        .expect("the pushed object is pollable");
+    assert!(object.metadata().is_none());
+    assert_eq!(object.track_properties(), None, "no block");
+}
+
+#[test]
+fn information_is_the_effective_configuration() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    s.set(
+        "info_time_mode",
+        i64::from(sys::MOQ_MEDIA_TIME_SHARED_EPOCH),
+    );
+    s.set(
+        "info_overflow_policy",
+        i64::from(sys::MOQ_MEDIA_OVERFLOW_FLOW_CONTROL),
+    );
+    s.set("info_auto_subscribe", 1);
+    s.set("info_terminals", 64);
+    s.set(
+        "info_companion",
+        i64::from(sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC),
+    );
+    s.set("info_version", 22);
+    s.set("poll_track_polled", 5);
+    let info = receiver.info().expect("information on a live receiver");
+    assert_eq!(info.time_mode, TimeMode::SharedEpoch);
+    assert_eq!(info.overflow_policy, OverflowPolicy::FlowControl);
+    assert_eq!((info.max_objects, info.max_bytes), (256, 32 << 20));
+    assert!(info.auto_subscribe);
+    assert_eq!(info.stream_terminals, Some(64));
+    assert_eq!(
+        info.companion_profile,
+        CompanionProfile::D22Msf01Loc04Public
+    );
+    assert_eq!(info.transport_version, Some(Version::DRAFT_22));
+    assert_eq!(info.track_events_polled, 5);
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "get_info "), "out_size"),
+        std::mem::size_of::<sys::moq_media_receiver_info_t>().to_string()
+    );
+    s.set("info_time_mode", 9);
+    s.set("info_overflow_policy", 0);
+    s.set("info_terminals", 0);
+    s.set("info_companion", i64::from(sys::MOQ_MEDIA_COMPANION_AUTO));
+    s.set("info_version", 0);
+    let info = receiver.info().expect("information on a live receiver");
+    assert_eq!(info.time_mode, TimeMode::Other(9));
+    assert_eq!(info.overflow_policy, OverflowPolicy::Other(0));
+    assert_eq!(info.stream_terminals, None, "the lane is off");
+    assert_eq!(info.companion_profile, CompanionProfile::Auto, "unresolved");
+    assert_eq!(info.transport_version, None, "no session observed yet");
+    s.set(
+        "info_stamp",
+        (sys::MOQ_MEDIA_RECEIVER_INFO_V0_SIZE - 1) as i64,
+    );
+    assert_eq!(receiver.info().err(), Some(Error::ABI_MISMATCH));
+    s.set("info_stamp", 9999);
+    assert_eq!(receiver.info().err(), Some(Error::ABI_MISMATCH));
+}
+
+static MODE_NAME: &[u8] = b"per-program";
+static TIMESTAMP_MODE_NAME: &[u8] = b"arrival-time";
+
+#[test]
+fn descriptions_carry_their_extension_records() {
+    let s = fake::suite();
+    let mut si_pids = [0x20u32, 0x21];
+    let record = sys::moq_msf_mpeg2ts_t {
+        struct_size: std::mem::size_of::<sys::moq_msf_mpeg2ts_t>() as u32,
+        has_mode: true,
+        mode: sys::MOQ_MSF_MPEG2TS_MODE_PER_PROGRAM,
+        mode_name: fake::span(MODE_NAME),
+        has_packet_size: true,
+        packet_size: 192,
+        has_program_number: true,
+        program_number: 7,
+        has_pcr_pid: true,
+        pcr_pid: 0x101,
+        has_mux_rate: true,
+        mux_rate: 0,
+        has_si_pids: true,
+        si_pids: si_pids.as_mut_ptr(),
+        si_pid_count: si_pids.len(),
+        has_random_access: true,
+        random_access: true,
+        has_timestamp_mode: true,
+        timestamp_mode: sys::MOQ_MSF_MPEG2TS_TIMESTAMP_ARRIVAL_TIME,
+        timestamp_mode_name: fake::span(TIMESTAMP_MODE_NAME),
+        malformed: sys::MOQ_MSF_MPEG2TS_F_MUX_RATE,
+        ..Default::default()
+    };
+    let short = sys::moq_msf_mpeg2ts_t {
+        struct_size: 8,
+        ..record
+    };
+    let entries = [
+        sys::moq_msf_track_ext_t {
+            kind: sys::MOQ_MSF_EXT_MPEG2TS,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 { mpeg2ts: &record },
+        },
+        sys::moq_msf_track_ext_t {
+            kind: 7,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 {
+                mpeg2ts: std::ptr::null(),
+            },
+        },
+    ];
+    let short_entries = [sys::moq_msf_track_ext_t {
+        kind: sys::MOQ_MSF_EXT_MPEG2TS,
+        u: sys::moq_msf_track_ext__bindgen_ty_1 { mpeg2ts: &short },
+    }];
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let mut description = raw_description(true);
+    description.extensions = entries.as_ptr();
+    description.extension_count = entries.len();
+    // The provider copies the record; its pointers reach locals that
+    // outlive the receiver.
+    set_description(&receiver, 0, &description);
+    let track = track(&receiver, 0);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    let kinds: Vec<u32> = copy
+        .extensions()
+        .map(|extension| match extension {
+            TrackExtension::Mpeg2ts(_) => sys::MOQ_MSF_EXT_MPEG2TS,
+            TrackExtension::Other(kind) => kind,
+            _ => unreachable!("only the two kinds are listed"),
+        })
+        .collect();
+    assert_eq!(kinds, [sys::MOQ_MSF_EXT_MPEG2TS, 7]);
+    let ts = copy.mpeg2ts().expect("the track carries its record");
+    assert_eq!(ts.mode(), Some(Mpeg2tsMode::PerProgram));
+    assert_eq!(ts.mode_name(), Some(MODE_NAME));
+    assert_eq!(ts.packet_size(), Some(192));
+    assert_eq!(ts.es_pid(), None);
+    assert_eq!(ts.program_number(), Some(7));
+    assert_eq!(ts.pcr_pid(), Some(0x101));
+    assert_eq!(ts.mux_rate(), Some(0), "present and malformed");
+    assert_eq!(ts.si_pids(), Some(&[0x20, 0x21][..]));
+    assert_eq!(ts.random_access(), Some(true));
+    assert_eq!(ts.timestamp_mode(), Some(Mpeg2tsTimestampMode::ArrivalTime));
+    assert_eq!(ts.timestamp_mode_name(), Some(TIMESTAMP_MODE_NAME));
+    assert_eq!(ts.scte35_pid(), None);
+    assert!(ts.malformed().contains(Mpeg2tsKeys::MUX_RATE));
+    assert!(!ts.malformed().contains(Mpeg2tsKeys::MODE));
+    assert!(format!("{ts:?}").contains("PerProgram"));
+
+    // A record below its first published size is not read as one.
+    description.extensions = short_entries.as_ptr();
+    description.extension_count = 1;
+    set_description(&receiver, 0, &description);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert!(matches!(
+        copy.extensions().next(),
+        Some(TrackExtension::Other(kind)) if kind == sys::MOQ_MSF_EXT_MPEG2TS
+    ));
+    assert!(copy.mpeg2ts().is_none());
+
+    // A stamp short of the list reports none.
+    description.extensions = entries.as_ptr();
+    description.extension_count = entries.len();
+    set_description(&receiver, 0, &description);
+    s.set("desc_stamp", sys::MOQ_MEDIA_TRACK_DESC_V0_SIZE as i64);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(copy.extensions().count(), 0);
+    assert!(copy.mpeg2ts().is_none());
+    drop(receiver);
+}
+
+#[test]
+fn fill_terminals_are_typed() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let cases = [
+        (sys::MOQ_FILL_COMPLETE, FillReason::Complete),
+        (sys::MOQ_FILL_NO_STREAM, FillReason::NoStream),
+        (sys::MOQ_FILL_LOCAL_CANCELLED, FillReason::LocalCancelled),
+        (
+            sys::MOQ_FILL_PEER_CANCELLED_OR_RESET,
+            FillReason::PeerCancelledOrReset,
+        ),
+        (sys::MOQ_FILL_LOCAL_ABORTED, FillReason::LocalAborted),
+        (sys::MOQ_FILL_PARENT_REJECTED, FillReason::ParentRejected),
+        (
+            sys::MOQ_FILL_PARENT_TERMINATED,
+            FillReason::ParentTerminated,
+        ),
+        (99, FillReason::Other(99)),
+    ];
+    let errors = [
+        (sys::MOQ_FILL_ERROR_NONE, 0, FillError::None),
+        (sys::MOQ_FILL_ERROR_STREAM, 0, FillError::Stream(0)),
+        (
+            sys::MOQ_FILL_ERROR_PARENT_REQUEST,
+            0x10,
+            FillError::ParentRequest(0x10),
+        ),
+        (sys::MOQ_FILL_ERROR_PARENT_DONE, 2, FillError::ParentDone(2)),
+        (9, 5, FillError::Other { domain: 9, code: 5 }),
+    ];
+    for ((reason, typed), (domain, code, error)) in
+        cases.into_iter().zip(errors.into_iter().cycle())
+    {
+        assert_eq!(typed.code(), reason);
+        let mut terminal = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_FILL_TERMINAL, 0);
+        terminal.initiating_request_id = 11;
+        terminal.fill_reason = reason;
+        terminal.fill_error_domain = domain;
+        terminal.fill_error_code = code;
+        push_event(terminal);
+        let event = receiver
+            .poll_track()
+            .expect("poll_track on a live receiver")
+            .expect("the pushed event is pollable");
+        let fill = event
+            .fill_terminal()
+            .expect("a FillTerminal event reports its terminal");
+        assert_eq!(
+            (fill.initiating_request_id, fill.reason, fill.error),
+            (11, typed, error)
+        );
+    }
 }

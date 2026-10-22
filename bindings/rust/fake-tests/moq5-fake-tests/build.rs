@@ -10,6 +10,10 @@ fn main() {
     for dir in include.split(';').filter(|d| !d.is_empty()) {
         build.include(dir);
     }
+    // The player's records, with the `player` feature (an SDK with it).
+    if env::var_os("CARGO_FEATURE_PLAYER").is_some() {
+        build.define("MOQ5_LAYOUT_PLAYER", None);
+    }
     build
         .file("../layout_probe.c")
         .warnings(true)

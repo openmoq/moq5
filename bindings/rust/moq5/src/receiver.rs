@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::time::Duration;
 use std::{fmt, mem, ptr};
@@ -7,10 +8,12 @@ use std::{fmt, mem, ptr};
 use crate::cmaf::{CmafSample, InitInfo};
 use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
+use crate::metadata::ObjectMetadata;
+use crate::mpeg2ts::{Mpeg2tsRecordRef, TrackExtension};
 use crate::namespace::Namespace;
 use crate::types::{
-    CompanionProfile, DeliveryOrigin, Location, MediaType, ObjectStatus, Packaging, SapType,
-    Version, WaitResult,
+    CompanionProfile, DeliveryOrigin, GroupOrder, Location, LocationFilter, MediaType,
+    ObjectStatus, Packaging, SapType, Version, WaitResult,
 };
 use crate::{ffi, sender, sys};
 
@@ -30,6 +33,8 @@ pub enum TimeMode {
     /// Rebase reported timestamps against one shared epoch (payloads are
     /// never modified).
     SharedEpoch,
+    /// A mode this crate does not know.
+    Other(u32),
 }
 
 impl TimeMode {
@@ -37,6 +42,58 @@ impl TimeMode {
         match self {
             TimeMode::Raw => sys::MOQ_MEDIA_TIME_RAW,
             TimeMode::SharedEpoch => sys::MOQ_MEDIA_TIME_SHARED_EPOCH,
+            TimeMode::Other(code) => code,
+        }
+    }
+
+    fn from_raw(code: u32) -> TimeMode {
+        match code {
+            sys::MOQ_MEDIA_TIME_RAW => TimeMode::Raw,
+            sys::MOQ_MEDIA_TIME_SHARED_EPOCH => TimeMode::SharedEpoch,
+            code => TimeMode::Other(code),
+        }
+    }
+
+    /// The `moq_media_time_mode_t` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        self.raw()
+    }
+}
+
+/// What a receiver does when its object queue is full
+/// (`moq_media_overflow_policy_t`), as [`ReceiverInfo`] reports it.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Drop to the newest keyframe (the live preset).
+    DropToKeyframe,
+    /// Drop whole groups.
+    DropGroup,
+    /// Pause the subscriptions upstream (the flow-control preset).
+    FlowControl,
+    /// A policy this crate does not know.
+    Other(u32),
+}
+
+impl OverflowPolicy {
+    fn from_raw(code: u32) -> OverflowPolicy {
+        match code {
+            sys::MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME => OverflowPolicy::DropToKeyframe,
+            sys::MOQ_MEDIA_OVERFLOW_DROP_GROUP => OverflowPolicy::DropGroup,
+            sys::MOQ_MEDIA_OVERFLOW_FLOW_CONTROL => OverflowPolicy::FlowControl,
+            code => OverflowPolicy::Other(code),
+        }
+    }
+
+    /// The `moq_media_overflow_policy_t` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            OverflowPolicy::DropToKeyframe => sys::MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME,
+            OverflowPolicy::DropGroup => sys::MOQ_MEDIA_OVERFLOW_DROP_GROUP,
+            OverflowPolicy::FlowControl => sys::MOQ_MEDIA_OVERFLOW_FLOW_CONTROL,
+            OverflowPolicy::Other(code) => code,
         }
     }
 }
@@ -44,8 +101,7 @@ impl TimeMode {
 /// How a [`Receiver`] subscribes. Start from a preset, then adjust; only
 /// the fields set here override the preset's. The C configuration is built
 /// with the preset's sized initializer at attach, so every field reaches
-/// the service. The MPEG-TS settings are not offered and stay at the
-/// initializer's defaults.
+/// the service.
 #[derive(Clone, Debug)]
 pub struct ReceiverConfig {
     namespace: Namespace,
@@ -58,6 +114,9 @@ pub struct ReceiverConfig {
     max_track_events: Option<u32>,
     companion_profile: Option<CompanionProfile>,
     stream_terminals: Option<u32>,
+    mpeg2ts_reorder: Option<(u32, Duration)>,
+    mpeg2ts_strip_prefix: Option<bool>,
+    mpeg2ts_join_psi: Option<bool>,
 }
 
 impl ReceiverConfig {
@@ -73,6 +132,9 @@ impl ReceiverConfig {
             max_track_events: None,
             companion_profile: None,
             stream_terminals: None,
+            mpeg2ts_reorder: None,
+            mpeg2ts_strip_prefix: None,
+            mpeg2ts_join_psi: None,
         }
     }
 
@@ -138,6 +200,51 @@ impl ReceiverConfig {
         self.stream_terminals = Some(max);
         self
     }
+    /// MPEG-TS tracks release their objects in Location order through a
+    /// reorder window: `slots` objects held per track (0 = 64), each waiting
+    /// at most `window` (exact microseconds; zero = 300 ms) for the ones
+    /// before it.
+    #[must_use]
+    pub fn mpeg2ts_reorder(mut self, slots: u32, window: Duration) -> Self {
+        self.mpeg2ts_reorder = Some((slots, window));
+        self
+    }
+    /// Remove the four-octet prefix of 192-octet source packets, so every
+    /// delivered payload of such a track is 188-octet TS packets (the
+    /// catalog's packet size on the description is unchanged).
+    #[must_use]
+    pub fn mpeg2ts_strip_prefix(mut self, strip: bool) -> Self {
+        self.mpeg2ts_strip_prefix = Some(strip);
+        self
+    }
+    /// Prefix the first object polled for each MPEG-TS subscription, live or
+    /// from one of its fills, with the catalog's PAT/PMT packets (the
+    /// track's init data), their continuity counters aligned to that object.
+    /// An object dropped before it is polled never takes it, and no later
+    /// object of the subscription carries it.
+    #[must_use]
+    pub fn mpeg2ts_join_psi(mut self, join: bool) -> Self {
+        self.mpeg2ts_join_psi = Some(join);
+        self
+    }
+
+    /// The configuration of the receiver a player owns: no auto-subscribe
+    /// and the stream-terminal lane on (as deep as given, else the
+    /// service's default), the time mode left as given for the player to
+    /// judge.
+    #[cfg(feature = "player")]
+    pub(crate) fn for_player(&self) -> ReceiverConfig {
+        let mut config = self.clone();
+        config.auto_subscribe = Some(false);
+        config.stream_terminals = Some(self.stream_terminals.unwrap_or(0));
+        config
+    }
+
+    /// The requested time mode, or the preset's.
+    #[cfg(feature = "player")]
+    pub(crate) fn time_mode_requested(&self) -> TimeMode {
+        self.time_mode.unwrap_or_default()
+    }
 }
 
 /// A track discovered by a [`Receiver`]. A plain handle; calls with a
@@ -155,6 +262,12 @@ unsafe impl Send for Track {}
 unsafe impl Sync for Track {}
 
 impl Track {
+    /// The handle `raw` of the receiver tagged `owner`.
+    #[cfg(feature = "player")]
+    pub(crate) fn new(raw: NonNull<sys::moq_media_track_t>, owner: u64) -> Track {
+        Track { raw, owner }
+    }
+
     /// The underlying `moq_media_track_t`.
     #[must_use]
     pub fn as_ptr(&self) -> *mut sys::moq_media_track_t {
@@ -403,6 +516,34 @@ impl<'receiver> TrackDescription<'receiver> {
         ));
         (reported && self.raw.has_render_group).then_some(self.raw.render_group)
     }
+    /// The catalog's packaging-extension records for the track, each read
+    /// under its own stamp; empty when the track carries none or the
+    /// library did not report the list.
+    pub fn extensions(&self) -> impl Iterator<Item = TrackExtension<'receiver>> {
+        let reported = self.covers(ffi::field_end!(
+            sys::moq_media_track_desc_t,
+            extension_count,
+            usize
+        ));
+        let entries = if reported {
+            // SAFETY: the entries are owned by the track handle, valid for
+            // the receiver's life.
+            unsafe { ffi::array(self.raw.extensions, self.raw.extension_count) }
+        } else {
+            &[]
+        };
+        entries.iter().map(TrackExtension::from_raw)
+    }
+    /// The track's MPEG-TS record (`moq_msf_ext_mpeg2ts`): the catalog's
+    /// mpeg2ts keys as parsed. `None` when the track carries none, or the
+    /// library did not report the list or the record.
+    #[must_use]
+    pub fn mpeg2ts(&self) -> Option<Mpeg2tsRecordRef<'receiver>> {
+        self.extensions().find_map(|extension| match extension {
+            TrackExtension::Mpeg2ts(record) => Some(record),
+            _ => None,
+        })
+    }
     /// The raw description; its spans borrow the handle.
     #[must_use]
     pub fn raw(&self) -> &sys::moq_media_track_desc_t {
@@ -543,19 +684,104 @@ pub struct ParseDrop {
     pub delta: u64,
 }
 
-/// One fill's end, for [`TrackEventKind::FillTerminal`].
+/// Why a fill ended (`MOQ_FILL_*`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FillReason {
+    /// Its stream ended with the whole range delivered.
+    Complete,
+    /// The response opened no stream.
+    NoStream,
+    /// Cancelled locally ([`Receiver::cancel_fill`]).
+    LocalCancelled,
+    /// The peer cancelled or reset its stream.
+    PeerCancelledOrReset,
+    /// Aborted locally.
+    LocalAborted,
+    /// The request that carried it was rejected.
+    ParentRejected,
+    /// The subscription it belongs to ended first.
+    ParentTerminated,
+    /// A reason this crate does not know.
+    Other(u32),
+}
+
+impl FillReason {
+    fn from_raw(code: u32) -> FillReason {
+        match code {
+            sys::MOQ_FILL_COMPLETE => FillReason::Complete,
+            sys::MOQ_FILL_NO_STREAM => FillReason::NoStream,
+            sys::MOQ_FILL_LOCAL_CANCELLED => FillReason::LocalCancelled,
+            sys::MOQ_FILL_PEER_CANCELLED_OR_RESET => FillReason::PeerCancelledOrReset,
+            sys::MOQ_FILL_LOCAL_ABORTED => FillReason::LocalAborted,
+            sys::MOQ_FILL_PARENT_REJECTED => FillReason::ParentRejected,
+            sys::MOQ_FILL_PARENT_TERMINATED => FillReason::ParentTerminated,
+            code => FillReason::Other(code),
+        }
+    }
+
+    /// The `MOQ_FILL_*` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            FillReason::Complete => sys::MOQ_FILL_COMPLETE,
+            FillReason::NoStream => sys::MOQ_FILL_NO_STREAM,
+            FillReason::LocalCancelled => sys::MOQ_FILL_LOCAL_CANCELLED,
+            FillReason::PeerCancelledOrReset => sys::MOQ_FILL_PEER_CANCELLED_OR_RESET,
+            FillReason::LocalAborted => sys::MOQ_FILL_LOCAL_ABORTED,
+            FillReason::ParentRejected => sys::MOQ_FILL_PARENT_REJECTED,
+            FillReason::ParentTerminated => sys::MOQ_FILL_PARENT_TERMINATED,
+            FillReason::Other(code) => code,
+        }
+    }
+}
+
+/// The error a fill ended with, in its domain (`MOQ_FILL_ERROR_*`). Zero
+/// is a valid code in every domain but `None`: a stream code of zero is
+/// still a failure, not completion.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FillError {
+    /// No error.
+    None,
+    /// The fill stream's error code.
+    Stream(u64),
+    /// The parent request's error code.
+    ParentRequest(u64),
+    /// The parent's done status code.
+    ParentDone(u64),
+    /// A domain this crate does not know, with its code.
+    Other {
+        /// The `MOQ_FILL_ERROR_*` domain.
+        domain: u32,
+        /// The code in it.
+        code: u64,
+    },
+}
+
+impl FillError {
+    fn from_raw(domain: u32, code: u64) -> FillError {
+        match domain {
+            sys::MOQ_FILL_ERROR_NONE => FillError::None,
+            sys::MOQ_FILL_ERROR_STREAM => FillError::Stream(code),
+            sys::MOQ_FILL_ERROR_PARENT_REQUEST => FillError::ParentRequest(code),
+            sys::MOQ_FILL_ERROR_PARENT_DONE => FillError::ParentDone(code),
+            domain => FillError::Other { domain, code },
+        }
+    }
+}
+
+/// One fill's end, for [`TrackEventKind::FillTerminal`]: exactly one per
+/// fill, the winner when a local cancellation races a peer terminal.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FillTerminal {
     /// The exact initiating SUBSCRIBE/UPDATE ID (zero is valid).
     pub initiating_request_id: u64,
-    /// `MOQ_FILL_*` reason from the session API.
-    pub reason: u32,
-    /// `MOQ_FILL_ERROR_*` domain from the session API.
-    pub error_domain: u32,
-    /// The error code in that domain; a stream code of zero is still a
-    /// failure, not completion.
-    pub error_code: u64,
+    /// Why it ended.
+    pub reason: FillReason,
+    /// The error it ended with.
+    pub error: FillError,
 }
 
 /// A fill's loss no delivered object reported, for
@@ -672,9 +898,8 @@ impl<'receiver> TrackEvent<'receiver> {
         ));
         reported.then_some(FillTerminal {
             initiating_request_id: self.raw.initiating_request_id,
-            reason: self.raw.fill_reason,
-            error_domain: self.raw.fill_error_domain,
-            error_code: self.raw.fill_error_code,
+            reason: FillReason::from_raw(self.raw.fill_reason),
+            error: FillError::from_raw(self.raw.fill_error_domain, self.raw.fill_error_code),
         })
     }
     /// For [`TrackEventKind::DeliveryLocalFailure`]: which delivery was
@@ -948,6 +1173,52 @@ impl MediaObject {
         ));
         reported.then_some(self.raw.initiating_request_id)
     }
+    /// The draft-22 effective metadata (LOC-04), borrowed from the object;
+    /// `None` for a draft-16/18 object, which carries none, or when the
+    /// library did not report the block.
+    #[must_use]
+    pub fn metadata(&self) -> Option<ObjectMetadata<'_>> {
+        let reported = self.covers(ffi::field_end!(
+            sys::moq_media_object_t,
+            metadata,
+            sys::moq_media_metadata_t
+        ));
+        if !reported {
+            return None;
+        }
+        ObjectMetadata::from_raw(&self.raw.metadata)
+    }
+    /// The track properties the subscription's acknowledgment carried
+    /// (draft 22), the object's own copy, raw in the negotiated draft's
+    /// encoding; `None` for an empty block, a draft-16/18 object, or when
+    /// the library did not report the field.
+    #[must_use]
+    pub fn track_properties(&self) -> Option<&[u8]> {
+        let reported = self.covers(ffi::field_end!(
+            sys::moq_media_object_t,
+            track_properties_ref,
+            *mut sys::moq_rcbuf_t
+        ));
+        if !reported || self.raw.track_properties_ref.is_null() {
+            return None;
+        }
+        let block = self.raw.track_properties_ref;
+        // SAFETY: a reference the object owns until cleanup.
+        Some(unsafe {
+            ffi::bytes(sys::moq_bytes_t {
+                data: sys::moq_rcbuf_data(block),
+                len: sys::moq_rcbuf_len(block),
+            })
+        })
+    }
+    /// The bytes the object holds until it is dropped, as
+    /// [`Receiver::poll_object_within`] charges them
+    /// (`moq_media_object_charge`).
+    #[must_use]
+    pub fn charge(&self) -> u64 {
+        // SAFETY: a polled object; the call reads only what its stamp covers.
+        unsafe { sys::moq_media_object_charge(&self.raw) }
+    }
     /// The raw object; its buffers stay owned by `self`.
     #[must_use]
     pub fn raw(&self) -> &sys::moq_media_object_t {
@@ -995,7 +1266,7 @@ pub enum StreamTerminalKind {
 }
 
 impl StreamTerminalKind {
-    fn from_raw(kind: sys::moq_media_stream_terminal_kind_t) -> StreamTerminalKind {
+    pub(crate) fn from_raw(kind: sys::moq_media_stream_terminal_kind_t) -> StreamTerminalKind {
         match kind {
             sys::MOQ_MEDIA_STREAM_FIN_END_OF_GROUP => StreamTerminalKind::FinEndOfGroup,
             sys::MOQ_MEDIA_STREAM_FIN => StreamTerminalKind::Fin,
@@ -1088,13 +1359,105 @@ pub enum StartMode {
 }
 
 /// Options applied when a track's subscription is first issued; a later
-/// subscribe is a resume and leaves them unchanged.
+/// subscribe is a resume and leaves them unchanged. It is the
+/// application's record (start from `Default`); it is not
+/// `#[non_exhaustive]`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubscribeOptions {
-    /// Where delivery starts.
+    /// Where delivery starts, unless `location` is given.
     pub start: StartMode,
     /// Subscriber priority.
     pub priority: Option<u8>,
+    /// MPEG-TS: the program whose PMT names the random access and PCR PIDs
+    /// the track's reorder window measures with (it matters on an
+    /// unmodified-multiplex track); `None` selects the catalog's
+    /// mpeg2tsProgramNumber, else the PAT's first program.
+    pub mpeg2ts_program: Option<NonZeroU32>,
+    /// The subscription's Location Filter. Given, it supersedes `start`, and
+    /// it suppresses the implicit current-group fill, as any explicit
+    /// option does. Drafts 16 and 18 take
+    /// [`Unconstrained`](LocationFilter::Unconstrained),
+    /// [`NextObject`](LocationFilter::NextObject),
+    /// [`RelativeGroup`](LocationFilter::RelativeGroup) with offset 0,
+    /// [`AbsoluteStart`](LocationFilter::AbsoluteStart) and
+    /// [`GroupEnd`](LocationFilter::GroupEnd), within 62 bits on draft 16;
+    /// the others need the draft-22 companion.
+    pub location: Option<LocationFilter>,
+    /// A fill requested with the subscription (draft 22's FILL_PARAMETERS;
+    /// it needs the draft-22 companion). It suppresses the implicit
+    /// current-group fill.
+    pub fill: Option<FillOptions>,
+}
+
+/// A fill requested with a subscription (`moq_fill_cfg_t`): a range of
+/// already-published objects, delivered on a stream of its own beside the
+/// live ones. Its objects report [`DeliveryOrigin::Fill`] and the fill's
+/// initiating request ID, and one [`TrackEventKind::FillTerminal`] ends it.
+/// What it leaves out inherits the subscription's effective state when the
+/// request is processed. It is the application's record (start from
+/// `Default`); it is not `#[non_exhaustive]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FillOptions {
+    /// Subscriber priority of the fill.
+    pub subscriber_priority: Option<u8>,
+    /// The order its groups come in.
+    pub group_order: Option<GroupOrder>,
+    /// How long upstream may take, in whole milliseconds (anything finer is
+    /// [`Error::INVAL`]); zero takes only objects available at once.
+    /// `None` leaves the wait to the implementation's policy.
+    pub timeout: Option<Duration>,
+    /// Which objects; `None` inherits the subscription's Location Filter.
+    pub location: Option<LocationFilter>,
+}
+
+/// What [`Receiver::poll_object_within`] found at the head of the queue.
+// The taken object is held by value, as poll_object returns it: a poll's
+// result is consumed at once, and boxing it would allocate on every poll.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum PollWithin {
+    /// The next object fit within the charge, and is the caller's now.
+    Taken {
+        /// The object.
+        object: MediaObject,
+        /// Its charge (as [`MediaObject::charge`]).
+        charge: u64,
+    },
+    /// The next object needs `charge` bytes, more than allowed: nothing was
+    /// dequeued and nothing changed.
+    TooLarge {
+        /// What the object would charge.
+        charge: u64,
+    },
+    /// No object is queued now.
+    Empty,
+}
+
+/// What a component built on a [`Receiver`] needs to know about it, as one
+/// snapshot (`moq_media_receiver_info_t`). Configuration values are the
+/// effective ones: a defaulted zero is reported as the value it selected.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiverInfo {
+    /// The time mode.
+    pub time_mode: TimeMode,
+    /// The overflow policy.
+    pub overflow_policy: OverflowPolicy,
+    /// Object-queue depth.
+    pub max_objects: u32,
+    /// Object-queue byte budget.
+    pub max_bytes: u64,
+    /// Media tracks are subscribed on discovery.
+    pub auto_subscribe: bool,
+    /// The stream-terminal lane's depth; `None` with the lane off.
+    pub stream_terminals: Option<u32>,
+    /// The companion, [`CompanionProfile::Auto`] until the first session
+    /// resolves it.
+    pub companion_profile: CompanionProfile,
+    /// The negotiated draft; `None` until a session has been observed.
+    pub transport_version: Option<Version>,
+    /// Track events [`Receiver::poll_track`] has returned so far.
+    pub track_events_polled: u64,
 }
 
 /// A track's delivery state (`moq_media_track_state_t`).
@@ -1263,6 +1626,31 @@ impl fmt::Debug for ContentProtectionRef<'_> {
     }
 }
 
+/// The C fill request for `fill`, sized and stamped by the library's
+/// initializer, its location pointing at `location` (alive for the call).
+fn raw_fill(
+    fill: &FillOptions,
+    location: Option<&sys::moq_location_filter_cfg_t>,
+) -> Result<sys::moq_fill_cfg_t> {
+    let mut raw = sys::moq_fill_cfg_t::default();
+    // SAFETY: a writable struct of exactly the size passed.
+    unsafe { sys::moq_fill_cfg_init_sized(&mut raw, mem::size_of_val(&raw)) };
+    if let Some(priority) = fill.subscriber_priority {
+        raw.has_subscriber_priority = true;
+        raw.subscriber_priority = priority;
+    }
+    if let Some(order) = fill.group_order {
+        raw.has_group_order = true;
+        raw.group_order = order.code();
+    }
+    if let Some(timeout) = fill.timeout {
+        raw.has_fill_timeout = true;
+        raw.fill_timeout_ms = ffi::millis(timeout)?;
+    }
+    raw.location = location.map_or(ptr::null(), |location| location as *const _);
+    Ok(raw)
+}
+
 const EVENT_V0: usize = ffi::field_end!(sys::moq_media_track_event_t, config_generation, u32);
 const RECEIVER_STATS_V0: usize = ffi::field_end!(sys::moq_media_receiver_stats_t, paused, bool);
 
@@ -1330,6 +1718,16 @@ impl Receiver {
             raw_config.surface_stream_terminals = true;
             raw_config.max_stream_terminals = max;
         }
+        if let Some((slots, window)) = config.mpeg2ts_reorder {
+            raw_config.mpeg2ts_reorder_slots = slots;
+            raw_config.mpeg2ts_reorder_window_us = ffi::micros(window)?;
+        }
+        if let Some(strip) = config.mpeg2ts_strip_prefix {
+            raw_config.mpeg2ts_strip_prefix = strip;
+        }
+        if let Some(join) = config.mpeg2ts_join_psi {
+            raw_config.mpeg2ts_join_psi = join;
+        }
         let mut raw = ptr::null_mut();
         // SAFETY: every pointer in raw_config points into config, alive for
         // the call; the service copies the namespace and catalog name at
@@ -1357,12 +1755,20 @@ impl Receiver {
         self.raw.as_ptr()
     }
 
-    fn own(&self, track: Track) -> Result<*mut sys::moq_media_track_t> {
+    /// The native handle of one of this receiver's tracks; a foreign track
+    /// is [`Error::INVAL`].
+    pub(crate) fn own(&self, track: Track) -> Result<*mut sys::moq_media_track_t> {
         if track.owner == self.owner {
             Ok(track.raw.as_ptr())
         } else {
             Err(Error::INVAL)
         }
+    }
+
+    /// The tag of this receiver's tracks.
+    #[cfg(feature = "player")]
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
     }
 
     fn track_from_raw(&self, raw: *mut sys::moq_media_track_t) -> Result<Track> {
@@ -1405,6 +1811,44 @@ impl Receiver {
             return Ok(None);
         }
         ffi::check(code)?;
+        self.take_object(object, size).map(Some)
+    }
+
+    /// The next media object, only when everything it carries fits in
+    /// `max_charge` bytes (its buffers and sample table, as
+    /// [`MediaObject::charge`] measures them). The check and the dequeue
+    /// are one step: no other object can replace the head between them. A
+    /// larger head stays queued and is reported with its charge. Every
+    /// other outcome is [`poll_object`](Receiver::poll_object)'s.
+    pub fn poll_object_within(&self, max_charge: u64) -> Result<PollWithin> {
+        let mut object = sys::moq_media_object_t::default();
+        let size = mem::size_of_val(&object);
+        let mut charge = 0;
+        // SAFETY: a live receiver, a writable charge and a writable struct
+        // of the size passed.
+        let code = unsafe {
+            sys::moq_media_receiver_poll_object_within(
+                self.as_ptr(),
+                max_charge,
+                &mut charge,
+                &mut object,
+                size,
+            )
+        };
+        match code {
+            sys::MOQ_DONE => Ok(PollWithin::Empty),
+            sys::MOQ_ERR_BUFFER => Ok(PollWithin::TooLarge { charge }),
+            code => {
+                ffi::check(code)?;
+                let object = self.take_object(object, size)?;
+                Ok(PollWithin::Taken { object, charge })
+            }
+        }
+    }
+
+    /// Own a polled record, or refuse one stamped outside the contract
+    /// after releasing what it transferred.
+    fn take_object(&self, mut object: sys::moq_media_object_t, size: usize) -> Result<MediaObject> {
         if let Err(refusal) = ffi::check_stamp(object.struct_size, OBJECT_V0, size) {
             // The record owns transferred buffers: release them within this
             // struct before refusing it.
@@ -1414,11 +1858,11 @@ impl Receiver {
             unsafe { sys::moq_media_object_cleanup(&mut object) };
             return Err(refusal);
         }
-        Ok(Some(MediaObject {
+        Ok(MediaObject {
             raw: object,
             owner: self.owner,
             _not_send: PhantomData,
-        }))
+        })
     }
 
     /// The next stream-terminal record, or `None` when none is pollable
@@ -1512,9 +1956,23 @@ impl Receiver {
 
     /// Ask for a track's objects, or resume them. Asynchronous: success
     /// means the request is recorded, not that the peer accepted. The
-    /// options apply only when the subscription is first issued.
+    /// options apply only when the subscription is first issued; a later
+    /// subscribe validates them and leaves the subscription as it is.
+    /// [`Error::UNSUPPORTED`] when the track has no delivery path, or when
+    /// a location or fill cannot be carried by the negotiated draft and
+    /// companion; nothing is recorded then.
     pub fn subscribe_track(&self, track: Track, options: Option<SubscribeOptions>) -> Result<()> {
         let track = self.own(track)?;
+        // The nested records the options point at, alive through the call.
+        let location = options.and_then(|o| o.location).map(LocationFilter::raw);
+        let fill_options = options.and_then(|o| o.fill);
+        let fill_location = fill_options
+            .and_then(|fill| fill.location)
+            .map(LocationFilter::raw);
+        let fill = match fill_options {
+            Some(fill) => Some(raw_fill(&fill, fill_location.as_ref())?),
+            None => None,
+        };
         let raw_options = options.map(|options| {
             let mut raw_options = sys::moq_media_receiver_track_subscribe_cfg_t::default();
             // SAFETY: a writable struct of exactly the size passed.
@@ -1530,15 +1988,42 @@ impl Receiver {
             };
             raw_options.has_priority = options.priority.is_some();
             raw_options.priority = options.priority.unwrap_or(0);
+            raw_options.mpeg2ts_program_number = options.mpeg2ts_program.map_or(0, NonZeroU32::get);
+            raw_options.location = location
+                .as_ref()
+                .map_or(ptr::null(), |location| location as *const _);
+            raw_options.fill = fill.as_ref().map_or(ptr::null(), |fill| fill as *const _);
             raw_options
         });
         let options_ptr = raw_options
             .as_ref()
             .map_or(ptr::null(), |raw_options| raw_options as *const _);
-        // SAFETY: a live receiver and one of its handles; the options (when
-        // given) are borrowed for the call and copied by the service.
+        // SAFETY: a live receiver and one of its handles; the options and
+        // the records they point at (when given) are borrowed for the call
+        // and copied by the service.
         ffi::check(unsafe {
             sys::moq_media_receiver_subscribe_track(self.as_ptr(), track, options_ptr)
+        })
+    }
+
+    /// Cancel one fill of `track`, named by its initiating request ID (zero
+    /// is a valid ID). Asynchronous: success means the cancellation is
+    /// scheduled (repeating it while pending is idempotent), not that it won
+    /// a race with the peer's terminal. Exactly one
+    /// [`TrackEventKind::FillTerminal`] reports how the fill ended, with
+    /// [`FillReason::LocalCancelled`] or the terminal that won. The track
+    /// and its other fills continue, and objects already polled stay valid.
+    /// Accepted while the interrupt latch is set; interruption does not
+    /// cancel recorded intent.
+    ///
+    /// [`Error::STALE_HANDLE`] for an unknown or completed fill,
+    /// [`Error::UNSUPPORTED`] outside the draft-22 companion,
+    /// [`Error::CLOSED`] for a terminal receiver or endpoint.
+    pub fn cancel_fill(&self, track: Track, initiating_request_id: u64) -> Result<()> {
+        let track = self.own(track)?;
+        // SAFETY: a live receiver and one of its handles.
+        ffi::check(unsafe {
+            sys::moq_media_receiver_cancel_fill(self.as_ptr(), track, initiating_request_id)
         })
     }
 
@@ -1651,6 +2136,31 @@ impl Receiver {
                 u64
             ))
             .then_some(stats.tracks_malformed),
+        })
+    }
+
+    /// What the receiver is: its effective configuration, the resolved
+    /// companion and draft, and the track events polled so far. Observes
+    /// only.
+    pub fn info(&self) -> Result<ReceiverInfo> {
+        let mut info = sys::moq_media_receiver_info_t::default();
+        let size = mem::size_of_val(&info);
+        // SAFETY: a live receiver and a writable struct of the size passed.
+        ffi::check(unsafe { sys::moq_media_receiver_get_info(self.as_ptr(), &mut info, size) })?;
+        ffi::check_stamp(info.struct_size, sys::MOQ_MEDIA_RECEIVER_INFO_V0_SIZE, size)?;
+        Ok(ReceiverInfo {
+            time_mode: TimeMode::from_raw(info.time_mode),
+            overflow_policy: OverflowPolicy::from_raw(info.overflow_policy),
+            max_objects: info.max_objects,
+            max_bytes: info.max_bytes,
+            auto_subscribe: info.auto_subscribe,
+            stream_terminals: info
+                .surface_stream_terminals
+                .then_some(info.max_stream_terminals),
+            companion_profile: CompanionProfile::from_raw(info.companion_profile),
+            transport_version: (info.transport_version != 0)
+                .then(|| Version::from_draft(info.transport_version)),
+            track_events_polled: info.track_events_polled,
         })
     }
 

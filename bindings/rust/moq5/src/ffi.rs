@@ -64,6 +64,17 @@ pub(crate) fn micros(duration: Duration) -> Result<u64> {
     u64::try_from(nanos / 1_000).map_err(|_| Error::INVAL)
 }
 
+/// A duration as the exact milliseconds libmoq takes, under the rule of
+/// [`micros`]: a sub-millisecond remainder or a value above `u64::MAX`
+/// milliseconds is [`Error::INVAL`].
+pub(crate) fn millis(duration: Duration) -> Result<u64> {
+    let nanos = duration.as_nanos();
+    if nanos % 1_000_000 != 0 {
+        return Err(Error::INVAL);
+    }
+    u64::try_from(nanos / 1_000_000).map_err(|_| Error::INVAL)
+}
+
 /// The stamped prefix of a sized output reaches the end of a field.
 pub(crate) fn covers(stamp: u32, field_end: usize) -> bool {
     stamp as usize >= field_end
@@ -123,6 +134,16 @@ mod tests {
             Err(Error::INVAL)
         );
         assert_eq!(micros(Duration::MAX), Err(Error::INVAL));
+    }
+
+    #[test]
+    fn millis_is_exact() {
+        assert_eq!(millis(Duration::ZERO), Ok(0));
+        assert_eq!(millis(Duration::from_millis(1500)), Ok(1500));
+        assert_eq!(millis(Duration::from_millis(u64::MAX)), Ok(u64::MAX));
+        assert_eq!(millis(Duration::from_micros(1)), Err(Error::INVAL));
+        assert_eq!(millis(Duration::from_micros(1_000_999)), Err(Error::INVAL));
+        assert_eq!(millis(Duration::MAX), Err(Error::INVAL));
     }
 
     #[test]

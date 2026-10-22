@@ -1,7 +1,8 @@
 //! The compile-fail cases: each fixture under `tests/compile_fail/` is
 //! type-checked against the crate as it is now, and must be refused with the
 //! expected error code and message; one fixture must compile (the positive
-//! control of the same path). The cargo that runs this test checks the
+//! control of the same path), and with the `player` feature the player's
+//! cases and their own positive control join them. The cargo that runs this test checks the
 //! crate, as the path dependency of a scratch package in a fresh target
 //! directory. What is asserted: cargo's artifact record for the crate
 //! compiled in this run from this directory; each refused fixture's error
@@ -35,8 +36,53 @@ const CASES: &[(&str, Option<(&str, &str)>)] = &[
         "sender_shared_across_threads",
         Some(("E0277", "cannot be shared between threads safely")),
     ),
+    (
+        "buffer_used_after_slice",
+        Some(("E0382", "borrow of moved value: `buffer`")),
+    ),
+    (
+        "mpeg2ts_record_outlives_receiver",
+        Some(("E0515", "cannot return value referencing local variable")),
+    ),
+    (
+        "metadata_outlives_object",
+        Some(("E0515", "cannot return value referencing local variable")),
+    ),
     ("buffer_read_in_place", None),
 ];
+
+/// The player's cases, checked when this crate is built with the `player`
+/// feature (the scratch package then enables it too).
+#[cfg(feature = "player")]
+const PLAYER_CASES: &[(&str, Option<(&str, &str)>)] = &[
+    (
+        "player_output_sent_to_thread",
+        Some(("E0277", "cannot be sent between threads safely")),
+    ),
+    (
+        "player_moved_while_output_held",
+        Some((
+            "E0505",
+            "cannot move out of `player` because it is borrowed",
+        )),
+    ),
+    (
+        "player_shared_across_threads",
+        Some(("E0277", "cannot be shared between threads safely")),
+    ),
+    (
+        "player_receiver_not_polled",
+        Some(("E0599", "no method named `poll_object`")),
+    ),
+    ("player_moves_between_threads", None),
+];
+#[cfg(not(feature = "player"))]
+const PLAYER_CASES: &[(&str, Option<(&str, &str)>)] = &[];
+
+/// Every case this build checks.
+fn cases() -> impl Iterator<Item = &'static (&'static str, Option<(&'static str, &'static str)>)> {
+    CASES.iter().chain(PLAYER_CASES)
+}
 
 /// The scratch package: every fixture a binary of one crate that depends on
 /// this crate by path.
@@ -47,12 +93,14 @@ fn write_scratch(scratch: &Path, manifest_dir: &Path, fixtures: &Path) {
         scratch.join("Cargo.toml"),
         format!(
             "[package]\nname = \"moq5-compile-fail\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             publish = false\n\n[dependencies]\nmoq5 = {{ path = {path:?} }}\n\n[workspace]\n",
-            path = manifest_dir.display().to_string()
+             publish = false\n\n[dependencies]\nmoq5 = {{ path = {path:?}, features = [{features}] }}\n\n\
+             [workspace]\n",
+            path = manifest_dir.display().to_string(),
+            features = if cfg!(feature = "player") { "\"player\"" } else { "" },
         ),
     )
     .expect("the scratch manifest is written");
-    for (name, _) in CASES {
+    for (name, _) in cases() {
         std::fs::copy(
             fixtures.join(format!("{name}.rs")),
             bins.join(format!("{name}.rs")),
@@ -132,7 +180,7 @@ fn fixtures_are_checked_against_the_current_crate() {
             .any(|record| record.contains(&package_id) && record.contains("\"fresh\":false")),
         "no artifact of this crate compiled in this run ({package_id}):\n{stdout}\n{stderr}"
     );
-    for (name, expected) in CASES {
+    for (name, expected) in cases() {
         let errors = errors_of(&stderr, name);
         let built = bin_built(&artifacts, name);
         match expected {

@@ -48,6 +48,14 @@
 //! to `preambles.md` and compiled into the crate documentation: the contracts
 //! a header states for all of its declarations at once (rcbuf's shard and
 //! overflow rules) are not attached to any one item by clang.
+//!
+//! The `player` feature binds the media player (`media_player.h`, with the
+//! playback engine configuration it takes from `playback.h`), which an SDK
+//! carries only when it was built with `MOQ_BUILD_PLAYBACK`. Its declarations
+//! are generated into a file of their own, `bindings_player.rs`, with their
+//! preambles in `preambles_player.md`, so the base bindings are the same with
+//! the feature and without it. With the feature, an SDK without the player
+//! headers fails the build; without it, they are never read.
 
 use std::env;
 use std::ffi::OsString;
@@ -70,6 +78,9 @@ const HEADERS: &[&str] = &[
     "moq/media_sender.h",
     "moq/media_receiver.h",
 ];
+
+/// The headers the `player` feature binds, in dependency order.
+const PLAYER_HEADERS: &[&str] = &["moq/playback.h", "moq/media_player.h"];
 
 /// The pkg-config search configuration of a cross build, kept for the
 /// diagnostics.
@@ -109,19 +120,38 @@ fn main() {
         .map(|p| p.display().to_string())
         .collect();
     println!("cargo:include={}", include.join(";"));
-
-    let mut builder = bindgen::Builder::default();
-    for dir in &lib.include_paths {
-        builder = builder.clang_arg(format!("-I{}", dir.display()));
+    // A static library is bundled into this crate's rlib when the crate is
+    // compiled, so cargo is told to watch every archive the link names: an
+    // SDK rebuilt in place then rebuilds the crate instead of linking the
+    // copy bundled earlier.
+    for archive in lib
+        .link_files
+        .iter()
+        .cloned()
+        .chain(lib.link_paths.iter().flat_map(|dir| {
+            lib.libs
+                .iter()
+                .map(move |name| dir.join(format!("lib{name}.a")))
+        }))
+    {
+        if archive.is_file() {
+            println!("cargo:rerun-if-changed={}", archive.display());
+        }
     }
+
+    let mut clang_args: Vec<String> = lib
+        .include_paths
+        .iter()
+        .map(|dir| format!("-I{}", dir.display()))
+        .collect();
     if let Some(cross) = &cross {
         // The target SDK's headers come from its pkg-config file; the
         // sysroot from the resolved input, unless BINDGEN_EXTRA_CLANG_ARGS
         // for the target carries it (bindgen appends those itself). Nothing
         // of the host is added.
-        builder = builder.clang_arg(format!("--target={target}"));
+        clang_args.push(format!("--target={target}"));
         if let Some(sysroot) = &cross.sysroot_arg {
-            builder = builder.clang_arg(format!("--sysroot={}", sysroot.display()));
+            clang_args.push(format!("--sysroot={}", sysroot.display()));
         }
     }
     // libclang's own resource headers (stddef.h, stdbool.h) are found by
@@ -129,25 +159,77 @@ fn main() {
     // directory through BINDGEN_EXTRA_CLANG_ARGS. The host C compiler's
     // headers are never substituted: a GCC stddef.h does not parse under
     // clang.
-    for h in HEADERS {
+    let player = env::var_os("CARGO_FEATURE_PLAYER").is_some();
+    let mut required = HEADERS.to_vec();
+    if player {
+        required.extend_from_slice(PLAYER_HEADERS);
+    }
+    for h in required {
         if !lib.include_paths.iter().any(|d| d.join(h).exists()) {
+            let remedy = if PLAYER_HEADERS.contains(&h) {
+                "the `player` feature needs an SDK built with MOQ_BUILD_PLAYBACK=ON"
+            } else {
+                "the SDK is incomplete or older than this crate requires"
+            };
             panic!(
                 "moq5-sys: `{h}` is not in the include directories pkg-config reported \
-                 ({}); the SDK is incomplete or older than this crate requires",
+                 ({}); {remedy}",
                 include.join(", ")
             );
         }
     }
-    let bindings = builder
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let bindings = generator(&clang_args)
         .header("wrapper.h")
-        // The headers document their contracts in ordinary comments, which
-        // clang attaches to declarations only when asked to parse them all.
-        .clang_arg("-fparse-all-comments")
         .allowlist_function("moq_.*")
         .allowlist_type("moq_.*")
         .allowlist_var("MOQ_.*")
         .allowlist_var("MOQ5_SYSVAL_.*")
         .blocklist_file(".*/moq/control\\.h")
+        .generate()
+        .expect("bindgen failed on the libmoq headers");
+    write_bindings(&bindings, &out_dir.join("bindings.rs"));
+    write_preambles(
+        &lib.include_paths,
+        HEADERS,
+        Some(PREAMBLES_INTRO),
+        &out_dir.join("preambles.md"),
+    );
+    if player {
+        // The player's own declarations and the playback configuration they
+        // take. Every other libmoq header is blocklisted: what the player
+        // references from them is in the base bindings, which the crate
+        // includes beside these, and bindgen still sees those types, so the
+        // derives it can prove for them hold here too.
+        let bindings = generator(&clang_args)
+            .header("wrapper_player.h")
+            .blocklist_file(base_headers_pattern(&lib.include_paths))
+            .parse_callbacks(Box::new(BaseDerives))
+            .allowlist_file(".*/moq/media_player\\.h")
+            .allowlist_type("moq_playback_cfg(_t)?")
+            .allowlist_function("moq_playback_cfg_init_sized")
+            .allowlist_var("MOQ_PLAYBACK_.*")
+            .allowlist_var("MOQ5_SYSVAL_.*")
+            .generate()
+            .expect("bindgen failed on the libmoq player headers");
+        write_bindings(&bindings, &out_dir.join("bindings_player.rs"));
+        write_preambles(
+            &lib.include_paths,
+            PLAYER_HEADERS,
+            None,
+            &out_dir.join("preambles_player.md"),
+        );
+    }
+}
+
+/// A bindgen run over the SDK's headers with the settings every generation
+/// shares; the caller adds the header and what to allowlist.
+fn generator(clang_args: &[String]) -> bindgen::Builder {
+    bindgen::Builder::default()
+        .clang_args(clang_args)
+        // The headers document their contracts in ordinary comments, which
+        // clang attaches to declarations only when asked to parse them all.
+        .clang_arg("-fparse-all-comments")
         // Plain integer constants keep the C semantics: an open set stays a
         // fixed-width integer, and `match` works on the values.
         .default_enum_style(bindgen::EnumVariation::Consts)
@@ -164,14 +246,29 @@ fn main() {
         .formatter(bindgen::Formatter::Rustfmt)
         .parse_callbacks(Box::new(ResultCodes))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("bindgen failed on the libmoq headers");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let out = out_dir.join("bindings.rs");
+}
+
+/// A pattern for every installed libmoq header except the player's, as the
+/// SDK's include directories hold them.
+fn base_headers_pattern(include_dirs: &[PathBuf]) -> String {
+    let mut names: Vec<String> = include_dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir.join("moq")).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".h"))
+        .filter(|name| !PLAYER_HEADERS.contains(&format!("moq/{name}").as_str()))
+        .map(|name| name.trim_end_matches(".h").replace('.', "\\."))
+        .collect();
+    names.sort();
+    names.dedup();
+    format!(".*/moq/({})\\.h", names.join("|"))
+}
+
+fn write_bindings(bindings: &bindgen::Bindings, out: &Path) {
     bindings
-        .write_to_file(&out)
+        .write_to_file(out)
         .unwrap_or_else(|e| panic!("could not write {}: {e}", out.display()));
-    write_preambles(&lib.include_paths, &out_dir.join("preambles.md"));
 }
 
 /// `MOQ_PREFIX` names an install prefix; its pkg-config directories go
@@ -414,17 +511,20 @@ fn diagnose(err: &pkg_config::Error, cross: Option<&Cross>) -> String {
     }
 }
 
-/// The leading comment of each bound header (the first block comment of the
-/// file), written as the crate documentation's "Header preambles" section:
-/// the contracts a header states for all of its declarations at once.
-fn write_preambles(include_dirs: &[PathBuf], out: &Path) {
-    let mut text = String::from(
-        "# Header preambles\n\nThe leading comment of each header this crate binds, verbatim: \
-         what a header states for all of its declarations at once rather than for one of \
-         them (rcbuf's shard and overflow contract among them), which clang attaches to no \
-         single item.\n\n",
-    );
-    for h in HEADERS {
+/// The heading of the crate documentation's "Header preambles" section.
+const PREAMBLES_INTRO: &str =
+    "# Header preambles\n\nThe leading comment of each header this crate binds, verbatim: \
+     what a header states for all of its declarations at once rather than for one of \
+     them (rcbuf's shard and overflow contract among them), which clang attaches to no \
+     single item.\n\n";
+
+/// The leading comment of each of `headers` (the first block comment of the
+/// file), written as sections of the crate documentation's "Header
+/// preambles": the contracts a header states for all of its declarations at
+/// once. `intro` opens the section; the player's preambles continue it.
+fn write_preambles(include_dirs: &[PathBuf], headers: &[&str], intro: Option<&str>, out: &Path) {
+    let mut text = String::from(intro.unwrap_or_default());
+    for h in headers {
         let path = include_dirs
             .iter()
             .map(|d| d.join(h))
@@ -468,6 +568,35 @@ fn header_preamble(source: &str) -> Option<String> {
     let text = lines.join("\n");
     let text = text.trim_matches('\n');
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// What the base bindings derive for the base types the player's records
+/// hold by value, which bindgen does not see in the player run (they are
+/// blocklisted there): the span derives `Debug` and `Copy` and implements
+/// `Default` by hand (it holds a pointer), and the two codes are plain
+/// integers. Without it, the records' unions would not be `Copy`, and bindgen
+/// would emit them as structs of placeholder fields.
+#[derive(Debug)]
+struct BaseDerives;
+
+impl bindgen::callbacks::ParseCallbacks for BaseDerives {
+    fn blocklisted_type_implements_trait(
+        &self,
+        name: &str,
+        derive_trait: bindgen::callbacks::DeriveTrait,
+    ) -> Option<bindgen::callbacks::ImplementsTrait> {
+        use bindgen::callbacks::{DeriveTrait, ImplementsTrait};
+        match (name, derive_trait) {
+            ("moq_bytes_t" | "moq_bytes", DeriveTrait::Copy | DeriveTrait::Debug) => {
+                Some(ImplementsTrait::Yes)
+            }
+            ("moq_bytes_t" | "moq_bytes", DeriveTrait::Default) => Some(ImplementsTrait::Manually),
+            ("moq_media_time_domain_t" | "moq_media_stream_terminal_kind_t", _) => {
+                Some(ImplementsTrait::Yes)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Two spellings bindgen gets wrong on its own: `MOQ_OK`/`MOQ_DONE` are

@@ -4,10 +4,15 @@ A safe Rust API for libmoq, the MOQ5 Media over QUIC library.
 
 It wraps libmoq's service tier: a managed `Endpoint` (connection, MoQ session
 and network thread), a `Sender` that publishes a namespace with an MSF/CMSF
-catalog, a `Receiver` that discovers and receives one (track events, owned
-media objects, the stream-terminal lane, SAP and media timeline records), and
-CMAF parsing. The raw C API is re-exported as `moq5::sys` (the `moq5-sys`
-crate); its header comments are the contract.
+catalog (with per-track statistics, explicit draft-22 object metadata and
+Track Properties, new-group requests, and MPEG-TS transport-stream writes),
+a `Receiver` that discovers and receives one (track events, owned media
+objects with their draft-22 metadata, bounded polls, the stream-terminal
+lane, SAP and media timeline records, location and fill subscriptions,
+MPEG-TS records, the effective configuration), `Buffer::slice`, and CMAF
+parsing. With the `player` feature, `moq5::player` plays a receiver's
+tracks for the application's decoders. The raw C API is re-exported as
+`moq5::sys` (the `moq5-sys` crate); its header comments are the contract.
 
 ```rust,no_run
 use moq5::{
@@ -45,9 +50,13 @@ sender.write(video, obj)?;
 - **Snapshots.** A `TrackDescription` is the track's current state, copied
   under the receiver's lock; nothing reads the mutable native description
   concurrently with the service.
-- **Threading.** `Endpoint` is `Send + Sync`; `Sender` and `Receiver` are
-  `Send` but not `Sync`; `MediaObject` is neither; `Buffer` moves and is never
-  shared.
+- **Threading.** `Endpoint` is `Send + Sync`; `Sender`, `Receiver` and
+  `Player` are `Send` but not `Sync`; `MediaObject` is neither, nor is a
+  player's output, which borrows its player; `Buffer` moves and is never
+  shared (a slice is the sole reference to its bytes).
+- **The player's receiver.** A player takes its receiver: while it exists it
+  is the receiver's only consumer, the application reaches only the
+  receiver's observing calls, and `detach` hands the receiver back.
 
 No application code runs on the service's threads: the crate installs no C
 callbacks, posts no tasks, and adopts no buffer whose release runs
@@ -55,16 +64,17 @@ application code. Demand is observed through the sender's queries;
 `Sender::wait` waits for the write level, not for a subscriber. Every one of
 the 17 native result codes is a named `Error` constant.
 
-Not in this crate yet: the media player, `poll_object_within`, the receiver
-info snapshot, fill cancellation, fill and location subscribe options,
-per-track sender statistics, explicit draft-22 object metadata and track
-properties, `Buffer::slice`, and MPEG-TS.
+Not in this crate yet: MSF catalog views, and an async adapter over `wait`
+and `wake`.
 
 ## Building
 
 `moq5-sys` finds the installed SDK through pkg-config (`libmoq-service`); see
 its README for `MOQ_PREFIX`, static/shared selection, cross builds and the
-supported SDK configurations. bindgen needs libclang.
+supported SDK configurations. bindgen needs libclang. The `player` feature
+needs an SDK built with the player (`MOQ_BUILD_PLAYBACK=ON`); MPEG-TS
+tracks need one built with `MOQ_BUILD_MPEG2TS=ON`, without which the
+service refuses them.
 
 ## License
 

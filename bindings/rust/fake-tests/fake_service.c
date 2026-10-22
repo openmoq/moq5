@@ -102,7 +102,7 @@ size_t moq5_fake_log_take(char *buf, size_t cap)
 /* -- Knobs and counters ------------------------------------------------- */
 
 typedef struct knob { const char *name; int64_t value; } knob_t;
-static knob_t g_knobs[96];
+static knob_t g_knobs[256];
 static size_t g_knob_count;
 
 /* Knob names outlive the caller's string (strdup is not ISO C). */
@@ -186,6 +186,9 @@ struct moq_media_receiver {
 };
 
 static moq_media_receiver_t *g_receiver;   /* the receiver pushes target */
+#ifdef MOQ5_FAKE_PLAYER
+static struct moq_media_player *g_player;  /* the player pushes target */
+#endif
 static const moq_cmsf_content_protection_t *g_cp;
 static uint8_t g_goaway[256];
 static size_t  g_goaway_len;
@@ -211,6 +214,13 @@ void moq5_fake_reset(void)
     knob("poll_terminal_result")->value = MOQ_DONE;
     knob("poll_sap_result")->value = MOQ_DONE;
     knob("poll_timeline_result")->value = MOQ_DONE;
+    knob("player_wait_result")->value = MOQ_DONE;
+    knob("poll_output_result")->value = MOQ_DONE;
+    knob("poll_event_result")->value = MOQ_DONE;
+    knob("player_deadline")->value = -1;   /* UINT64_MAX: no deadline */
+#ifdef MOQ5_FAKE_PLAYER
+    g_player = NULL;
+#endif
 }
 
 void moq5_fake_set_goaway(const uint8_t *uri, size_t len, bool present)
@@ -522,18 +532,55 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s, const moq_media_t
         snprintf(one, sizeof one, "%s%.*s", i ? "," : "", SPAN(cfg->content_protection_ref_ids[i]));
         strncat(refs, one, sizeof refs - strlen(refs) - 1);
     }
+    /* The MPEG-TS record of the first extension entry, key by key: mode,
+     * packet size, then each optional key as its value or '-'. */
+    char ts[256] = "none";
+    if (cfg->extension_count && cfg->extensions && cfg->extensions[0].kind == MOQ_MSF_EXT_MPEG2TS &&
+        cfg->extensions[0].u.mpeg2ts) {
+        const moq_msf_mpeg2ts_t *m = cfg->extensions[0].u.mpeg2ts;
+        char es[16] = "-", prog[16] = "-", pcr[16] = "-", mux[24] = "-", ra[4] = "-", tsm[8] = "-",
+             scte[16] = "-", si[96] = "-";
+        if (m->has_es_pid) snprintf(es, sizeof es, "%u", m->es_pid);
+        if (m->has_program_number) snprintf(prog, sizeof prog, "%u", m->program_number);
+        if (m->has_pcr_pid) snprintf(pcr, sizeof pcr, "%u", m->pcr_pid);
+        if (m->has_mux_rate) snprintf(mux, sizeof mux, "%" PRIu64, m->mux_rate);
+        if (m->has_random_access) snprintf(ra, sizeof ra, "%d", m->random_access ? 1 : 0);
+        if (m->has_timestamp_mode) snprintf(tsm, sizeof tsm, "%d", (int)m->timestamp_mode);
+        if (m->has_scte35_pid) snprintf(scte, sizeof scte, "%u", m->scte35_pid);
+        if (m->has_si_pids) {
+            si[0] = 0;
+            for (size_t i = 0; i < m->si_pid_count && i < 8; i++) {
+                char one[12];
+                snprintf(one, sizeof one, "%s%u", i ? "+" : "", m->si_pids[i]);
+                strncat(si, one, sizeof si - strlen(si) - 1);
+            }
+            if (!si[0]) snprintf(si, sizeof si, "empty");
+        }
+        snprintf(ts, sizeof ts, "%d:%u:%s:%s:%s:%s:%s:%s:%s:%s:struct=%u",
+                 m->has_mode ? (int)m->mode : -1, m->has_packet_size ? m->packet_size : 0, es, prog,
+                 pcr, mux, si, ra, tsm, scte, m->struct_size);
+    }
+    char props[80] = "";
+    for (size_t i = 0; i < cfg->track_properties.len && i < 32; i++) {
+        char one[4];
+        snprintf(one, sizeof one, "%02x", cfg->track_properties.data[i]);
+        strncat(props, one, sizeof props - strlen(props) - 1);
+    }
     logf_("add_track name=%.*s media_type=%d packaging=%u codec=%.*s timescale=%u "
           "init_data=%zu role=%.*s lang=%.*s is_live=%d dims=%ux%u framerate_millis=%" PRIu64
           " samplerate=%u channel_config=%.*s bitrate=%" PRIu64 " max_sap=%s refs=%zu[%s] "
           "sap_timeline=%s duration=%s media_timeline=%s alt_group=%s priority=%s "
           "extensions=%zu mpeg2ts_app_objects=%d track_properties=%zu dynamic_groups=%d "
-          "render_group=%s label=%s struct_size=%u",
+          "render_group=%s label=%s mpeg2ts=%s object_packets=%u min_group_ms=%u forward=%d "
+          "properties=[%s] struct_size=%u",
           SPAN(cfg->name), (int)cfg->media_type, cfg->packaging, SPAN(cfg->codec), cfg->timescale,
           cfg->init_data.len, SPAN(cfg->role), SPAN(cfg->lang), cfg->is_live ? 1 : 0, cfg->width,
           cfg->height, cfg->framerate_millis, cfg->samplerate, SPAN(cfg->channel_config),
           cfg->bitrate, maxsap, cfg->content_protection_ref_id_count, refs, sapt, duration, mediat,
           alt, prio, cfg->extension_count, cfg->mpeg2ts_app_objects ? 1 : 0,
-          cfg->track_properties.len, cfg->dynamic_groups ? 1 : 0, render, label, cfg->struct_size);
+          cfg->track_properties.len, cfg->dynamic_groups ? 1 : 0, render, label, ts,
+          cfg->mpeg2ts_object_packets, cfg->mpeg2ts_min_group_ms,
+          cfg->mpeg2ts_forward_before_random_access ? 1 : 0, props, cfg->struct_size);
     moq_result_t rc = (moq_result_t)get("add_track_result");
     if (rc != MOQ_OK) return rc;
     if (s->track_count == FAKE_TRACKS) return MOQ_ERR_NOMEM;
@@ -577,11 +624,29 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s, moq_media_track_t *tr
     else snprintf(sap, sizeof sap, "none");
     if (obj->properties) snprintf(props, sizeof props, "%zu", moq_rcbuf_len(obj->properties));
     else snprintf(props, sizeof props, "none");
+    /* The metadata record as given: its stamps, presence bits, then each
+     * value (marking bytes in hex, configurations as their lengths). */
+    char meta[200] = "none";
+    if (obj->metadata) {
+        const moq_media_metadata_t *m = obj->metadata;
+        char mark[12] = "";
+        for (size_t k = 0; k < m->loc.marking_len && k < 4; k++) {
+            char one[4];
+            snprintf(one, sizeof one, "%02x", m->loc.marking[k]);
+            strncat(mark, one, sizeof mark - strlen(mark) - 1);
+        }
+        snprintf(meta, sizeof meta,
+                 "struct=%u:loc_struct=%u:present=%u:ts=%" PRIu64 ":scale=%" PRIu64
+                 ":mark=%s:level=%u:video=%zu:audio=%zu",
+                 m->struct_size, m->loc.struct_size, m->loc.present, m->loc.timestamp,
+                 m->loc.timescale, mark, m->loc.audio_level, m->loc.video_config.len,
+                 m->loc.audio_config.len);
+    }
     logf_("write track=%d len=%zu props=%s sync=%d starts=%d ends=%d dts=%" PRIu64
-          " pts=%" PRIu64 " capture=%s sap=%s metadata=%d struct_size=%u",
+          " pts=%" PRIu64 " capture=%s sap=%s metadata=%d meta=%s struct_size=%u",
           i, moq_rcbuf_len(obj->payload), props, obj->is_sync ? 1 : 0, obj->starts_group ? 1 : 0,
           obj->ends_group ? 1 : 0, obj->decode_time_us, obj->presentation_time_us, capture, sap,
-          obj->metadata ? 1 : 0, obj->struct_size);
+          obj->metadata ? 1 : 0, meta, obj->struct_size);
     if (s->ep->interrupted) return MOQ_ERR_INTERRUPTED;
     if (s->tracks[i].removed || s->tracks[i].ended) return MOQ_ERR_WRONG_STATE;
     moq_result_t rc = (moq_result_t)get("write_result");
@@ -648,6 +713,72 @@ moq_result_t moq_media_sender_get_stats(const moq_media_sender_t *s,
     size_t n = out_size < sizeof st ? out_size : sizeof st;
     memcpy(out, &st, n);
     out->struct_size = stamp_for("sender_stats_stamp", out_size, sizeof st);
+    return MOQ_OK;
+}
+
+/* The bytes taken are scripted: mpeg2ts_consumed when set (and at most the
+ * input), else all of it; the result likewise, written with the count on
+ * every return, as the real call does. */
+moq_result_t moq_media_sender_write_mpeg2ts(moq_media_sender_t *s, moq_media_track_t *track,
+                                            const moq_media_send_mpeg2ts_t *in, size_t *consumed)
+{
+    if (consumed) *consumed = 0;
+    if (!s || !in || !consumed) return MOQ_ERR_INVAL;
+    int i = sender_track(s, track);
+    if (i < 0) return MOQ_ERR_INVAL;
+    bump("write_mpeg2ts");
+    logf_("write_mpeg2ts track=%d len=%zu end_object=%d first=%d struct_size=%u", i, in->data.len,
+          in->end_object ? 1 : 0, in->data.len ? in->data.data[0] : -1, in->struct_size);
+    if (in->struct_size < offsetof(moq_media_send_mpeg2ts_t, end_object) + sizeof in->end_object)
+        return MOQ_ERR_INVAL;
+    int64_t take = get("mpeg2ts_consumed");
+    size_t n = take > 0 && (size_t)take < in->data.len ? (size_t)take : in->data.len;
+    if (take < 0) n = 0;
+    *consumed = n;
+    if (s->ep->interrupted) return MOQ_ERR_INTERRUPTED;
+    return (moq_result_t)get("write_mpeg2ts_result");
+}
+
+moq_result_t moq_media_sender_get_track_stats(const moq_media_sender_t *s,
+                                              const moq_media_track_t *track,
+                                              moq_media_sender_track_stats_t *out, size_t out_size)
+{
+    if (!s || !track || !out) return MOQ_ERR_INVAL;
+    int i = track_index(s->tracks, track);
+    if (i < 0 || !s->tracks[i].used) return MOQ_ERR_INVAL;
+    logf_("track_stats track=%d out_size=%zu", i, out_size);
+    moq_result_t rc = (moq_result_t)get("track_stats_result");
+    if (rc != MOQ_OK) return rc;
+    moq_media_sender_track_stats_t st = {
+        .objects_written = 9, .objects_sent = 5, .objects_queued = 3, .objects_dropped = 1,
+        .bytes_queued = 600, .groups_dropped = 1, .keyframes_dropped = 1, .groups_abandoned = 2,
+        .mpeg2ts_groups = 4, .mpeg2ts_objects = 12, .mpeg2ts_packets_in = 48,
+        .mpeg2ts_packets_dropped_before_random_access = 3, .mpeg2ts_max_group_27mhz = 27000000,
+        .mpeg2ts_groups_over_2s = 0, .mpeg2ts_peak_rate_bps = 4000000,
+        .mpeg2ts_source_pcr_discontinuities = 1, .mpeg2ts_mux_rate_below_peak = true,
+        .mpeg2ts_program_gone = get("track_stats_program_gone") != 0,
+        .mpeg2ts_objects_parked = (uint64_t)get("track_stats_parked"),
+        .mpeg2ts_partial_bytes_discarded = 7, .mpeg2ts_continuation_objects_discarded = 2,
+    };
+    size_t n = out_size < sizeof st ? out_size : sizeof st;
+    memcpy(out, &st, n);
+    out->struct_size = stamp_for("track_stats_stamp", out_size, sizeof st);
+    return MOQ_OK;
+}
+
+/* A pending request (new_group_pending) is taken once: it clears, as the
+ * real one does, and its value is new_group_value. */
+moq_result_t moq_media_sender_take_new_group_request(moq_media_sender_t *s,
+                                                     moq_media_track_t *track,
+                                                     uint64_t *requested_group)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    int i = sender_track(s, track);
+    if (i < 0) return MOQ_ERR_INVAL;
+    logf_("take_new_group_request track=%d out=%d", i, requested_group ? 1 : 0);
+    if (!get("new_group_pending")) return MOQ_DONE;
+    knob("new_group_pending")->value = 0;
+    if (requested_group) *requested_group = (uint64_t)get("new_group_value");
     return MOQ_OK;
 }
 
@@ -861,6 +992,18 @@ const moq_cmsf_content_protection_t *moq_media_receiver_find_content_protection(
     return NULL;
 }
 
+/* A location filter record as kind:relative:start:end, or "none". */
+static void log_location(char *buf, size_t cap, const moq_location_filter_cfg_t *l)
+{
+    if (!l) {
+        snprintf(buf, cap, "none");
+        return;
+    }
+    snprintf(buf, cap, "%u:%" PRIu64 ":%" PRIu64 ".%" PRIu64 ":%" PRIu64 ".%" PRIu64 ":struct=%u",
+             l->kind, l->relative_group_offset, l->start_group, l->start_object, l->end_group,
+             l->end_object, l->struct_size);
+}
+
 moq_result_t moq_media_receiver_subscribe_track(moq_media_receiver_t *r, moq_media_track_t *track,
                                                 const moq_media_receiver_track_subscribe_cfg_t *cfg)
 {
@@ -871,10 +1014,24 @@ moq_result_t moq_media_receiver_subscribe_track(moq_media_receiver_t *r, moq_med
         char prio[16];
         if (cfg->has_priority) snprintf(prio, sizeof prio, "%u", cfg->priority);
         else snprintf(prio, sizeof prio, "none");
+        char loc[120], fill[200], fill_loc[120];
+        log_location(loc, sizeof loc, cfg->location);
+        if (cfg->fill) {
+            const moq_fill_cfg_t *f = cfg->fill;
+            log_location(fill_loc, sizeof fill_loc, f->location);
+            char fprio[8] = "-", order[8] = "-", timeout[24] = "-";
+            if (f->has_subscriber_priority) snprintf(fprio, sizeof fprio, "%u", f->subscriber_priority);
+            if (f->has_group_order) snprintf(order, sizeof order, "%u", f->group_order);
+            if (f->has_fill_timeout) snprintf(timeout, sizeof timeout, "%" PRIu64, f->fill_timeout_ms);
+            snprintf(fill, sizeof fill, "%s/%s/%s/%s/struct=%u", fprio, order, timeout, fill_loc,
+                     f->struct_size);
+        } else {
+            snprintf(fill, sizeof fill, "none");
+        }
         logf_("subscribe track=%d start=%d priority=%s program=%u location=%d fill=%d "
-              "struct_size=%u",
+              "loc=%s fill_cfg=%s struct_size=%u",
               i, (int)cfg->start, prio, cfg->mpeg2ts_program_number, cfg->location ? 1 : 0,
-              cfg->fill ? 1 : 0, cfg->struct_size);
+              cfg->fill ? 1 : 0, loc, fill, cfg->struct_size);
         if (cfg->struct_size < MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     } else {
         logf_("subscribe track=%d config=none", i);
@@ -1018,6 +1175,87 @@ moq_result_t moq_media_receiver_get_stats(const moq_media_receiver_t *r,
     return MOQ_OK;
 }
 
+moq_result_t moq_media_receiver_cancel_fill(moq_media_receiver_t *r, moq_media_track_t *track,
+                                            uint64_t initiating_request_id)
+{
+    if (!r || !track) return MOQ_ERR_INVAL;
+    int i = receiver_track(r, track);
+    if (i < 0) return MOQ_ERR_INVAL;
+    bump("cancel_fill");
+    logf_("cancel_fill track=%d id=%" PRIu64, i, initiating_request_id);
+    return (moq_result_t)get("cancel_fill_result");
+}
+
+/* What a polled object holds, from what it owns: its buffers' bytes and its
+ * owned sample table, each read only when the stamp covers it. */
+uint64_t moq_media_object_charge(const moq_media_object_t *obj)
+{
+    if (!obj) return 0;
+    size_t n = obj->struct_size;
+    uint64_t charge = 0;
+    if (n >= offsetof(moq_media_object_t, payload_ref) + sizeof obj->payload_ref)
+        charge += moq_rcbuf_len(obj->payload_ref);
+    if (n >= offsetof(moq_media_object_t, properties_ref) + sizeof obj->properties_ref)
+        charge += moq_rcbuf_len(obj->properties_ref);
+    if (n >= offsetof(moq_media_object_t, samples_owned) + sizeof obj->samples_owned &&
+        obj->samples_owned)
+        charge += (uint64_t)obj->sample_count * sizeof(moq_cmaf_sample_t);
+    if (n >= offsetof(moq_media_object_t, track_properties_ref) + sizeof obj->track_properties_ref)
+        charge += moq_rcbuf_len(obj->track_properties_ref);
+    return charge;
+}
+
+moq_result_t moq_media_receiver_poll_object_within(moq_media_receiver_t *r, uint64_t max_charge,
+                                                   uint64_t *charge, moq_media_object_t *out,
+                                                   size_t out_size)
+{
+    if (r && out && out_size < offsetof(moq_media_object_t, samples_owned) +
+                                    sizeof out->samples_owned)
+        return MOQ_ERR_INVAL;
+    if (!r || !out) return MOQ_ERR_INVAL;
+    bump("poll_object_within");
+    logf_("poll_object_within max_charge=%" PRIu64 " charge_out=%d", max_charge, charge ? 1 : 0);
+    if (r->ep->interrupted) return MOQ_ERR_INTERRUPTED;
+    if (r->object_count == 0) return (moq_result_t)get("poll_object_result");
+    moq_media_object_t *head = &r->objects[r->object_head];
+    /* A queued record is unstamped: it is charged as the whole record. */
+    moq_media_object_t whole = *head;
+    whole.struct_size = (uint32_t)sizeof whole;
+    uint64_t need = moq_media_object_charge(&whole);
+    if (charge) *charge = need;
+    if (need > max_charge) return MOQ_ERR_BUFFER;
+    size_t n = out_size < sizeof *head ? out_size : sizeof *head;
+    memcpy(out, head, n);
+    out->struct_size = stamp_for("poll_object_stamp", out_size, sizeof *head);
+    r->object_head = (r->object_head + 1) % FAKE_QUEUE;
+    r->object_count--;
+    return MOQ_OK;
+}
+
+moq_result_t moq_media_receiver_get_info(const moq_media_receiver_t *r,
+                                         moq_media_receiver_info_t *out, size_t out_size)
+{
+    if (!r || !out) return MOQ_ERR_INVAL;
+    if (out_size < MOQ_MEDIA_RECEIVER_INFO_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    logf_("get_info out_size=%zu", out_size);
+    moq_media_receiver_info_t info = {
+        .time_mode = (uint32_t)get("info_time_mode"),
+        .overflow_policy = (uint32_t)get("info_overflow_policy"),
+        .max_objects = 256,
+        .max_bytes = 33554432,
+        .auto_subscribe = get("info_auto_subscribe") != 0,
+        .surface_stream_terminals = get("info_terminals") != 0,
+        .companion_profile = (moq_media_companion_profile_t)get("info_companion"),
+        .transport_version = (uint32_t)get("info_version"),
+        .max_stream_terminals = (uint32_t)get("info_terminals"),
+        .track_events_polled = (uint64_t)get("poll_track_polled"),
+    };
+    size_t n = out_size < sizeof info ? out_size : sizeof info;
+    memcpy(out, &info, n);
+    out->struct_size = stamp_for("info_stamp", out_size, sizeof info);
+    return MOQ_OK;
+}
+
 bool moq_media_receiver_is_closed(const moq_media_receiver_t *r) { (void)r; return get("receiver_is_closed") != 0; }
 bool moq_media_receiver_is_fatal(const moq_media_receiver_t *r) { (void)r; return get("receiver_is_fatal") != 0; }
 uint64_t moq_media_receiver_fatal_code(const moq_media_receiver_t *r)
@@ -1025,3 +1263,260 @@ uint64_t moq_media_receiver_fatal_code(const moq_media_receiver_t *r)
     (void)r;
     return (uint64_t)get("receiver_fatal_code");
 }
+
+/* -- Player (an SDK with the player) ------------------------------------ *
+ * Compiled when run.sh finds the SDK's media_player.h. Outputs and events
+ * are pushed by the tests; an output's references pass to the poller and
+ * come back through output_cleanup, which counts what it releases. The
+ * player's create is deliberately absent: the binding attaches only. */
+#ifdef MOQ5_FAKE_PLAYER
+#include <moq/media_player.h>
+
+struct moq_media_player {
+    moq_media_receiver_t *r;
+    moq_media_player_output_t outputs[FAKE_QUEUE];
+    size_t output_head, output_count;
+    moq_media_player_event_t events[FAKE_QUEUE];
+    size_t event_head, event_count;
+};
+
+static void cfg_clear(void *cfg, size_t cfg_size, size_t lib_size)
+{
+    if (!cfg || cfg_size < sizeof(uint32_t)) return;
+    size_t n = cfg_size < lib_size ? cfg_size : lib_size;
+    memset(cfg, 0, n);
+    uint32_t stamp = (uint32_t)n;
+    memcpy(cfg, &stamp, sizeof stamp);
+}
+
+void moq_media_player_cfg_init_sized(moq_media_player_cfg_t *cfg, size_t cfg_size)
+{
+    cfg_clear(cfg, cfg_size, sizeof *cfg);
+}
+
+void moq_media_player_select_cfg_init_sized(moq_media_player_select_cfg_t *cfg, size_t cfg_size)
+{
+    cfg_clear(cfg, cfg_size, sizeof *cfg);
+}
+
+void moq_media_player_feedback_init_sized(moq_media_player_feedback_t *fb, size_t fb_size)
+{
+    cfg_clear(fb, fb_size, sizeof *fb);
+}
+
+moq_result_t moq_media_player_attach(moq_media_receiver_t *r, const moq_media_player_cfg_t *cfg,
+                                     moq_media_player_t **out)
+{
+    if (!r || !cfg || !out) return MOQ_ERR_INVAL;
+    *out = NULL;
+    bump("player_attach");
+    char playback[200] = "none";
+    if (cfg->playback) {
+        const moq_playback_cfg_t *p = cfg->playback;
+        snprintf(playback, sizeof playback,
+                 "%u/%u/%" PRIu64 "/%u/%u/%u/%" PRIu64 "/%u/%u/%u/%u/struct=%u", p->max_tracks,
+                 p->max_buffered_objects, p->max_buffered_bytes, p->max_backlog_groups,
+                 p->max_commands, p->max_events, p->gap_timeout_us, p->max_release_per_tick,
+                 p->max_track_config_bytes, p->max_samples_per_object, p->max_known_ranges,
+                 p->struct_size);
+    }
+    logf_("player_attach selection=%u receiver_cfg=%d playback=%s lang=%.*s tail_us=%" PRIu64
+          " cushion_us=%" PRIu64 " outputs=%u events=%u timing=%u held=%" PRIu64
+          " shared_epoch=%d struct_size=%u",
+          cfg->selection, cfg->receiver ? 1 : 0, playback, SPAN(cfg->preferred_lang),
+          cfg->end_tail_wait_us, cfg->cushion_us, cfg->max_outputs, cfg->max_events,
+          cfg->timing_policy, cfg->max_held_bytes, cfg->assume_shared_epoch ? 1 : 0,
+          cfg->struct_size);
+    if (cfg->struct_size < MOQ_MEDIA_PLAYER_CFG_V0_SIZE || cfg->receiver) return MOQ_ERR_INVAL;
+    moq_result_t rc = (moq_result_t)get("player_attach_result");
+    if (rc != MOQ_OK) return rc;
+    moq_media_player_t *p = fake_alloc(sizeof *p);
+    if (!p) return MOQ_ERR_NOMEM;
+    p->r = r;
+    g_player = p;
+    *out = p;
+    return MOQ_OK;
+}
+
+void moq_media_player_output_cleanup(moq_media_player_output_t *out)
+{
+    if (!out) return;
+    bump("output_cleanup");
+    switch (out->kind) {
+    case MOQ_MEDIA_PLAYER_OUTPUT_CONFIGURE:
+        if (out->u.configure.codec) bump("output_refs_released");
+        if (out->u.configure.codec_config) bump("output_refs_released");
+        moq_rcbuf_decref(out->u.configure.codec);
+        moq_rcbuf_decref(out->u.configure.codec_config);
+        out->u.configure.codec = NULL;
+        out->u.configure.codec_config = NULL;
+        break;
+    case MOQ_MEDIA_PLAYER_OUTPUT_UNIT:
+        if (out->u.unit.payload) bump("output_refs_released");
+        moq_rcbuf_decref(out->u.unit.payload);
+        out->u.unit.payload = NULL;
+        break;
+    default:
+        break;
+    }
+}
+
+void moq_media_player_destroy(moq_media_player_t *p)
+{
+    if (!p) return;
+    bump("player_destroy");
+    logf_("player_destroy");
+    /* Queued outputs still own their references. */
+    while (p->output_count) {
+        moq_media_player_output_cleanup(&p->outputs[p->output_head]);
+        p->output_head = (p->output_head + 1) % FAKE_QUEUE;
+        p->output_count--;
+    }
+    if (g_player == p) g_player = NULL;
+    fake_free(p, sizeof *p);
+}
+
+moq_media_receiver_t *moq_media_player_receiver(const moq_media_player_t *p)
+{
+    return p ? p->r : NULL;
+}
+
+void moq5_fake_push_player_output(const moq_media_player_output_t *out)
+{
+    moq_media_player_t *p = g_player;
+    if (!p || p->output_count == FAKE_QUEUE) abort();
+    p->outputs[(p->output_head + p->output_count) % FAKE_QUEUE] = *out;
+    p->output_count++;
+}
+
+void moq5_fake_push_player_event(const moq_media_player_event_t *ev)
+{
+    moq_media_player_t *p = g_player;
+    if (!p || p->event_count == FAKE_QUEUE) abort();
+    p->events[(p->event_head + p->event_count) % FAKE_QUEUE] = *ev;
+    p->event_count++;
+}
+
+moq_result_t moq_media_player_select_track(moq_media_player_t *p, moq_media_track_t *track,
+                                           const moq_media_player_select_cfg_t *cfg)
+{
+    if (!p || !track) return MOQ_ERR_INVAL;
+    int i = receiver_track(p->r, track);
+    if (i < 0) return MOQ_ERR_INVAL;
+    if (cfg)
+        logf_("select track=%d start=%u independent=%d shared_epoch=%d struct_size=%u", i,
+              cfg->start, cfg->independent_timing ? 1 : 0, cfg->shared_epoch ? 1 : 0,
+              cfg->struct_size);
+    else
+        logf_("select track=%d config=none", i);
+    if (cfg && cfg->struct_size < MOQ_MEDIA_PLAYER_SELECT_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+    return (moq_result_t)get("select_result");
+}
+
+moq_result_t moq_media_player_deselect_track(moq_media_player_t *p, moq_media_track_t *track)
+{
+    if (!p || !track) return MOQ_ERR_INVAL;
+    int i = receiver_track(p->r, track);
+    if (i < 0) return MOQ_ERR_INVAL;
+    logf_("deselect track=%d", i);
+    return (moq_result_t)get("deselect_result");
+}
+
+moq_result_t moq_media_player_tick(moq_media_player_t *p, uint64_t now_us)
+{
+    if (!p) return MOQ_ERR_INVAL;
+    logf_("tick %" PRIu64, now_us);
+    return (moq_result_t)get("tick_result");
+}
+
+moq_result_t moq_media_player_wait(moq_media_player_t *p, uint64_t now_us, uint64_t timeout_us)
+{
+    if (!p) return MOQ_ERR_INVAL;
+    logf_("player_wait now=%" PRIu64 " timeout=%" PRIu64, now_us, timeout_us);
+    if (p->r->ep->interrupted) return MOQ_ERR_INTERRUPTED;
+    if (p->output_count || p->event_count) return MOQ_OK;
+    return (moq_result_t)get("player_wait_result");
+}
+
+uint64_t moq_media_player_next_deadline_us(const moq_media_player_t *p)
+{
+    if (!p) return UINT64_MAX;
+    return (uint64_t)get("player_deadline");
+}
+
+moq_result_t moq_media_player_poll_output(moq_media_player_t *p, moq_media_player_output_t *out,
+                                          size_t out_size)
+{
+    if (!p || !out) return MOQ_ERR_INVAL;
+    bump("poll_output");
+    /* A record owns references: it is never truncated. */
+    if (out_size < sizeof *out) return MOQ_ERR_ABI_MISMATCH;
+    if (p->output_count == 0) return (moq_result_t)get("poll_output_result");
+    *out = p->outputs[p->output_head];
+    out->struct_size = stamp_for("poll_output_stamp", out_size, sizeof *out);
+    p->output_head = (p->output_head + 1) % FAKE_QUEUE;
+    p->output_count--;
+    return MOQ_OK;
+}
+
+moq_result_t moq_media_player_poll_event(moq_media_player_t *p, moq_media_player_event_t *ev,
+                                         size_t ev_size)
+{
+    if (!p || !ev) return MOQ_ERR_INVAL;
+    if (ev_size < sizeof *ev) return MOQ_ERR_ABI_MISMATCH;
+    if (p->event_count == 0) return (moq_result_t)get("poll_event_result");
+    *ev = p->events[p->event_head];
+    ev->struct_size = stamp_for("poll_event_stamp", ev_size, sizeof *ev);
+    p->event_head = (p->event_head + 1) % FAKE_QUEUE;
+    p->event_count--;
+    return MOQ_OK;
+}
+
+moq_result_t moq_media_player_handle_feedback(moq_media_player_t *p,
+                                              const moq_media_player_feedback_t *fb,
+                                              uint64_t now_us)
+{
+    if (!p || !fb) return MOQ_ERR_INVAL;
+    int i = receiver_track(p->r, fb->track);
+    char detail[120] = "";
+    if (fb->kind == MOQ_MEDIA_PLAYER_FEEDBACK_DECODER_QUEUE)
+        snprintf(detail, sizeof detail, "%u/%u", fb->u.decoder_queue.depth,
+                 fb->u.decoder_queue.max_recommended);
+    else if (fb->kind == MOQ_MEDIA_PLAYER_FEEDBACK_DECODE_ERROR)
+        snprintf(detail, sizeof detail, "\"%.*s\"", SPAN(fb->u.decode_error.message));
+    logf_("feedback track=%d kind=%u generation=%" PRIu64 " detail=%s now=%" PRIu64
+          " struct_size=%u",
+          i, fb->kind, fb->configuration_generation, detail[0] ? detail : "-", now_us,
+          fb->struct_size);
+    if (fb->struct_size < MOQ_MEDIA_PLAYER_FEEDBACK_V0_SIZE || i < 0) return MOQ_ERR_INVAL;
+    return (moq_result_t)get("feedback_result");
+}
+
+bool moq_media_player_is_closed(const moq_media_player_t *p) { (void)p; return get("player_is_closed") != 0; }
+bool moq_media_player_is_fatal(const moq_media_player_t *p) { (void)p; return get("player_is_fatal") != 0; }
+uint64_t moq_media_player_fatal_code(const moq_media_player_t *p)
+{
+    (void)p;
+    return (uint64_t)get("player_fatal_code");
+}
+
+moq_result_t moq_media_player_get_stats(const moq_media_player_t *p, moq_media_player_stats_t *out,
+                                        size_t out_size)
+{
+    if (!p || !out) return MOQ_ERR_INVAL;
+    if (out_size < MOQ_MEDIA_PLAYER_STATS_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    moq_media_player_stats_t st = {
+        .tracks_selected = 2, .outputs_queued = (uint64_t)p->output_count,
+        .events_queued = (uint64_t)p->event_count, .events_dropped = 1, .held_objects = 1,
+        .held_bytes = 4096, .objects_taken = 20, .objects_pushed = 18, .objects_dropped = 1,
+        .objects_discarded = 1, .terminals_taken = 6, .units_output = 17,
+        .configures_output = 2, .discontinuities_output = 1, .ends_output = 1,
+        .timeline_records_discarded = 3, .feedback_stale = 4, .outputs_bytes = 2048,
+        .selections_failed = 1,
+    };
+    size_t n = out_size < sizeof st ? out_size : sizeof st;
+    memcpy(out, &st, n);
+    out->struct_size = stamp_for("player_stats_stamp", out_size, sizeof st);
+    return MOQ_OK;
+}
+#endif /* MOQ5_FAKE_PLAYER */

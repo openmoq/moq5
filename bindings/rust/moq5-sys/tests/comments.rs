@@ -106,3 +106,50 @@ fn header_preambles_reach_the_crate_documentation() {
         }
     }
 }
+
+/// The player's ownership contracts, in its own generation and snapshot:
+/// attachment takes the receiver's queues, an output is never truncated
+/// because it owns references, and an output's release outlives the player.
+#[cfg(feature = "player")]
+mod player {
+    const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_player.rs"));
+    const SNAPSHOT: &str = include_str!("../docs/bindings_player.rs");
+    const GENERATED_PREAMBLES: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/preambles_player.md"));
+    const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles_player.md");
+
+    const CONTRACTS: &[(&str, &str)] = &[
+        (
+            "moq_media_player_attach",
+            "becomes the sole consumer of every receive queue",
+        ),
+        (
+            "moq_media_player_poll_output",
+            "a record owns refs, so it is never",
+        ),
+        ("moq_media_player_output_cleanup", "legal after the player"),
+    ];
+
+    #[test]
+    fn player_contracts_reach_the_generated_documentation() {
+        for (name, phrase) in CONTRACTS {
+            for (bindings, which) in [(GENERATED, "generated"), (SNAPSHOT, "snapshot")] {
+                assert!(
+                    super::function_doc(bindings, name).contains(phrase),
+                    "the {which} `{name}` carries its header comment ({phrase:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn player_preambles_reach_the_crate_documentation() {
+        for preambles in [GENERATED_PREAMBLES, SNAPSHOT_PREAMBLES] {
+            assert!(preambles.contains("## moq/media_player.h"));
+            assert!(
+                preambles.contains("Threading: the player owns no thread."),
+                "the media_player.h preamble reaches the crate documentation"
+            );
+        }
+    }
+}

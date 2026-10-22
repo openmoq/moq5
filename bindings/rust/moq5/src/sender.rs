@@ -8,6 +8,8 @@ use std::{fmt, mem, ptr};
 use crate::buffer::Buffer;
 use crate::endpoint::Endpoint;
 use crate::error::{Error, Result};
+use crate::metadata::LocMetadata;
+use crate::mpeg2ts::{Mpeg2tsInput, Mpeg2tsRecord, Mpeg2tsTrackStats, Mpeg2tsWriteError};
 use crate::namespace::Namespace;
 use crate::types::{CompanionProfile, MediaType, Packaging, SapType, WaitResult};
 use crate::{ffi, sys};
@@ -259,12 +261,11 @@ impl SenderConfig {
 /// One track to add to a [`Sender`]: enough to derive its catalog entry.
 /// MSF requires a codec and a bitrate for every audio and video track, and
 /// a sample rate and channel config for audio; the service refuses a track
-/// missing them with [`Error::INVAL`].
+/// missing them with [`Error::INVAL`]. An MPEG-TS track needs its record
+/// ([`mpeg2ts`](SendTrackConfig::mpeg2ts)) and a bitrate, and no codec.
 ///
 /// The C configuration is built with the sized initializer, so every field
-/// reaches the service. Not offered here and left at the initializer's
-/// defaults: the packaging extension records and MPEG-TS settings, the
-/// draft-22 track properties and dynamic groups.
+/// reaches the service.
 #[derive(Clone, Debug)]
 pub struct SendTrackConfig {
     name: String,
@@ -292,6 +293,9 @@ pub struct SendTrackConfig {
     publisher_priority: Option<u8>,
     render_group: Option<i32>,
     label: Option<String>,
+    mpeg2ts: Option<(Mpeg2tsRecord, Mpeg2tsInput)>,
+    track_properties: Vec<u8>,
+    dynamic_groups: bool,
 }
 
 impl SendTrackConfig {
@@ -329,6 +333,9 @@ impl SendTrackConfig {
             publisher_priority: None,
             render_group: None,
             label: None,
+            mpeg2ts: None,
+            track_properties: Vec::new(),
+            dynamic_groups: false,
         }
     }
 
@@ -458,6 +465,44 @@ impl SendTrackConfig {
         self.label = Some(label.into());
         self
     }
+    /// An MPEG-TS track ([`Packaging::Mpeg2ts`]): its catalog record and
+    /// how it takes its media. Its catalog entry is packaging `mpeg2ts`,
+    /// mimeType `video/mp2t`, the record's keys and the init data (whole
+    /// source packets of the record's size, normally the PAT and PMT) as an
+    /// inline initDataList entry. The service refuses with [`Error::INVAL`]
+    /// a record that fails the subscriber's check, an es-packets record, a
+    /// per-program record without a program number and a SAP or media
+    /// timeline on the track; a build without MPEG-TS support refuses the
+    /// track with [`Error::UNSUPPORTED`].
+    #[must_use]
+    pub fn mpeg2ts(mut self, record: Mpeg2tsRecord, input: Mpeg2tsInput) -> Self {
+        self.mpeg2ts = Some((record, input));
+        self
+    }
+    /// The track's Track Properties (draft 22), stated on every answer the
+    /// sender gives for the track: opaque bytes in the negotiated draft's
+    /// encoding (a property whose type and value are both below 64 encodes
+    /// the same on drafts 16, 18 and 22). [`Sender::add_track`] checks them
+    /// before it registers anything, against the negotiated draft once one
+    /// is, before that against every draft the endpoint offers: a set that
+    /// does not parse, states a property the sender may not publish, or
+    /// carries an unreadable delivery timeout or default publisher priority
+    /// is refused with [`Error::INVAL`] ([`Error::NOMEM`] when the copy with
+    /// DYNAMIC_GROUPS added cannot be allocated), and the sender is
+    /// unchanged: the same name can be added again.
+    #[must_use]
+    pub fn track_properties(mut self, properties: impl Into<Vec<u8>>) -> Self {
+        self.track_properties = properties.into();
+        self
+    }
+    /// Advertise DYNAMIC_GROUPS (draft 22), added to the track properties
+    /// and checked with them: subscribers may then ask for a new group,
+    /// which [`Sender::take_new_group_request`] reports.
+    #[must_use]
+    pub fn dynamic_groups(mut self, dynamic: bool) -> Self {
+        self.dynamic_groups = dynamic;
+        self
+    }
 }
 
 // -- handles ----------------------------------------------------------------------
@@ -514,6 +559,13 @@ pub struct SendObject {
     /// CMAF: the declared SAP type of the object's first sample
     /// ([`SapType::Unknown`] is refused by the service).
     pub sap_type: Option<SapType>,
+    /// Draft-22 RAW: the object's LOC-04 metadata, written as given (the
+    /// typed timing fields above are then not serialized). The explicit
+    /// draft-22 companion requires it on every RAW object; an AUTO sender
+    /// on draft 22 generates it from the typed fields when it is `None`
+    /// (capture time as Unix microseconds, else the presentation time with
+    /// a timescale of 1000000). Drafts 16/18 and CMAF ignore it.
+    pub metadata: Option<LocMetadata>,
 }
 
 impl SendObject {
@@ -530,6 +582,7 @@ impl SendObject {
             presentation_time_us: 0,
             capture_time_us: None,
             sap_type: None,
+            metadata: None,
         }
     }
 }
@@ -588,6 +641,26 @@ pub struct SenderStats {
     pub completion_error: Option<Error>,
 }
 
+/// One track's slice of the [`SenderStats`] (`moq_media_sender_track_stats_t`):
+/// the same meanings, summing to the sender-wide values over every track,
+/// with `objects_written == objects_sent + objects_queued + objects_dropped`
+/// per track; and the track's MPEG-TS counters.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct TrackStats {
+    pub objects_written: u64,
+    pub objects_sent: u64,
+    pub objects_queued: u64,
+    pub objects_dropped: u64,
+    pub bytes_queued: u64,
+    pub groups_dropped: u64,
+    pub keyframes_dropped: u64,
+    pub groups_abandoned: u64,
+    /// Zero for a track of another packaging.
+    pub mpeg2ts: Mpeg2tsTrackStats,
+}
+
 // -- the sender -------------------------------------------------------------------
 
 /// Publishes a namespace: an MSF/CMSF catalog derived from its tracks, and
@@ -611,6 +684,13 @@ pub struct Sender {
 unsafe impl Send for Sender {}
 
 const SENDER_STATS_V0: usize = ffi::field_end!(sys::moq_media_sender_stats_t, last_error, i32);
+/// The first published size of the per-track statistics: the whole record
+/// as first released, through its last counter.
+const TRACK_STATS_V0: usize = ffi::field_end!(
+    sys::moq_media_sender_track_stats_t,
+    mpeg2ts_continuation_objects_discarded,
+    u64
+);
 
 impl Sender {
     /// Attach a sender to `endpoint`. Add tracks after this; the catalog is
@@ -820,9 +900,38 @@ impl Sender {
             raw_config.has_label = true;
             raw_config.label = ffi::span(label.as_bytes());
         }
+        // The MPEG-TS record and its extension entry, alive for the call;
+        // add_track deep-copies both.
+        let mut si_pids: Vec<u32> = config
+            .mpeg2ts
+            .as_ref()
+            .and_then(|(mpeg2ts, _)| mpeg2ts.si_pids.clone())
+            .unwrap_or_default();
+        let mut record = None;
+        if let Some((mpeg2ts, input)) = &config.mpeg2ts {
+            let (app_objects, object_packets, min_group_ms, forward) = input.raw()?;
+            raw_config.mpeg2ts_app_objects = app_objects;
+            raw_config.mpeg2ts_object_packets = object_packets;
+            raw_config.mpeg2ts_min_group_ms = min_group_ms;
+            raw_config.mpeg2ts_forward_before_random_access = forward;
+            record = Some(mpeg2ts.raw(&mut si_pids));
+        }
+        let extension = record.as_ref().map(|record| sys::moq_msf_track_ext_t {
+            kind: sys::MOQ_MSF_EXT_MPEG2TS,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 {
+                mpeg2ts: record as *const _,
+            },
+        });
+        if let Some(extension) = &extension {
+            raw_config.extensions = extension as *const _;
+            raw_config.extension_count = 1;
+        }
+        raw_config.track_properties = ffi::span(&config.track_properties);
+        raw_config.dynamic_groups = config.dynamic_groups;
         let mut raw = ptr::null_mut();
-        // SAFETY: every pointer in raw_config points into config or ref_ids,
-        // alive for the call; the service copies what it keeps.
+        // SAFETY: every pointer in raw_config points into config, ref_ids,
+        // si_pids, record or extension, alive for the call; the service
+        // copies what it keeps.
         ffi::check(unsafe {
             sys::moq_media_sender_add_track(self.as_ptr(), &raw_config, &mut raw)
         })?;
@@ -845,6 +954,10 @@ impl Sender {
     /// error, untouched. Accepted means accepted by the service, not
     /// delivered: under a drop policy an accepted object may still be
     /// evicted.
+    // The error hands the caller's object back by value, as the call took
+    // it; boxing it would allocate on every refusal, and a WOULD_BLOCK
+    // refusal is the normal retry path of a lossless writer.
+    #[allow(clippy::result_large_err)]
     pub fn write(
         &self,
         track: SendTrack,
@@ -854,6 +967,8 @@ impl Sender {
             Ok(track) => track,
             Err(error) => return Err(WriteError { error, object }),
         };
+        // Borrows the object's metadata for the call; the service copies it.
+        let metadata = object.metadata.as_ref().map(LocMetadata::raw);
         let raw_object = sys::moq_media_send_object_t {
             struct_size: mem::size_of::<sys::moq_media_send_object_t>() as u32,
             payload: object.payload.as_ptr(),
@@ -870,10 +985,13 @@ impl Sender {
             capture_time_us: object.capture_time_us.unwrap_or(0),
             has_sap_type: object.sap_type.is_some(),
             sap_type: object.sap_type.map_or(sys::MOQ_SAP_NONE, SapType::raw),
-            metadata: ptr::null(),
+            metadata: metadata
+                .as_ref()
+                .map_or(ptr::null(), |metadata| metadata as *const _),
         };
         // SAFETY: a live sender and one of its handles; the buffers are
-        // live references this object owns.
+        // live references this object owns, and the metadata record and the
+        // spans it holds borrow the object for the call.
         let code = unsafe { sys::moq_media_sender_write(self.as_ptr(), track, &raw_object) };
         if code != sys::MOQ_OK {
             return Err(WriteError {
@@ -889,10 +1007,80 @@ impl Sender {
         Ok(())
     }
 
+    /// Hand TS bytes to a byte-stream MPEG-TS track
+    /// ([`Mpeg2tsInput::ByteStream`]): source packets of the record's packet
+    /// size, in any chunking, borrowed for the call. The service runs the
+    /// program filter and the packetizer; every Object goes through the
+    /// queue, backpressure policy and drain [`write`](Sender::write) uses.
+    /// `end_object` ends the Object being filled after `data`, so this
+    /// call's last packet closes one.
+    ///
+    /// The result counts the bytes the service now owns, on success and on
+    /// every failure alike ([`Mpeg2tsWriteError::consumed`]): resume after
+    /// them, and never write them again, whatever the result. A packet is
+    /// taken whole or not at all; the bytes of an unfinished packet (fewer
+    /// than one packet) are kept for the next call and count as taken.
+    /// Writes can be short, as with POSIX `write`: when an Object cannot be
+    /// queued under the backpressure policy, the track holds it (at most
+    /// two, see [`Mpeg2tsTrackStats::objects_parked`]) and the call stops
+    /// after the packet that completed it. Held Objects go first at the next
+    /// call or [`end_track`](Sender::end_track); with no more input, call
+    /// with empty `data` until none is held. `Ok` means progress: bytes taken
+    /// (maybe fewer than given), held Objects queued, or an Object ended.
+    ///
+    /// The failures: [`Error::WOULD_BLOCK`] made no progress (the first held
+    /// Object still cannot be queued; retry after [`wait`](Sender::wait));
+    /// [`Error::NOMEM`] lost an Object and the rest of its Group, the count
+    /// covering the packet that completed it; [`Error::PROTO`] found a
+    /// packet without its sync byte, which the service does not resync past,
+    /// the count stopping before that packet; [`Error::WRONG_STATE`] for an
+    /// app-object track, a second writer on the track, or an ended, removed
+    /// or converted track; [`Error::CLOSED`] and [`Error::INTERRUPTED`] as
+    /// for `write`, an interrupt reporting the bytes taken before it.
+    /// [`Error::UNSUPPORTED`] for a build without MPEG-TS, or the companion
+    /// refusal [`write`](Sender::write) applies, is checked when the call
+    /// starts, before any byte is taken (a count of 0); but a refusal the
+    /// session latches while the call has released the sender between
+    /// Objects stops the call there, with a count of the bytes it already
+    /// took, and the next call is refused with 0.
+    pub fn write_mpeg2ts(
+        &self,
+        track: SendTrack,
+        data: &[u8],
+        end_object: bool,
+    ) -> std::result::Result<usize, Mpeg2tsWriteError> {
+        let track = self
+            .own(track)
+            .map_err(|error| Mpeg2tsWriteError { error, consumed: 0 })?;
+        let input = sys::moq_media_send_mpeg2ts_t {
+            struct_size: mem::size_of::<sys::moq_media_send_mpeg2ts_t>() as u32,
+            data: ffi::span(data),
+            end_object,
+        };
+        let mut consumed = 0;
+        // SAFETY: a live sender and one of its handles; data is borrowed for
+        // the call; consumed is writable.
+        let code = unsafe {
+            sys::moq_media_sender_write_mpeg2ts(self.as_ptr(), track, &input, &mut consumed)
+        };
+        if code == sys::MOQ_OK {
+            Ok(consumed)
+        } else {
+            Err(Mpeg2tsWriteError {
+                error: Error::from_code(code),
+                consumed,
+            })
+        }
+    }
+
     /// End a finite track once its queued objects drain: a reliable
     /// END_OF_TRACK follows, which receivers see as the track ending.
     /// Idempotent. May fail with [`Error::WOULD_BLOCK`] while the queue is
-    /// full: retry.
+    /// full: retry. On a byte-stream MPEG-TS track it first queues the held
+    /// Objects and the packetizer's last ones (a [`Error::WOULD_BLOCK`] on
+    /// the way is retried the same way; [`Error::NOMEM`] lost one of them,
+    /// and calling again queues the END_OF_TRACK); there it belongs to the
+    /// track's writer thread.
     pub fn end_track(&self, track: SendTrack) -> Result<()> {
         let track = self.own(track)?;
         // SAFETY: a live sender and one of its handles.
@@ -960,6 +1148,69 @@ impl Sender {
                 None
             },
         })
+    }
+
+    /// One media track's statistics snapshot; [`Error::INVAL`] for a handle
+    /// that is not one of this sender's media tracks.
+    pub fn track_stats(&self, track: SendTrack) -> Result<TrackStats> {
+        let track = self.own(track)?;
+        let mut stats = sys::moq_media_sender_track_stats_t::default();
+        let size = mem::size_of_val(&stats);
+        // SAFETY: a live sender and one of its handles; a writable struct of
+        // exactly the size passed.
+        ffi::check(unsafe {
+            sys::moq_media_sender_get_track_stats(self.as_ptr(), track, &mut stats, size)
+        })?;
+        ffi::check_stamp(stats.struct_size, TRACK_STATS_V0, size)?;
+        Ok(TrackStats {
+            objects_written: stats.objects_written,
+            objects_sent: stats.objects_sent,
+            objects_queued: stats.objects_queued,
+            objects_dropped: stats.objects_dropped,
+            bytes_queued: stats.bytes_queued,
+            groups_dropped: stats.groups_dropped,
+            keyframes_dropped: stats.keyframes_dropped,
+            groups_abandoned: stats.groups_abandoned,
+            mpeg2ts: Mpeg2tsTrackStats {
+                groups: stats.mpeg2ts_groups,
+                objects: stats.mpeg2ts_objects,
+                packets_in: stats.mpeg2ts_packets_in,
+                packets_dropped_before_random_access: stats
+                    .mpeg2ts_packets_dropped_before_random_access,
+                max_group_27mhz: stats.mpeg2ts_max_group_27mhz,
+                groups_over_2s: stats.mpeg2ts_groups_over_2s,
+                peak_rate_bps: stats.mpeg2ts_peak_rate_bps,
+                source_pcr_discontinuities: stats.mpeg2ts_source_pcr_discontinuities,
+                mux_rate_below_peak: stats.mpeg2ts_mux_rate_below_peak,
+                program_gone: stats.mpeg2ts_program_gone,
+                objects_parked: stats.mpeg2ts_objects_parked,
+                partial_bytes_discarded: stats.mpeg2ts_partial_bytes_discarded,
+                continuation_objects_discarded: stats.mpeg2ts_continuation_objects_discarded,
+            },
+        })
+    }
+
+    /// Take the new-group request pending on a track added with
+    /// [`dynamic_groups`](SendTrackConfig::dynamic_groups): a subscriber
+    /// asked for a new group (NEW_GROUP_REQUEST, draft 22) with a value
+    /// that warrants one. The publisher should end the current group and
+    /// begin a new one as soon as practical: write the next object as a
+    /// group start (a sync object with `starts_group`). `Some` clears the
+    /// request and carries its value, the largest group the subscriber
+    /// knows plus one, or 0 when it knows none; requests that arrive before
+    /// it is taken coalesce into the latest. `None` when none is pending.
+    pub fn take_new_group_request(&self, track: SendTrack) -> Result<Option<u64>> {
+        let track = self.own(track)?;
+        let mut requested_group = 0;
+        // SAFETY: a live sender and one of its handles; any thread.
+        let code = unsafe {
+            sys::moq_media_sender_take_new_group_request(self.as_ptr(), track, &mut requested_group)
+        };
+        if code == sys::MOQ_DONE {
+            return Ok(None);
+        }
+        ffi::check(code)?;
+        Ok(Some(requested_group))
     }
 
     /// The namespace is accepted and the catalog published, so the publish

@@ -1,6 +1,9 @@
 //! Sender rows: configuration mapping through the sized presets, track
-//! configuration, write transfer and return, handle ownership, refusals,
-//! the stamped statistics and the demand queries.
+//! configuration (the MPEG-TS record and input, draft-22 track properties),
+//! write transfer and return with explicit metadata, MPEG-TS byte-stream
+//! writes and their consumed counts, handle ownership, refusals, the
+//! stamped statistics (sender-wide and per track), new-group requests and
+//! the demand queries.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,8 +11,9 @@ use std::time::Duration;
 
 use moq5::{
     Backpressure, Buffer, CmsfUrl, CompanionProfile, ContentProtection, DrmSystem, Endpoint,
-    EndpointConfig, Error, MediaType, Namespace, Packaging, SapType, SendObject, SendTrackConfig,
-    Sender, SenderConfig, WaitResult,
+    EndpointConfig, Error, LocMetadata, Marking, MediaType, Mpeg2tsInput, Mpeg2tsMode,
+    Mpeg2tsRecord, Mpeg2tsTimestampMode, Mpeg2tsWriteError, Namespace, Packaging, SapType,
+    SendObject, SendTrackConfig, Sender, SenderConfig, WaitResult,
 };
 use moq5_fake_tests as fake;
 use moq5_fake_tests::{sys, Suite};
@@ -600,4 +604,372 @@ fn sender_holds_its_endpoint() {
     assert!(s.take_log().is_empty());
     drop(sender);
     assert_eq!(s.take_log(), ["sender_destroy", "stop", "destroy"]);
+}
+
+fn sender(s: &Suite, endpoint: &Endpoint) -> Sender {
+    let sender = Sender::attach(endpoint, &SenderConfig::live(namespace()))
+        .expect("the provider accepts the sender attach");
+    s.take_log();
+    sender
+}
+
+fn transport_stream() -> SendTrackConfig {
+    SendTrackConfig::new("ts", MediaType::Video, Packaging::Mpeg2ts, "").bitrate(4_000_000)
+}
+
+#[test]
+fn add_track_maps_the_mpeg2ts_record_and_input() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    let mut record = Mpeg2tsRecord::new(Mpeg2tsMode::PerProgram, 192);
+    record.program_number = Some(7);
+    record.pcr_pid = Some(0x101);
+    record.mux_rate = Some(5_000_000);
+    record.si_pids = Some(vec![0x20, 0x21]);
+    record.random_access = Some(true);
+    record.timestamp_mode = Some(Mpeg2tsTimestampMode::ArrivalTime);
+    record.scte35_pid = Some(0x1F0);
+    let input = Mpeg2tsInput::ByteStream {
+        object_packets: 7,
+        min_group: Duration::from_millis(500),
+        forward_before_random_access: true,
+    };
+    sender
+        .add_track(&transport_stream().mpeg2ts(record.clone(), input))
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(
+        fake::field(&added, "packaging"),
+        sys::MOQ_MEDIA_PACKAGING_MPEG2TS.to_string()
+    );
+    assert_eq!(fake::field(&added, "extensions"), "1");
+    assert_eq!(
+        fake::field(&added, "mpeg2ts"),
+        format!(
+            "{}:192:-:7:257:5000000:32+33:1:{}:496:struct={}",
+            sys::MOQ_MSF_MPEG2TS_MODE_PER_PROGRAM,
+            sys::MOQ_MSF_MPEG2TS_TIMESTAMP_ARRIVAL_TIME,
+            std::mem::size_of::<sys::moq_msf_mpeg2ts_t>()
+        )
+    );
+    assert_eq!(fake::field(&added, "mpeg2ts_app_objects"), "0");
+    assert_eq!(fake::field(&added, "object_packets"), "7");
+    assert_eq!(fake::field(&added, "min_group_ms"), "500");
+    assert_eq!(fake::field(&added, "forward"), "1");
+
+    // App objects, and a record with only its required keys and an empty
+    // SI PID list (present, with no PID).
+    let mut bare = Mpeg2tsRecord::new(Mpeg2tsMode::UnmodifiedProgram, 188);
+    bare.si_pids = Some(Vec::new());
+    sender
+        .add_track(&transport_stream().mpeg2ts(bare, Mpeg2tsInput::AppObjects))
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(
+        fake::field(&added, "mpeg2ts"),
+        format!(
+            "{}:188:-:-:-:-:empty:-:-:-:struct={}",
+            sys::MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM,
+            std::mem::size_of::<sys::moq_msf_mpeg2ts_t>()
+        )
+    );
+    assert_eq!(fake::field(&added, "mpeg2ts_app_objects"), "1");
+    assert_eq!(fake::field(&added, "object_packets"), "0");
+
+    // The service defaults, and a track without the record.
+    sender
+        .add_track(&transport_stream().mpeg2ts(
+            Mpeg2tsRecord::new(Mpeg2tsMode::UnmodifiedProgram, 188),
+            Mpeg2tsInput::default(),
+        ))
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(fake::field(&added, "mpeg2ts_app_objects"), "0");
+    assert_eq!(fake::field(&added, "min_group_ms"), "0");
+    assert_eq!(fake::field(&added, "forward"), "0");
+    sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "add_track "), "mpeg2ts"),
+        "none"
+    );
+
+    // A minimum group finer than a millisecond, or beyond u32
+    // milliseconds, is refused before the service.
+    let adds = s.get("add_track");
+    for min_group in [
+        Duration::from_micros(1500),
+        Duration::from_millis(u64::from(u32::MAX) + 1),
+    ] {
+        let config = transport_stream().mpeg2ts(
+            Mpeg2tsRecord::new(Mpeg2tsMode::UnmodifiedProgram, 188),
+            Mpeg2tsInput::ByteStream {
+                object_packets: 0,
+                min_group,
+                forward_before_random_access: false,
+            },
+        );
+        assert_eq!(sender.add_track(&config).err(), Some(Error::INVAL));
+    }
+    assert_eq!(s.get("add_track"), adds);
+}
+
+#[test]
+fn add_track_maps_draft22_track_properties() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    sender
+        .add_track(
+            &video()
+                .track_properties(vec![0x04, 0x01, 0x30])
+                .dynamic_groups(true),
+        )
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(fake::field(&added, "track_properties"), "3");
+    assert_eq!(fake::field(&added, "properties"), "[040130]");
+    assert_eq!(fake::field(&added, "dynamic_groups"), "1");
+    sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(fake::field(&added, "properties"), "[]");
+    assert_eq!(fake::field(&added, "dynamic_groups"), "0");
+}
+
+#[test]
+fn write_carries_explicit_metadata() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    let track = sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    s.take_log();
+    RELEASES.store(0, Ordering::SeqCst);
+    let mut object = SendObject::new(counted_buffer());
+    object.metadata = Some(LocMetadata {
+        timestamp: Some(90),
+        timescale: Some(90_000),
+        marking: Some(Marking::new(&[0x20, 0x01]).expect("two bytes")),
+        audio_level: Some(0x85),
+        video_config: Some(vec![1, 2, 3]),
+        audio_config: Some(Vec::new()),
+    });
+    sender
+        .write(track, object)
+        .expect("the provider accepts the write");
+    let written = fake::line(&s.take_log(), "write ");
+    assert_eq!(fake::field(&written, "metadata"), "1");
+    assert_eq!(
+        fake::field(&written, "meta"),
+        format!(
+            "struct={}:loc_struct={}:present={}:ts=90:scale=90000:mark=2001:level=133:video=3:audio=0",
+            std::mem::size_of::<sys::moq_media_metadata_t>(),
+            std::mem::size_of::<sys::moq_loc_metadata_t>(),
+            sys::MOQ_LOC_METADATA_PRESENT_MASK
+        )
+    );
+    assert_eq!(
+        RELEASES.load(Ordering::SeqCst),
+        1,
+        "the payload transferred"
+    );
+    sender
+        .write(track, SendObject::new(counted_buffer()))
+        .expect("the provider accepts the write");
+    let written = fake::line(&s.take_log(), "write ");
+    assert_eq!(fake::field(&written, "metadata"), "0");
+    assert_eq!(fake::field(&written, "meta"), "none");
+
+    // A refused write hands the metadata back with the object.
+    s.set("write_result", i64::from(sys::MOQ_ERR_INVAL));
+    let mut object = SendObject::new(counted_buffer());
+    object.metadata = Some(LocMetadata {
+        timestamp: Some(1),
+        ..LocMetadata::default()
+    });
+    let failure = sender.write(track, object).unwrap_err();
+    assert_eq!(failure.error, Error::INVAL);
+    assert_eq!(
+        failure
+            .object
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.timestamp),
+        Some(1)
+    );
+}
+
+#[test]
+fn mpeg2ts_writes_report_what_they_took() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    let track = sender
+        .add_track(&transport_stream().mpeg2ts(
+            Mpeg2tsRecord::new(Mpeg2tsMode::UnmodifiedProgram, 188),
+            Mpeg2tsInput::default(),
+        ))
+        .expect("the provider accepts the track");
+    s.take_log();
+    let bytes = vec![0x47u8; 188 * 3];
+    assert_eq!(sender.write_mpeg2ts(track, &bytes, false), Ok(564));
+    assert_eq!(
+        s.take_log(),
+        [format!(
+            "write_mpeg2ts track=0 len=564 end_object=0 first=71 struct_size={}",
+            std::mem::size_of::<sys::moq_media_send_mpeg2ts_t>()
+        )]
+    );
+    // A short write is progress.
+    s.set("mpeg2ts_consumed", 188);
+    assert_eq!(sender.write_mpeg2ts(track, &bytes, true), Ok(188));
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "write_mpeg2ts "), "end_object"),
+        "1"
+    );
+    // Empty data queues held objects.
+    s.set("mpeg2ts_consumed", 0);
+    assert_eq!(sender.write_mpeg2ts(track, &[], false), Ok(0));
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "write_mpeg2ts "), "len"),
+        "0"
+    );
+    // Every failure carries what was taken before it: a refusal checked at
+    // entry takes nothing, and one latched while the call yielded between
+    // Objects reports the whole packets it took first.
+    for (code, taken) in [
+        (sys::MOQ_ERR_WOULD_BLOCK, -1),
+        (sys::MOQ_ERR_NOMEM, 376),
+        (sys::MOQ_ERR_PROTO, 188),
+        (sys::MOQ_ERR_WRONG_STATE, -1),
+        (sys::MOQ_ERR_UNSUPPORTED, -1),
+        (sys::MOQ_ERR_UNSUPPORTED, 376),
+        (sys::MOQ_ERR_CLOSED, -1),
+    ] {
+        s.set("write_mpeg2ts_result", i64::from(code));
+        s.set("mpeg2ts_consumed", taken);
+        assert_eq!(
+            sender.write_mpeg2ts(track, &bytes, false),
+            Err(Mpeg2tsWriteError {
+                error: Error::from_code(code),
+                consumed: taken.max(0) as usize,
+            })
+        );
+    }
+    s.set("write_mpeg2ts_result", 0);
+    s.set("mpeg2ts_consumed", 188);
+    endpoint.set_interrupted(true);
+    let failure = sender.write_mpeg2ts(track, &bytes, false).unwrap_err();
+    assert_eq!(
+        (failure.error, failure.consumed),
+        (Error::INTERRUPTED, 188),
+        "an interrupt reports the bytes taken before it"
+    );
+    assert_eq!(Error::from(failure), Error::INTERRUPTED);
+    endpoint.set_interrupted(false);
+    assert!(failure.to_string().contains("188"));
+
+    // A foreign track reports nothing taken and never reaches the service.
+    let other = sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    drop(sender);
+    let second = Sender::attach(&endpoint, &SenderConfig::live(namespace()))
+        .expect("the provider accepts the sender attach");
+    let writes = s.get("write_mpeg2ts");
+    assert_eq!(
+        second.write_mpeg2ts(other, &bytes, false),
+        Err(Mpeg2tsWriteError {
+            error: Error::INVAL,
+            consumed: 0
+        })
+    );
+    assert_eq!(s.get("write_mpeg2ts"), writes);
+}
+
+#[test]
+fn track_stats_are_read_under_the_stamp() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    let track = sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    s.set("track_stats_parked", 2);
+    s.set("track_stats_program_gone", 1);
+    let stats = sender
+        .track_stats(track)
+        .expect("stats of one of the sender's tracks");
+    assert_eq!(
+        (
+            stats.objects_written,
+            stats.objects_sent,
+            stats.objects_queued,
+            stats.objects_dropped
+        ),
+        (9, 5, 3, 1)
+    );
+    assert_eq!(
+        stats.objects_written,
+        stats.objects_sent + stats.objects_queued + stats.objects_dropped
+    );
+    assert_eq!(stats.bytes_queued, 600);
+    assert_eq!((stats.groups_dropped, stats.keyframes_dropped), (1, 1));
+    assert_eq!(stats.groups_abandoned, 2);
+    let ts = stats.mpeg2ts;
+    assert_eq!((ts.groups, ts.objects, ts.packets_in), (4, 12, 48));
+    assert_eq!(ts.packets_dropped_before_random_access, 3);
+    assert_eq!(ts.max_group_27mhz, 27_000_000);
+    assert_eq!(ts.groups_over_2s, 0);
+    assert_eq!(ts.peak_rate_bps, 4_000_000);
+    assert_eq!(ts.source_pcr_discontinuities, 1);
+    assert!(ts.mux_rate_below_peak);
+    assert!(ts.program_gone);
+    assert_eq!(ts.objects_parked, 2);
+    assert_eq!(ts.partial_bytes_discarded, 7);
+    assert_eq!(ts.continuation_objects_discarded, 2);
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "track_stats "), "out_size"),
+        std::mem::size_of::<sys::moq_media_sender_track_stats_t>().to_string()
+    );
+    let full = std::mem::size_of::<sys::moq_media_sender_track_stats_t>();
+    s.set("track_stats_stamp", (full - 1) as i64);
+    assert_eq!(sender.track_stats(track), Err(Error::ABI_MISMATCH));
+    s.set("track_stats_stamp", 9999);
+    assert_eq!(sender.track_stats(track), Err(Error::ABI_MISMATCH));
+    s.set("track_stats_stamp", 0);
+    s.set("track_stats_result", i64::from(sys::MOQ_ERR_INVAL));
+    assert_eq!(sender.track_stats(track), Err(Error::INVAL));
+}
+
+#[test]
+fn new_group_requests_are_taken_once() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    let track = sender
+        .add_track(&video().dynamic_groups(true))
+        .expect("the provider accepts the track");
+    s.take_log();
+    assert_eq!(sender.take_new_group_request(track), Ok(None));
+    s.set("new_group_pending", 1);
+    s.set("new_group_value", 0);
+    assert_eq!(
+        sender.take_new_group_request(track),
+        Ok(Some(0)),
+        "zero: the subscriber knows no group"
+    );
+    assert_eq!(sender.take_new_group_request(track), Ok(None), "cleared");
+    s.set("new_group_pending", 1);
+    s.set("new_group_value", 1 << 61);
+    assert_eq!(sender.take_new_group_request(track), Ok(Some(1 << 61)));
+    assert_eq!(
+        s.take_log().first().map(String::as_str),
+        Some("take_new_group_request track=0 out=1")
+    );
 }

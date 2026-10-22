@@ -3,10 +3,17 @@
 //! This crate wraps libmoq's *service tier*: a managed [`Endpoint`]
 //! (connection, MoQ session and network thread), a [`Sender`] that
 //! publishes a namespace with an MSF/CMSF catalog, and a [`Receiver`] that
-//! discovers and receives one. The raw C API stays available as [`sys`]
-//! (the `moq5-sys` crate), whose header comments are the contract; its
-//! generated names are used qualified (`sys::moq_endpoint_cfg_t`) rather
-//! than imported, as one large group of generated types.
+//! discovers and receives one. MPEG-TS tracks are written as transport
+//! streams ([`Sender::write_mpeg2ts`]) and described by their records
+//! ([`Mpeg2tsRecordRef`]); on draft 22, objects carry their LOC-04 metadata
+//! ([`ObjectMetadata`]) and their track's Track Properties, and a
+//! subscription can ask for a fill of what a relay retains
+//! ([`FillOptions`]). With the `player` feature, the `player` module plays
+//! a receiver's tracks for the application's decoders. The raw C API stays
+//! available as [`sys`] (the `moq5-sys` crate), whose header comments are
+//! the contract; its generated names are used qualified
+//! (`sys::moq_endpoint_cfg_t`) rather than imported, as one large group of
+//! generated types.
 //!
 //! What the types enforce that C leaves to documentation:
 //!
@@ -27,8 +34,9 @@
 //!   copied under the receiver's lock; nothing reads the mutable native
 //!   description concurrently with the service.
 //! - **Threading.** [`Endpoint`] is `Send + Sync` (interrupting from another
-//!   thread is the point of its latch); senders and receivers are `Send` but
-//!   not `Sync`; media objects stay on the polling thread; buffers move.
+//!   thread is the point of its latch); senders, receivers and players are
+//!   `Send` but not `Sync`; media objects and player outputs stay on the
+//!   polling thread (an output borrows its player); buffers move.
 //!
 //! **No application code runs on the service's threads.** This crate
 //! installs no C callbacks, posts no tasks, and adopts no buffer whose
@@ -69,6 +77,12 @@
 //! # }
 //! ```
 //!
+//! # Features
+//!
+//! - `player`: the `player` module, over `moq5-sys`'s player bindings. It
+//!   needs an SDK built with the player (`MOQ_BUILD_PLAYBACK=ON`) and fails
+//!   the build without one.
+//!
 //! # Linking
 //!
 //! `moq5-sys` finds the installed SDK through pkg-config (`libmoq-service`);
@@ -84,29 +98,39 @@ pub mod cmaf;
 mod endpoint;
 mod error;
 mod ffi;
+mod metadata;
+mod mpeg2ts;
 mod namespace;
+#[cfg(feature = "player")]
+pub mod player;
 mod receiver;
 mod sender;
 mod types;
 
-pub use buffer::Buffer;
+pub use buffer::{Buffer, SliceError};
 pub use endpoint::{
     AuthToken, Backend, Endpoint, EndpointConfig, EndpointState, Protocol, Terminal,
     TerminalReason, UriMode, VersionOffer, WtProfile,
 };
 pub use error::{Error, Result};
+pub use metadata::{LocMetadata, Marking, ObjectMetadata};
+pub use mpeg2ts::{
+    Mpeg2tsInput, Mpeg2tsKeys, Mpeg2tsMode, Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode,
+    Mpeg2tsTrackStats, Mpeg2tsWriteError, TrackExtension,
+};
 pub use namespace::Namespace;
 pub use receiver::{
-    ContentProtectionRef, FillLoss, FillTerminal, LossReport, MediaObject, MediaTemplate,
-    ObjectIdentity, ParseDrop, ParseDropClass, Receiver, ReceiverConfig, ReceiverStats, SapRecord,
-    StartMode, StreamTerminal, StreamTerminalKind, SubscribeOptions, TimeMode, TimelineRecord,
-    Track, TrackDescription, TrackEvent, TrackEventKind, TrackState,
+    ContentProtectionRef, FillError, FillLoss, FillOptions, FillReason, FillTerminal, LossReport,
+    MediaObject, MediaTemplate, ObjectIdentity, OverflowPolicy, ParseDrop, ParseDropClass,
+    PollWithin, Receiver, ReceiverConfig, ReceiverInfo, ReceiverStats, SapRecord, StartMode,
+    StreamTerminal, StreamTerminalKind, SubscribeOptions, TimeMode, TimelineRecord, Track,
+    TrackDescription, TrackEvent, TrackEventKind, TrackState,
 };
 pub use sender::{
     Backpressure, CmsfUrl, ContentProtection, DrmSystem, SendObject, SendTrack, SendTrackConfig,
-    Sender, SenderConfig, SenderStats, WriteError,
+    Sender, SenderConfig, SenderStats, TrackStats, WriteError,
 };
 pub use types::{
-    libmoq_version, CompanionProfile, DeliveryOrigin, Location, MediaType, ObjectStatus, Packaging,
-    SapType, Version, WaitResult,
+    libmoq_version, CompanionProfile, DeliveryOrigin, GroupOrder, Location, LocationFilter,
+    MediaType, ObjectStatus, Packaging, SapType, TimeDomain, Version, WaitResult,
 };
