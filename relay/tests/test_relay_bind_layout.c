@@ -81,6 +81,18 @@ typedef struct b_conn_baseline {
     b_usub_t      *usubs;
     b_pub_t       *pubs;
     b_ann_t       *anns;
+    b_cadv_t      *cluster_adverts;
+    uint64_t      *cluster_paths;
+    bool           cluster_peer_ready;
+    bool           cluster_negotiated;
+    bool           cluster_cost_override;
+    bool           cluster_discovery_closed;
+    bool           cluster_discovery_retiring;
+    bool           cluster_discovery_cancel_owed;
+    uint64_t       cluster_cost;
+    uint64_t       cluster_correlation;
+    uint64_t       cluster_peer_hop;
+    moq_ns_sub_handle_t cluster_discovery;
     b_fetch_t     *fetches;
     b_refusal_t   *refusals;
     uint32_t       refusals_reserved;

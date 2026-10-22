@@ -5,6 +5,8 @@
 
 /* Private error domain: a request refusal, not a session protocol error. */
 #define MOQ_D22_ERR_INVALID_FILTER (-201)
+#define MOQ_D22_HOP_PATH UINT64_C(0x40B57)
+#define MOQ_D22_ROUTE_COST UINT64_C(0x40B58)
 #define MOQ_D22_PARAM_PRESENT(type) (UINT64_C(1) << (type))
 
 typedef enum moq_d22_param_scope {
@@ -28,7 +30,8 @@ typedef enum moq_d22_param_scope {
     MOQ_D22_SCOPE_UPDATE_PUBLISH_NAMESPACE,
     MOQ_D22_SCOPE_UPDATE_SUBSCRIBE_NAMESPACE,
     MOQ_D22_SCOPE_UPDATE_SUBSCRIBE_TRACKS,
-    MOQ_D22_SCOPE_FILL
+    MOQ_D22_SCOPE_FILL,
+    MOQ_D22_SCOPE_NAMESPACE
 } moq_d22_param_scope_t;
 
 typedef struct moq_d22_location {
@@ -67,6 +70,8 @@ typedef struct moq_d22_range_filter {
 
 typedef struct moq_d22_param {
     uint64_t type;
+    const uint64_t *hop_ids; /* encode only: semantic path, otherwise encoded span */
+    size_t hop_count;
     union {
         uint64_t integer; /* also uint8 parameters; checked on encode */
         moq_d22_location_t location;
@@ -74,6 +79,7 @@ typedef struct moq_d22_param {
         moq_d22_token_t token;
         moq_d22_range_filter_t ranges;
         moq_d22_namespace_t ns;
+        moq_bytes_t hop_path; /* validated, encoded vi64 sequence */
         moq_bytes_t fill; /* the length-prefixed value: count, then parameters */
     } value;
 } moq_d22_param_t;
@@ -86,7 +92,11 @@ typedef struct moq_d22_params {
     uint64_t count;
     uint64_t present;
     uint64_t range_count;
+    bool has_hop_path;
+    bool has_route_cost;
 } moq_d22_params_t;
+
+moq_result_t moq_d22_validate_hop_path(moq_bytes_t path);
 
 /* Streaming functions conserve cursor, previous value and output on failure.
  * A truncated streaming prefix is BUFFER. Bounded token/range/fill interiors

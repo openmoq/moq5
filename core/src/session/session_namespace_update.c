@@ -25,6 +25,9 @@ static void ns_update_free_prefix(moq_session_t *s, uint8_t **buf, size_t *buf_l
 
 void ns_update_clear_owed(moq_session_t *s, moq_ns_update_t *u)
 {
+    size_t charge = u->owed_cluster.hop_count * sizeof(uint64_t);
+    s->recv_payload_bytes = charge <= s->recv_payload_bytes ? s->recv_payload_bytes - charge : 0;
+    session_cluster_free(s, &u->owed_cluster);
     ns_update_free_prefix(s, &u->owed_prefix_buf, &u->owed_prefix_buf_len,
                           &u->owed_prefix_parts, &u->owed_prefix_count);
     if (u->owed_token_bytes)
@@ -41,6 +44,7 @@ void ns_update_clear_owed(moq_session_t *s, moq_ns_update_t *u)
 
 void ns_update_clear_outstanding(moq_session_t *s, moq_ns_update_t *u)
 {
+    session_cluster_free(s, &u->out_cluster);
     ns_update_free_prefix(s, &u->out_prefix_buf, &u->out_prefix_buf_len,
                           &u->out_prefix_parts, &u->out_prefix_count);
     u->outstanding = false;
@@ -79,6 +83,26 @@ static moq_result_t ns_update_store_owed(moq_session_t *s, moq_ns_update_t *u,
             return MOQ_ERR_NOMEM;
         }
     }
+    moq_cluster_metadata_t cluster = {0};
+    moq_result_t rc = session_cluster_decode(s, d->cluster_hop_path, d->cluster_has_route_cost,
+                                             d->cluster_route_cost, &cluster);
+    if (rc < 0) {
+        if (tbuf)
+            s->alloc.free(tbuf, total, s->alloc.ctx);
+        moq_prefix_free(s, &pbuf, &pbuf_len, &pparts, &pcount);
+        return rc;
+    }
+    size_t charge = cluster.hop_count * sizeof(uint64_t);
+    if (s->recv_payload_bytes > s->max_recv_buf ||
+        charge > s->max_recv_buf - s->recv_payload_bytes) {
+        session_cluster_free(s, &cluster);
+        if (tbuf)
+            s->alloc.free(tbuf, total, s->alloc.ctx);
+        moq_prefix_free(s, &pbuf, &pbuf_len, &pparts, &pcount);
+        return close_with_error(s, 0x1, "namespace update path exceeds receive budget");
+    }
+    s->recv_payload_bytes += charge;
+    u->owed_cluster = cluster;
     u->owed = true;
     u->owed_request_id = d->request_id;
     u->owed_flags = (d->has_prefix ? MOQ_NAMESPACE_UPDATE_PREFIX : 0) |
@@ -120,6 +144,7 @@ void ns_update_fill_record(const moq_ns_update_t *u,
     rec->forward = u->owed_forward;
     rec->tokens = u->owed_token_count ? u->owed_tokens : NULL;
     rec->token_count = u->owed_token_count;
+    rec->cluster = u->owed_cluster;
 }
 
 /* The record, its prefix and its tokens copied into event scratch, borrowed
@@ -134,6 +159,8 @@ static moq_result_t ns_update_stage_record(moq_session_t *s, const moq_ns_update
                                     _Alignof(moq_namespace_update_record_t));
     if (!rec) goto short_scratch;
     ns_update_fill_record(u, rec);
+    if (session_cluster_event(s, &u->owed_cluster, &rec->cluster) < 0)
+        goto short_scratch;
     if (u->owed_flags & MOQ_NAMESPACE_UPDATE_PREFIX) {
         moq_namespace_t copy;
         if (!event_scratch_copy_namespace(s, &rec->track_namespace_prefix, &copy))
@@ -207,11 +234,12 @@ moq_result_t ns_update_push_request_event(moq_session_t *s,
     return rc;
 }
 
-moq_result_t ns_update_push_result_event(moq_session_t *s,
-    moq_request_family_t family, uint64_t handle_raw, uint64_t update_request_id,
-    moq_namespace_update_outcome_t outcome, moq_request_role_t role,
-    uint64_t error_code, const uint8_t *reason, size_t reason_len,
-    bool has_expires, uint64_t expires_ms)
+moq_result_t ns_update_push_result_event(moq_session_t *s, moq_request_family_t family,
+                                         uint64_t handle_raw, uint64_t update_request_id,
+                                         moq_namespace_update_outcome_t outcome,
+                                         moq_request_role_t role, uint64_t error_code,
+                                         const uint8_t *reason, size_t reason_len, bool has_expires,
+                                         uint64_t expires_ms, const moq_cluster_metadata_t *cluster)
 {
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     size_t saved = s->event_scratch_len;
@@ -239,6 +267,15 @@ moq_result_t ns_update_push_result_event(moq_session_t *s,
     x->reason = r;
     x->has_expires = has_expires;
     x->expires_ms = has_expires ? expires_ms : 0;
+    if (cluster && family == MOQ_REQUEST_FAMILY_ANNOUNCEMENT) {
+        moq_result_t rc = session_cluster_event(s, cluster, &x->cluster);
+        if (rc < 0) {
+            s->event_scratch_len = saved;
+            if (rc == MOQ_ERR_BUFFER)
+                return close_with_error(s, 0x1, "event scratch permanently too small");
+            return rc;
+        }
+    }
     switch (family) {
     case MOQ_REQUEST_FAMILY_ANNOUNCEMENT:
         ev.kind = MOQ_EVENT_NAMESPACE_UPDATE_RESULT;
@@ -259,15 +296,15 @@ moq_result_t ns_update_push_result_event(moq_session_t *s,
 }
 
 _Static_assert(offsetof(moq_namespace_update_result_event_t, update_request_id) ==
-               offsetof(moq_ns_sub_update_result_event_t, update_request_id) &&
-               offsetof(moq_namespace_update_result_event_t, expires_ms) ==
-               offsetof(moq_ns_sub_update_result_event_t, expires_ms) &&
-               sizeof(moq_namespace_update_result_event_t) ==
-               sizeof(moq_ns_sub_update_result_event_t) &&
-               offsetof(moq_namespace_update_result_event_t, expires_ms) ==
-               offsetof(moq_subscribe_tracks_update_result_event_t, expires_ms) &&
-               sizeof(moq_namespace_update_result_event_t) ==
-               sizeof(moq_subscribe_tracks_update_result_event_t),
+                       offsetof(moq_ns_sub_update_result_event_t, update_request_id) &&
+                   offsetof(moq_namespace_update_result_event_t, expires_ms) ==
+                       offsetof(moq_ns_sub_update_result_event_t, expires_ms) &&
+                   offsetof(moq_namespace_update_result_event_t, cluster) ==
+                       sizeof(moq_ns_sub_update_result_event_t) &&
+                   offsetof(moq_namespace_update_result_event_t, expires_ms) ==
+                       offsetof(moq_subscribe_tracks_update_result_event_t, expires_ms) &&
+                   offsetof(moq_namespace_update_result_event_t, cluster) ==
+                       sizeof(moq_subscribe_tracks_update_result_event_t),
                "the namespace update results share one layout");
 
 moq_result_t ns_update_owed_query(const moq_ns_update_t *u,
@@ -315,6 +352,10 @@ moq_result_t ns_update_admit(moq_session_t *s, moq_request_family_t family,
         return rc;
     }
     a->staged = true;
+    if (!s->cluster_negotiated && (a->d.cluster_hop_path.len || a->d.cluster_has_route_cost)) {
+        ns_update_admission_abort(s, a);
+        return close_with_error(s, 0x3, "cluster update without negotiation");
+    }
     a->refuse_code = reject ? reject
                    : invalid_filter ? MOQ_REQUEST_ERROR_INVALID_FILTER : 0;
     return MOQ_OK;
@@ -343,7 +384,8 @@ moq_result_t ns_update_defer(moq_session_t *s, moq_request_family_t family,
 {
     if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
     moq_result_t rc = ns_update_store_owed(s, u, &a->d, a->tokens, a->token_count);
-    if (rc < 0) return rc;
+    if (rc < 0 || s->state == MOQ_SESS_CLOSED)
+        return rc;
     rc = ns_update_push_request_event(s, family, handle_raw, u);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
         ns_update_clear_owed(s, u);
@@ -437,6 +479,16 @@ moq_result_t ns_update_cfg_read(const moq_session_t *s,
     }
     out->auth_tokens = cfg->auth_token_count ? cfg->auth_tokens : NULL;
     out->auth_token_count = cfg->auth_token_count;
+    if (cfg->struct_size >= offsetof(moq_namespace_update_cfg_t, cluster) + sizeof(cfg->cluster))
+        out->cluster = cfg->cluster;
+    if (out->cluster.hop_count || out->cluster.has_route_cost) {
+        if (family != MOQ_REQUEST_FAMILY_ANNOUNCEMENT)
+            return MOQ_ERR_INVAL;
+        if (!s->cluster_negotiated)
+            return MOQ_ERR_UNSUPPORTED;
+        if (session_cluster_validate(&out->cluster, false) < 0)
+            return MOQ_ERR_INVAL;
+    }
     return MOQ_OK;
 }
 
@@ -450,7 +502,7 @@ moq_result_t ns_update_send(moq_session_t *s, moq_stream_ref_t ref,
     if (rc < 0) return rc;
     args->request_id = ep.request_id;
     size_t saved = s->output_scratch_len;
-    size_t bound = 64 + 9 * MOQ_DECODED_MAX_TOKENS;
+    size_t bound = 64 + 9 * MOQ_DECODED_MAX_TOKENS + 9 * args->cluster.hop_count;
     if (args->has_prefix) {
         bound += 9;
         for (size_t i = 0; i < args->prefix.count; i++)
@@ -481,14 +533,24 @@ moq_result_t ns_update_send(moq_session_t *s, moq_stream_ref_t ref,
         s->profile->abort_request(s, &ep);
         return MOQ_ERR_NOMEM;
     }
+    moq_cluster_metadata_t cluster = {0};
+    rc = session_cluster_copy(s, &args->cluster, &cluster);
+    if (rc < 0) {
+        moq_prefix_free(s, &pbuf, &pbuf_len, &pparts, &pcount);
+        s->output_scratch_len = saved;
+        s->profile->abort_request(s, &ep);
+        return rc;
+    }
     rc = queue_send_bidi(s, ref, buf, moq_buf_writer_offset(&w), false);
     s->output_scratch_len = saved;
     if (rc < 0) {
+        session_cluster_free(s, &cluster);
         moq_prefix_free(s, &pbuf, &pbuf_len, &pparts, &pcount);
         s->profile->abort_request(s, &ep);
         return rc;
     }
     s->profile->commit_request(s, &ep);
+    u->out_cluster = cluster;
     u->outstanding = true;
     u->out_request_id = ep.request_id;
     u->out_flags = (args->has_prefix ? MOQ_NAMESPACE_UPDATE_PREFIX : 0) |

@@ -156,6 +156,14 @@ static moq_result_t accept_setup_option(moq_d22_setup_options_t *s,
     case 7:
         present = &s->has_implementation; s->implementation = kvp->bytes;
         break;
+    case UINT64_C(0x40B54):
+        present = &s->has_hop_id;
+        s->hop_id = kvp->integer;
+        break;
+    case UINT64_C(0x40B56):
+        present = &s->has_relay_cost;
+        s->relay_cost = kvp->integer;
+        break;
     case 8:
         present = &s->has_max_request_updates;
         s->max_request_updates = kvp->integer;

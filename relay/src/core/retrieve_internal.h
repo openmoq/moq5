@@ -61,6 +61,14 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_retrieve_open(
     moqr_core_t *core, moqr_binding_t binding, const moqr_fetch_req_t *req,
     uint64_t now_us, moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan);
 
+/* Same admission with original source generation and requester identity pinned
+ * across a shard mailbox. Never admits cached data from another publisher. */
+MOQR_CORE_API moqr_result_t moqr_core_internal_retrieve_open_cluster(
+    moqr_core_t *core, moqr_binding_t binding, const moqr_fetch_req_t *req,
+    uint64_t source_binding_cookie, uint64_t source_route_generation,
+    uint64_t requester_hop_id, uint64_t requester_correlation_id,
+    uint64_t now_us, moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan);
+
 /*
  * Move the owner's view to [start .. end] (inclusive, end_object UINT64_MAX
  * for the whole end group), which must lie inside the admitted range. Drops
@@ -103,6 +111,12 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_delivery_flags(
  * at or after a deadline never resumes that subscription. */
 MOQR_CORE_API moqr_result_t moqr_core_internal_rendezvous_expire(moqr_core_t *core,
                                                                  uint64_t now_us);
+
+/* True only for the same retained track immediately after one ordinary
+ * source release. Permits queued old OPEN cleanup after idle linger, while
+ * refusing active/pending replacement generations and replaced track handles. */
+MOQR_CORE_API bool moqr_core_internal_source_idle(const moqr_core_t *core,
+    moqr_track_t track, uint64_t old_source_gen);
 
 /* The immediate end of a failed source for when moqr_core_source_done
  * cannot queue its terminals (MOQR_ERR_WOULD_BLOCK that a drain did not

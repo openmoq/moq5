@@ -168,6 +168,13 @@ MOQR_API moqr_result_t moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                                           const moqr_core_limits_t *core_limits,
                                           moqr_bind_capacity_t *out);
 
+/* Capacity planning before a core exists: pass the immutable resolved
+ * cluster configuration from moqr_cluster_cfg_resolve. The ordinary describe
+ * function uses cfg->core when supplied, otherwise describes legacy mode. */
+MOQR_API moqr_result_t moqr_bind_cluster_capacity_describe(
+    const moqr_bind_cfg_t *cfg, const moqr_core_limits_t *core_limits,
+    const moqr_cluster_info_t *cluster, moqr_bind_capacity_t *out);
+
 MOQR_API moqr_result_t moqr_bind_create(const moqr_bind_cfg_t *cfg,
                                moqr_bind_t **out);
 /* Memory-only destruction: no session/core calls, transport shutdown or
@@ -199,6 +206,21 @@ MOQR_API void moqr_bind_destroy(moqr_bind_t *b);
  */
 MOQR_API moqr_result_t moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
                                   moq_version_t version);
+
+/* Optional local policy for an attached cluster peer. Correlation identities
+ * are local-only and must name only connections known to be one endpoint.
+ * A configured cost overrides that peer's asserted RELAY_COST, including zero.
+ * Configure at attachment, before any route or subscription uses the peer. */
+typedef struct moqr_bind_cluster_peer_cfg {
+    uint32_t struct_size;
+    bool has_relay_cost;
+    uint64_t relay_cost;
+    uint64_t correlation_id;
+} moqr_bind_cluster_peer_cfg_t;
+
+MOQR_API moqr_result_t moqr_bind_conn_open_cluster(moqr_bind_t *b,
+    moq_session_t *session, moq_version_t version,
+    const moqr_bind_cluster_peer_cfg_t *cfg, size_t cfg_size);
 
 /* This connection's negotiated draft, or MOQ_VERSION_DRAFT_16 if unattached. */
 MOQR_API moq_version_t moqr_bind_conn_version(const moqr_bind_t *b,

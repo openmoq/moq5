@@ -81,7 +81,7 @@ static moq_result_t d22_start(moq_session_t *s)
     const moq_transport_binding_t *binding = &s->binding.value;
     bool target = binding->kind == MOQ_BINDING_RAW_QUIC &&
                   s->perspective == MOQ_PERSPECTIVE_CLIENT;
-    moq_d22_kvp_t options[5 + MOQ_DECODED_MAX_TOKENS];
+    moq_d22_kvp_t options[7 + MOQ_DECODED_MAX_TOKENS];
     size_t n = 0;
     if (target) {
         options[n].type = D22_OPT_PATH;
@@ -111,6 +111,12 @@ static moq_result_t d22_start(moq_session_t *s)
     options[n].type = D22_OPT_MAX_REQUEST_UPDATES;
     options[n].integer = D22_LOCAL_MAX_REQUEST_UPDATES;
     n++;
+    if (s->cluster_enabled) {
+        options[n++] = (moq_d22_kvp_t){.type = UINT64_C(0x40B54), .integer = s->cluster_hop_id};
+        if (s->cluster_has_relay_cost)
+            options[n++] =
+                (moq_d22_kvp_t){.type = UINT64_C(0x40B56), .integer = s->cluster_relay_cost};
+    }
     /* Setup Options are delta-typed key-value pairs behind a 16-bit Length;
      * the body is sized before anything is written. */
     size_t body = 0;
@@ -236,8 +242,14 @@ static moq_result_t d22_handle_setup(moq_session_t *s,
     peer.implementation = opts.implementation;
     p->peer_max_filter_ranges = opts.has_max_filter_ranges ? opts.max_filter_ranges : 0;
     p->peer_max_request_updates = opts.has_max_request_updates ? opts.max_request_updates : 0;
-    return session_setup_complete_peer(s, &workspace, &peer,
-                                       &p->setup_received, p->setup_sent);
+    rc = session_setup_complete_peer(s, &workspace, &peer, &p->setup_received, p->setup_sent);
+    if (rc == MOQ_OK && p->setup_received && s->state != MOQ_SESS_CLOSED) {
+        s->cluster_negotiated = s->cluster_enabled && opts.has_hop_id;
+        s->cluster_peer_hop_id = opts.has_hop_id ? opts.hop_id : 0;
+        s->cluster_peer_has_relay_cost = opts.has_relay_cost;
+        s->cluster_peer_relay_cost = opts.has_relay_cost ? opts.relay_cost : 1;
+    }
+    return rc;
 }
 
 /* GOAWAY on the control stream (§9.2): New Session URI and Timeout, no
@@ -350,6 +362,9 @@ typedef struct d22_scalars {
     bool has_fill_timeout; uint64_t fill_timeout_ms;
     bool has_rendezvous_timeout; uint64_t rendezvous_timeout_ms;
     bool has_prefix; moq_d22_namespace_t prefix;
+    moq_bytes_t hop_path;
+    bool has_route_cost;
+    uint64_t route_cost;
 } d22_scalars_t;
 
 /* Walk a validated parameter sequence. Tokens go to tk when given. */
@@ -367,6 +382,13 @@ static moq_result_t d22_scan(const moq_d22_params_t *ps, d22_scalars_t *out,
         moq_result_t rc = moq_d22_param_next_scanned(&r, &prev, &pv);
         if (rc != MOQ_OK) return MOQ_ERR_PROTO;
         switch (pv.type) {
+        case MOQ_D22_HOP_PATH:
+            out->hop_path = pv.value.hop_path;
+            break;
+        case MOQ_D22_ROUTE_COST:
+            out->has_route_cost = true;
+            out->route_cost = pv.value.integer;
+            break;
         case D22_PARAM_FORWARD:
             out->has_forward = true; out->forward = pv.value.integer != 0; break;
         case D22_PARAM_SUBSCRIBER_PRIORITY:
@@ -767,6 +789,9 @@ static moq_result_t d22_rq_publish_namespace(const uint8_t *p, size_t n,
     rc = d22_ns_parts(&m.ns, d->track_namespace_parts, MOQ_DECODED_MAX_NAMESPACE_PARTS,
                       &d->track_namespace);
     if (rc < 0) return rc;
+    d->cluster_hop_path = v.hop_path;
+    d->cluster_has_route_cost = v.has_route_cost;
+    d->cluster_route_cost = v.route_cost;
     d->request_id = m.request_id;
     *request_id = m.request_id;
     return MOQ_OK;
@@ -911,6 +936,9 @@ static moq_result_t d22_rq_namespace_update(const uint8_t *p, size_t n,
     }
     out->has_forward = v.has_forward;
     out->forward = v.forward;
+    out->cluster_hop_path = v.hop_path;
+    out->cluster_has_route_cost = v.has_route_cost;
+    out->cluster_route_cost = v.route_cost;
     return invalid_filter ? MOQ_REQUEST_DECODE_INVALID_FILTER : MOQ_OK;
 }
 
@@ -1246,6 +1274,17 @@ static moq_result_t d22_pb_fill(d22_pb_t *b, const moq_fill_input_t *f,
     return MOQ_OK;
 }
 
+static void d22_pb_cluster(d22_pb_t *b, const moq_cluster_metadata_t *m)
+{
+    if (m->hop_count) {
+        moq_d22_param_t p = {
+            .type = MOQ_D22_HOP_PATH, .hop_ids = m->hop_ids, .hop_count = m->hop_count};
+        d22_pb_add(b, &p);
+    }
+    if (m->has_route_cost)
+        d22_pb_int(b, MOQ_D22_ROUTE_COST, m->route_cost);
+}
+
 /* Namespace scratch: the codec takes an already encoded namespace. */
 typedef struct d22_ns_scratch { uint8_t buf[4096 + 64]; } d22_ns_scratch_t;
 
@@ -1566,6 +1605,7 @@ static moq_result_t d22_encode_publish_namespace(moq_session_t *s, struct moq_bu
     d22_pb_t b = { .n = 0 };
     rc = d22_pb_tokens(&b, args->auth_tokens, args->auth_token_count);
     if (rc < 0) return rc;
+    d22_pb_cluster(&b, &args->cluster);
     return d22_emit(w, &m, &b, 0, false);
 }
 
@@ -1774,7 +1814,10 @@ static moq_result_t d22_encode_namespace_msg(moq_session_t *s, struct moq_buf_wr
     m.type = args->is_done ? MOQ_D22_NAMESPACE_DONE : MOQ_D22_NAMESPACE;
     moq_result_t rc = d22_set_ns(&m, &args->suffix, &sc);
     if (rc < 0) return rc;
-    return d22_emit(w, &m, NULL, 0, false);
+    d22_pb_t b = {.n = 0};
+    d22_pb_cluster(&b, &args->cluster);
+    moq_d22_message_context_t ctx = {.cluster = s->cluster_negotiated};
+    return moq_d22_encode_message(w, &m, b.p, b.n, &ctx);
 }
 
 static moq_result_t d22_encode_subscribe_tracks(moq_session_t *s, struct moq_buf_writer *w,
@@ -1841,6 +1884,7 @@ static moq_result_t d22_encode_namespace_update(moq_session_t *s, struct moq_buf
     }
     moq_result_t rc = d22_pb_tokens(&b, args->auth_tokens, args->auth_token_count);
     if (rc < 0) return rc;
+    d22_pb_cluster(&b, &args->cluster);
     return d22_emit(w, &m, &b, family_type, true);
 }
 
@@ -1994,12 +2038,22 @@ static moq_result_t d22_decode_ns_sub_response(moq_session_t *s, const uint8_t *
     }
     switch (env.msg_type) {
     case MOQ_D22_NAMESPACE:
-    case MOQ_D22_NAMESPACE_DONE:
-        rc = d22_decode(env.msg_type, env.payload, env.payload_len, 0, false, &m);
+    case MOQ_D22_NAMESPACE_DONE: {
+        moq_d22_message_context_t ctx = {.cluster = s->cluster_negotiated};
+        rc = moq_d22_decode_message(env.msg_type, env.payload, env.payload_len, &ctx, &m);
+    }
         if (rc < 0 || d22_ns_parts(&m.ns, out->parts_buf, MOQ_DECODED_NS_SUB_MAX_PARTS,
                                    &out->suffix) < 0) {
             out->close_reason = "malformed namespace suffix on bidi stream";
             return MOQ_ERR_PROTO;
+        }
+        if (env.msg_type == MOQ_D22_NAMESPACE && s->cluster_negotiated) {
+            d22_scalars_t values;
+            if (d22_scan(&m.params, &values, NULL) != MOQ_OK || !values.hop_path.len)
+                return MOQ_ERR_PROTO;
+            out->cluster_hop_path = values.hop_path;
+            out->cluster_has_route_cost = values.has_route_cost;
+            out->cluster_route_cost = values.route_cost;
         }
         out->kind = (env.msg_type == MOQ_D22_NAMESPACE)
             ? MOQ_NS_RESP_NAMESPACE : MOQ_NS_RESP_NAMESPACE_DONE;
@@ -2259,6 +2313,7 @@ static const moq_profile_ops_t d22_ops = {
     .capacity_request_error           = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD,
     .capacity_request_error_retryable = true,
     .reserved_session_namespaces      = true,
+    .cluster_metadata                 = true,
     .relative_group_clamps            = true,
     .malformed_track_local            = true,
     .scan_object_gaps                 = moq_d18_op_scan_object_gaps,

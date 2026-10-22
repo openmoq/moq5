@@ -84,6 +84,7 @@ static int ns_suffix_key_cmp(const uint8_t *a, size_t alen,
  * representation-neutral for any balanced tree. ------------------- */
 
 typedef struct ns_suffix_node {
+    moq_cluster_metadata_t cluster;
     uint8_t               *data;   /* owned copy of the canonical key bytes */
     size_t                 len;
     struct ns_suffix_node *left;
@@ -178,6 +179,7 @@ static ns_suffix_node_t *ns_node_create(const moq_alloc_t *alloc,
         return NULL;
     }
     memcpy(copy, key, key_len);
+    memset(&n->cluster, 0, sizeof(n->cluster));
     n->data = copy;
     n->len = key_len;
     n->left = n->right = NULL;
@@ -187,6 +189,9 @@ static ns_suffix_node_t *ns_node_create(const moq_alloc_t *alloc,
 
 static void ns_node_destroy(const moq_alloc_t *alloc, ns_suffix_node_t *n)
 {
+    if (n->cluster.hop_ids)
+        alloc->free((void *)n->cluster.hop_ids, n->cluster.hop_count * sizeof(uint64_t),
+                    alloc->ctx);
     alloc->free(n->data, n->len, alloc->ctx);
     alloc->free(n, sizeof(*n), alloc->ctx);
 }
@@ -209,6 +214,67 @@ static bool ns_suffix_set_contains(const ns_suffix_set_t *set,
         n = c < 0 ? n->left : n->right;
     }
     return false;
+}
+
+static ns_suffix_node_t *ns_suffix_find(ns_suffix_set_t *set, const uint8_t *key, size_t len)
+{
+    ns_suffix_node_t *n = set ? set->root : NULL;
+    while (n) {
+        int c = ns_suffix_key_cmp(key, len, n->data, n->len);
+        if (!c)
+            return n;
+        n = c < 0 ? n->left : n->right;
+    }
+    return NULL;
+}
+
+/* Both announcement mechanisms share the same full-namespace identity. */
+bool session_cluster_namespace_duplicate(moq_session_t *s, const moq_namespace_t *ns,
+                                         bool local_sender, int excluded_ns_sub)
+{
+    uint8_t key[1 + 2 * MOQ_DECODED_MAX_NAMESPACE_PARTS + MOQ_FULL_TRACK_NAME_MAX];
+    size_t len = ns_suffix_key_len(ns);
+    if (len > sizeof(key))
+        return true;
+    ns_suffix_key_build(ns, key);
+    for (size_t i = 0; i < s->ann_cap; i++) {
+        const moq_ann_entry_t *a = &s->announcements[i];
+        if (a->state == MOQ_ANN_FREE || a->state == MOQ_ANN_DRAINING)
+            continue;
+        if ((a->role == MOQ_ANN_ROLE_ANNOUNCER) != local_sender)
+            continue;
+        if (a->ns_id_len == len && !memcmp(a->ns_id_buf, key, len))
+            return true;
+    }
+    for (size_t i = 0; i < s->ns_sub_cap; i++) {
+        const moq_ns_sub_entry_t *e = &s->ns_subs[i];
+        if ((int)i == excluded_ns_sub || e->state == MOQ_NS_SUB_FREE ||
+            e->local_subscriber == local_sender || !e->announced_suffixes)
+            continue;
+        if (!ns_update_has_prefix(e->prefix_parts, e->prefix_count, ns->parts, ns->count))
+            continue;
+        moq_namespace_t suffix = {ns->parts ? ns->parts + e->prefix_count : NULL,
+                                  ns->count - e->prefix_count};
+        len = ns_suffix_key_len(&suffix);
+        ns_suffix_key_build(&suffix, key);
+        if (ns_suffix_set_contains((const ns_suffix_set_t *)e->announced_suffixes, key, len))
+            return true;
+    }
+    return false;
+}
+
+static bool ns_cluster_duplicate_suffix(moq_session_t *s, const moq_ns_sub_entry_t *e, int slot,
+                                        const moq_namespace_t *suffix, bool local_sender)
+{
+    moq_bytes_t parts[MOQ_DECODED_MAX_NAMESPACE_PARTS];
+    if (e->prefix_count + suffix->count > MOQ_DECODED_MAX_NAMESPACE_PARTS)
+        return true;
+    for (size_t i = 0; i < e->prefix_count; i++)
+        parts[i] = e->prefix_parts[i];
+    for (size_t i = 0; i < suffix->count; i++)
+        parts[e->prefix_count + i] = suffix->parts[i];
+    moq_namespace_t full = {parts, e->prefix_count + suffix->count};
+    return session_cluster_namespace_duplicate(s, &full, local_sender, slot);
 }
 
 /* Link a pre-created node whose key is known absent (caller checked via
@@ -254,6 +320,9 @@ static ns_suffix_node_t *ns_node_remove(ns_suffix_node_t *root,
              * the detached node carries the original target's key bytes. */
             ns_suffix_node_t *succ = ns_node_min(root->right);
             uint8_t *td = root->data; size_t tl = root->len;
+            moq_cluster_metadata_t tc = root->cluster;
+            root->cluster = succ->cluster;
+            succ->cluster = tc;
             root->data = succ->data; root->len = succ->len;
             succ->data = td;         succ->len = tl;
             root->right = ns_node_remove(root->right, td, tl, removed);
@@ -366,7 +435,7 @@ static bool ns_suffix_set_remove_counted(moq_session_t *s, ns_suffix_set_t *set,
     ns_suffix_node_t *removed = NULL;
     set->root = ns_node_remove(set->root, key, key_len, &removed);
     if (!removed) return false;
-    size_t charge = removed->len;      /* same amount charged on insert */
+    size_t charge = removed->len + removed->cluster.hop_count * sizeof(uint64_t);
     set->count--;
     set->counted_bytes = charge <= set->counted_bytes
                              ? set->counted_bytes - charge : 0;
@@ -1732,13 +1801,20 @@ moq_result_t moq_session_reject_ns_sub(
 
 /* -- Publisher: send NAMESPACE / NAMESPACE_DONE -------------------- */
 
-static moq_result_t send_ns_msg(moq_session_t *s,
-                                 moq_ns_sub_handle_t handle,
-                                 const moq_namespace_t *suffix,
-                                 bool is_done,
-                                 uint64_t now_us)
+static moq_result_t send_ns_msg(moq_session_t *s, moq_ns_sub_handle_t handle,
+                                const moq_namespace_t *suffix, bool is_done,
+                                const moq_cluster_metadata_t *metadata, uint64_t now_us)
 {
     if (!s || !suffix) return MOQ_ERR_INVAL;
+    moq_cluster_metadata_t input = {0};
+    if (metadata)
+        input = *metadata;
+    if (!is_done) {
+        if (!s->cluster_negotiated && (input.hop_count || input.has_route_cost))
+            return MOQ_ERR_UNSUPPORTED;
+        if (session_cluster_validate(&input, s->cluster_negotiated) < 0)
+            return MOQ_ERR_INVAL;
+    }
     if (suffix->count > 32) return MOQ_ERR_INVAL;
     if (suffix->count > 0 && !suffix->parts) return MOQ_ERR_INVAL;
     {
@@ -1763,15 +1839,33 @@ static moq_result_t send_ns_msg(moq_session_t *s,
      * before the key allocation + capacity work so the contract is WRONG_STATE. */
     if (e->goaway_sent) return MOQ_ERR_WRONG_STATE;
 
+    if (!is_done && s->cluster_negotiated && ns_cluster_duplicate_suffix(s, e, slot, suffix, true))
+        return MOQ_ERR_INVAL;
     /* Build suffix key for tracking. */
     size_t key_len = ns_suffix_key_len(suffix);
     uint8_t *key_buf = (uint8_t *)s->alloc.alloc(key_len, s->alloc.ctx);
     if (!key_buf) return MOQ_ERR_NOMEM;
     ns_suffix_key_build(suffix, key_buf);
 
+    ns_suffix_node_t *existing =
+        ns_suffix_find((ns_suffix_set_t *)e->announced_suffixes, key_buf, key_len);
+    if (!is_done && existing && input.hop_count && existing->cluster.hop_count &&
+        input.hop_ids[0] != existing->cluster.hop_ids[0]) {
+        s->alloc.free(key_buf, key_len, s->alloc.ctx);
+        return MOQ_ERR_INVAL;
+    }
+    moq_cluster_metadata_t owned = {0};
+    if (!is_done) {
+        moq_result_t crc = session_cluster_copy(s, &input, &owned);
+        if (crc < 0) {
+            s->alloc.free(key_buf, key_len, s->alloc.ctx);
+            return crc;
+        }
+    }
     if (is_done) {
         ns_suffix_set_t *set = (ns_suffix_set_t *)e->announced_suffixes;
         if (!set || !ns_suffix_set_contains(set, key_buf, key_len)) {
+            session_cluster_free(s, &owned);
             s->alloc.free(key_buf, key_len, s->alloc.ctx);
             return MOQ_ERR_WRONG_STATE;
         }
@@ -1785,6 +1879,7 @@ static moq_result_t send_ns_msg(moq_session_t *s,
             e->announced_suffixes = s->alloc.alloc(
                 sizeof(ns_suffix_set_t), s->alloc.ctx);
             if (!e->announced_suffixes) {
+                session_cluster_free(s, &owned);
                 s->alloc.free(key_buf, key_len, s->alloc.ctx);
                 return MOQ_ERR_NOMEM;
             }
@@ -1792,6 +1887,7 @@ static moq_result_t send_ns_msg(moq_session_t *s,
         }
         if (!ns_suffix_set_add((ns_suffix_set_t *)e->announced_suffixes,
                                 &s->alloc, key_buf, key_len, &inserted)) {
+            session_cluster_free(s, &owned);
             s->alloc.free(key_buf, key_len, s->alloc.ctx);
             return MOQ_ERR_NOMEM;
         }
@@ -1802,11 +1898,21 @@ static moq_result_t send_ns_msg(moq_session_t *s,
      * namespace suffix plus envelope overhead; the bounded writer prevents
      * overflow regardless. On any failure the speculative suffix insert is rolled
      * back so a re-feed retries cleanly. */
-    uint8_t nbuf[MOQ_FULL_TRACK_NAME_MAX + 128];
+    size_t ncap = MOQ_FULL_TRACK_NAME_MAX + 128 + 9 * input.hop_count;
+    uint8_t *nbuf = s->alloc.alloc(ncap, s->alloc.ctx);
+    if (!nbuf) {
+        if (!is_done && inserted)
+            ns_suffix_set_remove((ns_suffix_set_t *)e->announced_suffixes, &s->alloc, key_buf,
+                                 key_len);
+        session_cluster_free(s, &owned);
+        s->alloc.free(key_buf, key_len, s->alloc.ctx);
+        return MOQ_ERR_NOMEM;
+    }
     moq_buf_writer_t w;
-    moq_buf_writer_init(&w, nbuf, sizeof(nbuf));
+    moq_buf_writer_init(&w, nbuf, ncap);
 
     moq_namespace_msg_encode_args_t enc_args = {
+        .cluster = input,
         .is_done = is_done,
         .suffix = *suffix,
     };
@@ -1815,6 +1921,8 @@ static moq_result_t send_ns_msg(moq_session_t *s,
         if (!is_done && inserted)
             ns_suffix_set_remove((ns_suffix_set_t *)e->announced_suffixes,
                                   &s->alloc, key_buf, key_len);
+        s->alloc.free(nbuf, ncap, s->alloc.ctx);
+        session_cluster_free(s, &owned);
         s->alloc.free(key_buf, key_len, s->alloc.ctx);
         return rc;
     }
@@ -1823,10 +1931,19 @@ static moq_result_t send_ns_msg(moq_session_t *s,
         if (!is_done && inserted)
             ns_suffix_set_remove((ns_suffix_set_t *)e->announced_suffixes,
                                   &s->alloc, key_buf, key_len);
+        s->alloc.free(nbuf, ncap, s->alloc.ctx);
+        session_cluster_free(s, &owned);
         s->alloc.free(key_buf, key_len, s->alloc.ctx);
         return rc;
     }
 
+    s->alloc.free(nbuf, ncap, s->alloc.ctx);
+    if (!is_done) {
+        ns_suffix_node_t *node =
+            ns_suffix_find((ns_suffix_set_t *)e->announced_suffixes, key_buf, key_len);
+        session_cluster_apply(s, &node->cluster, &owned);
+        session_cluster_free(s, &owned);
+    }
     if (is_done) {
         ns_suffix_set_t *set = (ns_suffix_set_t *)e->announced_suffixes;
         ns_suffix_set_remove(set, &s->alloc, key_buf, key_len);
@@ -1842,7 +1959,7 @@ moq_result_t moq_session_send_namespace(
     const moq_namespace_t *suffix,
     uint64_t now_us)
 {
-    return send_ns_msg(s, handle, suffix, false, now_us);
+    return send_ns_msg(s, handle, suffix, false, NULL, now_us);
 }
 
 moq_result_t moq_session_send_namespace_done(
@@ -1851,7 +1968,17 @@ moq_result_t moq_session_send_namespace_done(
     const moq_namespace_t *suffix,
     uint64_t now_us)
 {
-    return send_ns_msg(s, handle, suffix, true, now_us);
+    return send_ns_msg(s, handle, suffix, true, NULL, now_us);
+}
+
+moq_result_t moq_session_send_namespace_cluster(moq_session_t *s, moq_ns_sub_handle_t handle,
+                                                const moq_namespace_t *suffix,
+                                                const moq_cluster_metadata_t *cluster,
+                                                size_t cluster_size, uint64_t now_us)
+{
+    if (!cluster || cluster_size < sizeof(*cluster))
+        return MOQ_ERR_INVAL;
+    return send_ns_msg(s, handle, suffix, false, cluster, now_us);
 }
 
 /* -- Subscriber: response parsing ---------------------------------- */
@@ -2331,6 +2458,9 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
             break;
         case MOQ_NS_RESP_NAMESPACE:
         case MOQ_NS_RESP_NAMESPACE_DONE: {
+            if (resp.kind == MOQ_NS_RESP_NAMESPACE && s->cluster_negotiated &&
+                ns_cluster_duplicate_suffix(s, e, slot, &resp.suffix, false))
+                return close_with_error(s, 0x3, "duplicate namespace advertisement");
             size_t skey_len = ns_suffix_key_len(&resp.suffix);
             uint8_t *skey_buf = (uint8_t *)s->alloc.alloc(
                 skey_len, s->alloc.ctx);
@@ -2385,6 +2515,55 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                 return rc;
             }
 
+            moq_cluster_metadata_t incoming_cluster = {0};
+            moq_cluster_metadata_t event_cluster = {0};
+            ns_suffix_node_t *existing_node =
+                ns_suffix_find((ns_suffix_set_t *)e->announced_suffixes, skey_buf, skey_len);
+            if (resp.kind == MOQ_NS_RESP_NAMESPACE && s->cluster_negotiated) {
+                rc = session_cluster_decode(s, resp.cluster_hop_path, resp.cluster_has_route_cost,
+                                            resp.cluster_route_cost, &incoming_cluster);
+                if (rc < 0) {
+                    s->event_scratch_len = scratch_save;
+                    s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                    return rc;
+                }
+                if (existing_node && existing_node->cluster.hop_count &&
+                    existing_node->cluster.hop_ids[0] != incoming_cluster.hop_ids[0]) {
+                    session_cluster_free(s, &incoming_cluster);
+                    s->event_scratch_len = scratch_save;
+                    s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                    return close_with_error(s, 0x3,
+                                            "namespace publisher changed without withdrawal");
+                }
+                size_t old_bytes =
+                    existing_node ? existing_node->cluster.hop_count * sizeof(uint64_t) : 0;
+                size_t new_bytes = incoming_cluster.hop_count * sizeof(uint64_t);
+                size_t key_charge = existing_node ? 0 : skey_len;
+                size_t growth = new_bytes > old_bytes ? new_bytes - old_bytes : 0;
+                if (s->recv_payload_bytes > s->max_recv_buf ||
+                    key_charge > s->max_recv_buf - s->recv_payload_bytes ||
+                    growth > s->max_recv_buf - s->recv_payload_bytes - key_charge) {
+                    session_cluster_free(s, &incoming_cluster);
+                    s->event_scratch_len = scratch_save;
+                    s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                    return close_with_error(s, 0x1, "namespace path exceeds receive budget");
+                }
+                moq_cluster_metadata_t effective = incoming_cluster;
+                if (!effective.has_route_cost && existing_node) {
+                    effective.has_route_cost = existing_node->cluster.has_route_cost;
+                    effective.route_cost = existing_node->cluster.route_cost;
+                }
+                rc = session_cluster_event(s, &effective, &event_cluster);
+                if (rc < 0) {
+                    session_cluster_free(s, &incoming_cluster);
+                    s->event_scratch_len = scratch_save;
+                    s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                    if (scratch_save == 0)
+                        return close_with_error(s, 0x1, "event scratch permanently too small");
+                    return rc;
+                }
+            }
+
             /* Record suffix tracking before emitting the event. The inbound,
              * peer-controlled set is charged against the receive budget so a
              * flood of unique NAMESPACE suffixes cannot retain unbounded memory;
@@ -2404,6 +2583,7 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                     if (!fresh) {
                         s->event_scratch_len = scratch_save;
                         s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                        session_cluster_free(s, &incoming_cluster);
                         return MOQ_ERR_NOMEM;
                     }
                     memset(fresh, 0, sizeof(*fresh));
@@ -2418,6 +2598,7 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                     }
                     s->event_scratch_len = scratch_save;
                     s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                    session_cluster_free(s, &incoming_cluster);
                     if (st == NS_SUF_OVER_BUDGET)
                         return close_with_error(s, 0x1,
                             "inbound namespace suffix tracking exceeds "
@@ -2439,6 +2620,7 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                 ev.detail_size = (uint32_t)sizeof(moq_namespace_found_event_t);
                 ev.u.namespace_found.handle = e->handle;
                 ev.u.namespace_found.track_namespace_suffix = suffix_copy;
+                ev.u.namespace_found.cluster = event_cluster;
             } else {
                 ev.kind = MOQ_EVENT_NAMESPACE_GONE;
                 ev.detail_size = (uint32_t)sizeof(moq_namespace_gone_event_t);
@@ -2453,8 +2635,19 @@ static moq_result_t handle_subscriber_response(moq_session_t *s,
                         (ns_suffix_set_t *)e->announced_suffixes,
                         skey_buf, skey_len);
                 s->alloc.free(skey_buf, skey_len, s->alloc.ctx);
+                session_cluster_free(s, &incoming_cluster);
                 return rc;
             }
+            if (resp.kind == MOQ_NS_RESP_NAMESPACE && incoming_cluster.hop_count) {
+                ns_suffix_set_t *set = (ns_suffix_set_t *)e->announced_suffixes;
+                ns_suffix_node_t *node = ns_suffix_find(set, skey_buf, skey_len);
+                size_t old_bytes = node->cluster.hop_count * sizeof(uint64_t);
+                size_t new_bytes = incoming_cluster.hop_count * sizeof(uint64_t);
+                s->recv_payload_bytes = s->recv_payload_bytes - old_bytes + new_bytes;
+                set->counted_bytes = set->counted_bytes - old_bytes + new_bytes;
+                session_cluster_apply(s, &node->cluster, &incoming_cluster);
+            }
+            session_cluster_free(s, &incoming_cluster);
             if (resp.kind == MOQ_NS_RESP_NAMESPACE_DONE) {
                 ns_suffix_set_t *set =
                     (ns_suffix_set_t *)e->announced_suffixes;
@@ -2708,7 +2901,10 @@ static bool ns_rebase_one(moq_session_t *s, const ns_suffix_node_t *n,
     if (klen > NS_REBASE_KEY_MAX) return false;
     ns_suffix_key_build(&ns, key);
     if (!ns_suffix_set_add(dst, &s->alloc, key, klen, NULL)) return false;
-    *bytes += klen;
+    ns_suffix_node_t *copy = ns_suffix_find(dst, key, klen);
+    if (session_cluster_copy(s, &n->cluster, &copy->cluster) < 0)
+        return false;
+    *bytes += klen + n->cluster.hop_count * sizeof(uint64_t);
     return true;
 }
 
@@ -2792,9 +2988,9 @@ static moq_result_t ns_sub_refuse_update(moq_session_t *s, size_t slot,
     if (rc < 0) return rc;
     rc = queue_send_bidi(s, e->stream_ref, buf, len, true);
     if (rc < 0) return rc;
-    (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_NS_SUB,
-        e->handle._opaque, a->d.request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
-        MOQ_REQUEST_ROLE_RESPONDER, code, NULL, 0, false, 0);
+    (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_NS_SUB, e->handle._opaque,
+                                      a->d.request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
+                                      MOQ_REQUEST_ROLE_RESPONDER, code, NULL, 0, false, 0, NULL);
     ns_update_admission_commit(s, a);
     if (drain) (void)drain_ref_add(s, e->stream_ref);   /* slot reserved above */
     ns_sub_free_entry(s, slot);
@@ -3008,13 +3204,12 @@ static moq_result_t ns_sub_on_update_response(moq_session_t *s, int32_t slot,
                 "inbound namespace suffix tracking exceeds receive budget");
         }
     }
-    moq_result_t rc = ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_NS_SUB,
-        e->handle._opaque, u->out_request_id,
+    moq_result_t rc = ns_update_push_result_event(
+        s, MOQ_REQUEST_FAMILY_NS_SUB, e->handle._opaque, u->out_request_id,
         ok ? MOQ_NAMESPACE_UPDATE_OUTCOME_OK : MOQ_NAMESPACE_UPDATE_OUTCOME_ERROR,
-        MOQ_REQUEST_ROLE_REQUESTER,
-        ok ? 0 : s->profile->semantic_request_error(resp->error_code),
-        ok ? NULL : resp->reason, ok ? 0 : resp->reason_len,
-        ok && resp->has_expires, resp->expires_ms);
+        MOQ_REQUEST_ROLE_REQUESTER, ok ? 0 : s->profile->semantic_request_error(resp->error_code),
+        ok ? NULL : resp->reason, ok ? 0 : resp->reason_len, ok && resp->has_expires,
+        resp->expires_ms, NULL);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) {
         if (fresh) {
             ns_suffix_set_free(fresh, &s->alloc);

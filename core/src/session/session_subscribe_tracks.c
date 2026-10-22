@@ -952,9 +952,10 @@ static moq_result_t track_sub_update_terminal(moq_session_t *s, int slot,
     rc = queue_send_bidi(s, e->rs.ref, buf, len, true);
     if (rc < 0) return rc;
     if (report_refused)
-        (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS,
-            e->handle._opaque, request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
-            MOQ_REQUEST_ROLE_RESPONDER, code, NULL, 0, false, 0);
+        (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, e->handle._opaque,
+                                          request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
+                                          MOQ_REQUEST_ROLE_RESPONDER, code, NULL, 0, false, 0,
+                                          NULL);
     if (need_drain) (void)drain_ref_add(s, e->rs.ref);   /* slot reserved above */
     return MOQ_OK;
 }
@@ -1020,12 +1021,11 @@ moq_result_t track_sub_on_update_response(moq_session_t *s, int slot, bool ok,
 {
     moq_track_sub_entry_t *e = &s->track_subs[slot];
     moq_ns_update_t *u = &e->update;
-    moq_result_t rc = ns_update_push_result_event(s,
-        MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, e->handle._opaque, u->out_request_id,
+    moq_result_t rc = ns_update_push_result_event(
+        s, MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS, e->handle._opaque, u->out_request_id,
         ok ? MOQ_NAMESPACE_UPDATE_OUTCOME_OK : MOQ_NAMESPACE_UPDATE_OUTCOME_ERROR,
-        MOQ_REQUEST_ROLE_REQUESTER,
-        ok ? 0 : s->profile->semantic_request_error(error_code),
-        ok ? NULL : reason, ok ? 0 : reason_len, has_expires, expires_ms);
+        MOQ_REQUEST_ROLE_REQUESTER, ok ? 0 : s->profile->semantic_request_error(error_code),
+        ok ? NULL : reason, ok ? 0 : reason_len, has_expires, expires_ms, NULL);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     if (ok) {
         /* The barrier: the new prefix names later PUBLISH_SKIPPED suffixes. */

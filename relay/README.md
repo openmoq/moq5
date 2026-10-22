@@ -14,6 +14,52 @@ platform thread synchronization for its bounded cross-shard queues; the host
 owns the workers and schedules every step. Transport adapters remain optional
 application dependencies.
 
+## Cluster Routing
+
+The reusable libraries support the
+[MoQ Cluster draft-01 extension](../docs/draft-lcurley-moq-cluster-01.txt)
+on draft-22 sessions. Enable it explicitly when constructing the relay core:
+
+```c
+moqr_core_relay_cfg_t core_cfg;
+moqr_core_relay_cfg_init_sized(&core_cfg, sizeof(core_cfg), moq_alloc_default());
+moqr_cluster_cfg_t cluster;
+moqr_cluster_cfg_init_sized(&cluster, sizeof(cluster));
+cluster.enabled = true;
+cluster.local_hop_id = 1234; /* one identity across this relay's sessions */
+moqr_core_t *core = NULL;
+moqr_result_t result = moqr_core_create_cluster(&core_cfg, &cluster, &core);
+```
+
+For the shard runtime, set `cluster_enabled`, `cluster_hop_id`, and optional
+`max_cluster_routes`/`max_cluster_hops` on `moqr_shards_cfg_t`. Set
+`cluster_enabled` and the same `cluster_hop_id` on each peer's
+`moq_session_cfg_t` before creating its session. The peer must also offer the
+extension. Zero is a valid withheld identity; an explicitly configured relay
+cost of zero differs from an omitted cost, which defaults to one.
+
+After attachment, the binding discovers namespaces on negotiated peer sessions,
+retains alternative paths, and applies the same peer exclusions to namespace
+advertisements and content requests. The host supplies connections and drives
+the transport and binding pumps. `moqr_bind_conn_open_cluster()` can override
+a peer's asserted relay cost and correlate connections known to belong to one
+endpoint. These identities guide routing; the existing authorization hook
+continues to decide access.
+
+For capacity planning before creating the core, resolve the cluster settings
+with `moqr_cluster_cfg_resolve()` and pass them to
+`moqr_bind_cluster_capacity_describe()`. `moqr_shards_capacity_describe()`
+includes cluster pools, metadata queues and binding storage.
+
+See the [cluster API contract](docs/api.md#cluster-configuration-and-metadata)
+for metadata ownership and [routing architecture](docs/architecture.md#cluster-routing)
+for path selection and failover. The
+[conformance page](../docs/conformance.md#moq-cluster-draft-01) records test
+coverage and remaining validation limits. Peer dialing and reconnect policy
+belong to the host; the relay command does not configure cluster peers.
+
+## Session Binding
+
 The binding serves draft-16, draft-18 and draft-22 sessions and forwards
 between them. On draft-22 it answers subscriber updates itself (applying a
 replacement Location Filter before acknowledging it), serves fills from the

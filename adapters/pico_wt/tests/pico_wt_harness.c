@@ -63,13 +63,10 @@ int pico_wt_harness_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
     return 0;
 }
 
-static int harness_create_session(moq_perspective_t persp,
-                                   uint32_t request_capacity,
-                                   uint64_t goaway_timeout_us,
-                                   uint32_t max_events,
-                                   moq_version_t version,
-                                   uint32_t max_fills,
-                                   moq_session_t **out)
+static int harness_create_session(moq_perspective_t persp, uint32_t request_capacity,
+                                  uint64_t goaway_timeout_us, uint32_t max_events,
+                                  moq_version_t version, uint32_t max_fills, bool cluster_enabled,
+                                  uint64_t hop_id, moq_session_t **out)
 {
     moq_session_cfg_t cfg;
     moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
@@ -79,6 +76,10 @@ static int harness_create_session(moq_perspective_t persp,
     if (max_events) cfg.max_events = max_events;
     cfg.version = version;
     if (max_fills) cfg.max_fills = max_fills;
+    cfg.cluster_enabled = cluster_enabled;
+    cfg.cluster_hop_id = hop_id;
+    cfg.cluster_has_relay_cost = cluster_enabled && persp == MOQ_PERSPECTIVE_CLIENT;
+    cfg.cluster_relay_cost = 0;
     return moq_session_create(&cfg, 0, out);
 }
 
@@ -213,15 +214,12 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
 
     h->version = cfg->version;
     h->phase = PICO_WT_HARNESS_SESSIONS;
-    if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, cap, 0,
-                               cfg->max_events, cfg->version, 0,
-                               &h->client_session) != 0)
+    if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, cap, 0, cfg->max_events, cfg->version, 0,
+                               cfg->cluster_enabled, cfg->client_hop_id, &h->client_session) != 0)
         return -1;
-    if (harness_create_session(MOQ_PERSPECTIVE_SERVER, cap,
-                               cfg->server_goaway_timeout_us,
-                               cfg->max_events, cfg->version,
-                               cfg->server_max_fills,
-                               &h->server_session) != 0)
+    if (harness_create_session(MOQ_PERSPECTIVE_SERVER, cap, cfg->server_goaway_timeout_us,
+                               cfg->max_events, cfg->version, cfg->server_max_fills,
+                               cfg->cluster_enabled, cfg->server_hop_id, &h->server_session) != 0)
         return -1;
 
     h->phase = PICO_WT_HARNESS_CLIENT_ATTACH;
@@ -315,8 +313,8 @@ const char *pico_wt_harness_check_attach_refusal(pico_wt_harness_t *h,
 
     /* The same inputs with a supported version attach. */
     moq_session_t *d16 = NULL;
-    if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, 16, 0, 0,
-                               MOQ_VERSION_DRAFT_16, 0, &d16) != 0)
+    if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, 16, 0, 0, MOQ_VERSION_DRAFT_16, 0, false, 0,
+                               &d16) != 0)
         return "draft-16 session refused";
     cfg.session = d16;
     int rc = moq_pico_wt_conn_create(&cfg, &out);

@@ -81,6 +81,9 @@ typedef struct {
     uint32_t max_events;               /* session event queue; 0 -> default */
     moq_version_t version;             /* both sessions; 0 -> draft-16 */
     uint32_t server_max_fills;         /* server fill pool; 0 -> default */
+    bool cluster_enabled;
+    uint64_t client_hop_id;
+    uint64_t server_hop_id;
 } pico_wt_harness_cfg_t;
 
 /* picohttp callback for the WT control stream on both ends:

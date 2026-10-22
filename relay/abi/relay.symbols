@@ -2,9 +2,11 @@ moqr_bind_auth_resolve
 moqr_bind_capacity_describe
 moqr_bind_cfg_init_sized
 moqr_bind_cfg_resolve
+moqr_bind_cluster_capacity_describe
 moqr_bind_conn_close
 moqr_bind_conn_is_open
 moqr_bind_conn_open
+moqr_bind_conn_open_cluster
 moqr_bind_conn_version
 moqr_bind_create
 moqr_bind_destroy

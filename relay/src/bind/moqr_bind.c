@@ -458,7 +458,19 @@ typedef struct b_ann {
     moq_bytes_t  parts[32];
     uint8_t     *bytes;
     size_t       bytes_len;
+    bool         discovered;
+    moq_ns_sub_handle_t discovery;
+    moq_cluster_metadata_t cluster; /* latest received state, in conn path pool */
+    bool cluster_pending;
+    bool cluster_initial;
+    moqr_grant_res_t cluster_grant;
 } b_ann_t;
+
+/* What one peer was actually told, independent of current best-route state. */
+typedef struct b_cadv {
+    b_ann_t ann;
+    uint64_t source_binding, source_advertisement, origin;
+} b_cadv_t;
 
 /* A namespace update held for retry. draft-18 Section 6.2 makes the NAMESPACE
  * owed to a matching prefix subscriber a MUST, so a blocked control path may
@@ -489,6 +501,7 @@ typedef struct b_nsans {
     uint32_t         conn;        /* connection slot                      */
     uint64_t         handle;      /* the updated request                  */
     uint64_t         update_id;
+    bool             cluster_applied;
     uint64_t         error_code;  /* reject only                          */
     moqr_grant_res_t gres;        /* an announcement's new grant, if any  */
 } b_nsans_t;
@@ -586,6 +599,18 @@ typedef struct b_conn {
     b_usub_t      *usubs;
     b_pub_t       *pubs;
     b_ann_t       *anns;
+    b_cadv_t      *cluster_adverts;
+    uint64_t      *cluster_paths;
+    bool           cluster_peer_ready;
+    bool           cluster_negotiated;
+    bool           cluster_cost_override;
+    bool           cluster_discovery_closed;
+    bool           cluster_discovery_retiring;
+    bool           cluster_discovery_cancel_owed;
+    uint64_t       cluster_cost;
+    uint64_t       cluster_correlation;
+    uint64_t       cluster_peer_hop;
+    moq_ns_sub_handle_t cluster_discovery;
     b_fetch_t     *fetches;
     b_refusal_t   *refusals;   /* held refusals, n_refusals entries      */
     uint32_t       refusals_reserved;   /* entries promised to parked auths */
@@ -597,6 +622,9 @@ struct moqr_bind {
     moq_alloc_t  alloc;
     b_dgrant_t   dgrants[BIND_DGRANTS];
     moqr_core_t *core;
+    moqr_cluster_info_t cluster_info;
+    uint64_t *cluster_hops; /* max received path plus this relay's append */
+    uint64_t cluster_next_discovery;
     /* The request namespace / name of the event being handled, copied out of
      * session event memory (see bind_stash_ftn). */
     moq_bytes_t  stash_parts[32];
@@ -1533,6 +1561,17 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                             const moqr_core_limits_t *lim,
                             moqr_bind_capacity_t *out)
 {
+    moqr_cluster_info_t cluster = {0};
+    if (cfg != NULL && BIND_CFG_HAS(cfg, core) && cfg->core != NULL)
+        moqr_core_cluster_info(cfg->core, &cluster);
+    return moqr_bind_cluster_capacity_describe(cfg, lim, &cluster, out);
+}
+
+moqr_result_t
+moqr_bind_cluster_capacity_describe(const moqr_bind_cfg_t *cfg,
+    const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
+    moqr_bind_capacity_t *out)
+{
     if (out == NULL) {
         return MOQR_ERR_INVAL;
     }
@@ -1565,6 +1604,15 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                      moqr_cap_mul(bl.max_conns,
                                   moqr_cap_add(sizeof(b_conn_t),
                                                per_conn))));
+    const moqr_cluster_info_t cluster = cluster_info != NULL
+        ? *cluster_info : (moqr_cluster_info_t){0};
+    if (cluster.enabled && cluster.max_hops == 0) return MOQR_ERR_INVAL;
+    if (cluster.enabled) {
+        out->structure_bytes = moqr_cap_add(out->structure_bytes,
+            moqr_cap_add(moqr_cap_mul((uint64_t)cluster.max_hops + 1u, sizeof(uint64_t)),
+                moqr_cap_mul(moqr_cap_mul(bl.max_conns, bl.n_anns),
+                    moqr_cap_add(sizeof(b_cadv_t), moqr_cap_mul(cluster.max_hops, sizeof(uint64_t))))));
+    }
     /* Delivery scheduling bitsets: ready + parked, one bit per conn slot. */
     out->structure_bytes = moqr_cap_add(
         out->structure_bytes,
@@ -1584,9 +1632,11 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
         ann_slots = lim->max_ns_nodes;
     }
     out->announce_bytes = moqr_cap_mul(ann_slots, BIND_ANN_BYTES_MAX);
-    /* The namespace payload sidecar: one entry per deferral-ring slot, plus
-     * the suffix bytes every slot could own at once. One held suffix is
-     * bounded by the same full-track-name cap an announce is. */
+    if (cluster.enabled) {
+        const uint64_t slots = moqr_cap_mul(bl.max_conns, bl.n_anns);
+        const uint64_t incoming = slots; /* includes not-yet-admitted candidates */
+        out->announce_bytes = moqr_cap_mul(moqr_cap_add(incoming, slots), BIND_ANN_BYTES_MAX);
+    }
     out->structure_bytes = moqr_cap_add(
         out->structure_bytes, moqr_cap_mul(bl.nsu_cap, sizeof(b_nsu_t)));
     out->announce_bytes = moqr_cap_add(
@@ -1652,6 +1702,7 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
     memset(b, 0, sizeof(*b));
     b->alloc = *a;
     b->core = core;
+    moqr_core_cluster_info(core, &b->cluster_info);
     /* Default map sizes FOLLOW the core's admission limits, so the
      * binding can never be under-provisioned relative to what the core
      * will admit. Explicit cfg values still win (tests use tiny maps to
@@ -1829,6 +1880,14 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         moqr_bind_destroy(b);
         return MOQR_ERR_NOMEM;
     }
+    if (b->cluster_info.enabled) {
+        b->cluster_hops = b->alloc.alloc(
+            ((size_t)b->cluster_info.max_hops + 1u) * sizeof(uint64_t), b->alloc.ctx);
+        if (b->cluster_hops == NULL) {
+            moqr_bind_destroy(b);
+            return MOQR_ERR_NOMEM;
+        }
+    }
     for (uint32_t i = 0; i < b->max_conns; i++) {
         b_conn_t *cn = &b->conns[i];
         /* Allocate each per-connection table and zero it IMMEDIATELY, before the
@@ -1853,6 +1912,14 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         BIND_ALLOC_TABLE(usubs, b->n_usubs);
         BIND_ALLOC_TABLE(pubs, b->n_pubs);
         BIND_ALLOC_TABLE(anns, b->n_anns);
+        if (b->cluster_info.enabled) {
+            BIND_ALLOC_TABLE(cluster_adverts, b->n_anns);
+            if ((size_t)b->n_anns > SIZE_MAX / sizeof(uint64_t) / b->cluster_info.max_hops) {
+                moqr_bind_destroy(b);
+                return MOQR_ERR_INVAL;
+            }
+            BIND_ALLOC_TABLE(cluster_paths, (size_t)b->n_anns * b->cluster_info.max_hops);
+        }
         BIND_ALLOC_TABLE(fetches, b->n_fetches);
         BIND_ALLOC_TABLE(refusals, b->n_refusals);
 #undef BIND_ALLOC_TABLE
@@ -1931,7 +1998,7 @@ bind_nsu_store(moqr_bind_t *b, uint32_t slot, moqr_intent_t *parked)
     if (parked->value > parked->ns_count) {
         return false;
     }
-    uint32_t off = parked->value;
+    uint32_t off = b->cluster_info.enabled ? 0u : parked->value;
     uint32_t suffix_count = parked->ns_count - off;
     if (suffix_count > 32) {
         return false;
@@ -2712,6 +2779,8 @@ ann_clear_slot(moqr_bind_t *b, b_conn_t *cn, uint32_t slot)
     memset(&cn->anns[slot], 0, sizeof(cn->anns[slot]));
 }
 
+static void bind_cluster_adverts_clear(moqr_bind_t *b, b_conn_t *cn, uint64_t handle);
+
 static void
 ann_clear_all(moqr_bind_t *b, b_conn_t *cn)
 {
@@ -2749,6 +2818,8 @@ bind_ann_withdraw(moqr_bind_t *b, b_conn_t *cn, uint64_t raw, uint64_t now_us)
     }
     if (urc == MOQR_OK || urc == MOQR_ERR_STALE_HANDLE ||
         urc == MOQR_ERR_WRONG_STATE) {
+        if (cn->anns[ann_slot].cluster_grant.gen != 0)
+            moqr_core_grant_abort(b->core, cn->anns[ann_slot].cluster_grant);
         ann_clear_slot(b, cn, (uint32_t)ann_slot);
     } else {
         b->session_errors++;
@@ -2832,6 +2903,34 @@ ns_equal(moqr_ns_t a, moqr_ns_t b)
     return true;
 }
 
+static void
+bind_cluster_adverts_clear(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
+{
+    if (cn->cluster_adverts == NULL) return;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_cadv_t *a = &cn->cluster_adverts[i];
+        if (!a->ann.used || (handle != 0 && a->ann.ann_raw != handle)) continue;
+        if (a->ann.bytes != NULL)
+            b->alloc.free(a->ann.bytes, a->ann.bytes_len, b->alloc.ctx);
+        memset(a, 0, sizeof(*a));
+    }
+}
+
+static moqr_result_t
+bind_cluster_announce_current(moqr_bind_t *b, b_conn_t *cn, moqr_ns_t ns, uint64_t raw)
+{
+    int slot = ann_find(b, cn, raw);
+    if (slot >= 0 && cn->anns[slot].discovered)
+        return moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
+                                          &cn->anns[slot].cluster, false);
+    moq_cluster_metadata_t metadata = {0};
+    moq_result_t rc = moq_session_namespace_cluster(cn->session,
+        (moq_announcement_t){raw}, &metadata, sizeof(metadata));
+    if (rc != MOQ_OK && cn->cluster_negotiated) return MOQR_ERR_WRONG_STATE;
+    return moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
+        cn->cluster_negotiated ? &metadata : NULL, false);
+}
+
 static bool
 conn_has_other_announce(const moqr_bind_t *b, const b_conn_t *cn,
                         uint64_t raw, moqr_ns_t ns)
@@ -2856,6 +2955,10 @@ bind_announce(moqr_bind_t *b, b_conn_t *cn, moqr_ns_t ns, uint64_t raw,
               uint64_t now_us)
 {
     moqr_result_t rc;
+    if (b->cluster_info.enabled) {
+        BIND_CALL_RETRY(rc, bind_cluster_announce_current(b, cn, ns, raw));
+        return rc;
+    }
     BIND_CALL_RETRY(rc, moqr_core_announce_ex(b->core, cn->binding, ns, raw));
     if (rc != MOQR_ERR_WRONG_STATE ||
         conn_has_other_announce(b, cn, raw, ns)) {
@@ -3009,6 +3112,7 @@ conn_detach(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         b->session_errors++;
     }
     ann_clear_all(b, cn);
+    bind_cluster_adverts_clear(b, cn, 0);
     usub_release_all(b, cn);
     cn->used = false;
     cn->detach_pending = false;
@@ -3053,6 +3157,12 @@ moqr_bind_destroy(moqr_bind_t *b)
                 a.free(cn->anns, (size_t)b->n_anns * sizeof(*cn->anns),
                        a.ctx);
             }
+            if (cn->cluster_paths != NULL)
+                a.free(cn->cluster_paths, (size_t)b->n_anns * b->cluster_info.max_hops * sizeof(uint64_t), a.ctx);
+            if (cn->cluster_adverts != NULL) {
+                bind_cluster_adverts_clear(b, cn, 0);
+                a.free(cn->cluster_adverts, (size_t)b->n_anns * sizeof(*cn->cluster_adverts), a.ctx);
+            }
             if (cn->fetches != NULL) {
                 a.free(cn->fetches, (size_t)b->n_fetches * sizeof(*cn->fetches),
                        a.ctx);
@@ -3064,6 +3174,8 @@ moqr_bind_destroy(moqr_bind_t *b)
         }
         a.free(b->conns, (size_t)b->max_conns * sizeof(*b->conns), a.ctx);
     }
+    if (b->cluster_hops != NULL)
+        a.free(b->cluster_hops, ((size_t)b->cluster_info.max_hops + 1u) * sizeof(uint64_t), a.ctx);
     if (b->fwd != NULL) {
         /* Memory-only: owned references the transactions still hold are
          * released without any session call. */
@@ -3178,9 +3290,9 @@ conn_by_cookie(moqr_bind_t *b, uint64_t cookie)
     return cn->used ? cn : NULL;
 }
 
-moqr_result_t
-moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
-                    moq_version_t version)
+static moqr_result_t
+bind_conn_open_cluster(moqr_bind_t *b, moq_session_t *session,
+                    moq_version_t version, const moqr_bind_cluster_peer_cfg_t *cluster)
 {
     if (b == NULL || session == NULL) {
         return MOQR_ERR_INVAL;
@@ -3198,6 +3310,10 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
     case MOQ_VERSION_DRAFT_22: draft = B_DRAFT_22; break;
     default:                   return MOQR_ERR_INVAL;
     }
+    moq_cluster_info_t ci;
+    if (moq_session_cluster_info(session, &ci, sizeof(ci)) == MOQ_OK && ci.enabled &&
+        (!b->cluster_info.enabled || ci.local_hop_id != b->cluster_info.local_hop_id))
+        return MOQR_ERR_INVAL;
     if (conn_by_session(b, session) != NULL) {
         return MOQR_ERR_INVAL;   /* duplicate attach */
     }
@@ -3218,6 +3334,15 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
             cn->session = session;
             cn->wire_draft = draft;
             cn->binding = binding;
+            cn->cluster_peer_ready = false;
+            cn->cluster_discovery_closed = false;
+            cn->cluster_discovery_retiring = false;
+            cn->cluster_discovery_cancel_owed = false;
+            cn->cluster_negotiated = false;
+            cn->cluster_discovery = (moq_ns_sub_handle_t){0};
+            cn->cluster_cost_override = cluster != NULL && cluster->has_relay_cost;
+            cn->cluster_cost = cluster != NULL ? cluster->relay_cost : 1;
+            cn->cluster_correlation = cluster != NULL ? cluster->correlation_id : 0;
             bind_dl_clear(b->dl_ready, i);
             bind_dl_clear(b->dl_parked, i);
             cn->park_reason = B_PARK_NONE;
@@ -3253,6 +3378,21 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
         }
     }
     return MOQR_ERR_CAPACITY;
+}
+
+moqr_result_t
+moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session, moq_version_t version)
+{
+    return bind_conn_open_cluster(b, session, version, NULL);
+}
+
+moqr_result_t
+moqr_bind_conn_open_cluster(moqr_bind_t *b, moq_session_t *session,
+    moq_version_t version, const moqr_bind_cluster_peer_cfg_t *cfg, size_t cfg_size)
+{
+    if (cfg == NULL || cfg_size < sizeof(*cfg) || cfg->struct_size < sizeof(*cfg))
+        return MOQR_ERR_INVAL;
+    return bind_conn_open_cluster(b, session, version, cfg);
 }
 
 /* The integer codec of the Object and Track Properties a connection reads
@@ -4857,6 +4997,19 @@ bind_ring_holds_ns(const moqr_bind_t *b, uint64_t bcookie, uint64_t handle)
 
 /* One attempt to accept a held update. true when the entry is settled
  * (answered, refused, or moot); false while it must still be held. */
+static moqr_result_t
+bind_cluster_update_current(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
+{
+    int slot = ann_find(b, cn, handle);
+    if (slot < 0) return MOQR_ERR_STALE_HANDLE;
+    moq_namespace_update_record_t rec;
+    if (moq_session_namespace_owed_update(cn->session,
+            (moq_announcement_t){handle}, &rec, sizeof(rec)) != MOQ_OK)
+        return MOQR_ERR_STALE_HANDLE;
+    return moqr_core_announce_cluster(b->core, cn->binding,
+        cn->anns[slot].ns, handle, &rec.cluster, true);
+}
+
 static bool
 bind_nsu_commit(moqr_bind_t *b, b_conn_t *cn, b_nsans_t *e, uint64_t now_us)
 {
@@ -4938,6 +5091,18 @@ bind_nsu_commit(moqr_bind_t *b, b_conn_t *cn, b_nsans_t *e, uint64_t now_us)
     if (family == B_NSU_NS && v.prefix && bind_ring_holds_ns(b, bcookie, handle)) {
         moqr_core_ns_update_abort(b->core, &nprep);
         return false;   /* an old-prefix notification goes first */
+    }
+    if (family == B_NSU_ANN && b->cluster_info.enabled && !e->cluster_applied) {
+        BIND_CALL_RETRY(crc, bind_cluster_update_current(b, cn, handle));
+        if (crc == MOQR_ERR_WOULD_BLOCK) return false;
+        if (crc != MOQR_OK) {
+            bind_nsans_drop(b, e);
+            bind_nsu_reject(b, cn, family, handle, id,
+                crc == MOQR_ERR_NOMEM || crc == MOQR_ERR_CAPACITY
+                    ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD : MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+            return true;
+        }
+        e->cluster_applied = true;
     }
     moq_result_t arc = bind_nsu_answer(cn, family, handle, id, false, 0, now_us);
     if (arc != MOQ_OK) {
@@ -6032,13 +6197,292 @@ bind_tracks_options(const moq_event_t *ev)
     return sq->options;
 }
 
+/* Resolve negotiated peer state once, then originate root discovery after
+ * SETUP authorization has been handled. Neither operation opens a transport. */
+static void bind_cluster_sync(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us, bool discover)
+{
+    if (!b->cluster_info.enabled || moq_session_state(cn->session) != MOQ_SESS_ESTABLISHED)
+        return;
+    moq_cluster_info_t info;
+    if (moq_session_cluster_info(cn->session, &info, sizeof(info)) != MOQ_OK)
+        return;
+    if (!cn->cluster_peer_ready) {
+        uint64_t cost = cn->cluster_cost_override ? cn->cluster_cost : info.peer_relay_cost;
+        if (moqr_core_binding_set_cluster(b->core, cn->binding, info.negotiated, info.peer_hop_id,
+                                          cost, cn->cluster_correlation) != MOQR_OK) {
+            b->session_errors++;
+            (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
+                                    "cluster peer configuration failed", now_us);
+            conn_detach(b, cn, now_us);
+            return;
+        }
+        cn->cluster_negotiated = info.negotiated;
+        cn->cluster_peer_hop = info.peer_hop_id;
+        cn->cluster_peer_ready = true;
+    }
+    if (discover && cn->cluster_negotiated && cn->cluster_discovery._opaque == 0) {
+        moq_subscribe_namespace_cfg_t cfg;
+        moq_subscribe_namespace_cfg_init(&cfg);
+        cfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+        moq_result_t rc =
+            moq_session_subscribe_namespace(cn->session, &cfg, now_us, &cn->cluster_discovery);
+        if (rc != MOQ_OK && rc != MOQ_ERR_WOULD_BLOCK && rc != MOQ_ERR_REQUEST_BLOCKED) {
+            b->session_errors++;
+            (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
+                                    "cluster discovery failed", now_us);
+            conn_detach(b, cn, now_us);
+        }
+    }
+}
+
+static void bind_cluster_discovery_end(moqr_bind_t *b, b_conn_t *cn, uint64_t handle,
+                                       uint64_t now_us)
+{
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_ann_t *a = &cn->anns[i];
+        if (a->used && a->discovered && a->discovery._opaque == handle)
+            (void)bind_ann_withdraw(b, cn, a->ann_raw, now_us);
+    }
+    cn->cluster_discovery_closed = true;
+    cn->cluster_discovery_retiring = false;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        const b_ann_t *a = &cn->anns[i];
+        if (a->used && a->discovered && a->discovery._opaque == handle)
+            cn->cluster_discovery_retiring = true;
+    }
+    /* Keep the terminal handle: rediscovery is a host reconnect policy,
+     * not a tight loop against a peer that rejected discovery. */
+}
+
+static void bind_cluster_discovery_cancel(moqr_bind_t *b, b_conn_t *cn, moq_ns_sub_handle_t handle,
+                                          uint64_t now_us)
+{
+    moq_result_t rc = moq_session_cancel_namespace_sub(cn->session, handle, now_us);
+    cn->cluster_discovery_cancel_owed = rc == MOQ_ERR_WOULD_BLOCK;
+    bind_cluster_discovery_end(b, cn, handle._opaque, now_us);
+}
+
+/* The latest candidate lives in an eager per-slot path buffer. Updating
+ * metadata cannot allocate or replace the engine's old route until admitted. */
+static void bind_cluster_apply_ann(moqr_bind_t *b, b_conn_t *cn, uint32_t slot, uint64_t now_us)
+{
+    b_ann_t *a = &cn->anns[slot];
+    if (!a->used || !a->discovered || !a->cluster_pending)
+        return;
+    moqr_result_t rc;
+    BIND_CALL_RETRY(rc, moqr_core_announce_cluster(b->core, cn->binding, a->ns, a->ann_raw,
+                                                   &a->cluster, !a->cluster_initial));
+    if (rc == MOQR_ERR_WOULD_BLOCK)
+        return;
+    if (rc == MOQR_OK) {
+        a->cluster_pending = false;
+        a->cluster_initial = false;
+        if (a->cluster_grant.gen != 0) {
+            moqr_grant_res_t grant = a->cluster_grant;
+            a->cluster_grant.gen = 0;
+            if (moqr_core_grant_commit(b->core, grant, 0) != MOQR_OK)
+                bind_cluster_discovery_cancel(b, cn, a->discovery, now_us);
+        }
+        return;
+    }
+    bool loop = false;
+    for (size_t i = 0; i < a->cluster.hop_count; i++)
+        if (b->cluster_info.local_hop_id != 0 &&
+            a->cluster.hop_ids[i] == b->cluster_info.local_hop_id)
+            loop = true;
+    if (loop) {
+        /* A looping replacement invalidates this route, while unrelated
+         * advertisements on its discovery stream remain usable. */
+        a->cluster_pending = false;
+        (void)bind_ann_withdraw(b, cn, a->ann_raw, now_us);
+    } else {
+        bind_cluster_discovery_cancel(b, cn, a->discovery, now_us);
+    }
+}
+
+static void bind_cluster_found(moqr_bind_t *b, b_conn_t *cn,
+                               const moq_namespace_found_event_t *found, uint64_t now_us)
+{
+    if (cn->cluster_discovery_closed || !cn->cluster_negotiated ||
+        found->handle._opaque != cn->cluster_discovery._opaque)
+        return;
+    const moq_ns_sub_handle_t discovery = found->handle;
+    moqr_ns_t ns = {found->track_namespace_suffix.parts, found->track_namespace_suffix.count};
+    if (found->cluster.hop_count == 0 || found->cluster.hop_ids == NULL ||
+        found->cluster.hop_count > b->cluster_info.max_hops) {
+        bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+        return;
+    }
+    int slot = -1;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_ann_t *a = &cn->anns[i];
+        if (a->used && a->discovered && a->discovery._opaque == discovery._opaque &&
+            ns_equal(a->ns, ns)) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        uint64_t err = 0, ticket = 0, lease = 0;
+        bind_auth_result_t auth =
+            bind_authorize(b, cn, MOQR_AUTH_PUBLISH_NAMESPACE, ns, (moq_bytes_t){0}, NULL, 0,
+                           now_us, &err, &ticket, &lease);
+        if (auth != BIND_AUTH_ALLOW || b->cluster_next_discovery == UINT64_C(0x0fffffffffffffff)) {
+            /* A response advertisement has no per-advertisement rejection.
+             * DENY/DEFER ends discovery without installing unauthorized routes. */
+            bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+            return;
+        }
+        uint64_t raw = UINT64_C(0xf000000000000000) | ++b->cluster_next_discovery;
+        slot = ann_store(b, cn, raw, ns);
+        if (slot < 0) {
+            bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+            return;
+        }
+        b_ann_t *a = &cn->anns[slot];
+        a->discovered = true;
+        a->discovery = discovery;
+        a->cluster_initial = true;
+        moqr_park_req_t request;
+        bind_park_init(&request, cn, b, MOQR_AUTH_PUBLISH_NAMESPACE, a->ns, (moq_bytes_t){0}, raw);
+        if (bind_grant_reserve(b, &request, NULL, 0, lease, now_us, &a->cluster_grant) != MOQR_OK) {
+            ann_clear_slot(b, cn, (uint32_t)slot);
+            bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+            return;
+        }
+    }
+    /* A metadata update changes neither the authorized namespace nor the
+     * publisher lifetime. Its existing grant continues tick-based renewal;
+     * it must not need a second grant slot for an unchanged authorization. */
+    b_ann_t *a = &cn->anns[slot];
+    uint64_t *path = cn->cluster_paths + (size_t)slot * b->cluster_info.max_hops;
+    memcpy(path, found->cluster.hop_ids, found->cluster.hop_count * sizeof(uint64_t));
+    a->cluster = found->cluster;
+    a->cluster.hop_ids = path;
+    a->cluster_pending = true;
+    bind_cluster_apply_ann(b, cn, (uint32_t)slot, now_us);
+}
+
+/* Send the route currently eligible for this recipient. Durable advertisement
+ * identity is recorded separately so a blocked origin change resumes after
+ * its withdrawal and never repeats DONE or splices publishers. */
+static moq_result_t bind_cluster_namespace(moqr_bind_t *b, b_conn_t *cn, const moqr_intent_t *it,
+                                           uint64_t now_us)
+{
+    moqr_ns_t ns = {it->ns_parts, it->ns_count};
+    moq_namespace_t suffix = {it->ns_parts + it->value, it->ns_count - (size_t)it->value};
+    moq_ns_sub_handle_t handle = {it->cookie};
+    b_cadv_t *old = NULL, *free_slot = NULL;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_cadv_t *a = &cn->cluster_adverts[i];
+        if (!a->ann.used) {
+            if (free_slot == NULL)
+                free_slot = a;
+        } else if (a->ann.ann_raw == it->cookie && ns_equal(a->ann.ns, ns))
+            old = a;
+    }
+    moqr_cluster_route_t route;
+    moqr_result_t selected = moqr_core_cluster_route(b->core, cn->binding, ns, &route);
+    if (selected != MOQR_OK && selected != MOQR_DONE)
+        return MOQ_ERR_INVAL;
+    bool gone = selected == MOQR_DONE || route.prefix_count != ns.count;
+    bool changed =
+        old != NULL && !gone &&
+        (old->origin != route.origin_id ||
+         (route.origin_id == 0 && (old->source_binding != route.original_source_binding_cookie ||
+                                   old->source_advertisement != route.original_route_generation)));
+    if (old != NULL && (gone || changed)) {
+        moq_result_t rc = moq_session_send_namespace_done(cn->session, handle, &suffix, now_us);
+        if (rc != MOQ_OK)
+            return rc;
+        if (old->ann.bytes != NULL)
+            b->alloc.free(old->ann.bytes, old->ann.bytes_len, b->alloc.ctx);
+        memset(old, 0, sizeof(*old));
+        free_slot = old;
+        old = NULL;
+    }
+    if (gone || (old != NULL && !cn->cluster_negotiated))
+        return MOQ_OK;
+    if (route.metadata.hop_count > b->cluster_info.max_hops || route.metadata.hop_ids == NULL)
+        return MOQ_ERR_INVAL;
+    memcpy(b->cluster_hops, route.metadata.hop_ids, route.metadata.hop_count * sizeof(uint64_t));
+    b->cluster_hops[route.metadata.hop_count] = b->cluster_info.local_hop_id;
+    moq_cluster_metadata_t metadata = route.metadata;
+    metadata.hop_ids = b->cluster_hops;
+    metadata.hop_count++;
+    b_cadv_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    if (old == NULL) {
+        if (free_slot == NULL)
+            return MOQ_ERR_NOMEM;
+        size_t size = 0;
+        for (size_t i = 0; i < ns.count; i++)
+            size += ns.parts[i].len;
+        if (size > BIND_ANN_BYTES_MAX)
+            return MOQ_ERR_INVAL;
+        if (size != 0) {
+            candidate.ann.bytes = b->alloc.alloc(size, b->alloc.ctx);
+            if (candidate.ann.bytes == NULL)
+                return MOQ_ERR_NOMEM;
+        }
+        candidate.ann.bytes_len = size;
+        candidate.ann.ns.count = ns.count;
+        size_t at = 0;
+        for (size_t i = 0; i < ns.count; i++) {
+            candidate.ann.parts[i] = (moq_bytes_t){candidate.ann.bytes + at, ns.parts[i].len};
+            memcpy(candidate.ann.bytes + at, ns.parts[i].data, ns.parts[i].len);
+            at += ns.parts[i].len;
+        }
+    }
+    moq_result_t rc = cn->cluster_negotiated
+                          ? moq_session_send_namespace_cluster(cn->session, handle, &suffix,
+                                                               &metadata, sizeof(metadata), now_us)
+                          : moq_session_send_namespace(cn->session, handle, &suffix, now_us);
+    if (rc != MOQ_OK) {
+        if (candidate.ann.bytes != NULL)
+            b->alloc.free(candidate.ann.bytes, candidate.ann.bytes_len, b->alloc.ctx);
+        return rc;
+    }
+    if (old == NULL) {
+        *free_slot = candidate;
+        old = free_slot;
+        old->ann.ns.parts = old->ann.parts;
+        old->ann.used = true;
+        old->ann.ann_raw = it->cookie;
+    }
+    old->origin = route.origin_id;
+    old->source_binding = route.original_source_binding_cookie;
+    old->source_advertisement = route.original_route_generation;
+    return MOQ_OK;
+}
+
 static void
 bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
               uint64_t now_us)
 {
     moq_bytes_t nsbuf[32];
     b->events_translated++;
+    bind_cluster_sync(b, cn, now_us, false);
+    if (cn->closed || !cn->used) return;
     switch (ev->kind) {
+    case MOQ_EVENT_NAMESPACE_FOUND:
+        bind_cluster_found(b, cn, &ev->u.namespace_found, now_us);
+        break;
+    case MOQ_EVENT_NAMESPACE_GONE: {
+        const moq_namespace_gone_event_t *gone = &ev->u.namespace_gone;
+        moqr_ns_t ns = {gone->track_namespace_suffix.parts, gone->track_namespace_suffix.count};
+        for (uint32_t i = 0; i < b->n_anns; i++) {
+            b_ann_t *a = &cn->anns[i];
+            if (a->used && a->discovered && a->discovery._opaque == gone->handle._opaque && ns_equal(a->ns, ns)) {
+                (void)bind_ann_withdraw(b, cn, a->ann_raw, now_us); break;
+            }
+        }
+        break;
+    }
+    case MOQ_EVENT_NS_SUB_ERROR:
+        if (ev->u.ns_sub_error.handle._opaque == cn->cluster_discovery._opaque)
+            bind_cluster_discovery_end(b, cn, cn->cluster_discovery._opaque, now_us);
+        break;
     case MOQ_EVENT_NAMESPACE_PUBLISHED: {
         const moq_namespace_published_event_t *np =
             &ev->u.namespace_published;
@@ -7020,6 +7464,12 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
     case MOQ_EVENT_NAMESPACE_SUBSCRIPTION_TERMINATED: {
         const moq_ns_subscription_terminated_event_t *nt =
             &ev->u.ns_subscription_terminated;
+        if (nt->local_role == MOQ_REQUEST_ROLE_REQUESTER &&
+            nt->handle._opaque == cn->cluster_discovery._opaque) {
+            bind_cluster_discovery_end(b, cn, nt->handle._opaque, now_us);
+            break;
+        }
+        bind_cluster_adverts_clear(b, cn, nt->handle._opaque);
         if (cn->wire_draft != B_DRAFT_22 ||
             nt->local_role != MOQ_REQUEST_ROLE_RESPONDER) {
             break;
@@ -7694,8 +8144,9 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
             !bind_ns_sub_accept_held(b, cn, it->cookie)) {
             moq_namespace_t suffix = { .parts = suffix_ns.parts,
                                        .count = suffix_ns.count };
-            moq_result_t rc =
-                is_gone
+            moq_result_t rc = b->cluster_info.enabled
+                ? bind_cluster_namespace(b, cn, it, now_us)
+                : is_gone
                     ? moq_session_send_namespace_done(cn->session, h, &suffix,
                                                       now_us)
                     : moq_session_send_namespace(cn->session, h, &suffix,
@@ -10061,6 +10512,18 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
             moqr_retrieve_standalone_query_t q;
             memset(&q, 0, sizeof(q));
             q.remote_cookie = plan.remote_cookie;
+            if (b->cluster_info.enabled) {
+                moqr_cluster_route_t selected;
+                if (moqr_core_cluster_route(b->core, cn->binding, req.ns, &selected) != MOQR_OK) {
+                    bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_DOES_NOT_EXIST, now_us);
+                    return;
+                }
+                q.cluster_selected = true;
+                q.cluster_source_binding_cookie = selected.original_source_binding_cookie;
+                q.cluster_source_route_generation = selected.original_route_generation;
+                q.cluster_requester_hop_id = cn->cluster_peer_hop;
+                q.cluster_requester_correlation_id = cn->cluster_correlation;
+            }
             q.ns = req.ns;
             q.name = req.name;
             q.start_group = req.start_group;
@@ -12526,6 +12989,17 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         /* Re-check the grant every pump (not only when events arrive): a peer
          * blocked at its ceiling sends nothing until the grant reaches it. */
         if (cn->used && !cn->closed && cn->session != NULL) {
+            if (!cn->cluster_discovery_closed && b->cluster_info.enabled) {
+                for (uint32_t a = 0; a < b->n_anns && cn->used && !cn->closed; a++)
+                    bind_cluster_apply_ann(b, cn, a, now_us);
+            }
+            if (!cn->used || cn->closed) continue;
+            if (cn->cluster_discovery_cancel_owed)
+                bind_cluster_discovery_cancel(b, cn, cn->cluster_discovery, now_us);
+            else if (cn->cluster_discovery_retiring)
+                bind_cluster_discovery_end(b, cn, cn->cluster_discovery._opaque, now_us);
+            bind_cluster_sync(b, cn, now_us, true);
+            if (!cn->used || cn->closed) continue;
             bind_maybe_grant_capacity(b, cn, now_us);
             bind_retry_owed_cancels(b, cn, now_us);
         }
@@ -12563,10 +13037,16 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         moq_cancel_namespace_cfg_t ccfg;
         moq_cancel_namespace_cfg_init(&ccfg);
         ccfg.error_code = rev->error_code;
-        moq_result_t crc = moq_session_cancel_namespace(
-            rcn->session,
-            (moq_announcement_t){ ._opaque = rev->session_cookie }, &ccfg,
-            now_us);
+        int source_ann = ann_find(b, rcn, rev->session_cookie);
+        bool discovered = source_ann >= 0 && rcn->anns[source_ann].discovered;
+        moq_ns_sub_handle_t discovery = discovered
+            ? rcn->anns[source_ann].discovery : (moq_ns_sub_handle_t){0};
+        moq_result_t crc = discovered
+            ? moq_session_cancel_namespace_sub(rcn->session, discovery, now_us)
+            : moq_session_cancel_namespace(rcn->session,
+                (moq_announcement_t){ ._opaque = rev->session_cookie }, &ccfg, now_us);
+        if (discovered && crc != MOQ_ERR_WOULD_BLOCK)
+            bind_cluster_discovery_end(b, rcn, discovery._opaque, now_us);
         if (crc == MOQ_OK) {
             int ann_slot = ann_find(b, rcn, rev->session_cookie);
             if (ann_slot >= 0) {
