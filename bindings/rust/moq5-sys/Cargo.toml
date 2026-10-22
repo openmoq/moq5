@@ -2,8 +2,8 @@
 name = "moq5-sys"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
-rust-version = "1.92"
 description = "Raw FFI bindings to the libmoq (MOQ5) service tier"
 repository = "https://github.com/openmoq/moq5"
 readme = "README.md"
@@ -11,8 +11,34 @@ keywords = ["moq", "media-over-quic", "ffi", "bindings"]
 categories = ["external-ffi-bindings", "multimedia"]
 links = "moq"
 build = "build.rs"
+publish = false
 
 [dependencies]
 
+[dev-dependencies]
+# The build script's sysroot rules (build_sysroot.rs) are tested as a module.
+shlex = "2"
+
+[lib]
+# The documentation is the C headers' comments, whose indented samples are
+# C: they are not doctests.
+doctest = false
+
 [build-dependencies]
-bindgen = "0.72"
+# Without the default features: they add bindgen's prettyplease formatter,
+# whose release takes syn 2 beside the syn 3 bindgen resolves. The bindings
+# are formatted by the toolchain's rustfmt instead (see build.rs).
+bindgen = { version = "0.73", default-features = false, features = ["runtime", "logging"] }
+pkg-config = "0.3"
+shlex = "2"
+
+[package.metadata.docs.rs]
+# docs.rs has no libmoq SDK: the build script sets cfg(docsrs) and the crate
+# includes the committed snapshot in docs/ instead of generating bindings.
+# The snapshot carries the layouts of the targets it is generated and
+# verified on (tests/snapshot.rs), so documentation builds are restricted
+# to those; docs.rs's default set includes 32-bit targets the snapshot's
+# layout assertions would not compile on.
+all-features = false
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

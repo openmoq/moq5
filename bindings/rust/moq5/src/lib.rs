@@ -1,121 +1,112 @@
 //! Safe Rust API for libmoq, the MOQ5 Media over QUIC library.
 //!
 //! This crate wraps libmoq's *service tier*: a managed [`Endpoint`]
-//! (connection, MoQ session and network thread), a [`MediaSender`] that
-//! publishes a namespace with an MSF/CMSF catalog, and a [`MediaReceiver`]
-//! that discovers and receives one. The raw C API stays available as
-//! [`sys`] (the `moq5-sys` crate).
+//! (connection, MoQ session and network thread), a [`Sender`] that
+//! publishes a namespace with an MSF/CMSF catalog, and a [`Receiver`] that
+//! discovers and receives one. The raw C API stays available as [`sys`]
+//! (the `moq5-sys` crate), whose header comments are the contract; its
+//! generated names are used qualified (`sys::moq_endpoint_cfg_t`) rather
+//! than imported, as one large group of generated types.
 //!
-//! What the wrapper enforces that C leaves to documentation:
+//! What the types enforce that C leaves to documentation:
 //!
 //! - **Teardown order.** Senders and receivers hold their endpoint, and the
 //!   endpoint is stopped and destroyed only when its last handle drops.
 //! - **Handle ownership.** Track handles are checked against the sender or
-//!   receiver that issued them; a foreign one fails with [`Error::INVAL`].
-//! - **Payload ownership.** [`MediaSender::write`] takes an [`RcBuf`] and
-//!   hands it back on failure; received [`MediaObject`]s release their
-//!   buffers on drop, on the polling thread.
-//! - **Lifetimes.** Track descriptions borrow the receiver that owns them.
+//!   receiver that issued them; a foreign one fails with [`Error::INVAL`]
+//!   before reaching libmoq.
+//! - **Buffer ownership.** [`Sender::write`] takes a [`Buffer`] and hands it
+//!   back on failure; received [`MediaObject`]s release their buffers on
+//!   drop, on the polling thread.
+//! - **Sized records.** Every configuration is built with the library's
+//!   sized initializer, so every field reaches the service; every sized
+//!   output is read under the `struct_size` the library stamped, a field it
+//!   did not report is `None`, and a stamp outside the contract is
+//!   [`Error::ABI_MISMATCH`].
+//! - **Snapshots.** A [`TrackDescription`] is the track's current state,
+//!   copied under the receiver's lock; nothing reads the mutable native
+//!   description concurrently with the service.
 //! - **Threading.** [`Endpoint`] is `Send + Sync` (interrupting from another
 //!   thread is the point of its latch); senders and receivers are `Send` but
-//!   not `Sync`, so their calls are serialized.
+//!   not `Sync`; media objects stay on the polling thread; buffers move.
+//!
+//! **No application code runs on the service's threads.** This crate
+//! installs no C callbacks, posts no tasks, and adopts no buffer whose
+//! release runs application code: a buffer release only deallocates. So the
+//! last [`Endpoint`] drop always happens on an application thread, and
+//! `stop()` never joins the thread it runs on. Anything that would run
+//! application code on a native thread (a raw endpoint from
+//! [`Endpoint::from_raw`], a release given to [`Buffer::wrap_raw`]) is
+//! `unsafe` and re-establishes that invariant itself.
+//!
+//! Demand is observed, not signalled: [`Sender::is_ready`] and the
+//! subscriber queries are point-in-time snapshots, and [`Sender::wait`] waits
+//! for the write level (ready with send-queue headroom), not for a
+//! subscriber.
+//!
+//! The public enums that mirror a native set and the records the library
+//! stamps are `#[non_exhaustive]`: they grow with the C API, and an unknown
+//! native value is carried as an `Other(raw)` variant.
 //!
 //! ```no_run
-//! use std::time::Duration;
 //! use moq5::{
-//!     Endpoint, EndpointConfig, MediaSender, MediaType, Namespace, Packaging,
-//!     RcBuf, SendObject, SenderConfig, StartupStatus, TrackConfig,
+//!     Buffer, Endpoint, EndpointConfig, MediaType, Namespace, Packaging, SendObject,
+//!     SendTrackConfig, Sender, SenderConfig,
 //! };
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let ep = Endpoint::connect(&EndpointConfig::new("https://relay.example:4443/moq"))?;
-//! let cfg = SenderConfig::live(Namespace::parse("live/demo")?);
-//! let video = TrackConfig::new("video", MediaType::Video, Packaging::Loc, "avc1.42e01e")
-//!     .bitrate(2_000_000);
-//! // Attach and add the track in one network turn, so the first catalog has it.
-//! let mut startup = MediaSender::start(&ep, cfg, vec![video])?;
-//! let (sender, tracks) = loop {
-//!     match startup.wait(Duration::from_millis(100)) {
-//!         StartupStatus::Done(r) => break r?,
-//!         StartupStatus::Pending(s) => startup = s,
-//!     }
-//! };
-//! let mut obj = SendObject::new(RcBuf::from_owner(vec![0u8; 100])?);
-//! obj.is_sync = true;
-//! obj.starts_group = true;
-//! sender.write(tracks[0], obj)?;
+//! let endpoint = Endpoint::connect(&EndpointConfig::new("https://relay.example:4443/moq"))?;
+//! let sender = Sender::attach(&endpoint, &SenderConfig::live(Namespace::parse("live/demo")?))?;
+//! let video = sender.add_track(
+//!     &SendTrackConfig::new("video", MediaType::Video, Packaging::Raw, "avc1.42e01e")
+//!         .bitrate(2_000_000),
+//! )?;
+//! let mut object = SendObject::new(Buffer::from_vec(vec![0u8; 100])?);
+//! object.is_sync = true;
+//! object.starts_group = true;
+//! sender.write(video, object)?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # Linking
 //!
-//! `moq5-sys` links the static libmoq archives from an install prefix; see
-//! its documentation for `MOQ_PREFIX`.
-//!
-//! # Testing without a relay
-//!
-//! With the `testing` feature, `testing::install` replaces libmoq's
-//! service calls with a table of fakes until the returned guard drops, so an
-//! integration can be tested deterministically.
+//! `moq5-sys` finds the installed SDK through pkg-config (`libmoq-service`);
+//! see its documentation for `MOQ_PREFIX` and the supported SDK builds.
 
 #![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub use moq5_sys as sys;
 
+mod buffer;
 pub mod cmaf;
 mod endpoint;
 mod error;
 mod ffi;
 mod namespace;
-mod rcbuf;
 mod receiver;
 mod sender;
 mod types;
 
+pub use buffer::Buffer;
 pub use endpoint::{
-    Backend, Endpoint, EndpointConfig, EndpointState, Protocol, TaskContext, Terminal,
-    TerminalReason, VersionOffer, WtProfile,
+    AuthToken, Backend, Endpoint, EndpointConfig, EndpointState, Protocol, Terminal,
+    TerminalReason, UriMode, VersionOffer, WtProfile,
 };
 pub use error::{Error, Result};
-pub use namespace::{Namespace, NamespaceError};
-pub use rcbuf::RcBuf;
+pub use namespace::Namespace;
 pub use receiver::{
-    ContentProtectionRef, MediaObject, MediaReceiver, ReceiverConfig, ReceiverStats, ReceiverTrack,
-    SapRecord, StartMode, SubscribeOptions, TimeMode, TimelineRecord, TrackDesc, TrackEvent,
-    TrackEventKind, TrackState,
+    ContentProtectionRef, FillLoss, FillTerminal, LossReport, MediaObject, MediaTemplate,
+    ObjectIdentity, ParseDrop, ParseDropClass, Receiver, ReceiverConfig, ReceiverStats, SapRecord,
+    StartMode, StreamTerminal, StreamTerminalKind, SubscribeOptions, TimeMode, TimelineRecord,
+    Track, TrackDescription, TrackEvent, TrackEventKind, TrackState,
 };
 pub use sender::{
-    Backpressure, CmsfUrl, ContentProtection, DrmSystem, MediaSender, MediaTrack, SendObject,
-    SenderConfig, SenderStartup, SenderStats, StartupStatus, TrackConfig, WriteError,
+    Backpressure, CmsfUrl, ContentProtection, DrmSystem, SendObject, SendTrack, SendTrackConfig,
+    Sender, SenderConfig, SenderStats, WriteError,
 };
-pub use types::{MediaType, Packaging, SapType, Version, Wait};
-
-/// The libmoq version string, e.g. `0.1.0`.
-pub fn libmoq_version() -> &'static str {
-    // SAFETY: a static NUL-terminated string.
-    unsafe { std::ffi::CStr::from_ptr(sys::moq_version_string()) }
-        .to_str()
-        .unwrap_or("unknown")
-}
-
-/// Replace libmoq's service calls with fakes, for tests.
-///
-/// ```ignore
-/// use moq5::testing::{install, Api, REAL};
-/// unsafe extern "C" fn connect(
-///     _cfg: *const moq5::sys::moq_endpoint_cfg_t,
-///     _out: *mut *mut moq5::sys::moq_endpoint_t,
-/// ) -> moq5::sys::moq_result_t {
-///     moq5::sys::MOQ_ERR_UNSUPPORTED
-/// }
-/// let _guard = install(Api { moq_endpoint_connect: connect, ..REAL });
-/// ```
-#[cfg(any(test, feature = "testing"))]
-pub mod testing {
-    pub use crate::ffi::seam::{install, ApiGuard};
-    pub use crate::ffi::{Api, REAL};
-}
-
-#[cfg(test)]
-mod tests;
+pub use types::{
+    libmoq_version, CompanionProfile, DeliveryOrigin, Location, MediaType, ObjectStatus, Packaging,
+    SapType, Version, WaitResult,
+};

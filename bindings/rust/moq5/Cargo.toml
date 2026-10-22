@@ -2,21 +2,24 @@
 name = "moq5"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.92"
+rust-version = "1.85"
 license = "Apache-2.0"
 description = "Safe Rust API for the libmoq (MOQ5) Media over QUIC service tier"
 repository = "https://github.com/openmoq/moq5"
+readme = "README.md"
 keywords = ["moq", "media-over-quic", "quic", "streaming", "cmaf"]
 categories = ["api-bindings", "multimedia", "network-programming"]
-
-[features]
-# Route every libmoq service call through a swappable table so tests can
-# replace libmoq without a relay. Off in normal builds, where the calls are
-# direct.
-testing = []
+publish = false
 
 [dependencies]
 moq5-sys = { version = "0.1.0", path = "../moq5-sys" }
 
 [package.metadata.docs.rs]
-features = ["testing"]
+# Documented from moq5-sys's cfg(docsrs) snapshot, on the targets that
+# snapshot is verified on (see moq5-sys/Cargo.toml).
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+[[test]]
+name = "compile_fail"
+path = "tests/compile_fail.rs"

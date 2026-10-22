@@ -1,12 +1,13 @@
 use std::fmt;
+use std::str::FromStr;
 
-use crate::sys;
-use crate::types::span;
+use crate::error::{Error, Result};
+use crate::{ffi, sys};
 
 /// A MoQ track namespace: an ordered list of non-empty byte parts.
 ///
-/// It owns the bytes libmoq's `moq_namespace_t` points into, so a sender or
-/// receiver keeps it alive for as long as it may be read.
+/// It owns the bytes the `moq_namespace_t` it lends to libmoq points into;
+/// the service copies them at attach.
 pub struct Namespace {
     parts: Vec<Box<[u8]>>,
     spans: Vec<sys::moq_bytes_t>,
@@ -17,63 +18,41 @@ pub struct Namespace {
 unsafe impl Send for Namespace {}
 unsafe impl Sync for Namespace {}
 
-/// Why a namespace was refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NamespaceError {
-    /// No parts at all.
-    Empty,
-    /// One of the parts is empty; carries the namespace as given.
-    EmptyPart(String),
-}
-
-impl fmt::Display for NamespaceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            NamespaceError::Empty => f.write_str("namespace is empty"),
-            NamespaceError::EmptyPart(s) => write!(f, "namespace has an empty part: '{s}'"),
-        }
-    }
-}
-
-impl std::error::Error for NamespaceError {}
-
 impl Namespace {
-    /// A namespace from its parts. Every part must be non-empty, and there
-    /// must be at least one.
-    pub fn new<I, P>(parts: I) -> Result<Namespace, NamespaceError>
+    /// A namespace from its parts. There must be at least one, and every
+    /// part must be non-empty; otherwise [`Error::INVAL`], as libmoq would
+    /// answer.
+    pub fn try_new<Parts, Part>(parts: Parts) -> Result<Namespace>
     where
-        I: IntoIterator<Item = P>,
-        P: Into<Vec<u8>>,
+        Parts: IntoIterator<Item = Part>,
+        Part: Into<Vec<u8>>,
     {
-        let parts: Vec<Box<[u8]>> = parts.into_iter().map(|p| p.into().into()).collect();
-        if parts.is_empty() {
-            return Err(NamespaceError::Empty);
+        let mut owned: Vec<Box<[u8]>> = Vec::new();
+        for part in parts {
+            owned.push(part.into().into_boxed_slice());
         }
-        if parts.iter().any(|p| p.is_empty()) {
-            let joined: Vec<String> = parts
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect();
-            return Err(NamespaceError::EmptyPart(joined.join("/")));
+        if owned.is_empty() || owned.iter().any(|part| part.is_empty()) {
+            return Err(Error::INVAL);
         }
-        let spans = parts.iter().map(|p| span(p)).collect();
-        Ok(Namespace { parts, spans })
+        let spans = owned.iter().map(|part| ffi::span(part)).collect();
+        Ok(Namespace {
+            parts: owned,
+            spans,
+        })
     }
 
-    /// Split a slash-separated namespace, e.g. `"live/room1"`.
-    pub fn parse(s: &str) -> Result<Namespace, NamespaceError> {
-        if s.is_empty() {
-            return Err(NamespaceError::Empty);
+    /// Split a slash-separated namespace, e.g. `"live/room1"` (also
+    /// `str::parse`).
+    pub fn parse(text: &str) -> Result<Namespace> {
+        if text.is_empty() {
+            return Err(Error::INVAL);
         }
-        Namespace::new(s.split('/')).map_err(|e| match e {
-            NamespaceError::EmptyPart(_) => NamespaceError::EmptyPart(s.into()),
-            e => e,
-        })
+        Namespace::try_new(text.split('/'))
     }
 
     /// The parts, in order.
     pub fn parts(&self) -> impl Iterator<Item = &[u8]> {
-        self.parts.iter().map(|p| &p[..])
+        self.parts.iter().map(|part| &part[..])
     }
 
     pub(crate) fn raw(&self) -> sys::moq_namespace_t {
@@ -84,9 +63,18 @@ impl Namespace {
     }
 }
 
+impl FromStr for Namespace {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Namespace> {
+        Namespace::parse(text)
+    }
+}
+
 impl Clone for Namespace {
     fn clone(&self) -> Namespace {
-        Namespace::new(self.parts.iter().map(|p| p.to_vec())).expect("already validated")
+        Namespace::try_new(self.parts.iter().map(|part| part.to_vec()))
+            .expect("the parts were validated when this namespace was built")
     }
 }
 
@@ -98,6 +86,7 @@ impl PartialEq for Namespace {
 
 impl Eq for Namespace {}
 
+// The parts as text, not the spans a derive would print.
 impl fmt::Debug for Namespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Namespace({self})")
@@ -106,11 +95,11 @@ impl fmt::Debug for Namespace {
 
 impl fmt::Display for Namespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, p) in self.parts.iter().enumerate() {
-            if i > 0 {
+        for (index, part) in self.parts.iter().enumerate() {
+            if index > 0 {
                 f.write_str("/")?;
             }
-            f.write_str(&String::from_utf8_lossy(p))?;
+            f.write_str(&String::from_utf8_lossy(part))?;
         }
         Ok(())
     }
@@ -122,27 +111,32 @@ mod tests {
 
     #[test]
     fn parse() {
-        let ns = Namespace::parse("live/room1").unwrap();
-        assert_eq!(ns.parts().collect::<Vec<_>>(), [&b"live"[..], b"room1"]);
-        assert_eq!(ns.to_string(), "live/room1");
-        let raw = ns.raw();
+        let namespace = Namespace::parse("live/room1").expect("two parts");
+        assert_eq!(
+            namespace.parts().collect::<Vec<_>>(),
+            [&b"live"[..], b"room1"]
+        );
+        assert_eq!(namespace.to_string(), "live/room1");
+        assert_eq!(format!("{namespace:?}"), "Namespace(live/room1)");
+        let raw = namespace.raw();
         assert_eq!(raw.count, 2);
-        assert_eq!(unsafe { crate::types::bytes(*raw.parts.add(1)) }, b"room1");
-        assert_eq!(ns.clone(), ns);
+        // SAFETY: the span points into `namespace`.
+        assert_eq!(unsafe { ffi::bytes(*raw.parts.add(1)) }, b"room1");
+        assert_eq!(namespace.clone(), namespace);
+        let parsed: Namespace = "a/b".parse().expect("FromStr");
+        assert_eq!(parsed.to_string(), "a/b");
     }
 
     #[test]
     fn refused() {
-        assert_eq!(Namespace::parse(""), Err(NamespaceError::Empty));
-        let e = Namespace::parse("a//b").unwrap_err();
-        assert_eq!(e.to_string(), "namespace has an empty part: 'a//b'");
+        assert_eq!(Namespace::parse("").unwrap_err(), Error::INVAL);
+        assert_eq!(Namespace::parse("a//b").unwrap_err(), Error::INVAL);
+        assert_eq!(Namespace::parse("/a").unwrap_err(), Error::INVAL);
         assert_eq!(
-            Namespace::parse("/a").unwrap_err(),
-            NamespaceError::EmptyPart("/a".into())
+            Namespace::try_new(Vec::<Vec<u8>>::new()).unwrap_err(),
+            Error::INVAL
         );
-        assert_eq!(
-            Namespace::new(Vec::<Vec<u8>>::new()),
-            Err(NamespaceError::Empty)
-        );
+        assert!(Namespace::try_new([b"a".to_vec(), b"b".to_vec()]).is_ok());
+        assert!("".parse::<Namespace>().is_err());
     }
 }

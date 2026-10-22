@@ -1,0 +1,12 @@
+[package]
+name = "moq5-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "An out-of-tree consumer of moq5 against an installed SDK"
+
+[dependencies]
+moq5 = { path = "../moq5" }
+
+[workspace]

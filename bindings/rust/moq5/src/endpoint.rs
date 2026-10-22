@@ -1,16 +1,14 @@
-use std::cell::Cell;
-use std::ffi::c_void;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{mem, ptr};
 
-use crate::error::{check, Error, Result};
-use crate::ffi;
-use crate::sys;
-use crate::types::{micros, span, wait_result, Version, Wait};
+use crate::error::{Error, Result};
+use crate::types::{Version, WaitResult};
+use crate::{ffi, sys};
 
-/// How the endpoint reaches the relay.
+/// How the endpoint reaches the relay (`moq_transport_protocol_t`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Protocol {
     /// Derive from the URL scheme: `moqt://`/`moq://` is raw QUIC, `https://`
@@ -23,12 +21,24 @@ pub enum Protocol {
     WebTransport,
 }
 
-/// Which QUIC stack serves the connection. Backends other than the picoquic
-/// default are opt-in and only present when libmoq was built with them.
+impl Protocol {
+    fn raw(self) -> sys::moq_transport_protocol_t {
+        match self {
+            Protocol::Auto => sys::MOQ_TRANSPORT_PROTOCOL_AUTO,
+            Protocol::RawQuic => sys::MOQ_TRANSPORT_PROTOCOL_RAW_QUIC,
+            Protocol::WebTransport => sys::MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT,
+        }
+    }
+}
+
+/// Which QUIC stack serves the connection (`moq_transport_backend_t`).
+/// Backends other than the picoquic default are opt-in and present only
+/// when libmoq was built with them.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum Backend {
-    /// The picoquic family, libmoq's stable default.
+    /// The picoquic family, libmoq's stable default; never an opt-in backend.
     #[default]
     Auto,
     Picoquic,
@@ -39,10 +49,26 @@ pub enum Backend {
     WtquicMsQuic,
 }
 
-/// Which MoQ Transport versions to offer.
+impl Backend {
+    fn raw(self) -> sys::moq_transport_backend_t {
+        match self {
+            Backend::Auto => sys::MOQ_TRANSPORT_BACKEND_AUTO,
+            Backend::Picoquic => sys::MOQ_TRANSPORT_BACKEND_PICOQUIC,
+            Backend::Mvfst => sys::MOQ_TRANSPORT_BACKEND_MVFST,
+            Backend::Proxygen => sys::MOQ_TRANSPORT_BACKEND_PROXYGEN,
+            Backend::MsQuic => sys::MOQ_TRANSPORT_BACKEND_MSQUIC,
+            Backend::WtquicNetwork => sys::MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK,
+            Backend::WtquicMsQuic => sys::MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC,
+        }
+    }
+}
+
+/// Which MoQ Transport versions to offer (`moq_version_policy_t`).
+#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum VersionOffer {
-    /// Every version this libmoq build supports, newest first.
+    /// Every version this libmoq build supports, newest first, with
+    /// [`EndpointConfig::preferred_version`] moved to the front.
     #[default]
     Auto,
     /// Exactly these, in preference order; the peer picks.
@@ -51,8 +77,10 @@ pub enum VersionOffer {
     Exact(Version),
 }
 
-/// The WebTransport-over-HTTP/3 wire profile. Only a backend that can choose
-/// a dialect accepts an explicit one.
+/// The WebTransport-over-HTTP/3 wire profile (`moq_wt_profile_t`). Only a
+/// backend that can choose a dialect (wtquic-msquic) accepts an explicit
+/// one; the others refuse it with [`Error::UNSUPPORTED`] at connect.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WtProfile {
     /// The backend's own default.
@@ -64,7 +92,62 @@ pub enum WtProfile {
     D13_14Compat,
 }
 
+impl WtProfile {
+    fn raw(self) -> u32 {
+        match self {
+            WtProfile::BackendDefault => sys::MOQ_WT_PROFILE_BACKEND_DEFAULT,
+            WtProfile::Current => sys::MOQ_WT_PROFILE_CURRENT,
+            WtProfile::D13_14Compat => sys::MOQ_WT_PROFILE_D13_14_COMPAT,
+        }
+    }
+}
+
+/// How the service reads the URL (`moq_endpoint_cfg_t.uri_mode`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UriMode {
+    /// The original parser: lowercase `moqt`/`moq`/`https`, port 4433 for
+    /// the QUIC schemes, the `wt_path` override and the `/moq` WebTransport
+    /// default.
+    #[default]
+    Legacy,
+    /// The MOQT URI scheme: `moqt`/`https` case-insensitively, port 443 when
+    /// omitted, the URL's own path and query as the WebTransport path; a
+    /// non-empty `wt_path` is [`Error::INVAL`].
+    Standard,
+    /// A mode this crate does not know; libmoq refuses it.
+    Other(u32),
+}
+
+impl UriMode {
+    /// The `MOQ_ENDPOINT_URI_*` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            UriMode::Legacy => sys::MOQ_ENDPOINT_URI_LEGACY,
+            UriMode::Standard => sys::MOQ_ENDPOINT_URI_STANDARD,
+            UriMode::Other(code) => code,
+        }
+    }
+}
+
+/// An authorization token the session presents in its SETUP
+/// (`moq_auth_token_t`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthToken {
+    /// The token type; draft-16 carries values up to 2^62-1.
+    pub token_type: u64,
+    /// The token value, at most 65535 bytes.
+    pub value: Vec<u8>,
+}
+
 /// How to connect an [`Endpoint`].
+///
+/// Every connect builds the C configuration with the sized initializer, so
+/// every field here reaches the service. What this crate does not expose
+/// stays at the initializer's default: the allocator, the certificate trust
+/// callback, the server-side URI policy and the perspective; those remain
+/// reachable through [`sys`](crate::sys).
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     url: String,
@@ -77,10 +160,14 @@ pub struct EndpointConfig {
     wt_path: Option<String>,
     wt_profile: WtProfile,
     handshake_timeout: Option<Duration>,
+    setup_auth_tokens: Vec<AuthToken>,
+    uri_mode: UriMode,
+    preferred_version: Option<Version>,
 }
 
 impl EndpointConfig {
     /// Connect to `url`: `moqt://host:port[/path]` or `https://host:port/path`.
+    #[must_use]
     pub fn new(url: impl Into<String>) -> EndpointConfig {
         EndpointConfig {
             url: url.into(),
@@ -93,28 +180,35 @@ impl EndpointConfig {
             wt_path: None,
             wt_profile: WtProfile::BackendDefault,
             handshake_timeout: None,
+            setup_auth_tokens: Vec::new(),
+            uri_mode: UriMode::Legacy,
+            preferred_version: None,
         }
     }
 
     /// Override the protocol the URL scheme implies.
+    #[must_use]
     pub fn protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
         self
     }
 
     /// Pick a QUIC backend.
+    #[must_use]
     pub fn backend(mut self, backend: Backend) -> Self {
         self.backend = backend;
         self
     }
 
     /// Which versions to offer.
+    #[must_use]
     pub fn versions(mut self, versions: VersionOffer) -> Self {
         self.versions = versions;
         self
     }
 
     /// TLS server name; defaults to the URL host.
+    #[must_use]
     pub fn sni(mut self, sni: impl Into<String>) -> Self {
         self.sni = Some(sni.into());
         self
@@ -122,112 +216,132 @@ impl EndpointConfig {
 
     /// PEM CA bundle to verify the peer against instead of the backend's
     /// default roots.
+    #[must_use]
     pub fn ca_file(mut self, path: impl Into<String>) -> Self {
         self.ca_file = Some(path.into());
         self
     }
 
     /// Skip certificate verification. For tests and demos only.
+    #[must_use]
     pub fn insecure_skip_verify(mut self, insecure: bool) -> Self {
         self.insecure_skip_verify = insecure;
         self
     }
 
-    /// WebTransport path; defaults to the URL path, or `/moq`.
+    /// WebTransport CONNECT target override; defaults to the URL path, or
+    /// `/moq`. Only under [`UriMode::Legacy`].
+    #[must_use]
     pub fn wt_path(mut self, path: impl Into<String>) -> Self {
         self.wt_path = Some(path.into());
         self
     }
 
     /// WebTransport wire profile.
+    #[must_use]
     pub fn wt_profile(mut self, profile: WtProfile) -> Self {
         self.wt_profile = profile;
         self
     }
 
-    /// Upper bound on the transport handshake (picoquic only).
+    /// Upper bound on the QUIC/TLS handshake, exact microseconds. Unset
+    /// leaves the backend's own value (30 s on picoquic); only the picoquic
+    /// backend honours it, and the service refuses a value above
+    /// `MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US`. It does not bound the
+    /// WebTransport CONNECT or the MoQ SETUP.
+    #[must_use]
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = Some(timeout);
         self
     }
-}
 
-fn opt_span(s: &Option<String>) -> sys::moq_bytes_t {
-    s.as_deref().map(|s| span(s.as_bytes())).unwrap_or_default()
+    /// Authorization tokens for the SETUP, copied by the service at connect.
+    /// At most 16; only the picoquic backend carries them, the others refuse
+    /// a non-empty list with [`Error::UNSUPPORTED`].
+    #[must_use]
+    pub fn setup_auth_tokens(mut self, tokens: Vec<AuthToken>) -> Self {
+        self.setup_auth_tokens = tokens;
+        self
+    }
+
+    /// How the URL is read.
+    #[must_use]
+    pub fn uri_mode(mut self, mode: UriMode) -> Self {
+        self.uri_mode = mode;
+        self
+    }
+
+    /// The version placed first in an [`VersionOffer::Auto`] offer. With a
+    /// LIST or EXACT offer the service answers [`Error::INVAL`].
+    #[must_use]
+    pub fn preferred_version(mut self, version: Version) -> Self {
+        self.preferred_version = Some(version);
+        self
+    }
 }
 
 /// The managed connection to a relay: one QUIC/WebTransport connection and
 /// MoQ session, with libmoq's network thread behind it.
 ///
-/// `Endpoint` is a shared handle: clones refer to the same connection, and
-/// every [`MediaSender`](crate::MediaSender) and
-/// [`MediaReceiver`](crate::MediaReceiver) attached to it holds one. When
-/// the last handle is dropped the endpoint is stopped (the network thread
-/// joined) and destroyed, so it always outlives its attachments.
-///
-/// Do not move the last handle into a [`post`](Endpoint::post) task or a
-/// sender callback: they run on the endpoint's own thread, which cannot stop
-/// itself. If that happens anyway the endpoint is leaked rather than stopped.
-#[derive(Clone)]
+/// `Endpoint` is a shared handle over an `Arc`: clones refer to the same
+/// connection, and every [`Sender`](crate::Sender) and
+/// [`Receiver`](crate::Receiver) attached to it holds one, so the endpoint
+/// outlives its attachments without the application sequencing the drops,
+/// and a clone on another thread can wake or interrupt a blocked call
+/// (which is the point of the latch). When the last handle drops the
+/// endpoint is stopped (the network thread joined) and destroyed. That last
+/// drop always happens on an application thread: this crate runs no
+/// application code on the service's threads (no callbacks, no posted tasks,
+/// no buffer owners with destructors), so the thread `stop()` joins is never
+/// the one running the drop.
+#[derive(Clone, Debug)]
 pub struct Endpoint(Arc<Inner>);
 
+#[derive(Debug)]
 struct Inner {
     raw: NonNull<sys::moq_endpoint_t>,
 }
 
-// SAFETY: libmoq's service tier is built for cross-thread use: the interrupt
-// latch and wake are callable from any thread, and the blocking calls from any
-// application thread. Only the endpoint's own thread is excluded, see Drop.
+// SAFETY: the service tier is built for cross-thread use: the interrupt latch
+// and wake are callable from any thread, the blocking calls from any
+// application thread, and the observers from anywhere.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
-thread_local! {
-    /// Nonzero while this thread runs a libmoq task or callback.
-    static IN_SERVICE: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Marks the current thread as running inside a libmoq task or callback.
-pub(crate) struct ServiceScope;
-
-impl ServiceScope {
-    pub(crate) fn enter() -> ServiceScope {
-        IN_SERVICE.with(|c| c.set(c.get() + 1));
-        ServiceScope
-    }
-}
-
-impl Drop for ServiceScope {
-    fn drop(&mut self) {
-        IN_SERVICE.with(|c| c.set(c.get() - 1));
-    }
-}
-
 impl Drop for Inner {
     fn drop(&mut self) {
-        if IN_SERVICE.with(|c| c.get()) > 0 {
-            // Stopping joins the network thread we are running on.
-            return;
-        }
+        // SAFETY: the last handle. Attachments hold a handle, so none is live
+        // and stop() is not refused for one. A raw attachment surviving an
+        // adopted endpoint (from_raw) breaks that adoption's contract; the
+        // native destroy asserts the precondition in debug builds rather
+        // than recovering from it.
         unsafe {
-            ffi::moq_endpoint_stop(self.raw.as_ptr());
-            ffi::moq_endpoint_destroy(self.raw.as_ptr());
+            let _ = sys::moq_endpoint_stop(self.raw.as_ptr());
+            sys::moq_endpoint_destroy(self.raw.as_ptr());
         }
     }
 }
 
-/// Lifecycle state of an endpoint.
+/// Lifecycle state of an endpoint (`moq_endpoint_state_t`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub enum EndpointState {
+    /// The handshake is in progress.
     Connecting,
+    /// The session is up.
     Established,
+    /// Reserved; never entered today.
     Reconnecting,
     /// GOAWAY received.
     Draining,
+    /// Terminal.
     Closed,
+    /// A state this crate does not know.
+    Other(u32),
 }
 
-/// Why an endpoint went terminal.
+/// Why an endpoint went terminal (`moq_endpoint_terminal_reason_t`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalReason {
     /// Not terminal, or the reason is unknown.
@@ -242,24 +356,25 @@ pub enum TerminalReason {
     Tls,
     /// A generic transport or handshake failure.
     Transport,
-    /// A reason this crate does not know yet.
+    /// A reason this crate does not know.
     Other(u32),
 }
 
 impl TerminalReason {
-    fn from_raw(v: sys::moq_endpoint_terminal_reason_t) -> TerminalReason {
-        match v {
+    fn from_raw(code: sys::moq_endpoint_terminal_reason_t) -> TerminalReason {
+        match code {
             sys::MOQ_ENDPOINT_TERMINAL_NONE => TerminalReason::None,
             sys::MOQ_ENDPOINT_TERMINAL_CLEAN => TerminalReason::Clean,
             sys::MOQ_ENDPOINT_TERMINAL_PROTOCOL => TerminalReason::Protocol,
             sys::MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE => TerminalReason::TlsCertificate,
             sys::MOQ_ENDPOINT_TERMINAL_TLS => TerminalReason::Tls,
             sys::MOQ_ENDPOINT_TERMINAL_TRANSPORT => TerminalReason::Transport,
-            v => TerminalReason::Other(v),
+            code => TerminalReason::Other(code),
         }
     }
 
     /// The `moq_endpoint_terminal_reason_t` value.
+    #[must_use]
     pub fn code(self) -> u32 {
         match self {
             TerminalReason::None => sys::MOQ_ENDPOINT_TERMINAL_NONE,
@@ -268,140 +383,98 @@ impl TerminalReason {
             TerminalReason::TlsCertificate => sys::MOQ_ENDPOINT_TERMINAL_TLS_CERTIFICATE,
             TerminalReason::Tls => sys::MOQ_ENDPOINT_TERMINAL_TLS,
             TerminalReason::Transport => sys::MOQ_ENDPOINT_TERMINAL_TRANSPORT,
-            TerminalReason::Other(v) => v,
+            TerminalReason::Other(code) => code,
         }
     }
 }
 
-/// An endpoint's terminal classification.
+/// An endpoint's terminal classification (`moq_endpoint_terminal_t`).
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Terminal {
     /// The classification.
     pub reason: TerminalReason,
-    /// Backend-native detail: the MoQ fatal code for
-    /// [`TerminalReason::Protocol`], the TLS/QUIC error otherwise, 0 when
-    /// clean.
+    /// Transport-native detail as raw bits: the MoQ fatal code for
+    /// [`TerminalReason::Protocol`]; for the TLS and transport reasons the
+    /// backend's native error (a negative OSStatus is stored two's
+    /// complement); 0 when clean or not terminal.
     pub detail_code: u64,
 }
 
-/// What a [`post`](Endpoint::post)ed task runs with on a live session.
-pub struct TaskContext {
-    endpoint: *mut sys::moq_endpoint_t,
-    session: NonNull<sys::moq_session_t>,
-    now_us: u64,
-}
-
-impl TaskContext {
-    /// The endpoint's monotonic clock, in microseconds.
-    pub fn now_us(&self) -> u64 {
-        self.now_us
-    }
-
-    /// The live MoQ session, for the core `moq_session_*` API in
-    /// [`sys`](crate::sys). Valid only for the duration of the task.
-    pub fn session_ptr(&self) -> *mut sys::moq_session_t {
-        self.session.as_ptr()
-    }
-
-    /// The endpoint the task runs on.
-    pub fn endpoint_ptr(&self) -> *mut sys::moq_endpoint_t {
-        self.endpoint
-    }
-}
-
-type Task = Box<dyn FnOnce(Option<&TaskContext>) -> Result<()> + Send>;
-
-unsafe extern "C" fn run_task(
-    ep: *mut sys::moq_endpoint_t,
-    session: *mut sys::moq_session_t,
-    now_us: u64,
-    ctx: *mut c_void,
-) -> sys::moq_result_t {
-    let _scope = ServiceScope::enter();
-    let task = Box::from_raw(ctx as *mut Task);
-    let tc = NonNull::new(session).map(|session| TaskContext {
-        endpoint: ep,
-        session,
-        now_us,
-    });
-    match catch_unwind(AssertUnwindSafe(move || task(tc.as_ref()))) {
-        Ok(Ok(())) => sys::MOQ_OK,
-        Ok(Err(e)) => e.code(),
-        Err(_) => sys::MOQ_ERR_INTERNAL,
-    }
-}
-
 impl Endpoint {
-    /// Validate `cfg` and start connecting. The handshake completes
+    /// Validate `config` and start connecting. The handshake completes
     /// asynchronously; watch it with [`wait`](Endpoint::wait) and
-    /// [`state`](Endpoint::state).
-    pub fn connect(cfg: &EndpointConfig) -> Result<Endpoint> {
-        let versions: Vec<sys::moq_version_t> = match &cfg.versions {
+    /// [`state`](Endpoint::state). Unless `insecure_skip_verify` is set,
+    /// the peer certificate is verified.
+    pub fn connect(config: &EndpointConfig) -> Result<Endpoint> {
+        let handshake_timeout_us = match config.handshake_timeout {
+            Some(timeout) => ffi::micros(timeout)?,
+            None => 0,
+        };
+        let versions: Vec<sys::moq_version_t> = match &config.versions {
             VersionOffer::Auto => Vec::new(),
-            VersionOffer::List(v) => v.iter().map(|v| v.raw()).collect(),
-            VersionOffer::Exact(v) => vec![v.raw()],
+            VersionOffer::List(list) => list.iter().map(|version| version.raw()).collect(),
+            VersionOffer::Exact(version) => vec![version.raw()],
         };
-        let tail = cfg.wt_profile != WtProfile::BackendDefault || cfg.handshake_timeout.is_some();
-
-        let mut raw = sys::moq_endpoint_cfg_t::default();
-        unsafe {
-            if tail {
-                ffi::moq_endpoint_cfg_init_sized(&mut raw, std::mem::size_of_val(&raw));
-            } else {
-                // The v0 initializer: the tail fields stay absent.
-                ffi::moq_endpoint_cfg_init(&mut raw);
-            }
+        let mut tokens: Vec<sys::moq_auth_token_t> =
+            Vec::with_capacity(config.setup_auth_tokens.len());
+        for token in &config.setup_auth_tokens {
+            tokens.push(sys::moq_auth_token_t {
+                token_type: token.token_type,
+                token_value: ffi::span(&token.value),
+            });
         }
-        raw.url = span(cfg.url.as_bytes());
-        raw.protocol = match cfg.protocol {
-            Protocol::Auto => sys::MOQ_TRANSPORT_PROTOCOL_AUTO,
-            Protocol::RawQuic => sys::MOQ_TRANSPORT_PROTOCOL_RAW_QUIC,
-            Protocol::WebTransport => sys::MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT,
-        };
-        raw.backend = match cfg.backend {
-            Backend::Auto => sys::MOQ_TRANSPORT_BACKEND_AUTO,
-            Backend::Picoquic => sys::MOQ_TRANSPORT_BACKEND_PICOQUIC,
-            Backend::Mvfst => sys::MOQ_TRANSPORT_BACKEND_MVFST,
-            Backend::Proxygen => sys::MOQ_TRANSPORT_BACKEND_PROXYGEN,
-            Backend::MsQuic => sys::MOQ_TRANSPORT_BACKEND_MSQUIC,
-            Backend::WtquicNetwork => sys::MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK,
-            Backend::WtquicMsQuic => sys::MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC,
-        };
-        if !matches!(cfg.versions, VersionOffer::Auto) {
-            raw.versions.struct_size = std::mem::size_of_val(&raw.versions) as u32;
-            raw.versions.policy = match cfg.versions {
+
+        let mut raw_config = sys::moq_endpoint_cfg_t::default();
+        // SAFETY: a writable struct of exactly the size passed.
+        unsafe { sys::moq_endpoint_cfg_init_sized(&mut raw_config, mem::size_of_val(&raw_config)) };
+        raw_config.url = ffi::span(config.url.as_bytes());
+        raw_config.protocol = config.protocol.raw();
+        raw_config.backend = config.backend.raw();
+        if !matches!(config.versions, VersionOffer::Auto) {
+            raw_config.versions.struct_size = mem::size_of_val(&raw_config.versions) as u32;
+            raw_config.versions.policy = match config.versions {
                 VersionOffer::Exact(_) => sys::MOQ_VERSION_POLICY_EXACT,
                 _ => sys::MOQ_VERSION_POLICY_LIST,
             };
-            raw.versions.versions = versions.as_ptr();
-            raw.versions.version_count = versions.len();
+            raw_config.versions.versions = versions.as_ptr();
+            raw_config.versions.version_count = versions.len();
         }
-        raw.sni = opt_span(&cfg.sni);
-        raw.ca_file = opt_span(&cfg.ca_file);
-        raw.insecure_skip_verify = cfg.insecure_skip_verify;
-        raw.wt_path = opt_span(&cfg.wt_path);
-        if tail {
-            raw.wt_profile = match cfg.wt_profile {
-                WtProfile::BackendDefault => sys::MOQ_WT_PROFILE_BACKEND_DEFAULT,
-                WtProfile::Current => sys::MOQ_WT_PROFILE_CURRENT,
-                WtProfile::D13_14Compat => sys::MOQ_WT_PROFILE_D13_14_COMPAT,
-            };
-            raw.handshake_timeout_us = cfg.handshake_timeout.map(micros).unwrap_or(0);
+        raw_config.sni = ffi::optional_span(config.sni.as_deref());
+        raw_config.ca_file = ffi::optional_span(config.ca_file.as_deref());
+        raw_config.insecure_skip_verify = config.insecure_skip_verify;
+        raw_config.wt_path = ffi::optional_span(config.wt_path.as_deref());
+        raw_config.wt_profile = config.wt_profile.raw();
+        raw_config.handshake_timeout_us = handshake_timeout_us;
+        if !tokens.is_empty() {
+            raw_config.setup_auth_tokens = tokens.as_ptr();
+            raw_config.setup_auth_token_count = tokens.len();
         }
+        raw_config.uri_mode = config.uri_mode.code();
+        raw_config.preferred_version = config.preferred_version.map_or(0, Version::raw);
 
-        let mut ep = std::ptr::null_mut();
-        check(unsafe { ffi::moq_endpoint_connect(&raw, &mut ep) })?;
-        let raw = NonNull::new(ep).ok_or(Error::INTERNAL)?;
+        let mut raw = ptr::null_mut();
+        // SAFETY: every pointer in raw_config points into config, versions or
+        // tokens, all alive for the call; the service copies what it keeps.
+        ffi::check(unsafe { sys::moq_endpoint_connect(&raw_config, &mut raw) })?;
+        let raw = NonNull::new(raw).ok_or(Error::INTERNAL)?;
         Ok(Endpoint(Arc::new(Inner { raw })))
     }
 
-    /// Take ownership of an endpoint created elsewhere.
+    /// Take ownership of an endpoint created through [`sys`](crate::sys).
     ///
     /// # Safety
     /// `raw` must be a live endpoint that nothing else will stop or destroy.
+    /// Its configuration must keep this crate's invariant, no application
+    /// code on the service's threads: no certificate callback, no posted
+    /// task and no allocator that reaches back into the application; and
+    /// its attachments must be dropped before the last handle.
+    ///
+    /// # Panics
+    /// If `raw` is null.
     pub unsafe fn from_raw(raw: *mut sys::moq_endpoint_t) -> Endpoint {
         Endpoint(Arc::new(Inner {
-            raw: NonNull::new(raw).expect("null endpoint"),
+            raw: NonNull::new(raw).expect("a null endpoint cannot be adopted"),
         }))
     }
 
@@ -410,120 +483,161 @@ impl Endpoint {
     pub fn into_raw(self) -> std::result::Result<*mut sys::moq_endpoint_t, Endpoint> {
         let inner = Arc::try_unwrap(self.0).map_err(Endpoint)?;
         let raw = inner.raw.as_ptr();
-        std::mem::forget(inner);
+        mem::forget(inner);
         Ok(raw)
     }
 
     /// The underlying `moq_endpoint_t`.
+    #[must_use]
     pub fn as_ptr(&self) -> *mut sys::moq_endpoint_t {
         self.0.raw.as_ptr()
     }
 
-    /// Block until the endpoint changes state or wakes, or `timeout` elapses.
-    /// Fails with [`Error::INTERRUPTED`] while the latch is set and
-    /// [`Error::CLOSED`] once terminal.
-    pub fn wait(&self, timeout: Duration) -> Result<Wait> {
-        wait_result(unsafe { ffi::moq_endpoint_wait(self.as_ptr(), micros(timeout)) })
+    /// Block until the endpoint changes state or wakes, or `timeout`
+    /// (exact microseconds; zero polls) elapses. Fails with
+    /// [`Error::INTERRUPTED`] while the latch is set and [`Error::CLOSED`]
+    /// once terminal.
+    pub fn wait(&self, timeout: Duration) -> Result<WaitResult> {
+        let timeout_us = ffi::micros(timeout)?;
+        // SAFETY: a live endpoint; waits are legal from any application
+        // thread.
+        ffi::wait_result(unsafe { sys::moq_endpoint_wait(self.as_ptr(), timeout_us) })
     }
 
-    /// Schedule a pump cycle soon. Callable from any thread; never fails.
+    /// Schedule a pump cycle soon. Callable from any thread; never fails
+    /// and does not clear the interrupt latch.
     pub fn wake(&self) {
-        unsafe { ffi::moq_endpoint_wake(self.as_ptr()) }
+        // SAFETY: a live endpoint; non-allocating and infallible.
+        unsafe { sys::moq_endpoint_wake(self.as_ptr()) }
     }
 
-    /// Block until local stream data has been handed to the transport, so a
-    /// stop does not truncate it. [`Wait::Ready`] means flushed. It does not
-    /// mean the peer acknowledged or consumed anything.
-    pub fn drain(&self, timeout: Duration) -> Result<Wait> {
-        wait_result(unsafe { ffi::moq_endpoint_drain(self.as_ptr(), micros(timeout)) })
+    /// Block until the output the attached services owe has been handed to
+    /// the session and flushed by the transport (and acknowledged, where the
+    /// backend observes it), so a stop does not truncate it.
+    /// [`WaitResult::Ready`] means flushed; it does not mean the peer
+    /// application consumed the media, and it is not proof that a broadcast
+    /// completed. Fails with [`Error::INTERRUPTED`], [`Error::CLOSED`],
+    /// [`Error::UNSUPPORTED`] when the backend cannot prove a flush, and
+    /// [`Error::INTERNAL`] for an unsuccessful flush.
+    pub fn drain(&self, timeout: Duration) -> Result<WaitResult> {
+        let timeout_us = ffi::micros(timeout)?;
+        // SAFETY: a live endpoint, called from an application thread.
+        ffi::wait_result(unsafe { sys::moq_endpoint_drain(self.as_ptr(), timeout_us) })
     }
 
     /// Stop the endpoint now: joins the network thread. Fails with
-    /// [`Error::WRONG_STATE`] while a sender or receiver is attached. Dropping
-    /// the last handle does this anyway; call it to stop early.
+    /// [`Error::WRONG_STATE`] while a sender or receiver is attached.
+    /// Dropping the last handle does this anyway; call it to stop early.
     pub fn stop(&self) -> Result<()> {
-        check(unsafe { ffi::moq_endpoint_stop(self.as_ptr()) })
+        // SAFETY: a live endpoint, called from an application thread.
+        ffi::check(unsafe { sys::moq_endpoint_stop(self.as_ptr()) })
     }
 
     /// Set or clear the sticky interrupt latch. While set, every blocking
     /// call on the endpoint and its attachments returns
     /// [`Error::INTERRUPTED`] at once. Callable from any thread.
     pub fn set_interrupted(&self, interrupted: bool) {
-        unsafe { ffi::moq_endpoint_set_interrupted(self.as_ptr(), interrupted) }
+        // SAFETY: a live endpoint; callable from any thread.
+        unsafe { sys::moq_endpoint_set_interrupted(self.as_ptr(), interrupted) }
     }
 
     /// The current lifecycle state.
+    #[must_use]
     pub fn state(&self) -> EndpointState {
-        match unsafe { ffi::moq_endpoint_state(self.as_ptr()) } {
+        // SAFETY: a live endpoint.
+        match unsafe { sys::moq_endpoint_state(self.as_ptr()) } {
             sys::MOQ_ENDPOINT_CONNECTING => EndpointState::Connecting,
             sys::MOQ_ENDPOINT_ESTABLISHED => EndpointState::Established,
             sys::MOQ_ENDPOINT_RECONNECTING => EndpointState::Reconnecting,
             sys::MOQ_ENDPOINT_DRAINING => EndpointState::Draining,
-            _ => EndpointState::Closed,
+            sys::MOQ_ENDPOINT_CLOSED => EndpointState::Closed,
+            code => EndpointState::Other(code),
         }
     }
 
-    /// Closed cleanly or drained.
+    /// The endpoint has reached its closed state: its managed teardown ran,
+    /// or a terminal was recorded. Why it closed -- a clean close, a drain,
+    /// a fatal error -- is the [`Terminal`]'s reason, from
+    /// [`Endpoint::terminal`]; this alone does not say the close was clean.
+    #[must_use]
     pub fn is_closed(&self) -> bool {
-        unsafe { ffi::moq_endpoint_is_closed(self.as_ptr()) }
+        // SAFETY: a live endpoint.
+        unsafe { sys::moq_endpoint_is_closed(self.as_ptr()) }
     }
 
     /// Failed. Use [`terminal`](Endpoint::terminal) to find out why.
+    #[must_use]
     pub fn is_fatal(&self) -> bool {
-        unsafe { ffi::moq_endpoint_is_fatal(self.as_ptr()) }
+        // SAFETY: a live endpoint.
+        unsafe { sys::moq_endpoint_is_fatal(self.as_ptr()) }
     }
 
-    /// The MoQ-level fatal code; 0 for a transport or TLS failure.
+    /// The MoQ-level fatal code; 0 for a transport or TLS failure, so zero
+    /// is not "no error".
+    #[must_use]
     pub fn fatal_code(&self) -> u64 {
-        unsafe { ffi::moq_endpoint_fatal_code(self.as_ptr()) }
+        // SAFETY: a live endpoint.
+        unsafe { sys::moq_endpoint_fatal_code(self.as_ptr()) }
     }
 
     /// Why the endpoint went terminal ([`TerminalReason::None`] while it is
     /// not).
     pub fn terminal(&self) -> Result<Terminal> {
-        let mut t = sys::moq_endpoint_terminal_t::default();
-        check(unsafe {
-            ffi::moq_endpoint_get_terminal(self.as_ptr(), &mut t, std::mem::size_of_val(&t))
-        })?;
+        let mut terminal = sys::moq_endpoint_terminal_t::default();
+        let size = mem::size_of_val(&terminal);
+        // SAFETY: a writable struct of exactly the size passed.
+        ffi::check(unsafe { sys::moq_endpoint_get_terminal(self.as_ptr(), &mut terminal, size) })?;
+        ffi::check_stamp(
+            terminal.struct_size,
+            sys::MOQ_ENDPOINT_TERMINAL_V0_SIZE,
+            size,
+        )?;
         Ok(Terminal {
-            reason: TerminalReason::from_raw(t.reason),
-            detail_code: t.detail_code,
+            reason: TerminalReason::from_raw(terminal.reason),
+            detail_code: terminal.detail_code,
         })
     }
 
     /// The negotiated version, once established.
+    #[must_use]
     pub fn negotiated_version(&self) -> Option<Version> {
-        match unsafe { ffi::moq_endpoint_negotiated_version(self.as_ptr()) } {
+        // SAFETY: a live endpoint.
+        match unsafe { sys::moq_endpoint_negotiated_version(self.as_ptr()) } {
             0 => None,
-            v => Some(Version::from_draft(v)),
+            draft => Some(Version::from_draft(draft)),
         }
     }
 
-    /// Run `task` on the endpoint's network thread, where the core session
-    /// API is legal. Tasks run once each, in submission order. On a live
-    /// session the task gets a [`TaskContext`]; when the endpoint stops or
-    /// goes terminal first it still runs, with `None`.
-    ///
-    /// The task must not block, and must not own the last [`Endpoint`]
-    /// handle. Fails with [`Error::CLOSED`] if the endpoint is already
-    /// terminal, in which case `task` is dropped without running.
-    pub fn post<F>(&self, task: F) -> Result<()>
-    where
-        F: FnOnce(Option<&TaskContext>) -> Result<()> + Send + 'static,
-    {
-        let ctx = Box::into_raw(Box::new(Box::new(task) as Task));
-        let rc =
-            unsafe { ffi::moq_endpoint_post(self.as_ptr(), Some(run_task), ctx as *mut c_void) };
-        if rc != sys::MOQ_OK {
-            // Not accepted: libmoq never runs it, so the context is ours.
-            drop(unsafe { Box::from_raw(ctx) });
+    /// The New Session URI of a session-wide GOAWAY the peer sent (the
+    /// endpoint is then draining): `Some(empty)` means the current URI,
+    /// `None` that no GOAWAY was recorded. Fails with [`Error::NOMEM`] when
+    /// one was received but its URI could not be kept.
+    pub fn goaway_uri(&self) -> Result<Option<Vec<u8>>> {
+        let mut uri: Vec<u8> = Vec::new();
+        loop {
+            let mut needed = 0usize;
+            let capacity = uri.capacity();
+            let buffer = if capacity == 0 {
+                ptr::null_mut()
+            } else {
+                uri.as_mut_ptr()
+            };
+            // SAFETY: buffer is writable for capacity bytes (or NULL with a
+            // capacity of 0); needed is written on every return.
+            let code = unsafe {
+                sys::moq_endpoint_get_goaway_uri(self.as_ptr(), buffer, capacity, &mut needed)
+            };
+            match code {
+                sys::MOQ_OK => {
+                    // SAFETY: the service wrote `needed` bytes, at most the
+                    // capacity.
+                    unsafe { uri.set_len(needed.min(capacity)) };
+                    return Ok(Some(uri));
+                }
+                sys::MOQ_DONE => return Ok(None),
+                sys::MOQ_ERR_BUFFER => uri.reserve_exact(needed.max(1)),
+                code => return Err(Error::from_code(code)),
+            }
         }
-        check(rc)
-    }
-}
-
-impl std::fmt::Debug for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Endpoint").field(&self.as_ptr()).finish()
     }
 }

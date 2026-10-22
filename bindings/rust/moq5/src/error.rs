@@ -5,11 +5,13 @@ use crate::sys;
 
 /// A libmoq result code other than `MOQ_OK`.
 ///
-/// Every fallible call returns the code libmoq reported, so a caller can
-/// match on the documented outcomes ([`Error::WOULD_BLOCK`],
-/// [`Error::INTERRUPTED`], [`Error::CLOSED`], ...) exactly as the C API
-/// describes them.
+/// Every fallible call returns the code the library reported, so a caller
+/// can match on the documented outcomes ([`Error::WOULD_BLOCK`],
+/// [`Error::INTERRUPTED`], [`Error::CLOSED`], ...) exactly as the C header
+/// describes them. Every native code has a named constant; a code this crate
+/// does not know is carried unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
 pub struct Error(i32);
 
 /// `Result` with [`Error`] as the default error type.
@@ -36,7 +38,11 @@ impl Error {
     pub const BUFFER: Error = Error(sys::MOQ_ERR_BUFFER);
     /// The peer's request limit blocks a new request.
     pub const REQUEST_BLOCKED: Error = Error(sys::MOQ_ERR_REQUEST_BLOCKED);
-    /// A struct size is below the frozen ABI floor.
+    /// A sized record is outside its size contract. The library reports it
+    /// for an input or output below the frozen v0 floor; this crate reports
+    /// it when the `struct_size` the library stamped on an output is below
+    /// that floor or above the size the crate passed in. An owning record
+    /// refused this way is released before the error returns.
     pub const ABI_MISMATCH: Error = Error(sys::MOQ_ERR_ABI_MISMATCH);
     /// The peer sent GOAWAY.
     pub const GOAWAY: Error = Error(sys::MOQ_ERR_GOAWAY);
@@ -46,6 +52,12 @@ impl Error {
     pub const INTERRUPTED: Error = Error(sys::MOQ_ERR_INTERRUPTED);
     /// This build of libmoq cannot serve the request.
     pub const UNSUPPORTED: Error = Error(sys::MOQ_ERR_UNSUPPORTED);
+    /// Transport-bridge inbound data was not consumed; the adapter redelivers
+    /// it. Never produced by the service tier this crate wraps.
+    pub const INPUT_NOT_CONSUMED: Error = Error(sys::MOQ_ERR_INPUT_NOT_CONSUMED);
+    /// A non-replenishable implementation limit was reached; retrying
+    /// unchanged cannot succeed.
+    pub const LIMIT: Error = Error(sys::MOQ_ERR_LIMIT);
     /// Internal error.
     pub const INTERNAL: Error = Error(sys::MOQ_ERR_INTERNAL);
 
@@ -55,6 +67,7 @@ impl Error {
     }
 
     /// The libmoq result code (`moq_result_t`).
+    #[must_use]
     pub const fn code(self) -> i32 {
         self.0
     }
@@ -75,19 +88,12 @@ impl Error {
             Error::GOAWAY => "GOAWAY",
             Error::INTERRUPTED => "INTERRUPTED",
             Error::UNSUPPORTED => "UNSUPPORTED",
+            Error::INPUT_NOT_CONSUMED => "INPUT_NOT_CONSUMED",
+            Error::LIMIT => "LIMIT",
             Error::INTERNAL => "INTERNAL",
             Error(sys::MOQ_DONE) => "DONE",
             _ => return None,
         })
-    }
-}
-
-/// Map a libmoq result code: `MOQ_OK` is success, anything else an error.
-pub(crate) fn check(rc: sys::moq_result_t) -> Result<()> {
-    if rc == sys::MOQ_OK {
-        Ok(())
-    } else {
-        Err(Error(rc))
     }
 }
 
@@ -102,11 +108,13 @@ impl fmt::Debug for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // SAFETY: moq_strerror returns a static string for any code.
+        // SAFETY: moq_strerror returns a static NUL-terminated string, or
+        // NULL, for any code.
         let text = unsafe { sys::moq_strerror(self.0) };
         if text.is_null() {
             write!(f, "libmoq error {}", self.0)
         } else {
+            // SAFETY: non-NULL, static, NUL-terminated (above).
             let text = unsafe { CStr::from_ptr(text) }.to_string_lossy();
             write!(f, "{text} ({})", self.0)
         }
@@ -120,16 +128,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_native_code_is_named() {
+        let named = [
+            (Error::NOMEM, sys::MOQ_ERR_NOMEM),
+            (Error::INVAL, sys::MOQ_ERR_INVAL),
+            (Error::PROTO, sys::MOQ_ERR_PROTO),
+            (Error::CLOSED, sys::MOQ_ERR_CLOSED),
+            (Error::WRONG_STATE, sys::MOQ_ERR_WRONG_STATE),
+            (Error::STALE_HANDLE, sys::MOQ_ERR_STALE_HANDLE),
+            (Error::WRONG_SESSION, sys::MOQ_ERR_WRONG_SESSION),
+            (Error::WOULD_BLOCK, sys::MOQ_ERR_WOULD_BLOCK),
+            (Error::BUFFER, sys::MOQ_ERR_BUFFER),
+            (Error::REQUEST_BLOCKED, sys::MOQ_ERR_REQUEST_BLOCKED),
+            (Error::ABI_MISMATCH, sys::MOQ_ERR_ABI_MISMATCH),
+            (Error::GOAWAY, sys::MOQ_ERR_GOAWAY),
+            (Error::INTERRUPTED, sys::MOQ_ERR_INTERRUPTED),
+            (Error::UNSUPPORTED, sys::MOQ_ERR_UNSUPPORTED),
+            (Error::INPUT_NOT_CONSUMED, sys::MOQ_ERR_INPUT_NOT_CONSUMED),
+            (Error::LIMIT, sys::MOQ_ERR_LIMIT),
+            (Error::INTERNAL, sys::MOQ_ERR_INTERNAL),
+        ];
+        assert_eq!(named.len(), 17, "every native code has a constant");
+        for (error, code) in named {
+            assert_eq!(error.code(), code);
+            assert!(error.name().is_some(), "{code} has no name");
+            assert!(code < 0, "{code} is not an error code");
+        }
+    }
+
+    #[test]
     fn codes_round_trip() {
         assert_eq!(Error::from_code(-2), Error::INVAL);
-        assert_eq!(Error::WOULD_BLOCK.code(), sys::MOQ_ERR_WOULD_BLOCK);
-        assert_eq!(check(sys::MOQ_OK), Ok(()));
-        assert_eq!(check(sys::MOQ_ERR_CLOSED), Err(Error::CLOSED));
+        assert_eq!(Error::from_code(-16), Error::LIMIT);
         assert_eq!(
             format!("{:?}", Error::INTERRUPTED),
             "Error(INTERRUPTED, -13)"
         );
+        assert_eq!(format!("{:?}", Error::INTERNAL), "Error(INTERNAL, -99)");
         assert_eq!(format!("{:?}", Error::from_code(-1000)), "Error(-1000)");
+        assert_eq!(Error::from_code(-1000).code(), -1000);
         assert!(Error::CLOSED.to_string().ends_with("(-4)"));
+        assert!(Error::from_code(-1000).to_string().ends_with("(-1000)"));
     }
 }

@@ -29,6 +29,7 @@ option(MOQ_BUILD_TESTS             "Build test suite"               ON)
 option(MOQ_BUILD_SIM               "Build moq-sim"                  ${MOQ_BUILD_TESTS})
 option(MOQ_BUILD_ADAPTER_PICOQUIC  "Build picoquic adapter"         OFF)
 option(MOQ_BUILD_CPP_BINDING       "Build C++ binding"              OFF)
+option(MOQ_BUILD_RUST_BINDING      "Qualify the Rust binding (cargo rows over the staged SDK)" OFF)
 option(MOQ_BUILD_LOC               "Build moq-loc LOC helpers"      ON)
 option(MOQ_BUILD_MSF               "Build moq-msf catalog parser"   OFF)
 option(MOQ_BUILD_CMAF              "Build moq-cmaf segment parser"  ON)
@@ -656,6 +657,11 @@ endif()
 # -- C++ Binding ----------------------------------------------------
 if(MOQ_BUILD_CPP_BINDING)
     add_subdirectory(bindings/cpp)
+endif()
+
+# -- Rust binding ---------------------------------------------------
+if(MOQ_BUILD_RUST_BINDING)
+    add_subdirectory(bindings/rust)
 endif()
 
 # -- Benchmarks -----------------------------------------------------

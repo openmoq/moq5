@@ -1,0 +1,14 @@
+[package]
+name = "moq5-fake-tests"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "moq5 ownership, threading and layout rows against a scripted service provider"
+
+[dependencies]
+moq5 = { path = "../../moq5" }
+moq5-sys = { path = "../../moq5-sys" }
+
+[build-dependencies]
+cc = "1"

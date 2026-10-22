@@ -1,3 +1,6 @@
 [workspace]
 members = ["moq5-sys", "moq5"]
+# The fake-provider tests and the installed-consumer check are their own
+# workspaces: nothing they depend on can unify into a build of these crates.
+exclude = ["fake-tests", "consumer"]
 resolver = "3"

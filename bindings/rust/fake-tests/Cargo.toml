@@ -1,0 +1,6 @@
+# The deterministic test workspace. It is not a member of bindings/rust: the
+# fake service provider it links reaches moq5-sys through pkg-config only
+# (see run.sh), so nothing here can unify into a consumer's build.
+[workspace]
+members = ["moq5-fake-tests"]
+resolver = "3"
