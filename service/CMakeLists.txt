@@ -507,6 +507,20 @@ if(MOQ_BUILD_TESTS)
         ${PROJECT_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_post_contract COMMAND test_endpoint_post_contract)
 
+    if(MOQ_BUILD_PQ_THREADED)
+        add_executable(test_endpoint_pico_terminal tests/test_endpoint_pico_terminal.c)
+        target_link_libraries(test_endpoint_pico_terminal PRIVATE
+            moq-service-endpoint-test-internals)
+        target_include_directories(test_endpoint_pico_terminal PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_endpoint_pico_terminal PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME endpoint_pico_terminal COMMAND test_endpoint_pico_terminal)
+        set_tests_properties(endpoint_pico_terminal PROPERTIES TIMEOUT 30)
+    endif()
+
     # moq_endpoint_drain succeeds only on a facade observation taken after the
     # hooks' owed output reached the session (a gated latched-facade stand-in).
     add_executable(test_endpoint_drain_barrier tests/test_endpoint_drain_barrier.c)

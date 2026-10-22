@@ -669,17 +669,23 @@ static size_t threaded_alpn_select(picoquic_quic_t *quic,
     return count;
 }
 
+static uint64_t client_transport_error(picoquic_cnx_t *cnx)
+{
+    if (!cnx) return 0;
+    uint64_t local_error = picoquic_get_local_error(cnx);
+    return local_error != 0 ? local_error : picoquic_get_remote_error(cnx);
+}
+
 /* Fail the (not yet sessioned) client connection: latch fatal so wait()
  * returns in bounded time, and return -1 so picoquic closes the cnx. */
 static int client_fail_deferred(moq_pq_threaded_t *t)
 {
-    uint64_t local_err = t->active_cnx
-        ? picoquic_get_local_error(t->active_cnx) : 0;
+    uint64_t transport_error = client_transport_error(t->active_cnx);
     pthread_mutex_lock(&t->mutex);
     if (!t->fatal) {
         t->fatal = true;
         t->fatal_code = 0;   /* transport/handshake-level failure */
-        t->terminal_error = local_err;  /* endpoint classifies (TLS vs transport) */
+        t->terminal_error = transport_error;  /* endpoint classifies (TLS vs transport) */
     }
     pthread_mutex_unlock(&t->mutex);
     mark_activity(t);
@@ -1117,12 +1123,12 @@ static int loop_callback_pump(picoquic_quic_t *quic,
     if (t->perspective == MOQ_PERSPECTIVE_CLIENT && !t->conn &&
         t->active_cnx &&
         picoquic_get_cnx_state(t->active_cnx) == picoquic_state_disconnected) {
-        uint64_t local_err = picoquic_get_local_error(t->active_cnx);
+        uint64_t transport_error = client_transport_error(t->active_cnx);
         pthread_mutex_lock(&t->mutex);
         if (!t->fatal && !t->pump_exit) {
             t->fatal = true;
             t->fatal_code = 0;
-            t->terminal_error = local_err;
+            t->terminal_error = transport_error;
         }
         pthread_mutex_unlock(&t->mutex);
         client_final_pump(t, quic);
@@ -1253,12 +1259,12 @@ static int loop_callback_pump(picoquic_quic_t *quic,
             t->setup_reached = true;
         } else if (picoquic_get_cnx_state(t->active_cnx) ==
                    picoquic_state_disconnected) {
-            uint64_t local_err = picoquic_get_local_error(t->active_cnx);
+            uint64_t transport_error = client_transport_error(t->active_cnx);
             pthread_mutex_lock(&t->mutex);
             if (!t->fatal && !t->pump_exit) {
                 t->fatal = true;
                 t->fatal_code = 0;  /* transport/handshake-level failure */
-                t->terminal_error = local_err;  /* endpoint classifies (TLS vs transport) */
+                t->terminal_error = transport_error;  /* endpoint classifies (TLS vs transport) */
             }
             pthread_mutex_unlock(&t->mutex);
             client_final_pump(t, quic);

@@ -159,7 +159,7 @@ struct moq_pq_threaded {
     struct sockaddr_storage bind_address;   /* cfg.bind_address; family 0 = any */
     bool                fatal;
     uint64_t            fatal_code;
-    uint64_t            terminal_error;  /* picoquic local error captured at a
+    uint64_t            terminal_error;  /* local or peer transport error at a
                                           * client handshake/transport failure;
                                           * 0 otherwise. Classified by the
                                           * service endpoint (TLS vs transport). */

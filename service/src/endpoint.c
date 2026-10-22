@@ -1077,7 +1077,7 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 /* -- Terminal-reason classification --------------------------------- *
  * Turn a facade's raw terminal signals into a transport-agnostic reason. The
  * generic form (mvfst/proxygen) knows only PROTOCOL vs generic transport; the
- * picoquic form additionally reads picoquic's captured local error to tell a
+ * picoquic form additionally reads the captured QUIC transport error to tell a
  * TLS/certificate failure apart from a plain transport failure. */
 #if defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
@@ -1103,7 +1103,6 @@ static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
 
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
-#include <picoquic.h>   /* picoquic_is_handshake_error */
 static void ep_classify_pico(bool is_fatal, uint64_t fatal_code,
                              bool clean_closed, uint64_t terminal_error,
                              moq_endpoint_terminal_reason_t *reason,
@@ -1115,7 +1114,7 @@ static void ep_classify_pico(bool is_fatal, uint64_t fatal_code,
         return;
     }
     if (is_fatal) {
-        if (picoquic_is_handshake_error(terminal_error)) {
+        if (terminal_error >= 0x100u && terminal_error <= 0x1ffu) {
             /* QUIC CRYPTO_ERROR: low byte is the TLS alert. Certificate-related
              * alerts (picotls PTLS_ALERT_*): 42 bad_certificate,
              * 44 certificate_revoked, 45 certificate_expired,
@@ -2690,6 +2689,16 @@ void moq_endpoint_test_free_bare(moq_endpoint_t *ep)
     moq_alloc_t alloc = ep->alloc;
     alloc.free(ep, sizeof(*ep), alloc.ctx);
 }
+
+#ifdef MOQ_SERVICE_HAVE_PQ_THREADED
+/* Borrow a fixture-owned facade; free_bare leaves its lifetime to the test. */
+void moq_endpoint_test_attach_picoquic(moq_endpoint_t *ep, moq_pq_threaded_t *t);
+void moq_endpoint_test_attach_picoquic(moq_endpoint_t *ep, moq_pq_threaded_t *t)
+{
+    ep->vt = &PQ_VT;
+    ep->facade = t;
+}
+#endif
 
 void moq_endpoint_test_lock_mu(moq_endpoint_t *ep)   { pthread_mutex_lock(&ep->mu); }
 void moq_endpoint_test_unlock_mu(moq_endpoint_t *ep) { pthread_mutex_unlock(&ep->mu); }

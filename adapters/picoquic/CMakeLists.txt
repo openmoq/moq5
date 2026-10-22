@@ -902,6 +902,21 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
 
+    add_executable(test_threaded_terminal_error
+        tests/test_threaded_terminal_error.c)
+    target_link_libraries(test_threaded_terminal_error PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_threaded_terminal_error PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    target_compile_definitions(test_threaded_terminal_error PRIVATE
+        MOQ_PQ_THREADED_TESTING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_terminal_error PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_terminal_error COMMAND test_threaded_terminal_error)
+    set_tests_properties(threaded_terminal_error PROPERTIES TIMEOUT 30)
+
     # Terminal retention until the application acknowledges, for every
     # terminal cause, plus the per-connection user slot (test-internals for
     # the service-failure seam).

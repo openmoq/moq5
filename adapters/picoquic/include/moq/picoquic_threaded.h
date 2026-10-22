@@ -650,9 +650,11 @@ size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
  * So a failed cert verification is observable via is_fatal(). */
 bool     moq_pq_threaded_is_fatal(const moq_pq_threaded_t *t);
 uint64_t moq_pq_threaded_fatal_code(const moq_pq_threaded_t *t);
-/* The picoquic local error captured when a CLIENT connection failed during the
- * handshake (a QUIC CRYPTO_ERROR = 0x100|alert for a TLS failure, else a
- * transport code; 0 when there was no such failure). The service endpoint
+/* The QUIC transport error captured when a CLIENT connection fails before
+ * MoQ SETUP completes: the local error when nonzero, otherwise the peer's
+ * transport error. A CRYPTO_ERROR = 0x100|alert identifies a TLS failure;
+ * application-close codes are not returned here. Zero means no transport
+ * error was recorded, not necessarily success. The service endpoint
  * classifies it into a transport-agnostic terminal reason. Thread-safe. */
 uint64_t moq_pq_threaded_terminal_error(const moq_pq_threaded_t *t);
 
