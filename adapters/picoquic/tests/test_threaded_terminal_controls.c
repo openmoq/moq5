@@ -82,6 +82,7 @@
 #include <moq/session.h>
 #include <picoquic.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -89,6 +90,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -310,6 +312,37 @@ static int cli_watch_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     return 0;
 }
 
+/* Local-close predicates need elapsed time, not a count of activity waits:
+ * wait() can return CLOSED before the client's final observing pump runs. */
+static struct timespec local_close_deadline(void)
+{
+    struct timespec deadline = { .tv_sec = 0, .tv_nsec = 0 };
+    int rc = clock_gettime(CLOCK_MONOTONIC, &deadline);
+    CHECK(rc == 0);
+    if (rc != 0)
+        return (struct timespec){ .tv_sec = 0, .tv_nsec = 0 };
+    deadline.tv_sec += 10;
+    return deadline;
+}
+
+static int local_close_wait_step(const struct timespec *deadline)
+{
+    struct timespec now;
+    int rc = clock_gettime(CLOCK_MONOTONIC, &now);
+    CHECK(rc == 0);
+    if (rc != 0 || now.tv_sec > deadline->tv_sec ||
+        (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec))
+        return 0;
+
+    /* Yield even when the facade is terminal; its final pump may still be
+     * publishing the predicate. Recheck the deadline after interruption. */
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000 };
+    rc = nanosleep(&pause, NULL);
+    int ok = rc == 0 || errno == EINTR;
+    CHECK(ok);
+    return ok;
+}
+
 static int row_local_close(void)
 {
     if (check_test_certs() != 0) {
@@ -353,30 +386,42 @@ static int row_local_close(void)
     CHECK(moq_pq_threaded_create(&cli_cfg, &cli) == MOQ_OK);
 
     if (cli) {
-        for (int tries = 0; tries < 400 &&
-             !__atomic_load_n(&sc.accepted, __ATOMIC_ACQUIRE); tries++)
-            moq_pq_threaded_wait(srv, 25000);
-        CHECK(__atomic_load_n(&sc.accepted, __ATOMIC_ACQUIRE) == 1);
+        struct timespec deadline = local_close_deadline();
+        while (!__atomic_load_n(&sc.accepted, __ATOMIC_ACQUIRE) &&
+               local_close_wait_step(&deadline)) {
+        }
+        int accepted = __atomic_load_n(&sc.accepted, __ATOMIC_ACQUIRE);
+        CHECK(accepted == 1);
+        if (accepted != 1)
+            goto stop_client;
 
         __atomic_store_n(&sc.armed, 1, __ATOMIC_RELEASE);
         moq_pq_threaded_wake(srv);
 
-        for (int tries = 0; tries < 400 &&
-             moq_pq_threaded_conn_count(srv) > 0; tries++)
-            moq_pq_threaded_wait(srv, 25000);
-        CHECK(moq_pq_threaded_conn_count(srv) == 0);
+        deadline = local_close_deadline();
+        while (moq_pq_threaded_conn_count(srv) > 0 &&
+               local_close_wait_step(&deadline)) {
+        }
+        int pruned = moq_pq_threaded_conn_count(srv) == 0;
+        CHECK(pruned);
+        if (!pruned)
+            goto stop_client;
         CHECK(sc.close_requested == 1);
         CHECK(sc.close_rc == MOQ_OK);
 
         /* The peer must observe the local close, exactly once, with the code
          * the server asked for. */
-        for (int tries = 0; tries < 400 &&
-             __atomic_load_n(&cw.closed_count, __ATOMIC_ACQUIRE) == 0; tries++)
-            moq_pq_threaded_wait(cli, 25000);
+        deadline = local_close_deadline();
+        while (__atomic_load_n(&cw.closed_count, __ATOMIC_ACQUIRE) == 0 &&
+               local_close_wait_step(&deadline)) {
+        }
         CHECK(__atomic_load_n(&cw.closed_count, __ATOMIC_ACQUIRE) == 1);
-        CHECK(__atomic_load_n(&cw.closed_code_valid, __ATOMIC_ACQUIRE) == 1);
-        CHECK(cw.closed_code == ROW_LOCAL_CLOSE_CODE);
+        int code_valid = __atomic_load_n(&cw.closed_code_valid, __ATOMIC_ACQUIRE);
+        CHECK(code_valid == 1);
+        if (code_valid == 1)
+            CHECK(cw.closed_code == ROW_LOCAL_CLOSE_CODE);
 
+stop_client:
         moq_pq_threaded_stop(cli);
         moq_pq_threaded_destroy(cli);
     }
