@@ -30,7 +30,12 @@
  * Invariant: LOC video objects delivered with no capture-timestamp extension
  * (as a moqx-style relay sends) are surfaced with has_capture_time=false, not
  * dropped. After TRACK_ADDED + CATALOG_READY, this test asserts all four
- * video objects surface.
+ * video objects surface. Completion then distinguishes a track declared VOD
+ * from one created live: only the latter re-arms once, whether its conversion
+ * catalog arrives before or after the done. A never-live track cannot become
+ * live through a later catalog. Every outbound SUBSCRIBE is counted; the peer
+ * replays the same group on any replacement so an erroneous re-arm also
+ * exposes duplicate delivery. All inputs and pumps are synchronous.
  */
 #include <moq/media_receiver.h>
 #include <moq/msf.h>
@@ -102,6 +107,58 @@ static size_t build_subscribe_ok(uint8_t *out, size_t out_cap,
     return moq_buf_writer_offset(&w);
 }
 
+/* Each video subscription has exactly one finished subgroup stream. */
+static void feed_track_ended(moq_session_t *client, uint64_t request_id,
+                             uint64_t now)
+{
+    uint8_t ctrl[64];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, ctrl, sizeof(ctrl));
+    MOQ_TEST_CHECK(moq_d16_encode_publish_done(&w, request_id, 0x2, 1,
+                                               NULL, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_session_on_control_bytes(client, ctrl,
+                           moq_buf_writer_offset(&w), now) >= 0);
+}
+
+static void feed_catalog(moq_session_t *client, uint64_t stream, uint64_t group,
+                         const char *json, uint64_t now)
+{
+    uint8_t buf[512];
+    size_t o = 0, len = strlen(json);
+    buf[o++] = 0x30;
+    o += put_varint(buf + o, 0);       /* catalog alias */
+    o += put_varint(buf + o, group);
+    o += put_varint(buf + o, 0);       /* object 0 */
+    o += put_varint(buf + o, len);
+    MOQ_TEST_CHECK(o + len <= sizeof(buf));
+    if (o + len > sizeof(buf)) return;
+    memcpy(buf + o, json, len);
+    o += len;
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(client, moq_stream_ref_from_u64(stream),
+                                             buf, o, true, now) >= 0);
+}
+
+/* The same four Objects, for the original subscription and any replacement. */
+static void feed_video_group(moq_session_t *client, uint64_t stream,
+                             uint64_t alias, uint64_t now)
+{
+    uint8_t buf[512];
+    size_t o = 0;
+    buf[o++] = 0x30;
+    o += put_varint(buf + o, alias);
+    o += put_varint(buf + o, 2);
+    for (int k = 0; k < 4; k++) {
+        char frame[16];
+        int fl = snprintf(frame, sizeof(frame), "frame:g2:o%d", k);
+        o += put_varint(buf + o, 0);
+        o += put_varint(buf + o, (uint64_t)fl);
+        memcpy(buf + o, frame, (size_t)fl);
+        o += (size_t)fl;
+    }
+    MOQ_TEST_CHECK(moq_session_on_data_bytes(client, moq_stream_ref_from_u64(stream),
+                                             buf, o, true, now) >= 0);
+}
+
 /* -- request-id learning: decode the receiver's outbound SUBSCRIBE actions -- */
 
 typedef struct {
@@ -109,6 +166,7 @@ typedef struct {
     uint64_t catalog_rid;
     bool     have_video_rid;
     uint64_t video_rid;
+    uint64_t last_sub_rid;
     int      subscribe_seen;
     int      fetch_seen;
 } learned_t;
@@ -121,14 +179,26 @@ static void drain_and_learn(moq_session_t *client, learned_t *l)
 {
     moq_action_t acts[16];
     size_t n;
-    while ((n = moq_session_poll_actions(client, acts, 16)) > 0) {
+    for (;;) {
+        moq_result_t rc = moq_session_poll_actions_ex(client, acts, 16,
+                                                       sizeof(acts[0]), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK || n == 0) break;
         for (size_t i = 0; i < n; i++) {
-            if (acts[i].kind != MOQ_ACTION_SEND_CONTROL) continue;
+            if (acts[i].kind != MOQ_ACTION_SEND_CONTROL) {
+                moq_action_cleanup(&acts[i]);
+                continue;
+            }
             moq_control_envelope_t env;
             moq_buf_reader_t r;
             moq_buf_reader_init(&r, acts[i].u.send_control.data,
                                 acts[i].u.send_control.len);
-            if (moq_control_decode_envelope(&r, &env) < 0) continue;
+            rc = moq_control_decode_envelope(&r, &env);
+            MOQ_TEST_CHECK(rc >= 0);
+            if (rc < 0) {
+                moq_action_cleanup(&acts[i]);
+                continue;
+            }
             if (env.msg_type == MOQ_D16_SUBSCRIBE) {
                 moq_bytes_t ns_parts[8];
                 moq_kvp_entry_t params[16];
@@ -138,9 +208,13 @@ static void drain_and_learn(moq_session_t *client, learned_t *l)
                 s.params_cap = 16;
                 moq_result_t drc = moq_d16_decode_subscribe(
                     env.payload, env.payload_len, ns_parts, 8, &s);
-                if (drc < 0)
+                MOQ_TEST_CHECK(drc >= 0);
+                if (drc < 0) {
+                    moq_action_cleanup(&acts[i]);
                     continue;
+                }
                 l->subscribe_seen++;
+                l->last_sub_rid = s.request_id;
                 if (!l->have_catalog_rid) {
                     l->have_catalog_rid = true;
                     l->catalog_rid = s.request_id;
@@ -151,6 +225,7 @@ static void drain_and_learn(moq_session_t *client, learned_t *l)
             } else if (env.msg_type == MOQ_D16_FETCH) {
                 l->fetch_seen++;
             }
+            moq_action_cleanup(&acts[i]);
         }
     }
 }
@@ -161,10 +236,59 @@ static const char CATALOG_JSON[] =
     "{\"name\":\"video\",\"packaging\":\"loc\",\"isLive\":true,"
     "\"role\":\"video\",\"codec\":\"avc1.42e01e\"}]}";
 
-int main(void)
+/* No duration is needed to declare a never-live VOD track. This also lets the
+ * rejected update change only isLive, isolating the false-to-true violation. */
+static const char VOD_CATALOG_JSON[] =
+    "{\"version\":1,\"tracks\":["
+    "{\"name\":\"video\",\"packaging\":\"loc\",\"isLive\":false,"
+    "\"role\":\"video\",\"codec\":\"avc1.42e01e\"}]}";
+static const char CONVERSION_JSON[] =
+    "{\"version\":1,\"tracks\":["
+    "{\"name\":\"video\",\"packaging\":\"loc\",\"isLive\":false,"
+    "\"role\":\"video\",\"codec\":\"avc1.42e01e\",\"trackDuration\":5000}]}";
+
+typedef struct {
+    int updated;
+    int ended;
+} completion_t;
+
+/* Pump every synchronous receiver stage and drain its outbound actions. There
+ * is no transport timer or peer thread that can hide a replacement SUBSCRIBE. */
+static void pump_completion(moq_media_receiver_t *r, moq_session_t *client,
+                            learned_t *learned, moq_media_track_t *video,
+                            completion_t *events, uint64_t *now)
 {
+    for (int i = 0; i < 8; i++) {
+        *now += 1000;
+        MOQ_TEST_CHECK(moq_session_process_pending(client, *now) >= 0);
+        moq_media_receiver_test_pump(r, client, *now);
+        drain_and_learn(client, learned);
+        moq_media_track_event_t ev;
+        while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+            MOQ_TEST_CHECK(ev.track == video);
+            if (ev.kind == MOQ_MEDIA_TRACK_UPDATED) {
+                events->updated++;
+            } else if (ev.kind == MOQ_MEDIA_TRACK_ENDED) {
+                events->ended++;
+                MOQ_TEST_CHECK(ev.has_done_status);
+                MOQ_TEST_CHECK_EQ_U64(ev.done_status, 0x2);
+            } else {
+                MOQ_TEST_CHECK(false); /* no new handle, removal or catalog-ready */
+            }
+        }
+    }
+    MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+    MOQ_TEST_CHECK(moq_session_state(client) == MOQ_SESS_ESTABLISHED);
+}
+
+static void run_scenario(const char *name, bool initially_live,
+                         bool catalog_before_done, bool invalid_live_update)
+{
+    int failures_before = failures;
+    fprintf(stderr, "SCENARIO: %s\n", name);
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
     cfg.alloc = moq_alloc_default();
+    cfg.version = MOQ_VERSION_DRAFT_16;
     cfg.seed = 42;
     cfg.initial_now_us = 1000;
     cfg.server_send_request_capacity = true;
@@ -173,14 +297,31 @@ int main(void)
     cfg.client_initial_request_capacity = 16;
 
     moq_simpair_t *sp = NULL;
-    MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
-    moq_simpair_start(sp);
-    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    moq_result_t setup_rc = moq_simpair_create(&cfg, &sp);
+    MOQ_TEST_CHECK(setup_rc == MOQ_OK);
+    if (setup_rc != MOQ_OK) return;
+    setup_rc = moq_simpair_start(sp);
+    MOQ_TEST_CHECK(setup_rc == MOQ_OK);
+    if (setup_rc != MOQ_OK) {
+        moq_simpair_destroy(sp);
+        return;
+    }
+    setup_rc = moq_simpair_run_until_quiescent(sp, 16, NULL);
+    MOQ_TEST_CHECK(setup_rc >= 0);
+    if (setup_rc < 0) {
+        moq_simpair_destroy(sp);
+        return;
+    }
 
     moq_session_t *client = moq_simpair_client(sp);
     moq_session_t *server = moq_simpair_server(sp);
     MOQ_TEST_CHECK(moq_session_state(client) == MOQ_SESS_ESTABLISHED);
     MOQ_TEST_CHECK(moq_session_state(server) == MOQ_SESS_ESTABLISHED);
+    if (moq_session_state(client) != MOQ_SESS_ESTABLISHED ||
+        moq_session_state(server) != MOQ_SESS_ESTABLISHED) {
+        moq_simpair_destroy(sp);
+        return;
+    }
     /* Drain handshake events both sides. */
     { moq_event_t ev;
       while (moq_session_poll_events(client, &ev, 1) == 1) moq_event_cleanup(&ev);
@@ -201,6 +342,10 @@ int main(void)
 
     moq_media_receiver_t *r = moq_media_receiver_test_new_cfg(&rcfg);
     MOQ_TEST_CHECK(r != NULL);
+    if (!r) {
+        moq_simpair_destroy(sp);
+        return;
+    }
 
     uint64_t now = moq_simpair_now_us(sp);
     learned_t learned;
@@ -208,13 +353,10 @@ int main(void)
 
     uint8_t ctrl[256];
 
-    /* Distinct rx stream refs for catalog vs video subgroups. */
-    moq_stream_ref_t rx_cat   = moq_stream_ref_from_u64(101);
-    moq_stream_ref_t rx_video = moq_stream_ref_from_u64(202);
-
     bool cat_ok_sent = false, cat_data_sent = false;
     bool video_ok_sent = false, video_data_sent = false;
     bool track_added = false, catalog_ready = false;
+    moq_media_track_t *video = NULL;
 
     /* Drive the flow deterministically. Each cycle: pump the real hook (which
      * issues the catalog SUBSCRIBE, then -- after CATALOG_READY -- the video
@@ -244,21 +386,8 @@ int main(void)
         /* 2) After the catalog OK, feed the catalog subgroup (alias 0):
          *    0x30, track_alias(0), group_id(0), objid_delta(0), len, JSON */
         if (cat_ok_sent && !cat_data_sent) {
-            uint8_t buf[512];
-            size_t o = 0;
-            buf[o++] = 0x30;                 /* subgroup header type */
-            o += put_varint(buf + o, 0);     /* track_alias = 0 */
-            o += put_varint(buf + o, 0);     /* group_id = 0 */
-            o += put_varint(buf + o, 0);     /* objid_delta = 0 (object 0) */
-            size_t jlen = sizeof(CATALOG_JSON) - 1;
-            o += put_varint(buf + o, jlen);  /* payload_len */
-            memcpy(buf + o, CATALOG_JSON, jlen);
-            o += jlen;
-            moq_result_t rc = moq_session_on_data_bytes(
-                client, rx_cat, buf, o, /*fin=*/true, now);
-            if (rc < 0)
-                fprintf(stderr, "catalog data rejected: rc=%d\n", rc);
-            MOQ_TEST_CHECK(rc >= 0);
+            feed_catalog(client, 101, 0,
+                         initially_live ? CATALOG_JSON : VOD_CATALOG_JSON, now);
             cat_data_sent = true;
         }
 
@@ -282,24 +411,7 @@ int main(void)
          *    0x30, alias(2), group(2), then 4 objects, each
          *    { objid_delta(0), len(0x0b), "frame:g2:oN" }. */
         if (video_ok_sent && !video_data_sent) {
-            uint8_t buf[512];
-            size_t o = 0;
-            buf[o++] = 0x30;                 /* subgroup header type */
-            o += put_varint(buf + o, 2);     /* track_alias = 2 */
-            o += put_varint(buf + o, 2);     /* group_id = 2 */
-            for (int k = 0; k < 4; k++) {
-                char frame[16];
-                int fl = snprintf(frame, sizeof(frame), "frame:g2:o%d", k);
-                o += put_varint(buf + o, 0);          /* objid_delta = 0 */
-                o += put_varint(buf + o, (uint64_t)fl); /* payload_len */
-                memcpy(buf + o, frame, (size_t)fl);
-                o += (size_t)fl;
-            }
-            moq_result_t rc = moq_session_on_data_bytes(
-                client, rx_video, buf, o, /*fin=*/true, now);
-            if (rc < 0)
-                fprintf(stderr, "video data rejected: rc=%d\n", rc);
-            MOQ_TEST_CHECK(rc >= 0);
+            feed_video_group(client, 202, 2, now);
             video_data_sent = true;
         }
 
@@ -308,6 +420,7 @@ int main(void)
         while (moq_media_receiver_poll_track(r, &te, sizeof(te)) == MOQ_OK) {
             if (te.kind == MOQ_MEDIA_TRACK_ADDED) {
                 track_added = true;
+                video = te.track;
                 if (te.desc)
                     fprintf(stderr, "TRACK_ADDED: %.*s\n",
                             (int)te.desc->name.len,
@@ -355,6 +468,9 @@ int main(void)
         MOQ_TEST_CHECK(obj.payload.len == (size_t)wl &&
                        memcmp(obj.payload.data, want, (size_t)wl) == 0);
         MOQ_TEST_CHECK(obj.has_capture_time == false);
+        MOQ_TEST_CHECK(obj.track == video);
+        MOQ_TEST_CHECK_EQ_U64(obj.group_id, 2);
+        MOQ_TEST_CHECK_EQ_U64(obj.object_id, (uint64_t)objects);
         objects++;
         moq_media_object_cleanup(&obj);
     }
@@ -395,6 +511,92 @@ int main(void)
     MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 0);
     MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
 
+    /* The first completion is terminal only for a track created non-live. */
+    completion_t events = { 0 };
+    const moq_media_track_desc_t *desc = moq_media_track_desc_get(video);
+    MOQ_TEST_CHECK(desc && desc->is_live == initially_live);
+    if (!video || !desc) goto teardown;
+    if (invalid_live_update) {
+        feed_catalog(client, 303, 1, CATALOG_JSON, now);
+        pump_completion(r, client, &learned, video, &events, &now);
+        MOQ_TEST_CHECK(!desc->is_live);
+        MOQ_TEST_CHECK_EQ_INT(events.updated, 0);
+        MOQ_TEST_CHECK(moq_media_receiver_get_stats(r, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.catalog_drops, 1);
+    }
+    if (initially_live && catalog_before_done) {
+        feed_catalog(client, 303, 1, CONVERSION_JSON, now);
+        pump_completion(r, client, &learned, video, &events, &now);
+        MOQ_TEST_CHECK_EQ_INT(events.updated, 1);
+        MOQ_TEST_CHECK(!desc->is_live && desc->has_track_duration);
+    }
+    MOQ_TEST_CHECK_EQ_INT(events.ended, 0);
+    MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen, 2);
+
+    feed_track_ended(client, learned.video_rid, now);
+    pump_completion(r, client, &learned, video, &events, &now);
+    MOQ_TEST_CHECK_EQ_INT(events.ended, initially_live ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen, initially_live ? 3 : 2);
+
+    if (initially_live && !catalog_before_done) {
+        /* The live subscription completed while the catalog still said live;
+         * its replacement is already on the wire before the catalog update. */
+        MOQ_TEST_CHECK(desc->is_live);
+        feed_catalog(client, 303, 1, CONVERSION_JSON, now);
+        pump_completion(r, client, &learned, video, &events, &now);
+    }
+    MOQ_TEST_CHECK_EQ_INT(events.updated, initially_live ? 1 : 0);
+    MOQ_TEST_CHECK(moq_media_track_desc_get(video) == desc);
+    MOQ_TEST_CHECK(!desc->is_live);
+    if (initially_live) {
+        MOQ_TEST_CHECK(desc->has_track_duration);
+        MOQ_TEST_CHECK_EQ_U64(desc->track_duration_ms, 5000);
+    }
+
+    /* Answer even an erroneous replacement and replay the SAME group. This
+     * makes the never-live duplicate-delivery assertion causal as well as
+     * checking the number of outbound subscriptions. */
+    bool replacement = learned.subscribe_seen > 2;
+    if (replacement) {
+        size_t n = build_subscribe_ok(ctrl, sizeof(ctrl), learned.last_sub_rid, 4);
+        MOQ_TEST_CHECK(n > 0);
+        MOQ_TEST_CHECK(moq_session_on_control_bytes(client, ctrl, n, now) >= 0);
+        feed_video_group(client, 404, 4, now);
+    }
+    pump_completion(r, client, &learned, video, &events, &now);
+    int replayed = 0;
+    while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
+        MOQ_TEST_CHECK(obj.track == video);
+        MOQ_TEST_CHECK_EQ_U64(obj.group_id, 2);
+        MOQ_TEST_CHECK_EQ_U64(obj.object_id, (uint64_t)replayed);
+        replayed++;
+        moq_media_object_cleanup(&obj);
+    }
+    MOQ_TEST_CHECK_EQ_INT(replayed, initially_live ? 4 : 0);
+    MOQ_TEST_CHECK_EQ_INT(events.ended, initially_live ? 0 : 1);
+    moq_media_track_state_t state = MOQ_MEDIA_TRACK_STATE_DISCOVERED;
+    MOQ_TEST_CHECK(moq_media_receiver_track_state(r, video, &state) == MOQ_OK);
+    MOQ_TEST_CHECK(state == (initially_live ? MOQ_MEDIA_TRACK_STATE_ACTIVE
+                                          : MOQ_MEDIA_TRACK_STATE_ENDED));
+
+    if (replacement) {
+        feed_track_ended(client, learned.last_sub_rid, now);
+        pump_completion(r, client, &learned, video, &events, &now);
+    }
+    MOQ_TEST_CHECK_EQ_INT(events.ended, 1);
+    MOQ_TEST_CHECK(moq_media_receiver_track_state(r, video, &state) == MOQ_OK);
+    MOQ_TEST_CHECK(state == MOQ_MEDIA_TRACK_STATE_ENDED);
+    MOQ_TEST_CHECK(moq_media_receiver_subscribe_track(r, video, NULL) ==
+                   MOQ_ERR_WRONG_STATE);
+    pump_completion(r, client, &learned, video, &events, &now);
+    MOQ_TEST_CHECK_EQ_INT(events.ended, 1);
+    MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen, initially_live ? 3 : 2);
+    moq_result_t rc = moq_media_receiver_poll_object(r, &obj, sizeof(obj));
+    /* This offline seam has no endpoint, so an empty queue reports CLOSED. */
+    MOQ_TEST_CHECK(rc == MOQ_ERR_CLOSED);
+    if (rc == MOQ_OK) moq_media_object_cleanup(&obj);
+
+teardown:
     /* Retire through the production teardown path while the client session is
      * live and the pair is quiescent (so each UNSUBSCRIBE has action capacity),
      * then deliver that teardown traffic before the pair goes away. */
@@ -407,7 +609,15 @@ int main(void)
       while (moq_session_poll_events(server, &ev, 1) == 1) moq_event_cleanup(&ev); }
     moq_simpair_destroy(sp);
 
-    if (failures == 0)
-        MOQ_TEST_PASS("media_receiver_scripted");
+    if (failures == failures_before)
+        MOQ_TEST_PASS(name);
+}
+
+int main(void)
+{
+    run_scenario("never_live_track_ended", false, false, false);
+    run_scenario("never_live_rejects_live_catalog", false, false, true);
+    run_scenario("live_conversion_catalog_before_done", true, true, false);
+    run_scenario("live_conversion_catalog_after_done", true, false, false);
     return failures ? 1 : 0;
 }

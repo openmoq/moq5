@@ -4984,9 +4984,9 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
  * cleared so reconcile re-subscribes for the VOD content (auto- or
  * explicitly-subscribed alike -- both reconcile on desired_subscribed).
  * vod_rearmed makes that re-arm one-shot, so a peer that keeps finishing before
- * the VOD catalog arrives cannot spin a re-subscribe loop. Only a track that
- * some catalog declared live can convert: Track Ended on a track that was never
- * live is terminal, like any other status or a repeat done after re-arm, and the
+ * the VOD catalog arrives cannot spin a re-subscribe loop. Only a track declared
+ * live by its creation catalog can convert: Track Ended on a never-live track
+ * is terminal, like any other status or a repeat done after re-arm, and the
  * track ends exactly once. */
 static void receiver_process_subscription_dones(moq_media_receiver_t *r,
                                                 uint64_t now_us)
@@ -5644,9 +5644,9 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     receiver_poll_group_ends(r, now_us);
     receiver_poll_stream_terminals(r);
 
-    /* Process subscription completions recorded during the tick, now that this
-     * tick's objects are drained: a "Track Ended" (live->VOD) re-arms the track
-     * for re-subscribe below; any other done ends it. */
+    /* Process subscription completions after draining this tick's objects.
+     * The first "Track Ended" of a track created live may re-arm it for VOD;
+     * a never-live track or a repeat done ends it. */
     if (!r->joins_by_fill) receiver_process_subscription_dones(r, now_us);
     /* Issue + drain the catalog Joining FETCH (MSF-01 §5). Runs after the
      * subscribe poll so a SUBSCRIBE-delivered catalog update dedupes a later

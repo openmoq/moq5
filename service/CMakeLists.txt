@@ -937,8 +937,14 @@ if(MOQ_BUILD_TESTS)
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_scripted PRIVATE
                 ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_scripted PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
             add_test(NAME media_receiver_scripted
                 COMMAND test_media_receiver_scripted)
+            set_tests_properties(media_receiver_scripted PROPERTIES TIMEOUT 30)
             add_executable(test_media_receiver_malformed
                 tests/test_media_receiver_malformed.c)
             target_link_libraries(test_media_receiver_malformed PRIVATE
@@ -1527,6 +1533,11 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_receiver PRIVATE
             ${PROJECT_SOURCE_DIR}/tests/unit
             ${PROJECT_SOURCE_DIR}/tests/support)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_media_receiver PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
         add_test(NAME media_receiver
             COMMAND test_media_receiver
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"

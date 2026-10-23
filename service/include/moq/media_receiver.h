@@ -366,7 +366,9 @@ typedef struct moq_media_track_desc {
     /* MSF §5.2.7 isLive. A live→VOD conversion (§11.3) is the one sanctioned
      * mutation of a surviving tuple: is_live flips true→false (and
      * track_duration may appear) on the SAME handle, which fires a
-     * MOQ_MEDIA_TRACK_UPDATED event. A plain value, no backing allocation. */
+     * MOQ_MEDIA_TRACK_UPDATED event. Once false, it cannot become true in
+     * a later catalog (MSF-01 section 5.2.7). A plain value, no backing
+     * allocation. */
     bool                     is_live;
 
     /* Never read: reserves the original tail padding on ABIs whose uint64_t
@@ -601,9 +603,13 @@ typedef struct moq_media_track_event {
      * (PUBLISH_DONE, or SUBSCRIBE_DONE on drafts 16/18); done_status is
      * that message's status code. TRACK_ENDED (0x2) and, on drafts 16/18,
      * SUBSCRIPTION_ENDED (0x3) report a normal end; any other code an
-     * error. A first TRACK_ENDED re-arms the track for VOD and raises no
-     * event. false: the track ended with no done status -- at its
-     * END_OF_TRACK, or because the peer refused its subscription (a VOD
+     * error. Only a track declared live by its creation catalog is eligible
+     * for a one-shot VOD re-arm on its first TRACK_ENDED, with no event,
+     * even if its conversion catalog has already arrived. A never-live
+     * track ends on its first TRACK_ENDED; its queued Objects stay pollable.
+     * Ended or removed tracks cannot re-arm.
+     * false: the track ended with no done status -- at its END_OF_TRACK,
+     * or because the peer refused its subscription (a VOD
      * re-subscription included). Neither value says whether the
      * END_OF_TRACK arrived: that comes on the stream-terminal lane. */
     bool     has_done_status;

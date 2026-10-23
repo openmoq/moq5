@@ -1949,20 +1949,35 @@ int main(int argc, char **argv)
         g_srv.vod_catalog_json = NULL;
         g_srv.convert_status = MOQ_PUB_DONE_TRACK_ENDED;
         atomic_store(&g_srv.convert_after, 6);
+        MOQ_TEST_CHECK_EQ_INT(moq_pq_threaded_wake(srv), MOQ_OK);
 
-        int ended = 0;
+        int ended = 0, objects = 0;
+        bool seen[2][3] = { { false } };
         for (int i = 0; i < 300 && ended == 0; i++) {
             (void)moq_media_receiver_wait(r, 100000);
             moq_media_object_t obj;
-            while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK)
+            while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
+                MOQ_TEST_CHECK(obj.track == track);
+                MOQ_TEST_CHECK(obj.group_id < 2 && obj.object_id < 3);
+                if (obj.group_id < 2 && obj.object_id < 3) {
+                    MOQ_TEST_CHECK(!seen[obj.group_id][obj.object_id]);
+                    seen[obj.group_id][obj.object_id] = true;
+                }
+                objects++;
                 moq_media_object_cleanup(&obj);
+            }
             moq_media_track_event_t ev;
             while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
-                if (ev.track == track && ev.kind == MOQ_MEDIA_TRACK_ENDED) ended++;
+                if (ev.track == track && ev.kind == MOQ_MEDIA_TRACK_ENDED) {
+                    ended++;
+                    MOQ_TEST_CHECK(ev.has_done_status);
+                    MOQ_TEST_CHECK_EQ_U64(ev.done_status, MOQ_PUB_DONE_TRACK_ENDED);
+                }
             }
             if (moq_media_receiver_is_fatal(r)) break;
         }
         MOQ_TEST_CHECK_EQ_INT(ended, 1);
+        MOQ_TEST_CHECK_EQ_INT(objects, 6);
         MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
 
         moq_media_track_state_t ts = MOQ_MEDIA_TRACK_STATE_ACTIVE;
@@ -1970,9 +1985,10 @@ int main(int argc, char **argv)
             (int)moq_media_receiver_track_state(r, track, &ts), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)ts, (int)MOQ_MEDIA_TRACK_STATE_ENDED);
 
-        /* No re-subscribe: give a re-arm time to reach the server. */
-        for (int i = 0; i < 10; i++) (void)moq_media_receiver_wait(r, 50000);
-        MOQ_TEST_CHECK(!atomic_load(&g_srv.media_rejoined));
+        MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_subscribe_track(r, track, NULL),
+                              MOQ_ERR_WRONG_STATE);
+        /* The scripted peer proves no replacement SUBSCRIBE or replayed group
+         * after this terminal, without a wall-clock negative assertion. */
 
         moq_media_receiver_destroy(r);
         server_stop(srv);
