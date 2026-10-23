@@ -57,6 +57,7 @@ static const moq5_layout_entry_t entries[] = {
     F(moq_endpoint_cfg_t, verify_certificate), F(moq_endpoint_cfg_t, verify_certificate_ctx),
     F(moq_endpoint_cfg_t, uri_mode), F(moq_endpoint_cfg_t, preferred_version),
     F(moq_endpoint_cfg_t, accept_uri), F(moq_endpoint_cfg_t, accept_uri_ctx),
+    F(moq_endpoint_cfg_t, send_queue_cap_bytes),
     S(moq_endpoint_terminal_t), F(moq_endpoint_terminal_t, struct_size),
     F(moq_endpoint_terminal_t, reason), F(moq_endpoint_terminal_t, detail_code),
 
@@ -98,6 +99,7 @@ static const moq5_layout_entry_t entries[] = {
     F(moq_media_track_cfg_t, track_properties), F(moq_media_track_cfg_t, dynamic_groups),
     F(moq_media_track_cfg_t, has_render_group), F(moq_media_track_cfg_t, render_group),
     F(moq_media_track_cfg_t, has_label), F(moq_media_track_cfg_t, label),
+    F(moq_media_track_cfg_t, group_order),
     S(moq_media_send_object_t), F(moq_media_send_object_t, struct_size),
     F(moq_media_send_object_t, payload), F(moq_media_send_object_t, properties),
     F(moq_media_send_object_t, is_sync), F(moq_media_send_object_t, starts_group),

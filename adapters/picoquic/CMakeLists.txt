@@ -1339,8 +1339,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
     endif()
 
-    # End-to-end group order over real picoquic: publisher facade ->
-    # subscriber session, asserting the order groups complete in.
+    # Group-order negotiation and complete delivery over real picoquic in
+    # drafts 16, 18 and 22. Deterministic tests own the scheduling oracle.
     if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
         add_executable(test_group_order_e2e tests/test_group_order_e2e.c)
         target_link_libraries(test_group_order_e2e PRIVATE
@@ -1349,12 +1349,17 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             ${PROJECT_SOURCE_DIR}/tests/unit)
         target_compile_options(test_group_order_e2e PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME group_order_e2e_helpers
+            COMMAND test_group_order_e2e --self-test)
+        set_tests_properties(group_order_e2e_helpers PROPERTIES TIMEOUT 30)
         add_test(NAME group_order_e2e
             COMMAND test_group_order_e2e
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
                 --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        # Twelve cases: 12 * (10 s receive + 1 s cleanup + 2 * 3 s stop)
+        # = 204 s, plus headroom for listener startup and scheduling.
         set_tests_properties(group_order_e2e PROPERTIES
-            LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
+            LABELS "network" TIMEOUT 240 RESOURCE_LOCK service_network)
     endif()
 endif()
 

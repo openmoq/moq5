@@ -535,12 +535,14 @@ Each of these is a stated limit or open decision a user can run into.
   because GROUP_ORDER cannot travel on the REQUEST_UPDATE that carries the
   subscriber's choices.
 - **Transport scheduling is per stream.** Datagrams are not scheduled by
-  priority at the transport. A FETCH or fill stream carries objects of
-  several groups, so it is placed by its priorities only, and fill streams
-  take each write's priority as they did before stream keys. A FETCH whose
-  objects carry different publisher priorities takes, while several of them
-  wait at the transport, the priority of the last one handed over, not of
-  the next to go (issue #36). With
+  priority at the transport. With the stream-drained capability, a FETCH
+  retains its held objects' publisher priority until those bytes drain;
+  a different priority waits in the bridge. Draft-22 fills also retain their
+  current group and parent identity. Within a group, fills precede subgroup
+  data; between groups the parent's order applies, except that an
+  opposite-order fill yields to subscription data. Cyclic fill preferences
+  share a rank. No peer acknowledgment is required. Without the drained
+  capability, per-write reprioritization remains best effort. With
   `max_actions` below 4 the bridge keys no stream: the group order is not
   applied at the transport. An adapter that sets priorities without the
   stream-drained notice loses the order whenever its transport still holds a

@@ -4277,9 +4277,11 @@ static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot,
     };
     moq_result_t rc = s->profile->encode_publish_done(s, &dw, &done_args);
     if (rc < 0) return rc;
-    return moq_session_uses_request_streams(s)
+    rc = moq_session_uses_request_streams(s)
         ? queue_send_bidi(s, s->subs[slot].rs.ref, buf, moq_buf_writer_offset(&dw), true)
         : queue_send_control(s, buf, moq_buf_writer_offset(&dw));
+    if (rc == MOQ_OK) session_tag_owner_done(s, s->subs[slot].handle._opaque);
+    return rc;
 }
 
 /* Whether a subgroup or fill stream of subscription `slot` still owes the
@@ -4538,10 +4540,9 @@ void moq_reject_subscription_update_cfg_init_sized(
     cfg->struct_size = (uint32_t)n;
 }
 
-/* Every byte of one acknowledgement per covered update fits the send
- * buffer now (MOQ_ERR_WOULD_BLOCK when not yet, MOQ_ERR_BUFFER when one can
- * never fit). */
-moq_result_t session_update_accept_fits(moq_session_t *s, const moq_owed_update_t *o,
+/* The entire answer must fit before any update is committed. Distinguish
+ * temporary occupancy from a batch larger than the configured send buffer. */
+static moq_result_t session_update_accept_fits(moq_session_t *s, const moq_owed_update_t *o,
                                         const moq_update_plan_t *p)
 {
     size_t total = 0;
@@ -4551,10 +4552,51 @@ moq_result_t session_update_accept_fits(moq_session_t *s, const moq_owed_update_
         moq_result_t rc = session_update_encode_ok(s, session_owed_update_id(o, i), p, ok_buf,
                                            sizeof(ok_buf), &ok_len);
         if (rc < 0) return rc;
-        if (ok_len > s->send_cap) return MOQ_ERR_BUFFER;
+        if (ok_len > s->send_cap - total) return MOQ_ERR_BUFFER;
         total += ok_len;
     }
     if (total > s->send_cap - s->send_len) return MOQ_ERR_WOULD_BLOCK;
+    return MOQ_OK;
+}
+
+moq_result_t session_update_queue_accept(moq_session_t *s, bool req_stream,
+    moq_stream_ref_t ref, const moq_owed_update_t *o, const moq_update_plan_t *p)
+{
+    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    moq_result_t rc = session_update_accept_fits(s, o, p);
+    if (rc < 0) return rc;
+
+    /* D18 permits coalesced processing, but still owes one wire response
+     * per update. Their common stream needs only one output action. Stage
+     * all bytes in the unused arena tail without advancing its cursor. */
+    size_t total = 0;
+    for (uint32_t i = 0; i < o->count; i++) {
+        uint8_t ok_buf[64];
+        size_t ok_len = 0;
+        rc = session_update_encode_ok(s, session_owed_update_id(o, i), p,
+                                     ok_buf, sizeof(ok_buf), &ok_len);
+        if (rc < 0) return rc;
+        memcpy(s->send_buf + s->send_len + total, ok_buf, ok_len);
+        total += ok_len;
+    }
+
+    moq_action_t a = {0};
+    a.borrow_epoch = s->borrow_epoch;
+    if (req_stream) {
+        a.kind = MOQ_ACTION_SEND_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_send_bidi_stream_action_t);
+        a.u.send_bidi_stream.stream_ref = ref;
+        a.u.send_bidi_stream.data = s->send_buf + s->send_len;
+        a.u.send_bidi_stream.len = total;
+    } else {
+        a.kind = MOQ_ACTION_SEND_CONTROL;
+        a.detail_size = (uint32_t)sizeof(moq_send_control_action_t);
+        a.u.send_control.data = s->send_buf + s->send_len;
+        a.u.send_control.len = total;
+    }
+    rc = push_action(s, &a);
+    if (rc < 0) return rc;
+    s->send_len += total;
     return MOQ_OK;
 }
 
@@ -4626,24 +4668,16 @@ moq_result_t session_accept_subscription_update_receipt(
     moq_result_t rc = sub_update_answer_target(s, sub, cfg->update_request_id, &slot);
     if (rc < 0) return rc;
     moq_sub_entry_t *e = &s->subs[slot];
-    uint32_t n = e->owed_update.count;
-
-    /* The whole answer is reserved before anything is queued: one REQUEST_OK
-     * per covered update, every byte of them, the subscriber priority's
-     * owner-wide key, and the fill. */
-    size_t ok_actions = n + sub_update_priority_slots(s, e, &e->owed_update.rec);
+    /* Reserve one action for all wire ACKs in the run, plus the priority
+     * update and fill. The ACKs share an action, not a wire message. */
+    size_t ok_actions = 1 + sub_update_priority_slots(s, e, &e->owed_update.rec);
     if (action_queue_avail(s) < ok_actions) return MOQ_ERR_WOULD_BLOCK;
     moq_update_plan_t plan;
     rc = sub_update_prepare(s, (size_t)slot, &e->owed_update.rec, ok_actions, &plan);
     if (rc < 0) return rc;
-    rc = session_update_accept_fits(s, &e->owed_update, &plan);
+    rc = session_update_queue_accept(s, moq_session_uses_request_streams(s),
+                                    e->rs.ref, &e->owed_update, &plan);
     if (rc < 0) return rc;
-
-    for (uint32_t i = 0; i < n; i++) {
-        rc = sub_update_queue_ok(s, (size_t)slot, session_owed_update_id(&e->owed_update, i),
-                                 &plan);
-        if (rc < 0) return rc;   /* unreachable: reserved above */
-    }
     moq_sub_update_t u = e->owed_update.rec;
     session_owed_update_clear(s, &e->owed_update);
     if (receipt) {
@@ -5968,6 +6002,7 @@ moq_result_t moq_session_done_subscribe(
         s->send_len += elen;
     }
 
+    session_tag_owner_done(s, e->handle._opaque);
     sub_free_entry(s, (size_t)slot);
     return MOQ_OK;
 }

@@ -285,11 +285,27 @@ target_link_libraries(test_scheduling PRIVATE moq-core)
 target_include_directories(test_scheduling PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME scheduling COMMAND test_scheduling)
+add_test(NAME bridge_retention_cancel COMMAND test_scheduling --retention-cancel)
+add_test(NAME bridge_fetch_priority COMMAND test_scheduling --fetch-priority)
+add_test(NAME bridge_fill_order COMMAND test_scheduling --fill-order)
+add_test(NAME bridge_fin_before_done COMMAND test_scheduling --fin-done)
+add_test(NAME bridge_retained_expiry COMMAND test_scheduling --retained-expiry)
+
+add_executable(test_stream_order unit/test_stream_order.c
+    ../core/src/bridge/stream_order.c)
+target_include_directories(test_stream_order PRIVATE ../core/include)
+add_test(NAME stream_order COMMAND test_stream_order)
 
 add_executable(test_pq_priority ../adapters/common/test_pq_priority.c
     ../adapters/common/moq_pq_send_queue.c)
 target_link_libraries(test_pq_priority PRIVATE moq::core)
 add_test(NAME pq_priority COMMAND test_pq_priority)
+
+add_executable(test_pq_priority_admission
+    ../adapters/common/test_pq_priority_admission.c
+    ../adapters/common/moq_pq_send_queue.c)
+target_link_libraries(test_pq_priority_admission PRIVATE moq::core)
+add_test(NAME pq_priority_admission COMMAND test_pq_priority_admission)
 
 # Fake-endpoint fidelity: every recorded-operation capacity loss and every
 # byte-bearing truncation is observable and sticky, so a fixture cannot
@@ -476,6 +492,11 @@ endif()
 add_executable(test_session_publish unit/test_session_publish.c)
 target_link_libraries(test_session_publish PRIVATE moq-core-test-internals)
 add_test(NAME session_publish COMMAND test_session_publish)
+
+add_executable(test_coalesced_update_capacity unit/test_coalesced_update_capacity.c)
+target_link_libraries(test_coalesced_update_capacity PRIVATE moq::core)
+add_test(NAME coalesced_update_capacity COMMAND test_coalesced_update_capacity)
+set_tests_properties(coalesced_update_capacity PROPERTIES TIMEOUT 30)
 
 add_executable(test_issue44_rejected_update unit/test_issue44_rejected_update.c)
 target_link_libraries(test_issue44_rejected_update PRIVATE moq-core-test-internals)
@@ -1404,6 +1425,10 @@ target_link_libraries(test_oom PRIVATE moq::core)
 add_test(NAME oom COMMAND test_oom)
 
 # -- C++ compatibility test -----------------------------------------
+add_executable(test_publish_event_client unit/test_publish_event_client.c)
+target_link_libraries(test_publish_event_client PRIVATE moq::core)
+add_test(NAME publish_event_client COMMAND test_publish_event_client)
+
 enable_language(CXX)
 add_executable(test_cxx_compat unit/test_cxx_compat.cpp)
 target_link_libraries(test_cxx_compat PRIVATE moq::core)

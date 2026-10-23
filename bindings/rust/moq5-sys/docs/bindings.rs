@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: 71559817a129 (native headers modified in the worktree)
+// libmoq commit: 974398eb0065 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -77,6 +77,7 @@ pub const MOQ_ACTION_SEND_UNI_CONTROL: u32 = 11;
 pub const MOQ_ACTION_RESET_BIDI_STREAM: u32 = 12;
 pub const MOQ_ACTION_STOP_BIDI_STREAM: u32 = 13;
 pub const MOQ_ACTION_ABORT_BIDI_STREAM: u32 = 14;
+pub const MOQ_ACTION_SET_DATA_PRIORITY: u32 = 15;
 pub const MOQ_ACTION_DETAIL_MAX: u32 = 80;
 pub const MOQ_EVENT_SETUP_COMPLETE: u32 = 1;
 pub const MOQ_EVENT_SESSION_CLOSED: u32 = 2;
@@ -548,6 +549,36 @@ const _: () = {
         [::std::mem::offset_of!(moq_track_sub_handle, _opaque) - 0usize];
 };
 pub type moq_track_sub_handle_t = moq_track_sub_handle;
+#[doc = " A data stream's scheduling key (MOQT 7.2): subscriber priority, then\n publisher priority (lower first), then, within one owner (the stream's\n subscription, publication or FETCH, an opaque id), group in the owner's\n group order, then lowest subgroup. Different owners that tie on both\n priorities share turns."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct moq_data_priority {
+    pub subscriber_priority: u8,
+    pub publisher_priority: u8,
+    pub descending: bool,
+    pub owner: u64,
+    pub group_id: u64,
+    pub subgroup_id: u64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_data_priority"][::std::mem::size_of::<moq_data_priority>() - 32usize];
+    ["Alignment of moq_data_priority"][::std::mem::align_of::<moq_data_priority>() - 8usize];
+    ["Offset of field: moq_data_priority::subscriber_priority"]
+        [::std::mem::offset_of!(moq_data_priority, subscriber_priority) - 0usize];
+    ["Offset of field: moq_data_priority::publisher_priority"]
+        [::std::mem::offset_of!(moq_data_priority, publisher_priority) - 1usize];
+    ["Offset of field: moq_data_priority::descending"]
+        [::std::mem::offset_of!(moq_data_priority, descending) - 2usize];
+    ["Offset of field: moq_data_priority::owner"]
+        [::std::mem::offset_of!(moq_data_priority, owner) - 8usize];
+    ["Offset of field: moq_data_priority::group_id"]
+        [::std::mem::offset_of!(moq_data_priority, group_id) - 16usize];
+    ["Offset of field: moq_data_priority::subgroup_id"]
+        [::std::mem::offset_of!(moq_data_priority, subgroup_id) - 24usize];
+};
+#[doc = " A data stream's scheduling key (MOQT 7.2): subscriber priority, then\n publisher priority (lower first), then, within one owner (the stream's\n subscription, publication or FETCH, an opaque id), group in the owner's\n group order, then lowest subgroup. Different owners that tie on both\n priorities share turns."]
+pub type moq_data_priority_t = moq_data_priority;
 unsafe extern "C" {
     pub fn moq_subscription_is_valid(h: moq_subscription_t) -> bool;
 }
@@ -934,7 +965,7 @@ pub struct moq_session_cfg {
     pub perspective: moq_perspective_t,
     pub send_request_capacity: bool,
     pub initial_request_capacity: u64,
-    #[doc = " action queue entries   (default 64)"]
+    #[doc = " action queue entries   (default 64;\n below 4 the transport bridge\n keys no data stream)"]
     pub max_actions: u32,
     #[doc = " event queue entries    (default 16)"]
     pub max_events: u32,
@@ -1353,6 +1384,24 @@ impl Default for moq_send_data_action {
 pub type moq_send_data_action_t = moq_send_data_action;
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
+pub struct moq_set_data_priority_action {
+    pub stream_ref: moq_stream_ref_t,
+    pub priority: moq_data_priority_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_set_data_priority_action"]
+        [::std::mem::size_of::<moq_set_data_priority_action>() - 40usize];
+    ["Alignment of moq_set_data_priority_action"]
+        [::std::mem::align_of::<moq_set_data_priority_action>() - 8usize];
+    ["Offset of field: moq_set_data_priority_action::stream_ref"]
+        [::std::mem::offset_of!(moq_set_data_priority_action, stream_ref) - 0usize];
+    ["Offset of field: moq_set_data_priority_action::priority"]
+        [::std::mem::offset_of!(moq_set_data_priority_action, priority) - 8usize];
+};
+pub type moq_set_data_priority_action_t = moq_set_data_priority_action;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct moq_reset_data_action {
     pub stream_ref: moq_stream_ref_t,
     pub error_code: u64,
@@ -1647,6 +1696,7 @@ pub union moq_action_moq_action_detail {
     pub reset_bidi_stream: moq_reset_bidi_stream_action_t,
     pub stop_bidi_stream: moq_stop_bidi_stream_action_t,
     pub abort_bidi_stream: moq_abort_bidi_stream_action_t,
+    pub set_data_priority: moq_set_data_priority_action_t,
     pub _reserved: [u8; 80usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -1683,6 +1733,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_action_moq_action_detail, stop_bidi_stream) - 0usize];
     ["Offset of field: moq_action_moq_action_detail::abort_bidi_stream"]
         [::std::mem::offset_of!(moq_action_moq_action_detail, abort_bidi_stream) - 0usize];
+    ["Offset of field: moq_action_moq_action_detail::set_data_priority"]
+        [::std::mem::offset_of!(moq_action_moq_action_detail, set_data_priority) - 0usize];
     ["Offset of field: moq_action_moq_action_detail::_reserved"]
         [::std::mem::offset_of!(moq_action_moq_action_detail, _reserved) - 0usize];
 };
@@ -1738,6 +1790,14 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Whether the session still holds outbound work it has not handed over:\n an action not yet polled, or accepted outbound work it retains to emit\n later (a FIN, RESET or STOP owed on a stream, a response, a cancellation,\n fill work). A queued datagram counts as output; this says nothing about\n its delivery. false for NULL.\n\n Pure observation: it does not poll, allocate, read a clock, retry,\n mutate, transfer ownership or invalidate borrows. Call it serialized with\n every other call on the session, on its owning serialized executor -- for\n a session a managed adapter owns, within that adapter's documented\n session-access window; it is not a cross-thread accessor.\n\n Not counted: answers the application has not supplied yet, timers alone,\n receive-only backpressure, and the send scratch arena. It says nothing\n about work already polled (handed to a bridge or provider), transport\n acknowledgement, peer consumption, or output the session may produce\n later."]
     pub fn moq_session_has_pending_output(s: *const moq_session_t) -> bool;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Opt in to MOQ_ACTION_SET_DATA_PRIORITY (default off, so older action\n consumers never see it); the transport bridge turns it on. Call it before\n any data stream opens. A key rides beside the actions a call already\n queues, so MOQ_ERR_INVAL (and no change) when max_actions is below 4."]
+    pub fn moq_session_set_data_priority_updates(
+        s: *mut moq_session_t,
+        enabled: bool,
+    ) -> moq_result_t;
 }
 #[doc = " Event kind discriminator. Fixed-width uint32_t for ABI stability.\n Values are never renumbered. Unknown kinds must be ignored."]
 pub type moq_event_kind_t = u32;
@@ -1973,6 +2033,8 @@ pub struct moq_subscribe_ok_event {
     pub track_properties: moq_bytes_t,
     #[doc = " Appended: the track supports dynamically started groups (Track\n Property DYNAMIC_GROUPS == 1); omitted on the wire means false. When\n true, new-group requests may ride this subscription's updates."]
     pub dynamic_groups: bool,
+    #[doc = " Appended: the publisher's DEFAULT_PUBLISHER_GROUP_ORDER, or\n MOQ_GROUP_ORDER_DEFAULT if it advertised none."]
+    pub publisher_group_order: moq_group_order_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -2001,6 +2063,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_subscribe_ok_event, track_properties) - 56usize];
     ["Offset of field: moq_subscribe_ok_event::dynamic_groups"]
         [::std::mem::offset_of!(moq_subscribe_ok_event, dynamic_groups) - 72usize];
+    ["Offset of field: moq_subscribe_ok_event::publisher_group_order"]
+        [::std::mem::offset_of!(moq_subscribe_ok_event, publisher_group_order) - 76usize];
 };
 impl Default for moq_subscribe_ok_event {
     fn default() -> Self {
@@ -5341,6 +5405,26 @@ pub type moq_accept_subscribe_cfg_t = moq_accept_subscribe_cfg;
 unsafe extern "C" {
     pub fn moq_accept_subscribe_cfg_init(cfg: *mut moq_accept_subscribe_cfg_t);
 }
+unsafe extern "C" {
+    #[doc = " The group order in effect for a subscription (MOQT 7.1): the subscriber's,\n else the publisher's advertised preference, else ascending. Never DEFAULT,\n except for a stale handle."]
+    pub fn moq_session_subscription_group_order(
+        s: *const moq_session_t,
+        sub: moq_subscription_t,
+    ) -> moq_group_order_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Build the track properties a publisher passes to an accept (subscription,\n FETCH, TRACK_STATUS) or a PUBLISH to advertise its preferred group order\n (ASCENDING or DESCENDING) as DEFAULT_PUBLISHER_GROUP_ORDER: `in` (may be\n empty) is copied to `out` with the preference added, encoded for this\n session's draft. An `in` that already carries the same preference is copied\n unchanged; MOQ_ERR_INVAL if it carries another one or does not parse\n (other properties are not checked here: an accept or PUBLISH checks the\n whole set); MOQ_ERR_BUFFER if `out` is too small (the preference adds at\n most 16 bytes). No session state changes."]
+    pub fn moq_session_track_properties_add_group_order(
+        s: *const moq_session_t,
+        in_: *const u8,
+        in_len: usize,
+        order: moq_group_order_t,
+        out: *mut u8,
+        out_cap: usize,
+        out_len: *mut usize,
+    ) -> moq_result_t;
+}
 #[doc = " REDIRECT (§10.6.1) target, set on a reject cfg only when\n error_code == MOQ_REQUEST_ERROR_REDIRECT. All fields may be empty (an all-empty\n Redirect reuses the current session URI and the original namespace/name). A\n CLIENT must leave connect_uri empty; namespace-scoped families\n (ANNOUNCEMENT, NS_SUB) must leave track_name empty. Bytes borrow for the call."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -6635,6 +6719,13 @@ unsafe extern "C" {
         now_us: u64,
         out_handle: *mut moq_publication_t,
     ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[doc = " moq_session_subscription_group_order() for a publisher-initiated\n subscription. Until the subscriber's accept is known, the publisher's\n preference."]
+    pub fn moq_session_publication_group_order(
+        s: *const moq_session_t,
+        pub_: moq_publication_t,
+    ) -> moq_group_order_t;
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -8505,10 +8596,12 @@ pub struct moq_endpoint_cfg {
     #[doc = " appended (enabled by struct_size): a server endpoint's URI policy, in\n the shape moq_connection_target_t carries it (see\n <moq/connection_target.h>). A client endpoint supplies neither; a\n client cfg carrying either is MOQ_ERR_INVAL. The server perspective is\n reserved in v0, so today these fields can only be left zero."]
     pub accept_uri: moq_uri_accept_fn,
     pub accept_uri_ctx: *mut ::std::os::raw::c_void,
+    #[doc = " appended (enabled by struct_size): the transport adapter's outbound\n queue bound in bytes (see moq_pq_conn_cfg_t); 0 = adapter default.\n Honored by raw QUIC over picoquic only; WebTransport and the other\n backends ignore it. Set it via moq_endpoint_cfg_init_sized(&cfg,\n sizeof cfg)."]
+    pub send_queue_cap_bytes: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_endpoint_cfg"][::std::mem::size_of::<moq_endpoint_cfg>() - 200usize];
+    ["Size of moq_endpoint_cfg"][::std::mem::size_of::<moq_endpoint_cfg>() - 208usize];
     ["Alignment of moq_endpoint_cfg"][::std::mem::align_of::<moq_endpoint_cfg>() - 8usize];
     ["Offset of field: moq_endpoint_cfg::struct_size"]
         [::std::mem::offset_of!(moq_endpoint_cfg, struct_size) - 0usize];
@@ -8552,6 +8645,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_endpoint_cfg, accept_uri) - 184usize];
     ["Offset of field: moq_endpoint_cfg::accept_uri_ctx"]
         [::std::mem::offset_of!(moq_endpoint_cfg, accept_uri_ctx) - 192usize];
+    ["Offset of field: moq_endpoint_cfg::send_queue_cap_bytes"]
+        [::std::mem::offset_of!(moq_endpoint_cfg, send_queue_cap_bytes) - 200usize];
 };
 impl Default for moq_endpoint_cfg {
     fn default() -> Self {
@@ -8564,11 +8659,11 @@ impl Default for moq_endpoint_cfg {
 }
 pub type moq_endpoint_cfg_t = moq_endpoint_cfg;
 unsafe extern "C" {
-    #[doc = " Pointer-only initializer: it cannot know the caller's struct size, so it\n clears and stamps ONLY the frozen v0 prefix (MOQ_ENDPOINT_CFG_V0_SIZE) and\n leaves every appended tail field untouched. A config produced this way runs\n with the tail ABSENT (struct_size stops at the v0 floor), which resolves to\n MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0\n (the backend default) for handshake_timeout_us, to no setup tokens, to no\n application certificate callback, LEGACY for uri_mode, the library default\n for preferred_version and no URI policy. Because it never writes past the v0\n floor, it can NEVER overflow the buffer of an old caller that predates a\n later tail field. To SET any tail field, use moq_endpoint_cfg_init_sized()."]
+    #[doc = " Pointer-only initializer: it cannot know the caller's struct size, so it\n clears and stamps ONLY the frozen v0 prefix (MOQ_ENDPOINT_CFG_V0_SIZE) and\n leaves every appended tail field untouched. A config produced this way runs\n with the tail ABSENT (struct_size stops at the v0 floor), which resolves to\n MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0\n (the backend default) for handshake_timeout_us, to no setup tokens, to no\n application certificate callback, LEGACY for uri_mode, the library default\n for preferred_version, no URI policy and the adapter's default queue bound. Because it never writes past the v0\n floor, it can NEVER overflow the buffer of an old caller that predates a\n later tail field. To SET any tail field, use moq_endpoint_cfg_init_sized()."]
     pub fn moq_endpoint_cfg_init(cfg: *mut moq_endpoint_cfg_t);
 }
 unsafe extern "C" {
-    #[doc = " Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the\n initializer to use whenever you set anything beyond the v0 floor (wt_profile,\n handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,\n verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,\n accept_uri). Pass sizeof(moq_endpoint_cfg_t).\n Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller\n header too."]
+    #[doc = " Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the\n initializer to use whenever you set anything beyond the v0 floor (wt_profile,\n handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,\n verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,\n accept_uri, send_queue_cap_bytes). Pass sizeof(moq_endpoint_cfg_t).\n Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller\n header too."]
     pub fn moq_endpoint_cfg_init_sized(cfg: *mut moq_endpoint_cfg_t, cfg_size: usize);
 }
 unsafe extern "C" {
@@ -10991,10 +11086,11 @@ pub struct moq_media_track_cfg {
     #[doc = " MSF-01 section 5.2.10 label: human-readable track-selection text.\n Borrowed for the call; add_track deep-copies the bytes. Read only when\n struct_size covers this entire presence/span block. With has_label\n false the span is ignored. With it true, an empty span emits \"\", and\n nonempty text must have a non-NULL pointer and well-formed UTF-8 or\n add_track returns MOQ_ERR_INVAL. Embedded NUL bytes are preserved."]
     pub has_label: bool,
     pub label: moq_bytes_t,
+    pub group_order: moq_group_order_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_track_cfg"][::std::mem::size_of::<moq_media_track_cfg>() - 328usize];
+    ["Size of moq_media_track_cfg"][::std::mem::size_of::<moq_media_track_cfg>() - 336usize];
     ["Alignment of moq_media_track_cfg"][::std::mem::align_of::<moq_media_track_cfg>() - 8usize];
     ["Offset of field: moq_media_track_cfg::struct_size"]
         [::std::mem::offset_of!(moq_media_track_cfg, struct_size) - 0usize];
@@ -11088,6 +11184,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_track_cfg, has_label) - 304usize];
     ["Offset of field: moq_media_track_cfg::label"]
         [::std::mem::offset_of!(moq_media_track_cfg, label) - 312usize];
+    ["Offset of field: moq_media_track_cfg::group_order"]
+        [::std::mem::offset_of!(moq_media_track_cfg, group_order) - 328usize];
 };
 impl Default for moq_media_track_cfg {
     fn default() -> Self {

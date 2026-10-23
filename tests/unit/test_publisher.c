@@ -598,10 +598,9 @@ static void test_write_single_sub(void) {
     MOQ_TEST_PASS("write_single_sub");
 }
 
-/* end_track queues a terminal subgroup -- open, END_OF_TRACK object, FIN --
- * in one go. With stream keys (as under the transport bridge) the open takes
- * one slot more, so with three slots free the call waits rather than strand
- * the subgroup without its FIN. */
+/* Stream keys add an action to END_OF_TRACK's open/object/FIN sequence.
+ * With three slots free, end_track retains partial progress and completes
+ * after capacity returns; it must not strand the subgroup without FIN. */
 static void test_end_track_with_stream_keys(void)
 {
     test_alloc_state_t as = {0};

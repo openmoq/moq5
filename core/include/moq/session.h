@@ -2179,10 +2179,6 @@ typedef struct moq_publish_request_event {
      * history at request commit, so the registry is current even if the app
      * ignores this field. */
     bool               has_largest;
-    /* Appended into the padding before largest_group (the union is at its
-     * size limit): the publisher's DEFAULT_PUBLISHER_GROUP_ORDER, or
-     * MOQ_GROUP_ORDER_DEFAULT if it advertised none. */
-    uint8_t            publisher_group_order;
     uint64_t           largest_group;
     uint64_t           largest_object;
     /* Appended: the publisher's advertised EXPIRES (milliseconds). Surfaced

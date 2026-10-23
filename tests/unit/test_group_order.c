@@ -36,6 +36,29 @@ static const moq_version_t k_versions[] = {
 
 static bool is_d18(moq_version_t ver) { return ver == MOQ_VERSION_DRAFT_18; }
 
+/* The original PUBLISH event already carries these borrowed bytes. Check the
+ * specified 0x22 property and its value without a product property builder;
+ * omission is distinct from the effective ascending default. These rows
+ * advertise no other properties. D16 11.1.1.2; D18 12.5. */
+static void check_publish_preference(moq_version_t ver, moq_bytes_t props,
+                                     moq_group_order_t expected)
+{
+    if (expected == NONE) {
+        MOQ_TEST_CHECK_EQ_SIZE(props.len, 0);
+        return;
+    }
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, props.data, props.len);
+    moq_result_t (*read_int)(moq_buf_reader_t *, uint64_t *) =
+        is_d18(ver) ? moq_buf_read_vi64 : moq_buf_read_varint;
+    uint64_t type = 0, value = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)read_int(&r, &type), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)read_int(&r, &value), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(type, 0x22);
+    MOQ_TEST_CHECK_EQ_U64(value, (uint64_t)expected);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_buf_reader_remaining(&r), 0);
+}
+
 /* -- harness --------------------------------------------------------- */
 
 static moq_simpair_t *make_pair(moq_version_t ver)
@@ -221,8 +244,7 @@ static void check_publish(moq_version_t ver, moq_group_order_t pref,
     MOQ_TEST_CHECK(got);
     if (!got) { moq_simpair_destroy(sp); return; }
     moq_publication_t sv_pub = ev.u.publish_request.pub;
-    MOQ_TEST_CHECK_EQ_INT((int)ev.u.publish_request.publisher_group_order,
-                          (int)pref);
+    check_publish_preference(ver, ev.u.publish_request.track_properties, pref);
     moq_event_cleanup(&ev);
 
     moq_accept_publish_cfg_t ac;
@@ -1056,8 +1078,10 @@ static void check_facade_publish(moq_version_t ver, bool app_prop,
     bool got = poll_for(sv, MOQ_EVENT_PUBLISH_REQUEST, &ev);
     MOQ_TEST_CHECK(got);
     if (got) {
-        MOQ_TEST_CHECK_EQ_INT((int)ev.u.publish_request.publisher_group_order,
-                              (int)(app_prop ? app_order : DESC));
+        const moq_group_order_t preference = app_prop ? app_order : DESC;
+        check_publish_preference(ver, ev.u.publish_request.track_properties, preference);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_publication_group_order(
+            sv, ev.u.publish_request.pub), preference == NONE ? ASC : preference);
         moq_event_cleanup(&ev);
     }
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(sv), MOQ_SESS_ESTABLISHED);

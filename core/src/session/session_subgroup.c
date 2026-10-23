@@ -302,13 +302,18 @@ void session_expire_queued_data(moq_session_t *s)
                 if (sg->timeout_expired) drop = true;
                 else if (m->deadline_us <= now) {
                     sg->timeout_expired = true;
-                    if (sg->state == MOQ_SG_RESETTING) drop = true;
+                    /* Cancellation admitted before expiry already owns the
+                     * cause, even if a full ring left its reset on the
+                     * subgroup rather than in an action slot. */
+                    if (sg->state == MOQ_SG_RESETTING ||
+                        sg->state == MOQ_SG_RESET_OWED) drop = true;
                     else reset_sg = sg;
                 }
             }
         }
         if (drop) { moq_action_cleanup(a); continue; }
         if (reset_sg) {
+            const uint64_t owner = m->owner;
             moq_action_cleanup(a);
             memset(a, 0, sizeof(*a));
             a->kind = MOQ_ACTION_RESET_DATA;
@@ -319,6 +324,7 @@ void session_expire_queued_data(moq_session_t *s)
             a->u.reset_data.reliable_size = reset_sg->header_len;
             memset(m, 0, sizeof(*m));
             m->deadline_us = UINT64_MAX;
+            m->owner = owner;
             reset_sg->state = MOQ_SG_RESETTING;
             reset_sg->streaming_payload_len = 0;
             reset_sg->streaming_bytes_written = 0;
@@ -619,6 +625,7 @@ moq_result_t moq_session_open_subgroup(
     probe.publisher_priority = cfg->publisher_priority;
     moq_action_meta_t meta;
     sg_stream_meta(s, &probe, &meta);
+    meta.subgroup_header = true;
 
     moq_data_priority_t key;
     session_subgroup_data_key(&meta, &key);

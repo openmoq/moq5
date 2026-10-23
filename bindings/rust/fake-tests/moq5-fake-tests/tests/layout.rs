@@ -50,7 +50,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             struct_size, url, protocol, backend, versions, sni, ca_file, insecure_skip_verify,
             wt_path, perspective, alloc, wt_profile, handshake_timeout_us, setup_auth_tokens,
             setup_auth_token_count, verify_certificate, verify_certificate_ctx, uri_mode,
-            preferred_version, accept_uri, accept_uri_ctx,
+            preferred_version, accept_uri, accept_uri_ctx, send_queue_cap_bytes,
         }
         moq_endpoint_terminal_t { struct_size, reason, detail_code }
         moq_media_sender_callbacks_t { struct_size, ctx, on_ready }
@@ -70,7 +70,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             emit_media_timeline, media_timeline_history_groups, has_alt_group, alt_group,
             has_publisher_priority, publisher_priority, extensions, extension_count,
             mpeg2ts_app_objects, track_properties, dynamic_groups, has_render_group,
-            render_group, has_label, label,
+            render_group, has_label, label, group_order,
         }
         moq_media_send_object_t {
             struct_size, payload, properties, is_sync, starts_group, ends_group, decode_time_us,

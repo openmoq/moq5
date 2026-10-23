@@ -9,6 +9,7 @@
 #include "profile.h"
 #include "transport_binding_internal.h"
 #include "session_transport.h"
+#include "action_meta.h"
 #include "fill_owner_internal.h"
 #include "fill_input_internal.h"
 #include "publisher_fill_receipt.h"
@@ -87,12 +88,6 @@ _Static_assert(sizeof(moq_fetch_complete_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_object_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_gap_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
-/* publisher_group_order must stay inside the old padding. */
-_Static_assert(offsetof(moq_publish_request_event_t, largest_group) ==
-               ((offsetof(moq_publish_request_event_t, has_largest) +
-                 sizeof(bool) + _Alignof(uint64_t) - 1u) &
-                ~(size_t)(_Alignof(uint64_t) - 1u)),
-               "publisher_group_order moved largest_group");
 _Static_assert(sizeof(moq_publish_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_finished_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -2130,26 +2125,6 @@ void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key);
  * rules 1-4), and an object whose OBJECT_DELIVERY_TIMEOUT has elapsed is
  * dropped instead of being handed to the transport.
  */
-#define MOQ_SCHED_MODE_NONE     0u
-#define MOQ_SCHED_MODE_SUBGROUP 1u   /* subscription-delivered, on a subgroup stream */
-#define MOQ_SCHED_MODE_DATAGRAM 2u   /* subscription-delivered, as a datagram */
-#define MOQ_SCHED_MODE_FILL     3u   /* fill-delivered, on the fill fetch stream */
-#define MOQ_SCHED_MODE_FETCH    4u   /* a FETCH response */
-
-typedef struct moq_action_meta {
-    uint64_t deadline_us;        /* OBJECT_DELIVERY_TIMEOUT expiry; UINT64_MAX = none */
-    uint64_t owner;              /* the request the object answers (handle bits); 0 = none */
-    uint64_t group_id;
-    uint64_t subgroup_id;        /* SUBGROUP */
-    uint64_t object_id;          /* DATAGRAM / FILL */
-    uint8_t  subscriber_priority;
-    uint8_t  publisher_priority;
-    uint8_t  mode;               /* MOQ_SCHED_MODE_* */
-    uint8_t  group_order;        /* the owner's: MOQ_GROUP_ORDER_ASCENDING / DESCENDING */
-    uint8_t  fill_group_order;   /* FILL: the fill's own order */
-    bool     has_location;       /* group_id and the id field are meaningful */
-} moq_action_meta_t;
-
 typedef struct moq_state_location_cell {
     moq_location_filter_cfg_t value;
     size_t next;
@@ -2711,6 +2686,7 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a);
  * none) and is stored whichever way the record came. */
 moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
                             const moq_action_meta_t *meta, uint64_t deadline_us);
+void session_tag_owner_done(moq_session_t *s, uint64_t owner);
 /* Earliest OBJECT_DELIVERY_TIMEOUT expiry among the queued actions. */
 uint64_t session_queued_data_deadline(const moq_session_t *s);
 /* Drop every queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at
@@ -4617,8 +4593,10 @@ void session_owed_update_record(moq_owed_update_t *o, const moq_sub_update_t *cu
 moq_result_t session_update_encode_ok(moq_session_t *s, uint64_t request_id,
                                       const moq_update_plan_t *p,
                                       uint8_t *buf, size_t cap, size_t *out_len);
-moq_result_t session_update_accept_fits(moq_session_t *s, const moq_owed_update_t *o,
-                                        const moq_update_plan_t *p);
+/* Queue the owed run's distinct wire acknowledgments in one output action.
+ * A refusal leaves the action queue, send cursor and owed record unchanged. */
+moq_result_t session_update_queue_accept(moq_session_t *s, bool req_stream,
+    moq_stream_ref_t ref, const moq_owed_update_t *o, const moq_update_plan_t *p);
 moq_result_t session_update_reject_cfg_check(const moq_session_t *s,
                                              const moq_reject_subscription_update_cfg_t *cfg);
 void session_update_reject_args(const moq_owed_update_t *o,

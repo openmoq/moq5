@@ -997,6 +997,10 @@ moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
         *m = *meta;
     } else if (a->kind == MOQ_ACTION_SEND_DATA) {
         derive_stream_meta(s, queued, m);
+    } else if (a->kind == MOQ_ACTION_RESET_DATA) {
+        moq_action_t data = { .kind = MOQ_ACTION_SEND_DATA };
+        data.u.send_data.stream_ref = a->u.reset_data.stream_ref;
+        derive_stream_meta(s, &data, m);
     } else if (a->kind == MOQ_ACTION_SET_DATA_PRIORITY) {
         m->subscriber_priority = a->u.set_data_priority.priority.subscriber_priority;
         m->publisher_priority = a->u.set_data_priority.priority.publisher_priority;
@@ -1015,6 +1019,12 @@ moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
 moq_result_t push_action(moq_session_t *s, const moq_action_t *a)
 {
     return push_action_ex(s, a, NULL, UINT64_MAX);
+}
+
+void session_tag_owner_done(moq_session_t *s, uint64_t owner)
+{
+    assert(s->action_tail > s->action_head && owner != 0);
+    s->action_meta[(s->action_tail - 1) % s->action_cap].terminal_owner = owner;
 }
 
 uint64_t session_queued_data_deadline(const moq_session_t *s)
@@ -1095,9 +1105,9 @@ static int sched_compare(const moq_action_meta_t *x, const moq_action_meta_t *y)
 }
 
 /* The queue index (head <= idx < tail) of the action the next poll takes. */
-static size_t action_select(const moq_session_t *s)
+static size_t action_select_from(const moq_session_t *s, size_t head)
 {
-    size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
+    size_t tail = s->action_tail, cap = s->action_cap;
     if (!action_is_data(&s->actions[head % cap])) return head;
     size_t best = head;
     for (size_t i = head + 1; i < tail; i++) {
@@ -1119,6 +1129,11 @@ static size_t action_select(const moq_session_t *s)
             best = i;
     }
     return best;
+}
+
+static size_t action_select(const moq_session_t *s)
+{
+    return action_select_from(s, s->action_head);
 }
 
 /* Remove the action at idx from the ring into *out, keeping the order of the
@@ -3963,6 +3978,228 @@ typedef struct {
 _Static_assert(offsetof(moq_send_data_action_t, scheduling_priority) >=
                sizeof(send_data_action_v0_t), "SEND_DATA v0 prefix changed");
 
+static void session_action_poll_prepare(moq_session_t *s)
+{
+    if (session_is_active(s)) session_expire_queued_data(s);
+    ts_retry_pending(s);
+    ann_retry_pending(s);
+    ns_sub_retry_pending(s);
+}
+
+static void session_action_poll_settled(moq_session_t *s, bool released)
+{
+    if (released && session_is_active(s)) {
+        session_retry_owed_stream_actions(s);
+        fill_service(s);
+        mt_retry_pending(s);
+    }
+    ts_retry_pending(s);
+    ann_retry_pending(s);
+    ns_sub_retry_pending(s);
+}
+
+bool bridge_session_offer_data_reset(moq_session_t *s,
+                                     moq_reset_data_action_t *out)
+{
+    session_action_poll_prepare(s);
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (action_is_data(a)) continue;
+        if (a->kind != MOQ_ACTION_RESET_DATA) return false;
+        memset(out, 0, sizeof(*out));
+        out->stream_ref = a->u.reset_data.stream_ref;
+        out->error_code = a->u.reset_data.error_code;
+        if (a->detail_size >= offsetof(moq_reset_data_action_t, reliable_size) +
+                              sizeof(out->reliable_size))
+            out->reliable_size = a->u.reset_data.reliable_size;
+        return true;
+    }
+    /* A completely full data ring can prevent the cancellation producer from
+     * enqueuing its reset. The existing subgroup owner retains that obligation
+     * without another queue slot; treat it as a virtual tail action. */
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->state != MOQ_SG_RESET_OWED) continue;
+        memset(out, 0, sizeof(*out));
+        out->stream_ref = sg->stream_ref;
+        out->error_code = sg->owed_reset_code;
+        out->reliable_size = sg->header_len;
+        return true;
+    }
+    return false;
+}
+
+void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
+{
+    size_t dst = s->action_head;
+    const size_t tail = s->action_tail;
+    for (size_t src = s->action_head; src < tail; ++src) {
+        const size_t from = src % s->action_cap;
+        moq_action_t *a = &s->actions[from];
+        moq_stream_ref_t data_ref;
+        if (action_data_stream(a, &data_ref) && data_ref._v == ref._v) {
+            moq_action_cleanup(a);
+            continue;
+        }
+        const size_t to = dst++ % s->action_cap;
+        if (to != from) {
+            s->actions[to] = *a;
+            s->action_meta[to] = s->action_meta[from];
+        }
+    }
+    s->action_tail = dst;
+    for (; dst < tail; ++dst) {
+        memset(&s->actions[dst % s->action_cap], 0, sizeof(*s->actions));
+        memset(&s->action_meta[dst % s->action_cap], 0, sizeof(*s->action_meta));
+    }
+}
+
+void bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
+                                      moq_reset_data_action_t *reset)
+{
+    reset->stream_ref = ref;
+    reset->error_code = MOQ_RESET_DELIVERY_TIMEOUT;
+    int slot = sg_find_by_stream_ref(s, ref);
+    if (slot >= 0) {
+        moq_sg_entry_t *sg = &s->subgroups[slot];
+        reset->reliable_size = sg->header_len;
+        if (sg->state == MOQ_SG_RESET_OWED)
+            reset->error_code = sg->owed_reset_code;
+        sg->state = MOQ_SG_RESETTING;
+        sg->streaming_payload_len = sg->streaming_bytes_written = 0;
+        sg->streaming_deadline_us = sg->delivery_deadline_us = UINT64_MAX;
+        sg_recompute_deadline(s);
+    }
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind == MOQ_ACTION_RESET_DATA &&
+            a->u.reset_data.stream_ref._v == ref._v) {
+            *reset = a->u.reset_data;
+            break;
+        }
+    }
+    /* The bridge now owns this exact close, including when the core slot
+     * already retired. Remove obsolete data and the transferred reset. */
+    bridge_session_discard_reset_data(s, ref);
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind == MOQ_ACTION_RESET_DATA &&
+            a->u.reset_data.stream_ref._v == ref._v) {
+            moq_action_t taken;
+            action_take(s, i, &taken);
+            moq_action_cleanup(&taken);
+        }
+    }
+}
+
+bool bridge_session_commit_data_reset(moq_session_t *s,
+                                      const moq_reset_data_action_t *reset)
+{
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind != MOQ_ACTION_RESET_DATA ||
+            a->u.reset_data.stream_ref._v != reset->stream_ref._v ||
+            a->u.reset_data.error_code != reset->error_code)
+            continue;
+        moq_action_t taken;
+        action_take(s, i, &taken);
+        moq_action_cleanup(&taken);
+        session_action_poll_settled(s, true);
+        return true;
+    }
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->state != MOQ_SG_RESET_OWED ||
+            sg->stream_ref._v != reset->stream_ref._v ||
+            sg->owed_reset_code != reset->error_code)
+            continue;
+        sg->state = MOQ_SG_RESETTING;
+        session_action_poll_settled(s, true);
+        return true;
+    }
+    return false;
+}
+
+static bool bridge_session_poll_action_impl(moq_session_t *s, moq_action_t *out,
+                                            moq_action_meta_t *meta,
+                                            bool data_only)
+{
+    session_action_poll_prepare(s);
+    if (s->action_head == s->action_tail ||
+        (data_only && !action_is_data(&s->actions[s->action_head % s->action_cap]))) {
+        if (!data_only) session_action_poll_settled(s, false);
+        return false;
+    }
+    const size_t selected = action_select(s);
+    *meta = s->action_meta[selected % s->action_cap];
+    action_take(s, selected, out);
+    out->borrow_epoch = s->borrow_epoch;
+    session_action_poll_settled(s, true);
+    return true;
+}
+
+bool bridge_session_poll_leading_data(moq_session_t *s, moq_action_t *out,
+                                     moq_action_meta_t *meta)
+{
+    return bridge_session_poll_action_impl(s, out, meta, true);
+}
+
+bool bridge_session_poll_action(moq_session_t *s, moq_action_t *out,
+                                moq_action_meta_t *meta)
+{
+    return bridge_session_poll_action_impl(s, out, meta, false);
+}
+
+static bool action_follows_done(const moq_action_t *done, const moq_action_t *a)
+{
+    if (done->kind == MOQ_ACTION_SEND_CONTROL)
+        return a->kind == MOQ_ACTION_SEND_CONTROL;
+    const moq_stream_ref_t ref = done->u.send_bidi_stream.stream_ref;
+    switch (a->kind) {
+    case MOQ_ACTION_SEND_BIDI_STREAM:
+        return a->u.send_bidi_stream.stream_ref._v == ref._v;
+    case MOQ_ACTION_CLOSE_BIDI_STREAM:
+        return a->u.close_bidi_stream.stream_ref._v == ref._v;
+    case MOQ_ACTION_RESET_BIDI_STREAM:
+        return a->u.reset_bidi_stream.stream_ref._v == ref._v;
+    case MOQ_ACTION_STOP_BIDI_STREAM:
+        return a->u.stop_bidi_stream.stream_ref._v == ref._v;
+    case MOQ_ACTION_ABORT_BIDI_STREAM:
+        return a->u.abort_bidi_stream.stream_ref._v == ref._v;
+    default:
+        return false;
+    }
+}
+
+bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
+    moq_action_meta_t *meta, bridge_done_ready_fn ready, void *ctx)
+{
+    session_action_poll_prepare(s);
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const size_t at = i % s->action_cap;
+        const uint64_t owner = s->action_meta[at].terminal_owner;
+        if (owner && !ready(ctx, owner)) continue;
+        bool blocked = false;
+        for (size_t j = s->action_head; j < i; ++j) {
+            const size_t prior = j % s->action_cap;
+            if (s->action_meta[prior].terminal_owner &&
+                action_follows_done(&s->actions[prior], &s->actions[at])) {
+                blocked = true;
+                break;
+            }
+        }
+        if (blocked) continue;
+        const size_t selected = action_select_from(s, i);
+        *meta = s->action_meta[selected % s->action_cap];
+        action_take(s, selected, out);
+        out->borrow_epoch = s->borrow_epoch;
+        session_action_poll_settled(s, true);
+        return true;
+    }
+    session_action_poll_settled(s, false);
+    return false;
+}
+
 moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
                                           void *out, size_t cap,
                                           size_t element_size,
@@ -3984,11 +4221,7 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
 
     /* Handing an action to the adapter is the handover to the transport: an
      * object whose OBJECT_DELIVERY_TIMEOUT has elapsed must not cross it. */
-    if (session_is_active(s))
-        session_expire_queued_data(s);
-    ts_retry_pending(s);
-    ann_retry_pending(s);
-    ns_sub_retry_pending(s);
+    session_action_poll_prepare(s);
 
     while (n < cap && s->action_head < s->action_tail) {
         size_t idx = action_select(s);
@@ -4014,17 +4247,7 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
     /* Draining actions freed action-queue capacity: a stream action owed
      * earlier is issued regardless of whether the peer ever sends another
      * byte on that stream. */
-    if (n > 0 && session_is_active(s)) {
-        session_retry_owed_stream_actions(s);
-        /* Likewise a RESET or STOP a fill child owes its stream. */
-        fill_service(s);
-        /* And a malformed Track's cancellation that wanted an action. */
-        mt_retry_pending(s);
-    }
-
-    ts_retry_pending(s);
-    ann_retry_pending(s);
-    ns_sub_retry_pending(s);
+    session_action_poll_settled(s, n > 0);
 
     *out_count = n;
     return MOQ_OK;

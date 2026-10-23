@@ -4,6 +4,8 @@
 #include <moq/transport_bridge.h>
 #include <moq/session.h>
 #include "../session/session_transport.h"   /* moq_uni_class_t + capability */
+#include "../session/action_meta.h"
+#include "stream_order.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -136,6 +138,9 @@ typedef struct {
     /* A retained subgroup FIN is being reset; keep its mapping until the
      * endpoint accepts the reset, and ignore later commit/STOP callbacks. */
     bool                   fin_reset_pending;
+    /* A pressure-path reset remains in core storage through endpoint refusal,
+     * even after discarding its data has relieved the byte pressure. */
+    bool                   reset_source_held;
     /* Local unidirectional data stream: bytes the endpoint has accepted
      * (header and payload writes). Bounds a reset's reliable size. */
     uint64_t               bytes_sent;
@@ -225,6 +230,7 @@ typedef enum {
 typedef struct {
     bridge_pending_kind_t kind;
     moq_action_t          act;
+    moq_action_meta_t     meta;
     moq_stream_ref_t      stream_ref;
     uint64_t              stream_id;
     uint8_t              *data;
@@ -262,13 +268,20 @@ typedef struct {
  * `q` until the endpoint can take them, best key first. Slot links use
  * BRIDGE_INDEX_EMPTY for none. */
 typedef struct {
+    moq_action_t action;
+    moq_action_meta_t meta;
+} bridge_data_item_t;
+
+typedef struct {
     moq_data_priority_t key;
+    moq_action_meta_t   meta;       /* current handed or retained class */
+    moq_action_meta_t   order_meta; /* representative in the current graph */
     moq_stream_ref_t    ref;
     uint64_t            sid;
     uint64_t            reset_code;
     uint64_t            reset_reliable;
     uint64_t            served;     /* serve_seq of its last hand-off */
-    moq_action_t       *q;          /* ring of owned SEND_DATA actions */
+    bridge_data_item_t *q;          /* action and metadata share ownership */
     uint32_t            q_cap;
     uint32_t            q_head;
     uint32_t            q_len;
@@ -285,9 +298,15 @@ typedef struct {
     bool                active;
     bool                has_sid;
     bool                keyed;      /* the endpoint holds `applied` */
+    bool                prefix_only; /* only the FETCH preamble was handed over */
     bool                fin_handed;
     /* A reset waiting behind the queued prefix its reliable size covers. */
     bool                has_reset;
+    bool                reset_attempted; /* at most one attempt per service call */
+    bool                order_dirty;
+    bool                order_active;
+    bool                pump_skipped;
+    bool                dispatching;
 } bridge_dstream_t;
 
 /* Open-addressing entry mapping an ID to a dstream slot. */
@@ -319,6 +338,8 @@ struct moq_transport_bridge {
      * decides. */
     bool     bidi_cancel_due;
     uint64_t needs_close_code;
+    uint64_t now_us;            /* time supplied to the current service pass */
+    bool     done_waiting;      /* a core terminal waited for bridge output */
     bool     is_client;
 
     bool     control_open;
@@ -378,6 +399,10 @@ struct moq_transport_bridge {
     uint32_t              *dheap[2];
     uint32_t               dheap_len[2];
     uint32_t              *dskip;          /* streams refused in one pump */
+    moq_stream_order_node_t *order_nodes;  /* scratch, bounded by dstream_cap */
+    uint32_t              *order_slots;
+    bool                   order_dirty;
+    uint32_t               pump_budget;  /* shared by pumps in one service call */
     /* The pump's write: one the endpoint refuses before any byte went out
      * comes back to its stream instead of the pending FIFO. */
     bool                   pump_hand_back;
@@ -408,6 +433,8 @@ static inline bool bridge_stream_is_session_control(
  * owns action-capacity admission, including when its subgroup slot was reaped. */
 uint8_t bridge_session_subgroup_header_size(
     const moq_session_t *s, const moq_send_data_action_t *data);
+bool bridge_session_is_fetch_header(
+    const moq_session_t *s, const moq_send_data_action_t *data);
 
 moq_result_t bridge_session_on_subgroup_stop(
     moq_session_t *s, moq_stream_ref_t ref, uint64_t error_code,
@@ -416,6 +443,35 @@ moq_result_t bridge_session_on_subgroup_stop(
 /* A reset action retains its stream identity even after its core slot reaps. */
 bool bridge_session_has_queued_data_reset(
     const moq_session_t *s, moq_stream_ref_t ref);
+
+/* Cancellation under output pressure. The offer is a value copy of the first
+ * reset after a data-only run, or an owed reset after a data-only ring. It
+ * stays session-owned until commit. The bridge may discard that ref's queued
+ * data only after proving its complete reliable prefix was handed over.
+ * No public polling contract or action layout changes. */
+bool bridge_session_offer_data_reset(moq_session_t *s,
+                                     moq_reset_data_action_t *out);
+void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref);
+bool bridge_session_commit_data_reset(moq_session_t *s,
+                                      const moq_reset_data_action_t *reset);
+/* After a refused offer, admit leading data without consuming its reset or
+ * any intervening control barrier. The caller reserves ordinary capacity. */
+bool bridge_session_poll_leading_data(moq_session_t *s, moq_action_t *out,
+                                     moq_action_meta_t *meta);
+/* Same settlement and ownership as public polling; copy the selected scalar
+ * metadata before compaction or owner retirement can invalidate its source. */
+bool bridge_session_poll_action(moq_session_t *s, moq_action_t *out,
+                                moq_action_meta_t *meta);
+/* The bridge can retain an owner's stream closure after the session has
+ * queued DONE. Leave that terminal in core storage until the bridge accepts
+ * its prerequisites; unrelated ordering domains remain eligible. */
+typedef bool (*bridge_done_ready_fn)(void *ctx, uint64_t owner);
+bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
+    moq_action_meta_t *meta, bridge_done_ready_fn ready, void *ctx);
+/* Transfer an expired subgroup's reset debt into its existing bridge owner.
+ * No action/event capacity is needed. An earlier reset keeps its cause. */
+void bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
+                                      moq_reset_data_action_t *reset);
 
 /* Local receive retirement (session_receive.c): the transport finished with a
  * peer data stream after our accepted STOP_SENDING, and no FIN or RESET for it

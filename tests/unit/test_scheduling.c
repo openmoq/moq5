@@ -1,6 +1,6 @@
 /*
- * Data scheduling (MOQT 7.2) through the transport bridge, draft-16 and
- * draft-18. The cases come from a test plan written from the drafts alone,
+ * Data scheduling through the transport bridge, draft-16/18 (MOQT 7.2)
+ * and draft-22 (5.1.2). The cases come from a test plan written from the drafts alone,
  * before reading the implementation (IDs in brackets, e.g. [SCH-01]).
  *
  * The publisher's endpoint is a model transport (`mt_*`) that follows the
@@ -13,14 +13,17 @@
  * order on the wire is exact. Control and request stream bytes bypass the
  * model and reach the subscriber at once.
  *
- * Ordering is a SHOULD in both drafts; this model is strict, so the cases
+ * Ordering is a SHOULD in these drafts; this model is strict, so the cases
  * assert strict order where the plan allows it.
  */
 #include <moq/moq.h>
+#include <moq/codec.h>
 #include <moq/transport_bridge.h>
 #include "test_support.h"
 #include "test_binding_support.h"
 #include "../support/fake_endpoint.h"
+#include "../../core/src/session/session_internal.h"
+#include "../../core/src/bridge/transport_bridge_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +62,7 @@ static int draft_of(moq_version_t ver)
 
 typedef struct {
     uint64_t sid;
+    uint64_t accepted_seq;
     size_t   len;
     uint8_t  head[PAYLOAD_LEN];
     bool     fin;
@@ -75,14 +79,46 @@ typedef struct {
     bool     reset;
     bool     blocked;   /* per-stream flow control exhausted */
     bool     refuse;    /* its own send budget is spent: writes refused */
+    bool     refuse_payload; /* accept headers, refuse marked object bodies */
+    bool     refuse_fin;     /* refuse only the stream's normal FIN */
+    uint32_t write_attempts;
+    uint32_t fin_attempts;
+    size_t   first_write_len;
+    uint8_t  first_write_head[PAYLOAD_LEN]; /* includes a refused header */
+    uint32_t refused_writes;
+    uint32_t writes_after_reset;
+    bool     refuse_reset;
+    uint32_t reset_attempts;
+    uint64_t reset_code;
+    uint64_t reset_reliable;
 } mt_stream_t;
 
 typedef struct {
     uint64_t sid;
+    uint64_t accepted_seq;
     uint8_t  data[512];
     size_t   len;
     bool     fin;
 } mt_ctrl_t;
+
+/* Detached-retry observation: copied inside an earlier stream's endpoint
+ * write, with no callback into the bridge and no product-state mutation. */
+typedef struct {
+    uint64_t sid;
+    size_t fill_payload_writes;
+    moq_action_meta_t fill_order_meta;
+    uint32_t sibling_pos, sibling_key;
+    bool fill_found, sibling_found, sibling_keyed, sibling_held;
+    bool fill_order_active;
+} mt_retry_sample_t;
+
+typedef struct {
+    bool armed;
+    uint64_t earlier_sid[2], fill_sid, sibling_sid;
+    moq_stream_ref_t fill_ref, sibling_ref;
+    size_t sample_count, fill_payload_writes;
+    mt_retry_sample_t samples[2];
+} mt_retry_probe_t;
 
 typedef struct {
     moq_transport_endpoint_ops_t ops;
@@ -91,6 +127,7 @@ typedef struct {
     size_t   cap;           /* queued data bytes that refuse further writes */
     size_t   queued;
     bool     drained_cap;   /* advertise and call the drained notice */
+    bool     refuse_control;
     mt_stream_t streams[MT_MAX_STREAMS];
     mt_chunk_t  chunks[MT_MAX_CHUNKS];
     size_t      nchunks;
@@ -103,11 +140,18 @@ typedef struct {
     size_t   nwire;
     uint32_t priority_calls;
     uint32_t bidi_keyed;        /* keys set on request/control bidi streams */
-    uint64_t op_seq;            /* order across control writes and resets */
+    uint64_t op_seq;            /* endpoint acceptance: data, control, resets */
     uint64_t wire_seq[MT_MAX_CHUNKS];
     uint64_t ctrl_seq_last;     /* seq of the latest control write */
     uint64_t ctrl_mark;         /* seq after which ctrl_first_after counts */
     uint64_t ctrl_first_after;  /* seq of the first control write past it */
+    /* Read-only capture at the first reset attempt, before admission can
+     * drain surviving core data. Used by the wrapped-ring retention row. */
+    const moq_session_t *capture_core;
+    moq_stream_ref_t capture_ref;
+    moq_action_meta_t captured_meta[8];
+    size_t captured_count;
+    mt_retry_probe_t retry_probe;
 } mt_t;
 
 static mt_stream_t *mt_stream(mt_t *m, uint64_t sid)
@@ -146,6 +190,52 @@ static moq_transport_result_t mt_open_bidi(void *ctx, uint64_t *out)
     return MOQ_TRANSPORT_OK;
 }
 
+static const bridge_dstream_t *mt_retry_dstream(const moq_transport_bridge_t *b,
+                                               moq_stream_ref_t ref)
+{
+    for (uint32_t i = 0; i < b->dstream_cap; i++)
+        if (b->dstreams[i].active && b->dstreams[i].ref._v == ref._v)
+            return &b->dstreams[i];
+    return NULL;
+}
+
+static void mt_retry_observe(mt_t *m, uint64_t sid, const uint8_t *data, size_t len)
+{
+    mt_retry_probe_t *p = &m->retry_probe;
+    if (!p->armed || len != PAYLOAD_LEN || !data || data[0] != PAYLOAD_TAG) return;
+    if (sid == p->fill_sid) {
+        p->fill_payload_writes++;
+        return;
+    }
+    if (sid != p->earlier_sid[0] && sid != p->earlier_sid[1]) return;
+    const size_t at = p->sample_count++;
+    if (at >= sizeof(p->samples) / sizeof(p->samples[0])) return;
+    mt_retry_sample_t *sample = &p->samples[at];
+    sample->sid = sid;
+    sample->fill_payload_writes = p->fill_payload_writes;
+    const bridge_dstream_t *f = mt_retry_dstream(m->bridge, p->fill_ref);
+    const bridge_dstream_t *s = mt_retry_dstream(m->bridge, p->sibling_ref);
+    sample->fill_found = f != NULL;
+    sample->sibling_found = s != NULL;
+    if (f) {
+        sample->fill_order_meta = f->order_meta;
+        sample->fill_order_active = f->order_active;
+    }
+    if (s) sample->sibling_pos = s->pos;
+    for (size_t i = 0; i < MT_MAX_STREAMS; i++) {
+        const mt_stream_t *st = &m->streams[i];
+        if (st->used && st->sid == p->sibling_sid) {
+            sample->sibling_keyed = st->keyed;
+            sample->sibling_key = st->key;
+        }
+    }
+    for (size_t i = 0; i < m->nchunks; i++) {
+        const mt_chunk_t *c = &m->chunks[i];
+        if (!c->sent && c->sid == p->sibling_sid && c->len == PAYLOAD_LEN &&
+            c->head[0] == PAYLOAD_TAG) sample->sibling_held = true;
+    }
+}
+
 static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
                                        const uint8_t *data, size_t len,
                                        bool fin)
@@ -155,10 +245,12 @@ static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
     if (st && !st->data && st->keyed) st->data = true;
     if (!st || !st->data) {
         /* Control: the subscriber gets it at once. */
+        if (m->refuse_control) return MOQ_TRANSPORT_WOULD_BLOCK;
         if (m->nctrl == MT_MAX_CTRL || len > sizeof(m->ctrl[0].data))
             return MOQ_TRANSPORT_ERROR;
         mt_ctrl_t *c = &m->ctrl[m->nctrl++];
         m->ctrl_seq_last = ++m->op_seq;
+        c->accepted_seq = m->ctrl_seq_last;
         if (m->ctrl_mark && !m->ctrl_first_after &&
             m->ctrl_seq_last > m->ctrl_mark)
             m->ctrl_first_after = m->ctrl_seq_last;
@@ -168,14 +260,28 @@ static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
         c->fin = fin;
         return MOQ_TRANSPORT_OK;
     }
+    mt_retry_observe(m, sid, data, len);
+    if (st->write_attempts == 0) {
+        st->first_write_len = len;
+        if (len) memcpy(st->first_write_head, data,
+                        len < PAYLOAD_LEN ? len : PAYLOAD_LEN);
+    }
+    st->write_attempts++;
+    if (fin) st->fin_attempts++;
     /* A shared queue bounded as the picoquic adapter's is (a low-water
      * mark), plus a per-stream budget as msquic's. */
-    if ((len > 0 && m->queued >= m->cap) || st->refuse)
+    if (st->reset) st->writes_after_reset++;
+    if ((len > 0 && m->queued >= m->cap) || st->refuse ||
+        (fin && st->refuse_fin) ||
+        (st->refuse_payload && len == PAYLOAD_LEN && data && data[0] == PAYLOAD_TAG)) {
+        st->refused_writes++;
         return MOQ_TRANSPORT_WOULD_BLOCK;
+    }
     if (m->nchunks == MT_MAX_CHUNKS) return MOQ_TRANSPORT_ERROR;
     mt_chunk_t *c = &m->chunks[m->nchunks++];
     memset(c, 0, sizeof(*c));
     c->sid = sid;
+    c->accepted_seq = ++m->op_seq;
     c->len = len;
     if (len) memcpy(c->head, data, len < PAYLOAD_LEN ? len : PAYLOAD_LEN);
     c->fin = fin;
@@ -186,14 +292,28 @@ static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
 static moq_transport_result_t mt_reset(void *ctx, uint64_t sid, uint64_t code)
 {
     mt_t *m = ctx;
-    (void)code;
+    mt_stream_t *st = mt_stream(m, sid);
+    if (!st) return MOQ_TRANSPORT_ERROR;
+    if (m->capture_core && st->reset_attempts == 0) {
+        const moq_session_t *s = m->capture_core;
+        for (size_t i = s->action_head; i < s->action_tail; ++i) {
+            const size_t idx = i % s->action_cap;
+            const moq_action_t *a = &s->actions[idx];
+            if (a->kind == MOQ_ACTION_SEND_DATA &&
+                a->u.send_data.stream_ref._v == m->capture_ref._v &&
+                m->captured_count < sizeof(m->captured_meta) / sizeof(m->captured_meta[0]))
+                m->captured_meta[m->captured_count++] = s->action_meta[idx];
+        }
+    }
+    st->reset_attempts++;
+    st->reset_code = code;
+    if (st->refuse_reset) return MOQ_TRANSPORT_WOULD_BLOCK;
     for (size_t i = 0; i < m->nchunks; i++)
         if (m->chunks[i].sid == sid && !m->chunks[i].sent) {
             m->chunks[i].sent = true;
             m->queued -= m->chunks[i].len;
         }
-    mt_stream_t *st = mt_stream(m, sid);
-    if (st) st->reset = true;
+    st->reset = true;
     if (m->nwire < MT_MAX_CHUNKS) {
         memset(&m->wire[m->nwire], 0, sizeof(m->wire[0]));
         m->wire[m->nwire].sid = sid;
@@ -202,6 +322,16 @@ static moq_transport_result_t mt_reset(void *ctx, uint64_t sid, uint64_t code)
         m->nwire++;
     }
     return MOQ_TRANSPORT_OK;
+}
+
+static moq_transport_result_t mt_reset_at(void *ctx, uint64_t sid,
+                                         uint64_t code, uint64_t reliable)
+{
+    mt_t *m = ctx;
+    mt_stream_t *st = mt_stream(m, sid);
+    if (!st) return MOQ_TRANSPORT_ERROR;
+    st->reset_reliable = reliable;
+    return mt_reset(ctx, sid, code);
 }
 
 static moq_transport_result_t mt_stop(void *ctx, uint64_t sid, uint64_t code)
@@ -388,15 +518,20 @@ static void drain_events(moq_session_t *s)
 /* pair_init() with the publisher bridge's stream map limited to
  * `max_streams` entries (0 = default) and the publisher's action queue to
  * `max_actions` entries. */
-static bool pair_init_limits(pair_t *p, moq_version_t ver, size_t cap,
-                             bool drained_cap, uint32_t max_streams,
-                             uint32_t max_actions)
+static bool pair_init_retained(pair_t *p, moq_version_t ver, size_t cap,
+                               bool drained_cap, uint32_t max_streams,
+                               uint32_t max_actions, uint64_t retained_cap,
+                               uint32_t max_pending, bool reliable_reset)
 {
     memset(p, 0, sizeof(*p));
     p->ver = ver;
     p->mt = calloc(1, sizeof(*p->mt));
     if (!p->mt) return false;
     mt_init(p->mt, cap, drained_cap);
+    if (reliable_reset) {
+        p->mt->ops.capabilities |= MOQ_TRANSPORT_CAP_RELIABLE_RESET;
+        p->mt->ops.reset_stream_at = mt_reset_at;
+    }
     fake_endpoint_init(&p->sub_ep, 1000, 2000);
     p->sub_ep.vtable.capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
 
@@ -420,6 +555,8 @@ static bool pair_init_limits(pair_t *p, moq_version_t ver, size_t cap,
                                     &p->sub_ep, &p->sub_br) != MOQ_OK)
         return false;
     bc.max_streams = max_streams;
+    bc.max_retained_bytes = retained_cap;
+    bc.max_pending = max_pending;
     if (moq_transport_bridge_create(&bc, p->pub, &p->mt->ops, p->mt,
                                     &p->pub_br) != MOQ_OK)
         return false;
@@ -433,6 +570,14 @@ static bool pair_init_limits(pair_t *p, moq_version_t ver, size_t cap,
     drain_events(p->pub);
     return moq_session_state(p->pub) == MOQ_SESS_ESTABLISHED &&
            moq_session_state(p->sub) == MOQ_SESS_ESTABLISHED;
+}
+
+static bool pair_init_limits(pair_t *p, moq_version_t ver, size_t cap,
+                             bool drained_cap, uint32_t max_streams,
+                             uint32_t max_actions)
+{
+    return pair_init_retained(p, ver, cap, drained_cap, max_streams,
+                              max_actions, 0, 0, false);
 }
 
 static bool pair_init_streams(pair_t *p, moq_version_t ver, size_t cap,
@@ -476,9 +621,9 @@ typedef struct {
 
 /* The subscriber subscribes to "live"/`name` with `sub_prio` (-1: omitted)
  * and `order`; the publisher accepts advertising `pref`. */
-static bool subscribe(pair_t *p, const char *name, int sub_prio,
-                      moq_group_order_t order, moq_group_order_t pref,
-                      track_t *out)
+static bool subscribe_timed(pair_t *p, const char *name, int sub_prio,
+                            moq_group_order_t order, moq_group_order_t pref,
+                            uint64_t object_timeout_ms, track_t *out)
 {
     moq_bytes_t part = MOQ_BYTES_LITERAL("live");
     moq_subscribe_cfg_t sc;
@@ -501,12 +646,24 @@ static bool subscribe(pair_t *p, const char *name, int sub_prio,
         moq_event_cleanup(&ev);
     }
     if (!got) return false;
-    uint8_t props[16];
-    size_t props_len = 0;
-    if (pref != NONE &&
-        moq_session_track_properties_add_group_order(p->pub, NULL, 0, pref,
-            props, sizeof(props), &props_len) != MOQ_OK)
+    uint8_t timeout[16], props[32];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, timeout, sizeof(timeout));
+    if (object_timeout_ms != 0 &&
+        (moq_buf_write_vi64(&w, 2) != MOQ_OK ||
+         moq_buf_write_vi64(&w, object_timeout_ms) != MOQ_OK))
         return false;
+    const size_t timeout_len = moq_buf_writer_offset(&w);
+    size_t props_len = 0;
+    if (pref != NONE) {
+        if (moq_session_track_properties_add_group_order(p->pub, timeout,
+            timeout_len, pref,
+            props, sizeof(props), &props_len) != MOQ_OK)
+            return false;
+    } else {
+        memcpy(props, timeout, timeout_len);
+        props_len = timeout_len;
+    }
     moq_accept_subscribe_cfg_t ac;
     moq_accept_subscribe_cfg_init(&ac);
     ac.track_properties = (moq_bytes_t){ props, props_len };
@@ -515,6 +672,13 @@ static bool subscribe(pair_t *p, const char *name, int sub_prio,
     shuttle(p);
     drain_events(p->sub);
     return true;
+}
+
+static bool subscribe(pair_t *p, const char *name, int sub_prio,
+                      moq_group_order_t order, moq_group_order_t pref,
+                      track_t *out)
+{
+    return subscribe_timed(p, name, sub_prio, order, pref, 0, out);
 }
 
 /* Object payload: tag, track tag, group, subgroup, object (low bytes). */
@@ -572,6 +736,21 @@ static size_t wire_objects(const pair_t *p, uint32_t *out, size_t cap)
     return n;
 }
 
+/* The data stream that carried object (track, group, subgroup, *). */
+static bool stream_of(const pair_t *p, uint8_t track, uint64_t group,
+                      uint64_t *sid)
+{
+    for (size_t i = 0; i < p->mt->nchunks; i++) {
+        const mt_chunk_t *c = &p->mt->chunks[i];
+        if (c->len == PAYLOAD_LEN && c->head[0] == PAYLOAD_TAG &&
+            c->head[1] == track && c->head[2] == (uint8_t)group) {
+            *sid = c->sid;
+            return true;
+        }
+    }
+    return false;
+}
+
 #define OBJ(track, group, subgroup, object) \
     ((uint32_t)(track) << 24 | (uint32_t)(group) << 16 | \
      (uint32_t)(subgroup) << 8 | (uint32_t)(object))
@@ -581,34 +760,6 @@ static size_t wire_objects(const pair_t *p, uint32_t *out, size_t cap)
  * orders everything). */
 static const size_t k_caps[] = { 1, 64, 1u << 20 };
 
-/* Known deviations from the drafts, tracked in issue #36: still run with the
- * drafts' expectation, reported without failing the suite -- and failing it
- * once they start passing, so the mark gets removed. */
-static void expect_known(bool ok, bool known, const char *what,
-                         moq_version_t ver, size_t cap)
-{
-    if (!known) {
-        MOQ_TEST_CHECK(ok);
-        return;
-    }
-    if (!ok) {
-        printf("KNOWN FAILURE (issue #36): %s (d%d, cap %zu)\n", what,
-               draft_of(ver), cap);
-        return;
-    }
-    fprintf(stderr, "%s (d%d, cap %zu) now passes: drop its issue #36 mark\n",
-            what, draft_of(ver), cap);
-    failures++;
-}
-
-/* Issue #36: a FETCH stream takes the priority of its last object written to
- * the transport, so with several of its objects queued there it is not
- * scheduled by its next object. */
-static bool fetch_priority_known(const char *what, size_t cap)
-{
-    return strcmp(what, "FET-04") == 0 && cap > 1;
-}
-
 /* Check the wire carried exactly `want`, in order. */
 static void expect_wire(const pair_t *p, const uint32_t *want, size_t n,
                         const char *what, size_t cap)
@@ -617,8 +768,7 @@ static void expect_wire(const pair_t *p, const uint32_t *want, size_t n,
     size_t m = wire_objects(p, got, 512);
     bool same = m == n;
     for (size_t i = 0; same && i < n; i++) same = got[i] == want[i];
-    bool known = fetch_priority_known(what, cap);
-    if (!same && !known) {
+    if (!same) {
         fprintf(stderr, "%s (d%d, cap %zu): wire", what,
                 draft_of(p->ver), cap);
         for (size_t i = 0; i < m; i++) fprintf(stderr, " %08x", got[i]);
@@ -626,7 +776,7 @@ static void expect_wire(const pair_t *p, const uint32_t *want, size_t n,
         for (size_t i = 0; i < n; i++) fprintf(stderr, " %08x", want[i]);
         fprintf(stderr, "\n");
     }
-    expect_known(same, known, what, p->ver, cap);
+    MOQ_TEST_CHECK(same);
 }
 
 /* -- A. group order on the wire ------------------------------------------ */
@@ -1349,16 +1499,16 @@ static bool fetch_object(pair_t *p, const fetch_t *f, uint8_t track,
  * The fetch stream's own order never changes. */
 static void build_fet04(pair_t *p, void *ctx)
 {
-    (void)ctx;
+    const bool increasing = ctx && *(const bool *)ctx;
     track_t s;
     fetch_t f;
     MOQ_TEST_CHECK(subscribe(p, "s", 128, NONE, NONE, &s));
     MOQ_TEST_CHECK(start_fetch(p, "f", 128, &f));
     MOQ_TEST_CHECK(publish_group(p, &s, 1, 1, 0, 100, 2, false, NULL));
-    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 3, 0, 10));
-    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 3, 1, 10));
-    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 4, 0, 200));
-    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 4, 1, 200));
+    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 3, 0, increasing ? 200 : 10));
+    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 3, 1, increasing ? 200 : 10));
+    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 4, 0, increasing ? 10 : 200));
+    MOQ_TEST_CHECK(fetch_object(p, &f, 2, 4, 1, increasing ? 10 : 200));
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(p->pub, f.fetch, p->now),
                           MOQ_OK);
 }
@@ -1433,6 +1583,14 @@ static void test_fetch_scheduling(void)
         OBJ(2, 4, 0, 0), OBJ(2, 4, 0, 1),
     };
     run_case("FET-04", build_fet04, NULL, w04, 6);
+    /* A later urgent object must not promote the earlier low-priority bytes
+     * on that same FETCH stream. The subscription can drain first. */
+    static const uint32_t w06[] = {
+        OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1), OBJ(2, 3, 0, 0), OBJ(2, 3, 0, 1),
+        OBJ(2, 4, 0, 0), OBJ(2, 4, 0, 1),
+    };
+    bool increasing = true;
+    run_case("FET-06", build_fet04, &increasing, w06, 6);
     static const uint32_t w05[] = {
         OBJ(2, 3, 0, 0), OBJ(2, 3, 0, 1), OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1),
     };
@@ -1440,7 +1598,1019 @@ static void test_fetch_scheduling(void)
     MOQ_TEST_PASS("FETCH responses scheduled by their next object");
 }
 
+/* A FETCH waiting for its old priority class must neither hold up a healthy
+ * sibling nor prevent cancellation. Exercise both release paths on every
+ * draft. No drained-notice endpoints must also complete, without an ordering
+ * promise their interface cannot support. */
+static void test_fetch_priority_boundary(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; v++)
+        for (unsigned row = 0; row < 3; ++row) {
+            const bool cancel = row == 1;
+            const bool drained = row != 2;
+            pair_t p;
+            MOQ_TEST_CHECK(pair_init(&p, k_versions[v], 1u << 20, drained));
+            track_t s;
+            fetch_t f;
+            MOQ_TEST_CHECK(subscribe(&p, "s", 128, NONE, NONE, &s));
+            MOQ_TEST_CHECK(start_fetch(&p, "f", 128, &f));
+            MOQ_TEST_CHECK(publish_group(&p, &s, 1, 1, 0, 100, 2, false, NULL));
+            for (uint64_t o = 0; o < 4; ++o)
+                MOQ_TEST_CHECK(fetch_object(&p, &f, 2, 3, o, o < 2 ? 10 : 200));
+            moq_transport_bridge_service(p.pub_br, p.now);
+            uint64_t sid = 0;
+            MOQ_TEST_CHECK(stream_of(&p, 2, 3, &sid));
+            mt_stream_t *st = mt_stream(p.mt, sid);
+            MOQ_TEST_CHECK(st != NULL);
+            if (!st) { pair_destroy(&p); continue; }
+            if (drained) {
+                size_t held = 0;
+                for (size_t i = 0; i < p.mt->nchunks; ++i) {
+                    const mt_chunk_t *c = &p.mt->chunks[i];
+                    if (c->sid == sid && !c->sent && c->len == PAYLOAD_LEN &&
+                        c->head[0] == PAYLOAD_TAG)
+                        held++;
+                }
+                MOQ_TEST_CHECK_EQ_SIZE(held, 2);
+                MOQ_TEST_CHECK_EQ_INT((int)((st->key >> 16) & 0xffu), 10);
+                MOQ_TEST_CHECK(moq_transport_bridge_has_pending(p.pub_br));
+                /* It awaits this stream's drain, not generic write readiness. */
+                MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p.pub_br));
+            }
+            st->blocked = true;
+            serve_all(&p);
+            const uint32_t sibling[] = { OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1) };
+            expect_wire(&p, sibling, 2, "FETCH blocked sibling", 1u << 20);
+            if (cancel) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch_cancel(
+                    p.sub, f.cfetch, p.now), MOQ_OK);
+                shuttle(&p);
+                drain_events(p.pub);
+                shuttle(&p);
+                MOQ_TEST_CHECK(st->reset);
+                MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 1);
+                expect_wire(&p, sibling, 2, "FETCH cancelled boundary", 1u << 20);
+            } else {
+                st->blocked = false;
+                if (drained) {
+                    for (unsigned i = 0; i < 32 && p.mt->queued > 0; ++i)
+                        MOQ_TEST_CHECK(mt_serve_one(p.mt));
+                    MOQ_TEST_CHECK_EQ_SIZE(p.mt->queued, 0);
+                    /* The notice alone makes the waiting priority eligible. */
+                    MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p.pub_br));
+                }
+                MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(
+                    p.pub, f.fetch, p.now), MOQ_OK);
+                serve_all(&p);
+                const uint32_t complete[] = {
+                    OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1), OBJ(2, 3, 0, 0),
+                    OBJ(2, 3, 0, 1), OBJ(2, 3, 0, 2), OBJ(2, 3, 0, 3)
+                };
+                expect_wire(&p, complete, 6, "FETCH resumed boundary", 1u << 20);
+            }
+            /* A duplicate/late notice cannot resurrect a completed stream. */
+            moq_transport_bridge_on_stream_drained(p.pub_br, sid);
+            moq_transport_bridge_service(p.pub_br, p.now);
+            MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p.pub_br));
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+            pair_destroy(&p);
+        }
+    MOQ_TEST_PASS("FETCH priority boundaries preserve sibling and terminal progress");
+}
+
 /* -- E. control and resets ---------------------------------------------------- */
+
+/* Draining an object's accepted header can clear the endpoint key while its
+ * refused payload still belongs to the pending FIFO. On retry, the accepted
+ * payload must reestablish the old class before the next object is eligible.
+ * Rows: demotion, promotion, same-class batching, no-drain fallback. */
+static void test_fetch_priority_payload_retry(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; ++v)
+        for (unsigned row = 0; row < 4; ++row) {
+            const bool drained = row != 3;
+            const uint8_t first = row == 1 ? 200 : 10;
+            const uint8_t next = row == 0 || row == 3 ? 200 : 10;
+            pair_t p;
+            MOQ_TEST_CHECK(pair_init(&p, k_versions[v], 1u << 20, drained));
+            track_t s;
+            fetch_t f;
+            MOQ_TEST_CHECK(subscribe(&p, "s", 128, NONE, NONE, &s));
+            MOQ_TEST_CHECK(start_fetch(&p, "f", 128, &f));
+            serve_all(&p); /* drain only the FETCH preamble */
+            mt_stream_t *st = first_data_stream(p.mt);
+            MOQ_TEST_CHECK(st != NULL);
+            if (!st) { pair_destroy(&p); continue; }
+            p.mt->cap = 1;
+            MOQ_TEST_CHECK(fetch_object(&p, &f, 2, 3, 0, first));
+            MOQ_TEST_CHECK(fetch_object(&p, &f, 2, 4, 0, next));
+            moq_transport_bridge_service(p.pub_br, p.now);
+            MOQ_TEST_CHECK_EQ_SIZE(mt_held_objects(p.mt), 0);
+            MOQ_TEST_CHECK_EQ_INT((int)p.pub_br->pending_count, 1);
+            MOQ_TEST_CHECK(p.mt->queued > 0);
+            MOQ_TEST_CHECK(mt_serve_one(p.mt)); /* the actual object header */
+            MOQ_TEST_CHECK_EQ_SIZE(p.mt->queued, 0);
+
+            p.mt->cap = 1u << 20;
+            MOQ_TEST_CHECK(publish_group(&p, &s, 1, 1, 0, 100, 2, false, NULL));
+            moq_transport_bridge_service(p.pub_br, p.now);
+            size_t held = 0;
+            for (size_t i = 0; i < p.mt->nchunks; ++i) {
+                const mt_chunk_t *c = &p.mt->chunks[i];
+                if (!c->sent && c->sid == st->sid && c->len == PAYLOAD_LEN &&
+                    c->head[0] == PAYLOAD_TAG)
+                    held++;
+            }
+            if (drained) {
+                MOQ_TEST_CHECK_EQ_INT((int)((st->key >> 16) & 0xffu), first);
+                MOQ_TEST_CHECK_EQ_SIZE(held, first == next ? 2 : 1);
+            }
+            MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fetch(
+                p.pub, f.fetch, p.now), MOQ_OK);
+            serve_all(&p);
+            if (drained) {
+                const uint32_t demote[] = { OBJ(2, 3, 0, 0), OBJ(1, 1, 0, 0),
+                    OBJ(1, 1, 0, 1), OBJ(2, 4, 0, 0) };
+                const uint32_t promote[] = { OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1),
+                    OBJ(2, 3, 0, 0), OBJ(2, 4, 0, 0) };
+                const uint32_t equal[] = { OBJ(2, 3, 0, 0), OBJ(2, 4, 0, 0),
+                    OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1) };
+                expect_wire(&p, row == 0 ? demote : row == 1 ? promote : equal,
+                            4, "FETCH split payload", 1u << 20);
+            } else {
+                uint32_t w[8];
+                size_t n = wire_objects(&p, w, 8), seen = 0;
+                MOQ_TEST_CHECK_EQ_SIZE(n, 4);
+                for (size_t i = 0; i < n; ++i)
+                    if ((w[i] & TRACK_MASK) == OBJ(2, 0, 0, 0)) {
+                        MOQ_TEST_CHECK_EQ_U64(w[i], OBJ(2, 3 + seen, 0, 0));
+                        ++seen;
+                    }
+                MOQ_TEST_CHECK_EQ_SIZE(seen, 2);
+            }
+            MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p.pub_br));
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+            pair_destroy(&p);
+        }
+    MOQ_TEST_PASS("FETCH split payload retries preserve the current object priority");
+}
+
+/* -- D22 fills: public request ingress through the same bridge/model -------- */
+
+typedef struct {
+    track_t track;
+    moq_fill_t fill;
+    moq_group_order_t parent_order, fill_order;
+    uint8_t subscriber_priority;
+} fill_track_t;
+
+static const char *fill_row_name;
+static size_t fill_row_cap;
+
+static bool fill_check(bool ok, const char *expr, int line)
+{
+    if (!ok) {
+        fprintf(stderr, "fill %s cap=%zu line=%d: %s\n",
+                fill_row_name, fill_row_cap, line, expr);
+        failures++;
+    }
+    return ok;
+}
+#define FILL_REQUIRE(expr) do { \
+    if (!fill_check((expr), #expr, __LINE__)) return false; \
+} while (0)
+#define FILL_TRY(expr) do { if (!(expr)) return false; } while (0)
+
+static bool fill_sync(pair_t *p)
+{
+    const int before = failures;
+    shuttle(p);
+    if (failures != before) return false;
+    FILL_REQUIRE(!p->sub_ep.overflowed && !p->sub_ep.truncated);
+    FILL_REQUIRE(moq_session_state(p->pub) == MOQ_SESS_ESTABLISHED &&
+                 moq_session_state(p->sub) == MOQ_SESS_ESTABLISHED);
+    FILL_REQUIRE(!moq_transport_bridge_is_terminal(p->pub_br) &&
+                 !moq_transport_bridge_is_terminal(p->sub_br));
+    return true;
+}
+
+/* Each setup phase has exactly the named event; unexpected events cannot be
+ * silently drained into a successful prerequisite. */
+static bool fill_event(moq_session_t *s, moq_event_kind_t kind, size_t detail,
+                        moq_event_t *out)
+{
+    size_t n = 0;
+    memset(out, 0, sizeof(*out));
+    FILL_REQUIRE(moq_session_poll_events_ex(s, out, 1, sizeof(*out), &n) == MOQ_OK);
+    bool ok = n == 1 && out->kind == kind && out->detail_size >= detail;
+    if (!ok) moq_event_cleanup(out);
+    FILL_REQUIRE(ok);
+    return true;
+}
+
+static bool fill_no_events(moq_session_t *s)
+{
+    moq_event_t e;
+    size_t n = 0;
+    FILL_REQUIRE(moq_session_poll_events_ex(s, &e, 1, sizeof(e), &n) == MOQ_OK);
+    if (n) moq_event_cleanup(&e);
+    FILL_REQUIRE(n == 0);
+    return true;
+}
+
+static bool fill_track_name(moq_namespace_t ns, moq_bytes_t name)
+{
+    return ns.count == 1 && ns.parts && ns.parts[0].data && ns.parts[0].len == 4 &&
+        memcmp(ns.parts[0].data, "live", 4) == 0 && name.len == 10 && name.data &&
+        memcmp(name.data, "fill-order", 10) == 0;
+}
+
+/* A real SUBSCRIBE with a fill, range {0,0}..{6,1}, on "live"/"fill-order".
+ * `fill_priority < 0` inherits; otherwise FILL_PARAMETERS overrides it. */
+static bool start_fill(pair_t *p, moq_group_order_t parent_order,
+                       moq_group_order_t fill_order, uint8_t parent_priority,
+                       int fill_priority, fill_track_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->parent_order = parent_order;
+    out->fill_order = fill_order;
+    out->subscriber_priority = fill_priority < 0 ? parent_priority : (uint8_t)fill_priority;
+    moq_fill_cfg_t fc;
+    moq_fill_cfg_init(&fc);
+    fc.has_group_order = true;
+    fc.group_order = (uint32_t)fill_order;
+    fc.has_subscriber_priority = fill_priority >= 0;
+    fc.subscriber_priority = out->subscriber_priority;
+    moq_bytes_t part = MOQ_BYTES_LITERAL("live");
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ &part, 1 };
+    sc.track_name = MOQ_BYTES_LITERAL("fill-order");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    sc.has_subscriber_priority = true;
+    sc.subscriber_priority = parent_priority;
+    sc.group_order = parent_order;
+    sc.has_forward = sc.forward = true;
+    sc.fill = &fc;
+    FILL_REQUIRE(moq_session_subscribe(p->sub, &sc, p->now, &out->track.csub) == MOQ_OK);
+    moq_event_t e;
+    FILL_TRY(fill_event(p->sub, MOQ_EVENT_FILL_CREATED, sizeof(moq_fill_created_event_t), &e));
+    bool valid = moq_fill_is_valid(e.u.fill_created.fill) &&
+        moq_subscription_eq(e.u.fill_created.sub, out->track.csub) &&
+        !moq_publication_is_valid(e.u.fill_created.pub);
+    uint64_t initiating_id = e.u.fill_created.initiating_request_id;
+    moq_event_cleanup(&e);
+    FILL_REQUIRE(valid);
+    FILL_TRY(fill_no_events(p->sub));
+    FILL_TRY(fill_sync(p));
+    FILL_TRY(fill_event(p->pub, MOQ_EVENT_SUBSCRIBE_REQUEST,
+                        sizeof(moq_subscribe_request_event_t), &e));
+    out->track.sub = e.u.subscribe_request.sub;
+    valid = moq_subscription_is_valid(out->track.sub) &&
+        fill_track_name(e.u.subscribe_request.track_namespace, e.u.subscribe_request.track_name) &&
+        e.u.subscribe_request.subscriber_priority == parent_priority &&
+        e.u.subscribe_request.group_order == parent_order &&
+        e.u.subscribe_request.filter == MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START &&
+        e.u.subscribe_request.start_group == 0 && e.u.subscribe_request.start_object == 0 &&
+        e.u.subscribe_request.forward;
+    moq_event_cleanup(&e);
+    FILL_REQUIRE(valid);
+    FILL_TRY(fill_no_events(p->pub));
+    moq_accept_subscribe_cfg_t ac;
+    moq_accept_subscribe_cfg_init(&ac);
+    ac.has_largest = true;
+    ac.largest_group = 6;
+    ac.largest_object = 1;
+    FILL_REQUIRE(moq_session_accept_subscribe(p->pub, out->track.sub, &ac, p->now) == MOQ_OK);
+    FILL_TRY(fill_sync(p));
+    FILL_TRY(fill_event(p->pub, MOQ_EVENT_FILL_REQUEST, sizeof(moq_fill_request_event_t), &e));
+    const moq_fill_request_event_t fr = e.u.fill_request;
+    out->fill = fr.fill;
+    moq_event_cleanup(&e);
+    FILL_REQUIRE(moq_fill_is_valid(fr.fill) && moq_subscription_eq(fr.sub, out->track.sub) &&
+                 !moq_publication_is_valid(fr.pub) && fr.initiating_request_id == initiating_id);
+    FILL_REQUIRE(fr.start_group == 0 && fr.start_object == 0 &&
+                 fr.end_group == 6 && fr.end_object == 1 && !fr.has_fill_timeout &&
+                 fr.group_order == (uint32_t)fill_order &&
+                 fr.subscriber_priority == out->subscriber_priority);
+    FILL_TRY(fill_no_events(p->pub));
+    FILL_TRY(fill_event(p->sub, MOQ_EVENT_SUBSCRIBE_OK, sizeof(moq_subscribe_ok_event_t), &e));
+    valid = moq_subscription_eq(e.u.subscribe_ok.sub, out->track.csub) &&
+        e.u.subscribe_ok.has_largest && e.u.subscribe_ok.largest_group == 6 &&
+        e.u.subscribe_ok.largest_object == 1;
+    moq_event_cleanup(&e);
+    FILL_REQUIRE(valid);
+    FILL_TRY(fill_no_events(p->sub));
+    FILL_REQUIRE(moq_session_subscription_group_order(p->pub, out->track.sub) == parent_order);
+    return true;
+}
+
+static bool fill_open_group(pair_t *p, const fill_track_t *f, uint8_t group,
+                            moq_subgroup_handle_t *out)
+{
+    moq_subgroup_cfg_t cfg;
+    moq_subgroup_cfg_init(&cfg);
+    cfg.group_id = group;
+    cfg.publisher_priority = 128;
+    FILL_REQUIRE(moq_session_open_subgroup(p->pub, f->track.sub, &cfg, p->now, out) == MOQ_OK);
+    FILL_REQUIRE(out->_opaque != 0);
+    return true;
+}
+
+/* Uses the existing payload marker format. Properties force the producer's
+ * two-action encoding, in addition to the bridge's header/payload phases. */
+static bool fill_object(pair_t *p, const fill_track_t *f, uint8_t group,
+                        uint8_t object, bool properties)
+{
+    uint8_t body[PAYLOAD_LEN] = { PAYLOAD_TAG, 2, group, 0, object };
+    moq_rcbuf_t *payload = NULL, *props = NULL;
+    FILL_REQUIRE(moq_rcbuf_create(moq_alloc_default(), body, sizeof(body), &payload) == MOQ_OK);
+    if (properties) {
+        uint8_t bytes[16];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, bytes, sizeof(bytes));
+        /* Valid Object Delivery Timeout KVP, also used by test_d18_object. */
+        moq_result_t rc = moq_buf_write_vi64(&w, 2);
+        if (rc == MOQ_OK) rc = moq_buf_write_vi64(&w, 65);
+        if (rc == MOQ_OK)
+            rc = moq_rcbuf_create(moq_alloc_default(), bytes, moq_buf_writer_offset(&w), &props);
+        if (rc != MOQ_OK) {
+            moq_rcbuf_decref(payload);
+            FILL_REQUIRE(rc == MOQ_OK);
+        }
+    }
+    moq_fetch_object_cfg_t cfg;
+    moq_fetch_object_cfg_init(&cfg);
+    cfg.group_id = group;
+    cfg.object_id = object;
+    cfg.publisher_priority = 128;
+    cfg.payload = payload;
+    cfg.properties = props;
+    moq_result_t rc = moq_session_write_fill_object(p->pub, f->fill, &cfg, p->now);
+    moq_rcbuf_decref(payload);
+    if (props) moq_rcbuf_decref(props);
+    FILL_REQUIRE(rc == MOQ_OK);
+    return true;
+}
+
+/* Finite completion of queued work, including a stranded bridge head. Streams
+ * may remain open; their destruction belongs to pair_destroy as in other rows. */
+static bool fill_drain(pair_t *p)
+{
+    for (unsigned guard = 0; guard < 4096; guard++) {
+        FILL_TRY(fill_sync(p));
+        if (mt_serve_one(p->mt)) continue;
+        FILL_TRY(fill_sync(p));
+        if (mt_serve_one(p->mt)) continue;
+        FILL_REQUIRE(p->mt->queued == 0 && p->pub->action_head == p->pub->action_tail &&
+                     p->pub_br->dq_items == 0 && p->pub_br->pending_count == 0 &&
+                     !moq_transport_bridge_has_outbound_pending(p->pub_br));
+        for (size_t i = 0; i < p->mt->nchunks; i++) FILL_REQUIRE(p->mt->chunks[i].sent);
+        return true;
+    }
+    return fill_check(false, "4096-write completion bound", __LINE__);
+}
+
+/* Read-only pre-poll facts: the producer has the mode/owner/location/order that
+ * the downstream scheduling decision needs. No private state is synthesized. */
+static bool fill_metadata(pair_t *p, const fill_track_t *f, uint8_t tag,
+                          uint64_t owner, uint8_t mode, uint8_t priority,
+                          size_t expected)
+{
+    size_t count = 0;
+    moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
+    for (size_t i = p->pub->action_head; i < p->pub->action_tail; i++) {
+        const size_t at = i % p->pub->action_cap;
+        const moq_action_t *a = &p->pub->actions[at];
+        if (a->kind != MOQ_ACTION_SEND_DATA || !a->u.send_data.payload ||
+            moq_rcbuf_len(a->u.send_data.payload) != PAYLOAD_LEN) continue;
+        const uint8_t *v = moq_rcbuf_data(a->u.send_data.payload);
+        if (v[0] != PAYLOAD_TAG || v[1] != tag) continue;
+        const moq_action_meta_t *m = &p->pub->action_meta[at];
+        count++;
+        FILL_REQUIRE(m->mode == mode && m->owner == owner &&
+                     m->subscriber_priority == priority && m->publisher_priority == 128 &&
+                     m->deadline_us == UINT64_MAX);
+        if (mode == MOQ_SCHED_MODE_FILL || mode == MOQ_SCHED_MODE_SUBGROUP) {
+            FILL_REQUIRE(m->has_location && m->group_id == v[2] &&
+                         m->group_order == (uint8_t)f->parent_order);
+            if (mode == MOQ_SCHED_MODE_FILL) {
+                FILL_REQUIRE(m->object_id == v[4] && m->fill_group_order == (uint8_t)f->fill_order);
+                FILL_REQUIRE(!ref._v || ref._v == a->u.send_data.stream_ref._v);
+                ref = a->u.send_data.stream_ref;
+            } else FILL_REQUIRE(m->subgroup_id == 0);
+        }
+    }
+    FILL_REQUIRE(count == expected);
+    return true;
+}
+
+static bool fill_complete_objects(const pair_t *p, const uint32_t *want, size_t n)
+{
+    uint32_t got[64];
+    size_t m = wire_objects(p, got, 64);
+    FILL_REQUIRE(m == n);
+    for (size_t i = 0; i < n; i++) {
+        size_t count = 0;
+        for (size_t j = 0; j < m; j++) if (got[j] == want[i]) count++;
+        FILL_REQUIRE(count == 1);
+        if ((want[i] & 0xffu) != 0)
+            FILL_REQUIRE(first_index(got, m, UINT32_MAX, want[i] - 1) <
+                         first_index(got, m, UINT32_MAX, want[i]));
+    }
+    return true;
+}
+
+typedef struct {
+    const char *name;
+    moq_group_order_t parent_order, fill_order;
+    uint8_t sub_group, fill_group, next_group;
+    bool fill_first, fetch;
+} fill_order_case_t;
+
+/* The private review probe's 30 rows: 24 order assertions and six independent
+ * FETCH-owner controls. Preambles drain first to isolate object scheduling. */
+static bool fill_order_row(pair_t *p, const void *ctx)
+{
+    const fill_order_case_t *c = ctx;
+    fill_track_t f;
+    FILL_TRY(start_fill(p, c->parent_order, c->fill_order, 128, -1, &f));
+    fetch_t fetch = { MOQ_FETCH_INVALID, MOQ_FETCH_INVALID };
+    if (c->fetch) FILL_REQUIRE(start_fetch(p, "fill-order", 128, &fetch));
+    moq_subgroup_handle_t sg = MOQ_SUBGROUP_INVALID;
+    FILL_TRY(fill_open_group(p, &f, c->sub_group, &sg));
+    FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    FILL_TRY(fill_drain(p));
+    uint32_t empty[1];
+    FILL_REQUIRE(wire_objects(p, empty, 1) == 0 && mt_held_objects(p->mt) == 0);
+    for (unsigned side = 0; side < 2; side++) {
+        bool put_fill = c->fill_first ? side == 1 : side == 0;
+        if (put_fill) {
+            for (uint8_t o = 0; o < 2; o++) {
+                if (c->fetch) FILL_REQUIRE(fetch_object(p, &fetch, 3, c->fill_group, o, 128));
+                else FILL_TRY(fill_object(p, &f, c->fill_group, o, false));
+            }
+            if (c->next_group)
+                for (uint8_t o = 0; o < 2; o++) FILL_TRY(fill_object(p, &f, c->next_group, o, false));
+        } else {
+            for (uint64_t o = 0; o < 2; o++)
+                FILL_REQUIRE(write_object(p, sg, 1, c->sub_group, 0, o) == MOQ_OK);
+        }
+    }
+    FILL_TRY(fill_metadata(p, &f, 1, f.track.sub._opaque, MOQ_SCHED_MODE_SUBGROUP, 128, 2));
+    if (c->fetch) {
+        FILL_REQUIRE(fetch.fetch._opaque != f.track.sub._opaque);
+        FILL_TRY(fill_metadata(p, &f, 3, fetch.fetch._opaque, MOQ_SCHED_MODE_FETCH, 128, 2));
+    } else {
+        FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 128,
+                               c->next_group ? 4 : 2));
+    }
+    FILL_REQUIRE(wire_objects(p, empty, 1) == 0 && mt_held_objects(p->mt) == 0);
+    FILL_TRY(fill_drain(p));
+    uint32_t want[6];
+    size_t n = 0;
+    for (unsigned side = 0; side < 2; side++) {
+        bool fill = c->fill_first ? side == 0 : side == 1;
+        uint8_t tag = fill ? (c->fetch ? 3 : 2) : 1;
+        uint8_t group = fill ? c->fill_group : c->sub_group;
+        for (uint8_t o = 0; o < 2; o++) want[n++] = OBJ(tag, group, 0, o);
+    }
+    if (c->next_group)
+        for (uint8_t o = 0; o < 2; o++) want[n++] = OBJ(2, c->next_group, 0, o);
+    FILL_TRY(fill_complete_objects(p, want, n));
+    if (c->fetch) {
+        uint64_t sub_sid = 0, fetch_sid = 0;
+        FILL_REQUIRE(stream_of(p, 1, c->sub_group, &sub_sid) &&
+                     stream_of(p, 3, c->fill_group, &fetch_sid) && sub_sid != fetch_sid);
+        size_t owned = 0;
+        for (uint32_t i = 0; i < p->pub_br->dstream_cap; i++) {
+            const bridge_dstream_t *d = &p->pub_br->dstreams[i];
+            if (d->active && d->has_sid && d->sid == fetch_sid) {
+                FILL_REQUIRE(d->key.owner == fetch.fetch._opaque);
+                owned++;
+            }
+        }
+        FILL_REQUIRE(owned == 1);
+        /* Cross-request equal-priority order is deliberately not asserted. */
+    } else expect_wire(p, want, n, c->name, fill_row_cap);
+    return true;
+}
+
+typedef struct {
+    moq_group_order_t order;
+    uint8_t updated_priority;
+    bool properties, reverse;
+} fill_boundary_case_t;
+
+/* The preamble's range starts at group 0, but the first actual object is in
+ * group 4. Keep that preamble in the provider while both competitors arrive. */
+static bool fill_first_group_row(pair_t *p, const void *ctx)
+{
+    const fill_boundary_case_t *c = ctx;
+    fill_track_t f;
+    FILL_TRY(start_fill(p, c->order, c->order, 128, -1, &f));
+    FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    FILL_REQUIRE(p->mt->queued > 0 && mt_held_objects(p->mt) == 0);
+    moq_subgroup_handle_t sg = MOQ_SUBGROUP_INVALID;
+    FILL_TRY(fill_open_group(p, &f, 2, &sg));
+    for (uint8_t o = 0; o < 2; o++) {
+        FILL_REQUIRE(write_object(p, sg, 1, 2, 0, o) == MOQ_OK);
+        FILL_TRY(fill_object(p, &f, 4, o, false));
+    }
+    FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 128, 2));
+    FILL_TRY(fill_drain(p));
+    const uint32_t asc[] = { OBJ(1, 2, 0, 0), OBJ(1, 2, 0, 1),
+                             OBJ(2, 4, 0, 0), OBJ(2, 4, 0, 1) };
+    const uint32_t desc[] = { OBJ(2, 4, 0, 0), OBJ(2, 4, 0, 1),
+                              OBJ(1, 2, 0, 0), OBJ(1, 2, 0, 1) };
+    FILL_TRY(fill_complete_objects(p, asc, 4));
+    expect_wire(p, c->order == ASC ? asc : desc, 4, fill_row_name, fill_row_cap);
+    return true;
+}
+
+/* An explicit child priority is not an owner-wide subscription update. Check
+ * the held class before supplying more objects with the child's original value. */
+static bool fill_priority_override_row(pair_t *p, const void *ctx)
+{
+    const fill_boundary_case_t *c = ctx;
+    fill_track_t f;
+    FILL_TRY(start_fill(p, c->order, c->order, 100, 10, &f));
+    moq_subgroup_handle_t sg = MOQ_SUBGROUP_INVALID;
+    FILL_TRY(fill_open_group(p, &f, 3, &sg));
+    FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    FILL_TRY(fill_drain(p));
+    for (uint8_t o = 0; o < 2; o++) {
+        FILL_REQUIRE(write_object(p, sg, 1, 3, 0, o) == MOQ_OK);
+        FILL_TRY(fill_object(p, &f, 3, o, false));
+    }
+    FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 10, 2));
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    uint64_t sub_sid = 0, fill_sid = 0;
+    FILL_REQUIRE(stream_of(p, 1, 3, &sub_sid) && stream_of(p, 2, 3, &fill_sid));
+    mt_stream_t *sub = mt_stream(p->mt, sub_sid), *child = mt_stream(p->mt, fill_sid);
+    FILL_REQUIRE(sub && child && sub_sid != fill_sid && sub->keyed && child->keyed);
+    FILL_REQUIRE((sub->key >> 24) == 100 && (child->key >> 24) == 10);
+    moq_subscription_update_cfg_t uc;
+    moq_subscription_update_cfg_init(&uc);
+    uc.has_subscriber_priority = true;
+    uc.subscriber_priority = c->updated_priority;
+    FILL_REQUIRE(moq_session_update_subscription(p->sub, f.track.csub, &uc, p->now) == MOQ_OK);
+    FILL_TRY(fill_sync(p));
+    moq_event_t e;
+    FILL_TRY(fill_event(p->pub, MOQ_EVENT_SUBSCRIBE_UPDATED,
+                        sizeof(moq_subscribe_updated_event_t), &e));
+    bool valid = moq_subscription_eq(e.u.subscribe_updated.sub, f.track.sub) &&
+        e.u.subscribe_updated.has_subscriber_priority &&
+        e.u.subscribe_updated.subscriber_priority == c->updated_priority &&
+        !e.u.subscribe_updated.answer_owed;
+    moq_event_cleanup(&e);
+    FILL_REQUIRE(valid);
+    FILL_TRY(fill_no_events(p->pub));
+    FILL_TRY(fill_event(p->sub, MOQ_EVENT_SUBSCRIPTION_UPDATE_OK,
+                        sizeof(moq_subscription_update_ok_event_t), &e));
+    valid = moq_subscription_eq(e.u.subscription_update_ok.sub, f.track.csub);
+    moq_event_cleanup(&e);
+    FILL_REQUIRE(valid);
+    FILL_TRY(fill_no_events(p->sub));
+    FILL_REQUIRE((sub->key >> 24) == c->updated_priority && (child->key >> 24) == 10);
+    for (uint8_t o = 2; o < 4; o++) FILL_TRY(fill_object(p, &f, 3, o, false));
+    FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 10, 2));
+    FILL_TRY(fill_drain(p));
+    const uint32_t parent_first[] = { OBJ(1, 3, 0, 0), OBJ(1, 3, 0, 1),
+        OBJ(2, 3, 0, 0), OBJ(2, 3, 0, 1), OBJ(2, 3, 0, 2), OBJ(2, 3, 0, 3) };
+    const uint32_t child_first[] = { OBJ(2, 3, 0, 0), OBJ(2, 3, 0, 1),
+        OBJ(2, 3, 0, 2), OBJ(2, 3, 0, 3), OBJ(1, 3, 0, 0), OBJ(1, 3, 0, 1) };
+    FILL_TRY(fill_complete_objects(p, parent_first, 6));
+    expect_wire(p, c->updated_priority < 10 ? parent_first : child_first,
+                6, fill_row_name, fill_row_cap);
+    return true;
+}
+
+static size_t fill_held_objects(const mt_t *m, uint64_t sid, uint8_t group)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < m->nchunks; i++) {
+        const mt_chunk_t *c = &m->chunks[i];
+        if (!c->sent && c->sid == sid && c->len == PAYLOAD_LEN &&
+            c->head[0] == PAYLOAD_TAG && c->head[1] == 2 && c->head[2] == group) n++;
+    }
+    return n;
+}
+
+/* Same publisher priority, different groups: draining an accepted object
+ * header must not let the next group's descriptor replace its retained payload.
+ * The properties variant exercises both fragments of the fill producer too. */
+static bool fill_payload_retry_row(pair_t *p, const void *ctx)
+{
+    const fill_boundary_case_t *c = ctx;
+    const uint8_t first = c->order == ASC ? 2 : 4;
+    const uint8_t next = c->order == ASC ? 4 : 2;
+    fill_track_t f;
+    FILL_TRY(start_fill(p, c->order, c->order, 128, -1, &f));
+    FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    FILL_TRY(fill_drain(p));
+    mt_stream_t *child = first_data_stream(p->mt); /* only the fill exists */
+    FILL_REQUIRE(child != NULL);
+    moq_subgroup_handle_t sg = MOQ_SUBGROUP_INVALID;
+    FILL_TRY(fill_open_group(p, &f, 3, &sg));
+    FILL_TRY(fill_drain(p));
+    p->mt->cap = 1;
+    FILL_TRY(fill_object(p, &f, first, 0, c->properties));
+    FILL_TRY(fill_object(p, &f, next, 0, false));
+    FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 128, 2));
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    FILL_REQUIRE(mt_held_objects(p->mt) == 0 && p->pub_br->pending_count == 1 && p->mt->queued > 0);
+    FILL_REQUIRE(mt_serve_one(p->mt)); /* first object's header, not its payload */
+    FILL_REQUIRE(p->mt->queued == 0);
+    p->mt->cap = 1u << 20;
+    for (uint64_t o = 0; o < 2; o++) FILL_REQUIRE(write_object(p, sg, 1, 3, 0, o) == MOQ_OK);
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    uint64_t sub_sid = 0;
+    FILL_REQUIRE(stream_of(p, 1, 3, &sub_sid));
+    mt_stream_t *sub = mt_stream(p->mt, sub_sid);
+    FILL_REQUIRE(sub && child->keyed && sub->keyed && child->key < sub->key);
+    FILL_REQUIRE(fill_held_objects(p->mt, child->sid, first) == 1 &&
+                 fill_held_objects(p->mt, child->sid, next) == 0);
+    FILL_REQUIRE(moq_transport_bridge_has_pending(p->pub_br));
+    FILL_TRY(fill_drain(p));
+    const uint32_t want[] = { OBJ(2, first, 0, 0), OBJ(1, 3, 0, 0),
+                              OBJ(1, 3, 0, 1), OBJ(2, next, 0, 0) };
+    FILL_TRY(fill_complete_objects(p, want, 4));
+    expect_wire(p, want, 4, fill_row_name, fill_row_cap);
+    return true;
+}
+
+static bool fill_stream_queued(const mt_t *m, uint64_t sid)
+{
+    for (size_t i = 0; i < m->nchunks; i++)
+        if (!m->chunks[i].sent && m->chunks[i].sid == sid) return true;
+    return false;
+}
+
+/* D22's opposite-order cycle is a logical tie, not an impossible strict
+ * ordering assertion. The earlier subscription group is an acyclic predecessor
+ * of the entire component. Reverse admission checks that this is a logical
+ * class, not an accident of queue/slot order. */
+static bool fill_cycle_row(pair_t *p, const void *ctx)
+{
+    const fill_boundary_case_t *c = ctx;
+    const uint8_t same = c->order == ASC ? 2 : 4;
+    const uint8_t other = c->order == ASC ? 4 : 2;
+    const uint8_t external = c->order == ASC ? 0 : 6;
+    const uint8_t groups[] = { external, same, other };
+    fill_track_t f;
+    FILL_TRY(start_fill(p, c->order, c->order == ASC ? DESC : ASC, 128, -1, &f));
+    moq_subgroup_handle_t sg[3] = { MOQ_SUBGROUP_INVALID, MOQ_SUBGROUP_INVALID, MOQ_SUBGROUP_INVALID };
+    if (c->reverse) FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    for (unsigned k = 0; k < 3; k++) {
+        unsigned j = c->reverse ? 2 - k : k;
+        FILL_TRY(fill_open_group(p, &f, groups[j], &sg[j]));
+    }
+    if (!c->reverse) FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    FILL_TRY(fill_drain(p));
+    for (unsigned side = 0; side < 2; side++) {
+        if ((side == 0) == c->reverse) {
+            for (uint8_t o = 0; o < 4; o++) FILL_TRY(fill_object(p, &f, same, o, false));
+        } else {
+            for (unsigned k = 0; k < 3; k++) {
+                unsigned j = c->reverse ? 2 - k : k;
+                for (uint8_t o = 0; o < (j == 0 ? 2 : 4); o++)
+                    FILL_REQUIRE(write_object(p, sg[j], 1, groups[j], 0, o) == MOQ_OK);
+            }
+        }
+    }
+    FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 128, 4));
+    FILL_TRY(fill_metadata(p, &f, 1, f.track.sub._opaque, MOQ_SCHED_MODE_SUBGROUP, 128, 10));
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    uint64_t ids[4] = { 0 };
+    FILL_REQUIRE(stream_of(p, 2, same, &ids[0]) && stream_of(p, 1, same, &ids[1]) &&
+                 stream_of(p, 1, other, &ids[2]) && stream_of(p, 1, external, &ids[3]));
+    mt_stream_t *st[4];
+    for (size_t i = 0; i < 4; i++) {
+        st[i] = mt_stream(p->mt, ids[i]);
+        FILL_REQUIRE(st[i] && st[i]->keyed);
+        for (size_t j = 0; j < i; j++) FILL_REQUIRE(ids[i] != ids[j]);
+    }
+    FILL_REQUIRE(st[0]->key == st[1]->key && st[1]->key == st[2]->key && st[3]->key < st[0]->key);
+    const uint32_t tied = st[0]->key, predecessor = st[3]->key;
+    for (unsigned i = 0; i < 3; i++) {
+        FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        FILL_REQUIRE(st[0]->key == tied && st[1]->key == tied && st[2]->key == tied &&
+                     st[3]->key == predecessor);
+    }
+    unsigned writes = 0;
+    for (; writes < 4096; writes++) {
+        FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        if (fill_stream_queued(p->mt, ids[0]) && fill_stream_queued(p->mt, ids[1]) &&
+            fill_stream_queued(p->mt, ids[2]))
+            FILL_REQUIRE(st[0]->key == st[1]->key && st[1]->key == st[2]->key);
+        if (!mt_serve_one(p->mt)) break;
+    }
+    FILL_REQUIRE(writes < 4096);
+    FILL_TRY(fill_drain(p));
+    uint32_t want[14], got[16];
+    size_t n = 0;
+    for (uint8_t o = 0; o < 2; o++) want[n++] = OBJ(1, external, 0, o);
+    for (uint8_t o = 0; o < 4; o++) want[n++] = OBJ(2, same, 0, o);
+    for (uint8_t o = 0; o < 4; o++) want[n++] = OBJ(1, same, 0, o);
+    for (uint8_t o = 0; o < 4; o++) want[n++] = OBJ(1, other, 0, o);
+    FILL_TRY(fill_complete_objects(p, want, n));
+    FILL_REQUIRE(wire_objects(p, got, 16) == n && got[0] == want[0] && got[1] == want[1]);
+    unsigned served[3] = { 0 };
+    for (size_t i = 2; i < 11; i++) { /* three full fair turns, in any order */
+        unsigned j = (got[i] >> 24) == 2 ? 0 : ((got[i] >> 16) & 0xffu) == same ? 1 : 2;
+        served[j]++;
+        unsigned low = served[0], high = served[0];
+        for (j = 1; j < 3; j++) {
+            if (served[j] < low) low = served[j];
+            if (served[j] > high) high = served[j];
+        }
+        FILL_REQUIRE(high - low <= 1);
+    }
+    return true;
+}
+
+typedef bool (*fill_row_fn)(pair_t *, const void *);
+
+/* -- Detached pending retries: observe before the affected stream retries -- */
+
+typedef struct {
+    const char *name;
+    bool drain_header;
+    uint8_t successor_group; /* zero: no successor; first object is group 1 */
+} fill_retry_case_t;
+
+static const bridge_dstream_t *fill_retry_locate(const pair_t *p, uint64_t owner,
+                                                uint8_t mode, uint64_t group)
+{
+    const bridge_dstream_t *found = NULL;
+    for (uint32_t i = 0; i < p->pub_br->dstream_cap; i++) {
+        const bridge_dstream_t *d = &p->pub_br->dstreams[i];
+        if (!d->active || d->meta.owner != owner || d->meta.mode != mode ||
+            !d->meta.has_location || d->meta.group_id != group) continue;
+        if (found) return NULL;
+        found = d;
+    }
+    return found;
+}
+
+static size_t fill_retry_unsent(const mt_t *m, uint64_t sid)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < m->nchunks; i++)
+        if (!m->chunks[i].sent && m->chunks[i].sid == sid) n++;
+    return n;
+}
+
+static bool fill_retry_first_class(const moq_action_meta_t *m, uint64_t owner)
+{
+    return m->owner == owner && m->mode == MOQ_SCHED_MODE_FILL &&
+        m->has_location && m->group_id == 1 && m->subgroup_id == 0 &&
+        m->group_order == ASC && m->fill_group_order == ASC &&
+        m->subscriber_priority == 128 && m->publisher_priority == 128;
+}
+
+static bool fill_retry_pending(const pair_t *p, uint32_t at,
+                               moq_stream_ref_t ref, uint64_t sid,
+                               uint64_t owner, uint8_t mode, uint8_t tag,
+                               uint8_t group)
+{
+    FILL_REQUIRE(at < p->pub_br->pending_count);
+    const bridge_pending_item_t *item = &p->pub_br->pending[at];
+    FILL_REQUIRE(item->kind == PENDING_PAYLOAD_ONLY && item->owns_action &&
+                 item->stream_ref._v == ref._v && item->has_stream_id && item->stream_id == sid);
+    FILL_REQUIRE(item->act.kind == MOQ_ACTION_SEND_DATA && item->act.u.send_data.header_len > 0 &&
+                 !item->act.u.send_data.fin && item->act.u.send_data.payload &&
+                 moq_rcbuf_len(item->act.u.send_data.payload) == PAYLOAD_LEN);
+    const uint8_t *body = moq_rcbuf_data(item->act.u.send_data.payload);
+    FILL_REQUIRE(body[0] == PAYLOAD_TAG && body[1] == tag && body[2] == group &&
+                 body[3] == 0 && body[4] == 0);
+    FILL_REQUIRE(item->meta.owner == owner && item->meta.mode == mode &&
+                 item->meta.has_location && item->meta.group_id == group &&
+                 item->meta.subscriber_priority == 128 && item->meta.publisher_priority == 128);
+    const bridge_dstream_t *d = mt_retry_dstream(p->pub_br, ref);
+    FILL_REQUIRE(d && d->has_sid && d->sid == sid && d->retained == 1 && !d->dispatching);
+    return true;
+}
+
+/* Two regular streams each retain an actual object payload before a fill in
+ * the pending FIFO. The fill's header may drain while its payload is retained.
+ * A sibling holds same-group bytes. Capture at BOTH earlier payload writes:
+ * checking after the fill's retry would miss the transient graph/key change. */
+static bool fill_detached_retry_row(pair_t *p, const void *ctx)
+{
+    const fill_retry_case_t *c = ctx;
+    fill_track_t f;
+    FILL_TRY(start_fill(p, ASC, ASC, 128, -1, &f));
+    track_t r;
+    FILL_REQUIRE(subscribe(p, "retry", 128, ASC, NONE, &r));
+    FILL_REQUIRE(moq_subscription_is_valid(r.sub) && r.sub._opaque != f.track.sub._opaque &&
+                 moq_session_subscription_group_order(p->pub, r.sub) == ASC);
+    FILL_TRY(fill_no_events(p->pub));
+    FILL_TRY(fill_no_events(p->sub));
+    moq_subgroup_handle_t rs[2], ss = MOQ_SUBGROUP_INVALID;
+    for (uint8_t i = 0; i < 2; i++)
+        FILL_REQUIRE(publish_group(p, &r, 3, i, 0, 128, 0, true, &rs[i]));
+    FILL_TRY(fill_open_group(p, &f, 1, &ss));
+    FILL_REQUIRE(moq_session_open_fill(p->pub, f.fill, p->now) == MOQ_OK);
+    FILL_TRY(fill_drain(p)); /* every stream preamble is already drained */
+
+    const uint64_t owners[] = { r.sub._opaque, r.sub._opaque, f.track.sub._opaque,
+                               f.track.sub._opaque };
+    const uint8_t modes[] = { MOQ_SCHED_MODE_SUBGROUP, MOQ_SCHED_MODE_SUBGROUP,
+                             MOQ_SCHED_MODE_FILL, MOQ_SCHED_MODE_SUBGROUP };
+    const uint8_t groups[] = { 0, 1, 0, 1 };
+    moq_stream_ref_t refs[4];
+    uint64_t ids[4];
+    mt_stream_t *st[4];
+    for (size_t i = 0; i < 4; i++) {
+        const bridge_dstream_t *d = fill_retry_locate(p, owners[i], modes[i], groups[i]);
+        FILL_REQUIRE(d && d->has_sid && d->ref._v != 0 && !d->keyed && d->retained == 0);
+        refs[i] = d->ref;
+        ids[i] = d->sid;
+        st[i] = mt_stream(p->mt, ids[i]);
+        FILL_REQUIRE(st[i] && st[i]->data && !st[i]->reset && fill_retry_unsent(p->mt, ids[i]) == 0);
+        for (size_t j = 0; j < i; j++) FILL_REQUIRE(ids[i] != ids[j] && refs[i]._v != refs[j]._v);
+    }
+    FILL_REQUIRE(p->mt->drained_cap && p->mt->queued == 0 && p->pub_br->max_pending >= 3);
+    uint32_t empty[1];
+    FILL_REQUIRE(wire_objects(p, empty, 1) == 0);
+
+    /* The sibling is fully handed but unsent. Refuse only the marked bodies
+     * of both regular streams and the fill, so their headers are accepted
+     * partial writes. */
+    FILL_REQUIRE(write_object(p, ss, 1, 1, 0, 0) == MOQ_OK);
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    FILL_REQUIRE(p->pub_br->pending_count == 0 && mt_held_objects(p->mt) == 1 &&
+                 fill_retry_unsent(p->mt, ids[3]) == 2);
+    for (uint8_t i = 0; i < 2; i++) {
+        st[i]->refuse_payload = true;
+        FILL_REQUIRE(write_object(p, rs[i], 3, i, 0, 0) == MOQ_OK);
+        FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        FILL_REQUIRE(p->pub_br->pending_count == (uint32_t)i + 1);
+        FILL_TRY(fill_retry_pending(p, i, refs[i], ids[i], r.sub._opaque,
+                                    MOQ_SCHED_MODE_SUBGROUP, 3, i));
+    }
+    st[2]->refuse_payload = true;
+    FILL_TRY(fill_object(p, &f, 1, 0, false));
+    if (c->successor_group)
+        FILL_TRY(fill_object(p, &f, c->successor_group,
+                             c->successor_group == 1 ? 1 : 0, false));
+    FILL_TRY(fill_metadata(p, &f, 2, f.track.sub._opaque, MOQ_SCHED_MODE_FILL, 128,
+                           c->successor_group ? 2 : 1));
+    FILL_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    FILL_REQUIRE(p->pub_br->pending_count == 3 && p->pub->action_head == p->pub->action_tail);
+    for (uint8_t i = 0; i < 3; i++) {
+        FILL_TRY(fill_retry_pending(p, i, refs[i], ids[i], owners[i], modes[i],
+                                    i == 2 ? 2 : 3, i == 2 ? 1 : i));
+        FILL_REQUIRE(st[i]->refused_writes > 0 && fill_retry_unsent(p->mt, ids[i]) == 1);
+    }
+    const bridge_dstream_t *fd = mt_retry_dstream(p->pub_br, refs[2]);
+    FILL_REQUIRE(fd && fd->keyed && !fd->prefix_only && fd->q_len == (c->successor_group ? 1u : 0u));
+    if (c->successor_group) {
+        const bridge_data_item_t *next = &fd->q[fd->q_head];
+        FILL_REQUIRE(next->action.kind == MOQ_ACTION_SEND_DATA &&
+                     next->meta.mode == MOQ_SCHED_MODE_FILL && next->meta.has_location &&
+                     next->meta.group_id == c->successor_group);
+    }
+    FILL_REQUIRE(p->pub_br->dq_items == (c->successor_group ? 1u : 0u));
+    const size_t before_wire = p->mt->nwire;
+    if (c->drain_header) {
+        st[0]->blocked = st[1]->blocked = st[3]->blocked = true;
+        FILL_REQUIRE(mt_serve_one(p->mt));
+        st[0]->blocked = st[1]->blocked = st[3]->blocked = false;
+        FILL_REQUIRE(p->mt->nwire == before_wire + 1 &&
+                     p->mt->wire[before_wire].sid == ids[2] &&
+                     !p->mt->wire[before_wire].reset && !p->mt->wire[before_wire].fin &&
+                     p->mt->wire[before_wire].len == p->pub_br->pending[2].act.u.send_data.header_len);
+    } else FILL_REQUIRE(p->mt->nwire == before_wire);
+    fd = mt_retry_dstream(p->pub_br, refs[2]);
+    const bridge_dstream_t *sd = mt_retry_dstream(p->pub_br, refs[3]);
+    const uint32_t sibling_key = UINT32_C(0x80800002); /* priority 128/128, rank 1 */
+    FILL_REQUIRE(fd && fd->keyed == !c->drain_header && fd->retained == 1 &&
+                 fd->order_active && fill_retry_first_class(&fd->order_meta, f.track.sub._opaque));
+    FILL_REQUIRE(sd && sd->keyed && sd->order_active && sd->pos == 1 &&
+                 st[3]->key == sibling_key && fill_retry_unsent(p->mt, ids[3]) == 2);
+    FILL_REQUIRE(fill_retry_unsent(p->mt, ids[2]) == (c->drain_header ? 0u : 1u) &&
+                 mt_held_objects(p->mt) == 1 && wire_objects(p, empty, 1) == 0);
+    FILL_REQUIRE(p->pub_br->pending_count == 3);
+    FILL_TRY(fill_retry_pending(p, 2, refs[2], ids[2], f.track.sub._opaque,
+                                MOQ_SCHED_MODE_FILL, 2, 1));
+
+    mt_retry_probe_t *probe = &p->mt->retry_probe;
+    probe->earlier_sid[0] = ids[0];
+    probe->earlier_sid[1] = ids[1];
+    probe->fill_sid = ids[2];
+    probe->sibling_sid = ids[3];
+    probe->fill_ref = refs[2];
+    probe->sibling_ref = refs[3];
+    for (size_t i = 0; i < 3; i++) st[i]->refuse_payload = false;
+    printf("READY %s: regular payloads precede fill; fill header drained=%d; successor=%u\n",
+           c->name, (int)c->drain_header, (unsigned)c->successor_group);
+    probe->armed = true;
+    moq_result_t rc = moq_transport_bridge_service(p->pub_br, p->now);
+    probe->armed = false;
+    FILL_REQUIRE(rc == MOQ_OK && probe->sample_count == 2 && probe->fill_payload_writes >= 1 &&
+                 p->pub_br->pending_count == 0);
+    bool correct = true;
+    for (size_t i = 0; i < 2; i++) {
+        const mt_retry_sample_t *sample = &probe->samples[i];
+        FILL_REQUIRE(sample->sid == ids[i] && sample->fill_payload_writes == 0 &&
+                     sample->fill_found && sample->sibling_found &&
+                     sample->sibling_keyed && sample->sibling_held);
+        printf("OBSERVE %s R%zu: F active=%d group=%llu; S pos=%u key=%08x; F writes=%zu\n",
+               c->name, i + 1, (int)sample->fill_order_active,
+               (unsigned long long)sample->fill_order_meta.group_id,
+               (unsigned)sample->sibling_pos, (unsigned)sample->sibling_key,
+               sample->fill_payload_writes);
+        if (!fill_check(sample->fill_order_active &&
+                        fill_retry_first_class(&sample->fill_order_meta, f.track.sub._opaque),
+                        "F retains its group-1 representative before its own retry", __LINE__)) correct = false;
+        if (!fill_check(sample->sibling_pos == 1,
+                        "S keeps logical rank 1 at earlier R retry", __LINE__)) correct = false;
+        if (!fill_check(sample->sibling_key == sibling_key,
+                        "S keeps its published key at earlier R retry", __LINE__)) correct = false;
+    }
+    FILL_TRY(fill_drain(p));
+    uint32_t want[5] = { OBJ(3, 0, 0, 0), OBJ(3, 1, 0, 0),
+                         OBJ(2, 1, 0, 0), OBJ(1, 1, 0, 0) };
+    size_t n = 4;
+    if (c->successor_group)
+        want[n++] = OBJ(2, c->successor_group, 0, c->successor_group == 1 ? 1 : 0);
+    FILL_TRY(fill_complete_objects(p, want, n));
+    if (c->successor_group) {
+        uint32_t got[8];
+        size_t count = wire_objects(p, got, 8);
+        FILL_REQUIRE(first_index(got, count, UINT32_MAX, want[2]) <
+                     first_index(got, count, UINT32_MAX, want[4]));
+    }
+    return correct;
+}
+
+static void run_fill_row(const char *name, size_t cap, fill_row_fn row, const void *ctx)
+{
+    fill_row_name = name;
+    fill_row_cap = cap;
+    pair_t p;
+    const int before = failures;
+    bool ready = pair_init(&p, MOQ_VERSION_DRAFT_22, cap, true);
+    if (fill_check(ready && failures == before, "pair initialization", __LINE__))
+        (void)row(&p, ctx);
+    pair_destroy(&p);
+    printf("fill %s cap=%zu failures=%d\n", name, cap, failures - before);
+}
+
+static void test_fill_order(void)
+{
+    static const fill_order_case_t cases[] = {
+        { "same-ASC", ASC, ASC, 3, 3, 0, true, false },
+        { "same-DESC", DESC, DESC, 3, 3, 0, true, false },
+        { "matching-ASC", ASC, ASC, 4, 2, 0, true, false },
+        { "matching-DESC", DESC, DESC, 2, 4, 0, true, false },
+        { "opposite-ASC", ASC, DESC, 4, 2, 0, false, false },
+        { "opposite-DESC", DESC, ASC, 2, 4, 0, false, false },
+        { "crossing-ASC", ASC, ASC, 3, 2, 4, true, false },
+        { "crossing-DESC", DESC, DESC, 3, 4, 2, true, false },
+        { "FETCH-owner-ASC", ASC, DESC, 3, 3, 0, false, true },
+        { "FETCH-owner-DESC", DESC, ASC, 3, 3, 0, false, true },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+        for (size_t k = 0; k < sizeof(k_caps) / sizeof(k_caps[0]); k++)
+            run_fill_row(cases[i].name, k_caps[k], fill_order_row, &cases[i]);
+    for (unsigned order = 0; order < 2; order++) {
+        fill_boundary_case_t c = { .order = order == 0 ? ASC : DESC };
+        for (size_t k = 0; k < sizeof(k_caps) / sizeof(k_caps[0]); k++)
+            run_fill_row(order == 0 ? "first-group-ASC" : "first-group-DESC",
+                         k_caps[k], fill_first_group_row, &c);
+        for (unsigned direction = 0; direction < 2; direction++) {
+            c.updated_priority = direction == 0 ? 5 : 200;
+            run_fill_row(order == 0 ? (direction == 0 ? "override-ASC-raise" : "override-ASC-lower")
+                                   : (direction == 0 ? "override-DESC-raise" : "override-DESC-lower"),
+                         1u << 20, fill_priority_override_row, &c);
+            c.properties = direction != 0;
+            run_fill_row(order == 0 ? (c.properties ? "split-properties-ASC" : "split-ASC")
+                                   : (c.properties ? "split-properties-DESC" : "split-DESC"),
+                         1u << 20, fill_payload_retry_row, &c);
+            c.reverse = direction != 0;
+            run_fill_row(order == 0 ? (c.reverse ? "cycle-ASC-reverse" : "cycle-ASC")
+                                   : (c.reverse ? "cycle-DESC-reverse" : "cycle-DESC"),
+                         1u << 20, fill_cycle_row, &c);
+        }
+    }
+    static const fill_retry_case_t retries[] = {
+        { "detached-next-group", true, 2 },
+        { "detached-no-successor", true, 0 },
+        { "detached-no-drain-control", false, 2 },
+        { "detached-same-class-control", true, 1 },
+    };
+    for (size_t i = 0; i < sizeof(retries) / sizeof(retries[0]); i++)
+        run_fill_row(retries[i].name, 1u << 20, fill_detached_retry_row, &retries[i]);
+    MOQ_TEST_PASS("D22 fill ordering, current groups, priority overrides and cycle fairness");
+}
+
+#undef FILL_REQUIRE
+#undef FILL_TRY
 
 /* [CTL-01] Control messages do not wait behind queued object data: with the
  * network stalled and the publisher's buffers full of data, a new SUBSCRIBE
@@ -1468,21 +2638,6 @@ static void test_control_not_behind_data(void)
         pair_destroy(&p);
     }
     MOQ_TEST_PASS("control is not stuck behind queued data");
-}
-
-/* The data stream that carried object (track, group, subgroup, *). */
-static bool stream_of(const pair_t *p, uint8_t track, uint64_t group,
-                      uint64_t *sid)
-{
-    for (size_t i = 0; i < p->mt->nchunks; i++) {
-        const mt_chunk_t *c = &p->mt->chunks[i];
-        if (c->len == PAYLOAD_LEN && c->head[0] == PAYLOAD_TAG &&
-            c->head[1] == track && c->head[2] == (uint8_t)group) {
-            *sid = c->sid;
-            return true;
-        }
-    }
-    return false;
 }
 
 static bool was_reset(const pair_t *p, uint64_t sid)
@@ -1831,8 +2986,1310 @@ static void test_done_with_pending(void)
     MOQ_TEST_PASS("ending a subscription resets its streams before the done");
 }
 
-int main(void)
+/* -- Cold-review regressions: terminal ordering and retained expiry ------- */
+
+/* These fixtures use public session/bridge calls and endpoint observations.
+ * A failed setup stops its row, so an absent request/stream cannot turn into
+ * an uninitialized handle, an invented model stream, or a misleading pass. */
+#define REG_REQUIRE(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+        failures++; \
+        return false; \
+    } \
+} while (0)
+
+typedef struct {
+    bool publication;
+    track_t track;
+    moq_publication_t pub, peer_pub;
+} regression_owner_t;
+
+static bool regression_sync(pair_t *p)
 {
+    const int before = failures;
+    shuttle(p);
+    REG_REQUIRE(failures == before);
+    REG_REQUIRE(!p->sub_ep.overflowed && !p->sub_ep.truncated);
+    REG_REQUIRE(moq_session_state(p->pub) == MOQ_SESS_ESTABLISHED);
+    REG_REQUIRE(moq_session_state(p->sub) == MOQ_SESS_ESTABLISHED);
+    REG_REQUIRE(!moq_transport_bridge_is_terminal(p->pub_br));
+    REG_REQUIRE(!moq_transport_bridge_is_terminal(p->sub_br));
+    REG_REQUIRE(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    REG_REQUIRE(!moq_transport_bridge_has_outbound_pending(p->sub_br));
+    return true;
+}
+
+static bool regression_event(moq_session_t *s, moq_event_kind_t kind,
+                              moq_event_t *out)
+{
+    size_t n = 0;
+    memset(out, 0, sizeof(*out));
+    moq_result_t rc = moq_session_poll_events_ex(s, out, 1, sizeof(*out), &n);
+    bool ok = rc == MOQ_OK && n == 1 && out->kind == kind;
+    if (!ok) moq_event_cleanup(out);
+    REG_REQUIRE(ok);
+    return true;
+}
+
+static bool regression_no_events(moq_session_t *s)
+{
+    moq_event_t e = {0};
+    size_t n = 0;
+    moq_result_t rc = moq_session_poll_events_ex(s, &e, 1, sizeof(e), &n);
+    moq_event_cleanup(&e);
+    REG_REQUIRE(rc == MOQ_OK && n == 0);
+    return true;
+}
+
+static bool regression_name(moq_namespace_t ns, moq_bytes_t name,
+                             const char *want)
+{
+    return ns.count == 1 && ns.parts && ns.parts[0].data &&
+        ns.parts[0].len == 4 && memcmp(ns.parts[0].data, "live", 4) == 0 &&
+        name.data && name.len == strlen(want) &&
+        memcmp(name.data, want, name.len) == 0;
+}
+
+static bool regression_owner(pair_t *p, bool publication, const char *name,
+                              uint8_t priority, uint64_t timeout_ms,
+                              regression_owner_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->publication = publication;
+    moq_bytes_t part = MOQ_BYTES_LITERAL("live");
+    moq_bytes_t track_name = { (const uint8_t *)name, strlen(name) };
+    if (publication) {
+        REG_REQUIRE(timeout_ms == 0); /* timeout rows use SUBSCRIBE */
+        moq_publish_cfg_t pc;
+        moq_publish_cfg_init_sized(&pc, sizeof(pc));
+        pc.track_namespace = (moq_namespace_t){ &part, 1 };
+        pc.track_name = track_name;
+        pc.has_subscriber_priority = p->ver == MOQ_VERSION_DRAFT_22;
+        pc.subscriber_priority = priority;
+        REG_REQUIRE(moq_session_publish(p->pub, &pc, p->now, &out->pub) == MOQ_OK);
+    } else {
+        moq_subscribe_cfg_t sc;
+        moq_subscribe_cfg_init(&sc);
+        sc.track_namespace = (moq_namespace_t){ &part, 1 };
+        sc.track_name = track_name;
+        sc.has_subscriber_priority = true;
+        sc.subscriber_priority = priority;
+        REG_REQUIRE(moq_session_subscribe(p->sub, &sc, p->now,
+                                          &out->track.csub) == MOQ_OK);
+    }
+    if (!regression_sync(p)) return false;
+    moq_event_t e;
+    if (!regression_event(publication ? p->sub : p->pub,
+            publication ? MOQ_EVENT_PUBLISH_REQUEST : MOQ_EVENT_SUBSCRIBE_REQUEST,
+            &e)) return false;
+    bool valid;
+    if (publication) {
+        out->peer_pub = e.u.publish_request.pub;
+        valid = moq_publication_is_valid(out->peer_pub) &&
+            regression_name(e.u.publish_request.track_namespace,
+                             e.u.publish_request.track_name, name);
+    } else {
+        out->track.sub = e.u.subscribe_request.sub;
+        valid = moq_subscription_is_valid(out->track.sub) &&
+            regression_name(e.u.subscribe_request.track_namespace,
+                             e.u.subscribe_request.track_name, name) &&
+            e.u.subscribe_request.subscriber_priority == priority;
+    }
+    moq_event_cleanup(&e);
+    REG_REQUIRE(valid);
+    if (!regression_no_events(p->pub) || !regression_no_events(p->sub)) return false;
+    if (publication) {
+        moq_accept_publish_cfg_t ac;
+        moq_accept_publish_cfg_init(&ac);
+        ac.has_subscriber_priority = p->ver != MOQ_VERSION_DRAFT_22;
+        ac.subscriber_priority = priority;
+        REG_REQUIRE(moq_session_accept_publish(p->sub, out->peer_pub, &ac,
+                                               p->now) == MOQ_OK);
+    } else {
+        uint8_t props[16];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, props, sizeof(props));
+        if (timeout_ms) {
+            REG_REQUIRE(moq_buf_write_vi64(&w, 0x02) == MOQ_OK);
+            REG_REQUIRE(moq_buf_write_vi64(&w, timeout_ms) == MOQ_OK);
+        }
+        moq_accept_subscribe_cfg_t ac;
+        moq_accept_subscribe_cfg_init(&ac);
+        ac.track_properties = (moq_bytes_t){ props, moq_buf_writer_offset(&w) };
+        REG_REQUIRE(moq_session_accept_subscribe(p->pub, out->track.sub, &ac,
+                                                 p->now) == MOQ_OK);
+    }
+    if (!regression_sync(p)) return false;
+    if (!regression_event(publication ? p->pub : p->sub,
+            publication ? MOQ_EVENT_PUBLISH_OK : MOQ_EVENT_SUBSCRIBE_OK, &e))
+        return false;
+    valid = publication ? moq_publication_eq(e.u.publish_ok.pub, out->pub)
+                        : moq_subscription_eq(e.u.subscribe_ok.sub, out->track.csub);
+    moq_event_cleanup(&e);
+    REG_REQUIRE(valid);
+    return regression_no_events(p->pub) && regression_no_events(p->sub);
+}
+
+/* Open just one stream at a time and identify it from the accepted header,
+ * without assuming stream-id arithmetic or consulting the bridge's map. */
+static bool regression_open_header(pair_t *p, const regression_owner_t *owner,
+                                    uint64_t group, moq_subgroup_handle_t *sg,
+                                    uint64_t *sid, size_t *header_len)
+{
+    const size_t mark = p->mt->nchunks;
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = group;
+    sc.publisher_priority = 128;
+    moq_result_t rc = owner->publication
+        ? moq_session_open_pub_subgroup(p->pub, owner->pub, &sc, p->now, sg)
+        : moq_session_open_subgroup(p->pub, owner->track.sub, &sc, p->now, sg);
+    REG_REQUIRE(rc == MOQ_OK && moq_subgroup_is_valid(*sg));
+    REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    REG_REQUIRE(p->mt->nchunks == mark + 1);
+    const mt_chunk_t *c = &p->mt->chunks[mark];
+    REG_REQUIRE(c->len > 0 && !c->fin && c->accepted_seq > 0);
+    *sid = c->sid;
+    *header_len = c->len;
+    REG_REQUIRE(!moq_session_has_pending_output(p->pub));
+    REG_REQUIRE(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    return true;
+}
+
+static moq_result_t regression_finish(pair_t *p, const regression_owner_t *owner,
+                                       uint64_t streams, const char *reason)
+{
+    moq_bytes_t text = { (const uint8_t *)reason, strlen(reason) };
+    if (owner->publication) {
+        moq_finish_publish_cfg_t fc;
+        moq_finish_publish_cfg_init(&fc);
+        fc.status_code = 0x3; /* SUBSCRIPTION_ENDED */
+        fc.stream_count = streams;
+        fc.reason = text;
+        return moq_session_finish_publish(p->pub, owner->pub, &fc, p->now);
+    }
+    moq_done_subscribe_cfg_t dc;
+    moq_done_subscribe_cfg_init(&dc);
+    dc.status_code = 0x3;
+    dc.stream_count = streams;
+    dc.reason = text;
+    return moq_session_done_subscribe(p->pub, owner->track.sub, &dc, p->now);
+}
+
+/* All three drafts use the public Type(vi64)/Length(16) envelope and this
+ * terminal body; only d16 prepends Request ID. Decode the actual terminal,
+ * not merely the first control write (which might be unrelated traffic).
+ * The reason identifies the owner even on d16's shared control stream. */
+static bool regression_done(const pair_t *p, const char *reason, uint64_t streams,
+                              size_t *count, uint64_t *seq)
+{
+    *count = 0;
+    *seq = 0;
+    for (size_t i = 0; i < p->mt->nctrl; ++i) {
+        const mt_ctrl_t *c = &p->mt->ctrl[i];
+        moq_buf_reader_t r;
+        moq_buf_reader_init(&r, c->data, c->len);
+        while (moq_buf_reader_remaining(&r)) {
+            moq_control_envelope_t env;
+            REG_REQUIRE(moq_control_decode_envelope(&r, &env) == MOQ_OK);
+            if (env.msg_type != MOQ_D16_PUBLISH_DONE) continue;
+            moq_buf_reader_t body;
+            moq_buf_reader_init(&body, env.payload, env.payload_len);
+            uint64_t request_id, status, stream_count, reason_len;
+            if (p->ver == MOQ_VERSION_DRAFT_16)
+                REG_REQUIRE(moq_buf_read_vi64(&body, &request_id) == MOQ_OK);
+            REG_REQUIRE(moq_buf_read_vi64(&body, &status) == MOQ_OK);
+            REG_REQUIRE(moq_buf_read_vi64(&body, &stream_count) == MOQ_OK);
+            REG_REQUIRE(moq_buf_read_vi64(&body, &reason_len) == MOQ_OK);
+            REG_REQUIRE(reason_len == moq_buf_reader_remaining(&body));
+            if (reason_len != strlen(reason) ||
+                memcmp(moq_buf_reader_ptr(&body), reason, (size_t)reason_len) != 0)
+                continue;
+            REG_REQUIRE(status == 0x3 && stream_count == streams);
+            REG_REQUIRE(c->fin == uni_control(p->ver));
+            ++*count;
+            *seq = c->accepted_seq;
+        }
+    }
+    return true;
+}
+
+static size_t regression_fins(const mt_t *m, uint64_t sid, uint64_t *seq)
+{
+    size_t n = 0;
+    *seq = 0;
+    for (size_t i = 0; i < m->nchunks; ++i)
+        if (m->chunks[i].sid == sid && m->chunks[i].fin) {
+            n++;
+            *seq = m->chunks[i].accepted_seq;
+        }
+    return n;
+}
+
+static bool regression_service(pair_t *p)
+{
+    /* Allow a deferred terminal to run in a subsequent pass; never serve the
+     * model network here. FIN handoff, not drain/ACK, releases the terminal. */
+    for (unsigned i = 0; i < 4; ++i)
+        REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    REG_REQUIRE(!moq_transport_bridge_is_terminal(p->pub_br));
+    REG_REQUIRE(moq_session_state(p->pub) == MOQ_SESS_ESTABLISHED);
+    return true;
+}
+
+/* d16 9.15 / d18 10.11 / d22 9.9: every subgroup must be closed before
+ * PUBLISH_DONE is sent. Cross-stream network arrival order is unconstrained. */
+static bool normal_fin_done_row(pair_t *p, bool publication, bool refuse_fin)
+{
+    regression_owner_t target, other;
+    if (!regression_owner(p, publication, "terminal-target", 128, 0, &target) ||
+        !regression_owner(p, publication, "terminal-other", 128, 0, &other))
+        return false;
+    moq_subgroup_handle_t sg[3];
+    uint64_t sid[3];
+    size_t header_len;
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!regression_open_header(p, i < 2 ? &target : &other,
+                i == 1 ? 2 : 1, &sg[i], &sid[i], &header_len)) return false;
+        REG_REQUIRE(write_object(p, sg[i], i < 2 ? 1 : 2,
+                                  i == 1 ? 2 : 1, 0, 0) == MOQ_OK);
+        serve_all(p);
+    }
+    REG_REQUIRE(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    mt_stream_t *blocked = mt_stream(p->mt, sid[0]);
+    REG_REQUIRE(blocked && blocked->data && !blocked->reset);
+    blocked->refuse_fin = refuse_fin;
+    const uint64_t mark = p->mt->op_seq;
+    /* No bridge service between these calls: the causal regression. */
+    REG_REQUIRE(moq_session_close_subgroup(p->pub, sg[0], p->now) == MOQ_OK);
+    REG_REQUIRE(moq_session_close_subgroup(p->pub, sg[1], p->now) == MOQ_OK);
+    REG_REQUIRE(regression_finish(p, &target, 2, "target") == MOQ_OK);
+    /* Work queued AFTER the blocked terminal must still make progress for
+     * another owner. D16 preserves shared-control FIFO; d18/22 can also
+     * send the other terminal on its independent request stream. */
+    REG_REQUIRE(write_object(p, sg[2], 2, 1, 0, 1) == MOQ_OK);
+    REG_REQUIRE(moq_session_close_subgroup(p->pub, sg[2], p->now) == MOQ_OK);
+    REG_REQUIRE(regression_finish(p, &other, 1, "other") == MOQ_OK);
+    if (!regression_service(p)) return false;
+    size_t target_count, other_count;
+    uint64_t target_seq, other_seq, fin_seq[3];
+    if (!regression_done(p, "target", 2, &target_count, &target_seq) ||
+        !regression_done(p, "other", 1, &other_count, &other_seq)) return false;
+    const bool other_control_held = refuse_fin && p->ver == MOQ_VERSION_DRAFT_16;
+    MOQ_TEST_CHECK_EQ_SIZE(other_count, other_control_held ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid[1], &fin_seq[1]), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid[2], &fin_seq[2]), 1);
+    MOQ_TEST_CHECK(fin_seq[2] > mark);
+    if (!other_control_held) MOQ_TEST_CHECK(fin_seq[2] < other_seq);
+    size_t other_payloads = 0;
+    for (size_t i = 0; i < p->mt->nchunks; ++i) {
+        const mt_chunk_t *c = &p->mt->chunks[i];
+        if (c->sid == sid[2] && c->accepted_seq > mark &&
+            c->len == PAYLOAD_LEN && c->head[0] == PAYLOAD_TAG)
+            other_payloads++;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(other_payloads, 1);
+    if (refuse_fin) {
+        MOQ_TEST_CHECK(blocked->fin_attempts > 0 && blocked->refused_writes > 0);
+        MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid[0], &fin_seq[0]), 0);
+        MOQ_TEST_CHECK_EQ_SIZE(target_count, 0);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p->pub_br));
+        const uint32_t attempts = blocked->fin_attempts;
+        blocked->refuse_fin = false;
+        if (!regression_service(p)) return false;
+        MOQ_TEST_CHECK(blocked->fin_attempts > attempts);
+    }
+    if (!regression_done(p, "target", 2, &target_count, &target_seq) ||
+        !regression_done(p, "other", 1, &other_count, &other_seq)) return false;
+    MOQ_TEST_CHECK_EQ_SIZE(target_count, 1);
+    MOQ_TEST_CHECK_EQ_SIZE(other_count, 1);
+    if (p->ver == MOQ_VERSION_DRAFT_16) MOQ_TEST_CHECK(target_seq < other_seq);
+    for (unsigned i = 0; i < 3; ++i) {
+        MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid[i], &fin_seq[i]), 1);
+        MOQ_TEST_CHECK(fin_seq[i] > mark && fin_seq[i] < (i < 2 ? target_seq : other_seq));
+        mt_stream_t *st = mt_stream(p->mt, sid[i]);
+        REG_REQUIRE(st != NULL);
+        MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)st->writes_after_reset, 0);
+    }
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p->pub_br));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+    serve_all(p);
+    uint32_t objects[8];
+    MOQ_TEST_CHECK_EQ_SIZE(wire_objects(p, objects, 8), 4);
+    return true;
+}
+
+static void test_normal_fin_before_done(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; ++v)
+        for (unsigned pub = 0; pub < 2; ++pub)
+            for (unsigned refused = 0; refused < 2; ++refused) {
+                const int before = failures;
+                pair_t p;
+                if (pair_init(&p, k_versions[v], 1u << 20, true))
+                    (void)normal_fin_done_row(&p, pub != 0, refused != 0);
+                else MOQ_TEST_CHECK(false);
+                pair_destroy(&p);
+                printf("normal FIN before DONE d%d publish=%u refused=%u failures=%d\n",
+                       draft_of(k_versions[v]), pub, refused, failures - before);
+            }
+}
+
+/* d18 8 / d22 5.2 require an object-timeout check BEFORE transport handoff.
+ * Header and whole payload are supplied together, so both drafts' clocks
+ * start at t0. The exact-deadline row pins the core's existing <= policy;
+ * the +1 row also covers the specs' literal "exceeds" wording. */
+static bool retained_expiry_row(pair_t *p, uint64_t release_after_us,
+                                 moq_rcbuf_t *payload[3])
+{
+    regression_owner_t a, b;
+    if (!regression_owner(p, false, "untimed", 0, 0, &a) ||
+        !regression_owner(p, false, "expires", 128, 1, &b)) return false;
+    moq_subgroup_handle_t asg, bsg;
+    uint64_t asid, bsid;
+    size_t a_header, b_header;
+    if (!regression_open_header(p, &a, 1, &asg, &asid, &a_header) ||
+        !regression_open_header(p, &b, 1, &bsg, &bsid, &b_header)) return false;
+    serve_all(p);
+    mt_stream_t *ast = mt_stream(p->mt, asid), *bst = mt_stream(p->mt, bsid);
+    REG_REQUIRE(ast && bst && ast->data && bst->data);
+    const uint32_t b_attempts = bst->write_attempts;
+    const size_t chunks_before = p->mt->nchunks;
+    const uint64_t t0 = p->now, deadline = t0 + 1000;
+    for (unsigned i = 0; i < 3; ++i) {
+        uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, i == 0 ? 1 : 2, 1, 0,
+                                       i == 2 ? 1 : 0 };
+        REG_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes),
+                                     &payload[i]) == MOQ_OK);
+        REG_REQUIRE(moq_session_write_object(p->pub, i == 0 ? asg : bsg,
+                i == 2 ? 1 : 0, payload[i], p->now) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 2);
+    }
+    REG_REQUIRE(moq_session_close_subgroup(p->pub, bsg, p->now) == MOQ_OK);
+    REG_REQUIRE(moq_session_next_deadline_us(p->pub) == deadline);
+    ast->refuse_payload = true;
+    REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    /* A's object header went out, its payload was refused, and the public
+     * max_pending=1 is now occupied. B's objects and FIN have left the core,
+     * but even their object headers have not been attempted at the endpoint. */
+    REG_REQUIRE(ast->refused_writes > 0);
+    REG_REQUIRE(p->mt->nchunks == chunks_before + 1);
+    REG_REQUIRE(p->mt->chunks[chunks_before].sid == asid);
+    REG_REQUIRE(!moq_session_has_pending_output(p->pub));
+    REG_REQUIRE(moq_transport_bridge_has_pending(p->pub_br));
+    REG_REQUIRE(bst->write_attempts == b_attempts && bst->reset_attempts == 0);
+    /* The retained deadline must still wake the adapter. This observation is
+     * nonfatal so an old baseline also reaches the late-delivery assertions. */
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 2);
+
+    p->now = deadline - 1;
+    REG_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->write_attempts, (int)b_attempts);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 0);
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 2);
+
+    p->now = t0 + release_after_us;
+    REG_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    ast->refuse_payload = false;
+    if (!regression_service(p)) return false;
+    const bool expired = release_after_us >= 1000;
+    uint64_t fin_seq;
+    MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, bsid, &fin_seq), expired ? 0 : 1);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, expired ? 1 : 0);
+    if (expired) {
+        MOQ_TEST_CHECK_EQ_INT((int)bst->write_attempts, (int)b_attempts);
+        MOQ_TEST_CHECK(bst->reset);
+        MOQ_TEST_CHECK_EQ_U64(bst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+        MOQ_TEST_CHECK_EQ_U64(bst->reset_reliable, b_header);
+        for (size_t i = chunks_before; i < p->mt->nchunks; ++i)
+            MOQ_TEST_CHECK(p->mt->chunks[i].sid != bsid);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)ast->reset_attempts, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->writes_after_reset, 0);
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 1);
+    MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p->pub_br));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    serve_all(p);
+    const uint32_t want[] = { OBJ(1, 1, 0, 0), OBJ(2, 1, 0, 0), OBJ(2, 1, 0, 1) };
+    expect_wire(p, want, expired ? 1 : 3, "retained expiry", 1u << 20);
+    return true;
+}
+
+static void test_retained_expiry(void)
+{
+    static const uint64_t release_after_us[] = { 999, 1000, 1001 };
+    for (size_t v = 1; v < N_VERSIONS; ++v)
+        for (size_t t = 0; t < sizeof(release_after_us) / sizeof(release_after_us[0]); ++t) {
+            const int before = failures;
+            pair_t p;
+            moq_rcbuf_t *payload[3] = { NULL, NULL, NULL };
+            if (pair_init_retained(&p, k_versions[v], 1u << 20, true,
+                                   0, 1024, 1u << 20, 1, true))
+                (void)retained_expiry_row(&p, release_after_us[t], payload);
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+            for (unsigned i = 0; i < 3; ++i)
+                if (payload[i]) {
+                    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 1);
+                    moq_rcbuf_decref(payload[i]);
+                }
+            printf("retained expiry d%d release=%llu us failures=%d\n",
+                   draft_of(k_versions[v]), (unsigned long long)release_after_us[t],
+                   failures - before);
+        }
+}
+
+typedef enum {
+    EXPIRY_PARTIAL,
+    EXPIRY_PARTIAL_RESET_REFUSED,
+    EXPIRY_HEADER_REFUSED,
+    EXPIRY_CANCEL_FIRST,
+} expiry_successor_t;
+
+static size_t regression_resets(const mt_t *m, uint64_t sid, uint64_t *seq)
+{
+    size_t n = 0;
+    *seq = 0;
+    for (size_t i = 0; i < m->nwire; ++i)
+        if (m->wire[i].sid == sid && m->wire[i].reset) {
+            n++;
+            *seq = m->wire_seq[i];
+        }
+    return n;
+}
+
+static bool regression_done_absent(const pair_t *p)
+{
+    size_t count;
+    uint64_t seq;
+    if (!regression_done(p, "successor", 1, &count, &seq)) return false;
+    MOQ_TEST_CHECK_EQ_SIZE(count, 0);
+    return true;
+}
+
+/* Only ONE timed object: an expired queued sibling must not mask a missing
+ * expiry check for PENDING_PAYLOAD_ONLY. The header-refused variant instead
+ * exercises an expired object behind its still-unaccepted subgroup prefix.
+ * MOQT d18 11.4.3 / d22 11.3.2 recommend preserving that prefix. Once the
+ * library selects it, RESET_STREAM_AT must not claim bytes never accepted. */
+static bool expiry_successor_row(pair_t *p, expiry_successor_t which,
+                                  moq_rcbuf_t **payload)
+{
+    const bool header_refused = which == EXPIRY_HEADER_REFUSED;
+    const bool cancel_first = which == EXPIRY_CANCEL_FIRST;
+    const bool reset_refused = which == EXPIRY_PARTIAL_RESET_REFUSED || cancel_first;
+    const uint64_t cause = cancel_first ? 0x1 /* CANCELLED */ : MOQ_RESET_DELIVERY_TIMEOUT;
+    regression_owner_t owner;
+    if (!regression_owner(p, false, "expiry-successor", 128, 1, &owner)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid = 0;
+    size_t header_len = 0;
+    mt_stream_t *st = NULL;
+    if (header_refused) {
+        p->mt->cap = 0; /* control remains writable; no data write fits */
+        moq_subgroup_cfg_t sc;
+        moq_subgroup_cfg_init(&sc);
+        sc.group_id = 1;
+        sc.publisher_priority = 128;
+        REG_REQUIRE(moq_session_open_subgroup(p->pub, owner.track.sub, &sc,
+                                              p->now, &sg) == MOQ_OK);
+    } else {
+        if (!regression_open_header(p, &owner, 1, &sg, &sid, &header_len)) return false;
+        serve_all(p);
+        st = mt_stream(p->mt, sid);
+        REG_REQUIRE(st && st->data);
+        st->refuse_payload = true;
+    }
+    const size_t chunks_before = p->mt->nchunks;
+    const uint64_t deadline = p->now + 1000;
+    const uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, 1, 1, 0, 0 };
+    REG_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes), payload) == MOQ_OK);
+    REG_REQUIRE(moq_session_write_object(p->pub, sg, 0, *payload, p->now) == MOQ_OK);
+    if (!cancel_first) {
+        REG_REQUIRE(moq_session_close_subgroup(p->pub, sg, p->now) == MOQ_OK);
+        REG_REQUIRE(regression_finish(p, &owner, 1, "successor") == MOQ_OK);
+    }
+    REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    if (header_refused) {
+        /* Identify the sole attempted data stream from endpoint observations,
+         * without predicting the next id or fabricating a model stream. */
+        for (size_t i = 0; i < MT_MAX_STREAMS; ++i)
+            if (p->mt->streams[i].used && p->mt->streams[i].data &&
+                p->mt->streams[i].write_attempts) {
+                REG_REQUIRE(st == NULL);
+                st = &p->mt->streams[i];
+            }
+        REG_REQUIRE(st != NULL);
+        sid = st->sid;
+        header_len = st->first_write_len;
+        REG_REQUIRE(header_len > 0 && header_len <= PAYLOAD_LEN);
+        REG_REQUIRE(p->mt->nchunks == chunks_before);
+    } else {
+        /* Object header accepted, body refused: exactly one new chunk. */
+        REG_REQUIRE(p->mt->nchunks == chunks_before + 1);
+        REG_REQUIRE(p->mt->chunks[chunks_before].sid == sid);
+        REG_REQUIRE(p->mt->chunks[chunks_before].len > 0 &&
+                     !p->mt->chunks[chunks_before].fin);
+        REG_REQUIRE(moq_transport_bridge_has_pending(p->pub_br));
+    }
+    REG_REQUIRE(st->refused_writes > 0 && st->reset_attempts == 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(*payload), 2);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
+    if (!regression_done_absent(p)) return false;
+
+    p->now = deadline - 1;
+    REG_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(*payload), 2);
+    MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + (header_refused ? 0 : 1));
+    if (!regression_done_absent(p)) return false;
+    if (cancel_first) {
+        /* Admit cancellation BEFORE expiry, but leave its RESET core-owned
+         * until the overdue service pass. Expiry must transfer that cause,
+         * not replace it with DELIVERY_TIMEOUT. */
+        REG_REQUIRE(moq_session_reset_subgroup(p->pub, sg, cause, p->now) == MOQ_OK);
+        REG_REQUIRE(regression_finish(p, &owner, 1, "successor") == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 0);
+    }
+    st->refuse_reset = reset_refused;
+    st->refuse_payload = false; /* a stale retry would now be accepted */
+    const uint32_t writes_before_expiry = st->write_attempts;
+    p->now = deadline + 1;
+    /* Advance through the bridge, without a separate due session tick:
+     * timeout handling must precede its pending-payload retry. */
+    if (!regression_service(p)) return false;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(*payload), 1);
+    uint64_t reset_seq = 0, fin_seq = 0;
+    if (header_refused) {
+        MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before);
+        MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 0);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p->pub_br));
+        if (!regression_done_absent(p)) return false;
+        p->mt->cap = 1u << 20;
+        if (!regression_service(p)) return false;
+        /* The only newly accepted bytes are the exact previously refused
+         * subgroup prefix. Neither an object header nor its body may pass. */
+        MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + 1);
+        REG_REQUIRE(p->mt->nchunks > chunks_before);
+        const mt_chunk_t *c = &p->mt->chunks[chunks_before];
+        MOQ_TEST_CHECK_EQ_U64(c->sid, sid);
+        MOQ_TEST_CHECK_EQ_SIZE(c->len, header_len);
+        MOQ_TEST_CHECK(memcmp(c->head, st->first_write_head, header_len) == 0);
+        MOQ_TEST_CHECK(!c->fin);
+        MOQ_TEST_CHECK_EQ_SIZE(regression_resets(p->mt, sid, &reset_seq), 1);
+        MOQ_TEST_CHECK(c->accepted_seq < reset_seq);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT((int)st->write_attempts, (int)writes_before_expiry);
+        MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + 1);
+    }
+    if (reset_refused) {
+        MOQ_TEST_CHECK(st->reset_attempts > 0 && !st->reset);
+        MOQ_TEST_CHECK_EQ_U64(st->reset_code, cause);
+        MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, header_len);
+        MOQ_TEST_CHECK_EQ_SIZE(regression_resets(p->mt, sid, &reset_seq), 0);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p->pub_br));
+        if (!regression_done_absent(p)) return false;
+        const uint32_t attempts = st->reset_attempts;
+        st->refuse_reset = false;
+        if (!regression_service(p)) return false;
+        MOQ_TEST_CHECK(st->reset_attempts > attempts);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(regression_resets(p->mt, sid, &reset_seq), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid, &fin_seq), 0);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, cause);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, header_len);
+    size_t done_count;
+    uint64_t done_seq;
+    if (!regression_done(p, "successor", 1, &done_count, &done_seq)) return false;
+    MOQ_TEST_CHECK_EQ_SIZE(done_count, 1);
+    MOQ_TEST_CHECK(reset_seq > 0 && reset_seq < done_seq);
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p->pub_br));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+
+    const uint32_t final_writes = st->write_attempts, final_resets = st->reset_attempts;
+    const size_t final_chunks = p->mt->nchunks;
+    if (!regression_service(p)) return false;
+    serve_all(p);
+    MOQ_TEST_CHECK_EQ_INT((int)st->write_attempts, (int)final_writes);
+    MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, (int)final_resets);
+    MOQ_TEST_CHECK_EQ_INT((int)st->writes_after_reset, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, final_chunks);
+    for (size_t i = 0; i < p->mt->nchunks; ++i)
+        MOQ_TEST_CHECK(!(p->mt->chunks[i].len == PAYLOAD_LEN &&
+                         p->mt->chunks[i].head[0] == PAYLOAD_TAG));
+    uint32_t objects[2];
+    MOQ_TEST_CHECK_EQ_SIZE(wire_objects(p, objects, 2), 0);
+    if (!regression_done(p, "successor", 1, &done_count, &done_seq)) return false;
+    MOQ_TEST_CHECK_EQ_SIZE(done_count, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(*payload), 1);
+    return true;
+}
+
+static void test_expiry_successors(void)
+{
+    static const char *names[] = { "partial", "partial-reset-refused",
+                                   "header-refused", "cancel-first" };
+    for (size_t v = 1; v < N_VERSIONS; ++v)
+        for (unsigned row = 0; row < sizeof(names) / sizeof(names[0]); ++row) {
+            const int before = failures;
+            pair_t p;
+            moq_rcbuf_t *payload = NULL;
+            if (pair_init_retained(&p, k_versions[v], 1u << 20, true,
+                                   0, 1024, 1u << 20, 1, true))
+                (void)expiry_successor_row(&p, (expiry_successor_t)row, &payload);
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+            if (payload) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 1);
+                moq_rcbuf_decref(payload);
+            }
+            printf("expiry successor d%d %s failures=%d\n",
+                   draft_of(k_versions[v]), names[row], failures - before);
+        }
+}
+
+/* R2 starts expiry in the core's action ring with no keyed dstream. R3
+ * starts it in a keyed bridge pending payload, with no FIN/DONE or unrelated
+ * work to obscure the reset-only pending-query contract. */
+static bool expiry_review_row(pair_t *p, bool core_owned, moq_rcbuf_t **payload)
+{
+    regression_owner_t owner;
+    if (!regression_owner(p, false, "expiry-review", 128, 1, &owner)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header_len;
+    if (!regression_open_header(p, &owner, 1, &sg, &sid, &header_len)) return false;
+    serve_all(p);
+    mt_stream_t *st = mt_stream(p->mt, sid);
+    REG_REQUIRE(st && st->data);
+    const size_t chunks_before = p->mt->nchunks;
+    const size_t slots_before = moq_session_action_capacity(p->pub);
+    const uint32_t header_writes = st->write_attempts;
+    const uint64_t deadline = p->now + 1000;
+    const uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, 1, 1, 0, 0 };
+    REG_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes), payload) == MOQ_OK);
+    REG_REQUIRE(moq_session_write_object(p->pub, sg, 0, *payload, p->now) == MOQ_OK);
+    REG_REQUIRE(moq_session_has_pending_output(p->pub));
+    REG_REQUIRE(moq_rcbuf_refcount(*payload) == 2);
+    st->refuse_reset = true;
+    if (core_owned) {
+        /* No bridge service/poll: the object still occupies one core slot.
+         * Tick must release its payload and replace it with RESET_DATA before
+         * DONE is admitted. Spare pending slots select normal reset dispatch. */
+        REG_REQUIRE(moq_session_action_capacity(p->pub) + 1 == slots_before);
+        REG_REQUIRE(st->write_attempts == header_writes);
+        p->now = deadline + 1;
+        REG_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+        REG_REQUIRE(moq_rcbuf_refcount(*payload) == 1);
+        REG_REQUIRE(moq_session_has_pending_output(p->pub));
+        REG_REQUIRE(st->reset_attempts == 0 && st->write_attempts == header_writes);
+        REG_REQUIRE(regression_finish(p, &owner, 1, "successor") == MOQ_OK);
+    } else {
+        st->refuse_payload = true;
+        REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        REG_REQUIRE(p->mt->nchunks == chunks_before + 1);
+        REG_REQUIRE(st->refused_writes > 0 && st->reset_attempts == 0);
+        REG_REQUIRE(moq_rcbuf_refcount(*payload) == 2);
+        REG_REQUIRE(!moq_session_has_pending_output(p->pub));
+        REG_REQUIRE(moq_transport_bridge_has_pending(p->pub_br));
+        st->refuse_payload = false;
+        p->now = deadline + 1;
+    }
+    const uint32_t writes_before_reset = st->write_attempts;
+    if (!regression_service(p)) return false;
+    MOQ_TEST_CHECK(st->reset_attempts > 0 && !st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, header_len);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(*payload), 1);
+    MOQ_TEST_CHECK_EQ_INT((int)st->write_attempts, (int)writes_before_reset);
+    MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + (core_owned ? 0 : 1));
+    uint64_t reset_seq, fin_seq;
+    MOQ_TEST_CHECK_EQ_SIZE(regression_resets(p->mt, sid, &reset_seq), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid, &fin_seq), 0);
+    if (!regression_done_absent(p)) return false;
+    if (!core_owned) {
+        MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+        MOQ_TEST_CHECK_EQ_SIZE(p->mt->nctrl, 0);
+    }
+    /* R3's essential observations are nonfatal: still release/reset the
+     * stream and verify the inverse transition on the captured broken code. */
+    MOQ_TEST_CHECK(moq_transport_bridge_has_pending(p->pub_br));
+    MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p->pub_br));
+    const uint32_t refused_attempts = st->reset_attempts;
+    st->refuse_reset = false;
+    if (!regression_service(p)) return false;
+    MOQ_TEST_CHECK(st->reset && st->reset_attempts > refused_attempts);
+    MOQ_TEST_CHECK_EQ_SIZE(regression_resets(p->mt, sid, &reset_seq), 1);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, header_len);
+    size_t done_count;
+    uint64_t done_seq;
+    if (!regression_done(p, "successor", 1, &done_count, &done_seq)) return false;
+    MOQ_TEST_CHECK_EQ_SIZE(done_count, core_owned ? 1 : 0);
+    if (core_owned) MOQ_TEST_CHECK(reset_seq > 0 && reset_seq < done_seq);
+    MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p->pub_br));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    serve_all(p);
+    MOQ_TEST_CHECK_EQ_INT((int)st->write_attempts, (int)writes_before_reset);
+    MOQ_TEST_CHECK_EQ_INT((int)st->writes_after_reset, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + (core_owned ? 0 : 1));
+    MOQ_TEST_CHECK_EQ_SIZE(regression_resets(p->mt, sid, &reset_seq), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, sid, &fin_seq), 0);
+    uint32_t objects[2];
+    MOQ_TEST_CHECK_EQ_SIZE(wire_objects(p, objects, 2), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(*payload), 1);
+    return true;
+}
+
+static void test_expiry_review(unsigned finding)
+{
+    for (size_t v = 1; v < N_VERSIONS; ++v) {
+        const int before = failures;
+        pair_t p;
+        moq_rcbuf_t *payload = NULL;
+        /* R1/R2 intentionally exercise the supported max_actions<4 fallback,
+         * which cannot opt in to keyed data actions. R2 needs spare pending
+         * slots so the pressure-reset path cannot mask the missing owner. */
+        if (pair_init_retained(&p, k_versions[v], 1u << 20, true, 0,
+                               finding == 3 ? 1024 : 3, 1u << 20,
+                               finding == 2 ? 4 : 1, true)) {
+            if (finding == 1)
+                (void)expiry_successor_row(&p, EXPIRY_PARTIAL, &payload);
+            else
+                (void)expiry_review_row(&p, finding == 2, &payload);
+        } else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        if (payload) {
+            MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 1);
+            moq_rcbuf_decref(payload);
+        }
+        printf("expiry review R%u d%d failures=%d\n",
+               finding, draft_of(k_versions[v]), failures - before);
+    }
+}
+
+#undef REG_REQUIRE
+
+/* [RST-06] A retained-data budget cannot wait for the very RESET that will
+ * release it. D18 5.1.1 / D22 3.1.2 request cancellation must reach the data
+ * stream even with queued sibling data and additional cancelled-stream data
+ * ahead of that reset. All requests and peer cancellation use real ingress.
+ * Public bridge configuration selects the cap; no private state is changed.
+ */
+static void retained_cancel_row(moq_version_t ver, uint64_t retained_cap,
+                                bool peer_cancel, bool queued_tail,
+                                bool reset_blocked, bool reliable_reset)
+{
+    const int before = failures;
+    pair_t p;
+    moq_rcbuf_t *payload = NULL;
+    uint8_t *bytes = NULL;
+    if (!pair_init_retained(&p, ver, 4096, true, 0, 1024, retained_cap,
+                           0, reliable_reset)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    track_t blocked, healthy;
+    moq_subgroup_handle_t blocked_sg, healthy_sg;
+    if (!subscribe(&p, "blocked", 128, NONE, NONE, &blocked) ||
+        !subscribe(&p, "healthy", 128, NONE, NONE, &healthy) ||
+        !publish_group(&p, &blocked, 1, 1, 0, 128, 1, true, &blocked_sg) ||
+        !publish_group(&p, &healthy, 2, 1, 0, 128, 1, true, &healthy_sg)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    serve_all(&p);
+    uint64_t blocked_sid = 0, healthy_sid = 0;
+    if (!stream_of(&p, 1, 1, &blocked_sid) ||
+        !stream_of(&p, 2, 1, &healthy_sid)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    mt_stream_t *st = mt_stream(p.mt, blocked_sid);
+    if (!st) { MOQ_TEST_CHECK(false); goto done; }
+    st->refuse = true;
+    st->refuse_reset = reset_blocked;
+    size_t header_len = 0;
+    for (size_t i = 0; i < p.mt->nchunks; ++i)
+        if (p.mt->chunks[i].sid == blocked_sid) {
+            header_len = p.mt->chunks[i].len;
+            break;
+        }
+    MOQ_TEST_CHECK(header_len != 0 && header_len < PAYLOAD_LEN);
+    const size_t wire_before = p.mt->nwire;
+    const size_t payload_len = retained_cap == MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT
+        ? (size_t)retained_cap : PAYLOAD_LEN;
+    bytes = calloc(1, payload_len);
+    if (!bytes) { MOQ_TEST_CHECK(false); goto done; }
+    bytes[0] = PAYLOAD_TAG;
+    bytes[1] = 1;
+    if (moq_rcbuf_create(moq_alloc_default(), bytes, payload_len, &payload) != MOQ_OK) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    free(bytes);
+    bytes = NULL;
+    if (moq_session_write_object(p.pub, blocked_sg, 1, payload, p.now) != MOQ_OK ||
+        moq_transport_bridge_service(p.pub_br, p.now) != MOQ_OK) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    /* The write was refused and still owns its payload before cancellation. */
+    MOQ_TEST_CHECK(st->refused_writes != 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 2);
+    if (queued_tail)
+        MOQ_TEST_CHECK_EQ_INT((int)write_object(&p, blocked_sg, 1, 1, 0, 2), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)write_object(&p, healthy_sg, 2, 1, 0, 1), MOQ_OK);
+    const moq_result_t cancelled = peer_cancel
+        ? moq_session_unsubscribe(p.sub, blocked.csub, p.now)
+        : moq_session_reset_subgroup(p.pub, blocked_sg, 1, p.now);
+    if (cancelled != MOQ_OK) { MOQ_TEST_CHECK(false); goto done; }
+    if (reset_blocked) {
+        /* This control follows RESET; healthy data precedes it. Refusal may
+         * hold the control, but must neither hide the reset nor hold B. */
+        p.mt->ctrl_mark = p.mt->op_seq;
+        moq_done_subscribe_cfg_t dc;
+        moq_done_subscribe_cfg_init(&dc);
+        dc.status_code = 2;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_done_subscribe(p.pub, blocked.sub,
+                                                              &dc, p.now), MOQ_OK);
+    }
+    if (peer_cancel) shuttle(&p);
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    if (reset_blocked) {
+        MOQ_TEST_CHECK(!was_reset(&p, blocked_sid));
+        MOQ_TEST_CHECK(st->reset_attempts != 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 1);
+        MOQ_TEST_CHECK_EQ_U64(st->reset_code, 1);
+        MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, reliable_reset ? header_len : 0);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_pending(p.pub_br));
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p.pub_br));
+        size_t healthy_accepted = 0;
+        for (size_t i = 0; i < p.mt->nchunks; ++i)
+            if (p.mt->chunks[i].sid == healthy_sid &&
+                p.mt->chunks[i].len == PAYLOAD_LEN &&
+                p.mt->chunks[i].head[0] == PAYLOAD_TAG &&
+                p.mt->chunks[i].head[4] == 1)
+                healthy_accepted++;
+        MOQ_TEST_CHECK_EQ_SIZE(healthy_accepted, 1);
+        MOQ_TEST_CHECK_EQ_U64(p.mt->ctrl_first_after, 0);
+        MOQ_TEST_CHECK(write_object(&p, blocked_sg, 1, 1, 0, 3) != MOQ_OK);
+        /* Late notifications cannot erase or replace the retained reset. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_on_local_stream_committed(
+            p.pub_br, blocked_sid, p.now), MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_on_peer_stop_sending(
+            p.pub_br, blocked_sid, 0x55, p.now), MOQ_OK);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p.pub_br));
+        st->refuse_reset = false;
+        for (unsigned i = 0; i < 3 &&
+             moq_transport_bridge_has_outbound_pending(p.pub_br); ++i)
+            MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p.pub_br));
+        MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p.pub_br));
+        MOQ_TEST_CHECK(p.mt->ctrl_first_after > p.mt->ctrl_mark);
+    }
+    MOQ_TEST_CHECK(was_reset(&p, blocked_sid));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 1);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.pub), MOQ_SESS_ESTABLISHED);
+
+    /* Becoming writable later must not resurrect the cancelled tail. */
+    st->refuse = false;
+    serve_all(&p);
+    unsigned reset_count = 0, healthy_objects = 0;
+    for (size_t i = wire_before; i < p.mt->nwire; ++i) {
+        if (p.mt->wire[i].sid == blocked_sid) {
+            if (p.mt->wire[i].reset) reset_count++;
+            else MOQ_TEST_CHECK(false);
+        }
+        if (p.mt->wire[i].sid == healthy_sid &&
+            p.mt->wire[i].len == PAYLOAD_LEN &&
+            p.mt->wire[i].head[0] == PAYLOAD_TAG &&
+            p.mt->wire[i].head[4] == 1)
+            healthy_objects++;
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)reset_count, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)healthy_objects, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)st->writes_after_reset, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 1);
+done:
+    pair_destroy(&p);
+    free(bytes);
+    if (payload) {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload), 1);
+        moq_rcbuf_decref(payload);
+    }
+    printf("retained cancellation d%d cap=%llu peer=%d tail=%d reset_blocked=%d reliable=%d failures=%d\n",
+           draft_of(ver), (unsigned long long)retained_cap,
+           (int)peer_cancel, (int)queued_tail, (int)reset_blocked,
+           (int)reliable_reset, failures - before);
+}
+
+/* An unhanded header is a real prerequisite, even under byte pressure. The
+ * pressure path must not lower Reliable Size or report reset acceptance until
+ * that header has been accepted. This is a model endpoint refusal, not loss. */
+static void retained_header_row(moq_version_t ver, bool reliable_reset)
+{
+    const int before = failures;
+    pair_t p;
+    if (!pair_init_retained(&p, ver, 4096, true, 0, 1024, 1, 0, reliable_reset)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    track_t t;
+    moq_subgroup_handle_t sg;
+    if (!subscribe(&p, "header", 128, NONE, NONE, &t)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    const uint64_t sid = p.mt->next_uni;
+    mt_stream_t *st = mt_stream(p.mt, sid);
+    if (!st) { MOQ_TEST_CHECK(false); goto done; }
+    st->refuse = true;
+    if (!publish_group(&p, &t, 1, 1, 0, 128, 1, true, &sg) ||
+        moq_session_reset_subgroup(p.pub, sg, 1, p.now) != MOQ_OK) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    MOQ_TEST_CHECK(st->refused_writes != 0);
+    MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 0);
+    MOQ_TEST_CHECK(!was_reset(&p, sid));
+    for (size_t i = 0; i < p.mt->nchunks; ++i)
+        MOQ_TEST_CHECK(p.mt->chunks[i].sid != sid);
+    st->refuse = false;
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    size_t headers = 0, header_len = 0;
+    for (size_t i = 0; i < p.mt->nchunks; ++i)
+        if (p.mt->chunks[i].sid == sid) {
+            headers++;
+            header_len = p.mt->chunks[i].len;
+        }
+    MOQ_TEST_CHECK_EQ_SIZE(headers, 1);
+    MOQ_TEST_CHECK(header_len != 0 && header_len < PAYLOAD_LEN);
+    MOQ_TEST_CHECK(was_reset(&p, sid));
+    MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 1);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, reliable_reset ? header_len : 0);
+    MOQ_TEST_CHECK_EQ_INT((int)st->writes_after_reset, 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+done:
+    pair_destroy(&p);
+    printf("retained header d%d reliable=%d failures=%d\n",
+           draft_of(ver), (int)reliable_reset, failures - before);
+}
+
+/* A full core ring leaves peer cancellation on its subgroup owner. Production
+ * ingress creates RESET_OWED; private fields are observed, never synthesized.
+ * Interleaved survivors wrap the action ring and retain their metadata. */
+static void retained_owed_row(moq_version_t ver, bool expire, bool refuse_reset)
+{
+    const int before = failures;
+    pair_t p;
+    if (!pair_init_retained(&p, ver, 4096, true, 0, 8, 1, 0, true)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    track_t a, b;
+    moq_subgroup_handle_t asg, bsg;
+    if (!subscribe_timed(&p, "owed", 128, NONE, NONE,
+                          ver == MOQ_VERSION_DRAFT_16 ? 0 : 1, &a) ||
+        !subscribe(&p, "survivor", 64, DESC, NONE, &b) ||
+        !publish_group(&p, &a, 1, 1, 0, 128, 1, true, &asg) ||
+        !publish_group(&p, &b, 2, 1, 0, 128, 1, true, &bsg)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    serve_all(&p);
+    uint64_t asid = 0, bsid = 0;
+    if (!stream_of(&p, 1, 1, &asid) || !stream_of(&p, 2, 1, &bsid)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    mt_stream_t *st = mt_stream(p.mt, asid);
+    if (!st) { MOQ_TEST_CHECK(false); goto done; }
+    uint64_t next_b = 1;
+    for (unsigned i = 0; i < 8 && p.pub->action_head % p.pub->action_cap != 6; ++i) {
+        MOQ_TEST_CHECK_EQ_INT((int)write_object(&p, bsg, 2, 1, 0, next_b++), MOQ_OK);
+        serve_all(&p);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(p.pub->action_head % p.pub->action_cap, 6);
+    st->refuse = true;
+    st->refuse_reset = refuse_reset;
+    MOQ_TEST_CHECK_EQ_INT((int)write_object(&p, asg, 1, 1, 0, 1), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    MOQ_TEST_CHECK(st->refused_writes != 0);
+    MOQ_TEST_CHECK_EQ_SIZE(p.pub->action_tail - p.pub->action_head, 0);
+    const size_t chunks_before = p.mt->nchunks;
+    const size_t head = p.pub->action_head;
+    moq_action_meta_t survivor_meta[4];
+    for (unsigned i = 0; i < 8; ++i) {
+        moq_result_t rc = (i % 2 == 0)
+            ? write_object(&p, asg, 1, 1, 0, 2 + i / 2)
+            : write_object(&p, bsg, 2, 1, 0, next_b++);
+        if (rc != MOQ_OK) { MOQ_TEST_CHECK(false); goto done; }
+        if (i % 2 != 0)
+            survivor_meta[i / 2] = p.pub->action_meta[(head + i) % p.pub->action_cap];
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(p.pub->action_tail - p.pub->action_head, p.pub->action_cap);
+    MOQ_TEST_CHECK(head % p.pub->action_cap != 0);
+    moq_sg_entry_t *sg = NULL;
+    const moq_sub_entry_t *sub = NULL;
+    for (size_t i = 0; i < p.pub->sg_cap; ++i)
+        if (moq_subscription_eq(p.pub->subgroups[i].sub, a.sub)) {
+            sg = &p.pub->subgroups[i];
+        } else if (moq_subscription_eq(p.pub->subgroups[i].sub, b.sub)) {
+            p.mt->capture_ref = p.pub->subgroups[i].stream_ref;
+        }
+    for (size_t i = 0; i < p.pub->sub_cap; ++i)
+        if (moq_subscription_eq(p.pub->subs[i].handle, a.sub)) sub = &p.pub->subs[i];
+    if (!sg || !sub) { MOQ_TEST_CHECK(false); goto done; }
+    p.mt->capture_core = p.pub;
+    const uint64_t header_len = sg->header_len;
+    if (expire) p.now += 2000;
+    if (ver == MOQ_VERSION_DRAFT_16) {
+        /* Encode the actual UNSUBSCRIBE, without polling publisher output. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_unsubscribe(p.sub, a.csub, p.now), MOQ_OK);
+        moq_action_t action;
+        if (moq_session_poll_actions(p.sub, &action, 1) != 1) {
+            MOQ_TEST_CHECK(false);
+            goto done;
+        }
+        MOQ_TEST_CHECK_EQ_INT((int)action.kind, MOQ_ACTION_SEND_CONTROL);
+        const moq_result_t rc = action.kind == MOQ_ACTION_SEND_CONTROL
+            ? moq_session_on_control_bytes(p.pub, action.u.send_control.data,
+                                            action.u.send_control.len, p.now)
+            : MOQ_ERR_INTERNAL;
+        moq_action_cleanup(&action);
+        MOQ_TEST_CHECK_EQ_INT((int)rc, MOQ_OK);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_reset(p.pub,
+            sub->rs.ref, 1, p.now), MOQ_OK);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)sg->state, MOQ_SG_RESET_OWED);
+    MOQ_TEST_CHECK_EQ_U64(sg->owed_reset_code, 1);
+    MOQ_TEST_CHECK_EQ_SIZE(p.pub->action_tail - p.pub->action_head, p.pub->action_cap);
+    size_t expired = 0;
+    for (size_t i = p.pub->action_head; i < p.pub->action_tail; ++i) {
+        const size_t idx = i % p.pub->action_cap;
+        MOQ_TEST_CHECK_EQ_INT((int)p.pub->actions[idx].kind, MOQ_ACTION_SEND_DATA);
+        if (p.pub->action_meta[idx].deadline_us <= p.now) expired++;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(expired, expire ? 4 : 0);
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    MOQ_TEST_CHECK(st->reset_attempts != 0);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, 1);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, header_len);
+    size_t survivors = 0;
+    for (size_t i = chunks_before; i < p.mt->nchunks; ++i) {
+        MOQ_TEST_CHECK(p.mt->chunks[i].sid != asid);
+        if (p.mt->chunks[i].sid == bsid && p.mt->chunks[i].len == PAYLOAD_LEN &&
+            p.mt->chunks[i].head[0] == PAYLOAD_TAG) survivors++;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(survivors, 4);
+    MOQ_TEST_CHECK_EQ_SIZE(p.mt->captured_count, 4);
+    for (size_t i = 0; i < p.mt->captured_count && i < 4; ++i) {
+        const moq_action_meta_t *actual = &p.mt->captured_meta[i];
+        MOQ_TEST_CHECK_EQ_INT(actual->subscriber_priority, 64);
+        MOQ_TEST_CHECK_EQ_INT(actual->group_order, DESC);
+        MOQ_TEST_CHECK_EQ_U64(actual->owner, survivor_meta[i].owner);
+        MOQ_TEST_CHECK_EQ_U64(actual->group_id, survivor_meta[i].group_id);
+        MOQ_TEST_CHECK_EQ_INT(actual->mode, survivor_meta[i].mode);
+        MOQ_TEST_CHECK_EQ_U64(actual->deadline_us, UINT64_MAX);
+    }
+    if (refuse_reset) {
+        MOQ_TEST_CHECK(!was_reset(&p, asid));
+        MOQ_TEST_CHECK(moq_transport_bridge_has_pending(p.pub_br));
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p.pub_br));
+        st->refuse_reset = false;
+        for (unsigned i = 0; i < 3 &&
+             moq_transport_bridge_has_outbound_pending(p.pub_br); ++i)
+            MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    }
+    MOQ_TEST_CHECK(was_reset(&p, asid));
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, 1);
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p.pub_br));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+    size_t resets = 0;
+    for (size_t i = 0; i < p.mt->nwire; ++i)
+        if (p.mt->wire[i].sid == asid && p.mt->wire[i].reset) resets++;
+    MOQ_TEST_CHECK_EQ_SIZE(resets, 1);
+done:
+    pair_destroy(&p);
+    printf("retained owed d%d expire=%d refused=%d failures=%d\n",
+           draft_of(ver), (int)expire, (int)refuse_reset, failures - before);
+}
+
+/* Full pending capacity is distinct from the data-byte budget. The partial
+ * object is real (header accepted, payload refused); only its own reset may
+ * discard it. An older connection-control item remains a barrier. */
+static void retained_pending_row(moq_version_t ver, bool same_stream,
+                                  bool connection_barrier)
+{
+    const int before = failures;
+    pair_t p;
+    if (!pair_init_retained(&p, ver, 4096, true, 0, 1024, 0, 1, true)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    track_t a, b;
+    moq_subgroup_handle_t asg, bsg;
+    if (!subscribe(&p, "cancelled", 128, NONE, NONE, &a) ||
+        !subscribe(&p, "pending", 128, NONE, NONE, &b) ||
+        !publish_group(&p, &a, 1, 1, 0, 128, 1, true, &asg) ||
+        !publish_group(&p, &b, 2, 1, 0, 128, 1, true, &bsg)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    serve_all(&p);
+    uint64_t asid = 0, bsid = 0;
+    if (!stream_of(&p, 1, 1, &asid) || !stream_of(&p, 2, 1, &bsid)) {
+        MOQ_TEST_CHECK(false);
+        goto done;
+    }
+    mt_stream_t *st = mt_stream(p.mt, asid);
+    if (!st) { MOQ_TEST_CHECK(false); goto done; }
+    const size_t chunks_before = p.mt->nchunks;
+    if (connection_barrier) {
+        p.mt->refuse_control = true;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_grant_request_capacity(p.pub,
+            moq_session_local_request_capacity(p.pub) + 1, p.now), MOQ_OK);
+    } else {
+        p.mt->cap = 1;
+        MOQ_TEST_CHECK_EQ_INT((int)write_object(&p, same_stream ? asg : bsg,
+            same_stream ? 1 : 2, 1, 0, 1), MOQ_OK);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)p.pub_br->pending_count, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)p.pub_br->max_pending, 1);
+    MOQ_TEST_CHECK(p.pub_br->dq_bytes < p.pub_br->max_retained_bytes);
+    if (!connection_barrier) {
+        MOQ_TEST_CHECK_EQ_INT((int)p.pub_br->pending[0].kind, PENDING_PAYLOAD_ONLY);
+        MOQ_TEST_CHECK_EQ_U64(p.pub_br->pending[0].stream_id, same_stream ? asid : bsid);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_reset_subgroup(p.pub, asg, 1, p.now), MOQ_OK);
+    for (unsigned i = 0; i < 3; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now), MOQ_OK);
+    if (connection_barrier) {
+        MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 0);
+        MOQ_TEST_CHECK(!was_reset(&p, asid));
+        MOQ_TEST_CHECK_EQ_INT((int)p.pub_br->pending_count, 1);
+        MOQ_TEST_CHECK(moq_transport_bridge_has_outbound_pending(p.pub_br));
+        p.mt->refuse_control = false;
+    } else {
+        MOQ_TEST_CHECK(was_reset(&p, asid));
+        MOQ_TEST_CHECK_EQ_INT((int)p.pub_br->pending_count, same_stream ? 0 : 1);
+    }
+    p.mt->cap = 4096;
+    serve_all(&p);
+    MOQ_TEST_CHECK(was_reset(&p, asid));
+    MOQ_TEST_CHECK_EQ_INT((int)st->reset_attempts, 1);
+    size_t payloads = 0;
+    for (size_t i = chunks_before; i < p.mt->nchunks; ++i) {
+        const mt_chunk_t *c = &p.mt->chunks[i];
+        if (c->len == PAYLOAD_LEN && c->head[0] == PAYLOAD_TAG) {
+            MOQ_TEST_CHECK_EQ_U64(c->sid, bsid);
+            payloads++;
+        }
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(payloads, !same_stream && !connection_barrier ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT((int)st->writes_after_reset, 0);
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(p.pub_br));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+done:
+    pair_destroy(&p);
+    printf("retained pending d%d same=%d connection_barrier=%d failures=%d\n",
+           draft_of(ver), (int)same_stream, (int)connection_barrier, failures - before);
+}
+
+static void test_retained_cancellation(void)
+{
+    static const uint64_t caps[] = { 4096, 1, MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT };
+    for (size_t v = 0; v < N_VERSIONS; ++v)
+        for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); ++c)
+            for (unsigned peer = 0; peer < 2; ++peer)
+                for (unsigned tail = 0; tail < 2; ++tail)
+                    retained_cancel_row(k_versions[v], caps[c], peer != 0,
+                                        tail != 0, false, false);
+    for (size_t v = 0; v < N_VERSIONS; ++v)
+        for (unsigned reliable = 0; reliable < 2; ++reliable) {
+            retained_cancel_row(k_versions[v], MOQ_TRANSPORT_BRIDGE_RETAINED_DEFAULT,
+                                false, true, true, reliable != 0);
+            retained_header_row(k_versions[v], reliable != 0);
+        }
+    for (size_t v = 0; v < N_VERSIONS; ++v)
+        for (unsigned refused = 0; refused < 2; ++refused) {
+            retained_owed_row(k_versions[v], false, refused != 0);
+            if (k_versions[v] != MOQ_VERSION_DRAFT_16)
+                retained_owed_row(k_versions[v], true, refused != 0);
+        }
+    for (size_t v = 0; v < N_VERSIONS; ++v)
+        for (unsigned same = 0; same < 2; ++same)
+            retained_pending_row(k_versions[v], same != 0, false);
+    retained_pending_row(MOQ_VERSION_DRAFT_16, false, true);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--fill-order") == 0) {
+        test_fill_order();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--fetch-priority") == 0) {
+        test_fetch_scheduling();
+        test_fetch_update();
+        test_fetch_priority_boundary();
+        test_fetch_priority_payload_retry();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--retention-cancel") == 0) {
+        test_retained_cancellation();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--fin-done") == 0) {
+        test_normal_fin_before_done();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--retained-expiry") == 0) {
+        test_retained_expiry();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--expiry-successors") == 0) {
+        test_expiry_successors();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--expiry-r1") == 0) {
+        test_expiry_review(1);
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--expiry-r2") == 0) {
+        test_expiry_review(2);
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--expiry-r3") == 0) {
+        test_expiry_review(3);
+        return failures ? 1 : 0;
+    }
+    if (argc != 1) return 2;
     test_group_order_wire();
     test_priorities_across_tracks();
     test_rules_within_track();
@@ -1848,6 +4305,9 @@ int main(void)
     test_publication_update();
     test_fetch_scheduling();
     test_fetch_update();
+    test_fetch_priority_boundary();
+    test_fetch_priority_payload_retry();
+    test_fill_order();
     test_control_not_behind_data();
     test_stop_sending_one_stream();
     test_unsubscribe_resets_pending();
@@ -1857,6 +4317,13 @@ int main(void)
     test_key_moves_with_its_stream();
     test_fetch_cancel_resets();
     test_done_with_pending();
+    test_normal_fin_before_done();
+    test_retained_expiry();
+    test_expiry_successors();
+    test_expiry_review(1);
+    test_expiry_review(2);
+    test_expiry_review(3);
+    test_retained_cancellation();
     if (failures) {
         fprintf(stderr, "test_scheduling: %d failure(s)\n", failures);
         return 1;

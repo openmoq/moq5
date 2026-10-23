@@ -1641,6 +1641,14 @@ static bool fetch_deferred_end_allowed(const moq_fetch_entry_t *e,
     return true;
 }
 
+/* Classify only the first bytes of a fresh stream, through its profile. */
+bool bridge_session_is_fetch_header(
+    const moq_session_t *s, const moq_send_data_action_t *data)
+{
+    return s->profile->classify_data_stream(data->header, data->header_len) ==
+        MOQ_STREAM_KIND_FETCH;
+}
+
 /* A FETCH response stream's key: its single stream needs no group order.
  * The publisher priority is a placeholder; each object's travels in its
  * SEND_DATA scheduling_priority. */

@@ -64,10 +64,8 @@ int main(void)
     assert(moq_pq_send_queue_push_copy(q, 1, big, 1, false) == 0);
     moq_pq_send_queue_destroy(q);
 
-    /* A newly opened keyed stream starts only while at most 127 keyed
-     * streams hold bytes (ranks 0 through 126, levels 2 through 254), so
-     * distinct keys keep distinct levels; a stream that already started is
-     * never held back. */
+    /* More than 127 distinct keys remain admissible within the byte budget.
+     * Excess ranks share level 254; existing bytes and control keep moving. */
     memset(observed, 0xff, sizeof(observed));
     q = moq_pq_send_queue_create(&alloc, 0);
     assert(q);
@@ -79,7 +77,7 @@ int main(void)
     }
     assert(moq_pq_send_queue_opened(q, 508) == 0);
     assert(moq_pq_send_queue_set_key(q, 508, 0x10000 + 127) == 0);
-    assert(moq_pq_send_queue_push_copy(q, 508, &byte, 1, false) == 0);
+    assert(moq_pq_send_queue_push_copy(q, 508, &byte, 1, false) == 1);
     assert(moq_pq_send_queue_push_copy(q, 0, &byte, 1, false) == 1);
     assert(moq_pq_send_queue_push_copy(q, 2, &byte, 1, false) == 1);
     size_t nb = 0;
@@ -93,13 +91,13 @@ int main(void)
     assert(moq_pq_send_queue_push_copy(q, 0, NULL, 0, true) == 1);
     assert(moq_pq_send_queue_opened(q, 512) == 0);
     assert(moq_pq_send_queue_set_key(q, 512, 0x10000 + 128) == 0);
-    assert(moq_pq_send_queue_push_copy(q, 512, &byte, 1, false) == 0);
+    assert(moq_pq_send_queue_push_copy(q, 512, &byte, 1, false) == 1);
     assert(moq_pq_send_queue_apply_priorities(q, apply, NULL) == 0);
     for (unsigned i = 1; i < 127; ++i)
         assert(observed[4 * i] == 2 + 2 * i);
     assert(observed[0] == 2 && observed[508] == 254);
     assert(observed[2] == 0);
-    assert(observed[512] == 0xff);   /* refused: never ranked */
+    assert(observed[512] == 254);
     moq_pq_send_queue_destroy(q);
     return 0;
 }

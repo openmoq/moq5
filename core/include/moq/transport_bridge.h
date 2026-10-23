@@ -634,7 +634,11 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_stop_sending(
 /*
  * The endpoint holds no more bytes of local data stream `stream_id` (its send
  * queue emptied). After the FIN the stream leaves the priority order;
- * otherwise its next write sets its key again. Without
+ * otherwise its next write sets its key again. A queued FETCH object whose
+ * publisher priority differs from the held objects becomes eligible now;
+ * a draft-22 fill also waits when its group changes. Objects in the same
+ * scheduling class may be handed over together. This is local send
+ * queue exhaustion, not peer acknowledgment. Without
  * MOQ_TRANSPORT_CAP_STREAM_DRAINED the bridge keys every write and drops the
  * stream from the order at the FIN. Its peers move up, so it may call
  * set_stream_priority for them before it returns.

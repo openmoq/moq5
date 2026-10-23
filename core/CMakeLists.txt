@@ -42,6 +42,7 @@ add_library(moq-core
     src/facade/publisher.c
     src/facade/subscriber.c
     src/bridge/transport_bridge.c
+    src/bridge/stream_order.c
     src/url.c
 )
 
@@ -107,6 +108,7 @@ if(MOQ_BUILD_TESTS OR MOQ_BUILD_FUZZ)
         src/session/session_fill.c src/session/location_d22.c
         src/facade/publisher.c src/facade/subscriber.c
         src/bridge/transport_bridge.c
+        src/bridge/stream_order.c
         src/url.c
     )
     target_include_directories(moq-core-test-internals
