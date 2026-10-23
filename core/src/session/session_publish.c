@@ -1577,6 +1577,14 @@ moq_result_t moq_session_publish(moq_session_t *s,
                              s->send_cap - s->send_len);
 
         moq_result_t rc2 = s->profile->encode_publish(s, &w, &args);
+        if (rc2 == MOQ_ERR_BUFFER && s->send_len > 0) {
+            moq_buf_writer_t probe;
+            rc2 = send_probe_begin(s, &probe);
+            if (rc2 == MOQ_OK) {
+                rc2 = s->profile->encode_publish(s, &probe, &args);
+                rc2 = send_probe_end(s, &probe, rc2);
+            }
+        }
         if (rc2 < 0) {
             track_hist_release(s, phist);
             s->profile->abort_request(s, &req_ep);

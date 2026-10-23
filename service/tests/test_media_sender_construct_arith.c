@@ -29,8 +29,10 @@
  * White-box: links moq-service-sender-test-internals (MOQ_MEDIA_SENDER_TESTING).
  */
 #include <moq/media_sender.h>
+#include <moq/media_auth.h>
 #include <moq/msf.h>
 #include "test_support.h"
+#include "media_sender_auth_old_layout.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -488,6 +490,130 @@ static void test_b9_ilp32_boundary_ring_product_wrap(void)
 }
 #endif
 
+static void auth_outcome(void *ctx, const moq_media_auth_outcome_info_t *info)
+{
+    (void)ctx; (void)info;
+    ROW("auth", "no_construction_callback", false);
+}
+
+static void test_auth_old_allocation(void)
+{
+    union {
+        sender_old_cfg_t alignment;
+        unsigned char bytes[sizeof(sender_old_cfg_t) + 16];
+    } storage;
+    void (*const initializers[])(moq_media_sender_cfg_t *, size_t) = {
+        moq_media_sender_cfg_init_sized,
+        moq_media_sender_cfg_init_live_sized,
+        moq_media_sender_cfg_init_lossless_sized
+    };
+    const moq_bytes_t parts[] = {{NS0, 4}};
+    for (size_t i = 0; i < sizeof(initializers) / sizeof(initializers[0]); ++i) {
+        memset(&storage, 0xa5, sizeof(storage));
+        moq_media_sender_cfg_t *cfg = (moq_media_sender_cfg_t *)(void *)storage.bytes;
+        initializers[i](cfg, sizeof(sender_old_cfg_t));
+        sender_old_cfg_t old;
+        memcpy(&old, storage.bytes, sizeof(old));
+        ROW("auth.old", "stamp", old.struct_size == sizeof(old));
+        ROW("auth.old", "validation_default", old.validate_cmaf);
+        ROW("auth.old", "companion_default", old.companion_profile == SENDER_OLD_COMPANION_AUTO);
+        ROW("auth.old", "preset", (int)old.backpressure == (i == 0 ?
+            MOQ_MEDIA_SEND_BP_UNSET : i == 1 ? MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME :
+            MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT));
+        old.namespace_.parts = parts;
+        old.namespace_.count = 1;
+        old.backpressure = SENDER_OLD_BP_DROP_TO_KEYFRAME;
+        memcpy(storage.bytes, &old, sizeof(old));
+        /* Poison any old tail padding independently of the initializer. */
+        size_t end = offsetof(sender_old_cfg_t, companion_profile) +
+                     sizeof(old.companion_profile);
+        memset(storage.bytes + end, 0xa5, sizeof(old) - end);
+        unsigned char before[sizeof(storage.bytes)];
+        memcpy(before, storage.bytes, sizeof(before));
+        arm(-1);
+        moq_media_sender_t *s = NULL;
+        ROW("auth.old", "anonymous", moq_media_sender_test_construct(cfg, &s) == MOQ_OK);
+        ROW("auth.old", "no_auth_allocation", g_ledger.requests == EXPECTED_REQUESTS);
+        if (s) moq_media_sender_test_free(s);
+        ROW("auth.old", "balanced", outstanding() == 0 && ledger_clean());
+        disarm();
+        ROW("auth.old", "input_preserved", memcmp(before, storage.bytes, sizeof(before)) == 0);
+        for (size_t n = sizeof(old); n < sizeof(storage.bytes); ++n)
+            ROW("auth.old", "initializer_canary", storage.bytes[n] == 0xa5);
+    }
+}
+
+static void test_auth_construction(void)
+{
+    moq_bytes_t parts[] = {{NS0, 4}};
+    moq_media_sender_cfg_t cfg;
+    base_cfg(&cfg, parts, 1);
+    moq_media_auth_cfg_t auth;
+    moq_media_auth_cfg_init(&auth);
+    cfg.resource_auth = &auth;
+    expect_refused(&cfg, "auth.invalid_source");
+    expect_refused_public(&cfg, "auth.invalid_source");
+
+    uint8_t bytes[] = {0x80, 0, 0xff};
+    moq_auth_token_t token = {7, {bytes, sizeof(bytes)}};
+    auth.tokens = &token;
+    auth.token_count = 1;
+    auth.on_outcome = auth_outcome;
+    for (int at = 0; at < EXPECTED_REQUESTS + 1; ++at) {
+        arm_once(at);
+        moq_media_sender_t *s = NULL;
+        moq_result_t rc = moq_media_sender_test_construct(&cfg, &s);
+        ROW("auth.nomem", "refused", rc == MOQ_ERR_NOMEM && !s);
+        if (s) moq_media_sender_test_free(s);
+        ROW("auth.nomem", "balanced", outstanding() == 0 && ledger_clean());
+        disarm();
+    }
+    arm(-1);
+    moq_media_sender_t *s = NULL;
+    ROW("auth.copy", "constructed", moq_media_sender_test_construct(&cfg, &s) == MOQ_OK);
+    ROW("auth.copy", "one_static_copy", g_ledger.requests == EXPECTED_REQUESTS + 1);
+    if (s) moq_media_sender_test_free(s);
+    ROW("auth.copy", "balanced", outstanding() == 0 && ledger_clean());
+    disarm();
+
+    /* The copied source is released on both wrong-ownership-mode exits. */
+    arm(-1);
+    moq_media_sender_t *out = (moq_media_sender_t *)(uintptr_t)1;
+    ROW("auth.create", "missing_endpoint", moq_media_sender_create(&cfg, &out) == MOQ_ERR_INVAL);
+    ROW("auth.create", "out_null", out == NULL);
+    ROW("auth.create", "only_static_copy", g_ledger.requests == 1);
+    ROW("auth.create", "balanced", outstanding() == 0 && ledger_clean());
+    disarm();
+    moq_endpoint_t *ep = moq_endpoint_test_make_bare();
+    ROW("auth.attach", "bare_endpoint", ep != NULL);
+    if (ep) {
+        cfg.endpoint = (const moq_endpoint_cfg_t *)(uintptr_t)1;
+        arm(-1);
+        out = (moq_media_sender_t *)(uintptr_t)1;
+        ROW("auth.attach", "owns_endpoint", moq_media_sender_attach(ep, &cfg, &out) == MOQ_ERR_INVAL);
+        ROW("auth.attach", "out_null", out == NULL);
+        ROW("auth.attach", "no_attachment", moq_endpoint_test_attachments(ep) == 0);
+        ROW("auth.attach", "only_static_copy", g_ledger.requests == 1);
+        ROW("auth.attach", "balanced", outstanding() == 0 && ledger_clean());
+        disarm();
+        cfg.endpoint = NULL;
+        moq_endpoint_test_free_bare(ep);
+    }
+    /* A partial pointer is absent, even when its backing bytes are poison. */
+    cfg.resource_auth = (const moq_media_auth_cfg_t *)(uintptr_t)1;
+    memset(cfg._reserved_companion_profile, 0xa5, sizeof(cfg._reserved_companion_profile));
+    for (size_t n = sizeof(sender_old_cfg_t);
+         n < offsetof(moq_media_sender_cfg_t, resource_auth) + sizeof(cfg.resource_auth); ++n) {
+        cfg.struct_size = (uint32_t)n;
+        arm(-1);
+        moq_media_sender_t *s = NULL;
+        ROW("auth.partial", "anonymous", moq_media_sender_test_construct(&cfg, &s) == MOQ_OK);
+        if (s) moq_media_sender_test_free(s);
+        ROW("auth.partial", "balanced", outstanding() == 0 && ledger_clean());
+        disarm();
+    }
+}
+
 int main(void)
 {
     test_b1_queue_objects_ring_wrap();
@@ -499,6 +625,8 @@ int main(void)
     test_b7_public_attach_counts();
     test_b8_nomem_once_unwinds_exactly();
     test_b8_nomem_from_here_unwinds_exactly();
+    test_auth_old_allocation();
+    test_auth_construction();
 #if SIZE_MAX > 0xFFFFFFFFu
     test_b9_boundary_ring_reaches_exact_nominated_request();
     fprintf(stderr, "sender_construct_arith: LP64 build; ILP32 size_t product-wrap rows NOT executed (qualification gap)\n");

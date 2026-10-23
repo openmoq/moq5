@@ -398,6 +398,12 @@ typedef struct moq_sub_update_cfg {
     uint32_t               reserved;
     uint64_t               object_delivery_timeout_ms;
     uint64_t               subgroup_delivery_timeout_ms;
+    /* Appended after the complete D22 timeout block: subscription-update
+     * credentials (D16/D18/D22), borrowed for the call and encoded before
+     * success. Use the sized initializer. An absent pair means anonymous;
+     * a size ending inside the pointer/count pair is INVAL. */
+    const moq_auth_token_t *auth_tokens;
+    size_t                 auth_token_count;
 } moq_sub_update_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen v0 prefix
@@ -797,9 +803,30 @@ typedef struct moq_sub_joining_fetch_cfg {
     moq_group_order_t group_order;
     bool              has_subscriber_priority;
     uint8_t           subscriber_priority;
+    /* FETCH credentials (D16/D18), borrowed for the call and encoded before
+     * success. D22 retains its UNSUPPORTED joining-fetch result. The aligned
+     * append preserves the previous allocation including its tail padding.
+     * An absent pair means anonymous; a partial pair is INVAL. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *auth_tokens;
+    size_t                 auth_token_count;
 } moq_sub_joining_fetch_cfg_t;
 
+#define MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE \
+    offsetof(moq_sub_joining_fetch_cfg_t, auth_tokens)
+
+/* Zero/stamp only the frozen prefix through subscriber_priority, including
+ * its trailing padding. Auth fields stay disabled. Safe for old allocations. */
 MOQ_API void moq_sub_joining_fetch_cfg_init(moq_sub_joining_fetch_cfg_t *cfg);
+
+/* Zero/stamp min(cfg_size, sizeof current struct). No write if NULL or size
+ * cannot hold struct_size. Required to enable the credential tail. */
+MOQ_API void moq_sub_joining_fetch_cfg_init_sized(moq_sub_joining_fetch_cfg_t *cfg,
+                                               size_t cfg_size);
 
 MOQ_API moq_result_t moq_sub_joining_fetch(
     moq_subscriber_t *sub,

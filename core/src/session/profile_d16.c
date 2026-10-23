@@ -3653,7 +3653,7 @@ static moq_result_t d16_encode_subscribe(moq_session_t *s,
 
     if (param_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_subscribe(w, args->request_id,
         &args->track_namespace, args->track_name, params, param_count);
@@ -3773,9 +3773,12 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
     size_t scratch_saved = s->output_scratch_len;
 
     if (args->auth_token_count > 0) {
-        if (args->auth_token_count > D16_MAX_MSG_PARAMS - 5)
-            return MOQ_ERR_INVAL;
-        params_cap = args->auth_token_count + 5;
+        size_t extra_count = (size_t)args->has_delivery_timeout +
+            (size_t)args->has_forward + (size_t)args->has_subscriber_priority +
+            (size_t)args->has_filter + (size_t)args->has_new_group_request;
+        if (args->auth_token_count > D16_MAX_MSG_PARAMS - extra_count)
+            return MOQ_ERR_BUFFER;
+        params_cap = args->auth_token_count + extra_count;
         params = (moq_kvp_entry_t *)scratch_alloc_aligned(
             s, params_cap * sizeof(moq_kvp_entry_t),
             _Alignof(moq_kvp_entry_t));
@@ -3896,7 +3899,7 @@ static moq_result_t d16_encode_publish_namespace_op(moq_session_t *s,
     }
     if (tok_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_publish_namespace(w, args->request_id,
         &args->track_namespace, params, tok_count);
@@ -3969,7 +3972,7 @@ static moq_result_t d16_encode_publish_op(moq_session_t *s,
 
     if (param_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
 
     moq_d16_publish_t pub = {
@@ -4152,7 +4155,7 @@ static moq_result_t d16_encode_track_status_op(moq_session_t *s,
     }
     if (tok_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_track_status(w, args->request_id,
         &args->track_namespace, args->track_name, params, tok_count);
@@ -4404,7 +4407,7 @@ static moq_result_t d16_encode_subscribe_namespace(
     }
     if (tok_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_subscribe_namespace(
         w, args->request_id, &args->prefix,
@@ -4771,7 +4774,7 @@ static moq_result_t d16_encode_fetch(moq_session_t *s,
     };
     if (param_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_fetch(w, &fetch, params, param_count);
     s->output_scratch_len = scratch_saved;

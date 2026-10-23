@@ -1167,6 +1167,14 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
             .auth_token_count = auth_token_count,
         };
         moq_result_t rc2 = s->profile->encode_publish_namespace(s, &w, &pn_args);
+        if (rc2 == MOQ_ERR_BUFFER && s->send_len > 0) {
+            moq_buf_writer_t probe;
+            rc2 = send_probe_begin(s, &probe);
+            if (rc2 == MOQ_OK) {
+                rc2 = s->profile->encode_publish_namespace(s, &probe, &pn_args);
+                rc2 = send_probe_end(s, &probe, rc2);
+            }
+        }
         if (rc2 < 0) {
             if (nid) s->alloc.free(nid, nid_len, s->alloc.ctx);
             s->profile->abort_request(s, &req_ep);

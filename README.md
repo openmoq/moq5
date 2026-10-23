@@ -115,6 +115,9 @@ See [`examples/service/README.md`](examples/service/README.md) for the full
 contract, examples (`media_receive.c` / `media_send.c`), and build/consume
 instructions.
 
+For per-resource credentials, see [`docs/service-auth.md`](docs/service-auth.md).
+Endpoint SETUP credentials and resource credentials are configured separately.
+
 ## Transport adapters
 
 All adapters share the transport bridge and a common conformance suite

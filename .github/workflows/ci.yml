@@ -159,7 +159,7 @@ jobs:
       - name: Deterministic service tests (incl. C/C++ consumers)
         run: >
           ctest --test-dir build/service-surface --output-on-failure
-          -R 'media_sender_catalog|media_sender_lifecycle|media_sender_pacing|media_sender_priority|media_track_cfg_init|service_consumer_cxx|endpoint_resolve|media_receiver_scripted|media_catalog_update|media_receiver_completion'
+          -R 'media_auth|media_sender_auth|media_receiver_auth|media_sender_catalog|media_sender_lifecycle|media_sender_pacing|media_sender_priority|media_track_cfg_init|service_consumer_cxx|endpoint_resolve|media_receiver_scripted|media_catalog_update|media_receiver_completion'
 
       - name: Shared service build + initializer symbol check
         run: |
@@ -172,13 +172,13 @@ jobs:
           cmake --build build/service-surface-shared -j3
           lib="$(find build/service-surface-shared/service -name 'libmoq-service.so*' -type f -print -quit)"
           test -n "$lib"
-          for sym in moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized moq_media_track_cfg_init moq_media_track_cfg_init_sized; do
+          for sym in moq_media_auth_cfg_init_sized moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized moq_media_track_cfg_init moq_media_track_cfg_init_sized; do
             nm -D --defined-only "$lib" | grep -q " $sym\$" ||
               { echo "missing export: $sym"; exit 1; }
           done
           core="$(find build/service-surface-shared/core -name 'libmoq-core.so*' -type f -print -quit)"
           test -n "$core"
-          for sym in moq_pub_callbacks_init_sized moq_pub_object_cfg_init_sized moq_pub_begin_object_cfg_init_sized; do
+          for sym in moq_pub_callbacks_init_sized moq_pub_object_cfg_init_sized moq_pub_begin_object_cfg_init_sized moq_sub_joining_fetch_cfg_init_sized; do
             nm -D --defined-only "$core" | grep -q " $sym\$" ||
               { echo "missing core export: $sym"; exit 1; }
           done

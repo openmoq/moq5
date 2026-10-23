@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f3dca409f1ff (native headers modified in the worktree)
+// libmoq commit: 71559817a129 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -266,6 +266,23 @@ pub const MOQ_MEDIA_DROP_UNSUPPORTED_MULTI_SAMPLE: u32 = 5;
 pub const MOQ_MEDIA_DROP_STALE: u32 = 6;
 pub const MOQ_MEDIA_DROP_KEYFRAME_WAIT: u32 = 7;
 pub const MOQ_MEDIA_DROP_MALFORMED_MPEG2TS: u32 = 8;
+pub const MOQ_MEDIA_AUTH_ACTION_NONE: u32 = 0;
+pub const MOQ_MEDIA_AUTH_ACTION_PUBLISH_NAMESPACE: u32 = 1;
+pub const MOQ_MEDIA_AUTH_ACTION_PUBLISH: u32 = 2;
+pub const MOQ_MEDIA_AUTH_ACTION_SUBSCRIBE: u32 = 3;
+pub const MOQ_MEDIA_AUTH_ACTION_FETCH: u32 = 4;
+pub const MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE: u32 = 5;
+pub const MOQ_MEDIA_AUTH_OUTCOME_NONE: u32 = 0;
+pub const MOQ_MEDIA_AUTH_OUTCOME_POLICY_DENIED: u32 = 1;
+pub const MOQ_MEDIA_AUTH_OUTCOME_SELECTOR_ERROR: u32 = 2;
+pub const MOQ_MEDIA_AUTH_OUTCOME_INVALID_SELECTION: u32 = 3;
+pub const MOQ_MEDIA_AUTH_OUTCOME_TOKEN_LIMIT: u32 = 4;
+pub const MOQ_MEDIA_AUTH_OUTCOME_TOKEN_COPY_FAILED: u32 = 5;
+pub const MOQ_MEDIA_AUTH_OUTCOME_UNSUPPORTED_PROFILE: u32 = 6;
+pub const MOQ_MEDIA_AUTH_SCOPE_NONE: u32 = 0;
+pub const MOQ_MEDIA_AUTH_SCOPE_SERVICE: u32 = 1;
+pub const MOQ_MEDIA_AUTH_SCOPE_TRACK: u32 = 2;
+pub const MOQ_MEDIA_AUTH_SCOPE_REQUEST: u32 = 3;
 pub const MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE: u32 = 1;
 pub const MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED: u32 = 2;
 pub const MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED: u32 = 3;
@@ -970,7 +987,7 @@ pub struct moq_session_cfg {
     pub max_namespace_suffixes_per_subscription: u32,
     #[doc = " Reserved: the 4 bytes of tail padding the layout that ended at\n max_namespace_suffixes_per_subscription left before its old sizeof on\n ABIs that align this struct to 8 bytes. setup_auth_tokens is placed AFTER\n this slot so its struct_size gate lands at or past that old sizeof on\n every ABI. This field must never become a readable config field."]
     pub _reserved_setup_auth: u32,
-    #[doc = " Appended (ABI-additive): authorization tokens this side presents in\n its SETUP, the AUTHORIZATION TOKEN Setup Option (draft-22 §9.1.4,\n draft-18 §10.3.1.4) or setup parameter (draft-16 §9.3.1.5), which the\n peer can use to authorize the session. Each is sent by value: nothing\n can be registered before the session exists. The tokens and their values are\n copied by moq_session_create; the caller's storage need not outlive\n the call. At most 16 tokens, each token_type within the version's\n encoding (at most 2^62-1 on draft-16, any uint64 on draft-18 and\n draft-22) and each value at most 65535 bytes, and together they must\n fit the setup message\n (MOQ_ERR_INVAL at create otherwise). Read only when struct_size covers\n setup_auth_token_count; older callers send none.\n\n Send-arena rule: the SETUP is queued in the send arena\n (send_buffer_size) when the session starts, and each token takes its\n value plus up to 32 bytes there, beside the other setup fields. The\n facades that carry these tokens check that rule when they are created,\n so a set that cannot be queued fails there rather than at start."]
+    #[doc = " Appended (ABI-additive): authorization tokens this side presents in\n its SETUP, the AUTHORIZATION TOKEN Setup Option (draft-22 §9.1.4,\n draft-18 §10.3.1.4) or setup parameter (draft-16 §9.3.1.5), which the\n peer can use to authorize the session. Each is sent by value: nothing\n can be registered before the session exists. The tokens and their values are\n copied by moq_session_create; the caller's storage need not outlive\n the call. At most 16 tokens, each token_type within the version's\n encoding (at most 2^62-1 on draft-16, including zero/default version;\n any uint64_t on draft-18 and\n draft-22) and each value at most 65535 bytes, and together they must\n fit the setup message\n (MOQ_ERR_INVAL at create otherwise). Read only when struct_size covers\n setup_auth_token_count; older callers send none.\n\n Send-arena rule: the SETUP is queued in the send arena\n (send_buffer_size) when the session starts, and each token takes its\n value plus up to 32 bytes there, beside the other setup fields. The\n facades that carry these tokens check that rule when they are created,\n so a set that cannot be queued fails there rather than at start."]
     pub setup_auth_tokens: *const moq_auth_token_t,
     pub setup_auth_token_count: usize,
     #[doc = " Appended (ABI-additive): the fill pool, the children a subscription may\n have open on either side at once, independent of the FETCH pool. 0\n selects the library default (16); the maximum is 65536. Read only when\n struct_size covers this field; older callers get the default."]
@@ -10525,16 +10542,160 @@ unsafe extern "C" {
 }
 #[repr(C)]
 #[derive(Debug)]
-pub struct moq_media_sender {
-    _unused: [u8; 0],
-}
-pub type moq_media_sender_t = moq_media_sender;
-#[repr(C)]
-#[derive(Debug)]
 pub struct moq_media_track {
     _unused: [u8; 0],
 }
 pub type moq_media_track_t = moq_media_track;
+#[doc = " Open action set. Unknown actions must be denied. Resource credentials are\n independent of SETUP credentials; no alias management or token verification\n is performed by this interface."]
+pub type moq_media_auth_action_t = u32;
+pub const MOQ_MEDIA_AUTH_DENY: moq_media_auth_decision = 0;
+pub const MOQ_MEDIA_AUTH_ALLOW: moq_media_auth_decision = 1;
+pub type moq_media_auth_decision = ::std::os::raw::c_uint;
+pub use self::moq_media_auth_decision as moq_media_auth_decision_t;
+#[doc = " Library-stamped, callback-duration borrowed identity. Namespace publication\n has an empty track_name; other actions name the actual resource, including\n catalog and generated tracks."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct moq_media_auth_request {
+    pub struct_size: u32,
+    pub action: moq_media_auth_action_t,
+    pub track_namespace: moq_namespace_t,
+    pub track_name: moq_bytes_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_media_auth_request"][::std::mem::size_of::<moq_media_auth_request>() - 40usize];
+    ["Alignment of moq_media_auth_request"]
+        [::std::mem::align_of::<moq_media_auth_request>() - 8usize];
+    ["Offset of field: moq_media_auth_request::struct_size"]
+        [::std::mem::offset_of!(moq_media_auth_request, struct_size) - 0usize];
+    ["Offset of field: moq_media_auth_request::action"]
+        [::std::mem::offset_of!(moq_media_auth_request, action) - 4usize];
+    ["Offset of field: moq_media_auth_request::track_namespace"]
+        [::std::mem::offset_of!(moq_media_auth_request, track_namespace) - 8usize];
+    ["Offset of field: moq_media_auth_request::track_name"]
+        [::std::mem::offset_of!(moq_media_auth_request, track_name) - 24usize];
+};
+impl Default for moq_media_auth_request {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Library-stamped, callback-duration borrowed identity. Namespace publication\n has an empty track_name; other actions name the actual resource, including\n catalog and generated tracks."]
+pub type moq_media_auth_request_t = moq_media_auth_request;
+#[doc = " Synchronous only. Scratch capacity is 16; count starts at zero and decision\n at DENY. OK+DENY ignores all token outputs. OK+ALLOW requires 1..16 unique\n (type, value) pairs. Values are opaque binary, including empty values;\n NULL data is valid only with zero length. Limits: 16 KiB/value and 32 KiB\n aggregate value bytes. D16 types fit 62 bits; D18/D22 types fit uint64_t.\n Opaque values and unique pairs follow draft-ietf-moq-transport-16 section\n 9.2.2.1, draft-ietf-moq-transport-18 section 10.2.2 and\n draft-ietf-moq-transport-22 section 8.9. The count/byte budgets\n and synchronous policy are service limits, not wire requirements.\n\n Returned bytes remain application-owned and valid until the next selection\n for this owner or owner destruction. Never return callback-stack storage.\n The library copies before the next selection or service pump return and\n retains that copy across transient request-admission retries. Replacement\n or cancellation of an unsent intent discards its selection.\n\n WOULD_BLOCK and nonnegative non-OK results are invalid selection, not async\n retry. Other negative results are terminal selector errors. No configured\n source can select anonymous access; ALLOW with zero tokens is invalid.\n\n Both callbacks run on the endpoint network thread, with endpoint mutex held\n and outside service-private locks. No blocking, issuer I/O, endpoint/service/\n facade reentry (including queries), or C++ exceptions across C. Shared\n context locks must not be held by a thread waiting on the endpoint thread."]
+pub type moq_media_auth_select_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut ::std::os::raw::c_void,
+        request: *const moq_media_auth_request_t,
+        out_tokens: *mut moq_auth_token_t,
+        token_capacity: usize,
+        out_token_count: *mut usize,
+        out_decision: *mut moq_media_auth_decision_t,
+    ) -> moq_result_t,
+>;
+pub type moq_media_auth_outcome_t = u32;
+pub type moq_media_auth_scope_t = u32;
+#[doc = " Borrowed callback input; contains no token bytes. Switch on outcome, not\n result: POLICY_DENIED has result MOQ_OK, which is not successful admission.\n Unknown outcomes/scopes are not success. Scope determines effect, not track:\n track is a real public handle, or NULL for private/generated resources.\n request always identifies the failed operation exactly."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct moq_media_auth_outcome_info {
+    pub struct_size: u32,
+    pub scope: moq_media_auth_scope_t,
+    pub outcome: moq_media_auth_outcome_t,
+    pub track: *mut moq_media_track_t,
+    pub request: *const moq_media_auth_request_t,
+    pub result: moq_result_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_media_auth_outcome_info"]
+        [::std::mem::size_of::<moq_media_auth_outcome_info>() - 40usize];
+    ["Alignment of moq_media_auth_outcome_info"]
+        [::std::mem::align_of::<moq_media_auth_outcome_info>() - 8usize];
+    ["Offset of field: moq_media_auth_outcome_info::struct_size"]
+        [::std::mem::offset_of!(moq_media_auth_outcome_info, struct_size) - 0usize];
+    ["Offset of field: moq_media_auth_outcome_info::scope"]
+        [::std::mem::offset_of!(moq_media_auth_outcome_info, scope) - 4usize];
+    ["Offset of field: moq_media_auth_outcome_info::outcome"]
+        [::std::mem::offset_of!(moq_media_auth_outcome_info, outcome) - 8usize];
+    ["Offset of field: moq_media_auth_outcome_info::track"]
+        [::std::mem::offset_of!(moq_media_auth_outcome_info, track) - 16usize];
+    ["Offset of field: moq_media_auth_outcome_info::request"]
+        [::std::mem::offset_of!(moq_media_auth_outcome_info, request) - 24usize];
+    ["Offset of field: moq_media_auth_outcome_info::result"]
+        [::std::mem::offset_of!(moq_media_auth_outcome_info, result) - 32usize];
+};
+impl Default for moq_media_auth_outcome_info {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " Borrowed callback input; contains no token bytes. Switch on outcome, not\n result: POLICY_DENIED has result MOQ_OK, which is not successful admission.\n Unknown outcomes/scopes are not success. Scope determines effect, not track:\n track is a real public handle, or NULL for private/generated resources.\n request always identifies the failed operation exactly."]
+pub type moq_media_auth_outcome_info_t = moq_media_auth_outcome_info;
+#[doc = " Exactly once on terminal local failure, after terminal state is latched and\n before ordinary service-close notification. Never invoked for success or\n construction failure. Notification allocates no memory. No peer rejection\n or delivery event is synthesized. Callback restrictions above also apply.\n\n INVALID_SELECTION -> INVAL (including duplicates, bad spans, empty ALLOW,\n excess count, invalid decision or selector WOULD_BLOCK/non-OK status).\n TOKEN_LIMIT -> INVAL for service byte budgets; BUFFER for lower-layer\n complete-message capacity (operational, not a caller-buffer sizing API).\n TOKEN_COPY_FAILED -> NOMEM; UNSUPPORTED_PROFILE -> UNSUPPORTED. An invalid\n token type for a supported profile is INVALID_SELECTION/INVAL instead.\n SELECTOR_ERROR preserves the selector's other negative result exactly."]
+pub type moq_media_auth_outcome_fn = ::std::option::Option<
+    unsafe extern "C" fn(
+        ctx: *mut ::std::os::raw::c_void,
+        info: *const moq_media_auth_outcome_info_t,
+    ),
+>;
+#[doc = " NULL source means anonymous resource requests, without callbacks. A non-NULL\n source requires the complete V0 prefix, on_outcome, and exactly one of:\n nonempty tokens/count with select == NULL, or NULL tokens/count == 0 with\n select != NULL. No empty configured source or anonymous fallback.\n\n Owner construction copies this config and all static descriptors/bytes.\n No cfg/static pointer survives construction; callback code and ctx remain\n borrowed until owner destruction. Validation/copy failure returns INVAL or\n NOMEM synchronously, attaches no owner, and invokes no outcome callback.\n Static type-width validation is deferred to the negotiated profile."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct moq_media_auth_cfg {
+    pub struct_size: u32,
+    pub ctx: *mut ::std::os::raw::c_void,
+    pub tokens: *const moq_auth_token_t,
+    pub token_count: usize,
+    pub select: moq_media_auth_select_fn,
+    pub on_outcome: moq_media_auth_outcome_fn,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_media_auth_cfg"][::std::mem::size_of::<moq_media_auth_cfg>() - 48usize];
+    ["Alignment of moq_media_auth_cfg"][::std::mem::align_of::<moq_media_auth_cfg>() - 8usize];
+    ["Offset of field: moq_media_auth_cfg::struct_size"]
+        [::std::mem::offset_of!(moq_media_auth_cfg, struct_size) - 0usize];
+    ["Offset of field: moq_media_auth_cfg::ctx"]
+        [::std::mem::offset_of!(moq_media_auth_cfg, ctx) - 8usize];
+    ["Offset of field: moq_media_auth_cfg::tokens"]
+        [::std::mem::offset_of!(moq_media_auth_cfg, tokens) - 16usize];
+    ["Offset of field: moq_media_auth_cfg::token_count"]
+        [::std::mem::offset_of!(moq_media_auth_cfg, token_count) - 24usize];
+    ["Offset of field: moq_media_auth_cfg::select"]
+        [::std::mem::offset_of!(moq_media_auth_cfg, select) - 32usize];
+    ["Offset of field: moq_media_auth_cfg::on_outcome"]
+        [::std::mem::offset_of!(moq_media_auth_cfg, on_outcome) - 40usize];
+};
+impl Default for moq_media_auth_cfg {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " NULL source means anonymous resource requests, without callbacks. A non-NULL\n source requires the complete V0 prefix, on_outcome, and exactly one of:\n nonempty tokens/count with select == NULL, or NULL tokens/count == 0 with\n select != NULL. No empty configured source or anonymous fallback.\n\n Owner construction copies this config and all static descriptors/bytes.\n No cfg/static pointer survives construction; callback code and ctx remain\n borrowed until owner destruction. Validation/copy failure returns INVAL or\n NOMEM synchronously, attaches no owner, and invokes no outcome callback.\n Static type-width validation is deferred to the negotiated profile."]
+pub type moq_media_auth_cfg_t = moq_media_auth_cfg;
+unsafe extern "C" {
+    #[doc = " Zero/stamp min(cfg_size, sizeof(*cfg)); NULL or a size too small for the\n leading struct_size causes no write. The zeroed cfg is not a valid source."]
+    pub fn moq_media_auth_cfg_init_sized(cfg: *mut moq_media_auth_cfg_t, cfg_size: usize);
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct moq_media_sender {
+    _unused: [u8; 0],
+}
+pub type moq_media_sender_t = moq_media_sender;
 #[doc = " creation fails: MOQ_ERR_INVAL"]
 pub const MOQ_MEDIA_SEND_BP_UNSET: moq_media_send_backpressure = 0;
 #[doc = " live default preset"]
@@ -10669,10 +10830,14 @@ pub struct moq_media_sender_cfg {
     pub catalog_refresh_interval_us: u64,
     #[doc = " Media companion. AUTO is the default: an absent or partially covered\n field, and every initializer that covers it (the _sized forms), select\n it. A zeroed field is LEGACY_MSF01_LOC01, not AUTO.\n\n Explicit companions are fixed at creation: LEGACY_MSF01_LOC01 requires\n negotiated D16/18 and D22_MSF01_LOC04_PUBLIC negotiated D22. A known\n mismatch reports UNSUPPORTED through write/wait and stats.last_error,\n never endpoint/session termination.\n\n AUTO resolves once, when the sender first observes a draft-16/18/22\n session, to the matching companion, and then behaves exactly as that\n companion (any other draft is UNSUPPORTED). Nothing is published before\n then, so the catalog and every object follow the resolved companion.\n Until it resolves, AUTO differs from an explicit companion in these\n ways only:\n   - Creation reads the wallclock Group-ID base described below, and\n     fails as D22_MSF01_LOC04_PUBLIC does when it cannot. Objects written\n     before resolution are numbered from it; resolving to legacy renumbers\n     them from 0, before any is sent.\n   - add_track accepts a CMAF track without init_data. If the sender then\n     resolves to draft 22 with such a track still registered, it reports\n     UNSUPPORTED (write/wait, stats.last_error) and publishes nothing\n     until those tracks are removed.\n   - write() accepts RAW objects (explicit D22 refuses writes before\n     D22 is observed). A RAW object's metadata tail, when present, is\n     validated and kept for draft 22 (an invalid one is INVAL); its\n     legacy timestamp must fit the narrowest draft (see\n     presentation_time_us).\n On draft 22, an AUTO sender's RAW object written without the metadata\n tail is not refused: it carries LOC-04 metadata generated from the typed\n fields. With has_capture_time, capture_time_us is an unscaled Timestamp\n (Unix-epoch microseconds, LOC-04 2.3.1.1). Otherwise\n presentation_time_us is media time: the Timestamp goes with a Timescale\n of 1000000 (2.3.1.2), so a receiver reads it as application media time,\n not a capture clock. On video a one-byte frame marking whose I bit is\n is_sync is added. A track whose track_properties carry a LOC-04\n Timescale (or do not parse as LOC-04 metadata) would make a receiver\n read every object's Timestamp at that scale, so on such a track a\n write with has_capture_time and no metadata tail is MOQ_ERR_INVAL\n whenever the object may go out as draft 22: once resolved to it, or\n before resolution when the endpoint offers draft 22. Explicit\n D22_MSF01_LOC04_PUBLIC still requires the tail. On drafts 16/18 the\n tail is ignored, as with LEGACY.\n\n D22_MSF01_LOC04_PUBLIC also selects its MSF-01 catalog: version\n \"draft-01\"; every track's init_data in the root initDataList,\n referenced by initRef (no per-track initData); a CMAF track without\n init_data refused by add_track (CMSF-01 3.1); an added track with\n init_data published as a full catalog, not a delta; and each track's\n Group IDs (media, generated timeline and catalog) starting at the\n wallclock milliseconds read when the sender is created, the\n best-effort approach MSF-01 6.1 suggests. It keeps a restarted\n publisher's IDs above its predecessor's only while the clock moves\n forward and no instance numbers groups faster than the clock; restart\n identity otherwise remains the application's responsibility. Creation\n fails with MOQ_ERR_INTERNAL when the clock cannot be read and with\n MOQ_ERR_LIMIT when the reading is above the largest Group ID the\n library writes (2^62 - 1, its object write-path bound on every\n profile). Group IDs never wrap: a write that would open a group past\n that ID, and an add_track / remove_track / convert_to_vod / complete\n whose catalog change would need one, return MOQ_ERR_LIMIT without\n taking ownership or changing state. The legacy companion keeps its\n catalog and Group IDs from 0. Unknown values fail creation with\n MOQ_ERR_INVAL."]
     pub companion_profile: moq_media_companion_profile_t,
+    #[doc = " Preserve the complete preceding allocation; never read."]
+    pub _reserved_companion_profile: [u8; 4usize],
+    #[doc = " Optional resource credentials, independent of endpoint SETUP tokens.\n Copied at construction, including all static token bytes. Selectors\n and local outcomes follow media_auth.h. Absent/partial/NULL means\n anonymous; a configured source never falls back to anonymous access.\n Use a sized initializer to enable this complete pointer field."]
+    pub resource_auth: *const moq_media_auth_cfg_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_sender_cfg"][::std::mem::size_of::<moq_media_sender_cfg>() - 184usize];
+    ["Size of moq_media_sender_cfg"][::std::mem::size_of::<moq_media_sender_cfg>() - 192usize];
     ["Alignment of moq_media_sender_cfg"][::std::mem::align_of::<moq_media_sender_cfg>() - 8usize];
     ["Offset of field: moq_media_sender_cfg::struct_size"]
         [::std::mem::offset_of!(moq_media_sender_cfg, struct_size) - 0usize];
@@ -10710,6 +10875,10 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_sender_cfg, catalog_refresh_interval_us) - 168usize];
     ["Offset of field: moq_media_sender_cfg::companion_profile"]
         [::std::mem::offset_of!(moq_media_sender_cfg, companion_profile) - 176usize];
+    ["Offset of field: moq_media_sender_cfg::_reserved_companion_profile"]
+        [::std::mem::offset_of!(moq_media_sender_cfg, _reserved_companion_profile) - 180usize];
+    ["Offset of field: moq_media_sender_cfg::resource_auth"]
+        [::std::mem::offset_of!(moq_media_sender_cfg, resource_auth) - 184usize];
 };
 impl Default for moq_media_sender_cfg {
     fn default() -> Self {
@@ -11472,10 +11641,14 @@ pub struct moq_media_receiver_cfg {
     #[doc = " Appended: the stream-terminal lane (moq_media_receiver_poll_stream_\n terminal), max_stream_terminals records deep (0 = 64). false (the\n default) keeps the lane, its intake rule and its records off; nothing\n else changes. Read as one block, only when struct_size covers\n surface_stream_terminals."]
     pub max_stream_terminals: u32,
     pub surface_stream_terminals: bool,
+    #[doc = " Preserve the complete preceding allocation; never read."]
+    pub _reserved_stream_terminals: [u8; 3usize],
+    #[doc = " Optional resource credentials, independent of endpoint SETUP tokens.\n Construction copies the source and static bytes. Selection/outcomes\n follow media_auth.h; absent/partial/NULL means anonymous. A configured\n source never falls back to anonymous access. A D22 SUBSCRIBE plus fill\n selects once for SUBSCRIBE, not a separate FETCH. Use a sized init."]
+    pub resource_auth: *const moq_media_auth_cfg_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_receiver_cfg"][::std::mem::size_of::<moq_media_receiver_cfg>() - 120usize];
+    ["Size of moq_media_receiver_cfg"][::std::mem::size_of::<moq_media_receiver_cfg>() - 128usize];
     ["Alignment of moq_media_receiver_cfg"]
         [::std::mem::align_of::<moq_media_receiver_cfg>() - 8usize];
     ["Offset of field: moq_media_receiver_cfg::struct_size"]
@@ -11512,6 +11685,10 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_receiver_cfg, max_stream_terminals) - 112usize];
     ["Offset of field: moq_media_receiver_cfg::surface_stream_terminals"]
         [::std::mem::offset_of!(moq_media_receiver_cfg, surface_stream_terminals) - 116usize];
+    ["Offset of field: moq_media_receiver_cfg::_reserved_stream_terminals"]
+        [::std::mem::offset_of!(moq_media_receiver_cfg, _reserved_stream_terminals) - 117usize];
+    ["Offset of field: moq_media_receiver_cfg::resource_auth"]
+        [::std::mem::offset_of!(moq_media_receiver_cfg, resource_auth) - 120usize];
 };
 impl Default for moq_media_receiver_cfg {
     fn default() -> Self {
@@ -12027,7 +12204,7 @@ pub const MOQ_MEDIA_TRACK_STATE_PAUSED_APP: moq_media_track_state = 3;
 pub const MOQ_MEDIA_TRACK_STATE_PAUSED_FLOW: moq_media_track_state = 4;
 #[doc = " ended (peer reject / end-of-track)"]
 pub const MOQ_MEDIA_TRACK_STATE_ENDED: moq_media_track_state = 5;
-#[doc = " local ACK retention, LIVE delivery\nor UPDATE admission failure;\nremains failed, never rearmed"]
+#[doc = " local ACK retention, LIVE delivery,\nUPDATE admission or credential failure;\nremains failed, never rearmed"]
 pub const MOQ_MEDIA_TRACK_STATE_FAILED: moq_media_track_state = 6;
 #[doc = " A track's current delivery state, for UI/status without inferring it from the\n event stream. The two pause states are distinct ON PURPOSE: PAUSED_APP is the\n application's own unsubscribe_track (it stays paused until the app re-enables);\n PAUSED_FLOW is automatic FLOW_CONTROL backpressure. D22 resumes when object\n depth and combined charged bytes (including an owned conversion) are both at\n or below floor-half of their effective max_objects/max_bytes thresholds.\n D16/18 retains object-depth-only resume, with no byte low-water condition.\n Collapsing them would hide that difference from a consumer\n and from resume logic."]
 pub type moq_media_track_state = ::std::os::raw::c_uint;
@@ -12917,6 +13094,9 @@ pub const MOQ_LOC_METADATA_PRESENT_MASK: u32 = 63;
 #[doc = " Frozen v0 floors of the sized records the service tier reads and writes."]
 pub const MOQ_ENDPOINT_CFG_V0_SIZE: usize = 128;
 pub const MOQ_ENDPOINT_TERMINAL_V0_SIZE: usize = 16;
+pub const MOQ_MEDIA_AUTH_REQUEST_V0_SIZE: usize = 40;
+pub const MOQ_MEDIA_AUTH_OUTCOME_INFO_V0_SIZE: usize = 36;
+pub const MOQ_MEDIA_AUTH_CFG_V0_SIZE: usize = 48;
 pub const MOQ_MEDIA_TRACK_CFG_V0_SIZE: usize = 200;
 pub const MOQ_MEDIA_SEND_OBJECT_V0_SIZE: usize = 72;
 pub const MOQ_MEDIA_RECEIVER_CFG_V0_SIZE: usize = 80;

@@ -45,6 +45,7 @@
 #include <moq/session.h>
 #include <moq/endpoint.h>
 #include <moq/media_object.h>
+#include <moq/media_auth.h>
 #include <moq/cmaf.h>
 #include <moq/msf.h>
 
@@ -187,6 +188,14 @@ typedef struct moq_media_receiver_cfg {
      * surface_stream_terminals. */
     uint32_t max_stream_terminals;
     bool     surface_stream_terminals;
+    /* Preserve the complete preceding allocation; never read. */
+    uint8_t  _reserved_stream_terminals[3];
+    /* Optional resource credentials, independent of endpoint SETUP tokens.
+     * Construction copies the source and static bytes. Selection/outcomes
+     * follow media_auth.h; absent/partial/NULL means anonymous. A configured
+     * source never falls back to anonymous access. A D22 SUBSCRIBE plus fill
+     * selects once for SUBSCRIBE, not a separate FETCH. Use a sized init. */
+    const moq_media_auth_cfg_t *resource_auth;
 } moq_media_receiver_cfg_t;
 
 /* Frozen v0 sizeof includes tail padding. Use the original embedded
@@ -873,8 +882,8 @@ typedef enum moq_media_track_state {
     MOQ_MEDIA_TRACK_STATE_PAUSED_APP,     /* disabled by unsubscribe_track */
     MOQ_MEDIA_TRACK_STATE_PAUSED_FLOW,    /* paused by FLOW_CONTROL backpressure */
     MOQ_MEDIA_TRACK_STATE_ENDED,          /* ended (peer reject / end-of-track) */
-    MOQ_MEDIA_TRACK_STATE_FAILED = 6      /* local ACK retention, LIVE delivery
-                                            or UPDATE admission failure;
+    MOQ_MEDIA_TRACK_STATE_FAILED = 6      /* local ACK retention, LIVE delivery,
+                                            UPDATE admission or credential failure;
                                             remains failed, never rearmed */
 } moq_media_track_state_t;
 

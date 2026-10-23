@@ -517,8 +517,9 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
             return MOQ_ERR_INVAL;
         for (size_t i = 0; i < cfg->setup_auth_token_count; i++) {
             const moq_auth_token_t *t = &cfg->setup_auth_tokens[i];
-            if (t->token_type > MOQ_QUIC_VARINT_MAX ||
-                (t->token_value.len && !t->token_value.data) ||
+            /* The selected session profile checks Token Type width after
+             * negotiation; D18/D22 carry every uint64_t via vi64. */
+            if ((t->token_value.len && !t->token_value.data) ||
                 t->token_value.len > UINT16_MAX)
                 return MOQ_ERR_INVAL;
         }

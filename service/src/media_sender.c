@@ -21,6 +21,7 @@
  */
 
 #include <moq/media_sender.h>
+#include "media_auth_internal.h"
 #include <moq/publisher.h>
 #include <moq/msf.h>
 #include <moq/loc.h>
@@ -139,6 +140,16 @@ _Static_assert(
         ((SENDER_CFG_PRE_REFRESH_END + SENDER_CFG_REFRESH_ALIGN - 1) &
          ~(size_t)(SENDER_CFG_REFRESH_ALIGN - 1)),
     "catalog_refresh_interval_us must begin at the old aligned sizeof boundary");
+_Static_assert(offsetof(moq_media_sender_cfg_t, resource_auth) >=
+    ((offsetof(moq_media_sender_cfg_t, companion_profile) +
+      sizeof(moq_media_companion_profile_t) + _Alignof(moq_media_sender_cfg_t) - 1u) &
+     ~((size_t)_Alignof(moq_media_sender_cfg_t) - 1u)),
+    "resource_auth must follow the complete companion sender allocation");
+
+#ifdef MOQ_MEDIA_SENDER_TESTING
+static void (*sender_test_after_select)(moq_media_sender_t *, moq_media_track_t *, void *);
+static void *sender_test_after_select_ctx;
+#endif
 
 #define SENDER_DEFAULT_SAP_HISTORY_GROUPS 8u
 #define SENDER_DEFAULT_MEDIA_TIMELINE_HISTORY_GROUPS 8u
@@ -252,6 +263,15 @@ struct moq_media_track {
                                                 Set on the app thread under mu,
                                                 cleared by the network pump once
                                                 the finish succeeds. */
+    bool                  auth_failed;       /* terminal local resource failure */
+    bool                  publish_submitted; /* actual PUBLISH accepted locally */
+    bool                  publish_resolved;  /* peer resolved this single intent;
+                                                sticky through partial end retries */
+    moq_media_auth_operation_t publish_auth; /* network-executor owned */
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    uint64_t              test_publish_attempts;
+    moq_result_t          test_publish_result;
+#endif
     bool                  complete_end_owed; /* complete() owes this track its
                                                 END_OF_TRACK: sent by the drain once
                                                 nothing of the track is left queued */
@@ -413,6 +433,9 @@ struct moq_media_sender {
     moq_alloc_t      alloc;
     moq_endpoint_t  *ep;
     bool             owns_endpoint;
+    moq_media_auth_source_t resource_auth;
+    moq_media_auth_operation_t namespace_auth;
+    bool             startup_complete;
 
     /* The negotiated transport draft, latched from the LIVE SESSION at the
      * top of every sender_hook and read under mu by the property encoder.
@@ -652,6 +675,13 @@ static void sender_fire_closed(moq_media_sender_t *s, bool is_fatal,
     pthread_mutex_lock(&s->mu);
     if (s->closed_fired) { pthread_mutex_unlock(&s->mu); return; }
     s->closed_fired = true;
+    /* All request intents end with the service. Network-thread confined:
+     * neither selectors nor native admission can be active concurrently. */
+    moq_media_auth_operation_clear(&s->namespace_auth, &s->alloc);
+    if (s->catalog_track)
+        moq_media_auth_operation_clear(&s->catalog_track->publish_auth, &s->alloc);
+    for (size_t i = 0; i < s->track_count; ++i)
+        moq_media_auth_operation_clear(&s->tracks[i]->publish_auth, &s->alloc);
     /* Terminal (incl. a CLEAN close): disarm the managed wake atomically with
      * the close latch, so a cached finite deadline cannot survive to a cycle
      * that returns early (e.g. session == NULL) before the next recompute. */
@@ -1121,13 +1151,13 @@ static void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m)
  * MOQ_OK with *out set, or an error (catalog tracks excluded). */
 /* A track belongs in the published catalog when it is a non-catalog, non-removed
  * track. With only_registered (the post-ready publish path), it must ALSO have a
- * registered publisher track -- the catalog must never advertise a track
- * moq_pub_add_track has not yet accepted (e.g. a same-name replacement whose
- * registration is still deferred). The white-box build path passes false. */
+ * registered publisher track and no pending publication selection. The catalog
+ * must not advertise a registration/PUBLISH still awaiting admission (e.g. a
+ * same-name replacement). The white-box build path passes false. */
 static bool track_in_catalog(const moq_media_track_t *t, bool only_registered)
 {
-    if (t->is_catalog || t->removed) return false;
-    if (only_registered && !t->pub_track) return false;
+    if (t->is_catalog || t->removed || t->auth_failed) return false;
+    if (only_registered && (!t->pub_track || t->publish_auth.prepared)) return false;
     return true;
 }
 
@@ -1933,6 +1963,16 @@ static bool track_is_generated_timeline(const moq_media_track_t *t)
     return t->is_event_timeline || t->is_media_timeline;
 }
 
+/* Registration and the push handshake must precede terminal admission. The
+ * callback latch survives local unpublish: an end may still owe pull slots
+ * after the facade's current published state has cleared. s->mu held. */
+static bool sender_terminal_admitted(const moq_media_sender_t *s,
+                                      const moq_media_track_t *t)
+{
+    return t->pub_track &&
+           (!s->publish_tracks || (t->publish_submitted && t->publish_resolved));
+}
+
 /* Emit queued objects in decode order until the queue drains or the
  * transport backpressures. s->mu held; the session is network-thread
  * confined, so facade calls are safe under this lock (nothing the facade
@@ -1955,9 +1995,9 @@ static bool sender_timeline_media_ended(const moq_media_sender_t *s,
     for (size_t i = 0; i < s->track_count; i++) {
         const moq_media_track_t *t = s->tracks[i];
         if (t->sap_timeline != tl && t->media_timeline != tl) continue;
-        if (t->removed) return true;
+        if (t->removed || t->auth_failed) return true;
         return !t->complete_end_owed &&
-               !(t->end_requested && !t->end_sent && t->pub_track);
+               !(t->end_requested && !t->end_sent);
     }
     return true;
 }
@@ -1988,9 +2028,10 @@ static void sender_drain_completion(moq_media_sender_t *s, uint64_t now_us)
     bool all_sent = true;
     for (size_t i = 0; i < s->track_count; i++) {
         moq_media_track_t *t = s->tracks[i];
-        if (t->is_catalog || t->removed || track_is_generated_timeline(t)) continue;
+        if (t->is_catalog || t->removed || t->auth_failed ||
+            track_is_generated_timeline(t)) continue;
         if (!t->complete_end_owed) {
-            if (t->end_requested && !t->end_sent && t->pub_track) all_sent = false;
+            if (t->end_requested && !t->end_sent) all_sent = false;
             continue;
         }
 #ifdef MOQ_SERVICE_HAVE_MPEG2TS
@@ -2004,7 +2045,11 @@ static void sender_drain_completion(moq_media_sender_t *s, uint64_t now_us)
             all_sent = false;
             continue;
         }
-        if (t->pub_track) {
+        if (!sender_terminal_admitted(s, t)) {
+            all_sent = false;
+            continue;
+        }
+        {
             moq_result_t erc = moq_pub_end_track(s->pub, t->pub_track, now_us);
             if (erc == MOQ_ERR_WOULD_BLOCK || erc == MOQ_ERR_WRONG_STATE) {
                 all_sent = false;
@@ -2022,13 +2067,18 @@ static void sender_drain_completion(moq_media_sender_t *s, uint64_t now_us)
     }
     for (size_t i = 0; i < s->track_count; i++) {
         moq_media_track_t *tl = s->tracks[i];
-        if (!track_is_generated_timeline(tl) || tl->removed || tl->end_sent) continue;
+        if (!track_is_generated_timeline(tl) || tl->removed || tl->auth_failed ||
+            tl->end_sent) continue;
         /* Its media first: that media's records feed the timeline. */
         if (!sender_timeline_media_ended(s, tl) || !sender_timeline_caught_up(tl)) {
             all_sent = false;   /* emitted with demand, else retained */
             continue;
         }
-        if (tl->pub_track) {
+        if (!sender_terminal_admitted(s, tl)) {
+            all_sent = false;
+            continue;
+        }
+        {
             moq_result_t erc = moq_pub_end_track(s->pub, tl->pub_track, now_us);
             if (erc == MOQ_ERR_WOULD_BLOCK || erc == MOQ_ERR_WRONG_STATE) {
                 all_sent = false;
@@ -2125,12 +2175,17 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
          * The facade closes any open subgroup and FINs a fresh one; the session
          * stays alive.
          *
-         * Handled BEFORE the no-demand branch below: moq_pub_end_track()
-         * treats "no subscriber" as local terminal success, so a track ended
-         * before a relay subscribes (or after the subscriber leaves) drains
-         * its terminal here -- and because nothing of that track is still
-         * held, it cannot overtake anything. */
+         * Once admitted, handled BEFORE the no-demand branch below:
+         * moq_pub_end_track() treats "no subscriber" as local terminal success.
+         * A registered pull track, or a resolved push publication whose peer
+         * left, can drain its terminal here without overtaking held media. */
         if (e->is_end) {
+            if (!sender_terminal_admitted(s, t)) {
+                t->drain_hold = true;  /* track-local wait, not shared capacity */
+                if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+                wr++; rd++;
+                continue;
+            }
             /* A drop abandoned an open group: the obligation is discharged
              * through THE one transition before the terminal can turn the same
              * subgroup into a clean FIN -- independent of the cached demand
@@ -2269,7 +2324,7 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
          * already required a declared TYPE_1/2); a mid-group Object records only
          * an actual SAP (declared type != NONE). A dropped Object never reaches
          * here, so it correctly yields no record. */
-        if (t->sap_timeline && e->has_sap_type &&
+        if (t->sap_timeline && !t->sap_timeline->auth_failed && e->has_sap_type &&
             (oid == 0 || e->sap_type != (uint8_t)MOQ_SAP_NONE))
             sap_history_append(s, t->sap_timeline, e->group_seq, oid,
                                e->sap_type, sap_ept_ms_from_us(e->pts_us));
@@ -2278,7 +2333,7 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
          * group, at the group-start Object (oid == 0), at its real wire Location.
          * mediaTime is the object's presentation time (ms); wallclock is the emit
          * time (ms) for a live track, 0 once the track is non-live/VOD. */
-        if (t->media_timeline && oid == 0)
+        if (t->media_timeline && !t->media_timeline->auth_failed && oid == 0)
             mt_history_append(s, t->media_timeline, e->group_seq, oid,
                               e->pts_us / 1000u,
                               t->is_live ? now_us / 1000u : 0u);
@@ -2314,6 +2369,7 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
      * media FIFO above, so an unsubscribed timeline track cannot stall media;
      * each is gated on its own subscriber (SAP MSF §8.3 / media §7.3). */
     for (size_t i = 0; i < s->track_count; i++) {
+        if (s->tracks[i]->auth_failed) continue;
         if (s->tracks[i]->is_event_timeline)
             sender_emit_sap_for(s, s->tracks[i], now_us);
         else if (s->tracks[i]->is_media_timeline)
@@ -2329,23 +2385,156 @@ static bool removed_pubtrack_with_name(moq_media_sender_t *s,
                                        moq_media_track_t *const *tracks,
                                        size_t n, moq_bytes_t name);  /* below */
 
-/* Register a publisher track for t, writing t->pub_track. t->pub_track is
- * network-thread-confined (read only by network-thread paths: drain,
- * build_catalog, resync/finish/republish, removed_pubtrack_with_name; no
- * app-thread call touches it). removed/pub_ended/teardown_done/catalog_dirty/
- * active_subs ARE app-touched and are accessed under s->mu.
- *
- * CALLER MUST HOLD s->mu and must re-check (!t->removed && !t->pub_track) under
- * that SAME lock before calling: removed is app-written (and monotonic), so the
- * "a removed/pre-catalog track must not get a publisher track" invariant only
- * holds if the check and the registration are atomic against a concurrent
- * remove_track. Uses sender_set_fatal_locked on failure -- calling the unlocked
- * sender_set_fatal while holding s->mu would deadlock. Holding s->mu across
- * moq_pub_add_track is safe: the sender installs no publisher callbacks, so the
- * facade cannot re-enter s->mu (same discipline as sender_drain / republish). */
-static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
-                                 bool advertise, uint64_t now_us)
+/* Resource names and namespace storage survive until sender destruction. */
+static moq_media_auth_request_t sender_auth_request(moq_media_sender_t *s,
+    moq_media_track_t *t, moq_media_auth_action_t action)
 {
+    moq_media_auth_request_t request = {0};
+    request.struct_size = sizeof(request);
+    request.action = action;
+    request.track_namespace = s->namespace_;
+    if (action != MOQ_MEDIA_AUTH_ACTION_PUBLISH_NAMESPACE)
+        request.track_name = t->is_catalog
+            ? (moq_bytes_t){s->catalog_name, s->catalog_name_len} : t->name;
+    return request;
+}
+
+/* The failure latch and queue purge precede the allocation-free notification.
+ * Only this resource's service-owned objects are discarded. */
+static void sender_auth_fail(moq_media_sender_t *s, moq_media_track_t *t,
+    moq_media_auth_operation_t *op, const moq_media_auth_request_t *request)
+{
+    pthread_mutex_lock(&s->mu);
+    t->auth_failed = true;
+    if (t->sap_timeline) t->sap_timeline->removed = true;
+    if (t->media_timeline) t->media_timeline->removed = true;
+    if (t->is_catalog) sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+    uint32_t wr = s->preq_head;
+    for (uint32_t rd = s->preq_head; rd != s->preq_tail; ++rd) {
+        sender_preq_entry_t *e = &s->preq[rd % s->ring_cap];
+        if (t->is_catalog || e->track == t) {
+            if (!e->is_end) preq_note_dropped(s, e->track, e);
+            preq_entry_release(s, e);
+        } else {
+            if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+            ++wr;
+        }
+    }
+    s->preq_tail = wr;
+    if (s->ready || s->tracks_frozen) s->catalog_dirty = true;
+    pthread_cond_broadcast(&s->space_cv);
+    pthread_mutex_unlock(&s->mu);
+    moq_media_auth_operation_notify(op, &s->resource_auth, request,
+        t->is_catalog ? MOQ_MEDIA_AUTH_SCOPE_SERVICE : MOQ_MEDIA_AUTH_SCOPE_TRACK,
+        t->is_catalog || track_is_generated_timeline(t) ? NULL : t);
+    moq_media_auth_operation_clear(op, &s->alloc);
+    if (t->is_catalog) {
+        moq_media_auth_operation_clear(&s->namespace_auth, &s->alloc);
+        moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
+        pthread_mutex_lock(&s->mu);
+        for (size_t i = 0; i < s->track_count; ++i)
+            moq_media_auth_operation_clear(&s->tracks[i]->publish_auth, &s->alloc);
+        pthread_mutex_unlock(&s->mu);
+    }
+    if (s->ep) moq_endpoint_wake(s->ep);
+}
+
+static bool sender_admission_retry(moq_result_t rc)
+{
+    return rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_REQUEST_BLOCKED;
+}
+
+/* The helper already validated the prepared list. Native INVAL can reject
+ * request identity, so it retains the ordinary service failure path. */
+static bool sender_auth_native_error(moq_media_sender_t *s,
+    moq_media_auth_operation_t *op, moq_result_t rc)
+{
+    if (!s->resource_auth.configured) return false;
+    if (rc == MOQ_ERR_BUFFER) op->outcome = MOQ_MEDIA_AUTH_OUTCOME_TOKEN_LIMIT;
+    else if (rc == MOQ_ERR_UNSUPPORTED) op->outcome = MOQ_MEDIA_AUTH_OUTCOME_UNSUPPORTED_PROFILE;
+    else return false;
+    op->status = op->result = rc;
+    return true;
+}
+
+/* Network executor, no private lock on entry. Track identity is immutable and
+ * its allocation survives removal. Recheck the intent after every selector. */
+static moq_result_t sender_select(moq_media_sender_t *s, moq_media_track_t *t,
+    moq_media_auth_operation_t *op, moq_media_auth_action_t action)
+{
+    pthread_mutex_lock(&s->mu);
+    bool cancelled = s->fatal || t->removed || t->auth_failed;
+    pthread_mutex_unlock(&s->mu);
+    if (cancelled) {
+        moq_media_auth_operation_clear(op, &s->alloc);
+        return MOQ_DONE;
+    }
+    moq_media_auth_request_t request = sender_auth_request(s, t, action);
+    moq_result_t rc = moq_media_auth_operation_prepare(op, &s->resource_auth,
+        &request, s->transport_version, &s->alloc);
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    /* Model an app-thread intent change AFTER the selector returns, not
+     * prohibited callback reentry. No shipping hook or export. */
+    if (sender_test_after_select)
+        sender_test_after_select(s, t, sender_test_after_select_ctx);
+#endif
+    pthread_mutex_lock(&s->mu);
+    cancelled = s->fatal || t->removed || t->auth_failed;
+    pthread_mutex_unlock(&s->mu);
+    if (cancelled) {
+        moq_media_auth_operation_clear(op, &s->alloc);
+        return MOQ_DONE;
+    }
+    if (rc != MOQ_OK) sender_auth_fail(s, t, op, &request);
+    return rc;
+}
+
+static moq_result_t sender_publish_track(moq_media_sender_t *s,
+    moq_media_track_t *t, uint64_t now_us)
+{
+    if (!s->publish_tracks || t->publish_submitted) return MOQ_OK;
+    moq_result_t rc = sender_select(s, t, &t->publish_auth, MOQ_MEDIA_AUTH_ACTION_PUBLISH);
+    if (rc != MOQ_OK) return rc;
+    moq_pub_publish_cfg_t cfg;
+    moq_pub_publish_cfg_init(&cfg);
+    cfg.auth_tokens = t->publish_auth.list.tokens;
+    cfg.auth_token_count = t->publish_auth.list.count;
+    pthread_mutex_lock(&s->mu);
+    if (t->removed || t->auth_failed || s->fatal) rc = MOQ_DONE;
+    else {
+        rc = moq_pub_publish_track(s->pub, t->pub_track, &cfg, now_us);
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        t->test_publish_attempts++;
+        t->test_publish_result = rc;
+#endif
+        if (rc == MOQ_OK) t->publish_submitted = true;
+    }
+    pthread_mutex_unlock(&s->mu);
+    if (sender_admission_retry(rc)) return rc;
+    if (rc < 0) {
+        if (sender_auth_native_error(s, &t->publish_auth, rc)) {
+            moq_media_auth_request_t req = sender_auth_request(s, t, MOQ_MEDIA_AUTH_ACTION_PUBLISH);
+            sender_auth_fail(s, t, &t->publish_auth, &req);
+        } else sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+    }
+    moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
+    return rc;
+}
+
+static moq_result_t sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
+                                        bool advertise, uint64_t now_us)
+{
+    moq_result_t rc;
+    if (advertise) {
+        rc = sender_select(s, t, &s->namespace_auth, MOQ_MEDIA_AUTH_ACTION_PUBLISH_NAMESPACE);
+        if (rc != MOQ_OK) return rc;
+    }
+    /* Select even before local registration/catalog inclusion. Catalog's
+     * PUBLISH itself waits until its retained initial group is installed. */
+    if (s->publish_tracks) {
+        rc = sender_select(s, t, &t->publish_auth, MOQ_MEDIA_AUTH_ACTION_PUBLISH);
+        if (rc != MOQ_OK) return rc;
+    }
     moq_pub_track_cfg_t tcfg;
     /* Sized init: the catalog branch below sets the APPENDED
      * has_publisher_priority tail field, which moq_pub_add_track reads only
@@ -2357,6 +2546,10 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
         ? (moq_bytes_t){ s->catalog_name, s->catalog_name_len }
         : t->name;
     tcfg.advertise_namespace = advertise;
+    if (advertise) {
+        tcfg.namespace_auth_tokens = s->namespace_auth.list.tokens;
+        tcfg.namespace_auth_token_count = s->namespace_auth.list.count;
+    }
 
     if (t->is_catalog) {
         tcfg.has_publisher_priority = true;
@@ -2375,17 +2568,66 @@ static void sender_add_pub_track(moq_media_sender_t *s, moq_media_track_t *t,
     tcfg.track_properties = t->track_properties;
     tcfg.dynamic_groups = t->dynamic_groups;
 
-    if (moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track) != MOQ_OK) {
-        sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-        return;
+    pthread_mutex_lock(&s->mu);
+    if (t->removed || t->auth_failed || s->fatal) rc = MOQ_DONE;
+    else rc = moq_pub_add_track(s->pub, &tcfg, now_us, &t->pub_track);
+    pthread_mutex_unlock(&s->mu);
+    if (sender_admission_retry(rc)) return rc;
+    if (rc != MOQ_OK) {
+        if (advertise && sender_auth_native_error(s, &s->namespace_auth, rc)) {
+            moq_media_auth_request_t req = sender_auth_request(s, t, MOQ_MEDIA_AUTH_ACTION_PUBLISH_NAMESPACE);
+            sender_auth_fail(s, t, &s->namespace_auth, &req);
+        } else if (rc < 0) sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+        moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
+        if (advertise) moq_media_auth_operation_clear(&s->namespace_auth, &s->alloc);
+        return rc;
     }
+    if (advertise) moq_media_auth_operation_clear(&s->namespace_auth, &s->alloc);
+    return t->is_catalog ? MOQ_OK : sender_publish_track(s, t, now_us);
+}
 
-    if (s->publish_tracks && t->pub_track) {
-        moq_pub_publish_cfg_t pcfg;
-        moq_pub_publish_cfg_init(&pcfg);
-        if (moq_pub_publish_track(s->pub, t->pub_track, &pcfg, now_us) != MOQ_OK)
-            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+/* Retire a cancelled registration in startup as well as after readiness.
+ * Auth-refused publications were never sent: remove their local registration
+ * without manufacturing a successful END_OF_TRACK. Cleanup retries do not
+ * reselect credentials or reissue a refused publication. */
+static bool sender_retire_track(moq_media_sender_t *s, moq_media_track_t *t,
+                                 uint64_t now_us)
+{
+    moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
+    pthread_mutex_lock(&s->mu);
+    bool failed = t->auth_failed;
+    moq_result_t rc = t->pending_reset ? sender_flush_reset(s, t, now_us) : MOQ_OK;
+    pthread_mutex_unlock(&s->mu);
+    if (rc != MOQ_OK) return false;
+    if (t->pub_track) {
+        if (!failed && !t->pub_ended) {
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            pthread_mutex_lock(&s->mu);
+            bool refuse = s->test_refuse_teardown_end > 0;
+            if (refuse) s->test_refuse_teardown_end--;
+            pthread_mutex_unlock(&s->mu);
+            if (refuse) return false;
+#endif
+            rc = moq_pub_end_track(s->pub, t->pub_track, now_us);
+            if (rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_WRONG_STATE) return false;
+            if (rc != MOQ_OK) {
+                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                return false;
+            }
+            t->pub_ended = true;
+        }
+        rc = moq_pub_remove_track(s->pub, t->pub_track, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) return false;
+        if (rc != MOQ_OK) {
+            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            return false;
+        }
+        t->pub_track = NULL;
     }
+    pthread_mutex_lock(&s->mu);
+    t->teardown_done = true;
+    pthread_mutex_unlock(&s->mu);
+    return true;
 }
 
 static bool rcbuf_bytes_eq(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
@@ -2773,8 +3015,9 @@ static bool sender_has_pending_output(void *ctx)
     }
     for (size_t i = 0; !pending && i < s->track_count; i++) {
         const moq_media_track_t *t = s->tracks[i];
-        if (t->pending_reset || (t->removed && t->pub_track))
+        if (t->pending_reset || ((t->removed || t->auth_failed) && t->pub_track))
             pending = true;
+        if (t->auth_failed) continue;
         /* A completion end owed with nothing of its track left queued is
          * sendable now; one behind retained media is held with that media,
          * as an end_track marker is. A TS track's unfinished source is work
@@ -2810,7 +3053,7 @@ static bool sender_has_pending_output(void *ctx)
         bool held = false;
         for (size_t i = 0; i < s->track_count && !held; i++) {
             moq_media_track_t *t = s->tracks[i];
-            if (t->is_catalog || t->removed) continue;
+            if (t->is_catalog || t->removed || t->auth_failed) continue;
             if (track_is_generated_timeline(t))
                 held = !t->end_sent && t->pub_track &&
                        !sender_timeline_caught_up(t) &&
@@ -3203,6 +3446,19 @@ static void sender_pub_on_closed(void *ctx, uint64_t error_code)
     sender_fire_closed(s, false, 0);
 }
 
+static void sender_pub_on_publish_ok(void *ctx, moq_pub_track_t *pt, bool forward)
+{
+    (void)forward;   /* Forward=0 resolves the handshake without demand. */
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->track_count; i++) {
+        if (s->tracks[i]->pub_track != pt) continue;
+        s->tracks[i]->publish_resolved = true;
+        break;
+    }
+    pthread_mutex_unlock(&s->mu);
+}
+
 static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
 {
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
@@ -3220,6 +3476,7 @@ static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
     for (size_t i = 0; i < s->track_count; i++) {
         if (s->tracks[i]->pub_track == pt) { t = s->tracks[i]; break; }
     }
+    if (t) t->publish_resolved = true;  /* includes private generated timelines */
     /* Fire once per track, for app-visible media only. */
     bool fire = t && track_is_app_media(t) && !t->pub_closed_fired;
     if (fire) t->pub_closed_fired = true;
@@ -3305,6 +3562,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
     if (sender_ep_closed(s)) {
         sender_fire_closed(s, moq_endpoint_is_fatal_internal(s->ep),
                            moq_endpoint_fatal_code_internal(s->ep));
+        return;
     }
     if (!session) return;
 
@@ -3346,6 +3604,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
         pcfg.callbacks.ctx = s;
         pcfg.callbacks.on_closed = sender_pub_on_closed;
+        pcfg.callbacks.on_publish_ok = sender_pub_on_publish_ok;
         pcfg.callbacks.on_publish_finished = sender_pub_on_publish_finished;
         pcfg.callbacks.on_publish_error = sender_pub_on_publish_error;
         pcfg.callbacks.on_namespace_terminal =
@@ -3372,25 +3631,19 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pthread_mutex_lock(&s->mu);
         s->tracks_frozen = true;
         pthread_mutex_unlock(&s->mu);
+    }
 
-        moq_pub_track_cfg_t ccfg;
-        /* Sized init: has_publisher_priority below is an appended tail field
-         * (see sender_add_pub_track). */
-        moq_pub_track_cfg_init_sized(&ccfg, sizeof(ccfg));
-        ccfg.track_namespace = s->namespace_;
-        ccfg.track_name = (moq_bytes_t){ s->catalog_name, s->catalog_name_len };
-        ccfg.advertise_namespace = true;
-        ccfg.has_publisher_priority = true;
-        ccfg.publisher_priority = 0;   /* catalog leads delivery */
-        /* Catalog generations are monotone; deltas append to the open
-         * generation group (legal: no completion evidence forms while the
-         * group's bracket never cleanly closes). */
-        ccfg.monotonic_groups = true;
-        if (moq_pub_add_track(s->pub, &ccfg, now_us,
-                              &s->catalog_track->pub_track) != MOQ_OK) {
-            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+    if (!s->startup_complete) {
+        /* Consume namespace/publication replies even while another startup
+         * request is waiting for native admission. Selection stays retained. */
+        (void)moq_pub_tick(s->pub, now_us);
+        pthread_mutex_lock(&s->mu);
+        fatal = s->fatal;
+        pthread_mutex_unlock(&s->mu);
+        if (fatal) return;
+        if (!s->catalog_track->pub_track &&
+            sender_add_pub_track(s, s->catalog_track, true, now_us) != MOQ_OK)
             return;
-        }
 
         /* Walk a snapshot so a concurrent app-thread realloc of s->tracks cannot
          * free the vector mid-walk; the per-track registration below takes s->mu
@@ -3413,9 +3666,21 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
              * concurrent remove_track in the gap could leave a removed track with
              * a publisher track. */
             pthread_mutex_lock(&s->mu);
-            if (!t->removed && !t->pub_track)
-                sender_add_pub_track(s, t, false, now_us);
+            bool skip = t->removed || t->auth_failed;
             pthread_mutex_unlock(&s->mu);
+            if (skip) {
+                if (!sender_retire_track(s, t, now_us)) {
+                    sender_tracks_release(s, snap, n);
+                    return;
+                }
+                continue;
+            }
+            moq_result_t rc = t->pub_track ? sender_publish_track(s, t, now_us)
+                : sender_add_pub_track(s, t, false, now_us);
+            if (sender_admission_retry(rc)) {
+                sender_tracks_release(s, snap, n);
+                return;
+            }
         }
         sender_tracks_release(s, snap, n);
         pthread_mutex_lock(&s->mu);
@@ -3428,59 +3693,50 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
          * pull it. A plain SUBSCRIBE delivers no retained objects; the receiver
          * obtains the catalog via SUBSCRIBE + Joining FETCH (MSF-01 §5).
          * sender_build_catalog_fresh requires s->mu (consistent track view). */
-        moq_rcbuf_t *json = NULL;
-        uint64_t json_stamp = 0;
-        pthread_mutex_lock(&s->mu);
-        moq_result_t bcrc = sender_build_catalog_fresh(s, &json, true,
-                                                       &json_stamp);
-        uint64_t first_group = sender_group_base(s);
-        pthread_mutex_unlock(&s->mu);
-        if (bcrc != MOQ_OK || !json) {
-            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
-            return;
-        }
-        moq_pub_retained_object_t robj = { .object_id = 0, .payload = json };
-        moq_pub_retained_group_cfg_t rg;
-        moq_pub_retained_group_cfg_init(&rg);
-        rg.group_id = first_group;
-        rg.objects = &robj;
-        rg.object_count = 1;
-        moq_result_t src = moq_pub_set_retained_group(
-            s->pub, s->catalog_track->pub_track, &rg);
-        if (src != MOQ_OK) {
-            moq_rcbuf_decref(json);
-            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-            return;
-        }
-#ifdef MOQ_MEDIA_SENDER_TESTING
-        pthread_mutex_lock(&s->mu);
-        s->test_retained_installs++;   /* the initial catalog's install */
-        pthread_mutex_unlock(&s->mu);
-#endif
-        /* Keep the ref as the published baseline (generation 0) for the no-op
-         * dedup and the deltaUpdate diff in sender_republish_catalog, with the
-         * stamp these exact bytes carry. */
-        s->published_catalog = json;
-        s->published_generated_at = json_stamp;
-        s->catalog_group = first_group;
-        s->catalog_published = true;
-
-        if (s->publish_tracks) {
-            moq_pub_publish_cfg_t cpcfg;
-            moq_pub_publish_cfg_init(&cpcfg);
-            if (moq_pub_publish_track(s->pub, s->catalog_track->pub_track,
-                                      &cpcfg, now_us) != MOQ_OK) {
+        if (!s->catalog_published) {
+            moq_rcbuf_t *json = NULL;
+            uint64_t json_stamp = 0;
+            pthread_mutex_lock(&s->mu);
+            s->catalog_dirty = false;
+            moq_result_t bcrc = sender_build_catalog_fresh(s, &json, true,
+                                                          &json_stamp);
+            uint64_t first_group = sender_group_base(s);
+            /* Commit the exact encoded track set before a blocked PUBLISH.
+             * Later app mutations must remain dirty until the next generation. */
+            if (bcrc == MOQ_OK && json)
+                for (size_t i = 0; i < s->track_count; ++i)
+                    s->tracks[i]->in_published = track_in_catalog(s->tracks[i], true);
+            pthread_mutex_unlock(&s->mu);
+            if (bcrc != MOQ_OK || !json) {
+                sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
+                return;
+            }
+            moq_pub_retained_object_t robj = { .object_id = 0, .payload = json };
+            moq_pub_retained_group_cfg_t rg;
+            moq_pub_retained_group_cfg_init(&rg);
+            rg.group_id = first_group;
+            rg.objects = &robj;
+            rg.object_count = 1;
+            moq_result_t src = moq_pub_set_retained_group(
+                s->pub, s->catalog_track->pub_track, &rg);
+            if (src != MOQ_OK) {
+                moq_rcbuf_decref(json);
                 sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
                 return;
             }
+#ifdef MOQ_MEDIA_SENDER_TESTING
+            pthread_mutex_lock(&s->mu);
+            s->test_retained_installs++;
+            pthread_mutex_unlock(&s->mu);
+#endif
+            s->published_catalog = json;
+            s->published_generated_at = json_stamp;
+            s->catalog_group = first_group;
+            s->catalog_published = true;
         }
-        /* Start the automatic-refresh clock from the initial catalog install. */
+        if (sender_publish_track(s, s->catalog_track, now_us) != MOQ_OK) return;
+        s->startup_complete = true;
         sender_arm_refresh(s, now_us);
-        /* Record the initial catalog's track set as the published baseline. */
-        pthread_mutex_lock(&s->mu);
-        for (size_t i = 0; i < s->track_count; i++)
-            s->tracks[i]->in_published = track_in_catalog(s->tracks[i], true);
-        pthread_mutex_unlock(&s->mu);
     }
 
     (void)moq_pub_tick(s->pub, now_us);
@@ -3561,63 +3817,19 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         for (size_t i = 0; i < n; i++) {
             moq_media_track_t *t = snap[i];
             if (t->is_catalog) continue;   /* creation-time immutable */
-            /* `removed` is app-written under s->mu; read it under the lock.
-             * The pending-reset PREFLIGHT is taken in the SAME critical
-             * section: an app-thread capacity eviction (or removal) cannot arm
-             * the obligation in a gap and then have this teardown turn the
-             * abandoned subgroup into a clean FIN. `owed` therefore reflects
-             * the obligation as of the same instant as `removed`. */
+            /* Intent latches are private-lock protected. The retirement
+             * helper checks any pending reset before ending the track. */
             pthread_mutex_lock(&s->mu);
             bool removed = t->removed;
-            moq_result_t owed = MOQ_OK;
-            if (removed && t->pending_reset)
-                owed = sender_flush_reset(s, t, now_us);
+            bool auth_failed = t->auth_failed;
+            bool stopped = s->fatal;
             pthread_mutex_unlock(&s->mu);
-            /* The abandon must complete BEFORE any end_track/remove can close
-             * the same subgroup: on refusal skip this track's teardown for now
-             * and retry on a later hook. */
-            if (owed != MOQ_OK) continue;
-            if (removed) {
-                if (!t->pub_track) {
-                    /* No publisher track (pre-ready removal or never registered)
-                     * -> nothing to tear down; the name is already free. */
-                    if (!t->teardown_done) {
-                        pthread_mutex_lock(&s->mu);
-                        t->teardown_done = true;
-                        pthread_mutex_unlock(&s->mu);
-                    }
-                    continue;
-                }
-                /* 1) reliable END_OF_TRACK to active subscribers. */
-                if (!t->pub_ended) {
-#ifdef MOQ_MEDIA_SENDER_TESTING
-                    pthread_mutex_lock(&s->mu);
-                    bool refuse = s->test_refuse_teardown_end > 0;
-                    if (refuse) s->test_refuse_teardown_end--;
-                    pthread_mutex_unlock(&s->mu);
-                    if (refuse) continue;                /* refused: retry */
-#endif
-                    moq_result_t e = moq_pub_end_track(s->pub, t->pub_track,
-                                                       now_us);
-                    if (e == MOQ_OK) t->pub_ended = true;
-                    else if (e == MOQ_ERR_WOULD_BLOCK ||
-                             e == MOQ_ERR_WRONG_STATE) continue;  /* retry */
-                    else { sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED); break; }
-                }
-                /* 2) remove the publisher track so its name can be reused. */
-                moq_result_t r = moq_pub_remove_track(s->pub, t->pub_track,
-                                                      now_us);
-                if (r == MOQ_OK) {
-                    t->pub_track = NULL;
-                    pthread_mutex_lock(&s->mu);
-                    t->teardown_done = true;   /* name free; a re-add may proceed */
-                    pthread_mutex_unlock(&s->mu);
-                }
-                else if (r == MOQ_ERR_WOULD_BLOCK) continue;     /* retry */
-                else { sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED); break; }
+            if (stopped) break;
+            if (removed || auth_failed) {
+                (void)sender_retire_track(s, t, now_us);
                 continue;
             }
-            if (!t->pub_track) {
+            if (!t->pub_track || (s->publish_tracks && !t->publish_submitted)) {
                 /* Defer registering a replacement until the old same-name
                  * publisher track (if any) is actually gone. */
                 if (removed_pubtrack_with_name(s, snap, n, t->name)) continue;
@@ -3630,11 +3842,11 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                  * publish while unregistered must trigger a republish now or it
                  * could never be advertised -- set catalog_dirty under the same
                  * lock. */
+                moq_result_t rc = t->pub_track ? sender_publish_track(s, t, now_us)
+                    : sender_add_pub_track(s, t, false, now_us);
                 pthread_mutex_lock(&s->mu);
-                if (!t->removed && !t->pub_track) {
-                    sender_add_pub_track(s, t, false, now_us);
-                    if (t->pub_track) s->catalog_dirty = true;
-                }
+                if (rc == MOQ_OK && !t->removed && !t->auth_failed)
+                    s->catalog_dirty = true;
                 pthread_mutex_unlock(&s->mu);
             }
         }
@@ -4284,6 +4496,7 @@ static void sender_ts_free(moq_media_sender_t *s, moq_media_track_t *t);
 static void track_free(moq_media_sender_t *s, moq_media_track_t *t)
 {
     if (!t) return;
+    moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
     sender_ts_free(s, t);
     if (t->ext)
         s->alloc.free(t->ext, t->ext_block_size, s->alloc.ctx);
@@ -4498,6 +4711,8 @@ static bool sender_tracks_push(moq_media_sender_t *s, moq_media_track_t *t)
 
 static void sender_free(moq_media_sender_t *s)
 {
+    moq_media_auth_operation_clear(&s->namespace_auth, &s->alloc);
+    moq_media_auth_source_clear(&s->resource_auth, &s->alloc);
     if (s->tracks) {
         for (size_t i = 0; i < s->track_count; i++)
             track_free(s, s->tracks[i]);
@@ -4600,6 +4815,8 @@ static void sender_copy_cfg_tail(moq_media_sender_t *s,
  * storage sum plus the catalog-name addition (size_t). An unrepresentable
  * value is a configuration error (MOQ_ERR_INVAL), never a wrapped request. */
 typedef struct sender_sizes {
+    moq_alloc_t alloc;
+    moq_media_auth_source_t resource_auth;
     uint32_t queue_cap;
     uint32_t preq_cap;
     uint32_t ring_cap;
@@ -4805,23 +5022,35 @@ static moq_result_t sender_prepare(const moq_media_sender_cfg_t *cfg,
      * are numbered from it, and a legacy resolution moves them down by it. */
     bool msf01 = sender_cfg_companion(cfg) !=
                  MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
-    return sender_resolve_group_base(msf01, &sz->group_base);
+    rc = sender_resolve_group_base(msf01, &sz->group_base);
+    if (rc != MOQ_OK) return rc;
+    sz->alloc = *SENDER_CTOR_ALLOC();
+    const moq_media_auth_cfg_t *auth = NULL;
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, resource_auth) +
+                            sizeof(cfg->resource_auth))
+        auth = cfg->resource_auth;
+    return moq_media_auth_source_copy(&sz->resource_auth, auth, &sz->alloc);
 }
 
 static moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
                                const moq_media_sender_cfg_t *cfg,
-                               const sender_sizes_t *sz,
+                               sender_sizes_t *sz,
                                moq_media_sender_t **out)
 {
-    const moq_alloc_t *alloc = SENDER_CTOR_ALLOC();
+    const moq_alloc_t *alloc = &sz->alloc;
     moq_media_sender_t *s = (moq_media_sender_t *)alloc->alloc(
         sizeof(*s), alloc->ctx);
-    if (!s) return MOQ_ERR_NOMEM;
+    if (!s) {
+        moq_media_auth_source_clear(&sz->resource_auth, alloc);
+        return MOQ_ERR_NOMEM;
+    }
     memset(s, 0, sizeof(*s));
 #ifdef MOQ_MEDIA_SENDER_TESTING
     s->test_block_republish_obj = -1;
 #endif
     s->alloc = *alloc;
+    s->resource_auth = sz->resource_auth;
+    memset(&sz->resource_auth, 0, sizeof(sz->resource_auth));
     s->ep = ep;
     s->owns_endpoint = owns;
     s->backpressure = cfg->backpressure;
@@ -4920,7 +5149,10 @@ moq_result_t moq_media_sender_attach(moq_endpoint_t *ep,
     sender_sizes_t sz;
     moq_result_t rc = sender_prepare(cfg, &sz);
     if (rc < 0) return rc;
-    if (cfg->endpoint != NULL) return MOQ_ERR_INVAL;   /* attach borrows */
+    if (cfg->endpoint != NULL) {
+        moq_media_auth_source_clear(&sz.resource_auth, &sz.alloc);
+        return MOQ_ERR_INVAL;   /* attach borrows */
+    }
     return sender_new(ep, false, cfg, &sz, out);
 }
 
@@ -4932,11 +5164,17 @@ moq_result_t moq_media_sender_create(const moq_media_sender_cfg_t *cfg,
     sender_sizes_t sz;
     moq_result_t rc = sender_prepare(cfg, &sz);   /* before any endpoint effect */
     if (rc < 0) return rc;
-    if (cfg->endpoint == NULL) return MOQ_ERR_INVAL;   /* create owns */
+    if (cfg->endpoint == NULL) {
+        moq_media_auth_source_clear(&sz.resource_auth, &sz.alloc);
+        return MOQ_ERR_INVAL;   /* create owns */
+    }
 
     moq_endpoint_t *ep = NULL;
     rc = moq_endpoint_connect(cfg->endpoint, &ep);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        moq_media_auth_source_clear(&sz.resource_auth, &sz.alloc);
+        return rc;
+    }
     rc = sender_new(ep, true, cfg, &sz, out);
     if (rc < 0) {
         (void)moq_endpoint_stop(ep);
@@ -5772,11 +6010,10 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         track_free(s, t);
         return MOQ_ERR_NOMEM;
     }
-    /* Post-ready: a new track requires a fresh independent catalog generation;
-     * the hook coalesces concurrent mutations into one republish. (Pre-ready
-     * the initial catalog has not been built yet, so no dirty flag is needed.) */
-    bool wake = s->ready;
-    if (s->ready) s->catalog_dirty = true;
+    /* Startup can retain the initial catalog before a blocked PUBLISH. Keep
+     * mutations in that interval just like post-ready mutations. */
+    bool wake = s->ready || s->tracks_frozen;
+    if (s->ready || s->tracks_frozen) s->catalog_dirty = true;
     pthread_mutex_unlock(&s->mu);
     if (wake && s->ep) moq_endpoint_wake(s->ep);
     *out = t;
@@ -5899,6 +6136,7 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
             const long dur_nsec =
                 (long)((s->block_timeout_us % 1000000ull) * 1000ull);
             for (;;) {
+                if (track->auth_failed) { wres = MOQ_ERR_WRONG_STATE; break; }
                 if (preq_fits(s, need)) { wres = MOQ_OK; break; }
                 if (s->fatal) { wres = MOQ_ERR_CLOSED; break; }
                 /* ep->mu-free closed check (sender_ep_closed): this loop holds s->mu,
@@ -5957,7 +6195,7 @@ static moq_result_t sender_admit_locked(moq_media_sender_t *s,
         /* The wait released s->mu. The track may have been ended or removed
          * meanwhile, or its open Group closed by a drop; the object is then
          * refused as it would be now, and the caller retries. */
-        if (track->end_requested || track->removed || track->vod_converted) {
+        if (track->end_requested || track->removed || track->auth_failed || track->vod_converted) {
             moq_rcbuf_decref(generated);
             s->stats.last_error = MOQ_ERR_WRONG_STATE;
             return MOQ_ERR_WRONG_STATE;
@@ -6059,7 +6297,7 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
 
     /* No writes after the track has been ended, removed from the catalog, or
      * converted to VOD (V4: isLive=false means no new content). */
-    if (track->end_requested || track->removed || track->vod_converted) {
+    if (track->end_requested || track->removed || track->auth_failed || track->vod_converted) {
         pthread_mutex_unlock(&s->mu);
         return MOQ_ERR_WRONG_STATE;
     }
@@ -6428,7 +6666,7 @@ static moq_result_t sender_ts_yield(moq_media_sender_t *s,
     if (s->fatal || sender_ep_closed(s)) return MOQ_ERR_CLOSED;
     /* complete() latched meanwhile: no further byte is taken; what this call
      * took already is the source complete() finishes. */
-    if (t->removed || t->vod_converted || t->complete_end_owed)
+    if (t->removed || t->auth_failed || t->vod_converted || t->complete_end_owed)
         return MOQ_ERR_WRONG_STATE;
     if (sender_companion_refused_locked(s)) return MOQ_ERR_UNSUPPORTED;
     return MOQ_OK;
@@ -6510,7 +6748,7 @@ moq_result_t moq_media_sender_write_mpeg2ts(moq_media_sender_t *s,
     }
     sender_ts_t *ts = (sender_ts_t *)track->ts;
     if (!ts || ts->busy || ts->ending || track->end_requested ||
-        track->removed || track->vod_converted) {
+        track->removed || track->auth_failed || track->vod_converted) {
         pthread_mutex_unlock(&s->mu);
         return MOQ_ERR_WRONG_STATE;
     }
@@ -6607,7 +6845,7 @@ moq_result_t moq_media_sender_end_track(moq_media_sender_t *s,
     /* A removed track is terminal: it is being torn down (END_OF_TRACK + pub
      * removal) by the hook, so end_track is refused rather than queuing a
      * terminal marker the drain would drop. */
-    if (track->removed || s->completing) {
+    if (track->removed || track->auth_failed || s->completing) {
         pthread_mutex_unlock(&s->mu);
         return MOQ_ERR_WRONG_STATE;
     }
@@ -6714,10 +6952,10 @@ moq_result_t moq_media_sender_remove_track(moq_media_sender_t *s,
     track->removed = true;
     if (track->sap_timeline) track->sap_timeline->removed = true;  /* couple */
     if (track->media_timeline) track->media_timeline->removed = true;  /* couple */
-    /* Pre-ready the initial catalog has not been built, so removal just keeps
-     * the track out of it (no republish needed). Post-ready, mark dirty. */
-    bool wake = s->ready;
-    if (s->ready) s->catalog_dirty = true;
+    /* A startup PUBLISH can be admission-blocked after retaining the initial
+     * catalog. Remember changes in that interval as well as after readiness. */
+    bool wake = s->ready || s->tracks_frozen;
+    if (s->ready || s->tracks_frozen) s->catalog_dirty = true;
     pthread_mutex_unlock(&s->mu);
 
     if (wake && s->ep)
@@ -6755,7 +6993,8 @@ moq_result_t moq_media_sender_complete(moq_media_sender_t *s)
     s->completing = true;
     for (size_t i = 0; i < s->track_count; i++) {
         moq_media_track_t *t = s->tracks[i];
-        if (t->is_catalog || t->removed || track_is_generated_timeline(t)) continue;
+        if (t->is_catalog || t->removed || t->auth_failed ||
+            track_is_generated_timeline(t)) continue;
         if (t->end_requested) continue;   /* its end_track marker is queued */
         t->end_requested = true;          /* refuses further writes */
         /* A byte-stream TS track's open Group continues with the Objects
@@ -6793,7 +7032,7 @@ moq_result_t moq_media_sender_convert_to_vod(moq_media_sender_t *s,
         for (size_t j = 0; j < s->track_count; j++)
             if (s->tracks[j] == t) { owned = true; break; }
         if (!owned || t->is_catalog || track_is_generated_timeline(t) ||
-            t->removed || t->end_requested ||
+            t->removed || t->auth_failed || t->end_requested ||
             !t->is_live || t->has_track_duration) {
             pthread_mutex_unlock(&s->mu);
             return MOQ_ERR_INVAL;       /* foreign/internal/removed/ended/not-
@@ -7078,6 +7317,86 @@ uint64_t moq_media_sender_fatal_code(const moq_media_sender_t *s)
  * add/remove tracks, then build the catalog the sender would publish. The
  * pump-driven wire republish (group numbering, retained group, staged
  * backpressure) is covered by the loopback tests. */
+
+bool moq_media_sender_test_auth_unlocked(moq_media_sender_t *s);
+bool moq_media_sender_test_auth_unlocked(moq_media_sender_t *s)
+{
+    if (pthread_mutex_trylock(&s->mu) != 0) return false;
+    pthread_mutex_unlock(&s->mu);
+    return true;
+}
+
+/* Passive native-call observation. NULL identifies the private catalog. */
+bool moq_media_sender_test_publish_admission(moq_media_sender_t *s,
+    moq_media_track_t *track, uint64_t *attempts, moq_result_t *result);
+bool moq_media_sender_test_publish_admission(moq_media_sender_t *s,
+    moq_media_track_t *track, uint64_t *attempts, moq_result_t *result)
+{
+    if (!s) return false;
+    pthread_mutex_lock(&s->mu);
+    moq_media_track_t *t = track ? NULL : s->catalog_track;
+    for (size_t i = 0; track && i < s->track_count; ++i)
+        if (s->tracks[i] == track) { t = track; break; }
+    if (t) {
+        if (attempts) *attempts = t->test_publish_attempts;
+        if (result) *result = t->test_publish_result;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return t != NULL;
+}
+
+bool moq_media_sender_test_auth_failed(moq_media_sender_t *s, moq_media_track_t *t);
+bool moq_media_sender_test_auth_failed(moq_media_sender_t *s, moq_media_track_t *t)
+{
+    pthread_mutex_lock(&s->mu);
+    bool failed = t ? t->auth_failed : s->fatal;
+    pthread_mutex_unlock(&s->mu);
+    return failed;
+}
+
+bool moq_media_sender_test_auth_named_failed(moq_media_sender_t *s, moq_bytes_t name);
+bool moq_media_sender_test_auth_named_failed(moq_media_sender_t *s, moq_bytes_t name)
+{
+    bool failed = false;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->track_count; ++i) {
+        moq_media_track_t *t = s->tracks[i];
+        if (t->name.len == name.len && memcmp(t->name.data, name.data, name.len) == 0)
+            failed = t->auth_failed;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return failed;
+}
+
+/* Called between deterministic hook steps, never concurrently with prepare. */
+size_t moq_media_sender_test_auth_pending(moq_media_sender_t *s);
+size_t moq_media_sender_test_auth_pending(moq_media_sender_t *s)
+{
+    size_t n = s->namespace_auth.prepared ? 1u : 0u;
+    if (s->catalog_track && s->catalog_track->publish_auth.prepared) ++n;
+    pthread_mutex_lock(&s->mu);
+    for (size_t i = 0; i < s->track_count; ++i)
+        if (s->tracks[i]->publish_auth.prepared) ++n;
+    pthread_mutex_unlock(&s->mu);
+    return n;
+}
+
+/* The actual full catalog baseline committed by the production hook, not a
+ * fresh hypothetical encoding of the current track list. */
+moq_rcbuf_t *moq_media_sender_test_auth_catalog(moq_media_sender_t *s);
+moq_rcbuf_t *moq_media_sender_test_auth_catalog(moq_media_sender_t *s)
+{
+    return s->published_catalog ? moq_rcbuf_incref(s->published_catalog) : NULL;
+}
+
+void moq_media_sender_test_auth_after_select(
+    void (*fn)(moq_media_sender_t *, moq_media_track_t *, void *), void *ctx);
+void moq_media_sender_test_auth_after_select(
+    void (*fn)(moq_media_sender_t *, moq_media_track_t *, void *), void *ctx)
+{
+    sender_test_after_select = fn;
+    sender_test_after_select_ctx = ctx;
+}
 
 /* The exact config gate moq_media_sender_create()/attach() run before any
  * networking, exposed so authoring validation (contentProtections syntax) is

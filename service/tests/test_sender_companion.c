@@ -33,6 +33,10 @@ typedef struct old_callbacks_v0 {
     void (*joined)(void *, moq_media_sender_t *, moq_media_track_t *, size_t);
     void (*left)(void *, moq_media_sender_t *, moq_media_track_t *, size_t);
 } old_callbacks_v0_t;
+typedef struct old_companion_sender_cfg {
+    old_sender_cfg_t prefix;
+    moq_media_companion_profile_t companion_profile;
+} old_companion_sender_cfg_t;
 
 #ifdef __cplusplus
 #define PIN static_assert
@@ -62,15 +66,19 @@ PIN(ALIGNOF(old_sender_cfg_t) == ALIGNOF(moq_media_sender_cfg_t), "cfg alignment
 PIN(sizeof(moq_media_send_object_t) ==
     ((sizeof(old_send_object_t) + sizeof(void *) + ALIGNOF(old_send_object_t) - 1) /
      ALIGNOF(old_send_object_t)) * ALIGNOF(old_send_object_t), "full object extent");
-PIN(sizeof(moq_media_sender_cfg_t) == sizeof(old_sender_cfg_t) + ALIGNOF(old_sender_cfg_t), "full cfg extent");
+PIN(sizeof(old_companion_sender_cfg_t) == sizeof(old_sender_cfg_t) + ALIGNOF(old_sender_cfg_t), "frozen companion cfg extent");
+PIN(offsetof(moq_media_sender_cfg_t, resource_auth) >= sizeof(old_companion_sender_cfg_t), "auth never uses old companion padding");
+PIN(sizeof(moq_media_sender_cfg_t) ==
+    ((offsetof(moq_media_sender_cfg_t, resource_auth) + sizeof(void *) + ALIGNOF(old_sender_cfg_t) - 1) /
+     ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t), "full cfg extent");
 #if UINTPTR_MAX == UINT64_MAX
-PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(moq_media_sender_cfg_t) == 184, "LP64 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(old_companion_sender_cfg_t) == 184 && sizeof(moq_media_sender_cfg_t) == 192, "LP64 cfg pin");
 PIN(sizeof(old_send_object_t) == 72 && sizeof(moq_media_send_object_t) == 80, "LP64 object pin");
 #elif defined(__arm__)
-PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(moq_media_sender_cfg_t) == 120, "ARM cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(old_companion_sender_cfg_t) == 120 && sizeof(moq_media_sender_cfg_t) == 128, "ARM cfg pin");
 PIN(sizeof(old_send_object_t) == 56 && sizeof(moq_media_send_object_t) == 64, "ARM object pin");
 #elif defined(__i386__)
-PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(moq_media_sender_cfg_t) == 108, "i686 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 && sizeof(moq_media_sender_cfg_t) == 116, "i686 cfg pin");
 PIN(sizeof(old_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 48 : 52), "i686 old object pin");
 PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), "i686 full object pin");
 #endif

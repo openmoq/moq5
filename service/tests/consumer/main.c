@@ -87,6 +87,12 @@ int main(void)
     if (ecs.handshake_timeout_us != 5000000ull)
         return 1;
 
+    moq_media_auth_cfg_t auth;
+    moq_media_auth_cfg_init(&auth);
+    if (auth.struct_size != sizeof(auth) || auth.select != NULL ||
+        auth.tokens != NULL || auth.on_outcome != NULL)
+        return 1;
+
     /* Receiver cfg (live preset): the pointer-only form stamps exactly the
      * frozen v0 allocation and leaves the appended tails alone; the sized
      * forms stamp the full struct. */
@@ -102,7 +108,7 @@ int main(void)
             return 2;
     moq_media_receiver_cfg_init_sized(&rcfg, sizeof(rcfg));
     if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_UNSET ||
-        rcfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO)
+        rcfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO || rcfg.resource_auth != NULL)
         return 2;
     moq_media_receiver_cfg_init_flow_control_sized(&rcfg, sizeof(rcfg));
     if (rcfg.struct_size != sizeof(rcfg) || rcfg.overflow.policy != MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
@@ -126,7 +132,7 @@ int main(void)
      * fields (the documented push-sender flow). */
     moq_media_sender_cfg_init_live_sized(&scfg, sizeof(scfg));
     if (scfg.struct_size != sizeof(moq_media_sender_cfg_t) ||
-        scfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO)
+        scfg.companion_profile != MOQ_MEDIA_COMPANION_AUTO || scfg.resource_auth != NULL)
         return 31;
     scfg.publish_tracks = true;
     scfg.drop_without_demand = true;

@@ -620,7 +620,11 @@ PIN_AT(moq_sub_update_cfg_t, _reserved_location, 64, 56, 60);
 PIN_AT(moq_sub_update_cfg_t, location, 72, 60, 64);
 PIN_AT(moq_sub_update_cfg_t, delivery_timeout_flags, 80, 64, 72);
 PIN_AT(moq_sub_update_cfg_t, subgroup_delivery_timeout_ms, 96, 80, 88);
-PIN_SIZE(moq_sub_update_cfg_t, 104, 88, 96);
+PIN_THROUGH(moq_sub_update_cfg_t, subgroup_delivery_timeout_ms, 104, 88, 96, 8, 4, 8);
+PIN_AFTER(moq_sub_update_cfg_t, subgroup_delivery_timeout_ms, auth_tokens);
+PIN_AT(moq_sub_update_cfg_t, auth_tokens, 104, 88, 96);
+PIN_AT(moq_sub_update_cfg_t, auth_token_count, 112, 92, 100);
+PIN_SIZE(moq_sub_update_cfg_t, 120, 96, 104);
 PIN_SIZE(moq_fetch_update_cfg_t, 24, 16, 16);
 PIN_SIZE(moq_filter_window_t, 40, 40, 40);
 PIN_AT(moq_pub_cfg_t, max_fills, 128 - ABI_PUB_ENUM_SHIFT,
@@ -986,7 +990,17 @@ PIN_THROUGH(moq_pub_track_cfg_t, monotonic_groups, 72, 44, 48, 8, 4, 8);
 PIN_AFTER(moq_pub_track_cfg_t, monotonic_groups, track_properties);
 PIN_AT(moq_pub_track_cfg_t, track_properties, 72, 48, 48);
 PIN_AT(moq_pub_track_cfg_t, dynamic_groups, 88, 56, 56);
-PIN_SIZE(moq_pub_track_cfg_t, 96, 60, 64);
+PIN_THROUGH(moq_pub_track_cfg_t, dynamic_groups, 96, 60, 64, 8, 4, 8);
+PIN_AFTER(moq_pub_track_cfg_t, dynamic_groups, namespace_auth_tokens);
+PIN_AT(moq_pub_track_cfg_t, namespace_auth_tokens, 96, 60, 64);
+PIN_AT(moq_pub_track_cfg_t, namespace_auth_token_count, 104, 64, 68);
+PIN_SIZE(moq_pub_track_cfg_t, 112, 68, 72);
+PIN_THROUGH(moq_sub_joining_fetch_cfg_t, subscriber_priority, 40, 28, 32, 8, 4, 8);
+PIN_AFTER(moq_sub_joining_fetch_cfg_t, subscriber_priority, auth_tokens);
+PIN_AT(moq_sub_joining_fetch_cfg_t, auth_tokens, 40, 28, 32);
+PIN_AT(moq_sub_joining_fetch_cfg_t, auth_token_count, 48, 32, 36);
+PIN_SIZE(moq_sub_joining_fetch_cfg_t, 56, 36, 40);
+PIN_V0(MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE, 40, 28, 32);
 PIN_AT(moq_pub_new_group_request_info_t, requested_group, 8, 8, 8);
 PIN_AT(moq_pub_new_group_request_info_t, current_group, 16, 16, 16);
 PIN_SIZE(moq_pub_new_group_request_info_t, 24, 24, 24);
@@ -1012,7 +1026,12 @@ PIN_AT(moq_media_receiver_cfg_t, max_stream_terminals,
        112, 80 - ABI_RECEIVER_ENUM_SHIFT, 88);
 PIN_AT(moq_media_receiver_cfg_t, surface_stream_terminals,
        116, 84 - ABI_RECEIVER_ENUM_SHIFT, 92);
-PIN_SIZE(moq_media_receiver_cfg_t, 120, 88 - ABI_RECEIVER_ENUM_SHIFT, 96);
+PIN_THROUGH(moq_media_receiver_cfg_t, surface_stream_terminals,
+            120, 88 - ABI_RECEIVER_ENUM_SHIFT, 96, 8, 4, 8);
+PIN_AFTER(moq_media_receiver_cfg_t, surface_stream_terminals, resource_auth);
+PIN_AT(moq_media_receiver_cfg_t, resource_auth,
+       120, 88 - ABI_RECEIVER_ENUM_SHIFT, 96);
+PIN_SIZE(moq_media_receiver_cfg_t, 128, 92 - ABI_RECEIVER_ENUM_SHIFT, 104);
 /* The descriptor's render-group block starts at the complete sizeof
  * through alt_group. */
 PIN_THROUGH(moq_media_track_desc_t, alt_group, 512, 356, 368, 8, 4, 8);
@@ -1044,6 +1063,10 @@ PIN_AFTER(moq_media_receiver_stats_t, reorder_refused, tracks_malformed);
 #endif
 
 #ifdef ABI_HAVE_MEDIA_SENDER
+PIN_THROUGH(moq_media_sender_cfg_t, companion_profile, 184, 108, 120, 8, 4, 8);
+PIN_AFTER(moq_media_sender_cfg_t, companion_profile, resource_auth);
+PIN_AT(moq_media_sender_cfg_t, resource_auth, 184, 112, 120);
+PIN_SIZE(moq_media_sender_cfg_t, 192, 116, 128);
 /* The media track's Track Properties start exactly at the sizeof of the
  * layout that ends at the MPEG2TS block (its enum members change that sizeof
  * under short enums, so the pin is relational), never in its tail padding.

@@ -5,6 +5,7 @@
 add_library(moq-service
     src/endpoint.c
     src/endpoint_uri.c
+    src/media_auth.c
     src/media_receiver.c
     src/media_sender.c
 )
@@ -252,6 +253,18 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 endif()
 
 if(MOQ_BUILD_TESTS)
+    add_executable(test_media_auth tests/test_media_auth.c src/media_auth.c)
+    target_include_directories(test_media_auth PRIVATE include src)
+    target_link_libraries(test_media_auth PRIVATE moq::core)
+    target_compile_features(test_media_auth PRIVATE c_std_11)
+    target_compile_definitions(test_media_auth PRIVATE MOQ_BUILDING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_media_auth PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME media_auth COMMAND test_media_auth)
+    set_tests_properties(media_auth PROPERTIES TIMEOUT 10)
+
     # White-box target: the resolution layer is internal (endpoint_internal.h,
     # not installed); tests compile the sources directly so the internal
     # symbols stay un-exported in the shared library (same pattern as
@@ -486,7 +499,10 @@ if(MOQ_BUILD_TESTS)
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
     # object set so the testing define never leaks into the shipping library.
-    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
+    # Direct production-TU fixtures link this endpoint-only support instead
+    # of a second sender/receiver object; they also need the shared auth helper.
+    add_library(moq-service-endpoint-test-internals OBJECT
+        src/endpoint.c src/endpoint_uri.c src/media_auth.c)
     target_include_directories(moq-service-endpoint-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -576,7 +592,7 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(media_receiver_init PROPERTIES TIMEOUT 30)
 
         add_library(moq-service-receiver-test-internals OBJECT
-            src/media_receiver.c src/endpoint.c src/endpoint_uri.c)
+            src/media_receiver.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -705,6 +721,16 @@ if(MOQ_BUILD_TESTS)
         # receiver_hook with a simpair client session and inject crafted moqx
         # control + subgroup data bytes. Requires moq-sim.
         if(TARGET moq::sim)
+            add_executable(test_media_receiver_auth tests/test_media_receiver_auth.c)
+            target_link_libraries(test_media_receiver_auth PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_auth PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_receiver_auth PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_receiver_auth COMMAND test_media_receiver_auth)
+            set_tests_properties(media_receiver_auth PROPERTIES TIMEOUT 30)
+
             # This fixture includes the production receiver conversion, so link
             # endpoint-only support rather than a second receiver object.
             add_executable(test_media_receiver_companion
@@ -1067,7 +1093,7 @@ if(MOQ_BUILD_TESTS)
         # the sender would publish after add/remove, to pin coalescing and the
         # no-op dedup deterministically.
         add_library(moq-service-sender-test-internals OBJECT
-            src/media_sender.c src/endpoint.c src/endpoint_uri.c)
+            src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-sender-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1099,6 +1125,16 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME media_track_cfg_init COMMAND test_media_track_cfg_init)
 
         if(TARGET moq::sim)
+            add_executable(test_media_sender_auth tests/test_media_sender_auth.c)
+            target_link_libraries(test_media_sender_auth PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_auth PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_auth PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_auth COMMAND test_media_sender_auth)
+            set_tests_properties(media_sender_auth PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_sender_priority
                 tests/test_media_sender_priority.c)
             target_link_libraries(test_media_sender_priority PRIVATE
@@ -1324,7 +1360,8 @@ if(MOQ_BUILD_TESTS)
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                src/media_sender.c src/media_receiver.c src/endpoint.c src/endpoint_uri.c)
+                src/media_sender.c src/media_receiver.c src/media_auth.c
+                src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1627,7 +1664,7 @@ if(MOQ_BUILD_TESTS)
             set(_stage_facade_libs ${_MOQ_SERVICE_FACADE_LIBS})
             list(REMOVE_ITEM _stage_facade_libs moq::adapter-picoquic-threaded)
             add_library(moq-service-sender-stage-test-internals OBJECT
-                src/media_sender.c src/endpoint.c src/endpoint_uri.c)
+                src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-sender-stage-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1714,7 +1751,7 @@ if(MOQ_BUILD_TESTS)
         set(_stage_wt_facade_libs ${_MOQ_SERVICE_FACADE_LIBS})
         list(REMOVE_ITEM _stage_wt_facade_libs moq::adapter-pico-wt-managed)
         add_library(moq-service-sender-stage-wt-test-internals OBJECT
-            src/media_sender.c src/endpoint.c src/endpoint_uri.c)
+            src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-sender-stage-wt-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

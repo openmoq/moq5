@@ -481,6 +481,19 @@ typedef struct moq_pub_track_cfg {
      * DYNAMIC_GROUPS = 0 is MOQ_ERR_INVAL. Read only when struct_size covers
      * the field. */
     bool            dynamic_groups;
+    /* Appended after dynamic_groups and the complete previous allocation.
+     * Credentials for an actual namespace advertisement, borrowed for
+     * add_track and encoded before success (D16/D18/D22). Ignored when
+     * advertise_namespace is false or the namespace is already shared.
+     * Use the sized initializer. An absent pair means anonymous; a size
+     * ending inside the pointer/count pair is INVAL. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *namespace_auth_tokens;
+    size_t                 namespace_auth_token_count;
 } moq_pub_track_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original

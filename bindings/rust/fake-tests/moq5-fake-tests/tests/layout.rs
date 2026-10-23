@@ -41,6 +41,9 @@ fn rust_side() -> BTreeMap<String, Entry> {
         moq_bytes_t { data, len }
         moq_namespace_t { parts, count }
         moq_auth_token_t { token_type, token_value }
+        moq_media_auth_request_t { struct_size, action, track_namespace, track_name }
+        moq_media_auth_outcome_info_t { struct_size, scope, outcome, track, request, result }
+        moq_media_auth_cfg_t { struct_size, ctx, tokens, token_count, select, on_outcome }
         moq_alloc_t { ctx, alloc, realloc, free }
         moq_version_offer_t { struct_size, policy, versions, version_count }
         moq_endpoint_cfg_t {
@@ -56,6 +59,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             queue_max_objects, queue_max_bytes, pre_ready_max_objects, pre_ready_max_bytes,
             validate_cmaf, content_protections, content_protection_count, callbacks,
             publish_tracks, drop_without_demand, catalog_refresh_interval_us, companion_profile,
+            resource_auth,
         }
         moq_media_track_cfg_t {
             struct_size, name, media_type, packaging, codec, timescale, init_data, role, lang,
@@ -91,7 +95,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             struct_size, endpoint, namespace_, catalog_track, auto_subscribe, time_mode,
             overflow, max_track_events, mpeg2ts_reorder_slots, mpeg2ts_reorder_window_us,
             mpeg2ts_strip_prefix, mpeg2ts_join_psi, companion_profile, max_stream_terminals,
-            surface_stream_terminals,
+            surface_stream_terminals, resource_auth,
         }
         moq_media_receiver_track_subscribe_cfg_t {
             struct_size, start, has_priority, priority, mpeg2ts_program_number, location, fill,
@@ -197,6 +201,18 @@ fn rust_side() -> BTreeMap<String, Entry> {
     player_side(&mut v);
     for (name, value) in [
         ("MOQ_ENDPOINT_CFG_V0_SIZE", sys::MOQ_ENDPOINT_CFG_V0_SIZE),
+        (
+            "MOQ_MEDIA_AUTH_REQUEST_V0_SIZE",
+            sys::MOQ_MEDIA_AUTH_REQUEST_V0_SIZE,
+        ),
+        (
+            "MOQ_MEDIA_AUTH_OUTCOME_INFO_V0_SIZE",
+            sys::MOQ_MEDIA_AUTH_OUTCOME_INFO_V0_SIZE,
+        ),
+        (
+            "MOQ_MEDIA_AUTH_CFG_V0_SIZE",
+            sys::MOQ_MEDIA_AUTH_CFG_V0_SIZE,
+        ),
         (
             "MOQ_ENDPOINT_TERMINAL_V0_SIZE",
             sys::MOQ_ENDPOINT_TERMINAL_V0_SIZE,
@@ -480,6 +496,19 @@ fn generated_types_match_the_c_compiler() {
 
 #[test]
 fn the_floors_lie_within_the_records() {
+    assert_eq!(
+        sys::MOQ_MEDIA_AUTH_REQUEST_V0_SIZE,
+        offset_of!(sys::moq_media_auth_request_t, track_name) + size_of::<sys::moq_bytes_t>()
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_AUTH_OUTCOME_INFO_V0_SIZE,
+        offset_of!(sys::moq_media_auth_outcome_info_t, result) + size_of::<sys::moq_result_t>()
+    );
+    assert_eq!(
+        sys::MOQ_MEDIA_AUTH_CFG_V0_SIZE,
+        offset_of!(sys::moq_media_auth_cfg_t, on_outcome)
+            + size_of::<sys::moq_media_auth_outcome_fn>()
+    );
     assert!(sys::MOQ_ENDPOINT_CFG_V0_SIZE <= size_of::<sys::moq_endpoint_cfg_t>());
     assert_eq!(
         sys::MOQ_ENDPOINT_CFG_V0_SIZE,

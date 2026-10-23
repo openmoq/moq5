@@ -92,8 +92,15 @@ static void test_setup_tokens(void)
     tokens[0].token_value = (moq_bytes_t){ NULL, 2 };
     MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
     tokens[0].token_value = (moq_bytes_t){ v, sizeof(v) };
-    tokens[0].token_type = UINT64_C(1) << 62;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), MOQ_ERR_INVAL);
+    /* The negotiated profile owns width validation: AUTO may select a vi64
+     * profile. Resolve still checks spans, budgets and backend capability. */
+    const uint64_t types[] = {(UINT64_C(1) << 62) - 1, UINT64_C(1) << 62, UINT64_MAX};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        tokens[0].token_type = types[i];
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)with);
+        if (with == MOQ_OK)
+            MOQ_TEST_CHECK(r.setup_auth_tokens[0].token_type == types[i]);
+    }
     tokens[0].token_type = 7;
 
     /* The SETUP carrying them must fit the default 4096-byte session send

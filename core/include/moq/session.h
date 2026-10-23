@@ -289,7 +289,8 @@ typedef struct moq_session_cfg {
      * can be registered before the session exists. The tokens and their values are
      * copied by moq_session_create; the caller's storage need not outlive
      * the call. At most 16 tokens, each token_type within the version's
-     * encoding (at most 2^62-1 on draft-16, any uint64 on draft-18 and
+     * encoding (at most 2^62-1 on draft-16, including zero/default version;
+     * any uint64_t on draft-18 and
      * draft-22) and each value at most 65535 bytes, and together they must
      * fit the setup message
      * (MOQ_ERR_INVAL at create otherwise). Read only when struct_size covers

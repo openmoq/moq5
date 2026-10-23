@@ -87,6 +87,12 @@ int main()
     if (ec.verify_certificate != consumerVerifyCertificate)
         return 1;
 
+    moq_media_auth_cfg_t auth;
+    moq_media_auth_cfg_init(&auth);
+    if (auth.struct_size != sizeof(auth) || auth.select != nullptr ||
+        auth.tokens != nullptr || auth.on_outcome != nullptr)
+        return 1;
+
     /* Exact frozen stamp, with no write into the appended tails. */
     moq_media_receiver_cfg_t rcfg;
     std::memset(&rcfg, 0xa5, sizeof(rcfg));

@@ -1164,8 +1164,7 @@ static void test_shared_init_ref_survives_removal(
     (void)init_track(s, "B", packaging, x, sizeof(x));
     static const char *const g0[] = {
         "\"name\":\"A\"", "\"name\":\"B\"",
-        "\"initDataList\":[{\"id\":\"A\",\"type\":\"inline\","
-        "\"data\":\"AAAAGA==\"}]",
+        "\"initDataList\":[{\"id\":\"A\",\"type\":\"inline\",\"data\":\"AAAAGA==\"}]",
     };
     ship_catalog(s, r, 0, g0, 3);
     int added, removed;
@@ -1176,8 +1175,7 @@ static void test_shared_init_ref_survives_removal(
                           (int)MOQ_OK);
     static const char *const g1[] = {
         "\"name\":\"B\"", "\"initRef\":\"A\"",
-        "\"initDataList\":[{\"id\":\"A\",\"type\":\"inline\","
-        "\"data\":\"AAAAGA==\"}]",
+        "\"initDataList\":[{\"id\":\"A\",\"type\":\"inline\",\"data\":\"AAAAGA==\"}]",
     };
     ship_catalog(s, r, 1, g1, 3);
     count_events(r, &added, &removed);

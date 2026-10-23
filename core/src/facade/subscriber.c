@@ -1629,6 +1629,12 @@ void moq_sub_update_cfg_init_sized(moq_sub_update_cfg_t *cfg,
     cfg->struct_size = (uint32_t)n;
 }
 
+_Static_assert(offsetof(moq_sub_update_cfg_t, auth_tokens) ==
+    ((offsetof(moq_sub_update_cfg_t, subgroup_delivery_timeout_ms) + sizeof(uint64_t) +
+      _Alignof(moq_sub_update_cfg_t) - 1) &
+     ~(size_t)(_Alignof(moq_sub_update_cfg_t) - 1)),
+    "update credentials must follow the complete D22 timeout block");
+
 moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
                                            moq_sub_track_t *track,
                                            const moq_sub_update_cfg_t *cfg,
@@ -1639,6 +1645,11 @@ moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
     /* Frozen v0 floor: an old caller's 24-byte struct stays valid; the
      * appended filter block is whole-block-gated below. */
     if (cfg->struct_size < MOQ_SUB_UPDATE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+    const size_t auth_end = offsetof(moq_sub_update_cfg_t, auth_token_count) +
+                            sizeof(cfg->auth_token_count);
+    if (cfg->struct_size > offsetof(moq_sub_update_cfg_t, auth_tokens) &&
+        cfg->struct_size < auth_end)
+        return MOQ_ERR_INVAL;
     if (sub->closed) return MOQ_ERR_CLOSED;
     if (track->state != SUB_TRACK_ACTIVE) return MOQ_ERR_WRONG_STATE;
 
@@ -1650,6 +1661,10 @@ moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
     ucfg.forward = cfg->forward;
     ucfg.has_delivery_timeout = cfg->has_delivery_timeout;
     ucfg.delivery_timeout_us = cfg->delivery_timeout_us;
+    if (cfg->struct_size >= auth_end) {
+        ucfg.auth_tokens = cfg->auth_tokens;
+        ucfg.auth_token_count = cfg->auth_token_count;
+    }
     if (cfg->struct_size >= offsetof(moq_sub_update_cfg_t, end_group) +
                                 sizeof(cfg->end_group) &&
         cfg->has_filter) {
@@ -2882,11 +2897,26 @@ moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
 
 /* -- Joining fetch -------------------------------------------------- */
 
+_Static_assert(MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE ==
+    ((offsetof(moq_sub_joining_fetch_cfg_t, subscriber_priority) + sizeof(uint8_t) +
+      _Alignof(moq_sub_joining_fetch_cfg_t) - 1) &
+     ~(size_t)(_Alignof(moq_sub_joining_fetch_cfg_t) - 1)),
+    "joining fetch credentials must start beyond the complete old allocation");
+
 void moq_sub_joining_fetch_cfg_init(moq_sub_joining_fetch_cfg_t *cfg)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    memset(cfg, 0, MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE);
+    cfg->struct_size = (uint32_t)MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE;
+}
+
+void moq_sub_joining_fetch_cfg_init_sized(moq_sub_joining_fetch_cfg_t *cfg,
+                                        size_t cfg_size)
+{
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
@@ -2896,7 +2926,12 @@ moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
 {
     if (!sub || !cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
-    if (cfg->struct_size < sizeof(moq_sub_joining_fetch_cfg_t))
+    if (cfg->struct_size < MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    const size_t auth_end = offsetof(moq_sub_joining_fetch_cfg_t, auth_token_count) +
+                            sizeof(cfg->auth_token_count);
+    if (cfg->struct_size > MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE &&
+        cfg->struct_size < auth_end)
         return MOQ_ERR_INVAL;
     if (!cfg->track) return MOQ_ERR_INVAL;
     if (cfg->track->sub != sub) return MOQ_ERR_INVAL;
@@ -2907,11 +2942,15 @@ moq_result_t moq_sub_joining_fetch(moq_subscriber_t *sub,
     if (!r) return MOQ_ERR_WOULD_BLOCK;
 
     moq_fetch_cfg_t fcfg;
-    moq_fetch_cfg_init(&fcfg);
+    moq_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
     fcfg.is_joining = true;
     fcfg.joining_sub = cfg->track->handle;
     fcfg.joining_relative = cfg->relative;
     fcfg.joining_start = cfg->joining_start;
+    if (cfg->struct_size >= auth_end) {
+        fcfg.auth_tokens = cfg->auth_tokens;
+        fcfg.auth_token_count = cfg->auth_token_count;
+    }
     fcfg.group_order = cfg->group_order;
     fcfg.has_subscriber_priority = cfg->has_subscriber_priority;
     fcfg.subscriber_priority = cfg->subscriber_priority;

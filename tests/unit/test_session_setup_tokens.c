@@ -27,6 +27,7 @@
 static int failures = 0;
 
 #include "../support/bridge_wire_pair.h"
+#include "test_binding_support.h"
 #include <moq/control_d18.h>
 
 #include <stddef.h>
@@ -106,6 +107,8 @@ static bool open_and_collect(rl_pair_t *p, moq_version_t v, token_side_t *t,
     o.tune(&sc, false, o.tune_ctx);
     if (moq_session_create(&cc, p->now, &p->c) < 0) return false;
     if (moq_session_create(&sc, p->now, &p->s) < 0) return false;
+    if (test_bind_if_required(p->c) < 0 || test_bind_if_required(p->s) < 0)
+        return false;
     fake_endpoint_init(&p->cep, 1000, 2000);
     fake_endpoint_init(&p->sep, 3000, 4000);
     p->cep.vtable.capabilities |= MOQ_TRANSPORT_CAP_HOLD_INPUT;
@@ -117,7 +120,7 @@ static bool open_and_collect(rl_pair_t *p, moq_version_t v, token_side_t *t,
     if (moq_transport_bridge_create(&bc, p->s, &p->sep.vtable, &p->sep, &p->sb) < 0)
         return false;
     if (moq_session_start(p->c, p->now) < 0) return false;
-    if (v == MOQ_VERSION_DRAFT_18 && moq_session_start(p->s, p->now) < 0)
+    if (v != MOQ_VERSION_DRAFT_16 && moq_session_start(p->s, p->now) < 0)
         return false;
     shuttle(p);
     moq_session_t *receiver = t->on_server ? p->c : p->s;
@@ -149,6 +152,7 @@ static bool open_and_collect(rl_pair_t *p, moq_version_t v, token_side_t *t,
 
 static const char *vname(moq_version_t v)
 {
+    if (v == MOQ_VERSION_DRAFT_22) return "draft-22";
     return v == MOQ_VERSION_DRAFT_18 ? "draft-18" : "draft-16";
 }
 
@@ -809,11 +813,55 @@ static int row_d18_codec(void)
     return failures;
 }
 
+/* SETUP width is selected before allocation. Zero retains the actual D16
+ * default; explicit D18/D22 must preserve every uint64_t bit at the peer. */
+static int row_type_width(moq_version_t v)
+{
+    failures = 0;
+    const uint64_t types[] = {MOQ_QUIC_VARINT_MAX, UINT64_C(1) << 62, UINT64_MAX};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        moq_auth_token_t tok = {types[i], {(const uint8_t *)"x", 1}};
+        if (v == MOQ_VERSION_DRAFT_16 && i > 0) {
+            test_alloc_state_t as = {0};
+            moq_alloc_t a = test_allocator(&as);
+            moq_session_cfg_t c;
+            moq_session_cfg_init_sized(&c, sizeof(c), &a, MOQ_PERSPECTIVE_CLIENT);
+            c.setup_auth_tokens = &tok;
+            c.setup_auth_token_count = 1;
+            for (int explicit_version = 0; explicit_version < 2; explicit_version++) {
+                c.version = explicit_version ? v : 0;
+                moq_session_t *s = NULL;
+                MOQ_TEST_CHECK(moq_session_create(&c, 0, &s) == MOQ_ERR_INVAL);
+                MOQ_TEST_CHECK(s == NULL && as.balance == 0);
+                if (s) moq_session_destroy(s);
+            }
+            continue;
+        }
+        for (int server = 0; server < 2; server++) {
+            token_side_t t = {.tokens = &tok, .count = 1, .on_server = server != 0};
+            rl_pair_t p;
+            got_tokens_t got;
+            bool ok = open_and_collect(&p, v, &t, &got);
+            MOQ_TEST_CHECK(ok);
+            if (ok) {
+                MOQ_TEST_CHECK(got.count == 1);
+                MOQ_TEST_CHECK(got.type[0] == types[i]);
+                MOQ_TEST_CHECK(got.len[0] == 1 && got.first[0] == 'x');
+            }
+            pair_close(&p);
+        }
+    }
+    if (!failures) printf("PASS: setup token width %s\n", vname(v));
+    return failures;
+}
+
 int main(void)
 {
     int total = 0;
+    total += row_type_width(MOQ_VERSION_DRAFT_22);
     const moq_version_t vers[2] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18 };
     for (int i = 0; i < 2; i++) {
+        total += row_type_width(vers[i]);
         total += row_tokens_reach_peer(vers[i]);
         total += row_large_token(vers[i]);
         total += row_owned_copy(vers[i]);

@@ -15,6 +15,7 @@
 
 #include <moq/media_receiver.h>
 #include <moq/subscriber.h>
+#include "media_auth_internal.h"
 #include <moq/msf.h>
 #include <moq/msf_media.h>
 #include <moq/media_object.h>
@@ -215,6 +216,11 @@ _Static_assert(offsetof(moq_media_receiver_cfg_t, mpeg2ts_join_psi) ==
 _Static_assert(offsetof(moq_media_receiver_cfg_t, companion_profile) >=
                sizeof(receiver_cfg_before_companion_t),
                "companion must not reuse the MPEG2TS-era tail padding");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) >=
+               ((offsetof(moq_media_receiver_cfg_t, surface_stream_terminals) +
+                 sizeof(bool) + _Alignof(moq_media_receiver_cfg_t) - 1u) &
+                ~((size_t)_Alignof(moq_media_receiver_cfg_t) - 1u)),
+               "resource_auth must follow the complete stream-terminal allocation");
 _Static_assert(offsetof(moq_media_receiver_track_subscribe_cfg_t, location) >=
                offsetof(moq_media_receiver_track_subscribe_cfg_t,
                         mpeg2ts_program_number) + sizeof(uint32_t),
@@ -252,6 +258,12 @@ typedef struct receiver_track_options {
 } receiver_track_options_t;
 
 struct moq_media_track {
+    /* Selection is executor-owned; failure and intent are mu-published. */
+    moq_media_auth_operation_t auth_operation;
+    moq_media_auth_action_t auth_action;
+    uint64_t auth_generation;
+    bool auth_forward;
+    bool auth_failed;
     moq_media_track_desc_t desc;
     moq_rcbuf_t           *init_buf;   /* owned; desc.init/init_data borrow */
 
@@ -520,6 +532,9 @@ typedef struct receiver_fill_dom {
 
 struct moq_media_receiver {
     moq_alloc_t     alloc;
+    moq_media_auth_source_t auth_source;
+    moq_media_auth_operation_t catalog_auth;
+    moq_media_auth_operation_t fetch_auth;
     moq_endpoint_t *ep;
     bool            owns_endpoint;
 
@@ -1014,6 +1029,20 @@ static void receiver_note_parse_drop(moq_media_receiver_t *r,
 }
 
 #ifdef MOQ_MEDIA_RECEIVER_TESTING
+/* Models a concurrent app cancellation after selection, without reentry from
+ * inside the selector. Never present in the shipping library. */
+static void (*g_auth_hook)(moq_media_receiver_t *, moq_media_track_t *, void *);
+static void *g_auth_hook_ctx;
+void moq_media_receiver_test_set_auth_hook(
+    void (*fn)(moq_media_receiver_t *, moq_media_track_t *, void *), void *ctx);
+void moq_media_receiver_test_set_auth_hook(
+    void (*fn)(moq_media_receiver_t *, moq_media_track_t *, void *), void *ctx)
+{
+    g_auth_hook = fn;
+    g_auth_hook_ctx = ctx;
+}
+#define AUTH_PRE_ADMIT(r, t) \
+    do { if (g_auth_hook) g_auth_hook((r), (t), g_auth_hook_ctx); } while (0)
 /* Test-only interleaving hook: invoked by the reconciler BETWEEN the
  * {desired, app_gen} snapshot and the wire send, with no locks held, so a
  * test can toggle app intent at exactly the racy instant and prove the
@@ -1076,6 +1105,7 @@ void moq_media_receiver_test_set_pub_phase_hook(
     do { if (g_pub_phase_hook) g_pub_phase_hook((r), (ph), g_pub_phase_hook_ctx); } \
     while (0)
 #else
+#define AUTH_PRE_ADMIT(r, t) ((void)0)
 #define RECONCILE_RACE_HOOK() ((void)0)
 #define PUB_PHASE_HOOK(r, ph) ((void)0)
 #endif
@@ -1551,6 +1581,7 @@ static void receiver_ts_free(moq_media_receiver_t *r, moq_media_track_t *t);
 static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
     if (!t) return;
+    moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
     receiver_ts_free(r, t);
     if (t->desc_ext)
         r->alloc.free(t->desc_ext, t->desc_ext_size, r->alloc.ctx);
@@ -2191,13 +2222,14 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
         if (t->removed || t->recon_seen) continue;
+        moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
         pthread_mutex_lock(&r->mu);
         t->removed = true;
         t->removed_by_completion = completing;
         /* Keep wanted media in flight after completion; do not revive a
          * subscription the application already cancelled. */
         if (!completing) t->desired_subscribed = false;
-        if (completing && t->local_result == MOQ_OK) {
+        if (completing && t->local_result == MOQ_OK && !t->auth_failed) {
             t->completion_pending = true;
             t->completion_cancelled = !t->desired_subscribed;
             pthread_mutex_unlock(&r->mu);
@@ -2210,7 +2242,7 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
          * terminals still queued for it reach the lane under the removed
          * handle. receiver_retire_tracks retries a refused unsubscribe or
          * release on every pass. */
-        if (t->sub_track && t->local_result == MOQ_OK)
+        if (t->sub_track && t->local_result == MOQ_OK && !t->auth_failed)
             receiver_retire_subscription(r, &t->sub_track, now_us,
                                          receiver_facade_drained(r));
         receiver_ts_free(r, t);
@@ -3040,7 +3072,8 @@ static void receiver_take_fill_item(moq_media_receiver_t *r,
     pthread_mutex_unlock(&r->mu);
     if (fi->kind == MOQ_SUB_FILL_OBJECT) {
         moq_media_track_t *t = track_for_sub(r, fi->track);
-        if (t && (t->local_result == MOQ_OK || t->delivery_failed)) {
+        if (t && !t->auth_failed &&
+            (t->local_result == MOQ_OK || t->delivery_failed)) {
             /* Ownership of the item's refs passes to the intake. */
             moq_sub_object_t so;
             memset(&so, 0, sizeof(so));
@@ -3083,26 +3116,135 @@ static void receiver_take_fill_item(moq_media_receiver_t *r,
     moq_sub_fill_item_cleanup(fi);
 }
 
+static moq_media_auth_request_t receiver_auth_request(moq_media_receiver_t *r,
+    moq_media_auth_action_t action, moq_media_track_t *track)
+{
+    moq_media_auth_request_t request = {0};
+    request.struct_size = sizeof(request);
+    request.action = action;
+    request.track_namespace = r->namespace_;
+    request.track_name = track ? track->desc.name :
+        (moq_bytes_t){r->catalog_name, r->catalog_name_len};
+    return request;
+}
+
+static bool receiver_admission_retry(moq_result_t rc)
+{
+    return rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_REQUEST_BLOCKED;
+}
+
+static void receiver_auth_clear_pending(moq_media_receiver_t *r)
+{
+    moq_media_auth_operation_clear(&r->catalog_auth, &r->alloc);
+    moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
+    for (size_t i = 0; i < r->track_count; i++)
+        moq_media_auth_operation_clear(&r->tracks[i]->auth_operation, &r->alloc);
+}
+
+/* Native INVAL can describe identity conflicts, not just token encoding.
+ * Preserve ordinary handling instead of inventing an auth diagnosis. */
+static bool receiver_auth_encoding_error(moq_media_receiver_t *r,
+    moq_media_auth_operation_t *op, moq_result_t rc)
+{
+    if (!r->auth_source.configured) return false;
+    if (rc == MOQ_ERR_BUFFER) op->outcome = MOQ_MEDIA_AUTH_OUTCOME_TOKEN_LIMIT;
+    else if (rc == MOQ_ERR_UNSUPPORTED)
+        op->outcome = MOQ_MEDIA_AUTH_OUTCOME_UNSUPPORTED_PROFILE;
+    else return false;
+    op->status = op->result = rc;
+    return true;
+}
+
+static void receiver_auth_fail(moq_media_receiver_t *r,
+    moq_media_auth_operation_t *op, const moq_media_auth_request_t *request,
+    moq_media_auth_scope_t scope, moq_media_track_t *t)
+{
+    pthread_mutex_lock(&r->mu);
+    if (scope == MOQ_MEDIA_AUTH_SCOPE_SERVICE) {
+        r->fatal = true;
+        r->fatal_code = MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED;
+        /* Reuse the child-aware executor drain, not an auth-only shortcut. */
+        r->catalog_ack_failed = true;
+    } else if (scope == MOQ_MEDIA_AUTH_SCOPE_REQUEST) {
+        r->catalog_fetch_issued = true;
+    } else {
+        t->auth_failed = true;
+        t->desired_subscribed = false;
+        t->upd_notify_app = false;
+        t->update_inflight = false;
+        t->upd_sent_app_gen = 0;
+        t->done_pending = false;
+        obj_compact_locked(r, keep_not_track, t);
+        uint32_t out = r->sap_head;
+        for (uint32_t in = r->sap_head; in != r->sap_tail; in++) {
+            if (r->saps[in % r->sap_cap].track != t)
+                r->saps[out++ % r->sap_cap] = r->saps[in % r->sap_cap];
+        }
+        r->sap_tail = out;
+        out = r->mt_head;
+        for (uint32_t in = r->mt_head; in != r->mt_tail; in++) {
+            if (r->mts[in % r->mt_cap].track != t)
+                r->mts[out++ % r->mt_cap] = r->mts[in % r->mt_cap];
+        }
+        r->mt_tail = out;
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (t) receiver_ts_free(r, t);
+    moq_media_auth_operation_notify(op, &r->auth_source, request, scope, t);
+    moq_media_auth_operation_clear(op, &r->alloc);
+    moq_endpoint_wake(r->ep);
+}
+
 static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
                                         uint64_t now_us)
 {
     if (!r->sub || !r->catalog_sub) return;
 
+    moq_sub_track_state_t state = moq_sub_track_get_state(r->catalog_sub);
+    if (!r->catalog_fetch_issued &&
+        (state == MOQ_SUB_TRACK_DONE || state == MOQ_SUB_TRACK_ERROR)) {
+        moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
+        r->catalog_fetch_issued = true;
+    }
     if (!r->joins_by_fill &&
         !r->catalog_fetch_issued && moq_sub_track_is_active(r->catalog_sub)) {
         moq_sub_joining_fetch_cfg_t fcfg;
-        moq_sub_joining_fetch_cfg_init(&fcfg);
+        moq_sub_joining_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
         fcfg.track = r->catalog_sub;
         fcfg.relative = true;     /* offset measured from the largest group */
         fcfg.joining_start = 0;   /* §5: offset = 0 -> the latest group */
-        moq_result_t rc = moq_sub_joining_fetch(r->sub, &fcfg, now_us,
+        moq_media_auth_request_t request = receiver_auth_request(r,
+            MOQ_MEDIA_AUTH_ACTION_FETCH, NULL);
+        moq_result_t rc = moq_media_auth_operation_prepare(&r->fetch_auth,
+            &r->auth_source, &request, r->transport_version, &r->alloc);
+        AUTH_PRE_ADMIT(r, NULL);
+        pthread_mutex_lock(&r->mu);
+        bool current = !r->fatal && !r->catalog_fetch_issued;
+        pthread_mutex_unlock(&r->mu);
+        if (!current || !moq_sub_track_is_active(r->catalog_sub)) {
+            moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
+            return;
+        }
+        if (rc != MOQ_OK) {
+            receiver_auth_fail(r, &r->fetch_auth, &request,
+                MOQ_MEDIA_AUTH_SCOPE_REQUEST, NULL);
+            return;
+        }
+        fcfg.auth_tokens = r->fetch_auth.list.tokens;
+        fcfg.auth_token_count = r->fetch_auth.list.count;
+        rc = moq_sub_joining_fetch(r->sub, &fcfg, now_us,
                                                 &r->catalog_fetch);
         /* WOULD_BLOCK (no fetch slot / action queue full) is transient: leave
          * the flag clear so the next pump cycle retries. Any other error means
          * the FETCH cannot be placed -- give up and rely on the SUBSCRIBE path
          * rather than spin. */
-        if (rc != MOQ_ERR_WOULD_BLOCK)
+        if (receiver_auth_encoding_error(r, &r->fetch_auth, rc))
+            receiver_auth_fail(r, &r->fetch_auth, &request,
+                MOQ_MEDIA_AUTH_SCOPE_REQUEST, NULL);
+        else if (!receiver_admission_retry(rc)) {
             r->catalog_fetch_issued = true;
+            moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
+        }
     }
 
     moq_sub_fetch_item_t item;
@@ -3142,9 +3284,11 @@ static void receiver_mark_track_ended(moq_media_receiver_t *r,
                                       moq_media_track_t *t)
 {
     pthread_mutex_lock(&r->mu);
-    bool first = !t->ended && t->local_result == MOQ_OK && !t->completion_cancelled;
+    bool first = !t->ended && t->local_result == MOQ_OK && !t->auth_failed &&
+                 !t->completion_cancelled;
     if (first) t->ended = true;
     pthread_mutex_unlock(&r->mu);
+    moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
     if (first)
         (void)rq_push(r, MOQ_MEDIA_TRACK_ENDED, t);
 }
@@ -3155,9 +3299,11 @@ static void receiver_mark_track_done(moq_media_receiver_t *r,
                                      moq_media_track_t *t, uint64_t status)
 {
     pthread_mutex_lock(&r->mu);
-    bool first = !t->ended && t->local_result == MOQ_OK && !t->completion_cancelled;
+    bool first = !t->ended && t->local_result == MOQ_OK && !t->auth_failed &&
+                 !t->completion_cancelled;
     if (first) t->ended = true;
     pthread_mutex_unlock(&r->mu);
+    moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
     if (!first || !rq_push(r, MOQ_MEDIA_TRACK_ENDED, t)) return;
     pthread_mutex_lock(&r->mu);
     receiver_event_t *e = &r->events[(r->ev_tail - 1) % r->ev_cap];
@@ -3309,7 +3455,7 @@ static void receiver_inspect_ack_results(moq_media_receiver_t *r, uint64_t now_u
     }
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
-        if (!t->sub_track || t->local_result != MOQ_OK) continue;
+        if (!t->sub_track || t->local_result != MOQ_OK || t->auth_failed) continue;
         moq_result_t rc = moq_sub_get_track_result(r->sub, t->sub_track,
                                                    &result, sizeof(result));
         if (rc == MOQ_ERR_NOMEM || rc == MOQ_ERR_BUFFER)
@@ -3376,7 +3522,7 @@ static void receiver_on_update_ok(void *ctx, moq_sub_track_t *track,
         if (r->tracks[i]->sub_track == track) { t = r->tracks[i]; break; }
     if (!t) return;
     pthread_mutex_lock(&r->mu);
-    bool notify = t->upd_notify_app;
+    bool notify = t->upd_notify_app && !t->auth_failed;
     t->upd_notify_app = false;
     t->update_inflight = false;
     t->upd_sent_app_gen = 0;
@@ -3412,7 +3558,7 @@ static void receiver_on_subscribe_done(void *ctx, moq_sub_track_t *track,
         return;
     }
     moq_media_track_t *t = track_for_sub(r, track);
-    if (!t) return;
+    if (!t || t->auth_failed) return;
     t->done_pending = true;
     t->done_status = status_code;
     if (status_code == MOQ_STREAM_ERROR_MALFORMED_TRACK) {
@@ -3637,7 +3783,7 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
      * preserves delivery. A straggler of evicted content is dropped even when
      * there is room; otherwise the overflow policy makes room and re-checks
      * the incoming object against the filter the eviction may have armed. */
-    bool wanted = track->desired_subscribed &&
+    bool wanted = track->desired_subscribed && !track->auth_failed &&
                   (track->local_result == MOQ_OK || track->delivery_failed);
     /* What the overflow policy drops here, the incoming Object included, is
      * safety loss recorded on the stream-terminal lane. */
@@ -3824,7 +3970,8 @@ static void receiver_on_media_object_with_origin(moq_media_receiver_t *r,
      * admission. */
     pthread_mutex_lock(&r->mu);
     bool wanted = track->desired_subscribed;
-    if ((track->local_result != MOQ_OK && !track->delivery_failed) ||
+    if (track->auth_failed ||
+        (track->local_result != MOQ_OK && !track->delivery_failed) ||
         (!wanted && so->status != MOQ_OBJECT_END_OF_TRACK)) {
         /* Count it as received-then-dropped so objects_dropped stays a subset of
          * objects_received (we skip the parse only as an optimization). */
@@ -3883,7 +4030,8 @@ static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
     d->has_prev = true;
     d->prev_group = so->group_id;
     d->prev_object = so->object_id;
-    if ((track->local_result != MOQ_OK && !track->delivery_failed) ||
+    if (track->auth_failed ||
+        (track->local_result != MOQ_OK && !track->delivery_failed) ||
         !track->desired_subscribed) {
         r->stats.objects_received++;
         r->stats.objects_dropped++;
@@ -4999,7 +5147,11 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         /* Failed generations retire separately, after both intake paths and
          * any pending child terminal have drained. Never project peer ENDED
          * or turn a local metadata failure into a VOD resubscribe. */
-        if (t->local_result != MOQ_OK) { t->done_pending = false; continue; }
+        if (t->local_result != MOQ_OK || t->auth_failed) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+            t->done_pending = false;
+            continue;
+        }
         uint64_t status = t->done_status;
 
         /* Every Object the subscription delivered is released before the
@@ -5020,6 +5172,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         }
         receiver_ts_free(r, t);
         t->done_pending = false;
+        moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
         /* the live subscription is gone; a pending app attribution
          * dies with it. The VOD-rearm replacement subscription's first
          * ack must not inherit it (and forward_sent resets with the fresh
@@ -5057,14 +5210,13 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
  * handle is left alone -- disabling a track does NOT tear its subscription down
  * (see receiver_reconcile_delivery), so repeated enable/disable never allocates
  * a fresh handle and the facade's bounded track table is never exhausted by
- * toggling. A subscribe that hits a transient WRONG_STATE/WOULD_BLOCK is retried
- * on a later cycle; a hard failure is receiver-fatal (as the auto path was). */
+ * toggling. Only documented capacity/credit refusals retain a selection. */
 static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
                                              uint64_t now_us)
 {
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
-        if (t->removed) continue;
+        if (t->removed || t->auth_failed) continue;
         /* Never subscribe a namespace-override track under the receiver
          * namespace (it is also refused at subscribe_track). */
         if (t->key_has_ns) continue;
@@ -5076,8 +5228,12 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         uint8_t prio = t->desired_priority;
         uint32_t ts_program = t->desired_ts_program;
         receiver_track_options_t options = t->desired_options;
+        uint64_t gen = t->app_gen;
         pthread_mutex_unlock(&r->mu);
 
+        if (t->ended || (!want &&
+                        t->auth_action == MOQ_MEDIA_AUTH_ACTION_SUBSCRIBE))
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
         if (!want || t->sub_track || t->ended || t->local_result != MOQ_OK) continue;
         /* The original done may precede either conversion or a terminal empty
          * catalog (MSF 11.3). Wait for the validated conversion before owning
@@ -5115,9 +5271,36 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
             tcfg.location = &loc;
             tcfg.fill = &fill;
         }
-        moq_result_t rc = moq_sub_subscribe(r->sub, &tcfg, now_us,
+        if (t->auth_action != MOQ_MEDIA_AUTH_ACTION_SUBSCRIBE ||
+            t->auth_generation != gen)
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+        t->auth_action = MOQ_MEDIA_AUTH_ACTION_SUBSCRIBE;
+        t->auth_generation = gen;
+        moq_media_auth_request_t request = receiver_auth_request(r, t->auth_action, t);
+        moq_result_t rc = moq_media_auth_operation_prepare(&t->auth_operation,
+            &r->auth_source, &request, r->transport_version, &r->alloc);
+        AUTH_PRE_ADMIT(r, t);
+        pthread_mutex_lock(&r->mu);
+        bool current = !r->fatal && !t->removed && !t->ended &&
+                       !t->auth_failed && t->local_result == MOQ_OK &&
+                       t->desired_subscribed && t->app_gen == gen;
+        pthread_mutex_unlock(&r->mu);
+        if (!current) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+            receiver_ts_free(r, t);
+            continue;
+        }
+        if (rc != MOQ_OK) {
+            receiver_auth_fail(r, &t->auth_operation, &request,
+                MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
+            continue;
+        }
+        tcfg.auth_tokens = t->auth_operation.list.tokens;
+        tcfg.auth_token_count = t->auth_operation.list.count;
+        rc = moq_sub_subscribe(r->sub, &tcfg, now_us,
                                             &t->sub_track);
         if (rc == MOQ_OK) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             t->forward_sent = true;     /* a fresh SUBSCRIBE forwards by default */
             t->forward_desired = true;
             t->has_drop_filter = false;
@@ -5128,10 +5311,14 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
             pthread_mutex_lock(&r->mu);
             t->requested = true;
             pthread_mutex_unlock(&r->mu);
-        } else if (rc == MOQ_ERR_WRONG_STATE || rc == MOQ_ERR_WOULD_BLOCK) {
+        } else if (receiver_admission_retry(rc)) {
             t->sub_track = NULL;        /* transient: retry next cycle */
             receiver_ts_free(r, t);
+        } else if (receiver_auth_encoding_error(r, &t->auth_operation, rc)) {
+            receiver_auth_fail(r, &t->auth_operation, &request,
+                MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
         } else {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
             return;
         }
@@ -5166,7 +5353,8 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
 
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
-        if (!t->sub_track || t->ended || t->removed || t->local_result != MOQ_OK) continue;
+        if (!t->sub_track || t->ended || t->removed || t->local_result != MOQ_OK ||
+            t->auth_failed) continue;
 
         /* Race rule: {desired_subscribed, app_gen} are
          * snapshotted TOGETHER under r->mu, and ONLY the snapshot
@@ -5191,6 +5379,7 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
         bool target = want && flow_allows;
         t->forward_desired = target;
         if (t->forward_desired == t->forward_sent) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             /* Wire-neutral pass: the SNAPSHOTTED app changes are proven
              * coalesced-away; reconcile them (and only them) silently. */
             pthread_mutex_lock(&r->mu);
@@ -5206,12 +5395,39 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
             t->update_inflight)
             continue;
         moq_sub_update_cfg_t ucfg;
-        moq_sub_update_cfg_init(&ucfg);
+        moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
         ucfg.has_forward = true;
         ucfg.forward = t->forward_desired;
-        moq_result_t rc = moq_sub_update_subscription(r->sub, t->sub_track,
-                                                      &ucfg, now_us);
+        if (t->auth_action != MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE ||
+            t->auth_generation != gen_snap || t->auth_forward != target)
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+        t->auth_action = MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE;
+        t->auth_generation = gen_snap;
+        t->auth_forward = target;
+        moq_media_auth_request_t request = receiver_auth_request(r, t->auth_action, t);
+        moq_result_t rc = moq_media_auth_operation_prepare(&t->auth_operation,
+            &r->auth_source, &request, r->transport_version, &r->alloc);
+        AUTH_PRE_ADMIT(r, t);
+        pthread_mutex_lock(&r->mu);
+        bool current = !r->fatal && !t->removed && !t->ended &&
+                       !t->auth_failed && t->local_result == MOQ_OK &&
+                       t->app_gen == gen_snap;
+        pthread_mutex_unlock(&r->mu);
+        /* Anonymous operation retains the existing snapshot-attribution rule. */
+        if (r->auth_source.configured && !current) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+            continue;
+        }
+        if (rc != MOQ_OK) {
+            receiver_auth_fail(r, &t->auth_operation, &request,
+                MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
+            continue;
+        }
+        ucfg.auth_tokens = t->auth_operation.list.tokens;
+        ucfg.auth_token_count = t->auth_operation.list.count;
+        rc = moq_sub_update_subscription(r->sub, t->sub_track, &ucfg, now_us);
         if (rc == MOQ_OK) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             t->forward_sent = t->forward_desired;
             /* Attribution is decided ONCE, from the SNAPSHOT taken with
              * the target computation (the race rule above). */
@@ -5222,8 +5438,11 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
             t->upd_sent_app_gen = gen_snap;
             t->update_inflight = true;
             pthread_mutex_unlock(&r->mu);
-        } else if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK &&
-                   rc != MOQ_ERR_REQUEST_BLOCKED) {
+        } else if (receiver_auth_encoding_error(r, &t->auth_operation, rc)) {
+            receiver_auth_fail(r, &t->auth_operation, &request,
+                MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
+        } else if (rc < 0 && !receiver_admission_retry(rc)) {
+            moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             receiver_mark_track_local_failure(r, t, rc,
                                                MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
         }
@@ -5240,7 +5459,7 @@ static void receiver_poll_group_ends(moq_media_receiver_t *r, uint64_t now_us)
     moq_sub_group_end_t ge;
     while (moq_sub_poll_group_end(r->sub, &ge) == MOQ_OK) {
         moq_media_track_t *t = track_for_sub(r, ge.track);
-        if (t && track_is_ts(t))
+        if (t && !t->auth_failed && track_is_ts(t))
             receiver_on_ts_group_end(r, t, ge.group_id, now_us);
     }
 }
@@ -5342,7 +5561,8 @@ static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us
         if (!cancelled && t->local_result == MOQ_OK && t->vod_rearmed &&
             !t->sub_track && !t->done_pending)
             receiver_mark_track_done(r, t, RECEIVER_DONE_TRACK_ENDED);
-        if (!cancelled && t->local_result == MOQ_OK && t->sub_track) {
+        if (!cancelled && t->local_result == MOQ_OK && !t->auth_failed &&
+            t->sub_track) {
             /* Live, or its done still to be processed (which releases the
              * slot once what it delivered has been taken in). */
             moq_sub_track_state_t st = moq_sub_track_get_state(t->sub_track);
@@ -5365,7 +5585,8 @@ static void receiver_retire_tracks(moq_media_receiver_t *r, uint64_t now_us)
 {
     bool drained = receiver_facade_drained(r);
     for (size_t i = 0; i < r->track_count; i++)
-        if ((r->tracks[i]->local_result != MOQ_OK || r->tracks[i]->removed) &&
+        if ((r->tracks[i]->local_result != MOQ_OK || r->tracks[i]->auth_failed ||
+             r->tracks[i]->removed) &&
             !r->tracks[i]->completion_pending)
             receiver_retire_subscription(r, &r->tracks[i]->sub_track, now_us, drained);
 }
@@ -5487,12 +5708,16 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     pthread_mutex_unlock(&r->mu);
     if (!session) return;
     if (r->catalog_ack_failed) {
+        receiver_auth_clear_pending(r);
         (void)moq_sub_tick(r->sub, now_us);
         receiver_inspect_delivery_failures(r);
         receiver_retire_failed_catalog(r, now_us);
         return;
     }
-    if (fatal) return;
+    if (fatal) {
+        receiver_auth_clear_pending(r);
+        return;
+    }
 
     /* Read the negotiated draft from the live session, under our own mutex,
      * before any catalog is ingested or any object is parsed on this pass.
@@ -5590,8 +5815,34 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             tcfg.location = &loc;
             tcfg.fill = &fill;
         }
-        if (moq_sub_subscribe(r->sub, &tcfg, now_us,
-                              &r->catalog_sub) != MOQ_OK) {
+        moq_media_auth_request_t request = receiver_auth_request(r,
+            MOQ_MEDIA_AUTH_ACTION_SUBSCRIBE, NULL);
+        moq_result_t rc = moq_media_auth_operation_prepare(&r->catalog_auth,
+            &r->auth_source, &request, r->transport_version, &r->alloc);
+        AUTH_PRE_ADMIT(r, NULL);
+        pthread_mutex_lock(&r->mu);
+        fatal = r->fatal;
+        pthread_mutex_unlock(&r->mu);
+        if (fatal) {
+            moq_media_auth_operation_clear(&r->catalog_auth, &r->alloc);
+            return;
+        }
+        if (rc != MOQ_OK) {
+            receiver_auth_fail(r, &r->catalog_auth, &request,
+                MOQ_MEDIA_AUTH_SCOPE_SERVICE, NULL);
+            return;
+        }
+        tcfg.auth_tokens = r->catalog_auth.list.tokens;
+        tcfg.auth_token_count = r->catalog_auth.list.count;
+        rc = moq_sub_subscribe(r->sub, &tcfg, now_us, &r->catalog_sub);
+        if (receiver_admission_retry(rc)) return;
+        if (receiver_auth_encoding_error(r, &r->catalog_auth, rc)) {
+            receiver_auth_fail(r, &r->catalog_auth, &request,
+                MOQ_MEDIA_AUTH_SCOPE_SERVICE, NULL);
+            return;
+        }
+        moq_media_auth_operation_clear(&r->catalog_auth, &r->alloc);
+        if (rc != MOQ_OK) {
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
             return;
         }
@@ -5624,7 +5875,8 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             continue;
         }
         moq_media_track_t *t = track_for_sub(r, obj.track);
-        if (!t || (t->local_result != MOQ_OK && !t->delivery_failed)) {
+        if (!t || t->auth_failed ||
+            (t->local_result != MOQ_OK && !t->delivery_failed)) {
             moq_sub_object_cleanup(&obj);
             receiver_intake_end(r);
             receiver_poll_group_ends(r, now_us);
@@ -5678,6 +5930,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     fatal = r->fatal;
     pthread_mutex_unlock(&r->mu);
     if (fatal) {
+        receiver_auth_clear_pending(r);
         receiver_dom_wake(r);
         return;
     }
@@ -5687,6 +5940,14 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     if (r->has_effective)
         receiver_reconcile_subscriptions(r, now_us);
 
+    pthread_mutex_lock(&r->mu);
+    fatal = r->fatal;
+    pthread_mutex_unlock(&r->mu);
+    if (fatal) {
+        receiver_auth_clear_pending(r);
+        receiver_dom_wake(r);
+        return;
+    }
     receiver_reconcile_delivery(r, now_us);
 
     receiver_ts_timers(r, now_us);
@@ -5927,6 +6188,7 @@ static void receiver_cfg_read(const moq_media_receiver_cfg_t *in,
     RCFG_COPY(mpeg2ts_reorder_window_us);
     RCFG_COPY(mpeg2ts_strip_prefix);
     RCFG_COPY(mpeg2ts_join_psi);
+    RCFG_COPY(resource_auth);
 #undef RCFG_COPY
     {
         const size_t end = offsetof(moq_media_receiver_cfg_t,
@@ -6061,6 +6323,9 @@ static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 
 static void receiver_free(moq_media_receiver_t *r)
 {
+    moq_media_auth_operation_clear(&r->catalog_auth, &r->alloc);
+    moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
+    moq_media_auth_source_clear(&r->auth_source, &r->alloc);
     /* Tracks are freed before the queue: unqueueing must not count. */
     r->st_enabled = false;
     if (r->st)
@@ -6222,15 +6487,18 @@ static moq_result_t receiver_prepare(const moq_media_receiver_cfg_t *cfg,
 static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
                                  const moq_media_receiver_cfg_t *cfg,
                                  const receiver_sizes_t *szp,
+                                 const moq_alloc_t *alloc,
+                                 moq_media_auth_source_t *auth,
                                  moq_media_receiver_t **out)
 {
     const receiver_sizes_t sz = *szp;
-    const moq_alloc_t *alloc = RECEIVER_CTOR_ALLOC();
     moq_media_receiver_t *r = (moq_media_receiver_t *)alloc->alloc(
         sizeof(*r), alloc->ctx);
     if (!r) return MOQ_ERR_NOMEM;
     memset(r, 0, sizeof(*r));
     r->alloc = *alloc;
+    r->auth_source = *auth;
+    memset(auth, 0, sizeof(*auth));
     r->ep = ep;
     r->owns_endpoint = owns;
     r->auto_subscribe = cfg->auto_subscribe;
@@ -6261,6 +6529,7 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
             r->alloc.free(r->ns_data, sz.ns_data_bytes, r->alloc.ctx);
         r->ns_parts = NULL;
         r->ns_data = NULL;
+        moq_media_auth_source_clear(&r->auth_source, &r->alloc);
         pthread_mutex_destroy(&r->mu);
         r->alloc.free(r, sizeof(*r), r->alloc.ctx);
         return MOQ_ERR_NOMEM;
@@ -6359,7 +6628,13 @@ moq_result_t moq_media_receiver_attach(moq_endpoint_t *ep,
     moq_result_t rc = receiver_prepare(cfg, &lc, &sz);
     if (rc < 0) return rc;
     if (lc.endpoint != NULL) return MOQ_ERR_INVAL;  /* attach borrows */
-    return receiver_new(ep, false, &lc, &sz, out);
+    moq_alloc_t alloc = *RECEIVER_CTOR_ALLOC();
+    moq_media_auth_source_t auth = {0};
+    rc = moq_media_auth_source_copy(&auth, lc.resource_auth, &alloc);
+    if (rc != MOQ_OK) return rc;
+    rc = receiver_new(ep, false, &lc, &sz, &alloc, &auth, out);
+    moq_media_auth_source_clear(&auth, &alloc);
+    return rc;
 }
 
 moq_result_t moq_media_receiver_create(const moq_media_receiver_cfg_t *cfg,
@@ -6375,11 +6650,19 @@ moq_result_t moq_media_receiver_create(const moq_media_receiver_cfg_t *cfg,
     if (rc < 0) return rc;
     if (lc.endpoint == NULL) return MOQ_ERR_INVAL;  /* create owns */
 
+    moq_alloc_t alloc = *RECEIVER_CTOR_ALLOC();
+    moq_media_auth_source_t auth = {0};
+    rc = moq_media_auth_source_copy(&auth, lc.resource_auth, &alloc);
+    if (rc != MOQ_OK) return rc;
     moq_endpoint_t *ep = NULL;
     rc = RECEIVER_CONNECT(lc.endpoint, &ep);
-    if (rc < 0) return rc;
+    if (rc < 0) {
+        moq_media_auth_source_clear(&auth, &alloc);
+        return rc;
+    }
 
-    rc = receiver_new(ep, true, &lc, &sz, out);
+    rc = receiver_new(ep, true, &lc, &sz, &alloc, &auth, out);
+    moq_media_auth_source_clear(&auth, &alloc);
     if (rc < 0) {
         (void)moq_endpoint_stop(ep);
         moq_endpoint_destroy(ep);
@@ -6944,7 +7227,8 @@ moq_result_t moq_media_receiver_subscribe_track(
      * from the catalog can never be re-established: the reconcile permanently
      * skips such tracks, so refuse here rather than recording desired state
      * that will never take effect. */
-    if (track->ended || track->removed || track->local_result != MOQ_OK) {
+    if (track->ended || track->removed || track->local_result != MOQ_OK ||
+        track->auth_failed) {
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_WRONG_STATE;
     }
@@ -6997,6 +7281,10 @@ moq_result_t moq_media_receiver_unsubscribe_track(
     if (!receiver_owns_track(r, track)) {
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_INVAL;
+    }
+    if (track->auth_failed) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_OK;
     }
     if (track->removed && !track->completion_pending) {
         pthread_mutex_unlock(&r->mu);
@@ -7085,7 +7373,7 @@ moq_result_t moq_media_receiver_track_state(
 
     moq_media_track_state_t st;
     bool issued = track->requested || track->established;
-    if (track->local_result != MOQ_OK) {
+    if (track->local_result != MOQ_OK || track->auth_failed) {
         st = MOQ_MEDIA_TRACK_STATE_FAILED;
     } else if (rr->fatal || closed || track->ended) {
         st = MOQ_MEDIA_TRACK_STATE_ENDED;
@@ -7460,6 +7748,18 @@ int moq_media_receiver_test_mu_held(const moq_media_receiver_t *r)
     return -1;                   /* INVALID */
 }
 
+bool moq_media_receiver_test_auth_latched(moq_media_receiver_t *r,
+                                         moq_media_track_t *track);
+bool moq_media_receiver_test_auth_latched(moq_media_receiver_t *r,
+                                         moq_media_track_t *track)
+{
+    pthread_mutex_lock(&r->mu);
+    bool latched = track ? track->auth_failed :
+                          (r->fatal || r->catalog_fetch_issued);
+    pthread_mutex_unlock(&r->mu);
+    return latched;
+}
+
 /* Number of retained CP-bearing catalog snapshots (retention contract). Lets
  * the writer fixture prove a snapshot was actually retained before free. */
 size_t moq_media_receiver_test_cp_snap_count(const moq_media_receiver_t *r);
@@ -7639,7 +7939,13 @@ moq_result_t moq_media_receiver_test_construct(
     moq_media_receiver_cfg_t lc;
     moq_result_t rc = receiver_prepare(cfg, &lc, &sz);
     if (rc < 0) return rc;
-    return receiver_new(NULL, false, &lc, &sz, out);
+    moq_alloc_t alloc = *RECEIVER_CTOR_ALLOC();
+    moq_media_auth_source_t auth = {0};
+    rc = moq_media_auth_source_copy(&auth, lc.resource_auth, &alloc);
+    if (rc != MOQ_OK) return rc;
+    rc = receiver_new(NULL, false, &lc, &sz, &alloc, &auth, out);
+    moq_media_auth_source_clear(&auth, &alloc);
+    return rc;
 }
 
 /* Drive the receiver into its terminal (fatal) state through the one

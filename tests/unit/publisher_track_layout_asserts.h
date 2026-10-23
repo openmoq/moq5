@@ -28,7 +28,11 @@ _Static_assert(offsetof(moq_pub_track_cfg_t, track_properties) >= PUB_TRACK_DIM(
                "track_properties starts past the monotonic-era sizeof");
 _Static_assert(offsetof(moq_pub_track_cfg_t, dynamic_groups) == PUB_TRACK_DIM(88, 56, 56),
                "dynamic_groups offset");
-_Static_assert(sizeof(moq_pub_track_cfg_t) == PUB_TRACK_DIM(96, 60, 64), "current sizeof");
+_Static_assert(offsetof(moq_pub_track_cfg_t, namespace_auth_tokens) ==
+               PUB_TRACK_DIM(96, 60, 64), "complete pre-auth allocation");
+_Static_assert(offsetof(moq_pub_track_cfg_t, namespace_auth_token_count) ==
+               PUB_TRACK_DIM(104, 64, 68), "namespace auth count offset");
+_Static_assert(sizeof(moq_pub_track_cfg_t) == PUB_TRACK_DIM(112, 68, 72), "current sizeof");
 _Static_assert(_Alignof(moq_pub_track_cfg_t) == PUB_TRACK_DIM(8, 4, 8), "current alignment");
 _Static_assert(offsetof(moq_pub_track_cfg_t, max_retained_bytes) ==
                sizeof(test_pub_track_original_t), "original prefix includes old tail padding");

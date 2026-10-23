@@ -23,6 +23,7 @@
 #include <moq/session.h>
 #include <moq/endpoint.h>
 #include <moq/media_object.h>
+#include <moq/media_auth.h>
 #include <moq/msf.h>     /* moq_cmsf_content_protection_t (CMSF authoring) */
 
 #ifdef __cplusplus
@@ -269,6 +270,14 @@ typedef struct moq_media_sender_cfg {
      * catalog and Group IDs from 0. Unknown values fail creation with
      * MOQ_ERR_INVAL. */
     moq_media_companion_profile_t         companion_profile;
+    /* Preserve the complete preceding allocation; never read. */
+    uint8_t                             _reserved_companion_profile[4];
+    /* Optional resource credentials, independent of endpoint SETUP tokens.
+     * Copied at construction, including all static token bytes. Selectors
+     * and local outcomes follow media_auth.h. Absent/partial/NULL means
+     * anonymous; a configured source never falls back to anonymous access.
+     * Use a sized initializer to enable this complete pointer field. */
+    const moq_media_auth_cfg_t          *resource_auth;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,

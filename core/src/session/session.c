@@ -1425,7 +1425,7 @@ moq_event_scratch_verdict_t event_scratch_classify_bytes(
 moq_result_t send_probe_begin(moq_session_t *s, moq_buf_writer_t *probe)
 {
     /* Same bounded envelope allowance as SETUP preflight: a 16-bit payload
-     * plus room for either profile's type and length framing. */
+     * plus room for the selected profile's type and length framing. */
     size_t cap = (size_t)UINT16_MAX + 16u;
     if (cap > s->send_cap) cap = s->send_cap;
     uint8_t *bytes = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
@@ -2503,6 +2503,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
             auth_token_cache_size = cfg->auth_token_cache_size;
     }
 
+    /* Resolve the effective profile before checking SETUP token width.
+     * An absent/zero version retains the existing draft-16 default. */
+    moq_version_t version = MOQ_VERSION_DRAFT_16;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, version) +
+        sizeof(cfg->version)) {
+        if (cfg->version != 0)
+            version = cfg->version;
+    }
+    const moq_profile_ops_t *profile = moq_profile_lookup(version);
+    if (!profile) return MOQ_ERR_INVAL;
+
     /* SETUP authorization tokens: validated here, copied into the arena. */
     const moq_auth_token_t *setup_tokens_in = NULL;
     size_t setup_token_count = 0;
@@ -2511,11 +2522,9 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         sizeof(cfg->setup_auth_token_count) && cfg->setup_auth_token_count > 0) {
         setup_tokens_in = cfg->setup_auth_tokens;
         setup_token_count = cfg->setup_auth_token_count;
-        /* Shape here; the Token Type width is the profile's, checked once
-         * the version is resolved below. */
         if (setup_token_count > MOQ_DECODED_MAX_TOKENS ||
             moq_validate_auth_tokens(setup_tokens_in, setup_token_count,
-                                     UINT64_MAX) < 0)
+                                     profile->auth_token_type_max) < 0)
             return MOQ_ERR_INVAL;
         for (size_t i = 0; i < setup_token_count; i++) {
             if (setup_tokens_in[i].token_value.len > UINT16_MAX)
@@ -2642,18 +2651,6 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (done_wait_us == 0) done_wait_us = MOQ_DONE_WAIT_DEFAULT_US;
     if (!th_cap)      th_cap = sub_cap + pub_cap + ts_cap;
     if (th_cap > SIZE_MAX / sizeof(moq_track_hist_t)) return MOQ_ERR_INVAL;
-
-    moq_version_t version = MOQ_VERSION_DRAFT_16;
-    if (cfg->struct_size >= offsetof(moq_session_cfg_t, version) +
-        sizeof(cfg->version)) {
-        if (cfg->version != 0)
-            version = cfg->version;
-    }
-    const moq_profile_ops_t *profile = moq_profile_lookup(version);
-    if (!profile) return MOQ_ERR_INVAL;
-    if (moq_validate_auth_tokens(setup_tokens_in, setup_token_count,
-                                 profile->auth_token_type_max) < 0)
-        return MOQ_ERR_INVAL;
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
