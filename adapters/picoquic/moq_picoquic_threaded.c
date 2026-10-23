@@ -22,6 +22,7 @@
 #include "../common/moq_alpn.h"
 #include "../common/moq_setup_tokens.h"
 #include "../common/moq_adapter_binding.h"
+#include "../common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
 #include "pq_wake_sched.h"
@@ -31,12 +32,29 @@
 
 #include <errno.h>
 #include <time.h>
+#ifdef _WIN32
+#include <ws2tcpip.h>   /* getaddrinfo */
+#else
 #include <netdb.h>
-#include <pthread.h>
+#endif
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
+
+/* Winsock is reference counted per process. Each successful create pairs one
+ * WSAStartup with one WSACleanup (destroy or the create failure path), so the
+ * facade works in hosts that never initialized Winsock themselves. */
+#ifdef _WIN32
+static int pq_net_startup(void)
+{
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 0 : -1;
+}
+static void pq_net_cleanup(void) { WSACleanup(); }
+#else
+static int pq_net_startup(void) { return 0; }
+static void pq_net_cleanup(void) {}
+#endif
 
 #include "pq_threaded_internal.h"
 #include "pq_lane_group.h"
@@ -1573,6 +1591,12 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
         t->alloc.free(t, sizeof(*t), t->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
+    if (pq_net_startup() != 0) {
+        pthread_cond_destroy(&t->cond);
+        pthread_mutex_destroy(&t->mutex);
+        t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+        return MOQ_ERR_INTERNAL;
+    }
 
     /* ---- Version offer (ABI-appended cfg fields) ---- */
 
@@ -1959,6 +1983,7 @@ fail_quic:
 fail_cfg_strings:
     free_alpn_list(t);
     free_target(t);
+    pq_net_cleanup();
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -2149,6 +2174,7 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
     free_alpn_list(t);
     free_target(t);
 
+    pq_net_cleanup();
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     moq_alloc_t alloc = t->alloc;

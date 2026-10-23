@@ -14,6 +14,7 @@
 #include "../common/moq_alpn.h"
 #include "../common/moq_setup_tokens.h"
 #include "../common/moq_adapter_binding.h"
+#include "../common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include "../common/moq_pq_stream_backlog.h"
 #include "pico_wt_adapter.h"
 
@@ -23,17 +24,37 @@
 #include <pico_webtransport.h>
 #include <h3zero_common.h>
 
-#include <arpa/inet.h>
 #include <errno.h>
+#ifdef _WIN32
+#include <ws2tcpip.h>   /* getaddrinfo, inet_pton */
+#else
+#include <arpa/inet.h>
 #include <netdb.h>
-#include <pthread.h>
+#include <unistd.h>
+#endif
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
 
 #define PICO_WT_MANAGED_ALPN "h3"
+
+/* Winsock is reference counted per process. Each successful create pairs one
+ * WSAStartup with one WSACleanup (destroy or the create failure path), so the
+ * facade works in hosts that never initialized Winsock themselves. */
+#ifdef _WIN32
+static int wt_net_startup(void)
+{
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 0 : -1;
+}
+static void wt_net_cleanup(void) { WSACleanup(); }
+static void wt_sleep_ms(unsigned ms) { Sleep(ms); }
+#else
+static int wt_net_startup(void) { return 0; }
+static void wt_net_cleanup(void) {}
+static void wt_sleep_ms(unsigned ms) { usleep(ms * 1000u); }
+#endif
 
 /* Advertised inbound flow-control credit, per unidirectional stream and
  * connection-wide. picoquic's defaults (initial_max_stream_data_uni 64 KiB,
@@ -1612,6 +1633,13 @@ moq_result_t moq_pico_wt_managed_create(
         m->alloc.free(m, sizeof(*m), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
+    if (wt_net_startup() != 0) {
+        pthread_cond_destroy(&m->cond);
+        pthread_mutex_destroy(&m->mutex);
+        free_strings(m);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return MOQ_ERR_INTERNAL;
+    }
 
     uint64_t now = picoquic_current_time();
 
@@ -1725,7 +1753,7 @@ moq_result_t moq_pico_wt_managed_create(
             came_up = m->loop_came_up;
             pthread_mutex_unlock(&m->mutex);
             if (came_up || cand->return_code != 0) break;
-            usleep(1000);
+            wt_sleep_ms(1);
         }
         if (came_up)
             tctx = cand;
@@ -1757,6 +1785,7 @@ fail_configure:
     picoquic_free(m->quic);
     m->quic = NULL;
 fail_quic:
+    wt_net_cleanup();
     pthread_cond_destroy(&m->cond);
     pthread_mutex_destroy(&m->mutex);
     free_strings(m);
@@ -1834,6 +1863,7 @@ void moq_pico_wt_managed_destroy(moq_pico_wt_managed_t *m)
         m->ctrl_ctx = NULL;
     }
     if (m->quic) picoquic_free(m->quic);
+    wt_net_cleanup();
     pthread_cond_destroy(&m->cond);
     pthread_mutex_destroy(&m->mutex);
     free_strings(m);

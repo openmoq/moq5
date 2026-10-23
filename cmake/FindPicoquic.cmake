@@ -19,8 +19,14 @@
 
 # WebTransport needs picoquic's HTTP/3 library (picohttp-core). Managed WT
 # requires the base WT adapter (enforced in the top-level CMakeLists), so this
-# one flag covers both.
-set(_MOQ_PQ_NEED_HTTP ${MOQ_BUILD_ADAPTER_PICO_WT})
+# one flag covers both. A consumer of an installed libmoq that ships the WT
+# adapter re-runs this module without MOQ_BUILD_ADAPTER_PICO_WT;
+# libmoqConfig.cmake sets _LIBMOQ_PICOQUIC_NEEDS_HTTP for it instead.
+if(MOQ_BUILD_ADAPTER_PICO_WT OR _LIBMOQ_PICOQUIC_NEEDS_HTTP)
+    set(_MOQ_PQ_NEED_HTTP ON)
+else()
+    set(_MOQ_PQ_NEED_HTTP OFF)
+endif()
 
 # A drain-capable adapter (raw threaded helper or managed WebTransport) compiles
 # adapters/common/moq_pq_stream_backlog.h against picoquic's PRIVATE
@@ -890,6 +896,17 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
         # tree MAY fail to link: its static archives still build with the
         # symbol unresolved, and another dependency may or may not supply
         # picoquic-log.
+
+        # picoquic's CMake build has no Windows configuration of its own (its
+        # Windows build is the Visual Studio solution, which defines _WINDOWS).
+        # Without it picoquic.h takes the POSIX path (<arpa/inet.h>), so define
+        # it for picoquic and for every libmoq source that includes picoquic.
+        # The same CMake build also omits the system libraries picoquic and
+        # picotls call on Windows (Winsock, BCryptGenRandom).
+        if(WIN32)
+            target_compile_definitions(picoquic-core PUBLIC _WINDOWS)
+            target_link_libraries(picoquic-core PUBLIC ws2_32 bcrypt)
+        endif()
         if(NOT TARGET picoquic::picoquic-core)
             add_library(picoquic::picoquic-core ALIAS picoquic-core)
         endif()
