@@ -240,6 +240,8 @@ struct moq_media_track {
                                                 reconciled on the network thread
                                                 from moq_pub_active_subscriptions()
                                                 for demand visibility (§7.2) */
+    moq_media_track_t     *closed_next;       /* terminal demand callbacks;
+                                                network-thread-only, no allocation */
     bool                  is_catalog;        /* the catalog track */
     bool                  pub_closed_fired;  /* on_track_closed fired: latched so a
                                                 repeated PUBLISH_FINISHED does not re-fire */
@@ -277,6 +279,8 @@ struct moq_media_track {
 #ifdef MOQ_MEDIA_SENDER_TESTING
     uint64_t              test_publish_attempts;
     moq_result_t          test_publish_result;
+    bool                  test_demand_set;
+    size_t                test_demand;
 #endif
     bool                  complete_end_owed; /* complete() owes this track its
                                                 END_OF_TRACK: sent by the drain once
@@ -673,30 +677,59 @@ static void sender_note_completion_failure(moq_media_sender_t *s, moq_result_t r
     if (s->stats.completion_error == MOQ_OK) s->stats.completion_error = rc;
 }
 
-/* Fire on_closed at most once. Claims closed_fired under the lock, then invokes
- * the callback OUTSIDE it (non-reentrant contract). Network thread. */
+/* Demand callbacks fire only for app-visible media, not the internal catalog
+ * or either generated timeline. */
+static bool track_is_app_media(const moq_media_track_t *t)
+{
+    return !t->is_catalog && !t->is_event_timeline && !t->is_media_timeline;
+}
+
+/* Fire on_closed at most once. Clear every demand mirror with the close latch,
+ * then deliver left callbacks and on_closed OUTSIDE the lock. Network thread. */
 static void sender_fire_closed(moq_media_sender_t *s, bool is_fatal,
                                uint64_t fatal_code)
 {
     pthread_mutex_lock(&s->mu);
     if (s->closed_fired) { pthread_mutex_unlock(&s->mu); return; }
     s->closed_fired = true;
+    moq_media_track_t *left = NULL;
     /* All request intents end with the service. Network-thread confined:
      * neither selectors nor native admission can be active concurrently. */
     moq_media_auth_operation_clear(&s->namespace_auth, &s->alloc);
-    if (s->catalog_track)
+    if (s->catalog_track) {
         moq_media_auth_operation_clear(&s->catalog_track->publish_auth, &s->alloc);
-    for (size_t i = 0; i < s->track_count; ++i)
-        moq_media_auth_operation_clear(&s->tracks[i]->publish_auth, &s->alloc);
+        s->catalog_track->active_subs = 0;
+    }
+    for (size_t i = 0; i < s->track_count; ++i) {
+        moq_media_track_t *t = s->tracks[i];
+        moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
+        if (t->active_subs && track_is_app_media(t)) {
+            t->closed_next = left;
+            left = t;
+        }
+        t->active_subs = 0;
+    }
     /* Terminal (incl. a CLEAN close): disarm the managed wake atomically with
      * the close latch, so a cached finite deadline cannot survive to a cycle
      * that returns early (e.g. session == NULL) before the next recompute. */
     s->refresh_wake_deadline_us = UINT64_MAX;
     void *cbctx = s->callbacks.ctx;
+    void (*left_cb)(void *, moq_media_sender_t *, moq_media_track_t *, size_t)
+        = s->callbacks.on_subscriber_left;
     void (*cb)(void *, moq_media_sender_t *, bool, uint64_t)
         = s->callbacks.on_closed;
     pthread_mutex_unlock(&s->mu);
 
+    /* Handles, including removed tracks, live until sender destruction; only
+     * the vector can move on an app-thread add. Link handles under mu instead
+     * of allocating a snapshot, so even NOMEM cannot strand terminal demand.
+     * All counts are already zero when the first callback queries them. */
+    while (left) {
+        moq_media_track_t *t = left;
+        left = t->closed_next;
+        t->closed_next = NULL;
+        if (left_cb) left_cb(cbctx, s, t, 0);
+    }
     if (cb) cb(cbctx, s, is_fatal, fatal_code);
 }
 
@@ -3336,13 +3369,6 @@ static bool sender_finish_conversions(moq_media_sender_t *s, uint64_t now_us)
 
 /* -- Demand visibility (§7.2): subscriber join/left mirroring -------- */
 
-/* True for an app-visible media track: a user-added track -- not the internal
- * catalog and not a generated SAP/media-timeline sibling. */
-static bool track_is_app_media(const moq_media_track_t *t)
-{
-    return !t->is_catalog && !t->is_event_timeline && !t->is_media_timeline;
-}
-
 /* Reconcile one track's mirrored subscriber count with the publisher's
  * AUTHORITATIVE count and fire the service callback on a change. Polling rather
  * than relying on the core on_subscriber_left is required because the publisher
@@ -3357,8 +3383,14 @@ static void sender_resync_track_demand(moq_media_sender_t *s,
 {
     size_t real = (s->pub && t->pub_track)
         ? moq_pub_active_subscriptions(s->pub, t->pub_track) : 0;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    if (t->test_demand_set) real = t->test_demand;
+#endif
 
     pthread_mutex_lock(&s->mu);
+    /* A close may precede publisher event consumption. Its zero demand is
+     * final even if a later resync still sees live facade subscriptions. */
+    if (s->closed_fired) { pthread_mutex_unlock(&s->mu); return; }
     size_t old = t->active_subs;
     if (real == old) { pthread_mutex_unlock(&s->mu); return; }
     t->active_subs = real;
@@ -7673,6 +7705,29 @@ void moq_media_sender_test_set_ready(moq_media_sender_t *s)
     pthread_mutex_lock(&s->mu);
     s->ready = true;
     pthread_mutex_unlock(&s->mu);
+}
+
+/* Supply only the authoritative count read by the production resync. The
+ * mirror update, callback filtering and terminal guard remain production code.
+ * Like the other fire seams, called on the test's single executor. */
+void moq_media_sender_test_resync_track_demand(moq_media_sender_t *s,
+                                              moq_media_track_t *t, size_t count);
+void moq_media_sender_test_resync_track_demand(moq_media_sender_t *s,
+                                              moq_media_track_t *t, size_t count)
+{
+    t->test_demand_set = true;
+    t->test_demand = count;
+    sender_resync_track_demand(s, t);
+    t->test_demand_set = false;
+}
+
+/* Read the real generated sibling; creation still uses public add_track. */
+moq_media_track_t *moq_media_sender_test_timeline_track(
+    const moq_media_track_t *track, bool media_timeline);
+moq_media_track_t *moq_media_sender_test_timeline_track(
+    const moq_media_track_t *track, bool media_timeline)
+{
+    return media_timeline ? track->media_timeline : track->sap_timeline;
 }
 
 /* Install lifecycle callbacks on a test sender (no endpoint), so the fire

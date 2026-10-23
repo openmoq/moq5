@@ -21,6 +21,9 @@ static int failures = 0;
 
 /* Test seam (media_sender.c, MOQ_MEDIA_SENDER_TESTING). */
 moq_media_sender_t *moq_media_sender_test_new(void);
+moq_media_sender_t *moq_media_sender_test_new_cfg(
+    const moq_media_sender_cfg_t *cfg);
+void moq_media_sender_test_set_alloc(const moq_alloc_t *alloc);
 void moq_media_sender_test_free(moq_media_sender_t *s);
 void moq_media_sender_test_set_callbacks(moq_media_sender_t *s,
                                          const moq_media_sender_callbacks_t *cb);
@@ -34,6 +37,10 @@ moq_media_track_t *moq_media_sender_test_catalog_track(moq_media_sender_t *s);
 void moq_media_sender_test_apply_cfg_tail(moq_media_sender_t *s,
                                           const moq_media_sender_cfg_t *cfg);
 unsigned moq_media_sender_test_cfg_tail_mask(const moq_media_sender_t *s);
+void moq_media_sender_test_resync_track_demand(moq_media_sender_t *s,
+                                              moq_media_track_t *t, size_t count);
+moq_media_track_t *moq_media_sender_test_timeline_track(
+    const moq_media_track_t *track, bool media_timeline);
 
 /* Add an app-visible RAW video track to a test sender (returns its handle). */
 static moq_media_track_t *add_video(moq_media_sender_t *s, const char *name)
@@ -120,8 +127,232 @@ static void install(moq_media_sender_t *s, struct obs *o)
     moq_media_sender_test_set_callbacks(s, &cb);
 }
 
+/* Terminal demand must not depend on allocating a track snapshot. Let normal
+ * construction use the real allocator, then refuse every allocation/realloc. */
+struct demand_alloc {
+    const moq_alloc_t *base;
+    bool refuse;
+    size_t refused;
+    size_t live;
+};
+
+static void *demand_alloc(size_t n, void *ctx)
+{
+    struct demand_alloc *a = (struct demand_alloc *)ctx;
+    if (a->refuse) { a->refused++; return NULL; }
+    void *p = a->base->alloc(n, a->base->ctx);
+    if (p) a->live++;
+    return p;
+}
+
+static void demand_free(void *ptr, size_t n, void *ctx)
+{
+    struct demand_alloc *a = (struct demand_alloc *)ctx;
+    if (ptr) {
+        MOQ_TEST_CHECK(a->live > 0);
+        if (a->live) a->live--;
+    }
+    a->base->free(ptr, n, a->base->ctx);
+}
+
+static void *demand_realloc(void *ptr, size_t old_size, size_t new_size, void *ctx)
+{
+    void *p = demand_alloc(new_size, ctx);
+    if (!p) return NULL;
+    if (ptr) memcpy(p, ptr, old_size < new_size ? old_size : new_size);
+    demand_free(ptr, old_size, ctx);
+    return p;
+}
+
+enum {
+    DEMAND_VIDEO, DEMAND_AUDIO, DEMAND_QUIET, DEMAND_REMOVED,
+    DEMAND_SAP, DEMAND_TIMELINE, DEMAND_CATALOG, DEMAND_TRACKS
+};
+
+struct demand_obs {
+    moq_media_track_t *tracks[DEMAND_TRACKS];
+    size_t joins[DEMAND_TRACKS];
+    size_t leaves[DEMAND_TRACKS];
+    bool terminal;
+    int closed_calls;
+    bool closed_is_fatal;
+    uint64_t closed_code;
+};
+
+static size_t demand_track_index(const struct demand_obs *o,
+                                 const moq_media_track_t *track)
+{
+    for (size_t i = 0; i < DEMAND_TRACKS; i++)
+        if (o->tracks[i] == track) return i;
+    return DEMAND_TRACKS;
+}
+
+static void demand_check_zero(moq_media_sender_t *s, const struct demand_obs *o)
+{
+    MOQ_TEST_CHECK(!moq_media_sender_has_media_subscriber(s));
+    for (size_t i = 0; i < DEMAND_TRACKS; i++) {
+        MOQ_TEST_CHECK_EQ_SIZE(moq_media_sender_track_subscriptions(s, o->tracks[i]), 0);
+        MOQ_TEST_CHECK(!moq_media_sender_track_has_subscriber(s, o->tracks[i]));
+    }
+}
+
+static void demand_joined(void *ctx, moq_media_sender_t *s,
+                           moq_media_track_t *track, size_t count)
+{
+    struct demand_obs *o = (struct demand_obs *)ctx;
+    size_t i = demand_track_index(o, track);
+    MOQ_TEST_CHECK(!o->terminal);
+    MOQ_TEST_CHECK(i < DEMAND_SAP);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_media_sender_track_subscriptions(s, track), count);
+    if (i < DEMAND_TRACKS) o->joins[i]++;
+}
+
+static void demand_left(void *ctx, moq_media_sender_t *s,
+                        moq_media_track_t *track, size_t count)
+{
+    struct demand_obs *o = (struct demand_obs *)ctx;
+    size_t i = demand_track_index(o, track);
+    MOQ_TEST_CHECK(o->terminal);
+    MOQ_TEST_CHECK(i < DEMAND_SAP && i != DEMAND_QUIET);
+    MOQ_TEST_CHECK_EQ_SIZE(count, 0);
+    MOQ_TEST_CHECK_EQ_INT(o->closed_calls, 0);
+    if (i < DEMAND_TRACKS) o->leaves[i]++;
+    /* These public queries take s->mu: calling them here also discriminates
+     * a callback incorrectly dispatched under the sender mutex. */
+    demand_check_zero(s, o);
+}
+
+static void demand_closed(void *ctx, moq_media_sender_t *s,
+                          bool is_fatal, uint64_t code)
+{
+    struct demand_obs *o = (struct demand_obs *)ctx;
+    o->closed_calls++;
+    o->closed_is_fatal = is_fatal;
+    o->closed_code = code;
+    demand_check_zero(s, o);
+    for (size_t i = 0; i < DEMAND_TRACKS; i++) {
+        size_t want = i == DEMAND_VIDEO || i == DEMAND_AUDIO || i == DEMAND_REMOVED;
+        MOQ_TEST_CHECK_EQ_SIZE(o->leaves[i], want);
+    }
+}
+
+static void terminal_demand_case(bool fatal, bool callbacks)
+{
+    struct demand_obs o;
+    memset(&o, 0, sizeof(o));
+    struct demand_alloc a = { .base = moq_alloc_default() };
+    moq_alloc_t alloc = {
+        .ctx = &a, .alloc = demand_alloc, .realloc = demand_realloc, .free = demand_free
+    };
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    moq_bytes_t part = MOQ_BYTES_LITERAL("terminal-demand");
+    cfg.namespace_ = (moq_namespace_t){ &part, 1 };
+    if (callbacks) {
+        cfg.callbacks.ctx = &o;
+        cfg.callbacks.on_subscriber_joined = demand_joined;
+        cfg.callbacks.on_subscriber_left = demand_left;
+        cfg.callbacks.on_closed = demand_closed;
+    }
+    moq_media_sender_test_set_alloc(&alloc);
+    moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
+    moq_media_sender_test_set_alloc(NULL);
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) return;
+
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = MOQ_BYTES_LITERAL("video");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.bitrate = 1500000;
+    tc.emit_sap_timeline = true;
+    tc.emit_media_timeline = true;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(s, &tc,
+        &o.tracks[DEMAND_VIDEO]), (int)MOQ_OK);
+    o.tracks[DEMAND_AUDIO] = add_video(s, "audio");
+    o.tracks[DEMAND_QUIET] = add_video(s, "quiet");
+    o.tracks[DEMAND_REMOVED] = add_video(s, "removed");
+    if (o.tracks[DEMAND_VIDEO]) {
+        o.tracks[DEMAND_SAP] = moq_media_sender_test_timeline_track(
+            o.tracks[DEMAND_VIDEO], false);
+        o.tracks[DEMAND_TIMELINE] = moq_media_sender_test_timeline_track(
+            o.tracks[DEMAND_VIDEO], true);
+    }
+    o.tracks[DEMAND_CATALOG] = moq_media_sender_test_catalog_track(s);
+    for (size_t i = 0; i < DEMAND_TRACKS; i++) {
+        MOQ_TEST_CHECK(o.tracks[i] != NULL);
+        if (!o.tracks[i]) { moq_media_sender_test_free(s); return; }
+    }
+
+    /* Private demand is visible through an exact handle, but produces no app
+     * callback and cannot make the media-demand aggregate true. */
+    for (size_t i = DEMAND_SAP; i < DEMAND_TRACKS; i++) {
+        moq_media_sender_test_resync_track_demand(s, o.tracks[i], i + 1);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_media_sender_track_subscriptions(s, o.tracks[i]), i + 1);
+    }
+    MOQ_TEST_CHECK(!moq_media_sender_has_media_subscriber(s));
+    moq_media_sender_test_resync_track_demand(s, o.tracks[DEMAND_VIDEO], 2);
+    moq_media_sender_test_resync_track_demand(s, o.tracks[DEMAND_AUDIO], 3);
+    moq_media_sender_test_resync_track_demand(s, o.tracks[DEMAND_REMOVED], 4);
+    moq_media_sender_test_resync_track_demand(s, o.tracks[DEMAND_VIDEO], 2);
+    MOQ_TEST_CHECK(moq_media_sender_has_media_subscriber(s));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_remove_track(s,
+        o.tracks[DEMAND_REMOVED]), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(moq_media_sender_track_subscriptions(s,
+        o.tracks[DEMAND_REMOVED]), 4);
+    for (size_t i = 0; i < DEMAND_TRACKS; i++) {
+        size_t want = callbacks && (i == DEMAND_VIDEO || i == DEMAND_AUDIO ||
+                                    i == DEMAND_REMOVED);
+        MOQ_TEST_CHECK_EQ_SIZE(o.joins[i], want);
+        MOQ_TEST_CHECK_EQ_SIZE(o.leaves[i], 0);
+    }
+
+    a.refuse = true;
+    o.terminal = true;
+    if (fatal)
+        moq_media_sender_test_fire_fatal(s, MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
+    else
+        moq_media_sender_test_fire_closed(s, false, 0);
+    demand_check_zero(s, &o);
+
+    /* Stale facade counts after close must neither resurrect a mirror nor
+     * produce a new joined callback, including for a previously quiet track. */
+    for (size_t i = 0; i < DEMAND_TRACKS; i++)
+        moq_media_sender_test_resync_track_demand(s, o.tracks[i], i + 10);
+    moq_media_sender_test_fire_closed(s, false, 0);
+    moq_media_sender_test_fire_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+    demand_check_zero(s, &o);
+    MOQ_TEST_CHECK_EQ_INT(o.closed_calls, callbacks ? 1 : 0);
+    if (callbacks) {
+        MOQ_TEST_CHECK(o.closed_is_fatal == fatal);
+        MOQ_TEST_CHECK_EQ_U64(o.closed_code,
+            fatal ? MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE : 0);
+    }
+    for (size_t i = 0; i < DEMAND_TRACKS; i++) {
+        size_t want = callbacks && (i == DEMAND_VIDEO || i == DEMAND_AUDIO ||
+                                    i == DEMAND_REMOVED);
+        MOQ_TEST_CHECK_EQ_SIZE(o.joins[i], want);
+        MOQ_TEST_CHECK_EQ_SIZE(o.leaves[i], want);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(a.refused, 0);
+    a.refuse = false;
+    moq_media_sender_test_free(s);
+    MOQ_TEST_CHECK_EQ_SIZE(a.live, 0);
+}
+
 int main(void)
 {
+    terminal_demand_case(false, true);
+    MOQ_TEST_PASS("sender_lifecycle.terminal_demand_clean");
+    terminal_demand_case(true, true);
+    MOQ_TEST_PASS("sender_lifecycle.terminal_demand_fatal");
+    terminal_demand_case(false, false);
+    MOQ_TEST_PASS("sender_lifecycle.terminal_demand_clean_no_callbacks");
+    terminal_demand_case(true, false);
+    MOQ_TEST_PASS("sender_lifecycle.terminal_demand_fatal_no_callbacks");
+
     /* on_ready fires exactly once, with the registered ctx + sender handle,
      * and does not re-fire on a second edge (latch). */
     {
