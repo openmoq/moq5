@@ -32,7 +32,9 @@ done
 requires=$(sed -n 's/^Requires: *//p' "$pc")
 target=$(rustc -vV | sed -n 's/^host: //p')
 bindgen=$(awk '/^name = "bindgen"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print }' "$HERE/Cargo.lock")
-libclang=${LIBCLANG_PATH:-"(clang-sys search)"}
+# The libclang that generated them: where it was found, and its version,
+# which decides whether macro constants carry documentation.
+libclang="from ${LIBCLANG_PATH:-"(clang-sys search)"} ($(cat "$out/libclang.txt"))"
 
 snapshot() {   # snapshot <generated file> <snapshot file> <what it holds>
     {
@@ -43,7 +45,7 @@ snapshot() {   # snapshot <generated file> <snapshot file> <what it holds>
         echo "//"
         echo "// libmoq commit: $commit"
         echo "// SDK: libmoq-service.pc Requires: $requires"
-        echo "// generated on: $target with bindgen $bindgen, libclang from $libclang"
+        echo "// generated on: $target with bindgen $bindgen, libclang $libclang"
         echo
         cat "$1"
     } > "$2"

@@ -57,14 +57,22 @@
 //! the feature and without it. With the feature, an SDK without the player
 //! headers fails the build; without it, they are never read.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use bindgen::callbacks::{IntKind, ItemInfo, ParseCallbacks};
 
 #[path = "build_sysroot.rs"]
 mod sysroot;
 
 const PROBE: &str = "libmoq-service";
+
+/// The prefix of the statics wrapper.h restates values under, stripped from
+/// their generated names.
+const SYSVAL_PREFIX: &str = "MOQ5_SYSVAL_";
 
 /// The headers the safe crate wraps, in dependency order.
 const HEADERS: &[&str] = &[
@@ -179,6 +187,12 @@ fn main() {
         }
     }
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+    // Which libclang generated the bindings, for the snapshot test's report.
+    write_file(
+        &out_dir.join("libclang.txt"),
+        &bindgen::clang_version().full,
+    );
+    let macros = MacroNames::default();
     let bindings = generator(&clang_args)
         .header("wrapper.h")
         .allowlist_function("moq_.*")
@@ -186,9 +200,12 @@ fn main() {
         .allowlist_var("MOQ_.*")
         .allowlist_var("MOQ5_SYSVAL_.*")
         .blocklist_file(".*/moq/control\\.h")
+        // After every other callback, as MacroNames requires.
+        .parse_callbacks(Box::new(macros.clone()))
         .generate()
         .expect("bindgen failed on the libmoq headers");
     write_bindings(&bindings, &out_dir.join("bindings.rs"));
+    macros.write(&out_dir.join("macros.txt"));
     write_preambles(
         &lib.include_paths,
         HEADERS,
@@ -201,6 +218,7 @@ fn main() {
         // references from them is in the base bindings, which the crate
         // includes beside these, and bindgen still sees those types, so the
         // derives it can prove for them hold here too.
+        let macros = MacroNames::default();
         let bindings = generator(&clang_args)
             .header("wrapper_player.h")
             .blocklist_file(base_headers_pattern(&lib.include_paths))
@@ -210,9 +228,12 @@ fn main() {
             .allowlist_function("moq_playback_cfg_init_sized")
             .allowlist_var("MOQ_PLAYBACK_.*")
             .allowlist_var("MOQ5_SYSVAL_.*")
+            // After every other callback, as MacroNames requires.
+            .parse_callbacks(Box::new(macros.clone()))
             .generate()
             .expect("bindgen failed on the libmoq player headers");
         write_bindings(&bindings, &out_dir.join("bindings_player.rs"));
+        macros.write(&out_dir.join("macros_player.txt"));
         write_preambles(
             &lib.include_paths,
             PLAYER_HEADERS,
@@ -239,9 +260,11 @@ fn generator(clang_args: &[String]) -> bindgen::Builder {
         .layout_tests(true)
         .generate_comments(true)
         // Formatted by rustfmt (RUSTFMT, else the one on PATH): the committed
-        // snapshot is held byte-equal to a fresh generation on every qualified
-        // toolchain, so a formatter release that changes the layout shows up
-        // there as a regeneration, never silently. A missing rustfmt is not an
+        // snapshot is held equal to a fresh generation on every qualified
+        // toolchain, line for line (tests/snapshot.rs; only a macro constant's
+        // documentation may differ, as libclang releases attach it
+        // differently), so a formatter release that changes the layout shows
+        // up there as a regeneration, never silently. A missing rustfmt is not an
         // error for a consumer (bindgen writes the bindings unformatted).
         .formatter(bindgen::Formatter::Rustfmt)
         .parse_callbacks(Box::new(ResultCodes))
@@ -268,6 +291,11 @@ fn base_headers_pattern(include_dirs: &[PathBuf]) -> String {
 fn write_bindings(bindings: &bindgen::Bindings, out: &Path) {
     bindings
         .write_to_file(out)
+        .unwrap_or_else(|e| panic!("could not write {}: {e}", out.display()));
+}
+
+fn write_file(out: &Path, contents: &str) {
+    std::fs::write(out, contents)
         .unwrap_or_else(|e| panic!("could not write {}: {e}", out.display()));
 }
 
@@ -612,7 +640,71 @@ impl bindgen::callbacks::ParseCallbacks for ResultCodes {
             .then_some(bindgen::callbacks::IntKind::Int)
     }
 
-    fn item_name(&self, item: bindgen::callbacks::ItemInfo<'_>) -> Option<String> {
-        item.name.strip_prefix("MOQ5_SYSVAL_").map(str::to_owned)
+    fn item_name(&self, item: ItemInfo<'_>) -> Option<String> {
+        item.name.strip_prefix(SYSVAL_PREFIX).map(str::to_owned)
+    }
+}
+
+/// The names of the constants one generation made from macros, written
+/// beside its bindings: the snapshot test tells those constants from every
+/// other item by them. libclang 23 attaches the comment before a macro
+/// definition to the macro under `-fparse-all-comments`, and earlier
+/// releases attach none, so only those constants' documentation varies
+/// with the libclang that generated them.
+///
+/// bindgen reports each macro it evaluates to an integer or a string, the
+/// blocklisted headers' included; it reports no floating-point or character
+/// macro (no bound constant is one), so a constant made from one would be
+/// held to its documentation. A reported name a `MOQ5_SYSVAL_` static
+/// restates is left out: wrapper.h restates control.h's object statuses,
+/// whose macros bindgen evaluates but the blocklist drops, so those
+/// constants are declarations. The callbacks only observe, and bindgen asks
+/// the last registered callback first and stops at the first answer, so this
+/// one is registered after every other.
+#[derive(Clone, Debug, Default)]
+struct MacroNames(Arc<Mutex<Names>>);
+
+#[derive(Debug, Default)]
+struct Names {
+    /// The macros bindgen evaluated to a constant.
+    macros: BTreeSet<String>,
+    /// The names the `MOQ5_SYSVAL_` statics restate.
+    restated: BTreeSet<String>,
+}
+
+impl MacroNames {
+    fn names(&self) -> MutexGuard<'_, Names> {
+        self.0
+            .lock()
+            .expect("no bindgen callback panicked holding the names")
+    }
+
+    /// The macro constants' names, one a line, sorted.
+    fn write(&self, out: &Path) {
+        let names = self.names();
+        let mut text = String::new();
+        for name in names.macros.difference(&names.restated) {
+            text.push_str(name);
+            text.push('\n');
+        }
+        write_file(out, &text);
+    }
+}
+
+impl ParseCallbacks for MacroNames {
+    fn int_macro(&self, name: &str, _value: i64) -> Option<IntKind> {
+        self.names().macros.insert(name.to_owned());
+        None
+    }
+
+    fn str_macro(&self, name: &str, _value: &[u8]) {
+        self.names().macros.insert(name.to_owned());
+    }
+
+    fn item_name(&self, item: ItemInfo<'_>) -> Option<String> {
+        if let Some(name) = item.name.strip_prefix(SYSVAL_PREFIX) {
+            self.names().restated.insert(name.to_owned());
+        }
+        None
     }
 }

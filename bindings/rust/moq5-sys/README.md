@@ -116,6 +116,9 @@ the player, every build ran with and without the `player` feature:
 | Ubuntu 24.04 container, aarch64, gcc (the SDK, the relay, and the rows' C: the CTest environment carries the tree's compiler) | picoquic plus PicoWT managed with the player and MPEG-TS, static, from the relay tree | all and the relay rows on drafts 22 and 18, natively | `aarch64-unknown-linux-gnu`, the player's too | refusal row only |
 | Ubuntu 24.04 container, x86_64 under emulation on an aarch64 host, clang | no-adapter with the player and MPEG-TS, static | all, under emulation | `x86_64-unknown-linux-gnu`, the player's too | refusal row only |
 
+The macOS rows ran with the libclang of Homebrew's LLVM 22.1.4, and on the
+first, second and fifth configurations once more with libclang 23.1.4 (an
+llvm-project release build); the snapshot test also ran with 23.1.3.
 The `rust_doc` row builds the `cfg(docsrs)` snapshots, the player's
 included, for all three docs.rs targets on every host above. Unrun: Windows
 (any configuration), Linux x86_64 with a shared or a picoquic SDK, native
@@ -133,12 +136,23 @@ list.
 compiled with the `player` feature, which both manifests document. The
 bindings'
 header records the libmoq commit, the SDK's `Requires` closure and the
-generating target and tooling (bindgen 0.73, the output formatted by the
-toolchain's rustfmt, on which rustfmt 1.9 and 1.10 agree byte for byte);
-`scripts/update_snapshot.sh <sdk-prefix>` regenerates all four from a build
-against an installed SDK with the player, and `tests/snapshot.rs` holds
-them byte for byte equal to a fresh generation on every target the tests
-run on (the player's pair under the feature). The snapshots
+generating target and tooling (bindgen 0.73, the libclang and its version,
+the output formatted by the toolchain's rustfmt, on which rustfmt 1.9 and
+1.10 agree byte for byte); `scripts/update_snapshot.sh <sdk-prefix>`
+regenerates all four from a build against an installed SDK with the player.
+`tests/snapshot.rs` holds them equal to a fresh generation on every target
+the tests run on (the player's pair under the feature): the preambles byte
+for byte, and the bindings line for line, every declaration, attribute,
+layout assertion and documentation attribute, with one exception. A
+constant bindgen made from a macro may carry its documentation on one side
+only. libclang 23 attaches the comment before a macro definition to the
+macro under `-fparse-all-comments`, earlier releases attach none, and no
+snapshot can equal both. The build script lists the constants each
+generation made from macros beside it (never a value wrapper.h restates,
+which is a declaration, nor an enumerator: the test holds the list to
+that), and where both sides document such a constant the texts must agree.
+A difference is reported with both sides' lines, the snapshot's provenance
+and the libclang the build used. The snapshots
 carry those targets' layouts (their layout assertions are compiled into
 every build), so both manifests restrict docs.rs to them
 (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,

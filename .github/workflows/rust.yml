@@ -99,6 +99,8 @@ jobs:
             build/rust/bindings/rust/work/*.stderr
             build/rust/bindings/rust/work/gate-controls/*.out
             build/rust/bindings/rust/work/gate-controls/*.inv
+            build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
+            build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
 
   relay-rows:
     name: Relay rows (${{ matrix.os }}, picoquic SDK)
@@ -133,9 +135,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install ninja pkg-config llvm openssl@3
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-          echo "CC=clang" >> "$GITHUB_ENV"
-          echo "CXX=clang++" >> "$GITHUB_ENV"
+          {
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"
+            echo "CC=clang"
+            echo "CXX=clang++"
+          } >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchains
         run: |
@@ -207,4 +211,6 @@ jobs:
             build/rust-relay/bindings/rust/work/live-work/**/relay.log
             build/rust-relay/bindings/rust/work/live-work/**/peer.log
             build/rust-relay/bindings/rust/work/peer-verdict-*.log
+            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
+            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
             build/rust-relay/bindings/rust/work/*.diagnostics.txt
