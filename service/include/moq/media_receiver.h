@@ -604,10 +604,13 @@ typedef struct moq_media_track_event {
      * that message's status code. TRACK_ENDED (0x2) and, on drafts 16/18,
      * SUBSCRIPTION_ENDED (0x3) report a normal end; any other code an
      * error. Only a track declared live by its creation catalog is eligible
-     * for a one-shot VOD re-arm on its first TRACK_ENDED, with no event,
-     * even if its conversion catalog has already arrived. A never-live
-     * track ends on its first TRACK_ENDED; its queued Objects stay pollable.
-     * Ended or removed tracks cannot re-arm.
+     * for a one-shot VOD re-arm on its first TRACK_ENDED, with no event.
+     * The replacement SUBSCRIBE waits for both the original subscription's
+     * drain and a validated conversion catalog (isLive:false with
+     * trackDuration), in either order. A terminal empty catalog before a
+     * replacement is issued instead reports the drained original done,
+     * then TRACK_REMOVED; queued Objects stay pollable. A never-live track
+     * ends on its first TRACK_ENDED. Ended or removed tracks cannot re-arm.
      * false: the track ended with no done status -- at its END_OF_TRACK,
      * or because the peer refused its subscription (a VOD
      * re-subscription included). Neither value says whether the

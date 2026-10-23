@@ -12,9 +12,9 @@
  *     END{PEER_DONE, TAIL_CUTOFF} after the tail wait; a track its receiver
  *     ended for good without END_OF_TRACK -- a terminal normal done, or a
  *     VOD re-subscription the peer refused -- is END{PEER_DONE,
- *     TAIL_CUTOFF} once the tail wait passes, never before, while a re-armed
- *     live subscription is no end; a closed receiver drains what it holds
- *     into END{CLOSED, IMMEDIATE}, then CLOSED;
+ *     TAIL_CUTOFF} once the tail wait passes, never before, while a confirmed
+ *     VOD replacement still active is no end; a closed receiver drains what
+ *     it holds into END{CLOSED, IMMEDIATE}, then CLOSED;
  *   - AUTO selects the lowest render group, one track per alternate group,
  *     on one timeline; without render groups, one video track; a group in
  *     application media time needs the shared-epoch assertion, or
@@ -406,6 +406,9 @@ static const char *vname(moq_version_t v)
 #define LOC_VIDEO(name, extra) \
     "{\"name\":\"" name "\",\"packaging\":\"loc\",\"isLive\":true," \
     "\"role\":\"video\",\"codec\":\"avc1.42e01e\"" extra "}"
+#define LOC_VOD_VIDEO(name, extra) \
+    "{\"name\":\"" name "\",\"packaging\":\"loc\",\"isLive\":false," \
+    "\"trackDuration\":5000,\"role\":\"video\",\"codec\":\"avc1.42e01e\"" extra "}"
 #define LOC_AUDIO(name, codec, extra) \
     "{\"name\":\"" name "\",\"packaging\":\"loc\",\"isLive\":true," \
     "\"role\":\"audio\",\"codec\":\"" codec "\",\"samplerate\":48000," \
@@ -414,6 +417,7 @@ static const char *vname(moq_version_t v)
 
 static const char *const k_v[] = { "video" };
 static const char k_cat_v[] = CATALOG(LOC_VIDEO("video", ""));
+static const char k_cat_vod[] = CATALOG(LOC_VOD_VIDEO("video", ""));
 
 static moq_result_t select_plain(pf_t *f, const char *name)
 {
@@ -422,18 +426,13 @@ static moq_result_t select_plain(pf_t *f, const char *name)
     return moq_media_player_select_track(f->p, t, NULL);
 }
 
-/* The publisher ends the track's subscription for good with a normal done:
- * draft 22's first TRACK_ENDED re-arms it for VOD, so the done that ends
- * it is the next one; drafts 16/18 end it with SUBSCRIPTION_ENDED. */
+/* One final normal done: callers start never-live or have already sent
+ * END_OF_TRACK. This helper does not convert or re-subscribe a live track.
+ * Draft 22 uses TRACK_ENDED; drafts 16/18 use SUBSCRIPTION_ENDED. */
 static void terminal_normal_done(pf_t *f, moq_version_t ver, const char *name)
 {
-    if (ver == MOQ_VERSION_DRAFT_22) {
-        CHECK(moq_pub_finish_subscribers(f->pub, pf_pub(f, name), 0x2u, f->now) == MOQ_OK);
-        cycles(f, 24);
-        CHECK(moq_pub_finish_subscribers(f->pub, pf_pub(f, name), 0x2u, f->now) == MOQ_OK);
-    } else {
-        CHECK(moq_pub_finish_subscribers(f->pub, pf_pub(f, name), 0x3u, f->now) == MOQ_OK);
-    }
+    CHECK(moq_pub_finish_subscribers(f->pub, pf_pub(f, name),
+              ver == MOQ_VERSION_DRAFT_22 ? 0x2u : 0x3u, f->now) == MOQ_OK);
 }
 
 /* Cycles until the receiver reports `name` ENDED (bounded). */
@@ -601,7 +600,7 @@ static void test_done(moq_version_t ver, bool error)
     row = label;
     unsigned before = failures;
     pf_t f;
-    REQUIRE(pf_setup(&f, ver, k_cat_v, k_v, 1, NULL));
+    REQUIRE(pf_setup(&f, ver, error ? k_cat_v : k_cat_vod, k_v, 1, NULL));
     REQUIRE(select_plain(&f, "video") == MOQ_OK);
     cycles(&f, 16);
     write_loc(&f, "video", 0, 0, true, 0, 0);
@@ -1148,9 +1147,9 @@ out:
 
 static void write_catalog(pf_t *f, uint64_t g, const char *json);
 
-/* The first normal done re-arms the subscription for VOD; the peer refuses
- * the new SUBSCRIBE (the track is gone), and the receiver ends the track
- * with no done status. No END_OF_TRACK can follow: END{PEER_DONE,
+/* The first normal done waits for a valid VOD conversion catalog; the peer
+ * then refuses the new SUBSCRIBE (the track is gone), and the receiver ends
+ * the track with no done status. No END_OF_TRACK can follow: END{PEER_DONE,
  * TAIL_CUTOFF} once the tail wait passes. */
 static void test_rearm_refused(moq_version_t ver)
 {
@@ -1166,16 +1165,27 @@ static void test_rearm_refused(moq_version_t ver)
     end_group(&f, "video");
     cycles(&f, 8);
     CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x2u, f.now) == MOQ_OK);
-    CHECK(moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+    cycles(&f, 24);
+    moq_media_track_state_t state;
+    REQUIRE(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
+    REQUIRE(state == MOQ_MEDIA_TRACK_STATE_PENDING);
+    REQUIRE(!moq_pub_has_subscriber(f.pub, pf_pub(&f, "video")));
+    REQUIRE(moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+    write_catalog(&f, 1, k_cat_vod);
     REQUIRE(until_receiver_ended(&f, "video"));
+    moq_media_track_desc_t desc;
+    REQUIRE(moq_media_receiver_track_desc_copy(f.r, pf_track(&f, "video"),
+                                               &desc, sizeof(desc)) == MOQ_OK);
+    REQUIRE(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
     expect_bounded_peer_done(&f);
 out:
     pf_teardown(&f);
     if (failures == before) printf("PASS: %s\n", row);
 }
 
-/* The control: the re-armed subscription is accepted and stays live, so
- * the track has not ended and nothing ends it, however long. */
+/* The control: waiting for conversion is no end. Once a valid conversion
+ * arrives, the accepted VOD replacement stays active without a done or
+ * END_OF_TRACK, also for longer than the tail wait. */
 static void test_rearm_live(moq_version_t ver)
 {
     static char label[64];
@@ -1196,8 +1206,26 @@ static void test_rearm_live(moq_version_t ver)
         outputs(&f, &log);
     }
     moq_media_track_state_t state;
-    CHECK(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
-    CHECK(state != MOQ_MEDIA_TRACK_STATE_ENDED);
+    REQUIRE(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
+    REQUIRE(state == MOQ_MEDIA_TRACK_STATE_PENDING);
+    REQUIRE(!moq_pub_has_subscriber(f.pub, pf_pub(&f, "video")));
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 0);
+    write_catalog(&f, 1, k_cat_vod);
+    cycles(&f, 24);
+    moq_media_track_desc_t desc;
+    REQUIRE(moq_media_receiver_track_desc_copy(f.r, pf_track(&f, "video"),
+                                               &desc, sizeof(desc)) == MOQ_OK);
+    REQUIRE(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
+    REQUIRE(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
+    REQUIRE(state == MOQ_MEDIA_TRACK_STATE_ACTIVE);
+    REQUIRE(moq_pub_has_subscriber(f.pub, pf_pub(&f, "video")));
+    for (unsigned i = 0; i < 4 * (TAIL_US / 1000); i++) {
+        (void)cycle(&f);
+        outputs(&f, &log);
+    }
+    REQUIRE(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
+    CHECK(state == MOQ_MEDIA_TRACK_STATE_ACTIVE);
+    CHECK(moq_pub_has_subscriber(f.pub, pf_pub(&f, "video")));
     CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 0);
 out:
     pf_teardown(&f);
@@ -1216,7 +1244,7 @@ static void test_terminal_done_and_end(moq_version_t ver, bool done_first)
     row = label;
     unsigned before = failures;
     pf_t f;
-    REQUIRE(pf_setup(&f, ver, k_cat_v, k_v, 1, NULL));
+    REQUIRE(pf_setup(&f, ver, k_cat_vod, k_v, 1, NULL));
     REQUIRE(select_plain(&f, "video") == MOQ_OK);
     cycles(&f, 16);
     write_loc(&f, "video", 0, 0, true, 0, 0);
@@ -1291,7 +1319,7 @@ static void test_done_then_removed(moq_version_t ver)
     snprintf(label, sizeof(label), "done_then_removed_%s", vname(ver));
     row = label;
     unsigned before = failures;
-    static const char cat[] = CATALOG(LOC_VIDEO("video", "") "," LOC_VIDEO("other", ""));
+    static const char cat[] = CATALOG(LOC_VOD_VIDEO("video", "") "," LOC_VIDEO("other", ""));
     static const char cat2[] = CATALOG(LOC_VIDEO("other", ""));
     static const char *const names[] = { "video", "other" };
     pf_t f;
@@ -1319,8 +1347,9 @@ out:
     if (failures == before) printf("PASS: %s\n", row);
 }
 
-/* A normal done is not a cause: with END_OF_TRACK after it, or before it,
- * the end is COMPLETE. */
+/* A live track's first normal done is not a cause: END_OF_TRACK either
+ * finishes the original subscription first, or arrives on the replacement
+ * after a confirmed VOD conversion. The end is COMPLETE. */
 static void test_done_and_end(moq_version_t ver, bool done_first)
 {
     static char label[64];
@@ -1339,6 +1368,19 @@ static void test_done_and_end(moq_version_t ver, bool done_first)
     if (done_first) {
         CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x2u, f.now) == MOQ_OK);
         cycles(&f, 24);
+        moq_media_track_state_t state;
+        REQUIRE(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
+        REQUIRE(state == MOQ_MEDIA_TRACK_STATE_PENDING);
+        REQUIRE(!moq_pub_has_subscriber(f.pub, pf_pub(&f, "video")));
+        write_catalog(&f, 1, k_cat_vod);
+        cycles(&f, 24);
+        moq_media_track_desc_t desc;
+        REQUIRE(moq_media_receiver_track_desc_copy(f.r, pf_track(&f, "video"),
+                                                   &desc, sizeof(desc)) == MOQ_OK);
+        REQUIRE(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
+        REQUIRE(moq_media_receiver_track_state(f.r, pf_track(&f, "video"), &state) == MOQ_OK);
+        REQUIRE(state == MOQ_MEDIA_TRACK_STATE_ACTIVE);
+        REQUIRE(moq_pub_has_subscriber(f.pub, pf_pub(&f, "video")));
         CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
     } else {
         CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
@@ -1460,7 +1502,7 @@ static void test_withdrawal_then_complete(moq_version_t ver)
     snprintf(label, sizeof(label), "withdrawal_then_complete_%s", vname(ver));
     row = label;
     unsigned before = failures;
-    static const char cat[] = CATALOG(LOC_VIDEO("video", "") "," LOC_VIDEO("other", ""));
+    static const char cat[] = CATALOG(LOC_VOD_VIDEO("video", "") "," LOC_VIDEO("other", ""));
     static const char cat2[] = CATALOG(LOC_VIDEO("other", ""));
     static const char terminal[] = "{\"version\":1,\"isComplete\":true,\"tracks\":[]}";
     static const char *const names[] = { "video", "other" };
@@ -1472,13 +1514,7 @@ static void test_withdrawal_then_complete(moq_version_t ver)
     end_group(&f, "video");
     cycles(&f, 8);
     /* From here on the player is not ticked until all three are in. */
-    if (ver == MOQ_VERSION_DRAFT_22) {
-        CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x2u, f.now) == MOQ_OK);
-        for (unsigned i = 0; i < 24; i++) net_step(&f);
-        CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x2u, f.now) == MOQ_OK);
-    } else {
-        CHECK(moq_pub_finish_subscribers(f.pub, pf_pub(&f, "video"), 0x3u, f.now) == MOQ_OK);
-    }
+    terminal_normal_done(&f, ver, "video");
     bool ended = false;
     for (unsigned i = 0; i < 64 && !ended; i++) {
         net_step(&f);
@@ -2494,7 +2530,7 @@ static void test_unrelated_pause(moq_version_t ver, bool pause_audio)
     row = label;
     unsigned before = failures;
     static const char *const names[] = { "video", "audio" };
-    static const char cat[] = CATALOG(LOC_VIDEO("video", "") "," LOC_AUDIO("audio", "opus", ""));
+    static const char cat[] = CATALOG(LOC_VOD_VIDEO("video", "") "," LOC_AUDIO("audio", "opus", ""));
     pf_opts_t o = { .gap_timeout_us = UINT64_MAX, .max_buffered_objects = 2 };
     pf_t f;
     REQUIRE(pf_setup(&f, ver, cat, names, 2, &o));
@@ -2554,7 +2590,7 @@ static void test_sparse_pause(moq_version_t ver, bool eot)
     unsigned before = failures;
     pf_opts_t o = { .max_buffered_objects = 2 };
     pf_t f;
-    REQUIRE(pf_setup(&f, ver, k_cat_v, k_v, 1, &o));
+    REQUIRE(pf_setup(&f, ver, k_cat_vod, k_v, 1, &o));
     REQUIRE(select_plain(&f, "video") == MOQ_OK);
     cycles(&f, 16);
     write_loc_eog(&f, "video", 0, 0, true, 0, 0, true);
@@ -2636,7 +2672,7 @@ static void test_full_output_release(moq_version_t ver)
     pf_opts_t o = { .gap_timeout_us = UINT64_MAX, .max_buffered_objects = 2,
                     .max_outputs = 2 };
     pf_t f;
-    REQUIRE(pf_setup(&f, ver, k_cat_v, k_v, 1, &o));
+    REQUIRE(pf_setup(&f, ver, k_cat_vod, k_v, 1, &o));
     REQUIRE(select_plain(&f, "video") == MOQ_OK);
     moq_media_track_t *v = pf_track(&f, "video");
     cycles(&f, 16);
@@ -2698,10 +2734,11 @@ typedef struct {
     size_t             asize;
 } shared_t;
 
-static bool shared_setup(shared_t *s, moq_version_t ver, bool bytes)
+static bool shared_setup(shared_t *s, moq_version_t ver, bool bytes, bool never_live_video)
 {
     static const char *const names[] = { "video", "audio" };
     static const char cat[] = CATALOG(LOC_VIDEO("video", "") "," LOC_AUDIO("audio", "opus", ""));
+    static const char vod[] = CATALOG(LOC_VOD_VIDEO("video", "") "," LOC_AUDIO("audio", "opus", ""));
     pf_opts_t o = { .gap_timeout_us = UINT64_MAX };
     const size_t bsize = bytes ? 1500 : 8;
     s->asize = bytes ? 1500 : 8;
@@ -2712,7 +2749,7 @@ static bool shared_setup(shared_t *s, moq_version_t ver, bool bytes)
         o.max_buffered_objects = 2;
     }
     pf_t *f = &s->f;
-    if (!pf_setup(f, ver, cat, names, 2, &o)) return false;
+    if (!pf_setup(f, ver, never_live_video ? vod : cat, names, 2, &o)) return false;
     if (select_plain(f, "video") != MOQ_OK || select_plain(f, "audio") != MOQ_OK)
         return false;
     s->va = pf_track(f, "video");
@@ -2805,7 +2842,7 @@ static void test_shared_capacity_pause(moq_version_t ver, bool bytes)
     row = label;
     unsigned before = failures;
     shared_t s;
-    REQUIRE(shared_setup(&s, ver, bytes));
+    REQUIRE(shared_setup(&s, ver, bytes, false));
     pf_t *f = &s.f;
     write_loc_eog(f, "video", 0, 1, false, 0, s.asize, true);
     end_group(f, "video");
@@ -2849,7 +2886,7 @@ static void test_shared_capacity_eot(moq_version_t ver, bool bytes)
     row = label;
     unsigned before = failures;
     shared_t s;
-    REQUIRE(shared_setup(&s, ver, bytes));
+    REQUIRE(shared_setup(&s, ver, bytes, false));
     pf_t *f = &s.f;
     end_group(f, "video");
     cycles(f, 2);
@@ -2897,7 +2934,7 @@ static void test_shared_capacity_sparse(moq_version_t ver, bool eot)
     row = label;
     unsigned before = failures;
     shared_t s;
-    REQUIRE(shared_setup(&s, ver, false));
+    REQUIRE(shared_setup(&s, ver, false, !eot));
     pf_t *f = &s.f;
     if (eot) {
         end_group(f, "video");
@@ -3322,7 +3359,7 @@ static void test_shared_capacity_error_done(moq_version_t ver)
     row = label;
     unsigned before = failures;
     shared_t s;
-    REQUIRE(shared_setup(&s, ver, false));
+    REQUIRE(shared_setup(&s, ver, false, false));
     pf_t *f = &s.f;
     write_loc_eog(f, "video", 0, 1, false, 0, s.asize, true);
     ev_log_t evl = {0};
@@ -3359,7 +3396,7 @@ static void test_shared_capacity_failure(moq_version_t ver)
     row = label;
     unsigned before = failures;
     shared_t s;
-    REQUIRE(shared_setup(&s, ver, false));
+    REQUIRE(shared_setup(&s, ver, false, false));
     pf_t *f = &s.f;
     write_loc_eog(f, "video", 0, 1, false, 0, s.asize, true);
     ev_log_t evl = {0};
@@ -3419,7 +3456,7 @@ static void test_terminal_settles_held(moq_version_t ver, end_by_t by, bool pres
     pf_opts_t o = { .gap_timeout_us = UINT64_MAX, .max_buffered_objects = 2,
                     .max_outputs = pressure ? 2 : 0 };
     pf_t f;
-    REQUIRE(pf_setup(&f, ver, k_cat_v, k_v, 1, &o));
+    REQUIRE(pf_setup(&f, ver, by == END_BY_NORMAL_DONE ? k_cat_vod : k_cat_v, k_v, 1, &o));
     REQUIRE(select_plain(&f, "video") == MOQ_OK);
     moq_media_track_t *v = pf_track(&f, "video");
     cycles(&f, 16);

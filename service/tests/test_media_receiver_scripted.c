@@ -536,15 +536,22 @@ static void run_scenario(const char *name, bool initially_live,
     feed_track_ended(client, learned.video_rid, now);
     pump_completion(r, client, &learned, video, &events, &now);
     MOQ_TEST_CHECK_EQ_INT(events.ended, initially_live ? 0 : 1);
-    MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen, initially_live ? 3 : 2);
+    MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen,
+                         initially_live && catalog_before_done ? 3 : 2);
 
     if (initially_live && !catalog_before_done) {
         /* The live subscription completed while the catalog still said live;
-         * its replacement is already on the wire before the catalog update. */
+         * the handle stays PENDING without a replacement wire request. */
         MOQ_TEST_CHECK(desc->is_live);
+        moq_media_track_state_t waiting = MOQ_MEDIA_TRACK_STATE_DISCOVERED;
+        MOQ_TEST_CHECK(moq_media_receiver_track_state(r, video, &waiting) == MOQ_OK);
+        MOQ_TEST_CHECK(waiting == MOQ_MEDIA_TRACK_STATE_PENDING);
+        pump_completion(r, client, &learned, video, &events, &now);
+        MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen, 2);
         feed_catalog(client, 303, 1, CONVERSION_JSON, now);
         pump_completion(r, client, &learned, video, &events, &now);
     }
+    MOQ_TEST_CHECK_EQ_INT(learned.subscribe_seen, initially_live ? 3 : 2);
     MOQ_TEST_CHECK_EQ_INT(events.updated, initially_live ? 1 : 0);
     MOQ_TEST_CHECK(moq_media_track_desc_get(video) == desc);
     MOQ_TEST_CHECK(!desc->is_live);

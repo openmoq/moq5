@@ -487,9 +487,19 @@ static void fill_generation_pressure(void)
     ORIGIN_NEED(fill_start(&f));
     moq_sub_track_t *generation = f.track->sub_track;
     f.receiver->ev_cap = 1;
-    ORIGIN_NEED(rq_push(f.receiver, MOQ_MEDIA_TRACK_UPDATED, f.track));
     ORIGIN_NEED(origin_send_fill(&f, 0));
     ORIGIN_NEED(origin_send_fill(&f, 1));
+    /* Confirm conversion through catalog ingress while both original fill
+     * terminals are queued. Its real TRACK_UPDATED fills the event lane;
+     * confirmation must not bypass either child or release the old slot. */
+    static const char conversion[] =
+        "{\"version\":1,\"generatedAt\":2,\"tracks\":["
+        "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":false,"
+        "\"trackDuration\":5000,\"role\":\"video\",\"codec\":\"av01\"}]}";
+    moq_media_receiver_test_ingest(f.receiver, 1, 0, conversion, sizeof(conversion) - 1);
+    moq_media_track_desc_t desc;
+    ORIGIN_NEED(moq_media_receiver_track_desc_copy(f.receiver, f.track, &desc, sizeof(desc)) == MOQ_OK);
+    ORIGIN_NEED(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
     moq_done_subscribe_cfg_t done_cfg;
     moq_done_subscribe_cfg_init(&done_cfg);
     done_cfg.status_code = RECEIVER_DONE_TRACK_ENDED;
@@ -500,6 +510,7 @@ static void fill_generation_pressure(void)
     ORIGIN_NEED(f.track->done_pending && f.track->sub_track == generation && !f.track->vod_rearmed);
     moq_media_track_event_t event;
     ORIGIN_NEED(moq_media_receiver_poll_track(f.receiver, &event, sizeof(event)) == MOQ_OK);
+    ORIGIN_NEED(event.kind == MOQ_MEDIA_TRACK_UPDATED && event.track == f.track);
     fill_pump(&f);
     ORIGIN_NEED(fill_event(&f, 0, MOQ_FILL_COMPLETE, MOQ_FILL_ERROR_NONE, 0));
     ORIGIN_NEED(f.track->sub_track == generation && !f.track->vod_rearmed);
@@ -507,6 +518,7 @@ static void fill_generation_pressure(void)
     ORIGIN_NEED(fill_event(&f, 4, MOQ_FILL_COMPLETE, MOQ_FILL_ERROR_NONE, 0));
     fill_pump(&f);
     ORIGIN_NEED(f.track->vod_rearmed && !f.track->done_pending);
+    ORIGIN_NEED(f.track->sub_track != NULL);
     ORIGIN_NEED(moq_media_receiver_cancel_fill(f.receiver, f.track, 0) == MOQ_ERR_STALE_HANDLE);
     ORIGIN_NEED(moq_media_receiver_cancel_fill(f.receiver, f.track, 4) == MOQ_ERR_STALE_HANDLE);
     ORIGIN_NEED(!moq_media_receiver_is_fatal(f.receiver));

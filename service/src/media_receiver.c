@@ -4975,17 +4975,18 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
 /* Process recorded SUBSCRIBE_DONEs (network thread), AFTER objects were drained
  * this tick so media delivered alongside the done is not lost.
  *
- * "Track Ended" (status 0x2) is the MSF §11.3 live->VOD step 1: the live phase
- * ended but the publisher keeps the track registered/retained/joinable, so the
- * track is NOT terminalized -- already-delivered media stays queued, no
- * TRACK_ENDED is emitted, and the conversion catalog (isLive:false +
+ * "Track Ended" (status 0x2) may precede either live->VOD conversion or a
+ * terminal empty catalog (MSF §11.3). The formerly-live track is not yet
+ * terminalized: already-delivered media stays queued, no TRACK_ENDED is
+ * emitted, and a conversion catalog (isLive:false +
  * trackDuration) lands separately on the live catalog SUBSCRIBE and emits
  * TRACK_UPDATED on the SAME handle. The old facade slot is freed and sub_track
- * cleared so reconcile re-subscribes for the VOD content (auto- or
- * explicitly-subscribed alike -- both reconcile on desired_subscribed).
- * vod_rearmed makes that re-arm one-shot, so a peer that keeps finishing before
- * the VOD catalog arrives cannot spin a re-subscribe loop. Only a track declared
- * live by its creation catalog can convert: Track Ended on a never-live track
+ * cleared so reconcile can re-subscribe once the conversion catalog confirms
+ * VOD content (auto- or explicitly-subscribed alike -- both reconcile on
+ * desired_subscribed). A terminal empty catalog instead projects this drained
+ * done before removing the handle. vod_rearmed makes the re-arm one-shot.
+ * Only a track declared live by its creation catalog can convert:
+ * Track Ended on a never-live track
  * is terminal, like any other status or a repeat done after re-arm, and the
  * track ends exactly once. */
 static void receiver_process_subscription_dones(moq_media_receiver_t *r,
@@ -5031,9 +5032,9 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
 
         if (status == RECEIVER_DONE_TRACK_ENDED && t->was_live && !t->vod_rearmed &&
             !t->ended && !t->removed) {
-            /* Re-arm for VOD: keep desired_subscribed; reset the lifecycle flags
-             * so the track_state accessor reads PENDING again until the VOD
-             * SUBSCRIBE_OK lands. Delivered media stays in the object queue. */
+            /* Eligible for VOD: keep desired_subscribed; reset the lifecycle
+             * flags so track_state reads PENDING while awaiting conversion
+             * and then SUBSCRIBE_OK. Delivered media stays in the queue. */
             t->vod_rearmed = true;
             pthread_mutex_lock(&r->mu);
             t->established = false;
@@ -5078,6 +5079,10 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         pthread_mutex_unlock(&r->mu);
 
         if (!want || t->sub_track || t->ended || t->local_result != MOQ_OK) continue;
+        /* The original done may precede either conversion or a terminal empty
+         * catalog (MSF 11.3). Wait for the validated conversion before owning
+         * a replacement's streams, fill or TS window. */
+        if (t->was_live && t->vod_rearmed && t->desc.is_live) continue;
         /* A TS track's reorder window exists before its first Object can. */
         if (track_is_ts(t) && !receiver_ts_start(r, t, ts_program))
             continue;   /* allocation failed: retried next cycle */
@@ -5319,6 +5324,8 @@ static void receiver_retire_subscription(moq_media_receiver_t *r,
  * can overtake the track's last Objects, and ending the subscription on it
  * would make the peer stop their stream. No timer settles it: the catalog
  * says the broadcast completed, not that its last objects were delivered.
+ * A drained original done waiting for conversion also settles here, but only
+ * if no replacement owns the slot and no done remains to be processed.
  * Its delivered media stays queued for the application either way. The
  * application's unsubscribe (completion_cancelled) settles it too, without
  * synthesizing an end: its queued media was purged by that call, and a refused
@@ -5332,6 +5339,9 @@ static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us
         bool cancelled = t->completion_cancelled;
         pthread_mutex_unlock(&r->mu);
         if (!pending) continue;
+        if (!cancelled && t->local_result == MOQ_OK && t->vod_rearmed &&
+            !t->sub_track && !t->done_pending)
+            receiver_mark_track_done(r, t, RECEIVER_DONE_TRACK_ENDED);
         if (!cancelled && t->local_result == MOQ_OK && t->sub_track) {
             /* Live, or its done still to be processed (which releases the
              * slot once what it delivered has been taken in). */

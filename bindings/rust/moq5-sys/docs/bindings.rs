@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f38d9d5882c0
+// libmoq commit: f3dca409f1ff (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -11809,7 +11809,7 @@ pub struct moq_media_track_event {
     pub _reserved_fill_loss: u32,
     pub fill_unreported_loss_group: u64,
     pub fill_unreported_loss_object: u64,
-    #[doc = " Appended after the complete fill-loss allocation. Valid only for\n TRACK_ENDED; zero for every other event. Written and readable only\n when struct_size covers the whole block, through done_status.\n has_done_status: the track ended because its subscription completed\n (PUBLISH_DONE, or SUBSCRIBE_DONE on drafts 16/18); done_status is\n that message's status code. TRACK_ENDED (0x2) and, on drafts 16/18,\n SUBSCRIPTION_ENDED (0x3) report a normal end; any other code an\n error. Only a track declared live by its creation catalog is eligible\n for a one-shot VOD re-arm on its first TRACK_ENDED, with no event,\n even if its conversion catalog has already arrived. A never-live\n track ends on its first TRACK_ENDED; its queued Objects stay pollable.\n Ended or removed tracks cannot re-arm.\n false: the track ended with no done status -- at its END_OF_TRACK,\n or because the peer refused its subscription (a VOD\n re-subscription included). Neither value says whether the\n END_OF_TRACK arrived: that comes on the stream-terminal lane."]
+    #[doc = " Appended after the complete fill-loss allocation. Valid only for\n TRACK_ENDED; zero for every other event. Written and readable only\n when struct_size covers the whole block, through done_status.\n has_done_status: the track ended because its subscription completed\n (PUBLISH_DONE, or SUBSCRIBE_DONE on drafts 16/18); done_status is\n that message's status code. TRACK_ENDED (0x2) and, on drafts 16/18,\n SUBSCRIPTION_ENDED (0x3) report a normal end; any other code an\n error. Only a track declared live by its creation catalog is eligible\n for a one-shot VOD re-arm on its first TRACK_ENDED, with no event.\n The replacement SUBSCRIBE waits for both the original subscription's\n drain and a validated conversion catalog (isLive:false with\n trackDuration), in either order. A terminal empty catalog before a\n replacement is issued instead reports the drained original done,\n then TRACK_REMOVED; queued Objects stay pollable. A never-live track\n ends on its first TRACK_ENDED. Ended or removed tracks cannot re-arm.\n false: the track ended with no done status -- at its END_OF_TRACK,\n or because the peer refused its subscription (a VOD\n re-subscription included). Neither value says whether the\n END_OF_TRACK arrived: that comes on the stream-terminal lane."]
     pub has_done_status: bool,
     #[doc = " zero; never read"]
     pub _reserved_done: [u8; 7usize],

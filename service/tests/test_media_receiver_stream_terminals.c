@@ -76,6 +76,10 @@ typedef struct {
 static const char k_catalog[] =
     "{\"version\":\"1\",\"tracks\":[{\"name\":\"video\","
     "\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\",\"codec\":\"av01\"}]}";
+static const char k_vod_catalog[] =
+    "{\"version\":\"1\",\"tracks\":[{\"name\":\"video\","
+    "\"packaging\":\"loc\",\"isLive\":false,\"trackDuration\":5000,"
+    "\"role\":\"video\",\"codec\":\"av01\"}]}";
 #ifdef MOQ_TEST_HAVE_TS
 static const char k_ts_catalog[] =
     "{\"version\":\"1\",\"tracks\":[{\"name\":\"video\","
@@ -90,6 +94,15 @@ static const char k_mixed_catalog[] =
     "\"mpeg2tsMode\":\"unmodified-program\",\"mpeg2tsPacketSize\":188,"
     "\"mpeg2tsProgramNumber\":1},{\"name\":\"side\",\"packaging\":\"loc\","
     "\"isLive\":true,\"role\":\"video\",\"codec\":\"av01\"}]}";
+#ifdef MOQ_TEST_HAVE_TS
+static const char k_mixed_vod_catalog[] =
+    "{\"version\":\"1\",\"tracks\":[{\"name\":\"video\","
+    "\"packaging\":\"mpeg2ts\",\"isLive\":false,\"trackDuration\":5000,"
+    "\"mimeType\":\"video/mp2t\",\"mpeg2tsMode\":\"unmodified-program\","
+    "\"mpeg2tsPacketSize\":188,\"mpeg2tsProgramNumber\":1},"
+    "{\"name\":\"side\",\"packaging\":\"loc\","
+    "\"isLive\":true,\"role\":\"video\",\"codec\":\"av01\"}]}";
+#endif
 /* The catalog the next fx_setup publishes, and its reorder window. */
 static const char *g_catalog = k_catalog;
 #define TS_WINDOW_US 1000u
@@ -691,6 +704,13 @@ static void test_done_with_queued_terminals(moq_version_t ver)
     unsigned before = failures;
     fx_t f;
     REQUIRE(fx_setup(&f, ver, MOQ_MEDIA_OVERFLOW_DROP_GROUP, 64, 1, 2));
+    /* Conversion permits rearm, but cannot release the original slot while
+     * the full lane still holds its last Object and FIN. */
+    write_catalog(&f, 1, k_vod_catalog);
+    cycles(&f, 16);
+    moq_media_track_desc_t desc;
+    REQUIRE(moq_media_receiver_track_desc_copy(f.r, f.track, &desc, sizeof(desc)) == MOQ_OK);
+    REQUIRE(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
     for (uint64_t g = 0; g < 3; g++) {
         write_obj(&f, g, 0, false);
         end_group(&f);
@@ -880,6 +900,13 @@ static void test_ts_done_waits_for_room(moq_version_t ver)
     REQUIRE(fx_setup_ts(&f, ver, k_mixed_catalog, 1, 2));
     write_ts(&f, 0, 1);
     cycles(&f, 8);
+    /* The conversion arrives while the ORIGINAL TS window holds Object 1.
+     * Its later done must still wait for lane room before any replacement. */
+    write_catalog(&f, 1, k_mixed_vod_catalog);
+    cycles(&f, 8);
+    moq_media_track_desc_t desc;
+    REQUIRE(moq_media_receiver_track_desc_copy(f.r, f.track, &desc, sizeof(desc)) == MOQ_OK);
+    REQUIRE(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
     write_side(&f, 7);
     cycles(&f, 8);
     CHECK(moq_pub_finish_subscribers(f.pub, f.video, MOQ_PUB_DONE_TRACK_ENDED,

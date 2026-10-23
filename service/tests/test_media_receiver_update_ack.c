@@ -265,6 +265,12 @@ static const char CATALOG_JSON[] =
     "\"role\":\"video\",\"codec\":\"avc1.42e01e\"},"
     "{\"name\":\"audio\",\"packaging\":\"loc\",\"isLive\":true,"
     "\"role\":\"audio\",\"codec\":\"opus\"}]}";
+static const char CONVERSION_JSON[] =
+    "{\"version\":1,\"tracks\":["
+    "{\"name\":\"video\",\"packaging\":\"loc\",\"isLive\":false,"
+    "\"trackDuration\":5000,\"role\":\"video\",\"codec\":\"avc1.42e01e\"},"
+    "{\"name\":\"audio\",\"packaging\":\"loc\",\"isLive\":true,"
+    "\"role\":\"audio\",\"codec\":\"opus\"}]}";
 
 int main(void)
 {
@@ -756,17 +762,43 @@ int main(void)
         MOQ_TEST_CHECK(!notify);
         MOQ_TEST_CHECK_EQ_U64(sent_gen, 0);
 
-        /* The app re-enables; the receiver issues a REPLACEMENT SUBSCRIBE
-         * for the same stable handle; established at alias 4. */
+        /* Re-enabling alone leaves the original handle PENDING, with no
+         * replacement until its conversion catalog arrives. */
         MOQ_TEST_CHECK(moq_media_receiver_subscribe_track(r, video,
                                                           NULL) == MOQ_OK);
         uint64_t old_rid = learned.last_sub_rid;   /* audio's, from setup */
+        for (int i = 0; i < 3; i++) {
+            now += 1000;
+            moq_media_receiver_test_pump(r, client, now);
+            drain_and_learn(client, &learned);
+        }
+        MOQ_TEST_CHECK_EQ_U64(learned.last_sub_rid, old_rid);
+        moq_media_track_state_t waiting = MOQ_MEDIA_TRACK_STATE_DISCOVERED;
+        MOQ_TEST_CHECK(moq_media_receiver_track_state(r, video, &waiting) == MOQ_OK);
+        MOQ_TEST_CHECK(waiting == MOQ_MEDIA_TRACK_STATE_PENDING);
+        {
+            uint8_t buf[512];
+            size_t o = 0, jlen = sizeof(CONVERSION_JSON) - 1;
+            buf[o++] = 0x30;
+            o += put_varint(buf + o, 0); /* catalog alias */
+            o += put_varint(buf + o, 1);
+            o += put_varint(buf + o, 0);
+            o += put_varint(buf + o, jlen);
+            memcpy(buf + o, CONVERSION_JSON, jlen);
+            o += jlen;
+            MOQ_TEST_CHECK(moq_session_on_data_bytes(client,
+                moq_stream_ref_from_u64(103), buf, o, true, now) >= 0);
+        }
+        /* The confirmed replacement keeps the same handle, at alias 4. */
         for (int i = 0; i < 6 && learned.last_sub_rid == old_rid; i++) {
             now += 1000;
             moq_media_receiver_test_pump(r, client, now);
             drain_and_learn(client, &learned);
         }
         MOQ_TEST_CHECK(learned.last_sub_rid != old_rid);
+        moq_media_track_desc_t desc;
+        MOQ_TEST_CHECK(moq_media_receiver_track_desc_copy(r, video, &desc, sizeof(desc)) == MOQ_OK);
+        MOQ_TEST_CHECK(!desc.is_live && desc.has_track_duration && desc.track_duration_ms == 5000);
         {
             size_t n = build_subscribe_ok(ctrl, sizeof(ctrl),
                                           learned.last_sub_rid, 4);
