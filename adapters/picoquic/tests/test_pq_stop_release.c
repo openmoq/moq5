@@ -1085,8 +1085,14 @@ static void growth(uint8_t cid)
     moq_subscription_t csub;
     moq_subscription_t ss = subscribe(&r, &csub);
     moq_subgroup_handle_t h[12];
+    /* A worse publisher priority than the later groups': the new streams'
+     * data goes out before these streams' FINs, which would end them. */
     for (int g = 0; g < 7; g++) {
-        h[g] = open_sg(&r, ss, (uint64_t)g);
+        moq_subgroup_cfg_t c;
+        moq_subgroup_cfg_init(&c);
+        c.group_id = (uint64_t)g;
+        c.publisher_priority = 1;
+        CHECK(moq_session_open_subgroup(r.ss, ss, &c, r.now, &h[g]) == MOQ_OK);
         CHECK(write_obj(&r, h[g], 0) == MOQ_OK);
     }
     pump(&r, 200);

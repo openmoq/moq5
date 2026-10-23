@@ -32,7 +32,9 @@ _Static_assert(offsetof(moq_pub_track_cfg_t, namespace_auth_tokens) ==
                PUB_TRACK_DIM(96, 60, 64), "complete pre-auth allocation");
 _Static_assert(offsetof(moq_pub_track_cfg_t, namespace_auth_token_count) ==
                PUB_TRACK_DIM(104, 64, 68), "namespace auth count offset");
-_Static_assert(sizeof(moq_pub_track_cfg_t) == PUB_TRACK_DIM(112, 68, 72), "current sizeof");
+_Static_assert(offsetof(moq_pub_track_cfg_t, group_order) ==
+               PUB_TRACK_DIM(112, 68, 72), "group order follows complete auth layout");
+_Static_assert(sizeof(moq_pub_track_cfg_t) == PUB_TRACK_DIM(120, 72, 80), "current sizeof");
 _Static_assert(_Alignof(moq_pub_track_cfg_t) == PUB_TRACK_DIM(8, 4, 8), "current alignment");
 _Static_assert(offsetof(moq_pub_track_cfg_t, max_retained_bytes) ==
                sizeof(test_pub_track_original_t), "original prefix includes old tail padding");

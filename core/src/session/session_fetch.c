@@ -335,7 +335,14 @@ moq_result_t session_core_on_fetch_request_update(
         goto committed;
     }
 
-    if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
+    /* REQUEST_OK, and the data stream's new subscriber priority. */
+    const size_t prio_slots = session_owner_priority_slots(s,
+        d->has_subscriber_priority, d->subscriber_priority,
+        fe->subscriber_priority);
+    if (action_queue_avail(s) < 1 + prio_slots) {
+        result = MOQ_ERR_WOULD_BLOCK;
+        goto cleanup_all;
+    }
     {
         uint8_t ok_buf[64];
         moq_buf_writer_t ow;
@@ -346,6 +353,9 @@ moq_result_t session_core_on_fetch_request_update(
         rc = queue_send_bidi(s, resp_ref, ok_buf, moq_buf_writer_offset(&ow), false);
         if (rc < 0) { result = rc; goto cleanup_all; }
     }
+    if (prio_slots)   /* reserved above */
+        (void)session_update_owner_priority(s, fe->handle._opaque,
+                                            d->subscriber_priority);
     /* The priority steers this fetch's data-stream scheduling from here on. */
     if (d->has_subscriber_priority)
         fe->subscriber_priority = d->subscriber_priority;
@@ -1631,6 +1641,21 @@ static bool fetch_deferred_end_allowed(const moq_fetch_entry_t *e,
     return true;
 }
 
+/* A FETCH response stream's key: its single stream needs no group order.
+ * The publisher priority is a placeholder; each object's travels in its
+ * SEND_DATA scheduling_priority. */
+static moq_result_t fetch_push_data_key(moq_session_t *s,
+                                        const moq_fetch_entry_t *e,
+                                        moq_stream_ref_t ref)
+{
+    moq_data_priority_t key;
+    memset(&key, 0, sizeof(key));
+    key.subscriber_priority = e->subscriber_priority;
+    key.publisher_priority = 128;
+    key.owner = e->handle._opaque;
+    return session_push_data_key(s, ref, &key, NULL);
+}
+
 moq_result_t moq_session_accept_fetch(
     moq_session_t *s,
     moq_fetch_t fetch,
@@ -1700,9 +1725,12 @@ moq_result_t moq_session_accept_fetch(
         const bool empty_fin = cfg->empty;
         const bool need_drain = (upd_refused || empty_fin) &&
                                 !fetch_peer_fin_observed(fe);
-        /* Two actions: FETCH_OK on the request bidi + FETCH_HEADER on the uni;
-         * a third (the data stream's reset) and an event for a refusal. */
-        if (action_queue_avail(s) < (upd_refused ? 3u : 2u)) return MOQ_ERR_WOULD_BLOCK;
+        /* FETCH_OK on the request bidi, FETCH_HEADER on the uni and the
+         * uni's key; for a refusal also the data stream's reset and an
+         * event. */
+        if (action_queue_avail(s) < (upd_refused ? 3u : 2u) +
+                                    (s->data_priority_updates ? 1u : 0u))
+            return MOQ_ERR_WOULD_BLOCK;
         if (upd_refused && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
             return MOQ_ERR_WOULD_BLOCK;
@@ -1773,6 +1801,9 @@ moq_result_t moq_session_accept_fetch(
         data_act.u.send_data.fin = cfg->empty && !upd_refused;
         data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
             ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
+        rc = fetch_push_data_key(s, &s->fetches[slot],
+                                 data_act.u.send_data.stream_ref);
+        if (rc < 0) return rc;
         rc = push_action(s, &data_act);
         if (rc < 0) return rc;
 
@@ -1791,8 +1822,10 @@ moq_result_t moq_session_accept_fetch(
         return MOQ_OK;
     }
 
-    /* Pre-check: need 2 action slots before any encoding/mutation. */
-    if (action_queue_avail(s) < 2) return MOQ_ERR_WOULD_BLOCK;
+    /* Pre-check: 2 action slots (3 with the uni's key) before any
+     * encoding/mutation. */
+    if (action_queue_avail(s) < (s->data_priority_updates ? 3u : 2u))
+        return MOQ_ERR_WOULD_BLOCK;
 
     /* Encode both outputs before pushing either action. */
     moq_accept_fetch_encode_args_t ok_args = {
@@ -1842,6 +1875,9 @@ moq_result_t moq_session_accept_fetch(
     data_act.u.send_data.fin = cfg->empty;
     data_act.u.send_data.scheduling_priority = UINT64_C(0x10000) |
         ((uint64_t)s->fetches[slot].subscriber_priority << 8) | 128;
+    rc = fetch_push_data_key(s, &s->fetches[slot],
+                             data_act.u.send_data.stream_ref);
+    if (rc < 0) return rc;
     rc = push_action(s, &data_act);
     if (rc < 0) return rc;
 

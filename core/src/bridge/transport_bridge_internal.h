@@ -257,6 +257,47 @@ typedef struct {
     uint64_t              canon_sid;
 } bridge_pending_item_t;
 
+/* A local data stream's MOQT 7.2 scheduling state, from its SET_DATA_PRIORITY
+ * key until its FIN or reset leaves the bridge. Its SEND_DATA actions wait in
+ * `q` until the endpoint can take them, best key first. Slot links use
+ * BRIDGE_INDEX_EMPTY for none. */
+typedef struct {
+    moq_data_priority_t key;
+    moq_stream_ref_t    ref;
+    uint64_t            sid;
+    uint64_t            reset_code;
+    uint64_t            reset_reliable;
+    uint64_t            served;     /* serve_seq of its last hand-off */
+    moq_action_t       *q;          /* ring of owned SEND_DATA actions */
+    uint32_t            q_cap;
+    uint32_t            q_head;
+    uint32_t            q_len;
+    uint32_t            pos;        /* place within (owner, publisher prio) */
+    uint32_t            applied;    /* endpoint key last set */
+    uint32_t            hkey;       /* endpoint key of its next object */
+    uint32_t            retained;   /* its writes the bridge retains */
+    uint32_t            heap_at;    /* place in dheap[heap_id] */
+    uint32_t            owner_prev; /* streams of key.owner */
+    uint32_t            owner_next;
+    uint32_t            next_free;  /* free slot list */
+    uint8_t             pub;        /* publisher priority of the next object */
+    uint8_t             heap_id;    /* 0: open, 1: not yet open */
+    bool                active;
+    bool                has_sid;
+    bool                keyed;      /* the endpoint holds `applied` */
+    bool                fin_handed;
+    /* A reset waiting behind the queued prefix its reliable size covers. */
+    bool                has_reset;
+} bridge_dstream_t;
+
+/* Open-addressing entry mapping an ID to a dstream slot. */
+typedef struct {
+    uint64_t id;
+    uint32_t slot;                  /* BRIDGE_INDEX_EMPTY when unused */
+} bridge_index_entry_t;
+
+#define BRIDGE_INDEX_EMPTY UINT32_MAX
+
 /* -- Bridge --------------------------------------------------------- */
 
 struct moq_transport_bridge {
@@ -304,10 +345,12 @@ struct moq_transport_bridge {
 
     bridge_stream_entry_t *streams;
     uint32_t               max_streams;
+    uint32_t               streams_active;
 
     bridge_pending_item_t *pending;
     uint32_t               pending_count;
     uint32_t               max_pending;
+    uint32_t               pending_opens;  /* OPEN_UNI_DATA */
 
     uint64_t              *tombstones;
     uint32_t               tombstone_count;
@@ -323,6 +366,26 @@ struct moq_transport_bridge {
     bridge_hold_t         *holds;
     uint32_t               max_holds;
     uint64_t               hold_seq;
+    bridge_dstream_t      *dstreams;       /* dstream_cap entries, grows */
+    uint32_t               dstream_cap;
+    uint32_t               dstream_free;   /* free list; dstream_cap if empty */
+    bridge_index_entry_t  *dref_index;     /* ref -> slot */
+    bridge_index_entry_t  *dsid_index;     /* stream ID -> slot */
+    bridge_index_entry_t  *downer_index;   /* owner -> first of its slots */
+    uint32_t               dindex_mask;    /* index size - 1 */
+    /* Streams ready to hand data over, best key first: open ones, and ones
+     * still to open (a blocked open holds back only those). */
+    uint32_t              *dheap[2];
+    uint32_t               dheap_len[2];
+    uint32_t              *dskip;          /* streams refused in one pump */
+    /* The pump's write: one the endpoint refuses before any byte went out
+     * comes back to its stream instead of the pending FIFO. */
+    bool                   pump_hand_back;
+    bool                   pump_handed_back;
+    uint64_t               dq_bytes;       /* bytes queued across dstreams */
+    uint32_t               dq_items;       /* actions queued across dstreams */
+    uint64_t               max_retained_bytes;
+    uint64_t               serve_seq;
 };
 
 /* -- Internal helpers ----------------------------------------------- */
@@ -389,7 +452,8 @@ bridge_stream_entry_t *bridge_find_by_id(
 const bridge_stream_entry_t *bridge_find_by_id_const(
     const moq_transport_bridge_t *b, uint64_t transport_id);
 
-void bridge_deactivate_stream(bridge_stream_entry_t *e);
+void bridge_deactivate_stream(moq_transport_bridge_t *b,
+                              bridge_stream_entry_t *e);
 moq_stream_ref_t bridge_assign_inbound_ref(
     moq_transport_bridge_t *b, uint64_t transport_id,
     bridge_stream_kind_t kind);

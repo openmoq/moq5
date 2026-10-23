@@ -36,6 +36,18 @@ static bool session_idle_expired(const moq_session_t *s)
            s->last_now_us >= s->idle_deadline_us;
 }
 
+moq_result_t moq_session_track_properties_add_group_order(
+    const moq_session_t *s, const uint8_t *in, size_t in_len,
+    moq_group_order_t order, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    if (!s || !out || !out_len || (in_len > 0 && !in)) return MOQ_ERR_INVAL;
+    if (order != MOQ_GROUP_ORDER_ASCENDING &&
+        order != MOQ_GROUP_ORDER_DESCENDING)
+        return MOQ_ERR_INVAL;
+    return s->profile->track_properties_add_group_order(
+        in, in_len, (uint8_t)order, out, out_cap, out_len);
+}
+
 moq_result_t session_scan_dt_props(const moq_session_t *s,
                                    const uint8_t *data, size_t len,
                                    bool strict_local, moq_dt_scan_t *out)
@@ -920,6 +932,21 @@ bool moq_session_has_pending_output(const moq_session_t *s)
     return s && session_has_outbound_obligation(s);
 }
 
+/* With keys, one call queues up to four actions at once: a FETCH_OK beside
+ * its stream's key, header and reset, or an update's REQUEST_OK and key
+ * beside a refused fill's header and reset. */
+#define SESSION_DATA_PRIORITY_MIN_ACTIONS 4u
+
+moq_result_t moq_session_set_data_priority_updates(moq_session_t *s,
+                                                   bool enabled)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (enabled && s->action_cap < SESSION_DATA_PRIORITY_MIN_ACTIONS)
+        return MOQ_ERR_INVAL;
+    s->data_priority_updates = enabled;
+    return MOQ_OK;
+}
+
 /* The scheduling record of a SEND_DATA action, from the stream it rides:
  * a subgroup stream, a FETCH response stream, or a fill fetch stream. Fills
  * in the public scheduling snapshot too when the producer left it absent. */
@@ -970,6 +997,9 @@ moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
         *m = *meta;
     } else if (a->kind == MOQ_ACTION_SEND_DATA) {
         derive_stream_meta(s, queued, m);
+    } else if (a->kind == MOQ_ACTION_SET_DATA_PRIORITY) {
+        m->subscriber_priority = a->u.set_data_priority.priority.subscriber_priority;
+        m->publisher_priority = a->u.set_data_priority.priority.publisher_priority;
     }
     if (a->kind == MOQ_ACTION_SEND_DATA && queued->u.send_data.scheduling_priority) {
         /* The producer's snapshot is the authority for the priorities. */
@@ -1005,11 +1035,30 @@ uint64_t session_queued_data_deadline(const moq_session_t *s)
  * subscription's yields to the subscription-delivered object) and, within a
  * group, the fill-delivered object, then a datagram before a subgroup, then
  * the lowest Subgroup ID or Object ID. Actions on one stream keep their
- * order, ties keep queue order, and a non-data action holds its place. */
+ * order, ties keep queue order, and a non-data action holds its place. A
+ * stream's key is data of its stream, scheduled with the header it
+ * precedes; an owner-wide key holds its place. */
 
-static bool action_is_data(uint32_t kind)
+/* The data stream `a` acts on, if it is a stream action: SEND_DATA or a
+ * stream's key. */
+static bool action_data_stream(const moq_action_t *a, moq_stream_ref_t *ref)
 {
-    return kind == MOQ_ACTION_SEND_DATA || kind == MOQ_ACTION_SEND_DATAGRAM;
+    if (a->kind == MOQ_ACTION_SEND_DATA) {
+        *ref = a->u.send_data.stream_ref;
+        return true;
+    }
+    if (a->kind == MOQ_ACTION_SET_DATA_PRIORITY &&
+        a->u.set_data_priority.stream_ref._v != 0) {
+        *ref = a->u.set_data_priority.stream_ref;
+        return true;
+    }
+    return false;
+}
+
+static bool action_is_data(const moq_action_t *a)
+{
+    moq_stream_ref_t ref;
+    return a->kind == MOQ_ACTION_SEND_DATAGRAM || action_data_stream(a, &ref);
 }
 
 static int sched_compare(const moq_action_meta_t *x, const moq_action_meta_t *y)
@@ -1049,17 +1098,17 @@ static int sched_compare(const moq_action_meta_t *x, const moq_action_meta_t *y)
 static size_t action_select(const moq_session_t *s)
 {
     size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
-    if (!action_is_data(s->actions[head % cap].kind)) return head;
+    if (!action_is_data(&s->actions[head % cap])) return head;
     size_t best = head;
     for (size_t i = head + 1; i < tail; i++) {
         const moq_action_t *a = &s->actions[i % cap];
-        if (!action_is_data(a->kind)) break;
-        if (a->kind == MOQ_ACTION_SEND_DATA) {
+        if (!action_is_data(a)) break;
+        moq_stream_ref_t ref, other;
+        if (action_data_stream(a, &ref)) {
             bool later_on_its_stream = false;
             for (size_t j = head; j < i; j++) {
-                const moq_action_t *b = &s->actions[j % cap];
-                if (b->kind == MOQ_ACTION_SEND_DATA &&
-                    b->u.send_data.stream_ref._v == a->u.send_data.stream_ref._v) {
+                if (action_data_stream(&s->actions[j % cap], &other) &&
+                    other._v == ref._v) {
                     later_on_its_stream = true;
                     break;
                 }

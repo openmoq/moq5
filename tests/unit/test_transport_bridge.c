@@ -11541,6 +11541,13 @@ static uint32_t hol_pending(const hol_fix_t *f)
     return f->tp.server_bridge->pending_count;
 }
 
+/* Writes the bridge retains: in its pending FIFO, or -- a keyed stream's
+ * refused write -- back in that stream's queue. */
+static uint32_t hol_retained(const hol_fix_t *f)
+{
+    return f->tp.server_bridge->pending_count + f->tp.server_bridge->dq_items;
+}
+
 /* -- 1. THE CONTRACT: an unrelated ref must progress ---------------------- */
 static int test_hol_unrelated_ref_progresses(void)
 {
@@ -11620,7 +11627,7 @@ static int test_hol_same_ref_no_bypass_fin_last(void)
     f.tp.server_ep.block_write = true;
     MOQ_TEST_CHECK(hol_write(&f, a, 1, 32) == MOQ_OK);
     hol_service(&f, 4);
-    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    MOQ_TEST_CHECK(hol_retained(&f) >= 1);
 
     /* more same-ref data and the terminal, all behind the parked write */
     for (uint64_t i = 2; i <= 4; i++)
@@ -12101,7 +12108,9 @@ static int hol_explore_seed(uint64_t seed, int steps, bool verbose)
 
 /* A walk that deliberately runs max_actions > max_pending on one blocked
  * stream, so retention saturation is actually reached -- the state that made
- * fatal. Same oracles: no fatal ever, full drain, conservation. */
+ * fatal. Same oracles: no fatal ever, full drain, conservation. A data
+ * stream's backlog waits in its scheduling queue rather than the pending
+ * FIFO, so saturation is the retained-bytes bound, sized to be reached. */
 static int hol_explore_saturation_seed(uint64_t seed, int steps)
 {
     int failures = 0;
@@ -12117,8 +12126,10 @@ static int hol_explore_saturation_seed(uint64_t seed, int steps)
     held_bridge_destroy(f.tp.server_bridge);
     {
         moq_transport_bridge_cfg_t bcfg;
-        moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+        moq_transport_bridge_cfg_init_sized(&bcfg, sizeof(bcfg),
+                                            moq_alloc_default());
         bcfg.max_pending = MP;
+        bcfg.max_retained_bytes = MP * 24u;   /* about MP objects */
         if (held_bridge_create(&bcfg, f.tp.server,
                 &f.tp.server_ep.vtable, &f.tp.server_ep,
                 &f.tp.server_bridge) != MOQ_OK) {
@@ -12149,7 +12160,9 @@ static int hol_explore_saturation_seed(uint64_t seed, int steps)
             hol_service(&f, 2);
             fake_block_stream(&f.tp.server_ep, sid_a);
         }
-        if (hol_pending(&f) >= f.tp.server_bridge->max_pending) saturated++;
+        if (f.tp.server_bridge->dq_bytes >=
+            f.tp.server_bridge->max_retained_bytes)
+            saturated++;
         if (moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
             fprintf(stderr, "EXPLORE-SAT seed=%llu step=%d FATAL "
                     "(pending=%u of %u offered=%u)\n",
@@ -12164,9 +12177,10 @@ static int hol_explore_saturation_seed(uint64_t seed, int steps)
     if (!moq_transport_bridge_is_fatal(f.tp.server_bridge)) {
         fake_unblock_stream(&f.tp.server_ep);
         hol_service(&f, 512);
-        if (hol_pending(&f) != 0) {
-            fprintf(stderr, "EXPLORE-SAT seed=%llu %u still pending after "
-                    "unblock\n", (unsigned long long)seed, hol_pending(&f));
+        if (hol_pending(&f) != 0 || f.tp.server_bridge->dq_items != 0) {
+            fprintf(stderr, "EXPLORE-SAT seed=%llu %u pending + %u queued "
+                    "after unblock\n", (unsigned long long)seed,
+                    hol_pending(&f), f.tp.server_bridge->dq_items);
             failures++;
         }
         if (offered > 0 && f.tp.server_ep.write_calls < (uint64_t)offered) {
@@ -12206,7 +12220,7 @@ static int test_hol_explorer(void)
             failures += hol_explore_saturation_seed(sat[i], 200);
         printf("EXPLORE receipt: %zu seeds x 48 steps (refs=%d, credit 0..3) + "
                "%zu saturation seeds x 200 steps (max_actions=4096, "
-               "max_pending=8), %d failure(s)\n",
+               "max_pending=8, max_retained_bytes=192), %d failure(s)\n",
                n, HOL_EXPLORE_REFS, m, failures);
     }
     return failures;
@@ -12255,7 +12269,7 @@ static int test_hol_gate_orders_when_endpoint_would_accept(void)
     fake_block_stream(&f.tp.server_ep, sid_a);
     MOQ_TEST_CHECK(hol_write(&f, a, 1, 41) == MOQ_OK);
     hol_service(&f, 4);
-    MOQ_TEST_CHECK(hol_pending(&f) >= 2);
+    MOQ_TEST_CHECK(hol_retained(&f) >= 2);
 
     /* the endpoint is now willing to accept A, but the retry still stops at
      * the head, so A's object 1 stays retained and un-attempted */
@@ -13354,7 +13368,7 @@ static int test_hol_owned_payload_conservation(void)
     MOQ_TEST_CHECK(hol_write(&f, a, 0, 96) == MOQ_OK);
     f.tp.server_ep.block_write = true;
     hol_service(&f, 2);
-    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    MOQ_TEST_CHECK(hol_retained(&f) >= 1);
     /* many re-enqueues of the SAME owning item */
     for (pass = 0; pass < 10; pass++)
         (void)held_bridge_service(f.tp.server_bridge, 0);
@@ -13367,7 +13381,7 @@ static int test_hol_owned_payload_conservation(void)
     MOQ_TEST_CHECK(hol_write(&f, a, 1, 96) == MOQ_OK);
     f.tp.server_ep.block_write = true;
     hol_service(&f, 4);
-    MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+    MOQ_TEST_CHECK(hol_retained(&f) >= 1);
 
     held_bridge_destroy(f.tp.server_bridge);
     f.tp.server_bridge = NULL;
@@ -13810,7 +13824,12 @@ static void priority_pump(test_pair_t *tp, bool d18, uint64_t now)
     }
 }
 
-static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d18)
+/* The stream's priority survives the subgroup's retirement and a blocked
+ * open. With `update`, a subscriber priority update made meanwhile applies to
+ * that not yet scheduled data (MOQT 7.1: "a best effort SHOULD be made to
+ * apply the change to all objects that have not been scheduled"). */
+static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d18,
+                                                  bool update_priority)
 {
     int failures = 0;
     test_pair_t tp;
@@ -13867,28 +13886,29 @@ static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d
     tp.server_ep.block_open_uni = true;
     held_bridge_service(tp.server_bridge, 1);
     MOQ_TEST_CHECK(priority_calls == 0);
-    /* A later request update must not rewrite already retained metadata. */
-    moq_subscription_update_cfg_t update;
-    moq_subscription_update_cfg_init(&update);
-    update.has_subscriber_priority = true;
-    update.subscriber_priority = 0;
-    moq_result_t update_result = moq_session_update_subscription(
-        tp.client, client_sub, &update, 1);
-    if (update_result != MOQ_OK)
-        fprintf(stderr, "priority retained update: d18=%d rc=%d\n", d18, update_result);
-    MOQ_TEST_CHECK(update_result == MOQ_OK);
-    priority_pump(&tp, d18, 1);
-    bool updated = false;
-    while (moq_session_poll_events(tp.server, &ev, 1) > 0) {
-        if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
-            updated = true;
-            MOQ_TEST_CHECK(ev.u.subscribe_updated.has_subscriber_priority);
-            MOQ_TEST_CHECK(ev.u.subscribe_updated.subscriber_priority == 0);
+    if (update_priority) {
+        moq_subscription_update_cfg_t update;
+        moq_subscription_update_cfg_init(&update);
+        update.has_subscriber_priority = true;
+        update.subscriber_priority = 0;
+        moq_result_t update_result = moq_session_update_subscription(
+            tp.client, client_sub, &update, 1);
+        if (update_result != MOQ_OK)
+            fprintf(stderr, "priority retained update: d18=%d rc=%d\n", d18, update_result);
+        MOQ_TEST_CHECK(update_result == MOQ_OK);
+        priority_pump(&tp, d18, 1);
+        bool updated = false;
+        while (moq_session_poll_events(tp.server, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                updated = true;
+                MOQ_TEST_CHECK(ev.u.subscribe_updated.has_subscriber_priority);
+                MOQ_TEST_CHECK(ev.u.subscribe_updated.subscriber_priority == 0);
+            }
+            moq_event_cleanup(&ev);
         }
-        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(updated);
+        MOQ_TEST_CHECK(priority_calls == 0);
     }
-    MOQ_TEST_CHECK(updated);
-    MOQ_TEST_CHECK(priority_calls == 0);
     tp.server_ep.block_open_uni = false;
     held_bridge_service(tp.server_bridge, 2);
     MOQ_TEST_CHECK(tp.server_ep.open_uni_calls == opens_before + 1);
@@ -13897,7 +13917,10 @@ static int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d
         MOQ_TEST_CHECK(priority_calls == 0);
     } else {
         MOQ_TEST_CHECK(priority_calls > 0);
-        MOQ_TEST_CHECK(priority_key == UINT32_C(0x12513));
+        /* Sub 37 (0x25), or 0 once updated; pub 19 (0x13); position 0 (+1). */
+        MOQ_TEST_CHECK(priority_key == (update_priority
+                                            ? UINT32_C(0x00130001)
+                                            : UINT32_C(0x25130001)));
         MOQ_TEST_CHECK(priority_sid == expected_sid);
     }
     MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(tp.server_bridge) == (fail && !legacy));
@@ -14264,7 +14287,7 @@ static int test_hold_bidi_records_fifo_and_expiry(void)
 
     /* A mapping frees: only the oldest held stream is offered; the next one
      * stays held even when it redelivers. */
-    bridge_deactivate_stream(&r.b->streams[0]);
+    bridge_deactivate_stream(r.b, &r.b->streams[0]);
     MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3000) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
     MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 2002));
@@ -14386,7 +14409,7 @@ static int test_hold_uni_d16(void)
     MOQ_TEST_CHECK(moq_session_next_deadline_us(r.s) == 1000 + age);
     MOQ_TEST_CHECK(r.ep.count == 0);
 
-    bridge_deactivate_stream(&r.b->streams[0]);
+    bridge_deactivate_stream(r.b, &r.b->streams[0]);
     MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3000) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 101));
     MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 102));
@@ -14783,7 +14806,7 @@ static int test_fm_offer_and_age(moq_version_t ver)
 
     /* A mapping frees: only the oldest is offered, and an offer maps
      * nothing until the redelivery. */
-    bridge_deactivate_stream(&r.b->streams[0]);
+    bridge_deactivate_stream(r.b, &r.b->streams[0]);
     MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 1004000) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 501));
     MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 505));
@@ -14897,7 +14920,7 @@ static int test_fm_padding(moq_version_t ver, bool use_rcbuf)
     MOQ_TEST_CHECK(r.ep.count == 0);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(r.b));
 
-    bridge_deactivate_stream(&r.b->streams[0]);
+    bridge_deactivate_stream(r.b, &r.b->streams[0]);
     MOQ_TEST_CHECK(fm_uni(&r, 505, k_fm_padding, sizeof(k_fm_padding), false, 1100) ==
                    MOQ_OK);
     MOQ_TEST_CHECK(moq_transport_bridge_find_ref(r.b, 505)._v != 0);
@@ -15027,7 +15050,7 @@ static int test_fm_cross_kind_fifo(moq_version_t ver)
     MOQ_TEST_CHECK(hb_bidi(&r, 2001, 1000) == MOQ_ERR_INPUT_NOT_CONSUMED);
     MOQ_TEST_CHECK(fm_uni(&r, 501, k_fm_data, sizeof(k_fm_data), false, 2000) ==
                    MOQ_ERR_INPUT_NOT_CONSUMED);
-    bridge_deactivate_stream(&r.b->streams[0]);
+    bridge_deactivate_stream(r.b, &r.b->streams[0]);
     MOQ_TEST_CHECK(moq_transport_bridge_service(r.b, 3000) == MOQ_OK);
     MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(r.b, 2001));
     MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(r.b, 501));
@@ -15335,9 +15358,14 @@ int main(void)
     failures += test_held_driver_replay(false);
     failures += test_held_driver_replay(true);
     for (int d18 = 0; d18 < 2; ++d18) {
-        failures += test_priority_survives_closed_subgroup(false, false, d18 != 0);
-        failures += test_priority_survives_closed_subgroup(true, false, d18 != 0);
-        failures += test_priority_survives_closed_subgroup(true, true, d18 != 0);
+        for (int upd = 0; upd <= 1; upd++) {
+            failures += test_priority_survives_closed_subgroup(
+                false, false, d18 != 0, upd != 0);
+            failures += test_priority_survives_closed_subgroup(
+                true, false, d18 != 0, upd != 0);
+            failures += test_priority_survives_closed_subgroup(
+                true, true, d18 != 0, upd != 0);
+        }
     }
 
     failures += test_budget_context_paired_on_every_exit();

@@ -13,10 +13,14 @@
  *   - a FIN flag on the final chunk (a zero-length chunk carries a bare FIN).
  * All are released exactly once on drain, drop, or destroy.
  *
- * An aggregate byte cap bounds the buffered backlog: a push over the cap is
- * refused so the bridge retains and retries, except a push onto an empty
- * aggregate always succeeds so a single object larger than the cap is never
- * permanently blocked.
+ * An aggregate byte cap bounds the buffered backlog, as a low-water mark: a
+ * push is refused once the backlog has reached the cap, so the bridge
+ * retries; below it a push is accepted whole, so the backlog overshoots the
+ * cap by at most one write and a large object is never passed over by
+ * smaller ones. A newly opened prioritized stream also waits while 127
+ * prioritized streams hold bytes, so distinct keys among them keep distinct
+ * transport priority levels; streams already sending are never refused for
+ * this.
  *
  * Transport-agnostic (no picoquic dependency): the endpoint owns the picoquic
  * glue (mark_active_stream / provide_stream_data_buffer). Single-threaded:
@@ -35,23 +39,45 @@
 extern "C" {
 #endif
 
-#define MOQ_PQ_SEND_QUEUE_CAP_DEFAULT ((uint64_t)(1u << 20))  /* 1 MiB */
+/* Small so that little data is committed to the transport out of priority
+ * order or out of reach of a delivery timeout (the bridge holds the rest);
+ * large enough to keep a fast link busy between services. */
+#define MOQ_PQ_SEND_QUEUE_CAP_DEFAULT ((uint64_t)(128u * 1024u))
 
 typedef struct moq_pq_send_queue moq_pq_send_queue_t;
 
-/* Rank pending stream priority pairs (subscriber first, publisher second).
- * key is 0x10000 | subscriber<<8 | publisher; zero is control traffic.
+/* `sid` was just opened: its first push waits for a free priority level (see
+ * above). Returns 0, or -1 on allocation failure. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int moq_pq_send_queue_opened(moq_pq_send_queue_t *q, uint64_t sid);
+
+/* Record the bridge priority key of `sid` (lower first, zero is control
+ * traffic); takes effect at the next moq_pq_send_queue_apply_priorities.
+ * Returns 0, or -1 on allocation failure. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int moq_pq_send_queue_set_key(moq_pq_send_queue_t *q, uint64_t sid,
+                              uint32_t key);
+
+/* Rank the recorded keys once and apply each changed transport priority.
  * Equal keys round-robin. Beyond 126 better pending streams ranks coalesce,
- * never reverse. The callback must return zero on success. */
+ * never reverse. The callback must return zero on success. Returns 0, or -1
+ * on callback or allocation failure. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int moq_pq_send_queue_apply_priorities(moq_pq_send_queue_t *q,
+    int (*apply)(void *, uint64_t, uint8_t), void *ctx);
+
+/* moq_pq_send_queue_set_key, then moq_pq_send_queue_apply_priorities. */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("hidden")))
 #endif
 int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
     uint32_t key, int (*apply)(void *, uint64_t, uint8_t), void *ctx);
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((visibility("hidden")))
-#endif
-uint32_t moq_pq_send_queue_priority_key(moq_pq_send_queue_t *q, uint64_t sid);
 
 /* Create with an aggregate byte cap (0 -> MOQ_PQ_SEND_QUEUE_CAP_DEFAULT, also
  * overridable by the internal env var MOQ_PQ_STREAM_QUEUE_BYTES). Returns NULL
@@ -64,8 +90,8 @@ moq_pq_send_queue_t *moq_pq_send_queue_create(const moq_alloc_t *alloc,
 void moq_pq_send_queue_destroy(moq_pq_send_queue_t *q);
 
 /* Append a copy of `data[0..len)` to stream `sid`. `fin` marks it as the
- * stream's final chunk. Returns 1 if accepted, 0 if the aggregate cap would be
- * exceeded (the caller returns WOULD_BLOCK), -1 on allocation failure. */
+ * stream's final chunk. Returns 1 if accepted, 0 if a cap would be exceeded
+ * (the caller returns WOULD_BLOCK), -1 on allocation failure. */
 int moq_pq_send_queue_push_copy(moq_pq_send_queue_t *q, uint64_t sid,
                                 const uint8_t *data, size_t len, bool fin);
 

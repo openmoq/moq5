@@ -1369,7 +1369,7 @@ static int row_endpoint_classification(void)
     memset(&ep, 0, sizeof(ep));
     static int cnx_tag;
     CHECK(pq_endpoint_init(&ops, &ep, (picoquic_cnx_t *)&cnx_tag,
-                           moq_alloc_default()) == 0);
+                           moq_alloc_default(), 0) == 0);
     ep.rx_stopped = count_rx_stopped;
     g_rx_stopped_n = 0;
     g_active_n = 0;

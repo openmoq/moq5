@@ -395,6 +395,9 @@ PIN_AFTER(moq_endpoint_cfg_t, verify_certificate_ctx, uri_mode);
 PIN_AFTER(moq_endpoint_cfg_t, verify_certificate_ctx, preferred_version);
 PIN_AFTER(moq_endpoint_cfg_t, verify_certificate_ctx, accept_uri);
 PIN_AFTER(moq_endpoint_cfg_t, verify_certificate_ctx, accept_uri_ctx);
+PIN_THROUGH(moq_endpoint_cfg_t, accept_uri_ctx, 200,
+            116 - ABI_ENDPOINT_ENUM_SHIFT, 120 - 2 * ABI_ENDPOINT_ENUM_SHIFT, 8, 4, 8);
+PIN_AFTER(moq_endpoint_cfg_t, accept_uri_ctx, send_queue_cap_bytes);
 #endif
 
 /* -- Simulator ------------------------------------------------------------- */
@@ -794,8 +797,11 @@ PIN_AT(moq_endpoint_cfg_t, accept_uri, 184,
        108 - ABI_ENDPOINT_ENUM_SHIFT, 112 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
 PIN_AT(moq_endpoint_cfg_t, accept_uri_ctx, 192,
        112 - ABI_ENDPOINT_ENUM_SHIFT, 116 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
-PIN_SIZE(moq_endpoint_cfg_t, 200,
-         116 - ABI_ENDPOINT_ENUM_SHIFT, 120 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+/* The adapter queue bound starts at the sizeof through accept_uri_ctx. */
+PIN_AT(moq_endpoint_cfg_t, send_queue_cap_bytes, 200,
+       116 - ABI_ENDPOINT_ENUM_SHIFT, 120 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+PIN_SIZE(moq_endpoint_cfg_t, 208,
+         124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
 #endif
 
 #ifdef ABI_HAVE_MEDIA_RECEIVER
@@ -994,7 +1000,10 @@ PIN_THROUGH(moq_pub_track_cfg_t, dynamic_groups, 96, 60, 64, 8, 4, 8);
 PIN_AFTER(moq_pub_track_cfg_t, dynamic_groups, namespace_auth_tokens);
 PIN_AT(moq_pub_track_cfg_t, namespace_auth_tokens, 96, 60, 64);
 PIN_AT(moq_pub_track_cfg_t, namespace_auth_token_count, 104, 64, 68);
-PIN_SIZE(moq_pub_track_cfg_t, 112, 68, 72);
+PIN_THROUGH(moq_pub_track_cfg_t, namespace_auth_token_count, 112, 68, 72, 8, 4, 8);
+PIN_AFTER(moq_pub_track_cfg_t, namespace_auth_token_count, group_order);
+PIN_AT(moq_pub_track_cfg_t, group_order, 112, 68, 72);
+PIN_SIZE(moq_pub_track_cfg_t, 120, 72, 80);
 PIN_THROUGH(moq_sub_joining_fetch_cfg_t, subscriber_priority, 40, 28, 32, 8, 4, 8);
 PIN_AFTER(moq_sub_joining_fetch_cfg_t, subscriber_priority, auth_tokens);
 PIN_AT(moq_sub_joining_fetch_cfg_t, auth_tokens, 40, 28, 32);
@@ -1079,6 +1088,7 @@ PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           track_properties);
 PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           dynamic_groups);
+PIN_AFTER(moq_media_track_cfg_t, label, group_order);
 _Static_assert(offsetof(moq_media_track_cfg_t, track_properties) ==
                ABI_SIZEOF_THROUGH(moq_media_track_cfg_t,
                                   mpeg2ts_forward_before_random_access),

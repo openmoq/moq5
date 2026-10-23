@@ -101,6 +101,16 @@ const moq_resolved_window_t *moq_session_pub_resolved_window(
     return &e->window;
 }
 
+moq_group_order_t moq_session_publication_group_order(
+    const moq_session_t *s, moq_publication_t pub)
+{
+    if (!s) return MOQ_GROUP_ORDER_DEFAULT;
+    int slot = pub_resolve_handle(s, pub);
+    if (slot < 0) return MOQ_GROUP_ORDER_DEFAULT;
+    const moq_pub_entry_t *e = &s->publishes[slot];
+    return session_group_order(e->group_order, e->track_group_order);
+}
+
 moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
     bool has_largest, uint64_t largest_group, uint64_t largest_object,
     bool has_expires, uint64_t expires_ms)
@@ -919,6 +929,8 @@ moq_result_t session_core_on_publish(moq_session_t *s,
                                        (uint32_t)slot);
     moq_publication_t handle = { packed };
 
+    const uint8_t track_order = s->profile->track_properties_group_order(
+        d->track_properties, d->track_properties_len);
     moq_event_t e;
     memset(&e, 0, sizeof(e));
     e.kind = MOQ_EVENT_PUBLISH_REQUEST;
@@ -933,6 +945,7 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     e.u.publish_request.token_count = d->token_count;
     e.u.publish_request.track_properties = ev_props;
     e.u.publish_request.dynamic_groups = d->dynamic_groups;
+    e.u.publish_request.publisher_group_order = track_order;
     e.u.publish_request.has_largest = d->has_largest;
     e.u.publish_request.largest_group = d->has_largest ? d->largest_group : 0;
     e.u.publish_request.largest_object = d->has_largest ? d->largest_object : 0;
@@ -985,8 +998,7 @@ moq_result_t session_core_on_publish(moq_session_t *s,
         d->has_subscriber_priority ? d->subscriber_priority : 128;
     entry->group_order = d->has_group_order ? d->group_order
                                             : (uint8_t)MOQ_GROUP_ORDER_DEFAULT;
-    entry->track_group_order = s->profile->track_properties_group_order(
-        d->track_properties, d->track_properties_len);
+    entry->track_group_order = track_order;
     entry->default_publisher_priority = default_priority;
     if (s->profile->publish_initial_parameters) {
         entry->d22_initial = d->initial;
@@ -1838,6 +1850,8 @@ moq_result_t moq_session_accept_publish(
      * the PUBLISH's own; its window resolves against the Largest the PUBLISH
      * advertised, as the publisher's does against its track history. */
     s->publishes[slot].send_allowed = fwd_effective;
+    if (cfg->group_order != MOQ_GROUP_ORDER_DEFAULT)
+        s->publishes[slot].group_order = (uint8_t)cfg->group_order;
     if (has_filter) {
         s->publishes[slot].filter_type = (uint32_t)filter;
         s->publishes[slot].req_start_group = f_start_group;
@@ -2354,6 +2368,16 @@ static void pub_inbound_update_snapshot(moq_session_t *s, moq_pub_entry_t *e,
     u->snapshot = *v;
 }
 
+/* Action slots the update's subscriber priority change needs. */
+static size_t pub_inbound_update_priority_slots(const moq_session_t *s,
+                                                const moq_pub_entry_t *e,
+                                                const moq_sub_update_t *u)
+{
+    return session_owner_priority_slots(s, u->has_subscriber_priority,
+                                        u->subscriber_priority,
+                                        e->subscriber_priority);
+}
+
 static moq_result_t pub_inbound_update_prepare(moq_session_t *s, size_t slot,
                                        const moq_sub_update_t *u, size_t ok_actions,
                                        moq_update_plan_t *p)
@@ -2417,6 +2441,9 @@ static void pub_inbound_update_commit(moq_session_t *s, size_t slot, const moq_s
 {
     moq_pub_entry_t *e = &s->publishes[slot];
     memset(&e->update_snapshot, 0, sizeof(e->update_snapshot));
+    if (pub_inbound_update_priority_slots(s, e, u))
+        (void)session_update_owner_priority(s, e->handle._opaque,
+                                            u->subscriber_priority);
     if (u->has_subscriber_priority)
         e->subscriber_priority = u->subscriber_priority;
     /* draft-18 5.1: this endpoint is the PUBLISHER, and the REQUEST_UPDATE_OK
@@ -2762,13 +2789,18 @@ moq_result_t session_core_on_publish_request_update(
         return MOQ_OK;
     }
 
-    if (action_queue_full(s)) { result = MOQ_ERR_WOULD_BLOCK; goto cleanup_all; }
+    /* Plus the changed subscriber priority's owner-wide key. */
+    size_t ok_actions = 1 + pub_inbound_update_priority_slots(s, e, &u);
+    if (action_queue_avail(s) < ok_actions) {
+        result = MOQ_ERR_WOULD_BLOCK;
+        goto cleanup_all;
+    }
 
     moq_subscription_update_options_t *options = NULL;
     rc = session_update_stage_options(s, &u, d->tokens, d->token_count, &options);
     if (rc < 0) { result = rc; goto cleanup_all; }
     moq_update_plan_t plan;
-    rc = pub_inbound_update_prepare(s, (size_t)d->target_slot, &u, 1, &plan);
+    rc = pub_inbound_update_prepare(s, (size_t)d->target_slot, &u, ok_actions, &plan);
     if (rc < 0) { result = rc; goto cleanup_all; }
 
     /* Copy resolved auth tokens into scratch for borrow-epoch-safe delivery. */
@@ -2848,10 +2880,13 @@ moq_result_t session_accept_publication_update_receipt(
     bool req_stream = e->rs.ref._v != 0;
 
     /* The whole answer is reserved before anything is queued: one REQUEST_OK
-     * per covered update, every byte of them, and the fill. */
-    if (action_queue_avail(s) < n) return MOQ_ERR_WOULD_BLOCK;
+     * per covered update, every byte of them, the subscriber priority's
+     * owner-wide key, and the fill. */
+    size_t ok_actions = n + pub_inbound_update_priority_slots(s, e, &e->owed_update.rec);
+    if (action_queue_avail(s) < ok_actions) return MOQ_ERR_WOULD_BLOCK;
     moq_update_plan_t plan;
-    rc = pub_inbound_update_prepare(s, (size_t)slot, &e->owed_update.rec, n, &plan);
+    rc = pub_inbound_update_prepare(s, (size_t)slot, &e->owed_update.rec, ok_actions,
+                                    &plan);
     if (rc < 0) return rc;
     rc = session_update_accept_fits(s, &e->owed_update, &plan);
     if (rc < 0) return rc;
@@ -3509,7 +3544,9 @@ moq_result_t moq_session_open_pub_subgroup(
     int slot = sg_find_free(s);
     if (slot < 0) return MOQ_ERR_WOULD_BLOCK;
 
-    if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    /* The stream's key goes out ahead of its first SEND_DATA. */
+    if (action_queue_avail(s) < (s->data_priority_updates ? 2u : 1u))
+        return MOQ_ERR_WOULD_BLOCK;
 
     bool has_ext = false;
     if (cfg->struct_size >= offsetof(moq_subgroup_cfg_t, object_properties) +
@@ -3567,6 +3604,10 @@ moq_result_t moq_session_open_pub_subgroup(
     moq_action_meta_t meta;
     sg_stream_meta(s, &probe, &meta);
 
+    moq_data_priority_t key;
+    session_subgroup_data_key(&meta, &key);
+    rc = session_push_data_key(s, a.u.send_data.stream_ref, &key, &meta);
+    if (rc < 0) return rc;
     rc = push_action_ex(s, &a, &meta, UINT64_MAX);
     if (rc < 0) return rc;
 

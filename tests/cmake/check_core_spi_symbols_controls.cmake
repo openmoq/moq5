@@ -59,15 +59,16 @@ function(run_row name format expect reason out err code)
 endfunction()
 
 set(want "moq_core_internal_track_max_cache_duration")
+set(want2 "moq_core_internal_track_properties_validate")
 set(other "moq_session_create")
 
 # Exact native inventories.
 run_row(macho_exact macho pass "exact private SPI set verified"
-    "0000000000001000 T _${want}\n0000000000002000 T _${other}\n" "" 0)
+    "0000000000001000 T _${want}\n0000000000001800 T _${want2}\n0000000000002000 T _${other}\n" "" 0)
 run_row(elf_exact elf pass "exact private SPI set verified"
-    "0000000000001000 T ${want}\n0000000000002000 T ${other}\n" "" 0)
+    "0000000000001000 T ${want}\n0000000000001800 T ${want2}\n0000000000002000 T ${other}\n" "" 0)
 run_row(elf_versioned elf pass "exact private SPI set verified"
-    "0000000000001000 T ${want}@@MOQ_1\n0000000000002000 T ${other}\n" "" 0)
+    "0000000000001000 T ${want}@@MOQ_1\n0000000000001800 T ${want2}@@MOQ_1\n0000000000002000 T ${other}\n" "" 0)
 
 # The expected symbol is absent.
 run_row(missing macho fail "MISSING"

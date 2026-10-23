@@ -240,6 +240,7 @@ static struct moq_pq_threaded_conn *server_accept(moq_pq_threaded_t *t,
     acfg.session = session;
     acfg.cnx = cnx;
     acfg.alloc = &t->alloc;
+    acfg.send_queue_cap_bytes = t->send_queue_cap_bytes;
     acfg.user_ctx = c;
     acfg.after_callback = server_conn_after_callback;
     moq_pq_conn_t *conn = NULL;
@@ -755,6 +756,7 @@ static int client_callback(picoquic_cnx_t *cnx,
         acfg.session = session;
         acfg.cnx = cnx;
         acfg.alloc = &t->alloc;
+        acfg.send_queue_cap_bytes = t->send_queue_cap_bytes;
         moq_pq_conn_t *conn = NULL;
         if (moq_pq_conn_create(&acfg, &conn) != 0) {
             moq_session_destroy(session);
@@ -1522,6 +1524,8 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
         t->recv_buffer_size = cfg->recv_buffer_size;
     if (CFG_HAS(cfg, goaway_timeout_us))
         t->goaway_timeout_us = cfg->goaway_timeout_us;
+    if (CFG_HAS(cfg, send_queue_cap_bytes))
+        t->send_queue_cap_bytes = cfg->send_queue_cap_bytes;
     if (CFG_HAS(cfg, keep_alive_interval_ms))
         t->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
     t->max_connections =
@@ -1841,6 +1845,7 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
             acfg.session = session;
             acfg.cnx = cnx;
             acfg.alloc = &t->alloc;
+            acfg.send_queue_cap_bytes = t->send_queue_cap_bytes;
             moq_pq_conn_t *conn = NULL;
             if (moq_pq_conn_create(&acfg, &conn) != 0) {
                 moq_session_destroy(session);

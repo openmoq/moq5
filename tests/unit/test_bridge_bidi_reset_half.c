@@ -559,24 +559,19 @@ static void run_pressure(moq_version_t v, int which)
         CHECK(moq_transport_bridge_stream_count(sb) == base - 2);
     }
     if (which == P_UNRELATED) {
-        /* An object for the third subscription is retained (the endpoint
-         * refuses writes) and fills the one slot; then two requests end. */
-        moq_subgroup_cfg_t gc;
-        moq_subgroup_cfg_init(&gc);
-        gc.group_id = 0;
-        moq_subgroup_handle_t sg;
-        CHECK(moq_session_open_subgroup(p->s, s3, &gc, p->now, &sg) == MOQ_OK);
-        moq_rcbuf_t *obj = NULL;
-        uint8_t bytes[4] = { 1, 2, 3, 4 };
-        CHECK(moq_rcbuf_create(moq_alloc_default(), bytes, 4, &obj) == MOQ_OK);
-        CHECK(moq_session_write_object(p->s, sg, 0, obj, p->now) == MOQ_OK);
-        moq_rcbuf_decref(obj);
+        /* The third subscription's PUBLISH_DONE is retained (the endpoint
+         * refuses writes) and fills the one slot; then two requests end. A
+         * refused data object would wait in its own stream's queue, not in
+         * the slot. */
+        moq_done_subscribe_cfg_t dc3;
+        moq_done_subscribe_cfg_init(&dc3);
+        CHECK(moq_session_done_subscribe(p->s, s3, &dc3, p->now) == MOQ_OK);
         ep->block_write = true;
         p->now += 10;
         CHECK(moq_transport_bridge_service(sb, p->now) == MOQ_OK);
         CHECK(sb->pending_count == 1);
         bridge_pending_item_t held = sb->pending[0];
-        uint64_t data_sid = held.canon_have_sid ? held.canon_sid : held.stream_id;
+        uint64_t held_sid = held.canon_have_sid ? held.canon_sid : held.stream_id;
         fake_endpoint_clear_ops(ep);
         CHECK(moq_transport_bridge_on_peer_stream_reset(sb, a, 0x5, p->now) == MOQ_OK);
         CHECK(moq_transport_bridge_on_peer_stream_reset(sb, b, 0x6, p->now) == MOQ_OK);
@@ -597,8 +592,8 @@ static void run_pressure(moq_version_t v, int which)
         ep->block_write = false;
         p->now += 10;
         CHECK(moq_transport_bridge_service(sb, p->now) == MOQ_OK);
-        /* The held object goes first; then each cancellation, once. */
-        int w = first_op(ep, FAKE_OP_WRITE, data_sid);
+        /* The held PUBLISH_DONE goes first; then each cancellation, once. */
+        int w = first_op(ep, FAKE_OP_WRITE, held_sid);
         int ra = first_op(ep, FAKE_OP_RESET, a), rb = first_op(ep, FAKE_OP_RESET, b);
         CHECK(w >= 0 && ra > w && rb > w);
         CHECK(ops_of(ep, FAKE_OP_RESET, a, MOQ_STREAM_ERROR_CANCELLED, false) == 1);
@@ -648,10 +643,10 @@ static void run_pressure(moq_version_t v, int which)
         /* First pass, before anything is cleared: nothing on `a`. */
         CHECK(g_obs.fins == 0 && g_obs.resets == 0 && g_obs.stops == 0 && g_obs.closes == 0);
         CHECK(g_obs.writes == ep->write_calls - w0);       /* the observer saw every write */
-        /* Stopped at the budget (the subgroup open, its objects and
-         * PUBLISH_DONE with our FIN were queued): the FIN is still the
-         * session's. */
-        CHECK(p->s->action_tail - p->s->action_head + BRIDGE_DRAIN_BUDGET == objects + 2);
+        /* Stopped at the budget (the subgroup open, its priority key, its
+         * objects and PUBLISH_DONE with our FIN were queued): the FIN is
+         * still the session's. */
+        CHECK(p->s->action_tail - p->s->action_head + BRIDGE_DRAIN_BUDGET == objects + 3);
         bridge_stream_entry_t *ea = bridge_find_by_id(sb, a);
         CHECK(ea != NULL && !ea->local_send_closed && !ea->local_cancel_queued);
         for (int k = 0; k < 2; k++) {

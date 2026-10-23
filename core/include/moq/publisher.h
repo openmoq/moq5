@@ -494,22 +494,34 @@ typedef struct moq_pub_track_cfg {
 #endif
     const moq_auth_token_t *namespace_auth_tokens;
     size_t                 namespace_auth_token_count;
+    /* Appended past the complete namespace-auth layout: the track's group
+     * order (MOQT 7.1), ASCENDING or
+     * DESCENDING, advertised as DEFAULT_PUBLISHER_GROUP_ORDER: added to
+     * track_properties in the session's encoding unless they already carry
+     * it. A subscriber's own order takes precedence. DEFAULT (the default)
+     * advertises none. A track_properties set that carries another value, or
+     * any other value here, is MOQ_ERR_INVAL. Read only when struct_size
+     * covers the whole field. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    moq_group_order_t group_order;
 } moq_pub_track_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen original
- * prefix (struct_size .. publisher_priority, i.e. before the appended
- * max_retained_bytes, has_publisher_priority, and monotonic_groups). All
- * appended fields stay disabled — callers that want an explicit priority, a
- * retained-byte budget, or the monotonic-groups declaration (default OFF)
+ * prefix (struct_size .. publisher_priority, i.e. before every appended
+ * field). All appended fields stay disabled — callers that set any of them
  * must use moq_pub_track_cfg_init_sized(). Mirrors moq_pub_cfg_init(). */
 MOQ_API void moq_pub_track_cfg_init(moq_pub_track_cfg_t *cfg);
 
 /* Size-aware initializer: zeroes and stamps min(cfg_size, sizeof) so all
  * appended fields the caller's struct covers are active. Pass
  * sizeof(moq_pub_track_cfg_t). No-op if cfg is NULL or cfg_size cannot hold
- * struct_size. Use this whenever you set has_publisher_priority or
- * monotonic_groups (both default off; monotonic_groups is read only when
- * struct_size covers the whole field). */
+ * struct_size. Use this whenever you set has_publisher_priority,
+ * monotonic_groups, or group_order (all default off; the last two are
+ * read only when struct_size covers the whole field). */
 MOQ_API void moq_pub_track_cfg_init_sized(moq_pub_track_cfg_t *cfg,
                                           size_t cfg_size);
 

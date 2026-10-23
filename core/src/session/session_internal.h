@@ -73,6 +73,7 @@ _Static_assert(sizeof(moq_open_uni_control_action_t) <= MOQ_ACTION_DETAIL_MAX, "
 _Static_assert(sizeof(moq_send_uni_control_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_reset_bidi_stream_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_stop_bidi_stream_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
+_Static_assert(sizeof(moq_set_data_priority_action_t) <= MOQ_ACTION_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_ns_sub_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_ns_sub_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_ns_sub_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -86,6 +87,12 @@ _Static_assert(sizeof(moq_fetch_complete_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_object_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_gap_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
+/* publisher_group_order must stay inside the old padding. */
+_Static_assert(offsetof(moq_publish_request_event_t, largest_group) ==
+               ((offsetof(moq_publish_request_event_t, has_largest) +
+                 sizeof(bool) + _Alignof(uint64_t) - 1u) &
+                ~(size_t)(_Alignof(uint64_t) - 1u)),
+               "publisher_group_order moved largest_group");
 _Static_assert(sizeof(moq_publish_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_finished_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -2338,6 +2345,7 @@ struct moq_session {
 
     moq_sg_entry_t *subgroups;
     size_t          sg_cap;
+    bool            data_priority_updates;   /* SET_DATA_PRIORITY opt-in */
     uint64_t        next_stream_ref;
 
     moq_rx_stream_t *rx_streams;
@@ -2964,7 +2972,7 @@ void fill_stream_meta(const moq_session_t *s, const moq_fill_entry_t *f,
                       moq_action_meta_t *out);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
 
-int sub_resolve_handle(moq_session_t *s, moq_subscription_t h);
+int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h);
 /* Whether `h` resolves to a subscription whose peer cancellation is pending
  * (moq_sub_entry_t.cancel_pending). */
 bool sub_cancel_pending(moq_session_t *s, moq_subscription_t h);
@@ -4228,6 +4236,33 @@ moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                                                   moq_subscription_t sub,
                                                   moq_publication_t pub,
                                                   uint32_t *budget);
+
+/* MOQT 7.2 scheduling key of a subgroup stream, from its scheduling record
+ * (sg_stream_meta). */
+void session_subgroup_data_key(const moq_action_meta_t *m,
+                               moq_data_priority_t *out);
+
+/* Queue a SET_DATA_PRIORITY action; no-op unless data_priority_updates. A
+ * stream's key takes `meta`, its header's scheduling record (NULL: its
+ * priorities alone). */
+moq_result_t session_push_data_key(moq_session_t *s, moq_stream_ref_t ref,
+                                   const moq_data_priority_t *key,
+                                   const moq_action_meta_t *meta);
+
+/* Action slots a subscriber priority update needs for its owner-wide key. */
+static inline size_t session_owner_priority_slots(const moq_session_t *s,
+                                                  bool has_priority,
+                                                  uint8_t new_priority,
+                                                  uint8_t old_priority)
+{
+    return s->data_priority_updates && has_priority &&
+           new_priority != old_priority ? 1u : 0u;
+}
+
+/* The owner-wide key for a changed subscriber priority. The caller reserved
+ * session_owner_priority_slots() action slots. */
+moq_result_t session_update_owner_priority(moq_session_t *s, uint64_t owner,
+                                           uint8_t subscriber_priority);
 
 moq_result_t session_scan_dt_props(const moq_session_t *s,
                                    const uint8_t *data, size_t len,

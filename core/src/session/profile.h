@@ -236,6 +236,13 @@ typedef struct moq_profile_ops {
      * MOQ_GROUP_ORDER_DEFAULT when it is absent or unreadable. Never
      * errors (validation lives in the encoders and the inbound decoders). */
     uint8_t (*track_properties_group_order)(const uint8_t *data, size_t len);
+    /* `in` with DEFAULT_PUBLISHER_GROUP_ORDER = `order` (ASCENDING or
+     * DESCENDING) added, as track_properties_add_dynamic_groups adds its
+     * property: a set that already carries `order` is copied unchanged, one
+     * with another value is MOQ_ERR_INVAL. */
+    moq_result_t (*track_properties_add_group_order)(const uint8_t *in, size_t len,
+                                                     uint8_t order, uint8_t *out,
+                                                     size_t cap, size_t *out_len);
     /* MAX_CACHE_DURATION (0x04) in a track properties blob, searching the
      * mutable list and Immutable Properties: true with its milliseconds when
      * present. A blob that does not parse states nothing past the failure. */
@@ -728,6 +735,21 @@ const moq_profile_ops_t *moq_profile_lookup(moq_version_t version);
  * timeouts and default publisher priority read. MOQ_OK or MOQ_ERR_INVAL. */
 moq_result_t moq_profile_check_track_properties(const moq_profile_ops_t *p,
                                                 const uint8_t *data, size_t len);
+
+/* The Track Property set a track publishes under `p`: `in` with
+ * DYNAMIC_GROUPS = 1 and DEFAULT_PUBLISHER_GROUP_ORDER = `group_order` added
+ * when declared (MOQ_GROUP_ORDER_DEFAULT adds none), checked as
+ * moq_profile_check_track_properties() checks it. *out is allocated from `a`
+ * (*out_cap bytes; NULL for an empty set). MOQ_ERR_INVAL for a set the
+ * session would refuse or a group order other than the three defined,
+ * MOQ_ERR_NOMEM. */
+moq_result_t moq_profile_build_track_properties(const moq_profile_ops_t *p,
+                                                const moq_alloc_t *a,
+                                                const uint8_t *in, size_t len,
+                                                bool dynamic_groups,
+                                                moq_group_order_t group_order,
+                                                uint8_t **out, size_t *out_cap,
+                                                size_t *out_len);
 
 /* Every version this build has a profile for, newest first. Returns the
  * count written (at most cap). */

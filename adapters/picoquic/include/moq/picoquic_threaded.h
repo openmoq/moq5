@@ -391,6 +391,10 @@ typedef struct moq_pq_threaded_cfg {
      * none. Set via moq_pq_threaded_cfg_init_sized. */
     uint64_t         (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
     void              *app_lane_deadline_ctx;
+    /* Appended: every connection's moq_pq_conn_cfg_t send_queue_cap_bytes
+     * (see <moq/picoquic.h>). 0 = default. Set via
+     * moq_pq_threaded_cfg_init_sized. */
+    uint64_t           send_queue_cap_bytes;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
