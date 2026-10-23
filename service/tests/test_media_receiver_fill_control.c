@@ -665,6 +665,64 @@ done:
 }
 #endif
 
+#ifndef MOQ_RECEIVER_FILL_BASELINE
+static void fill_track_fill_update(void)
+{
+    origin_fixture_t f;
+    ORIGIN_NEED(fill_start(&f));
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_OBJECT_END;
+    loc.start_group = 0; loc.start_object = 10;
+    loc.end_group = 0; loc.end_object = 19;
+    moq_fill_cfg_t fill;
+    moq_fill_cfg_init(&fill);
+    fill.location = &loc;
+    moq_media_track_t foreign = {0};
+    ORIGIN_NEED(moq_media_receiver_track_fill(NULL, f.track, &fill) == MOQ_ERR_INVAL);
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, NULL, &fill) == MOQ_ERR_INVAL);
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, NULL) == MOQ_ERR_INVAL);
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, &foreign, &fill) == MOQ_ERR_INVAL);
+    ORIGIN_NEED(!f.track->pending_fill);
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_OK);
+    ORIGIN_NEED(f.track->pending_fill);
+    /* One request is held per track until the endpoint thread sends it. */
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_ERR_WOULD_BLOCK);
+    fill_pump(&f);
+    fill_pump(&f);
+    ORIGIN_NEED(!f.track->pending_fill);
+    ORIGIN_NEED(!moq_media_receiver_is_fatal(f.receiver));
+    ORIGIN_NEED(f.track->local_result == MOQ_OK);
+    /* A fill still waiting to be sent is dropped by a disable. */
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_OK);
+    ORIGIN_NEED(moq_media_receiver_unsubscribe_track(f.receiver, f.track) == MOQ_OK);
+    ORIGIN_NEED(!f.track->pending_fill);
+    ORIGIN_NEED(moq_media_receiver_subscribe_track(f.receiver, f.track, NULL) == MOQ_OK);
+    ORIGIN_NEED(moq_media_receiver_unsubscribe_track(f.receiver, f.track) == MOQ_OK);
+    /* A disabled track takes no new fill. */
+    ORIGIN_NEED(moq_media_receiver_unsubscribe_track(f.receiver, f.track) == MOQ_OK);
+    ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_ERR_WRONG_STATE);
+done:
+    fill_finish(&f);
+}
+
+static void fill_track_fill_legacy(void)
+{
+    const moq_version_t versions[] = {MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18};
+    for (unsigned i = 0; i < 2; i++) {
+        origin_fixture_t f;
+        ORIGIN_NEED(origin_start(&f, versions[i]));
+        moq_fill_cfg_t fill;
+        moq_fill_cfg_init(&fill);
+        ORIGIN_NEED(moq_media_receiver_track_fill(f.receiver, f.track, &fill) == MOQ_ERR_UNSUPPORTED);
+        ORIGIN_NEED(!f.track->pending_fill);
+done:
+        fill_finish(&f);
+    }
+}
+
+#endif
+
 int main(void)
 {
     origin_run("fill_terminal_delivery", fill_terminal_delivery);
@@ -683,6 +741,8 @@ int main(void)
     origin_run("parent_request_done_domains_and_no_stream", fill_parent_outcomes);
     origin_run("catalog_child_terminal_stays_private", fill_catalog_private);
     origin_run("executor_transient_cancel_retry_keeps_original_identity", fill_cancel_retry);
+    origin_run("track_fill_sends_one_update_and_holds_one_request", fill_track_fill_update);
+    origin_run("track_fill_refused_before_draft_22", fill_track_fill_legacy);
 #endif
     printf("receiver_fill_control: %d failures\n", failures);
     return failures ? 1 : 0;

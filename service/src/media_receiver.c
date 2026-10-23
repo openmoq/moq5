@@ -325,6 +325,11 @@ struct moq_media_track {
      * ts_gen the application polled: no later Object of it carries it. */
     bool             ts_join_delivered;
     receiver_track_options_t desired_options;
+    /* One fill requested after the subscription started
+     * (moq_media_receiver_track_fill), sent as an UPDATE by the next
+     * reconcile pass. mu-protected. */
+    bool             pending_fill;
+    receiver_track_options_t pending_fill_options;
 
     /* Data path (network-thread state). */
     moq_sub_track_t *sub_track;        /* non-NULL while subscribed */
@@ -5325,6 +5330,46 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
     }
 }
 
+/* Send the track's pending fill, if any, as an UPDATE carrying the fill.
+ * Returns true when this pass used the track's update slot (sent, or failed
+ * permanently); false leaves the pass to the forward-state reconcile. */
+static bool receiver_send_pending_fill(moq_media_receiver_t *r,
+                                       moq_media_track_t *t, uint64_t now_us)
+{
+    pthread_mutex_lock(&r->mu);
+    bool pending = t->pending_fill;
+    receiver_track_options_t options = t->pending_fill_options;
+    pthread_mutex_unlock(&r->mu);
+    if (!pending) return false;
+    if (moq_sub_track_get_state(t->sub_track) == MOQ_SUB_TRACK_PENDING ||
+        t->update_inflight)
+        return true;                /* retried on a later pass */
+
+    moq_location_filter_cfg_t fill_loc = options.fill_location;
+    moq_fill_cfg_t fill = options.fill;
+    fill.location = options.has_fill_location ? &fill_loc : NULL;
+    moq_sub_update_cfg_t ucfg;
+    moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+    ucfg.fill = &fill;
+    moq_result_t rc = moq_sub_update_subscription(r->sub, t->sub_track,
+                                                  &ucfg, now_us);
+    if (rc == MOQ_OK) {
+        pthread_mutex_lock(&r->mu);
+        t->pending_fill = false;
+        t->upd_notify_app = false;  /* the app asked for a fill, not a toggle */
+        t->update_inflight = true;
+        pthread_mutex_unlock(&r->mu);
+    } else if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK &&
+               rc != MOQ_ERR_REQUEST_BLOCKED) {
+        pthread_mutex_lock(&r->mu);
+        t->pending_fill = false;
+        pthread_mutex_unlock(&r->mu);
+        receiver_mark_track_local_failure(r, t, rc,
+                                           MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
+    }
+    return true;
+}
+
 /* Reconcile per-track delivery (the subscription's Forward State) with the two
  * things that can suppress it: an app unsubscribe (desired_subscribed=false) and
  * FLOW_CONTROL backpressure. A disabled track keeps its handle but pauses with
@@ -5375,6 +5420,10 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
          * the snapshot -- it must influence neither this pass's target nor
          * its attribution, and must stay unreconciled for the next pass. */
         RECONCILE_RACE_HOOK();
+
+        /* A fill requested on the running subscription goes out as its own
+         * UPDATE, after the initial response and any update in flight. */
+        if (receiver_send_pending_fill(r, t, now_us)) continue;
 
         bool target = want && flow_allows;
         t->forward_desired = target;
@@ -7304,6 +7353,7 @@ moq_result_t moq_media_receiver_unsubscribe_track(
      * that arrive before the forward=false update lands are dropped at intake. */
     obj_compact_locked(r, keep_not_track, track);
     track->has_drop_filter = false;
+    track->pending_fill = false;   /* a fill not yet sent is abandoned with the delivery it was for */
     pthread_mutex_unlock(&r->mu);
 
     moq_endpoint_wake(r->ep);
@@ -7333,6 +7383,36 @@ moq_result_t moq_media_receiver_cancel_fill(
                 break;
             }
         }
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (rc == MOQ_OK) moq_endpoint_wake(r->ep);
+    return rc;
+}
+
+moq_result_t moq_media_receiver_track_fill(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    const moq_fill_cfg_t *fill)
+{
+    if (!r || !track || !fill) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+    receiver_track_options_t options = {0};
+    moq_result_t rc = receiver_copy_fill(fill, &options);
+    if (rc != MOQ_OK) return rc;
+    pthread_mutex_lock(&r->mu);
+    if (r->fatal) rc = MOQ_ERR_CLOSED;
+    else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
+    else if (r->transport_version != MOQ_VERSION_DRAFT_22 ||
+             r->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        rc = MOQ_ERR_UNSUPPORTED;
+    else if (track->ended || track->removed || track->local_result != MOQ_OK ||
+             !track->desired_subscribed || !track->requested)
+        rc = MOQ_ERR_WRONG_STATE;
+    else if (track->pending_fill)
+        rc = MOQ_ERR_WOULD_BLOCK;
+    else {
+        track->pending_fill_options = options;
+        track->pending_fill = true;
+        rc = MOQ_OK;
     }
     pthread_mutex_unlock(&r->mu);
     if (rc == MOQ_OK) moq_endpoint_wake(r->ep);

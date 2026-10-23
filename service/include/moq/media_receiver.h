@@ -848,6 +848,29 @@ MOQ_API moq_result_t moq_media_receiver_subscribe_track(
 MOQ_API moq_result_t moq_media_receiver_unsubscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track);
 
+/* Request one more fill on a track that is already subscribed. The fill is
+ * sent as an UPDATE on the running subscription (draft 22 companion only), so
+ * a consumer can fetch a clip in ranges: set fill->location to a range inside
+ * the cached group and issue the next range when the buffer drains. The
+ * fill's objects arrive through poll_object with delivery_origin FILL, and its
+ * end as MOQ_MEDIA_TRACK_FILL_TERMINAL carrying the request id (use it with
+ * moq_media_receiver_cancel_fill). A new fill never cancels an earlier one.
+ * fill and fill->location borrow only for the call.
+ *
+ * One request is held per track until it is sent; a second call before then
+ * returns MOQ_ERR_WOULD_BLOCK (retry after the next wake). Returns:
+ *   MOQ_OK             recorded; sent by the endpoint thread
+ *   MOQ_ERR_INVAL      NULL args, a foreign track, or a malformed fill
+ *   MOQ_ERR_ABI_MISMATCH  fill->struct_size below the frozen floor
+ *   MOQ_ERR_UNSUPPORTED   not negotiated draft 22 with the D22 companion
+ *   MOQ_ERR_WRONG_STATE   the track is not subscribed (never requested,
+ *                         disabled, ended or failed)
+ *   MOQ_ERR_WOULD_BLOCK   a previous request is still waiting to be sent
+ *   MOQ_ERR_CLOSED     the receiver is terminal */
+MOQ_API moq_result_t moq_media_receiver_track_fill(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    const moq_fill_cfg_t *fill);
+
 /* Cancel one owned D22 fill, selected by its initiating SUBSCRIBE/UPDATE ID.
  * Zero is a valid ID. Records bounded intent and wakes the endpoint executor;
  * only that executor calls the facade and supplies time. No application session
