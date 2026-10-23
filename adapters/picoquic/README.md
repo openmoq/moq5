@@ -261,11 +261,20 @@ and `Threads::Threads`.
 
 ## Provider source baseline
 
-The qualified picoquic source is 7e77d01d9ec4fd03f71529637549863917aeb793
+The pinned development picoquic source is
+70b5fd5aafdd2d6c349ff783202ece9d778bcaf2 (release `v2026.10.22.70b5fd5`)
 with the patches `scripts/setup_picoquic_deps.sh` applies, built against
 picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1. Other source trees given
 through `MOQ_PICOQUIC_SOURCE_DIR` are used as they are: no version is
 checked, and no Git metadata is required.
+
+This release advertises and accepts both the legacy RESET_STREAM_AT transport
+parameter (`0x17f7586d2cb571`) and the draft-11 parameter (`0x1d`). That support
+comes from upstream, not a LibMoQ patch. It does not change the MoQ draft offer
+or enable reliable reset when the peer advertises neither parameter. The
+remaining development patches and their removal conditions are documented in
+[`patches/picoquic/README.md`](../../patches/picoquic/README.md); the unmodified
+release does not yet supply all contracts required below.
 
 On that baseline picoquic-core needs nothing from picoquic-log, so libmoq
 links the provider's targets with picoquic's own dependency edges only

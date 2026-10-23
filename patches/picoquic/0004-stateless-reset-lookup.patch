@@ -1,6 +1,6 @@
 Look up a stateless reset without processing the datagram.
 
-Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
 0003.
 
 RFC 9000 Section 10.3.1 has an endpoint compare a datagram's last 16 bytes

@@ -1,6 +1,6 @@
 Keep the declared project version in source archives and subproject builds.
 
-Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793.
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2.
 
 The parent may not be a Git checkout, and its revision is not picoquic's. The
 package configuration and version files use project()'s version, and

@@ -1,6 +1,6 @@
 Refuse STOP_SENDING for a receive half completed through direct receive.
 
-Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
 0009.
 
 Direct receive marks a completed receive half with fin_received and

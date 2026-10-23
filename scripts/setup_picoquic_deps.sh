@@ -65,7 +65,7 @@ set -euo pipefail
 
 # -- Pinned, known-good dependency commits -----------------------------
 PICOQUIC_REPO="${PICOQUIC_REPO:-https://github.com/private-octopus/picoquic}"
-PICOQUIC_REF="${PICOQUIC_REF:-7e77d01d9ec4fd03f71529637549863917aeb793}"
+PICOQUIC_REF="${PICOQUIC_REF:-70b5fd5aafdd2d6c349ff783202ece9d778bcaf2}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
 PICOTLS_REF="${PICOTLS_REF:-7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1}"
 

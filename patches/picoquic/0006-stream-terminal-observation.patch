@@ -1,6 +1,6 @@
 Observe exact STOP and opted-in local UNI byte+FIN ACK.
 
-Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
 0005.
 
 Preserve callback values; append a successful send-commit event. Observation
@@ -18,8 +18,9 @@ The committed callback runs before picoquic_callback_stream_released, while
 the stream's correlation is still live. PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION
 advertises the contract.
 
-Reset after FIN, the scheduler's handling of a pending reset, empty non-FIN
-ACK ranges and RESET_STREAM_AT ACK dispatch come from 0003.
+Reset after FIN comes from upstream; 0003 retains terminal refusal and
+context preservation, empty non-FIN ACK handling and reliable-prefix
+retirement. This patch preserves reset precedence over a later FIN ACK.
 
 Tests: adapters/picoquic/tests/test_pq_terminal.c in LibMoQ, with separate
 constructed-state and deterministic native packet rows.

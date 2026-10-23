@@ -1,11 +1,14 @@
 Classify a reset or stop of a terminal or unknown stream by the ID's state.
 
-Applies to picoquic 7e77d01d9ec4fd03f71529637549863917aeb793, after 0001 to
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
 0007.
 
 0003 supplies the direction checks and refuses a stop before its context
-changes. This adds the rest of the contract. Stream IDs are never reused
-(RFC 9000 Section 2.1), and picoquic keeps each type's creation boundary:
+changes. Upstream PR2279 already classifies absent retired reset IDs; that
+replacement is no longer supplied here. This retains range checks, the
+STOP classification and the complete contract declaration. Stream IDs are
+never reused (RFC 9000 Section 2.1), and picoquic keeps each type's creation
+boundary:
 
 - An ID outside the 62-bit range answers PICOQUIC_ERROR_INVALID_STREAM_ID.
 - An absent ID below its type's boundary answers
@@ -24,13 +27,13 @@ Tests: adapters/picoquic/tests/test_pq_stop_release.c (reset and stop
 contract rows) and test_pq_hold_input.c (call order, bounded).
 
 diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
-index aa29f5a0..19215218 100644
+index a70d08a4..10d10bac 100644
 --- a/picoquic/picoquic.h
 +++ b/picoquic/picoquic.h
-@@ -1703,6 +1703,17 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t * cnx, uint64_t stream_id, co
- 
- /* Reset a stream, indicating that no more data will be sent on 
-  * that stream and that any data currently queued can be abandoned. */
+@@ -1709,6 +1709,17 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t * cnx, uint64_t stream_id, co
+  * the stream is invalid, e.g., if attempting to reset a stream that was not
+  * yet created.
+  */
 +#define PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED 1
 +/* picoquic_reset_stream, picoquic_reset_stream_at and picoquic_stop_sending
 + * classify the stream ID before touching anything. A part already terminal
@@ -46,10 +49,10 @@ index aa29f5a0..19215218 100644
      uint64_t stream_id, uint64_t local_stream_error);
  int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
 diff --git a/picoquic/streams.c b/picoquic/streams.c
-index 9e687675..8e9a25f3 100644
+index 5bc13867..91a8f799 100644
 --- a/picoquic/streams.c
 +++ b/picoquic/streams.c
-@@ -497,14 +497,21 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+@@ -497,8 +497,10 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
      if (reliable_size > 0 && !cnx->is_reset_stream_at_enabled) {
          ret = PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION;
      }
@@ -62,19 +65,7 @@ index 9e687675..8e9a25f3 100644
           * the peer closes the connection on a RESET_STREAM for its send-only
           * stream (RFC 9000 Section 19.4). */
          ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
-     }
-     else if ((stream = picoquic_find_stream(cnx, stream_id)) == NULL) {
--        ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
-+        /* Stream IDs are never reused (RFC 9000 Section 2.1): an absent ID
-+         * below its type's creation boundary was opened and has since been
-+         * retired, so its sending part is already terminal and no frame is
-+         * due. Any other absent ID was never opened. */
-+        ret = (stream_id < cnx->next_stream_id[STREAM_TYPE_FROM_ID(stream_id)]) ?
-+            PICOQUIC_ERROR_STREAM_ALREADY_CLOSED : PICOQUIC_ERROR_INVALID_STREAM_ID;
-     }
-     else {
-         /* RFC 9000 Section 3.1: a reset is allowed in "Data Sent", after the
-@@ -587,17 +594,27 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+@@ -585,17 +587,27 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
      picoquic_stream_head_t* stream = NULL;
      PICOQUIC_THREAD_CHECK(cnx->quic);
  
