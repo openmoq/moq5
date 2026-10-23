@@ -9,7 +9,7 @@ This file is the reviewed in-tree architecture reference.
 A relay is a set of single-writer **shards**; each shard owns sessions and
 **tracks**; each track is a **bounded append-and-evict log** of refcounted
 object records; every consumer of any kind — live subscriber, fetch, cache
-retention, cross-shard pump, future cluster leg — is a **cursor** over that
+retention, cross-shard pump, cluster leg — is a **cursor** over that
 log; and the whole relay is a deterministic state machine whose only inputs
 are session events, delivery outcomes, control operations, and time.
 
@@ -44,7 +44,9 @@ Consequences, each load-bearing:
   clamped at create to `max(2, max_subs, max_ns_subs, max_ns_nodes)` — the
   largest single *atomic* reservation (a track's upstream resolution
   ≤ max_subs; one namespace's withdrawal ≤ max_ns_subs; a namespace
-  subscription's matches ≤ max_ns_nodes). A binding close, whose total
+  subscription's matches ≤ max_ns_nodes). Cluster cores also clamp it to
+  at least `max_subs + 2 * max_tracks + max_ns_subs` for route changes.
+  A binding close, whose total
   fan-out could be multiplicative (announced namespaces × watchers), is
   **resumable**: it delivers as much as fits, returns WOULD_BLOCK, and the
   binding drains and retries until done — so a close never strands and a
@@ -61,6 +63,35 @@ Consequences, each load-bearing:
   prints it at every lane count; overflow refuses `INVAL` rather than
   under-reporting. Admission control refuses past capacity instead of
   degrading.
+
+## Cluster routing
+
+Draft-22 sessions can negotiate the pinned
+[MoQ Cluster draft-01](../../docs/draft-lcurley-moq-cluster-01.txt). The
+[embedding guide](../README.md#cluster-routing) describes configuration.
+The host creates and reconnects peer connections; core and binding remain
+sans-I/O and run on their existing owners.
+
+The core retains bounded alternative routes for a namespace. Selection starts
+with the longest advertised prefix, excludes routes returning to the requester
+or containing its nonzero hop ID, then prefers known paths, lower accumulated
+cost, fewer hops and newer arrival. Local-loop routes are dropped. Link costs
+saturate, and a currently served path advertises zero cost while retaining its
+accumulated cost for later use. Warm reparenting uses a deterministic ordering.
+
+The binding advertises one selected route per recipient, appending its local
+hop exactly once. Same-publisher metadata changes update the advertisement;
+publisher changes withdraw it before replacement. Ordinary publishers enter
+the mesh as path `[0]`; separate unknown publishers retain distinct lifetimes.
+Peer identifiers guide routing while the existing authorization policy
+continues to control namespace discovery and content requests.
+
+Track ingest and upstream FETCH retain the selected source and generation.
+Same-origin failover resumes beyond the previous source's largest group; old
+partial records are abandoned and unsealed subgroups reset before replacement.
+Different/unknown publishers do not share retained content. Shards copy route
+metadata through bounded queues and verify the current source generation before
+applying replies, so delayed old-source data cannot enter a replacement log.
 
 ## Hard rules (CI-enforced where possible)
 

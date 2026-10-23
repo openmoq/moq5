@@ -76,6 +76,11 @@ interoperability evidence are in [docs/conformance.md](docs/conformance.md);
 the draft-22 wire format is in
 [docs/draft22-wire-reference.md](docs/draft22-wire-reference.md).
 
+MoQ Cluster draft-01 is available as an opt-in on draft-22 sessions and the
+reusable relay libraries. Hosts configure peer connections and drive the relay;
+see the [cluster setup guide](relay/README.md#cluster-routing) and
+[coverage and limits](docs/conformance.md#moq-cluster-draft-01).
+
 ## Media service tier
 
 For media applications, the service tier is the recommended API. It links only

@@ -495,6 +495,8 @@ typedef struct moq_drain_scan {
  * per request (the advertised MAX_REQUEST_UPDATES is one, and this side
  * keeps at most one update of its own in flight). */
 typedef struct moq_ns_update {
+    moq_cluster_metadata_t owed_cluster;
+    moq_cluster_metadata_t out_cluster;
     bool                 owed;
     uint32_t             owed_flags;
     uint64_t             owed_request_id;
@@ -531,6 +533,7 @@ typedef struct moq_ns_update {
 } moq_ns_update_t;
 
 typedef struct moq_ann_entry {
+    moq_cluster_metadata_t cluster;
     moq_ann_state_t    state;
     moq_ann_role_t     role;
     uint32_t           generation;
@@ -1731,6 +1734,7 @@ typedef struct moq_goaway_encode_args {
 } moq_goaway_encode_args_t;
 
 typedef struct moq_publish_namespace_encode_args {
+    moq_cluster_metadata_t cluster;
     uint64_t        request_id;
     moq_namespace_t track_namespace;
     const moq_auth_token_t *auth_tokens;
@@ -1753,6 +1757,7 @@ typedef struct moq_subscribe_namespace_encode_args {
 } moq_subscribe_namespace_encode_args_t;
 
 typedef struct moq_namespace_msg_encode_args {
+    moq_cluster_metadata_t cluster;
     bool is_done;    /* false = NAMESPACE (found), true = NAMESPACE_DONE (gone) */
     moq_namespace_t suffix;
 } moq_namespace_msg_encode_args_t;
@@ -2186,6 +2191,14 @@ struct moq_session {
     bool                defer_fetch_ranges;
     /* The application answers draft-22 namespace updates
      * (moq_session_set_defer_namespace_updates). */
+    bool cluster_enabled;
+    bool cluster_negotiated;
+    bool cluster_has_relay_cost;
+    bool cluster_peer_has_relay_cost;
+    uint64_t cluster_hop_id;
+    uint64_t cluster_relay_cost;
+    uint64_t cluster_peer_hop_id;
+    uint64_t cluster_peer_relay_cost;
     bool                defer_namespace_updates;
     /* The peer's implementation identifier, copied at setup completion. */
     uint8_t            *peer_implementation;
@@ -3428,6 +3441,9 @@ moq_result_t session_core_reject_initial_request(moq_session_t *s,
 /* -- Decoded inbound PUBLISH_NAMESPACE (profile → session core) ------- */
 
 typedef struct moq_decoded_publish_namespace {
+    moq_bytes_t cluster_hop_path;
+    bool cluster_has_route_cost;
+    uint64_t cluster_route_cost;
     moq_request_endpoint_t endpoint;
     uint64_t         request_id;
     moq_namespace_t  track_namespace;
@@ -3533,6 +3549,9 @@ static inline uint64_t retry_interval_to_ms(uint64_t wire)
 }
 
 typedef struct moq_decoded_ns_sub_response {
+    moq_bytes_t cluster_hop_path;
+    bool cluster_has_route_cost;
+    uint64_t cluster_route_cost;
     moq_ns_sub_response_kind_t kind;
     size_t consumed;                 /* bytes consumed from input */
 
@@ -4430,6 +4449,9 @@ typedef struct moq_decoded_publish_blocked {
 /* A draft-22 REQUEST_UPDATE of a namespace request (§9.5): the selected
  * parameters its family permits. Spans borrow the message body. */
 typedef struct moq_decoded_namespace_update {
+    moq_bytes_t cluster_hop_path;
+    bool cluster_has_route_cost;
+    uint64_t cluster_route_cost;
     uint64_t        request_id;
     bool            has_prefix;
     moq_namespace_t prefix;
@@ -4439,6 +4461,7 @@ typedef struct moq_decoded_namespace_update {
 } moq_decoded_namespace_update_t;
 
 typedef struct moq_namespace_update_encode_args {
+    moq_cluster_metadata_t cluster;
     uint64_t                request_id;
     moq_request_family_t    family;
     bool                    has_prefix;
@@ -4939,6 +4962,20 @@ moq_result_t request_stream_failed_by_fin(moq_session_t *s,
  * bidi. The caller reserved the action slot. */
 void request_bidi_reset_local(moq_session_t *s, moq_stream_ref_t stream_ref);
 
+/* Owned cluster metadata helpers; mutations reserve the new path first. */
+bool session_cluster_namespace_duplicate(moq_session_t *s, const moq_namespace_t *ns,
+                                         bool local_sender, int excluded_ns_sub);
+moq_result_t session_cluster_validate(const moq_cluster_metadata_t *m, bool required);
+moq_result_t session_cluster_copy(moq_session_t *s, const moq_cluster_metadata_t *in,
+                                  moq_cluster_metadata_t *out);
+moq_result_t session_cluster_decode(moq_session_t *s, moq_bytes_t path, bool has_cost,
+                                    uint64_t cost, moq_cluster_metadata_t *out);
+void session_cluster_free(moq_session_t *s, moq_cluster_metadata_t *m);
+moq_result_t session_cluster_event(moq_session_t *s, const moq_cluster_metadata_t *in,
+                                   moq_cluster_metadata_t *out);
+void session_cluster_apply(moq_session_t *s, moq_cluster_metadata_t *current,
+                           moq_cluster_metadata_t *update);
+
 /* -- Draft-22 namespace updates (session_namespace_update.c) ---------- */
 
 struct moq_request_envelope;
@@ -4968,11 +5005,13 @@ moq_result_t ns_update_owed_query(const moq_ns_update_t *u,
     moq_namespace_update_record_t *out, size_t out_size);
 moq_result_t ns_update_push_request_event(moq_session_t *s,
     moq_request_family_t family, uint64_t handle_raw, const moq_ns_update_t *u);
-moq_result_t ns_update_push_result_event(moq_session_t *s,
-    moq_request_family_t family, uint64_t handle_raw, uint64_t update_request_id,
-    moq_namespace_update_outcome_t outcome, moq_request_role_t role,
-    uint64_t error_code, const uint8_t *reason, size_t reason_len,
-    bool has_expires, uint64_t expires_ms);
+moq_result_t ns_update_push_result_event(moq_session_t *s, moq_request_family_t family,
+                                         uint64_t handle_raw, uint64_t update_request_id,
+                                         moq_namespace_update_outcome_t outcome,
+                                         moq_request_role_t role, uint64_t error_code,
+                                         const uint8_t *reason, size_t reason_len, bool has_expires,
+                                         uint64_t expires_ms,
+                                         const moq_cluster_metadata_t *cluster);
 /* Decode, admit the Request ID and stage the token transaction of a peer
  * namespace update. A malformed message closes the session. On MOQ_OK the
  * caller ends the admission with ns_update_defer, or with

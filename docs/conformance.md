@@ -469,6 +469,36 @@ A request naming a Track Namespace whose first field is "." or ".session"
 is refused with DOES_NOT_EXIST before the application sees it, and the
 application may not publish under one (§2.4.3, §6.5; `request_refusal`).
 
+## MoQ Cluster draft-01
+
+The [pinned cluster draft](draft-lcurley-moq-cluster-01.txt) is supported as an
+opt-in on draft-22 sessions and the reusable relay core, binding and shard
+runtime. The draft references transport draft-21; this implementation maps its
+cluster semantics onto draft-22 request streams. This adds no draft-21 wire
+profile. Draft-16, draft-18 and unnegotiated draft-22 behavior remain unchanged.
+See the [setup guide](../relay/README.md#cluster-routing),
+[API contract](../relay/docs/api.md#cluster-configuration-and-metadata) and
+[design](moq-cluster-01-design.md).
+
+Tests `cluster_wire`, `cluster_session` and `cluster_work` cover negotiation,
+metadata validation, partial updates and bounded receive work. Tests
+`relay_cluster`, `relay_cluster_shards` and `relay_cluster_mesh` cover route
+selection, source identity, backpressure, failover and delayed responses across
+shards. The nine-case mesh delivers exact catalog bytes and three progressing
+media groups through two relays, including sharded and redundant topologies.
+`pq_sim_establish`, `pico_wt_loopback` and `pico_wt_loopback_private` separately
+verify cluster negotiation and catalog/media delivery in native QUIC and
+WebTransport TLS/packet simulations. These are not live socket mesh evidence.
+
+The recorded implementation run passed 575/575 Debug tests and 3/3 adapter
+tests. ASan/UBSan/LeakSanitizer passed 569/575, including all six cluster tests.
+The six failures reproduce on the unchanged baseline: a bounds error in the
+MPEG-TS fixture, four relay-bootstrap leak fixtures and one finite-tail leak
+fixture. Commands and results are in [the validation record](moq-cluster-01-plan.txt).
+Live socket mesh testing and the absent `../moq-pub` application remain
+unverified. Peer discovery, dialing and reconnect policy belong to the host;
+the relay command does not expose cluster-peer configuration.
+
 ## Known limitations
 
 Each of these is a stated limit or open decision a user can run into.

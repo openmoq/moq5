@@ -31,6 +31,7 @@ typedef struct moq_d22_message_context {
     uint64_t updated_request_type;
     bool update_from_subscriber;
     uint64_t max_filter_ranges;
+    bool cluster;
 } moq_d22_message_context_t;
 
 /* A semantic tagged message. Only fields selected by type are active.

@@ -37,6 +37,52 @@ Public declarations use only C types and opaque library objects. Test counters,
 seal/inspection hooks, binding authorization glue, and the CLI toy policy are
 private; defining a testing macro does not expose them from installed headers.
 
+## Cluster Configuration And Metadata
+
+Cluster draft-01 is opt-in on draft-22 sessions. Use a sized session
+initializer, then set `cluster_enabled` and `cluster_hop_id` before creation.
+Both endpoints must offer the feature. `cluster_has_relay_cost` distinguishes
+an omitted cost (one) from `cluster_relay_cost == 0` (free). Query local/peer
+identity and negotiation with `moq_session_cluster_info`. Zero withholds an
+identity and is valid; use one configured local identity across relay peers.
+
+Use `moqr_cluster_cfg_init_sized` and `moqr_core_create_cluster` for a standalone
+core. The separate record preserves the layout of embedded core configurations.
+For the shard runtime, use its appended `cluster_enabled`, `cluster_hop_id`,
+`max_cluster_routes` and `max_cluster_hops` fields. A binding refuses a
+cluster-enabled session whose local identity differs from its core, or whose
+core has clustering disabled. Ordinary sessions can attach to a cluster core.
+
+The default route and received-path limits are 256 routes and 32 hops per
+core. Paths exceeding the configured limit are refused without truncation.
+`moqr_core_cluster_info` reports these limits and route usage. Before creating
+the core, pass the same cluster configuration to
+`moqr_core_cluster_capacity_describe`; resolve it with `moqr_cluster_cfg_resolve`
+for `moqr_bind_cluster_capacity_describe`. The shard capacity description
+includes its cluster pools, copied metadata and bounded replication queues.
+
+Attach peer sessions with `moqr_bind_conn_open`, or use
+`moqr_bind_conn_open_cluster` with a sized `moqr_bind_cluster_peer_cfg_t` to
+override the peer's relay cost or correlate connections known to be one
+endpoint. Correlation IDs remain local. The binding opens namespace discovery
+after setup and applies the existing authorization policy before importing
+routes. Hop and correlation IDs do not grant access.
+
+Session publication/update configurations carry `moq_cluster_metadata_t`.
+Inputs are borrowed for the call; retained paths are copied. Event paths and
+`moq_session_namespace_cluster` results are borrowed until the next advancing
+session call. `moq_session_send_namespace_cluster` sends discovery metadata;
+repeat it to update the same advertisement. Partial publication updates retain
+omitted fields; explicit zero changes cost to zero. Updates preserve the first
+hop; changing publisher identity requires withdrawal and a new advertisement.
+
+Direct engine hosts configure peer bindings with
+`moqr_core_binding_set_cluster` and supply routes through
+`moqr_core_announce_cluster`. `moqr_core_cluster_route` selects for one
+recipient; its metadata borrows core storage until the next mutating core call.
+Its cost is already accumulated. A direct forwarding host appends the local
+hop once; the session binding performs that step for attached sessions.
+
 ## Ownership
 
 | Resource | Contract |

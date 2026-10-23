@@ -286,6 +286,17 @@ typedef struct moq_simpair_cfg {
      * session cannot admit yet is exercised deterministically. Read via
      * cfg_has_field; 0 keeps the session default. */
     uint32_t           client_max_data_streams;
+
+    /* Cluster draft-01, independently offered by each endpoint. The first
+     * aligned field starts beyond the preceding layout's tail padding. */
+    uint64_t client_cluster_hop_id;
+    uint64_t server_cluster_hop_id;
+    uint64_t client_cluster_relay_cost;
+    uint64_t server_cluster_relay_cost;
+    bool client_cluster_enabled;
+    bool server_cluster_enabled;
+    bool client_cluster_has_relay_cost;
+    bool server_cluster_has_relay_cost;
 } moq_simpair_cfg_t;
 
 #ifdef __cplusplus

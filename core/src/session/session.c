@@ -2651,6 +2651,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     }
     const moq_profile_ops_t *profile = moq_profile_lookup(version);
     if (!profile) return MOQ_ERR_INVAL;
+    bool cluster_config = cfg->struct_size >= offsetof(moq_session_cfg_t, cluster_relay_cost) +
+                                                  sizeof(cfg->cluster_relay_cost);
+    bool cluster_enabled = cluster_config && cfg->cluster_enabled;
+    if (cluster_enabled && !profile->cluster_metadata)
+        return MOQ_ERR_UNSUPPORTED;
     if (moq_validate_auth_tokens(setup_tokens_in, setup_token_count,
                                  profile->auth_token_type_max) < 0)
         return MOQ_ERR_INVAL;
@@ -3143,6 +3148,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->auth_token_cache_size = auth_token_cache_size;
     s->defer_subscription_updates = defer_subscription_updates;
     s->defer_fetch_ranges = defer_fetch_ranges;
+    s->cluster_enabled = cluster_enabled;
+    s->cluster_hop_id = cluster_enabled ? cfg->cluster_hop_id : 0;
+    s->cluster_has_relay_cost = cluster_enabled && cfg->cluster_has_relay_cost;
+    s->cluster_relay_cost = s->cluster_has_relay_cost ? cfg->cluster_relay_cost : 1;
+    s->cluster_peer_relay_cost = 1;
     {
         size_t cache_max = (size_t)auth_token_cache_size;
         size_t cache_entries;
@@ -3275,6 +3285,7 @@ void moq_session_destroy(moq_session_t *s)
             s->alloc.free(s->announcements[i].ns_id_buf,
                           s->announcements[i].ns_id_len,
                           s->alloc.ctx);
+        session_cluster_free(s, &s->announcements[i].cluster);
         ns_update_release(s, &s->announcements[i].update);
     }
     /* A buffered or released-but-unaccepted Joining FETCH (§10.12.2) owns deep-copied

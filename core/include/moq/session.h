@@ -59,6 +59,7 @@
 #include "types.h"
 #include "location.h"
 #include "fill.h"
+#include "cluster.h"
 
 /* Forward declaration; full definition in rcbuf.h (included by moq.h). */
 typedef struct moq_rcbuf moq_rcbuf_t;
@@ -348,6 +349,13 @@ typedef struct moq_session_cfg {
      * this field; older callers get the session's resolution. Can also be
      * switched after creation with moq_session_set_defer_fetch_ranges(). */
     bool               defer_fetch_ranges;
+
+    /* Cluster draft-01, draft-22 only. Zero is a valid withheld Hop ID.
+     * Read only when struct_size covers the entire appended block. */
+    uint64_t cluster_hop_id;
+    bool cluster_enabled;
+    bool cluster_has_relay_cost;
+    uint64_t cluster_relay_cost;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus
@@ -446,6 +454,20 @@ MOQ_API bool moq_session_supports_zero_field_track_namespace(
  * borrows, does not advance the session).
  */
 MOQ_API moq_version_t moq_session_version(const moq_session_t *s);
+
+/* Observing, size-aware negotiated session metadata. Absent relay cost is 1;
+ * peer_has_relay_cost distinguishes that default from an explicit value. */
+typedef struct moq_cluster_info {
+    uint32_t struct_size;
+    bool enabled;
+    bool negotiated;
+    bool peer_has_relay_cost;
+    uint64_t local_hop_id;
+    uint64_t peer_hop_id;
+    uint64_t peer_relay_cost;
+} moq_cluster_info_t;
+MOQ_API moq_result_t moq_session_cluster_info(const moq_session_t *s, moq_cluster_info_t *out,
+                                              size_t out_size);
 
 /*
  * Record that an Object at {group_id, object_id} has been published or
@@ -1468,6 +1490,7 @@ typedef struct moq_namespace_published_event {
     moq_namespace_t    track_namespace;  /* BORROWED from output scratch */
     const moq_resolved_token_t *tokens;  /* BORROWED; NULL if none */
     size_t                       token_count;
+    moq_cluster_metadata_t cluster; /* BORROWED for event epoch */
 } moq_namespace_published_event_t;
 
 typedef struct moq_namespace_done_event {
@@ -1967,6 +1990,7 @@ typedef struct moq_ns_sub_error_event {
 typedef struct moq_namespace_found_event {
     moq_ns_sub_handle_t handle;
     moq_namespace_t     track_namespace_suffix;  /* BORROWED from output scratch */
+    moq_cluster_metadata_t cluster;              /* repeated FOUND is a metadata update */
 } moq_namespace_found_event_t;
 
 typedef struct moq_namespace_gone_event {
@@ -2465,6 +2489,7 @@ typedef struct moq_namespace_update_record {
     uint8_t                     _reserved[7];
     const moq_resolved_token_t *tokens;
     size_t                      token_count;
+    moq_cluster_metadata_t cluster; /* selected partial update, BORROWED */
 } moq_namespace_update_record_t;
 
 /* Frozen v0 layout: everything through token_count. */
@@ -2507,7 +2532,8 @@ typedef uint32_t moq_namespace_update_outcome_t;
 #define MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED 3u
 
 /* The conclusion of one update, emitted once. local_role is REQUESTER for
- * OK/ERROR (the peer answered this side's update) and RESPONDER for REFUSED.
+ * OK/ERROR (the peer answered this side's update) and RESPONDER for REFUSED
+ * or an automatically accepted negotiated cluster update.
  * error_code is the request error code (zero for OK); reason is BORROWED for
  * the event's epoch. has_expires / expires_ms report an EXPIRES the peer's
  * acceptance carried. After REFUSED the owner's handle is stale. Scalars
@@ -2522,6 +2548,7 @@ typedef struct moq_namespace_update_result_event {
     bool                           has_expires;
     uint8_t                        _reserved[7];
     uint64_t                       expires_ms;
+    moq_cluster_metadata_t cluster; /* accepted partial update; BORROWED */
 } moq_namespace_update_result_event_t;
 
 typedef struct moq_ns_sub_update_result_event {
@@ -4273,9 +4300,19 @@ typedef struct moq_publish_namespace_cfg {
     /* Appended: authorization tokens (borrowed for the call). */
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
+    moq_cluster_metadata_t cluster;
 } moq_publish_namespace_cfg_t;
 
+/* The pointer-only symbol initializes the frozen pre-cluster extent. */
 MOQ_API void moq_publish_namespace_cfg_init(moq_publish_namespace_cfg_t *cfg);
+MOQ_API void moq_publish_namespace_cfg_init_sized(moq_publish_namespace_cfg_t *cfg,
+                                                  size_t cfg_size);
+#define moq_publish_namespace_cfg_init(cfg)                                                        \
+    moq_publish_namespace_cfg_init_sized((cfg), sizeof(*(cfg)))
+
+/* Observing: current accepted metadata, borrowed until next advancing call. */
+MOQ_API moq_result_t moq_session_namespace_cluster(moq_session_t *s, moq_announcement_t ann,
+                                                   moq_cluster_metadata_t *out, size_t out_size);
 
 MOQ_API moq_result_t moq_session_publish_namespace(moq_session_t *s,
     const moq_publish_namespace_cfg_t *cfg, uint64_t now_us,
@@ -4541,6 +4578,15 @@ MOQ_API moq_result_t moq_session_send_namespace(
  * subscription (publisher side). Advancing call.
  * Same constraints as send_namespace.
  */
+/* cluster_size must cover moq_cluster_metadata_t. Copies bytes before return.
+ * Every negotiated NAMESPACE requires a nonempty path; repeated sends update
+ * the same advertisement and must preserve its first path entry. */
+MOQ_API moq_result_t moq_session_send_namespace_cluster(moq_session_t *s,
+                                                        moq_ns_sub_handle_t handle,
+                                                        const moq_namespace_t *suffix,
+                                                        const moq_cluster_metadata_t *cluster,
+                                                        size_t cluster_size, uint64_t now_us);
+
 MOQ_API moq_result_t moq_session_send_namespace_done(
     moq_session_t *s,
     moq_ns_sub_handle_t handle,
@@ -4699,6 +4745,7 @@ typedef struct moq_namespace_update_cfg {
     /* AUTHORIZATION_TOKEN values (USE_VALUE), borrowed for the call. */
     const moq_auth_token_t *auth_tokens;
     size_t                  auth_token_count;
+    moq_cluster_metadata_t cluster; /* omitted members retain prior values */
 } moq_namespace_update_cfg_t;
 
 /* Frozen v0 layout: everything through auth_token_count. */

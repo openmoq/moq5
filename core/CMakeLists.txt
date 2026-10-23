@@ -20,6 +20,7 @@ add_library(moq-core
     src/session/session_publish.c
     src/session/session_track_status.c
     src/session/session_track_hist.c
+    src/session/session_cluster.c
     src/session/session_namespace.c
     src/session/session_namespace_sub.c
     src/session/session_namespace_update.c
@@ -95,6 +96,7 @@ if(MOQ_BUILD_TESTS OR MOQ_BUILD_FUZZ)
         src/session/session_subscribe.c src/session/session_fetch.c
         src/session/session_publish.c src/session/session_track_status.c
         src/session/session_track_hist.c
+        src/session/session_cluster.c
         src/session/session_namespace.c src/session/session_namespace_sub.c
         src/session/session_namespace_update.c
         src/session/session_subscribe_tracks.c

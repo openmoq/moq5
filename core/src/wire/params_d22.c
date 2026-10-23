@@ -16,28 +16,30 @@
  * PUBLISH_OK). The publisher's own REQUEST_UPDATE of its PUBLISH, like its
  * PUBLISH and PUBLISH_STATE_NOTIFY, cannot carry one. */
 static const uint64_t allowed[] = {
-    [MOQ_D22_SCOPE_SUBSCRIBE] = B(2)|B(3)|B(4)|B(6)|B(16)|B(32)|B(33)|B(34)|B(35)|RANGES|B(50)|B(53),
-    [MOQ_D22_SCOPE_PUBLISH] = B(2)|B(3)|B(6)|B(8)|B(9)|B(16)|B(32)|B(33)|B(34),
-    [MOQ_D22_SCOPE_FETCH] = B(3)|B(10)|B(32)|B(33)|B(34)|RANGES|B(53),
-    [MOQ_D22_SCOPE_TRACK_STATUS] = B(3)|B(53),
-    [MOQ_D22_SCOPE_PUBLISH_NAMESPACE] = B(3),
+    [MOQ_D22_SCOPE_SUBSCRIBE] =
+        B(2) | B(3) | B(4) | B(6) | B(16) | B(32) | B(33) | B(34) | B(35) | RANGES | B(50) | B(53),
+    [MOQ_D22_SCOPE_PUBLISH] = B(2) | B(3) | B(6) | B(8) | B(9) | B(16) | B(32) | B(33) | B(34),
+    [MOQ_D22_SCOPE_FETCH] = B(3) | B(10) | B(32) | B(33) | B(34) | RANGES | B(53),
+    [MOQ_D22_SCOPE_TRACK_STATUS] = B(3) | B(53),
+    [MOQ_D22_SCOPE_PUBLISH_NAMESPACE] = B(3) | B(63),
     [MOQ_D22_SCOPE_SUBSCRIBE_NAMESPACE] = B(3),
-    [MOQ_D22_SCOPE_SUBSCRIBE_TRACKS] = B(3)|B(16)|B(34)|RANGES|B(41)|B(53),
-    [MOQ_D22_SCOPE_SUBSCRIBE_OK] = B(8)|B(9),
+    [MOQ_D22_SCOPE_SUBSCRIBE_TRACKS] = B(3) | B(16) | B(34) | RANGES | B(41) | B(53),
+    [MOQ_D22_SCOPE_SUBSCRIBE_OK] = B(8) | B(9),
     [MOQ_D22_SCOPE_PUBLISH_OK] = B(8),
-    [MOQ_D22_SCOPE_UPDATE_OK] = B(8)|B(9),
+    [MOQ_D22_SCOPE_UPDATE_OK] = B(8) | B(9),
     [MOQ_D22_SCOPE_TRACK_STATUS_OK] = B(9),
     [MOQ_D22_SCOPE_NAMESPACE_OK] = B(8),
     [MOQ_D22_SCOPE_FETCH_OK] = 0,
-    [MOQ_D22_SCOPE_NOTIFY] = B(9)|B(16)|B(33),
-    [MOQ_D22_SCOPE_UPDATE_SUBSCRIBER] = B(2)|B(3)|B(6)|B(16)|B(32)|B(33)|B(35)|RANGES|B(50),
-    [MOQ_D22_SCOPE_UPDATE_PUBLISHER] = B(2)|B(3)|B(6)|B(16)|B(32)|B(33)|B(50),
-    [MOQ_D22_SCOPE_UPDATE_FETCH] = B(3)|B(32),
-    [MOQ_D22_SCOPE_UPDATE_PUBLISH_NAMESPACE] = B(3),
-    [MOQ_D22_SCOPE_UPDATE_SUBSCRIBE_NAMESPACE] = B(3)|B(52),
-    [MOQ_D22_SCOPE_UPDATE_SUBSCRIBE_TRACKS] = B(3)|B(16)|B(41)|B(52),
-    [MOQ_D22_SCOPE_FILL] = B(10)|B(32)|B(33)|B(34)|RANGES
-};
+    [MOQ_D22_SCOPE_NOTIFY] = B(9) | B(16) | B(33),
+    [MOQ_D22_SCOPE_UPDATE_SUBSCRIBER] =
+        B(2) | B(3) | B(6) | B(16) | B(32) | B(33) | B(35) | RANGES | B(50),
+    [MOQ_D22_SCOPE_UPDATE_PUBLISHER] = B(2) | B(3) | B(6) | B(16) | B(32) | B(33) | B(50),
+    [MOQ_D22_SCOPE_UPDATE_FETCH] = B(3) | B(32),
+    [MOQ_D22_SCOPE_UPDATE_PUBLISH_NAMESPACE] = B(3) | B(63),
+    [MOQ_D22_SCOPE_UPDATE_SUBSCRIBE_NAMESPACE] = B(3) | B(52),
+    [MOQ_D22_SCOPE_UPDATE_SUBSCRIBE_TRACKS] = B(3) | B(16) | B(41) | B(52),
+    [MOQ_D22_SCOPE_FILL] = B(10) | B(32) | B(33) | B(34) | RANGES,
+    [MOQ_D22_SCOPE_NAMESPACE] = B(63)};
 
 static bool reader_valid(const moq_buf_reader_t *r)
 { return r && r->pos <= r->len && (r->data || r->len == 0); }
@@ -46,7 +48,9 @@ static bool writer_valid(const moq_buf_writer_t *w)
 { return w && w->pos <= w->cap && (w->data || w->cap == 0); }
 
 static bool scope_valid(moq_d22_param_scope_t scope)
-{ return (unsigned)scope <= (unsigned)MOQ_D22_SCOPE_FILL; }
+{
+    return (unsigned)scope <= (unsigned)MOQ_D22_SCOPE_NAMESPACE;
+}
 
 static bool is_range(uint64_t type)
 { return type >= 0x25 && type <= 0x29; }
@@ -202,6 +206,70 @@ static moq_result_t decode_ranges(uint64_t type, moq_bytes_t bytes,
     return MOQ_OK;
 }
 
+moq_result_t moq_d22_validate_hop_path(moq_bytes_t path)
+{
+    if (!path.data || !path.len)
+        return MOQ_ERR_PROTO;
+    /* Fixed scratch, independent of peer path length. A full table divides
+     * its ID space by one more bit and re-scans those partitions. At most
+     * 64 partitions can be pending; each partition accepts 256 distinct IDs.
+     * This avoids quadratic decoder work and needs no allocator in the codec.
+     * Zero is the table's empty slot and is deliberately never inserted. */
+    struct {
+        uint64_t prefix;
+        unsigned bits;
+    } pending[65];
+    size_t count = 1;
+    pending[0].prefix = 0;
+    pending[0].bits = 0;
+    while (count) {
+        --count;
+        uint64_t prefix = pending[count].prefix;
+        unsigned bits = pending[count].bits;
+        uint64_t mask = bits ? UINT64_MAX << (64 - bits) : 0;
+        uint64_t seen[512] = {0};
+        size_t used = 0;
+        bool split = false;
+        moq_buf_reader_t r = {path.data, path.len, 0};
+        while (r.pos < r.len) {
+            uint64_t id;
+            if (moq_buf_read_vi64(&r, &id) != MOQ_OK)
+                return MOQ_ERR_PROTO;
+            if (!id || (id & mask) != prefix)
+                continue;
+            uint64_t hash = id ^ (id >> 33);
+            hash *= UINT64_C(0xff51afd7ed558ccd);
+            hash ^= hash >> 33;
+            size_t slot = (size_t)hash & 511;
+            while (seen[slot] && seen[slot] != id)
+                slot = (slot + 1) & 511;
+            if (seen[slot] == id)
+                return MOQ_ERR_PROTO;
+            seen[slot] = id;
+            if (++used > 256) {
+                split = true;
+                break;
+            }
+        }
+        if (split) {
+            /* More than one distinct ID cannot share all 64 bits. */
+            if (bits == 64 || count + 2 > 65)
+                return MOQ_ERR_PROTO;
+            uint64_t bit = UINT64_C(1) << (63 - bits);
+            pending[count].prefix = prefix;
+            pending[count++].bits = bits + 1;
+            pending[count].prefix = prefix | bit;
+            pending[count++].bits = bits + 1;
+        }
+    }
+    return MOQ_OK;
+}
+
+static bool cluster_type(uint64_t type)
+{
+    return type == MOQ_D22_HOP_PATH || type == MOQ_D22_ROUTE_COST;
+}
+
 static moq_result_t scan_param(moq_buf_reader_t *r, uint64_t *previous_type,
                               uint64_t legal, moq_d22_param_t *out,
                               bool *invalid_filter)
@@ -214,10 +282,19 @@ static moq_result_t scan_param(moq_buf_reader_t *r, uint64_t *previous_type,
     TRY(moq_buf_read_vi64(&c, &delta));
     if (delta > UINT64_MAX - *previous_type) return MOQ_ERR_PROTO;
     v.type = *previous_type + delta;
-    if (v.type >= 64 || !(legal & B(v.type))) return MOQ_ERR_PROTO;
+    if (cluster_type(v.type)) {
+        if (!(legal & B(63)))
+            return MOQ_ERR_PROTO;
+    } else if (v.type >= 63 || !(legal & B(v.type)))
+        return MOQ_ERR_PROTO;
     switch (v.type) {
+    case MOQ_D22_ROUTE_COST:
     case 2: case 4: case 6: case 8: case 10: case 50:
         TRY(moq_buf_read_vi64(&c, &v.value.integer)); break;
+    case MOQ_D22_HOP_PATH:
+        TRY(read_span(&c, UINT16_MAX, &v.value.hop_path));
+        TRY(moq_d22_validate_hop_path(v.value.hop_path));
+        break;
     case 3:
         TRY(read_span(&c, UINT16_MAX, &span));
         TRY(decode_token(span, &v.value.token)); break;
@@ -314,7 +391,9 @@ static moq_result_t decode_sequence(moq_buf_reader_t *r, uint64_t count,
     while (v.count < count) {
         moq_d22_param_t p;
         TRY(scan_param(&c, &previous, allowed[scope], &p, &invalid));
-        bool repeat = (v.present & B(p.type)) != 0;
+        bool repeat = p.type == MOQ_D22_HOP_PATH     ? v.has_hop_path
+                      : p.type == MOQ_D22_ROUTE_COST ? v.has_route_cost
+                                                     : (v.present & B(p.type)) != 0;
         if (repeat && p.type != 3 && !is_range(p.type)) return MOQ_ERR_PROTO;
         if (is_range(p.type)) {
             if (max == 0 || v.range_count > max ||
@@ -333,7 +412,12 @@ static moq_result_t decode_sequence(moq_buf_reader_t *r, uint64_t count,
             TRY(decode_fill_value(p.value.fill, max, &fill, &fill_invalid));
             invalid |= fill_invalid;
         }
-        v.present |= B(p.type);
+        if (p.type == MOQ_D22_HOP_PATH)
+            v.has_hop_path = true;
+        else if (p.type == MOQ_D22_ROUTE_COST)
+            v.has_route_cost = true;
+        else
+            v.present |= B(p.type);
         v.encoded.len = c.pos - r->pos;
         if (v.encoded.len > UINT16_MAX) return MOQ_ERR_PROTO;
         ++v.count;
@@ -404,6 +488,7 @@ moq_result_t moq_d22_decode_fill(moq_bytes_t body, uint64_t max, moq_d22_params_
 static moq_result_t encode_value(moq_buf_writer_t *w, const moq_d22_param_t *p)
 {
     switch (p->type) {
+    case MOQ_D22_ROUTE_COST:
     case 2: case 4: case 6: case 8: case 10: case 50:
         return moq_buf_write_vi64(w, p->value.integer);
     case 16: case 32: case 34: case 53: {
@@ -417,6 +502,20 @@ static moq_result_t encode_value(moq_buf_writer_t *w, const moq_d22_param_t *p)
         TRY(moq_buf_write_vi64(w, p->value.location.group));
         return moq_buf_write_vi64(w, p->value.location.object);
     case 33: return moq_d22_encode_location_filter(w, &p->value.filter);
+    case MOQ_D22_HOP_PATH:
+        if (p->hop_ids) {
+            if(p->hop_count>UINT16_MAX)return MOQ_ERR_INVAL;
+            size_t bytes = 0;
+            for (size_t i = 0; i < p->hop_count; i++)
+                bytes += moq_vi64_len(p->hop_ids[i]);
+            if (bytes > UINT16_MAX)
+                return MOQ_ERR_INVAL;
+            TRY(moq_buf_write_vi64(w, bytes));
+            for (size_t i = 0; i < p->hop_count; i++)
+                TRY(moq_buf_write_vi64(w, p->hop_ids[i]));
+            return MOQ_OK;
+        }
+        return write_span(w, p->value.hop_path);
     case 35: return write_span(w, p->value.fill);
     case 52: {
         const moq_bytes_t bytes = p->value.ns.encoded;
@@ -472,8 +571,13 @@ moq_result_t moq_d22_encode_params(moq_buf_writer_t *w, const moq_d22_param_t *p
     moq_buf_writer_t c = *w;
     uint64_t previous = 0;
     for (size_t i = 0; i < count; ++i) {
-        if (p[i].type >= 64 || !(allowed[scope] & B(p[i].type)) ||
-            p[i].type < previous) return MOQ_ERR_INVAL;
+        if (p[i].type < previous)
+            return MOQ_ERR_INVAL;
+        if (cluster_type(p[i].type)) {
+            if (!(allowed[scope] & B(63)))
+                return MOQ_ERR_INVAL;
+        } else if (p[i].type >= 63 || !(allowed[scope] & B(p[i].type)))
+            return MOQ_ERR_INVAL;
         TRY(moq_buf_write_vi64(&c, p[i].type - previous));
         TRY(encode_value(&c, &p[i]));
         if (c.pos - w->pos > UINT16_MAX) return MOQ_ERR_INVAL;
