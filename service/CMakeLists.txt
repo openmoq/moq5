@@ -1720,8 +1720,10 @@ if(MOQ_BUILD_TESTS)
             include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
             set(_svc_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
             moq_write_consumer_abi_context("${_svc_abi_context}")
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+            moq_nested_cxx_env(_svc_pkgconfig_cxx_env)
             add_test(NAME service_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_svc_pkgconfig_cxx_env} bash
                     "${PROJECT_SOURCE_DIR}/adapters/pico_wt/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-service"

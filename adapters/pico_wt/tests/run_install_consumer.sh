@@ -35,6 +35,11 @@ ABI_PRELOAD="${13}"
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
 CONB="$WORK/consumer-build"
+# This fixture has no libdir argument; use the parent's configured layout.
+LIBDIR=$(sed -n 's/^CMAKE_INSTALL_LIBDIR:[^=]*=//p' "$LIBMOQ_BUILD/CMakeCache.txt")
+if [ -z "$LIBDIR" ]; then
+    echo "FAIL: CMAKE_INSTALL_LIBDIR missing from parent cache"; exit 1
+fi
 
 # Fall back to the picotls build adjacent to picoquic (as FindPicoquic
 # does) when no prefix was supplied.
@@ -64,6 +69,7 @@ echo "== 1. install picoquic (BUILD_HTTP=ON) -> $P =="
     -DBUILD_PICO_SIM=OFF -Dpicoquic_BUILD_TESTS=OFF -DBUILD_LOGLIB=ON \
     -DCMAKE_INSTALL_PREFIX="$P" \
     -DPTLS_PREFIX="$PTLS_SRC" \
+    -DPTLS_INCLUDE_DIR="$PTLS_SRC/include" \
     -DCMAKE_LIBRARY_PATH="$PTLS_LIB" \
     "${ossl_arg[@]}" \
     -DCMAKE_C_COMPILER="$CC" \
@@ -102,7 +108,10 @@ echo "== 3. configure consumer against install prefix (installed picoquic) =="
 "$CMAKE" --build "$CONB"
 
 echo "== 4. run consumer =="
-"$CONB/moq_pico_wt_adapter_consumer_test"
+# The consumer owns the loader path for this temporary install. On Linux,
+# an executable's RUNPATH does not cover transitive shared dependencies.
+# Keep caller-provided dependency directories after the installed libraries.
+LD_LIBRARY_PATH="$P/$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$CONB/moq_pico_wt_adapter_consumer_test"
 
 echo "== install-tree consumer OK =="
 rm -rf "$WORK"
