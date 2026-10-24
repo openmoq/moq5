@@ -262,6 +262,7 @@ moq_result_t moq_transport_bridge_create(
     if (!b->dstreams) goto fail;
     memset(b->dstreams, 0, max_s * sizeof(bridge_dstream_t));
     b->dstream_cap = max_s;
+    b->pass_seq = 1;
     for (uint32_t i = 0; i < max_s; i++) b->dstreams[i].next_free = i + 1;
     if (!bridge_dindex_build(b, max_s)) goto fail;
     for (int h = 0; h < 2; h++) {
@@ -697,6 +698,7 @@ static void bridge_dstream_release(moq_transport_bridge_t *b,
         moq_action_t *a = &d->q[d->q_head].action;
         b->dq_bytes -= bridge_send_data_bytes(&a->u.send_data);
         b->dq_items--;
+        if (d->q[d->q_head].meta.deadline_us != UINT64_MAX) b->dq_timed--;
         moq_action_cleanup(a);
         d->q_head = (d->q_head + 1) % d->q_cap;
     }
@@ -1012,8 +1014,10 @@ static void bridge_publish_deadline(moq_transport_bridge_t *b)
         if (!has || due < d) d = due;
         has = true;
     }
-    for (uint32_t i = 0; i < b->dstream_cap; ++i) {
+    /* Only a queued item with a deadline can bring it earlier. */
+    for (uint32_t i = 0; b->dq_timed && i < b->dstream_cap; ++i) {
         const bridge_dstream_t *stream = &b->dstreams[i];
+        ++b->deadline_slots;
         if (!stream->active || stream->has_reset) continue;
         for (uint32_t j = 0; j < stream->q_len; ++j) {
             uint64_t due = stream->q[(stream->q_head + j) % stream->q_cap].meta.deadline_us;
@@ -2210,6 +2214,7 @@ static moq_result_t bridge_dstream_push(moq_transport_bridge_t *b,
     d->q_len++;
     b->dq_bytes += bridge_send_data_bytes(&act->u.send_data);
     b->dq_items++;
+    if (meta->deadline_us != UINT64_MAX) b->dq_timed++;
     if (d->q_len == 1) bridge_dstream_requeue(b, d);
     return MOQ_OK;
 }
@@ -2223,6 +2228,7 @@ static void bridge_dstream_pop(moq_transport_bridge_t *b, bridge_dstream_t *d,
     d->q_len--;
     b->dq_bytes -= bridge_send_data_bytes(&out->action.u.send_data);
     b->dq_items--;
+    if (out->meta.deadline_us != UINT64_MAX) b->dq_timed--;
 }
 
 /* Put `act` back as `d`'s oldest queued action (ownership moves back). */
@@ -2234,6 +2240,7 @@ static void bridge_dstream_unpop(moq_transport_bridge_t *b, bridge_dstream_t *d,
     d->q_len++;
     b->dq_bytes += bridge_send_data_bytes(&item->action.u.send_data);
     b->dq_items++;
+    if (item->meta.deadline_us != UINT64_MAX) b->dq_timed++;
 }
 
 /* Drop all but `d`'s oldest `keep` queued actions. */
@@ -2241,9 +2248,11 @@ static void bridge_dstream_truncate(moq_transport_bridge_t *b,
                                     bridge_dstream_t *d, uint32_t keep)
 {
     for (uint32_t i = keep; i < d->q_len; i++) {
-        moq_action_t *a = &d->q[(d->q_head + i) % d->q_cap].action;
+        bridge_data_item_t *item = &d->q[(d->q_head + i) % d->q_cap];
+        moq_action_t *a = &item->action;
         b->dq_bytes -= bridge_send_data_bytes(&a->u.send_data);
         b->dq_items--;
+        if (item->meta.deadline_us != UINT64_MAX) b->dq_timed--;
         moq_action_cleanup(a);
     }
     d->q_len = keep;
@@ -3697,7 +3706,7 @@ static moq_result_t bridge_try_deferred_reset(moq_transport_bridge_t *b,
                                               bridge_dstream_t *d, bool *accepted)
 {
     *accepted = false;
-    if (d->reset_attempted) return MOQ_OK;
+    if (d->reset_pass == b->pass_seq) return MOQ_OK;
     bridge_stream_entry_t *e = bridge_find_by_ref(b, d->ref);
     if (!e) {
         *accepted = true; /* no transport stream was opened */
@@ -3707,7 +3716,7 @@ static moq_result_t bridge_try_deferred_reset(moq_transport_bridge_t *b,
         bridge_domain_blocked(b, d->ref, e->transport_id, true)) return MOQ_OK;
     e->awaiting_commit = false;
     e->fin_reset_pending = true;
-    d->reset_attempted = true;
+    d->reset_pass = b->pass_seq;
     moq_transport_result_t r = bridge_reset_uni(b, e->transport_id,
                                                 d->reset_code, d->reset_reliable);
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) return MOQ_OK;
@@ -4847,8 +4856,7 @@ static moq_result_t bridge_service_pass(
     *suspended = false;
     b->now_us = now_us;
     b->pump_budget = BRIDGE_DRAIN_BUDGET;
-    for (uint32_t i = 0; i < b->dstream_cap; ++i)
-        b->dstreams[i].reset_attempted = false;
+    ++b->pass_seq; /* every dstream's reset is untried in this pass */
     for (;;) {
         /* Deferred close has priority — runs even if writes are blocked.
          * Session has already been notified; this closes the transport. */

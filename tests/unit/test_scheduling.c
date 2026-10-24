@@ -621,17 +621,34 @@ static void pair_destroy(pair_t *p)
     free(p->mt);
 }
 
+/* Queued data items with a delivery deadline, counted from the queues: what
+ * the bridge's dq_timed must hold. */
+static uint32_t dq_timed_recount(const moq_transport_bridge_t *b)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < b->dstream_cap; i++) {
+        const bridge_dstream_t *d = &b->dstreams[i];
+        for (uint32_t j = 0; d->active && j < d->q_len; j++)
+            if (d->q[(d->q_head + j) % d->q_cap].meta.deadline_us != UINT64_MAX)
+                n++;
+    }
+    return n;
+}
+
 /* Serve the network until nothing is left, servicing the publisher's
- * bridge after every write so it can refill. */
+ * bridge after every write so it can refill. The bridge's count of timed
+ * items must then match its queues. */
 static void serve_all(pair_t *p)
 {
     for (int guard = 0; guard < 100000; guard++) {
         moq_transport_bridge_service(p->pub_br, p->now);
         if (!mt_serve_one(p->mt)) {
             moq_transport_bridge_service(p->pub_br, p->now);
-            if (!mt_serve_one(p->mt)) return;
+            if (!mt_serve_one(p->mt)) break;
         }
     }
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed,
+                          (int)dq_timed_recount(p->pub_br));
 }
 
 typedef struct {
@@ -3257,6 +3274,8 @@ static bool regression_service(pair_t *p)
         REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
     REG_REQUIRE(!moq_transport_bridge_is_terminal(p->pub_br));
     REG_REQUIRE(moq_session_state(p->pub) == MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed,
+                          (int)dq_timed_recount(p->pub_br));
     return true;
 }
 
@@ -4695,6 +4714,473 @@ static void test_shared_admission_expiry(void)
     MOQ_TEST_PASS("an expiry reset and a control write go while the shared budget is spent");
 }
 
+/* -- Per-pass bookkeeping ----------------------------------------------------
+ *
+ * A service pass costs what its work costs, not what the bridge's tables can
+ * hold: the deadline walk reads the stream table only while a queued item has
+ * a delivery deadline, and the per-pass reset attempt needs no sweep of it.
+ * Neither may cost a wake-up or an attempt: the published deadline stays the
+ * exact earliest through refusal, expiry, cancellation and the pending FIFO,
+ * and a refused reset is tried once in every pass, in a reused slot too. */
+
+#define PC_REQUIRE(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+        failures++; \
+        return false; \
+    } \
+} while (0)
+
+#define PC_STREAMS 512u   /* the stream table, far above the streams in use */
+
+/* Untimed objects held at the budget publish no deadline and read no table
+ * slot; one held object with a 1 ms timeout makes the next deadline exactly
+ * its own, read through the table; once it expires, nothing is read again. */
+static bool pass_cost_deadline_row(pair_t *p, moq_rcbuf_t *payload[3])
+{
+    regression_owner_t u, t;
+    if (!regression_owner(p, false, "untimed", 0, 0, &u) ||
+        !regression_owner(p, false, "timed", 128, 1, &t)) return false;
+    moq_subgroup_handle_t usg, tsg;
+    uint64_t usid, tsid;
+    size_t u_header, t_header;
+    if (!regression_open_header(p, &u, 1, &usg, &usid, &u_header) ||
+        !regression_open_header(p, &t, 1, &tsg, &tsid, &t_header)) return false;
+    serve_all(p);
+    PC_REQUIRE(p->pub_br->dstream_cap >= PC_STREAMS);
+    p->mt->cap = 1;
+    for (unsigned i = 0; i < 2; ++i) {
+        uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, 1, 1, 0, (uint8_t)i };
+        PC_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes),
+                                    &payload[i]) == MOQ_OK);
+        PC_REQUIRE(moq_session_write_object(p->pub, usg, i, payload[i],
+                                            p->now) == MOQ_OK);
+    }
+    uint64_t slots = p->pub_br->deadline_slots;
+    for (unsigned i = 0; i < 3; ++i)
+        PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(p->pub_br->dq_items > 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 0);
+    MOQ_TEST_CHECK_EQ_U64(p->pub_br->deadline_slots, slots);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+
+    const uint64_t deadline = p->now + 1000;
+    uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, 2, 1, 0, 0 };
+    PC_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes),
+                                &payload[2]) == MOQ_OK);
+    PC_REQUIRE(moq_session_write_object(p->pub, tsg, 0, payload[2],
+                                        p->now) == MOQ_OK);
+    slots = p->pub_br->deadline_slots;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)dq_timed_recount(p->pub_br), 1);
+    MOQ_TEST_CHECK(p->pub_br->deadline_slots - slots >= p->pub_br->dstream_cap);
+    MOQ_TEST_CHECK_EQ_U64((p->pub_br->deadline_slots - slots) %
+                          p->pub_br->dstream_cap, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
+
+    p->now = deadline;
+    PC_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    if (!regression_service(p)) return false;
+    mt_stream_t *tst = mt_stream(p->mt, tsid);
+    PC_REQUIRE(tst != NULL);
+    MOQ_TEST_CHECK(tst->reset);
+    MOQ_TEST_CHECK_EQ_U64(tst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 0);
+    slots = p->pub_br->deadline_slots;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(p->pub_br->deadline_slots, slots);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    return true;
+}
+
+/* A refused deferred reset is tried once in each service pass, and in every
+ * one: no attempt from an earlier pass blocks it, and no second attempt runs
+ * within one. The reset is deferred behind its reliable prefix, the subgroup
+ * header, which the budget holds back when the reset arrives; once the header
+ * goes the reset is due, and the transport refuses it until released. A pass
+ * that hands the header over repeats its round, so a missing per-pass guard
+ * would try the reset twice there. */
+static bool pass_cost_reset_row(pair_t *p)
+{
+    regression_owner_t owner;
+    if (!regression_owner(p, false, "reset", 128, 0, &owner)) return false;
+    p->mt->cap = 0; /* control stays writable; no data write fits */
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 1;
+    sc.publisher_priority = 128;
+    moq_subgroup_handle_t sg;
+    PC_REQUIRE(moq_session_open_subgroup(p->pub, owner.track.sub, &sc, p->now,
+                                         &sg) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    mt_stream_t *st = NULL;
+    for (size_t i = 0; i < MT_MAX_STREAMS; ++i)
+        if (p->mt->streams[i].used && p->mt->streams[i].write_attempts > 0 &&
+            p->mt->streams[i].refused_writes > 0)
+            st = &p->mt->streams[i];
+    PC_REQUIRE(st != NULL && !st->reset);
+    PC_REQUIRE(moq_session_reset_subgroup(p->pub, sg, 0x1 /* CANCELLED */,
+                                          p->now) == MOQ_OK);
+    st->refuse_reset = true;
+    p->mt->cap = 1u << 20;
+    const uint32_t before = st->reset_attempts;
+    for (unsigned i = 1; i <= 5; ++i) {
+        PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)(st->reset_attempts - before), (int)i);
+    }
+    MOQ_TEST_CHECK(!st->reset);
+    st->refuse_reset = false;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_INT((int)(st->reset_attempts - before), 6);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, st->first_write_len);
+    return true;
+}
+
+/* Two timed streams held at the budget, the later deadline's opened first so
+ * that it is the first the table walk meets: the next deadline is exactly
+ * the earlier one; once that stream expires, exactly the later one, with the
+ * count down to the survivor's; once that expires too, none, and the table
+ * is no longer read. */
+static bool pass_cost_earliest_row(pair_t *p)
+{
+    regression_owner_t late, soon;
+    if (!regression_owner(p, false, "late", 128, 3, &late) ||
+        !regression_owner(p, false, "soon", 128, 1, &soon)) return false;
+    moq_subgroup_handle_t lsg, ssg;
+    uint64_t lsid, ssid;
+    size_t l_header, s_header;
+    if (!regression_open_header(p, &late, 1, &lsg, &lsid, &l_header) ||
+        !regression_open_header(p, &soon, 1, &ssg, &ssid, &s_header))
+        return false;
+    serve_all(p);
+    p->mt->cap = 0; /* no data write fits */
+    const uint64_t t0 = p->now;
+    PC_REQUIRE(write_object(p, lsg, 1, 1, 0, 0) == MOQ_OK);
+    PC_REQUIRE(write_object(p, ssg, 2, 1, 0, 0) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 2);
+    MOQ_TEST_CHECK_EQ_INT((int)dq_timed_recount(p->pub_br), 2);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), t0 + 1000);
+
+    p->now = t0 + 1000;
+    PC_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    if (!regression_service(p)) return false;
+    mt_stream_t *lst = mt_stream(p->mt, lsid), *sst = mt_stream(p->mt, ssid);
+    PC_REQUIRE(lst != NULL && sst != NULL);
+    MOQ_TEST_CHECK(sst->reset && !lst->reset);
+    MOQ_TEST_CHECK_EQ_U64(sst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), t0 + 3000);
+
+    p->now = t0 + 3000;
+    PC_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    if (!regression_service(p)) return false;
+    MOQ_TEST_CHECK(lst->reset);
+    MOQ_TEST_CHECK_EQ_U64(lst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    const uint64_t slots = p->pub_br->deadline_slots;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(p->pub_br->deadline_slots, slots);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    return true;
+}
+
+/* A refused timed write goes back to its queue still counted: each pass pops
+ * it, the transport refuses it, it is put back, and the count, the table read
+ * and the exact deadline survive every round. Once the write is taken,
+ * nothing is counted or read. */
+static bool pass_cost_unpop_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "unpop", 128, 2, &o)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    serve_all(p);
+    mt_stream_t *st = mt_stream(p->mt, sid);
+    PC_REQUIRE(st != NULL);
+    p->mt->cap = 0;
+    const uint64_t deadline = p->now + 2000;
+    PC_REQUIRE(write_object(p, sg, 1, 1, 0, 0) == MOQ_OK);
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint32_t refused = st->refused_writes;
+        const uint64_t slots = p->pub_br->deadline_slots;
+        PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        MOQ_TEST_CHECK(st->refused_writes > refused);
+        MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->pending_count, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_items, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)dq_timed_recount(p->pub_br), 1);
+        MOQ_TEST_CHECK(p->pub_br->deadline_slots - slots >=
+                       p->pub_br->dstream_cap);
+        MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
+    }
+    p->mt->cap = 1u << 20;
+    const size_t chunks = p->mt->nchunks;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(p->mt->nchunks > chunks);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    const uint64_t slots = p->pub_br->deadline_slots;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(p->pub_br->deadline_slots, slots);
+    serve_all(p);
+    return true;
+}
+
+/* Cancelling a subgroup takes its queued timed objects out of the count at
+ * once, both ways a queued stream can go: freed outright when its header has
+ * already been sent, or cut back to the reliable prefix it still owes when
+ * its header is held back too. The next deadline falls back to the surviving
+ * stream's, the cancelled objects are released, and the owed reset goes out
+ * once its prefix does. */
+static bool pass_cost_cancel_row(pair_t *p, moq_rcbuf_t *payload[5])
+{
+    regression_owner_t sent, held, kept;
+    if (!regression_owner(p, false, "sent", 128, 1, &sent) ||
+        !regression_owner(p, false, "held", 128, 1, &held) ||
+        !regression_owner(p, false, "kept", 128, 4, &kept)) return false;
+    moq_subgroup_handle_t ssg, hsg, ksg;
+    uint64_t ssid, ksid;
+    size_t s_header, k_header;
+    if (!regression_open_header(p, &sent, 1, &ssg, &ssid, &s_header) ||
+        !regression_open_header(p, &kept, 1, &ksg, &ksid, &k_header))
+        return false;
+    serve_all(p);
+    p->mt->cap = 0; /* no data write fits, held's header included */
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 1;
+    sc.publisher_priority = 128;
+    PC_REQUIRE(moq_session_open_subgroup(p->pub, held.track.sub, &sc, p->now,
+                                         &hsg) == MOQ_OK);
+    const uint64_t t0 = p->now;
+    const moq_subgroup_handle_t to[5] = { ssg, ssg, hsg, hsg, ksg };
+    for (unsigned i = 0; i < 5; ++i) {
+        uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, 3, 1, 0, (uint8_t)i };
+        PC_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes),
+                                    &payload[i]) == MOQ_OK);
+        PC_REQUIRE(moq_session_write_object(p->pub, to[i], i == 4 ? 0 : i % 2,
+                                            payload[i], p->now) == MOQ_OK);
+    }
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 5);
+    MOQ_TEST_CHECK_EQ_INT((int)dq_timed_recount(p->pub_br), 5);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), t0 + 1000);
+    mt_stream_t *hst = NULL;
+    for (size_t i = 0; i < MT_MAX_STREAMS; ++i)
+        if (p->mt->streams[i].used && p->mt->streams[i].sid != ssid &&
+            p->mt->streams[i].sid != ksid && p->mt->streams[i].data &&
+            p->mt->streams[i].refused_writes > 0 &&
+            p->mt->streams[i].first_write_len > 0)
+            hst = &p->mt->streams[i];
+    PC_REQUIRE(hst != NULL);
+    const size_t h_header = hst->first_write_len;
+
+    PC_REQUIRE(moq_session_reset_subgroup(p->pub, ssg, 0x1 /* CANCELLED */,
+                                          p->now) == MOQ_OK);
+    PC_REQUIRE(moq_session_reset_subgroup(p->pub, hsg, 0x1, p->now) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)dq_timed_recount(p->pub_br), 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), t0 + 4000);
+    for (unsigned i = 0; i < 4; ++i)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[4]), 2);
+    mt_stream_t *sst = mt_stream(p->mt, ssid);
+    PC_REQUIRE(sst != NULL);
+    MOQ_TEST_CHECK(sst->reset);
+    MOQ_TEST_CHECK_EQ_U64(sst->reset_code, 0x1);
+    MOQ_TEST_CHECK(!hst->reset);
+
+    p->mt->cap = 1u << 20;
+    if (!regression_service(p)) return false;
+    MOQ_TEST_CHECK(hst->reset);
+    MOQ_TEST_CHECK_EQ_U64(hst->reset_code, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(hst->reset_reliable, h_header);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    serve_all(p);
+    return true;
+}
+
+/* A timed object whose header went out and whose payload the transport
+ * refused waits in the pending FIFO, not in a stream queue: the count stays
+ * 0 and no table slot is read, yet the next deadline is exactly the
+ * object's, and at it the stream is reset for the delivery timeout. */
+static bool pass_cost_pending_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "pending", 128, 1, &o)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    serve_all(p);
+    mt_stream_t *st = mt_stream(p->mt, sid);
+    PC_REQUIRE(st != NULL);
+    st->refuse_payload = true;
+    const uint64_t deadline = p->now + 1000;
+    PC_REQUIRE(write_object(p, sg, 1, 1, 0, 0) == MOQ_OK);
+    const uint64_t slots = p->pub_br->deadline_slots;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(st->refused_writes > 0);
+    MOQ_TEST_CHECK(p->pub_br->pending_count > 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_items, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dq_timed, 0);
+    MOQ_TEST_CHECK_EQ_U64(p->pub_br->deadline_slots, slots);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
+
+    p->now = deadline;
+    PC_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    if (!regression_service(p)) return false;
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->pending_count, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    st->refuse_payload = false;
+    serve_all(p);
+    return true;
+}
+
+/* A stream slot freed in a pass and taken again in that same pass starts
+ * with its reset untried. Stream A's deferred reset is tried and taken in the
+ * pass, which frees its slot; B, held back until then by the retained budget
+ * that another stream's objects fill, takes the slot, and B's own deferred
+ * reset is still tried in that pass. */
+static bool pass_cost_reuse_row(pair_t *p)
+{
+    regression_owner_t o, fill;
+    if (!regression_owner(p, false, "reuse", 128, 0, &o) ||
+        !regression_owner(p, false, "fill", 128, 0, &fill)) return false;
+    p->mt->cap = 0; /* no data write fits */
+    moq_subgroup_cfg_t sc;
+    moq_subgroup_cfg_init(&sc);
+    sc.group_id = 1;
+    sc.publisher_priority = 128;
+    moq_subgroup_handle_t asg, fsg, bsg;
+    PC_REQUIRE(moq_session_open_subgroup(p->pub, o.track.sub, &sc, p->now,
+                                         &asg) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < p->pub_br->dstream_cap; ++i)
+        if (p->pub_br->dstreams[i].active) {
+            PC_REQUIRE(slot == UINT32_MAX);
+            slot = i;
+        }
+    PC_REQUIRE(slot != UINT32_MAX);
+    mt_stream_t *ast = NULL;
+    for (size_t i = 0; i < MT_MAX_STREAMS; ++i)
+        if (p->mt->streams[i].used && p->mt->streams[i].data &&
+            p->mt->streams[i].refused_writes > 0)
+            ast = &p->mt->streams[i];
+    PC_REQUIRE(ast != NULL);
+    PC_REQUIRE(moq_session_reset_subgroup(p->pub, asg, 0x1 /* CANCELLED */,
+                                          p->now) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    PC_REQUIRE(p->pub_br->dstreams[slot].active &&
+               p->pub_br->dstreams[slot].has_reset);
+    PC_REQUIRE(moq_session_open_subgroup(p->pub, fill.track.sub, &sc, p->now,
+                                         &fsg) == MOQ_OK);
+    for (unsigned i = 0; i < 8; ++i)
+        PC_REQUIRE(write_object(p, fsg, 4, 1, 0, i) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    PC_REQUIRE(p->pub_br->dq_bytes >= p->pub_br->max_retained_bytes);
+    /* Opened and cancelled with no service between: its actions wait in
+     * the core behind the budget. It opens the next transport stream. */
+    sc.group_id = 2;
+    PC_REQUIRE(moq_session_open_subgroup(p->pub, o.track.sub, &sc, p->now,
+                                         &bsg) == MOQ_OK);
+    PC_REQUIRE(moq_session_reset_subgroup(p->pub, bsg, 0x1, p->now) == MOQ_OK);
+    mt_stream_t *bst = mt_stream(p->mt, p->mt->next_uni);
+    PC_REQUIRE(bst != NULL && bst != ast);
+    bst->refuse_reset = true;
+    p->mt->cap = 1u << 20;
+    const uint64_t pass = p->pub_br->pass_seq + 1;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    PC_REQUIRE(p->pub_br->pass_seq == pass);
+    MOQ_TEST_CHECK(ast->reset);
+    MOQ_TEST_CHECK_EQ_INT((int)ast->reset_attempts, 1);
+    const bridge_dstream_t *d = &p->pub_br->dstreams[slot];
+    MOQ_TEST_CHECK(d->active && d->has_reset && d->has_sid &&
+                   d->sid == bst->sid);
+    MOQ_TEST_CHECK_EQ_U64(d->reset_pass, pass);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 1);
+    MOQ_TEST_CHECK(!bst->reset);
+    bst->refuse_reset = false;
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(bst->reset);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 2);
+    MOQ_TEST_CHECK(!p->pub_br->dstreams[slot].active);
+    serve_all(p);
+    return true;
+}
+
+#undef PC_REQUIRE
+
+static void test_pass_costs(void)
+{
+    for (size_t v = 1; v < N_VERSIONS; ++v) {
+        moq_rcbuf_t *payload[3] = { NULL, NULL, NULL };
+        pair_t p;
+        if (pair_init_retained(&p, k_versions[v], 1u << 20, true, PC_STREAMS,
+                               1024, 1u << 20, 0, true))
+            MOQ_TEST_CHECK(pass_cost_deadline_row(&p, payload));
+        else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        for (unsigned i = 0; i < 3; ++i)
+            if (payload[i]) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 1);
+                moq_rcbuf_decref(payload[i]);
+            }
+        if (pair_init_retained(&p, k_versions[v], 1u << 20, true, PC_STREAMS,
+                               1024, 1u << 20, 0, true))
+            MOQ_TEST_CHECK(pass_cost_reset_row(&p));
+        else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        static bool (*const rows[])(pair_t *) = {
+            pass_cost_earliest_row, pass_cost_unpop_row, pass_cost_pending_row,
+        };
+        for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); ++r) {
+            if (pair_init_retained(&p, k_versions[v], 1u << 20, true,
+                                   PC_STREAMS, 1024, 1u << 20, 0, true))
+                MOQ_TEST_CHECK(rows[r](&p));
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
+        moq_rcbuf_t *cancelled[5] = { NULL, NULL, NULL, NULL, NULL };
+        if (pair_init_retained(&p, k_versions[v], 1u << 20, true, PC_STREAMS,
+                               1024, 1u << 20, 0, true))
+            MOQ_TEST_CHECK(pass_cost_cancel_row(&p, cancelled));
+        else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        for (unsigned i = 0; i < 5; ++i)
+            if (cancelled[i]) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(cancelled[i]), 1);
+                moq_rcbuf_decref(cancelled[i]);
+            }
+        /* A retained budget a few objects fill. */
+        if (pair_init_retained(&p, k_versions[v], 1u << 20, true, PC_STREAMS,
+                               1024, 64, 0, true))
+            MOQ_TEST_CHECK(pass_cost_reuse_row(&p));
+        else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        printf("pass costs d%d: checked\n", draft_of(k_versions[v]));
+    }
+    MOQ_TEST_PASS("deadline walks read the stream table only for timed items "
+                  "and keep the exact earliest deadline through refusal, "
+                  "expiry, cancellation and the pending FIFO; a refused reset "
+                  "is tried once a pass, a reused slot's reset included");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--shared-admission") == 0) {
@@ -4702,6 +5188,10 @@ int main(int argc, char **argv)
         test_shared_admission_fin();
         test_shared_admission_reset();
         test_shared_admission_expiry();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--pass-costs") == 0) {
+        test_pass_costs();
         return failures ? 1 : 0;
     }
     if (argc == 2 && strcmp(argv[1], "--shared-all") == 0) {

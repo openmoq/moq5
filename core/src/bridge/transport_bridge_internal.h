@@ -281,6 +281,7 @@ typedef struct {
     uint64_t            reset_code;
     uint64_t            reset_reliable;
     uint64_t            served;     /* serve_seq of its last hand-off */
+    uint64_t            reset_pass; /* pass_seq of its last reset attempt */
     bridge_data_item_t *q;          /* action and metadata share ownership */
     uint32_t            q_cap;
     uint32_t            q_head;
@@ -302,7 +303,6 @@ typedef struct {
     bool                fin_handed;
     /* A reset waiting behind the queued prefix its reliable size covers. */
     bool                has_reset;
-    bool                reset_attempted; /* at most one attempt per service call */
     bool                order_dirty;
     bool                order_active;
     bool                pump_skipped;
@@ -412,6 +412,11 @@ struct moq_transport_bridge {
     bool                   pump_refused;
     uint64_t               dq_bytes;       /* bytes queued across dstreams */
     uint32_t               dq_items;       /* actions queued across dstreams */
+    uint32_t               dq_timed;       /* of those, with a delivery deadline */
+    /* Service passes begun, from 1: a dstream whose reset_pass equals it
+     * has had its reset attempt in this pass. */
+    uint64_t               pass_seq;
+    uint64_t               deadline_slots; /* dstream slots deadline walks read */
     uint64_t               max_retained_bytes;
     uint64_t               serve_seq;
 };

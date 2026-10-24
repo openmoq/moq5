@@ -292,6 +292,7 @@ add_test(NAME bridge_fin_before_done COMMAND test_scheduling --fin-done)
 add_test(NAME bridge_retained_expiry COMMAND test_scheduling --retained-expiry)
 add_test(NAME bridge_shared_admission COMMAND test_scheduling --shared-admission)
 add_test(NAME bridge_shared_admission_suite COMMAND test_scheduling --shared-all)
+add_test(NAME bridge_pass_costs COMMAND test_scheduling --pass-costs)
 
 add_executable(test_stream_order unit/test_stream_order.c
     ../core/src/bridge/stream_order.c)
