@@ -30,6 +30,15 @@
 
 static int failures = 0;
 
+/* Every model transport advertises MOQ_TRANSPORT_CAP_SHARED_ADMISSION
+ * (--shared-all). Its write refuses data only at its one queue cap, as the
+ * capability requires, unless a row sets a per-stream refusal; rows that do
+ * are not run with it. */
+static bool g_shared_all = false;
+/* Data writes refused at the cap while the capability was advertised: that
+ * the --shared-all rows reach a spent budget at all. */
+static uint32_t g_shared_cap_refusals = 0;
+
 #define ASC  MOQ_GROUP_ORDER_ASCENDING
 #define DESC MOQ_GROUP_ORDER_DESCENDING
 #define NONE MOQ_GROUP_ORDER_DEFAULT
@@ -139,6 +148,8 @@ typedef struct {
              bool reset; } wire[MT_MAX_CHUNKS];
     size_t   nwire;
     uint32_t priority_calls;
+    uint32_t refuse_run;        /* refused writes since the last acceptance */
+    uint32_t worst_refuse_run;
     uint32_t bidi_keyed;        /* keys set on request/control bidi streams */
     uint64_t op_seq;            /* endpoint acceptance: data, control, resets */
     uint64_t wire_seq[MT_MAX_CHUNKS];
@@ -249,6 +260,7 @@ static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
         if (m->nctrl == MT_MAX_CTRL || len > sizeof(m->ctrl[0].data))
             return MOQ_TRANSPORT_ERROR;
         mt_ctrl_t *c = &m->ctrl[m->nctrl++];
+        m->refuse_run = 0;
         m->ctrl_seq_last = ++m->op_seq;
         c->accepted_seq = m->ctrl_seq_last;
         if (m->ctrl_mark && !m->ctrl_first_after &&
@@ -271,13 +283,19 @@ static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
     /* A shared queue bounded as the picoquic adapter's is (a low-water
      * mark), plus a per-stream budget as msquic's. */
     if (st->reset) st->writes_after_reset++;
-    if ((len > 0 && m->queued >= m->cap) || st->refuse ||
+    const bool at_cap = len > 0 && m->queued >= m->cap;
+    if (at_cap && (m->ops.capabilities & MOQ_TRANSPORT_CAP_SHARED_ADMISSION))
+        g_shared_cap_refusals++;
+    if (at_cap || st->refuse ||
         (fin && st->refuse_fin) ||
         (st->refuse_payload && len == PAYLOAD_LEN && data && data[0] == PAYLOAD_TAG)) {
         st->refused_writes++;
+        if (++m->refuse_run > m->worst_refuse_run)
+            m->worst_refuse_run = m->refuse_run;
         return MOQ_TRANSPORT_WOULD_BLOCK;
     }
     if (m->nchunks == MT_MAX_CHUNKS) return MOQ_TRANSPORT_ERROR;
+    m->refuse_run = 0;
     mt_chunk_t *c = &m->chunks[m->nchunks++];
     memset(c, 0, sizeof(*c));
     c->sid = sid;
@@ -308,6 +326,7 @@ static moq_transport_result_t mt_reset(void *ctx, uint64_t sid, uint64_t code)
     st->reset_attempts++;
     st->reset_code = code;
     if (st->refuse_reset) return MOQ_TRANSPORT_WOULD_BLOCK;
+    m->refuse_run = 0;
     for (size_t i = 0; i < m->nchunks; i++)
         if (m->chunks[i].sid == sid && !m->chunks[i].sent) {
             m->chunks[i].sent = true;
@@ -369,7 +388,8 @@ static void mt_init(mt_t *m, size_t cap, bool drained_cap)
     m->drained_cap = drained_cap;
     m->ops = MOQ_TRANSPORT_ENDPOINT_OPS_INIT;
     m->ops.capabilities = MOQ_TRANSPORT_CAP_HOLD_INPUT |
-        (drained_cap ? MOQ_TRANSPORT_CAP_STREAM_DRAINED : 0);
+        (drained_cap ? MOQ_TRANSPORT_CAP_STREAM_DRAINED : 0) |
+        (g_shared_all ? MOQ_TRANSPORT_CAP_SHARED_ADMISSION : 0);
     m->ops.open_uni = mt_open_uni;
     m->ops.open_bidi = mt_open_bidi;
     m->ops.write = mt_write;
@@ -2604,7 +2624,9 @@ static void test_fill_order(void)
         { "detached-no-drain-control", false, 2 },
         { "detached-same-class-control", true, 1 },
     };
-    for (size_t i = 0; i < sizeof(retries) / sizeof(retries[0]); i++)
+    /* These refuse one stream's payload, which a transport advertising shared
+     * admission never does. */
+    for (size_t i = 0; !g_shared_all && i < sizeof(retries) / sizeof(retries[0]); i++)
         run_fill_row(retries[i].name, 1u << 20, fill_detached_retry_row, &retries[i]);
     MOQ_TEST_PASS("D22 fill ordering, current groups, priority overrides and cycle fairness");
 }
@@ -3662,9 +3684,9 @@ static void test_expiry_successors(void)
         }
 }
 
-/* R2 starts expiry in the core's action ring with no keyed dstream. R3
- * starts it in a keyed bridge pending payload, with no FIN/DONE or unrelated
- * work to obscure the reset-only pending-query contract. */
+/* Expiry that starts in the core's action ring with no keyed dstream
+ * (core_owned), or in a keyed bridge pending payload, with no FIN/DONE or
+ * unrelated work to obscure the reset-only pending-query contract. */
 static bool expiry_review_row(pair_t *p, bool core_owned, moq_rcbuf_t **payload)
 {
     regression_owner_t owner;
@@ -3763,9 +3785,10 @@ static void test_expiry_review(unsigned finding)
         const int before = failures;
         pair_t p;
         moq_rcbuf_t *payload = NULL;
-        /* R1/R2 intentionally exercise the supported max_actions<4 fallback,
-         * which cannot opt in to keyed data actions. R2 needs spare pending
-         * slots so the pressure-reset path cannot mask the missing owner. */
+        /* The partial-successor and core-ring rows exercise the supported
+         * max_actions<4 fallback, which cannot opt in to keyed data actions.
+         * The core-ring row needs spare pending slots so the pressure-reset
+         * path cannot mask the missing owner. */
         if (pair_init_retained(&p, k_versions[v], 1u << 20, true, 0,
                                finding == 3 ? 1024 : 3, 1u << 20,
                                finding == 2 ? 4 : 1, true)) {
@@ -4248,8 +4271,482 @@ static void test_retained_cancellation(void)
     retained_pending_row(MOQ_VERSION_DRAFT_16, false, true);
 }
 
+/* -- Shared admission (MOQ_TRANSPORT_CAP_SHARED_ADMISSION) ------------------
+ *
+ * The model's send queue has one byte cap for the whole connection, as the
+ * picoquic adapters' does, and it refuses a write only at that cap (these
+ * rows set no per-stream refusal); a FIN-only write still goes. That is the
+ * capability's contract, so each row also runs with it advertised. */
+
+static void mt_set_shared(mt_t *m, bool shared)
+{
+    if (shared) m->ops.capabilities |= MOQ_TRANSPORT_CAP_SHARED_ADMISSION;
+    else m->ops.capabilities &= ~(uint32_t)MOQ_TRANSPORT_CAP_SHARED_ADMISSION;
+}
+
+static uint32_t mt_refused(const mt_t *m)
+{
+    uint32_t n = 0;
+    for (size_t i = 0; i < MT_MAX_STREAMS; i++)
+        if (m->streams[i].used) n += m->streams[i].refused_writes;
+    return n;
+}
+
+static uint32_t mt_attempts(const mt_t *m)
+{
+    uint32_t n = 0;
+    for (size_t i = 0; i < MT_MAX_STREAMS; i++)
+        if (m->streams[i].used) n += m->streams[i].write_attempts;
+    return n;
+}
+
+#define SA_GROUPS 6
+
+typedef struct {
+    uint32_t services, refused, attempts, worst_refused, worst_run;
+    size_t nchunks, nwire, nctrl;
+} sa_run_t;
+
+/* Three tracks of SA_GROUPS groups -- one ahead of two equal ones, closed
+ * subgroups, subgroups closed later (FIN-only writes), then every
+ * subscription done -- served one write at a time. Every service's refused
+ * writes are counted, and its longest run of refusals with no write, control
+ * write or reset accepted between them. */
+static bool sa_scenario(pair_t *p, sa_run_t *r)
+{
+    memset(r, 0, sizeof(*r));
+    track_t hi, mid, lo;
+    if (!subscribe(p, "hi", 10, NONE, NONE, &hi) ||
+        !subscribe(p, "mid", 20, NONE, NONE, &mid) ||
+        !subscribe(p, "lo", 20, NONE, NONE, &lo)) return false;
+    p->mt->nctrl = 0;
+    moq_subgroup_handle_t open[SA_GROUPS];
+    for (uint64_t g = 1; g <= SA_GROUPS; g++) {
+        if (!publish_group(p, &hi, 1, g, 0, 128, 3, false, NULL) ||
+            !publish_group(p, &mid, 2, g, 0, 128, 2, true, &open[g - 1]) ||
+            !publish_group(p, &lo, 3, g, 0, 128, 2, false, NULL)) return false;
+    }
+    bool closed = false, done = false;
+    for (int step = 0; step < 4000; step++) {
+        if (step == 6 && !closed) {
+            for (size_t g = 0; g < SA_GROUPS; g++)
+                if (moq_session_close_subgroup(p->pub, open[g], p->now) != MOQ_OK)
+                    return false;
+            closed = true;
+        }
+        if (step == 12 && !done) {
+            const track_t *t[3] = { &hi, &mid, &lo };
+            for (size_t i = 0; i < 3; i++) {
+                moq_done_subscribe_cfg_t dc;
+                moq_done_subscribe_cfg_init(&dc);
+                dc.status_code = 0x3;
+                dc.stream_count = SA_GROUPS;
+                if (moq_session_done_subscribe(p->pub, t[i]->sub, &dc,
+                                               p->now) != MOQ_OK)
+                    return false;
+            }
+            done = true;
+        }
+        const uint32_t before = mt_refused(p->mt);
+        p->mt->refuse_run = p->mt->worst_refuse_run = 0;
+        if (moq_transport_bridge_service(p->pub_br, p->now) != MOQ_OK) return false;
+        r->services++;
+        const uint32_t refused = mt_refused(p->mt) - before;
+        if (refused > r->worst_refused) r->worst_refused = refused;
+        if (p->mt->worst_refuse_run > r->worst_run)
+            r->worst_run = p->mt->worst_refuse_run;
+        if (!mt_serve_one(p->mt) && closed && done &&
+            !moq_transport_bridge_has_outbound_pending(p->pub_br) &&
+            !moq_session_has_pending_output(p->pub))
+            break;
+    }
+    r->refused = mt_refused(p->mt);
+    r->attempts = mt_attempts(p->mt);
+    r->nchunks = p->mt->nchunks;
+    r->nwire = p->mt->nwire;
+    r->nctrl = p->mt->nctrl;
+    return closed && done;
+}
+
+/* What the endpoint accepted, in acceptance order, and what it sent. */
+static bool sa_same_output(const mt_t *a, const mt_t *b)
+{
+    if (a->nchunks != b->nchunks || a->nwire != b->nwire || a->nctrl != b->nctrl)
+        return false;
+    for (size_t i = 0; i < a->nchunks; i++) {
+        const mt_chunk_t *x = &a->chunks[i], *y = &b->chunks[i];
+        if (x->sid != y->sid || x->len != y->len || x->fin != y->fin ||
+            x->accepted_seq != y->accepted_seq ||
+            memcmp(x->head, y->head, PAYLOAD_LEN) != 0)
+            return false;
+    }
+    for (size_t i = 0; i < a->nwire; i++)
+        if (a->wire[i].sid != b->wire[i].sid || a->wire[i].len != b->wire[i].len ||
+            a->wire[i].fin != b->wire[i].fin || a->wire[i].reset != b->wire[i].reset ||
+            memcmp(a->wire[i].head, b->wire[i].head, PAYLOAD_LEN) != 0 ||
+            a->wire_seq[i] != b->wire_seq[i])
+            return false;
+    for (size_t i = 0; i < a->nctrl; i++)
+        if (a->ctrl[i].sid != b->ctrl[i].sid || a->ctrl[i].len != b->ctrl[i].len ||
+            a->ctrl[i].fin != b->ctrl[i].fin ||
+            a->ctrl[i].accepted_seq != b->ctrl[i].accepted_seq ||
+            memcmp(a->ctrl[i].data, b->ctrl[i].data, a->ctrl[i].len) != 0)
+            return false;
+    return true;
+}
+
+/* A spent budget costs one refused write a hand-off, and changes nothing the
+ * endpoint accepts or sends: every write the bridge stops offering would
+ * have been refused. Without the capability every ready stream is tried.
+ * A service repeats its round -- the pending FIFO, which already stops at its
+ * first refusal, then a hand-off of queued data -- after a round that moved
+ * something; nothing else moves here (no peer input, retirement or
+ * deadline). So at most three refusals come in a row: one ending a hand-off
+ * that moved something, then the next round's pending head and hand-off. */
+static void test_shared_admission_refusals(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; v++)
+        for (size_t c = 0; c < 2; c++) {
+            const size_t cap = k_caps[c];
+            pair_t plain, shared;
+            sa_run_t rp, rs;
+            bool ok = pair_init(&plain, k_versions[v], cap, true) &&
+                      pair_init(&shared, k_versions[v], cap, true);
+            MOQ_TEST_CHECK(ok);
+            if (ok) {
+                mt_set_shared(shared.mt, true);
+                MOQ_TEST_CHECK(sa_scenario(&plain, &rp));
+                MOQ_TEST_CHECK(sa_scenario(&shared, &rs));
+                MOQ_TEST_CHECK(sa_same_output(plain.mt, shared.mt));
+                MOQ_TEST_CHECK_EQ_SIZE(rp.nwire, rs.nwire);
+                MOQ_TEST_CHECK(rs.nwire > 0);
+                MOQ_TEST_CHECK(rs.worst_run <= 3);
+                MOQ_TEST_CHECK(rp.worst_run > 3);
+                MOQ_TEST_CHECK(rs.refused < rp.refused);
+                MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(shared.pub_br));
+                printf("shared admission d%d cap %zu: refused %u -> %u "
+                       "(a service at worst %u -> %u, in a row %u -> %u), "
+                       "attempts %u -> %u, %zu writes accepted, %zu sent\n",
+                       draft_of(k_versions[v]), cap, rp.refused, rs.refused,
+                       rp.worst_refused, rs.worst_refused, rp.worst_run,
+                       rs.worst_run, rp.attempts, rs.attempts, rs.nchunks,
+                       rs.nwire);
+            }
+            pair_destroy(&plain);
+            pair_destroy(&shared);
+        }
+    MOQ_TEST_PASS("a spent shared budget is refused once a hand-off");
+}
+
+/* While the budget is spent, a FIN-only write still goes in the same
+ * hand-off: the endpoint may mark it on bytes it holds. */
+static void test_shared_admission_fin(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; v++) {
+        pair_t p;
+        MOQ_TEST_CHECK(pair_init(&p, k_versions[v], 1, true));
+        mt_set_shared(p.mt, true);
+        track_t a, b;
+        MOQ_TEST_CHECK(subscribe(&p, "a", 10, NONE, NONE, &a));
+        MOQ_TEST_CHECK(subscribe(&p, "b", 20, NONE, NONE, &b));
+        moq_subgroup_handle_t bg;
+        MOQ_TEST_CHECK(publish_group(&p, &b, 2, 1, 0, 128, 1, true, &bg));
+        serve_all(&p);
+        uint64_t bsid = 0;
+        MOQ_TEST_CHECK(stream_of(&p, 2, 1, &bsid));
+        mt_stream_t *bst = mt_stream(p.mt, bsid);
+        MOQ_TEST_CHECK(bst != NULL && bst->fin_attempts == 0);
+        /* A, ahead of B, spends the budget; B has only its FIN left. */
+        MOQ_TEST_CHECK(publish_group(&p, &a, 1, 1, 0, 128, 3, true, NULL));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_close_subgroup(p.pub, bg, p.now),
+                              MOQ_OK);
+        const uint32_t refused = mt_refused(p.mt);
+        const size_t chunks = p.mt->nchunks;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now),
+                              MOQ_OK);
+        MOQ_TEST_CHECK(mt_refused(p.mt) > refused);       /* spent */
+        bool b_fin = false;
+        for (size_t i = chunks; i < p.mt->nchunks; i++)
+            if (p.mt->chunks[i].sid == bsid && p.mt->chunks[i].fin &&
+                p.mt->chunks[i].len == 0)
+                b_fin = true;
+        MOQ_TEST_CHECK(b_fin);
+        if (bst) MOQ_TEST_CHECK_EQ_INT((int)bst->fin_attempts, 1);
+        serve_all(&p);
+        uint32_t w[16];
+        MOQ_TEST_CHECK_EQ_SIZE(wire_objects(&p, w, 16), 4);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+        pair_destroy(&p);
+    }
+    MOQ_TEST_PASS("a FIN-only write goes while the shared budget is spent");
+}
+
+/* A reset accepted while the budget is spent may have given capacity back:
+ * a stream not yet tried in that hand-off gets its bytes offered. Four
+ * tracks of equal priority take turns, B, A, C then D, and any accepted
+ * write spends the budget (cap 1). B's subgroup header goes and its object
+ * is refused, so A, never opened, keeps its writes; A's subgroup is reset,
+ * and the reset waits behind A's subgroup header, its reliable prefix. Next
+ * hand-off: A's header goes, C is refused, and A's reset, now due, is
+ * accepted and gives the budget back; D, not yet tried, goes. */
+static bool sa_reset_row(moq_version_t ver, bool shared, bool *d_went)
+{
+    pair_t p;
+    bool ok = pair_init_retained(&p, ver, 1, true, 0, 1024, 0, 0, true);
+    MOQ_TEST_CHECK(ok);
+    if (!ok) { pair_destroy(&p); return false; }
+    mt_set_shared(p.mt, shared);
+    track_t a, b, c, d;
+    ok = subscribe(&p, "b", 20, NONE, NONE, &b) &&
+         subscribe(&p, "a", 20, NONE, NONE, &a) &&
+         subscribe(&p, "c", 20, NONE, NONE, &c) &&
+         subscribe(&p, "d", 20, NONE, NONE, &d);
+    MOQ_TEST_CHECK(ok);
+    moq_subgroup_handle_t ag;
+    ok = ok && publish_group(&p, &b, 2, 1, 0, 128, 1, true, NULL) &&
+         publish_group(&p, &a, 1, 1, 0, 128, 1, true, &ag);
+    MOQ_TEST_CHECK(ok);
+    if (ok) {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now),
+                              MOQ_OK);
+        ok = moq_session_reset_subgroup(p.pub, ag, 0x7, p.now) == MOQ_OK &&
+             publish_group(&p, &c, 3, 1, 0, 128, 1, true, NULL) &&
+             publish_group(&p, &d, 4, 1, 0, 128, 1, true, NULL);
+        MOQ_TEST_CHECK(ok);
+    }
+    size_t mark = 0, end = 0;
+    if (ok) {
+        while (mt_serve_one(p.mt)) {}
+        mark = p.mt->nchunks;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now),
+                              MOQ_OK);
+        end = p.mt->nchunks;
+        uint64_t asid = 0;
+        for (size_t i = mark; i < end && !asid; i++) asid = p.mt->chunks[i].sid;
+        const mt_stream_t *ast = asid ? mt_stream(p.mt, asid) : NULL;
+        MOQ_TEST_CHECK(ast != NULL && ast->reset);   /* A: its prefix, then its reset */
+        serve_all(&p);
+        uint64_t dsid = 0;
+        MOQ_TEST_CHECK(stream_of(&p, 4, 1, &dsid));
+        *d_went = false;
+        for (size_t i = mark; i < end; i++)
+            if (p.mt->chunks[i].sid == dsid) *d_went = true;
+        uint32_t w[16];
+        MOQ_TEST_CHECK_EQ_SIZE(wire_objects(&p, w, 16), 3);   /* B, C and D */
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+    }
+    pair_destroy(&p);
+    return ok;
+}
+
+static void test_shared_admission_reset(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; v++) {
+        bool plain_d = true, shared_d = false;
+        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], false, &plain_d));
+        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], true, &shared_d));
+        /* Without the capability D was tried, and refused, before A's reset
+         * gave the budget back; with it D waits for that reset and goes. */
+        MOQ_TEST_CHECK(!plain_d);
+        MOQ_TEST_CHECK(shared_d);
+        printf("shared admission reset d%d: D in the same hand-off %d -> %d\n",
+               draft_of(k_versions[v]), (int)plain_d, (int)shared_d);
+    }
+    MOQ_TEST_PASS("a reset accepted while the shared budget is spent reopens it");
+}
+
+#define SA_REQUIRE(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+        failures++; \
+        return false; \
+    } \
+} while (0)
+
+/* A deadline passes while the shared budget is spent. A (the most urgent)
+ * spends the budget, and C's object and B's two wait; B's carry a 1 ms
+ * delivery timeout. Only the budget holds data back -- the model refuses
+ * data at its one cap -- so the row runs with the capability and without.
+ * Until the deadline the held objects keep it as the session's next one. At
+ * the deadline the bridge's expiry drops B's objects and resets B, keeping
+ * its subgroup header, though the budget is still spent; that service's
+ * hand-off still offers C, which is refused. B's PUBLISH_DONE, a control
+ * write, then goes while data is still refused. Draft-18 and later, as the
+ * retained expiry rows. */
+static bool shared_expiry_row(pair_t *p, moq_rcbuf_t *payload[4],
+                              uint32_t *refused)
+{
+    regression_owner_t a, c, b;
+    if (!regression_owner(p, false, "fills", 0, 0, &a) ||
+        !regression_owner(p, false, "ahead", 64, 0, &c) ||
+        !regression_owner(p, false, "expires", 128, 1, &b)) return false;
+    moq_subgroup_handle_t asg, csg, bsg;
+    uint64_t asid, csid, bsid;
+    size_t a_header, c_header, b_header;
+    if (!regression_open_header(p, &a, 1, &asg, &asid, &a_header) ||
+        !regression_open_header(p, &c, 1, &csg, &csid, &c_header) ||
+        !regression_open_header(p, &b, 1, &bsg, &bsid, &b_header)) return false;
+    serve_all(p);
+    mt_stream_t *bst = mt_stream(p->mt, bsid), *cst = mt_stream(p->mt, csid);
+    SA_REQUIRE(bst && cst && bst->data && cst->data);
+    const size_t chunks_before = p->mt->nchunks;
+    const uint64_t t0 = p->now, deadline = t0 + 1000;
+    p->mt->cap = 1; /* one accepted data write spends the budget */
+    static const struct { uint8_t track; uint8_t object; } objs[4] = {
+        { 1, 0 }, { 3, 0 }, { 2, 0 }, { 2, 1 },
+    };
+    for (unsigned i = 0; i < 4; ++i) {
+        uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, objs[i].track, 1, 0,
+                                       objs[i].object };
+        SA_REQUIRE(moq_rcbuf_create(moq_alloc_default(), bytes, sizeof(bytes),
+                                     &payload[i]) == MOQ_OK);
+        const moq_subgroup_handle_t sg = objs[i].track == 1 ? asg
+                                       : objs[i].track == 3 ? csg : bsg;
+        SA_REQUIRE(moq_session_write_object(p->pub, sg, objs[i].object,
+                                             payload[i], p->now) == MOQ_OK);
+    }
+    SA_REQUIRE(moq_session_close_subgroup(p->pub, bsg, p->now) == MOQ_OK);
+    SA_REQUIRE(moq_session_next_deadline_us(p->pub) == deadline);
+    SA_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    /* Only A's writes went; the budget is spent. */
+    SA_REQUIRE(p->mt->nchunks > chunks_before && p->mt->queued >= p->mt->cap);
+    for (size_t i = chunks_before; i < p->mt->nchunks; ++i)
+        SA_REQUIRE(p->mt->chunks[i].sid == asid);
+    /* The held objects' deadline still wakes the adapter, exactly. */
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
+
+    p->now = deadline - 1;
+    SA_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    SA_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 0);
+
+    p->now = deadline;
+    SA_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    const uint32_t c_refused = cst->refused_writes;
+    SA_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(cst->refused_writes > c_refused);
+    MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 1);
+    MOQ_TEST_CHECK(bst->reset);
+    MOQ_TEST_CHECK_EQ_U64(bst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(bst->reset_reliable, b_header);
+    for (size_t i = chunks_before; i < p->mt->nchunks; ++i)
+        MOQ_TEST_CHECK(p->mt->chunks[i].sid != bsid);
+    SA_REQUIRE(p->mt->queued >= p->mt->cap);
+
+    const size_t ctrl_before = p->mt->nctrl;
+    SA_REQUIRE(regression_finish(p, &b, 1, "expired") == MOQ_OK);
+    if (!regression_service(p)) return false;
+    size_t count;
+    uint64_t seq;
+    if (!regression_done(p, "expired", 1, &count, &seq)) return false;
+    MOQ_TEST_CHECK_EQ_SIZE(count, 1);
+    MOQ_TEST_CHECK(p->mt->nctrl > ctrl_before);
+    SA_REQUIRE(p->mt->queued >= p->mt->cap);
+
+    *refused = mt_refused(p->mt);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    const uint32_t want[] = { OBJ(1, 1, 0, 0), OBJ(3, 1, 0, 0) };
+    expect_wire(p, want, 2, "shared expiry", 1u << 20);
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_outbound_pending(p->pub_br));
+    return true;
+}
+
+#undef SA_REQUIRE
+
+static void test_shared_admission_expiry(void)
+{
+    for (size_t v = 1; v < N_VERSIONS; ++v) {
+        pair_t plain, shared;
+        moq_rcbuf_t *pp[4] = { NULL, NULL, NULL, NULL };
+        moq_rcbuf_t *ps[4] = { NULL, NULL, NULL, NULL };
+        uint32_t rp = 0, rs = 0;
+        /* The bridge's own pending limit: a full pending FIFO would hold the
+         * hand-off and the control write back whatever the budget. */
+        const bool ok =
+            pair_init_retained(&plain, k_versions[v], 1u << 20, true, 0, 1024,
+                               1u << 20, 0, true) &&
+            pair_init_retained(&shared, k_versions[v], 1u << 20, true, 0, 1024,
+                               1u << 20, 0, true);
+        MOQ_TEST_CHECK(ok);
+        if (ok) {
+            mt_set_shared(shared.mt, true);
+            MOQ_TEST_CHECK(shared_expiry_row(&plain, pp, &rp));
+            MOQ_TEST_CHECK(shared_expiry_row(&shared, ps, &rs));
+            MOQ_TEST_CHECK(sa_same_output(plain.mt, shared.mt));
+            MOQ_TEST_CHECK(rs < rp);
+            printf("shared admission expiry d%d: refused %u -> %u, %zu writes "
+                   "accepted, %zu control writes\n", draft_of(k_versions[v]),
+                   rp, rs, shared.mt->nchunks, shared.mt->nctrl);
+        }
+        pair_destroy(&plain);
+        pair_destroy(&shared);
+        for (unsigned i = 0; i < 4; ++i) {
+            if (pp[i]) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(pp[i]), 1);
+                moq_rcbuf_decref(pp[i]);
+            }
+            if (ps[i]) {
+                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(ps[i]), 1);
+                moq_rcbuf_decref(ps[i]);
+            }
+        }
+    }
+    MOQ_TEST_PASS("an expiry reset and a control write go while the shared budget is spent");
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--shared-admission") == 0) {
+        test_shared_admission_refusals();
+        test_shared_admission_fin();
+        test_shared_admission_reset();
+        test_shared_admission_expiry();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--shared-all") == 0) {
+        /* The default rows with the capability advertised. Left out, because
+         * they refuse per stream: refused_stream_parks_alone,
+         * fetch_priority_payload_retry, normal_fin_before_done,
+         * retained_expiry, expiry_successors, expiry_review,
+         * retained_cancellation, and fill_order's detached-retry rows. */
+        g_shared_all = true;
+        test_group_order_wire();
+        test_priorities_across_tracks();
+        test_rules_within_track();
+        test_group_id_bounds();
+        test_ladder_and_default();
+        test_equal_priorities_share();
+        test_flow_blocked_stream();
+        test_data_before_close();
+        test_live_subgroup_catches_up();
+        test_completeness();
+        test_priority_updates();
+        test_publication_update();
+        test_fetch_scheduling();
+        test_fetch_update();
+        test_fetch_priority_boundary();
+        test_fill_order();
+        test_control_not_behind_data();
+        test_stop_sending_one_stream();
+        test_unsubscribe_resets_pending();
+        test_reset_before_open();
+        test_keys_need_four_slots();
+        test_map_full_is_not_outbound_work();
+        test_key_moves_with_its_stream();
+        test_fetch_cancel_resets();
+        test_done_with_pending();
+        MOQ_TEST_CHECK(g_shared_cap_refusals > 0);
+        printf("shared-all: %u data writes refused at the cap while advertised\n",
+               g_shared_cap_refusals);
+        if (failures) {
+            fprintf(stderr, "test_scheduling --shared-all: %d failure(s)\n",
+                    failures);
+            return 1;
+        }
+        printf("test_scheduling --shared-all: all passed\n");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--fill-order") == 0) {
         test_fill_order();
         return failures ? 1 : 0;

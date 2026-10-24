@@ -10,16 +10,22 @@
  * All session work happens on the network thread inside on_pump; the
  * main thread only create/wait/stop/destroys and reads a shared flag
  * published through the facade's wait() barrier.
+ *
+ * --early-wake-control runs, with no server, the wait loop against waits
+ * that return at once: the timeout is monotonic time, not a count of
+ * waits.
  */
 
 #include <moq/moq.h>
 #include <moq/pico_wt_managed.h>
 
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     int        subscribed;   /* network thread only */
@@ -76,11 +82,108 @@ static int on_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
     return atomic_load(&a->got_object) ? 1 : 0;
 }
 
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+typedef moq_result_t (*wait_fn)(void *ctx, uint64_t timeout_us);
+typedef bool (*done_fn)(void *ctx);
+
+/* Wait until done() holds or `budget_us` of monotonic time has passed. A
+ * wait may return early (every pump cycle wakes it); each return costs only
+ * the time it took. True when done() held; false on timeout or a closed
+ * facade. */
+static bool wait_until(uint64_t budget_us, wait_fn wait, done_fn done,
+                       void *ctx)
+{
+    const uint64_t deadline = mono_us() + budget_us;
+    for (;;) {
+        if (done(ctx)) return true;
+        const uint64_t now = mono_us();
+        if (now >= deadline) return false;
+        const uint64_t slice = deadline - now < 200000u ? deadline - now
+                                                         : 200000u;
+        if (wait(ctx, slice) == MOQ_ERR_CLOSED) return done(ctx);
+    }
+}
+
+typedef struct {
+    moq_pico_wt_managed_t *m;
+    app_t *app;
+} real_wait_t;
+
+static moq_result_t real_wait(void *ctx, uint64_t timeout_us)
+{
+    return moq_pico_wt_managed_wait(((real_wait_t *)ctx)->m, timeout_us);
+}
+
+static bool real_done(void *ctx)
+{
+    return atomic_load(&((real_wait_t *)ctx)->app->got_object) != 0;
+}
+
+typedef struct {
+    unsigned calls;
+    unsigned done_after;   /* done() holds after this many waits */
+    bool sleep;            /* the wait sleeps its slice instead of returning */
+} fake_wait_t;
+
+static moq_result_t fake_wait(void *ctx, uint64_t timeout_us)
+{
+    fake_wait_t *f = (fake_wait_t *)ctx;
+    f->calls++;
+    if (f->sleep) {
+        struct timespec ts = {
+            .tv_sec = (time_t)(timeout_us / 1000000u),
+            .tv_nsec = (long)(timeout_us % 1000000u) * 1000L };
+        nanosleep(&ts, NULL);
+    }
+    return MOQ_OK;
+}
+
+static bool fake_done(void *ctx)
+{
+    const fake_wait_t *f = (const fake_wait_t *)ctx;
+    return f->done_after && f->calls >= f->done_after;
+}
+
+/* A hundred waits returning at once, then the object: inside a five-second
+ * budget, which a 200 ms charge per wait would spend after 25. Then a wait
+ * that sleeps and an object that never comes: the budget ends it, on time. */
+static int early_wake_control(void)
+{
+    int failures = 0;
+    fake_wait_t f = { .done_after = 100 };
+    if (!wait_until(5000000u, fake_wait, fake_done, &f) || f.calls != 100) {
+        fprintf(stderr, "FAIL: early wakes: done=%d after %u waits\n",
+                fake_done(&f), f.calls);
+        failures++;
+    }
+    fake_wait_t g = { .sleep = true };
+    const uint64_t t0 = mono_us();
+    const bool got = wait_until(300000u, fake_wait, fake_done, &g);
+    const uint64_t took = mono_us() - t0;
+    if (got || took < 300000u || took > 2000000u) {
+        fprintf(stderr, "FAIL: timeout: done=%d after %llu us\n", got,
+                (unsigned long long)took);
+        failures++;
+    }
+    if (failures) return 1;
+    printf("PASS: early wakes cost only their time (100 waits within the "
+           "budget; a 300 ms budget ended after %llu us)\n",
+           (unsigned long long)took);
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s [--host H] [--port N] [--path /moq] [--timeout-sec N]\n",
-        prog);
+        "usage: %s [--host H] [--port N] [--path /moq] [--timeout-sec N]\n"
+        "       %s --early-wake-control\n",
+        prog, prog);
 }
 
 int main(int argc, char **argv)
@@ -90,6 +193,8 @@ int main(int argc, char **argv)
     const char *path = "/moq";
     int timeout_sec = 5;
 
+    if (argc == 2 && !strcmp(argv[1], "--early-wake-control"))
+        return early_wake_control();
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc)
@@ -125,14 +230,9 @@ int main(int argc, char **argv)
            host, port, path);
 
     /* Wait for on_pump to report the object (or fatal / timeout). */
-    uint64_t waited_ms = 0;
-    const uint64_t budget_ms = (uint64_t)timeout_sec * 1000;
-    while (!atomic_load(&app.got_object) && waited_ms < budget_ms) {
-        moq_result_t r = moq_pico_wt_managed_wait(m, 200000);  /* 200ms */
-        if (r == MOQ_ERR_CLOSED)
-            break;  /* pump_exit (done) or fatal */
-        waited_ms += 200;
-    }
+    real_wait_t rw = { .m = m, .app = &app };
+    (void)wait_until((uint64_t)timeout_sec * 1000000u, real_wait, real_done,
+                     &rw);
 
     bool fatal = moq_pico_wt_managed_is_fatal(m);
     moq_pico_wt_managed_stop(m);

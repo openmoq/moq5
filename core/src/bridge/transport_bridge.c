@@ -2299,6 +2299,7 @@ static void bridge_count_sent(moq_transport_bridge_t *b,
 static moq_result_t bridge_send_refused(moq_transport_bridge_t *b,
                                         bridge_pending_item_t *p, bool started)
 {
+    if (b->pump_hand_back) b->pump_refused = true;
     if (b->pump_hand_back && !started) {
         b->pump_handed_back = true;
         return MOQ_OK;
@@ -4045,25 +4046,62 @@ static bridge_dstream_t *bridge_pump_pick(const moq_transport_bridge_t *b)
     return best == BRIDGE_INDEX_EMPTY ? NULL : &b->dstreams[best];
 }
 
+/* What `d` hands over next adds no stream bytes: a FIN-only write, or a
+ * reset waiting behind the prefix it has already handed over. */
+static bool bridge_dstream_next_empty(const bridge_dstream_t *d)
+{
+    return d->q_len == 0 ||
+           bridge_send_data_bytes(&d->q[d->q_head].action.u.send_data) == 0;
+}
+
+/* The ready stream with the best key whose next hand-off adds no bytes, for
+ * an endpoint whose shared budget is spent (MOQ_TRANSPORT_CAP_SHARED_ADMISSION):
+ * an open stream's FIN-only write, which the endpoint may still take, or a
+ * reset, which may give capacity back. A stream still to open needs bytes,
+ * unless all it holds is a reset. */
+static bridge_dstream_t *bridge_pump_pick_empty(const moq_transport_bridge_t *b)
+{
+    uint32_t best = BRIDGE_INDEX_EMPTY;
+    for (uint32_t h = 0; h < 2; h++)
+        for (uint32_t i = 0; i < b->dheap_len[h]; i++) {
+            const uint32_t s = b->dheap[h][i];
+            const bridge_dstream_t *d = &b->dstreams[s];
+            if (h == 1 ? d->q_len != 0 : !bridge_dstream_next_empty(d))
+                continue;
+            if (best == BRIDGE_INDEX_EMPTY || bridge_dheap_less(b, s, best))
+                best = s;
+        }
+    return best == BRIDGE_INDEX_EMPTY ? NULL : &b->dstreams[best];
+}
+
 /* Hand queued data to the endpoint, best key first (equal keys take turns).
  * A write the endpoint refuses before any byte went out goes back to its
  * stream, which sits out the rest of this pass: one stream's refusal never
  * holds back another, and nothing waits in the pending FIFO out of priority
  * order. Each step needs at most one pending slot. Sets *progress if
- * anything went. */
+ * anything went.
+ *
+ * An endpoint with MOQ_TRANSPORT_CAP_SHARED_ADMISSION refuses a write only
+ * when its connection-wide budget is spent, which no other stream's write
+ * can change: from that refusal on, only work that adds no bytes is offered,
+ * until a reset it accepts may have given capacity back. */
 static moq_result_t bridge_pump_data(moq_transport_bridge_t *b,
                                      bool *progress)
 {
     *progress = false;
     uint32_t nskip = 0;
     moq_result_t rc = MOQ_OK;
+    const bool shared = (b->ops->capabilities &
+                         MOQ_TRANSPORT_CAP_SHARED_ADMISSION) != 0;
+    bool spent = false;
     /* A bounded number of head transitions bounds rank rebuilds in a pump.
      * The remaining ready heap is visible to outbound_ready for continuation. */
     while (!b->fatal && !b->closed && b->pending_count < b->max_pending &&
            b->pump_budget > 0) {
         rc = bridge_dstreams_reorder(b);
         if (rc < 0) break;
-        bridge_dstream_t *d = bridge_pump_pick(b);
+        bridge_dstream_t *d = spent ? bridge_pump_pick_empty(b)
+                                    : bridge_pump_pick(b);
         if (!d) break;
         b->pump_budget--;
         moq_stream_ref_t ref = d->ref;
@@ -4071,8 +4109,10 @@ static moq_result_t bridge_pump_data(moq_transport_bridge_t *b,
             bool accepted;
             rc = bridge_try_deferred_reset(b, d, &accepted);
             if (rc < 0) break;
-            if (accepted) *progress = true;
-            else {
+            if (accepted) {
+                *progress = true;
+                spent = false;
+            } else {
                 d->pump_skipped = true;
                 if (d->heap_at != BRIDGE_INDEX_EMPTY) bridge_dheap_remove(b, d);
                 b->dskip[nskip++] = (uint32_t)(d - b->dstreams);
@@ -4083,9 +4123,11 @@ static moq_result_t bridge_pump_data(moq_transport_bridge_t *b,
         bridge_dstream_pop(b, d, &item);
         b->pump_hand_back = true;
         b->pump_handed_back = false;
+        b->pump_refused = false;
         rc = dispatch_send_data(b, &item.action, &item.meta);
         b->pump_hand_back = false;
         if (rc < 0) break;
+        if (shared && b->pump_refused) spent = true;
         if (b->pump_handed_back) {
             bridge_dstream_unpop(b, d, &item);
             d->pump_skipped = true;

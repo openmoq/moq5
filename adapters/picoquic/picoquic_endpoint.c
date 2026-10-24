@@ -8,9 +8,11 @@
  * write_payload() copy/retain the bytes into the adapter-owned send queue and
  * mark the stream active; picoquic later asks for them via
  * picoquic_callback_prepare_to_send, serviced by pq_endpoint_on_prepare_to_send.
- * write returns WOULD_BLOCK when the queue's byte cap is reached, so the bridge
- * retains and retries. reset_stream and stop_sending return codes are checked —
- * non-zero maps to ERROR (the bridge treats this as fatal).
+ * write returns WOULD_BLOCK only when the queue's byte cap, one for the whole
+ * connection, is reached (MOQ_TRANSPORT_CAP_SHARED_ADMISSION), so the bridge
+ * retains and retries, and offers no other stream's bytes meanwhile.
+ * reset_stream and stop_sending return codes are checked — non-zero maps to
+ * ERROR (the bridge treats this as fatal).
  *
  * Reliable reset: reset_stream_at keeps a prefix of the stream with
  * RESET_STREAM_AT when both sides advertised the reset_stream_at transport
@@ -97,7 +99,7 @@ static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
 {
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;    /* cnx released */
     if (r < 0) return MOQ_TRANSPORT_ERROR;       /* allocation failure: fatal */
-    if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* queue cap: retain + retry */
+    if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* connection queue cap */
     /* Bytes are queued; picoquic must poll the stream to pull them. A failure
      * to mark it active means they would never be sent -- treat as fatal. */
     if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, NULL) != 0 ||
@@ -375,7 +377,8 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
                            MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
                            MOQ_TRANSPORT_CAP_HOLD_INPUT |
                            MOQ_TRANSPORT_CAP_RELIABLE_RESET |
-                           MOQ_TRANSPORT_CAP_STREAM_DRAINED,
+                           MOQ_TRANSPORT_CAP_STREAM_DRAINED |
+                           MOQ_TRANSPORT_CAP_SHARED_ADMISSION,
         .open_uni        = pq_open_uni,
         .open_bidi       = pq_open_bidi,
         .write           = pq_write,

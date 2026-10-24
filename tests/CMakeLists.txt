@@ -290,6 +290,8 @@ add_test(NAME bridge_fetch_priority COMMAND test_scheduling --fetch-priority)
 add_test(NAME bridge_fill_order COMMAND test_scheduling --fill-order)
 add_test(NAME bridge_fin_before_done COMMAND test_scheduling --fin-done)
 add_test(NAME bridge_retained_expiry COMMAND test_scheduling --retained-expiry)
+add_test(NAME bridge_shared_admission COMMAND test_scheduling --shared-admission)
+add_test(NAME bridge_shared_admission_suite COMMAND test_scheduling --shared-all)
 
 add_executable(test_stream_order unit/test_stream_order.c
     ../core/src/bridge/stream_order.c)

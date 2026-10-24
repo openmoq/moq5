@@ -59,9 +59,14 @@ without measurement.
 
 The adapter queue holds 128 KiB by default (PicoQUIC: `send_queue_cap_bytes`).
 The bridge retains the rest, up to 1 MiB in total (at least 128 KiB in the
-bridge), and hands it over in priority order. When a stream's queued bytes
-drain, the adapter reports it (`MOQ_TRANSPORT_CAP_STREAM_DRAINED`), so the
-bridge sets the priority again on the next write.
+bridge), and hands it over in priority order. The cap is one for the whole
+connection, so the adapter refuses a write only when no stream can take
+bytes (`MOQ_TRANSPORT_CAP_SHARED_ADMISSION`): after a refusal the bridge
+offers no more bytes in that hand-off, while FIN-only writes and resets still
+go, and a reset that frees queued bytes reopens it. PicoWT's queue is the
+same. When a stream's queued bytes drain, the adapter reports it
+(`MOQ_TRANSPORT_CAP_STREAM_DRAINED`), so the bridge sets the priority again on
+the next write.
 
 The bridge priority callback is optional and size-gated. Other adapters retain
 their existing scheduling behavior when they do not implement it. Without

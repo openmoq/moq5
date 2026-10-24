@@ -101,9 +101,10 @@ int pico_wt_endpoint_apply_priorities(pico_wt_endpoint_ctx_t *ctx)
                                               ctx);
 }
 
-/* Map a queue push result to the bridge write contract. On accept, mark the
- * stream active with its h3zero stream context so h3zero routes prepare_to_send
- * back to our provide_data path. */
+/* Map a queue push result to the bridge write contract: a refusal is the
+ * queue's one cap for the connection (MOQ_TRANSPORT_CAP_SHARED_ADMISSION). On
+ * accept, mark the stream active with its h3zero stream context so h3zero
+ * routes prepare_to_send back to our provide_data path. */
 static moq_transport_result_t wt_push_result(pico_wt_endpoint_ctx_t *ep,
                                              uint64_t stream_id, int r)
 {
@@ -568,7 +569,8 @@ int pico_wt_endpoint_init(moq_transport_endpoint_ops_t *ops,
                            MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
                            MOQ_TRANSPORT_CAP_HOLD_INPUT |
                            MOQ_TRANSPORT_CAP_RELIABLE_RESET |
-                           MOQ_TRANSPORT_CAP_STREAM_DRAINED,
+                           MOQ_TRANSPORT_CAP_STREAM_DRAINED |
+                           MOQ_TRANSPORT_CAP_SHARED_ADMISSION,
         .open_uni        = ep_open_uni,
         .set_stream_priority = ep_priority,
         .open_bidi       = ep_open_bidi,

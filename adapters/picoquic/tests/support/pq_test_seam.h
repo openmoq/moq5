@@ -49,6 +49,10 @@ void moq_pq_test_endpoint(moq_pq_conn_t *conn,
                           const moq_transport_endpoint_ops_t **ops,
                           void **ctx);
 
+/* That vtable, writable: a test may withdraw a capability or wrap an
+ * operation. The bridge reads it through this pointer at every use. */
+moq_transport_endpoint_ops_t *moq_pq_test_endpoint_ops(moq_pq_conn_t *conn);
+
 /* The next `n` per-stream context assignments the adapter makes fail as
  * picoquic would refuse them. */
 void moq_pq_test_fail_stream_ctx(int n);

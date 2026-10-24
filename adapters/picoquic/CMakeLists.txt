@@ -678,6 +678,34 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME pq_stop_release COMMAND test_pq_stop_release)
         set_tests_properties(pq_stop_release PROPERTIES TIMEOUT 120)
 
+        # Shared send admission over real picoquic: the adapter's queue with
+        # a small budget, the capability advertised and withdrawn, what the
+        # subscriber receives compared, coalesced and standalone FINs while
+        # the budget is spent.
+        add_executable(test_pq_sim_shared_admission
+            tests/test_pq_sim_shared_admission.c moq_picoquic.c
+            picoquic_endpoint.c ../common/moq_pq_send_queue.c)
+        target_compile_definitions(test_pq_sim_shared_admission PRIVATE
+            MOQ_BUILDING MOQ_PICOQUIC_TESTING
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        target_include_directories(test_pq_sim_shared_admission PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../common
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/support
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_sim_shared_admission PRIVATE
+            moq::core
+            picoquic-test
+            ${_adapter_tls_link})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_sim_shared_admission PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_sim_shared_admission COMMAND test_pq_sim_shared_admission)
+        set_tests_properties(pq_sim_shared_admission PROPERTIES TIMEOUT 300)
+
         include(${PROJECT_SOURCE_DIR}/cmake/MoqPicoquicTerminalTests.cmake)
         moq_add_picoquic_terminal_tests(pq moq::adapter-picoquic ${_adapter_tls_link})
     endif()
@@ -897,8 +925,35 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
     target_include_directories(moq-adapter-picoquic-threaded-test-internals
         PRIVATE "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    # The group crypto in this archive (pq_group_crypto.c) calls the picotls
+    # OpenSSL backend directly. A picotls built outside this tree reaches
+    # picoquic-core as plain archive paths, which carry no edge to the
+    # backend's crypto library, and picoquic-core lists its OpenSSL ahead of
+    # them. A linker that keeps a shared library only when something before it
+    # needs one (GNU ld's --as-needed) then leaves the backend archive's
+    # OpenSSL references unresolved in a test whose only OpenSSL user is that
+    # archive. So this archive also depends on the backend archive as an
+    # imported target that carries the edge, which places OpenSSL after it.
+    # The archive is then named twice, harmlessly for such a linker; Apple's
+    # linker needs no order and reports a library named twice, so there the
+    # archive is left to picoquic-core alone.
+    set(_pq_ptls_backend "")
+    if(_moq_pq_verify_backend STREQUAL "openssl" AND NOT APPLE AND
+       TARGET picoquic-core AND TARGET OpenSSL::Crypto)
+        get_target_property(_pq_core_links picoquic-core INTERFACE_LINK_LIBRARIES)
+        foreach(_item IN LISTS _pq_core_links)
+            if(_item MATCHES "(^|/)libpicotls-openssl\\.a$")
+                add_library(moq_pq_test_ptls_openssl STATIC IMPORTED)
+                set_target_properties(moq_pq_test_ptls_openssl PROPERTIES
+                    IMPORTED_LOCATION "${_item}"
+                    INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
+                set(_pq_ptls_backend moq_pq_test_ptls_openssl)
+                break()
+            endif()
+        endforeach()
+    endif()
     target_link_libraries(moq-adapter-picoquic-threaded-test-internals
-        PUBLIC moq::adapter-picoquic Threads::Threads)
+        PUBLIC ${_pq_ptls_backend} moq::adapter-picoquic Threads::Threads)
     target_compile_definitions(moq-adapter-picoquic-threaded-test-internals
         PRIVATE MOQ_PQ_THREADED_TESTING)
     set_target_properties(moq-adapter-picoquic-threaded-test-internals

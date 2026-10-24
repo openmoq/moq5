@@ -23,6 +23,18 @@
  * pico_wt_managed.c, compiled into this test; the bridge's stream count is
  * read on the owner network thread. Preparation failures fail the row and
  * unwind; every wait is bounded by a monotonic deadline.
+ *
+ * Each row's server starts on a port the IPv4 allocator found free when it
+ * handed it out (tests/support/loopback_port.h). Nothing reserves it once the
+ * allocator's socket closes, so a start may still find it taken. The facade
+ * reports every start failure alike, so a failed start probes its port:
+ * observed held (EADDRINUSE), the start moves to a fresh port, a bounded
+ * number of times; free, or not probeable, the failure is the setup's own
+ * and fatal, its cause printed. Every start prints its port and result. A
+ * failed row is never retried. --port-control runs the classification
+ * alone; --port-guards, its handling of starts that unexpectedly succeed;
+ * --port-guards-setup-failure, that those guards refuse a setup failure in
+ * place of such a start.
  */
 #include <moq/pico_wt_managed.h>
 #include <moq/session.h>
@@ -30,7 +42,9 @@
 
 #include "pico_wt_adapter.h"
 #include "pico_wt_test_seam.h"
+#include "../../../tests/support/loopback_port.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,10 +55,13 @@
 #include <unistd.h>
 
 static int failures = 0;
+static bool expecting_failures;   /* a control that provokes its own CHECKs */
 #define CHECK(expr)                                                          \
     do {                                                                     \
         if (!(expr)) {                                                       \
-            fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr);  \
+            fprintf(stderr, "%s: %s:%d: %s\n",                               \
+                    expecting_failures ? "expected failure" : "FAIL",       \
+                    __FILE__, __LINE__, #expr);                              \
             failures++;                                                      \
         }                                                                    \
     } while (0)
@@ -393,7 +410,8 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
 
 /* -- row ------------------------------------------------------------- */
 
-static moq_pico_wt_managed_t *make(bool server, int port, const char *cert, const char *key)
+static moq_pico_wt_managed_t *make(bool server, int port, const char *cert,
+                                    const char *key, moq_result_t *rc)
 {
     moq_pico_wt_managed_cfg_t cfg;
     moq_pico_wt_managed_cfg_init_sized(&cfg, sizeof(cfg));
@@ -414,20 +432,147 @@ static moq_pico_wt_managed_t *make(bool server, int port, const char *cert, cons
         cfg.on_pump = client_pump;
     }
     moq_pico_wt_managed_t *m = NULL;
-    return moq_pico_wt_managed_create(&cfg, &m) == MOQ_OK ? m : NULL;
+    *rc = moq_pico_wt_managed_create(&cfg, &m);
+    return *rc == MOQ_OK ? m : NULL;
 }
 
-static void run_row(int port, const char *cert, const char *key, bool force_overtake)
+/* -- the server's port ----------------------------------------------- */
+
+typedef struct {
+    const char *row;
+    const char *cert, *key;
+    unsigned starts;
+    unsigned listening;  /* starts that left a live server */
+    bool setup_failed;   /* a start failed for a reason other than a held
+                          * port: no more starts */
+} server_start_t;
+
+typedef enum { PORT_FREE, PORT_HELD, PORT_UNKNOWN } port_state_t;
+
+/* Whether another socket holds `port`. HELD only when a bind of it (IPv4, or
+ * IPv6-only) fails with EADDRINUSE; FREE when both binds succeed; UNKNOWN
+ * when a probe itself fails, its cause in `why`. */
+static port_state_t port_probe(uint16_t port, char *why, size_t why_len)
+{
+    port_state_t st = PORT_FREE;
+    for (int v6 = 0; v6 < 2; v6++) {
+        const char *fam = v6 ? "IPv6" : "IPv4";
+        const int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            snprintf(why, why_len, "%s socket: %s", fam, strerror(errno));
+            if (st != PORT_HELD) st = PORT_UNKNOWN;
+            continue;
+        }
+        int rc;
+        if (v6) {
+            int one = 1;
+            struct sockaddr_in6 a6;
+            (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+            memset(&a6, 0, sizeof(a6));
+            a6.sin6_family = AF_INET6;
+            a6.sin6_addr = in6addr_any;
+            a6.sin6_port = htons(port);
+            rc = bind(fd, (const struct sockaddr *)&a6, sizeof(a6));
+        } else {
+            struct sockaddr_in a;
+            memset(&a, 0, sizeof(a));
+            a.sin_family = AF_INET;
+            a.sin_addr.s_addr = htonl(INADDR_ANY);
+            a.sin_port = htons(port);
+            rc = bind(fd, (const struct sockaddr *)&a, sizeof(a));
+        }
+        const int err = errno;
+        close(fd);
+        if (rc == 0) continue;
+        if (err == EADDRINUSE) {
+            st = PORT_HELD;
+            continue;
+        }
+        snprintf(why, why_len, "%s bind: %s", fam, strerror(err));
+        if (st != PORT_HELD) st = PORT_UNKNOWN;
+    }
+    return st;
+}
+
+/* moq_test_listen_ipv4_port()'s start: the row's server on `port`. A live
+ * server is never overwritten. A start that fails on a port observed held
+ * lets the helper try a fresh one; one that fails with the port free, or not
+ * probeable, ends the row's starts. */
+static bool start_server(void *ctx, uint16_t port)
+{
+    server_start_t *s = (server_start_t *)ctx;
+    if (s->setup_failed) return false;
+    if (g.srv) {
+        printf("%s: no start on port %u: a server is already live\n", s->row,
+               (unsigned)port);
+        s->setup_failed = true;
+        return false;
+    }
+    moq_result_t rc;
+    s->starts++;
+    g.srv = make(true, port, s->cert, s->key, &rc);
+    if (g.srv) {
+        s->listening++;
+        printf("%s: server listening on port %u (start %u)\n", s->row,
+               (unsigned)port, s->starts);
+        return true;
+    }
+    char why[128] = "";
+    switch (port_probe(port, why, sizeof(why))) {
+    case PORT_HELD:
+        printf("%s: server start %u on port %u failed (%d): the port is "
+               "held (EADDRINUSE), trying another\n", s->row, s->starts,
+               (unsigned)port, rc);
+        return false;
+    case PORT_FREE:
+        printf("%s: server start %u on port %u failed (%d) with the port "
+               "free: a setup failure\n", s->row, s->starts, (unsigned)port, rc);
+        break;
+    case PORT_UNKNOWN:
+        printf("%s: server start %u on port %u failed (%d) and the port "
+               "could not be probed (%s): a setup failure\n", s->row,
+               s->starts, (unsigned)port, rc, why);
+        break;
+    }
+    s->setup_failed = true;
+    return false;
+}
+
+static void stop_server(void)
+{
+    if (!g.srv) return;
+    moq_pico_wt_managed_stop(g.srv);
+    moq_pico_wt_managed_destroy(g.srv);
+    g.srv = NULL;
+}
+
+/* The row's server and its client, on a port from the IPv4 allocator. */
+static bool make_pair(const char *row, const char *cert, const char *key)
+{
+    server_start_t s = { .row = row, .cert = cert, .key = key };
+    const uint16_t port = moq_test_listen_ipv4_port(start_server, &s);
+    if (!port) {
+        printf("%s: no server after %u start(s)\n", row, s.starts);
+        return false;
+    }
+    moq_result_t rc;
+    g.cli = make(false, port, cert, key, &rc);
+    if (!g.cli)
+        printf("%s: client for port %u failed (%d)\n", row, (unsigned)port, rc);
+    return g.cli != NULL;
+}
+
+static void run_row(const char *cert, const char *key, bool force_overtake)
 {
     memset(&g, 0, sizeof(g));
     pthread_mutex_init(&g.mu, NULL);
     pthread_cond_init(&g.cv, NULL);
     bool ok;
 
-    g.srv = make(true, port, cert, key);
-    g.cli = g.srv ? make(false, port, cert, key) : NULL;
-    CHECK(g.srv && g.cli);
-    if (!g.srv || !g.cli) goto out;
+    const bool made = make_pair(force_overtake ? "retained, overtaken" : "retained",
+                                cert, key);
+    CHECK(made && g.srv && g.cli);
+    if (!made || !g.srv || !g.cli) goto out;
 
     /* Every request issued and answered or held. */
     lock();
@@ -614,15 +759,14 @@ out:
 /* A hold the test never releases ends by timeout: the hook records it, the
  * hold is no longer active, and the forced row's verdict rejects it. The
  * hold bound is the fixture's own (short) one; nothing sleeps. */
-static void run_hold_timeout_negative(int port, const char *cert, const char *key)
+static void run_hold_timeout_negative(const char *cert, const char *key)
 {
     memset(&g, 0, sizeof(g));
     pthread_mutex_init(&g.mu, NULL);
     pthread_cond_init(&g.cv, NULL);
-    g.srv = make(true, port, cert, key);
-    g.cli = g.srv ? make(false, port, cert, key) : NULL;
-    CHECK(g.srv && g.cli);
-    if (!g.srv || !g.cli) goto out;
+    const bool made = make_pair("forced hold timeout", cert, key);
+    CHECK(made && g.srv && g.cli);
+    if (!made || !g.srv || !g.cli) goto out;
     lock();
     bool hooked = wait_flag(&g.cli_hook_installed);
     g.hold_bound_ms = 50;
@@ -653,24 +797,218 @@ out:
     pthread_mutex_destroy(&g.mu);
 }
 
+/* -- the port classification's controls ---------------------------- */
+
+/* What a branch did: its starts, the starts that left a live server, whether
+ * one failed for a reason other than a held port, the expectations it
+ * recorded as failed, and whether a server was still live when it returned. */
+typedef struct {
+    unsigned starts, listening;
+    bool setup_failed;
+    int failed;
+    bool live_after;
+} branch_outcome_t;
+
+static branch_outcome_t branch_outcome(const server_start_t *s, int failures_before)
+{
+    return (branch_outcome_t){ .starts = s->starts, .listening = s->listening,
+                               .setup_failed = s->setup_failed,
+                               .failed = failures - failures_before,
+                               .live_after = g.srv != NULL };
+}
+
+/* The held branch, on `port`: a start there must fail and be classed as
+ * held, and the helper's next start must listen on another port. Nothing
+ * dependent runs once an expectation fails, and every server it creates is
+ * stopped before it returns. */
+static branch_outcome_t held_branch(const char *cert, const char *key, uint16_t port)
+{
+    const int before = failures;
+    server_start_t s = { .row = "port control, held", .cert = cert, .key = key };
+    const bool started = start_server(&s, port);
+    CHECK(!started && g.srv == NULL && !s.setup_failed && s.starts == 1);
+    if (started || g.srv || s.setup_failed) {
+        stop_server();
+        return branch_outcome(&s, before);
+    }
+    const uint16_t next = moq_test_listen_ipv4_port(start_server, &s);
+    CHECK(next != 0 && next != port && g.srv != NULL && !s.setup_failed &&
+          s.listening == 1);
+    stop_server();
+    return branch_outcome(&s, before);
+}
+
+/* The setup-failure branch, with `cert`: the start must fail with its port
+ * free, be classed as a setup failure and end the starts after one. Any
+ * server it creates is stopped before it returns. */
+static branch_outcome_t setup_failure_branch(const char *cert, const char *key)
+{
+    const int before = failures;
+    server_start_t s = { .row = "port control, missing certificate",
+                         .cert = cert, .key = key };
+    const uint16_t port = moq_test_listen_ipv4_port(start_server, &s);
+    CHECK(port == 0 && s.setup_failed && s.starts == 1 && g.srv == NULL);
+    stop_server();
+    return branch_outcome(&s, before);
+}
+
+static void port_control_begin(void)
+{
+    memset(&g, 0, sizeof(g));
+    pthread_mutex_init(&g.mu, NULL);
+    pthread_cond_init(&g.cv, NULL);
+}
+
+/* Every server is gone before the synchronization it uses. */
+static void port_control_end(void)
+{
+    stop_server();
+    pthread_cond_destroy(&g.cv);
+    pthread_mutex_destroy(&g.mu);
+}
+
+/* With a socket holding a port on IPv4, as another application's might, a
+ * server start on that port fails and is classed as held, and the helper's
+ * next start lands on another port and listens. A start that fails with its
+ * port free -- here a certificate that does not exist -- is classed as a
+ * setup failure and ends the starts after one. */
+static void run_port_controls(const char *cert, const char *key)
+{
+    port_control_begin();
+    struct sockaddr_in a;
+    socklen_t len = sizeof(a);
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    const bool holding = fd >= 0 &&
+        bind(fd, (const struct sockaddr *)&a, sizeof(a)) == 0 &&
+        getsockname(fd, (struct sockaddr *)&a, &len) == 0;
+    const uint16_t held = holding ? ntohs(a.sin_port) : 0;
+    CHECK(holding && held != 0);
+    if (holding) held_branch(cert, key, held);
+    if (fd >= 0) close(fd);
+    setup_failure_branch("/nonexistent/moq-test-cert.pem", key);
+    port_control_end();
+}
+
+/* The guards' verdict on a branch given a start that unexpectedly succeeds:
+ * exactly one start, and it listened; the branch recorded its one failed
+ * expectation and stopped that server. A start that failed for a reason of
+ * its own, a second start or a server left live is another outcome, never
+ * accepted in its place. */
+static bool unexpected_start_handled(const branch_outcome_t *o)
+{
+    return o->starts == 1 && o->listening == 1 && !o->setup_failed &&
+           o->failed == 1 && !o->live_after;
+}
+
+static void print_outcome(const char *branch, const branch_outcome_t *o)
+{
+    printf("port guards, %s: %u start(s), %u listening, setup failure %s, "
+           "%d failed expectation(s), server live after %s\n", branch,
+           o->starts, o->listening, o->setup_failed ? "yes" : "no", o->failed,
+           o->live_after ? "yes" : "no");
+}
+
+/* Both branches as the guards run them, the held branch on `port`, both with
+ * `cert`: their outcomes, the failures they record set aside. */
+static void guarded_branches(const char *cert, const char *key, uint16_t port,
+                             branch_outcome_t *held, branch_outcome_t *setup)
+{
+    const int before = failures;
+    expecting_failures = true;
+    *held = held_branch(cert, key, port);
+    failures = before;
+    *setup = setup_failure_branch(cert, key);
+    failures = before;
+    expecting_failures = false;
+    print_outcome("held branch", held);
+    print_outcome("setup branch", setup);
+}
+
+/* The branches' own guards, against starts that unexpectedly succeed: the
+ * held branch given a port nobody holds, and the setup-failure branch given
+ * the real certificate. Each branch's one start must listen, and the branch
+ * must record its one failed expectation, stop that server and start no
+ * second one. The failures they record are this control's expected outcome,
+ * so they are counted and set aside. */
+static void run_port_guards(const char *cert, const char *key)
+{
+    port_control_begin();
+    const uint16_t free_port = moq_test_ipv4_free_port();
+    CHECK(free_port != 0);
+    if (free_port) {
+        branch_outcome_t held, setup;
+        guarded_branches(cert, key, free_port, &held, &setup);
+        CHECK(unexpected_start_handled(&held));
+        CHECK(unexpected_start_handled(&setup));
+    }
+    port_control_end();
+}
+
+/* The guards' negative: both branches given a certificate that does not
+ * exist, so each start fails with its port free -- a setup failure in place
+ * of the unexpected start. The held branch then records one failed
+ * expectation and leaves no server live, the outcome a count of failures and
+ * live servers alone would accept; but nothing listened, so the guards must
+ * refuse both branches. */
+static void run_port_guards_setup_failure(const char *key)
+{
+    port_control_begin();
+    const uint16_t free_port = moq_test_ipv4_free_port();
+    CHECK(free_port != 0);
+    if (free_port) {
+        branch_outcome_t held, setup;
+        guarded_branches("/nonexistent/moq-test-cert.pem", key, free_port,
+                         &held, &setup);
+        CHECK(held.starts == 1 && held.listening == 0 && held.setup_failed &&
+              held.failed == 1 && !held.live_after);
+        CHECK(setup.starts == 1 && setup.listening == 0 && setup.setup_failed &&
+              setup.failed == 0 && !setup.live_after);
+        CHECK(!unexpected_start_handled(&held));
+        CHECK(!unexpected_start_handled(&setup));
+    }
+    port_control_end();
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 4 && !strcmp(argv[1], "--port-guards")) {
+        run_port_guards(argv[2], argv[3]);
+        printf("%s: pico_wt managed drain retained: an unexpected start is "
+               "recorded and stopped, never overwritten\n",
+               failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--port-guards-setup-failure")) {
+        run_port_guards_setup_failure(argv[2]);
+        printf("%s: pico_wt managed drain retained: the guards refuse a setup "
+               "failure in place of an unexpected start\n",
+               failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
+    }
+    if (argc == 4 && !strcmp(argv[1], "--port-control")) {
+        run_port_controls(argv[2], argv[3]);
+        printf("%s: pico_wt managed drain retained: a held port is left for "
+               "a fresh one, a setup failure ends the starts\n",
+               failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
+    }
     if (argc < 3) {
         printf("SKIP: pico_wt managed drain retained (no cert/key)\n");
         return 0;
     }
-    srand((unsigned)getpid());
-    int port = 17200 + (rand() % 400);
     int before = failures;
-    run_row(port, argv[1], argv[2], false);
+    run_row(argv[1], argv[2], false);
     printf("%s: pico_wt managed drain holds for retained output\n",
            failures == before ? "PASS" : "FAIL");
     before = failures;
-    run_row(port + 5, argv[1], argv[2], true);
+    run_row(argv[1], argv[2], true);
     printf("%s: pico_wt managed drain holds for retained output, a pass in flight at arming is not observed\n",
            failures == before ? "PASS" : "FAIL");
     before = failures;
-    run_hold_timeout_negative(port + 10, argv[1], argv[2]);
+    run_hold_timeout_negative(argv[1], argv[2]);
     printf("%s: pico_wt managed forced hold: a timed-out hold is recorded and rejected\n",
            failures == before ? "PASS" : "FAIL");
     return failures ? 1 : 0;

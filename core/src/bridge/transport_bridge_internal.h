@@ -407,6 +407,9 @@ struct moq_transport_bridge {
      * comes back to its stream instead of the pending FIFO. */
     bool                   pump_hand_back;
     bool                   pump_handed_back;
+    /* The pump's write was refused (handed back, or retained after a part
+     * of it went). */
+    bool                   pump_refused;
     uint64_t               dq_bytes;       /* bytes queued across dstreams */
     uint32_t               dq_items;       /* actions queued across dstreams */
     uint64_t               max_retained_bytes;

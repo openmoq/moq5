@@ -774,6 +774,11 @@ void moq_pq_test_endpoint(moq_pq_conn_t *conn,
     *ctx = &conn->endpoint_ctx;
 }
 
+moq_transport_endpoint_ops_t *moq_pq_test_endpoint_ops(moq_pq_conn_t *conn)
+{
+    return &conn->endpoint_ops;
+}
+
 void moq_pq_test_fail_stream_ctx(int n)
 {
     g_pq_test_fail_stream_ctx = n;

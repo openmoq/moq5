@@ -570,10 +570,15 @@ jobs:
       # behaviour; it needs picoquic-test, which this lane builds.
       # endpoint_wt_target verifies the service CONNECT target at adapter
       # creation without starting a transport, including allocation failures.
+      # pq_sim_shared_admission and pico_wt_shared_admission pin shared send
+      # admission over picoquic-test's simulated link.
+      # pico_wt_managed_drain_retained runs over real loopback; its
+      # _port_control, _port_guards and _port_guards_setup_failure rows check
+      # its server-port handling.
       - name: Test (pico_wt regression + conformance)
         run: >
           ctest --test-dir build/pico-wt-ci --output-on-failure --no-tests=error
-          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pq_provider_stream_credit|pq_sim_reliable_reset|pq_stop_release|pq_terminal|pq_terminal_provider|pico_wt_terminal|pico_wt_reliable_reset|pico_wt_d18|pico_wt_stop_release|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_loopback_private|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_reset_after_fin|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|endpoint_resolve|endpoint_wt_target|endpoint_pico_terminal)$'
+          -R '^(pq_close_reason|pq_close_reason_oom|pq_reset_after_fin|pq_provider_stream_credit|pq_sim_reliable_reset|pq_sim_shared_admission|pq_stop_release|pq_terminal|pq_terminal_provider|pico_wt_terminal|pico_wt_reliable_reset|pico_wt_d18|pico_wt_stop_release|pico_wt_public_compile|pico_wt_capsule_sequence|pico_wt_loopback|pico_wt_loopback_private|pico_wt_conformance|pico_wt_managed_early_streams|pico_wt_managed_edges|pico_wt_rx_lifecycle|pico_wt_backpressure|pico_wt_hold_input|pico_wt_shared_admission|pico_wt_reset_after_fin|pico_wt_managed_keepalive|pico_wt_managed_keepalive_server|pico_wt_managed_stop_close|pico_wt_managed_pump_exit_close|pico_wt_managed_cfg_abi|pico_wt_managed_drain_retained|pico_wt_managed_drain_retained_port_control|pico_wt_managed_drain_retained_port_guards|pico_wt_managed_drain_retained_port_guards_setup_failure|endpoint_resolve|endpoint_wt_target|endpoint_pico_terminal)$'
 
       # Static archives conceal private references crossing adapter DSOs.
       # Require complete shared-library links, including the managed facade.

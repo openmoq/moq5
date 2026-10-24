@@ -519,6 +519,36 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     add_test(NAME pico_wt_backpressure COMMAND test_pico_wt_backpressure)
     set_tests_properties(pico_wt_backpressure PROPERTIES TIMEOUT 180)
 
+    # Shared send admission over the real adapter: its queue kept full, the
+    # capability advertised and withdrawn, what the subscriber receives
+    # compared, coalesced and standalone FINs while the budget is spent.
+    # Compiles the adapter sources in, as the backpressure test does, for the
+    # connection's endpoint vtable and queue.
+    add_executable(test_pico_wt_shared_admission
+        tests/test_pico_wt_shared_admission.c
+        tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_shared_admission PRIVATE
+        MOQ_PICO_WT_TESTING
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    target_include_directories(test_pico_wt_shared_admission PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_shared_admission PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_shared_admission PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_shared_admission COMMAND test_pico_wt_shared_admission)
+    set_tests_properties(pico_wt_shared_admission PROPERTIES TIMEOUT 300)
+
     # Receive-backpressure lifecycle: what happens to a paused stream on FIN,
     # RESET, STOP_SENDING, teardown, and before the connection is READY.
     # Recompiles the adapter sources so the test build can reach the
@@ -1001,6 +1031,28 @@ endif()\n")
                 "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
         set_tests_properties(pico_wt_managed_drain_retained PROPERTIES
             TIMEOUT 120 LABELS "network;pico_wt;managed")
+        # Its server-port classification alone, against a held port and a
+        # failing setup.
+        add_test(NAME pico_wt_managed_drain_retained_port_control
+            COMMAND test_pico_wt_managed_drain_retained --port-control
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained_port_control
+            PROPERTIES TIMEOUT 60 LABELS "network;pico_wt;managed")
+        # Its own guards, against starts that unexpectedly succeed.
+        add_test(NAME pico_wt_managed_drain_retained_port_guards
+            COMMAND test_pico_wt_managed_drain_retained --port-guards
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained_port_guards
+            PROPERTIES TIMEOUT 60 LABELS "network;pico_wt;managed")
+        # Those guards refuse a setup failure in place of an unexpected
+        # start.
+        add_test(NAME pico_wt_managed_drain_retained_port_guards_setup_failure
+            COMMAND test_pico_wt_managed_drain_retained --port-guards-setup-failure
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained_port_guards_setup_failure
+            PROPERTIES TIMEOUT 60 LABELS "network;pico_wt;managed")
     endif()
 
     # Managed client pre-accept stream buffer: chunk order and FIN, the stream
@@ -1058,6 +1110,11 @@ endif()\n")
             set_tests_properties(pico_wt_managed_client PROPERTIES
                 TIMEOUT 30
                 LABELS "network;pico_wt;managed")
+            # Its wait loop alone, against waits that return at once.
+            add_test(NAME pico_wt_managed_client_early_wake
+                COMMAND test_pico_wt_managed_client --early-wake-control)
+            set_tests_properties(pico_wt_managed_client_early_wake PROPERTIES
+                TIMEOUT 30 LABELS "pico_wt;managed")
         endif()
 
         # Managed server <-> managed client, both in-process, each on

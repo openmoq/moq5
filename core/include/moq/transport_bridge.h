@@ -241,6 +241,10 @@ typedef enum moq_transport_cap {
     MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT = 1u << 5,
     /* The endpoint calls moq_transport_bridge_on_stream_drained(). */
     MOQ_TRANSPORT_CAP_STREAM_DRAINED = 1u << 6,
+    /* write() and write_payload() refuse only when the connection-wide
+     * budget for the stream bytes the endpoint holds is spent (see "Shared
+     * admission" below). */
+    MOQ_TRANSPORT_CAP_SHARED_ADMISSION = 1u << 7,
 } moq_transport_cap_t;
 
 /* Private ingress outcome of on_peer_uni_bytes / on_peer_uni_rcbuf /
@@ -271,6 +275,28 @@ typedef enum moq_transport_cap {
  *
  * write() and write_payload(): all-or-nothing. Consume all bytes or
  * reject with WOULD_BLOCK. No partial consumption.
+ *
+ * Without MOQ_TRANSPORT_CAP_SHARED_ADMISSION a refused write holds back only
+ * its own stream: the bridge goes on to the next ready stream.
+ *
+ * -- Shared admission (MOQ_TRANSPORT_CAP_SHARED_ADMISSION) --
+ *
+ * The endpoint holds the stream bytes it accepts in one budget for the whole
+ * connection, and write() and write_payload() return WOULD_BLOCK only when
+ * that budget is spent. Such a refusal is not about its stream: no write
+ * adding bytes to any stream can be accepted until the endpoint has capacity
+ * again -- once its transport takes queued bytes, which happens between
+ * bridge services, or once it drops a stream's queued bytes for a reset the
+ * bridge issues. A write of no bytes with FIN may still be accepted while the
+ * budget is spent (the endpoint can mark the FIN on bytes it still holds for
+ * that stream). The results of open_uni, open_bidi, reset_stream,
+ * reset_stream_at, abort_stream, stop_sending and close_transport keep their
+ * own meaning.
+ *
+ * After such a refusal, the bridge offers no further write adding bytes in
+ * that hand-off of queued data, unless a reset it issues there is accepted;
+ * FIN-only writes and resets still go. It offers data again at its next
+ * hand-off.
  *
  * -- Reset/stop/close contract --
  *
