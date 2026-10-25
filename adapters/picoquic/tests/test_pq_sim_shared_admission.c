@@ -30,6 +30,8 @@
 #include "pq_test_seam.h"
 #include "../../../tests/support/fin_obligations.h"
 #include "../../../tests/unit/test_binding_support.h"
+#include "../../../core/src/session/session_internal.h"
+#include "../../../core/src/bridge/transport_bridge_internal.h"
 
 #include <picoquictest_internal.h>
 #include <picoquic_utils.h>
@@ -200,6 +202,9 @@ static void sim_cleanup(pq_sim_t *s)
 
 typedef struct {
     moq_transport_endpoint_ops_t orig;
+    moq_transport_bridge_t *bridge;
+    bool (*orig_budget_spent)(void *);
+    uint64_t budget_queries;
     moq_pq_send_queue_t *queue;
     uint32_t refused;            /* writes the queue refused */
     uint32_t coalesced_spent;    /* FIN-only, onto held bytes, budget spent: taken */
@@ -256,8 +261,17 @@ static moq_transport_result_t tap_write_payload(void *ctx, uint64_t sid,
     return rc;
 }
 
-/* Wrap the publisher's writes; withdraw the capability unless `advertise`. */
-static void tap_install(moq_pq_conn_t *conn, bool advertise)
+static bool tap_budget_spent(void *ctx)
+{
+    g_tap.budget_queries++;
+    return g_tap.orig_budget_spent(ctx);
+}
+
+/* The bridge imports the optional query at create. This fixture changes the
+ * endpoint afterward, so change both its flag and imported query together.
+ * The counting wrapper stays installed even in the withdrawn arm: retaining
+ * it by mistake in the bridge must make that arm's zero-query oracle fail. */
+static bool tap_install(moq_pq_conn_t *conn, bool advertise)
 {
     memset(&g_tap, 0, sizeof(g_tap));
     const moq_transport_endpoint_ops_t *cops;
@@ -265,12 +279,32 @@ static void tap_install(moq_pq_conn_t *conn, bool advertise)
     moq_pq_test_endpoint(conn, &cops, &ctx);
     g_tap.queue = ((pq_endpoint_ctx_t *)ctx)->queue;
     moq_transport_endpoint_ops_t *ops = moq_pq_test_endpoint_ops(conn);
+    moq_session_t *session = moq_pq_conn_session(conn);
+    moq_transport_bridge_t *bridge = session
+        ? (moq_transport_bridge_t *)session->transport_owner : NULL;
+    CHECK(bridge != NULL && bridge->session == session && bridge->ops == cops);
+    if (!bridge || bridge->session != session || bridge->ops != cops) return false;
     CHECK((ops->capabilities & MOQ_TRANSPORT_CAP_SHARED_ADMISSION) != 0);
+    CHECK(bridge->budget_spent != NULL && bridge->budget_spent == ops->budget_spent);
+    if (!bridge->budget_spent || bridge->budget_spent != ops->budget_spent) return false;
     g_tap.orig = *ops;
-    if (!advertise)
+    g_tap.bridge = bridge;
+    g_tap.orig_budget_spent = bridge->budget_spent;
+    ops->budget_spent = tap_budget_spent;
+    bridge->budget_spent = tap_budget_spent;
+    if (!advertise) {
         ops->capabilities &= ~(uint32_t)MOQ_TRANSPORT_CAP_SHARED_ADMISSION;
+        bridge->budget_spent = NULL;
+    }
     ops->write = tap_write;
     if (ops->write_payload) ops->write_payload = tap_write_payload;
+    return true;
+}
+
+static void tap_remove(moq_pq_conn_t *conn)
+{
+    *moq_pq_test_endpoint_ops(conn) = g_tap.orig;
+    g_tap.bridge->budget_spent = g_tap.orig_budget_spent;
 }
 
 /* -- subscriptions, data and what the subscriber received ---------------- */
@@ -601,7 +635,12 @@ static bool run_case(moq_version_t ver, uint8_t cid, bool advertise, run_t *r)
         ok = subscribe(&s, t, &tr[t]) == 0;
         CHECK(ok);
     }
-    if (ok) tap_install(s.server_conn, advertise);
+    bool tapped = false;
+    if (ok) {
+        ok = tap_install(s.server_conn, advertise);
+        CHECK(ok);
+        tapped = ok;
+    }
 
     /* LATE's subgroups stay open until all their objects have arrived. */
     moq_subgroup_handle_t late[LATE_GROUPS];
@@ -645,10 +684,9 @@ static bool run_case(moq_version_t ver, uint8_t cid, bool advertise, run_t *r)
     CHECK(r->rx.repeats == 0);
     for (int t = 0; t < NTRACKS; t++) CHECK(r->rx.resets[t] == 0);
     r->tap = g_tap;
-    if (s.server_conn) {
-        moq_pq_test_endpoint_ops(s.server_conn)->write = g_tap.orig.write;
-        moq_pq_test_endpoint_ops(s.server_conn)->write_payload =
-            g_tap.orig.write_payload;
+    if (tapped) {
+        CHECK(advertise ? g_tap.budget_queries > 0 : g_tap.budget_queries == 0);
+        tap_remove(s.server_conn);
     }
     sim_cleanup(&s);
     return ok;
@@ -697,6 +735,12 @@ int main(void)
         CHECK(same_rx(&adv.rx, &again.rx));
         CHECK(same_rx(&adv.rx, &wd.rx));
         CHECK(adv.tap.refused < wd.tap.refused);
+        CHECK(adv.tap.budget_queries > 0 && again.tap.budget_queries > 0);
+        CHECK(wd.tap.budget_queries == 0);
+        printf("d%d: actual budget queries advertised/repeat/withdrawn %llu/%llu/%llu\n",
+               draft_of(versions[v]), (unsigned long long)adv.tap.budget_queries,
+               (unsigned long long)again.tap.budget_queries,
+               (unsigned long long)wd.tap.budget_queries);
         const run_t *both[2] = { &adv, &wd };
         for (int i = 0; i < 2; i++) {
             CHECK(both[i]->tap.coalesced_spent > 0);

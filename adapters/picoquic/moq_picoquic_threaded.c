@@ -181,7 +181,13 @@ static void server_conn_free(moq_pq_threaded_t *t,
 static void server_conn_after_callback(moq_pq_conn_t *conn, void *user_ctx)
 {
     struct moq_pq_threaded_conn *c = (struct moq_pq_threaded_conn *)user_ctx;
-    if (!c || !c->cnx) return;
+    if (!c) return;
+    uint64_t events = moq_pq_conn_event_count(conn);
+    if (events != c->events_seen) {
+        c->events_seen = events;
+        if (c->parent) c->parent->input_seq++;
+    }
+    if (!c->cnx) return;
     if (!moq_pq_conn_cnx_released(conn)) return;
 
     c->cnx = NULL;
@@ -830,6 +836,7 @@ static int server_callback(picoquic_cnx_t *cnx,
         /* An explicit adapter keepalive applies to every connection this
          * facade owns, accepted server connections included. No-op when 0. */
         pq_threaded_arm_keep_alive(t, cnx);
+        t->input_seq++;
         pthread_mutex_lock(&t->mutex);
         if (t->negotiated == 0) t->negotiated = c->negotiated;
         pthread_mutex_unlock(&t->mutex);
@@ -1006,6 +1013,14 @@ int64_t moq_pq_threaded_test_deadline_until(uint64_t deadline_us, uint64_t now_u
 {
     return deadline_until_us(deadline_us, now_us);
 }
+/* Test-only: the server connection hook (moq_pq_conn_cfg_t.after_callback of
+ * every accepted connection), for a test that ties a connection's picoquic
+ * callbacks to the facade's input sequence without a handshake. */
+void moq_pq_threaded_test_conn_hook(moq_pq_conn_t *conn, void *user_ctx);
+void moq_pq_threaded_test_conn_hook(moq_pq_conn_t *conn, void *user_ctx)
+{
+    server_conn_after_callback(conn, user_ctx);
+}
 #endif
 
 int moq_pq_threaded_loop_callback(picoquic_quic_t *quic,
@@ -1143,10 +1158,24 @@ static int loop_callback_pump(picoquic_quic_t *quic,
      * stays up (only endpoint-wide failures terminate the packet loop). --- */
     if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
         uint64_t snow = picoquic_get_quic_time(quic);
+        /* A receive that brought no connection input (acknowledgements and
+         * flow-control credit raise no callback) leaves every connection
+         * where the last pass's post-pump service left it, so the service
+         * before the pump has nothing to take in; it is skipped. The pump,
+         * the service after it, the drain publication and the activity
+         * mark run as on every pass. */
+        bool quiet = cb_mode == picoquic_packet_loop_after_receive &&
+                     t->input_seq == t->input_served;
+        /* Input arriving from here on is new to the next receive. */
+        t->input_served = t->input_seq;
         /* The pass runs, and pumps, with no connection too: an application
          * may have work of its own (another lane's push, a timer) whatever
          * its connection count. */
-        server_service_all(t, snow);
+        if (quiet) {
+            if (t->stats_enabled) t->st_quiet_recv++;
+        } else {
+            server_service_all(t, snow);
+        }
 
         if (t->on_lane_pump) {
             t->in_lane_pump = true;
@@ -2082,7 +2111,8 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
             "pkts_per_positive_send_avg=%.2f pkts_per_send_max=%llu "
             "after_recv=%llu wake=%llu service_all=%llu "
             "prepare=%llu provided=%llu q_high_water=%llu q_would_block=%llu "
-            "cwin=%llu rtt_us=%llu pacing_Bps=%llu bytes_sent=%llu\n",
+            "cwin=%llu rtt_us=%llu pacing_Bps=%llu bytes_sent=%llu "
+            "quiet_recv=%llu\n",
             t->perspective == MOQ_PERSPECTIVE_SERVER ? "server" : "client",
             (unsigned long long)t->st_after_send,
             (unsigned long long)t->st_after_send_nz,
@@ -2098,7 +2128,8 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
             (unsigned long long)agg.queue_would_block,
             (unsigned long long)q.cwin, (unsigned long long)q.rtt,
             (unsigned long long)q.pacing_rate,
-            (unsigned long long)q.bytes_sent);
+            (unsigned long long)q.bytes_sent,
+            (unsigned long long)t->st_quiet_recv);
     }
 
     pthread_mutex_lock(&t->mutex);

@@ -135,9 +135,30 @@ static inline void held_bridge_replay(moq_transport_bridge_t *b, uint64_t now)
     else HELD_REQUIRE(test_replay_uni(h, b, now) == MOQ_OK);
 }
 
+/* Every stream entry holding inbound work -- an admission mark, a retained
+ * retry, a deferred RESET or STOP -- keeps the bridge's inbound walk due: an
+ * entry left with inbound_due clear would never be retried. Checked around
+ * every service the driver runs. */
+static inline void held_bridge_inbound_due_check(const moq_transport_bridge_t *b,
+                                                 const char *when)
+{
+    if (!b || b->inbound_due || b->fatal || b->closed) return;
+    for (uint32_t i = 0; i < b->max_streams; i++) {
+        const bridge_stream_entry_t *e = &b->streams[i];
+        if (e->active && (e->pending_admission || e->pending_retry ||
+                          e->pending_reset || e->pending_stop)) {
+            fprintf(stderr, "FAIL: inbound work at entry %u with inbound_due "
+                    "clear (%s)\n", (unsigned)i, when);
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
 static inline moq_result_t held_bridge_service(moq_transport_bridge_t *b, uint64_t now)
 {
+    held_bridge_inbound_due_check(b, "before service");
     moq_result_t rc = moq_transport_bridge_service(b, now);
+    held_bridge_inbound_due_check(b, "after service");
     if (rc == MOQ_OK || (b && moq_transport_bridge_is_terminal(b))) held_bridge_replay(b, now);
     return rc;
 }
@@ -145,7 +166,9 @@ static inline moq_result_t held_bridge_service(moq_transport_bridge_t *b, uint64
 static inline moq_result_t held_bridge_service_budgeted(moq_transport_bridge_t *b,
     uint64_t now, uint32_t budget, moq_bridge_budgeted_result_t *result)
 {
+    held_bridge_inbound_due_check(b, "before budgeted service");
     moq_result_t rc = moq_transport_bridge_service_budgeted(b, now, budget, result);
+    held_bridge_inbound_due_check(b, "after budgeted service");
     if (rc == MOQ_OK || (b && moq_transport_bridge_is_terminal(b))) held_bridge_replay(b, now);
     return rc;
 }

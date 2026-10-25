@@ -244,6 +244,11 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c)
         set_tests_properties(relay_signal_order
             PROPERTIES LABELS "relay" TIMEOUT 30)
+        add_test(NAME relay_coord_wake_order COMMAND ${MOQR_WIRE_BASH}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_coord_wake_order.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c)
+        set_tests_properties(relay_coord_wake_order
+            PROPERTIES LABELS "relay" TIMEOUT 30)
         add_test(NAME relay_log_sink_wiring COMMAND ${MOQR_WIRE_BASH}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_log_sink_wiring.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c
@@ -908,6 +913,38 @@ if(TARGET moq::adapter-msquic-managed)
                 set_tests_properties(relay_pq_serve_d${_d}
                     PROPERTIES TIMEOUT 120 LABELS "relay;picoquic")
             endforeach()
+            # The serve coordinator wakes for its own work (signals, row
+            # publications) over the production PicoQUIC serve, with no
+            # client and the health fallback disabled.
+            add_executable(test_relay_coord_wake
+                tests/test_relay_coord_wake.c tests/pq_serve_cli_tu.c
+                cli/admin_listen.c cli/cliargs.c cli/config.c
+                cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c
+                cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c)
+            target_compile_definitions(test_relay_coord_wake PRIVATE
+                MOQR_PUMP_TESTING MOQR_HAVE_PICOQUIC)
+            target_link_libraries(test_relay_coord_wake PRIVATE moqr-admin
+                moq::adapter-msquic-managed moq::adapter-picoquic-threaded
+                Threads::Threads)
+            target_include_directories(test_relay_coord_wake PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_coord_wake PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME relay_coord_wake
+                COMMAND test_relay_coord_wake ${MOQR_TEST_CERT} ${MOQR_TEST_KEY})
+            set_tests_properties(relay_coord_wake
+                PROPERTIES TIMEOUT 240 LABELS "relay;picoquic")
+            # A serve that cannot be settled ends the process before another
+            # case can reuse its state.
+            add_test(NAME relay_coord_wake_stuck_control
+                COMMAND test_relay_coord_wake ${MOQR_TEST_CERT} ${MOQR_TEST_KEY}
+                    control-stuck)
+            set_tests_properties(relay_coord_wake_stuck_control
+                PROPERTIES TIMEOUT 60 LABELS "relay;picoquic")
             # Traffic while serve is still publishing its facade.
             add_test(NAME relay_pq_serve_d18_early_traffic
                 COMMAND test_relay_pq_serve ${MOQR_TEST_CERT} ${MOQR_TEST_KEY}

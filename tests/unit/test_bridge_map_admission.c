@@ -16,6 +16,12 @@ static uint64_t payload_gate_sid = UINT64_MAX;
 static const uint8_t *payload_gate_data;
 static size_t payload_gate_len;
 static unsigned payload_refusals;
+static struct {
+    bool enabled, spent, hold_fin;
+    unsigned queries, spent_queries, false_queries;
+    unsigned byte_offers, data_offers, request_offers;
+    uint64_t data_sid, request_sid;
+} budget;
 #define REQUIRE(x) do { ++checks; if (!(x)) { ++failures; \
     fprintf(stderr, "FAIL %s:%d: %s\n", row_name, __LINE__, #x); \
     return false; } } while (0)
@@ -37,6 +43,16 @@ typedef struct fixture {
     uint64_t existing_sid;
 } fixture_t;
 
+/* Observation only: accepting an empty FIN does not replenish this budget. */
+static bool fixture_budget_spent(void *ctx)
+{
+    (void)ctx;
+    ++budget.queries;
+    if (budget.spent) ++budget.spent_queries;
+    else ++budget.false_queries;
+    return budget.spent;
+}
+
 /* During one retry phase a prior mapped response is refused while its later
  * FIN would fit. The production ordering gate, not the fake's stream-wide
  * block, must keep that FIN behind the refused response. */
@@ -44,6 +60,19 @@ static moq_transport_result_t write_with_body_gate(void *ctx, uint64_t sid,
     const uint8_t *data, size_t len, bool fin)
 {
     fake_endpoint_t *ep = ctx;
+    if (budget.enabled && budget.spent) {
+        if (len > 0) {
+            ++budget.byte_offers;
+            if (sid == budget.data_sid) ++budget.data_offers;
+            if (sid == budget.request_sid) ++budget.request_offers;
+            ep->block_count++;
+            return MOQ_TRANSPORT_WOULD_BLOCK;
+        }
+        if (fin && budget.hold_fin) {
+            ep->block_count++;
+            return MOQ_TRANSPORT_WOULD_BLOCK;
+        }
+    }
     if (sid == payload_gate_sid && data == payload_gate_data &&
         len == payload_gate_len) {
         ++payload_refusals;
@@ -166,6 +195,10 @@ static bool create_pair(fixture_t *f, moq_version_t version,
     held_endpoint_init(&p->cep, 1000, 2000);
     held_endpoint_init(&p->sep, 3000, 4000);
     p->cep.vtable.write = write_with_body_gate;
+    if (budget.enabled) {
+        p->cep.vtable.capabilities |= MOQ_TRANSPORT_CAP_SHARED_ADMISSION;
+        p->cep.vtable.budget_spent = fixture_budget_spent;
+    }
     if (hold_server) p->sep.vtable.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
     moq_transport_bridge_cfg_t bc;
     moq_transport_bridge_cfg_init(&bc, &p->calloc);
@@ -387,10 +420,10 @@ static bool open_group(fixture_t *f, uint64_t group, moq_subgroup_handle_t *out,
     return true;
 }
 
-static bool output_setup(fixture_t *f, uint32_t pending)
+static bool output_setup_maps(fixture_t *f, uint32_t pending, uint32_t maps)
 {
     rl_pair_t *p = &f->p;
-    REQUIRE(create_pair(f, MOQ_VERSION_DRAFT_18, 5, 12, pending, false));
+    REQUIRE(create_pair(f, MOQ_VERSION_DRAFT_18, maps, 12, pending, false));
     REQUIRE(establish(f));
     moq_bytes_t part = MOQ_BYTES_LITERAL("map-admission");
     moq_subscribe_cfg_t cfg;
@@ -428,6 +461,11 @@ static bool output_setup(fixture_t *f, uint32_t pending)
     REQUIRE(p->cb->pending_count == 0 && p->cb->dq_items == 0);
     fake_endpoint_clear_ops(&p->cep);
     return true;
+}
+
+static bool output_setup(fixture_t *f, uint32_t pending)
+{
+    return output_setup_maps(f, pending, 5);
 }
 
 static bool queue_status(moq_session_t *s, uint64_t now,
@@ -814,6 +852,155 @@ static const bridge_dstream_t *data_queue(const moq_transport_bridge_t *b,
     return NULL;
 }
 
+/* Full pending capacity and an already-spent shared budget intersect here.
+ * A mapped FIN releases the map, but not byte capacity. A mapped sibling's
+ * byte-bearing head must stay queued; the ordinary request retry may open,
+ * then must retain its actually refused body until explicit budget release. */
+static bool full_pending_budget_fin(fixture_t *f, bool in_dstream)
+{
+    rl_pair_t *p = &f->p;
+    ADMISSION_SETUP(budget.enabled && !budget.spent);
+    ADMISSION_SETUP(output_setup_maps(f, 1, 6));
+    ADMISSION_SETUP(p->cb->max_pending == 1 && p->cb->max_streams == 6);
+    ADMISSION_SETUP((p->cep.vtable.capabilities & MOQ_TRANSPORT_CAP_SHARED_ADMISSION) != 0);
+    ADMISSION_SETUP((p->cep.vtable.capabilities & MOQ_TRANSPORT_CAP_WRITE_PAYLOAD) == 0);
+    ADMISSION_SETUP(p->cep.vtable.budget_spent == fixture_budget_spent);
+    ADMISSION_SETUP(budget.queries > 0 && budget.false_queries > 0);
+
+    moq_subgroup_handle_t sibling;
+    moq_stream_ref_t sibling_ref;
+    ADMISSION_SETUP(open_group(f, 1, &sibling, &sibling_ref));
+    ADMISSION_SETUP(write_object(p, sibling, 0));
+    ADMISSION_SETUP(service(p->cb, &p->now));
+    const bridge_stream_entry_t *mapped = bridge_find_by_ref(p->cb, sibling_ref);
+    ADMISSION_SETUP(mapped != NULL && mapped->origin == BRIDGE_ORIGIN_LOCAL);
+    uint64_t sibling_sid = mapped->transport_id;
+    budget.data_sid = sibling_sid;
+    ADMISSION_SETUP(moq_transport_bridge_stream_count(p->cb) == 5);
+    ADMISSION_SETUP(p->cb->pending_count == 0 && p->cb->dq_items == 0);
+    fake_endpoint_clear_ops(&p->cep);
+
+    budget.spent = true;
+    budget.hold_fin = true;
+    if (in_dstream) {
+        ADMISSION_SETUP(moq_session_close_subgroup(p->c, f->existing, ++p->now) == MOQ_OK);
+        ADMISSION_SETUP(service(p->cb, &p->now));
+        ADMISSION_SETUP(core_fin_count(p->c, f->existing_ref) == 0);
+        ADMISSION_SETUP(dstream_fin_count(p->cb, f->existing_ref) == 1);
+        ADMISSION_SETUP(p->cb->pending_count == 0 && p->cep.block_count > 0);
+    }
+    ADMISSION_SETUP(write_object(p, sibling, 1));
+    ADMISSION_SETUP(moq_session_close_subgroup(p->c, sibling, ++p->now) == MOQ_OK);
+    bytes_t expected_data;
+    ADMISSION_SETUP(snapshot(p->c, sibling_ref, &expected_data));
+    ADMISSION_SETUP(expected_data.fins == 1);
+    moq_track_status_handle_t request;
+    ADMISSION_SETUP(queue_status(p->c, ++p->now, &request));
+    moq_stream_ref_t target = queued_open(p->c, MOQ_ACTION_OPEN_BIDI_STREAM);
+    ADMISSION_SETUP(target._v != 0);
+    bytes_t expected_request;
+    ADMISSION_SETUP(snapshot(p->c, target, &expected_request));
+    ADMISSION_SETUP(expected_request.fins == 1);
+    uint64_t sid = p->cep.next_bidi_id;
+    budget.request_sid = sid;
+    p->cep.block_open_bidi = true;
+    ADMISSION_SETUP(service(p->cb, &p->now));
+    ADMISSION_SETUP(p->cb->pending_count == 1);
+    ADMISSION_SETUP(p->cb->pending[0].kind == PENDING_OPEN_BIDI_DATA);
+    ADMISSION_SETUP(p->cb->pending[0].stream_ref._v == target._v);
+    ADMISSION_SETUP(bridge_find_by_ref(p->cb, target) == NULL);
+    const bridge_dstream_t *d = data_queue(p->cb, sibling_ref);
+    ADMISSION_SETUP(d != NULL && d->q_len == 2 && d->retained == 0);
+    const moq_action_t *head = &d->q[d->q_head].action;
+    ADMISSION_SETUP(head->kind == MOQ_ACTION_SEND_DATA && head->u.send_data.header_len > 0);
+    moq_rcbuf_t *payload = head->u.send_data.payload;
+    ADMISSION_SETUP(payload != NULL && moq_rcbuf_refcount(payload) == 1);
+    uint32_t head_at = d->q_head;
+    ADMISSION_SETUP(p->cb->dq_bytes == expected_data.len);
+    ADMISSION_SETUP(occupy_data(p->cb, p->c, 3900, ++p->now));
+    ADMISSION_SETUP(moq_transport_bridge_stream_count(p->cb) == 6);
+    if (!in_dstream) {
+        ADMISSION_SETUP(moq_session_close_subgroup(p->c, f->existing, ++p->now) == MOQ_OK);
+        ADMISSION_SETUP(core_fin_count(p->c, f->existing_ref) == 1);
+        ADMISSION_SETUP(dstream_fin_count(p->cb, f->existing_ref) == 0);
+    } else {
+        ADMISSION_SETUP(core_fin_count(p->c, f->existing_ref) == 0);
+        ADMISSION_SETUP(dstream_fin_count(p->cb, f->existing_ref) == 1);
+    }
+    ADMISSION_SETUP(p->cep.count == 0);
+
+    /* Empty FIN now fits, but all byte-adding writes still really refuse. */
+    budget.hold_fin = false;
+    p->cep.block_open_bidi = false;
+    unsigned queries_before = budget.spent_queries;
+    unsigned offers_before = budget.byte_offers;
+    int refusals_before = p->cep.block_count;
+    for (unsigned i = 0; i < 4; ++i) {
+        REQUIRE(service(p->cb, &p->now));
+        REQUIRE(budget.spent && p->cb->pending_count <= 1);
+    }
+    REQUIRE(budget.spent_queries > queries_before);
+    bytes_t actual;
+    REQUIRE(recorded(&p->cep, f->existing_sid, &actual));
+    REQUIRE(actual.len == 0 && actual.fins == 1);
+    REQUIRE(bridge_find_by_ref(p->cb, f->existing_ref) == NULL);
+    REQUIRE(core_fin_count(p->c, f->existing_ref) == 0);
+    REQUIRE(dstream_fin_count(p->cb, f->existing_ref) == 0);
+    REQUIRE(budget.data_offers == 0);
+    REQUIRE(budget.request_offers > 0 && budget.byte_offers == budget.request_offers);
+    REQUIRE(p->cep.block_count - refusals_before == (int)(budget.byte_offers - offers_before));
+    REQUIRE(count_op(&p->cep, FAKE_OP_OPEN_BIDI, sid, 0) == 1);
+    REQUIRE(moq_transport_bridge_stream_count(p->cb) == 6);
+    REQUIRE(p->cb->pending_count == 1);
+    const bridge_pending_item_t *pending = &p->cb->pending[0];
+    REQUIRE(pending->kind == PENDING_COPIED_WRITE && pending->fin);
+    REQUIRE(pending->stream_ref._v == target._v && pending->has_stream_id && pending->stream_id == sid);
+    REQUIRE(pending->data_len == expected_request.len);
+    REQUIRE(memcmp(pending->data, expected_request.data, expected_request.len) == 0);
+    for (size_t i = 0; i < p->cep.count; ++i) {
+        const fake_op_t *op = &p->cep.ops[i];
+        if (op->kind == FAKE_OP_WRITE)
+            REQUIRE(op->stream_id == f->existing_sid && op->data_len == 0 && op->fin);
+    }
+    d = data_queue(p->cb, sibling_ref);
+    REQUIRE(d != NULL && d->q_head == head_at && d->q_len == 2 && d->retained == 0);
+    REQUIRE(p->cb->dq_items == 2 && p->cb->dq_bytes == expected_data.len);
+    REQUIRE(d->q[d->q_head].action.u.send_data.stream_ref._v == sibling_ref._v);
+    REQUIRE(d->q[d->q_head].action.u.send_data.payload == payload);
+    REQUIRE(moq_rcbuf_refcount(d->q[d->q_head].action.u.send_data.payload) == 1);
+    REQUIRE(dstream_fin_count(p->cb, sibling_ref) == 1);
+
+    /* Only this explicit transport-budget release admits bodies again. */
+    budget.spent = false;
+    queries_before = budget.false_queries;
+    unsigned refused_bytes = budget.byte_offers;
+    for (unsigned i = 0; i < 4; ++i) REQUIRE(service(p->cb, &p->now));
+    REQUIRE(budget.false_queries > queries_before && budget.byte_offers == refused_bytes);
+    REQUIRE(recorded(&p->cep, sibling_sid, &actual));
+    REQUIRE(actual.len == expected_data.len && actual.fins == 1);
+    REQUIRE(memcmp(actual.data, expected_data.data, actual.len) == 0);
+    REQUIRE(bridge_find_by_ref(p->cb, sibling_ref) == NULL);
+    REQUIRE(recorded(&p->cep, sid, &actual));
+    REQUIRE(actual.len == expected_request.len && actual.fins == 1);
+    REQUIRE(memcmp(actual.data, expected_request.data, actual.len) == 0);
+    REQUIRE(count_op(&p->cep, FAKE_OP_OPEN_BIDI, sid, 0) == 1);
+    size_t fin_at = SIZE_MAX, open_at = SIZE_MAX, body_at = SIZE_MAX;
+    for (size_t i = 0; i < p->cep.count; ++i) {
+        const fake_op_t *op = &p->cep.ops[i];
+        if (op->kind == FAKE_OP_WRITE && op->stream_id == f->existing_sid && op->fin)
+            fin_at = i;
+        if (op->kind == FAKE_OP_OPEN_BIDI && op->stream_id == sid) open_at = i;
+        if (op->kind == FAKE_OP_WRITE && op->stream_id == sid) body_at = i;
+    }
+    REQUIRE(fin_at != SIZE_MAX && open_at > fin_at && body_at > open_at);
+    REQUIRE(p->cb->pending_count == 0 && p->cb->dq_items == 0 && p->cb->dq_bytes == 0);
+    REQUIRE(p->c->action_head == p->c->action_tail);
+    size_t before = p->cep.count;
+    for (unsigned i = 0; i < 3; ++i) REQUIRE(service(p->cb, &p->now));
+    REQUIRE(p->cep.count == before && !moq_transport_bridge_has_outbound_pending(p->cb));
+    return true;
+}
+
 /* The generic queue is full throughout partial DATA progress. The accepted
  * object header cannot be offered twice, and its refused payload must remain
  * owned at the same scheduler head ahead of the original FIN. */
@@ -1001,7 +1188,8 @@ static bool full_pending_request_ahead(fixture_t *f)
 static const char *const names[] = {
     "d16-hold", "d16-legacy", "bidi-full", "bidi-retry", "uni-picker",
     "uni-retry", "pending-terminal", "control-full", "control-retry",
-    "full-core-fin", "full-dq-fin", "full-payload", "full-request-ahead"
+    "full-core-fin", "full-dq-fin", "full-payload", "full-request-ahead",
+    "budget-core-fin", "budget-dq-fin"
 };
 
 int main(int argc, char **argv)
@@ -1017,6 +1205,9 @@ int main(int argc, char **argv)
         payload_gate_data = NULL;
         payload_gate_len = 0;
         payload_refusals = 0;
+        memset(&budget, 0, sizeof(budget));
+        budget.enabled = i >= 13;
+        budget.data_sid = budget.request_sid = UINT64_MAX;
         fixture_t *f = calloc(1, sizeof(*f));
         if (!f) { fprintf(stderr, "fixture allocation failed\n"); return 2; }
         int before = failures;
@@ -1027,7 +1218,8 @@ int main(int argc, char **argv)
         else if (i < 9) ok = control_open(f, i == 8);
         else if (i < 11) ok = full_pending_fin(f, i == 10);
         else if (i == 11) ok = full_pending_payload(f);
-        else ok = full_pending_request_ahead(f);
+        else if (i == 12) ok = full_pending_request_ahead(f);
+        else ok = full_pending_budget_fin(f, i == 14);
         if (f->p.cep.overflowed || f->p.cep.truncated ||
             f->p.sep.overflowed || f->p.sep.truncated) {
             ++failures;

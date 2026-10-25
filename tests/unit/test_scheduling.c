@@ -477,7 +477,29 @@ typedef struct {
     mt_t *mt;
     fake_endpoint_t sub_ep;
     uint64_t now;
+    void *ops_copy;   /* the publisher bridge's ops object, when not &mt->ops */
 } pair_t;
+
+/* How the next pair's publisher endpoint offers budget_spent to its bridge,
+ * which reads the op once, at create (see ops_apply). */
+typedef enum {
+    OPS_PLAIN,        /* no shared admission, no op */
+    OPS_REPORTED,     /* shared admission, op answering the model's budget */
+    OPS_SHORT_SIZE,   /* the op set, struct_size ending before it */
+    OPS_OLD_PREFIX,   /* an allocation of exactly the old struct, op absent */
+    OPS_POISON_TAIL,  /* the old struct followed by a poisoned op pointer */
+    OPS_NULL_OP,      /* full struct, op NULL */
+    OPS_FALSE_OP,     /* full struct, op always answering false */
+} ops_mode_t;
+static ops_mode_t g_ops_mode = OPS_PLAIN;
+/* Make ops_apply's copy allocation fail (the setup-failure control). */
+static bool g_ops_copy_fail = false;
+static void *ops_apply(mt_t *m, const moq_transport_endpoint_ops_t **ops);
+
+static bool ops_mode_needs_copy(ops_mode_t mode)
+{
+    return mode == OPS_OLD_PREFIX || mode == OPS_POISON_TAIL;
+}
 
 /* The session's queued actions with a delivery deadline, and those that are
  * not data, counted from its ring: what its summary (action_timed,
@@ -499,11 +521,23 @@ static void session_queue_recount(const moq_session_t *s, size_t *timed,
     }
 }
 
+/* Whether a subgroup owes a reset or terminal event while sg_reset_owed
+ * is clear: the per-action walks would then never find it. */
+static bool sg_owed_unflagged(const moq_session_t *s)
+{
+    if (s->sg_reset_owed) return false;
+    for (size_t i = 0; i < s->sg_cap; i++)
+        if (s->subgroups[i].state == MOQ_SG_RESET_OWED ||
+            s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) return true;
+    return false;
+}
+
 #define CHECK_SESSION_COUNTS(s) do { \
     size_t timed_, nondata_; \
     session_queue_recount((s), &timed_, &nondata_); \
     MOQ_TEST_CHECK_EQ_INT((int)(s)->action_timed, (int)timed_); \
     MOQ_TEST_CHECK_EQ_INT((int)(s)->action_nondata, (int)nondata_); \
+    MOQ_TEST_CHECK(!sg_owed_unflagged(s)); \
 } while (0)
 
 /* Peer uni bytes. These scenarios never run out of receive entries, so an
@@ -628,7 +662,13 @@ static bool pair_init_retained(pair_t *p, moq_version_t ver, size_t cap,
     bc.max_streams = max_streams;
     bc.max_retained_bytes = retained_cap;
     bc.max_pending = max_pending;
-    if (moq_transport_bridge_create(&bc, p->pub, &p->mt->ops, p->mt,
+    const moq_transport_endpoint_ops_t *pub_ops = &p->mt->ops;
+    p->ops_copy = ops_apply(p->mt, &pub_ops);
+    /* A mode that tests a historical prefix has no stand-in: without its
+     * copy the pair would run on the full current struct. */
+    if (ops_mode_needs_copy(g_ops_mode) && p->ops_copy == NULL)
+        return false;
+    if (moq_transport_bridge_create(&bc, p->pub, pub_ops, p->mt,
                                     &p->pub_br) != MOQ_OK)
         return false;
     p->mt->bridge = p->pub_br;
@@ -670,6 +710,7 @@ static void pair_destroy(pair_t *p)
     moq_session_destroy(p->sub);
     moq_session_destroy(p->pub);
     free(p->mt);
+    free(p->ops_copy);
 }
 
 /* Queued data items with a delivery deadline, counted from the queues: what
@@ -3464,8 +3505,11 @@ static bool retained_expiry_row(pair_t *p, uint64_t release_after_us,
     mt_stream_t *ast = mt_stream(p->mt, asid), *bst = mt_stream(p->mt, bsid);
     REG_REQUIRE(ast && bst && ast->data && bst->data);
     const uint32_t b_attempts = bst->write_attempts;
+    const uint32_t b_refused = bst->refused_writes;
     const size_t chunks_before = p->mt->nchunks;
     const uint64_t t0 = p->now, deadline = t0 + 1000;
+    /* D18/D22, no properties: zero object-ID delta, twelve-byte payload. */
+    static const uint8_t object_header[] = { 0x00, PAYLOAD_LEN };
     for (unsigned i = 0; i < 3; ++i) {
         uint8_t bytes[PAYLOAD_LEN] = { PAYLOAD_TAG, i == 0 ? 1 : 2, 1, 0,
                                        i == 2 ? 1 : 0 };
@@ -3478,16 +3522,21 @@ static bool retained_expiry_row(pair_t *p, uint64_t release_after_us,
     REG_REQUIRE(moq_session_close_subgroup(p->pub, bsg, p->now) == MOQ_OK);
     REG_REQUIRE(moq_session_next_deadline_us(p->pub) == deadline);
     ast->refuse_payload = true;
+    bst->refuse = true;
     REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
     /* A's object header went out, its payload was refused, and the public
      * max_pending=1 is now occupied. B's objects and FIN have left the core,
-     * but even their object headers have not been attempted at the endpoint. */
+     * but its mapped head can still run. A genuine B refusal keeps its first
+     * object header and every byte after it owned by the bridge until release. */
     REG_REQUIRE(ast->refused_writes > 0);
     REG_REQUIRE(p->mt->nchunks == chunks_before + 1);
-    REG_REQUIRE(p->mt->chunks[chunks_before].sid == asid);
+    const mt_chunk_t *first = &p->mt->chunks[chunks_before];
+    REG_REQUIRE(first->sid == asid && first->len == sizeof(object_header) &&
+                !first->fin && memcmp(first->head, object_header, sizeof(object_header)) == 0);
     REG_REQUIRE(!moq_session_has_pending_output(p->pub));
     REG_REQUIRE(moq_transport_bridge_has_pending(p->pub_br));
-    REG_REQUIRE(bst->write_attempts == b_attempts && bst->reset_attempts == 0);
+    REG_REQUIRE(bst->write_attempts > b_attempts && bst->refused_writes > b_refused &&
+                bst->reset_attempts == 0);
     /* The retained deadline must still wake the adapter. This observation is
      * nonfatal so an old baseline also reaches the late-delivery assertions. */
     MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
@@ -3497,21 +3546,47 @@ static bool retained_expiry_row(pair_t *p, uint64_t release_after_us,
     p->now = deadline - 1;
     REG_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
     REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
-    MOQ_TEST_CHECK_EQ_INT((int)bst->write_attempts, (int)b_attempts);
+    MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + 1);
     MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), deadline);
     for (unsigned i = 0; i < 3; ++i)
         MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(payload[i]), 2);
 
+    /* Earlier refused header attempts are legitimate; after expiry not even
+     * another object-header attempt may reach the now-writable endpoint. */
+    const uint32_t writes_before_release = bst->write_attempts;
     p->now = t0 + release_after_us;
     REG_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
     ast->refuse_payload = false;
+    bst->refuse = false;
     if (!regression_service(p)) return false;
     const bool expired = release_after_us >= 1000;
+    /* The exact accepted stream, bytes and FIN sequence: after the already
+     * accepted A header, A's body goes first. B follows only before expiry. */
+    const uint8_t *expected_bytes[] = {
+        object_header, moq_rcbuf_data(payload[0]),
+        object_header, moq_rcbuf_data(payload[1]),
+        object_header, moq_rcbuf_data(payload[2]), NULL,
+    };
+    const size_t expected_len[] = {
+        sizeof(object_header), PAYLOAD_LEN, sizeof(object_header), PAYLOAD_LEN,
+        sizeof(object_header), PAYLOAD_LEN, 0,
+    };
+    const size_t expected_count = expired ? 2u : 7u;
+    MOQ_TEST_CHECK_EQ_SIZE(p->mt->nchunks, chunks_before + expected_count);
+    for (size_t i = 0; i < expected_count && chunks_before + i < p->mt->nchunks; ++i) {
+        const mt_chunk_t *c = &p->mt->chunks[chunks_before + i];
+        MOQ_TEST_CHECK_EQ_U64(c->sid, i < 2 ? asid : bsid);
+        MOQ_TEST_CHECK_EQ_SIZE(c->len, expected_len[i]);
+        MOQ_TEST_CHECK(c->fin == (i == 6));
+        if (expected_len[i])
+            MOQ_TEST_CHECK(memcmp(c->head, expected_bytes[i], expected_len[i]) == 0);
+    }
     uint64_t fin_seq;
     MOQ_TEST_CHECK_EQ_SIZE(regression_fins(p->mt, bsid, &fin_seq), expired ? 0 : 1);
     MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, expired ? 1 : 0);
     if (expired) {
-        MOQ_TEST_CHECK_EQ_INT((int)bst->write_attempts, (int)b_attempts);
+        MOQ_TEST_CHECK_EQ_INT((int)bst->write_attempts, (int)writes_before_release);
         MOQ_TEST_CHECK(bst->reset);
         MOQ_TEST_CHECK_EQ_U64(bst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
         MOQ_TEST_CHECK_EQ_U64(bst->reset_reliable, b_header);
@@ -4199,6 +4274,8 @@ static void retained_owed_row(moq_version_t ver, bool expire, bool refuse_reset)
     }
     MOQ_TEST_CHECK_EQ_INT((int)sg->state, MOQ_SG_RESET_OWED);
     MOQ_TEST_CHECK_EQ_U64(sg->owed_reset_code, 1);
+    /* The production owe path arms the owed-reset walks. */
+    MOQ_TEST_CHECK(p.pub->sg_reset_owed);
     MOQ_TEST_CHECK_EQ_SIZE(p.pub->action_tail - p.pub->action_head, p.pub->action_cap);
     size_t expired = 0;
     for (size_t i = p.pub->action_head; i < p.pub->action_tail; ++i) {
@@ -4390,6 +4467,81 @@ static uint32_t mt_attempts(const mt_t *m)
     return n;
 }
 
+/* The model's budget_spent: exactly the condition its write refuses a write
+ * adding bytes on. */
+static uint32_t g_budget_queries = 0;
+static bool mt_budget_spent(void *ctx)
+{
+    const mt_t *m = ctx;
+    g_budget_queries++;
+    return m->queued >= m->cap;
+}
+
+/* Ops the bridge must never call: a budget_spent past the caller's object. */
+static uint32_t g_poison_calls = 0;
+static bool mt_budget_poison(void *ctx)
+{
+    (void)ctx;
+    g_poison_calls++;
+    return true;
+}
+
+static uint32_t g_false_queries = 0;
+static bool mt_budget_false(void *ctx)
+{
+    (void)ctx;
+    g_false_queries++;
+    return false;
+}
+
+/* Apply g_ops_mode to the model before its bridge is created. Every mode but
+ * OPS_PLAIN advertises shared admission. The two old-struct modes hand the
+ * bridge a separate allocation holding only the struct as it was before
+ * budget_spent (returned, for pair_destroy to free); OPS_POISON_TAIL follows
+ * it with a pointer to an op that counts any call. */
+static void *ops_apply(mt_t *m, const moq_transport_endpoint_ops_t **ops)
+{
+    const size_t old = offsetof(moq_transport_endpoint_ops_t, budget_spent);
+    if (g_ops_mode == OPS_PLAIN) return NULL;
+    mt_set_shared(m, true);
+    switch (g_ops_mode) {
+    case OPS_REPORTED:   m->ops.budget_spent = mt_budget_spent; break;
+    case OPS_NULL_OP:    m->ops.budget_spent = NULL; break;
+    case OPS_FALSE_OP:   m->ops.budget_spent = mt_budget_false; break;
+    case OPS_SHORT_SIZE:
+        m->ops.budget_spent = mt_budget_spent;
+        m->ops.struct_size = (uint32_t)old;
+        break;
+    case OPS_OLD_PREFIX:
+    case OPS_POISON_TAIL: {
+        bool (*poison)(void *) = mt_budget_poison;
+        const size_t len = old + (g_ops_mode == OPS_POISON_TAIL
+                                      ? sizeof(poison) : 0);
+        uint8_t *copy = g_ops_copy_fail ? NULL : malloc(len);
+        if (!copy) return NULL;
+        moq_transport_endpoint_ops_t prefix = m->ops;
+        prefix.struct_size = (uint32_t)old;
+        memcpy(copy, &prefix, old);
+        if (g_ops_mode == OPS_POISON_TAIL)
+            memcpy(copy + old, &poison, sizeof(poison));
+        *ops = (const moq_transport_endpoint_ops_t *)(void *)copy;
+        return copy;
+    }
+    default: break;
+    }
+    return NULL;
+}
+
+/* Make a pair whose publisher endpoint is in `mode`. */
+static bool pair_init_mode(pair_t *p, moq_version_t ver, size_t cap,
+                           ops_mode_t mode)
+{
+    g_ops_mode = mode;
+    const bool ok = pair_init(p, ver, cap, true);
+    g_ops_mode = OPS_PLAIN;
+    return ok;
+}
+
 #define SA_GROUPS 6
 
 typedef struct {
@@ -4495,37 +4647,177 @@ static bool sa_same_output(const mt_t *a, const mt_t *b)
  * that moved something, then the next round's pending head and hand-off. */
 static void test_shared_admission_refusals(void)
 {
+    /* Modes that must behave exactly as shared admission without the op:
+     * the op absent from the caller's struct (by size, or by a physically
+     * smaller allocation, with or without a poisoned pointer after it),
+     * NULL, or answering false. */
+    static const ops_mode_t k_same[] = {
+        OPS_SHORT_SIZE, OPS_OLD_PREFIX, OPS_POISON_TAIL, OPS_NULL_OP,
+        OPS_FALSE_OP,
+    };
     for (size_t v = 0; v < N_VERSIONS; v++)
         for (size_t c = 0; c < 2; c++) {
             const size_t cap = k_caps[c];
-            pair_t plain, shared;
-            sa_run_t rp, rs;
+            pair_t plain, shared, reported;
+            /* Cleanup below is unconditional: a pair an earlier failed setup
+             * skipped must still be safe to destroy. */
+            memset(&plain, 0, sizeof(plain));
+            memset(&shared, 0, sizeof(shared));
+            memset(&reported, 0, sizeof(reported));
+            sa_run_t rp, rs, rr;
             bool ok = pair_init(&plain, k_versions[v], cap, true) &&
-                      pair_init(&shared, k_versions[v], cap, true);
+                      pair_init(&shared, k_versions[v], cap, true) &&
+                      pair_init_mode(&reported, k_versions[v], cap,
+                                     OPS_REPORTED);
             MOQ_TEST_CHECK(ok);
             if (ok) {
                 mt_set_shared(shared.mt, true);
                 MOQ_TEST_CHECK(sa_scenario(&plain, &rp));
                 MOQ_TEST_CHECK(sa_scenario(&shared, &rs));
+                g_budget_queries = 0;
+                MOQ_TEST_CHECK(sa_scenario(&reported, &rr));
+                MOQ_TEST_CHECK(g_budget_queries > 0);
                 MOQ_TEST_CHECK(sa_same_output(plain.mt, shared.mt));
+                MOQ_TEST_CHECK(sa_same_output(plain.mt, reported.mt));
                 MOQ_TEST_CHECK_EQ_SIZE(rp.nwire, rs.nwire);
                 MOQ_TEST_CHECK(rs.nwire > 0);
                 MOQ_TEST_CHECK(rs.worst_run <= 3);
                 MOQ_TEST_CHECK(rp.worst_run > 3);
                 MOQ_TEST_CHECK(rs.refused < rp.refused);
+                /* A budget reported spent costs its hand-off no refusal: the
+                 * write that would be refused is not made. */
+                MOQ_TEST_CHECK(rr.refused < rs.refused);
+                MOQ_TEST_CHECK(rr.worst_run <= rs.worst_run);
                 MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(shared.pub_br));
-                printf("shared admission d%d cap %zu: refused %u -> %u "
-                       "(a service at worst %u -> %u, in a row %u -> %u), "
-                       "attempts %u -> %u, %zu writes accepted, %zu sent\n",
+                MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(reported.pub_br));
+                for (size_t m = 0; m < sizeof(k_same) / sizeof(k_same[0]); m++) {
+                    pair_t q;
+                    sa_run_t rq;
+                    g_budget_queries = g_poison_calls = g_false_queries = 0;
+                    const bool qok = pair_init_mode(&q, k_versions[v], cap,
+                                                    k_same[m]);
+                    MOQ_TEST_CHECK(qok);
+                    if (qok) {
+                        MOQ_TEST_CHECK(sa_scenario(&q, &rq));
+                        MOQ_TEST_CHECK(sa_same_output(plain.mt, q.mt));
+                        MOQ_TEST_CHECK_EQ_INT((int)rq.refused, (int)rs.refused);
+                        MOQ_TEST_CHECK_EQ_INT((int)g_budget_queries, 0);
+                        MOQ_TEST_CHECK_EQ_INT((int)g_poison_calls, 0);
+                        if (k_same[m] == OPS_FALSE_OP)
+                            MOQ_TEST_CHECK(g_false_queries > 0);
+                        else
+                            MOQ_TEST_CHECK_EQ_INT((int)g_false_queries, 0);
+                        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(q.pub_br));
+                    }
+                    pair_destroy(&q);
+                }
+                printf("shared admission d%d cap %zu: refused %u -> %u -> %u "
+                       "reported (a service at worst %u -> %u -> %u, in a row "
+                       "%u -> %u -> %u), attempts %u -> %u -> %u, %zu writes "
+                       "accepted, %zu sent\n",
                        draft_of(k_versions[v]), cap, rp.refused, rs.refused,
-                       rp.worst_refused, rs.worst_refused, rp.worst_run,
-                       rs.worst_run, rp.attempts, rs.attempts, rs.nchunks,
-                       rs.nwire);
+                       rr.refused, rp.worst_refused, rs.worst_refused,
+                       rr.worst_refused, rp.worst_run, rs.worst_run,
+                       rr.worst_run, rp.attempts, rs.attempts, rr.attempts,
+                       rs.nchunks, rs.nwire);
             }
             pair_destroy(&plain);
             pair_destroy(&shared);
+            pair_destroy(&reported);
         }
-    MOQ_TEST_PASS("a spent shared budget is refused once a hand-off");
+    MOQ_TEST_PASS("a spent shared budget is refused once a hand-off, and not "
+                  "at all when the endpoint reports it spent; an op the "
+                  "caller's struct does not hold, NULL or false changes nothing");
+}
+
+/* Setup decisions: a historical-prefix mode whose copy cannot be allocated
+ * fails setup rather than running on the full current struct; modes needing
+ * no copy are unaffected; a pair setup never reached, or left partial, is
+ * safe to destroy. */
+static void test_ops_copy_setup(void)
+{
+    static const ops_mode_t k_copy[] = { OPS_OLD_PREFIX, OPS_POISON_TAIL };
+    static const ops_mode_t k_none[] = { OPS_REPORTED, OPS_SHORT_SIZE,
+                                         OPS_NULL_OP, OPS_FALSE_OP };
+    g_ops_copy_fail = true;
+    for (size_t m = 0; m < 2; m++) {
+        pair_t q;
+        memset(&q, 0, sizeof(q));
+        MOQ_TEST_CHECK(!pair_init_mode(&q, MOQ_VERSION_DRAFT_16, 64, k_copy[m]));
+        MOQ_TEST_CHECK(q.ops_copy == NULL && q.pub_br == NULL);
+        pair_destroy(&q);   /* partial setup: subscriber side, sessions, model */
+    }
+    for (size_t m = 0; m < sizeof(k_none) / sizeof(k_none[0]); m++) {
+        pair_t q;
+        memset(&q, 0, sizeof(q));
+        MOQ_TEST_CHECK(pair_init_mode(&q, MOQ_VERSION_DRAFT_16, 64, k_none[m]));
+        MOQ_TEST_CHECK(q.ops_copy == NULL && q.pub_br != NULL);
+        pair_destroy(&q);
+    }
+    g_ops_copy_fail = false;
+    for (size_t m = 0; m < 2; m++) {
+        pair_t q;
+        memset(&q, 0, sizeof(q));
+        MOQ_TEST_CHECK(pair_init_mode(&q, MOQ_VERSION_DRAFT_16, 64, k_copy[m]));
+        MOQ_TEST_CHECK(q.ops_copy != NULL && q.pub_br != NULL);
+        pair_destroy(&q);
+    }
+    pair_t never;
+    memset(&never, 0, sizeof(never));
+    pair_destroy(&never);   /* a zeroed pair no setup touched */
+    MOQ_TEST_PASS("a prefix mode without its copy fails setup; cleanup is "
+                  "safe for skipped and partial pairs");
+}
+
+/* A hand-off that begins with the budget reported spent makes no write
+ * adding bytes, and a FIN-only write still goes in it. */
+static void test_shared_admission_reported_fin(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; v++) {
+        pair_t p;
+        MOQ_TEST_CHECK(pair_init_mode(&p, k_versions[v], 1, OPS_REPORTED));
+        track_t a, b;
+        MOQ_TEST_CHECK(subscribe(&p, "a", 10, NONE, NONE, &a));
+        MOQ_TEST_CHECK(subscribe(&p, "b", 20, NONE, NONE, &b));
+        moq_subgroup_handle_t bg;
+        MOQ_TEST_CHECK(publish_group(&p, &b, 2, 1, 0, 128, 1, true, &bg));
+        serve_all(&p);
+        uint64_t bsid = 0;
+        MOQ_TEST_CHECK(stream_of(&p, 2, 1, &bsid));
+        mt_stream_t *bst = mt_stream(p.mt, bsid);
+        MOQ_TEST_CHECK(bst != NULL && bst->fin_attempts == 0);
+        /* A, ahead of B, spends the budget in one service; nothing is sent. */
+        MOQ_TEST_CHECK(publish_group(&p, &a, 1, 1, 0, 128, 3, true, NULL));
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now),
+                              MOQ_OK);
+        MOQ_TEST_CHECK(p.mt->queued >= p.mt->cap);
+        /* B has only its FIN left: the next hand-off begins spent. */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_close_subgroup(p.pub, bg, p.now),
+                              MOQ_OK);
+        const uint32_t refused = mt_refused(p.mt);
+        const size_t chunks = p.mt->nchunks;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_service(p.pub_br, p.now),
+                              MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)mt_refused(p.mt), (int)refused);
+        bool b_fin = false, other = false;
+        for (size_t i = chunks; i < p.mt->nchunks; i++) {
+            if (p.mt->chunks[i].sid == bsid && p.mt->chunks[i].fin &&
+                p.mt->chunks[i].len == 0)
+                b_fin = true;
+            else
+                other = true;
+        }
+        MOQ_TEST_CHECK(b_fin);
+        MOQ_TEST_CHECK(!other);
+        if (bst) MOQ_TEST_CHECK_EQ_INT((int)bst->fin_attempts, 1);
+        serve_all(&p);
+        uint32_t w[16];
+        MOQ_TEST_CHECK_EQ_SIZE(wire_objects(&p, w, 16), 4);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+        pair_destroy(&p);
+    }
+    MOQ_TEST_PASS("a hand-off begun with the budget reported spent makes no "
+                  "refused write, and its FIN-only write goes");
 }
 
 /* While the budget is spent, a FIN-only write still goes in the same
@@ -4579,13 +4871,16 @@ static void test_shared_admission_fin(void)
  * and the reset waits behind A's subgroup header, its reliable prefix. Next
  * hand-off: A's header goes, C is refused, and A's reset, now due, is
  * accepted and gives the budget back; D, not yet tried, goes. */
-static bool sa_reset_row(moq_version_t ver, bool shared, bool *d_went)
+static bool sa_reset_row(moq_version_t ver, bool shared, bool reported,
+                         bool *d_went)
 {
     pair_t p;
+    g_ops_mode = reported ? OPS_REPORTED : OPS_PLAIN;
     bool ok = pair_init_retained(&p, ver, 1, true, 0, 1024, 0, 0, true);
+    g_ops_mode = OPS_PLAIN;
     MOQ_TEST_CHECK(ok);
     if (!ok) { pair_destroy(&p); return false; }
-    mt_set_shared(p.mt, shared);
+    if (!reported) mt_set_shared(p.mt, shared);
     track_t a, b, c, d;
     ok = subscribe(&p, "b", 20, NONE, NONE, &b) &&
          subscribe(&p, "a", 20, NONE, NONE, &a) &&
@@ -4632,9 +4927,15 @@ static bool sa_reset_row(moq_version_t ver, bool shared, bool *d_went)
 static void test_shared_admission_reset(void)
 {
     for (size_t v = 0; v < N_VERSIONS; v++) {
-        bool plain_d = true, shared_d = false;
-        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], false, &plain_d));
-        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], true, &shared_d));
+        bool plain_d = true, shared_d = false, reported_d = false;
+        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], false, false, &plain_d));
+        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], true, false, &shared_d));
+        g_budget_queries = 0;
+        MOQ_TEST_CHECK(sa_reset_row(k_versions[v], true, true, &reported_d));
+        /* With the budget reported, the accepted reset still reopens the
+         * hand-off: D goes, as with shared admission alone. */
+        MOQ_TEST_CHECK(reported_d);
+        MOQ_TEST_CHECK(g_budget_queries > 0);
         /* Without the capability D was tried, and refused, before A's reset
          * gave the budget back; with it D waits for that reset and goes. */
         MOQ_TEST_CHECK(!plain_d);
@@ -4664,7 +4965,7 @@ static void test_shared_admission_reset(void)
  * write, then goes while data is still refused. Draft-18 and later, as the
  * retained expiry rows. */
 static bool shared_expiry_row(pair_t *p, moq_rcbuf_t *payload[4],
-                              uint32_t *refused)
+                              uint32_t *refused, bool reported)
 {
     regression_owner_t a, c, b;
     if (!regression_owner(p, false, "fills", 0, 0, &a) ||
@@ -4714,7 +5015,12 @@ static bool shared_expiry_row(pair_t *p, moq_rcbuf_t *payload[4],
     SA_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
     const uint32_t c_refused = cst->refused_writes;
     SA_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
-    MOQ_TEST_CHECK(cst->refused_writes > c_refused);
+    /* C is offered and refused, unless the budget is reported spent before
+     * the hand-off begins; B's expiry reset goes either way. */
+    if (reported)
+        MOQ_TEST_CHECK_EQ_INT((int)cst->refused_writes, (int)c_refused);
+    else
+        MOQ_TEST_CHECK(cst->refused_writes > c_refused);
     MOQ_TEST_CHECK_EQ_INT((int)bst->reset_attempts, 1);
     MOQ_TEST_CHECK(bst->reset);
     MOQ_TEST_CHECK_EQ_U64(bst->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
@@ -4747,42 +5053,57 @@ static bool shared_expiry_row(pair_t *p, moq_rcbuf_t *payload[4],
 static void test_shared_admission_expiry(void)
 {
     for (size_t v = 1; v < N_VERSIONS; ++v) {
-        pair_t plain, shared;
+        pair_t plain, shared, reported;
+        /* Cleanup below is unconditional: a pair an earlier failed setup
+         * skipped must still be safe to destroy. */
+        memset(&plain, 0, sizeof(plain));
+        memset(&shared, 0, sizeof(shared));
+        memset(&reported, 0, sizeof(reported));
         moq_rcbuf_t *pp[4] = { NULL, NULL, NULL, NULL };
         moq_rcbuf_t *ps[4] = { NULL, NULL, NULL, NULL };
-        uint32_t rp = 0, rs = 0;
+        moq_rcbuf_t *pr[4] = { NULL, NULL, NULL, NULL };
+        uint32_t rp = 0, rs = 0, rr = 0;
         /* The bridge's own pending limit: a full pending FIFO would hold the
          * hand-off and the control write back whatever the budget. */
-        const bool ok =
+        bool ok =
             pair_init_retained(&plain, k_versions[v], 1u << 20, true, 0, 1024,
                                1u << 20, 0, true) &&
             pair_init_retained(&shared, k_versions[v], 1u << 20, true, 0, 1024,
                                1u << 20, 0, true);
+        g_ops_mode = OPS_REPORTED;
+        ok = ok && pair_init_retained(&reported, k_versions[v], 1u << 20, true,
+                                      0, 1024, 1u << 20, 0, true);
+        g_ops_mode = OPS_PLAIN;
         MOQ_TEST_CHECK(ok);
         if (ok) {
             mt_set_shared(shared.mt, true);
-            MOQ_TEST_CHECK(shared_expiry_row(&plain, pp, &rp));
-            MOQ_TEST_CHECK(shared_expiry_row(&shared, ps, &rs));
+            MOQ_TEST_CHECK(shared_expiry_row(&plain, pp, &rp, false));
+            MOQ_TEST_CHECK(shared_expiry_row(&shared, ps, &rs, false));
+            g_budget_queries = 0;
+            MOQ_TEST_CHECK(shared_expiry_row(&reported, pr, &rr, true));
+            MOQ_TEST_CHECK(g_budget_queries > 0);
             MOQ_TEST_CHECK(sa_same_output(plain.mt, shared.mt));
+            MOQ_TEST_CHECK(sa_same_output(plain.mt, reported.mt));
             MOQ_TEST_CHECK(rs < rp);
-            printf("shared admission expiry d%d: refused %u -> %u, %zu writes "
-                   "accepted, %zu control writes\n", draft_of(k_versions[v]),
-                   rp, rs, shared.mt->nchunks, shared.mt->nctrl);
+            MOQ_TEST_CHECK(rr < rs);
+            printf("shared admission expiry d%d: refused %u -> %u -> %u "
+                   "reported, %zu writes accepted, %zu control writes\n",
+                   draft_of(k_versions[v]), rp, rs, rr, shared.mt->nchunks,
+                   shared.mt->nctrl);
         }
         pair_destroy(&plain);
         pair_destroy(&shared);
-        for (unsigned i = 0; i < 4; ++i) {
-            if (pp[i]) {
-                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(pp[i]), 1);
-                moq_rcbuf_decref(pp[i]);
-            }
-            if (ps[i]) {
-                MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(ps[i]), 1);
-                moq_rcbuf_decref(ps[i]);
-            }
-        }
+        pair_destroy(&reported);
+        moq_rcbuf_t **all[3] = { pp, ps, pr };
+        for (unsigned k = 0; k < 3; ++k)
+            for (unsigned i = 0; i < 4; ++i)
+                if (all[k][i]) {
+                    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(all[k][i]), 1);
+                    moq_rcbuf_decref(all[k][i]);
+                }
     }
-    MOQ_TEST_PASS("an expiry reset and a control write go while the shared budget is spent");
+    MOQ_TEST_PASS("an expiry reset and a control write go while the shared "
+                  "budget is spent, reported or not");
 }
 
 /* -- Per-pass bookkeeping ----------------------------------------------------
@@ -4811,6 +5132,7 @@ static void test_shared_admission_expiry(void)
 #ifdef MOQ_SESSION_SWEEP_TESTING
 typedef struct {
     uint64_t expiry_slots, expiry_items, reset_slots, query_slots;
+    uint64_t inbound_slots;   /* stream entries the inbound retry walk read */
     /* The session's (session_internal.h): the next-deadline query's pool
      * walks and its queued-deadline scan, expiry's search and compaction,
      * the reset offer's queue scan and the stream-to-subgroup lookup. */
@@ -4825,6 +5147,7 @@ static walk_t walk_now(void)
         .expiry_items = bridge_work_expiry_items,
         .reset_slots = bridge_work_reset_slots,
         .query_slots = bridge_work_query_slots,
+        .inbound_slots = bridge_work_inbound_slots,
         .dl_sg = session_work_deadline_sg_probes,
         .dl_sub = session_work_deadline_sub_probes,
         .dl_pub = session_work_deadline_pub_probes,
@@ -4844,6 +5167,7 @@ static walk_t walk_since(walk_t w0)
     w.expiry_items -= w0.expiry_items;
     w.reset_slots -= w0.reset_slots;
     w.query_slots -= w0.query_slots;
+    w.inbound_slots -= w0.inbound_slots;
     w.dl_sg -= w0.dl_sg;
     w.dl_sub -= w0.dl_sub;
     w.dl_pub -= w0.dl_pub;
@@ -5100,6 +5424,41 @@ static bool pass_cost_earliest_row(pair_t *p)
                walk_since(w2).expiry_items == 0);
     p->mt->cap = 1u << 20;
     serve_all(p);
+    return true;
+}
+
+/* The inbound walk reads the stream table only after an entry was marked
+ * with inbound work; the walk that finds none left ends it. Passes that
+ * carry data with nothing retained inbound read no entry, and a marked
+ * table is read once, whole, then not again. */
+static bool pass_cost_inbound_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "inbound", 128, 0, &o)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    serve_all(p);
+    PC_REQUIRE(!p->pub_br->inbound_due);
+    WALK_MARK(w0);
+    for (uint64_t obj = 0; obj < 3; ++obj) {
+        PC_REQUIRE(write_object(p, sg, 1, 1, 0, obj) == MOQ_OK);
+        PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    }
+    serve_all(p);
+    WALK_CHECK(walk_since(w0).inbound_slots == 0);
+    MOQ_TEST_CHECK(!p->pub_br->inbound_due);
+
+    /* A mark with nothing behind it: one whole walk clears it. */
+    p->pub_br->inbound_due = true;
+    WALK_MARK(w1);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    WALK_CHECK(walk_since(w1).inbound_slots == p->pub_br->max_streams);
+    MOQ_TEST_CHECK(!p->pub_br->inbound_due);
+    WALK_MARK(w2);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    WALK_CHECK(walk_since(w2).inbound_slots == 0);
     return true;
 }
 
@@ -5865,6 +6224,7 @@ static void test_pass_costs(void)
         pair_destroy(&p);
         static bool (*const rows[])(pair_t *) = {
             pass_cost_earliest_row, pass_cost_unpop_row, pass_cost_pending_row,
+            pass_cost_inbound_row,
         };
         for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); ++r) {
             if (pair_init_retained(&p, k_versions[v], 1u << 20, true,
@@ -5895,7 +6255,8 @@ static void test_pass_costs(void)
     MOQ_TEST_PASS("deadline walks read the stream table only for timed items "
                   "and keep the exact earliest deadline through refusal, "
                   "expiry, cancellation and the pending FIFO; a refused reset "
-                  "is tried once a pass, a reused slot's reset included");
+                  "is tried once a pass, a reused slot's reset included; the "
+                  "inbound walk reads the table only once an entry is marked");
 }
 
 /* -- session queue inspection ----------------------------------------------- */
@@ -5994,6 +6355,15 @@ static size_t ss_live_subgroups(const moq_session_t *s)
     return n;
 }
 
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* The subgroups the deadline query reads: every live one while a subgroup
+ * deadline is armed (subgroup_deadline_us), none while none is. */
+static size_t ss_deadline_subgroups(const moq_session_t *s)
+{
+    return s->subgroup_deadline_us == UINT64_MAX ? 0 : ss_live_subgroups(s);
+}
+#endif
+
 static size_t ss_live_subs(const moq_session_t *s)
 {
     size_t n = 0;
@@ -6083,7 +6453,8 @@ static bool ss_sparse_row(pair_t *p, ss_image_t *img)
     img->pub_dl = ss_rel(moq_session_next_deadline_us(p->pub), t0);
 #ifdef MOQ_SESSION_SWEEP_TESTING
     img->pub_walk = walk_since(w);
-    WALK_CHECK(img->pub_walk.dl_sg == 3 && img->pub_walk.dl_sub == 2 &&
+    WALK_CHECK(img->pub_walk.dl_sg == ss_deadline_subgroups(p->pub) &&
+               img->pub_walk.dl_sub == 2 &&
                img->pub_walk.dl_pub == 1 && img->pub_walk.queued_dl == queued);
 #endif
     MOQ_TEST_CHECK_EQ_U64(img->pub_dl, SS_TIMEOUT_US);
@@ -6091,7 +6462,8 @@ static bool ss_sparse_row(pair_t *p, ss_image_t *img)
     img->sub_dl = ss_rel(moq_session_next_deadline_us(p->sub), t0);
 #ifdef MOQ_SESSION_SWEEP_TESTING
     img->sub_walk = walk_since(v);
-    WALK_CHECK(img->sub_walk.dl_sg == 0 && img->sub_walk.dl_sub == 2 &&
+    WALK_CHECK(img->sub_walk.dl_sg == ss_deadline_subgroups(p->sub) &&
+               img->sub_walk.dl_sub == 2 &&
                img->sub_walk.dl_pub == 1 && img->sub_walk.queued_dl == 0);
 #endif
     MOQ_TEST_CHECK_EQ_U64(img->sub_dl, UINT64_MAX);
@@ -6337,6 +6709,204 @@ static bool ss_offer_row(pair_t *p)
     return true;
 }
 
+/* Two real streams expire with notification storage full. The second's
+ * unrecognized deadline must beat the first's retry; once both are terminal,
+ * no live/queued data timer remains, but the retry is still published. One
+ * freed event slot commits only one debt: the summary stays armed for the
+ * other. Synthetic scalar notifications supply pressure only; public polls
+ * release it, and production timeout/STOP paths create every terminal. */
+static bool ss_terminal_debt_row(pair_t *p)
+{
+    const uint64_t t0 = p->now;
+    regression_owner_t o[2];
+    moq_subgroup_handle_t h[2];
+    moq_stream_ref_t ref[2];
+    uint64_t sid[2];
+    size_t header[2];
+    if (!regression_owner(p, false, "ss-debt-first", 128, 7, &o[0]) ||
+        !regression_owner(p, false, "ss-debt-next", 128, 9, &o[1]))
+        return false;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!regression_open_header(p, &o[i], 1, &h[i], &sid[i], &header[i]))
+            return false;
+        ref[i] = p->pub->subgroups[moq_handle_slot(h[i]._opaque)].stream_ref;
+    }
+    for (unsigned i = 0; i < 2; ++i)
+        SS_REQUIRE(write_object(p, h[i], (uint8_t)(i + 1), 1, 0, 0) == MOQ_OK);
+    SS_REQUIRE(p->pub->event_head == p->pub->event_tail && p->pub->event_cap >= 2);
+    const size_t fillers = p->pub->event_cap;
+    for (size_t i = 0; i < fillers; ++i) {
+        moq_event_t *e = &p->pub->events[p->pub->event_tail++ % p->pub->event_cap];
+        memset(e, 0, sizeof(*e));
+        e->kind = MOQ_EVENT_GOAWAY;
+    }
+
+    p->now = t0 + 7000;
+    SS_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_ERR_WOULD_BLOCK);
+    SS_REQUIRE(p->pub->subgroups[moq_handle_slot(h[0]._opaque)].state ==
+               MOQ_SG_TERMINAL_OWED && p->pub->sg_reset_owed);
+    MOQ_TEST_CHECK_EQ_U64(p->pub->subgroup_retry_deadline_us, p->now + 5000);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), t0 + 9000);
+    /* A later STOP must not replace the timeout's first cause. */
+    SS_REQUIRE(moq_session_on_data_stop(p->pub, ref[0], 73, p->now) ==
+               MOQ_ERR_WOULD_BLOCK);
+    p->now = t0 + 9000;
+    SS_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_ERR_WOULD_BLOCK);
+    for (unsigned i = 0; i < 2; ++i)
+        SS_REQUIRE(p->pub->subgroups[moq_handle_slot(h[i]._opaque)].state ==
+                   MOQ_SG_TERMINAL_OWED);
+    CHECK_SESSION_COUNTS(p->pub);
+    SS_REQUIRE(p->pub->sg_reset_owed && ss_queued(p->pub) == 2 &&
+               p->pub->action_timed == 0 && p->pub->action_nondata == 0);
+    MOQ_TEST_CHECK_EQ_U64(p->pub->subgroup_deadline_us, UINT64_MAX);
+    WALK_MARK(w);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), p->now + 5000);
+    WALK_CHECK(walk_since(w).dl_sg == 0 && walk_since(w).queued_dl == 0);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    moq_reset_data_action_t offer;
+    memset(&offer, 0, sizeof(offer));
+    MOQ_TEST_CHECK(!bridge_session_offer_data_reset(p->pub, &offer));
+    MOQ_TEST_CHECK(!bridge_session_offer_data_reset(p->pub, &offer));
+    SS_REQUIRE(p->pub->sg_reset_owed && ss_queued(p->pub) == 2 &&
+               p->pub->event_tail - p->pub->event_head == fillers);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), p->now + 5000);
+#endif
+
+    moq_event_t e;
+    for (unsigned released = 0; released < 2; ++released) {
+        SS_REQUIRE(moq_session_poll_events(p->pub, &e, 1) == 1);
+        const bool filler = e.kind == MOQ_EVENT_GOAWAY;
+        moq_event_cleanup(&e);
+        SS_REQUIRE(filler);
+        CHECK_SESSION_COUNTS(p->pub);
+        MOQ_TEST_CHECK(p->pub->sg_reset_owed == (released == 0));
+        MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                              released == 0 ? p->now + 5000 : UINT64_MAX);
+    }
+    unsigned events[2] = {0}, resets[2] = {0};
+    for (size_t n = 0; n < fillers; ++n) {
+        SS_REQUIRE(moq_session_poll_events(p->pub, &e, 1) == 1);
+        bool valid = n < fillers - 2 ? e.kind == MOQ_EVENT_GOAWAY
+                                    : e.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED;
+        if (e.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED) {
+            const moq_outgoing_subgroup_terminated_event_t *d =
+                &e.u.outgoing_subgroup_terminated;
+            const unsigned i = d->subgroup._opaque == h[0]._opaque ? 0u : 1u;
+            valid = valid && d->subgroup._opaque == h[i]._opaque &&
+                d->stream_ref._v == ref[i]._v && d->sub._opaque == o[i].track.sub._opaque &&
+                d->error_code == MOQ_RESET_DELIVERY_TIMEOUT &&
+                d->cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT;
+            ++events[i];
+        }
+        moq_event_cleanup(&e);
+        SS_REQUIRE(valid);
+    }
+    moq_action_t a;
+    for (unsigned n = 0; n < 2; ++n) {
+        SS_REQUIRE(moq_session_poll_actions(p->pub, &a, 1) == 1);
+        const unsigned i = a.u.reset_data.stream_ref._v == ref[0]._v ? 0u : 1u;
+        const bool valid = a.kind == MOQ_ACTION_RESET_DATA &&
+            a.u.reset_data.stream_ref._v == ref[i]._v &&
+            a.u.reset_data.error_code == MOQ_RESET_DELIVERY_TIMEOUT &&
+            a.u.reset_data.reliable_size == header[i];
+        ++resets[i];
+        moq_action_cleanup(&a);
+        SS_REQUIRE(valid);
+    }
+    SS_REQUIRE(events[0] == 1 && events[1] == 1 && resets[0] == 1 && resets[1] == 1);
+    SS_REQUIRE(!p->pub->sg_reset_owed && ss_queued(p->pub) == 0 &&
+               p->pub->event_head == p->pub->event_tail);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    return true;
+}
+
+static bool ss_take_reset(moq_session_t *s, moq_stream_ref_t ref,
+                          uint64_t code, size_t header)
+{
+    moq_action_t a;
+    SS_REQUIRE(moq_session_poll_actions(s, &a, 1) == 1);
+    const bool valid = a.kind == MOQ_ACTION_RESET_DATA &&
+        a.u.reset_data.stream_ref._v == ref._v && a.u.reset_data.error_code == code &&
+        a.u.reset_data.reliable_size == header;
+    moq_action_cleanup(&a);
+    SS_REQUIRE(valid);
+    return true;
+}
+
+/* A full ring contains only a sibling's data, so STOP has no replaceable
+ * barrier. Retrying cannot clear its debt summary. In the private variant,
+ * a bridge claim commits the event and changes TERMINAL_OWED to RESET_OWED
+ * without freeing an action slot; an event poll must keep that reset armed.
+ * A public action poll then transfers the exact reset before the sibling. */
+static bool ss_terminal_action_debt_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "ss-action-debt", 128, 0, &o)) return false;
+    moq_subgroup_handle_t stopped, sibling;
+    uint64_t sid, sibling_sid;
+    size_t header, sibling_header;
+    if (!regression_open_header(p, &o, 1, &stopped, &sid, &header) ||
+        !regression_open_header(p, &o, 2, &sibling, &sibling_sid, &sibling_header))
+        return false;
+    const moq_stream_ref_t ref =
+        p->pub->subgroups[moq_handle_slot(stopped._opaque)].stream_ref;
+    const moq_stream_ref_t sibling_ref =
+        p->pub->subgroups[moq_handle_slot(sibling._opaque)].stream_ref;
+    for (size_t i = 0; i < p->pub->action_cap; ++i)
+        SS_REQUIRE(write_object(p, sibling, 1, 2, 0, i) == MOQ_OK);
+    SS_REQUIRE(ss_queued(p->pub) == p->pub->action_cap);
+    SS_REQUIRE(moq_session_on_data_stop(p->pub, ref, 71, p->now) == MOQ_ERR_WOULD_BLOCK);
+    SS_REQUIRE(moq_session_on_data_stop(p->pub, ref, 72, p->now) == MOQ_ERR_WOULD_BLOCK);
+    SS_REQUIRE(p->pub->subgroups[moq_handle_slot(stopped._opaque)].state ==
+               MOQ_SG_TERMINAL_OWED && p->pub->sg_reset_owed);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), p->now + 5000);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    moq_reset_data_action_t offer;
+    memset(&offer, 0, sizeof(offer));
+    SS_REQUIRE(bridge_session_offer_data_reset(p->pub, &offer));
+    SS_REQUIRE(offer.stream_ref._v == ref._v && offer.error_code == 71 &&
+               offer.reliable_size == header);
+    SS_REQUIRE(p->pub->event_head == p->pub->event_tail);
+    SS_REQUIRE(bridge_session_claim_data_reset(p->pub, &offer));
+    SS_REQUIRE(p->pub->subgroups[moq_handle_slot(stopped._opaque)].state ==
+               MOQ_SG_RESET_OWED && p->pub->sg_reset_owed);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+#endif
+    moq_event_t e;
+    /* With a claim the event is already admitted; otherwise the public
+     * action poll admits it atomically with its virtual reset. */
+#ifndef MOQ_SESSION_SWEEP_TESTING
+    if (!ss_take_reset(p->pub, ref, 71, header)) return false;
+#endif
+    SS_REQUIRE(moq_session_poll_events(p->pub, &e, 1) == 1);
+    const bool event_ok = e.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+        e.u.outgoing_subgroup_terminated.subgroup._opaque == stopped._opaque &&
+        e.u.outgoing_subgroup_terminated.stream_ref._v == ref._v &&
+        e.u.outgoing_subgroup_terminated.error_code == 71 &&
+        e.u.outgoing_subgroup_terminated.cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING;
+    moq_event_cleanup(&e);
+    SS_REQUIRE(event_ok);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    SS_REQUIRE(p->pub->sg_reset_owed && ss_queued(p->pub) == p->pub->action_cap);
+    if (!ss_take_reset(p->pub, ref, 71, header)) return false;
+#endif
+    SS_REQUIRE(!p->pub->sg_reset_owed && ss_queued(p->pub) == p->pub->action_cap);
+    for (size_t i = 0; i < p->pub->action_cap; ++i) {
+        moq_action_t a;
+        SS_REQUIRE(moq_session_poll_actions(p->pub, &a, 1) == 1);
+        const bool sibling_data = a.kind == MOQ_ACTION_SEND_DATA &&
+            a.u.send_data.stream_ref._v == sibling_ref._v;
+        moq_action_cleanup(&a);
+        SS_REQUIRE(sibling_data);
+    }
+    SS_REQUIRE(ss_queued(p->pub) == 0 && p->pub->event_head == p->pub->event_tail);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    return true;
+}
+
 /* The subscriber cancels an owner whose stream fills the publisher's
  * eight-slot ring behind another owner's object: with no slot for the reset,
  * the subgroup owes it (CANCELLED). The offer finds the owed reset without
@@ -6546,7 +7116,7 @@ static bool ss_reuse_row(pair_t *p)
                    MOQ_OK);
         MOQ_TEST_CHECK(ss_occupancy_ok(p->pub));
 #ifdef MOQ_SESSION_SWEEP_TESTING
-        const uint64_t live_sg = ss_live_subgroups(p->pub);
+        const uint64_t live_sg = ss_deadline_subgroups(p->pub);
         const uint64_t live_sub = ss_live_subs(p->pub);
 #endif
         WALK_MARK(w);
@@ -6649,7 +7219,7 @@ static bool ss_done_wait_row(pair_t *p, bool publication)
                           t1 + SS_DONE_WAIT_US);
     WALK_CHECK(walk_since(w).dl_sub == (publication ? 0u : 1u) &&
                walk_since(w).dl_pub == (publication ? 1u : 0u) &&
-               walk_since(w).dl_sg == 0);
+               walk_since(w).dl_sg == ss_deadline_subgroups(p->sub));
     p->now = t1 + SS_DONE_WAIT_US - 1;
     SS_REQUIRE(moq_session_tick(p->sub, p->now) == MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT(ss_done_terminals(p, &o, "ss-done-wait", &right), 0);
@@ -6769,6 +7339,15 @@ static void test_session_scans(void)
                 pair_destroy(&p);
             }
         }
+        static bool (*const debt[])(pair_t *) = {
+            ss_terminal_debt_row, ss_terminal_action_debt_row,
+        };
+        for (size_t r = 0; r < sizeof(debt) / sizeof(debt[0]); ++r) {
+            if (ss_pair(&p, ver, &k_ss_sparse, 8, 1u << 20))
+                MOQ_TEST_CHECK(debt[r](&p));
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
         if (ss_pair(&p, ver, &k_ss_sparse, 8, 1))
             MOQ_TEST_CHECK(ss_owed_row(&p));
         else MOQ_TEST_CHECK(false);
@@ -6812,8 +7391,10 @@ static void test_session_scans(void)
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--shared-admission") == 0) {
+        test_ops_copy_setup();
         test_shared_admission_refusals();
         test_shared_admission_fin();
+        test_shared_admission_reported_fin();
         test_shared_admission_reset();
         test_shared_admission_expiry();
         return failures ? 1 : 0;

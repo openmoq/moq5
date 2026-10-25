@@ -345,6 +345,17 @@ arig_connect(arig_t *r, uint16_t shard, moq_version_t version)
     return cn;
 }
 
+/* After any shard step: every shard's binding keeps the scan bounds its
+ * per-pump walks rely on (moqr_bind_debug_scan_bounds_ok). */
+static void
+arig_check_scan_bounds(arig_t *r)
+{
+    for (uint32_t i = 0; i < moqr_shards_count(r->s); i++) {
+        A_CHECK(r, moqr_bind_debug_scan_bounds_ok(
+                       moqr_shards_bind(r->s, (uint16_t)i)));
+    }
+}
+
 /* One deterministic pump cycle: transport steps for every connection, then
  * ONE round of the multi-shard runtime (both binds pump inside it, plus the
  * cross-shard phases under the round barrier). */
@@ -362,6 +373,7 @@ arig_cycle(arig_t *r)
         (void)moq_simpair_run_until_quiescent(cn->sp, 64, &steps);
     }
     (void)moqr_shards_step(r->s, r->now);
+    arig_check_scan_bounds(r);
 }
 
 static void
@@ -402,6 +414,9 @@ typedef struct aps {
     uint64_t           sg_reset_group;   /* last one's identity + code      */
     uint64_t           sg_reset_sub;
     uint64_t           sg_reset_code;
+    /* Every reset of the drain, in order (the first 8): group, subgroup,
+     * code -- a batch can end several subgroups. */
+    uint64_t           sg_resets[8][3];
 #endif
     uint64_t           cur_bytes;    /* streamed object reassembly      */
     uint8_t            cur_first;
@@ -498,6 +513,14 @@ aps_drain(arig_t *r, aconn_t *cn, aps_t *ps, bool auto_accept)
             }
 #ifdef MOQ_EVENT_SUBGROUP_RESET
             case MOQ_EVENT_SUBGROUP_RESET:
+                if (ps->sg_reset < 8) {
+                    ps->sg_resets[ps->sg_reset][0] =
+                        ev->u.subgroup_reset.group_id;
+                    ps->sg_resets[ps->sg_reset][1] =
+                        ev->u.subgroup_reset.subgroup_id;
+                    ps->sg_resets[ps->sg_reset][2] =
+                        ev->u.subgroup_reset.error_code;
+                }
                 ps->sg_reset++;
                 ps->sg_reset_group = ev->u.subgroup_reset.group_id;
                 ps->sg_reset_sub = ev->u.subgroup_reset.subgroup_id;
@@ -1497,6 +1520,7 @@ ep_run(arig_t *r, ep_t *e)
         uint64_t mask = 0;
         A_CHECK(r, moqr_shards_step_shard(r->s, (uint16_t)s, r->now,
                                           &mask) == MOQR_OK);
+        arig_check_scan_bounds(r);
         if (s == 0) {
             e->dest_passes++;
         }
@@ -3875,8 +3899,9 @@ scenario_evict_reset_whole_object_pin(void)
     A_CHECK(&r, moqr_bind_conn_is_open(b0, sub->rsess));
 
     /* Relay-side truth for the reset arm: slot torn down, subscription
-     * live, and NO false FIN for the reset subgroup (its termination is
-     * whole-object-invisible until the queued libmoq surface fix). */
+     * live, and NO false FIN for the reset subgroup (a whole-object client
+     * observes its termination as MOQ_EVENT_SUBGROUP_RESET; the reset rows
+     * under MOQ_EVENT_SUBGROUP_RESET assert that). */
     A_CHECK(&r, moqr_bind_debug_conn_open_sgs(b0, 0) == 0);
     A_CHECK(&r, !g0_fin);
     A_CHECK(&r, moqr_shards_debug_requester_open_objects(r.s, 0) == 0);   /* GROUP 0's stream specifically: the reset-tail
@@ -4162,15 +4187,20 @@ scenario_upstream_reset_retained_then_terminal(void)
 #endif /* MOQ_EVENT_SUBGROUP_RESET */
 
 
-/* The not-begun whole-object FIN arm: subgroup 0 carries only COMPLETE
- * delivered objects and its seal dies with the owner's eviction; subgroup 1
- * of the same group carries the begun/partial casualty. The reset honestly
- * terminalizes sg1 (invisible in whole-object mode, which has no reset
- * event); sg0 owes the client a CLEAN, VISIBLE FIN — the watermark seals it
- * through the ordinary seal-note path and the client observes
- * SUBGROUP_FINISHED for (g0, sg0). Subscription stays live throughout. */
+#ifdef MOQ_EVENT_SUBGROUP_RESET
+/* The not-begun whole-object reset arm: subgroup 0 carries one COMPLETE
+ * delivered object and is never closed (no FIN, EndOfGroup or EndOfTrack
+ * from the publisher); subgroup 1 of the same group carries the begun/partial
+ * casualty. The owner's eviction ends further delivery of group 0, so its
+ * completeness is unknown: a clean FIN would claim every object of the
+ * subgroup was delivered, which the relay cannot establish (transport-18
+ * §11.4.3). Both subgroups end with a reset, which a whole-object client
+ * observes as MOQ_EVENT_SUBGROUP_RESET: (g0, sg0) exactly once, with the
+ * D18 eviction code 0x5, after its delivered object, and never a FIN. Later
+ * groups, each complete and closed, are delivered and FIN cleanly, and the
+ * subscription and session stay live throughout. */
 static int
-scenario_evict_overtake_notbegun_fin(void)
+scenario_evict_overtake_notbegun_reset(void)
 {
     ca_t a;
     ca_init(&a);
@@ -4265,16 +4295,41 @@ scenario_evict_overtake_notbegun_fin(void)
     ep_run(&r, &e);
     int objs = 0;
     bool done = false;
-    bool g0sg0_fin = false;
+    int g0sg0_fins = 0, g0sg0_resets = 0, g0sg1_resets = 0, other_resets = 0;
+    uint64_t g0sg0_code = 0;
+    uint32_t delivered_groups = 0;   /* bit g: an object of group g (3..7) */
+    uint32_t finned_groups = 0;      /* bit g: a clean FIN for (g, 0) */
+    int unsubscribed = 0, sub_errors = 0;
     for (int rounds = 0; rounds < 10; rounds++) {
         memset(&sps, 0, sizeof(sps));
         aps_drain(&r, sub, &sps, false);
         objs += sps.objects;
-        for (int f = 0; f < sps.sg_finished && f < 8; f++) {
-            if (sps.sg_fin_group[f] == 0 && sps.sg_fin_sub[f] == 0) {
-                g0sg0_fin = true;
+        for (int o = 0; o < sps.objects && o < 8; o++) {
+            uint8_t g = (uint8_t)(sps.obj_byte[o] - 0xD0);
+            if (g >= 3 && g < 8) {
+                delivered_groups |= 1u << g;
             }
         }
+        A_CHECK(&r, sps.sg_finished <= 8 && sps.sg_reset <= 8);
+        for (int f = 0; f < sps.sg_finished && f < 8; f++) {
+            if (sps.sg_fin_group[f] == 0 && sps.sg_fin_sub[f] == 0) {
+                g0sg0_fins++;
+            } else if (sps.sg_fin_sub[f] == 0 && sps.sg_fin_group[f] < 8) {
+                finned_groups |= 1u << sps.sg_fin_group[f];
+            }
+        }
+        for (int k = 0; k < sps.sg_reset && k < 8; k++) {
+            if (sps.sg_resets[k][0] == 0 && sps.sg_resets[k][1] == 0) {
+                g0sg0_resets++;
+                g0sg0_code = sps.sg_resets[k][2];
+            } else if (sps.sg_resets[k][0] == 0 && sps.sg_resets[k][1] == 1) {
+                g0sg1_resets++;
+            } else {
+                other_resets++;
+            }
+        }
+        unsubscribed += sps.unsubscribed;
+        sub_errors += sps.subscribe_errors;
         if (sps.done_seen) {
             done = true;
         }
@@ -4294,26 +4349,44 @@ scenario_evict_overtake_notbegun_fin(void)
         A_CHECK(&r, c0.ingested_total >= 4);  /* survivors + g0 obj0 arrived */
     }
     A_CHECK(&r, objs >= 3);
+    /* THE invariant: (g0, sg0) -- one delivered object, completeness unknown
+     * once the owner evicted the group -- ends with exactly one reset carrying
+     * the D18 eviction code, never a FIN. Its object was delivered before it
+     * (first drain above). The begun partial's subgroup may reset too; no
+     * other subgroup does. */
+    A_CHECK(&r, g0sg0_resets == 1);
+    A_CHECK(&r, g0sg0_code == 0x5);
+    A_CHECK(&r, g0sg0_fins == 0);
+    A_CHECK(&r, g0sg1_resets <= 1);
+    A_CHECK(&r, other_resets == 0);
+    /* Later healthy groups: every one delivered FINs cleanly, and at least
+     * three were delivered (the eviction may overtake the earliest). */
+    A_CHECK(&r, delivered_groups != 0 &&
+                    (delivered_groups & ~finned_groups) == 0);
+    A_CHECK(&r, finned_groups == delivered_groups);
+    /* No subscription or session termination. */
     A_CHECK(&r, !done);
+    A_CHECK(&r, unsubscribed == 0 && sub_errors == 0);
+    A_CHECK(&r, moq_session_state(sub->peer) == MOQ_SESS_ESTABLISHED);
     A_CHECK(&r, moqr_bind_conn_is_open(b0, sub->rsess));
+    /* Downstream subgroup slots are reclaimed (allocations: a.live below). */
     A_CHECK(&r, moqr_bind_debug_conn_open_sgs(b0, 0) == 0);
-    /* THE invariant: (g0, sg0) — complete content, dead seal — FINs
-     * VISIBLY for the whole-object client. */
-    A_CHECK(&r, g0sg0_fin);
 
     A_CHECK(&r, moq_session_unsubscribe(sub->peer, sh, r.now) == MOQ_OK);
     ep_run(&r, &e);
     arig_destroy(&r);
     A_CHECK(&r, a.live == 0);
     if (r.failures == 0) {
-        printf("PASS: auth_shards evict_overtake_notbegun_fin\n");
+        printf("PASS: auth_shards evict_overtake_notbegun_reset\n");
     }
     return r.failures;
 }
+#endif /* MOQ_EVENT_SUBGROUP_RESET */
 
-/* D2s — the begun/reset arm in STREAMING mode: the one mode where libmoq can
- * expose the reset today. Same shape as the whole-object pin; the client
- * observes the reset terminal (OBJECT_CHUNK terminal=RESET). */
+/* D2s — the begun/reset arm in STREAMING mode. Same shape as the
+ * whole-object pin; a streaming client observes the reset terminal on the
+ * object itself (OBJECT_CHUNK terminal=RESET), where a whole-object client
+ * observes MOQ_EVENT_SUBGROUP_RESET. */
 static int
 scenario_evict_reset_streaming_observed(void)
 {
@@ -4455,8 +4528,8 @@ main(void)
 #ifdef MOQ_EVENT_SUBGROUP_RESET
     failures += scenario_upstream_reset_whole_object_terminal();
     failures += scenario_upstream_reset_retained_then_terminal();
+    failures += scenario_evict_overtake_notbegun_reset();     /* unknown end: reset, no FIN */
 #endif
-    failures += scenario_evict_overtake_notbegun_fin();       /* dead seal, visible FIN */
     failures += scenario_evict_reset_streaming_observed();    /* streaming: reset observable */
     failures += scenario_evict_overtake_silent_wait();    /* explicit terminal, never silence */
     failures += scenario_eot_complete_retires();      /* finished track completes */

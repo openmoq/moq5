@@ -18,6 +18,7 @@ uint64_t bridge_work_expiry_items;
 uint64_t bridge_work_reset_slots;
 uint64_t bridge_work_query_slots;
 uint64_t bridge_work_terminal_slots;
+uint64_t bridge_work_inbound_slots;
 #endif
 
 static void bridge_discard_if_dropped(moq_transport_bridge_t *b,
@@ -198,6 +199,27 @@ static bool bridge_dindex_build(moq_transport_bridge_t *b, uint32_t cap)
     ((ops)->struct_size >= offsetof(moq_transport_endpoint_ops_t, field) + \
                            sizeof((ops)->field))
 
+/* The optional budget_spent op of a caller whose ops object may be a smaller
+ * historical struct: struct_size and capabilities are copied from the frozen
+ * prefix, and the op only when struct_size covers the whole field, all by
+ * byte offset, so nothing past the caller's object is read. Gated by the
+ * shared-admission capability, which is what gives the answer its meaning. */
+static bool (*bridge_ops_budget_spent(const moq_transport_endpoint_ops_t *ops))(void *)
+{
+    uint32_t size, caps;
+    memcpy(&size, (const uint8_t *)ops +
+                      offsetof(moq_transport_endpoint_ops_t, struct_size),
+           sizeof(size));
+    memcpy(&caps, (const uint8_t *)ops +
+                      offsetof(moq_transport_endpoint_ops_t, capabilities),
+           sizeof(caps));
+    bool (*fn)(void *) = NULL;
+    const size_t at = offsetof(moq_transport_endpoint_ops_t, budget_spent);
+    if ((caps & MOQ_TRANSPORT_CAP_SHARED_ADMISSION) && size >= at + sizeof(fn))
+        memcpy(&fn, (const uint8_t *)ops + at, sizeof(fn));
+    return fn;
+}
+
 static bool ops_valid(const moq_transport_endpoint_ops_t *ops)
 {
     if (!ops) return false;
@@ -260,6 +282,7 @@ moq_result_t moq_transport_bridge_create(
     b->alloc        = *a;
     b->session      = session;
     b->ops          = ops;
+    b->budget_spent = bridge_ops_budget_spent(ops);
     b->endpoint_ctx = endpoint_ctx;
     b->is_client    = (moq_session_perspective(session) == MOQ_PERSPECTIVE_CLIENT);
     b->max_streams    = max_s;
@@ -1456,6 +1479,7 @@ static moq_result_t bridge_hold_admission(moq_transport_bridge_t *b,
         }
     }
     e->pending_admission = true;
+    b->inbound_due = true;
     e->held_input = true;
     if (len > 0) e->held_payload = true;
     return bridge_input_not_consumed(b);
@@ -4518,7 +4542,9 @@ static moq_result_t bridge_pump_data(moq_transport_bridge_t *b,
     moq_result_t rc = MOQ_OK;
     const bool shared = (b->ops->capabilities &
                          MOQ_TRANSPORT_CAP_SHARED_ADMISSION) != 0;
-    bool spent = false;
+    /* A budget already spent refuses every write adding bytes: start where
+     * the first such refusal would leave the hand-off. */
+    bool spent = b->budget_spent && b->budget_spent(b->endpoint_ctx);
     /* A bounded number of head transitions bounds rank rebuilds in a pump.
      * The remaining ready heap is visible to outbound_ready for continuation. */
     while (!b->fatal && !b->closed && b->pump_budget > 0) {
@@ -5174,6 +5200,23 @@ static moq_result_t bridge_stop_local_data(moq_transport_bridge_t *b,
     return moq_session_on_data_stop(b->session, e->ref, code, now_us);
 }
 
+/* An entry with inbound work left keeps the next pass's walk due. */
+static void bridge_inbound_keep_due(moq_transport_bridge_t *b,
+                                    const bridge_stream_entry_t *e)
+{
+    if (e->active && (e->pending_admission || e->pending_retry ||
+                      e->pending_reset || e->pending_stop))
+        b->inbound_due = true;
+}
+
+/* A walk the session suspended has not reached every entry. */
+static bridge_inbound_outcome_t bridge_inbound_suspended(
+    moq_transport_bridge_t *b, bool progress)
+{
+    b->inbound_due = true;
+    return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
+}
+
 static bridge_inbound_outcome_t bridge_retry_inbound_pending(
     moq_transport_bridge_t *b, uint64_t now_us)
 {
@@ -5208,7 +5251,17 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
         }
     }
 
-    for (uint32_t i = 0; i < b->max_streams && !b->fatal; i++) {
+    /* The walk re-marks every entry it leaves with inbound work (its
+     * increment step), and a suspension re-marks the entries it did not
+     * reach; a setter run inside the walk marks its own. */
+    if (!b->inbound_due)
+        return (bridge_inbound_outcome_t){ progress, MOQ_OK };
+    b->inbound_due = false;
+    for (uint32_t i = 0; i < b->max_streams && !b->fatal;
+         bridge_inbound_keep_due(b, &b->streams[i]), i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        bridge_work_inbound_slots++;
+#endif
         bridge_stream_entry_t *e = &b->streams[i];
         if (!e->active) continue;
 
@@ -5238,7 +5291,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
              * makes every later owner suspend too, so continuing would only
              * repeat the work. */
             if (rc == MOQ_SESSION_SUSPENDED)
-                return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
+                return bridge_inbound_suspended(b, progress);
             if (rc != MOQ_ERR_WOULD_BLOCK) {
                 e->pending_retry = false;
                 progress = true;
@@ -5262,6 +5315,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
                     if (frc == MOQ_ERR_WOULD_BLOCK) {
                         /* FIN delivery blocked — keep stream pending */
                         e->pending_retry = true;
+                        b->inbound_due = true;
                         e->fin_retained = true;
                         continue;
                     }
@@ -5288,7 +5342,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
             /* pending_reset and its code stay intact, and the entry stays
              * active: the reset has not been delivered. */
             if (rc == MOQ_SESSION_SUSPENDED)
-                return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
+                return bridge_inbound_suspended(b, progress);
             if (rc != MOQ_ERR_WOULD_BLOCK) {
                 e->pending_reset = false;
                 progress = true;
@@ -5319,7 +5373,7 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
                 : bridge_stop_local_data(b, e, e->pending_stop_code, now_us);
             /* pending_stop and its code stay intact. */
             if (rc == MOQ_SESSION_SUSPENDED)
-                return (bridge_inbound_outcome_t){ progress, MOQ_SESSION_SUSPENDED };
+                return bridge_inbound_suspended(b, progress);
             if (rc != MOQ_ERR_WOULD_BLOCK) {
                 e->pending_stop = false;
                 progress = true;
@@ -5797,6 +5851,7 @@ static moq_result_t bridge_feed_peer_data(
         if (moq_session_has_transport_stream(b->session, ref)) {
             /* Session retained the bytes; the service tick drains them. */
             e->pending_retry = true;
+            b->inbound_due = true;
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
@@ -6162,6 +6217,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_bytes(
             /* Legitimate inbound backpressure: the session retained the bytes.
              * Let the service tick drain them; never fatal. */
             e->pending_retry = true;
+            b->inbound_due = true;
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
@@ -6266,6 +6322,7 @@ moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
         if (moq_session_has_transport_stream(b->session, ref)) {
             /* Legitimate inbound backpressure: the session retained the bytes. */
             e->pending_retry = true;
+            b->inbound_due = true;
             if (fin) e->fin_retained = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
@@ -6379,6 +6436,7 @@ moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
             return MOQ_ERR_INTERNAL;
         }
         e->pending_retry = true;
+        b->inbound_due = true;
         if (fin) e->fin_retained = true;
         return MOQ_ERR_WOULD_BLOCK;
     }
@@ -6475,6 +6533,7 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
          * still owed does not overwrite it. */
         if (!e->pending_reset) {
             e->pending_reset = true;
+            b->inbound_due = true;
             e->pending_reset_code = error_code;
         }
         return MOQ_ERR_WOULD_BLOCK;
@@ -6617,6 +6676,7 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
 
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         e->pending_stop = true;
+        b->inbound_due = true;
         e->pending_stop_code = error_code;
         return MOQ_ERR_WOULD_BLOCK;
     }

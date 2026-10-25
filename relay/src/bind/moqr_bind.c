@@ -568,6 +568,13 @@ typedef struct b_conn {
      * is encoded for the peer that reads it. Rides the bool padding — no size
      * cost. */
     uint8_t        wire_draft;       /* B_DRAFT_*                       */
+    /* Whether a refusal entry may be held (set by bind_terminal_hold) or an
+     * upstream cancellation may be owed (set where cancel_owed is). Each is
+     * cleared only by the walk that finds none left, so a false flag proves
+     * the table holds nothing for the per-pump walks to retry. Both ride the
+     * bool padding — no size cost. */
+    bool           refusal_held;
+    bool           cancel_scan;
     size_t         park_cap;         /* ACTION_CAP: capacity floor when
                                       * parked; retry only above it     */
 #ifdef MOQR_BIND_TESTING
@@ -602,9 +609,27 @@ typedef struct b_conn {
     b_fetch_t     *fetches;
     b_refusal_t   *refusals;   /* held refusals, n_refusals entries      */
     uint32_t       refusals_reserved;   /* entries promised to parked auths */
+    /* One past the highest fetch slot marked used since the table was last
+     * cleared: every slot at or above it is unused, so the per-pump fetch
+     * walks stop there instead of at n_fetches. Raised when a slot is
+     * marked used, lowered only by bind_fetch_pump's trailing trim. Rides
+     * the padding after refusals_reserved — no size cost. */
+    uint32_t       fetch_hw;
     uint64_t       requests_seen;    /* inbound peer requests observed (d16
                                       * request-id consumption proxy)     */
 } b_conn_t;
+
+/* The only way a fetch slot becomes used: it also keeps fetch_hw above the
+ * slot, so the per-pump walks bounded by it still reach it. */
+static void
+bind_fetch_mark_used(b_conn_t *cn, b_fetch_t *bf)
+{
+    uint32_t slot = (uint32_t)(bf - cn->fetches);
+    bf->used = true;
+    if (slot >= cn->fetch_hw) {
+        cn->fetch_hw = slot + 1u;
+    }
+}
 
 struct moqr_bind {
     moq_alloc_t  alloc;
@@ -1387,6 +1412,38 @@ moqr_bind_debug_blocked_aggregate(const moqr_bind_t *b,
         }
     }
     return MOQR_OK;
+}
+
+bool
+moqr_bind_debug_scan_bounds_ok(const moqr_bind_t *b)
+{
+    for (uint32_t ci = 0; ci < b->max_conns; ci++) {
+        const b_conn_t *cn = &b->conns[ci];
+        if (!cn->used) {
+            continue;
+        }
+        for (uint32_t fi = cn->fetch_hw; fi < b->n_fetches; fi++) {
+            if (cn->fetches[fi].used) {
+                return false;
+            }
+        }
+        for (uint32_t i = 0; !cn->refusal_held && i < b->n_refusals; i++) {
+            if (cn->refusals[i].used) {
+                return false;
+            }
+        }
+        for (uint32_t i = 0; !cn->cancel_scan && i < b->n_usubs; i++) {
+            if (cn->usubs[i].used && cn->usubs[i].cancel_owed) {
+                return false;
+            }
+        }
+        for (uint32_t i = 0; !cn->cancel_scan && i < b->n_pubs; i++) {
+            if (cn->pubs[i].used && cn->pubs[i].cancel_owed) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* Test-only downstream subgroup-pool occupancy for one conn slot. */
@@ -3248,8 +3305,11 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
             usub_release_all(b, cn);   /* owned keys, then the clean table */
             memset(cn->pubs, 0, (size_t)b->n_pubs * sizeof(*cn->pubs));
             memset(cn->fetches, 0, (size_t)b->n_fetches * sizeof(*cn->fetches));
+            cn->fetch_hw = 0;
             memset(cn->refusals, 0, (size_t)b->n_refusals * sizeof(*cn->refusals));
             cn->refusals_reserved = 0;
+            cn->refusal_held = false;
+            cn->cancel_scan = false;
             /* The relay answers every downstream subscription update itself
              * (bind_update_answer), so nothing is acknowledged before the
              * relay has decided. */
@@ -9196,6 +9256,7 @@ bind_terminal_hold(moqr_bind_t *b, b_conn_t *cn, const b_refusal_t *want)
         b_refusal_t *r = &cn->refusals[i];
         if (!r->used) {
             *r = *want;
+            cn->refusal_held = true;
             FWD_DBG(b, refusals_parked);
             return;
         }
@@ -9296,9 +9357,9 @@ bind_fetch_refuse(moqr_bind_t *b, b_conn_t *cn, moq_fetch_t fetch,
 static uint32_t
 bind_refusal_free(const moqr_bind_t *b, const b_conn_t *cn)
 {
-    uint32_t free_slots = 0;
-    for (uint32_t i = 0; i < b->n_refusals; i++) {
-        free_slots += cn->refusals[i].used ? 0u : 1u;
+    uint32_t free_slots = b->n_refusals;
+    for (uint32_t i = 0; cn->refusal_held && i < b->n_refusals; i++) {
+        free_slots -= cn->refusals[i].used ? 1u : 0u;
     }
     return free_slots > cn->refusals_reserved
                ? free_slots - cn->refusals_reserved
@@ -9332,7 +9393,8 @@ bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
 {
     for (uint32_t ci = 0; ci < b->max_conns; ci++) {
         b_conn_t *cn = &b->conns[ci];
-        if (!cn->used || cn->closed || cn->session == NULL) {
+        if (!cn->used || cn->closed || cn->session == NULL ||
+            !cn->refusal_held) {
             continue;
         }
         for (uint32_t i = 0; i < b->n_refusals; i++) {
@@ -9380,6 +9442,13 @@ bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
             }
             memset(r, 0, sizeof(*r));
         }
+        /* Re-read rather than tracked through the walk: a retry above may
+         * hold another terminal in an entry the walk already passed. */
+        bool held = false;
+        for (uint32_t i = 0; !held && i < b->n_refusals; i++) {
+            held = cn->refusals[i].used;
+        }
+        cn->refusal_held = held;
     }
 }
 
@@ -9773,7 +9842,7 @@ bind_fill_request(moqr_bind_t *b, b_conn_t *cn,
         bind_fill_fail(b, cn, fr->fill, now_us);
         return;
     }
-    bf->used = true;
+    bind_fetch_mark_used(cn, bf);
 }
 
 /* The child ended on the session side (its FIN or RESET committed, the peer
@@ -10179,7 +10248,7 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
             moqr_result_t orc = b->sa_src.open(b->sa_src.ctx, &q, &handle);
             if (orc == MOQR_OK) {
                 memset(bf, 0, sizeof(*bf));
-                bf->used = true;
+                bind_fetch_mark_used(cn, bf);
                 bf->standalone = true;
                 bf->sa_remote = true;
                 bf->sa_handle = handle;
@@ -10241,7 +10310,7 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
         bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
         return;
     }
-    bf->used = true;
+    bind_fetch_mark_used(cn, bf);
 }
 
 /* The subscriber cancelled (draft-22 3.2.4): nothing more is owed on the
@@ -11638,6 +11707,7 @@ bind_track_malformed(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
             usub_release(b, us);
         } else {
             us->cancel_owed = true;
+            cn->cancel_scan = true;
         }
     } else if (bp != NULL) {
         uint64_t code = MOQ_STREAM_ERROR_MALFORMED_TRACK;
@@ -11651,6 +11721,7 @@ bind_track_malformed(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
         } else {
             bp->cancel_owed = true;
             bp->cancel_code = code;
+            cn->cancel_scan = true;
         }
     }
 }
@@ -11709,6 +11780,9 @@ bind_cancel_upstream_pub(b_conn_t *cn, moq_publication_t pub, uint64_t code,
 static void
 bind_retry_owed_cancels(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
+    if (!cn->cancel_scan) {
+        return;   /* nothing was marked owed since a walk last found none */
+    }
     for (uint32_t i = 0; i < b->n_usubs; i++) {
         b_usub_t *us = &cn->usubs[i];
         if (!us->used || !us->cancel_owed) continue;
@@ -11727,12 +11801,22 @@ bind_retry_owed_cancels(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             memset(bp, 0, sizeof(*bp));
         }
     }
+    /* Re-read rather than tracked through the walks: a settlement above may
+     * mark another entry owed, possibly one already passed. */
+    bool owed = false;
+    for (uint32_t i = 0; !owed && i < b->n_usubs; i++) {
+        owed = cn->usubs[i].used && cn->usubs[i].cancel_owed;
+    }
+    for (uint32_t i = 0; !owed && i < b->n_pubs; i++) {
+        owed = cn->pubs[i].used && cn->pubs[i].cancel_owed;
+    }
+    cn->cancel_scan = owed;
 }
 
 static void
 bind_fetch_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
-    for (uint32_t fi = 0; fi < b->n_fetches; fi++) {
+    for (uint32_t fi = 0; fi < cn->fetch_hw; fi++) {
         b_fetch_t *bf = &cn->fetches[fi];
         if (!bf->used) {
             continue;
@@ -11756,6 +11840,10 @@ bind_fetch_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             continue;
         }
         /* Every fetch the binding admits is a fill or a standalone FETCH. */
+    }
+    /* Slots released at the top end no longer bound the walks. */
+    while (cn->fetch_hw > 0 && !cn->fetches[cn->fetch_hw - 1u].used) {
+        cn->fetch_hw--;
     }
 }
 
@@ -13116,7 +13204,7 @@ moqr_bind_next_deadline_us(const moqr_bind_t *b)
         if (!cn->used || cn->closed) {
             continue;
         }
-        for (uint32_t fi = 0; fi < b->n_fetches; fi++) {
+        for (uint32_t fi = 0; fi < cn->fetch_hw; fi++) {
             const b_fetch_t *bf = &cn->fetches[fi];
             /* A fill reading through a fill source that reports its own
              * deadlines leaves its deadline to the source, which knows

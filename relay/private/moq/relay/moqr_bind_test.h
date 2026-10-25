@@ -184,6 +184,12 @@ uint32_t moqr_bind_debug_max_conns(const moqr_bind_t *b);
  * intent scratch was already active and therefore had to defer to the caller's
  * normal retry path instead of draining recursively. */
 uint64_t moqr_bind_debug_intent_retry_suppressed(const moqr_bind_t *b);
+
+/* Test-only: the per-connection bounds the per-pump walks rely on hold on
+ * every live connection: each used fetch slot lies below the connection's
+ * fetch high-water, a held refusal has refusal_held set, and an owed
+ * upstream cancellation has cancel_scan set. */
+bool moqr_bind_debug_scan_bounds_ok(const moqr_bind_t *b);
 #endif
 
 

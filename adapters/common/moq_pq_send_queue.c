@@ -657,6 +657,11 @@ uint64_t moq_pq_send_queue_high_water(const moq_pq_send_queue_t *q)
     return q ? q->high_water : 0;
 }
 
+bool moq_pq_send_queue_budget_full(const moq_pq_send_queue_t *q)
+{
+    return q != NULL && pq_budget_full(q);
+}
+
 uint64_t moq_pq_send_queue_would_block_count(const moq_pq_send_queue_t *q)
 {
     return q ? q->would_block : 0;

@@ -192,6 +192,16 @@ relay_bind_test_rig_connect(rig_t *r, moq_version_t version)
     return cn;
 }
 
+/* The bind pump, with the scan bounds its walks rely on checked on both
+ * sides of it (moqr_bind_debug_scan_bounds_ok). */
+static void
+rig_bind_pump(rig_t *r)
+{
+    R_CHECK(r, moqr_bind_debug_scan_bounds_ok(r->bind));
+    (void)moqr_bind_pump(r->bind, r->now);
+    R_CHECK(r, moqr_bind_debug_scan_bounds_ok(r->bind));
+}
+
 /* One deterministic pump cycle: transport steps, then the production
  * binding does everything else (events -> core -> intents -> deliveries). */
 void
@@ -210,7 +220,7 @@ relay_bind_test_rig_cycle(rig_t *r)
         size_t steps = 0;
         (void)moq_simpair_run_until_quiescent(cn->sp, 64, &steps);
     }
-    (void)moqr_bind_pump(r->bind, r->now);
+    rig_bind_pump(r);
 }
 
 void
@@ -238,7 +248,7 @@ rig_cycle_except(rig_t *r, const conn_t *skip)
         size_t steps = 0;
         (void)moq_simpair_run_until_quiescent(cn->sp, 64, &steps);
     }
-    (void)moqr_bind_pump(r->bind, r->now);
+    rig_bind_pump(r);
 }
 
 /* Advance ONE pair's transport without running the bind pump, so several
@@ -260,7 +270,7 @@ relay_bind_test_rig_step_pair(rig_t *r, conn_t *cn)
 void
 relay_bind_test_rig_bind_pump_once(rig_t *r)
 {
-    (void)moqr_bind_pump(r->bind, r->now);
+    rig_bind_pump(r);
 }
 
 void

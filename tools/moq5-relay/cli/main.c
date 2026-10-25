@@ -84,8 +84,10 @@ static uint8_t g_test_serve_log_last_state;
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 
 /* The signal flags are written from a signal handler (delivered on an
@@ -128,11 +130,249 @@ static atomic_uint g_dump_trace_epoch;
 /* The broker owns the metrics generation serial for the multi-lane serve. */
 static moqr_broker_t g_metrics_broker;
 
+/*
+ * The coordinator's wake: a CLI-owned nonblocking self-pipe.
+ *
+ * A byte means "recheck": the coordinator drains the pipe, then reads the
+ * authoritative state (facade health, signal latches, broker and snapshot
+ * rows), and only then waits for the next byte or its health deadline. A
+ * producer changes that state first and writes one byte after it, so a
+ * change landing after the coordinator's reads leaves a byte for its next
+ * wait. Producers are the actual coordinator work: a lane publishing a
+ * metrics row while the coordinator owns the broker, and the signal
+ * handlers. Network passes write nothing.
+ *
+ * Both ends are nonblocking. A full pipe is already readable, so a write
+ * refused with EAGAIN coalesces into the bytes waiting there; any other
+ * refusal is counted as a failure. The write end is published through an
+ * atomic, and every writer marks itself in flight around its load and write:
+ * retirement unpublishes the descriptor, waits for writers already past the
+ * load, and only then closes, so no producer or handler ever writes a closed
+ * or reused descriptor.
+ */
+static atomic_int  g_coord_wr = -1;   /* write end; -1 while not serving */
+static int         g_coord_rd = -1;   /* read end, coordinator thread only */
+static atomic_uint g_coord_inflight;  /* writers between load and write */
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2,
+               "the wake counters are bumped from signal handlers");
+static _Atomic unsigned long long g_coord_notified;   /* bytes written */
+static _Atomic unsigned long long g_coord_coalesced;  /* full pipe (EAGAIN) */
+static _Atomic unsigned long long g_coord_failed;     /* any other refusal */
+
+/* The longest the coordinator goes without checking facade, WebTransport and
+ * admin health, and without retrying a render that failed transiently. */
+#define RELAY_COORD_HEALTH_US UINT64_C(500000)
+
+/* One notification. Async-signal-safe: no lock, errno preserved. */
+static void
+coord_wake_notify(void)
+{
+    int saved = errno;
+    atomic_fetch_add(&g_coord_inflight, 1u);
+    int fd = atomic_load(&g_coord_wr);
+    if (fd >= 0) {
+        const char b = 1;
+        ssize_t w;
+        do {
+            w = write(fd, &b, 1);
+        } while (w < 0 && errno == EINTR);
+        if (w == 1) {
+            atomic_fetch_add(&g_coord_notified, 1u);
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            atomic_fetch_add(&g_coord_coalesced, 1u);
+        } else {
+            atomic_fetch_add(&g_coord_failed, 1u);
+        }
+    }
+    atomic_fetch_sub(&g_coord_inflight, 1u);
+    errno = saved;
+}
+
+static bool
+coord_fd_nonblocking(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+    int fdf = fcntl(fd, F_GETFD);
+    return fl >= 0 && fdf >= 0 &&
+           fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0 &&
+           fcntl(fd, F_SETFD, fdf | FD_CLOEXEC) == 0;
+}
+
+/* Before any producer exists: before a facade is created (lanes publish) and
+ * before the signal handlers are installed. */
+static bool
+coord_wake_init(void)
+{
+    int p[2];
+    if (pipe(p) != 0) {
+        return false;
+    }
+    if (!coord_fd_nonblocking(p[0]) || !coord_fd_nonblocking(p[1])) {
+        close(p[0]);
+        close(p[1]);
+        return false;
+    }
+    atomic_store(&g_coord_notified, 0u);
+    atomic_store(&g_coord_coalesced, 0u);
+    atomic_store(&g_coord_failed, 0u);
+    g_coord_rd = p[0];
+    atomic_store(&g_coord_wr, p[1]);
+    return true;
+}
+
+/* After every producer that could still hold the descriptor is gone (lanes
+ * joined, admin settled). Signal handlers stay installed: once the write end
+ * is unpublished they latch and write nothing, and a handler already past
+ * the load is waited out before the close. */
+static void
+coord_wake_retire(void)
+{
+    int fd = atomic_exchange(&g_coord_wr, -1);
+    while (atomic_load(&g_coord_inflight) != 0u) {
+        sched_yield();
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (g_coord_rd >= 0) {
+        close(g_coord_rd);
+        g_coord_rd = -1;
+    }
+}
+
+/* Read attempts one drain pass may make, interrupted ones included. A
+ * producer refilling the pipe as fast as it is read cannot hold the
+ * coordinator here: after this many attempts the turn goes on to the stop,
+ * health and work checks, and whatever is left keeps the pipe readable for
+ * the next wait, so no notification is lost. */
+#define RELAY_COORD_DRAIN_READS 16u
+
+#ifdef MOQR_PUMP_TESTING
+/* Test seam: the drain's read (a sustained producer or EINTR, made
+ * deterministic). A test may install it while the coordinator runs, so the
+ * pointer is published and loaded atomically. Never in a shipped binary. */
+typedef ssize_t (*coord_read_fn)(int, void *, size_t);
+static _Atomic(coord_read_fn) g_coord_read = read;
+static unsigned g_coord_last_drain_reads;
+#define COORD_READ(fd, buf, n)                                             \
+    atomic_load_explicit(&g_coord_read, memory_order_acquire)((fd), (buf), \
+                                                              (n))
+#else
+#define COORD_READ(fd, buf, n) read((fd), (buf), (n))
+#endif
+
+/* One bounded drain pass: read until the pipe is empty or the pass has made
+ * RELAY_COORD_DRAIN_READS attempts. False only on an unexpected read error
+ * or end of file. */
+static bool
+coord_wake_drain(void)
+{
+    char buf[64];
+    unsigned attempts = 0;
+    bool ok = true;
+    while (attempts < RELAY_COORD_DRAIN_READS) {
+        attempts++;
+        ssize_t r = COORD_READ(g_coord_rd, buf, sizeof(buf));
+        if (r > 0) {
+            continue;
+        }
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        ok = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        break;
+    }
+#ifdef MOQR_PUMP_TESTING
+    g_coord_last_drain_reads = attempts;
+#endif
+    return ok;
+}
+
+static uint64_t
+coord_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000) +
+           (uint64_t)ts.tv_nsec / UINT64_C(1000);
+}
+
+/* Wait until the pipe is readable (1) or `deadline_us` passes (0); -1 on a
+ * poll error. An interrupted wait resumes against the SAME deadline, so a
+ * stream of signals cannot keep extending it. UINT64_MAX waits for a byte
+ * alone. */
+static int
+coord_wake_wait_until(uint64_t deadline_us)
+{
+    for (;;) {
+        int timeout_ms = -1;
+        if (deadline_us != UINT64_MAX) {
+            uint64_t now = coord_now_us();
+            if (now >= deadline_us) {
+                return 0;
+            }
+            uint64_t left_ms = (deadline_us - now + 999u) / 1000u;
+            timeout_ms = left_ms > (uint64_t)INT32_MAX ? INT32_MAX
+                                                        : (int)left_ms;
+        }
+        struct pollfd pfd = { .fd = g_coord_rd, .events = POLLIN,
+                              .revents = 0 };
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr > 0) {
+            return 1;
+        }
+        if (pr < 0 && errno != EINTR) {
+            return -1;
+        }
+        /* pr == 0 (the deadline) or EINTR: re-evaluate the same deadline. */
+    }
+}
+
+#ifdef MOQR_PUMP_TESTING
+/* Test seam: the health interval (UINT64_MAX disables the fallback, so a
+ * lost notification cannot be rescued by it). Never in a shipped binary. */
+static uint64_t g_coord_health_us = RELAY_COORD_HEALTH_US;
+#define RELAY_COORD_HEALTH_INTERVAL() g_coord_health_us
+#else
+#define RELAY_COORD_HEALTH_INTERVAL() RELAY_COORD_HEALTH_US
+#endif
+
+/* Coordinator observations, for the opt-in wake report and the tests. */
+static _Atomic unsigned long long g_coord_turns;        /* loop turns */
+static _Atomic unsigned long long g_coord_pipe_wakes;   /* waits a byte ended */
+static _Atomic unsigned long long g_coord_health_wakes; /* waits the deadline ended */
+static _Atomic unsigned long long g_coord_renders;      /* generations rendered */
+static _Atomic unsigned long long g_coord_conversions;  /* signal latches turned into requests */
+static _Atomic unsigned long long g_coord_trace_wakes;  /* lane wakes for a trace epoch */
+static _Atomic unsigned long long g_coord_forwards;     /* signal demand forwarded to admin */
+
+/* Opt-in (MOQR_COORD_WAKE_STATS set and not "0"): one line of the counters
+ * above, after the coordinator has stopped. */
+static void
+coord_wake_report(void)
+{
+    const char *e = getenv("MOQR_COORD_WAKE_STATS");
+    if (e == NULL || *e == '\0' || strcmp(e, "0") == 0) {
+        return;
+    }
+    fprintf(stderr,
+            "MOQ5 Relay: coordinator wakes turns=%llu pipe=%llu health=%llu "
+            "notified=%llu coalesced=%llu failed=%llu renders=%llu "
+            "conversions=%llu forwards=%llu trace_wakes=%llu\n",
+            atomic_load(&g_coord_turns), atomic_load(&g_coord_pipe_wakes),
+            atomic_load(&g_coord_health_wakes),
+            atomic_load(&g_coord_notified), atomic_load(&g_coord_coalesced),
+            atomic_load(&g_coord_failed), atomic_load(&g_coord_renders),
+            atomic_load(&g_coord_conversions), atomic_load(&g_coord_forwards),
+            atomic_load(&g_coord_trace_wakes));
+}
+
 static void
 on_signal(int sig)
 {
     (void)sig;
     atomic_store(&g_stop, 1);
+    coord_wake_notify();
 }
 
 /*
@@ -152,6 +392,9 @@ on_dump_signal(int sig)
     } else if (sig == SIGUSR2) {
         atomic_fetch_add(&g_dump_trace_epoch, 1u);
     }
+    /* Latched first, then the wake: the coordinator rereads the latches
+     * after draining. Errno is preserved inside. */
+    coord_wake_notify();
 }
 
 /* The multi-lane path installs its own named handler so the signal-order gate
@@ -213,9 +456,152 @@ typedef struct coord_retire_ctx {
 } coord_retire_ctx_t;
 
 #ifdef MOQR_PUMP_TESTING
+/* The coordinator hooks below may be installed or cleared while the
+ * coordinator runs: each (function, context) pair is set and read as one
+ * under this lock, and called outside it. */
+static pthread_mutex_t g_coord_hook_mu = PTHREAD_MUTEX_INITIALIZER;
 static void (*g_coord_midflight)(void *);
 static void  *g_coord_midflight_ctx;
 static void (*g_coord_pinned)(void *);
+static _Atomic unsigned g_coord_dump_failures;   /* renders still to fail */
+
+/* Row publications begun and those whose notification has been posted (see
+ * relay_publish_row). Equal means no publication's notification is still on
+ * its way to the self-pipe. */
+static _Atomic unsigned long long g_test_rows_begun;
+static _Atomic unsigned long long g_test_rows_notified;
+
+/* Coordinator counters (notified, pipe wakes, health wakes) as observed by
+ * the coordinator itself at two boundaries: the injected render failure, and
+ * the last successful render. Each record is written before the counter that
+ * announces it (the failure count, the render count), so a reader that sees
+ * the announcement reads the record of that boundary. */
+static _Atomic unsigned long long g_test_fail_at[3];
+static _Atomic unsigned long long g_test_render_at[3];
+
+static void
+coord_test_record(_Atomic unsigned long long at[3])
+{
+    atomic_store(&at[0], atomic_load(&g_coord_notified));
+    atomic_store(&at[1], atomic_load(&g_coord_pipe_wakes));
+    atomic_store(&at[2], atomic_load(&g_coord_health_wakes));
+}
+
+/* Where a coordinator event fell: its place in one sequence shared by every
+ * mark, the loop turn it ran in, and how many waits the loop had entered. */
+typedef struct {
+    _Atomic unsigned long long seq;
+    _Atomic unsigned long long turn;
+    _Atomic unsigned long long waits;
+} coord_test_mark_t;
+
+static _Atomic unsigned long long g_test_seq;
+static _Atomic unsigned long long g_test_wait_entries;  /* waits entered */
+
+/* The release-specific lane wake. Its observation takes the wake call's own
+ * result (see the release branch of cmd_serve_lanes), so a release branch
+ * without that call records nothing, whatever else pumps the lanes. The
+ * first accepted wake of a serve is marked. */
+static _Atomic unsigned long long g_test_release_wakes;    /* accepted */
+static _Atomic unsigned long long g_test_release_refused;
+static coord_test_mark_t          g_test_release_mark;
+
+/* One mark per rendered generation of this serve, by render index. */
+#define COORD_TEST_RENDER_MARKS 8u
+static coord_test_mark_t g_test_render_marks[COORD_TEST_RENDER_MARKS];
+
+static void
+coord_test_mark(coord_test_mark_t *m)
+{
+    atomic_store(&m->turn, atomic_load(&g_coord_turns));
+    atomic_store(&m->waits, atomic_load(&g_test_wait_entries));
+    atomic_store(&m->seq, atomic_fetch_add(&g_test_seq, 1u) + 1u);
+}
+
+static void
+coord_test_mark_clear(coord_test_mark_t *m)
+{
+    atomic_store(&m->seq, 0u);
+    atomic_store(&m->turn, 0u);
+    atomic_store(&m->waits, 0u);
+}
+
+static void
+coord_test_release_woke(bool accepted)
+{
+    if (!accepted) {
+        atomic_fetch_add(&g_test_release_refused, 1u);
+        return;
+    }
+    if (atomic_load(&g_test_release_wakes) == 0u) {
+        coord_test_mark(&g_test_release_mark);
+    }
+    atomic_fetch_add(&g_test_release_wakes, 1u);
+}
+/* Takes the release wake call's result: the test build observes it, a
+ * shipped build discards it (as serve_wake_shard does). */
+#define RELEASE_WAKE_SEEN(accepted) coord_test_release_woke(accepted)
+
+/* The injection boundary of an armed render failure. Deferrals because the
+ * self-pipe still held a byte (the first one recorded and marked, with the
+ * armed count it left untouched); poll results that prove neither empty nor
+ * readable (an error, POLLERR, POLLNVAL or POLLHUP), which fail the fixture;
+ * and the mark of the injected failure. */
+static _Atomic unsigned long long g_test_fail_deferred;
+static _Atomic unsigned long long g_test_boundary_faults;
+static _Atomic unsigned long long g_test_defer_at[3];
+static _Atomic unsigned long long g_test_defer_armed;
+static coord_test_mark_t          g_test_defer_mark;
+static coord_test_mark_t          g_test_fail_mark;
+
+/* The coordinator's self-pipe at this instant, without consuming it: 0 when
+ * a zero-timeout poll returns exactly 0 (empty), 1 when it reports only
+ * POLLIN (a byte is waiting), -1 for anything else. Coordinator thread. */
+static int
+coord_test_pipe_state(void)
+{
+    struct pollfd pfd = { .fd = g_coord_rd, .events = POLLIN, .revents = 0 };
+    int r = poll(&pfd, 1, 0);
+    if (r == 0) {
+        return 0;
+    }
+    if (r == 1 && (pfd.revents & (POLLERR | POLLNVAL | POLLHUP)) == 0 &&
+        (pfd.revents & POLLIN) != 0) {
+        return 1;
+    }
+    return -1;
+}
+
+/* Called by a lane between publishing its row and notifying the coordinator,
+ * so a test can hold the notification back. */
+static void (*g_test_publish_gate)(void *);
+static void  *g_test_publish_gate_ctx;
+
+static void
+coord_test_publish_gate(void)
+{
+    pthread_mutex_lock(&g_coord_hook_mu);
+    void (*fn)(void *) = g_test_publish_gate;
+    void *ctx = g_test_publish_gate_ctx;
+    pthread_mutex_unlock(&g_coord_hook_mu);
+    if (fn != NULL) {
+        fn(ctx);
+    }
+}
+
+/* Whether every lane has published a row for the newest requested epoch. */
+static bool
+coord_test_rows_complete(moqr_cli_snapshot_t *snap)
+{
+    moqr_cli_snapshot_stats_t *rows =
+        calloc(snap->lanes, sizeof(moqr_cli_snapshot_stats_t));
+    uint64_t e = 0;
+    bool complete = rows != NULL &&
+                    moqr_cli_snapshot_collect(snap, coord_epoch, NULL, rows,
+                                              &e) == MOQR_OK;
+    free(rows);
+    return complete;
+}
 static void  *g_coord_pinned_ctx;
 static bool   g_corrupt_release_bank;
 
@@ -225,8 +611,12 @@ static bool   g_corrupt_release_bank;
 static void
 coord_midflight(void)
 {
-    if (g_coord_midflight != NULL) {
-        g_coord_midflight(g_coord_midflight_ctx);
+    pthread_mutex_lock(&g_coord_hook_mu);
+    void (*fn)(void *) = g_coord_midflight;
+    void *ctx = g_coord_midflight_ctx;
+    pthread_mutex_unlock(&g_coord_hook_mu);
+    if (fn != NULL) {
+        fn(ctx);
     }
 }
 
@@ -236,11 +626,16 @@ coord_midflight(void)
 static void
 coord_pinned(void)
 {
-    if (g_coord_pinned != NULL) {
-        g_coord_pinned(g_coord_pinned_ctx);
+    pthread_mutex_lock(&g_coord_hook_mu);
+    void (*fn)(void *) = g_coord_pinned;
+    void *ctx = g_coord_pinned_ctx;
+    pthread_mutex_unlock(&g_coord_hook_mu);
+    if (fn != NULL) {
+        fn(ctx);
     }
 }
 #else
+#define RELEASE_WAKE_SEEN(accepted) ((void)(accepted))
 static void
 coord_midflight(void)
 {
@@ -348,8 +743,49 @@ coord_try_dump_labels(const moqr_obs_labels_t *labels,
         false
     };
     uint64_t      epoch = 0;
-    moqr_result_t rc = moqr_cli_coord_dump(snap, labels, coord_epoch, NULL,
-                                           coord_emit_retire, &rc_ctx, &epoch);
+    moqr_result_t rc;
+#ifdef MOQR_PUMP_TESTING
+    if (atomic_load(&g_coord_dump_failures) > 0u) {
+        /* Test seam: a transient render failure (as an allocation failure
+         * inside the dump would report it), injected only where nothing but
+         * the health turn is left to retry it: every row has arrived, every
+         * publication has posted its notification, and the self-pipe is
+         * empty -- a posted byte may still be waiting, written after this
+         * turn's drain. Until then the generation stays outstanding, the
+         * failure stays armed, and the turn goes to its ordinary wait, which
+         * the waiting byte (or the notification still to come) ends; the real
+         * dump is not attempted, so nothing renders before the failure. The
+         * counters at the boundary are recorded before the failure is
+         * announced. */
+        if (!coord_test_rows_complete(snap) ||
+            atomic_load(&g_test_rows_notified) !=
+                atomic_load(&g_test_rows_begun)) {
+            return rendered;
+        }
+        const int ps = coord_test_pipe_state();
+        if (ps != 0) {
+            if (ps > 0) {
+                if (atomic_load(&g_test_fail_deferred) == 0u) {
+                    coord_test_record(g_test_defer_at);
+                    atomic_store(&g_test_defer_armed,
+                                 atomic_load(&g_coord_dump_failures));
+                    coord_test_mark(&g_test_defer_mark);
+                }
+                atomic_fetch_add(&g_test_fail_deferred, 1u);
+            } else {
+                atomic_fetch_add(&g_test_boundary_faults, 1u);
+            }
+            return rendered;
+        }
+        coord_test_record(g_test_fail_at);
+        coord_test_mark(&g_test_fail_mark);
+        atomic_fetch_sub(&g_coord_dump_failures, 1u);
+        epoch = target;
+        rc = MOQR_ERR_NOMEM;
+    } else
+#endif
+    rc = moqr_cli_coord_dump(snap, labels, coord_epoch, NULL,
+                             coord_emit_retire, &rc_ctx, &epoch);
 
     if (rc == MOQR_ERR_INVAL) {
         /* Suppressed: no document exists, but the generation still finished
@@ -1872,11 +2308,51 @@ reap_wt(moqr_bind_t *bind, void *lane)
 }
 #endif
 
+#ifdef MOQR_PUMP_TESTING
+/* Test seam: an acknowledged lane-pump boundary. A test posts a request
+ * number; every lane pump reads the newest request when it begins and, when
+ * it has finished (its row publication included), acknowledges the number it
+ * read. Lane pumps run one at a time on their lane's thread, so an
+ * acknowledgement of request R proves that a pump which began after R was
+ * posted has finished, and with it every pump of that lane begun earlier.
+ * Never in a shipped binary. */
+static _Atomic uint64_t g_test_pump_req;
+static _Atomic uint64_t g_test_pump_ack[MOQR_CLI_MAX_LANES];
+#endif
+
+/* Publish a lane's row, then tell its generation's owner: the admin endpoint
+ * when it exists, the coordinator (one self-pipe byte) otherwise. The row is
+ * visible before the notification, so the owner's next read finds it. */
+static void
+relay_publish_row(serve_lanes_ctx_t *ctx, uint32_t shard,
+                  const moqr_cli_snapshot_stats_t *st, uint64_t serial)
+{
+#ifdef MOQR_PUMP_TESTING
+    atomic_fetch_add(&g_test_rows_begun, 1u);
+#endif
+    moqr_cli_snapshot_publish(ctx->snap, shard, st, serial);
+#ifdef MOQR_PUMP_TESTING
+    coord_test_publish_gate();
+#endif
+    if (atomic_load_explicit(&ctx->admin_listen, memory_order_acquire) !=
+        NULL) {
+        admin_notify_published(&ctx->admin_listen);
+    } else {
+        coord_wake_notify();
+    }
+#ifdef MOQR_PUMP_TESTING
+    atomic_fetch_add(&g_test_rows_notified, 1u);
+#endif
+}
+
 static int
 relay_pump_shard(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
                  uint32_t shard, uint64_t now_us, moqr_bind_t *bind,
                  relay_reap_fn reap, void *lane)
 {
+#ifdef MOQR_PUMP_TESTING
+    const uint64_t test_req = atomic_load(&g_test_pump_req);
+#endif
     uint64_t mask = 0;
     moqr_result_t rc =
         moqr_shards_step_shard(ctx->shards, (uint16_t)shard, now_us, &mask);
@@ -2060,9 +2536,7 @@ relay_pump_shard(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
             }
         }
 #endif
-        moqr_cli_snapshot_publish(ctx->snap, shard, &st, serial);
-        /* Published -- tell the owner, at the publish point. */
-        admin_notify_published(&ctx->admin_listen);
+        relay_publish_row(ctx, shard, &st, serial);
     }
     unsigned te = atomic_load(&g_dump_trace_epoch);
     if (ctx->seen_trace_epoch[shard] != te) {
@@ -2071,6 +2545,11 @@ relay_pump_shard(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw,
         dump_emit(lbl, dump_trace_fn,
                   moqr_shards_trace(ctx->shards, (uint16_t)shard));
     }
+#ifdef MOQR_PUMP_TESTING
+    if (shard < MOQR_CLI_MAX_LANES) {
+        atomic_store(&g_test_pump_ack[shard], test_req);
+    }
+#endif
     return atomic_load(&g_stop) ? 1 : 0;
 }
 
@@ -2327,17 +2806,16 @@ relay_raw_destroy(serve_lanes_ctx_t *ctx)
     }
 }
 
-/* The coordinator's wait: MOQ_ERR_CLOSED once the raw listener is terminal
- * (for PicoQUIC, any one of its facades: a relay that has lost a lane is not
- * serving its configuration). */
+/* The coordinator's health check: MOQ_ERR_CLOSED once the raw listener is
+ * terminal (for PicoQUIC, any one of its facades: a relay that has lost a
+ * lane is not serving its configuration). It never blocks: the coordinator
+ * waits on its own self-pipe, which facade activity does not write. */
 static moq_result_t
-relay_raw_wait(serve_lanes_ctx_t *ctx, uint64_t timeout_us)
+relay_raw_poll(serve_lanes_ctx_t *ctx)
 {
 #ifdef MOQR_HAVE_PICOQUIC
     uint32_t n = atomic_load(&ctx->pq_count);
     if (n > 0) {
-        moq_result_t rc = moq_pq_threaded_wait(atomic_load(&ctx->pq[0]),
-                                               timeout_us);
         for (uint32_t i = 0; i < n; i++) {
             moq_pq_threaded_t *f = atomic_load(&ctx->pq[i]);
             if (moq_pq_threaded_is_fatal(f) ||
@@ -2345,10 +2823,11 @@ relay_raw_wait(serve_lanes_ctx_t *ctx, uint64_t timeout_us)
                 return MOQ_ERR_CLOSED;
             }
         }
-        return rc;
+        return MOQ_OK;
     }
 #endif
-    return moq_msquic_managed_wait(ctx->raw, timeout_us);
+    return moq_msquic_managed_wait(ctx->raw, 0) == MOQ_ERR_CLOSED
+               ? MOQ_ERR_CLOSED : MOQ_OK;
 }
 
 /* A raw lane's doorbell counters. The PicoQUIC facade keeps none, so its
@@ -2600,6 +3079,25 @@ coord_try_dump_blocked(const serve_lanes_ctx_t *ctx, moqr_cli_snapshot_t *snap,
 }
 #endif  /* MOQR_BIND_TESTING */
 
+#ifdef MOQR_PUMP_TESTING
+/* Test seam: the running serve's context, published only while its
+ * coordinator loop runs, so a test can wake its lanes (busy lanes) or stop a
+ * lane-0 facade (terminal health) without a client. Never in a shipped
+ * binary. */
+static pthread_mutex_t        g_test_serve_mu = PTHREAD_MUTEX_INITIALIZER;
+static serve_lanes_ctx_t     *g_test_serve_ctx;
+static moq_msquic_managed_t  *g_test_serve_raw;
+
+static void
+test_serve_publish(serve_lanes_ctx_t *ctx, moq_msquic_managed_t *raw)
+{
+    pthread_mutex_lock(&g_test_serve_mu);
+    g_test_serve_ctx = ctx;
+    g_test_serve_raw = raw;
+    pthread_mutex_unlock(&g_test_serve_mu);
+}
+#endif
+
 static int
 cmd_serve_lanes(const moqr_cli_config_t *cfg)
 {
@@ -2697,6 +3195,48 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         moqr_shards_destroy(shards);
         return serve_done(&log, 1);
     }
+    /* The coordinator's self-pipe exists before any producer can: a facade's
+     * lanes publish rows from inside its create, and the signal handlers are
+     * installed further down. */
+    if (!coord_wake_init()) {
+        fprintf(stderr, "MOQ5 Relay: coordinator wake pipe init failed\n");
+        moqr_cli_snapshot_destroy(&snap);
+        moqr_broker_destroy(&g_metrics_broker);
+        moqr_shards_destroy(shards);
+        free(ctx);
+        return serve_done(&log, 1);
+    }
+    atomic_store(&g_coord_turns, 0u);
+    atomic_store(&g_coord_pipe_wakes, 0u);
+    atomic_store(&g_coord_health_wakes, 0u);
+    atomic_store(&g_coord_renders, 0u);
+    atomic_store(&g_coord_conversions, 0u);
+    atomic_store(&g_coord_trace_wakes, 0u);
+    atomic_store(&g_coord_forwards, 0u);
+#ifdef MOQR_PUMP_TESTING
+    /* The boundary records belong to this serve, like the counters. */
+    for (int i = 0; i < 3; i++) {
+        atomic_store(&g_test_fail_at[i], 0u);
+        atomic_store(&g_test_render_at[i], 0u);
+    }
+    atomic_store(&g_test_wait_entries, 0u);
+    atomic_store(&g_test_release_wakes, 0u);
+    atomic_store(&g_test_release_refused, 0u);
+    coord_test_mark_clear(&g_test_release_mark);
+    atomic_store(&g_test_rows_begun, 0u);
+    atomic_store(&g_test_rows_notified, 0u);
+    atomic_store(&g_test_fail_deferred, 0u);
+    atomic_store(&g_test_boundary_faults, 0u);
+    atomic_store(&g_test_defer_armed, 0u);
+    for (int i = 0; i < 3; i++) {
+        atomic_store(&g_test_defer_at[i], 0u);
+    }
+    coord_test_mark_clear(&g_test_defer_mark);
+    coord_test_mark_clear(&g_test_fail_mark);
+    for (unsigned i = 0; i < COORD_TEST_RENDER_MARKS; i++) {
+        coord_test_mark_clear(&g_test_render_marks[i]);
+    }
+#endif
     ctx->shards = shards;
     ctx->snap = &snap;
     ctx->lanes = plan.total_shards;
@@ -2716,6 +3256,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
     if (cfg->transport == MOQR_CLI_TRANSPORT_PICOQUIC) {
 #ifdef MOQR_HAVE_PICOQUIC
         if (!relay_pq_create_lanes(ctx, cfg, raw_max_conns)) {
+            coord_wake_retire();
             moqr_cli_snapshot_destroy(&snap);
             moqr_broker_destroy(&g_metrics_broker);
             moqr_shards_destroy(shards);
@@ -2764,6 +3305,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
 
         if (moq_msquic_managed_create(&tcfg, &t) != MOQ_OK) {
             fprintf(stderr, "transport create failed (port %d)\n", cfg->port);
+            coord_wake_retire();
             moqr_cli_snapshot_destroy(&snap);
             moqr_broker_destroy(&g_metrics_broker);
             moqr_shards_destroy(shards);
@@ -2792,6 +3334,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
                     cfg->wt.port);
             relay_raw_stop(ctx);
             relay_raw_destroy(ctx);
+            coord_wake_retire();
             moqr_cli_snapshot_destroy(&snap);
             moqr_broker_destroy(&g_metrics_broker);
             moqr_shards_destroy(shards);
@@ -2822,6 +3365,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         relay_raw_destroy(ctx);
         /* Facades stopped and lanes joined: nothing can reach the broker or
          * the snapshot any more, so both are safe to tear down here. */
+        coord_wake_retire();
         moqr_cli_snapshot_destroy(&snap);
         moqr_broker_destroy(&g_metrics_broker);
         moqr_shards_destroy(shards);
@@ -2856,6 +3400,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
 #endif
         relay_raw_stop(ctx);
         relay_raw_destroy(ctx);
+        coord_wake_retire();
         moqr_cli_snapshot_destroy(&snap);
         moqr_broker_destroy(&g_metrics_broker);
         moqr_shards_destroy(shards);
@@ -2882,6 +3427,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         relay_raw_destroy(ctx);
         atomic_store_explicit(&ctx->admin_listen, NULL, memory_order_release);
         admin_endpoint_destroy(admin_l, &admin_owner);
+        coord_wake_retire();
         moqr_cli_snapshot_destroy(&snap);
         moqr_broker_destroy(&g_metrics_broker);
         moqr_shards_destroy(shards);
@@ -2903,8 +3449,29 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
     uint64_t incomplete_told = 0;
     uint64_t fail_told = 0;
     unsigned woken_trace = 0;
+    /* One health deadline at a time: a byte from the self-pipe ends a wait
+     * early without moving it, and only the deadline passing starts the next
+     * interval. Facades, WebTransport and the admin owner are checked on
+     * every turn whatever woke it. */
+    uint64_t health_due;
+    {
+        uint64_t iv = RELAY_COORD_HEALTH_INTERVAL();
+        uint64_t now = coord_now_us();
+        health_due = iv > UINT64_MAX - now ? UINT64_MAX : now + iv;
+    }
+#ifdef MOQR_PUMP_TESTING
+    test_serve_publish(ctx, t);
+#endif
     while (!atomic_load(&g_stop)) {
-        if (relay_raw_wait(ctx, 500 * 1000) == MOQ_ERR_CLOSED) {
+        atomic_fetch_add(&g_coord_turns, 1u);
+        /* Drain BEFORE reading any state: a notification posted after this
+         * point stays in the pipe for the wait at the end of the turn. */
+        if (!coord_wake_drain()) {
+            fprintf(stderr, "MOQ5 Relay: coordinator wake pipe failed — "
+                            "stopping\n");
+            break;
+        }
+        if (relay_raw_poll(ctx) == MOQ_ERR_CLOSED) {
             break;
         }
         /* An endpoint whose owner has died is a dead admin surface (every
@@ -2933,7 +3500,14 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
          * here rather than in the handler is what keeps generation identity
          * and output demand separable. */
         bool wake_lanes = false;
+        /* With the endpoint, the latch is its owner's to consume (it alone
+         * opens generations): wake it, and leave the latch for it. */
+        if (admin_l != NULL && atomic_load(&g_signal_metrics_pending) != 0) {
+            moqr_admin_listen_notify(admin_l);
+            atomic_fetch_add(&g_coord_forwards, 1u);
+        }
         if (admin_l == NULL && atomic_exchange(&g_signal_metrics_pending, 0)) {
+            atomic_fetch_add(&g_coord_conversions, 1u);
             uint64_t issued = 0;
             bool     w = false;
             if (moqr_broker_request(&g_metrics_broker,
@@ -2955,6 +3529,9 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
             admin_l == NULL && moqr_broker_busy(&g_metrics_broker);
         unsigned te = atomic_load(&g_dump_trace_epoch);
         if (wake_lanes || state_owed || te != woken_trace) {
+            if (te != woken_trace) {
+                atomic_fetch_add(&g_coord_trace_wakes, 1u);
+            }
             woken_trace = te;
             for (uint32_t d = 0; d < plan.total_shards; d++) {
                 /* a WebTransport shard has no raw lane: route by plan */
@@ -2965,6 +3542,7 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
         /* `state_owed` is already false whenever the endpoint exists, so the
          * coordinator cannot run beside its owner. */
         if (state_owed) {
+            const uint64_t rendered_before = rendered_epoch;
 #ifdef MOQR_BIND_TESTING
             rendered_epoch = coord_try_dump_blocked(
                 ctx, &snap, rendered_epoch, &incomplete_told, &fail_told,
@@ -2979,11 +3557,48 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
              * for the next poll cadence. */
             if (wake_after_release) {
                 for (uint32_t d = 0; d < plan.total_shards; d++) {
-                    serve_wake_shard(ctx, t, d);
+                    RELEASE_WAKE_SEEN(serve_wake_shard_checked(ctx, t, d));
                 }
             }
+            if (rendered_epoch != rendered_before) {
+#ifdef MOQR_PUMP_TESTING
+                coord_test_record(g_test_render_at);
+                {
+                    unsigned long long i = atomic_load(&g_coord_renders);
+                    if (i < COORD_TEST_RENDER_MARKS) {
+                        coord_test_mark(&g_test_render_marks[i]);
+                    }
+                }
+#endif
+                atomic_fetch_add(&g_coord_renders, 1u);
+            }
+        }
+        if (atomic_load(&g_stop)) {
+            break;
+        }
+        /* Nothing more to do on this turn: wait for coordinator work or the
+         * health deadline. A transient render failure, a generation whose
+         * rows are still arriving, and health all resume from here. */
+#ifdef MOQR_PUMP_TESTING
+        atomic_fetch_add(&g_test_wait_entries, 1u);
+#endif
+        int w = coord_wake_wait_until(health_due);
+        if (w > 0) {
+            atomic_fetch_add(&g_coord_pipe_wakes, 1u);
+        } else if (w == 0) {
+            atomic_fetch_add(&g_coord_health_wakes, 1u);
+            uint64_t iv = RELAY_COORD_HEALTH_INTERVAL();
+            uint64_t now = coord_now_us();
+            health_due = iv > UINT64_MAX - now ? UINT64_MAX : now + iv;
+        } else {
+            fprintf(stderr, "MOQ5 Relay: coordinator wake pipe failed — "
+                            "stopping\n");
+            break;
         }
     }
+#ifdef MOQR_PUMP_TESTING
+    test_serve_publish(NULL, NULL);
+#endif
     /* The endpoint is cancelled and joined BEFORE either facade stops, so the
      * owner thread has settled every bank while everything it reads is still
      * alive. The endpoint OBJECT outlives this, until every lane has joined. */
@@ -3081,6 +3696,8 @@ cmd_serve_lanes(const moqr_cli_config_t *cfg)
      * only now is the endpoint object safe to release. */
     atomic_store_explicit(&ctx->admin_listen, NULL, memory_order_release);
     admin_endpoint_destroy(admin_l, &admin_owner);
+    coord_wake_retire();
+    coord_wake_report();
     moqr_cli_snapshot_destroy(&snap);
     moqr_broker_destroy(&g_metrics_broker);
     moqr_shards_destroy(shards);   /* owns per-shard bind/core/trace teardown */
@@ -3370,6 +3987,221 @@ uint64_t moqr_test_lanes_ctx_wake_pushes(void *vctx, uint32_t lane)
 
 void moqr_test_raise_stop(void) { on_signal(SIGTERM); }
 
+/* The coordinator's self-pipe and its counters, driven directly. */
+bool moqr_test_coord_wake_init(void) { return coord_wake_init(); }
+void moqr_test_coord_wake_retire(void) { coord_wake_retire(); }
+void moqr_test_coord_wake_notify(void) { coord_wake_notify(); }
+bool moqr_test_coord_wake_drain(void) { return coord_wake_drain(); }
+int moqr_test_coord_wake_wait_until(uint64_t deadline_us)
+{
+    return coord_wake_wait_until(deadline_us);
+}
+uint64_t moqr_test_coord_now_us(void) { return coord_now_us(); }
+int moqr_test_coord_wake_wr(void) { return atomic_load(&g_coord_wr); }
+/* Readable right now, without waiting: the deterministic oracle for "a
+ * notification is pending". */
+bool moqr_test_coord_wake_readable(void)
+{
+    struct pollfd pfd = { .fd = g_coord_rd, .events = POLLIN, .revents = 0 };
+    return g_coord_rd >= 0 && poll(&pfd, 1, 0) > 0;
+}
+void moqr_test_coord_set_health_us(uint64_t us) { g_coord_health_us = us; }
+/* The drain's read (NULL restores read) and the attempts of its last pass. */
+void moqr_test_coord_set_read(ssize_t (*fn)(int, void *, size_t))
+{
+    atomic_store_explicit(&g_coord_read, fn != NULL ? fn : read,
+                          memory_order_release);
+}
+unsigned moqr_test_coord_last_drain_reads(void) { return g_coord_last_drain_reads; }
+unsigned moqr_test_coord_drain_bound(void) { return RELAY_COORD_DRAIN_READS; }
+/* Make the next `n` coordinator renders fail transiently; the count left. */
+void moqr_test_coord_fail_renders(unsigned n) { atomic_store(&g_coord_dump_failures, n); }
+unsigned moqr_test_coord_render_failures_left(void)
+{
+    return atomic_load(&g_coord_dump_failures);
+}
+/* The coordinator's (notified, pipe wakes, health wakes) at the last injected
+ * render failure and at the last successful render. */
+void moqr_test_coord_fail_at(uint64_t out[3])
+{
+    for (int i = 0; i < 3; i++) {
+        out[i] = atomic_load(&g_test_fail_at[i]);
+    }
+}
+void moqr_test_coord_render_at(uint64_t out[3])
+{
+    for (int i = 0; i < 3; i++) {
+        out[i] = atomic_load(&g_test_render_at[i]);
+    }
+}
+/* This serve's release-specific lane wakes: accepted, refused, then the
+ * first accepted one's mark (seq, turn, waits entered). */
+void moqr_test_coord_release_wake(uint64_t out[5])
+{
+    out[0] = atomic_load(&g_test_release_wakes);
+    out[1] = atomic_load(&g_test_release_refused);
+    out[2] = atomic_load(&g_test_release_mark.seq);
+    out[3] = atomic_load(&g_test_release_mark.turn);
+    out[4] = atomic_load(&g_test_release_mark.waits);
+}
+/* The armed render failure's injection boundary in this serve:
+ *   [0] deferrals because the pipe held a byte  [1] poll faults
+ *   [2] row publications begun  [3] row notifications posted
+ *   [4..6] (notified, pipe, health) at the first deferral
+ *   [7] armed count left at the first deferral
+ *   [8] first deferral's turn  [9] injected failure's turn
+ *   [10] first deferral's seq  [11] injected failure's seq */
+void moqr_test_coord_retry_boundary(uint64_t out[12])
+{
+    out[0] = atomic_load(&g_test_fail_deferred);
+    out[1] = atomic_load(&g_test_boundary_faults);
+    out[2] = atomic_load(&g_test_rows_begun);
+    out[3] = atomic_load(&g_test_rows_notified);
+    for (int i = 0; i < 3; i++) {
+        out[4 + i] = atomic_load(&g_test_defer_at[i]);
+    }
+    out[7] = atomic_load(&g_test_defer_armed);
+    out[8] = atomic_load(&g_test_defer_mark.turn);
+    out[9] = atomic_load(&g_test_fail_mark.turn);
+    out[10] = atomic_load(&g_test_defer_mark.seq);
+    out[11] = atomic_load(&g_test_fail_mark.seq);
+}
+/* Hold each lane between its row publication and its notification. */
+void moqr_test_set_publish_gate(void (*fn)(void *), void *ctx)
+{
+    pthread_mutex_lock(&g_coord_hook_mu);
+    g_test_publish_gate = fn;
+    g_test_publish_gate_ctx = ctx;
+    pthread_mutex_unlock(&g_coord_hook_mu);
+}
+/* The mark (seq, turn, waits entered) of this serve's render `i`; false
+ * past the recorded range. A zero seq means that render has not happened. */
+bool moqr_test_coord_render_mark(unsigned i, uint64_t out[3])
+{
+    if (i >= COORD_TEST_RENDER_MARKS) {
+        return false;
+    }
+    out[0] = atomic_load(&g_test_render_marks[i].seq);
+    out[1] = atomic_load(&g_test_render_marks[i].turn);
+    out[2] = atomic_load(&g_test_render_marks[i].waits);
+    return true;
+}
+/* An acknowledged lane-0 pump boundary: post a new request, wake lane 0, and
+ * wait (at most `max_ms` of monotonic time) for a lane-0 pump that began after
+ * the request to acknowledge it. True only when that acknowledgement arrived
+ * by the deadline: then every lane-0 pump begun before the request has
+ * finished. False when no serve runs, the wake is refused, or the deadline
+ * passes first. It says nothing of a later pump, such as one a wake still
+ * pending at the request causes. */
+bool moqr_test_serve_lane0_pump_boundary(int max_ms)
+{
+    pthread_mutex_lock(&g_test_serve_mu);
+    serve_lanes_ctx_t *ctx = g_test_serve_ctx;
+    bool acked = false;
+    if (ctx != NULL && ctx->plan.total_shards > 0u) {
+        const uint64_t req = atomic_fetch_add(&g_test_pump_req, 1u) + 1u;
+        const uint64_t deadline =
+            coord_now_us() + (uint64_t)(max_ms > 0 ? max_ms : 0) * 1000u;
+        if (serve_wake_shard_checked(ctx, g_test_serve_raw, 0)) {
+            for (;;) {
+                if (atomic_load(&g_test_pump_ack[0]) >= req) {
+                    acked = coord_now_us() <= deadline;
+                    break;
+                }
+                if (coord_now_us() > deadline) {
+                    break;
+                }
+                struct timespec ts = { 0, 200 * 1000 };
+                nanosleep(&ts, NULL);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_test_serve_mu);
+    return acked;
+}
+/* The broker's busy state, observed only while a serve is published (its
+ * coordinator loop runs, so the broker is alive): false in *live otherwise. */
+bool moqr_test_serve_broker_busy(bool *live)
+{
+    pthread_mutex_lock(&g_test_serve_mu);
+    *live = g_test_serve_ctx != NULL;
+    bool busy = *live && moqr_broker_busy(&g_metrics_broker);
+    pthread_mutex_unlock(&g_test_serve_mu);
+    return busy;
+}
+/* Run `fn(broker, arg)` with the broker only while a serve is published;
+ * false when none is. */
+bool moqr_test_serve_with_broker(void (*fn)(moqr_broker_t *, void *), void *arg)
+{
+    pthread_mutex_lock(&g_test_serve_mu);
+    bool live = g_test_serve_ctx != NULL;
+    if (live) {
+        fn(&g_metrics_broker, arg);
+    }
+    pthread_mutex_unlock(&g_test_serve_mu);
+    return live;
+}
+/* Wake every lane of the running serve (false when none runs). */
+bool moqr_test_serve_wake_lanes(void)
+{
+    pthread_mutex_lock(&g_test_serve_mu);
+    serve_lanes_ctx_t *ctx = g_test_serve_ctx;
+    if (ctx != NULL) {
+        for (uint32_t d = 0; d < ctx->plan.total_shards; d++) {
+            serve_wake_shard(ctx, g_test_serve_raw, d);
+        }
+    }
+    pthread_mutex_unlock(&g_test_serve_mu);
+    return ctx != NULL;
+}
+#ifdef MOQR_HAVE_PICOQUIC
+/* Stop the running serve's lane-0 PicoQUIC facade: a lane-0 terminal the
+ * coordinator can only see through its health check. */
+bool moqr_test_serve_stop_lane0(void)
+{
+    bool done = false;
+    pthread_mutex_lock(&g_test_serve_mu);
+    serve_lanes_ctx_t *ctx = g_test_serve_ctx;
+    if (ctx != NULL && atomic_load(&ctx->pq_count) > 0) {
+        done = moq_pq_threaded_stop(atomic_load(&ctx->pq[0])) == MOQ_OK;
+    }
+    pthread_mutex_unlock(&g_test_serve_mu);
+    return done;
+}
+#endif
+/* notified, coalesced, failed, turns, pipe wakes, health wakes, renders,
+ * conversions, forwards, trace wakes */
+void moqr_test_coord_counts(uint64_t out[10])
+{
+    out[0] = atomic_load(&g_coord_notified);
+    out[1] = atomic_load(&g_coord_coalesced);
+    out[2] = atomic_load(&g_coord_failed);
+    out[3] = atomic_load(&g_coord_turns);
+    out[4] = atomic_load(&g_coord_pipe_wakes);
+    out[5] = atomic_load(&g_coord_health_wakes);
+    out[6] = atomic_load(&g_coord_renders);
+    out[7] = atomic_load(&g_coord_conversions);
+    out[8] = atomic_load(&g_coord_forwards);
+    out[9] = atomic_load(&g_coord_trace_wakes);
+}
+/* The real multi-lane dump handler (SIGUSR1/SIGUSR2), called directly. */
+void moqr_test_dump_signal(int sig) { on_dump_signal_lanes(sig); }
+int moqr_test_signal_metrics_pending(void)
+{
+    return atomic_load(&g_signal_metrics_pending);
+}
+/* A lane's row publication exactly as relay_pump_shard performs it. */
+void moqr_test_lanes_ctx_set_snap(void *vctx, moqr_cli_snapshot_t *snap)
+{
+    ((serve_lanes_ctx_t *)vctx)->snap = snap;
+}
+void moqr_test_publish_row(void *vctx, uint32_t shard,
+                           const moqr_cli_snapshot_stats_t *st,
+                           uint64_t serial)
+{
+    relay_publish_row((serve_lanes_ctx_t *)vctx, shard, st, serial);
+}
+
 /* The two production coordinators, reachable so their generation lifecycle
  * can be driven directly: produce, freeze, take the token, dispatch by frozen
  * demand, release. The verify coordinator is only compiled into the verify
@@ -3379,15 +4211,19 @@ moqr_broker_t *moqr_test_metrics_broker(void) { return &g_metrics_broker; }
 void
 moqr_test_set_coord_midflight(void (*fn)(void *), void *ctx)
 {
+    pthread_mutex_lock(&g_coord_hook_mu);
     g_coord_midflight = fn;
     g_coord_midflight_ctx = ctx;
+    pthread_mutex_unlock(&g_coord_hook_mu);
 }
 
 void
 moqr_test_set_coord_pinned(void (*fn)(void *), void *ctx)
 {
+    pthread_mutex_lock(&g_coord_hook_mu);
     g_coord_pinned = fn;
     g_coord_pinned_ctx = ctx;
+    pthread_mutex_unlock(&g_coord_hook_mu);
 }
 
 /* Make the coordinator's own authenticated release refuse, WITHOUT touching

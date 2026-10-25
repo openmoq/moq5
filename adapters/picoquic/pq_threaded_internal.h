@@ -62,6 +62,7 @@ struct moq_pq_threaded_conn {
      * the application acknowledges; then acked, and freed after the pump. */
     bool            retired;
     bool            acked;
+    uint64_t        events_seen;       /* moq_pq_conn_event_count, last read */
 #ifdef MOQ_PQ_THREADED_TESTING
     bool            test_service_fatal; /* seam: next service pass fatals */
 #endif
@@ -106,6 +107,14 @@ struct moq_pq_threaded {
     uint64_t          (*app_lane_deadline_us)(void *, uint32_t lane_index);
     void               *app_lane_deadline_ctx;
     uint64_t            deadline_served;   /* app deadline instant last woken for */
+    /* Server input sequence: advanced when a connection is accepted and
+     * whenever a connection's picoquic callbacks include one other than
+     * prepare_to_send. input_served is its value when the last pass began:
+     * an after_receive pass finding them equal brought the connections
+     * nothing new (acknowledgements, flow-control credit) and skips its
+     * pre-pump service; it still pumps. Network thread only. */
+    uint64_t            input_seq;
+    uint64_t            input_served;
     void              (*on_activity)(moq_pq_threaded_t *, void *);
     void               *on_activity_ctx;
 
@@ -210,6 +219,7 @@ struct moq_pq_threaded {
     uint64_t            st_after_send;      /* after_send loop callbacks */
     uint64_t            st_after_send_nz;   /* after_send phases that sent >0 pkts */
     uint64_t            st_after_recv;      /* after_receive loop callbacks */
+    uint64_t            st_quiet_recv;      /* after_receive passes with no pre-pump service */
     uint64_t            st_wake;            /* wake_up loop callbacks */
     uint64_t            st_after_send_bytes;/* sum of bytes_sent reported */
     uint64_t            st_service_all;     /* server_service_all invocations */

@@ -105,6 +105,15 @@ bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn);
 bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn);
 
 /*
+ * How many picoquic callbacks other than prepare_to_send the connection has
+ * received: stream data, terminals, datagrams, closes. A count unchanged
+ * since a service pass means the connection has no new input for the next
+ * one. PRIVATE, like moq_pq_conn_cnx_released. A NULL conn reports 0.
+ * Network thread only.
+ */
+uint64_t moq_pq_conn_event_count(const moq_pq_conn_t *conn);
+
+/*
  * True once the session's MOQ_EVENT_SESSION_CLOSED has been transferred to the
  * application by a poll (moq_transport_bridge_terminal_facts' observed fact),
  * not merely queued. PRIVATE, like moq_pq_conn_cnx_released. A NULL conn

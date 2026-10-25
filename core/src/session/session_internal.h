@@ -2246,6 +2246,10 @@ struct moq_session {
     int32_t          sg_occ_head;
     int32_t          rx_occ_head;
     int32_t          fetch_occ_head;
+    /* A subgroup may be RESET_OWED or TERMINAL_OWED (event + reset). Set
+     * at every debt producer; cleared only by a complete subgroup walk
+     * finding neither, so a clear flag spares the per-action walks. */
+    bool             sg_reset_owed;
 
     moq_ann_entry_t *announcements;
     size_t           ann_cap;

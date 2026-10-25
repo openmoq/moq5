@@ -1753,11 +1753,9 @@ row_unmapped_then_admission_refused_uni_pair(moq_version_t version, bool use_rcb
     return failures - before;
 }
 
-/* Cancellation isolation on a live protocol pair (draft-16 section 12.1 asks
- * for the cancellation of one stream; subscriptions and other subgroups are
- * not affected). The fetcher holds a subscription whose subgroup is open and
- * one live response; a second response is held and cancelled at its age.
- * The subscription survives, and its next subgroup is delivered. */
+/* Receive pressure may cancel an admitted subgroup before a held FETCH ages
+ * out. Both cancellations are per-stream: the publisher reports the subgroup's
+ * actual STOP/reset terminal, and the subscription delivers a later group. */
 static int
 row_bounded_subscription_survives_d16(void)
 {
@@ -1775,7 +1773,9 @@ row_bounded_subscription_survives_d16(void)
     sc.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
     sc.track_name = MOQ_BYTES_LITERAL("t");
     moq_subscription_t csub;
-    MOQ_TEST_CHECK(moq_session_subscribe(p.c, &sc, p.now, &csub) == MOQ_OK);
+    moq_result_t rc = moq_session_subscribe(p.c, &sc, p.now, &csub);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto out;
     pump(&p, 4);
     moq_subscription_t ssub = { 0 };
     bool got = false;
@@ -1787,10 +1787,12 @@ row_bounded_subscription_survives_d16(void)
         }
     }
     MOQ_TEST_CHECK(got);
-    if (!got) { pair_close(&p); return failures - before; }
+    if (!got) goto out;
     moq_accept_subscribe_cfg_t ac;
     moq_accept_subscribe_cfg_init(&ac);
-    MOQ_TEST_CHECK(moq_session_accept_subscribe(p.sv, ssub, &ac, p.now) == MOQ_OK);
+    rc = moq_session_accept_subscribe(p.sv, ssub, &ac, p.now);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto out;
     pump(&p, 4);
 
     int objects = 0, ends = 0;
@@ -1798,35 +1800,101 @@ row_bounded_subscription_survives_d16(void)
     moq_subgroup_cfg_init(&g);
     g.group_id = 0; g.subgroup_id = 0; g.publisher_priority = 10;
     moq_subgroup_handle_t sg0;
-    MOQ_TEST_CHECK(moq_session_open_subgroup(p.sv, ssub, &g, p.now, &sg0) == MOQ_OK);
+    uint64_t sg0_sid = p.sep.next_uni_id;
+    rc = moq_session_open_subgroup(p.sv, ssub, &g, p.now, &sg0);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto out;
     {
         uint8_t body[4] = { 1, 2, 3, 4 };
         moq_rcbuf_t *pl = NULL;
-        MOQ_TEST_CHECK(moq_rcbuf_create(moq_alloc_default(), body, sizeof(body), &pl) == MOQ_OK);
-        MOQ_TEST_CHECK(moq_session_write_object(p.sv, sg0, 0, pl, p.now) == MOQ_OK);
+        rc = moq_rcbuf_create(moq_alloc_default(), body, sizeof(body), &pl);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) goto out;
+        rc = moq_session_write_object(p.sv, sg0, 0, pl, p.now);
         moq_rcbuf_decref(pl);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) goto out;
     }
     pump(&p, 4);
+    moq_stream_ref_t sg0_ref = moq_transport_bridge_find_ref(p.sb, sg0_sid);
+    MOQ_TEST_CHECK(sg0_ref._v != 0);
+    if (sg0_ref._v == 0) goto out;
 
     moq_fetch_t fh[2], sfh[2];
-    if (!fetch_all(&p, 2, fh, sfh)) { MOQ_TEST_CHECK(false); pair_close(&p); return failures - before; }
-    MOQ_TEST_CHECK(accept_and_write(&p, sfh[0], 0));
+    if (!fetch_all(&p, 2, fh, sfh)) { MOQ_TEST_CHECK(false); goto out; }
+    ok = accept_and_write(&p, sfh[0], 0);
+    MOQ_TEST_CHECK(ok);
+    if (!ok) goto out;
     pump(&p, 4);
     MOQ_TEST_CHECK(!moq_session_can_admit_data_stream(p.c));
-    uint64_t s2 = answer(&p, sfh[1], 0);
+
+    /* Inspect the pressure STOP before delivering it to the publisher. */
+    ok = accept_and_write(&p, sfh[1], 0);
+    MOQ_TEST_CHECK(ok);
+    if (!ok) goto out;
+    uint64_t s2 = p.sep.next_uni_id;
+    p.now += 10;
+    service_server(&p);
     uint64_t t2 = p.now;
     held_t *h2 = held_find(&p, s2);
     MOQ_TEST_CHECK(h2 != NULL);
-    if (!h2) { pair_close(&p); return failures - before; }
+    if (!h2) goto out;
+    int pressure_stops = 0, pressure_others = 0;
+    service_client_stops(&p, sg0_sid, MOQ_STREAM_ERROR_CANCELLED,
+                         &pressure_stops, &pressure_others);
+    MOQ_TEST_CHECK_EQ_INT(pressure_stops, 1);
+    MOQ_TEST_CHECK_EQ_INT(pressure_others, 0);
+
+    /* The real STOP retires sg0. Keep its recorded RESET in transit until
+     * the held FETCH's age expires, so its receive entry cannot free early. */
+    MOQ_TEST_CHECK(moq_transport_bridge_service(p.sb, p.now) == MOQ_OK);
+    int resets_ready = 0, terminals = 0;
+    for (size_t i = 0; i < p.sep.count; i++) {
+        const fake_op_t *o = &p.sep.ops[i];
+        if (o->stream_id != sg0_sid) continue;
+        MOQ_TEST_CHECK(o->kind == FAKE_OP_RESET);
+        MOQ_TEST_CHECK(o->error_code == MOQ_STREAM_ERROR_CANCELLED);
+        if (o->kind == FAKE_OP_RESET) resets_ready++;
+    }
+    MOQ_TEST_CHECK_EQ_INT(resets_ready, 1);
+    MOQ_TEST_CHECK(!p.sep.overflowed && !p.sep.truncated);
+    MOQ_TEST_CHECK(held_find(&p, s2) == h2);
+    MOQ_TEST_CHECK(!moq_session_can_admit_data_stream(p.c));
     {
         moq_event_t ev;
+        while (moq_session_poll_events(p.sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED) {
+                const moq_outgoing_subgroup_terminated_event_t *t = &ev.u.outgoing_subgroup_terminated;
+                terminals++;
+                MOQ_TEST_CHECK(moq_subgroup_eq(t->subgroup, sg0));
+                MOQ_TEST_CHECK(moq_subscription_eq(t->sub, ssub));
+                MOQ_TEST_CHECK(t->pub._opaque == 0);
+                MOQ_TEST_CHECK(t->group_id == 0 && t->subgroup_id == 0);
+                MOQ_TEST_CHECK(t->stream_ref._v == sg0_ref._v);
+                MOQ_TEST_CHECK(t->cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING);
+                MOQ_TEST_CHECK(t->error_code == MOQ_STREAM_ERROR_CANCELLED);
+            }
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE || ev.kind == MOQ_EVENT_UNSUBSCRIBED) ends++;
+            moq_event_cleanup(&ev);
+        }
         while (moq_session_poll_events(p.c, &ev, 1) > 0) {
-            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) objects++;
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                const moq_object_received_event_t *o = &ev.u.object_received;
+                const uint8_t body[4] = { 1, 2, 3, 4 };
+                objects++;
+                MOQ_TEST_CHECK(moq_subscription_eq(o->sub, csub));
+                MOQ_TEST_CHECK(o->group_id == 0 && o->subgroup_id == 0 && o->object_id == 0);
+                bool exact = o->payload && moq_rcbuf_len(o->payload) == sizeof(body) &&
+                    memcmp(moq_rcbuf_data(o->payload), body, sizeof(body)) == 0;
+                MOQ_TEST_CHECK(exact);
+            }
             if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE || ev.kind == MOQ_EVENT_UNSUBSCRIBED) ends++;
             moq_event_cleanup(&ev);
         }
     }
+    MOQ_TEST_CHECK_EQ_INT(terminals, 1);
     MOQ_TEST_CHECK_EQ_INT(objects, 1);
+    MOQ_TEST_CHECK_EQ_INT(ends, 0);
 
     int on_sid = 0, others = 0;
     p.now = t2 + HOLD_AGE_US;
@@ -1834,34 +1902,90 @@ row_bounded_subscription_survives_d16(void)
     MOQ_TEST_CHECK_EQ_INT(on_sid, 1);
     MOQ_TEST_CHECK_EQ_INT(others, 0);
     h2->active = false;
-    pump(&p, 4);
+    int resets_delivered = 0;
+    int later_stops = p.client_stops, later_resets = p.client_resets;
+    for (int i = 0; i < 4; i++) {
+        p.now += 10;
+        service_client(&p);
+        MOQ_TEST_CHECK(moq_transport_bridge_service(p.sb, p.now) == MOQ_OK);
+        MOQ_TEST_CHECK(test_replay_uni(&p.server_input, p.sb, p.now) == MOQ_OK);
+        for (size_t j = 0; j < p.sep.count; j++) {
+            const fake_op_t *o = &p.sep.ops[j];
+            if (o->stream_id != sg0_sid) continue;
+            MOQ_TEST_CHECK(o->kind == FAKE_OP_RESET);
+            MOQ_TEST_CHECK(o->error_code == MOQ_STREAM_ERROR_CANCELLED);
+            if (o->kind == FAKE_OP_RESET) resets_delivered++;
+        }
+        MOQ_TEST_CHECK(!p.sep.overflowed && !p.sep.truncated);
+        (void)deliver(&p, &p.sep, p.cb, false);
+    }
+    MOQ_TEST_CHECK_EQ_INT(resets_delivered, 1);
 
-    /* The subscription's first subgroup ends and a later one is delivered. */
-    MOQ_TEST_CHECK(moq_session_close_subgroup(p.sv, sg0, p.now) == MOQ_OK);
-    pump(&p, 4);
+    /* The same subscription can open and deliver a later subgroup. */
     g.group_id = 1;
     moq_subgroup_handle_t sg1;
-    MOQ_TEST_CHECK(moq_session_open_subgroup(p.sv, ssub, &g, p.now, &sg1) == MOQ_OK);
+    rc = moq_session_open_subgroup(p.sv, ssub, &g, p.now, &sg1);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto out;
     {
         uint8_t body[4] = { 5, 6, 7, 8 };
         moq_rcbuf_t *pl = NULL;
-        MOQ_TEST_CHECK(moq_rcbuf_create(moq_alloc_default(), body, sizeof(body), &pl) == MOQ_OK);
-        MOQ_TEST_CHECK(moq_session_write_object(p.sv, sg1, 0, pl, p.now) == MOQ_OK);
+        rc = moq_rcbuf_create(moq_alloc_default(), body, sizeof(body), &pl);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) goto out;
+        rc = moq_session_write_object(p.sv, sg1, 0, pl, p.now);
         moq_rcbuf_decref(pl);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) goto out;
     }
-    pump(&p, 6);
+    for (int i = 0; i < 6; i++) {
+        p.now += 10;
+        service_client(&p);
+        MOQ_TEST_CHECK(moq_transport_bridge_service(p.sb, p.now) == MOQ_OK);
+        MOQ_TEST_CHECK(test_replay_uni(&p.server_input, p.sb, p.now) == MOQ_OK);
+        for (size_t j = 0; j < p.sep.count; j++) {
+            const fake_op_t *o = &p.sep.ops[j];
+            if (o->stream_id != sg0_sid) continue;
+            MOQ_TEST_CHECK(o->kind == FAKE_OP_RESET);
+            MOQ_TEST_CHECK(o->error_code == MOQ_STREAM_ERROR_CANCELLED);
+            if (o->kind == FAKE_OP_RESET) resets_delivered++;
+        }
+        MOQ_TEST_CHECK(!p.sep.overflowed && !p.sep.truncated);
+        (void)deliver(&p, &p.sep, p.cb, false);
+    }
     int later = 0;
     {
         moq_event_t ev;
         while (moq_session_poll_events(p.c, &ev, 1) > 0) {
-            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED && ev.u.object_received.group_id == 1) later++;
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                const moq_object_received_event_t *o = &ev.u.object_received;
+                const uint8_t body[4] = { 5, 6, 7, 8 };
+                later++;
+                MOQ_TEST_CHECK(moq_subscription_eq(o->sub, csub));
+                MOQ_TEST_CHECK(o->group_id == 1 && o->subgroup_id == 0 && o->object_id == 0);
+                bool exact = o->payload && moq_rcbuf_len(o->payload) == sizeof(body) &&
+                    memcmp(moq_rcbuf_data(o->payload), body, sizeof(body)) == 0;
+                MOQ_TEST_CHECK(exact);
+            }
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE || ev.kind == MOQ_EVENT_UNSUBSCRIBED) ends++;
+            moq_event_cleanup(&ev);
+        }
+        while (moq_session_poll_events(p.sv, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED) terminals++;
             if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE || ev.kind == MOQ_EVENT_UNSUBSCRIBED) ends++;
             moq_event_cleanup(&ev);
         }
     }
     MOQ_TEST_CHECK_EQ_INT(later, 1);
     MOQ_TEST_CHECK_EQ_INT(ends, 0);
+    MOQ_TEST_CHECK_EQ_INT(terminals, 1);
+    MOQ_TEST_CHECK_EQ_INT(resets_delivered, 1);
+    MOQ_TEST_CHECK_EQ_INT(p.client_stops, later_stops);
+    MOQ_TEST_CHECK_EQ_INT(p.client_resets, later_resets);
+    MOQ_TEST_CHECK(!p.deliver_error);
     MOQ_TEST_CHECK(moq_session_state(p.c) == MOQ_SESS_ESTABLISHED && !moq_transport_bridge_is_fatal(p.cb));
+    MOQ_TEST_CHECK(moq_session_state(p.sv) == MOQ_SESS_ESTABLISHED && !moq_transport_bridge_is_fatal(p.sb));
+out:
     pair_close(&p);
     if (failures == before) printf("PASS: hold_input bounded subscription survives v16\n");
     return failures - before;

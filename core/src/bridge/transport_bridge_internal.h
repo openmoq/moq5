@@ -343,6 +343,15 @@ struct moq_transport_bridge {
      * request cancellation (its owner ended, our half open): the service pass
      * decides. */
     bool     bidi_cancel_due;
+    /* Some stream entry may hold inbound work for the service pass (an
+     * admission readiness mark, a retained retry, a deferred RESET or
+     * STOP): set wherever one is marked, cleared only by the walk that
+     * visits every entry, so a clear flag means the walk would find none. */
+    bool     inbound_due;
+    /* The endpoint's budget_spent op, copied at create when the endpoint
+     * advertises MOQ_TRANSPORT_CAP_SHARED_ADMISSION and its struct_size
+     * covers the op; NULL otherwise. */
+    bool   (*budget_spent)(void *ctx);
     uint64_t needs_close_code;
     uint64_t now_us;            /* time supplied to the current service pass */
     bool     done_waiting;      /* a core terminal waited for bridge output */
@@ -455,6 +464,7 @@ extern uint64_t bridge_work_expiry_items;  /* queued items read, same walk */
 extern uint64_t bridge_work_reset_slots;   /* slots read, deferred-reset walk */
 extern uint64_t bridge_work_query_slots;   /* slots read, has_pending's reset walk */
 extern uint64_t bridge_work_terminal_slots; /* slots read, new-terminal prune */
+extern uint64_t bridge_work_inbound_slots; /* stream entries read, inbound retry walk */
 #endif
 
 /* -- Internal helpers ----------------------------------------------- */

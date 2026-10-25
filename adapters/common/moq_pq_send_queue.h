@@ -132,6 +132,14 @@ void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid);
 uint64_t moq_pq_send_queue_truncate(moq_pq_send_queue_t *q, uint64_t sid,
                                     uint64_t reliable);
 
+/* True when the aggregate cap is reached, so push_copy and push_rcbuf refuse
+ * every push adding bytes (a bare FIN may still collapse onto a queued
+ * chunk). Changes nothing. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+bool moq_pq_send_queue_budget_full(const moq_pq_send_queue_t *q);
+
 /* Aggregate bytes currently buffered across all streams (test/telemetry). */
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q);
 

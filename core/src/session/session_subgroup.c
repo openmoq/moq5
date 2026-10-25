@@ -329,6 +329,7 @@ static void sg_latch_terminal(moq_session_t *s, size_t slot,
     sg->terminal_cause = cause;
     sg->terminal_code = code;
     sg->state = MOQ_SG_TERMINAL_OWED;
+    s->sg_reset_owed = true;
     s->outgoing_terminal_dirty = true;
     sg->streaming_payload_len = sg->streaming_bytes_written = 0;
     sg->streaming_deadline_us = sg->delivery_deadline_us = UINT64_MAX;
@@ -460,6 +461,7 @@ void session_expire_queued_data(moq_session_t *s)
 
 bool sg_has_terminal_debt(const moq_session_t *s)
 {
+    if (!s->sg_reset_owed) return false;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
         if (s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) return true;
     return false;
@@ -532,6 +534,7 @@ void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep)
     } else {
         sg->state = MOQ_SG_RESET_OWED;
         sg->owed_reset_code = code;
+        s->sg_reset_owed = true;
     }
     if (had_deadline) sg_recompute_deadline(s);
 }
@@ -667,12 +670,14 @@ bool sg_claim_terminal_reset(moq_session_t *s, size_t slot)
     sg_commit_terminal(s, slot);
     sg->owed_reset_code = sg->terminal_code;
     sg->state = MOQ_SG_RESET_OWED;
+    s->sg_reset_owed = true;
     sg_set_terminal_retry(s, sg_has_terminal_debt(s), s->last_now_us);
     return true;
 }
 
 bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out)
 {
+    if (!s->sg_reset_owed) return false;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
         moq_sg_entry_t *sg = &s->subgroups[i];
         if (!sg_terminal_reset_ready(s, sg)) continue;
@@ -689,10 +694,15 @@ bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out)
 
 void sg_retry_owed_resets(moq_session_t *s)
 {
+    if (!s->sg_reset_owed) return;
+    bool reset_owed = false, terminal_owed = false;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
         moq_sg_entry_t *sg = &s->subgroups[i];
         if (sg->state == MOQ_SG_TERMINAL_OWED) {
-            if (event_queue_full(s)) continue;
+            if (event_queue_full(s)) {
+                terminal_owed = true;
+                continue;
+            }
             size_t barrier = s->action_tail;
             for (size_t j = s->action_head; j < s->action_tail; j++) {
                 if (s->action_meta[j % s->action_cap].terminal_barrier &&
@@ -703,7 +713,10 @@ void sg_retry_owed_resets(moq_session_t *s)
                 }
             }
             if (barrier == s->action_tail) {
-                if (action_queue_full(s)) continue;
+                if (action_queue_full(s)) {
+                    terminal_owed = true;
+                    continue;
+                }
                 moq_action_t a;
                 sg_terminal_action(s, sg, &a);
                 (void)push_action(s, &a);
@@ -732,11 +745,14 @@ void sg_retry_owed_resets(moq_session_t *s)
             sg_commit_terminal(s, (size_t)i);
             m->terminal_barrier = false;
             session_action_enqueued(s, a, m);
-        } else if (sg->state == MOQ_SG_RESET_OWED && !action_queue_full(s)) {
-            sg_queue_reset(s, sg, sg->owed_reset_code);
+        } else if (sg->state == MOQ_SG_RESET_OWED) {
+            if (action_queue_full(s)) reset_owed = true;
+            else sg_queue_reset(s, sg, sg->owed_reset_code);
         }
     }
-    sg_set_terminal_retry(s, sg_has_terminal_debt(s), s->last_now_us);
+    /* A blocked entry is still owed even if another entry made progress. */
+    s->sg_reset_owed = reset_owed || terminal_owed;
+    sg_set_terminal_retry(s, terminal_owed, s->last_now_us);
 }
 
 /*

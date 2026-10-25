@@ -117,6 +117,14 @@ static moq_transport_result_t pq_write(void *ctx, uint64_t stream_id,
         moq_pq_send_queue_push_copy(ep->queue, stream_id, data, len, fin));
 }
 
+/* The queue's cap is the shared budget. A released connection answers false:
+ * the write itself reports that. */
+static bool pq_budget_spent(void *ctx)
+{
+    pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    return ep->cnx && moq_pq_send_queue_budget_full(ep->queue);
+}
+
 static moq_transport_result_t pq_write_payload(void *ctx, uint64_t stream_id,
                                                 moq_rcbuf_t *buf, bool fin)
 {
@@ -395,6 +403,7 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
         .close_transport = pq_close,
         .set_stream_priority = pq_priority,
         .reset_stream_at = pq_reset_at,
+        .budget_spent    = pq_budget_spent,
     };
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
     ops->capabilities |= MOQ_TRANSPORT_CAP_COMMIT_REPORT;

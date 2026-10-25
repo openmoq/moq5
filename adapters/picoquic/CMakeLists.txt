@@ -993,6 +993,23 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     add_test(NAME threaded_terminal_error COMMAND test_threaded_terminal_error)
     set_tests_properties(threaded_terminal_error PROPERTIES TIMEOUT 30)
 
+    # A server receive with no connection input still pumps the application;
+    # only its pre-pump service is skipped.
+    add_executable(test_threaded_quiet_receive
+        tests/test_threaded_quiet_receive.c)
+    target_link_libraries(test_threaded_quiet_receive PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_threaded_quiet_receive PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    target_compile_definitions(test_threaded_quiet_receive PRIVATE
+        MOQ_PQ_THREADED_TESTING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_quiet_receive PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_quiet_receive COMMAND test_threaded_quiet_receive)
+    set_tests_properties(threaded_quiet_receive PROPERTIES TIMEOUT 30)
+
     # Terminal retention until the application acknowledges, for every
     # terminal cause, plus the per-connection user slot (test-internals for
     # the service-failure seam).

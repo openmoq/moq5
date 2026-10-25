@@ -2181,6 +2181,8 @@ static void test_reuse_while_owed(bool reset)
                 owed_n++;
             }
         MOQ_TEST_CHECK_EQ_SIZE(owed_n, (size_t)live_count(&f));
+        /* The owe path arms the owed-reset walks. */
+        MOQ_TEST_CHECK(owed_n == 0 || f.s->sg_reset_owed);
         int fr = sg_find_free(f.s);
         MOQ_TEST_CHECK(fr < 0 || (fr < 64 && !owed_slot[fr]));
         for (size_t k = 0; k < f.s->sg_cap && k < 64; k++)
@@ -2219,6 +2221,8 @@ static void test_reuse_while_owed(bool reset)
     MOQ_TEST_CHECK_EQ_INT(t.other_actions, 0);
     for (size_t k = 0; k < f.s->sg_cap; k++)
         MOQ_TEST_CHECK(f.s->subgroups[k].state != MOQ_SG_RESET_OWED);
+    /* The retry that issued the last of them ended the walks. */
+    MOQ_TEST_CHECK(!f.s->sg_reset_owed);
 
     /* C is accepted and opens as many subgroups as A held. */
     moq_accept_subscribe_cfg_t acc;

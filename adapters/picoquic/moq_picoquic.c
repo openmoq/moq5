@@ -23,6 +23,9 @@ struct moq_pq_conn {
     void                       *user_ctx;
     void                      (*after_callback)(moq_pq_conn_t *conn,
                                                  void *user_ctx);
+    /* picoquic callbacks other than prepare_to_send received so far: what a
+     * service pass may have new input from (moq_pq_conn_event_count). */
+    uint64_t                    events;
 
     moq_transport_bridge_t     *bridge;
     moq_transport_endpoint_ops_t endpoint_ops;
@@ -1096,6 +1099,11 @@ bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn)
     return !conn || conn->cnx == NULL;
 }
 
+uint64_t moq_pq_conn_event_count(const moq_pq_conn_t *conn)
+{
+    return conn ? conn->events : 0;
+}
+
 bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn)
 {
     return conn && conn->bridge &&
@@ -1150,6 +1158,8 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
             c->after_callback(c, c->user_ctx);
         return 0;
     }
+
+    c->events++;
 
     /* Does picoquic hand the cnx back on THIS callback? Decided before the
      * terminal short-circuit below: a bridge that is already terminal (a local

@@ -298,7 +298,9 @@ typedef enum moq_transport_cap {
  * After such a refusal, the bridge offers no further write adding bytes in
  * that hand-off of queued data, unless a reset it issues there is accepted;
  * FIN-only writes and resets still go. It offers data again at its next
- * hand-off.
+ * hand-off. An endpoint that reports its budget through budget_spent() is
+ * asked at the start of each hand-off instead, and a spent budget makes the
+ * whole hand-off one that follows a refusal.
  *
  * -- Reset/stop/close contract --
  *
@@ -397,6 +399,18 @@ typedef struct moq_transport_endpoint_ops {
     moq_transport_result_t (*reset_stream_at)(void *ctx, uint64_t stream_id,
                                               uint64_t error_code,
                                               uint64_t reliable_size);
+    /*
+     * OPTIONAL, read only with MOQ_TRANSPORT_CAP_SHARED_ADMISSION: true when
+     * the connection-wide budget is spent right now, so write() and
+     * write_payload() would refuse every write adding bytes. It must change
+     * no state, and must answer false whenever it cannot tell. The bridge
+     * then begins a hand-off of queued data as it would after such a
+     * refusal, without first making the write that would be refused.
+     * Appended after reset_stream_at; the bridge reads it by byte offset
+     * only when struct_size covers it, so an adapter built against the
+     * smaller struct keeps the old behavior.
+     */
+    bool (*budget_spent)(void *ctx);
 } moq_transport_endpoint_ops_t;
 
 #ifdef __cplusplus

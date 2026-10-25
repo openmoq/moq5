@@ -4041,11 +4041,14 @@ bool bridge_session_offer_data_reset(moq_session_t *s,
     }
     /* A full ring can leave a reset on its subgroup. A terminal may precede
      * its own DONE; every other non-data ordering barrier remains intact. */
-    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+    bool owed = false;
+    for (int32_t i = s->sg_occ_head; s->sg_reset_owed && i >= 0;
+         i = s->subgroups[i].occ_next) {
         const moq_sg_entry_t *sg = &s->subgroups[i];
         bool terminal = sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
         if (sg->state != MOQ_SG_RESET_OWED && sg->state != MOQ_SG_TERMINAL_OWED)
             continue;
+        owed = true;
         if (terminal && !sg_terminal_reset_ready(s, sg)) continue;
         if (done_owner && (!terminal ||
             (sg->sub._opaque != done_owner && sg->pub._opaque != done_owner)))
@@ -4056,6 +4059,9 @@ bool bridge_session_offer_data_reset(moq_session_t *s,
         out->reliable_size = sg->header_len;
         return true;
     }
+    /* An ineligible debt still needs retries: event/prefix pressure or an
+     * unrelated owner's DONE can hide it from this passive offer. */
+    s->sg_reset_owed = owed;
     return false;
 }
 
@@ -4649,6 +4655,10 @@ static uint64_t reported_subgroup_deadline(const moq_session_t *s)
 {
     uint64_t d = sg_has_terminal_debt(s)
         ? s->subgroup_retry_deadline_us : UINT64_MAX;
+    /* subgroup_deadline_us is at or below every armed subgroup deadline (the
+     * tick's own gate relies on it). Unarmed, skip that walk but retain the
+     * retry wake for already recognized terminals. */
+    if (s->subgroup_deadline_us == UINT64_MAX) return d;
     /* Only a live subgroup carries a deadline, and only those are linked. */
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
 #ifdef MOQ_SESSION_SWEEP_TESTING
