@@ -293,6 +293,19 @@ add_test(NAME bridge_retained_expiry COMMAND test_scheduling --retained-expiry)
 add_test(NAME bridge_shared_admission COMMAND test_scheduling --shared-admission)
 add_test(NAME bridge_shared_admission_suite COMMAND test_scheduling --shared-all)
 add_test(NAME bridge_pass_costs COMMAND test_scheduling --pass-costs)
+add_test(NAME bridge_scan_work COMMAND test_scheduling --scan-work)
+add_test(NAME bridge_expiry_walk COMMAND test_scheduling --expiry-walk)
+# The same rows against the test-internals core, whose probe counters let
+# them assert how much of the stream table each walk read.
+add_executable(test_scheduling_work unit/test_scheduling.c)
+target_link_libraries(test_scheduling_work PRIVATE moq-core-test-internals)
+target_compile_definitions(test_scheduling_work PRIVATE
+    MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_scheduling_work PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_pass_costs_work COMMAND test_scheduling_work --pass-costs)
+add_test(NAME bridge_scan_work_probes COMMAND test_scheduling_work --scan-work)
+add_test(NAME bridge_expiry_walk_probes COMMAND test_scheduling_work --expiry-walk)
 
 add_executable(test_stream_order unit/test_stream_order.c
     ../core/src/bridge/stream_order.c)

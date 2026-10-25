@@ -12,6 +12,13 @@
 #include <moq/rcbuf.h>
 #include <string.h>
 
+#ifdef MOQ_SESSION_SWEEP_TESTING
+uint64_t bridge_work_expiry_slots;
+uint64_t bridge_work_expiry_items;
+uint64_t bridge_work_reset_slots;
+uint64_t bridge_work_query_slots;
+#endif
+
 static void bridge_discard_if_dropped(moq_transport_bridge_t *b,
                                       bridge_stream_entry_t *e);
 
@@ -707,6 +714,7 @@ static void bridge_dstream_release(moq_transport_bridge_t *b,
     if (d->has_sid)
         bridge_index_remove(b->dsid_index, b->dindex_mask, d->sid);
     uint32_t slot = (uint32_t)(d - b->dstreams);
+    if (d->has_reset) b->dreset_count--;
     memset(d, 0, sizeof(*d));
     d->next_free = b->dstream_free;
     b->dstream_free = slot;
@@ -1424,8 +1432,14 @@ bool moq_transport_bridge_has_pending(const moq_transport_bridge_t *b)
     if (b->pending_count > 0 || b->dq_items > 0) return true;
     if (b->pending_control) return true;
     if (b->needs_close) return true;
-    for (uint32_t i = 0; i < b->dstream_cap; ++i)
+    /* Only a held deferred reset can answer here: with none held, the stream
+     * table is not read. */
+    for (uint32_t i = 0; b->dreset_count && i < b->dstream_cap; ++i) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        bridge_work_query_slots++;
+#endif
         if (b->dstreams[i].active && b->dstreams[i].has_reset) return true;
+    }
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (b->streams[i].active &&
             (b->streams[i].reset_source_held ||
@@ -2819,6 +2833,7 @@ static moq_result_t bridge_dstream_reset(moq_transport_bridge_t *b,
     if (keep == 0) return bridge_dstream_free(b, d);
     bridge_dstream_truncate(b, d, keep);
     d->has_reset = true;
+    b->dreset_count++;
     d->reset_code = error_code;
     d->reset_reliable = reliable;
     *deferred = true;
@@ -3686,6 +3701,7 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
     if (d) {
         if (!pending_reset && !d->has_reset) {
             d->has_reset = true;
+            b->dreset_count++;
             d->reset_code = reset.error_code;
             d->reset_reliable = reset.reliable_size;
         }
@@ -3733,10 +3749,18 @@ static moq_result_t bridge_try_deferred_reset(moq_transport_bridge_t *b,
 
 static moq_result_t bridge_expire_retained_data(moq_transport_bridge_t *b)
 {
-    for (uint32_t i = 0; i < b->dstream_cap; ++i) {
+    /* Only a queued item with a deadline can expire: with none queued, the
+     * stream table is not read; once the last one is gone, the walk stops. */
+    for (uint32_t i = 0; b->dq_timed && i < b->dstream_cap; ++i) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        bridge_work_expiry_slots++;
+#endif
         bridge_dstream_t *d = &b->dstreams[i];
         if (!d->active) continue;
         for (uint32_t j = 0; j < d->q_len; ++j) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            bridge_work_expiry_items++;
+#endif
             const bridge_data_item_t *item = &d->q[(d->q_head + j) % d->q_cap];
             if (!bridge_data_expired(b, &item->meta)) continue;
             moq_result_t rc = bridge_expire_data(b, d->ref, &item->meta);
@@ -3755,7 +3779,14 @@ static moq_result_t bridge_expire_retained_data(moq_transport_bridge_t *b)
             ++i;
         }
     }
-    for (uint32_t i = 0; i < b->dstream_cap && b->pump_budget; ++i) {
+    /* With no deferred reset held, the stream table is not read. With any,
+     * the walk reads every slot in turn, reset-bearing or not, until the
+     * last one is settled or the pass's budget is spent. */
+    for (uint32_t i = 0;
+         b->dreset_count && i < b->dstream_cap && b->pump_budget; ++i) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        bridge_work_reset_slots++;
+#endif
         bridge_dstream_t *d = &b->dstreams[i];
         if (!d->active || !d->has_reset || d->q_len || d->retained) continue;
         bool accepted;

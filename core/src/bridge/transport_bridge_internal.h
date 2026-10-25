@@ -413,6 +413,8 @@ struct moq_transport_bridge {
     uint64_t               dq_bytes;       /* bytes queued across dstreams */
     uint32_t               dq_items;       /* actions queued across dstreams */
     uint32_t               dq_timed;       /* of those, with a delivery deadline */
+    uint32_t               dreset_count;   /* active dstreams holding a deferred
+                                            * reset (has_reset) */
     /* Service passes begun, from 1: a dstream whose reset_pass equals it
      * has had its reset attempt in this pass. */
     uint64_t               pass_seq;
@@ -420,6 +422,18 @@ struct moq_transport_bridge {
     uint64_t               max_retained_bytes;
     uint64_t               serve_seq;
 };
+
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* Exact-work probe counters for the per-pass dstream-table walks, the same
+ * kind as the session's (session_internal.h): each is a plain increment at a
+ * loop-body entry, none takes part in any decision, and they are compiled
+ * solely into moq-core-test-internals. A probe is one dstream slot (or one
+ * queued item) a walk reads. Tests assert deltas around a call. */
+extern uint64_t bridge_work_expiry_slots;  /* slots read, queued-expiry walk */
+extern uint64_t bridge_work_expiry_items;  /* queued items read, same walk */
+extern uint64_t bridge_work_reset_slots;   /* slots read, deferred-reset walk */
+extern uint64_t bridge_work_query_slots;   /* slots read, has_pending's reset walk */
+#endif
 
 /* -- Internal helpers ----------------------------------------------- */
 
