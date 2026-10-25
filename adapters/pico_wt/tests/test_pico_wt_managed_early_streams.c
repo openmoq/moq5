@@ -1201,7 +1201,7 @@ static void test_early_stop_real_adapter(void)
  * held chunk. So at the hold age both the completion record and the later
  * FIN show its receive half terminal -- this row does not single out either.
  * With held-stream records (the bridge is rebuilt with
- * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT, which no shipped adapter declares), the
+ * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT and this fixture's smaller limits), the
  * hold age cancels it: the held bytes are discarded, no STOP_SENDING reaches
  * picoquic for the retired stream, and nothing is fatal. */
 static void test_early_fin_held_cancel_real_adapter(void)

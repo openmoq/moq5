@@ -3050,58 +3050,148 @@ int main(void)
         svextra.max_actions = 1;
         moq_session_t *c = NULL, *sv = NULL;
         establish_pair(&alloc, 10, 10, &c, &sv, NULL, &svextra);
+        MOQ_TEST_CHECK(c != NULL && sv != NULL);
+        if (!c || !sv) goto deadline_retry_cleanup;
+        MOQ_TEST_CHECK(sv->action_cap == 1);
+        if (sv->action_cap != 1) goto deadline_retry_cleanup;
 
         feed_subscribe(sv, 0, "ns", "t", NULL, 0);
-        moq_event_t ev;
-        MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
-        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+        moq_event_t ev = {0};
+        size_t n = 0;
+        moq_result_t rc = moq_session_poll_events_ex(sv, &ev, 1, sizeof(ev), &n);
+        bool request_ready = rc == MOQ_OK && n == 1 &&
+            ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST &&
+            moq_subscription_is_valid(ev.u.subscribe_request.sub);
+        MOQ_TEST_CHECK(request_ready);
+        if (!request_ready) {
+            if (n) moq_event_cleanup(&ev);
+            goto deadline_retry_cleanup;
+        }
         moq_subscription_t ssub = ev.u.subscribe_request.sub;
         moq_event_cleanup(&ev);
         moq_accept_subscribe_cfg_t acc;
         moq_accept_subscribe_cfg_init(&acc);
-        moq_session_accept_subscribe(sv, ssub, &acc, 0);
-        /* SUBSCRIBE_OK fills the 1-slot action queue. Don't drain. */
+        rc = moq_session_accept_subscribe(sv, ssub, &acc, 0);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) goto deadline_retry_cleanup;
 
         moq_subgroup_cfg_t sg_cfg;
         moq_subgroup_cfg_init(&sg_cfg);
-        moq_subgroup_handle_t sg;
+        moq_subgroup_handle_t sg = MOQ_SUBGROUP_INVALID;
         /* open_subgroup needs an action slot — drain first. */
-        moq_action_t acts[16]; size_t na;
-        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
-            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
-        moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
-        /* Subgroup header fills queue again. Don't drain. */
-
+        moq_action_t action = {0};
+        rc = moq_session_poll_actions_ex(sv, &action, 1, sizeof(action), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 1);
+        if (n) moq_action_cleanup(&action);
+        if (rc != MOQ_OK || n != 1) goto deadline_retry_cleanup;
+        MOQ_TEST_CHECK(moq_session_action_capacity(sv) == 1);
+        if (moq_session_action_capacity(sv) != 1) goto deadline_retry_cleanup;
+        rc = moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
+        MOQ_TEST_CHECK(rc == MOQ_OK && moq_subgroup_is_valid(sg));
+        if (rc != MOQ_OK || !moq_subgroup_is_valid(sg)) goto deadline_retry_cleanup;
+        size_t slot = moq_handle_slot(sg._opaque);
+        MOQ_TEST_CHECK(slot < sv->sg_cap);
+        if (slot >= sv->sg_cap) goto deadline_retry_cleanup;
+        const moq_sg_entry_t original = sv->subgroups[slot];
+        bool header_queued = sv->action_tail - sv->action_head == 1 &&
+            sv->actions[sv->action_head % sv->action_cap].kind == MOQ_ACTION_SEND_DATA;
+        MOQ_TEST_CHECK(header_queued);
+        if (!header_queued) goto deadline_retry_cleanup;
+        const moq_send_data_action_t header =
+            sv->actions[sv->action_head % sv->action_cap].u.send_data;
+        bool valid_header = original.state == MOQ_SG_OPEN && original.stream_ref._v != 0 &&
+            moq_subgroup_eq(sg_make_handle(sv, slot), sg) &&
+            moq_subscription_eq(original.sub, ssub) && original.pub._opaque == 0 &&
+            header.stream_ref._v == original.stream_ref._v &&
+            header.header_len > 0 && header.header_len <= sizeof(header.header) &&
+            header.header_len == original.header_len && !header.payload && !header.fin;
+        MOQ_TEST_CHECK(valid_header);
+        if (!valid_header) goto deadline_retry_cleanup;
+        MOQ_TEST_CHECK(moq_session_action_capacity(sv) == 0);
         test_set_sg_deadline(sv, sg, 1000);
 
         /* Tick past deadline — action queue full → WOULD_BLOCK. */
         MOQ_TEST_CHECK(moq_session_tick(sv, 2000) == MOQ_ERR_WOULD_BLOCK);
-        /* Pending reset retained: raw subgroup deadline stays expired. */
-        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == 1000);
-        /* But the *reported* next deadline must be deferred past now so a
-         * timer driver sleeps instead of busy-spinning a zero wait on the
-         * still-expired deadline (without the backoff this returns 1000,
-         * the expired raw deadline). */
-        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) > 2000);
+        /* Recognition clears the timer but retains exact terminal ownership. */
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == UINT64_MAX);
+        const moq_sg_entry_t *owed = &sv->subgroups[slot];
+        MOQ_TEST_CHECK(owed->state == MOQ_SG_TERMINAL_OWED);
+        MOQ_TEST_CHECK(moq_subgroup_eq(sg_make_handle(sv, slot), sg));
+        MOQ_TEST_CHECK(moq_subscription_eq(owed->sub, ssub) && owed->pub._opaque == 0);
+        MOQ_TEST_CHECK(owed->stream_ref._v == original.stream_ref._v);
+        MOQ_TEST_CHECK(owed->group_id == sg_cfg.group_id && owed->subgroup_id == sg_cfg.subgroup_id);
+        MOQ_TEST_CHECK(owed->terminal_cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT);
+        MOQ_TEST_CHECK(owed->terminal_code == MOQ_RESET_DELIVERY_TIMEOUT);
+        MOQ_TEST_CHECK(owed->header_len == header.header_len);
+        uint64_t retry = moq_session_next_deadline_us(sv);
+        MOQ_TEST_CHECK(retry > 2000 && retry != UINT64_MAX);
+        rc = moq_session_poll_events_ex(sv, &ev, 1, sizeof(ev), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 0);
+        if (n) moq_event_cleanup(&ev);
 
-        /* Drain and retry. */
-        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
-            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
-        MOQ_TEST_CHECK(moq_session_tick(sv, 2000) == MOQ_OK);
-
-        bool got_reset = false;
-        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
-            for (size_t i = 0; i < na; i++) {
-                if (acts[i].kind == MOQ_ACTION_RESET_DATA &&
-                    acts[i].u.reset_data.error_code == MOQ_RESET_DELIVERY_TIMEOUT)
-                    got_reset = true;
-                moq_action_cleanup(&acts[i]);
+        /* Draining the header retries debt immediately. Observe both actions
+         * before another tick: the header must precede exactly one reset. */
+        for (unsigned phase = 0; phase < 2; phase++) {
+            rc = moq_session_poll_actions_ex(sv, &action, 1, sizeof(action), &n);
+            MOQ_TEST_CHECK(rc == MOQ_OK && n == 1);
+            if (rc != MOQ_OK || n != 1) {
+                if (n) moq_action_cleanup(&action);
+                goto deadline_retry_cleanup;
             }
-        MOQ_TEST_CHECK(got_reset);
-        /* Reset emitted → deadline fully cleared, no lingering backoff that
-         * would keep waking the driver. */
+            if (phase == 0) {
+                MOQ_TEST_CHECK(action.kind == MOQ_ACTION_SEND_DATA);
+                if (action.kind == MOQ_ACTION_SEND_DATA) {
+                    MOQ_TEST_CHECK(action.u.send_data.stream_ref._v == original.stream_ref._v);
+                    MOQ_TEST_CHECK(action.u.send_data.header_len == header.header_len);
+                    MOQ_TEST_CHECK(memcmp(action.u.send_data.header, header.header, header.header_len) == 0);
+                    MOQ_TEST_CHECK(!action.u.send_data.payload && !action.u.send_data.fin);
+                }
+            } else {
+                MOQ_TEST_CHECK(action.kind == MOQ_ACTION_RESET_DATA);
+                if (action.kind == MOQ_ACTION_RESET_DATA) {
+                    MOQ_TEST_CHECK(action.u.reset_data.stream_ref._v == original.stream_ref._v);
+                    MOQ_TEST_CHECK(action.u.reset_data.error_code == MOQ_RESET_DELIVERY_TIMEOUT);
+                    MOQ_TEST_CHECK(action.u.reset_data.reliable_size == header.header_len);
+                }
+            }
+            moq_action_cleanup(&action);
+        }
+        rc = moq_session_poll_actions_ex(sv, &action, 1, sizeof(action), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 0);
+        if (n) moq_action_cleanup(&action);
+        rc = moq_session_poll_events_ex(sv, &ev, 1, sizeof(ev), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 1);
+        if (n) {
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED);
+            MOQ_TEST_CHECK(ev.detail_size == MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE);
+            if (ev.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+                ev.detail_size >= MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+                const moq_outgoing_subgroup_terminated_event_t *t = &ev.u.outgoing_subgroup_terminated;
+                MOQ_TEST_CHECK(moq_subgroup_eq(t->subgroup, sg));
+                MOQ_TEST_CHECK(moq_subscription_eq(t->sub, ssub) && t->pub._opaque == 0);
+                MOQ_TEST_CHECK(t->stream_ref._v == original.stream_ref._v);
+                MOQ_TEST_CHECK(t->group_id == sg_cfg.group_id && t->subgroup_id == sg_cfg.subgroup_id);
+                MOQ_TEST_CHECK(t->cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT);
+                MOQ_TEST_CHECK(t->error_code == MOQ_RESET_DELIVERY_TIMEOUT);
+            }
+            moq_event_cleanup(&ev);
+        }
+        rc = moq_session_poll_events_ex(sv, &ev, 1, sizeof(ev), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 0);
+        if (n) moq_event_cleanup(&ev);
         MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == UINT64_MAX);
 
+        /* A later tick cannot repeat the already committed reset/event. */
+        MOQ_TEST_CHECK(moq_session_tick(sv, 2000) == MOQ_OK);
+        rc = moq_session_poll_actions_ex(sv, &action, 1, sizeof(action), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 0);
+        if (n) moq_action_cleanup(&action);
+        rc = moq_session_poll_events_ex(sv, &ev, 1, sizeof(ev), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK && n == 0);
+        if (n) moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == UINT64_MAX);
+
+deadline_retry_cleanup:
         moq_session_destroy(c);
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);

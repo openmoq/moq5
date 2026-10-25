@@ -12,6 +12,21 @@ _Static_assert(offsetof(moq_outgoing_subgroup_terminated_event_t, cause) == 56 &
 
 #define MOQ_SG_TERMINAL_RETRY_US 5000
 
+static void sg_set_terminal_retry(moq_session_t *s, bool owed, uint64_t now_us)
+{
+    if (!owed) {
+        s->subgroup_retry_deadline_us = UINT64_MAX;
+        return;
+    }
+    const uint64_t retry = deadline_add(now_us, MOQ_SG_TERMINAL_RETRY_US);
+    /* Bridge expiry can recognize debt after the core's last advance.
+     * Polling must not regress its retry. deadline_add reserves UINT64_MAX
+     * for unarmed timers, including when arithmetic saturates. */
+    if (s->subgroup_retry_deadline_us == UINT64_MAX ||
+        retry > s->subgroup_retry_deadline_us)
+        s->subgroup_retry_deadline_us = retry;
+}
+
 /* Backstop registry feed: max-merge an outbound object's Location
  * into the owning subscription's or publication's reserved record. The facade
  * additionally merges via its own record reference (the authoritative feed);
@@ -582,8 +597,7 @@ bool bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
         *outgoing_terminal |= sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
         if (sg->state == MOQ_SG_TERMINAL_OWED) {
             if (event_queue_full(s)) {
-                s->subgroup_retry_deadline_us =
-                    deadline_add(retry_now, MOQ_SG_TERMINAL_RETRY_US);
+                sg_set_terminal_retry(s, true, retry_now);
                 sg_recompute_deadline(s);
                 return false;
             }
@@ -594,8 +608,7 @@ bool bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
         sg->state = MOQ_SG_RESETTING;
         sg->streaming_payload_len = sg->streaming_bytes_written = 0;
         sg->streaming_deadline_us = sg->delivery_deadline_us = UINT64_MAX;
-        s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
-            ? deadline_add(retry_now, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+        sg_set_terminal_retry(s, sg_has_terminal_debt(s), retry_now);
         sg_recompute_deadline(s);
     }
     /* Transfer an existing reset as well as its obsolete core data. If the
@@ -654,8 +667,7 @@ bool sg_claim_terminal_reset(moq_session_t *s, size_t slot)
     sg_commit_terminal(s, slot);
     sg->owed_reset_code = sg->terminal_code;
     sg->state = MOQ_SG_RESET_OWED;
-    s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
-        ? deadline_add(s->last_now_us, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+    sg_set_terminal_retry(s, sg_has_terminal_debt(s), s->last_now_us);
     return true;
 }
 
@@ -669,8 +681,7 @@ bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out)
             sg_commit_terminal(s, (size_t)i);
         else
             sg->state = MOQ_SG_RESETTING; /* event committed by pressure claim */
-        s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
-            ? deadline_add(s->last_now_us, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+        sg_set_terminal_retry(s, sg_has_terminal_debt(s), s->last_now_us);
         return true;
     }
     return false;
@@ -725,8 +736,7 @@ void sg_retry_owed_resets(moq_session_t *s)
             sg_queue_reset(s, sg, sg->owed_reset_code);
         }
     }
-    s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
-        ? deadline_add(s->last_now_us, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+    sg_set_terminal_retry(s, sg_has_terminal_debt(s), s->last_now_us);
 }
 
 /*

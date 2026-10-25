@@ -2315,6 +2315,21 @@ static moq_request_error_t d18_semantic_request_error(uint64_t raw)
     return MOQ_REQUEST_ERROR_INTERNAL_ERROR;
 }
 
+/* Section 5.1: a Forward 0 -> 1 acknowledgement replaces the Joining
+ * Location with exactly the communicated snapshot, not live history. The
+ * caller has committed the response/event but has not changed Forward. */
+static void d18_commit_subscribe_update_location(moq_session_t *s, int slot,
+    bool has_forward, bool forward, bool has_largest,
+    uint64_t largest_group, uint64_t largest_object)
+{
+    moq_sub_entry_t *e = &s->subs[slot];
+    if (has_forward && !e->forward && forward) {
+        e->has_largest = has_largest;
+        e->largest_group = has_largest ? largest_group : 0;
+        e->largest_object = has_largest ? largest_object : 0;
+    }
+}
+
 static const moq_profile_ops_t d18_ops = {
     .version                 = MOQ_VERSION_DRAFT_18,
     .state_size              = sizeof(moq_d18_profile_state_t),
@@ -2342,6 +2357,7 @@ static const moq_profile_ops_t d18_ops = {
     .publish_initial_parameters = false,
     .publish_ok_carries_params = true,
     .supports_joining_fetch   = true,
+    .commit_subscribe_update_location = d18_commit_subscribe_update_location,
     .supports_fill            = false,
     .stream_count_unknown     = MOQ_QUIC_VARINT_MAX,
     .subgroup_timer_at_fin    = true,
@@ -2355,6 +2371,7 @@ static const moq_profile_ops_t d18_ops = {
     .going_away_request_error       = MOQ_REQUEST_ERROR_GOING_AWAY,
     .capacity_request_error         = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD,
     .capacity_request_error_retryable = true,
+    .resource_limit_stream_error    = MOQ_STREAM_ERROR_EXCESSIVE_LOAD,
     .reserved_session_namespaces    = true,
     .binding_requirements     = 0,
     .auth_token_type_max      = UINT64_MAX,   /* §10.2.2: vi64 */

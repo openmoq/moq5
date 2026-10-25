@@ -617,6 +617,15 @@ typedef struct moq_profile_ops {
     /* FETCH has joining forms that reference a subscription. False refuses a
      * joining fetch request. */
     bool supports_joining_fetch;
+    /* Commit the profile's subscription-update location effect using the
+     * acknowledged snapshot, before the caller changes Forward. `slot` is a
+     * live subscription entry in either role. Called only after response/event
+     * queueing succeeds; cannot fail, allocate, queue output or retain pointers.
+     * Draft-18 section 5.1 replaces the Joining Location on Forward 0 -> 1,
+     * preserving absence as well as coordinates. NULL leaves it unchanged. */
+    void (*commit_subscribe_update_location)(moq_session_t *s, int slot,
+        bool has_forward, bool forward, bool has_largest,
+        uint64_t largest_group, uint64_t largest_object);
     /* A subscription may request fill streams for past objects. False
      * refuses a fill request. */
     bool supports_fill;
@@ -677,6 +686,11 @@ typedef struct moq_profile_ops {
      * registers it; INTERNAL_ERROR, with no retry, where it does not. */
     uint64_t capacity_request_error;
     bool     capacity_request_error_retryable;
+    /* Stream error used to cancel at a local resource limit. Draft-16
+     * section 10.4.3 defines CANCELLED for subscriber cancellation; draft-18
+     * section 3.3.3 and draft-22 section 12.5 define EXCESSIVE_LOAD for an
+     * overloaded endpoint. This is a stream code, not a REQUEST_ERROR. */
+    uint64_t resource_limit_stream_error;
     /* The draft reserves the "." and ".session" first namespace fields: a
      * request naming one is refused with DOES_NOT_EXIST before the
      * application sees it, and the application may not publish under one. */

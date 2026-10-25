@@ -1,5 +1,5 @@
 /*
- * Draft-18 sections 3.3.1 and 10.12.2: a Forward 0 -> 1 acknowledgement
+ * Draft-18 sections 5.1 and 10.12.2: a Forward 0 -> 1 acknowledgement
  * supplies the Joining Location. Later history and a Forward 1 -> 1 refresh
  * do not replace that saved location. All state is established over SimPair
  * through public publisher/session APIs; no subscription-pool edits.

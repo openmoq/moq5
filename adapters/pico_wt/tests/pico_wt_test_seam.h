@@ -103,10 +103,9 @@ const moq_connection_target_t *moq_pico_wt_managed_test_target(
  * (receive-admission tests; adapter compiled with MOQ_PICO_WT_TESTING). */
 void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on);
 
-/* Connections created while set also declare
- * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT, so their bridge keeps held-stream
- * records (age, cancellation). Test builds only; no shipped adapter declares
- * that capability. */
+/* Legacy test-only request to add MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT at
+ * create. Redundant with the production default; false does not disable
+ * bounded admission. Never installed or exported. */
 void moq_pico_wt_test_create_with_hold_bidi(bool on);
 
 /* Receive-lifecycle observers (adapter compiled with MOQ_PICO_WT_TESTING):
@@ -119,6 +118,8 @@ extern void (*pw_test_local_stop_observer)(moq_pico_wt_conn_t *conn,
                                            uint64_t stream_id);
 extern void (*pw_test_grant_observer)(moq_pico_wt_conn_t *conn,
                                       uint64_t stream_id, uint64_t headroom);
+/* One notification at the start of each nonterminal full receive sweep. */
+extern void (*pw_test_sweep_observer)(moq_pico_wt_conn_t *conn);
 
 /* Keepalive seam globals (test-internals build only). */
 extern void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);

@@ -1,4 +1,4 @@
-/* R1: terminal reset escape through a full bridge pending array and full
+/* Terminal reset escape through a full bridge pending array and full
  * core action ring. All retained output is produced by real session/bridge
  * calls; only event-credit saturation uses the private queue producer. */
 #include <moq/moq.h>
@@ -24,11 +24,11 @@ typedef struct group {
 typedef struct endpoint {
     fake_endpoint_t fake; /* the other fake callbacks use this prefix */
     moq_session_t *session;
+    moq_transport_bridge_t *bridge;
     group_t target;
     uint64_t owner, code, reliable;
     uint32_t cause;
     bool suppress_target, saw_event_before_reset, bad_reset;
-    bool queued_reset_source;
     unsigned post_terminal_writes;
 } endpoint_t;
 
@@ -70,33 +70,60 @@ static moq_transport_result_t write_checked(void *ctx, uint64_t sid,
     return fake_write(&ep->fake, sid, data, len, fin);
 }
 
+/* The reset can migrate from compact debt into a typed core action when
+ * unrelated DATA frees action credit. It must have exactly one owner. */
+static bool reset_inventory(const endpoint_t *ep, bool committed, unsigned expected)
+{
+    unsigned owners = 0;
+    for (int32_t i = ep->session->sg_occ_head; i >= 0;
+         i = ep->session->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &ep->session->subgroups[i];
+        if (sg->stream_ref._v != ep->target.ref._v ||
+            (sg->state != MOQ_SG_TERMINAL_OWED && sg->state != MOQ_SG_RESET_OWED))
+            continue;
+        owners++;
+        CHECK((uint32_t)i == moq_handle_slot(ep->target.handle._opaque));
+        CHECK(sg->generation == moq_handle_generation(ep->target.handle._opaque));
+        CHECK(sg->sub._opaque == ep->owner && !moq_publication_is_valid(sg->pub));
+        CHECK(sg->group_id == ep->target.id && sg->subgroup_id == 0);
+        CHECK(sg->terminal_cause == ep->cause && sg->terminal_code == ep->code);
+        CHECK(sg->header_len == ep->reliable);
+        if (committed) CHECK(sg->state == MOQ_SG_RESET_OWED);
+        if (sg->state == MOQ_SG_RESET_OWED) CHECK(sg->owed_reset_code == ep->code);
+    }
+    for (size_t i = ep->session->action_head; i < ep->session->action_tail; i++) {
+        size_t at = i % ep->session->action_cap;
+        const moq_action_t *a = &ep->session->actions[at];
+        if (a->kind != MOQ_ACTION_RESET_DATA ||
+            a->u.reset_data.stream_ref._v != ep->target.ref._v) continue;
+        owners++;
+        CHECK(a->u.reset_data.error_code == ep->code &&
+              a->u.reset_data.reliable_size == ep->reliable);
+        CHECK(ep->session->action_meta[at].outgoing_terminal &&
+              !ep->session->action_meta[at].terminal_barrier);
+    }
+    /* These rows retain the reset in the core, not in a second bridge owner. */
+    for (uint32_t i = 0; i < ep->bridge->pending_count; i++) {
+        const bridge_pending_item_t *p = &ep->bridge->pending[i];
+        CHECK(p->kind != PENDING_RESET_STREAM ||
+              (p->stream_ref._v != ep->target.ref._v &&
+               (!p->has_stream_id || p->stream_id != ep->target.sid)));
+    }
+    for (uint32_t i = 0; i < ep->bridge->dstream_cap; i++) {
+        const bridge_dstream_t *d = &ep->bridge->dstreams[i];
+        CHECK(!d->active || d->ref._v != ep->target.ref._v || !d->has_reset);
+    }
+    CHECK(owners == expected);
+    return true;
+}
+
 static moq_transport_result_t reset_checked(void *ctx, uint64_t sid,
                                             uint64_t code, uint64_t reliable)
 {
     endpoint_t *ep = ctx;
     if (sid == ep->target.sid) {
         ep->bad_reset |= code != ep->code || reliable != ep->reliable;
-        if (ep->queued_reset_source) {
-            /* This row has action credit: the typed reset stays in the core
-             * ring through refusal, even after its subgroup entry reaps. */
-            unsigned found = 0;
-            for (size_t i = ep->session->action_head; i < ep->session->action_tail; i++) {
-                size_t at = i % ep->session->action_cap;
-                const moq_action_t *a = &ep->session->actions[at];
-                if (a->kind == MOQ_ACTION_RESET_DATA &&
-                    a->u.reset_data.stream_ref._v == ep->target.ref._v &&
-                    a->u.reset_data.error_code == code &&
-                    a->u.reset_data.reliable_size == reliable &&
-                    ep->session->action_meta[at].outgoing_terminal) found++;
-            }
-            ep->bad_reset |= found != 1;
-        } else {
-            const moq_sg_entry_t *sg = &ep->session->subgroups[
-                moq_handle_slot(ep->target.handle._opaque)];
-            ep->bad_reset |= sg->state != MOQ_SG_RESET_OWED ||
-                sg->stream_ref._v != ep->target.ref._v ||
-                sg->owed_reset_code != code || sg->terminal_cause != ep->cause;
-        }
+        ep->bad_reset |= !reset_inventory(ep, true, 1);
         if (!ep->saw_event_before_reset) {
             unsigned found = 0;
             for (size_t i = ep->session->event_head; i < ep->session->event_tail; i++)
@@ -174,6 +201,7 @@ static bool setup(fixture_t *f, bool object_timed)
     moq_transport_bridge_cfg_init(&bc, &f->alloc);
     bc.max_pending = 1;
     CHECK(moq_transport_bridge_create(&bc, f->sender, &f->ep.fake.vtable, &f->ep, &f->bridge) == MOQ_OK);
+    f->ep.bridge = f->bridge;
     CHECK(f->sender->action_cap == ACTIONS && f->sender->event_cap == EVENTS);
     return true;
 }
@@ -237,8 +265,8 @@ static bool save_ring(fixture_t *f)
     CHECK(f->tail - f->head == ACTIONS);
     for (size_t i = 0; i < ACTIONS; i++) {
         size_t at = (f->head + i) % ACTIONS;
-        f->actions[i] = f->sender->actions[at];
-        f->meta[i] = f->sender->action_meta[at];
+        memcpy(&f->actions[i], &f->sender->actions[at], sizeof(f->actions[i]));
+        memcpy(&f->meta[i], &f->sender->action_meta[at], sizeof(f->meta[i]));
     }
     return true;
 }
@@ -251,6 +279,137 @@ static bool same_ring(const fixture_t *f)
         CHECK(memcmp(&f->actions[i], &f->sender->actions[at], sizeof(f->actions[i])) == 0);
         CHECK(memcmp(&f->meta[i], &f->sender->action_meta[at], sizeof(f->meta[i])) == 0);
     }
+    return true;
+}
+
+/* Only the offer is passive. Snapshot immediately around it, independently
+ * of the original sibling inventory, which active service may have moved. */
+static bool passive_offer(fixture_t *f, moq_reset_data_action_t *out, bool *available)
+{
+    moq_action_t actions[ACTIONS];
+    moq_action_meta_t meta[ACTIONS];
+    moq_event_t events[EVENTS];
+    size_t head = f->sender->action_head, tail = f->sender->action_tail;
+    size_t eh = f->sender->event_head, et = f->sender->event_tail;
+    CHECK(tail - head <= ACTIONS && et - eh <= EVENTS);
+    for (size_t i = head; i < tail; i++) {
+        memcpy(&actions[i - head], &f->sender->actions[i % ACTIONS], sizeof(actions[0]));
+        memcpy(&meta[i - head], &f->sender->action_meta[i % ACTIONS], sizeof(meta[0]));
+    }
+    for (size_t i = eh; i < et; i++)
+        memcpy(&events[i - eh], &f->sender->events[i % EVENTS], sizeof(events[0]));
+    size_t slot = moq_handle_slot(f->ep.target.handle._opaque);
+    moq_sg_entry_t sg;
+    memcpy(&sg, &f->sender->subgroups[slot], sizeof(sg));
+    *available = bridge_session_offer_data_reset(f->sender, out);
+    CHECK(f->sender->action_head == head && f->sender->action_tail == tail);
+    CHECK(f->sender->event_head == eh && f->sender->event_tail == et);
+    CHECK(memcmp(&sg, &f->sender->subgroups[slot], sizeof(sg)) == 0);
+    for (size_t i = head; i < tail; i++) {
+        CHECK(memcmp(&actions[i - head], &f->sender->actions[i % ACTIONS], sizeof(actions[0])) == 0);
+        CHECK(memcmp(&meta[i - head], &f->sender->action_meta[i % ACTIONS], sizeof(meta[0])) == 0);
+    }
+    for (size_t i = eh; i < et; i++)
+        CHECK(memcmp(&events[i - eh], &f->sender->events[i % EVENTS], sizeof(events[0])) == 0);
+    return true;
+}
+
+typedef struct sibling_inventory {
+    uint8_t bytes[ACTIONS * (32 + 5)];
+    size_t end[ACTIONS];
+    size_t len, pos, next;
+    unsigned retained;
+} sibling_inventory_t;
+
+static bool inventory_bytes(sibling_inventory_t *v, const uint8_t *data, size_t n)
+{
+    CHECK(v->pos <= v->len && n <= v->len - v->pos);
+    if (n) CHECK(data && memcmp(v->bytes + v->pos, data, n) == 0);
+    v->pos += n;
+    return true;
+}
+
+static bool inventory_action(const fixture_t *f, sibling_inventory_t *v,
+                             const moq_action_t *a, const moq_action_meta_t *m,
+                             bool payload_only)
+{
+    CHECK(v->next < ACTIONS && a->kind == MOQ_ACTION_SEND_DATA);
+    const moq_send_data_action_t *want = &f->actions[v->next].u.send_data;
+    const moq_send_data_action_t *got = &a->u.send_data;
+    size_t start = v->next ? v->end[v->next - 1] : 0;
+    CHECK(v->pos == start || v->pos == start + want->header_len);
+    size_t remaining_header = v->pos == start ? want->header_len : 0;
+    CHECK((payload_only ? 0 : got->header_len) == remaining_header);
+    CHECK(got->header_len == 0 || got->header_len == want->header_len);
+    CHECK(got->stream_ref._v == want->stream_ref._v && !got->fin);
+    CHECK(got->payload == f->other_payload && moq_rcbuf_len(got->payload) == 5);
+    CHECK(a->detail_size == f->actions[v->next].detail_size &&
+          got->scheduling_priority == want->scheduling_priority);
+    CHECK(memcmp(m, &f->meta[v->next], sizeof(*m)) == 0);
+    CHECK(inventory_bytes(v, got->header, remaining_header));
+    CHECK(inventory_bytes(v, moq_rcbuf_data(got->payload), 5));
+    CHECK(v->pos == v->end[v->next]);
+    v->next++;
+    v->retained++;
+    return true;
+}
+
+/* Accepted wire is an exact prefix; pending, bridge-queued and core-owned
+ * DATA must account for the exact remaining suffix, in that order. No helper
+ * takes a payload reference that could hide loss of a product owner. */
+static bool sibling_inventory(const fixture_t *f, const group_t *sibling, bool complete)
+{
+    sibling_inventory_t v = { 0 };
+    CHECK(!f->ep.fake.overflowed && !f->ep.fake.truncated);
+    for (size_t i = 0; i < ACTIONS; i++) {
+        const moq_send_data_action_t *a = &f->actions[i].u.send_data;
+        CHECK(f->actions[i].kind == MOQ_ACTION_SEND_DATA &&
+              a->stream_ref._v == sibling->ref._v && !a->fin);
+        CHECK(a->header_len <= sizeof(a->header) && a->payload == f->other_payload);
+        CHECK(moq_rcbuf_len(a->payload) == 5);
+        memcpy(v.bytes + v.len, a->header, a->header_len);
+        v.len += a->header_len;
+        memcpy(v.bytes + v.len, moq_rcbuf_data(a->payload), 5);
+        v.len += 5;
+        v.end[i] = v.len;
+    }
+    for (size_t i = 0; i < f->ep.fake.count; i++) {
+        const fake_op_t *op = &f->ep.fake.ops[i];
+        if (op->stream_id != sibling->sid) continue;
+        CHECK(op->kind == FAKE_OP_WRITE && !op->fin && op->data_len > 0);
+        CHECK(inventory_bytes(&v, op->data, op->data_len));
+    }
+    while (v.next < ACTIONS && v.pos >= v.end[v.next]) v.next++;
+    for (uint32_t i = 0; i < f->bridge->pending_count; i++) {
+        const bridge_pending_item_t *p = &f->bridge->pending[i];
+        if (p->stream_ref._v != sibling->ref._v &&
+            (!p->has_stream_id || p->stream_id != sibling->sid)) continue;
+        CHECK(p->owns_action && (p->kind == PENDING_HEADER_PAYLOAD ||
+                                p->kind == PENDING_PAYLOAD_ONLY));
+        CHECK(inventory_action(f, &v, &p->act, &p->meta, p->kind == PENDING_PAYLOAD_ONLY));
+    }
+    for (uint32_t i = 0; i < f->bridge->dstream_cap; i++) {
+        const bridge_dstream_t *d = &f->bridge->dstreams[i];
+        if (!d->active || d->ref._v != sibling->ref._v) continue;
+        CHECK(d->has_sid && d->sid == sibling->sid && !d->has_reset);
+        for (uint32_t j = 0; j < d->q_len; j++) {
+            const bridge_data_item_t *item = &d->q[(d->q_head + j) % d->q_cap];
+            CHECK(inventory_action(f, &v, &item->action, &item->meta, false));
+        }
+    }
+    for (size_t i = f->sender->action_head; i < f->sender->action_tail; i++) {
+        size_t at = i % f->sender->action_cap;
+        const moq_action_t *a = &f->sender->actions[at];
+        if (a->kind == MOQ_ACTION_RESET_DATA)
+            CHECK(a->u.reset_data.stream_ref._v != sibling->ref._v);
+        if (a->kind != MOQ_ACTION_SEND_DATA ||
+            a->u.send_data.stream_ref._v != sibling->ref._v) continue;
+        CHECK(inventory_action(f, &v, a, &f->sender->action_meta[at], false));
+    }
+    CHECK(v.next == ACTIONS && v.pos == v.len);
+    CHECK(moq_rcbuf_refcount(f->other_payload) == 1u + v.retained);
+    if (complete) CHECK(v.retained == 0);
+    CHECK(bridge_find_by_ref(f->bridge, sibling->ref) != NULL);
     return true;
 }
 
@@ -327,6 +486,7 @@ static bool pressure(fixture_t *f, bool timeout, bool object_timed)
         CHECK(f->actions[i].kind == MOQ_ACTION_SEND_DATA);
         CHECK(f->actions[i].u.send_data.stream_ref._v == sibling.ref._v);
     }
+    CHECK(sibling_inventory(f, &sibling, false));
 
     moq_sg_entry_t *sg = &f->sender->subgroups[moq_handle_slot(target.handle._opaque)];
     f->ep.fake.block_reset_at = true;
@@ -348,8 +508,10 @@ static bool pressure(fixture_t *f, bool timeout, bool object_timed)
         CHECK(service(f));
         CHECK(f->ep.fake.reset_at_calls == 0 && !f->ep.saw_event_before_reset);
         moq_reset_data_action_t offer;
-        CHECK(!bridge_session_offer_data_reset(f->sender, &offer));
-        CHECK(same_ring(f));
+        bool available;
+        CHECK(passive_offer(f, &offer, &available));
+        CHECK(!available);
+        CHECK(sibling_inventory(f, &sibling, false));
         for (size_t i = 0; i < EVENTS; i++) {
             moq_event_t ev;
             CHECK(moq_session_poll_events(f->sender, &ev, 1) == 1);
@@ -357,29 +519,32 @@ static bool pressure(fixture_t *f, bool timeout, bool object_timed)
             moq_event_cleanup(&ev);
         }
     }
-    CHECK(sg->state == MOQ_SG_TERMINAL_OWED && sg->terminal_code == f->ep.code);
+    /* Returning event credit can already move compact debt into the ring
+     * when mapped sibling progress has freed action capacity. */
+    CHECK(reset_inventory(&f->ep, false, 1));
     moq_reset_data_action_t offer;
     bool offered = true;
     for (unsigned i = 0; i < 2; i++) {
-        bool available = bridge_session_offer_data_reset(f->sender, &offer);
+        bool available;
+        CHECK(passive_offer(f, &offer, &available));
         offered &= available;
         if (available) {
             CHECK(offer.stream_ref._v == target.ref._v && offer.error_code == f->ep.code);
             CHECK(offer.reliable_size == f->ep.reliable);
         }
-        CHECK(sg->state == MOQ_SG_TERMINAL_OWED);
-        CHECK(f->sender->event_head == f->sender->event_tail);
-        CHECK(same_ring(f)); /* offering cannot claim event/reset or poll output */
+        CHECK(reset_inventory(&f->ep, false, 1));
+        CHECK(sibling_inventory(f, &sibling, false));
     }
     CHECK(service(f)); /* the actual bridge pressure escape must call claim */
     CHECK(f->ep.fake.reset_at_calls > 0 && f->ep.saw_event_before_reset);
-    CHECK(offered); /* old product must reach the production escape before RED */
+    CHECK(offered); /* Require the pending reset to reach the escape path. */
 #ifdef MOQ_SESSION_SWEEP_TESTING
     CHECK(bridge_work_terminal_slots > terminal_slots);
 #endif
     CHECK(f->bridge->dq_timed == 0);
-    CHECK(accepted_resets(f) == 0 && sg->state == MOQ_SG_RESET_OWED);
-    CHECK(sg->owed_reset_code == f->ep.code && sg->terminal_cause == f->ep.cause);
+    CHECK(accepted_resets(f) == 0);
+    CHECK(reset_inventory(&f->ep, true, 1));
+    CHECK(sibling_inventory(f, &sibling, false));
     CHECK(take_terminal(f));
     CHECK(moq_rcbuf_refcount(f->payload) == 1);
     CHECK(moq_transport_bridge_on_peer_stop_sending(f->bridge, target.sid, 99, f->now) == MOQ_OK);
@@ -388,15 +553,17 @@ static bool pressure(fixture_t *f, bool timeout, bool object_timed)
         bridge_stream_entry_t *e = bridge_find_by_ref(f->bridge, target.ref);
         CHECK(e && e->reset_source_held);
         CHECK(f->bridge->pending_count == 1 && f->bridge->pending[0].stream_ref._v == blocked.ref._v);
-        CHECK(same_ring(f));
-        CHECK(sg->state == MOQ_SG_RESET_OWED && sg->owed_reset_code == f->ep.code);
+        CHECK(sibling_inventory(f, &sibling, false));
+        CHECK(reset_inventory(&f->ep, true, 1));
         CHECK(f->sender->event_head == f->sender->event_tail);
     }
     f->ep.fake.block_reset_at = false;
     CHECK(service(f));
     CHECK(accepted_resets(f) == 1);
     CHECK(moq_transport_bridge_find_ref(f->bridge, target.sid)._v == 0);
-    CHECK(f->bridge->pending_count == 1 && same_ring(f));
+    CHECK(f->bridge->pending_count == 1);
+    CHECK(sibling_inventory(f, &sibling, false));
+    CHECK(reset_inventory(&f->ep, true, 0));
     CHECK(f->sender->event_head == f->sender->event_tail);
     f->ep.fake.block_open_uni = false;
     CHECK(service(f));
@@ -406,6 +573,8 @@ static bool pressure(fixture_t *f, bool timeout, bool object_timed)
     CHECK(moq_rcbuf_refcount(f->payload) == 1 && moq_rcbuf_refcount(f->other_payload) == 1);
     CHECK(bridge_find_by_ref(f->bridge, sibling.ref) != NULL);
     CHECK(accepted_resets(f) == 1);
+    CHECK(sibling_inventory(f, &sibling, true));
+    CHECK(f->sender->event_head == f->sender->event_tail);
     return true;
 }
 
@@ -427,7 +596,7 @@ static bool request(fixture_t *f, unsigned id)
 
 /* An OPEN subgroup has no close timer. Only its bridge-owned object's
  * deadline can create this terminal, with the core clock still stale. */
-static bool retained_object_event_credit(fixture_t *f)
+static bool retained_object_event_credit(fixture_t *f, bool saturated)
 {
     group_t target, sibling, blocked;
     CHECK(open_group(f, 30, &target, true));
@@ -436,7 +605,6 @@ static bool retained_object_event_credit(fixture_t *f)
     f->ep.code = MOQ_RESET_DELIVERY_TIMEOUT;
     f->ep.cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT;
     f->ep.reliable = bridge_find_by_ref(f->bridge, target.ref)->subgroup_header_len;
-    f->ep.queued_reset_source = true;
     fake_endpoint_clear_ops(&f->ep.fake);
     fake_block_stream(&f->ep.fake, target.sid);
     CHECK(moq_session_write_object(f->sender, target.handle, 0, f->payload, f->now) == MOQ_OK);
@@ -464,10 +632,11 @@ static bool retained_object_event_credit(fixture_t *f)
     CHECK(sg->state == MOQ_SG_OPEN && sg->delivery_deadline_us == UINT64_MAX);
     CHECK(f->sender->subgroup_deadline_us == UINT64_MAX);
     uint64_t old_now = f->sender->last_now_us;
-    CHECK(old_now < due && old_now <= UINT64_MAX - 10000);
+    CHECK(old_now < due && old_now <= UINT64_MAX - 15000);
     CHECK(fill_events(f));
     size_t event_head = f->sender->event_head, event_tail = f->sender->event_tail;
-    f->now = old_now + 10000; /* exceeds the 5000us terminal retry interval */
+    f->now = saturated ? UINT64_MAX - 1000 : old_now + 10000;
+    const uint64_t retry = saturated ? UINT64_MAX - 1 : f->now + 5000;
     CHECK(f->now > due);
     f->ep.suppress_target = true;
     f->ep.fake.block_reset_at = true;
@@ -484,14 +653,30 @@ static bool retained_object_event_credit(fixture_t *f)
     CHECK(moq_rcbuf_refcount(f->payload) == 1);
     CHECK(f->bridge->pending_count == 1 &&
           f->bridge->pending[0].stream_ref._v == blocked.ref._v);
-    /* Check after debt/cleanup: stale-clock RED must reach the actual handoff. */
-    CHECK(f->sender->subgroup_retry_deadline_us > f->now &&
-          f->sender->subgroup_retry_deadline_us != UINT64_MAX);
+    /* Check after debt/cleanup so a stale clock cannot bypass the handoff. */
+    CHECK(f->sender->subgroup_retry_deadline_us == retry);
+    CHECK(f->sender->last_now_us == old_now);
+    /* Public polling prepares even an empty ring. Repetition must not
+     * replace recognition time with the still-stale core clock. MAX-1 is
+     * the saturated armed deadline; MAX is reserved for no debt. */
+    for (unsigned i = 0; i < 3; i++) {
+        moq_action_t a;
+        size_t n = moq_session_poll_actions(f->sender, &a, 1);
+        if (n) moq_action_cleanup(&a);
+        CHECK(n == 0);
+        CHECK(f->sender->last_now_us == old_now);
+        CHECK(f->sender->subgroup_retry_deadline_us == retry);
+        CHECK(sg->state == MOQ_SG_TERMINAL_OWED && sg->terminal_code == f->ep.code);
+        CHECK(sg->terminal_cause == f->ep.cause && sg_has_terminal_debt(f->sender));
+        CHECK(f->sender->event_head == event_head && f->sender->event_tail == event_tail);
+        CHECK(f->ep.fake.reset_at_calls == 0 && f->bridge->dreset_count == 0);
+        CHECK(moq_rcbuf_refcount(f->payload) == 1);
+    }
     CHECK(service(f));
     CHECK(sg->state == MOQ_SG_TERMINAL_OWED && sg->terminal_code == f->ep.code);
     CHECK(f->sender->event_head == event_head && f->sender->event_tail == event_tail);
     CHECK(f->ep.fake.reset_at_calls == 0 && f->bridge->dreset_count == 0);
-    CHECK(f->sender->subgroup_retry_deadline_us > f->now);
+    CHECK(f->sender->subgroup_retry_deadline_us == retry);
 
     /* Exactly one returned event slot is sufficient, without advancing time. */
     moq_event_t ev;
@@ -505,6 +690,9 @@ static bool retained_object_event_credit(fixture_t *f)
         moq_event_cleanup(&ev);
     }
     CHECK(take_terminal(f));
+    CHECK(!sg_has_terminal_debt(f->sender));
+    CHECK(f->sender->subgroup_retry_deadline_us == UINT64_MAX);
+    CHECK(reset_inventory(&f->ep, true, 1));
     const bridge_stream_entry_t *e = bridge_find_by_ref(f->bridge, target.ref);
     CHECK(e && e->data_terminal_received && e->reset_source_held);
     CHECK(f->bridge->pending_count == 1 && f->bridge->dreset_count == 0);
@@ -539,6 +727,7 @@ static bool retained_object_event_credit(fixture_t *f)
     f->ep.fake.block_reset_at = false;
     CHECK(service(f));
     CHECK(accepted_resets(f) == 1 && bridge_find_by_ref(f->bridge, target.ref) == NULL);
+    CHECK(reset_inventory(&f->ep, true, 0));
     payload_writes = 0;
     for (size_t i = 0; i < f->ep.fake.count; i++) {
         const fake_op_t *op = &f->ep.fake.ops[i];
@@ -553,6 +742,8 @@ static bool retained_object_event_credit(fixture_t *f)
     CHECK(moq_session_poll_events(f->sender, &ev, 1) == 0);
     CHECK(f->bridge->dreset_count == 0 && f->bridge->dq_timed == 0);
     CHECK(moq_rcbuf_refcount(f->payload) == 1 && f->ep.post_terminal_writes == 0);
+    CHECK(!sg_has_terminal_debt(f->sender) &&
+          f->sender->subgroup_retry_deadline_us == UINT64_MAX);
     /* A normal close through the original handle proves it remains usable;
      * neither the target's terminal nor its reset terminated this sibling. */
     CHECK(moq_session_close_subgroup(f->sender, sibling.handle, f->now) == MOQ_OK);
@@ -626,7 +817,10 @@ int main(void)
     if (setup(&f, true)) (void)pressure(&f, false, true);
     (void)cleanup(&f);
     puts("terminal pressure: live retained object, full events, stale-clock retry");
-    if (setup(&f, true)) (void)retained_object_event_credit(&f);
+    if (setup(&f, true)) (void)retained_object_event_credit(&f, false);
+    (void)cleanup(&f);
+    puts("terminal pressure: saturated recognition retry, full events, stale clock");
+    if (setup(&f, true)) (void)retained_object_event_credit(&f, true);
     (void)cleanup(&f);
     printf("%u assertions, %u failures\n", checks, failures);
     return failures ? 1 : 0;

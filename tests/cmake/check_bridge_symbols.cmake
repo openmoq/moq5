@@ -49,6 +49,8 @@ set(BASE_SYMBOLS
     moq_transport_bridge_on_peer_control_bytes
     moq_transport_bridge_on_peer_uni_bytes
     moq_transport_bridge_on_peer_uni_rcbuf
+    moq_transport_bridge_on_peer_uni_prefix_bytes
+    moq_transport_bridge_on_peer_uni_prefix_rcbuf
     moq_transport_bridge_on_peer_bidi_bytes
     moq_transport_bridge_on_peer_stream_reset
     moq_transport_bridge_on_peer_stop_sending

@@ -321,6 +321,27 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     add_test(NAME pico_wt_loopback COMMAND test_pico_wt_loopback)
     set_tests_properties(pico_wt_loopback PROPERTIES TIMEOUT 30)
 
+    if(TARGET moq::adapter-picoquic)
+        add_executable(test_outbound_stream_credit
+            tests/test_outbound_stream_credit.c tests/pico_wt_harness.c)
+        target_include_directories(test_outbound_stream_credit PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_outbound_stream_credit PRIVATE
+            moq::adapter-pico-wt moq::adapter-picoquic picoquic-test)
+        target_compile_definitions(test_outbound_stream_credit PRIVATE
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_outbound_stream_credit PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        foreach(cell raw-uni raw-bidi wt-uni wt-bidi raw-reset wt-reset)
+            string(REPLACE "-" "_" suffix "${cell}")
+            add_test(NAME outbound_credit_${suffix}
+                COMMAND test_outbound_stream_credit ${cell})
+            set_tests_properties(outbound_credit_${suffix} PROPERTIES TIMEOUT 60)
+        endforeach()
+    endif()
+
     # The loopback rows that construct an endpoint directly call the
     # adapter's private endpoint constructor, which the shipping library does
     # not export. They run in this build, which compiles the adapter sources

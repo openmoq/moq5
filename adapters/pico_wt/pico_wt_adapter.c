@@ -18,12 +18,12 @@
  * - Server: first peer WT bidi → MoQ control → on_peer_control_bytes
  * - Client: first local WT bidi → MoQ control (via on_bidi_opened)
  * - Other WT bidi → on_peer_bidi_bytes
- * - WT uni → on_peer_uni_bytes
+ * - WT uni → on_peer_uni_prefix_bytes
  *
  * Uni-control-pair profiles (draft-18):
  * - No WT bidi is ever MoQ control; every bidi (including the first,
  *   each way) is a request stream → on_peer_bidi_bytes
- * - WT uni → on_peer_uni_bytes; the bridge classifies each peer uni
+ * - WT uni → on_peer_uni_prefix_bytes; the bridge classifies each peer uni
  *   itself (control vs data vs padding) by its leading stream type
  */
 
@@ -34,6 +34,16 @@
 
 /* Inbound receive flow control (defined below). */
 static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now);
+
+/* Ordinary (unbudgeted) service cannot suspend. Pair every successful,
+ * nonterminal pass with receive replay, including passes inside a sweep. */
+static moq_result_t pw_service_bridge(moq_pico_wt_conn_t *c, uint64_t now)
+{
+    moq_result_t rc = moq_transport_bridge_service(c->bridge, now);
+    if (rc >= 0 && !moq_transport_bridge_is_terminal(c->bridge))
+        pw_rx_after_service(c, now);
+    return rc;
+}
 
 /* Dispatch a FIN-initiated deferred bridge close from the post-service sweep.
  * Thin wrapper over moq_transport_bridge_service so a test can force the
@@ -47,10 +57,14 @@ moq_result_t (*pw_test_after_fin_service_hook)(moq_transport_bridge_t *,
 static moq_result_t pw_after_fin_service(moq_pico_wt_conn_t *c, uint64_t now)
 {
 #ifdef MOQ_PICO_WT_TESTING
-    if (pw_test_after_fin_service_hook)
-        return pw_test_after_fin_service_hook(c->bridge, now);
+    if (pw_test_after_fin_service_hook) {
+        moq_result_t rc = pw_test_after_fin_service_hook(c->bridge, now);
+        if (rc >= 0 && !moq_transport_bridge_is_terminal(c->bridge))
+            pw_rx_after_service(c, now);
+        return rc;
+    }
 #endif
-    return moq_transport_bridge_service(c->bridge, now);
+    return pw_service_bridge(c, now);
 }
 static void pw_rx_free_all(moq_pico_wt_conn_t *c);
 
@@ -62,6 +76,8 @@ static void pw_apply_priorities(moq_pico_wt_conn_t *c, uint64_t now)
         moq_transport_bridge_on_transport_error(c->bridge, 0x1, now);
 }
 static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid);
+static void pw_rx_stopped(moq_pico_wt_conn_t *c, uint64_t sid);
+static void pw_rx_stop_terminal(void *ctx, uint64_t sid);
 static bool pw_rx_terminal_discard(void *ctx, uint64_t sid);
 
 #ifdef MOQ_PICO_WT_TESTING
@@ -72,16 +88,20 @@ static bool pw_rx_terminal_discard(void *ctx, uint64_t sid);
 void (*pw_test_callback_observer)(moq_pico_wt_conn_t *, int, uint64_t, int) = NULL;
 void (*pw_test_local_stop_observer)(moq_pico_wt_conn_t *, uint64_t) = NULL;
 void (*pw_test_grant_observer)(moq_pico_wt_conn_t *, uint64_t, uint64_t) = NULL;
+void (*pw_test_sweep_observer)(moq_pico_wt_conn_t *) = NULL;
 #define PW_OBSERVE_CALLBACK(c, ev, sid, phase) \
     do { if (pw_test_callback_observer) pw_test_callback_observer((c), (int)(ev), (sid), (phase)); } while (0)
 #define PW_OBSERVE_LOCAL_STOP(c, sid) \
     do { if (pw_test_local_stop_observer) pw_test_local_stop_observer((c), (sid)); } while (0)
 #define PW_OBSERVE_GRANT(c, sid, n) \
     do { if (pw_test_grant_observer) pw_test_grant_observer((c), (sid), (n)); } while (0)
+#define PW_OBSERVE_SWEEP(c) \
+    do { if (pw_test_sweep_observer) pw_test_sweep_observer(c); } while (0)
 #else
 #define PW_OBSERVE_CALLBACK(c, ev, sid, phase) do { } while (0)
 #define PW_OBSERVE_LOCAL_STOP(c, sid) do { } while (0)
 #define PW_OBSERVE_GRANT(c, sid, n) do { } while (0)
+#define PW_OBSERVE_SWEEP(c) do { } while (0)
 #endif
 
 #if defined(MOQ_PICO_WT_TEST_QUIC_LOST)
@@ -124,7 +144,7 @@ static void on_local_stop_sending(void *ctx, uint64_t stream_id)
     moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)ctx;
     if (!c) return;
     PW_OBSERVE_LOCAL_STOP(c, stream_id);
-    pw_rx_drop(c, stream_id);
+    pw_rx_stopped(c, stream_id);
 }
 
 static void on_local_bidi_opened(void *ctx, uint64_t stream_id)
@@ -255,7 +275,10 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
     c->endpoint_ctx.on_uni_opened = on_local_uni_opened;
     c->endpoint_ctx.on_local_stop_sending = on_local_stop_sending;
     c->endpoint_ctx.rx_terminal_discard = pw_rx_terminal_discard;
+    c->endpoint_ctx.rx_stop_terminal = pw_rx_stop_terminal;
     c->endpoint_ctx.cb_ctx = c;
+    /* Every ingress/replay site handles bounded refusal before advertising. */
+    c->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
 #ifdef MOQ_PICO_WT_TESTING
     if (g_pw_test_hold_bidi)
         c->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
@@ -408,14 +431,12 @@ int moq_pico_wt_service(moq_pico_wt_conn_t *conn, uint64_t now_us)
             conn->bridge, PICO_WT_RESET_FATAL_CODE, now_us);
         return -1;
     }
-    moq_result_t rc = moq_transport_bridge_service(
-        conn->bridge, now_us);
-    if (rc >= 0 && !moq_transport_bridge_is_terminal(conn->bridge)) {
-        /* replay anything the drain unblocked and issue owed grants */
-        pw_rx_after_service(conn, now_us);
+    moq_result_t rc = pw_service_bridge(conn, now_us);
+    if (rc >= 0 && !moq_transport_bridge_is_terminal(conn->bridge))
         pw_apply_priorities(conn, now_us);
-        if (moq_transport_bridge_is_fatal(conn->bridge)) return -1;
-    }
+    /* Replay in the paired helper (or priority application) can go fatal
+     * after bridge service returned success. Preserve the public error. */
+    if (moq_transport_bridge_is_fatal(conn->bridge)) return -1;
 
     return rc < 0 ? -1 : 0;
 }
@@ -519,6 +540,27 @@ static void pw_rx_drop(moq_pico_wt_conn_t *c, uint64_t sid)
     memset(st, 0, sizeof(*st));   /* active = false */
 }
 
+/* A held/refused stream keeps a payload-free slot until its actual receive
+ * terminal or h3zero release, so repeated input cannot become a new request.
+ * Core-owned input keeps the existing local-STOP behavior. */
+static void pw_rx_stopped(moq_pico_wt_conn_t *c, uint64_t sid)
+{
+    pw_rx_stream_t *st = pw_rx_find(c, sid);
+    if (st == NULL || !st->held_input) {
+        pw_rx_drop(c, sid);
+        return;
+    }
+    memset(&st->uni_prefix, 0, sizeof(st->uni_prefix));
+    if (st->buf != NULL)
+        c->alloc.free(st->buf, st->buf_cap, c->alloc.ctx);
+    st->buf = NULL;
+    st->buf_len = st->buf_cap = st->held_len = 0;
+    st->held_input = st->held_fin = st->buf_fin = st->fin_blocked = false;
+    st->blocked = 0;
+    st->paused = false;
+    st->admission_stopped = true;
+}
+
 /* The stream's whole terminal goes to the bridge: h3zero released it, both
  * directions over at the transport. That fact names no cause -- FIN or
  * RESET -- commits no bytes, and says nothing about our own sends having
@@ -561,6 +603,16 @@ static void pw_rx_retire(moq_pico_wt_conn_t *c, uint64_t sid, uint64_t now)
     if (released) pw_report_stream_terminal(c, sid, now);
 }
 
+/* The provider confirmed only the receive half ended. Never discard work
+ * already owned by the core or manufacture a whole-bidi terminal. */
+static void pw_rx_stop_terminal(void *ctx, uint64_t sid)
+{
+    moq_pico_wt_conn_t *c = (moq_pico_wt_conn_t *)ctx;
+    pw_rx_stream_t *st = pw_rx_find(c, sid);
+    if (st == NULL || (!st->held_input && !st->admission_stopped)) return;
+    pw_rx_retire(c, sid, picoquic_get_quic_time(picoquic_get_quic_ctx(c->cnx)));
+}
+
 /* Asked before a STOP_SENDING (pico_wt_endpoint_ctx_t.rx_terminal_discard).
  * True only for a stream this adapter still holds a refused chunk of whose
  * receive half its own record shows terminal at the transport: the held
@@ -588,7 +640,7 @@ static bool pw_rx_terminal_discard(void *ctx, uint64_t sid)
     if (st == NULL) return false;
     if (!st->held_input)
         return st->released;
-    if (!(st->held_fin || st->buf_fin || st->rx_complete))
+    if (!(st->held_fin || st->buf_fin || st->rx_complete || st->released))
         return false;
     bool released = st->released;
     pw_rx_drop(c, sid);
@@ -660,9 +712,31 @@ static moq_result_t pw_rx_feed(moq_pico_wt_conn_t *c, pw_rx_stream_t *st,
             c->bridge, st->stream_id, bytes, len, fin, now);
     case PW_RX_UNI:
     default:
-        return moq_transport_bridge_on_peer_uni_bytes(
-            c->bridge, st->stream_id, bytes, len, fin, now);
+        return moq_transport_bridge_on_peer_uni_prefix_bytes(
+            c->bridge, st->stream_id, &st->uni_prefix, bytes, len, fin, now);
     }
+}
+
+/* REFUSE_CANCEL consumes nothing and retains no bridge identity. Endpoint
+ * hooks may retire the receive slot, so only scalar identity crosses them. */
+static int pw_rx_refuse(moq_pico_wt_conn_t *c, pw_rx_stream_t *st,
+                         bool fin, uint64_t now)
+{
+    uint64_t sid = st->stream_id;
+    bool bidi = st->kind == PW_RX_BIDI;
+    if (st->kind == PW_RX_CONTROL) goto fatal;
+    st->held_input = true;
+    st->held_fin |= fin;
+    uint64_t code = moq_session_version(c->session) == MOQ_VERSION_DRAFT_16
+        ? MOQ_STREAM_ERROR_CANCELLED : MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+    if (c->endpoint_ops.stop_sending(&c->endpoint_ctx, sid, code) != MOQ_TRANSPORT_OK)
+        goto fatal;
+    if (bidi && c->endpoint_ops.reset_stream(&c->endpoint_ctx, sid, code) != MOQ_TRANSPORT_OK)
+        goto fatal;
+    return 0;
+fatal:
+    moq_transport_bridge_on_transport_error(c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
+    return -1;
 }
 
 /*
@@ -689,7 +763,7 @@ static moq_result_t pw_rx_feed(moq_pico_wt_conn_t *c, pw_rx_stream_t *st,
  */
 static int pw_rx_refresh_credit(moq_pico_wt_conn_t *c, pw_rx_stream_t *st)
 {
-    if (!st->app_fc || c->cnx == NULL) return 0;
+    if (!st->app_fc || st->admission_stopped || c->cnx == NULL) return 0;
     uint64_t held = (uint64_t)st->buf_len + st->blocked;
     if (held < st->blocked || held >= st->budget)
         return 0;                                   /* no headroom: frozen */
@@ -721,7 +795,12 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
                          const uint8_t *bytes, size_t len, bool fin,
                          uint64_t now)
 {
-    pw_rx_stream_t *st = pw_rx_get(c, sid, kind);
+    pw_rx_stream_t *st = pw_rx_find(c, sid);
+    if (st != NULL && st->admission_stopped) {
+        if (fin) pw_rx_retire(c, sid, now);
+        return 0;
+    }
+    st = pw_rx_get(c, sid, kind);
     if (st == NULL) {
         moq_transport_bridge_on_transport_error(
             c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
@@ -760,13 +839,14 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
     moq_result_t rc = pw_rx_feed(c, st, bytes, len, fin, now);
     if (moq_transport_bridge_is_terminal(c->bridge))
         return -1;                           /* handler drove terminal */
+    if (rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL)
+        return pw_rx_refuse(c, st, fin, now);
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         st->paused = true;
         st->blocked = len;
         if (fin) st->fin_blocked = true;
         /* service may clear it immediately; the sweep below resumes if so */
-        moq_transport_bridge_service(c->bridge, now);
-        pw_rx_after_service(c, now);
+        pw_service_bridge(c, now);
         return moq_transport_bridge_is_fatal(c->bridge) ? -1 : 0;
     }
     if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
@@ -784,8 +864,7 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
         st->held_input = true;
         st->held_len = len;
         st->held_fin = fin;
-        moq_transport_bridge_service(c->bridge, now);
-        pw_rx_after_service(c, now);
+        pw_service_bridge(c, now);
         return moq_transport_bridge_is_fatal(c->bridge) ? -1 : 0;
     }
     if (rc < 0) {
@@ -801,10 +880,8 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
             c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
         return -1;
     }
-    if (!moq_transport_bridge_is_terminal(c->bridge)) {
-        moq_transport_bridge_service(c->bridge, now);
-        pw_rx_after_service(c, now);
-    }
+    if (!moq_transport_bridge_is_terminal(c->bridge))
+        pw_service_bridge(c, now);
     return moq_transport_bridge_is_fatal(c->bridge) ? -1 : 0;
 }
 
@@ -814,7 +891,7 @@ static int pw_rx_on_data(moq_pico_wt_conn_t *c, uint64_t sid, pw_rx_kind_t kind,
  * that were never paused, so a grant deferred while the connection was not yet
  * READY is not stranded waiting for further stream activity.
  */
-static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
+static void pw_rx_sweep(moq_pico_wt_conn_t *c, uint64_t now)
 {
     /* Never sweep a terminal connection. Callers check the bridge BEFORE
      * servicing it, but the service itself can go terminal -- a directly
@@ -824,6 +901,7 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
      * connection was already closing. */
     if (moq_transport_bridge_is_terminal(c->bridge))
         return;
+    PW_OBSERVE_SWEEP(c);
     /* The attach contract fixes the transport parameters: a changed
      * peer-unidirectional stream credit means a later
      * picoquic_set_transport_parameters reset picoquic's stream accounting
@@ -840,7 +918,7 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
     }
     for (size_t i = 0; i < c->rx_count; i++) {
         pw_rx_stream_t *st = &c->rx[i];
-        if (!st->active) continue;
+        if (!st->active || st->admission_stopped) continue;
 
         if (!st->paused) {
             if (pw_rx_refresh_credit(c, st) != 0) {
@@ -877,6 +955,10 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
             moq_result_t rc = pw_rx_feed(c, st, st->buf, hl, hfin, now);
             if (rc == MOQ_ERR_INPUT_NOT_CONSUMED)
                 continue;
+            if (rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL) {
+                if (pw_rx_refuse(c, st, hfin, now) != 0) return;
+                continue;
+            }
             st->held_input = false;
             st->held_len = 0;
             st->held_fin = false;
@@ -912,7 +994,16 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
              * re-block must re-track by byte count, not re-own this buffer */
             st->buf = NULL; st->buf_len = 0; st->buf_cap = 0; st->buf_fin = false;
             moq_result_t rc = pw_rx_feed(c, st, buf, blen, bfin, now);
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                st->buf = buf; st->buf_len = blen; st->buf_cap = bcap; st->buf_fin = bfin;
+                st->held_input = true; st->held_len = blen; st->held_fin = bfin;
+                continue;
+            }
             if (buf != NULL) c->alloc.free(buf, bcap, c->alloc.ctx);
+            if (rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL) {
+                if (pw_rx_refuse(c, st, bfin, now) != 0) return;
+                continue;
+            }
             if (rc == MOQ_ERR_WOULD_BLOCK) {
                 st->blocked = blen;
                 if (bfin) st->fin_blocked = true;
@@ -958,6 +1049,26 @@ static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
             return;
         }
     }
+}
+
+static void pw_rx_after_service(moq_pico_wt_conn_t *c, uint64_t now)
+{
+    if (moq_transport_bridge_is_terminal(c->bridge)) return;
+    c->rx_resweep_owed = true;
+    if (c->rx_sweep_active) return;
+    c->rx_sweep_active = true;
+    do {
+        c->rx_resweep_owed = false;
+        pw_rx_sweep(c, now);
+        /* Only the retired buffered-FIN path services the bridge inside a
+         * sweep. Each such service can wake an earlier-index waiter, so repeat
+         * from zero with fresh record pointers. A held chunk/prefix that made
+         * no progress never requests another pass. Each repeat therefore
+         * consumes at least one live FIN record; no receive callback creates
+         * records inside bridge service. */
+    } while (c->rx_resweep_owed && !moq_transport_bridge_is_terminal(c->bridge));
+    c->rx_resweep_owed = false;
+    c->rx_sweep_active = false;
 }
 
 
@@ -1061,7 +1172,7 @@ static void handle_control_capsule(moq_pico_wt_conn_t *c,
         moq_transport_bridge_on_transport_close(c->bridge, 0, now);
 
     if (!moq_transport_bridge_is_terminal(c->bridge))
-        moq_transport_bridge_service(c->bridge, now);
+        pw_service_bridge(c, now);
 }
 
 /* The MoQ control channel on this conn: the draft-16 control bidi the
@@ -1215,7 +1326,7 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
             c->bridge, bytes, length, now);
         (void)rc;
         if (!moq_transport_bridge_is_terminal(c->bridge))
-            moq_transport_bridge_service(c->bridge, now);
+            pw_service_bridge(c, now);
         break;
     }
 
@@ -1264,10 +1375,8 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
             moq_transport_bridge_on_peer_stream_reset(
                 c->bridge, sid, has_code ? error_code : PICO_WT_RESET_NO_APP_CODE,
                 now);
-            if (!moq_transport_bridge_is_terminal(c->bridge)) {
-                moq_transport_bridge_service(c->bridge, now);
-                pw_rx_after_service(c, now);
-            }
+            if (!moq_transport_bridge_is_terminal(c->bridge))
+                pw_service_bridge(c, now);
         }
         break;
     }
@@ -1305,10 +1414,8 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
                 PW_OBSERVE_CALLBACK(c, event, sid, 1);
                 return -1;
             }
-            if (!moq_transport_bridge_is_terminal(c->bridge)) {
-                moq_transport_bridge_service(c->bridge, now);
-                pw_rx_after_service(c, now);
-            }
+            if (!moq_transport_bridge_is_terminal(c->bridge))
+                pw_service_bridge(c, now);
             if (moq_transport_bridge_is_terminal(c->bridge)) {
                 PW_OBSERVE_CALLBACK(c, event, sid, 1);
                 return -1;

@@ -828,6 +828,11 @@ bool moq_session_uses_uni_control(const moq_session_t *s)
     return s->profile->uses_uni_control_channel;
 }
 
+uint64_t moq_session_resource_limit_stream_error(const moq_session_t *s)
+{
+    return s->profile->resource_limit_stream_error;
+}
+
 /* Public: derived from the profile's own Track Namespace floor rather than a
  * second capability bit, so the two can never disagree. Unlike its neighbours
  * above -- core-internal, always called on a fully built session -- this one is
@@ -895,6 +900,14 @@ moq_uni_class_t moq_session_classify_peer_uni(const moq_session_t *s,
     if (!s->profile->classify_uni_stream)
         return MOQ_UNI_CLASS_DATA;
     return s->profile->classify_uni_stream(data, len);
+}
+
+bool bridge_session_has_data_stream_type(
+    const moq_session_t *s, const uint8_t *data, size_t len)
+{
+    if (!s || !data || !len) return false;
+    uint32_t kind = s->profile->classify_data_stream(data, len);
+    return kind == MOQ_STREAM_KIND_SUBGROUP || kind == MOQ_STREAM_KIND_FETCH;
 }
 
 moq_result_t moq_session_validate_inbound_request_stream(
@@ -4229,6 +4242,74 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
     }
     session_action_poll_settled(s, false);
     return false;
+}
+
+bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
+    moq_action_meta_t *meta, bridge_action_gate_fn gate, void *ctx)
+{
+    session_action_poll_prepare(s);
+    size_t best = s->action_tail;
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const size_t at = i % s->action_cap;
+        const moq_action_t *a = &s->actions[at];
+        const moq_action_meta_t *m = &s->action_meta[at];
+        if (m->terminal_barrier || m->terminal_owner ||
+            action_waits_for_terminal(s, i)) break;
+        if (a->kind == MOQ_ACTION_CLOSE_SESSION) {
+            /* close_with_error discards the core backlog before queuing this.
+             * Supersede bridge storage, not an intervening core barrier. */
+            if (i == s->action_head) best = i;
+            break;
+        }
+        if (!action_is_data(a)) {
+            if (gate(ctx, a, m, false) == BRIDGE_ACTION_SKIP) continue;
+            /* A request's open can still be core-owned. Its following bytes
+             * and FIN have the same map dependency; no other bidi terminal
+             * or connection action is allowed through this exception. */
+            moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
+            if (a->kind == MOQ_ACTION_SEND_BIDI_STREAM)
+                ref = a->u.send_bidi_stream.stream_ref;
+            else if (a->kind == MOQ_ACTION_CLOSE_BIDI_STREAM)
+                ref = a->u.close_bidi_stream.stream_ref;
+            bool blocked_open = false;
+            for (size_t j = s->action_head; ref._v && j < i; ++j) {
+                const size_t prior = j % s->action_cap;
+                const moq_action_t *open = &s->actions[prior];
+                if (open->kind == MOQ_ACTION_OPEN_BIDI_STREAM &&
+                    open->u.open_bidi_stream.stream_ref._v == ref._v &&
+                    gate(ctx, open, &s->action_meta[prior], false) ==
+                        BRIDGE_ACTION_SKIP) {
+                    blocked_open = true;
+                    break;
+                }
+            }
+            if (blocked_open) continue;
+            break;
+        }
+        if (a->kind != MOQ_ACTION_SEND_DATA) continue;
+        bool later = false;
+        for (size_t j = s->action_head; j < i; ++j) {
+            moq_stream_ref_t ref;
+            if (action_data_stream(&s->actions[j % s->action_cap], &ref) &&
+                ref._v == a->u.send_data.stream_ref._v) {
+                later = true;
+                break;
+            }
+        }
+        if (later || gate(ctx, a, m, false) != BRIDGE_ACTION_READY) continue;
+        if (best == s->action_tail ||
+            sched_compare(m, &s->action_meta[best % s->action_cap]) < 0)
+            best = i;
+    }
+    if (best == s->action_tail) return false;
+    const size_t at = best % s->action_cap;
+    if (gate(ctx, &s->actions[at], &s->action_meta[at], true) !=
+        BRIDGE_ACTION_READY) return false;
+    *meta = s->action_meta[at];
+    action_take(s, best, out);
+    out->borrow_epoch = s->borrow_epoch;
+    session_action_poll_settled(s, true);
+    return true;
 }
 
 moq_result_t moq_session_poll_actions_ex(moq_session_t *s,

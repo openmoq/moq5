@@ -544,7 +544,7 @@ static bool open_refused_prefix(fixture_t *f, group_t *g)
     return true;
 }
 
-/* R2: the first reset belongs to the bridge after the core entry has reaped.
+/* The first reset belongs to the bridge after the core entry has reaped.
  * A late STOP suppresses even an unsent prefix, without changing that reset. */
 static bool deferred_reset_stop(fixture_t *f, bool prefix_ready, bool application)
 {
@@ -646,7 +646,7 @@ static bool deferred_reset_stop(fixture_t *f, bool prefix_ready, bool applicatio
     return true;
 }
 
-/* R3: object ID delta 16 begins with 0x10, but is not a subgroup prefix.
+/* Object ID delta 16 begins with 0x10, but is not a subgroup prefix.
  * Expiry must suppress it while event pressure prevents reset admission. */
 static bool object_header_timeout(fixture_t *f)
 {
@@ -702,7 +702,7 @@ static bool object_header_timeout(fixture_t *f)
     return true;
 }
 
-/* R2: no stream mapping exists when expiry moves its reset into the bridge.
+/* No stream mapping exists when expiry moves its reset into the bridge.
  * Opening later must recover that terminal identity until reset acceptance. */
 static bool timeout_refused_open(fixture_t *f)
 {
@@ -966,7 +966,7 @@ int main(void)
     }
     for (unsigned row = 0; row < 3; row++) {
         fixture_t f;
-        printf("R2/deferred-reset/%s\n", row == 0 ? "timeout-before-prefix" :
+        printf("deferred-reset/%s\n", row == 0 ? "timeout-before-prefix" :
                row == 1 ? "timeout-prefix-last-budget" : "application-prefix-last-budget");
         if (setup(&f, MOQ_VERSION_DRAFT_18, true, true))
             (void)deferred_reset_stop(&f, row != 0, row == 2);
@@ -974,13 +974,13 @@ int main(void)
     }
     {
         fixture_t f;
-        printf("R3/object-header-0x10/event-pressure\n");
+        printf("object-header-0x10/event-pressure\n");
         if (setup(&f, MOQ_VERSION_DRAFT_18, true, true)) (void)object_header_timeout(&f);
         (void)cleanup(&f);
     }
     {
         fixture_t f;
-        printf("R2/deferred-reset/timeout-refused-open-reset-retry\n");
+        printf("deferred-reset/timeout-refused-open-reset-retry\n");
         if (setup(&f, MOQ_VERSION_DRAFT_18, true, true)) (void)timeout_refused_open(&f);
         (void)cleanup(&f);
     }

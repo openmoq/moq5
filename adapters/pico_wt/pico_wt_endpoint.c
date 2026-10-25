@@ -460,17 +460,20 @@ static moq_transport_result_t ep_stop_sending(void *ctx,
         return MOQ_TRANSPORT_OK;
     /* Idempotent as a reset is: picoquic answers a receiving part already
      * terminal -- reset by the peer, read to its final size, or retired with
-     * the stream -- before changing anything, and nothing is sent, restored
-     * or reported for it. Any other refusal stays an ERROR. */
+     * the stream -- before changing anything. No frame/context change is
+     * due; notify only that receive fact to discard held adapter input.
+     * Any other refusal stays an ERROR. */
     int rc = picoquic_stop_sending(ep->cnx, stream_id, wt_code);
-    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED)
+    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
+        if (ep->rx_stop_terminal) ep->rx_stop_terminal(ep->cb_ctx, stream_id);
         return MOQ_TRANSPORT_OK;
+    }
     if (rc != 0)
         return MOQ_TRANSPORT_ERROR;   /* nothing sent: receive state untouched */
     if (wt_restore_h3_ctx(ep, stream_id) != 0)
         return MOQ_TRANSPORT_ERROR;
     /* STOP_SENDING accepted: our receive direction on this stream is cancelled,
-     * so the adapter must drop its tracked receive state. Otherwise a later
+     * so the adapter must discard what it retained. Otherwise a later
      * sweep could replay retained bytes, or grant credit, for a stream the
      * application just stopped -- which is exactly what libmoq emits when it
      * cancels a peer-origin fetch data stream. */

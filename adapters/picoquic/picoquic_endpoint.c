@@ -272,10 +272,14 @@ static moq_transport_result_t pq_stop_sending(void *ctx, uint64_t stream_id,
         return MOQ_TRANSPORT_OK;
     /* Idempotent as a reset is: picoquic answers a receiving part already
      * terminal -- reset by the peer, read to its final size, or retired with
-     * the stream -- before changing anything, and nothing is sent, watched or
-     * reported for it. Any other refusal stays an ERROR. */
+     * the stream -- before changing anything. No frame/watch is due; notify
+     * only that receive fact so held adapter input can be discarded.
+     * Any other refusal stays an ERROR. */
     int rc = picoquic_stop_sending(ep->cnx, stream_id, error_code);
-    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) return MOQ_TRANSPORT_OK;
+    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
+        if (ep->rx_stop_terminal) ep->rx_stop_terminal(ep->rx_owner, stream_id);
+        return MOQ_TRANSPORT_OK;
+    }
     if (rc != 0) return MOQ_TRANSPORT_ERROR;
     if (ep->rx_stopped && ep->rx_stopped(ep->rx_owner, stream_id) != 0)
         return MOQ_TRANSPORT_ERROR;
@@ -365,6 +369,7 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
     ep_ctx->deferred_count = ep_ctx->deferred_cap = 0;
     ep_ctx->reliable_resets = 0;
     ep_ctx->rx_terminal_discard = NULL;
+    ep_ctx->rx_stop_terminal = NULL;
     ep_ctx->rx_stopped = NULL;
     ep_ctx->rx_rebind = NULL;
     ep_ctx->rx_owner = NULL;

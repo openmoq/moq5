@@ -160,19 +160,21 @@
  *     stream that finds no mapping free beyond that reserve is held too:
  *     MOQ_ERR_INPUT_NOT_CONSUMED, with the same zero-consumption and
  *     exact-redelivery obligations as above.
- *   - On the same profiles, a NEW peer uni stream whose first chunk carries
- *     a complete data stream type (a subgroup or fetch header) and finds no
+ *   - On the same profiles, a NEW peer uni stream whose type completes as
+ *     a data stream (a subgroup or fetch header) and finds no
  *     mapping free beyond the reserve is held the same way; a NEW peer uni
- *     stream whose first chunk carries a complete padding stream type is
+ *     stream whose type completes as padding is
  *     then refused with MOQ_BRIDGE_INGRESS_REFUSE_CANCEL and never held. A
- *     stream whose first chunk is the control type, an incomplete type or
- *     an unknown type is never held or refused this way: it takes a free
- *     mapping as without this capability, and a full stream map is fatal
- *     for it.
+ *     possible control stream is never cancelled for capacity. Use the
+ *     prefix-state ingress below: incomplete types collect in the adapter's
+ *     existing receive record, without a mapping or hold slot. Classification
+ *     continues while control input is retained, but session delivery does
+ *     not. A completed DATA callback gets bounded map/hold ownership or a
+ *     refusal immediately; invalid types and truncated FIN remain errors.
  *   - On a profile whose control channel is one bidirectional stream (draft
  *     16, where every peer unidirectional stream is data), a NEW peer uni
- *     stream that finds no free stream mapping is held the same way. The
- *     draft-16 control stream is never held.
+ *     stream or non-control request bidi that finds no free stream mapping
+ *     is held the same way. The draft-16 control stream is never held.
  *   - Every held stream (uni or bidi) takes one hold record; there are
  *     max_pending of them. Held streams are offered for redelivery oldest
  *     first, and a new arrival waits behind them.
@@ -566,6 +568,36 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_bytes(
 MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     moq_rcbuf_t *data, bool fin, uint64_t now_us);
+
+/* Held-stream adapters keep this parser state in their existing receive
+ * record, zeroed on creation and discarded with that exact stream identity.
+ * The bridge alone reads/writes it. At most eight bytes can precede a complete
+ * vi64 type; the ninth byte completes even a nonminimal encoding. Accepted
+ * prefixes consume no stream-map entry or control reservation. Their storage
+ * follows the adapter's bounded receive population, not cumulative stream IDs.
+ *
+ * Use these entry points for every uni delivery and replay when declaring
+ * HOLD_BIDI_INPUT. Collection accepts the entire incomplete fragment and must
+ * permit later type bytes even while other control input is pending. Once
+ * classified, admission may refuse the entire CURRENT chunk; accepted prefix
+ * bytes stay in this state or move into the bridge mapping and are never
+ * redelivered by the adapter. FIN/RESET and teardown keep their usual meaning.
+ * No borrowed rcbuf reference survives a call merely to collect its prefix.
+ * This is private, lockstep adapter state, not an application API. */
+typedef struct moq_transport_uni_prefix {
+    uint8_t bytes[8];
+    uint8_t len;
+} moq_transport_uni_prefix_t;
+
+MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_prefix_bytes(
+    moq_transport_bridge_t *brg, uint64_t stream_id,
+    moq_transport_uni_prefix_t *prefix, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us);
+
+MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_prefix_rcbuf(
+    moq_transport_bridge_t *brg, uint64_t stream_id,
+    moq_transport_uni_prefix_t *prefix, moq_rcbuf_t *data, bool fin,
+    uint64_t now_us);
 
 MOQ_API moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
     moq_transport_bridge_t *brg, uint64_t stream_id,

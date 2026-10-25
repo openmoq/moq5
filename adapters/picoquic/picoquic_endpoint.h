@@ -54,6 +54,9 @@ typedef struct {
      * adapter restores what a stopped receive half needs; nonzero likewise
      * fails the call. */
     bool               (*rx_terminal_discard)(void *owner, uint64_t stream_id);
+    /* Provider-confirmed receive-half terminal on STOP (not whole-stream
+     * closure): discard only held/refused input, without installing a watch. */
+    void               (*rx_stop_terminal)(void *owner, uint64_t stream_id);
     int                (*rx_stopped)(void *owner, uint64_t stream_id);
     int                (*rx_rebind)(void *owner, uint64_t stream_id);
     void                *rx_owner;
