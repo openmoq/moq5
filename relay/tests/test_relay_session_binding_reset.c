@@ -31,7 +31,13 @@
  *            B's terminals are held;
  *   live     object 1 completes and subgroup 0 ends with a FIN: no reset;
  *   idle     object 1 completes and the reset arrives between objects, which
- *            the session reports with SUBGROUP_RESET: one reset after both.
+ *            the session reports with SUBGROUP_RESET: one reset after both;
+ *   reopen   as idle, and the publisher then opens the subgroup again on a
+ *            new stream with object 4 and a FIN: after the reset, a new
+ *            stream carries object 4 and ends with that FIN. B's send queue
+ *            takes the reset and the new stream before it has room for
+ *            object 4, which then goes out on that stream, with no further
+ *            reset.
  */
 #include "relay_session_binding_harness.h"
 
@@ -40,9 +46,10 @@
 #define SR_ACTIONS 2u    /* send queue of the held subscribers' sessions */
 #define SR_CODE    0x99u /* the publisher's reset code */
 
-typedef enum { SR_UNBEGUN, SR_SIBLING, SR_LIVE, SR_IDLE, SR_ROWS } sr_row_t;
+typedef enum { SR_UNBEGUN, SR_SIBLING, SR_LIVE, SR_IDLE, SR_REOPEN,
+               SR_ROWS } sr_row_t;
 static const char *const sr_row_names[SR_ROWS] = { "unbegun", "sibling", "live",
-                                                   "idle" };
+                                                   "idle", "reopen" };
 
 /* What one subscriber's session surfaced for one subgroup. */
 typedef struct sr_sg {
@@ -313,7 +320,8 @@ sr_check_end(rig_t *r, sr_row_t row, const char *who, const sr_peer_t *p,
     }
     R_CHECK(r, s0->bodies_ok && s1->bodies_ok);
     R_CHECK(r, s0->chunks[0] == 1 && (s0->done & 1u) != 0);
-    R_CHECK(r, s0->after_terminal == 0 && s1->after_terminal == 0);
+    R_CHECK(r, (row == SR_REOPEN || s0->after_terminal == 0) &&
+                   s1->after_terminal == 0);
     switch (row) {
     case SR_LIVE:
         R_CHECK(r, s0->done == 3u && s0->chunks[1] == 4);
@@ -323,6 +331,18 @@ sr_check_end(rig_t *r, sr_row_t row, const char *who, const sr_peer_t *p,
         /* Both objects whole, then the reset on its own. */
         R_CHECK(r, s0->done == 3u && s0->chunks[1] == 4);
         R_CHECK(r, s0->fins == 0 && s0->chunk_resets == 0 && s0->sg_resets == 1);
+        R_CHECK(r, s0->reset_code == SR_CODE);
+        R_CHECK(r, s0->reset_has_last && s0->reset_last == 1);
+        break;
+    case SR_REOPEN:
+        /* Both objects whole and the reset; then object 4 on a new stream,
+         * ended by the FIN. */
+        if (strcmp(s0->seq, "01S4F") != 0) {
+            printf("  %s, subgroup 0: saw \"%s\", want \"01S4F\"\n", who,
+                   s0->seq);
+        }
+        R_CHECK(r, strcmp(s0->seq, "01S4F") == 0);
+        R_CHECK(r, s0->done == 0x13u && s0->chunks[1] == 4 && s0->chunks[4] == 2);
         R_CHECK(r, s0->reset_code == SR_CODE);
         R_CHECK(r, s0->reset_has_last && s0->reset_last == 1);
         break;
@@ -469,11 +489,23 @@ sr_case(moq_version_t v, sr_row_t row)
                           MOQ_OK);
         break;
     case SR_IDLE:
+    case SR_REOPEN:
         sr_write(&rig, pub, h0, 1, 0, 1, 0, 1);
         R_CHECK(&rig, moq_session_end_object(pub->peer, h0, rig.now) == MOQ_OK);
         relay_bind_test_rig_pump(&rig, 12);
         R_CHECK(&rig, moq_session_reset_subgroup(pub->peer, h0, SR_CODE,
                                                  rig.now) == MOQ_OK);
+        if (row == SR_REOPEN) {
+            relay_bind_test_rig_pump(&rig, 12);
+            sr_drain(c, &cp);
+            /* The subgroup again, on a new stream: object 4, then the FIN. */
+            moq_subgroup_handle_t h2 = sr_open(&rig, pub, pub_ps.up_sub, 1, 0);
+            sr_write(&rig, pub, h2, 1, 0, 4, 2, 2);
+            R_CHECK(&rig, moq_session_end_object(pub->peer, h2, rig.now) ==
+                              MOQ_OK);
+            R_CHECK(&rig, moq_session_close_subgroup(pub->peer, h2, rig.now) ==
+                              MOQ_OK);
+        }
         break;
     case SR_UNBEGUN:
     case SR_SIBLING:

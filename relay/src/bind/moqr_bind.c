@@ -144,6 +144,12 @@ typedef struct b_sg {
     /* The downstream stream was opened with PROPERTIES, so it can carry an
      * object with properties. */
     bool                  props;
+    /* The stream was opened for the record of object open_obj and nothing
+     * has been written on it since: that record, offered again after the
+     * session refused its first write, starts this stream rather than
+     * finding one it does not continue. */
+    bool                  unwritten;
+    uint64_t              open_obj;
     /* A reset with reset_wire is owed on this stream (its Track turned out
      * malformed while the session could not take the reset): every later
      * close of the stream is that reset, never a FIN or another code. */
@@ -12171,10 +12177,15 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                  * known to be the next object (§11.3.2: the relay "MUST
                  * reset the Subgroup stream and open a new one to forward
                  * it"); or it has properties the stream was opened without.
-                 * A record already begun on the stream continues there. */
+                 * A record already begun on the stream continues there, and
+                 * one whose first write the session refused right after
+                 * opening the stream for it starts there: the stream has
+                 * carried nothing it could fail to continue. */
                 if (sgi >= 0 &&
                     !(cn->sgs[sgi].obj_begun &&
                       cn->sgs[sgi].obj_id == d.rec.object_id) &&
+                    !(cn->sgs[sgi].unwritten &&
+                      cn->sgs[sgi].open_obj == d.rec.object_id) &&
                     (rec_gap ||
                      (d.rec.properties != NULL && !cn->sgs[sgi].props))) {
                     moqr_reset_desc_t rd = moqr_reset_desc_none();
@@ -12352,6 +12363,8 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     cn->sgs[sgi].obj_id = 0;
                     cn->sgs[sgi].next_chunk = 0;
                     cn->sgs[sgi].props = sc.object_properties;
+                    cn->sgs[sgi].unwritten = true;
+                    cn->sgs[sgi].open_obj = d.rec.object_id;
                 }
                 if (d.rec.chunk_count > 0) {
                     /* Chunked record: stream the batch. Returns DELIVERED after
@@ -12378,6 +12391,9 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                             cn->session, cn->sgs[sgi].h, &ocfg, now_us));
                     }
                     if (props_own != NULL) moq_rcbuf_decref(props_own);
+                }
+                if (oc == MOQR_DELIVERY_DELIVERED || cn->sgs[sgi].obj_begun) {
+                    cn->sgs[sgi].unwritten = false;   /* the stream carries it */
                 }
                 /* NO inline graceful close here — every graceful subgroup
                  * closure rides the acknowledged SEAL notice, whose close
