@@ -6608,16 +6608,32 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
          * increfs the slice; the event keeps its ref (freed by event cleanup).
          * Fail-closed: an append failure abandons the record, no half-state. */
         if (oc->chunk != NULL) {
-            if (moqr_core_append_chunk(b->core, track, oc->group_id,
+            moqr_result_t arc =
+                moqr_core_append_chunk(b->core, track, oc->group_id,
                                        oc->subgroup_id, oc->object_id,
-                                       oc->chunk) != MOQR_OK) {
-                moqr_reset_desc_t stopd;
-                if (moqr_reset_desc_internal(MOQR_RESET_CODE_STOPPED,
-                                             &stopd) == MOQR_OK) {
-                    (void)moqr_core_abandon_record(b->core, track,
+                                       oc->chunk);
+            if (arc != MOQR_OK) {
+                /* The chunk is not held, so the object is lost here. Refused
+                 * for capacity, with nothing older left to reclaim, it is
+                 * lost to the relay's bounded cache: the record and its
+                 * subgroup's stream end with the eviction cause, as a refused
+                 * ingest does, so no subscriber's stream goes on past the
+                 * lost object or ends with a FIN, and a later object of the
+                 * subgroup starts a new stream. Any other refusal (a chunk
+                 * past the declared length, a record no longer OPEN) ends the
+                 * record alone, as a local STOP does. */
+                bool lost = arc == MOQR_ERR_CAPACITY;
+                moqr_reset_desc_t cause;
+                if (moqr_reset_desc_internal(lost ? MOQR_RESET_CODE_EVICTED
+                                                  : MOQR_RESET_CODE_STOPPED,
+                                             &cause) == MOQR_OK &&
+                    moqr_core_abandon_record(b->core, track, oc->group_id,
+                                             oc->subgroup_id, oc->object_id,
+                                             cause) == MOQR_OK &&
+                    lost) {
+                    (void)moqr_core_reset_subgroup(b->core, track,
                                                    oc->group_id,
-                                                   oc->subgroup_id,
-                                                   oc->object_id, stopd);
+                                                   oc->subgroup_id, cause);
                 }
                 b->ingest_refusals++;
                 break;

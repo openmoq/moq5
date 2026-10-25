@@ -373,7 +373,7 @@ if(TARGET moq::sim)
     target_link_libraries(test_relay_shard_evict_terminal PRIVATE
         moq::relay moq::sim)
     moqr_test_warnings(test_relay_shard_evict_terminal)
-    foreach(row IN ITEMS whole chunks watermark-only)
+    foreach(row IN ITEMS whole chunks watermark-only nodes refused)
         string(REPLACE "-" "_" _row "${row}")
         add_test(NAME relay_shard_evict_terminal_${_row}
             COMMAND test_relay_shard_evict_terminal ${row})

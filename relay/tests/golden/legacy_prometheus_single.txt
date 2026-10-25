@@ -90,7 +90,7 @@ moqrelay_events_translated_total{shard="0",transport="msquic",version="moqt-18+m
 # HELP moqrelay_deliveries_written_total Deliveries written to downstream sessions.
 # TYPE moqrelay_deliveries_written_total counter
 moqrelay_deliveries_written_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 250000
-# HELP moqrelay_ingest_refusals_total Ingest records refused as too old or out of order.
+# HELP moqrelay_ingest_refusals_total Ingest operations refused: objects or chunks too old, out of order or over capacity; not distinct objects lost.
 # TYPE moqrelay_ingest_refusals_total counter
 moqrelay_ingest_refusals_total{shard="0",transport="msquic",version="moqt-18+moqt-16"} 44
 # HELP moqrelay_session_errors_total Unexpected session-call failures.

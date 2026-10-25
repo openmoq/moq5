@@ -80,6 +80,10 @@ uint32_t relay_bind_test_log_max_groups = 0;
 /* 0 = 1 MiB; a small value makes the log refuse an object larger than it. */
 uint64_t relay_bind_test_log_max_bytes = 0;
 
+/* 0 = the log default; a small value makes chunked objects meet the log's
+ * chunk-node pool, so node pressure and local capacity loss are exercised. */
+uint32_t relay_bind_test_log_max_chunk_nodes = 0;
+
 /* Track Properties the origin states when it accepts the relay's SUBSCRIBE
  * through relay_bind_test_peer_drain (empty = none). Borrowed. */
 moq_bytes_t relay_bind_test_accept_track_properties = { NULL, 0 };
@@ -307,6 +311,9 @@ relay_bind_test_rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t b
                                     : 8;
     cfg.log_budget.max_bytes = relay_bind_test_log_max_bytes != 0 ? relay_bind_test_log_max_bytes
                                                          : 1 << 20;
+    if (relay_bind_test_log_max_chunk_nodes != 0) {
+        cfg.log_max_chunk_nodes = relay_bind_test_log_max_chunk_nodes;
+    }
     cfg.linger_us = relay_bind_test_linger_us != 0 ? relay_bind_test_linger_us : 500;
     cfg.max_intents = core_intents;
     cfg.authorize = relay_bind_test_authorize; /* NULL = allow-all (default)      */

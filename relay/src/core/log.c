@@ -295,6 +295,23 @@ chunk_alloc(moqr_log_t *log)
     return idx;
 }
 
+/* Whether a group's records hold a chunk node: OPEN and COMPLETE chunked
+ * records alike keep one per retained chunk (datagrams are never chunked).
+ * Stops at the first record that does. */
+static bool
+group_holds_node(const moqr_group_t *g)
+{
+    for (uint32_t s = 0; s < g->sg_count; s++) {
+        const moqr_rec_vec_t *v = &g->sgs[s].v;
+        for (uint32_t i = 0; i < v->count; i++) {
+            if (v->recs[i].chunk_count > 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* Return a record's chunk list to the pool, decref'ing each retained slice
  * exactly once, and reset the record's list to empty. Byte accounting is the
  * caller's job (eviction subtracts g->bytes wholesale; abandon adjusts
@@ -1383,13 +1400,40 @@ moqr_log_append_chunk(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id,
     if (len == 0) {
         return MOQR_OK;   /* zero-length chunk: no node, no bytes, no state */
     }
-    /* Byte budget: evict oldest groups (never this open record's group) until
-     * the chunk fits. The record fits alone (open checked declared+props <=
-     * max_bytes), so this only sheds older data; if this record's group is
-     * itself the oldest and blocking, fail closed (the caller abandons). */
-    while (log->retained_bytes + len > log->max_bytes) {
+    /* Byte budget and chunk-node pool: evict oldest groups (never this open
+     * record's group) until the chunk fits both. COMPLETE chunked records
+     * keep their nodes until their group is evicted, so the pool, like the
+     * byte budget, is reclaimed from the oldest data. The record fits alone in
+     * bytes (open checked declared+props <= max_bytes), so this only sheds
+     * older data. Eviction stops at this record's group, so only a group older
+     * than it can give a node back: when only nodes are short, those groups
+     * are looked at once, up to the first that holds a node. If none does --
+     * every node in use is this group's or a newer group's -- nothing is
+     * evicted for nothing; otherwise the groups ahead of that holder go first,
+     * a group holding no node included, and the holder frees a node. If this
+     * record's group is itself the oldest and blocking, or no older group
+     * holds a node when only nodes are short, fail closed: the record stays
+     * OPEN and the chunk is not taken (the caller abandons). Eviction compacts
+     * the group array, so the record is resolved again after each. */
+    bool older_holds_node = false;   /* found at the first node-only shortage */
+    for (;;) {
+        bool bytes_short = log->retained_bytes + len > log->max_bytes;
+        if (!bytes_short && log->chunk_free_head != MOQR_CHUNK_NIL) {
+            break;
+        }
         if (log->group_count == 0 || &log->groups[0] == g) {
             return MOQR_ERR_CAPACITY;
+        }
+        if (!bytes_short && !older_holds_node) {
+            for (const moqr_group_t *o = log->groups; o != g; o++) {
+                if (group_holds_node(o)) {
+                    older_holds_node = true;
+                    break;
+                }
+            }
+            if (!older_holds_node) {
+                return MOQR_ERR_CAPACITY;
+            }
         }
         evict_group_at(log, 0, /*reason=*/0);
         rc = resolve_open_rec(log, group_id, subgroup_id, object_id,

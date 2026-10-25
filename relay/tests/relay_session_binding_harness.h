@@ -395,6 +395,7 @@ extern bool relay_bind_test_client_streaming_objects;
 extern uint32_t relay_bind_test_max_open_subgroups;
 extern uint32_t relay_bind_test_log_max_groups;
 extern uint64_t relay_bind_test_log_max_bytes;
+extern uint32_t relay_bind_test_log_max_chunk_nodes;
 extern moq_bytes_t relay_bind_test_accept_track_properties;
 extern uint64_t relay_bind_test_accept_track_alias;
 extern uint32_t relay_bind_test_initial_request_capacity;

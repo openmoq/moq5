@@ -3,14 +3,16 @@
  * exactly the bindings whose deliverable state can have changed — activation
  * (parked resolve + immediate accept), the whole ingest family (whole/OPEN/
  * chunk/completion/abandon), seal, eviction pending-skip, an upstream
- * eviction watermark that changed something, and subscription
+ * eviction watermark that changed something, an eviction made to admit a
+ * record even when the record is then refused, and subscription
  * retirement — deduplicated by slot, filtered of pseudo-bindings at
  * production, drained in ascending slot order with exact remainder
- * retention, and cleared at binding close before slot reuse. Capacity: the
- * bitset's descriptor and create-time allocation terms are pinned across
- * word boundaries (1/63/64/65 bindings). Nothing consumes the set in
- * production yet, so every fixture drives the public API and observes only
- * moqr_core_drain_ready plus white-box set internals.
+ * retention, and cleared at binding close before slot reuse. A delivery
+ * held mid-object keeps its pinned chunks across a chunk-node eviction.
+ * Capacity: the bitset's descriptor and create-time allocation terms are
+ * pinned across word boundaries (1/63/64/65 bindings). Every fixture drives
+ * the public API and observes moqr_core_drain_ready, the deliveries the
+ * marks make possible, and white-box set internals.
  */
 
 #include "relay.c"
@@ -119,13 +121,48 @@ mkcore(ca_t *a, uint32_t max_bindings, uint32_t max_subs)
     return c;
 }
 
-static moqr_result_t
-ing(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t o)
+/* A core whose track logs hold `nodes` chunk nodes (0: the default) within
+ * `max_bytes`. */
+static moqr_core_t *
+mkcore_log(ca_t *a, uint32_t nodes, uint64_t max_bytes)
 {
-    uint8_t buf[32];
-    memset(buf, (uint8_t)(g * 16 + o), sizeof(buf));
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a->vt);
+    cfg.max_bindings = 8;
+    cfg.max_subs = 16;
+    cfg.max_tracks = 4;
+    cfg.log_budget.max_groups = 4;
+    cfg.log_budget.max_bytes = max_bytes;
+    cfg.log_max_chunk_nodes = nodes;
+    cfg.linger_us = 1000;
+    moqr_core_t *c = NULL;
+    if (moqr_core_create(&cfg, &c) != MOQR_OK) {
+        return NULL;
+    }
+    return c;
+}
+
+/* The log of `t` (white-box). */
+static moqr_log_t *
+track_log(moqr_core_t *c, moqr_track_t t)
+{
+    uint32_t slot = 0;
+    r_track_t *tr = track_resolve(c, t, &slot);
+    return tr != NULL ? tr->log : NULL;
+}
+
+/* Ingest a whole object of `len` bytes (at most 64). */
+static moqr_result_t
+ing_len(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t o,
+        size_t len)
+{
+    uint8_t buf[64];
+    if (len == 0 || len > sizeof(buf)) {
+        return MOQR_ERR_INVAL;
+    }
+    memset(buf, (uint8_t)(g * 16 + o), len);
     moq_rcbuf_t *pl = NULL;
-    if (moq_rcbuf_create(&a->vt, buf, sizeof(buf), &pl) != 0) {
+    if (moq_rcbuf_create(&a->vt, buf, len, &pl) != 0) {
         return MOQR_ERR_NOMEM;
     }
     moqr_log_append_desc_t d;
@@ -141,6 +178,12 @@ ing(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t o)
         moq_rcbuf_decref(pl);
     }
     return rc;
+}
+
+static moqr_result_t
+ing(moqr_core_t *c, ca_t *a, moqr_track_t t, uint64_t g, uint64_t o)
+{
+    return ing_len(c, a, t, g, o, 32);
 }
 
 /* Open a chunk-through record (OPEN head). */
@@ -780,6 +823,191 @@ test_ready_watermark(void)
     return failures;
 }
 
+/* -- Chunk-node pressure: a held delivery keeps its chunks ------------------ */
+
+/* A later group's chunk reclaims the chunk-node pool from the oldest group
+ * while a subscription's delivery of that group's object is held mid-object.
+ * The chunk is admitted and the track's subscribers are marked; the held
+ * delivery still serves its pinned chunks byte for byte, its pins holding
+ * the only references once the group is gone, and each is released once. */
+static int
+test_ready_chunk_nodes_held(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore_log(&a, 4, 1u << 20);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) {
+        return failures;
+    }
+    moq_bytes_t nsb[2];
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 10, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 11, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    uint64_t cookie = 100;
+    moqr_binding_t subs[1] = { s1 };
+    moqr_sub_t ks[1];
+    moqr_track_t t = mk_active_track(c, nsb, "t", subs, NULL, ks, 1, &cookie);
+    MOQ_TEST_CHECK(moqr_track_is_valid(t));
+
+    /* Group 1: one object of four 16-byte chunks holds every node. */
+    MOQ_TEST_CHECK(ing_open(c, t, 1, 0, 64) == MOQR_OK);
+    for (int i = 0; i < 4; i++) {
+        MOQ_TEST_CHECK(ing_chunk(c, &a, t, 1, 0, (uint8_t)(0x40 + i)) ==
+                       MOQR_OK);
+    }
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, t, 1, 0, 0) == MOQR_OK);
+
+    /* The delivery writes chunk 0, then the downstream write is refused. */
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 100, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 1 && d.rec.object_id == 0 &&
+                   d.rec.chunk_count == 4);
+    MOQ_TEST_CHECK(moqr_core_delivery_note_emitted(c, s1, 1, 100) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_WOULD_BLOCK,
+                                           100) == MOQR_OK);
+    const moq_rcbuf_t *pinned[4] = { NULL, NULL, NULL, NULL };
+    for (uint32_t i = 0; i < 4; i++) {
+        uint64_t len = 0;
+        MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, s1, i, &pinned[i], &len) ==
+                       MOQR_OK);
+        MOQ_TEST_CHECK(pinned[i] != NULL && len == 16);
+        /* The log's reference and the delivery's pin. */
+        MOQ_TEST_CHECK(pinned[i] != NULL && moq_rcbuf_refcount(pinned[i]) == 2);
+    }
+    (void)moqr_core_drain_ready(c, (uint64_t[16]){ 0 }, 16);
+
+    /* Group 2's chunk needs a node: group 1 is evicted and the chunk taken. */
+    MOQ_TEST_CHECK(ing_open(c, t, 2, 0, 16) == MOQR_OK);
+    (void)moqr_core_drain_ready(c, (uint64_t[16]){ 0 }, 16);
+    MOQ_TEST_CHECK(ing_chunk(c, &a, t, 2, 0, 0x50) == MOQR_OK);
+    uint64_t want[1] = { 11 };
+    MOQ_TEST_CHECK(expect_drain(c, want, 1) == 0);
+    moqr_log_t *log = track_log(c, t);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log != NULL) {
+        MOQ_TEST_CHECK_EQ_U64(moqr_log_evicted_groups_total(log), 1);
+    }
+
+    /* The held delivery resumes where it stopped, from its pins alone. */
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 200, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 1 && d.rec.object_id == 0 &&
+                   d.rec.chunk_count == 4);
+    for (uint32_t i = 1; i < 4; i++) {
+        const moq_rcbuf_t *cb = NULL;
+        uint64_t len = 0;
+        MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, s1, i, &cb, &len) == MOQR_OK);
+        MOQ_TEST_CHECK(cb == pinned[i] && len == 16);
+        if (cb != NULL && cb == pinned[i] && len == 16) {
+            MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(cb), 1);
+            bool intact = true;
+            for (size_t j = 0; j < 16; j++) {
+                intact = intact && moq_rcbuf_data(cb)[j] == (uint8_t)(0x40 + i);
+            }
+            MOQ_TEST_CHECK(intact);
+        }
+    }
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           200) == MOQR_OK);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("ready_chunk_nodes_held");
+    return failures;
+}
+
+/* -- An eviction owes its progress when the admission then fails ------------ */
+
+/* Making room for group 2's record evicts group 1, and the record is still
+ * refused: group 2 alone is over the byte budget. The subscriber whose stream
+ * of group 1 is open is marked all the same, and its next delivery is the
+ * eviction watermark that ends that stream. A refused chunk leaves its record
+ * OPEN and is not taken; a refused whole object is not retained. */
+static int
+test_ready_evicted_then_refused(bool chunked)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore_log(&a, 0, 64);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) {
+        return failures;
+    }
+    moq_bytes_t nsb[2];
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 10, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 11, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    uint64_t cookie = 100;
+    moqr_binding_t subs[1] = { s1 };
+    moqr_sub_t ks[1];
+    moqr_track_t t = mk_active_track(c, nsb, "t", subs, NULL, ks, 1, &cookie);
+    MOQ_TEST_CHECK(moqr_track_is_valid(t));
+
+    /* 8 bytes of group 1 and 56 of group 2 fill the budget; both reach the
+     * subscriber, whose streams stay open. */
+    MOQ_TEST_CHECK(ing_len(c, &a, t, 1, 0, 8) == MOQR_OK);
+    MOQ_TEST_CHECK(ing_len(c, &a, t, 2, 0, 56) == MOQR_OK);
+    moqr_delivery_t d;
+    for (uint64_t g = 1; g <= 2; g++) {
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 100, &d) == MOQR_OK);
+        MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_NONE &&
+                       d.rec.group_id == g && d.rec.object_id == 0);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                               100) == MOQR_OK);
+    }
+    if (chunked) {
+        MOQ_TEST_CHECK(ing_open(c, t, 2, 1, 16) == MOQR_OK);
+    }
+    (void)moqr_core_drain_ready(c, (uint64_t[16]){ 0 }, 16);
+    MOQ_TEST_CHECK_EQ_U64(c->ready_count, 0);
+
+    /* Object 1 of group 2, 16 bytes: group 1 goes, and 72 bytes still do not
+     * fit. */
+    if (chunked) {
+        uint8_t body[16];
+        memset(body, 0x61, sizeof(body));
+        moq_rcbuf_t *ch = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&a.vt, body, sizeof(body), &ch) == 0);
+        MOQ_TEST_CHECK(moqr_core_append_chunk(c, t, 2, 0, 1, ch) ==
+                       MOQR_ERR_CAPACITY);
+        MOQ_TEST_CHECK(ch != NULL && moq_rcbuf_refcount(ch) == 1);
+        moq_rcbuf_decref(ch);
+    } else {
+        MOQ_TEST_CHECK(ing_len(c, &a, t, 2, 1, 16) == MOQR_ERR_CAPACITY);
+    }
+    moqr_log_t *log = track_log(c, t);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log != NULL) {
+        MOQ_TEST_CHECK_EQ_U64(moqr_log_evicted_groups_total(log), 1);
+        moqr_record_view_t v;
+        moqr_result_t vrc = moqr_log_read_rec(log, 2, 0, 1, &v);
+        if (chunked) {
+            MOQ_TEST_CHECK(vrc == MOQR_OK && v.obj_state == MOQR_OBJ_OPEN &&
+                           v.chunk_count == 0);
+        } else {
+            MOQ_TEST_CHECK(vrc != MOQR_OK);
+        }
+    }
+    uint64_t want[1] = { 11 };
+    MOQ_TEST_CHECK(expect_drain(c, want, 1) == 0);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 200, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_EVICT_WATERMARK &&
+                   d.oldest_group == 2);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           200) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 200, &d) == MOQR_DONE);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS(chunked ? "ready_evicted_then_refused_chunk"
+                          : "ready_evicted_then_refused_whole");
+    return failures;
+}
+
 static int
 test_ready_capacity(void)
 {
@@ -852,6 +1080,9 @@ main(void)
     failures += test_ready_ingest_family();
     failures += test_ready_eviction_skip();
     failures += test_ready_watermark();
+    failures += test_ready_chunk_nodes_held();
+    failures += test_ready_evicted_then_refused(true);
+    failures += test_ready_evicted_then_refused(false);
     failures += test_ready_retire();
     failures += test_ready_pseudo_filtered();
     failures += test_ready_close_reuse();

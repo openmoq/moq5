@@ -6274,17 +6274,25 @@ moqr_core_ingest(moqr_core_t *c, moqr_track_t th,
      * Object advances when the first byte of an Object past it arrives
      * (draft-22 3.1.4), so an Object still arriving can be the Largest; what
      * is served up to the Largest waits for it to complete (fetch peek). */
+    /* Groups evicted to make room owe their watermark and terminal progress
+     * even when the record is then refused. */
+    const uint64_t evicted = moqr_log_evicted_groups_total(t->log);
     if (desc->obj_state == MOQR_OBJ_OPEN) {
         moqr_result_t orc = moqr_log_open_record(t->log, desc);
         if (orc == MOQR_OK) {
             track_note_largest(t, desc->group_id, desc->object_id);
             track_location_ingest(c, t, desc);
             ready_mark_track(c, tslot);   /* a live-edge head is selectable */
+        } else if (moqr_log_evicted_groups_total(t->log) != evicted) {
+            ready_mark_track(c, tslot);
         }
         return orc;
     }
     moqr_result_t rc = moqr_log_append(t->log, desc);
     if (rc != MOQR_OK) {
+        if (moqr_log_evicted_groups_total(t->log) != evicted) {
+            ready_mark_track(c, tslot);
+        }
         return rc;
     }
     track_note_largest(t, desc->group_id, desc->object_id);
@@ -6313,10 +6321,14 @@ moqr_core_append_chunk(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (t->state != R_TRACK_ACTIVE) {
         return MOQR_ERR_WRONG_STATE;
     }
+    const uint64_t evicted = moqr_log_evicted_groups_total(t->log);
     moqr_result_t rc =
         moqr_log_append_chunk(t->log, group_id, subgroup_id, object_id, chunk);
-    if (rc == MOQR_OK) {
-        ready_mark_track(c, tslot);   /* growth resumes a stalled delivery */
+    /* Growth resumes a stalled delivery; the groups evicted to make room owe
+     * their watermark and terminal progress even when the chunk is then
+     * refused. */
+    if (rc == MOQR_OK || moqr_log_evicted_groups_total(t->log) != evicted) {
+        ready_mark_track(c, tslot);
     }
     return rc;
 }

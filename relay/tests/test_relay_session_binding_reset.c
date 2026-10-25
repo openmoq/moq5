@@ -1,7 +1,7 @@
 /*
  * A subgroup whose stream ends early -- reset by the upstream while one of its
- * objects is streaming in -- ends with a reset for every subscriber, on
- * draft-16, draft-18 and draft-22.
+ * objects is streaming in, or cut where the relay could not hold an object --
+ * ends with a reset for every subscriber, on draft-16, draft-18 and draft-22.
  *
  * In streaming receive mode the relay learns of an upstream RESET_STREAM
  * that cuts an object off from that object's terminal chunk, and nothing
@@ -38,6 +38,22 @@
  *            takes the reset and the new stream before it has room for
  *            object 4, which then goes out on that stream, with no further
  *            reset.
+ *
+ * Local capacity loss. The relay's log holds SL_NODES chunk nodes, one per
+ * retained chunk. Objects 0 and 2 hold four; object 1 takes the other three
+ * with its first three chunks, and its fourth cannot be held: every node is
+ * in its own group, the only one, so nothing can be reclaimed. Object 1 is
+ * lost at the relay, so subgroup 0's stream ends with the eviction's reset --
+ * the relay's own cause, not a peer's -- for C and A, which began it, and for
+ * B and D, which did not and see nothing of it. A's reset is refused once
+ * and taken when its queue frees, and the sibling subgroup finishes while
+ * A's and B's terminals are held. Then the upstream goes on:
+ *   lost-fin       object 1's last chunk and the subgroup's FIN: still the
+ *                  reset, never a FIN;
+ *   lost-reset     the publisher resets the subgroup with its own code
+ *                  mid-object: the first terminal, the eviction's, stands;
+ *   lost-continue  object 1's last chunk, then object 4 and the FIN: object 4
+ *                  starts a new stream, which ends with that FIN.
  */
 #include "relay_session_binding_harness.h"
 
@@ -578,6 +594,247 @@ sr_case(moq_version_t v, sr_row_t row)
     return rig.failures;
 }
 
+#define SL_NODES 7u   /* the relay log's chunk-node pool */
+
+typedef enum { SL_FIN, SL_RESET, SL_CONTINUE, SL_ROWS } sl_row_t;
+static const char *const sl_row_names[SL_ROWS] = { "lost-fin", "lost-reset",
+                                                   "lost-continue" };
+
+/* One subscriber's subgroups at the end of a local-capacity row. */
+static void
+sl_check_end(rig_t *r, sl_row_t row, const char *who, const sr_peer_t *p,
+             bool began, uint64_t evicted_code)
+{
+    R_CHECK(r, p->subscribe_ok && p->dones == 0 && !p->closed &&
+                   !p->unexpected && !p->overflow);
+    const sr_sg_t *s0 = sr_find(p, 1, 0);
+    const sr_sg_t *s1 = sr_find(p, 1, 1);
+    R_CHECK(r, s0 != NULL && s1 != NULL);
+    if (s0 == NULL || s1 == NULL) {
+        return;
+    }
+    R_CHECK(r, s0->bodies_ok && s1->bodies_ok);
+    /* Subgroup 0: object 0, then the stream's reset with the relay's eviction
+     * cause, exactly once; with the continuation, a new stream carries object
+     * 4 and ends with the upstream FIN. */
+    const char *want = row == SL_CONTINUE ? (began ? "0x14F" : "0S4F")
+                                          : (began ? "0x1" : "0S");
+    if (strcmp(s0->seq, want) != 0) {
+        printf("  %s, subgroup 0: saw \"%s\", want \"%s\"\n", who, s0->seq,
+               want);
+    }
+    R_CHECK(r, strcmp(s0->seq, want) == 0);
+    R_CHECK(r, s0->reset_code == evicted_code);
+    if (began) {
+        R_CHECK(r, (s0->begun & 2u) != 0 && s0->chunks[1] == 3);
+    } else {
+        R_CHECK(r, (s0->begun & 2u) == 0 && s0->chunks[1] == 0);
+        R_CHECK(r, s0->reset_has_last && s0->reset_last == 0);
+    }
+    /* The sibling: whole, and ended where its publisher ended it. */
+    if (strcmp(s1->seq, "23F") != 0) {
+        printf("  %s, subgroup 1: saw \"%s\", want \"23F\"\n", who, s1->seq);
+    }
+    R_CHECK(r, strcmp(s1->seq, "23F") == 0);
+}
+
+static int
+sl_case(moq_version_t v, sl_row_t row)
+{
+    char label[64];
+    snprintf(label, sizeof(label), "stream_reset_%s d%d", sl_row_names[row],
+             v == MOQ_VERSION_DRAFT_16 ? 16 : v == MOQ_VERSION_DRAFT_18 ? 18 : 22);
+    moqr_reset_desc_t ed;
+    uint64_t evicted_code = 0;
+    bool code_ok = moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED, &ed) ==
+                       MOQR_OK &&
+                   moqr_reset_desc_emit(ed, v, &evicted_code) == MOQR_OK;
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    relay_bind_test_server_streaming_objects = true;
+    relay_bind_test_client_streaming_objects = true;
+    relay_bind_test_log_max_chunk_nodes = SL_NODES;
+    rig_t rig;
+    moqr_result_t crc = relay_bind_test_rig_create(&rig, &a);
+    relay_bind_test_log_max_chunk_nodes = 0;
+    if (crc != MOQR_OK) {
+        relay_bind_test_server_streaming_objects = false;
+        relay_bind_test_client_streaming_objects = false;
+        printf("FAIL: %s: rig create\n", label);
+        return 1;
+    }
+    R_CHECK(&rig, code_ok);
+    conn_t *pub = relay_bind_test_rig_connect(&rig, v);
+    conn_t *c = relay_bind_test_rig_connect(&rig, v);
+    conn_t *d = relay_bind_test_rig_connect(&rig, v);
+    relay_bind_test_max_actions = SR_ACTIONS;
+    conn_t *ah = relay_bind_test_rig_connect(&rig, v);
+    conn_t *bh = relay_bind_test_rig_connect(&rig, v);
+    relay_bind_test_max_actions = 0;
+    relay_bind_test_server_streaming_objects = false;
+    relay_bind_test_client_streaming_objects = false;
+    R_CHECK(&rig, pub && c && d && ah && bh);
+    if (!(pub && c && d && ah && bh)) {
+        relay_bind_test_rig_destroy(&rig);
+        printf("FAIL: %s: connect\n", label);
+        return 1;
+    }
+    relay_bind_test_rig_pump(&rig, 8);
+
+    moq_bytes_t nsp[1] = { B("demo") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 1 };
+    moq_announcement_t ann;
+    R_CHECK(&rig, moq_session_publish_namespace(pub->peer, &pcfg, rig.now,
+                                                &ann) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 8);
+    sr_subscribe(&rig, c, 0);
+    sr_subscribe(&rig, ah, 0);
+    sr_subscribe(&rig, bh, 0);
+    relay_bind_test_rig_pump(&rig, 8);
+    peer_state_t pub_ps;
+    memset(&pub_ps, 0, sizeof(pub_ps));
+    relay_bind_test_peer_drain(&rig, pub, &pub_ps, true, false, 0, 0);
+    R_CHECK(&rig, pub_ps.up_seen);
+    relay_bind_test_rig_pump(&rig, 8);
+
+    sr_peer_t cp, ap, bp, dp;
+    memset(&cp, 0, sizeof(cp));
+    memset(&ap, 0, sizeof(ap));
+    memset(&bp, 0, sizeof(bp));
+    memset(&dp, 0, sizeof(dp));
+
+    /* Object 0 of subgroup 0, two chunks: two nodes. */
+    moq_subgroup_handle_t h0 = sr_open(&rig, pub, pub_ps.up_sub, 1, 0);
+    sr_write(&rig, pub, h0, 1, 0, 0, 2, 2);
+    R_CHECK(&rig, moq_session_end_object(pub->peer, h0, rig.now) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+    sr_drain(ah, &ap);
+    sr_drain(bh, &bp);
+
+    /* B is held on the sibling's object 2 (two more nodes). */
+    bh->frozen = true;
+    moq_subgroup_handle_t h1 = sr_open(&rig, pub, pub_ps.up_sub, 1, 1);
+    sr_write(&rig, pub, h1, 1, 1, 2, 2, 2);
+    R_CHECK(&rig, moq_session_end_object(pub->peer, h1, rig.now) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+    sr_drain(ah, &ap);
+
+    /* Object 1, five chunks declared: the first reaches C and A. */
+    sr_write(&rig, pub, h0, 1, 0, 1, 5, 1);
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+    sr_drain(ah, &ap);
+    {
+        const sr_sg_t *ce = sr_find(&cp, 1, 0);
+        const sr_sg_t *ae = sr_find(&ap, 1, 0);
+        R_CHECK(&rig, ce != NULL && (ce->begun & 2u) != 0 && ce->chunks[1] == 1);
+        R_CHECK(&rig, ae != NULL && (ae->begun & 2u) != 0 && ae->chunks[1] == 1);
+    }
+
+    /* A's queue fills with chunks 2 and 3, which take the last two nodes. */
+    ah->frozen = true;
+    sr_write(&rig, pub, h0, 1, 0, 1, 0, 2);
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+
+    /* Chunk 4 cannot be held: object 1 is lost at the relay. */
+    sr_write(&rig, pub, h0, 1, 0, 1, 0, 1);
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+    {
+        const sr_sg_t *ce = sr_find(&cp, 1, 0);
+        R_CHECK(&rig, ce != NULL && ce->chunks[1] == 3 && ce->chunk_resets == 1);
+    }
+
+    switch (row) {
+    case SL_FIN:
+        sr_write(&rig, pub, h0, 1, 0, 1, 0, 1);
+        R_CHECK(&rig, moq_session_end_object(pub->peer, h0, rig.now) == MOQ_OK);
+        R_CHECK(&rig, moq_session_close_subgroup(pub->peer, h0, rig.now) ==
+                          MOQ_OK);
+        break;
+    case SL_RESET:
+        R_CHECK(&rig, moq_session_reset_subgroup(pub->peer, h0, SR_CODE,
+                                                 rig.now) == MOQ_OK);
+        break;
+    case SL_CONTINUE:
+        sr_write(&rig, pub, h0, 1, 0, 1, 0, 1);
+        R_CHECK(&rig, moq_session_end_object(pub->peer, h0, rig.now) == MOQ_OK);
+        sr_write(&rig, pub, h0, 1, 0, 4, 2, 2);
+        R_CHECK(&rig, moq_session_end_object(pub->peer, h0, rig.now) == MOQ_OK);
+        R_CHECK(&rig, moq_session_close_subgroup(pub->peer, h0, rig.now) ==
+                          MOQ_OK);
+        break;
+    case SL_ROWS:
+        break;
+    }
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+
+    /* The sibling finishes while A's and B's terminals are held. */
+    sr_write(&rig, pub, h1, 1, 1, 3, 1, 1);
+    R_CHECK(&rig, moq_session_end_object(pub->peer, h1, rig.now) == MOQ_OK);
+    R_CHECK(&rig, moq_session_close_subgroup(pub->peer, h1, rig.now) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 12);
+    sr_drain(c, &cp);
+    {
+        const sr_sg_t *cs = sr_find(&cp, 1, 1);
+        R_CHECK(&rig, cs != NULL && strcmp(cs->seq, "23F") == 0);
+    }
+    relay_bind_test_peer_drain(&rig, pub, &pub_ps, true, false, 0, 0);
+
+    /* A's reset was refused while its queue held the two chunks: they arrive
+     * without it, and one bind pump takes it once the queue has room. */
+    sr_drain(ah, &ap);
+    relay_bind_test_rig_step_pair(&rig, ah);
+    sr_drain(ah, &ap);
+    {
+        const sr_sg_t *ae = sr_find(&ap, 1, 0);
+        R_CHECK(&rig, ae != NULL && ae->chunks[1] == 3 && sr_terminals(ae) == 0);
+    }
+    relay_bind_test_rig_bind_pump_once(&rig);
+    relay_bind_test_rig_step_pair(&rig, ah);
+    sr_drain(ah, &ap);
+    {
+        const sr_sg_t *ae = sr_find(&ap, 1, 0);
+        R_CHECK(&rig, ae != NULL && ae->chunk_resets == 1);
+    }
+
+    /* D joins; then A and B run free. */
+    sr_subscribe(&rig, d, 1);
+    relay_bind_test_rig_pump(&rig, 12);
+    ah->frozen = false;
+    bh->frozen = false;
+    sr_settle(&rig, pub, &pub_ps, (conn_t *[]){ c, ah, bh, d },
+              (sr_peer_t *[]){ &cp, &ap, &bp, &dp });
+
+    sl_check_end(&rig, row, "C", &cp, true, evicted_code);
+    sl_check_end(&rig, row, "A", &ap, true, evicted_code);
+    sl_check_end(&rig, row, "B", &bp, false, evicted_code);
+    sl_check_end(&rig, row, "D", &dp, false, evicted_code);
+    moqr_bind_stats_t bst;
+    moqr_bind_get_stats(rig.bind, &bst);
+    R_CHECK(&rig, bst.session_errors == 0);
+    /* Refused ingest operations, not lost objects: the fourth chunk, and in
+     * the FIN and continuation rows the fifth, which the abandoned record
+     * no longer takes, for the one object lost. */
+    R_CHECK(&rig, bst.ingest_refusals == (row == SL_RESET ? 1u : 2u));
+    R_CHECK(&rig, !pub_ps.session_closed);
+
+    relay_bind_test_rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (rig.failures == 0) {
+        printf("PASS: %s\n", label);
+    } else {
+        printf("FAIL: %s: %d check(s)\n", label, rig.failures);
+    }
+    return rig.failures;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -591,6 +848,14 @@ main(int argc, char **argv)
         }
         for (size_t i = 0; i < sizeof(drafts) / sizeof(drafts[0]); i++) {
             failures += sr_case(drafts[i], (sr_row_t)row);
+        }
+    }
+    for (int row = 0; row < SL_ROWS; row++) {
+        if (argc == 2 && strcmp(argv[1], sl_row_names[row]) != 0) {
+            continue;
+        }
+        for (size_t i = 0; i < sizeof(drafts) / sizeof(drafts[0]); i++) {
+            failures += sl_case(drafts[i], (sl_row_t)row);
         }
     }
     return failures == 0 ? 0 : 1;

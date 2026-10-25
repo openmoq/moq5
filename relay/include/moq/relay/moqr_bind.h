@@ -404,7 +404,10 @@ typedef struct moqr_bind_stats {
     uint32_t conns;
     uint64_t events_translated;
     uint64_t deliveries_written;
-    uint64_t ingest_refusals;    /* TOO_OLD / ordering INVALs at the log */
+    uint64_t ingest_refusals;    /* ingest operations the log refused:
+                                  * objects or chunks too old, out of
+                                  * order or over capacity (one object
+                                  * can count more than once)          */
     uint64_t session_errors;     /* unexpected session-call failures     */
     moqr_latency_hist_t forward_latency;   /* ingest→delivery, us          */
     uint32_t pending_high_water; /* max deferred-output ring depth seen   */

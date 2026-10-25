@@ -16,10 +16,19 @@
  * promptly, so the reset stream was counted.
  *
  * Rows: objects ingested whole, so the destination's journal resets the
- * subgroup; ingested as chunks, so its progress slot does; and whole objects
+ * subgroup; ingested as chunks, so its progress slot does; whole objects
  * with the owner frozen right after it pushes the watermark, so that no
  * later object wakes the subscriber's shard and the watermark alone must
- * make the reset deliverable. The rig is test_relay_shard_fill's.
+ * make the reset deliverable; and chunks again with each log bounded by its
+ * chunk-node pool rather than its group count, so that group 2's first chunk
+ * evicts group 0 because it needs one of group 0's nodes.
+ *
+ * Row "refused": the owner evicts a group to make room for an object and
+ * still cannot hold it. Group 1's eviction watermark crosses all the same,
+ * and group 2's subgroup, whose object 1 is lost at the owner, ends with the
+ * eviction's reset after object 0, never with the publisher's FIN.
+ *
+ * The rig is test_relay_shard_fill's.
  */
 #define main relay_shard_fill_main
 #include "test_relay_shard_fill.c"
@@ -193,9 +202,11 @@ typedef enum ev_row {
     EV_WHOLE,
     EV_CHUNKS,
     EV_WATERMARK_ONLY,
+    EV_NODES,
 } ev_row_t;
 
-static const char *const k_ev_rows[] = { "whole", "chunks", "watermark-only" };
+static const char *const k_ev_rows[] = { "whole", "chunks", "watermark-only",
+                                         "nodes" };
 
 static int
 ev_case(moq_version_t version, ev_row_t row)
@@ -209,8 +220,12 @@ ev_case(moq_version_t version, ev_row_t row)
     ca_t a;
     ca_init(&a);
     g_sf_version = version;
-    g_sf_server_streaming = row == EV_CHUNKS;
-    g_sf_log_groups = 2;
+    g_sf_server_streaming = row == EV_CHUNKS || row == EV_NODES;
+    /* Every object arrives as one chunk, so five nodes hold group 0's three
+     * objects and both of group 1's, and group 2's first chunk needs one of
+     * group 0's; four groups fit the group budget. */
+    g_sf_log_groups = row == EV_NODES ? 4 : 2;
+    g_sf_log_chunk_nodes = row == EV_NODES ? 5 : 0;
     sfrig_t rig;
     /* One entry per channel keeps the watermark a step ahead of the record
      * that follows it. The frozen row runs the wake-driven runtime, where a
@@ -218,6 +233,7 @@ ev_case(moq_version_t version, ev_row_t row)
     moqr_result_t crc =
         sfrig_create_ex(&rig, &a, row == EV_WATERMARK_ONLY, 1, 0);
     g_sf_log_groups = 4;
+    g_sf_log_chunk_nodes = 0;
     if (crc != MOQR_OK) {
         g_sf_version = MOQ_VERSION_DRAFT_22;
         g_sf_server_streaming = false;
@@ -326,6 +342,11 @@ ev_case(moq_version_t version, ev_row_t row)
                         e2->fins == 1 && e2->resets == 0);
         SF_CHECK(r, !s.overflow && s.n_sgs == 3);
         SF_CHECK(r, s.dones == 0 && !s.closed);
+        if (row == EV_NODES) {
+            /* The owner's eviction crossed as its watermark: the reset is
+             * not only the subscriber shard's own eviction of its copy. */
+            SF_CHECK(r, sfrig_owner_evicts(r) >= 1);
+        }
 
         /* The publisher ends the subscription: the subscriber's session
          * counted the reset stream, so the end is not held to a timeout. */
@@ -352,6 +373,130 @@ ev_case(moq_version_t version, ev_row_t row)
     return f;
 }
 
+/* Row "refused" (see the header). Each shard's log holds 16 bytes: group 1's
+ * object and group 2's object 0 take 8, and group 2's object 1 is one 16-byte
+ * chunk, for which the owner evicts group 1 and which it still cannot hold
+ * beside object 0. Both subgroups are left open until the end. */
+static int
+ev_refused_case(moq_version_t version)
+{
+    char label[96];
+    snprintf(label, sizeof(label), "shard_evict_terminal refused (draft-%d)",
+             version == MOQ_VERSION_DRAFT_16   ? 16
+             : version == MOQ_VERSION_DRAFT_18 ? 18
+                                               : 22);
+    ca_t a;
+    ca_init(&a);
+    g_sf_version = version;
+    g_sf_server_streaming = true;
+    g_sf_log_bytes = 16;
+    sfrig_t rig;
+    moqr_result_t crc = sfrig_create_ex(&rig, &a, false, 1, 0);
+    g_sf_log_bytes = 0;
+    if (crc != MOQR_OK) {
+        g_sf_version = MOQ_VERSION_DRAFT_22;
+        g_sf_server_streaming = false;
+        printf("FAIL: %s: rig create\n", label);
+        return 1;
+    }
+    sfrig_t *r = &rig;
+    moqr_reset_desc_t evicted;
+    uint64_t want_code = UINT64_MAX;
+    SF_CHECK(r, moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED, &evicted) ==
+                        MOQR_OK &&
+                    moqr_reset_desc_emit(evicted, version, &want_code) ==
+                        MOQR_OK);
+
+    sf_origin_t o;
+    memset(&o, 0, sizeof(o));
+    sf_announce(r, &o);
+    sfconn_t *sub = sfrig_connect(r, 1);
+    SF_CHECK(r, o.pub != NULL && sub != NULL);
+    ev_sub_t s;
+    memset(&s, 0, sizeof(s));
+    if (o.pub != NULL && sub != NULL) {
+        sfrig_pump(r, 4);   /* the subscriber's session sets up */
+        moq_subscribe_cfg_t scfg;
+        sf_subscribe_cfg(&scfg);
+        scfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        moq_subscription_t sh;
+        SF_CHECK(r, moq_session_subscribe(sub->peer, &scfg, r->now, &sh) ==
+                        MOQ_OK);
+        for (int i = 0; i < 60 && !(o.pub_ps.up_seen && s.subscribe_ok); i++) {
+            ev_run(r, &o, sub, &s, 1);
+        }
+        SF_CHECK(r, o.pub_ps.up_seen && s.subscribe_ok);
+    }
+    if (r->failures == 0) {
+        moq_subgroup_handle_t g1 = ev_open(r, &o, 1);
+        ev_write(r, &o, g1, 1, 0);
+        moq_subgroup_handle_t g2 = ev_open(r, &o, 2);
+        ev_write(r, &o, g2, 2, 0);
+        ev_run(r, &o, sub, &s, 30);
+        ev_sg_t *e1 = ev_lookup(&s, 1, 0);
+        ev_sg_t *e2 = ev_lookup(&s, 2, 0);
+        SF_CHECK(r, e1 != NULL && e1->objects == 1 && e1->fins + e1->resets == 0);
+        SF_CHECK(r, e2 != NULL && e2->objects == 1 && e2->fins + e2->resets == 0);
+        const uint64_t evicts = sfrig_owner_evicts(r);
+        moqr_bind_stats_t before;
+        moqr_bind_get_stats(moqr_shards_bind(r->s, 0), &before);
+
+        /* Group 2's object 1: one 16-byte chunk the owner cannot hold. */
+        uint8_t body[16];
+        memset(body, 0x5E, sizeof(body));
+        moq_rcbuf_t *pl = NULL;
+        SF_CHECK(r, moq_rcbuf_create(&r->alloc->vt, body, sizeof(body), &pl) ==
+                        MOQ_OK);
+        SF_CHECK(r, moq_session_begin_object(o.pub->peer, g2, 1, sizeof(body),
+                                             r->now) == MOQ_OK);
+        SF_CHECK(r, moq_session_write_object_data(o.pub->peer, g2, pl, r->now) ==
+                        MOQ_OK);
+        moq_rcbuf_decref(pl);
+        SF_CHECK(r, moq_session_end_object(o.pub->peer, g2, r->now) == MOQ_OK);
+        ev_run(r, &o, sub, &s, 40);
+        /* The publisher's FINs change nothing. */
+        moq_result_t c1 = moq_session_close_subgroup(o.pub->peer, g1, r->now);
+        SF_CHECK(r, c1 == MOQ_OK || c1 == MOQ_ERR_STALE_HANDLE);
+        moq_result_t c2 = moq_session_close_subgroup(o.pub->peer, g2, r->now);
+        SF_CHECK(r, c2 == MOQ_OK || c2 == MOQ_ERR_STALE_HANDLE);
+        ev_run(r, &o, sub, &s, 40);
+
+        for (uint64_t g = 1; g <= 2; g++) {
+            ev_sg_t *e = ev_lookup(&s, g, 0);
+            SF_CHECK(r, e != NULL);
+            if (e == NULL) {
+                continue;
+            }
+            if (e->fins != 0 || e->resets != 1) {
+                printf("  [%s] group %llu: %d object(s), %d FIN(s), %d "
+                       "reset(s)\n",
+                       label, (unsigned long long)g, e->objects, e->fins,
+                       e->resets);
+            }
+            SF_CHECK(r, e->objects == 1 && e->last_object == 0 && e->bodies_ok);
+            SF_CHECK(r, e->fins == 0 && e->resets == 1 && e->after_terminal == 0);
+            SF_CHECK(r, e->reset_code == want_code);
+            SF_CHECK(r, e->reset_has_last && e->reset_last == 0);
+        }
+        SF_CHECK(r, !s.overflow && s.n_sgs == 2);
+        SF_CHECK(r, s.dones == 0 && !s.closed);
+        /* Group 1's watermark crossed, and the owner refused the chunk. */
+        SF_CHECK(r, sfrig_owner_evicts(r) > evicts);
+        moqr_bind_stats_t after;
+        moqr_bind_get_stats(moqr_shards_bind(r->s, 0), &after);
+        SF_CHECK(r, after.ingest_refusals > before.ingest_refusals);
+        for (uint16_t i = 0; i < 2; i++) {
+            moqr_bind_stats_t bs;
+            moqr_bind_get_stats(moqr_shards_bind(r->s, i), &bs);
+            SF_CHECK(r, bs.session_errors == 0);
+        }
+    }
+    int f = sf_finish(r, &a, label);
+    g_sf_version = MOQ_VERSION_DRAFT_22;
+    g_sf_server_streaming = false;
+    return f;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -365,6 +510,11 @@ main(int argc, char **argv)
         }
         for (size_t v = 0; v < sizeof(versions) / sizeof(versions[0]); v++) {
             failures += ev_case(versions[v], (ev_row_t)row);
+        }
+    }
+    if (argc <= 1 || strcmp(argv[1], "refused") == 0) {
+        for (size_t v = 0; v < sizeof(versions) / sizeof(versions[0]); v++) {
+            failures += ev_refused_case(versions[v]);
         }
     }
     return failures == 0 ? 0 : 1;

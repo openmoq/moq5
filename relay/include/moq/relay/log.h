@@ -106,8 +106,10 @@ typedef struct moqr_log_cfg {
     uint32_t           max_objects_per_group;    /* subgroup records +
                                                   * datagrams; 0 = def 4096 */
     uint32_t           max_cursors;              /* 0 = default 64         */
-    uint32_t           max_chunk_nodes;          /* OPEN-record chunk-node
-                                                  * pool; 0 = default 8192  */
+    uint32_t           max_chunk_nodes;          /* chunk-node pool: a node
+                                                  * per retained chunk of an
+                                                  * OPEN or COMPLETE chunked
+                                                  * record; 0 = default 8192 */
     moqr_trace_t      *trace;        /* optional; BORROWED, must outlive   */
     uint64_t           trace_id;     /* scalar track id in trace records   */
 } moqr_log_cfg_t;
@@ -249,12 +251,17 @@ MOQR_CORE_API moqr_result_t moqr_log_open_record(moqr_log_t *log,
 
 /*
  * Append one payload chunk (zero-copy rcbuf slice) to an OPEN record. The log
- * increfs `chunk` and retains it; its bytes count against retained_bytes as
- * accepted. Errors: MOQR_ERR_TOO_OLD (the record's group was evicted),
- * MOQR_ERR_WRONG_STATE (no OPEN record at that identity), MOQR_ERR_INVAL
- * (bytes would exceed declared_len), MOQR_ERR_CAPACITY (chunk-node pool
- * exhausted, or bytes cannot fit even after evicting older groups). On any
- * error the caller keeps its ref and the record stays OPEN.
+ * increfs `chunk` and retains it; its bytes count against retained_bytes and
+ * it takes one chunk node, both as accepted. When the bytes or a node are
+ * short, older groups are evicted, oldest first and never the record's own
+ * or a newer one, until both fit. Errors: MOQR_ERR_TOO_OLD (the record's
+ * group was evicted), MOQR_ERR_WRONG_STATE (no OPEN record at that identity),
+ * MOQR_ERR_INVAL (bytes would exceed declared_len), MOQR_ERR_CAPACITY (no
+ * eviction can admit it: the record's group is the oldest left, or only
+ * nodes are short and no group older than the record's holds one -- every
+ * node in use is that group's or a newer group's -- in which case nothing is
+ * evicted). On any error the caller keeps its ref and the record stays OPEN;
+ * groups already evicted for it stay evicted.
  */
 MOQR_CORE_API moqr_result_t moqr_log_append_chunk(moqr_log_t *log, uint64_t group_id,
                                     uint64_t subgroup_id, uint64_t object_id,

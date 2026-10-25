@@ -166,6 +166,8 @@ static moq_version_t g_sf_version = MOQ_VERSION_DRAFT_22;
 static uint64_t g_sf_log_bytes = 0;
 /* The groups each shard's log retains (4 unless a row needs fewer). */
 static uint32_t g_sf_log_groups = 4;
+/* The chunk nodes each shard's log holds (0: the default). */
+static uint32_t g_sf_log_chunk_nodes = 0;
 /* The shards the next rig runs (2 unless a row needs a third). */
 static uint16_t g_sf_shards = 2;
 
@@ -180,6 +182,7 @@ sfrig_cfg(moqr_shards_cfg_t *cfg, ca_t *a, bool earned, uint32_t channel_entries
     cfg->core_cfg.log_budget.max_groups = g_sf_log_groups;
     cfg->core_cfg.log_budget.max_bytes = g_sf_log_bytes != 0
                                            ? g_sf_log_bytes : 1u << 20;
+    cfg->core_cfg.log_max_chunk_nodes = g_sf_log_chunk_nodes;
     cfg->core_cfg.linger_us = 500;
     cfg->fill_timeout_default_ms = SF_DEFAULT_WAIT_MS;
     cfg->fill_timeout_max_ms = SF_MAX_WAIT_MS;
