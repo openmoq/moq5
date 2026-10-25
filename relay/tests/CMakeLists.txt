@@ -190,7 +190,7 @@ if(TARGET moq::sim)
     # The core suite keeps the relay_session_binding test name; the others
     # register as relay_session_binding_<suite>.
     set(MOQR_SESSION_BINDING_SUITES
-        core auth delivery ingress fetch namespace d22 metadata)
+        core auth delivery ingress fetch namespace d22 metadata reset)
     foreach(suite IN LISTS MOQR_SESSION_BINDING_SUITES)
         set(_exe test_relay_session_binding_${suite})
         add_executable(${_exe} ${_exe}.c
@@ -449,6 +449,7 @@ set(MOQR_LIBRARY_TESTS_SANSIO
     relay_session_binding_delivery relay_session_binding_ingress
     relay_session_binding_fetch relay_session_binding_namespace
     relay_session_binding_d22 relay_session_binding_metadata
+    relay_session_binding_reset
     relay_lifecycle relay_ns_propagation
     relay_shard_fill relay_namespace_controls relay_namespace_features
     relay_namespace_d22

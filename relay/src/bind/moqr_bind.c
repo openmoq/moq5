@@ -6622,7 +6622,16 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
          * abandon stores the terminal cause code: a genuine upstream RESET
          * forwards the publisher's oc->error_code; STOP / a relay-initiated
          * abandon uses a relay-defined code. Downstream delivery
-         * propagates it. */
+         * propagates it.
+         *
+         * An upstream RESET also ends the subgroup's stream, and this chunk
+         * is the session's only report of it (a reset is reported once, on
+         * one surface): the subgroup's list ends with the same reset, so a
+         * subscription that never began this object is still closed with a
+         * reset after the retained objects. Only the source whose OPEN record
+         * this abandoned ends the list; a copy's terminal from another source
+         * finds no OPEN record of its own. STOP and a failed complete end the
+         * record alone. */
         if (oc->end) {
             moqr_result_t erc = MOQR_OK;
             if (oc->terminal == MOQ_OBJECT_TERMINAL_NORMAL) {
@@ -6640,11 +6649,14 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                                      MOQR_RESET_CODE_STOPPED, &rdesc) ==
                                  MOQR_OK;
                 }
-                if (have_rdesc) {
-                    (void)moqr_core_abandon_record(b->core, track,
+                if (have_rdesc &&
+                    moqr_core_abandon_record(b->core, track, oc->group_id,
+                                             oc->subgroup_id, oc->object_id,
+                                             rdesc) == MOQR_OK &&
+                    oc->terminal == MOQ_OBJECT_TERMINAL_RESET) {
+                    (void)moqr_core_reset_subgroup(b->core, track,
                                                    oc->group_id,
-                                                   oc->subgroup_id,
-                                                   oc->object_id, rdesc);
+                                                   oc->subgroup_id, rdesc);
                 }
                 if (erc != MOQR_OK) {
                     b->ingest_refusals++;
@@ -6655,14 +6667,19 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
     }
 #ifdef MOQ_EVENT_SUBGROUP_RESET
     case MOQ_EVENT_SUBGROUP_RESET: {
-        /* The upstream subgroup stream RESET in whole-object receive mode:
-         * the session dropped the partial object (no OBJECT_RECEIVED for
-         * it), so this event is the only ingest-side evidence the stream
-         * ended. Terminate the (group, subgroup) ledger abnormally with the
-         * publisher's code — retained COMPLETE records stay servable and
-         * each subscription's downstream subgroup is reset (never FIN'd)
-         * once it has consumed them. Streaming receive mode surfaces resets
-         * as terminal OBJECT_CHUNKs and never reaches here. */
+        /* An upstream subgroup stream RESET that no surfaced object terminal
+         * carries: in whole-object receive mode (the session dropped the
+         * partial object, no OBJECT_RECEIVED for it), and in streaming mode
+         * a stream reset between objects or after its last object, an object
+         * suppressed by Forward State 0, or a shared stream's subscriptions
+         * the object in flight did not match. This event is then the only
+         * ingest-side evidence the stream ended. Terminate the (group,
+         * subgroup) ledger abnormally with the publisher's code — retained
+         * COMPLETE records stay servable and each subscription's downstream
+         * subgroup is reset (never FIN'd) once it has consumed them. A reset
+         * that cuts a surfaced streaming object off arrives as that object's
+         * terminal OBJECT_CHUNK instead; where both arrive (a shared stream)
+         * the list keeps the first terminal recorded. */
         moq_subgroup_reset_event_t *sr = &ev->u.subgroup_reset;
         moqr_track_t track = bind_ingest_track(b, cn, sr->sub, sr->pub);
         if (moqr_track_is_valid(track)) {
