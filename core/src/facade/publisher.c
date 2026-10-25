@@ -30,6 +30,10 @@ unsigned long moq_pub_test_release_count = 0;
 #define MOQ_PUB_TEST_BUMP(c) ((void)0)
 #endif
 
+#define PUB_GROUP_RECORDS     16
+#define PUB_GROUP_GENERATIONS 8
+_Static_assert(PUB_GROUP_GENERATIONS <= 8, "stopped-key mask covers every subgroup generation");
+
 /* Per-subscriber send state. Each track holds a heap-allocated array
  * of one slot. The array shape is internal prep; session core allows
  * at most one same-track subscription per session. */
@@ -122,6 +126,12 @@ typedef struct {
      * destination snapshot is stamped; a widening installed later never joins
      * an already pending operation or an open streaming bracket. */
     moq_resolved_window_t window;
+    /* Record index is only storage: group and the generation bit identify
+     * the stopped key. Cleared when that record is sealed or this owner ends. */
+    struct {
+        uint64_t group;
+        uint8_t generations;
+    } stopped[PUB_GROUP_RECORDS];
 } pub_sub_slot_t;
 
 /* One in-flight fan-out operation per track. The op's payload/properties are
@@ -184,8 +194,6 @@ typedef struct pub_ns_entry {
  * track's life ("pinned"); at most PUB_GROUP_PINS groups may be pinned, so one
  * record always rolls. A record leaving the rolling set is compacted into one
  * of PUB_SEALED_RUNS runs of sealed groups, which accept nothing further. */
-#define PUB_GROUP_RECORDS     16
-#define PUB_GROUP_GENERATIONS 8
 #define PUB_GROUP_PINS        15
 #define PUB_SEALED_RUNS       16
 /* Exact assignment membership: at most PUB_GROUP_INTERVALS owner-tagged
@@ -397,9 +405,9 @@ typedef struct {
     moq_pub_subscribe_update_info_t update_info;
 } pub_pending_t;
 
-/* D22 advertises one unanswered UPDATE per parent. Initial admission and
- * sequential UPDATEs reuse this scalar cell at ACK commit, not child terminal.
- * No borrowed event data or snapshot references live outside a fill job. */
+/* One scalar owner per parent. Legacy cumulative UPDATEs replace its snapshot
+ * when their FIFO event arrives; D22 permits one unanswered UPDATE. No borrowed
+ * event data or snapshot references live outside a fill job. */
 typedef struct {
     uint64_t parent, update_id, reject_code, delivery_timeout_us;
     moq_pub_track_t *track;
@@ -412,10 +420,6 @@ typedef struct {
     size_t cap;
     uint32_t head, tail;
 } pub_admissions_t;
-
-_Static_assert(sizeof(pub_admissions_t) <= sizeof(pub_pending_t) &&
-               _Alignof(pub_admissions_t) <= _Alignof(pub_pending_t),
-               "D22 bookkeeping must not enlarge the legacy publisher");
 
 #define PUB_ADMISSION_NONE UINT32_MAX
 enum {
@@ -458,6 +462,8 @@ typedef struct {
     /* The served track, for the Track Properties its FETCH_OK states; cleared
      * when the track is removed first (the answer then carries none). */
     moq_pub_track_t    *track;
+    moq_subscription_t joining_sub;
+    moq_publication_t joining_pub;
 } pub_pending_fetch_t;
 
 typedef struct {
@@ -472,9 +478,6 @@ typedef struct {
 } pub_fetch_owners_t;
 
 #define PUB_FETCH_NONE UINT32_MAX
-_Static_assert(sizeof(pub_fetch_owners_t) <= sizeof(pub_pending_fetch_t) &&
-               _Alignof(pub_fetch_owners_t) <= _Alignof(pub_pending_fetch_t),
-               "D22 FETCH bookkeeping must not enlarge the legacy publisher");
 
 /* One fill request in flight (draft-22 section 3.4). Mirrors
  * pub_pending_fetch_t: the retained group is SNAPSHOTTED at stage time so the
@@ -536,21 +539,14 @@ struct moq_publisher {
     size_t              track_count;
     pub_ns_entry_t     *ns_entries;
     size_t              sub_slot_cap;
-    /* Preserve the legacy publisher allocation size as well as its pump. */
-    union {
-        pub_pending_t pending;
-        pub_admissions_t admissions;
-    };
-    union {
-        pub_pending_fetch_t pending_fetch;
-        pub_fetch_owners_t fetch_owners;
-    };
+    pub_admissions_t admissions;
+    pub_fetch_owners_t fetch_owners;
     pub_pending_fill_t *pending_fills;
     size_t              pending_fill_cap;
     uint64_t            fill_bytes;
     bool                in_fill_callback;
     moq_pub_deferred_t  deferred;
-    /* Answers owed, in arrival order; allocated on first need. */
+    /* One answer per eligible session owner, in arrival order. */
     pub_owed_answer_t  *owed;
     size_t              owed_count;
     size_t              owed_cap;
@@ -565,6 +561,13 @@ static void track_clear_slot(moq_publisher_t *pub, pub_sub_slot_t *s)
     (void)pub;
     memset(s, 0, sizeof(*s));
 }
+
+static void track_observe_terminals(moq_publisher_t *pub, moq_pub_track_t *t);
+static bool slot_key_stopped(const moq_pub_track_t *t, const pub_sub_slot_t *sl,
+                              uint64_t group, uint64_t subgroup);
+static moq_result_t slot_stale_subgroup(moq_publisher_t *pub,
+                                         moq_pub_track_t *t,
+                                         pub_sub_slot_t *sl);
 
 static pub_sub_slot_t *track_find_slot_by_sub(moq_pub_track_t *t,
                                                 moq_subscription_t sub)
@@ -608,8 +611,7 @@ static void pub_free(moq_publisher_t *p, void *ptr, size_t sz);
 
 /* Where concurrent subscriptions to a track are allowed (draft-22 §3.1),
  * each one is a destination slot of its own. Before a subscription is
- * accepted, make sure a free slot will be waiting for it. D22 checks at each
- * serialized ACK commit; legacy also reserves for its deferred authorizer.
+ * accepted, make sure a free slot will be waiting for it at ACK commit.
  * The install after session accept therefore cannot find the slots full.
  * Slots are values,
  * so growing the array moves no live reference. */
@@ -617,8 +619,6 @@ static moq_result_t track_reserve_sub_slots(moq_publisher_t *pub,
                                             moq_pub_track_t *t)
 {
     size_t need = 1;
-    if (!moq_session_supports_fill(pub->session) &&
-        pub->deferred.active && pub->deferred.track == t) need++;
     size_t free_slots = 0;
     for (size_t i = 0; i < t->slot_cap; i++)
         if (!t->slots[i].active && !t->slots[i].retiring) free_slots++;
@@ -854,6 +854,7 @@ static moq_result_t slot_close_subgroup(moq_publisher_t *pub,
 static moq_result_t track_run_retires(moq_publisher_t *pub,
                                       moq_pub_track_t *t, uint64_t now_us)
 {
+    track_observe_terminals(pub, t);
     for (size_t i = 0; i < t->slot_cap; i++) {
         pub_sub_slot_t *sl = &t->slots[i];
         if (!(sl->active || sl->retiring) || !sl->needs_reset) continue;
@@ -1196,6 +1197,93 @@ static int hist_find(const moq_pub_track_t *t, uint64_t group)
     return -1;
 }
 
+static bool slot_key_stopped(const moq_pub_track_t *t, const pub_sub_slot_t *sl,
+                              uint64_t group, uint64_t subgroup)
+{
+    int ri = hist_find(t, group);
+    return ri >= 0 && subgroup < PUB_GROUP_GENERATIONS &&
+        sl->stopped[ri].group == group &&
+        (sl->stopped[ri].generations & (1u << subgroup)) != 0;
+}
+
+static bool track_note_terminal(moq_publisher_t *pub, moq_pub_track_t *t,
+                                 const moq_event_t *event)
+{
+    if (event->kind != MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED ||
+        event->detail_size < MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE)
+        return false;
+    const moq_outgoing_subgroup_terminated_event_t *d =
+        &event->u.outgoing_subgroup_terminated;
+    bool subscription = moq_subscription_is_valid(d->sub);
+    if (subscription == moq_publication_is_valid(d->pub) ||
+        moq_handle_pool_tag(d->subgroup._opaque) != MOQ_HANDLE_POOL_SUBGROUP ||
+        moq_handle_session_tag(d->subgroup._opaque) != pub->session->session_tag ||
+        (d->cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING &&
+         d->cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT))
+        return false;
+    for (size_t i = 0; i < t->slot_cap; i++) {
+        pub_sub_slot_t *sl = &t->slots[i];
+        if (!sl->active && !sl->retiring) continue;
+        if (subscription ? (sl->kind != PUB_SLOT_SUBSCRIPTION ||
+                             !moq_subscription_eq(sl->sub, d->sub))
+                         : (sl->kind != PUB_SLOT_PUBLICATION ||
+                             !moq_publication_eq(sl->pub, d->pub)))
+            continue;
+        int ri = hist_find(t, d->group_id);
+        if (ri >= 0 && d->subgroup_id < t->recs[ri].ngen) {
+            if (sl->stopped[ri].group != d->group_id) {
+                sl->stopped[ri].group = d->group_id;
+                sl->stopped[ri].generations = 0;
+            }
+            sl->stopped[ri].generations |= (uint8_t)(1u << d->subgroup_id);
+        }
+        bool exact = moq_subgroup_eq(sl->sg, d->subgroup);
+        bool object_op = (t->op.kind == PUB_OP_WRITE_OBJECT ||
+                          t->op.kind == PUB_OP_BEGIN_OBJECT) &&
+            !t->op.datagram && t->op.group_id == d->group_id &&
+            t->op.subgroup == d->subgroup_id;
+        bool bracket_op = exact && sl->streaming &&
+            (t->op.kind == PUB_OP_WRITE_DATA || t->op.kind == PUB_OP_END_OBJECT);
+        if (sl->target_op == t->cur_op && (object_op || bracket_op))
+            sl->done_op = t->cur_op;
+        if (exact) {
+            sl->sg_open = false;
+            sl->streaming = false;
+            sl->needs_reset = false;
+            if (sl->retiring) track_clear_slot(pub, sl);
+        }
+        return true;
+    }
+    return false;
+}
+
+/* Scalar notices can precede their normal FIFO dispatch while a caller is
+ * retrying production. Observe them without taking another facade's events,
+ * advancing the session, or invoking callbacks under a service lock. */
+static void track_observe_terminals(moq_publisher_t *pub, moq_pub_track_t *t)
+{
+    const moq_session_t *s = pub->session;
+    for (size_t i = s->event_head; i < s->event_tail; i++)
+        (void)track_note_terminal(pub, t, &s->events[i % s->event_cap]);
+}
+
+static moq_result_t slot_stale_subgroup(moq_publisher_t *pub,
+                                         moq_pub_track_t *t,
+                                         pub_sub_slot_t *sl)
+{
+    track_observe_terminals(pub, t);
+    if (!sl->active || slot_key_stopped(t, sl, sl->cur_group, sl->cur_gen))
+        return MOQ_OK;
+    int owner = sl->kind == PUB_SLOT_PUBLICATION
+        ? pub_resolve_handle(pub->session, sl->pub)
+        : sub_resolve_handle(pub->session, sl->sub);
+    if (owner < 0) {
+        track_clear_slot(pub, sl);
+        return MOQ_OK;
+    }
+    return MOQ_ERR_STALE_HANDLE;
+}
+
 static bool hist_sealed(const moq_pub_track_t *t, uint64_t group)
 {
     for (size_t i = 0; i < t->sealed_count; i++)
@@ -1255,6 +1343,7 @@ static void hist_seal(moq_pub_track_t *t, int ri)
     pub_group_rec_t *r = &t->recs[ri];
     for (size_t i = 0; i < t->slot_cap; i++) {
         pub_sub_slot_t *sl = &t->slots[i];
+        memset(&sl->stopped[ri], 0, sizeof(sl->stopped[ri]));
         if (!sl->sg_open || sl->cur_group != r->group || sl->cur_gen >= r->ngen)
             continue;
         const pub_gen_t *g = &r->gen[sl->cur_gen];
@@ -1813,10 +1902,19 @@ static moq_result_t slot_close_subgroup(moq_publisher_t *pub,
     if (!reset && g && g->last > sl->sg_last &&
         window_owes(&sl->window, sl->cur_group, g->last))
         reset = true;
-    if (reset)
-        return moq_session_reset_subgroup(pub->session, sl->sg, 0x0, now_us);
-    moq_result_t rc = moq_session_close_subgroup(pub->session, sl->sg, now_us);
-    if (rc == MOQ_OK && g) g->fin_seen = true;
+    moq_result_t rc = reset
+        ? moq_session_reset_subgroup(pub->session, sl->sg, 0x0, now_us)
+        : moq_session_close_subgroup(pub->session, sl->sg, now_us);
+    if (rc == MOQ_ERR_STALE_HANDLE) {
+        /* Closing an already ended stream completes only that close. The
+         * owner and its stream count remain until terminal control ends it. */
+        track_observe_terminals(pub, t);
+        sl->streaming = false;
+        sl->sg_open = false;
+        sl->needs_reset = false;
+        return MOQ_OK;
+    }
+    if (rc == MOQ_OK && !reset && g) g->fin_seen = true;
     return rc;
 }
 
@@ -1961,6 +2059,87 @@ static void pub_init_accept_cfg(const moq_pub_track_t *t,
 
 /* -- Owed request answers ---------------------------------------- */
 
+/* Pure eligibility checks: a live generation that was already answered is
+ * not an answer owner. ANN and NS_SUB have file-local session resolvers, so
+ * their identity checks are mirrored here without advancing the session. */
+static bool pub_answer_pending(moq_publisher_t *pub, const pub_owed_answer_t *a)
+{
+    moq_session_t *s = pub->session;
+    switch (a->kind) {
+    case MOQ_EVENT_SUBSCRIBE_REQUEST: {
+        int slot = sub_resolve_handle(s, (moq_subscription_t){a->handle});
+        if (slot < 0) return false;
+        const moq_sub_entry_t *e = &s->subs[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_SUB_ROLE_PUBLISHER &&
+            e->state == MOQ_SUB_PENDING_PUBLISHER && !e->cancel_pending;
+    }
+    case MOQ_EVENT_PUBLISH_REQUEST: {
+        int slot = pub_resolve_handle(s, (moq_publication_t){a->handle});
+        if (slot < 0) return false;
+        const moq_pub_entry_t *e = &s->publishes[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_PUB_ROLE_SUBSCRIBER &&
+            e->state == MOQ_PUB_PENDING_SUBSCRIBER && !e->done_pending;
+    }
+    case MOQ_EVENT_NAMESPACE_PUBLISHED: {
+        size_t slot = moq_handle_slot(a->handle);
+        if (moq_handle_pool_tag(a->handle) != MOQ_HANDLE_POOL_ANNOUNCEMENT ||
+            moq_handle_session_tag(a->handle) != s->session_tag || slot >= s->ann_cap)
+            return false;
+        const moq_ann_entry_t *e = &s->announcements[slot];
+        if (e->generation != moq_handle_generation(a->handle) ||
+            e->handle._opaque != a->handle || e->role != MOQ_ANN_ROLE_RECEIVER ||
+            e->state != MOQ_ANN_PENDING_RECEIVER)
+            return false;
+        return !s->profile->premature_fin_fails_request ||
+            (!e->terminal_cause && !e->response_validated &&
+             moq_request_lifetime_check_initial_response(&e->rs.lifetime, true) == MOQ_OK);
+    }
+    case MOQ_EVENT_NS_SUB_REQUEST: {
+        size_t slot = moq_handle_slot(a->handle);
+        if (moq_handle_pool_tag(a->handle) != MOQ_HANDLE_POOL_NAMESPACE_SUB ||
+            moq_handle_session_tag(a->handle) != s->session_tag || slot >= s->ns_sub_cap)
+            return false;
+        const moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+        return e->generation == moq_handle_generation(a->handle) &&
+            e->handle._opaque == a->handle && !e->local_subscriber &&
+            e->state == MOQ_NS_SUB_PENDING_PUBLISHER && !e->terminal.cause;
+    }
+    case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST: {
+        int slot = track_sub_resolve_handle(s, (moq_track_sub_handle_t){a->handle});
+        if (slot < 0) return false;
+        const moq_track_sub_entry_t *e = &s->track_subs[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_TRACK_SUB_ROLE_PUBLISHER &&
+            e->state == MOQ_TRACK_SUB_PENDING_PUBLISHER;
+    }
+    case MOQ_EVENT_TRACK_STATUS_REQUEST: {
+        int slot = ts_resolve_handle(s, (moq_track_status_handle_t){a->handle});
+        if (slot < 0) return false;
+        const moq_ts_entry_t *e = &s->track_statuses[slot];
+        if (e->handle._opaque != a->handle || e->role != MOQ_TS_ROLE_PUBLISHER ||
+            e->state != MOQ_TS_PENDING_PUBLISHER || e->goaway_sent)
+            return false;
+        return !s->profile->premature_fin_fails_request ||
+            (!e->terminal_cause && !e->response_validated &&
+             moq_request_lifetime_check_initial_response(&e->rs.lifetime, true) == MOQ_OK);
+    }
+    default:
+        return false;
+    }
+}
+
+/* Prune every retired owner, including tails behind a blocked live head.
+ * Stable compaction does not send answers or reorder the remaining owners. */
+static void pub_owed_prune(moq_publisher_t *pub)
+{
+    size_t keep = 0;
+    for (size_t i = 0; i < pub->owed_count; i++) {
+        if (!pub_answer_pending(pub, &pub->owed[i])) continue;
+        if (keep != i) pub->owed[keep] = pub->owed[i];
+        keep++;
+    }
+    pub->owed_count = keep;
+}
+
 /* The answer is settled: given, or its request is gone (a stale handle, or
  * no longer awaiting an answer). WOULD_BLOCK and CLOSED are told apart by
  * the callers; anything else is a local failure to answer. */
@@ -2047,11 +2226,18 @@ static moq_result_t pub_answer_request(moq_publisher_t *pub,
  * one the session refuses outright is dropped and reported. */
 static moq_result_t pub_owed_drive(moq_publisher_t *pub, uint64_t now_us)
 {
+    pub_owed_prune(pub);
     size_t done = 0;
     moq_result_t out = MOQ_OK;
     while (done < pub->owed_count) {
+        /* Answering advances the session and may retire another owner. */
+        if (!pub_answer_pending(pub, &pub->owed[done])) { done++; continue; }
         moq_result_t rc = pub_answer_request(pub, &pub->owed[done], now_us);
-        if (rc == MOQ_ERR_WOULD_BLOCK) { out = rc; break; }
+        if (rc == MOQ_ERR_WOULD_BLOCK) {
+            if (!pub_answer_pending(pub, &pub->owed[done])) { done++; continue; }
+            if (out == MOQ_OK) out = rc;
+            break;
+        }
         if (rc == MOQ_ERR_CLOSED) { done = pub->owed_count; out = rc; break; }
         if (!pub_answer_settled(rc) && out == MOQ_OK) out = rc;
         done++;
@@ -2061,37 +2247,36 @@ static moq_result_t pub_owed_drive(moq_publisher_t *pub, uint64_t now_us)
                 (pub->owed_count - done) * sizeof(pub->owed[0]));
         pub->owed_count -= done;
     }
+    pub_owed_prune(pub);
     return out;
 }
 
 /* Answer now, or hold the answer when the session cannot take it yet (also
  * when earlier answers are still held, so answers keep their order). Sets
- * *held when it was held. MOQ_ERR_NOMEM when it can be neither; the
- * session's own error when it refuses the answer outright. */
+ * *held when it was held. Each exact kind/handle owns one immutable decision
+ * and FIFO position. The fixed six-pool sum bounds all eligible owners. */
 static moq_result_t pub_answer_or_owe(moq_publisher_t *pub, const pub_owed_answer_t *in,
                                       uint64_t now_us, bool *held)
 {
     *held = false;
+    pub_owed_prune(pub);
+    if (!pub_answer_pending(pub, in)) return MOQ_OK;
+    for (size_t i = 0; i < pub->owed_count; i++) {
+        if (pub->owed[i].kind == in->kind && pub->owed[i].handle == in->handle) {
+            *held = true;
+            return MOQ_OK;
+        }
+    }
     pub_owed_answer_t cur = *in;
-    const pub_owed_answer_t *a = &cur;
     if (pub->owed_count == 0) {
         moq_result_t rc = pub_answer_request(pub, &cur, now_us);
         if (rc != MOQ_ERR_WOULD_BLOCK)
             return pub_answer_settled(rc) ? MOQ_OK : rc;
+        /* The failed attempt still advanced the session. */
+        if (!pub_answer_pending(pub, &cur)) return MOQ_OK;
     }
-    if (pub->owed_count == pub->owed_cap) {
-        size_t cap = pub->owed_cap ? pub->owed_cap * 2 : 4;
-        if (cap > SIZE_MAX / sizeof(pub->owed[0])) return MOQ_ERR_NOMEM;
-        pub_owed_answer_t *grown = (pub_owed_answer_t *)pub_alloc(pub,
-            cap * sizeof(pub->owed[0]));
-        if (!grown) return MOQ_ERR_NOMEM;
-        if (pub->owed_count)
-            memcpy(grown, pub->owed, pub->owed_count * sizeof(pub->owed[0]));
-        if (pub->owed) pub_free(pub, pub->owed, pub->owed_cap * sizeof(pub->owed[0]));
-        pub->owed = grown;
-        pub->owed_cap = cap;
-    }
-    pub->owed[pub->owed_count++] = *a;
+    if (pub->owed_count >= pub->owed_cap) return MOQ_ERR_INTERNAL;
+    pub->owed[pub->owed_count++] = cur;
     *held = true;
     return MOQ_OK;
 }
@@ -2139,7 +2324,7 @@ static moq_result_t pub_refuse_unserved(moq_publisher_t *pub, const moq_event_t 
 /* Finish the pending fetch: release the snapshot refs and clear the slot. */
 static void pending_fetch_clear(moq_publisher_t *pub, pub_pending_fetch_t *pf)
 {
-    if (moq_session_supports_fill(pub->session) && pf->active) {
+    if (pf->active) {
         pub_fetch_owners_t *owners = &pub->fetch_owners;
         pub_fetch_owner_t *cell = &owners->cells[moq_handle_slot(pf->fetch._opaque)];
         if (cell->prev != PUB_FETCH_NONE)
@@ -2155,10 +2340,6 @@ static void pending_fetch_clear(moq_publisher_t *pub, pub_pending_fetch_t *pf)
 
 static void pending_fetches_clear(moq_publisher_t *pub)
 {
-    if (!moq_session_supports_fill(pub->session)) {
-        pending_fetch_clear(pub, &pub->pending_fetch);
-        return;
-    }
     while (pub->fetch_owners.head != PUB_FETCH_NONE)
         pending_fetch_clear(pub,
             &pub->fetch_owners.cells[pub->fetch_owners.head].pending);
@@ -2179,9 +2360,18 @@ static moq_result_t serve_retained_fetch(moq_publisher_t *pub,
     bool d22 = moq_session_supports_fill(pub->session);
     /* Cancellation must release references even with no action credit. The
      * resolver checks pool, session, slot and generation, without advancing. */
-    if (d22 && fetch_resolve_handle(pub->session, pf->fetch) < 0) {
+    if (fetch_resolve_handle(pub->session, pf->fetch) < 0) {
         pending_fetch_clear(pub, pf);
         return MOQ_OK;
+    }
+    /* Independent FETCH owners may progress, but a Joining FETCH's answer
+     * cannot overtake an unanswered update of its own parent. */
+    if (!pf->accepted) {
+        int sub = sub_resolve_handle(pub->session, pf->joining_sub);
+        int publication = pub_resolve_handle(pub->session, pf->joining_pub);
+        if ((sub >= 0 && pub->session->subs[sub].owed_update.owed) ||
+            (publication >= 0 && pub->session->publishes[publication].owed_update.owed))
+            return MOQ_ERR_WOULD_BLOCK;
     }
 
     /* The reject flag, not the code, decides: INTERNAL_ERROR is code zero
@@ -2267,13 +2457,14 @@ static moq_result_t serve_retained_fetch(moq_publisher_t *pub,
  * earlier one waits for event or drain credit. No polling or retry loop. */
 static moq_result_t serve_retained_fetches(moq_publisher_t *pub, uint64_t now_us)
 {
-    if (!moq_session_supports_fill(pub->session))
-        return serve_retained_fetch(pub, &pub->pending_fetch, now_us);
     pub_fetch_owners_t *owners = &pub->fetch_owners;
-    for (uint32_t i = owners->head; i != PUB_FETCH_NONE;) {
+    size_t remaining = owners->cap;
+    uint32_t last = owners->tail;
+    for (uint32_t i = owners->head; i != PUB_FETCH_NONE && remaining--;) {
         uint32_t next = owners->cells[i].next;
         moq_result_t rc = serve_retained_fetch(pub, &owners->cells[i].pending, now_us);
         if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
+        if (i == last) break;
         i = next;
     }
     return owners->head == PUB_FETCH_NONE ? MOQ_OK : MOQ_ERR_WOULD_BLOCK;
@@ -2738,9 +2929,7 @@ static void pub_forget_track(moq_publisher_t *pub, const moq_pub_track_t *t)
         pub->owed[i].track = NULL;
         pub->owed[i].code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
     }
-    if (!moq_session_supports_fill(pub->session)) {
-        if (pub->pending_fetch.track == t) pub->pending_fetch.track = NULL;
-    } else if (pub->fetch_owners.cells) {
+    if (pub->fetch_owners.cells) {
         for (size_t i = 0; i < pub->fetch_owners.cap; i++)
             if (pub->fetch_owners.cells[i].pending.track == t)
                 pub->fetch_owners.cells[i].pending.track = NULL;
@@ -2827,6 +3016,27 @@ static bool admission_live(moq_publisher_t *pub, uint64_t parent,
     return owed->owed && owed->rec.request_id == update_id;
 }
 
+/* A later cumulative legacy UPDATE still has to reach the FIFO dispatcher.
+ * Keep the parent owner, but never ACK its old ID or apply an old snapshot. */
+static bool admission_update_waits(moq_publisher_t *pub, const pub_admission_t *a)
+{
+    if (pub->session->profile->request_updates_max == 1 || !(a->flags & PUB_ADMISSION_UPDATE))
+        return false;
+    const moq_owed_update_t *owed;
+    if (a->flags & PUB_ADMISSION_PUBLICATION) {
+        int i = pub_resolve_handle(pub->session, (moq_publication_t){a->parent});
+        if (i < 0 || pub->session->publishes[i].role != MOQ_PUB_ROLE_PUBLISHER ||
+            pub->session->publishes[i].state != MOQ_PUB_ESTABLISHED) return false;
+        owed = &pub->session->publishes[i].owed_update;
+    } else {
+        int i = sub_resolve_handle(pub->session, (moq_subscription_t){a->parent});
+        if (i < 0 || pub->session->subs[i].role != MOQ_SUB_ROLE_PUBLISHER ||
+            pub->session->subs[i].state != MOQ_SUB_ESTABLISHED) return false;
+        owed = &pub->session->subs[i].owed_update;
+    }
+    return owed->owed && owed->rec.request_id != a->update_id;
+}
+
 static pub_admission_t *admission_cell(moq_publisher_t *pub, uint64_t parent,
                                       bool publication)
 {
@@ -2878,10 +3088,21 @@ static moq_result_t admission_claim(moq_publisher_t *pub, uint64_t parent,
                                         (flags & PUB_ADMISSION_PUBLICATION) != 0);
     if (!a) return MOQ_OK;
     if ((a->flags & PUB_ADMISSION_ACTIVE) &&
-        !admission_live(pub, a->parent, a->flags, a->update_id))
+        !admission_live(pub, a->parent, a->flags, a->update_id) &&
+        !admission_update_waits(pub, a))
         admission_clear(pub, a);
     if (!admission_live(pub, parent, flags, update_id)) return MOQ_OK;
     if (a->flags & PUB_ADMISSION_ACTIVE) {
+        if (pub->session->profile->request_updates_max != 1 && a->parent == parent &&
+            (a->flags & flags & PUB_ADMISSION_UPDATE) && a->update_id != update_id) {
+            /* The event contains the session's cumulative scalar projection.
+             * Legacy has no fill reservation to detach or borrowed spans. */
+            a->update_id = update_id;
+            a->flags = flags | PUB_ADMISSION_ACTIVE;
+            *fresh = true;
+            *out = a;
+            return MOQ_OK;
+        }
         if (a->parent != parent || a->update_id != update_id ||
             ((a->flags ^ flags) & PUB_ADMISSION_UPDATE))
             return MOQ_ERR_WRONG_STATE;
@@ -2907,6 +3128,7 @@ static moq_result_t flush_admission(moq_publisher_t *pub, pub_admission_t *a,
                                      uint64_t now_us)
 {
     if (!admission_live(pub, a->parent, a->flags, a->update_id)) {
+        if (admission_update_waits(pub, a)) return MOQ_ERR_WOULD_BLOCK;
         admission_clear(pub, a);
         return MOQ_OK;
     }
@@ -2916,6 +3138,11 @@ static moq_result_t flush_admission(moq_publisher_t *pub, pub_admission_t *a,
     if (!update && (a->flags & PUB_ADMISSION_ACCEPT) && a->track->ended) {
         a->flags &= ~PUB_ADMISSION_ACCEPT;
         a->reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+    }
+    if (!update && (a->flags & PUB_ADMISSION_ACCEPT) &&
+        !moq_session_supports_concurrent_subscriptions(pub->session) && track_has_subscriber(a->track)) {
+        a->flags &= ~PUB_ADMISSION_ACCEPT;
+        a->reject_code = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION;
     }
     bool accept = (a->flags & PUB_ADMISSION_ACCEPT) != 0;
     moq_result_t rc;
@@ -3031,73 +3258,6 @@ static moq_result_t stage_update(moq_publisher_t *pub, const pub_pending_t *p,
     return flush_admission(pub, a, now_us);
 }
 
-static moq_result_t flush_pending(moq_publisher_t *pub, uint64_t now_us,
-                                   moq_pub_track_t **out_joined)
-{
-    if (out_joined) *out_joined = NULL;
-    if (moq_session_supports_fill(pub->session))
-        return flush_admissions(pub, now_us);
-    pub_pending_t *p = &pub->pending;
-    if (!p->active) return MOQ_OK;
-
-    /* A track ended while its accept was pending: reject the late subscriber
-     * instead of completing the accept onto a terminal track. */
-    if (!p->update && p->accept && p->track && p->track->ended) {
-        p->accept = false;
-        p->reject_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
-    }
-
-    moq_result_t rc;
-    if (p->accept && p->fill_requested) {
-        rc = pending_fill_reserve(pub, p->track, &p->fill_job);
-        if (rc < 0) {
-            if (rc != MOQ_ERR_WOULD_BLOCK) memset(p, 0, sizeof(*p));
-            return rc;
-        }
-    }
-    moq_pub_fill_receipt_t receipt = {0};
-    if (p->update) {
-        moq_accept_subscription_update_cfg_t acc;
-        moq_accept_subscription_update_cfg_init_sized(&acc, sizeof(acc));
-        acc.update_request_id = p->update_id;
-        rc = moq_publication_is_valid(p->publication)
-            ? session_accept_publication_update_receipt(pub->session, p->publication,
-                                                         &acc, now_us, &receipt)
-            : session_accept_subscription_update_receipt(pub->session, p->sub,
-                                                          &acc, now_us, &receipt);
-    } else if (p->accept) {
-        moq_accept_subscribe_cfg_t acc;
-        pub_init_accept_cfg(p->track, &acc);
-        rc = session_accept_subscribe_receipt(pub->session, p->sub, &acc,
-                                               now_us, &receipt);
-    } else {
-        moq_reject_subscribe_cfg_t rej;
-        moq_reject_subscribe_cfg_init(&rej);
-        rej.error_code = p->reject_code;
-        rc = moq_session_reject_subscribe(pub->session, p->sub, &rej, now_us);
-    }
-
-    if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-
-    if (p->fill_job) {
-        if (rc == MOQ_OK && p->accept) pending_fill_bind(pub, p->fill_job, &receipt);
-        else pending_fill_clear(pub, p->fill_job);
-    }
-
-    if (rc == MOQ_OK && p->update) {
-        pub_pending_t committed = *p;
-        memset(p, 0, sizeof(*p));
-        return pending_update_apply(pub, &committed, now_us);
-    }
-    if (rc == MOQ_OK && p->accept && p->track) {
-        track_set_subscriber(pub, p->track, p->sub, p->forward);
-        if (out_joined) *out_joined = p->track;
-    }
-
-    memset(p, 0, sizeof(*p));
-    return rc < 0 ? rc : MOQ_OK;
-}
-
 /*
  * Canonical local close: observe a session close ONCE. Tears down every piece
  * of local state so nothing is stranded until destroy -- pending accept/reject
@@ -3111,8 +3271,8 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
     if (pub->closed) return;
     pub->closed = true;
     pub->deferred.active = false;
-    if (moq_session_supports_fill(pub->session)) admissions_clear(pub);
-    else pub->pending.active = false;
+    pub->owed_count = 0;
+    admissions_clear(pub);
     pending_fetches_clear(pub);   /* release retained-FETCH snapshot refs now */
     pending_fills_clear_all(pub);
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
@@ -3128,11 +3288,10 @@ static void pub_close_local(moq_publisher_t *pub, uint64_t code)
  * Progress ALL staged, action-queue-limited work: a pending subscribe accept/
  * reject (firing on_subscriber_joined exactly once on completion), a deferred
  * retained FETCH, pending fills, and lazy Forward-0 subgroup retirements.
- * Idempotent under retry -- admission cells unlink at commit (legacy uses
- * pending.active),
+ * Idempotent under retry -- admission cells unlink at commit,
  * serve_retained_fetch, serve_pending_fills and track_run_retires mutate only
- * on success and re-arm on WOULD_BLOCK -- so a
- * repeated call never doubles a callback or a wire action. Shared by
+ * on success and re-arm on WOULD_BLOCK -- so a repeated call never doubles
+ * a callback or a wire action. Shared by
  * moq_pub_flush (manual mode) and moq_pub_tick.
  */
 static moq_result_t pub_progress_staged(moq_publisher_t *pub, uint64_t now_us)
@@ -3147,36 +3306,31 @@ static moq_result_t pub_progress_staged(moq_publisher_t *pub, uint64_t now_us)
     /* Progress held children even when the next parent waits for their credit.
      * Waiting for a real terminal is not action-queue-limited work. */
     serve_pending_fills(pub, now_us);
-    moq_pub_track_t *joined = NULL;
-    moq_result_t rc = flush_pending(pub, now_us, &joined);
-    if (joined && pub->callbacks.on_subscriber_joined)
-        pub->callbacks.on_subscriber_joined(pub->callbacks.ctx, joined);
+    moq_result_t rc = flush_admissions(pub, now_us);
     bool waiting = rc == MOQ_ERR_WOULD_BLOCK || owed_waiting;
-    if (rc < 0 && (!waiting || !moq_session_supports_fill(pub->session)))
-        return rc;
+    if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
 
     rc = serve_retained_fetches(pub, now_us);
-    if (rc < 0 && (rc != MOQ_ERR_WOULD_BLOCK ||
-                   !moq_session_supports_fill(pub->session))) return rc;
+    if (rc < 0 && rc != MOQ_ERR_WOULD_BLOCK) return rc;
     waiting |= rc == MOQ_ERR_WOULD_BLOCK;
 
     if (pending_fills_active(pub)) {
         serve_pending_fills(pub, now_us);
-        if (pending_fills_active(pub)) return MOQ_ERR_WOULD_BLOCK;
+        waiting |= pending_fills_active(pub);
     }
 
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
         moq_result_t rrc = track_run_retires(pub, t, now_us);
-        if (rrc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rrc < 0 && rrc != MOQ_ERR_STALE_HANDLE) return rrc;
+        if (rrc == MOQ_ERR_WOULD_BLOCK) waiting = true;
+        else if (rrc < 0 && rrc != MOQ_ERR_STALE_HANDLE) return rrc;
     }
 
     /* §10: finite-window completion, strictly AFTER the retire sweep
      * (a required RESET is never converted into completion's clean FIN). */
     for (moq_pub_track_t *t = pub->tracks; t; t = t->next) {
         moq_result_t crc = track_run_completions(pub, t, now_us);
-        if (crc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (crc < 0 && crc != MOQ_ERR_STALE_HANDLE) return crc;
+        if (crc == MOQ_ERR_WOULD_BLOCK) waiting = true;
+        else if (crc < 0 && crc != MOQ_ERR_STALE_HANDLE) return crc;
     }
     if (owed_err != MOQ_OK) return owed_err;
     return waiting ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
@@ -3373,23 +3527,27 @@ moq_result_t moq_pub_create(moq_session_t *session,
                            sizeof(cfg->max_fill_snapshot_bytes)) && cfg->max_fill_snapshot_bytes)))
         return MOQ_ERR_UNSUPPORTED;
 
-    size_t admission_cap = 0, fetch_cap = 0;
-    if (moq_session_supports_fill(session)) {
-        /* The fixed-cell proof does not extend to profiles allowing multiple
-         * unanswered UPDATEs on one parent. Fail closed if that changes. */
-        if (session->profile->request_updates_max != 1)
-            return MOQ_ERR_UNSUPPORTED;
-        if (session->pub_cap > SIZE_MAX - session->sub_cap)
-            return MOQ_ERR_LIMIT;
-        admission_cap = session->sub_cap + session->pub_cap;
-        if (admission_cap >= PUB_ADMISSION_NONE ||
-            admission_cap > SIZE_MAX / sizeof(pub_admission_t))
-            return MOQ_ERR_LIMIT;
-        fetch_cap = session->fetch_cap;
-        if (fetch_cap >= PUB_FETCH_NONE ||
-            fetch_cap > SIZE_MAX / sizeof(pub_fetch_owner_t))
-            return MOQ_ERR_LIMIT;
+    if (moq_session_supports_fill(session) && session->profile->request_updates_max != 1)
+        return MOQ_ERR_UNSUPPORTED;
+    if (session->pub_cap > SIZE_MAX - session->sub_cap)
+        return MOQ_ERR_LIMIT;
+    size_t admission_cap = session->sub_cap + session->pub_cap;
+    if (admission_cap >= PUB_ADMISSION_NONE ||
+        admission_cap > SIZE_MAX / sizeof(pub_admission_t))
+        return MOQ_ERR_LIMIT;
+    size_t fetch_cap = session->fetch_cap;
+    if (fetch_cap >= PUB_FETCH_NONE ||
+        fetch_cap > SIZE_MAX / sizeof(pub_fetch_owner_t))
+        return MOQ_ERR_LIMIT;
+    size_t owed_cap = admission_cap;
+    const size_t answer_caps[] = {
+        session->ann_cap, session->ns_sub_cap, session->track_sub_cap, session->ts_cap
+    };
+    for (size_t i = 0; i < sizeof(answer_caps) / sizeof(answer_caps[0]); i++) {
+        if (answer_caps[i] > SIZE_MAX - owed_cap) return MOQ_ERR_LIMIT;
+        owed_cap += answer_caps[i];
     }
+    if (owed_cap > SIZE_MAX / sizeof(pub_owed_answer_t)) return MOQ_ERR_LIMIT;
 
     moq_publisher_t *p = (moq_publisher_t *)alloc->alloc(
         sizeof(moq_publisher_t), alloc->ctx);
@@ -3467,14 +3625,17 @@ moq_result_t moq_pub_create(moq_session_t *session,
         }
         memset(p->pending_fills, 0, (size_t)nfills * sizeof(pub_pending_fill_t));
         p->pending_fill_cap = nfills;
+    }
+    {
         p->admissions.head = p->admissions.tail = PUB_ADMISSION_NONE;
         p->admissions.cap = admission_cap;
         if (admission_cap) {
             p->admissions.cells = alloc->alloc(
                 admission_cap * sizeof(pub_admission_t), alloc->ctx);
             if (!p->admissions.cells) {
-                alloc->free(p->pending_fills,
-                    p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
+                if (p->pending_fills)
+                    alloc->free(p->pending_fills,
+                        p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
                 alloc->free(p, sizeof(*p), alloc->ctx);
                 return MOQ_ERR_NOMEM;
             }
@@ -3489,12 +3650,30 @@ moq_result_t moq_pub_create(moq_session_t *session,
                 if (p->admissions.cells)
                     alloc->free(p->admissions.cells,
                         admission_cap * sizeof(pub_admission_t), alloc->ctx);
-                alloc->free(p->pending_fills,
-                    p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
+                if (p->pending_fills)
+                    alloc->free(p->pending_fills,
+                        p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
                 alloc->free(p, sizeof(*p), alloc->ctx);
                 return MOQ_ERR_NOMEM;
             }
             memset(p->fetch_owners.cells, 0, fetch_cap * sizeof(pub_fetch_owner_t));
+        }
+    }
+    p->owed_cap = owed_cap;
+    if (owed_cap) {
+        p->owed = alloc->alloc(owed_cap * sizeof(pub_owed_answer_t), alloc->ctx);
+        if (!p->owed) {
+            if (p->fetch_owners.cells)
+                alloc->free(p->fetch_owners.cells,
+                    fetch_cap * sizeof(pub_fetch_owner_t), alloc->ctx);
+            if (p->admissions.cells)
+                alloc->free(p->admissions.cells,
+                    admission_cap * sizeof(pub_admission_t), alloc->ctx);
+            if (p->pending_fills)
+                alloc->free(p->pending_fills,
+                    p->pending_fill_cap * sizeof(pub_pending_fill_t), alloc->ctx);
+            alloc->free(p, sizeof(*p), alloc->ctx);
+            return MOQ_ERR_NOMEM;
         }
     }
 
@@ -3505,7 +3684,7 @@ moq_result_t moq_pub_create(moq_session_t *session,
 void moq_pub_destroy(moq_publisher_t *pub) {
     if (!pub) return;
     if (pub->in_fill_callback) return;
-    if (moq_session_supports_fill(pub->session)) admissions_clear(pub);
+    admissions_clear(pub);
     pending_fetches_clear(pub);   /* release any snapshot refs held for a fetch */
     pending_fills_clear_all(pub);
     moq_pub_track_t *t = pub->tracks;
@@ -3536,10 +3715,10 @@ void moq_pub_destroy(moq_publisher_t *pub) {
     moq_alloc_t alloc = pub->alloc;
     if (pub->owed)
         alloc.free(pub->owed, pub->owed_cap * sizeof(pub->owed[0]), alloc.ctx);
-    if (moq_session_supports_fill(pub->session) && pub->fetch_owners.cells)
+    if (pub->fetch_owners.cells)
         alloc.free(pub->fetch_owners.cells,
                    pub->fetch_owners.cap * sizeof(pub_fetch_owner_t), alloc.ctx);
-    if (moq_session_supports_fill(pub->session) && pub->admissions.cells)
+    if (pub->admissions.cells)
         alloc.free(pub->admissions.cells,
                    pub->admissions.cap * sizeof(pub_admission_t), alloc.ctx);
     if (pub->pending_fills)
@@ -3863,14 +4042,10 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
     /* Pre-flight checks before any side effects. */
     if (pub->deferred.active && pub->deferred.track == track)
         return MOQ_ERR_WOULD_BLOCK;
-    if (moq_session_supports_fill(pub->session)) {
-        for (uint32_t i = pub->admissions.head; i != PUB_ADMISSION_NONE;
-             i = pub->admissions.cells[i].next)
-            if (pub->admissions.cells[i].track == track)
-                return MOQ_ERR_WOULD_BLOCK;
-    } else if (pub->pending.active && pub->pending.track == track) {
-        return MOQ_ERR_WOULD_BLOCK;
-    }
+    for (uint32_t i = pub->admissions.head; i != PUB_ADMISSION_NONE;
+         i = pub->admissions.cells[i].next)
+        if (pub->admissions.cells[i].track == track)
+            return MOQ_ERR_WOULD_BLOCK;
     /* A pending retained FETCH is served from its own snapshot, so removing the
      * source track here is safe -- no guard needed. */
     if (track->ns_entry && track->ns_entry->state == PUB_NS_PENDING &&
@@ -4119,6 +4294,8 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
     moq_pub_track_t *track, pub_sub_slot_t *slot,
     const moq_pub_object_cfg_t *obj, uint64_t now_us)
 {
+    if (slot_key_stopped(track, slot, obj->group_id, track->op.subgroup))
+        return MOQ_OK;
     bool need_ext = (obj->properties != NULL);
 
     bool want_eog = false;
@@ -4142,10 +4319,6 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
     if (slot->sg_open && !same_sg) {
         moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
-            return MOQ_OK;
-        }
         if (rc < 0) return rc;
         slot->sg_open = false;
     }
@@ -4190,8 +4363,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
             slot->sg, &ocfg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
-            return MOQ_OK;
+            return slot_stale_subgroup(pub, track, slot);
         }
         if (rc == MOQ_OK) slot->sg_last = obj->object_id;
         return rc;
@@ -4201,8 +4373,7 @@ static moq_result_t write_stream_object(moq_publisher_t *pub,
         slot->sg, obj->object_id, obj->payload, now_us);
     if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
     if (rc == MOQ_ERR_STALE_HANDLE) {
-        track_clear_slot(pub, slot);
-        return MOQ_OK;
+        return slot_stale_subgroup(pub, track, slot);
     }
     if (rc == MOQ_OK) slot->sg_last = obj->object_id;
     return rc;
@@ -4271,6 +4442,8 @@ moq_result_t moq_pub_write_object_ex(moq_publisher_t *pub,
         return MOQ_ERR_INVAL;
 
     if (track->streaming_active && !obj->datagram) return MOQ_ERR_WRONG_STATE;
+
+    track_observe_terminals(pub, track);
 
     /* end_of_group is APPENDED past the v0 gate: read it only when the
      * caller's struct_size covers it -- an exactly-old-sized cfg must never
@@ -4809,6 +4982,8 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
 
     if (track->streaming_active) return MOQ_ERR_WRONG_STATE;  /* double begin */
 
+    track_observe_terminals(pub, track);
+
     moq_rcbuf_t *begin_props = NULL;
     if (cfg->struct_size >= offsetof(moq_pub_begin_object_cfg_t, properties) +
         sizeof(cfg->properties))
@@ -4870,6 +5045,10 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
     for (size_t si = 0; si < track->slot_cap; si++) {
         pub_sub_slot_t *slot = &track->slots[si];
         if (!slot_op_pending(track, slot)) continue;
+        if (slot_key_stopped(track, slot, cfg->group_id, track->op.subgroup)) {
+            slot->done_op = track->cur_op;
+            continue;
+        }
         if (slot->streaming) {              /* this slot's begin already done */
             slot->done_op = track->cur_op;
             continue;
@@ -4879,10 +5058,6 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
                               slot->cur_gen != track->op.subgroup)) {
             moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-            if (rc == MOQ_ERR_STALE_HANDLE) {
-                track_clear_slot(pub, slot);
-                continue;
-            }
             if (rc < 0) return rc;
             slot->sg_open = false;
         }
@@ -4928,7 +5103,8 @@ static moq_result_t begin_object_impl(moq_publisher_t *pub,
         }
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            rc = slot_stale_subgroup(pub, track, slot);
+            if (rc < 0) return rc;
             continue;
         }
         if (rc < 0) return rc;
@@ -5014,7 +5190,8 @@ moq_result_t moq_pub_write_data(moq_publisher_t *pub,
             slot->sg, track->op.payload, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            rc = slot_stale_subgroup(pub, track, slot);
+            if (rc < 0) return rc;
             continue;
         }
         if (rc < 0) return rc;
@@ -5055,7 +5232,8 @@ moq_result_t moq_pub_end_object(moq_publisher_t *pub,
             slot->sg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
+            rc = slot_stale_subgroup(pub, track, slot);
+            if (rc < 0) return rc;
             continue;
         }
         if (rc < 0) return rc;
@@ -5098,10 +5276,6 @@ moq_result_t moq_pub_end_group(moq_publisher_t *pub,
         }
         moq_result_t rc = slot_close_subgroup(pub, track, slot, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rc == MOQ_ERR_STALE_HANDLE) {
-            track_clear_slot(pub, slot);
-            continue;
-        }
         if (rc < 0) return rc;
         slot->sg_open = false;
         if (slot->active) slot->done_op = track->cur_op;
@@ -5174,6 +5348,8 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
     if (track->pub != pub) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
 
+    track_observe_terminals(pub, track);
+
     /* Abandon the open subgroup on every active slot (same loop as
      * remove_track's teardown). WOULD_BLOCK is retryable: a slot already
      * reset has sg_open cleared, so a re-drive skips it. */
@@ -5183,8 +5359,7 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
         moq_result_t rc = moq_session_reset_subgroup(pub->session,
             sl->sg, error_code, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-        if (rc == MOQ_ERR_STALE_HANDLE) { track_clear_slot(pub, sl); continue; }
-        if (rc < 0) return rc;
+        if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
         sl->sg_open = false;
         sl->streaming = false;   /* any in-flight streaming object is gone */
         sl->needs_reset = false;
@@ -5238,12 +5413,12 @@ static void pub_new_group_request(moq_publisher_t *pub, moq_pub_track_t *t,
  * WOULD_BLOCK pairs with the result to say what happened:
  *   - WOULD_BLOCK + CONSUMED: this event WAS taken and staged owned work (a
  *     pending accept/reject, a deferred retained FETCH, or an armed subgroup
- *     retirement). Drain actions and call moq_pub_flush; D22 also continues
+ *     retirement). Drain actions, call moq_pub_flush once and continue bounded
  *     FIFO event dispatch to return event/fill credit. Never replay an owned
  *     event. flush itself does not poll.
- *   - WOULD_BLOCK + IGNORED: the event was NOT taken. Legacy profiles require
- *     flushing their single pending admission/FETCH owner before another poll.
- * See the moq_pub_handle_event header for the profile-specific pump contract.
+ *   - WOULD_BLOCK + IGNORED: the event was NOT taken; route it to other owners
+ *     before another advancing call invalidates borrowed spans.
+ * See the moq_pub_handle_event header for the progress-round contract.
  * `*result` is assumed pre-initialized by the caller.
  */
 static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
@@ -5253,6 +5428,15 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
 {
     if (!pub || !event || !result) return MOQ_ERR_INVAL;
     *result = MOQ_PUB_EVENT_IGNORED;
+
+    if (event->kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED) {
+        for (moq_pub_track_t *t = pub->tracks; t; t = t->next)
+            if (track_note_terminal(pub, t, event)) {
+                *result = MOQ_PUB_EVENT_CONSUMED;
+                break;
+            }
+        return MOQ_OK;
+    }
 
     if (event->kind == MOQ_EVENT_SESSION_CLOSED) {
         /* Shared broadcast: fully tear down local state and notify (canonical
@@ -5381,14 +5565,8 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 pub->callbacks.on_subscriber_left(pub->callbacks.ctx, t);
             break;
         }
-        if (moq_session_supports_fill(pub->session)) {
-            if (admission_cancel(pub, sub._opaque, false))
-                *result = MOQ_PUB_EVENT_CONSUMED;
-        } else if (pub->pending.active && moq_subscription_eq(pub->pending.sub, sub)) {
-            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
-            memset(&pub->pending, 0, sizeof(pub->pending));
+        if (admission_cancel(pub, sub._opaque, false))
             *result = MOQ_PUB_EVENT_CONSUMED;
-        }
         if (pub->deferred.active && moq_subscription_eq(pub->deferred.sub, sub)) {
             pub->deferred.active = false;
             *result = MOQ_PUB_EVENT_CONSUMED;
@@ -5396,8 +5574,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         return MOQ_OK;
     }
 
-    if (event->kind == MOQ_EVENT_FETCH_CANCELLED &&
-        moq_session_supports_fill(pub->session)) {
+    if (event->kind == MOQ_EVENT_FETCH_CANCELLED) {
         moq_fetch_t fetch = event->u.fetch_cancelled.fetch;
         uint32_t slot = moq_handle_slot(fetch._opaque);
         if (slot < pub->fetch_owners.cap) {
@@ -5419,24 +5596,16 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
      * keeps standalone serve bounded to exactly the retained group. */
     if (event->kind == MOQ_EVENT_FETCH_REQUEST) {
         const moq_fetch_request_event_t *fr = &event->u.fetch_request;
-        bool d22 = moq_session_supports_fill(pub->session);
         pub_pending_fetch_t *pf;
-        int slot = -1;
-        if (d22) {
-            slot = fetch_resolve_handle(pub->session, fr->fetch);
-            if (slot < 0) return MOQ_OK;   /* stale event owns no references */
-            pf = &pub->fetch_owners.cells[slot].pending;
-            if (pf->active && moq_fetch_eq(pf->fetch, fr->fetch)) {
-                *result = MOQ_PUB_EVENT_CONSUMED;
-                return serve_retained_fetches(pub, now_us);
-            }
-            /* Reusing a core slot cannot inherit an old generation's refs or
-             * FIFO position. Resolve first, then retire only that old owner. */
-            if (pf->active) pending_fetch_clear(pub, pf);
-        } else {
-            pf = &pub->pending_fetch;
-            if (pf->active) return MOQ_ERR_WOULD_BLOCK;
+        int slot = fetch_resolve_handle(pub->session, fr->fetch);
+        if (slot < 0) return MOQ_OK;   /* stale event owns no references */
+        pf = &pub->fetch_owners.cells[slot].pending;
+        if (pf->active && moq_fetch_eq(pf->fetch, fr->fetch)) {
+            *result = MOQ_PUB_EVENT_CONSUMED;
+            return serve_retained_fetches(pub, now_us);
         }
+        /* Resolve the generation before retiring an older slot's snapshot. */
+        if (pf->active) pending_fetch_clear(pub, pf);
 
         moq_request_error_t reject_code = 0;
         bool reject = true;
@@ -5545,9 +5714,11 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         memset(pf, 0, sizeof(*pf));
         pf->active = true;
         pf->fetch = fr->fetch;
+        pf->joining_sub = fr->joining_sub;
+        pf->joining_pub = fr->joining_pub;
         pf->reject_code = reject_code;
         pf->reject = reject;
-        if (d22) {
+        {
             pub_fetch_owners_t *owners = &pub->fetch_owners;
             pub_fetch_owner_t *cell = &owners->cells[slot];
             cell->prev = owners->tail;
@@ -5699,10 +5870,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
             pub_new_group_request(pub, t, u->new_group_request);
         if (event->detail_size >= sizeof(*u) && u->answer_owed) {
             pub_pending_t local = {0};
-            pub_pending_t *p = moq_session_supports_fill(pub->session)
-                ? &local : &pub->pending;
-            if (p->active && (!p->update || !moq_subscription_eq(p->sub, u->sub)))
-                return MOQ_ERR_WOULD_BLOCK;
+            pub_pending_t *p = &local;
             p->active = p->accept = p->update = true;
             p->track = t;
             p->sub = u->sub;
@@ -5717,8 +5885,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 .delivery_timeout_us = u->delivery_timeout_us
             };
             *result = MOQ_PUB_EVENT_CONSUMED;
-            return moq_session_supports_fill(pub->session)
-                ? stage_update(pub, p, now_us) : flush_pending(pub, now_us, NULL);
+            return stage_update(pub, p, now_us);
         }
         *result = MOQ_PUB_EVENT_CONSUMED;
         /* Track the subscription's Forward state on its slot. A drop to
@@ -5817,10 +5984,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
             pub_new_group_request(pub, t, u->new_group_request);
         if (event->detail_size >= sizeof(*u) && u->answer_owed) {
             pub_pending_t local = {0};
-            pub_pending_t *p = moq_session_supports_fill(pub->session)
-                ? &local : &pub->pending;
-            if (p->active && (!p->update || !moq_publication_eq(p->publication, u->pub)))
-                return MOQ_ERR_WOULD_BLOCK;
+            pub_pending_t *p = &local;
             p->active = p->accept = p->update = true;
             p->track = t;
             p->publication = u->pub;
@@ -5835,8 +5999,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 .delivery_timeout_us = u->delivery_timeout_us
             };
             *result = MOQ_PUB_EVENT_CONSUMED;
-            return moq_session_supports_fill(pub->session)
-                ? stage_update(pub, p, now_us) : flush_pending(pub, now_us, NULL);
+            return stage_update(pub, p, now_us);
         }
         *result = MOQ_PUB_EVENT_CONSUMED;
         bool armed_retire = false;
@@ -5913,14 +6076,8 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                 pub->callbacks.on_subscriber_left(pub->callbacks.ctx, t);
             break;
         }
-        if (moq_session_supports_fill(pub->session)) {
-            if (admission_cancel(pub, sub._opaque, false))
-                *result = MOQ_PUB_EVENT_CONSUMED;
-        } else if (pub->pending.active && moq_subscription_eq(pub->pending.sub, sub)) {
-            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
-            memset(&pub->pending, 0, sizeof(pub->pending));
+        if (admission_cancel(pub, sub._opaque, false))
             *result = MOQ_PUB_EVENT_CONSUMED;
-        }
         if (pub->deferred.active && moq_subscription_eq(pub->deferred.sub, sub)) {
             pub->deferred.active = false;
             *result = MOQ_PUB_EVENT_CONSUMED;
@@ -5936,13 +6093,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         const moq_request_goaway_event_t *ga = &event->u.request_goaway;
         moq_pub_track_t *t = find_track_by_pub(pub, ga->handle.publication);
         if (!t) return MOQ_OK;
-        if (moq_session_supports_fill(pub->session)) {
-            (void)admission_cancel(pub, ga->handle.publication._opaque, true);
-        } else if (pub->pending.active &&
-            moq_publication_eq(pub->pending.publication, ga->handle.publication)) {
-            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
-            memset(&pub->pending, 0, sizeof(pub->pending));
-        }
+        (void)admission_cancel(pub, ga->handle.publication._opaque, true);
         *result = MOQ_PUB_EVENT_CONSUMED;
         facade_migration_set(&t->migration, &pub->alloc, false, false, 0,
             ga->timeout_ms, ga->new_session_uri, NULL, (moq_bytes_t){ NULL, 0 });
@@ -5979,13 +6130,7 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         moq_pub_track_t *t = find_track_by_pub(pub,
             event->u.publish_unsubscribed.pub);
         if (!t) return MOQ_OK;
-        if (moq_session_supports_fill(pub->session)) {
-            (void)admission_cancel(pub, event->u.publish_unsubscribed.pub._opaque, true);
-        } else if (pub->pending.active &&
-            moq_publication_eq(pub->pending.publication, event->u.publish_unsubscribed.pub)) {
-            if (pub->pending.fill_job) pending_fill_clear(pub, pub->pending.fill_job);
-            memset(&pub->pending, 0, sizeof(pub->pending));
-        }
+        (void)admission_cancel(pub, event->u.publish_unsubscribed.pub._opaque, true);
         *result = MOQ_PUB_EVENT_CONSUMED;
         /* Return the track to the UN-published state (like PUBLISH_ERROR): a
          * peer-terminated publication must be restartable -- leaving
@@ -6048,13 +6193,9 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
         offsetof(moq_subscribe_request_event_t, new_group_request) +
         sizeof(req->new_group_request) && req->has_new_group_request;
 
-    bool d22 = moq_session_supports_fill(pub->session);
-    if (!d22 && pub->pending.active)
-        return MOQ_ERR_WOULD_BLOCK;
-
     *result = MOQ_PUB_EVENT_CONSUMED;
     pub_admission_t *admission = NULL;
-    if (d22) {
+    {
         bool fresh;
         moq_result_t rc = admission_claim(pub, req->sub._opaque, 0, 0,
                                            &admission, &fresh);
@@ -6079,12 +6220,6 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
                track_has_subscriber(track)) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_DUPLICATE_SUBSCRIPTION;
-    } else if (!d22 && moq_session_supports_concurrent_subscriptions(pub->session) &&
-               track_reserve_sub_slots(pub, track) < 0) {
-        /* No memory for one more destination on the track: refused, like a
-         * full subscription pool. */
-        want_accept = false;
-        reject_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
     } else if (pub->cfg.accept_mode == MOQ_PUB_REJECT_ALL) {
         want_accept = false;
         reject_code = MOQ_REQUEST_ERROR_UNAUTHORIZED;
@@ -6173,42 +6308,9 @@ static moq_result_t pub_dispatch_event(moq_publisher_t *pub,
     if (want_accept && new_group)
         pub_new_group_request(pub, track, req->new_group_request);
 
-    if (admission) {
-        if (want_accept) admission->flags |= PUB_ADMISSION_ACCEPT;
-        admission->reject_code = reject_code;
-        return flush_admission(pub, admission, now_us);
-    }
-    pub->pending = (pub_pending_t){
-        .active = true, .sub = req->sub, .track = want_accept ? track : NULL,
-        .accept = want_accept, .reject_code = reject_code,
-        .forward = req->forward, .fill_requested = fill_requested
-    };
-    moq_pub_track_t *joined = NULL;
-    moq_result_t rc = flush_pending(pub, now_us, &joined);
-    if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
-    if (rc < 0) {
-        *result = MOQ_PUB_EVENT_ERROR;
-        return rc;
-    }
-
-    if (joined) {
-        /* Immediate accept: fire the joined callback here, exactly once. The
-         * WOULD_BLOCK / deferred paths returned above without accepting; they
-         * fire it later via flush_pending when the accept completes, so the
-         * callback never doubles. */
-        if (track_has_subscriber(track) && pub->callbacks.on_subscriber_joined)
-            pub->callbacks.on_subscriber_joined(pub->callbacks.ctx, track);
-        /* §10: the fresh slot's finite end may already be covered by
-         * the declared watermark. The accept is committed (event stays
-         * CONSUMED); a blocked sweep surfaces WOULD_BLOCK so the manual
-         * caller drains + flushes -- never replays the event. */
-        {
-            moq_result_t cr = track_run_completions(pub, track, now_us);
-            if (cr == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-            if (cr < 0 && cr != MOQ_ERR_STALE_HANDLE) return cr;
-        }
-    }
-    return MOQ_OK;
+    if (want_accept) admission->flags |= PUB_ADMISSION_ACCEPT;
+    admission->reject_code = reject_code;
+    return flush_admission(pub, admission, now_us);
 }
 
 /* Public manual event-forwarding API: a thin wrapper over the canonical
@@ -6238,74 +6340,21 @@ moq_result_t moq_pub_resolve_deferred(moq_publisher_t *pub,
     if (!deferred->active || deferred->generation != deferred_id)
         return MOQ_ERR_STALE_HANDLE;
 
-    if (moq_session_supports_fill(pub->session)) {
-        pub_admission_t *a = admission_cell(pub, deferred->sub._opaque, false);
-        if (!a || !(a->flags & PUB_ADMISSION_DEFERRED) ||
-            a->parent != deferred->sub._opaque)
-            return MOQ_ERR_STALE_HANDLE;
-        if (!admission_live(pub, a->parent, a->flags, a->update_id)) {
-            admission_clear(pub, a);
-            return MOQ_ERR_STALE_HANDLE;
-        }
-        a->flags &= ~PUB_ADMISSION_DEFERRED;
-        if (accept) a->flags |= PUB_ADMISSION_ACCEPT;
-        a->reject_code = error_code;
-        deferred->active = false;
-        if (accept && deferred->has_new_group)
-            pub_new_group_request(pub, deferred->track, deferred->new_group);
-        return flush_admission(pub, a, now_us);
+    pub_admission_t *a = admission_cell(pub, deferred->sub._opaque, false);
+    if (!a || !(a->flags & PUB_ADMISSION_DEFERRED) ||
+        a->parent != deferred->sub._opaque)
+        return MOQ_ERR_STALE_HANDLE;
+    if (!admission_live(pub, a->parent, a->flags, a->update_id)) {
+        admission_clear(pub, a);
+        return MOQ_ERR_STALE_HANDLE;
     }
-
-    /* The facade has a single pending accept/reject slot. If an earlier
-     * backpressured accept/reject still occupies it, resolving now would have to
-     * overwrite pub->pending -- silently dropping that earlier request and
-     * orphaning its subscription (stuck in PENDING_PUBLISHER with no facade state
-     * left to accept/reject it). Refuse: keep the deferred request active and
-     * return WOULD_BLOCK so the caller flushes the pending slot and retries. */
-    if (pub->pending.active)
-        return MOQ_ERR_WOULD_BLOCK;
-
-    /* The track was ended after the defer was issued: the late subscriber must
-     * not join a terminal track. Override the accept into a reject. */
-    if (accept && deferred->track && deferred->track->ended) {
-        accept = false;
-        error_code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
-    }
-
-    pub->pending = (pub_pending_t){
-        .active = true, .sub = deferred->sub, .track = accept ? deferred->track : NULL,
-        .accept = accept, .reject_code = error_code, .forward = deferred->forward,
-        .fill_requested = deferred->fill_requested
-    };
+    a->flags &= ~PUB_ADMISSION_DEFERRED;
+    if (accept) a->flags |= PUB_ADMISSION_ACCEPT;
+    a->reject_code = error_code;
     deferred->active = false;
     if (accept && deferred->has_new_group)
         pub_new_group_request(pub, deferred->track, deferred->new_group);
-    moq_pub_track_t *joined = NULL;
-    moq_result_t rc = flush_pending(pub, now_us, &joined);
-    if (rc == MOQ_ERR_WOULD_BLOCK) return rc;
-    if (rc < 0) {
-        deferred->active = false;
-        return rc;
-    }
-
-    if (joined) {
-        if (pub->callbacks.on_subscriber_joined)
-            pub->callbacks.on_subscriber_joined(pub->callbacks.ctx,
-                deferred->track);
-        /* §10: complete a fresh covered slot; the acceptance is
-         * committed either way -- WOULD_BLOCK here means "flush to finish
-         * the completion", never "retry the resolution". */
-        deferred->active = false;
-        {
-            moq_result_t cr = track_run_completions(pub, deferred->track,
-                                                    now_us);
-            if (cr == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
-            if (cr < 0 && cr != MOQ_ERR_STALE_HANDLE) return cr;
-        }
-        return MOQ_OK;
-    }
-    deferred->active = false;
-    return MOQ_OK;
+    return flush_admission(pub, a, now_us);
 }
 
 moq_result_t moq_pub_flush(moq_publisher_t *pub, uint64_t now_us) {
@@ -6518,32 +6567,26 @@ moq_result_t moq_pub_tick(moq_publisher_t *pub, uint64_t now_us)
      * joined), a deferred retained FETCH, and retirements armed in earlier
      * ticks. Shared with moq_pub_flush so the two never drift. */
     moq_result_t frc = pub_progress_staged(pub, now_us);
-    bool d22 = moq_session_supports_fill(pub->session);
-    bool waiting_credit = !d22 && pub->pending.active && pub->pending.fill_requested &&
-                          !pub->pending.fill_job;
-    /* Legacy profiles serialize through the single owner. D22 can keep
-     * consuming FIFO events into its bounded owners to return event credit. */
-    if (frc == MOQ_ERR_WOULD_BLOCK &&
-        !d22 && (pub->pending_fetch.active || !waiting_credit)) return frc;
     if (frc < 0 && frc != MOQ_ERR_WOULD_BLOCK) {
         if (frc == MOQ_ERR_CLOSED) drain_closed_event(pub);
         return frc;
     }
 
     moq_event_t ev;
-    size_t remaining = d22 ? pub->session->event_cap : SIZE_MAX;
-    while (remaining-- && moq_session_poll_events(pub->session, &ev, 1) == 1) {
+    size_t remaining = pub->session->event_cap;
+    while (remaining--) {
+        size_t count = 0;
+        moq_result_t prc = moq_session_poll_events_ex(pub->session, &ev, 1,
+                                                      sizeof(ev), &count);
+        if (prc < 0) return prc;
+        if (!count) break;
         /* One canonical dispatcher for every event -- identical handling to
          * the public moq_pub_handle_event path. A WOULD_BLOCK means the event
          * staged work (pending accept / deferred FETCH / armed retirement);
          * the next tick, via pub_progress_staged, drains it. */
         moq_pub_event_result_t res = MOQ_PUB_EVENT_IGNORED;
         moq_result_t drc = pub_dispatch_event(pub, &ev, now_us, &res);
-        waiting_credit = !d22 && pub->pending.active && pub->pending.fill_requested &&
-                         !pub->pending.fill_job;
-        if (drc == MOQ_ERR_WOULD_BLOCK &&
-            ((!d22 && (pub->pending_fetch.active || !waiting_credit)) ||
-             res != MOQ_PUB_EVENT_CONSUMED)) {
+        if (drc == MOQ_ERR_WOULD_BLOCK && res != MOQ_PUB_EVENT_CONSUMED) {
             moq_event_cleanup(&ev);
             return MOQ_ERR_WOULD_BLOCK;
         }
@@ -6562,12 +6605,7 @@ moq_result_t moq_pub_tick(moq_publisher_t *pub, uint64_t now_us)
                 return urc;
             }
         }
-        bool returned_credit = d22 && ev.kind == MOQ_EVENT_FILL_TERMINAL;
         moq_event_cleanup(&ev);
-        if (waiting_credit || returned_credit) {
-            frc = pub_progress_staged(pub, now_us);
-            if (frc < 0 && frc != MOQ_ERR_WOULD_BLOCK) return frc;
-        }
     }
 
     /* Progress work armed by events processed THIS tick (Forward-0

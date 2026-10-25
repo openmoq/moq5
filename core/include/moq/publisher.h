@@ -396,12 +396,13 @@ MOQ_API void moq_pub_destroy(moq_publisher_t *pub);
  * Fires callbacks synchronously. Retries pending accept/reject, deferred
  * retained-FETCH serving, lazy subgroup retirements, and finite-window
  * completion work unlocked by moq_pub_declare_groups_complete_through.
- * D22 keeps draining the normal FIFO while admissions wait for fill credit or
- * retained-FETCH responses wait for output credit. Each retained FETCH has a
+ * Every profile keeps draining the normal FIFO while admissions or retained
+ * FETCH responses wait for credit. Each retained FETCH has a
  * bounded owner and immutable snapshot; progress visits owners in arrival
- * order and skips blocked owners so independent work can proceed. D16/18 keep
- * one retained-FETCH slot and serialize polling until that response completes.
- * Drain actions and retry tick; WOULD_BLOCK reports remaining staged work.
+ * order and skips blocked owners so independent work can proceed. A tick polls
+ * at most the session's event capacity, with finite staged-work passes before
+ * and after dispatch. Drain actions and retry tick in progress rounds;
+ * WOULD_BLOCK reports remaining staged work, not permission to spin to OK.
  *
  * Because tick is the session's only event consumer, it answers every request
  * nothing else will: a SUBSCRIBE or TRACK_STATUS for a track this publisher
@@ -694,14 +695,15 @@ MOQ_API bool moq_pub_track_forward(
  * retained set is bounded: at most MOQ_PUB_RETAINED_MAX_OBJECTS objects and a
  * total payload+properties byte budget (the track's max_retained_bytes) —
  * exceeding either is MOQ_ERR_INVAL and leaves the prior retained set intact.
- * D22 can retain one immutable response snapshot per session FETCH slot. Each
- * snapshot pins at most MOQ_PUB_RETAINED_MAX_OBJECTS payload/properties pairs
- * and its source track's max_retained_bytes at admission. The total pinned
+ * Every profile can retain one immutable response snapshot per session FETCH
+ * slot. Each snapshot pins at most MOQ_PUB_RETAINED_MAX_OBJECTS
+ * payload/properties pairs and its source track's max_retained_bytes at
+ * admission. The total pinned
  * response bytes are bounded by the sum of those per-owner limits, separately
  * from the current retained caches, fill budgets and transport send buffers.
  * Replacing/clearing a cache or removing its track does not change an already
  * admitted response. Completion, cancellation or publisher destruction releases
- * its snapshot. D16/18 retain only one such response snapshot at a time.
+ * its snapshot.
  *
  * Fills: on a draft with fills (draft-22 section 3.4), a subscription on the
  * track may carry a fill request, surfaced by the session as
@@ -828,8 +830,15 @@ MOQ_API void moq_pub_object_cfg_init_sized(moq_pub_object_cfg_t *cfg,
  * the window start, and within the end group when one is set; drafts 16/18
  * §5.1.2 forbid sending outside the requested range) -- plus an established
  * publication with Forward 1 under the same window rule. A fully filtered
- * write still succeeds, delivers nothing, and advances track history. On
- * MOQ_ERR_WOULD_BLOCK the operation is PARTIAL: the facade RETAINS the
+ * write still succeeds, delivers nothing, and advances track history.
+ * Peer STOP_SENDING or delivery expiry ends only the exact outgoing subgroup
+ * for its destination. Later Objects assigned that (Group, Subgroup ID) are
+ * skipped there, including after a Forward/filter change; other destinations
+ * and later subgroup keys remain eligible. The owner, subscriber count and
+ * opened-stream count survive. Streaming callers still finish their begin/end
+ * bracket even if every destination's stream ended. Pending terminal output
+ * is retryable WOULD_BLOCK, never a request termination.
+ * On MOQ_ERR_WOULD_BLOCK the operation is PARTIAL: the facade RETAINS the
  * payload/properties (rcbuf references) until the operation completes or is
  * abandoned, and the caller MUST retry the same call. A retry may pass a
  * DIFFERENT buffer with byte-identical content (re-encoding per attempt is
@@ -1169,39 +1178,47 @@ typedef enum moq_pub_event_result {
  * next advancing session call (see moq/session.h). Dispatch while they are live,
  * clean up each event exactly once, and NEVER retain/re-submit it across flush.
  * CONSUMED means required state is owned, not that ACK/output has completed.
+ * OUTGOING_SUBGROUP_TERMINATED is consumed only for a matching full owner
+ * identity and a complete v0 detail. It updates subgroup-local state without
+ * firing subscriber-left or publication-finished callbacks. Production may
+ * observe the same queued scalar notice before FIFO dispatch; this does not
+ * poll events or consume another facade's events.
  *
- * D22: drain actions and call flush once per progress round, then continue
- * ordinary FIFO polling/dispatch even after WOULD_BLOCK + CONSUMED. In
+ * On every profile, drain actions and call flush once per progress round, then
+ * continue ordinary FIFO polling/dispatch even after WOULD_BLOCK + CONSUMED. In
  * particular, FILL_REQUEST and FILL_TERMINAL must reach this publisher: only
  * terminal dispatch returns a bound job's credit. Flush never polls events.
  * Retry flush after terminal dispatch; yield to the driver when no event,
  * action or application progress exists (an intentionally deferred fill or
  * authorizer may remain pending). Do not spin waiting for flush-to-OK.
- * Retained FETCHes follow the same D22 polling rule: each has a fixed owner
+ * Retained FETCHes follow the same polling rule: each has a fixed owner
  * indexed by the session FETCH slot and distinguished by its full generation.
  * CONSUMED owns the complete response snapshot even if output is blocked.
  * Admissions use fixed per-parent scalar cells; the authorizer runs once and
- * a reserved candidate remains immutable until its ACK commits. This relies
- * on D22's one-unanswered-UPDATE-per-parent bound.
+ * an initial decision remains immutable until its ACK commits. D22 permits
+ * one unanswered UPDATE per parent. D16/18 instead preserve the session's
+ * cumulative UPDATE snapshot: the newest event replaces that parent's scalar
+ * projection, omitted fields remain cumulative, and superseded IDs never ACK
+ * or apply old values. This does not enable deferred session UPDATE answers
+ * or any wire capability on a profile that did not have them.
  * If destination allocation fails after staging, NOMEM + CONSUMED leaves the
  * decision owned for a later flush; no ACK or peer rejection has been sent.
  *
- * D16/18 retain the SERIALIZED rule: after WOULD_BLOCK, drain actions and flush
- * until OK before polling the next event. On every profile, let other owners
- * inspect IGNORED events before an advancing call invalidates borrowed spans.
+ * Let other owners inspect IGNORED events before an advancing call invalidates
+ * borrowed spans.
  *
  * Returns MOQ_OK (see *result for CONSUMED/IGNORED), MOQ_ERR_INVAL on NULL
  * args, or MOQ_ERR_WOULD_BLOCK for pending output/admission credit:
  *
  *   WOULD_BLOCK + result == CONSUMED: THIS event was taken and staged owned
  *     work (a Forward-0 subgroup retirement, or a blocked accept/reject).
- *     Drain actions + moq_pub_flush; use the profile-specific pump rule above.
+ *     Drain actions + moq_pub_flush and continue bounded FIFO dispatch.
  *     Do NOT replay the event.
  *
- *   WOULD_BLOCK + result == IGNORED: this event was NOT taken. D16/18's single
- *     pending admission and retained-FETCH response require serialization.
- *     D22 SUBSCRIBE/UPDATE admissions and retained FETCHes never return this
- *     combination merely because another owner is waiting for credit.
+ *   WOULD_BLOCK + result == IGNORED: this event was NOT taken. Route it to
+ *     other owners while its borrowed spans remain valid. Admissions and
+ *     retained FETCHes never return this combination merely because another
+ *     owner is waiting for credit.
  */
 MOQ_API moq_result_t moq_pub_handle_event(
     moq_publisher_t *pub,
@@ -1218,15 +1235,18 @@ MOQ_API moq_result_t moq_pub_handle_event(
  * moq_pub_handle_event (and the manual-mode drive for completion work
  * staged by a declaration that returned MOQ_ERR_WOULD_BLOCK).
  * Returns MOQ_OK when no staged work remains or it all completed.
- * Returns MOQ_ERR_WOULD_BLOCK if still blocked. D22 callers must keep routing
- * FIFO events for admission/output-credit waits as described above, not require
- * flush-to-OK before another poll. D16/18 retained-FETCH serving remains
- * serialized. Each D22 admission or retained-FETCH pass visits its occupied
+ * Returns MOQ_ERR_WOULD_BLOCK while a facade obligation remains, including a
+ * retirement or completion waiting on a session-owned STOP/expiry reset.
+ * Continue normal bounded FIFO dispatch after WOULD_BLOCK; event credit may
+ * be what the pending reset needs. Never require flush-to-OK before polling
+ * again, and yield when no event, action or application progress occurred.
+ * Each admission or retained-FETCH pass visits its occupied
  * owners once in arrival order, skipping blocked entries so independent work
  * can progress. Flush never polls or takes the next request.
  * Idempotent under retry: callbacks and wire actions never double.
- * Caller must resolve pending work (flush until OK or error) before destroying
- * the publisher.
+ * For graceful completion, keep driving progress rounds until staged work
+ * completes. Destruction releases local staged ownership; it does not promise
+ * that pending answers or object output reached the peer.
  */
 MOQ_API moq_result_t moq_pub_flush(
     moq_publisher_t *pub,
@@ -1236,12 +1256,15 @@ MOQ_API moq_result_t moq_pub_flush(
 
 /*
  * Resolve a previously deferred subscribe decision.
- * accept=true sends SUBSCRIBE_OK; accept=false sends SUBSCRIBE_ERROR
- * with the given error_code.
- * Returns MOQ_ERR_WOULD_BLOCK if the session action queue is full;
- * moq_pub_flush/moq_pub_tick will retry.
+ * accept=true records acceptance; accept=false records rejection with the
+ * given error_code. Once recorded, the publisher owns the decision and the
+ * deferred_id is stale, including when this call returns MOQ_ERR_WOULD_BLOCK
+ * for output credit or MOQ_ERR_NOMEM for destination allocation. Continue
+ * moq_pub_flush/moq_pub_tick progress rounds to retry the owned decision;
+ * do not replay resolve_deferred. Recording does not promise that the
+ * corresponding SUBSCRIBE_OK/SUBSCRIBE_ERROR has reached the peer.
  * Returns MOQ_ERR_STALE_HANDLE if the deferred handle is no longer
- * valid (session closed or track removed).
+ * valid (already resolved, session closed or track removed).
  */
 MOQ_API moq_result_t moq_pub_resolve_deferred(
     moq_publisher_t *pub,

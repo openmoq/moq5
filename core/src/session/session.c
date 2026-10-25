@@ -5,15 +5,6 @@
 #include "session_event_admission.h"
 #include "session_outbound_internal.h"
 
-/* Bounded backoff applied to the *reported* next deadline when a subgroup
- * delivery-timeout reset cannot be enqueued because the action queue is full.
- * The pending reset is retained (the raw per-subgroup deadline stays expired);
- * this only defers when timer drivers next poll so a backpressured peer cannot
- * drive a zero-sleep retry loop. A few milliseconds keeps reset latency low
- * once the queue drains while bounding wakeups to roughly the rate a managed
- * pump already uses for its idle tick. */
-#define MOQ_SG_RETRY_BACKOFF_US 5000
-
 /* -- Advancing-call bookkeeping ------------------------------------ */
 
 static void session_refresh_idle(moq_session_t *s, uint64_t now_us)
@@ -1170,6 +1161,21 @@ static size_t action_select(const moq_session_t *s)
     return action_select_from(s, s->action_head);
 }
 
+static bool action_waits_for_terminal(const moq_session_t *s, size_t idx)
+{
+    uint64_t owner = s->action_meta[idx % s->action_cap].terminal_owner;
+    if (owner == 0) return false;
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &s->subgroups[i];
+        if ((sg->state == MOQ_SG_TERMINAL_OWED ||
+             (sg->state == MOQ_SG_RESET_OWED &&
+              sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE)) &&
+            (sg->sub._opaque == owner || sg->pub._opaque == owner))
+            return true;
+    }
+    return false;
+}
+
 /* Remove the action at idx from the ring into *out, keeping the order of the
  * actions it overtook. */
 static void action_take(moq_session_t *s, size_t idx, moq_action_t *out)
@@ -2001,62 +2007,19 @@ static moq_result_t handle_tick(moq_session_t *s)
                                 "GOAWAY drain timeout");
     }
 
-    /* Object delivery timeout: drop expired queued objects, resetting their
-     * streams. */
-    session_expire_queued_data(s);
+    session_service_outgoing_terminals(s);
+    return sg_has_terminal_debt(s) ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+}
 
-    /* Subgroup delivery timeout: reset expired subgroups. A CLOSING entry
-     * whose deadline is armed is one whose FIN-started timer ran out before
-     * the transport reported the stream committed. */
-    if (s->subgroup_deadline_us != UINT64_MAX &&
-        s->last_now_us >= s->subgroup_deadline_us) {
-        for (size_t i = 0; i < s->sg_cap; i++) {
-            moq_sg_entry_t *sg = &s->subgroups[i];
-            if (sg->state == MOQ_SG_FREE) continue;
-            if (sg->delivery_deadline_us == UINT64_MAX) continue;
-            if (s->last_now_us < sg->delivery_deadline_us) continue;
-            if (sg->state == MOQ_SG_RESETTING) {
-                sg->delivery_deadline_us = UINT64_MAX;
-                continue;
-            }
-            if (action_queue_full(s)) {
-                sg_recompute_deadline(s);
-                /* The reset is still pending (the per-subgroup deadline
-                 * stays expired), but the action queue is full. Defer the
-                 * *reported* next deadline by a bounded backoff so timer
-                 * drivers sleep until then instead of busy-spinning a
-                 * zero-length wait on the already-expired deadline. */
-                s->subgroup_retry_deadline_us =
-                    deadline_add(s->last_now_us, MOQ_SG_RETRY_BACKOFF_US);
-                return MOQ_ERR_WOULD_BLOCK;
-            }
-            moq_action_t a;
-            memset(&a, 0, sizeof(a));
-            a.kind = MOQ_ACTION_RESET_DATA;
-            a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
-            a.borrow_epoch = s->borrow_epoch;
-            a.u.reset_data.stream_ref = sg->stream_ref;
-            a.u.reset_data.error_code = MOQ_RESET_DELIVERY_TIMEOUT;
-            a.u.reset_data.reliable_size = sg->header_len;
-            moq_result_t arc = push_action(s, &a);
-            if (arc < 0) {
-                sg_recompute_deadline(s);
-                s->subgroup_retry_deadline_us =
-                    deadline_add(s->last_now_us, MOQ_SG_RETRY_BACKOFF_US);
-                return arc;
-            }
-            sg->state = MOQ_SG_RESETTING;
-            sg->streaming_payload_len = 0;
-            sg->streaming_bytes_written = 0;
-            sg->streaming_deadline_us = UINT64_MAX;
-            sg->delivery_deadline_us = UINT64_MAX;
-        }
-        sg_recompute_deadline(s);
-    }
-
-    /* All due subgroup resets were enqueued (or none were due): no deferred
-     * reset remains, so drop any backoff armed by a prior WOULD_BLOCK. */
-    s->subgroup_retry_deadline_us = UINT64_MAX;
+moq_result_t bridge_session_service_outgoing(moq_session_t *s, uint64_t now_us)
+{
+    if (!session_is_active(s)) return MOQ_OK;
+    if (s->subgroup_deadline_us > now_us &&
+        session_queued_data_deadline(s) > now_us && !sg_has_terminal_debt(s))
+        return MOQ_OK;
+    moq_result_t rc = session_advance_entry(s, now_us);
+    if (rc != MOQ_OK) return rc;
+    if (session_is_active(s)) session_service_outgoing_terminals(s);
     return MOQ_OK;
 }
 
@@ -4026,6 +3989,7 @@ static void session_action_poll_prepare(moq_session_t *s)
 static void session_action_poll_settled(moq_session_t *s, bool released)
 {
     if (released && session_is_active(s)) {
+        sg_retry_owed_resets(s);
         session_retry_owed_stream_actions(s);
         fill_service(s);
         mt_retry_pending(s);
@@ -4038,9 +4002,9 @@ static void session_action_poll_settled(moq_session_t *s, bool released)
 bool bridge_session_offer_data_reset(moq_session_t *s,
                                      moq_reset_data_action_t *out)
 {
-    /* Preparing comes first: an expiry can rewrite queued data into its
-     * stream's reset, which the summary below then counts. */
-    session_action_poll_prepare(s);
+    /* Passive: expiry/retry belongs to service, and event admission belongs
+     * to claim after the bridge has checked its pressure/prefix gates. */
+    uint64_t done_owner = 0;
     /* The first non-data action decides; a ring of data alone has none. */
     for (size_t i = s->action_head;
          s->action_nondata != 0 && i < s->action_tail; ++i) {
@@ -4049,7 +4013,11 @@ bool bridge_session_offer_data_reset(moq_session_t *s,
 #endif
         const moq_action_t *a = &s->actions[i % s->action_cap];
         if (action_is_data(a)) continue;
-        if (a->kind != MOQ_ACTION_RESET_DATA) return false;
+        if (a->kind != MOQ_ACTION_RESET_DATA) {
+            done_owner = s->action_meta[i % s->action_cap].terminal_owner;
+            if (done_owner == 0) return false;
+            break;
+        }
         memset(out, 0, sizeof(*out));
         out->stream_ref = a->u.reset_data.stream_ref;
         out->error_code = a->u.reset_data.error_code;
@@ -4058,19 +4026,44 @@ bool bridge_session_offer_data_reset(moq_session_t *s,
             out->reliable_size = a->u.reset_data.reliable_size;
         return true;
     }
-    /* A completely full data ring can prevent the cancellation producer from
-     * enqueuing its reset. The existing subgroup owner retains that obligation
-     * without another queue slot; treat it as a virtual tail action. */
+    /* A full ring can leave a reset on its subgroup. A terminal may precede
+     * its own DONE; every other non-data ordering barrier remains intact. */
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
         const moq_sg_entry_t *sg = &s->subgroups[i];
-        if (sg->state != MOQ_SG_RESET_OWED) continue;
+        bool terminal = sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+        if (sg->state != MOQ_SG_RESET_OWED && sg->state != MOQ_SG_TERMINAL_OWED)
+            continue;
+        if (terminal && !sg_terminal_reset_ready(s, sg)) continue;
+        if (done_owner && (!terminal ||
+            (sg->sub._opaque != done_owner && sg->pub._opaque != done_owner)))
+            continue;
         memset(out, 0, sizeof(*out));
         out->stream_ref = sg->stream_ref;
-        out->error_code = sg->owed_reset_code;
+        out->error_code = terminal ? sg->terminal_code : sg->owed_reset_code;
         out->reliable_size = sg->header_len;
         return true;
     }
     return false;
+}
+
+bool bridge_session_claim_data_reset(moq_session_t *s,
+                                      const moq_reset_data_action_t *reset)
+{
+    moq_reset_data_action_t offered;
+    if (!bridge_session_offer_data_reset(s, &offered) ||
+        offered.stream_ref._v != reset->stream_ref._v ||
+        offered.error_code != reset->error_code ||
+        offered.reliable_size != reset->reliable_size)
+        return false;
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->stream_ref._v == reset->stream_ref._v &&
+            sg->state == MOQ_SG_TERMINAL_OWED)
+            return sg_claim_terminal_reset(s, (size_t)i);
+    }
+    /* A queued reset or RESET_OWED already has local ownership, with any
+     * outgoing-terminal event committed before this claim. */
+    return true;
 }
 
 void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
@@ -4096,44 +4089,6 @@ void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
     for (; dst < tail; ++dst) {
         memset(&s->actions[dst % s->action_cap], 0, sizeof(*s->actions));
         memset(&s->action_meta[dst % s->action_cap], 0, sizeof(*s->action_meta));
-    }
-}
-
-void bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
-                                      moq_reset_data_action_t *reset)
-{
-    reset->stream_ref = ref;
-    reset->error_code = MOQ_RESET_DELIVERY_TIMEOUT;
-    int slot = sg_find_by_stream_ref(s, ref);
-    if (slot >= 0) {
-        moq_sg_entry_t *sg = &s->subgroups[slot];
-        reset->reliable_size = sg->header_len;
-        if (sg->state == MOQ_SG_RESET_OWED)
-            reset->error_code = sg->owed_reset_code;
-        sg->state = MOQ_SG_RESETTING;
-        sg->streaming_payload_len = sg->streaming_bytes_written = 0;
-        sg->streaming_deadline_us = sg->delivery_deadline_us = UINT64_MAX;
-        sg_recompute_deadline(s);
-    }
-    for (size_t i = s->action_head; i < s->action_tail; ++i) {
-        const moq_action_t *a = &s->actions[i % s->action_cap];
-        if (a->kind == MOQ_ACTION_RESET_DATA &&
-            a->u.reset_data.stream_ref._v == ref._v) {
-            *reset = a->u.reset_data;
-            break;
-        }
-    }
-    /* The bridge now owns this exact close, including when the core slot
-     * already retired. Remove obsolete data and the transferred reset. */
-    bridge_session_discard_reset_data(s, ref);
-    for (size_t i = s->action_head; i < s->action_tail; ++i) {
-        const moq_action_t *a = &s->actions[i % s->action_cap];
-        if (a->kind == MOQ_ACTION_RESET_DATA &&
-            a->u.reset_data.stream_ref._v == ref._v) {
-            moq_action_t taken;
-            action_take(s, i, &taken);
-            moq_action_cleanup(&taken);
-        }
     }
 }
 
@@ -4165,17 +4120,44 @@ bool bridge_session_commit_data_reset(moq_session_t *s,
     return false;
 }
 
+static bool session_take_terminal_action(moq_session_t *s, moq_action_t *out,
+                                          moq_action_meta_t *meta)
+{
+    /* A retained terminal with no queued data can precede its owner's DONE
+     * even when that DONE occupies the last action slot. Commit its event
+     * with the reset, just as the public poll does. */
+    if (!session_is_active(s) || !sg_take_terminal_action(s, out)) return false;
+    memset(meta, 0, sizeof(*meta));
+    meta->deadline_us = UINT64_MAX;
+    meta->outgoing_terminal = true;
+    int slot = sg_find_by_stream_ref(s, out->u.reset_data.stream_ref);
+    if (slot >= 0) {
+        /* The owner itself may already have retired after queuing DONE.
+         * Keep its full handle from the subgroup, without resolving it. */
+        const moq_sg_entry_t *sg = &s->subgroups[slot];
+        meta->owner = moq_subscription_is_valid(sg->sub)
+            ? sg->sub._opaque : sg->pub._opaque;
+    }
+    session_action_poll_settled(s, true);
+    return true;
+}
+
 static bool bridge_session_poll_action_impl(moq_session_t *s, moq_action_t *out,
                                             moq_action_meta_t *meta,
                                             bool data_only)
 {
     session_action_poll_prepare(s);
+    if (!data_only && session_take_terminal_action(s, out, meta))
+        return true;
     if (s->action_head == s->action_tail ||
         (data_only && !action_is_data(&s->actions[s->action_head % s->action_cap]))) {
         if (!data_only) session_action_poll_settled(s, false);
         return false;
     }
     const size_t selected = action_select(s);
+    if (s->action_meta[selected % s->action_cap].terminal_barrier ||
+        action_waits_for_terminal(s, selected))
+        return false;
     *meta = s->action_meta[selected % s->action_cap];
     action_take(s, selected, out);
     out->borrow_epoch = s->borrow_epoch;
@@ -4220,10 +4202,12 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
     moq_action_meta_t *meta, bridge_done_ready_fn ready, void *ctx)
 {
     session_action_poll_prepare(s);
+    if (session_take_terminal_action(s, out, meta)) return true;
     for (size_t i = s->action_head; i < s->action_tail; ++i) {
         const size_t at = i % s->action_cap;
         const uint64_t owner = s->action_meta[at].terminal_owner;
-        if (owner && !ready(ctx, owner)) continue;
+        if (owner && (action_waits_for_terminal(s, i) || !ready(ctx, owner)))
+            continue;
         bool blocked = false;
         for (size_t j = s->action_head; j < i; ++j) {
             const size_t prior = j % s->action_cap;
@@ -4235,6 +4219,8 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
         }
         if (blocked) continue;
         const size_t selected = action_select_from(s, i);
+        if (s->action_meta[selected % s->action_cap].terminal_barrier)
+            return false;
         *meta = s->action_meta[selected % s->action_cap];
         action_take(s, selected, out);
         out->borrow_epoch = s->borrow_epoch;
@@ -4262,6 +4248,7 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
     const size_t send_data_needed = prefix + sizeof(send_data_action_v0_t);
 
     size_t n = 0;
+    bool terminal_blocked = false;
     uint8_t *dst = (uint8_t *)out;
 
     /* Handing an action to the adapter is the handover to the transport: an
@@ -4269,23 +4256,30 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
     session_action_poll_prepare(s);
 
     while (n < cap && s->action_head < s->action_tail) {
-        size_t idx = action_select(s);
-        const moq_action_t *head = &s->actions[idx % s->action_cap];
-
-        if (head->kind == MOQ_ACTION_SEND_DATA &&
-            element_size < send_data_needed)
-            break;
-
         moq_action_t taken;
-        action_take(s, idx, &taken);
+        if (!session_is_active(s) || !sg_take_terminal_action(s, &taken)) {
+            size_t idx = action_select(s);
+            const moq_action_t *head = &s->actions[idx % s->action_cap];
+            if (s->action_meta[idx % s->action_cap].terminal_barrier ||
+                action_waits_for_terminal(s, idx)) {
+                terminal_blocked = true;
+                break;
+            }
+            if (head->kind == MOQ_ACTION_SEND_DATA && element_size < send_data_needed)
+                break;
+            action_take(s, idx, &taken);
+        }
         memset(dst, 0, element_size);
         memcpy(dst, &taken, copy);
         uint64_t epoch = s->borrow_epoch;
         memcpy(dst + offsetof(moq_action_t, borrow_epoch), &epoch, sizeof(epoch));
         dst += element_size;
         n++;
+        if (session_is_active(s)) sg_retry_owed_resets(s);
     }
 
+    if (n == 0 && terminal_blocked)
+        return MOQ_ERR_WOULD_BLOCK;
     if (n == 0 && s->action_head < s->action_tail)
         return MOQ_ERR_ABI_MISMATCH;
 
@@ -4321,6 +4315,8 @@ static size_t event_min_poll_size(uint32_t kind)
         return prefix + MOQ_FILL_GAP_EVENT_V0_SIZE;
     case MOQ_EVENT_FILL_TERMINAL:
         return prefix + MOQ_FILL_TERMINAL_EVENT_V0_SIZE;
+    case MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED:
+        return prefix + MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE;
     default:
         return prefix;
     }
@@ -4485,6 +4481,7 @@ static moq_result_t session_poll_events_impl(moq_session_t *s,
     /* Freed event capacity may let a fill child surface its owed request or
      * terminal (session_fill.c retains them until then). */
     if (n > 0 && session_is_active(s)) {
+        sg_retry_owed_resets(s);
         fill_service(s);
         /* Likewise a malformed Track's cancellation that wanted an event. */
         mt_retry_pending(s);
@@ -4564,20 +4561,13 @@ uint64_t moq_session_peer_auth_token_cache_size(const moq_session_t *s)
         s->peer_setup.max_auth_token_cache_size : 0;
 }
 
-/* Earliest subgroup deadline to *report* to a timer driver.
- *
- * Expired subgroups (deadline <= now) need a delivery-timeout reset. When that
- * reset has already been deferred by a full action queue, a retry backoff is
- * armed (subgroup_retry_deadline_us) and we report it for the expired work so
- * drivers back off instead of spinning a zero-length wait. Subgroups whose
- * deadline is still in the future are always reported on their own schedule --
- * the backoff for expired work must never mask a nearer un-expired deadline.
- * If no subgroup is currently expired, any armed retry field is stale (the
- * blocked subgroup was reset/freed elsewhere) and is ignored. */
+/* Recognized terminal debts use a bounded retry wake. Every unrecognized
+ * timer, due or future, retains its own deadline: one blocked debt must not
+ * postpone recognition of another stream's expiry. */
 static uint64_t reported_subgroup_deadline(const moq_session_t *s)
 {
-    uint64_t earliest_future = UINT64_MAX;
-    uint64_t earliest_expired = UINT64_MAX;
+    uint64_t d = sg_has_terminal_debt(s)
+        ? s->subgroup_retry_deadline_us : UINT64_MAX;
     /* Only a live subgroup carries a deadline, and only those are linked. */
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
 #ifdef MOQ_SESSION_SWEEP_TESTING
@@ -4585,24 +4575,7 @@ static uint64_t reported_subgroup_deadline(const moq_session_t *s)
 #endif
         const moq_sg_entry_t *sg = &s->subgroups[i];
         if (sg->state == MOQ_SG_FREE) continue;
-        if (sg->delivery_deadline_us == UINT64_MAX) continue;
-        if (sg->delivery_deadline_us <= s->last_now_us) {
-            if (sg->delivery_deadline_us < earliest_expired)
-                earliest_expired = sg->delivery_deadline_us;
-        } else if (sg->delivery_deadline_us < earliest_future) {
-            earliest_future = sg->delivery_deadline_us;
-        }
-    }
-
-    uint64_t d = earliest_future;
-    if (earliest_expired != UINT64_MAX) {
-        /* Expired reset work pending: defer to the retry backoff if one is
-         * armed, otherwise report the expired deadline so the driver ticks
-         * promptly to enqueue the reset. */
-        uint64_t due = (s->subgroup_retry_deadline_us != UINT64_MAX)
-                           ? s->subgroup_retry_deadline_us
-                           : earliest_expired;
-        if (due < d) d = due;
+        if (sg->delivery_deadline_us < d) d = sg->delivery_deadline_us;
     }
     return d;
 }

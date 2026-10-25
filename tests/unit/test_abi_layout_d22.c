@@ -329,6 +329,25 @@ PIN_DETAIL(moq_subscribe_tracks_update_request_event_t);
 PIN_DETAIL(moq_namespace_update_result_event_t);
 PIN_DETAIL(moq_ns_sub_update_result_event_t);
 PIN_DETAIL(moq_subscribe_tracks_update_result_event_t);
+PIN_DETAIL(moq_outgoing_subgroup_terminated_event_t);
+PIN_SIZE(moq_outgoing_subgroup_terminated_event_t, 64, 64, 64);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, subgroup, 0, 0, 0);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, sub, 8, 8, 8);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, pub, 16, 16, 16);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, group_id, 24, 24, 24);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, subgroup_id, 32, 32, 32);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, stream_ref, 40, 40, 40);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, error_code, 48, 48, 48);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, cause, 56, 56, 56);
+PIN_AT(moq_outgoing_subgroup_terminated_event_t, _reserved, 60, 60, 60);
+_Static_assert(sizeof(moq_outgoing_subgroup_terminal_cause_t) == 4,
+               "outgoing subgroup terminal cause width");
+_Static_assert(MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE == 0u &&
+               MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING == 1u &&
+               MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT == 2u,
+               "outgoing subgroup terminal cause values");
+_Static_assert(MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE == 64,
+               "outgoing subgroup terminal frozen prefix");
 
 PIN_THROUGH(moq_publish_state_event_t, largest_object, 40, 36, 40, 8, 4, 8);
 PIN_AFTER(moq_publish_state_event_t, largest_object, location);
@@ -420,6 +439,10 @@ PIN_AFTER(moq_simpair_cfg_t, client_defer_subscription_updates,
 /* -- Relay ------------------------------------------------------------------ */
 
 #ifdef ABI_HAVE_RELAY
+_Static_assert(sizeof(moqr_delivery_outcome_t) == 4,
+               "relay delivery outcome width");
+_Static_assert(MOQR_DELIVERY_DISCARDED == 7u,
+               "relay intentional discard outcome value");
 /* Embedded by value in moqr_shards_cfg_t, so it never grows: its sizeof is
  * the one it ends at (pinned exactly below). */
 PIN_THROUGH(moqr_bind_cfg_t, fetch_forward_bytes, 88, 64, 64, 8, 4, 8);

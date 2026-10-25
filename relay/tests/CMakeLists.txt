@@ -216,6 +216,26 @@ if(TARGET moq::sim)
     moqr_test_warnings(test_relay_props_delivery)
     add_test(NAME relay_props_delivery COMMAND test_relay_props_delivery)
     set_tests_properties(relay_props_delivery PROPERTIES TIMEOUT 120 LABELS "relay;sansio")
+    add_executable(test_relay_session_binding_stop test_relay_session_binding_stop.c
+        $<TARGET_OBJECTS:moq-relay-session-binding-harness>
+        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+    target_compile_definitions(test_relay_session_binding_stop PRIVATE MOQR_BIND_TESTING)
+    target_link_libraries(test_relay_session_binding_stop PRIVATE moq::sim moq-relay-policy)
+    moqr_test_warnings(test_relay_session_binding_stop)
+    foreach(draft IN ITEMS 16 18 22)
+        foreach(row IN ITEMS seal continuation siblings no-reopen capacity)
+            string(REPLACE "-" "_" _row "${row}")
+            foreach(disposition IN ITEMS stop control)
+                foreach(load IN ITEMS normal pressure)
+                    set(_test relay_subgroup_stop_d${draft}_${_row}_${disposition}_${load})
+                    add_test(NAME ${_test} COMMAND test_relay_session_binding_stop
+                        ${draft} ${row} ${disposition} ${load})
+                    set_tests_properties(${_test} PROPERTIES TIMEOUT 120
+                        LABELS "relay;sansio;subgroup-stop;d${draft}")
+                endforeach()
+            endforeach()
+        endforeach()
+    endforeach()
     add_test(NAME relay_metadata_lifetime
         COMMAND test_relay_session_binding_metadata --metadata-lifetime)
     add_test(NAME relay_direct_core_publisher

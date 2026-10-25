@@ -3007,20 +3007,33 @@ static void test_end_group_stale_handle(void) {
           for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
     }
 
-    /* end_group should hit STALE_HANDLE from close_subgroup,
-     * clear sg_open + has_sub, and return OK. */
+    /* Ending an already stopped subgroup preserves the live destination. */
     moq_result_t rc = moq_pub_end_group(pub, track,
         moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 0);
+    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 1);
 
-    /* Subsequent write is a no-op (no subscription). */
+    /* A later group still opens a stream and writes its object. */
     moq_rcbuf_t *p2 = NULL;
     moq_rcbuf_create(&alloc, d, 1, &p2);
     rc = moq_pub_write_object(pub, track, 1, 0, p2,
         moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 0);
+    MOQ_TEST_CHECK(moq_pub_active_subscriptions(pub, track) == 1);
+    {
+        moq_action_t acts[8];
+        size_t na = moq_session_poll_actions(moq_simpair_server(sp), acts, 8);
+        unsigned headers = 0, payloads = 0;
+        for (size_t i = 0; i < na; i++) {
+            if (acts[i].kind == MOQ_ACTION_SEND_DATA) {
+                headers += acts[i].u.send_data.header_len != 0;
+                payloads += acts[i].u.send_data.payload != NULL;
+            }
+            moq_action_cleanup(&acts[i]);
+        }
+        MOQ_TEST_CHECK(headers == 2); /* subgroup header and object header */
+        MOQ_TEST_CHECK(payloads == 1);
+    }
     moq_rcbuf_decref(p2);
 
     moq_pub_remove_track(pub, track, moq_simpair_now_us(sp));
@@ -5995,12 +6008,9 @@ static void test_deferred_reject(void) {
     MOQ_TEST_PASS("deferred_reject");
 }
 
-/* resolving a deferred subscribe must not clobber an earlier
- * backpressured accept/reject sitting in the single pending slot. Defer
- * subscribe #1, then backpressure subscribe #2's accept into pub->pending, then
- * resolve_deferred(#1) while the queue is still full. The deferred resolution
- * must NOT overwrite pending (which would orphan #2); it returns WOULD_BLOCK
- * with the deferred still active, so a drain + flush + retry resolves both. */
+/* Resolving one deferred authorizer transfers the decision to its parent
+ * owner even while another parent's ACK is blocked. Flush commits both once,
+ * and the public deferred ID cannot be replayed after transfer. */
 static int g_defer_then_accept_calls = 0;
 static moq_pub_accept_decision_t cb_defer_then_accept(
     void *ctx, const moq_pub_subscribe_info_t *info,
@@ -6027,7 +6037,7 @@ static void feed_control(moq_session_t *from, moq_session_t *to)
         }
 }
 
-static void test_deferred_resolve_no_pending_clobber(void) {
+static void test_deferred_resolution_keeps_multiple_owners(void) {
     test_alloc_state_t as = {0};
     moq_alloc_t alloc = test_allocator(&as);
 
@@ -6096,8 +6106,7 @@ static void test_deferred_resolve_no_pending_clobber(void) {
     moq_announcement_t blk_ann;
     moq_session_publish_namespace(server, &nscfg, 0, &blk_ann);
 
-    /* Subscribe #2 (track t2) -> ACCEPT, but the queue is full -> parked in
-     * pub->pending. */
+    /* Subscribe #2 is accepted into its owner while wire output is full. */
     subcfg.track_name = MOQ_BYTES_LITERAL("t2");
     moq_subscription_t s2;
     moq_session_subscribe(client, &subcfg, 0, &s2);
@@ -6109,24 +6118,21 @@ static void test_deferred_resolve_no_pending_clobber(void) {
           == MOQ_ERR_WOULD_BLOCK); }
     moq_event_cleanup(&ev);
 
-    /* Resolve the deferred #1 while pending(#2) is occupied and the queue full.
-     * Must return WOULD_BLOCK WITHOUT clobbering pending(#2). */
+    /* The decision transfers without overwriting the other parent's owner. */
     MOQ_TEST_CHECK_EQ_INT((int)moq_pub_resolve_deferred(pub, last_deferred,
         last_deferred_id, true, 0, 0), (int)MOQ_ERR_WOULD_BLOCK);
 
-    /* Drain the blocker, flush pending(#2), then retry the deferred(#1). The
-     * deferred must still be active -> MOQ_OK; if it were cleared, #2 would be
-     * orphaned, the retry would be STALE_HANDLE, and only one sub would
-     * survive. */
-    { moq_action_t acts[4]; size_t na;
-      while ((na = moq_session_poll_actions(server, acts, 4)) > 0)
-          for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]); }
-    MOQ_TEST_CHECK_EQ_INT((int)moq_pub_flush(pub, 0), (int)MOQ_OK);
-    { moq_action_t acts[4]; size_t na;
-      while ((na = moq_session_poll_actions(server, acts, 4)) > 0)
-          for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]); }
     MOQ_TEST_CHECK_EQ_INT((int)moq_pub_resolve_deferred(pub, last_deferred,
-        last_deferred_id, true, 0, 0), (int)MOQ_OK);
+        last_deferred_id, true, 0, 0), (int)MOQ_ERR_STALE_HANDLE);
+    moq_result_t rc = MOQ_ERR_WOULD_BLOCK;
+    for (unsigned i = 0; i < 4 && rc == MOQ_ERR_WOULD_BLOCK; i++) {
+        moq_action_t acts[4]; size_t na;
+        while ((na = moq_session_poll_actions(server, acts, 4)) > 0)
+            for (size_t j = 0; j < na; j++) moq_action_cleanup(&acts[j]);
+        rc = moq_pub_flush(pub, 0);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(g_defer_then_accept_calls, 2);
 
     /* Both subscriptions accepted: neither was orphaned. */
     MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track1), 1);
@@ -6144,7 +6150,7 @@ static void test_deferred_resolve_no_pending_clobber(void) {
     moq_session_destroy(client);
     moq_session_destroy(server);
     MOQ_TEST_CHECK(as.balance == 0);
-    MOQ_TEST_PASS("deferred_resolve_no_pending_clobber");
+    MOQ_TEST_PASS("deferred_resolution_keeps_multiple_owners");
 }
 
 /* A track ended before any subscriber must reject a late DIRECT subscribe
@@ -11133,11 +11139,9 @@ static void test_pub_manual_two_track_serialized_no_loss(void) {
     MOQ_TEST_PASS("pub_manual_two_track_serialized_no_loss");
 }
 
-/* handing a second SUBSCRIBE_REQUEST while the pending
- * slot is occupied returns WOULD_BLOCK + IGNORED -- the event is NOT taken
- * (never silently accepted with soon-to-be-invalid borrowed data). A correct
- * serialized caller avoids this by flushing before polling the next event. */
-static void test_pub_manual_pending_blocks_second_ignored(void) {
+/* A second FIFO request has its own bounded owner while the first ACK waits;
+ * both consumed events can be cleaned before output capacity returns. */
+static void test_pub_manual_multiple_owned_answers(void) {
     test_alloc_state_t as; moq_alloc_t alloc; moq_simpair_t *sp;
     simpair_setup(&as, &alloc, &sp);
     moq_session_t *sv = moq_simpair_server(sp);
@@ -11172,8 +11176,7 @@ static void test_pub_manual_pending_blocks_second_ignored(void) {
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     test_session_fill_action_queue(sv);
 
-    /* Poll two SUBSCRIBE_REQUESTs. The first blocks (staged); the second,
-     * with the pending slot occupied, is NOT taken. */
+    /* Poll and transfer both requests while the action queue stays full. */
     moq_event_t e1, e2;
     MOQ_TEST_CHECK(moq_session_poll_events(sv, &e1, 1) == 1);
     MOQ_TEST_CHECK(e1.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
@@ -11187,25 +11190,24 @@ static void test_pub_manual_pending_blocks_second_ignored(void) {
     moq_pub_event_result_t r2 = MOQ_PUB_EVENT_CONSUMED;
     moq_result_t rc2 = moq_pub_handle_event(pub, &e2, moq_simpair_now_us(sp), &r2);
     MOQ_TEST_CHECK(rc2 == MOQ_ERR_WOULD_BLOCK);
-    MOQ_TEST_CHECK(r2 == MOQ_PUB_EVENT_IGNORED);    /* NOT taken */
+    MOQ_TEST_CHECK(r2 == MOQ_PUB_EVENT_CONSUMED);
     moq_event_cleanup(&e1);
     moq_event_cleanup(&e2);
 
-    /* The staged first accept completes on flush; the second was not accepted
-     * (the correct loop would have kept it in the session queue). */
+    /* Repeated bounded drives install both without replaying either event. */
     for (int g = 0; g < 32; g++) {
         moq_result_t rc = moq_pub_flush(pub, moq_simpair_now_us(sp));
         if (rc != MOQ_ERR_WOULD_BLOCK) break;
         manual_drain_actions(sv);
     }
     MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, trackA) +
-                           moq_pub_active_subscriptions(pub, trackB), 1);
+                           moq_pub_active_subscriptions(pub, trackB), 2);
 
     moq_pub_destroy(pub);
     drain_all(sp);
     moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
-    MOQ_TEST_PASS("pub_manual_pending_blocks_second_ignored");
+    MOQ_TEST_PASS("pub_manual_multiple_owned_answers");
 }
 
 /* a blocked (deferred) retained-FETCH snapshot is released AT CLOSE,
@@ -17897,7 +17899,7 @@ int main(void) {
     test_pub_manual_forward_zero_resets_open_subgroup();
     test_pub_manual_publish_family_results();
     test_pub_manual_two_track_serialized_no_loss();
-    test_pub_manual_pending_blocks_second_ignored();
+    test_pub_manual_multiple_owned_answers();
     test_pub_manual_publish_error_matched();
     test_nsterm_unmatched();
     test_nsterm_abi_canary();
@@ -18133,7 +18135,7 @@ int main(void) {
     test_unsubscribed_retires_slot();
     test_deferred_accept();
     test_deferred_reject();
-    test_deferred_resolve_no_pending_clobber();
+    test_deferred_resolution_keeps_multiple_owners();
     test_end_track_rejects_late_subscribe();
     test_end_track_rejects_deferred_subscribe();
     test_deferred_would_block_then_flush();

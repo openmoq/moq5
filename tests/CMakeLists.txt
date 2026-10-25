@@ -857,6 +857,20 @@ if(TARGET moq::sim)
     target_compile_definitions(test_subgroup_stop_after_fin PRIVATE MOQ_SESSION_SWEEP_TESTING)
     add_test(NAME subgroup_stop_after_fin COMMAND test_subgroup_stop_after_fin)
     set_tests_properties(subgroup_stop_after_fin PROPERTIES TIMEOUT 30)
+    foreach(_terminal_test IN ITEMS outgoing_subgroup_terminal bridge_stop_terminal
+                                    bridge_terminal_pressure)
+        add_executable(test_${_terminal_test} unit/test_${_terminal_test}.c)
+        target_link_libraries(test_${_terminal_test} PRIVATE moq-core-test-internals moq::sim)
+        target_compile_definitions(test_${_terminal_test} PRIVATE MOQ_SESSION_SWEEP_TESTING)
+        target_include_directories(test_${_terminal_test} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+        add_test(NAME ${_terminal_test} COMMAND test_${_terminal_test})
+        set_tests_properties(${_terminal_test} PROPERTIES TIMEOUT 30)
+    endforeach()
+    add_executable(test_d18_joining_update_location unit/test_d18_joining_update_location.c)
+    target_link_libraries(test_d18_joining_update_location PRIVATE moq::core moq::sim)
+    add_test(NAME d18_joining_update_location COMMAND test_d18_joining_update_location)
+    set_tests_properties(d18_joining_update_location PROPERTIES TIMEOUT 30)
     add_executable(test_d22_fetch_ok unit/test_d22_fetch_ok.c)
     target_link_libraries(test_d22_fetch_ok PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d22_fetch_ok COMMAND test_d22_fetch_ok)
@@ -1021,6 +1035,26 @@ if(TARGET moq::sim)
     add_executable(test_publisher unit/test_publisher.c)
     target_link_libraries(test_publisher PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME publisher COMMAND test_publisher)
+
+    add_executable(test_publisher_subgroup_terminal unit/test_publisher_subgroup_terminal.c)
+    target_link_libraries(test_publisher_subgroup_terminal PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME publisher_subgroup_terminal COMMAND test_publisher_subgroup_terminal)
+    set_tests_properties(publisher_subgroup_terminal PROPERTIES TIMEOUT 30)
+
+    # The directional pump is private in shared SimPair builds.
+    add_executable(test_publisher_response_ownership
+        unit/test_publisher_response_ownership.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_fault.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_delay.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_hold.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_pump.c)
+    target_link_libraries(test_publisher_response_ownership PRIVATE moq-core-test-internals)
+    target_compile_definitions(test_publisher_response_ownership PRIVATE MOQ_STATIC MOQ_SIM_BUILDING)
+    target_include_directories(test_publisher_response_ownership PRIVATE
+        ${PROJECT_SOURCE_DIR}/sim/include)
+    add_test(NAME publisher_response_ownership COMMAND test_publisher_response_ownership)
+    set_tests_properties(publisher_response_ownership PROPERTIES TIMEOUT 30)
 
     add_executable(test_publisher_admission_v1 unit/test_publisher_admission_v1.c)
     target_link_libraries(test_publisher_admission_v1 PRIVATE moq::core moq::sim)

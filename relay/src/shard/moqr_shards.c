@@ -2223,8 +2223,9 @@ shard_delivery_subgroup_props(r_mgr *m, uint16_t src)
 {
     bool sgp = false, follows_gap = false;
     moqr_reset_desc_t gap_reset;
+    uint32_t list;
     if (moqr_core_internal_delivery_flags(m->core, m->pb[src], &sgp, &follows_gap,
-                                          &gap_reset) != MOQR_OK) {
+                                          &gap_reset, &list) != MOQR_OK) {
         return false;
     }
     return sgp;

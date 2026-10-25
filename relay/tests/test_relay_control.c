@@ -8252,10 +8252,11 @@ take_rec(moqr_core_t *c, moqr_binding_t b, uint64_t now, uint64_t object_id,
     MOQ_TEST_CHECK_EQ_U64(d.notice, MOQR_DELIVERY_NOTICE_NONE);
     MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, object_id);
     bool props = false;
+    uint32_t list = 0;
     *follows_gap = false;
     *gap_reset = moqr_reset_desc_none();
     MOQ_TEST_CHECK(moqr_core_internal_delivery_flags(c, b, &props, follows_gap,
-                                                     gap_reset) == MOQR_OK);
+                                                     gap_reset, &list) == MOQR_OK);
     MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED, now) ==
                    MOQR_OK);
     return failures;

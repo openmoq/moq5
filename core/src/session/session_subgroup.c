@@ -1,6 +1,17 @@
 #include "session_internal.h"
 #include "../bridge/transport_bridge_internal.h"
 
+_Static_assert(sizeof(moq_outgoing_subgroup_terminated_event_t) ==
+               MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE,
+               "outgoing subgroup terminal detail layout");
+_Static_assert(sizeof(moq_outgoing_subgroup_terminated_event_t) <= MOQ_EVENT_DETAIL_MAX,
+               "outgoing subgroup terminal exceeds event reserve");
+_Static_assert(offsetof(moq_outgoing_subgroup_terminated_event_t, cause) == 56 &&
+               offsetof(moq_outgoing_subgroup_terminated_event_t, _reserved) == 60,
+               "outgoing subgroup terminal frozen prefix");
+
+#define MOQ_SG_TERMINAL_RETRY_US 5000
+
 /* Backstop registry feed: max-merge an outbound object's Location
  * into the owning subscription's or publication's reserved record. The facade
  * additionally merges via its own record reference (the authoritative feed);
@@ -88,8 +99,8 @@ moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot)
     return h;
 }
 
-/* Returns slot if handle is valid and state matches, -1 if stale, -2 if
- * handle is valid but in a different state (for WRONG_STATE errors). */
+/* Returns slot on a match, -1 if stale, -2 for another state, and -3 while
+ * the exact handle is frozen behind an unpublished terminal obligation. */
 static int sg_resolve_handle_ex(moq_session_t *s, moq_subgroup_handle_t h,
                                  moq_sg_state_t required)
 {
@@ -101,6 +112,8 @@ static int sg_resolve_handle_ex(moq_session_t *s, moq_subgroup_handle_t h,
     if (tag != s->session_tag) return -1;
     if (slot >= s->sg_cap) return -1;
     if (s->subgroups[slot].generation != gen) return -1;
+    if (s->subgroups[slot].state == MOQ_SG_TERMINAL_OWED &&
+        required != MOQ_SG_TERMINAL_OWED) return -3;
     if (s->subgroups[slot].state != required) return -2;
     return (int)slot;
 }
@@ -133,7 +146,8 @@ void sg_free_entry(moq_session_t *s, size_t slot)
     entries[slot].delivery_deadline_us = UINT64_MAX;
     entries[slot].streaming_deadline_us = UINT64_MAX;
     entries[slot].ovr_has_object = entries[slot].ovr_has_subgroup = false;
-    entries[slot].timeout_expired = false;
+    entries[slot].terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+    entries[slot].terminal_code = 0;
     entries[slot].state = MOQ_SG_FREE;
     entries[slot].generation++;
     /* Clear ownership handles so a reused slot can never be matched by an
@@ -276,84 +290,57 @@ static uint64_t sg_streaming_header_deadline(moq_session_t *s, const moq_sg_entr
     return UINT64_MAX;
 }
 
-void session_expire_queued_data(moq_session_t *s)
+static void sg_terminal_action(moq_session_t *s, const moq_sg_entry_t *sg,
+                                moq_action_t *a)
 {
-    uint64_t now = s->last_now_us;
-    size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
-    /* Untimed actions carry UINT64_MAX, which is due only when the clock
-     * itself reads UINT64_MAX: short of that, an untimed ring has nothing
-     * due. */
-    if (s->action_timed == 0 && now != UINT64_MAX) return;
-    bool any = false;
-    for (size_t i = head; i < tail && !any; i++) {
-#ifdef MOQ_SESSION_SWEEP_TESTING
-        session_work_expiry_search++;
-#endif
-        any = s->action_meta[i % cap].deadline_us <= now;
-    }
-    if (!any) return;
+    memset(a, 0, sizeof(*a));
+    a->kind = MOQ_ACTION_RESET_DATA;
+    a->detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+    a->borrow_epoch = s->borrow_epoch;
+    a->u.reset_data.stream_ref = sg->stream_ref;
+    a->u.reset_data.error_code = sg->terminal_code;
+    a->u.reset_data.reliable_size = sg->header_len;
+}
 
-    /* Drop every expired datagram and, on a subgroup stream, everything from
-     * its first expired object onward; compact the ring in place. The first
-     * dropped action of a stream becomes its DELIVERY_TIMEOUT reset, in the
-     * same place: a reset that took the queue's tail would follow messages
-     * queued after the stream's data -- a PUBLISH_DONE queued behind the
-     * subgroup's FIN among them, which must come after every stream of the
-     * subscription is closed. */
-    size_t w = head;
-    for (size_t r = head; r < tail; r++) {
-#ifdef MOQ_SESSION_SWEEP_TESTING
-        session_work_expiry_compact++;
-#endif
+/* Keep the reset where the obsolete output began. The barrier is private:
+ * poll never transfers it until its event can commit as well. */
+static void sg_latch_terminal(moq_session_t *s, size_t slot,
+                               moq_outgoing_subgroup_terminal_cause_t cause,
+                               uint64_t code, size_t first)
+{
+    moq_sg_entry_t *sg = &s->subgroups[slot];
+    if (sg->state != MOQ_SG_OPEN && sg->state != MOQ_SG_STREAMING &&
+        sg->state != MOQ_SG_CLOSING) return;
+    sg->terminal_cause = cause;
+    sg->terminal_code = code;
+    sg->state = MOQ_SG_TERMINAL_OWED;
+    s->outgoing_terminal_dirty = true;
+    sg->streaming_payload_len = sg->streaming_bytes_written = 0;
+    sg->streaming_deadline_us = sg->delivery_deadline_us = UINT64_MAX;
+    bool barrier = false;
+    size_t w = s->action_head, cap = s->action_cap;
+    for (size_t r = s->action_head; r < s->action_tail; r++) {
         moq_action_t *a = &s->actions[r % cap];
         moq_action_meta_t *m = &s->action_meta[r % cap];
-        bool drop = false;
-        moq_sg_entry_t *reset_sg = NULL;
-        if (a->kind == MOQ_ACTION_SEND_DATAGRAM) {
-            drop = m->deadline_us <= now;
-        } else if (a->kind == MOQ_ACTION_SEND_DATA) {
-            int slot = sg_find_by_stream_ref(s, a->u.send_data.stream_ref);
-            if (slot >= 0) {
-                moq_sg_entry_t *sg = &s->subgroups[slot];
-                if (sg->timeout_expired) drop = true;
-                else if (m->deadline_us <= now) {
-                    sg->timeout_expired = true;
-                    /* Cancellation admitted before expiry already owns the
-                     * cause, even if a full ring left its reset on the
-                     * subgroup rather than in an action slot. */
-                    if (sg->state == MOQ_SG_RESETTING ||
-                        sg->state == MOQ_SG_RESET_OWED) drop = true;
-                    else reset_sg = sg;
-                }
-            }
-        }
-        if (drop) {
+        if (r >= first && a->kind == MOQ_ACTION_SEND_DATA &&
+            a->u.send_data.stream_ref._v == sg->stream_ref._v) {
             session_action_dequeued(s, a, m);
             moq_action_cleanup(a);
-            continue;
-        }
-        if (reset_sg) {
-            const uint64_t owner = m->owner;
-            /* Rewritten in place: it leaves as the expired data and enters
-             * as its stream's reset. */
-            session_action_dequeued(s, a, m);
-            moq_action_cleanup(a);
+            if (barrier) continue;
+            /* Keep its data scheduling identity while unpublished: unrelated
+             * higher-priority data can progress, but this stream's expired
+             * bytes and its later owner terminal cannot cross the barrier. */
             memset(a, 0, sizeof(*a));
-            a->kind = MOQ_ACTION_RESET_DATA;
-            a->detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+            a->kind = MOQ_ACTION_SEND_DATA;
+            a->detail_size = (uint32_t)sizeof(moq_send_data_action_t);
             a->borrow_epoch = s->borrow_epoch;
-            a->u.reset_data.stream_ref = reset_sg->stream_ref;
-            a->u.reset_data.error_code = MOQ_RESET_DELIVERY_TIMEOUT;
-            a->u.reset_data.reliable_size = reset_sg->header_len;
-            memset(m, 0, sizeof(*m));
+            a->u.send_data.stream_ref = sg->stream_ref;
             m->deadline_us = UINT64_MAX;
-            m->owner = owner;
+            m->terminal_barrier = true;
+            m->outgoing_terminal = true;
+            m->subgroup_header = false;
             session_action_enqueued(s, a, m);
-            reset_sg->state = MOQ_SG_RESETTING;
-            reset_sg->streaming_payload_len = 0;
-            reset_sg->streaming_bytes_written = 0;
-            reset_sg->streaming_deadline_us = UINT64_MAX;
-            reset_sg->delivery_deadline_us = UINT64_MAX;
+            barrier = true;
         }
         if (w != r) {
             s->actions[w % cap] = *a;
@@ -362,9 +349,126 @@ void session_expire_queued_data(moq_session_t *s)
         w++;
     }
     s->action_tail = w;
+}
 
+static size_t sg_first_output(const moq_session_t *s, moq_stream_ref_t ref,
+                               bool keep_header)
+{
+    for (size_t i = s->action_head; i < s->action_tail; i++) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind == MOQ_ACTION_SEND_DATA &&
+            a->u.send_data.stream_ref._v == ref._v &&
+            !(keep_header && s->action_meta[i % s->action_cap].subgroup_header))
+            return i;
+    }
+    return s->action_tail;
+}
+
+void session_expire_queued_data(moq_session_t *s)
+{
+    /* Preserve the untimed-ring fast path, including saturated-clock
+     * expiry, while still retrying terminal debt after event admission. */
+    bool due = false;
+    for (size_t i = s->action_head;
+         (s->action_timed != 0 || s->last_now_us == UINT64_MAX) &&
+             i < s->action_tail && !due; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_expiry_search++;
+#endif
+        uint64_t deadline = s->action_meta[i % s->action_cap].deadline_us;
+        due = deadline <= s->last_now_us;
+    }
+    if (!due) {
+        sg_retry_owed_resets(s);
+        return;
+    }
+    for (size_t i = s->action_head; i < s->action_tail; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_expiry_compact++;
+#endif
+        moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind != MOQ_ACTION_SEND_DATA ||
+            s->action_meta[i % s->action_cap].terminal_barrier ||
+            s->action_meta[i % s->action_cap].subgroup_header ||
+            s->action_meta[i % s->action_cap].deadline_us > s->last_now_us)
+            continue;
+        int slot = sg_find_by_stream_ref(s, a->u.send_data.stream_ref);
+        if (slot >= 0 && (s->subgroups[slot].state == MOQ_SG_OPEN ||
+                         s->subgroups[slot].state == MOQ_SG_STREAMING ||
+                         s->subgroups[slot].state == MOQ_SG_CLOSING)) {
+            sg_latch_terminal(s, (size_t)slot,
+                MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT,
+                MOQ_RESET_DELIVERY_TIMEOUT, i);
+        } else if ((slot >= 0 && (s->subgroups[slot].state == MOQ_SG_RESETTING ||
+                                 s->subgroups[slot].state == MOQ_SG_RESET_OWED)) ||
+                   bridge_session_has_queued_data_reset(s, a->u.send_data.stream_ref)) {
+            /* An earlier application/owner reset already won. Drop expired
+             * output behind it without manufacturing a timeout event. */
+            moq_stream_ref_t ref = a->u.send_data.stream_ref;
+            for (size_t j = i; j < s->action_tail; j++) {
+                moq_action_t *later = &s->actions[j % s->action_cap];
+                moq_action_meta_t *m = &s->action_meta[j % s->action_cap];
+                if (later->kind == MOQ_ACTION_SEND_DATA &&
+                    later->u.send_data.stream_ref._v == ref._v) {
+                    session_action_dequeued(s, later, m);
+                    m->deadline_us = 0;
+                    session_action_enqueued(s, later, m);
+                }
+            }
+        }
+    }
+    size_t w = s->action_head;
+    for (size_t r = s->action_head; r < s->action_tail; r++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_expiry_compact++;
+#endif
+        moq_action_t *a = &s->actions[r % s->action_cap];
+        if ((a->kind == MOQ_ACTION_SEND_DATAGRAM ||
+             (a->kind == MOQ_ACTION_SEND_DATA &&
+              !s->action_meta[r % s->action_cap].terminal_barrier &&
+              !s->action_meta[r % s->action_cap].subgroup_header)) &&
+            s->action_meta[r % s->action_cap].deadline_us <= s->last_now_us) {
+            session_action_dequeued(s, a, &s->action_meta[r % s->action_cap]);
+            moq_action_cleanup(a);
+            continue;
+        }
+        if (w != r) {
+            s->actions[w % s->action_cap] = *a;
+            s->action_meta[w % s->action_cap] = s->action_meta[r % s->action_cap];
+        }
+        w++;
+    }
+    s->action_tail = w;
+    sg_retry_owed_resets(s);
+    sg_recompute_deadline(s);
+}
+
+bool sg_has_terminal_debt(const moq_session_t *s)
+{
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
-        s->subgroups[i].timeout_expired = false;
+        if (s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) return true;
+    return false;
+}
+
+bool bridge_session_take_terminal_changes(moq_session_t *s)
+{
+    bool dirty = s->outgoing_terminal_dirty;
+    s->outgoing_terminal_dirty = false;
+    return dirty;
+}
+
+void session_service_outgoing_terminals(moq_session_t *s)
+{
+    session_expire_queued_data(s);
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->delivery_deadline_us != UINT64_MAX &&
+            sg->delivery_deadline_us <= s->last_now_us)
+            sg_latch_terminal(s, (size_t)i,
+                MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT,
+                MOQ_RESET_DELIVERY_TIMEOUT, sg_first_output(s, sg->stream_ref, true));
+    }
+    sg_retry_owed_resets(s);
     sg_recompute_deadline(s);
 }
 
@@ -379,12 +483,30 @@ static void sg_queue_reset(moq_session_t *s, moq_sg_entry_t *sg, uint64_t code)
     a.u.reset_data.error_code = code;
     a.u.reset_data.reliable_size = sg->header_len;
     (void)push_action(s, &a);   /* the caller checked capacity */
+    if (sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE) {
+        /* A pressure claim already published the event. Its compact reset
+         * still precedes the owner's DONE when action capacity returns. */
+        size_t at = s->action_head, last = s->action_tail - 1;
+        for (size_t j = s->action_head; j < last; j++)
+            if (s->action_meta[j % s->action_cap].subgroup_header &&
+                s->actions[j % s->action_cap].u.send_data.stream_ref._v ==
+                    sg->stream_ref._v) at = j + 1;
+        moq_action_meta_t meta = s->action_meta[last % s->action_cap];
+        meta.outgoing_terminal = true;
+        for (size_t j = last; j > at; j--) {
+            s->actions[j % s->action_cap] = s->actions[(j - 1) % s->action_cap];
+            s->action_meta[j % s->action_cap] = s->action_meta[(j - 1) % s->action_cap];
+        }
+        s->actions[at % s->action_cap] = a;
+        s->action_meta[at % s->action_cap] = meta;
+    }
     sg->state = MOQ_SG_RESETTING;
 }
 
 void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep)
 {
     moq_sg_entry_t *sg = &s->subgroups[slot];
+    if (sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE) return;
     sg->streaming_payload_len = 0;
     sg->streaming_bytes_written = 0;
     sg->streaming_deadline_us = UINT64_MAX;
@@ -399,14 +521,212 @@ void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep)
     if (had_deadline) sg_recompute_deadline(s);
 }
 
+static void sg_commit_terminal(moq_session_t *s, size_t slot)
+{
+    moq_sg_entry_t *sg = &s->subgroups[slot];
+    moq_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED;
+    ev.detail_size = MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE;
+    ev.borrow_epoch = s->borrow_epoch;
+    ev.u.outgoing_subgroup_terminated =
+        (moq_outgoing_subgroup_terminated_event_t){
+            .subgroup = sg_make_handle(s, slot),
+            .sub = sg->sub, .pub = sg->pub,
+            .group_id = sg->group_id, .subgroup_id = sg->subgroup_id,
+            .stream_ref = sg->stream_ref, .error_code = sg->terminal_code,
+            .cause = sg->terminal_cause,
+        };
+    (void)push_event(s, &ev);  /* caller reserved capacity; no intervening producer */
+    sg->state = MOQ_SG_RESETTING;
+}
+
+bool bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
+                                      uint64_t now_us,
+                                      moq_reset_data_action_t *reset,
+                                      bool *outgoing_terminal)
+{
+    /* Bridge-retained expiry can be the first due work since the core's
+     * last advance. Stamp retries at recognition without advancing here. */
+    const uint64_t retry_now = now_us > s->last_now_us ? now_us : s->last_now_us;
+    moq_reset_data_action_t value = *reset;
+    value.stream_ref = ref;
+    value.error_code = MOQ_RESET_DELIVERY_TIMEOUT;
+    *outgoing_terminal = false;
+    bool queued = false;
+    for (size_t i = s->action_head;
+         s->action_nondata != 0 && i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind == MOQ_ACTION_RESET_DATA && a->u.reset_data.stream_ref._v == ref._v) {
+            value = a->u.reset_data;
+            *outgoing_terminal = s->action_meta[i % s->action_cap].outgoing_terminal;
+            queued = true;
+            break;
+        }
+    }
+    int slot = sg_find_by_stream_ref(s, ref);
+    if (slot >= 0) {
+        moq_sg_entry_t *sg = &s->subgroups[slot];
+        if (!queued) {
+            /* Freeze production before the entry can reap. An earlier
+             * STOP/application reset remains the first cause. */
+            sg_latch_terminal(s, (size_t)slot,
+                MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT,
+                MOQ_RESET_DELIVERY_TIMEOUT, sg_first_output(s, ref, true));
+            value.reliable_size = sg->header_len;
+            if (sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE)
+                value.error_code = sg->terminal_code;
+            else if (sg->state == MOQ_SG_RESET_OWED)
+                value.error_code = sg->owed_reset_code;
+        }
+        *outgoing_terminal |= sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+        if (sg->state == MOQ_SG_TERMINAL_OWED) {
+            if (event_queue_full(s)) {
+                s->subgroup_retry_deadline_us =
+                    deadline_add(retry_now, MOQ_SG_TERMINAL_RETRY_US);
+                sg_recompute_deadline(s);
+                return false;
+            }
+            /* The bridge already owns the reliable prefix. Commit only the
+             * event here; its reset needs no extra action-ring slot. */
+            sg_commit_terminal(s, (size_t)slot);
+        }
+        sg->state = MOQ_SG_RESETTING;
+        sg->streaming_payload_len = sg->streaming_bytes_written = 0;
+        sg->streaming_deadline_us = sg->delivery_deadline_us = UINT64_MAX;
+        s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
+            ? deadline_add(retry_now, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+        sg_recompute_deadline(s);
+    }
+    /* Transfer an existing reset as well as its obsolete core data. If the
+     * subgroup already reaped, preserve the queued cause and provenance. */
+    bridge_session_discard_reset_data(s, ref);
+    if (queued) {
+        size_t dst = s->action_head, tail = s->action_tail;
+        for (size_t src = s->action_head; src < tail; ++src) {
+            moq_action_t *a = &s->actions[src % s->action_cap];
+            moq_action_meta_t *m = &s->action_meta[src % s->action_cap];
+            if (a->kind == MOQ_ACTION_RESET_DATA && a->u.reset_data.stream_ref._v == ref._v) {
+                session_action_dequeued(s, a, m);
+                moq_action_cleanup(a);
+                continue;
+            }
+            size_t to = dst++ % s->action_cap;
+            if (to != src % s->action_cap) {
+                s->actions[to] = *a;
+                s->action_meta[to] = *m;
+            }
+        }
+        s->action_tail = dst;
+        for (; dst < tail; ++dst) {
+            memset(&s->actions[dst % s->action_cap], 0, sizeof(*s->actions));
+            memset(&s->action_meta[dst % s->action_cap], 0, sizeof(*s->action_meta));
+        }
+    }
+    *reset = value;
+    return true;
+}
+
+bool sg_terminal_reset_ready(const moq_session_t *s, const moq_sg_entry_t *sg)
+{
+    if (sg->state == MOQ_SG_TERMINAL_OWED) {
+        if (event_queue_full(s)) return false;
+    } else if (sg->state != MOQ_SG_RESET_OWED ||
+               sg->terminal_cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE) {
+        return false;
+    }
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        const moq_action_meta_t *m = &s->action_meta[j % s->action_cap];
+        if (a->kind == MOQ_ACTION_SEND_DATA &&
+            (m->terminal_barrier || m->subgroup_header) &&
+            a->u.send_data.stream_ref._v == sg->stream_ref._v)
+            return false;
+    }
+    return true;
+}
+
+bool sg_claim_terminal_reset(moq_session_t *s, size_t slot)
+{
+    moq_sg_entry_t *sg = &s->subgroups[slot];
+    if (sg->state != MOQ_SG_TERMINAL_OWED || !sg_terminal_reset_ready(s, sg))
+        return false;
+    sg_commit_terminal(s, slot);
+    sg->owed_reset_code = sg->terminal_code;
+    sg->state = MOQ_SG_RESET_OWED;
+    s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
+        ? deadline_add(s->last_now_us, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+    return true;
+}
+
+bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        moq_sg_entry_t *sg = &s->subgroups[i];
+        if (!sg_terminal_reset_ready(s, sg)) continue;
+        sg_terminal_action(s, sg, out);
+        if (sg->state == MOQ_SG_TERMINAL_OWED)
+            sg_commit_terminal(s, (size_t)i);
+        else
+            sg->state = MOQ_SG_RESETTING; /* event committed by pressure claim */
+        s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
+            ? deadline_add(s->last_now_us, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
+        return true;
+    }
+    return false;
+}
+
 void sg_retry_owed_resets(moq_session_t *s)
 {
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
         moq_sg_entry_t *sg = &s->subgroups[i];
-        if (sg->state != MOQ_SG_RESET_OWED) continue;
-        if (action_queue_full(s)) return;
-        sg_queue_reset(s, sg, sg->owed_reset_code);
+        if (sg->state == MOQ_SG_TERMINAL_OWED) {
+            if (event_queue_full(s)) continue;
+            size_t barrier = s->action_tail;
+            for (size_t j = s->action_head; j < s->action_tail; j++) {
+                if (s->action_meta[j % s->action_cap].terminal_barrier &&
+                    s->actions[j % s->action_cap].u.send_data.stream_ref._v ==
+                        sg->stream_ref._v) {
+                    barrier = j;
+                    break;
+                }
+            }
+            if (barrier == s->action_tail) {
+                if (action_queue_full(s)) continue;
+                moq_action_t a;
+                sg_terminal_action(s, sg, &a);
+                (void)push_action(s, &a);
+                /* The reset precedes any later owner terminal, but a queued
+                 * subgroup header still has to reach the transport first. */
+                size_t at = s->action_head;
+                for (size_t j = s->action_head; j + 1 < s->action_tail; j++)
+                    if (s->action_meta[j % s->action_cap].subgroup_header &&
+                        s->actions[j % s->action_cap].u.send_data.stream_ref._v ==
+                            sg->stream_ref._v) at = j + 1;
+                size_t last = s->action_tail - 1;
+                moq_action_meta_t meta = s->action_meta[last % s->action_cap];
+                meta.outgoing_terminal = true;
+                for (size_t j = last; j > at; j--) {
+                    s->actions[j % s->action_cap] = s->actions[(j - 1) % s->action_cap];
+                    s->action_meta[j % s->action_cap] = s->action_meta[(j - 1) % s->action_cap];
+                }
+                s->actions[at % s->action_cap] = a;
+                s->action_meta[at % s->action_cap] = meta;
+                barrier = at;
+            }
+            moq_action_t *a = &s->actions[barrier % s->action_cap];
+            moq_action_meta_t *m = &s->action_meta[barrier % s->action_cap];
+            session_action_dequeued(s, a, m);
+            sg_terminal_action(s, sg, a);
+            sg_commit_terminal(s, (size_t)i);
+            m->terminal_barrier = false;
+            session_action_enqueued(s, a, m);
+        } else if (sg->state == MOQ_SG_RESET_OWED && !action_queue_full(s)) {
+            sg_queue_reset(s, sg, sg->owed_reset_code);
+        }
     }
+    s->subgroup_retry_deadline_us = sg_has_terminal_debt(s)
+        ? deadline_add(s->last_now_us, MOQ_SG_TERMINAL_RETRY_US) : UINT64_MAX;
 }
 
 /*
@@ -433,7 +753,17 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
 #endif
         /* A CLOSING entry with an armed deadline is awaiting the transport's
          * commit report for its FIN; it stays until that report or its timer. */
-        if ((s->subgroups[i].state != MOQ_SG_CLOSING &&
+        bool queued_expiry = false;
+        if (s->action_timed != 0 && s->subgroups[i].state == MOQ_SG_CLOSING)
+            for (size_t j = s->action_head; j < s->action_tail; j++)
+                if (s->actions[j % s->action_cap].kind == MOQ_ACTION_SEND_DATA &&
+                    s->actions[j % s->action_cap].u.send_data.stream_ref._v ==
+                        s->subgroups[i].stream_ref._v &&
+                    s->action_meta[j % s->action_cap].deadline_us != UINT64_MAX) {
+                    queued_expiry = true;
+                    break;
+                }
+        if (queued_expiry || (s->subgroups[i].state != MOQ_SG_CLOSING &&
              s->subgroups[i].state != MOQ_SG_RESETTING) ||
             (s->subgroups[i].state == MOQ_SG_CLOSING &&
              s->subgroups[i].delivery_deadline_us != UINT64_MAX)) {
@@ -679,7 +1009,8 @@ moq_result_t moq_session_open_subgroup(
     entry->has_extensions = has_ext;
     entry->streaming_deadline_us = UINT64_MAX;
     entry->ovr_has_object = entry->ovr_has_subgroup = false;
-    entry->timeout_expired = false;
+    entry->terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+    entry->terminal_code = 0;
     /* The subgroup timer uses the negotiated SUBGROUP timeout: the per-type
      * smaller non-zero of the publisher-side (our Track Properties) and
      * subscriber-side (peer parameters / acknowledged updates) values. On
@@ -716,6 +1047,7 @@ moq_result_t moq_session_write_object(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         if (sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING) >= 0)
             return MOQ_ERR_WRONG_STATE;
@@ -800,6 +1132,7 @@ moq_result_t moq_session_write_status_object(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         if (sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING) >= 0)
             return MOQ_ERR_WRONG_STATE;
@@ -888,6 +1221,7 @@ static moq_result_t object_gap_properties(moq_session_t *s,
     *out = NULL;
     if (!s->profile->add_object_gap) return MOQ_ERR_UNSUPPORTED;
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot >= 0) {
         if (cfg->has_prior_group_gap &&
             cfg->prior_group_gap > s->subgroups[slot].group_id)
@@ -955,6 +1289,7 @@ static moq_result_t write_object_ex_impl(moq_session_t *s,
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         if (sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING) >= 0)
             return MOQ_ERR_WRONG_STATE;
@@ -1097,6 +1432,7 @@ moq_result_t moq_session_close_subgroup(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         if (sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING) >= 0)
             return MOQ_ERR_WRONG_STATE;
@@ -1147,6 +1483,7 @@ moq_result_t moq_session_reset_subgroup(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         slot = sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING);
         if (slot == -2) return MOQ_ERR_STALE_HANDLE;
@@ -1189,6 +1526,7 @@ moq_result_t moq_session_begin_object(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         if (sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING) >= 0)
             return MOQ_ERR_WRONG_STATE;
@@ -1264,6 +1602,7 @@ moq_result_t moq_session_begin_object_ex(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle(s, subgroup);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot < 0) {
         if (sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING) >= 0)
             return MOQ_ERR_WRONG_STATE;
@@ -1395,6 +1734,7 @@ moq_result_t moq_session_write_object_data(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot == -2) return MOQ_ERR_WRONG_STATE;
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
 
@@ -1449,6 +1789,7 @@ moq_result_t moq_session_end_object(
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
 
     int slot = sg_resolve_handle_ex(s, subgroup, MOQ_SG_STREAMING);
+    if (slot == -3) return MOQ_ERR_WOULD_BLOCK;
     if (slot == -2) return MOQ_ERR_WRONG_STATE;
     if (slot < 0) return MOQ_ERR_STALE_HANDLE;
 
@@ -2004,6 +2345,27 @@ bool bridge_session_has_queued_data_reset(
     return false;
 }
 
+bool bridge_session_has_data_terminal(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
+        if (s->subgroups[i].stream_ref._v == ref._v &&
+            s->subgroups[i].terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE)
+            return true;
+    for (size_t i = s->action_head; i < s->action_tail; i++)
+        if (s->action_meta[i % s->action_cap].outgoing_terminal &&
+            s->actions[i % s->action_cap].kind == MOQ_ACTION_RESET_DATA &&
+            s->actions[i % s->action_cap].u.reset_data.stream_ref._v == ref._v)
+            return true;
+    return false;
+}
+
+bool bridge_session_is_outgoing_subgroup(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
+        if (s->subgroups[i].stream_ref._v == ref._v) return true;
+    return false;
+}
+
 static moq_result_t session_on_data_stop(moq_session_t *s,
                                          moq_stream_ref_t stream_ref,
                                          uint64_t error_code,
@@ -2012,6 +2374,15 @@ static moq_result_t session_on_data_stop(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    int stopped_slot = sg_find_by_stream_ref(s, stream_ref);
+    if (stopped_slot >= 0 &&
+        (s->subgroups[stopped_slot].state != MOQ_SG_CLOSING ||
+         s->subgroups[stopped_slot].delivery_deadline_us != UINT64_MAX))
+        sg_latch_terminal(s, (size_t)stopped_slot,
+            MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING, error_code,
+            sg_first_output(s, stream_ref, false));
     moq_result_t arc = session_advance_entry(s, now_us);
     if (arc != MOQ_OK) return arc;
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -2024,9 +2395,13 @@ static moq_result_t session_on_data_stop(moq_session_t *s,
         return frc == MOQ_ERR_STALE_HANDLE ? MOQ_OK : frc;
     }
     if (slot >= 0) {
-        if (s->subgroups[slot].state != MOQ_SG_OPEN &&
-            s->subgroups[slot].state != MOQ_SG_STREAMING &&
-            s->subgroups[slot].state != MOQ_SG_CLOSING) return MOQ_OK;
+        sg_latch_terminal(s, (size_t)slot,
+            MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING, error_code,
+            sg_first_output(s, stream_ref, false));
+        sg_retry_owed_resets(s);
+        sg_recompute_deadline(s);
+        return s->subgroups[slot].state == MOQ_SG_TERMINAL_OWED
+            ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
     } else {
         /* Only a bridge-retained subgroup FIN can reach this fallback. A
          * timeout/local reset may already own an action even though the slot
@@ -2043,20 +2418,10 @@ static moq_result_t session_on_data_stop(moq_session_t *s,
     a.borrow_epoch = s->borrow_epoch;
     a.u.reset_data.stream_ref = stream_ref;
     a.u.reset_data.error_code = error_code;
-    a.u.reset_data.reliable_size = slot >= 0
-        ? s->subgroups[slot].header_len : retained_header_len;
+    a.u.reset_data.reliable_size = retained_header_len;
 
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
-    if (slot < 0) return MOQ_OK;
-
-    s->subgroups[slot].state = MOQ_SG_RESETTING;
-    s->subgroups[slot].streaming_payload_len = 0;
-    s->subgroups[slot].streaming_bytes_written = 0;
-    if (s->subgroups[slot].delivery_deadline_us != UINT64_MAX) {
-        s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
-        sg_recompute_deadline(s);
-    }
     return MOQ_OK;
 }
 
@@ -2088,6 +2453,9 @@ moq_result_t moq_session_on_data_committed(moq_session_t *s,
         return MOQ_OK;
     moq_result_t arc = session_advance_entry(s, now_us);
     if (arc != MOQ_OK) return arc;
+    slot = sg_find_by_stream_ref(s, stream_ref);
+    if (slot < 0 || s->subgroups[slot].state != MOQ_SG_CLOSING)
+        return MOQ_OK;
     s->subgroups[slot].delivery_deadline_us = UINT64_MAX;
     sg_recompute_deadline(s);
     return MOQ_OK;

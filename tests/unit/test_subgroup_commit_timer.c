@@ -58,6 +58,36 @@ static size_t drain_events(moq_session_t *s)
     return count;
 }
 
+static void expect_terminal(fixture_t *f, moq_subgroup_handle_t subgroup,
+                             moq_stream_ref_t ref, uint64_t group, bool expired)
+{
+    moq_event_t e;
+    unsigned count = 0;
+    while (moq_session_poll_events(f->sender, &e, 1)) {
+        ++count;
+        expect("sender-event-is-outgoing-terminal", e.kind,
+               MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED);
+        expect("terminal-detail-prefix", e.detail_size,
+               MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE);
+        if (e.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+            e.detail_size >= MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+            const moq_outgoing_subgroup_terminated_event_t *d =
+                &e.u.outgoing_subgroup_terminated;
+            expect("terminal-exact-subgroup", d->subgroup._opaque, subgroup._opaque);
+            expect("terminal-exact-subscription", d->sub._opaque, f->sub._opaque);
+            expect("terminal-exact-publication", d->pub._opaque, f->pub._opaque);
+            expect("terminal-exact-stream", d->stream_ref._v, ref._v);
+            expect("terminal-exact-group", d->group_id, group);
+            expect("terminal-exact-subgroup-id", d->subgroup_id, 0);
+            expect("terminal-timeout-code", d->error_code, MOQ_RESET_DELIVERY_TIMEOUT);
+            expect("terminal-timeout-cause", d->cause,
+                   MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT);
+        }
+        moq_event_cleanup(&e);
+    }
+    expect("exact-terminal-event-count", count, expired ? 1 : 0);
+}
+
 static bool take(moq_session_t *s, moq_event_kind_t kind, moq_event_t *out)
 {
     READY(moq_session_poll_events(s, out, 1) == 1);
@@ -268,6 +298,9 @@ static void timer_row(moq_version_t version, bool publication, unsigned mode)
     moq_subgroup_handle_t a;
     moq_stream_ref_t ar = moq_stream_ref_from_u64(0);
     if (!open_group(&f, 7, 10, &a, &ar) || !write_object(&f, a, ar, 20)) goto done;
+    moq_subgroup_handle_t expired_subgroup = a;
+    moq_stream_ref_t expired_ref = ar;
+    uint64_t expired_group = 7;
     if (mode == 0) {
         expect("no-deadline-before-fin", moq_session_next_deadline_us(f.sender), UINT64_MAX);
         NEED(moq_session_on_data_committed(f.sender, ar, f.base + 30 * MS) == MOQ_OK);
@@ -301,6 +334,9 @@ static void timer_row(moq_version_t version, bool publication, unsigned mode)
             NEED(moq_session_tick(f.sender, f.base + 150 * MS) == MOQ_OK);
             timer_actions(&f, ar, "committed-A-does-not-reset", 0);
             pending = br;
+            expired_subgroup = b;
+            expired_ref = br;
+            expired_group = 8;
             deadline = f.base + 170 * MS;
         }
         NEED(moq_session_tick(f.sender, deadline - 1) == MOQ_OK);
@@ -315,7 +351,7 @@ static void timer_row(moq_version_t version, bool publication, unsigned mode)
     }
     expect("sender-live", moq_session_state(f.sender), MOQ_SESS_ESTABLISHED);
     expect("receiver-live", moq_session_state(f.receiver), MOQ_SESS_ESTABLISHED);
-    expect("no-sender-events", drain_events(f.sender), 0);
+    expect_terminal(&f, expired_subgroup, expired_ref, expired_group, mode != 0);
     expect("no-receiver-events", drain_events(f.receiver), 0);
     if (mode == 2) {
         NEED(moq_session_close(f.sender, 0, NULL, f.base + 210 * MS) == MOQ_OK);

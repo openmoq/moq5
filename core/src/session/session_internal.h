@@ -1320,11 +1320,13 @@ typedef enum moq_sg_state {
     MOQ_SG_CLOSING   = 2,
     MOQ_SG_RESETTING = 3,
     MOQ_SG_STREAMING = 4,
-    /* Ended by a teardown whose action queue had no room left for the
-     * stream's reset: the reset is owed (owed_reset_code) and issued by
-     * session_retry_owed_stream_actions once capacity returns; the entry takes no more
-     * objects and is not reaped until the reset is queued. */
+    /* A reset retained on its entry until action capacity or the bridge's
+     * pressure escape admits it. A nonzero terminal_cause means its terminal
+     * event already committed; owed_reset_code retains that first code.
+     * The entry takes no more objects and is not reaped before handover. */
     MOQ_SG_RESET_OWED = 5,
+    /* First STOP/expiry recognized; event and RESET_DATA are still owed. */
+    MOQ_SG_TERMINAL_OWED = 6,
 } moq_sg_state_t;
 
 typedef struct moq_sg_entry {
@@ -1356,11 +1358,10 @@ typedef struct moq_sg_entry {
      * UINT64_MAX: none running, or (clock at the first payload byte) not yet
      * started. */
     uint64_t               streaming_deadline_us;
-    /* A queued object on this stream has exceeded its OBJECT_DELIVERY_TIMEOUT;
-     * set and consumed within one expiry pass. */
-    bool                   timeout_expired;
     /* MOQ_SG_RESET_OWED: the error code of the reset still owed. */
     uint64_t               owed_reset_code;
+    moq_outgoing_subgroup_terminal_cause_t terminal_cause;
+    uint64_t               terminal_code;
     /*
      * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
      * is allocated (state != FREE / active). Every sweep that used to scan the
@@ -2117,14 +2118,6 @@ void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key);
 
 /* -- Session struct ------------------------------------------------ */
 
-/*
- * Scheduling and timing record of a queued action, kept beside the action
- * ring (same index). Only SEND_DATA and SEND_DATAGRAM carry one; every other
- * kind has a zeroed record and is never reordered. The adapter's poll takes
- * the best schedulable action rather than the oldest (design: Priorities,
- * rules 1-4), and an object whose OBJECT_DELIVERY_TIMEOUT has elapsed is
- * dropped instead of being handed to the transport.
- */
 typedef struct moq_state_location_cell {
     moq_location_filter_cfg_t value;
     size_t next;
@@ -2424,14 +2417,13 @@ struct moq_session {
     uint64_t            goaway_timeout_us;
     uint64_t            goaway_deadline_us;
     uint64_t            subgroup_deadline_us;
-    /* When a subgroup delivery-timeout reset cannot be enqueued because the
-     * action queue is full (transport backpressure), the raw subgroup
-     * deadline above stays expired so the pending reset is not lost. This
-     * holds a bounded retry time in the future so moq_session_next_deadline_us()
-     * reports a deferred deadline instead of the still-expired one -- timer
-     * drivers then sleep until the backoff elapses rather than busy-spinning a
-     * zero-length wait. UINT64_MAX when no reset is deferred. */
+    /* Recognized terminal debt uses a bounded retry wake while action/event
+     * admission is blocked. Unrecognized subgroup deadlines remain separate.
+     * UINT64_MAX when no unpublished outgoing terminal remains. */
     uint64_t            subgroup_retry_deadline_us;
+    /* First outgoing-terminal recognition owes the bridge a prune pass.
+     * Event consumption and reset handover do not acknowledge this latch. */
+    bool                outgoing_terminal_dirty;
     uint64_t            idle_timeout_us;
     uint64_t            idle_deadline_us;
     /* §9.8: configured terminal wait (effective; cfg 0 -> library default)
@@ -2931,6 +2923,26 @@ void session_retry_owed_stops(moq_session_t *s);
 void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep);
 /* The send half: the resets owed by MOQ_SG_RESET_OWED subgroups. */
 void sg_retry_owed_resets(moq_session_t *s);
+/* Recognize queued-object and subgroup expiry, then retry bounded terminal
+ * debts. Does not advance time or invalidate borrows. */
+void session_service_outgoing_terminals(moq_session_t *s);
+bool sg_has_terminal_debt(const moq_session_t *s);
+/* Acknowledge new terminal recognition for bridge queue pruning. Private;
+ * event polling does not clear it, and reset retries do not set it again. */
+bool bridge_session_take_terminal_changes(moq_session_t *s);
+/* Transfer a reset debt directly into a poll slot when the action ring is
+ * full, publishing its event unless already claimed. Never overtakes its header. */
+bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out);
+/* An uncommitted terminal needs event credit; either terminal form must
+ * remain behind its queued subgroup header/barrier. These checks are passive. */
+bool sg_terminal_reset_ready(const moq_session_t *s, const moq_sg_entry_t *sg);
+/* Commit a terminal's event while retaining its reset on the subgroup entry.
+ * Used only after the bridge has admitted the pressure escape. */
+bool sg_claim_terminal_reset(moq_session_t *s, size_t slot);
+/* Revalidate a passive reset offer and claim event/local-reset ownership
+ * before provider calls. False leaves the offer unclaimed. Private bridge SPI. */
+bool bridge_session_claim_data_reset(moq_session_t *s,
+                                      const moq_reset_data_action_t *reset);
 
 /* Index of `ref_v` among the streams stopped without a receive entry, or -1. */
 int rx_stopped_ref_find(const moq_session_t *s, uint64_t ref_v);

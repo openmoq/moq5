@@ -1739,13 +1739,38 @@ static int test_bidi_stop_suspension_preserves_pending(void)
     return failures;
 }
 
+static int observe_data_stop_terminal(const moq_event_t *ev,
+                                      moq_subscription_t owner,
+                                      moq_subgroup_handle_t subgroup,
+                                      moq_stream_ref_t ref, unsigned *count)
+{
+    int failures = 0;
+    if (ev->kind == MOQ_EVENT_SUBGROUP_FINISHED) return 0; /* pressure cell */
+    MOQ_TEST_CHECK(ev->kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED);
+    MOQ_TEST_CHECK(ev->detail_size == MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE);
+    if (ev->kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+        ev->detail_size >= MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+        const moq_outgoing_subgroup_terminated_event_t *d =
+            &ev->u.outgoing_subgroup_terminated;
+        ++*count;
+        MOQ_TEST_CHECK(moq_subgroup_eq(d->subgroup, subgroup));
+        MOQ_TEST_CHECK(moq_subscription_eq(d->sub, owner));
+        MOQ_TEST_CHECK(!moq_publication_is_valid(d->pub));
+        MOQ_TEST_CHECK(d->stream_ref._v == ref._v);
+        MOQ_TEST_CHECK(d->group_id == 0 && d->subgroup_id == 0);
+        MOQ_TEST_CHECK(d->error_code == 0x7);
+        MOQ_TEST_CHECK(d->cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING);
+    }
+    return failures;
+}
+
 /*
  * moq_session_on_data_stop is the local-origin uni arm of the stop family: a
  * peer STOP_SENDING on a stream WE opened. So the client must be the publisher
  * here, which is the reverse of every other fixture in this file.
  *
- * This entry blocks on ACTION capacity, not event capacity -- it answers a stop
- * by enqueuing RESET_DATA -- so the action queue is what has to be full.
+ * Keep unrelated ACTION work queued so dropping obsolete same-stream output
+ * cannot supply the reset's capacity. STOP recognition precedes retry sweeps.
  */
 static int test_data_stop_suspension_preserves_pending(void)
 {
@@ -1809,6 +1834,8 @@ static int test_data_stop_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(e->kind == BRIDGE_STREAM_UNI);
     MOQ_TEST_CHECK(e->origin == BRIDGE_ORIGIN_LOCAL);
     MOQ_TEST_CHECK(e->uni_disp != BRIDGE_UNI_DISP_CONTROL);
+    moq_stream_ref_t stopped_ref = e->ref;
+    unsigned terminal_notices = 0;
 
     /* The subgroup this stream carries must be live, or on_data_stop returns
      * without performing its reset transition at all. */
@@ -1819,16 +1846,25 @@ static int test_data_stop_suspension_preserves_pending(void)
              tp.client->subgroups[i].state == MOQ_SG_STREAMING))
             target = i;
     MOQ_TEST_CHECK(target != SIZE_MAX);
-    moq_sg_state_t target_state = tp.client->subgroups[target].state;
-
-    /* Fill the action queue with one real queued object, never serviced. */
+    /* An unrelated datagram keeps action capacity full through STOP. */
     {
         moq_rcbuf_t *p = NULL;
         moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)"AAA", 3, &p);
-        MOQ_TEST_CHECK(moq_session_write_object(tp.client, sg, 0, p, 0) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_send_object_datagram(
+                           tp.client, csub, 1, 0, 200, false, p, NULL, 0, 0) == MOQ_OK);
         moq_rcbuf_decref(p);
     }
     MOQ_TEST_CHECK(action_queue_full(tp.client));
+
+    /* Otherwise the action poll can commit the reset directly, legitimately
+     * settling STOP before its deferred-input retry reaches the sweep. */
+    while (!event_queue_full(tp.client)) {
+        moq_event_t pressure;
+        memset(&pressure, 0, sizeof(pressure));
+        pressure.kind = MOQ_EVENT_SUBGROUP_FINISHED;
+        pressure.detail_size = sizeof(moq_subgroup_finished_event_t);
+        MOQ_TEST_CHECK(push_event(tp.client, &pressure) == MOQ_OK);
+    }
 
     MOQ_TEST_CHECK(moq_transport_bridge_on_peer_stop_sending(
                        tp.client_bridge, uni_sid, 0x7, 0) == MOQ_ERR_WOULD_BLOCK);
@@ -1858,9 +1894,11 @@ static int test_data_stop_suspension_preserves_pending(void)
     MOQ_TEST_CHECK(e->pending_stop_code == 0x7);
     MOQ_TEST_CHECK(e->active);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
-    /* The stop has not been performed: the subgroup is untouched and no reset
-     * reached the transport. */
-    MOQ_TEST_CHECK(tp.client->subgroups[target].state == target_state);
+    /* Recognition survives suspension; no reset reached the transport. */
+    MOQ_TEST_CHECK(tp.client->subgroups[target].state == MOQ_SG_TERMINAL_OWED);
+    MOQ_TEST_CHECK(tp.client->subgroups[target].terminal_cause ==
+                   MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING);
+    MOQ_TEST_CHECK(tp.client->subgroups[target].terminal_code == 0x7);
     MOQ_TEST_CHECK(tp.client->subgroups[arm].state == MOQ_SG_CLOSING);
     /* The recorder never overflowed, so an absent reset really is absent
      * rather than dropped. */
@@ -1869,14 +1907,22 @@ static int test_data_stop_suspension_preserves_pending(void)
         MOQ_TEST_CHECK(tp.client_ep.ops[i].kind != FAKE_OP_RESET);
 
     fake_endpoint_clear_ops(&tp.client_ep);
+    while (moq_session_poll_events(tp.client, &ev, 1) > 0) {
+        failures += observe_data_stop_terminal(&ev, csub, sg, stopped_ref, &terminal_notices);
+        moq_event_cleanup(&ev);
+    }
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);
+
+    /* The accepted reset no longer needs an inbound retry. A subsequent
+     * advancing call reaps the suspended sweep's terminal entries. */
+    MOQ_TEST_CHECK(moq_session_tick(tp.client, 0) == MOQ_OK);
 
     MOQ_TEST_CHECK(tp.client->subgroups[arm].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->pending_stop);
     MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(tp.client_bridge));
     /* on_data_stop deterministically resets the subgroup, and dispatching that
      * reset deactivates the bridge entry. */
-    MOQ_TEST_CHECK(tp.client->subgroups[target].state == MOQ_SG_RESETTING);
+    MOQ_TEST_CHECK(tp.client->subgroups[target].state == MOQ_SG_FREE);
     MOQ_TEST_CHECK(!e->active);
 
     size_t resets = 0;
@@ -1889,6 +1935,11 @@ static int test_data_stop_suspension_preserves_pending(void)
         MOQ_TEST_CHECK(o->error_code == 0x7);
     }
     MOQ_TEST_CHECK(resets == 1);
+    while (moq_session_poll_events(tp.client, &ev, 1) > 0) {
+        failures += observe_data_stop_terminal(&ev, csub, sg, stopped_ref, &terminal_notices);
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(terminal_notices == 1);
 
     fake_endpoint_clear_ops(&tp.client_ep);
     MOQ_TEST_CHECK(held_bridge_service(tp.client_bridge, 0) == MOQ_OK);

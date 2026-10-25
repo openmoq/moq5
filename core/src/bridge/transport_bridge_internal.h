@@ -135,12 +135,15 @@ typedef struct {
     /* First accepted stream header, classified by the session profile. Zero
      * for non-subgroup streams. Survives zero-timeout core-slot retirement. */
     uint8_t                subgroup_header_len;
-    /* A retained subgroup FIN is being reset; keep its mapping until the
-     * endpoint accepts the reset, and ignore later commit/STOP callbacks. */
+    /* A retained FIN or outgoing terminal is being reset; keep its mapping
+     * until reset acceptance, ignoring later commit/STOP callbacks. */
     bool                   fin_reset_pending;
     /* A pressure-path reset remains in core storage through endpoint refusal,
      * even after discarding its data has relieved the byte pressure. */
     bool                   reset_source_held;
+    /* A core terminal debt owns this outgoing ref, even before its RESET
+     * reaches the bridge. Never retire its mapping on a late ACK. */
+    bool                   data_terminal_received;
     /* Local unidirectional data stream: bytes the endpoint has accepted
      * (header and payload writes). Bounds a reset's reliable size. */
     uint64_t               bytes_sent;
@@ -303,6 +306,7 @@ typedef struct {
     bool                fin_handed;
     /* A reset waiting behind the queued prefix its reliable size covers. */
     bool                has_reset;
+    bool                reset_terminal; /* typed terminal, even before open */
     bool                order_dirty;
     bool                order_active;
     bool                pump_skipped;
@@ -433,6 +437,7 @@ extern uint64_t bridge_work_expiry_slots;  /* slots read, queued-expiry walk */
 extern uint64_t bridge_work_expiry_items;  /* queued items read, same walk */
 extern uint64_t bridge_work_reset_slots;   /* slots read, deferred-reset walk */
 extern uint64_t bridge_work_query_slots;   /* slots read, has_pending's reset walk */
+extern uint64_t bridge_work_terminal_slots; /* slots read, new-terminal prune */
 #endif
 
 /* -- Internal helpers ----------------------------------------------- */
@@ -450,7 +455,7 @@ static inline bool bridge_stream_is_session_control(
            (b->peer_control_open && b->peer_control_stream_id == stream_id);
 }
 
-/* Session-side helpers for the bridge's retained subgroup FIN only. None
+/* Session-side helpers for outgoing subgroup terminals/retained FIN. None
  * is public/exported. The profile owns header classification; the session
  * owns action-capacity admission, including when its subgroup slot was reaped. */
 uint8_t bridge_session_subgroup_header_size(
@@ -465,6 +470,13 @@ moq_result_t bridge_session_on_subgroup_stop(
 /* A reset action retains its stream identity even after its core slot reaps. */
 bool bridge_session_has_queued_data_reset(
     const moq_session_t *s, moq_stream_ref_t ref);
+bool bridge_session_has_data_terminal(const moq_session_t *s, moq_stream_ref_t ref);
+/* Consume only the need to inspect newly recognized terminals. Their event
+ * and reset obligations remain session-owned until ordinary settlement. */
+bool bridge_session_take_terminal_changes(moq_session_t *s);
+bool bridge_session_is_outgoing_subgroup(const moq_session_t *s, moq_stream_ref_t ref);
+/* Service only due outgoing subgroup work, including behind blocked output. */
+moq_result_t bridge_session_service_outgoing(moq_session_t *s, uint64_t now_us);
 
 /* Cancellation under output pressure. The offer is a value copy of the first
  * reset after a data-only run, or an owed reset after a data-only ring. It
@@ -473,6 +485,10 @@ bool bridge_session_has_queued_data_reset(
  * No public polling contract or action layout changes. */
 bool bridge_session_offer_data_reset(moq_session_t *s,
                                      moq_reset_data_action_t *out);
+/* Claim only after pressure/prefix checks: a terminal event and its compact
+ * reset become locally owned together, before any provider reset attempt. */
+bool bridge_session_claim_data_reset(moq_session_t *s,
+                                     const moq_reset_data_action_t *reset);
 void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref);
 bool bridge_session_commit_data_reset(moq_session_t *s,
                                       const moq_reset_data_action_t *reset);
@@ -491,9 +507,14 @@ typedef bool (*bridge_done_ready_fn)(void *ctx, uint64_t owner);
 bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
     moq_action_meta_t *meta, bridge_done_ready_fn ready, void *ctx);
 /* Transfer an expired subgroup's reset debt into its existing bridge owner.
- * No action/event capacity is needed. An earlier reset keeps its cause. */
-void bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
-                                      moq_reset_data_action_t *reset);
+ * No action slot is needed. False retains a terminal waiting for event credit
+ * in the session; do not dispatch its reset yet. The terminal flag is returned
+ * on either outcome. An earlier reset keeps its cause and provenance.
+ * Retry timing uses recognition time now_us; this does not advance the session. */
+bool bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
+                                      uint64_t now_us,
+                                      moq_reset_data_action_t *reset,
+                                      bool *outgoing_terminal);
 
 /* Local receive retirement (session_receive.c): the transport finished with a
  * peer data stream after our accepted STOP_SENDING, and no FIN or RESET for it

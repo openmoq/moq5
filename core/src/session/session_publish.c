@@ -2587,7 +2587,8 @@ static moq_result_t pub_queue_update_done(moq_session_t *s, size_t slot,
 static bool pub_owes_closures(const moq_session_t *s, size_t slot)
 {
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
-        if (s->subgroups[i].state == MOQ_SG_RESET_OWED &&
+        if ((s->subgroups[i].state == MOQ_SG_RESET_OWED ||
+             s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) &&
             moq_publication_is_valid(s->subgroups[i].pub) &&
             moq_publication_eq(s->publishes[slot].handle, s->subgroups[i].pub))
             return true;
@@ -3414,6 +3415,8 @@ moq_result_t moq_session_finish_publish(
 
     for (size_t i = 0; i < s->sg_cap; i++) {
         moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->state == MOQ_SG_TERMINAL_OWED && moq_publication_eq(sg->pub, pub))
+            return MOQ_ERR_WOULD_BLOCK;
         if (sg->state == MOQ_SG_FREE || sg->state == MOQ_SG_CLOSING ||
             sg->state == MOQ_SG_RESETTING)
             continue;
@@ -3625,7 +3628,8 @@ moq_result_t moq_session_open_pub_subgroup(
     entry->delivery_deadline_us = UINT64_MAX;
     entry->streaming_deadline_us = UINT64_MAX;
     entry->ovr_has_object = entry->ovr_has_subgroup = false;
-    entry->timeout_expired = false;
+    entry->terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+    entry->terminal_code = 0;
     /* Saturates at the profile's unknown Stream Count, which every
      * PUBLISH_DONE clamps to anyway. */
     if (s->publishes[pub_slot].subgroup_streams_opened <

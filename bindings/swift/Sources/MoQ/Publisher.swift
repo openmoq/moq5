@@ -241,8 +241,12 @@ public final class Publisher {
 
     // MARK: - Tick
 
-    /// Process pending session events, dispatch subscribe requests,
-    /// and fire any lifecycle callbacks.
+    /// Process one bounded FIFO event pass and retry owned work before and
+    /// after it, firing lifecycle callbacks synchronously. This is the
+    /// session's sole event consumer; do not also poll its events directly.
+    /// On every draft, `MoQError.wouldBlock` means staged work remains.
+    /// Drain transport actions and retry in driver rounds; yield when nothing
+    /// progresses instead of spinning until tick succeeds.
     public func tick(now: UInt64) throws {
         try MoQError.check(moq_pub_tick(raw, now))
     }

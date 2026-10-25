@@ -1071,6 +1071,228 @@ test_ready_capacity(void)
     return failures;
 }
 
+/* Discard must clear both begun ledgers even after STALLED or Forward=0
+ * released the pin, and must leave another subscription's held pin intact. */
+static int
+test_discard_accounting(void)
+{
+    int failures = 0;
+    for (unsigned mode = 0; mode < 5; mode++) {
+        ca_t a;
+        ca_init(&a);
+        moqr_core_t *c = mkcore(&a, 4, 8);
+        MOQ_TEST_CHECK(c != NULL);
+        if (c == NULL) return failures;
+        moqr_binding_t pub, bh;
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 10, &pub) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_binding_open(c, 11, &bh) == MOQR_OK);
+        moq_bytes_t nsb[2];
+        MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+        uint64_t cookie = 100;
+        moqr_sub_t target[1], sibling[1];
+        moqr_track_t t = mk_active_track(c, nsb, "target", &bh, NULL,
+                                         target, 1, &cookie);
+        moqr_track_t u = mk_active_track(c, nsb, "sibling", &bh, NULL,
+                                         sibling, 1, &cookie);
+        MOQ_TEST_CHECK(moqr_track_is_valid(t) && moqr_track_is_valid(u));
+        moqr_trace_t *trace = NULL;
+        MOQ_TEST_CHECK(moqr_trace_create(&a.vt, 64, &trace) == MOQR_OK);
+        c->trace = trace;
+        MOQ_TEST_CHECK(ing_open(c, t, 1, 0, 32) == MOQR_OK);
+        MOQ_TEST_CHECK(ing_chunk(c, &a, t, 1, 0, 0xA1) == MOQR_OK);
+        moqr_delivery_t d;
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 2, &d) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_sub_eq(d.sub, target[0]));
+        MOQ_TEST_CHECK(moqr_core_delivery_note_emitted(c, bh,
+                                                       mode == 3 ? 0 : 1,
+                                                       2) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh,
+            mode == 1 ? MOQR_DELIVERY_STALLED : MOQR_DELIVERY_WOULD_BLOCK,
+            2) == MOQR_OK);
+        r_binding_t *b = binding_resolve(c, bh, NULL);
+        r_sub_t *s = sub_resolve(c, target[0], NULL);
+        MOQ_TEST_CHECK_EQ_U64(s->begun_count, 1);
+        MOQ_TEST_CHECK_EQ_U64(b->begun_subs, 1);
+        if (mode == 1) {
+            MOQ_TEST_CHECK(!b->out_active && b->pin_chunk_count == 0);
+            MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 3, &d) == MOQR_DONE);
+        }
+        if (mode == 2) {
+            MOQ_TEST_CHECK(moqr_core_sub_set_forward(c, target[0], false, 3) == MOQR_OK);
+            MOQ_TEST_CHECK(!b->out_active && b->pin_chunk_count == 0);
+            MOQ_TEST_CHECK(ing_open(c, u, 2, 0, 32) == MOQR_OK);
+            MOQ_TEST_CHECK(ing_chunk(c, &a, u, 2, 0, 0xB2) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 3, &d) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_sub_eq(d.sub, sibling[0]));
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_WOULD_BLOCK,
+                                                   3) == MOQR_OK);
+        }
+        bool retired = true, more = true;
+        MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+            c, pub, target[0], 1, 0, 0, 1, 4, &retired, &more) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+            c, bh, target[0], 1, 99, 0, 1, 4, &retired, &more) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK_EQ_U64(s->begun_count, 1);
+        if (mode == 4) {
+            MOQ_TEST_CHECK(moqr_log_evict_groups(c->tracks[s->track].log, 1) == 1);
+            const moq_rcbuf_t *held = NULL;
+            uint64_t held_len = 0;
+            MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, bh, 0, &held, &held_len) == MOQR_OK);
+            MOQ_TEST_CHECK(held_len == 16 && moq_rcbuf_data(held)[0] == 0xA1);
+        }
+        MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+            c, bh, target[0], 1, 0, 0, 1, 4, &retired, &more) == MOQR_OK);
+        MOQ_TEST_CHECK(retired == (mode == 4) && !more);
+        MOQ_TEST_CHECK_EQ_U64(s->begun_count, 0);
+        MOQ_TEST_CHECK_EQ_U64(b->begun_subs, 0);
+        MOQ_TEST_CHECK_EQ_U64(c->delivered_total, 0);
+        moqr_trace_rec_t records[64];
+        size_t n = moqr_trace_read(trace, records, 64);
+        unsigned discarded = 0, delivered = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (records[i].kind == MOQR_TRACE_CURSOR_SKIP && records[i].detail == 2) {
+                discarded++;
+            }
+            if (records[i].kind == MOQR_TRACE_DELIVERY && records[i].detail == 0) {
+                delivered++;
+            }
+        }
+        MOQ_TEST_CHECK(discarded == 1 && delivered == 0);
+        if (mode != 4) {
+            moqr_record_view_t source;
+            MOQ_TEST_CHECK(moqr_log_read_rec(c->tracks[s->track].log, 1, 0, 0,
+                                             &source) == MOQR_OK);
+            MOQ_TEST_CHECK(source.obj_state == MOQR_OBJ_OPEN && source.chunk_count == 1);
+        }
+        if (mode == 2) {
+            MOQ_TEST_CHECK(b->out_active && b->pin_chunk_count == 1);
+            MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 5, &d) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_sub_eq(d.sub, sibling[0]));
+            const moq_rcbuf_t *chunk = NULL;
+            uint64_t len = 0;
+            MOQ_TEST_CHECK(moqr_core_delivery_chunk(c, bh, 0, &chunk, &len) == MOQR_OK);
+            MOQ_TEST_CHECK(len == 16 && moq_rcbuf_data(chunk)[0] == 0xB2);
+            MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DISCARDED,
+                                                   5) == MOQR_OK);
+        } else {
+            MOQ_TEST_CHECK(!b->out_active && b->pin_chunk_count == 0);
+        }
+        /* Later source abandonment must not demand a second downstream reset. */
+        if (mode != 4) {
+            MOQ_TEST_CHECK(moqr_core_abandon_record(c, t, 1, 0, 0, rd_wire(1)) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, t, 2) == MOQR_OK);
+            /* A source watermark leaves this cached key servable. Its floor
+             * covers absent groups, not this retained position. */
+            MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+                c, bh, target[0], 1, 0, 0, 1, 6, &retired, &more) == MOQR_OK);
+            MOQ_TEST_CHECK(!retired && !more);
+            moqr_record_view_t retained;
+            MOQ_TEST_CHECK(moqr_log_read_rec(c->tracks[s->track].log, 1, 0, 0,
+                                             &retained) == MOQR_OK);
+            MOQ_TEST_CHECK(moqr_log_evict_groups(c->tracks[s->track].log, 1) == 1);
+        }
+        MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+            c, bh, target[0], 1, 0, 0, 1, 6, &retired, &more) == MOQR_OK);
+        MOQ_TEST_CHECK(retired && !more);
+        uint64_t sweeps = c->evict_sweeps;
+        MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 7, &d) == MOQR_OK);
+        MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_EVICT_WATERMARK);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DISCARDED,
+                                               7) == MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DELIVERED,
+                                               7) == MOQR_OK);
+        MOQ_TEST_CHECK_EQ_U64(c->evict_sweeps, sweeps);
+        MOQ_TEST_CHECK(sub_resolve(c, target[0], NULL) != NULL);
+        MOQ_TEST_CHECK_EQ_U64(c->delivered_total, 0);
+        moqr_core_destroy(c);
+        moqr_trace_destroy(trace);
+        MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    }
+    MOQ_TEST_PASS("discard_accounting");
+    return failures;
+}
+
+static bool
+eligible_except_cookie(void *ctx, uint64_t cookie, const moqr_record_view_t *rec)
+{
+    (void)rec;
+    return cookie != *(const uint64_t *)ctx;
+}
+
+/* A lower-priority stopped list has buffered records before its seal is
+ * eligible. Keyed maintenance must consume them without selecting the fresh
+ * high-priority record, and a notice must still receive its ordinary ack. */
+static int
+test_discard_maintenance(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 4, 8);
+    MOQ_TEST_CHECK(c != NULL);
+    if (c == NULL) return failures;
+    moqr_binding_t pub, bh;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 10, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 11, &bh) == MOQR_OK);
+    moq_bytes_t nsb[2];
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    uint64_t cookie = 100;
+    moqr_sub_t low[1], high[1], healthy[1];
+    moqr_track_t t = mk_active_track(c, nsb, "low", &bh, NULL, low, 1, &cookie);
+    moqr_track_t u = mk_active_track(c, nsb, "high", &bh, NULL, high, 1, &cookie);
+    moqr_track_t v = mk_active_track(c, nsb, "healthy", &bh, NULL, healthy, 1, &cookie);
+    sub_resolve(c, low[0], NULL)->subscriber_priority = 200;
+    sub_resolve(c, high[0], NULL)->subscriber_priority = 10;
+    sub_resolve(c, healthy[0], NULL)->subscriber_priority = 20;
+    uint64_t blocked_cookie = sub_resolve(c, high[0], NULL)->cookie;
+    for (uint64_t i = 0; i < 3; i++) MOQ_TEST_CHECK(ing(c, &a, t, 1, i) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 1, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, u, 2, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, v, 3, 0) == MOQR_OK);
+    bool retired = false, more = false;
+    MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+        c, bh, low[0], 1, 0, 0, 1, 2, &retired, &more) == MOQR_OK);
+    MOQ_TEST_CHECK(!retired && more);
+    MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+        c, bh, low[0], 1, 0, 0, 2, 2, &retired, &more) == MOQR_OK);
+    MOQ_TEST_CHECK(!retired && !more);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 3, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_sub_eq(d.sub, high[0]) && d.notice == MOQR_DELIVERY_NOTICE_NONE);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_REFUSED_UNBEGUN, 3) == MOQR_OK);
+    /* Among eligible work a healthy record keeps its priority over the
+     * lower-priority releasing seal. No new ingest/wake occurs here. */
+    MOQ_TEST_CHECK(moqr_core_internal_next_eligible(c, bh, 3, &d,
+        eligible_except_cookie, &blocked_cookie) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_sub_eq(d.sub, healthy[0]) && d.notice == MOQR_DELIVERY_NOTICE_NONE);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DELIVERED, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_internal_next_eligible(c, bh, 3, &d,
+        eligible_except_cookie, &blocked_cookie) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_sub_eq(d.sub, low[0]) && d.notice == MOQR_DELIVERY_NOTICE_SEAL);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DISCARDED, 3) == MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DELIVERED, 3) == MOQR_OK);
+    /* A seal ack does not prove key retirement. A later upstream lifetime of
+     * the same key must also be discardable, and owe its own seal ack. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c, t, 1, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_internal_discard_subgroup(
+        c, bh, low[0], 1, 0, 0, 1, 4, &retired, &more) == MOQR_OK);
+    MOQ_TEST_CHECK(!retired && !more);
+    MOQ_TEST_CHECK(moqr_core_internal_next_eligible(c, bh, 4, &d,
+        eligible_except_cookie, &blocked_cookie) == MOQR_OK);
+    MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_SEAL && moqr_sub_eq(d.sub, low[0]));
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DELIVERED, 4) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->delivered_total, 1);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, bh, 5, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_sub_eq(d.sub, high[0]));
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, bh, MOQR_DELIVERY_DELIVERED, 5) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->delivered_total, 2);
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("discard_maintenance");
+    return failures;
+}
+
 int
 main(void)
 {
@@ -1087,6 +1309,8 @@ main(void)
     failures += test_ready_pseudo_filtered();
     failures += test_ready_close_reuse();
     failures += test_ready_capacity();
+    failures += test_discard_accounting();
+    failures += test_discard_maintenance();
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

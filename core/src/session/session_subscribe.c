@@ -333,9 +333,8 @@ static void sub_free_entry(moq_session_t *s, size_t slot)
     /* A reused slot starts uncancelled, with no peer-direction terminal. */
     e->cancel_pending = false;
     e->req_recv_reset = false;
-    /* Clear the cached largest-object location so a reused slot can never carry
-     * a prior subscription's largest state into a joining FETCH (only
-     * SUBSCRIBE_OK / accept stamps current largest, and only at ESTABLISHED). */
+    /* Clear the saved Joining Location so a reused slot cannot carry a prior
+     * subscription's establishment or resume-ACK snapshot into a FETCH. */
     e->has_largest = false;
     e->largest_group = 0;
     e->largest_object = 0;
@@ -3465,6 +3464,14 @@ moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
     ev.u.subscription_update_ok.expires_ms = has_expires ? expires_ms : 0;
     moq_result_t rc = push_event(s, &ev);
     if (rc < 0) return rc;   /* retryable; update_pending still set */
+    /* Draft-18 §3.3.1: only a Forward 0 -> 1 ACK replaces the Joining
+     * Location. Preserve its exact presence and coordinates, not history. */
+    if (s->profile->version == MOQ_VERSION_DRAFT_18 &&
+        e->update_has_forward && !e->forward && e->update_forward) {
+        e->has_largest = has_largest;
+        e->largest_group = has_largest ? largest_group : 0;
+        e->largest_object = has_largest ? largest_object : 0;
+    }
     /* Merge the peer-advertised Largest into the registry. */
     if (has_largest && e->hist)
         track_hist_merge(e->hist, largest_group, largest_object);
@@ -3972,6 +3979,14 @@ static void sub_update_commit(moq_session_t *s, size_t slot, const moq_sub_updat
 {
     moq_sub_entry_t *e = &s->subs[slot];
     memset(&e->update_snapshot, 0, sizeof(e->update_snapshot));
+    /* Draft-18 §3.3.1: commit the same snapshot encoded into the ACK, only
+     * once the response can no longer fail and Forward changes 0 -> 1. */
+    if (s->profile->version == MOQ_VERSION_DRAFT_18 &&
+        u->has_forward && !e->forward && u->forward) {
+        e->has_largest = p->snap_has;
+        e->largest_group = p->snap_has ? p->snap_group : 0;
+        e->largest_object = p->snap_has ? p->snap_object : 0;
+    }
     if (u->has_forward)
         e->forward = u->forward;
     if (sub_update_priority_slots(s, e, u))
@@ -4289,7 +4304,8 @@ static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot,
 static bool sub_owes_closures(const moq_session_t *s, size_t slot)
 {
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
-        if (s->subgroups[i].state == MOQ_SG_RESET_OWED &&
+        if ((s->subgroups[i].state == MOQ_SG_RESET_OWED ||
+             s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) &&
             moq_subscription_eq(s->subs[slot].handle, s->subgroups[i].sub))
             return true;
     return fill_parent_actions_needed(s, fill_parent_sub(s, slot)) > 0;
@@ -5928,6 +5944,8 @@ moq_result_t moq_session_done_subscribe(
      * is impossible, and leaving it unanswered is not allowed (§9.5). */
     if (e->owed_update.owed) return MOQ_ERR_WRONG_STATE;
     for (size_t i = 0; i < s->sg_cap; i++) {
+        if (s->subgroups[i].state == MOQ_SG_TERMINAL_OWED &&
+            moq_subscription_eq(s->subgroups[i].sub, sub)) return MOQ_ERR_WOULD_BLOCK;
         if (s->subgroups[i].state != MOQ_SG_OPEN &&
             s->subgroups[i].state != MOQ_SG_STREAMING)
             continue;

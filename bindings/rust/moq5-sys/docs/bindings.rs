@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: 974398eb0065 (native headers modified in the worktree)
+// libmoq commit: c92fa3d2abcb (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -144,6 +144,7 @@ pub const MOQ_EVENT_SUBSCRIBE_TRACKS_UPDATE_REQUEST: u32 = 62;
 pub const MOQ_EVENT_NAMESPACE_UPDATE_RESULT: u32 = 63;
 pub const MOQ_EVENT_NS_SUB_UPDATE_RESULT: u32 = 64;
 pub const MOQ_EVENT_SUBSCRIBE_TRACKS_UPDATE_RESULT: u32 = 65;
+pub const MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED: u32 = 66;
 pub const MOQ_SUBSCRIBE_FILTER_NONE: u32 = 0;
 pub const MOQ_SUBSCRIBE_FILTER_NEXT_GROUP: u32 = 1;
 pub const MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT: u32 = 2;
@@ -189,6 +190,10 @@ pub const MOQ_SUBSCRIPTION_ADMISSION_OBJECT_DELIVERY_TIMEOUT: u32 = 4;
 pub const MOQ_SUBSCRIPTION_ADMISSION_SUBGROUP_DELIVERY_TIMEOUT: u32 = 8;
 pub const MOQ_SUBSCRIPTION_ADMISSION_RENDEZVOUS_TIMEOUT: u32 = 16;
 pub const MOQ_SUBSCRIPTION_ADMISSION_OPTIONS_V0_SIZE: u32 = 72;
+pub const MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE: u32 = 0;
+pub const MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING: u32 = 1;
+pub const MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT: u32 = 2;
+pub const MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE: u32 = 64;
 pub const MOQ_NAMESPACE_TERMINAL_PEER_FIN_COMPLETE: u32 = 1;
 pub const MOQ_NAMESPACE_TERMINAL_PEER_RESET_STREAM: u32 = 2;
 pub const MOQ_NAMESPACE_TERMINAL_PEER_STOP_SENDING: u32 = 3;
@@ -1236,7 +1241,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Notify the session that the peer sent STOP_SENDING on a data stream\n we opened. Queues RESET_DATA (the adapter must send RESET_STREAM)\n and transitions the outgoing subgroup to RESETTING.\n\n Advancing call: invalidates borrows, takes now_us."]
+    #[doc = " Notify the session that the peer sent STOP_SENDING on a data stream\n we opened. Records the first STOP cause/code and freezes that exact outgoing\n subgroup before attempting output. Queues RESET_DATA together with\n OUTGOING_SUBGROUP_TERMINATED when both output queues admit them. MOQ_OK means\n committed (or already terminal/unknown); MOQ_ERR_WOULD_BLOCK retains the\n obligation and its identity, even though no action/event has committed yet.\n Writes, object end, close and reset on the pending subgroup return\n MOQ_ERR_WOULD_BLOCK without retaining payload refs. Draining either queue\n retries the obligation; a later STOP/expiry/ACK cannot replace its cause.\n MOQ_ERR_INVAL: NULL session or error_code greater than 2^62 - 1.\n MOQ_ERR_CLOSED: inactive session. No caller payload ownership is taken.\n\n Advancing call: invalidates borrows, takes now_us."]
     pub fn moq_session_on_data_stop(
         s: *mut moq_session_t,
         stream_ref: moq_stream_ref_t,
@@ -1246,7 +1251,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Report that a data stream we opened has reached the transport's \"all data\n committed\" state: every byte up to and including its FIN has been\n acknowledged by the peer. A subgroup whose SUBGROUP_DELIVERY_TIMEOUT runs\n from its FIN stops its timer here instead of resetting the stream when it\n expires. The transport, not the session, knows this fact; adapters report\n it through moq_transport_bridge_on_local_stream_committed().\n\n Advancing when a subgroup was awaiting the report; a report for any other\n stream changes nothing and returns MOQ_OK."]
+    #[doc = " Report that a data stream we opened has reached the transport's \"all data\n committed\" state: every byte up to and including its FIN has been\n acknowledged by the peer. A subgroup whose SUBGROUP_DELIVERY_TIMEOUT runs\n from its FIN stops its timer here instead of resetting the stream when it\n expires. The transport, not the session, knows this fact; adapters report\n it through moq_transport_bridge_on_local_stream_committed().\n\n Advancing when a subgroup was awaiting the report; a report for any other\n stream changes nothing and returns MOQ_OK. A recognized STOP or delivery\n expiry retains its reset obligation even if this report arrives before\n event/action capacity permits committing it."]
     pub fn moq_session_on_data_committed(
         s: *mut moq_session_t,
         stream_ref: moq_stream_ref_t,
@@ -1774,7 +1779,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Size-aware drain of pending actions.\n\n Returns MOQ_OK on success (including 0 actions and partial drains).\n Returns MOQ_ERR_INVAL if element_size < fixed prefix.\n Returns MOQ_ERR_ABI_MISMATCH if the head action carries owned\n   resources (e.g. SEND_DATA with rcbuf payload) and element_size\n   is too small to hold it. Queue is left untouched.\n\n If a prefix of non-owned actions can be drained but the next action\n is too large, returns MOQ_OK with the partial count and leaves the\n owned action queued for a later full-size poll.\n\n Owned SEND_DATA payload refs transfer to the caller on poll.\n Caller MUST call moq_action_cleanup after processing each action.\n\n Order: data actions (SEND_DATA, SEND_DATAGRAM) queued ahead of the next\n action of any other kind come out as the scheduling algorithm places\n them: the higher subscriber priority first, then the higher publisher\n priority, then within one request the subscription's group order between\n groups, and within a group the fill-delivered object, a datagram before a\n subgroup object, and the lowest Subgroup ID or Object ID. Actions on one\n stream keep their relative order; ties keep queue order; every other kind\n of action holds its place and data queued after it does not overtake it.\n\n A queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at the session's\n current time is never handed over: a datagram is dropped, and a subgroup\n object is dropped together with the rest of its stream's queued data and\n the stream is reset with DELIVERY_TIMEOUT (a RESET_DATA is queued and\n polled in turn).\n\n Observing (does not invalidate borrows)."]
+    #[doc = " Size-aware drain of pending actions.\n\n Returns MOQ_OK on success (including 0 actions and partial drains).\n Returns MOQ_ERR_INVAL for NULL required arguments or if element_size is\n smaller than the fixed prefix. With cap == 0, returns OK without draining.\n Returns MOQ_ERR_ABI_MISMATCH with *out_count == 0 if the selected SEND_DATA\n cannot fit its frozen v0 detail (including its owned payload reference).\n That action stays queued; retry with a full-sized element.\n Returns MOQ_ERR_WOULD_BLOCK with *out_count == 0 if the selected outgoing\n terminal barrier, or its owner's queued DONE, must wait for terminal-event\n capacity. Available action capacity and full-sized elements do not resolve\n this wait. Poll and dispatch/cleanup events to return notification credit,\n continue driving both output queues and deadlines, then retry actions.\n\n If any actions transfer before the next selected action is too large or\n blocked as above, returns MOQ_OK with that partial count and leaves the\n selected action queued. Only the reported elements are written. No action\n transfers on WOULD_BLOCK or ABI_MISMATCH; expiry/retained-debt housekeeping\n may still progress. After a partial drain, the next poll reports any\n remaining wait. Owned actions in a partial result require normal cleanup.\n\n Owned SEND_DATA payload refs transfer to the caller on poll.\n Caller MUST call moq_action_cleanup after processing each action.\n\n Order: data actions (SEND_DATA, SEND_DATAGRAM) queued ahead of the next\n action of any other kind come out as the scheduling algorithm places\n them: the higher subscriber priority first, then the higher publisher\n priority, then within one request the subscription's group order between\n groups, and within a group the fill-delivered object, a datagram before a\n subgroup object, and the lowest Subgroup ID or Object ID. Actions on one\n stream keep their relative order; ties keep queue order; every other kind\n of action holds its place and data queued after it does not overtake it,\n except for the outgoing terminal reset ordering below.\n\n A queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at the session's\n current time is never handed over: a datagram is dropped, and a subgroup\n object is dropped together with the rest of its stream's queued data and\n the stream is reset with DELIVERY_TIMEOUT. An outgoing subgroup terminal\n reset commits together with its typed event. Its RESET_DATA may replace\n obsolete queued data or transfer directly from retained debt before an\n already-queued non-data action, but never before its own queued reliable\n subgroup header. An owner's queued DONE cannot transfer while that exact\n owner's reset/event debt remains unpaid, including after FIN was polled\n and the owner slot was freed/reused. Unrelated work otherwise retains the\n scheduling and non-data ordering above; this is not a session-wide fence.\n\n Observing (does not invalidate borrows)."]
     pub fn moq_session_poll_actions_ex(
         s: *mut moq_session_t,
         out: *mut ::std::os::raw::c_void,
@@ -2259,6 +2264,62 @@ const _: () = {
 };
 #[doc = " A subgroup data stream ended gracefully with a FIN. Emitted after the\n subgroup header has been parsed and every buffered object on the stream has\n been delivered -- i.e. strictly AFTER the final OBJECT_RECEIVED / OBJECT_CHUNK\n of that subgroup. Lets a receiver/relay reclaim per-subgroup state on a clean\n end without inferring it from object IDs.\n\n Exactly one of `sub` / `pub` is valid, matching the OBJECT_RECEIVED events of\n the same subgroup (sub for a subscriber-role stream, pub for a\n publisher-initiated one). Not emitted for FETCH streams, for streams reset via\n RESET_STREAM / STOP_SENDING, or for streams that FIN before a usable subgroup\n header was parsed. Owns no resources (moq_event_cleanup is a no-op)."]
 pub type moq_subgroup_finished_event_t = moq_subgroup_finished_event;
+#[doc = " Fixed-width open cause set for ABI stability. Values are never renumbered.\n Unknown causes must be ignored. NONE is never emitted."]
+pub type moq_outgoing_subgroup_terminal_cause_t = u32;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct moq_subgroup_handle {
+    pub _opaque: u64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_subgroup_handle"][::std::mem::size_of::<moq_subgroup_handle>() - 8usize];
+    ["Alignment of moq_subgroup_handle"][::std::mem::align_of::<moq_subgroup_handle>() - 8usize];
+    ["Offset of field: moq_subgroup_handle::_opaque"]
+        [::std::mem::offset_of!(moq_subgroup_handle, _opaque) - 0usize];
+};
+pub type moq_subgroup_handle_t = moq_subgroup_handle;
+#[doc = " An outgoing subgroup was reset after peer STOP_SENDING or local delivery\n expiry, on every supported profile. Exactly one of sub/pub is valid.\n Emitted once, atomically with committing its RESET_DATA action, retaining\n the first recognized cause/code across pressure in either output queue.\n This is local commitment, not provider acceptance or peer acknowledgement.\n All fields are scalars; no borrowed memory or owned resources. The subgroup\n and owner handles are identities after reap/reuse, not operational promises.\n error_code is the exact wire reset code; zero is valid. Read fields only\n when detail_size covers them. App resets, clean FIN, owner cancellation,\n incoming resets and transport failure do not produce this event. A STOP\n after the core entry retired can still reset a retained FIN through the\n bridge, without fabricating an event identity."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct moq_outgoing_subgroup_terminated_event {
+    pub subgroup: moq_subgroup_handle_t,
+    pub sub: moq_subscription_t,
+    pub pub_: moq_publication_t,
+    pub group_id: u64,
+    pub subgroup_id: u64,
+    pub stream_ref: moq_stream_ref_t,
+    pub error_code: u64,
+    pub cause: moq_outgoing_subgroup_terminal_cause_t,
+    pub _reserved: [u8; 4usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_outgoing_subgroup_terminated_event"]
+        [::std::mem::size_of::<moq_outgoing_subgroup_terminated_event>() - 64usize];
+    ["Alignment of moq_outgoing_subgroup_terminated_event"]
+        [::std::mem::align_of::<moq_outgoing_subgroup_terminated_event>() - 8usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::subgroup"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, subgroup) - 0usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::sub"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, sub) - 8usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::pub_"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, pub_) - 16usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::group_id"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, group_id) - 24usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::subgroup_id"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, subgroup_id) - 32usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::stream_ref"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, stream_ref) - 40usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::error_code"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, error_code) - 48usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::cause"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, cause) - 56usize];
+    ["Offset of field: moq_outgoing_subgroup_terminated_event::_reserved"]
+        [::std::mem::offset_of!(moq_outgoing_subgroup_terminated_event, _reserved) - 60usize];
+};
+#[doc = " An outgoing subgroup was reset after peer STOP_SENDING or local delivery\n expiry, on every supported profile. Exactly one of sub/pub is valid.\n Emitted once, atomically with committing its RESET_DATA action, retaining\n the first recognized cause/code across pressure in either output queue.\n This is local commitment, not provider acceptance or peer acknowledgement.\n All fields are scalars; no borrowed memory or owned resources. The subgroup\n and owner handles are identities after reap/reuse, not operational promises.\n error_code is the exact wire reset code; zero is valid. Read fields only\n when detail_size covers them. App resets, clean FIN, owner cancellation,\n incoming resets and transport failure do not produce this event. A STOP\n after the core entry retired can still reset a retained FIN through the\n bridge, without fabricating an event identity."]
+pub type moq_outgoing_subgroup_terminated_event_t = moq_outgoing_subgroup_terminated_event;
 #[doc = " A subgroup data stream ended abnormally with a RESET_STREAM: the abnormal\n counterpart of SUBGROUP_FINISHED, which a receiver/relay uses to close its\n per-subgroup state.\n\n A reset has exactly TWO non-overlapping surfaces, chosen by whether an\n application-visible object terminal can carry the closure -- for one reset\n exactly one of them fires:\n\n   - A streaming object is in flight AND its object events are surfaced:\n     the closure IS that object's OBJECT_CHUNK with\n     terminal=MOQ_OBJECT_TERMINAL_RESET, carrying the peer's code in the\n     chunk's error_code. This event is NOT emitted.\n   - Otherwise, for a bound subgroup whose ID is resolved, no visible object\n     terminal can carry the closure, so THIS event reports it. That covers\n     whole-object mode (a partial payload is dropped; a complete one is\n     delivered as OBJECT_RECEIVED first, in order, and this event follows),\n     a streaming stream between objects or after its last object completed,\n     and a streaming object whose events are suppressed by Forward State 0\n     (its parsed header resolves the subgroup identity even though no object\n     event is surfaced for it).\n\n Exactly one of `sub` / `pub` is valid, matching the OBJECT_RECEIVED events of\n the same subgroup. `error_code` is the RESET_STREAM application error code:\n the FIRST code the peer sent for this stream, retained across event-queue\n backpressure so a re-driven terminal reports the original cause. Emitted at\n most once per stream.\n\n Not emitted for FETCH streams, for gracefully FINed streams (those emit\n SUBGROUP_FINISHED), or for a stream reset before its subgroup ID was\n resolved -- a FIRST_OBJECT-mode header that never carried an object has only\n the decoder default, and reporting it would let a relay seal subgroup 0 by\n mistake. A suppressed object's parsed header DOES resolve the identity, so\n that case still reports. Owns no resources (moq_event_cleanup is a no-op)."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -4944,6 +5005,7 @@ pub struct moq_event {
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union moq_event_moq_event_detail {
+    pub outgoing_subgroup_terminated: moq_outgoing_subgroup_terminated_event_t,
     pub setup_complete: moq_setup_complete_event_t,
     pub closed: moq_session_closed_event_t,
     pub subscribe_request: moq_subscribe_request_event_t,
@@ -5017,6 +5079,8 @@ const _: () = {
         [::std::mem::size_of::<moq_event_moq_event_detail>() - 128usize];
     ["Alignment of moq_event_moq_event_detail"]
         [::std::mem::align_of::<moq_event_moq_event_detail>() - 8usize];
+    ["Offset of field: moq_event_moq_event_detail::outgoing_subgroup_terminated"]
+        [::std::mem::offset_of!(moq_event_moq_event_detail, outgoing_subgroup_terminated) - 0usize];
     ["Offset of field: moq_event_moq_event_detail::setup_complete"]
         [::std::mem::offset_of!(moq_event_moq_event_detail, setup_complete) - 0usize];
     ["Offset of field: moq_event_moq_event_detail::closed"]
@@ -5584,7 +5648,7 @@ unsafe extern "C" {
         now_us: u64,
     ) -> moq_result_t;
 }
-#[doc = " Finish publishing to an accepted subscription (publisher side).\n Queues a completion message and frees the local subscription entry.\n All open subgroups for this subscription must be closed or reset\n before calling.\n\n stream_count is the number of data streams the APPLICATION opened for\n this subscription (every subgroup it opened as a stream, including ones\n that carried no object). The session adds the fill fetch streams it opened itself\n (through moq_session_open_fill, and for a fill it answered as a failed\n stream), so the application never counts those. The sum saturates to\n the profile's \"unknown\" sentinel (2^62-1 for draft-16/18 and 2^64-1 for\n draft-22); passing that sentinel sends it unchanged, meaning the exact\n count is not known.\n\n Valid for publisher-role subscriptions in ESTABLISHED state.\n Returns MOQ_ERR_WRONG_STATE if subgroups are still open, or while an\n answer to a subscription update is owed (answer it first: a rejection\n itself ends the subscription with UPDATE_FAILED).\n Returns MOQ_ERR_STALE_HANDLE once the session has ended the subscription\n itself -- e.g. an update it refused on its own, which it ends with\n UPDATE_FAILED -- whether or not that terminal and the resets before it\n have gone out yet: the session still sends them. A stale handle is not\n proof that any byte or FIN reached the peer."]
+#[doc = " Finish publishing to an accepted subscription (publisher side).\n Queues a completion message and frees the local subscription entry.\n All open subgroups for this subscription must be closed or reset\n before calling.\n\n stream_count is the number of data streams the APPLICATION opened for\n this subscription (every subgroup it opened as a stream, including ones\n that carried no object). The session adds the fill fetch streams it opened itself\n (through moq_session_open_fill, and for a fill it answered as a failed\n stream), so the application never counts those. The sum saturates to\n the profile's \"unknown\" sentinel (2^62-1 for draft-16/18 and 2^64-1 for\n draft-22); passing that sentinel sends it unchanged, meaning the exact\n count is not known.\n\n Valid for publisher-role subscriptions in ESTABLISHED state.\n Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset\n is still owed; it must commit before this completion can overtake it.\n Returns MOQ_ERR_WRONG_STATE if subgroups are still open, or while an\n answer to a subscription update is owed (answer it first: a rejection\n itself ends the subscription with UPDATE_FAILED).\n Returns MOQ_ERR_STALE_HANDLE once the session has ended the subscription\n itself -- e.g. an update it refused on its own, which it ends with\n UPDATE_FAILED -- whether or not that terminal and the resets before it\n have gone out yet: the session still sends them. A stale handle is not\n proof that any byte or FIN reached the peer."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct moq_done_subscribe_cfg {
@@ -5616,7 +5680,7 @@ impl Default for moq_done_subscribe_cfg {
         }
     }
 }
-#[doc = " Finish publishing to an accepted subscription (publisher side).\n Queues a completion message and frees the local subscription entry.\n All open subgroups for this subscription must be closed or reset\n before calling.\n\n stream_count is the number of data streams the APPLICATION opened for\n this subscription (every subgroup it opened as a stream, including ones\n that carried no object). The session adds the fill fetch streams it opened itself\n (through moq_session_open_fill, and for a fill it answered as a failed\n stream), so the application never counts those. The sum saturates to\n the profile's \"unknown\" sentinel (2^62-1 for draft-16/18 and 2^64-1 for\n draft-22); passing that sentinel sends it unchanged, meaning the exact\n count is not known.\n\n Valid for publisher-role subscriptions in ESTABLISHED state.\n Returns MOQ_ERR_WRONG_STATE if subgroups are still open, or while an\n answer to a subscription update is owed (answer it first: a rejection\n itself ends the subscription with UPDATE_FAILED).\n Returns MOQ_ERR_STALE_HANDLE once the session has ended the subscription\n itself -- e.g. an update it refused on its own, which it ends with\n UPDATE_FAILED -- whether or not that terminal and the resets before it\n have gone out yet: the session still sends them. A stale handle is not\n proof that any byte or FIN reached the peer."]
+#[doc = " Finish publishing to an accepted subscription (publisher side).\n Queues a completion message and frees the local subscription entry.\n All open subgroups for this subscription must be closed or reset\n before calling.\n\n stream_count is the number of data streams the APPLICATION opened for\n this subscription (every subgroup it opened as a stream, including ones\n that carried no object). The session adds the fill fetch streams it opened itself\n (through moq_session_open_fill, and for a fill it answered as a failed\n stream), so the application never counts those. The sum saturates to\n the profile's \"unknown\" sentinel (2^62-1 for draft-16/18 and 2^64-1 for\n draft-22); passing that sentinel sends it unchanged, meaning the exact\n count is not known.\n\n Valid for publisher-role subscriptions in ESTABLISHED state.\n Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset\n is still owed; it must commit before this completion can overtake it.\n Returns MOQ_ERR_WRONG_STATE if subgroups are still open, or while an\n answer to a subscription update is owed (answer it first: a rejection\n itself ends the subscription with UPDATE_FAILED).\n Returns MOQ_ERR_STALE_HANDLE once the session has ended the subscription\n itself -- e.g. an update it refused on its own, which it ends with\n UPDATE_FAILED -- whether or not that terminal and the resets before it\n have gone out yet: the session still sends them. A stale handle is not\n proof that any byte or FIN reached the peer."]
 pub type moq_done_subscribe_cfg_t = moq_done_subscribe_cfg;
 unsafe extern "C" {
     pub fn moq_done_subscribe_cfg_init(cfg: *mut moq_done_subscribe_cfg_t);
@@ -7890,21 +7954,6 @@ unsafe extern "C" {
         now_us: u64,
     ) -> moq_result_t;
 }
-#[doc = " -- Subgroup lifecycle ---------------------------------------------"]
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct moq_subgroup_handle {
-    pub _opaque: u64,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of moq_subgroup_handle"][::std::mem::size_of::<moq_subgroup_handle>() - 8usize];
-    ["Alignment of moq_subgroup_handle"][::std::mem::align_of::<moq_subgroup_handle>() - 8usize];
-    ["Offset of field: moq_subgroup_handle::_opaque"]
-        [::std::mem::offset_of!(moq_subgroup_handle, _opaque) - 0usize];
-};
-#[doc = " -- Subgroup lifecycle ---------------------------------------------"]
-pub type moq_subgroup_handle_t = moq_subgroup_handle;
 unsafe extern "C" {
     pub fn moq_subgroup_is_valid(h: moq_subgroup_handle_t) -> bool;
 }
@@ -8057,7 +8106,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Write a complete object with optional properties. Advancing call.\n\n If cfg->properties != NULL, the subgroup must have been opened with\n object_properties=true. Uses two actions when properties are present.\n Returns MOQ_ERR_WOULD_BLOCK if insufficient action queue slots."]
+    #[doc = " Write a complete object with optional properties. Advancing call.\n\n If cfg->properties != NULL, the subgroup must have been opened with\n object_properties=true. Uses two actions when properties are present.\n Returns MOQ_ERR_WOULD_BLOCK if insufficient action queue slots, or if the\n exact subgroup owes an outgoing terminal event/reset. Neither refusal\n retains a payload/properties reference or advances object progress."]
     pub fn moq_session_write_object_ex(
         s: *mut moq_session_t,
         subgroup: moq_subgroup_handle_t,
@@ -8067,6 +8116,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
+    #[doc = " Close/reset are advancing. A latched outgoing terminal takes precedence:\n both return MOQ_ERR_WOULD_BLOCK until its event/reset commit, without\n replacing its cause or queuing a FIN/second reset."]
     pub fn moq_session_close_subgroup(
         s: *mut moq_session_t,
         subgroup: moq_subgroup_handle_t,
@@ -8222,7 +8272,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Finish a publisher-initiated subscription. Advancing call.\n Queues the terminal completion message and frees the entry.\n Returns MOQ_ERR_WRONG_STATE while an answer to an update is owed (answer\n it first: a rejection itself ends the subscription with UPDATE_FAILED).\n Returns MOQ_ERR_STALE_HANDLE once the session has ended the publication\n itself -- e.g. an update it refused on its own, which it ends with\n UPDATE_FAILED -- whether or not that terminal and the resets before it\n have gone out yet: the session still sends them. A stale handle is not\n proof that any byte or FIN reached the peer."]
+    #[doc = " Finish a publisher-initiated subscription. Advancing call.\n Queues the terminal completion message and frees the entry.\n Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset\n is still owed, before queuing any completion or freeing this owner.\n Returns MOQ_ERR_WRONG_STATE while an answer to an update is owed (answer\n it first: a rejection itself ends the subscription with UPDATE_FAILED).\n Returns MOQ_ERR_STALE_HANDLE once the session has ended the publication\n itself -- e.g. an update it refused on its own, which it ends with\n UPDATE_FAILED -- whether or not that terminal and the resets before it\n have gone out yet: the session still sends them. A stale handle is not\n proof that any byte or FIN reached the peer."]
     pub fn moq_session_finish_publish(
         s: *mut moq_session_t,
         pub_: moq_publication_t,
@@ -8299,7 +8349,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Push payload data for the active streamed object. Advancing call.\n\n Queues a payload-only SEND_DATA action. data must not be NULL.\n Zero-length data is a no-op (no action queued, no state change).\n\n Returns MOQ_ERR_INVAL if bytes would exceed declared payload_length.\n Returns MOQ_ERR_WRONG_STATE if no streamed object is active.\n Returns MOQ_ERR_WOULD_BLOCK if the action queue is full;\n streaming_bytes_written is NOT advanced on failure."]
+    #[doc = " Push payload data for the active streamed object. Advancing call.\n\n Queues a payload-only SEND_DATA action. data must not be NULL.\n Zero-length data is a no-op (no action queued, no state change).\n\n Returns MOQ_ERR_INVAL if bytes would exceed declared payload_length.\n Returns MOQ_ERR_WRONG_STATE if no streamed object is active.\n Returns MOQ_ERR_WOULD_BLOCK if the action queue is full or the exact subgroup\n owes an outgoing terminal event/reset; no payload ref is retained and\n streaming_bytes_written is NOT advanced on failure."]
     pub fn moq_session_write_object_data(
         s: *mut moq_session_t,
         subgroup: moq_subgroup_handle_t,
@@ -8309,7 +8359,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Finalize a streamed object. Advancing call.\n\n Validates streaming_bytes_written == payload_length and returns the\n subgroup to OPEN state. Queues no action.\n\n Returns MOQ_ERR_INVAL if bytes written != declared payload_length\n (subgroup stays STREAMING so the app can write remaining bytes).\n Returns MOQ_ERR_WRONG_STATE if no streamed object is active."]
+    #[doc = " Finalize a streamed object. Advancing call.\n\n Validates streaming_bytes_written == payload_length and returns the\n subgroup to OPEN state. Queues no action.\n\n Returns MOQ_ERR_INVAL if bytes written != declared payload_length\n (subgroup stays STREAMING so the app can write remaining bytes).\n Returns MOQ_ERR_WRONG_STATE if no streamed object is active.\n Returns MOQ_ERR_WOULD_BLOCK while the exact subgroup owes an outgoing\n terminal event/reset; no object progress changes in that case."]
     pub fn moq_session_end_object(
         s: *mut moq_session_t,
         subgroup: moq_subgroup_handle_t,

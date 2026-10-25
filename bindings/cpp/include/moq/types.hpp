@@ -321,6 +321,14 @@ constexpr request_terminal_cause request_terminal_cause_from_c(
     return static_cast<request_terminal_cause>(v);
 }
 
+/* An asynchronous termination of an outgoing subgroup. Unknown causes retain
+ * their raw value; the event never implies that the entire request ended. */
+enum class outgoing_subgroup_terminal_cause : uint32_t {
+    none              = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE,
+    peer_stop_sending = MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING,
+    delivery_timeout  = MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT,
+};
+
 enum class track_status_terminal_cause : uint32_t {
     peer_reset_stream  = MOQ_TRACK_STATUS_PEER_RESET_STREAM,
     peer_stop_sending  = MOQ_TRACK_STATUS_PEER_STOP_SENDING,

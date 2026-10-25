@@ -95,7 +95,38 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_fetch_track(
  */
 MOQR_CORE_API moqr_result_t moqr_core_internal_delivery_flags(
     const moqr_core_t *core, moqr_binding_t binding,
-    bool *subgroup_properties, bool *follows_gap, moqr_reset_desc_t *gap_reset);
+    bool *subgroup_properties, bool *follows_gap, moqr_reset_desc_t *gap_reset,
+    uint32_t *list);
+
+/* Reconcile only this owner's locally ended outgoing subgroup, including a
+ * STALLED or paused head with no outstanding delivery. `list` is the stable
+ * position captured from delivery_flags when that stream opened; it also
+ * identifies its begun ledger after group eviction. Consume at most budget
+ * records (OPEN heads included), with DISCARDED accounting. An unrelated
+ * held delivery and all shared log data remain untouched. `more` requests
+ * another bounded pass; `retired` proves authoritative eviction or that the
+ * exact subscription owner is gone. A seal alone never retires the numeric
+ * key. No notice is acked. STALE_HANDLE for a gone binding/owner/track (only
+ * the gone owner also sets retired), INVAL for a foreign binding or bad
+ * position, WRONG_STATE for an absent key above the eviction horizon,
+ * CAPACITY for unavailable cursor storage. Outputs are borrowed for the call.
+ */
+MOQR_CORE_API moqr_result_t moqr_core_internal_discard_subgroup(
+    moqr_core_t *core, moqr_binding_t binding, moqr_sub_t sub,
+    uint64_t group, uint64_t subgroup, uint32_t list, uint32_t budget,
+    uint64_t now_us, bool *retired, bool *more);
+
+/* Under demonstrated binder-slot pressure only, omit records that cannot
+ * acquire a downstream stream. The synchronous predicate is pure and must
+ * not reenter the core; its pointers are borrowed for the call. Notices and
+ * evict resets remain eligible, and the original ranking applies among all
+ * eligible work, including records already owning a binder slot. Existing
+ * held work is preserved. Ordinary next_delivery is unchanged. */
+typedef bool (*moqr_core_delivery_eligible_fn)(void *ctx, uint64_t sub_cookie,
+                                               const moqr_record_view_t *rec);
+MOQR_CORE_API moqr_result_t moqr_core_internal_next_eligible(
+    moqr_core_t *core, moqr_binding_t binding, uint64_t now_us,
+    moqr_delivery_t *out, moqr_core_delivery_eligible_fn eligible, void *ctx);
 
 /* End every held rendezvous SUBSCRIBE whose deadline has passed at `now_us`
  * with TIMEOUT (one queued now, or owed until the intent ring takes it). The

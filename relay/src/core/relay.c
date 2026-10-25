@@ -7135,10 +7135,13 @@ track_rec_expired(const r_track_t *t, const moqr_record_view_t *v,
 static bool
 sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                    r_cand_t *out, bool *out_range_done,
-                   r_seal_note_t *out_seal, uint64_t now_us)
+                   r_seal_note_t *out_seal, uint64_t now_us,
+                   moqr_core_delivery_eligible_fn eligible, void *ctx,
+                   bool *capacity_blocked)
 {
     uint32_t gn = moqr_log_group_count(log);
     *out_range_done = false;
+    *capacity_blocked = false;
     r_cand_t best = { .have = false };
     bool any_in_range = false;
     bool blocked_open = false;   /* an in-range OPEN head is pending */
@@ -7307,6 +7310,10 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                 }
                 /* Selectable: OPEN with new chunks, COMPLETE (deliver the
                  * remaining emitted..chunk_count then end), or ABANDONED-begun. */
+                if (eligible != NULL && !eligible(ctx, s->cookie, &v)) {
+                    *capacity_blocked = true;
+                    break;   /* leave this list's head and ledgers untouched */
+                }
                 r_cand_t cand = { .have = true,
                                   .list = pos_slot,
                                   .emitted = emitted,
@@ -7340,7 +7347,7 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
      * in-range record remains deliverable — but NOT while an in-range OPEN head
      * is still pending (it must complete or be reset/abandoned first, else a
      * begun downstream object would be left without a terminal). */
-    if (s->has_end && !blocked_open) {
+    if (s->has_end && !blocked_open && !*capacity_blocked) {
         const r_track_t *t = &c->tracks[s->track];
         if (s->excluded != NULL) {
             *out_range_done = t->has_largest &&
@@ -7458,9 +7465,10 @@ sub_eot_complete(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
     return true;
 }
 
-moqr_result_t
-moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
-                        moqr_delivery_t *out)
+static moqr_result_t
+core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
+                   moqr_delivery_t *out, moqr_core_delivery_eligible_fn eligible,
+                   void *ctx)
 {
     if (c == NULL || out == NULL) {
         return MOQR_ERR_INVAL;
@@ -7640,10 +7648,11 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
         }
         r_cand_t cand;
         bool range_done = false;
+        bool capacity_blocked = false;
         r_seal_note_t seal;
         memset(&seal, 0, sizeof(seal));
         if (!sub_best_candidate(c, s, t->log, &cand, &range_done, &seal,
-                                now_us)) {
+                                now_us, eligible, ctx, &capacity_blocked)) {
             if (s->pending_skip) {
                 /* Fresh jump found by the scan's gpos_gc: EVICT_WATERMARK
                  * precedes any SEAL for the same sub. */
@@ -7660,6 +7669,9 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
                     ntc_kind = MOQR_DELIVERY_NOTICE_SEAL;
                     ntc_seal = seal;
                 }
+            } else if (capacity_blocked) {
+                /* Still owes records; lack of a stream slot is not source
+                 * completion, range completion or subscription retirement. */
             } else if (range_done && !s->range_end_holds && s->forward) {
                 /* Range-completion retirement is a delivery outcome, not stream
                  * maintenance — hold it while paused (Forward=0); resume re-runs
@@ -7918,28 +7930,42 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
         moqr_log_subgroup_is_final(c->tracks[ws->track].log,
                                    best.view.group_id, best.list,
                                    best.view.object_id);
-    if (b->out_chunked || b->out_abandoned) {
-        /* Store the delivery so a re-peek after a downstream WOULD_BLOCK
-         * replays it verbatim: chunk bytes come from the pinned array via
-         * moqr_core_delivery_chunk (survives record eviction), and an abandoned
-         * head replays so the bind can retry a WOULD_BLOCKed reset. */
-        b->out_view = *out;
-    }
+    /* Held batches replay this view; all record shapes retain their scalar
+     * identity here for intentional-discard tracing at confirmation. */
+    b->out_view = *out;
     return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
+                        moqr_delivery_t *out)
+{
+    return core_next_delivery(c, bh, now_us, out, NULL, NULL);
+}
+
+moqr_result_t
+moqr_core_internal_next_eligible(moqr_core_t *c, moqr_binding_t bh,
+                                 uint64_t now_us, moqr_delivery_t *out,
+                                 moqr_core_delivery_eligible_fn eligible,
+                                 void *ctx)
+{
+    if (eligible == NULL) return MOQR_ERR_INVAL;
+    return core_next_delivery(c, bh, now_us, out, eligible, ctx);
 }
 
 moqr_result_t
 moqr_core_internal_delivery_flags(const moqr_core_t *c, moqr_binding_t bh,
                                   bool *subgroup_properties, bool *follows_gap,
-                                  moqr_reset_desc_t *gap_reset)
+                                  moqr_reset_desc_t *gap_reset, uint32_t *list)
 {
     if (c == NULL || subgroup_properties == NULL || follows_gap == NULL ||
-        gap_reset == NULL) {
+        gap_reset == NULL || list == NULL) {
         return MOQR_ERR_INVAL;
     }
     *subgroup_properties = false;
     *follows_gap = false;
     *gap_reset = moqr_reset_desc_none();
+    *list = 0;
     r_binding_t *b = binding_resolve((moqr_core_t *)(uintptr_t)c, bh, NULL);
     if (b == NULL) {
         return MOQR_ERR_STALE_HANDLE;
@@ -7950,6 +7976,7 @@ moqr_core_internal_delivery_flags(const moqr_core_t *c, moqr_binding_t bh,
     *subgroup_properties = b->out_subgroup_properties;
     *follows_gap = b->out_follows_gap;
     *gap_reset = b->out_gap_reset;
+    *list = b->out_list;
     return MOQR_OK;
 }
 
@@ -7973,15 +8000,20 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
         outcome != MOQR_DELIVERY_STREAM_ERROR &&
         outcome != MOQR_DELIVERY_STALLED &&
         outcome != MOQR_DELIVERY_ABANDONED &&
-        outcome != MOQR_DELIVERY_REFUSED_UNBEGUN) {
+        outcome != MOQR_DELIVERY_REFUSED_UNBEGUN &&
+        outcome != MOQR_DELIVERY_DISCARDED) {
         return MOQR_ERR_INVAL;
     }
     if (b->out_notice != MOQR_DELIVERY_NOTICE_NONE &&
         (outcome == MOQR_DELIVERY_STALLED ||
          outcome == MOQR_DELIVERY_ABANDONED ||
-         outcome == MOQR_DELIVERY_REFUSED_UNBEGUN)) {
+         outcome == MOQR_DELIVERY_REFUSED_UNBEGUN ||
+         outcome == MOQR_DELIVERY_DISCARDED)) {
         return MOQR_ERR_INVAL;   /* a notice has no stall/abandon/pre-begin
                                   * refusal shape */
+    }
+    if (outcome == MOQR_DELIVERY_DISCARDED && b->out_evict_reset) {
+        return MOQR_ERR_INVAL;   /* names a group, not an exact record */
     }
     if (outcome == MOQR_DELIVERY_REFUSED_UNBEGUN && b->out_abandoned) {
         return MOQR_ERR_INVAL;   /* a reset has no pre-begin refusal site */
@@ -8058,6 +8090,7 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
         return MOQR_OK;
     }
     switch (outcome) {
+    case MOQR_DELIVERY_DISCARDED:
     case MOQR_DELIVERY_DELIVERED:
         if (pe != NULL) {
             if (gpos_emit(s, pe)[b->out_list] > 0) {
@@ -8071,12 +8104,18 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
             /* A record that does not continue the earlier stream opens a new
              * downstream stream, which owes its own terminal: a seal this sub
              * acknowledged belonged to the stream before it. */
-            if (b->out_follows_gap && b->out_list < s->gpos_lists - 1) {
+            if ((b->out_follows_gap || outcome == MOQR_DELIVERY_DISCARDED) &&
+                b->out_list < s->gpos_lists - 1) {
                 gpos_acked(s, pe)[b->out_list / 32u] &= ~(1u << (b->out_list % 32u));
             }
         }
-        c->delivered_total++;
-        r_trace(c, MOQR_TRACE_DELIVERY, 0, bslot, b->out_sub, b->out_group, 0);
+        if (outcome == MOQR_DELIVERY_DELIVERED) {
+            c->delivered_total++;
+            r_trace(c, MOQR_TRACE_DELIVERY, 0, bslot, b->out_sub, b->out_group, 0);
+        } else {
+            r_trace(c, MOQR_TRACE_CURSOR_SKIP, 2, bslot, b->out_sub,
+                    b->out_group, b->out_view.rec.object_id);
+        }
         break;
     case MOQR_DELIVERY_STALLED:
         /* Live edge drained but not COMPLETE: record how many chunks are now
@@ -8134,6 +8173,118 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
         break;
     }
     binding_unpin(b);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_internal_discard_subgroup(moqr_core_t *c, moqr_binding_t bh,
+                                    moqr_sub_t sh, uint64_t group,
+                                    uint64_t subgroup, uint32_t list,
+                                    uint32_t budget, uint64_t now_us,
+                                    bool *retired, bool *more)
+{
+    if (c == NULL || retired == NULL || more == NULL || budget == 0) {
+        return MOQR_ERR_INVAL;
+    }
+    *retired = false;
+    *more = false;
+    uint32_t bslot = 0, sslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    r_sub_t *s = sub_resolve(c, sh, &sslot);
+    if (b == NULL) return MOQR_ERR_STALE_HANDLE;
+    if (s == NULL) {
+        *retired = true;   /* this exact subscription owner is gone */
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (s->binding != bslot || s->binding_gen != b->gen || s->gpos_lists == 0 ||
+        list >= s->gpos_lists - 1u) return MOQR_ERR_INVAL;
+    r_track_t *t = &c->tracks[s->track];
+    if ((t->gen & 1u) == 0 || t->gen != s->track_gen_slot) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    moqr_log_t *log = t->log;
+    moqr_record_view_t probe;
+    *retired = moqr_log_read_rec(log, group, MOQR_LOG_LIST_DATAGRAM, 0,
+                                 &probe) == MOQR_ERR_TOO_OLD;
+    /* Validate the captured position while the group is retained. Group
+     * eviction never reuses its ID, so its old list index remains sufficient
+     * to clear just this position's ledger after the log releases the list. */
+    bool retained = false;
+    for (uint32_t gi = 0; gi < log->group_count; gi++) {
+        const moqr_group_t *g = &log->groups[gi];
+        if (g->group_id != group) continue;
+        if (list >= g->sg_count || g->sgs[list].subgroup_id != subgroup) {
+            return MOQR_ERR_INVAL;
+        }
+        retained = true;
+        break;
+    }
+    if (!retained && !*retired) return MOQR_ERR_WRONG_STATE;
+    uint32_t used = 0;
+    bool changed = false;
+    if (b->out_active && b->out_sub == sslot &&
+        b->out_notice == MOQR_DELIVERY_NOTICE_NONE && !b->out_evict_reset &&
+        b->out_group == group && b->out_list == list) {
+        moqr_result_t rc = moqr_core_delivery_done(c, bh,
+                                                   MOQR_DELIVERY_DISCARDED,
+                                                   now_us);
+        if (rc != MOQR_OK) return rc;
+        used++;
+        changed = true;
+    }
+    uint32_t pos = gpos_hash_find(s, group);
+    r_gpos_t *pe = pos == R_GPOS_NIL ? NULL : gpos_at(s, pos);
+    if (pe == NULL && !*retired) pe = gpos_entry(c, s, log, group);
+    if (pe == NULL && !*retired) return MOQR_ERR_CAPACITY;
+    if (pe != NULL) {
+        if (gpos_emit(s, pe)[list] != 0) {
+            sub_begun_sub(c, s);
+            changed = true;
+        }
+        gpos_emit(s, pe)[list] = 0;
+        gpos_gap_set(s, pe, list, false);
+        gpos_renew_set(s, pe, list, false);
+        gpos_owed(s, pe)[list] = 0;
+        if (!*retired) {
+            while (used < budget &&
+                   moqr_log_read_rec(log, group, list, pe->idx[list],
+                                      &probe) == MOQR_OK) {
+                pe->idx[list]++;
+                gpos_acked(s, pe)[list / 32u] &= ~(1u << (list % 32u));
+                r_trace(c, MOQR_TRACE_CURSOR_SKIP, 2, bslot, sslot,
+                        group, probe.object_id);
+                used++;
+                changed = true;
+            }
+            *more = moqr_log_read_rec(log, group, list, pe->idx[list],
+                                       &probe) == MOQR_OK;
+        }
+        /* A held synthetic reset can lose its last begun position here.
+         * Preserve it when any sibling of the evicted group still needs it. */
+        if (b->out_active && b->out_evict_reset && b->out_sub == sslot &&
+            b->out_group == group) {
+            bool begun = false;
+            for (uint32_t li = 0; li < s->gpos_lists; li++) {
+                begun = begun || gpos_emit(s, pe)[li] != 0;
+            }
+            if (!begun) binding_drop_held(b);
+        }
+        if (*retired) {
+            bool begun = false;
+            for (uint32_t li = 0; li < s->gpos_lists; li++) {
+                begun = begun || gpos_emit(s, pe)[li] != 0;
+            }
+            if (!begun) {
+                pe->occupied = false;
+                gpos_body_clear(s, pe);
+                gpos_hash_rebuild(s);
+                s->pending_skip = true;
+            }
+        }
+    }
+    if (changed || *retired) {
+        ready_mark(c, bslot);   /* newly exposed notices still need ack */
+    }
     return MOQR_OK;
 }
 

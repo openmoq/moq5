@@ -222,9 +222,9 @@ MOQR_API moqr_result_t moqr_bind_conn_close(moqr_bind_t *b, moq_session_t *sessi
  */
 MOQR_API moqr_result_t moqr_bind_pump(moqr_bind_t *b, uint64_t now_us);
 
-/* Whether the LAST moqr_bind_pump ended with any connection's delivery pass
- * expired on the per-pass delivery guard with work remaining. The runtime's
- * stepper reads this to request one further coalesced self-wake, so a batch
+/* Whether the LAST moqr_bind_pump exhausted a delivery/discard work budget,
+ * or recovered refusal room with an interrupted event drain still owed.
+ * The runtime's stepper requests one further coalesced self-wake, so a batch
  * larger than a single pass drains across a FINITE continuation chain
  * instead of stranding behind a doorbell nobody rings — a guard-bounded
  * batch may be the only traffic there is, so nothing else is guaranteed to
@@ -245,7 +245,9 @@ MOQR_API bool moqr_bind_pump_budget_pending(const moqr_bind_t *b);
  * wake), so a continuation would only spin. The runtime's stepper uses this to gate
  * the applied-inbound self-continuation on ACTUAL forward-progressable work: a
  * pass that drained everything (or left only ACTION_CAP backpressure) leaves
- * this false, so an applied batch that fully delivered earns no wake. */
+ * this false, so an applied batch that fully delivered earns no wake. An
+ * interrupted event drain gates every delivery retry; its retained ready bit
+ * earns a continuation only after refusal room permits polling again. */
 MOQR_API bool moqr_bind_pump_continuation_pending(const moqr_bind_t *b);
 
 /* The fill wait: how long a fill fetch stream waits for upstream to deliver

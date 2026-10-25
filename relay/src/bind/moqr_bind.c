@@ -131,9 +131,15 @@ typedef struct b_dgrant {
 
 typedef struct b_sg {
     bool                  used;
+    /* Suppression belongs to this exact owner/key, not the reusable session
+     * pool slot. Source seals do not retire numeric keys. */
+    bool                  stopped;
     uint64_t              sub_raw;
+    moqr_sub_t            rsub;
     uint64_t              group, subgroup;
+    uint32_t              core_list;
     moq_subgroup_handle_t h;
+    moq_stream_ref_t       stopped_ref;
     /* Chunked-delivery write progress on this downstream subgroup:
      * whether begin_object has shipped for the in-flight object, its id, and the
      * next chunk index to write. Held across a downstream WOULD_BLOCK so
@@ -546,6 +552,7 @@ typedef struct b_conn {
     bool           used;
     bool           closed;
     bool           detach_pending;   /* close blocked on intent space   */
+    bool           events_pending;   /* refusal pressure interrupted drain */
     bool           bind_sg_waiting;  /* a delivery blocked on this conn's
                                       * subgroup-slot pool (B_DELIVER_BLOCKED_
                                       * BIND_SG): the ONLY state that makes a
@@ -3897,6 +3904,10 @@ bind_update_answer_pump(moqr_bind_t *b, uint64_t now_us)
             if (!ds->used || ds->upd_answer == B_UPD_NONE) {
                 continue;
             }
+            if (cn->events_pending) {
+                held++;
+                continue;
+            }
             if (bind_update_answer_give(b, cn, ds, now_us) == B_UPD_HELD) {
                 held++;
             }
@@ -5138,6 +5149,7 @@ bind_nsu_pump(moqr_bind_t *b, uint64_t now_us)
             bind_nsans_drop(b, e);
             continue;
         }
+        if (cn->events_pending) continue;
         if (e->initial) {
             bind_tracks_answer_held(b, cn, e, now_us);
             continue;
@@ -6045,6 +6057,45 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
     moq_bytes_t nsbuf[32];
     b->events_translated++;
     switch (ev->kind) {
+    case MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED: {
+        if (ev->detail_size < MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+            break;
+        }
+        const moq_outgoing_subgroup_terminated_event_t *te =
+            &ev->u.outgoing_subgroup_terminated;
+        if (te->cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING &&
+            te->cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT) break;
+        bool pub = moq_publication_is_valid(te->pub);
+        bool sub = moq_subscription_is_valid(te->sub);
+        if (pub == sub) break;
+        uint64_t owner = pub ? te->pub._opaque : te->sub._opaque;
+        if (bind_cookie_is_publication(owner) != pub) break;
+        for (uint32_t i = 0; i < b->n_sgs; i++) {
+            b_sg_t *sg = &cn->sgs[i];
+            if (!sg->used || sg->sub_raw != owner ||
+                !moq_subgroup_eq(sg->h, te->subgroup) ||
+                sg->group != te->group_id || sg->subgroup != te->subgroup_id) {
+                continue;
+            }
+            if (sg->stopped) break;   /* keep the first exact terminal identity */
+            sg->stopped = true;
+            sg->stopped_ref = te->stream_ref;
+            sg->obj_begun = false;
+            sg->obj_id = 0;
+            sg->next_chunk = 0;
+            sg->reset_owed = false;
+            sg->reset_wire = 0;
+            /* The failed write's capacity floor is obsolete: reconciliation
+             * needs no action space, and may preserve a sibling's hold. */
+            uint32_t ci = (uint32_t)(cn - b->conns);
+            bind_dl_clear(b->dl_parked, ci);
+            cn->park_reason = B_PARK_NONE;
+            cn->park_cap = 0;
+            bind_dl_set(b->dl_ready, ci);
+            break;
+        }
+        break;
+    }
     case MOQ_EVENT_NAMESPACE_PUBLISHED: {
         const moq_namespace_published_event_t *np =
             &ev->u.namespace_published;
@@ -7318,6 +7369,10 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
     if (cn == NULL || cn->closed) {
         return true; /* moot: the target session is gone or tearing down */
     }
+    if (cn->events_pending && bind_intent_deferrable(it->kind)) {
+        *defer = *it;
+        return false;
+    }
     switch (it->kind) {
     case MOQR_INTENT_ACCEPT_SUB: {
         if (bind_cookie_is_publication(it->cookie)) {
@@ -7446,6 +7501,11 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
          * only once the terminal is actually on the wire. */
         for (uint32_t i = 0; i < b->n_sgs; i++) {
             if (!cn->sgs[i].used || cn->sgs[i].sub_raw != it->cookie) {
+                continue;
+            }
+            if (cn->sgs[i].stopped) {
+                memset(&cn->sgs[i], 0, sizeof(cn->sgs[i]));
+                bind_dl_rearm_on_slot_release(b, cn);
                 continue;
             }
             moq_result_t crc;
@@ -10969,6 +11029,10 @@ bind_fwd_pump(moqr_bind_t *b, uint64_t now_us)
         if (!t->used) {
             continue;
         }
+        b_conn_t *pending_up = conn_by_cookie(b, t->u_cookie);
+        b_conn_t *pending_down = conn_by_cookie(b, t->d_cookie);
+        if ((pending_up != NULL && pending_up->events_pending) ||
+            (pending_down != NULL && pending_down->events_pending)) continue;
         /* -- upstream side -- */
         if (t->consumer == FW_CONSUMER_FILL) {
             if (t->end == FW_END_NONE && !retrieve_fwd_current(b, t)) {
@@ -11410,6 +11474,12 @@ bind_reset_track_streams(moqr_bind_t *b, moqr_track_t track, uint64_t now_us)
             }
             for (uint32_t i = 0; i < b->n_sgs; i++) {
                 if (!cn->sgs[i].used || cn->sgs[i].sub_raw != ds->sub_raw) continue;
+                if (cn->sgs[i].stopped) continue;
+                if (cn->events_pending) {
+                    cn->sgs[i].reset_owed = true;
+                    cn->sgs[i].reset_wire = wire;
+                    continue;
+                }
                 moq_result_t rrc = moq_session_reset_subgroup(cn->session,
                                                               cn->sgs[i].h, wire,
                                                               now_us);
@@ -11790,8 +11860,15 @@ bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
         return MOQR_DELIVERY_STALLED;
     }
     moq_result_t erc = moq_session_end_object(cn->session, sg->h, now_us);
+    if (erc == MOQ_ERR_WOULD_BLOCK) {
+        if (moqr_core_delivery_note_emitted(b->core, cn->binding,
+                                            sg->next_chunk, now_us) != MOQR_OK) {
+            return MOQR_DELIVERY_STREAM_ERROR;
+        }
+        return MOQR_DELIVERY_WOULD_BLOCK;
+    }
     if (erc != MOQ_OK) {
-        return MOQR_DELIVERY_STREAM_ERROR;   /* end_object never WOULD_BLOCKs */
+        return MOQR_DELIVERY_STREAM_ERROR;
     }
     sg->obj_begun = false;   /* object complete; the slot can begin the next */
     return MOQR_DELIVERY_DELIVERED;
@@ -11829,6 +11906,38 @@ bind_confirm_delivery(moqr_bind_t *b, b_conn_t *cn,
     return false;
 }
 
+/* Bounded exact-key work is independent of Forward, live-edge growth and
+ * ordinary record priority. It cannot consume a sibling's outstanding item. */
+static bool
+bind_discard_stopped(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
+{
+    for (uint32_t i = 0; i < b->n_sgs; i++) {
+        b_sg_t *sg = &cn->sgs[i];
+        if (!sg->used || !sg->stopped) continue;
+        bool retired = false, more = false;
+        moqr_result_t rc = moqr_core_internal_discard_subgroup(
+            b->core, cn->binding, sg->rsub, sg->group, sg->subgroup,
+            sg->core_list, 256u, now_us, &retired, &more);
+        if (rc == MOQR_ERR_CAPACITY) more = true;
+        else if (rc != MOQR_OK && !(rc == MOQR_ERR_STALE_HANDLE && retired)) {
+            b->session_errors++;
+            (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
+                                    "stopped cursor mismatch", now_us);
+            conn_detach(b, cn, now_us);
+            return false;
+        }
+        if (retired) {
+            memset(sg, 0, sizeof(*sg));
+            bind_dl_rearm_on_slot_release(b, cn);
+        }
+        if (more) {
+            b->budget_pending = true;
+            bind_dl_set(b->dl_ready, (uint32_t)(cn - b->conns));
+        }
+    }
+    return true;
+}
+
 /* One delivery pass over a connection, ending in exactly one outcome that
  * tells Phase F how to reschedule it. STALLED and ABANDONED remain in-loop
  * continuations (sibling subscriptions keep being served in the same pass);
@@ -11845,9 +11954,28 @@ typedef enum b_deliver_outcome {
     B_DELIVER_CLOSED,             /* conn detached or consistency failure   */
 } b_deliver_outcome_t;
 
+typedef struct b_delivery_capacity {
+    const moqr_bind_t *bind;
+    const b_conn_t *conn;
+} b_delivery_capacity_t;
+
+static bool
+bind_delivery_eligible(void *ctx, uint64_t cookie, const moqr_record_view_t *rec)
+{
+    const b_delivery_capacity_t *cap = ctx;
+    if (rec->datagram_pref || rec->obj_state == MOQR_OBJ_ABANDONED) return true;
+    for (uint32_t i = 0; i < cap->bind->n_sgs; i++) {
+        const b_sg_t *sg = &cap->conn->sgs[i];
+        if (!sg->used || (sg->sub_raw == cookie && sg->group == rec->group_id &&
+                         sg->subgroup == rec->subgroup_id)) return true;
+    }
+    return false;
+}
+
 static b_deliver_outcome_t
 bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
+    b_delivery_capacity_t cap = { .bind = b, .conn = cn };
     for (uint32_t guard = 0; guard < 256; guard++) {
         moqr_delivery_t d;
         moqr_result_t drc;
@@ -11859,10 +11987,23 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         } else
 #endif
         {
-            drc = moqr_core_next_delivery(b->core, cn->binding, now_us, &d);
+            if (cn->bind_sg_waiting) {
+                for (uint32_t si = 0; si < b->n_sgs; si++) {
+                    if (!cn->sgs[si].used) {
+                        cn->bind_sg_waiting = false;
+                        break;
+                    }
+                }
+            }
+            drc = cn->bind_sg_waiting
+                ? moqr_core_internal_next_eligible(b->core, cn->binding,
+                                                    now_us, &d,
+                                                    bind_delivery_eligible, &cap)
+                : moqr_core_next_delivery(b->core, cn->binding, now_us, &d);
         }
         if (drc != MOQR_OK) {
             if (drc == MOQR_DONE) {
+                if (cn->bind_sg_waiting) return B_DELIVER_BLOCKED_BIND_SG;
                 return B_DELIVER_DRAINED;   /* nothing NOW; a mark re-arms */
             }
             if (drc == MOQR_ERR_CAPACITY) {
@@ -11904,11 +12045,12 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             }
         }
         bool rec_props = false, rec_gap = false;
+        uint32_t rec_list = 0;
         moqr_reset_desc_t rec_gap_reset = moqr_reset_desc_none();
         if (d.notice == MOQR_DELIVERY_NOTICE_NONE) {
             (void)moqr_core_internal_delivery_flags(b->core, cn->binding,
                                                     &rec_props, &rec_gap,
-                                                    &rec_gap_reset);
+                                                    &rec_gap_reset, &rec_list);
         }
         /* Recordless acknowledged notices precede record work. The close IS
          * the payload here, so the notice is acknowledged (DELIVERED) only
@@ -11934,6 +12076,16 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                          * strictly ascending, so a lower group can still be
                          * live only at/above it. */
                         : cn->sgs[i].group >= d.oldest_group) {
+                    continue;
+                }
+                if (cn->sgs[i].stopped) {
+                    /* This stream already has its session-owned terminal.
+                     * A SEAL ack leaves suppression intact for later source
+                     * lifetimes. Only authoritative eviction frees the key. */
+                    if (d.notice == MOQR_DELIVERY_NOTICE_EVICT_WATERMARK) {
+                        memset(&cn->sgs[i], 0, sizeof(cn->sgs[i]));
+                        bind_dl_rearm_on_slot_release(b, cn);
+                    }
                     continue;
                 }
                 /* A reset-flavored seal closes abnormally, forwarding the
@@ -12077,7 +12229,9 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     freei = (int)i;
                 }
             }
-            if (d.rec.obj_state == MOQR_OBJ_ABANDONED && d.evicted_reset) {
+            if (sgi >= 0 && cn->sgs[sgi].stopped && !d.evicted_reset) {
+                oc = MOQR_DELIVERY_DISCARDED;
+            } else if (d.rec.obj_state == MOQR_OBJ_ABANDONED && d.evicted_reset) {
                 /* The whole group was evicted while begun downstream: reset EVERY
                  * begun subgroup of the group so no peer stream is left with a
                  * begun object and no terminal. Retry-safe — a reset subgroup is
@@ -12088,6 +12242,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                 for (uint32_t i = 0; i < b->n_sgs; i++) {
                     if (!cn->sgs[i].used || cn->sgs[i].sub_raw != d.sub_cookie ||
                         cn->sgs[i].group != d.rec.group_id ||
+                        cn->sgs[i].stopped ||
                         !cn->sgs[i].obj_begun) {
                         continue;
                     }
@@ -12305,6 +12460,10 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                                 now_us)) {
                             return B_DELIVER_CLOSED;
                         }
+                        if (!cn->bind_sg_waiting) {
+                            cn->bind_sg_waiting = true;
+                            continue;   /* maintenance gets the next selection */
+                        }
                         return B_DELIVER_BLOCKED_BIND_SG;
                     }
                     b_dsub_t *ds = dsub_find(b, cn, d.sub_cookie);
@@ -12371,7 +12530,10 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                         ds->streams_opened, cn->wire_draft);
                     sgi = freei;
                     cn->sgs[sgi].used = true;
+                    cn->sgs[sgi].stopped = false;
                     cn->sgs[sgi].sub_raw = d.sub_cookie;
+                    cn->sgs[sgi].rsub = d.sub;
+                    cn->sgs[sgi].core_list = rec_list;
                     cn->sgs[sgi].group = d.rec.group_id;
                     cn->sgs[sgi].subgroup = d.rec.subgroup_id;
                     cn->sgs[sgi].h = h;
@@ -12381,8 +12543,12 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     cn->sgs[sgi].props = sc.object_properties;
                     cn->sgs[sgi].unwritten = true;
                     cn->sgs[sgi].open_obj = d.rec.object_id;
+                    cn->sgs[sgi].reset_owed = false;
+                    cn->sgs[sgi].reset_wire = 0;
+                    cn->bind_sg_waiting = false;
                 }
-                if (d.rec.chunk_count > 0) {
+                if (d.rec.chunk_count > 0 || d.rec.obj_state == MOQR_OBJ_OPEN ||
+                    cn->sgs[sgi].obj_begun) {
                     /* Chunked record: stream the batch. Returns DELIVERED after
                      * end_object (COMPLETE), STALLED at the live edge (OPEN),
                      * WOULD_BLOCK to hold, or STREAM_ERROR. */
@@ -12530,12 +12696,15 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         return MOQR_ERR_INVAL;
     }
     b->in_pump = true;
-    /* Per-pump flag, not sticky: a pass below reports it when the
-     * 256-delivery guard expired with work remaining — the ONE outcome
-     * whose leftover work no future event re-signals AND whose retry needs
-     * nothing but another pump. The runtime turns it into one further
-     * coalesced self-wake (see moqr_bind_pump_budget_pending). */
+    /* A bounded delivery/discard pass, or refusal recovery with events still
+     * undrained, may owe another pump without an external edge. The runtime
+     * turns that debt into one coalesced self-wake. */
     b->budget_pending = false;
+    for (uint32_t i = 0; i < b->max_conns; i++) {
+        if (b->conns[i].used && !b->conns[i].closed) {
+            b->conns[i].events_pending = true;
+        }
+    }
     /* Held rendezvous SUBSCRIBEs past their deadline end before any event
      * of this pump -- a source among them included -- is consumed. */
     (void)moqr_core_internal_rendezvous_expire(b->core, now_us);
@@ -12555,6 +12724,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             n = moq_session_poll_events(cn->session, b->pump_events,
                                         BIND_PUMP_EVENT_POLL);
             if (n == 0) {
+                cn->events_pending = false;
                 break;
             }
             for (size_t e = 0; e < n; e++) {
@@ -12574,9 +12744,18 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         }
         /* Re-check the grant every pump (not only when events arrive): a peer
          * blocked at its ceiling sends nothing until the grant reaches it. */
-        if (cn->used && !cn->closed && cn->session != NULL) {
+        if (cn->used && !cn->closed && !cn->events_pending && cn->session != NULL) {
             bind_maybe_grant_capacity(b, cn, now_us);
             bind_retry_owed_cancels(b, cn, now_us);
+        }
+    }
+    /* All source connections have ingested their events now. A subscriber
+     * earlier in the connection table must also reconcile bytes that arrived
+     * on a later source, even while paused with no ordinary delivery. */
+    for (uint32_t i = 0; i < b->max_conns; i++) {
+        b_conn_t *cn = &b->conns[i];
+        if (cn->used && !cn->closed && !cn->events_pending) {
+            (void)bind_discard_stopped(b, cn, now_us);
         }
     }
     (void)moqr_core_tick(b->core, now_us);
@@ -12609,6 +12788,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
                                         rev->session_cookie);
             continue;
         }
+        if (rcn->events_pending) continue;
         moq_cancel_namespace_cfg_t ccfg;
         moq_cancel_namespace_cfg_init(&ccfg);
         ccfg.error_code = rev->error_code;
@@ -12660,7 +12840,8 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
     bind_nsu_pump(b, now_us);
     for (uint32_t i = 0; i < b->max_conns; i++) {
         b_conn_t *cn = &b->conns[i];
-        if (cn->used && !cn->closed && cn->wire_draft == B_DRAFT_22) {
+        if (cn->used && !cn->closed && !cn->events_pending &&
+            cn->wire_draft == B_DRAFT_22) {
             bind_discovery_pump(b, cn, now_us);
         }
     }
@@ -12685,7 +12866,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         } while (got == 64);
         for (uint32_t i = 0; i < b->max_conns; i++) {
             b_conn_t *cn = &b->conns[i];
-            if (cn->used && !cn->closed) {
+            if (cn->used && !cn->closed && !cn->events_pending) {
                 bool ready = bind_dl_test(b->dl_ready, i);
                 bool parked = bind_dl_test(b->dl_parked, i);
                 bool attempt;
@@ -12772,7 +12953,6 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
                          * pump, so the starvation bound is exactly the
                          * old one (guard x ready bindings). Not a pool block:
                          * the self-rearm above already schedules the retry. */
-                        cn->bind_sg_waiting = false;
                         bind_dl_set(b->dl_ready, i);
                         break;
                     case B_DELIVER_CLOSED:
@@ -12789,7 +12969,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             }
             /* The fetch half is untouched: per open connection, every
              * pump, exactly as before. */
-            if (cn->used && !cn->closed) {
+            if (cn->used && !cn->closed && !cn->events_pending) {
                 bind_fetch_pump(b, cn, now_us);
             }
         }
@@ -12799,6 +12979,14 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
          * pump; nothing else is bound to bring a later one, so they would
          * otherwise wait for an unrelated event. */
         (void)bind_execute_intents(b, now_us);
+    }
+    /* Refusal recovery permits another event drain; it does not prove that
+     * the deferred terminal event was seen. Preserve ready/park state and
+     * arrange the next pump before any delivery can use an old handle. */
+    for (uint32_t i = 0; i < b->max_conns; i++) {
+        b_conn_t *cn = &b->conns[i];
+        if (cn->used && !cn->closed && cn->events_pending &&
+            bind_refusal_can_poll(b, cn)) b->budget_pending = true;
     }
     b->in_pump = false;
     return MOQR_OK;
@@ -13004,6 +13192,10 @@ moqr_bind_pump_continuation_pending(const moqr_bind_t *b)
         const b_conn_t *cn = &b->conns[i];
         if (!cn->used || cn->closed) {
             continue;
+        }
+        if (cn->events_pending) {
+            if (bind_refusal_can_poll(b, cn)) return true;
+            continue;   /* retained readiness cannot outrun the event drain */
         }
         if (bind_dl_test(b->dl_ready, i)) {
             return true;   /* a live connection has residual ready work */

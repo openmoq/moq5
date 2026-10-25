@@ -17,6 +17,7 @@ uint64_t bridge_work_expiry_slots;
 uint64_t bridge_work_expiry_items;
 uint64_t bridge_work_reset_slots;
 uint64_t bridge_work_query_slots;
+uint64_t bridge_work_terminal_slots;
 #endif
 
 static void bridge_discard_if_dropped(moq_transport_bridge_t *b,
@@ -940,6 +941,115 @@ static void bridge_drop_pending_bidi_output(moq_transport_bridge_t *b,
         dst++;
     }
     b->pending_count = dst;
+}
+
+static bool bridge_send_data_obsolete(moq_transport_bridge_t *b,
+                                      const moq_send_data_action_t *data,
+                                      bool subgroup_header_pending)
+{
+    bridge_stream_entry_t *e = bridge_find_by_ref(b, data->stream_ref);
+    bool stopped = e && e->origin == BRIDGE_ORIGIN_LOCAL &&
+                   e->kind == BRIDGE_STREAM_UNI && e->peer_stop_received;
+    bool terminal = (e && e->data_terminal_received) ||
+        bridge_session_has_data_terminal(b->session, data->stream_ref);
+    if (!stopped && !terminal) return false;
+    /* A timeout still owes reliable delivery of an unsent subgroup header.
+     * Peer STOP suppresses even that write at callback receipt. */
+    if (!stopped && subgroup_header_pending && (!e || e->bytes_sent == 0))
+        return false;
+    return true;
+}
+
+static bool bridge_data_output_obsolete(moq_transport_bridge_t *b,
+                                         const bridge_pending_item_t *p)
+{
+    if (p->kind != PENDING_OPEN_UNI_DATA && p->kind != PENDING_HEADER_PAYLOAD &&
+        p->kind != PENDING_PAYLOAD_ONLY) return false;
+    return bridge_send_data_obsolete(b, &p->act.u.send_data,
+                                    p->meta.subgroup_header &&
+                                    p->kind != PENDING_PAYLOAD_ONLY);
+}
+
+static void bridge_prioritize_pending_resets(moq_transport_bridge_t *b)
+{
+    /* A terminal reset must not wait forever behind an unrelated blocked
+     * stream. Keep every earlier same-stream or control operation ahead of
+     * it; only independent data-stream work may be overtaken. */
+    for (uint32_t i = 0; i < b->pending_count; i++) {
+        bridge_pending_item_t reset = b->pending[i];
+        if (reset.kind != PENDING_RESET_STREAM || !reset.uni_reset ||
+            reset.stream_ref._v == 0) continue;
+        bridge_stream_entry_t *e = bridge_find_by_ref(b, reset.stream_ref);
+        if (!e || !e->fin_reset_pending) continue;
+        uint32_t at = 0;
+        for (uint32_t j = 0; j < i; j++) {
+            const bridge_pending_item_t *p = &b->pending[j];
+            if (p->dom != BRIDGE_DOM_STREAM ||
+                (p->canon_ref && p->canon_ref == reset.canon_ref) ||
+                (p->canon_have_sid && reset.canon_have_sid &&
+                 p->canon_sid == reset.canon_sid)) at = j + 1;
+        }
+        for (uint32_t j = i; j > at; j--) b->pending[j] = b->pending[j - 1];
+        b->pending[at] = reset;
+    }
+}
+
+static void bridge_prune_terminal_output(moq_transport_bridge_t *b)
+{
+    for (uint32_t i = 0; i < b->max_streams; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        bridge_work_terminal_slots++;
+#endif
+        bridge_stream_entry_t *e = &b->streams[i];
+        if (e->active && e->kind == BRIDGE_STREAM_UNI &&
+            e->origin == BRIDGE_ORIGIN_LOCAL &&
+            bridge_session_has_data_terminal(b->session, e->ref))
+            e->data_terminal_received = true;
+    }
+    uint32_t w = 0;
+    for (uint32_t r = 0; r < b->pending_count; r++) {
+        bridge_pending_item_t *p = &b->pending[r];
+        if (bridge_data_output_obsolete(b, p)) {
+            bridge_pending_counts(b, p, -1);
+            bridge_cleanup_pending_item(&b->alloc, p);
+            memset(p, 0, sizeof(*p));
+            continue;
+        }
+        if (w != r) {
+            b->pending[w] = *p;
+            memset(p, 0, sizeof(*p));
+        }
+        w++;
+    }
+    b->pending_count = w;
+    /* The scheduler owns retained DATA too. Drop obsolete bytes there at
+     * the same boundary, while preserving the stream's reset/key lifetime. */
+    for (uint32_t i = 0; i < b->dstream_cap; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        bridge_work_terminal_slots++;
+#endif
+        bridge_dstream_t *d = &b->dstreams[i];
+        if (!d->active || d->q_len == 0) continue;
+        uint32_t kept = 0;
+        for (uint32_t j = 0; j < d->q_len; j++) {
+            bridge_data_item_t *item = &d->q[(d->q_head + j) % d->q_cap];
+            if (bridge_send_data_obsolete(b, &item->action.u.send_data,
+                                         item->meta.subgroup_header)) {
+                b->dq_bytes -= bridge_send_data_bytes(&item->action.u.send_data);
+                b->dq_items--;
+                if (item->meta.deadline_us != UINT64_MAX) b->dq_timed--;
+                moq_action_cleanup(&item->action);
+                continue;
+            }
+            if (kept != j) d->q[(d->q_head + kept) % d->q_cap] = *item;
+            kept++;
+        }
+        if (kept != d->q_len) {
+            d->q_len = kept;
+            bridge_dstream_requeue(b, d);
+        }
+    }
+    bridge_prioritize_pending_resets(b);
 }
 
 /* RFC 9000 §3.5: a STOP_SENDING asks us to stop sending, and we answer with
@@ -2337,6 +2447,10 @@ static moq_result_t bridge_try_send_data_impl(moq_transport_bridge_t *b,
                                              bridge_pending_item_t *p,
                                              bridge_stream_entry_t *e)
 {
+    if (bridge_data_output_obsolete(b, p)) {
+        bridge_cleanup_pending_item(&b->alloc, p);
+        return MOQ_OK;
+    }
     moq_send_data_action_t *sd = &p->act.u.send_data;
     uint64_t sid = p->stream_id;
     bool started = p->kind != PENDING_HEADER_PAYLOAD;
@@ -2415,6 +2529,10 @@ static moq_result_t bridge_try_send_data_impl(moq_transport_bridge_t *b,
     }
 
     /* Phase 2: send payload */
+    if (bridge_data_output_obsolete(b, p)) {
+        bridge_cleanup_pending_item(&b->alloc, p);
+        return MOQ_OK;
+    }
     if (sd->payload) {
         moq_transport_result_t wr;
         bool has_write_payload =
@@ -2812,6 +2930,7 @@ static uint64_t bridge_pending_stream_bytes(const moq_transport_bridge_t *b,
 static moq_result_t bridge_dstream_reset(moq_transport_bridge_t *b,
                                          moq_stream_ref_t ref,
                                          uint64_t error_code, uint64_t reliable,
+                                         bool terminal,
                                          bool *deferred)
 {
     *deferred = false;
@@ -2834,6 +2953,7 @@ static moq_result_t bridge_dstream_reset(moq_transport_bridge_t *b,
     bridge_dstream_truncate(b, d, keep);
     d->has_reset = true;
     b->dreset_count++;
+    d->reset_terminal = terminal;
     d->reset_code = error_code;
     d->reset_reliable = reliable;
     *deferred = true;
@@ -2849,6 +2969,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
      * error code, so they share this dispatcher (reading the right field) --
      * but their lifecycle differs, see below. */
     const bool is_bidi = (act->kind == MOQ_ACTION_RESET_BIDI_STREAM);
+    bool terminal = !is_bidi && meta && meta->outgoing_terminal;
     moq_stream_ref_t ref = is_bidi
         ? act->u.reset_bidi_stream.stream_ref : act->u.reset_data.stream_ref;
     bridge_dstream_t *d = is_bidi ? NULL : bridge_dstream_find(b, ref);
@@ -2865,8 +2986,16 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
     moq_action_cleanup(act);
 
     if (!is_bidi) {
+        /* A reset retained behind its reliable prefix owns the first cause,
+         * even if the core slot has since reaped and another reset arrives. */
+        const bridge_dstream_t *d = bridge_dstream_find(b, ref);
+        if (d && d->has_reset) {
+            error_code = d->reset_code;
+            reliable = d->reset_reliable;
+            terminal = d->reset_terminal;
+        }
         bool deferred;
-        moq_result_t frc = bridge_dstream_reset(b, ref, error_code, reliable,
+        moq_result_t frc = bridge_dstream_reset(b, ref, error_code, reliable, terminal,
                                                 &deferred);
         if (frc < 0 || deferred) return frc;
     }
@@ -2888,6 +3017,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         p.meta.owner = owner;
         p.error_code = error_code;
         p.uni_reset = true;
+        p.meta.outgoing_terminal = terminal;
         p.reliable_size = reliable < queued ? reliable : queued;
         if (!bridge_enqueue_pending(b, &p))
             return bridge_retention_failed(b, &p);
@@ -2895,6 +3025,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
     }
 
     uint64_t sid = e->transport_id;
+    if (!is_bidi && terminal) e->data_terminal_received = true;
     if (!is_bidi && e->fin_reset_pending) return MOQ_OK;
     /* Our send half was already reset in answer to the peer's STOP_SENDING:
      * one reset per half, never a second. */
@@ -2902,8 +3033,10 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         bridge_retire_or_tombstone(b, ref);
         return MOQ_OK;
     }
-    const bool retained_fin = !is_bidi && e->awaiting_commit &&
-                              e->subgroup_header_len != 0;
+    const bool retain_reset_mapping = !is_bidi &&
+        ((e->awaiting_commit && e->subgroup_header_len != 0) ||
+         e->data_terminal_received || e->peer_stop_received ||
+         bridge_session_has_data_terminal(b->session, ref));
 
     /* A RESET_STREAM closes only OUR sending direction (RFC 9000 §3.5). For a
      * request bidi the peer's sending direction stays independently capable of
@@ -2924,7 +3057,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         uint64_t handed = e->bytes_sent +
                           bridge_pending_stream_bytes(b, ref, sid, true);
         if (reliable > handed) reliable = handed;
-        if (retained_fin) {
+        if (retain_reset_mapping) {
             e->awaiting_commit = false;
             e->fin_reset_pending = true;
         } else {
@@ -2949,6 +3082,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         p.meta.owner = owner;
         p.error_code = error_code;
         p.uni_reset = !is_bidi;
+        p.meta.outgoing_terminal = terminal;
         p.reliable_size = reliable;
         /* Defer the bidi local-close/retire decision until the endpoint has
          * actually accepted the reset -- never before. Carry the ref so the
@@ -2963,7 +3097,7 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         bridge_set_fatal(b, 0x1);
         return MOQ_ERR_INTERNAL;
     }
-    if (is_bidi || retained_fin) {
+    if (is_bidi || retain_reset_mapping) {
         bridge_mark_local_close(b, ref);
         bridge_retire_or_tombstone(b, ref);
     }
@@ -3677,7 +3811,10 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
         }
         bridge_dstream_truncate(b, d, keep);
     }
-    bridge_session_take_data_timeout(b->session, ref, &reset);
+    bool terminal = false;
+    const bool reset_ready = bridge_session_take_data_timeout(
+        b->session, ref, b->now_us, &reset, &terminal);
+    if (e && terminal) e->data_terminal_received = true;
     uint32_t dst = 0;
     for (uint32_t src = 0; src < b->pending_count; ++src) {
         bridge_pending_item_t *p = &b->pending[src];
@@ -3699,9 +3836,10 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
     }
     b->pending_count = dst;
     if (d) {
-        if (!pending_reset && !d->has_reset) {
+        if (reset_ready && !pending_reset && !d->has_reset) {
             d->has_reset = true;
             b->dreset_count++;
+            d->reset_terminal = terminal;
             d->reset_code = reset.error_code;
             d->reset_reliable = reset.reliable_size;
         }
@@ -3728,13 +3866,19 @@ static moq_result_t bridge_try_deferred_reset(moq_transport_bridge_t *b,
         *accepted = true; /* no transport stream was opened */
         return bridge_dstream_free(b, d);
     }
-    if (e->bytes_sent < d->reset_reliable ||
+    if (d->reset_terminal) e->data_terminal_received = true;
+    uint64_t reliable = d->reset_reliable;
+    /* STOP suppresses even an unsent prefix. Preserve the first reset cause,
+     * but do not wait for bytes the peer has asked us to stop sending. */
+    if (e->peer_stop_received && reliable > e->bytes_sent)
+        reliable = e->bytes_sent;
+    if (e->bytes_sent < reliable ||
         bridge_domain_blocked(b, d->ref, e->transport_id, true)) return MOQ_OK;
     e->awaiting_commit = false;
     e->fin_reset_pending = true;
     d->reset_pass = b->pass_seq;
     moq_transport_result_t r = bridge_reset_uni(b, e->transport_id,
-                                                d->reset_code, d->reset_reliable);
+                                                d->reset_code, reliable);
     if (r == MOQ_TRANSPORT_WOULD_BLOCK) return MOQ_OK;
     if (r == MOQ_TRANSPORT_ERROR) {
         bridge_set_fatal(b, 0x1);
@@ -3961,6 +4105,7 @@ static moq_result_t bridge_service_data_reset(moq_transport_bridge_t *b,
         return MOQ_OK;
     bridge_dstream_t *d = bridge_dstream_find(b, reset.stream_ref);
     if (d && d->has_reset) return MOQ_OK; /* older deferred reset owns its cause */
+    if (!bridge_session_claim_data_reset(b->session, &reset)) return MOQ_OK;
     *offered = true;
     e->reset_source_held = true;
     bridge_session_discard_reset_data(b->session, reset.stream_ref);
@@ -4238,6 +4383,12 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
         }
         bridge_pending_counts(b, p, -1);
         first_counted = i + 1;
+        if (bridge_data_output_obsolete(b, p)) {
+            bridge_cleanup_pending_item(&b->alloc, p);
+            bridge_pending_dispatch_done(b, dispatch_ref);
+            dispatch_ref = moq_stream_ref_from_u64(0);
+            continue;
+        }
 
         switch (p->kind) {
         case PENDING_OPEN_CONTROL: {
@@ -4355,7 +4506,9 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                 if (p->reliable_size > ue->bytes_sent)
                     p->reliable_size = ue->bytes_sent;
                 bridge_item_set_sid(p, ue->transport_id);
-                if (ue->awaiting_commit && ue->subgroup_header_len != 0) {
+                if (p->meta.outgoing_terminal) ue->data_terminal_received = true;
+                if ((ue->awaiting_commit && ue->subgroup_header_len != 0) ||
+                    ue->data_terminal_received || ue->peer_stop_received) {
                     ue->awaiting_commit = false;
                     ue->fin_reset_pending = true;
                 } else {
@@ -4705,12 +4858,20 @@ static moq_result_t bridge_stop_local_data(moq_transport_bridge_t *b,
                                             bridge_stream_entry_t *e,
                                             uint64_t code, uint64_t now_us)
 {
+    const bridge_dstream_t *d = bridge_dstream_find(b, e->ref);
+    if (d && d->has_reset) {
+        /* STOP cancels further writes, but does not replace a reset already
+         * retained by the scheduler with a later core fallback reset. */
+        e->peer_stop_received = true;
+        bridge_prune_terminal_output(b);
+        return MOQ_OK;
+    }
     if (e->fin_reset_pending) return MOQ_OK;
-    if (e->awaiting_commit && e->subgroup_header_len != 0) {
+    if (e->subgroup_header_len != 0) {
         moq_result_t rc = bridge_session_on_subgroup_stop(
             b->session, e->ref, code, now_us, e->subgroup_header_len);
-        /* WOULD_BLOCK has no core reset effect, but the bridge retains the
-         * first STOP fact for retry. A later ACK must not erase that fact. */
+        /* WOULD_BLOCK may retain a core terminal debt. Keep the first STOP
+         * through output pressure; a later ACK must not erase that fact. */
         if (rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK)
             e->peer_stop_received = true;
         return rc;
@@ -4889,6 +5050,20 @@ static moq_result_t bridge_service_pass(
     b->pump_budget = BRIDGE_DRAIN_BUDGET;
     ++b->pass_seq; /* every dstream's reset is untried in this pass */
     for (;;) {
+        /* Outgoing expiry/debt is independent of unrelated blocked provider
+         * output. This path advances only when outgoing work is actually due. */
+        if (!b->fatal && !b->closed) {
+            moq_result_t orc = bridge_session_service_outgoing(b->session, now_us);
+            if (orc == MOQ_SESSION_SUSPENDED) {
+                *suspended = true;
+                break;
+            }
+            if (orc < 0) return orc;
+            if (bridge_session_take_terminal_changes(b->session))
+                bridge_prune_terminal_output(b);
+            else
+                bridge_prioritize_pending_resets(b);
+        }
         /* Deferred close has priority — runs even if writes are blocked.
          * Session has already been notified; this closes the transport. */
         if (!b->fatal && !b->closed && b->needs_close) {
@@ -5789,14 +5964,17 @@ moq_result_t moq_transport_bridge_on_local_stream_committed(
 {
     if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
-    if (!e || !e->awaiting_commit || e->peer_stop_received) return MOQ_OK;
+    if (!e || !e->awaiting_commit || e->peer_stop_received ||
+        e->data_terminal_received ||
+        bridge_session_has_data_terminal(b->session, e->ref)) return MOQ_OK;
     moq_stream_ref_t ref = e->ref;
     moq_result_t rc = moq_session_on_data_committed(b->session, ref, now_us);
     if (rc != MOQ_OK && rc != MOQ_ERR_CLOSED) return rc;
     /* Resolve session ownership after its advancing input. An already-queued
      * reset can outlive the subgroup slot and still needs this mapping until
      * the endpoint accepts it; the clock alone does not establish ownership. */
-    if (!bridge_session_has_queued_data_reset(b->session, ref))
+    if (!bridge_session_has_queued_data_reset(b->session, ref) &&
+        !bridge_session_has_data_terminal(b->session, ref))
         bridge_deactivate_stream(b, e);
     return MOQ_OK;
 }
@@ -5866,8 +6044,17 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
         rc = moq_session_on_bidi_stream_stop(
             b->session, e->ref, error_code, now_us);
     } else if (e->origin == BRIDGE_ORIGIN_LOCAL) {
+        const bridge_dstream_t *d = bridge_dstream_find(b, e->ref);
+        if (d && d->has_reset)
+            return bridge_stop_local_data(b, e, error_code, now_us);
         if (e->fin_reset_pending || e->peer_stop_received)
             return e->pending_stop ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+        if (e->data_terminal_received || e->subgroup_header_len != 0 ||
+            bridge_session_is_outgoing_subgroup(b->session, e->ref)) {
+            e->peer_stop_received = true;
+            e->pending_stop_code = error_code;
+            bridge_prune_terminal_output(b);
+        }
         rc = bridge_stop_local_data(b, e, error_code, now_us);
     } else {
         /* Peer-origin uni: we have no send half to stop. */

@@ -493,10 +493,18 @@ Each of these is a stated limit or open decision a user can run into.
   namespace terminals and sender-local fatal projection are implemented,
   including additive C++/Swift views. Whole-profile qualification is not
   complete; this is not whole-media-service acceptance.
-- **Publisher progress:** Bounded admission and retained-FETCH serialization
-  are implemented, including retained-FETCH rejection while the event queue is
-  full (`publisher_retained_fetch_event_credit`). A tighter bound on snapshot
-  memory is not implemented, and no broader progress guarantee is made.
+- **Publisher progress:** Every draft uses bounded FIFO event pumping with
+  fixed per-parent admission owners and one immutable retained-FETCH snapshot
+  per session FETCH slot. Each snapshot has an object-count and track byte
+  limit; its references survive cache replacement and are released on
+  completion, cancellation or local teardown. Generic refusal/status answers
+  use fixed storage bounded by the session's responder pools and retain FIFO
+  wire order. Manual callers continue dispatching after
+  `WOULD_BLOCK + CONSUMED`; flush never polls and must not be spun to OK before
+  another event is handled. Focused fixtures include
+  `publisher_retained_fetch_event_credit`, `publisher_subgroup_terminal` and
+  `publisher_response_ownership`. Whole-profile and transport qualification
+  remain incomplete; bounded storage is not an unconditional progress promise.
 - **Namespace completion:** A lawful responder FIN on an established
   namespace subscription reports its own completion cause after the remaining
   GONE observations, natively and in the C++/Swift views. Whole-profile

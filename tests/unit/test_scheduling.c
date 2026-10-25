@@ -6159,10 +6159,10 @@ static bool ss_untimed_row(pair_t *p)
 }
 
 /* Objects with a 7 ms timeout wait in the session behind a stalled network
- * (the bridge's budget admits one). A pass just before their deadline
- * searches the queue and expires nothing; at the deadline the stream is reset
- * with DELIVERY_TIMEOUT, its header kept; afterwards nothing timed is queued,
- * so the queue is not read again and nothing is due. */
+ * (the bridge's budget admits one). Before their deadline, bridge service may
+ * skip expiry after inspecting deadlines; an explicit session tick searches
+ * without compacting. At the deadline the stream is reset with DELIVERY_TIMEOUT,
+ * its header kept; afterwards nothing timed is queued or due. */
 static bool ss_expiry_row(pair_t *p)
 {
     const uint64_t t0 = p->now;
@@ -6185,8 +6185,11 @@ static bool ss_expiry_row(pair_t *p)
     p->now = t0 + SS_TIMEOUT_US - 1;
     WALK_MARK(w);
     SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
-    WALK_CHECK(walk_since(w).expiry_search > 0 &&
-               walk_since(w).expiry_compact == 0);
+    WALK_CHECK(walk_since(w).expiry_compact == 0);
+    WALK_MARK(tick_work);
+    SS_REQUIRE(moq_session_tick(p->pub, p->now) == MOQ_OK);
+    WALK_CHECK(walk_since(tick_work).expiry_search > 0 &&
+               walk_since(tick_work).expiry_compact == 0);
     const mt_stream_t *st = mt_stream(p->mt, sid);
     SS_REQUIRE(st != NULL);
     MOQ_TEST_CHECK(!st->reset);
@@ -6280,12 +6283,10 @@ static bool ss_earlier_row(pair_t *p)
     return true;
 }
 
-/* The reset offer prepares the queue before it looks: a ring of data alone,
- * one object due, becomes that object's stream reset in the offer's own
- * preparation, and the offer returns it. An untimed write at the deadline
- * moves the session's clock there without expiring anything. The untimed
- * object still goes out; the timed stream ends with DELIVERY_TIMEOUT after
- * its header. */
+/* A reset offer observes only: even at an object's deadline it leaves a
+ * data-only ring unchanged. Explicit outgoing service recognizes the timeout
+ * before a later offer can return its reset. The untimed object still goes
+ * out; the timed stream ends with DELIVERY_TIMEOUT after its header. */
 static bool ss_offer_row(pair_t *p)
 {
     const uint64_t t0 = p->now;
@@ -6306,10 +6307,17 @@ static bool ss_offer_row(pair_t *p)
     SS_REQUIRE(ss_queued(p->pub) == 2 && p->pub->action_timed == 1 &&
                p->pub->action_nondata == 0);
 #ifdef MOQ_SESSION_SWEEP_TESTING
-    /* The offer itself, as the bridge makes it (linked from the internals
-     * build, where the session's private entry points are visible). */
+    /* A passive offer must not turn timed data into a terminal as a side
+     * effect. The bridge's explicit service call owns that transition. */
     moq_reset_data_action_t r;
     memset(&r, 0, sizeof(r));
+    const size_t events_before = p->pub->event_tail - p->pub->event_head;
+    MOQ_TEST_CHECK(!bridge_session_offer_data_reset(p->pub, &r));
+    MOQ_TEST_CHECK_EQ_INT((int)ss_queued(p->pub), 2);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_nondata, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_timed, 1);
+    MOQ_TEST_CHECK_EQ_U64(p->pub->event_tail - p->pub->event_head, events_before);
+    SS_REQUIRE(bridge_session_service_outgoing(p->pub, p->now) == MOQ_OK);
     MOQ_TEST_CHECK(bridge_session_offer_data_reset(p->pub, &r));
     MOQ_TEST_CHECK_EQ_U64(r.error_code, MOQ_RESET_DELIVERY_TIMEOUT);
     MOQ_TEST_CHECK_EQ_U64(r.reliable_size, hd);

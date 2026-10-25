@@ -642,8 +642,16 @@ MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
 
 /*
  * Notify the session that the peer sent STOP_SENDING on a data stream
- * we opened. Queues RESET_DATA (the adapter must send RESET_STREAM)
- * and transitions the outgoing subgroup to RESETTING.
+ * we opened. Records the first STOP cause/code and freezes that exact outgoing
+ * subgroup before attempting output. Queues RESET_DATA together with
+ * OUTGOING_SUBGROUP_TERMINATED when both output queues admit them. MOQ_OK means
+ * committed (or already terminal/unknown); MOQ_ERR_WOULD_BLOCK retains the
+ * obligation and its identity, even though no action/event has committed yet.
+ * Writes, object end, close and reset on the pending subgroup return
+ * MOQ_ERR_WOULD_BLOCK without retaining payload refs. Draining either queue
+ * retries the obligation; a later STOP/expiry/ACK cannot replace its cause.
+ * MOQ_ERR_INVAL: NULL session or error_code greater than 2^62 - 1.
+ * MOQ_ERR_CLOSED: inactive session. No caller payload ownership is taken.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -661,7 +669,9 @@ MOQ_API moq_result_t moq_session_on_data_stop(moq_session_t *s,
  * it through moq_transport_bridge_on_local_stream_committed().
  *
  * Advancing when a subgroup was awaiting the report; a report for any other
- * stream changes nothing and returns MOQ_OK.
+ * stream changes nothing and returns MOQ_OK. A recognized STOP or delivery
+ * expiry retains its reset obligation even if this report arrives before
+ * event/action capacity permits committing it.
  */
 MOQ_API moq_result_t moq_session_on_data_committed(moq_session_t *s,
                                                     moq_stream_ref_t stream_ref,
@@ -938,14 +948,23 @@ MOQ_API void moq_action_cleanup(moq_action_t *action);
  * Size-aware drain of pending actions.
  *
  * Returns MOQ_OK on success (including 0 actions and partial drains).
- * Returns MOQ_ERR_INVAL if element_size < fixed prefix.
- * Returns MOQ_ERR_ABI_MISMATCH if the head action carries owned
- *   resources (e.g. SEND_DATA with rcbuf payload) and element_size
- *   is too small to hold it. Queue is left untouched.
+ * Returns MOQ_ERR_INVAL for NULL required arguments or if element_size is
+ * smaller than the fixed prefix. With cap == 0, returns OK without draining.
+ * Returns MOQ_ERR_ABI_MISMATCH with *out_count == 0 if the selected SEND_DATA
+ * cannot fit its frozen v0 detail (including its owned payload reference).
+ * That action stays queued; retry with a full-sized element.
+ * Returns MOQ_ERR_WOULD_BLOCK with *out_count == 0 if the selected outgoing
+ * terminal barrier, or its owner's queued DONE, must wait for terminal-event
+ * capacity. Available action capacity and full-sized elements do not resolve
+ * this wait. Poll and dispatch/cleanup events to return notification credit,
+ * continue driving both output queues and deadlines, then retry actions.
  *
- * If a prefix of non-owned actions can be drained but the next action
- * is too large, returns MOQ_OK with the partial count and leaves the
- * owned action queued for a later full-size poll.
+ * If any actions transfer before the next selected action is too large or
+ * blocked as above, returns MOQ_OK with that partial count and leaves the
+ * selected action queued. Only the reported elements are written. No action
+ * transfers on WOULD_BLOCK or ABI_MISMATCH; expiry/retained-debt housekeeping
+ * may still progress. After a partial drain, the next poll reports any
+ * remaining wait. Owned actions in a partial result require normal cleanup.
  *
  * Owned SEND_DATA payload refs transfer to the caller on poll.
  * Caller MUST call moq_action_cleanup after processing each action.
@@ -957,13 +976,20 @@ MOQ_API void moq_action_cleanup(moq_action_t *action);
  * groups, and within a group the fill-delivered object, a datagram before a
  * subgroup object, and the lowest Subgroup ID or Object ID. Actions on one
  * stream keep their relative order; ties keep queue order; every other kind
- * of action holds its place and data queued after it does not overtake it.
+ * of action holds its place and data queued after it does not overtake it,
+ * except for the outgoing terminal reset ordering below.
  *
  * A queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at the session's
  * current time is never handed over: a datagram is dropped, and a subgroup
  * object is dropped together with the rest of its stream's queued data and
- * the stream is reset with DELIVERY_TIMEOUT (a RESET_DATA is queued and
- * polled in turn).
+ * the stream is reset with DELIVERY_TIMEOUT. An outgoing subgroup terminal
+ * reset commits together with its typed event. Its RESET_DATA may replace
+ * obsolete queued data or transfer directly from retained debt before an
+ * already-queued non-data action, but never before its own queued reliable
+ * subgroup header. An owner's queued DONE cannot transfer while that exact
+ * owner's reset/event debt remains unpaid, including after FIN was polled
+ * and the owner slot was freed/reused. Unrelated work otherwise retains the
+ * scheduling and non-data ordering above; this is not a session-wide fence.
  *
  * Observing (does not invalidate borrows).
  */
@@ -973,7 +999,11 @@ MOQ_API moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
                                                   size_t element_size,
                                                   size_t *out_count);
 
-/* Convenience wrapper. */
+/* Convenience wrapper: returns only the transferred count and discards the
+ * result code. Zero does NOT prove the action queue is empty: terminal event
+ * pressure can require event polling before any action can transfer. Use
+ * poll_actions_ex to distinguish WOULD_BLOCK, ABI_MISMATCH and an empty queue;
+ * a partial count has the same cleanup and progress requirements as above. */
 static inline size_t
 moq_session_poll_actions(moq_session_t *s, moq_action_t *out, size_t cap)
 {
@@ -1144,6 +1174,8 @@ typedef uint32_t moq_event_kind_t;
 #define MOQ_EVENT_NAMESPACE_UPDATE_RESULT           63u
 #define MOQ_EVENT_NS_SUB_UPDATE_RESULT              64u
 #define MOQ_EVENT_SUBSCRIBE_TRACKS_UPDATE_RESULT    65u
+/* Local outgoing subgroup reset commitment; see the scalar detail below. */
+#define MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED       66u
 
 /* Resolved authorization token (stable app API, NOT wire).
  * token_value is BORROWED from output scratch, follows borrow epoch. */
@@ -1435,6 +1467,41 @@ typedef struct moq_subgroup_finished_event {
     uint8_t            _pad_last[7];
     uint64_t           last_object_id;
 } moq_subgroup_finished_event_t;
+
+/* Fixed-width open cause set for ABI stability. Values are never renumbered.
+ * Unknown causes must be ignored. NONE is never emitted. */
+typedef uint32_t moq_outgoing_subgroup_terminal_cause_t;
+#define MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE              0u
+#define MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING  1u
+#define MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT   2u
+
+typedef struct moq_subgroup_handle { uint64_t _opaque; } moq_subgroup_handle_t;
+
+/* An outgoing subgroup was reset after peer STOP_SENDING or local delivery
+ * expiry, on every supported profile. Exactly one of sub/pub is valid.
+ * Emitted once, atomically with committing its RESET_DATA action, retaining
+ * the first recognized cause/code across pressure in either output queue.
+ * This is local commitment, not provider acceptance or peer acknowledgement.
+ * All fields are scalars; no borrowed memory or owned resources. The subgroup
+ * and owner handles are identities after reap/reuse, not operational promises.
+ * error_code is the exact wire reset code; zero is valid. Read fields only
+ * when detail_size covers them. App resets, clean FIN, owner cancellation,
+ * incoming resets and transport failure do not produce this event. A STOP
+ * after the core entry retired can still reset a retained FIN through the
+ * bridge, without fabricating an event identity. */
+typedef struct moq_outgoing_subgroup_terminated_event {
+    moq_subgroup_handle_t subgroup;
+    moq_subscription_t sub;
+    moq_publication_t pub;
+    uint64_t group_id;
+    uint64_t subgroup_id;
+    moq_stream_ref_t stream_ref;
+    uint64_t error_code;
+    moq_outgoing_subgroup_terminal_cause_t cause;
+    uint8_t _reserved[4];
+} moq_outgoing_subgroup_terminated_event_t;
+
+#define MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE 64u
 
 /*
  * A subgroup data stream ended abnormally with a RESET_STREAM: the abnormal
@@ -2605,6 +2672,7 @@ typedef struct moq_event {
     uint32_t         detail_size;  /* meaningful bytes in u */
     uint64_t         borrow_epoch;
     union moq_event_detail {
+        moq_outgoing_subgroup_terminated_event_t outgoing_subgroup_terminated;
         moq_setup_complete_event_t  setup_complete;
         moq_session_closed_event_t  closed;
         moq_subscribe_request_event_t subscribe_request;
@@ -3036,6 +3104,8 @@ MOQ_API moq_result_t moq_session_unsubscribe(moq_session_t *s,
  * count is not known.
  *
  * Valid for publisher-role subscriptions in ESTABLISHED state.
+ * Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset
+ * is still owed; it must commit before this completion can overtake it.
  * Returns MOQ_ERR_WRONG_STATE if subgroups are still open, or while an
  * answer to a subscription update is owed (answer it first: a rejection
  * itself ends the subscription with UPDATE_FAILED).
@@ -4924,8 +4994,6 @@ MOQ_API moq_result_t moq_session_on_bidi_stream_stop(
 
 /* -- Subgroup lifecycle --------------------------------------------- */
 
-typedef struct moq_subgroup_handle { uint64_t _opaque; } moq_subgroup_handle_t;
-
 #ifdef __cplusplus
 #define MOQ_SUBGROUP_INVALID (moq_subgroup_handle_t{0})
 #else
@@ -5037,7 +5105,9 @@ MOQ_API void moq_object_cfg_init_sized(moq_object_cfg_t *cfg, size_t cfg_size);
  *
  * If cfg->properties != NULL, the subgroup must have been opened with
  * object_properties=true. Uses two actions when properties are present.
- * Returns MOQ_ERR_WOULD_BLOCK if insufficient action queue slots.
+ * Returns MOQ_ERR_WOULD_BLOCK if insufficient action queue slots, or if the
+ * exact subgroup owes an outgoing terminal event/reset. Neither refusal
+ * retains a payload/properties reference or advances object progress.
  */
 MOQ_API moq_result_t moq_session_write_object_ex(
     moq_session_t *s,
@@ -5045,6 +5115,9 @@ MOQ_API moq_result_t moq_session_write_object_ex(
     const moq_object_cfg_t *cfg,
     uint64_t now_us);
 
+/* Close/reset are advancing. A latched outgoing terminal takes precedence:
+ * both return MOQ_ERR_WOULD_BLOCK until its event/reset commit, without
+ * replacing its cause or queuing a FIN/second reset. */
 MOQ_API moq_result_t moq_session_close_subgroup(
     moq_session_t *s,
     moq_subgroup_handle_t subgroup,
@@ -5155,6 +5228,8 @@ MOQ_API void moq_finish_publish_cfg_init(moq_finish_publish_cfg_t *cfg);
 /*
  * Finish a publisher-initiated subscription. Advancing call.
  * Queues the terminal completion message and frees the entry.
+ * Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset
+ * is still owed, before queuing any completion or freeing this owner.
  * Returns MOQ_ERR_WRONG_STATE while an answer to an update is owed (answer
  * it first: a rejection itself ends the subscription with UPDATE_FAILED).
  * Returns MOQ_ERR_STALE_HANDLE once the session has ended the publication
@@ -5236,7 +5311,8 @@ MOQ_API moq_result_t moq_session_begin_object_ex(
  *
  * Returns MOQ_ERR_INVAL if bytes would exceed declared payload_length.
  * Returns MOQ_ERR_WRONG_STATE if no streamed object is active.
- * Returns MOQ_ERR_WOULD_BLOCK if the action queue is full;
+ * Returns MOQ_ERR_WOULD_BLOCK if the action queue is full or the exact subgroup
+ * owes an outgoing terminal event/reset; no payload ref is retained and
  * streaming_bytes_written is NOT advanced on failure.
  */
 MOQ_API moq_result_t moq_session_write_object_data(
@@ -5254,6 +5330,8 @@ MOQ_API moq_result_t moq_session_write_object_data(
  * Returns MOQ_ERR_INVAL if bytes written != declared payload_length
  * (subgroup stays STREAMING so the app can write remaining bytes).
  * Returns MOQ_ERR_WRONG_STATE if no streamed object is active.
+ * Returns MOQ_ERR_WOULD_BLOCK while the exact subgroup owes an outgoing
+ * terminal event/reset; no object progress changes in that case.
  */
 MOQ_API moq_result_t moq_session_end_object(
     moq_session_t *s,

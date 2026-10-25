@@ -2027,11 +2027,9 @@ moq_result_t moq_session_fetch(moq_session_t *s,
             return MOQ_ERR_WRONG_STATE;
         if (s->subs[jsub].filter_type != MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT)
             return MOQ_ERR_INVAL;
-        /* The joining start is derived from the subscription's *current* largest
-         * location. has_largest is stamped only by SUBSCRIBE_OK / accept (at
-         * ESTABLISHED) and cleared on slot alloc/free, so a pending or reused
-         * subscription has no current largest and is rejected here -- it can
-         * never carry a prior occupant's stale largest into this computation. */
+        /* Use the saved Joining Location: establishment stamps it, and D18
+         * replaces it on a Forward 0 -> 1 ACK. Slot allocation/free clears it,
+         * so a reused subscription cannot inherit its predecessor's value. */
         if (!s->subs[jsub].has_largest)
             return MOQ_ERR_INVAL;
         joining_wire_request_id = s->subs[jsub].request_id;

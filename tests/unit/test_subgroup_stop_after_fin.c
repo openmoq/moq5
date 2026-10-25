@@ -70,7 +70,7 @@ typedef struct {
 typedef struct {
     moq_subgroup_handle_t handle;
     moq_stream_ref_t ref;
-    uint64_t sid, header_len;
+    uint64_t sid, header_len, group_id;
 } group_t;
 
 static void drain_events(moq_session_t *s)
@@ -178,6 +178,7 @@ static bool service(fixture_t *f)
 static bool open_group(fixture_t *f, uint64_t group_id, group_t *g)
 {
     memset(g, 0, sizeof(*g));
+    g->group_id = group_id;
     moq_subgroup_cfg_t cfg;
     moq_subgroup_cfg_init(&cfg);
     cfg.group_id = group_id;
@@ -274,8 +275,36 @@ static unsigned endpoint_resets(fixture_t *f, const group_t *g, uint64_t code,
     return resets;
 }
 
-/* Public core WOULD_BLOCK owns no reset: retry, an accepted commit, or an
- * already-owned timer reset can win. A zero-timeout retired core ref is inert;
+static unsigned terminal_events(fixture_t *f, const group_t *g, uint64_t code,
+                                  moq_outgoing_subgroup_terminal_cause_t cause)
+{
+    unsigned count = 0;
+    moq_event_t e;
+    while (moq_session_poll_events(f->sender, &e, 1)) {
+        ++count;
+        expect("sender-event-is-terminal", e.kind, MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED);
+        expect("terminal-detail-size", e.detail_size,
+               MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE);
+        if (e.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+            e.detail_size >= MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+            const moq_outgoing_subgroup_terminated_event_t *d =
+                &e.u.outgoing_subgroup_terminated;
+            expect("terminal-subgroup", d->subgroup._opaque, g->handle._opaque);
+            expect("terminal-owner", d->sub._opaque, f->sub._opaque);
+            expect("terminal-no-publication", d->pub._opaque, 0);
+            expect("terminal-group", d->group_id, g->group_id);
+            expect("terminal-subgroup-id", d->subgroup_id, 0);
+            expect("terminal-ref", d->stream_ref._v, g->ref._v);
+            expect("terminal-code", d->error_code, code);
+            expect("terminal-cause", d->cause, cause);
+        }
+        moq_event_cleanup(&e);
+    }
+    return count;
+}
+
+/* Recognized STOP retains its cause through output pressure and a later ACK.
+ * An ACK observed first still wins. A zero-timeout retired core ref is inert;
  * the bridge tests below exercise its separate retained transport obligation. */
 static void core_case(moq_version_t version, bool client_sender, bool timed, unsigned mode)
 {
@@ -290,19 +319,26 @@ static void core_case(moq_version_t version, bool client_sender, bool timed, uns
     NEED(open_group(&f, 11, &sibling));
     NEED(close_group(&f, &g));
     uint64_t deadline = moq_session_next_deadline_us(f.sender);
+    unsigned observed_resets = 0;
     if (timed) NEED(deadline != UINT64_MAX);
     if (mode == 1 || mode == 4) {
         NEED(fill_actions(&f, &sibling));
-        expect("stop-pre-effect-would-block",
+        expect("stop-retained-would-block",
                (uint64_t)moq_session_on_data_stop(f.sender, g.ref, 0x77, f.now),
                (uint64_t)MOQ_ERR_WOULD_BLOCK);
-        expect("deadline-unchanged", moq_session_next_deadline_us(f.sender), deadline);
+        uint64_t retry = moq_session_next_deadline_us(f.sender);
+        expect("retained-stop-bounded-retry", retry > f.now && retry < deadline, true);
         int slot = sg_find_by_stream_ref(f.sender, g.ref);
         NEED(slot >= 0);
-        expect("core-stop-refusal-stays-closing", f.sender->subgroups[slot].state, MOQ_SG_CLOSING);
-        expect("no-reset-before-capacity", core_actions(&f, &g, 0x77), 0);
+        expect("core-stop-retains-terminal", f.sender->subgroups[slot].state,
+               MOQ_SG_TERMINAL_OWED);
+        expect("core-stop-retains-first-cause", f.sender->subgroups[slot].terminal_cause,
+               MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING);
+        expect("core-stop-retains-first-code", f.sender->subgroups[slot].terminal_code, 0x77);
         if (mode == 4)
             NEED(moq_session_on_data_committed(f.sender, g.ref, f.now) == MOQ_OK);
+        observed_resets += core_actions(&f, &g, 0x77);
+        expect("reset-on-action-drain", observed_resets, 1);
     } else if (mode == 2) {
         NEED(moq_session_on_data_committed(f.sender, g.ref, f.now) == MOQ_OK);
     } else if (mode == 3) {
@@ -312,9 +348,14 @@ static void core_case(moq_version_t version, bool client_sender, bool timed, uns
     NEED(moq_session_on_data_stop(f.sender, g.ref, 0x77, f.now) == MOQ_OK);
     NEED(moq_session_on_data_stop(f.sender, g.ref, 0x99, f.now) == MOQ_OK);
     NEED(moq_session_on_data_committed(f.sender, g.ref, f.now) == MOQ_OK);
-    unsigned wanted = timed && mode != 2 && mode != 4 ? 1 : 0;
-    expect("one-first-terminal-reset", core_actions(&f, &g,
-           mode == 3 ? MOQ_RESET_DELIVERY_TIMEOUT : 0x77), wanted);
+    unsigned wanted = timed && mode != 2 ? 1 : 0;
+    observed_resets += core_actions(&f, &g,
+           mode == 3 ? MOQ_RESET_DELIVERY_TIMEOUT : 0x77);
+    expect("one-first-terminal-reset", observed_resets, wanted);
+    expect("one-first-terminal-event", terminal_events(&f, &g,
+           mode == 3 ? MOQ_RESET_DELIVERY_TIMEOUT : 0x77,
+           mode == 3 ? MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT
+                     : MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING), wanted);
     expect("timer-retired", moq_session_next_deadline_us(f.sender), UINT64_MAX);
     NEED(moq_session_write_object(f.sender, sibling.handle, 20, f.payload, f.now) == MOQ_OK);
     expect("sibling-still-writable", core_actions(&f, &g, 0x77), 0);
@@ -449,6 +490,9 @@ static void order_case(moq_version_t version, bool client, unsigned mode)
     NEED(service(&f));
     expect("owned-reset-reaches-endpoint", endpoint_resets(&f, &g,
            MOQ_RESET_DELIVERY_TIMEOUT, false), mode == 0 ? 0 : 1);
+    expect("owned-timeout-event-count", terminal_events(&f, &g,
+           MOQ_RESET_DELIVERY_TIMEOUT, MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT),
+           mode == 0 ? 0 : 1);
     expect("mapping-retires", moq_transport_bridge_find_ref(f.bridge, g.sid)._v, 0);
     expect("timer-retires", moq_session_next_deadline_us(f.sender), UINT64_MAX);
     NEED(moq_session_write_object(f.sender, sibling.handle, 0, f.payload, f.now) == MOQ_OK);
@@ -509,21 +553,24 @@ static void order_boundary_case(moq_version_t version, bool client, unsigned mod
     if (mode == ACK_AT_DEADLINE || mode == REFUSED_TIMER_THEN_ACK) {
         if (mode == REFUSED_TIMER_THEN_ACK) {
             NEED(fill_actions(&f, &sibling));
-            expect("timer-refused-before-ownership", (uint64_t)moq_session_tick(f.sender, f.now),
+            expect("timer-retained-under-pressure", (uint64_t)moq_session_tick(f.sender, f.now),
                    (uint64_t)MOQ_ERR_WOULD_BLOCK);
         }
         expect("no-reset-before-commit-input", queued_resets(&f, &g), 0);
         NEED(moq_transport_bridge_on_local_stream_committed(f.bridge, g.sid, f.now) == MOQ_OK);
         expect("commit-input-advances-to-deadline", f.sender->last_now_us, deadline);
-        expect("commit-before-reset-owner", queued_resets(&f, &g), 0);
-        expect("committed-map-retired", moq_transport_bridge_find_ref(f.bridge, g.sid)._v, 0);
+        expect("no-reset-enqueued-before-drain", queued_resets(&f, &g), 0);
+        expect("first-cause-controls-mapping", moq_transport_bridge_find_ref(f.bridge, g.sid)._v,
+               mode == REFUSED_TIMER_THEN_ACK ? g.ref._v : 0);
         NEED(service(&f));
         NEED(moq_session_tick(f.sender, f.now) == MOQ_OK);
         NEED(service(&f));
-        expect("no-endpoint-reset-without-owner", endpoint_resets(&f, &g,
-               MOQ_RESET_DELIVERY_TIMEOUT, false), 0);
-        expect("no-reset-attempt-without-owner", f.ep.reset_attempts, 0);
-        expect("commit-retires-timer", moq_session_next_deadline_us(f.sender), UINT64_MAX);
+        expect("recognized-timeout-survives-ack", endpoint_resets(&f, &g,
+               MOQ_RESET_DELIVERY_TIMEOUT, false), mode == REFUSED_TIMER_THEN_ACK ? 1 : 0);
+        expect("exact-reset-attempts", f.ep.reset_attempts,
+               mode == REFUSED_TIMER_THEN_ACK ? 1 : 0);
+        expect("settled-map-retired", moq_transport_bridge_find_ref(f.bridge, g.sid)._v, 0);
+        expect("settlement-retires-timer", moq_session_next_deadline_us(f.sender), UINT64_MAX);
         if (mode == REFUSED_TIMER_THEN_ACK)
             expect("action-pressure-sibling-progress", sibling_payloads(&f, &sibling), 4);
         goto progress;
@@ -585,6 +632,8 @@ static void order_boundary_case(moq_version_t version, bool client, unsigned mod
         expect("refused-reset-prefix", f.ep.reset_prefix, g.header_len);
         expect("native-refusal-no-accepted-reset", endpoint_resets(&f, &g,
                MOQ_RESET_DELIVERY_TIMEOUT, false), 0);
+        expect("native-refusal-one-local-terminal", terminal_events(&f, &g,
+               MOQ_RESET_DELIVERY_TIMEOUT, MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT), 1);
         goto done;
     }
     NEED(service(&f));
@@ -598,6 +647,9 @@ static void order_boundary_case(moq_version_t version, bool client, unsigned mod
     NEED(service(&f));
     expect("post-accept-acks-inert", f.ep.reset_attempts, attempts);
 progress:
+    expect("exact-local-timeout-event-count", terminal_events(&f, &g,
+           MOQ_RESET_DELIVERY_TIMEOUT, MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT),
+           mode == ACK_AT_DEADLINE ? 0 : 1);
     fake_endpoint_clear_ops(&f.ep.fake);
     NEED(moq_session_write_object(f.sender, sibling.handle, 20, f.payload, f.now) == MOQ_OK);
     NEED(service(&f));

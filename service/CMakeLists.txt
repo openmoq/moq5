@@ -1155,6 +1155,17 @@ if(MOQ_BUILD_TESTS)
             target_compile_options(test_media_sender_owed_output PRIVATE
                 $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
             add_test(NAME media_sender_owed_output COMMAND test_media_sender_owed_output)
+            add_executable(test_media_sender_subgroup_terminal
+                tests/test_media_sender_subgroup_terminal.c)
+            target_link_libraries(test_media_sender_subgroup_terminal PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_subgroup_terminal PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_subgroup_terminal PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_subgroup_terminal
+                COMMAND test_media_sender_subgroup_terminal)
+            set_tests_properties(media_sender_subgroup_terminal PROPERTIES TIMEOUT 30)
         endif()
 
         add_executable(test_service_surfaces tests/test_service_surfaces.c)

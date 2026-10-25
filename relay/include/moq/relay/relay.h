@@ -1302,6 +1302,15 @@ typedef uint32_t moqr_delivery_outcome_t;
  * abandoned head WITHOUT counting a delivery. (An ABANDONED head with nothing
  * begun downstream is skipped internally and never surfaces this outcome.) */
 #define MOQR_DELIVERY_ABANDONED    5u
+/* Intentionally discard this subscription's record after its outgoing
+ * subgroup ended locally. Advance only this record, release held pins and
+ * clear its begun watermark, without counting delivery, abandoning the
+ * shared source or retiring the subscription. Recordless notices still use
+ * their normal acknowledgement; DISCARDED is invalid for a notice or a
+ * synthetic whole-group eviction reset. Emits CURSOR_SKIP trace detail 2
+ * (intentional discard): e0=binding slot, e1=subscription slot, e2=group ID,
+ * e3=object ID. It never emits a delivered-record trace. */
+#define MOQR_DELIVERY_DISCARDED    7u
 
 /*
  * Peek the highest-ranked deliverable record across the binding's ACTIVE
@@ -1323,7 +1332,7 @@ typedef uint32_t moqr_delivery_outcome_t;
  * recordless NOTICE (out->notice != NONE, defined above the struct) is a
  * delivery like any other: it precedes record work, holds verbatim across a
  * WOULD_BLOCK, is consumed only by a DELIVERED acknowledgement, and admits
- * no STALLED/ABANDONED outcome (MOQR_ERR_INVAL).
+ * no STALLED/ABANDONED/DISCARDED outcome (MOQR_ERR_INVAL).
  *
  * COMPLETE records are served whole-object (rec.chunk_count == 0, payload in
  * rec.payload) or chunked (rec.chunk_count > 0, payload NULL — read the chunks

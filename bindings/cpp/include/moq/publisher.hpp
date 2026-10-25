@@ -351,11 +351,19 @@ public:
 
     // -- Event processing ----------------------------------------------
 
+    /* Sole event consumer for this session: one bounded FIFO pass with
+     * staged-work progress before and after it, on every draft. would_block
+     * means work remains; drain actions and retry in driver rounds, yielding
+     * when nothing progresses. Do not also poll session events directly. */
     result<void> tick(uint64_t now)
     {
         return result_from_rc(moq_pub_tick(p_, now));
     }
 
+    /* Retry owned work without polling events. A manual C event dispatcher
+     * calls this once per progress round, then keeps routing FIFO events even
+     * after would_block. Never spin waiting for flush-to-OK before polling;
+     * a consumed event is owned and must not be replayed. See publisher.h. */
     result<void> flush(uint64_t now)
     {
         return result_from_rc(moq_pub_flush(p_, now));

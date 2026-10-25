@@ -15,6 +15,10 @@
 typedef struct moq_action_meta {
     uint64_t terminal_owner;     /* owner of PUBLISH_DONE; 0 for other actions */
     bool subgroup_header;       /* the stream prefix, never an object header */
+    /* An empty data placeholder retains its scheduling identity until the
+     * outgoing terminal event and its replacement RESET_DATA commit. */
+    bool terminal_barrier;
+    bool outgoing_terminal;
     uint64_t deadline_us;        /* UINT64_MAX = no object delivery deadline */
     uint64_t owner;              /* request handle; a fill uses its parent */
     uint64_t group_id;
