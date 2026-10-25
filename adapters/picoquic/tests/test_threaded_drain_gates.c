@@ -25,8 +25,14 @@
  * reached its pump), yet a wake overtook it: the public probe must read
  * PENDING. Released, a later pass admits and drains the batch.
  * The hook is installed from the pump (the owner executor), never from the
- * test thread. Parking is bounded; every failure path releases the network
- * thread before stop/destroy.
+ * test thread, by the first pump of the publishing side. That side is fixed
+ * before either facade starts, so the install does not wait for the test
+ * thread to learn the facade's handle: a network thread can pump before
+ * moq_pq_threaded_create returns. The late-publication rows (one per site)
+ * make that order certain -- the test thread publishes the handle only after
+ * the publisher's first pump -- and require the hook installed by then.
+ * Parking is bounded; every failure path releases the network thread before
+ * stop/destroy.
  *
  * Datagrams are an observer-integration workload on the adapter's existing
  * public datagram path (the threaded helper negotiates QUIC DATAGRAM by
@@ -70,9 +76,10 @@ enum { BATCH = 600, BOUND_MS = 5000, MAX_ACTIONS = 2048 };
 typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
-    bool               publisher_is_server;
-    moq_pq_threaded_t *publisher;          /* whose stage hook observes */
+    bool               publisher_is_server; /* set before either facade starts */
+    moq_pq_threaded_t *publisher;          /* the test thread's handle to it */
     bool               hook_installed;     /* by the publisher's pump */
+    bool               publisher_pumped;   /* the publisher's pump has run */
     /* subscription plumbing (network threads) */
     bool               subscribed;
     bool               established;
@@ -243,18 +250,22 @@ static void admit_batch(moq_session_t *s, uint64_t now)
     unlock();
 }
 
-/* On a pump (the owner executor): install the hook on the publisher once.
- * The publisher is published by the test thread after both facades exist,
- * so it is read under the fixture mutex, as is the installed flag. */
-static void install_hook_once(moq_pq_threaded_t *t)
+/* On a pump (the owner executor) of the publishing side, `server_side`
+ * saying which side this pump serves: install the hook the first time, and
+ * record that the publisher has pumped. The publishing side is set before
+ * either facade starts; the facade's handle is not needed, so a pump that
+ * runs before the test thread has it installs the hook all the same. */
+static void publisher_pump(moq_pq_threaded_t *t, bool server_side)
 {
     lock();
-    bool mine = t == g.publisher && !g.hook_installed;
+    bool mine = server_side == g.publisher_is_server;
+    bool install = mine && !g.hook_installed;
     unlock();
     if (!mine) return;
-    moq_pq_threaded_test_set_stage_hook(t, stage_hook, NULL);
+    if (install) moq_pq_threaded_test_set_stage_hook(t, stage_hook, NULL);
     lock();
-    g.hook_installed = true;
+    if (install) g.hook_installed = true;
+    g.publisher_pumped = true;
     pthread_cond_broadcast(&g.cv);
     unlock();
 }
@@ -262,7 +273,7 @@ static void install_hook_once(moq_pq_threaded_t *t)
 static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane, uint64_t now, void *ctx)
 {
     (void)ctx;
-    install_hook_once(t);
+    publisher_pump(t, true);
     for (moq_pq_threaded_conn_t *c = moq_pq_threaded_lane_next_conn(lane, NULL); c;
          c = moq_pq_threaded_lane_next_conn(lane, c)) {
         moq_session_t *s = moq_pq_threaded_conn_session(c);
@@ -281,7 +292,7 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane, uint6
 static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane, uint64_t now, void *ctx)
 {
     (void)lane; (void)ctx;
-    install_hook_once(t);
+    publisher_pump(t, false);
     moq_session_t *s = moq_pq_threaded_session(t);
     if (!s) return 0;
     if (g.publisher_is_server) {
@@ -350,7 +361,8 @@ static bool probe_reaches(moq_pq_threaded_t *t, int want)
     }
 }
 
-static void run_row(bool publisher_is_server, int port, bool old_pass)
+static void run_row(bool publisher_is_server, int port, bool old_pass,
+                    bool late_publication)
 {
     int before = failures;
     memset(&g, 0, sizeof(g));
@@ -361,6 +373,17 @@ static void run_row(bool publisher_is_server, int port, bool old_pass)
     moq_pq_threaded_t *cli = srv ? make(false, port) : NULL;
     CHECK(srv && cli);
     if (!srv || !cli) goto out;
+    if (late_publication) {
+        /* The publisher pumps before the test thread has its handle: the
+         * hook is installed by then, without a later pump or a wake. */
+        lock();
+        bool pumped = wait_flag(&g.publisher_pumped);
+        bool hooked_unpublished = g.hook_installed;
+        unlock();
+        CHECK(pumped);
+        CHECK(hooked_unpublished);
+        if (!pumped) goto out;
+    }
     lock();
     g.publisher = publisher_is_server ? srv : cli;
     unlock();
@@ -480,7 +503,8 @@ out:
     pthread_cond_destroy(&g.cv);
     pthread_mutex_destroy(&g.mu);
     printf("%s: threaded drain %s, %s site\n", failures == before ? "PASS" : "FAIL",
-           old_pass ? "old-pass publication" : "gate",
+           old_pass ? "old-pass publication"
+                    : late_publication ? "gate, handle published late" : "gate",
            publisher_is_server ? "server aggregate" : "client single-connection");
 }
 
@@ -488,10 +512,12 @@ int main(void)
 {
     srand((unsigned)getpid());
     int port = 16200 + (rand() % 400);
-    run_row(false, port, false);
-    run_row(true, port + 7, false);
-    run_row(false, port + 14, true);
-    run_row(true, port + 21, true);
+    run_row(false, port, false, false);
+    run_row(true, port + 7, false, false);
+    run_row(false, port + 14, true, false);
+    run_row(true, port + 21, true, false);
+    run_row(false, port + 28, false, true);
+    run_row(true, port + 35, false, true);
     return failures ? 1 : 0;
 }
 

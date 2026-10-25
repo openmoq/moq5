@@ -1282,9 +1282,11 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     add_test(NAME pq_lane_group_unwind COMMAND test_pq_lane_group_unwind)
     set_tests_properties(pq_lane_group_unwind PROPERTIES TIMEOUT 30)
 
-    # Drives one real receive turn through the test-internals seam and confirms
-    # the per-turn budget is shared fairly across a lane's ready sockets (the
-    # use of pq_recv_share, not its arithmetic). Public seam only, no context.
+    # Drives one real receive turn through the test-internals seams: over two
+    # scripted sockets the per-turn budget is shared exactly fairly
+    # (pq_recv_turn), and over two real loopback sockets the turn reads within
+    # each socket's share (pq_recv_turn_native). The use of pq_recv_share, not
+    # its arithmetic; no connection context.
     add_executable(test_pq_recv_turn tests/test_pq_recv_turn.c)
     target_link_libraries(test_pq_recv_turn PRIVATE
         moq-adapter-picoquic-threaded-test-internals Threads::Threads)
@@ -1292,8 +1294,10 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         target_compile_options(test_pq_recv_turn PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
-    add_test(NAME pq_recv_turn COMMAND test_pq_recv_turn)
+    add_test(NAME pq_recv_turn COMMAND test_pq_recv_turn fair)
     set_tests_properties(pq_recv_turn PROPERTIES TIMEOUT 30)
+    add_test(NAME pq_recv_turn_native COMMAND test_pq_recv_turn native)
+    set_tests_properties(pq_recv_turn_native PROPERTIES TIMEOUT 30)
 
     # Reads a lane's detect-drop fold through the public lane-stats getter after
     # presetting the counters through the test-internals seam, so the public

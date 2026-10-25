@@ -84,6 +84,14 @@ struct pq_lane {
     picoquic_packet_loop_param_t send_param;
     uint64_t deadline_served;        /* the lane deadline instant last pumped for */
     _Atomic uint64_t st[ST_COUNT];
+#ifdef MOQ_PQ_THREADED_TESTING
+    /* A receive-turn test's view of the reads, per socket: with test_queued
+     * set the sockets are scripted (each holds test_queued[i] datagrams and
+     * no kernel is read); with test_reads set each datagram read is counted.
+     * Null in every lane the group creates. */
+    int *test_queued;
+    int *test_reads;
+#endif
 };
 
 struct pq_lane_group {
@@ -449,6 +457,34 @@ static pq_route_kind_t lane_dispatch(struct pq_lane *ln, uint8_t *buf,
     return r.kind;
 }
 
+#ifdef MOQ_PQ_THREADED_TESTING
+/* One datagram for the receive turn of the test-internals build. A scripted
+ * socket gives one oversized datagram (the whole buffer) while its count
+ * lasts, then none, so a test knows the input the turn met exactly; a real
+ * socket is read as in the shipped build, and the read counted. */
+static int lane_test_recvmsg(struct pq_lane *ln, struct pq_lane_socket *s,
+                             struct sockaddr_storage *from,
+                             struct sockaddr_storage *to, int *if_index,
+                             unsigned char *ecn, uint8_t *buf, int len)
+{
+    const int i = (int)(s - ln->sock);
+    if (ln->test_queued) {
+        if (ln->test_queued[i] <= 0) return -1;
+        ln->test_queued[i]--;
+        ln->test_reads[i]++;
+        memset(buf, 0x5A, (size_t)len);
+        return len;
+    }
+    int got = picoquic_recvmsg(s->fd, from, to, if_index, ecn, buf, len);
+    if (got > 0 && ln->test_reads) ln->test_reads[i]++;
+    return got;
+}
+#define LANE_RECVMSG(ln, s, ...) lane_test_recvmsg(ln, s, __VA_ARGS__)
+#else
+/* The shipped build reads the socket itself. */
+#define LANE_RECVMSG(ln, s, ...) picoquic_recvmsg(s->fd, __VA_ARGS__)
+#endif
+
 /* Read this turn's datagrams from one socket. Returns the datagrams read. */
 static int lane_receive(struct pq_lane *ln, struct pq_lane_socket *s,
                         int budget, uint64_t now, size_t *bytes_total,
@@ -462,8 +498,8 @@ static int lane_receive(struct pq_lane *ln, struct pq_lane_socket *s,
         unsigned char ecn = 0;
         memset(&from, 0, sizeof(from));
         memset(&to, 0, sizeof(to));
-        int got = picoquic_recvmsg(s->fd, &from, &to, &if_index, &ecn, buf,
-                                   (int)sizeof(buf));
+        int got = LANE_RECVMSG(ln, s, &from, &to, &if_index, &ecn, buf,
+                               (int)sizeof(buf));
         if (got <= 0) break;
         n++;
         st_add(ln, ST_RECEIVED, 1);
@@ -576,11 +612,12 @@ _Atomic int moq_pq_threaded_test_spawn_fail_reached;
 _Atomic int moq_pq_threaded_test_live_at_spawn_fail;
 
 /* Drive one receive turn over a lane whose only populated fields are the given
- * ready socket fds, so a test can confirm the per-turn budget is shared fairly
- * among them. The caller queues oversized datagrams: each is read and counted
- * toward the budget but discarded before routing, so no connection context is
- * needed. Returns the datagrams read. At most two sockets, as a lane has. */
-int moq_pq_threaded_test_recv_turn(const int *fds, int nsock)
+ * socket fds, all reported ready, so a test can confirm how the per-turn
+ * budget is shared among them. The caller queues oversized datagrams: each is
+ * read and counted toward the budget but discarded before routing, so no
+ * connection context is needed. Returns the datagrams read, and reads[i] the
+ * datagrams the turn read from fds[i]. At most two sockets, as a lane has. */
+int moq_pq_threaded_test_recv_turn(const int *fds, int nsock, int *reads)
 {
     struct pq_lane ln;
     struct pollfd pfd[2];
@@ -590,11 +627,38 @@ int moq_pq_threaded_test_recv_turn(const int *fds, int nsock)
     if (nsock > 2) nsock = 2;
     ln.nsock = nsock;
     for (int i = 0; i < nsock; i++) {
+        reads[i] = 0;
         ln.sock[i].fd = fds[i];
         pfd[i].fd = fds[i];
         pfd[i].events = POLLIN;
         pfd[i].revents = POLLIN;
     }
+    ln.test_reads = reads;
+    return lane_recv_turn(&ln, pfd, 0, &bytes, &fanout);
+}
+
+/* The same turn over scripted sockets, all reported ready: socket i holds
+ * queued[i] oversized datagrams and no kernel is read, so the input the turn
+ * met is known exactly. Returns the datagrams read; on return reads[i] is
+ * what the turn read from socket i and queued[i] what it left there. */
+int moq_pq_threaded_test_recv_turn_scripted(int *queued, int nsock, int *reads)
+{
+    struct pq_lane ln;
+    struct pollfd pfd[2];
+    size_t bytes = 0;
+    int fanout = 0;
+    memset(&ln, 0, sizeof(ln));
+    if (nsock > 2) nsock = 2;
+    ln.nsock = nsock;
+    for (int i = 0; i < nsock; i++) {
+        reads[i] = 0;
+        ln.sock[i].fd = -1;
+        pfd[i].fd = -1;
+        pfd[i].events = POLLIN;
+        pfd[i].revents = POLLIN;
+    }
+    ln.test_queued = queued;
+    ln.test_reads = reads;
     return lane_recv_turn(&ln, pfd, 0, &bytes, &fanout);
 }
 
