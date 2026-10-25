@@ -544,6 +544,9 @@ typedef struct b_meta_publish {
 #define B_PARK_ACTION_CAP 1u   /* session action queue full: capacity gate  */
 #define B_PARK_SESSION_SG 2u   /* session subgroup pool: one try per pump   */
 
+#define B_RETRY_REFUSAL (1u << 0)
+#define B_RETRY_CANCEL  (1u << 1)
+
 #define B_DRAFT_16 0u
 #define B_DRAFT_18 1u
 #define B_DRAFT_22 2u
@@ -568,13 +571,10 @@ typedef struct b_conn {
      * is encoded for the peer that reads it. Rides the bool padding — no size
      * cost. */
     uint8_t        wire_draft;       /* B_DRAFT_*                       */
-    /* Whether a refusal entry may be held (set by bind_terminal_hold) or an
-     * upstream cancellation may be owed (set where cancel_owed is). Each is
-     * cleared only by the walk that finds none left, so a false flag proves
-     * the table holds nothing for the per-pump walks to retry. Both ride the
-     * bool padding — no size cost. */
-    bool           refusal_held;
-    bool           cancel_scan;
+    /* B_RETRY_*: a held refusal or owed upstream cancellation. Each bit is
+     * cleared only by the walk that finds none left. Sharing one byte keeps
+     * both scan hints in the padding before park_cap. */
+    uint8_t        retry_pending;
     size_t         park_cap;         /* ACTION_CAP: capacity floor when
                                       * parked; retry only above it     */
 #ifdef MOQR_BIND_TESTING
@@ -1427,17 +1427,20 @@ moqr_bind_debug_scan_bounds_ok(const moqr_bind_t *b)
                 return false;
             }
         }
-        for (uint32_t i = 0; !cn->refusal_held && i < b->n_refusals; i++) {
+        for (uint32_t i = 0; !(cn->retry_pending & B_RETRY_REFUSAL) &&
+                             i < b->n_refusals; i++) {
             if (cn->refusals[i].used) {
                 return false;
             }
         }
-        for (uint32_t i = 0; !cn->cancel_scan && i < b->n_usubs; i++) {
+        for (uint32_t i = 0; !(cn->retry_pending & B_RETRY_CANCEL) &&
+                             i < b->n_usubs; i++) {
             if (cn->usubs[i].used && cn->usubs[i].cancel_owed) {
                 return false;
             }
         }
-        for (uint32_t i = 0; !cn->cancel_scan && i < b->n_pubs; i++) {
+        for (uint32_t i = 0; !(cn->retry_pending & B_RETRY_CANCEL) &&
+                             i < b->n_pubs; i++) {
             if (cn->pubs[i].used && cn->pubs[i].cancel_owed) {
                 return false;
             }
@@ -3308,8 +3311,7 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
             cn->fetch_hw = 0;
             memset(cn->refusals, 0, (size_t)b->n_refusals * sizeof(*cn->refusals));
             cn->refusals_reserved = 0;
-            cn->refusal_held = false;
-            cn->cancel_scan = false;
+            cn->retry_pending = 0;
             /* The relay answers every downstream subscription update itself
              * (bind_update_answer), so nothing is acknowledged before the
              * relay has decided. */
@@ -9256,7 +9258,7 @@ bind_terminal_hold(moqr_bind_t *b, b_conn_t *cn, const b_refusal_t *want)
         b_refusal_t *r = &cn->refusals[i];
         if (!r->used) {
             *r = *want;
-            cn->refusal_held = true;
+            cn->retry_pending |= B_RETRY_REFUSAL;
             FWD_DBG(b, refusals_parked);
             return;
         }
@@ -9358,7 +9360,8 @@ static uint32_t
 bind_refusal_free(const moqr_bind_t *b, const b_conn_t *cn)
 {
     uint32_t free_slots = b->n_refusals;
-    for (uint32_t i = 0; cn->refusal_held && i < b->n_refusals; i++) {
+    for (uint32_t i = 0; (cn->retry_pending & B_RETRY_REFUSAL) &&
+                         i < b->n_refusals; i++) {
         free_slots -= cn->refusals[i].used ? 1u : 0u;
     }
     return free_slots > cn->refusals_reserved
@@ -9394,7 +9397,7 @@ bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
     for (uint32_t ci = 0; ci < b->max_conns; ci++) {
         b_conn_t *cn = &b->conns[ci];
         if (!cn->used || cn->closed || cn->session == NULL ||
-            !cn->refusal_held) {
+            !(cn->retry_pending & B_RETRY_REFUSAL)) {
             continue;
         }
         for (uint32_t i = 0; i < b->n_refusals; i++) {
@@ -9448,7 +9451,8 @@ bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
         for (uint32_t i = 0; !held && i < b->n_refusals; i++) {
             held = cn->refusals[i].used;
         }
-        cn->refusal_held = held;
+        cn->retry_pending = (uint8_t)((cn->retry_pending & ~B_RETRY_REFUSAL) |
+                                      (held ? B_RETRY_REFUSAL : 0u));
     }
 }
 
@@ -11707,7 +11711,7 @@ bind_track_malformed(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
             usub_release(b, us);
         } else {
             us->cancel_owed = true;
-            cn->cancel_scan = true;
+            cn->retry_pending |= B_RETRY_CANCEL;
         }
     } else if (bp != NULL) {
         uint64_t code = MOQ_STREAM_ERROR_MALFORMED_TRACK;
@@ -11721,7 +11725,7 @@ bind_track_malformed(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
         } else {
             bp->cancel_owed = true;
             bp->cancel_code = code;
-            cn->cancel_scan = true;
+            cn->retry_pending |= B_RETRY_CANCEL;
         }
     }
 }
@@ -11780,7 +11784,7 @@ bind_cancel_upstream_pub(b_conn_t *cn, moq_publication_t pub, uint64_t code,
 static void
 bind_retry_owed_cancels(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
-    if (!cn->cancel_scan) {
+    if (!(cn->retry_pending & B_RETRY_CANCEL)) {
         return;   /* nothing was marked owed since a walk last found none */
     }
     for (uint32_t i = 0; i < b->n_usubs; i++) {
@@ -11810,7 +11814,8 @@ bind_retry_owed_cancels(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
     for (uint32_t i = 0; !owed && i < b->n_pubs; i++) {
         owed = cn->pubs[i].used && cn->pubs[i].cancel_owed;
     }
-    cn->cancel_scan = owed;
+    cn->retry_pending = (uint8_t)((cn->retry_pending & ~B_RETRY_CANCEL) |
+                                  (owed ? B_RETRY_CANCEL : 0u));
 }
 
 static void

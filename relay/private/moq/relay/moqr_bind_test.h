@@ -187,8 +187,8 @@ uint64_t moqr_bind_debug_intent_retry_suppressed(const moqr_bind_t *b);
 
 /* Test-only: the per-connection bounds the per-pump walks rely on hold on
  * every live connection: each used fetch slot lies below the connection's
- * fetch high-water, a held refusal has refusal_held set, and an owed
- * upstream cancellation has cancel_scan set. */
+ * fetch high-water, and held refusals and owed upstream cancellations have
+ * their retry bits set. */
 bool moqr_bind_debug_scan_bounds_ok(const moqr_bind_t *b);
 #endif
 

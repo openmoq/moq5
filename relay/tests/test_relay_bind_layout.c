@@ -1,8 +1,8 @@
 /*
  * Bind delivery-scheduler capacity oracle. White-box (includes moqr_bind.c):
- * pins the delivery-park structural delta with a baseline b_conn_t replica (the
- * park fields must cost exactly one size_t — park_reason rides existing
- * bool padding), the widened bitset word arithmetic at the uint32_t
+ * pins the 64-bit delivery-park structural delta with a baseline b_conn_t
+ * replica (the park fields cost one size_t in that ABI's padding), the
+ * widened bitset word arithmetic at the uint32_t
  * maximum, the descriptor slope across the 63/64/65 and 128/129 word
  * boundaries (ready + parked add exactly TWO 8-byte words per crossing),
  * the bind-owned pump scratch term, and the create-time counting-allocator
@@ -69,7 +69,7 @@ static void ca_init(ca_t *a)
     a->vt.free = ca_f;
 }
 
-/* -- Layout pin: the park state costs exactly one size_t -------------------- */
+/* -- 64-bit footprint pin -------------------------------------------------- */
 
 typedef struct b_conn_baseline {
     bool           used;
@@ -88,8 +88,11 @@ typedef struct b_conn_baseline {
     uint64_t       requests_seen;
 } b_conn_baseline_t;
 
-_Static_assert(sizeof(b_conn_t) == sizeof(b_conn_baseline_t) + sizeof(size_t),
-               "park_reason must ride bool padding; park_cap costs one size_t");
+/* Smaller ABIs have different pointer/uint64_t padding. Their allocation
+ * sizes are checked by the descriptor and counting-allocator equations below. */
+_Static_assert(sizeof(void *) != 8 || sizeof(size_t) != 8 ||
+                   sizeof(b_conn_t) == sizeof(b_conn_baseline_t) + sizeof(size_t),
+               "64-bit park state and retry hints must cost one size_t");
 
 /* -- Word arithmetic: widened round-up ---------------------------------------- */
 
@@ -415,7 +418,8 @@ test_deferred_event_readiness(void)
     b_meta_publish_t metadata;
     memset(&metadata, 0, sizeof(metadata));
     b_conn_t cn = { .used = true, .events_pending = true,
-                    .refusals = &refusal, .park_reason = B_PARK_ACTION_CAP };
+                    .refusals = &refusal, .retry_pending = B_RETRY_REFUSAL,
+                    .park_reason = B_PARK_ACTION_CAP };
     uint64_t ready = 1, parked = 1;
     moqr_bind_t b = { .max_conns = 1, .n_refusals = 1, .conns = &cn,
                      .metadata_publish_cap = 1, .metadata_publishes = &metadata,
@@ -621,6 +625,42 @@ answer_fixture_close(answer_fixture_t *f)
     moqr_core_destroy(f->core);
     moq_session_destroy(f->peer);
     moq_session_destroy(f->server);
+}
+
+/* The two scan hints share storage, but settling one cannot clear the other. */
+static int
+test_retry_hint_independence(void)
+{
+    int failures = 0;
+    answer_fixture_t f;
+    bool opened = answer_fixture_open(&f);
+    MOQ_TEST_CHECK(opened);
+    if (!opened) goto cleanup;
+    b_conn_t *cn = &f.bind->conns[0];
+    MOQ_TEST_CHECK(cn->retry_pending == 0);
+
+    cn->retry_pending = B_RETRY_REFUSAL | B_RETRY_CANCEL;
+    bind_refusal_pump(f.bind, 2);
+    MOQ_TEST_CHECK(cn->retry_pending == B_RETRY_CANCEL);
+
+    b_refusal_t held = { .used = true, .kind = MOQR_AUTH_FETCH };
+    bind_terminal_hold(f.bind, cn, &held);
+    MOQ_TEST_CHECK(cn->retry_pending == (B_RETRY_REFUSAL | B_RETRY_CANCEL));
+    bind_retry_owed_cancels(f.bind, cn, 2);
+    MOQ_TEST_CHECK(cn->retry_pending == B_RETRY_REFUSAL);
+    MOQ_TEST_CHECK(cn->refusals[0].used);
+    MOQ_TEST_CHECK(bind_refusal_free(f.bind, cn) == f.bind->n_refusals - 1u);
+
+    /* Releasing a held entry leaves a conservative hint until the next walk. */
+    memset(&cn->refusals[0], 0, sizeof(cn->refusals[0]));
+    bind_refusal_pump(f.bind, 3);
+    MOQ_TEST_CHECK(cn->retry_pending == 0);
+    MOQ_TEST_CHECK(f.bind->session_errors == 0);
+cleanup:
+    answer_fixture_close(&f);
+    MOQ_TEST_CHECK_EQ_INT((int)f.alloc.live, 0);
+    MOQ_TEST_PASS("retry_hint_independence");
+    return failures;
 }
 
 /* Use the existing raw-pair transport, recording the actual sender refs. */
@@ -1141,6 +1181,7 @@ main(void)
     failures += test_terminal_event_identity();
     failures += test_deferred_event_readiness();
     failures += test_stopped_full_table();
+    failures += test_retry_hint_independence();
     for (unsigned reject = 0; reject < 2; reject++) {
         failures += test_namespace_answer_event_gate(true, reject != 0);
         failures += test_namespace_answer_event_gate(false, reject != 0);

@@ -57,6 +57,28 @@ jobs:
             .deps/wtquic-ci/build.*/*.log
             build/relay-setup/CMakeCache.txt
 
+  relay-tests:
+    name: Relay library suite (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure relay libraries and simulator
+        run: >
+          cmake --preset default -B build/relay-tests
+          -DMOQ_BUILD_RELAY_CORE=ON -DMOQ_BUILD_RELAY_RUNTIME=ON
+          -DMOQ_BUILD_RELAY_TOOL=OFF -DMOQ_BUILD_EXAMPLES=OFF
+      - name: Build configured tree
+        run: cmake --build build/relay-tests --parallel 2
+      - name: Relay library and scenario tests
+        run: >
+          ctest --test-dir build/relay-tests --output-on-failure
+          --no-tests=error --parallel 2 --timeout 120
+          -R '^(relay_|scenario_relay_)'
+
   build-and-test:
     name: Build + Test (${{ matrix.preset }})
     runs-on: ${{ matrix.os }}

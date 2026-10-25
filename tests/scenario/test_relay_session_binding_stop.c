@@ -1,7 +1,7 @@
 /* Subgroup-local peer STOP regressions through the production binding.
  * The injection uses the traced sender-local ref, not SimPair's receive ref.
  * These rows deliberately do not exercise the transport bridge or STOP retry. */
-#include "relay_session_binding_harness.h"
+#include "../../relay/tests/relay_session_binding_harness.h"
 #include <moq/control.h>
 #include <moq/control_d18.h>
 

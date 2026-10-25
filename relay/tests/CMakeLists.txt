@@ -216,7 +216,9 @@ if(TARGET moq::sim)
     moqr_test_warnings(test_relay_props_delivery)
     add_test(NAME relay_props_delivery COMMAND test_relay_props_delivery)
     set_tests_properties(relay_props_delivery PROPERTIES TIMEOUT 120 LABELS "relay;sansio")
-    add_executable(test_relay_session_binding_stop test_relay_session_binding_stop.c
+    # Wire decoding belongs to a scenario outside the relay source boundary.
+    add_executable(test_relay_session_binding_stop
+        ${PROJECT_SOURCE_DIR}/tests/scenario/test_relay_session_binding_stop.c
         $<TARGET_OBJECTS:moq-relay-session-binding-harness>
         $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
     target_compile_definitions(test_relay_session_binding_stop PRIVATE MOQR_BIND_TESTING)
