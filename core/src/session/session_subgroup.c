@@ -113,7 +113,12 @@ static int sg_resolve_handle(moq_session_t *s, moq_subgroup_handle_t h)
 
 int sg_find_by_stream_ref(moq_session_t *s, moq_stream_ref_t ref)
 {
-    for (size_t i = 0; i < s->sg_cap; i++) {
+    /* The occupancy list holds exactly the live subgroups, in ascending slot
+     * order, so its first match is the lowest-slot match. */
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_sg_stream_find++;
+#endif
         moq_sg_entry_t *e = &s->subgroups[i];
         if (e->state != MOQ_SG_FREE && e->stream_ref._v == ref._v)
             return (int)i;
@@ -275,9 +280,17 @@ void session_expire_queued_data(moq_session_t *s)
 {
     uint64_t now = s->last_now_us;
     size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
+    /* Untimed actions carry UINT64_MAX, which is due only when the clock
+     * itself reads UINT64_MAX: short of that, an untimed ring has nothing
+     * due. */
+    if (s->action_timed == 0 && now != UINT64_MAX) return;
     bool any = false;
-    for (size_t i = head; i < tail && !any; i++)
+    for (size_t i = head; i < tail && !any; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_expiry_search++;
+#endif
         any = s->action_meta[i % cap].deadline_us <= now;
+    }
     if (!any) return;
 
     /* Drop every expired datagram and, on a subgroup stream, everything from
@@ -289,6 +302,9 @@ void session_expire_queued_data(moq_session_t *s)
      * subscription is closed. */
     size_t w = head;
     for (size_t r = head; r < tail; r++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_expiry_compact++;
+#endif
         moq_action_t *a = &s->actions[r % cap];
         moq_action_meta_t *m = &s->action_meta[r % cap];
         bool drop = false;
@@ -311,9 +327,16 @@ void session_expire_queued_data(moq_session_t *s)
                 }
             }
         }
-        if (drop) { moq_action_cleanup(a); continue; }
+        if (drop) {
+            session_action_dequeued(s, a, m);
+            moq_action_cleanup(a);
+            continue;
+        }
         if (reset_sg) {
             const uint64_t owner = m->owner;
+            /* Rewritten in place: it leaves as the expired data and enters
+             * as its stream's reset. */
+            session_action_dequeued(s, a, m);
             moq_action_cleanup(a);
             memset(a, 0, sizeof(*a));
             a->kind = MOQ_ACTION_RESET_DATA;
@@ -325,6 +348,7 @@ void session_expire_queued_data(moq_session_t *s)
             memset(m, 0, sizeof(*m));
             m->deadline_us = UINT64_MAX;
             m->owner = owner;
+            session_action_enqueued(s, a, m);
             reset_sg->state = MOQ_SG_RESETTING;
             reset_sg->streaming_payload_len = 0;
             reset_sg->streaming_bytes_written = 0;

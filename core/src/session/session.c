@@ -325,6 +325,14 @@ uint64_t session_work_index_find_calls;
 uint64_t session_work_index_rm_calls;
 uint64_t session_work_index_rm_search;
 uint64_t session_work_index_rm_backshift;
+uint64_t session_work_deadline_sg_probes;
+uint64_t session_work_deadline_sub_probes;
+uint64_t session_work_deadline_pub_probes;
+uint64_t session_work_queued_deadline;
+uint64_t session_work_expiry_search;
+uint64_t session_work_expiry_compact;
+uint64_t session_work_reset_offer;
+uint64_t session_work_sg_stream_find;
 uint64_t session_work_catchup_passes;
 uint64_t session_work_rx_rescan_passes;
 #endif
@@ -1011,6 +1019,7 @@ moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
         m->publisher_priority = (uint8_t)queued->u.send_data.scheduling_priority;
     }
     m->deadline_us = deadline_us;
+    session_action_enqueued(s, queued, m);
     s->action_tail++;
     session_refresh_idle(s, s->last_now_us);
     return MOQ_OK;
@@ -1030,7 +1039,12 @@ void session_tag_owner_done(moq_session_t *s, uint64_t owner)
 uint64_t session_queued_data_deadline(const moq_session_t *s)
 {
     uint64_t d = UINT64_MAX;
+    /* Untimed actions all carry UINT64_MAX: only a timed one can be earlier. */
+    if (s->action_timed == 0) return d;
     for (size_t i = s->action_head; i < s->action_tail; i++) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_queued_deadline++;
+#endif
         uint64_t x = s->action_meta[i % s->action_cap].deadline_us;
         if (x < d) d = x;
     }
@@ -1069,6 +1083,26 @@ static bool action_is_data(const moq_action_t *a)
 {
     moq_stream_ref_t ref;
     return a->kind == MOQ_ACTION_SEND_DATAGRAM || action_data_stream(a, &ref);
+}
+
+void session_action_enqueued(moq_session_t *s, const moq_action_t *a,
+                             const moq_action_meta_t *m)
+{
+    if (m->deadline_us != UINT64_MAX) s->action_timed++;
+    if (!action_is_data(a)) s->action_nondata++;
+}
+
+void session_action_dequeued(moq_session_t *s, const moq_action_t *a,
+                             const moq_action_meta_t *m)
+{
+    if (m->deadline_us != UINT64_MAX) {
+        assert(s->action_timed > 0);
+        s->action_timed--;
+    }
+    if (!action_is_data(a)) {
+        assert(s->action_nondata > 0);
+        s->action_nondata--;
+    }
 }
 
 static int sched_compare(const moq_action_meta_t *x, const moq_action_meta_t *y)
@@ -1141,6 +1175,7 @@ static size_t action_select(const moq_session_t *s)
 static void action_take(moq_session_t *s, size_t idx, moq_action_t *out)
 {
     size_t cap = s->action_cap;
+    session_action_dequeued(s, &s->actions[idx % cap], &s->action_meta[idx % cap]);
     *out = s->actions[idx % cap];
     for (size_t j = idx; j > s->action_head; j--) {
         s->actions[j % cap] = s->actions[(j - 1) % cap];
@@ -1871,6 +1906,7 @@ moq_result_t close_with_error(moq_session_t *s,
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
     s->action_head = s->action_tail = 0;
+    s->action_timed = s->action_nondata = 0;
     s->send_len = 0;
     s->event_head = s->event_tail = 0;
 
@@ -3710,6 +3746,7 @@ moq_result_t moq_session_on_transport_close(moq_session_t *s,
     decref_queued_event_payloads(s);
     free_rx_stream_bufs(s);
     s->action_head = s->action_tail = 0;
+    s->action_timed = s->action_nondata = 0;
     s->send_len = 0;
     s->event_head = s->event_tail = 0;
 
@@ -4001,8 +4038,15 @@ static void session_action_poll_settled(moq_session_t *s, bool released)
 bool bridge_session_offer_data_reset(moq_session_t *s,
                                      moq_reset_data_action_t *out)
 {
+    /* Preparing comes first: an expiry can rewrite queued data into its
+     * stream's reset, which the summary below then counts. */
     session_action_poll_prepare(s);
-    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+    /* The first non-data action decides; a ring of data alone has none. */
+    for (size_t i = s->action_head;
+         s->action_nondata != 0 && i < s->action_tail; ++i) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_reset_offer++;
+#endif
         const moq_action_t *a = &s->actions[i % s->action_cap];
         if (action_is_data(a)) continue;
         if (a->kind != MOQ_ACTION_RESET_DATA) return false;
@@ -4038,6 +4082,7 @@ void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
         moq_action_t *a = &s->actions[from];
         moq_stream_ref_t data_ref;
         if (action_data_stream(a, &data_ref) && data_ref._v == ref._v) {
+            session_action_dequeued(s, a, &s->action_meta[from]);
             moq_action_cleanup(a);
             continue;
         }
@@ -4533,7 +4578,11 @@ static uint64_t reported_subgroup_deadline(const moq_session_t *s)
 {
     uint64_t earliest_future = UINT64_MAX;
     uint64_t earliest_expired = UINT64_MAX;
-    for (size_t i = 0; i < s->sg_cap; i++) {
+    /* Only a live subgroup carries a deadline, and only those are linked. */
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_deadline_sg_probes++;
+#endif
         const moq_sg_entry_t *sg = &s->subgroups[i];
         if (sg->state == MOQ_SG_FREE) continue;
         if (sg->delivery_deadline_us == UINT64_MAX) continue;
@@ -4568,15 +4617,25 @@ uint64_t moq_session_next_deadline_us(const moq_session_t *s)
     if (qd < d) d = qd;
     if (s->idle_deadline_us < d) d = s->idle_deadline_us;
     /* §9.8: every armed, not-yet-fired terminal deadline; fired entries
-     * contribute only via the bounded retry deadline below. */
-    for (size_t i = 0; i < s->sub_cap; i++)
+     * contribute only via the bounded retry deadline below. A terminal
+     * deadline is armed only on a live owner, and freeing one clears it, so
+     * the occupancy lists hold every candidate. */
+    for (int32_t i = s->sub_occ_head; i >= 0; i = s->subs[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_deadline_sub_probes++;
+#endif
         if (s->subs[i].done_pending && !s->subs[i].done_expired &&
             s->subs[i].done_deadline_us < d)
             d = s->subs[i].done_deadline_us;
-    for (size_t i = 0; i < s->pub_cap; i++)
+    }
+    for (int32_t i = s->pub_occ_head; i >= 0; i = s->publishes[i].occ_next) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_work_deadline_pub_probes++;
+#endif
         if (s->publishes[i].done_pending && !s->publishes[i].done_expired &&
             s->publishes[i].done_deadline_us < d)
             d = s->publishes[i].done_deadline_us;
+    }
     if (s->expiry_retry_deadline_us < d) d = s->expiry_retry_deadline_us;
     if (s->has_owner_deadline && s->owner_deadline_us < d)
         d = s->owner_deadline_us;

@@ -2189,6 +2189,16 @@ struct moq_session {
     size_t        action_head;
     size_t        action_tail;
     moq_action_meta_t *action_meta;   /* parallel to actions */
+    /* A summary of the queued actions [action_head, action_tail): how many
+     * carry a finite OBJECT_DELIVERY_TIMEOUT expiry, and how many are not
+     * data (the kinds the poll's data scheduling does not reorder). It lets
+     * the expiry check, the queued-deadline query and the reset offer skip a
+     * queue that cannot hold what they look for. An action entering or
+     * leaving the ring, or a queued action whose kind or deadline changes in
+     * place, goes through session_action_enqueued/_dequeued; a ring emptied
+     * wholesale zeroes both. */
+    size_t        action_timed;
+    size_t        action_nondata;
 
     moq_event_t  *events;
     size_t        event_cap;
@@ -2687,6 +2697,14 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a);
 moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
                             const moq_action_meta_t *meta, uint64_t deadline_us);
 void session_tag_owner_done(moq_session_t *s, uint64_t owner);
+/* Keep the queued-action summary (action_timed, action_nondata) as an action
+ * enters the ring or leaves it, called with the action and its scheduling
+ * record as they stand at that moment. A queued action rewritten in place
+ * leaves as it was and enters as it becomes. */
+void session_action_enqueued(moq_session_t *s, const moq_action_t *a,
+                             const moq_action_meta_t *m);
+void session_action_dequeued(moq_session_t *s, const moq_action_t *a,
+                             const moq_action_meta_t *m);
 /* Earliest OBJECT_DELIVERY_TIMEOUT expiry among the queued actions. */
 uint64_t session_queued_data_deadline(const moq_session_t *s);
 /* Drop every queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at
@@ -4195,6 +4213,21 @@ extern uint64_t session_work_index_find_calls;   /* moq_index_find invocations *
 extern uint64_t session_work_index_rm_calls;     /* moq_index_remove invocations */
 extern uint64_t session_work_index_rm_search;    /* moq_index_remove search steps */
 extern uint64_t session_work_index_rm_backshift; /* moq_index_remove backshift steps */
+
+/*
+ * The deadline query's walks and the queued-action inspections of expiry and
+ * the reset offer, outside the advancing preamble: one counter per loop site,
+ * the same rule as above. moq_session_next_deadline_us is observing, so a test
+ * reads them around one query or one bridge service.
+ */
+extern uint64_t session_work_deadline_sg_probes;  /* subgroup slots visited, next-deadline query */
+extern uint64_t session_work_deadline_sub_probes; /* subscription slots visited, next-deadline query */
+extern uint64_t session_work_deadline_pub_probes; /* publication slots visited, next-deadline query */
+extern uint64_t session_work_queued_deadline;     /* queued actions visited, session_queued_data_deadline */
+extern uint64_t session_work_expiry_search;       /* queued actions visited, expiry's search for a due one */
+extern uint64_t session_work_expiry_compact;      /* queued actions visited, expiry's compaction */
+extern uint64_t session_work_reset_offer;         /* queued actions visited, bridge_session_offer_data_reset */
+extern uint64_t session_work_sg_stream_find;      /* subgroup slots visited, sg_find_by_stream_ref */
 
 /*
  * CONTROL loops: bounded by active work, not by capacity and not by occupancy.

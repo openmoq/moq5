@@ -22,6 +22,7 @@
 #include "test_support.h"
 #include "test_binding_support.h"
 #include "../support/fake_endpoint.h"
+#include "../support/occupancy_audit.h"
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/bridge/transport_bridge_internal.h"
 #include <stdio.h>
@@ -38,6 +39,14 @@ static bool g_shared_all = false;
 /* Data writes refused at the cap while the capability was advertised: that
  * the --shared-all rows reach a spent budget at all. */
 static uint32_t g_shared_cap_refusals = 0;
+
+/* Pool sizes both sessions of the next pair are created with (0: the
+ * session's default). A row sizes them, makes its pair and puts them back. */
+typedef struct {
+    uint32_t subscriptions, subgroups, publishes;
+    uint64_t done_wait_us;   /* the PUBLISH_DONE stream wait (0: default) */
+} pools_t;
+static pools_t g_pools;
 
 #define ASC  MOQ_GROUP_ORDER_ASCENDING
 #define DESC MOQ_GROUP_ORDER_DESCENDING
@@ -470,6 +479,33 @@ typedef struct {
     uint64_t now;
 } pair_t;
 
+/* The session's queued actions with a delivery deadline, and those that are
+ * not data, counted from its ring: what its summary (action_timed,
+ * action_nondata) must hold. Data is a datagram, a SEND_DATA, or a stream's
+ * own key; an owner-wide key, a reset and every control action are not. */
+static void session_queue_recount(const moq_session_t *s, size_t *timed,
+                                  size_t *nondata)
+{
+    *timed = *nondata = 0;
+    for (size_t i = s->action_head; i < s->action_tail; i++) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (s->action_meta[i % s->action_cap].deadline_us != UINT64_MAX)
+            ++*timed;
+        const bool data = a->kind == MOQ_ACTION_SEND_DATAGRAM ||
+            a->kind == MOQ_ACTION_SEND_DATA ||
+            (a->kind == MOQ_ACTION_SET_DATA_PRIORITY &&
+             a->u.set_data_priority.stream_ref._v != 0);
+        if (!data) ++*nondata;
+    }
+}
+
+#define CHECK_SESSION_COUNTS(s) do { \
+    size_t timed_, nondata_; \
+    session_queue_recount((s), &timed_, &nondata_); \
+    MOQ_TEST_CHECK_EQ_INT((int)(s)->action_timed, (int)timed_); \
+    MOQ_TEST_CHECK_EQ_INT((int)(s)->action_nondata, (int)nondata_); \
+} while (0)
+
 /* Peer uni bytes. These scenarios never run out of receive entries, so an
  * unconsumed chunk (which the endpoint would have to hold) is a failure. */
 static void feed_uni(moq_transport_bridge_t *b, uint64_t sid,
@@ -480,36 +516,45 @@ static void feed_uni(moq_transport_bridge_t *b, uint64_t sid,
                    MOQ_ERR_INPUT_NOT_CONSUMED);
 }
 
+/* The subscriber's bridge is serviced and what it wrote reaches the
+ * publisher's bridge, which is not serviced: the first half of a shuttle
+ * round. Returns how many operations moved. */
+static size_t shuttle_sub_to_pub(pair_t *p)
+{
+    size_t moved = 0;
+    moq_transport_bridge_service(p->sub_br, p->now);
+    for (size_t i = 0; i < p->sub_ep.count; i++) {
+        const fake_op_t *o = &p->sub_ep.ops[i];
+        if (o->kind == FAKE_OP_RESET || o->kind == FAKE_OP_ABORT) {
+            moved++;
+            moq_transport_bridge_on_peer_stream_reset(p->pub_br,
+                o->stream_id, o->error_code, p->now);
+        }
+        if (o->kind == FAKE_OP_STOP || o->kind == FAKE_OP_ABORT) {
+            moved++;
+            moq_transport_bridge_on_peer_stop_sending(p->pub_br,
+                o->stream_id, o->error_code, p->now);
+        }
+        if (o->kind != FAKE_OP_WRITE) continue;
+        moved++;
+        if (!uni_control(p->ver))
+            moq_transport_bridge_on_peer_control_bytes(p->pub_br,
+                o->stream_id, o->data, o->data_len, o->fin, p->now);
+        else if (o->stream_id < 2000)
+            feed_uni(p->pub_br, o->stream_id, o->data, o->data_len,
+                     o->fin, p->now);
+        else
+            moq_transport_bridge_on_peer_bidi_bytes(p->pub_br,
+                o->stream_id, o->data, o->data_len, o->fin, p->now);
+    }
+    fake_endpoint_clear_ops(&p->sub_ep);
+    return moved;
+}
+
 static void shuttle(pair_t *p)
 {
     for (int round = 0; round < 64; round++) {
-        size_t moved = 0;
-        moq_transport_bridge_service(p->sub_br, p->now);
-        for (size_t i = 0; i < p->sub_ep.count; i++) {
-            const fake_op_t *o = &p->sub_ep.ops[i];
-            if (o->kind == FAKE_OP_RESET || o->kind == FAKE_OP_ABORT) {
-                moved++;
-                moq_transport_bridge_on_peer_stream_reset(p->pub_br,
-                    o->stream_id, o->error_code, p->now);
-            }
-            if (o->kind == FAKE_OP_STOP || o->kind == FAKE_OP_ABORT) {
-                moved++;
-                moq_transport_bridge_on_peer_stop_sending(p->pub_br,
-                    o->stream_id, o->error_code, p->now);
-            }
-            if (o->kind != FAKE_OP_WRITE) continue;
-            moved++;
-            if (!uni_control(p->ver))
-                moq_transport_bridge_on_peer_control_bytes(p->pub_br,
-                    o->stream_id, o->data, o->data_len, o->fin, p->now);
-            else if (o->stream_id < 2000)
-                feed_uni(p->pub_br, o->stream_id, o->data, o->data_len,
-                         o->fin, p->now);
-            else
-                moq_transport_bridge_on_peer_bidi_bytes(p->pub_br,
-                    o->stream_id, o->data, o->data_len, o->fin, p->now);
-        }
-        fake_endpoint_clear_ops(&p->sub_ep);
+        size_t moved = shuttle_sub_to_pub(p);
         moq_transport_bridge_service(p->pub_br, p->now);
         for (size_t i = 0; i < p->mt->nctrl; i++) {
             const mt_ctrl_t *c = &p->mt->ctrl[i];
@@ -524,8 +569,10 @@ static void shuttle(pair_t *p)
                     c->sid, c->data, c->len, c->fin, p->now);
         }
         p->mt->nctrl = 0;
-        if (!moved) return;
+        if (!moved) break;
     }
+    CHECK_SESSION_COUNTS(p->pub);
+    CHECK_SESSION_COUNTS(p->sub);
 }
 
 static void drain_events(moq_session_t *s)
@@ -564,6 +611,10 @@ static bool pair_init_retained(pair_t *p, moq_version_t ver, size_t cap,
     cc.send_request_capacity = sc.send_request_capacity = true;
     cc.initial_request_capacity = sc.initial_request_capacity = 32;
     sc.max_actions = max_actions;
+    cc.max_subscriptions = sc.max_subscriptions = g_pools.subscriptions;
+    cc.max_open_subgroups = sc.max_open_subgroups = g_pools.subgroups;
+    cc.max_publishes = sc.max_publishes = g_pools.publishes;
+    cc.done_wait_timeout_us = sc.done_wait_timeout_us = g_pools.done_wait_us;
     if (moq_session_create(&cc, 0, &p->sub) < 0) return false;
     if (moq_session_create(&sc, 0, &p->pub) < 0) return false;
     if (test_bind_if_required(p->sub) < 0 || test_bind_if_required(p->pub) < 0)
@@ -645,10 +696,11 @@ static uint32_t dreset_recount(const moq_transport_bridge_t *b)
     return n;
 }
 
-/* Both table counts against their recounts. */
+/* Both table counts against their recounts, and the session's summary. */
 #define CHECK_TABLE_COUNTS(br) do { \
     MOQ_TEST_CHECK_EQ_INT((int)(br)->dq_timed, (int)dq_timed_recount(br)); \
     MOQ_TEST_CHECK_EQ_INT((int)(br)->dreset_count, (int)dreset_recount(br)); \
+    CHECK_SESSION_COUNTS((br)->session); \
 } while (0)
 
 /* Serve the network until nothing is left, servicing the publisher's
@@ -4759,12 +4811,29 @@ static void test_shared_admission_expiry(void)
 #ifdef MOQ_SESSION_SWEEP_TESTING
 typedef struct {
     uint64_t expiry_slots, expiry_items, reset_slots, query_slots;
+    /* The session's (session_internal.h): the next-deadline query's pool
+     * walks and its queued-deadline scan, expiry's search and compaction,
+     * the reset offer's queue scan and the stream-to-subgroup lookup. */
+    uint64_t dl_sg, dl_sub, dl_pub, queued_dl, expiry_search,
+             expiry_compact, reset_offer, sg_find;
 } walk_t;
 
 static walk_t walk_now(void)
 {
-    walk_t w = { bridge_work_expiry_slots, bridge_work_expiry_items,
-                 bridge_work_reset_slots, bridge_work_query_slots };
+    walk_t w = {
+        .expiry_slots = bridge_work_expiry_slots,
+        .expiry_items = bridge_work_expiry_items,
+        .reset_slots = bridge_work_reset_slots,
+        .query_slots = bridge_work_query_slots,
+        .dl_sg = session_work_deadline_sg_probes,
+        .dl_sub = session_work_deadline_sub_probes,
+        .dl_pub = session_work_deadline_pub_probes,
+        .queued_dl = session_work_queued_deadline,
+        .expiry_search = session_work_expiry_search,
+        .expiry_compact = session_work_expiry_compact,
+        .reset_offer = session_work_reset_offer,
+        .sg_find = session_work_sg_stream_find,
+    };
     return w;
 }
 
@@ -4775,6 +4844,14 @@ static walk_t walk_since(walk_t w0)
     w.expiry_items -= w0.expiry_items;
     w.reset_slots -= w0.reset_slots;
     w.query_slots -= w0.query_slots;
+    w.dl_sg -= w0.dl_sg;
+    w.dl_sub -= w0.dl_sub;
+    w.dl_pub -= w0.dl_pub;
+    w.queued_dl -= w0.queued_dl;
+    w.expiry_search -= w0.expiry_search;
+    w.expiry_compact -= w0.expiry_compact;
+    w.reset_offer -= w0.reset_offer;
+    w.sg_find -= w0.sg_find;
     return w;
 }
 
@@ -5821,6 +5898,909 @@ static void test_pass_costs(void)
                   "is tried once a pass, a reused slot's reset included");
 }
 
+/* -- session queue inspection ----------------------------------------------- */
+
+/* The session's deadline query walks its live subgroups, subscriptions and
+ * publications rather than their configured pools, and reads its queued
+ * actions only while one carries a deadline; expiry searches the queue for a
+ * due action, and the reset offer for the first control action, only where
+ * the queue can hold one. Each row holds its live set fixed and asserts the
+ * exact deadline, the wire and the session's queue summary; in the build with
+ * the session's probe counters it also asserts what each walk read. */
+
+/* A step the row cannot go on without: it returns at the first miss. */
+#define SS_REQUIRE(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+        failures++; \
+        return false; \
+    } \
+} while (0)
+
+#define SS_TIMEOUT_MS 7u
+#define SS_TIMEOUT_US ((uint64_t)SS_TIMEOUT_MS * 1000u)
+#define SS_LONG_MS 20u
+#define SS_LONG_US ((uint64_t)SS_LONG_MS * 1000u)
+#define SS_DONE_WAIT_US 40000u
+
+/* Pools far larger than any row's live set, and the defaults, both with an
+ * explicit PUBLISH_DONE stream wait. */
+static const pools_t k_ss_sparse = { 1024, 1024, 256, SS_DONE_WAIT_US };
+static const pools_t k_ss_default = { 0, 0, 0, SS_DONE_WAIT_US };
+
+static bool ss_pair(pair_t *p, moq_version_t ver, const pools_t *pools,
+                    uint32_t max_actions, uint64_t retained)
+{
+    g_pools = *pools;
+    const bool ok = pair_init_retained(p, ver, 1u << 20, true, PC_STREAMS,
+                                       max_actions, retained, 0, true);
+    memset(&g_pools, 0, sizeof(g_pools));
+    return ok;
+}
+
+/* Objects stream `sid` carried to the wire, recognized as wire_objects
+ * recognizes them: by the payload's length and marker. */
+static size_t ss_objects_on(const pair_t *p, uint64_t sid)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < p->mt->nwire; i++)
+        if (p->mt->wire[i].sid == sid && !p->mt->wire[i].reset &&
+            p->mt->wire[i].len == PAYLOAD_LEN &&
+            p->mt->wire[i].head[0] == PAYLOAD_TAG)
+            n++;
+    return n;
+}
+
+/* Stream `sid` carried exactly `want` to the wire, each once and in order.
+ * An object is identified as wire_objects identifies it, by its payload's
+ * length, marker and four identifying bytes, so a duplicate, a loss or a
+ * swap between the stream's objects shows; the rest of the payload is not
+ * compared. */
+static bool ss_stream_carried(const pair_t *p, uint64_t sid,
+                              const uint32_t *want, size_t n)
+{
+    size_t seen = 0;
+    bool in_order = true;
+    for (size_t i = 0; i < p->mt->nwire; i++) {
+        const uint8_t *h = p->mt->wire[i].head;
+        if (p->mt->wire[i].sid != sid || p->mt->wire[i].reset ||
+            p->mt->wire[i].len != PAYLOAD_LEN || h[0] != PAYLOAD_TAG)
+            continue;
+        const uint32_t id = (uint32_t)h[1] << 24 | (uint32_t)h[2] << 16 |
+                            (uint32_t)h[3] << 8 | h[4];
+        if (seen >= n || id != want[seen]) in_order = false;
+        seen++;
+    }
+    if (!in_order || seen != n)
+        fprintf(stderr, "stream %llu carried %zu objects, %zu expected%s\n",
+                (unsigned long long)sid, seen, n,
+                in_order ? "" : ", not the expected ones in order");
+    return in_order && seen == n;
+}
+
+/* Actions waiting in the session's ring. */
+static size_t ss_queued(const moq_session_t *s)
+{
+    return s->action_tail - s->action_head;
+}
+
+/* Live owners, counted over the whole of each pool: what a walk over the
+ * live owners alone must read. */
+static size_t ss_live_subgroups(const moq_session_t *s)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < s->sg_cap; i++)
+        if (s->subgroups[i].state != MOQ_SG_FREE) n++;
+    return n;
+}
+
+static size_t ss_live_subs(const moq_session_t *s)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < s->sub_cap; i++)
+        if (s->subs[i].state != MOQ_SUB_FREE) n++;
+    return n;
+}
+
+static size_t ss_live_pubs(const moq_session_t *s)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < s->pub_cap; i++)
+        if (s->publishes[i].state != MOQ_PUB_FREE) n++;
+    return n;
+}
+
+/* The occupancy lists the walks follow are whole and exact. */
+static bool ss_occupancy_ok(const moq_session_t *s)
+{
+    const char *pool = NULL;
+    size_t slot = 0;
+    const occ_fault_t f = occ_check_all(s, &pool, &slot);
+    if (f != OCC_OK)
+        fprintf(stderr, "occupancy: %s pool, slot %zu: %s\n", pool, slot,
+                occ_fault_name(f));
+    return f == OCC_OK;
+}
+
+/* A deadline relative to the row's start; none stays none. */
+static uint64_t ss_rel(uint64_t d, uint64_t t0)
+{
+    return d == UINT64_MAX ? UINT64_MAX : d - t0;
+}
+
+/* What a sparse row observed, compared between pool sizes: its deadlines
+ * and, in the probe build, what each walk read. The wire is checked in the
+ * row itself. */
+typedef struct {
+    uint64_t pub_dl, sub_dl, drained_dl, closed_dl;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    walk_t pub_walk, sub_walk;
+#endif
+} ss_image_t;
+
+/* Three owners -- a subscription whose objects carry a 7 ms delivery
+ * timeout, an untimed subscription and a publication -- each open one
+ * subgroup, and objects wait in the publisher's session. Its deadline is the
+ * timed objects' (draft-16's one DELIVERY TIMEOUT also bounds that stream,
+ * whose timer started when it opened, with them); once they are written,
+ * each stream carrying its own objects once and in order, only that
+ * draft-16 subgroup timer is left, and once the subgroups close none is. The
+ * subscriber arms nothing. Each walk reads the live owners: three subgroups,
+ * two subscriptions and one publication on the publisher; two subscriptions
+ * and one publication on the subscriber. */
+static bool ss_sparse_row(pair_t *p, ss_image_t *img)
+{
+    memset(img, 0, sizeof(*img));
+    const uint64_t t0 = p->now;
+    regression_owner_t timed, plain, pubo;
+    if (!regression_owner(p, false, "ss-timed", 128, SS_TIMEOUT_MS, &timed) ||
+        !regression_owner(p, false, "ss-plain", 128, 0, &plain) ||
+        !regression_owner(p, true, "ss-pub", 128, 0, &pubo))
+        return false;
+    const regression_owner_t *owner[3] = { &timed, &plain, &pubo };
+    moq_subgroup_handle_t sg[3];
+    uint64_t sid[3];
+    size_t header[3];
+    for (int i = 0; i < 3; i++)
+        if (!regression_open_header(p, owner[i], 1, &sg[i], &sid[i],
+                                    &header[i]))
+            return false;
+    for (uint64_t o = 0; o < 2; o++)
+        SS_REQUIRE(write_object(p, sg[0], 1, 1, 0, o) == MOQ_OK);
+    SS_REQUIRE(write_object(p, sg[1], 2, 1, 0, 0) == MOQ_OK);
+    SS_REQUIRE(write_object(p, sg[2], 3, 1, 0, 0) == MOQ_OK);
+    CHECK_SESSION_COUNTS(p->pub);
+    SS_REQUIRE(ss_queued(p->pub) >= 4);
+    SS_REQUIRE(ss_live_subgroups(p->pub) == 3 && ss_live_subs(p->pub) == 2 &&
+               ss_live_pubs(p->pub) == 1);
+    SS_REQUIRE(ss_live_subgroups(p->sub) == 0 && ss_live_subs(p->sub) == 2 &&
+               ss_live_pubs(p->sub) == 1);
+    MOQ_TEST_CHECK(ss_occupancy_ok(p->pub) && ss_occupancy_ok(p->sub));
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    const uint64_t queued = ss_queued(p->pub);
+#endif
+    WALK_MARK(w);
+    img->pub_dl = ss_rel(moq_session_next_deadline_us(p->pub), t0);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    img->pub_walk = walk_since(w);
+    WALK_CHECK(img->pub_walk.dl_sg == 3 && img->pub_walk.dl_sub == 2 &&
+               img->pub_walk.dl_pub == 1 && img->pub_walk.queued_dl == queued);
+#endif
+    MOQ_TEST_CHECK_EQ_U64(img->pub_dl, SS_TIMEOUT_US);
+    WALK_MARK(v);
+    img->sub_dl = ss_rel(moq_session_next_deadline_us(p->sub), t0);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    img->sub_walk = walk_since(v);
+    WALK_CHECK(img->sub_walk.dl_sg == 0 && img->sub_walk.dl_sub == 2 &&
+               img->sub_walk.dl_pub == 1 && img->sub_walk.queued_dl == 0);
+#endif
+    MOQ_TEST_CHECK_EQ_U64(img->sub_dl, UINT64_MAX);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* A stream no subgroup carries: the lookup reads the three live ones
+     * and finds none. */
+    WALK_MARK(f);
+    MOQ_TEST_CHECK_EQ_INT(sg_find_by_stream_ref(p->pub,
+                              moq_stream_ref_from_u64(UINT64_MAX)), -1);
+    WALK_CHECK(walk_since(f).sg_find == 3);
+#endif
+
+    serve_all(p);
+    static const uint32_t timed_objs[] = { OBJ(1, 1, 0, 0), OBJ(1, 1, 0, 1) };
+    static const uint32_t plain_objs[] = { OBJ(2, 1, 0, 0) };
+    static const uint32_t pub_objs[] = { OBJ(3, 1, 0, 0) };
+    MOQ_TEST_CHECK(ss_stream_carried(p, sid[0], timed_objs, 2));
+    MOQ_TEST_CHECK(ss_stream_carried(p, sid[1], plain_objs, 1));
+    MOQ_TEST_CHECK(ss_stream_carried(p, sid[2], pub_objs, 1));
+    img->drained_dl = ss_rel(moq_session_next_deadline_us(p->pub), t0);
+    MOQ_TEST_CHECK_EQ_U64(img->drained_dl, p->ver == MOQ_VERSION_DRAFT_16
+                                               ? SS_TIMEOUT_US : UINT64_MAX);
+    for (int i = 0; i < 3; i++)
+        SS_REQUIRE(moq_session_close_subgroup(p->pub, sg[i], p->now) == MOQ_OK);
+    serve_all(p);
+    img->closed_dl = ss_rel(moq_session_next_deadline_us(p->pub), t0);
+    MOQ_TEST_CHECK_EQ_U64(img->closed_dl, UINT64_MAX);
+    return true;
+}
+
+/* Untimed objects wait in the session behind a network that takes one write
+ * at a time and a bridge whose budget admits one. No pass searches them for
+ * expiry, scans them for a reset, or reads them for a deadline, and the
+ * session publishes none; once the network opens every object goes out, in
+ * order. */
+static bool ss_untimed_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "ss-untimed", 128, 0, &o)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    p->mt->cap = 1;
+    for (uint64_t i = 0; i < 6; i++)
+        SS_REQUIRE(write_object(p, sg, 1, 1, 0, i) == MOQ_OK);
+    for (unsigned pass = 0; pass < 4; pass++) {
+        WALK_MARK(w);
+        SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        WALK_CHECK(walk_since(w).expiry_search == 0 &&
+                   walk_since(w).reset_offer == 0 &&
+                   walk_since(w).queued_dl == 0);
+        CHECK_TABLE_COUNTS(p->pub_br);
+    }
+    SS_REQUIRE(ss_queued(p->pub) > 0);
+    SS_REQUIRE(p->pub->action_timed == 0 && p->pub->action_nondata == 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    uint32_t want[6];
+    for (unsigned i = 0; i < 6; i++) want[i] = OBJ(1, 1, 0, i);
+    expect_wire(p, want, 6, "untimed objects held in the session", 1);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sid), 6);
+    return true;
+}
+
+/* Objects with a 7 ms timeout wait in the session behind a stalled network
+ * (the bridge's budget admits one). A pass just before their deadline
+ * searches the queue and expires nothing; at the deadline the stream is reset
+ * with DELIVERY_TIMEOUT, its header kept; afterwards nothing timed is queued,
+ * so the queue is not read again and nothing is due. */
+static bool ss_expiry_row(pair_t *p)
+{
+    const uint64_t t0 = p->now;
+    regression_owner_t o;
+    if (!regression_owner(p, false, "ss-expiry", 128, SS_TIMEOUT_MS, &o))
+        return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    p->mt->cap = 0;
+    for (uint64_t i = 0; i < 3; i++)
+        SS_REQUIRE(write_object(p, sg, 1, 1, 0, i) == MOQ_OK);
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    SS_REQUIRE(ss_queued(p->pub) > 0 && p->pub->action_timed > 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          t0 + SS_TIMEOUT_US);
+
+    p->now = t0 + SS_TIMEOUT_US - 1;
+    WALK_MARK(w);
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    WALK_CHECK(walk_since(w).expiry_search > 0 &&
+               walk_since(w).expiry_compact == 0);
+    const mt_stream_t *st = mt_stream(p->mt, sid);
+    SS_REQUIRE(st != NULL);
+    MOQ_TEST_CHECK(!st->reset);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          t0 + SS_TIMEOUT_US);
+
+    p->now = t0 + SS_TIMEOUT_US;
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, header);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sid), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_timed, 0);
+
+    p->now = t0 + SS_TIMEOUT_US + 1;
+    WALK_MARK(q);
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    WALK_CHECK(walk_since(q).expiry_search == 0 &&
+               walk_since(q).queued_dl == 0);
+    return true;
+}
+
+/* The deadline moves earlier, then later. Two subscriptions, with 20 ms and
+ * 7 ms delivery timeouts, each open a subgroup at the same instant behind a
+ * network that takes no data. The longer one's object is queued first and
+ * the shorter one's after it, which moves the deadline earlier, to the
+ * shorter one's (draft-16's subgroup timers run from the open, so there it
+ * is the deadline from the start). Just before it nothing changes; at it the
+ * shorter stream is reset with DELIVERY_TIMEOUT after its header, and the
+ * deadline moves later, to the longer object's. That object then goes out,
+ * and once its subgroup closes nothing is due. */
+static bool ss_earlier_row(pair_t *p)
+{
+    const uint64_t t0 = p->now;
+    const bool d16 = p->ver == MOQ_VERSION_DRAFT_16;
+    regression_owner_t lo, sh;
+    if (!regression_owner(p, false, "ss-long", 128, SS_LONG_MS, &lo) ||
+        !regression_owner(p, false, "ss-short", 128, SS_TIMEOUT_MS, &sh))
+        return false;
+    moq_subgroup_handle_t sgl, sgs;
+    uint64_t sidl, sids;
+    size_t hl, hs;
+    if (!regression_open_header(p, &lo, 1, &sgl, &sidl, &hl) ||
+        !regression_open_header(p, &sh, 1, &sgs, &sids, &hs))
+        return false;
+    p->mt->cap = 0;
+    SS_REQUIRE(write_object(p, sgl, 1, 1, 0, 0) == MOQ_OK);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          t0 + (d16 ? SS_TIMEOUT_US : SS_LONG_US));
+    SS_REQUIRE(write_object(p, sgs, 2, 1, 0, 0) == MOQ_OK);
+    CHECK_SESSION_COUNTS(p->pub);
+    SS_REQUIRE(ss_queued(p->pub) == 2 && p->pub->action_timed == 2);
+    WALK_MARK(w);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          t0 + SS_TIMEOUT_US);
+    WALK_CHECK(walk_since(w).queued_dl == 2);
+
+    p->now = t0 + SS_TIMEOUT_US - 1;
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    const mt_stream_t *st = mt_stream(p->mt, sids);
+    SS_REQUIRE(st != NULL);
+    MOQ_TEST_CHECK(!st->reset);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          t0 + SS_TIMEOUT_US);
+
+    p->now = t0 + SS_TIMEOUT_US;
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, hs);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          t0 + SS_LONG_US);
+
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sidl), 1);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sids), 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                          d16 ? t0 + SS_LONG_US : UINT64_MAX);
+    SS_REQUIRE(moq_session_close_subgroup(p->pub, sgl, p->now) == MOQ_OK);
+    serve_all(p);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    return true;
+}
+
+/* The reset offer prepares the queue before it looks: a ring of data alone,
+ * one object due, becomes that object's stream reset in the offer's own
+ * preparation, and the offer returns it. An untimed write at the deadline
+ * moves the session's clock there without expiring anything. The untimed
+ * object still goes out; the timed stream ends with DELIVERY_TIMEOUT after
+ * its header. */
+static bool ss_offer_row(pair_t *p)
+{
+    const uint64_t t0 = p->now;
+    regression_owner_t due, later;
+    if (!regression_owner(p, false, "ss-due", 128, SS_TIMEOUT_MS, &due) ||
+        !regression_owner(p, false, "ss-later", 128, 0, &later))
+        return false;
+    moq_subgroup_handle_t sgd, sgl;
+    uint64_t sidd, sidl;
+    size_t hd, hl;
+    if (!regression_open_header(p, &due, 1, &sgd, &sidd, &hd) ||
+        !regression_open_header(p, &later, 1, &sgl, &sidl, &hl))
+        return false;
+    p->mt->cap = 0;
+    SS_REQUIRE(write_object(p, sgd, 1, 1, 0, 0) == MOQ_OK);
+    p->now = t0 + SS_TIMEOUT_US;
+    SS_REQUIRE(write_object(p, sgl, 2, 1, 0, 0) == MOQ_OK);
+    SS_REQUIRE(ss_queued(p->pub) == 2 && p->pub->action_timed == 1 &&
+               p->pub->action_nondata == 0);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* The offer itself, as the bridge makes it (linked from the internals
+     * build, where the session's private entry points are visible). */
+    moq_reset_data_action_t r;
+    memset(&r, 0, sizeof(r));
+    MOQ_TEST_CHECK(bridge_session_offer_data_reset(p->pub, &r));
+    MOQ_TEST_CHECK_EQ_U64(r.error_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(r.reliable_size, hd);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_nondata, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_timed, 0);
+#endif
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    const mt_stream_t *st = mt_stream(p->mt, sidd);
+    SS_REQUIRE(st != NULL);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, hd);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sidd), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sidl), 1);
+    return true;
+}
+
+/* The subscriber cancels an owner whose stream fills the publisher's
+ * eight-slot ring behind another owner's object: with no slot for the reset,
+ * the subgroup owes it (CANCELLED). The offer finds the owed reset without
+ * scanning the ring, which holds data alone; the bridge drops the stream's
+ * queued objects and resets it after its header, and the other owner's
+ * object still goes out. */
+static bool ss_owed_row(pair_t *p)
+{
+    regression_owner_t o, other;
+    if (!regression_owner(p, false, "ss-owed", 128, 0, &o) ||
+        !regression_owner(p, false, "ss-other", 128, 0, &other))
+        return false;
+    moq_subgroup_handle_t sg, sgo;
+    uint64_t sid, sido;
+    size_t h, ho;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &h) ||
+        !regression_open_header(p, &other, 1, &sgo, &sido, &ho))
+        return false;
+    p->mt->cap = 0;
+    SS_REQUIRE(write_object(p, sgo, 2, 1, 0, 0) == MOQ_OK);
+    uint64_t written = 0;
+    while (written < 64 && write_object(p, sg, 1, 1, 0, written) == MOQ_OK)
+        written++;
+    SS_REQUIRE(written > 0 && written < 64);
+    SS_REQUIRE(ss_queued(p->pub) == p->pub->action_cap);
+    SS_REQUIRE(moq_session_unsubscribe(p->sub, o.track.csub, p->now) ==
+               MOQ_OK);
+    SS_REQUIRE(shuttle_sub_to_pub(p) > 0);
+    SS_REQUIRE(ss_queued(p->pub) == p->pub->action_cap &&
+               p->pub->action_nondata == 0);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    WALK_MARK(w);
+    moq_reset_data_action_t r;
+    memset(&r, 0, sizeof(r));
+    MOQ_TEST_CHECK(bridge_session_offer_data_reset(p->pub, &r));
+    WALK_CHECK(walk_since(w).reset_offer == 0);
+    MOQ_TEST_CHECK_EQ_U64(r.error_code, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(r.reliable_size, h);
+#endif
+    SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    shuttle(p);
+    drain_events(p->pub);
+    drain_events(p->sub);
+    const mt_stream_t *st = mt_stream(p->mt, sid);
+    SS_REQUIRE(st != NULL);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, h);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sid), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sido), 1);
+    return true;
+}
+
+/* A four-slot ring carries two dozen objects, so its head and tail pass the
+ * end of the ring again and again; another owner's PUBLISH_DONE queued among
+ * them is a control action the summary counts, and so is the reset queued at
+ * the end with room to spare. The summary matches its recount after every
+ * step; the wire carries every object once and in order, then the reset, and
+ * the PUBLISH_DONE goes out once. */
+static bool ss_wrap_row(pair_t *p)
+{
+    regression_owner_t o, done;
+    if (!regression_owner(p, false, "ss-wrap", 128, 0, &o) ||
+        !regression_owner(p, false, "ss-wrap-done", 128, 0, &done))
+        return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    uint32_t want[24];
+    unsigned n = 0;
+    for (unsigned round = 0; round < 12; round++) {
+        SS_REQUIRE(write_object(p, sg, 1, 1, 0, n) == MOQ_OK);
+        want[n] = OBJ(1, 1, 0, n);
+        n++;
+        if (round == 5) {
+            SS_REQUIRE(regression_finish(p, &done, 0, "ss-wrap-done") == MOQ_OK);
+            SS_REQUIRE(p->pub->action_nondata > 0);
+        }
+        SS_REQUIRE(write_object(p, sg, 1, 1, 0, n) == MOQ_OK);
+        want[n] = OBJ(1, 1, 0, n);
+        n++;
+        CHECK_SESSION_COUNTS(p->pub);
+        serve_all(p);
+        SS_REQUIRE(ss_queued(p->pub) == 0);
+    }
+    SS_REQUIRE(p->pub->action_head >= 4 * p->pub->action_cap);
+    expect_wire(p, want, n, "objects through a wrapping ring", 1u << 20);
+    size_t dones = 0;
+    uint64_t seq = 0;
+    SS_REQUIRE(regression_done(p, "ss-wrap-done", 0, &dones, &seq));
+    MOQ_TEST_CHECK_EQ_INT((int)dones, 1);
+    SS_REQUIRE(moq_session_reset_subgroup(p->pub, sg, 0x1, p->now) == MOQ_OK);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK(p->pub->action_nondata > 0);
+    serve_all(p);
+    const mt_stream_t *st = mt_stream(p->mt, sid);
+    SS_REQUIRE(st != NULL);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, 0x1);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sid), (int)n);
+    return true;
+}
+
+/* The subscriber cancels one of two owners whose objects wait in the
+ * publisher's session, the cancelled owner's timed. The publisher resets
+ * that stream after its header and discards its queued objects; the other
+ * owner's objects all go out, in order; nothing timed is left queued. */
+static bool ss_cancel_row(pair_t *p)
+{
+    regression_owner_t gone, kept;
+    if (!regression_owner(p, false, "ss-gone", 128, SS_TIMEOUT_MS, &gone) ||
+        !regression_owner(p, false, "ss-kept", 128, 0, &kept))
+        return false;
+    moq_subgroup_handle_t sgg, sgk;
+    uint64_t sidg, sidk;
+    size_t hg, hk;
+    if (!regression_open_header(p, &gone, 1, &sgg, &sidg, &hg) ||
+        !regression_open_header(p, &kept, 1, &sgk, &sidk, &hk))
+        return false;
+    p->mt->cap = 0;
+    for (uint64_t i = 0; i < 3; i++) {
+        SS_REQUIRE(write_object(p, sgg, 1, 1, 0, i) == MOQ_OK);
+        SS_REQUIRE(write_object(p, sgk, 2, 1, 0, i) == MOQ_OK);
+    }
+    SS_REQUIRE(p->pub->action_timed > 0);
+    SS_REQUIRE(moq_session_unsubscribe(p->sub, gone.track.csub, p->now) ==
+               MOQ_OK);
+    shuttle(p);
+    drain_events(p->pub);
+    drain_events(p->sub);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    p->mt->cap = 1u << 20;
+    serve_all(p);
+    const mt_stream_t *st = mt_stream(p->mt, sidg);
+    SS_REQUIRE(st != NULL);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, hg);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sidg), 0);
+    const uint32_t want[3] = { OBJ(2, 1, 0, 0), OBJ(2, 1, 0, 1),
+                               OBJ(2, 1, 0, 2) };
+    expect_wire(p, want, 3, "the kept owner after a cancellation", 1u << 20);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_timed, 0);
+    return true;
+}
+
+/* A reset the transport refuses stays its stream's and is tried in every
+ * pass while the other owner's objects keep going out; once accepted the
+ * stream ends after its header with nothing else. */
+static bool ss_refused_row(pair_t *p)
+{
+    regression_owner_t o, other;
+    if (!regression_owner(p, false, "ss-refused", 128, 0, &o) ||
+        !regression_owner(p, false, "ss-flowing", 128, 0, &other))
+        return false;
+    moq_subgroup_handle_t sg, sgo;
+    uint64_t sid, sido;
+    size_t h, ho;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &h) ||
+        !regression_open_header(p, &other, 1, &sgo, &sido, &ho))
+        return false;
+    mt_stream_t *st = mt_stream(p->mt, sid);
+    SS_REQUIRE(st != NULL);
+    st->refuse_reset = true;
+    SS_REQUIRE(moq_session_reset_subgroup(p->pub, sg, 0x1, p->now) == MOQ_OK);
+    CHECK_SESSION_COUNTS(p->pub);
+    SS_REQUIRE(p->pub->action_nondata > 0);
+    const uint32_t before = st->reset_attempts;
+    for (uint64_t i = 0; i < 3; i++) {
+        SS_REQUIRE(write_object(p, sgo, 2, 1, 0, i) == MOQ_OK);
+        SS_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        CHECK_TABLE_COUNTS(p->pub_br);
+        while (mt_serve_one(p->mt)) {}
+    }
+    MOQ_TEST_CHECK(st->reset_attempts - before >= 3);
+    MOQ_TEST_CHECK(!st->reset);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sido), 3);
+    st->refuse_reset = false;
+    serve_all(p);
+    MOQ_TEST_CHECK(st->reset);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_code, 0x1);
+    MOQ_TEST_CHECK_EQ_U64(st->reset_reliable, h);
+    MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sid), 0);
+    return true;
+}
+
+/* Subscriptions come and go in the publisher's pools, so later ones take
+ * earlier ones' slots. In every round the deadline is the newest timed
+ * object's, and the walk reads exactly the live owners. */
+static bool ss_reuse_row(pair_t *p)
+{
+    for (unsigned round = 0; round < 3; round++) {
+        char name[16];
+        snprintf(name, sizeof(name), "ss-reuse-%u", round);
+        regression_owner_t o;
+        if (!regression_owner(p, false, name, 128, SS_TIMEOUT_MS, &o))
+            return false;
+        moq_subgroup_handle_t sg;
+        uint64_t sid;
+        size_t h;
+        if (!regression_open_header(p, &o, 1, &sg, &sid, &h)) return false;
+        const uint64_t t = p->now;
+        SS_REQUIRE(write_object(p, sg, (uint8_t)(round + 1), 1, 0, 0) ==
+                   MOQ_OK);
+        MOQ_TEST_CHECK(ss_occupancy_ok(p->pub));
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        const uint64_t live_sg = ss_live_subgroups(p->pub);
+        const uint64_t live_sub = ss_live_subs(p->pub);
+#endif
+        WALK_MARK(w);
+        MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
+                              t + SS_TIMEOUT_US);
+        WALK_CHECK(walk_since(w).dl_sg == live_sg &&
+                   walk_since(w).dl_sub == live_sub &&
+                   walk_since(w).dl_pub == 0);
+        serve_all(p);
+        MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sid), 1);
+        SS_REQUIRE(moq_session_close_subgroup(p->pub, sg, p->now) == MOQ_OK);
+        serve_all(p);
+        SS_REQUIRE(moq_session_unsubscribe(p->sub, o.track.csub, p->now) ==
+                   MOQ_OK);
+        shuttle(p);
+        drain_events(p->pub);
+        drain_events(p->sub);
+        MOQ_TEST_CHECK(ss_occupancy_ok(p->pub));
+        p->now += 1000;
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)ss_live_subs(p->pub), 0);
+    WALK_MARK(e);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    WALK_CHECK(walk_since(e).dl_sub == 0);
+    return true;
+}
+
+/* Polls every event the subscriber has queued. Returns how many are the
+ * owner's terminal -- SUBSCRIBE_DONE for its subscription, PUBLISH_FINISHED
+ * for its publication -- and adds to *right those that carry the publisher's
+ * values: SUBSCRIPTION_ENDED, two streams and `reason`. */
+static int ss_done_terminals(pair_t *p, const regression_owner_t *o,
+                             const char *reason, int *right)
+{
+    int n = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(p->sub, &ev, 1) == 1) {
+        uint64_t status = 0, streams = 0;
+        moq_bytes_t text = { NULL, 0 };
+        bool mine = false;
+        if (o->publication && ev.kind == MOQ_EVENT_PUBLISH_FINISHED &&
+            moq_publication_eq(ev.u.publish_finished.pub, o->peer_pub)) {
+            mine = true;
+            status = ev.u.publish_finished.status_code;
+            streams = ev.u.publish_finished.stream_count;
+            text = ev.u.publish_finished.reason;
+        } else if (!o->publication && ev.kind == MOQ_EVENT_SUBSCRIBE_DONE &&
+                   moq_subscription_eq(ev.u.subscribe_done.sub,
+                                       o->track.csub)) {
+            mine = true;
+            status = ev.u.subscribe_done.status_code;
+            streams = ev.u.subscribe_done.stream_count;
+            text = ev.u.subscribe_done.reason;
+        }
+        if (mine) {
+            n++;
+            if (status == 0x3 && streams == 2 && text.len == strlen(reason) &&
+                memcmp(text.data, reason, text.len) == 0)
+                ++*right;
+        }
+        moq_event_cleanup(&ev);
+    }
+    return n;
+}
+
+/* PUBLISH_DONE, for a subscription or a publication, reaches the
+ * subscriber while the two streams it counts have not: its terminal waits
+ * for them, at most the 40 ms stream wait, and that wait is the subscriber's
+ * deadline. No terminal is delivered on arrival or at deadline-minus-one, and
+ * the deadline stands; at it exactly one is, the owner's, with the
+ * publisher's status, stream count and reason, and nothing is due; later
+ * there is no second. The walk reads the subscriber's one live owner. */
+static bool ss_done_wait_row(pair_t *p, bool publication)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, publication, "ss-done-wait", 128, 0, &o))
+        return false;
+    moq_subgroup_handle_t sg[2];
+    uint64_t sid[2];
+    size_t h[2];
+    for (unsigned i = 0; i < 2; i++)
+        if (!regression_open_header(p, &o, i + 1, &sg[i], &sid[i], &h[i]))
+            return false;
+    for (unsigned i = 0; i < 2; i++) {
+        SS_REQUIRE(write_object(p, sg[i], 1, (uint64_t)i + 1, 0, 0) == MOQ_OK);
+        SS_REQUIRE(moq_session_close_subgroup(p->pub, sg[i], p->now) ==
+                   MOQ_OK);
+    }
+    serve_all(p);
+    SS_REQUIRE(regression_finish(p, &o, 2, "ss-done-wait") == MOQ_OK);
+    serve_all(p);
+    const uint64_t t1 = p->now;
+    shuttle(p);
+    SS_REQUIRE(ss_live_subs(p->sub) == (publication ? 0u : 1u) &&
+               ss_live_pubs(p->sub) == (publication ? 1u : 0u));
+    int right = 0;
+    MOQ_TEST_CHECK_EQ_INT(ss_done_terminals(p, &o, "ss-done-wait", &right), 0);
+    WALK_MARK(w);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->sub),
+                          t1 + SS_DONE_WAIT_US);
+    WALK_CHECK(walk_since(w).dl_sub == (publication ? 0u : 1u) &&
+               walk_since(w).dl_pub == (publication ? 1u : 0u) &&
+               walk_since(w).dl_sg == 0);
+    p->now = t1 + SS_DONE_WAIT_US - 1;
+    SS_REQUIRE(moq_session_tick(p->sub, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(ss_done_terminals(p, &o, "ss-done-wait", &right), 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->sub),
+                          t1 + SS_DONE_WAIT_US);
+    p->now = t1 + SS_DONE_WAIT_US;
+    SS_REQUIRE(moq_session_tick(p->sub, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(ss_done_terminals(p, &o, "ss-done-wait", &right), 1);
+    MOQ_TEST_CHECK_EQ_INT(right, 1);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->sub), UINT64_MAX);
+    p->now = t1 + 2 * SS_DONE_WAIT_US;
+    SS_REQUIRE(moq_session_tick(p->sub, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(ss_done_terminals(p, &o, "ss-done-wait", &right), 0);
+    return true;
+}
+
+/* At the saturated clock, UINT64_MAX, an untimed queued object compares as
+ * due, as it always has: the object becomes its stream's DELIVERY_TIMEOUT
+ * reset, in place. The expiry check's shortcut for an untimed ring stops
+ * short of that clock. */
+static bool ss_saturated_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "ss-saturated", 128, 0, &o)) return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t header;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &header)) return false;
+    p->mt->cap = 0;
+    SS_REQUIRE(write_object(p, sg, 1, 1, 0, 0) == MOQ_OK);
+    SS_REQUIRE(ss_queued(p->pub) == 1 && p->pub->action_timed == 0);
+    SS_REQUIRE(moq_session_tick(p->pub, UINT64_MAX) == MOQ_OK);
+    CHECK_SESSION_COUNTS(p->pub);
+    SS_REQUIRE(ss_queued(p->pub) == 1);
+    const moq_action_t *a =
+        &p->pub->actions[p->pub->action_head % p->pub->action_cap];
+    MOQ_TEST_CHECK(a->kind == MOQ_ACTION_RESET_DATA);
+    MOQ_TEST_CHECK_EQ_U64(a->u.reset_data.error_code,
+                          MOQ_RESET_DELIVERY_TIMEOUT);
+    MOQ_TEST_CHECK_EQ_U64(a->u.reset_data.reliable_size, header);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_nondata, 1);
+    return true;
+}
+
+/* Closing a session empties its ring at once, timed objects and all, by the
+ * application's close or its transport's: the summary empties with it (a
+ * close the session queues counts afresh), and a closed session has no
+ * deadline. */
+static bool ss_close_row(pair_t *p, bool by_transport)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "ss-close", 128, SS_TIMEOUT_MS, &o))
+        return false;
+    moq_subgroup_handle_t sg;
+    uint64_t sid;
+    size_t h;
+    if (!regression_open_header(p, &o, 1, &sg, &sid, &h)) return false;
+    p->mt->cap = 0;
+    for (uint64_t i = 0; i < 3; i++)
+        SS_REQUIRE(write_object(p, sg, 1, 1, 0, i) == MOQ_OK);
+    SS_REQUIRE(p->pub->action_timed > 0);
+    if (by_transport)
+        SS_REQUIRE(moq_session_on_transport_close(p->pub, 0, p->now) == MOQ_OK);
+    else
+        SS_REQUIRE(moq_session_close(p->pub, 0, "ss-close", p->now) == MOQ_OK);
+    SS_REQUIRE(moq_session_state(p->pub) == MOQ_SESS_CLOSED);
+    CHECK_SESSION_COUNTS(p->pub);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub->action_timed, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
+    return true;
+}
+
+#undef SS_REQUIRE
+
+static void test_session_scans(void)
+{
+    for (size_t v = 0; v < N_VERSIONS; ++v) {
+        const moq_version_t ver = k_versions[v];
+        pair_t p;
+        ss_image_t img[2];
+        bool completed[2] = { false, false };
+        memset(img, 0, sizeof(img));
+        const pools_t *pools[2] = { &k_ss_default, &k_ss_sparse };
+        for (int k = 0; k < 2; k++) {
+            if (ss_pair(&p, ver, pools[k], 1024, 1u << 20)) {
+                completed[k] = ss_sparse_row(&p, &img[k]);
+                MOQ_TEST_CHECK(completed[k]);
+            } else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
+        /* Only images whose rows ran to the end are compared or shown. */
+        if (completed[0] && completed[1])
+            MOQ_TEST_CHECK(memcmp(&img[0], &img[1], sizeof(img[0])) == 0);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        for (int k = 0; k < 2; k++)
+            if (completed[k])
+                printf("session scans d%d, %s pools: the publisher's deadline "
+                       "query read %llu subgroup, %llu subscription and %llu "
+                       "publication slots and %llu queued actions\n",
+                       draft_of(ver), k ? "sparse" : "default",
+                       (unsigned long long)img[k].pub_walk.dl_sg,
+                       (unsigned long long)img[k].pub_walk.dl_sub,
+                       (unsigned long long)img[k].pub_walk.dl_pub,
+                       (unsigned long long)img[k].pub_walk.queued_dl);
+#endif
+        /* Rows over a bridge whose budget admits one object, so the rest
+         * wait in the session's ring. */
+        static bool (*const held[])(pair_t *) = {
+            ss_untimed_row, ss_expiry_row, ss_earlier_row, ss_offer_row,
+            ss_cancel_row,
+        };
+        for (size_t r = 0; r < sizeof(held) / sizeof(held[0]); ++r) {
+            for (int k = 0; k < 2; k++) {
+                if (ss_pair(&p, ver, pools[k], 1024, 1))
+                    MOQ_TEST_CHECK(held[r](&p));
+                else MOQ_TEST_CHECK(false);
+                pair_destroy(&p);
+            }
+        }
+        if (ss_pair(&p, ver, &k_ss_sparse, 8, 1))
+            MOQ_TEST_CHECK(ss_owed_row(&p));
+        else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        if (ss_pair(&p, ver, &k_ss_sparse, 4, 1u << 20))
+            MOQ_TEST_CHECK(ss_wrap_row(&p));
+        else MOQ_TEST_CHECK(false);
+        pair_destroy(&p);
+        static bool (*const open[])(pair_t *) = {
+            ss_refused_row, ss_reuse_row, ss_saturated_row,
+        };
+        for (size_t r = 0; r < sizeof(open) / sizeof(open[0]); ++r) {
+            if (ss_pair(&p, ver, &k_ss_sparse, 1024, 1u << 20))
+                MOQ_TEST_CHECK(open[r](&p));
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
+        for (int publication = 0; publication < 2; publication++) {
+            if (ss_pair(&p, ver, &k_ss_sparse, 1024, 1u << 20))
+                MOQ_TEST_CHECK(ss_done_wait_row(&p, publication != 0));
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
+        for (int by_transport = 0; by_transport < 2; by_transport++) {
+            if (ss_pair(&p, ver, &k_ss_sparse, 1024, 1))
+                MOQ_TEST_CHECK(ss_close_row(&p, by_transport != 0));
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
+        printf("session scans d%d: checked\n", draft_of(ver));
+    }
+    MOQ_TEST_PASS("the deadline query walks live owners and reads queued "
+                  "actions only while one is timed, expiry and the reset "
+                  "offer skip a queue that cannot hold what they look for, "
+                  "and each row's deadline, wire and queue-summary checks "
+                  "hold through expiry, a deadline moving earlier and later, "
+                  "cancellation, refusal, a full and a wrapping ring, slot "
+                  "reuse, close and the saturated clock");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--shared-admission") == 0) {
@@ -5840,6 +6820,10 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--expiry-walk") == 0) {
         test_expiry_walk();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--session-scans") == 0) {
+        test_session_scans();
         return failures ? 1 : 0;
     }
     if (argc == 2 && strcmp(argv[1], "--shared-all") == 0) {

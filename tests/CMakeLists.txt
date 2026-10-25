@@ -295,6 +295,7 @@ add_test(NAME bridge_shared_admission_suite COMMAND test_scheduling --shared-all
 add_test(NAME bridge_pass_costs COMMAND test_scheduling --pass-costs)
 add_test(NAME bridge_scan_work COMMAND test_scheduling --scan-work)
 add_test(NAME bridge_expiry_walk COMMAND test_scheduling --expiry-walk)
+add_test(NAME session_queue_scans COMMAND test_scheduling --session-scans)
 # The same rows against the test-internals core, whose probe counters let
 # them assert how much of the stream table each walk read.
 add_executable(test_scheduling_work unit/test_scheduling.c)
@@ -306,6 +307,7 @@ target_include_directories(test_scheduling_work PRIVATE
 add_test(NAME bridge_pass_costs_work COMMAND test_scheduling_work --pass-costs)
 add_test(NAME bridge_scan_work_probes COMMAND test_scheduling_work --scan-work)
 add_test(NAME bridge_expiry_walk_probes COMMAND test_scheduling_work --expiry-walk)
+add_test(NAME session_queue_scans_probes COMMAND test_scheduling_work --session-scans)
 
 add_executable(test_stream_order unit/test_stream_order.c
     ../core/src/bridge/stream_order.c)
