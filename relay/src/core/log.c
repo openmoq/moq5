@@ -519,34 +519,49 @@ moqr_log_note_evicted_below(moqr_log_t *log, uint64_t oldest_retained)
     if (log == NULL || oldest_retained == 0) {
         return 0;
     }
-    /* Locally retained groups below the watermark stay SERVABLE — the
-     * upstream eviction only proves nothing MORE will arrive for them, so
-     * their unsealed subgroup lists are sealed through the ordinary seal
-     * path (late-FIN notices, downstream closes, retirement coverage all
-     * follow from that), never destroyed. A seal the preflight rejects
-     * (contradictory header-EOG evidence) is left unsealed: the range stays
-     * UNKNOWN and fail-closed rather than force-closed. */
-    size_t sealed = 0;
-    for (uint32_t gi = 0; gi < log->group_count; gi++) {
+    /* Locally retained groups below the watermark stay SERVABLE: the
+     * upstream eviction proves that nothing MORE will arrive for them, not
+     * that what arrived is the whole subgroup. A list that has not ended may
+     * lack objects the source evicted before it forwarded them, so it ends
+     * with a reset, never a clean FIN (a FIN says every object of the
+     * subgroup was delivered; draft-22 §11.3.2). An object still OPEN can
+     * never complete: it is abandoned with the eviction cause first. A list
+     * that already ended keeps its terminal (a seal stays a FIN, a reset
+     * keeps its cause), and a list whose last object was abandoned ends with
+     * that object's reset, the terminal its stream already has. Without an
+     * eviction cause nothing is terminalized: the lists stay UNKNOWN and
+     * fail-closed rather than force-closed. Complete records stay retained,
+     * and each subscription gets the reset after them. */
+    moqr_reset_desc_t evicted;
+    bool have_cause =
+        moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED, &evicted) == MOQR_OK;
+    size_t ended = 0;
+    for (uint32_t gi = 0; have_cause && gi < log->group_count; gi++) {
         moqr_group_t *g = &log->groups[gi];
         if (g->group_id >= oldest_retained) {
             break;   /* ids ascend */
         }
         for (uint32_t si = 0; si < g->sg_count; si++) {
-            if (g->sgs[si].sealed) {
-                continue;
+            moqr_subgroup_t *sg = &g->sgs[si];
+            if (sg->sealed) {
+                continue;   /* first terminal wins */
             }
-            /* A list whose tail is ABANDONED was already terminalized
-             * downstream by its reset — sealing it would close the same
-             * subgroup twice. Leave it to the reset's own accounting. */
-            const moqr_rec_vec_t *v = &g->sgs[si].v;
-            if (v->count > 0 &&
-                v->recs[v->count - 1].obj_state == MOQR_OBJ_ABANDONED) {
-                continue;
+            moqr_reset_desc_t cause = evicted;
+            moqr_rec_t *tail =
+                sg->v.count > 0 ? &sg->v.recs[sg->v.count - 1] : NULL;
+            if (tail != NULL && tail->obj_state == MOQR_OBJ_OPEN &&
+                moqr_log_abandon_record(log, g->group_id, sg->subgroup_id,
+                                        tail->object_id,
+                                        evicted) != MOQR_OK) {
+                continue;   /* left OPEN: the list stays UNKNOWN */
             }
-            if (moqr_log_seal_subgroup(log, g->group_id,
-                                       g->sgs[si].subgroup_id) == MOQR_OK) {
-                sealed++;
+            if (tail != NULL && tail->obj_state == MOQR_OBJ_ABANDONED &&
+                moqr_reset_desc_valid(tail->reset)) {
+                cause = tail->reset;
+            }
+            if (moqr_log_reset_subgroup(log, g->group_id, sg->subgroup_id,
+                                        cause) == MOQR_OK) {
+                ended++;
             }
         }
     }
@@ -561,7 +576,7 @@ moqr_log_note_evicted_below(moqr_log_t *log, uint64_t oldest_retained)
         }
         log->any_evicted = true;
     }
-    return sealed;
+    return ended;
 }
 
 uint64_t

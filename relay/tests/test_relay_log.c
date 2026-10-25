@@ -8,6 +8,7 @@
 
 #include <moq/relay/capacity.h>
 #include <moq/relay/log.h>
+#include <moq/relay/relay.h>
 #include <moq/relay/trace.h>
 
 #include <moq/rcbuf.h>
@@ -1175,6 +1176,150 @@ test_chunk_abandon(void)
     return failures;
 }
 
+/* The terminal one list carries: none, a FIN (sealed), or a reset and its
+ * cause. */
+typedef struct list_end {
+    bool              sealed;
+    bool              reset;
+    moqr_reset_desc_t cause;
+} list_end_t;
+
+static list_end_t
+list_end(const moqr_log_t *log, uint64_t group, uint32_t list_slot)
+{
+    list_end_t e;
+    memset(&e, 0, sizeof(e));
+    e.sealed = moqr_log_subgroup_sealed(log, group, list_slot, NULL);
+    e.reset = moqr_log_subgroup_reset(log, group, list_slot, &e.cause);
+    return e;
+}
+
+static bool
+same_cause(moqr_reset_desc_t a, moqr_reset_desc_t b)
+{
+    return a.tag == b.tag && a.value == b.value;
+}
+
+/* An upstream eviction watermark closes the retained groups below it
+ * without inventing completion. Nothing more will arrive for them, but
+ * nothing proves their retained objects are whole subgroups, so a list
+ * that had not ended ends with a reset, never a FIN (draft-16 §10.4.3,
+ * draft-18 §11.4.3, draft-22 §11.3.2): complete-but-unsealed and header
+ * End-of-Group lists alike, with the eviction cause.
+ * An OPEN object is abandoned with that cause, and a list whose last
+ * object was abandoned ends with that object's cause. Complete records stay
+ * readable; a list that already ended keeps its terminal; End-of-Group
+ * finality stays unresolved; groups at or above the watermark are
+ * untouched. The count is the lists newly terminalized, and a repeated or
+ * lower watermark changes nothing. */
+static int
+test_watermark_terminals(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog(&ca, 8, 1u << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    moqr_reset_desc_t evicted, upstream = rd_wire(0x7), abandoned = rd_wire(0x9);
+    MOQ_TEST_CHECK(moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED,
+                                            &evicted) == MOQR_OK);
+
+    /* Group 2, one list per shape (object ids are unique group-wide). */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 0, 0, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 0: unsealed */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 0, 1, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 1, 2, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 1: sealed */
+    MOQ_TEST_CHECK(moqr_log_seal_subgroup(log, 2, 1) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 2, 3, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 2: reset */
+    MOQ_TEST_CHECK(moqr_log_reset_subgroup(log, 2, 2, upstream) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 3, 4, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 3: OPEN tail */
+    MOQ_TEST_CHECK(open_rec(log, 2, 3, 5, 16) == MOQR_OK);
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 2, 3, 5, 6, 0xC5) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 4, 6, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 4: abandoned tail */
+    MOQ_TEST_CHECK(open_rec(log, 2, 4, 7, 16) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_abandon_record(log, 2, 4, 7, abandoned) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 5, 8, 8, true, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 5: header EOG */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 5, 9, 8, true, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    /* Group 3, at the watermark: an unsealed list that must stay open. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 3, 0, 0, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    STEP_CHECK(log);
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    const uint64_t bytes_before = st.retained_bytes;
+    const uint64_t records_before = st.record_count;
+
+    MOQ_TEST_CHECK_EQ_SIZE(moqr_log_note_evicted_below(log, 3), (size_t)4);
+    STEP_CHECK(log);
+
+    list_end_t e = list_end(log, 2, 0);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, evicted));
+    MOQ_TEST_CHECK(!moqr_log_subgroup_is_final(log, 2, 0, 1));
+    e = list_end(log, 2, 1);
+    MOQ_TEST_CHECK(e.sealed && !e.reset);   /* the FIN stands */
+    MOQ_TEST_CHECK(moqr_log_subgroup_is_final(log, 2, 1, 2));
+    e = list_end(log, 2, 2);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, upstream));
+    e = list_end(log, 2, 3);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, evicted));
+    e = list_end(log, 2, 4);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, abandoned));
+    e = list_end(log, 2, 5);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, evicted));
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 2, NULL));   /* unresolved */
+    e = list_end(log, 3, 0);
+    MOQ_TEST_CHECK(!e.sealed && !e.reset);
+
+    /* The complete records are all still there, byte for byte; only the
+     * OPEN object's partial chunks went, abandoned with the eviction cause. */
+    moqr_record_view_t v;
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 2, 0, 1, &v) == MOQR_OK);
+    MOQ_TEST_CHECK(v.object_id == 1 && v.obj_state == MOQR_OBJ_COMPLETE &&
+                   v.payload != NULL && moq_rcbuf_len(v.payload) == 8 &&
+                   moq_rcbuf_data(v.payload)[0] == 1);
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 2, 3, 1, &v) == MOQR_OK);
+    MOQ_TEST_CHECK(v.object_id == 5 && v.obj_state == MOQR_OBJ_ABANDONED &&
+                   v.chunk_count == 0);
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.retained_bytes, bytes_before - 6);
+    MOQ_TEST_CHECK_EQ_U64(st.record_count, records_before);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 2);
+
+    /* Below the watermark, what was never received is closed for good. */
+    MOQ_TEST_CHECK_EQ_U64(moqr_log_evicted_floor(log), 3);
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 1, 0, 0, &v) == MOQR_ERR_TOO_OLD);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 1, 0, 0, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_ERR_TOO_OLD);
+
+    /* Repeated and lower watermarks are no-ops: first terminal wins. */
+    MOQ_TEST_CHECK_EQ_SIZE(moqr_log_note_evicted_below(log, 3), (size_t)0);
+    MOQ_TEST_CHECK_EQ_SIZE(moqr_log_note_evicted_below(log, 2), (size_t)0);
+    MOQ_TEST_CHECK_EQ_U64(moqr_log_evicted_floor(log), 3);
+    e = list_end(log, 2, 2);
+    MOQ_TEST_CHECK(e.reset && same_cause(e.cause, upstream));
+    e = list_end(log, 2, 1);
+    MOQ_TEST_CHECK(e.sealed && !e.reset);
+    e = list_end(log, 3, 0);
+    MOQ_TEST_CHECK(!e.sealed && !e.reset);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("watermark_terminals");
+    return failures;
+}
+
 /* Identity + ordering — a duplicate object id is rejected, and no
  * later object can be appended to a subgroup while a record is OPEN. */
 static int
@@ -1754,6 +1899,7 @@ main(void)
     failures += test_capacity_describe_bounds();
     failures += test_chunk_open_append_complete();
     failures += test_chunk_abandon();
+    failures += test_watermark_terminals();
     failures += test_chunk_ordering_and_dup();
     failures += test_chunk_capacity();
     failures += test_chunk_byte_accounting_eviction();

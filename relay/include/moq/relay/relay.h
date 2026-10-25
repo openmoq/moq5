@@ -1184,10 +1184,12 @@ MOQR_CORE_API moqr_result_t moqr_core_reset_subgroup(moqr_core_t *core, moqr_tra
 
 /* Apply an upstream eviction watermark to `track`'s journal (see
  * moqr_log_note_evicted_below): groups below `oldest_retained` become
- * authoritatively closed, local survivors below it are evicted through the
- * ordinary path, and the existing per-subscription eviction machinery
- * (position reclaim, EVICT_WATERMARK notices, downstream closes) does the
- * rest on the following delivery scans. Idempotent and monotonic.
+ * authoritatively closed. Locally retained groups below it stay servable;
+ * each of their subgroups that had not ended is terminalized as a reset, so
+ * every ACTIVE subscription gets its retained records and then the reset
+ * notice (see moqr_core_reset_subgroup), never a FIN. A watermark that
+ * terminalizes a subgroup or closes more of the range marks the track's
+ * subscriptions deliverable. Idempotent and monotonic.
  * MOQR_ERR_STALE_HANDLE on a dead track. */
 MOQR_CORE_API moqr_result_t moqr_core_note_track_evicted_below(moqr_core_t *core,
                                                  moqr_track_t track,

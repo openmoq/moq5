@@ -139,6 +139,10 @@ typedef struct sfrig {
     uint64_t       carried;
     bool           freeze_owner_on_ack;
     uint64_t       ack_base;
+    /* With `freeze_owner_on_evict`, shard 0 freezes right after the step
+     * that pushed its first eviction watermark beyond `evict_base`. */
+    bool           freeze_owner_on_evict;
+    uint64_t       evict_base;
     int            failures;
 } sfrig_t;
 
@@ -160,6 +164,8 @@ static bool g_sf_server_streaming = false;
 /* The draft every connection the rig makes speaks. */
 static moq_version_t g_sf_version = MOQ_VERSION_DRAFT_22;
 static uint64_t g_sf_log_bytes = 0;
+/* The groups each shard's log retains (4 unless a row needs fewer). */
+static uint32_t g_sf_log_groups = 4;
 /* The shards the next rig runs (2 unless a row needs a third). */
 static uint16_t g_sf_shards = 2;
 
@@ -171,7 +177,7 @@ sfrig_cfg(moqr_shards_cfg_t *cfg, ca_t *a, bool earned, uint32_t channel_entries
     moqr_shards_cfg_init_sized(cfg, sizeof(*cfg), &a->vt);
     cfg->shards = g_sf_shards;
     cfg->admit_remote_demand = true;
-    cfg->core_cfg.log_budget.max_groups = 4;
+    cfg->core_cfg.log_budget.max_groups = g_sf_log_groups;
     cfg->core_cfg.log_budget.max_bytes = g_sf_log_bytes != 0
                                            ? g_sf_log_bytes : 1u << 20;
     cfg->core_cfg.linger_us = 500;
@@ -212,6 +218,19 @@ sfrig_owner_acks(sfrig_t *r)
         return 0;
     }
     return st.enqueued[MOQR_SHARDS_MSG_ACK];
+}
+
+/* Eviction watermarks shard 0 has pushed toward any requester so far. */
+static uint64_t
+sfrig_owner_evicts(sfrig_t *r)
+{
+    moqr_shards_stats_t st;
+    memset(&st, 0, sizeof(st));
+    if (moqr_shards_get_stats(r->s, 0, &st) != MOQR_OK) {
+        r->failures++;
+        return 0;
+    }
+    return st.enqueued[MOQR_SHARDS_MSG_GRP_EVICT];
 }
 
 static void
@@ -308,6 +327,11 @@ sfrig_step_earned(sfrig_t *r, uint16_t sh, uint64_t *pending)
         sfrig_owner_acks(r) > r->ack_base) {
         r->frozen |= 1u;
         r->freeze_owner_on_ack = false;
+    }
+    if (r->freeze_owner_on_evict && sh == 0 &&
+        sfrig_owner_evicts(r) > r->evict_base) {
+        r->frozen |= 1u;
+        r->freeze_owner_on_evict = false;
     }
 }
 

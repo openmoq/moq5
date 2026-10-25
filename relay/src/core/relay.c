@@ -6547,7 +6547,13 @@ moqr_core_note_track_evicted_below(moqr_core_t *c, moqr_track_t th,
     if (t == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
-    (void)moqr_log_note_evicted_below(t->log, oldest_retained);
+    uint64_t floor = moqr_log_evicted_floor(t->log);
+    if (moqr_log_note_evicted_below(t->log, oldest_retained) > 0 ||
+        moqr_log_evicted_floor(t->log) != floor) {
+        /* The reset notices are deliverable, and a subscription waiting on
+         * the closed range may now retire. */
+        ready_mark_track(c, tslot);
+    }
     return MOQR_OK;
 }
 

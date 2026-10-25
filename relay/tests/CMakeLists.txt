@@ -366,6 +366,21 @@ if(TARGET moq::sim)
             TIMEOUT 60 LABELS "relay;sansio")
     endforeach()
 
+    # Eviction at a remote owner over real sessions, every draft (the same
+    # rig as test_relay_shard_fill, which the source includes).
+    add_executable(test_relay_shard_evict_terminal
+        test_relay_shard_evict_terminal.c)
+    target_link_libraries(test_relay_shard_evict_terminal PRIVATE
+        moq::relay moq::sim)
+    moqr_test_warnings(test_relay_shard_evict_terminal)
+    foreach(row IN ITEMS whole chunks watermark-only)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_shard_evict_terminal_${_row}
+            COMMAND test_relay_shard_evict_terminal ${row})
+        set_tests_properties(relay_shard_evict_terminal_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio")
+    endforeach()
+
     add_executable(test_relay_shard_fill test_relay_shard_fill.c)
     target_link_libraries(test_relay_shard_fill PRIVATE
         moq::relay moq::sim)

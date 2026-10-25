@@ -2,7 +2,8 @@
  * Binding-ready set oracle. White-box (includes relay.c): the core must mark
  * exactly the bindings whose deliverable state can have changed — activation
  * (parked resolve + immediate accept), the whole ingest family (whole/OPEN/
- * chunk/completion/abandon), seal, eviction pending-skip, and subscription
+ * chunk/completion/abandon), seal, eviction pending-skip, an upstream
+ * eviction watermark that changed something, and subscription
  * retirement — deduplicated by slot, filtered of pseudo-bindings at
  * production, drained in ascending slot order with exact remainder
  * retention, and cleared at binding close before slot reuse. Capacity: the
@@ -708,6 +709,77 @@ create_live_bytes_b(ca_t *a, uint32_t max_bindings)
     return a->live == before ? created : -1;   /* -1: leaked */
 }
 
+/* -- An upstream eviction watermark marks what it changed ------------------- */
+
+/* The watermark resets the retained subgroups below it that had not ended,
+ * so every subscriber of the track is owed that reset: its binding is
+ * marked by the watermark itself, with nothing else arriving. A repeated or
+ * lower watermark changes nothing and marks nothing; one that only closes
+ * more of the absent range still marks, since a subscription waiting on
+ * that range may now retire. */
+static int
+test_ready_watermark(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_t *c = mkcore(&a, 8, 16);
+    MOQ_TEST_CHECK(c != NULL);
+    moq_bytes_t nsb[2];
+    moqr_binding_t pub, s1;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 10, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 11, &s1) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_announce(c, pub, NS2(nsb, "n", "s")) == MOQR_OK);
+    uint64_t cookie = 100;
+    moqr_binding_t subs[1] = { s1 };
+    moqr_sub_t ks[1];
+    moqr_track_t t = mk_active_track(c, nsb, "t", subs, NULL, ks, 1, &cookie);
+    MOQ_TEST_CHECK(moqr_track_is_valid(t));
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(ing(c, &a, t, 1, 1) == MOQR_OK);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 100, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.rec.group_id == 1 && d.rec.object_id == 0);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           100) == MOQR_OK);
+    (void)moqr_core_drain_ready(c, (uint64_t[16]){ 0 }, 16);
+    MOQ_TEST_CHECK_EQ_U64(c->ready_count, 0);
+
+    uint64_t want[1] = { 11 };
+    MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, t, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(expect_drain(c, want, 1) == 0);
+    MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, t, 2) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, t, 1) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(c->ready_count, 0);
+
+    /* What the mark makes deliverable: the rest of the subgroup, then its
+     * reset with the eviction cause. */
+    moqr_reset_desc_t evicted;
+    MOQ_TEST_CHECK(moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED,
+                                            &evicted) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 200, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_NONE &&
+                   d.rec.object_id == 1 && !d.subgroup_end);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           200) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 200, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_SEAL && d.seal_reset &&
+                   d.seal_reset_desc.tag == evicted.tag &&
+                   d.seal_reset_desc.value == evicted.value);
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c, s1, MOQR_DELIVERY_DELIVERED,
+                                           200) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c, s1, 200, &d) == MOQR_DONE);
+
+    (void)moqr_core_drain_ready(c, (uint64_t[16]){ 0 }, 16);
+    MOQ_TEST_CHECK(moqr_core_note_track_evicted_below(c, t, 5) == MOQR_OK);
+    MOQ_TEST_CHECK(expect_drain(c, want, 1) == 0);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("ready_watermark");
+    return failures;
+}
+
 static int
 test_ready_capacity(void)
 {
@@ -779,6 +851,7 @@ main(void)
     failures += test_ready_activation();
     failures += test_ready_ingest_family();
     failures += test_ready_eviction_skip();
+    failures += test_ready_watermark();
     failures += test_ready_retire();
     failures += test_ready_pseudo_filtered();
     failures += test_ready_close_reuse();

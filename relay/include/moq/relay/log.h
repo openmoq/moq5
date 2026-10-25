@@ -291,13 +291,17 @@ MOQR_CORE_API size_t moqr_log_evict_groups(moqr_log_t *log, size_t max_groups);
 
 /* Record an authoritative upstream eviction watermark: every group below
  * `oldest_retained` is gone at the source, so nothing more will ever arrive
- * for that range. Locally retained groups below it remain SERVABLE — their
- * unsealed subgroup lists are sealed through the ordinary seal path (which
- * drives the usual late-FIN notices and downstream closes) — while the
+ * for that range. Locally retained groups below it remain SERVABLE, but a
+ * subgroup list that has not ended may lack objects the source evicted, so
+ * it is terminalized as a RESET, never sealed: its OPEN object, if any, is
+ * abandoned with MOQR_RESET_CODE_EVICTED, and the list ends with the cause
+ * of its abandoned last object, else with MOQR_RESET_CODE_EVICTED. A list
+ * that already ended keeps its terminal. Complete records are kept. The
  * log's eviction visibility (`any_evicted` / `max_evicted_group_id`)
  * advances over the ABSENT range so probes there answer MOQR_ERR_TOO_OLD —
  * "never will" — instead of MOQR_DONE — "not yet". Monotonic: a stale or
- * duplicate watermark is a no-op. Returns the number of lists sealed. */
+ * duplicate watermark is a no-op. Returns the number of lists newly
+ * terminalized. */
 MOQR_CORE_API size_t moqr_log_note_evicted_below(moqr_log_t *log, uint64_t oldest_retained);
 
 /* The first group id NOT covered by eviction knowledge: 0 when nothing was

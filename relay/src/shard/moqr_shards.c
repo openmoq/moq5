@@ -5008,7 +5008,7 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                      * the local bind's evict-reset, this stage touches ONLY
                      * begun/open subgroups — completed-but-unsealed slots
                      * survive so the GRP_EVICT behind it can still find and
-                     * seal those streams. Each cleared slot is the retry
+                     * reset those streams. Each cleared slot is the retry
                      * cursor — a fail-stop retry never redoes one. */
                     bool fault = false;
                     if (row != NULL) {
@@ -5056,8 +5056,15 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     dch_pop(s, src, shard);
                 } else {   /* D_MSG_GRP_EVICT: group_id = the watermark */
                     /* Everything below the owner's oldest retained group is
-                     * gone: abandon still-open objects, seal so completed-
-                     * but-unsealed streams close, then free the slots. */
+                     * gone there: what this destination holds of it stays
+                     * servable, but nothing more of it will cross. A slot
+                     * still here never got its SG_SEAL, and the owner may
+                     * have evicted the subgroup's remaining objects too:
+                     * its completeness is unknown, so its still-open object
+                     * is abandoned and the subgroup is reset, never sealed
+                     * (a FIN says every object was delivered; same rule as
+                     * the bind's own watermark close). Each slot is settled
+                     * once, then freed. */
                     bool fault = false;
                     if (row != NULL) {
                         for (uint32_t sl = 0; sl < s->sg_slots; sl++) {
@@ -5087,32 +5094,37 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                                     m->inbound_data_applied = true;
                                 }
                             }
-                            moqr_result_t sr = moqr_core_seal_subgroup(
+                            moqr_result_t sr = moqr_core_reset_subgroup(
                                 m->core, d->track, row[sl].group,
-                                row[sl].subgroup);
+                                row[sl].subgroup, evict_desc);
                             if (sr != MOQR_OK && sr != MOQR_DONE &&
                                 sr != MOQR_ERR_STALE_HANDLE) {
                                 fault = true;
                                 break;
                             }
+                            if (sr == MOQR_OK) {
+                                m->inbound_data_applied = true;
+                            }
                             memset(&row[sl], 0, sizeof(row[sl]));
                         }
                     }
                     /* The slot sweep above can only reach subgroups this
-                     * destination already OPENED; the watermark also closes
-                     * everything it never received. Recording it on the local
-                     * journal turns "not yet" into "never will" for the whole
-                     * below-watermark range, and the EXISTING per-subscription
-                     * eviction machinery (position reclaim, EVICT_WATERMARK
-                     * notices, downstream subgroup closes) then retires the
-                     * dangling downstream state on the following scans —
-                     * without this, a subgroup whose seal died with the
-                     * owner's eviction stays open downstream forever. */
+                     * destination streamed through a slot; whole-object
+                     * subgroups and ones a GRP_RESET already settled have
+                     * none. Recording the watermark on the local journal
+                     * resets every retained subgroup below it that had not
+                     * ended, the same way, and turns "not yet" into "never
+                     * will" for the absent range — without this, a subgroup
+                     * whose seal died with the owner's eviction stays open
+                     * downstream until this shard evicts the group too. */
                     {
                         moqr_result_t wr = moqr_core_note_track_evicted_below(
                             m->core, d->track, msg->group_id);
                         if (wr != MOQR_OK && wr != MOQR_ERR_STALE_HANDLE) {
                             fault = true;
+                        }
+                        if (wr == MOQR_OK) {
+                            m->inbound_data_applied = true;
                         }
                     }
                     if (fault) {
