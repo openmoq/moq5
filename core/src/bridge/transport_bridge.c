@@ -4018,6 +4018,9 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
     const moq_action_meta_t meta = *expired;
     bridge_dstream_t *d = bridge_dstream_find(b, ref);
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
+    /* A subgroup that times out before its stream opens gets no stream, not
+     * even for its header (draft-18 8: SHOULD NOT open a new stream for it). */
+    const bool unopened = !e;
     moq_reset_data_action_t reset = { .stream_ref = ref,
         .reliable_size = e ? e->subgroup_header_len : 0 };
     bool pending_reset = false;
@@ -4052,7 +4055,7 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
     }
     if (d) {
         uint32_t keep = 0;
-        if (d->q_len && d->q[d->q_head].meta.subgroup_header) {
+        if (!unopened && d->q_len && d->q[d->q_head].meta.subgroup_header) {
             reset.reliable_size = d->q[d->q_head].action.u.send_data.header_len;
             keep = 1;
         }
@@ -4069,7 +4072,8 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
                           p->kind == PENDING_HEADER_PAYLOAD ||
                           p->kind == PENDING_PAYLOAD_ONLY;
         if (data && p->stream_ref._v == ref._v &&
-            !(p->meta.subgroup_header && p->kind != PENDING_PAYLOAD_ONLY)) {
+            (unopened ||
+             !(p->meta.subgroup_header && p->kind != PENDING_PAYLOAD_ONLY))) {
             bridge_pending_counts(b, p, -1);
             bridge_cleanup_pending_item(&b->alloc, p);
             memset(p, 0, sizeof(*p));

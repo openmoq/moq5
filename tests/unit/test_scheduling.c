@@ -7661,6 +7661,48 @@ static void test_object_timeout_after_handover(void)
     MOQ_TEST_PASS("an object handed over in time is not timed out later");
 }
 
+/* [DT-03] An expired subgroup whose stream the bridge has not opened yet
+ * (the stream map is full) gets no stream: draft-18 8 "SHOULD NOT attempt
+ * to open a new stream to deliver additional Objects in that Subgroup".
+ * Drafts 18 and 22: draft-16 times a whole subgroup from its open, so its
+ * earlier subgroup would time out too. */
+static void test_object_timeout_before_open(void)
+{
+    static const moq_version_t vers[] = { MOQ_VERSION_DRAFT_18,
+                                          MOQ_VERSION_DRAFT_22 };
+    for (size_t v = 0; v < 2; v++) {
+        /* Two control streams, the subscription's request stream, and one
+         * data stream. */
+        pair_t p;
+        MOQ_TEST_CHECK(pair_init_streams(&p, vers[v], 1u << 20, true, 4));
+        track_t t;
+        MOQ_TEST_CHECK(subscribe_timed(&p, "v", -1, NONE, NONE, 50, &t));
+        MOQ_TEST_CHECK_EQ_SIZE(moq_transport_bridge_stream_count(p.pub_br), 3);
+        moq_subgroup_handle_t g1;
+        MOQ_TEST_CHECK(publish_group(&p, &t, 1, 1, 0, 128, 2, true, &g1));
+        moq_transport_bridge_service(p.pub_br, p.now);
+        MOQ_TEST_CHECK(publish_group(&p, &t, 1, 2, 0, 128, 2, false, NULL));
+        moq_transport_bridge_service(p.pub_br, p.now);
+        uint64_t next_uni = p.mt->next_uni;
+        p.now += 51 * 1000;
+        moq_transport_bridge_service(p.pub_br, p.now);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_close_subgroup(p.pub, g1,
+                                                              p.now), MOQ_OK);
+        serve_all(&p);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
+        MOQ_TEST_CHECK_EQ_U64(p.mt->next_uni, next_uni);
+        uint32_t w[8];
+        size_t n = wire_objects(&p, w, 8);
+        MOQ_TEST_CHECK_EQ_SIZE(n, 2);
+        for (size_t i = 0; i < n; i++)
+            MOQ_TEST_CHECK_EQ_INT((int)((w[i] >> 16) & 0xff), 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.pub),
+                              MOQ_SESS_ESTABLISHED);
+        pair_destroy(&p);
+    }
+    MOQ_TEST_PASS("an expired subgroup waiting for a stream never opens one");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--shared-admission") == 0) {
@@ -7807,6 +7849,7 @@ int main(int argc, char **argv)
     test_retained_cancellation();
     test_object_timeout_in_bridge();
     test_object_timeout_after_handover();
+    test_object_timeout_before_open();
     if (failures) {
         fprintf(stderr, "test_scheduling: %d failure(s)\n", failures);
         return 1;

@@ -373,8 +373,8 @@ Tests: `delivery_timers`, `scheduling_order`, `group_order_default`.
 
 The transport bridge holds data for the endpoint in priority order and checks
 OBJECT_DELIVERY_TIMEOUT again before it hands an object over: an expired
-object's stream is reset with DELIVERY_TIMEOUT and the session ends the
-subgroup. The publisher facade then
+object's stream is reset with DELIVERY_TIMEOUT, a stream not yet opened is
+never opened, and the session ends the subgroup. The publisher facade then
 drops the rest of that group for the subscriber and keeps the subscription,
 as after a STOP_SENDING on one subgroup stream. Tests: `scheduling`,
 `publisher_stream_loss`.
