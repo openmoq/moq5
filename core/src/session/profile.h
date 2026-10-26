@@ -248,12 +248,15 @@ typedef struct moq_profile_ops {
     moq_result_t (*track_properties_add_group_order)(const uint8_t *in, size_t len,
                                                      uint8_t order, uint8_t *out,
                                                      size_t cap, size_t *out_len);
-    /* `in` with the publisher's OBJECT_ (or, with `subgroup`, SUBGROUP_)
-     * DELIVERY_TIMEOUT = `ms` added the same way. Draft-16's single
-     * DELIVERY_TIMEOUT stands for either. */
-    moq_result_t (*track_properties_add_delivery_timeout)(
-        const uint8_t *in, size_t len, bool subgroup, uint64_t ms,
-        uint8_t *out, size_t cap, size_t *out_len);
+    /* `in` with the publisher's OBJECT_ (or SUBGROUP_) DELIVERY_TIMEOUT =
+     * `ms` added the same way. Draft-16's single DELIVERY_TIMEOUT stands for
+     * either. */
+    moq_result_t (*track_properties_add_object_timeout)(
+        const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+        size_t *out_len);
+    moq_result_t (*track_properties_add_subgroup_timeout)(
+        const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+        size_t *out_len);
     /* MAX_CACHE_DURATION (0x04) in a track properties blob, searching the
      * mutable list and Immutable Properties: true with its milliseconds when
      * present. A blob that does not parse states nothing past the failure. */

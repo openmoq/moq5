@@ -4071,10 +4071,9 @@ static moq_result_t d16_track_properties_add_group_order(const uint8_t *in,
  * stands for both. */
 #define D16_EXT_DELIVERY_TIMEOUT 0x02u
 static moq_result_t d16_track_properties_add_delivery_timeout(
-    const uint8_t *in, size_t len, bool subgroup, uint64_t ms, uint8_t *out,
-    size_t cap, size_t *out_len)
+    const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+    size_t *out_len)
 {
-    (void)subgroup;
     return moq_kvp_list_add_int(in, len, false, D16_EXT_DELIVERY_TIMEOUT, ms,
                                 out, cap, out_len);
 }
@@ -5216,7 +5215,9 @@ static const moq_profile_ops_t d16_ops = {
     .validate_track_properties = d16_validate_track_properties,
     .track_properties_group_order = d16_track_properties_group_order,
     .track_properties_add_group_order = d16_track_properties_add_group_order,
-    .track_properties_add_delivery_timeout =
+    .track_properties_add_object_timeout =
+        d16_track_properties_add_delivery_timeout,
+    .track_properties_add_subgroup_timeout =
         d16_track_properties_add_delivery_timeout,
     .single_delivery_timeout = true,
     .track_properties_max_cache = d16_track_properties_max_cache,

@@ -65,20 +65,24 @@ moq_result_t moq_session_track_properties_add_delivery_timeouts(
     moq_result_t rc = session_check_dt_selection(s, has_object, object_ms,
                                                  has_subgroup, subgroup_ms);
     if (rc < 0) return rc;
-    if (s->profile->single_delivery_timeout || !has_object || !has_subgroup)
-        return s->profile->track_properties_add_delivery_timeout(
-            in, in_len, !has_object, has_object ? object_ms : subgroup_ms,
-            out, out_cap, out_len);
+    const moq_profile_ops_t *p = s->profile;
+    if (p->single_delivery_timeout || !has_subgroup)
+        return p->track_properties_add_object_timeout(
+            in, in_len, has_object ? object_ms : subgroup_ms, out, out_cap,
+            out_len);
+    if (!has_object)
+        return p->track_properties_add_subgroup_timeout(
+            in, in_len, subgroup_ms, out, out_cap, out_len);
     /* Both types: the object one into scratch, then the subgroup one. */
     if (in_len > SIZE_MAX - 16) return MOQ_ERR_INVAL;
     size_t cap = in_len + 16, len = 0;
     uint8_t *tmp = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
     if (!tmp) return MOQ_ERR_NOMEM;
-    rc = s->profile->track_properties_add_delivery_timeout(
-        in, in_len, false, object_ms, tmp, cap, &len);
+    rc = p->track_properties_add_object_timeout(in, in_len, object_ms, tmp,
+                                                cap, &len);
     if (rc >= 0)
-        rc = s->profile->track_properties_add_delivery_timeout(
-            tmp, len, true, subgroup_ms, out, out_cap, out_len);
+        rc = p->track_properties_add_subgroup_timeout(tmp, len, subgroup_ms,
+                                                      out, out_cap, out_len);
     s->alloc.free(tmp, cap, s->alloc.ctx);
     return rc;
 }

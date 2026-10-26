@@ -586,15 +586,25 @@ moq_result_t moq_d18_op_track_properties_add_group_order(const uint8_t *in,
 
 /* OBJECT_ or SUBGROUP_DELIVERY_TIMEOUT = `ms` added to a Track Property list
  * (12.1, 12.2), looked up together with Immutable Properties. */
-moq_result_t moq_d18_op_track_properties_add_delivery_timeout(
-    const uint8_t *in, size_t len, bool subgroup, uint64_t ms, uint8_t *out,
-    size_t cap, size_t *out_len)
+moq_result_t moq_d18_op_track_properties_add_object_timeout(
+    const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+    size_t *out_len)
 {
     if (!out_len) return MOQ_ERR_INVAL;
     return moq_kvp_list_merge_int(in, len, true,
-                                  subgroup ? D18_PROP_SUBGROUP_DELIVERY_TIMEOUT
-                                           : D18_PROP_OBJECT_DELIVERY_TIMEOUT,
-                                  ms, D18_PROP_IMMUTABLE_PROPERTIES, out, cap,
+                                  D18_PROP_OBJECT_DELIVERY_TIMEOUT, ms,
+                                  D18_PROP_IMMUTABLE_PROPERTIES, out, cap,
+                                  out_len);
+}
+
+moq_result_t moq_d18_op_track_properties_add_subgroup_timeout(
+    const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+    size_t *out_len)
+{
+    if (!out_len) return MOQ_ERR_INVAL;
+    return moq_kvp_list_merge_int(in, len, true,
+                                  D18_PROP_SUBGROUP_DELIVERY_TIMEOUT, ms,
+                                  D18_PROP_IMMUTABLE_PROPERTIES, out, cap,
                                   out_len);
 }
 
@@ -2454,8 +2464,10 @@ static const moq_profile_ops_t d18_ops = {
     .track_properties_add_dynamic_groups = moq_d18_op_track_properties_add_dynamic_groups,
     .track_properties_group_order = moq_d18_op_track_properties_group_order,
     .track_properties_add_group_order = moq_d18_op_track_properties_add_group_order,
-    .track_properties_add_delivery_timeout =
-        moq_d18_op_track_properties_add_delivery_timeout,
+    .track_properties_add_object_timeout =
+        moq_d18_op_track_properties_add_object_timeout,
+    .track_properties_add_subgroup_timeout =
+        moq_d18_op_track_properties_add_subgroup_timeout,
     .track_properties_max_cache = moq_d18_op_track_properties_max_cache,
     .encode_publish_ok       = d18_encode_publish_ok,
     .encode_track_status     = d18_encode_track_status,
